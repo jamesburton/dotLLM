@@ -51,6 +51,7 @@ public sealed class Gemma4DensePleVulkanParityTests
         ["no-ple", 1],
         ["no-shared-kv", 2],
         ["no-rope-freqs", 3],
+        ["e2b-double-wide-ffn", 4],
     ];
 
     private static ModelConfig Mutate(ModelConfig c, int variant) => variant switch
@@ -66,7 +67,9 @@ public sealed class Gemma4DensePleVulkanParityTests
     {
         RequireVulkan();
         string spv = SpvDir();
-        var syn = variant == 3 ? Cfg() with { EmitRopeFreqs = false } : Cfg();
+        var syn = variant == 3 ? Cfg() with { EmitRopeFreqs = false }
+            : variant == 4 ? Cfg() with { DoubleWideSharedKvFfn = true }   // #917: E2B per-layer FFN widths
+            : Cfg();
         string path = Path.Combine(Path.GetTempPath(), $"syn_g4ple_{Guid.NewGuid():N}.gguf");
         SyntheticGemma4Gguf.WriteGemma4(path, syn);
         try
@@ -78,6 +81,90 @@ public sealed class Gemma4DensePleVulkanParityTests
             float[] a = LastRow(cpu.Forward(Ids, Pos, -1), cfg.VocabSize);
             float[] b = LastRow(vk.Forward(Ids, Pos, -1, kvCache: null), cfg.VocabSize);
             AssertClose(name, a, b);
+        }
+        finally { try { File.Delete(path); } catch { } }
+    }
+
+    [SkippableTheory]
+    [InlineData(1)]
+    [InlineData(7)]
+    public void GpuPleInputs_MatchHostPath_AndAreActuallyUsed(int rows)
+    {
+        // #916: the GPU PLE pipeline (projection GEMM + combine kernel) must reproduce the host
+        // ComputeLayerMajor result (here: through the logits of a real forward) for 1 row and a prefill chunk,
+        // and the default path must really be the GPU one (A/B arm: DOTLLM_VK_GEMMA4_PLE_GPU=0).
+        RequireVulkan();
+        string spv = SpvDir();
+        string path = Path.Combine(Path.GetTempPath(), $"syn_g4ple_{Guid.NewGuid():N}.gguf");
+        SyntheticGemma4Gguf.WriteGemma4(path, Cfg());
+        string? prev = Environment.GetEnvironmentVariable("DOTLLM_VK_GEMMA4_PLE_GPU");
+        try
+        {
+            using var gguf = GgufFile.Open(path);
+            var cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            var ids = Ids.AsSpan(0, rows).ToArray();
+            var pos = Pos.AsSpan(0, rows).ToArray();
+
+            Environment.SetEnvironmentVariable("DOTLLM_VK_GEMMA4_PLE_GPU", "0");
+            float[] host, hostPle;
+            int pleElems = cfg.NumLayers * rows * cfg.PerLayerEmbedding!.PerLayerDim;
+            using (var vkHost = VulkanTransformerModel.LoadFromGguf(gguf, cfg, spv))
+            {
+                Assert.False(vkHost.Gemma4PleOnGpu);
+                host = LastRow(vkHost.Forward(ids, pos, -1, kvCache: null), cfg.VocabSize);
+                hostPle = vkHost.DownloadPleInputsForTest(pleElems);
+            }
+            Environment.SetEnvironmentVariable("DOTLLM_VK_GEMMA4_PLE_GPU", null);
+            float[] gpu, gpuPle;
+            using (var vkGpu = VulkanTransformerModel.LoadFromGguf(gguf, cfg, spv))
+            {
+                Assert.True(vkGpu.Gemma4PleOnGpu);
+                gpu = LastRow(vkGpu.Forward(ids, pos, -1, kvCache: null), cfg.VocabSize);
+                gpuPle = vkGpu.DownloadPleInputsForTest(pleElems);
+            }
+
+            float pleWorst = 0, pleMax = 0;
+            for (int i = 0; i < pleElems; i++) { pleWorst = MathF.Max(pleWorst, MathF.Abs(hostPle[i] - gpuPle[i])); pleMax = MathF.Max(pleMax, MathF.Abs(hostPle[i])); }
+            _output.WriteLine($"rows={rows}: PLE inputs worst|diff|={pleWorst:E3} (max |value| {pleMax:E3})");
+            Assert.True(pleMax > 0.05f, "PLE inputs degenerate");
+            Assert.True(pleWorst <= 1e-5f * pleMax + 1e-6f, $"PLE inputs differ: {pleWorst:E3} vs max {pleMax:E3}");
+
+            float worst = 0;
+            for (int i = 0; i < host.Length; i++) worst = MathF.Max(worst, MathF.Abs(host[i] - gpu[i]));
+            _output.WriteLine($"rows={rows}: host-PLE vs gpu-PLE worst|logit diff|={worst:E3} (logit range {host.Min():F2}..{host.Max():F2})");
+            Assert.True(worst < 2e-3f, $"GPU PLE logits diverge from the host path: {worst:E3}");
+            Assert.Equal(ArgMax(host), ArgMax(gpu));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("DOTLLM_VK_GEMMA4_PLE_GPU", prev);
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [SkippableFact]
+    public void CachedPrefillThenDecode_DoubleWideFfn_MatchesCpu()
+    {
+        // #917: E2B's shared-KV layers have a 2x-wide MLP; the per-layer FFN activation must be sized by that
+        // layer's own gate width. Prefill (7 rows) then single-token decode must both match the CPU oracle.
+        RequireVulkan();
+        string spv = SpvDir();
+        string path = Path.Combine(Path.GetTempPath(), $"syn_g4e2b_{Guid.NewGuid():N}.gguf");
+        SyntheticGemma4Gguf.WriteGemma4(path, Cfg() with { DoubleWideSharedKvFfn = true });
+        try
+        {
+            using var gguf = GgufFile.Open(path);
+            var cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            Assert.Equal(128, cfg.IntermediateSize);   // widest layer, not the first layer's 64
+            using var cpu = TransformerModel.LoadFromGguf(gguf, cfg, ThreadingConfig.SingleThreaded);
+            using var vk = VulkanTransformerModel.LoadFromGguf(gguf, cfg, spv);
+            int last = Ids.Length - 1;
+            float[] oracle = LastRow(cpu.Forward(Ids, Pos, -1), cfg.VocabSize);
+            AssertClose("e2b-cacheless", oracle, LastRow(vk.Forward(Ids, Pos, -1, kvCache: null), cfg.VocabSize));
+            using var kv = vk.CreateKvCache(maxSeqLen: 16);
+            using (vk.Forward(Ids.AsSpan(0, last), Pos.AsSpan(0, last), -1, kv)) { }
+            AssertClose("e2b-cached-decode", oracle,
+                LastRow(vk.Forward(Ids.AsSpan(last, 1), Pos.AsSpan(last, 1), -1, kv), cfg.VocabSize));
         }
         finally { try { File.Delete(path); } catch { } }
     }

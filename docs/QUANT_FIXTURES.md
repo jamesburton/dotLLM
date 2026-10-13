@@ -130,3 +130,40 @@ deliberately excluded from this ladder.
 Every gate resolves its fixture and calls `Skip.If`, so an absent fixture reports **skipped**
 with the paths it probed — never a silent pass (issues #421 / #307). If you see one of these
 cases reported as *passed*, the case genuinely ran.
+
+## Small real-model fixture: Gemma-4 E2B (fast test model)
+
+`unsloth/gemma-4-E2B-it-GGUF` / `gemma-4-E2B-it-Q4_K_M.gguf` (2.9 GiB) is the repo's **fast small
+real model**: it handles arithmetic, JSON extraction, one-word classification, short summaries and
+tool calls (7/7 on `scripts/small-model-tasks.py`, CPU and Vulkan, greedy-identical) and decodes at
+~60-70 tok/s on the Strix Halo iGPU. Fetch it into the HF hub cache (`hf download`), never into the tree.
+
+```
+DOTLLM_GEMMA4E2B_GGUF=/absolute/path/gemma-4-E2B-it-Q4_K_M.gguf
+```
+
+unset falls back to the first `gemma-4-E2B-it-Q4_K_M.gguf` under
+`~/.cache/huggingface/hub/models--unsloth--gemma-4-E2B-it-GGUF/snapshots` (`HF_HOME` respected);
+`Gemma4E2BGgufForwardTests` skips when neither resolves. Shape facts the tests assert: 35 layers,
+hidden 1536, PLE dim 256, 20 shared-KV layers, and a **per-layer `feed_forward_length` array**
+(6144 x15, 12288 x20: double-wide MLP on the shared-KV layers, #923).
+
+Use it through the **chat template** (`dotllm chat` / `serve`): `dotllm run` is raw completion with
+no template, and an instruction-tuned model answers a bare question with its end-of-turn token
+immediately (`stop | N prompt, 0 generated`; llama.cpp `-dev none` does the same, verified).
+
+```bash
+dotnet dotllm.dll serve <gguf> -d vulkan --no-browser --no-ui --no-warmup &
+python scripts/small-model-tasks.py http://localhost:8080 <model-id from /v1/models>
+```
+
+## MiMo-V2 tiny-oracle fixtures (`mimo2`, #936)
+
+`tests/DotLLM.Tests.Unit/Models/MiMoV2/MiMoV2TinyOracleParityTests.cs` and `MiMoV2QuantMixParityTests.cs` resolve
+`~/.dotllm/test-cache/mimo2-tiny/` and `~/.dotllm/test-cache/mimo2-tiny-k256/` (override: `DOTLLM_MIMO2_TINY_DIR`,
+`DOTLLM_MIMO2_TINY_K256_DIR`) and skip when absent. Recipe (`tools/mimo2-tiny-oracle/`): `make_tiny.py <hf-remote-code-dir> <out> [seed] [small|k256]`
+(needs torch + transformers 5.3.0 and the `XiaomiMiMo/MiMo-V2.6-Flash-RL` remote code + tokenizer files) -> llama.cpp
+`convert_hf_to_gguf.py <out> --outtype f32` -> `dumplogits.cpp` (llama.cpp CPU logits, F32 KV, no flash attention) -> `cmp.py`. The k256 mix is
+`llama-quantize --tensor-type ffn_gate_exps=q2_k --tensor-type ffn_up_exps=q2_k --tensor-type ffn_down_exps=mxfp4 --output-tensor-type q6_k
+--token-embedding-type q8_0 in.gguf out.gguf Q8_0`; the F32-decoded control file is made by dequantising every tensor with gguf-py. These are
+random-weight fixtures (88 MB / 340 MB because of the real 152576-token vocabulary) and are never committed.

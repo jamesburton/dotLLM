@@ -8,7 +8,7 @@ using Xunit;
 namespace DotLLM.Tests.Unit.Cpu.Kernels;
 
 /// <summary>
-/// Issue #605: packed × Q8_K dots for IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ1_S.
+/// Issue #605 (+ #958 IQ1_M): packed × Q8_K dots for IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ1_S / IQ1_M.
 /// Oracle = the format's dequantiser (<c>Dequantize.ToFloat32</c>) × Q8_K activations summed in
 /// double. Weight blocks are fully random bytes (every grid index, sign index, scale and — for IQ1_S
 /// — every delta sign); activations span the production range ±127. Every tier (scalar, SSSE3,
@@ -18,7 +18,7 @@ public sealed unsafe class IQCodebookDotTests
 {
     private const int Q8KBytes = 292;
 
-    public enum Fmt { IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S }
+    public enum Fmt { IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M }
 
     private static QuantizationType Qt(Fmt f) => f switch
     {
@@ -27,6 +27,7 @@ public sealed unsafe class IQCodebookDotTests
         Fmt.IQ2_S => QuantizationType.IQ2_S,
         Fmt.IQ3_XXS => QuantizationType.IQ3_XXS,
         Fmt.IQ3_S => QuantizationType.IQ3_S,
+        Fmt.IQ1_M => QuantizationType.IQ1_M,
         _ => QuantizationType.IQ1_S,
     };
 
@@ -39,6 +40,7 @@ public sealed unsafe class IQCodebookDotTests
         Fmt.IQ2_S => MatMul.VecDotIq_Q8_KScalar<MatMul.Iq2SFmt>(w, x, n),
         Fmt.IQ3_XXS => MatMul.VecDotIq_Q8_KScalar<MatMul.Iq3XxsFmt>(w, x, n),
         Fmt.IQ3_S => MatMul.VecDotIq_Q8_KScalar<MatMul.Iq3SFmt>(w, x, n),
+        Fmt.IQ1_M => MatMul.VecDotIq_Q8_KScalar<MatMul.Iq1MFmt>(w, x, n),
         _ => MatMul.VecDotIq_Q8_KScalar<MatMul.Iq1SFmt>(w, x, n),
     };
 
@@ -49,6 +51,7 @@ public sealed unsafe class IQCodebookDotTests
         Fmt.IQ2_S => MatMul.VecDotIq_Q8_KSse<MatMul.Iq2SFmt>(w, x, n),
         Fmt.IQ3_XXS => MatMul.VecDotIq_Q8_KSse<MatMul.Iq3XxsFmt>(w, x, n),
         Fmt.IQ3_S => MatMul.VecDotIq_Q8_KSse<MatMul.Iq3SFmt>(w, x, n),
+        Fmt.IQ1_M => MatMul.VecDotIq_Q8_KSse<MatMul.Iq1MFmt>(w, x, n),
         _ => MatMul.VecDotIq_Q8_KSse<MatMul.Iq1SFmt>(w, x, n),
     };
 
@@ -59,6 +62,7 @@ public sealed unsafe class IQCodebookDotTests
         Fmt.IQ2_S => MatMul.VecDotIq_Q8_KAvx2<MatMul.Iq2SFmt>(w, x, n),
         Fmt.IQ3_XXS => MatMul.VecDotIq_Q8_KAvx2<MatMul.Iq3XxsFmt>(w, x, n),
         Fmt.IQ3_S => MatMul.VecDotIq_Q8_KAvx2<MatMul.Iq3SFmt>(w, x, n),
+        Fmt.IQ1_M => MatMul.VecDotIq_Q8_KAvx2<MatMul.Iq1MFmt>(w, x, n),
         _ => MatMul.VecDotIq_Q8_KAvx2<MatMul.Iq1SFmt>(w, x, n),
     };
 
@@ -71,6 +75,7 @@ public sealed unsafe class IQCodebookDotTests
             case Fmt.IQ2_S: MatMul.VecDotIq_Q8_KAvx2x4<MatMul.Iq2SFmt>(w, x, rowBytes, n, o); break;
             case Fmt.IQ3_XXS: MatMul.VecDotIq_Q8_KAvx2x4<MatMul.Iq3XxsFmt>(w, x, rowBytes, n, o); break;
             case Fmt.IQ3_S: MatMul.VecDotIq_Q8_KAvx2x4<MatMul.Iq3SFmt>(w, x, rowBytes, n, o); break;
+            case Fmt.IQ1_M: MatMul.VecDotIq_Q8_KAvx2x4<MatMul.Iq1MFmt>(w, x, rowBytes, n, o); break;
             default: MatMul.VecDotIq_Q8_KAvx2x4<MatMul.Iq1SFmt>(w, x, rowBytes, n, o); break;
         }
     }
@@ -164,6 +169,7 @@ public sealed unsafe class IQCodebookDotTests
     [InlineData(Fmt.IQ3_XXS, 1)] [InlineData(Fmt.IQ3_XXS, 7)]
     [InlineData(Fmt.IQ3_S, 1)] [InlineData(Fmt.IQ3_S, 7)]
     [InlineData(Fmt.IQ1_S, 1)] [InlineData(Fmt.IQ1_S, 7)]
+    [InlineData(Fmt.IQ1_M, 1)] [InlineData(Fmt.IQ1_M, 7)]
     public void GemvGemm_MatchDequantizeAndDot(Fmt f, int cols)
     {
         const int m = 39, n = 4;
@@ -224,11 +230,53 @@ public sealed unsafe class IQCodebookDotTests
 
     [Theory]
     [InlineData(Fmt.IQ2_XXS)] [InlineData(Fmt.IQ2_XS)] [InlineData(Fmt.IQ2_S)]
-    [InlineData(Fmt.IQ3_XXS)] [InlineData(Fmt.IQ3_S)] [InlineData(Fmt.IQ1_S)]
+    [InlineData(Fmt.IQ3_XXS)] [InlineData(Fmt.IQ3_S)] [InlineData(Fmt.IQ1_S)] [InlineData(Fmt.IQ1_M)]
     public void Dispatch_TablesRouteToThePackedDot(Fmt f)
     {
         Assert.True(MatMul.UsesQ8KDot(Qt(f)));
         Assert.True(MatMul.SupportsFusedDecode(Qt(f)));
+    }
+
+    /// <summary>
+    /// Grouped-MoE batch invariance (see the MoeSwiGluMlp.DispatchGemm remark): a token's result must not depend on how many other tokens routed to the
+    /// same expert, i.e. column 0 of an n=1 GEMM, an n=4 (one 4-column block) and an n=7 (block + ragged tail) GEMM are bit-identical.
+    /// </summary>
+    [Theory]
+    [InlineData(Fmt.IQ2_XXS)] [InlineData(Fmt.IQ2_XS)] [InlineData(Fmt.IQ3_S)] [InlineData(Fmt.IQ1_S)] [InlineData(Fmt.IQ1_M)]
+    public void Gemm_IsBatchInvariant(Fmt f)
+    {
+        const int m = 33, nb = 4, k = nb * 256;
+        var rng = new Random(6120 + (int)f);
+        int bb = BlockBytes(f), rowBytes = nb * bb;
+        QuantizationType qt = Qt(f);
+        byte* w = (byte*)NativeMemory.AlignedAlloc((nuint)(m * rowBytes), 64);
+        float* b = (float*)NativeMemory.AlignedAlloc((nuint)(7 * k * sizeof(float)), 64);
+        float* r1 = (float*)NativeMemory.Alloc((nuint)(m * sizeof(float)));
+        float* r4 = (float*)NativeMemory.Alloc((nuint)(4 * m * sizeof(float)));
+        float* r7 = (float*)NativeMemory.Alloc((nuint)(7 * m * sizeof(float)));
+        try
+        {
+            for (int r = 0; r < m; r++)
+            {
+                byte* row = RandomRow(rng, f, nb);
+                Buffer.MemoryCopy(row, w + r * rowBytes, rowBytes, rowBytes);
+                NativeMemory.Free(row);
+            }
+            for (int i = 0; i < 7 * k; i++) b[i] = rng.NextSingle() * 2f - 1f;
+            MatMul.GemmIQCodebook(qt, w, b, r1, m, k, 1, null);
+            MatMul.GemmIQCodebook(qt, w, b, r4, m, k, 4, null);
+            MatMul.GemmIQCodebook(qt, w, b, r7, m, k, 7, null);
+            for (int r = 0; r < m; r++)
+            {
+                Assert.True(BitConverter.SingleToInt32Bits(r1[r]) == BitConverter.SingleToInt32Bits(r4[r]), $"{f} row {r}: n=1 {r1[r]} vs n=4 {r4[r]}");
+                Assert.True(BitConverter.SingleToInt32Bits(r1[r]) == BitConverter.SingleToInt32Bits(r7[r]), $"{f} row {r}: n=1 {r1[r]} vs n=7 {r7[r]}");
+            }
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(w); NativeMemory.AlignedFree(b);
+            NativeMemory.Free(r1); NativeMemory.Free(r4); NativeMemory.Free(r7);
+        }
     }
 
     // ──────────────────── helpers ────────────────────
@@ -268,7 +316,19 @@ public sealed unsafe class IQCodebookDotTests
         byte* p = (byte*)NativeMemory.Alloc((nuint)(n * bb));
         for (int i = 0; i < n * bb; i++) p[i] = (byte)rng.Next(256);
         for (int sb = 0; sb < n; sb++)
-            *(Half*)(p + sb * bb) = (Half)((rng.NextSingle() * 2f - 1f) * 0.01f);
+        {
+            Half d = (Half)((rng.NextSingle() * 2f - 1f) * 0.01f);
+            if (f != Fmt.IQ1_M)
+                *(Half*)(p + sb * bb) = d;
+            else
+            {
+                // IQ1_M has no leading d: the fp16 super-scale lives in the top nibbles of the four scale words (bytes 48..55).
+                ushort bits = BitConverter.HalfToUInt16Bits(d);
+                ushort* sc = (ushort*)(p + sb * bb + 48);
+                for (int i = 0; i < 4; i++)
+                    sc[i] = (ushort)((sc[i] & 0x0FFF) | (((bits >> (4 * i)) & 0xF) << 12));
+            }
+        }
         return p;
     }
 

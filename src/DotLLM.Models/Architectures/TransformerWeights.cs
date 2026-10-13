@@ -910,6 +910,26 @@ internal sealed class MlaLayerWeights
     public readonly nint KvBProjRaw;
     public readonly QuantizationType KvBProjRawQt;
 
+    /// <summary>
+    /// Raw GGUF view of the llama.cpp pre-split absorbed-attention up-projections (#913):
+    /// <c>attn_k_b</c> = per-head <c>[kvLoraRank, qkNope]</c> row-major matrices (<c>numHeads * kvLoraRank</c> rows of
+    /// <c>qkNope</c> elements), <c>attn_v_b</c> = per-head <c>[vHead, kvLoraRank]</c> (<c>numHeads * vHead</c> rows of
+    /// <c>kvLoraRank</c> elements). Zero when the file ships the fused legacy <c>attn_kv_b</c> instead.
+    /// </summary>
+    public nint KBRaw { get; init; }
+    /// <summary>Quantization of <see cref="KBRaw"/>.</summary>
+    public QuantizationType KBRawQt { get; init; } = QuantizationType.F32;
+    /// <summary>See <see cref="KBRaw"/>.</summary>
+    public nint VBRaw { get; init; }
+    /// <summary>Quantization of <see cref="VBRaw"/>.</summary>
+    public QuantizationType VBRawQt { get; init; } = QuantizationType.F32;
+    /// <summary>
+    /// True when the host F32 dequants (<see cref="QAProj"/>, <see cref="QBProj"/>, <see cref="QProj"/>,
+    /// <see cref="KvAProjWithMqa"/>, <see cref="KvBProj"/>) were deliberately NOT materialised (GPU-only load,
+    /// #913): only the raw GGUF views are valid. The CPU MLA oracle cannot run on such weights.
+    /// </summary>
+    public bool HostF32Skipped { get; init; }
+
     // Hyperparameters (mirrors MlaConfig, carried on the layer for forward-path convenience).
     public readonly int NumHeads;
     public readonly int QkNopeHeadDim;
@@ -1273,12 +1293,20 @@ internal sealed class TransformerWeights : IDisposable
     /// unsupported bank no longer forces the F32 host dequant for its resident-capable
     /// siblings. <see langword="null"/> (the default) preserves the prior model-wide
     /// behavior driven solely by <paramref name="skipF32MoeDequant"/>.</param>
+    /// <param name="skipMlaF32Dequant">GPU-only MLA load (#913): skip the host F32 dequant of every MLA projection
+    /// (q_a/q_b/q, kv_a_mqa, kv_b, attn_output) and keep only the raw GGUF views, which the Vulkan absorbed-MLA path
+    /// uploads packed. Requires the llama.cpp split <c>attn_k_b</c>/<c>attn_v_b</c> pair (throws otherwise). The CPU MLA
+    /// oracle cannot run on weights loaded this way.</param>
+    /// <param name="skipSharedExpertF32Dequant">GPU-only load (#949): skip the host F32 dequant of the MLA+MoE shared-expert
+    /// gate/up/down (the Vulkan loader keeps them packed from the raw views). The CPU MoE oracle cannot run on such weights.</param>
     /// <param name="allowNanoQuant">True only for the CPU backend: accepts a community NanoQuant GGUF (#869). Every other
     /// caller leaves it false and gets a clear <see cref="NotSupportedException"/> for such a file.</param>
     public static TransformerWeights LoadFromGguf(GgufFile gguf, ModelConfig config,
                                                     bool skipF32MoeDequant = false,
                                                     Func<int, (bool SkipGate, bool SkipUp, bool SkipDown)>? moeBankSkipSelector = null,
-                                                    bool allowNanoQuant = false)
+                                                    bool allowNanoQuant = false,
+                                                    bool skipMlaF32Dequant = false,
+                                                    bool skipSharedExpertF32Dequant = false)
     {
         ThrowIfArchitectureNeedsDedicatedLoader(config);
 
@@ -1315,6 +1343,7 @@ internal sealed class TransformerWeights : IDisposable
         // (E2B/E4B) additionally owns F32 upcasts of the PLE projections when
         // they are not stored as F32 (per_layer_model_proj ships BF16).
         var owned = config.MlaConfig is not null || config.PerLayerEmbedding is not null || nanoQuant
+                    || config.Architecture == DotLLM.Core.Configuration.Architecture.MiMoV2
             ? new List<nint>()
             : null;
 
@@ -1323,7 +1352,7 @@ internal sealed class TransformerWeights : IDisposable
         for (int i = 0; i < config.NumLayers; i++)
         {
             layers[i] = config.MlaConfig is not null
-                ? LoadMlaLayer(i, dataBase, tensors, config, owned!, skipF32MoeDequant, moeBankSkipSelector)
+                ? LoadMlaLayer(i, dataBase, tensors, config, owned!, skipF32MoeDequant, moeBankSkipSelector, skipMlaF32Dequant, skipSharedExpertF32Dequant)
                 : config.Gemma4DualFfn
                     ? LoadGemma4Layer(i, dataBase, tensors, config, owned)
                     : LoadLayer(i, dataBase, tensors, config, nanoQuant ? gguf : null, owned);
@@ -1645,10 +1674,15 @@ internal sealed class TransformerWeights : IDisposable
 
             int qDim = config.NumAttentionHeads * layerHeadDim;
             int kvDim = layerKvHeads * layerHeadDim;
+            // MiMo-V2: V rows are layerKvHeads * ValueHeadDim (128) while K rows are layerKvHeads * HeadDim (192).
+            int vDim = layerKvHeads * config.GetValueHeadDim();
+            if (qkvDesc.Shape[1] != qDim + kvDim + vDim)
+                throw new InvalidDataException(
+                    $"{prefix}.attn_qkv.weight has {qkvDesc.Shape[1]} rows; expected q {qDim} + k {kvDim} + v {vDim} = {qDim + kvDim + vDim}.");
 
             qPtr = qkvPtr; qQt = qkvDesc.QuantizationType; qM = qDim; qK = inputDim;
             kPtr = qkvPtr + (nint)(qDim * rowBytes); kQt = qkvDesc.QuantizationType; kM = kvDim; kK = inputDim;
-            vPtr = qkvPtr + (nint)((qDim + kvDim) * rowBytes); vQt = qkvDesc.QuantizationType; vM = kvDim; vK = inputDim;
+            vPtr = qkvPtr + (nint)((qDim + kvDim) * rowBytes); vQt = qkvDesc.QuantizationType; vM = vDim; vK = inputDim;
         }
         else
         {
@@ -1736,6 +1770,32 @@ internal sealed class TransformerWeights : IDisposable
 
         // Optional FFN sub-norm (BitNet Sub-LN): RMSNorm over the gated intermediate [intermediateSize] before ffn_down.
         float[]? ffnSubNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.ffn_sub_norm.weight", config.IntermediateSize);
+
+        // MiMo-V2 routed-MoE layer: sigmoid + selection-bias top-k, no shared expert, raw GGUF quant banks kept in place
+        // (the F32 host dequant would be ~1.2 TB at 310B scale). Layer 0 is dense and falls through to the dense path below.
+        if (config.Architecture == DotLLM.Core.Configuration.Architecture.MiMoV2
+            && config.Moe is not null && config.Moe.IsMoeLayer(layerIdx)
+            && tensors.ContainsKey($"{prefix}.ffn_gate_exps.weight"))
+        {
+            MoeLayerWeights mimoMoe = LoadDeepSeekMoeLayer(
+                layerIdx, dataBase, tensors, config, nqOwned ?? new List<nint>(), skipF32Dequant: true);
+            return new TransformerLayerWeights(
+                attnNorm,
+                qPtr, qQt, qM, qK,
+                kPtr, kQt, kM, kK,
+                vPtr, vQt, vM, vK,
+                oPtr, oQt, oM, oK,
+                ffnNorm,
+                gateWeight: 0, gateQuantType: QuantizationType.F32, gateOutputDim: 0, gateInputDim: 0,
+                upWeight: 0, upQuantType: QuantizationType.F32, upOutputDim: 0, upInputDim: 0,
+                downWeight: 0, downQuantType: QuantizationType.F32, downOutputDim: 0, downInputDim: 0,
+                qBias, kBias, vBias, oBias,
+                gateBias: null, upBias: null, downBias: null,
+                qNormWeight, kNormWeight,
+                moe: mimoMoe,
+                mla: null,
+                attnSinks: attnSinks);
+        }
 
         // Routed-MoE layer with quantized experts (gpt-oss): the dense
         // ffn_gate/up/down tensors are absent; a 3D-stacked expert block with
@@ -2222,7 +2282,9 @@ internal sealed class TransformerWeights : IDisposable
         ModelConfig config,
         List<nint> owned,
         bool skipF32MoeDequant = false,
-        Func<int, (bool SkipGate, bool SkipUp, bool SkipDown)>? moeBankSkipSelector = null)
+        Func<int, (bool SkipGate, bool SkipUp, bool SkipDown)>? moeBankSkipSelector = null,
+        bool skipMlaF32Dequant = false,
+        bool skipSharedExpertF32Dequant = false)
     {
         var mla = config.MlaConfig
             ?? throw new InvalidOperationException("LoadMlaLayer called without MlaConfig.");
@@ -2260,34 +2322,39 @@ internal sealed class TransformerWeights : IDisposable
             var qaDesc = tensors[$"{prefix}.attn_q_a.weight"];
             qAProjRaw = dataBase.Of(qaDesc);
             qAProjRawQt = qaDesc.QuantizationType;
-            qAProj = DequantToF32(dataBase, qaDesc, (long)qLora * hiddenSize, owned);
+            qAProj = skipMlaF32Dequant ? 0 : DequantToF32(dataBase, qaDesc, (long)qLora * hiddenSize, owned);
             qANorm = DequantizeNorm(dataBase, tensors[$"{prefix}.attn_q_a_norm.weight"], qLora);
 
             var qbDesc = tensors[$"{prefix}.attn_q_b.weight"];
             qBProjRaw = dataBase.Of(qbDesc);
             qBProjRawQt = qbDesc.QuantizationType;
-            qBProj = DequantToF32(dataBase, qbDesc, (long)qTotal * qLora, owned);
+            qBProj = skipMlaF32Dequant ? 0 : DequantToF32(dataBase, qbDesc, (long)qTotal * qLora, owned);
         }
         else
         {
             var qDesc = tensors[$"{prefix}.attn_q.weight"];
             qProjRaw = dataBase.Of(qDesc);
             qProjRawQt = qDesc.QuantizationType;
-            qProj = DequantToF32(dataBase, qDesc, (long)qTotal * hiddenSize, owned);
+            qProj = skipMlaF32Dequant ? 0 : DequantToF32(dataBase, qDesc, (long)qTotal * hiddenSize, owned);
         }
 
         // ── KV path (always factored) ────────────────────────────────
         var kvaDesc = tensors[$"{prefix}.attn_kv_a_mqa.weight"];
         nint kvAProjRaw = dataBase.Of(kvaDesc);
         QuantizationType kvAProjRawQt = kvaDesc.QuantizationType;
-        nint kvAProj = DequantToF32(dataBase, kvaDesc, (long)kvAOut * hiddenSize, owned);
+        nint kvAProj = skipMlaF32Dequant ? 0 : DequantToF32(dataBase, kvaDesc, (long)kvAOut * hiddenSize, owned);
         float[] kvANorm = DequantizeNorm(dataBase, tensors[$"{prefix}.attn_kv_a_norm.weight"], kvLora);
 
         nint kvBProjRaw;
         QuantizationType kvBProjRawQt;
         nint kvBProj;
+        nint kbRaw = 0, vbRaw = 0;
+        QuantizationType kbRawQt = QuantizationType.F32, vbRawQt = QuantizationType.F32;
         if (tensors.TryGetValue($"{prefix}.attn_kv_b.weight", out var kvbDesc))
         {
+            if (skipMlaF32Dequant)
+                throw new InvalidDataException(
+                    $"{prefix}: GPU-only MLA load requires the split attn_k_b/attn_v_b pair; this file ships the fused attn_kv_b.");
             kvBProjRaw = dataBase.Of(kvbDesc);
             kvBProjRawQt = kvbDesc.QuantizationType;
             kvBProj = DequantToF32(dataBase, kvbDesc, (long)kvBOut * kvLora, owned);
@@ -2306,6 +2373,16 @@ internal sealed class TransformerWeights : IDisposable
                     $"{prefix}: MLA layer has neither attn_kv_b.weight nor the split attn_k_b/attn_v_b pair.");
             long kbCount = (long)numHeads * kvLora * qkNope;
             long vbCount = (long)numHeads * vHead * kvLora;
+            kbRaw = dataBase.Of(kbDesc); kbRawQt = kbDesc.QuantizationType;
+            vbRaw = dataBase.Of(vbDesc); vbRawQt = vbDesc.QuantizationType;
+            if (skipMlaF32Dequant)
+            {
+                kvBProj = 0;
+                kvBProjRaw = 0;
+                kvBProjRawQt = QuantizationType.F32;
+            }
+            else
+            {
             nint kbF32 = DequantToF32(dataBase, kbDesc, kbCount, owned);
             nint vbF32 = DequantToF32(dataBase, vbDesc, vbCount, owned);
             kvBProj = (nint)NativeMemory.AlignedAlloc((nuint)((long)kvBOut * kvLora * sizeof(float)), 64);
@@ -2329,6 +2406,7 @@ internal sealed class TransformerWeights : IDisposable
             }
             kvBProjRaw = kvBProj;
             kvBProjRawQt = QuantizationType.F32;
+            }
         }
 
         // ── O projection (same tensor name as GQA: attn_output) ──────
@@ -2336,7 +2414,8 @@ internal sealed class TransformerWeights : IDisposable
         // GQA slot) — the raw quant view comes for free via that field;
         // the F32 dequant here is for the CPU MLA path's o_proj GEMM.
         var oDesc = tensors[$"{prefix}.attn_output.weight"];
-        nint oProj = DequantToF32(dataBase, oDesc, (long)hiddenSize * oInput, owned);
+        nint oProj = skipMlaF32Dequant ? dataBase.Of(oDesc) : DequantToF32(dataBase, oDesc, (long)hiddenSize * oInput, owned);
+        QuantizationType oProjQt = skipMlaF32Dequant ? oDesc.QuantizationType : QuantizationType.F32;
 
         var mlaBundle = new MlaLayerWeights(
             qAProj: qAProj,
@@ -2357,7 +2436,11 @@ internal sealed class TransformerWeights : IDisposable
             qBProjRaw: qBProjRaw, qBProjRawQt: qBProjRawQt,
             qProjRaw: qProjRaw, qProjRawQt: qProjRawQt,
             kvAProjWithMqaRaw: kvAProjRaw, kvAProjWithMqaRawQt: kvAProjRawQt,
-            kvBProjRaw: kvBProjRaw, kvBProjRawQt: kvBProjRawQt);
+            kvBProjRaw: kvBProjRaw, kvBProjRawQt: kvBProjRawQt)
+        {
+            KBRaw = kbRaw, KBRawQt = kbRawQt, VBRaw = vbRaw, VBRawQt = vbRawQt,
+            HostF32Skipped = skipMlaF32Dequant,
+        };
 
         // ── FFN ────────────────────────────────────────────────────────
         // DeepSeek-V2/V3 layouts:
@@ -2384,7 +2467,8 @@ internal sealed class TransformerWeights : IDisposable
                 ? moeBankSkipSelector(layerIdx)
                 : (skipF32MoeDequant, skipF32MoeDequant, skipF32MoeDequant);
             moeBundle = LoadDeepSeekMoeLayer(layerIdx, dataBase, tensors, config, owned,
-                skipGateDequant: skipGate, skipUpDequant: skipUp, skipDownDequant: skipDown);
+                skipGateDequant: skipGate, skipUpDequant: skipUp, skipDownDequant: skipDown,
+                skipSharedDequant: skipSharedExpertF32Dequant ? true : null);
         }
         else if (tensors.TryGetValue($"{prefix}.ffn_gate.weight", out var gateDesc))
         {
@@ -2404,7 +2488,7 @@ internal sealed class TransformerWeights : IDisposable
             qWeight: 0, qQuantType: QuantizationType.F32, qOutputDim: 0, qInputDim: 0,
             kWeight: 0, kQuantType: QuantizationType.F32, kOutputDim: 0, kInputDim: 0,
             vWeight: 0, vQuantType: QuantizationType.F32, vOutputDim: 0, vInputDim: 0,
-            oWeight: oProj, oQuantType: QuantizationType.F32,
+            oWeight: oProj, oQuantType: oProjQt,
             oOutputDim: hiddenSize, oInputDim: oInput,
             ffnNormWeight: ffnNorm,
             gateWeight: gatePtr, gateQuantType: gateQt, gateOutputDim: gateM, gateInputDim: gateK,
@@ -2461,6 +2545,7 @@ internal sealed class TransformerWeights : IDisposable
     /// for <c>ffn_up_exps</c>.</param>
     /// <param name="skipDownDequant">Per-bank override, sibling of <paramref name="skipGateDequant"/>
     /// for <c>ffn_down_exps</c>.</param>
+    /// <param name="skipSharedDequant">Override for the shared-expert F32 host dequant (#949); null follows <paramref name="skipF32Dequant"/>.</param>
     internal static unsafe MoeLayerWeights LoadDeepSeekMoeLayer(
         int layerIdx,
         GgufDataBase dataBase,
@@ -2471,7 +2556,8 @@ internal sealed class TransformerWeights : IDisposable
         bool skipRoutedF32Only = false,
         bool? skipGateDequant = null,
         bool? skipUpDequant = null,
-        bool? skipDownDequant = null)
+        bool? skipDownDequant = null,
+        bool? skipSharedDequant = null)
     {
         var moe = config.Moe
             ?? throw new InvalidOperationException("LoadDeepSeekMoeLayer called without Moe config.");
@@ -2513,7 +2599,7 @@ internal sealed class TransformerWeights : IDisposable
         // CanSkipMoeF32HostDequant was true. No numeric impact; whether to restore that
         // skip (e.g. thread a shared-expert bool through moeBankSkipSelector too) is a
         // separate decision, deliberately out of scope here.
-        bool skipSharedDequant = skipF32Dequant; // shared stays unless caller asks for full skip
+        bool skipSharedF32 = skipSharedDequant ?? skipF32Dequant; // shared stays unless caller asks for a skip (#949)
 
         // Per-bank overrides (#327) default to the combined decision above — this keeps
         // every existing caller's behavior byte-identical (all three still move together)
@@ -2565,7 +2651,7 @@ internal sealed class TransformerWeights : IDisposable
             // ~10 MB host RAM per layer (vs ~2.2 GB for routed experts). With skipRoutedF32Only
             // we still dequant shared so the CPU MoE kernel can use them directly without a
             // separate on-the-fly path for the (small) shared branch.
-            if (skipSharedDequant)
+            if (skipSharedF32)
             {
                 sharedGate = [(nint)0];
                 sharedUp = [(nint)0];

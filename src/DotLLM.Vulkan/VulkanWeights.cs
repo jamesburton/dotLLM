@@ -206,10 +206,22 @@ internal sealed class VulkanWeights : IDisposable
         // KV path — KvAProjWithMqa split row-wise on upload:
         //   KvALatentProj = first kvLoraRank rows  (→ kv latent bottleneck)
         //   KvAKPeProj    = last qkRopeHeadDim rows (→ MQA-shared rope-K)
-        public readonly VulkanDevice.Buffer KvALatentProj;
-        public readonly VulkanDevice.Buffer KvAKPeProj;
+        public readonly VulkanDevice.Buffer? KvALatentProj;
+        public readonly VulkanDevice.Buffer? KvAKPeProj;
         public readonly VulkanDevice.Buffer KvALayernormWeight;
-        public readonly VulkanDevice.Buffer KvBProj;
+        public readonly VulkanDevice.Buffer? KvBProj;
+
+        // ── Absorbed-MLA layout (#913). All null / default in the legacy expanded layout. ──
+        // Projections stay in their packed device quantization (the dense RecordMatmul router picks MMVQ / coopmat
+        // per type); KvAFull is the UNSPLIT kv_a_mqa [kvLoraRank + qkRope, hidden]. KBProj / VBProj are the
+        // llama.cpp pre-split up-projections, both Q8_0: KB = numHeads*kvLoraRank rows of qkNope, VB = numHeads*vHead
+        // rows of kvLoraRank (one contiguous per-head matrix after another).
+        public readonly bool Absorbed;
+        public readonly VulkanDevice.Buffer? KvAFull;
+        public readonly QuantizationType KvAFullQt;
+        public readonly QuantizationType QAQt, QBQt, QQt;
+        public readonly VulkanDevice.Buffer? KBProj;
+        public readonly VulkanDevice.Buffer? VBProj;
 
         // Hyperparameters carried for forward-path convenience.
         public readonly int NumHeads;
@@ -223,11 +235,19 @@ internal sealed class VulkanWeights : IDisposable
         public MlaLayerBuffers(
             VulkanDevice.Buffer? qAProj, VulkanDevice.Buffer? qALayernorm, VulkanDevice.Buffer? qBProj,
             VulkanDevice.Buffer? qProj,
-            VulkanDevice.Buffer kvALatentProj, VulkanDevice.Buffer kvAKPeProj,
-            VulkanDevice.Buffer kvALayernorm, VulkanDevice.Buffer kvBProj,
+            VulkanDevice.Buffer? kvALatentProj, VulkanDevice.Buffer? kvAKPeProj,
+            VulkanDevice.Buffer kvALayernorm, VulkanDevice.Buffer? kvBProj,
             int numHeads, int qkNopeHeadDim, int qkRopeHeadDim, int vHeadDim,
-            int qLoraRank, int kvLoraRank, int hiddenSize)
+            int qLoraRank, int kvLoraRank, int hiddenSize,
+            VulkanDevice.Buffer? kvAFull = null, QuantizationType kvAFullQt = QuantizationType.F32,
+            QuantizationType qAQt = QuantizationType.F32, QuantizationType qBQt = QuantizationType.F32,
+            QuantizationType qQt = QuantizationType.F32,
+            VulkanDevice.Buffer? kbProj = null, VulkanDevice.Buffer? vbProj = null)
         {
+            Absorbed = kbProj is not null;
+            KvAFull = kvAFull; KvAFullQt = kvAFullQt;
+            QAQt = qAQt; QBQt = qBQt; QQt = qQt;
+            KBProj = kbProj; VBProj = vbProj;
             QAProj = qAProj;
             QALayernormWeight = qALayernorm;
             QBProj = qBProj;
@@ -255,10 +275,13 @@ internal sealed class VulkanWeights : IDisposable
             QALayernormWeight?.Dispose();
             QBProj?.Dispose();
             QProj?.Dispose();
-            KvALatentProj.Dispose();
-            KvAKPeProj.Dispose();
+            KvALatentProj?.Dispose();
+            KvAKPeProj?.Dispose();
             KvALayernormWeight.Dispose();
-            KvBProj.Dispose();
+            KvBProj?.Dispose();
+            KvAFull?.Dispose();
+            KBProj?.Dispose();
+            VBProj?.Dispose();
         }
     }
 
@@ -600,6 +623,9 @@ internal sealed class VulkanWeights : IDisposable
     /// matching dequant shader instead of on the host (issue #147). Null (tests,
     /// legacy callers) falls back to the streamed CPU dequant.
     /// </param>
+    /// <param name="valuePad">
+    /// MiMo-V2: (K head dim, V head dim) when V is narrower than K; every layer's V projection is zero-row padded to the K head dim.
+    /// </param>
     /// <remarks>
     /// <para>
     /// Staging is a single bounded, persistently-mapped buffer
@@ -613,7 +639,8 @@ internal sealed class VulkanWeights : IDisposable
         VulkanDevice device, TransformerWeights weights, int numLayers,
         bool dequantToFp32 = false, int firstLayer = 0,
         bool skipTokenEmbed = false, bool skipOutputHead = false,
-        string? spvDir = null)
+        string? spvDir = null,
+        (int KHeadDim, int VHeadDim)? valuePad = null)
     {
         if (firstLayer < 0 || firstLayer + numLayers > weights.Layers.Length)
             throw new ArgumentOutOfRangeException(nameof(firstLayer),
@@ -622,6 +649,7 @@ internal sealed class VulkanWeights : IDisposable
         long totalBytes = 0;
         ResetUploadCounters();
         _residencyReport = new VulkanResidencyReport();
+        bool mlaAbsorbed = UseAbsorbedMla(weights, firstLayer, numLayers);
 
         // Bounded persistently-mapped staging (issue #147): sized to the largest single
         // upload but capped at VulkanStagingBuffer.MaxChunkBytes — larger tensors stream
@@ -719,6 +747,7 @@ internal sealed class VulkanWeights : IDisposable
             VulkanDevice.Buffer q, k, v;
             QuantizationType qDeviceQt, kDeviceQt, vDeviceQt;
             long qBytes, kBytes, vBytes;
+            int vPaddedRows = lw.VOutputDim;
             VulkanDevice.Buffer? qBias, kBias, vBias;
             if (lw.Mla is not null)
             {
@@ -752,6 +781,15 @@ internal sealed class VulkanWeights : IDisposable
                     vDeviceQt = QuantizationType.F32;
                     vBytes = 0;
                 }
+                else if (valuePad is { } vp && vp.VHeadDim != vp.KHeadDim)
+                {
+                    // MiMo-V2 (V head_dim 128 != K 192): each V head's rows are zero-padded to the K head dim at upload so the
+                    // projection produces a K-shaped V and the KV cache / attention kernels stay single-head-dim. Exact: a zero row
+                    // is an all-zero block in every packed format. The attention output's pad columns are compacted away before o_proj.
+                    v = UploadValueMatrixPadded(device, staging, lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim,
+                        vp.VHeadDim, vp.KHeadDim, dequantToFp32, $"blk.{firstLayer + i}.attn_v.weight",
+                        out vDeviceQt, out vBytes, out vPaddedRows);
+                }
                 else
                 {
                     v = UploadMatrix(device, staging, lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim,
@@ -768,7 +806,8 @@ internal sealed class VulkanWeights : IDisposable
             MlaLayerBuffers? mla = null;
             if (lw.Mla is not null)
             {
-                mla = UploadMlaLayer(device, staging, vecStaging, lw.Mla, weights.HiddenSize, out long mlaBytes);
+                mla = UploadMlaLayer(device, staging, vecStaging, lw.Mla, weights.HiddenSize,
+                    $"blk.{firstLayer + i}", mlaAbsorbed, out long mlaBytes);
                 totalBytes += mlaBytes;
             }
 
@@ -910,7 +949,7 @@ internal sealed class VulkanWeights : IDisposable
                 attnNorm,
                 q, qDeviceQt, lw.QOutputDim, lw.QInputDim,
                 k, kDeviceQt, lw.KOutputDim, lw.KInputDim,
-                v, vDeviceQt, lw.VOutputDim, lw.VInputDim,
+                v, vDeviceQt, vPaddedRows, lw.VInputDim,
                 o, oDeviceQt, lw.OOutputDim, lw.OInputDim,
                 qBias, kBias, vBias, oBias,
                 ffnNorm,
@@ -1588,6 +1627,46 @@ internal sealed class VulkanWeights : IDisposable
     /// upload below — the import is opportunistic, not load-bearing.
     /// </para>
     /// </remarks>
+    /// <summary>
+    /// Uploads the V projection of a model whose V head dim (<paramref name="vHeadDim"/>) is smaller than its K head dim
+    /// (<paramref name="kHeadDim"/>), inserting <c>kHeadDim - vHeadDim</c> all-zero rows after every V head so the output is
+    /// K-shaped. Packed formats only (a zero row of any block format is zero bytes); the padded copy goes through the staging
+    /// buffer, never a zero-copy import (the padded host buffer is freed here).
+    /// </summary>
+    private static unsafe VulkanDevice.Buffer UploadValueMatrixPadded(
+        VulkanDevice device, VulkanStagingBuffer staging,
+        nint srcPtr, QuantizationType qt, int outputDim, int inputDim, int vHeadDim, int kHeadDim,
+        bool dequantToFp32, string name, out QuantizationType deviceQuantType, out long uploadedBytes, out int paddedRows)
+    {
+        if (outputDim % vHeadDim != 0)
+            throw new InvalidDataException($"{name}: {outputDim} rows is not a multiple of the V head dim {vHeadDim}.");
+        QuantizationType keepQt = DeviceQuantTypeFor(qt, inputDim, dequantToFp32);
+        if (keepQt != qt)  // F32 / packed formats are verbatim row-copyable; a format that would be widened on upload is not
+            throw new NotSupportedException(
+                $"{name}: a V projection stored as {qt} (K={inputDim}) cannot be zero-row padded on the Vulkan backend (needs a format kept verbatim on device).");
+        int heads = outputDim / vHeadDim;
+        paddedRows = heads * kHeadDim;
+        long rowBytes = Dequantize.RowByteSize(inputDim, qt);
+        long bytes = rowBytes * paddedRows;
+        byte* host = (byte*)NativeMemory.AlignedAlloc((nuint)bytes, 64);
+        try
+        {
+            new Span<byte>(host, checked((int)bytes)).Clear();
+            for (int h = 0; h < heads; h++)
+                Buffer.MemoryCopy((byte*)srcPtr + (long)h * vHeadDim * rowBytes, host + (long)h * kHeadDim * rowBytes,
+                    vHeadDim * rowBytes, vHeadDim * rowBytes);
+            var buf = AllocateAndUploadPacked(device, staging, (nint)host, bytes);
+            deviceQuantType = keepQt;
+            uploadedBytes = bytes;
+            _residencyReport.Add(name, qt, keepQt, rowBytes * outputDim, bytes);
+            return buf;
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(host);
+        }
+    }
+
     private static unsafe VulkanDevice.Buffer UploadMatrix(
         VulkanDevice device, VulkanStagingBuffer staging,
         nint srcPtr, QuantizationType qt, int outputDim, int inputDim,
@@ -1724,9 +1803,10 @@ internal sealed class VulkanWeights : IDisposable
     /// </summary>
     private static MlaLayerBuffers UploadMlaLayer(
         VulkanDevice device, VulkanStagingBuffer staging, VulkanStagingBuffer vecStaging,
-        MlaLayerWeights mla, int hiddenSize, out long uploadedBytes)
+        MlaLayerWeights mla, int hiddenSize, string name, bool absorbed, out long uploadedBytes)
     {
         uploadedBytes = 0;
+        if (absorbed) return UploadMlaLayerAbsorbed(device, staging, vecStaging, mla, hiddenSize, name, out uploadedBytes);
         int qTotal = mla.NumHeads * (mla.QkNopeHeadDim + mla.QkRopeHeadDim);
         int kvBOut = mla.NumHeads * (mla.QkNopeHeadDim + mla.VHeadDim);
 
@@ -1767,6 +1847,164 @@ internal sealed class VulkanWeights : IDisposable
             kvALatent, kvAKPe, kvALayernorm, kvBProj,
             mla.NumHeads, mla.QkNopeHeadDim, mla.QkRopeHeadDim, mla.VHeadDim,
             mla.QLoraRank, mla.KvLoraRank, hiddenSize);
+    }
+
+    /// <summary>
+    /// True when this layer carries what the absorbed-MLA path needs (#913): the llama.cpp split <c>attn_k_b</c> /
+    /// <c>attn_v_b</c> pair as Q8_0 (the shaders read Q8_0 blocks directly) with the head layout the kernels are
+    /// compiled for (kvLoraRank 512, qkRope 64, qkNope and vHead multiples of 32 and at most 256).
+    /// </summary>
+    /// <summary>
+    /// <c>DOTLLM_VK_MLA_LEGACY=1</c> forces the pre-#913 expanded MLA path (F32-widened projections, expanded per-head
+    /// K/V cache). Kept as the same-binary control arm for A/B measurement and as the fallback for files the absorbed
+    /// path cannot take.
+    /// </summary>
+    /// <summary>
+    /// <c>DOTLLM_VK_SHARED_EXPERT_PACKED=0</c> restores the pre-#949 behaviour (shared-expert gate/up/down widened to F32
+    /// unless the Q8_0/Q4_K overlay applies): the same-binary control arm for A/B measurement.
+    /// </summary>
+    internal static bool SharedExpertPackedDisabled
+        => Environment.GetEnvironmentVariable("DOTLLM_VK_SHARED_EXPERT_PACKED") == "0";
+
+    /// <summary>
+    /// GGUF preflight (#949): true when every MLA+MoE layer's shared-expert gate/up/down will be kept packed on device, so the
+    /// loader may skip their host F32 dequant (~38 MB per layer). Mirrors <c>UploadMoeLayer</c>'s per-projection decision.
+    /// </summary>
+    internal static bool PlanSharedExpertsPacked(GgufFile gguf, ModelConfig config)
+    {
+        if (config.MlaConfig is null || config.Moe is null || SharedExpertPackedDisabled) return false;
+        var t = gguf.TensorsByName;
+        int hidden = config.HiddenSize;
+        int sharedI = config.Moe.SharedExpertIntermediateSize ?? 0;
+        bool any = false;
+        for (int i = 0; i < config.NumLayers; i++)
+        {
+            if (!t.TryGetValue($"blk.{i}.ffn_gate_shexp.weight", out var g)) continue;
+            if (!t.TryGetValue($"blk.{i}.ffn_up_shexp.weight", out var u)
+                || !t.TryGetValue($"blk.{i}.ffn_down_shexp.weight", out var d)) return false;
+            if (sharedI <= 0) return false;
+            if (g.QuantizationType == QuantizationType.F32 || DeviceQuantTypeFor(g.QuantizationType, hidden, false) != g.QuantizationType) return false;
+            if (u.QuantizationType == QuantizationType.F32 || DeviceQuantTypeFor(u.QuantizationType, hidden, false) != u.QuantizationType) return false;
+            if (d.QuantizationType == QuantizationType.F32 || DeviceQuantTypeFor(d.QuantizationType, sharedI, false) != d.QuantizationType) return false;
+            any = true;
+        }
+        return any;
+    }
+
+    internal static bool MlaLegacyForced
+        => Environment.GetEnvironmentVariable("DOTLLM_VK_MLA_LEGACY") == "1";
+
+    /// <summary>
+    /// Decides, once per model, whether the absorbed-MLA path is used: no legacy override, and EVERY MLA layer in
+    /// <c>[firstLayer, firstLayer+numLayers)</c> supports it. Throws when the host F32 views were skipped (GPU-only
+    /// load) but the layers cannot run absorbed, since the legacy path would then read null pointers.
+    /// </summary>
+    internal static bool UseAbsorbedMla(TransformerWeights weights, int firstLayer, int numLayers)
+    {
+        bool any = false, all = true, skipped = false;
+        for (int i = 0; i < numLayers; i++)
+        {
+            var m = weights.Layers[firstLayer + i].Mla;
+            if (m is null) continue;
+            any = true;
+            all &= MlaLayerSupportsAbsorbed(m);
+            skipped |= m.HostF32Skipped;
+        }
+        bool absorbed = any && all && !MlaLegacyForced;
+        if (any && skipped && !absorbed)
+            throw new NotSupportedException(
+                "The MLA weights were loaded GPU-only (host F32 copies skipped) but the absorbed-MLA path cannot take them "
+                + "(needs Q8_0 attn_k_b/attn_v_b, kv_lora_rank 512, qk_rope 64) or DOTLLM_VK_MLA_LEGACY=1 is set.");
+        return absorbed;
+    }
+
+    /// <summary>
+    /// GGUF preflight for the absorbed-MLA path (#913), run BEFORE the CPU weight load so it can skip the host F32
+    /// dequant of every MLA projection: true when no legacy override is set and EVERY layer ships the split
+    /// <c>attn_k_b</c>/<c>attn_v_b</c> pair as Q8_0 with the compiled head layout.
+    /// </summary>
+    internal static bool PlanMlaAbsorbed(GgufFile gguf, ModelConfig config)
+    {
+        var mla = config.MlaConfig;
+        if (mla is null || MlaLegacyForced) return false;
+        if (mla.KvLoraRank != 512 || mla.QkRopeHeadDim != 64) return false;
+        if (mla.QkNopeHeadDim % 32 != 0 || mla.QkNopeHeadDim > 256 || mla.VHeadDim % 32 != 0 || mla.VHeadDim > 256) return false;
+        var t = gguf.TensorsByName;
+        for (int i = 0; i < config.NumLayers; i++)
+        {
+            if (!t.TryGetValue($"blk.{i}.attn_k_b.weight", out var kb) || kb.QuantizationType != QuantizationType.Q8_0) return false;
+            if (!t.TryGetValue($"blk.{i}.attn_v_b.weight", out var vb) || vb.QuantizationType != QuantizationType.Q8_0) return false;
+        }
+        return true;
+    }
+
+    internal static bool MlaLayerSupportsAbsorbed(MlaLayerWeights m)
+        => m.KBRaw != 0 && m.VBRaw != 0
+           && m.KBRawQt == QuantizationType.Q8_0 && m.VBRawQt == QuantizationType.Q8_0
+           && m.KvLoraRank == 512 && m.QkRopeHeadDim == 64
+           && m.QkNopeHeadDim % 32 == 0 && m.QkNopeHeadDim <= 256
+           && m.VHeadDim % 32 == 0 && m.VHeadDim <= 256
+           && m.NumHeads > 0;
+
+    /// <summary>
+    /// Absorbed-MLA upload (#913): every projection keeps its GGUF packed quantization (zero-copy import when the
+    /// driver allows it); nothing is widened to F32 unless no packed kernel exists, and no host F32 copy is read.
+    /// kv_a_mqa stays one fused matrix.
+    /// </summary>
+    private static MlaLayerBuffers UploadMlaLayerAbsorbed(
+        VulkanDevice device, VulkanStagingBuffer staging, VulkanStagingBuffer vecStaging,
+        MlaLayerWeights mla, int hiddenSize, string name, out long uploadedBytes)
+    {
+        uploadedBytes = 0;
+        int qTotal = mla.NumHeads * (mla.QkNopeHeadDim + mla.QkRopeHeadDim);
+        // Raw view when the loader kept one (always, for GGUF); the F32 dequant otherwise.
+        static (nint Ptr, QuantizationType Qt) Pick(nint raw, QuantizationType rawQt, nint f32)
+            => raw != 0 ? (raw, rawQt) : (f32, QuantizationType.F32);
+
+        VulkanDevice.Buffer? qA = null, qB = null, qMono = null, qALayernorm = null;
+        QuantizationType qAQt = QuantizationType.F32, qBQt = QuantizationType.F32, qQt = QuantizationType.F32;
+        if (mla.QLoraRank > 0)
+        {
+            var (pa, ta) = Pick(mla.QAProjRaw, mla.QAProjRawQt, mla.QAProj);
+            qA = UploadMatrix(device, staging, pa, ta, mla.QLoraRank, hiddenSize, false,
+                $"{name}.attn_q_a.weight", out qAQt, out long b1);
+            var (pb, tb) = Pick(mla.QBProjRaw, mla.QBProjRawQt, mla.QBProj);
+            qB = UploadMatrix(device, staging, pb, tb, qTotal, mla.QLoraRank, false,
+                $"{name}.attn_q_b.weight", out qBQt, out long b2);
+            qALayernorm = UploadNormVec(device, vecStaging, mla.QALayernormWeight!);
+            uploadedBytes += b1 + b2 + (long)mla.QLoraRank * sizeof(float);
+        }
+        else
+        {
+            var (pq, tq) = Pick(mla.QProjRaw, mla.QProjRawQt, mla.QProj);
+            qMono = UploadMatrix(device, staging, pq, tq, qTotal, hiddenSize, false,
+                $"{name}.attn_q.weight", out qQt, out long b3);
+            uploadedBytes += b3;
+        }
+
+        var (pk, tk) = Pick(mla.KvAProjWithMqaRaw, mla.KvAProjWithMqaRawQt, mla.KvAProjWithMqa);
+        var kvA = UploadMatrix(device, staging, pk, tk, mla.KvLoraRank + mla.QkRopeHeadDim, hiddenSize, false,
+            $"{name}.attn_kv_a_mqa.weight", out var kvAQt, out long b4);
+        uploadedBytes += b4;
+        var kvALayernorm = UploadNormVec(device, vecStaging, mla.KvALayernormWeight);
+        uploadedBytes += (long)mla.KvLoraRank * sizeof(float);
+
+        // k_b: numHeads*kvLoraRank rows x qkNope ; v_b: numHeads*vHead rows x kvLoraRank (both Q8_0, checked by the caller).
+        var kb = UploadMatrix(device, staging, mla.KBRaw, QuantizationType.Q8_0, mla.NumHeads * mla.KvLoraRank,
+            mla.QkNopeHeadDim, false, $"{name}.attn_k_b.weight", out var kbQt, out long b5);
+        var vb = UploadMatrix(device, staging, mla.VBRaw, QuantizationType.Q8_0, mla.NumHeads * mla.VHeadDim,
+            mla.KvLoraRank, false, $"{name}.attn_v_b.weight", out var vbQt, out long b6);
+        if (kbQt != QuantizationType.Q8_0 || vbQt != QuantizationType.Q8_0)
+            throw new InvalidOperationException(
+                $"{name}: absorbed MLA k_b/v_b must stay Q8_0 on device (got {kbQt}/{vbQt}).");
+        uploadedBytes += b5 + b6;
+
+        return new MlaLayerBuffers(
+            qA, qALayernorm, qB, qMono,
+            null, null, kvALayernorm, null,
+            mla.NumHeads, mla.QkNopeHeadDim, mla.QkRopeHeadDim, mla.VHeadDim,
+            mla.QLoraRank, mla.KvLoraRank, hiddenSize,
+            kvAFull: kvA, kvAFullQt: kvAQt, qAQt: qAQt, qBQt: qBQt, qQt: qQt, kbProj: kb, vbProj: vb);
     }
 
     /// <summary>
@@ -1830,6 +2068,21 @@ internal sealed class VulkanWeights : IDisposable
             ? MoeOverlayUploadBytes(moe.SharedExpertProjQuantTypeOverlay, hidden, sharedI)
             : 0;
         long perSharedW3Bytes = perSharedW1Bytes;
+
+        // #949: DeepSeek/GLM shared experts have no overlay (the production loader never sets one), so they used to
+        // widen to F32 (GLM: 3 x 2048 x 1536 x 4 B x 46 layers = 1.7 GB read per decoded token, ~12 ms). Keep each
+        // projection in its own packed GGUF format whenever the dense router has a kernel for it; the shared-expert
+        // dispatch already goes through RecordMatmul with the per-projection device quant type.
+        static QuantizationType RawKeepQt(bool enabled, nint[] ptrs, int n, QuantizationType rawQt, int contraction)
+        {
+            if (!enabled || rawQt == QuantizationType.F32 || ptrs.Length != n) return QuantizationType.F32;
+            foreach (var q in ptrs) if (q == 0) return QuantizationType.F32;
+            return DeviceQuantTypeFor(rawQt, contraction, dequantToFp32: false) == rawQt ? rawQt : QuantizationType.F32;
+        }
+        bool packedSharedOn = hasShared && !SharedExpertPackedDisabled;
+        QuantizationType rawSharedW1 = sharedW1KeepQuant ? QuantizationType.F32 : RawKeepQt(packedSharedOn, moe.SharedGateRaw, numShared, moe.SharedGateRawQt, hidden);
+        QuantizationType rawSharedW3 = sharedW3KeepQuant ? QuantizationType.F32 : RawKeepQt(packedSharedOn, moe.SharedUpRaw, numShared, moe.SharedUpRawQt, hidden);
+        QuantizationType rawSharedW2 = sharedW2KeepQuant ? QuantizationType.F32 : RawKeepQt(packedSharedOn, moe.SharedDownRaw, numShared, moe.SharedDownRawQt, sharedI);
 
         // Every upload streams through the shared bounded staging buffer — one
         // expert slab (or a chunk of it) at a time; no per-layer staging alloc.
@@ -1895,32 +2148,62 @@ internal sealed class VulkanWeights : IDisposable
             sharedW1 = new VulkanDevice.Buffer[numShared];
             sharedW2 = new VulkanDevice.Buffer[numShared];
             sharedW3 = new VulkanDevice.Buffer[numShared];
-            sharedW1Qt = sharedW1KeepQuant ? moe.SharedExpertProjQuantTypeOverlay : QuantizationType.F32;
-            sharedW2Qt = sharedW2KeepQuant ? moe.SharedExpertProjQuantTypeOverlay : QuantizationType.F32;
-            sharedW3Qt = sharedW3KeepQuant ? moe.SharedExpertProjQuantTypeOverlay : QuantizationType.F32;
+            sharedW1Qt = sharedW1KeepQuant ? moe.SharedExpertProjQuantTypeOverlay : rawSharedW1;
+            sharedW2Qt = sharedW2KeepQuant ? moe.SharedExpertProjQuantTypeOverlay : rawSharedW2;
+            sharedW3Qt = sharedW3KeepQuant ? moe.SharedExpertProjQuantTypeOverlay : rawSharedW3;
 
             for (int s = 0; s < numShared; s++)
             {
-                sharedW1[s] = device.AllocateDeviceLocal(perSharedW1Bytes);
-                sharedW2[s] = device.AllocateDeviceLocal(perSharedW2Bytes);
-                sharedW3[s] = device.AllocateDeviceLocal(perSharedW3Bytes);
-
-                if (sharedW1KeepQuant)
-                    UploadRawBytes(device, stage, moe.SharedGateProjQ8Ptrs![s], perSharedW1Bytes, sharedW1[s]);
+                // Packed GGUF views go through UploadMatrix (zero-copy import / padded staging upload + residency report);
+                // overlay and F32 modes keep the original pre-sized buffers.
+                if (rawSharedW1 != QuantizationType.F32)
+                {
+                    sharedW1[s] = UploadMatrix(device, stage, moe.SharedGateRaw[s], moe.SharedGateRawQt, sharedI, hidden, false,
+                        $"{namePrefix}.ffn_gate_shexp.weight", out _, out long b1);
+                    uploadedBytes += b1;
+                }
                 else
-                    UploadExpertBankSlot(device, stage, moe.SharedGateProj[s], perSharedW1Bytes, sharedW1[s], 0);
+                {
+                    sharedW1[s] = device.AllocateDeviceLocal(perSharedW1Bytes);
+                    if (sharedW1KeepQuant)
+                        UploadRawBytes(device, stage, moe.SharedGateProjQ8Ptrs![s], perSharedW1Bytes, sharedW1[s]);
+                    else
+                        UploadExpertBankSlot(device, stage, moe.SharedGateProj[s], perSharedW1Bytes, sharedW1[s], 0);
+                    uploadedBytes += perSharedW1Bytes;
+                }
 
-                if (sharedW2KeepQuant)
-                    UploadRawBytes(device, stage, moe.SharedDownProjQ8Ptrs![s], perSharedW2Bytes, sharedW2[s]);
+                if (rawSharedW2 != QuantizationType.F32)
+                {
+                    sharedW2[s] = UploadMatrix(device, stage, moe.SharedDownRaw[s], moe.SharedDownRawQt, hidden, sharedI, false,
+                        $"{namePrefix}.ffn_down_shexp.weight", out _, out long b2);
+                    uploadedBytes += b2;
+                }
                 else
-                    UploadExpertBankSlot(device, stage, moe.SharedDownProj[s], perSharedW2Bytes, sharedW2[s], 0);
+                {
+                    sharedW2[s] = device.AllocateDeviceLocal(perSharedW2Bytes);
+                    if (sharedW2KeepQuant)
+                        UploadRawBytes(device, stage, moe.SharedDownProjQ8Ptrs![s], perSharedW2Bytes, sharedW2[s]);
+                    else
+                        UploadExpertBankSlot(device, stage, moe.SharedDownProj[s], perSharedW2Bytes, sharedW2[s], 0);
+                    uploadedBytes += perSharedW2Bytes;
+                }
 
-                if (sharedW3KeepQuant)
-                    UploadRawBytes(device, stage, moe.SharedUpProjQ8Ptrs![s], perSharedW3Bytes, sharedW3[s]);
+                if (rawSharedW3 != QuantizationType.F32)
+                {
+                    sharedW3[s] = UploadMatrix(device, stage, moe.SharedUpRaw[s], moe.SharedUpRawQt, sharedI, hidden, false,
+                        $"{namePrefix}.ffn_up_shexp.weight", out _, out long b3);
+                    uploadedBytes += b3;
+                }
                 else
-                    UploadExpertBankSlot(device, stage, moe.SharedUpProj[s], perSharedW3Bytes, sharedW3[s], 0);
+                {
+                    sharedW3[s] = device.AllocateDeviceLocal(perSharedW3Bytes);
+                    if (sharedW3KeepQuant)
+                        UploadRawBytes(device, stage, moe.SharedUpProjQ8Ptrs![s], perSharedW3Bytes, sharedW3[s]);
+                    else
+                        UploadExpertBankSlot(device, stage, moe.SharedUpProj[s], perSharedW3Bytes, sharedW3[s], 0);
+                    uploadedBytes += perSharedW3Bytes;
+                }
             }
-            uploadedBytes += (long)numShared * (perSharedW1Bytes + perSharedW2Bytes + perSharedW3Bytes);
         }
 
         // Optional Qwen1.5-MoE per-token sigmoid gate. Uploaded as a [1, hidden] device
@@ -2369,6 +2652,14 @@ internal sealed class VulkanWeights : IDisposable
             && rawM == expectedM && rawK == expectedK && (expectedK % 32) == 0)
             return QuantizationType.MXFP4;
 
+        // MiMo-V2 BPW2.0 (#955): IQ-family routed banks (IQ1_M gate/up, IQ2_XXS/IQ2_XS/IQ3_S down) stay packed and are read by the indexed
+        // IQ MMVQ decode kernels and the grouped IQ coopmat prefill kernels (the #823 kernels, now wired into the generic MoE path).
+        // The MMVQ kernels need integer-dot-product; without it the bank would widen to F32 (loud: ValidateRoutedBankF32Source).
+        if (raw != 0 && device.HasIntegerDotProduct && rawM == expectedM && rawK == expectedK
+            && MoeIqFormats.FromQuantizationType(qt) is { } iqFormat
+            && (expectedK % MoeIqFormats.Describe(iqFormat).GroupSize) == 0 && (expectedK % 256) == 0)
+            return qt;
+
         // Strategy C path: keep routed F16 expert banks raw only when the
         // coopmat grouped matmul can consume them. Otherwise upload F32 so
         // the existing indexed path remains the fallback.
@@ -2779,6 +3070,9 @@ internal sealed class VulkanWeights : IDisposable
             return Dequantize.RowByteSize(contractionDim, QuantizationType.Q6_K) * outputDim;
         if (qt == QuantizationType.MXFP4 && (contractionDim % 32) == 0)
             return Dequantize.RowByteSize(contractionDim, QuantizationType.MXFP4) * outputDim;
+        if (MoeIqFormats.FromQuantizationType(qt) is { } iqf && (contractionDim % 256) == 0
+            && (contractionDim % MoeIqFormats.Describe(iqf).GroupSize) == 0)
+            return Dequantize.RowByteSize(contractionDim, qt) * outputDim;
         if (MoeOverlayKeepsF16(qt, contractionDim))
             return Dequantize.RowByteSize(contractionDim, QuantizationType.F16) * outputDim;
         if (MoeOverlayKeepsBf16(qt, contractionDim))

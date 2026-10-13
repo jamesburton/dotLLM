@@ -454,6 +454,17 @@ public enum Architecture
     Qwen4Exp,
 
     /// <summary>
+    /// Xiaomi MiMo-V2 / V2.5 / V2.6-Flash (llama.cpp <c>mimo2</c>, HF <c>MiMoV2ForCausalLM</c>): plain GQA attention + MoE.
+    /// Per-layer global/sliding-window mix (<c>hybrid_layer_pattern</c>; window 128 with learned per-head attention sinks on
+    /// the sliding layers only), K head_dim 192 but V head_dim 128 (<see cref="DotLLM.Core.Models.ModelConfig.ValueHeadDim"/>),
+    /// partial NEOX RoPE (first 64 dims; theta 1e7 global / 1e4 sliding), V scaled by 0.707
+    /// (<see cref="DotLLM.Core.Models.ModelConfig.AttentionValueScale"/>), fused QKV, a dense first layer then
+    /// sigmoid + selection-bias top-8 MoE with no shared expert. Trailing <c>nextn_predict_layers</c> MTP blocks are
+    /// not part of the trunk. See issues #935 / #936.
+    /// </summary>
+    MiMoV2,
+
+    /// <summary>
     /// Gemma 4 MTP drafter model (llama.cpp GGUF arch <c>gemma4-assistant</c>). A
     /// standalone 4-layer mini-transformer (78M params for E4B, ~407M for larger
     /// variants) that drafts speculative tokens for the <see cref="Gemma4"/> trunk

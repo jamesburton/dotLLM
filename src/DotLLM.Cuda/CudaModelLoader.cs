@@ -101,6 +101,9 @@ public static class CudaModelLoader
             case Architecture.Qwen4Exp:
                 throw new NotSupportedException(Qwen4ExpConfig.UnsupportedMessage("CUDA"));
 
+            case Architecture.MiMoV2:
+                throw new NotSupportedException(ModelConfig.MiMoV2UnsupportedMessage("CUDA"));
+
             case Architecture.NemotronHMoe:
                 throw new NotSupportedException(
                     "nemotron_h_moe (Nemotron 3.5 Lightning) is recognized but not yet runnable on "

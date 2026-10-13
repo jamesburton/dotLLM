@@ -480,6 +480,7 @@ public static unsafe partial class MatMul
                 case QuantizationType.IQ2_S:
                 case QuantizationType.IQ3_XXS:
                 case QuantizationType.IQ3_S:
+                case QuantizationType.IQ1_M:
                 case QuantizationType.IQ1_S:
                     GemvIQCodebook(qt, weights, input, result, m, k, pool); break;
                 case QuantizationType.Q4_K: GemvQ4_K(weights, input, result, m, k, pool); break;

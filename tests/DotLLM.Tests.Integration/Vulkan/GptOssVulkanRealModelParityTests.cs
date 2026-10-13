@@ -121,8 +121,13 @@ public sealed class GptOssVulkanRealModelParityTests
             var k = vk.GptOssKernels!;
             _output.WriteLine($"dispatches: sinks={k.SinkAttentionDispatches} swigluOai={k.SwiGluOaiDispatches} "
                 + $"expertBias={k.ExpertBiasDispatches} rawTopK={k.RawTopKDispatches} mxfp4={k.Mxfp4MatmulDispatches} yarn={k.RopeYarnDispatches}");
-            Assert.True(k.SinkAttentionDispatches > 0 && k.SwiGluOaiDispatches > 0 && k.ExpertBiasDispatches > 0
-                && k.RawTopKDispatches > 0 && k.Mxfp4MatmulDispatches > 0 && k.RopeYarnDispatches > 0,
+            // Since #912 the decode-sized MoE rows run the indexed MXFP4 MMVQ arm (bias folded into its epilogue, SwiGLU fused with the down-input quantize)
+            // and rows >= the grouped gate run the grouped GEMM (bias in its epilogue), so the standalone scalar-path counters (mxfp4 / expertBias / swigluOai)
+            // are only a subset of the evidence: a feature counts as live if ANY of its implementations dispatched.
+            bool moeArm = vk.GenericMoeMmvqLayerCount > 0 || vk.GroupedMoeMxfp4DispatchCount > 0;
+            _output.WriteLine($"mmvq layers={vk.GenericMoeMmvqLayerCount} grouped mxfp4 layers={vk.GroupedMoeMxfp4DispatchCount}");
+            Assert.True(k.SinkAttentionDispatches > 0 && (k.SwiGluOaiDispatches > 0 || moeArm) && (k.ExpertBiasDispatches > 0 || moeArm)
+                && k.RawTopKDispatches > 0 && (k.Mxfp4MatmulDispatches > 0 || moeArm) && k.RopeYarnDispatches > 0,
                 "a gpt-oss kernel never dispatched");
 
             baselineLong = PrefillRow(vk, config.VocabSize, promptIds[2]);
@@ -196,8 +201,8 @@ public sealed class GptOssVulkanRealModelParityTests
             int before = vk.GroupedMoeDispatchCount, beforeMx = vk.GroupedMoeMxfp4DispatchCount;
             float[] grouped = PrefillRow(vk, config.VocabSize, promptIds[p]);
             int groupedLayers = vk.GroupedMoeDispatchCount - before;
-            // every gpt-oss layer is MoE; prompts shorter than the 16-token gate (prompt 0) keep the scalar path by design.
-            int expectLayers = promptIds[p].Length >= 16 ? config.NumLayers : 0;
+            // every gpt-oss layer is MoE; prompts shorter than the grouped gate (prompt 0) run the MMVQ arm by design (#912).
+            int expectLayers = promptIds[p].Length >= vk.EffGroupedMoeMinTokens ? config.NumLayers : 0;
             Assert.Equal(expectLayers, groupedLayers);
             Assert.Equal(groupedLayers, vk.GroupedMoeMxfp4DispatchCount - beforeMx);
 
@@ -214,7 +219,7 @@ public sealed class GptOssVulkanRealModelParityTests
             _output.WriteLine($"prompt {p} ({promptIds[p].Length} tok): grouped layers={groupedLayers}; rms(grouped-scalar)={rmsGS:F4} (logit rms {Rms(scalar, new float[scalar.Length]):F3}); "
                 + $"argmax grouped={ArgMax(grouped)} scalar={ArgMax(scalar)}{cpuNote}");
             Assert.Equal(ArgMax(scalar), ArgMax(grouped));
-            if (expectLayers == 0) Assert.Equal(0.0, rmsGS);                    // scalar path both times: bit-identical
+            if (expectLayers == 0) Assert.Equal(0.0, rmsGS);                    // same (non-grouped) path both times: bit-identical
             Assert.True(rmsGS < 0.05 * Rms(scalar, new float[scalar.Length]) + 0.05, $"grouped vs scalar logit rms {rmsGS} exceeds the F16-operand envelope");
             if (cpuRefs is not null)
                 Assert.True(Rms(grouped, cpuRefs[p].PrefillLogits) < Rms(scalar, cpuRefs[p].PrefillLogits) * 1.5 + 0.05, "grouped path is further from CPU than the scalar path by more than noise");

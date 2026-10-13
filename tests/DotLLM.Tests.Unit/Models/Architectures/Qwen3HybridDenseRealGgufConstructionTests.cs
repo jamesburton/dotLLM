@@ -8,7 +8,7 @@ namespace DotLLM.Tests.Unit.Models.Architectures;
 
 /// <summary>
 /// Real-weight construction smoke test for <see cref="Qwen3HybridDenseTransformerModel"/>
-/// against PrismML's actual <c>Ternary-Bonsai-27B-Q2_0.gguf</c> (issue #157). Confirms the
+/// against PrismML's actual <c>Ternary-Bonsai-2-27B-PQ2_0.gguf</c> (issue #157). Confirms the
 /// full loader path — GGUF parsing, config extraction (<c>qwen35</c> → dense GDN/attention
 /// hybrid layout), per-layer weight loading (GDN, full-attention, and dense FFN tensor
 /// lookups) — completes without throwing on the real 27B checkpoint. Does NOT run a forward
@@ -17,7 +17,7 @@ namespace DotLLM.Tests.Unit.Models.Architectures;
 public sealed class Qwen3HybridDenseRealGgufConstructionTests
 {
     private const string ModelPathEnvVar = "DOTLLM_BONSAI_PQ2_0_GGUF";
-    private const string FileName = "Ternary-Bonsai-27B-Q2_0.gguf";
+    private const string FileName = "Ternary-Bonsai-2-27B-PQ2_0.gguf";
 
     [SkippableFact]
     public void LoadFromGguf_RealBonsai27B_ConstructsWithoutThrowing()
@@ -25,7 +25,7 @@ public sealed class Qwen3HybridDenseRealGgufConstructionTests
         string? path = ResolveFixturePath();
         Skip.If(path is null,
             $"Bonsai PQ2_0 GGUF fixture not found. Set {ModelPathEnvVar}, or place {FileName} under "
-            + "~/.dotllm/models/PrismML/Ternary-Bonsai-27B-GGUF/ or ~/.dotllm/test-cache/PrismML/Ternary-Bonsai-27B-GGUF/.");
+            + "~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/ or ~/.dotllm/test-cache/prism-ml/Ternary-Bonsai-2-27B-gguf/.");
 
         using var gguf = GgufFile.Open(path!);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
@@ -56,8 +56,8 @@ public sealed class Qwen3HybridDenseRealGgufConstructionTests
         string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         string[] candidates =
         [
-            Path.Combine(home, ".dotllm", "models", "PrismML", "Ternary-Bonsai-27B-GGUF", FileName),
-            Path.Combine(home, ".dotllm", "test-cache", "PrismML", "Ternary-Bonsai-27B-GGUF", FileName),
+            Path.Combine(home, ".dotllm", "models", "prism-ml", "Ternary-Bonsai-2-27B-gguf", FileName),
+            Path.Combine(home, ".dotllm", "test-cache", "prism-ml", "Ternary-Bonsai-2-27B-gguf", FileName),
         ];
         foreach (string candidate in candidates)
             if (File.Exists(candidate))

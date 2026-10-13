@@ -925,6 +925,7 @@ public static unsafe partial class MoeSwiGluMlp
             case QuantizationType.IQ2_S:
             case QuantizationType.IQ3_XXS:
             case QuantizationType.IQ3_S:
+            case QuantizationType.IQ1_M:
             case QuantizationType.IQ1_S:
             case QuantizationType.Q4_K:
             case QuantizationType.Q5_K:
@@ -969,6 +970,7 @@ public static unsafe partial class MoeSwiGluMlp
             case QuantizationType.IQ2_S:
             case QuantizationType.IQ3_XXS:
             case QuantizationType.IQ3_S:
+            case QuantizationType.IQ1_M:
             case QuantizationType.IQ1_S:
             case QuantizationType.Q4_K:
             case QuantizationType.Q5_K:
@@ -981,6 +983,9 @@ public static unsafe partial class MoeSwiGluMlp
                 }
         }
     }
+
+    /// <summary>IQ1_M routed experts use the packed x Q8_K dot (default). <c>DOTLLM_CPU_IQ1M_PACKED=0</c> falls back to dequantize-per-row (A/B baseline).</summary>
+    public static bool Iq1MPackedEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_CPU_IQ1M_PACKED") != "0";
 
     /// <summary>
     /// Diagnostic (#873): when true every quantized expert GEMM dequantizes the weights to F32 and dots them with the UNQUANTIZED F32
@@ -1002,6 +1007,12 @@ public static unsafe partial class MoeSwiGluMlp
         QuantizationType qt, nint weights, float* b, float* c,
         int m, int k, int n, byte* preQuantizedInput, ComputeThreadPool? pool)
     {
+        // A/B switch for the IQ1_M packed arm (#958): DOTLLM_CPU_IQ1M_PACKED=0 restores the generic dequant-per-row path.
+        if (qt == QuantizationType.IQ1_M && !Iq1MPackedEnabled)
+        {
+            MatMul.GemmDequantRows((byte*)weights, qt, b, c, m, k, n, pool);
+            return;
+        }
         if (DiagF32Activations && qt is not (QuantizationType.F32 or QuantizationType.F16))
         {
             MatMul.GemmDequantRows((byte*)weights, qt, b, c, m, k, n, pool);
@@ -1053,6 +1064,7 @@ public static unsafe partial class MoeSwiGluMlp
             case QuantizationType.IQ2_S:
             case QuantizationType.IQ3_XXS:
             case QuantizationType.IQ3_S:
+            case QuantizationType.IQ1_M:
             case QuantizationType.IQ1_S:
                 MatMul.GemmIQCodebook(qt, (byte*)weights, b, c, m, k, n, pool, preQuantizedInput);
                 return;
@@ -1073,6 +1085,11 @@ public static unsafe partial class MoeSwiGluMlp
                     MatMul.GemmQ6_K((byte*)weights, b, c, m, k, n, pool, preQuantizedInput);
                 else
                     MatMul.GemmQ6_K((byte*)weights, b, c, m, k, n, preQuantizedInput);
+                return;
+            case QuantizationType.MXFP4:
+                // SIMD pshufb row dot against the F32 activations (no activation quantisation, same maths as the dequant fallback),
+                // batch-invariant by construction (see GemmMxfp4). The generic dequant fallback below was ~3 s/token on MiMo-V2 (#935).
+                MatMul.GemmMxfp4((byte*)weights, b, c, m, k, n, pool);
                 return;
             default:
                 // Fallback for quant types without a direct kernel (Q4_0/Q4_1/Q5_1, IQ*, BF16).

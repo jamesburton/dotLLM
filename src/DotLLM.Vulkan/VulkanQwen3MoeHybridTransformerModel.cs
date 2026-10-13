@@ -2006,6 +2006,14 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             seqLen: seqLen, numExperts: numE, k: topK, normTopKProb: moeW.NormTopKProb);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("topk");
+        // #939 expert tiering: the host makes the selected experts resident (ends this command buffer, loads misses, reopens one) and rewrites the ids
+        // as slot numbers; the expert kernels below then bound-check against the SLOT count. Null tier (resident, the default) records nothing extra.
+        if (moeW.Tier is { } tier)
+        {
+            if (seqLen != 1) throw new NotSupportedException("Tiered routed experts support single-row forwards only (prototype, #939).");
+            cmdBuf = tier.AfterTopk(moeW.TierLayer, cmdBuf, _state.MoeTopkIndices);
+            numE = moeW.BankExperts;
+        }
 
         // Issue #637: prefill batches group the routed rows by expert and run each expert's weights through a coopmat GEMM once per
         // 16-row tile (the indexed kernels below re-read an expert's weights for every routed row). Resident Q4_K gate/up + Q5_K/Q6_K down only (UD-Q4_K_M mixes both down types).
@@ -2270,6 +2278,14 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         _kernels.SwiGlu.Record(cmdBuf, _state.MoeSharedGate, _state.MoeSharedUp, _state.MoeSharedSilu, n: sharedI);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("topk");
+        // #939 expert tiering: the host makes the selected experts resident (ends this command buffer, loads misses, reopens one) and rewrites the ids
+        // as slot numbers; the expert kernels below then bound-check against the SLOT count. Null tier (resident, the default) records nothing extra.
+        if (moeW.Tier is { } tier)
+        {
+            if (1 != 1) throw new NotSupportedException("Tiered routed experts support single-row forwards only (prototype, #939).");
+            cmdBuf = tier.AfterTopk(moeW.TierLayer, cmdBuf, _state.MoeTopkIndices);
+            numE = moeW.BankExperts;
+        }
 
         // Phase 3: routed gate/up + shared down. The multi-row variant (2 output rows per workgroup) is the measured decode win (#885).
         bool mr = EffMoeMrMinRows > 0 && 1 >= EffMoeMrMinRows && SmallRowGemvEnabled;   // one decode row

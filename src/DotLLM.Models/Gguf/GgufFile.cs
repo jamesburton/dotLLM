@@ -168,6 +168,20 @@ public sealed class GgufFile : IDisposable
         return TensorDataPointer(in tensor);
     }
 
+    /// <summary>
+    /// Where the named tensor's bytes live ON DISK: the owning shard's path and the absolute byte offset from the start of that file
+    /// (shard data-section offset + the descriptor's data offset). For readers that bypass the memory mapping (expert tiering, #939:
+    /// unbuffered overlapped reads straight into GPU-visible memory) - no mapped page is touched.
+    /// </summary>
+    /// <exception cref="KeyNotFoundException">No tensor of that name exists.</exception>
+    public (string Path, long FileOffset) GetTensorFileLocation(string tensorName)
+    {
+        if (!TensorsByName.TryGetValue(tensorName, out var tensor))
+            throw new KeyNotFoundException($"GGUF tensor '{tensorName}' not found.");
+        int shard = _shardByTensor is null ? 0 : _shardByTensor[tensorName];
+        return (_shards[shard].Path, _shards[shard].DataSectionOffset + (long)tensor.DataOffset);
+    }
+
     /// <summary>Zero-based index of the shard that stores the named tensor (always 0 for an ordinary file).</summary>
     /// <exception cref="KeyNotFoundException">No tensor of that name exists.</exception>
     public int GetTensorShardIndex(string tensorName)

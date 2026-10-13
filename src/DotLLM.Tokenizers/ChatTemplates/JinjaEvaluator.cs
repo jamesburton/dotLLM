@@ -107,11 +107,48 @@ internal sealed class JinjaEvaluator
         }
     }
 
+    /// <summary>Binds the loop variable(s) for one item, unpacking dict entries / 2-element lists when the loop has two variables.</summary>
+    private void BindLoopVariables(ForNode node, object? item)
+    {
+        if (node.SecondVariableName != null && item is KeyValuePair<string, object?> kvp)
+        {
+            SetVariable(node.VariableName, kvp.Key);
+            SetVariable(node.SecondVariableName, kvp.Value);
+        }
+        else if (node.SecondVariableName != null && item is IList tupleList && tupleList.Count >= 2)
+        {
+            SetVariable(node.VariableName, tupleList[0]);
+            SetVariable(node.SecondVariableName, tupleList[1]);
+        }
+        else
+        {
+            SetVariable(node.VariableName, item);
+        }
+    }
+
     private void EvaluateFor(ForNode node)
     {
         var iterableValue = EvalExpr(node.Iterable);
-        var items = ToEnumerable(iterableValue);
+        // Jinja iterates a dict's KEYS when the loop has a single variable (two variables unpack items()).
+        var items = iterableValue is Dictionary<string, object?> keyedDict && node.SecondVariableName is null
+            ? keyedDict.Keys.Cast<object?>()
+            : ToEnumerable(iterableValue);
         var itemList = items.ToList();
+
+        if (node.Filter is not null)
+        {
+            // Evaluate the per-item filter in a scope that binds the loop variable(s) exactly as the body will see them.
+            var kept = new List<object?>(itemList.Count);
+            foreach (var candidate in itemList)
+            {
+                PushScope();
+                BindLoopVariables(node, candidate);
+                bool keep = IsTruthy(EvalExpr(node.Filter));
+                PopScope();
+                if (keep) kept.Add(candidate);
+            }
+            itemList = kept;
+        }
 
         if (itemList.Count == 0)
         {
@@ -128,21 +165,7 @@ internal sealed class JinjaEvaluator
 
             var item = itemList[i];
 
-            // Handle tuple unpacking for dict iteration
-            if (node.SecondVariableName != null && item is KeyValuePair<string, object?> kvp)
-            {
-                SetVariable(node.VariableName, kvp.Key);
-                SetVariable(node.SecondVariableName, kvp.Value);
-            }
-            else if (node.SecondVariableName != null && item is IList tupleList && tupleList.Count >= 2)
-            {
-                SetVariable(node.VariableName, tupleList[0]);
-                SetVariable(node.SecondVariableName, tupleList[1]);
-            }
-            else
-            {
-                SetVariable(node.VariableName, item);
-            }
+            BindLoopVariables(node, item);
 
             // Set loop variable. previtem/nextitem are intentionally omitted rather than set to
             // Undefined at the first/last iteration respectively — member access on a
@@ -356,7 +379,15 @@ internal sealed class JinjaEvaluator
         return expr.Op switch
         {
             UnaryOp.Not => !IsTruthy(operand),
-            UnaryOp.Negate => operand is int i ? -i : operand is double d ? -d : throw new JinjaException("Cannot negate non-number"),
+            // Box each arm separately: `cond ? -i : cond2 ? -d : throw` is typed double, which turned -1 into -1.0 and broke
+            // negative list/string indexing (`x[-1]`).
+            UnaryOp.Negate => operand switch
+            {
+                int i => (object)(-i),
+                long l => -l,
+                double d => -d,
+                _ => throw new JinjaException("Cannot negate non-number"),
+            },
             _ => throw new JinjaException($"Unknown unary operator: {expr.Op}")
         };
     }

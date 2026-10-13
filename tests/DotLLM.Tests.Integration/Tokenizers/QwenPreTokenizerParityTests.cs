@@ -72,7 +72,7 @@ public sealed class QwenPreTokenizerParityTests
         198, 40495,
     ];
 
-    /// <summary>llama.cpp b10434, <c>Ternary-Bonsai-27B-Q2_0.gguf</c> vocab (pre = <c>qwen35</c>).</summary>
+    /// <summary>Expected ids from llama.cpp b10434 on the Ternary-Bonsai-27B (v1) Q2_0 vocab; Bonsai-2 shares the same qwen35 vocab (verified identical ids).</summary>
     private static readonly int[] Qwen35ExpectedIds =
     [
         2064, 579, 220, 19496, 25191, 149496, 220, 17, 15, 17, 21, 25, 39579, 52033, 220,

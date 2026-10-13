@@ -901,6 +901,10 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 
                 var finishReasonStr = finishReason.ToString().ToLowerInvariant();
                 bodyLines.Add(new Markup($"  [dim]{Markup.Escape(finishReasonStr)} | {promptLen} prompt, {generated} generated[/]"));
+                if (generated == 0 && finishReason == FinishReason.Stop)
+                    bodyLines.Add(new Markup("  [yellow]hint:[/] [dim]the model emitted its end-of-turn token immediately. `run` is raw completion with no chat template; " +
+                        "instruction-tuned models (Gemma, Llama-Instruct, Qwen-Instruct...) do this on a bare question (llama.cpp does too). " +
+                        "Use `dotllm chat`, `dotllm serve`, or `--tools` (which applies the chat template).[/]"));
 
                 var backendBits = $"sampler: {samplerPath}";
                 if (decodeGraph is not null)

@@ -34,7 +34,7 @@ namespace DotLLM.Tests.Unit.Server;
 public sealed class ServerStartupHybridKvCacheDispatchTests
 {
     private const string ModelPathEnvVar = "DOTLLM_BONSAI_PQ2_0_GGUF";
-    private const string FileName = "Ternary-Bonsai-27B-Q2_0.gguf";
+    private const string FileName = "Ternary-Bonsai-2-27B-PQ2_0.gguf";
 
     private readonly ITestOutputHelper _out;
     public ServerStartupHybridKvCacheDispatchTests(ITestOutputHelper output) => _out = output;
@@ -61,7 +61,7 @@ public sealed class ServerStartupHybridKvCacheDispatchTests
         string? path = ResolveFixturePath();
         Skip.If(path is null,
             $"Bonsai PQ2_0 GGUF fixture not found. Set {ModelPathEnvVar}, or place {FileName} under "
-            + "~/.dotllm/models/PrismML/Ternary-Bonsai-27B-GGUF/ or ~/.dotllm/test-cache/PrismML/Ternary-Bonsai-27B-GGUF/.");
+            + "~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/ or ~/.dotllm/test-cache/prism-ml/Ternary-Bonsai-2-27B-gguf/.");
         Skip.If(FindPtxDir() is null, "PTX files not found");
 
         var options = new ServerOptions
@@ -107,7 +107,7 @@ public sealed class ServerStartupHybridKvCacheDispatchTests
         string? path = ResolveFixturePath();
         Skip.If(path is null,
             $"Bonsai PQ2_0 GGUF fixture not found. Set {ModelPathEnvVar}, or place {FileName} under "
-            + "~/.dotllm/models/PrismML/Ternary-Bonsai-27B-GGUF/ or ~/.dotllm/test-cache/PrismML/Ternary-Bonsai-27B-GGUF/.");
+            + "~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/ or ~/.dotllm/test-cache/prism-ml/Ternary-Bonsai-2-27B-gguf/.");
         Skip.If(FindPtxDir() is null, "PTX files not found");
 
         var options = new ServerOptions
@@ -169,8 +169,8 @@ public sealed class ServerStartupHybridKvCacheDispatchTests
         string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         string[] candidates =
         [
-            Path.Combine(home, ".dotllm", "models", "PrismML", "Ternary-Bonsai-27B-GGUF", FileName),
-            Path.Combine(home, ".dotllm", "test-cache", "PrismML", "Ternary-Bonsai-27B-GGUF", FileName),
+            Path.Combine(home, ".dotllm", "models", "prism-ml", "Ternary-Bonsai-2-27B-gguf", FileName),
+            Path.Combine(home, ".dotllm", "test-cache", "prism-ml", "Ternary-Bonsai-2-27B-gguf", FileName),
         ];
         foreach (string candidate in candidates)
             if (File.Exists(candidate))

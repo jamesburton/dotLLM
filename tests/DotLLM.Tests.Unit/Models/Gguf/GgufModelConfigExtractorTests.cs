@@ -803,6 +803,53 @@ public class GgufModelConfigExtractorTests
         Assert.Null(config.DiffusionConfig);
     }
 
+    /// <summary>
+    /// Regression (#917): the real E2B GGUF stores <c>feed_forward_length</c> as a
+    /// per-layer array (6144 x15 then 12288 x20, the double-wide MLP of the shared-KV
+    /// layers). It used to read as a missing scalar =&gt; IntermediateSize 0 =&gt; zero-sized
+    /// FFN scratch =&gt; CPU access violation / Vulkan "bytes" range error at load.
+    /// </summary>
+    [Fact]
+    public void Extract_Gemma4_E2B_PerLayerFeedForwardArray_UsesWidestLayer()
+    {
+        const int n = 35;
+        var ff = new int[n];
+        for (int i = 0; i < n; i++) ff[i] = i < 15 ? 6144 : 12288;
+        var pattern = new int[n];
+        for (int i = 0; i < n; i++) pattern[i] = ((i + 1) % 5) == 0 ? 0 : 1;
+
+        var metadata = BuildMetadata(d =>
+        {
+            const string arch = "gemma4";
+            d.AddString("general.architecture", arch);
+            d.AddUInt32($"{arch}.embedding_length", 1536);
+            d.AddUInt32($"{arch}.block_count", n);
+            d.AddUInt32($"{arch}.attention.head_count", 8);
+            d.AddUInt32($"{arch}.attention.head_count_kv", 1);
+            d.AddInt32Array($"{arch}.feed_forward_length", ff);
+            d.AddUInt32($"{arch}.context_length", 131072);
+            d.AddFloat32($"{arch}.attention.layer_norm_rms_epsilon", 1e-6f);
+            d.AddUInt32($"{arch}.attention.key_length", 512);
+            d.AddUInt32($"{arch}.attention.key_length_swa", 256);
+            d.AddUInt32($"{arch}.attention.sliding_window", 512);
+            d.AddInt32Array($"{arch}.attention.sliding_window_pattern", pattern);
+            d.AddUInt32($"{arch}.attention.shared_kv_layers", 20);
+            d.AddUInt32($"{arch}.embedding_length_per_layer_input", 256);
+            d.AddFloat32($"{arch}.rope.freq_base", 1_000_000.0f);
+            d.AddFloat32($"{arch}.rope.freq_base_swa", 10_000.0f);
+            d.AddUInt32($"{arch}.rope.dimension_count", 512);
+            d.AddUInt32($"{arch}.rope.dimension_count_swa", 256);
+            d.AddFloat32($"{arch}.final_logit_softcapping", 30.0f);
+            d.AddUInt32($"{arch}.vocab_size", 262144);
+        });
+
+        var config = GgufModelConfigExtractor.Extract(metadata);
+
+        Assert.Equal(12288, config.IntermediateSize);
+        Assert.True(config.IsGemma4DensePle);
+        Assert.Equal(20, config.NumSharedKvLayers);
+    }
+
     [Fact]
     public void Extract_DiffusionGemma_BuildsDiffusionConfigOverGemma4Backbone()
     {

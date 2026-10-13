@@ -1,0 +1,77 @@
+#version 450
+// Fused gated activation + row-wise Q8_1 quantization for the MoE decode arm (#912): one dispatch producing the
+// Q8_1 quantization (packed int8 xq + per-32-block (scale, sum) xds) of  act(gate[i], up[i])  without writing the F32
+// activation, replacing  swiglu / swiglu_oai (n elements)  ->  barrier  ->  quantize_q8_1_rows  for the routed-expert
+// down projection. The activation is pointwise and rows are contiguous 32-block runs (the row length is a multiple of 32),
+// so the whole [rows * K] activation is one flat run of blocks and one thread owns one block - no reduction, no barrier.
+//
+//   mode 0 (SwiGLU, GLM / DeepSeek / Mixtral / Qwen):  v = gate * sigmoid(gate) * up                    (swiglu_f32.comp)
+//   mode 1 (gpt-oss clamped SwiGLU):   x = min(gate, limit); y = clamp(up, -limit, limit);
+//                                      v = x / (1 + exp(-alpha * x)) * (y + 1)                          (swiglu_oai_f32.comp)
+//
+// PARITY CONTRACT: bit-identical to the standalone pair (same expressions, same amax / round / pack / block-sum as
+// quantize_q8_1_rows.comp), so enabling the fusion cannot move logits.
+//
+// Dispatch: ceil(blocks / 64) workgroups of 64 threads (one 32-element Q8_1 block per thread).
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufGate { float gate[]; }; // [n]
+layout(set = 0, binding = 1, std430) readonly  buffer BufUp   { float up[];   }; // [n]
+layout(set = 0, binding = 2, std430) writeonly buffer BufXq   { uint  xq[];   }; // [n/4]
+layout(set = 0, binding = 3, std430) writeonly buffer BufXds  { vec2  xds[];  }; // [n/32]
+
+layout(push_constant) uniform PushConstants {
+    uint  blocks; // = n / 32
+    uint  mode;   // 0 = SwiGLU, 1 = gpt-oss clamped SwiGLU
+    float alpha;
+    float limit;
+} pc;
+
+const uint QK = 32u;
+
+float act(float g, float u) {
+    if (pc.mode == 0u) {
+        float sig = 1.0 / (1.0 + exp(-g));
+        return g * sig * u;
+    }
+    float x = min(g, pc.limit);
+    float y = clamp(u, -pc.limit, pc.limit);
+    float glu = x / (1.0 + exp(-pc.alpha * x));
+    return glu * (y + 1.0);
+}
+
+void main() {
+    uint b = gl_GlobalInvocationID.x;
+    if (b >= pc.blocks) return;
+    uint base = b * QK;
+
+    float vals[QK];
+    float amax = 0.0;
+    for (uint i = 0u; i < QK; i++) {
+        float v = act(gate[base + i], up[base + i]);
+        vals[i] = v;
+        amax = max(amax, abs(v));
+    }
+
+    float d = amax / 127.0;
+    float id = (d != 0.0) ? (1.0 / d) : 0.0;
+
+    int sumI = 0;
+    uint qBase = base >> 2u;
+    for (uint g2 = 0u; g2 < QK / 4u; g2++) {
+        uint e = g2 * 4u;
+        int q0 = int(round(vals[e + 0u] * id));
+        int q1 = int(round(vals[e + 1u] * id));
+        int q2 = int(round(vals[e + 2u] * id));
+        int q3 = int(round(vals[e + 3u] * id));
+        sumI += q0 + q1 + q2 + q3;
+        uint packed = (uint(q0) & 0xFFu)
+                    | ((uint(q1) & 0xFFu) << 8u)
+                    | ((uint(q2) & 0xFFu) << 16u)
+                    | ((uint(q3) & 0xFFu) << 24u);
+        xq[qBase + g2] = packed;
+    }
+
+    xds[b] = vec2(d, d * float(sumI));
+}

@@ -158,7 +158,18 @@ public static class SyntheticGemma4Gguf
         w.AddUInt32($"{arch}.context_length", (uint)cfg.ContextLength);
         w.AddUInt32($"{arch}.embedding_length", (uint)cfg.HiddenSize);
         w.AddUInt32($"{arch}.block_count", (uint)cfg.BlockCount);
-        w.AddUInt32($"{arch}.feed_forward_length", (uint)cfg.DenseFeedForward);
+        if (cfg.DoubleWideSharedKvFfn && cfg.SharedKvLayers > 0)
+        {
+            // E2B shape: per-layer feed_forward_length array, 2x on the trailing shared-KV layers.
+            var ffArr = new int[cfg.BlockCount];
+            for (int i = 0; i < ffArr.Length; i++)
+                ffArr[i] = cfg.DenseFeedForward * (i >= cfg.BlockCount - cfg.SharedKvLayers ? 2 : 1);
+            w.AddInt32Array($"{arch}.feed_forward_length", ffArr);
+        }
+        else
+        {
+            w.AddUInt32($"{arch}.feed_forward_length", (uint)cfg.DenseFeedForward);
+        }
         w.AddUInt32($"{arch}.attention.head_count", (uint)cfg.HeadCount);
         w.AddFloat32($"{arch}.attention.layer_norm_rms_epsilon", cfg.NormEpsilon);
         w.AddUInt32($"{arch}.attention.sliding_window", (uint)cfg.SlidingWindow);
@@ -271,7 +282,7 @@ public static class SyntheticGemma4Gguf
         int kv = global ? cfg.GlobalKvHeads : cfg.SlidingKvHeads;
         int qOut = cfg.HeadCount * hd;
         int kvOut = kv * hd;
-        int ff = cfg.DenseFeedForward;
+        int ff = cfg.DenseFeedForward * (cfg.DoubleWideSharedKvFfn && cfg.SharedKvLayers > 0 && layer >= cfg.BlockCount - cfg.SharedKvLayers ? 2 : 1);
         int ie = cfg.ExpertFeedForward;
         int e = cfg.ExpertCount;
 
