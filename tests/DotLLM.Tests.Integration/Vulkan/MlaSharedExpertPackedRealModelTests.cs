@@ -96,12 +96,22 @@ public sealed class MlaSharedExpertPackedRealModelTests
         _output.WriteLine($"weight bytes: control {control.WeightBytes / 1073741824.0:F2} GiB, packed {packed.WeightBytes / 1073741824.0:F2} GiB, saved {savedGb:F2} GiB");
         Assert.True(savedGb > 1.2, $"expected > 1.2 GiB saved, got {savedGb:F2}");
 
+        // Gate (#949): the MEAN KL is NOT a usable gate on this model. A few teacher-forced rows are ill-conditioned (massive-activation
+        // tokens, CPU max-logit ~110 on every row) and flip on rounding-level differences in ANY arm: on 4544 rows (40 prompts, see
+        // MlaSharedExpertOutlierStudyTests) control / packed / packed+legacy-GEMV have outlier (KL>1) rates 21 / 23 / 22 per 4544, medians
+        // 0.00371 / 0.00369 / 0.00370, 99%-trimmed means 0.00679 / 0.00651 / 0.00657, and the three GPU arms agree with EACH OTHER on most
+        // outlier rows while all disagree with the CPU oracle (flips go both ways). So the gate is: median and 99%-trimmed KL no worse than
+        // the F32 control (+ small slack), outlier-row count no more than control + 2, top-1 agreement, and greedy identity below.
         foreach (var (name, chunk) in new[] { ("decode(1)", 1), ("prefill(all)", 0) })
         {
-            var (klP, agP, n) = Evaluate(packed, mkPacked, ids, cpuLogits, vocab, chunk);
-            var (klC, agC, _) = Evaluate(control, mkControl, ids, cpuLogits, vocab, chunk);
-            _output.WriteLine($"{name,-13} rows={n,4} mean KL(cpu||vk) packed {klP:F5} control {klC:F5}  top-1 packed {agP}/{n} control {agC}/{n}");
-            Assert.True(klP <= Math.Max(klC * 2.0, klC + 0.01), $"{name}: packed KL {klP:F5} vs control {klC:F5}");
+            var (klP, agP, n, rowsP) = Evaluate(packed, mkPacked, ids, cpuLogits, vocab, chunk);
+            var (klC, agC, _, rowsC) = Evaluate(control, mkControl, ids, cpuLogits, vocab, chunk);
+            double medP = Median(rowsP), medC = Median(rowsC), trP = Trimmed(rowsP), trC = Trimmed(rowsC);
+            int outP = rowsP.Count(v => v > 1.0), outC = rowsC.Count(v => v > 1.0);
+            _output.WriteLine($"{name,-13} rows={n,4} mean KL(cpu||vk) packed {klP:F5} control {klC:F5} | median {medP:F5} / {medC:F5} | trimmed99 {trP:F5} / {trC:F5} | outliers(KL>1) {outP} / {outC} | top-1 packed {agP}/{n} control {agC}/{n}");
+            Assert.True(medP <= Math.Max(medC * 1.5, medC + 0.002), $"{name}: packed median KL {medP:F5} vs control {medC:F5}");
+            Assert.True(trP <= Math.Max(trC * 1.5, trC + 0.003), $"{name}: packed 99%-trimmed KL {trP:F5} vs control {trC:F5}");
+            Assert.True(outP <= outC + 2, $"{name}: packed outlier rows {outP} vs control {outC}");
             Assert.True(agP >= agC - Math.Max(2, n / 20), $"{name}: top-1 {agP} vs {agC} of {n}");
         }
 
@@ -120,9 +130,9 @@ public sealed class MlaSharedExpertPackedRealModelTests
         Assert.True(identP >= identC - 1);
     }
 
-    private (double Kl, int Agree, int Rows) Evaluate(VulkanTransformerModel vk, Func<int, IKvCache> mk, int[][] ids, float[][][] cpu, int vocab, int chunkSize)
+    private (double Kl, int Agree, int Rows, double[] PerRow) Evaluate(VulkanTransformerModel vk, Func<int, IKvCache> mk, int[][] ids, float[][][] cpu, int vocab, int chunkSize)
     {
-        double klSum = 0; int agree = 0, rows = 0;
+        double klSum = 0; int agree = 0, rows = 0; var per = new List<double>();
         for (int p = 0; p < ids.Length; p++)
         {
             int len = ids[p].Length;
@@ -134,13 +144,18 @@ public sealed class MlaSharedExpertPackedRealModelTests
                 using ITensor l = vk.Forward(ids[p].AsSpan(s, n), Enumerable.Range(s, n).ToArray(), -1, kv);
                 float[] row = Rows(l, vocab)[^1];
                 float[] want = cpu[p][s + n - 1];
-                klSum += Kl(want, row);
+                double kl1 = Kl(want, row);
+                klSum += kl1; per.Add(kl1);
                 if (ArgMax(row) == ArgMax(want)) agree++;
                 rows++;
             }
         }
-        return (klSum / rows, agree, rows);
+        return (klSum / rows, agree, rows, per.ToArray());
     }
+
+    private static double Median(double[] v) { var s = v.OrderBy(x => x).ToArray(); return s[s.Length / 2]; }
+
+    private static double Trimmed(double[] v) { var s = v.OrderBy(x => x).ToArray(); return s.Take(Math.Max(1, (int)(s.Length * 0.99))).Average(); }
 
     private static int[] Encode(DotLLM.Tokenizers.ITokenizer tok, string text, bool addBos)
     {
