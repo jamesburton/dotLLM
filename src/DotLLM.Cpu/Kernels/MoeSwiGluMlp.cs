@@ -1074,6 +1074,11 @@ public static unsafe partial class MoeSwiGluMlp
                 else
                     MatMul.GemmQ6_K((byte*)weights, b, c, m, k, n, preQuantizedInput);
                 return;
+            case QuantizationType.MXFP4:
+                // SIMD pshufb row dot against the F32 activations (no activation quantisation, same maths as the dequant fallback),
+                // batch-invariant by construction (see GemmMxfp4). The generic dequant fallback below was ~3 s/token on MiMo-V2 (#935).
+                MatMul.GemmMxfp4((byte*)weights, b, c, m, k, n, pool);
+                return;
             default:
                 // Fallback for quant types without a direct kernel (Q4_0/Q4_1/Q5_1, IQ*, BF16).
                 //
