@@ -1177,6 +1177,7 @@ End-to-end (`bench -p 512 -n 64 --depth-list 0,3584,15872`, MTP off), decode tok
 |---|---|---|
 | F16 | 18.8 / - / 14.5 | 19.2 / 19.6 / 19.4 |
 | Q4_0 fused (new default) | 18.2 / - / 12.4 (fused v1), 18.7 / - / 13.3 (scratch) | 18.5 / 18.6 / 18.7 |
+| Q4_0 scratch + v2 (`DOTLLM_HYBRID_KV_FUSED=0`) | 18.7 / - / 13.3 | 18.9 / 18.7 / 17.8 |
 
 Parity: v2 vs F64 reference max abs error ~1e-5 at seqKv in {1,15,16,17,255,256,4096,16385} (v1 vs v2 <= 2.6e-5);
 `CudaAttentionMmaDecodeGqaSplitGenerationParityTests` PPL delta -0.04% (pre-gate bit-identical).
