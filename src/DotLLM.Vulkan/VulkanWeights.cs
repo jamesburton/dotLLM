@@ -1805,6 +1805,38 @@ internal sealed class VulkanWeights : IDisposable
     /// K/V cache). Kept as the same-binary control arm for A/B measurement and as the fallback for files the absorbed
     /// path cannot take.
     /// </summary>
+    /// <summary>
+    /// <c>DOTLLM_VK_SHARED_EXPERT_PACKED=0</c> restores the pre-#949 behaviour (shared-expert gate/up/down widened to F32
+    /// unless the Q8_0/Q4_K overlay applies): the same-binary control arm for A/B measurement.
+    /// </summary>
+    internal static bool SharedExpertPackedDisabled
+        => Environment.GetEnvironmentVariable("DOTLLM_VK_SHARED_EXPERT_PACKED") == "0";
+
+    /// <summary>
+    /// GGUF preflight (#949): true when every MLA+MoE layer's shared-expert gate/up/down will be kept packed on device, so the
+    /// loader may skip their host F32 dequant (~38 MB per layer). Mirrors <c>UploadMoeLayer</c>'s per-projection decision.
+    /// </summary>
+    internal static bool PlanSharedExpertsPacked(GgufFile gguf, ModelConfig config)
+    {
+        if (config.MlaConfig is null || config.Moe is null || SharedExpertPackedDisabled) return false;
+        var t = gguf.TensorsByName;
+        int hidden = config.HiddenSize;
+        int sharedI = config.Moe.SharedExpertIntermediateSize ?? 0;
+        bool any = false;
+        for (int i = 0; i < config.NumLayers; i++)
+        {
+            if (!t.TryGetValue($"blk.{i}.ffn_gate_shexp.weight", out var g)) continue;
+            if (!t.TryGetValue($"blk.{i}.ffn_up_shexp.weight", out var u)
+                || !t.TryGetValue($"blk.{i}.ffn_down_shexp.weight", out var d)) return false;
+            if (sharedI <= 0) return false;
+            if (g.QuantizationType == QuantizationType.F32 || DeviceQuantTypeFor(g.QuantizationType, hidden, false) != g.QuantizationType) return false;
+            if (u.QuantizationType == QuantizationType.F32 || DeviceQuantTypeFor(u.QuantizationType, hidden, false) != u.QuantizationType) return false;
+            if (d.QuantizationType == QuantizationType.F32 || DeviceQuantTypeFor(d.QuantizationType, sharedI, false) != d.QuantizationType) return false;
+            any = true;
+        }
+        return any;
+    }
+
     internal static bool MlaLegacyForced
         => Environment.GetEnvironmentVariable("DOTLLM_VK_MLA_LEGACY") == "1";
 
@@ -1983,6 +2015,21 @@ internal sealed class VulkanWeights : IDisposable
             : 0;
         long perSharedW3Bytes = perSharedW1Bytes;
 
+        // #949: DeepSeek/GLM shared experts have no overlay (the production loader never sets one), so they used to
+        // widen to F32 (GLM: 3 x 2048 x 1536 x 4 B x 46 layers = 1.7 GB read per decoded token, ~12 ms). Keep each
+        // projection in its own packed GGUF format whenever the dense router has a kernel for it; the shared-expert
+        // dispatch already goes through RecordMatmul with the per-projection device quant type.
+        static QuantizationType RawKeepQt(bool enabled, nint[] ptrs, int n, QuantizationType rawQt, int contraction)
+        {
+            if (!enabled || rawQt == QuantizationType.F32 || ptrs.Length != n) return QuantizationType.F32;
+            foreach (var q in ptrs) if (q == 0) return QuantizationType.F32;
+            return DeviceQuantTypeFor(rawQt, contraction, dequantToFp32: false) == rawQt ? rawQt : QuantizationType.F32;
+        }
+        bool packedSharedOn = hasShared && !SharedExpertPackedDisabled;
+        QuantizationType rawSharedW1 = sharedW1KeepQuant ? QuantizationType.F32 : RawKeepQt(packedSharedOn, moe.SharedGateRaw, numShared, moe.SharedGateRawQt, hidden);
+        QuantizationType rawSharedW3 = sharedW3KeepQuant ? QuantizationType.F32 : RawKeepQt(packedSharedOn, moe.SharedUpRaw, numShared, moe.SharedUpRawQt, hidden);
+        QuantizationType rawSharedW2 = sharedW2KeepQuant ? QuantizationType.F32 : RawKeepQt(packedSharedOn, moe.SharedDownRaw, numShared, moe.SharedDownRawQt, sharedI);
+
         // Every upload streams through the shared bounded staging buffer — one
         // expert slab (or a chunk of it) at a time; no per-layer staging alloc.
 
@@ -2047,32 +2094,62 @@ internal sealed class VulkanWeights : IDisposable
             sharedW1 = new VulkanDevice.Buffer[numShared];
             sharedW2 = new VulkanDevice.Buffer[numShared];
             sharedW3 = new VulkanDevice.Buffer[numShared];
-            sharedW1Qt = sharedW1KeepQuant ? moe.SharedExpertProjQuantTypeOverlay : QuantizationType.F32;
-            sharedW2Qt = sharedW2KeepQuant ? moe.SharedExpertProjQuantTypeOverlay : QuantizationType.F32;
-            sharedW3Qt = sharedW3KeepQuant ? moe.SharedExpertProjQuantTypeOverlay : QuantizationType.F32;
+            sharedW1Qt = sharedW1KeepQuant ? moe.SharedExpertProjQuantTypeOverlay : rawSharedW1;
+            sharedW2Qt = sharedW2KeepQuant ? moe.SharedExpertProjQuantTypeOverlay : rawSharedW2;
+            sharedW3Qt = sharedW3KeepQuant ? moe.SharedExpertProjQuantTypeOverlay : rawSharedW3;
 
             for (int s = 0; s < numShared; s++)
             {
-                sharedW1[s] = device.AllocateDeviceLocal(perSharedW1Bytes);
-                sharedW2[s] = device.AllocateDeviceLocal(perSharedW2Bytes);
-                sharedW3[s] = device.AllocateDeviceLocal(perSharedW3Bytes);
-
-                if (sharedW1KeepQuant)
-                    UploadRawBytes(device, stage, moe.SharedGateProjQ8Ptrs![s], perSharedW1Bytes, sharedW1[s]);
+                // Packed GGUF views go through UploadMatrix (zero-copy import / padded staging upload + residency report);
+                // overlay and F32 modes keep the original pre-sized buffers.
+                if (rawSharedW1 != QuantizationType.F32)
+                {
+                    sharedW1[s] = UploadMatrix(device, stage, moe.SharedGateRaw[s], moe.SharedGateRawQt, sharedI, hidden, false,
+                        $"{namePrefix}.ffn_gate_shexp.weight", out _, out long b1);
+                    uploadedBytes += b1;
+                }
                 else
-                    UploadExpertBankSlot(device, stage, moe.SharedGateProj[s], perSharedW1Bytes, sharedW1[s], 0);
+                {
+                    sharedW1[s] = device.AllocateDeviceLocal(perSharedW1Bytes);
+                    if (sharedW1KeepQuant)
+                        UploadRawBytes(device, stage, moe.SharedGateProjQ8Ptrs![s], perSharedW1Bytes, sharedW1[s]);
+                    else
+                        UploadExpertBankSlot(device, stage, moe.SharedGateProj[s], perSharedW1Bytes, sharedW1[s], 0);
+                    uploadedBytes += perSharedW1Bytes;
+                }
 
-                if (sharedW2KeepQuant)
-                    UploadRawBytes(device, stage, moe.SharedDownProjQ8Ptrs![s], perSharedW2Bytes, sharedW2[s]);
+                if (rawSharedW2 != QuantizationType.F32)
+                {
+                    sharedW2[s] = UploadMatrix(device, stage, moe.SharedDownRaw[s], moe.SharedDownRawQt, hidden, sharedI, false,
+                        $"{namePrefix}.ffn_down_shexp.weight", out _, out long b2);
+                    uploadedBytes += b2;
+                }
                 else
-                    UploadExpertBankSlot(device, stage, moe.SharedDownProj[s], perSharedW2Bytes, sharedW2[s], 0);
+                {
+                    sharedW2[s] = device.AllocateDeviceLocal(perSharedW2Bytes);
+                    if (sharedW2KeepQuant)
+                        UploadRawBytes(device, stage, moe.SharedDownProjQ8Ptrs![s], perSharedW2Bytes, sharedW2[s]);
+                    else
+                        UploadExpertBankSlot(device, stage, moe.SharedDownProj[s], perSharedW2Bytes, sharedW2[s], 0);
+                    uploadedBytes += perSharedW2Bytes;
+                }
 
-                if (sharedW3KeepQuant)
-                    UploadRawBytes(device, stage, moe.SharedUpProjQ8Ptrs![s], perSharedW3Bytes, sharedW3[s]);
+                if (rawSharedW3 != QuantizationType.F32)
+                {
+                    sharedW3[s] = UploadMatrix(device, stage, moe.SharedUpRaw[s], moe.SharedUpRawQt, sharedI, hidden, false,
+                        $"{namePrefix}.ffn_up_shexp.weight", out _, out long b3);
+                    uploadedBytes += b3;
+                }
                 else
-                    UploadExpertBankSlot(device, stage, moe.SharedUpProj[s], perSharedW3Bytes, sharedW3[s], 0);
+                {
+                    sharedW3[s] = device.AllocateDeviceLocal(perSharedW3Bytes);
+                    if (sharedW3KeepQuant)
+                        UploadRawBytes(device, stage, moe.SharedUpProjQ8Ptrs![s], perSharedW3Bytes, sharedW3[s]);
+                    else
+                        UploadExpertBankSlot(device, stage, moe.SharedUpProj[s], perSharedW3Bytes, sharedW3[s], 0);
+                    uploadedBytes += perSharedW3Bytes;
+                }
             }
-            uploadedBytes += (long)numShared * (perSharedW1Bytes + perSharedW2Bytes + perSharedW3Bytes);
         }
 
         // Optional Qwen1.5-MoE per-token sigmoid gate. Uploaded as a [1, hidden] device

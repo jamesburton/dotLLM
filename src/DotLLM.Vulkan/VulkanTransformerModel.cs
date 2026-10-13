@@ -797,6 +797,12 @@ public sealed class VulkanTransformerModel : IModel
     private MlaAbsorbedAttentionKernel? _mlaAbsAttn;
     /// <summary>True when this model runs MLA in the absorbed latent form (#913).</summary>
     internal bool MlaAbsorbed => _mlaAbsorbed;
+
+    /// <summary>Layers whose shared-expert gate projection stays in a packed (non-F32) device format (#949).</summary>
+    internal int SharedExpertPackedLayerCount => _weights.Layers.Count(l => l.Moe is { NumSharedExperts: > 0 } m && m.SharedW1DeviceQuantType != QuantizationType.F32);
+
+    /// <summary>Device bytes uploaded for weights (as accounted by the loader).</summary>
+    internal long WeightBytes => _weights.AllocatedBytes;
     // MoE (Mixtral / Qwen-MoE) — null when the model carries no MoE layer.
     private readonly MoeTopKSoftmaxF32Kernel? _moeTopkSoftmax;
     // DeepSeek-V3 / GLM-4.7-Flash sigmoid + selection-bias router (#742). Null unless config.Moe.SigmoidGating.
@@ -1427,7 +1433,8 @@ public sealed class VulkanTransformerModel : IModel
                 moeBankSkipSelector: layerIdx => moeBankResidency.TryGetValue(layerIdx, out var r)
                     ? (r.Gate, r.Up, r.Down)
                     : (false, false, false),
-                skipMlaF32Dequant: VulkanWeights.PlanMlaAbsorbed(gguf, config));
+                skipMlaF32Dequant: VulkanWeights.PlanMlaAbsorbed(gguf, config),
+            skipSharedExpertF32Dequant: VulkanWeights.PlanSharedExpertsPacked(gguf, config));
             return BuildModel(device, ownsDevice: true, config, cpuWeights, spvDir, gguf);
         }
         catch
@@ -1465,7 +1472,8 @@ public sealed class VulkanTransformerModel : IModel
             moeBankSkipSelector: layerIdx => moeBankResidency.TryGetValue(layerIdx, out var r)
                 ? (r.Gate, r.Up, r.Down)
                 : (false, false, false),
-            skipMlaF32Dequant: VulkanWeights.PlanMlaAbsorbed(gguf, config));
+            skipMlaF32Dequant: VulkanWeights.PlanMlaAbsorbed(gguf, config),
+            skipSharedExpertF32Dequant: VulkanWeights.PlanSharedExpertsPacked(gguf, config));
         return BuildModel(device, ownsDevice: false, config, cpuWeights, spvDir, gguf);
     }
 

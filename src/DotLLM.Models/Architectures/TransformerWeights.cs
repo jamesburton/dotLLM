@@ -1297,13 +1297,16 @@ internal sealed class TransformerWeights : IDisposable
     /// (q_a/q_b/q, kv_a_mqa, kv_b, attn_output) and keep only the raw GGUF views, which the Vulkan absorbed-MLA path
     /// uploads packed. Requires the llama.cpp split <c>attn_k_b</c>/<c>attn_v_b</c> pair (throws otherwise). The CPU MLA
     /// oracle cannot run on weights loaded this way.</param>
+    /// <param name="skipSharedExpertF32Dequant">GPU-only load (#949): skip the host F32 dequant of the MLA+MoE shared-expert
+    /// gate/up/down (the Vulkan loader keeps them packed from the raw views). The CPU MoE oracle cannot run on such weights.</param>
     /// <param name="allowNanoQuant">True only for the CPU backend: accepts a community NanoQuant GGUF (#869). Every other
     /// caller leaves it false and gets a clear <see cref="NotSupportedException"/> for such a file.</param>
     public static TransformerWeights LoadFromGguf(GgufFile gguf, ModelConfig config,
                                                     bool skipF32MoeDequant = false,
                                                     Func<int, (bool SkipGate, bool SkipUp, bool SkipDown)>? moeBankSkipSelector = null,
                                                     bool allowNanoQuant = false,
-                                                    bool skipMlaF32Dequant = false)
+                                                    bool skipMlaF32Dequant = false,
+                                                    bool skipSharedExpertF32Dequant = false)
     {
         ThrowIfArchitectureNeedsDedicatedLoader(config);
 
@@ -1348,7 +1351,7 @@ internal sealed class TransformerWeights : IDisposable
         for (int i = 0; i < config.NumLayers; i++)
         {
             layers[i] = config.MlaConfig is not null
-                ? LoadMlaLayer(i, dataBase, tensors, config, owned!, skipF32MoeDequant, moeBankSkipSelector, skipMlaF32Dequant)
+                ? LoadMlaLayer(i, dataBase, tensors, config, owned!, skipF32MoeDequant, moeBankSkipSelector, skipMlaF32Dequant, skipSharedExpertF32Dequant)
                 : config.Gemma4DualFfn
                     ? LoadGemma4Layer(i, dataBase, tensors, config, owned)
                     : LoadLayer(i, dataBase, tensors, config, nanoQuant ? gguf : null, owned);
@@ -2248,7 +2251,8 @@ internal sealed class TransformerWeights : IDisposable
         List<nint> owned,
         bool skipF32MoeDequant = false,
         Func<int, (bool SkipGate, bool SkipUp, bool SkipDown)>? moeBankSkipSelector = null,
-        bool skipMlaF32Dequant = false)
+        bool skipMlaF32Dequant = false,
+        bool skipSharedExpertF32Dequant = false)
     {
         var mla = config.MlaConfig
             ?? throw new InvalidOperationException("LoadMlaLayer called without MlaConfig.");
@@ -2431,7 +2435,8 @@ internal sealed class TransformerWeights : IDisposable
                 ? moeBankSkipSelector(layerIdx)
                 : (skipF32MoeDequant, skipF32MoeDequant, skipF32MoeDequant);
             moeBundle = LoadDeepSeekMoeLayer(layerIdx, dataBase, tensors, config, owned,
-                skipGateDequant: skipGate, skipUpDequant: skipUp, skipDownDequant: skipDown);
+                skipGateDequant: skipGate, skipUpDequant: skipUp, skipDownDequant: skipDown,
+                skipSharedDequant: skipSharedExpertF32Dequant ? true : null);
         }
         else if (tensors.TryGetValue($"{prefix}.ffn_gate.weight", out var gateDesc))
         {
@@ -2508,6 +2513,7 @@ internal sealed class TransformerWeights : IDisposable
     /// for <c>ffn_up_exps</c>.</param>
     /// <param name="skipDownDequant">Per-bank override, sibling of <paramref name="skipGateDequant"/>
     /// for <c>ffn_down_exps</c>.</param>
+    /// <param name="skipSharedDequant">Override for the shared-expert F32 host dequant (#949); null follows <paramref name="skipF32Dequant"/>.</param>
     internal static unsafe MoeLayerWeights LoadDeepSeekMoeLayer(
         int layerIdx,
         GgufDataBase dataBase,
@@ -2518,7 +2524,8 @@ internal sealed class TransformerWeights : IDisposable
         bool skipRoutedF32Only = false,
         bool? skipGateDequant = null,
         bool? skipUpDequant = null,
-        bool? skipDownDequant = null)
+        bool? skipDownDequant = null,
+        bool? skipSharedDequant = null)
     {
         var moe = config.Moe
             ?? throw new InvalidOperationException("LoadDeepSeekMoeLayer called without Moe config.");
@@ -2560,7 +2567,7 @@ internal sealed class TransformerWeights : IDisposable
         // CanSkipMoeF32HostDequant was true. No numeric impact; whether to restore that
         // skip (e.g. thread a shared-expert bool through moeBankSkipSelector too) is a
         // separate decision, deliberately out of scope here.
-        bool skipSharedDequant = skipF32Dequant; // shared stays unless caller asks for full skip
+        bool skipSharedF32 = skipSharedDequant ?? skipF32Dequant; // shared stays unless caller asks for a skip (#949)
 
         // Per-bank overrides (#327) default to the combined decision above — this keeps
         // every existing caller's behavior byte-identical (all three still move together)
@@ -2612,7 +2619,7 @@ internal sealed class TransformerWeights : IDisposable
             // ~10 MB host RAM per layer (vs ~2.2 GB for routed experts). With skipRoutedF32Only
             // we still dequant shared so the CPU MoE kernel can use them directly without a
             // separate on-the-fly path for the (small) shared branch.
-            if (skipSharedDequant)
+            if (skipSharedF32)
             {
                 sharedGate = [(nint)0];
                 sharedUp = [(nint)0];
