@@ -449,30 +449,6 @@ public sealed class GgufFile : IDisposable
 
     // ───────────────────────────── shard mapping ─────────────────────────────
 
-    /// <summary>
-    /// Experimental (env <c>DOTLLM_MMAP_PREFETCH</c>): bulk page-in of a shard's data section via <c>PrefetchVirtualMemory</c> (Windows)
-    /// so the first decode tokens do not pay per-4K soft/hard faults on newly routed MoE experts. Off unless set to 1.
-    /// </summary>
-    private static unsafe class MmapPrefetch
-    {
-        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-        private struct Range { public nint Address; public nuint Bytes; }
-
-        [System.Runtime.InteropServices.DllImport("kernel32.dll")]
-        private static extern bool PrefetchVirtualMemory(nint process, nuint count, Range* entries, uint flags);
-        [System.Runtime.InteropServices.DllImport("kernel32.dll")]
-        private static extern nint GetCurrentProcess();
-
-        public static void Apply(nint address, long length)
-        {
-            if (Environment.GetEnvironmentVariable("DOTLLM_MMAP_PREFETCH") != "1" || !OperatingSystem.IsWindows() || length <= 0) return;
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            var r = new Range { Address = address, Bytes = (nuint)length };
-            bool ok = PrefetchVirtualMemory(GetCurrentProcess(), 1, &r, 0);
-            Console.Error.WriteLine($"[mmap-prefetch] {length >> 20} MiB ok={ok} {sw.ElapsedMilliseconds} ms");
-        }
-    }
-
     /// <summary>Owns one shard file's memory mapping.</summary>
     private sealed unsafe class Shard : IDisposable
     {
@@ -507,7 +483,6 @@ public sealed class GgufFile : IDisposable
                 shard._accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref basePointer);
                 shard._basePointer = basePointer;
                 shard.DataBase = (nint)(basePointer + shard._accessor.PointerOffset + parsed.DataSectionOffset);
-                MmapPrefetch.Apply(shard.DataBase, parsed.DataSectionLength);
                 return shard;
             }
             catch
