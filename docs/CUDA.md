@@ -1125,3 +1125,58 @@ The dense Gemma-4 variants (per-layer embeddings, 18 trailing shared-KV layers, 
 - Layer-split (pipeline / hybrid) loading of this variant is rejected: PLE inputs and cross-window shared-KV donors cannot be split.
 
 Performance caveat: this path dequantises each projection to F32 per forward (the validated 26B design), so decode throughput is far below the quantised-GEMV paths; a quantised-GEMV Gemma-4 path is the perf follow-up.
+
+## v2 tensor-core decode attention: warp-independent, register-resident (issue #988)
+
+`attention_flash_mma_decode_gqa_split_f16` (v1, head_dim 256, GQA group <= 8, seqQ == 1) was latency/sync bound: ~12 us
+per 16-key tile per block (KV_TILE=16, five `__syncthreads`, a 16-deep serial mma chain on two warps, a serial 6-lane
+softmax, a shared-memory O read-modify-write, scalar 2-byte K/V loads and transposed V stores). At 16k keys that is
+~0.9-1.3 ms per attention layer, so Bonsai-2 27B decode fell 18.8 -> 14.5 tok/s between ctx 512 and 16384.
+
+v2 (`attention_flash_mma_decode_gqa_split_f16_v2`, body in `native/kernels/attention_mma_decode_v2.cuh`) keeps the
+interface, the `(numKvHeads, kvSplit)` cooperative grid, the `partial_max/sum/out` scratch layout and the combine
+algebra byte-for-byte, and changes only the per-block inner loop:
+
+- **Every warp is an independent online-softmax stream** over interleaved 16-key tiles; there is no block-level barrier
+  in the key loop. The block merges its 8 warps once at the end (deterministic warp-ordered sum through 8 KiB of smem).
+- **K and V go straight from global into mma fragment registers** with 16-byte loads (no smem staging, no transposes).
+  This relies on the mma k-dimension being a free permutation: a thread loads 8 consecutive `d` of one key and feeds two
+  consecutive k16 steps; Q's A fragments (kept in a 4 KiB smem table) use the identical permutation.
+- **PV is computed transposed** (`O^T[d x q8] += V^T[d x key16] . P^T[key16 x q8]`) so M = d fills all 16 rows, and the
+  QK C fragment is exactly the PV B fragment (FA2-style register reuse, no shuffles for P).
+- **Online softmax is warp-parallel**: quad max via two `shfl_xor`, per-thread partial row sum, reduced once at the end.
+- 230 registers, 0 spills, 12.8 KB static smem, `__launch_bounds__(256, 1)`: one block per SM. kvSplit heuristic is now
+  `clamp(ceil(seqKv / 128), 1, maxCoResident/numKvHeads)` (`CudaKernels.ComputeAttentionMmaV2KvSplit`,
+  `DOTLLM_ATTN_MMA_V2_MIN_KV` override); on a 28-SM 3060 that is 7 splits x 4 KV heads.
+
+The fused quantized-KV kernels (`..._split_kvq_v2_{q8q8,q4q4,q8q4,q4q8}`) instantiate the **same body** with loader
+policies (`V2LoadQ8`/`V2LoadQ4`: one scale + four `u16` data loads per 8 elements, exact `half(d * q)` dequant), so fused
+output is bit-identical to dequant-scratch + the F16 v2 kernel (tested, kernel level and real model).
+
+**Selection / opt-outs.** v2 is the default; `DOTLLM_ATTN_MMA_DECODE_V2=0` (or `CudaKernels.MmaDecodeV2Enabled = false`
+in-process) selects v1 for A/B. Fused quantized decode (`DOTLLM_HYBRID_KV_FUSED`) is now **default ON when the v2 fused
+kernels are loaded** and OFF otherwise (v1 fused is still slower than scratch); `=1` / `=0` force it.
+
+### Measurements (RTX 3060, Bonsai-2 shape 24/4/256, synthetic data, ms per launch; GPU shared with other jobs)
+
+Kernel microbench (`CudaAttentionMmaDecodeV2Tests.Microbench_*`, `DOTLLM_ATTN_MICROBENCH=1`):
+
+| seqKv | v1 F16 | v2 F16 | v2 eff. GB/s | scratch(dequant)+v2 Q8_0 / Q4_0 | fused v2 Q8_0 | fused v2 Q4_0 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 512   | 0.060 | 0.026 | 79  | - | - | - |
+| 4096  | 0.359 | 0.075 | 223 | 0.195 / 0.195 | 0.056 | 0.050 |
+| 16384 | 1.340 | 0.222 | 302 | 0.670 / 0.668 | 0.139 | 0.114 |
+| 65536 | 5.389 | 0.819 | 328 | 2.697 / 2.656 | 0.477 | 0.383 |
+
+v2 F16 is at the DRAM roofline (~330 GB/s of ~360); the fused quantized kernels beat F16 because they read 2-4x fewer
+bytes. (v1 fused was 2.1 ms at 16k, v1 scratch 1.8 ms.)
+
+End-to-end (`bench -p 512 -n 64 --depth-list 0,3584,15872`, MTP off), decode tok/s at ctx 512 / 4096 / 16384:
+
+| KV | before (#956 measurements) | after |
+|---|---|---|
+| F16 | 18.8 / - / 14.5 | 19.2 / 19.6 / 19.4 |
+| Q4_0 fused (new default) | 18.2 / - / 12.4 (fused v1), 18.7 / - / 13.3 (scratch) | 18.5 / 18.6 / 18.7 |
+
+Parity: v2 vs F64 reference max abs error ~1e-5 at seqKv in {1,15,16,17,255,256,4096,16385} (v1 vs v2 <= 2.6e-5);
+`CudaAttentionMmaDecodeGqaSplitGenerationParityTests` PPL delta -0.04% (pre-gate bit-identical).
