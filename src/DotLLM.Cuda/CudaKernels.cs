@@ -557,6 +557,25 @@ public sealed unsafe class CudaKernels : IDisposable
     private int _attnMmaDecodeGqaSplitMaxCoResidentGrid = -1; // -1 = not yet queried
     private int _attnMmaDecodeGqaSplitCachedGroup = -1;        // group the cached query above is valid for
 
+    // Issue #988: v2 (warp-independent, register-resident) decode kernels living in the same PTX
+    // modules as the v1 kernels above. v1 stays loaded as the DOTLLM_ATTN_MMA_DECODE_V2=0 fallback.
+    private nint _attentionMmaDecodeGqaSplitV2Func;
+    private readonly nint[] _attentionMmaDecodeKvqV2Funcs = new nint[4];
+    private readonly int[] _attentionMmaDecodeKvqV2MaxCoResident = { -1, -1, -1, -1 };
+    private int _attnMmaDecodeGqaSplitV2MaxCoResidentGrid = -1;
+
+    /// <summary>
+    /// Issue #988: selects the v2 mma decode kernels (default ON; <c>DOTLLM_ATTN_MMA_DECODE_V2=0</c>
+    /// opts back out to v1). Mutable so tests/benchmarks can A/B within one process; the
+    /// per-function co-residency ceilings are cached separately so toggling is safe.
+    /// </summary>
+    public static bool MmaDecodeV2Enabled =
+        Environment.GetEnvironmentVariable("DOTLLM_ATTN_MMA_DECODE_V2") != "0";
+
+    private bool UseMmaDecodeV2 => MmaDecodeV2Enabled && _attentionMmaDecodeGqaSplitV2Func != 0;
+    private nint ActiveMmaDecodeFunc => UseMmaDecodeV2 ? _attentionMmaDecodeGqaSplitV2Func : _attentionMmaDecodeGqaSplitFunc;
+    private bool UseMmaDecodeKvqV2(int idx) => MmaDecodeV2Enabled && _attentionMmaDecodeKvqV2Funcs[idx] != 0;
+
 
     /// <summary>
     /// The directory this instance loaded its PTX from — lets an optional, separately-owned kernel
@@ -1327,12 +1346,14 @@ public sealed unsafe class CudaKernels : IDisposable
             {
                 var mmaDecodeGqaSplitModule = CudaModule.LoadFromFile(attentionMmaDecodeGqaSplitPath);
                 _attentionMmaDecodeGqaSplitFunc = mmaDecodeGqaSplitModule.TryGetFunction("attention_flash_mma_decode_gqa_split_f16");
+                _attentionMmaDecodeGqaSplitV2Func = mmaDecodeGqaSplitModule.TryGetFunction("attention_flash_mma_decode_gqa_split_f16_v2");
                 _attentionMmaDecodeGqaSplitModule = mmaDecodeGqaSplitModule;
             }
             catch (CudaException)
             {
                 _attentionMmaDecodeGqaSplitModule = null;
                 _attentionMmaDecodeGqaSplitFunc = 0;
+                _attentionMmaDecodeGqaSplitV2Func = 0;
             }
         }
 
@@ -1350,13 +1371,18 @@ public sealed unsafe class CudaKernels : IDisposable
                     "attention_flash_mma_decode_gqa_split_kvq_q4q8",
                 };
                 for (int i = 0; i < names.Length; i++)
+                {
                     _attentionMmaDecodeKvqFuncs[i] = kvqModule.TryGetFunction(names[i]);
+                    _attentionMmaDecodeKvqV2Funcs[i] = kvqModule.TryGetFunction(
+                        names[i].Replace("_kvq_", "_kvq_v2_"));
+                }
                 _attentionMmaDecodeKvqModule = kvqModule;
             }
             catch (CudaException)
             {
                 _attentionMmaDecodeKvqModule = null;
                 Array.Clear(_attentionMmaDecodeKvqFuncs);
+                Array.Clear(_attentionMmaDecodeKvqV2Funcs);
             }
         }
     }
@@ -3058,6 +3084,14 @@ public sealed unsafe class CudaKernels : IDisposable
     {
         if (_attentionMmaDecodeGqaSplitFunc == 0 || numKvHeads <= 0 || group <= 0) return 0;
 
+        if (UseMmaDecodeV2)
+        {
+            if (_attnMmaDecodeGqaSplitV2MaxCoResidentGrid < 0)
+                _attnMmaDecodeGqaSplitV2MaxCoResidentGrid = QueryCoResidentGrid(_attentionMmaDecodeGqaSplitV2Func);
+            return _attnMmaDecodeGqaSplitV2MaxCoResidentGrid <= 0
+                ? 0 : _attnMmaDecodeGqaSplitV2MaxCoResidentGrid / numKvHeads;
+        }
+
         if (_attnMmaDecodeGqaSplitMaxCoResidentGrid < 0 || _attnMmaDecodeGqaSplitCachedGroup != group)
         {
             CudaDriverApi.cuCtxGetDevice(out int device);
@@ -3082,6 +3116,47 @@ public sealed unsafe class CudaKernels : IDisposable
 
         if (_attnMmaDecodeGqaSplitMaxCoResidentGrid <= 0) return 0;
         return _attnMmaDecodeGqaSplitMaxCoResidentGrid / numKvHeads; // integer floor; 0 = unsafe at any split
+    }
+
+    private int QueryCoResidentGrid(nint func)
+    {
+        CudaDriverApi.cuCtxGetDevice(out int device);
+        CudaDriverApi.cuDeviceGetAttribute(out int coopSupported,
+            CudaDriverApi.CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH, device);
+        if (coopSupported == 0) return 0;
+        CudaDriverApi.cuDeviceGetAttribute(out int numSms,
+            CudaDriverApi.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
+        int rc = CudaDriverApi.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+            out int maxBlocksPerSm, func, AttentionMmaDecodeGqaSplitBlockSize, dynamicSMemSize: 0);
+        return rc == 0 ? numSms * maxBlocksPerSm : 0;
+    }
+
+    /// <summary>True when the v2 fused quantized-KV kernel for this K/V pair is loaded AND v2 is selected (issue #988).</summary>
+    public bool HasAttentionMmaDecodeKvqV2(KvCacheDType kDtype, KvCacheDType vDtype)
+    {
+        int i = KvqIndex(kDtype, vDtype);
+        return i >= 0 && UseMmaDecodeKvqV2(i);
+    }
+
+    /// <summary>True when the v2 decode kernel (issue #988) is loaded AND selected.</summary>
+    public bool MmaDecodeV2Active => UseMmaDecodeV2;
+
+    /// <summary>
+    /// Minimum KV rows per split for the v2 kernel (8 warps x 16-key tiles = 128 keys keeps every
+    /// warp busy). <c>DOTLLM_ATTN_MMA_V2_MIN_KV</c> overrides.
+    /// </summary>
+    private static readonly int MmaV2MinKvPerSplit = EnvIntOrDefault("DOTLLM_ATTN_MMA_V2_MIN_KV", 128);
+
+    /// <summary>
+    /// kvSplit for the v2 decode kernels: <c>clamp(ceil(seqKv / MmaV2MinKvPerSplit), 1, maxSafe)</c>.
+    /// v2 blocks are independent warp streams (no per-tile barrier), so the split only has to
+    /// fill the SMs, not hide sync latency like v1's heuristic assumes.
+    /// </summary>
+    public static int ComputeAttentionMmaV2KvSplit(int seqKv, int maxSafeSplit)
+    {
+        if (seqKv <= 0 || maxSafeSplit <= 0) return 1;
+        int byKv = (seqKv + MmaV2MinKvPerSplit - 1) / MmaV2MinKvPerSplit;
+        return Math.Max(1, Math.Min(byKv, maxSafeSplit));
     }
 
     /// <summary>
@@ -3118,7 +3193,7 @@ public sealed unsafe class CudaKernels : IDisposable
         void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
                         &skvArg, &nhArg, &nkvArg, &scArg, &ksArg, &pmArg, &psArg, &poutArg};
 
-        CudaDriverApi.cuLaunchCooperativeKernel(_attentionMmaDecodeGqaSplitFunc,
+        CudaDriverApi.cuLaunchCooperativeKernel(ActiveMmaDecodeFunc,
                 (uint)numKvHeads, (uint)kvSplit, 1, AttentionMmaDecodeGqaSplitBlockSize, 1, 1,
                 0, stream, (nint)args).ThrowOnError();
     }
@@ -3148,6 +3223,14 @@ public sealed unsafe class CudaKernels : IDisposable
     {
         int idx = KvqIndex(kDtype, vDtype);
         if (idx < 0 || _attentionMmaDecodeKvqFuncs[idx] == 0 || numKvHeads <= 0) return 0;
+
+        if (UseMmaDecodeKvqV2(idx))
+        {
+            if (_attentionMmaDecodeKvqV2MaxCoResident[idx] < 0)
+                _attentionMmaDecodeKvqV2MaxCoResident[idx] = QueryCoResidentGrid(_attentionMmaDecodeKvqV2Funcs[idx]);
+            int g2 = _attentionMmaDecodeKvqV2MaxCoResident[idx];
+            return g2 <= 0 ? 0 : g2 / numKvHeads;
+        }
 
         if (_attentionMmaDecodeKvqMaxCoResident[idx] < 0)
         {
@@ -3196,7 +3279,8 @@ public sealed unsafe class CudaKernels : IDisposable
         void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
                         &skvArg, &nhArg, &nkvArg, &scArg, &ksArg, &pmArg, &psArg, &poutArg};
 
-        CudaDriverApi.cuLaunchCooperativeKernel(_attentionMmaDecodeKvqFuncs[idx],
+        nint kvqFunc = UseMmaDecodeKvqV2(idx) ? _attentionMmaDecodeKvqV2Funcs[idx] : _attentionMmaDecodeKvqFuncs[idx];
+        CudaDriverApi.cuLaunchCooperativeKernel(kvqFunc,
                 (uint)numKvHeads, (uint)kvSplit, 1, AttentionMmaDecodeGqaSplitBlockSize, 1, 1,
                 0, stream, (nint)args).ThrowOnError();
     }

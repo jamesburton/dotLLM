@@ -175,12 +175,28 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     private nint[]? _kQuant;
     private nint[]? _vQuant;
 
-    // Fused dequant-in-load decode attention for quantized KV (issue #956). Default OFF: measured
-    // on the RTX 3060 at ctx 16384 it is SLOWER than dequant-into-scratch + the F16 kernel (Q4_0:
-    // 12.4 vs 13.3 tok/s; its per-element block loads are uncoalesced). Bit-identical output either
-    // way (tested); DOTLLM_HYBRID_KV_FUSED=1 opts in for A/B until the load path is vectorized.
-    internal bool FuseQuantKvDecodeForTest { get; set; } =
-        Environment.GetEnvironmentVariable("DOTLLM_HYBRID_KV_FUSED") == "1";
+    // Fused dequant-in-load decode attention for quantized KV (issue #956 / #988).
+    // History: #956 shipped it default OFF because the v1 load path (one element + one scale load per
+    // thread, uncoalesced) measured SLOWER than dequant-into-scratch + the F16 kernel at ctx 16k
+    // (Q4_0: 12.4 vs 13.3 tok/s). #988's v2 kernel loads whole 32-element blocks per quad with
+    // vectorised byte loads and reads 2-4x fewer bytes than F16; at the kernel level it is ~5-6x
+    // faster than scratch+F16 (16k keys: 0.11-0.14 ms vs 0.67 ms) and bit-identical (tested).
+    // So the default is: ON when the v2 fused kernels are loaded and selected, OFF otherwise (v1
+    // fused stays slower than scratch). DOTLLM_HYBRID_KV_FUSED=1 forces ON, =0 forces OFF.
+    private bool? _fuseQuantKvDecodeOverride;
+    internal bool FuseQuantKvDecodeForTest
+    {
+        get => _fuseQuantKvDecodeOverride ?? DefaultFuseQuantKvDecode();
+        set => _fuseQuantKvDecodeOverride = value;
+    }
+
+    private bool DefaultFuseQuantKvDecode()
+    {
+        string? env = Environment.GetEnvironmentVariable("DOTLLM_HYBRID_KV_FUSED");
+        if (env == "1") return true;
+        if (env == "0") return false;
+        return _kernels.HasAttentionMmaDecodeKvqV2(_kvKeyDType, _kvValueDType);
+    }
 
     /// <summary>Test-only: decode attention calls served by the fused quantized-KV kernel.</summary>
     internal int DebugFusedKvqAttentionCallsForTest { get; private set; }

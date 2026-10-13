@@ -116,6 +116,7 @@ internal sealed class CudaAttentionMmaDecodeGqaSplit
     {
         int maxSafe = _kernels.MaxSafeAttentionMmaDecodeGqaSplit(numKvHeads, SupportedHeadDim, group);
         if (maxSafe <= 0) return 0;
+        if (_kernels.MmaDecodeV2Active) return CudaKernels.ComputeAttentionMmaV2KvSplit(seqKv, maxSafe);
         return CudaKernels.ComputeAttentionKvSplit(seqKv, numKvHeads, maxSafe);
     }
 
@@ -135,6 +136,7 @@ internal sealed class CudaAttentionMmaDecodeGqaSplit
     {
         int maxSafe = _kernels.MaxSafeAttentionMmaDecodeKvq(numKvHeads, kDtype, vDtype);
         if (maxSafe <= 0) return 0;
+        if (CudaKernels.MmaDecodeV2Enabled) return CudaKernels.ComputeAttentionMmaV2KvSplit(seqKv, maxSafe);
         return CudaKernels.ComputeAttentionKvSplit(seqKv, numKvHeads, maxSafe);
     }
 
