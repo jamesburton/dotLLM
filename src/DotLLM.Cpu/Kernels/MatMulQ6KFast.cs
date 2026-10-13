@@ -17,6 +17,12 @@ public static unsafe partial class MatMul
     internal static void Q6KRows4Tokens1(byte* w0, byte* w1, byte* w2, byte* w3, byte* q8k,
         int superBlockCount, int wStride, float* results)
     {
+        if (!FastKQuantIsa)
+        {
+            VecDotQ6_K_Q8_K_4RowsReference(w0, w1, w2, w3, q8k, superBlockCount, wStride, results);
+            return;
+        }
+
         results[0] = Q6KRowTok1(w0, q8k, superBlockCount, wStride);
         results[1] = Q6KRowTok1(w1, q8k, superBlockCount, wStride);
         results[2] = Q6KRowTok1(w2, q8k, superBlockCount, wStride);
@@ -29,6 +35,18 @@ public static unsafe partial class MatMul
         float* results, int ldc)
     {
         int wStride = 4 * Q6_K_BlockBytes;
+        if (!FastKQuantIsa)
+        {
+            float* tmp = stackalloc float[4];
+            for (int t = 0; t < 4; t++)
+            {
+                VecDotQ6_K_Q8_K_4RowsReference(groupBase, groupBase + Q6_K_BlockBytes, groupBase + 2 * Q6_K_BlockBytes,
+                    groupBase + 3 * Q6_K_BlockBytes, q8k + (long)t * q8RowBytes, superBlockCount, wStride, tmp);
+                for (int r = 0; r < 4; r++) results[(long)t * ldc + r] = tmp[r];
+            }
+            return;
+        }
+
         for (int r = 0; r < 4; r++)
             Q6KRowTok4(groupBase + r * Q6_K_BlockBytes, q8k, q8RowBytes, superBlockCount, wStride,
                 results + r, ldc);

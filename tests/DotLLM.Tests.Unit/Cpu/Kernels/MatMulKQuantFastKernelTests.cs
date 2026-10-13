@@ -24,10 +24,11 @@ public sealed unsafe class MatMulKQuantFastKernelTests
         return d;
     }
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Cases))]
     public void FastKernels_MatchReference_BitExact(int fmt, int sbCount)
     {
+        Skip.IfNot(MatMul.FastKQuantIsa, "fast K-quant kernels need AVX2 + SSE4.1");
         bool q6 = fmt == 6, q5 = fmt == 5;
         int blockBytes = q6 ? 210 : q5 ? 176 : 144;
         int k = sbCount * 256;
@@ -121,12 +122,13 @@ public sealed unsafe class MatMulKQuantFastKernelTests
     /// whole 4-row groups. M = 250 forces three tiles and a 2-row remainder; n = 9 forces two 4-token blocks
     /// plus a single-token tail. Must equal the serial per-token result bit for bit.
     /// </summary>
-    [Theory]
+    [SkippableTheory]
     [InlineData(4)]
     [InlineData(5)]
     [InlineData(6)]
     public void RowMajorPooledGemm_FourTokenPath_MatchesSerial_BitExact(int fmt)
     {
+        Skip.IfNot(MatMul.FastKQuantIsa, "fast K-quant kernels need AVX2 + SSE4.1");
         bool q6 = fmt == 6, q5 = fmt == 5;
         const int m = 250, k = 4096, n = 9;
         int sb = k / 256;
@@ -173,6 +175,92 @@ public sealed unsafe class MatMulKQuantFastKernelTests
             NativeMemory.AlignedFree(x);
             NativeMemory.AlignedFree(serial);
             NativeMemory.AlignedFree(pooled);
+        }
+    }
+
+    /// <summary>
+    /// With the fast ISA forced off (what a non-AVX2 / non-x86 host sees) every entry point and dispatcher must
+    /// fall back to the reference kernels and never throw PlatformNotSupportedException. Runs on every host.
+    /// </summary>
+    [Theory]
+    [InlineData(4)]
+    [InlineData(5)]
+    [InlineData(6)]
+    public void FastIsaForcedOff_EntryPointsFallBackToReference(int fmt)
+    {
+        bool q6 = fmt == 6, q5 = fmt == 5;
+        int bb = q6 ? 210 : q5 ? 176 : 144;
+        const int sb = 2, tokens = 4;
+        int k = sb * 256, q8Row = sb * Q8KBytes;
+        var rng = new Random(77 + fmt);
+        byte* w = (byte*)NativeMemory.AlignedAlloc((nuint)(4L * sb * bb), 64);
+        byte* x = (byte*)NativeMemory.AlignedAlloc((nuint)((long)tokens * q8Row), 64);
+        float* src = (float*)NativeMemory.AlignedAlloc((nuint)(k * 4), 64);
+        float* exp = (float*)NativeMemory.AlignedAlloc(tokens * 4 * 4, 64);
+        float* act = (float*)NativeMemory.AlignedAlloc(tokens * 4 * 4, 64);
+        bool prev = MatMul.ForceDisableFastKQuant;
+        try
+        {
+            for (int i = 0; i < 4 * sb * bb; i++) w[i] = (byte)rng.Next(256);
+            for (int b = 0; b < 4 * sb; b++)
+            {
+                byte* blk = w + (long)b * bb;
+                if (q6) *(Half*)(blk + 208) = (Half)0.01f;
+                else { *(Half*)blk = (Half)0.01f; *(Half*)(blk + 2) = (Half)0.005f; }
+            }
+            for (int t = 0; t < tokens; t++)
+            {
+                for (int i = 0; i < k; i++) src[i] = (float)(rng.NextDouble() - 0.5);
+                MatMul.QuantizeF32ToQ8_K(src, x + (long)t * q8Row, k);
+            }
+
+            int stride = 4 * bb;
+            for (int t = 0; t < tokens; t++)
+            {
+                byte* q = x + (long)t * q8Row;
+                if (q6) MatMul.VecDotQ6_K_Q8_K_4RowsReference(w, w + bb, w + 2 * bb, w + 3 * bb, q, sb, stride, exp + t * 4);
+                else if (q5) MatMul.VecDotQ5_K_Q8_K_4RowsReference(w, w + bb, w + 2 * bb, w + 3 * bb, q, sb, stride, exp + t * 4);
+                else MatMul.VecDotQ4_K_Q8_K_4RowsReference(w, w + bb, w + 2 * bb, w + 3 * bb, q, sb, stride, exp + t * 4);
+            }
+
+            MatMul.ForceDisableFastKQuant = true;
+            Assert.False(MatMul.FastKQuantIsa);
+
+            // 4-token entry point.
+            new Span<float>(act, tokens * 4).Clear();
+            if (q6) MatMul.Q6KRows4Tokens4(w, sb, x, q8Row, act, 4);
+            else if (q5) MatMul.Q5KRows4Tokens4(w, sb, x, q8Row, act, 4);
+            else MatMul.Rows4Tokens4(w, sb, x, q8Row, act, 4);
+            AssertBits(exp, act, tokens * 4, $"Q{fmt}_K forced-off 4-token entry point");
+
+            // 1-token entry point and the public dispatcher.
+            for (int pass = 0; pass < 2; pass++)
+            {
+                new Span<float>(act, tokens * 4).Clear();
+                for (int t = 0; t < tokens; t++)
+                {
+                    byte* q = x + (long)t * q8Row;
+                    if (pass == 0)
+                    {
+                        if (q6) MatMul.Q6KRows4Tokens1(w, w + bb, w + 2 * bb, w + 3 * bb, q, sb, stride, act + t * 4);
+                        else if (q5) MatMul.Q5KRows4Tokens1(w, w + bb, w + 2 * bb, w + 3 * bb, q, sb, stride, act + t * 4);
+                        else MatMul.Q4KRows4Tokens1(w, w + bb, w + 2 * bb, w + 3 * bb, q, sb, stride, act + t * 4);
+                    }
+                    else
+                    {
+                        if (q6) MatMul.VecDotQ6_K_Q8_K_4Rows(w, w + bb, w + 2 * bb, w + 3 * bb, q, sb, stride, act + t * 4);
+                        else if (q5) MatMul.VecDotQ5_K_Q8_K_4Rows(w, w + bb, w + 2 * bb, w + 3 * bb, q, sb, stride, act + t * 4);
+                        else MatMul.VecDotQ4_K_Q8_K_4Rows(w, w + bb, w + 2 * bb, w + 3 * bb, q, sb, stride, act + t * 4);
+                    }
+                }
+                AssertBits(exp, act, tokens * 4, $"Q{fmt}_K forced-off {(pass == 0 ? "1-token entry point" : "dispatcher")}");
+            }
+        }
+        finally
+        {
+            MatMul.ForceDisableFastKQuant = prev;
+            NativeMemory.AlignedFree(w); NativeMemory.AlignedFree(x); NativeMemory.AlignedFree(src);
+            NativeMemory.AlignedFree(exp); NativeMemory.AlignedFree(act);
         }
     }
 

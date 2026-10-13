@@ -27,6 +27,12 @@ namespace DotLLM.Cpu.Kernels;
 /// </remarks>
 public static unsafe partial class MatMul
 {
+    /// <summary>Test/diagnostic switch: pretend the AVX2 fast K-quant ISA is unavailable (forces the reference kernels).</summary>
+    internal static volatile bool ForceDisableFastKQuant;
+
+    /// <summary>True when the hoisted/4-token K-quant kernels may run (AVX2 + SSE4.1 and not force-disabled).</summary>
+    internal static bool FastKQuantIsa => !ForceDisableFastKQuant && Avx2.IsSupported && Sse41.IsSupported;
+
     /// <summary>
     /// 4 rows x 1 token. <paramref name="w0"/> is the first row's first super-block, rows are
     /// <see cref="Q4_K_BlockBytes"/> apart within a group, super-blocks of one row are
@@ -36,6 +42,12 @@ public static unsafe partial class MatMul
     internal static void Q4KRows4Tokens1(byte* w0, byte* w1, byte* w2, byte* w3, byte* q8k,
         int superBlockCount, int wStride, float* results)
     {
+        if (!FastKQuantIsa)
+        {
+            VecDotQ4_K_Q8_K_4RowsReference(w0, w1, w2, w3, q8k, superBlockCount, wStride, results);
+            return;
+        }
+
         results[0] = Q4KRowTok1(w0, q8k, superBlockCount, wStride);
         results[1] = Q4KRowTok1(w1, q8k, superBlockCount, wStride);
         results[2] = Q4KRowTok1(w2, q8k, superBlockCount, wStride);
@@ -53,6 +65,18 @@ public static unsafe partial class MatMul
         float* results, int ldc)
     {
         int wStride = 4 * Q4_K_BlockBytes;
+        if (!FastKQuantIsa)
+        {
+            float* tmp = stackalloc float[4];
+            for (int t = 0; t < 4; t++)
+            {
+                VecDotQ4_K_Q8_K_4RowsReference(groupBase, groupBase + Q4_K_BlockBytes, groupBase + 2 * Q4_K_BlockBytes,
+                    groupBase + 3 * Q4_K_BlockBytes, q8k + (long)t * q8RowBytes, superBlockCount, wStride, tmp);
+                for (int r = 0; r < 4; r++) results[(long)t * ldc + r] = tmp[r];
+            }
+            return;
+        }
+
         for (int r = 0; r < 4; r++)
         {
             Q4KRowTok4(groupBase + r * Q4_K_BlockBytes, q8k, q8RowBytes, superBlockCount, wStride,
