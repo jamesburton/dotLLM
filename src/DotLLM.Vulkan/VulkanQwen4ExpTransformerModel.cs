@@ -94,6 +94,17 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
     private readonly VulkanQwen4ExpGrWeights[] _attnGr, _ffnGr;
     private readonly VulkanQwen4ExpGrWeights _headGr;
     private readonly VulkanQwen3MoeMoeUpload.LayerBundle[] _moe;
+    /// <summary>Expert tiering (#939): non-null when the routed experts live on the SSD and a per-layer slot pool caches them. Set once by the loader.</summary>
+    private Tiering.VulkanExpertTier? _tier;
+
+    /// <summary>The expert tier (null = every routed expert is resident). Counters and the summary line are the tiering evidence.</summary>
+    internal Tiering.VulkanExpertTier? ExpertTier => _tier;
+
+    /// <summary>True when the routed experts are tiered (decode-shaped single-row forwards; MTP, speculative verify and batched forwards are not available).</summary>
+    public bool ExpertsTiered => _tier is not null;
+
+    /// <summary>Tiering counters on one line (hit rate, SSD bytes, stall split); null when not tiered.</summary>
+    public string? ExpertTierSummary => _tier?.Describe();
     private readonly Qwen4ExpPleBranch? _ple;
     private readonly VulkanQwen4ExpPleGpu? _pleGpu;
     private readonly int _pleLayer;
@@ -411,7 +422,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
     /// many rows at load. A longer call (a whole perplexity window, an unchunked prompt) is split into chunks of this size, which equals a chunked prefill
     /// (verified bit-for-bit class: relL2 3e-7) instead of growing the scratch past the resident-memory wall after the weights filled it.
     /// </summary>
-    public int MaxRowsPerForward => Qwen4ExpResidencyPlan.PlannedRows(_kvCapacity);
+    public int MaxRowsPerForward => _tier is not null ? 1 : Qwen4ExpResidencyPlan.PlannedRows(_kvCapacity);
 
     private ITensor ForwardChunked(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, VulkanQwen4ExpSequenceState state,
                                    IKvCache? kvCache, bool lastTokenLogitsOnly, bool allRows, int cap)
@@ -529,7 +540,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         bool splitHalves = T > SplitHalvesAbove;
         // #885: ONE fence-free mid-forward submit a few layers after the host PLE step (or from the start without one): the GPU runs those layers
         // while the host records the remaining ~45 (~1.3 ms of recording that would otherwise be idle GPU time). Same queue order, so bit-identical.
-        int splitAt = !splitHalves && DecodeSplitLayers > 0 && Trace is null && (!_core.Q4StageProfiling || StageTimestamps)
+        int splitAt = !splitHalves && _tier is null && DecodeSplitLayers > 0 && Trace is null && (!_core.Q4StageProfiling || StageTimestamps)
             ? (_ple is not null ? _pleLayer : 0) + DecodeSplitLayers : -1;
 
         void GrRead(VulkanQwen4ExpGrWeights w, VulkanDevice.Buffer src, int tokens, bool inject)
@@ -537,6 +548,12 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
 
         _core.Q4DecodeMr = DecodeMoeMr;
         Begin();
+        if (_tier is { } tier)
+        {
+            if (T != 1) throw new NotSupportedException("Tiered routed experts support single-row forwards only (MTP verify / batched rows need the resident bank).");
+            tier.EndSubmit = End;
+            tier.Begin = () => { Begin(); return cmd; };
+        }
         _core.Q4StageBegin();
         if (NgramPrefetch) _ple?.BeginPrefetch(tokenIds, state.Ple!);   // #822: the n-gram rows depend only on token ids - start paging the table in before layer 0
         // #885: the PLE key/value projections need only the token ids: run them on the GPU ahead of layer 0 (short forwards), so the host step
@@ -893,6 +910,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         _pleGpu?.Dispose();
         _defaultState.Dispose();
         foreach (var m in _moe) m.Dispose();
+        _tier?.Dispose();
         foreach (var g in _attnGr) g.Dispose();
         foreach (var g in _ffnGr) g.Dispose();
         _headGr.Dispose();

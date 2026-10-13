@@ -139,6 +139,25 @@ internal static class VulkanQwen3MoeMoeUpload
         public QuantizationType W3QuantType { get; }
 
         public int NumExperts { get; }
+
+        /// <summary>
+        /// Expert slots per layer when the routed banks are TIERED (#939): <see cref="W1Bank"/> / <see cref="W2Bank"/> / <see cref="W3Bank"/> then hold only this many
+        /// experts (slot-indexed) and <see cref="Tier"/> keeps them filled. 0 = the banks hold all <see cref="NumExperts"/> experts (resident, the default).
+        /// </summary>
+        public int SlotCount { get; init; }
+
+        /// <summary>Experts the bank buffers hold: what the indexed expert kernels take as their <c>numExperts</c> bound (the router still scores <see cref="NumExperts"/>).</summary>
+        public int BankExperts => SlotCount > 0 ? SlotCount : NumExperts;
+
+        /// <summary>Tiering host step (null = resident: the recorded command stream is exactly the untiered one).</summary>
+        internal Tiering.VulkanExpertTier? Tier { get; private set; }
+
+        /// <summary>Layer index this bundle has inside <see cref="Tier"/>.</summary>
+        internal int TierLayer { get; private set; }
+
+        /// <summary>Connects the bundle to the tier that fills its slots.</summary>
+        internal void AttachTier(Tiering.VulkanExpertTier tier, int layer) { Tier = tier; TierLayer = layer; }
+
         public int NumExpertsPerTok { get; }
         public int IntermediateSize { get; }
         public bool NormTopKProb { get; }
@@ -246,9 +265,10 @@ internal static class VulkanQwen3MoeMoeUpload
     /// </param>
     /// <param name="sharedStaging">Optional caller-owned (typically multi-threaded) staging buffer reused across layers; null = a per-layer one (#874).</param>
     /// <param name="prealloc">Optional pool of bank buffers allocated ahead on background threads; null = allocate inline (#874).</param>
+    /// <param name="expertSlots">Expert tiering (#939): when &gt; 0 the three routed banks are allocated for this many experts and left EMPTY (filled on demand by the tier); 0 = full resident banks.</param>
     public static unsafe LayerBundle UploadLayer(
         VulkanDevice device, MoeLayerWeights moe, int hiddenSize,
-        bool residentQuant = false, VulkanStagingBuffer? sharedStaging = null, VulkanBankPrealloc? prealloc = null)
+        bool residentQuant = false, VulkanStagingBuffer? sharedStaging = null, VulkanBankPrealloc? prealloc = null, int expertSlots = 0)
     {
         int numE = moe.NumExperts;
         int interm = moe.IntermediateSize;
@@ -288,12 +308,23 @@ internal static class VulkanQwen3MoeMoeUpload
         //       staging at the expert's contiguous slot, then copy. Device
         //       buffer is at a fraction of the F32 size (quant-dependent).
         long tBanks = System.Diagnostics.Stopwatch.GetTimestamp();
-        VulkanDevice.Buffer w1Bank = UploadRoutedBankAnyQuant(
+        VulkanDevice.Buffer w1Bank, w2Bank, w3Bank;
+        if (expertSlots > 0)
+        {
+            // #939 tiered: the banks are slot pools, filled on demand from the file; nothing is read from (or touches) the routed-expert pages here.
+            w1Bank = AllocateSlotBank(device, w1Qt, moe.GateExpsRawQt, 'G', expertSlots, interm, hiddenSize);
+            w2Bank = AllocateSlotBank(device, w2Qt, moe.DownExpsRawQt, 'D', expertSlots, hiddenSize, interm);
+            w3Bank = AllocateSlotBank(device, w3Qt, moe.UpExpsRawQt, 'U', expertSlots, interm, hiddenSize);
+        }
+        else
+        {
+        w1Bank = UploadRoutedBankAnyQuant(
             device, staging, moe, w1Qt, kind: 'G', numE: numE, mDim: interm, kDim: hiddenSize, elemsF32: w1Elems, prealloc);
-        VulkanDevice.Buffer w2Bank = UploadRoutedBankAnyQuant(
+        w2Bank = UploadRoutedBankAnyQuant(
             device, staging, moe, w2Qt, kind: 'D', numE: numE, mDim: hiddenSize, kDim: interm, elemsF32: w2Elems, prealloc);
-        VulkanDevice.Buffer w3Bank = UploadRoutedBankAnyQuant(
+        w3Bank = UploadRoutedBankAnyQuant(
             device, staging, moe, w3Qt, kind: 'U', numE: numE, mDim: interm, kDim: hiddenSize, elemsF32: w1Elems, prealloc);
+        }
 
         Interlocked.Add(ref s_banksTicks, System.Diagnostics.Stopwatch.GetTimestamp() - tBanks);
         // ── Shared expert (optional) ─────────────────────────────────────────
@@ -355,10 +386,27 @@ internal static class VulkanQwen3MoeMoeUpload
             sharedGate: sharedGate, sharedUp: sharedUp, sharedDown: sharedDown,
             sharedExpertGate: sharedExpertGate, sharedQuantType: sharedQt)
         {
+            SlotCount = expertSlots,
             SharedGateQ8 = sharedGateQ8,
             SharedUpQ8 = sharedUpQ8,
         };
     }
+
+    /// <summary>
+    /// Bytes of one expert of a routed bank stored raw at <paramref name="quantType"/> (the tiering unit, #939):
+    /// <c>mDim</c> rows of <c>RowByteSize(kDim)</c>. Throws for a bank that would be widened to F32: tiering moves the on-disk bytes verbatim.
+    /// </summary>
+    internal static long TieredExpertBytes(QuantizationType quantType, QuantizationType sourceQt, char kind, int mDim, int kDim)
+    {
+        if (quantType == QuantizationType.F32 || quantType != sourceQt)
+            throw new NotSupportedException(
+                $"Expert tiering needs every routed bank to stay packed on the device, but the {kind} bank (source {sourceQt}) would be {quantType}: " +
+                "there is no resident indexed kernel for it (see VulkanQwen3MoeMoeUpload.BankStaysPacked). Widening to F32 would make a slot 4-8x larger and add a dequant to every miss.");
+        return Dequantize.RowByteSize(kDim, quantType) * mDim;
+    }
+
+    private static VulkanDevice.Buffer AllocateSlotBank(VulkanDevice device, QuantizationType quantType, QuantizationType sourceQt, char kind, int slots, int mDim, int kDim)
+        => device.AllocateDeviceLocal(slots * TieredExpertBytes(quantType, sourceQt, kind, mDim, kDim));
 
     /// <summary>
     /// Allocates and uploads ONE routed bank at its resolved quant type —

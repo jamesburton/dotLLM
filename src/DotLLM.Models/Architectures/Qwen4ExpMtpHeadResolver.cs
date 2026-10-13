@@ -61,6 +61,12 @@ public static class Qwen4ExpMtpHeadResolver
     public static string? TryAttach(IModel model, string modelPath, string? explicitPath = null, long trunkBytes = -1)
     {
         if (model is not IMtpHeadAttachable q4 || q4.HasMtpHead) return null;
+        if (!q4.CanAttachMtpHead)
+        {
+            if (explicitPath is not null)
+                throw new NotSupportedException("An MTP head cannot be attached while the routed experts are tiered (DOTLLM_VK_EXPERT_SLOTS): a verify window of 5 rows touches 31-33 experts per layer.");
+            return null;
+        }
         string? path = explicitPath;
         if (path is not null)
         {
