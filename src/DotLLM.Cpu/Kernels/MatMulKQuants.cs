@@ -796,6 +796,22 @@ public static unsafe partial class MatMul
         byte* w0, byte* w1, byte* w2, byte* w3,
         byte* q8k, int superBlockCount, int wStride, float* results)
     {
+        if (Avx2.IsSupported && Sse41.IsSupported)
+        {
+            // Bit-identical rewrite (#933).
+            Q5KRows4Tokens1(w0, w1, w2, w3, q8k, superBlockCount, wStride, results);
+            return;
+        }
+
+        VecDotQ5_K_Q8_K_4RowsReference(w0, w1, w2, w3, q8k, superBlockCount, wStride, results);
+    }
+
+    /// <summary>Original (pre-#933) 4-row Q5_K x Q8_K kernel; the bit-exactness oracle for the fast kernels.</summary>
+    [SkipLocalsInit]
+    internal static void VecDotQ5_K_Q8_K_4RowsReference(
+        byte* w0, byte* w1, byte* w2, byte* w3,
+        byte* q8k, int superBlockCount, int wStride, float* results)
+    {
         if (!Avx2.IsSupported)
         {
             results[0] = VecDotQ5_K_Q8_KPortable(w0, q8k, superBlockCount, wStride);
@@ -1934,8 +1950,9 @@ public static unsafe partial class MatMul
         // Q4_K / Q6_K on AVX2: weights of a 4-row group are decoded once per 4 tokens (#933), bit-identical
         // to the per-token ComputeRows path. Everything else (and the <4-token / <4-row remainders) is unchanged.
         bool tok4 = Avx2.IsSupported && Sse41.IsSupported
-            && (ctx.KBlockBytes == Q4_K_BlockBytes || ctx.KBlockBytes == Q6_K_BlockBytes);
+            && (ctx.KBlockBytes == Q4_K_BlockBytes || ctx.KBlockBytes == Q5_K_BlockBytes || ctx.KBlockBytes == Q6_K_BlockBytes);
         bool q6 = ctx.KBlockBytes == Q6_K_BlockBytes;
+        bool q5 = ctx.KBlockBytes == Q5_K_BlockBytes;
 
         for (int tile = startTile; tile < endTile; tile++)
         {
@@ -1958,6 +1975,9 @@ public static unsafe partial class MatMul
                             if (q6)
                                 Q6KRowTok4(gw + (long)rr * ctx.KRowBytes, xq, ctx.Q8RowBytes, ctx.SuperBlockCount,
                                     Q6_K_BlockBytes, cc + rr, ctx.M);
+                            else if (q5)
+                                Q5KRowTok4(gw + (long)rr * ctx.KRowBytes, xq, ctx.Q8RowBytes, ctx.SuperBlockCount,
+                                    Q5_K_BlockBytes, cc + rr, ctx.M);
                             else
                                 Q4KRowTok4(gw + (long)rr * ctx.KRowBytes, xq, ctx.Q8RowBytes, ctx.SuperBlockCount,
                                     Q4_K_BlockBytes, cc + rr, ctx.M);

@@ -234,7 +234,8 @@ public static unsafe partial class MatMul
         int fullGroups, int tailRows, int superBlockCount, int m, int k, int n, ComputeThreadPool? pool)
         => GemmR4Tiled(repackedWeights, b, inputQ, c, fullGroups, tailRows, superBlockCount, m, k, n,
             Q5_K_BlockBytes, superBlockCount * Q8_K_BlockBytes,
-            &ComputeRowsQ5_KInterleaved, &QuantizeF32ToQ8_K, pool);
+            &ComputeRowsQ5_KInterleaved, &QuantizeF32ToQ8_K, pool,
+            Avx2.IsSupported && Sse41.IsSupported ? &Q5KRows4Tokens4 : null);
 
     /// <inheritdoc cref="GemmR4Tiled"/>
     [SkipLocalsInit]

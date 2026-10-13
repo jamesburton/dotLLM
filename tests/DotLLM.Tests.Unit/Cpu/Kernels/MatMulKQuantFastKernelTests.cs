@@ -15,23 +15,24 @@ public sealed unsafe class MatMulKQuantFastKernelTests
 {
     private const int Q8KBytes = 292;
 
-    public static TheoryData<bool, int> Cases()
+    public static TheoryData<int, int> Cases()
     {
-        var d = new TheoryData<bool, int>();
-        foreach (bool q6 in new[] { false, true })
+        var d = new TheoryData<int, int>();
+        foreach (int fmt in new[] { 4, 5, 6 })
             foreach (int sb in new[] { 1, 2, 6, 7 })
-                d.Add(q6, sb);
+                d.Add(fmt, sb);
         return d;
     }
 
     [Theory]
     [MemberData(nameof(Cases))]
-    public void FastKernels_MatchReference_BitExact(bool q6, int sbCount)
+    public void FastKernels_MatchReference_BitExact(int fmt, int sbCount)
     {
-        int blockBytes = q6 ? 210 : 144;
+        bool q6 = fmt == 6, q5 = fmt == 5;
+        int blockBytes = q6 ? 210 : q5 ? 176 : 144;
         int k = sbCount * 256;
         const int tokens = 4;
-        var rng = new Random(933 + sbCount + (q6 ? 100 : 0));
+        var rng = new Random(933 + sbCount + fmt * 100);
 
         // One R4 group (4 rows): super-block s of row r lives at (s * 4 + r) * blockBytes.
         byte* w = (byte*)NativeMemory.AlignedAlloc((nuint)(4L * sbCount * blockBytes), 64);
@@ -74,6 +75,9 @@ public sealed unsafe class MatMulKQuantFastKernelTests
                 if (q6)
                     MatMul.VecDotQ6_K_Q8_K_4RowsReference(g, g + 210, g + 420, g + 630,
                         x + (long)t * q8Row, sbCount, wStride, expected + t * 4);
+                else if (q5)
+                    MatMul.VecDotQ5_K_Q8_K_4RowsReference(g, g + 176, g + 352, g + 528,
+                        x + (long)t * q8Row, sbCount, wStride, expected + t * 4);
                 else
                     MatMul.VecDotQ4_K_Q8_K_4RowsReference(g, g + 144, g + 288, g + 432,
                         x + (long)t * q8Row, sbCount, wStride, expected + t * 4);
@@ -85,18 +89,22 @@ public sealed unsafe class MatMulKQuantFastKernelTests
                 byte* g = w;
                 if (q6)
                     MatMul.Q6KRows4Tokens1(g, g + 210, g + 420, g + 630, x + (long)t * q8Row, sbCount, wStride, actual + t * 4);
+                else if (q5)
+                    MatMul.Q5KRows4Tokens1(g, g + 176, g + 352, g + 528, x + (long)t * q8Row, sbCount, wStride, actual + t * 4);
                 else
                     MatMul.Q4KRows4Tokens1(g, g + 144, g + 288, g + 432, x + (long)t * q8Row, sbCount, wStride, actual + t * 4);
             }
-            AssertBits(expected, actual, tokens * 4, $"{(q6 ? "Q6_K" : "Q4_K")} sb={sbCount} 1-token kernel");
+            AssertBits(expected, actual, tokens * 4, $"Q{fmt}_K sb={sbCount} 1-token kernel");
 
             // (2) 4 rows x 4 tokens; output laid out [token][row] with ldc = 4.
             new Span<float>(actual, tokens * 4).Clear();
             if (q6)
                 MatMul.Q6KRows4Tokens4(w, sbCount, x, q8Row, actual, 4);
+            else if (q5)
+                MatMul.Q5KRows4Tokens4(w, sbCount, x, q8Row, actual, 4);
             else
                 MatMul.Rows4Tokens4(w, sbCount, x, q8Row, actual, 4);
-            AssertBits(expected, actual, tokens * 4, $"{(q6 ? "Q6_K" : "Q4_K")} sb={sbCount} 4-token kernel");
+            AssertBits(expected, actual, tokens * 4, $"Q{fmt}_K sb={sbCount} 4-token kernel");
         }
         finally
         {
@@ -114,14 +122,16 @@ public sealed unsafe class MatMulKQuantFastKernelTests
     /// plus a single-token tail. Must equal the serial per-token result bit for bit.
     /// </summary>
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void RowMajorPooledGemm_FourTokenPath_MatchesSerial_BitExact(bool q6)
+    [InlineData(4)]
+    [InlineData(5)]
+    [InlineData(6)]
+    public void RowMajorPooledGemm_FourTokenPath_MatchesSerial_BitExact(int fmt)
     {
+        bool q6 = fmt == 6, q5 = fmt == 5;
         const int m = 250, k = 4096, n = 9;
         int sb = k / 256;
-        int blockBytes = q6 ? 210 : 144;
-        var rng = new Random(q6 ? 61 : 41);
+        int blockBytes = q6 ? 210 : q5 ? 176 : 144;
+        var rng = new Random(41 + fmt);
         long wBytes = (long)m * sb * blockBytes;
         byte* w = (byte*)NativeMemory.AlignedAlloc((nuint)wBytes, 64);
         float* x = (float*)NativeMemory.AlignedAlloc((nuint)((long)n * k * 4), 64);
@@ -144,13 +154,18 @@ public sealed unsafe class MatMulKQuantFastKernelTests
                 MatMul.GemmQ6_K(w, x, serial, m, k, n, null, null);
                 MatMul.GemmQ6_K(w, x, pooled, m, k, n, pool, null);
             }
+            else if (q5)
+            {
+                MatMul.GemmQ5_K(w, x, serial, m, k, n, null, null);
+                MatMul.GemmQ5_K(w, x, pooled, m, k, n, pool, null);
+            }
             else
             {
                 MatMul.GemmQ4_K(w, x, serial, m, k, n, null, null);
                 MatMul.GemmQ4_K(w, x, pooled, m, k, n, pool, null);
             }
 
-            AssertBits(serial, pooled, n * m, q6 ? "Q6_K pooled row-major GEMM" : "Q4_K pooled row-major GEMM");
+            AssertBits(serial, pooled, n * m, $"Q{fmt}_K pooled row-major GEMM");
         }
         finally
         {
