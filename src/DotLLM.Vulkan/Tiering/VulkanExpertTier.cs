@@ -79,7 +79,8 @@ internal sealed unsafe class VulkanExpertTier : IDisposable
     public long LayerVisits { get; private set; }
 
     /// <summary>Bytes read from the SSD, aligned over-read included.</summary>
-    public long BytesRead => _reader.BytesRead;
+    public long BytesRead => _reader.BytesRead - _bytesBase;
+    private long _bytesBase;
 
     /// <summary>Wall ticks spent ending the command buffer and waiting for the GPU to reach the router (useful work, not stall).</summary>
     public long GpuWaitTicks { get; private set; }
@@ -110,7 +111,7 @@ internal sealed unsafe class VulkanExpertTier : IDisposable
     {
         _device = device; _layers = layers; _topK = topK; Slots = slots; NumExperts = numExperts;
         if (slots < topK) throw new ArgumentOutOfRangeException(nameof(slots), $"{slots} slots per layer cannot hold the {topK} experts one token selects.");
-        _reader = new UnbufferedFileReader(paths, unbuffered);
+        _reader = new UnbufferedFileReader(paths, unbuffered, queueDepth: int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_EXPERT_QD"), out int qd) && qd > 0 ? qd : 8);
         long stride = 0;
         const long A = UnbufferedFileReader.Align;
         foreach (var l in layers)
@@ -227,6 +228,7 @@ internal sealed unsafe class VulkanExpertTier : IDisposable
         foreach (var l in _layers) { l.Cache.Clear(); l.Cache.ResetCounters(); l.BytesRead = 0; }
         Hits = Misses = Evictions = MissStalls = LayerVisits = 0;
         GpuWaitTicks = ReadTicks = ResumeTicks = 0;
+        _bytesBase = _reader.BytesRead;
     }
 
     /// <summary>Zeroes the counters but keeps the resident experts (warm-up -> measured window).</summary>
@@ -235,6 +237,7 @@ internal sealed unsafe class VulkanExpertTier : IDisposable
         foreach (var l in _layers) { l.Cache.ResetCounters(); l.BytesRead = 0; }
         Hits = Misses = Evictions = MissStalls = LayerVisits = 0;
         GpuWaitTicks = ReadTicks = ResumeTicks = 0;
+        _bytesBase = _reader.BytesRead;
     }
 
     /// <summary>One-line summary for logs.</summary>
