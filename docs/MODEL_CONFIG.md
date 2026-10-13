@@ -123,8 +123,13 @@ Differences between architectures are captured entirely in ModelConfig.
   projection so the shared attention kernels and every KV cache (single K/V row stride) are used unchanged; the pad columns of the
   attention output are exact zeros and are compacted away before `o_proj` (`TransformerModel.ExpandValueHeads` /
   `CompactAttentionHeads`). Cost: 1.5x V memory and PV work on the CPU. A native V-dim kernel is a GPU-backend task.
-- **GPU backends refuse** `mimo2` explicitly (`ModelConfig.MiMoV2UnsupportedMessage`): V!=K attention kernels, sliding-window KV ring,
-  packed Q2_K/IQ expert banks in the generic MoE path and MTP are missing - see #935.
+- **Vulkan (single device, #955)**: runs on the generic `VulkanTransformerModel`. V projection rows are zero-padded to the K head dim at
+  upload (exact for every block format), the attention output is compacted back to `nH*128` (and `attention_value_scale` applied) by
+  `attn_compact_scale_f32` before `o_proj`; per-layer KV heads (`GetLayerKvHeads`), dual rope theta on the inverse-frequency kernel, sink
+  attention on the sliding layers (gpt-oss kernels), the GLM sigmoid+bias router, and IQ1_M / IQ2_XXS / IQ2_XS / IQ3_S routed banks kept
+  packed (indexed IQ MMVQ at <16 rows, grouped IQ coopmat above). KV cache is the dense per-layer-strided `VulkanKvCache` (no sliding ring yet,
+  F32 K and padded V, ~535 KiB/token). Pipeline-parallel / hybrid Vulkan+CUDA and **CUDA refuse** `mimo2` (`ModelConfig.MiMoV2UnsupportedMessage`).
+  MTP is not implemented anywhere.
 - Verification: `tools/mimo2-tiny-oracle` builds a tiny random MiMoV2 (K 48 / V 32, rotary 16/48, GQA 4 global / 2 sliding,
   window 4, sinks, 8 experts top-2, dense layer 0) in HF torch, converts it with llama.cpp's own `convert_hf_to_gguf.py`, and
   compares HF torch / llama.cpp CPU / dotLLM CPU (max |dlogit| 1.9e-5, KL 8.6e-12, top-1 100%; decode through the per-layer-strided KV cache
