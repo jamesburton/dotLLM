@@ -623,6 +623,9 @@ internal sealed class VulkanWeights : IDisposable
     /// matching dequant shader instead of on the host (issue #147). Null (tests,
     /// legacy callers) falls back to the streamed CPU dequant.
     /// </param>
+    /// <param name="valuePad">
+    /// MiMo-V2: (K head dim, V head dim) when V is narrower than K; every layer's V projection is zero-row padded to the K head dim.
+    /// </param>
     /// <remarks>
     /// <para>
     /// Staging is a single bounded, persistently-mapped buffer
@@ -636,7 +639,8 @@ internal sealed class VulkanWeights : IDisposable
         VulkanDevice device, TransformerWeights weights, int numLayers,
         bool dequantToFp32 = false, int firstLayer = 0,
         bool skipTokenEmbed = false, bool skipOutputHead = false,
-        string? spvDir = null)
+        string? spvDir = null,
+        (int KHeadDim, int VHeadDim)? valuePad = null)
     {
         if (firstLayer < 0 || firstLayer + numLayers > weights.Layers.Length)
             throw new ArgumentOutOfRangeException(nameof(firstLayer),
@@ -743,6 +747,7 @@ internal sealed class VulkanWeights : IDisposable
             VulkanDevice.Buffer q, k, v;
             QuantizationType qDeviceQt, kDeviceQt, vDeviceQt;
             long qBytes, kBytes, vBytes;
+            int vPaddedRows = lw.VOutputDim;
             VulkanDevice.Buffer? qBias, kBias, vBias;
             if (lw.Mla is not null)
             {
@@ -775,6 +780,15 @@ internal sealed class VulkanWeights : IDisposable
                     v = device.AllocateDeviceLocal(64);
                     vDeviceQt = QuantizationType.F32;
                     vBytes = 0;
+                }
+                else if (valuePad is { } vp && vp.VHeadDim != vp.KHeadDim)
+                {
+                    // MiMo-V2 (V head_dim 128 != K 192): each V head's rows are zero-padded to the K head dim at upload so the
+                    // projection produces a K-shaped V and the KV cache / attention kernels stay single-head-dim. Exact: a zero row
+                    // is an all-zero block in every packed format. The attention output's pad columns are compacted away before o_proj.
+                    v = UploadValueMatrixPadded(device, staging, lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim,
+                        vp.VHeadDim, vp.KHeadDim, dequantToFp32, $"blk.{firstLayer + i}.attn_v.weight",
+                        out vDeviceQt, out vBytes, out vPaddedRows);
                 }
                 else
                 {
@@ -935,7 +949,7 @@ internal sealed class VulkanWeights : IDisposable
                 attnNorm,
                 q, qDeviceQt, lw.QOutputDim, lw.QInputDim,
                 k, kDeviceQt, lw.KOutputDim, lw.KInputDim,
-                v, vDeviceQt, lw.VOutputDim, lw.VInputDim,
+                v, vDeviceQt, vPaddedRows, lw.VInputDim,
                 o, oDeviceQt, lw.OOutputDim, lw.OInputDim,
                 qBias, kBias, vBias, oBias,
                 ffnNorm,
@@ -1613,6 +1627,46 @@ internal sealed class VulkanWeights : IDisposable
     /// upload below — the import is opportunistic, not load-bearing.
     /// </para>
     /// </remarks>
+    /// <summary>
+    /// Uploads the V projection of a model whose V head dim (<paramref name="vHeadDim"/>) is smaller than its K head dim
+    /// (<paramref name="kHeadDim"/>), inserting <c>kHeadDim - vHeadDim</c> all-zero rows after every V head so the output is
+    /// K-shaped. Packed formats only (a zero row of any block format is zero bytes); the padded copy goes through the staging
+    /// buffer, never a zero-copy import (the padded host buffer is freed here).
+    /// </summary>
+    private static unsafe VulkanDevice.Buffer UploadValueMatrixPadded(
+        VulkanDevice device, VulkanStagingBuffer staging,
+        nint srcPtr, QuantizationType qt, int outputDim, int inputDim, int vHeadDim, int kHeadDim,
+        bool dequantToFp32, string name, out QuantizationType deviceQuantType, out long uploadedBytes, out int paddedRows)
+    {
+        if (outputDim % vHeadDim != 0)
+            throw new InvalidDataException($"{name}: {outputDim} rows is not a multiple of the V head dim {vHeadDim}.");
+        QuantizationType keepQt = DeviceQuantTypeFor(qt, inputDim, dequantToFp32);
+        if (keepQt != qt)  // F32 / packed formats are verbatim row-copyable; a format that would be widened on upload is not
+            throw new NotSupportedException(
+                $"{name}: a V projection stored as {qt} (K={inputDim}) cannot be zero-row padded on the Vulkan backend (needs a format kept verbatim on device).");
+        int heads = outputDim / vHeadDim;
+        paddedRows = heads * kHeadDim;
+        long rowBytes = Dequantize.RowByteSize(inputDim, qt);
+        long bytes = rowBytes * paddedRows;
+        byte* host = (byte*)NativeMemory.AlignedAlloc((nuint)bytes, 64);
+        try
+        {
+            new Span<byte>(host, checked((int)bytes)).Clear();
+            for (int h = 0; h < heads; h++)
+                Buffer.MemoryCopy((byte*)srcPtr + (long)h * vHeadDim * rowBytes, host + (long)h * kHeadDim * rowBytes,
+                    vHeadDim * rowBytes, vHeadDim * rowBytes);
+            var buf = AllocateAndUploadPacked(device, staging, (nint)host, bytes);
+            deviceQuantType = keepQt;
+            uploadedBytes = bytes;
+            _residencyReport.Add(name, qt, keepQt, rowBytes * outputDim, bytes);
+            return buf;
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(host);
+        }
+    }
+
     private static unsafe VulkanDevice.Buffer UploadMatrix(
         VulkanDevice device, VulkanStagingBuffer staging,
         nint srcPtr, QuantizationType qt, int outputDim, int inputDim,
@@ -2521,6 +2575,14 @@ internal sealed class VulkanWeights : IDisposable
             && rawM == expectedM && rawK == expectedK && (expectedK % 32) == 0)
             return QuantizationType.MXFP4;
 
+        // MiMo-V2 BPW2.0 (#955): IQ-family routed banks (IQ1_M gate/up, IQ2_XXS/IQ2_XS/IQ3_S down) stay packed and are read by the indexed
+        // IQ MMVQ decode kernels and the grouped IQ coopmat prefill kernels (the #823 kernels, now wired into the generic MoE path).
+        // The MMVQ kernels need integer-dot-product; without it the bank would widen to F32 (loud: ValidateRoutedBankF32Source).
+        if (raw != 0 && device.HasIntegerDotProduct && rawM == expectedM && rawK == expectedK
+            && MoeIqFormats.FromQuantizationType(qt) is { } iqFormat
+            && (expectedK % MoeIqFormats.Describe(iqFormat).GroupSize) == 0 && (expectedK % 256) == 0)
+            return qt;
+
         // Strategy C path: keep routed F16 expert banks raw only when the
         // coopmat grouped matmul can consume them. Otherwise upload F32 so
         // the existing indexed path remains the fallback.
@@ -2931,6 +2993,9 @@ internal sealed class VulkanWeights : IDisposable
             return Dequantize.RowByteSize(contractionDim, QuantizationType.Q6_K) * outputDim;
         if (qt == QuantizationType.MXFP4 && (contractionDim % 32) == 0)
             return Dequantize.RowByteSize(contractionDim, QuantizationType.MXFP4) * outputDim;
+        if (MoeIqFormats.FromQuantizationType(qt) is { } iqf && (contractionDim % 256) == 0
+            && (contractionDim % MoeIqFormats.Describe(iqf).GroupSize) == 0)
+            return Dequantize.RowByteSize(contractionDim, qt) * outputDim;
         if (MoeOverlayKeepsF16(qt, contractionDim))
             return Dequantize.RowByteSize(contractionDim, QuantizationType.F16) * outputDim;
         if (MoeOverlayKeepsBf16(qt, contractionDim))
