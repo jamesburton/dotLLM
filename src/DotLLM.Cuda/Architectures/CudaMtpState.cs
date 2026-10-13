@@ -1,5 +1,6 @@
 using DotLLM.Core.Models;
 using DotLLM.Cuda.Interop;
+using DotLLM.Models.Architectures;
 
 namespace DotLLM.Cuda.Architectures;
 
@@ -20,13 +21,14 @@ public sealed class CudaMtpState : IMtpState, IDisposable
     private readonly int _hiddenSize;
     private readonly int _numKvHeads;
     private readonly int _headDim;
-    private readonly int _maxSteps;
+    private readonly int _maxSteps;   // hard ceiling on positions (the trunk KV-cache's MaxLength)
+    private int _capacity;            // rows currently allocated, <= _maxSteps; grows on demand (issue #966)
     private readonly int _kvStride; // numKvHeads * headDim
 
-    private nint _keyCacheDevice;     // [maxSteps, kvStride] f32, device-resident
-    private nint _valueCacheDevice;   // [maxSteps, kvStride] f32, device-resident
+    private nint _keyCacheDevice;     // [capacity, kvStride] f32, device-resident
+    private nint _valueCacheDevice;   // [capacity, kvStride] f32, device-resident
     private nint _pendingHiddenDevice; // [hiddenSize] f32, device-resident — seed for the next ForwardMtp call
-    private nint _positionIotaDevice;  // [maxSteps] int32, device-resident — element p holds p (issue #482)
+    private nint _positionIotaDevice;  // [capacity] int32, device-resident — element p holds p (issue #482)
 
     private float[] _capturedRows = []; // host [rowCount, hiddenSize], grown on demand
 
@@ -39,8 +41,14 @@ public sealed class CudaMtpState : IMtpState, IDisposable
     private int _currentLength;
     private bool _disposed;
 
-    /// <summary>Max autoregressive MTP steps this state's KV-cache can hold before needing a reset/rollback.</summary>
+    /// <summary>
+    /// Hard ceiling on the positions this state can hold (the <c>maxSteps</c> it was created with).
+    /// Exceeding it throws <see cref="InvalidOperationException"/> before any device write.
+    /// </summary>
     public int MaxSteps => _maxSteps;
+
+    /// <summary>Positions the device buffers currently hold; grows in <see cref="MtpKvCapacity.GrowthStep"/> steps up to <see cref="MaxSteps"/>.</summary>
+    public int Capacity => _capacity;
 
     /// <summary>K/V stride (numKvHeads * headDim) — the per-step row width of the device K/V cache.</summary>
     public int KvStride => _kvStride;
@@ -79,7 +87,11 @@ public sealed class CudaMtpState : IMtpState, IDisposable
         _maxSteps = maxSteps;
         _kvStride = numKvHeads * headDim;
 
-        long kvBytes = (long)maxSteps * _kvStride * sizeof(float);
+        // Lazy KV (issue #966): allocate min(ceiling, 1024) positions now and grow as positions are
+        // reached. An F32 head cache is 8 KiB/position on Bonsai 2 (4 KV heads x 256 dim), i.e. 512 MiB
+        // at 64k, which an eager allocation reserved even for a short prompt.
+        _capacity = MtpKvCapacity.Initial(maxSteps);
+        long kvBytes = (long)_capacity * _kvStride * sizeof(float);
         CudaDriverApi.cuMemAlloc_v2(out _keyCacheDevice, (nuint)kvBytes).ThrowOnError();
         CudaDriverApi.cuMemAlloc_v2(out _valueCacheDevice, (nuint)kvBytes).ThrowOnError();
         CudaDriverApi.cuMemsetD8_v2(_keyCacheDevice, 0, (nuint)kvBytes).ThrowOnError();
@@ -90,16 +102,73 @@ public sealed class CudaMtpState : IMtpState, IDisposable
         CudaDriverApi.cuMemsetD8_v2(_pendingHiddenDevice, 0, (nuint)hiddenBytes).ThrowOnError();
 
         // Positions as a device-resident iota (issue #482): a draft step's RoPE and a batched absorb's
-        // contiguous positions are slices of it, so neither uploads positions per call. Filled once.
-        int[] iota = new int[maxSteps];
-        for (int i = 0; i < maxSteps; i++) iota[i] = i;
-        long iotaBytes = (long)maxSteps * sizeof(int);
-        CudaDriverApi.cuMemAlloc_v2(out _positionIotaDevice, (nuint)iotaBytes).ThrowOnError();
-        unsafe
+        // contiguous positions are slices of it, so neither uploads positions per call. Grows with the KV.
+        UploadIota(_capacity, out _positionIotaDevice);
+    }
+
+    /// <summary>Allocates an iota table of <paramref name="count"/> int32 rows (values 0..count-1) on the device.</summary>
+    private static unsafe void UploadIota(int count, out nint device)
+    {
+        int[] iota = new int[count];
+        for (int i = 0; i < count; i++) iota[i] = i;
+        long iotaBytes = (long)count * sizeof(int);
+        CudaDriverApi.cuMemAlloc_v2(out device, (nuint)iotaBytes).ThrowOnError();
+        fixed (int* p = iota)
+            CudaDriverApi.cuMemcpyHtoD_v2(device, (nint)p, (nuint)iotaBytes).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Makes the device buffers cover at least <paramref name="positions"/> rows (issue #966), growing in
+    /// <see cref="MtpKvCapacity.GrowthStep"/> steps up to <see cref="MaxSteps"/> and preserving the
+    /// committed rows <c>[0, CurrentLength)</c>. Must run before any pointer into the buffers is derived
+    /// for a write at <c>positions - 1</c>; no caller caches those pointers across calls. Throws
+    /// <see cref="InvalidOperationException"/> above the ceiling: never a clamp, never an
+    /// out-of-range device access.
+    /// </summary>
+    /// <param name="positions">Rows required (last position + 1).</param>
+    /// <param name="stream">The stream the head's kernels run on: drained before the buffers are swapped.</param>
+    internal void EnsureCapacity(int positions, nint stream)
+    {
+        ThrowIfDisposed();
+        int target = MtpKvCapacity.Next(_capacity, positions, _maxSteps);
+        if (target == _capacity)
+            return;
+
+        // Drain in-flight work that may still read/write the old buffers, then swap. The copy covers
+        // only committed rows; speculative rows beyond CurrentLength are rewritten before they are read.
+        CudaDriverApi.cuStreamSynchronize(stream).ThrowOnError();
+
+        long newKvBytes = (long)target * _kvStride * sizeof(float);
+        long keepBytes = (long)Math.Min(_currentLength, _capacity) * _kvStride * sizeof(float);
+        nint newKey = 0, newValue = 0, newIota = 0;
+        try
         {
-            fixed (int* p = iota)
-                CudaDriverApi.cuMemcpyHtoD_v2(_positionIotaDevice, (nint)p, (nuint)iotaBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out newKey, (nuint)newKvBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out newValue, (nuint)newKvBytes).ThrowOnError();
+            CudaDriverApi.cuMemsetD8_v2(newKey, 0, (nuint)newKvBytes).ThrowOnError();
+            CudaDriverApi.cuMemsetD8_v2(newValue, 0, (nuint)newKvBytes).ThrowOnError();
+            if (keepBytes > 0)
+            {
+                CudaDriverApi.cuMemcpyDtoD_v2(newKey, _keyCacheDevice, (nuint)keepBytes).ThrowOnError();
+                CudaDriverApi.cuMemcpyDtoD_v2(newValue, _valueCacheDevice, (nuint)keepBytes).ThrowOnError();
+            }
+            UploadIota(target, out newIota);
         }
+        catch
+        {
+            if (newKey != 0) CudaDriverApi.cuMemFree_v2(newKey);
+            if (newValue != 0) CudaDriverApi.cuMemFree_v2(newValue);
+            if (newIota != 0) CudaDriverApi.cuMemFree_v2(newIota);
+            throw;   // the old buffers are untouched: the state stays valid at its previous capacity
+        }
+
+        CudaDriverApi.cuMemFree_v2(_keyCacheDevice);
+        CudaDriverApi.cuMemFree_v2(_valueCacheDevice);
+        CudaDriverApi.cuMemFree_v2(_positionIotaDevice);
+        _keyCacheDevice = newKey;
+        _valueCacheDevice = newValue;
+        _positionIotaDevice = newIota;
+        _capacity = target;
     }
 
     /// <summary>
@@ -110,9 +179,9 @@ public sealed class CudaMtpState : IMtpState, IDisposable
     internal nint GetPositionDevicePtr(int position, int count = 1)
     {
         ThrowIfDisposed();
-        if (position < 0 || count < 0 || (long)position + count > _maxSteps)
+        if (position < 0 || count < 0 || (long)position + count > _capacity)
             throw new ArgumentOutOfRangeException(nameof(position),
-                $"positions [{position}, {(long)position + count}) exceed MaxSteps={_maxSteps}.");
+                $"positions [{position}, {(long)position + count}) exceed the allocated capacity {_capacity} (MaxSteps={_maxSteps}).");
         return _positionIotaDevice + (nint)((long)position * sizeof(int));
     }
 
@@ -122,13 +191,13 @@ public sealed class CudaMtpState : IMtpState, IDisposable
         get { ThrowIfDisposed(); return _pendingHiddenDevice; }
     }
 
-    /// <summary>Device pointer to the key-cache buffer, shape <c>[maxSteps, kvStride]</c> row-major.</summary>
+    /// <summary>Device pointer to the key-cache buffer, shape <c>[Capacity, kvStride]</c> row-major; re-fetch after any call that may grow it.</summary>
     internal nint KeyCacheDevicePtr
     {
         get { ThrowIfDisposed(); return _keyCacheDevice; }
     }
 
-    /// <summary>Device pointer to the value-cache buffer, shape <c>[maxSteps, kvStride]</c> row-major.</summary>
+    /// <summary>Device pointer to the value-cache buffer, shape <c>[Capacity, kvStride]</c> row-major; re-fetch after any call that may grow it.</summary>
     internal nint ValueCacheDevicePtr
     {
         get { ThrowIfDisposed(); return _valueCacheDevice; }
@@ -138,7 +207,7 @@ public sealed class CudaMtpState : IMtpState, IDisposable
     internal nint GetKeyRowDevicePtr(int step)
     {
         ThrowIfDisposed();
-        if ((uint)step >= (uint)_maxSteps) throw new ArgumentOutOfRangeException(nameof(step));
+        if ((uint)step >= (uint)_capacity) throw new ArgumentOutOfRangeException(nameof(step));
         return _keyCacheDevice + (nint)((long)step * _kvStride * sizeof(float));
     }
 
@@ -146,7 +215,7 @@ public sealed class CudaMtpState : IMtpState, IDisposable
     internal nint GetValueRowDevicePtr(int step)
     {
         ThrowIfDisposed();
-        if ((uint)step >= (uint)_maxSteps) throw new ArgumentOutOfRangeException(nameof(step));
+        if ((uint)step >= (uint)_capacity) throw new ArgumentOutOfRangeException(nameof(step));
         return _valueCacheDevice + (nint)((long)step * _kvStride * sizeof(float));
     }
 
@@ -167,7 +236,7 @@ public sealed class CudaMtpState : IMtpState, IDisposable
     /// it, rejects a gap, and bounds-checks the whole slab before anything is written. Mirrors
     /// <see cref="DotLLM.Models.Architectures.CpuMtpState"/>.
     /// </summary>
-    internal void BeginAbsorb(int firstPosition, int count)
+    internal void BeginAbsorb(int firstPosition, int count, nint stream)
     {
         ThrowIfDisposed();
         if (_currentLength > firstPosition)
@@ -181,6 +250,7 @@ public sealed class CudaMtpState : IMtpState, IDisposable
             throw new InvalidOperationException(
                 $"CudaMtpState KV-cache exhausted absorbing positions [{firstPosition}, {firstPosition + count}) " +
                 $"(MaxSteps={_maxSteps}). Create the state with CreateMtpState(maxSequenceLength) covering the whole sequence.");
+        EnsureCapacity(firstPosition + count, stream);   // issue #966: lazy growth, after the ceiling check
     }
 
     /// <summary>Completes a batched absorb begun by <see cref="BeginAbsorb"/>: the cache now covers <paramref name="length"/> positions.</summary>
@@ -296,7 +366,7 @@ public sealed class CudaMtpState : IMtpState, IDisposable
     }
 
     /// <summary>Total bytes allocated for this state's own KV-cache + pending-hidden buffer (device memory).</summary>
-    public long AllocatedBytes => (2L * _maxSteps * _kvStride + _hiddenSize) * sizeof(float) + (long)_maxSteps * sizeof(int);
+    public long AllocatedBytes => (2L * _capacity * _kvStride + _hiddenSize) * sizeof(float) + (long)_capacity * sizeof(int);
 
     private void ThrowIfDisposed()
     {

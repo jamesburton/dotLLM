@@ -1497,9 +1497,11 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     /// Sized for the MTP head's own attention (<see cref="Config"/>'s standard head count/dim —
     /// the MTP block is a normal full-attention layer, see <see cref="MtpHeadWeights"/>). The head's
     /// KV-cache is indexed by sequence position (issue #469), so it must cover the whole sequence;
-    /// this overload uses <see cref="MtpDefaultMaxSequenceLength"/>.
+    /// this overload uses the model's whole context window as the ceiling. The head KV allocates
+    /// lazily (issue #966), so that costs only the first 1024 positions up front.
     /// </remarks>
-    public IMtpState? CreateMtpState() => CreateMtpState(MtpDefaultMaxSequenceLength);
+    public IMtpState? CreateMtpState()
+        => CreateMtpState(Math.Max(MtpDefaultMaxSequenceLength, Config.MaxSequenceLength));
 
     /// <inheritdoc/>
     public IMtpState? CreateMtpState(int maxSequenceLength)
@@ -1515,7 +1517,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     }
 
     /// <summary>
-    /// Default MTP KV-cache depth, in sequence positions, for <see cref="CreateMtpState()"/>.
+    /// Floor of the ceiling <see cref="CreateMtpState()"/> uses: <c>max(this, Config.MaxSequenceLength)</c>.
     /// Callers that know their context length should use <see cref="CreateMtpState(int)"/>.
     /// </summary>
     public const int MtpDefaultMaxSequenceLength = 4096;
@@ -2116,6 +2118,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             throw new InvalidOperationException(
                 $"CpuMtpState KV-cache exhausted at position {position} (MaxSteps={state.MaxSteps}). " +
                 "Create the state with CreateMtpState(maxSequenceLength) covering the whole sequence.");
+        state.EnsureCapacity(step + 1);   // issue #966: lazy head-KV growth, before any row pointer is taken
 
         var pool = ArrayPool<float>.Shared;
         float[] tokEmbedArr = pool.Rent(hiddenSize);

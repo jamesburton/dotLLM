@@ -504,10 +504,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// <remarks>
     /// Sized for the MTP head's own attention (<see cref="Config"/>'s standard head count/dim —
     /// the MTP block is a normal full-attention layer, see <see cref="CudaMtpHeadWeights"/>), with a
-    /// device-resident, position-indexed KV-cache of <see cref="MtpDefaultMaxSequenceLength"/>
-    /// positions. Mirrors the CPU host's <c>Qwen3HybridDenseTransformerModel.CreateMtpState</c>.
+    /// device-resident, position-indexed KV-cache. The cache allocates lazily (issue #966), so this
+    /// parameterless overload costs only the first 1024 positions up front and uses the model's whole
+    /// context window as its ceiling. Engine callers pass the trunk KV-cache's <c>MaxLength</c>.
+    /// Mirrors the CPU host's <c>Qwen3HybridDenseTransformerModel.CreateMtpState</c>.
     /// </remarks>
-    public IMtpState? CreateMtpState() => CreateMtpState(MtpDefaultMaxSequenceLength);
+    public IMtpState? CreateMtpState()
+        => CreateMtpState(Math.Max(MtpDefaultMaxSequenceLength, Config.MaxSequenceLength));
 
     /// <inheritdoc/>
     public IMtpState? CreateMtpState(int maxSequenceLength)
@@ -524,8 +527,9 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     }
 
     /// <summary>
-    /// Default MTP KV-cache depth, in sequence positions, for <see cref="CreateMtpState()"/> —
-    /// the head's cache is indexed by position and absorbs the whole sequence (issue #469).
+    /// Floor of the ceiling <see cref="CreateMtpState()"/> uses (the head's cache is indexed by position
+    /// and absorbs the whole sequence, issue #469). The ceiling is <c>max(this, Config.MaxSequenceLength)</c>;
+    /// memory follows the positions actually reached, not this value (issue #966).
     /// </summary>
     public const int MtpDefaultMaxSequenceLength = 4096;
 
@@ -2070,7 +2074,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         nint streamH = _stream.Handle;
         long hiddenRowBytes = (long)hiddenSize * sizeof(float);
 
-        state.BeginAbsorb(firstPosition, total);
+        state.BeginAbsorb(firstPosition, total, streamH);
         ProfMark("mtp-absorb-0a-begin");
 
         int chunkRows = Math.Max(1, Math.Min(total, MtpAbsorbChunkRows));
@@ -2468,6 +2472,8 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             throw new InvalidOperationException(
                 $"CudaMtpState KV-cache exhausted at position {position} (MaxSteps={state.MaxSteps}). " +
                 "Create the state with CreateMtpState(maxSequenceLength) covering the whole sequence.");
+        // Issue #966: the head KV grows lazily; make slot `step` addressable before any pointer into it.
+        state.EnsureCapacity(step + 1, _stream.Handle);
 
         _mtpScratch ??= CudaMtpScratch.Allocate(hiddenSize, qElems, intermediateSize, vocabSize);
         var s = _mtpScratch;
