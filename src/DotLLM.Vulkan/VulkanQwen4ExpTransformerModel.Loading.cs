@@ -40,6 +40,13 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
     /// </summary>
     public static bool LazyKv { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_QWEN4EXP_KV_LAZY") != "0";
 
+    /// <summary>
+    /// Expert tiering (#939): routed experts per layer kept in device slots; the rest stay on the SSD and are read on demand (stall on miss, output identical to a fully
+    /// resident run). 0 = off (every routed expert resident, the default). <c>DOTLLM_VK_EXPERT_SLOTS=N</c> sets it at startup; must be at least the model's top-k.
+    /// </summary>
+    public static int ExpertSlots { get; set; } =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_EXPERT_SLOTS"), out int es) && es > 0 ? es : 0;
+
     /// <summary>Resident-capacity refusal override: <c>DOTLLM_VK_ALLOW_OVERCOMMIT=1</c> turns the pre-load refusal into a warning.</summary>
     private static bool AllowOvercommit
         => string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_ALLOW_OVERCOMMIT"), "1", StringComparison.Ordinal);
@@ -60,8 +67,18 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
     /// <paramref name="otherPressureProbe"/> replaces the OS read of other processes' GPU memory (called once before and once after the upload).
     /// </summary>
     internal static VulkanQwen4ExpTransformerModel BuildFromGguf(VulkanDevice device, GgufFile gguf, ModelConfig config, string spvDir,
-        long? residentCapacityOverrideBytes, Func<VulkanGpuMemoryPressure?>? otherPressureProbe = null)
+        long? residentCapacityOverrideBytes, Func<VulkanGpuMemoryPressure?>? otherPressureProbe = null, int? expertSlots = null)
     {
+        int slots = expertSlots ?? ExpertSlots;
+        if (slots > 0)
+        {
+            if (config.Moe is not { } moeCfg0) throw new ArgumentException("Expert tiering needs a MoE configuration.", nameof(config));
+            if (slots < moeCfg0.NumExpertsPerTok)
+                throw new ArgumentOutOfRangeException(nameof(expertSlots), $"{slots} expert slots per layer cannot hold the {moeCfg0.NumExpertsPerTok} experts one token selects.");
+            if (slots > moeCfg0.NumExperts) slots = moeCfg0.NumExperts;
+            if (string.Equals(Environment.GetEnvironmentVariable("DOTLLM_GGUF_MAP_COW"), "1", StringComparison.Ordinal))
+                throw new NotSupportedException("Expert tiering reads the GGUF with a second handle, which a copy-on-write mapping (DOTLLM_GGUF_MAP_COW=1) forbids.");
+        }
         ArgumentNullException.ThrowIfNull(device);
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
@@ -92,7 +109,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
         Qwen4ExpResidencyPlan MakePlan(int capacity)
         {
             var p = Qwen4ExpResidencyPlan.Create(tensors, config, residentCapacity, capacity, GC.GetGCMemoryInfo().TotalAvailableMemoryBytes,
-                integerDot: device.HasIntegerDotProduct, kvElementBytes: KvStorage == VulkanKvStorage.F16 ? 2 : 4, rawKeysF16: IndexerRawF16);
+                integerDot: device.HasIntegerDotProduct, kvElementBytes: KvStorage == VulkanKvStorage.F16 ? 2 : 4, rawKeysF16: IndexerRawF16, expertSlots: slots);
             return pressure is not null ? p with { OtherProcessBytes = pressure.OtherBytes, OtherProcessDetail = pressure.DescribeCulprits() } : p;
         }
         var plan = MakePlan(kvCapacity);
@@ -201,7 +218,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             bool parallelUpload = !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_PARALLEL_UPLOAD"), "0", StringComparison.Ordinal);
             using (var upStaging = parallelUpload
                        ? VulkanStagingBuffer.CreateParallel(device, VulkanStagingBuffer.ParallelSlotBytes, VulkanStagingBuffer.ParallelSlotCount) : null)
-            using (var prealloc = parallelUpload && !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_BANK_PREALLOC"), "0", StringComparison.Ordinal) ? new VulkanBankPrealloc(device) : null)
+            using (var prealloc = parallelUpload && slots == 0 && !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_BANK_PREALLOC"), "0", StringComparison.Ordinal) ? new VulkanBankPrealloc(device) : null)
             {
                 const int AllocAhead = 2;
                 long heapBytes = device.DeviceLocalHeapBytes();
@@ -220,7 +237,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
                 {
                     long tl = System.Diagnostics.Stopwatch.GetTimestamp();
                     double cw0 = VulkanStagingBuffer.CopyWaitMilliseconds, aw0 = VulkanBankPrealloc.WaitMilliseconds, am0 = VulkanDevice.AllocateMemoryMilliseconds;
-                    moeBundles.Add(VulkanQwen3MoeMoeUpload.UploadLayer(device, layers[il].Moe, config.HiddenSize, residentQuant: true, upStaging, prealloc));
+                    moeBundles.Add(VulkanQwen3MoeMoeUpload.UploadLayer(device, layers[il].Moe, config.HiddenSize, residentQuant: true, upStaging, prealloc, expertSlots: slots));
                     ScheduleLayer(il + AllocAhead);
                     if (layerTrace)
                         Console.Error.WriteLine($"[vulkan-load] layer {il}: {System.Diagnostics.Stopwatch.GetElapsedTime(tl).TotalMilliseconds:F0} ms " +
@@ -279,6 +296,12 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             model = new VulkanQwen4ExpTransformerModel(device, gguf, config, core, attnGr.ToArray(), ffnGr.ToArray(), head, moeBundles.ToArray(),
                 ple, pleLayer, owned, hostOnly, gr, groupRms, sigmoidGate, kvCapacity, weightBytes, qsa, hostEmbedding, pleGpu);
             model._spvDir = spvDir;
+            if (slots > 0)
+            {
+                model._tier = BuildExpertTier(device, gguf, config, moeBundles, slots);
+                Console.Error.WriteLine($"[dotLLM] qwen4exp expert tiering: {slots} of {config.Moe!.NumExperts} routed experts per layer resident on the device, " +
+                                        $"the rest read from the GGUF on demand ({(model._tier.Unbuffered ? "unbuffered overlapped reads" : "buffered reads")}); greedy output is identical to the resident run. MTP is off.");
+            }
             model._groupRmsOop = GroupRmsNormOopF32Kernel.Create(device, spvDir);
             try
             {
@@ -563,5 +586,50 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             F32(gguf, t, b + "ple_norm_key.weight", hcDim), F32(gguf, t, b + "ple_norm_query.weight", hcDim), F32(gguf, t, b + "ple_norm_conv.weight", hcDim),
             Qwen4ExpPle.TransposeConvWeight(convRaw, hcDim, ple.ConvKernel),
             HostProj(b + "ple_key.weight"), HostProj(b + "ple_value.weight"));
+    }
+
+    /// <summary>
+    /// Creates the expert tier (#939) over the slot-sized bundles: resolves where each layer's gate / up / down expert tensors sit on disk and attaches the tier to
+    /// every bundle. Reads nothing from the file.
+    /// </summary>
+    internal static Tiering.VulkanExpertTier BuildExpertTier(
+        VulkanDevice device, GgufFile gguf, ModelConfig config, IReadOnlyList<VulkanQwen3MoeMoeUpload.LayerBundle> bundles, int slots)
+    {
+        var moe = config.Moe!;
+        int hidden = config.HiddenSize, interm = moe.MoeIntermediateSize;
+        var layers = new Tiering.VulkanExpertTier.Layer[bundles.Count];
+        for (int il = 0; il < layers.Length; il++)
+        {
+            var b = bundles[il];
+            string[] names =
+            {
+                Qwen4ExpTensors.Block(il, Qwen4ExpTensors.Suffix.FfnGateExps),
+                Qwen4ExpTensors.Block(il, Qwen4ExpTensors.Suffix.FfnUpExps),
+                Qwen4ExpTensors.Block(il, Qwen4ExpTensors.Suffix.FfnDownExps),
+            };
+            // Piece order: gate (W1), up (W3), down (W2) - the slot banks are the bundle's own buffers.
+            var banks = new[] { b.W1Bank, b.W3Bank, b.W2Bank };
+            var qts = new[] { b.W1QuantType, b.W3QuantType, b.W2QuantType };
+            var mk = new[] { (interm, hidden), (interm, hidden), (hidden, interm) };
+            var pieceBytes = new long[3]; var file = new int[3]; var offset = new long[3];
+            for (int p = 0; p < 3; p++)
+            {
+                pieceBytes[p] = Dequantize.RowByteSize(mk[p].Item2, qts[p]) * mk[p].Item1;
+                var desc = gguf.TensorsByName[names[p]];
+                long total = Dequantize.RowByteSize(desc.Shape[0], desc.QuantizationType) * desc.Shape[1] * desc.Shape[2];
+                if (desc.QuantizationType != qts[p] || total != pieceBytes[p] * moe.NumExperts)
+                    throw new InvalidDataException($"{names[p]}: tensor is {total} bytes of {desc.QuantizationType} but the tiered bank expects {moe.NumExperts} x {pieceBytes[p]} bytes of {qts[p]}.");
+                file[p] = gguf.GetTensorShardIndex(names[p]);
+                offset[p] = gguf.GetTensorFileLocation(names[p]).FileOffset;
+            }
+            layers[il] = new Tiering.VulkanExpertTier.Layer
+            {
+                Cache = new Tiering.ExpertSlotCache(moe.NumExperts, slots),
+                SlotBanks = banks, PieceBytes = pieceBytes, File = file, FileOffset = offset,
+            };
+        }
+        var tier = new Tiering.VulkanExpertTier(device, gguf.ShardPaths, layers, moe.NumExperts, moe.NumExpertsPerTok, slots);
+        for (int il = 0; il < layers.Length; il++) bundles[il].AttachTier(tier, il);
+        return tier;
     }
 }
