@@ -72,7 +72,10 @@ public class CudaQwen3HybridDenseFlashPrefillHd256Test
                            $"flash calls {fl.Flash} (layers {model.AttentionLayerCount})");
 
             Assert.Equal(0, rf.Flash);
-            Assert.Equal(model.AttentionLayerCount, fl.Flash);
+            // Long prompts are chunked by the model: one flash call per attention layer per chunk.
+            Assert.True(fl.Flash >= model.AttentionLayerCount && fl.Flash % model.AttentionLayerCount == 0,
+                $"flash calls {fl.Flash} not a whole number of per-layer passes");
+            Assert.Equal(rf.Staged, fl.Flash);   // reference staged exactly where flash served
             Assert.Equal(0, fl.Staged);
             Assert.True(cos > 0.999, $"prefill {prefillLen}: logits cosine {cos}");
             Assert.Equal(Argmax(rf.First), Argmax(fl.First));
@@ -83,6 +86,9 @@ public class CudaQwen3HybridDenseFlashPrefillHd256Test
     private static Run Execute(CudaQwen3HybridDenseTransformerModel model, int vocab,
         int[] tokens, int[] pos, int[]? forced, int prefillLen)
     {
+        // The GDN recurrent state is model-owned and persists across forwards: reset it so every run
+        // is an independent sequence (otherwise run 2 starts from run 1's state).
+        model.ResetSequenceState();
         using var kv = model.CreateKvCache(maxSeqLen: prefillLen + DecodeSteps + 8);
         int s0 = model.DebugF32StagedAttentionCallsForTest, f0 = model.DebugFlashPrefillHd256CallsForTest;
         float[] first;
