@@ -18,6 +18,7 @@ internal static class Program
 {
     private static int Main(string[] args)
     {
+        Console.OutputEncoding = new System.Text.UTF8Encoding(false);
         if (args.Length < 3) { Console.Error.WriteLine("usage: tok|logits ..."); return 2; }
         using var gguf = GgufFile.Open(args[1]);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
@@ -170,13 +171,17 @@ internal static class Program
         }
         if (args[0] != "logits" || args.Length < 6) { Console.Error.WriteLine("usage: logits <gguf> <ids> <prefix> <ctx> <chunks> [device]"); return 2; }
 
-        int[] ids = File.ReadAllText(args[2]).Split(new[] { ' ', '\n', '\r', ',', '[', ']' }, StringSplitOptions.RemoveEmptyEntries)
-            .Select(int.Parse).ToArray();
-        string prefix = args[3];
+        // <ids> and <prefix> may be comma-separated lists of equal length: one model load, many corpora.
+        string[] idFiles = args[2].Split(',');
+        string[] prefixes = args[3].Split(',');
+        if (idFiles.Length != prefixes.Length) { Console.Error.WriteLine("ids and prefix lists differ in length"); return 2; }
         int ctx = int.Parse(args[4]);
         int chunks = int.Parse(args[5]);
         string device = args.Length > 6 ? args[6] : "cpu";
-        if (ids.Length < ctx * chunks) { Console.Error.WriteLine($"need {ctx * chunks} ids, have {ids.Length}"); return 2; }
+        var allIds = idFiles.Select(f => File.ReadAllText(f).Split(new[] { ' ', '\n', '\r', ',', '[', ']' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(int.Parse).ToArray()).ToArray();
+        foreach (var a in allIds)
+            if (a.Length < ctx * chunks) { Console.Error.WriteLine($"need {ctx * chunks} ids, have {a.Length}"); return 2; }
 
         IModel model;
         int deviceId;
@@ -195,9 +200,13 @@ internal static class Program
             int vocab = config.VocabSize;
             int first = ctx / 2;
             model.TrySetAllRowLogitsLimit(ctx + 1);
-            using var fs = File.Create(prefix + ".logits.f32");
             var positions = Enumerable.Range(0, ctx).ToArray();
             var rowBuf = new byte[vocab * 4];
+            for (int corpus = 0; corpus < allIds.Length; corpus++)
+            {
+            int[] ids = allIds[corpus];
+            string prefix = prefixes[corpus];
+            using var fs = File.Create(prefix + ".logits.f32");
             for (int c = 0; c < chunks; c++)
             {
                 model.ResetSequenceState();
@@ -218,6 +227,7 @@ internal static class Program
                 Console.Error.WriteLine($"chunk {c}: {sw.Elapsed.TotalSeconds:F1} s ({ctx / sw.Elapsed.TotalSeconds:F1} tok/s)");
             }
             File.WriteAllText(prefix + ".meta.txt", $"{ctx} {chunks} {vocab} {first}\n");
+            }
         }
         return 0;
     }

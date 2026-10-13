@@ -25,7 +25,7 @@ public sealed class TransformerArchitecture : IModelArchitecture
     /// <inheritdoc/>
     public IReadOnlyList<Architecture> SupportedArchitectures { get; } =
         [Architecture.Llama, Architecture.Mistral, Architecture.Phi, Architecture.Qwen,
-         Architecture.NemotronH, Architecture.Qwen3MoeHybrid,
+         Architecture.NemotronH, Architecture.NemotronHMoe, Architecture.Qwen3MoeHybrid,
          Architecture.DeepSeekV2, Architecture.DeepSeekV3,
          // Gemma 3 / Gemma 4 MoE / DiffusionGemma all ride the standard
          // TransformerModel forward path (four RMSNorms, GeGLU, (1+w) norm,
@@ -45,7 +45,7 @@ public sealed class TransformerArchitecture : IModelArchitecture
                 "Pre-V2 DeepSeek (legacy 'deepseek' arch string in GGUF) is not supported — " +
                 "the kernel set targets DeepSeek-V2 / V3 (MLA + MoE). Re-export from a V2/V3 checkpoint.");
 
-        if (config.Architecture is Architecture.NemotronH)
+        if (config.Architecture is Architecture.NemotronH or Architecture.NemotronHMoe)
             return NemotronHTransformerModel.LoadFromGguf(_gguf, config);
 
         if (config.Architecture is Architecture.Qwen3MoeHybrid)

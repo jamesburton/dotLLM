@@ -1343,6 +1343,7 @@ internal sealed class TransformerWeights : IDisposable
         // (E2B/E4B) additionally owns F32 upcasts of the PLE projections when
         // they are not stored as F32 (per_layer_model_proj ships BF16).
         var owned = config.MlaConfig is not null || config.PerLayerEmbedding is not null || nanoQuant
+                    || config.Architecture == DotLLM.Core.Configuration.Architecture.MiMoV2
             ? new List<nint>()
             : null;
 
@@ -1673,10 +1674,15 @@ internal sealed class TransformerWeights : IDisposable
 
             int qDim = config.NumAttentionHeads * layerHeadDim;
             int kvDim = layerKvHeads * layerHeadDim;
+            // MiMo-V2: V rows are layerKvHeads * ValueHeadDim (128) while K rows are layerKvHeads * HeadDim (192).
+            int vDim = layerKvHeads * config.GetValueHeadDim();
+            if (qkvDesc.Shape[1] != qDim + kvDim + vDim)
+                throw new InvalidDataException(
+                    $"{prefix}.attn_qkv.weight has {qkvDesc.Shape[1]} rows; expected q {qDim} + k {kvDim} + v {vDim} = {qDim + kvDim + vDim}.");
 
             qPtr = qkvPtr; qQt = qkvDesc.QuantizationType; qM = qDim; qK = inputDim;
             kPtr = qkvPtr + (nint)(qDim * rowBytes); kQt = qkvDesc.QuantizationType; kM = kvDim; kK = inputDim;
-            vPtr = qkvPtr + (nint)((qDim + kvDim) * rowBytes); vQt = qkvDesc.QuantizationType; vM = kvDim; vK = inputDim;
+            vPtr = qkvPtr + (nint)((qDim + kvDim) * rowBytes); vQt = qkvDesc.QuantizationType; vM = vDim; vK = inputDim;
         }
         else
         {
@@ -1764,6 +1770,32 @@ internal sealed class TransformerWeights : IDisposable
 
         // Optional FFN sub-norm (BitNet Sub-LN): RMSNorm over the gated intermediate [intermediateSize] before ffn_down.
         float[]? ffnSubNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.ffn_sub_norm.weight", config.IntermediateSize);
+
+        // MiMo-V2 routed-MoE layer: sigmoid + selection-bias top-k, no shared expert, raw GGUF quant banks kept in place
+        // (the F32 host dequant would be ~1.2 TB at 310B scale). Layer 0 is dense and falls through to the dense path below.
+        if (config.Architecture == DotLLM.Core.Configuration.Architecture.MiMoV2
+            && config.Moe is not null && config.Moe.IsMoeLayer(layerIdx)
+            && tensors.ContainsKey($"{prefix}.ffn_gate_exps.weight"))
+        {
+            MoeLayerWeights mimoMoe = LoadDeepSeekMoeLayer(
+                layerIdx, dataBase, tensors, config, nqOwned ?? new List<nint>(), skipF32Dequant: true);
+            return new TransformerLayerWeights(
+                attnNorm,
+                qPtr, qQt, qM, qK,
+                kPtr, kQt, kM, kK,
+                vPtr, vQt, vM, vK,
+                oPtr, oQt, oM, oK,
+                ffnNorm,
+                gateWeight: 0, gateQuantType: QuantizationType.F32, gateOutputDim: 0, gateInputDim: 0,
+                upWeight: 0, upQuantType: QuantizationType.F32, upOutputDim: 0, upInputDim: 0,
+                downWeight: 0, downQuantType: QuantizationType.F32, downOutputDim: 0, downInputDim: 0,
+                qBias, kBias, vBias, oBias,
+                gateBias: null, upBias: null, downBias: null,
+                qNormWeight, kNormWeight,
+                moe: mimoMoe,
+                mla: null,
+                attnSinks: attnSinks);
+        }
 
         // Routed-MoE layer with quantized experts (gpt-oss): the dense
         // ffn_gate/up/down tensors are absent; a 3D-stacked expert block with
