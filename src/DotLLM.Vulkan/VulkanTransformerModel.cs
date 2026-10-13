@@ -56,7 +56,7 @@ namespace DotLLM.Vulkan;
 /// matching the CUDA return convention.
 /// </para>
 /// </remarks>
-public sealed class VulkanTransformerModel : IModel
+public sealed partial class VulkanTransformerModel : IModel
 {
     private readonly VulkanDevice _device;
     private readonly VulkanWeights _weights;
@@ -7826,6 +7826,7 @@ public sealed class VulkanTransformerModel : IModel
         // ForwardBatch scratch — null when batched path was never invoked.
         _batchScratch?.Dispose();
 
+        _g4mtp?.Dispose();
         _diffusionLogits?.Dispose();
         _diffusionScSig?.Dispose();
         _pkvStore?.Dispose();
