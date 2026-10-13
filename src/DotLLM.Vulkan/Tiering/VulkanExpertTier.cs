@@ -49,6 +49,7 @@ internal sealed unsafe class VulkanExpertTier : IDisposable
     private readonly VulkanDevice.Buffer _idsReadback, _idsUpload;
     private readonly int* _idsReadbackPtr, _idsUploadPtr;
     private bool _disposed;
+    private static readonly bool s_debug = Environment.GetEnvironmentVariable("DOTLLM_TIER_DEBUG") == "1";
 
     /// <summary>Slots per layer.</summary>
     public int Slots { get; }
@@ -181,7 +182,7 @@ internal sealed unsafe class VulkanExpertTier : IDisposable
             for (int p = 0; p < 3; p++)
             {
                 var (start, length, d) = PieceSpan(L.FileOffset[p] + (long)missE[j] * L.PieceBytes[p], L.PieceBytes[p]);
-                reqs[nReq] = new UnbufferedFileReader.Request(L.File[p], start, length, dst, d + (int)L.PieceBytes[p]);
+                reqs[nReq + p] = new UnbufferedFileReader.Request(L.File[p], start, length, dst, d + (int)L.PieceBytes[p]);
                 delta[3 * j + p] = d;
                 dst += length;
                 L.BytesRead += length;
@@ -189,6 +190,15 @@ internal sealed unsafe class VulkanExpertTier : IDisposable
             nReq += 3;
         }
         if (nReq > 0) { _reader.Read(reqs[..nReq]); MissStalls++; }
+        if (nReq > 0 && s_debug)
+        {
+            for (int j = 0; j < Math.Min(nMiss, 1); j++)
+                for (int p = 0; p < 3; p++)
+                {
+                    var rq = reqs[3 * j + p];
+                    Console.Error.WriteLine($"[tier-debug] layer {layer} expert {missE[j]} -> slot {missS[j]} piece {p}: file {rq.File} off {rq.Offset} len {rq.Length} need {rq.Need} delta {delta[3 * j + p]} first8 {BitConverter.ToString(new ReadOnlySpan<byte>(rq.Dest + delta[3 * j + p], 8).ToArray())}");
+                }
+        }
         long t2 = Stopwatch.GetTimestamp();
 
         cmd = begin();
