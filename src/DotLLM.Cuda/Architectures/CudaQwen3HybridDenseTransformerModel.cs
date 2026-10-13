@@ -239,6 +239,19 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// </summary>
     internal int DebugF32StagedAttentionCallsForTest { get; private set; }
 
+    /// <summary>
+    /// Issue #962: serve prefill (seqLen &gt; 1) full-attention through the head_dim-256 tensor-core
+    /// flash kernel reading the F16 KV cache directly (no F32 staging). Default ON; env opt-out
+    /// <c>DOTLLM_ATTN_FLASH_PREFILL_HD256=0</c>. Settable so tests can A/B against attention_f32.
+    /// </summary>
+    internal bool FlashPrefillHd256ForTest { get; set; } = CudaKernels.EnableAttentionFlashPrefillHd256;
+
+    /// <summary>Test-only: prefill attention calls served by the head_dim-256 flash kernel.</summary>
+    internal int DebugFlashPrefillHd256CallsForTest { get; private set; }
+
+    private nint _attnFlashPrefillQF16;
+    private long _attnFlashPrefillQF16ElemsAllocated;
+
     // Opt-in split-KV attention (issue #183) scratch: partial (max, sum, out) per (head, split).
     // Sized once for the model's fixed (numHeads, headDim) shape and reused every decode step.
     private nint _attnSplitKvPartialMax;
@@ -3292,7 +3305,12 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             // decode kernel below reads the F16 cache directly, so on the default decode path no
             // F32 copy is allocated or converted at all. Tier precedence mirrors the dispatch
             // chain: the #226 fp64-combine toggle wins over mma, then mma, then the F32 tiers.
-            bool needF32Stage = useSplitKvHpAttn || !useMmaDecodeGqaSplitAttn;
+            // Issue #962: tensor-core flash prefill (head_dim 256) reads the F16 view directly too.
+            bool useFlashPrefillHd256 = seqLen > 1
+                && FlashPrefillHd256ForTest
+                && _kernels.HasAttentionFlashPrefillHd256
+                && CudaKernels.IsAttentionFlashPrefillHd256Shape(numHeads, numKvHeads, headDim);
+            bool needF32Stage = !useFlashPrefillHd256 && (useSplitKvHpAttn || !useMmaDecodeGqaSplitAttn);
             nint kStage = 0, vStage = 0;
             // F16 view of K/V history: the persistent cache, or a fresh dequant into the shared
             // scratch when KV storage is quantized (Phase 2).
@@ -3328,7 +3346,21 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                     $"state+gdn {ComputeMemoryBytes / 1048576.0:F0} MiB");
             }
 
-            if (useSplitKvHpAttn)
+            if (useFlashPrefillHd256)
+            {
+                long qElemsAll = (long)seqLen * numHeads * headDim;
+                if (qElemsAll > _attnFlashPrefillQF16ElemsAllocated)
+                {
+                    FreeIfNonZero(ref _attnFlashPrefillQF16);
+                    _attnFlashPrefillQF16 = AllocDevice(qElemsAll * sizeof(ushort));
+                    _attnFlashPrefillQF16ElemsAllocated = qElemsAll;
+                }
+                _kernels.LaunchConvertF32ToF16(q, _attnFlashPrefillQF16, (int)qElemsAll, streamH);
+                _kernels.LaunchAttentionFlashPrefillHd256(_attnFlashPrefillQF16, kF16, vF16, attnOut,
+                    seqLen, seqKv, numHeads, numKvHeads, positionOffset, streamH);
+                DebugFlashPrefillHd256CallsForTest++;
+            }
+            else if (useSplitKvHpAttn)
             {
                 EnsureAttentionSplitKvScratch(numHeads, headDim);
                 _kernels.LaunchAttentionF32SplitKvHp(q, kStage, vStage, attnOut,
@@ -4266,6 +4298,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         FreeIfNonZero(ref _attnGqaSplitPartialSum);
         FreeIfNonZero(ref _attnGqaSplitPartialOut);
         FreeIfNonZero(ref _attnMmaDecodeQF16);
+        FreeIfNonZero(ref _attnFlashPrefillQF16);
 
         // MTP (issue #253): free the trailing NextN head's device weights (a no-op when absent).
         if (_mtpHead is { } mtpHead)
