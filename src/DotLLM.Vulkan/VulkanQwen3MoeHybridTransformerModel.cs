@@ -174,6 +174,26 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     /// <summary>Number of full-attention layers — the matching sparse KV-cache slot count.</summary>
     public int AttentionLayerCount => _attentionLayerCount;
 
+    /// <summary>Resident MoE layers whose shared-expert gate/up/down stay packed Q8_0 on the device (#987); 0 with <c>DOTLLM_VK_MOE_SHARED_PACKED=0</c>.</summary>
+    internal int SharedExpertPackedLayerCount => _residentMoeBundles.Count(b => b is { HasSharedExpert: true, SharedQuantType: QuantizationType.Q8_0 });
+
+    /// <summary>Device bytes held by the resident layers' shared-expert gate/up/down buffers (each distinct buffer once).</summary>
+    internal long SharedExpertBufferBytes
+    {
+        get
+        {
+            long total = 0;
+            foreach (var b in _residentMoeBundles)
+            {
+                if (b is null) continue;
+                var seen = new HashSet<VulkanDevice.Buffer>(ReferenceEqualityComparer.Instance as IEqualityComparer<VulkanDevice.Buffer>);
+                foreach (var buf in new[] { b.SharedGate, b.SharedUp, b.SharedDown, b.SharedGateQ8, b.SharedUpQ8 })
+                    if (buf is not null && seen.Add(buf)) total += (long)buf.Size;
+            }
+            return total;
+        }
+    }
+
     /// <summary>Creates a sparse <see cref="VulkanNemotronHKvCache"/> sized for this model.</summary>
     public VulkanNemotronHKvCache CreateKvCache(int maxSeqLen)
         => new(_device, _kvSlotForLayer, _attentionLayerCount,
@@ -1583,9 +1603,16 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             _state.MoeTopkIndices, _state.MoeGateInter, m: interm, k: hidden, n: topK, numExperts: numE, xDiv: topK);
         _kernels.MoeMmvqQ4K.Record(cmdBuf, moeW.W3Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
             _state.MoeTopkIndices, _state.MoeUpInter, m: interm, k: hidden, n: topK, numExperts: numE, xDiv: topK);
-        RecordMatmul(cmdBuf, moeW.SharedDown!, moeW.SharedQuantType, _state.MoeSharedSilu, _state.MoeSharedSumA,
-            outputDim: hidden, inputDim: sharedI, seqLen: 1);
+        // #987: a packed (Q8_0) shared down quantises MoeSharedSilu into MoeExpandedInputXq, which the routed MMVQs above are still reading;
+        // it runs after this barrier (Phase 4) instead. F16/F32 shared down has no quantise and stays here.
+        bool sharedDownLate = moeW.SharedQuantType is not (QuantizationType.F16 or QuantizationType.F32);
+        if (!sharedDownLate)
+            RecordMatmul(cmdBuf, moeW.SharedDown!, moeW.SharedQuantType, _state.MoeSharedSilu, _state.MoeSharedSumA,
+                outputDim: hidden, inputDim: sharedI, seqLen: 1);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        if (sharedDownLate)
+            RecordMatmul(cmdBuf, moeW.SharedDown!, moeW.SharedQuantType, _state.MoeSharedSilu, _state.MoeSharedSumA,
+                outputDim: hidden, inputDim: sharedI, seqLen: 1);
 
         // Phase 4: SwiGLU fused with the Q8_1 quantize feeding the down projection (topK rows of interm are one contiguous run of 32-blocks).
         _kernels.SwiGluQuantizeFused!.Record(cmdBuf, _state.MoeGateInter, _state.MoeUpInter, _state.MoeSiluInter,
@@ -2309,9 +2336,14 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             gateUp.Record(cmdBuf, moeW.W3Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
                 _state.MoeTopkIndices, _state.MoeUpInter, m: interm, k: hidden, n: topK, numExperts: numE, xDiv: topK);
         }
-        RecordMatmul(cmdBuf, moeW.SharedDown!, moeW.SharedQuantType, _state.MoeSharedSilu, _state.MoeSharedSumA, outputDim: hidden, inputDim: sharedI, seqLen: 1);
+        // #987: see the Q4E-fused decode path - a packed shared down must not quantise into MoeExpandedInputXq while the routed MMVQs read it.
+        bool sharedDownLate = moeW.SharedQuantType is not (QuantizationType.F16 or QuantizationType.F32);
+        if (!sharedDownLate)
+            RecordMatmul(cmdBuf, moeW.SharedDown!, moeW.SharedQuantType, _state.MoeSharedSilu, _state.MoeSharedSumA, outputDim: hidden, inputDim: sharedI, seqLen: 1);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("gate_up");
+        if (sharedDownLate)
+            RecordMatmul(cmdBuf, moeW.SharedDown!, moeW.SharedQuantType, _state.MoeSharedSilu, _state.MoeSharedSumA, outputDim: hidden, inputDim: sharedI, seqLen: 1);
 
         // Phase 4: routed SwiGLU fused with the Q8_1 quantize feeding the down projection.
         _kernels.SwiGluQuantizeFused!.Record(cmdBuf, _state.MoeGateInter, _state.MoeUpInter, _state.MoeSiluInter,
@@ -2430,6 +2462,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         RecordMatmul(cmdBuf, moeW.SharedGate!, moeW.SharedQuantType,
             _state.MoeSharedInput, _state.MoeSharedGate,
             outputDim: sharedI, inputDim: hidden, seqLen: seqLen);
+        // #987: packed gate/up both quantise the same input into the shared Q8_1 scratch on the small-row path (#952 race).
+        if (moeW.SharedQuantType is not (QuantizationType.F16 or QuantizationType.F32)) KernelSupport.ComputeToComputeBarrier(cmdBuf);
         RecordMatmul(cmdBuf, moeW.SharedUp!, moeW.SharedQuantType,
             _state.MoeSharedInput, _state.MoeSharedUp,
             outputDim: sharedI, inputDim: hidden, seqLen: seqLen);
