@@ -57,21 +57,19 @@ public sealed class CudaQwen3HybridDenseKvRollbackTest : IDisposable
 
         string path = SyntheticQwen35HybridDenseMtpGguf.Write(Path.Combine(_scratch, "kv-rollback.gguf"), withMtp: false);
 
-        var incremental = Run(path, ptxDir!, forceFullOnLastStep: false);
-        var forcedFull = Run(path, ptxDir!, forceFullOnLastStep: true);
+        var incremental = Run(path, ptxDir!);
+        var forcedFull = Run(path, ptxDir!);
 
         _out.WriteLine($"cursor before rollback {incremental.CursorBeforeRollback}, after append {incremental.CursorAfterAppend}; " +
-                       $"full reconversions on the post-rollback append: {incremental.FullReconvertsOnAppend} " +
                        $"(attention slots: {incremental.AttentionSlots})");
 
         Assert.Equal(6, incremental.CursorBeforeRollback);
         Assert.True(incremental.CursorAfterAppend == 5,
             $"F16 cursor is {incremental.CursorAfterAppend} after rollback-to-4 + append at 4, expected 5 " +
             "(6 means the cursor did not shrink on rollback — issue #478).");
-        Assert.True(incremental.FullReconvertsOnAppend == 0,
-            $"The post-rollback append took {incremental.FullReconvertsOnAppend} full-range F16->F32 " +
-            "reconversion(s); expected the incremental #182 path (issue #478).");
-        Assert.Equal(forcedFull.AttentionSlots, forcedFull.FullReconvertsOnAppend);   // control: the counter works
+        // Issue #956: the F32 staging is a shared scratch reconverted in full per use, so there is no
+        // incremental conversion path left to assert on. Rollback correctness is the cursor shrink
+        // above plus a bit-identical re-run of the same rollback + append (below).
 
         Assert.Equal(forcedFull.Logits.Length, incremental.Logits.Length);
         for (int i = 0; i < forcedFull.Logits.Length; i++)
@@ -81,7 +79,7 @@ public sealed class CudaQwen3HybridDenseKvRollbackTest : IDisposable
     private sealed record Result(int CursorBeforeRollback, int CursorAfterAppend, int FullReconvertsOnAppend,
                                  int AttentionSlots, float[] Logits);
 
-    private static Result Run(string path, string ptxDir, bool forceFullOnLastStep)
+    private static Result Run(string path, string ptxDir)
     {
         using var gguf = GgufFile.Open(path);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
@@ -95,14 +93,11 @@ public sealed class CudaQwen3HybridDenseKvRollbackTest : IDisposable
         Assert.Equal(6, kv.CurrentLength);
 
         kv.Rollback(4);   // a partial rejection: positions 4 and 5 are dropped
-        model.ForceFullKvReconvertForTest = forceFullOnLastStep;
-        int reconverts0 = model.DebugFullKvReconvertCountForTest;
         float[] logits;
         using (ITensor t = model.Forward([7], [4], deviceId: -1, kv))
             logits = Copy(t, config.VocabSize);
-        int reconverts = model.DebugFullKvReconvertCountForTest - reconverts0;
 
-        return new Result(before, model.DebugF16CacheCurrentLengthForTest, reconverts,
+        return new Result(before, model.DebugF16CacheCurrentLengthForTest, 0,
                           model.AttentionLayerCount, logits);
     }
 
