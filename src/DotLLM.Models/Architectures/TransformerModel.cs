@@ -729,6 +729,19 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         return RunLmHead(tokenIds.Length, deviceId);
     }
 
+    /// <summary>
+    /// Hint-aware forward (#933). With <paramref name="lastTokenLogitsOnly"/> and more than one token, only the
+    /// LAST row goes through the LM head (<c>[1, vocab]</c>): a 262k-vocab head over a 512-token prefill is
+    /// 6-10% of the CPU forward for logits nobody reads. The row is computed by the same n == 1 kernel arm as
+    /// a decode step, which the batch-invariance guarantee (#530) makes bit-identical to the full-rows result.
+    /// </summary>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly)
+    {
+        RunLayersAndFinalNormCore(tokenIds, positions, kvCache);
+        return RunLmHead(tokenIds.Length, deviceId, lastTokenLogitsOnly && tokenIds.Length > 1);
+    }
+
     /// <inheritdoc/>
     /// <remarks>
     /// Runs exactly the same graph as <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>
@@ -1039,7 +1052,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 projScratch: pleInputs,
                 output: pleInputs,
                 seqLen: seqLen, hiddenSize: hiddenSize,
-                numLayers: Config.NumLayers, pleDim: pleDim, eps: eps);
+                numLayers: Config.NumLayers, pleDim: pleDim, eps: eps, pool: _threadPool);
             G4Prof.E(12,_tp);
         }
 
@@ -1931,7 +1944,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                     postNormWeight: lw.PlePostNormWeight,
                     gateScratch: pleGateScratch,
                     projScratch: pleProjScratch,
-                    seqLen: seqLen, hiddenSize: hiddenSize, pleDim: pleDim, eps: eps);
+                    seqLen: seqLen, hiddenSize: hiddenSize, pleDim: pleDim, eps: eps, pool: _threadPool);
             }
         }
 
@@ -2412,7 +2425,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 postNormWeight: lw.PlePostNormWeight,
                 gateScratch: pleGateScratch,
                 projScratch: pleProjScratch,
-                seqLen: seqLen, hiddenSize: hiddenSize, pleDim: pleDim, eps: eps);
+                seqLen: seqLen, hiddenSize: hiddenSize, pleDim: pleDim, eps: eps, pool: _threadPool);
         }
 
         G4Prof.E(11,_t0); _t0=G4Prof.T();
@@ -2719,7 +2732,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                         postNormWeight: lw.PlePostNormWeight!,
                         gateScratch: pleGateScratch,
                         projScratch: pleProjScratch,
-                        seqLen: seqLen, hiddenSize: hiddenSize, pleDim: pleDim, eps: eps);
+                        seqLen: seqLen, hiddenSize: hiddenSize, pleDim: pleDim, eps: eps, pool: _threadPool);
 
                     for (int i = 0; i < numInputs; i++)
                     {
@@ -2748,6 +2761,23 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             ArrayPool<float>.Shared.Return(activatedBuf);
             ArrayPool<float>.Shared.Return(firstPredBuf);
         }
+    }
+
+    private struct GeGluCtx
+    {
+        public float* Gate, Up, Out;
+        public int Interm, SeqLen;
+    }
+
+    private static void GeGluWorker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        ref var c = ref Unsafe.AsRef<GeGluCtx>((void*)ctxPtr);
+        ComputeThreadPool.PartitionRange(c.SeqLen, threadIdx, threadCount, out int start, out int end);
+        for (int t = start; t < end; t++)
+            FusedOps.GeGLUTanh(
+                new ReadOnlySpan<float>(c.Gate + (long)t * c.Interm, c.Interm),
+                new ReadOnlySpan<float>(c.Up + (long)t * c.Interm, c.Interm),
+                new Span<float>(c.Out + (long)t * c.Interm, c.Interm));
     }
 
     /// <summary>
@@ -2793,12 +2823,22 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         }
 
         G4Prof.E(7,_t1); _t1=G4Prof.T();
-        for (int t = 0; t < seqLen; t++)
+        if (_threadPool is not null && seqLen >= 8)
         {
-            var gSpan = new ReadOnlySpan<float>(ffnGate + t * interm, interm);
-            var uSpan = new ReadOnlySpan<float>(ffnUp + t * interm, interm);
-            var oSpan = new Span<float>(siluOut + t * interm, interm);
-            FusedOps.GeGLUTanh(gSpan, uSpan, oSpan);
+            // Prefill: GeGLU is per-token independent; the tanh pass over seqLen x 6-12k floats is ~10% of
+            // the E2B CPU forward when run on one thread (#933). Per-row arithmetic is unchanged.
+            var gctx = new GeGluCtx { Gate = ffnGate, Up = ffnUp, Out = siluOut, Interm = interm, SeqLen = seqLen };
+            _threadPool.Dispatch((nint)(&gctx), &GeGluWorker);
+        }
+        else
+        {
+            for (int t = 0; t < seqLen; t++)
+            {
+                var gSpan = new ReadOnlySpan<float>(ffnGate + t * interm, interm);
+                var uSpan = new ReadOnlySpan<float>(ffnUp + t * interm, interm);
+                var oSpan = new Span<float>(siluOut + t * interm, interm);
+                FusedOps.GeGLUTanh(gSpan, uSpan, oSpan);
+            }
         }
 
         G4Prof.E(8,_t1); _t1=G4Prof.T();
@@ -2993,11 +3033,16 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     /// <c>_state.Logits</c>, allocates a freshly-owned tensor and copies the logits
     /// into it. Caller disposes the tensor.
     /// </summary>
-    private unsafe ITensor RunLmHead(int seqLen, int deviceId)
+    private unsafe ITensor RunLmHead(int seqLen, int deviceId, bool lastRowOnly = false)
     {
         int vocabSize = Config.VocabSize;
         float* hidden = (float*)_state.HiddenState;
         float* logits = (float*)_state.Logits;
+        if (lastRowOnly)
+        {
+            hidden += (long)(seqLen - 1) * Config.HiddenSize;
+            seqLen = 1;
+        }
 
         long _tl = G4Prof.T();
         var rwOutput = _weights.RepackedOutput ?? default;

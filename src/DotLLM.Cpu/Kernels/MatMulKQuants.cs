@@ -1781,7 +1781,7 @@ public static unsafe partial class MatMul
                 Weights = weights, InputQ8 = preQuantizedInput, C = c,
                 M = m, N = n, SuperBlockCount = superBlockCount2,
                 TileM = tileM, KRowBytes = kRowBytes, Q8RowBytes = q8RowBytes,
-                ComputeRows = computeRows
+                ComputeRows = computeRows, KBlockBytes = kBlockBytes
             };
             pool.Dispatch((nint)(&ctx), &GemmTiledKQuantWorker);
             return;
@@ -1813,7 +1813,7 @@ public static unsafe partial class MatMul
                     Weights = weights, InputQ8 = inputQ8, C = c,
                     M = m, N = n, SuperBlockCount = superBlockCount2,
                     TileM = tileM, KRowBytes = kRowBytes, Q8RowBytes = q8RowBytes,
-                    ComputeRows = computeRows
+                    ComputeRows = computeRows, KBlockBytes = kBlockBytes
                 };
                 pool.Dispatch((nint)(&ctx), &GemmTiledKQuantWorker);
             }
@@ -1921,6 +1921,7 @@ public static unsafe partial class MatMul
         public int TileM;
         public int KRowBytes;
         public int Q8RowBytes;
+        public int KBlockBytes;
         public delegate*<byte*, byte*, float*, int, int, void> ComputeRows;
     }
 
@@ -1930,12 +1931,49 @@ public static unsafe partial class MatMul
         int totalTiles = (ctx.M + ctx.TileM - 1) / ctx.TileM;
         ComputeThreadPool.PartitionRange(totalTiles, threadIdx, threadCount, out int startTile, out int endTile);
 
+        // Q4_K / Q6_K on AVX2: weights of a 4-row group are decoded once per 4 tokens (#933), bit-identical
+        // to the per-token ComputeRows path. Everything else (and the <4-token / <4-row remainders) is unchanged.
+        bool tok4 = Avx2.IsSupported && Sse41.IsSupported
+            && (ctx.KBlockBytes == Q4_K_BlockBytes || ctx.KBlockBytes == Q6_K_BlockBytes);
+        bool q6 = ctx.KBlockBytes == Q6_K_BlockBytes;
+
         for (int tile = startTile; tile < endTile; tile++)
         {
             int mStart = tile * ctx.TileM;
             int tileRows = Math.Min(ctx.TileM, ctx.M - mStart);
             byte* tileWeights = ctx.Weights + (long)mStart * ctx.KRowBytes;
-            for (int t = 0; t < ctx.N; t++)
+            int t = 0;
+            int groupRows = tileRows & ~3;
+            if (tok4 && groupRows > 0)
+            {
+                for (; t + 4 <= ctx.N; t += 4)
+                {
+                    byte* xq = ctx.InputQ8 + (long)t * ctx.Q8RowBytes;
+                    for (int r = 0; r < groupRows; r += 4)
+                    {
+                        byte* gw = tileWeights + (long)r * ctx.KRowBytes;
+                        float* cc = ctx.C + (long)t * ctx.M + mStart + r;
+                        for (int rr = 0; rr < 4; rr++)
+                        {
+                            if (q6)
+                                Q6KRowTok4(gw + (long)rr * ctx.KRowBytes, xq, ctx.Q8RowBytes, ctx.SuperBlockCount,
+                                    Q6_K_BlockBytes, cc + rr, ctx.M);
+                            else
+                                Q4KRowTok4(gw + (long)rr * ctx.KRowBytes, xq, ctx.Q8RowBytes, ctx.SuperBlockCount,
+                                    Q4_K_BlockBytes, cc + rr, ctx.M);
+                        }
+                    }
+
+                    if (tileRows > groupRows)
+                    {
+                        for (int tt = t; tt < t + 4; tt++)
+                            ctx.ComputeRows(tileWeights + (long)groupRows * ctx.KRowBytes, ctx.InputQ8 + (long)tt * ctx.Q8RowBytes,
+                                ctx.C + (long)tt * ctx.M + mStart + groupRows, tileRows - groupRows, ctx.SuperBlockCount);
+                    }
+                }
+            }
+
+            for (; t < ctx.N; t++)
                 ctx.ComputeRows(tileWeights, ctx.InputQ8 + t * ctx.Q8RowBytes,
                     ctx.C + t * ctx.M + mStart, tileRows, ctx.SuperBlockCount);
         }
