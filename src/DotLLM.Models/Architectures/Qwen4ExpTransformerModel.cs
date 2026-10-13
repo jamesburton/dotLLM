@@ -435,6 +435,7 @@ public sealed unsafe partial class Qwen4ExpTransformerModel : IModel
             case QuantizationType.IQ2_S:
             case QuantizationType.IQ3_XXS:
             case QuantizationType.IQ3_S:
+            case QuantizationType.IQ1_M:
             case QuantizationType.IQ1_S:
                 MatMul.GemmIQCodebook(qt, (byte*)weights, b, c, m, k, n, pool, null); return;
             case QuantizationType.F32: MatMul.GemmF32((float*)weights, b, c, m, k, n, pool); return;
