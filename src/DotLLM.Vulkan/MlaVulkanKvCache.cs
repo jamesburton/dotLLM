@@ -42,6 +42,8 @@ public sealed class MlaVulkanKvCache : IKvCache, IDisposable
     private readonly VulkanDevice.Buffer[] _kNopeBuffers;
     private readonly VulkanDevice.Buffer[] _vBuffers;
     private readonly VulkanDevice.Buffer[] _kPeBuffers;
+    private readonly VulkanDevice.Buffer[]? _latentBuffers;
+    private readonly int _latentDim;
     private readonly int _numLayers;
     private readonly int _numHeads;
     private readonly int _qkNopeHeadDim;
@@ -56,6 +58,16 @@ public sealed class MlaVulkanKvCache : IKvCache, IDisposable
 
     /// <inheritdoc/>
     public int MaxLength => _maxSeqLen;
+
+    /// <summary>
+    /// True for the absorbed-MLA latent layout (#913): ONE <c>[maxSeqLen, latentDim]</c> row per token per layer holding
+    /// <c>concat(rmsnorm(c_kv), rope(k_pe))</c> (kv_lora_rank + qk_rope = 576 floats for GLM-4.7-Flash / DeepSeek-V2),
+    /// ~16x smaller than the expanded per-head K_nope/V/K_pe layout (36 KB -> 2.25 KB per token per layer).
+    /// </summary>
+    public bool IsLatent => _latentBuffers is not null;
+
+    /// <summary>Latent row width in floats (kv_lora_rank + qk_rope); 0 in the expanded layout.</summary>
+    public int LatentDim => _latentDim;
 
     /// <summary>Number of MLA-bearing layers in the model.</summary>
     public int NumLayers => _numLayers;
@@ -76,6 +88,7 @@ public sealed class MlaVulkanKvCache : IKvCache, IDisposable
     {
         get
         {
+            if (_latentBuffers is not null) return (long)_numLayers * _maxSeqLen * _latentDim * sizeof(float);
             long perLayerBytes =
                 (long)_maxSeqLen * (KNopeRowBytes + VRowBytes + KPeRowBytes);
             return _numLayers * perLayerBytes;
@@ -90,10 +103,11 @@ public sealed class MlaVulkanKvCache : IKvCache, IDisposable
     /// <param name="qkNopeHeadDim">Per-head non-rope K dimension.</param>
     /// <param name="vHeadDim">Per-head V dimension.</param>
     /// <param name="qkRopeHeadDim">Shared rope-K dimension (broadcast across heads).</param>
+    /// <param name="latentDim">0 = expanded K_nope/V/K_pe layout; &gt; 0 = absorbed latent layout with this row width (kv_lora_rank + qk_rope).</param>
     public MlaVulkanKvCache(
         VulkanDevice device,
         int numLayers, int maxSeqLen,
-        int numHeads, int qkNopeHeadDim, int vHeadDim, int qkRopeHeadDim)
+        int numHeads, int qkNopeHeadDim, int vHeadDim, int qkRopeHeadDim, int latentDim = 0)
     {
         ArgumentNullException.ThrowIfNull(device);
         if (numLayers <= 0) throw new ArgumentOutOfRangeException(nameof(numLayers));
@@ -111,6 +125,18 @@ public sealed class MlaVulkanKvCache : IKvCache, IDisposable
         _vHeadDim = vHeadDim;
         _qkRopeHeadDim = qkRopeHeadDim;
 
+        _latentDim = latentDim;
+        if (latentDim > 0)
+        {
+            _kNopeBuffers = [];
+            _vBuffers = [];
+            _kPeBuffers = [];
+            _latentBuffers = new VulkanDevice.Buffer[numLayers];
+            for (int i = 0; i < numLayers; i++)
+                _latentBuffers[i] = device.AllocateDeviceLocal((long)maxSeqLen * latentDim * sizeof(float));
+            return;
+        }
+
         _kNopeBuffers = new VulkanDevice.Buffer[numLayers];
         _vBuffers = new VulkanDevice.Buffer[numLayers];
         _kPeBuffers = new VulkanDevice.Buffer[numLayers];
@@ -125,6 +151,31 @@ public sealed class MlaVulkanKvCache : IKvCache, IDisposable
             _vBuffers[i] = device.AllocateDeviceLocal(vBytesPerLayer);
             _kPeBuffers[i] = device.AllocateDeviceLocal(kPeBytesPerLayer);
         }
+    }
+
+    /// <summary>Latent cache buffer <c>[maxSeqLen, latentDim]</c> for the given layer (latent layout only).</summary>
+    internal VulkanDevice.Buffer GetLatentBuffer(int layerIndex)
+        => (_latentBuffers ?? throw new InvalidOperationException("Not a latent MLA cache.")) [layerIndex];
+
+    /// <summary>
+    /// Latent layout: validates the (contiguous, ascending) positions a kv-prep dispatch is about to write straight into
+    /// the cache rows and advances the visible length. No copy is recorded: the shader writes the rows itself.
+    /// Returns the first written row.
+    /// </summary>
+    internal int NoteLatentWrite(ReadOnlySpan<int> positions, int seqLen)
+    {
+        if (_latentBuffers is null) throw new InvalidOperationException("Not a latent MLA cache.");
+        if (positions.Length != seqLen) throw new ArgumentException("positions.Length must equal seqLen", nameof(positions));
+        int start = positions[0];
+        for (int i = 1; i < seqLen; i++)
+            if (positions[i] != positions[i - 1] + 1)
+                throw new NotSupportedException(
+                    "MlaVulkanKvCache only supports contiguous-ascending position updates; got non-contiguous positions.");
+        int last = positions[seqLen - 1];
+        if ((uint)start >= (uint)_maxSeqLen || (uint)last >= (uint)_maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(positions), $"Position {last} exceeds max cache length {_maxSeqLen}.");
+        if (last + 1 > _currentLength) _currentLength = last + 1;
+        return start;
     }
 
     /// <summary>Cached K_nope buffer for the given layer.</summary>
@@ -253,7 +304,9 @@ public sealed class MlaVulkanKvCache : IKvCache, IDisposable
     {
         if (_disposed) return;
         _disposed = true;
-        for (int i = 0; i < _numLayers; i++)
+        if (_latentBuffers is not null)
+            foreach (var b in _latentBuffers) b?.Dispose();
+        for (int i = 0; i < _kNopeBuffers.Length; i++)
         {
             _kNopeBuffers[i]?.Dispose();
             _vBuffers[i]?.Dispose();

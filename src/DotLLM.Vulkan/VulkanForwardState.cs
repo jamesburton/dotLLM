@@ -22,6 +22,7 @@ internal sealed class VulkanForwardState : IDisposable
     private readonly int _intermediateSize;
     private readonly int _vocabSize;
     // MLA dims — zero unless the model carries an MLA layer.
+    private readonly bool _mlaAbsorbed;
     private readonly int _mlaQLoraRank;
     private readonly int _mlaKvLoraRank;
     private readonly int _mlaQkNopeHeadDim;
@@ -171,6 +172,14 @@ internal sealed class VulkanForwardState : IDisposable
     public VulkanDevice.Buffer? MlaKPe { get; private set; }           // [seqLen, qkRope]
     public VulkanDevice.Buffer? MlaAttnOutput { get; private set; }    // [seqLen, numHeads * vHead]
 
+    // Absorbed-MLA scratch (#913), allocated instead of the expanded K/V scratch when _mlaAbsorbed.
+    public VulkanDevice.Buffer? MlaKvA { get; private set; }           // [seqLen, kvLoraRank + qkRope]  raw kv_a_mqa output
+    public VulkanDevice.Buffer? MlaCKvScratch { get; private set; }    // [seqLen, kvLoraRank + qkRope]  latent rows for cache-less forwards
+    public VulkanDevice.Buffer? MlaQAbs { get; private set; }          // [seqLen, numHeads, kvLoraRank + qkRope]  absorbed query
+    public VulkanDevice.Buffer? MlaLatOut { get; private set; }        // [seqLen, numHeads, kvLoraRank]  softmax(QK)·C, pre v_b
+    public VulkanDevice.Buffer? MlaSplitO { get; private set; }        // [MaxSplits, MaxSplitRows, kvLoraRank]
+    public VulkanDevice.Buffer? MlaSplitML { get; private set; }       // [MaxSplits, MaxSplitRows, 2]
+
     // ── Q8_1 activation-quantization scratch (dp4a MMVQ decode path) ───
     // Allocated only when the device supports integer dot product AND the
     // MMVQ kernels were created (mmvqEnabled at construction). Sized for the
@@ -238,9 +247,11 @@ internal sealed class VulkanForwardState : IDisposable
         int moeNumExperts = 0, int moeTopK = 0, int moeIntermediateSize = 0,
         int moeSharedIntermediateSize = 0, int moeNumSharedExperts = 0,
         bool mmvqEnabled = false,
-        bool gemma4DualFfn = false)
+        bool gemma4DualFfn = false,
+        bool mlaAbsorbed = false)
     {
         _device = device;
+        _mlaAbsorbed = mlaAbsorbed;
         _mmvqEnabled = mmvqEnabled;
         _gemma4DualFfn = gemma4DualFfn;
         _hiddenSize = hiddenSize;
@@ -507,6 +518,11 @@ internal sealed class VulkanForwardState : IDisposable
         return total;
     }
 
+    /// <summary>Upper bound on split-KV partitions of the absorbed-MLA decode attention (must match the shader).</summary>
+    public const int MlaSplitMaxSplits = 32;
+    /// <summary>Largest token count (rows = tokens x heads) the split-KV absorbed attention handles; larger chunks run unsplit.</summary>
+    public const int MlaSplitMaxRows = 4;
+
     private long AllocateMlaScratch(int seqLen)
     {
         if (_mlaNumHeads == 0) return 0;
@@ -528,6 +544,26 @@ internal sealed class VulkanForwardState : IDisposable
             MlaQLatentNorm = _device.AllocateDeviceLocal(qLatentBytes);
         }
         MlaQ = _device.AllocateDeviceLocal(qBytes);
+        if (_mlaAbsorbed)
+        {
+            // Absorbed MLA (#913): no expanded per-head K/V, no standalone latent buffers. The attention reads the
+            // [kvLoraRank + qkRope] latent cache directly; Q is pre-multiplied by k_b into the same 576-wide space.
+            long cDim = _mlaKvLoraRank + _mlaQkRopeHeadDim;
+            long kvABytes = (long)seqLen * cDim * sizeof(float);
+            long qAbsBytes = (long)seqLen * _mlaNumHeads * cDim * sizeof(float);
+            long latOutBytes = (long)seqLen * _mlaNumHeads * _mlaKvLoraRank * sizeof(float);
+            long absAttnOut = (long)seqLen * _mlaNumHeads * _mlaVHeadDim * sizeof(float);
+            long splitO = (long)MlaSplitMaxSplits * MlaSplitMaxRows * _mlaNumHeads * _mlaKvLoraRank * sizeof(float);
+            long splitML = (long)MlaSplitMaxSplits * MlaSplitMaxRows * _mlaNumHeads * 2 * sizeof(float);
+            MlaKvA = _device.AllocateDeviceLocal(kvABytes);
+            MlaCKvScratch = _device.AllocateDeviceLocal(kvABytes);
+            MlaQAbs = _device.AllocateDeviceLocal(qAbsBytes);
+            MlaLatOut = _device.AllocateDeviceLocal(latOutBytes);
+            MlaAttnOutput = _device.AllocateDeviceLocal(absAttnOut);
+            MlaSplitO = _device.AllocateDeviceLocal(splitO);
+            MlaSplitML = _device.AllocateDeviceLocal(splitML);
+            return qLatentBytes * 2 + qBytes + kvABytes * 2 + qAbsBytes + latOutBytes + absAttnOut + splitO + splitML;
+        }
         MlaKvLatent = _device.AllocateDeviceLocal(kvLatentBytes);
         MlaKvLatentNorm = _device.AllocateDeviceLocal(kvLatentBytes);
         MlaKvBExpanded = _device.AllocateDeviceLocal(kvBExpandedBytes);
@@ -565,6 +601,12 @@ internal sealed class VulkanForwardState : IDisposable
         MlaV?.Dispose(); MlaV = null;
         MlaKPe?.Dispose(); MlaKPe = null;
         MlaAttnOutput?.Dispose(); MlaAttnOutput = null;
+        MlaKvA?.Dispose(); MlaKvA = null;
+        MlaCKvScratch?.Dispose(); MlaCKvScratch = null;
+        MlaQAbs?.Dispose(); MlaQAbs = null;
+        MlaLatOut?.Dispose(); MlaLatOut = null;
+        MlaSplitO?.Dispose(); MlaSplitO = null;
+        MlaSplitML?.Dispose(); MlaSplitML = null;
 
         MoeRouterLogits?.Dispose(); MoeRouterLogits = null;
         MoeTopkIndices?.Dispose(); MoeTopkIndices = null;
