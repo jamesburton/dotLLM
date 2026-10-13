@@ -23,6 +23,7 @@ unsafe
         case "io": Io.Run(args); return;
         case "mm": MmapArm.Run(args); return;
         case "gpucopy": GpuCopy.Run(args); return;
+        case "immap": ImMap.Run(args); return;
         default: Console.WriteLine("unknown command"); return;
     }
 }
@@ -268,5 +269,36 @@ static unsafe class GpuCopy
             }
             catch (Exception e) { Console.WriteLine($"[gpucopy] {kind}: {e.GetType().Name} {e.Message}"); }
         }
+    }
+}
+
+static unsafe class ImMap
+{
+    // immap <file> <startMiB> <sizeMiB> : map the file (copy-on-write view, as DOTLLM_GGUF_MAP_COW does), import [start,start+size) with
+    // VK_EXT_external_memory_host, then GPU-copy it to a device-local buffer twice (cold, then warm). Shows whether import pre-faults the
+    // pages (pinning) or the GPU faults them lazily, how long each takes, and what the import costs in available RAM.
+    public static void Run(string[] a)
+    {
+        string path = a[1]; long start = long.Parse(a[2]) << 20, size = long.Parse(a[3]) << 20;
+        using var dev = VulkanDevice.Create();
+        using var mmf = MemoryMappedFile.CreateFromFile(path, FileMode.Open, null, 0, MemoryMappedFileAccess.CopyOnWrite);
+        using var view = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.CopyOnWrite);
+        byte* p = null; view.SafeMemoryMappedViewHandle.AcquirePointer(ref p); p += view.PointerOffset;
+        Mem.Print("before import");
+        var sw = Stopwatch.StartNew();
+        var imp = dev.TryWrapHostVisible((nint)(p + start), size);
+        Console.WriteLine($"[immap] import {(imp is null ? "REFUSED" : "OK")} in {sw.Elapsed.TotalSeconds:F2} s");
+        Mem.Print("after import ");
+        if (imp is null) return;
+        using var dst = dev.AllocateDeviceLocal(size);
+        for (int i = 0; i < 2; i++)
+        {
+            sw.Restart();
+            dev.CopyBufferSynchronous(imp, dst, (ulong)size);
+            Console.WriteLine($"[immap] GPU copy #{i}: {sw.Elapsed.TotalSeconds:F2} s = {size / sw.Elapsed.TotalSeconds / 1e9:F2} GB/s");
+            Mem.Print("after copy   ");
+        }
+        imp.Dispose();
+        view.SafeMemoryMappedViewHandle.ReleasePointer();
     }
 }

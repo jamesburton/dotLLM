@@ -17,7 +17,7 @@ int chunk = args.Length > 4 ? int.Parse(args[4]) : 256;
 int needleTokens = args.Length > 5 ? int.Parse(args[5]) : 0;
 
 var sw = Stopwatch.StartNew();
-var (model, file, cfg) = ModelLoader.LoadFromGguf(gguf, new DotLLM.Core.Configuration.ThreadingConfig(0));
+var (model, file, cfg) = ModelLoader.LoadFromGguf(gguf, new DotLLM.Core.Configuration.ThreadingConfig(int.TryParse(Environment.GetEnvironmentVariable("TRACE_THREADS"), out int th) ? th : 0));
 var q4 = (Qwen4ExpTransformerModel)model;
 var tok = GgufTokenizerFactory.Load(file.Metadata);
 Console.WriteLine($"[trace] loaded in {sw.Elapsed.TotalSeconds:F0} s; vocab {cfg.VocabSize}");

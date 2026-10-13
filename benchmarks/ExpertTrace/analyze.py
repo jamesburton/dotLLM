@@ -170,6 +170,39 @@ def main():
             out.append(f"C={c}: {np.mean(vals):.0f}")
         print(f"  {n:<14}" + "  ".join(out))
 
+
+    # ---- per-layer budget allocation (same total slots as uniform 64/layer) ----
+    grid = [8, 16, 32, 48, 64, 96, 128, 192, 256]
+    hit = {}   # (name, layer) -> list of hits per grid cap ; look count
+    for n, (a, npre) in tr.items():
+        for l in range(a.shape[1]):
+            hs = []
+            for c in grid:
+                h, k, _ = lru_hits(a[:, l, :], c, npre); hs.append(h)
+            hit[(n, l)] = (hs, k)
+    def allocate(names, L, total):
+        alloc = [0] * L          # index into grid, start at smallest
+        slots = grid[0] * L
+        gain = lambda l, i: sum(hit[(n, l)][0][i + 1] - hit[(n, l)][0][i] for n in names) / (grid[i + 1] - grid[i])
+        while True:
+            best, bl = 0.0, -1
+            for l in range(L):
+                i = alloc[l]
+                if i + 1 < len(grid) and slots + grid[i + 1] - grid[i] <= total:
+                    g = gain(l, i)
+                    if g > best: best, bl = g, l
+            if bl < 0: break
+            slots += grid[alloc[bl] + 1] - grid[alloc[bl]]; alloc[bl] += 1
+        return alloc
+    print("\n== Per-layer slot budget (same TOTAL as uniform 64/layer = 12.5% of experts): allocation fitted on the OTHER workloads, evaluated on this one")
+    for n, (a, npre) in tr.items():
+        L = a.shape[1]; others = [m for m in tr if m != n]
+        if not others: continue
+        al = allocate(others, L, 64 * L)
+        h = sum(hit[(n, l)][0][al[l]] for l in range(L)); k = sum(hit[(n, l)][1] for l in range(L))
+        h64 = sum(hit[(n, l)][0][grid.index(64)] for l in range(L))
+        print(f"  {n:<14} uniform-64 {pct(h64,k):.1f}%  cross-fitted per-layer {pct(h,k):.1f}%   (slots/layer min {min(grid[i] for i in al)} max {max(grid[i] for i in al)})")
+
     # ---- traffic ----
     print("\n== Implied SSD traffic per decoded token (all layers, qwen4exp 2.93 MiB/expert)")
     for n, (a, npre) in tr.items():
