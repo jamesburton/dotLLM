@@ -1893,8 +1893,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         if (iqDown is not null) CountMoePath(MoePath.GroupedIqDown);
         if (moeW.W1QuantType != QuantizationType.Q4_K) CountMoePath(MoePath.GroupedGateUpNotQ4K);
 
-        // #986: dp4a 64×64 grouped MMQ path — Q8_1 activations, preferred over coopmat for K-quant-only layers.
-        // Both gate/up AND down must have MMQ kernels so the tile list shares one row-tile=64.
+        // #986: dp4a grouped MMQ path — Q8_1 activations, preferred over coopmat for K-quant-only layers.
+        // Both gate/up AND down must have MMQ kernels so the tile list shares one row-tile (32 or 64).
         var gateUpMmq = (iqGateUp is null && legacyDown is null && iqDown is null) ? GroupedGateUpMmqKernel(moeW.W1QuantType) : null;
         var downMmq = (gateUpMmq is not null) ? GroupedDownMmqKernel(moeW.W2QuantType) : null;
         bool useMmq = gateUpMmq is not null && downMmq is not null
