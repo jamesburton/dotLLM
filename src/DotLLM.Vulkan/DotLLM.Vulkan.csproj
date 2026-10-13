@@ -7,6 +7,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="DotLLM.Tests.Unit" />
+    <InternalsVisibleTo Include="IoProbe" />
     <InternalsVisibleTo Include="DotLLM.Tests.Integration" />
     <InternalsVisibleTo Include="DotLLM.Benchmarks" />
     <InternalsVisibleTo Include="DotLLM.Cuda" />

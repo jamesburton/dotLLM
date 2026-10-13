@@ -791,6 +791,15 @@ public sealed unsafe partial class Qwen4ExpTransformerModel : IModel
     public static float DiagMoeInputNoise { get; set; } = float.TryParse(Environment.GetEnvironmentVariable("DOTLLM_Q4E_DIAG_NOISE"), System.Globalization.NumberStyles.Float,
         System.Globalization.CultureInfo.InvariantCulture, out float dn) ? dn : 0f;
 
+    /// <summary>Receives the routed-expert assignments of one MoE layer: <c>assignExpert[t * topK + j]</c> is token <c>t</c>'s j-th selected expert.</summary>
+    public delegate void RoutingTraceCallback(int layer, int rows, int topK, ReadOnlySpan<int> assignExpert);
+
+    /// <summary>
+    /// Diagnostic (#938, expert tiering): when non-null, called after the router of every MoE layer on the CPU oracle path with the
+    /// per-token top-k expert ids. A null check when off; never set in production.
+    /// </summary>
+    public static RoutingTraceCallback? RoutingTrace { get; set; }
+
     private void ForwardMoe(MoeLayerWeights moe, int layer, float[] x, float[] y, int T)
     {
         if (DiagMoeInputNoise != 0f)
@@ -816,6 +825,7 @@ public sealed unsafe partial class Qwen4ExpTransformerModel : IModel
             int uniqueCount = MoeSwiGluMlp.Route(
                 x.AsSpan(0, T * H), moe.Gate, assignExpert, assignWeight, cursors, bucketTokens, bucketSlots, unique,
                 ne, k, H, T, moe.NormTopKProb);
+            RoutingTrace?.Invoke(layer, T, k, assignExpert.AsSpan(0, total));
 
             long gateRow = Dequantize.RowByteSize((long)inter * H, moe.GateExpsRawQt);
             long upRow = Dequantize.RowByteSize((long)inter * H, moe.UpExpsRawQt);
