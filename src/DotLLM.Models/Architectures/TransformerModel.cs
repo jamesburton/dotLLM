@@ -3970,6 +3970,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     /// avoids cross-page TLB misses and prefetcher stride-limit failures.
     /// </summary>
     private const int InterleavedMinRowBytes = 1024;
+    private static readonly bool _r4DecodeKQuants = Environment.GetEnvironmentVariable("DOTLLM_R4_DECODE_KQUANT") == "1";
 
     /// <summary>
     /// True when the R4 repacked kernels should serve this projection. K-quants are exempt from
@@ -4098,6 +4099,15 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                     return;
             }
 
+            Gemm(origWeights, qt, b, c, m, k, n, preQuantizedInput);
+            return;
+        }
+
+        // Single token on a K-quant: the row-major GEMV beats the R4 ComputeRows arm on decode (Gemma-4 E2B,
+        // same session: 26-28 vs 16-17 tok/s with identical bits - both run the same 4-row dot, #933), so
+        // decode keeps reading the mmap weights and the R4 copy only serves n > 1.
+        if ((qt is QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K) && !_r4DecodeKQuants)
+        {
             Gemm(origWeights, qt, b, c, m, k, n, preQuantizedInput);
             return;
         }
