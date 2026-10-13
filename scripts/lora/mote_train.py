@@ -59,6 +59,7 @@ except Exception:
     pass  # older torch or dynamo not available
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -66,6 +67,7 @@ import sys
 import time
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -237,6 +239,56 @@ def _kl_loss(
     # teacher mass). The spec's "KL(student || teacher)" notation was inverted; this
     # implementation is the scientifically correct direction.
     return F.kl_div(s_lp, t_p, reduction="batchmean")
+
+
+def _self_kd_loss_temp(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    T: float = 2.0,
+) -> torch.Tensor:
+    """Temperature-scaled KL(teacher || student) for self-KD (full-vocab).
+
+    Identical direction to ``_kl_loss`` but applies temperature scaling T before
+    softmax/log-softmax and multiplies the result by T^2 to preserve gradient
+    magnitude (Hinton et al. 2015 convention).
+
+    student_logits / teacher_logits: [B, L-1, V] (valid next-token positions).
+    Returns a scalar loss.
+    """
+    V = student_logits.size(-1)
+    s_lp = F.log_softmax(student_logits.float().view(-1, V) / T, dim=-1)
+    t_p = F.softmax(teacher_logits.float().view(-1, V).detach() / T, dim=-1)
+    return F.kl_div(s_lp, t_p, reduction="batchmean") * (T * T)
+
+
+def _topk_kd_loss(
+    student_logits_shift: torch.Tensor,
+    topk_idx: torch.Tensor,
+    topk_logit: torch.Tensor,
+    T: float = 2.0,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Sparse top-K KL distillation from a pre-computed teacher cache.
+
+    Parameters
+    ----------
+    student_logits_shift : [L-1, V]  -- student logits at valid next-token positions
+    topk_idx             : [L-1, K]  -- top-K vocab indices from teacher (int64)
+    topk_logit           : [L-1, K]  -- teacher RAW logits for those indices (float32)
+    T                    : temperature (default 2.0)
+    eps                  : numerical floor for log(teacher_p + eps)
+
+    Returns a scalar KD loss = mean over positions * T^2.
+    """
+    # Gather student logits at teacher's top-K positions
+    s_topk = student_logits_shift.float().gather(-1, topk_idx)          # [L-1, K]
+    # Soft targets from teacher over the top-K positions
+    teacher_p = F.softmax(topk_logit / T, dim=-1)                       # [L-1, K]
+    # Student log-probs at those same positions
+    student_logp = F.log_softmax(s_topk / T, dim=-1)                    # [L-1, K]
+    # KL: Σ_k  teacher_p[k] * (log teacher_p[k] – log student_p[k])
+    kd_per_pos = (teacher_p * (torch.log(teacher_p + eps) - student_logp)).sum(-1)  # [L-1]
+    return kd_per_pos.mean() * (T * T)
 
 
 def _build_corpus(
@@ -585,7 +637,73 @@ def main() -> None:
             "checkpointing activates even when the embedding is frozen.  Default: off."
         ),
     )
+    ap.add_argument(
+        "--self-kd", action="store_true", default=False,
+        help=(
+            "Local frozen-tail KD: immediately after loading student weights, deepcopy "
+            "model.model.norm + model.lm_head as a frozen teacher-tail snapshot.  During "
+            "training the student tail is distilled toward this snapshot to anchor English "
+            "output and prevent forgetting.  EN-gated: self-KD is suppressed on JA sequences "
+            "because the base is weak at Japanese -- applying it on JA positions would fight "
+            "the JA LM objective.  Requires --mix ja_en to benefit from EN-gating; without it "
+            "is_en is always False and kd stays zero.  Combines with --kd-weight (loss weight) "
+            "and --kd-temp (softmax temperature).  Mutually exclusive with --teacher-cache."
+        ),
+    )
+    ap.add_argument(
+        "--kd-temp", type=float, default=2.0,
+        help=(
+            "Softmax temperature for the KD loss (default 2.0, Hinton et al. 2015).  "
+            "Applied to both --self-kd (full-vocab KL) and --teacher-cache (top-K KL).  "
+            "The loss is multiplied by T^2 to preserve gradient magnitude under temperature scaling."
+        ),
+    )
+    ap.add_argument(
+        "--teacher-cache", default=None,
+        help=(
+            "Path to a pre-computed top-K teacher logit cache directory.  "
+            "Expects topk_idx.npy [N, L, K] int32, topk_logit.npy [N, L, K] float16, "
+            "and meta.json {model_id, K, seq_len, n_seqs, vocab_size}.  "
+            "Must be combined with --kd-corpus.  Mutually exclusive with --self-kd.  "
+            "See scripts/lora/TEACHER_CACHE_FORMAT.md for the full byte-for-byte contract."
+        ),
+    )
+    ap.add_argument(
+        "--kd-corpus", default=None,
+        help=(
+            "Path to a pre-tokenized fixed corpus directory aligned to --teacher-cache.  "
+            "Expects ids.npy [N, L] int32 (right-padded) and meta.json "
+            "{tokenizer, seq_len, n_seqs, pad_id, mix}.  Required when --teacher-cache is set.  "
+            "The trainer iterates sequences in row order so that corpus row i aligns with "
+            "teacher-cache row i."
+        ),
+    )
     args = ap.parse_args()
+
+    # ------------------------------------------------------------------
+    # Validate new KD-source flag combinations
+    # ------------------------------------------------------------------
+    if args.self_kd and args.teacher_cache:
+        raise SystemExit(
+            "[mote_train] ERROR: --self-kd and --teacher-cache are mutually exclusive; "
+            "choose one KD source."
+        )
+    if args.teacher_cache and not args.kd_corpus:
+        raise SystemExit(
+            "[mote_train] ERROR: --teacher-cache requires --kd-corpus (pre-tokenized corpus "
+            "aligned to the cache).  See scripts/lora/TEACHER_CACHE_FORMAT.md."
+        )
+    if args.self_kd and args.kd_weight == 0.0:
+        print(
+            "[mote_train] WARNING: --self-kd is set but --kd-weight=0; "
+            "self-KD loss will be zero (no English-anchoring effect)."
+        )
+    if args.self_kd and not args.train_lm_head:
+        print(
+            "[mote_train] WARNING: --self-kd without --train-lm-head -- the tail stays frozen "
+            "so teacher_tail == student_tail and the self-KD loss will be ~0 throughout. "
+            "Pair --self-kd with --train-lm-head for meaningful anchoring."
+        )
 
     device = torch.device(args.device)
     teacher_device = torch.device(args.teacher_device)
@@ -621,7 +739,10 @@ def main() -> None:
     # 2. Teacher -- loaded (or created) BEFORE build_mote so it is dense
     # ------------------------------------------------------------------
     teacher = None
-    if args.kd_weight > 0.0:
+    if args.kd_weight > 0.0 and not args.self_kd and not args.teacher_cache:
+        # Full-teacher KD: load a separate dense BitNet as teacher.
+        # Skipped for --self-kd (frozen tail snapshot built after student load)
+        # and --teacher-cache (pre-computed top-K cache consumed from disk).
         if args.tiny_random:
             from transformers import BitNetForCausalLM
             teacher = BitNetForCausalLM(tiny_cfg).to(device=teacher_device)
@@ -642,6 +763,10 @@ def main() -> None:
         for p in teacher.parameters():
             p.requires_grad_(False)
         print(f"[mote_train] teacher loaded and frozen on {teacher_device} (dense BitNet, no grad)")
+    elif args.self_kd:
+        print("[mote_train] --self-kd mode: no full teacher loaded (frozen tail snapshot built after student load)")
+    elif args.teacher_cache:
+        print(f"[mote_train] --teacher-cache mode: no full teacher loaded (pre-computed top-K cache: {args.teacher_cache!r})")
     else:
         print(f"[mote_train] KD disabled (kd_weight=0) -- no teacher loaded")
 
@@ -683,6 +808,46 @@ def main() -> None:
             f"Buffer {name} is on {buf.device} but training device is {device}"
         )
     print(f"[mote_train] student moved to device {device}; all params/buffers verified on {device}")
+
+    # ------------------------------------------------------------------
+    # 3c. Self-KD: snapshot frozen tail BEFORE unfreezing for training
+    # ------------------------------------------------------------------
+    # Must happen BEFORE _freeze_for_mote_training so the snapshot captures
+    # original pre-training weights.  Only model.model.norm and model.lm_head
+    # are copied -- the same modules --train-lm-head will unfreeze for the
+    # student (so they will diverge from the snapshot as training proceeds).
+    teacher_tail_norm = None
+    teacher_tail_lm_head = None
+    _hidden_stash: dict = {}   # populated each forward by the pre-hook below
+    _hook_handle = None
+    if args.self_kd:
+        teacher_tail_norm = copy.deepcopy(student.model.norm)
+        teacher_tail_lm_head = copy.deepcopy(student.lm_head)
+        for p in teacher_tail_norm.parameters():
+            p.requires_grad_(False)
+        for p in teacher_tail_lm_head.parameters():
+            p.requires_grad_(False)
+        teacher_tail_norm.eval()
+        teacher_tail_lm_head.eval()
+        teacher_tail_norm.to(device)
+        teacher_tail_lm_head.to(device)
+
+        # Register a forward pre-hook on model.model.norm to capture the shared
+        # hidden state h (= last decoder layer output = input to norm).
+        # Detach immediately: the teacher branch must never accumulate gradient.
+        def _stash_hidden(module, args_in):  # noqa: ARG001 (module unused)
+            _hidden_stash['h'] = args_in[0].detach()
+
+        _hook_handle = student.model.norm.register_forward_pre_hook(_stash_hidden)
+        _tail_n_params = (
+            sum(p.numel() for p in teacher_tail_norm.parameters())
+            + sum(p.numel() for p in teacher_tail_lm_head.parameters())
+        )
+        print(
+            f"[mote_train] --self-kd: frozen tail snapshot created on {device} "
+            f"(model.norm + lm_head, {_tail_n_params:,} params frozen); "
+            f"pre-hook registered on model.model.norm to stash shared hidden"
+        )
 
     _freeze_for_mote_training(student, args)
 
@@ -854,11 +1019,62 @@ def main() -> None:
     vocab_size = (teacher or student).config.vocab_size
     max_seqs = max(200, max_tokens // args.max_seq_len + 1)
 
-    if args.mix == "ja_en":
-        # Mixed-language corpus: ~60% JA (wiki_ja) + ~40% EN (no_robots train)
+    # Per-sequence language labels ("ja"/"en") for --self-kd EN-gating;
+    # set to a list only in --mix ja_en mode, None otherwise.
+    mix_labels = None
+    # Teacher-cache mmap arrays (set below when --teacher-cache is active, None otherwise).
+    _tc_ids_np = None
+    _tc_topk_idx = None
+    _tc_topk_logit = None
+    _tc_K = None
+
+    if args.teacher_cache:
+        # --teacher-cache mode: corpus is the pre-tokenized fixed corpus from --kd-corpus.
+        # Both LM loss and KD loss iterate in aligned row order (corpus row i == cache row i).
+        _corpus_meta_path = os.path.join(args.kd_corpus, "meta.json")
+        with open(_corpus_meta_path, encoding="utf-8") as _cf:
+            _corpus_meta = json.load(_cf)
+        _tc_ids_np = np.load(
+            os.path.join(args.kd_corpus, "ids.npy"), mmap_mode='r'
+        )   # [N, L] int32 mmap -- NOT loaded fully into RAM
+        _cache_meta_path = os.path.join(args.teacher_cache, "meta.json")
+        with open(_cache_meta_path, encoding="utf-8") as _cf:
+            _cache_meta = json.load(_cf)
+        _tc_K = int(_cache_meta["K"])
+        _tc_n_seqs_cache = int(_cache_meta["n_seqs"])
+        _tc_seq_len_cache = int(_cache_meta["seq_len"])
+        _tc_n_seqs_corpus = int(_corpus_meta["n_seqs"])
+        _tc_seq_len_corpus = int(_corpus_meta["seq_len"])
+        if _tc_n_seqs_cache != _tc_n_seqs_corpus or _tc_seq_len_cache != _tc_seq_len_corpus:
+            raise RuntimeError(
+                f"Teacher cache / corpus alignment mismatch: "
+                f"cache n_seqs={_tc_n_seqs_cache}, seq_len={_tc_seq_len_cache}  vs  "
+                f"corpus n_seqs={_tc_n_seqs_corpus}, seq_len={_tc_seq_len_corpus}.  "
+                "Regenerate the cache against this corpus."
+            )
+        _tc_topk_idx = np.load(
+            os.path.join(args.teacher_cache, "topk_idx.npy"), mmap_mode='r'
+        )   # [N, L, K] int32 mmap
+        _tc_topk_logit = np.load(
+            os.path.join(args.teacher_cache, "topk_logit.npy"), mmap_mode='r'
+        )   # [N, L, K] float16 mmap
+        # Materialise token IDs into a corpus list (rows are small; fits RAM easily).
+        corpus = [
+            torch.tensor(_tc_ids_np[i].copy(), dtype=torch.long)
+            for i in range(_tc_n_seqs_corpus)
+        ]
+        _eval_tokenizer = None if args.tiny_random else AutoTokenizer.from_pretrained(args.base)
+        print(
+            f"[mote_train] teacher-cache corpus: {_tc_n_seqs_corpus} seqs "
+            f"x {_tc_seq_len_corpus} tokens  K={_tc_K}  "
+            f"cache={args.teacher_cache!r}"
+        )
+    elif args.mix == "ja_en":
+        # Mixed-language corpus: ~60% JA (wiki_ja) + ~40% EN (no_robots train).
+        # mix_labels is a parallel list of "ja"/"en" strings used by --self-kd EN-gating.
         from domain_data import load_mixed_ja_en_sequences
         _eval_tokenizer = AutoTokenizer.from_pretrained(args.base)
-        corpus, _mix_labels = load_mixed_ja_en_sequences(
+        corpus, mix_labels = load_mixed_ja_en_sequences(
             tokenizer=_eval_tokenizer,
             n_seqs=int(max_seqs),
             seq_len=args.max_seq_len,
@@ -916,15 +1132,22 @@ def main() -> None:
     _steps_per_sec: Optional[float] = None
 
     while tokens_seen < max_tokens:
-        seq = corpus[step % len(corpus)].unsqueeze(0).to(device)  # [1, T] on student device
+        _row_idx = step % len(corpus)
+        seq = corpus[_row_idx].unsqueeze(0).to(device)  # [1, T] on student device
 
-        # Teacher forward (no grad) -- input moved to teacher_device (may be CPU)
+        # Per-sequence language tag for --self-kd EN-gating.
+        # mix_labels is a list of "ja"/"en" strings only when --mix ja_en is active;
+        # it is None in all other modes, so is_en stays False and self-KD never fires.
+        is_en: bool = (mix_labels is not None and mix_labels[_row_idx] == "en")
+
+        # Teacher forward (no grad) -- input moved to teacher_device (may be CPU).
+        # Used ONLY in the default full-teacher KD mode; skipped for --self-kd / --teacher-cache.
         teacher_logits = None
         if teacher is not None:
             with torch.no_grad():
                 teacher_logits = teacher(input_ids=seq.to(teacher_device)).logits  # [1, T, V]
 
-        # Student forward
+        # Student forward (also fires the pre-hook that stashes the hidden for --self-kd)
         student_logits = student(input_ids=seq).logits  # [1, T, V]
 
         # --- LM loss (causal; shift by 1) ---
@@ -933,12 +1156,53 @@ def main() -> None:
             seq[:, 1:].contiguous().view(-1),
         )
 
-        # --- KD loss: KL(student || teacher) per token ---
-        if args.kd_weight > 0.0 and teacher_logits is not None:
-            kd = _kl_loss(
-                student_logits[:, :-1, :].contiguous(),
-                teacher_logits[:, :-1, :].contiguous(),
-            )
+        # --- KD loss: source determined by active mode flag ---
+        if args.kd_weight > 0.0:
+            if args.self_kd:
+                # Self-KD: anchor the trained tail toward the frozen original tail.
+                # EN-gated: skip on JA sequences to avoid opposing the JA LM objective
+                # (the base model is poor at Japanese; distilling toward it on JA hurts).
+                if is_en:
+                    _h = _hidden_stash.get('h')  # stashed by forward pre-hook on model.norm
+                    if _h is not None:
+                        with torch.no_grad():
+                            _t_logits = teacher_tail_lm_head(teacher_tail_norm(_h))
+                        kd = _self_kd_loss_temp(
+                            student_logits[:, :-1, :].contiguous(),
+                            _t_logits[:, :-1, :].contiguous(),
+                            args.kd_temp,
+                        )
+                    else:
+                        kd = torch.zeros(1, device=device).squeeze()
+                else:
+                    # JA sequence: self-KD suppressed; JA LM loss trains unimpeded.
+                    kd = torch.zeros(1, device=device).squeeze()
+            elif args.teacher_cache:
+                # Sparse top-K teacher-cache KD (no EN-gating; external teacher is
+                # assumed competent across languages).
+                # NOTE: if the cache was produced by the BASE model itself (not a stronger
+                # external teacher), the base is similarly weak on JA -- consider EN-gating
+                # by wrapping this block in `if is_en:` or lowering --kd-weight for JA heals.
+                _tc_idx_b = torch.from_numpy(
+                    _tc_topk_idx[_row_idx, :-1, :].copy()
+                ).long().to(device)                             # [L-1, K]
+                _tc_logit_b = torch.from_numpy(
+                    _tc_topk_logit[_row_idx, :-1, :].copy()
+                ).to(dtype=torch.float32, device=device)       # [L-1, K]
+                kd = _topk_kd_loss(
+                    student_logits[0, :-1, :],
+                    _tc_idx_b,
+                    _tc_logit_b,
+                    args.kd_temp,
+                )
+            elif teacher_logits is not None:
+                # Default: full-teacher dense KD (original behaviour).
+                kd = _kl_loss(
+                    student_logits[:, :-1, :].contiguous(),
+                    teacher_logits[:, :-1, :].contiguous(),
+                )
+            else:
+                kd = torch.zeros(1, device=device).squeeze()
         else:
             kd = torch.zeros(1, device=device).squeeze()
 

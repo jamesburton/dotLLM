@@ -44,6 +44,9 @@ def main():
     ap.add_argument("--max-seq-len", type=int, default=4096,
                     help="Drop training examples longer than this (tokens). Lower it (e.g. 1024) "
                          "to bound activation memory for long-example tasks on small GPUs.")
+    ap.add_argument("--rank", type=int, default=16,
+                    help="LoRA rank r. lora_alpha is set to 2*rank to keep alpha/r=2 constant. "
+                         "Default 16 matches the historical no_robots training runs.")
     ap.add_argument("--grad-checkpoint", action="store_true",
                     help="Enable gradient checkpointing (saves activation memory at some compute cost).")
     ap.add_argument("--chat-template", default=None,
@@ -51,6 +54,12 @@ def main():
                          "Required for tool-use on bases whose template lacks tool support (e.g. BitNet → "
                          "scripts/lora/templates/bitnet_tooluse.jinja), so the <tools> block is rendered "
                          "identically to dotLLM serving.")
+    ap.add_argument("--lora-init-seed", type=int, default=0,
+                    help="Fixed torch seed for LoRA weight initialisation (kaiming_uniform_ on lora_A, "
+                         "zeros on lora_B). MUST be IDENTICAL across every adapter in a population: "
+                         "without a shared init the raw lora_A matrices live in arbitrarily-rotated "
+                         "rank bases (gauge freedom A→RA, B→BR⁻¹), making them mutually orthogonal "
+                         "even for functionally similar adapters. Vary ONLY the data split, not this.")
     args = ap.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.base)
@@ -73,8 +82,16 @@ def main():
         model = prepare_model_for_kbit_training(model)
     model.config.use_cache = False
 
-    lcfg = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, bias="none",
+    lcfg = LoraConfig(r=args.rank, lora_alpha=2 * args.rank, lora_dropout=0.05, bias="none",
                       task_type="CAUSAL_LM", target_modules=TARGET_MODULES)
+    # Gauge fix: seed torch RNG to an identical value before PEFT constructs the
+    # LoRA layers (lora_A ← kaiming_uniform_, lora_B ← zeros).  Without this every
+    # subprocess draws from a fresh OS-entropy RNG, so independently-initialised
+    # lora_A matrices span mutually-orthogonal subspaces (pairwise cos ≈ 0.12)
+    # even when the adapters learn the same task — breaking weight-space diffusion.
+    # All adapters in a population must use the SAME --lora-init-seed; vary ONLY
+    # the training data split (--split / --examples-per in pdiff_bootstrap.py).
+    torch.manual_seed(args.lora_init_seed)
     model = get_peft_model(model, lcfg)
     # Gradient checkpointing trades compute for a large activation-memory saving —
     # required to fit long examples (e.g. code) of a full-bf16 base on a 12 GB card.
