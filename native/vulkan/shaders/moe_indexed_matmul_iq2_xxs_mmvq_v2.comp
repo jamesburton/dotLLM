@@ -30,8 +30,9 @@ layout(push_constant) uniform PushConstants {
 
 const uint BLOCK_BYTES = 66u;
 
-// 8 sub-block bytes (a0, a1) at an absolute byte offset p that is 0 or 2 mod 4. The third word is only read when it is needed (p % 4 == 2),
-// so the last block of a bank never reads past its end.
+// 8 sub-block bytes (a0, a1) at an absolute byte offset p that is 0 or 2 mod 4. The third word is only read when it is needed (p % 4 == 2).
+// Like V1's read4Bytes, that word can extend 2 bytes past the end of a block (for the last sub-block it is the next block's first bytes, or, in
+// the very last block of a bank, bytes past the bank: bank allocations are word-granular and the extra bytes are discarded by the shifts).
 void load8(uint p, out uint a0, out uint a1) {
     uint pw = p >> 2u;
     uint w0 = weight[pw];
