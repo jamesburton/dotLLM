@@ -175,11 +175,12 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     private nint[]? _kQuant;
     private nint[]? _vQuant;
 
-    // Fused dequant-in-load decode attention for quantized KV (issue #956). Default ON when both
-    // sides are quantized and the kvq kernels are loaded; DOTLLM_HYBRID_KV_FUSED=0 forces the
-    // dequant-into-scratch path (kept for A/B and as the fallback).
+    // Fused dequant-in-load decode attention for quantized KV (issue #956). Default OFF: measured
+    // on the RTX 3060 at ctx 16384 it is SLOWER than dequant-into-scratch + the F16 kernel (Q4_0:
+    // 12.4 vs 13.3 tok/s; its per-element block loads are uncoalesced). Bit-identical output either
+    // way (tested); DOTLLM_HYBRID_KV_FUSED=1 opts in for A/B until the load path is vectorized.
     internal bool FuseQuantKvDecodeForTest { get; set; } =
-        Environment.GetEnvironmentVariable("DOTLLM_HYBRID_KV_FUSED") != "0";
+        Environment.GetEnvironmentVariable("DOTLLM_HYBRID_KV_FUSED") == "1";
 
     /// <summary>Test-only: decode attention calls served by the fused quantized-KV kernel.</summary>
     internal int DebugFusedKvqAttentionCallsForTest { get; private set; }
