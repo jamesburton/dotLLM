@@ -120,6 +120,94 @@ public sealed class VulkanMoeIndexedMatmulIqMmvqKernelTests
         }
     }
 
+    /// <summary>
+    /// V1 and V2 (issue #991) against the CPU oracle with the MoE decode geometry: the activation is broadcast across <c>xDiv</c> routed rows
+    /// (<c>xDiv = topK</c> in the model), K spans one, a partial 4-block step, a full 16-block chunk and a chunk plus tail (18 blocks), M is not a
+    /// multiple of anything, and every expert carries distinct bytes. <c>IsV2</c> is asserted, so a silent fall back to the V1 shader fails here.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(QuantizationType.IQ1_M, 256, true)]
+    [InlineData(QuantizationType.IQ1_M, 768, true)]
+    [InlineData(QuantizationType.IQ1_M, 4096, true)]
+    [InlineData(QuantizationType.IQ1_M, 4608, true)]
+    [InlineData(QuantizationType.IQ1_M, 4608, false)]
+    [InlineData(QuantizationType.IQ2_XXS, 256, true)]
+    [InlineData(QuantizationType.IQ2_XXS, 1280, true)]
+    [InlineData(QuantizationType.IQ2_XXS, 4096, true)]
+    [InlineData(QuantizationType.IQ2_XXS, 4608, true)]
+    [InlineData(QuantizationType.IQ2_XXS, 4608, false)]
+    [InlineData(QuantizationType.IQ2_XS, 256, true)]
+    [InlineData(QuantizationType.IQ2_XS, 1280, true)]
+    [InlineData(QuantizationType.IQ2_XS, 4096, true)]
+    [InlineData(QuantizationType.IQ2_XS, 4608, true)]
+    [InlineData(QuantizationType.IQ2_XS, 4608, false)]
+    public void BroadcastActivation_V1AndV2_MatchSameTierCpuOracle(QuantizationType qt, int k, bool v2)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(device.HasIntegerDotProduct, "Device does not advertise VK_KHR_shader_integer_dot_product.");
+
+        using var quant = QuantizeQ8_1RowsKernel.TryCreate(device, spvDir)
+            ?? throw new Xunit.Sdk.XunitException("quantize_q8_1_rows.spv missing.");
+        using var codebooks2 = Iq2Codebooks.Create(device);
+        using var codebooks1 = Iq1Codebooks.Create(device);
+        var iq = MoeIndexedMatmulIqMmvqKernel.FromQuantizationType(qt)!.Value;
+        using var kernel = MoeIndexedMatmulIqMmvqKernel.TryCreate(device, spvDir, iq, null, codebooks2, codebooks1, v2: v2)
+            ?? throw new Xunit.Sdk.XunitException(MoeIndexedMatmulIqMmvqKernel.ShaderName(iq, v2) + ".spv missing or unsupported.");
+        Assert.Equal(v2, kernel.IsV2);
+
+        const int tokens = 2, xDiv = 4, n = tokens * xDiv, numExperts = 24, m = 37, activeExperts = 9;
+        var rng = new Random(0x991 + (int)qt * 1009 + k * 7 + (v2 ? 1 : 0));
+        var (blockBytes, group) = MoeIndexedMatmulIqMmvqKernel.Describe(iq);
+        long rowBytes = (long)(k / group) * blockBytes;
+        byte[] bank = RandomBank(rng, (long)numExperts * m, (int)rowBytes, blockBytes);
+        float[] x = new float[tokens * k];
+        for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2.0 - 1.0);
+        int[] indices = MoeMmvqParitySupport.RandomIndices(rng, n, numExperts, activeExperts);
+
+        float[] actual = LaunchBroadcast(device, quant, kernel, bank, x, indices, m, k, n, xDiv, numExperts, out sbyte[] xq, out float[] xds);
+        // The oracle indexes the activation per routed row: expand the token rows by xDiv.
+        sbyte[] xqRows = new sbyte[n * k];
+        float[] xdsRows = new float[n * (k / 32) * 2];
+        for (int r = 0; r < n; r++)
+        {
+            Array.Copy(xq, (r / xDiv) * k, xqRows, r * k, k);
+            Array.Copy(xds, (r / xDiv) * (k / 32) * 2, xdsRows, r * (k / 32) * 2, (k / 32) * 2);
+        }
+        float[] expected = CpuOracle(bank, qt, xqRows, xdsRows, indices, m, k, n, numExperts, rowBytes);
+        MoeMmvqParitySupport.AssertSameTierParity(expected, actual, m, n, qt + (v2 ? " V2" : " V1") + " broadcast MoE MMVQ");
+    }
+
+    private static float[] LaunchBroadcast(
+        VulkanDevice device, QuantizeQ8_1RowsKernel quant, MoeIndexedMatmulIqMmvqKernel kernel,
+        byte[] bank, float[] x, int[] indices, int m, int k, int n, int xDiv, int numExperts,
+        out sbyte[] xqBytes, out float[] xdsPairs)
+    {
+        int tokens = n / xDiv;
+        using var bankBuf = device.Allocate(((long)bank.Length + 3) & ~3L);
+        using var xBuf = device.Allocate((long)x.Length * sizeof(float));
+        using var xqBuf = device.Allocate(QuantizeQ8_1RowsKernel.PackedBytes(tokens, k));
+        using var xdsBuf = device.Allocate(QuantizeQ8_1RowsKernel.ScaleBytes(tokens, k));
+        using var idxBuf = device.Allocate((long)indices.Length * sizeof(int));
+        using var yBuf = device.Allocate((long)n * m * sizeof(float));
+        device.Upload(new ReadOnlySpan<byte>(bank), bankBuf);
+        device.Upload(x, xBuf);
+        device.Upload(MemoryMarshal.AsBytes<int>(indices), idxBuf);
+        using (var ctx = device.CreateSubmitContext())
+        {
+            ctx.Begin();
+            quant.Record(ctx.CommandBuffer, xBuf, xqBuf, xdsBuf, tokens, k);
+            KernelSupport.ComputeToComputeBarrier(ctx.CommandBuffer);
+            kernel.Record(ctx.CommandBuffer, bankBuf, xqBuf, xdsBuf, idxBuf, yBuf, m, k, n, numExperts, xDiv);
+            ctx.SubmitAndWait();
+        }
+        float[] y = new float[(long)n * m];
+        device.Download(yBuf, y);
+        xqBytes = MoeMmvqParitySupport.DownloadActivationBytes(device, xqBuf, tokens, k);
+        xdsPairs = MoeMmvqParitySupport.DownloadActivationScales(device, xdsBuf, tokens, k);
+        return y;
+    }
+
     /// <summary>Random block bytes with the leading fp16 of every block forced to a sane positive scale.</summary>
     private static byte[] RandomBank(Random rng, long rows, int rowBytes, int blockBytes)
     {
