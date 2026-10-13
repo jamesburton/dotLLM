@@ -1,0 +1,110 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-04-29T13:35:00Z",
+  "phase": "Spec 1 Phase 2",
+  "phase_name": "CUDA IQ4_NL + IQ4_XS coverage",
+  "phase_dir": ".planning",
+  "plan": null,
+  "task": "cuda-iq4-completion-sweep",
+  "total_tasks": 10,
+  "status": "cuda_complete_pending_merge",
+  "completed_tasks": [
+    {
+      "id": "cuda-iq4-core",
+      "name": "IQ4_NL/IQ4_XS enum, sizing, CPU dequant, CUDA dequant",
+      "status": "done"
+    },
+    {
+      "id": "cuda-iq4-gemv",
+      "name": "IQ4 direct GEMV, grouped MoE GEMV, MMQ, MMVQ-large",
+      "status": "done"
+    },
+    {
+      "id": "cuda-iq4-preq",
+      "name": "IQ4 pre-Q8_1 MMQ/MMVQ-large variants",
+      "status": "done"
+    },
+    {
+      "id": "cuda-stale-ptx",
+      "name": "Runtime loaded-kernel capability guard for stale PTX",
+      "status": "done"
+    },
+    {
+      "id": "cuda-real-iq4-smoke",
+      "name": "Real IQ4_XS/IQ4_NL GGUF smoke fixture and test",
+      "status": "done"
+    },
+    {
+      "id": "cuda-llamacpp-sidecar",
+      "name": "Docker-generated llama.cpp IQ4_XS logits sidecar",
+      "status": "done"
+    },
+    {
+      "id": "classify-divergence",
+      "name": "Classify IQ4_XS divergence as CPU vs CUDA",
+      "status": "done",
+      "result": "CPU matches llama.cpp. CUDA divergence was isolated to CUDA-specific full-model output."
+    },
+    {
+      "id": "pin-cuda-root-cause",
+      "name": "Pin CUDA IQ4_XS sidecar root cause",
+      "status": "done",
+      "result": "The divergence was caused by the CUDA Q5_K dequant layout used by IQ4_XS models, not cumulative FP16 activation precision. Q5_K stores four 64-element pairs; CUDA now indexes pair_idx=sub>>1, nibble_half=sub&1, and qh bit=sub."
+    },
+    {
+      "id": "restore-performance",
+      "name": "Remove default CPU correctness fallback and restore fast CUDA forward",
+      "status": "done",
+      "result": "High-precision IQ fallback is now opt-in via DOTLLM_ENABLE_HIGH_PRECISION_IQUANTS=1. The default path disposes CPU weights after upload and runs CUDA kernels directly."
+    },
+    {
+      "id": "merge-gating-followups",
+      "name": "Fixture un-gating, IQ4_NL real fixture coverage, KV-cache parity, and CUDA perf harness audit",
+      "status": "done",
+      "result": "Sidecar fixture lookup accepts the shared DOTLLM_CUDA_IQ4_GGUF path and default local model cache paths. IQ4_NL has synthetic dequant/GEMV/MMQ/preq/grouped coverage plus a real-fixture smoke test. IQ4_XS has a sidecar KV-cache decode parity test. CUDA now has an opt-in DOTLLM_CUDA_PERF harness matching the Vulkan perf pattern."
+    },
+    {
+      "id": "final-focused-sweep",
+      "name": "Run focused CUDA sidecar, KV-cache, IQ4_NL, Q5_K regression, and perf-harness skip/compile tests",
+      "status": "done",
+      "result": "IQ4_XS sidecar prefill passes, IQ4_XS graph-backed KV decode matches sidecar and no-cache prefill, IQ4_NL synthetic coverage passes, IQ4_NL real fixture smoke passes after downloading Meta-Llama-3.1-8B-Instruct-IQ4_NL.gguf, CUDA perf harness passes with DOTLLM_CUDA_PERF=1 on IQ4_NL, and Q5_K MMQ/MMVQ/preq regression tests pass."
+    }
+  ],
+  "remaining_tasks": [
+    {
+      "id": "final-review-commit",
+      "name": "Final review, test sweep, and commit/merge preparation",
+      "status": "not_started"
+    }
+  ],
+  "blockers": [],
+  "human_actions_pending": [],
+  "decisions": [
+    {
+      "decision": "Treat Q5_K dequant layout as the IQ4_XS sidecar root cause",
+      "rationale": "Layer diagnostics showed IQ4_XS components matched until tensors using Q5_K were projected. Correcting Q5_K dequant brought the full llama.cpp sidecar into tolerance."
+    },
+    {
+      "decision": "Keep high-precision IQ forward as opt-in only",
+      "rationale": "The corrected CUDA path is accurate and fast. Retaining CPU weights by default would regress load/runtime memory and decode performance."
+    },
+    {
+      "decision": "Gate real GGUF and perf tests by local fixtures and explicit env vars",
+      "rationale": "GGUF weights are too large to commit. Tests should run automatically on developer/CUDA hosts with cached fixtures and skip cleanly elsewhere."
+    }
+  ],
+  "uncommitted_files": [
+    "native/kernels/dequant.cu",
+    "native/ptx/dequant.ptx",
+    "src/DotLLM.Cuda/CudaKernels.cs",
+    "src/DotLLM.Cuda/CudaTransformerModel.cs",
+    "tests/DotLLM.Tests.Unit/Cuda/CpuLlamaCppLogitsParitySidecarTests.cs",
+    "tests/DotLLM.Tests.Unit/Cuda/CudaForwardPerfHarness.cs",
+    "tests/DotLLM.Tests.Unit/Cuda/CudaIQ4_XS_DequantUnitTest.cs",
+    "tests/DotLLM.Tests.Unit/Cuda/CudaLlamaCppLogitsParitySidecarTests.cs",
+    "tests/DotLLM.Tests.Unit/Cuda/CudaRealGgufIQuantSmokeTests.cs",
+    "tests/DotLLM.Tests.Unit/Cuda/References/llamacpp/README.md"
+  ],
+  "next_action": "Prepare final review/commit and merge CUDA completion work.",
+  "context_notes": "Latest verified sidecar after Q5_K fixes: IQ4_XS CUDA prefill argmax matches llama.cpp token 12366 with max_abs about 0.40 and mean_abs about 0.075, CUDA forward time is back under half a second on the local fixture, and graph-backed KV decode now matches both sidecar and no-cache prefill. IQ4_NL real fixture path: C:/Users/james/.dotllm/models/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-IQ4_NL.gguf. CUDA perf on IQ4_NL with DOTLLM_CUDA_PERF=1: load_ms=3961.2, prefill_len=5, prefill_ms=1033.69, decode_steps=32, decode_avg_ms=121.26, decode_min_ms=117.32, decode_max_ms=146.37, decode_tok_per_sec=8.25. HIP warnings are ignored on this machine because HIP is tested elsewhere. The old precision-fix plan is stale and should not be followed."
+}
