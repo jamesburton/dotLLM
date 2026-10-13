@@ -109,8 +109,44 @@ public static unsafe partial class MatMul
 
         int blockCount = k / Mxfp4GroupSize;
 
-        for (int t = 0; t < n; t++)
-            ComputeRowsMxfp4Parallel(weights, b + (long)t * k, c + (long)t * m, m, blockCount, pool);
+        // Rows outer, columns inner: each weight row (K/32 * 17 bytes) is streamed from memory ONCE and stays in L1 for all n
+        // columns, instead of being re-read per column. Every (row, column) result is the same ComputeRowsMxfp4 row dot
+        // whatever n is, so a token's result does not depend on how many other tokens share its expert bucket (the
+        // batch-invariance requirement of the grouped MoE path).
+        if (pool is null || m < ParallelMinRows)
+        {
+            ComputeRowsMxfp4Cols(weights, b, c, 0, m, m, k, blockCount, n);
+            return;
+        }
+        var ctx = new ColsCtx { Weights = weights, B = b, C = c, M = m, K = k, BlockCount = blockCount, N = n };
+        pool.Dispatch((nint)(&ctx), &ComputeRowsMxfp4ColsWorker);
+    }
+
+    private struct ColsCtx
+    {
+        public byte* Weights;
+        public float* B;
+        public float* C;
+        public int M, K, BlockCount, N;
+    }
+
+    private static void ComputeRowsMxfp4ColsWorker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        ref var ctx = ref Unsafe.AsRef<ColsCtx>((void*)ctxPtr);
+        PartitionRows(ctx.M, threadIdx, threadCount, out int start, out int count);
+        if (count == 0) return;
+        ComputeRowsMxfp4Cols(ctx.Weights, ctx.B, ctx.C, start, count, ctx.M, ctx.K, ctx.BlockCount, ctx.N);
+    }
+
+    private static void ComputeRowsMxfp4Cols(byte* weights, float* b, float* c, int rowStart, int rowCount, int m, int k, int blockCount, int n)
+    {
+        long rowBytes = (long)blockCount * Mxfp4BlockBytes;
+        for (int row = rowStart; row < rowStart + rowCount; row++)
+        {
+            byte* w = weights + row * rowBytes;
+            for (int t = 0; t < n; t++)
+                ComputeRowsMxfp4(w, b + (long)t * k, c + (long)t * m + row, 1, blockCount);
+        }
     }
 
     private struct ComputeRowsMxfp4Ctx
