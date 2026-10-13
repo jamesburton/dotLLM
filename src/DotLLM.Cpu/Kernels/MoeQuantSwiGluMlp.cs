@@ -258,6 +258,7 @@ public static unsafe class MoeQuantSwiGluMlp
             case QuantizationType.IQ2_S:
             case QuantizationType.IQ3_XXS:
             case QuantizationType.IQ3_S:
+            case QuantizationType.IQ1_M:
             case QuantizationType.IQ1_S:
                 MatMul.GemvIQCodebook(qt, (byte*)weights, x, y, m, k, pool);
                 break;
