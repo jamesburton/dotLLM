@@ -167,7 +167,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         // MLA + routed-MoE GGUFs (DeepSeek-V2/V3, GLM-4.7-Flash): keep the routed experts in the
         // raw quant view and run them through the grouped quantised kernels (ForwardMoeGrouped).
         // The F32 host dequant is ~57 GB at V2-Lite and ~120 GB at GLM-4.7-Flash scale (#742).
-        Func<int, (bool, bool, bool)>? skipRoutedF32 = config.MlaConfig is not null && config.Moe is not null
+        Func<int, (bool, bool, bool)>? skipRoutedF32 = (config.MlaConfig is not null
+                                                         || config.Architecture == DotLLM.Core.Configuration.Architecture.MiMoV2) && config.Moe is not null
             ? static _ => (true, true, true)
             : null;
         var weights = TransformerWeights.LoadFromGguf(gguf, config, moeBankSkipSelector: skipRoutedF32, allowNanoQuant: true);
@@ -358,7 +359,9 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             // (Gemma 4 global layers: rotate globalRopeDim=128 dims but use freq
             // base over the full head dim 512). Equals globalRopeDim when there is
             // no partial rotary (Gemma 3), collapsing to the standard precompute.
-            globalFullHeadDim: config.GlobalHeadDim ?? config.HeadDim,
+            // MiMo-V2 (HF compute_default_rope_parameters / ggml rope n_rot): the denominator is the ROTATED dim, not the
+            // head dim, so the partial-rotary table must collapse to the standard precompute.
+            globalFullHeadDim: config.Architecture == DotLLM.Core.Configuration.Architecture.MiMoV2 ? globalRopeDim : config.GlobalHeadDim ?? config.HeadDim,
             // Proportional-rope factors (rope_freqs.weight — Gemma-4 E2B/E4B
             // full-attention layers): folded into the global cos/sin table
             // (angle = pos * θ^(-2i/dim) / factor[i], ggml theta/ff). Null for
@@ -453,7 +456,9 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     /// single-stride KV cache cannot hold two distinct per-layer K/V block sizes.
     /// </summary>
     private bool HasDistinctPerLayerHeadDim =>
-        Config.GlobalHeadDim is int ghd && ghd != Config.HeadDim;
+        (Config.GlobalHeadDim is int ghd && ghd != Config.HeadDim)
+        // Per-layer KV-head counts (MiMo-V2: 8 sliding / 4 global) give the same non-uniform per-layer KV row width.
+        || (Config.NumGlobalKvHeads is int gkv && gkv != Config.NumKvHeads);
 
     /// <summary>
     /// Validates a supplied KV-cache against a distinct-per-layer-head-dim model
@@ -492,8 +497,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         }
 
         throw new NotSupportedException(
-            $"Gemma 4 with distinct global_head_dim ({Config.GlobalHeadDim}) and head_dim "
-            + $"({Config.HeadDim}) requires a per-layer-strided KV-cache. Only the contiguous F32 "
+            $"A model with per-layer KV row widths (Gemma 4 global_head_dim {Config.GlobalHeadDim?.ToString() ?? "n/a"} vs head_dim "
+            + $"{Config.HeadDim}; per-layer KV-head counts {Config.NumKvHeads} vs {Config.NumGlobalKvHeads?.ToString() ?? "n/a"}, e.g. MiMo-V2) requires a per-layer-strided KV-cache. Only the contiguous F32 "
             + $"SimpleKvCache carries per-layer strides today; the supplied "
             + $"{kvCache.GetType().Name} does not. Build a SimpleKvCache with "
             + "KvGeometry.FromConfig(Config) (F32) or run cacheless. Per-layer quantized / paged "
@@ -1487,6 +1492,15 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                                preQ_v, lw.VQuantType);
             }
 
+            // V head dim != Q/K head dim (MiMo-V2: K 192, V 128). CPU reference realisation: zero-pad each V head to the
+            // K head dim so the shared attention kernels and every KV cache (single K/V row stride) are used unchanged.
+            // The pad columns are exact zeros, so the attention output's pad columns are exact zeros as well; they are
+            // compacted away again below, before o_proj. Exact (not an approximation); costs 1.5x V memory/PV work.
+            bool distinctV = Config.HasDistinctValueHeadDim;
+            int vHeadDimLayer = distinctV ? Config.GetValueHeadDim() : headDimLayer;
+            if (distinctV)
+                ExpandValueHeads(v, seqLen, numKvHeadsLayer, vHeadDimLayer, headDimLayer);
+
             // Optional QK-norms (Qwen3-style): per-head RMSNorm on Q/K after projection, before RoPE
             if (lw.QNormWeight is not null)
                 ApplyPerHeadNorm(lw.QNormWeight, q, numHeads, headDimLayer, seqLen, eps);
@@ -1572,20 +1586,29 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                     _currentMaskSpec.Mode, _currentMaskSpec.PrefixLength, lw.AttnSinks);
             }
 
+            // Pre-o_proj attention output row width: numHeads * V head dim (== lw.OInputDim). Equal to qStrideLayer unless
+            // V's head dim differs from K's (MiMo-V2), in which case drop the zero pad columns (see ExpandValueHeads).
+            int oInStride = numHeads * vHeadDimLayer;
+            if (distinctV)
+                CompactAttentionHeads(attnOut, seqLen, numHeads, headDimLayer, vHeadDimLayer);
+            // MiMo-V2 attention_value_scale: V is linear in the output, so scaling the pre-o_proj output is exactly V*scale.
+            if (Config.AttentionValueScale is float valueScale)
+                TensorPrimitives.Multiply(new Span<float>(attnOut, seqLen * oInStride), valueScale, new Span<float>(attnOut, seqLen * oInStride));
+
             // Optional attention sub-norm (BitNet Sub-LN): RMSNorm over the attention output
             // before the output projection. In-place per token. No-op for non-BitNet models.
             if (lw.AttnSubNormWeight is not null)
             {
                 for (int t = 0; t < seqLen; t++)
                 {
-                    var s = new Span<float>(attnOut + t * qStrideLayer, qStrideLayer);
+                    var s = new Span<float>(attnOut + t * oInStride, oInStride);
                     RmsNorm.Execute(s, lw.AttnSubNormWeight, eps, s);
                 }
             }
 
             // f. Batched O projection. The O projection input width is the
-            // attention output stride (numHeads * headDimLayer == lw.OInputDim).
-            byte* preQuantAttn = QuantizeInput(attnOut, inputQ8Scratch, qStrideLayer, seqLen, lw.OQuantType);
+            // attention output stride (numHeads * vHeadDimLayer == lw.OInputDim).
+            byte* preQuantAttn = QuantizeInput(attnOut, inputQ8Scratch, oInStride, seqLen, lw.OQuantType);
             var rwO = rl?.O ?? default;
             GemmInterleaved(lw.OWeight, lw.OQuantType, attnOut, normOut, lw.OOutputDim, lw.OInputDim, seqLen,
                 preQuantAttn, in rwO);
@@ -3696,6 +3719,44 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     /// multiplies every post-RoPE query row by <see cref="ModelConfig.AttnTemperatureAt"/> of its
     /// position. No-op (single branch) for every other model (#743).
     /// </summary>
+    /// <summary>
+    /// In place: widens each token's V rows from <c>numKvHeads * vDim</c> (head-major, contiguous) to
+    /// <c>numKvHeads * kDim</c> by zero-padding every head from <paramref name="vDim"/> to <paramref name="kDim"/> columns.
+    /// Walks tokens and heads from the end so the widening never overwrites unread source columns.
+    /// </summary>
+    internal static unsafe void ExpandValueHeads(float* v, int seqLen, int numKvHeads, int vDim, int kDim)
+    {
+        if (vDim == kDim) return;
+        if (vDim > kDim) throw new ArgumentOutOfRangeException(nameof(vDim), "V head dim larger than K head dim is not supported by the padded CPU path.");
+        for (int t = seqLen - 1; t >= 0; t--)
+        {
+            float* src = v + (long)t * numKvHeads * vDim;
+            float* dst = v + (long)t * numKvHeads * kDim;
+            for (int h = numKvHeads - 1; h >= 0; h--)
+            {
+                // dst >= src for every (t, h): safe to move high-to-low (Buffer.MemoryCopy handles overlap).
+                Buffer.MemoryCopy(src + h * vDim, dst + h * kDim, vDim * sizeof(float), vDim * sizeof(float));
+                new Span<float>(dst + h * kDim + vDim, kDim - vDim).Clear();
+            }
+        }
+    }
+
+    /// <summary>
+    /// In place: compacts each token's attention output from <c>numHeads * kDim</c> to <c>numHeads * vDim</c> by dropping
+    /// the (zero) pad columns of every head. Inverse of the widening done by <see cref="ExpandValueHeads"/>.
+    /// </summary>
+    internal static unsafe void CompactAttentionHeads(float* attnOut, int seqLen, int numHeads, int kDim, int vDim)
+    {
+        if (vDim == kDim) return;
+        for (int t = 0; t < seqLen; t++)
+        {
+            float* src = attnOut + (long)t * numHeads * kDim;
+            float* dst = attnOut + (long)t * numHeads * vDim;
+            for (int h = 0; h < numHeads; h++)
+                Buffer.MemoryCopy(src + h * kDim, dst + h * vDim, vDim * sizeof(float), vDim * sizeof(float));
+        }
+    }
+
     private void ApplyAttnTemperature(float* q, ReadOnlySpan<int> positions, int seqLen, int qStride)
     {
         if (Config.AttnTemperatureScale == 0f) return;

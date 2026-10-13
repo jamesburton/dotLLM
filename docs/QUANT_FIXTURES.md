@@ -156,3 +156,14 @@ immediately (`stop | N prompt, 0 generated`; llama.cpp `-dev none` does the same
 dotnet dotllm.dll serve <gguf> -d vulkan --no-browser --no-ui --no-warmup &
 python scripts/small-model-tasks.py http://localhost:8080 <model-id from /v1/models>
 ```
+
+## MiMo-V2 tiny-oracle fixtures (`mimo2`, #936)
+
+`tests/DotLLM.Tests.Unit/Models/MiMoV2/MiMoV2TinyOracleParityTests.cs` and `MiMoV2QuantMixParityTests.cs` resolve
+`~/.dotllm/test-cache/mimo2-tiny/` and `~/.dotllm/test-cache/mimo2-tiny-k256/` (override: `DOTLLM_MIMO2_TINY_DIR`,
+`DOTLLM_MIMO2_TINY_K256_DIR`) and skip when absent. Recipe (`tools/mimo2-tiny-oracle/`): `make_tiny.py <hf-remote-code-dir> <out> [seed] [small|k256]`
+(needs torch + transformers 5.3.0 and the `XiaomiMiMo/MiMo-V2.6-Flash-RL` remote code + tokenizer files) -> llama.cpp
+`convert_hf_to_gguf.py <out> --outtype f32` -> `dumplogits.cpp` (llama.cpp CPU logits, F32 KV, no flash attention) -> `cmp.py`. The k256 mix is
+`llama-quantize --tensor-type ffn_gate_exps=q2_k --tensor-type ffn_up_exps=q2_k --tensor-type ffn_down_exps=mxfp4 --output-tensor-type q6_k
+--token-embedding-type q8_0 in.gguf out.gguf Q8_0`; the F32-decoded control file is made by dequantising every tensor with gguf-py. These are
+random-weight fixtures (88 MB / 340 MB because of the real 152576-token vocabulary) and are never committed.

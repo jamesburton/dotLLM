@@ -2819,6 +2819,11 @@ public sealed class VulkanTransformerModel : IModel
         // (issue #324).
         TransformerWeights.ThrowIfArchitectureNeedsDedicatedLoader(config);
 
+        // MiMo-V2 (#936): V head_dim != QK head_dim, SWA ring + sinks, packed low-bit expert banks - none of it exists in the Vulkan
+        // attention/KV/MoE paths. Loading through the dense model would run and be silently wrong.
+        if (config.Architecture == DotLLM.Core.Configuration.Architecture.MiMoV2)
+            throw new NotSupportedException(ModelConfig.MiMoV2UnsupportedMessage("Vulkan"));
+
         // gpt-oss (#480): the dense VulkanTransformerModel would load it and produce wrong output
         // with no error — see GptOssUnsupportedMessage. Checked here (not only in
         // VulkanModelLoader.CreateFromGguf) because every factory on this class calls this first,
