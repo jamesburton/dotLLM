@@ -2386,6 +2386,8 @@ public static unsafe partial class MatMul
         public int K;
         public int N;
         public int TileM;
+        /// <summary>Token chunks per weight tile (>= 1): lets few-tile GEMMs (PLE gate: 7 tiles) use every thread.</summary>
+        public int TokChunks;
     }
 
     private struct GemmTiledF16Ctx
@@ -2550,14 +2552,18 @@ public static unsafe partial class MatMul
     {
         ref var ctx = ref Unsafe.AsRef<GemmTiledF32Ctx>((void*)ctxPtr);
         int totalTiles = (ctx.M + ctx.TileM - 1) / ctx.TileM;
-        ComputeThreadPool.PartitionRange(totalTiles, threadIdx, threadCount, out int startTile, out int endTile);
+        // Work item = (tile, token chunk); row results are independent dots, so any split is bit-identical.
+        int chunks = Math.Max(1, ctx.TokChunks);
+        ComputeThreadPool.PartitionRange(totalTiles * chunks, threadIdx, threadCount, out int startItem, out int endItem);
 
-        for (int tile = startTile; tile < endTile; tile++)
+        for (int item = startItem; item < endItem; item++)
         {
+            int tile = item / chunks;
+            ComputeThreadPool.PartitionRange(ctx.N, item % chunks, chunks, out int t0, out int t1);
             int mStart = tile * ctx.TileM;
             int tileRows = Math.Min(ctx.TileM, ctx.M - mStart);
             float* tileWeights = ctx.A + (long)mStart * ctx.K;
-            for (int t = 0; t < ctx.N; t++)
+            for (int t = t0; t < t1; t++)
                 GemvF32(tileWeights, ctx.B + t * ctx.K, ctx.C + t * ctx.M + mStart, tileRows, ctx.K);
         }
     }
@@ -2805,13 +2811,14 @@ public static unsafe partial class MatMul
         int tileM = ComputeTileM(rowBytes);
         int totalTiles = (m + tileM - 1) / tileM;
 
-        if (totalTiles < 2)
+        if (totalTiles < 2 && n < 8)
         {
             GemmF32(a, b, c, m, k, n);
             return;
         }
 
-        var ctx = new GemmTiledF32Ctx { A = a, B = b, C = c, M = m, K = k, N = n, TileM = tileM };
+        int tokChunks = totalTiles >= pool.ThreadCount ? 1 : Math.Min(n, (pool.ThreadCount + totalTiles - 1) / totalTiles);
+        var ctx = new GemmTiledF32Ctx { A = a, B = b, C = c, M = m, K = k, N = n, TileM = tileM, TokChunks = tokChunks };
         pool.Dispatch((nint)(&ctx), &GemmTiledF32Worker);
     }
 
