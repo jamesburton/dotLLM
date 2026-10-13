@@ -6713,6 +6713,9 @@ public sealed class VulkanTransformerModel : IModel
             RecordMatmul(cmdBuf, moeW.SharedW1![s], moeW.SharedW1DeviceQuantType,
                 sharedInput, _state.MoeSharedGate!,
                 outputDim: sharedI, inputDim: hidden, seqLen: seqLen);
+            // #949: with packed K-quant weights both projections quantise the SAME input into the shared Q8_1 scratch;
+            // without this barrier the second quantise races the first MMVQ's reads of that scratch (KL 0.066 vs 0.004).
+            BarrierComputeToCompute(cmdBuf);
             RecordMatmul(cmdBuf, moeW.SharedW3![s], moeW.SharedW3DeviceQuantType,
                 sharedInput, _state.MoeSharedUp!,
                 outputDim: sharedI, inputDim: hidden, seqLen: seqLen);
