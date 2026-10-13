@@ -87,6 +87,8 @@ public sealed class MiMoV2SyntheticGoldenTests : IDisposable
         Assert.Equal(1e7f, c.GlobalRoPEConfig!.Value.Theta);
         Assert.Equal(RoPEType.NeoX, c.RoPEConfig.Value.Type);
         Assert.Equal(0.707f, c.AttentionValueScale);
+        // serve must NOT pick the paged KV cache (single stride) for this geometry: ServerStartup keys off IsUniform (#943).
+        Assert.False(DotLLM.Core.Attention.KvGeometry.FromConfig(c).IsUniform);
         Assert.Equal(1f / MathF.Sqrt(48), c.AttentionScoreScale(c.HeadDim));   // 1/sqrt(K head dim), NOT of V's
         var moe = c.Moe!;
         Assert.True(moe.SigmoidGating); Assert.True(moe.HasSelectionBias); Assert.True(moe.NormalizeExpertWeights);
