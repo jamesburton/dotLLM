@@ -165,6 +165,55 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         Environment.GetEnvironmentVariable("DOTLLM_HYBRID_VRAM_LEDGER") == "1";
     private bool _vramLedgerLogged;
 
+    // KV storage format (issue #956 Phase 2). Default F32 == "unquantized F16 on GPU" (the
+    // KvCacheDType convention). DOTLLM_HYBRID_KV = f16 | q8_0 | q4_0 | k8v4 | k4v8 selects
+    // quantized storage per side. Quantized rows live in _kQuant/_vQuant (per attention slot,
+    // standard block_q8_0 / block_q4_0 layout) and are dequantized into ONE shared F16 scratch
+    // pair per attention call, so the F16 persistent cache (64 KiB/token) disappears.
+    private KvCacheDType _kvKeyDType = ParseKvStorageEnv().key;
+    private KvCacheDType _kvValueDType = ParseKvStorageEnv().value;
+    private nint[]? _kQuant;
+    private nint[]? _vQuant;
+    private nint _kvF16ScratchK;
+    private nint _kvF16ScratchV;
+    private long _kvF16ScratchElems;
+
+    private static (KvCacheDType key, KvCacheDType value) ParseKvStorageEnv()
+    {
+        string? v = Environment.GetEnvironmentVariable("DOTLLM_HYBRID_KV")?.Trim().ToLowerInvariant();
+        return v switch
+        {
+            null or "" or "f16" or "f32" => (KvCacheDType.F32, KvCacheDType.F32),
+            "q8_0" or "q8" => (KvCacheDType.Q8_0, KvCacheDType.Q8_0),
+            "q4_0" or "q4" => (KvCacheDType.Q4_0, KvCacheDType.Q4_0),
+            "k8v4" => (KvCacheDType.Q8_0, KvCacheDType.Q4_0),
+            "k4v8" => (KvCacheDType.Q4_0, KvCacheDType.Q8_0),
+            _ => throw new InvalidOperationException(
+                $"DOTLLM_HYBRID_KV='{v}' is not one of f16, q8_0, q4_0, k8v4, k4v8."),
+        };
+    }
+
+    private static bool IsQuantKv(KvCacheDType d) => d is KvCacheDType.Q8_0 or KvCacheDType.Q4_0;
+
+    private static long QuantRowBytes(KvCacheDType d, int kvElems) => d switch
+    {
+        KvCacheDType.Q8_0 => (long)kvElems / 32 * 34,
+        KvCacheDType.Q4_0 => (long)kvElems / 32 * 18,
+        _ => (long)kvElems * sizeof(ushort),
+    };
+
+    /// <summary>
+    /// Test-only (issue #956): selects the KV storage format. Must be called before the first
+    /// attention-enabled Forward (the cache is sized lazily from it).
+    /// </summary>
+    internal void SetKvStorageForTest(KvCacheDType key, KvCacheDType value)
+    {
+        if (_f16KCache is not null || _kQuant is not null)
+            throw new InvalidOperationException("KV storage must be chosen before the first Forward.");
+        _kvKeyDType = key;
+        _kvValueDType = value;
+    }
+
     /// <summary>
     /// Test-only accessor for issue #185's regression test — exposes the F16 KV cache's current
     /// -length cursor directly, since correctness (attention logits) is unaffected by the bug this
@@ -3224,13 +3273,17 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             // chain: the #226 fp64-combine toggle wins over mma, then mma, then the F32 tiers.
             bool needF32Stage = useSplitKvHpAttn || !useMmaDecodeGqaSplitAttn;
             nint kStage = 0, vStage = 0;
+            // F16 view of K/V history: the persistent cache, or a fresh dequant into the shared
+            // scratch when KV storage is quantized (Phase 2).
+            nint kF16 = ResolveKvF16(slot, isKey: true, seqKv, kvElems, streamH);
+            nint vF16 = ResolveKvF16(slot, isKey: false, seqKv, kvElems, streamH);
             if (needF32Stage)
             {
                 EnsureF32KvStaging(seqKv, kvElems);
                 kStage = _f32KvStageK;
                 vStage = _f32KvStageV;
-                _kernels.LaunchConvertF16ToF32(_f16KCache![slot], kStage, kvLiveElems, streamH);
-                _kernels.LaunchConvertF16ToF32(_f16VCache![slot], vStage, kvLiveElems, streamH);
+                _kernels.LaunchConvertF16ToF32(kF16, kStage, kvLiveElems, streamH);
+                _kernels.LaunchConvertF16ToF32(vF16, vStage, kvLiveElems, streamH);
                 DebugF32StagedAttentionCallsForTest++;
             }
             ProfMark("attn-6b-kvdequant");
@@ -3238,11 +3291,15 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             if (s_vramLedger && !_vramLedgerLogged)
             {
                 _vramLedgerLogged = true;
-                long f16Kv = 2L * _attentionLayerCount * _f16CacheMaxSeqLen * kvElems * sizeof(ushort);
+                long kvBytes = (long)_attentionLayerCount * _f16CacheMaxSeqLen *
+                    (QuantRowBytes(_kvKeyDType, kvElems) + QuantRowBytes(_kvValueDType, kvElems));
                 long f32Stage = 2L * _f32KvStageElems * sizeof(float);
+                long f16Scratch = (IsQuantKv(_kvKeyDType) ? 1L : 0L) + (IsQuantKv(_kvValueDType) ? 1L : 0L);
+                f16Scratch *= _kvF16ScratchElems * sizeof(ushort);
                 Console.Error.WriteLine(
-                    $"[vram-ledger] F16 KV {f16Kv / 1048576.0:F0} MiB (maxSeq {_f16CacheMaxSeqLen}, " +
+                    $"[vram-ledger] KV {_kvKeyDType}/{_kvValueDType} {kvBytes / 1048576.0:F0} MiB (maxSeq {_f16CacheMaxSeqLen}, " +
                     $"{_attentionLayerCount} slots), shared F32 staging {f32Stage / 1048576.0:F0} MiB, " +
+                    $"F16 dequant scratch {f16Scratch / 1048576.0:F0} MiB, " +
                     $"state+gdn {ComputeMemoryBytes / 1048576.0:F0} MiB");
             }
 
@@ -3259,7 +3316,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                 EnsureAttentionMmaDecodeQF16Scratch(numHeads, headDim);
                 EnsureAttentionGqaSplitScratch(numHeads, headDim, mmaKvSplit);
                 _kernels.LaunchConvertF32ToF16(q, _attnMmaDecodeQF16, numHeads * headDim, streamH);
-                _mmaDecodeGqaSplit.Run(_attnMmaDecodeQF16, _f16KCache![slot], _f16VCache![slot], attnOut,
+                _mmaDecodeGqaSplit.Run(_attnMmaDecodeQF16, kF16, vF16, attnOut,
                     seqKv, numHeads, numKvHeads, mmaKvSplit,
                     _attnGqaSplitPartialMax, _attnGqaSplitPartialSum, _attnGqaSplitPartialOut, streamH);
             }
@@ -3347,6 +3404,34 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     {
         if (_f16KCache is not null && maxSeqLen <= _f16CacheMaxSeqLen) return;
 
+        FreeKvStorage();
+
+        int kvElems = numKvHeads * headDim;
+        if ((IsQuantKv(_kvKeyDType) || IsQuantKv(_kvValueDType)) && kvElems % 32 != 0)
+            throw new NotSupportedException(
+                $"Quantized KV storage needs numKvHeads*headDim ({kvElems}) to be a multiple of 32.");
+
+        _f16KCache = new nint[_attentionLayerCount];
+        _f16VCache = new nint[_attentionLayerCount];
+        _kQuant = new nint[_attentionLayerCount];
+        _vQuant = new nint[_attentionLayerCount];
+        long f16Bytes = (long)maxSeqLen * kvElems * sizeof(ushort);
+        long kBytes = (long)maxSeqLen * QuantRowBytes(_kvKeyDType, kvElems);
+        long vBytes = (long)maxSeqLen * QuantRowBytes(_kvValueDType, kvElems);
+        for (int i = 0; i < _attentionLayerCount; i++)
+        {
+            if (IsQuantKv(_kvKeyDType)) _kQuant[i] = AllocDevice(kBytes);
+            else _f16KCache[i] = AllocDevice(f16Bytes);
+            if (IsQuantKv(_kvValueDType)) _vQuant[i] = AllocDevice(vBytes);
+            else _f16VCache[i] = AllocDevice(f16Bytes);
+        }
+        _f16CacheMaxSeqLen = maxSeqLen;
+        _f16CacheCurrentLength = 0;
+    }
+
+    /// <summary>Frees the per-slot KV storage (F16 and quantized) and the shared dequant scratch.</summary>
+    private void FreeKvStorage()
+    {
         if (_f16KCache is not null)
         {
             for (int i = 0; i < _f16KCache.Length; i++)
@@ -3355,18 +3440,54 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                 if (_f16VCache![i] != 0) CudaDriverApi.cuMemFree_v2(_f16VCache[i]);
             }
         }
-
-        _f16KCache = new nint[_attentionLayerCount];
-        _f16VCache = new nint[_attentionLayerCount];
-        long bytesPerLayer = (long)maxSeqLen * numKvHeads * headDim * sizeof(ushort);
-        for (int i = 0; i < _attentionLayerCount; i++)
+        if (_kQuant is not null)
         {
-            _f16KCache[i] = AllocDevice(bytesPerLayer);
-            _f16VCache[i] = AllocDevice(bytesPerLayer);
+            for (int i = 0; i < _kQuant.Length; i++)
+            {
+                if (_kQuant[i] != 0) CudaDriverApi.cuMemFree_v2(_kQuant[i]);
+                if (_vQuant![i] != 0) CudaDriverApi.cuMemFree_v2(_vQuant[i]);
+            }
         }
-        _f16CacheMaxSeqLen = maxSeqLen;
-        _f16CacheCurrentLength = 0;
+        _f16KCache = null;
+        _f16VCache = null;
+        _kQuant = null;
+        _vQuant = null;
+    }
 
+    /// <summary>
+    /// Ensures the shared F16 dequant scratch pair holds <c>seqKv * kvElems</c> halves each
+    /// (1024-token growth steps; content is never preserved -- every use re-dequantizes).
+    /// </summary>
+    private void EnsureKvF16Scratch(int seqKv, int kvElems)
+    {
+        long needed = (long)seqKv * kvElems;
+        if (needed <= _kvF16ScratchElems) return;
+
+        const int GrowTokens = 1024;
+        long grown = ((long)seqKv + GrowTokens - 1) / GrowTokens * GrowTokens * kvElems;
+        FreeIfNonZero(ref _kvF16ScratchK);
+        FreeIfNonZero(ref _kvF16ScratchV);
+        if (IsQuantKv(_kvKeyDType)) _kvF16ScratchK = AllocDevice(grown * sizeof(ushort));
+        if (IsQuantKv(_kvValueDType)) _kvF16ScratchV = AllocDevice(grown * sizeof(ushort));
+        _kvF16ScratchElems = grown;
+    }
+
+    /// <summary>
+    /// Device pointer to a contiguous F16 <c>[seqKv, numKvHeads, headDim]</c> view of the K (or V)
+    /// history for <paramref name="slot"/>: the persistent F16 cache when unquantized, otherwise the
+    /// shared scratch just filled by a dequantize of rows <c>[0, seqKv)</c>.
+    /// </summary>
+    private nint ResolveKvF16(int slot, bool isKey, int seqKv, int kvElems, nint stream)
+    {
+        KvCacheDType dt = isKey ? _kvKeyDType : _kvValueDType;
+        if (!IsQuantKv(dt))
+            return isKey ? _f16KCache![slot] : _f16VCache![slot];
+
+        EnsureKvF16Scratch(seqKv, kvElems);
+        nint scratch = isKey ? _kvF16ScratchK : _kvF16ScratchV;
+        nint quant = isKey ? _kQuant![slot] : _vQuant![slot];
+        _kernels.LaunchKvDequantToF16(quant, dt, scratch, seqKv * kvElems, stream);
+        return scratch;
     }
 
     private void EnsureF16KvWriteStaging(int seqLen, int kvElems)
@@ -3491,44 +3612,58 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
 
         EnsureF16KvWriteStaging(seqLen, kvElems);
         nint stagingF16 = _f16KvWriteStaging;
-        nint kBase = _f16KCache![layerSlot];
-        nint vBase = _f16VCache![layerSlot];
 
         _kernels.LaunchConvertF32ToF16(kSrcF32, stagingF16, totalElems, streamH);
-        if (contiguous && seqLen > 1)
-        {
-            long bulkBytes = (long)seqLen * rowBytes;
-            nint kDst = kBase + (nint)((long)positions[0] * rowBytes);
-            CudaDriverApi.cuMemcpyDtoDAsync_v2(kDst, stagingF16, (nuint)bulkBytes, streamH).ThrowOnError();
-        }
-        else
-        {
-            for (int i = 0; i < seqLen; i++)
-            {
-                nint kDst = kBase + (nint)((long)positions[i] * rowBytes);
-                nint kS = stagingF16 + (nint)((long)i * rowBytes);
-                CudaDriverApi.cuMemcpyDtoDAsync_v2(kDst, kS, (nuint)rowBytes, streamH).ThrowOnError();
-            }
-        }
+        StoreKvRows(stagingF16, _f16KCache![layerSlot], _kQuant![layerSlot], _kvKeyDType,
+                    positions, contiguous, kvElems, rowBytes, streamH);
 
         _kernels.LaunchConvertF32ToF16(vSrcF32, stagingF16, totalElems, streamH);
+        StoreKvRows(stagingF16, _f16VCache![layerSlot], _vQuant![layerSlot], _kvValueDType,
+                    positions, contiguous, kvElems, rowBytes, streamH);
+
+        _f16CacheCurrentLength = HybridKvLengthBookkeeping.LengthAfterWrite(_f16CacheCurrentLength, positions);
+    }
+
+    /// <summary>
+    /// Stores <paramref name="positions"/>.Length F16 rows from <paramref name="stagingF16"/> into
+    /// either the persistent F16 cache or the quantized buffer (issue #956 Phase 2).
+    /// </summary>
+    private void StoreKvRows(nint stagingF16, nint f16Base, nint quantBase, KvCacheDType dtype,
+                             ReadOnlySpan<int> positions, bool contiguous, int kvElems, long f16RowBytes,
+                             nint streamH)
+    {
+        int seqLen = positions.Length;
+        if (IsQuantKv(dtype))
+        {
+            long qRow = QuantRowBytes(dtype, kvElems);
+            if (contiguous)
+            {
+                _kernels.LaunchQuantKv(stagingF16, quantBase + (nint)((long)positions[0] * qRow),
+                    seqLen * kvElems, dtype, streamH);
+            }
+            else
+            {
+                for (int i = 0; i < seqLen; i++)
+                    _kernels.LaunchQuantKv(stagingF16 + (nint)((long)i * f16RowBytes),
+                        quantBase + (nint)((long)positions[i] * qRow), kvElems, dtype, streamH);
+            }
+            return;
+        }
+
         if (contiguous && seqLen > 1)
         {
-            long bulkBytes = (long)seqLen * rowBytes;
-            nint vDst = vBase + (nint)((long)positions[0] * rowBytes);
-            CudaDriverApi.cuMemcpyDtoDAsync_v2(vDst, stagingF16, (nuint)bulkBytes, streamH).ThrowOnError();
+            nint dst = f16Base + (nint)((long)positions[0] * f16RowBytes);
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(dst, stagingF16, (nuint)((long)seqLen * f16RowBytes), streamH).ThrowOnError();
         }
         else
         {
             for (int i = 0; i < seqLen; i++)
             {
-                nint vDst = vBase + (nint)((long)positions[i] * rowBytes);
-                nint vS = stagingF16 + (nint)((long)i * rowBytes);
-                CudaDriverApi.cuMemcpyDtoDAsync_v2(vDst, vS, (nuint)rowBytes, streamH).ThrowOnError();
+                nint dst = f16Base + (nint)((long)positions[i] * f16RowBytes);
+                nint src = stagingF16 + (nint)((long)i * f16RowBytes);
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(dst, src, (nuint)f16RowBytes, streamH).ThrowOnError();
             }
         }
-
-        _f16CacheCurrentLength = HybridKvLengthBookkeeping.LengthAfterWrite(_f16CacheCurrentLength, positions);
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -4080,16 +4215,10 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         nint embPtr = _tokenEmbedDevice;
         if (embPtr != 0) CudaDriverApi.cuMemFree_v2(embPtr);
 
-        if (_f16KCache is not null)
-        {
-            for (int i = 0; i < _f16KCache.Length; i++)
-            {
-                if (_f16KCache[i] != 0) CudaDriverApi.cuMemFree_v2(_f16KCache[i]);
-                if (_f16VCache![i] != 0) CudaDriverApi.cuMemFree_v2(_f16VCache[i]);
-            }
-            _f16KCache = null;
-            _f16VCache = null;
-        }
+        FreeKvStorage();
+        FreeIfNonZero(ref _kvF16ScratchK);
+        FreeIfNonZero(ref _kvF16ScratchV);
+        _kvF16ScratchElems = 0;
         FreeIfNonZero(ref _f16KvWriteStaging);
         FreeIfNonZero(ref _f32KvStageK);
         FreeIfNonZero(ref _f32KvStageV);

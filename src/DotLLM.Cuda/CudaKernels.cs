@@ -351,6 +351,7 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _kvWriteOneF16RingFunc;
     private readonly nint _kvDequantQ8_0DynFunc;
     private readonly nint _kvDequantQ4_0DynFunc;
+    private readonly nint _kvDequantQ4_0Func;
     private readonly nint _kvWindowToScratchDynFunc;
 
     // Fused decode-step RoPE + KV-cache write. Replaces three eager launches per
@@ -1068,6 +1069,7 @@ public sealed unsafe class CudaKernels : IDisposable
             _kvWriteOneF16RingFunc = _kvWriteModule.GetFunction("kv_write_one_f16_ring");
             _kvDequantQ8_0DynFunc = _kvWriteModule.GetFunction("kv_dequant_q8_0_dyn");
             _kvDequantQ4_0DynFunc = _kvWriteModule.GetFunction("kv_dequant_q4_0_dyn");
+            _kvDequantQ4_0Func = _kvWriteModule.TryGetFunction("kv_dequant_q4_0");
             _kvWindowToScratchDynFunc = _kvWriteModule.GetFunction("kv_window_to_scratch_dyn");
         }
 
@@ -4582,6 +4584,41 @@ public sealed unsafe class CudaKernels : IDisposable
         CudaDriverApi.cuLaunchKernel(func,
                 gridDim, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Eager dequantization of a contiguous run of KV-format blocks (as written by
+    /// <see cref="LaunchQuantKv"/>) to FP16. KV Q4_0 packs ADJACENT PAIRS (low nibble = even
+    /// element), which differs from the GGUF weight layout <see cref="LaunchDequantToF16"/>
+    /// unpacks -- use this, not the generic weight dequant, for any KV-cache data (issue #956).
+    /// Q8_0 shares the weight layout and is forwarded to the generic kernel.
+    /// </summary>
+    public void LaunchKvDequantToF16(nint src, KvCacheDType dtype, nint dst, int totalElements, nint stream)
+    {
+        switch (dtype)
+        {
+            case KvCacheDType.Q8_0:
+                LaunchDequantToF16(src, QuantizationType.Q8_0, dst, totalElements, stream);
+                return;
+            case KvCacheDType.Q4_0:
+            {
+                if (_kvDequantQ4_0Func == 0)
+                    throw new InvalidOperationException(
+                        "kv_dequant_q4_0 not loaded (kv_write.ptx missing/stale). Rebuild native PTX.");
+                nint srcArg = src, dstArg = dst;
+                int totalBlocks = totalElements / 32;
+                int tbArg = totalBlocks;
+                void** args = stackalloc void*[] { &srcArg, &dstArg, &tbArg };
+                uint gridDim = (uint)Math.Min((totalBlocks + 7) / 8, MaxDequantGridSize);
+                if (gridDim == 0) gridDim = 1;
+                CudaDriverApi.cuLaunchKernel(_kvDequantQ4_0Func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+            default:
+                throw new NotSupportedException($"KV dequant not supported for {dtype}.");
+        }
     }
 
     /// <summary>
