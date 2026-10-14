@@ -274,6 +274,12 @@ public sealed partial class VulkanTransformerModel : IModel
     // Same for IQ4_XS (issue #600).
     private MatMulIq4XsGemmCoopmatKernel? _matmulIq4XsGemmCoopmat;
     private readonly MatMulQ6KMmqKernel? _matmulQ6KMmq;
+    // Small-row (2..4 rows: speculative verify / scheduler batched decode) multi-column GEMVs (#996). Weights read once for N activation rows,
+    // per-column accumulation order == the 1-row coalesced GEMV, instead of the MMQ / tiled GEMM tuned for prefill. Null when the SPIR-V or the
+    // device feature is missing; created in Create() after construction.
+    private MatMulQuantGemvMultiKernel? _smallRowQ6K;
+    private MatMulF32GemvMultiKernel? _smallRowF32;
+    private MatMulQ8_0MmvqMultiKernel? _smallRowQ8;
     private readonly MatMulQ5KMmqKernel? _matmulQ5KMmq;
     private readonly MatMulIq4XsMmqKernel? _matmulIq4XsMmq;
     private readonly MatMulIq4NlMmqKernel? _matmulIq4NlMmq;
@@ -2320,6 +2326,7 @@ public sealed partial class VulkanTransformerModel : IModel
         }
         model._headless = headless;
         model._noTokenEmbed = skipTokenEmbed;
+        model.CreateSmallRowKernels(device, spvDir);
         if (config.Architecture == DotLLM.Core.Configuration.Architecture.GptOss)
             model.InitGptOss(spvDir);
         if (config.Architecture == DotLLM.Core.Configuration.Architecture.MiMoV2)
@@ -4835,6 +4842,9 @@ public sealed partial class VulkanTransformerModel : IModel
         _matmulQ3KGemmCoopmat?.InvalidateDescriptorCache();
         _matmulIq4XsGemmCoopmat?.InvalidateDescriptorCache();
         _matmulQ6KMmq?.InvalidateDescriptorCache();
+        _smallRowQ6K?.InvalidateDescriptorCache();
+        _smallRowF32?.InvalidateDescriptorCache();
+        _smallRowQ8?.InvalidateDescriptorCache();
         _matmulQ5KMmq?.InvalidateDescriptorCache();
         _matmulIq4XsMmq?.InvalidateDescriptorCache();
         _matmulIq4NlMmq?.InvalidateDescriptorCache();
@@ -7420,6 +7430,7 @@ public sealed partial class VulkanTransformerModel : IModel
         if (QuantizeQ8_1RowsKernel.ScaleBytes(seqLen, inputDim) > _state.Q8_1XdsRows.Size) return false;
         foreach (var p in projections)
         {
+            if (SmallRowGemvApplies(p.WeightQt, inputDim, seqLen)) return false;   // #996: each projection goes through RecordMatmul's multi-column GEMV
             if (p.WeightQt == QuantType.Q4_K && PreferQ4KCoopmat(seqLen)) return false;
             if (p.WeightQt == QuantType.Q6_K && PreferQ6KCoopmat(seqLen)) return false;
             if (p.WeightQt == QuantType.Q2_K && PreferQ2KCoopmat(seqLen)) return false;
@@ -7606,6 +7617,10 @@ public sealed partial class VulkanTransformerModel : IModel
         VulkanDevice.Buffer input, VulkanDevice.Buffer output,
         int outputDim, int inputDim, int seqLen)
     {
+        // Small-row multi-column GEMVs (#996): 2..4 rows read the weights once instead of running the prefill GEMM / MMQ.
+        if (seqLen > 1 && TryRecordSmallRowGemv(cmdBuf, weights, weightQt, input, output, outputDim, inputDim, seqLen))
+            return;
+
         // IQ1/IQ2/IQ3 prefill: dequant to F16 scratch + coopmat GEMM instead of the scalar tiled GEMM (#621).
         if (seqLen > 1 && _iqF16Prefill is not null
             && _iqF16Prefill.TryRecord(cmdBuf, weightQt, weights, input, output, outputDim, inputDim, seqLen))
@@ -8578,6 +8593,9 @@ public sealed partial class VulkanTransformerModel : IModel
         _matmulQ3KGemmCoopmat?.Dispose();
         _matmulIq4XsGemmCoopmat?.Dispose();
         _matmulQ6KMmq?.Dispose();
+        _smallRowQ6K?.Dispose();
+        _smallRowF32?.Dispose();
+        _smallRowQ8?.Dispose();
         _matmulQ5KMmq?.Dispose();
         _matmulIq4XsMmq?.Dispose();
         _matmulIq4NlMmq?.Dispose();
