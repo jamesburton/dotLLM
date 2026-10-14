@@ -451,3 +451,22 @@ precedence over the simple `PrefixCache` from Step 54. Both engine paths
   to make room is deferred to Step 59 (priority-based scheduling).
 - The trie walks linearly to find a node by block id during `Release`;
   good enough for typical depths (< 1024 blocks) but a future tweak.
+### Bonsai-2 quality gate and recommended format (#973)
+
+RTX 3060 12 GB, Bonsai-2 27B PQ2_0, flash prefill (#962), v2 decode + fused quantized decode (#988).
+Perplexity: `DOTLLM_HYBRID_KV=<fmt> dotllm perplexity <gguf> --device cuda --kv-cache f32 --context 512 --max-tokens 8192`
+(wikitext-2 test; without `--kv-cache` the CUDA hybrid-dense model scores cacheless over exact F32 K/V and is blind to KV format).
+Needles: 3 secrets at 10/50/90% depth, greedy; token counts are 18,011 / 35,888 / 71,811.
+
+| KV | PPL | vs F16 | needles 18k / 36k / 72k | peak VRAM 36k / 72k | decode tok/s @72k |
+|---|---:|---:|---|---|---:|
+| F16 | 10.2350 | - | 3/3, 3/3, does not fit | 11.7 GB / - | - |
+| Q8_0 | 10.2346 | -0.004% | 3/3, 3/3, 3/3 | 10.7 GB / **12.08 GB** | 18.1 |
+| K8V4 | 10.2529 | +0.18% | 3/3, 3/3, 3/3 | 10.5 GB / 11.5 GB | 17.1 |
+| Q4_0 | 10.2661 | +0.32% | 3/3, 3/3, 3/3 | 10.2 GB / 10.95 GB | 18.8 |
+
+Decode sweep (Q4_0, 64 tokens per point): 18.9 tok/s at ctx 512, 19.5 at 4k, 19.7 at 16k, 18.9 at 32k, 18.4 at 64k.
+
+**Recommendation (12 GB card):** Q8_0 up to ~36k (indistinguishable from F16, 1 GB headroom). Beyond that
+prefer K8V4 (+0.18% PPL, 11.5 GB at 72k) or Q4_0 (10.95 GB) - Q8_0 at 72k peaks at 12.08 GB of 12.29 and is
+one allocation from WDDM paging. Needle retrieval is a coarse test; the PPL deltas are the fine-grained signal.
