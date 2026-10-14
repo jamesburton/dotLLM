@@ -41,7 +41,7 @@ public class CudaQwen3HybridDenseKvStagingTest
         return CudaDevice.IsAvailable();
     }
 
-    private sealed record RunResult(int PrefillStaged, int DecodeStaged, int Layers, float[][] DecodeLogits);
+    private sealed record RunResult(int PrefillStaged, int DecodeStaged, int Layers, float[][] DecodeLogits, int PrefillFlashCalls);
 
     [SkippableFact]
     public void MmaDecode_StagesNothing_AndMatchesF32Tier()
@@ -67,7 +67,10 @@ public class CudaQwen3HybridDenseKvStagingTest
         _out.WriteLine($"mma: prefill staged {mma.PrefillStaged}, decode staged {mma.DecodeStaged}; " +
                        $"f32: prefill staged {f32.PrefillStaged}, decode staged {f32.DecodeStaged}; layers {mma.Layers}");
 
-        Assert.Equal(mma.Layers, mma.PrefillStaged);                // prefill stages once per attention layer
+        // Prefill stages once per attention layer through attention_f32 -- unless the #962 head_dim-256
+        // flash prefill kernel served it, which reads the F16 cache directly and stages nothing.
+        int expectedPrefillStaged = mma.PrefillFlashCalls > 0 ? 0 : mma.Layers;
+        Assert.Equal(expectedPrefillStaged, mma.PrefillStaged);
         Assert.Equal(0, mma.DecodeStaged);                          // mma decode reads the F16 cache directly
         Assert.Equal(f32.Layers * DecodeSteps, f32.DecodeStaged);   // control: the counter really counts
 
@@ -92,8 +95,10 @@ public class CudaQwen3HybridDenseKvStagingTest
         for (int i = 0; i < PrefillLen; i++) { tokens[i] = 1 + (i * 7919) % 30000; pos[i] = i; }
 
         int c0 = model.DebugF32StagedAttentionCallsForTest;
+        int f0 = model.DebugFlashPrefillHd256CallsForTest;
         using (model.Forward(tokens, pos, deviceId: -1, kv, lastTokenLogitsOnly: true)) { }
         int prefillStaged = model.DebugF32StagedAttentionCallsForTest - c0;
+        int prefillFlash = model.DebugFlashPrefillHd256CallsForTest - f0;
 
         int c1 = model.DebugF32StagedAttentionCallsForTest;
         var logits = new float[DecodeSteps][];
@@ -103,7 +108,7 @@ public class CudaQwen3HybridDenseKvStagingTest
             logits[s] = Copy(t, config.VocabSize);
         }
         int decodeStaged = model.DebugF32StagedAttentionCallsForTest - c1;
-        return new RunResult(prefillStaged, decodeStaged, model.AttentionLayerCount, logits);
+        return new RunResult(prefillStaged, decodeStaged, model.AttentionLayerCount, logits, prefillFlash);
     }
 
     private static unsafe float[] Copy(ITensor t, int count)

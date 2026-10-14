@@ -1125,3 +1125,40 @@ The dense Gemma-4 variants (per-layer embeddings, 18 trailing shared-KV layers, 
 - Layer-split (pipeline / hybrid) loading of this variant is rejected: PLE inputs and cross-window shared-KV donors cannot be split.
 
 Performance caveat: this path dequantises each projection to F32 per forward (the validated 26B design), so decode throughput is far below the quantised-GEMV paths; a quantised-GEMV Gemma-4 path is the perf follow-up.
+
+## Flash-style tensor-core prefill attention, head_dim 256 (issue #962)
+
+`native/kernels/attention_flash_mma_prefill_hd256.cu` replaces the naive `attention_f32` prefill
+(one block per query row x head, scalar F32, F32 K/V staged from the F16 cache) for
+`qwen35`-style dense hybrids (Bonsai-2 27B: 24 Q / 4 KV heads, head_dim 256, causal, no window).
+
+- **Layout**: grid = (ceil(seqQ/16) q-tiles, numKvHeads); block = `group` warps, one per query head
+  of the GQA group, all sharing the same 16 query rows (K/V tile fetched once, reused `group`x;
+  identical causal range per warp). Heaviest q-tiles are scheduled first.
+- **Per warp**: 16x256 F32 O accumulator in registers (222 regs, no spill), `mma.sync.m16n8k16`
+  F16 operands / F32 accumulate for QK^T and PV, S->P fragment re-pack in registers, online
+  softmax in the exp2 domain, O rescaled only when a row max changes. Q in padded shared memory,
+  K/V tiles (16 keys) double-buffered with `cp.async`; dynamic smem 84.5 KB at group 6
+  (opt-in via `cuFuncSetAttribute`; eligibility: group <= 8 and smem <= 99 KB, i.e. group <= 6).
+- **Reads the F16 KV cache directly** (or the F16 dequant scratch for quantized KV); F32 staging is
+  skipped. Q is converted F32->F16 into a per-model scratch. Output F32 `[seqQ, numHeads*256]`.
+- **Dispatch**: `ForwardFullAttnBody`, `seqLen > 1`, head_dim 256, numKvHeads < numHeads, group <= 6.
+  Opt out with `DOTLLM_ATTN_FLASH_PREFILL_HD256=0`; `attention_f32` remains the fallback (also when
+  the PTX is not loaded, e.g. pre-Ampere).
+- **Accuracy** vs `attention_f32` on the same F16-rounded data: relRms 0.9e-4..2.0e-4, max abs
+  <= 2e-4 of max |ref| (`CudaAttentionFlashPrefillHd256Tests`). Real Bonsai-2 weights: last-token
+  prefill logits cosine >= 0.999999, same top-1.
+- **Performance (RTX 3060, seqQ=256, 24/4/256)**:
+
+  | seqKv | flash ms | attention_f32 ms | speedup |
+  |---|---|---|---|
+  | 1024 | 0.81 | 31.5 | 39x |
+  | 4096 | 2.04 | 207 | 102x |
+  | 16384 | 8.54 | 1044 | 122x |
+  | 65536 | 36.5 | 4790 | 131x |
+
+  Sustained ~11-12 TFLOP/s, about the GA106 FP16-with-F32-accumulate tensor peak.
+  End-to-end `dotllm bench -p N`: 2048: 100 -> 150 tok/s; 8192: 49 -> 140 tok/s (now flat in
+  length: prefill is bound by the weight GEMMs, not attention).
+- **Not done**: fused quantized-KV load (quantized KV still dequantizes to the F16 scratch first);
+  group 7/8 would need a smaller Q tile or KV_TILE (smem); no sliding-window / sinks / soft-cap variants.
