@@ -1,10 +1,12 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Evaluation;
 using DotLLM.Core.Models;
 using DotLLM.Engine;
 using DotLLM.Engine.Evaluation;
+using DotLLM.Engine.KvCache;
 using DotLLM.Models;
 using DotLLM.Models.Evaluation;
 using DotLLM.Models.Gguf;
@@ -108,6 +110,16 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         [Description("Compute threads. 0 = auto.")]
         [DefaultValue(0)]
         public int Threads { get; set; }
+
+        [CommandOption("--kv-cache")]
+        [Description("KV-cache storage format for perplexity scoring: 'none' (cacheless, exact K/V baseline — the default), 'f32' (FP32 cache), 'q8_0', 'q4_0'. When set, the forward pass reads K/V from the cache, so perplexity reflects the quantization quality of KV storage.")]
+        [DefaultValue("none")]
+        public string KvCache { get; set; } = "none";
+
+        [CommandOption("--kv-window")]
+        [Description("Full-precision window size for quantized KV cache (recent tokens kept in FP32 before quantize-on-evict). 0 = quantize all tokens immediately. Only applies when --kv-cache is q8_0 or q4_0.")]
+        [DefaultValue(0)]
+        public int KvWindow { get; set; }
     }
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
@@ -301,6 +313,17 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         if (settings.DumpTokens is not null)
             File.WriteAllText(settings.DumpTokens, string.Join(' ', tokens));
 
+        // #992: optional KV cache so perplexity measures the cache's storage format.
+        if (!TryParseKvCacheMode(settings.KvCache, out KvCacheDType? kvKeyDType, out KvCacheDType? kvValueDType))
+        {
+            AnsiConsole.MarkupLine(
+                $"[red]Unknown --kv-cache '{Markup.Escape(settings.KvCache)}'. Expected 'none', 'f32', 'q8_0', or 'q4_0'.[/]");
+            return 1;
+        }
+
+        IKvCache? kvCache = null;
+        string kvCacheLabel = "none (cacheless, exact K/V)";
+
         try
         {
         // Probed, not assumed: the CPU transformer returns [seqLen, vocab] but the CUDA model
@@ -310,10 +333,26 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         // scoring window (+1 for a prepended BOS) is the longest batch this run will submit.
         model.TrySetAllRowLogitsLimit(effectiveContext + 1);
         bool returnsAllRows = BackendPerplexityModel.Probe(model, forwardDeviceId, effectiveContext + 1);
-        var perplexityModel = new BackendPerplexityModel(model, forwardDeviceId, returnsAllRows);
+        if (kvKeyDType is not null)
+        {
+            var geom = KvGeometry.FromConfig(config);
+            if (kvKeyDType == KvCacheDType.F32)
+            {
+                kvCache = new SimpleKvCache(geom, effectiveContext);
+                kvCacheLabel = "f32";
+            }
+            else
+            {
+                kvCache = new QuantizedKvCache(geom, effectiveContext,
+                    kvKeyDType.Value, kvValueDType!.Value, settings.KvWindow);
+                kvCacheLabel = $"{settings.KvCache}" + (settings.KvWindow > 0 ? $" (window={settings.KvWindow})" : "");
+            }
+        }
+
+        var perplexityModel = new BackendPerplexityModel(model, forwardDeviceId, returnsAllRows, kvCache);
         AnsiConsole.MarkupLine(
             $"[grey]device: {Markup.Escape(deviceLabel)}  all-rows logits: {returnsAllRows} "
-            + $"({(returnsAllRows ? "single-pass O(n)" : "growing-prefix O(n^2)")})[/]");
+            + $"({(returnsAllRows ? "single-pass O(n)" : "growing-prefix O(n^2)")})  kv-cache: {kvCacheLabel}[/]");
         int bosTokenId = addBos ? tokenizer!.BosTokenId : -1;
         var options = new PerplexityOptions(
             mode, effectiveContext, effectiveStride, settings.MaxTokens, effectivePrefix, bosTokenId);
@@ -359,6 +398,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
             table.AddRow("Corpus line endings", Markup.Escape(
                 CorpusLineEndings.SummarizeForReport(corpusCarriageReturns, settings.NormalizeLineEndings)));
         }
+        table.AddRow("KV cache", kvCacheLabel);
         table.AddRow("Elapsed", $"{sw.Elapsed.TotalSeconds:F2} s");
         AnsiConsole.Write(table);
 
@@ -367,6 +407,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         }
         finally
         {
+            kvCache?.Dispose();
             model.Dispose();
             ownedDevice?.Dispose();
         }
@@ -409,6 +450,39 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
                 return true;
             default:
                 mode = default;
+                return false;
+        }
+    }
+
+    /// <summary>
+    /// Parses the <c>--kv-cache</c> value into key/value dtype pairs. Returns <see langword="false"/>
+    /// for unrecognised values. <c>null</c> dtypes mean cacheless (the default).
+    /// </summary>
+    private static bool TryParseKvCacheMode(string value, out KvCacheDType? keyDType, out KvCacheDType? valueDType)
+    {
+        keyDType = null;
+        valueDType = null;
+        switch (value.Trim().ToLowerInvariant())
+        {
+            case "none":
+            case "off":
+                return true;
+            case "f32":
+            case "fp32":
+                keyDType = KvCacheDType.F32;
+                valueDType = KvCacheDType.F32;
+                return true;
+            case "q8_0":
+            case "q8":
+                keyDType = KvCacheDType.Q8_0;
+                valueDType = KvCacheDType.Q8_0;
+                return true;
+            case "q4_0":
+            case "q4":
+                keyDType = KvCacheDType.Q4_0;
+                valueDType = KvCacheDType.Q4_0;
+                return true;
+            default:
                 return false;
         }
     }

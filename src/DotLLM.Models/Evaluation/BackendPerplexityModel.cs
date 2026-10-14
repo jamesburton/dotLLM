@@ -1,3 +1,4 @@
+using DotLLM.Core.Attention;
 using DotLLM.Core.Evaluation;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
@@ -23,6 +24,7 @@ public sealed class BackendPerplexityModel : IPerplexityModel
 {
     private readonly IModel _model;
     private readonly int _deviceId;
+    private readonly IKvCache? _kvCache;
 
     /// <param name="model">An already-loaded model. Not owned; not disposed by this adapter.</param>
     /// <param name="deviceId">Device for the forward pass; <c>-1</c> is CPU.</param>
@@ -30,11 +32,17 @@ public sealed class BackendPerplexityModel : IPerplexityModel
     /// Whether <paramref name="model"/>'s forward returns logits for every position. Prefer
     /// <see cref="Probe"/> over hardcoding this per backend.
     /// </param>
-    public BackendPerplexityModel(IModel model, int deviceId, bool returnsAllRows)
+    /// <param name="kvCache">
+    /// Optional KV cache. When non-null, the forward pass stores K/V through it, so perplexity
+    /// measures the cache's storage format (F16/Q8_0/Q4_0). Rolled back on every
+    /// <see cref="ResetState"/> call. Not owned; the caller is responsible for disposal.
+    /// </param>
+    public BackendPerplexityModel(IModel model, int deviceId, bool returnsAllRows, IKvCache? kvCache = null)
     {
         _model = model ?? throw new ArgumentNullException(nameof(model));
         _deviceId = deviceId;
         ReturnsAllRows = returnsAllRows;
+        _kvCache = kvCache;
     }
 
     /// <summary>Vocabulary size; the row length of the returned logits.</summary>
@@ -46,12 +54,21 @@ public sealed class BackendPerplexityModel : IPerplexityModel
     /// <inheritdoc/>
     public bool ReturnsAllRows { get; }
 
-    /// <inheritdoc/>
-    public ITensor Forward(ReadOnlySpan<int> tokens, ReadOnlySpan<int> positions)
-        => _model.Forward(tokens, positions, _deviceId);
+    /// <summary>Whether this adapter routes the forward pass through a KV cache.</summary>
+    public bool UsesKvCache => _kvCache is not null;
 
     /// <inheritdoc/>
-    public void ResetState() => _model.ResetSequenceState();
+    public ITensor Forward(ReadOnlySpan<int> tokens, ReadOnlySpan<int> positions)
+        => _kvCache is not null
+            ? _model.Forward(tokens, positions, _deviceId, _kvCache)
+            : _model.Forward(tokens, positions, _deviceId);
+
+    /// <inheritdoc/>
+    public void ResetState()
+    {
+        _kvCache?.Rollback(0);
+        _model.ResetSequenceState();
+    }
 
     /// <summary>
     /// Determines empirically whether <paramref name="model"/> returns logits for every position, by
