@@ -302,7 +302,7 @@ public static unsafe class FusedOps
             return dest;
         }
         if (qt is QuantizationType.Q2_K or QuantizationType.Q3_K or QuantizationType.IQ4_XS or QuantizationType.IQ2_XXS
-                or QuantizationType.IQ2_XS or QuantizationType.IQ2_S or QuantizationType.IQ3_XXS or QuantizationType.IQ3_S or QuantizationType.IQ1_S
+                or QuantizationType.IQ2_XS or QuantizationType.IQ2_S or QuantizationType.IQ3_XXS or QuantizationType.IQ3_S or QuantizationType.IQ1_S or QuantizationType.IQ1_M
                 or QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K)
         {
             RmsNormQuantizeQ8_K(input, weight, eps, dest, dim);

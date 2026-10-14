@@ -24,8 +24,9 @@ public readonly record struct BenchRep(double PrefillMs, double DecodeMs, int Pr
 /// </summary>
 public sealed class BenchResult
 {
-    /// <summary>The discarded warm-up repetition (JIT / shader-compile / page-in cost).</summary>
-    public required BenchRep Warmup { get; init; }
+    /// <summary>The discarded warm-up repetition (JIT / shader-compile / page-in cost).
+    /// <see langword="null"/> when <c>--warmup 0</c> skips warm-up entirely.</summary>
+    public BenchRep? Warmup { get; init; }
 
     /// <summary>Measured repetitions (warm-up excluded), in run order.</summary>
     public required IReadOnlyList<BenchRep> Reps { get; init; }

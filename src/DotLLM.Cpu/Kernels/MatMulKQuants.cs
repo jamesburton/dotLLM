@@ -630,7 +630,7 @@ public static unsafe partial class MatMul
         byte* w0, byte* w1, byte* w2, byte* w3,
         byte* q8k, int superBlockCount, int wStride, float* results)
     {
-        if (Avx2.IsSupported && Sse41.IsSupported)
+        if (FastKQuantIsa)
         {
             // Bit-identical rewrite with hoisted/vectorised scale + min handling (#933).
             Q4KRows4Tokens1(w0, w1, w2, w3, q8k, superBlockCount, wStride, results);
@@ -796,7 +796,7 @@ public static unsafe partial class MatMul
         byte* w0, byte* w1, byte* w2, byte* w3,
         byte* q8k, int superBlockCount, int wStride, float* results)
     {
-        if (Avx2.IsSupported && Sse41.IsSupported)
+        if (FastKQuantIsa)
         {
             // Bit-identical rewrite (#933).
             Q5KRows4Tokens1(w0, w1, w2, w3, q8k, superBlockCount, wStride, results);
@@ -986,7 +986,7 @@ public static unsafe partial class MatMul
         byte* w0, byte* w1, byte* w2, byte* w3,
         byte* q8k, int superBlockCount, int wStride, float* results)
     {
-        if (Avx2.IsSupported)
+        if (FastKQuantIsa)
         {
             // Bit-identical rewrite (#933).
             Q6KRows4Tokens1(w0, w1, w2, w3, q8k, superBlockCount, wStride, results);
@@ -1949,7 +1949,7 @@ public static unsafe partial class MatMul
 
         // Q4_K / Q6_K on AVX2: weights of a 4-row group are decoded once per 4 tokens (#933), bit-identical
         // to the per-token ComputeRows path. Everything else (and the <4-token / <4-row remainders) is unchanged.
-        bool tok4 = Avx2.IsSupported && Sse41.IsSupported
+        bool tok4 = FastKQuantIsa
             && (ctx.KBlockBytes == Q4_K_BlockBytes || ctx.KBlockBytes == Q5_K_BlockBytes || ctx.KBlockBytes == Q6_K_BlockBytes);
         bool q6 = ctx.KBlockBytes == Q6_K_BlockBytes;
         bool q5 = ctx.KBlockBytes == Q5_K_BlockBytes;

@@ -56,7 +56,7 @@ namespace DotLLM.Vulkan;
 /// matching the CUDA return convention.
 /// </para>
 /// </remarks>
-public sealed class VulkanTransformerModel : IModel
+public sealed partial class VulkanTransformerModel : IModel
 {
     private readonly VulkanDevice _device;
     private readonly VulkanWeights _weights;
@@ -494,10 +494,12 @@ public sealed class VulkanTransformerModel : IModel
         "start", "embed", "qkv_proj", "rope", "kv_update", "attention",
         "o_proj", "norm_resid", "ffn_gate_up", "ffn_act", "ffn_down", "lm_head",
         "attn_split", "moe_route", "moe_experts",
+        "mla_proj", "mla_prep", "mla_attn", "mla_vup", "mla_o",
     };
     private const byte DpCatStart = 0, DpCatEmbed = 1, DpCatQkv = 2, DpCatRope = 3,
         DpCatKv = 4, DpCatAttn = 5, DpCatO = 6, DpCatResid = 7, DpCatGateUp = 8,
-        DpCatAct = 9, DpCatDown = 10, DpCatLmHead = 11, DpCatAttnSplit = 12, DpCatMoeRoute = 13, DpCatMoeExperts = 14;
+        DpCatAct = 9, DpCatDown = 10, DpCatLmHead = 11, DpCatAttnSplit = 12, DpCatMoeRoute = 13, DpCatMoeExperts = 14,
+        DpCatMlaProj = 15, DpCatMlaPrep = 16, DpCatMlaAttn = 17, DpCatMlaVup = 18, DpCatMlaO = 19;
 
     // Cached delegate for the split-KV kernel's inter-pass profiler hook — when
     // the GPU decode profiler is active this splits the "attention" category
@@ -787,6 +789,20 @@ public sealed class VulkanTransformerModel : IModel
     private readonly int _mlaVHeadDim;
     private readonly int _mlaNumHeads;
     private readonly float _mlaRopeTheta;
+    // Absorbed MLA (#913): attention over the compressed latent cache with packed projections. Decided once per model
+    // (VulkanWeights.UseAbsorbedMla); when false the pre-#913 expanded path above runs unchanged.
+    private bool _mlaAbsorbed;
+    private MlaKvPrepKernel? _mlaKvPrep;
+    private MlaHeadGemmQ8Kernel? _mlaHeadGemm;
+    private MlaAbsorbedAttentionKernel? _mlaAbsAttn;
+    /// <summary>True when this model runs MLA in the absorbed latent form (#913).</summary>
+    internal bool MlaAbsorbed => _mlaAbsorbed;
+
+    /// <summary>Layers whose shared-expert gate projection stays in a packed (non-F32) device format (#949).</summary>
+    internal int SharedExpertPackedLayerCount => _weights.Layers.Count(l => l.Moe is { NumSharedExperts: > 0 } m && m.SharedW1DeviceQuantType != QuantizationType.F32);
+
+    /// <summary>Device bytes uploaded for weights (as accounted by the loader).</summary>
+    internal long WeightBytes => _weights.AllocatedBytes;
     // MoE (Mixtral / Qwen-MoE) — null when the model carries no MoE layer.
     private readonly MoeTopKSoftmaxF32Kernel? _moeTopkSoftmax;
     // DeepSeek-V3 / GLM-4.7-Flash sigmoid + selection-bias router (#742). Null unless config.Moe.SigmoidGating.
@@ -851,6 +867,13 @@ public sealed class VulkanTransformerModel : IModel
     private MoeIndexedMatmulMxfp4MmvqKernel? _gmMmvqMxfp4;
     private MoeIndexedMatmulKQuantMmvqKernel? _gmMmvqQ4KMr;
     private SwiGluQuantizeRowsKernel? _gmSwiGluQuant;
+    // IQ-family routed banks (MiMo-V2 BPW2.0, #955): the #823 indexed MMVQ (decode) and grouped coopmat (prefill) kernels, created only for the
+    // formats a loaded MoE layer actually carries. Empty for every other model.
+    private readonly Dictionary<MoeIqQuant, MoeIndexedMatmulIqMmvqKernel> _gmMmvqIq = new();
+    private readonly Dictionary<MoeIqQuant, MoeGroupedMatmulIqCoopmatKernel> _grpIq = new();
+    private Iq1Codebooks? _moeIq1Codebooks;
+    // MiMo-V2: pre-o_proj compaction of the K-shaped (zero-padded V) attention output to the V head dim, with attention_value_scale folded in.
+    private SimpleComputeKernel? _attnCompact;
     /// <summary>Runtime A/B switch: fuse the routed-expert activation with the Q8_1 quantize of the down input (default on).</summary>
     public bool GenericMoeFuseEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_GMOE_FUSE") != "0";
     /// <summary>
@@ -864,7 +887,8 @@ public sealed class VulkanTransformerModel : IModel
     public long GenericMoeScalarDecodeLayerCount { get; private set; }
     /// <summary>True when at least one generic-MoE MMVQ kernel was built for this model (integer-dot device, SPIR-V present, not disabled by env).</summary>
     public bool GenericMoeMmvqAvailable =>
-        _quantizeQ8_1Rows is not null && (_gmMmvqQ4K is not null || _gmMmvqQ5K is not null || _gmMmvqQ6K is not null || _gmMmvqQ8_0 is not null || _gmMmvqMxfp4 is not null);
+        _quantizeQ8_1Rows is not null && (_gmMmvqQ4K is not null || _gmMmvqQ5K is not null || _gmMmvqQ6K is not null || _gmMmvqQ8_0 is not null || _gmMmvqMxfp4 is not null
+            || _gmMmvqIq.Count > 0);
     /// <summary>Runtime A/B switch for the generic MoE MMVQ decode arm (default on). Off = the scalar indexed kernels, so one loaded model can compare both.</summary>
     public bool GenericMoeMmvqEnabled { get; set; } = true;
     /// <summary>
@@ -1042,6 +1066,69 @@ public sealed class VulkanTransformerModel : IModel
         }
     }
 
+    /// <summary>
+    /// MiMo-V2 (#955): sink-attention kernels (shared with gpt-oss) and the attention-output compaction kernel. Refuses to run a model whose
+    /// sliding layers lack their attention sinks (silently dropping them would be wrong logits).
+    /// </summary>
+    private void InitMiMoV2(string spvDir)
+    {
+        _gptOssDbg = new GptOssDebugToggles(Environment.GetEnvironmentVariable("DOTLLM_GPTOSS_DEBUG_OFF"));
+        for (int l = 0; l < _weights.Layers.Length; l++)
+        {
+            bool sliding = !Config.IsFullAttentionLayer(_firstLayer + l);
+            ref readonly var lw = ref _weights.Layers[l];
+            if (sliding && lw.AttnSinks is null)
+                throw new NotSupportedException($"MiMo-V2 sliding layer {_firstLayer + l} has no attention sinks tensor; refusing to run (wrong logits).");
+        }
+        _gptOss = VulkanGptOssKernels.Create(_device, spvDir);
+        _attnCompact = SimpleComputeKernel.Create(_device, spvDir, "attn_compact_scale_f32", buffers: 2, pushWords: 4);
+    }
+
+    /// <summary>Compacts <c>rows</c> attention-output rows from the K head dim to the V head dim (drops the exact-zero pad columns), scaling by <paramref name="scale"/>.</summary>
+    private void RecordAttnCompactScale(nint cmdBuf, VulkanDevice.Buffer src, VulkanDevice.Buffer dst, int rows, int kDim, int vDim, float scale)
+    {
+        uint total = (uint)(rows * vDim);
+        Span<nint> bufs = stackalloc nint[2] { src.Handle, dst.Handle };
+        Span<uint> pc = stackalloc uint[4] { total, (uint)kDim, (uint)vDim, BitConverter.SingleToUInt32Bits(scale) };
+        _attnCompact!.Record(cmdBuf, bufs, pc, (total + 255) / 256);
+    }
+
+    private static HashSet<MoeIqQuant> IqBankFormats(TransformerWeights cpuWeights, int firstLayer, int numLayers)
+    {
+        var set = new HashSet<MoeIqQuant>();
+        for (int i = 0; i < numLayers; i++)
+        {
+            var moe = cpuWeights.Layers[firstLayer + i].Moe;
+            if (moe is null) continue;
+            foreach (var qt in new[] { moe.GateExpsRawQt, moe.UpExpsRawQt, moe.DownExpsRawQt })
+                if (MoeIqFormats.FromQuantizationType(qt) is { } f) set.Add(f);
+        }
+        return set;
+    }
+
+    private void CreateIqMoeMmvqKernels(VulkanDevice device, string spvDir, TransformerWeights cpuWeights, int firstLayer, int numLayers,
+        Iq2Codebooks iq2, Iq3Codebooks iq3)
+    {
+        var formats = IqBankFormats(cpuWeights, firstLayer, numLayers);
+        if (formats.Count == 0) return;
+        _moeIq1Codebooks ??= Iq1Codebooks.Create(device);
+        foreach (var f in formats)
+            if (MoeIndexedMatmulIqMmvqKernel.TryCreate(device, spvDir, f, iq3, iq2, _moeIq1Codebooks) is { } k)
+                _gmMmvqIq[f] = k;
+    }
+
+    private void CreateIqMoeGroupedKernels(VulkanDevice device, string spvDir, TransformerWeights cpuWeights, int firstLayer, int numLayers,
+        Iq2Codebooks iq2, Iq3Codebooks iq3)
+    {
+        if (Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_IQ_GROUPED") == "0") return;
+        var formats = IqBankFormats(cpuWeights, firstLayer, numLayers);
+        if (formats.Count == 0) return;
+        _moeIq1Codebooks ??= Iq1Codebooks.Create(device);
+        foreach (var f in formats)
+            if (MoeGroupedMatmulIqCoopmatKernel.IsSupportedOn(device, spvDir, f))
+                _grpIq[f] = MoeGroupedMatmulIqCoopmatKernel.Create(device, spvDir, f, iq3, iq2, _moeIq1Codebooks);
+    }
+
     /// <summary>RoPE on Q/K: dense-YaRN kernel for gpt-oss, the theta-derived kernel otherwise.</summary>
     private void RecordRopeQk(nint cmdBuf, int layer, int seqLen, int numHeads, int numKvHeads, int headDim)
     {
@@ -1143,7 +1230,8 @@ public sealed class VulkanTransformerModel : IModel
             throw new InvalidOperationException(
                 "CreateMlaKvCache requires a model with MlaConfig set; this model has none.");
         return new MlaVulkanKvCache(_device, Config.NumLayers, maxSeqLen,
-            _mlaNumHeads, _mlaQkNopeHeadDim, _mlaVHeadDim, _mlaQkRopeHeadDim);
+            _mlaNumHeads, _mlaQkNopeHeadDim, _mlaVHeadDim, _mlaQkRopeHeadDim,
+            latentDim: _mlaAbsorbed ? Config.MlaConfig.KvLoraRank + _mlaQkRopeHeadDim : 0);
     }
 
     private VulkanTransformerModel(
@@ -1415,7 +1503,9 @@ public sealed class VulkanTransformerModel : IModel
             var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config,
                 moeBankSkipSelector: layerIdx => moeBankResidency.TryGetValue(layerIdx, out var r)
                     ? (r.Gate, r.Up, r.Down)
-                    : (false, false, false));
+                    : (false, false, false),
+                skipMlaF32Dequant: VulkanWeights.PlanMlaAbsorbed(gguf, config),
+            skipSharedExpertF32Dequant: VulkanWeights.PlanSharedExpertsPacked(gguf, config));
             return BuildModel(device, ownsDevice: true, config, cpuWeights, spvDir, gguf);
         }
         catch
@@ -1452,7 +1542,9 @@ public sealed class VulkanTransformerModel : IModel
         var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config,
             moeBankSkipSelector: layerIdx => moeBankResidency.TryGetValue(layerIdx, out var r)
                 ? (r.Gate, r.Up, r.Down)
-                : (false, false, false));
+                : (false, false, false),
+            skipMlaF32Dequant: VulkanWeights.PlanMlaAbsorbed(gguf, config),
+            skipSharedExpertF32Dequant: VulkanWeights.PlanSharedExpertsPacked(gguf, config));
         return BuildModel(device, ownsDevice: false, config, cpuWeights, spvDir, gguf);
     }
 
@@ -1548,7 +1640,8 @@ public sealed class VulkanTransformerModel : IModel
         // below dispatches them through the Q8_0 GEMV / GEMM kernels. Other
         // quant types are still dequantised to FP32 at upload.
         var weights = VulkanWeights.Upload(device, cpuWeights, config.NumLayers, firstLayer: firstLayer,
-            skipTokenEmbed: skipTokenEmbed, skipOutputHead: headless, spvDir: spvDir);
+            skipTokenEmbed: skipTokenEmbed, skipOutputHead: headless, spvDir: spvDir,
+            valuePad: config.HasDistinctValueHeadDim ? (config.HeadDim, config.GetValueHeadDim()) : null);
 
         // MoE detection: any layer with non-null Moe in CPU weights. We
         // don't gate on config.Moe because Mixtral/Qwen-MoE configs may
@@ -1576,6 +1669,7 @@ public sealed class VulkanTransformerModel : IModel
         }
 
         bool hasMla = config.MlaConfig is not null;
+        bool mlaAbsorbed = hasMla && VulkanWeights.UseAbsorbedMla(cpuWeights, firstLayer, config.NumLayers);
         int mlaNumHeads = hasMla ? config.NumAttentionHeads : 0;
         int mlaQkNope = hasMla ? config.MlaConfig!.QkNopeHeadDim : 0;
         int mlaQkRope = hasMla ? config.MlaConfig!.QkRopeHeadDim : 0;
@@ -1757,6 +1851,7 @@ public sealed class VulkanTransformerModel : IModel
             mlaVHeadDim: mlaVHead,
             mlaQLoraRank: mlaQLora,
             mlaKvLoraRank: mlaKvLora,
+            mlaAbsorbed: mlaAbsorbed,
             moeNumExperts: moeNumExperts,
             moeTopK: moeTopK,
             moeIntermediateSize: moeIntermediate,
@@ -2139,6 +2234,13 @@ public sealed class VulkanTransformerModel : IModel
             mlaScale, mlaRopeTheta);
         if (hasMoe && config.Moe is { SigmoidGating: true })
             model._moeTopkSigmoid = MoeTopKSigmoidBiasF32Kernel.Create(device, spvDir);
+        if (mlaAbsorbed)
+        {
+            model._mlaAbsorbed = true;
+            model._mlaKvPrep = MlaKvPrepKernel.Create(device, spvDir);
+            model._mlaHeadGemm = MlaHeadGemmQ8Kernel.Create(device, spvDir);
+            model._mlaAbsAttn = MlaAbsorbedAttentionKernel.Create(device, spvDir);
+        }
         if (Environment.GetEnvironmentVariable(DisableQ4KCoopmatEnvVar) != "1"
             && MatMulQ4KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
             model._matmulQ4KGemmCoopmat = MatMulQ4KGemmCoopmatKernel.Create(device, spvDir);
@@ -2190,6 +2292,7 @@ public sealed class VulkanTransformerModel : IModel
             if (MoeGroupedMatmulLegacyQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedLegacyQuant.Mxfp4))
                 model._grpMxfp4 = MoeGroupedMatmulLegacyQuantCoopmatKernel.Create(device, spvDir, MoeGroupedLegacyQuant.Mxfp4);
             model._grpTileList = MoeBuildTileListKernel.Create(device, spvDir);
+            model.CreateIqMoeGroupedKernels(device, spvDir, cpuWeights, firstLayer, config.NumLayers, iq2Codebooks, iq3Codebooks);
         }
         if (hasMoe && !config.Gemma4DualFfn && quantizeQ8_1Rows is not null && !IsMmvqDisabled() && !IsMoeMmvqDisabled()
             && Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_MMVQ") != "0")
@@ -2204,6 +2307,7 @@ public sealed class VulkanTransformerModel : IModel
             if (int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_MR"), out int gmMrEnv) && gmMrEnv >= 2)
                 model._gmMmvqQ4KMr = MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q4_K, gmMrEnv);
             model._gmSwiGluQuant = SwiGluQuantizeRowsKernel.TryCreate(device, spvDir);
+            model.CreateIqMoeMmvqKernels(device, spvDir, cpuWeights, firstLayer, config.NumLayers, iq2Codebooks, iq3Codebooks);
         }
         model._firstLayer = firstLayer;
         model._proportionalRopePairs = proportionalRopePairs;
@@ -2218,6 +2322,8 @@ public sealed class VulkanTransformerModel : IModel
         model._noTokenEmbed = skipTokenEmbed;
         if (config.Architecture == DotLLM.Core.Configuration.Architecture.GptOss)
             model.InitGptOss(spvDir);
+        if (config.Architecture == DotLLM.Core.Configuration.Architecture.MiMoV2)
+            model.InitMiMoV2(spvDir);
         if (config.PerLayerEmbedding is not null && config.IsGemma4DensePle)
             model.InitGemma4Ple(spvDir);
         return model;
@@ -2690,7 +2796,7 @@ public sealed class VulkanTransformerModel : IModel
         bool temp = config.AttnTemperatureScale != 0f;
         // Gemma-3 dual RoPE: dense (non-Gemma-4) models carrying a GlobalRoPEConfig rotate their full-attention
         // layers with a separate theta (+ optional linear scale), which the theta-driven kernels cannot express.
-        bool dual = config.Architecture == DotLLM.Core.Configuration.Architecture.Gemma3
+        bool dual = config.Architecture is DotLLM.Core.Configuration.Architecture.Gemma3 or DotLLM.Core.Configuration.Architecture.MiMoV2
             && config.GlobalRoPEConfig is not null;
         if (factors is null && !temp && !dual) return;
         int half = ropeDim / 2;
@@ -2709,7 +2815,7 @@ public sealed class VulkanTransformerModel : IModel
             int gDim = g.DimensionCount > 0 ? g.DimensionCount : config.HeadDim;
             if (gDim != ropeDim)
                 throw new NotSupportedException(
-                    $"Gemma-3 local/global RoPE rotate different dim counts ({ropeDim} vs {gDim}); not implemented on Vulkan.");
+                    $"{config.Architecture} local/global RoPE rotate different dim counts ({ropeDim} vs {gDim}); not implemented on Vulkan.");
             float lin = g.ScalingType == RoPEScalingType.Linear && g.ScalingFactor > 1f ? g.ScalingFactor : 1f;
             var ginv = new float[half];
             for (int i = 0; i < half; i++)
@@ -2821,7 +2927,7 @@ public sealed class VulkanTransformerModel : IModel
 
         // MiMo-V2 (#936): V head_dim != QK head_dim, SWA ring + sinks, packed low-bit expert banks - none of it exists in the Vulkan
         // attention/KV/MoE paths. Loading through the dense model would run and be silently wrong.
-        if (config.Architecture == DotLLM.Core.Configuration.Architecture.MiMoV2)
+        if (config.Architecture == DotLLM.Core.Configuration.Architecture.MiMoV2 && !allowGptOss)
             throw new NotSupportedException(ModelConfig.MiMoV2UnsupportedMessage("Vulkan"));
 
         // gpt-oss (#480): the dense VulkanTransformerModel would load it and produce wrong output
@@ -3840,6 +3946,8 @@ public sealed class VulkanTransformerModel : IModel
             // _firstLayer (0 on a single-device model) to read this stage's global layer.
             ref readonly var lw = ref _weights.Layers[layer];
             ref readonly var cpuLw = ref _cpuWeights.Layers[_firstLayer + layer];
+            // Per-layer KV-head count (MiMo-V2: 4 global / 8 sliding; equals Config.NumKvHeads for every uniform model).
+            numKvHeads = Config.GetLayerKvHeads(_firstLayer + layer);
 
             // Pre-attention residual snapshot: Residual aliases HiddenState
             // (same physical buffer), so no copy is needed. The barrier from
@@ -4077,11 +4185,22 @@ public sealed class VulkanTransformerModel : IModel
             ProfSample("attention");
             DpStamp(cmdBuf, DpCatAttn);
 
+            // MiMo-V2: V was zero-padded to the K head dim (VulkanWeights), so the attention output rows are K-shaped with exact-zero pad
+            // columns; compact them to the V head dim (and apply attention_value_scale, linear in V) into the Q scratch (dead after attention).
+            VulkanDevice.Buffer attnOutBuf = _state.AttnOutput;
+            if (Config.HasDistinctValueHeadDim)
+            {
+                RecordAttnCompactScale(cmdBuf, _state.AttnOutput, _state.Q, seqLen * numHeads, headDim, Config.GetValueHeadDim(),
+                    Config.AttentionValueScale ?? 1.0f);
+                BarrierComputeToCompute(cmdBuf);
+                attnOutBuf = _state.Q;
+            }
+
             // BitNet Sub-LN: in-place RMSNorm over the attention output before the
             // output projection. No-op for non-BitNet (AttnSubNormWeight null).
             if (lw.AttnSubNormWeight is { } attnSubNorm)
             {
-                _rmsnorm.Record(cmdBuf, _state.AttnOutput, attnSubNorm, _state.AttnOutput,
+                _rmsnorm.Record(cmdBuf, attnOutBuf, attnSubNorm, attnOutBuf,
                     rowCount: seqLen, n: lw.OInputDim, eps: eps);
                 BarrierComputeToCompute(cmdBuf);
             }
@@ -4098,12 +4217,12 @@ public sealed class VulkanTransformerModel : IModel
             oProjFused = lw.OBias is null && _currentLora is null && lw.PostAttnNormWeight is null
                 && _residualScale == 1.0f
                 && TryRecordMatmulWithResidualQ8_0(cmdBuf, lw.O, lw.ODeviceQuantType,
-                    _state.AttnOutput, _state.Residual, _state.AddScratch,
+                    attnOutBuf, _state.Residual, _state.AddScratch,
                     lw.OOutputDim, lw.OInputDim, seqLen);
 
             if (!oProjFused)
             {
-                RecordMatmul(cmdBuf, lw.O, lw.ODeviceQuantType, _state.AttnOutput, _state.NormOutput,
+                RecordMatmul(cmdBuf, lw.O, lw.ODeviceQuantType, attnOutBuf, _state.NormOutput,
                     lw.OOutputDim, lw.OInputDim, seqLen);
 
                 BarrierComputeToCompute(cmdBuf);
@@ -4117,7 +4236,7 @@ public sealed class VulkanTransformerModel : IModel
             // LoRA delta (o_proj): y += scale * (attnOut · B) · A.
             if (_currentLora is not null)
             {
-                MaybeApplyLoraDelta(cmdBuf, layer, "o_proj", _state.AttnOutput, _state.NormOutput,
+                MaybeApplyLoraDelta(cmdBuf, layer, "o_proj", attnOutBuf, _state.NormOutput,
                     seqLen, lw.OInputDim, lw.OOutputDim);
             }
             ProfSample("o_proj");
@@ -4741,6 +4860,9 @@ public sealed class VulkanTransformerModel : IModel
         _mlaAttention?.InvalidateDescriptorCache();
         _mlaRope?.InvalidateDescriptorCache();
         _mlaKvSplit?.InvalidateDescriptorCache();
+        _mlaKvPrep?.InvalidateDescriptorCache();
+        _mlaHeadGemm?.InvalidateDescriptorCache();
+        _mlaAbsAttn?.InvalidateDescriptorCache();
         _moeTopkSoftmax?.InvalidateDescriptorCache();
         _moeTopkSigmoid?.InvalidateDescriptorCache();
         _moeIndexedMatmul?.InvalidateDescriptorCache();
@@ -4768,6 +4890,9 @@ public sealed class VulkanTransformerModel : IModel
         _gmMmvqQ8_0?.InvalidateDescriptorCache();
         _gmMmvqMxfp4?.InvalidateDescriptorCache();
         _gmMmvqQ4KMr?.InvalidateDescriptorCache();
+        foreach (var iqk in _gmMmvqIq.Values) iqk.InvalidateDescriptorCache();
+        foreach (var iqg in _grpIq.Values) iqg.InvalidateDescriptorCache();
+        _attnCompact?.InvalidateDescriptorCache();
         _gmSwiGluQuant?.InvalidateDescriptorCache();
         _gemma4GroupedQ4K?.InvalidateDescriptorCache();
         _gemma4GroupedQ5_1?.InvalidateDescriptorCache();
@@ -4863,6 +4988,12 @@ public sealed class VulkanTransformerModel : IModel
         in VulkanWeights.LayerBuffers lw, int seqLen, float eps,
         ReadOnlySpan<int> positions, IKvCache? kvCache)
     {
+        if (mlaW.Absorbed)
+        {
+            RecordMlaLayerAbsorbed(cmdBuf, layer, mlaW, lw, seqLen, eps, positions, kvCache);
+            return;
+        }
+
         int qkHeadDim = mlaW.QkHeadDim;
         int hidden = mlaW.HiddenSize;
 
@@ -4906,9 +5037,9 @@ public sealed class VulkanTransformerModel : IModel
         // qkRopeHeadDim rows → MlaKPe (independent — also independent from
         // the Q matmul above). All three writes complete before the
         // single barrier below.
-        _matmul.Record(cmdBuf, mlaW.KvALatentProj, _state.NormOutput, _state.MlaKvLatent!,
+        _matmul.Record(cmdBuf, mlaW.KvALatentProj!, _state.NormOutput, _state.MlaKvLatent!,
             m: mlaW.KvLoraRank, k: hidden, n: seqLen);
-        _matmul.Record(cmdBuf, mlaW.KvAKPeProj, _state.NormOutput, _state.MlaKPe!,
+        _matmul.Record(cmdBuf, mlaW.KvAKPeProj!, _state.NormOutput, _state.MlaKPe!,
             m: mlaW.QkRopeHeadDim, k: hidden, n: seqLen);
         BarrierComputeToCompute(cmdBuf);
 
@@ -4919,7 +5050,7 @@ public sealed class VulkanTransformerModel : IModel
 
         // kv_b expansion: latent_norm → MlaKvBExpanded
         // Then split per-head into MlaKNope and MlaV.
-        _matmul.Record(cmdBuf, mlaW.KvBProj, _state.MlaKvLatentNorm!, _state.MlaKvBExpanded!,
+        _matmul.Record(cmdBuf, mlaW.KvBProj!, _state.MlaKvLatentNorm!, _state.MlaKvBExpanded!,
             m: mlaW.KvBOutputDim, k: mlaW.KvLoraRank, n: seqLen);
         BarrierComputeToCompute(cmdBuf);
         MaybeApplyLoraDelta(cmdBuf, layer, "kv_b_proj", _state.MlaKvLatentNorm!, _state.MlaKvBExpanded!,
@@ -4929,6 +5060,7 @@ public sealed class VulkanTransformerModel : IModel
             seqLen: seqLen, numHeads: mlaW.NumHeads,
             qkNopeHeadDim: mlaW.QkNopeHeadDim, vHeadDim: mlaW.VHeadDim);
         BarrierComputeToCompute(cmdBuf);
+        DpStamp(cmdBuf, DpCatMlaProj);
 
         // ── Decoupled RoPE on Q_pe (per head) and shared K_pe ────────
         _mlaRope!.Record(cmdBuf, _state.MlaQ!, _state.MlaKPe!, _state.PositionsBuffer,
@@ -4969,6 +5101,7 @@ public sealed class VulkanTransformerModel : IModel
             vHeadDim: mlaW.VHeadDim,
             positionOffset: positionOffset, scale: _mlaScale);
         BarrierComputeToCompute(cmdBuf);
+        DpStamp(cmdBuf, DpCatMlaAttn);
 
         // ── o_proj → NormOutput (mirrors GQA contract for residual add) ─
         RecordMatmul(cmdBuf, lw.O, lw.ODeviceQuantType, _state.MlaAttnOutput!, _state.NormOutput,
@@ -4981,6 +5114,138 @@ public sealed class VulkanTransformerModel : IModel
         }
         MaybeApplyLoraDelta(cmdBuf, layer, "o_proj", _state.MlaAttnOutput!, _state.NormOutput,
             seqLen, lw.OInputDim, lw.OOutputDim);
+        DpStamp(cmdBuf, DpCatMlaO);
+    }
+
+    /// <summary>
+    /// Absorbed MLA attention block (#913). The cache holds the compressed latent row <c>[c_kv | k_pe]</c> (576 floats) per
+    /// token; the query is multiplied by the per-head <c>W_UK</c> (<c>attn_k_b</c>) so scores and the value mix run in the
+    /// latent space, and <c>W_UV</c> (<c>attn_v_b</c>) is applied once to the mixed latent. All projections keep their
+    /// packed GGUF quantization and go through the ordinary <see cref="RecordMatmul"/> router (MMVQ at one row, coopmat /
+    /// MMQ for prefill chunks). Output contract identical to the expanded path: post-o_proj result in NormOutput.
+    /// </summary>
+    private void RecordMlaLayerAbsorbed(
+        nint cmdBuf, int layer, VulkanWeights.MlaLayerBuffers mlaW,
+        in VulkanWeights.LayerBuffers lw, int seqLen, float eps,
+        ReadOnlySpan<int> positions, IKvCache? kvCache)
+    {
+        int hidden = mlaW.HiddenSize;
+        int numHeads = mlaW.NumHeads;
+        int kvLora = mlaW.KvLoraRank;
+        int rope = mlaW.QkRopeHeadDim;
+        int cDim = kvLora + rope;
+        int qkHead = mlaW.QkHeadDim;
+        if (_currentLora?.Get(layer, "kv_b_proj") is not null)
+            throw new NotSupportedException(
+                "A LoRA adapter targeting kv_b_proj cannot run on the absorbed MLA path (kv_b is never materialised); "
+                + "set DOTLLM_VK_MLA_LEGACY=1 to use the expanded path.");
+
+        _rmsnorm.Record(cmdBuf, _state.HiddenState, lw.AttnNormWeight, _state.NormOutput,
+            rowCount: seqLen, n: hidden, eps: eps);
+        BarrierComputeToCompute(cmdBuf);
+
+        // Q path (packed q_a / q_b through the dense router)
+        if (mlaW.QLoraRank > 0)
+        {
+            RecordMatmul(cmdBuf, mlaW.QAProj!, mlaW.QAQt, _state.NormOutput, _state.MlaQLatent!,
+                mlaW.QLoraRank, hidden, seqLen);
+            BarrierComputeToCompute(cmdBuf);
+            MaybeApplyLoraDelta(cmdBuf, layer, "q_a_proj", _state.NormOutput, _state.MlaQLatent!,
+                seqLen, hidden, mlaW.QLoraRank);
+            _rmsnorm.Record(cmdBuf, _state.MlaQLatent!, mlaW.QALayernormWeight!, _state.MlaQLatentNorm!,
+                rowCount: seqLen, n: mlaW.QLoraRank, eps: eps);
+            BarrierComputeToCompute(cmdBuf);
+            RecordMatmul(cmdBuf, mlaW.QBProj!, mlaW.QBQt, _state.MlaQLatentNorm!, _state.MlaQ!,
+                mlaW.QTotal, mlaW.QLoraRank, seqLen);
+            BarrierComputeToCompute(cmdBuf);
+            MaybeApplyLoraDelta(cmdBuf, layer, "q_b_proj", _state.MlaQLatentNorm!, _state.MlaQ!,
+                seqLen, mlaW.QLoraRank, mlaW.QTotal);
+        }
+        else
+        {
+            RecordMatmul(cmdBuf, mlaW.QProj!, mlaW.QQt, _state.NormOutput, _state.MlaQ!,
+                mlaW.QTotal, hidden, seqLen);
+            BarrierComputeToCompute(cmdBuf);
+            MaybeApplyLoraDelta(cmdBuf, layer, "q_proj", _state.NormOutput, _state.MlaQ!,
+                seqLen, hidden, mlaW.QTotal);
+        }
+
+        // fused kv_a_mqa (latent + rope-K rows in one matmul)
+        RecordMatmul(cmdBuf, mlaW.KvAFull!, mlaW.KvAFullQt, _state.NormOutput, _state.MlaKvA!,
+            cDim, hidden, seqLen);
+        BarrierComputeToCompute(cmdBuf);
+        DpStamp(cmdBuf, DpCatMlaProj);
+
+        // latent cache row: rmsnorm(c_kv) | rope(k_pe), written in place
+        VulkanDevice.Buffer cBuf;
+        int rowOffset, seqKv, positionOffset;
+        if (kvCache is MlaVulkanKvCache mlaCache)
+        {
+            if (!mlaCache.IsLatent)
+                throw new InvalidOperationException(
+                    "The absorbed MLA path needs a latent MlaVulkanKvCache (use the model's CreateMlaKvCache / VulkanModelLoader factory); "
+                    + "got an expanded one.");
+            rowOffset = mlaCache.NoteLatentWrite(positions, seqLen);
+            cBuf = mlaCache.GetLatentBuffer(layer);
+            seqKv = mlaCache.CurrentLength;
+            positionOffset = positions[0];
+        }
+        else
+        {
+            cBuf = _state.MlaCKvScratch!;
+            rowOffset = 0;
+            seqKv = seqLen;
+            positionOffset = 0;
+        }
+        _mlaKvPrep!.Record(cmdBuf, _state.MlaKvA!, mlaW.KvALayernormWeight, _state.PositionsBuffer, cBuf,
+            seqLen, rowOffset, kvLora, rope, eps, _mlaRopeTheta);
+
+        // query absorption: q_abs[t,h,0..kvLora) = W_UK_h . q_nope[t,h], q_abs[..kvLora..) = rope(q_pe)
+        _mlaHeadGemm!.Record(cmdBuf, mlaW.KBProj!, _state.MlaQ!, _state.MlaQAbs!, _state.PositionsBuffer,
+            m: kvLora, k: mlaW.QkNopeHeadDim, numHeads: numHeads, seqLen: seqLen,
+            xTokStride: numHeads * qkHead, xHeadStride: qkHead,
+            outTokStride: numHeads * cDim, outHeadStride: cDim,
+            ropeDim: rope, ropeSrcOff: mlaW.QkNopeHeadDim, ropeDstOff: kvLora, theta: _mlaRopeTheta);
+        BarrierComputeToCompute(cmdBuf);
+        DpStamp(cmdBuf, DpCatMlaPrep);
+
+        // attention over the latent cache (split-KV for decode / tiny verify chunks)
+        int numSplits = seqLen <= VulkanForwardState.MlaSplitMaxRows
+            ? MlaAbsorbedAttentionKernel.ChooseSplits(seqKv, VulkanForwardState.MlaSplitMaxSplits)
+            : 1;
+        int splitRows = VulkanForwardState.MlaSplitMaxRows * numHeads;
+        _mlaAbsAttn!.Record(cmdBuf, _state.MlaQAbs!, cBuf, _state.MlaLatOut!, _state.MlaSplitO!, _state.MlaSplitML!,
+            seqLen, seqKv, numHeads, positionOffset, _mlaScale, numSplits, splitRows);
+        if (numSplits > 1)
+        {
+            BarrierComputeToCompute(cmdBuf);
+            _mlaAbsAttn.RecordMerge(cmdBuf, _state.MlaSplitO!, _state.MlaSplitML!, _state.MlaLatOut!,
+                seqLen * numHeads, numSplits, splitRows);
+        }
+        BarrierComputeToCompute(cmdBuf);
+        DpStamp(cmdBuf, DpCatMlaAttn);
+
+        // value up-projection W_UV_h . latent_out[t,h] -> per-head v
+        _mlaHeadGemm.Record(cmdBuf, mlaW.VBProj!, _state.MlaLatOut!, _state.MlaAttnOutput!, _state.PositionsBuffer,
+            m: mlaW.VHeadDim, k: kvLora, numHeads: numHeads, seqLen: seqLen,
+            xTokStride: numHeads * kvLora, xHeadStride: kvLora,
+            outTokStride: numHeads * mlaW.VHeadDim, outHeadStride: mlaW.VHeadDim,
+            ropeDim: 0, ropeSrcOff: 0, ropeDstOff: 0, theta: 0f);
+        BarrierComputeToCompute(cmdBuf);
+        DpStamp(cmdBuf, DpCatMlaVup);
+
+        // o_proj -> NormOutput (same contract as the GQA path for the residual add)
+        RecordMatmul(cmdBuf, lw.O, lw.ODeviceQuantType, _state.MlaAttnOutput!, _state.NormOutput,
+            lw.OOutputDim, lw.OInputDim, seqLen);
+        BarrierComputeToCompute(cmdBuf);
+        if (lw.OBias is not null)
+        {
+            _biasAdd.Record(cmdBuf, _state.NormOutput, lw.OBias, seqLen, lw.OOutputDim);
+            BarrierComputeToCompute(cmdBuf);
+        }
+        MaybeApplyLoraDelta(cmdBuf, layer, "o_proj", _state.MlaAttnOutput!, _state.NormOutput,
+            seqLen, lw.OInputDim, lw.OOutputDim);
+        DpStamp(cmdBuf, DpCatMlaO);
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -6192,7 +6457,7 @@ public sealed class VulkanTransformerModel : IModel
             QuantType.Q6_K => _grpQ6K is not null && (k % MoeGroupedMatmulKQuantCoopmatKernel.KGroup) == 0,
             QuantType.Q8_0 => _grpQ8_0 is not null && (k % MoeGroupedMatmulLegacyQuantCoopmatKernel.KGroup) == 0,
             QuantType.MXFP4 => _grpMxfp4 is not null && (k % MoeGroupedMatmulLegacyQuantCoopmatKernel.KGroup) == 0,
-            _ => false,
+            _ => MoeIqFormats.FromQuantizationType(qt) is { } f && _grpIq.TryGetValue(f, out var gk) && (k % gk.KGroup) == 0,
         };
 
     /// <summary>
@@ -6229,7 +6494,7 @@ public sealed class VulkanTransformerModel : IModel
             QuantType.Q6_K => _gmMmvqQ6K is not null && (k % 256) == 0,
             QuantType.Q8_0 => _gmMmvqQ8_0 is not null && (k % 32) == 0,
             QuantType.MXFP4 => _gmMmvqMxfp4 is not null && (k % 32) == 0,
-            _ => false,
+            _ => GenericMoeMmvqIqSupported(qt, k, out xDiv),
         };
     }
 
@@ -6251,6 +6516,12 @@ public sealed class VulkanTransformerModel : IModel
         return true;
     }
 
+    private bool GenericMoeMmvqIqSupported(QuantType qt, int k, out bool xDiv)
+    {
+        xDiv = true;
+        return MoeIqFormats.FromQuantizationType(qt) is { } f && _gmMmvqIq.TryGetValue(f, out var mk) && (k % mk.GroupSize) == 0;
+    }
+
     private void RecordGenericMoeMmvqProjection(nint cmdBuf, QuantType qt, VulkanDevice.Buffer bank, VulkanDevice.Buffer y, VulkanDevice.Buffer? bias,
         int m, int k, int n, int numE, int xDiv)
     {
@@ -6267,7 +6538,13 @@ public sealed class VulkanTransformerModel : IModel
             case QuantType.Q6_K: _gmMmvqQ6K!.Record(cmdBuf, bank, xq, xds, idx, y, m, k, n, numE, xDiv); break;
             case QuantType.Q8_0: _gmMmvqQ8_0!.Record(cmdBuf, bank, xq, xds, idx, y, m, k, n, numE); break;
             case QuantType.MXFP4: _gmMmvqMxfp4!.Record(cmdBuf, bank, xq, xds, idx, y, bias, m, k, n, numE, xDiv); break;
-            default: throw new InvalidOperationException($"No generic MoE MMVQ kernel for {qt}.");
+            default:
+                if (MoeIqFormats.FromQuantizationType(qt) is { } iqf && _gmMmvqIq.TryGetValue(iqf, out var iqk))
+                {
+                    iqk.Record(cmdBuf, bank, xq, xds, idx, y, m, k, n, numE, xDiv);
+                    break;
+                }
+                throw new InvalidOperationException($"No generic MoE MMVQ kernel for {qt}.");
         }
     }
 
@@ -6353,7 +6630,13 @@ public sealed class VulkanTransformerModel : IModel
                 _grpMxfp4!.RecordIndirect(cmdBuf, bank, packedIn, offsets, packedOut, bias ?? _state.MoeTopkWeights!, false, args, argsOffset, m, k, rows, numE,
                     applyBias: bias is not null);
                 break;
-            default: throw new InvalidOperationException($"No grouped MoE kernel for {qt}.");
+            default:
+                if (MoeIqFormats.FromQuantizationType(qt) is { } iqf && _grpIq.TryGetValue(iqf, out var iqg))
+                {
+                    iqg.RecordIndirect(cmdBuf, bank, packedIn, offsets, packedOut, args, argsOffset, m, k, rows, numE);
+                    break;
+                }
+                throw new InvalidOperationException($"No grouped MoE kernel for {qt}.");
         }
     }
 
@@ -6412,7 +6695,8 @@ public sealed class VulkanTransformerModel : IModel
         QuantType.Q5_K => _grpQ5K!.MTiles(m),
         QuantType.Q6_K => _grpQ6K!.MTiles(m),
         QuantType.Q8_0 => _grpQ8_0!.MTiles(m),
-        _ => _grpMxfp4!.MTiles(m),
+        QuantType.MXFP4 => _grpMxfp4!.MTiles(m),
+        _ => _grpIq[MoeIqFormats.FromQuantizationType(qt) ?? throw new InvalidOperationException($"No grouped MoE kernel for {qt}.")].MTiles(m),
     };
 
     private bool CanUseGroupedF16Moe(
@@ -6545,6 +6829,9 @@ public sealed class VulkanTransformerModel : IModel
             RecordMatmul(cmdBuf, moeW.SharedW1![s], moeW.SharedW1DeviceQuantType,
                 sharedInput, _state.MoeSharedGate!,
                 outputDim: sharedI, inputDim: hidden, seqLen: seqLen);
+            // #949: with packed K-quant weights both projections quantise the SAME input into the shared Q8_1 scratch;
+            // without this barrier the second quantise races the first MMVQ's reads of that scratch (KL 0.066 vs 0.004).
+            BarrierComputeToCompute(cmdBuf);
             RecordMatmul(cmdBuf, moeW.SharedW3![s], moeW.SharedW3DeviceQuantType,
                 sharedInput, _state.MoeSharedUp!,
                 outputDim: sharedI, inputDim: hidden, seqLen: seqLen);
@@ -6705,7 +6992,9 @@ public sealed class VulkanTransformerModel : IModel
         }
 
         if (weightQt != QuantizationType.F32)
-            throw new NotSupportedException($"MoE indexed matmul does not support {weightQt} banks.");
+            throw new NotSupportedException(MoeIqFormats.FromQuantizationType(weightQt) is not null
+                ? $"{weightQt} routed-expert banks are served only by the IQ MMVQ / grouped coopmat MoE arms (LoRA active, row count above the MMVQ limit without grouped kernels, or the kernels failed to build); the scalar indexed kernel has no {weightQt} path."
+                : $"MoE indexed matmul does not support {weightQt} banks.");
 
         bool useTiled = _moeIndexedMatmulTiled is not null
             && n >= TiledMinRows
@@ -8151,6 +8440,7 @@ public sealed class VulkanTransformerModel : IModel
         // ForwardBatch scratch — null when batched path was never invoked.
         _batchScratch?.Dispose();
 
+        _g4mtp?.Dispose();
         _diffusionLogits?.Dispose();
         _diffusionScSig?.Dispose();
         _pkvStore?.Dispose();
@@ -8178,6 +8468,10 @@ public sealed class VulkanTransformerModel : IModel
         _gmMmvqQ8_0?.Dispose();
         _gmMmvqMxfp4?.Dispose();
         _gmMmvqQ4KMr?.Dispose();
+        foreach (var iqk in _gmMmvqIq.Values) iqk.Dispose();
+        foreach (var iqg in _grpIq.Values) iqg.Dispose();
+        _moeIq1Codebooks?.Dispose();
+        _attnCompact?.Dispose();
         _gmSwiGluQuant?.Dispose();
         _grpTileList?.Dispose();
         _gemma4GroupedQ4K?.Dispose();
@@ -8201,6 +8495,9 @@ public sealed class VulkanTransformerModel : IModel
         _moeTopkSoftmax?.Dispose();
         _moeTopkSigmoid?.Dispose();
         _mlaKvSplit?.Dispose();
+        _mlaKvPrep?.Dispose();
+        _mlaHeadGemm?.Dispose();
+        _mlaAbsAttn?.Dispose();
         _mlaRope?.Dispose();
         _mlaAttention?.Dispose();
         _biasAdd.Dispose();

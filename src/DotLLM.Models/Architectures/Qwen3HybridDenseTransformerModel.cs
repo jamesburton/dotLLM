@@ -2377,6 +2377,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             case QuantizationType.IQ2_S:
             case QuantizationType.IQ3_XXS:
             case QuantizationType.IQ3_S:
+            case QuantizationType.IQ1_M:
             case QuantizationType.IQ1_S:
                 MatMul.GemmIQCodebook(qt, (byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
                 return;

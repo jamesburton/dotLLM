@@ -226,7 +226,7 @@ public static unsafe partial class MatMul
         => GemmR4Tiled(repackedWeights, b, inputQ, c, fullGroups, tailRows, superBlockCount, m, k, n,
             Q4_K_BlockBytes, superBlockCount * Q8_K_BlockBytes,
             &ComputeRowsQ4_KInterleaved, &QuantizeF32ToQ8_K, pool,
-            Avx2.IsSupported && Sse41.IsSupported ? &Rows4Tokens4 : null);
+            FastKQuantIsa ? &Rows4Tokens4 : null);
 
     /// <inheritdoc cref="GemmR4Tiled"/>
     [SkipLocalsInit]
@@ -235,7 +235,7 @@ public static unsafe partial class MatMul
         => GemmR4Tiled(repackedWeights, b, inputQ, c, fullGroups, tailRows, superBlockCount, m, k, n,
             Q5_K_BlockBytes, superBlockCount * Q8_K_BlockBytes,
             &ComputeRowsQ5_KInterleaved, &QuantizeF32ToQ8_K, pool,
-            Avx2.IsSupported && Sse41.IsSupported ? &Q5KRows4Tokens4 : null);
+            FastKQuantIsa ? &Q5KRows4Tokens4 : null);
 
     /// <inheritdoc cref="GemmR4Tiled"/>
     [SkipLocalsInit]
@@ -244,5 +244,5 @@ public static unsafe partial class MatMul
         => GemmR4Tiled(repackedWeights, b, inputQ, c, fullGroups, tailRows, superBlockCount, m, k, n,
             Q6_K_BlockBytes, superBlockCount * Q8_K_BlockBytes,
             &ComputeRowsQ6_KInterleaved, &QuantizeF32ToQ8_K, pool,
-            Avx2.IsSupported ? &Q6KRows4Tokens4 : null);
+            FastKQuantIsa ? &Q6KRows4Tokens4 : null);
 }

@@ -554,7 +554,19 @@ public static unsafe partial class MoeSwiGluMlp
                     UseGeGLU = useGeGLU,
                 };
 
-                if (threadPool is null || uniqueExpertCount < 2)
+                if (seqLen == 1 && threadPool is not null && loraAdapter is null
+                    && gateExpsF32Ptrs.IsEmpty && upExpsF32Ptrs.IsEmpty && downExpsF32Ptrs.IsEmpty
+                    && TryExecuteRoutedDecodeN1(
+                        hiddenPtr, scatterDownPtr,
+                        gateExpsRawBase, gateExpsQt, gateExpsRowBytes,
+                        upExpsRawBase, upExpsQt, upExpsRowBytes,
+                        downExpsRawBase, downExpsQt, downExpsRowBytes,
+                        bucketCursors, bucketSlots, uniqueExperts, uniqueExpertCount,
+                        numExpertsPerTok, hiddenSize, intermediateSize, useGeGLU, threadPool))
+                {
+                    // Decode fast path ran: two pool dispatches for the whole layer (see TryExecuteRoutedDecodeN1).
+                }
+                else if (threadPool is null || uniqueExpertCount < 2)
                 {
                     // Serial path — bit-identity with the historical ascending-id loop.
                     for (int u = 0; u < uniqueExpertCount; u++)
@@ -761,6 +773,7 @@ public static unsafe partial class MoeSwiGluMlp
         int intermediateSize = ctx.IntermediateSize;
         int numExpertsPerTok = ctx.NumExpertsPerTok;
 
+        long _p0 = CpuStageProf.T();
         // Rent per-call buffers from ArrayPool — worker-local, returned in finally.
         float[] batchInBuf = ArrayPool<float>.Shared.Rent(batch * hiddenSize);
         float[] gateBatchBuf = ArrayPool<float>.Shared.Rent(batch * intermediateSize);
@@ -830,6 +843,7 @@ public static unsafe partial class MoeSwiGluMlp
                     preQuantGateUp = prequantPtr;
                 }
 
+                CpuStageProf.E(9, _p0); _p0 = CpuStageProf.T();
                 // ── gate = batchIn × W1 (gate_proj) ───────────────────────────
                 DispatchGemm(
                     ctx.GateExpsQt, gatePtr, batchInPtr, gateBatchPtr,
@@ -847,6 +861,7 @@ public static unsafe partial class MoeSwiGluMlp
                 ApplyLoraDelta(loraAdapter, loraLayer, ExpertProjectionName(e, "up_proj"),
                     batchInPtr, upBatchPtr, batch, hiddenSize, intermediateSize);
 
+                CpuStageProf.E(10, _p0); _p0 = CpuStageProf.T();
                 // ── Per-row gate fuse (GeGLU for Gemma 4, SwiGLU otherwise) ──
                 var gateBatchSpan = new Span<float>(gateBatchPtr, batch * intermediateSize);
                 var upBatchSpan = new Span<float>(upBatchPtr, batch * intermediateSize);
@@ -863,6 +878,7 @@ public static unsafe partial class MoeSwiGluMlp
                         FusedOps.SwiGLU(gSlice, uSlice, oSlice);
                 }
 
+                CpuStageProf.E(11, _p0); _p0 = CpuStageProf.T();
                 // ── down = silu × W2 (down_proj) ─────────────────────────────
                 // K=intermediateSize differs from gate/up (K=hiddenSize) so the pre-quantized
                 // input is not reusable here — let the kernel quantize internally. This is one
@@ -875,6 +891,7 @@ public static unsafe partial class MoeSwiGluMlp
                 ApplyLoraDelta(loraAdapter, loraLayer, ExpertProjectionName(e, "down_proj"),
                     siluBatchPtr, downBatchPtr, batch, intermediateSize, hiddenSize);
 
+                CpuStageProf.E(12, _p0); _p0 = CpuStageProf.T();
                 // ── Scatter down rows to scatterDown[(t*k+slot)*H] ───────────
                 for (int b = 0; b < batch; b++)
                 {
@@ -886,6 +903,7 @@ public static unsafe partial class MoeSwiGluMlp
                         hiddenSize * sizeof(float),
                         hiddenSize * sizeof(float));
                 }
+                CpuStageProf.E(13, _p0);
             }
         }
         finally
@@ -925,6 +943,7 @@ public static unsafe partial class MoeSwiGluMlp
             case QuantizationType.IQ2_S:
             case QuantizationType.IQ3_XXS:
             case QuantizationType.IQ3_S:
+            case QuantizationType.IQ1_M:
             case QuantizationType.IQ1_S:
             case QuantizationType.Q4_K:
             case QuantizationType.Q5_K:
@@ -969,6 +988,7 @@ public static unsafe partial class MoeSwiGluMlp
             case QuantizationType.IQ2_S:
             case QuantizationType.IQ3_XXS:
             case QuantizationType.IQ3_S:
+            case QuantizationType.IQ1_M:
             case QuantizationType.IQ1_S:
             case QuantizationType.Q4_K:
             case QuantizationType.Q5_K:
@@ -981,6 +1001,9 @@ public static unsafe partial class MoeSwiGluMlp
                 }
         }
     }
+
+    /// <summary>IQ1_M routed experts use the packed x Q8_K dot (default). <c>DOTLLM_CPU_IQ1M_PACKED=0</c> falls back to dequantize-per-row (A/B baseline).</summary>
+    public static bool Iq1MPackedEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_CPU_IQ1M_PACKED") != "0";
 
     /// <summary>
     /// Diagnostic (#873): when true every quantized expert GEMM dequantizes the weights to F32 and dots them with the UNQUANTIZED F32
@@ -1002,6 +1025,12 @@ public static unsafe partial class MoeSwiGluMlp
         QuantizationType qt, nint weights, float* b, float* c,
         int m, int k, int n, byte* preQuantizedInput, ComputeThreadPool? pool)
     {
+        // A/B switch for the IQ1_M packed arm (#958): DOTLLM_CPU_IQ1M_PACKED=0 restores the generic dequant-per-row path.
+        if (qt == QuantizationType.IQ1_M && !Iq1MPackedEnabled)
+        {
+            MatMul.GemmDequantRows((byte*)weights, qt, b, c, m, k, n, pool);
+            return;
+        }
         if (DiagF32Activations && qt is not (QuantizationType.F32 or QuantizationType.F16))
         {
             MatMul.GemmDequantRows((byte*)weights, qt, b, c, m, k, n, pool);
@@ -1053,6 +1082,7 @@ public static unsafe partial class MoeSwiGluMlp
             case QuantizationType.IQ2_S:
             case QuantizationType.IQ3_XXS:
             case QuantizationType.IQ3_S:
+            case QuantizationType.IQ1_M:
             case QuantizationType.IQ1_S:
                 MatMul.GemmIQCodebook(qt, (byte*)weights, b, c, m, k, n, pool, preQuantizedInput);
                 return;
@@ -1073,6 +1103,11 @@ public static unsafe partial class MoeSwiGluMlp
                     MatMul.GemmQ6_K((byte*)weights, b, c, m, k, n, pool, preQuantizedInput);
                 else
                     MatMul.GemmQ6_K((byte*)weights, b, c, m, k, n, preQuantizedInput);
+                return;
+            case QuantizationType.MXFP4:
+                // SIMD pshufb row dot against the F32 activations (no activation quantisation, same maths as the dequant fallback),
+                // batch-invariant by construction (see GemmMxfp4). The generic dequant fallback below was ~3 s/token on MiMo-V2 (#935).
+                MatMul.GemmMxfp4((byte*)weights, b, c, m, k, n, pool);
                 return;
             default:
                 // Fallback for quant types without a direct kernel (Q4_0/Q4_1/Q5_1, IQ*, BF16).

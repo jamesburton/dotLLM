@@ -130,8 +130,8 @@ public static class VulkanModelLoader
                 return (q4, size => q4.CreateKvCache(size));
             }
 
-            case Architecture.MiMoV2:
-                throw new NotSupportedException(ModelConfig.MiMoV2UnsupportedMessage("Vulkan"));
+            // MiMo-V2 (#955) falls through to `default`: the generic VulkanTransformerModel implements zero-padded-V attention, per-layer
+            // KV heads / rope, sink attention and the IQ routed banks.
 
             case Architecture.Mamba3:
                 throw new NotSupportedException(

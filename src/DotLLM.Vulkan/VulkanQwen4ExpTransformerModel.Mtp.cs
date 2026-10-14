@@ -116,6 +116,9 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
     public bool HasMtpHead => _mtp is not null;
 
     /// <inheritdoc/>
+    public bool CanAttachMtpHead => _tier is null;
+
+    /// <inheritdoc/>
     public void AttachMtpHead(string path)
     {
         var file = GgufFile.Open(path);
@@ -133,6 +136,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
     {
         ArgumentNullException.ThrowIfNull(headFile);
         if (_mtp is not null) throw new InvalidOperationException("An MTP head is already attached.");
+        if (_tier is not null) throw new NotSupportedException("An MTP head cannot be attached while the routed experts are tiered: a verify window of 5 rows touches 31-33 experts per layer.");
         if (_spvDir is null) throw new InvalidOperationException("The model was not built by BuildFromGguf (no SPIR-V directory).");
         var tensors = headFile.TensorsByName;
         var cfg = Config with { NextnPredictLayers = 1 };
@@ -238,7 +242,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
                 enorm = VulkanQwen3MoeHybridWeights.UploadFloatArray(_device, staging, F32(headFile, tensors, n + "enorm.weight", H));
                 hnorm = VulkanQwen3MoeHybridWeights.UploadFloatArray(_device, staging, F32(headFile, tensors, n + "hnorm.weight", hcDim));
             }
-            moe = VulkanQwen3MoeMoeUpload.UploadLayer(_device, layers[0].Moe, H, residentQuant: true);
+            moe = VulkanQwen3MoeMoeUpload.UploadLayer(_device, layers[0].Moe, H, residentQuant: true, sharedPackedDefault: false);
 
             long rowBytes = (long)hcDim * 4;
             VulkanDevice.Buffer Scratch(long bytes) { var x = _device.AllocateDeviceLocal(bytes); bufs.Add(x); return x; }

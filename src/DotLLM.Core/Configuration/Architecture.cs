@@ -462,5 +462,27 @@ public enum Architecture
     /// sigmoid + selection-bias top-8 MoE with no shared expert. Trailing <c>nextn_predict_layers</c> MTP blocks are
     /// not part of the trunk. See issues #935 / #936.
     /// </summary>
-    MiMoV2
+    MiMoV2,
+
+    /// <summary>
+    /// Gemma 4 MTP drafter model (llama.cpp GGUF arch <c>gemma4-assistant</c>). A
+    /// standalone 4-layer mini-transformer (78M params for E4B, ~407M for larger
+    /// variants) that drafts speculative tokens for the <see cref="Gemma4"/> trunk
+    /// using Q-only cross-attention into the trunk's KV-cache — no K/V weights, all
+    /// layers read K/V directly from the trunk's cache (<c>shared_kv_layers = block_count</c>).
+    /// <para>
+    /// <b>Forward flow (per draft step):</b>
+    /// <c>nextn.pre_projection(concat(embed(token) * sqrt(trunk_hidden), trunk_hidden))</c>
+    /// → 4 decoder layers (Q-only GQA cross-attention into trunk KV + GeGLU FFN,
+    /// interleaved SWA/full per <c>sliding_window_pattern</c>) →
+    /// <c>output_norm</c> → trunk's LM head for logits; <c>nextn.post_projection</c>
+    /// output feeds back as the next step's hidden-state input.
+    /// </para>
+    /// <para>
+    /// Ships as a separate GGUF (<c>mtp-*.gguf</c>, ~57 MB for E4B Q4_0) beside the
+    /// trunk checkpoint. Attached via <see cref="DotLLM.Core.Models.IMtpHeadAttachable"/>
+    /// (issue #959).
+    /// </para>
+    /// </summary>
+    Gemma4Assistant
 }

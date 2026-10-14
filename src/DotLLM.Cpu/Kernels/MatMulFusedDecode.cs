@@ -92,6 +92,30 @@ public static unsafe partial class MatMul
     public static bool SupportsFusedDecode(QuantizationType qt) =>
         qt is QuantizationType.F32 or QuantizationType.F16 || GetComputeRowsFn(qt) != null;
 
+    /// <summary>
+    /// Row-kernel descriptor for a quantised projection used by the MoE n=1 decode path: the <c>ComputeRows</c> function (the same one
+    /// <see cref="FusedDecodeGemv2"/> dispatches), the weight row stride and the block count for reduction width <paramref name="k"/>.
+    /// Returns false when <paramref name="qt"/> has no fused row kernel or <paramref name="k"/> is not a whole number of blocks.
+    /// <paramref name="family"/> is the activation-quantisation family (equal families share one pre-quantised input).
+    /// </summary>
+    internal static bool TryGetDecodeRowKernel(
+        QuantizationType qt, int k,
+        out delegate*<byte*, byte*, float*, int, int, void> computeRows, out long weightRowBytes, out int blockCount, out int family)
+    {
+        computeRows = null; weightRowBytes = 0; blockCount = 0; family = 0;
+        var fam = GetQuantFamily(qt);
+        if (fam == QuantFamily.None) return false;
+        var fn = GetComputeRowsFn(qt);
+        if (fn == null) return false;
+        int group = fam == QuantFamily.KQuantFamily ? KQuantGroupSize : Q8_0GroupSize;
+        if (k <= 0 || k % group != 0) return false;
+        computeRows = fn;
+        blockCount = k / group;
+        weightRowBytes = (long)blockCount * GetWeightBlockBytes(qt);
+        family = (int)fam;
+        return true;
+    }
+
     /// <summary>Returns per-row weight block bytes for the given quant type.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int GetWeightBlockBytes(QuantizationType qt) => qt switch
@@ -480,6 +504,7 @@ public static unsafe partial class MatMul
                 case QuantizationType.IQ2_S:
                 case QuantizationType.IQ3_XXS:
                 case QuantizationType.IQ3_S:
+                case QuantizationType.IQ1_M:
                 case QuantizationType.IQ1_S:
                     GemvIQCodebook(qt, weights, input, result, m, k, pool); break;
                 case QuantizationType.Q4_K: GemvQ4_K(weights, input, result, m, k, pool); break;

@@ -13,6 +13,36 @@ Llama 3 8B, FP16, 2048 tokens:
 ```
 Scales linearly with sequence length and batch size. Dominant memory consumer in production.
 
+### Quantized KV-Cache Memory
+
+Quantizing the KV-cache to Q8_0 or Q4_0 reduces memory by 3.8-7.1x vs FP32,
+enabling long-context inference on memory-constrained systems.
+
+Effective bytes per element (including 2-byte scale per 32-element block):
+
+| Format | Bytes/element | Compression vs FP32 |
+|--------|---------------|---------------------|
+| FP32   | 4.000         | 1.0x                |
+| FP16   | 2.000         | 2.0x                |
+| Q8_0   | 1.0625        | 3.8x                |
+| Q4_0   | 0.5625        | 7.1x                |
+
+KV bytes per token (K+V, one layer, `kvStride = numKvHeads * headDim`):
+
+| Model shape       | KV heads | head_dim | FP32   | Q8_0   | Q4_0   | K8V4   |
+|--------------------|----------|----------|--------|--------|--------|--------|
+| Qwen3.5 27B Dense  | 4        | 128      | 4096 B | 1088 B | 576 B  | 832 B  |
+| Llama 3 8B/70B     | 8        | 128      | 8192 B | 2176 B | 1152 B | 1664 B |
+
+Example: Qwen3.5 27B, 64 layers, 64K context:
+- FP32: 16.4 GB
+- Q8_0: 4.4 GB (3.8x savings)
+- K8V4: 3.3 GB (5.0x savings)
+- Q4_0: 2.3 GB (7.1x savings)
+
+See `.docs/kv_quant_memory_estimates.md` for per-hardware breakdowns (hybrid
+GPU/CPU split, T5500/Framework/Strix targets).
+
 ## Simple KV-Cache (Phase 1)
 
 Pre-allocated contiguous buffer per sequence:

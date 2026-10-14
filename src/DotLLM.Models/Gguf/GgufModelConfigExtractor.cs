@@ -30,7 +30,7 @@ public static partial class GgufModelConfigExtractor
         // scalar path below — in particular `attention.head_count_kv` is a
         // per-layer Int32 ARRAY here, which the generic GetUInt32 path cannot
         // read. Build it via the dedicated extractor.
-        if (architecture is Architecture.Gemma4 or Architecture.DiffusionGemma)
+        if (architecture is Architecture.Gemma4 or Architecture.DiffusionGemma or Architecture.Gemma4Assistant)
             return BuildGemma4Config(metadata, arch, architecture);
 
         // MiMo-V2 likewise stores head_count_kv / sliding_window_pattern as per-layer arrays (global vs SWA layers differ),
@@ -1022,6 +1022,9 @@ public static partial class GgufModelConfigExtractor
             // BERT-class embedding encoders (#739).
             "bert" => Architecture.Bert,
             "nomic-bert" => Architecture.NomicBert,
+            // Gemma 4 MTP drafter (issue #959): standalone 4-layer mini-transformer
+            // that cross-attends into the trunk's KV-cache.
+            "gemma4-assistant" or "gemma4_assistant" => Architecture.Gemma4Assistant,
             _ => throw new InvalidDataException($"Unsupported GGUF architecture: '{archString}'.")
         };
     }
@@ -1333,6 +1336,9 @@ public static partial class GgufModelConfigExtractor
         // the PLE marker, which cleanly separates the two released families.
         float? partialRotaryFactor = perLayerEmbedding is null ? 0.25f : null;
 
+        // MTP draft token count (gemma4-assistant: nextn_predict_layers = 4).
+        int nextnPredictLayers = (int)metadata.GetUInt32OrDefault($"{arch}.nextn_predict_layers", 0);
+
         float? finalLogitSoftcap = null;
         float fls = metadata.GetFloat32OrDefault($"{arch}.final_logit_softcapping", 0f);
         if (fls > 0f) finalLogitSoftcap = fls;
@@ -1398,7 +1404,8 @@ public static partial class GgufModelConfigExtractor
             QueryPreAttnScalar = 1.0f,
             // Gemma 4 MoE dual-FFN graph (V-from-K, weight-less V-norm, dense+MoE
             // parallel FFN, custom router, per-expert down scale, layer_output_scale).
-            Gemma4DualFfn = true,
+            // The gemma4-assistant drafter has no MoE and no dual FFN.
+            Gemma4DualFfn = architecture is not Architecture.Gemma4Assistant,
             ActivationFunction = ActivationFunction.GELUTanh,
             NormType = NormType.RMSNorm,
             NormEpsilon = normEps,
@@ -1412,6 +1419,7 @@ public static partial class GgufModelConfigExtractor
             Moe = moe,
             PerLayerEmbedding = perLayerEmbedding,
             NumSharedKvLayers = sharedKvLayers,
+            NextnPredictLayers = nextnPredictLayers,
             ChatTemplate = chatTemplate,
             DiffusionConfig = diffusion,
         };
@@ -1422,7 +1430,7 @@ public static partial class GgufModelConfigExtractor
     /// encoding llama.cpp uses for unsigned per-layer values. Returns an empty
     /// array when the key is absent or not an array.
     /// </summary>
-    private static int[] GetIntArrayOrEmpty(GgufMetadata metadata, string key)
+    internal static int[] GetIntArrayOrEmpty(GgufMetadata metadata, string key)
     {
         if (!metadata.TryGetValue(key, out var entry) || entry.Type != GgufValueType.Array)
             return Array.Empty<int>();

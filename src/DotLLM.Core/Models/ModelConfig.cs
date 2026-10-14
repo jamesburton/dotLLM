@@ -498,7 +498,7 @@ public record ModelConfig
     /// produce wrong logits silently, so refuse. CPU is the reference backend (issue #936).
     /// </summary>
     public static string MiMoV2UnsupportedMessage(string backend)
-        => $"The MiMo-V2 architecture (GGUF 'mimo2', Xiaomi MiMo-V2 / V2.5 / V2.6-Flash) is not supported on the {backend} backend yet: "
+        => $"The MiMo-V2 architecture (GGUF 'mimo2', Xiaomi MiMo-V2 / V2.5 / V2.6-Flash) is not supported on the {backend} backend (or mode) yet - the CPU and the single-device Vulkan model run it: "
          + "its attention uses V head_dim 128 with Q/K head_dim 192 (every GPU attention kernel and KV cache here assumes one head dim), "
          + "it needs a sliding-window KV ring with learned attention sinks on the sliding layers, and its low-bit routed-expert banks "
          + "(Q2_K / IQ1_M / IQ2_*) are not kept packed by the generic MoE path. Use --device cpu. "

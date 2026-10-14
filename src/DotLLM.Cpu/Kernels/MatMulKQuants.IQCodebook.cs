@@ -30,6 +30,8 @@ internal unsafe interface IIqFormat
     /// <summary>Multiplier applied to <c>d · d8</c> on top of the integer sub-block scales.</summary>
     static abstract float Factor { get; }
     static abstract IqSubBlock Decode(byte* qk, int ib);
+    /// <summary>The block's fp32 super-scale <c>d</c>; every format but IQ1_M stores it as the leading fp16.</summary>
+    static virtual float Scale(byte* qk) => (float)Unsafe.ReadUnaligned<Half>(qk);
 }
 
 /// <summary>
@@ -224,6 +226,72 @@ public static unsafe partial class MatMul
         }
     }
 
+    /// <summary>
+    /// IQ1_M (#823 layout: <c>qs[32]@0, qh[16]@32, scales[4 x u16]@48</c>, 56 B / 256 values, NO leading d - the fp16 super-scale is the top
+    /// nibbles of the four scale words). value = dl * (grid + delta), grid in {-1,0,1} (the IQ1_S table), delta = +/-0.125 per 8-value group
+    /// (qh bit 3 / 7 of each half), dl = d * (2*s3 + 1) per 16 values. Scaled by 8 the value is <c>dl/8 * (8*grid + delta_sign)</c>, an integer
+    /// in [-9, 9] that is never 0 - so the whole thing (delta included) rides the generic PMADDUBSW(|v|, SIGN(q8, sign(v))) kernel with
+    /// <c>Factor = 1/8</c>; the 2 x 2048-entry |v| / sign tables are built once from the IQ1_S grid.
+    /// </summary>
+    internal struct Iq1MFmt : IIqFormat
+    {
+        public static int BlockBytes => QuantFormat.IQ1_MBlockBytes;
+        public static bool HasDelta => false;
+        public static float Factor => 0.125f;
+
+        private static readonly nint Mag = BuildIq1MTables(sign: false);
+        private static readonly nint Sgn = BuildIq1MTables(sign: true);
+
+        /// <summary>[delta sign 0 = +, 1 = -][2048] of 8 bytes.</summary>
+        private static nint BuildIq1MTables(bool sign)
+        {
+            ulong* t = (ulong*)NativeMemory.AlignedAlloc((nuint)(2 * 2048 * 8), 64);
+            ulong* grid = (ulong*)IqGridIq1S;
+            for (int neg = 0; neg < 2; neg++)
+                for (int i = 0; i < 2048; i++)
+                {
+                    ulong e = grid[i], o = 0;
+                    for (int j = 0; j < 8; j++)
+                    {
+                        int g = (sbyte)((e >> (8 * j)) & 0xFF);
+                        int v = 8 * g + (neg == 0 ? 1 : -1);
+                        ulong b = sign ? (v > 0 ? 0x01UL : 0xFFUL) : (ulong)Math.Abs(v);
+                        o |= b << (8 * j);
+                    }
+                    t[neg * 2048 + i] = o;
+                }
+            return (nint)t;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float Scale(byte* qk)
+        {
+            ushort* sc = (ushort*)(qk + 48);
+            ushort bits = (ushort)((sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
+            return (float)BitConverter.UInt16BitsToHalf(bits);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static IqSubBlock Decode(byte* qk, int ib)
+        {
+            byte* qs = qk + ib * 4;
+            int qh0 = qk[32 + ib * 2], qh1 = qk[32 + ib * 2 + 1];
+            int word = Unsafe.ReadUnaligned<ushort>(qk + 48 + 2 * (ib >> 1));
+            int shift = 6 * (ib & 1);
+            ulong* mag = (ulong*)Mag, sgn = (ulong*)Sgn;
+            int i0 = qs[0] | ((qh0 << 8) & 0x700) | ((qh0 & 0x08) << 8);   // bit 3 -> table bit 11 (negative delta)
+            int i1 = qs[1] | ((qh0 << 4) & 0x700) | ((qh0 & 0x80) << 4);   // bit 7 -> table bit 11
+            int i2 = qs[2] | ((qh1 << 8) & 0x700) | ((qh1 & 0x08) << 8);
+            int i3 = qs[3] | ((qh1 << 4) & 0x700) | ((qh1 & 0x80) << 4);
+            IqSubBlock b = default;
+            b.G0 = mag[i0]; b.S0 = sgn[i0]; b.G1 = mag[i1]; b.S1 = sgn[i1];
+            b.G2 = mag[i2]; b.S2 = sgn[i2]; b.G3 = mag[i3]; b.S3 = sgn[i3];
+            b.ScLo = 2 * ((word >> shift) & 7) + 1;
+            b.ScHi = 2 * ((word >> (shift + 3)) & 7) + 1;
+            return b;
+        }
+    }
+
     // ──────────────────── Generic dots ────────────────────
 
     /// <summary>Scalar tier (no SSSE3): sums <c>grid · sign · q8</c> per half.</summary>
@@ -233,7 +301,7 @@ public static unsafe partial class MatMul
         float sumf = 0;
         for (int sb = 0; sb < superBlockCount; sb++)
         {
-            float f = (float)Unsafe.ReadUnaligned<Half>(qk) * Unsafe.ReadUnaligned<float>(q8k) * T.Factor;
+            float f = T.Scale(qk) * Unsafe.ReadUnaligned<float>(q8k) * T.Factor;
             sbyte* q8 = (sbyte*)(q8k + 4);
             short* bsums = (short*)(q8k + 260);
             int sumi = 0, deltaAcc = 0;
@@ -267,7 +335,7 @@ public static unsafe partial class MatMul
         float deltaF = 0;
         for (int sb = 0; sb < superBlockCount; sb++)
         {
-            float f = (float)Unsafe.ReadUnaligned<Half>(qk) * Unsafe.ReadUnaligned<float>(q8k) * T.Factor;
+            float f = T.Scale(qk) * Unsafe.ReadUnaligned<float>(q8k) * T.Factor;
             sbyte* q8 = (sbyte*)(q8k + 4);
             short* bsums = (short*)(q8k + 260);
             Vector128<int> sumi = Vector128<int>.Zero;
@@ -303,7 +371,7 @@ public static unsafe partial class MatMul
         float deltaF = 0;
         for (int sb = 0; sb < superBlockCount; sb++)
         {
-            float f = (float)Unsafe.ReadUnaligned<Half>(qk) * Unsafe.ReadUnaligned<float>(q8k) * T.Factor;
+            float f = T.Scale(qk) * Unsafe.ReadUnaligned<float>(q8k) * T.Factor;
             sbyte* q8 = (sbyte*)(q8k + 4);
             short* bsums = (short*)(q8k + 260);
             Vector256<int> sumi = Vector256<int>.Zero;
@@ -338,7 +406,7 @@ public static unsafe partial class MatMul
         byte* x0 = q8k, x1 = q8k + q8RowBytes, x2 = q8k + 2L * q8RowBytes, x3 = q8k + 3L * q8RowBytes;
         for (int sb = 0; sb < superBlockCount; sb++)
         {
-            float d = (float)Unsafe.ReadUnaligned<Half>(qk) * T.Factor;
+            float d = T.Scale(qk) * T.Factor;
             Vector256<int> s0 = Vector256<int>.Zero, s1 = s0, s2 = s0, s3 = s0;
             int da0 = 0, da1 = 0, da2 = 0, da3 = 0;
             for (int ib = 0; ib < 8; ib++)
@@ -517,7 +585,7 @@ public static unsafe partial class MatMul
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool IsCodebookIq(QuantizationType qt) =>
         qt is QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS or QuantizationType.IQ2_S
-            or QuantizationType.IQ3_XXS or QuantizationType.IQ3_S or QuantizationType.IQ1_S;
+            or QuantizationType.IQ3_XXS or QuantizationType.IQ3_S or QuantizationType.IQ1_S or QuantizationType.IQ1_M;
 
     /// <summary>Block bytes for a codebook IQ format.</summary>
     internal static int IqCodebookBlockBytes(QuantizationType qt) => QuantFormat.TryGetInfo(qt)!.Value.BlockBytes;
@@ -531,6 +599,7 @@ public static unsafe partial class MatMul
         QuantizationType.IQ3_XXS => &ComputeRowsIq<Iq3XxsFmt>,
         QuantizationType.IQ3_S => &ComputeRowsIq<Iq3SFmt>,
         QuantizationType.IQ1_S => &ComputeRowsIq<Iq1SFmt>,
+        QuantizationType.IQ1_M => &ComputeRowsIq<Iq1MFmt>,
         _ => null,
     };
 
@@ -546,6 +615,7 @@ public static unsafe partial class MatMul
             case QuantizationType.IQ3_XXS: GemvIq<Iq3XxsFmt>(weights, x, result, m, k, pool); break;
             case QuantizationType.IQ3_S: GemvIq<Iq3SFmt>(weights, x, result, m, k, pool); break;
             case QuantizationType.IQ1_S: GemvIq<Iq1SFmt>(weights, x, result, m, k, pool); break;
+            case QuantizationType.IQ1_M: GemvIq<Iq1MFmt>(weights, x, result, m, k, pool); break;
             default: throw new NotSupportedException($"{qt} is not a codebook IQ format.");
         }
     }
@@ -562,6 +632,7 @@ public static unsafe partial class MatMul
             case QuantizationType.IQ3_XXS: GemmIq<Iq3XxsFmt>(weights, b, c, m, k, n, pool, preQuantizedInput); break;
             case QuantizationType.IQ3_S: GemmIq<Iq3SFmt>(weights, b, c, m, k, n, pool, preQuantizedInput); break;
             case QuantizationType.IQ1_S: GemmIq<Iq1SFmt>(weights, b, c, m, k, n, pool, preQuantizedInput); break;
+            case QuantizationType.IQ1_M: GemmIq<Iq1MFmt>(weights, b, c, m, k, n, pool, preQuantizedInput); break;
             default: throw new NotSupportedException($"{qt} is not a codebook IQ format.");
         }
     }

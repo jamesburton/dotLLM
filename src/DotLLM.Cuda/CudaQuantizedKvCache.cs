@@ -192,11 +192,16 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache
 
         if (_windowSize > 0)
         {
-            // Per-layer eviction: each layer independently tracks how far it has evicted.
             int prevQuantLen = _layerQuantizedLength[layerIndex];
             int newQuantLen = Math.Max(0, newLength - _windowSize);
 
-            for (int evictPos = prevQuantLen; evictPos < newQuantLen; evictPos++)
+            // Phase 1: evict ring slots from PREVIOUS calls (safe to read).
+            int minNewPos = positions[0];
+            for (int i = 1; i < seqLen; i++)
+                if (positions[i] < minNewPos) minNewPos = positions[i];
+            int safeEvictEnd = Math.Min(newQuantLen, minNewPos);
+
+            for (int evictPos = prevQuantLen; evictPos < safeEvictEnd; evictPos++)
             {
                 int ringIdx = evictPos % _windowSize;
 
@@ -209,20 +214,40 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache
                 kernels.LaunchQuantKv(evictedV, quantDstV, stride, ValueDType, stream);
             }
 
-            _layerQuantizedLength[layerIndex] = newQuantLen;
-
-            // Write new FP16 data into window ring buffer (position-addressed, idempotent).
+            // Phase 2: current-batch positions that will be evicted immediately —
+            // quantize directly from source, skip the ring.
             for (int i = 0; i < seqLen; i++)
             {
                 int pos = positions[i];
-                int ringIdx = pos % _windowSize;
-                nint kDst = _keysWindow![layerIndex] + (nint)(ringIdx * fp16RowBytes);
-                nint vDst = _valuesWindow![layerIndex] + (nint)(ringIdx * fp16RowBytes);
-                nint kSrc = keysDevice + (nint)(i * fp16RowBytes);
-                nint vSrc = valuesDevice + (nint)(i * fp16RowBytes);
+                if (pos < newQuantLen)
+                {
+                    nint kSrc = keysDevice + (nint)(i * fp16RowBytes);
+                    nint vSrc = valuesDevice + (nint)(i * fp16RowBytes);
+                    nint kDst = _keysQuant[layerIndex] + (nint)((long)pos * _keyQuantRowBytes[layerIndex]);
+                    nint vDst = _valuesQuant[layerIndex] + (nint)((long)pos * _valueQuantRowBytes[layerIndex]);
 
-                CudaDriverApi.cuMemcpyDtoDAsync_v2(kDst, kSrc, (nuint)fp16RowBytes, stream).ThrowOnError();
-                CudaDriverApi.cuMemcpyDtoDAsync_v2(vDst, vSrc, (nuint)fp16RowBytes, stream).ThrowOnError();
+                    kernels.LaunchQuantKv(kSrc, kDst, stride, KeyDType, stream);
+                    kernels.LaunchQuantKv(vSrc, vDst, stride, ValueDType, stream);
+                }
+            }
+
+            _layerQuantizedLength[layerIndex] = newQuantLen;
+
+            // Phase 3: positions that stay in the window — write FP16 into the ring.
+            for (int i = 0; i < seqLen; i++)
+            {
+                int pos = positions[i];
+                if (pos >= newQuantLen)
+                {
+                    int ringIdx = pos % _windowSize;
+                    nint kDst = _keysWindow![layerIndex] + (nint)(ringIdx * fp16RowBytes);
+                    nint vDst = _valuesWindow![layerIndex] + (nint)(ringIdx * fp16RowBytes);
+                    nint kSrc = keysDevice + (nint)(i * fp16RowBytes);
+                    nint vSrc = valuesDevice + (nint)(i * fp16RowBytes);
+
+                    CudaDriverApi.cuMemcpyDtoDAsync_v2(kDst, kSrc, (nuint)fp16RowBytes, stream).ThrowOnError();
+                    CudaDriverApi.cuMemcpyDtoDAsync_v2(vDst, vSrc, (nuint)fp16RowBytes, stream).ThrowOnError();
+                }
             }
 
             _quantizedLength = newQuantLen;

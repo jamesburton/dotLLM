@@ -1,0 +1,116 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// MoE INDEXED IQ1_M MMVQ decode GEMV, V2 (issue #991; V1 = issue #823): integer-dot (dp4a) matrix-vector multiply over a packed IQ1_M expert bank.
+//
+//   y[n, m] = sum_k dequant_iq1_m(bank[indices[n], m, k]) * x[n, k]
+//
+// IQ1_M super-block (56 bytes / 256 elements, word aligned): qs[32] @0, qh[16] @32, scales[4 x uint16] @48. The fp16 super-scale is spread over the
+// TOP NIBBLES of the four scale words (d bits = sc0>>12 | (sc1>>8)&0xF0 | (sc2>>4)&0xF00 | sc3&0xF000). Sub-block ib (32 elements) = 4 groups of 8:
+// group l: grid index = qs[4ib+l] | ((l even ? qh[2ib+l/2] << 8 : qh[2ib+l/2] << 4) & 0x700) into the 2048-entry iq1s ternary grid, delta sign = qh bit 3 (l even)
+// / bit 7 (l odd), dl = d * (2*s + 1) with s = 3-bit field (sc[ib/2] >> (6*(ib%2) + 3*(l/2))) & 7. As in IQ1_S:
+//   sum_j w_j x_j = dl * ( dp4a(grid, xq) + delta * dp4a(1, xq) ) * d_x
+// V2 layout: one wave32 per output cell (n, m); lane L owns sub-block ib = L%8 (all four 8-element groups) of block bq = L/8 of a 4-block step, so the
+// wave issues ~5x fewer load instructions per weight byte than V1 (lane = (sub-block, group), ~9 loads per block per lane: issue/latency bound at
+// ~110 GB/s on gfx1151; V2 ~170 GB/s). The activation of the lane's sub-blocks is loaded once per 16-block chunk. Same integer math; the float
+// accumulation order differs from V1 (per-lane sum over steps and groups, then one subgroupAdd).
+// NOT bit-exact (x is int8-quantized). Dispatch: 2D grid - x = m, y = n. Bindings: 0 bank, 1 xq, 2 xds, 3 indices, 4 y, 5 iq1s grid.
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufBank { uint  bank[]; };      // IQ1_M blob [numExperts, M, K/256 x 56 B]
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq   { uint  xq[]; };        // [xRows * K/4]
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds  { vec2  xds[]; };       // [xRows * K/32]
+layout(set = 0, binding = 3, std430) readonly  buffer BufIdx  { int   indices[]; };   // [N]
+layout(set = 0, binding = 4, std430) writeonly buffer BufY    { float y[]; };         // [N * M]
+layout(set = 0, binding = 5, std430) readonly  buffer BufGrid { uint  iq1sGrid[]; };  // 2048 entries x 8 int8 (2 uints each)
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+    uint numExperts;
+    uint blocksPerRow;  // K / 256
+    uint xDiv;          // activation row = n / xDiv (1 = per-row input; topK = one row broadcast to its topK expert slots)
+} pc;
+
+const uint IQ1_M_BLOCK_BYTES = 56u;
+const float IQ1S_DELTA = 0.125;
+
+uint readByte(uint absByteOff) {
+    return (bank[absByteOff >> 2u] >> ((absByteOff & 3u) * 8u)) & 0xFFu;
+}
+
+const uint R = 1u;   // rows per workgroup (one wave32)
+
+void main() {
+    uint mBase = gl_WorkGroupID.x * R;
+    uint n = gl_WorkGroupID.y;
+    if (mBase >= pc.M || n >= pc.N) return;
+    uint expert = uint(indices[n]);
+    if (expert >= pc.numExperts) return;
+
+    uint lane = gl_LocalInvocationID.x;
+    uint bq = lane >> 3u;                 // block within a 4-block step
+    uint ib = lane & 7u;                  // sub-block 0..7 (4 groups of 8 elements)
+    uint xRow       = n / pc.xDiv;
+    uint xqRowBase  = xRow * (pc.K >> 2u);
+    uint xdsRowBase = xRow * (pc.K >> 5u);
+
+    float acc[R];
+    [[unroll]] for (uint r = 0u; r < R; r++) acc[r] = 0.0;
+
+    for (uint chunk = 0u; chunk < pc.blocksPerRow; chunk += 16u) {
+        // Activation of this lane's sub-block for each of the 4 steps (shared by all R rows).
+        uint xv[4][8];
+        float xd[4];
+        [[unroll]] for (uint s = 0u; s < 4u; s++) {
+            uint blk = min(chunk + s * 4u + bq, pc.blocksPerRow - 1u);
+            uint xqi = xqRowBase + blk * 64u + ib * 8u;
+            [[unroll]] for (uint j = 0u; j < 8u; j++) xv[s][j] = xq[xqi + j];
+            xd[s] = xds[xdsRowBase + blk * 8u + ib].x;
+        }
+        [[unroll]] for (uint r = 0u; r < R; r++) {
+            uint m = min(mBase + r, pc.M - 1u);
+            uint rowByteBase = (expert * pc.M + m) * pc.blocksPerRow * IQ1_M_BLOCK_BYTES;
+            [[unroll]] for (uint s = 0u; s < 4u; s++) {
+                uint blkRaw = chunk + s * 4u + bq;
+                if (blkRaw >= pc.blocksPerRow) continue;
+                uint base = rowByteBase + blkRaw * IQ1_M_BLOCK_BYTES;
+                uint sw0 = bank[(base + 48u) >> 2u];
+                uint sw1 = bank[((base + 48u) >> 2u) + 1u];
+                uint qsw = bank[(base + ib * 4u) >> 2u];
+                uint qhw = bank[(base + 32u + (ib >> 1u) * 4u) >> 2u];
+                uint qh16 = (qhw >> (16u * (ib & 1u))) & 0xFFFFu;
+                uint sc0 = sw0 & 0xFFFFu, sc1 = sw0 >> 16u, sc2 = sw1 & 0xFFFFu, sc3 = sw1 >> 16u;
+                uint dBits = (sc0 >> 12u) | ((sc1 >> 8u) & 0x00F0u) | ((sc2 >> 4u) & 0x0F00u) | (sc3 & 0xF000u);
+                float d = unpackHalf2x16(dBits).x;
+                uint scWord = ((ib >> 1u) == 0u) ? sc0 : ((ib >> 1u) == 1u) ? sc1 : ((ib >> 1u) == 2u) ? sc2 : sc3;
+                float part = 0.0;
+                [[unroll]] for (uint l = 0u; l < 4u; l++) {
+                    uint qhByte = (l < 2u) ? (qh16 & 0xFFu) : (qh16 >> 8u);
+                    uint idx = ((qsw >> (8u * l)) & 0xFFu) | ((((l & 1u) == 0u) ? (qhByte << 8u) : (qhByte << 4u)) & 0x700u);
+                    float delta = ((((l & 1u) == 0u) ? (qhByte & 0x08u) : (qhByte & 0x80u)) != 0u) ? -IQ1S_DELTA : IQ1S_DELTA;
+                    uint sub = (scWord >> (6u * (ib & 1u) + 3u * (l >> 1u))) & 7u;
+                    float dl = d * float(2u * sub + 1u);
+                    uint gridLo = iq1sGrid[2u * idx];
+                    uint gridHi = iq1sGrid[2u * idx + 1u];
+                    int dotGrid = dotPacked4x8AccSatEXT(int(gridLo), int(xv[s][2u * l]), 0);
+                    dotGrid = dotPacked4x8AccSatEXT(int(gridHi), int(xv[s][2u * l + 1u]), dotGrid);
+                    int sumXq = dotPacked4x8AccSatEXT(0x01010101, int(xv[s][2u * l]), 0);
+                    sumXq = dotPacked4x8AccSatEXT(0x01010101, int(xv[s][2u * l + 1u]), sumXq);
+                    part += dl * (float(dotGrid) + delta * float(sumXq));
+                }
+                acc[r] += xd[s] * part;
+            }
+        }
+    }
+
+    [[unroll]] for (uint r = 0u; r < R; r++) {
+        float total = subgroupAdd(acc[r]);
+        if (subgroupElect() && mBase + r < pc.M)
+            y[n * pc.M + mBase + r] = total;
+    }
+}
