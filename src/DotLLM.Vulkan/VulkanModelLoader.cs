@@ -102,6 +102,13 @@ public static class VulkanModelLoader
                 return (moe, size => moe.CreateKvCache(size));
             }
 
+            case Architecture.Lfm2Moe:
+            {
+                // LFM2.5-24B-A2B (#1015): gated short-conv + GQA hybrid, dense-then-MoE FFN; Q4_0 weights are served as exact Q8_0.
+                var lfm = VulkanLfm2MoeTransformerModel.BuildFromGguf(device, gguf, config, spvDir);
+                return (lfm, size => lfm.CreateKvCache(size));
+            }
+
             case Architecture.NemotronH:
             case Architecture.NemotronHMoe:   // #402: routed layers are detected per layer by the router tensor
             {

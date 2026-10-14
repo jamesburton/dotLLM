@@ -183,6 +183,14 @@ internal static class VulkanQwen3MoeMoeUpload
         /// <inheritdoc cref="SharedGateQ8"/>
         public VulkanDevice.Buffer? SharedUpQ8 { get; init; }
 
+        /// <summary>Sigmoid (DeepSeek-V3 / GLM / MiMo / LFM2-MoE) routing: top-k picked on sigmoid(logit) + <see cref="SelectionBias"/>, weights are the
+        /// UNBIASED sigmoids of the picked experts (renormalised when <see cref="NormTopKProb"/>), then times <see cref="WeightsScale"/> (#1015).</summary>
+        public bool SigmoidGating { get; init; }
+        /// <summary>Per-expert selection bias (<c>exp_probs_b</c>); non-null iff <see cref="SigmoidGating"/> and the source carries one.</summary>
+        public VulkanDevice.Buffer? SelectionBias { get; init; }
+        /// <summary>Scale applied to the final top-k weights (<c>expert_weights_scale</c>).</summary>
+        public float WeightsScale { get; init; } = 1.0f;
+
         public LayerBundle(
             VulkanDevice.Buffer gate, VulkanDevice.Buffer w1Bank, VulkanDevice.Buffer w2Bank, VulkanDevice.Buffer w3Bank,
             QuantizationType w1QuantType, QuantizationType w2QuantType, QuantizationType w3QuantType,
@@ -211,6 +219,7 @@ internal static class VulkanQwen3MoeMoeUpload
             if (!ReferenceEquals(SharedGateQ8, SharedGate)) SharedGateQ8?.Dispose();
             if (!ReferenceEquals(SharedUpQ8, SharedUp)) SharedUpQ8?.Dispose();
             SharedExpertGate?.Dispose();
+            SelectionBias?.Dispose();
         }
     }
 
@@ -409,6 +418,9 @@ internal static class VulkanQwen3MoeMoeUpload
             SlotCount = expertSlots,
             SharedGateQ8 = sharedGateQ8,
             SharedUpQ8 = sharedUpQ8,
+            SigmoidGating = moe.SigmoidGating,
+            SelectionBias = moe.SigmoidGating && moe.SelectionBias is not null ? UploadFloatArray(device, staging, moe.SelectionBias) : null,
+            WeightsScale = moe.WeightsScale,
         };
     }
 

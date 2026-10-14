@@ -466,6 +466,7 @@ public static unsafe partial class MoeSwiGluMlp
     /// <param name="loraLayer">Layer index used to resolve adapter weights.</param>
     /// <param name="threadPool">Optional thread pool — when non-null the outer per-expert loop is parallelised.</param>
     /// <param name="useGeGLU">When <c>true</c>, experts apply GeGLU (tanh-approx GELU) instead of SwiGLU. Gemma 4 MoE.</param>
+    /// <param name="packedLegacyExperts">When <c>true</c>, Q4_0/Q4_1/Q5_1/IQ4_NL expert banks use the packed x Q8_1 dot instead of the dequantise-to-F32 fallback (batch-invariant: per-column activation quantisation). Opt-in per model (LFM2-MoE, #1015).</param>
     [SkipLocalsInit]
     public static void ExecuteRoutedFromAssignments(
         ReadOnlySpan<float> hidden,
@@ -481,7 +482,8 @@ public static unsafe partial class MoeSwiGluMlp
         int sharedIntermediateSize, ReadOnlySpan<float> sharedExpertGate,
         ILoraAdapter? loraAdapter, int loraLayer,
         ComputeThreadPool? threadPool = null,
-        bool useGeGLU = false)
+        bool useGeGLU = false,
+        bool packedLegacyExperts = false)
     {
         if (hidden.Length < (long)seqLen * hiddenSize)
             throw new ArgumentException("hidden too small", nameof(hidden));
@@ -552,6 +554,7 @@ public static unsafe partial class MoeSwiGluMlp
                     IntermediateSize = intermediateSize,
                     NumExpertsPerTok = numExpertsPerTok,
                     UseGeGLU = useGeGLU,
+                    PackedLegacy = packedLegacyExperts,
                 };
 
                 if (seqLen == 1 && threadPool is not null && loraAdapter is null
@@ -749,6 +752,7 @@ public static unsafe partial class MoeSwiGluMlp
         public int NumExpertsPerTok;
         /// <summary>When true, experts apply GeGLU (tanh-approx GELU) instead of SwiGLU.</summary>
         public bool UseGeGLU;
+        public bool PackedLegacy;
     }
 
     /// <summary>
@@ -848,13 +852,13 @@ public static unsafe partial class MoeSwiGluMlp
                 DispatchGemm(
                     ctx.GateExpsQt, gatePtr, batchInPtr, gateBatchPtr,
                     intermediateSize, hiddenSize, batch,
-                    preQuantGateUp, threadPool);
+                    preQuantGateUp, threadPool, ctx.PackedLegacy);
 
                 // ── up = batchIn × W3 (up_proj) ───────────────────────────────
                 DispatchGemm(
                     ctx.UpExpsQt, upPtr, batchInPtr, upBatchPtr,
                     intermediateSize, hiddenSize, batch,
-                    preQuantGateUp, threadPool);
+                    preQuantGateUp, threadPool, ctx.PackedLegacy);
 
                 ApplyLoraDelta(loraAdapter, loraLayer, ExpertProjectionName(e, "gate_proj"),
                     batchInPtr, gateBatchPtr, batch, hiddenSize, intermediateSize);
@@ -886,7 +890,7 @@ public static unsafe partial class MoeSwiGluMlp
                 DispatchGemm(
                     ctx.DownExpsQt, downPtr, siluBatchPtr, downBatchPtr,
                     hiddenSize, intermediateSize, batch,
-                    preQuantizedInput: null, threadPool);
+                    preQuantizedInput: null, threadPool, ctx.PackedLegacy);
 
                 ApplyLoraDelta(loraAdapter, loraLayer, ExpertProjectionName(e, "down_proj"),
                     siluBatchPtr, downBatchPtr, batch, intermediateSize, hiddenSize);
@@ -1023,7 +1027,7 @@ public static unsafe partial class MoeSwiGluMlp
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void DispatchGemm(
         QuantizationType qt, nint weights, float* b, float* c,
-        int m, int k, int n, byte* preQuantizedInput, ComputeThreadPool? pool)
+        int m, int k, int n, byte* preQuantizedInput, ComputeThreadPool? pool, bool packedLegacy = false)
     {
         // A/B switch for the IQ1_M packed arm (#958): DOTLLM_CPU_IQ1M_PACKED=0 restores the generic dequant-per-row path.
         if (qt == QuantizationType.IQ1_M && !Iq1MPackedEnabled)
@@ -1034,6 +1038,15 @@ public static unsafe partial class MoeSwiGluMlp
         if (DiagF32Activations && qt is not (QuantizationType.F32 or QuantizationType.F16))
         {
             MatMul.GemmDequantRows((byte*)weights, qt, b, c, m, k, n, pool);
+            return;
+        }
+        // #1015: Q4_0 / Q4_1 / Q5_1 / IQ4_NL expert banks: packed x Q8_1 dot (llama.cpp quantises the activations to Q8 for these
+        // banks too; the dequantise-to-F32 fallback below is ~10x slower and numerically differs from the reference).
+        if (packedLegacy && qt is QuantizationType.Q4_0 or QuantizationType.Q4_1 or QuantizationType.Q5_1 or QuantizationType.IQ4_NL)
+        {
+            // The kernel quantises the activations to Q8_1 itself: the pre-quant staging buffer is Q8_0/Q8_K-shaped and has
+            // no Q4_0/Q4_1/Q5_1/IQ4_NL entry (ComputePrequantBytes returns 0), so a caller-supplied buffer must not be consumed.
+            MatMul.GemmLegacyQuant((byte*)weights, qt, b, c, m, k, n, pool, null);
             return;
         }
         switch (qt)

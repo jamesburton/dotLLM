@@ -53,6 +53,10 @@ public static class ToolCallParserFactory
             // variable). When the template has only the Pythonic branch
             // wired we route to the Pythonic parser; the XML branch shares
             // the Hermes-compatible <tool_call> envelope with everyone else.
+            // Liquid AI LFM2 / LFM2.5: `<|tool_call_start|>[fn(arg='x')]<|tool_call_end|>` (Pythonic calls in a list).
+            if (chatTemplate.Contains("<|tool_call_start|>", StringComparison.Ordinal))
+                return new PythonicToolCallParser();
+
             if (chatTemplate.Contains("python_tools", StringComparison.Ordinal)
                 && !chatTemplate.Contains("xml_tools", StringComparison.Ordinal))
                 return new PythonicToolCallParser();
@@ -77,6 +81,7 @@ public static class ToolCallParserFactory
             // Qwen3.5+ hybrids speak the Qwen3-Coder XML form; the parser also accepts Hermes JSON.
             Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense => new QwenXmlToolCallParser(),
             Architecture.Gemma4 => new Gemma4ToolCallParser(),
+            Architecture.Lfm2Moe => new PythonicToolCallParser(),
             Architecture.Granite or Architecture.GraniteMoe => new GraniteToolCallParser(),
             Architecture.GptOss => new HarmonyToolCallParser(),
             // SmolLM3 defaults to the XML (Hermes-compatible) format; the

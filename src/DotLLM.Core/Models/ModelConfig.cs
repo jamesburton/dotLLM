@@ -174,6 +174,12 @@ public record ModelConfig
     public HybridLayerLayout? HybridLayout { get; init; }
 
     /// <summary>
+    /// LFM2 short-convolution kernel length (<c>{arch}.shortconv.l_cache</c>, 3 for LFM2.5); the recurrent state holds the
+    /// last <c>L_cache - 1</c> projected inputs per channel. 0 for architectures without short-conv layers.
+    /// </summary>
+    public int ShortConvCacheLength { get; init; }
+
+    /// <summary>
     /// Mamba2 SSM configuration shared by all SSM layers in a hybrid model.
     /// Null when the model has no SSM layers.
     /// </summary>

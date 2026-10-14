@@ -20,7 +20,10 @@ public enum HybridLayerKind
     /// Gated DeltaNet recurrence layer (Qwen3MoeHybrid). Carries a full
     /// <c>[n_head, d_k, d_v]</c> matrix state updated via the delta rule.
     /// </summary>
-    GatedDeltaNet
+    GatedDeltaNet,
+
+    /// <summary>LFM2 gated short-convolution token mixer (recurrent state = last L_cache-1 inputs per channel).</summary>
+    ShortConv
 }
 
 /// <summary>

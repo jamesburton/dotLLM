@@ -25,7 +25,7 @@ public sealed class TransformerArchitecture : IModelArchitecture
     /// <inheritdoc/>
     public IReadOnlyList<Architecture> SupportedArchitectures { get; } =
         [Architecture.Llama, Architecture.Mistral, Architecture.Phi, Architecture.Qwen,
-         Architecture.NemotronH, Architecture.NemotronHMoe, Architecture.Qwen3MoeHybrid,
+         Architecture.NemotronH, Architecture.NemotronHMoe, Architecture.Qwen3MoeHybrid, Architecture.Lfm2Moe,
          Architecture.DeepSeekV2, Architecture.DeepSeekV3,
          // Gemma 3 / Gemma 4 MoE / DiffusionGemma all ride the standard
          // TransformerModel forward path (four RMSNorms, GeGLU, (1+w) norm,
@@ -50,6 +50,9 @@ public sealed class TransformerArchitecture : IModelArchitecture
 
         if (config.Architecture is Architecture.Qwen3MoeHybrid)
             return Qwen3MoeHybridTransformerModel.LoadFromGguf(_gguf, config);
+
+        if (config.Architecture is Architecture.Lfm2Moe)
+            return Lfm2MoeTransformerModel.LoadFromGguf(_gguf, config);
 
         if (config.Architecture is not (Architecture.Llama or Architecture.Mistral
                                     or Architecture.Phi or Architecture.Qwen

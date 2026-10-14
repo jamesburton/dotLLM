@@ -311,10 +311,17 @@ public static class ServerStartup
             // paged/quantized KV, no cross-request prefix reuse yet).
             if (options.UsePaged)
                 Console.WriteLine("[dotllm] Paged KV-cache not supported on Vulkan; using the model's own KV-cache.");
-            if (kvConfig.IsQuantized)
-                Console.WriteLine($"[dotllm] WARNING: --cache-type-k/-v (K:{kvConfig.KeyDType} V:{kvConfig.ValueDType}) is ignored: the Vulkan backend has no quantized KV storage (model {config.Architecture}).");
-            var vkFactory = vulkanKvFactory;
-            kvFactory = (cfg, size) => vkFactory(size);
+            if (kvConfig.IsQuantized && model is DotLLM.Vulkan.VulkanTransformerModel vkModel)
+            {
+                string spvDir = DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir();
+                kvFactory = (cfg, size) => vkModel.CreateQuantizedKvCache(
+                    spvDir, size, kvConfig.KeyDType, kvConfig.ValueDType);
+            }
+            else
+            {
+                var vkFactory = vulkanKvFactory;
+                kvFactory = (cfg, size) => vkFactory(size);
+            }
         }
         else if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
         {

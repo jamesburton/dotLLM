@@ -6,7 +6,7 @@ Comprehensive record describing any transformer variant. Populated from GGUF met
 
 ```
 ModelConfig:
-  Architecture          Llama | Mistral | Phi | Qwen | DeepSeekV2 | DeepSeekV3 | NemotronH | Mamba3 | Mixtral | QwenMoe | GraniteMoe
+  Architecture          Llama | Mistral | Phi | Qwen | DeepSeekV2 | DeepSeekV3 | NemotronH | Lfm2Moe | Mamba3 | Mixtral | QwenMoe | GraniteMoe
   VocabSize             int
   HiddenSize            int
   IntermediateSize      int       (FFN intermediate dim)
@@ -219,6 +219,25 @@ Differences between architectures are captured entirely in ModelConfig.
   round-trip; table registered host-only so no upload/import/staging path can take it); model-owned single sequence state (#817); no MTP;
   Q5_1 / Q8_0 / IQ expert banks are widened to F32 (no resident kernel yet), which the pre-load gate (`Qwen4ExpResidencyPlan`, refuses over
   `ResidentCapacityBytes - headroom`, `DOTLLM_VK_ALLOW_OVERCOMMIT=1` overrides) accounts for.
+
+### LFM2.5-24B-A2B (`lfm2moe`, Liquid AI, #1015)
+
+- **Layer algebra** (`Architecture.Lfm2Moe`, CPU `Lfm2MoeTransformerModel`, Vulkan `VulkanLfm2MoeTransformerModel`): every layer is two residual sub-layers,
+  `x += mixer(operator_norm(x)); x += ffn(ffn_norm(x))`. The mixer is a **gated short convolution** on 30 layers
+  (`in_proj -> [B | C | X]; y = out_proj(C * causal_depthwise_conv_k3(B * X))`, no bias, no activation; state = the last `L_cache-1 = 2` rows of `B*X` per
+  channel, `ModelConfig.ShortConvCacheLength`) or **GQA with per-head QK RMS-norm and NeoX RoPE** on 10 layers (indices 2, 6, ..., 38; the layout comes
+  from the per-layer `head_count_kv` array, 0 = conv: `HybridLayerKind.ShortConv` / `Attention`). The FFN is a dense SwiGLU (`feed_forward_length` 11776)
+  for the first `leading_dense_block_count` = 2 layers, then 64-expert top-4 SwiGLU MoE with **sigmoid gating + `exp_probs_b` selection bias**
+  (top-k on `sigmoid + bias`, weights = the unbiased sigmoids, renormalised: llama.cpp `lfm2moe.cpp` hard-codes `norm_w = true`), no shared expert.
+  The final norm is `token_embd_norm.weight` and the head is tied to `token_embd`.
+- **State**: `Lfm2ConvStateCache` / `VulkanLfm2ConvStateCache` are `ISsmState`s (per sequence through `CreateSequenceState` / `ForwardBatch`); attention layers
+  use the sparse hybrid KV cache (slots only for the 10 attention layers). No recurrent checkpoint/rollback yet (so no speculative draft/verify).
+- **Quantisation**: the QAD-Q4_0 file is Q4_0 + a Q6_K tied head. CPU routes Q4_0 expert banks through the packed x Q8_1 dot (opt-in
+  `packedLegacyExperts`, batch-invariant). Vulkan has no Q4_0 kernels: the loader transcodes Q4_0 -> Q8_0 exactly (same f16 scale, `q8 = nibble - 8`) and
+  uses the Q8_0 dense, MMVQ and grouped-coopmat paths (25.4 GB resident); native Q4_0 kernels are the follow-up. Router dump: `DOTLLM_TENSOR_DUMP_DIR`.
+- **Chat / tools**: always-thinking ChatML (`...assistant
+<think>`), Pythonic tool calls `<|tool_call_start|>[fn(a='x')]<|tool_call_end|>` parsed by
+  `PythonicToolCallParser`. Raw `dotllm run` adds no BOS (prefix `<|startoftext|>` or use the chat/serve path).
 
 ## GGUF → ModelConfig Mapping
 

@@ -286,6 +286,8 @@ public sealed class TextGenerator
         bool useMtp = ShouldUseMtp(captureLogprobs) && cachedTokenCount == 0
             && (mtpGate?.ShouldUseMtp(maxTokens) ?? true);
         TraceGate(mtpGate, pipeline.IsStochastic, useMtp, captureLogprobs, cachedTokenCount);
+        if (useMtp)
+            _model.TrySetAllRowLogitsLimit(_mtpCandidates + 1);
         bool useHybrid = _hybridStrategy is not null
             && _hybridStrategy.ShouldRunHybrid(promptLen)
             && cachedTokenCount == 0
@@ -877,6 +879,8 @@ public sealed class TextGenerator
         bool useMtp = ShouldUseMtp(captureLogprobs) && cachedTokenCount == 0
             && (mtpGate?.ShouldUseMtp(maxTokens) ?? true);
         TraceGate(mtpGate, pipeline.IsStochastic, useMtp, captureLogprobs, cachedTokenCount);
+        if (useMtp)
+            _model.TrySetAllRowLogitsLimit(_mtpCandidates + 1);
         bool useHybrid = _hybridStrategy is not null
             && _hybridStrategy.ShouldRunHybrid(promptLen)
             && cachedTokenCount == 0

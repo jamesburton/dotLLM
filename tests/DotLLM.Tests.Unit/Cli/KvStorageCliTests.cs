@@ -165,6 +165,13 @@ public sealed class KvStorageCliTests
         Assert.Empty(KvStorageCli.Warnings(KvStorageRequest.None, KvFlagTarget.Vulkan, "m", "vulkan", true));
     }
 
+    [Fact]
+    public void Warnings_VulkanQuantSupported_NoWarning()
+    {
+        KvStorageCli.TryBuild(null, null, "q8_0", "q4_0", 0, out var req, out _);
+        Assert.Empty(KvStorageCli.Warnings(req, KvFlagTarget.VulkanQuantSupported, "Phi", "vulkan", true));
+    }
+
     // ── option parsing through Spectre's real parser ──
 
     private sealed class Capture<T> : Command<T> where T : CommandSettings
