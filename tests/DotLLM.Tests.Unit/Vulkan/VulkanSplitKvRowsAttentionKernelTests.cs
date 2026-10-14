@@ -67,6 +67,77 @@ public class VulkanSplitKvRowsAttentionKernelTests
         }
     }
 
+
+    // #996: sink layers (MiMo-V2 / gpt-oss). Row r must equal the 1-row sink decode the model runs (kvStart = max(0, pos - W + 1), splits of the clipped
+    // span, the sink joining the merge denominator) bit for bit. Positions straddle the window edge (pos - W + 1 crossing 0), include a window
+    // wider than the context, and 64 heads (4-split cap, the MiMo shape) next to a 16-head shape.
+    [SkippableTheory]
+    [InlineData(126, 4, 16, 4, 64, 128)]    // rows 126..129: the window starts clipping inside the batch
+    [InlineData(200, 4, 64, 8, 192, 128)]   // MiMo SWA geometry, window fully inside the context
+    [InlineData(127, 3, 64, 8, 192, 128)]
+    [InlineData(300, 2, 16, 4, 64, 4096)]   // window wider than the context: no clipping, sink still joins
+    [InlineData(1000, 4, 32, 8, 128, 128)]
+    public void SinkRows_AreBitIdentical_ToTheOneRowSinkDecodeAtThatLength(int positionOffset, int rows, int numHeads, int numKvHeads, int headDim, int window)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        Assert.True(VulkanSplitKvRowsAttentionKernel.CanServe(rows, positionOffset, numHeads, window, hasSinks: true));
+
+        int seqKv = positionOffset + rows;
+        var rng = new Random(0x996 + positionOffset * 31 + rows);
+        float[] q = Rand(rng, rows * numHeads * headDim), k = Rand(rng, seqKv * numKvHeads * headDim), v = Rand(rng, seqKv * numKvHeads * headDim);
+        var sinkVals = new float[numHeads];
+        for (int h = 0; h < numHeads; h++) sinkVals[h] = (float)(rng.NextDouble() * 6 - 3);   // comparable to the scores so the sink moves the output
+
+        using var device = VulkanDevice.Create();
+        using var one = VulkanSplitKvAttentionKernel.Create(device, spvDir);
+        using var rowsKernel = VulkanSplitKvRowsAttentionKernel.TryCreate(device, spvDir)
+            ?? throw new Xunit.Sdk.XunitException("rows SPIR-V missing");
+        using var bq = device.Allocate((long)q.Length * 4);
+        using var bk = device.Allocate((long)k.Length * 4);
+        using var bv = device.Allocate((long)v.Length * 4);
+        using var bOut = device.Allocate((long)q.Length * 4);
+        using var bSink = device.Allocate((long)numHeads * 4);
+        device.Upload(q.AsSpan(), bq); device.Upload(k.AsSpan(), bk); device.Upload(v.AsSpan(), bv); device.Upload(sinkVals.AsSpan(), bSink);
+
+        using (var ctx = device.CreateSubmitContext())
+        {
+            ctx.Begin();
+            rowsKernel.Record(ctx.CommandBuffer, bq, bk, bv, bOut, rows, numHeads, numKvHeads, headDim, positionOffset, window, bSink);
+            ctx.SubmitAndWait();
+        }
+        var got = new float[q.Length];
+        device.Download(bOut, got);
+
+        int rowLen = numHeads * headDim;
+        int distinctFromNoSink = 0;
+        for (int r = 0; r < rows; r++)
+        {
+            int pos = positionOffset + r;
+            using var bqr = device.Allocate((long)rowLen * 4);
+            using var bor = device.Allocate((long)rowLen * 4);
+            using var bor2 = device.Allocate((long)rowLen * 4);
+            device.Upload(q.AsSpan(r * rowLen, rowLen), bqr);
+            int kvStart = Math.Max(0, pos - window + 1);
+            using (var ctx = device.CreateSubmitContext())
+            {
+                ctx.Begin();
+                one.Record(ctx.CommandBuffer, bqr, bk, bv, bor, 1, pos + 1, numHeads, numKvHeads, headDim,
+                    positionOffset: pos, slidingWindow: window, sinks: bSink, kvStart: kvStart);
+                ctx.SubmitAndWait();
+            }
+            one.Launch(bqr, bk, bv, bor2, 1, pos + 1, numHeads, numKvHeads, headDim, pos, window);   // same window, NO sink: the control
+            var want = new float[rowLen]; var noSink = new float[rowLen];
+            device.Download(bor, want); device.Download(bor2, noSink);
+            for (int i = 0; i < rowLen; i++)
+            {
+                Assert.True(BitConverter.SingleToInt32Bits(want[i]) == BitConverter.SingleToInt32Bits(got[r * rowLen + i]),
+                    $"row {r} (pos {pos}) element {i}: 1-row sink decode {want[i]:R} vs rows kernel {got[r * rowLen + i]:R}");
+                if (want[i] != noSink[i]) distinctFromNoSink++;
+            }
+        }
+        Assert.True(distinctFromNoSink > rows * rowLen / 2, "the sink must change the output (a control that could not disagree proves nothing)");
+    }
+
     [SkippableFact]
     public void CanServe_RefusesRowsThatWouldNotSplitAndOutOfRangeCounts()
     {

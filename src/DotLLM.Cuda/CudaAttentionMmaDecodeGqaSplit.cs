@@ -116,7 +116,38 @@ internal sealed class CudaAttentionMmaDecodeGqaSplit
     {
         int maxSafe = _kernels.MaxSafeAttentionMmaDecodeGqaSplit(numKvHeads, SupportedHeadDim, group);
         if (maxSafe <= 0) return 0;
+        if (_kernels.MmaDecodeV2Active) return CudaKernels.ComputeAttentionMmaV2KvSplit(seqKv, maxSafe);
         return CudaKernels.ComputeAttentionKvSplit(seqKv, numKvHeads, maxSafe);
+    }
+
+    /// <summary>Shape/precondition check for the fused quantized-KV kernel (issue #956); mirrors <see cref="CanUse"/>.</summary>
+    internal bool CanUseKvq(Core.Configuration.KvCacheDType kDtype, Core.Configuration.KvCacheDType vDtype,
+                            int seqQ, int seqKv, int slidingWindow, int numHeads, int numKvHeads, int headDim)
+        => Enabled
+        && _kernels.HasAttentionMmaDecodeKvq(kDtype, vDtype)
+        && seqQ == 1
+        && seqKv > 0
+        && headDim == SupportedHeadDim
+        && slidingWindow <= 0
+        && CudaKernels.IsGqaGroupShapeSupported(numHeads, numKvHeads);
+
+    internal int ComputeSafeKvSplitKvq(Core.Configuration.KvCacheDType kDtype,
+                                       Core.Configuration.KvCacheDType vDtype, int numKvHeads, int seqKv)
+    {
+        int maxSafe = _kernels.MaxSafeAttentionMmaDecodeKvq(numKvHeads, kDtype, vDtype);
+        if (maxSafe <= 0) return 0;
+        if (CudaKernels.MmaDecodeV2Enabled) return CudaKernels.ComputeAttentionMmaV2KvSplit(seqKv, maxSafe);
+        return CudaKernels.ComputeAttentionKvSplit(seqKv, numKvHeads, maxSafe);
+    }
+
+    internal void RunKvq(nint q, nint k, nint v, Core.Configuration.KvCacheDType kDtype,
+                         Core.Configuration.KvCacheDType vDtype, nint output,
+                         int seqKv, int numHeads, int numKvHeads, int kvSplit,
+                         nint partialMax, nint partialSum, nint partialOut, nint stream)
+    {
+        DispatchCount++;
+        _kernels.LaunchAttentionMmaDecodeGqaSplitKvq(q, k, v, kDtype, vDtype, output, seqKv, numHeads,
+            numKvHeads, kvSplit, partialMax, partialSum, partialOut, stream);
     }
 
     /// <summary>

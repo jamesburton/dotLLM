@@ -25,6 +25,7 @@ layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
 layout(set = 0, binding = 0, std430) readonly  buffer BufPartOut { float partOut[]; }; // [numHeads*numSplits, head_dim]
 layout(set = 0, binding = 1, std430) readonly  buffer BufPartMS  { float partMS[]; };  // [numHeads*numSplits, 2]
 layout(set = 0, binding = 2, std430) writeonly buffer BufOut     { float outp[]; };    // [1, numHeads * head_dim]
+layout(set = 0, binding = 3, std430) readonly  buffer BufSink    { float sinks[]; };   // [numHeads] attention sinks (bound but unread when hasSinks == 0)
 
 layout(push_constant) uniform PushConstants {
     uint numHeads;
@@ -34,6 +35,8 @@ layout(push_constant) uniform PushConstants {
     uint targetWg;         // split heuristic of the 1-row kernel (see attention_f32_splitkv_rows.comp::splitsFor)
     uint minKv;
     uint seqQ;
+    uint slidingWindow;    // sink layers: span clipping, see the split pass
+    uint hasSinks;         // 1 = the sink joins the softmax denominator (exp(sink - M)) but adds no value (#996, as attention_f32_splitkv_merge.comp)
 } pc;
 
 uint splitsFor(uint kvLen) {
@@ -81,7 +84,9 @@ void main() {
     uint rh = gl_WorkGroupID.x;
     if (rh >= pc.seqQ * pc.numHeads) return;
     uint row = rh / pc.numHeads;
-    uint numSplits = splitsFor(pc.positionOffset + row + 1u);
+    uint rowKv = pc.positionOffset + row + 1u;
+    uint kvStart = (pc.hasSinks != 0u && pc.slidingWindow > 0u && rowKv > pc.slidingWindow) ? rowKv - pc.slidingWindow : 0u;
+    uint numSplits = splitsFor(rowKv - kvStart);
     uint tid = gl_LocalInvocationID.x;
     uint headBase = rh * pc.maxSplits;
 
@@ -91,6 +96,9 @@ void main() {
         localMax = max(localMax, partMS[(headBase + s) * 2u + 0u]);
     }
     float M = workgroupMaxSg(localMax);
+    uint hq = rh - row * pc.numHeads;
+    float sinkLogit = (pc.hasSinks != 0u) ? sinks[hq] : NEG_INF;
+    if (pc.hasSinks != 0u) M = max(M, sinkLogit);
 
     // 2. Combined denominator L = sum_s exp(m_s - M) * l_s.
     float localL = 0.0;
@@ -101,6 +109,7 @@ void main() {
         localL += w * ls;
     }
     float L = workgroupSumSg(localL);
+    if (pc.hasSinks != 0u) L += exp(sinkLogit - M);
     float invL = (L > 1e-20) ? (1.0 / L) : 0.0;
 
     // 3. O[d] = invL * sum_s exp(m_s - M) * acc_s[d]. Coalesced partOut read.
