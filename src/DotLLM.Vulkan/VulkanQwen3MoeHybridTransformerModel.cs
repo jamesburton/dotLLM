@@ -108,7 +108,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     private readonly VulkanDevice.Buffer? _moeUnitScale;
 
     /// <summary>Which routed-MoE fast paths were RECORDED (test hook: proves a branch was taken, not merely that a kernel exists).</summary>
-    internal enum MoePath { GroupedPrefill, GroupedGateUpNotQ4K, GroupedLegacyDown, MmvqDown, MmvqLegacyDown, FusedDecode, IqMmvqGateUp, IqMmvqDown, GroupedIqGateUp, GroupedIqDown }
+    internal enum MoePath { GroupedPrefill, GroupedGateUpNotQ4K, GroupedLegacyDown, MmvqDown, MmvqLegacyDown, FusedDecode, IqMmvqGateUp, IqMmvqDown, GroupedIqGateUp, GroupedIqDown, GroupedMmqPrefill }
     internal readonly long[] MoePathCounts = new long[Enum.GetValues<MoePath>().Length];
 
     /// <summary>Record-time counters for the 2..8-row fast paths (#876): prove a fast path ran by counting, not by IsSupported.</summary>
@@ -1805,6 +1805,20 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         _ => null,
     };
 
+    private MoeGroupedMatmulKQuantMmqKernel? GroupedGateUpMmqKernel(QuantizationType qt) => qt switch
+    {
+        QuantizationType.Q4_K => _kernels.MoeGroupedQ4KMmq,
+        QuantizationType.Q5_K => _kernels.MoeGroupedQ5KMmq,
+        _ => null,
+    };
+
+    private MoeGroupedMatmulKQuantMmqKernel? GroupedDownMmqKernel(QuantizationType qt) => qt switch
+    {
+        QuantizationType.Q4_K => _kernels.MoeGroupedQ4KMmq,
+        QuantizationType.Q5_K => _kernels.MoeGroupedQ5KMmq,
+        _ => null,
+    };
+
     /// <summary>
     /// Grouped coopmat kernel for a gate/up bank of type <paramref name="qt"/> (#821): Q4_K plus the Q5_K/Q6_K kernels the down projection already
     /// uses (UD-Q4_K_XL layer 2 has Q5_K gate/up and used to fall off the grouped path onto the scalar indexed kernels - half the prefill time).
@@ -1848,6 +1862,11 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     private bool GroupedKernelsFit(VulkanQwen3MoeMoeUpload.LayerBundle moeW, int hidden, int interm)
     {
         if (moeW.W1QuantType != moeW.W3QuantType) return false;
+        // #986: dp4a MMQ grouped path (64×64 tiles, Q8_1 activations). Both gate/up AND down must have MMQ kernels
+        // so the tile list row-tile=64 is shared. Also needs the Q8_1 quantizer.
+        if (GroupedGateUpMmqKernel(moeW.W1QuantType) is not null && GroupedDownMmqKernel(moeW.W2QuantType) is not null
+            && _kernels.QuantizeQ8_1RowsActivations is not null && (interm % 256) == 0)
+            return true;
         bool sixteen = GroupedLegacyDownKernel(moeW.W2QuantType) is not null || GroupedIqKernel(moeW.W2QuantType) is not null;
         if (IsIqBankQuant(moeW.W1QuantType))
         {
@@ -1889,11 +1908,9 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("expand_group");
 
-        // Launch only the (expert, 16-row tile) pairs that exist. The legacy grid (every expert x every possible row tile; a token routes
+        // Launch only the (expert, tile) pairs that exist. The legacy grid (every expert x every possible row tile; a token routes
         // to an expert at most once, so no expert owns more than seqLen rows) launched ~30x more workgroups than there was work and the
         // early-out workgroups alone cost ~100 ms of a 512-token prefill. DOTLLM_VK_MOE_INDIRECT_TILES=0 restores it.
-        // A legacy-quant down kernel only exists for 16-row tiles, so when gate/up would be the 32-row row-pair form the layer's gate/up
-        // drops to the 16-row Q4_K kernel to share one tile list (the tile list is rebuilt per layer).
         var legacyDown = GroupedLegacyDownKernel(moeW.W2QuantType);
         var iqDown = GroupedIqKernel(moeW.W2QuantType);          // #823
         var iqGateUp = GroupedIqKernel(moeW.W1QuantType);        // #823
@@ -1902,6 +1919,73 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         if (iqGateUp is not null) CountMoePath(MoePath.GroupedIqGateUp);
         if (iqDown is not null) CountMoePath(MoePath.GroupedIqDown);
         if (moeW.W1QuantType != QuantizationType.Q4_K) CountMoePath(MoePath.GroupedGateUpNotQ4K);
+
+        // #986: dp4a grouped MMQ path — Q8_1 activations, preferred over coopmat for K-quant-only layers.
+        // Both gate/up AND down must have MMQ kernels so the tile list shares one row-tile (32 or 64).
+        var gateUpMmq = (iqGateUp is null && legacyDown is null && iqDown is null) ? GroupedGateUpMmqKernel(moeW.W1QuantType) : null;
+        var downMmq = (gateUpMmq is not null) ? GroupedDownMmqKernel(moeW.W2QuantType) : null;
+        bool useMmq = gateUpMmq is not null && downMmq is not null
+            && _kernels.QuantizeQ8_1RowsActivations is not null && (interm % 256) == 0;
+
+        if (useMmq)
+        {
+            CountMoePath(MoePath.GroupedMmqPrefill);
+            // Quantize expert-sorted F32 activations to Q8_1 for the gate/up projection (K=hidden).
+            _kernels.QuantizeQ8_1RowsActivations!.Record(cmdBuf, _state.MoeDownRows, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
+                n: expandedRows, k: hidden);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            MoeStage("quantize_q8_gate_up");
+
+            var tileBuildMmq = _kernels.MoeBuildTileList;
+            if (tileBuildMmq is not null)
+            {
+                tileBuildMmq.Record(cmdBuf, _state.MoeGroupOffsets, _state.MoeGroupDispatchArgs, numE,
+                    gateUpMmq!.MTiles(interm), downMmq!.MTiles(hidden), tileRows: gateUpMmq.RowTile);
+                KernelSupport.ComputeToIndirectAndComputeBarrier(cmdBuf);
+                if (MoeStageProfileEnabled)
+                {
+                    MoeStage("tile_list_build");
+                    Span<float> raw = stackalloc float[6];
+                    _device.Download(_state.MoeGroupDispatchArgs, raw);
+                    _moeStageMs["tiles(count,not ms)"] = _moeStageMs.GetValueOrDefault("tiles(count,not ms)") + BitConverter.SingleToUInt32Bits(raw[1]);
+                    _moeStageLast = System.Diagnostics.Stopwatch.GetTimestamp();
+                }
+                gateUpMmq.RecordIndirect(cmdBuf, moeW.W1Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, _state.MoeGroupOffsets,
+                    _state.MoeGateInter, _state.MoeGroupDispatchArgs, 0, m: interm, k: hidden, rows: expandedRows, numExperts: numE);
+                gateUpMmq.RecordIndirect(cmdBuf, moeW.W3Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, _state.MoeGroupOffsets,
+                    _state.MoeUpInter, _state.MoeGroupDispatchArgs, 0, m: interm, k: hidden, rows: expandedRows, numExperts: numE);
+            }
+            else
+            {
+                gateUpMmq!.Record(cmdBuf, moeW.W1Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, _state.MoeGroupOffsets,
+                    _state.MoeGateInter, m: interm, k: hidden, rows: expandedRows, numExperts: numE, maxRowsPerExpert: seqLen);
+                gateUpMmq.Record(cmdBuf, moeW.W3Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, _state.MoeGroupOffsets,
+                    _state.MoeUpInter, m: interm, k: hidden, rows: expandedRows, numExperts: numE, maxRowsPerExpert: seqLen);
+            }
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            MoeStage("grouped_gate_up");
+
+            _kernels.SwiGlu.Record(cmdBuf, _state.MoeGateInter, _state.MoeUpInter, _state.MoeSiluInter, n: expandedRows * interm);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            MoeStage("swiglu");
+
+            // Quantize SwiGLU output to Q8_1 for the down projection (K=interm).
+            _kernels.QuantizeQ8_1RowsActivations!.Record(cmdBuf, _state.MoeSiluInter, _state.MoeSiluInterXq, _state.MoeSiluInterXds,
+                n: expandedRows, k: interm);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            MoeStage("quantize_q8_down");
+
+            if (tileBuildMmq is not null)
+                downMmq!.RecordIndirect(cmdBuf, moeW.W2Bank, _state.MoeSiluInterXq, _state.MoeSiluInterXds, _state.MoeGroupOffsets,
+                    _state.MoeExpandedInput, _state.MoeGroupDispatchArgs, MoeBuildTileListKernel.ArgsStrideBytes, m: hidden, k: interm, rows: expandedRows, numExperts: numE);
+            else
+                downMmq!.Record(cmdBuf, moeW.W2Bank, _state.MoeSiluInterXq, _state.MoeSiluInterXds, _state.MoeGroupOffsets,
+                    _state.MoeExpandedInput, m: hidden, k: interm, rows: expandedRows, numExperts: numE, maxRowsPerExpert: seqLen);
+        }
+        else
+        {
+        // A legacy-quant down kernel only exists for 16-row tiles, so when gate/up would be the 32-row row-pair form the layer's gate/up
+        // drops to the 16-row Q4_K kernel to share one tile list (the tile list is rebuilt per layer).
         var gateUpKernel = iqGateUp is null ? GroupedGateUpKernel(moeW.W1QuantType, sixteenRow: legacyDown is not null || iqDown is not null)! : null;
         var downKernel = GroupedDownKernel(moeW.W2QuantType);
         int downMTiles = downKernel?.MTiles(hidden) ?? legacyDown?.MTiles(hidden) ?? iqDown!.MTiles(hidden);
@@ -1984,6 +2068,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         else
             downKernel!.Record(cmdBuf, moeW.W2Bank, _state.MoeSiluInter, _state.MoeGroupOffsets, _state.MoeExpandedInput,
                 m: hidden, k: interm, rows: expandedRows, numExperts: numE, maxRowsPerExpert: seqLen);
+        } // end else (!useMmq)
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("grouped_down");
         if (!fusedGlue)
