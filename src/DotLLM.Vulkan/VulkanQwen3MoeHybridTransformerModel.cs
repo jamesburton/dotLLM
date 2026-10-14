@@ -1822,6 +1822,14 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         return k;
     }
 
+    /// <summary>
+    /// Grouped coopmat kernel for a LEGACY-quant gate/up bank (#1015). Only Q8_0: the LFM2.5 Q4_0 banks are served as exact Q8_0 and every other
+    /// Q8_0/Q5_1 gate/up bank kept its indexed F32-in kernels (the coopmat path rounds activations to F16, so widening it is a numeric change
+    /// for those models that this change deliberately does not make).
+    /// </summary>
+    private MoeGroupedMatmulLegacyQuantCoopmatKernel? LegacyGateUpKernel(QuantizationType qt)
+        => qt == QuantizationType.Q8_0 ? GroupedLegacyDownKernel(qt) : null;
+
     private MoeGroupedMatmulLegacyQuantCoopmatKernel? GroupedLegacyDownKernel(QuantizationType qt) => qt switch
     {
         QuantizationType.Q5_1 => _kernels.MoeGroupedQ5_1,
@@ -1856,6 +1864,9 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             if (GroupedLegacyDownKernel(moeW.W2QuantType) is not null) return GroupedDownFits(moeW.W2QuantType, interm);
             return GroupedDownKernel(moeW.W2QuantType) is { RowTile: 16 } && GroupedDownFits(moeW.W2QuantType, interm);
         }
+        // Legacy-quant (Q8_0 / Q5_1) gate/up banks (#1015): the same 16-row packed-bank grouped kernel serves them (K = hidden, % 64 == 0).
+        if (LegacyGateUpKernel(moeW.W1QuantType) is not null)
+            return sixteen && _moeUnitScale is not null && (hidden % MoeGroupedMatmulLegacyQuantCoopmatKernel.KGroup) == 0 && GroupedDownFits(moeW.W2QuantType, interm);
         if (GroupedGateUpKernel(moeW.W1QuantType, sixteenRow: sixteen) is not { } gu || (sixteen && gu.RowTile != 16)) return false;
         if (GroupedIqKernel(moeW.W2QuantType) is { } iqDown) return (interm % iqDown.KGroup) == 0;
         return GroupedDownFits(moeW.W2QuantType, interm);
@@ -1902,15 +1913,16 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         if (iqGateUp is not null) CountMoePath(MoePath.GroupedIqGateUp);
         if (iqDown is not null) CountMoePath(MoePath.GroupedIqDown);
         if (moeW.W1QuantType != QuantizationType.Q4_K) CountMoePath(MoePath.GroupedGateUpNotQ4K);
-        var gateUpKernel = iqGateUp is null ? GroupedGateUpKernel(moeW.W1QuantType, sixteenRow: legacyDown is not null || iqDown is not null)! : null;
+        var legacyGateUp = iqGateUp is null ? LegacyGateUpKernel(moeW.W1QuantType) : null;   // #1015: Q8_0 gate/up banks
+        var gateUpKernel = iqGateUp is null && legacyGateUp is null ? GroupedGateUpKernel(moeW.W1QuantType, sixteenRow: legacyDown is not null || iqDown is not null)! : null;
         var downKernel = GroupedDownKernel(moeW.W2QuantType);
         int downMTiles = downKernel?.MTiles(hidden) ?? legacyDown?.MTiles(hidden) ?? iqDown!.MTiles(hidden);
-        int gateUpMTiles = iqGateUp?.MTiles(interm) ?? gateUpKernel!.MTiles(interm);
+        int gateUpMTiles = iqGateUp?.MTiles(interm) ?? legacyGateUp?.MTiles(interm) ?? gateUpKernel!.MTiles(interm);
         var tileBuild = _kernels.MoeBuildTileList;
         if (tileBuild is not null)
         {
             tileBuild.Record(cmdBuf, _state.MoeGroupOffsets, _state.MoeGroupDispatchArgs, numE,
-                gateUpMTiles, downMTiles, tileRows: iqGateUp?.RowTile ?? gateUpKernel!.RowTile);
+                gateUpMTiles, downMTiles, tileRows: iqGateUp?.RowTile ?? legacyGateUp?.RowTile ?? gateUpKernel!.RowTile);
             KernelSupport.ComputeToIndirectAndComputeBarrier(cmdBuf);
             if (MoeStageProfileEnabled)
             {
@@ -1926,6 +1938,13 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                     _state.MoeGroupDispatchArgs, 0, m: interm, k: hidden, rows: expandedRows, numExperts: numE);
                 iqGateUp.RecordIndirect(cmdBuf, moeW.W3Bank, _state.MoeDownRows, _state.MoeGroupOffsets, _state.MoeUpInter,
                     _state.MoeGroupDispatchArgs, 0, m: interm, k: hidden, rows: expandedRows, numExperts: numE);
+            }
+            else if (legacyGateUp is not null)
+            {
+                legacyGateUp.RecordIndirect(cmdBuf, moeW.W1Bank, _state.MoeDownRows, _state.MoeGroupOffsets, _state.MoeGateInter, _moeUnitScale!,
+                    applyScale: false, _state.MoeGroupDispatchArgs, 0, m: interm, k: hidden, rows: expandedRows, numExperts: numE);
+                legacyGateUp.RecordIndirect(cmdBuf, moeW.W3Bank, _state.MoeDownRows, _state.MoeGroupOffsets, _state.MoeUpInter, _moeUnitScale!,
+                    applyScale: false, _state.MoeGroupDispatchArgs, 0, m: interm, k: hidden, rows: expandedRows, numExperts: numE);
             }
             else
             {
@@ -1943,6 +1962,13 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                     m: interm, k: hidden, rows: expandedRows, numExperts: numE, maxRowsPerExpert: seqLen);
                 iqGateUp.Record(cmdBuf, moeW.W3Bank, _state.MoeDownRows, _state.MoeGroupOffsets, _state.MoeUpInter,
                     m: interm, k: hidden, rows: expandedRows, numExperts: numE, maxRowsPerExpert: seqLen);
+            }
+            else if (legacyGateUp is not null)
+            {
+                legacyGateUp.Record(cmdBuf, moeW.W1Bank, _state.MoeDownRows, _state.MoeGroupOffsets, _state.MoeGateInter, _moeUnitScale!,
+                    applyScale: false, m: interm, k: hidden, rows: expandedRows, numExperts: numE, maxRowsPerExpert: seqLen);
+                legacyGateUp.Record(cmdBuf, moeW.W3Bank, _state.MoeDownRows, _state.MoeGroupOffsets, _state.MoeUpInter, _moeUnitScale!,
+                    applyScale: false, m: interm, k: hidden, rows: expandedRows, numExperts: numE, maxRowsPerExpert: seqLen);
             }
             else
             {

@@ -62,8 +62,12 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
     /// <summary>Creates the sparse (attention-layers-only) KV cache this model expects.</summary>
     public VulkanNemotronHKvCache CreateKvCache(int maxSeqLen) => _host.CreateKvCache(maxSeqLen);
 
-    /// <summary>Per-stage wall ms accumulated by the split-submit profiler (see <see cref="StageProfile"/>).</summary>
+    /// <summary>Per-stage wall ms via split-submit (<c>DOTLLM_VK_LFM2_STAGE_PROFILE=1</c>): distorts decode (a fence round trip per stage).</summary>
     public static bool StageProfile { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_LFM2_STAGE_PROFILE") == "1";
+
+    /// <summary>GPU-timestamp stage profile (<c>DOTLLM_VK_LFM2_STAGE_PROFILE=ts</c>): one BOTTOM_OF_PIPE stamp per stage in the real submission structure;
+    /// per-forward breakdown on stderr (decode: averaged over 32 forwards).</summary>
+    public static bool StageTs { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_LFM2_STAGE_PROFILE") == "ts";
 
     private sealed class LayerDev
     {
@@ -322,8 +326,59 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
         return copy;
     }
 
+    private const int TsMax = 4096;
+    private nint _tsPool;
+    private int _tsCount;
+    private readonly string[] _tsLabels = new string[TsMax];
+    private readonly ulong[] _tsScratch = new ulong[TsMax];
+    private int _tsForwards;
+
+    private void TsBegin(nint cmd)
+    {
+        if (_tsPool == 0)
+        {
+            var qci = new VkQueryPoolCreateInfo { sType = 11, queryType = 2, queryCount = TsMax };
+            if (VulkanApi.vkCreateQueryPool(_device.Handle, qci, 0, out _tsPool) < 0) { _tsPool = 0; return; }
+        }
+        _tsCount = 0;
+        VulkanApi.vkCmdResetQueryPool(cmd, _tsPool, 0, TsMax);
+        TsStamp(cmd, "~begin");
+    }
+
+    private void TsStamp(nint cmd, string label)
+    {
+        if (_tsPool == 0 || _tsCount >= TsMax) return;
+        _tsLabels[_tsCount] = label;
+        VulkanApi.vkCmdWriteTimestamp(cmd, VkPipelineStageFlags.BottomOfPipe, _tsPool, (uint)_tsCount++);
+    }
+
+    private unsafe void TsCollect(int T)
+    {
+        int n = _tsCount;
+        _tsCount = 0;
+        if (_tsPool == 0 || n < 2) return;
+        fixed (ulong* p = _tsScratch)
+        {
+            if (VulkanApi.vkGetQueryPoolResults(_device.Handle, _tsPool, 0, (uint)n, (nuint)(n * sizeof(ulong)), (nint)p, sizeof(ulong), flags: 0x1 | 0x2) < 0) return;
+        }
+        double toMs = _device.TimestampPeriodNs / 1_000_000.0;
+        double total = (_tsScratch[n - 1] - _tsScratch[0]) * toMs;
+        for (int i = 1; i < n; i++)
+            _stageMs[_tsLabels[i]] = _stageMs.GetValueOrDefault(_tsLabels[i]) + (_tsScratch[i] - _tsScratch[i - 1]) * toMs;
+        _stageMs["~total"] = _stageMs.GetValueOrDefault("~total") + total;
+        _tsForwards++;
+        if (T > 1 || _tsForwards % 32 == 0)
+        {
+            int div = T > 1 ? 1 : 32;
+            Console.Error.WriteLine($"[lfm2-stage-ts] T={T} avg over {div} forward(s): " + string.Join("  ",
+                _stageMs.OrderByDescending(kv => kv.Value).Select(kv => $"{kv.Key}={kv.Value / div:F3}ms")));
+            _stageMs.Clear();
+        }
+    }
+
     private nint Stage(nint cmd, string name)
     {
+        if (StageTs) { TsStamp(cmd, name); return cmd; }
         if (!StageProfile) return cmd;
         var submit = _host.Q4Submit;
         Fb(cmd);
@@ -383,6 +438,8 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
         _host.Q4RecordEmbedding(cmd, tokenIds);
         KernelSupport.TransferToComputeBarrier(cmd);
         if (StageProfile) { _stageLast = System.Diagnostics.Stopwatch.GetTimestamp(); }
+        if (StageTs) TsBegin(cmd);
+        if (_host.Q4StageProfiling) _host.Q4StageBegin();   // routed-MoE sub-stage profile (DOTLLM_VULKAN_MOE_STAGE_PROFILE=1 [+ DOTLLM_VK_STAGE_TS=1])
         cmd = Stage(cmd, "embed");
 
         ulong hiddenBytes = (ulong)((long)T * H * sizeof(float));
@@ -413,6 +470,7 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
             if (ld.Moe is { } moe)
             {
                 _host.LfmRecordMoe(cmd, moe, ld.FfnNorm, T);
+                cmd = submit.CommandBuffer;   // the host's split-submit stage profile re-begins the buffer
                 cmd = Stage(cmd, "moe_total");
             }
             else
@@ -450,10 +508,29 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
         cmd = Stage(cmd, "lm_head");
         KernelSupport.ComputeToHostBarrier(cmd);
         submit.SubmitAndWait();
+        if (StageTs) TsCollect(T);
+        if (_host.Q4StageProfiling) ReportMoeSubStages(T);
 
         var result = UnmanagedTensor.Allocate(new TensorShape(rows, V), DType.Float32, deviceId: -1);
         _device.Download(logitsBuf, new Span<float>((void*)result.DataPointer, rows * V));
         return result;
+    }
+
+    private readonly Dictionary<string, double> _moeSub = new();
+    private int _moeSubForwards;
+
+    private void ReportMoeSubStages(int T)
+    {
+        foreach (var kv in _host.TakeStageTimes())
+            _moeSub[kv.Key] = _moeSub.GetValueOrDefault(kv.Key) + kv.Value;
+        _moeSubForwards++;
+        if (T > 1 || _moeSubForwards % 32 == 0)
+        {
+            int div = T > 1 ? 1 : 32;
+            Console.Error.WriteLine($"[lfm2-moe-sub] T={T} sum over 38 MoE layers, avg over {div} forward(s): " + string.Join("  ",
+                _moeSub.OrderByDescending(kv => kv.Value).Select(kv => $"{kv.Key}={kv.Value / div:F3}ms")));
+            _moeSub.Clear();
+        }
     }
 
     private bool EnsureDense(int T)
