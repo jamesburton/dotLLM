@@ -148,6 +148,14 @@ public sealed class VulkanMoeIndexedMatmulIqMmvqKernelTests
     [InlineData(QuantizationType.IQ2_XS, 4096, true)]
     [InlineData(QuantizationType.IQ2_XS, 4608, true)]
     [InlineData(QuantizationType.IQ2_XS, 4608, false)]
+    [InlineData(QuantizationType.Q4_0, 32, true)]       // #1018: one block, 31 masked lanes
+    [InlineData(QuantizationType.Q4_0, 1536, true)]     // LFM2.5 down: 48 blocks = one full 32-block step + 16
+    [InlineData(QuantizationType.Q4_0, 2048, true)]     // LFM2.5 gate/up: 64 blocks = exactly one U=2 chunk
+    [InlineData(QuantizationType.Q4_0, 2080, true)]     // 65 blocks: chunk + 1-block tail
+    [InlineData(QuantizationType.Q4_0, 4608, true)]
+    [InlineData(QuantizationType.Q4_0, 1536, false)]
+    [InlineData(QuantizationType.Q4_0, 2048, false)]
+    [InlineData(QuantizationType.Q4_0, 4608, false)]
     public void BroadcastActivation_V1AndV2_MatchSameTierCpuOracle(QuantizationType qt, int k, bool v2)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);

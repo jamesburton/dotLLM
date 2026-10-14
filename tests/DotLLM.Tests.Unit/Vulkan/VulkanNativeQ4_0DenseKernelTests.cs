@@ -47,20 +47,26 @@ public sealed class VulkanNativeQ4_0DenseKernelTests
     }
 
     [SkippableTheory]
-    [InlineData(1, 32)]
-    [InlineData(7, 96)]            // 3 blocks, window tail
-    [InlineData(33, 288)]          // 9 blocks: window + 1 block
-    [InlineData(6144, 2048)]       // LFM2.5 conv in_proj
-    [InlineData(2048, 2048)]       // conv out_proj / attention q,o
-    [InlineData(11776, 2048)]      // dense FFN gate/up
-    [InlineData(2048, 11776)]      // dense FFN down (368 blocks/row)
-    public void Mmvq_MatchesSameTierCpuOracle(int m, int k)
+    [InlineData(1, 32, true)]
+    [InlineData(7, 96, true)]            // 3 blocks: one partial 32-block step
+    [InlineData(33, 288, true)]          // 9 blocks
+    [InlineData(5, 2080, true)]          // 65 blocks: one full 64-block U=2 chunk + a 1-block tail
+    [InlineData(6144, 2048, true)]       // LFM2.5 conv in_proj
+    [InlineData(2048, 2048, true)]       // conv out_proj / attention q,o
+    [InlineData(11776, 2048, true)]      // dense FFN gate/up
+    [InlineData(2048, 11776, true)]      // dense FFN down (368 blocks/row)
+    [InlineData(7, 96, false)]
+    [InlineData(33, 288, false)]
+    [InlineData(2048, 2048, false)]
+    [InlineData(2048, 11776, false)]
+    public void Mmvq_MatchesSameTierCpuOracle(int m, int k, bool v2)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
         Skip.IfNot(device.HasIntegerDotProduct, "No integer-dot-product support.");
         using var quant = QuantizeQ8_1RowsKernel.TryCreate(device, spvDir) ?? throw new Xunit.Sdk.XunitException("quantize_q8_1_rows.spv missing.");
-        using var mmvq = MatMulQ4_0MmvqKernel.TryCreate(device, spvDir) ?? throw new Xunit.Sdk.XunitException("matmul_q4_0_mmvq.spv missing or unsupported.");
+        using var mmvq = MatMulQ4_0MmvqKernel.TryCreate(device, spvDir, v2) ?? throw new Xunit.Sdk.XunitException("matmul_q4_0_mmvq(_v2).spv missing or unsupported.");
+        Assert.Equal(v2, mmvq.IsV2);
 
         var rng = new Random(0x1018 + m * 7 + k * 11);
         byte[] w = RandomWeights(rng, m, k);
@@ -95,7 +101,7 @@ public sealed class VulkanNativeQ4_0DenseKernelTests
             for (int i = 0; i < k; i++) acc += (double)wf[(long)r * k + i] * xq[i] * xds[(i / Group) * 2];
             expected[r] = (float)acc;
         }
-        MoeMmvqParitySupport.AssertSameTierParity(expected, actual, m, 1, "Q4_0 dense MMVQ");
+        MoeMmvqParitySupport.AssertSameTierParity(expected, actual, m, 1, "Q4_0 dense MMVQ " + (v2 ? "V2" : "V1"));
     }
 
     [SkippableTheory]

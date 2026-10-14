@@ -30,6 +30,15 @@ public sealed class MatMulQ4_0MmvqKernel : IDisposable
     private readonly DescriptorSetCache _descriptorCache;
     private bool _disposed;
 
+    /// <summary>
+    /// Default shader generation: V2 (a lane owns a whole 18-byte block; ~3x fewer load instructions per weight byte, issue #1018) unless
+    /// <c>DOTLLM_VK_Q4_0_V2=0</c> selects the V1 4-lanes-per-block shader (A/B).
+    /// </summary>
+    internal static bool V2Default { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_Q4_0_V2") != "0";
+
+    /// <summary>True when this instance runs the V2 shader.</summary>
+    public bool IsV2 { get; private set; }
+
     private MatMulQ4_0MmvqKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
     {
         _device = device;
@@ -41,12 +50,13 @@ public sealed class MatMulQ4_0MmvqKernel : IDisposable
 
     /// <summary>Loads <c>matmul_q4_0_mmvq.spv</c>; null when the SPV is missing or the device
     /// lacks integer-dot-product support.</summary>
-    public static MatMulQ4_0MmvqKernel? TryCreate(VulkanDevice device, string spvDir)
+    public static MatMulQ4_0MmvqKernel? TryCreate(VulkanDevice device, string spvDir, bool? v2 = null)
     {
         if (!device.HasIntegerDotProduct)
             return null;
 
-        string path = Path.Combine(spvDir, "matmul_q4_0_mmvq.spv");
+        bool wantV2 = v2 ?? V2Default;
+        string path = Path.Combine(spvDir, wantV2 ? "matmul_q4_0_mmvq_v2.spv" : "matmul_q4_0_mmvq.spv");
         if (!File.Exists(path))
             return null;
 
@@ -74,7 +84,7 @@ public sealed class MatMulQ4_0MmvqKernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
-        return new MatMulQ4_0MmvqKernel(device, module, pipeline, pool);
+        return new MatMulQ4_0MmvqKernel(device, module, pipeline, pool) { IsV2 = wantV2 };
     }
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
