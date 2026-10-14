@@ -263,6 +263,30 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
             outputW, outputDeviceQt, outputOutputDim, outputInputDim, totalBytes);
     }
 
+    /// <summary>
+    /// Uploads only the token embedding, final norm and LM head (no per-layer buffers). Used by architectures that borrow this class's
+    /// recording machinery through a headless host and upload their own layers (LFM2-MoE, #1015).
+    /// </summary>
+    internal static VulkanQwen3MoeHybridWeights UploadHeadOnly(
+        VulkanDevice device, ModelConfig config, float[] outputNormWeight,
+        nint tokenEmbedWeight, QuantizationType tokenEmbedQt,
+        nint outputWeight, QuantizationType outputQt, int outputOutputDim, int outputInputDim)
+    {
+        long stagingBytes = Math.Max((long)config.VocabSize * config.HiddenSize * sizeof(float),
+            ProjectionUploadBytes(outputOutputDim, outputInputDim, outputQt));
+        stagingBytes = Math.Max(stagingBytes, (long)outputNormWeight.Length * sizeof(float));
+        VulkanWeightImportPolicy.Reset();
+        using var staging = VulkanStagingBuffer.Create(device, Math.Max(stagingBytes, 64));
+        var tokenEmbed = VulkanChunkedRowTable.Create(device, staging,
+            tokenEmbedWeight, tokenEmbedQt, config.VocabSize, config.HiddenSize);
+        var outputNorm = UploadFloatArray(device, staging, outputNormWeight);
+        var outputW = UploadProjectionMatrix(device, staging, outputWeight, outputQt, outputOutputDim, outputInputDim,
+            forceF32: false, out var outputDeviceQt, out long outputBytes);
+        long total = tokenEmbed.TotalBytes + (long)outputNormWeight.Length * sizeof(float) + outputBytes;
+        return new VulkanQwen3MoeHybridWeights(Array.Empty<LayerBuffers>(), tokenEmbed, outputNorm,
+            outputW, outputDeviceQt, outputOutputDim, outputInputDim, total);
+    }
+
     internal static GdnLayerBuffers UploadGdnLayer(
         VulkanDevice device, VulkanStagingBuffer staging,
         GdnTokenMixingWeights gdnW, out long uploadedBytes)

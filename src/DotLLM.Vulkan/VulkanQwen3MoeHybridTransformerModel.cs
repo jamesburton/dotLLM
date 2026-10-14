@@ -254,7 +254,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         _gdnCache = gdnCache;
         _kernels = kernels;
         _layout = config.HybridLayout!;
-        _gdn = config.GdnConfig!.Value;
+        _gdn = config.GdnConfig ?? default;   // null for the LFM2-MoE headless host (#1015)
         _kvSlotForLayer = kvSlotForLayer;
         _attentionLayerCount = attentionLayerCount;
         _gdnLayerOrdinal = gdnLayerOrdinal;
@@ -2027,7 +2027,14 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("router");
 
-        // 2. Top-k softmax.
+        // 2. Top-k: softmax (Qwen), or sigmoid + selection bias (LFM2-MoE, #1015).
+        if (moeW.SigmoidGating)
+        {
+            _kernels.MoeTopkSigmoid!.Record(cmdBuf,
+                _state.MoeRouterLogits, moeW.SelectionBias!, _state.MoeTopkIndices, _state.MoeTopkWeights,
+                seqLen: seqLen, numExperts: numE, k: topK, normTopKProb: moeW.NormTopKProb, weightsScale: moeW.WeightsScale);
+        }
+        else
         _kernels.MoeTopkSoftmax.Record(cmdBuf,
             _state.MoeRouterLogits, _state.MoeTopkIndices, _state.MoeTopkWeights,
             seqLen: seqLen, numExperts: numE, k: topK, normTopKProb: moeW.NormTopKProb);

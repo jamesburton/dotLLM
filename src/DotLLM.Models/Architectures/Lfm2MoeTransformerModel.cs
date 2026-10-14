@@ -55,6 +55,15 @@ public sealed unsafe class Lfm2MoeTransformerModel : IModel
     /// <inheritdoc/>
     public long ComputeMemoryBytes => _s.AllocatedBytes + _defaultState.AllocatedBytes;
 
+    // ── Internal accessors for the Vulkan host (weights are read from the same mmap'd GGUF views) ──
+    internal Lfm2Layer[] LayerWeights => _layers;
+    internal float[] OutputNormWeight => _outputNormWeight;
+    internal (nint Ptr, QuantizationType Qt) TokenEmbed => (_tokenEmbedWeight, _tokenEmbedQuantType);
+    internal (nint Ptr, QuantizationType Qt, int OutDim, int InDim) Output => (_outputWeight, _outputQuantType, _outputOutputDim, _outputInputDim);
+    internal int[] KvSlotForLayer => _kvSlotForLayer;
+    internal int[] ConvOrdinalForLayer => _convOrdinalForLayer;
+    internal int ConvLayerCount => _convLayerCount;
+
     /// <summary>Number of full-attention layers (the sparse KV-cache slot count).</summary>
     public int AttentionLayerCount => _attentionLayerCount;
 
@@ -533,9 +542,9 @@ public sealed unsafe class Lfm2MoeTransformerModel : IModel
 
     // ── Weights / scratch ────────────────────────────────────────────────────
 
-    private readonly record struct Lfm2Proj(nint Ptr, QuantizationType Qt, int InDim, int OutDim);
+    internal readonly record struct Lfm2Proj(nint Ptr, QuantizationType Qt, int InDim, int OutDim);
 
-    private sealed class Lfm2Layer
+    internal sealed class Lfm2Layer
     {
         public required float[] OperatorNorm;
         public required float[] FfnNorm;

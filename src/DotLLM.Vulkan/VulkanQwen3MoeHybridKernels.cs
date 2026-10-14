@@ -36,6 +36,10 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MoeSharedGateAddF32Kernel? MoeSharedGateAdd { get; private set; }
     /// <summary>Fused conv + SiLU for the GDN prefill (issue #695); null when disabled or the SPIR-V is missing.</summary>
     public GdnConvSiluF32Kernel? GdnConvSilu { get; private set; }
+    /// <summary>LFM2 gated short-conv mixer core (#1015); null when the blob is absent.</summary>
+    public Lfm2ShortConvF32Kernel? Lfm2ShortConv { get; private set; }
+    /// <summary>Sigmoid + selection-bias top-k router (DeepSeek-V3 / GLM / MiMo / LFM2-MoE); null when the blob is absent.</summary>
+    public MoeTopKSigmoidBiasF32Kernel? MoeTopkSigmoid { get; private set; }
     public MoeExpandGroupByExpertF32Kernel? MoeExpandGroupByExpert { get; private set; }
     public MoeUngroupScatterF32Kernel? MoeUngroupScatter { get; private set; }
     public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ4K { get; private set; }
@@ -512,6 +516,9 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         kernels.MatMulQ8MmvqMulti = MatMulQ8_0MmvqMultiKernel.TryCreate(device, spvDir);
         if (Environment.GetEnvironmentVariable("DOTLLM_VK_GDN_CONV_FUSED") != "0" && GdnConvSiluF32Kernel.IsSupportedOn(spvDir))
             kernels.GdnConvSilu = GdnConvSiluF32Kernel.Create(device, spvDir);
+        if (Lfm2ShortConvF32Kernel.IsSupportedOn(spvDir))
+            kernels.Lfm2ShortConv = Lfm2ShortConvF32Kernel.Create(device, spvDir);
+        kernels.MoeTopkSigmoid = MoeTopKSigmoidBiasF32Kernel.Create(device, spvDir);
 
         // Opt-outs are the same env vars the dense VulkanTransformerModel honours (kernel-level LEGACY vars are inside IsSupportedOn).
         if (Environment.GetEnvironmentVariable(VulkanTransformerModel.DisableQ2KCoopmatEnvVar) != "1" && MatMulQ2KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
@@ -704,6 +711,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeSigmoidGatedAdd.InvalidateDescriptorCache();
         MoeSharedGateAdd?.InvalidateDescriptorCache();
         GdnConvSilu?.InvalidateDescriptorCache();
+        Lfm2ShortConv?.InvalidateDescriptorCache();
+        MoeTopkSigmoid?.InvalidateDescriptorCache();
         MoeExpertOffsets?.InvalidateDescriptorCache();
         MoeBuildTileList?.InvalidateDescriptorCache();
         MoeExpandGatherGroup?.InvalidateDescriptorCache();
@@ -758,6 +767,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeSigmoidGatedAdd.Dispose();
         MoeSharedGateAdd?.Dispose();
         GdnConvSilu?.Dispose();
+        Lfm2ShortConv?.Dispose();
+        MoeTopkSigmoid?.Dispose();
         MoeWeightedScatter.Dispose();
         MoeIndexedMatmulQ4KMmq?.Dispose();
         QuantizeQ8_1RowsActivations?.Dispose();
