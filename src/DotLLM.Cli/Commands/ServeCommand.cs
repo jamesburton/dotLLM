@@ -12,7 +12,7 @@ namespace DotLLM.Cli.Commands;
 /// </summary>
 internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 {
-    public sealed class Settings : CommandSettings
+    public sealed class Settings : DotLLM.Cli.Helpers.KvQuantSettings
     {
         /// <summary>Path to a GGUF file or HuggingFace repo ID.</summary>
         [CommandArgument(0, "[model]")]
@@ -61,15 +61,14 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 
         /// <summary>KV-cache key quantization type.</summary>
         [CommandOption("--cache-type-k")]
-        [Description("KV-cache key quantization: f32 (default), q8_0, q4_0.")]
-        [DefaultValue("f32")]
-        public string CacheTypeK { get; set; } = "f32";
+        [Description("KV-cache key quantization: f32 (default), f16, q8_0, q4_0. Synonym of --kv-quant-k. " +
+                     "For the CUDA hybrid-dense model f32 means 'not given' (DOTLLM_HYBRID_KV applies); use f16 to force unquantized.")]
+        public string? CacheTypeK { get; set; }
 
         /// <summary>KV-cache value quantization type.</summary>
         [CommandOption("--cache-type-v")]
-        [Description("KV-cache value quantization: f32 (default), q8_0, q4_0.")]
-        [DefaultValue("f32")]
-        public string CacheTypeV { get; set; } = "f32";
+        [Description("KV-cache value quantization: f32 (default), f16, q8_0, q4_0. Synonym of --kv-quant-v.")]
+        public string? CacheTypeV { get; set; }
 
         /// <summary>Disable prompt caching (enabled by default).</summary>
         [CommandOption("--no-prompt-cache")]
@@ -311,6 +310,14 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             return 1;
         }
 
+        // #967: --kv-quant-k/-v are synonyms of --cache-type-k/-v; reject conflicts and bad values up front.
+        if (!DotLLM.Cli.Helpers.KvStorageCli.TryBuild(settings.CacheTypeK, settings.CacheTypeV,
+                settings.KvQuantK, settings.KvQuantV, 0, out _, out string? kvFlagError))
+        {
+            AnsiConsole.MarkupLine($"[red]{Markup.Escape(kvFlagError!)}[/]");
+            return 1;
+        }
+
         int? maxMessages;
         try
         {
@@ -338,8 +345,8 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             DecodeThreads = settings.DecodeThreads,
             Host = settings.Host,
             Port = settings.Port,
-            CacheTypeK = settings.CacheTypeK,
-            CacheTypeV = settings.CacheTypeV,
+            CacheTypeK = settings.KvQuantK ?? settings.CacheTypeK ?? "f32",
+            CacheTypeV = settings.KvQuantV ?? settings.CacheTypeV ?? "f32",
             PromptCacheEnabled = !settings.NoPromptCache,
             PromptCacheSize = settings.PromptCacheSize,
             Warmup = new WarmupOptions

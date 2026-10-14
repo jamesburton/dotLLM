@@ -411,6 +411,7 @@ To embed the same endpoints inside your own ASP.NET Core app, see [Host the Open
 | `--quant` | `-q` | *(auto)* | Quant filter when a repo has multiple `.gguf` files (e.g., `Q4_K_M`) |
 | `--cache-type-k` | | `f32` | KV-cache key quant: `f32`, `q8_0`, `q4_0` |
 | `--cache-type-v` | | `f32` | KV-cache value quant: `f32`, `q8_0`, `q4_0` |
+| `--kv-quant-k` / `--kv-quant-v` | | *(unset)* | Synonyms of `--cache-type-k/-v` (`f16`, `q8_0`, `q4_0`); on `run`, `bench` and `serve`. The only way to select quantized KV for the CUDA hybrid-dense model (Bonsai-2 / qwen35), where they override `DOTLLM_HYBRID_KV`. See [docs/KV_CACHE.md](docs/KV_CACHE.md) |
 | `--speculative-model` | | *(none)* | Draft model for speculative decoding (must share vocab) |
 | `--speculative-k` | | 3 | Draft tokens per speculative step |
 | `--mtp-head` | | *(auto)* | `serve`: path of a separate MTP head GGUF (qwen4exp `mtp-*.gguf`); an auto-detected sibling is attached when it fits the device. See [docs/SERVER.md](docs/SERVER.md) |

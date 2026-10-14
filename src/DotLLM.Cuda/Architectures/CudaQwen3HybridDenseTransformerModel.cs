@@ -188,29 +188,50 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     private nint _kvF16ScratchV;
     private long _kvF16ScratchElems;
 
-    private static (KvCacheDType key, KvCacheDType value) ParseKvStorageEnv()
-    {
-        string? v = Environment.GetEnvironmentVariable("DOTLLM_HYBRID_KV")?.Trim().ToLowerInvariant();
-        return v switch
-        {
-            null or "" or "f16" or "f32" => (KvCacheDType.F32, KvCacheDType.F32),
-            "q8_0" or "q8" => (KvCacheDType.Q8_0, KvCacheDType.Q8_0),
-            "q4_0" or "q4" => (KvCacheDType.Q4_0, KvCacheDType.Q4_0),
-            "k8v4" => (KvCacheDType.Q8_0, KvCacheDType.Q4_0),
-            "k4v8" => (KvCacheDType.Q4_0, KvCacheDType.Q8_0),
-            _ => throw new InvalidOperationException(
-                $"DOTLLM_HYBRID_KV='{v}' is not one of f16, q8_0, q4_0, k8v4, k4v8."),
-        };
-    }
+    private static (KvCacheDType key, KvCacheDType value) ParseKvStorageEnv() =>
+        HybridKvStorage.Resolve(null, null, Environment.GetEnvironmentVariable(HybridKvStorage.EnvVar));
 
     private static bool IsQuantKv(KvCacheDType d) => d is KvCacheDType.Q8_0 or KvCacheDType.Q4_0;
 
-    private static long QuantRowBytes(KvCacheDType d, int kvElems) => d switch
+    private static long QuantRowBytes(KvCacheDType d, int kvElems) => HybridKvStorage.RowBytes(d, kvElems);
+
+    /// <summary>Effective key storage format (<see cref="KvCacheDType.F32"/> means an unquantized F16 cache).</summary>
+    public KvCacheDType KvKeyStorage => _kvKeyDType;
+
+    /// <summary>Effective value storage format (<see cref="KvCacheDType.F32"/> means an unquantized F16 cache).</summary>
+    public KvCacheDType KvValueStorage => _kvValueDType;
+
+    /// <summary>Short label of the effective KV storage: <c>f16</c>, <c>q8_0</c>, <c>q4_0</c>, <c>k8v4</c>, <c>k4v8</c>.</summary>
+    public string KvStorageLabel => HybridKvStorage.Label(_kvKeyDType, _kvValueDType);
+
+    /// <summary>
+    /// Persistent K/V device bytes for <paramref name="maxSeqLen"/> tokens across all full-attention
+    /// slots under the effective storage format. The VRAM ledger and the CLI summary share this.
+    /// </summary>
+    public long ComputeKvBytes(long maxSeqLen) => HybridKvStorage.TotalBytes(
+        _attentionLayerCount, maxSeqLen, Config.NumKvHeads * Config.HeadDim, _kvKeyDType, _kvValueDType);
+
+    /// <summary>Persistent K/V device bytes actually allocated so far (0 before the first attention forward).</summary>
+    public long KvAllocatedBytes => _f16KCache is null ? 0 : ComputeKvBytes(_f16CacheMaxSeqLen);
+
+    /// <summary>
+    /// Selects the KV storage format (issue #967). A non-null argument is an explicit request and
+    /// overrides <c>DOTLLM_HYBRID_KV</c> for that side; a null argument keeps the current value
+    /// (environment variable or default). Must be called before the first attention-enabled forward.
+    /// </summary>
+    /// <exception cref="NotSupportedException">The format is unsupported or the KV row width is not a multiple of 32.</exception>
+    /// <exception cref="InvalidOperationException">The KV cache has already been allocated.</exception>
+    public void ConfigureKvStorage(KvCacheDType? key, KvCacheDType? value)
     {
-        KvCacheDType.Q8_0 => (long)kvElems / 32 * 34,
-        KvCacheDType.Q4_0 => (long)kvElems / 32 * 18,
-        _ => (long)kvElems * sizeof(ushort),
-    };
+        if (_f16KCache is not null || _kQuant is not null)
+            throw new InvalidOperationException("KV storage must be chosen before the first Forward.");
+        var k = key ?? _kvKeyDType;
+        var v = value ?? _kvValueDType;
+        string? error = HybridKvStorage.Validate(k, v, Config.NumKvHeads * Config.HeadDim);
+        if (error is not null) throw new NotSupportedException(error);
+        _kvKeyDType = k;
+        _kvValueDType = v;
+    }
 
     /// <summary>
     /// Test-only (issue #956): selects the KV storage format. Must be called before the first
@@ -3322,8 +3343,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             if (s_vramLedger && !_vramLedgerLogged)
             {
                 _vramLedgerLogged = true;
-                long kvBytes = (long)_attentionLayerCount * _f16CacheMaxSeqLen *
-                    (QuantRowBytes(_kvKeyDType, kvElems) + QuantRowBytes(_kvValueDType, kvElems));
+                long kvBytes = ComputeKvBytes(_f16CacheMaxSeqLen);
                 long f32Stage = 2L * _f32KvStageElems * sizeof(float);
                 long f16Scratch = (IsQuantKv(_kvKeyDType) ? 1L : 0L) + (IsQuantKv(_kvValueDType) ? 1L : 0L);
                 f16Scratch *= _kvF16ScratchElems * sizeof(ushort);
