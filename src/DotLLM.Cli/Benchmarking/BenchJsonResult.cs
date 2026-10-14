@@ -64,8 +64,8 @@ public sealed class BenchJsonResult
     /// <summary>Context depth the timed decode ran at (prompt + depth).</summary>
     public int DecodeCtxDepth { get; init; }
 
-    /// <summary>The discarded warm-up repetition.</summary>
-    public required BenchJsonRep Warmup { get; init; }
+    /// <summary>The discarded warm-up repetition; <see langword="null"/> when warm-up was skipped.</summary>
+    public BenchJsonRep? Warmup { get; init; }
 
     /// <summary>Measured repetitions (warm-up excluded), in run order.</summary>
     public required BenchJsonRep[] Reps { get; init; }
