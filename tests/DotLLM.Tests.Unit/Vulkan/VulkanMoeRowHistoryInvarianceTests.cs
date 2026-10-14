@@ -26,8 +26,8 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// </para>
 /// <para>
 /// <b>Why this fixture.</b> The condition is a ratio of widths, so the tiny model has Q8_0 attention weights (the quantization whose MMQ path is gated on
-/// the scratch) and <c>numHeads x headDim</c> = 128 against <c>hidden = moeIntermediate = 64</c>: after a 4-row forward a 2-row o_proj fits
-/// (2 x 128 &lt;= 4 x 64), on a fresh state it does not (2 x 128 &gt; 2 x 64). Run on the pre-fix code this test fails; see the PR for the mutant evidence.
+/// the scratch) and <c>numHeads x headDim</c> = 128 against <c>hidden = moeIntermediate = 96</c> (the gpt-oss-20b ratio is 4096 / 2880 = 1.42; here 1.33): after a 3-row
+/// forward a 2-row o_proj fits (2 x 128 &lt;= 3 x 96), on a fresh state it does not (2 x 128 &gt; 2 x 96). Run on the pre-fix code this test fails; see the PR for the mutant evidence.
 /// The 1-row case is excluded on purpose: the single-row Q8_1 scratch is capacity independent.
 /// </para>
 /// </remarks>
@@ -35,8 +35,8 @@ namespace DotLLM.Tests.Unit.Vulkan;
 [Collection("VulkanKernels")]
 public sealed class VulkanMoeRowHistoryInvarianceTests : IDisposable
 {
-    private const int Hidden = 64, Layers = 2, Heads = 4, KvHeads = 2, HeadDim = 32, Vocab = 64, Experts = 8, TopK = 2, MoeI = 64, Window = 3, Ctx = 128;
-    private const int QDim = Heads * HeadDim;   // 128 > Hidden = MoeI = 64: the o_proj input is wider than the scratch's maxK
+    private const int Hidden = 96, Layers = 2, Heads = 4, KvHeads = 2, HeadDim = 32, Vocab = 64, Experts = 8, TopK = 2, MoeI = 96, Window = 3, Ctx = 128;
+    private const int QDim = Heads * HeadDim;   // 128 > Hidden = MoeI = 96: the o_proj input is wider than the scratch's maxK
 
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "dotllm-1016-" + Guid.NewGuid().ToString("N"));
 
