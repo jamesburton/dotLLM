@@ -476,12 +476,20 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         DotLLM.Cuda.CudaPagedKvCacheFactory? cudaPagedFactory = null;
         if (vulkanKv is not null)
         {
-            // Vulkan models own their device-resident KV storage (the factory is the one the shared loader returned). Like serve,
-            // paged / quantized KV are not available on Vulkan and the prefix cache is off (no snapshot/restore of device KV).
-            if (settings.Paged || kvConfig.IsQuantized)
-                AnsiConsole.MarkupLine("[yellow]WARNING: paged / quantized KV-cache is not supported on Vulkan; using the model's own device KV-cache.[/]");
-            var vkFactory = vulkanKv;
-            kvFactory = (cfg, size) => vkFactory(size);
+            if (settings.Paged)
+                AnsiConsole.MarkupLine("[yellow]WARNING: Paged KV-cache is not supported on Vulkan; using the model's own device KV-cache.[/]");
+
+            if (kvConfig.IsQuantized && model is DotLLM.Vulkan.VulkanTransformerModel vkModel)
+            {
+                string spvDir = DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir();
+                kvFactory = (cfg, size) => vkModel.CreateQuantizedKvCache(
+                    spvDir, size, kvConfig.KeyDType, kvConfig.ValueDType);
+            }
+            else
+            {
+                var vkFactory = vulkanKv;
+                kvFactory = (cfg, size) => vkFactory(size);
+            }
         }
         else if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
         {
