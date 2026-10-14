@@ -150,4 +150,66 @@ public sealed class VulkanNativeQ4_0DenseKernelTests
             Assert.True(Math.Abs(actual[i] - expected[i]) <= tol,
                 $"t={i / m} row={i % m}: gpu={actual[i]:F6} vs ref={expected[i]:F6} (tol {tol:G4}, rms {rms:G4})");
     }
+
+    [SkippableTheory]
+    [InlineData(1, 32)]
+    [InlineData(5, 96)]
+    [InlineData(300, 2080)]    // 65 blocks, ragged rows
+    [InlineData(2048, 2048)]
+    public void ScalarGemv_MatchesCpuReference(int m, int k)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        using var kernel = MatMulQ4_0GemvF32Kernel.Create(device, spvDir);
+        var rng = new Random(0x2018 + m * 7 + k);
+        byte[] w = RandomWeights(rng, m, k);
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = rng.NextSingle() * 2f - 1f;
+        float[] wf = Dequant(w, m, k);
+        using var bufW = device.Allocate(((long)w.Length + 3) & ~3L);
+        using var bufX = device.Allocate((long)k * sizeof(float));
+        using var bufY = device.Allocate((long)m * sizeof(float));
+        device.Upload(new ReadOnlySpan<byte>(w), bufW);
+        device.Upload(x, bufX);
+        kernel.Launch(bufW, bufX, bufY, m, k);
+        float[] actual = new float[m];
+        device.Download(bufY, actual);
+        for (int r = 0; r < m; r++)
+        {
+            double acc = 0;
+            for (int i = 0; i < k; i++) acc += (double)wf[(long)r * k + i] * x[i];
+            Assert.True(Math.Abs(actual[r] - acc) <= 1e-3 + 1e-4 * Math.Abs(acc), $"row {r}: gpu={actual[r]:G9} ref={acc:G9}");
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData(1, 1, 32)]
+    [InlineData(17, 33, 96)]
+    [InlineData(40, 130, 2080)]
+    public void ScalarGemm_MatchesCpuReference(int n, int m, int k)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        using var kernel = MatMulQ4_0GemmF32Kernel.Create(device, spvDir);
+        var rng = new Random(0x3018 + n * 31 + m * 17 + k);
+        byte[] w = RandomWeights(rng, m, k);
+        float[] b = new float[(long)n * k];
+        for (int i = 0; i < b.Length; i++) b[i] = rng.NextSingle() * 2f - 1f;
+        float[] wf = Dequant(w, m, k);
+        using var bufW = device.Allocate(((long)w.Length + 3) & ~3L);
+        using var bufB = device.Allocate((long)n * k * sizeof(float));
+        using var bufC = device.Allocate((long)n * m * sizeof(float));
+        device.Upload(new ReadOnlySpan<byte>(w), bufW);
+        device.Upload(b, bufB);
+        kernel.Launch(bufW, bufB, bufC, m, k, n);
+        float[] actual = new float[(long)n * m];
+        device.Download(bufC, actual);
+        for (int t = 0; t < n; t++)
+            for (int r = 0; r < m; r++)
+            {
+                double acc = 0;
+                for (int i = 0; i < k; i++) acc += (double)wf[(long)r * k + i] * b[(long)t * k + i];
+                Assert.True(Math.Abs(actual[(long)t * m + r] - acc) <= 1e-3 + 1e-4 * Math.Abs(acc), $"t={t} row {r}: gpu={actual[(long)t * m + r]:G9} ref={acc:G9}");
+            }
+    }
 }
