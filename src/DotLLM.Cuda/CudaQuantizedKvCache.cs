@@ -223,11 +223,11 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache
                 {
                     nint kSrc = keysDevice + (nint)(i * fp16RowBytes);
                     nint vSrc = valuesDevice + (nint)(i * fp16RowBytes);
-                    nint kDst = _keysQuant[layerIndex] + (nint)((long)pos * _keyQuantRowBytes);
-                    nint vDst = _valuesQuant[layerIndex] + (nint)((long)pos * _valueQuantRowBytes);
+                    nint kDst = _keysQuant[layerIndex] + (nint)((long)pos * _keyQuantRowBytes[layerIndex]);
+                    nint vDst = _valuesQuant[layerIndex] + (nint)((long)pos * _valueQuantRowBytes[layerIndex]);
 
-                    kernels.LaunchQuantKv(kSrc, kDst, _kvStride, KeyDType, stream);
-                    kernels.LaunchQuantKv(vSrc, vDst, _kvStride, ValueDType, stream);
+                    kernels.LaunchQuantKv(kSrc, kDst, stride, KeyDType, stream);
+                    kernels.LaunchQuantKv(vSrc, vDst, stride, ValueDType, stream);
                 }
             }
 
