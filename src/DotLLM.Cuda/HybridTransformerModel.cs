@@ -507,15 +507,26 @@ public sealed unsafe class HybridTransformerModel : IModel
                 {
                     var kRef = new TensorRef(seqLen, kvStride, DType.Float32, -1, (nint)k);
                     var vRef = new TensorRef(seqLen, kvStride, DType.Float32, -1, (nint)v);
+                    int cpuLocalLayer = cpuCacheLayer - _numGpuLayers;
                     hybridKvCache.Update(kRef, vRef, positions, cpuCacheLayer);
 
                     int seqKv = hybridKvCache.CpuCache.CurrentLength;
-                    var cachedK = hybridKvCache.CpuCache.GetKeysRef(cpuCacheLayer - _numGpuLayers);
-                    var cachedV = hybridKvCache.CpuCache.GetValuesRef(cpuCacheLayer - _numGpuLayers);
 
-                    Attention.Execute(q, (float*)cachedK.DataPointer, (float*)cachedV.DataPointer, attnOut,
-                        seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], _threadPool,
-                        _slidingWindowSize);
+                    if (hybridKvCache.CpuCache is IQuantizedKvCache qkvCache)
+                    {
+                        Attention.Execute(q, qkvCache, cpuLocalLayer, attnOut,
+                            seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], _threadPool,
+                            _slidingWindowSize);
+                    }
+                    else
+                    {
+                        var cachedK = hybridKvCache.CpuCache.GetKeysRef(cpuLocalLayer);
+                        var cachedV = hybridKvCache.CpuCache.GetValuesRef(cpuLocalLayer);
+
+                        Attention.Execute(q, (float*)cachedK.DataPointer, (float*)cachedV.DataPointer, attnOut,
+                            seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], _threadPool,
+                            _slidingWindowSize);
+                    }
                 }
                 else
                 {
