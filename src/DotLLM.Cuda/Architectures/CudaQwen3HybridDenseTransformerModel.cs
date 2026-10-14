@@ -135,9 +135,9 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     // Identity of the IKvCache instance last seen by ForwardFullAttnBody (issue #185). A fresh
     // Forward call whose kvCache is a DIFFERENT instance than last time means "new/unrelated
     // sequence" even when its MaxLength happens to match the previous cache's -- EnsureF16KvCache's
-    // "maxSeqLen <= _f16CacheMaxSeqLen" guard only resets _f16CacheCurrentLength/_f32KvValidLength
-    // on a capacity-driven reallocation, so a same-size reused-instance-free sequence (e.g. every
-    // rep after the first in `dotllm bench -r N>1`, or a scheduler session rebuild that lands on an
+    // "maxSeqLen <= _f16CacheMaxSeqLen" guard only resets _f16CacheCurrentLength on a
+    // capacity-driven reallocation, so a same-size reused-instance-free sequence (e.g. every rep
+    // after the first in `dotllm bench -r N>1`, or a scheduler session rebuild that lands on an
     // identical cacheSize) would otherwise leave the previous sequence's final depth "stuck" for the
     // new sequence's entire duration. Reference identity is a reliable signal here because every
     // caller (BenchRunner, ContinuousBatchScheduler, TextGenerator) allocates a brand-new IKvCache
@@ -149,24 +149,11 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     private nint _f16KvWriteStaging;
     private long _f16KvWriteStagingElems;
 
-    // Per-attention-layer-slot F32 KV read-staging buffers (issue #182). ONE pair per slot
-    // (not shared across the 16 full-attention layers, unlike the old single shared-buffer
-    // design) so each slot's incrementally-converted history survives from one layer's call
-    // to the next layer's call within the same decode step, and across decode steps.
-    // _f32KvValidLength[slot] tracks how many leading KV positions are already validly
-    // converted into _f32KvReadStagingK/V[slot] as of the last call for that slot -- see
-    // ForwardFullAttnBody's "incremental KV F16->F32 staging" block and EnsureF32KvReadStaging.
+    // Per-attention-layer-slot F32 KV read-staging buffers. ONE pair per slot (not shared
+    // across the full-attention layers) — each layer's call overwrites its slot's content.
     private nint[]? _f32KvReadStagingK;
     private nint[]? _f32KvReadStagingV;
     private long[]? _f32KvReadStagingElems;
-    private int[]? _f32KvValidLength;
-
-    // Test-only escape hatch (issue #182): forces every call to take the full-range
-    // reconversion path (pre-fix behavior) instead of the incremental append fast path. Used by
-    // CudaQwen3HybridDenseIncrementalKvDequantTest to assert the fast path is bit-exact against
-    // the old behavior across many consecutive decode steps and buffer growths. Never set on the
-    // production Forward path.
-    internal bool ForceFullKvReconvertForTest { get; set; }
 
     /// <summary>
     /// Test-only accessor for issue #185's regression test — exposes the F16 KV cache's current
@@ -175,13 +162,6 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// black-box logits comparison cannot discriminate broken vs. fixed here.
     /// </summary>
     internal int DebugF16CacheCurrentLengthForTest => _f16CacheCurrentLength;
-
-    /// <summary>
-    /// Test-only counter (issue #478): full-range F16→F32 KV reconversions taken by
-    /// <see cref="ForwardFullAttnBody"/> (one per attention slot per forward that misses the
-    /// incremental #182 path). Lets a test prove a post-rollback append stays incremental.
-    /// </summary>
-    internal int DebugFullKvReconvertCountForTest { get; private set; }
 
     // Opt-in split-KV attention (issue #183) scratch: partial (max, sum, out) per (head, split).
     // Sized once for the model's fixed (numHeads, headDim) shape and reused every decode step.
@@ -1054,15 +1034,14 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
 
     /// <summary>
     /// Advances the length-only KV handle to cover <paramref name="positions"/> and, first, syncs the
-    /// model-owned KV lengths to the handle's committed length (issues #476, #478).
+    /// model-owned F16 cursor to the handle's committed length (issues #476, #478).
     /// </summary>
     /// <remarks>
     /// The handle is length-only, but callers rely on its <c>CurrentLength</c>: speculative decoding
     /// rolls it back to a committed position after a rejected round. Nothing used to advance it, so
     /// <c>Rollback(n &gt; 0)</c> always threw (#476). Its length BEFORE this call is the committed
-    /// prefix; <see cref="_f16CacheCurrentLength"/> and every <see cref="_f32KvValidLength"/> slot
-    /// shrink to it, so post-rollback appends take the incremental #182 conversion instead of a
-    /// full-range reconversion (#478). Runs once per forward, before any attention layer reads them.
+    /// prefix; <see cref="_f16CacheCurrentLength"/> shrinks to it so the next forward converts only
+    /// the live range (#478). Runs once per forward, before any attention layer reads it.
     /// </remarks>
     private void AdvanceKvHandleAndSyncLengths(IKvCache? kvCache, ReadOnlySpan<int> positions)
     {
@@ -1070,7 +1049,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             return;
 
         _f16CacheCurrentLength = HybridKvLengthBookkeeping.SyncToCommitted(
-            _f16CacheCurrentLength, _f32KvValidLength ?? Span<int>.Empty, handle.CurrentLength);
+            _f16CacheCurrentLength, handle.CurrentLength);
 
         int maxPos = 0;
         for (int i = 0; i < positions.Length; i++)
@@ -3121,7 +3100,6 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             {
                 _lastForwardKvCache = kvCache;
                 _f16CacheCurrentLength = 0;
-                if (_f32KvValidLength is not null) Array.Clear(_f32KvValidLength);
             }
 
             EnsureF16KvCache(kvCache.MaxLength, numKvHeads, headDim);
@@ -3136,77 +3114,16 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             int seqKv = _f16CacheCurrentLength;
             int kvLiveElems = seqKv * kvElems;
 
-            // EnsureF32KvReadStaging may grow (and reset _f32KvValidLength[slot] to 0) --
-            // always read the valid-length AFTER this call so a fresh grow is observed below.
             EnsureF32KvReadStaging(slot, seqKv, kvElems);
             nint kStage = _f32KvReadStagingK![slot];
             nint vStage = _f32KvReadStagingV![slot];
 
-            // Incremental KV F16->F32 staging (issue #182): the old code unconditionally
-            // reconverted the ENTIRE [0, seqKv) live range every call, even though ordinary
-            // prefill/decode only ever APPENDS rows (one row per decode step). Convert just the
-            // newly-written range when it is a plain contiguous append starting exactly where
-            // this slot's staging buffer left off; otherwise fall back to the old full-range
-            // reconversion, which is always correct (just not fast) and re-synchronizes
-            // _f32KvValidLength. The fallback also covers non-contiguous position batches, a
-            // freshly-grown/reallocated buffer (content lost, valid length reset to 0 above), and
-            // a KV-cache handle reused for an unrelated sequence without a growth-triggered reset
-            // (that case cannot be told apart here from ordinary appends by length alone, but ANY
-            // deviation from "starts exactly at the recorded valid length" -- including the
-            // shrink case the position range would otherwise imply -- is treated as untrusted and
-            // triggers the safe full reconversion). Issue #478: a speculative-decoding rollback is
-            // NOT such a deviation any more -- AdvanceKvHandleAndSyncLengths shrinks this slot's
-            // valid length to the handle's committed length before the first layer runs, so the
-            // post-rollback append starts exactly at it and stays incremental.
-            //
-            // Result (issue #182, RTX 3060, real Bonsai-27B, single continuous decode sequence --
-            // NOT `dotllm bench -r N>1`, which was found during this work to be unsuitable for
-            // measuring this specific change: all reps but the discarded warmup shared one model
-            // instance whose _f16CacheCurrentLength never reset when a same-size IKvCache was
-            // reused, so every REPORTED rep ran "stuck" at the previous rep's final depth for its
-            // entire duration -- a separate bench-methodology gap, not a correctness bug in this
-            // fix, tracked and FIXED by issue #185's reference-identity reset above): bit-exact vs. the old full-range
-            // reconversion (dedicated correctness test, many consecutive steps incl. a mid-run F32
-            // staging buffer growth). End-to-end wall-clock across several full single-sequence
-            // decode runs (2048-4096 steps, single-token-decode-loop depth-building to avoid an
-            // unrelated pre-existing VRAM-ceiling issue in the batched --depth path -- also found
-            // this session, reproduces identically on unmodified pre-#182 code): a small, directionally
-            // positive but noise-comparable full-run win (roughly 0 to +4.5% across independent
-            // rounds, averaging ~+1.5%), consistent with the theoretical model (this eliminates a
-            // per-decode-step O(depth) cost, i.e. an O(depth^2) cumulative cost over a generation,
-            // replacing it with O(1) per step / O(depth) cumulative -- but attn-6b-kvdequant was
-            // always a small slice of total decode time next to the O(depth) naive-attention kernel
-            // itself, `attn-6c-core`, which this fix does not touch). Kept: zero added
-            // synchronization/round-trips, provably less work than before in every case, and no
-            // observed regression in any round (unlike this file's several genuine negative results,
-            // which all showed consistent, large regressions from added sync overhead).
-            int prevValid = _f32KvValidLength![slot];
-            bool contiguousAppend = HybridKvLengthBookkeeping.IsIncrementalAppend(
-                positions, prevValid, ForceFullKvReconvertForTest);
-
-            if (contiguousAppend)
-            {
-                int newCount = positions.Length;
-                if (newCount > 0)
-                {
-                    long newFirstElems = (long)positions[0] * kvElems;
-                    int newElems = newCount * kvElems;
-                    nint kSrc = _f16KCache![slot] + (nint)(newFirstElems * sizeof(ushort));
-                    nint vSrc = _f16VCache![slot] + (nint)(newFirstElems * sizeof(ushort));
-                    nint kDst = kStage + (nint)(newFirstElems * sizeof(float));
-                    nint vDst = vStage + (nint)(newFirstElems * sizeof(float));
-                    _kernels.LaunchConvertF16ToF32(kSrc, kDst, newElems, streamH);
-                    _kernels.LaunchConvertF16ToF32(vSrc, vDst, newElems, streamH);
-                }
-                _f32KvValidLength[slot] = Math.Max(prevValid, positions[^1] + 1);
-            }
-            else
-            {
-                _kernels.LaunchConvertF16ToF32(_f16KCache![slot], kStage, kvLiveElems, streamH);
-                _kernels.LaunchConvertF16ToF32(_f16VCache![slot], vStage, kvLiveElems, streamH);
-                _f32KvValidLength[slot] = seqKv;
-                DebugFullKvReconvertCountForTest++;
-            }
+            // Full F16->F32 reconversion of the live KV range every call. The former incremental
+            // path (#182) was removed by #977: the tensor-core MMA decode attention reads
+            // directly from F16, so the F32 staging is only a fallback for non-MMA tiers and the
+            // added bookkeeping complexity was not justified.
+            _kernels.LaunchConvertF16ToF32(_f16KCache![slot], kStage, kvLiveElems, streamH);
+            _kernels.LaunchConvertF16ToF32(_f16VCache![slot], vStage, kvLiveElems, streamH);
             ProfMark("attn-6b-kvdequant");
 
             // Opt-in split-KV ("Flash-Decoding") attention (issue #183): attention_f32's grid is
@@ -3219,9 +3136,8 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             // check. Off by default (DOTLLM_ATTN_SPLIT_KV=1 to enable) — see CudaKernels.cs's
             // EnableAttentionSplitKv doc and attention_f32.cu's header for the full tradeoff
             // (reassociated, not bit-exact, float reduction across the cross-block combine).
-            // kStage/vStage are this SLOT's per-layer F32 KV staging buffers (issue #182 made
-            // these per-slot arrays, not one shared buffer) — the split-KV kernel reads the same
-            // staged data the exact kernel would, just via more blocks.
+            // kStage/vStage are this SLOT's per-layer F32 KV staging buffers — the split-KV
+            // kernel reads the same staged data the exact kernel would, just via more blocks.
             // Opt-in combined GQA-group + split-KV attention (issues #197 + #198): register-blocks
             // the QK/PV loops across the numHeads/numKvHeads query-head group sharing each KV
             // head (grid = numKvHeads instead of numHeads), composed with a runtime-tuned KV
@@ -3415,13 +3331,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         _f16CacheMaxSeqLen = maxSeqLen;
         _f16CacheCurrentLength = 0;
 
-        // Per-slot F32 KV read-staging (issue #182): reset alongside the F16 cache reallocation
-        // above. Freeing any previously-allocated staging buffers and re-zeroing the valid-length
-        // array here mirrors _f16CacheCurrentLength's own reset -- the next ForwardFullAttnBody
-        // call for every slot will see prevValid==0, take the "not a matching contiguous append"
-        // branch only if positions[0] != 0 (freshly-sized buffers still correctly fast-path a
-        // from-scratch prefill starting at position 0), and otherwise safely fall back to a full
-        // reconversion.
+        // Per-slot F32 KV read-staging: reset alongside the F16 cache reallocation above.
         if (_f32KvReadStagingK is not null)
         {
             for (int i = 0; i < _f32KvReadStagingK.Length; i++)
@@ -3433,7 +3343,6 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         _f32KvReadStagingK = new nint[_attentionLayerCount];
         _f32KvReadStagingV = new nint[_attentionLayerCount];
         _f32KvReadStagingElems = new long[_attentionLayerCount];
-        _f32KvValidLength = new int[_attentionLayerCount];
     }
 
     private void EnsureF16KvWriteStaging(int seqLen, int kvElems)
@@ -3451,11 +3360,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
 
     /// <summary>
     /// Ensures <paramref name="slot"/>'s F32 KV read-staging buffer pair can hold
-    /// <c>seqKv * kvElems</c> floats, growing (doubling) if needed. A grow reallocates the
-    /// buffer at a new address with unspecified content -- any previously-converted prefix for
-    /// this slot is gone, so <see cref="_f32KvValidLength"/>[<paramref name="slot"/>] is reset to
-    /// 0, forcing the caller (see the "incremental KV F16->F32 staging" block in
-    /// <c>ForwardFullAttnBody</c>) to fully reconvert on its next use of this slot.
+    /// <c>seqKv * kvElems</c> floats, growing (doubling) if needed.
     /// </summary>
     private void EnsureF32KvReadStaging(int slot, int seqKv, int kvElems)
     {
@@ -3470,7 +3375,6 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         _f32KvReadStagingK[slot] = AllocDevice(grown * sizeof(float));
         _f32KvReadStagingV![slot] = AllocDevice(grown * sizeof(float));
         _f32KvReadStagingElems[slot] = grown;
-        _f32KvValidLength![slot] = 0;
     }
 
 

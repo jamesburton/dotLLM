@@ -1051,8 +1051,9 @@ This is well-proven — llama.cpp, vLLM, and every CUDA inference engine uses th
   `CudaAttentionMmaDecodeGqaSplit.CanUse`'s own shape checks (at group=1 there's no query-head
   group to pack into the mma tile's M dimension, degenerating to v1's exact failure mode), converts
   Q to FP16 into a new dedicated scratch buffer, and reads K/V straight from the FP16 KV cache
-  (skips the F32 staging conversion this call doesn't need, though that conversion still runs
-  unconditionally for the fallback tiers below it).
+  (skips the F32 staging conversion this call doesn't need; the fallback tiers below it
+  reconvert the full live range each call — the former incremental staging optimization
+  from #182 was removed by #977 as the MMA tier made it dead weight).
 
   A dedicated generation-parity test
   (`tests/DotLLM.Tests.Integration/Cuda/CudaAttentionMmaDecodeGqaSplitGenerationParityTests.cs`,

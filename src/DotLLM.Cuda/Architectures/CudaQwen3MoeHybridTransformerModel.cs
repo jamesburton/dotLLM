@@ -1765,10 +1765,9 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             // Issue #478: the handle's length before this call is the committed prefix. After a
             // speculative rollback the model's own cursor still sits at the old maximum, and every
             // later forward would convert and attend over the rejected rows until the sequence
-            // outgrew it (masked by position, so wasted work rather than wrong output). This model
-            // has no incremental #182 staging, so only the F16 cursor needs the sync.
+            // outgrew it (masked by position, so wasted work rather than wrong output).
             _f16CacheCurrentLength = HybridKvLengthBookkeeping.SyncToCommitted(
-                _f16CacheCurrentLength, Span<int>.Empty, handle.CurrentLength);
+                _f16CacheCurrentLength, handle.CurrentLength);
 
             int maxPos = 0;
             for (int i = 0; i < positions.Length; i++)
