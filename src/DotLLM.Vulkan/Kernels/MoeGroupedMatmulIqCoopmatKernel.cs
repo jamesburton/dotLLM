@@ -64,6 +64,7 @@ public sealed class MoeGroupedMatmulIqCoopmatKernel : IDisposable
         MoeIqQuant.IQ3_XXS => "moe_grouped_matmul_iq3_xxs_coopmat_m64.spv",
         MoeIqQuant.Q2_0 => "moe_grouped_matmul_q2_0_coopmat_m64.spv",
         MoeIqQuant.IQ1_M => "moe_grouped_matmul_iq1_m_coopmat_m64.spv",
+        MoeIqQuant.Q4_0 => "moe_grouped_matmul_q4_0_coopmat_m64.spv",
         _ => throw new ArgumentOutOfRangeException(nameof(quant)),
     };
 

@@ -221,6 +221,12 @@ struct Stage { uint aw[5]; vec4 bv; };   // aw: the block's 18 bytes realigned t
     }
 ''' + B_COMMIT)
 
+# Q4_0 (issue #1018): the IQ4_NL block (18 bytes: fp16 d, 16 nibble bytes) with a linear decode value = d * (nibble - 8).
+Q4_0 = dict(
+    name='q4_0', fmt='Q4_0', kreq='64', extra='',
+    layout='Bank layout: [E, M, K/32 blocks of 18 bytes]: fp16 d, qs[16] (low nibble of byte j = element j, high nibble = element j + 16);\n// value = d * (nibble - 8). Blocks are 18 bytes (not word aligned): each thread loads the 5 words covering its block and funnel-shifts them.',
+    body=IQ4_NL['body'].replace(KV, '').replace('IQ4_NL_BLOCK_BYTES', 'Q4_0_BLOCK_BYTES').replace('d * float(KV[nib])', 'd * float(int(nib) - 8)'))
+
 # ---------------------------------------------------------------------------------------------------------------------------------
 # IQ4_XS: 136-byte super-blocks (word aligned): d, scales_h, scales_l[4], qs[128]; sub-block s = ib32 of the super-block.
 IQ4_XS = dict(
@@ -530,7 +536,7 @@ struct Stage { uint sw0; uint sw1; uint qs2; uint qhb; uint ib; vec4 bv; };   //
     }
 ''' + B_COMMIT)
 
-SHADERS = [IQ4_NL, IQ4_XS, IQ3_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, Q2_0, IQ1_M]
+SHADERS = [IQ4_NL, IQ4_XS, IQ3_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, Q2_0, IQ1_M, Q4_0]
 
 
 def render(spec):

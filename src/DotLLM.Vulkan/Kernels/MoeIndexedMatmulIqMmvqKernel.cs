@@ -24,6 +24,8 @@ public enum MoeIqQuant
     Q2_0,
     /// <summary>IQ1_M: 56 B / 256 elements, iq1s ternary grid.</summary>
     IQ1_M,
+    /// <summary>Q4_0 (issue #1018): 18 B / 32 elements, value = d * (nibble - 8); same block as IQ4_NL with a linear instead of a codebook decode.</summary>
+    Q4_0,
 }
 
 /// <summary>Per-format facts shared by the indexed MMVQ and grouped coopmat IQ kernels (#823).</summary>
@@ -41,6 +43,7 @@ internal static class MoeIqFormats
         MoeIqQuant.IQ3_XXS => (QuantFormat.IQ3_XXSBlockBytes, QuantFormat.KQuantGroupSize),
         MoeIqQuant.Q2_0 => (QuantFormat.Q2_0BlockBytes, QuantFormat.Q2_0GroupSize),
         MoeIqQuant.IQ1_M => (QuantFormat.IQ1_MBlockBytes, QuantFormat.KQuantGroupSize),
+        MoeIqQuant.Q4_0 => (QuantFormat.Q4_0BlockBytes, QuantFormat.LegacyGroupSize),
         _ => throw new ArgumentOutOfRangeException(nameof(quant)),
     };
 
@@ -56,6 +59,7 @@ internal static class MoeIqFormats
         QuantizationType.IQ3_XXS => MoeIqQuant.IQ3_XXS,
         QuantizationType.Q2_0 => MoeIqQuant.Q2_0,
         QuantizationType.IQ1_M => MoeIqQuant.IQ1_M,
+        QuantizationType.Q4_0 => MoeIqQuant.Q4_0,
         _ => null,
     };
 
@@ -104,10 +108,13 @@ public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
     /// blocks per step, so a wave issues ~5x fewer load instructions per weight byte (V1 was issue/latency bound at ~70-110 GB/s on gfx1151).
     /// The float summation order over a row differs from V1 (rounding-level).
     /// </summary>
-    internal static bool HasV2(MoeIqQuant quant) => quant is MoeIqQuant.IQ1_M or MoeIqQuant.IQ2_XXS or MoeIqQuant.IQ2_XS;
+    internal static bool HasV2(MoeIqQuant quant) => quant is MoeIqQuant.IQ1_M or MoeIqQuant.IQ2_XXS or MoeIqQuant.IQ2_XS or MoeIqQuant.Q4_0;
 
     /// <summary>Default for new kernels; <c>DOTLLM_VK_MOE_IQ_V2=0</c> selects the V1 shaders (A/B and bisection).</summary>
     internal static bool V2Default { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_IQ_V2") != "0";
+
+    /// <summary>#1018: <c>DOTLLM_VK_Q4_0_V2=0</c> keeps the Q4_0 bank kernel on its V1 (4 lanes per block) shader (A/B).</summary>
+    internal static bool Q4_0V2Default { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_Q4_0_V2") != "0";
 
     /// <summary>True when this instance runs the V2 shader.</summary>
     public bool IsV2 { get; }
@@ -153,6 +160,7 @@ public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
         MoeIqQuant.IQ3_XXS => "moe_indexed_matmul_iq3_xxs_mmvq",
         MoeIqQuant.Q2_0 => "moe_indexed_matmul_q2_0_mmvq",
         MoeIqQuant.IQ1_M => "moe_indexed_matmul_iq1_m_mmvq",
+        MoeIqQuant.Q4_0 => "moe_indexed_matmul_q4_0_mmvq",
         _ => throw new ArgumentOutOfRangeException(nameof(quant)),
     };
 
@@ -168,7 +176,7 @@ public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
     {
         if (!device.HasIntegerDotProduct)
             return null;
-        bool useV2 = (v2 ?? V2Default) && HasV2(quant);
+        bool useV2 = (v2 ?? (V2Default && (quant != MoeIqQuant.Q4_0 || Q4_0V2Default))) && HasV2(quant);
         string path = Path.Combine(spvDir, ShaderName(quant, useV2) + ".spv");
         if (!File.Exists(path))
             return null;
