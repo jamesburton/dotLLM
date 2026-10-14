@@ -134,6 +134,9 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
         var host = VulkanQwen3MoeHybridTransformerModel.CreateLayerlessHost(device, config, spvDir, head,
             cpu.KvSlotForLayer, cpu.AttentionLayerCount, ropeDim, ropeTheta);
         host.Q8GateUpMmvq = Environment.GetEnvironmentVariable("DOTLLM_VK_LFM2_Q8_GATEUP_MMVQ") != "0";
+        // #1018: Q4_0 stays packed (4.5 bpw) when the native kernels exist; DOTLLM_VK_Q4_0_NATIVE=0 restores the exact Q8_0 transcode (8.5 bpw).
+        bool native = host.SupportsNativeQ4_0;
+        Console.Error.WriteLine($"LFM2-MoE Vulkan: Q4_0 weights {(native ? "NATIVE (packed 4.5 bpw)" : "transcoded to Q8_0 (8.5 bpw)")}");
 
         var layers = new LayerDev[config.NumLayers];
         var layout = config.HybridLayout!;
@@ -143,7 +146,7 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
         // Reusable host scratch for the transcoded routed banks (freed after each layer's upload, which copies through staging).
         long bankQ8Bytes = 0;
         foreach (var l in cpu.LayerWeights)
-            if (l.Moe is { } m) bankQ8Bytes = Math.Max(bankQ8Bytes, Q4_0ToQ8_0.Q8Bytes((long)m.NumExperts * m.IntermediateSize * hidden / 32 * 18));
+            if (!native && l.Moe is { } m) bankQ8Bytes = Math.Max(bankQ8Bytes, Q4_0ToQ8_0.Q8Bytes((long)m.NumExperts * m.IntermediateSize * hidden / 32 * 18));
         nint bankG = 0, bankU = 0, bankD = 0;
         if (bankQ8Bytes > 0)
         {
@@ -164,8 +167,8 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
 
                 if (layout.LayerKind[i] == HybridLayerKind.ShortConv)
                 {
-                    ld.InProj = UploadQ8(device, staging, cl.InProj.Ptr, cl.InProj.Qt, cl.InProj.OutDim, cl.InProj.InDim, owned, out ld.InProjQt, ref bytes);
-                    ld.OutProj = UploadQ8(device, staging, cl.OutProj.Ptr, cl.OutProj.Qt, cl.OutProj.OutDim, cl.OutProj.InDim, owned, out ld.OutProjQt, ref bytes);
+                    ld.InProj = UploadQ8(device, staging, cl.InProj.Ptr, cl.InProj.Qt, cl.InProj.OutDim, cl.InProj.InDim, owned, native, out ld.InProjQt, ref bytes);
+                    ld.OutProj = UploadQ8(device, staging, cl.OutProj.Ptr, cl.OutProj.Qt, cl.OutProj.OutDim, cl.OutProj.InDim, owned, native, out ld.OutProjQt, ref bytes);
                     // CPU keeps the taps tap-major ([L][H]); the shader wants channel-major (GGUF layout): w[c*L + k].
                     int L = config.ShortConvCacheLength;
                     var wT = cl.ConvWeightT!;
@@ -179,10 +182,10 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
                 else
                 {
                     var a = cl.Attn!;
-                    ld.Q = UploadQ8(device, staging, a.QWeight, a.QQuantType, a.QOutputDim, a.QInputDim, owned, out ld.QQt, ref bytes);
-                    ld.K = UploadQ8(device, staging, a.KWeight, a.KQuantType, a.KOutputDim, a.KInputDim, owned, out ld.KQt, ref bytes);
-                    ld.V = UploadQ8(device, staging, a.VWeight, a.VQuantType, a.VOutputDim, a.VInputDim, owned, out ld.VQt, ref bytes);
-                    ld.O = UploadQ8(device, staging, a.OWeight, a.OQuantType, a.OOutputDim, a.OInputDim, owned, out ld.OQt, ref bytes);
+                    ld.Q = UploadQ8(device, staging, a.QWeight, a.QQuantType, a.QOutputDim, a.QInputDim, owned, native, out ld.QQt, ref bytes);
+                    ld.K = UploadQ8(device, staging, a.KWeight, a.KQuantType, a.KOutputDim, a.KInputDim, owned, native, out ld.KQt, ref bytes);
+                    ld.V = UploadQ8(device, staging, a.VWeight, a.VQuantType, a.VOutputDim, a.VInputDim, owned, native, out ld.VQt, ref bytes);
+                    ld.O = UploadQ8(device, staging, a.OWeight, a.OQuantType, a.OOutputDim, a.OInputDim, owned, native, out ld.OQt, ref bytes);
                     ld.QNorm = VulkanQwen3MoeHybridWeights.UploadFloatArray(device, staging, a.QNormWeight);
                     ld.KNorm = VulkanQwen3MoeHybridWeights.UploadFloatArray(device, staging, a.KNormWeight);
                     ld.NumKvHeads = a.NumKvHeads;
@@ -194,22 +197,33 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
                     long perBank = (long)moe.NumExperts * moe.IntermediateSize * hidden / 32 * 18;   // Q4_0 source bytes of one bank
                     if (moe.GateExpsRawQt != QuantizationType.Q4_0 || moe.UpExpsRawQt != QuantizationType.Q4_0 || moe.DownExpsRawQt != QuantizationType.Q4_0)
                         throw new NotSupportedException(
-                            $"LFM2-MoE Vulkan: layer {i} routed banks are {moe.GateExpsRawQt}/{moe.UpExpsRawQt}/{moe.DownExpsRawQt}; only Q4_0 is transcoded today.");
-                    Q4_0ToQ8_0.Transcode(moe.GateExpsRaw, bankG, perBank / 18);
-                    Q4_0ToQ8_0.Transcode(moe.UpExpsRaw, bankU, perBank / 18);
-                    Q4_0ToQ8_0.Transcode(moe.DownExpsRaw, bankD, perBank / 18);
-                    var m8 = moe.WithRawBanks(bankG, QuantizationType.Q8_0, bankU, QuantizationType.Q8_0, bankD, QuantizationType.Q8_0);
-                    ld.Moe = VulkanQwen3MoeMoeUpload.UploadLayer(device, m8, hidden, residentQuant: true);
-                    if (ld.Moe.W1QuantType != QuantizationType.Q8_0 || ld.Moe.W2QuantType != QuantizationType.Q8_0 || ld.Moe.W3QuantType != QuantizationType.Q8_0)
-                        throw new InvalidOperationException(
-                            $"LFM2-MoE layer {i}: expected Q8_0-resident banks, got {ld.Moe.W1QuantType}/{ld.Moe.W3QuantType}/{ld.Moe.W2QuantType}.");
-                    bytes += 3 * Q4_0ToQ8_0.Q8Bytes(perBank) + (long)moe.NumExperts * hidden * sizeof(float);
+                            $"LFM2-MoE Vulkan: layer {i} routed banks are {moe.GateExpsRawQt}/{moe.UpExpsRawQt}/{moe.DownExpsRawQt}; only Q4_0 is supported today.");
+                    if (native)
+                    {
+                        ld.Moe = VulkanQwen3MoeMoeUpload.UploadLayer(device, moe, hidden, residentQuant: true);
+                        if (ld.Moe.W1QuantType != QuantizationType.Q4_0 || ld.Moe.W2QuantType != QuantizationType.Q4_0 || ld.Moe.W3QuantType != QuantizationType.Q4_0)
+                            throw new InvalidOperationException(
+                                $"LFM2-MoE layer {i}: expected Q4_0-resident banks, got {ld.Moe.W1QuantType}/{ld.Moe.W3QuantType}/{ld.Moe.W2QuantType}.");
+                        bytes += 3 * perBank + (long)moe.NumExperts * hidden * sizeof(float);
+                    }
+                    else
+                    {
+                        Q4_0ToQ8_0.Transcode(moe.GateExpsRaw, bankG, perBank / 18);
+                        Q4_0ToQ8_0.Transcode(moe.UpExpsRaw, bankU, perBank / 18);
+                        Q4_0ToQ8_0.Transcode(moe.DownExpsRaw, bankD, perBank / 18);
+                        var m8 = moe.WithRawBanks(bankG, QuantizationType.Q8_0, bankU, QuantizationType.Q8_0, bankD, QuantizationType.Q8_0);
+                        ld.Moe = VulkanQwen3MoeMoeUpload.UploadLayer(device, m8, hidden, residentQuant: true);
+                        if (ld.Moe.W1QuantType != QuantizationType.Q8_0 || ld.Moe.W2QuantType != QuantizationType.Q8_0 || ld.Moe.W3QuantType != QuantizationType.Q8_0)
+                            throw new InvalidOperationException(
+                                $"LFM2-MoE layer {i}: expected Q8_0-resident banks, got {ld.Moe.W1QuantType}/{ld.Moe.W3QuantType}/{ld.Moe.W2QuantType}.");
+                        bytes += 3 * Q4_0ToQ8_0.Q8Bytes(perBank) + (long)moe.NumExperts * hidden * sizeof(float);
+                    }
                 }
                 else
                 {
-                    ld.Gate = UploadQ8(device, staging, cl.DenseGate.Ptr, cl.DenseGate.Qt, cl.DenseGate.OutDim, cl.DenseGate.InDim, owned, out ld.GateQt, ref bytes);
-                    ld.Up = UploadQ8(device, staging, cl.DenseUp.Ptr, cl.DenseUp.Qt, cl.DenseUp.OutDim, cl.DenseUp.InDim, owned, out ld.UpQt, ref bytes);
-                    ld.Down = UploadQ8(device, staging, cl.DenseDown.Ptr, cl.DenseDown.Qt, cl.DenseDown.OutDim, cl.DenseDown.InDim, owned, out ld.DownQt, ref bytes);
+                    ld.Gate = UploadQ8(device, staging, cl.DenseGate.Ptr, cl.DenseGate.Qt, cl.DenseGate.OutDim, cl.DenseGate.InDim, owned, native, out ld.GateQt, ref bytes);
+                    ld.Up = UploadQ8(device, staging, cl.DenseUp.Ptr, cl.DenseUp.Qt, cl.DenseUp.OutDim, cl.DenseUp.InDim, owned, native, out ld.UpQt, ref bytes);
+                    ld.Down = UploadQ8(device, staging, cl.DenseDown.Ptr, cl.DenseDown.Qt, cl.DenseDown.OutDim, cl.DenseDown.InDim, owned, native, out ld.DownQt, ref bytes);
                     ld.GateOut = cl.DenseGate.OutDim;
                 }
                 layers[i] = ld;
@@ -236,9 +250,17 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
     /// lifetime (the upload may import the host pointer instead of copying it); any other quant type is uploaded as the loader would.
     /// </summary>
     private static VulkanDevice.Buffer UploadQ8(VulkanDevice device, VulkanStagingBuffer staging, nint src, QuantizationType qt,
-        int outDim, int inDim, List<nint> owned, out QuantizationType deviceQt, ref long bytes)
+        int outDim, int inDim, List<nint> owned, bool native, out QuantizationType deviceQt, ref long bytes)
     {
         nint ptr = src;
+        if (qt == QuantizationType.Q4_0 && native && inDim % 32 == 0)
+        {
+            // #1018: keep the 18-byte blocks verbatim (zero-copy mmap import when the policy allows it).
+            var raw = VulkanQwen3MoeHybridWeights.UploadRawQuantMatrix(device, staging, src, qt, outDim, inDim, out long rawBytes);
+            deviceQt = QuantizationType.Q4_0;
+            bytes += rawBytes;
+            return raw;
+        }
         if (qt == QuantizationType.Q4_0)
         {
             if (inDim % 32 != 0) throw new NotSupportedException($"Q4_0 projection with K={inDim} is not a multiple of 32.");

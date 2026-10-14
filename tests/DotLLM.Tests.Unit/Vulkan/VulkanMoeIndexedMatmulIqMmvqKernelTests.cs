@@ -48,6 +48,12 @@ public sealed class VulkanMoeIndexedMatmulIqMmvqKernelTests
     [InlineData(QuantizationType.Q2_0, 6, 8, 12, 192, 5)]      // 3 blocks/row - window tail
     [InlineData(QuantizationType.Q2_0, 3, 4, 9, 256, 3)]       // exactly one 4-block window
     [InlineData(QuantizationType.Q2_0, 10, 512, 48, 640, 10)]  // ISTA down: 10 blocks/row
+    [InlineData(QuantizationType.Q4_0, 5, 7, 12, 32, 4)]       // #1018: 1 block/row
+    [InlineData(QuantizationType.Q4_0, 6, 8, 12, 96, 5)]       // 3 blocks/row - window-tail path
+    [InlineData(QuantizationType.Q4_0, 3, 4, 9, 256, 3)]       // exactly one 8-block lane window
+    [InlineData(QuantizationType.Q4_0, 9, 16, 20, 288, 11)]    // 9 blocks/row - window + 1-block tail
+    [InlineData(QuantizationType.Q4_0, 10, 64, 48, 2048, 10)]  // LFM2.5 gate/up: 64 experts, K = hidden 2048
+    [InlineData(QuantizationType.Q4_0, 12, 64, 40, 1536, 10)]  // LFM2.5 down: K = expert_feed_forward_length 1536 (48 blocks/row)
     public void Launch_MatchesSameTierCpuOracle(QuantizationType qt, int n, int numExperts, int m, int k, int activeExperts)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
@@ -86,6 +92,7 @@ public sealed class VulkanMoeIndexedMatmulIqMmvqKernelTests
     [InlineData(QuantizationType.IQ3_XXS, 6, 8, 12, 768)]
     [InlineData(QuantizationType.Q2_0, 6, 8, 12, 192)]
     [InlineData(QuantizationType.IQ1_M, 6, 8, 12, 768)]
+    [InlineData(QuantizationType.Q4_0, 9, 16, 20, 288)]
     public void PerRowExpertIndex_MatchesSingleRowLaunches(QuantizationType qt, int n, int numExperts, int m, int k)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);

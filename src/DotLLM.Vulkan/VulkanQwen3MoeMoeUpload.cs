@@ -75,6 +75,8 @@ internal static class VulkanQwen3MoeMoeUpload
         QuantizationType.IQ3_XXS,
         QuantizationType.Q2_0,
         QuantizationType.IQ1_M,
+        // #1018: Q4_0 banks (LFM2.5-24B-A2B) stay packed: indexed MMVQ decode + grouped coopmat prefill, same 18-byte block as IQ4_NL.
+        QuantizationType.Q4_0,
     };
 
     /// <summary>
@@ -84,7 +86,12 @@ internal static class VulkanQwen3MoeMoeUpload
     internal static bool BankStaysPacked(QuantizationType qt, int kDim, bool integerDot = true)
         => s_ResidentQuantTypes.Contains(qt)
             && (qt is not (QuantizationType.Q5_1 or QuantizationType.Q8_0) || kDim % 32 == 0)
+            && (qt != QuantizationType.Q4_0 || Q4_0NativeEnabled)
             && (DotLLM.Vulkan.Kernels.MoeIqFormats.FromQuantizationType(qt) is not { } iq || (kDim % DotLLM.Vulkan.Kernels.MoeIqFormats.Describe(iq).GroupSize == 0 && integerDot && IqBanksResidentEnabled));
+
+    /// <summary>#1018 A/B switch: <c>DOTLLM_VK_Q4_0_NATIVE=0</c> disables every native Q4_0 Vulkan kernel (dense and routed banks): Q4_0 expert banks widen to
+    /// F32 as before and the LFM2 loader falls back to its exact Q4_0 -> Q8_0 transcode.</summary>
+    internal static bool Q4_0NativeEnabled => Environment.GetEnvironmentVariable("DOTLLM_VK_Q4_0_NATIVE") != "0";
 
     /// <summary>#823 A/B switch: <c>DOTLLM_VK_IQ_RESIDENT=0</c> widens IQ expert banks to F32 as before (pairs with the residency estimate).</summary>
     internal static bool IqBanksResidentEnabled => Environment.GetEnvironmentVariable("DOTLLM_VK_IQ_RESIDENT") != "0"

@@ -24,6 +24,8 @@ public enum MoeIqQuant
     Q2_0,
     /// <summary>IQ1_M: 56 B / 256 elements, iq1s ternary grid.</summary>
     IQ1_M,
+    /// <summary>Q4_0 (issue #1018): 18 B / 32 elements, value = d * (nibble - 8); same block as IQ4_NL with a linear instead of a codebook decode.</summary>
+    Q4_0,
 }
 
 /// <summary>Per-format facts shared by the indexed MMVQ and grouped coopmat IQ kernels (#823).</summary>
@@ -41,6 +43,7 @@ internal static class MoeIqFormats
         MoeIqQuant.IQ3_XXS => (QuantFormat.IQ3_XXSBlockBytes, QuantFormat.KQuantGroupSize),
         MoeIqQuant.Q2_0 => (QuantFormat.Q2_0BlockBytes, QuantFormat.Q2_0GroupSize),
         MoeIqQuant.IQ1_M => (QuantFormat.IQ1_MBlockBytes, QuantFormat.KQuantGroupSize),
+        MoeIqQuant.Q4_0 => (QuantFormat.Q4_0BlockBytes, QuantFormat.LegacyGroupSize),
         _ => throw new ArgumentOutOfRangeException(nameof(quant)),
     };
 
@@ -56,6 +59,7 @@ internal static class MoeIqFormats
         QuantizationType.IQ3_XXS => MoeIqQuant.IQ3_XXS,
         QuantizationType.Q2_0 => MoeIqQuant.Q2_0,
         QuantizationType.IQ1_M => MoeIqQuant.IQ1_M,
+        QuantizationType.Q4_0 => MoeIqQuant.Q4_0,
         _ => null,
     };
 
@@ -153,6 +157,7 @@ public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
         MoeIqQuant.IQ3_XXS => "moe_indexed_matmul_iq3_xxs_mmvq",
         MoeIqQuant.Q2_0 => "moe_indexed_matmul_q2_0_mmvq",
         MoeIqQuant.IQ1_M => "moe_indexed_matmul_iq1_m_mmvq",
+        MoeIqQuant.Q4_0 => "moe_indexed_matmul_q4_0_mmvq",
         _ => throw new ArgumentOutOfRangeException(nameof(quant)),
     };
 

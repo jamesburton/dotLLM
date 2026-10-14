@@ -571,6 +571,25 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
         return fpBuf;
     }
 
+    /// <summary>
+    /// Uploads a quantised projection verbatim (no widening, no <see cref="KeepNative"/> gate): the zero-copy mmap import when
+    /// <see cref="VulkanWeightImportPolicy"/> allows it, a staged copy otherwise. For a type whose kernels the CALLER has verified exist
+    /// (native Q4_0 on LFM2.5, #1018); the shared <see cref="UploadProjectionMatrix"/> deliberately does not keep Q4_0 so the other hybrid
+    /// models, whose dispatch tables have no Q4_0 arm, keep their old behaviour.
+    /// </summary>
+    internal static VulkanDevice.Buffer UploadRawQuantMatrix(
+        VulkanDevice device, VulkanStagingBuffer staging, nint srcPtr, QuantizationType qt, int outputDim, int inputDim, out long uploadedBytes)
+    {
+        long bytes = Dequantize.RowByteSize(inputDim, qt) * outputDim;
+        uploadedBytes = bytes;
+        if (VulkanWeightImportPolicy.TryImport(device, srcPtr, bytes, out var imported))
+            return imported!;
+        var buf = device.AllocateDeviceLocal(bytes);
+        staging.UploadBytes(srcPtr, bytes, buf);
+        VulkanWeightImportPolicy.NoteStaged(srcPtr, bytes);
+        return buf;
+    }
+
     internal static unsafe VulkanDevice.Buffer UploadFloatArray(
         VulkanDevice device, VulkanStagingBuffer staging, float[] data)
     {

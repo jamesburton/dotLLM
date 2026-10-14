@@ -38,6 +38,9 @@ public sealed class VulkanMoeGroupedIqCoopmatTests
     [InlineData(QuantizationType.IQ4_NL, 64, 64, "16,15,17,1")]                          // single staging round
     [InlineData(QuantizationType.IQ4_NL, 100, 640, "5,0,1,40,17,0,3")]                   // real down K = 640 (not a multiple of 256)
     [InlineData(QuantizationType.IQ4_NL, 130, 704, "0,3,0,17,40,16,15,1,33,64,2,0")]
+    [InlineData(QuantizationType.Q4_0, 64, 64, "16,15,17,1")]                            // #1018: single staging round
+    [InlineData(QuantizationType.Q4_0, 100, 1536, "5,0,1,40,17,0,3")]                    // LFM2.5 down K = 1536
+    [InlineData(QuantizationType.Q4_0, 130, 2048, "0,3,0,17,40,16,15,1,33,64,2,0")]      // LFM2.5 gate/up K = hidden 2048, m not a multiple of 64
     [InlineData(QuantizationType.IQ2_XXS, 100, 512, "5,0,1,40,17,0,3")]
     [InlineData(QuantizationType.IQ2_XXS, 130, 2560, "0,3,0,17,40,16,15,1,33,64,2,0")]
     [InlineData(QuantizationType.IQ2_XS, 100, 512, "5,0,1,40,17,0,3")]
