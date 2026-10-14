@@ -203,6 +203,16 @@ internal sealed class VulkanForwardState : IDisposable
     public VulkanDevice.Buffer? Q8_1XdsRows { get; private set; }  // [seqLen*maxK/32] (d, s)
     private int _q8_1RowsMaxK; // per-row K the rows-scratch is currently sized for
 
+    /// <summary>
+    /// Whether a <c>[seqLen, inputDim]</c> activation fits the multi-row Q8_1 scratch (<see cref="Q8_1XqRows"/> / <see cref="Q8_1XdsRows"/>), i.e. whether the
+    /// dp4a MMQ / small-row Q8 paths may quantize it. Decided on the row WIDTH the scratch was sized for - a property of the model - and never on the
+    /// scratch's current byte size, which tracks the largest forward seen so far (<c>capacity x maxK</c>). The two coincide for every K &lt;= maxK, but a
+    /// projection wider than maxK (gpt-oss / Gemma-4 attention output: numHeads x headDim &gt; max(hidden, intermediate)) used to fit only once an earlier
+    /// forward had grown the capacity enough, so the same N-row forward took the MMQ path after a bigger forward and the fallback GEMM before it (#1016).
+    /// </summary>
+    internal bool Q8_1RowsFit(int seqLen, int inputDim)
+        => Q8_1XqRows is not null && Q8_1XdsRows is not null && inputDim <= _q8_1RowsMaxK && seqLen <= _capacitySeqLen;
+
     // ── Logits (last token only) ──────────────────────────────────────
     public VulkanDevice.Buffer Logits { get; private set; }
 

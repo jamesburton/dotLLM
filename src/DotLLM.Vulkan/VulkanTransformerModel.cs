@@ -4971,6 +4971,7 @@ public sealed partial class VulkanTransformerModel : IModel
         _gemma4GroupedQ5_1?.InvalidateDescriptorCache();
         _gemma4GroupedQ8_0?.InvalidateDescriptorCache();
         _gemma4MoeBuildTileList?.InvalidateDescriptorCache();
+        _grpTileList?.InvalidateDescriptorCache();   // generic grouped-MoE tile builder (#789): the one kernel field this method missed
         _moeWeightedScatter?.InvalidateDescriptorCache();
         _moeBroadcast?.InvalidateDescriptorCache();
         _moeIndexedLoraDelta?.InvalidateDescriptorCache();
@@ -7503,8 +7504,7 @@ public sealed partial class VulkanTransformerModel : IModel
         if (_quantizeQ8_1Rows is null || _state.Q8_1XqRows is null || _state.Q8_1XdsRows is null)
             return false;
         if ((inputDim % QuantizeQ8_1RowsKernel.GroupSize) != 0) return false;
-        if (QuantizeQ8_1RowsKernel.PackedBytes(seqLen, inputDim) > _state.Q8_1XqRows.Size) return false;
-        if (QuantizeQ8_1RowsKernel.ScaleBytes(seqLen, inputDim) > _state.Q8_1XdsRows.Size) return false;
+        if (!_state.Q8_1RowsFit(seqLen, inputDim)) return false;
         foreach (var p in projections)
         {
             if (SmallRowGemvApplies(p.WeightQt, inputDim, seqLen)) return false;   // #996: each projection goes through RecordMatmul's multi-column GEMV
@@ -7674,8 +7674,7 @@ public sealed partial class VulkanTransformerModel : IModel
         if (_matmulQ8MmqResidual is null || _quantizeQ8_1Rows is null
             || _state.Q8_1XqRows is null || _state.Q8_1XdsRows is null
             || (inputDim % QuantizeQ8_1RowsKernel.GroupSize) != 0
-            || QuantizeQ8_1RowsKernel.PackedBytes(seqLen, inputDim) > _state.Q8_1XqRows.Size
-            || QuantizeQ8_1RowsKernel.ScaleBytes(seqLen, inputDim) > _state.Q8_1XdsRows.Size)
+            || !_state.Q8_1RowsFit(seqLen, inputDim))
         {
             return false;
         }
@@ -7732,8 +7731,7 @@ public sealed partial class VulkanTransformerModel : IModel
             else if (_matmulQ8Mmq is not null && _quantizeQ8_1Rows is not null
                 && _state.Q8_1XqRows is not null && _state.Q8_1XdsRows is not null
                 && (inputDim % QuantizeQ8_1RowsKernel.GroupSize) == 0
-                && QuantizeQ8_1RowsKernel.PackedBytes(seqLen, inputDim) <= _state.Q8_1XqRows.Size
-                && QuantizeQ8_1RowsKernel.ScaleBytes(seqLen, inputDim) <= _state.Q8_1XdsRows.Size)
+                && _state.Q8_1RowsFit(seqLen, inputDim))
             {
                 // dp4a MMQ prefill path (issue #50): quantize the F32 activation
                 // B-matrix to Q8_1 row-wise, then run the integer-dot GEMM. The
@@ -7860,8 +7858,7 @@ public sealed partial class VulkanTransformerModel : IModel
             else if (_matmulQ2KMmq is not null && _quantizeQ8_1Rows is not null
                 && _state.Q8_1XqRows is not null && _state.Q8_1XdsRows is not null
                 && (inputDim % MatMulQ2KMmqKernel.Q2KGroupSize) == 0
-                && QuantizeQ8_1RowsKernel.PackedBytes(seqLen, inputDim) <= _state.Q8_1XqRows.Size
-                && QuantizeQ8_1RowsKernel.ScaleBytes(seqLen, inputDim) <= _state.Q8_1XdsRows.Size)
+                && _state.Q8_1RowsFit(seqLen, inputDim))
             {
                 // dp4a MMQ prefill path (issue #344).
                 _quantizeQ8_1Rows.Record(cmdBuf, input, _state.Q8_1XqRows, _state.Q8_1XdsRows,
@@ -7907,8 +7904,7 @@ public sealed partial class VulkanTransformerModel : IModel
             else if (_matmulQ3KMmq is not null && _quantizeQ8_1Rows is not null
                 && _state.Q8_1XqRows is not null && _state.Q8_1XdsRows is not null
                 && (inputDim % MatMulQ3KMmqKernel.Q3KGroupSize) == 0
-                && QuantizeQ8_1RowsKernel.PackedBytes(seqLen, inputDim) <= _state.Q8_1XqRows.Size
-                && QuantizeQ8_1RowsKernel.ScaleBytes(seqLen, inputDim) <= _state.Q8_1XdsRows.Size)
+                && _state.Q8_1RowsFit(seqLen, inputDim))
             {
                 // dp4a MMQ prefill path (issue #344).
                 _quantizeQ8_1Rows.Record(cmdBuf, input, _state.Q8_1XqRows, _state.Q8_1XdsRows,
@@ -7962,8 +7958,7 @@ public sealed partial class VulkanTransformerModel : IModel
             else if (_matmulQ4KMmq is not null && _quantizeQ8_1Rows is not null
                 && _state.Q8_1XqRows is not null && _state.Q8_1XdsRows is not null
                 && (inputDim % MatMulQ4KMmqKernel.Q4KGroupSize) == 0
-                && QuantizeQ8_1RowsKernel.PackedBytes(seqLen, inputDim) <= _state.Q8_1XqRows.Size
-                && QuantizeQ8_1RowsKernel.ScaleBytes(seqLen, inputDim) <= _state.Q8_1XdsRows.Size)
+                && _state.Q8_1RowsFit(seqLen, inputDim))
             {
                 // dp4a MMQ prefill path (issue #340): quantize the F32 activation
                 // B-matrix to Q8_1 row-wise, then run the integer-dot Q4_K GEMM.
@@ -8019,8 +8014,7 @@ public sealed partial class VulkanTransformerModel : IModel
             else if (_matmulQ5KMmq is not null && _quantizeQ8_1Rows is not null
                 && _state.Q8_1XqRows is not null && _state.Q8_1XdsRows is not null
                 && (inputDim % MatMulQ5KMmqKernel.Q5KGroupSize) == 0
-                && QuantizeQ8_1RowsKernel.PackedBytes(seqLen, inputDim) <= _state.Q8_1XqRows.Size
-                && QuantizeQ8_1RowsKernel.ScaleBytes(seqLen, inputDim) <= _state.Q8_1XdsRows.Size)
+                && _state.Q8_1RowsFit(seqLen, inputDim))
             {
                 // dp4a MMQ prefill path (issue #342): sibling of the Q4_K MMQ +
                 // the qh 5th bit. Quantize the F32 activation B-matrix to Q8_1
@@ -8077,8 +8071,7 @@ public sealed partial class VulkanTransformerModel : IModel
             else if (_matmulQ6KMmq is not null && _quantizeQ8_1Rows is not null
                 && _state.Q8_1XqRows is not null && _state.Q8_1XdsRows is not null
                 && (inputDim % MatMulQ6KMmqKernel.Q6KGroupSize) == 0
-                && QuantizeQ8_1RowsKernel.PackedBytes(seqLen, inputDim) <= _state.Q8_1XqRows.Size
-                && QuantizeQ8_1RowsKernel.ScaleBytes(seqLen, inputDim) <= _state.Q8_1XdsRows.Size)
+                && _state.Q8_1RowsFit(seqLen, inputDim))
             {
                 // dp4a MMQ prefill path (issue #341): quantize the F32 activation
                 // B-matrix to Q8_1 row-wise, then run the integer-dot Q6_K GEMM —
@@ -8125,8 +8118,7 @@ public sealed partial class VulkanTransformerModel : IModel
             else if (_matmulIq4NlMmq is not null && _quantizeQ8_1Rows is not null
                 && _state.Q8_1XqRows is not null && _state.Q8_1XdsRows is not null
                 && (inputDim % MatMulIq4NlMmqKernel.Iq4NlGroupSize) == 0
-                && QuantizeQ8_1RowsKernel.PackedBytes(seqLen, inputDim) <= _state.Q8_1XqRows.Size
-                && QuantizeQ8_1RowsKernel.ScaleBytes(seqLen, inputDim) <= _state.Q8_1XdsRows.Size)
+                && _state.Q8_1RowsFit(seqLen, inputDim))
             {
                 // dp4a MMQ prefill path (issue #344).
                 _quantizeQ8_1Rows.Record(cmdBuf, input, _state.Q8_1XqRows, _state.Q8_1XdsRows,
@@ -8173,8 +8165,7 @@ public sealed partial class VulkanTransformerModel : IModel
             else if (_matmulIq4XsMmq is not null && _quantizeQ8_1Rows is not null
                 && _state.Q8_1XqRows is not null && _state.Q8_1XdsRows is not null
                 && (inputDim % MatMulIq4XsMmqKernel.Iq4XsGroupSize) == 0
-                && QuantizeQ8_1RowsKernel.PackedBytes(seqLen, inputDim) <= _state.Q8_1XqRows.Size
-                && QuantizeQ8_1RowsKernel.ScaleBytes(seqLen, inputDim) <= _state.Q8_1XdsRows.Size)
+                && _state.Q8_1RowsFit(seqLen, inputDim))
             {
                 // dp4a MMQ prefill path (issue #343): the first IQ-family prefill
                 // MMQ — codebook-decode in shared mem, no min term. Quantize the F32
@@ -8217,8 +8208,7 @@ public sealed partial class VulkanTransformerModel : IModel
             else if (_matmulIq2XxsMmq is not null && _quantizeQ8_1Rows is not null
                 && _state.Q8_1XqRows is not null && _state.Q8_1XdsRows is not null
                 && (inputDim % MatMulIq2XxsMmqKernel.Iq2XxsGroupSize) == 0
-                && QuantizeQ8_1RowsKernel.PackedBytes(seqLen, inputDim) <= _state.Q8_1XqRows.Size
-                && QuantizeQ8_1RowsKernel.ScaleBytes(seqLen, inputDim) <= _state.Q8_1XdsRows.Size)
+                && _state.Q8_1RowsFit(seqLen, inputDim))
             {
                 // dp4a MMQ prefill path (issue #344).
                 _quantizeQ8_1Rows.Record(cmdBuf, input, _state.Q8_1XqRows, _state.Q8_1XdsRows,
