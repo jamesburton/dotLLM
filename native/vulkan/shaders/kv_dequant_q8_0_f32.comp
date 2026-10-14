@@ -1,0 +1,50 @@
+#version 450
+// KV-cache dequantization: Q8_0 (split layout) → FP32.
+//
+// Reads per-32-element block:
+//   scales[blockIdx] = float scale
+//   quants[blockIdx*8 + 0..7] = uint (4 packed int8 per uint, little-endian)
+// Writes: dst[blockIdx * 32 + i] = scale * int8(quants[...])
+//
+// Dispatch: ceil(totalBlocks / 256) workgroups × 1 × 1.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Scales { float scales[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer Quants { uint  quants[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer Dst    { float dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint totalBlocks;
+    uint srcOffset;     // block offset in scales/quants
+    uint dstOffset;     // element offset in dst
+} pc;
+
+const uint QK = 32u;
+
+void main() {
+    uint b = gl_GlobalInvocationID.x;
+    if (b >= pc.totalBlocks) return;
+
+    uint srcBlock = pc.srcOffset + b;
+    uint dstBase  = pc.dstOffset + b * QK;
+
+    float scale = scales[srcBlock];
+    uint qBase  = srcBlock * 8u;
+
+    for (uint g = 0u; g < QK / 4u; g++) {
+        uint packed = quants[qBase + g];
+        uint e = dstBase + g * 4u;
+
+        // Sign-extend each packed int8 via bitfieldExtract on the signed interpretation.
+        int q0 = bitfieldExtract(int(packed),  0, 8);
+        int q1 = bitfieldExtract(int(packed),  8, 8);
+        int q2 = bitfieldExtract(int(packed), 16, 8);
+        int q3 = bitfieldExtract(int(packed), 24, 8);
+
+        dst[e + 0u] = scale * float(q0);
+        dst[e + 1u] = scale * float(q1);
+        dst[e + 2u] = scale * float(q2);
+        dst[e + 3u] = scale * float(q3);
+    }
+}

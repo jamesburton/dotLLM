@@ -595,8 +595,17 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             Func<ModelConfig, int, DotLLM.Core.Attention.IKvCache>? kvFactory = null;
             if (vulkanKv is not null)
             {
-                var vkFactory = vulkanKv;
-                kvFactory = (cfg, size) => vkFactory(size);
+                if (kvConfig.IsQuantized && model is DotLLM.Vulkan.VulkanTransformerModel vkModel)
+                {
+                    string spvDir = DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir();
+                    kvFactory = (cfg, size) => vkModel.CreateQuantizedKvCache(
+                        spvDir, size, kvConfig.KeyDType, kvConfig.ValueDType);
+                }
+                else
+                {
+                    var vkFactory = vulkanKv;
+                    kvFactory = (cfg, size) => vkFactory(size);
+                }
             }
             else if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
             {

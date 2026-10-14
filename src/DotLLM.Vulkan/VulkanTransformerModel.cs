@@ -1207,6 +1207,16 @@ public sealed partial class VulkanTransformerModel : IModel
         => new(_device, KvGeometry.FromConfig(Config), maxSeqLen);
 
     /// <summary>
+    /// Creates a GPU-resident Q8_0/Q4_0 quantized KV-cache on this model's device. Pure-quantized
+    /// (no FP32 recency window): all tokens are quantized on write, dequantized into a shared FP32
+    /// scratch before each attention call. Supports mixed K/V types (e.g. K=Q8_0, V=Q4_0).
+    /// </summary>
+    public VulkanQuantizedKvCache CreateQuantizedKvCache(
+        string spvDir, int maxSeqLen, KvCacheDType keyDType, KvCacheDType valueDType)
+        => new(_device, spvDir, Config.NumLayers, Config.NumKvHeads, Config.HeadDim,
+               maxSeqLen, keyDType, valueDType);
+
+    /// <summary>
     /// Creates a GPU-resident TurboQuant (MSE-stage) KV-cache on this model's device. The caller
     /// supplies the codec constants (the Vulkan project does not depend on the Engine codec):
     /// <paramref name="centroids"/> (2^mseBits, scaled by 1/√d), per-K/V RHT sign sets (length
@@ -4150,6 +4160,19 @@ public sealed partial class VulkanTransformerModel : IModel
                     seqKv = tqCache.CurrentLength;
                     positionOffset = positions[0];
                 }
+                else if (kvCache is VulkanQuantizedKvCache qCache)
+                {
+                    // Q8_0/Q4_0: quantize K/V on write, dequant the live range into scratch before attention.
+                    BarrierComputeToCompute(cmdBuf);
+                    qCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, layer);
+                    BarrierComputeToCompute(cmdBuf);
+                    qCache.RecordDequant(cmdBuf, layer);
+                    BarrierComputeToCompute(cmdBuf);
+                    kSrc = qCache.GetKeysBuffer();
+                    vSrc = qCache.GetValuesBuffer();
+                    seqKv = qCache.CurrentLength;
+                    positionOffset = positions[0];
+                }
                 else
                 {
                     BarrierComputeToCompute(cmdBuf);
@@ -5740,6 +5763,20 @@ public sealed partial class VulkanTransformerModel : IModel
             kSrc = tqCache.GetKeysBuffer();
             vSrc = tqCache.GetValuesBuffer();
             seqKv = tqCache.CurrentLength;
+            positionOffset = positions[0];
+            maskMode = AttentionMaskMode.Causal;
+            prefixLen = 0;
+        }
+        else if (kvCache is VulkanQuantizedKvCache qCache)
+        {
+            BarrierComputeToCompute(cmdBuf);
+            qCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, layer);
+            BarrierComputeToCompute(cmdBuf);
+            qCache.RecordDequant(cmdBuf, layer);
+            BarrierComputeToCompute(cmdBuf);
+            kSrc = qCache.GetKeysBuffer();
+            vSrc = qCache.GetValuesBuffer();
+            seqKv = qCache.CurrentLength;
             positionOffset = positions[0];
             maskMode = AttentionMaskMode.Causal;
             prefixLen = 0;
