@@ -1835,8 +1835,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     private bool GroupedKernelsFit(VulkanQwen3MoeMoeUpload.LayerBundle moeW, int hidden, int interm)
     {
         if (moeW.W1QuantType != moeW.W3QuantType) return false;
-        // #986: dp4a MMQ grouped path (64×64 tiles, Q8_1 activations). Both gate/up AND down must have MMQ kernels
-        // so the tile list row-tile=64 is shared. Also needs the Q8_1 quantizer.
+        // #986: dp4a MMQ grouped path (adaptive 32/64-row tiles, Q8_1 activations). Both gate/up AND down must have
+        // MMQ kernels so the tile list row-tile is shared. Also needs the Q8_1 quantizer.
         if (GroupedGateUpMmqKernel(moeW.W1QuantType) is not null && GroupedDownMmqKernel(moeW.W2QuantType) is not null
             && _kernels.QuantizeQ8_1RowsActivations is not null && (interm % 256) == 0)
             return true;
@@ -1923,6 +1923,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         if (useMmq)
         {
             CountMoePath(MoePath.GroupedMmqPrefill);
+            int mmqTileN = gateUpMmq!.SelectRowTile(seqLen);
             if (!useQuantizeOnce)
             {
                 _kernels.QuantizeQ8_1RowsActivations!.Record(cmdBuf, _state.MoeDownRows, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
@@ -1935,7 +1936,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             if (tileBuildMmq is not null)
             {
                 tileBuildMmq.Record(cmdBuf, _state.MoeGroupOffsets, _state.MoeGroupDispatchArgs, numE,
-                    gateUpMmq!.MTiles(interm), downMmq!.MTiles(hidden), tileRows: gateUpMmq.RowTile);
+                    gateUpMmq.MTiles(interm), downMmq!.MTiles(hidden), tileRows: mmqTileN);
                 KernelSupport.ComputeToIndirectAndComputeBarrier(cmdBuf);
                 if (MoeStageProfileEnabled)
                 {
@@ -1946,16 +1947,16 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                     _moeStageLast = System.Diagnostics.Stopwatch.GetTimestamp();
                 }
                 gateUpMmq.RecordIndirect(cmdBuf, moeW.W1Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, _state.MoeGroupOffsets,
-                    _state.MoeGateInter, _state.MoeGroupDispatchArgs, 0, m: interm, k: hidden, rows: expandedRows, numExperts: numE);
+                    _state.MoeGateInter, _state.MoeGroupDispatchArgs, 0, m: interm, k: hidden, rows: expandedRows, numExperts: numE, tileN: mmqTileN);
                 gateUpMmq.RecordIndirect(cmdBuf, moeW.W3Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, _state.MoeGroupOffsets,
-                    _state.MoeUpInter, _state.MoeGroupDispatchArgs, 0, m: interm, k: hidden, rows: expandedRows, numExperts: numE);
+                    _state.MoeUpInter, _state.MoeGroupDispatchArgs, 0, m: interm, k: hidden, rows: expandedRows, numExperts: numE, tileN: mmqTileN);
             }
             else
             {
-                gateUpMmq!.Record(cmdBuf, moeW.W1Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, _state.MoeGroupOffsets,
-                    _state.MoeGateInter, m: interm, k: hidden, rows: expandedRows, numExperts: numE, maxRowsPerExpert: seqLen);
+                gateUpMmq.Record(cmdBuf, moeW.W1Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, _state.MoeGroupOffsets,
+                    _state.MoeGateInter, m: interm, k: hidden, rows: expandedRows, numExperts: numE, tileN: mmqTileN, maxRowsPerExpert: seqLen);
                 gateUpMmq.Record(cmdBuf, moeW.W3Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, _state.MoeGroupOffsets,
-                    _state.MoeUpInter, m: interm, k: hidden, rows: expandedRows, numExperts: numE, maxRowsPerExpert: seqLen);
+                    _state.MoeUpInter, m: interm, k: hidden, rows: expandedRows, numExperts: numE, tileN: mmqTileN, maxRowsPerExpert: seqLen);
             }
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
             MoeStage("grouped_gate_up");
@@ -1981,10 +1982,10 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
 
             if (tileBuildMmq is not null)
                 downMmq!.RecordIndirect(cmdBuf, moeW.W2Bank, _state.MoeSiluInterXq, _state.MoeSiluInterXds, _state.MoeGroupOffsets,
-                    _state.MoeExpandedInput, _state.MoeGroupDispatchArgs, MoeBuildTileListKernel.ArgsStrideBytes, m: hidden, k: interm, rows: expandedRows, numExperts: numE);
+                    _state.MoeExpandedInput, _state.MoeGroupDispatchArgs, MoeBuildTileListKernel.ArgsStrideBytes, m: hidden, k: interm, rows: expandedRows, numExperts: numE, tileN: mmqTileN);
             else
                 downMmq!.Record(cmdBuf, moeW.W2Bank, _state.MoeSiluInterXq, _state.MoeSiluInterXds, _state.MoeGroupOffsets,
-                    _state.MoeExpandedInput, m: hidden, k: interm, rows: expandedRows, numExperts: numE, maxRowsPerExpert: seqLen);
+                    _state.MoeExpandedInput, m: hidden, k: interm, rows: expandedRows, numExperts: numE, tileN: mmqTileN, maxRowsPerExpert: seqLen);
         }
         else
         {
