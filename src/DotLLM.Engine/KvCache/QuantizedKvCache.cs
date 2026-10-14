@@ -153,11 +153,19 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache
 
         if (_windowSize > 0)
         {
-            // Per-layer eviction: each layer independently tracks how far it has evicted.
             int prevQuantLen = _layerQuantizedLength[layerIndex];
             int newQuantLen = Math.Max(0, newLength - _windowSize);
 
-            for (int evictPos = prevQuantLen; evictPos < newQuantLen; evictPos++)
+            // Phase 1: evict ring slots that hold data from PREVIOUS calls (safe to read).
+            // When seqLen > windowSize, some eviction positions fall in the current batch —
+            // those ring slots have not been written yet (or hold stale data), so we must not
+            // read them. Evict only up to the first position in the current batch.
+            int minNewPos = positions[0];
+            for (int i = 1; i < seqLen; i++)
+                if (positions[i] < minNewPos) minNewPos = positions[i];
+            int safeEvictEnd = Math.Min(newQuantLen, minNewPos);
+
+            for (int evictPos = prevQuantLen; evictPos < safeEvictEnd; evictPos++)
             {
                 int ringIdx = evictPos % _windowSize;
                 QuantizeRow((float*)_keysWindow![layerIndex] + ringIdx * _kvStride,
@@ -168,9 +176,8 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache
                             _kvStride, ValueDType);
             }
 
-            _layerQuantizedLength[layerIndex] = newQuantLen;
-
-            // Write new FP32 data into window ring buffer (position-addressed, idempotent).
+            // Phase 2: positions from the current batch that will be evicted immediately
+            // (pos < newQuantLen) — quantize directly from the source data, skip the ring.
             for (int i = 0; i < seqLen; i++)
             {
                 int pos = positions[i];
@@ -178,15 +185,35 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache
                     throw new ArgumentOutOfRangeException(nameof(positions),
                         $"Position {pos} exceeds max cache length {_maxSeqLen}.");
 
-                int ringIdx = pos % _windowSize;
-                Buffer.MemoryCopy(
-                    kSrc + i * _kvStride,
-                    (float*)_keysWindow![layerIndex] + ringIdx * _kvStride,
-                    fpRowBytes, fpRowBytes);
-                Buffer.MemoryCopy(
-                    vSrc + i * _kvStride,
-                    (float*)_valuesWindow![layerIndex] + ringIdx * _kvStride,
-                    fpRowBytes, fpRowBytes);
+                if (pos < newQuantLen)
+                {
+                    QuantizeRow(kSrc + i * _kvStride,
+                                (byte*)_keysQuant[layerIndex] + (long)pos * _keyQuantRowBytes,
+                                _kvStride, KeyDType);
+                    QuantizeRow(vSrc + i * _kvStride,
+                                (byte*)_valuesQuant[layerIndex] + (long)pos * _valueQuantRowBytes,
+                                _kvStride, ValueDType);
+                }
+            }
+
+            _layerQuantizedLength[layerIndex] = newQuantLen;
+
+            // Phase 3: positions that stay in the window — write FP32 into the ring buffer.
+            for (int i = 0; i < seqLen; i++)
+            {
+                int pos = positions[i];
+                if (pos >= newQuantLen)
+                {
+                    int ringIdx = pos % _windowSize;
+                    Buffer.MemoryCopy(
+                        kSrc + i * _kvStride,
+                        (float*)_keysWindow![layerIndex] + ringIdx * _kvStride,
+                        fpRowBytes, fpRowBytes);
+                    Buffer.MemoryCopy(
+                        vSrc + i * _kvStride,
+                        (float*)_valuesWindow![layerIndex] + ringIdx * _kvStride,
+                        fpRowBytes, fpRowBytes);
+                }
             }
 
             _quantizedLength = newQuantLen;
