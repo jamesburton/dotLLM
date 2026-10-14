@@ -1020,7 +1020,7 @@ public static unsafe partial class MoeSwiGluMlp
     /// the matching <c>MatMul.GemmQX</c> kernel for supported quant types, falls back to
     /// per-row dequant + <see cref="TensorPrimitives.Dot"/> for everything else.
     /// </summary>
-    private static readonly bool LegacyPackedExperts = Environment.GetEnvironmentVariable("DOTLLM_MOE_LEGACY_PACKED") == "1";
+    private static readonly bool LegacyPackedExperts = Environment.GetEnvironmentVariable("DOTLLM_MOE_LEGACY_PACKED") != "0";
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void DispatchGemm(

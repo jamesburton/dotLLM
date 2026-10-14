@@ -488,7 +488,7 @@ public sealed unsafe class Lfm2MoeTransformerModel : IModel
         }
     }
 
-    private static readonly bool LegacyPacked = Environment.GetEnvironmentVariable("DOTLLM_MOE_LEGACY_PACKED") == "1";
+    private static readonly bool LegacyPacked = Environment.GetEnvironmentVariable("DOTLLM_MOE_LEGACY_PACKED") != "0";
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void Gemm(nint w, QuantizationType qt, float* b, float* c, int m, int k, int n)
