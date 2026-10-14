@@ -280,6 +280,7 @@ public sealed partial class VulkanTransformerModel : IModel
     private MatMulQuantGemvMultiKernel? _smallRowQ6K;
     private MatMulF32GemvMultiKernel? _smallRowF32;
     private MatMulQ8_0MmvqMultiKernel? _smallRowQ8;
+    private VulkanSplitKvRowsAttentionKernel? _smallRowAttn;
     private readonly MatMulQ5KMmqKernel? _matmulQ5KMmq;
     private readonly MatMulIq4XsMmqKernel? _matmulIq4XsMmq;
     private readonly MatMulIq4NlMmqKernel? _matmulIq4NlMmq;
@@ -2624,6 +2625,24 @@ public sealed partial class VulkanTransformerModel : IModel
     {
         AttentionSpanInvariant.AssertTight(seqKv, positionOffset, seqQ, "Vulkan");
 
+        // Small-row (2..4 rows) split-KV attention (#996): each row is the 1-row split-KV decode kernel's result (sink merge + window-clipped span on sink
+        // layers), instead of the per-token sink kernel (one workgroup per head, whole KV range) / the f16 coopmat flash kernel. MiMo-V2 and gpt-oss only.
+        bool rowsSink = sinks is not null && _gptOss is not null && !_gptOssDbg.NoSinks;
+        if (seqQ >= 2 && seqQ <= SmallRowAttnMaxRows && _smallRowAttn is not null
+            && (rowsSink || (sinks is null && Config.Architecture == DotLLM.Core.Configuration.Architecture.MiMoV2))
+            && softCap == 0.0f && scaleOverride == 0.0f && maskMode == AttentionMaskMode.Causal
+            && headDim <= VulkanSplitKvAttentionKernel.MaxHeadDim
+            && (rowsSink || slidingWindow == 0)
+            && VulkanSplitKvRowsAttentionKernel.CanServe(seqQ, positionOffset, numHeads, slidingWindow, rowsSink))
+        {
+            SmallRowAttnCount++;
+            ProfNote("attn_splitkv_rows", seqQ, seqKv, numHeads);
+            _smallRowAttn.Record(cmdBuf, q, k, v, output,
+                seqQ: seqQ, numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim, positionOffset: positionOffset,
+                slidingWindow: slidingWindow, sinks: rowsSink ? sinks : null);
+            return;
+        }
+
         // gpt-oss attention sinks (#737): ALWAYS the sink kernel (prefill + decode), never the
         // split-KV / coopmat / flash variants - none of them carry the sink term.
         if (sinks is not null && _gptOss is not null && !_gptOssDbg.NoSinks)
@@ -4845,6 +4864,7 @@ public sealed partial class VulkanTransformerModel : IModel
         _smallRowQ6K?.InvalidateDescriptorCache();
         _smallRowF32?.InvalidateDescriptorCache();
         _smallRowQ8?.InvalidateDescriptorCache();
+        _smallRowAttn?.InvalidateDescriptorCache();
         _matmulQ5KMmq?.InvalidateDescriptorCache();
         _matmulIq4XsMmq?.InvalidateDescriptorCache();
         _matmulIq4NlMmq?.InvalidateDescriptorCache();
@@ -8596,6 +8616,7 @@ public sealed partial class VulkanTransformerModel : IModel
         _smallRowQ6K?.Dispose();
         _smallRowF32?.Dispose();
         _smallRowQ8?.Dispose();
+        _smallRowAttn?.Dispose();
         _matmulQ5KMmq?.Dispose();
         _matmulIq4XsMmq?.Dispose();
         _matmulIq4NlMmq?.Dispose();

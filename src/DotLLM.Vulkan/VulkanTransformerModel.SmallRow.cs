@@ -20,6 +20,11 @@ public sealed partial class VulkanTransformerModel
     /// <summary>Largest row count served by the Q8_0 MMVQ multi-column GEMV (lm_head, Q8_0 projections; default 4; <c>DOTLLM_VK_SMALLROW_Q8_MAX_ROWS</c>; 0 = off).</summary>
     public int SmallRowQ8MaxRows { get; set; } = EnvRows("DOTLLM_VK_SMALLROW_Q8_MAX_ROWS", 4, MatMulQ8_0MmvqMultiKernel.MaxColumns);
 
+    /// <summary>Largest row count served by the small-row split-KV attention (MiMo-V2 and gpt-oss sink layers; default 4, hard cap <see cref="VulkanSplitKvRowsAttentionKernel.MaxRows"/>; <c>DOTLLM_VK_SMALLROW_ATTN_MAX_ROWS</c>; 0 = off).</summary>
+    public int SmallRowAttnMaxRows { get; set; } = EnvRows("DOTLLM_VK_SMALLROW_ATTN_MAX_ROWS", 4, VulkanSplitKvRowsAttentionKernel.MaxRows);
+    /// <summary>Attention layers dispatched on the small-row split-KV kernel (test / diagnostic).</summary>
+    public long SmallRowAttnCount { get; private set; }
+
     /// <summary>Dispatch counters of the small-row multi-column GEMVs (test / diagnostic).</summary>
     public long SmallRowQ6KCount { get; private set; }
     /// <inheritdoc cref="SmallRowQ6KCount"/>
@@ -32,6 +37,7 @@ public sealed partial class VulkanTransformerModel
         _smallRowQ6K = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K);
         _smallRowF32 = MatMulF32GemvMultiKernel.TryCreate(device, spvDir);
         _smallRowQ8 = MatMulQ8_0MmvqMultiKernel.TryCreate(device, spvDir);
+        if (_splitKvAttention is not null) _smallRowAttn = VulkanSplitKvRowsAttentionKernel.TryCreate(device, spvDir);
     }
 
     private bool SmallRowQ8Fits(int inputDim, int seqLen)
