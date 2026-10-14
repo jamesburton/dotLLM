@@ -484,5 +484,14 @@ public enum Architecture
     /// (issue #959).
     /// </para>
     /// </summary>
-    Gemma4Assistant
+    Gemma4Assistant,
+
+    /// <summary>
+    /// Liquid AI LFM2 / LFM2.5 MoE (llama.cpp <c>lfm2moe</c>, HF <c>Lfm2MoeForCausalLM</c>): 30 gated short-convolution
+    /// layers (<c>in_proj -> B*X -> causal depthwise conv k=L_cache -> C* -> out_proj</c>, no activation, no bias) interleaved
+    /// with 10 GQA layers (per-head QK RMS-norm, NeoX RoPE); every layer then has a SwiGLU FFN: dense for the leading
+    /// <c>leading_dense_block_count</c> layers, sigmoid + selection-bias top-k MoE (renormalised) after. Tied LM head.
+    /// See issue #1015.
+    /// </summary>
+    Lfm2Moe
 }

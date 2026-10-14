@@ -1254,6 +1254,8 @@ internal sealed class TransformerWeights : IDisposable
                 + "attn_norm/ffn_norm/output_norm), an n-gram embedding and no dense attention projections on "
                 + "its linear-attention layers; it has dedicated models (CPU Qwen4ExpTransformerModel, Vulkan VulkanQwen4ExpTransformerModel; CUDA is not "
                 + "implemented yet), issues #814 / #816 / #818",
+            DotLLM.Core.Configuration.Architecture.Lfm2Moe =>
+                "its gated short-conv layers carry shortconv.in_proj/conv/out_proj tensors instead of attn_q/attn_k/attn_v/attn_output",
             DotLLM.Core.Configuration.Architecture.Mamba3 =>
                 "Mamba-3 has no GGUF representation at all (no upstream 'mamba3' value for "
                 + "general.architecture and no GGUF tensor-naming convention) — it is "

@@ -1020,6 +1020,8 @@ public static unsafe partial class MoeSwiGluMlp
     /// the matching <c>MatMul.GemmQX</c> kernel for supported quant types, falls back to
     /// per-row dequant + <see cref="TensorPrimitives.Dot"/> for everything else.
     /// </summary>
+    private static readonly bool LegacyPackedExperts = Environment.GetEnvironmentVariable("DOTLLM_MOE_LEGACY_PACKED") == "1";
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void DispatchGemm(
         QuantizationType qt, nint weights, float* b, float* c,
@@ -1034,6 +1036,13 @@ public static unsafe partial class MoeSwiGluMlp
         if (DiagF32Activations && qt is not (QuantizationType.F32 or QuantizationType.F16))
         {
             MatMul.GemmDequantRows((byte*)weights, qt, b, c, m, k, n, pool);
+            return;
+        }
+        // #1015: Q4_0 / Q4_1 / Q5_1 / IQ4_NL expert banks: packed x Q8_1 dot (llama.cpp quantises the activations to Q8 for these
+        // banks too; the dequantise-to-F32 fallback below is ~10x slower and numerically differs from the reference).
+        if (LegacyPackedExperts && qt is QuantizationType.Q4_0 or QuantizationType.Q4_1 or QuantizationType.Q5_1 or QuantizationType.IQ4_NL)
+        {
+            MatMul.GemmLegacyQuant((byte*)weights, qt, b, c, m, k, n, pool, preQuantizedInput);
             return;
         }
         switch (qt)
