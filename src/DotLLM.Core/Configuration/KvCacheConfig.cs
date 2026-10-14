@@ -72,7 +72,7 @@ public readonly record struct KvCacheConfig(
 
         return v switch
         {
-            "f32" or "fp32" => KvCacheDType.F32,
+            "f32" or "fp32" or "f16" or "fp16" => KvCacheDType.F32, // F32 == "unquantized" (an F16 cache on GPU)
             "q8_0" or "q8" => KvCacheDType.Q8_0,
             "q4_0" or "q4" => KvCacheDType.Q4_0,
             "turboquant" => KvCacheDType.TurboQuant,

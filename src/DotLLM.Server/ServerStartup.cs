@@ -311,6 +311,8 @@ public static class ServerStartup
             // paged/quantized KV, no cross-request prefix reuse yet).
             if (options.UsePaged)
                 Console.WriteLine("[dotllm] Paged KV-cache not supported on Vulkan; using the model's own KV-cache.");
+            if (kvConfig.IsQuantized)
+                Console.WriteLine($"[dotllm] WARNING: --cache-type-k/-v (K:{kvConfig.KeyDType} V:{kvConfig.ValueDType}) is ignored: the Vulkan backend has no quantized KV storage (model {config.Architecture}).");
             var vkFactory = vulkanKvFactory;
             kvFactory = (cfg, size) => vkFactory(size);
         }
@@ -346,6 +348,8 @@ public static class ServerStartup
         {
             if (options.UsePaged)
                 Console.WriteLine("[dotllm] Paged KV-cache not supported with hybrid GPU, using hybrid cache.");
+            if (kvConfig.IsQuantized)
+                Console.WriteLine($"[dotllm] WARNING: --cache-type-k/-v (K:{kvConfig.KeyDType} V:{kvConfig.ValueDType}) is ignored: the hybrid GPU/CPU model owns its KV cache and has no quantized storage (model {config.Architecture}).");
             kvFactory = (cfg, size) => hybridModel.CreateKvCache(size);
         }
         else if (model is DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel qwen3SplitModel)
@@ -353,6 +357,8 @@ public static class ServerStartup
             // #729: partial-offload Qwen3HybridDense owns a split (GPU head / CPU tail) cache.
             if (options.UsePaged)
                 Console.WriteLine("[dotllm] Paged KV-cache not supported with hybrid GPU, using the model's split cache.");
+            if (kvConfig.IsQuantized)
+                Console.WriteLine($"[dotllm] WARNING: --cache-type-k/-v (K:{kvConfig.KeyDType} V:{kvConfig.ValueDType}) is ignored: the split GPU/CPU model owns its KV cache and has no quantized storage (model {config.Architecture}).");
             kvFactory = (cfg, size) => qwen3SplitModel.CreateKvCache(size);
         }
         else if (model is DotLLM.Cuda.Architectures.CudaNemotronHTransformerModel nemotronHModel)
@@ -360,6 +366,8 @@ public static class ServerStartup
             // #729: the all-GPU fallback for a partial request on Nemotron-H; sparse attention-only KV.
             if (options.UsePaged)
                 Console.WriteLine("[dotllm] Paged KV-cache not supported for Nemotron-H on GPU; using the model's own cache.");
+            if (kvConfig.IsQuantized)
+                Console.WriteLine($"[dotllm] WARNING: --cache-type-k/-v (K:{kvConfig.KeyDType} V:{kvConfig.ValueDType}) is ignored: Nemotron-H owns its KV cache and has no quantized storage (model {config.Architecture}).");
             kvFactory = (cfg, size) => nemotronHModel.CreateKvCache(size);
         }
         else if (model is DotLLM.Cuda.Architectures.CudaQwen3HybridDenseTransformerModel qwen3HybridDenseModel)
@@ -377,8 +385,14 @@ public static class ServerStartup
             // EnsureF16KvCache using AttentionLayerCount.
             if (options.UsePaged)
                 Console.WriteLine("[dotllm] Paged KV-cache not supported for Qwen3HybridDense hybrid GPU model (#274); using the model's own internal KV-cache.");
-            else if (kvConfig.IsQuantized)
-                Console.WriteLine("[dotllm] KV-cache quantization not supported for Qwen3HybridDense hybrid GPU model (#274); using the model's own internal KV-cache.");
+            // #967: the model owns quantized K/V storage; --cache-type-k/-v / --kv-quant-k/-v override DOTLLM_HYBRID_KV.
+            // "f32" (the option default) means "not given"; an unsupported pair (TurboQuant, row width % 32) throws.
+            qwen3HybridDenseModel.ConfigureKvStorage(
+                HybridKvStorage.FromServerOption(options.CacheTypeK),
+                HybridKvStorage.FromServerOption(options.CacheTypeV));
+            Console.WriteLine(
+                $"[dotllm] KV storage: {qwen3HybridDenseModel.KvStorageLabel} (K:{qwen3HybridDenseModel.KvKeyStorage} V:{qwen3HybridDenseModel.KvValueStorage}), " +
+                $"~{qwen3HybridDenseModel.ComputeKvBytes(config.MaxSequenceLength) / 1048576.0:F0} MiB at {config.MaxSequenceLength} tokens.");
             kvFactory = (cfg, size) => qwen3HybridDenseModel.CreateKvCache(size);
         }
         else if (model is DotLLM.Cuda.Architectures.CudaQwen3MoeHybridTransformerModel qwen3MoeHybridModel)

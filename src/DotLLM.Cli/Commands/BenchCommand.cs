@@ -28,7 +28,7 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
     /// <summary>Fixed seed prompt tiled to synthesize the benchmark prompt.</summary>
     internal const string DefaultSeedPrompt = "The quick brown fox jumps over the lazy dog. ";
 
-    public sealed class Settings : CommandSettings
+    public sealed class Settings : DotLLM.Cli.Helpers.KvQuantSettings
     {
         [CommandArgument(0, "<model>")]
         [Description("Path to a GGUF file or HuggingFace repo ID (e.g., QuantFactory/SmolLM-135M-GGUF).")]
@@ -162,6 +162,12 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         if (!DeviceCli.TryResolveForTool(settings.Device, ggufPath, settings.Json, out string backend, out int gpuId))
             return 1;
 
+        if (!DotLLM.Cli.Helpers.KvStorageCli.TryBuild(null, null, settings.KvQuantK, settings.KvQuantV, 0, out var kvRequest, out var kvFlagError))
+        {
+            WriteError(settings, kvFlagError!);
+            return 1;
+        }
+
         using var gguf = GgufFile.Open(ggufPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
@@ -285,6 +291,25 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         }
         loadSw.Stop();
 
+        // #967: apply --kv-quant-k/-v to a CUDA hybrid-dense model; warn (never silently ignore) elsewhere.
+        if (kvRequest.IsSpecified)
+        {
+            var kvTarget = DotLLM.Cli.Helpers.KvStorageCli.Classify(model, vulkanDevice is not null);
+            foreach (var w in DotLLM.Cli.Helpers.KvStorageCli.Warnings(kvRequest, kvTarget, config.Architecture.ToString(), backend, engineCacheHonoured: false))
+                Console.Error.WriteLine($"WARNING: {w}");
+            try
+            {
+                DotLLM.Cli.Helpers.KvStorageCli.Apply(model, kvRequest);
+            }
+            catch (NotSupportedException e)
+            {
+                WriteError(settings, e.Message);
+                model.Dispose();
+                vulkanDevice?.Dispose();
+                return 1;
+            }
+        }
+
         if (HostResidencyProbe.Enabled)
             HostResidencyProbe.Report("after-load", mapBase, mapLength, vulkanDevice?.MemorySnapshot());
 
@@ -349,6 +374,8 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
             else
             {
                 RenderTable(settings, config, result, modelName, quant, backend, deviceLabel, runtimeVersion, csvRow);
+                if (DotLLM.Cli.Helpers.KvStorageCli.Describe(model, result.PromptTokens + result.Depth + result.DecodeTokens) is { } kvInfo)
+                    AnsiConsole.MarkupLine($"  [dim]{Markup.Escape(kvInfo.Text)}[/]");
             }
 
             return 0;
@@ -530,6 +557,8 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         if (result.Depth > 0) parts.Add($"--depth {result.Depth}");
         if (settings.Threads > 0) parts.Add($"--threads {settings.Threads}");
         if (settings.DecodeThreads > 0) parts.Add($"--decode-threads {settings.DecodeThreads}");
+        if (settings.KvQuantK is not null) parts.Add($"--kv-quant-k {settings.KvQuantK}");
+        if (settings.KvQuantV is not null) parts.Add($"--kv-quant-v {settings.KvQuantV}");
         return string.Join(" ", parts);
     }
 

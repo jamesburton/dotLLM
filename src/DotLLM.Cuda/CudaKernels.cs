@@ -551,6 +551,12 @@ public sealed unsafe class CudaKernels : IDisposable
     // Quantized-KV fused-dequant variants of the mma decode kernel (issue #956), indexed by
     // KvqIndex(kDtype, vDtype): 0 = q8q8, 1 = q4q4, 2 = q8q4, 3 = q4q8. Best-effort load: absent
     // PTX or a pre-Ampere driver leaves them 0 and callers fall back to dequant-into-scratch.
+    // Tensor-core flash-style PREFILL attention for head_dim 256 reading the F16 KV cache directly
+    // (issue #962 -- native/kernels/attention_flash_mma_prefill_hd256.cu). Best-effort load,
+    // Ampere-only; absent/unloadable leaves the func 0 and callers fall back to attention_f32.
+    private readonly CudaModule? _attentionFlashPrefillHd256Module;
+    private readonly nint _attentionFlashPrefillHd256Func;
+
     private readonly CudaModule? _attentionMmaDecodeKvqModule;
     private readonly nint[] _attentionMmaDecodeKvqFuncs = new nint[4];
     private readonly int[] _attentionMmaDecodeKvqMaxCoResident = { -1, -1, -1, -1 };
@@ -1385,6 +1391,28 @@ public sealed unsafe class CudaKernels : IDisposable
                 Array.Clear(_attentionMmaDecodeKvqV2Funcs);
             }
         }
+
+        // Flash-style tensor-core prefill attention, head_dim 256 (issue #962). Same best-effort
+        // pattern as the decode kernels above: mma.sync/cp.async PTX is sm_80+, so a pre-Ampere
+        // device (or stale PTX) throws CudaException at module load and the feature stays off.
+        string attentionFlashPrefillHd256Path = Path.Combine(ptxDir, "attention_flash_mma_prefill_hd256.ptx");
+        if (File.Exists(attentionFlashPrefillHd256Path))
+        {
+            try
+            {
+                var m = CudaModule.LoadFromFile(attentionFlashPrefillHd256Path);
+                nint f = m.TryGetFunction("attention_flash_mma_prefill_hd256_f16");
+                if (f != 0)
+                    SetMaxDynamicSharedBytes(f, AttentionFlashPrefillHd256MaxSmemBytes);
+                _attentionFlashPrefillHd256Func = f;
+                _attentionFlashPrefillHd256Module = m;
+            }
+            catch (CudaException)
+            {
+                _attentionFlashPrefillHd256Module = null;
+                _attentionFlashPrefillHd256Func = 0;
+            }
+        }
     }
 
     /// <summary>
@@ -1398,6 +1426,71 @@ public sealed unsafe class CudaKernels : IDisposable
         && _scaleInplaceF32Func != 0 && _rmsnormWeightlessF32Func != 0
         && _softcapInplaceF32Func != 0 && _moeRenormTopkClampedF32Func != 0
         && _quantizeActQ8_0RoundtripF32Func != 0;
+
+    /// <summary>
+    /// True when the head_dim-256 tensor-core flash prefill kernel (issue #962,
+    /// <c>attention_flash_mma_prefill_hd256.ptx</c>) is loaded on this device.
+    /// </summary>
+    public bool HasAttentionFlashPrefillHd256 => _attentionFlashPrefillHd256Func != 0;
+
+    /// <summary>Largest dynamic shared memory the flash prefill hd256 kernel is opted into (99 KB sm_86 cap).</summary>
+    public const int AttentionFlashPrefillHd256MaxSmemBytes = 99 * 1024;
+
+    /// <summary>KV rows per pipeline stage the kernel was compiled with -- MUST match <c>KV_TILE</c> in the .cu.</summary>
+    public const int AttentionFlashPrefillHd256KvTile = 16;
+
+    /// <summary>Double-buffered K/V stages -- MUST match <c>NBUF</c> in the .cu.</summary>
+    public const int AttentionFlashPrefillHd256NumBuf = 2;
+
+    /// <summary>
+    /// Opt-out gate: <c>DOTLLM_ATTN_FLASH_PREFILL_HD256=0</c> forces the attention_f32 prefill
+    /// path. Read once; default ON (issue #962).
+    /// </summary>
+    public static readonly bool EnableAttentionFlashPrefillHd256 =
+        Environment.GetEnvironmentVariable("DOTLLM_ATTN_FLASH_PREFILL_HD256") != "0";
+
+    /// <summary>Dynamic shared memory the kernel needs for a GQA <paramref name="group"/>.</summary>
+    public static int AttentionFlashPrefillHd256SmemBytes(int group)
+        => (group * 16 * (256 + 8) + AttentionFlashPrefillHd256NumBuf * 2 * AttentionFlashPrefillHd256KvTile * (256 + 8)) * 2;
+
+    /// <summary>
+    /// Pure shape check for <see cref="LaunchAttentionFlashPrefillHd256"/>: head_dim 256, real GQA
+    /// (numKvHeads &lt; numHeads, evenly divisible), group &lt;= 8 and the shared-memory footprint fits
+    /// the opt-in cap. Does not check whether the kernel is loaded.
+    /// </summary>
+    public static bool IsAttentionFlashPrefillHd256Shape(int numHeads, int numKvHeads, int headDim)
+    {
+        if (headDim != 256 || numKvHeads <= 0 || numKvHeads >= numHeads || numHeads % numKvHeads != 0) return false;
+        int group = numHeads / numKvHeads;
+        return group <= 8 && AttentionFlashPrefillHd256SmemBytes(group) <= AttentionFlashPrefillHd256MaxSmemBytes;
+    }
+
+    /// <summary>
+    /// Flash-style tensor-core causal prefill attention (issue #962). <paramref name="q"/> is F16
+    /// <c>[seqQ, numHeads*256]</c>, <paramref name="k"/>/<paramref name="v"/> are the F16 KV history
+    /// <c>[seqKv, numKvHeads*256]</c>, <paramref name="output"/> is F32 <c>[seqQ, numHeads*256]</c> --
+    /// the same output contract as <see cref="LaunchAttentionF32"/>. Query row i attends keys
+    /// <c>0..positionOffset+i</c>. <paramref name="scale"/> 0 means <c>1/sqrt(256)</c>.
+    /// </summary>
+    public void LaunchAttentionFlashPrefillHd256(nint q, nint k, nint v, nint output,
+        int seqQ, int seqKv, int numHeads, int numKvHeads, int positionOffset, nint stream,
+        float scale = 0f)
+    {
+        if (_attentionFlashPrefillHd256Func == 0)
+            throw new InvalidOperationException("attention_flash_mma_prefill_hd256 kernel is not loaded.");
+        DotLLM.Core.Attention.AttentionSpanInvariant.AssertTight(seqKv, positionOffset, seqQ, "CUDA");
+
+        int group = numHeads / numKvHeads;
+        nint qArg = q, kArg = k, vArg = v, oArg = output;
+        int sqArg = seqQ, skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, poArg = positionOffset;
+        float scArg = scale > 0f ? scale : 1f / MathF.Sqrt(256f);
+
+        void** args = stackalloc void*[] { &qArg, &kArg, &vArg, &oArg, &sqArg, &skvArg, &nhArg, &nkvArg, &poArg, &scArg };
+        uint gridX = (uint)((seqQ + 15) / 16);
+        CudaDriverApi.cuLaunchKernel(_attentionFlashPrefillHd256Func,
+                gridX, (uint)numKvHeads, 1, (uint)(group * 32), 1, 1,
+                (uint)AttentionFlashPrefillHd256SmemBytes(group), stream, (nint)args, 0).ThrowOnError();
+    }
 
     /// <summary>
     /// True when the hand-fused mma.sync flash-attention prefill kernel is loaded

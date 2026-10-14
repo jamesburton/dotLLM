@@ -90,7 +90,7 @@ length-only `CudaHybridKvCacheHandle`. Per full-attention slot (16 of 64 layers 
   tiers) read F32 K/V. They get ONE staging pair shared by all layers, fully reconverted per use (512 MiB at 64k). The
   default mma decode kernel reads the F16 cache directly and stages nothing. Before #956 every slot kept a persistent F32
   mirror (128 KiB/token, power-of-two growth): 8 GiB at 64k, 16 GiB past 65,536.
-- **Quantized storage** (`DOTLLM_HYBRID_KV=f16|q8_0|q4_0|k8v4|k4v8`): rows are quantized on write
+- **Quantized storage** (`--kv-quant-k/--kv-quant-v` or `DOTLLM_HYBRID_KV=f16|q8_0|q4_0|k8v4|k4v8`): rows are quantized on write
   (`quant_f16_to_q{8,4}_0`, standard 32-element blocks) and read either by the **fused** decode kernel
   (`attention_flash_mma_decode_gqa_split_kvq_*`, dequant inside the K/V tile load, bit-identical to the scratch path;
   **default ON since #988's v2 kernels** — v1 fused measured slower than scratch, Q4_0 at ctx 16k 12.4 vs 13.3 tok/s, v2
@@ -100,6 +100,23 @@ length-only `CudaHybridKvCacheHandle`. Per full-attention slot (16 of 64 layers 
   `KvQuantize` and `quant_kv.cu`; the weight dequant (`dequant_q4_0_f16`) unpacks low/high HALVES. Always use
   `CudaKernels.LaunchKvDequantToF16` for KV data. (The eager `CudaQuantizedKvCache` path used the weight dequant until
   #956, permuting elements inside every 32-block.)
+- **CLI selection (issue #967).** `run`, `bench` and `serve` accept `--kv-quant-k` / `--kv-quant-v` (`f16`, `q8_0`, `q4_0`);
+  on `run` and `serve` they are synonyms of `--cache-type-k/-v` (giving both with different values is an error).
+  `dotllm run --device gpu --kv-quant-k q8_0 --kv-quant-v q4_0` selects K8/V4. Precedence is **per side**:
+  explicit flag, then `DOTLLM_HYBRID_KV`, then F16 (so `--kv-quant-k q4_0` with `DOTLLM_HYBRID_KV=q8_0` gives K4/V8, and
+  `--kv-quant-k f16 --kv-quant-v f16` forces unquantized over the env var). `serve`'s `--cache-type-*` default is `f32`,
+  which cannot be told apart from "not given" and so leaves the env var in charge; pass `f16` to force unquantized.
+  The pure logic lives in `HybridKvStorage` (Core); the model exposes `ConfigureKvStorage(key, value)` (call before the
+  first forward), `KvStorageLabel`, `ComputeKvBytes(maxSeq)` and `KvAllocatedBytes`; the VRAM ledger and the `run`
+  summary share that byte math. `run` prints the effective format in the Memory box
+  (`KV Cache  ... (N slots, KV k8v4 (K:Q8_0 V:Q4_0), 1664 MiB)`), `bench` prints a `KV ...` line after the table and
+  records the flags in the results.csv settings column, `serve` logs `KV storage: ...` at startup.
+  - A flag the selected model/backend cannot honour prints a `WARNING` naming the flag, model and backend, never silence:
+    Vulkan (no quantized KV), split GPU/CPU hybrids, Qwen3MoeHybrid and Nemotron-H (own cache, no quantized storage), and
+    `bench` on CPU / plain CUDA models (its `SimpleKvCache` ignores them). `--cache-window` is ignored (warned) for the
+    hybrid-dense model: one format for the whole cache, no mixed-precision window.
+  - Rejected with an error (exit 1 / startup failure): TurboQuant on this model, and quantized storage when
+    `numKvHeads * headDim` is not a multiple of 32.
 - `DOTLLM_HYBRID_VRAM_LEDGER=1` logs the model-owned KV/staging/scratch bytes once after the first attention call.
 
 ## Paged KV-Cache
@@ -253,8 +270,8 @@ On each new token write, the oldest window entry is quantized and appended to th
 
 ### CLI
 ```
---cache-type-k q8_0    # key quantization (f32, q8_0, q4_0)
---cache-type-v q4_0    # value quantization (f32, q8_0, q4_0)
+--cache-type-k q8_0    # key quantization (f32, q8_0, q4_0); synonym --kv-quant-k (also on bench)
+--cache-type-v q4_0    # value quantization (f32, q8_0, q4_0); synonym --kv-quant-v (also on bench)
 --cache-window 64      # recent tokens in full precision (0 = all quantized)
 ```
 

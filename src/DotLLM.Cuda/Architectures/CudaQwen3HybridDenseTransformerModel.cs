@@ -204,29 +204,50 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     private nint _kvF16ScratchV;
     private long _kvF16ScratchElems;
 
-    private static (KvCacheDType key, KvCacheDType value) ParseKvStorageEnv()
-    {
-        string? v = Environment.GetEnvironmentVariable("DOTLLM_HYBRID_KV")?.Trim().ToLowerInvariant();
-        return v switch
-        {
-            null or "" or "f16" or "f32" => (KvCacheDType.F32, KvCacheDType.F32),
-            "q8_0" or "q8" => (KvCacheDType.Q8_0, KvCacheDType.Q8_0),
-            "q4_0" or "q4" => (KvCacheDType.Q4_0, KvCacheDType.Q4_0),
-            "k8v4" => (KvCacheDType.Q8_0, KvCacheDType.Q4_0),
-            "k4v8" => (KvCacheDType.Q4_0, KvCacheDType.Q8_0),
-            _ => throw new InvalidOperationException(
-                $"DOTLLM_HYBRID_KV='{v}' is not one of f16, q8_0, q4_0, k8v4, k4v8."),
-        };
-    }
+    private static (KvCacheDType key, KvCacheDType value) ParseKvStorageEnv() =>
+        HybridKvStorage.Resolve(null, null, Environment.GetEnvironmentVariable(HybridKvStorage.EnvVar));
 
     private static bool IsQuantKv(KvCacheDType d) => d is KvCacheDType.Q8_0 or KvCacheDType.Q4_0;
 
-    private static long QuantRowBytes(KvCacheDType d, int kvElems) => d switch
+    private static long QuantRowBytes(KvCacheDType d, int kvElems) => HybridKvStorage.RowBytes(d, kvElems);
+
+    /// <summary>Effective key storage format (<see cref="KvCacheDType.F32"/> means an unquantized F16 cache).</summary>
+    public KvCacheDType KvKeyStorage => _kvKeyDType;
+
+    /// <summary>Effective value storage format (<see cref="KvCacheDType.F32"/> means an unquantized F16 cache).</summary>
+    public KvCacheDType KvValueStorage => _kvValueDType;
+
+    /// <summary>Short label of the effective KV storage: <c>f16</c>, <c>q8_0</c>, <c>q4_0</c>, <c>k8v4</c>, <c>k4v8</c>.</summary>
+    public string KvStorageLabel => HybridKvStorage.Label(_kvKeyDType, _kvValueDType);
+
+    /// <summary>
+    /// Persistent K/V device bytes for <paramref name="maxSeqLen"/> tokens across all full-attention
+    /// slots under the effective storage format. The VRAM ledger and the CLI summary share this.
+    /// </summary>
+    public long ComputeKvBytes(long maxSeqLen) => HybridKvStorage.TotalBytes(
+        _attentionLayerCount, maxSeqLen, Config.NumKvHeads * Config.HeadDim, _kvKeyDType, _kvValueDType);
+
+    /// <summary>Persistent K/V device bytes actually allocated so far (0 before the first attention forward).</summary>
+    public long KvAllocatedBytes => _f16KCache is null ? 0 : ComputeKvBytes(_f16CacheMaxSeqLen);
+
+    /// <summary>
+    /// Selects the KV storage format (issue #967). A non-null argument is an explicit request and
+    /// overrides <c>DOTLLM_HYBRID_KV</c> for that side; a null argument keeps the current value
+    /// (environment variable or default). Must be called before the first attention-enabled forward.
+    /// </summary>
+    /// <exception cref="NotSupportedException">The format is unsupported or the KV row width is not a multiple of 32.</exception>
+    /// <exception cref="InvalidOperationException">The KV cache has already been allocated.</exception>
+    public void ConfigureKvStorage(KvCacheDType? key, KvCacheDType? value)
     {
-        KvCacheDType.Q8_0 => (long)kvElems / 32 * 34,
-        KvCacheDType.Q4_0 => (long)kvElems / 32 * 18,
-        _ => (long)kvElems * sizeof(ushort),
-    };
+        if (_f16KCache is not null || _kQuant is not null)
+            throw new InvalidOperationException("KV storage must be chosen before the first Forward.");
+        var k = key ?? _kvKeyDType;
+        var v = value ?? _kvValueDType;
+        string? error = HybridKvStorage.Validate(k, v, Config.NumKvHeads * Config.HeadDim);
+        if (error is not null) throw new NotSupportedException(error);
+        _kvKeyDType = k;
+        _kvValueDType = v;
+    }
 
     /// <summary>
     /// Test-only (issue #956): selects the KV storage format. Must be called before the first
@@ -254,6 +275,19 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// default mma decode kernel (F16 cache read directly) is serving decode.
     /// </summary>
     internal int DebugF32StagedAttentionCallsForTest { get; private set; }
+
+    /// <summary>
+    /// Issue #962: serve prefill (seqLen &gt; 1) full-attention through the head_dim-256 tensor-core
+    /// flash kernel reading the F16 KV cache directly (no F32 staging). Default ON; env opt-out
+    /// <c>DOTLLM_ATTN_FLASH_PREFILL_HD256=0</c>. Settable so tests can A/B against attention_f32.
+    /// </summary>
+    internal bool FlashPrefillHd256ForTest { get; set; } = CudaKernels.EnableAttentionFlashPrefillHd256;
+
+    /// <summary>Test-only: prefill attention calls served by the head_dim-256 flash kernel.</summary>
+    internal int DebugFlashPrefillHd256CallsForTest { get; private set; }
+
+    private nint _attnFlashPrefillQF16;
+    private long _attnFlashPrefillQF16ElemsAllocated;
 
     // Opt-in split-KV attention (issue #183) scratch: partial (max, sum, out) per (head, split).
     // Sized once for the model's fixed (numHeads, headDim) shape and reused every decode step.
@@ -520,10 +554,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// <remarks>
     /// Sized for the MTP head's own attention (<see cref="Config"/>'s standard head count/dim —
     /// the MTP block is a normal full-attention layer, see <see cref="CudaMtpHeadWeights"/>), with a
-    /// device-resident, position-indexed KV-cache of <see cref="MtpDefaultMaxSequenceLength"/>
-    /// positions. Mirrors the CPU host's <c>Qwen3HybridDenseTransformerModel.CreateMtpState</c>.
+    /// device-resident, position-indexed KV-cache. The cache allocates lazily (issue #966), so this
+    /// parameterless overload costs only the first 1024 positions up front and uses the model's whole
+    /// context window as its ceiling. Engine callers pass the trunk KV-cache's <c>MaxLength</c>.
+    /// Mirrors the CPU host's <c>Qwen3HybridDenseTransformerModel.CreateMtpState</c>.
     /// </remarks>
-    public IMtpState? CreateMtpState() => CreateMtpState(MtpDefaultMaxSequenceLength);
+    public IMtpState? CreateMtpState()
+        => CreateMtpState(Math.Max(MtpDefaultMaxSequenceLength, Config.MaxSequenceLength));
 
     /// <inheritdoc/>
     public IMtpState? CreateMtpState(int maxSequenceLength)
@@ -540,8 +577,9 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     }
 
     /// <summary>
-    /// Default MTP KV-cache depth, in sequence positions, for <see cref="CreateMtpState()"/> —
-    /// the head's cache is indexed by position and absorbs the whole sequence (issue #469).
+    /// Floor of the ceiling <see cref="CreateMtpState()"/> uses (the head's cache is indexed by position
+    /// and absorbs the whole sequence, issue #469). The ceiling is <c>max(this, Config.MaxSequenceLength)</c>;
+    /// memory follows the positions actually reached, not this value (issue #966).
     /// </summary>
     public const int MtpDefaultMaxSequenceLength = 4096;
 
@@ -2086,7 +2124,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         nint streamH = _stream.Handle;
         long hiddenRowBytes = (long)hiddenSize * sizeof(float);
 
-        state.BeginAbsorb(firstPosition, total);
+        state.BeginAbsorb(firstPosition, total, streamH);
         ProfMark("mtp-absorb-0a-begin");
 
         int chunkRows = Math.Max(1, Math.Min(total, MtpAbsorbChunkRows));
@@ -2484,6 +2522,8 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             throw new InvalidOperationException(
                 $"CudaMtpState KV-cache exhausted at position {position} (MaxSteps={state.MaxSteps}). " +
                 "Create the state with CreateMtpState(maxSequenceLength) covering the whole sequence.");
+        // Issue #966: the head KV grows lazily; make slot `step` addressable before any pointer into it.
+        state.EnsureCapacity(step + 1, _stream.Handle);
 
         _mtpScratch ??= CudaMtpScratch.Allocate(hiddenSize, qElems, intermediateSize, vocabSize);
         var s = _mtpScratch;
@@ -3308,7 +3348,12 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             // decode kernel below reads the F16 cache directly, so on the default decode path no
             // F32 copy is allocated or converted at all. Tier precedence mirrors the dispatch
             // chain: the #226 fp64-combine toggle wins over mma, then mma, then the F32 tiers.
-            bool needF32Stage = useSplitKvHpAttn || !useMmaDecodeGqaSplitAttn;
+            // Issue #962: tensor-core flash prefill (head_dim 256) reads the F16 view directly too.
+            bool useFlashPrefillHd256 = seqLen > 1
+                && FlashPrefillHd256ForTest
+                && _kernels.HasAttentionFlashPrefillHd256
+                && CudaKernels.IsAttentionFlashPrefillHd256Shape(numHeads, numKvHeads, headDim);
+            bool needF32Stage = !useFlashPrefillHd256 && (useSplitKvHpAttn || !useMmaDecodeGqaSplitAttn);
             nint kStage = 0, vStage = 0;
             // F16 view of K/V history: the persistent cache, or a fresh dequant into the shared
             // scratch when KV storage is quantized (Phase 2).
@@ -3332,8 +3377,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             if (s_vramLedger && !_vramLedgerLogged)
             {
                 _vramLedgerLogged = true;
-                long kvBytes = (long)_attentionLayerCount * _f16CacheMaxSeqLen *
-                    (QuantRowBytes(_kvKeyDType, kvElems) + QuantRowBytes(_kvValueDType, kvElems));
+                long kvBytes = ComputeKvBytes(_f16CacheMaxSeqLen);
                 long f32Stage = 2L * _f32KvStageElems * sizeof(float);
                 long f16Scratch = (IsQuantKv(_kvKeyDType) ? 1L : 0L) + (IsQuantKv(_kvValueDType) ? 1L : 0L);
                 f16Scratch *= _kvF16ScratchElems * sizeof(ushort);
@@ -3344,7 +3388,21 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                     $"state+gdn {ComputeMemoryBytes / 1048576.0:F0} MiB");
             }
 
-            if (useSplitKvHpAttn)
+            if (useFlashPrefillHd256)
+            {
+                long qElemsAll = (long)seqLen * numHeads * headDim;
+                if (qElemsAll > _attnFlashPrefillQF16ElemsAllocated)
+                {
+                    FreeIfNonZero(ref _attnFlashPrefillQF16);
+                    _attnFlashPrefillQF16 = AllocDevice(qElemsAll * sizeof(ushort));
+                    _attnFlashPrefillQF16ElemsAllocated = qElemsAll;
+                }
+                _kernels.LaunchConvertF32ToF16(q, _attnFlashPrefillQF16, (int)qElemsAll, streamH);
+                _kernels.LaunchAttentionFlashPrefillHd256(_attnFlashPrefillQF16, kF16, vF16, attnOut,
+                    seqLen, seqKv, numHeads, numKvHeads, positionOffset, streamH);
+                DebugFlashPrefillHd256CallsForTest++;
+            }
+            else if (useSplitKvHpAttn)
             {
                 EnsureAttentionSplitKvScratch(numHeads, headDim);
                 _kernels.LaunchAttentionF32SplitKvHp(q, kStage, vStage, attnOut,
@@ -4282,6 +4340,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         FreeIfNonZero(ref _attnGqaSplitPartialSum);
         FreeIfNonZero(ref _attnGqaSplitPartialOut);
         FreeIfNonZero(ref _attnMmaDecodeQF16);
+        FreeIfNonZero(ref _attnFlashPrefillQF16);
 
         // MTP (issue #253): free the trailing NextN head's device weights (a no-op when absent).
         if (_mtpHead is { } mtpHead)
