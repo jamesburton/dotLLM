@@ -52,6 +52,10 @@ app.Configure(config =>
         .WithDescription("Launch API server with built-in web chat UI.")
         .WithExample("serve", "Qwen/Qwen3-0.6B-GGUF", "--port", "8080");
 
+    config.AddCommand<BenchCommand>("bench")
+        .WithDescription("Benchmark decode throughput at multiple context depths in one process.")
+        .WithExample("bench", "Qwen/Qwen3-0.6B-GGUF", "--depth-list", "512,2048,8192", "--decode-tokens", "128");
+
 #if DEBUG
     config.AddBranch("debug", debug =>
     {

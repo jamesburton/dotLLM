@@ -8,6 +8,7 @@ namespace DotLLM.Cli;
 /// Enables Native AOT compilation by eliminating reflection-based serialization.
 /// </summary>
 [JsonSerializable(typeof(RunJsonResult))]
+[JsonSerializable(typeof(List<BenchDepthResult>))]
 [JsonSourceGenerationOptions(
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower)]
