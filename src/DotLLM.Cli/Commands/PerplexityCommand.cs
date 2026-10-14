@@ -1,10 +1,12 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Evaluation;
 using DotLLM.Core.Models;
 using DotLLM.Engine;
 using DotLLM.Engine.Evaluation;
+using DotLLM.Engine.KvCache;
 using DotLLM.Models;
 using DotLLM.Models.Evaluation;
 using DotLLM.Models.Gguf;
@@ -108,6 +110,11 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         [Description("Compute threads. 0 = auto.")]
         [DefaultValue(0)]
         public int Threads { get; set; }
+
+        [CommandOption("--no-kv-cache")]
+        [Description("Score without a KV cache (exact F32 K/V baseline). By default perplexity uses the backend's real KV cache so that KV quantization (F16, Q8, etc.) is reflected in the reported figure. Pass this flag to measure the cacheless path as a comparison baseline.")]
+        [DefaultValue(false)]
+        public bool NoKvCache { get; set; }
     }
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
@@ -183,6 +190,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         var tokenizer = hfDir is null ? GgufBpeTokenizerFactory.Load(gguf!.Metadata) : null;
         IDisposable? safetensorsSource = null;
         IModel model;
+        Func<int, IKvCache>? kvCacheFactory = null;
         IDisposable? ownedDevice = null;
         int forwardDeviceId;
         string deviceLabel;
@@ -195,6 +203,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
             ownedDevice = safetensorsSource;
             addBos = settings.Bos ?? false;
             forwardDeviceId = -1;
+            kvCacheFactory = size => new SimpleKvCache(KvGeometry.FromConfig(cfg), size);
             deviceLabel = $"cpu-{new ThreadingConfig(settings.Threads).EffectiveThreadCount}t (safetensors)";
         }
         else
@@ -222,7 +231,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
                 // (Qwen3MoeHybrid, Qwen3HybridDense) to their dedicated loaders. The plain
                 // CudaTransformerModel loader fails on them with
                 // "blk.0.attn_output.weight not present" (issue #259).
-                (model, _) = DotLLM.Cuda.CudaModelLoader.CreateFromGguf(gguf, config, gpuId);
+                (model, kvCacheFactory) = DotLLM.Cuda.CudaModelLoader.CreateFromGguf(gguf, config, gpuId);
                 forwardDeviceId = gpuId;
                 deviceLabel = DotLLM.Cuda.CudaDevice.GetDevice(gpuId).Name;
                 break;
@@ -233,7 +242,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
                 var vkDevice = DotLLM.Vulkan.VulkanDevice.Create();
                 ownedDevice = vkDevice;
                 // Shared per-architecture Vulkan dispatch — see the CPU/CUDA branches (#259).
-                (model, _) = DotLLM.Vulkan.VulkanModelLoader.CreateFromGguf(
+                (model, kvCacheFactory) = DotLLM.Vulkan.VulkanModelLoader.CreateFromGguf(
                     vkDevice, gguf, config, ResolveSpvDir());
                 forwardDeviceId = 0;
                 deviceLabel = vkDevice.DeviceName;
@@ -248,6 +257,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
                 // follow (a GDN layer has no attn_output.weight — issue #259).
                 model = ModelLoader.CreateCpuModelFromGguf(
                     gguf, config, new ThreadingConfig(settings.Threads));
+                kvCacheFactory = size => new SimpleKvCache(KvGeometry.FromConfig(config), size);
                 forwardDeviceId = -1;
                 deviceLabel = $"cpu-{new ThreadingConfig(settings.Threads).EffectiveThreadCount}t";
                 break;
@@ -301,6 +311,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         if (settings.DumpTokens is not null)
             File.WriteAllText(settings.DumpTokens, string.Join(' ', tokens));
 
+        IKvCache? kvCache = null;
         try
         {
         // Probed, not assumed: the CPU transformer returns [seqLen, vocab] but the CUDA model
@@ -310,10 +321,19 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         // scoring window (+1 for a prepended BOS) is the longest batch this run will submit.
         model.TrySetAllRowLogitsLimit(effectiveContext + 1);
         bool returnsAllRows = BackendPerplexityModel.Probe(model, forwardDeviceId, effectiveContext + 1);
-        var perplexityModel = new BackendPerplexityModel(model, forwardDeviceId, returnsAllRows);
+
+        // Issue #992: by default, score through a real KV cache so perplexity reflects the
+        // quality cost of KV storage format (F16, quantized, etc.). --no-kv-cache restores
+        // the old cacheless path as an exact-K/V baseline.
+        if (!settings.NoKvCache && kvCacheFactory is not null)
+            kvCache = kvCacheFactory(effectiveContext);
+
+        var perplexityModel = new BackendPerplexityModel(model, forwardDeviceId, returnsAllRows, kvCache);
+        string kvLabel = perplexityModel.UsesKvCache ? "yes" : "no (exact F32 K/V)";
         AnsiConsole.MarkupLine(
             $"[grey]device: {Markup.Escape(deviceLabel)}  all-rows logits: {returnsAllRows} "
-            + $"({(returnsAllRows ? "single-pass O(n)" : "growing-prefix O(n^2)")})[/]");
+            + $"({(returnsAllRows ? "single-pass O(n)" : "growing-prefix O(n^2)")})  "
+            + $"KV cache: {kvLabel}[/]");
         int bosTokenId = addBos ? tokenizer!.BosTokenId : -1;
         var options = new PerplexityOptions(
             mode, effectiveContext, effectiveStride, settings.MaxTokens, effectivePrefix, bosTokenId);
@@ -359,6 +379,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
             table.AddRow("Corpus line endings", Markup.Escape(
                 CorpusLineEndings.SummarizeForReport(corpusCarriageReturns, settings.NormalizeLineEndings)));
         }
+        table.AddRow("KV cache", kvCache is not null ? "yes" : "no (exact F32 K/V)");
         table.AddRow("Elapsed", $"{sw.Elapsed.TotalSeconds:F2} s");
         AnsiConsole.Write(table);
 
@@ -367,6 +388,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         }
         finally
         {
+            kvCache?.Dispose();
             model.Dispose();
             ownedDevice?.Dispose();
         }

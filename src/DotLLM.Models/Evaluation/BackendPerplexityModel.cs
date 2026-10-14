@@ -1,3 +1,4 @@
+using DotLLM.Core.Attention;
 using DotLLM.Core.Evaluation;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
@@ -18,11 +19,19 @@ namespace DotLLM.Models.Evaluation;
 /// error — the evaluator would read one row and attribute it to the wrong target. Because it cannot
 /// fail loudly, it is passed in explicitly and is best obtained from
 /// <see cref="Probe"/> rather than from an assumption about the concrete type.</para>
+/// <para><b>KV cache (issue #992).</b> When constructed with a <see cref="IKvCache"/>, the adapter
+/// routes every forward through <see cref="IModel.Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>
+/// so the model stores K/V in the cache's native format (F16, quantized, etc.) and attends from
+/// that stored representation. <see cref="ResetState"/> rolls the cache back to zero so each
+/// scoring window starts fresh. Without a cache the adapter uses the three-argument
+/// <see cref="IModel.Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int)"/>, which computes K/V
+/// in F32 and never stores them — the exact-K/V baseline (<c>--no-kv-cache</c>).</para>
 /// </remarks>
 public sealed class BackendPerplexityModel : IPerplexityModel
 {
     private readonly IModel _model;
     private readonly int _deviceId;
+    private readonly IKvCache? _kvCache;
 
     /// <param name="model">An already-loaded model. Not owned; not disposed by this adapter.</param>
     /// <param name="deviceId">Device for the forward pass; <c>-1</c> is CPU.</param>
@@ -30,10 +39,18 @@ public sealed class BackendPerplexityModel : IPerplexityModel
     /// Whether <paramref name="model"/>'s forward returns logits for every position. Prefer
     /// <see cref="Probe"/> over hardcoding this per backend.
     /// </param>
-    public BackendPerplexityModel(IModel model, int deviceId, bool returnsAllRows)
+    /// <param name="kvCache">
+    /// Optional KV cache. When non-null, every <see cref="Forward"/> call stores K/V in this cache
+    /// and attends from the stored (potentially quantized) representation, matching the real
+    /// inference path. <see cref="ResetState"/> rolls it back to zero. The cache is borrowed, not
+    /// owned: the caller is responsible for disposing it. When null, the model uses the cacheless
+    /// forward and computes K/V in F32 — the exact-K/V baseline.
+    /// </param>
+    public BackendPerplexityModel(IModel model, int deviceId, bool returnsAllRows, IKvCache? kvCache = null)
     {
         _model = model ?? throw new ArgumentNullException(nameof(model));
         _deviceId = deviceId;
+        _kvCache = kvCache;
         ReturnsAllRows = returnsAllRows;
     }
 
@@ -46,12 +63,21 @@ public sealed class BackendPerplexityModel : IPerplexityModel
     /// <inheritdoc/>
     public bool ReturnsAllRows { get; }
 
-    /// <inheritdoc/>
-    public ITensor Forward(ReadOnlySpan<int> tokens, ReadOnlySpan<int> positions)
-        => _model.Forward(tokens, positions, _deviceId);
+    /// <summary>Whether this adapter is scoring through a KV cache.</summary>
+    public bool UsesKvCache => _kvCache is not null;
 
     /// <inheritdoc/>
-    public void ResetState() => _model.ResetSequenceState();
+    public ITensor Forward(ReadOnlySpan<int> tokens, ReadOnlySpan<int> positions)
+        => _kvCache is not null
+            ? _model.Forward(tokens, positions, _deviceId, _kvCache)
+            : _model.Forward(tokens, positions, _deviceId);
+
+    /// <inheritdoc/>
+    public void ResetState()
+    {
+        _kvCache?.Rollback(0);
+        _model.ResetSequenceState();
+    }
 
     /// <summary>
     /// Determines empirically whether <paramref name="model"/> returns logits for every position, by
