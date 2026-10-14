@@ -137,6 +137,7 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
         // #1018: Q4_0 stays packed (4.5 bpw) when the native kernels exist; DOTLLM_VK_Q4_0_NATIVE=0 restores the exact Q8_0 transcode (8.5 bpw).
         bool native = host.SupportsNativeQ4_0;
         Console.Error.WriteLine($"LFM2-MoE Vulkan: Q4_0 weights {(native ? "NATIVE (packed 4.5 bpw)" : "transcoded to Q8_0 (8.5 bpw)")}");
+        host.Q8GroupedGateUp = true;
 
         var layers = new LayerDev[config.NumLayers];
         var layout = config.HybridLayout!;

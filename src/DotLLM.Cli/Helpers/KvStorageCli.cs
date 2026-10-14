@@ -34,6 +34,8 @@ public enum KvFlagTarget
     CudaPlain,
     /// <summary>CPU backends: honour via the engine's QuantizedKvCache (run/serve only).</summary>
     Cpu,
+    /// <summary>Vulkan VulkanTransformerModel: device-resident KV, quantized storage supported.</summary>
+    VulkanQuantSupported,
     /// <summary>Vulkan: device-resident KV, no quantized storage.</summary>
     Vulkan,
     /// <summary>A model that owns its KV (split GPU/CPU, MoE-hybrid, Nemotron-H) and has no quantized storage.</summary>
@@ -116,6 +118,7 @@ internal static class KvStorageCli
         bool honoured = target switch
         {
             KvFlagTarget.CudaHybridDense => true,
+            KvFlagTarget.VulkanQuantSupported => true,
             KvFlagTarget.CudaPlain or KvFlagTarget.Cpu or KvFlagTarget.Other => engineCacheHonoured,
             _ => false,
         };
@@ -146,7 +149,8 @@ internal static class KvStorageCli
     /// <summary>Classifies a loaded model.</summary>
     public static KvFlagTarget Classify(IModel model, bool isVulkan)
     {
-        if (isVulkan) return KvFlagTarget.Vulkan;
+        if (isVulkan)
+            return model is DotLLM.Vulkan.VulkanTransformerModel ? KvFlagTarget.VulkanQuantSupported : KvFlagTarget.Vulkan;
         return model switch
         {
             CudaQwen3HybridDenseTransformerModel => KvFlagTarget.CudaHybridDense,

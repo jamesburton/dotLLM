@@ -1,0 +1,51 @@
+#version 450
+// KV-cache dequantization: Q4_0 (split layout) → FP32.
+//
+// Reads per-32-element block:
+//   scales[blockIdx] = float scale
+//   quants[blockIdx*4 + 0..3] = uint (8 nibbles per uint, lo=even elem, hi=odd)
+// Writes: dst[blockIdx * 32 + i] = scale * (nibble - 8)
+//
+// Nibble layout (matches GGUF Q4_0 / CPU KvQuantize):
+//   byte[j] = (elem[2j+1] << 4) | elem[2j]
+//
+// Dispatch: ceil(totalBlocks / 256) workgroups × 1 × 1.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Scales { float scales[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer Quants { uint  quants[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer Dst    { float dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint totalBlocks;
+    uint srcOffset;
+    uint dstOffset;
+} pc;
+
+const uint QK = 32u;
+
+void main() {
+    uint b = gl_GlobalInvocationID.x;
+    if (b >= pc.totalBlocks) return;
+
+    uint srcBlock = pc.srcOffset + b;
+    uint dstBase  = pc.dstOffset + b * QK;
+
+    float scale = scales[srcBlock];
+    uint qBase  = srcBlock * 4u;
+
+    // Each uint holds 4 bytes; each byte has 2 nibbles → 8 elements per uint.
+    for (uint g = 0u; g < 4u; g++) {
+        uint packed = quants[qBase + g];
+        uint e = dstBase + g * 8u;
+
+        for (uint j = 0u; j < 4u; j++) {
+            uint byteVal = (packed >> (j * 8u)) & 0xFFu;
+            int lo = int(byteVal & 0xFu) - 8;
+            int hi = int(byteVal >> 4u) - 8;
+            dst[e + j * 2u]      = scale * float(lo);
+            dst[e + j * 2u + 1u] = scale * float(hi);
+        }
+    }
+}
