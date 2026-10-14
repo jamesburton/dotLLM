@@ -133,13 +133,13 @@ internal static class MimoFwd
     /// </summary>
     private static void SmallRow(VulkanTransformerModel model, Func<int, int, bool, double> fwd, int reps, int ctx)
     {
-        var cfgs = new (string name, int q6, int f32, int q8, int attn, int r2)[]
+        var cfgs = new (string name, int q6, int f32, int q8, int attn, int r2, int moe)[]
         {
-            ("old", 0, 0, 0, 0, 99), ("+q6k", 4, 0, 0, 0, 99), ("+f32", 4, 4, 0, 0, 99), ("+q8", 4, 4, 4, 0, 99), ("+attn", 4, 4, 4, 4, 99), ("+q6k-r2", 4, 4, 4, 4, 3),
-            ("attn-only", 0, 0, 0, 4, 99), ("f32-only", 0, 4, 0, 0, 99), ("f32<=3", 4, 3, 4, 4, 3),
+            ("old", 0, 0, 0, 0, 99, 4), ("+q6k", 4, 0, 0, 0, 99, 4), ("+f32", 4, 4, 0, 0, 99, 4), ("+q8", 4, 4, 4, 0, 99, 4), ("+attn", 4, 4, 4, 4, 99, 4), ("+q6k-r2", 4, 4, 4, 4, 3, 4),
+            ("attn-only", 0, 0, 0, 4, 99, 4), ("f32-only", 0, 4, 0, 0, 99, 4), ("f32<=3", 4, 3, 4, 4, 3, 4), ("final+grouped-moe", 4, 4, 4, 4, 3, 1),
         };
-        void Apply((string name, int q6, int f32, int q8, int attn, int r2) c)
-        { model.SmallRowQ6KMaxRows = c.q6; model.SmallRowF32MaxRows = c.f32; model.SmallRowQ8MaxRows = c.q8; model.SmallRowAttnMaxRows = c.attn; model.SmallRowQ6KR2MinRows = c.r2; }
+        void Apply((string name, int q6, int f32, int q8, int attn, int r2, int moe) c)
+        { model.GenericMoeMmvqMaxRows = c.moe; model.SmallRowQ6KMaxRows = c.q6; model.SmallRowF32MaxRows = c.f32; model.SmallRowQ8MaxRows = c.q8; model.SmallRowAttnMaxRows = c.attn; model.SmallRowQ6KR2MinRows = c.r2; }
         var arms = new List<(string name, int rows, int ci)> { ("r1", 1, 5) };
         for (int ci = 0; ci < cfgs.Length; ci++) for (int rows = 2; rows <= 4; rows++) arms.Add(($"r{rows} {cfgs[ci].name}", rows, ci));
         var times = arms.ToDictionary(a => a.name, _ => new List<double>());
