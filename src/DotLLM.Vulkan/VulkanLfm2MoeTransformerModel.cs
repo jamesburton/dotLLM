@@ -452,6 +452,7 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
         if (resized) _host.Q4InvalidateCaches();
         _host.Q4UploadPositions(positions);
 
+        long hp0 = HostProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         var submit = _host.Q4Submit;
         submit.Begin();
         nint cmd = submit.CommandBuffer;
@@ -529,13 +530,32 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
             wts.OutputOutputDim, wts.OutputInputDim, rows);
         cmd = Stage(cmd, "lm_head");
         KernelSupport.ComputeToHostBarrier(cmd);
+        long hp1 = HostProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         submit.SubmitAndWait();
+        long hp2 = HostProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         if (StageTs) TsCollect(T);
         if (_host.Q4StageProfiling) ReportMoeSubStages(T);
 
         var result = UnmanagedTensor.Allocate(new TensorShape(rows, V), DType.Float32, deviceId: -1);
         _device.Download(logitsBuf, new Span<float>((void*)result.DataPointer, rows * V));
+        if (HostProfile && T == 1) HostProfileTick(hp0, hp1, hp2, System.Diagnostics.Stopwatch.GetTimestamp());
         return result;
+    }
+
+    /// <summary>Host-side split of a decode forward (<c>DOTLLM_VK_LFM2_HOST_PROFILE=1</c>): command recording, submit + GPU wait, logits download; printed per 32 tokens.</summary>
+    public static bool HostProfile { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_LFM2_HOST_PROFILE") == "1";
+    private double _hpRecord, _hpWait, _hpDownload;
+    private int _hpN;
+
+    private void HostProfileTick(long t0, long t1, long t2, long t3)
+    {
+        double f = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        _hpRecord += (t1 - t0) * f; _hpWait += (t2 - t1) * f; _hpDownload += (t3 - t2) * f;
+        if (++_hpN % 32 == 0)
+        {
+            Console.Error.WriteLine($"[lfm2-host] decode avg over 32: record={_hpRecord / 32:F3}ms  submit+wait={_hpWait / 32:F3}ms  download={_hpDownload / 32:F3}ms");
+            _hpRecord = _hpWait = _hpDownload = 0;
+        }
     }
 
     private readonly Dictionary<string, double> _moeSub = new();

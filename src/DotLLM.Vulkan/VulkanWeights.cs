@@ -1336,6 +1336,13 @@ internal sealed class VulkanWeights : IDisposable
     private static bool KeepQ5_0OnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
         => !dequantToFp32 && qt == QuantizationType.Q5_0 && (inputDim % 32) == 0;
 
+    /// <summary>Returns true when the matrix will be kept on device as Q4_0 blocks (18 bytes per 32 elements: fp16 scale +
+    /// 16 packed nibble bytes; issue #1018). Consumed by <c>MatMulQ4_0GemvF32Kernel</c> / <c>MatMulQ4_0GemmF32Kernel</c> (always created,
+    /// the scalar fallbacks), the dp4a MMVQ decode kernel and the coopmat prefill GEMM. <c>DOTLLM_VK_Q4_0_NATIVE=0</c> restores the old
+    /// widen-to-F32 behaviour.</summary>
+    private static bool KeepQ4_0OnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.Q4_0 && (inputDim % 32) == 0 && VulkanQwen3MoeMoeUpload.Q4_0NativeEnabled;
+
     /// <summary>Returns true when the matrix will be kept on device as native F16
     /// (2 bytes per element). Gated on the contraction axis being a multiple of 2
     /// (each storage uint holds two F16 elements via <c>unpackHalf2x16</c>).
@@ -1448,7 +1455,7 @@ internal sealed class VulkanWeights : IDisposable
 
     /// <summary>Returns the on-device storage quant type for a projection. Every
     /// <see cref="QuantizationType"/> is kept in its packed source form <em>except</em>
-    /// Q4_0, Q4_1 and Q5_1, which have no Vulkan projection kernel and so return
+    /// Q4_1 and Q5_1 (and Q4_0 under <c>DOTLLM_VK_Q4_0_NATIVE=0</c>), which have no Vulkan projection kernel and so return
     /// <see cref="QuantizationType.F32"/> (Q5_1 is nonetheless supported as a routed-MoE
     /// <c>down</c> bank — see <c>moe_indexed_matmul_q5_1_*</c>). Any format also falls back
     /// to F32 when <paramref name="inputDim"/> is not a multiple of its group size, or when
@@ -1460,6 +1467,7 @@ internal sealed class VulkanWeights : IDisposable
     {
         if (KeepQ8OnDevice(srcQt, dequantToFp32)) return QuantizationType.Q8_0;
         if (KeepQ5_0OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q5_0;
+        if (KeepQ4_0OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q4_0;
         if (KeepQ2KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q2_K;
         if (KeepQ3KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q3_K;
         if (KeepQ4KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q4_K;
@@ -1560,6 +1568,8 @@ internal sealed class VulkanWeights : IDisposable
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q8_0) * outputDim;
         if (KeepQ5_0OnDevice(qt, inputDim, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q5_0) * outputDim;
+        if (KeepQ4_0OnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.Q4_0) * outputDim;
         if (KeepQ2KOnDevice(qt, inputDim, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q2_K) * outputDim;
         if (KeepQ3KOnDevice(qt, inputDim, dequantToFp32))

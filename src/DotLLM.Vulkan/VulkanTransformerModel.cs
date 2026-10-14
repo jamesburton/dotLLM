@@ -269,6 +269,12 @@ public sealed partial class VulkanTransformerModel : IModel
     private MatMulQ5KGemmCoopmatKernel? _matmulQ5KGemmCoopmat;
     // Same for Q5_0 (issue #592).
     private MatMulQ5_0GemmCoopmatKernel? _matmulQ5_0GemmCoopmat;
+    // Native Q4_0 (issue #1018): scalar F32-in GEMV / GEMM fallbacks, dp4a MMVQ decode (needs the shared Q8_1 activation scratch) and the
+    // 128x128x4 coopmat prefill GEMM. All created post-construction; a null optional kernel just selects the next fallback.
+    private MatMulQ4_0GemvF32Kernel? _matmulQ4_0;
+    private MatMulQ4_0GemmF32Kernel? _matmulQ4_0Gemm;
+    private MatMulQ4_0MmvqKernel? _matmulQ4_0Mmvq;
+    private MatMulQ4_0GemmCoopmatKernel? _matmulQ4_0GemmCoopmat;
     // Same for Q3_K (issue #598).
     private MatMulQ3KGemmCoopmatKernel? _matmulQ3KGemmCoopmat;
     // Same for IQ4_XS (issue #600).
@@ -2264,6 +2270,14 @@ public sealed partial class VulkanTransformerModel : IModel
         if (Environment.GetEnvironmentVariable(DisableQ5_0CoopmatEnvVar) != "1"
             && MatMulQ5_0GemmCoopmatKernel.IsSupportedOn(device, spvDir))
             model._matmulQ5_0GemmCoopmat = MatMulQ5_0GemmCoopmatKernel.Create(device, spvDir);
+        if (VulkanQwen3MoeMoeUpload.Q4_0NativeEnabled && File.Exists(Path.Combine(spvDir, "matmul_q4_0_f32_gemv.spv")))
+        {
+            model._matmulQ4_0 = MatMulQ4_0GemvF32Kernel.Create(device, spvDir);
+            model._matmulQ4_0Gemm = MatMulQ4_0GemmF32Kernel.Create(device, spvDir);
+            model._matmulQ4_0Mmvq = MatMulQ4_0MmvqKernel.TryCreate(device, spvDir);
+            if (MatMulQ4_0GemmCoopmatKernel.IsSupportedOn(device, spvDir))
+                model._matmulQ4_0GemmCoopmat = MatMulQ4_0GemmCoopmatKernel.Create(device, spvDir);
+        }
         if (Environment.GetEnvironmentVariable(DisableQ3KCoopmatEnvVar) != "1"
             && MatMulQ3KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
             model._matmulQ3KGemmCoopmat = MatMulQ3KGemmCoopmatKernel.Create(device, spvDir);
@@ -4793,6 +4807,10 @@ public sealed partial class VulkanTransformerModel : IModel
         _matmulQ8GemmCoopmat?.InvalidateDescriptorCache();
         _matmulQ5_0.InvalidateDescriptorCache();
         _matmulQ5_0Gemm.InvalidateDescriptorCache();
+        _matmulQ4_0?.InvalidateDescriptorCache();
+        _matmulQ4_0Gemm?.InvalidateDescriptorCache();
+        _matmulQ4_0Mmvq?.InvalidateDescriptorCache();
+        _matmulQ4_0GemmCoopmat?.InvalidateDescriptorCache();
         _matmulQ2K.InvalidateDescriptorCache();
         _matmulQ2KGemm.InvalidateDescriptorCache();
         _matmulQ3K.InvalidateDescriptorCache();
@@ -7737,6 +7755,43 @@ public sealed partial class VulkanTransformerModel : IModel
                 ProfNote("q5_0_f32gemm", outputDim, inputDim, seqLen);
             }
         }
+        else if (weightQt == QuantType.Q4_0)
+        {
+            // Native Q4_0 (#1018): 18-byte blocks (fp16 scale + 16 nibble bytes), value d * (nibble - 8); inputDim % 32 == 0 is enforced by
+            // VulkanWeights.KeepQ4_0OnDevice. Decode: dp4a MMVQ against the Q8_1 activation when the scratch exists, else the F32-in GEMV.
+            // Prefill: the 128x128x4 coopmat GEMM, else the tiled F32 GEMM.
+            if (_matmulQ4_0 is null || _matmulQ4_0Gemm is null)
+                throw new InvalidOperationException("Q4_0 weights are device-resident but the Q4_0 kernels were not created.");
+            if (seqLen == 1)
+            {
+                if (_matmulQ4_0Mmvq is not null && _quantizeQ8_1 is not null
+                    && _state.Q8_1Xq is not null && _state.Q8_1Xds is not null
+                    && (inputDim % QuantizeQ8_1Kernel.GroupSize) == 0
+                    && QuantizeQ8_1Kernel.PackedBytes(inputDim) <= _state.Q8_1Xq.Size
+                    && QuantizeQ8_1Kernel.ScaleBytes(inputDim) <= _state.Q8_1Xds.Size)
+                {
+                    _quantizeQ8_1.Record(cmdBuf, input, _state.Q8_1Xq, _state.Q8_1Xds, inputDim);
+                    BarrierComputeToCompute(cmdBuf);
+                    _matmulQ4_0Mmvq.Record(cmdBuf, weights, _state.Q8_1Xq, _state.Q8_1Xds, output, m: outputDim, k: inputDim);
+                    ProfNote("q4_0_mmvq", outputDim, inputDim, seqLen);
+                }
+                else
+                {
+                    _matmulQ4_0.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                    ProfNote("q4_0_f32gemv", outputDim, inputDim, seqLen);
+                }
+            }
+            else if (_matmulQ4_0GemmCoopmat is not null)
+            {
+                _matmulQ4_0GemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q4_0_coopmat", outputDim, inputDim, seqLen);
+            }
+            else
+            {
+                _matmulQ4_0Gemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q4_0_f32gemm", outputDim, inputDim, seqLen);
+            }
+        }
         else if (weightQt == QuantType.Q2_K)
         {
             if (seqLen == 1)
@@ -8604,6 +8659,10 @@ public sealed partial class VulkanTransformerModel : IModel
         _matmulQ2K.Dispose();
         _matmulQ5_0Gemm.Dispose();
         _matmulQ5_0.Dispose();
+        _matmulQ4_0Gemm?.Dispose();
+        _matmulQ4_0?.Dispose();
+        _matmulQ4_0Mmvq?.Dispose();
+        _matmulQ4_0GemmCoopmat?.Dispose();
         _matmulQ8Mmq?.Dispose();
         _matmulQ8MmqResidual?.Dispose();
         _matmulQ4KMmq?.Dispose();
