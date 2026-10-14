@@ -134,6 +134,7 @@ public class QuantFormatTests
             ("q5_0", QuantFormat.Q5_0BlockBytes), ("q5_1", QuantFormat.Q5_1BlockBytes),
             ("q4_0", QuantFormat.Q4_0BlockBytes), ("q4_1", QuantFormat.Q4_1BlockBytes),
             ("iq4_nl", QuantFormat.IQ4_NLBlockBytes), ("mxfp4", QuantFormat.Mxfp4BlockBytes),
+            ("iq2_xxs", QuantFormat.IQ2_XXSBlockBytes), ("iq2_xs", QuantFormat.IQ2_XSBlockBytes), ("iq1_m", QuantFormat.IQ1_MBlockBytes),
         };
 
         var re = new Regex(@"const uint (?<name>[A-Z0-9_]*?)_?BLOCK_BYTES\s*=\s*(?<val>\d+)",
