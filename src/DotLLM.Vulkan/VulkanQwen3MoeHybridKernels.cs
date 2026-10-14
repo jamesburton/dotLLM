@@ -41,6 +41,14 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ4K { get; private set; }
     public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ5K { get; private set; }
     public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ6K { get; private set; }
+    /// <summary>dp4a register-tiled grouped Q4_K MMQ (issue #986); preferred over coopmat when available.</summary>
+    public MoeGroupedMatmulKQuantMmqKernel? MoeGroupedQ4KMmq { get; private set; }
+    /// <summary>dp4a register-tiled grouped Q5_K MMQ (issue #986).</summary>
+    public MoeGroupedMatmulKQuantMmqKernel? MoeGroupedQ5KMmq { get; private set; }
+    /// <summary>Fused SwiGLU + Q8_1 row quantize for the grouped MMQ prefill path (#986); eliminates a barrier + BW pass.</summary>
+    public SwiGluQuantizeRowsKernel? SwiGluQuantizeRows { get; private set; }
+    /// <summary>Q8_1 broadcast+gather for the quantize-once MMQ path (#986); replaces F32 gather + quantize.</summary>
+    public MoeExpandGatherGroupQ8_1Kernel? MoeExpandGatherGroupQ8_1 { get; private set; }
     // Decode-path (small expanded-row count) indexed dp4a MMVQ GEMVs: coalesced subgroup-per-cell, replacing the one-thread-per-cell MMQ/scalar kernels.
     public MoeIndexedMatmulKQuantMmvqKernel? MoeMmvqQ4K { get; private set; }
     /// <summary>Multi-row (NR output rows per workgroup) Q4_K indexed MMVQ for the 2..15-token MoE steps (#876); null = off.</summary>
@@ -584,6 +592,17 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
                 if (q5.RowTile != 16) kernels.MoeGroupedQ5K16 = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q5_K);
             }
         }
+        // #986: dp4a grouped MMQ kernels (preferred over coopmat when available). DOTLLM_VK_MOE_GROUPED_MMQ=0 disables.
+        if (Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_GROUPED_MMQ") != "0")
+        {
+            if (MoeGroupedMatmulKQuantMmqKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q4_K))
+                kernels.MoeGroupedQ4KMmq = MoeGroupedMatmulKQuantMmqKernel.Create(device, spvDir, MoeGroupedKQuant.Q4_K);
+            if (MoeGroupedMatmulKQuantMmqKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q5_K))
+                kernels.MoeGroupedQ5KMmq = MoeGroupedMatmulKQuantMmqKernel.Create(device, spvDir, MoeGroupedKQuant.Q5_K);
+            kernels.SwiGluQuantizeRows = SwiGluQuantizeRowsKernel.TryCreate(device, spvDir);
+            if (MoeExpandGatherGroupQ8_1Kernel.IsSupportedOn(spvDir))
+                kernels.MoeExpandGatherGroupQ8_1 = MoeExpandGatherGroupQ8_1Kernel.Create(device, spvDir);
+        }
         if (File.Exists(Path.Combine(spvDir, "moe_indexed_matmul_q5_1_f32.spv")))
             kernels.MoeIndexedMatmulQ5_1 = MoeIndexedMatmulQ5_1F32Kernel.Create(device, spvDir);
         if (File.Exists(Path.Combine(spvDir, "moe_indexed_matmul_q8_0_f32.spv")))
@@ -714,6 +733,10 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeGroupedQ4K?.InvalidateDescriptorCache();
         MoeGroupedQ5K?.InvalidateDescriptorCache();
         MoeGroupedQ6K?.InvalidateDescriptorCache();
+        MoeGroupedQ4KMmq?.InvalidateDescriptorCache();
+        MoeGroupedQ5KMmq?.InvalidateDescriptorCache();
+        SwiGluQuantizeRows?.InvalidateDescriptorCache();
+        MoeExpandGatherGroupQ8_1?.InvalidateDescriptorCache();
         MoeMmvqQ4K?.InvalidateDescriptorCache();
         MoeMmvqQ4KMr?.InvalidateDescriptorCache();
         MoeMmvqQ5_1Mr?.InvalidateDescriptorCache();
@@ -753,6 +776,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeIndexedMatmulQ5_1?.Dispose(); MoeIndexedMatmulQ8_0?.Dispose(); MoeMmvqQ5_1?.Dispose(); MoeMmvqQ8_0?.Dispose(); MoeMmvqQ4KMr?.Dispose(); MoeMmvqQ5_1Mr?.Dispose();
         MoeGroupedQ5_1?.Dispose(); MoeGroupedQ8_0?.Dispose(); MoeGroupedQ4K16?.Dispose(); MoeGroupedQ5K16?.Dispose();
         QGateDeinterleave?.Dispose(); GdnQkvSplit?.Dispose(); SwiGluQuantizeFused?.Dispose(); RmsNormQuantizeFused?.Dispose(); MatMulQ8Mmvq?.Dispose(); MatMulQ8MmvqWideRows?.Dispose(); MatMulQ8MmvqWideKSplit?.Dispose(); MoeMmvqQ6K?.Dispose(); MoeMmvqQ5K?.Dispose(); MoeMmvqQ4K?.Dispose();
+        MoeGroupedQ4KMmq?.Dispose(); MoeGroupedQ5KMmq?.Dispose(); SwiGluQuantizeRows?.Dispose(); MoeExpandGatherGroupQ8_1?.Dispose();
         MoeGroupedQ6K?.Dispose(); MoeGroupedQ5K?.Dispose(); MoeGroupedQ4K?.Dispose(); MoeUngroupScatter?.Dispose();
         MoeExpandGroupByExpert?.Dispose(); MoeExpertOffsets?.Dispose(); MoeBuildTileList?.Dispose(); MoeExpandGatherGroup?.Dispose(); MoeWeightedScatterGrouped?.Dispose(); MoeScatterGatedAddDecode?.Dispose();
         MoeSigmoidGatedAdd.Dispose();
