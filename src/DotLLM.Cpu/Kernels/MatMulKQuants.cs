@@ -103,6 +103,12 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     internal static void QuantizeF32ToQ8_KAvx2(float* src, byte* dest, int elementCount)
     {
+        if (!Avx2.IsSupported)
+        {
+            QuantizeF32ToQ8_KScalar(src, dest, elementCount);
+            return;
+        }
+
         int blockCount = elementCount / Q8_K_GroupSize;
 
         for (int block = 0; block < blockCount; block++)
@@ -354,6 +360,9 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     internal static float VecDotQ4_K_Q8_KAvx2(byte* qk, byte* q8k, int superBlockCount)
     {
+        if (!Avx2.IsSupported)
+            return VecDotQ4_K_Q8_KScalar(qk, q8k, superBlockCount);
+
         Vector256<float> acc = Vector256<float>.Zero;
         Vector256<byte> mask0F = Vector256.Create((byte)0x0F);
         float sumMin = 0;
@@ -417,6 +426,9 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     internal static float VecDotQ6_K_Q8_KAvx2(byte* qk, byte* q8k, int superBlockCount)
     {
+        if (!Avx2.IsSupported)
+            return VecDotQ6_K_Q8_KScalar(qk, q8k, superBlockCount);
+
         Vector256<float> acc = Vector256<float>.Zero;
         Vector256<byte> mask0F = Vector256.Create((byte)0x0F);
         Vector256<byte> mask03 = Vector256.Create((byte)0x03);
@@ -502,6 +514,9 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     internal static float VecDotQ5_K_Q8_KAvx2(byte* qk, byte* q8k, int superBlockCount)
     {
+        if (!Avx2.IsSupported)
+            return VecDotQ5_K_Q8_KScalar(qk, q8k, superBlockCount);
+
         Vector256<float> acc = Vector256<float>.Zero;
         Vector256<byte> mask0F = Vector256.Create((byte)0x0F);
         float sumMin = 0;

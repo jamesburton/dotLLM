@@ -121,6 +121,12 @@ public static unsafe partial class Dequantize
     [SkipLocalsInit]
     internal static void DequantizeQ6_KAvx2(nint src, long elementCount, Span<float> dest)
     {
+        if (!Avx2.IsSupported)
+        {
+            DequantizeQ6_KScalar(src, elementCount, dest);
+            return;
+        }
+
         long blockCount = elementCount / KQuantGroupSize;
         byte* blockBase = (byte*)src;
 
@@ -273,6 +279,12 @@ public static unsafe partial class Dequantize
     [SkipLocalsInit]
     internal static void DequantizeQ4_KAvx2(nint src, long elementCount, Span<float> dest)
     {
+        if (!Avx2.IsSupported)
+        {
+            DequantizeQ4_KScalar(src, elementCount, dest);
+            return;
+        }
+
         long blockCount = elementCount / KQuantGroupSize;
         byte* blockBase = (byte*)src;
 
@@ -406,6 +418,12 @@ public static unsafe partial class Dequantize
     [SkipLocalsInit]
     internal static void DequantizeQ5_KAvx2(nint src, long elementCount, Span<float> dest)
     {
+        if (!Avx2.IsSupported)
+        {
+            DequantizeQ5_KScalar(src, elementCount, dest);
+            return;
+        }
+
         long blockCount = elementCount / KQuantGroupSize;
         byte* blockBase = (byte*)src;
 
