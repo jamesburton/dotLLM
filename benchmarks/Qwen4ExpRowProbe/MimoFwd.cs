@@ -133,14 +133,14 @@ internal static class MimoFwd
     /// </summary>
     private static void SmallRow(VulkanTransformerModel model, Func<int, int, bool, double> fwd, int reps, int ctx)
     {
-        var cfgs = new (string name, int q6, int f32, int q8, int attn)[]
+        var cfgs = new (string name, int q6, int f32, int q8, int attn, int r2)[]
         {
-            ("old", 0, 0, 0, 0), ("+q6k", 4, 0, 0, 0), ("+f32", 4, 4, 0, 0), ("+q8", 4, 4, 4, 0), ("+attn", 4, 4, 4, 4),
-            ("attn-only", 0, 0, 0, 4), ("f32-only", 0, 4, 0, 0),
+            ("old", 0, 0, 0, 0, 99), ("+q6k", 4, 0, 0, 0, 99), ("+f32", 4, 4, 0, 0, 99), ("+q8", 4, 4, 4, 0, 99), ("+attn", 4, 4, 4, 4, 99), ("+q6k-r2", 4, 4, 4, 4, 3),
+            ("attn-only", 0, 0, 0, 4, 99), ("f32-only", 0, 4, 0, 0, 99), ("f32<=3", 4, 3, 4, 4, 3),
         };
-        void Apply((string name, int q6, int f32, int q8, int attn) c)
-        { model.SmallRowQ6KMaxRows = c.q6; model.SmallRowF32MaxRows = c.f32; model.SmallRowQ8MaxRows = c.q8; model.SmallRowAttnMaxRows = c.attn; }
-        var arms = new List<(string name, int rows, int ci)> { ("r1", 1, 4) };
+        void Apply((string name, int q6, int f32, int q8, int attn, int r2) c)
+        { model.SmallRowQ6KMaxRows = c.q6; model.SmallRowF32MaxRows = c.f32; model.SmallRowQ8MaxRows = c.q8; model.SmallRowAttnMaxRows = c.attn; model.SmallRowQ6KR2MinRows = c.r2; }
+        var arms = new List<(string name, int rows, int ci)> { ("r1", 1, 5) };
         for (int ci = 0; ci < cfgs.Length; ci++) for (int rows = 2; rows <= 4; rows++) arms.Add(($"r{rows} {cfgs[ci].name}", rows, ci));
         var times = arms.ToDictionary(a => a.name, _ => new List<double>());
         var counts = new Dictionary<string, (long q6, long f32, long q8, long attn)>();
@@ -154,7 +154,7 @@ internal static class MimoFwd
                 times[a.name].Add(fwd(a.rows, rep * 13 + j, false));
                 if (rep == 0) counts[a.name] = (model.SmallRowQ6KCount - q60, model.SmallRowF32Count - f0, model.SmallRowQ8Count - q80, model.SmallRowAttnCount - a0);
             }
-        Apply(cfgs[4]);
+        Apply(cfgs[5]);
         double med1 = Median(times["r1"]), min1 = times["r1"].Min();
         Console.WriteLine($"[sr] ctx={ctx} reps={reps}; 1-row {min1:F1} / {med1:F1} / {times["r1"].Max():F1} ms (min/median/max) = {1000 / med1:F1} tok/s median");
         foreach (var a in arms.Skip(1))
