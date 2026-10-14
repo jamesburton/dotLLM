@@ -6,7 +6,7 @@ using Xunit;
 namespace DotLLM.Tests.Unit.Models.Lfm2Moe;
 
 /// <summary>
-/// #1015: config / layout extraction for <c>lfm2moe</c> from the real LFM2.5-24B-A2B GGUF header (returns without asserting when no such file
+/// #1015: config / layout extraction for <c>lfm2moe</c> from the real LFM2.5-24B-A2B GGUF header (skipped when no such file
 /// is available; resolve via <c>DOTLLM_LFM2_GGUF</c> or the HF hub cache).
 /// </summary>
 public sealed class Lfm2MoeConfigTests
@@ -20,11 +20,11 @@ public sealed class Lfm2MoeConfigTests
         return Directory.Exists(hub) ? Directory.EnumerateFiles(hub, "*.gguf", SearchOption.AllDirectories).FirstOrDefault() : null;
     }
 
-    [Fact]
+    [SkippableFact]
     public void RealHeader_ExtractsHybridLayoutAndSigmoidBiasMoe()
     {
         string? path = FindGguf();
-        if (path is null) return;
+        Skip.If(path is null, "LFM2.5 GGUF not found: set DOTLLM_LFM2_GGUF or fetch LiquidAI/LFM2.5-24B-A2B-GGUF into the HF hub cache.");
         using var gguf = GgufFile.Open(path);
         var cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
 

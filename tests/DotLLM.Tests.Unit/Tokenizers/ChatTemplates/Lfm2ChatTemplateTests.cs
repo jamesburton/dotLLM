@@ -36,22 +36,24 @@ public sealed class Lfm2ChatTemplateTests
 
     private sealed record JinjaChatTemplateHolder(IChatTemplate Template);
 
-    [Fact]
+    [SkippableFact]
     public void SimpleChat_EndsWithOpenThinkTag()
     {
         var h = Load();
-        if (h is null) return;
+        Skip.If(h is null, "LFM2.5 GGUF not found: set DOTLLM_LFM2_GGUF or fetch LiquidAI/LFM2.5-24B-A2B-GGUF into the HF hub cache.");
+        Assert.NotNull(h);
         string s = h.Template.Apply(new[] { new ChatMessage { Role = "user", Content = "What is C. elegans?" } },
             new ChatTemplateOptions { AddGenerationPrompt = true });
         _out.WriteLine(s);
         Assert.Equal("<|startoftext|><|im_start|>user\nWhat is C. elegans?<|im_end|>\n<|im_start|>assistant\n<think>", s);
     }
 
-    [Fact]
+    [SkippableFact]
     public void ToolConversation_RendersToolListAndPythonicCall()
     {
         var h = Load();
-        if (h is null) return;
+        Skip.If(h is null, "LFM2.5 GGUF not found: set DOTLLM_LFM2_GGUF or fetch LiquidAI/LFM2.5-24B-A2B-GGUF into the HF hub cache.");
+        Assert.NotNull(h);
         var tools = new[]
         {
             new ToolDefinition("get_candidate_status", "Retrieves the current status of a candidate",
