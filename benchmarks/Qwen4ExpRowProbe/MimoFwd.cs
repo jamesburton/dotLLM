@@ -21,8 +21,8 @@ internal static class MimoFwd
     {
         string path = args[1];
         string mode = args[2];
-        int reps = mode == "time" && args.Length > 3 ? int.Parse(args[3]) : 7;
-        int ctx = args.Length > (mode == "time" ? 4 : 3) ? int.Parse(args[mode == "time" ? 4 : 3]) : 512;
+        int reps = (mode == "time" || mode == "sr") && args.Length > 3 ? int.Parse(args[3]) : 7;
+        int ctx = args.Length > (mode is "time" or "sr" ? 4 : 3) ? int.Parse(args[mode is "time" or "sr" ? 4 : 3]) : 512;
         using var gguf = GgufFile.Open(path);
         var cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var tk = GgufBpeTokenizerFactory.Load(gguf.Metadata);
@@ -59,6 +59,8 @@ internal static class MimoFwd
             if (checkShape && lg.Shape[0] != rows) throw new Exception($"logits rows {lg.Shape[0]} != {rows}");
             return ms;
         }
+
+        if (mode == "sr") { SmallRow(model, Fwd, reps, ctx); return; }
 
         if (mode == "attrib")
         {
@@ -122,6 +124,45 @@ internal static class MimoFwd
         catch (Exception e) { Console.WriteLine($"[mimofwd] canary stopped: {e.GetType().Name}: {e.Message[..Math.Min(100, e.Message.Length)]}"); }
         Console.WriteLine($"[mimofwd] headroom canary: {ok} extra GiB allocated+touched beside the resident trunk (cap 20); model still usable: {Fwd(1, 5000) > 0}");
         foreach (var b in bufs) b.Dispose();
+    }
+
+    /// <summary>
+    /// <c>mimofwd gguf sr [reps] [ctx]</c>: cost(N)/cost(1) of the 2..4 row forward under cumulative small-row lever configs, switched at runtime in ONE
+    /// process (#996). Config = (Q6_K multi, F32 multi, Q8_0 multi, split-KV rows attention). Every rep runs every (config, rows) arm once, rotated.
+    /// Also prints dispatch counters so the path is proven, not assumed.
+    /// </summary>
+    private static void SmallRow(VulkanTransformerModel model, Func<int, int, bool, double> fwd, int reps, int ctx)
+    {
+        var cfgs = new (string name, int q6, int f32, int q8, int attn)[]
+        {
+            ("old", 0, 0, 0, 0), ("+q6k", 4, 0, 0, 0), ("+f32", 4, 4, 0, 0), ("+q8", 4, 4, 4, 0), ("+attn", 4, 4, 4, 4),
+            ("attn-only", 0, 0, 0, 4), ("f32-only", 0, 4, 0, 0),
+        };
+        void Apply((string name, int q6, int f32, int q8, int attn) c)
+        { model.SmallRowQ6KMaxRows = c.q6; model.SmallRowF32MaxRows = c.f32; model.SmallRowQ8MaxRows = c.q8; model.SmallRowAttnMaxRows = c.attn; }
+        var arms = new List<(string name, int rows, int ci)> { ("r1", 1, 4) };
+        for (int ci = 0; ci < cfgs.Length; ci++) for (int rows = 2; rows <= 4; rows++) arms.Add(($"r{rows} {cfgs[ci].name}", rows, ci));
+        var times = arms.ToDictionary(a => a.name, _ => new List<double>());
+        var counts = new Dictionary<string, (long q6, long f32, long q8, long attn)>();
+        foreach (var a in arms) { Apply(cfgs[a.ci]); fwd(a.rows, 900, true); fwd(a.rows, 901, false); }
+        for (int rep = 0; rep < reps; rep++)
+            for (int j = 0; j < arms.Count; j++)
+            {
+                var a = arms[(j + rep * 5) % arms.Count];
+                Apply(cfgs[a.ci]);
+                long q60 = model.SmallRowQ6KCount, f0 = model.SmallRowF32Count, q80 = model.SmallRowQ8Count, a0 = model.SmallRowAttnCount;
+                times[a.name].Add(fwd(a.rows, rep * 13 + j, false));
+                if (rep == 0) counts[a.name] = (model.SmallRowQ6KCount - q60, model.SmallRowF32Count - f0, model.SmallRowQ8Count - q80, model.SmallRowAttnCount - a0);
+            }
+        Apply(cfgs[4]);
+        double med1 = Median(times["r1"]), min1 = times["r1"].Min();
+        Console.WriteLine($"[sr] ctx={ctx} reps={reps}; 1-row {min1:F1} / {med1:F1} / {times["r1"].Max():F1} ms (min/median/max) = {1000 / med1:F1} tok/s median");
+        foreach (var a in arms.Skip(1))
+        {
+            var t = times[a.name]; var c = counts[a.name];
+            var ratios = t.Select((x, i) => x / times["r1"][i]).OrderBy(x => x).ToList();
+            Console.WriteLine($"  {a.name,-16} {t.Min():F1} / {Median(t):F1} / {t.Max():F1} ms   ratio min {t.Min() / min1:F2} median {Median(t) / med1:F2}  paired {ratios[0]:F2}..{ratios[^1]:F2} (med {ratios[ratios.Count / 2]:F2})   dispatches/fwd q6k {c.q6} f32 {c.f32} q8 {c.q8} attn {c.attn}");
+        }
     }
 
     private static double Median(List<double> l) { var s = l.OrderBy(x => x).ToList(); return s[s.Count / 2]; }
