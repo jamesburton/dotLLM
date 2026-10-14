@@ -554,7 +554,19 @@ public static unsafe partial class MoeSwiGluMlp
                     UseGeGLU = useGeGLU,
                 };
 
-                if (threadPool is null || uniqueExpertCount < 2)
+                if (seqLen == 1 && threadPool is not null && loraAdapter is null
+                    && gateExpsF32Ptrs.IsEmpty && upExpsF32Ptrs.IsEmpty && downExpsF32Ptrs.IsEmpty
+                    && TryExecuteRoutedDecodeN1(
+                        hiddenPtr, scatterDownPtr,
+                        gateExpsRawBase, gateExpsQt, gateExpsRowBytes,
+                        upExpsRawBase, upExpsQt, upExpsRowBytes,
+                        downExpsRawBase, downExpsQt, downExpsRowBytes,
+                        bucketCursors, bucketSlots, uniqueExperts, uniqueExpertCount,
+                        numExpertsPerTok, hiddenSize, intermediateSize, useGeGLU, threadPool))
+                {
+                    // Decode fast path ran: two pool dispatches for the whole layer (see TryExecuteRoutedDecodeN1).
+                }
+                else if (threadPool is null || uniqueExpertCount < 2)
                 {
                     // Serial path — bit-identity with the historical ascending-id loop.
                     for (int u = 0; u < uniqueExpertCount; u++)
@@ -761,6 +773,7 @@ public static unsafe partial class MoeSwiGluMlp
         int intermediateSize = ctx.IntermediateSize;
         int numExpertsPerTok = ctx.NumExpertsPerTok;
 
+        long _p0 = CpuStageProf.T();
         // Rent per-call buffers from ArrayPool — worker-local, returned in finally.
         float[] batchInBuf = ArrayPool<float>.Shared.Rent(batch * hiddenSize);
         float[] gateBatchBuf = ArrayPool<float>.Shared.Rent(batch * intermediateSize);
@@ -830,6 +843,7 @@ public static unsafe partial class MoeSwiGluMlp
                     preQuantGateUp = prequantPtr;
                 }
 
+                CpuStageProf.E(9, _p0); _p0 = CpuStageProf.T();
                 // ── gate = batchIn × W1 (gate_proj) ───────────────────────────
                 DispatchGemm(
                     ctx.GateExpsQt, gatePtr, batchInPtr, gateBatchPtr,
@@ -847,6 +861,7 @@ public static unsafe partial class MoeSwiGluMlp
                 ApplyLoraDelta(loraAdapter, loraLayer, ExpertProjectionName(e, "up_proj"),
                     batchInPtr, upBatchPtr, batch, hiddenSize, intermediateSize);
 
+                CpuStageProf.E(10, _p0); _p0 = CpuStageProf.T();
                 // ── Per-row gate fuse (GeGLU for Gemma 4, SwiGLU otherwise) ──
                 var gateBatchSpan = new Span<float>(gateBatchPtr, batch * intermediateSize);
                 var upBatchSpan = new Span<float>(upBatchPtr, batch * intermediateSize);
@@ -863,6 +878,7 @@ public static unsafe partial class MoeSwiGluMlp
                         FusedOps.SwiGLU(gSlice, uSlice, oSlice);
                 }
 
+                CpuStageProf.E(11, _p0); _p0 = CpuStageProf.T();
                 // ── down = silu × W2 (down_proj) ─────────────────────────────
                 // K=intermediateSize differs from gate/up (K=hiddenSize) so the pre-quantized
                 // input is not reusable here — let the kernel quantize internally. This is one
@@ -875,6 +891,7 @@ public static unsafe partial class MoeSwiGluMlp
                 ApplyLoraDelta(loraAdapter, loraLayer, ExpertProjectionName(e, "down_proj"),
                     siluBatchPtr, downBatchPtr, batch, intermediateSize, hiddenSize);
 
+                CpuStageProf.E(12, _p0); _p0 = CpuStageProf.T();
                 // ── Scatter down rows to scatterDown[(t*k+slot)*H] ───────────
                 for (int b = 0; b < batch; b++)
                 {
@@ -886,6 +903,7 @@ public static unsafe partial class MoeSwiGluMlp
                         hiddenSize * sizeof(float),
                         hiddenSize * sizeof(float));
                 }
+                CpuStageProf.E(13, _p0);
             }
         }
         finally

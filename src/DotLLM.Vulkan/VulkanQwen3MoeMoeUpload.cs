@@ -208,7 +208,8 @@ internal static class VulkanQwen3MoeMoeUpload
             Gate.Dispose();
             W1Bank.Dispose(); W2Bank.Dispose(); W3Bank.Dispose();
             SharedGate?.Dispose(); SharedUp?.Dispose(); SharedDown?.Dispose();
-            SharedGateQ8?.Dispose(); SharedUpQ8?.Dispose();
+            if (!ReferenceEquals(SharedGateQ8, SharedGate)) SharedGateQ8?.Dispose();
+            if (!ReferenceEquals(SharedUpQ8, SharedUp)) SharedUpQ8?.Dispose();
             SharedExpertGate?.Dispose();
         }
     }
@@ -266,9 +267,10 @@ internal static class VulkanQwen3MoeMoeUpload
     /// <param name="sharedStaging">Optional caller-owned (typically multi-threaded) staging buffer reused across layers; null = a per-layer one (#874).</param>
     /// <param name="prealloc">Optional pool of bank buffers allocated ahead on background threads; null = allocate inline (#874).</param>
     /// <param name="expertSlots">Expert tiering (#939): when &gt; 0 the three routed banks are allocated for this many experts and left EMPTY (filled on demand by the tier); 0 = full resident banks.</param>
+    /// <param name="sharedPackedDefault">Default for the packed Q8_0 shared-expert upload (#987) when <c>DOTLLM_VK_MOE_SHARED_PACKED</c> is unset: true for the Qwen3.6 hybrid loader, false for qwen4exp (prefill -4..5%).</param>
     public static unsafe LayerBundle UploadLayer(
         VulkanDevice device, MoeLayerWeights moe, int hiddenSize,
-        bool residentQuant = false, VulkanStagingBuffer? sharedStaging = null, VulkanBankPrealloc? prealloc = null, int expertSlots = 0)
+        bool residentQuant = false, VulkanStagingBuffer? sharedStaging = null, VulkanBankPrealloc? prealloc = null, int expertSlots = 0, bool sharedPackedDefault = true)
     {
         int numE = moe.NumExperts;
         int interm = moe.IntermediateSize;
@@ -334,7 +336,26 @@ internal static class VulkanQwen3MoeMoeUpload
         int numShared = moe.NumSharedExperts;
         int sharedI = moe.SharedIntermediateSize;
         bool hasShared = moe.HasSharedExpert;
-        if (hasShared && numShared > 0)
+        VulkanDevice.Buffer? sharedGateQ8 = null, sharedUpQ8 = null;
+        bool packedShared = hasShared && numShared == 1 && moe.SharedGateRaw.Length == 1 && moe.SharedUpRaw.Length == 1 && moe.SharedDownRaw.Length == 1
+            && moe.SharedGateRaw[0] != 0 && moe.SharedUpRaw[0] != 0 && moe.SharedDownRaw[0] != 0
+            && SharedPackedPlan(moe.SharedGateRawQt, moe.SharedUpRawQt, moe.SharedDownRawQt, hiddenSize, sharedI, sharedPackedDefault);
+        if (packedShared)
+        {
+            // #987: one packed Q8_0 buffer per projection serves decode (MMVQ) AND prefill (Q8_0 coopmat GEMM / small-row GEMV); the F16 copies are not built.
+            sharedGate = VulkanQwen3MoeHybridWeights.UploadProjectionMatrix(device, staging, moe.SharedGateRaw[0], QuantizationType.Q8_0,
+                sharedI, hiddenSize, forceF32: false, out var pgq, out _);
+            sharedUp = VulkanQwen3MoeHybridWeights.UploadProjectionMatrix(device, staging, moe.SharedUpRaw[0], QuantizationType.Q8_0,
+                sharedI, hiddenSize, forceF32: false, out var puq, out _);
+            sharedDown = VulkanQwen3MoeHybridWeights.UploadProjectionMatrix(device, staging, moe.SharedDownRaw[0], QuantizationType.Q8_0,
+                hiddenSize, sharedI, forceF32: false, out var pdq, out _);
+            if (pgq != QuantizationType.Q8_0 || puq != QuantizationType.Q8_0 || pdq != QuantizationType.Q8_0)
+                throw new InvalidOperationException("Shared-expert Q8_0 upload widened unexpectedly.");
+            sharedQt = QuantizationType.Q8_0;
+            sharedGateQ8 = sharedGate; sharedUpQ8 = sharedUp;   // aliases: LayerBundle.Dispose releases each buffer once
+            Interlocked.Increment(ref PackedSharedLayerCount);
+        }
+        else if (hasShared && numShared > 0)
         {
             // qwen35moe convention is one shared expert per layer — upload its
             // gate/up/down directly. Larger numShared (DeepSeek family) would
@@ -359,8 +380,7 @@ internal static class VulkanQwen3MoeMoeUpload
         if (moe.SharedExpertGate is not null)
             sharedExpertGate = UploadFloatArray(device, staging, moe.SharedExpertGate);
 
-        VulkanDevice.Buffer? sharedGateQ8 = null, sharedUpQ8 = null;
-        if (hasShared && numShared == 1 && SharedAsQ8 && (hiddenSize & 31) == 0
+        if (!packedShared && hasShared && numShared == 1 && SharedAsQ8 && (hiddenSize & 31) == 0
             && moe.SharedGateRawQt == QuantizationType.Q8_0 && moe.SharedUpRawQt == QuantizationType.Q8_0
             && moe.SharedGateRaw.Length == 1 && moe.SharedUpRaw.Length == 1)
         {
@@ -564,6 +584,24 @@ internal static class VulkanQwen3MoeMoeUpload
     /// </summary>
     private static readonly bool SharedAsF16 =
         !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_SHARED_F16"), "0", StringComparison.Ordinal);
+
+    /// <summary>
+    /// #987: keep the shared-expert gate/up/down packed Q8_0 on the device (no F16 copies) when all three source tensors are Q8_0.
+    /// <c>DOTLLM_VK_MOE_SHARED_PACKED=0</c> restores the pre-#987 layout (F16 gate/up/down + decode-only Q8_0 gate/up): same-binary control arm. Default ON for the Qwen3.6/3.5 hybrid loader (decode/prefill neutral, -197 MiB); default OFF for qwen4exp (prefill -4..5%, saves 470 MiB device + 3.3 GiB host peak: <c>=1</c> opts in).
+    /// </summary>
+    internal static bool SharedPackedEnabled(bool defaultOn)
+    {
+        string? v = Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_SHARED_PACKED");
+        return v is null || v.Length == 0 ? defaultOn : !string.Equals(v, "0", StringComparison.Ordinal);
+    }
+
+    /// <summary>True when a layer's shared gate/up/down take the packed Q8_0 upload (#987); loaders use it to skip the host F32 dequant.</summary>
+    internal static bool SharedPackedPlan(QuantizationType gate, QuantizationType up, QuantizationType down, int hidden, int sharedI, bool defaultOn = true)
+        => SharedPackedEnabled(defaultOn) && SharedAsQ8 && (hidden & 31) == 0 && (sharedI & 31) == 0
+           && gate == QuantizationType.Q8_0 && up == QuantizationType.Q8_0 && down == QuantizationType.Q8_0;
+
+    /// <summary>Layers uploaded with packed Q8_0 shared experts (#987): the counter that proves the fast path ran.</summary>
+    internal static int PackedSharedLayerCount;
 
     private static readonly bool SharedAsQ8 =
         !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_SHARED_Q8"), "0", StringComparison.Ordinal);

@@ -108,7 +108,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     private readonly VulkanDevice.Buffer? _moeUnitScale;
 
     /// <summary>Which routed-MoE fast paths were RECORDED (test hook: proves a branch was taken, not merely that a kernel exists).</summary>
-    internal enum MoePath { GroupedPrefill, GroupedGateUpNotQ4K, GroupedLegacyDown, MmvqDown, MmvqLegacyDown, FusedDecode, IqMmvqGateUp, IqMmvqDown, GroupedIqGateUp, GroupedIqDown, GroupedMmqPrefill }
+    internal enum MoePath { GroupedPrefill, GroupedGateUpNotQ4K, GroupedLegacyDown, GroupedMmqPrefill, MmvqDown, MmvqLegacyDown, FusedDecode, IqMmvqGateUp, IqMmvqDown, GroupedIqGateUp, GroupedIqDown }
     internal readonly long[] MoePathCounts = new long[Enum.GetValues<MoePath>().Length];
 
     /// <summary>Record-time counters for the 2..8-row fast paths (#876): prove a fast path ran by counting, not by IsSupported.</summary>
@@ -173,6 +173,26 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
 
     /// <summary>Number of full-attention layers — the matching sparse KV-cache slot count.</summary>
     public int AttentionLayerCount => _attentionLayerCount;
+
+    /// <summary>Resident MoE layers whose shared-expert gate/up/down stay packed Q8_0 on the device (#987); 0 with <c>DOTLLM_VK_MOE_SHARED_PACKED=0</c>.</summary>
+    internal int SharedExpertPackedLayerCount => _residentMoeBundles.Count(b => b is { HasSharedExpert: true, SharedQuantType: QuantizationType.Q8_0 });
+
+    /// <summary>Device bytes held by the resident layers' shared-expert gate/up/down buffers (each distinct buffer once).</summary>
+    internal long SharedExpertBufferBytes
+    {
+        get
+        {
+            long total = 0;
+            foreach (var b in _residentMoeBundles)
+            {
+                if (b is null) continue;
+                var seen = new HashSet<VulkanDevice.Buffer>(ReferenceEqualityComparer.Instance as IEqualityComparer<VulkanDevice.Buffer>);
+                foreach (var buf in new[] { b.SharedGate, b.SharedUp, b.SharedDown, b.SharedGateQ8, b.SharedUpQ8 })
+                    if (buf is not null && seen.Add(buf)) total += (long)buf.Size;
+            }
+            return total;
+        }
+    }
 
     /// <summary>Creates a sparse <see cref="VulkanNemotronHKvCache"/> sized for this model.</summary>
     public VulkanNemotronHKvCache CreateKvCache(int maxSeqLen)
@@ -1583,9 +1603,16 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             _state.MoeTopkIndices, _state.MoeGateInter, m: interm, k: hidden, n: topK, numExperts: numE, xDiv: topK);
         _kernels.MoeMmvqQ4K.Record(cmdBuf, moeW.W3Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
             _state.MoeTopkIndices, _state.MoeUpInter, m: interm, k: hidden, n: topK, numExperts: numE, xDiv: topK);
-        RecordMatmul(cmdBuf, moeW.SharedDown!, moeW.SharedQuantType, _state.MoeSharedSilu, _state.MoeSharedSumA,
-            outputDim: hidden, inputDim: sharedI, seqLen: 1);
+        // #987: a packed (Q8_0) shared down quantises MoeSharedSilu into MoeExpandedInputXq, which the routed MMVQs above are still reading;
+        // it runs after this barrier (Phase 4) instead. F16/F32 shared down has no quantise and stays here.
+        bool sharedDownLate = moeW.SharedQuantType is not (QuantizationType.F16 or QuantizationType.F32);
+        if (!sharedDownLate)
+            RecordMatmul(cmdBuf, moeW.SharedDown!, moeW.SharedQuantType, _state.MoeSharedSilu, _state.MoeSharedSumA,
+                outputDim: hidden, inputDim: sharedI, seqLen: 1);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        if (sharedDownLate)
+            RecordMatmul(cmdBuf, moeW.SharedDown!, moeW.SharedQuantType, _state.MoeSharedSilu, _state.MoeSharedSumA,
+                outputDim: hidden, inputDim: sharedI, seqLen: 1);
 
         // Phase 4: SwiGLU fused with the Q8_1 quantize feeding the down projection (topK rows of interm are one contiguous run of 32-blocks).
         _kernels.SwiGluQuantizeFused!.Record(cmdBuf, _state.MoeGateInter, _state.MoeUpInter, _state.MoeSiluInter,
@@ -1771,13 +1798,6 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         }
     }
 
-    private MoeGroupedMatmulKQuantCoopmatKernel? GroupedDownKernel(QuantizationType qt) => qt switch
-    {
-        QuantizationType.Q5_K => _kernels.MoeGroupedQ5K,
-        QuantizationType.Q6_K => _kernels.MoeGroupedQ6K,
-        _ => null,
-    };
-
     private MoeGroupedMatmulKQuantMmqKernel? GroupedGateUpMmqKernel(QuantizationType qt) => qt switch
     {
         QuantizationType.Q4_K => _kernels.MoeGroupedQ4KMmq,
@@ -1789,6 +1809,13 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     {
         QuantizationType.Q4_K => _kernels.MoeGroupedQ4KMmq,
         QuantizationType.Q5_K => _kernels.MoeGroupedQ5KMmq,
+        _ => null,
+    };
+
+    private MoeGroupedMatmulKQuantCoopmatKernel? GroupedDownKernel(QuantizationType qt) => qt switch
+    {
+        QuantizationType.Q5_K => _kernels.MoeGroupedQ5K,
+        QuantizationType.Q6_K => _kernels.MoeGroupedQ6K,
         _ => null,
     };
 
@@ -1912,6 +1939,11 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             MoeStage("expand_group");
         }
 
+        // Launch only the (expert, 16-row tile) pairs that exist. The legacy grid (every expert x every possible row tile; a token routes
+        // to an expert at most once, so no expert owns more than seqLen rows) launched ~30x more workgroups than there was work and the
+        // early-out workgroups alone cost ~100 ms of a 512-token prefill. DOTLLM_VK_MOE_INDIRECT_TILES=0 restores it.
+        // A legacy-quant down kernel only exists for 16-row tiles, so when gate/up would be the 32-row row-pair form the layer's gate/up
+        // drops to the 16-row Q4_K kernel to share one tile list (the tile list is rebuilt per layer).
         CountMoePath(MoePath.GroupedPrefill);
         if (legacyDown is not null) CountMoePath(MoePath.GroupedLegacyDown);
         if (iqGateUp is not null) CountMoePath(MoePath.GroupedIqGateUp);
@@ -1989,8 +2021,6 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         }
         else
         {
-        // A legacy-quant down kernel only exists for 16-row tiles, so when gate/up would be the 32-row row-pair form the layer's gate/up
-        // drops to the 16-row Q4_K kernel to share one tile list (the tile list is rebuilt per layer).
         var gateUpKernel = iqGateUp is null ? GroupedGateUpKernel(moeW.W1QuantType, sixteenRow: legacyDown is not null || iqDown is not null)! : null;
         var downKernel = GroupedDownKernel(moeW.W2QuantType);
         int downMTiles = downKernel?.MTiles(hidden) ?? legacyDown?.MTiles(hidden) ?? iqDown!.MTiles(hidden);
@@ -2073,7 +2103,6 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         else
             downKernel!.Record(cmdBuf, moeW.W2Bank, _state.MoeSiluInter, _state.MoeGroupOffsets, _state.MoeExpandedInput,
                 m: hidden, k: interm, rows: expandedRows, numExperts: numE, maxRowsPerExpert: seqLen);
-        } // end else (!useMmq)
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("grouped_down");
         if (!fusedGlue)
@@ -2081,6 +2110,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             _kernels.MoeUngroupScatter!.Record(cmdBuf, _state.MoeExpandedInput, _state.MoeGroupPerm, _state.MoeDownRows, rows: expandedRows, hidden: hidden);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
             MoeStage("ungroup");
+        }
         }
     }
 
@@ -2426,9 +2456,14 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             gateUp.Record(cmdBuf, moeW.W3Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
                 _state.MoeTopkIndices, _state.MoeUpInter, m: interm, k: hidden, n: topK, numExperts: numE, xDiv: topK);
         }
-        RecordMatmul(cmdBuf, moeW.SharedDown!, moeW.SharedQuantType, _state.MoeSharedSilu, _state.MoeSharedSumA, outputDim: hidden, inputDim: sharedI, seqLen: 1);
+        // #987: see the Q4E-fused decode path - a packed shared down must not quantise into MoeExpandedInputXq while the routed MMVQs read it.
+        bool sharedDownLate = moeW.SharedQuantType is not (QuantizationType.F16 or QuantizationType.F32);
+        if (!sharedDownLate)
+            RecordMatmul(cmdBuf, moeW.SharedDown!, moeW.SharedQuantType, _state.MoeSharedSilu, _state.MoeSharedSumA, outputDim: hidden, inputDim: sharedI, seqLen: 1);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("gate_up");
+        if (sharedDownLate)
+            RecordMatmul(cmdBuf, moeW.SharedDown!, moeW.SharedQuantType, _state.MoeSharedSilu, _state.MoeSharedSumA, outputDim: hidden, inputDim: sharedI, seqLen: 1);
 
         // Phase 4: routed SwiGLU fused with the Q8_1 quantize feeding the down projection.
         _kernels.SwiGluQuantizeFused!.Record(cmdBuf, _state.MoeGateInter, _state.MoeUpInter, _state.MoeSiluInter,
@@ -2547,6 +2582,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         RecordMatmul(cmdBuf, moeW.SharedGate!, moeW.SharedQuantType,
             _state.MoeSharedInput, _state.MoeSharedGate,
             outputDim: sharedI, inputDim: hidden, seqLen: seqLen);
+        // #987: packed gate/up both quantise the same input into the shared Q8_1 scratch on the small-row path (#952 race).
+        if (moeW.SharedQuantType is not (QuantizationType.F16 or QuantizationType.F32)) KernelSupport.ComputeToComputeBarrier(cmdBuf);
         RecordMatmul(cmdBuf, moeW.SharedUp!, moeW.SharedQuantType,
             _state.MoeSharedInput, _state.MoeSharedUp,
             outputDim: sharedI, inputDim: hidden, seqLen: seqLen);

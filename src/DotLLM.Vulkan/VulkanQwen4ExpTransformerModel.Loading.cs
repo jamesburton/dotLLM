@@ -237,7 +237,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
                 {
                     long tl = System.Diagnostics.Stopwatch.GetTimestamp();
                     double cw0 = VulkanStagingBuffer.CopyWaitMilliseconds, aw0 = VulkanBankPrealloc.WaitMilliseconds, am0 = VulkanDevice.AllocateMemoryMilliseconds;
-                    moeBundles.Add(VulkanQwen3MoeMoeUpload.UploadLayer(device, layers[il].Moe, config.HiddenSize, residentQuant: true, upStaging, prealloc, expertSlots: slots));
+                    moeBundles.Add(VulkanQwen3MoeMoeUpload.UploadLayer(device, layers[il].Moe, config.HiddenSize, residentQuant: true, upStaging, prealloc, expertSlots: slots, sharedPackedDefault: false));
                     ScheduleLayer(il + AllocAhead);
                     if (layerTrace)
                         Console.Error.WriteLine($"[vulkan-load] layer {il}: {System.Diagnostics.Stopwatch.GetElapsedTime(tl).TotalMilliseconds:F0} ms " +
@@ -481,8 +481,12 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
         int hidden = config.HiddenSize, ne = moe.NumExperts, inter = moe.MoeIntermediateSize;
         int shared = moe.SharedExpertIntermediateSize ?? inter;
 
+        // #987: when the shared gate/up/down upload packed Q8_0 the host F32 dequant (3.3 GiB on the real file) is never read - skip it.
+        bool sharedPacked = VulkanQwen3MoeMoeUpload.SharedPackedPlan(t[p + "ffn_gate_shexp.weight"].QuantizationType,
+            t[p + "ffn_up_shexp.weight"].QuantizationType, t[p + "ffn_down_shexp.weight"].QuantizationType, hidden, shared, defaultOn: false);
         nint SharedF32(string name, long count)
         {
+            if (sharedPacked) return 0;
             var d = t[name];
             nint dst = (nint)NativeMemory.AlignedAlloc((nuint)(count * sizeof(float)), 64);
             owned.Add(dst);

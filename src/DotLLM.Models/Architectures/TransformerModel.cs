@@ -872,6 +872,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             Span<int> bucketSlots = bucketSlotsBuf.AsSpan(0, total);
             Span<int> unique = uniqueBuf.AsSpan(0, numExperts);
 
+            long _tr = DotLLM.Cpu.CpuStageProf.T();
             int uniqueCount = MoeSwiGluMlp.Route(
                 hidden: new ReadOnlySpan<float>(normOut, seqLen * hiddenSize),
                 gateWeights: moe.Gate,
@@ -884,6 +885,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 sigmoidGating: moe.SigmoidGating,
                 selectionBias: moe.SelectionBias is null ? default : moe.SelectionBias.AsSpan(),
                 weightsScale: moe.WeightsScale);
+            DotLLM.Cpu.CpuStageProf.E(4, _tr);
 
             bool raw = moe.HasRawQuantView;
             QuantizationType gateQt = raw ? moe.GateExpsRawQt : QuantizationType.F32;
@@ -1188,6 +1190,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
 
             // a. Copy hiddenState → residual
             new Span<float>(hidden, seqLen * hiddenSize).CopyTo(new Span<float>(residual, seqLen * hiddenSize));
+            long _pt = DotLLM.Cpu.CpuStageProf.T();
 
             // ── Gemma 4 MoE branch ───────────────────────────────────────
             // The gemma4 graph is sufficiently distinct (V-from-K, weight-less
@@ -1522,6 +1525,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             if (lw.KNormWeight is not null)
                 ApplyPerHeadNorm(lw.KNormWeight, k, numKvHeadsLayer, headDimLayer, seqLen, eps);
 
+            DotLLM.Cpu.CpuStageProf.E(0, _pt); _pt = DotLLM.Cpu.CpuStageProf.T();
             // d. RoPE (in-place on Q and K for all tokens). SmolLM3 marks
             // selected layers as NoPE (skip RoPE entirely) via
             // ModelConfig.NoRopeLayers — the attention math runs unmodified on
@@ -1621,6 +1625,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 }
             }
 
+            DotLLM.Cpu.CpuStageProf.E(1, _pt); _pt = DotLLM.Cpu.CpuStageProf.T();
             // f. Batched O projection. The O projection input width is the
             // attention output stride (numHeads * vHeadDimLayer == lw.OInputDim).
             byte* preQuantAttn = QuantizeInput(attnOut, inputQ8Scratch, oInStride, seqLen, lw.OQuantType);
@@ -1664,6 +1669,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             new Span<float>(hidden, seqLen * hiddenSize).CopyTo(new Span<float>(residual, seqLen * hiddenSize));
             }
 
+            DotLLM.Cpu.CpuStageProf.E(2, _pt); _pt = DotLLM.Cpu.CpuStageProf.T();
             // ── MoE branch ──────────────────────────────────────────────
             // Mixtral-convention top-k dense routing replaces the dense FFN
             // block entirely. Takes post-attn hidden + FFN RMSNorm weight,
@@ -1681,6 +1687,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                         new Span<float>(normOut + t * hiddenSize, hiddenSize));
                 }
 
+                DotLLM.Cpu.CpuStageProf.E(3, _pt); _pt = DotLLM.Cpu.CpuStageProf.T();
                 MoeLayerWeights moe = lw.Moe!;
                 // BitNet-ternary MoE (identity-MoTE): experts are I2_S with a relu² +
                 // per-expert ffn_sub_norm body, dispatched through the indexed I2_S kernel.
@@ -1794,6 +1801,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                         useGeGLU: _useGeGLU);
                 }
 
+                DotLLM.Cpu.CpuStageProf.E(5, _pt); _pt = DotLLM.Cpu.CpuStageProf.T();
                 // Residual add (per token) → hidden. Same as dense path.
                 ScaleSublayerOutput(normOut, seqLen * hiddenSize);   // Granite residual multiplier (no-op otherwise)
                 for (int t = 0; t < seqLen; t++)
@@ -1803,8 +1811,10 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                         new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
                         new Span<float>(hidden + t * hiddenSize, hiddenSize));
                 }
+                DotLLM.Cpu.CpuStageProf.E(6, _pt);
                 continue;
             }
+            _pt = DotLLM.Cpu.CpuStageProf.T();
 
             // i. FFN RMSNorm + Pre-quantize + Gate/Up projections
             // When a LoRA adapter is active we need F32 normOut for delta —
@@ -1942,6 +1952,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                         new Span<float>(normOut + t * hiddenSize, hiddenSize));
             }
 
+            DotLLM.Cpu.CpuStageProf.E(7, _pt);
             // k. Residual add (per token)
             ScaleSublayerOutput(normOut, seqLen * hiddenSize);   // Granite residual multiplier (no-op otherwise)
             for (int t = 0; t < seqLen; t++)
@@ -3068,11 +3079,13 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         }
 
         long _tl = G4Prof.T();
+        long _tlp = DotLLM.Cpu.CpuStageProf.T();
         var rwOutput = _weights.RepackedOutput ?? default;
         GemmInterleaved(_weights.OutputWeight, _weights.OutputQuantType,
             hidden, logits, _weights.OutputOutputDim, _weights.OutputInputDim, seqLen,
             null, in rwOutput);
         G4Prof.E(13,_tl);
+        DotLLM.Cpu.CpuStageProf.E(8, _tlp);
 
         // Optional Gemma 2/3 final-logit soft-cap (z' = cap * tanh(z / cap)).
         // Fires when Config.FinalLogitSoftcap is non-null and positive. Uses

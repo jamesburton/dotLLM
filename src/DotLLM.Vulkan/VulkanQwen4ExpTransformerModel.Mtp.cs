@@ -242,7 +242,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
                 enorm = VulkanQwen3MoeHybridWeights.UploadFloatArray(_device, staging, F32(headFile, tensors, n + "enorm.weight", H));
                 hnorm = VulkanQwen3MoeHybridWeights.UploadFloatArray(_device, staging, F32(headFile, tensors, n + "hnorm.weight", hcDim));
             }
-            moe = VulkanQwen3MoeMoeUpload.UploadLayer(_device, layers[0].Moe, H, residentQuant: true);
+            moe = VulkanQwen3MoeMoeUpload.UploadLayer(_device, layers[0].Moe, H, residentQuant: true, sharedPackedDefault: false);
 
             long rowBytes = (long)hcDim * 4;
             VulkanDevice.Buffer Scratch(long bytes) { var x = _device.AllocateDeviceLocal(bytes); bufs.Add(x); return x; }
