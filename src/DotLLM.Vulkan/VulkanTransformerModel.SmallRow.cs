@@ -43,11 +43,13 @@ public sealed partial class VulkanTransformerModel
         if (_splitKvAttention is not null) _smallRowAttn = VulkanSplitKvRowsAttentionKernel.TryCreate(device, spvDir);
     }
 
+    /// <summary>Test hook: whether a <c>[seqLen, inputDim]</c> activation currently fits the multi-row Q8_1 scratch (#1016).</summary>
+    internal bool Q8RowsFitForTest(int seqLen, int inputDim) => _state.Q8_1RowsFit(seqLen, inputDim);
+
     private bool SmallRowQ8Fits(int inputDim, int seqLen)
         => _smallRowQ8 is not null && _quantizeQ8_1Rows is not null && _state.Q8_1XqRows is not null && _state.Q8_1XdsRows is not null
            && (inputDim % QuantizeQ8_1RowsKernel.GroupSize) == 0
-           && QuantizeQ8_1RowsKernel.PackedBytes(seqLen, inputDim) <= _state.Q8_1XqRows.Size
-           && QuantizeQ8_1RowsKernel.ScaleBytes(seqLen, inputDim) <= _state.Q8_1XdsRows.Size;
+           && _state.Q8_1RowsFit(seqLen, inputDim);
 
     /// <summary>True when <see cref="TryRecordSmallRowGemv"/> would serve a projection of <paramref name="qt"/> weights over <paramref name="seqLen"/> rows.</summary>
     private bool SmallRowGemvApplies(QuantType qt, int inputDim, int seqLen)
