@@ -351,6 +351,7 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _kvWriteOneF16RingFunc;
     private readonly nint _kvDequantQ8_0DynFunc;
     private readonly nint _kvDequantQ4_0DynFunc;
+    private readonly nint _kvDequantQ4_0Func;
     private readonly nint _kvWindowToScratchDynFunc;
 
     // Fused decode-step RoPE + KV-cache write. Replaces three eager launches per
@@ -546,6 +547,13 @@ public sealed unsafe class CudaKernels : IDisposable
     // PTX, Ampere-only (mma.sync is sm_80+).
     private readonly CudaModule? _attentionMmaDecodeGqaSplitModule;
     private readonly nint _attentionMmaDecodeGqaSplitFunc;
+
+    // Quantized-KV fused-dequant variants of the mma decode kernel (issue #956), indexed by
+    // KvqIndex(kDtype, vDtype): 0 = q8q8, 1 = q4q4, 2 = q8q4, 3 = q4q8. Best-effort load: absent
+    // PTX or a pre-Ampere driver leaves them 0 and callers fall back to dequant-into-scratch.
+    private readonly CudaModule? _attentionMmaDecodeKvqModule;
+    private readonly nint[] _attentionMmaDecodeKvqFuncs = new nint[4];
+    private readonly int[] _attentionMmaDecodeKvqMaxCoResident = { -1, -1, -1, -1 };
     private int _attnMmaDecodeGqaSplitMaxCoResidentGrid = -1; // -1 = not yet queried
     private int _attnMmaDecodeGqaSplitCachedGroup = -1;        // group the cached query above is valid for
 
@@ -1068,6 +1076,7 @@ public sealed unsafe class CudaKernels : IDisposable
             _kvWriteOneF16RingFunc = _kvWriteModule.GetFunction("kv_write_one_f16_ring");
             _kvDequantQ8_0DynFunc = _kvWriteModule.GetFunction("kv_dequant_q8_0_dyn");
             _kvDequantQ4_0DynFunc = _kvWriteModule.GetFunction("kv_dequant_q4_0_dyn");
+            _kvDequantQ4_0Func = _kvWriteModule.TryGetFunction("kv_dequant_q4_0");
             _kvWindowToScratchDynFunc = _kvWriteModule.GetFunction("kv_window_to_scratch_dyn");
         }
 
@@ -1324,6 +1333,30 @@ public sealed unsafe class CudaKernels : IDisposable
             {
                 _attentionMmaDecodeGqaSplitModule = null;
                 _attentionMmaDecodeGqaSplitFunc = 0;
+            }
+        }
+
+        string attentionMmaDecodeKvqPath = Path.Combine(ptxDir, "attention_flash_mma_decode_gqa_split_kvq.ptx");
+        if (File.Exists(attentionMmaDecodeKvqPath))
+        {
+            try
+            {
+                var kvqModule = CudaModule.LoadFromFile(attentionMmaDecodeKvqPath);
+                string[] names =
+                {
+                    "attention_flash_mma_decode_gqa_split_kvq_q8q8",
+                    "attention_flash_mma_decode_gqa_split_kvq_q4q4",
+                    "attention_flash_mma_decode_gqa_split_kvq_q8q4",
+                    "attention_flash_mma_decode_gqa_split_kvq_q4q8",
+                };
+                for (int i = 0; i < names.Length; i++)
+                    _attentionMmaDecodeKvqFuncs[i] = kvqModule.TryGetFunction(names[i]);
+                _attentionMmaDecodeKvqModule = kvqModule;
+            }
+            catch (CudaException)
+            {
+                _attentionMmaDecodeKvqModule = null;
+                Array.Clear(_attentionMmaDecodeKvqFuncs);
             }
         }
     }
@@ -3091,6 +3124,83 @@ public sealed unsafe class CudaKernels : IDisposable
     }
 
 
+    private static int KvqIndex(KvCacheDType k, KvCacheDType v) => (k, v) switch
+    {
+        (KvCacheDType.Q8_0, KvCacheDType.Q8_0) => 0,
+        (KvCacheDType.Q4_0, KvCacheDType.Q4_0) => 1,
+        (KvCacheDType.Q8_0, KvCacheDType.Q4_0) => 2,
+        (KvCacheDType.Q4_0, KvCacheDType.Q8_0) => 3,
+        _ => -1,
+    };
+
+    /// <summary>True when the fused quantized-KV mma decode kernel for this K/V format pair is loaded (issue #956).</summary>
+    public bool HasAttentionMmaDecodeKvq(KvCacheDType kDtype, KvCacheDType vDtype)
+    {
+        int i = KvqIndex(kDtype, vDtype);
+        return i >= 0 && _attentionMmaDecodeKvqFuncs[i] != 0;
+    }
+
+    /// <summary>
+    /// Cooperative co-residency ceiling (max safe kvSplit) for the fused quantized-KV kernel, using ITS
+    /// OWN occupancy (its register count differs from the F16 kernel's). 0 = unsupported/unsafe.
+    /// </summary>
+    public int MaxSafeAttentionMmaDecodeKvq(int numKvHeads, KvCacheDType kDtype, KvCacheDType vDtype)
+    {
+        int idx = KvqIndex(kDtype, vDtype);
+        if (idx < 0 || _attentionMmaDecodeKvqFuncs[idx] == 0 || numKvHeads <= 0) return 0;
+
+        if (_attentionMmaDecodeKvqMaxCoResident[idx] < 0)
+        {
+            CudaDriverApi.cuCtxGetDevice(out int device);
+            CudaDriverApi.cuDeviceGetAttribute(out int coopSupported,
+                CudaDriverApi.CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH, device);
+            if (coopSupported == 0)
+            {
+                _attentionMmaDecodeKvqMaxCoResident[idx] = 0;
+            }
+            else
+            {
+                CudaDriverApi.cuDeviceGetAttribute(out int numSms,
+                    CudaDriverApi.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
+                int rc = CudaDriverApi.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                    out int maxBlocksPerSm, _attentionMmaDecodeKvqFuncs[idx],
+                    AttentionMmaDecodeGqaSplitBlockSize, dynamicSMemSize: 0);
+                _attentionMmaDecodeKvqMaxCoResident[idx] = rc == 0 ? numSms * maxBlocksPerSm : 0;
+            }
+        }
+        int grid = _attentionMmaDecodeKvqMaxCoResident[idx];
+        return grid <= 0 ? 0 : grid / numKvHeads;
+    }
+
+    /// <summary>
+    /// Fused quantized-KV variant of <see cref="LaunchAttentionMmaDecodeGqaSplit"/> (issue #956):
+    /// <paramref name="k"/>/<paramref name="v"/> are KV-format Q8_0/Q4_0 block bytes
+    /// (<c>[seqKv, numKvHeads*headDim]</c> logical elements) read in-kernel, bit-identical to
+    /// dequantizing into F16 first. <paramref name="kvSplit"/> must be clamped to
+    /// <see cref="MaxSafeAttentionMmaDecodeKvq"/>.
+    /// </summary>
+    public void LaunchAttentionMmaDecodeGqaSplitKvq(nint q, nint k, nint v,
+        KvCacheDType kDtype, KvCacheDType vDtype, nint output,
+        int seqKv, int numHeads, int numKvHeads, int kvSplit,
+        nint partialMax, nint partialSum, nint partialOut, nint stream)
+    {
+        int idx = KvqIndex(kDtype, vDtype);
+        if (idx < 0 || _attentionMmaDecodeKvqFuncs[idx] == 0)
+            throw new InvalidOperationException($"Fused KV decode kernel for {kDtype}/{vDtype} is not loaded.");
+
+        nint qArg = q, kArg = k, vArg = v, outArg = output;
+        int skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, ksArg = kvSplit;
+        float scArg = 1.0f / MathF.Sqrt(AttentionMmaDecodeGqaSplitHeadDim);
+        nint pmArg = partialMax, psArg = partialSum, poutArg = partialOut;
+
+        void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
+                        &skvArg, &nhArg, &nkvArg, &scArg, &ksArg, &pmArg, &psArg, &poutArg};
+
+        CudaDriverApi.cuLaunchCooperativeKernel(_attentionMmaDecodeKvqFuncs[idx],
+                (uint)numKvHeads, (uint)kvSplit, 1, AttentionMmaDecodeGqaSplitBlockSize, 1, 1,
+                0, stream, (nint)args).ThrowOnError();
+    }
+
     /// <summary>FP32 SwiGLU: out = SiLU(gate) * up, all FP32.</summary>
     public void LaunchSwiGLUF32(nint gate, nint up, nint output,
                                   int n, int seqLen, nint stream)
@@ -4582,6 +4692,41 @@ public sealed unsafe class CudaKernels : IDisposable
         CudaDriverApi.cuLaunchKernel(func,
                 gridDim, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Eager dequantization of a contiguous run of KV-format blocks (as written by
+    /// <see cref="LaunchQuantKv"/>) to FP16. KV Q4_0 packs ADJACENT PAIRS (low nibble = even
+    /// element), which differs from the GGUF weight layout <see cref="LaunchDequantToF16"/>
+    /// unpacks -- use this, not the generic weight dequant, for any KV-cache data (issue #956).
+    /// Q8_0 shares the weight layout and is forwarded to the generic kernel.
+    /// </summary>
+    public void LaunchKvDequantToF16(nint src, KvCacheDType dtype, nint dst, int totalElements, nint stream)
+    {
+        switch (dtype)
+        {
+            case KvCacheDType.Q8_0:
+                LaunchDequantToF16(src, QuantizationType.Q8_0, dst, totalElements, stream);
+                return;
+            case KvCacheDType.Q4_0:
+            {
+                if (_kvDequantQ4_0Func == 0)
+                    throw new InvalidOperationException(
+                        "kv_dequant_q4_0 not loaded (kv_write.ptx missing/stale). Rebuild native PTX.");
+                nint srcArg = src, dstArg = dst;
+                int totalBlocks = totalElements / 32;
+                int tbArg = totalBlocks;
+                void** args = stackalloc void*[] { &srcArg, &dstArg, &tbArg };
+                uint gridDim = (uint)Math.Min((totalBlocks + 7) / 8, MaxDequantGridSize);
+                if (gridDim == 0) gridDim = 1;
+                CudaDriverApi.cuLaunchKernel(_kvDequantQ4_0Func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+            default:
+                throw new NotSupportedException($"KV dequant not supported for {dtype}.");
+        }
     }
 
     /// <summary>

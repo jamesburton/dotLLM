@@ -119,6 +119,35 @@ internal sealed class CudaAttentionMmaDecodeGqaSplit
         return CudaKernels.ComputeAttentionKvSplit(seqKv, numKvHeads, maxSafe);
     }
 
+    /// <summary>Shape/precondition check for the fused quantized-KV kernel (issue #956); mirrors <see cref="CanUse"/>.</summary>
+    internal bool CanUseKvq(Core.Configuration.KvCacheDType kDtype, Core.Configuration.KvCacheDType vDtype,
+                            int seqQ, int seqKv, int slidingWindow, int numHeads, int numKvHeads, int headDim)
+        => Enabled
+        && _kernels.HasAttentionMmaDecodeKvq(kDtype, vDtype)
+        && seqQ == 1
+        && seqKv > 0
+        && headDim == SupportedHeadDim
+        && slidingWindow <= 0
+        && CudaKernels.IsGqaGroupShapeSupported(numHeads, numKvHeads);
+
+    internal int ComputeSafeKvSplitKvq(Core.Configuration.KvCacheDType kDtype,
+                                       Core.Configuration.KvCacheDType vDtype, int numKvHeads, int seqKv)
+    {
+        int maxSafe = _kernels.MaxSafeAttentionMmaDecodeKvq(numKvHeads, kDtype, vDtype);
+        if (maxSafe <= 0) return 0;
+        return CudaKernels.ComputeAttentionKvSplit(seqKv, numKvHeads, maxSafe);
+    }
+
+    internal void RunKvq(nint q, nint k, nint v, Core.Configuration.KvCacheDType kDtype,
+                         Core.Configuration.KvCacheDType vDtype, nint output,
+                         int seqKv, int numHeads, int numKvHeads, int kvSplit,
+                         nint partialMax, nint partialSum, nint partialOut, nint stream)
+    {
+        DispatchCount++;
+        _kernels.LaunchAttentionMmaDecodeGqaSplitKvq(q, k, v, kDtype, vDtype, output, seqKv, numHeads,
+            numKvHeads, kvSplit, partialMax, partialSum, partialOut, stream);
+    }
+
     /// <summary>
     /// Runs the composed tensor-core decode kernel. <paramref name="q"/>/<paramref name="k"/>/
     /// <paramref name="v"/> must already be FP16 (caller converts Q; K/V come straight from the
