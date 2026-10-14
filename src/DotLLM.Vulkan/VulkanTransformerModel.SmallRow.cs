@@ -15,6 +15,8 @@ public sealed partial class VulkanTransformerModel
 
     /// <summary>Largest row count served by the Q6_K multi-column GEMV (default 4; <c>DOTLLM_VK_SMALLROW_Q6K_MAX_ROWS</c>; 0 restores the MMQ / GEMM path). Runtime A/B switch.</summary>
     public int SmallRowQ6KMaxRows { get; set; } = EnvRows("DOTLLM_VK_SMALLROW_Q6K_MAX_ROWS", 4, MatMulQuantGemvMultiKernel.MaxColumns);
+    /// <summary>Smallest row count that takes the two-output-rows-per-workgroup Q6_K kernel (default 3: at 2 columns the single-row kernel is as fast; 3..4 columns are load-issue bound there; <c>DOTLLM_VK_SMALLROW_Q6K_R2_MIN_ROWS</c>; 99 = never).</summary>
+    public int SmallRowQ6KR2MinRows { get; set; } = EnvRows("DOTLLM_VK_SMALLROW_Q6K_R2_MIN_ROWS", 3, 99);
     /// <summary>Largest row count served by the F32 multi-column GEMV (router, F32 projections; default 4; <c>DOTLLM_VK_SMALLROW_F32_MAX_ROWS</c>; 0 = off).</summary>
     public int SmallRowF32MaxRows { get; set; } = EnvRows("DOTLLM_VK_SMALLROW_F32_MAX_ROWS", 4, MatMulF32GemvMultiKernel.MaxColumns);
     /// <summary>Largest row count served by the Q8_0 MMVQ multi-column GEMV (lm_head, Q8_0 projections; default 4; <c>DOTLLM_VK_SMALLROW_Q8_MAX_ROWS</c>; 0 = off).</summary>
@@ -35,6 +37,7 @@ public sealed partial class VulkanTransformerModel
     private void CreateSmallRowKernels(VulkanDevice device, string spvDir)
     {
         _smallRowQ6K = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K);
+        _smallRowQ6KR2 = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K_R2);
         _smallRowF32 = MatMulF32GemvMultiKernel.TryCreate(device, spvDir);
         _smallRowQ8 = MatMulQ8_0MmvqMultiKernel.TryCreate(device, spvDir);
         if (_splitKvAttention is not null) _smallRowAttn = VulkanSplitKvRowsAttentionKernel.TryCreate(device, spvDir);
@@ -68,8 +71,16 @@ public sealed partial class VulkanTransformerModel
         {
             case QuantType.Q6_K:
                 SmallRowQ6KCount++;
-                _smallRowQ6K!.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
-                ProfNote("q6_k_multi", outputDim, inputDim, seqLen);
+                if (seqLen >= SmallRowQ6KR2MinRows && _smallRowQ6KR2 is { } r2)
+                {
+                    r2.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                    ProfNote("q6_k_multi_r2", outputDim, inputDim, seqLen);
+                }
+                else
+                {
+                    _smallRowQ6K!.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                    ProfNote("q6_k_multi", outputDim, inputDim, seqLen);
+                }
                 return true;
             case QuantType.F32:
                 SmallRowF32Count++;

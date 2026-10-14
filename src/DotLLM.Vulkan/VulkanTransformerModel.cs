@@ -278,6 +278,7 @@ public sealed partial class VulkanTransformerModel : IModel
     // per-column accumulation order == the 1-row coalesced GEMV, instead of the MMQ / tiled GEMM tuned for prefill. Null when the SPIR-V or the
     // device feature is missing; created in Create() after construction.
     private MatMulQuantGemvMultiKernel? _smallRowQ6K;
+    private MatMulQuantGemvMultiKernel? _smallRowQ6KR2;
     private MatMulF32GemvMultiKernel? _smallRowF32;
     private MatMulQ8_0MmvqMultiKernel? _smallRowQ8;
     private VulkanSplitKvRowsAttentionKernel? _smallRowAttn;
@@ -4862,6 +4863,7 @@ public sealed partial class VulkanTransformerModel : IModel
         _matmulIq4XsGemmCoopmat?.InvalidateDescriptorCache();
         _matmulQ6KMmq?.InvalidateDescriptorCache();
         _smallRowQ6K?.InvalidateDescriptorCache();
+        _smallRowQ6KR2?.InvalidateDescriptorCache();
         _smallRowF32?.InvalidateDescriptorCache();
         _smallRowQ8?.InvalidateDescriptorCache();
         _smallRowAttn?.InvalidateDescriptorCache();
@@ -8614,6 +8616,7 @@ public sealed partial class VulkanTransformerModel : IModel
         _matmulIq4XsGemmCoopmat?.Dispose();
         _matmulQ6KMmq?.Dispose();
         _smallRowQ6K?.Dispose();
+        _smallRowQ6KR2?.Dispose();
         _smallRowF32?.Dispose();
         _smallRowQ8?.Dispose();
         _smallRowAttn?.Dispose();
