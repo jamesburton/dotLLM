@@ -25,8 +25,8 @@ public static class BenchRunner
     private const int DepthExtensionChunkSize = 256;
 
     /// <summary>
-    /// Runs <paramref name="reps"/> measured repetitions (plus one discarded warm-up)
-    /// of prefill + greedy decode against <paramref name="model"/>.
+    /// Runs <paramref name="reps"/> measured repetitions (plus <paramref name="warmupReps"/>
+    /// discarded warm-up reps) of prefill + greedy decode against <paramref name="model"/>.
     /// </summary>
     /// <param name="model">Loaded model. Recurrent-state architectures (Nemotron-H SSM,
     /// Qwen3MoeHybrid GDN) reuse the model-owned recurrent state across repetitions —
@@ -40,6 +40,8 @@ public static class BenchRunner
     /// and decode, so decode runs at context depth <c>promptTokens.Length + depth</c>.
     /// The extra tokens re-tile the prompt.</param>
     /// <param name="loadMs">Model load wall time to embed in the result.</param>
+    /// <param name="warmupReps">Number of warm-up repetitions to discard (default 1).
+    /// Use 0 to skip warm-up entirely.</param>
     public static BenchResult Run(
         IModel model,
         Func<int, IKvCache> kvCacheFactory,
@@ -47,7 +49,8 @@ public static class BenchRunner
         int decodeTokens,
         int reps,
         int depth = 0,
-        double loadMs = 0)
+        double loadMs = 0,
+        int warmupReps = 1)
     {
         ArgumentNullException.ThrowIfNull(model);
         ArgumentNullException.ThrowIfNull(kvCacheFactory);
@@ -56,6 +59,7 @@ public static class BenchRunner
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(decodeTokens);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(reps);
         ArgumentOutOfRangeException.ThrowIfNegative(depth);
+        ArgumentOutOfRangeException.ThrowIfNegative(warmupReps);
 
         int cacheSize = promptTokens.Length + depth + decodeTokens + 8;
         if (cacheSize > model.Config.MaxSequenceLength)
@@ -63,14 +67,15 @@ public static class BenchRunner
                 $"prompt ({promptTokens.Length}) + depth ({depth}) + decode ({decodeTokens}) exceeds the model's " +
                 $"max sequence length ({model.Config.MaxSequenceLength}). Reduce -p / -n / --depth.");
 
-        var all = new List<BenchRep>(reps + 1);
-        for (int rep = 0; rep < reps + 1; rep++)
+        int totalReps = warmupReps + reps;
+        var all = new List<BenchRep>(totalReps);
+        for (int rep = 0; rep < totalReps; rep++)
             all.Add(RunOneRep(model, kvCacheFactory, promptTokens, decodeTokens, depth, cacheSize));
 
         return new BenchResult
         {
-            Warmup = all[0],
-            Reps = BenchStats.DiscardWarmup(all),
+            Warmup = warmupReps > 0 ? all[0] : null,
+            Reps = warmupReps > 0 ? BenchStats.DiscardWarmup(all, warmupReps) : all,
             LoadMs = loadMs,
             PromptTokens = promptTokens.Length,
             DecodeTokens = decodeTokens,

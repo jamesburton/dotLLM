@@ -274,6 +274,14 @@ public sealed partial class VulkanTransformerModel : IModel
     // Same for IQ4_XS (issue #600).
     private MatMulIq4XsGemmCoopmatKernel? _matmulIq4XsGemmCoopmat;
     private readonly MatMulQ6KMmqKernel? _matmulQ6KMmq;
+    // Small-row (2..4 rows: speculative verify / scheduler batched decode) multi-column GEMVs (#996). Weights read once for N activation rows,
+    // per-column accumulation order == the 1-row coalesced GEMV, instead of the MMQ / tiled GEMM tuned for prefill. Null when the SPIR-V or the
+    // device feature is missing; created in Create() after construction.
+    private MatMulQuantGemvMultiKernel? _smallRowQ6K;
+    private MatMulQuantGemvMultiKernel? _smallRowQ6KR2;
+    private MatMulF32GemvMultiKernel? _smallRowF32;
+    private MatMulQ8_0MmvqMultiKernel? _smallRowQ8;
+    private VulkanSplitKvRowsAttentionKernel? _smallRowAttn;
     private readonly MatMulQ5KMmqKernel? _matmulQ5KMmq;
     private readonly MatMulIq4XsMmqKernel? _matmulIq4XsMmq;
     private readonly MatMulIq4NlMmqKernel? _matmulIq4NlMmq;
@@ -2330,6 +2338,7 @@ public sealed partial class VulkanTransformerModel : IModel
         }
         model._headless = headless;
         model._noTokenEmbed = skipTokenEmbed;
+        model.CreateSmallRowKernels(device, spvDir);
         if (config.Architecture == DotLLM.Core.Configuration.Architecture.GptOss)
             model.InitGptOss(spvDir);
         if (config.Architecture == DotLLM.Core.Configuration.Architecture.MiMoV2)
@@ -2626,6 +2635,24 @@ public sealed partial class VulkanTransformerModel : IModel
         VulkanDevice.Buffer? sinks = null)
     {
         AttentionSpanInvariant.AssertTight(seqKv, positionOffset, seqQ, "Vulkan");
+
+        // Small-row (2..4 rows) split-KV attention (#996): each row is the 1-row split-KV decode kernel's result (sink merge + window-clipped span on sink
+        // layers), instead of the per-token sink kernel (one workgroup per head, whole KV range) / the f16 coopmat flash kernel. MiMo-V2 and gpt-oss only.
+        bool rowsSink = sinks is not null && _gptOss is not null && !_gptOssDbg.NoSinks;
+        if (seqQ >= 2 && seqQ <= SmallRowAttnMaxRows && _smallRowAttn is not null
+            && (rowsSink || (sinks is null && Config.Architecture == DotLLM.Core.Configuration.Architecture.MiMoV2))
+            && softCap == 0.0f && scaleOverride == 0.0f && maskMode == AttentionMaskMode.Causal
+            && headDim <= VulkanSplitKvAttentionKernel.MaxHeadDim
+            && (rowsSink || slidingWindow == 0)
+            && VulkanSplitKvRowsAttentionKernel.CanServe(seqQ, positionOffset, numHeads, slidingWindow, rowsSink))
+        {
+            SmallRowAttnCount++;
+            ProfNote("attn_splitkv_rows", seqQ, seqKv, numHeads);
+            _smallRowAttn.Record(cmdBuf, q, k, v, output,
+                seqQ: seqQ, numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim, positionOffset: positionOffset,
+                slidingWindow: slidingWindow, sinks: rowsSink ? sinks : null);
+            return;
+        }
 
         // gpt-oss attention sinks (#737): ALWAYS the sink kernel (prefill + decode), never the
         // split-KV / coopmat / flash variants - none of them carry the sink term.
@@ -4858,6 +4885,11 @@ public sealed partial class VulkanTransformerModel : IModel
         _matmulQ3KGemmCoopmat?.InvalidateDescriptorCache();
         _matmulIq4XsGemmCoopmat?.InvalidateDescriptorCache();
         _matmulQ6KMmq?.InvalidateDescriptorCache();
+        _smallRowQ6K?.InvalidateDescriptorCache();
+        _smallRowQ6KR2?.InvalidateDescriptorCache();
+        _smallRowF32?.InvalidateDescriptorCache();
+        _smallRowQ8?.InvalidateDescriptorCache();
+        _smallRowAttn?.InvalidateDescriptorCache();
         _matmulQ5KMmq?.InvalidateDescriptorCache();
         _matmulIq4XsMmq?.InvalidateDescriptorCache();
         _matmulIq4NlMmq?.InvalidateDescriptorCache();
@@ -7457,6 +7489,7 @@ public sealed partial class VulkanTransformerModel : IModel
         if (QuantizeQ8_1RowsKernel.ScaleBytes(seqLen, inputDim) > _state.Q8_1XdsRows.Size) return false;
         foreach (var p in projections)
         {
+            if (SmallRowGemvApplies(p.WeightQt, inputDim, seqLen)) return false;   // #996: each projection goes through RecordMatmul's multi-column GEMV
             if (p.WeightQt == QuantType.Q4_K && PreferQ4KCoopmat(seqLen)) return false;
             if (p.WeightQt == QuantType.Q6_K && PreferQ6KCoopmat(seqLen)) return false;
             if (p.WeightQt == QuantType.Q2_K && PreferQ2KCoopmat(seqLen)) return false;
@@ -7643,6 +7676,10 @@ public sealed partial class VulkanTransformerModel : IModel
         VulkanDevice.Buffer input, VulkanDevice.Buffer output,
         int outputDim, int inputDim, int seqLen)
     {
+        // Small-row multi-column GEMVs (#996): 2..4 rows read the weights once instead of running the prefill GEMM / MMQ.
+        if (seqLen > 1 && TryRecordSmallRowGemv(cmdBuf, weights, weightQt, input, output, outputDim, inputDim, seqLen))
+            return;
+
         // IQ1/IQ2/IQ3 prefill: dequant to F16 scratch + coopmat GEMM instead of the scalar tiled GEMM (#621).
         if (seqLen > 1 && _iqF16Prefill is not null
             && _iqF16Prefill.TryRecord(cmdBuf, weightQt, weights, input, output, outputDim, inputDim, seqLen))
@@ -8615,6 +8652,11 @@ public sealed partial class VulkanTransformerModel : IModel
         _matmulQ3KGemmCoopmat?.Dispose();
         _matmulIq4XsGemmCoopmat?.Dispose();
         _matmulQ6KMmq?.Dispose();
+        _smallRowQ6K?.Dispose();
+        _smallRowQ6KR2?.Dispose();
+        _smallRowF32?.Dispose();
+        _smallRowQ8?.Dispose();
+        _smallRowAttn?.Dispose();
         _matmulQ5KMmq?.Dispose();
         _matmulIq4XsMmq?.Dispose();
         _matmulIq4NlMmq?.Dispose();

@@ -177,4 +177,80 @@ public sealed class MiMoV2VulkanParityTests
         double bad = rk.Count(x => x > 0.02) / (double)rk.Length;
         Assert.True(bad > 0.4, $"mutant '{mutant}' is invisible: only {bad:P0} rows moved");
     }
+
+    // ---- #996: small-row (2..4 rows) forwards --------------------------------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Feeds ids[ctx..ctx+rows) as ONE forward (all-row logits) and as <paramref name="rows"/> sequential 1-row decode steps from the same cache state, under
+    /// the given small-row switches. Returns (batched rows, sequential rows) and the dispatch counters of the batched forward.
+    /// </summary>
+    private static (float[] Batched, float[] Sequential, long Attn, long F32, long Q8, long Q6) SmallRowRun(
+        SyntheticMiMoV2Gguf.Options options, int ctx, int rows, int attnMax, int f32Max, int q8Max = 4, int q6Max = 4, int window = 20)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        string path = Path.Combine(Path.GetTempPath(), $"dotllm-mimo2-sr-{Guid.NewGuid():N}.gguf");
+        File.WriteAllBytes(path, SyntheticMiMoV2Gguf.Build(options));
+        try
+        {
+            using var gguf = GgufFile.Open(path);
+            ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            // The synthetic window (4) leaves every sliding layer's clipped span below the 17 keys a split needs, so widen it: the sink layers must exercise the
+            // window-clipped split-KV merge, like the real model's 128.
+            cfg = cfg with { PerLayerSlidingWindow = cfg.PerLayerSlidingWindow!.Select(w => w is null ? (int?)null : window).ToArray() };
+            using var vk = VulkanTransformerModel.LoadFromGguf(gguf, cfg, spvDir);
+            vk.TrySetAllRowLogitsLimit(8);
+            int[] ids = Enumerable.Range(0, ctx + rows).Select(i => (i * 7 + 3) % cfg.VocabSize).ToArray();
+            int[] pos = Enumerable.Range(0, ctx + rows).ToArray();
+            using var cache = (VulkanKvCache)vk.CreateKvCache(128);
+            using (vk.Forward(ids.AsSpan(0, ctx), pos.AsSpan(0, ctx), deviceId: 0, cache)) { }
+            var seq = new List<float>();
+            for (int i = 0; i < rows; i++)
+            {
+                using ITensor t = vk.Forward(ids.AsSpan(ctx + i, 1), pos.AsSpan(ctx + i, 1), deviceId: 0, cache);
+                seq.AddRange(Copy(t));
+            }
+            cache.Rollback(ctx);
+            vk.SmallRowAttnMaxRows = attnMax; vk.SmallRowF32MaxRows = f32Max; vk.SmallRowQ8MaxRows = q8Max; vk.SmallRowQ6KMaxRows = q6Max;
+            long a0 = vk.SmallRowAttnCount, f0 = vk.SmallRowF32Count, q80 = vk.SmallRowQ8Count, q60 = vk.SmallRowQ6KCount;
+            float[] batched;
+            using (ITensor t = vk.Forward(ids.AsSpan(ctx, rows), pos.AsSpan(ctx, rows), deviceId: 0, cache))
+            {
+                Assert.Equal(rows, (int)t.Shape[0]);
+                batched = Copy(t);
+            }
+            return (batched, seq.ToArray(), vk.SmallRowAttnCount - a0, vk.SmallRowF32Count - f0, vk.SmallRowQ8Count - q80, vk.SmallRowQ6KCount - q60);
+        }
+        finally { try { File.Delete(path); } catch { /* best effort */ } }
+    }
+
+    private static double MaxAbs(float[] a, float[] b) { double m = 0; for (int i = 0; i < a.Length; i++) m = Math.Max(m, Math.Abs(a[i] - b[i])); return m; }
+
+    /// <summary>
+    /// A 2..4 row forward must take the small-row paths (counted), match the same tokens fed one at a time to near-ULP level, and be measurably CLOSER to
+    /// the 1-row result than the old path (f16 coopmat flash attention + tiled F32 GEMM): the sensitive control that proves the comparison could disagree.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    public void SmallRowForward_TakesTheMultiColumnPaths_AndTracksTheOneRowDecode(int rows)
+    {
+        var o = new SyntheticMiMoV2Gguf.Options { HiddenSize = 256, ExpertFf = 256, DenseFfWidth = 256, GateUpQuant = QuantizationType.Q8_0, DownQuant = QuantizationType.Q8_0, RouterStd = 0.15f };
+        const int ctx = 40;   // window 20 < ctx: sliding layers clip to 20 keys (>= 17: they split) and the rows straddle nothing special; global layers see 40+
+        var on = SmallRowRun(o, ctx, rows, attnMax: 4, f32Max: 4);
+        var off = SmallRowRun(o, ctx, rows, attnMax: 0, f32Max: 0, q8Max: 0, q6Max: 0);
+        double dOn = MaxAbs(on.Batched, on.Sequential), dOff = MaxAbs(off.Batched, off.Sequential);
+        var noAttn = SmallRowRun(o, ctx, rows, attnMax: 0, f32Max: 4);
+        var noF32 = SmallRowRun(o, ctx, rows, attnMax: 4, f32Max: 0);
+        _output.WriteLine($"[mimo2 smallrow rows={rows}] attribution: attn off {MaxAbs(noAttn.Batched, noAttn.Sequential):E2}, f32 off {MaxAbs(noF32.Batched, noF32.Sequential):E2}");
+        Console.WriteLine($"[mimo2 smallrow rows={rows}] attribution: attn off {MaxAbs(noAttn.Batched, noAttn.Sequential):E2}, f32 off {MaxAbs(noF32.Batched, noF32.Sequential):E2}");
+        _output.WriteLine($"[mimo2 smallrow rows={rows}] attn {on.Attn} f32 {on.F32} q8 {on.Q8} | max|batched - sequential|: new {dOn:E2} old {dOff:E2}");
+        Console.WriteLine($"[mimo2 smallrow rows={rows}] attn {on.Attn} f32 {on.F32} q8 {on.Q8} | max|batched - sequential|: new {dOn:E2} old {dOff:E2}");
+        Assert.Equal(SyntheticMiMoV2Gguf.Layers, on.Attn);   // one rows-kernel dispatch per attention layer (sink layers AND the global layers)
+        Assert.True(on.F32 > 0, "F32 multi-column GEMV never ran (router / F32 projections)");
+        Assert.Equal(0, off.Attn); Assert.Equal(0, off.F32);
+        // 0 at 2 and 3 rows; ~1e-2 at 4 rows (F32 multi NC=4 contracts its FMAs differently from the 1-row GEMV, one near-tie MoE expert choice flips): ULP noise, vs 0.2 for the old path.
+        Assert.True(dOn < 5e-2, $"new batched forward off the 1-row decode: {dOn:E2}");
+        Assert.True(dOff > 3 * dOn, $"old path not measurably farther from the 1-row decode (new {dOn:E2}, old {dOff:E2}): the comparison cannot disagree");
+    }
 }

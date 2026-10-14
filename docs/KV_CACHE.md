@@ -73,6 +73,52 @@ Qwen4-Exp model) and `lazy: true` (buffers start empty and `EnsureCapacity(posit
 (handles are recycled; a stale cached set reads zeros without any error). Qwen4-Exp does this in `ForwardCore` before recording (`EnsureContext`), for the sequence's K/V and its indexer
 state. Switches and measurements: [ATTENTION.md](ATTENTION.md), "Lazy growth and F16 K/V".
 
+### CUDA hybrid-dense KV: staging, quantized storage, fused decode (issue #956)
+
+`CudaQwen3HybridDenseTransformerModel` (Bonsai-2 27B and other qwen35 dense hybrids) owns its KV buffers behind the
+length-only `CudaHybridKvCacheHandle`. Per full-attention slot (16 of 64 layers for Bonsai-2: 4 KV heads x 256 dim,
+32,768 elements/token across slots):
+
+| storage | per token | at 64k |
+|---|---|---|
+| F16 (default) | 64 KiB | 4.0 GiB |
+| Q8_0 (`DOTLLM_HYBRID_KV=q8_0`) | ~34 KiB | ~2.2 GiB |
+| K8/V4 (`k8v4`) | ~26 KiB | ~1.7 GiB |
+| Q4_0 (`q4_0`) | ~18 KiB | ~1.15 GiB |
+
+- **F32 staging is shared and on demand.** Only the F32-consuming tiers (prefill `attention_f32`, opt-in/fallback decode
+  tiers) read F32 K/V. They get ONE staging pair shared by all layers, fully reconverted per use (512 MiB at 64k). The
+  default mma decode kernel reads the F16 cache directly and stages nothing. Before #956 every slot kept a persistent F32
+  mirror (128 KiB/token, power-of-two growth): 8 GiB at 64k, 16 GiB past 65,536.
+- **Quantized storage** (`--kv-quant-k/--kv-quant-v` or `DOTLLM_HYBRID_KV=f16|q8_0|q4_0|k8v4|k4v8`): rows are quantized on write
+  (`quant_f16_to_q{8,4}_0`, standard 32-element blocks) and read either by the **fused** decode kernel
+  (`attention_flash_mma_decode_gqa_split_kvq_*`, dequant inside the K/V tile load, bit-identical to the scratch path;
+  **default ON since #988's v2 kernels** — v1 fused measured slower than scratch, Q4_0 at ctx 16k 12.4 vs 13.3 tok/s, v2
+  reads whole blocks per quad and holds 18.5 tok/s flat from ctx 512 to 16k; `DOTLLM_HYBRID_KV_FUSED=0` opts out) or
+  by a dequant into one shared F16 scratch pair (used by prefill, the fallback tiers, and decode when fused is off).
+- **KV Q4_0 is not the GGUF Q4_0 layout.** KV blocks pack ADJACENT PAIRS (low nibble = even element), matching CPU
+  `KvQuantize` and `quant_kv.cu`; the weight dequant (`dequant_q4_0_f16`) unpacks low/high HALVES. Always use
+  `CudaKernels.LaunchKvDequantToF16` for KV data. (The eager `CudaQuantizedKvCache` path used the weight dequant until
+  #956, permuting elements inside every 32-block.)
+- **CLI selection (issue #967).** `run`, `bench` and `serve` accept `--kv-quant-k` / `--kv-quant-v` (`f16`, `q8_0`, `q4_0`);
+  on `run` and `serve` they are synonyms of `--cache-type-k/-v` (giving both with different values is an error).
+  `dotllm run --device gpu --kv-quant-k q8_0 --kv-quant-v q4_0` selects K8/V4. Precedence is **per side**:
+  explicit flag, then `DOTLLM_HYBRID_KV`, then F16 (so `--kv-quant-k q4_0` with `DOTLLM_HYBRID_KV=q8_0` gives K4/V8, and
+  `--kv-quant-k f16 --kv-quant-v f16` forces unquantized over the env var). `serve`'s `--cache-type-*` default is `f32`,
+  which cannot be told apart from "not given" and so leaves the env var in charge; pass `f16` to force unquantized.
+  The pure logic lives in `HybridKvStorage` (Core); the model exposes `ConfigureKvStorage(key, value)` (call before the
+  first forward), `KvStorageLabel`, `ComputeKvBytes(maxSeq)` and `KvAllocatedBytes`; the VRAM ledger and the `run`
+  summary share that byte math. `run` prints the effective format in the Memory box
+  (`KV Cache  ... (N slots, KV k8v4 (K:Q8_0 V:Q4_0), 1664 MiB)`), `bench` prints a `KV ...` line after the table and
+  records the flags in the results.csv settings column, `serve` logs `KV storage: ...` at startup.
+  - A flag the selected model/backend cannot honour prints a `WARNING` naming the flag, model and backend, never silence:
+    Vulkan (no quantized KV), split GPU/CPU hybrids, Qwen3MoeHybrid and Nemotron-H (own cache, no quantized storage), and
+    `bench` on CPU / plain CUDA models (its `SimpleKvCache` ignores them). `--cache-window` is ignored (warned) for the
+    hybrid-dense model: one format for the whole cache, no mixed-precision window.
+  - Rejected with an error (exit 1 / startup failure): TurboQuant on this model, and quantized storage when
+    `numKvHeads * headDim` is not a multiple of 32.
+- `DOTLLM_HYBRID_VRAM_LEDGER=1` logs the model-owned KV/staging/scratch bytes once after the first attention call.
+
 ## Paged KV-Cache
 
 Inspired by OS virtual memory paging. This is the **memory management** half of PagedAttention (vLLM): block-based allocation, ref counting, CoW. The **kernel** half (attention reading non-contiguous blocks directly) is opt-in on CUDA as of issue #200 (`DOTLLM_ATTN_PAGED_NATIVE=1`, decode only — see the CUDA section below); it remains a future step for CPU and any future Vulkan paged cache, where current kernels still see contiguous buffers via staging-buffer gather.
@@ -224,8 +270,8 @@ On each new token write, the oldest window entry is quantized and appended to th
 
 ### CLI
 ```
---cache-type-k q8_0    # key quantization (f32, q8_0, q4_0)
---cache-type-v q4_0    # value quantization (f32, q8_0, q4_0)
+--cache-type-k q8_0    # key quantization (f32, q8_0, q4_0); synonym --kv-quant-k (also on bench)
+--cache-type-v q4_0    # value quantization (f32, q8_0, q4_0); synonym --kv-quant-v (also on bench)
 --cache-window 64      # recent tokens in full precision (0 = all quantized)
 ```
 
@@ -423,3 +469,22 @@ precedence over the simple `PrefixCache` from Step 54. Both engine paths
   to make room is deferred to Step 59 (priority-based scheduling).
 - The trie walks linearly to find a node by block id during `Release`;
   good enough for typical depths (< 1024 blocks) but a future tweak.
+### Bonsai-2 quality gate and recommended format (#973)
+
+RTX 3060 12 GB, Bonsai-2 27B PQ2_0, flash prefill (#962), v2 decode + fused quantized decode (#988).
+Perplexity: `DOTLLM_HYBRID_KV=<fmt> dotllm perplexity <gguf> --device cuda --kv-cache f32 --context 512 --max-tokens 8192`
+(wikitext-2 test; without `--kv-cache` the CUDA hybrid-dense model scores cacheless over exact F32 K/V and is blind to KV format).
+Needles: 3 secrets at 10/50/90% depth, greedy; token counts are 18,011 / 35,888 / 71,811.
+
+| KV | PPL | vs F16 | needles 18k / 36k / 72k | peak VRAM 36k / 72k | decode tok/s @72k |
+|---|---:|---:|---|---|---:|
+| F16 | 10.2350 | - | 3/3, 3/3, does not fit | 11.7 GB / - | - |
+| Q8_0 | 10.2346 | -0.004% | 3/3, 3/3, 3/3 | 10.7 GB / **12.08 GB** | 18.1 |
+| K8V4 | 10.2529 | +0.18% | 3/3, 3/3, 3/3 | 10.5 GB / 11.5 GB | 17.1 |
+| Q4_0 | 10.2661 | +0.32% | 3/3, 3/3, 3/3 | 10.2 GB / 10.95 GB | 18.8 |
+
+Decode sweep (Q4_0, 64 tokens per point): 18.9 tok/s at ctx 512, 19.5 at 4k, 19.7 at 16k, 18.9 at 32k, 18.4 at 64k.
+
+**Recommendation (12 GB card):** Q8_0 up to ~36k (indistinguishable from F16, 1 GB headroom). Beyond that
+prefer K8V4 (+0.18% PPL, 11.5 GB at 72k) or Q4_0 (10.95 GB) - Q8_0 at 72k peaks at 12.08 GB of 12.29 and is
+one allocation from WDDM paging. Needle retrieval is a coarse test; the PPL deltas are the fine-grained signal.

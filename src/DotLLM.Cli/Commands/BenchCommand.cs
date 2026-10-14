@@ -28,7 +28,7 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
     /// <summary>Fixed seed prompt tiled to synthesize the benchmark prompt.</summary>
     internal const string DefaultSeedPrompt = "The quick brown fox jumps over the lazy dog. ";
 
-    public sealed class Settings : CommandSettings
+    public sealed class Settings : DotLLM.Cli.Helpers.KvQuantSettings
     {
         [CommandArgument(0, "<model>")]
         [Description("Path to a GGUF file or HuggingFace repo ID (e.g., QuantFactory/SmolLM-135M-GGUF).")]
@@ -93,6 +93,21 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         [DefaultValue(0)]
         public int NCpuMoeLayers { get; set; }
 
+        [CommandOption("--depth-list")]
+        [Description("Comma-separated context depths for multi-point sweep (e.g., 512,2048,8192). " +
+                     "Measures decode at each checkpoint in one process without reloading the model. " +
+                     "Mutually exclusive with --depth.")]
+        public string? DepthList { get; set; }
+
+        [CommandOption("--warmup")]
+        [Description("Number of warm-up repetitions to discard per checkpoint (default: 1). " +
+                     "Use 0 to skip warm-up entirely.")]
+        [DefaultValue(-1)]
+        public int Warmup { get; set; } = -1;
+
+        /// <summary>Effective warm-up rep count: <c>--warmup N</c> or 1 when unset.</summary>
+        public int EffectiveWarmup => Warmup < 0 ? 1 : Warmup;
+
         public override ValidationResult Validate()
         {
             if (PromptTokens <= 0) return ValidationResult.Error("--prompt-tokens|-p must be positive.");
@@ -100,9 +115,39 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
             if (Reps <= 0) return ValidationResult.Error("--reps|-r must be positive.");
             if (Depth < 0) return ValidationResult.Error("--depth must be >= 0.");
             if (NCpuMoeLayers < 0) return ValidationResult.Error("--n-cpu-moe must be >= 0.");
+            if (Warmup < -1) return ValidationResult.Error("--warmup must be >= 0.");
+            if (DepthList is not null && Depth > 0)
+                return ValidationResult.Error("--depth-list and --depth are mutually exclusive.");
+            if (DepthList is not null && !TryParseDepthList(DepthList, out _, out string? parseError))
+                return ValidationResult.Error(parseError!);
             if (DeviceCli.Validate(Device) is { } deviceError)
                 return ValidationResult.Error(deviceError);
             return ValidationResult.Success();
+        }
+
+        internal static bool TryParseDepthList(string input, out int[] depths, out string? error)
+        {
+            error = null;
+            depths = [];
+            var parts = input.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (parts.Length == 0)
+            {
+                error = "--depth-list requires at least one depth value.";
+                return false;
+            }
+            var parsed = new int[parts.Length];
+            for (int i = 0; i < parts.Length; i++)
+            {
+                if (!int.TryParse(parts[i], out int val) || val < 0)
+                {
+                    error = $"--depth-list: '{parts[i]}' is not a valid non-negative integer.";
+                    return false;
+                }
+                parsed[i] = val;
+            }
+            Array.Sort(parsed);
+            depths = parsed;
+            return true;
         }
     }
 
@@ -117,6 +162,12 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         if (!DeviceCli.TryResolveForTool(settings.Device, ggufPath, settings.Json, out string backend, out int gpuId))
             return 1;
 
+        if (!DotLLM.Cli.Helpers.KvStorageCli.TryBuild(null, null, settings.KvQuantK, settings.KvQuantV, 0, out var kvRequest, out var kvFlagError))
+        {
+            WriteError(settings, kvFlagError!);
+            return 1;
+        }
+
         using var gguf = GgufFile.Open(ggufPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
@@ -128,13 +179,20 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
             return 1;
         }
 
-        // Clamp the prompt so prompt + depth + decode (+ margin) fits the model context.
+        // Parse depth-list if provided; otherwise single-depth mode.
+        int[]? depthList = null;
+        if (settings.DepthList is not null)
+            Settings.TryParseDepthList(settings.DepthList, out depthList, out _);
+
+        int maxDepth = depthList is not null ? depthList[^1] : settings.Depth;
+
+        // Clamp the prompt so prompt + maxDepth + decode (+ margin) fits the model context.
         int promptLen = settings.PromptTokens;
-        int budget = config.MaxSequenceLength - settings.Depth - settings.GenTokens - 8;
+        int budget = config.MaxSequenceLength - maxDepth - settings.GenTokens - 8;
         if (budget <= 0)
         {
             WriteError(settings,
-                $"--depth {settings.Depth} + -n {settings.GenTokens} exceeds the model's max sequence " +
+                $"--depth {maxDepth} + -n {settings.GenTokens} exceeds the model's max sequence " +
                 $"length ({config.MaxSequenceLength}).");
             return 1;
         }
@@ -233,6 +291,25 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         }
         loadSw.Stop();
 
+        // #967: apply --kv-quant-k/-v to a CUDA hybrid-dense model; warn (never silently ignore) elsewhere.
+        if (kvRequest.IsSpecified)
+        {
+            var kvTarget = DotLLM.Cli.Helpers.KvStorageCli.Classify(model, vulkanDevice is not null);
+            foreach (var w in DotLLM.Cli.Helpers.KvStorageCli.Warnings(kvRequest, kvTarget, config.Architecture.ToString(), backend, engineCacheHonoured: false))
+                Console.Error.WriteLine($"WARNING: {w}");
+            try
+            {
+                DotLLM.Cli.Helpers.KvStorageCli.Apply(model, kvRequest);
+            }
+            catch (NotSupportedException e)
+            {
+                WriteError(settings, e.Message);
+                model.Dispose();
+                vulkanDevice?.Dispose();
+                return 1;
+            }
+        }
+
         if (HostResidencyProbe.Enabled)
             HostResidencyProbe.Report("after-load", mapBase, mapLength, vulkanDevice?.MemorySnapshot());
 
@@ -255,23 +332,32 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
 
         try
         {
+            string quant = BenchEnvironment.InferQuantLabel(ggufPath, settings.Quant);
+            string modelName = BenchEnvironment.InferModelName(ggufPath, quant);
+            string runtimeVersion = BenchEnvironment.ResolveRuntimeVersion();
+            string host = Environment.MachineName.ToLowerInvariant();
+            double loadMs = loadSw.Elapsed.TotalMilliseconds;
+            int warmupReps = settings.EffectiveWarmup;
+
+            if (depthList is not null)
+                return ExecuteDepthList(settings, depthList, model, kvFactory, promptTokens, warmupReps,
+                    loadMs, mapBase, mapLength, vulkanDevice,
+                    ggufPath, quant, modelName, runtimeVersion, host, backend, deviceLabel, config);
+
             var result = BenchRunner.Run(
                 model, kvFactory, promptTokens,
                 decodeTokens: settings.GenTokens,
                 reps: settings.Reps,
                 depth: settings.Depth,
-                loadMs: loadSw.Elapsed.TotalMilliseconds);
+                loadMs: loadMs,
+                warmupReps: warmupReps);
 
             if (HostResidencyProbe.Enabled)
                 HostResidencyProbe.Report("after-decode", mapBase, mapLength, vulkanDevice?.MemorySnapshot());
 
-            string quant = BenchEnvironment.InferQuantLabel(ggufPath, settings.Quant);
-            string modelName = BenchEnvironment.InferModelName(ggufPath, quant);
-            string runtimeVersion = BenchEnvironment.ResolveRuntimeVersion();
-            string host = Environment.MachineName.ToLowerInvariant();
-
             string settingsSummary = BuildSettingsSummary(settings, result, backend);
-            string notes = $"pp{result.PromptTokens}/tg{result.DecodeTokens} r{settings.Reps} warmup-discarded; " +
+            string notes = $"pp{result.PromptTokens}/tg{result.DecodeTokens} r{settings.Reps} " +
+                           $"warmup={warmupReps}; " +
                            $"tg best {BenchStats.FormatTokS(result.DecodeTokSBest)}; load {result.LoadMs:F0} ms";
             string csvRow = BenchCsv.FormatRow(
                 DateOnly.FromDateTime(DateTime.Now), host, SanitizeLabel(deviceLabel), backend,
@@ -281,37 +367,15 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
 
             if (settings.Json)
             {
-                var json = new BenchJsonResult
-                {
-                    Model = modelName,
-                    ModelPath = ggufPath,
-                    Quant = quant,
-                    Backend = backend,
-                    Device = deviceLabel,
-                    Host = host,
-                    Commit = runtimeVersion,
-                    LoadMs = Math.Round(result.LoadMs, 1),
-                    PromptTokens = result.PromptTokens,
-                    DecodeTokens = result.DecodeTokens,
-                    Depth = result.Depth,
-                    DecodeCtxDepth = result.DecodeCtxDepth,
-                    Warmup = BenchJsonRep.From(result.Warmup),
-                    Reps = result.Reps.Select(BenchJsonRep.From).ToArray(),
-                    PrefillTokSMedian = Math.Round(result.PrefillTokSMedian, 2),
-                    PrefillTokSBest = Math.Round(result.PrefillTokSBest, 2),
-                    DecodeTokSMedian = Math.Round(result.DecodeTokSMedian, 2),
-                    DecodeTokSBest = Math.Round(result.DecodeTokSBest, 2),
-                    PrefillMsMedian = Math.Round(result.PrefillMsMedian, 2),
-                    PrefillMsMin = Math.Round(result.PrefillMsMin, 2),
-                    DecodeMsMedian = Math.Round(result.DecodeMsMedian, 2),
-                    DecodeMsMin = Math.Round(result.DecodeMsMin, 2),
-                    CsvRow = csvRow,
-                };
-                Console.WriteLine(JsonSerializer.Serialize(json, CliJsonContext.Default.BenchJsonResult));
+                Console.WriteLine(JsonSerializer.Serialize(
+                    BuildJsonResult(result, modelName, ggufPath, quant, backend, deviceLabel, host, runtimeVersion, csvRow),
+                    CliJsonContext.Default.BenchJsonResult));
             }
             else
             {
                 RenderTable(settings, config, result, modelName, quant, backend, deviceLabel, runtimeVersion, csvRow);
+                if (DotLLM.Cli.Helpers.KvStorageCli.Describe(model, result.PromptTokens + result.Depth + result.DecodeTokens) is { } kvInfo)
+                    AnsiConsole.MarkupLine($"  [dim]{Markup.Escape(kvInfo.Text)}[/]");
             }
 
             return 0;
@@ -321,6 +385,117 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
             model.Dispose();
             vulkanDevice?.Dispose();
         }
+    }
+
+    private static int ExecuteDepthList(
+        Settings settings, int[] depthList, IModel model, Func<int, IKvCache> kvFactory,
+        int[] promptTokens, int warmupReps, double loadMs,
+        nint mapBase, long mapLength, DotLLM.Vulkan.VulkanDevice? vulkanDevice,
+        string ggufPath, string quant, string modelName, string runtimeVersion,
+        string host, string backend, string deviceLabel, ModelConfig config)
+    {
+        var jsonResults = new BenchJsonResult[depthList.Length];
+
+        for (int di = 0; di < depthList.Length; di++)
+        {
+            int depth = depthList[di];
+            if (!settings.Json)
+                AnsiConsole.MarkupLine($"[grey]depth-list checkpoint {di + 1}/{depthList.Length}: depth={depth}[/]");
+
+            var result = BenchRunner.Run(
+                model, kvFactory, promptTokens,
+                decodeTokens: settings.GenTokens,
+                reps: settings.Reps,
+                depth: depth,
+                loadMs: loadMs,
+                warmupReps: warmupReps);
+
+            string settingsSummary = BuildSettingsSummary(settings, result, backend);
+            string notes = $"pp{result.PromptTokens}/tg{result.DecodeTokens} r{settings.Reps} " +
+                           $"warmup={warmupReps} depth-list[{di}]; " +
+                           $"tg best {BenchStats.FormatTokS(result.DecodeTokSBest)}; load {result.LoadMs:F0} ms";
+            string csvRow = BenchCsv.FormatRow(
+                DateOnly.FromDateTime(DateTime.Now), host, SanitizeLabel(deviceLabel), backend,
+                runtimeVersion, modelName, quant,
+                result.PrefillTokSMedian, result.DecodeTokSMedian, result.DecodeCtxDepth,
+                settingsSummary, notes);
+
+            jsonResults[di] = BuildJsonResult(result, modelName, ggufPath, quant, backend, deviceLabel, host, runtimeVersion, csvRow);
+
+            if (!settings.Json)
+                RenderTable(settings, config, result, modelName, quant, backend, deviceLabel, runtimeVersion, csvRow);
+        }
+
+        if (HostResidencyProbe.Enabled)
+            HostResidencyProbe.Report("after-decode", mapBase, mapLength, vulkanDevice?.MemorySnapshot());
+
+        if (settings.Json)
+        {
+            Console.WriteLine(JsonSerializer.Serialize(jsonResults, CliJsonContext.Default.BenchJsonResultArray));
+        }
+        else
+        {
+            RenderSweepSummary(depthList, jsonResults, modelName, quant, backend, deviceLabel);
+        }
+
+        return 0;
+    }
+
+    private static BenchJsonResult BuildJsonResult(
+        BenchResult result, string modelName, string modelPath,
+        string quant, string backend, string device, string host,
+        string commit, string csvRow) => new()
+    {
+        Model = modelName,
+        ModelPath = modelPath,
+        Quant = quant,
+        Backend = backend,
+        Device = device,
+        Host = host,
+        Commit = commit,
+        LoadMs = Math.Round(result.LoadMs, 1),
+        PromptTokens = result.PromptTokens,
+        DecodeTokens = result.DecodeTokens,
+        Depth = result.Depth,
+        DecodeCtxDepth = result.DecodeCtxDepth,
+        Warmup = result.Warmup is { } w ? BenchJsonRep.From(w) : null,
+        Reps = result.Reps.Select(BenchJsonRep.From).ToArray(),
+        PrefillTokSMedian = Math.Round(result.PrefillTokSMedian, 2),
+        PrefillTokSBest = Math.Round(result.PrefillTokSBest, 2),
+        DecodeTokSMedian = Math.Round(result.DecodeTokSMedian, 2),
+        DecodeTokSBest = Math.Round(result.DecodeTokSBest, 2),
+        PrefillMsMedian = Math.Round(result.PrefillMsMedian, 2),
+        PrefillMsMin = Math.Round(result.PrefillMsMin, 2),
+        DecodeMsMedian = Math.Round(result.DecodeMsMedian, 2),
+        DecodeMsMin = Math.Round(result.DecodeMsMin, 2),
+        CsvRow = csvRow,
+    };
+
+    private static void RenderSweepSummary(
+        int[] depthList, BenchJsonResult[] results, string modelName,
+        string quant, string backend, string deviceLabel)
+    {
+        AnsiConsole.WriteLine();
+        AnsiConsole.Write(new Rule($"[grey]depth-list sweep summary | {Markup.Escape(modelName)} {quant} | {backend} ({Markup.Escape(deviceLabel)})[/]").LeftJustified());
+
+        var table = new Table().Border(TableBorder.Rounded);
+        table.AddColumn("depth");
+        table.AddColumn(new TableColumn("ctx depth").RightAligned());
+        table.AddColumn(new TableColumn("pp tok/s").RightAligned());
+        table.AddColumn(new TableColumn("tg tok/s").RightAligned());
+        table.AddColumn(new TableColumn("tg best").RightAligned());
+
+        for (int i = 0; i < depthList.Length; i++)
+        {
+            table.AddRow(
+                depthList[i].ToString(),
+                results[i].DecodeCtxDepth.ToString(),
+                BenchStats.FormatTokS(results[i].PrefillTokSMedian),
+                $"[bold green]{BenchStats.FormatTokS(results[i].DecodeTokSMedian)}[/]",
+                BenchStats.FormatTokS(results[i].DecodeTokSBest));
+        }
+
+        AnsiConsole.Write(table);
     }
 
     private static void RenderTable(
@@ -340,12 +515,15 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         table.AddColumn(new TableColumn("decode ms").RightAligned());
         table.AddColumn(new TableColumn("tg tok/s").RightAligned());
 
-        table.AddRow(
-            "[dim]warmup[/]",
-            $"[dim]{result.Warmup.PrefillMs:F1}[/]",
-            $"[dim]{result.Warmup.PrefillTokS:F2}[/]",
-            $"[dim]{result.Warmup.DecodeMs:F1}[/]",
-            $"[dim]{result.Warmup.DecodeTokS:F2}[/]");
+        if (result.Warmup is { } warmup)
+        {
+            table.AddRow(
+                "[dim]warmup[/]",
+                $"[dim]{warmup.PrefillMs:F1}[/]",
+                $"[dim]{warmup.PrefillTokS:F2}[/]",
+                $"[dim]{warmup.DecodeMs:F1}[/]",
+                $"[dim]{warmup.DecodeTokS:F2}[/]");
+        }
         for (int i = 0; i < result.Reps.Count; i++)
         {
             var r = result.Reps[i];
@@ -379,6 +557,8 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         if (result.Depth > 0) parts.Add($"--depth {result.Depth}");
         if (settings.Threads > 0) parts.Add($"--threads {settings.Threads}");
         if (settings.DecodeThreads > 0) parts.Add($"--decode-threads {settings.DecodeThreads}");
+        if (settings.KvQuantK is not null) parts.Add($"--kv-quant-k {settings.KvQuantK}");
+        if (settings.KvQuantV is not null) parts.Add($"--kv-quant-v {settings.KvQuantV}");
         return string.Join(" ", parts);
     }
 

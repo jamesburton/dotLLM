@@ -37,7 +37,7 @@ internal static class DecodeKl
     {
         switch (args[1])
         {
-            case "dump": Dump(args[2], args[3], args[4]); return 0;
+            case "dump": Dump(args[2], args[3], args[4], args.Length > 5 ? int.Parse(args[5]) : 1); return 0;
             case "cmp": Compare(args[2], args[3], int.Parse(args[4]), args.Length > 5 ? args[5] : "test"); return 0;
             case "margin": Margin(args[2], int.Parse(args[3]), args[4..7], args.Length > 7 ? args[7].Split(',') : new[] { "A", "B", "C" }); return 0;
             default: Console.WriteLine("decodekl dump|cmp|margin"); return 1;
@@ -50,7 +50,7 @@ internal static class DecodeKl
         return Texts.Select(t => tk.Encode(t).ToArray()).ToArray();
     }
 
-    private static unsafe void Dump(string ggufPath, string backend, string outPath)
+    private static unsafe void Dump(string ggufPath, string backend, string outPath, int chunk = 1)
     {
         using var gguf = GgufFile.Open(ggufPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
@@ -70,17 +70,25 @@ internal static class DecodeKl
             (model, kvFactory) = DotLLM.Vulkan.VulkanModelLoader.CreateFromGguf(dev, gguf, config, Path.Combine(AppContext.BaseDirectory, "spv"), 0);
         }
         int vocab = config.VocabSize;
+        if (chunk > 1)
+        {
+            // Batched-row dump (#996): the same teacher-forced steps fed `chunk` tokens per forward (speculative-verify / batched-decode shape), all-row logits,
+            // written in the same step order as the 1-row dump so `cmp` pairs them step for step.
+            if (model is not DotLLM.Vulkan.VulkanTransformerModel vm || !vm.TrySetAllRowLogitsLimit(chunk)) throw new InvalidOperationException("chunked dump needs the generic Vulkan model with all-row logits");
+        }
         using var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.Read, 1 << 20);
         var sw = System.Diagnostics.Stopwatch.StartNew();
         int step = 0;
         foreach (var ids in seqs)
         {
             using var cache = kvFactory(ids.Length + 8);
-            for (int i = 0; i < ids.Length; i++)
+            for (int i = 0; i < ids.Length; i += chunk)
             {
-                using ITensor t = model.Forward(ids.AsSpan(i, 1), new[] { i }, backend == "cpu" ? -1 : 0, cache);
-                fs.Write(new ReadOnlySpan<byte>((void*)t.DataPointer, vocab * 4));
-                step++;
+                int n = Math.Min(chunk, ids.Length - i);
+                using ITensor t = model.Forward(ids.AsSpan(i, n), Enumerable.Range(i, n).ToArray(), backend == "cpu" ? -1 : 0, cache);
+                if (n > 1 && t.Shape[0] != n) throw new InvalidOperationException($"expected {n} logits rows, got {t.Shape[0]}");
+                fs.Write(new ReadOnlySpan<byte>((void*)t.DataPointer, n * vocab * 4));
+                step += n;
             }
             Console.WriteLine($"  seq done, {step} steps, {sw.Elapsed.TotalSeconds:F0} s");
         }

@@ -58,8 +58,9 @@ public sealed class BenchRunnerTests
         Assert.Equal(123.4, result.LoadMs, 3);
 
         // Warm-up rep exists and was actually measured.
-        Assert.True(result.Warmup.PrefillMs > 0);
-        Assert.True(result.Warmup.DecodeMs > 0);
+        Assert.NotNull(result.Warmup);
+        Assert.True(result.Warmup.Value.PrefillMs > 0);
+        Assert.True(result.Warmup.Value.DecodeMs > 0);
 
         // Every measured rep has positive timings and throughput.
         foreach (var rep in result.Reps)

@@ -11,6 +11,8 @@ public enum QuantGemvMultiFormat
     Q5_K,
     /// <summary>Q6_K, 210-byte super-blocks.</summary>
     Q6_K,
+    /// <summary>Q6_K, 210-byte super-blocks, two output rows per workgroup sharing the activation loads (#996; faster than <see cref="Q6_K"/> at 3..4 columns).</summary>
+    Q6_K_R2,
     /// <summary>IQ4_XS, 136-byte super-blocks.</summary>
     IQ4_XS,
     /// <summary>IQ3_S, 110-byte super-blocks (needs the shared grid codebook).</summary>
@@ -61,6 +63,7 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
         QuantGemvMultiFormat.Q4_K => ("matmul_q4_k_gemv_f32_multi.spv", 144, 3, true),
         QuantGemvMultiFormat.Q5_K => ("matmul_q5_k_gemv_f32_multi.spv", 176, 3, true),
         QuantGemvMultiFormat.Q6_K => ("matmul_q6_k_gemv_f32_multi.spv", 210, 3, true),
+        QuantGemvMultiFormat.Q6_K_R2 => ("matmul_q6_k_gemv_f32_multi_r2.spv", 210, 3, true),
         QuantGemvMultiFormat.IQ4_XS => ("matmul_iq4_xs_f32_gemv_multi.spv", 136, 3, false),
         QuantGemvMultiFormat.IQ3_S => ("matmul_iq3_s_f32_gemv_multi.spv", 110, 4, false),
         _ => throw new ArgumentOutOfRangeException(nameof(f)),
@@ -110,7 +113,7 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
         Span<uint> pc = stackalloc uint[4] { (uint)m, (uint)k, (uint)blocksPerRow, (uint)((rowBytes + 3) / 4) };
         fixed (uint* p = pc)
             VulkanApi.vkCmdPushConstants(cmdBuf, pipe.Layout, VkShaderStageFlags.Compute, 0, PushConstantBytes, (nint)p);
-        VulkanApi.vkCmdDispatch(cmdBuf, (uint)m, 1, 1);
+        VulkanApi.vkCmdDispatch(cmdBuf, Format == QuantGemvMultiFormat.Q6_K_R2 ? (uint)((m + 1) / 2) : (uint)m, 1, 1);
     }
 
     /// <inheritdoc/>

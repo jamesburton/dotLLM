@@ -40,7 +40,7 @@ public class VulkanQuantGemvMultiKernelTests
         {
             QuantGemvMultiFormat.Q4_K => (144, new[] { 0, 2 }),
             QuantGemvMultiFormat.Q5_K => (176, new[] { 0, 2 }),
-            QuantGemvMultiFormat.Q6_K => (210, new[] { 208 }),
+            QuantGemvMultiFormat.Q6_K or QuantGemvMultiFormat.Q6_K_R2 => (210, new[] { 208 }),
             QuantGemvMultiFormat.IQ4_XS => (136, new[] { 0 }),
             _ => (110, new[] { 0 }),
         };
@@ -66,7 +66,7 @@ public class VulkanQuantGemvMultiKernelTests
         {
             case QuantGemvMultiFormat.Q4_K: { var r = MatMulQ4KGemvF32Kernel.Create(device, spvDir); refKernel = r; single = (w, xx, yy) => r.Launch(w, xx, yy, m, k); break; }
             case QuantGemvMultiFormat.Q5_K: { var r = MatMulQ5KGemvF32Kernel.Create(device, spvDir); refKernel = r; single = (w, xx, yy) => r.Launch(w, xx, yy, m, k); break; }
-            case QuantGemvMultiFormat.Q6_K: { var r = MatMulQ6KGemvF32Kernel.Create(device, spvDir); refKernel = r; single = (w, xx, yy) => r.Launch(w, xx, yy, m, k); break; }
+            case QuantGemvMultiFormat.Q6_K or QuantGemvMultiFormat.Q6_K_R2: { var r = MatMulQ6KGemvF32Kernel.Create(device, spvDir); refKernel = r; single = (w, xx, yy) => r.Launch(w, xx, yy, m, k); break; }
             case QuantGemvMultiFormat.IQ4_XS: { var r = MatMulIq4XsGemvF32Kernel.Create(device, spvDir); refKernel = r; single = (w, xx, yy) => r.Launch(w, xx, yy, m, k); break; }
             default: { var r = MatMulIq3SGemvF32Kernel.Create(device, spvDir); refKernel = r; codebook = r.GridBuffer; single = (w, xx, yy) => r.Launch(w, xx, yy, m, k); break; }
         }
@@ -100,6 +100,12 @@ public class VulkanQuantGemvMultiKernelTests
     [InlineData(QuantGemvMultiFormat.Q5_K, 40, 2560, 8)]
     [InlineData(QuantGemvMultiFormat.Q6_K, 64, 1024, 2)]
     [InlineData(QuantGemvMultiFormat.Q6_K, 40, 2560, 5)]     // 4 super-blocks per 64-lane step: 10 blocks leave a partial window
+    // Two output rows per workgroup (#996): odd M (the lone last row), a single super-block, partial windows, every column count the dispatcher can pick.
+    [InlineData(QuantGemvMultiFormat.Q6_K_R2, 64, 1024, 3)]
+    [InlineData(QuantGemvMultiFormat.Q6_K_R2, 33, 2560, 4)]
+    [InlineData(QuantGemvMultiFormat.Q6_K_R2, 17, 256, 8)]
+    [InlineData(QuantGemvMultiFormat.Q6_K_R2, 40, 2560, 2)]
+    [InlineData(QuantGemvMultiFormat.Q6_K_R2, 1, 4096, 4)]
     [InlineData(QuantGemvMultiFormat.IQ4_XS, 64, 1024, 4)]
     [InlineData(QuantGemvMultiFormat.IQ4_XS, 48, 2560, 7)]
     [InlineData(QuantGemvMultiFormat.IQ3_S, 64, 1024, 2)]

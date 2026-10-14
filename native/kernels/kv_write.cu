@@ -125,6 +125,33 @@ extern "C" __global__ void kv_dequant_q4_0_dyn(
     }
 }
 
+// Eager (non-graph) dequant of a contiguous run of KV-format Q4_0 blocks.
+//
+// The KV Q4_0 convention is ADJACENT PAIRS (low nibble = even element, high nibble = odd
+// element) -- what quant_f16_to_q4_0 / the CPU KvQuantize write and kv_dequant_q4_0_dyn above
+// reads. It is NOT the GGUF/ggml weight layout (low nibbles = elements 0..15, high = 16..31)
+// that the generic dequant_q4_0_f16 in dequant.cu unpacks. Using the generic kernel on KV
+// data permutes elements inside every 32-block (issue #956).
+extern "C" __global__ void kv_dequant_q4_0(
+    const uint8_t* __restrict__ quant_base,
+    half* __restrict__ dst,
+    const int total_blocks)
+{
+    int lane = threadIdx.x % KV_Q4_0_BLOCK_SIZE;
+    int warp_in_block = threadIdx.x / KV_Q4_0_BLOCK_SIZE;
+    int warps_per_grid = (gridDim.x * blockDim.x) / KV_Q4_0_BLOCK_SIZE;
+    int start_block = blockIdx.x * (blockDim.x / KV_Q4_0_BLOCK_SIZE) + warp_in_block;
+
+    for (int block_idx = start_block; block_idx < total_blocks; block_idx += warps_per_grid)
+    {
+        const uint8_t* block = quant_base + (size_t)block_idx * KV_Q4_0_BLOCK_BYTES;
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        uint8_t packed = (block + 2)[lane / 2];
+        int val = (lane & 1) ? ((int)(packed >> 4) - 8) : ((int)(packed & 0x0F) - 8);
+        dst[(size_t)block_idx * KV_Q4_0_BLOCK_SIZE + lane] = __float2half(d * (float)val);
+    }
+}
+
 // Scatters the live FP16 window from the per-layer ring buffer into the
 // contiguous attention scratch starting at scratch row `quant_len`. One
 // CUDA block per ring slot — each block decides whether its slot is live

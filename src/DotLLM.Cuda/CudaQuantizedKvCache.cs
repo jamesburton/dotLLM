@@ -395,15 +395,9 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache
         if (_quantizedLength > 0)
         {
             int totalElements = _quantizedLength * stride;
-            kernels.LaunchDequantToF16(
-                _keysQuant[layerIndex],
-                KeyDType == KvCacheDType.Q8_0 ? Core.Configuration.QuantizationType.Q8_0 : Core.Configuration.QuantizationType.Q4_0,
-                _kScratch, totalElements, stream);
-
-            kernels.LaunchDequantToF16(
-                _valuesQuant[layerIndex],
-                ValueDType == KvCacheDType.Q8_0 ? Core.Configuration.QuantizationType.Q8_0 : Core.Configuration.QuantizationType.Q4_0,
-                _vScratch, totalElements, stream);
+            // KV-format dequant, NOT the GGUF weight dequant: KV Q4_0 packs adjacent pairs (issue #956).
+            kernels.LaunchKvDequantToF16(_keysQuant[layerIndex], KeyDType, _kScratch, totalElements, stream);
+            kernels.LaunchKvDequantToF16(_valuesQuant[layerIndex], ValueDType, _vScratch, totalElements, stream);
         }
 
         // Phase 2: Copy window region → scratch[quantizedLength..currentLength)

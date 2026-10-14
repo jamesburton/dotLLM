@@ -351,6 +351,7 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _kvWriteOneF16RingFunc;
     private readonly nint _kvDequantQ8_0DynFunc;
     private readonly nint _kvDequantQ4_0DynFunc;
+    private readonly nint _kvDequantQ4_0Func;
     private readonly nint _kvWindowToScratchDynFunc;
 
     // Fused decode-step RoPE + KV-cache write. Replaces three eager launches per
@@ -546,8 +547,40 @@ public sealed unsafe class CudaKernels : IDisposable
     // PTX, Ampere-only (mma.sync is sm_80+).
     private readonly CudaModule? _attentionMmaDecodeGqaSplitModule;
     private readonly nint _attentionMmaDecodeGqaSplitFunc;
+
+    // Quantized-KV fused-dequant variants of the mma decode kernel (issue #956), indexed by
+    // KvqIndex(kDtype, vDtype): 0 = q8q8, 1 = q4q4, 2 = q8q4, 3 = q4q8. Best-effort load: absent
+    // PTX or a pre-Ampere driver leaves them 0 and callers fall back to dequant-into-scratch.
+    // Tensor-core flash-style PREFILL attention for head_dim 256 reading the F16 KV cache directly
+    // (issue #962 -- native/kernels/attention_flash_mma_prefill_hd256.cu). Best-effort load,
+    // Ampere-only; absent/unloadable leaves the func 0 and callers fall back to attention_f32.
+    private readonly CudaModule? _attentionFlashPrefillHd256Module;
+    private readonly nint _attentionFlashPrefillHd256Func;
+
+    private readonly CudaModule? _attentionMmaDecodeKvqModule;
+    private readonly nint[] _attentionMmaDecodeKvqFuncs = new nint[4];
+    private readonly int[] _attentionMmaDecodeKvqMaxCoResident = { -1, -1, -1, -1 };
     private int _attnMmaDecodeGqaSplitMaxCoResidentGrid = -1; // -1 = not yet queried
     private int _attnMmaDecodeGqaSplitCachedGroup = -1;        // group the cached query above is valid for
+
+    // Issue #988: v2 (warp-independent, register-resident) decode kernels living in the same PTX
+    // modules as the v1 kernels above. v1 stays loaded as the DOTLLM_ATTN_MMA_DECODE_V2=0 fallback.
+    private nint _attentionMmaDecodeGqaSplitV2Func;
+    private readonly nint[] _attentionMmaDecodeKvqV2Funcs = new nint[4];
+    private readonly int[] _attentionMmaDecodeKvqV2MaxCoResident = { -1, -1, -1, -1 };
+    private int _attnMmaDecodeGqaSplitV2MaxCoResidentGrid = -1;
+
+    /// <summary>
+    /// Issue #988: selects the v2 mma decode kernels (default ON; <c>DOTLLM_ATTN_MMA_DECODE_V2=0</c>
+    /// opts back out to v1). Mutable so tests/benchmarks can A/B within one process; the
+    /// per-function co-residency ceilings are cached separately so toggling is safe.
+    /// </summary>
+    public static bool MmaDecodeV2Enabled =
+        Environment.GetEnvironmentVariable("DOTLLM_ATTN_MMA_DECODE_V2") != "0";
+
+    private bool UseMmaDecodeV2 => MmaDecodeV2Enabled && _attentionMmaDecodeGqaSplitV2Func != 0;
+    private nint ActiveMmaDecodeFunc => UseMmaDecodeV2 ? _attentionMmaDecodeGqaSplitV2Func : _attentionMmaDecodeGqaSplitFunc;
+    private bool UseMmaDecodeKvqV2(int idx) => MmaDecodeV2Enabled && _attentionMmaDecodeKvqV2Funcs[idx] != 0;
 
 
     /// <summary>
@@ -1068,6 +1101,7 @@ public sealed unsafe class CudaKernels : IDisposable
             _kvWriteOneF16RingFunc = _kvWriteModule.GetFunction("kv_write_one_f16_ring");
             _kvDequantQ8_0DynFunc = _kvWriteModule.GetFunction("kv_dequant_q8_0_dyn");
             _kvDequantQ4_0DynFunc = _kvWriteModule.GetFunction("kv_dequant_q4_0_dyn");
+            _kvDequantQ4_0Func = _kvWriteModule.TryGetFunction("kv_dequant_q4_0");
             _kvWindowToScratchDynFunc = _kvWriteModule.GetFunction("kv_window_to_scratch_dyn");
         }
 
@@ -1318,12 +1352,65 @@ public sealed unsafe class CudaKernels : IDisposable
             {
                 var mmaDecodeGqaSplitModule = CudaModule.LoadFromFile(attentionMmaDecodeGqaSplitPath);
                 _attentionMmaDecodeGqaSplitFunc = mmaDecodeGqaSplitModule.TryGetFunction("attention_flash_mma_decode_gqa_split_f16");
+                _attentionMmaDecodeGqaSplitV2Func = mmaDecodeGqaSplitModule.TryGetFunction("attention_flash_mma_decode_gqa_split_f16_v2");
                 _attentionMmaDecodeGqaSplitModule = mmaDecodeGqaSplitModule;
             }
             catch (CudaException)
             {
                 _attentionMmaDecodeGqaSplitModule = null;
                 _attentionMmaDecodeGqaSplitFunc = 0;
+                _attentionMmaDecodeGqaSplitV2Func = 0;
+            }
+        }
+
+        string attentionMmaDecodeKvqPath = Path.Combine(ptxDir, "attention_flash_mma_decode_gqa_split_kvq.ptx");
+        if (File.Exists(attentionMmaDecodeKvqPath))
+        {
+            try
+            {
+                var kvqModule = CudaModule.LoadFromFile(attentionMmaDecodeKvqPath);
+                string[] names =
+                {
+                    "attention_flash_mma_decode_gqa_split_kvq_q8q8",
+                    "attention_flash_mma_decode_gqa_split_kvq_q4q4",
+                    "attention_flash_mma_decode_gqa_split_kvq_q8q4",
+                    "attention_flash_mma_decode_gqa_split_kvq_q4q8",
+                };
+                for (int i = 0; i < names.Length; i++)
+                {
+                    _attentionMmaDecodeKvqFuncs[i] = kvqModule.TryGetFunction(names[i]);
+                    _attentionMmaDecodeKvqV2Funcs[i] = kvqModule.TryGetFunction(
+                        names[i].Replace("_kvq_", "_kvq_v2_"));
+                }
+                _attentionMmaDecodeKvqModule = kvqModule;
+            }
+            catch (CudaException)
+            {
+                _attentionMmaDecodeKvqModule = null;
+                Array.Clear(_attentionMmaDecodeKvqFuncs);
+                Array.Clear(_attentionMmaDecodeKvqV2Funcs);
+            }
+        }
+
+        // Flash-style tensor-core prefill attention, head_dim 256 (issue #962). Same best-effort
+        // pattern as the decode kernels above: mma.sync/cp.async PTX is sm_80+, so a pre-Ampere
+        // device (or stale PTX) throws CudaException at module load and the feature stays off.
+        string attentionFlashPrefillHd256Path = Path.Combine(ptxDir, "attention_flash_mma_prefill_hd256.ptx");
+        if (File.Exists(attentionFlashPrefillHd256Path))
+        {
+            try
+            {
+                var m = CudaModule.LoadFromFile(attentionFlashPrefillHd256Path);
+                nint f = m.TryGetFunction("attention_flash_mma_prefill_hd256_f16");
+                if (f != 0)
+                    SetMaxDynamicSharedBytes(f, AttentionFlashPrefillHd256MaxSmemBytes);
+                _attentionFlashPrefillHd256Func = f;
+                _attentionFlashPrefillHd256Module = m;
+            }
+            catch (CudaException)
+            {
+                _attentionFlashPrefillHd256Module = null;
+                _attentionFlashPrefillHd256Func = 0;
             }
         }
     }
@@ -1339,6 +1426,71 @@ public sealed unsafe class CudaKernels : IDisposable
         && _scaleInplaceF32Func != 0 && _rmsnormWeightlessF32Func != 0
         && _softcapInplaceF32Func != 0 && _moeRenormTopkClampedF32Func != 0
         && _quantizeActQ8_0RoundtripF32Func != 0;
+
+    /// <summary>
+    /// True when the head_dim-256 tensor-core flash prefill kernel (issue #962,
+    /// <c>attention_flash_mma_prefill_hd256.ptx</c>) is loaded on this device.
+    /// </summary>
+    public bool HasAttentionFlashPrefillHd256 => _attentionFlashPrefillHd256Func != 0;
+
+    /// <summary>Largest dynamic shared memory the flash prefill hd256 kernel is opted into (99 KB sm_86 cap).</summary>
+    public const int AttentionFlashPrefillHd256MaxSmemBytes = 99 * 1024;
+
+    /// <summary>KV rows per pipeline stage the kernel was compiled with -- MUST match <c>KV_TILE</c> in the .cu.</summary>
+    public const int AttentionFlashPrefillHd256KvTile = 16;
+
+    /// <summary>Double-buffered K/V stages -- MUST match <c>NBUF</c> in the .cu.</summary>
+    public const int AttentionFlashPrefillHd256NumBuf = 2;
+
+    /// <summary>
+    /// Opt-out gate: <c>DOTLLM_ATTN_FLASH_PREFILL_HD256=0</c> forces the attention_f32 prefill
+    /// path. Read once; default ON (issue #962).
+    /// </summary>
+    public static readonly bool EnableAttentionFlashPrefillHd256 =
+        Environment.GetEnvironmentVariable("DOTLLM_ATTN_FLASH_PREFILL_HD256") != "0";
+
+    /// <summary>Dynamic shared memory the kernel needs for a GQA <paramref name="group"/>.</summary>
+    public static int AttentionFlashPrefillHd256SmemBytes(int group)
+        => (group * 16 * (256 + 8) + AttentionFlashPrefillHd256NumBuf * 2 * AttentionFlashPrefillHd256KvTile * (256 + 8)) * 2;
+
+    /// <summary>
+    /// Pure shape check for <see cref="LaunchAttentionFlashPrefillHd256"/>: head_dim 256, real GQA
+    /// (numKvHeads &lt; numHeads, evenly divisible), group &lt;= 8 and the shared-memory footprint fits
+    /// the opt-in cap. Does not check whether the kernel is loaded.
+    /// </summary>
+    public static bool IsAttentionFlashPrefillHd256Shape(int numHeads, int numKvHeads, int headDim)
+    {
+        if (headDim != 256 || numKvHeads <= 0 || numKvHeads >= numHeads || numHeads % numKvHeads != 0) return false;
+        int group = numHeads / numKvHeads;
+        return group <= 8 && AttentionFlashPrefillHd256SmemBytes(group) <= AttentionFlashPrefillHd256MaxSmemBytes;
+    }
+
+    /// <summary>
+    /// Flash-style tensor-core causal prefill attention (issue #962). <paramref name="q"/> is F16
+    /// <c>[seqQ, numHeads*256]</c>, <paramref name="k"/>/<paramref name="v"/> are the F16 KV history
+    /// <c>[seqKv, numKvHeads*256]</c>, <paramref name="output"/> is F32 <c>[seqQ, numHeads*256]</c> --
+    /// the same output contract as <see cref="LaunchAttentionF32"/>. Query row i attends keys
+    /// <c>0..positionOffset+i</c>. <paramref name="scale"/> 0 means <c>1/sqrt(256)</c>.
+    /// </summary>
+    public void LaunchAttentionFlashPrefillHd256(nint q, nint k, nint v, nint output,
+        int seqQ, int seqKv, int numHeads, int numKvHeads, int positionOffset, nint stream,
+        float scale = 0f)
+    {
+        if (_attentionFlashPrefillHd256Func == 0)
+            throw new InvalidOperationException("attention_flash_mma_prefill_hd256 kernel is not loaded.");
+        DotLLM.Core.Attention.AttentionSpanInvariant.AssertTight(seqKv, positionOffset, seqQ, "CUDA");
+
+        int group = numHeads / numKvHeads;
+        nint qArg = q, kArg = k, vArg = v, oArg = output;
+        int sqArg = seqQ, skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, poArg = positionOffset;
+        float scArg = scale > 0f ? scale : 1f / MathF.Sqrt(256f);
+
+        void** args = stackalloc void*[] { &qArg, &kArg, &vArg, &oArg, &sqArg, &skvArg, &nhArg, &nkvArg, &poArg, &scArg };
+        uint gridX = (uint)((seqQ + 15) / 16);
+        CudaDriverApi.cuLaunchKernel(_attentionFlashPrefillHd256Func,
+                gridX, (uint)numKvHeads, 1, (uint)(group * 32), 1, 1,
+                (uint)AttentionFlashPrefillHd256SmemBytes(group), stream, (nint)args, 0).ThrowOnError();
+    }
 
     /// <summary>
     /// True when the hand-fused mma.sync flash-attention prefill kernel is loaded
@@ -3025,6 +3177,14 @@ public sealed unsafe class CudaKernels : IDisposable
     {
         if (_attentionMmaDecodeGqaSplitFunc == 0 || numKvHeads <= 0 || group <= 0) return 0;
 
+        if (UseMmaDecodeV2)
+        {
+            if (_attnMmaDecodeGqaSplitV2MaxCoResidentGrid < 0)
+                _attnMmaDecodeGqaSplitV2MaxCoResidentGrid = QueryCoResidentGrid(_attentionMmaDecodeGqaSplitV2Func);
+            return _attnMmaDecodeGqaSplitV2MaxCoResidentGrid <= 0
+                ? 0 : _attnMmaDecodeGqaSplitV2MaxCoResidentGrid / numKvHeads;
+        }
+
         if (_attnMmaDecodeGqaSplitMaxCoResidentGrid < 0 || _attnMmaDecodeGqaSplitCachedGroup != group)
         {
             CudaDriverApi.cuCtxGetDevice(out int device);
@@ -3049,6 +3209,47 @@ public sealed unsafe class CudaKernels : IDisposable
 
         if (_attnMmaDecodeGqaSplitMaxCoResidentGrid <= 0) return 0;
         return _attnMmaDecodeGqaSplitMaxCoResidentGrid / numKvHeads; // integer floor; 0 = unsafe at any split
+    }
+
+    private int QueryCoResidentGrid(nint func)
+    {
+        CudaDriverApi.cuCtxGetDevice(out int device);
+        CudaDriverApi.cuDeviceGetAttribute(out int coopSupported,
+            CudaDriverApi.CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH, device);
+        if (coopSupported == 0) return 0;
+        CudaDriverApi.cuDeviceGetAttribute(out int numSms,
+            CudaDriverApi.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
+        int rc = CudaDriverApi.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+            out int maxBlocksPerSm, func, AttentionMmaDecodeGqaSplitBlockSize, dynamicSMemSize: 0);
+        return rc == 0 ? numSms * maxBlocksPerSm : 0;
+    }
+
+    /// <summary>True when the v2 fused quantized-KV kernel for this K/V pair is loaded AND v2 is selected (issue #988).</summary>
+    public bool HasAttentionMmaDecodeKvqV2(KvCacheDType kDtype, KvCacheDType vDtype)
+    {
+        int i = KvqIndex(kDtype, vDtype);
+        return i >= 0 && UseMmaDecodeKvqV2(i);
+    }
+
+    /// <summary>True when the v2 decode kernel (issue #988) is loaded AND selected.</summary>
+    public bool MmaDecodeV2Active => UseMmaDecodeV2;
+
+    /// <summary>
+    /// Minimum KV rows per split for the v2 kernel (8 warps x 16-key tiles = 128 keys keeps every
+    /// warp busy). <c>DOTLLM_ATTN_MMA_V2_MIN_KV</c> overrides.
+    /// </summary>
+    private static readonly int MmaV2MinKvPerSplit = EnvIntOrDefault("DOTLLM_ATTN_MMA_V2_MIN_KV", 128);
+
+    /// <summary>
+    /// kvSplit for the v2 decode kernels: <c>clamp(ceil(seqKv / MmaV2MinKvPerSplit), 1, maxSafe)</c>.
+    /// v2 blocks are independent warp streams (no per-tile barrier), so the split only has to
+    /// fill the SMs, not hide sync latency like v1's heuristic assumes.
+    /// </summary>
+    public static int ComputeAttentionMmaV2KvSplit(int seqKv, int maxSafeSplit)
+    {
+        if (seqKv <= 0 || maxSafeSplit <= 0) return 1;
+        int byKv = (seqKv + MmaV2MinKvPerSplit - 1) / MmaV2MinKvPerSplit;
+        return Math.Max(1, Math.Min(byKv, maxSafeSplit));
     }
 
     /// <summary>
@@ -3085,11 +3286,97 @@ public sealed unsafe class CudaKernels : IDisposable
         void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
                         &skvArg, &nhArg, &nkvArg, &scArg, &ksArg, &pmArg, &psArg, &poutArg};
 
-        CudaDriverApi.cuLaunchCooperativeKernel(_attentionMmaDecodeGqaSplitFunc,
+        CudaDriverApi.cuLaunchCooperativeKernel(ActiveMmaDecodeFunc,
                 (uint)numKvHeads, (uint)kvSplit, 1, AttentionMmaDecodeGqaSplitBlockSize, 1, 1,
                 0, stream, (nint)args).ThrowOnError();
     }
 
+
+    private static int KvqIndex(KvCacheDType k, KvCacheDType v) => (k, v) switch
+    {
+        (KvCacheDType.Q8_0, KvCacheDType.Q8_0) => 0,
+        (KvCacheDType.Q4_0, KvCacheDType.Q4_0) => 1,
+        (KvCacheDType.Q8_0, KvCacheDType.Q4_0) => 2,
+        (KvCacheDType.Q4_0, KvCacheDType.Q8_0) => 3,
+        _ => -1,
+    };
+
+    /// <summary>True when the fused quantized-KV mma decode kernel for this K/V format pair is loaded (issue #956).</summary>
+    public bool HasAttentionMmaDecodeKvq(KvCacheDType kDtype, KvCacheDType vDtype)
+    {
+        int i = KvqIndex(kDtype, vDtype);
+        return i >= 0 && _attentionMmaDecodeKvqFuncs[i] != 0;
+    }
+
+    /// <summary>
+    /// Cooperative co-residency ceiling (max safe kvSplit) for the fused quantized-KV kernel, using ITS
+    /// OWN occupancy (its register count differs from the F16 kernel's). 0 = unsupported/unsafe.
+    /// </summary>
+    public int MaxSafeAttentionMmaDecodeKvq(int numKvHeads, KvCacheDType kDtype, KvCacheDType vDtype)
+    {
+        int idx = KvqIndex(kDtype, vDtype);
+        if (idx < 0 || _attentionMmaDecodeKvqFuncs[idx] == 0 || numKvHeads <= 0) return 0;
+
+        if (UseMmaDecodeKvqV2(idx))
+        {
+            if (_attentionMmaDecodeKvqV2MaxCoResident[idx] < 0)
+                _attentionMmaDecodeKvqV2MaxCoResident[idx] = QueryCoResidentGrid(_attentionMmaDecodeKvqV2Funcs[idx]);
+            int g2 = _attentionMmaDecodeKvqV2MaxCoResident[idx];
+            return g2 <= 0 ? 0 : g2 / numKvHeads;
+        }
+
+        if (_attentionMmaDecodeKvqMaxCoResident[idx] < 0)
+        {
+            CudaDriverApi.cuCtxGetDevice(out int device);
+            CudaDriverApi.cuDeviceGetAttribute(out int coopSupported,
+                CudaDriverApi.CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH, device);
+            if (coopSupported == 0)
+            {
+                _attentionMmaDecodeKvqMaxCoResident[idx] = 0;
+            }
+            else
+            {
+                CudaDriverApi.cuDeviceGetAttribute(out int numSms,
+                    CudaDriverApi.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
+                int rc = CudaDriverApi.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                    out int maxBlocksPerSm, _attentionMmaDecodeKvqFuncs[idx],
+                    AttentionMmaDecodeGqaSplitBlockSize, dynamicSMemSize: 0);
+                _attentionMmaDecodeKvqMaxCoResident[idx] = rc == 0 ? numSms * maxBlocksPerSm : 0;
+            }
+        }
+        int grid = _attentionMmaDecodeKvqMaxCoResident[idx];
+        return grid <= 0 ? 0 : grid / numKvHeads;
+    }
+
+    /// <summary>
+    /// Fused quantized-KV variant of <see cref="LaunchAttentionMmaDecodeGqaSplit"/> (issue #956):
+    /// <paramref name="k"/>/<paramref name="v"/> are KV-format Q8_0/Q4_0 block bytes
+    /// (<c>[seqKv, numKvHeads*headDim]</c> logical elements) read in-kernel, bit-identical to
+    /// dequantizing into F16 first. <paramref name="kvSplit"/> must be clamped to
+    /// <see cref="MaxSafeAttentionMmaDecodeKvq"/>.
+    /// </summary>
+    public void LaunchAttentionMmaDecodeGqaSplitKvq(nint q, nint k, nint v,
+        KvCacheDType kDtype, KvCacheDType vDtype, nint output,
+        int seqKv, int numHeads, int numKvHeads, int kvSplit,
+        nint partialMax, nint partialSum, nint partialOut, nint stream)
+    {
+        int idx = KvqIndex(kDtype, vDtype);
+        if (idx < 0 || _attentionMmaDecodeKvqFuncs[idx] == 0)
+            throw new InvalidOperationException($"Fused KV decode kernel for {kDtype}/{vDtype} is not loaded.");
+
+        nint qArg = q, kArg = k, vArg = v, outArg = output;
+        int skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, ksArg = kvSplit;
+        float scArg = 1.0f / MathF.Sqrt(AttentionMmaDecodeGqaSplitHeadDim);
+        nint pmArg = partialMax, psArg = partialSum, poutArg = partialOut;
+
+        void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
+                        &skvArg, &nhArg, &nkvArg, &scArg, &ksArg, &pmArg, &psArg, &poutArg};
+
+        nint kvqFunc = UseMmaDecodeKvqV2(idx) ? _attentionMmaDecodeKvqV2Funcs[idx] : _attentionMmaDecodeKvqFuncs[idx];
+        CudaDriverApi.cuLaunchCooperativeKernel(kvqFunc,
+                (uint)numKvHeads, (uint)kvSplit, 1, AttentionMmaDecodeGqaSplitBlockSize, 1, 1,
+                0, stream, (nint)args).ThrowOnError();
+    }
 
     /// <summary>FP32 SwiGLU: out = SiLU(gate) * up, all FP32.</summary>
     public void LaunchSwiGLUF32(nint gate, nint up, nint output,
@@ -4582,6 +4869,41 @@ public sealed unsafe class CudaKernels : IDisposable
         CudaDriverApi.cuLaunchKernel(func,
                 gridDim, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Eager dequantization of a contiguous run of KV-format blocks (as written by
+    /// <see cref="LaunchQuantKv"/>) to FP16. KV Q4_0 packs ADJACENT PAIRS (low nibble = even
+    /// element), which differs from the GGUF weight layout <see cref="LaunchDequantToF16"/>
+    /// unpacks -- use this, not the generic weight dequant, for any KV-cache data (issue #956).
+    /// Q8_0 shares the weight layout and is forwarded to the generic kernel.
+    /// </summary>
+    public void LaunchKvDequantToF16(nint src, KvCacheDType dtype, nint dst, int totalElements, nint stream)
+    {
+        switch (dtype)
+        {
+            case KvCacheDType.Q8_0:
+                LaunchDequantToF16(src, QuantizationType.Q8_0, dst, totalElements, stream);
+                return;
+            case KvCacheDType.Q4_0:
+            {
+                if (_kvDequantQ4_0Func == 0)
+                    throw new InvalidOperationException(
+                        "kv_dequant_q4_0 not loaded (kv_write.ptx missing/stale). Rebuild native PTX.");
+                nint srcArg = src, dstArg = dst;
+                int totalBlocks = totalElements / 32;
+                int tbArg = totalBlocks;
+                void** args = stackalloc void*[] { &srcArg, &dstArg, &tbArg };
+                uint gridDim = (uint)Math.Min((totalBlocks + 7) / 8, MaxDequantGridSize);
+                if (gridDim == 0) gridDim = 1;
+                CudaDriverApi.cuLaunchKernel(_kvDequantQ4_0Func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+            default:
+                throw new NotSupportedException($"KV dequant not supported for {dtype}.");
+        }
     }
 
     /// <summary>

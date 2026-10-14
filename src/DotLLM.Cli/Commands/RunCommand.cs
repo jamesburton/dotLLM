@@ -26,7 +26,7 @@ namespace DotLLM.Cli.Commands;
 /// </summary>
 internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 {
-    public sealed class Settings : CommandSettings
+    public sealed class Settings : DotLLM.Cli.Helpers.KvQuantSettings
     {
         [CommandArgument(0, "<model>")]
         [Description("Path to a GGUF file or HuggingFace repo ID (e.g., QuantFactory/SmolLM-135M-GGUF).")]
@@ -215,15 +215,13 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 
         /// <summary>KV-cache key quantization type.</summary>
         [CommandOption("--cache-type-k")]
-        [Description("KV-cache key quantization: f32 (default), q8_0, q4_0.")]
-        [DefaultValue("f32")]
-        public string CacheTypeK { get; set; } = "f32";
+        [Description("KV-cache key quantization: f32/f16 (default), q8_0, q4_0. Synonym of --kv-quant-k.")]
+        public string? CacheTypeK { get; set; }
 
         /// <summary>KV-cache value quantization type.</summary>
         [CommandOption("--cache-type-v")]
-        [Description("KV-cache value quantization: f32 (default), q8_0, q4_0.")]
-        [DefaultValue("f32")]
-        public string CacheTypeV { get; set; } = "f32";
+        [Description("KV-cache value quantization: f32/f16 (default), q8_0, q4_0. Synonym of --kv-quant-v.")]
+        public string? CacheTypeV { get; set; }
 
         /// <summary>Mixed-precision window size for KV-cache quantization.</summary>
         [CommandOption("--cache-window")]
@@ -304,6 +302,14 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         if (DeviceCli.Validate(settings.Device) is { } deviceError)
         {
             DeviceCli.PrintError(deviceError, settings.Json);
+            return 1;
+        }
+
+        // #967: --kv-quant-k/-v and --cache-type-k/-v are synonyms; bad values fail before anything loads.
+        if (!DotLLM.Cli.Helpers.KvStorageCli.TryBuild(settings.CacheTypeK, settings.CacheTypeV,
+                settings.KvQuantK, settings.KvQuantV, settings.CacheWindow, out var kvStorageRequest, out var kvFlagError))
+        {
+            DeviceCli.PrintError(kvFlagError!, settings.Json);
             return 1;
         }
 
@@ -411,6 +417,31 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 
         // Resolved device line + (for auto on the CPU) the prominent warning, printed after the spinner so it stays visible.
         DeviceCli.Report(deviceOutcome, settings.Json);
+
+        // #967: apply the KV storage request to models that own their KV (CUDA hybrid-dense) and warn - never silently
+        // ignore - when the selected model/backend cannot honour a flag.
+        if (kvStorageRequest.IsSpecified)
+        {
+            var kvTarget = DotLLM.Cli.Helpers.KvStorageCli.Classify(model, vulkanKv is not null);
+            string kvBackend = vulkanKv is not null ? "vulkan" : model.GetType().Namespace?.StartsWith("DotLLM.Cuda", StringComparison.Ordinal) == true ? "cuda" : "cpu";
+            foreach (var w in DotLLM.Cli.Helpers.KvStorageCli.Warnings(kvStorageRequest, kvTarget, config.Architecture.ToString(), kvBackend, engineCacheHonoured: true))
+            {
+                if (settings.Json) Console.Error.WriteLine($"WARNING: {w}");
+                else AnsiConsole.MarkupLine($"[yellow]WARNING: {Markup.Escape(w)}[/]");
+            }
+            try
+            {
+                DotLLM.Cli.Helpers.KvStorageCli.Apply(model, kvStorageRequest);
+            }
+            catch (NotSupportedException ex)
+            {
+                DeviceCli.PrintError(ex.Message, settings.Json);
+                model.Dispose();
+                gguf?.Dispose();
+                safetensorsSource?.Dispose();
+                return 1;
+            }
+        }
 
         // Display VRAM warning after spinner completes (so it stays visible).
         // In JSON mode, write to stderr so it doesn't corrupt the JSON output.
@@ -588,8 +619,8 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 Console.Write(tools is { Length: > 0 } ? "" : prompt);
 
             var kvConfig = new KvCacheConfig(
-                KvCacheConfig.ParseDType(settings.CacheTypeK),
-                KvCacheConfig.ParseDType(settings.CacheTypeV),
+                kvStorageRequest.Key ?? KvCacheDType.F32,
+                kvStorageRequest.Value ?? KvCacheDType.F32,
                 settings.CacheWindow);
 
             Func<ModelConfig, int, DotLLM.Core.Attention.IKvCache>? kvFactory = null;
@@ -641,6 +672,14 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 if (settings.Paged)
                     Console.Error.WriteLine("WARNING: Paged KV-cache not supported with hybrid GPU, using hybrid cache.");
                 kvFactory = (cfg, size) => qwen35HybridModel.CreateKvCache(size);
+            }
+            else if (model is DotLLM.Cuda.Architectures.CudaQwen3HybridDenseTransformerModel qwen35DenseGpu)
+            {
+                // #967: owns its KV (per-attention-slot device buffers behind a length-only handle); storage format
+                // was applied right after load via ConfigureKvStorage. Never the host SimpleKvCache/QuantizedKvCache.
+                if (settings.Paged)
+                    Console.Error.WriteLine("WARNING: Paged KV-cache not supported for the CUDA hybrid-dense model, using its own KV cache.");
+                kvFactory = (cfg, size) => qwen35DenseGpu.CreateKvCache(size);
             }
             else if (model is DotLLM.Cuda.Architectures.CudaNemotronHTransformerModel nemotronHGpu)
             {
@@ -773,7 +812,10 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             // Use actual KV-cache bytes from engine timings (reflects quantization compression).
             // Fall back to computed estimate for GPU caches (based on config).
             long kvCacheBytes;
-            if (timings.KvCacheBytes > 0)
+            var hybridKv = DotLLM.Cli.Helpers.KvStorageCli.Describe(model, cacheSize);
+            if (hybridKv is not null)
+                kvCacheBytes = hybridKv.Value.Bytes;
+            else if (timings.KvCacheBytes > 0)
                 kvCacheBytes = timings.KvCacheBytes;
             else if (kvConfig.IsQuantized)
                 kvCacheBytes = ComputeQuantizedKvBytes(config, cacheSize, kvConfig);
@@ -900,9 +942,11 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 if (repackedBytes > 0)
                     bodyLines.Add(new Markup(MemLine("Repacked (R4)", repackedBytes, "(committed)")));
                 bodyLines.Add(new Markup(MemLine("Compute", computeBytes, null)));
-                string kvLabel = kvConfig.IsQuantized
-                    ? $"({cacheSize} slots, K:{settings.CacheTypeK} V:{settings.CacheTypeV})"
-                    : $"({cacheSize} slots)";
+                string kvLabel = hybridKv is not null
+                    ? $"({cacheSize} slots, {hybridKv.Value.Text})"
+                    : kvConfig.IsQuantized
+                        ? $"({cacheSize} slots, K:{kvConfig.KeyDType} V:{kvConfig.ValueDType})"
+                        : $"({cacheSize} slots)";
                 bodyLines.Add(new Markup(MemLine("KV Cache", kvCacheBytes, kvLabel)));
                 bodyLines.Add(new Markup("  [dim]──────────────────────────────────────────────────────[/]"));
                 bodyLines.Add(new Markup(MemLine("Total", totalMemory, null)));
