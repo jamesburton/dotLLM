@@ -134,6 +134,7 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
         var host = VulkanQwen3MoeHybridTransformerModel.CreateLayerlessHost(device, config, spvDir, head,
             cpu.KvSlotForLayer, cpu.AttentionLayerCount, ropeDim, ropeTheta);
         host.Q8GateUpMmvq = Environment.GetEnvironmentVariable("DOTLLM_VK_LFM2_Q8_GATEUP_MMVQ") != "0";
+        host.Q8GroupedGateUp = true;
 
         var layers = new LayerDev[config.NumLayers];
         var layout = config.HybridLayout!;

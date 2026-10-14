@@ -1842,7 +1842,13 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     /// for those models that this change deliberately does not make).
     /// </summary>
     private MoeGroupedMatmulLegacyQuantCoopmatKernel? LegacyGateUpKernel(QuantizationType qt)
-        => qt == QuantizationType.Q8_0 ? GroupedLegacyDownKernel(qt) : null;
+        => Q8GroupedGateUp && qt == QuantizationType.Q8_0 ? GroupedLegacyDownKernel(qt) : null;
+
+    /// <summary>
+    /// Opt-in (LFM2-MoE, #1015): Q8_0 gate/up banks take the grouped coopmat prefill path. Off by default so every other host (Qwen3.x hybrids,
+    /// qwen4exp) keeps its previous Q8_0 gate/up path bit-for-bit (before this flag existed, such banks were never grouped).
+    /// </summary>
+    internal bool Q8GroupedGateUp { get; set; }
 
     private MoeGroupedMatmulLegacyQuantCoopmatKernel? GroupedLegacyDownKernel(QuantizationType qt) => qt switch
     {
