@@ -1867,26 +1867,51 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     private void RecordGroupedExperts(nint cmdBuf, VulkanQwen3MoeMoeUpload.LayerBundle moeW, int seqLen, int hidden, int interm, int numE, int expandedRows,
         bool fusedGlue, int topK)
     {
+        // Resolve kernel availability early so the gather step can be skipped for quantize-once.
+        var legacyDown = GroupedLegacyDownKernel(moeW.W2QuantType);
+        var iqDown = GroupedIqKernel(moeW.W2QuantType);          // #823
+        var iqGateUp = GroupedIqKernel(moeW.W1QuantType);        // #823
+        var gateUpMmq = (iqGateUp is null && legacyDown is null && iqDown is null) ? GroupedGateUpMmqKernel(moeW.W1QuantType) : null;
+        var downMmq = (gateUpMmq is not null) ? GroupedDownMmqKernel(moeW.W2QuantType) : null;
+        bool useMmq = gateUpMmq is not null && downMmq is not null
+            && _kernels.QuantizeQ8_1RowsActivations is not null && (interm % 256) == 0;
+        bool useQuantizeOnce = useMmq && fusedGlue && _kernels.MoeExpandGatherGroupQ8_1 is not null;
+
         _kernels.MoeExpertOffsets!.Record(cmdBuf, _state.MoeTopkIndices, _state.MoeGroupCounts, _state.MoeGroupOffsets, _state.MoeGroupCounters,
             rows: expandedRows, numExperts: numE);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("expert_offsets");
-        if (fusedGlue)
-            _kernels.MoeExpandGatherGroup!.Record(cmdBuf, _state.NormOutput, _state.MoeTopkIndices, _state.MoeGroupOffsets,
-                _state.MoeGroupCounters, _state.MoeDownRows, _state.MoeGroupPerm, _state.MoeGroupInvPerm,
-                rows: expandedRows, hidden: hidden, numExperts: numE, topK: topK);
-        else
-            _kernels.MoeExpandGroupByExpert!.Record(cmdBuf, _state.MoeExpandedInput, _state.MoeTopkIndices, _state.MoeGroupOffsets,
-                _state.MoeGroupCounters, _state.MoeDownRows, _state.MoeGroupPerm, rows: expandedRows, hidden: hidden, numExperts: numE);
-        KernelSupport.ComputeToComputeBarrier(cmdBuf);
-        MoeStage("expand_group");
 
-        // Launch only the (expert, tile) pairs that exist. The legacy grid (every expert x every possible row tile; a token routes
-        // to an expert at most once, so no expert owns more than seqLen rows) launched ~30x more workgroups than there was work and the
-        // early-out workgroups alone cost ~100 ms of a 512-token prefill. DOTLLM_VK_MOE_INDIRECT_TILES=0 restores it.
-        var legacyDown = GroupedLegacyDownKernel(moeW.W2QuantType);
-        var iqDown = GroupedIqKernel(moeW.W2QuantType);          // #823
-        var iqGateUp = GroupedIqKernel(moeW.W1QuantType);        // #823
+        if (useQuantizeOnce)
+        {
+            // Quantize-once: quantize compact [seqLen] NormOutput to Q8_1, then Q8_1 gather into expert order.
+            // Saves topK× quantize work + gathers Q8_1 (~1 B/elem) instead of F32 (4 B/elem).
+            _kernels.QuantizeQ8_1RowsActivations!.Record(cmdBuf, _state.NormOutput, _state.MoeSiluInterXq, _state.MoeSiluInterXds,
+                n: seqLen, k: hidden);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            MoeStage("quantize_q8_compact");
+
+            _kernels.MoeExpandGatherGroupQ8_1!.Record(cmdBuf, _state.MoeSiluInterXq, _state.MoeSiluInterXds,
+                _state.MoeTopkIndices, _state.MoeGroupOffsets, _state.MoeGroupCounters,
+                _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
+                _state.MoeGroupPerm, _state.MoeGroupInvPerm,
+                rows: expandedRows, k: hidden, numExperts: numE, topK: topK);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            MoeStage("q8_gather_group");
+        }
+        else
+        {
+            if (fusedGlue)
+                _kernels.MoeExpandGatherGroup!.Record(cmdBuf, _state.NormOutput, _state.MoeTopkIndices, _state.MoeGroupOffsets,
+                    _state.MoeGroupCounters, _state.MoeDownRows, _state.MoeGroupPerm, _state.MoeGroupInvPerm,
+                    rows: expandedRows, hidden: hidden, numExperts: numE, topK: topK);
+            else
+                _kernels.MoeExpandGroupByExpert!.Record(cmdBuf, _state.MoeExpandedInput, _state.MoeTopkIndices, _state.MoeGroupOffsets,
+                    _state.MoeGroupCounters, _state.MoeDownRows, _state.MoeGroupPerm, rows: expandedRows, hidden: hidden, numExperts: numE);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            MoeStage("expand_group");
+        }
+
         CountMoePath(MoePath.GroupedPrefill);
         if (legacyDown is not null) CountMoePath(MoePath.GroupedLegacyDown);
         if (iqGateUp is not null) CountMoePath(MoePath.GroupedIqGateUp);
@@ -1895,19 +1920,16 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
 
         // #986: dp4a grouped MMQ path — Q8_1 activations, preferred over coopmat for K-quant-only layers.
         // Both gate/up AND down must have MMQ kernels so the tile list shares one row-tile (32 or 64).
-        var gateUpMmq = (iqGateUp is null && legacyDown is null && iqDown is null) ? GroupedGateUpMmqKernel(moeW.W1QuantType) : null;
-        var downMmq = (gateUpMmq is not null) ? GroupedDownMmqKernel(moeW.W2QuantType) : null;
-        bool useMmq = gateUpMmq is not null && downMmq is not null
-            && _kernels.QuantizeQ8_1RowsActivations is not null && (interm % 256) == 0;
-
         if (useMmq)
         {
             CountMoePath(MoePath.GroupedMmqPrefill);
-            // Quantize expert-sorted F32 activations to Q8_1 for the gate/up projection (K=hidden).
-            _kernels.QuantizeQ8_1RowsActivations!.Record(cmdBuf, _state.MoeDownRows, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
-                n: expandedRows, k: hidden);
-            KernelSupport.ComputeToComputeBarrier(cmdBuf);
-            MoeStage("quantize_q8_gate_up");
+            if (!useQuantizeOnce)
+            {
+                _kernels.QuantizeQ8_1RowsActivations!.Record(cmdBuf, _state.MoeDownRows, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
+                    n: expandedRows, k: hidden);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                MoeStage("quantize_q8_gate_up");
+            }
 
             var tileBuildMmq = _kernels.MoeBuildTileList;
             if (tileBuildMmq is not null)
@@ -1938,15 +1960,24 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
             MoeStage("grouped_gate_up");
 
-            _kernels.SwiGlu.Record(cmdBuf, _state.MoeGateInter, _state.MoeUpInter, _state.MoeSiluInter, n: expandedRows * interm);
-            KernelSupport.ComputeToComputeBarrier(cmdBuf);
-            MoeStage("swiglu");
+            if (_kernels.SwiGluQuantizeRows is { } swiGluQuant)
+            {
+                swiGluQuant.Record(cmdBuf, _state.MoeGateInter, _state.MoeUpInter, _state.MoeSiluInterXq, _state.MoeSiluInterXds,
+                    n: expandedRows * interm, oai: false);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                MoeStage("swiglu_quantize_fused");
+            }
+            else
+            {
+                _kernels.SwiGlu.Record(cmdBuf, _state.MoeGateInter, _state.MoeUpInter, _state.MoeSiluInter, n: expandedRows * interm);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                MoeStage("swiglu");
 
-            // Quantize SwiGLU output to Q8_1 for the down projection (K=interm).
-            _kernels.QuantizeQ8_1RowsActivations!.Record(cmdBuf, _state.MoeSiluInter, _state.MoeSiluInterXq, _state.MoeSiluInterXds,
-                n: expandedRows, k: interm);
-            KernelSupport.ComputeToComputeBarrier(cmdBuf);
-            MoeStage("quantize_q8_down");
+                _kernels.QuantizeQ8_1RowsActivations!.Record(cmdBuf, _state.MoeSiluInter, _state.MoeSiluInterXq, _state.MoeSiluInterXds,
+                    n: expandedRows, k: interm);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                MoeStage("quantize_q8_down");
+            }
 
             if (tileBuildMmq is not null)
                 downMmq!.RecordIndirect(cmdBuf, moeW.W2Bank, _state.MoeSiluInterXq, _state.MoeSiluInterXds, _state.MoeGroupOffsets,
