@@ -4930,6 +4930,7 @@ public sealed partial class VulkanTransformerModel : IModel
         _gemma4GroupedQ5_1?.InvalidateDescriptorCache();
         _gemma4GroupedQ8_0?.InvalidateDescriptorCache();
         _gemma4MoeBuildTileList?.InvalidateDescriptorCache();
+        _grpTileList?.InvalidateDescriptorCache();   // generic grouped-MoE tile builder (#789): the one kernel field this method missed
         _moeWeightedScatter?.InvalidateDescriptorCache();
         _moeBroadcast?.InvalidateDescriptorCache();
         _moeIndexedLoraDelta?.InvalidateDescriptorCache();
