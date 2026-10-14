@@ -61,7 +61,9 @@ public static partial class GgufModelConfigExtractor
         // per-layer Int32 arrays whose entries are zero for layers of the wrong kind.
         // Build a HybridLayerLayout in that case; for pure-Transformer architectures
         // both keys are scalar UInt32.
-        HybridLayerLayout? hybridLayout = TryExtractHybridLayout(metadata, arch, numTrunkLayers, nextnPredictLayers);
+        HybridLayerLayout? hybridLayout = architecture == Architecture.Lfm2Moe
+            ? BuildLfm2MoeLayout(metadata, arch, numTrunkLayers)
+            : TryExtractHybridLayout(metadata, arch, numTrunkLayers, nextnPredictLayers);
 
         int intermediateSize;
         int numKvHeads;
@@ -230,6 +232,10 @@ public static partial class GgufModelConfigExtractor
         {
             moeConfig = ExtractNemotronHMoeConfig(metadata, arch, intermediateSize);
         }
+        else if (architecture == Architecture.Lfm2Moe)
+        {
+            moeConfig = ExtractLfm2MoeConfig(metadata, arch, intermediateSize);
+        }
         else if (architecture == Architecture.GraniteMoe)
         {
             moeConfig = ExtractGraniteMoeConfig(metadata, arch, intermediateSize);
@@ -306,6 +312,8 @@ public static partial class GgufModelConfigExtractor
             SlidingWindowSize = slidingWindowSize,
             SlidingWindowPattern = slidingWindowPattern,
             HybridLayout = hybridLayout,
+            ShortConvCacheLength = architecture == Architecture.Lfm2Moe
+                ? (int)metadata.GetUInt32($"{arch}.shortconv.l_cache") : 0,
             SsmConfig = ssmConfig,
             MlaConfig = mlaConfig,
             Moe = moeConfig,
@@ -853,6 +861,71 @@ public static partial class GgufModelConfigExtractor
         };
     }
 
+    /// <summary>
+    /// LFM2 layer layout (llama.cpp <c>llama_model_lfm2moe</c>): <c>head_count_kv</c> is a per-layer array whose zero entries
+    /// are the short-conv layers (<c>recurrent_layer_arr[il] = n_head_kv(il) == 0</c>); every layer additionally carries an
+    /// FFN (dense for the first <c>leading_dense_block_count</c>, MoE after), so <see cref="HybridLayerLayout.FeedForwardLength"/>
+    /// only records the dense width for the leading layers.
+    /// </summary>
+    private static HybridLayerLayout BuildLfm2MoeLayout(GgufMetadata metadata, string arch, int numLayers)
+    {
+        string kvKey = $"{arch}.attention.head_count_kv";
+        int[] kv = metadata.GetInt32Array(kvKey);
+        if (kv.Length != numLayers)
+            throw new InvalidDataException($"'{kvKey}' array length {kv.Length} does not match block_count {numLayers}.");
+        int dense = (int)metadata.GetUInt32OrDefault($"{arch}.leading_dense_block_count", 0);
+        int denseFf = (int)metadata.GetUInt32OrDefault($"{arch}.feed_forward_length", 0);
+        var kinds = new HybridLayerKind[numLayers];
+        var ff = new int[numLayers];
+        for (int i = 0; i < numLayers; i++)
+        {
+            kinds[i] = kv[i] > 0 ? HybridLayerKind.Attention : HybridLayerKind.ShortConv;
+            ff[i] = i < dense ? denseFf : 0;
+        }
+        return new HybridLayerLayout { LayerKind = kinds, HeadCountKv = kv, FeedForwardLength = ff };
+    }
+
+    /// <summary>
+    /// LFM2-MoE routing (llama.cpp <c>lfm2moe.cpp</c>): <c>build_moe_ffn(..., LLM_FFN_SILU, norm_w=true, expert_weights_scale,
+    /// gating_func=expert_gating_func)</c> with the <c>exp_probs_b</c> selection bias; no shared expert; the first
+    /// <c>leading_dense_block_count</c> layers use a dense SwiGLU of width <c>feed_forward_length</c>.
+    /// </summary>
+    private static MoeConfig ExtractLfm2MoeConfig(GgufMetadata metadata, string arch, int denseIntermediate)
+    {
+        int expertCount = (int)metadata.GetUInt32($"{arch}.expert_count");
+        int expertUsed = (int)metadata.GetUInt32($"{arch}.expert_used_count");
+        int moeIntermediate = (int)metadata.GetUInt32($"{arch}.expert_feed_forward_length");
+        int leadingDense = (int)metadata.GetUInt32OrDefault($"{arch}.leading_dense_block_count", 0);
+        uint gating = metadata.GetUInt32OrDefault($"{arch}.expert_gating_func", 0);
+        if (gating != 1 && gating != 2)
+            throw new InvalidDataException($"{arch}.expert_gating_func={gating} is not supported (only 1=softmax, 2=sigmoid).");
+        float scale = metadata.GetFloat32OrDefault($"{arch}.expert_weights_scale", 1.0f);
+        if (scale == 0f) scale = 1.0f;
+        int[]? mlpOnly = null;
+        if (leadingDense > 0)
+        {
+            mlpOnly = new int[leadingDense];
+            for (int i = 0; i < leadingDense; i++) mlpOnly[i] = i;
+        }
+        bool sigmoid = gating == 2;
+        return new MoeConfig
+        {
+            NumExperts = expertCount,
+            NumExpertsPerTok = expertUsed,
+            MoeIntermediateSize = moeIntermediate,
+            NormTopKProb = !sigmoid,           // norm_w is a hard-coded `true` in lfm2moe.cpp
+            SigmoidGating = sigmoid,
+            HasSelectionBias = sigmoid,
+            NormalizeExpertWeights = sigmoid,
+            ExpertWeightsScale = scale,
+            SharedExpertIntermediateSize = null,
+            NumSharedExperts = 0,
+            HasSharedExpertGate = false,
+            DecoderSparseStep = 1,
+            MlpOnlyLayers = mlpOnly,
+        };
+    }
+
     private static MambaSsmConfig? TryExtractSsmConfig(GgufMetadata metadata, string arch)
     {
         string innerKey = $"{arch}.ssm.inner_size";
@@ -986,6 +1059,7 @@ public static partial class GgufModelConfigExtractor
             "deepseek2" => Architecture.DeepSeekV2,
             // V3 / V3-MoE — MLA + sigmoid-gated routing + group-norm experts.
             "deepseek3" => Architecture.DeepSeekV3,
+            "lfm2moe" => Architecture.Lfm2Moe,
             "nemotron_h" => Architecture.NemotronH,
             // Nemotron-H hybrid stack + DeepSeek-V3-style MoE + optional MTP head
             // (Nemotron 3.5 Lightning). Distinct llama.cpp arch from nemotron_h.
@@ -1512,6 +1586,8 @@ public static partial class GgufModelConfigExtractor
             Architecture.Qwen or Architecture.QwenMoe
                 or Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense or Architecture.Qwen4Exp or Architecture.Phi
                 or Architecture.GptOss or Architecture.BitNet
+                // llama.cpp llama_model_rope_type: LFM2 / LFM2MOE are NEOX (HF layout).
+                or Architecture.Lfm2Moe
                 // llama.cpp llama_model_rope_type: gemma / gemma2 / gemma3 are NEOX, and their
                 // converter does not permute Q/K (HF rotate_half layout).
                 or Architecture.Gemma or Architecture.Gemma2 or Architecture.Gemma3

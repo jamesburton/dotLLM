@@ -72,6 +72,8 @@ public static class ModelLoader
             // FFN layers are detected per-layer by the ffn_gate_inp router tensor.
             Architecture.NemotronHMoe => NemotronHTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             Architecture.Qwen3MoeHybrid => Qwen3MoeHybridTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
+            // LFM2.5-24B-A2B (#1015): gated short-conv + GQA hybrid with dense-then-MoE FFN.
+            Architecture.Lfm2Moe => Lfm2MoeTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             Architecture.Qwen3HybridDense => Qwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             // CPU reference forward (#816): GR + GDN/QSA + 512-expert MoE + n-gram PLE.
             Architecture.Qwen4Exp => Qwen4ExpTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),

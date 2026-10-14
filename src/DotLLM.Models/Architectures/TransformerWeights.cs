@@ -258,6 +258,26 @@ internal sealed class MoeLayerWeights
     /// </summary>
     public bool HasRawQuantView => GateExpsRaw != 0 && UpExpsRaw != 0 && DownExpsRaw != 0;
 
+    /// <summary>
+    /// Copy of this layer whose routed-expert raw views point at different (e.g. host-transcoded) buffers of a different quant type
+    /// (same geometry). Used by the Vulkan LFM2-MoE loader to serve Q4_0 banks as exactly-equivalent Q8_0 (#1015).
+    /// </summary>
+    internal MoeLayerWeights WithRawBanks(nint gateRaw, QuantizationType gateQt, nint upRaw, QuantizationType upQt,
+                                          nint downRaw, QuantizationType downQt)
+    {
+        var m = new MoeLayerWeights(
+            Gate, W1, W2, W3, NumExperts, NumExpertsPerTok, HiddenSize, IntermediateSize, NormTopKProb,
+            SharedGateProj, SharedUpProj, SharedDownProj, SharedIntermediateSize, SharedExpertGate,
+            gateRaw, gateQt, GateExpsMDim, GateExpsKDim,
+            upRaw, upQt, UpExpsMDim, UpExpsKDim,
+            downRaw, downQt, DownExpsMDim, DownExpsKDim,
+            SharedGateRaw, SharedGateRawQt, SharedUpRaw, SharedUpRawQt, SharedDownRaw, SharedDownRawQt);
+        m.SigmoidGating = SigmoidGating;
+        m.SelectionBias = SelectionBias;
+        m.WeightsScale = WeightsScale;
+        return m;
+    }
+
     // ── BitNet ternary (I2_S) routed-expert banks (CPU) ─────────────────────────
     // Populated by the safetensors BitNet-MoE loader (LoadBitNetMoeLayer). The
     // per-expert {gate,up,down}_proj are ternary I2_S, laid out as CONTIGUOUS
@@ -1254,6 +1274,8 @@ internal sealed class TransformerWeights : IDisposable
                 + "attn_norm/ffn_norm/output_norm), an n-gram embedding and no dense attention projections on "
                 + "its linear-attention layers; it has dedicated models (CPU Qwen4ExpTransformerModel, Vulkan VulkanQwen4ExpTransformerModel; CUDA is not "
                 + "implemented yet), issues #814 / #816 / #818",
+            DotLLM.Core.Configuration.Architecture.Lfm2Moe =>
+                "its gated short-conv layers carry shortconv.in_proj/conv/out_proj tensors instead of attn_q/attn_k/attn_v/attn_output",
             DotLLM.Core.Configuration.Architecture.Mamba3 =>
                 "Mamba-3 has no GGUF representation at all (no upstream 'mamba3' value for "
                 + "general.architecture and no GGUF tensor-naming convention) — it is "
