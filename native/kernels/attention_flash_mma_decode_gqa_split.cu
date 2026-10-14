@@ -113,6 +113,7 @@
 #include <float.h>
 #include <math.h>
 #include <cooperative_groups.h>
+#include "attention_mma_decode_v2.cuh"   // issue #988: v2 body (kernel at the end of this file)
 
 #define HEAD_DIM 256
 #define Q_TILE 16
@@ -464,4 +465,18 @@ extern "C" __global__ void __launch_bounds__(NUM_WARPS * 32) attention_flash_mma
         }
         __syncthreads();
     }
+}
+
+// ─── v2 (issue #988) ────────────────────────────────────────────────────────────────────────
+// Warp-independent, register-resident decode kernel -- see attention_mma_decode_v2.cuh.
+// Same signature, same grid (numKvHeads, kvSplit), same scratch layout and combine as v1;
+// selected by C# unless DOTLLM_ATTN_MMA_DECODE_V2=0. Static shared memory ~12 KB.
+extern "C" __global__ void __launch_bounds__(V2_WARPS * 32, 1) attention_flash_mma_decode_gqa_split_f16_v2(
+    const half* __restrict__ q, const half* __restrict__ k, const half* __restrict__ v,
+    float* __restrict__ output, const int seq_kv, const int num_heads, const int num_kv_heads,
+    const float scale, const int kv_split, float* __restrict__ partial_max,
+    float* __restrict__ partial_sum, float* __restrict__ partial_out)
+{
+    attn_decode_v2_body<V2LoadF16, V2LoadF16>(q, k, v, output, seq_kv, num_heads, num_kv_heads,
+        scale, kv_split, partial_max, partial_sum, partial_out);
 }

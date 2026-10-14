@@ -18,6 +18,7 @@
 #include <float.h>
 #include <math.h>
 #include <cooperative_groups.h>
+#include "attention_mma_decode_v2.cuh"   // issue #988: v2 body
 
 #define HEAD_DIM 256
 #define Q_TILE 16
@@ -401,3 +402,11 @@ KVQ_ENTRY(attention_flash_mma_decode_gqa_split_kvq_q8q8, 1, 1)
 KVQ_ENTRY(attention_flash_mma_decode_gqa_split_kvq_q4q4, 2, 2)
 KVQ_ENTRY(attention_flash_mma_decode_gqa_split_kvq_q8q4, 1, 2)
 KVQ_ENTRY(attention_flash_mma_decode_gqa_split_kvq_q4q8, 2, 1)
+
+// ─── v2 entry points (issue #988) -- same arithmetic as the F16 v2 kernel, loaders differ. ───
+#define KVQ_V2_ENTRY(NAME, KLOAD, VLOAD)                                                      extern "C" __global__ void __launch_bounds__(V2_WARPS * 32, 1) NAME(                              const half* __restrict__ q, const uint8_t* __restrict__ k, const uint8_t* __restrict__ v,     float* __restrict__ output, const int seq_kv, const int num_heads, const int num_kv_heads,     const float scale, const int kv_split, float* __restrict__ partial_max,                       float* __restrict__ partial_sum, float* __restrict__ partial_out)                         {                                                                                                 attn_decode_v2_body<KLOAD, VLOAD>(q, k, v, output, seq_kv, num_heads, num_kv_heads,               scale, kv_split, partial_max, partial_sum, partial_out);                              }
+
+KVQ_V2_ENTRY(attention_flash_mma_decode_gqa_split_kvq_v2_q8q8, V2LoadQ8, V2LoadQ8)
+KVQ_V2_ENTRY(attention_flash_mma_decode_gqa_split_kvq_v2_q4q4, V2LoadQ4, V2LoadQ4)
+KVQ_V2_ENTRY(attention_flash_mma_decode_gqa_split_kvq_v2_q8q4, V2LoadQ8, V2LoadQ4)
+KVQ_V2_ENTRY(attention_flash_mma_decode_gqa_split_kvq_v2_q4q8, V2LoadQ4, V2LoadQ8)

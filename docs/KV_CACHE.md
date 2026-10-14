@@ -93,8 +93,9 @@ length-only `CudaHybridKvCacheHandle`. Per full-attention slot (16 of 64 layers 
 - **Quantized storage** (`--kv-quant-k/--kv-quant-v` or `DOTLLM_HYBRID_KV=f16|q8_0|q4_0|k8v4|k4v8`): rows are quantized on write
   (`quant_f16_to_q{8,4}_0`, standard 32-element blocks) and read either by the **fused** decode kernel
   (`attention_flash_mma_decode_gqa_split_kvq_*`, dequant inside the K/V tile load, bit-identical to the scratch path;
-  opt-in with `DOTLLM_HYBRID_KV_FUSED=1`, default OFF because it measured slower: Q4_0 at ctx 16k 12.4 vs 13.3 tok/s) or,
-  by default, by a dequant into one shared F16 scratch pair (also used by prefill and the fallback tiers).
+  **default ON since #988's v2 kernels** — v1 fused measured slower than scratch, Q4_0 at ctx 16k 12.4 vs 13.3 tok/s, v2
+  reads whole blocks per quad and holds 18.5 tok/s flat from ctx 512 to 16k; `DOTLLM_HYBRID_KV_FUSED=0` opts out) or
+  by a dequant into one shared F16 scratch pair (used by prefill, the fallback tiers, and decode when fused is off).
 - **KV Q4_0 is not the GGUF Q4_0 layout.** KV blocks pack ADJACENT PAIRS (low nibble = even element), matching CPU
   `KvQuantize` and `quant_kv.cu`; the weight dequant (`dequant_q4_0_f16`) unpacks low/high HALVES. Always use
   `CudaKernels.LaunchKvDequantToF16` for KV data. (The eager `CudaQuantizedKvCache` path used the weight dequant until
