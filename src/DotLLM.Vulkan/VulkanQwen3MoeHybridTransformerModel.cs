@@ -1878,6 +1878,9 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     /// <summary>Smallest token count that takes the expert-grouped coopmat MoE path; per instance so the qwen4exp wrapper can lower it (#876).</summary>
     internal int GroupedMinTokens { get; set; } = GroupedMinTokensDefault;
 
+    /// <summary>Opt-in (LFM2-MoE, #1015): decode-sized Q8_0 gate/up banks use the dp4a MMVQ kernel instead of the F32-in indexed kernel.</summary>
+    internal bool Q8GateUpMmvq { get; set; }
+
     /// <summary>
     /// Grouped-by-expert routed FFN (issue #637). Buffer reuse: MoeExpandedInput (broadcast rows) -> packed rows in MoeDownRows ->
     /// gate/up into MoeGateInter/MoeUpInter (packed order) -> SwiGLU -> grouped down into MoeExpandedInput (dead by now) -> ungroup into
@@ -2154,6 +2157,20 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 _state.MoeTopkIndices, _state.MoeUpInter,
                 m: interm, k: hidden, n: expandedRows, numExperts: numE);
             }
+        }
+        else if (Q8GateUpMmvq && decodeMmvq && moeW.W1QuantType == QuantizationType.Q8_0 && moeW.W3QuantType == QuantizationType.Q8_0
+            && _kernels.MoeMmvqQ8_0 is not null && _kernels.QuantizeQ8_1RowsActivations is not null && (hidden % 32) == 0)
+        {
+            // #1015: decode-sized Q8_0 gate/up banks read the Q8_1-quantized activation through the dp4a MMVQ kernel (the down projection already does)
+            // instead of the one-thread-per-cell F32-in indexed kernel: LFM2.5 decode gate/up measured ~42 GB/s there vs ~190 GB/s on the MMVQ.
+            _kernels.QuantizeQ8_1RowsActivations.Record(cmdBuf,
+                _state.MoeExpandedInput, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
+                n: expandedRows, k: hidden);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            _kernels.MoeMmvqQ8_0.Record(cmdBuf, moeW.W1Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
+                _state.MoeTopkIndices, _state.MoeGateInter, m: interm, k: hidden, n: expandedRows, numExperts: numE);
+            _kernels.MoeMmvqQ8_0.Record(cmdBuf, moeW.W3Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
+                _state.MoeTopkIndices, _state.MoeUpInter, m: interm, k: hidden, n: expandedRows, numExperts: numE);
         }
         else if (IsIqBankQuant(moeW.W1QuantType) || IsIqBankQuant(moeW.W3QuantType))
         {

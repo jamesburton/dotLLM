@@ -133,7 +133,7 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
         float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
         var host = VulkanQwen3MoeHybridTransformerModel.CreateLayerlessHost(device, config, spvDir, head,
             cpu.KvSlotForLayer, cpu.AttentionLayerCount, ropeDim, ropeTheta);
-        host.LfmGroupedMinTokens = Math.Max(host.LfmGroupedMinTokens, 1);
+        host.Q8GateUpMmvq = Environment.GetEnvironmentVariable("DOTLLM_VK_LFM2_Q8_GATEUP_MMVQ") != "0";
 
         var layers = new LayerDev[config.NumLayers];
         var layout = config.HybridLayout!;
@@ -484,7 +484,7 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
 
             // Windows TDR: a single submission must finish within ~2 s. A 512-token prefill of the whole stack does not, so a multi-row
             // forward is cut into one submission per layer.
-            if (T > 1 && layer + 1 < _layers.Length && !StageProfile)
+            if (T > 1 && (layer + 1) % LayersPerSubmit(T) == 0 && layer + 1 < _layers.Length && !StageProfile)
             {
                 Fb(cmd);
                 submit.SubmitAndWait();   // SplitSubmit is limited to one use per forward; per-layer waits are noise next to a prefill layer
@@ -532,6 +532,9 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
             _moeSub.Clear();
         }
     }
+
+    /// <summary>Layers recorded per submission on a multi-row forward (TDR budget: ~2 s per submission; a layer is ~15 ms at 512 rows).</summary>
+    private static int LayersPerSubmit(int T) => T >= 4096 ? 1 : T >= 1536 ? 2 : 4;
 
     private bool EnsureDense(int T)
     {
