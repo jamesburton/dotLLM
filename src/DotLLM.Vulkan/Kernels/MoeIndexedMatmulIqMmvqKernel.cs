@@ -99,6 +99,19 @@ public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
     private readonly int _buffersPerSet;
     private bool _disposed;
 
+    /// <summary>
+    /// Formats that have a V2 shader (issue #991): same integer dp4a math as V1, but each lane owns a whole 32-element sub-block of one of four
+    /// blocks per step, so a wave issues ~5x fewer load instructions per weight byte (V1 was issue/latency bound at ~70-110 GB/s on gfx1151).
+    /// The float summation order over a row differs from V1 (rounding-level).
+    /// </summary>
+    internal static bool HasV2(MoeIqQuant quant) => quant is MoeIqQuant.IQ1_M or MoeIqQuant.IQ2_XXS or MoeIqQuant.IQ2_XS;
+
+    /// <summary>Default for new kernels; <c>DOTLLM_VK_MOE_IQ_V2=0</c> selects the V1 shaders (A/B and bisection).</summary>
+    internal static bool V2Default { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_IQ_V2") != "0";
+
+    /// <summary>True when this instance runs the V2 shader.</summary>
+    public bool IsV2 { get; }
+
     /// <summary>The bank format this kernel reads.</summary>
     public MoeIqQuant Quant { get; }
 
@@ -109,8 +122,9 @@ public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
     public int GroupSize { get; }
 
     private MoeIndexedMatmulIqMmvqKernel(MoeIqQuant quant, VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
-        int buffersPerSet, VulkanDevice.Buffer[] codebooks)
+        int buffersPerSet, VulkanDevice.Buffer[] codebooks, bool isV2)
     {
+        IsV2 = isV2;
         Quant = quant;
         (BlockBytes, GroupSize) = Describe(quant);
         _device = device;
@@ -126,7 +140,9 @@ public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
     public static (int BlockBytes, int GroupSize) Describe(MoeIqQuant quant) => MoeIqFormats.Describe(quant);
 
     /// <summary>The MMVQ shader file (without extension) for <paramref name="quant"/>.</summary>
-    public static string ShaderName(MoeIqQuant quant) => quant switch
+    public static string ShaderName(MoeIqQuant quant, bool v2 = false) => ShaderBase(quant) + (v2 ? "_v2" : "");
+
+    private static string ShaderBase(MoeIqQuant quant) => quant switch
     {
         MoeIqQuant.IQ3_S => "moe_indexed_matmul_iq3_s_mmvq",
         MoeIqQuant.IQ4_XS => "moe_indexed_matmul_iq4_xs_mmvq",
@@ -148,11 +164,12 @@ public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
     /// SPV is missing or the device lacks integer-dot-product support. <paramref name="iq3Codebooks"/> supplies the iq3s grid (required
     /// for <see cref="MoeIqQuant.IQ3_S"/>, ignored otherwise; the caller keeps ownership).
     /// </summary>
-    internal static MoeIndexedMatmulIqMmvqKernel? TryCreate(VulkanDevice device, string spvDir, MoeIqQuant quant, Iq3Codebooks? iq3Codebooks = null, Iq2Codebooks? iq2Codebooks = null, Iq1Codebooks? iq1Codebooks = null)
+    internal static MoeIndexedMatmulIqMmvqKernel? TryCreate(VulkanDevice device, string spvDir, MoeIqQuant quant, Iq3Codebooks? iq3Codebooks = null, Iq2Codebooks? iq2Codebooks = null, Iq1Codebooks? iq1Codebooks = null, bool? v2 = null)
     {
         if (!device.HasIntegerDotProduct)
             return null;
-        string path = Path.Combine(spvDir, ShaderName(quant) + ".spv");
+        bool useV2 = (v2 ?? V2Default) && HasV2(quant);
+        string path = Path.Combine(spvDir, ShaderName(quant, useV2) + ".spv");
         if (!File.Exists(path))
             return null;
         var codebooks = MoeIqFormats.Codebooks(quant, iq3Codebooks, iq2Codebooks, iq1Codebooks);
@@ -179,7 +196,7 @@ public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)buffersPerSet);
-        return new MoeIndexedMatmulIqMmvqKernel(quant, device, module, pipeline, pool, buffersPerSet, codebooks);
+        return new MoeIndexedMatmulIqMmvqKernel(quant, device, module, pipeline, pool, buffersPerSet, codebooks, useV2);
     }
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
