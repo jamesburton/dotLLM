@@ -443,6 +443,13 @@ public sealed unsafe class Lfm2MoeTransformerModel : IModel
             selectionBias: moe.SelectionBias is null ? default : moe.SelectionBias.AsSpan(),
             weightsScale: moe.WeightsScale);
 
+        if (TensorDump.Enabled)
+        {
+            // Router decisions for cross-engine agreement checks: [T, K] expert ids as floats.
+            float* ids = _s.Q; // scratch: free during the FFN sub-layer
+            for (int i = 0; i < total; i++) ids[i] = assignExpert[i];
+            TensorDump.Dump2D($"blk.{layer}.moe_topk", ids, T, K);
+        }
         var gQt = moe.GateExpsRawQt; var uQt = moe.UpExpsRawQt; var dQt = moe.DownExpsRawQt;
         MoeSwiGluMlp.ExecuteRoutedFromAssignments(
             hidden: new ReadOnlySpan<float>(normOut, T * H),
@@ -456,7 +463,8 @@ public sealed unsafe class Lfm2MoeTransformerModel : IModel
             numExperts: E, numExpertsPerTok: K, hiddenSize: H, intermediateSize: I, seqLen: T,
             sharedGateProj: moe.SharedGateProj, sharedUpProj: moe.SharedUpProj, sharedDownProj: moe.SharedDownProj,
             sharedIntermediateSize: moe.SharedIntermediateSize, sharedExpertGate: ReadOnlySpan<float>.Empty,
-            loraAdapter: null, loraLayer: layer, threadPool: _threadPool);
+            loraAdapter: null, loraLayer: layer, threadPool: _threadPool,
+            packedLegacyExperts: LegacyPacked);
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
