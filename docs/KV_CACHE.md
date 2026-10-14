@@ -13,6 +13,36 @@ Llama 3 8B, FP16, 2048 tokens:
 ```
 Scales linearly with sequence length and batch size. Dominant memory consumer in production.
 
+### Quantized KV-Cache Memory
+
+Quantizing the KV-cache to Q8_0 or Q4_0 reduces memory by 3.8-7.1x vs FP32,
+enabling long-context inference on memory-constrained systems.
+
+Effective bytes per element (including 2-byte scale per 32-element block):
+
+| Format | Bytes/element | Compression vs FP32 |
+|--------|---------------|---------------------|
+| FP32   | 4.000         | 1.0x                |
+| FP16   | 2.000         | 2.0x                |
+| Q8_0   | 1.0625        | 3.8x                |
+| Q4_0   | 0.5625        | 7.1x                |
+
+KV bytes per token (K+V, one layer, `kvStride = numKvHeads * headDim`):
+
+| Model shape       | KV heads | head_dim | FP32   | Q8_0   | Q4_0   | K8V4   |
+|--------------------|----------|----------|--------|--------|--------|--------|
+| Qwen3.5 27B Dense  | 4        | 128      | 4096 B | 1088 B | 576 B  | 832 B  |
+| Llama 3 8B/70B     | 8        | 128      | 8192 B | 2176 B | 1152 B | 1664 B |
+
+Example: Qwen3.5 27B, 64 layers, 64K context:
+- FP32: 16.4 GB
+- Q8_0: 4.4 GB (3.8x savings)
+- K8V4: 3.3 GB (5.0x savings)
+- Q4_0: 2.3 GB (7.1x savings)
+
+See `.docs/kv_quant_memory_estimates.md` for per-hardware breakdowns (hybrid
+GPU/CPU split, T5500/Framework/Strix targets).
+
 ## Simple KV-Cache (Phase 1)
 
 Pre-allocated contiguous buffer per sequence:
@@ -22,9 +52,30 @@ V_cache[layer][kv_head][max_seq_len][head_dim]  — FP16
 ```
 Simple indexing: `K_cache[layer][head][pos] = new_K`. Wastes memory for short sequences.
 
+### Hybrid-aware geometry (issue #839)
+
+For hybrid models (`ModelConfig.HybridLayout` set: Qwen3.5/3.6/3.8 GDN, Nemotron-H, Qwen4-Exp) only the attention layers hold K/V.
+`KvGeometry.FromConfig` therefore allocates **slots for attention layers only**, in layer order (slot k = k-th attention layer — the
+`kvSlotForLayer` convention every hybrid forward pass, CPU/Vulkan/CUDA, already uses). The geometry exposes the map:
+`HasLayerSlotMap`, `SlotOfLayer(modelLayer)` (-1 for a recurrent layer), `ModelLayerCount`; `LayerCount` is the **slot** count and
+`KvStrideOf(slot)` takes a slot. `KvGeometry.SlotCount(config)` is the allocation-free slot count (use it instead of
+`config.NumLayers` anywhere a cache or handoff is sized). A 1-in-4 hybrid (Qwen4-Exp: 12 of 48) allocates 4x less KV; dense models
+are unchanged (`HasLayerSlotMap == false`, identity map). Vulkan (`VulkanNemotronHKvCache`) and CUDA (`CudaNemotronHKvCache`) hybrid
+caches were already sparse; the CPU `SimpleKvCache` / `QuantizedKvCache` / `TurboQuantKvCache`, the hybrid CPU-tail cache of the
+split Qwen3-hybrid model, the KV handoff paths and the CLI memory estimate now agree with them.
+
+### Vulkan hybrid KV: element format and lazy growth (issue #898)
+
+`VulkanNemotronHKvCache` (shared by the Vulkan Nemotron-H, Qwen3.5/3.6/3.8 hybrids and Qwen4-Exp) takes two opt-in constructor arguments, both OFF by default so existing models are
+untouched: `storage: VulkanKvStorage.F16` (K/V rows written by a convert kernel, 2 bytes per element; only the Qwen4-Exp QSA gather kernel reads them, so it is created only through the
+Qwen4-Exp model) and `lazy: true` (buffers start empty and `EnsureCapacity(positions)` reallocates layer by layer, 25 % / >= 1024 positions at a time, copying the live prefix).
+`MaxLength` is the logical limit, `AllocatedLength` the physical one. After `EnsureCapacity` returns true the CALLER must drop every descriptor cache that may name the freed buffers
+(handles are recycled; a stale cached set reads zeros without any error). Qwen4-Exp does this in `ForwardCore` before recording (`EnsureContext`), for the sequence's K/V and its indexer
+state. Switches and measurements: [ATTENTION.md](ATTENTION.md), "Lazy growth and F16 K/V".
+
 ## Paged KV-Cache
 
-Inspired by OS virtual memory paging. This is the **memory management** half of PagedAttention (vLLM): block-based allocation, ref counting, CoW. The **kernel** half (attention reading non-contiguous blocks directly) is a future step — current kernels see contiguous buffers via staging-buffer gather.
+Inspired by OS virtual memory paging. This is the **memory management** half of PagedAttention (vLLM): block-based allocation, ref counting, CoW. The **kernel** half (attention reading non-contiguous blocks directly) is opt-in on CUDA as of issue #200 (`DOTLLM_ATTN_PAGED_NATIVE=1`, decode only — see the CUDA section below); it remains a future step for CPU and any future Vulkan paged cache, where current kernels still see contiguous buffers via staging-buffer gather.
 
 ### Why
 
@@ -62,6 +113,53 @@ Future optimization: specialized paged attention kernels that read blocks direct
 - `PagedKvCache : IKvCache` — Paged cache with staging-buffer gather. Drop-in replacement for `SimpleKvCache`.
 - `PagedKvCacheFactory` — Creates `PagedKvCache` instances backed by a shared `KvBlockPool`.
 
+### CUDA Paged KV-Cache (issue #252)
+
+GPU-resident mirror of the above, in `DotLLM.Cuda`:
+
+- `CudaKvBlockPool` — Same `[totalBlocks, blockSize, kvStride]` shape as `KvBlockPool`, but block
+  storage lives in device memory (FP16, matching `CudaKvCache`'s on-device element type) instead of
+  host `NativeMemory`. Allocation/free-list/refcount bookkeeping stays host-side (a C# `lock` +
+  `Interlocked`, identical to the CPU pool) — only block storage and copy-on-write duplication
+  (`CopyBlock`) touch the device. Built around `KvGeometry` (per-layer stride) rather than a single
+  scalar stride, matching `CudaKvCache`/`CudaQuantizedKvCache`'s existing generalization for
+  Gemma-4's non-uniform layer shapes.
+- `CudaKvBlockTable` — Per-sequence block table, same semantics as `KvBlockTable` (`Fork`,
+  `EnsureWritable`/CoW, `SeedSharedBlocks`, `SnapshotFullBlocks`), except `EnsureWritable` drives a
+  device-to-device async copy on a caller-supplied CUDA stream instead of `Buffer.MemoryCopy`.
+- `CudaPagedKvCache : IKvCache, IPerLayerKvCache` — Device-pointer-only cache (mirrors
+  `CudaKvCache`/`CudaQuantizedKvCache`'s convention: `Update(ITensor/TensorRef)`,
+  `GetKeys`/`GetValues`, and `GetKeysRef`/`GetValuesRef` all throw `NotSupportedException`). Driven
+  via `UpdateDevice` (block-boundary-batched D2D writes, allocating/CoW'ing blocks as needed) and
+  `PrepareAttentionScratch` (gathers this layer's blocks into a contiguous FP16 scratch buffer via
+  D2D copies — the GPU-side equivalent of `PagedKvCache`'s staging-buffer gather). The existing
+  CUDA attention kernels are unmodified; they read the gathered scratch exactly like a plain
+  `CudaKvCache`'s buffer.
+- `CudaPagedKvCacheFactory` — Creates `CudaPagedKvCache` instances backed by a shared
+  `CudaKvBlockPool`, mirroring `PagedKvCacheFactory`.
+- Wired into `CudaTransformerModel` via `CreateKvBlockPool`/`CreatePagedKvCache`, and into `--paged`
+  for the `run`/`chat`/`serve` CLI commands.
+- `CudaTransformerModel.ForwardBatch` (issue #251) is a real, fused-launch-sequence override — no
+  longer the `IModel` per-sequence-loop default — so `ContinuousBatchScheduler`-driven multi-sequence
+  decode on CUDA runs through this cache's dispatch too, not just single-sequence `run`/`chat`.
+
+**Issue #200 (opt-in, default OFF)**: a direct block-table-read decode attention kernel,
+`attention_f16_paged`, now exists alongside the default gather-into-scratch path — see
+`docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md` for the full design/implementation note. Set
+`DOTLLM_ATTN_PAGED_NATIVE=1` to enable it. It reads K/V rows through a small per-layer array of
+block base device pointers (`CudaPagedKvCache.PrepareNativeBlockPtrs`) instead of gathering KV
+bytes into a contiguous scratch buffer first (`PrepareAttentionScratch`), eliminating that D2D copy
+on the decode hot path. Restricted to decode (`seqLen == 1`); prefill still uses the gather-based
+path (G3/flash prefill kernels need a contiguous buffer regardless). Default remains the
+gather-based dispatch — this kernel is unmeasured on real hardware as of this writing (see the
+design doc's "What's still unverified" section) and is deliberately opt-in per this project's
+"don't ship an unvalidated kernel as the default" convention.
+
+**Still not wired**: `ContinuousBatchScheduler`'s own paged-pool-aware preemption/prefix-trie logic
+(`pagedPool:` parameter) is CPU-`KvBlockPool`-typed and does not drive `CudaPagedKvCache` — CUDA
+requests still get scheduled without paged-cache-aware preemption, even though the cache itself is
+now paged. This is a separate scheduler-integration gap, not part of #200's scope.
+
 ### CLI
 
 ```
@@ -78,9 +176,23 @@ dotllm serve model.gguf --no-ui
 
 ### Limitations (v1)
 
-- CPU `PagedKvCache` only. CUDA and hybrid models fall back to their native KV-cache.
-- Not compatible with quantized KV-cache (`--cache-type-k`/`--cache-type-v`). Falls back to `QuantizedKvCache` with a warning.
-- Staging buffer means `GetKeysRef`/`GetValuesRef` results are only valid until the next call (shared buffer).
+- CUDA now has a paged KV-cache (issue #252, see above) via `CudaPagedKvCache`. Hybrid (CPU+GPU
+  split-layer) models still fall back to their native KV-cache — `CudaKvBlockPool`'s per-layer
+  shape assumes every layer's storage lives on one device, which doesn't fit the hybrid split.
+- Not compatible with quantized KV-cache (`--cache-type-k`/`--cache-type-v`) on either backend.
+  Falls back to `QuantizedKvCache`/`CudaQuantizedKvCache` with a warning.
+- Staging buffer means `GetKeysRef`/`GetValuesRef` (CPU) results are only valid until the next call
+  (shared buffer). CUDA's `CudaPagedKvCache` doesn't implement `GetKeysRef`/`GetValuesRef` at all —
+  there's no single contiguous device pointer to hand back without a gather — callers must use
+  `PrepareAttentionScratch(layerIndex, stream)` instead.
+- CUDA paged KV-cache is not wired into `ContinuousBatchScheduler`'s paged-pool-aware preemption —
+  see the CUDA section above.
+- CUDA has an opt-in direct block-table-read decode attention kernel now (issue #200,
+  `DOTLLM_ATTN_PAGED_NATIVE=1`, see the CUDA section above and
+  `docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md`), but it defaults OFF pending real-hardware
+  measurement, and it only covers CUDA decode — CPU's `PagedKvCache` and any future Vulkan paged
+  cache still only have the staging-buffer-gather shape (see `docs/ROADMAP.md`'s "Paged attention
+  kernels" row for the remaining backends/prefill scope).
 
 ## KV-Cache Quantization
 
@@ -118,6 +230,77 @@ On each new token write, the oldest window entry is quantized and appended to th
 ```
 
 Orthogonal to weight quantization — Q4_K_M model can use Q8_0 KV-cache.
+
+## MLA KV-Cache (DeepSeek-V2 / V3)
+
+MLA decouples Q head-dim from V head-dim (V2-Lite: qk=192, v=128) and adds
+a shared MQA-style rope-K that broadcasts across heads — neither fits the
+per-head-uniform `IKvCache` shape that GQA/MHA caches assume. A dedicated
+`MlaExpandedKvState` lives next to `TransformerModel` for this reason.
+
+**Loader default**: HF and GGUF config extractors both set `MlaConfig.UseHybridMlaCache = true` for `Architecture.DeepSeekV2` / `Architecture.DeepSeekV3`, so production code paths get **Phase C** (hybrid latent + absorbed decode) without needing per-call configuration. Phase A remains active and is the numerical oracle; tests that build `MlaConfig` directly (bypassing the loader) still default to Phase A. The default flip lives at commits `4b54a72` (HF) and `4724397` (GGUF) — pre-flip, V2-Lite at `max_position_embeddings=163840` allocated ~68 GB and OOM'd on most hosts.
+
+### Phase A — expanded reference cache
+
+`src/DotLLM.Models/Architectures/MlaExpandedKvState.cs`. Per layer:
+
+- `K_nope[layer]` : `[maxSeqLen, numHeads * qkNopeHeadDim]` — per-head non-rope K
+- `V[layer]` : `[maxSeqLen, numHeads * vHeadDim]` — per-head V
+- `KPe[layer]` : `[maxSeqLen, qkRopeHeadDim]` — shared rope-K (post-rotation)
+
+All 64-byte aligned native memory, lazily constructed on the first MLA
+forward and reset when the caller signals a fresh sequence by passing
+`positions[0] == 0`. Not re-entrant; single-stream only (beam search or
+batching needs per-sequence instances). Caller-supplied `IKvCache` is
+ignored for MLA layers.
+
+This layout is the PoC scalar kernel's scratch layout made persistent —
+storage is 1:1 with what the kernel already computes, so zero shape
+translation. Memory: ~16.6 KB per token per layer at F32 for V2-Lite;
+on a 27-layer 8K context that's ~3.6 GB. The purpose of Phase A is
+**correctness oracle**: generation works end-to-end and a split call
+(prefill + step-by-step decode) produces logits that match a single-call
+forward over the combined range within 1e-4.
+
+### Phase B — pure latent + W_UK absorbed (landed)
+
+The production memory win (per the DeepSeek-V2 paper, §2.1.2): store
+the *compressed* latent `c_kv[kv_lora_rank]` per token (512 floats for
+V2-Lite) alongside the shared `k_pe[qk_rope_head_dim]` (64 floats) —
+a single `[kv_lora_rank + qk_rope_head_dim] = 576` value per token per
+layer, 7.2× smaller than Phase A at F32. Attention math absorbs `W_UK`
+into Q on-the-fly: `Q_latent[h] = Q_nope[h] @ W_UK_T[h]` (size
+kv_lora_rank) and `score[h, t, s] = Q_latent[h] · c_kv[s] + Q_pe[h]
+· k_pe[s]`. Output uses absorbed `W_UV`: `out[h] = W_UV[h] @ (softmax
+· c_kv)`. vLLM's MLA backend is the reference implementation.
+
+Lives at `src/DotLLM.Models/Architectures/MlaLatentKvState.cs` +
+`src/DotLLM.Cpu/Kernels/MlaAttention.ExecuteLatent`. Selected via
+`MlaConfig.UseLatentCache = true` (mutually exclusive with
+`UseHybridMlaCache`).
+
+### Phase C — hybrid: latent persistence + Phase A-equivalent prefill expand + absorbed decode (landed, default)
+
+The production-shipping path mirrors vLLM's MLA backend: prefill
+(`seqLen > 1`) expands cached latents through `W_UK` / `W_UV` into
+local scratch and runs the standard 192-dim per-head MHA loop
+(compute-bound at long seqKv); decode (`seqLen == 1`) delegates to
+`ExecuteLatent` — the absorbed 576-dim MQA-style read of the compact
+latent cache (bandwidth-bound at decode). Both paths persist the
+SAME latent form (c_kv + k_pe per token) to `MlaLatentKvState` —
+Phase A's expanded per-head K_nope/V is local prefill scratch and is
+discarded. A decode step therefore consumes exactly the latents a
+pure-Phase-B prefill would have written, so the absorbed kernel can
+run over them without re-expansion.
+
+Lives at `src/DotLLM.Cpu/Kernels/MlaAttention.ExecuteLatentHybrid`.
+Selected via `MlaConfig.UseHybridMlaCache = true` (mutually
+exclusive with `UseLatentCache`). **Default for DeepSeek-V2/V3 from
+the loaders.**
+
+Phase A is the numerical oracle for Phase B / Phase C: oracle tests
+prove split-call match against the expanded-cache reference at 1e-3
+drift on real-weight prompts.
 
 ## Simple Prompt Caching (Step 54)
 
@@ -159,23 +342,84 @@ Each turn's prompt = previous prompt + assistant response + new user message. Th
 
 `InferenceTimings.CachedTokenCount` reports how many prompt tokens were served from cache. Displayed in CLI output, API `timings.cached_tokens`, and Chat UI stats bar.
 
-## Advanced Prompt Caching / Prefix Sharing (Future — Step 36+)
+## Advanced Prompt Caching / Prefix Sharing (Step 37)
 
-Requires paged KV-cache. Enables cross-request prefix sharing (e.g., shared system prompts across users).
+Cross-request prefix sharing on top of paged KV-cache. Shared system prompts
+are computed once and reused by every subsequent request, regardless of which
+sequence first filled the trie.
 
 ### Problem
+
 Many requests share the same system prompt (e.g., all chat requests in a deployment).
 Recomputing KV-cache for the shared prefix is wasteful.
 
-### Solution: Prefix Trie
-- Maintain a **trie** of recently computed prompt prefixes, keyed by token sequences.
-- On new request: walk the trie matching the prompt's token sequence.
-- If match found: share the cached KV blocks (read-only), only prefill the new suffix.
+### Solution: Prefix Trie (RadixAttention-style)
 
-### Implementation
-- Shared blocks use **reference counting**. Freed when all referencing sequences complete.
-- **LRU eviction** when memory scarce. Frequently used prefixes (system prompts) stay cached.
-- **Explicit registration**: Server API accepts `prefix_id` for deterministic caching.
+A block-granular radix trie of computed KV blocks. Each path from the root
+corresponds to a sequence of physical blocks in the shared `KvBlockPool`; the
+tokens that filled each block are the "label" on that edge.
 
-### Integration with PagedAttention
-The prefix trie stores references to physical KV blocks. New sequences get their own block table with shared prefix entries pointing to existing blocks, plus new blocks for the suffix. Copy-on-write if modification needed (rare — KV cache is append-only).
+- Walks one step per `BlockSize` (16) tokens of prompt.
+- FNV-1a 64-bit hash keys the child map; full-token comparison guards against
+  collisions (the trie reuses **full** blocks only).
+- Per-node `RefCount` + `LastTouchedTicks` so zero-refcount LRU leaves are
+  evictable on block-pool pressure.
+
+### Key Classes
+
+- `PrefixTrie` — the radix structure itself. `Lookup` / `Insert` /
+  `Release` / `EvictOneLru` / `RegisterNamedPrefix` / `UnpinNamedPrefix`.
+- `PrefixTrieManager` — single integration seam in front of `PagedKvCache`.
+  Owns the trie + the paged-cache factory; mints per-sequence caches seeded
+  with the longest matching prefix and routes completion back into the trie.
+- `PrefixCacheConfig` — `Enabled` (default true when paged is active),
+  `MaxPrefixDepth` (token cap, 0 = unbounded), `EvictionEnabled`.
+
+### Refcount Lifecycle
+
+For each block in the trie:
+
+1. **Trie ref**: created when `Insert` links a freshly-computed block.
+   Released when the node is evicted.
+2. **Sequence ref**: created when `Lookup` matches a block (one per
+   `Admit` call). Released when the sequence's `PagedKvCache.Dispose` runs.
+3. **Named-prefix pin**: created when `RegisterNamedPrefix` pins a path.
+   Released by `UnpinNamedPrefix`.
+
+LRU eviction picks zero-refcount nodes (no active sequence, no pin); the
+trie ref is then released and the block returns to the pool.
+
+### Scheduler Integration
+
+`ContinuousBatchScheduler` accepts an optional `PrefixTrieManager`. When
+present, admission seeds a new sequence's cache from the trie (only the
+suffix runs through `Forward`) and completion pushes new blocks back so
+later requests reuse them. The admission loop calls `TryEvict` to relieve
+block-pool pressure before refusing admission — active sequences are NOT
+preempted (that's Step 59).
+
+`TextGenerator` accepts an optional `PrefixTrieManager` too; it takes
+precedence over the simple `PrefixCache` from Step 54. Both engine paths
+(scheduler + single-session generator) benefit from the trie.
+
+### Server API
+
+- `GET /v1/prompt-cache` — stats for the active trie.
+- `GET /v1/prompt-cache/{id}` — inspect a named prefix.
+- `POST /v1/prompt-cache/{id}` — pre-warm + pin a named prefix
+  (body: `{ "prompt": "..." }` or `{ "token_ids": [...] }`).
+- `DELETE /v1/prompt-cache/{id}` — unpin a named prefix.
+- `DELETE /v1/prompt-cache` — clear the entire trie.
+- `prefix_id` field on chat/completion requests — best-effort hint that
+  validates the named prefix exists before the request runs.
+
+### Limitations (Step 37 MVP)
+
+- Block-level (16-token) match granularity — partial trailing blocks
+  are NOT shared.
+- Paged KV-cache only (CPU). GPU caches fall back to the per-sequence
+  Step 54 behaviour. Quantized KV-cache fall back too.
+- Eviction only frees zero-refcount blocks. Preempting active sequences
+  to make room is deferred to Step 59 (priority-based scheduling).
+- The trie walks linearly to find a node by block id during `Release`;
+  good enough for typical depths (< 1024 blocks) but a future tweak.

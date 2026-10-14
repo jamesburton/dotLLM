@@ -29,3 +29,7 @@ This file defines the foundational mandates for Gemini CLI's operation within th
 ## Documentation Reference
 
 Always consult the relevant specification in `docs/` before modifying a module (e.g., `docs/QUANTIZATION.md` for kernel changes).
+
+## Local Handoff
+
+If `.docs/HANDOFF.md` exists, read it at session start before planning or editing. This private, git-ignored folder tracks concise local progress and next tasks. Maintain `.docs/HANDOFF.md` when durable progress, benchmark results, or task context changes. Put longer load-on-demand notes in sibling files such as `.docs/FUTURE_TASKS.md` and link them from the handoff.

@@ -1,0 +1,130 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Fused dual-output Q8_0 MMVQ decode GEMV (issue #71): computes TWO
+// independent same-K, same-quant-type GEMVs that share one pre-quantized
+// Q8_1 activation IN ONE DISPATCH:
+//
+//   ya[m] = sum_k Wa_q8[m,k] * x[k]      for m in [0, Ma)
+//   yb[m] = sum_k Wb_q8[m,k] * x[k]      for m in [0, Mb)
+//
+// Replaces the two-dispatch sequence used by RecordSharedInputMmvqGroup for
+// a same-input pair (e.g. FFN gate_proj + up_proj, both K = hidden_size):
+//   matmul_q8_0_mmvq(A)  ->  matmul_q8_0_mmvq(B)
+// (no barrier was needed between them since they only read the shared xq/xds
+// scratch and write disjoint outputs — but each was still a SEPARATE
+// vkCmdDispatch + vkCmdBindPipeline + vkCmdBindDescriptorSets). On an
+// underfilled decode GPU (SmolLM-class hidden=576: gate/up together are the
+// single largest GPU-time category, ~41% of the per-token decode budget per
+// the #71 profiling pass) collapsing the two dispatches into one removes a
+// dispatch-boundary + a pipeline (re)bind, and lets the driver schedule both
+// halves' workgroups together against one underfilled wave of SMs instead of
+// two separately-launched underfilled waves.
+//
+// Per-row kernel body is copied VERBATIM from matmul_q8_0_mmvq.comp (the
+// coalesced lane=K-position layout, issue #338) — bit-identical per-row
+// output to running the two GEMVs separately. Row selection: workgroup id m
+// in [0, Ma) is row m of A; m in [Ma, Ma+Mb) is row (m - Ma) of B.
+//
+// Both matrices MUST share K (hence blocksPerRow) — true for any same-input
+// pair (gate/up share hidden_size; q/k/v would too, but their M's differ per
+// head-count and this 2-way kernel only fuses pairs. A 3-way Q/K/V variant is
+// a natural follow-up using the same row-selection trick with one more
+// weight/output buffer pair).
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufWa  { uint  weightA[]; }; // Q8_0 blob A, 4-byte indexable
+layout(set = 0, binding = 1, std430) readonly  buffer BufWb  { uint  weightB[]; }; // Q8_0 blob B, 4-byte indexable
+layout(set = 0, binding = 2, std430) readonly  buffer BufXq  { uint  xq[]; };      // [K/4] packed int8 activations (shared)
+layout(set = 0, binding = 3, std430) readonly  buffer BufXds { vec2  xds[]; };     // [K/32] (d_x, s_x) (shared)
+layout(set = 0, binding = 4, std430) writeonly buffer BufYa  { float ya[]; };      // [Ma]
+layout(set = 0, binding = 5, std430) writeonly buffer BufYb  { float yb[]; };      // [Mb]
+
+layout(push_constant) uniform PushConstants {
+    uint Ma;           // output rows of A
+    uint Mb;           // output rows of B
+    uint blocksPerRow; // = K / 32 (shared by both — same K)
+} pc;
+
+const uint UINT16_PER_BLOCK = 17u;  // 34 bytes = 1 scale + 16 qs (uint16)
+const uint WINDOW_BLOCKS    = 8u;   // 32 lanes * 8 int8/lane = 256 weights = 8 blocks
+
+// Read one uint16 (little-endian) from a 4-byte-indexed weight buffer at the
+// given uint16 index. Duplicated per-buffer (GLSL has no buffer-reference
+// genericity over a plain std430 array binding without extra extensions) —
+// kept as two tiny free functions rather than a bigger refactor.
+uint readU16A(uint idx16) {
+    uint w = weightA[idx16 >> 1u];
+    return ((idx16 & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
+}
+uint readU16B(uint idx16) {
+    uint w = weightB[idx16 >> 1u];
+    return ((idx16 & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
+}
+
+// Shared per-row body — copied verbatim from matmul_q8_0_mmvq.comp's main(),
+// parameterised over which weight buffer to read via `useA` (resolved at
+// compile time is not possible per-invocation, so this takes a bool and lets
+// the compiler predicate the two readU16 calls; both branches are cheap
+// uniform-per-workgroup control flow, not per-lane divergence, since `useA`
+// is derived from gl_WorkGroupID.x which is uniform across the subgroup).
+void computeRow(uint rowInMatrix, bool useA) {
+    uint lane = gl_LocalInvocationID.x;        // 0..31 (one subgroup per workgroup)
+    uint blockInWindow = lane >> 2u;           // 0..7 : which block of the 8-block window
+    uint subInBlock    = lane & 3u;            // 0..3 : which 8-int8 quarter of that block
+    uint qOff16        = 1u + 4u * subInBlock; // uint16 offset into the block's qs for this lane
+
+    uint rowBase16 = rowInMatrix * pc.blocksPerRow * UINT16_PER_BLOCK;
+
+    float acc = 0.0;
+    for (uint w0 = 0u; w0 < pc.blocksPerRow; w0 += WINDOW_BLOCKS) {
+        uint blk = w0 + blockInWindow;
+        if (blk >= pc.blocksPerRow)
+            continue;
+
+        uint blkBase16 = rowBase16 + blk * UINT16_PER_BLOCK;
+        uint qb = blkBase16 + qOff16;
+
+        float dW;
+        uint w32a, w32b;
+        if (useA) {
+            dW  = unpackHalf2x16(readU16A(blkBase16)).x;
+            w32a = readU16A(qb)      | (readU16A(qb + 1u) << 16u);
+            w32b = readU16A(qb + 2u) | (readU16A(qb + 3u) << 16u);
+        } else {
+            dW  = unpackHalf2x16(readU16B(blkBase16)).x;
+            w32a = readU16B(qb)      | (readU16B(qb + 1u) << 16u);
+            w32b = readU16B(qb + 2u) | (readU16B(qb + 3u) << 16u);
+        }
+
+        float dX = xds[blk].x;
+
+        uint xbase = blk * 8u + 2u * subInBlock;
+        uint xa = xq[xbase];
+        uint xb = xq[xbase + 1u];
+
+        int dotI = 0;
+        dotI = dotPacked4x8AccSatEXT(int(w32a), int(xa), dotI);
+        dotI = dotPacked4x8AccSatEXT(int(w32b), int(xb), dotI);
+
+        acc += (dW * dX) * float(dotI);
+    }
+
+    float total = subgroupAdd(acc);
+    if (subgroupElect()) {
+        if (useA) ya[rowInMatrix] = total;
+        else      yb[rowInMatrix] = total;
+    }
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.Ma + pc.Mb) return;
+
+    if (m < pc.Ma)
+        computeRow(m, true);
+    else
+        computeRow(m - pc.Ma, false);
+}

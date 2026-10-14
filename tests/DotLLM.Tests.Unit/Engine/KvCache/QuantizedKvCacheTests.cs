@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
@@ -151,10 +152,9 @@ public sealed unsafe class QuantizedKvCacheTests
     [Fact]
     public void Dispose_IsSafeToCallMultipleTimes()
     {
-        var cache = new QuantizedKvCache(1, NumKvHeads, HeadDim, 8,
+        using var cache = new QuantizedKvCache(1, NumKvHeads, HeadDim, 8,
             KvCacheDType.Q8_0, KvCacheDType.Q8_0, windowSize: 0);
-        cache.Dispose();
-        cache.Dispose(); // Should not throw
+        cache.Dispose(); // Explicit dispose; the `using` scope disposes again on exit — should not throw
     }
 
     [Fact]
@@ -163,7 +163,7 @@ public sealed unsafe class QuantizedKvCacheTests
         using var cache = new QuantizedKvCache(NumLayers, NumKvHeads, HeadDim, MaxSeqLen,
             KvCacheDType.Q8_0, KvCacheDType.Q4_0, windowSize: 4);
 
-        IQuantizedKvCache qkv = cache;
+        using IQuantizedKvCache qkv = cache;
 
         Assert.Equal(KvCacheDType.Q8_0, qkv.KeyDType);
         Assert.Equal(KvCacheDType.Q4_0, qkv.ValueDType);
@@ -292,6 +292,65 @@ public sealed unsafe class QuantizedKvCacheTests
         }
     }
 
+    [Theory]
+    [InlineData(KvCacheDType.Q8_0)]
+    [InlineData(KvCacheDType.Q4_0)]
+    public void RoundTrip_RandomData_PerElementErrorBound(KvCacheDType dtype)
+    {
+        const int headDim = 64;
+        const int numKvHeads = 2;
+        const int kvStride = numKvHeads * headDim;
+        const int maxSeqLen = 4;
+
+        using var cache = new QuantizedKvCache(1, numKvHeads, headDim, maxSeqLen,
+            dtype, dtype, windowSize: 0);
+
+        var rng = new Random(42);
+        float[] input = new float[kvStride];
+        for (int i = 0; i < input.Length; i++)
+            input[i] = (float)(rng.NextDouble() * 2 - 1) * 5.0f;
+
+        nint kPtr = (nint)NativeMemory.AlignedAlloc((nuint)(kvStride * sizeof(float)), 64);
+        nint vPtr = (nint)NativeMemory.AlignedAlloc((nuint)(kvStride * sizeof(float)), 64);
+        try
+        {
+            new Span<float>((void*)kPtr, kvStride).Fill(0);
+            input.CopyTo(new Span<float>((void*)vPtr, kvStride));
+
+            var kRef = new TensorRef(1, kvStride, DType.Float32, -1, kPtr);
+            var vRef = new TensorRef(1, kvStride, DType.Float32, -1, vPtr);
+            cache.Update(kRef, vRef, [0], layerIndex: 0);
+
+            Assert.Equal(1, cache.QuantizedLength);
+
+            // Dequant the stored values and compare per-element
+            nint quantPtr = cache.GetQuantizedValuesPtr(0);
+            int quantRowBytes = cache.ValueQuantizedRowBytes;
+            float[] output = new float[kvStride];
+            fixed (float* op = output)
+            {
+                if (dtype == KvCacheDType.Q8_0)
+                    DotLLM.Cpu.Kernels.KvQuantize.Q8_0ToF32((byte*)quantPtr, op, kvStride);
+                else
+                    DotLLM.Cpu.Kernels.KvQuantize.Q4_0ToF32((byte*)quantPtr, op, kvStride);
+            }
+
+            float tolerance = dtype == KvCacheDType.Q8_0
+                ? input.Max(MathF.Abs) / 127.0f * 1.1f
+                : input.Max(MathF.Abs) / 7.0f * 1.1f;
+
+            for (int i = 0; i < kvStride; i++)
+                Assert.True(MathF.Abs(input[i] - output[i]) <= tolerance,
+                    $"Element {i}: input={input[i]}, output={output[i]}, " +
+                    $"err={MathF.Abs(input[i] - output[i])}, tol={tolerance}");
+        }
+        finally
+        {
+            NativeMemory.AlignedFree((void*)kPtr);
+            NativeMemory.AlignedFree((void*)vPtr);
+        }
+    }
+
     /// <summary>
     /// Verifies that a prefill followed by decode produces the same quantized data regardless
     /// of whether the prefill was chunked to fit the window or sent in one large batch.
@@ -373,6 +432,70 @@ public sealed unsafe class QuantizedKvCacheTests
             NativeMemory.AlignedFree((void*)kPtr);
             NativeMemory.AlignedFree((void*)vPtr);
         }
+    }
+
+    [Theory]
+    [InlineData(KvCacheDType.Q8_0)]
+    [InlineData(KvCacheDType.Q4_0)]
+    public void RoundTrip_RandomData_WindowEvict_PerElementErrorBound(KvCacheDType dtype)
+    {
+        const int headDim = 64;
+        const int numKvHeads = 2;
+        const int kvStride = numKvHeads * headDim;
+        const int windowSize = 2;
+        const int maxSeqLen = 8;
+
+        using var cache = new QuantizedKvCache(1, numKvHeads, headDim, maxSeqLen,
+            dtype, dtype, windowSize);
+
+        var rng = new Random(123);
+
+        // Fill the window and then evict to quantized
+        float[][] inputs = new float[windowSize + 1][];
+        for (int s = 0; s <= windowSize; s++)
+        {
+            inputs[s] = new float[kvStride];
+            for (int i = 0; i < kvStride; i++)
+                inputs[s][i] = (float)(rng.NextDouble() * 2 - 1) * 5.0f;
+
+            nint kPtr = (nint)NativeMemory.AlignedAlloc((nuint)(kvStride * sizeof(float)), 64);
+            nint vPtr = (nint)NativeMemory.AlignedAlloc((nuint)(kvStride * sizeof(float)), 64);
+            try
+            {
+                inputs[s].CopyTo(new Span<float>((void*)kPtr, kvStride));
+                inputs[s].CopyTo(new Span<float>((void*)vPtr, kvStride));
+
+                var kRef = new TensorRef(1, kvStride, DType.Float32, -1, kPtr);
+                var vRef = new TensorRef(1, kvStride, DType.Float32, -1, vPtr);
+                cache.Update(kRef, vRef, [s], layerIndex: 0);
+            }
+            finally
+            {
+                NativeMemory.AlignedFree((void*)kPtr);
+                NativeMemory.AlignedFree((void*)vPtr);
+            }
+        }
+
+        // Token 0 should have been evicted to quantized storage
+        Assert.Equal(1, cache.QuantizedLength);
+
+        nint quantKeysPtr = cache.GetQuantizedKeysPtr(0);
+        float[] evicted = new float[kvStride];
+        fixed (float* ep = evicted)
+        {
+            if (dtype == KvCacheDType.Q8_0)
+                DotLLM.Cpu.Kernels.KvQuantize.Q8_0ToF32((byte*)quantKeysPtr, ep, kvStride);
+            else
+                DotLLM.Cpu.Kernels.KvQuantize.Q4_0ToF32((byte*)quantKeysPtr, ep, kvStride);
+        }
+
+        float maxAbs = inputs[0].Max(MathF.Abs);
+        float tolerance = dtype == KvCacheDType.Q8_0 ? maxAbs / 127.0f * 1.1f : maxAbs / 7.0f * 1.1f;
+
+        for (int i = 0; i < kvStride; i++)
+            Assert.True(MathF.Abs(inputs[0][i] - evicted[i]) <= tolerance,
+                $"Evicted key element {i}: input={inputs[0][i]}, output={evicted[i]}, " +
+                $"err={MathF.Abs(inputs[0][i] - evicted[i])}, tol={tolerance}");
     }
 
     private static nint AllocAndFill(int seqLen, float value)

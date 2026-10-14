@@ -1,0 +1,207 @@
+#version 450
+// I2_S (BitNet b1.58 ternary) prefill GEMM — cooperative-matrix WARPTILE variant.
+//
+//   C[N, M] = B[N, K] @ W_i2s[M, K]^T     with W_i2s dequantized on the fly.
+//
+// Third coopmat attempt, testing the leading hypothesis for why the plain
+// coopmat kernel LOSES to the register-blocked kernel (issue #229):
+//
+//   matmul_i2_s_f32_gemm_coopmat.comp emits ONE 16x16 fragment per workgroup.
+//   matmul_i2_s_f32_gemm_rb.comp (production) emits a 32x32 tile per workgroup.
+//   So coopmat launches 4x the workgroups for the same output and gets half
+//   the data reuse. The measured shape ranking fits workgroup COUNT rather
+//   than FLOPs: gate/up (M=6912) and down (K=6912) have identical M*K, yet
+//   gate/up — which spawns 4x the workgroups — was 0.57x while down was 0.88x.
+//
+// So: keep coopmat, but restore the tile. This is llama.cpp mul_mm.comp's
+// warptile idea — SEVERAL fragments per workgroup:
+//
+//   Output tile per workgroup : 32 x 32 (a 2x2 grid of 16x16 fragments),
+//                               matching the register-blocked tile exactly.
+//   Fragments                 : 4 accumulators (sums00/01/10/11).
+//   Reuse                     : per K-slice we load 2 A fragments and 2 B
+//                               fragments and issue 4 coopMatMulAdd — each
+//                               loaded fragment feeds TWO multiplies. That is
+//                               the reuse the single-fragment kernel lacks.
+//   K chunk per iter          : BK = 128 (one I2_S block; forced by the byte
+//                               layout, one packed byte spans the whole block).
+//   Inner coopmat K           : TK = 16, so 8 K-slices per block.
+//
+// EXPERIMENT DESIGN — deliberately ONE subgroup per workgroup (32 threads),
+// matching matmul_i2_s_f32_gemm_coopmat32.comp. That makes
+// coopmat32 (16x16, 1 subgroup) -> this (32x32, 1 subgroup) a controlled A/B
+// in which ONLY the tile size changes, so the result actually attributes the
+// effect. The 64-thread original confounds tile size with subgroup count, and
+// a separate probe already refuted the subgroup-count explanation on its own
+// (coopmat32 was 0.87-0.99x, i.e. slower, not faster).
+// NOT portable as-is: on a 64-wide device 32 threads is half a wave. The real
+// fix is a specialization constant for workgroup size fed from
+// VulkanDevice.SubgroupSize — tracked as a follow-up on #229.
+//
+// Precision: identical to the other I2_S coopmat variants and BETTER than the
+// Q8_0 coopmat path. Q8_0 must fold its per-block scale into the F16 A operand
+// (storing d x q), so A carries rounding error. I2_S has ONE per-tensor scale,
+// so the raw ternary values {-1, 0, +1} — each exact in F16 — are staged
+// directly and the scale is applied once to the F32 accumulators at the end.
+// The A operand contributes NO rounding error; all F16 error is the activation
+// cast alone. The F32 scalar variant remains the parity reference.
+//
+// Shared: sharedA 32x128 f16 (8 KB) + sharedB 32x128 f16 (8 KB) +
+//         storeStage 32x32 f32 (4 KB) = 20 KB. Comfortable on Xe-LPG's 64 KB.
+
+#extension GL_KHR_cooperative_matrix      : require
+#extension GL_KHR_memory_scope_semantics  : require
+#extension GL_KHR_shader_subgroup_basic   : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage    : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; }; // I2_S blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufB { float b[]; };      // [N*K]
+layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[]; };      // [N*M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // output dim (number of weight rows)
+    uint K;             // contraction dim (must be a multiple of 128)
+    uint N;             // batch size (number of input rows)
+    uint blocksPerRow;  // = K / 128
+    uint rowUints;      // unused here; kept for push-constant layout parity
+} pc;
+
+const uint FM    = 16u;   // coopmat fragment M
+const uint FN    = 16u;   // coopmat fragment N
+const uint TK    = 16u;   // coopmat K per coopMatMulAdd
+const uint TILE_M = 32u;  // workgroup output rows  (2 fragments of FM)
+const uint TILE_N = 32u;  // workgroup output cols  (2 fragments of FN)
+const uint BK    = 128u;  // K elements staged per outer iter (one I2_S block)
+const uint I2S_BLOCK_BYTES = 32u;
+const uint WG_SIZE = 32u;
+
+// Raw ternary {-1,0,+1} in F16 — exact, scale deliberately NOT folded in.
+shared float16_t sharedA[TILE_M * BK];
+shared float16_t sharedB[TILE_N * BK];
+
+// Staging for the bounds-guarded store path (whole 32x32 tile).
+shared float storeStage[TILE_M * TILE_N];
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+void main() {
+    uint mBase = gl_WorkGroupID.x * TILE_M; // weight rows (C columns)
+    uint tBase = gl_WorkGroupID.y * TILE_N; // input rows (C rows)
+
+    uint tid = gl_LocalInvocationID.x;
+    uint rowBytes = pc.K >> 2u;             // K/4 packed bytes per row
+
+    // Per-tensor float32 scale at the weight-buffer tail; applied once at the end.
+    float scale = uintBitsToFloat(weight[(pc.M * rowBytes) >> 2u]);
+
+    // 2x2 grid of accumulators. Separate variables rather than an array so we
+    // do not rely on driver support for arrays of cooperative matrix types.
+    coopmat<float, gl_ScopeSubgroup, FM, FN, gl_MatrixUseAccumulator> sums00 =
+        coopmat<float, gl_ScopeSubgroup, FM, FN, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, FM, FN, gl_MatrixUseAccumulator> sums01 =
+        coopmat<float, gl_ScopeSubgroup, FM, FN, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, FM, FN, gl_MatrixUseAccumulator> sums10 =
+        coopmat<float, gl_ScopeSubgroup, FM, FN, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, FM, FN, gl_MatrixUseAccumulator> sums11 =
+        coopmat<float, gl_ScopeSubgroup, FM, FN, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint blk = 0u; blk < pc.blocksPerRow; blk++) {
+        uint kBase = blk * BK;
+
+        // ---- 1. Stage sharedB[TILE_N, BK] as F16 (32x128 = 4096). ----
+        for (uint idx = tid; idx < TILE_N * BK; idx += WG_SIZE) {
+            uint row = idx >> 7u;            // 0..31  (token within tile)
+            uint col = idx & 127u;           // 0..127 (element within block)
+            uint tGlobal = tBase + row;
+            float v = (tGlobal < pc.N) ? b[tGlobal * pc.K + kBase + col] : 0.0;
+            sharedB[row * BK + col] = float16_t(v);
+        }
+
+        // ---- 2. Unpack sharedA[TILE_M, BK] as RAW ternary in F16. ----
+        // 32 rows x 32 bytes = 1024 bytes, 4 ternary codes per byte.
+        for (uint byteFlat = tid; byteFlat < TILE_M * I2S_BLOCK_BYTES; byteFlat += WG_SIZE) {
+            uint rowLocal = byteFlat >> 5u;  // 0..31  (weight row within tile)
+            uint gp       = byteFlat & 31u;  // 0..31  (byte within block)
+            uint mGlobal  = mBase + rowLocal;
+            uint sBase    = rowLocal * BK;
+
+            if (mGlobal < pc.M) {
+                uint pk = readByte(mGlobal * rowBytes + blk * I2S_BLOCK_BYTES + gp);
+                sharedA[sBase + gp]        = float16_t(int((pk >> 6u) & 3u) - 1);
+                sharedA[sBase + gp + 32u]  = float16_t(int((pk >> 4u) & 3u) - 1);
+                sharedA[sBase + gp + 64u]  = float16_t(int((pk >> 2u) & 3u) - 1);
+                sharedA[sBase + gp + 96u]  = float16_t(int( pk        & 3u) - 1);
+            } else {
+                sharedA[sBase + gp]        = float16_t(0.0);
+                sharedA[sBase + gp + 32u]  = float16_t(0.0);
+                sharedA[sBase + gp + 64u]  = float16_t(0.0);
+                sharedA[sBase + gp + 96u]  = float16_t(0.0);
+            }
+        }
+
+        barrier();
+        memoryBarrierShared();
+
+        // ---- 3. Warptile inner loop: 2 A + 2 B fragments -> 4 coopMatMulAdd. ----
+        // Each loaded fragment feeds two multiplies; that reuse is the whole point.
+        for (uint kSlice = 0u; kSlice < BK; kSlice += TK) {
+            coopmat<float16_t, gl_ScopeSubgroup, FM, TK, gl_MatrixUseA> a0, a1;
+            coopmat<float16_t, gl_ScopeSubgroup, TK, FN, gl_MatrixUseB> b0, b1;
+
+            coopMatLoad(a0, sharedA, kSlice,              BK, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(a1, sharedA, FM * BK + kSlice,    BK, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b0, sharedB, kSlice,              BK, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(b1, sharedB, FN * BK + kSlice,    BK, gl_CooperativeMatrixLayoutColumnMajor);
+
+            sums00 = coopMatMulAdd(a0, b0, sums00);
+            sums01 = coopMatMulAdd(a0, b1, sums01);
+            sums10 = coopMatMulAdd(a1, b0, sums10);
+            sums11 = coopMatMulAdd(a1, b1, sums11);
+        }
+
+        barrier();
+    }
+
+    // ---- 4. Apply the single per-tensor scale to the F32 accumulators. ----
+    sums00 = sums00 * scale;
+    sums01 = sums01 * scale;
+    sums10 = sums10 * scale;
+    sums11 = sums11 * scale;
+
+    // ---- 5. Store. C is [N, M] row-major. ----
+    // ColumnMajor with stride S places fragment element [m][t] at offset + t*S + m,
+    // which is exactly row-major-C indexing for a tile at (mBase+mOff, tBase+tOff).
+    bool tileAllIn = (mBase + TILE_M) <= pc.M && (tBase + TILE_N) <= pc.N;
+
+    if (tileAllIn) {
+        uint base = tBase * pc.M + mBase;
+        coopMatStore(sums00, c, base,                                pc.M, gl_CooperativeMatrixLayoutColumnMajor);
+        coopMatStore(sums10, c, base + FM,                           pc.M, gl_CooperativeMatrixLayoutColumnMajor);
+        coopMatStore(sums01, c, base + FN * pc.M,                    pc.M, gl_CooperativeMatrixLayoutColumnMajor);
+        coopMatStore(sums11, c, base + FN * pc.M + FM,               pc.M, gl_CooperativeMatrixLayoutColumnMajor);
+    } else {
+        // Stage the whole 32x32 tile, then scatter with per-lane bounds checks.
+        coopMatStore(sums00, storeStage, 0,                          TILE_M, gl_CooperativeMatrixLayoutColumnMajor);
+        coopMatStore(sums10, storeStage, FM,                         TILE_M, gl_CooperativeMatrixLayoutColumnMajor);
+        coopMatStore(sums01, storeStage, FN * TILE_M,                TILE_M, gl_CooperativeMatrixLayoutColumnMajor);
+        coopMatStore(sums11, storeStage, FN * TILE_M + FM,           TILE_M, gl_CooperativeMatrixLayoutColumnMajor);
+        barrier();
+
+        for (uint idx = tid; idx < TILE_M * TILE_N; idx += WG_SIZE) {
+            uint t = idx / TILE_M;            // 0..31
+            uint m = idx - t * TILE_M;        // 0..31
+            uint mGlobal = mBase + m;
+            uint tGlobal = tBase + t;
+            if (mGlobal < pc.M && tGlobal < pc.N) {
+                c[tGlobal * pc.M + mGlobal] = storeStage[t * TILE_M + m];
+            }
+        }
+    }
+}

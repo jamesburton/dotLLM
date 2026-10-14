@@ -1,0 +1,6 @@
+#version 450
+// Issue #470 — 5-column PQ2_0 GEMV. See matmul_pq2_0_f32_gemv_multicol.glsl.
+#define NCOLS 5
+
+#extension GL_GOOGLE_include_directive : require
+#include "matmul_pq2_0_f32_gemv_multicol.glsl"

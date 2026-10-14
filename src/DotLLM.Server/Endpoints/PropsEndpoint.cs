@@ -22,11 +22,16 @@ public static class PropsEndpoint
                 VocabSize = state.Config?.VocabSize ?? 0,
                 MaxSequenceLength = state.Config?.MaxSequenceLength ?? 0,
                 Device = state.Options.Device,
+                ResolvedDevice = state.Options.ResolvedDevice,
                 GpuLayers = state.Options.GpuLayers,
                 Threads = threading.EffectiveThreadCount,
                 SamplingDefaults = ToDto(state.SamplingDefaults),
                 DraftModelPath = string.IsNullOrEmpty(state.DraftModelPath) ? null : state.DraftModelPath,
+                MtpActive = state.IsReady && state.MtpActive,
+                MtpStatus = state.IsReady ? state.MtpStatus : null,
+                DeviceFallbackWarning = state.IsReady ? state.DeviceFallbackWarning : null,
                 IsReady = state.IsReady,
+                Version = DotLLM.Core.BuildInfo.Version,
             };
         });
 

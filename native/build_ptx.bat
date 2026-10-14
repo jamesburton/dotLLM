@@ -1,0 +1,283 @@
+@echo off
+REM Build all CUDA kernels to PTX.
+REM Requires: %CUDA_PATH% set to a CUDA toolkit that supports the host MSVC
+REM (CUDA 13.x supports VS 2022/2026 MSVC; CUDA 11.8 does not).
+REM Usage: build_ptx.bat [arch]     (default: compute_75)
+REM
+REM compute_75 = Turing, the CUDA 13 floor. PTX is forward-compatible so this
+REM runs on any Turing (SM 7.5), Ampere (8.0/8.6), Ada (8.9), Hopper (9.0),
+REM or Blackwell (10.0/12.0) GPU. CUDA 13 dropped Pascal/Volta (SM 6.x/7.0).
+REM
+REM ARCH POLICY: keep the default at compute_75. The driver JITs PTX to the
+REM actual SM at module load, so compute_75 PTX already runs as native sm_86 on
+REM (e.g.) an RTX 3060 with NO perf penalty. Raising the GLOBAL default does not
+REM make anything faster; it only drops portability to Turing. The ONLY reason
+REM to use compute_86+ is a kernel that emits Ampere-only PTX (mma.sync /
+REM cp.async). For those: build that ONE kernel at the higher arch AND
+REM dispatch-gate it to capable GPUs in C# (e.g. the G3 attention path is
+REM GeForce-Ampere-gated, so its PTX never loads on Turing). Per-kernel arch
+REM overrides live in the ARCH_86 list below; the committed native/ptx tree
+REM stays uniform sm_75 except such gated kernels. See issue #70.
+setlocal EnableDelayedExpansion
+
+set ARCH=%1
+if "%ARCH%"=="" set ARCH=compute_75
+
+REM ── PTX ISA version contract ────────────────────────────────────────────
+REM Every committed .ptx must declare .version 8.7 (what CUDA 12.8 emits).
+REM PTX whose ISA version exceeds the driver's is rejected outright with
+REM CUDA_ERROR_UNSUPPORTED_PTX_VERSION: CUDA 13.1 emits .version 9.1, which no
+REM pre-13.1 driver will load.
+REM
+REM This has now regressed TWICE (#124, #318) by the same mechanism — %CUDA_PATH%
+REM silently pointing at a newer toolkit than intended, on a box where several are
+REM installed side by side. Nothing downstream notices, because the wrong PTX
+REM compiles, commits and reviews exactly like the right PTX; it only fails on
+REM someone else's older driver. So the version is asserted per file, here, at the
+REM moment of generation. Override only when deliberately re-baselining the whole
+REM tree onto a new toolkit.
+if not defined DOTLLM_PTX_EXPECT_VERSION set "DOTLLM_PTX_EXPECT_VERSION=8.7"
+
+if not defined CUDA_PATH (
+    echo CUDA_PATH is not set. Install a CUDA toolkit and ensure CUDA_PATH points at it.
+    exit /b 1
+)
+set "NVCC=%CUDA_PATH%\bin\nvcc.exe"
+if not exist "%NVCC%" (
+    echo nvcc.exe not found at %NVCC%
+    exit /b 1
+)
+
+REM Locate a CUDA-compatible host MSVC toolchain (cl.exe under VC\Tools\MSVC\
+REM <ver>\bin\Hostx64\x64). nvcc needs this on PATH to compile .cu -> .ptx.
+REM All discovery is done in the :find_msvc subroutine at the end of this file
+REM (subroutine lines parse independently, so paths containing "(x86)" and the
+REM delayed-expansion blocks can't trip cmd's paren matching).
+call :find_msvc
+if errorlevel 1 exit /b 1
+echo Using host MSVC: %MSVC_BIN%
+set "PATH=%MSVC_BIN%;%PATH%"
+
+set SCRIPT_DIR=%~dp0
+set KERNEL_DIR=%SCRIPT_DIR%kernels
+set OUT_DIR=%SCRIPT_DIR%ptx
+if not exist "%OUT_DIR%" mkdir "%OUT_DIR%"
+
+REM Kernels safe under --use_fast_math (elementwise; no expf/rsqrtf/sin/cos/pow):
+set "FAST_MATH=add add_f32 swiglu swiglu_f32 convert bias_add bias_add_f32 embedding embedding_f32out dequant quant_kv"
+
+REM Kernels requiring --fmad=false for bit-perfect parity with the CPU scalar
+REM reference. .NET RyuJIT does NOT emit FMA from `a*b+c` patterns without an
+REM explicit MathF.FusedMultiplyAdd call, so leaving nvcc's --fmad=true default
+REM produces ~1 ULP precision drift per accumulation versus the CPU's separate
+REM mul+add. The Qwen3MoeHybrid recurrence (GDN) compounds those tiny errors
+REM over time steps, so the two kernels backing it must be compiled with FMA
+REM fusion disabled. Costs minor perf; matches the CPU bit-for-bit.
+set "NO_FMA=conv1d_causal gated_delta_net_scan elementwise_f32 turboquant hadamard_fwht mamba2_selective_scan mamba3_data_rope_f32 mamba3_chunk_boundary_f32 mamba3_ssd_scan_siso_f32 mamba3_ssd_scan_mimo_f32"
+
+REM Kernels that emit Ampere-only PTX (mma.sync / cp.async) and so MUST be built
+REM at compute_86 instead of the global default. These are dispatch-gated to
+REM Ampere+ GPUs in C# (the PTX never loads on Turing), so overriding their arch
+REM does not affect portability of the rest of the tree. See ARCH POLICY above.
+set "ARCH_86=attention_flash_mma attention_flash_mma_decode_gqa_split"
+
+REM Kernels that #include <cooperative_groups.h> (needed for grid.sync() — see
+REM gated_delta_net_scan.cu's gdn_scan_step_f32_coop_split4, issue #180, and
+REM attention_f32.cu's attention_f32_split_kv, issue #183). NVCC's
+REM default C++ dialect for this MSVC toolchain is below C++17, which libcu++
+REM (cccl, cooperative_groups.h's dependency) requires — fails with "libcu++
+REM requires at least C++ 17" otherwise. Scoped to ONLY the kernels that need
+REM it (a per-kernel flag list, same pattern as ARCH_86) rather than bumping
+REM the global default, to avoid any risk of -std=c++17 subtly changing SASS
+REM for the other ~40 kernel files that don't need it.
+set "CXX17=gated_delta_net_scan attention_f32 attention_flash_mma_decode_gqa_split"
+
+echo Using nvcc: %NVCC%
+echo Compiling CUDA kernels -^> PTX (target: %ARCH%)...
+
+set FAIL=0
+for %%F in ("%KERNEL_DIR%\*.cu") do (
+    set "BASE=%%~nF"
+    set "FAST_FLAG="
+    for %%M in (%FAST_MATH%) do (
+        if /I "%%~nF"=="%%M" set "FAST_FLAG=--use_fast_math"
+    )
+    set "FMAD_FLAG="
+    for %%M in (%NO_FMA%) do (
+        if /I "%%~nF"=="%%M" set "FMAD_FLAG=-fmad=false"
+    )
+    REM Per-kernel arch override: Ampere-only kernels build at compute_86.
+    set "KARCH=%ARCH%"
+    for %%M in (%ARCH_86%) do (
+        if /I "%%~nF"=="%%M" set "KARCH=compute_86"
+    )
+    set "CXX17_FLAG="
+    for %%M in (%CXX17%) do (
+        if /I "%%~nF"=="%%M" set "CXX17_FLAG=-std=c++17"
+    )
+    "%NVCC%" -ptx -arch=!KARCH! !FAST_FLAG! !FMAD_FLAG! !CXX17_FLAG! -allow-unsupported-compiler -o "%OUT_DIR%\!BASE!.ptx" "%%F"
+    if errorlevel 1 (
+        echo FAILED: %%~nxF
+        set FAIL=1
+    ) else (
+        call :assert_ptx_version "%OUT_DIR%\!BASE!.ptx"
+        set "ARCH_NOTE="
+        if /I not "!KARCH!"=="%ARCH%" set "ARCH_NOTE= [!KARCH!]"
+        if not "!PTX_VERSION_BAD!"=="1" (
+            if defined FAST_FLAG (
+                echo   %%~nxF -^> !BASE!.ptx ^(fast_math^)!ARCH_NOTE!
+            ) else (
+                if defined FMAD_FLAG (
+                    echo   %%~nxF -^> !BASE!.ptx ^(precise, no FMA — bit-perfect with CPU^)!ARCH_NOTE!
+                ) else (
+                    echo   %%~nxF -^> !BASE!.ptx ^(precise^)!ARCH_NOTE!
+                )
+            )
+        )
+    )
+)
+
+if "%FAIL%"=="1" exit /b 1
+echo All PTX at .version %DOTLLM_PTX_EXPECT_VERSION%.
+echo Done. PTX files in %OUT_DIR%
+exit /b 0
+
+REM ===================================================================
+REM :assert_ptx_version <ptx file>
+REM Fails (exit /b 1) if the generated file's .version directive is not the
+REM expected baseline, naming the nvcc that produced it. See the PTX ISA
+REM version contract note near the top of this file.
+REM ===================================================================
+:assert_ptx_version
+REM Deliberately NO setlocal: the failure flag must reach the caller's FAIL, and
+REM cmd's errorlevel does not survive `endlocal` reliably from inside a FOR body.
+set "PTX_FILE=%~1"
+set "PTX_ACTUAL="
+set "PTX_VERSION_BAD="
+for /f "tokens=2" %%V in ('findstr /R /C:"^\.version" "%PTX_FILE%"') do (
+    if not defined PTX_ACTUAL set "PTX_ACTUAL=%%V"
+)
+if "%PTX_ACTUAL%"=="%DOTLLM_PTX_EXPECT_VERSION%" exit /b 0
+echo.
+echo ERROR: %~nx1 declares .version %PTX_ACTUAL%, expected %DOTLLM_PTX_EXPECT_VERSION%.
+echo        nvcc used: %NVCC%
+echo        A committed PTX file at the wrong ISA version fails to load with
+echo        CUDA_ERROR_UNSUPPORTED_PTX_VERSION on older drivers ^(see #124, #318^).
+echo        Point CUDA_PATH at the CUDA 12.8 toolkit and rerun, or set
+echo        DOTLLM_PTX_EXPECT_VERSION if you are deliberately re-baselining the tree.
+set "PTX_VERSION_BAD=1"
+set FAIL=1
+exit /b 1
+
+REM ===================================================================
+REM :find_msvc — locate a CUDA-compatible host MSVC toolchain.
+REM Sets MSVC_BIN (the ...\bin\Hostx64\x64 directory containing cl.exe).
+REM Returns 0 on success, 1 if no usable toolchain was found.
+REM
+REM Selection rationale (CUDA 13.x host compiler support):
+REM   - MSVC 14.50+ (_MSC_VER >= 1950, shipped with VS 2026 / 18.x) is rejected
+REM     by CUDA 13.1's host_config.h and nvcc's OS-target check, so we must NOT
+REM     pick the numerically highest toolset when a 14.50+ is present.
+REM   - We therefore prefer the highest toolset STRICTLY BELOW 14.50 (the 14.3x-
+REM     14.4x VS 2022 range), and only fall back to a 14.50+ if nothing else
+REM     exists (relying on -allow-unsupported-compiler).
+REM
+REM Discovery order:
+REM   1. Honor a pre-set MSVC_BIN (full bin dir) or MSVC_DIR (toolset root).
+REM   2. vswhere -find across ALL instances (no -latest: on this kind of box
+REM      -latest can resolve to SSMS or a VS 2026 instance with no CUDA-usable
+REM      VC tools). -products * is required because Build Tools' product id is
+REM      excluded from vswhere's default query.
+REM   3. Fallback: scan standard VS 2019/2022 install roots for VC\Tools\MSVC.
+REM ===================================================================
+:find_msvc
+setlocal EnableDelayedExpansion
+
+REM Capture the Program Files roots into plain vars. %ProgramFiles(x86)% has a
+REM literal ')' in its name; referencing it inside ( ... ) blocks miscounts the
+REM closing paren, so we only use these flat vars from here on.
+set "PF_X86=%ProgramFiles(x86)%"
+set "PF_64=%ProgramFiles%"
+
+REM 1. Explicit override wins.
+if not defined MSVC_BIN if defined MSVC_DIR set "MSVC_BIN=%MSVC_DIR%\bin\Hostx64\x64"
+if defined MSVC_BIN goto :find_msvc_done
+
+REM 2. vswhere: enumerate every cl.exe, pick the best CUDA-compatible version.
+set "VSWHERE=!PF_X86!\Microsoft Visual Studio\Installer\vswhere.exe"
+if exist "!VSWHERE!" (
+    for /f "usebackq delims=" %%I in (`""!VSWHERE!" -products * -find "VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe""`) do (
+        call :consider_cl "%%I"
+    )
+)
+if defined MSVC_BIN goto :find_msvc_done
+
+REM 3. Fallback: scan the standard install roots directly (flat calls, no
+REM parenthesized data block, so "(x86)" can't break parsing).
+call :scan_root "!PF_64!\Microsoft Visual Studio\2022\BuildTools"
+call :scan_root "!PF_64!\Microsoft Visual Studio\2022\Community"
+call :scan_root "!PF_64!\Microsoft Visual Studio\2022\Professional"
+call :scan_root "!PF_64!\Microsoft Visual Studio\2022\Enterprise"
+call :scan_root "!PF_X86!\Microsoft Visual Studio\2022\BuildTools"
+call :scan_root "!PF_X86!\Microsoft Visual Studio\2022\Community"
+call :scan_root "!PF_X86!\Microsoft Visual Studio\2022\Professional"
+call :scan_root "!PF_X86!\Microsoft Visual Studio\2022\Enterprise"
+call :scan_root "!PF_X86!\Microsoft Visual Studio\2019\BuildTools"
+call :scan_root "!PF_X86!\Microsoft Visual Studio\2019\Community"
+call :scan_root "!PF_X86!\Microsoft Visual Studio\2019\Professional"
+call :scan_root "!PF_X86!\Microsoft Visual Studio\2019\Enterprise"
+
+:find_msvc_done
+if not defined MSVC_BIN (
+    echo Could not locate a host MSVC toolchain via override, vswhere, or the
+    echo standard VS install roots. Install VS 2022 Build Tools, or pre-set
+    echo MSVC_BIN / MSVC_DIR before invoking this script.
+    endlocal
+    exit /b 1
+)
+if not exist "!MSVC_BIN!\cl.exe" (
+    echo cl.exe not found at !MSVC_BIN!
+    endlocal
+    exit /b 1
+)
+REM Propagate MSVC_BIN out of the local scope to the caller. The FOR carries the
+REM delayed-expanded value across the endlocal barrier on a single command line.
+for /f "delims=" %%V in ("!MSVC_BIN!") do (endlocal & set "MSVC_BIN=%%V")
+exit /b 0
+
+REM :consider_cl <full path to cl.exe>
+REM Records this toolset as the best so far if it is CUDA-compatible and higher
+REM than any previously seen. "best" = highest version strictly below 14.50;
+REM a 14.50+ is only kept if no sub-14.50 has been found yet.
+:consider_cl
+set "CL_PATH=%~1"
+set "CL_BIN=%~dp1"
+if "!CL_BIN:~-1!"=="\" set "CL_BIN=!CL_BIN:~0,-1!"
+REM Extract the MSVC version dir: ...\VC\Tools\MSVC\<ver>\bin\Hostx64\x64\cl.exe
+for %%P in ("!CL_BIN!\..\..\..") do set "CL_VER=%%~nxP"
+REM Only consider 14.* toolsets.
+if "!CL_VER:~0,3!" neq "14." exit /b 0
+REM Build a sortable key. minor < 50 => CUDA-compatible (rank 1, preferred);
+REM minor >= 50 => incompatible-but-usable-with-override (rank 0, last resort).
+for /f "tokens=1,2 delims=." %%a in ("!CL_VER!") do set "CL_MINOR=%%b"
+set "CL_RANK=1"
+if !CL_MINOR! geq 50 set "CL_RANK=0"
+if not defined BEST_RANK goto :consider_cl_take
+REM Higher rank always wins; within a rank, higher version string wins.
+if !CL_RANK! gtr !BEST_RANK! goto :consider_cl_take
+if !CL_RANK! lss !BEST_RANK! exit /b 0
+if "!CL_VER!" gtr "!BEST_VER!" goto :consider_cl_take
+exit /b 0
+:consider_cl_take
+set "MSVC_BIN=!CL_BIN!"
+set "BEST_RANK=!CL_RANK!"
+set "BEST_VER=!CL_VER!"
+exit /b 0
+
+REM :scan_root <VS install root>
+REM Adds every 14.* toolset found under <root>\VC\Tools\MSVC to consideration.
+:scan_root
+set "SR_ROOT=%~1"
+if not exist "!SR_ROOT!\VC\Tools\MSVC\" exit /b 0
+for /d %%D in ("!SR_ROOT!\VC\Tools\MSVC\14.*") do call :consider_cl "%%D\bin\Hostx64\x64\cl.exe"
+exit /b 0

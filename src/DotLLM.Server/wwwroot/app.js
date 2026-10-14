@@ -126,6 +126,10 @@ const modalDecodeThreads = $('#modal-decode-threads');
 const modalStatus = $('#modal-status');
 const modalCancelBtn = $('#modal-cancel-btn');
 const modalLoadBtn = $('#modal-load-btn');
+const modalMtpSection = $('#modal-mtp-section');
+const modalMtpEnabled = $('#modal-mtp-enabled');
+const modalDeviceHint = $('#modal-device-hint');
+const modalDeviceGpuLabel = $('#modal-device-gpu-label');
 const modalSpeculativeSection = $('#modal-speculative-section');
 const modalSpeculativeSelect = $('#modal-speculative-select');
 const modalSpeculativeInfo = $('#modal-speculative-info');
@@ -145,6 +149,14 @@ async function fetchAvailableModels() {
     return res.json();
 }
 
+// (#757) Devices the server can actually serve; recommended_device uses the same ordering as `--device auto`.
+async function fetchDevices(modelBytes) {
+    try {
+        const res = await fetch('/v1/devices' + (modelBytes ? `?model_bytes=${modelBytes}` : ''));
+        return res.ok ? res.json() : null;
+    } catch { return null; }
+}
+
 async function inspectModel(fullPath) {
     const res = await fetch(`/v1/models/inspect?path=${encodeURIComponent(fullPath)}`);
     return res.ok ? res.json() : null;
@@ -152,15 +164,18 @@ async function inspectModel(fullPath) {
 
 async function loadModel(model, quant, opts) {
     const body = { model };
+    // Exact file the user picked/inspected; repo+quant resolution can choose a different GGUF in the same repo.
+    if (opts?.path) body.path = opts.path;
     if (quant) body.quant = quant;
     if (opts?.device) body.device = opts.device;
-    if (opts?.device === 'gpu' && opts?.gpuLayers != null) body.gpu_layers = opts.gpuLayers;
+    if (opts?.isGpu && opts?.gpuLayers != null) body.gpu_layers = opts.gpuLayers;
     if (opts?.cacheTypeK && opts.cacheTypeK !== 'f32') body.cache_type_k = opts.cacheTypeK;
     if (opts?.cacheTypeV && opts.cacheTypeV !== 'f32') body.cache_type_v = opts.cacheTypeV;
     if (opts?.threads) body.threads = opts.threads;
     if (opts?.decodeThreads) body.decode_threads = opts.decodeThreads;
     if (opts?.speculativeModel) body.speculative_model = opts.speculativeModel;
     if (opts?.speculativeK) body.speculative_k = opts.speculativeK;
+    if (opts?.mtp != null) body.mtp = opts.mtp;
     const res = await fetch('/v1/models/load', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -185,6 +200,10 @@ async function* streamChat(messages, params) {
     const body = {
         messages,
         stream: true,
+        // The server no longer carries usage on the final content chunk (OpenAI puts it in a
+        // dedicated chunk, and only on request) — so ask for it explicitly, or the token
+        // counts in the stats line go blank.
+        stream_options: { include_usage: true },
         temperature: params.temperature,
         top_p: params.top_p,
         top_k: params.top_k,
@@ -203,6 +222,10 @@ async function* streamChat(messages, params) {
     if (params.logprobs) {
         body.logprobs = true;
         body.top_logprobs = params.top_logprobs || 5;
+    }
+    // Thinking switch (#767): null = the model's default; true/false -> the chat template's enable_thinking.
+    if (params.enable_thinking === true || params.enable_thinking === false) {
+        body.enable_thinking = params.enable_thinking;
     }
 
     const response = await fetch('/v1/chat/completions', {
@@ -235,6 +258,9 @@ async function* streamChat(messages, params) {
                     const chunk = JSON.parse(data);
                     const choice = chunk.choices?.[0];
 
+                    if (choice?.delta?.reasoning_content) {
+                        yield { type: 'reasoning', content: choice.delta.reasoning_content };
+                    }
                     if (choice?.delta?.content) {
                         yield { type: 'delta', content: choice.delta.content, logprobs: choice?.logprobs?.content };
                     }
@@ -435,6 +461,9 @@ function buildModelBadgeText(config) {
     } else {
         parts.push('GPU');
     }
+    if (config.device_fallback_warning) parts.push('CPU FALLBACK (slow): ' + config.device_fallback_warning);
+
+    if (config.mtp_active) parts.push('MTP');
 
     // Draft model indicator
     if (config.draft_model_path) {
@@ -473,7 +502,23 @@ function hideWelcome() {
     welcomeEl.classList.add('hidden');
 }
 
-function addMessageToDOM(role, content, stats, rawPrompt, rawResponse) {
+// Collapsible "thinking" block (#767). Open while the model is still reasoning, collapsed once the answer starts.
+function createReasoningBlock(text, open) {
+    const details = document.createElement('details');
+    details.className = 'reasoning-block';
+    details.open = !!open;
+    const summary = document.createElement('summary');
+    summary.className = 'reasoning-summary';
+    summary.textContent = open ? 'Thinking\u2026' : 'Thought process';
+    details.appendChild(summary);
+    const body = document.createElement('div');
+    body.className = 'reasoning-body';
+    body.textContent = text || '';
+    details.appendChild(body);
+    return details;
+}
+
+function addMessageToDOM(role, content, stats, rawPrompt, rawResponse, reasoning) {
     hideWelcome();
 
     const wrapper = document.createElement('div');
@@ -492,6 +537,10 @@ function addMessageToDOM(role, content, stats, rawPrompt, rawResponse) {
         (role === 'user' ? 'text-zinc-500' : 'text-accent/60');
     label.textContent = role;
     bubble.appendChild(label);
+
+    if (role === 'assistant' && reasoning) {
+        bubble.appendChild(createReasoningBlock(reasoning, false));
+    }
 
     // Content
     const contentEl = document.createElement('div');
@@ -777,6 +826,7 @@ function getSettingsFromUI() {
         repetition_penalty: parseFloat($('#opt-rep-penalty').value),
         max_tokens: parseInt($('#opt-max-tokens').value) || 2048,
         seed: $('#opt-seed').value ? parseInt($('#opt-seed').value) : null,
+        enable_thinking: ({ on: true, off: false })[$('#opt-thinking')?.value] ?? null,
         logprobs: logprobs,
         top_logprobs: logprobs ? (parseInt($('#opt-top-logprobs')?.value) || 5) : 0,
     };
@@ -869,6 +919,47 @@ function resetToolsJson() {
 let modalModels = [];      // flat list from /v1/models/available
 let modalInspect = null;   // inspect result for selected model
 let modalSelectedFullPath = null;
+let modalGpuDevice = null;      // device string to send for "GPU" (e.g. "vulkan", "gpu:0"); null when no GPU is servable
+let modalDeviceTouched = false; // the user picked a device by hand: never override it
+
+/** Picks the GPU device string for the GPU radio from a /v1/devices payload (recommended first, else any servable non-CPU device). */
+function pickGpuDevice(devices) {
+    if (!devices) return null;
+    if (devices.recommended_device && devices.recommended_device !== 'cpu') return devices.recommended_device;
+    for (const b of devices.backends || []) {
+        if (b.name === 'cpu' || !b.servable) continue;
+        const d = (b.devices || []).find(x => x.device_string);
+        if (d) return d.device_string;
+    }
+    return null;
+}
+
+function applyModalDevices(devices) {
+    modalGpuDevice = pickGpuDevice(devices);
+    const gpuRadio = document.querySelector('input[name="modal-device"][value="gpu"]');
+    const cpuRadio = document.querySelector('input[name="modal-device"][value="cpu"]');
+    if (!devices) {
+        modalDeviceHint.textContent = 'Detecting devices...';
+        gpuRadio.disabled = false;
+        modalDeviceGpuLabel.textContent = 'GPU';
+        return;
+    }
+    gpuRadio.disabled = !modalGpuDevice;
+    if (modalGpuDevice) {
+        modalDeviceGpuLabel.textContent = `GPU (${modalGpuDevice})`;
+        modalDeviceHint.textContent = 'GPU is selected by default because a servable GPU was found. CPU is universal but several times slower. An explicit GPU load that fails reports an error; it never falls back to the CPU silently.';
+        if (!modalDeviceTouched) gpuRadio.checked = true;
+    } else {
+        modalDeviceGpuLabel.textContent = 'GPU (none detected)';
+        modalDeviceHint.textContent = 'No servable GPU (CUDA or Vulkan) was detected, so the CPU is used.';
+        cpuRadio.checked = true;
+    }
+    updateGpuVisibility();
+}
+
+async function refreshModalDevices(modelBytes) {
+    applyModalDevices(await fetchDevices(modelBytes));
+}
 
 function openModelModal() {
     modalSelectedFullPath = null;
@@ -877,6 +968,8 @@ function openModelModal() {
     modalGpuSection.classList.add('hidden');
     modalModelInfo.classList.add('hidden');
     modalSpeculativeSection.classList.add('hidden');
+    modalMtpSection.classList.add('hidden');
+    modalMtpEnabled.checked = true;
     modalSpeculativeSelect.innerHTML = '<option value="">None (disabled)</option>';
     modalSpeculativeInfo.classList.add('hidden');
     modalSpeculativeInfo.textContent = '';
@@ -886,7 +979,12 @@ function openModelModal() {
     modalStatus.innerHTML = '';
     modalCacheK.value = 'f32';
     modalCacheV.value = 'f32';
+    // (#757) Device defaults to the best servable GPU, CPU only when none is servable (resolved asynchronously).
+    modalDeviceTouched = false;
+    modalGpuDevice = null;
     document.querySelector('input[name="modal-device"][value="cpu"]').checked = true;
+    applyModalDevices(null);
+    refreshModalDevices();
     modelModalOverlay.classList.remove('hidden');
     modelModalOverlay.style.display = 'flex';
     populateModalDropdown();
@@ -978,6 +1076,7 @@ async function onModalModelChange() {
         modalOptions.classList.add('hidden');
         modalModelInfo.classList.add('hidden');
         modalSpeculativeSection.classList.add('hidden');
+        modalMtpSection.classList.add('hidden');
         modalLoadBtn.disabled = true;
         modalInspect = null;
         modalSelectedFullPath = null;
@@ -985,12 +1084,15 @@ async function onModalModelChange() {
     }
 
     modalSelectedFullPath = fullPath;
+    modalMtpSection.classList.add('hidden');
     modalLoadBtn.disabled = false;
     modalModelInfo.classList.remove('hidden');
     modalModelInfo.textContent = 'Inspecting model...';
 
     // Inspect the selected model to get layer count
-    modalInspect = await inspectModel(fullPath);
+    const inspected = await inspectModel(fullPath);
+    if (modalSelectedFullPath !== fullPath) return;   // a newer selection superseded this (out-of-order response)
+    modalInspect = inspected;
     if (modalInspect) {
         const size = formatFileSize(modalInspect.file_size_bytes);
         modalModelInfo.textContent = `${modalInspect.architecture} | ${modalInspect.num_layers} layers | ${modalInspect.hidden_size}H | ctx ${modalInspect.max_sequence_length?.toLocaleString() ?? '?'} | ${size}`;
@@ -1000,16 +1102,32 @@ async function onModalModelChange() {
         modalGpuLayers.value = modalInspect.num_layers;
         modalGpuLayersMax.textContent = modalInspect.num_layers;
         updateGpuLayersDisplay();
+        // (#729) Architectures that cannot split layers (e.g. Nemotron-H): all-or-nothing on GPU.
+        const canSplit = modalInspect.supports_partial_offload !== false;
+        modalGpuLayers.disabled = !canSplit;
+        modalGpuLayers.title = canSplit ? '' : 'Partial GPU offload is not supported for this architecture';
     } else {
-        modalModelInfo.textContent = 'Could not read model metadata';
+        modalModelInfo.textContent = 'Could not read model metadata (layer count unknown; "All" will load every layer)';
+        modalGpuLayersMax.textContent = '?';
+        updateGpuLayersDisplay();
     }
 
     modalOptions.classList.remove('hidden');
     updateGpuVisibility();
 
-    // Show speculative section and populate draft model dropdown
-    modalSpeculativeSection.classList.remove('hidden');
-    populateSpeculativeDropdown(fullPath);
+    // (#757) Embedded MTP head: automatic, with an opt-out. Otherwise offer an optional external draft model.
+    if (modalInspect?.has_mtp) {
+        modalMtpSection.classList.remove('hidden');
+        modalSpeculativeSection.classList.add('hidden');
+        modalSpeculativeSelect.value = '';
+    } else {
+        modalMtpSection.classList.add('hidden');
+        modalSpeculativeSection.classList.remove('hidden');
+        populateSpeculativeDropdown(fullPath);
+    }
+
+    // Re-pick the GPU device for this model's size (CUDA is skipped when the file will not fit).
+    refreshModalDevices(modalInspect?.file_size_bytes);
 }
 
 function getModalDevice() {
@@ -1028,6 +1146,11 @@ function updateGpuVisibility() {
 function updateGpuLayersDisplay() {
     const layers = parseInt(modalGpuLayers.value) || 0;
     const maxLayers = parseInt(modalGpuLayers.max) || 32;
+    if (!modalInspect) {
+        // Inspect failed or not run: the slider range is a placeholder, so don't claim a layer count.
+        modalGpuLayersVal.textContent = layers === 0 ? 'CPU only (no offloading)' : 'All layers on GPU';
+        return;
+    }
 
     if (layers === 0) {
         modalGpuLayersVal.textContent = 'CPU only (no offloading)';
@@ -1057,8 +1180,16 @@ async function handleModalLoad() {
     const repo = opt?.dataset.repo;
     const filename = opt?.dataset.filename;
     const quant = extractQuantFromPath(filename);
-    const device = getModalDevice();
-    const gpuLayers = device === 'gpu' ? parseInt(modalGpuLayers.value) : undefined;
+    const deviceChoice = getModalDevice();
+    const isGpu = deviceChoice === 'gpu' && !!modalGpuDevice;
+    const device = isGpu ? modalGpuDevice : 'cpu';
+    // "All" is a sentinel (-1), not the slider's number: the server resolves it against the layer count the loader sees.
+    // Also covers a failed inspect, where the slider still shows its HTML default.
+    const sliderLayers = parseInt(modalGpuLayers.value);
+    const sliderMax = parseInt(modalGpuLayers.max);
+    const gpuLayers = !isGpu ? undefined
+        : (!modalInspect || !(sliderLayers < sliderMax)) ? -1
+        : sliderLayers;
     const threads = parseInt(modalThreads.value) || 0;
     const decodeThreads = parseInt(modalDecodeThreads.value) || 0;
 
@@ -1068,13 +1199,17 @@ async function handleModalLoad() {
     setStatus('Loading and warming up model...', 'text-yellow-500');
 
     // Get speculative model selection
-    const specPath = modalSpeculativeSelect.value || undefined;
-    const specK = parseInt(modalSpeculativeK.value) || 5;
+    const embeddedMtp = !modalMtpSection.classList.contains('hidden');
+    const specPath = embeddedMtp ? undefined : (modalSpeculativeSelect.value || undefined);
+    const specK = parseInt(modalSpeculativeK.value) || 3;
 
     try {
         const res = await loadModel(repo, quant, {
+            path: modalSelectedFullPath,
             device,
+            isGpu,
             gpuLayers,
+            mtp: embeddedMtp ? modalMtpEnabled.checked : undefined,
             cacheTypeK: modalCacheK.value,
             cacheTypeV: modalCacheV.value,
             threads: threads || undefined,
@@ -1090,7 +1225,9 @@ async function handleModalLoad() {
             closeModelModal();
         } else {
             const err = await res.json().catch(() => ({}));
-            const errMsg = err.error || `HTTP ${res.status}`;
+            // #452: the error envelope is now {"error": {"message", ...}}. Read .message, but
+            // still tolerate a bare string so this keeps working against an older server.
+            const errMsg = (err.error && (err.error.message || err.error)) || `HTTP ${res.status}`;
             modalStatus.innerHTML = `<span class="text-red-400">Failed: ${esc(errMsg)}</span>`;
             setStatus(`Load failed: ${errMsg}`, 'text-red-400');
         }
@@ -1116,6 +1253,8 @@ function buildApiMessages() {
         const msg = { role: m.role, content: m.content };
         if (m.tool_calls) msg.tool_calls = m.tool_calls;
         if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
+        // Replay earlier reasoning; the chat template decides whether to render it (preserve_thinking).
+        if (m.role === 'assistant' && m.reasoning) msg.reasoning_content = m.reasoning;
         // Assistant tool-call messages have null content per OpenAI spec
         if (m.role === 'assistant' && m.tool_calls) msg.content = null;
         apiMessages.push(msg);
@@ -1163,6 +1302,15 @@ async function runGeneration(round) {
     let finishReason = null;
     const startTime = performance.now();
     let firstTokenTime = null;
+    let reasoningText = '';
+    let reasoningEl = null;
+    let reasoningStart = null;
+    const collapseReasoning = () => {
+        if (!reasoningEl || !reasoningEl.open) return;
+        reasoningEl.open = false;
+        const secs = ((performance.now() - reasoningStart) / 1000).toFixed(1);
+        reasoningEl.querySelector('.reasoning-summary').textContent = `Thought for ${secs}s`;
+    };
 
     // Show live timer immediately (before first token)
     placeholder.liveStats.classList.remove('hidden');
@@ -1186,10 +1334,24 @@ async function runGeneration(round) {
 
     try {
         for await (const event of streamChat(apiMessages, params)) {
-            if (event.type === 'delta') {
+            if (event.type === 'reasoning') {
                 if (firstTokenTime === null) {
                     firstTokenTime = performance.now();
                 }
+                tokenCount++;
+                if (!reasoningEl) {
+                    reasoningStart = performance.now();
+                    reasoningEl = createReasoningBlock('', true);
+                    placeholder.bubble.insertBefore(reasoningEl, placeholder.contentEl);
+                }
+                reasoningText += event.content;
+                reasoningEl.querySelector('.reasoning-body').textContent = reasoningText;
+                scrollToBottom();
+            } else if (event.type === 'delta') {
+                if (firstTokenTime === null) {
+                    firstTokenTime = performance.now();
+                }
+                collapseReasoning();
                 tokenCount++;
                 fullText += event.content;
                 if (useLogprobs && event.logprobs) {
@@ -1221,6 +1383,7 @@ async function runGeneration(round) {
 
     // Finalize
     clearInterval(liveTimer);
+    collapseReasoning();
     placeholder.contentEl.classList.remove('cursor-blink');
     placeholder.liveStats.remove();
 
@@ -1243,6 +1406,7 @@ async function runGeneration(round) {
         state.messages.push({
             role: 'assistant',
             content: fullText,
+            reasoning: reasoningText || undefined,
             tool_calls: detectedToolCalls,
             stats: statsInfo,
             rawPrompt,
@@ -1310,6 +1474,7 @@ async function runGeneration(round) {
     placeholder.bubble.setAttribute('data-msg-idx', msgIdx);
     state.messages.push({
         role: 'assistant', content: fullText, stats: statsInfo, rawPrompt, rawResponse: fullText,
+        reasoning: reasoningText || undefined,
         logprobs: useLogprobs ? logprobEntries : null,
     });
 
@@ -1620,6 +1785,7 @@ function saveConversation() {
                 const msg = { role: m.role, content: m.content };
                 if (m.tool_calls) msg.tool_calls = m.tool_calls;
                 if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
+                if (m.reasoning) msg.reasoning = m.reasoning;
                 return msg;
             })
         ));
@@ -1654,6 +1820,7 @@ function loadConversation() {
             const stateMsg = { role: m.role, content: m.content };
             if (m.tool_calls) stateMsg.tool_calls = m.tool_calls;
             if (m.tool_call_id) stateMsg.tool_call_id = m.tool_call_id;
+            if (m.reasoning) stateMsg.reasoning = m.reasoning;
             state.messages.push(stateMsg);
 
             if (m.role === 'tool') {
@@ -1674,7 +1841,7 @@ function loadConversation() {
                 messagesEl.appendChild(wrapper);
                 hideWelcome();
             } else {
-                addMessageToDOM(m.role, m.content);
+                addMessageToDOM(m.role, m.content, undefined, undefined, undefined, m.reasoning);
             }
         }
     } catch { /* corrupted data, ignore */ }
@@ -1816,7 +1983,7 @@ modalModelSelect.addEventListener('change', onModalModelChange);
 
 // Device radio toggle → show/hide GPU section
 document.querySelectorAll('input[name="modal-device"]').forEach(radio => {
-    radio.addEventListener('change', updateGpuVisibility);
+    radio.addEventListener('change', () => { modalDeviceTouched = true; updateGpuVisibility(); });
 });
 
 // GPU layers slider live update

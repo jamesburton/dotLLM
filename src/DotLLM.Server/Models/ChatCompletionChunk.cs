@@ -104,7 +104,31 @@ public sealed record ChatDeltaDto
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Content { get; init; }
 
+    /// <summary>Incremental reasoning text (#767), streamed separately from <see cref="Content"/>.</summary>
+    [JsonPropertyName("reasoning_content")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReasoningContent { get; init; }
+
     [JsonPropertyName("tool_calls")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public ToolCallDto[]? ToolCalls { get; init; }
+    public StreamingToolCallDto[]? ToolCalls { get; init; }
+}
+
+/// <summary>
+/// A streamed tool call, identified by its position in the assistant's tool-call list.
+/// Unlike a non-streaming tool call, OpenAI clients require this index to assemble deltas.
+/// </summary>
+public sealed record StreamingToolCallDto
+{
+    [JsonPropertyName("index")]
+    public required int Index { get; init; }
+
+    [JsonPropertyName("id")]
+    public required string Id { get; init; }
+
+    [JsonPropertyName("type")]
+    public string Type => "function";
+
+    [JsonPropertyName("function")]
+    public required ToolCallFunctionDto Function { get; init; }
 }
