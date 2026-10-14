@@ -30,6 +30,9 @@ if (args[0] == "tier") { TierRun.Run(args); return; }
 if (args[0] == "kbench") { KBench.Run(args); return; }
 if (args[0] == "iqbench") { IqKBench.Run(args); return; }
 if (args[0] == "mimobench") { MimoIqBench.Run(args); return; }
+if (args[0] == "mimofwd") { MimoFwd.Run(args); return; }
+if (args[0] == "smlsweep") { SmlSweep.Run(args); return; }
+if (args[0] == "rowdump") { RowDump.Run(args); return; }
 if (args[0] == "decodekl") { Environment.Exit(DecodeKl.Run(args)); return; }
 if (args[0] == "mcbench") { McBench.Run(args); return; }
 if (args[0] == "capscan")

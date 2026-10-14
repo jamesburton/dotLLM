@@ -59,6 +59,7 @@ layout(push_constant) uniform PushConstants {
     uint maxSplits;       // split slots per (row, head) in the partial scratch (= the splits of the longest row, >= 2)
     uint targetWg;        // split heuristic of the 1-row kernel (VulkanSplitKvAttentionKernel.ComputeSplits), so each row picks ITS 1-row split count
     uint minKv;
+    uint hasSinks;        // 1 = attention-sink layer (#996): the KV span of row r is clipped to its sliding window exactly as the 1-row sink decode path does (kvStart = posQ - W + 1)
 } pc;
 
 // Splits the 1-row decode kernel would use for a context of kvLen keys (VulkanSplitKvAttentionKernel.ComputeSplits).
@@ -147,7 +148,10 @@ void main() {
     uint splitId = rem - hq * pc.maxSplits;
 
     uint rowKv     = pc.positionOffset + row + 1u;
-    uint numSplits = splitsFor(rowKv);
+    // Sink layers clip the span to the window (the 1-row sink decode passes kvStart = posQ - W + 1 and splits the clipped span); others scan [0, rowKv).
+    uint kvStart   = (pc.hasSinks != 0u && pc.slidingWindow > 0u && rowKv > pc.slidingWindow) ? rowKv - pc.slidingWindow : 0u;
+    uint spanLen   = rowKv - kvStart;
+    uint numSplits = splitsFor(spanLen);
     if (splitId >= numSplits) return;   // uniform per workgroup; this row needs fewer splits than the longest
 
     uint groupSize = pc.numHeads / pc.numKvHeads;
@@ -165,8 +169,8 @@ void main() {
     uint qBase = (row * pc.numHeads + hq) * pc.headDim;
 
     // This split's KV chunk.
-    uint splitLen   = (rowKv + numSplits - 1u) / numSplits;
-    uint chunkStart = splitId * splitLen;
+    uint splitLen   = (spanLen + numSplits - 1u) / numSplits;
+    uint chunkStart = kvStart + splitId * splitLen;
     uint chunkEnd   = min(chunkStart + splitLen, rowKv);
 
     // 1. Load Q and zero the accumulator.
