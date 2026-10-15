@@ -188,7 +188,7 @@ public static class OllamaApiEndpoint
         foreach (var m in ModelResolver.EnumerateLocal(includeOllama: true))
         {
             string stem = System.IO.Path.GetFileNameWithoutExtension(m.Filename);
-            string name = stem;
+            string name = ModelResolver.IdFor(m);   // repo-qualified: a bare stem collides across repos (two "q4_k_m"s listed as one)
             if (m.RepoId.StartsWith("ollama/", StringComparison.Ordinal))
             {
                 string safe = m.RepoId["ollama/".Length..];
@@ -612,9 +612,7 @@ public static class OllamaApiEndpoint
             return;
         }
 
-        var match = ModelResolver.EnumerateLocal().FirstOrDefault(m =>
-            System.IO.Path.GetFileNameWithoutExtension(m.Filename).Equals(name, StringComparison.OrdinalIgnoreCase)
-            || m.Filename.Equals(name, StringComparison.OrdinalIgnoreCase));
+        var match = ModelResolver.EnumerateLocal().FirstOrDefault(m => ModelResolver.IsNamedBy(m, name));
         if (match is null)
         {
             bool inOllama = OllamaRef.TryParse(name) is { } o && OllamaStore.TryFind(o) is not null;

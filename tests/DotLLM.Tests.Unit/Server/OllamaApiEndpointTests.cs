@@ -76,7 +76,7 @@ public sealed class OllamaApiEndpointTests : IAsyncLifetime
         var models = doc.RootElement.GetProperty("models").EnumerateArray().ToList();
 
         var helper = models.Single(m => m.GetProperty("name").GetString() == "helper:v1");
-        var tiny = models.Single(m => m.GetProperty("name").GetString() == "tiny-Q4_K_M");
+        var tiny = models.Single(m => m.GetProperty("name").GetString() == "acme/tiny-GGUF/tiny-Q4_K_M.gguf");   // repo-qualified: bare stems collide across repos
         foreach (var m in new[] { helper, tiny })
         {
             Assert.Equal(m.GetProperty("name").GetString(), m.GetProperty("model").GetString());

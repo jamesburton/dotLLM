@@ -46,14 +46,15 @@ public static class ServerStartup
 
     /// <summary>
     /// The id a loaded model is known by: the profile name when <paramref name="requested"/> names a profile (so a request for that alias
-    /// matches the active model and residency keys by it), otherwise the file stem.
+    /// matches the active model and residency keys by it), otherwise the repo-qualified <see cref="ModelResolver.IdForPath"/>
+    /// (<c>owner/repo/file.gguf</c>; the bare file stem only for a file outside the model stores).
     /// </summary>
     public static string ModelIdFor(string requested, string resolvedPath) =>
         ModelProfileStore.NormalizeName(requested) is { } n && ModelProfileStore.TryGet(n) is not null
             ? n
             // An ollama blob is named sha256-<hex>: key the model by the ollama name it was requested under.
             : OllamaStore.IsBlobPath(resolvedPath) && OllamaRef.TryParse(requested) is { } o ? o.ToString()
-            : Path.GetFileNameWithoutExtension(resolvedPath);
+            : ModelResolver.IdForPath(resolvedPath);
 
     /// <summary>
     /// <see cref="ResolveModelPath"/>, falling back to a Hub download when <paramref name="autoPull"/> is on and the reference names a Hub repo

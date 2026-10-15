@@ -9,7 +9,7 @@ namespace DotLLM.Server;
 /// <para>
 /// The key is the same string chat/completion requests match against and
 /// <c>GET /v1/models</c> reports — <see cref="ServerOptions.ModelId"/>, which for a file-resolved
-/// model is <c>Path.GetFileNameWithoutExtension(path)</c>. Comparison is ordinal-ignore-case, the
+/// model is the repo-qualified <c>owner/repo/file.gguf</c> (<c>ModelResolver.IdFor</c>). Comparison is ordinal-ignore-case, the
 /// same as <see cref="ServerState.EnsureActiveAsync"/>'s own key matching.
 /// </para>
 /// <para>

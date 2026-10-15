@@ -387,10 +387,8 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             if (resolvedPath is null)
                 return 1;
 
-            string modelId = Path.GetFileNameWithoutExtension(resolvedPath);
-            if (settings.Model.Contains('/'))
-                modelId = settings.Model.Split('/')[^1];
-            serverOptions = serverOptions with { ModelId = modelId };
+            // The same key a later load/request of this file produces (repo-qualified), so /v1/models never reports a bare quant stem.
+            serverOptions = serverOptions with { ModelId = ServerStartup.ModelIdFor(settings.Model, resolvedPath) };
 
             try
             {

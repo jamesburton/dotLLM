@@ -69,6 +69,41 @@ public static class ModelResolver
         return new ModelReference(null, s, tag);
     }
 
+    /// <summary>
+    /// The id a local model is listed and served under: <c>owner/repo/file.gguf</c> for a Hub/mirror file, so two repos that both ship
+    /// <c>q4_k_m.gguf</c> are distinguishable (a bare stem told a client nothing about which model it was). It is an accepted reference
+    /// (<see cref="Parse"/>), so a client can send it straight back. Ollama-store entries keep their file stem; they are addressed by ollama name.
+    /// </summary>
+    public static string IdFor(LocalModel model) =>
+        model.RepoId.StartsWith("ollama/", StringComparison.OrdinalIgnoreCase)
+            ? Path.GetFileNameWithoutExtension(model.Filename)
+            : $"{model.RepoId}/{model.Filename}";
+
+    /// <summary>
+    /// <see cref="IdFor(LocalModel)"/> for a resolved file path: the qualified id when the file is a known local model, else the file stem
+    /// (an explicit path outside the model stores has no repo to qualify it with).
+    /// </summary>
+    public static string IdForPath(string path, string? modelsDir = null, string? cacheRoot = null)
+    {
+        string full;
+        try { full = Path.GetFullPath(path); } catch { return Path.GetFileNameWithoutExtension(path); }
+        var match = EnumerateLocal(modelsDir, cacheRoot).FirstOrDefault(m =>
+            string.Equals(SafeFullPath(m.FullPath), full, StringComparison.OrdinalIgnoreCase));
+        return match is null ? Path.GetFileNameWithoutExtension(path) : IdFor(match);
+    }
+
+    /// <summary>True when <paramref name="name"/> addresses <paramref name="model"/> by its id, file stem, or filename.</summary>
+    public static bool IsNamedBy(LocalModel model, string name) =>
+        IdFor(model).Equals(name, StringComparison.OrdinalIgnoreCase)
+        || model.Filename.Equals(name, StringComparison.OrdinalIgnoreCase)
+        || Path.GetFileNameWithoutExtension(model.Filename).Equals(name, StringComparison.OrdinalIgnoreCase)
+        || Path.GetFileName(model.Filename).Equals(name, StringComparison.OrdinalIgnoreCase);
+
+    private static string SafeFullPath(string path)
+    {
+        try { return Path.GetFullPath(path); } catch { return path; }
+    }
+
     /// <summary>Every local GGUF (mirror + hub cache), de-duplicated by repo and filename. Never throws.</summary>
     public static List<LocalModel> EnumerateLocal(string? modelsDir = null, string? cacheRoot = null, bool includeOllama = false, string? ollamaRoot = null)
     {
@@ -167,11 +202,9 @@ public static class ModelResolver
             return ChooseFile(inRepo, tag)?.FullPath;
         }
 
-        // Bare name: the file stem /v1/models reports, or the full filename.
+        // Bare name: a file stem (the id /v1/models reported before ids were repo-qualified), or the full filename.
         string name = r.Filename ?? arg;
-        var named = all.Where(m =>
-            Path.GetFileNameWithoutExtension(m.Filename).Equals(name, StringComparison.OrdinalIgnoreCase)
-            || Path.GetFileName(m.Filename).Equals(name, StringComparison.OrdinalIgnoreCase)).ToList();
+        var named = all.Where(m => IsNamedBy(m, name)).ToList();
         return ChooseFile(named, tag)?.FullPath;
     }
 

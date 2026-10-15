@@ -48,7 +48,7 @@ public static class ModelManagementEndpoint
             {
                 Models = models.Select(m =>
                 {
-                    var modelId = Path.GetFileNameWithoutExtension(m.Filename);
+                    var modelId = ModelResolver.IdFor(m);
                     return new AvailableModelDto
                     {
                         RepoId = m.RepoId,

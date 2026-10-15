@@ -194,4 +194,38 @@ public sealed class ModelResolverTests : IDisposable
         Assert.False(Directory.Exists(HubCache.RepoDirectory("acme/solo", Hub)));
         Assert.False(Directory.Exists(Path.Combine(Mirror, "acme", "solo")));
     }
+
+    [Fact]
+    public void IdFor_QualifiesSameNamedFilesByRepo_AndTheIdResolvesBackToItsOwnFile()
+    {
+        // Two repos shipping the same bare quant filename were both listed as "q4_k_m", indistinguishable to a client.
+        string a = AddHub("acme/alpha", "q4_k_m.gguf", 100);
+        string b = AddHub("other/beta", "q4_k_m.gguf", 200);
+
+        var ids = ModelResolver.EnumerateLocal(Mirror, Hub).Select(ModelResolver.IdFor).ToList();
+        Assert.Equal(["acme/alpha/q4_k_m.gguf", "other/beta/q4_k_m.gguf"], ids);
+
+        Assert.Equal(a, ModelResolver.ResolveLocal("acme/alpha/q4_k_m.gguf", null, Mirror, Hub));
+        Assert.Equal(b, ModelResolver.ResolveLocal("other/beta/q4_k_m.gguf", null, Mirror, Hub));
+        Assert.Equal("acme/alpha/q4_k_m.gguf", ModelResolver.IdForPath(a, Mirror, Hub));
+        Assert.Equal("other/beta/q4_k_m.gguf", ModelResolver.IdForPath(b, Mirror, Hub));
+    }
+
+    [Fact]
+    public void IdForPath_FileOutsideTheStores_FallsBackToItsStem()
+    {
+        string loose = Path.Combine(_root, "loose", "my-model.gguf");
+        Directory.CreateDirectory(Path.GetDirectoryName(loose)!);
+        File.WriteAllBytes(loose, new byte[10]);
+
+        Assert.Equal("my-model", ModelResolver.IdForPath(loose, Mirror, Hub));
+    }
+
+    [Fact]
+    public void ResolveLocal_BareStemStillResolves_ForClientsHoldingAnOldId()
+    {
+        string only = AddHub("acme/solo-stem", "q5_k_m.gguf", 100);
+
+        Assert.Equal(only, ModelResolver.ResolveLocal("q5_k_m", null, Mirror, Hub));
+    }
 }
