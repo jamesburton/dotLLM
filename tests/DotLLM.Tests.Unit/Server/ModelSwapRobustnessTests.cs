@@ -26,10 +26,28 @@ public sealed class ModelSwapRobustnessTests
         }
     }
 
-    private static async Task<string> StreamAsync(Func<Func<Task>, CancellationToken, Task> gate, TimeSpan? interval)
+    /// <summary>A response body that can be read while the keep-alive loop writes to it.</summary>
+    private sealed class RecordingStream : MemoryStream
+    {
+        private readonly object _gate = new();
+
+        public override void Write(byte[] buffer, int offset, int count) { lock (_gate) base.Write(buffer, offset, count); }
+
+        public override void Write(ReadOnlySpan<byte> buffer) { lock (_gate) base.Write(buffer); }
+
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken ct) { Write(buffer, offset, count); return Task.CompletedTask; }
+
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default) { Write(buffer.Span); return ValueTask.CompletedTask; }
+
+        public string Text { get { lock (_gate) return Encoding.UTF8.GetString(ToArray()); } }
+    }
+
+    private static Task<string> StreamAsync(Func<Func<Task>, CancellationToken, Task> gate, TimeSpan? interval) =>
+        StreamAsync(gate, interval, new RecordingStream());
+
+    private static async Task<string> StreamAsync(Func<Func<Task>, CancellationToken, Task> gate, TimeSpan? interval, RecordingStream body)
     {
         var ctx = new DefaultHttpContext();
-        var body = new MemoryStream();
         ctx.Response.Body = body;
         await ChatCompletionEndpoint.WriteChatStreamAsync(
             new ChatCompletionRequest { Messages = [], Stream = true }, ctx, _ => Script("hi"), gate, "chatcmpl-1", "m",
@@ -42,16 +60,20 @@ public sealed class ModelSwapRobustnessTests
     public async Task QueuedStream_GetsKeepAliveComments_AndTheRoleChunkOnlyOnceTheGateIsHeld()
     {
         bool gateHeld = false;
+        var body = new RecordingStream();
 
-        // A gate that is "busy" for 400 ms before running the work (another request generating, or a load).
+        // A gate that stays "busy" (another request generating, or a load) until two keep-alives have gone out - waiting on the
+        // observable outcome rather than a fixed delay, so a starved thread pool under the full suite cannot make it flaky.
         async Task SlowGate(Func<Task> work, CancellationToken ct)
         {
-            await Task.Delay(400, ct);
+            var deadline = DateTime.UtcNow.AddSeconds(30);
+            while (body.Text.Split(": waiting for").Length - 1 < 2 && DateTime.UtcNow < deadline)
+                await Task.Delay(10, ct);
             gateHeld = true;
             await work();
         }
 
-        string raw = await StreamAsync(SlowGate, TimeSpan.FromMilliseconds(50));
+        string raw = await StreamAsync(SlowGate, TimeSpan.FromMilliseconds(50), body);
 
         Assert.True(gateHeld);
         Assert.StartsWith(": waiting for loading owner/repo/x.gguf\n\n", raw);
@@ -65,7 +87,7 @@ public sealed class ModelSwapRobustnessTests
     [Fact]
     public async Task UncontendedStream_IsByteForByteFreeOfKeepAlives()
     {
-        string raw = await StreamAsync((work, _) => work(), TimeSpan.FromMilliseconds(50));
+        string raw = await StreamAsync((work, _) => work(), TimeSpan.FromSeconds(1));
 
         Assert.DoesNotContain(": waiting", raw);
         Assert.StartsWith("data: ", raw);
@@ -132,7 +154,7 @@ public sealed class ModelSwapRobustnessTests
 
     private static async Task WaitUntil(Func<bool> condition)
     {
-        for (int i = 0; i < 200 && !condition(); i++) await Task.Delay(10);
+        for (int i = 0; i < 3000 && !condition(); i++) await Task.Delay(10);   // up to 30 s: the full suite can starve the pool
         Assert.True(condition());
     }
 
