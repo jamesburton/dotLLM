@@ -99,7 +99,6 @@ public static class MessagesEndpoint
         // Echo the model that actually served the request, not the requested alias — after
         // EnsureActiveAsync, Options.ModelId is the active model's key.
         var modelId = state.Options.ModelId;
-        var generator = state.Generator;
 
         string? prompt = BuildPrompt(request, state, out var tools, out bool constrained, out string? templateError);
         if (prompt is null)
@@ -138,10 +137,10 @@ public static class MessagesEndpoint
             toolChoice, tools, state.ToolCallParser, ref options, out bool forcedToolCall);
 
         if (request.Stream)
-            await HandleStreamingAsync(request, generator, state, httpContext, prompt, options,
+            await HandleStreamingAsync(request, state, httpContext, prompt, options,
                 messageId, modelId, effectiveParser, forcedToolCall, promptTokenCount, plan, ct, tools);
         else
-            await HandleNonStreamingAsync(request, generator, state, httpContext, prompt, options,
+            await HandleNonStreamingAsync(request, state, httpContext, prompt, options,
                 messageId, modelId, effectiveParser, plan, ct, tools);
     }
 
@@ -159,7 +158,6 @@ public static class MessagesEndpoint
 
     private static async Task HandleNonStreamingAsync(
         AnthropicMessagesRequest request,
-        TextGenerator generator,
         ServerState state,
         HttpContext httpContext,
         string prompt,
@@ -183,9 +181,11 @@ public static class MessagesEndpoint
         }
         else
         {
-            await state.ExecuteAsync(async () =>
+            // (#1023) The generator current under the gate, not the one captured before a possible queued swap.
+            await state.ExecuteAsync(modelId, current =>
             {
-                result = generator.Generate(prompt, options);
+                result = current.Generate(prompt, options);
+                return Task.CompletedTask;
             }, ct);
         }
 
@@ -268,7 +268,6 @@ public static class MessagesEndpoint
 
     private static async Task HandleStreamingAsync(
         AnthropicMessagesRequest request,
-        TextGenerator generator,
         ServerState state,
         HttpContext httpContext,
         string prompt,
@@ -280,13 +279,20 @@ public static class MessagesEndpoint
         ReasoningPlan plan,
         CancellationToken ct,
         ToolDefinition[]? tools = null)
-        => await WriteMessageStreamAsync(
+    {
+        // (#1023) Keep-alive comments while the gate is contended; the generator is read once it is held, so a request queued
+        // behind a model swap never runs on a disposed or different model.
+        TextGenerator? current = null;
+        await WriteMessageStreamAsync(
             httpContext,
-            innerCt => generator.GenerateStreamingTokensAsync(prompt, options, innerCt),
-            state.ExecuteAsync,
+            innerCt => current!.GenerateStreamingTokensAsync(prompt, options, innerCt),
+            SseKeepAlive.Wrap(httpContext,
+                (work, gateCt) => state.ExecuteAsync(modelId, g => { current = g; return work(); }, gateCt),
+                state.DescribeWait),
             toolCallParser,
             request.StopSequences,
             messageId, modelId, promptTokenCount, ct, forcedToolCall, plan, tools);
+    }
 
     /// <summary>
     /// Emits the Anthropic SSE event sequence for one streaming request:

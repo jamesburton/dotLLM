@@ -28,26 +28,19 @@ public static class ChatCompletionEndpoint
         // (#369) Activate the requested model — a cheap field-swap if it's already resident, a
         // lazy reload if it idled out, or a fresh load otherwise. No-op when request.Model is null
         // or already active.
+        // (#1023) A streaming request may wait minutes here (a load in progress, or the lock). Keep-alive comments every ~10 s
+        // tell the client it is queued, not dead; nothing is written when the wait is shorter, so the fast path is unchanged.
+        await using var keepAlive = request.Stream ? SseKeepAlive.Start(httpContext, state.DescribeWait) : null;
         var activationError = await state.EnsureActiveAsync(request.Model, request.KeepAlive, httpContext.RequestAborted);
         if (activationError is not null)
         {
-            httpContext.Response.StatusCode = 400;
-            await httpContext.Response.WriteAsJsonAsync(
-                ErrorResponse.InvalidRequest(activationError, param: "model", code: "model_not_found"),
-                ServerJsonContext.Default.ErrorResponse,
-                contentType: null,
-                httpContext.RequestAborted);
+            await WriteErrorAsync(httpContext, 400, ErrorResponse.InvalidRequest(activationError, param: "model", code: "model_not_found"), keepAlive);
             return;
         }
 
         if (!state.IsReady || state.Generator is null || state.ChatTemplate is null)
         {
-            httpContext.Response.StatusCode = 503;
-            await httpContext.Response.WriteAsJsonAsync(
-                ErrorResponse.Internal("No model loaded", code: "model_not_loaded"),
-                ServerJsonContext.Default.ErrorResponse,
-                contentType: null,
-                httpContext.RequestAborted);
+            await WriteErrorAsync(httpContext, 503, ErrorResponse.Internal("No model loaded", code: "model_not_loaded"), keepAlive);
             return;
         }
 
@@ -55,12 +48,7 @@ public static class ChatCompletionEndpoint
         var validationError = RequestValidator.ValidateChatRequest(request, state.Options.EffectiveMaxMessages);
         if (validationError is not null)
         {
-            httpContext.Response.StatusCode = 400;
-            await httpContext.Response.WriteAsJsonAsync(
-                ErrorResponse.InvalidRequest(validationError),
-                ServerJsonContext.Default.ErrorResponse,
-                contentType: null,
-                httpContext.RequestAborted);
+            await WriteErrorAsync(httpContext, 400, ErrorResponse.InvalidRequest(validationError), keepAlive);
             return;
         }
 
@@ -69,22 +57,16 @@ public static class ChatCompletionEndpoint
         // returning one choice -- the defect this closes -- say so.
         if (request.Stream && request.ChoiceCount != 1)
         {
-            httpContext.Response.StatusCode = 400;
-            await httpContext.Response.WriteAsJsonAsync(
-                ErrorResponse.InvalidRequest(
+            await WriteErrorAsync(httpContext, 400, ErrorResponse.InvalidRequest(
                     "n > 1 is not supported with stream: true. Request the choices without streaming, "
                     + "or issue n separate streaming requests.",
-                    param: "n"),
-                ServerJsonContext.Default.ErrorResponse,
-                contentType: null,
-                httpContext.RequestAborted);
+                    param: "n"), keepAlive);
             return;
         }
 
         var ct = httpContext.RequestAborted;
         var requestId = RequestConverter.GenerateRequestId();
         var modelId = state.Options.ModelId;
-        var generator = state.Generator;
 
         // Validate prefix_id reference (Step 37): must be registered if supplied.
         if (!string.IsNullOrWhiteSpace(request.PrefixId))
@@ -92,12 +74,7 @@ public static class ChatCompletionEndpoint
             var mgr = state.PrefixTrieManager;
             if (mgr is null || mgr.InspectNamedPrefix(request.PrefixId) is null)
             {
-                httpContext.Response.StatusCode = 400;
-                await httpContext.Response.WriteAsJsonAsync(
-                    ErrorResponse.InvalidRequest($"prefix_id '{request.PrefixId}' is not registered. POST /v1/prompt-cache/{request.PrefixId} first.", param: "prefix_id"),
-                    ServerJsonContext.Default.ErrorResponse,
-                    contentType: null,
-                    httpContext.RequestAborted);
+                await WriteErrorAsync(httpContext, 400, ErrorResponse.InvalidRequest($"prefix_id '{request.PrefixId}' is not registered. POST /v1/prompt-cache/{request.PrefixId} first.", param: "prefix_id"), keepAlive);
                 return;
             }
         }
@@ -110,12 +87,7 @@ public static class ChatCompletionEndpoint
         }
         catch (LoraAdapterNotFoundException ex)
         {
-            httpContext.Response.StatusCode = 400;
-            await httpContext.Response.WriteAsJsonAsync(
-                ErrorResponse.InvalidRequest(ex.Message, param: "lora_adapter"),
-                ServerJsonContext.Default.ErrorResponse,
-                contentType: null,
-                httpContext.RequestAborted);
+            await WriteErrorAsync(httpContext, 400, ErrorResponse.InvalidRequest(ex.Message, param: "lora_adapter"), keepAlive);
             return;
         }
 
@@ -135,23 +107,13 @@ public static class ChatCompletionEndpoint
         if (!ReasoningSupport.TryApply(state.ChatTemplate, messages, templateOptions,
                 out string prompt, out string? templateError, out string? templateParam))
         {
-            httpContext.Response.StatusCode = 400;
-            await httpContext.Response.WriteAsJsonAsync(
-                ErrorResponse.InvalidRequest(templateError!, param: templateParam),
-                ServerJsonContext.Default.ErrorResponse,
-                contentType: null,
-                httpContext.RequestAborted);
+            await WriteErrorAsync(httpContext, 400, ErrorResponse.InvalidRequest(templateError!, param: templateParam), keepAlive);
             return;
         }
         var plan = ReasoningSupport.Plan(state.Options.ReasoningFormat, request.ReasoningFormat, constrained, prompt, out string? planError, state.ChatTemplate);
         if (planError is not null)
         {
-            httpContext.Response.StatusCode = 400;
-            await httpContext.Response.WriteAsJsonAsync(
-                ErrorResponse.InvalidRequest(planError, param: "reasoning_format"),
-                ServerJsonContext.Default.ErrorResponse,
-                contentType: null,
-                httpContext.RequestAborted);
+            await WriteErrorAsync(httpContext, 400, ErrorResponse.InvalidRequest(planError, param: "reasoning_format"), keepAlive);
             return;
         }
 
@@ -162,12 +124,7 @@ public static class ChatCompletionEndpoint
             maxTokens, out int effectiveMaxTokens, out _);
         if (promptError is not null)
         {
-            httpContext.Response.StatusCode = 400;
-            await httpContext.Response.WriteAsJsonAsync(
-                ErrorResponse.InvalidRequest(promptError, param: "messages", code: "context_length_exceeded"),
-                ServerJsonContext.Default.ErrorResponse,
-                contentType: null,
-                httpContext.RequestAborted);
+            await WriteErrorAsync(httpContext, 400, ErrorResponse.InvalidRequest(promptError, param: "messages", code: "context_length_exceeded"), keepAlive);
             return;
         }
 
@@ -191,6 +148,7 @@ public static class ChatCompletionEndpoint
         // AR models leave DiffusionGenerator null and fall through to the unchanged path below.
         if (state.DiffusionGenerator is { } diffusionGenerator)
         {
+            if (keepAlive is not null) await keepAlive.StopAsync();
             // Per-request diffusion overrides (canvas length / steps / temperature schedule) build a
             // fresh generator over the same model with a tweaked DiffusionConfig; absent overrides reuse
             // the load-time generator (verified DiffusionConfig defaults). max_tokens → target length.
@@ -198,12 +156,8 @@ public static class ChatCompletionEndpoint
 
             if (request.ChoiceCount != 1)
             {
-                httpContext.Response.StatusCode = 400;
-                await httpContext.Response.WriteAsJsonAsync(
-                    ErrorResponse.InvalidRequest(
-                        "n > 1 is not supported for diffusion models.", param: "n"),
-                    ServerJsonContext.Default.ErrorResponse,
-                    contentType: null, httpContext.RequestAborted);
+                await WriteErrorAsync(httpContext, 400, ErrorResponse.InvalidRequest(
+                        "n > 1 is not supported for diffusion models.", param: "n"), keepAlive);
                 return;
             }
 
@@ -217,16 +171,15 @@ public static class ChatCompletionEndpoint
         }
 
         if (request.Stream)
-            await HandleStreamingAsync(request, generator, state, httpContext, prompt, options,
-                requestId, modelId, tools, effectiveToolParser, adapter, plan, ct, forcedToolCall);
+            await HandleStreamingAsync(request, state, httpContext, prompt, options,
+                requestId, modelId, tools, effectiveToolParser, adapter, plan, ct, forcedToolCall, keepAlive);
         else
-            await HandleNonStreamingAsync(request, generator, state, httpContext, prompt, options,
+            await HandleNonStreamingAsync(request, state, httpContext, prompt, options,
                 requestId, modelId, tools, effectiveToolParser, adapter, plan, ct);
     }
 
     private static async Task HandleNonStreamingAsync(
         ChatCompletionRequest request,
-        TextGenerator generator,
         ServerState state,
         HttpContext httpContext,
         string prompt,
@@ -267,9 +220,11 @@ public static class ChatCompletionEndpoint
             {
                 var choiceOptions = SeedForChoice(options, i);
                 InferenceResponse? one = null;
-                await state.ExecuteAsync(async () =>
+                // (#1023) The generator is the one current under the gate, not one captured before a queued swap.
+                await state.ExecuteAsync(modelId, generator =>
                 {
                     one = generator.Generate(prompt, choiceOptions, adapter: adapter);
+                    return Task.CompletedTask;
                 }, ct);
                 results[i] = one!;
             }
@@ -418,7 +373,6 @@ public static class ChatCompletionEndpoint
 
     private static Task HandleStreamingAsync(
         ChatCompletionRequest request,
-        TextGenerator generator,
         ServerState state,
         HttpContext httpContext,
         string prompt,
@@ -429,11 +383,19 @@ public static class ChatCompletionEndpoint
         DotLLM.Core.Lora.ILoraAdapter? adapter,
         ReasoningPlan plan,
         CancellationToken ct,
-        bool forcedToolCall = false)
-        => WriteChatStreamAsync(
+        bool forcedToolCall,
+        SseKeepAlive? keepAlive)
+    {
+        // (#1023) The generator is resolved under the gate (re-activating the admitted model if a queued swap replaced it), so the
+        // token source reads it only once the gate is held.
+        TextGenerator? current = null;
+        return WriteChatStreamAsync(
             request, httpContext,
-            innerCt => generator.GenerateStreamingTokensAsync(prompt, options, innerCt, adapter),
-            state.ExecuteAsync, requestId, modelId, tools, toolParser, plan, ct, forcedToolCall);
+            innerCt => current!.GenerateStreamingTokensAsync(prompt, options, innerCt, adapter),
+            (work, gateCt) => state.ExecuteAsync(modelId, generator => { current = generator; return work(); }, gateCt),
+            requestId, modelId, tools, toolParser, plan, ct, forcedToolCall,
+            keepAlive, state.DescribeWait);
+    }
 
     /// <summary>
     /// Emits the OpenAI SSE stream for one request. The token source and the model gate are injected
@@ -450,12 +412,19 @@ public static class ChatCompletionEndpoint
         IToolCallParser? toolParser,
         ReasoningPlan plan,
         CancellationToken ct,
-        bool forcedToolCall = false)
+        bool forcedToolCall = false,
+        SseKeepAlive? keepAlive = null,
+        Func<string>? waitReason = null,
+        TimeSpan? keepAliveInterval = null)
     {
         // No Connection header: it is connection-specific and illegal over HTTP/2+. See SseResponse.
         SseResponse.ApplyHeaders(httpContext);
 
-        // First chunk: role
+        // (#1023) While the gate is contended, ": waiting for ..." comments every ~10 s; they stop before the first real chunk.
+        execute = SseKeepAlive.Wrap(httpContext, execute, waitReason ?? (() => "the server"), keepAliveInterval, keepAlive);
+
+        // First chunk: role. Written only once the request holds the gate (#1023): a role chunk and response id sent before a long
+        // silent wait made a queued request indistinguishable from a dead one.
         var roleChunk = new ChatCompletionChunk
         {
             Id = requestId,
@@ -465,7 +434,6 @@ public static class ChatCompletionEndpoint
                 Delta = new ChatDeltaDto { Role = "assistant" },
             }],
         };
-        await WriteSseChunk(httpContext, roleChunk, ct);
 
         // `sb` accumulates the ANSWER only (#767): tool-call detection below must not see reasoning.
         var sb = new StringBuilder();
@@ -529,6 +497,7 @@ public static class ChatCompletionEndpoint
 
         await execute(async () =>
         {
+            await WriteSseChunk(httpContext, roleChunk, ct);
             await foreach (var token in tokenSource(ct))
             {
                 if (token.Text.Length > 0)
@@ -667,6 +636,24 @@ public static class ChatCompletionEndpoint
     /// </summary>
     internal static ToolCall[]? ApplyParallelToolCalls(ToolCall[]? toolCalls, bool? parallelToolCalls) =>
         parallelToolCalls == false && toolCalls is { Length: > 1 } ? [toolCalls[0]] : toolCalls;
+
+    /// <summary>
+    /// Writes an error: the usual status + JSON body, or - when a keep-alive already committed an SSE response (#1023) - an
+    /// in-stream <c>data: {"error":...}</c> event and <c>data: [DONE]</c>.
+    /// </summary>
+    private static async Task WriteErrorAsync(HttpContext ctx, int status, ErrorResponse error, SseKeepAlive? keepAlive)
+    {
+        if (keepAlive is not null) await keepAlive.StopAsync();
+        if (!ctx.Response.HasStarted)
+        {
+            ctx.Response.StatusCode = status;
+            await ctx.Response.WriteAsJsonAsync(error, ServerJsonContext.Default.ErrorResponse, contentType: null, ctx.RequestAborted);
+            return;
+        }
+        await ctx.Response.WriteAsync("data: " + JsonSerializer.Serialize(error, ServerJsonContext.Default.ErrorResponse) + "\n\ndata: [DONE]\n\n",
+            ctx.RequestAborted);
+        await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+    }
 
     private static async Task WriteSseChunk(HttpContext ctx, ChatCompletionChunk chunk, CancellationToken ct)
     {

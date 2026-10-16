@@ -165,7 +165,7 @@ public static class DeviceModelLoader
         if (spec.Kind == DeviceKind.Auto && requestedGpuLayers == 0)
             spec = new(DeviceKind.Cpu, 0);
 
-        var plan = DeviceSelector.Plan(spec, modelBytes, devices);
+        var plan = DeviceSelector.Plan(spec, modelBytes, devices, fullOffload: requestedGpuLayers is null or < 0);
         if (plan.Error is not null)
             throw new DeviceUnavailableException(DeviceSelector.ExplicitFailureMessage(requestedDevice, modelName, modelBytes, plan.Error));
 

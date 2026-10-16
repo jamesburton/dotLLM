@@ -7,7 +7,7 @@ using Xunit;
 namespace DotLLM.Tests.Unit.Engine.Scheduler;
 
 /// <summary>
-/// #461, follow-up 1: the scheduler lease must be taken by <see cref="ServerState.ExecuteAsync"/>
+/// #461, follow-up 1: the scheduler lease must be taken by <see cref="ServerState.ExecuteAsync(Func{Task}, CancellationToken)"/>
 /// itself, not by each caller remembering to.
 /// </summary>
 /// <remarks>
@@ -32,7 +32,7 @@ namespace DotLLM.Tests.Unit.Engine.Scheduler;
 public sealed partial class ContinuousBatchSchedulerServiceTests
 {
     /// <summary>
-    /// While <see cref="ServerState.ExecuteAsync"/> is running work, the scheduler's model lease
+    /// While <see cref="ServerState.ExecuteAsync(Func{Task}, CancellationToken)"/> is running work, the scheduler's model lease
     /// is unavailable — which is exactly what stops its run loop entering a step. Against the
     /// pre-fix <c>ExecuteAsync</c> (request gate only) the lease is free throughout, and this
     /// fails on the first assertion.

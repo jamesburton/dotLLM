@@ -141,7 +141,7 @@ public static class ServerStartup
             string name = ModelIdFor(options.Model, resolvedPath);
             if (spec.IsGpu)
             {
-                var plan = DeviceSelector.Plan(spec, bytes, Endpoints.DeviceEndpoint.Describe());
+                var plan = DeviceSelector.Plan(spec, bytes, Endpoints.DeviceEndpoint.Describe(), fullOffload: options.GpuLayers is null or < 0);
                 if (plan.Error is not null)
                     throw new DeviceUnavailableException(DeviceSelector.ExplicitFailureMessage(options.Device, name, bytes, plan.Error));
             }
@@ -780,6 +780,9 @@ public static class ServerStartup
 
         // (#1021) "[dotllm] req#N POST /v1/chat/completions" ... "done 200 in 3.2s" / "cancelled after 600.0s".
         app.UseRequestLifecycleLog();
+
+        // (#1023) A request whose admitted model was swapped out while it queued, and could not be re-activated: 503 / in-stream error.
+        ModelUnavailableException.UseModelUnavailableHandler(app);
 
         // SDK observability headers (#452) — x-request-id, openai-processing-ms and the
         // x-ratelimit-* trio. Registered unconditionally and OUTSIDE the limiter so the headers

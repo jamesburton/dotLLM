@@ -75,6 +75,11 @@ public sealed record PropsResponse
     [JsonPropertyName("is_ready")]
     public bool IsReady { get; init; }
 
+    /// <summary>What the server is doing right now - <c>loading</c> / <c>busy</c> / <c>idle</c> / <c>no_model</c> (#1023); same object as <c>GET /v1/status</c>.</summary>
+    [JsonPropertyName("activity")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ServerStatusResponse? Activity { get; init; }
+
     /// <summary>The server build's informational version (<c>0.3.0-dev.N+sha</c>) (#774). Nullable: no initializer on an init-only DTO property (STJ source-gen drops it).</summary>
     [JsonPropertyName("version")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]

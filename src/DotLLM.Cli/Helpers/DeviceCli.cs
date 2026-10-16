@@ -110,7 +110,7 @@ internal static class DeviceCli
         backend = "cpu"; ordinal = 0;
         if (!DeviceSpec.TryParse(device, out var spec, out string? error)) { PrintError(error!, json); return false; }
         long bytes = ModelResolver.FileLength(modelPath);
-        var plan = DeviceSelector.Plan(spec, bytes, DotLLM.Server.Endpoints.DeviceEndpoint.Describe());
+        var plan = DeviceSelector.Plan(spec, bytes, DotLLM.Server.Endpoints.DeviceEndpoint.Describe(), fullOffload: false);   // tools take --gpu-layers; the loader judges fit
         if (plan.Error is not null)
         {
             PrintError(DeviceSelector.ExplicitFailureMessage(device, Path.GetFileName(modelPath), bytes, plan.Error), json);

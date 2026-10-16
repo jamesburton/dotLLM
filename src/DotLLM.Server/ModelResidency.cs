@@ -170,6 +170,23 @@ public sealed class ModelResidencyManager : IDisposable
     }
 
     /// <summary>
+    /// Evicts (disposes) the least-recently-used stashed model regardless of budget - used to make room on a device before a load
+    /// (#1023). Returns it (already disposed), or null when nothing is stashed.
+    /// </summary>
+    /// <returns>The evicted snapshot, or null.</returns>
+    public ResidentModelSnapshot? EvictLeastRecentlyUsed()
+    {
+        ResidentModelSnapshot? oldest;
+        lock (_lock)
+        {
+            oldest = _resident.Values.OrderBy(s => s.LastUsedUtc).FirstOrDefault();
+            if (oldest is not null) _resident.Remove(oldest.Key);
+        }
+        oldest?.Dispose();
+        return oldest;
+    }
+
+    /// <summary>
     /// Removes and disposes stashed models whose keep-alive has elapsed. Does not touch the active
     /// model — callers check that separately against <see cref="ServerState.LastUsedUtc"/> since it
     /// requires the request gate.

@@ -60,7 +60,6 @@ public static class CompletionEndpoint
         var ct = httpContext.RequestAborted;
         var requestId = RequestConverter.GenerateRequestId();
         var modelId = state.Options.ModelId;
-        var generator = state.Generator;
 
         // Validate prefix_id reference (Step 37).
         if (!string.IsNullOrWhiteSpace(request.PrefixId))
@@ -118,15 +117,15 @@ public static class CompletionEndpoint
         options = options with { MaxTokens = effectiveMaxTokens };
 
         if (request.Stream)
-            await HandleStreamingAsync(generator, state, httpContext, request.Prompt, options,
+            await HandleStreamingAsync(state, httpContext, request.Prompt, options,
                 requestId, modelId, adapter, request.WantsUsageChunk, ct);
         else
-            await HandleNonStreamingAsync(generator, state, httpContext, request.Prompt, options,
+            await HandleNonStreamingAsync(state, httpContext, request.Prompt, options,
                 requestId, modelId, adapter, ct);
     }
 
     private static async Task HandleNonStreamingAsync(
-        TextGenerator generator, ServerState state, HttpContext httpContext,
+        ServerState state, HttpContext httpContext,
         string prompt, DotLLM.Core.Configuration.InferenceOptions options,
         string requestId, string modelId,
         DotLLM.Core.Lora.ILoraAdapter? adapter,
@@ -154,9 +153,11 @@ public static class CompletionEndpoint
         }
         else
         {
-            await state.ExecuteAsync(async () =>
+            // (#1023) The generator current under the gate, not the one captured before a possible queued swap.
+            await state.ExecuteAsync(modelId, current =>
             {
-                result = generator.Generate(prompt, options, adapter: adapter);
+                result = current.Generate(prompt, options, adapter: adapter);
+                return Task.CompletedTask;
             }, ct);
         }
 
@@ -192,7 +193,7 @@ public static class CompletionEndpoint
     }
 
     private static async Task HandleStreamingAsync(
-        TextGenerator generator, ServerState state, HttpContext httpContext,
+        ServerState state, HttpContext httpContext,
         string prompt, DotLLM.Core.Configuration.InferenceOptions options,
         string requestId, string modelId,
         DotLLM.Core.Lora.ILoraAdapter? adapter,
@@ -205,9 +206,14 @@ public static class CompletionEndpoint
         int completionTokens = 0;
         int promptTokens = 0;
 
-        await state.ExecuteAsync(async () =>
+        // (#1023) ": waiting for ..." keep-alive comments while the gate is contended; the generator is read once it is held.
+        TextGenerator? current = null;
+        var execute = SseKeepAlive.Wrap(httpContext,
+            (work, gateCt) => state.ExecuteAsync(modelId, g => { current = g; return work(); }, gateCt),
+            state.DescribeWait);
+        await execute(async () =>
         {
-            await foreach (var token in generator.GenerateStreamingTokensAsync(prompt, options, ct, adapter))
+            await foreach (var token in current!.GenerateStreamingTokensAsync(prompt, options, ct, adapter))
             {
                 if (token.Text.Length > 0) completionTokens++;
                 if (token.Timings.HasValue) promptTokens = token.Timings.Value.PrefillTokenCount;

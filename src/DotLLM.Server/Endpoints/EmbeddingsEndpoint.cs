@@ -18,7 +18,7 @@ namespace DotLLM.Server.Endpoints;
 /// <para>Each input item is its own forward pass with positions <c>0..n-1</c>; sequences are not
 /// packed into one batch, because the CPU forward has no per-sequence attention mask.</para>
 /// <para>The model's scratch buffers (and its compute thread pool) are shared mutable state, so
-/// the request holds <b>both</b> locks that guard the model: <see cref="ServerState.ExecuteAsync"/>
+/// the request holds <b>both</b> locks that guard the model: <see cref="ServerState.ExecuteAsync(Func{Task}, CancellationToken)"/>
 /// against the direct-generator path, and — when a continuous-batch scheduler is active —
 /// <c>ContinuousBatchSchedulerService.AcquireModelAsync</c> against its run loop, which drives
 /// forward passes outside the request gate by design.</para>

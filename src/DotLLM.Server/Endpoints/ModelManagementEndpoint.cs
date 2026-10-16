@@ -152,7 +152,7 @@ public static class ModelManagementEndpoint
                         newState.LoraRegistry.Dispose();
 
                     await Task.CompletedTask;
-                }, ct);
+                }, ct, incomingModelId: loadKey, incomingBytes: SafeFileLength(resolvedPath));   // (#1023) free before loading
 
                 return Results.Ok(new ModelLoadResponse
                 {

@@ -278,6 +278,63 @@ Logged: arrival (method + path), the requested `model`, lock waits (only when co
 duration, or the failure), idle-unload / explicit unload, and completion (status + duration) or cancellation. `GET`s (health / props polling)
 are not logged. Spectre.Console output (banner, spinners) is not stamped.
 
+## Model swaps, `GET /v1/status` and SSE keep-alive (#1023)
+
+**Free before load.** A request (or `POST /v1/models/load`) for a different model takes the server lock, then - before loading - stashes the
+active model and enforces the residency budget **with the incoming model in the active slot**. By default (`MaxResidentModels = 1`) that
+disposes the old model first, so the two never share device memory. With a larger budget, stashed models are additionally evicted
+least-recently-used until the incoming weights fit in the CUDA device's **free** memory. `--device auto` now judges a CUDA device by free
+memory (NVML, all processes): `weights + 15 % of total <= free`; an explicit `--device gpu` whose weights exceed the free memory fails at
+once with the numbers (unless `--gpu-layers` asks for a partial offload). If the requesting client has already disconnected, nothing is
+freed and nothing is loaded. A request queued behind a swap re-checks its model once it holds the lock and re-activates it if needed
+(a stashed one is a field swap, an evicted one reloads); if that fails it gets a 503 (`code: model_not_loaded`) - it never runs on a
+disposed or different model.
+
+**`GET /v1/status`** - lock-free, unmetered, cheap to poll. Also embedded in `/props` as `activity`.
+
+```json
+{
+  "state": "loading",
+  "is_ready": false,
+  "model_id": null,
+  "loading_model_id": "BoldingBuilds/Ternary-Bonsai-2-27B-Abliterated-v2-PQ2_0-MTP-GGUF/Ternary-Bonsai-2-27B-Abliterated-v2-PQ2_0-MTP.gguf",
+  "loading_since": "2026-10-16T14:12:54.921+00:00",
+  "loading_elapsed_seconds": 41.3,
+  "loading_request": "req#12",
+  "busy_with": "req#12 model activation",
+  "busy_since": "2026-10-16T14:12:54.903+00:00",
+  "busy_elapsed_seconds": 41.3,
+  "waiting_requests": 1
+}
+```
+
+| field | meaning |
+|---|---|
+| `state` | `loading` (a load is in progress; wins over busy), `busy` (a request holds the execution lock), `idle` (model ready, lock free), `no_model` |
+| `is_ready` / `model_id` | the active model, only when ready - `is_ready` is false for the whole of any load |
+| `loading_*` | the load target, its start (UTC ISO 8601), elapsed seconds and triggering request; null when not loading |
+| `busy_*` | the lock holder (`req#N generate`, `req#N model activation`, `idle sweep`, ...), since when, elapsed; null when free |
+| `waiting_requests` | requests queued for the lock |
+
+`/ready` answers 503 during a load. Requests arriving while a model loads queue behind it. Known gap: non-streaming requests routed
+through the continuous-batch scheduler bypass the lock, so they are not re-validated after a swap.
+
+**SSE keep-alive.** A streaming request (`/v1/chat/completions`, `/v1/completions`, `/v1/messages`) that waits - for a load or for the lock -
+receives an SSE comment every 10 s:
+
+```text
+: waiting for loading owner/repo/x.gguf (started 2026-10-16T14:12:54Z, 41s)
+
+: waiting for busy: req#7 generate (73s), 1 queued
+
+```
+
+Comment lines are ignored by EventSource and the OpenAI / Anthropic SDKs. Nothing is sent when the wait is shorter than 10 s, so the
+uncontended stream is byte-for-byte unchanged. On `/v1/chat/completions` the role chunk (and with it the `chatcmpl-...` id) is sent only
+once the request holds the lock. Once a keep-alive has committed the response (HTTP 200, `text/event-stream`), a later error arrives
+in-stream as `data: {"error":{...}}` followed by `data: [DONE]`. Ollama's NDJSON `/api/*` streams get no keep-alive (NDJSON has no comment
+syntax).
+
 ## Model names, the hub cache and pulling (#714)
 
 One resolver (`DotLLM.HuggingFace.ModelResolver`) turns a model name into a GGUF everywhere - `dotllm run|chat|serve|bench`, a request's `model`

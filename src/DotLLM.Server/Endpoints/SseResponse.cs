@@ -22,6 +22,8 @@ internal static class SseResponse
     /// <param name="httpContext">The HTTP context whose response is being turned into an SSE stream.</param>
     internal static void ApplyHeaders(HttpContext httpContext)
     {
+        // Idempotent: a keep-alive (#1023) may already have committed the stream with these headers.
+        if (httpContext.Response.HasStarted) return;
         httpContext.Response.ContentType = "text/event-stream";
         httpContext.Response.Headers.CacheControl = "no-cache";
     }

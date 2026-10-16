@@ -210,6 +210,14 @@ public sealed record DeviceInfoDto
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public long? TotalMemoryBytes { get; init; }
 
+    /// <summary>
+    /// Device-wide free memory in bytes right now (all processes), when the backend reports it - CUDA via NVML (#1023). This, not
+    /// <see cref="TotalMemoryBytes"/>, decides whether <c>--device auto</c> tries the device.
+    /// </summary>
+    [JsonPropertyName("free_memory_bytes")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public long? FreeMemoryBytes { get; init; }
+
     /// <summary>CUDA compute capability ("8.6"), CUDA only.</summary>
     [JsonPropertyName("compute_capability")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
