@@ -30,7 +30,7 @@ public static class ChatCompletionEndpoint
         // or already active.
         // (#1023) A streaming request may wait minutes here (a load in progress, or the lock). Keep-alive comments every ~10 s
         // tell the client it is queued, not dead; nothing is written when the wait is shorter, so the fast path is unchanged.
-        await using var keepAlive = request.Stream ? SseKeepAlive.Start(httpContext, state.DescribeWait) : null;
+        await using var keepAlive = request.Stream ? SseKeepAlive.Start(httpContext, state.DescribeWait, state.KeepAliveInterval) : null;
         var activationError = await state.EnsureActiveAsync(request.Model, request.KeepAlive, httpContext.RequestAborted);
         if (activationError is not null)
         {
@@ -394,7 +394,7 @@ public static class ChatCompletionEndpoint
             innerCt => current!.GenerateStreamingTokensAsync(prompt, options, innerCt, adapter),
             (work, gateCt) => state.ExecuteAsync(modelId, generator => { current = generator; return work(); }, gateCt),
             requestId, modelId, tools, toolParser, plan, ct, forcedToolCall,
-            keepAlive, state.DescribeWait);
+            keepAlive, state.DescribeWait, state.KeepAliveInterval);
     }
 
     /// <summary>
@@ -417,11 +417,16 @@ public static class ChatCompletionEndpoint
         Func<string>? waitReason = null,
         TimeSpan? keepAliveInterval = null)
     {
+        // (#1023 review) Stop the activation-phase keep-alive BEFORE touching headers: it commits them itself, and setting them while it
+        // writes threw "headers are read-only". The gate-phase keep-alive below starts afresh.
+        if (keepAlive is not null) await keepAlive.StopAsync();
+        await SseKeepAlive.StopForAsync(httpContext);
+
         // No Connection header: it is connection-specific and illegal over HTTP/2+. See SseResponse.
         SseResponse.ApplyHeaders(httpContext);
 
         // (#1023) While the gate is contended, ": waiting for ..." comments every ~10 s; they stop before the first real chunk.
-        execute = SseKeepAlive.Wrap(httpContext, execute, waitReason ?? (() => "the server"), keepAliveInterval, keepAlive);
+        execute = SseKeepAlive.Wrap(httpContext, execute, waitReason ?? (() => "the server"), keepAliveInterval);
 
         // First chunk: role. Written only once the request holds the gate (#1023): a role chunk and response id sent before a long
         // silent wait made a queued request indistinguishable from a dead one.
@@ -641,19 +646,8 @@ public static class ChatCompletionEndpoint
     /// Writes an error: the usual status + JSON body, or - when a keep-alive already committed an SSE response (#1023) - an
     /// in-stream <c>data: {"error":...}</c> event and <c>data: [DONE]</c>.
     /// </summary>
-    private static async Task WriteErrorAsync(HttpContext ctx, int status, ErrorResponse error, SseKeepAlive? keepAlive)
-    {
-        if (keepAlive is not null) await keepAlive.StopAsync();
-        if (!ctx.Response.HasStarted)
-        {
-            ctx.Response.StatusCode = status;
-            await ctx.Response.WriteAsJsonAsync(error, ServerJsonContext.Default.ErrorResponse, contentType: null, ctx.RequestAborted);
-            return;
-        }
-        await ctx.Response.WriteAsync("data: " + JsonSerializer.Serialize(error, ServerJsonContext.Default.ErrorResponse) + "\n\ndata: [DONE]\n\n",
-            ctx.RequestAborted);
-        await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
-    }
+    private static Task WriteErrorAsync(HttpContext ctx, int status, ErrorResponse error, SseKeepAlive? keepAlive) =>
+        SseResponse.WriteOpenAiErrorAsync(ctx, status, error);   // stops the request's keep-alive (incl. keepAlive) first
 
     private static async Task WriteSseChunk(HttpContext ctx, ChatCompletionChunk chunk, CancellationToken ct)
     {

@@ -285,8 +285,11 @@ active model and enforces the residency budget **with the incoming model in the 
 disposes the old model first, so the two never share device memory. With a larger budget, stashed models are additionally evicted
 least-recently-used until the incoming weights fit in the CUDA device's **free** memory. `--device auto` now judges a CUDA device by free
 memory (NVML, all processes): `weights + 15 % of total <= free`; an explicit `--device gpu` whose weights exceed the free memory fails at
-once with the numbers (unless `--gpu-layers` asks for a partial offload). If the requesting client has already disconnected, nothing is
-freed and nothing is loaded. A request queued behind a swap re-checks its model once it holds the lock and re-activates it if needed
+once with the numbers (unless `--gpu-layers` asks for a partial offload). A load that can never fit an explicit GPU - weights above its
+total memory, or above its free memory plus what this server's models on that device would release - is refused **before** anything is
+freed, so the resident model keeps serving. Device-room eviction only evicts models on the target GPU. If the requesting client has already
+disconnected, nothing is freed and nothing is loaded; once freeing has begun the load runs to completion even if the client goes away
+(abandoning it would leave no model). A request queued behind a swap re-checks its model once it holds the lock and re-activates it if needed
 (a stashed one is a field swap, an evicted one reloads); if that fails it gets a 503 (`code: model_not_loaded`) - it never runs on a
 disposed or different model.
 
@@ -316,11 +319,15 @@ disposed or different model.
 | `busy_*` | the lock holder (`req#N generate`, `req#N model activation`, `idle sweep`, ...), since when, elapsed; null when free |
 | `waiting_requests` | requests queued for the lock |
 
+During the activation hand-off (a request that just loaded a model keeps first use of it for up to 30 s, so a waiter for another model
+does not swap it away and force a reload) `/v1/status` reports `busy` with `busy_with: "req#N (activated <id>, preparing to generate)"`,
+and yielding requests count in `waiting_requests`.
+
 `/ready` answers 503 during a load. Requests arriving while a model loads queue behind it. Known gap: non-streaming requests routed
 through the continuous-batch scheduler bypass the lock, so they are not re-validated after a swap.
 
-**SSE keep-alive.** A streaming request (`/v1/chat/completions`, `/v1/completions`, `/v1/messages`) that waits - for a load or for the lock -
-receives an SSE comment every 10 s:
+**SSE keep-alive.** A streaming request (`/v1/chat/completions`, `/v1/completions`, `/v1/messages`) that waits - for a load or for the lock,
+in the model-activation phase as well as the generation phase - receives an SSE comment every 10 s:
 
 ```text
 : waiting for loading owner/repo/x.gguf (started 2026-10-16T14:12:54Z, 41s)
@@ -332,8 +339,9 @@ receives an SSE comment every 10 s:
 Comment lines are ignored by EventSource and the OpenAI / Anthropic SDKs. Nothing is sent when the wait is shorter than 10 s, so the
 uncontended stream is byte-for-byte unchanged. On `/v1/chat/completions` the role chunk (and with it the `chatcmpl-...` id) is sent only
 once the request holds the lock. Once a keep-alive has committed the response (HTTP 200, `text/event-stream`), a later error arrives
-in-stream as `data: {"error":{...}}` followed by `data: [DONE]`. Ollama's NDJSON `/api/*` streams get no keep-alive (NDJSON has no comment
-syntax).
+in-stream: on the OpenAI surfaces as `data: {"error":{...}}` followed by `data: [DONE]`; on `/v1/messages` as Anthropic's
+`event: error` / `data: {"type":"error","error":{"type":"...","message":"..."}}` (no `[DONE]`). Ollama's NDJSON `/api/*` streams get no
+keep-alive (NDJSON has no comment syntax).
 
 ## Model names, the hub cache and pulling (#714)
 

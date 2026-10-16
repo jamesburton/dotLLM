@@ -39,16 +39,14 @@ public sealed class ModelUnavailableException : Exception
             catch (ModelUnavailableException ex) when (!context.RequestAborted.IsCancellationRequested)
             {
                 ServerLog.Info(ex.Message);
-                var error = ErrorResponse.Internal(ex.Message, code: "model_not_loaded");
-                if (!context.Response.HasStarted)
+                if (context.Request.Path.StartsWithSegments("/v1/messages"))
                 {
-                    context.Response.StatusCode = 503;
-                    await context.Response.WriteAsJsonAsync(error, ServerJsonContext.Default.ErrorResponse, contentType: null, context.RequestAborted);
+                    // Anthropic surface: its envelope, and `event: error` once the stream has started (#1023 review).
+                    await Endpoints.MessagesEndpoint.WriteErrorAsync(context, 503, "api_error", ex.Message);
                     return;
                 }
-                await context.Response.WriteAsync("data: " + JsonSerializer.Serialize(error, ServerJsonContext.Default.ErrorResponse) + "\n\ndata: [DONE]\n\n",
-                    context.RequestAborted);
-                await context.Response.Body.FlushAsync(context.RequestAborted);
+                var error = ErrorResponse.Internal(ex.Message, code: "model_not_loaded");
+                await Endpoints.SseResponse.WriteOpenAiErrorAsync(context, 503, error);
             }
         });
 }

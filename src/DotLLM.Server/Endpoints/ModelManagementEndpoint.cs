@@ -118,7 +118,8 @@ public static class ModelManagementEndpoint
                             request.YarnBetaFast, request.YarnBetaSlow)
                             ?? state.Options.RopeOverride,
                     };
-                    var newState = await Task.Run(() => ServerStartup.LoadModel(resolvedPath, newOptions), ct);
+                    // (#1023 review) Not cancellable: the old model is already freed, so abandoning the load would leave no model.
+                    var newState = await Task.Run(() => ServerStartup.LoadModel(resolvedPath, newOptions), CancellationToken.None);
 
                     // Transfer new state fields into the existing ServerState
                     state.Options = newOptions with { ResolvedDevice = newState.Options.ResolvedDevice };   // #790: keep the device actually used
@@ -155,7 +156,8 @@ public static class ModelManagementEndpoint
                         newState.LoraRegistry.Dispose();
 
                     await Task.CompletedTask;
-                }, ct, incomingModelId: loadKey, incomingBytes: SafeFileLength(resolvedPath));   // (#1023) free before loading
+                }, ct, incomingModelId: loadKey, incomingBytes: SafeFileLength(resolvedPath),   // (#1023) free before loading
+                    incomingDevice: request.Device ?? state.Options.Device);
 
                 return Results.Ok(new ModelLoadResponse
                 {

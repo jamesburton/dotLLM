@@ -21,26 +21,18 @@ public static class CompletionEndpoint
         HttpContext httpContext)
     {
         // (#369) Activate the requested model — see ChatCompletionEndpoint for the same pattern.
+        // (#1023 review) Keep-alive comments while a streaming request waits here for a load or the lock, as on chat.
+        await using var keepAlive = request.Stream ? SseKeepAlive.Start(httpContext, state.DescribeWait, state.KeepAliveInterval) : null;
         var activationError = await state.EnsureActiveAsync(request.Model, request.KeepAlive, httpContext.RequestAborted);
         if (activationError is not null)
         {
-            httpContext.Response.StatusCode = 400;
-            await httpContext.Response.WriteAsJsonAsync(
-                ErrorResponse.InvalidRequest(activationError, param: "model", code: DotLLM.HuggingFace.AmbiguousModelReferenceException.CodeFor(activationError)),
-                ServerJsonContext.Default.ErrorResponse,
-                contentType: null,
-                httpContext.RequestAborted);
+            await SseResponse.WriteOpenAiErrorAsync(httpContext, 400, ErrorResponse.InvalidRequest(activationError, param: "model", code: DotLLM.HuggingFace.AmbiguousModelReferenceException.CodeFor(activationError)));
             return;
         }
 
         if (!state.IsReady || state.Generator is null)
         {
-            httpContext.Response.StatusCode = 503;
-            await httpContext.Response.WriteAsJsonAsync(
-                ErrorResponse.Internal("No model loaded", code: "model_not_loaded"),
-                ServerJsonContext.Default.ErrorResponse,
-                contentType: null,
-                httpContext.RequestAborted);
+            await SseResponse.WriteOpenAiErrorAsync(httpContext, 503, ErrorResponse.Internal("No model loaded", code: "model_not_loaded"));
             return;
         }
 
@@ -48,12 +40,7 @@ public static class CompletionEndpoint
         var validationError = RequestValidator.ValidateCompletionRequest(request);
         if (validationError is not null)
         {
-            httpContext.Response.StatusCode = 400;
-            await httpContext.Response.WriteAsJsonAsync(
-                ErrorResponse.InvalidRequest(validationError),
-                ServerJsonContext.Default.ErrorResponse,
-                contentType: null,
-                httpContext.RequestAborted);
+            await SseResponse.WriteOpenAiErrorAsync(httpContext, 400, ErrorResponse.InvalidRequest(validationError));
             return;
         }
 
@@ -67,12 +54,7 @@ public static class CompletionEndpoint
             var mgr = state.PrefixTrieManager;
             if (mgr is null || mgr.InspectNamedPrefix(request.PrefixId) is null)
             {
-                httpContext.Response.StatusCode = 400;
-                await httpContext.Response.WriteAsJsonAsync(
-                    ErrorResponse.InvalidRequest($"prefix_id '{request.PrefixId}' is not registered. POST /v1/prompt-cache/{request.PrefixId} first.", param: "prefix_id"),
-                    ServerJsonContext.Default.ErrorResponse,
-                    contentType: null,
-                    httpContext.RequestAborted);
+                await SseResponse.WriteOpenAiErrorAsync(httpContext, 400, ErrorResponse.InvalidRequest($"prefix_id '{request.PrefixId}' is not registered. POST /v1/prompt-cache/{request.PrefixId} first.", param: "prefix_id"));
                 return;
             }
         }
@@ -85,12 +67,7 @@ public static class CompletionEndpoint
         }
         catch (LoraAdapterNotFoundException ex)
         {
-            httpContext.Response.StatusCode = 400;
-            await httpContext.Response.WriteAsJsonAsync(
-                ErrorResponse.InvalidRequest(ex.Message, param: "lora_adapter"),
-                ServerJsonContext.Default.ErrorResponse,
-                contentType: null,
-                httpContext.RequestAborted);
+            await SseResponse.WriteOpenAiErrorAsync(httpContext, 400, ErrorResponse.InvalidRequest(ex.Message, param: "lora_adapter"));
             return;
         }
 
@@ -101,12 +78,7 @@ public static class CompletionEndpoint
             maxTokens, out int effectiveMaxTokens, out _);
         if (promptError is not null)
         {
-            httpContext.Response.StatusCode = 400;
-            await httpContext.Response.WriteAsJsonAsync(
-                ErrorResponse.InvalidRequest(promptError, param: "prompt", code: "context_length_exceeded"),
-                ServerJsonContext.Default.ErrorResponse,
-                contentType: null,
-                httpContext.RequestAborted);
+            await SseResponse.WriteOpenAiErrorAsync(httpContext, 400, ErrorResponse.InvalidRequest(promptError, param: "prompt", code: "context_length_exceeded"));
             return;
         }
 
@@ -200,6 +172,9 @@ public static class CompletionEndpoint
         bool includeUsageChunk,
         CancellationToken ct)
     {
+        // (#1023 review) Stop the activation-phase keep-alive before touching headers (it commits them itself).
+        await SseKeepAlive.StopForAsync(httpContext);
+
         // No Connection header: it is connection-specific and illegal over HTTP/2+. See SseResponse.
         SseResponse.ApplyHeaders(httpContext);
 
@@ -210,7 +185,7 @@ public static class CompletionEndpoint
         TextGenerator? current = null;
         var execute = SseKeepAlive.Wrap(httpContext,
             (work, gateCt) => state.ExecuteAsync(modelId, g => { current = g; return work(); }, gateCt),
-            state.DescribeWait);
+            state.DescribeWait, state.KeepAliveInterval);
         await execute(async () =>
         {
             await foreach (var token in current!.GenerateStreamingTokensAsync(prompt, options, ct, adapter))

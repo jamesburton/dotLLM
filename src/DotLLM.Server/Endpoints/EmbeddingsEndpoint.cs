@@ -86,13 +86,14 @@ public static class EmbeddingsEndpoint
             return EmbedResult.Fail(503, "No model loaded");
         }
 
-        if (state.Model is not IEmbeddingModel embeddingModel)
+        if (state.Model is not IEmbeddingModel preGateModel)
         {
             return EmbedResult.Fail(501, $"The loaded model ({state.Model.GetType().Name}) does not support embedding extraction. "
                 + "POST /v1/embeddings is implemented for the CPU backend only; run the server without "
                 + "a GPU backend to use it.");
         }
 
+        string admittedModelId = state.Options.ModelId;
         int outDims = state.Config.HiddenSize;
         if (request.Dimensions is { } dims)
         {
@@ -149,7 +150,7 @@ public static class EmbeddingsEndpoint
             }
         }
 
-        var pooling = EmbeddingPooler.Resolve(requestedPooling, embeddingModel.DeclaredPoolingType);
+        var pooling = EmbeddingPooler.Resolve(requestedPooling, preGateModel.DeclaredPoolingType);
         if (pooling is PoolingType.None or PoolingType.Rank)
         {
             return EmbedResult.Fail(400, $"The loaded checkpoint declares pooling type '{pooling}', which this endpoint cannot represent. "
@@ -168,8 +169,11 @@ public static class EmbeddingsEndpoint
             // the scheduler lease itself (#461 follow-up), so this endpoint no longer takes it
             // separately. Re-adding an inner AcquireModelAsync here would self-deadlock: the
             // semaphore is not reentrant.
-            await state.ExecuteAsync(async () =>
+            // (#1023 review) Re-validated under the gate: the model is read THEN, never the instance seen before a queued swap.
+            await state.ExecuteOnModelAsync(admittedModelId, async () =>
             {
+                var embeddingModel = state.Model as IEmbeddingModel
+                    ?? throw new ModelUnavailableException(admittedModelId, "the active model does not support embedding extraction");
                 for (int i = 0; i < sequences.Count; i++)
                 {
                     ct.ThrowIfCancellationRequested();
@@ -201,6 +205,10 @@ public static class EmbeddingsEndpoint
         catch (NotSupportedException ex)
         {
             return EmbedResult.Fail(400, ex.Message);
+        }
+        catch (ModelUnavailableException ex)
+        {
+            return EmbedResult.Fail(503, ex.Message);
         }
 
         return new EmbedResult(200, null, vectors, promptTokens, base64);

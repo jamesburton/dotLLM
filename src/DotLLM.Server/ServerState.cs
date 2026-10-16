@@ -65,6 +65,7 @@ public sealed class ServerState : IDisposable
     {
         private readonly TaskCompletionSource _released = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+        public DateTimeOffset Since { get; } = DateTimeOffset.UtcNow;
         public ServerLog.RequestScope Request { get; } = request;
         public string ModelId { get; } = modelId;
         public DateTimeOffset Until { get; } = until;
@@ -79,6 +80,9 @@ public sealed class ServerState : IDisposable
     /// </summary>
     internal Func<int, (long Free, long Total)?> CudaMemoryProbe { get; set; } =
         ordinal => DotLLM.Cuda.CudaMemoryInfo.TryGet(ordinal, out long free, out long total) ? (free, total) : null;
+
+    /// <summary>Interval between SSE keep-alive comments for a waiting streaming request (#1023); settable for tests.</summary>
+    internal TimeSpan KeepAliveInterval { get; set; } = Endpoints.SseKeepAlive.DefaultInterval;
 
     /// <summary>The loader an activation uses (<see cref="ServerStartup.LoadModel"/>); settable so tests can observe the state at load time.</summary>
     internal Func<string, ServerOptions, ServerState> ModelLoader { get; set; } = ServerStartup.LoadModel;
@@ -385,16 +389,50 @@ public sealed class ServerState : IDisposable
             ServerLog.Info($"yielding to {grant.Request.Tag}, which just activated {grant.ModelId} and has not generated yet");
             ReleaseGate();
             var remaining = grant.Until - DateTimeOffset.UtcNow;
-            using (var wake = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            Interlocked.Increment(ref _gateWaiters);   // (#1023 review) a yielding request is queued: /v1/status must count it
+            try
             {
+                using var wake = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 var timeout = Task.Delay(remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero, wake.Token);
                 await Task.WhenAny(grant.Released, grant.Request.Ended, timeout).ConfigureAwait(false);
                 wake.Cancel();
             }
+            finally { Interlocked.Decrement(ref _gateWaiters); }
             ct.ThrowIfCancellationRequested();
             await AcquireGateAsync(purpose, ct).ConfigureAwait(false);
         }
     }
+
+    /// <summary>
+    /// <see cref="ExecuteAsync(string, Func{TextGenerator, Task}, CancellationToken)"/> for work that reads the model itself rather than
+    /// a generator (embeddings, #1023 review): under the gate the admitted model is re-checked and re-activated if a queued swap
+    /// replaced it, so <paramref name="work"/> must read <see cref="Model"/> etc. inside, never an instance captured before the wait.
+    /// </summary>
+    /// <param name="admittedModelId">The model the request was admitted for.</param>
+    /// <param name="work">The work, run with the gate (and the scheduler lease) held.</param>
+    /// <param name="ct">Cancels the gate wait and any re-activation.</param>
+    /// <returns>A task that completes when <paramref name="work"/> has.</returns>
+    /// <exception cref="ModelUnavailableException">The admitted model is no longer active and could not be re-activated.</exception>
+    public async Task ExecuteOnModelAsync(string admittedModelId, Func<Task> work, CancellationToken ct)
+    {
+        await AcquireGateHonouringGrantAsync("generate", () => !ModelIsActive(admittedModelId), ct).ConfigureAwait(false);
+        try
+        {
+            if (!ModelIsActive(admittedModelId))
+            {
+                ServerLog.Info($"model changed while queued (active: {(IsReady ? Options.ModelId : "none")}); re-activating {admittedModelId}");
+                string? error = await ActivateLockedAsync(admittedModelId, keepAliveOverride: null, ct).ConfigureAwait(false);
+                if (error is not null || Model is null)
+                    throw new ModelUnavailableException(admittedModelId, error ?? "no model is loaded");
+            }
+            using var lease = Scheduler is { } scheduler ? await scheduler.AcquireModelAsync(ct) : null;
+            await work();
+        }
+        finally { ReleaseGate(); }
+    }
+
+    private bool ModelIsActive(string modelId) =>
+        IsReady && Model is not null && string.Equals(Options.ModelId, modelId, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>The active generator when <paramref name="modelId"/> is the active, ready model; otherwise re-activates it. Gate held.</summary>
     private async Task<TextGenerator> RevalidateLockedAsync(string modelId, CancellationToken ct)
@@ -423,6 +461,14 @@ public sealed class ServerState : IDisposable
         long heldTicks = Interlocked.Read(ref _gateHeldSinceTicks);
         DateTimeOffset? heldSince = holder is not null && heldTicks > 0 ? new DateTimeOffset(heldTicks, TimeSpan.Zero) : null;
         bool ready = IsReady && Model is not null;
+
+        // (#1023 review) During an activation hand-off the gate is briefly free, but the server is not idle: the activating request is
+        // rendering its prompt and others are yielding to it.
+        if (holder is null && _activationGrant is { IsLive: true } grant)
+        {
+            holder = $"{grant.Request.Tag} (activated {grant.ModelId}, preparing to generate)";
+            heldSince = grant.Since;
+        }
 
         return new Models.ServerStatusResponse
         {
@@ -517,20 +563,26 @@ public sealed class ServerState : IDisposable
     /// <param name="incomingModelId">The id being loaded, for <see cref="GetStatus"/>; null = unknown.</param>
     /// <param name="incomingBytes">The incoming model's size; 0 = unknown (no budget enforcement before the load).</param>
     /// <returns>A task that completes when the swap has.</returns>
-    public async Task SwapModelAsync(Func<Task> loadAction, CancellationToken ct, string? incomingModelId = null, long incomingBytes = 0)
+    /// <param name="incomingDevice">The device the load targets, for the fit check and device-local eviction; the current device when null.</param>
+    /// <exception cref="InvalidOperationException">The model cannot fit the target GPU even after freeing everything (nothing is freed).</exception>
+    public async Task SwapModelAsync(Func<Task> loadAction, CancellationToken ct, string? incomingModelId = null, long incomingBytes = 0,
+        string? incomingDevice = null)
     {
         await AcquireGateAsync("model load", ct).ConfigureAwait(false);
         long start = System.Diagnostics.Stopwatch.GetTimestamp();
         try
         {
             ct.ThrowIfCancellationRequested();   // (#1023) the caller has gone: do not free or load anything
+            string device = incomingDevice ?? Options.Device;
+            if (incomingBytes > 0 && CannotFitReason(incomingBytes, device, Options.GpuLayers) is { } cannotFit)
+                throw new InvalidOperationException(cannotFit);   // (#1023 review) refused BEFORE anything is freed
             IsReady = false;
             _loading = new LoadingInfo(incomingModelId ?? "(explicit load)", DateTimeOffset.UtcNow, ServerLog.RequestTag);
             ServerLog.Info($"model load started (POST /v1/models/load){(incomingModelId is null ? "" : ": " + incomingModelId)}");
             await StopSchedulerAsync().ConfigureAwait(false);
             StashOrDropActiveLocked();
             if (incomingBytes > 0)
-                FreeForIncomingLocked(incomingBytes, Options.Device);
+                FreeForIncomingLocked(incomingBytes, device);
 
             await loadAction();
             IsReady = true;
@@ -564,13 +616,43 @@ public sealed class ServerState : IDisposable
             ServerLog.Info($"evicted {evicted.Key} before loading (residency budget)");
 
         if (CudaOrdinalFor(device) is not { } ordinal) return;
+        // (#1023 review) Only models on the target GPU free memory there; a CPU- or other-GPU-resident model is left alone.
         while (Residency.StashedCount > 0 && CudaMemoryProbe(ordinal) is { } mem
                && incomingBytes + (long)(mem.Total * (1 - DeviceSelector.CudaFitFraction)) > mem.Free)
         {
-            if (Residency.EvictLeastRecentlyUsed() is not { } evicted) break;
+            if (Residency.EvictLeastRecentlyUsed(s => IsOnCuda(s.Options, ordinal)) is not { } evicted) break;
             ServerLog.Info($"evicted {evicted.Key} before loading: {incomingBytes / (1024.0 * 1024 * 1024):F1} GiB needs room on gpu:{ordinal} "
                 + $"({mem.Free / (1024.0 * 1024 * 1024):F1} GiB free)");
         }
+    }
+
+    /// <summary>True when a model loaded with <paramref name="options"/> lives on CUDA device <paramref name="ordinal"/>.</summary>
+    private static bool IsOnCuda(ServerOptions options, int ordinal) =>
+        DeviceSpec.TryParse(options.ResolvedDevice ?? options.Device, out var spec, out _) && spec.Kind == DeviceKind.Cuda && spec.Ordinal == ordinal;
+
+    /// <summary>
+    /// Why a full-offload load of <paramref name="incomingBytes"/> on an explicit CUDA <paramref name="device"/> can never fit, or null
+    /// (#1023 review): weights larger than the device's total memory, or than its free memory plus everything this server's models on
+    /// that device would release. Checked BEFORE anything is freed, so an impossible request never costs the resident model.
+    /// <c>auto</c>, partial offload and non-CUDA devices are not refused here (the device plan or the loader decides).
+    /// </summary>
+    private string? CannotFitReason(long incomingBytes, string? device, int? gpuLayers)
+    {
+        if (DeviceSelector.IsAuto(device) || gpuLayers is >= 0) return null;
+        if (!DeviceSpec.TryParse(device, out var spec, out _) || spec.Kind != DeviceKind.Cuda) return null;
+        if (CudaMemoryProbe(spec.Ordinal) is not { } mem) return null;
+
+        static string Gib(long b) => $"{b / (1024.0 * 1024 * 1024):F1} GiB";
+        if (incomingBytes > mem.Total)
+            return $"The model's {Gib(incomingBytes)} of weights exceed gpu:{spec.Ordinal}'s {Gib(mem.Total)} of memory; it cannot load there. "
+                + "Use --gpu-layers for a partial offload, or another device.";
+
+        long releasable = Residency.StashedBytes(s => IsOnCuda(s.Options, spec.Ordinal))
+            + (Model is not null && IsOnCuda(Options, spec.Ordinal) ? EstimatedBytes : 0);
+        if (incomingBytes > mem.Free + releasable)
+            return $"The model's {Gib(incomingBytes)} of weights exceed the {Gib(mem.Free)} free on gpu:{spec.Ordinal} plus the "
+                + $"{Gib(releasable)} this server's models there would release (other processes hold the rest); nothing was unloaded.";
+        return null;
     }
 
     /// <summary>The CUDA ordinal a load on <paramref name="device"/> would use: explicit <c>gpu[:N]</c>, or 0 for <c>auto</c>; null otherwise.</summary>
@@ -706,6 +788,10 @@ public sealed class ServerState : IDisposable
             // (#1023) A queued request whose client has gone must not free the active model or start a load.
             ct.ThrowIfCancellationRequested();
 
+            // (#1023 review) A load that can never fit is refused BEFORE the resident model is freed.
+            if (CannotFitReason(incomingBytes, loadOptions.Device, loadOptions.GpuLayers) is { } cannotFit)
+                return cannotFit;
+
             ServerLog.Info($"loading {loadOptions.ModelId} from {reloadPath} (active: {(Model is null ? "none" : Options.ModelId)})");
             loadStart = System.Diagnostics.Stopwatch.GetTimestamp();
             _loading = new LoadingInfo(loadOptions.ModelId, DateTimeOffset.UtcNow, ServerLog.RequestTag);
@@ -716,9 +802,10 @@ public sealed class ServerState : IDisposable
             StashOrDropActiveLocked();
             IsReady = false;
             FreeForIncomingLocked(incomingBytes, loadOptions.Device);
-            ct.ThrowIfCancellationRequested();
 
-            var loaded = await Task.Run(() => ModelLoader(reloadPath, loadOptions), ct).ConfigureAwait(false);
+            // (#1023 review) Once freeing has begun the load runs to completion even if the requester disconnects: abandoning it here
+            // would leave the server with no model at all.
+            var loaded = await Task.Run(() => ModelLoader(reloadPath, loadOptions), CancellationToken.None).ConfigureAwait(false);
 
             InstallLoadedModelLocked(loaded, incomingBytes, keepAliveOverride);
             Residency.EnforceBudget(EstimatedBytes);

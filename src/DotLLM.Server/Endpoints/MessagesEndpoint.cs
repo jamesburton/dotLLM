@@ -62,6 +62,8 @@ public static class MessagesEndpoint
         // (#369) Activate the requested model, mirroring the OpenAI surface: a cheap field-swap
         // when already resident, a lazy reload when it idled out, a fresh load otherwise.
         // Anthropic has no `keep_alive` request field, so the per-model override is left alone.
+        // (#1023 review) Keep-alive comments while a streaming request waits here for a load or the lock, as on chat.
+        await using var keepAlive = request.Stream ? SseKeepAlive.Start(httpContext, state.DescribeWait, state.KeepAliveInterval) : null;
         var activationError = await state.EnsureActiveAsync(
             request.Model, keepAliveOverride: null, httpContext.RequestAborted);
         if (activationError is not null)
@@ -288,7 +290,7 @@ public static class MessagesEndpoint
             innerCt => current!.GenerateStreamingTokensAsync(prompt, options, innerCt),
             SseKeepAlive.Wrap(httpContext,
                 (work, gateCt) => state.ExecuteAsync(modelId, g => { current = g; return work(); }, gateCt),
-                state.DescribeWait),
+                state.DescribeWait, state.KeepAliveInterval),
             toolCallParser,
             request.StopSequences,
             messageId, modelId, promptTokenCount, ct, forcedToolCall, plan, tools);
@@ -322,6 +324,9 @@ public static class MessagesEndpoint
         ReasoningPlan? plan = null,
         IReadOnlyList<ToolDefinition>? tools = null)
     {
+        // (#1023 review) Stop the activation-phase keep-alive before touching headers (it commits them itself).
+        await SseKeepAlive.StopForAsync(httpContext);
+
         // No `Connection: keep-alive` — it is connection-specific and illegal over HTTP/2+.
         SseResponse.ApplyHeaders(httpContext);
 
@@ -823,11 +828,16 @@ public static class MessagesEndpoint
     internal static async Task WriteErrorAsync(
         HttpContext ctx, int statusCode, string errorType, string message)
     {
+        var error = new AnthropicErrorResponse { Error = new AnthropicErrorBody { Type = errorType, Message = message } };
+        await SseKeepAlive.StopForAsync(ctx);
+        if (ctx.Response.HasStarted)
+        {
+            // (#1023 review) The stream has begun (keep-alive, or message_start): Anthropic's in-stream error event, which the SDKs
+            // raise - not OpenAI's data-only error + [DONE], which they ignore.
+            await WriteEventAsync(ctx, "error", error, ServerJsonContext.Default.AnthropicErrorResponse, ctx.RequestAborted);
+            return;
+        }
         ctx.Response.StatusCode = statusCode;
-        await ctx.Response.WriteAsJsonAsync(
-            new AnthropicErrorResponse { Error = new AnthropicErrorBody { Type = errorType, Message = message } },
-            ServerJsonContext.Default.AnthropicErrorResponse,
-            contentType: null,
-            ctx.RequestAborted);
+        await ctx.Response.WriteAsJsonAsync(error, ServerJsonContext.Default.AnthropicErrorResponse, contentType: null, ctx.RequestAborted);
     }
 }

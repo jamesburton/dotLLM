@@ -21,6 +21,9 @@ internal sealed class SseKeepAlive : IAsyncDisposable
     /// <summary>Interval between keep-alive comments.</summary>
     public static readonly TimeSpan DefaultInterval = TimeSpan.FromSeconds(10);
 
+    /// <summary>The <see cref="HttpContext.Items"/> key the running keep-alive of a request is registered under.</summary>
+    private const string ItemKey = "dotllm.sse-keepalive";
+
     private readonly HttpContext _context;
     private readonly Func<string> _reason;
     private readonly CancellationTokenSource _stop;
@@ -43,8 +46,22 @@ internal sealed class SseKeepAlive : IAsyncDisposable
     /// <param name="reason">What the request is waiting for, re-read for every comment.</param>
     /// <param name="interval">Interval between comments; <see cref="DefaultInterval"/> when null.</param>
     /// <returns>The running keep-alive; stop it before writing the first real event.</returns>
-    public static SseKeepAlive Start(HttpContext context, Func<string> reason, TimeSpan? interval = null) =>
-        new(context, reason, interval ?? DefaultInterval);
+    public static SseKeepAlive Start(HttpContext context, Func<string> reason, TimeSpan? interval = null)
+    {
+        var keepAlive = new SseKeepAlive(context, reason, interval ?? DefaultInterval);
+        context.Items[ItemKey] = keepAlive;
+        return keepAlive;
+    }
+
+    /// <summary>
+    /// Stops the request's running keep-alive, if any, and waits for an in-flight comment (#1023 review). Call before touching the
+    /// response headers or writing anything: a keep-alive commits the headers itself, so setting them concurrently threw
+    /// "headers are read-only".
+    /// </summary>
+    /// <param name="context">The request.</param>
+    /// <returns>A task that completes when no keep-alive can write any more.</returns>
+    public static Task StopForAsync(HttpContext context) =>
+        context.Items.TryGetValue(ItemKey, out var value) && value is SseKeepAlive keepAlive ? keepAlive.StopAsync() : Task.CompletedTask;
 
     /// <summary>
     /// Wraps a model gate so keep-alives run while <paramref name="execute"/> waits, and stop before the work starts.
@@ -60,6 +77,7 @@ internal sealed class SseKeepAlive : IAsyncDisposable
         TimeSpan? interval = null, SseKeepAlive? existing = null) =>
         async (work, ct) =>
         {
+            if (existing is null) await StopForAsync(context);   // never two writers on one response
             var keepAlive = existing ?? Start(context, reason, interval);
             try
             {
