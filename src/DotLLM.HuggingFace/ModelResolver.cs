@@ -152,28 +152,28 @@ public static class ModelResolver
     /// <summary>Every local GGUF (mirror + hub cache), de-duplicated by repo and filename. Never throws.</summary>
     public static List<LocalModel> EnumerateLocal(string? modelsDir = null, string? cacheRoot = null, bool includeOllama = false, string? ollamaRoot = null)
     {
+        // Keyed on repo + RELATIVE path, newest wins: two snapshot revisions of one file (a re-upload leaves the old snapshot dir behind,
+        // usually with a different size) are one id, and the newest revision is the one every resolution path sees.
         var byKey = new Dictionary<string, LocalModel>(StringComparer.OrdinalIgnoreCase);
+        static LocalModel? Normalise(LocalModel m)
+        {
+            if (Path.GetFileName(m.Filename).StartsWith("mmproj", StringComparison.OrdinalIgnoreCase)) return null;   // multimodal projector, not a model
+            if (SplitGguf.IsLaterShard(m.Filename)) return null;   // shard 2..N is part of the set listed under shard 1 (#756)
+            return SplitGguf.IsFirstShard(m.Filename) ? m with { SizeBytes = SplitGguf.TotalLength(m.FullPath) } : m;
+        }
         void Add(LocalModel m)
         {
-            if (Path.GetFileName(m.Filename).StartsWith("mmproj", StringComparison.OrdinalIgnoreCase)) return;   // multimodal projector, not a model
-            if (SplitGguf.IsLaterShard(m.Filename)) return;   // shard 2..N is part of the set listed under shard 1 (#756)
-            if (SplitGguf.IsFirstShard(m.Filename)) m = m with { SizeBytes = SplitGguf.TotalLength(m.FullPath) };
-            // (#1021) One file, two listings: the flat mirror keeps only the file NAME while the hub snapshot keeps its subfolder
-            // ("Q4_K_M/model-00001-of-00002.gguf"), so key on repo + name + size, not the relative path - otherwise the same file is
-            // listed twice and a bare name reports it as ambiguous with itself.
-            string key = m.RepoId + "|" + Path.GetFileName(m.Filename) + "|" + m.SizeBytes;
-            if (!byKey.TryGetValue(key, out var have) || Preferred(m, have)) byKey[key] = m;
+            if (Normalise(m) is not { } n) return;
+            string key = n.RepoId + "|" + n.Filename;
+            if (!byKey.TryGetValue(key, out var have) || n.DownloadedAt > have.DownloadedAt) byKey[key] = n;
         }
 
-        // The snapshot's path-preserving entry wins, so the id (owner/repo/sub/file.gguf) is the same however the file is reached;
-        // between equally deep entries, the newer (unchanged behaviour).
-        static bool Preferred(LocalModel candidate, LocalModel have)
-        {
-            bool deep = candidate.Filename.Contains('/'), haveDeep = have.Filename.Contains('/');
-            return deep != haveDeep ? deep : candidate.DownloadedAt > have.DownloadedAt;
-        }
-
-        try { foreach (var m in HuggingFaceDownloader.ListLocalModels(modelsDir)) Add(m); } catch { /* unreadable mirror: skip */ }
+        // The flat mirror is merged AFTER the hub cache: it keeps only the file NAME, while the snapshot may keep a subfolder
+        // ("Q4_K_M/model-00001-of-00002.gguf"). A mirror entry with the same repo, file name and SIZE as a subfolder snapshot entry is
+        // that same file (#1021): it is not listed again, so a bare name is never ambiguous with itself and the id stays the snapshot's.
+        // Size is used only for this mirror-to-snapshot match, never between snapshots (where it would split revisions).
+        var mirror = new List<LocalModel>();
+        try { foreach (var m in HuggingFaceDownloader.ListLocalModels(modelsDir)) if (Normalise(m) is { } n) mirror.Add(n); } catch { /* unreadable mirror: skip */ }
 
         try
         {
@@ -203,6 +203,14 @@ public static class ModelResolver
             }
         }
         catch { /* unreadable cache: skip */ }
+
+        foreach (var m in mirror)
+        {
+            bool sameAsSnapshot = !byKey.ContainsKey(m.RepoId + "|" + m.Filename) && byKey.Values.Any(h =>
+                h.RepoId.Equals(m.RepoId, StringComparison.OrdinalIgnoreCase) && h.Filename.Contains('/')
+                && Path.GetFileName(h.Filename).Equals(m.Filename, StringComparison.OrdinalIgnoreCase) && h.SizeBytes == m.SizeBytes);
+            if (!sameAsSnapshot) Add(m);
+        }
 
         if (includeOllama)
         {

@@ -46,17 +46,27 @@ public sealed class ServerState : IDisposable
     /// </summary>
     /// <param name="modelId">The id reported to clients.</param>
     /// <param name="path">The GGUF it was loaded from.</param>
+    /// <remarks>
+    /// Only FILE ids are recorded. A profile name (or an ollama name) is an alias whose target can change - <c>dotllm model profile set
+    /// myprof --base other/repo</c> - so pinning it to the file it named at load time would reload the old file; it is always resolved
+    /// afresh instead.
+    /// </remarks>
     public void RememberIssuedId(string modelId, string path)
     {
-        if (!string.IsNullOrEmpty(modelId) && modelId != "none" && !string.IsNullOrEmpty(path))
-            _issuedIds[modelId] = path;
+        if (string.IsNullOrEmpty(modelId) || modelId == "none" || string.IsNullOrEmpty(path) || IsAlias(modelId)
+            || OllamaStore.IsBlobPath(path)) return;   // an ollama name is an alias too: a re-pull re-points it at a new blob
+        _issuedIds[modelId] = path;
     }
+
+    /// <summary>True when <paramref name="modelId"/> is a profile name - an alias, re-resolved on every use.</summary>
+    private static bool IsAlias(string modelId) =>
+        ModelProfileStore.NormalizeName(modelId) is { } n && ModelProfileStore.TryGet(n) is not null;
 
     /// <summary>The file an id this server handed out was minted for, when it still exists; otherwise null.</summary>
     /// <param name="modelId">A model id.</param>
     /// <returns>The path, or null.</returns>
     public string? PathForIssuedId(string modelId) =>
-        _issuedIds.TryGetValue(modelId, out var path) && File.Exists(path) ? path : null;
+        !IsAlias(modelId) && _issuedIds.TryGetValue(modelId, out var path) && File.Exists(path) ? path : null;
 
     /// <summary>Server startup options (updated on model swap).</summary>
     public required ServerOptions Options { get; set; }
@@ -413,7 +423,9 @@ public sealed class ServerState : IDisposable
             string reloadPath;
             ServerOptions loadOptions;
             long incomingBytes;
-            if (string.Equals(targetKey, Options.ModelId, StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(LoadedModelPath))
+            // A profile is re-resolved even when it was the last model: its base may have changed since (#1021 review).
+            if (string.Equals(targetKey, Options.ModelId, StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(LoadedModelPath)
+                && ModelProfileStore.Resolve(targetKey) is null)
             {
                 // Same model as before, just idled out - reload from the same path/options.
                 reloadPath = LoadedModelPath;

@@ -125,4 +125,51 @@ public sealed class AmbiguousModelNameEndpointTests : IAsyncLifetime
         Assert.DoesNotContain("ambiguous", text, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("not found", text, StringComparison.OrdinalIgnoreCase);
     }
+
+    /// <summary>
+    /// Review round 2 of #1021: a profile name is an alias whose base can change, so it is never pinned in the issued-id map.
+    /// </summary>
+    [Fact]
+    public void ProfileName_IsNeverPinnedToTheFileItOnceNamed()
+    {
+        string file = HubCache.SnapshotFilePath("Hcompany/Holo4-27B-GGUF", "c0ffee", "q4_k_m.gguf", Path.Combine(_root, "hub"));
+        ModelProfileStore.Save("myprof-1021", new ModelProfile { From = "Hcompany/Holo4-27B-GGUF/q4_k_m.gguf" });
+
+        _state!.RememberIssuedId("myprof-1021", file);
+        _state.RememberIssuedId("Hcompany/Holo4-27B-GGUF/q4_k_m.gguf", file);
+
+        Assert.Null(_state.PathForIssuedId("myprof-1021"));
+        Assert.Equal(file, _state.PathForIssuedId("Hcompany/Holo4-27B-GGUF/q4_k_m.gguf"));   // file ids still are
+    }
+
+    private static string? FindSmolLm(string quant)
+    {
+        string hub = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache", "huggingface", "hub");
+        return Directory.Exists(hub)
+            ? Directory.EnumerateFiles(hub, "*.gguf", SearchOption.AllDirectories)
+                .FirstOrDefault(f => f.Contains("SmolLM-135M", StringComparison.OrdinalIgnoreCase) && f.Contains(quant, StringComparison.OrdinalIgnoreCase))
+            : null;
+    }
+
+    /// <summary>
+    /// Review round 2 of #1021, end to end on CPU: after a profile's base changes, reactivating the profile (idled out) loads the NEW base.
+    /// It used to reload the old file - from the issued-id map, and from the "same model, idled out" path.
+    /// </summary>
+    [SkippableFact]
+    public async Task ProfileWhoseBaseChanged_ReloadsTheNewBase()
+    {
+        string? a = FindSmolLm("Q5_K_M"), b = FindSmolLm("Q3_K_M");
+        Skip.If(a is null || b is null, "SmolLM-135M cached GGUF quants not found locally.");
+        _state!.Options = _state.Options with { Device = "cpu", UsePaged = false, PromptCacheEnabled = false, Warmup = DotLLM.Engine.WarmupOptions.Disabled };
+        ModelProfileStore.Save("swapbase-1021", new ModelProfile { From = a });
+
+        Assert.Null(await _state.EnsureActiveAsync("swapbase-1021", keepAliveOverride: null, CancellationToken.None));
+        Assert.Equal(Path.GetFileName(a), Path.GetFileName(_state.LoadedModelPath));
+        await _state.UnloadAsync(key: null, all: false, CancellationToken.None);   // idled out
+
+        ModelProfileStore.Save("swapbase-1021", new ModelProfile { From = b });   // dotllm model profile set ... --base
+        Assert.Null(await _state.EnsureActiveAsync("swapbase-1021", keepAliveOverride: null, CancellationToken.None));
+
+        Assert.Equal(Path.GetFileName(b), Path.GetFileName(_state.LoadedModelPath));
+    }
 }
