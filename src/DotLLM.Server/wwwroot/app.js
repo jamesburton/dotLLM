@@ -441,6 +441,8 @@ function extractQuantFromPath(modelPath) {
 }
 
 function buildModelBadgeText(config) {
+    if (config?.activity?.state === 'loading')
+        return `loading ${config.activity.loading_model_id} (${Math.round(config.activity.loading_elapsed_seconds)}s)`;
     if (!config || !config.is_ready) return 'no model loaded';
 
     const parts = [];

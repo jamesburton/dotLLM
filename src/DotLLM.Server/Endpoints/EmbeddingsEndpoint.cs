@@ -18,7 +18,7 @@ namespace DotLLM.Server.Endpoints;
 /// <para>Each input item is its own forward pass with positions <c>0..n-1</c>; sequences are not
 /// packed into one batch, because the CPU forward has no per-sequence attention mask.</para>
 /// <para>The model's scratch buffers (and its compute thread pool) are shared mutable state, so
-/// the request holds <b>both</b> locks that guard the model: <see cref="ServerState.ExecuteAsync"/>
+/// the request holds <b>both</b> locks that guard the model: <see cref="ServerState.ExecuteAsync(Func{Task}, CancellationToken)"/>
 /// against the direct-generator path, and — when a continuous-batch scheduler is active —
 /// <c>ContinuousBatchSchedulerService.AcquireModelAsync</c> against its run loop, which drives
 /// forward passes outside the request gate by design.</para>
@@ -86,13 +86,14 @@ public static class EmbeddingsEndpoint
             return EmbedResult.Fail(503, "No model loaded");
         }
 
-        if (state.Model is not IEmbeddingModel embeddingModel)
+        if (state.Model is not IEmbeddingModel preGateModel)
         {
             return EmbedResult.Fail(501, $"The loaded model ({state.Model.GetType().Name}) does not support embedding extraction. "
                 + "POST /v1/embeddings is implemented for the CPU backend only; run the server without "
                 + "a GPU backend to use it.");
         }
 
+        string admittedModelId = state.Options.ModelId;
         int outDims = state.Config.HiddenSize;
         if (request.Dimensions is { } dims)
         {
@@ -149,7 +150,7 @@ public static class EmbeddingsEndpoint
             }
         }
 
-        var pooling = EmbeddingPooler.Resolve(requestedPooling, embeddingModel.DeclaredPoolingType);
+        var pooling = EmbeddingPooler.Resolve(requestedPooling, preGateModel.DeclaredPoolingType);
         if (pooling is PoolingType.None or PoolingType.Rank)
         {
             return EmbedResult.Fail(400, $"The loaded checkpoint declares pooling type '{pooling}', which this endpoint cannot represent. "
@@ -168,8 +169,11 @@ public static class EmbeddingsEndpoint
             // the scheduler lease itself (#461 follow-up), so this endpoint no longer takes it
             // separately. Re-adding an inner AcquireModelAsync here would self-deadlock: the
             // semaphore is not reentrant.
-            await state.ExecuteAsync(async () =>
+            // (#1023 review) Re-validated under the gate: the model is read THEN, never the instance seen before a queued swap.
+            await state.ExecuteOnModelAsync(admittedModelId, async () =>
             {
+                var embeddingModel = state.Model as IEmbeddingModel
+                    ?? throw new ModelUnavailableException(admittedModelId, "the active model does not support embedding extraction");
                 for (int i = 0; i < sequences.Count; i++)
                 {
                     ct.ThrowIfCancellationRequested();
@@ -201,6 +205,10 @@ public static class EmbeddingsEndpoint
         catch (NotSupportedException ex)
         {
             return EmbedResult.Fail(400, ex.Message);
+        }
+        catch (ModelUnavailableException ex)
+        {
+            return EmbedResult.Fail(503, ex.Message);
         }
 
         return new EmbedResult(200, null, vectors, promptTokens, base64);

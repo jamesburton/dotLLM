@@ -415,7 +415,6 @@ public static class OllamaApiEndpoint
         options = plan.Gate(options, ReasoningSupport.UngatedStops);
         bool stream = !(root.TryGetProperty("stream", out var sv) && sv.ValueKind == JsonValueKind.False);
         string modelId = state.Options.ModelId;
-        var generator = state.Generator;
         string created() => DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture);
 
         void Chunk(Utf8JsonWriter w, string text, bool done, string? doneReason, InferenceTimings? t, int evalCount, double totalMs, string? thinking = null)
@@ -457,7 +456,7 @@ public static class OllamaApiEndpoint
                 }, ct);
             }
             else
-                await state.ExecuteAsync(() => { result = generator.Generate(finalPrompt, options); return Task.CompletedTask; }, ct);
+                await state.ExecuteAsync(modelId, g => { result = g.Generate(finalPrompt, options); return Task.CompletedTask; }, ct);
 
             RateLimitMiddleware.GetLease(c)?.ReportActualTokens(result!.PromptTokenCount + result.GeneratedTokenCount);
             c.Response.ContentType = "application/json; charset=utf-8";
@@ -490,9 +489,9 @@ public static class OllamaApiEndpoint
             if (chunk.Reasoning.Length > 0) await Send("", chunk.Reasoning);
             if (chunk.Content.Length > 0) await Send(chunk.Content, null);
         }
-        await state.ExecuteAsync(async () =>
+        await state.ExecuteAsync(modelId, async g =>
         {
-            await foreach (var token in generator.GenerateStreamingTokensAsync(finalPrompt, options, ct))
+            await foreach (var token in g.GenerateStreamingTokensAsync(finalPrompt, options, ct))
             {
                 if (token.Text.Length > 0)
                 {

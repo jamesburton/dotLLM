@@ -93,17 +93,22 @@ public static class ModelManagementEndpoint
             if (!state.Catalog.IsEnabled(request.Model) || !state.Catalog.IsEnabled(loadKey))
                 return Results.BadRequest(ErrorResponse.InvalidRequest($"Model is disabled: {request.Model}", param: "model", code: "model_disabled"));
 
+            // (#1023 review) The placement this load will actually use - computed ONCE, so the pre-free fit check judges the same device
+            // and layer count the load uses (request, then profile, then server default), not the current model's.
+            var loadProfile = ModelProfileStore.Resolve(request.Model) is { } lp ? ModelProfileStore.Merge(lp.Chain) : null;
+            string loadDevice = request.Device ?? loadProfile?.Device ?? state.Options.Device;
+            int? loadGpuLayers = ResolveRequestedGpuLayers(request.GpuLayers, loadProfile?.GpuLayers, state.Options.GpuLayers);
+
             try
             {
                 await state.SwapModelAsync(async () =>
                 {
-                    var loadProfile = ModelProfileStore.Resolve(request.Model) is { } lp ? ModelProfileStore.Merge(lp.Chain) : null;
                     var newOptions = state.Options with
                     {
                         Model = request.Model,
                         Quant = request.Quant,
-                        Device = request.Device ?? loadProfile?.Device ?? state.Options.Device,
-                        GpuLayers = ResolveRequestedGpuLayers(request.GpuLayers, loadProfile?.GpuLayers, state.Options.GpuLayers),
+                        Device = loadDevice,
+                        GpuLayers = loadGpuLayers,
                         CacheTypeK = request.CacheTypeK ?? state.Options.CacheTypeK,
                         CacheTypeV = request.CacheTypeV ?? state.Options.CacheTypeV,
                         Threads = request.Threads ?? state.Options.Threads,
@@ -118,7 +123,8 @@ public static class ModelManagementEndpoint
                             request.YarnBetaFast, request.YarnBetaSlow)
                             ?? state.Options.RopeOverride,
                     };
-                    var newState = await Task.Run(() => ServerStartup.LoadModel(resolvedPath, newOptions), ct);
+                    // (#1023 review) Not cancellable: the old model is already freed, so abandoning the load would leave no model.
+                    var newState = await Task.Run(() => ServerStartup.LoadModel(resolvedPath, newOptions), CancellationToken.None);
 
                     // Transfer new state fields into the existing ServerState
                     state.Options = newOptions with { ResolvedDevice = newState.Options.ResolvedDevice };   // #790: keep the device actually used
@@ -155,7 +161,8 @@ public static class ModelManagementEndpoint
                         newState.LoraRegistry.Dispose();
 
                     await Task.CompletedTask;
-                }, ct);
+                }, ct, incomingModelId: loadKey, incomingBytes: SafeFileLength(resolvedPath),   // (#1023) free before loading
+                    incomingPlacement: (loadDevice, loadGpuLayers));
 
                 return Results.Ok(new ModelLoadResponse
                 {

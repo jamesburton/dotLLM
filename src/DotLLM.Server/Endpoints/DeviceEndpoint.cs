@@ -94,6 +94,7 @@ public static class DeviceEndpoint
                         Name = d.Name,
                         DeviceString = $"gpu:{i}",
                         TotalMemoryBytes = d.TotalMemoryBytes,
+                        FreeMemoryBytes = DotLLM.Cuda.CudaMemoryInfo.TryGet(i, out long free, out _) ? free : null,
                         ComputeCapability = d.ComputeCapability,
                     });
                 }

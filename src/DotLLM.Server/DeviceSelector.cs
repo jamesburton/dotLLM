@@ -26,8 +26,8 @@ public static class DeviceSelector
             if (!backend.Servable) continue;
             if (backend.Name == "cuda")
             {
-                var best = (backend.Devices ?? []).Where(d => d.DeviceString is not null && (d.TotalMemoryBytes is not { } t || modelBytes <= t * CudaFitFraction))
-                    .OrderByDescending(d => d.TotalMemoryBytes ?? 0).FirstOrDefault();
+                var best = (backend.Devices ?? []).Where(d => d.DeviceString is not null && FitsCuda(modelBytes, d))
+                    .OrderByDescending(d => d.FreeMemoryBytes ?? d.TotalMemoryBytes ?? 0).FirstOrDefault();
                 if (best is not null) order.Insert(0, best.DeviceString!);   // CUDA first
             }
             else if (backend.Name == "vulkan" && backend.Devices is { Length: > 0 } vk && vk[0].DeviceString is { } v)
@@ -35,6 +35,23 @@ public static class DeviceSelector
         }
         order.Add("cpu");
         return order;
+    }
+
+    /// <summary>
+    /// Whether a model of <paramref name="modelBytes"/> fits CUDA device <paramref name="device"/> NOW (#1023): the same
+    /// <see cref="CudaFitFraction"/> headroom as before, but measured against FREE memory when the device reports it - the weights plus
+    /// <c>(1 - CudaFitFraction) x total</c> for KV cache and scratch must fit in what is free. Total memory alone counted VRAM another
+    /// model (or process) still held, so <c>auto</c> chose a device the load could not fit and the swap crawled.
+    /// </summary>
+    /// <param name="modelBytes">Size of the model's weights (GGUF file length).</param>
+    /// <param name="device">The device as described by <see cref="Endpoints.DeviceEndpoint.Describe"/>.</param>
+    /// <returns>True when it fits, or when the device reports no memory figures.</returns>
+    public static bool FitsCuda(long modelBytes, Models.DeviceInfoDto device)
+    {
+        if (device.TotalMemoryBytes is not { } total) return true;
+        if (device.FreeMemoryBytes is { } free)
+            return modelBytes + (long)(total * (1 - CudaFitFraction)) <= free;
+        return modelBytes <= total * CudaFitFraction;
     }
 
     /// <summary>Tracking issue linked from every "GPU requested but unavailable" message.</summary>
@@ -45,7 +62,12 @@ public static class DeviceSelector
     /// servable device can satisfy yields <see cref="DevicePlan.Error"/> and no candidates - it never resolves to the CPU.
     /// <c>auto</c> that has no servable GPU resolves to the CPU with <see cref="DevicePlan.CpuWarning"/> set.
     /// </summary>
-    public static DevicePlan Plan(DeviceSpec spec, long modelBytes, Models.DeviceListResponse devices)
+    /// <param name="spec">The parsed device request.</param>
+    /// <param name="modelBytes">Size of the model's weights.</param>
+    /// <param name="devices">The machine's device inventory.</param>
+    /// <param name="fullOffload">False when <c>--gpu-layers</c> asks for a partial offload, which exempts it from the free-memory refusal.</param>
+    /// <returns>The candidate devices, or the error.</returns>
+    public static DevicePlan Plan(DeviceSpec spec, long modelBytes, Models.DeviceListResponse devices, bool fullOffload = true)
     {
         var backends = devices.Backends ?? [];
         switch (spec.Kind)
@@ -64,8 +86,16 @@ public static class DeviceSelector
             {
                 var cuda = backends.FirstOrDefault(b => b.Name == "cuda");
                 string want = $"gpu:{spec.Ordinal}";
-                if (cuda is { Servable: true } && (cuda.Devices ?? []).Any(d => d.DeviceString == want))
+                if (cuda is { Servable: true } && (cuda.Devices ?? []).FirstOrDefault(d => d.DeviceString == want) is { } dev)
+                {
+                    // (#1023) Weights larger than the device's FREE memory cannot load: say so now with the numbers, instead of
+                    // starting a load that fails late or crawls. Only the weights are compared (no headroom), so a tight fit that
+                    // works today is never refused; partial offload (--gpu-layers) is checked by the loader instead.
+                    if (dev.FreeMemoryBytes is { } free && modelBytes > free && fullOffload)
+                        return new DevicePlan(spec, [], $"the model's {Gib(modelBytes)} of weights exceed the {Gib(free)} free on {want} "
+                            + $"({(dev.TotalMemoryBytes is { } t ? Gib(t) + " total; " : "")}other models or processes hold the rest)", null);
                     return new DevicePlan(spec, [want], null, null);
+                }
                 // Distinguish "no CUDA here" (this branch: nothing was attempted) from "CUDA present but the load failed" (a load-time error
                 // with real numbers, produced by the loader - see DeviceModelLoader.LoadWith).
                 string why = cuda is null || !cuda.Servable
@@ -85,6 +115,8 @@ public static class DeviceSelector
             }
         }
     }
+
+    private static string Gib(long bytes) => $"{bytes / (1024.0 * 1024 * 1024):F1} GiB";
 
     private static string AlternativeHint(Models.BackendInfoDto[] backends, string except)
     {

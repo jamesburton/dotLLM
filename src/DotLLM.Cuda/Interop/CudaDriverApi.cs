@@ -33,6 +33,11 @@ internal static partial class CudaDriverApi
     [LibraryImport(LibName)]
     internal static partial int cuDeviceTotalMem_v2(out nuint bytes, int device);
 
+    /// <summary>PCI bus id ("0000:01:00.0") of a device - the key that maps a CUDA ordinal to its NVML handle (#1023).</summary>
+    [LibraryImport(LibName)]
+    internal static partial int cuDeviceGetPCIBusId(
+        [MarshalAs(UnmanagedType.LPArray)] byte[] pciBusId, int len, int device);
+
     [LibraryImport(LibName)]
     internal static partial int cuMemGetInfo_v2(out nuint free, out nuint total);
 

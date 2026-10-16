@@ -26,7 +26,7 @@ public static class ServerLog
     /// <summary>The prefix every server log line starts with; only lines starting with it are timestamped.</summary>
     public const string Prefix = "[dotllm]";
 
-    private static readonly AsyncLocal<string?> CurrentRequestTag = new();
+    private static readonly AsyncLocal<RequestScope?> CurrentRequestScope = new();
     private static long _requestCounter;
     private static int _installed;
 
@@ -34,7 +34,42 @@ public static class ServerLog
     /// The current request's tag (<c>req#12</c>) when the caller runs inside a request logged by <see cref="UseRequestLifecycleLog"/>;
     /// null otherwise (startup, idle sweep, tests).
     /// </summary>
-    public static string? RequestTag => CurrentRequestTag.Value;
+    public static string? RequestTag => CurrentRequestScope.Value?.Tag;
+
+    /// <summary>The current request (its tag, and a task that completes when it ends), or null outside one.</summary>
+    internal static RequestScope? CurrentRequest => CurrentRequestScope.Value;
+
+    /// <summary>
+    /// Enters a request scope for the current async flow: sets <see cref="RequestTag"/> and, on dispose, completes
+    /// <see cref="RequestScope.Ended"/> and clears it. Used by <see cref="UseRequestLifecycleLog"/> and by tests.
+    /// </summary>
+    /// <param name="tag">The request's tag.</param>
+    /// <returns>The scope; dispose it when the request ends.</returns>
+    internal static RequestScope BeginRequest(string tag)
+    {
+        var scope = new RequestScope(tag);
+        CurrentRequestScope.Value = scope;
+        return scope;
+    }
+
+    /// <summary>One in-flight request: its tag and a task that completes when it has ended (#1023 activation hand-off).</summary>
+    internal sealed class RequestScope(string tag) : IDisposable
+    {
+        private readonly TaskCompletionSource _ended = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>The request's tag (<c>req#12</c>).</summary>
+        public string Tag { get; } = tag;
+
+        /// <summary>Completes when the request has ended.</summary>
+        public Task Ended => _ended.Task;
+
+        /// <inheritdoc/>
+        public void Dispose()
+        {
+            _ended.TrySetResult();
+            if (ReferenceEquals(CurrentRequestScope.Value, this)) CurrentRequestScope.Value = null;
+        }
+    }
 
     /// <summary>
     /// Replaces <see cref="Console.Out"/> and <see cref="Console.Error"/> with writers that prefix each <c>[dotllm]</c> line with a
@@ -82,7 +117,7 @@ public static class ServerLog
             }
 
             string tag = "req#" + Interlocked.Increment(ref _requestCounter).ToString(CultureInfo.InvariantCulture);
-            CurrentRequestTag.Value = tag;
+            using var scope = BeginRequest(tag);
             long start = Stopwatch.GetTimestamp();
             Info($"{context.Request.Method} {context.Request.Path}");
             try
@@ -95,7 +130,6 @@ public static class ServerLog
                 Info(context.RequestAborted.IsCancellationRequested
                     ? $"cancelled (client disconnected) after {elapsed}"
                     : $"done {context.Response.StatusCode} in {elapsed}");
-                CurrentRequestTag.Value = null;
             }
         });
 
