@@ -160,7 +160,7 @@ public sealed class ModelManagementEndpointsTests
         try
         {
             var state = NewState();
-            state.Catalog.Disable("curated-off"); // the derived key, not the path
+            state.Catalog.Disable(DotLLM.HuggingFace.ModelResolver.IdForPath(path)); // the derived key (#1021: a full path outside the stores, never a bare stem)
 
             var error = await state.EnsureActiveAsync(path, keepAliveOverride: null, CancellationToken.None);
 

@@ -37,6 +37,27 @@ public sealed class ServerState : IDisposable
     /// <summary>Who holds <see cref="_requestGate"/> (<c>req#3 generate</c>), for the lock-wait log line (#1021). Null when free.</summary>
     private volatile string? _gateHolder;
 
+    /// <summary>Every model id this server has handed out, mapped to the exact file it was minted for (#1021).</summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> _issuedIds = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Records that <paramref name="modelId"/> was handed out for <paramref name="path"/> (#1021). Name resolution consults this first,
+    /// so a client sending back an id it was given reaches exactly that file - never whatever the name would resolve to today.
+    /// </summary>
+    /// <param name="modelId">The id reported to clients.</param>
+    /// <param name="path">The GGUF it was loaded from.</param>
+    public void RememberIssuedId(string modelId, string path)
+    {
+        if (!string.IsNullOrEmpty(modelId) && modelId != "none" && !string.IsNullOrEmpty(path))
+            _issuedIds[modelId] = path;
+    }
+
+    /// <summary>The file an id this server handed out was minted for, when it still exists; otherwise null.</summary>
+    /// <param name="modelId">A model id.</param>
+    /// <returns>The path, or null.</returns>
+    public string? PathForIssuedId(string modelId) =>
+        _issuedIds.TryGetValue(modelId, out var path) && File.Exists(path) ? path : null;
+
     /// <summary>Server startup options (updated on model swap).</summary>
     public required ServerOptions Options { get; set; }
 
@@ -401,7 +422,9 @@ public sealed class ServerState : IDisposable
             }
             else
             {
-                var resolvedPath = await ServerStartup.ResolveOrPullAsync(targetKey, quant: null, Options.AutoPull, ct).ConfigureAwait(false);
+                // (#1021) An id this server handed out goes back to the exact file it was minted for, never re-resolved by name.
+                string? issued = PathForIssuedId(targetKey);
+                var resolvedPath = issued ?? await ServerStartup.ResolveOrPullAsync(targetKey, quant: null, Options.AutoPull, ct).ConfigureAwait(false);
                 if (resolvedPath is null)
                     return ServerStartup.NotFoundMessage(targetKey);
 
@@ -420,7 +443,7 @@ public sealed class ServerState : IDisposable
                 {
                     Model = targetKey,
                     Quant = null,
-                    ModelId = ServerStartup.ModelIdFor(targetKey, resolvedPath),
+                    ModelId = issued is not null ? targetKey : ServerStartup.ModelIdFor(targetKey, resolvedPath),
                     Device = profile?.Device ?? Options.Device,
                     GpuLayers = profile?.GpuLayers ?? Options.GpuLayers,
                 };
@@ -736,6 +759,7 @@ public sealed class ServerState : IDisposable
         DraftGguf = loaded.DraftGguf;
         MtpActive = loaded.MtpActive;
         MtpStatus = loaded.MtpStatus;
+        RememberIssuedId(Options.ModelId, LoadedModelPath);
         EstimatedBytes = estimatedBytes;
         KeepAliveSecondsOverride = keepAliveOverride;
         IsReady = true;

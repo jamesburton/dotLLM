@@ -799,6 +799,9 @@ public static class ServerStartup
 
         app.MapDotLLMEndpoints(serveUi);
 
+        // (#1021) The startup model's id is one the server hands out too.
+        state.RememberIssuedId(state.Options.ModelId, state.LoadedModelPath);
+
         var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
         state.ShutdownToken = lifetime.ApplicationStopping;
 

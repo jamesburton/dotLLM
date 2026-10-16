@@ -99,7 +99,7 @@ public sealed class ModelProfileTests : IDisposable
         Assert.Equal(Path.GetFullPath(gguf), ServerStartup.ResolveModelPath("tuned", null));
         Assert.Equal("tuned", ServerStartup.ModelIdFor("tuned", gguf));
         Assert.Equal("tuned", ServerStartup.ModelIdFor("tuned:latest", gguf));
-        Assert.Equal("base-model", ServerStartup.ModelIdFor(gguf, gguf));   // not a profile -> the file stem
+        Assert.Equal(Path.GetFullPath(gguf), ServerStartup.ModelIdFor(gguf, gguf));   // not a profile, outside the stores -> its full path (#1021: never a bare stem)
     }
 
     [Fact]

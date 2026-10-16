@@ -212,13 +212,16 @@ public sealed class ModelResolverTests : IDisposable
     }
 
     [Fact]
-    public void IdForPath_FileOutsideTheStores_FallsBackToItsStem()
+    public void IdForPath_FileOutsideTheStores_IsItsFullPath_NeverABareStem()
     {
         string loose = Path.Combine(_root, "loose", "my-model.gguf");
         Directory.CreateDirectory(Path.GetDirectoryName(loose)!);
         File.WriteAllBytes(loose, new byte[10]);
 
-        Assert.Equal("my-model", ModelResolver.IdForPath(loose, Mirror, Hub));
+        // #1021: a bare stem would be persisted by clients and could later resolve to a different (store) file of that name.
+        string id = ModelResolver.IdForPath(loose, Mirror, Hub);
+        Assert.Equal(Path.GetFullPath(loose), id);
+        Assert.Equal(Path.GetFullPath(loose), ModelResolver.ResolveLocal(id, null, Mirror, Hub));
     }
 
     /// <summary>
@@ -294,5 +297,41 @@ public sealed class ModelResolverTests : IDisposable
         string only = AddHub("acme/solo-stem", "q5_k_m.gguf", 100);
 
         Assert.Equal(only, ModelResolver.ResolveLocal("q5_k_m", null, Mirror, Hub));
+    }
+
+    /// <summary>
+    /// Review of #1021: the flat mirror keeps only the file NAME while the hub snapshot keeps its subfolder, so one file was listed twice
+    /// and a bare name reported it as ambiguous with itself.
+    /// </summary>
+    [Fact]
+    public void SubfolderSnapshotPlusFlatMirror_IsOneModel_ListedOnce_AndNotAmbiguousWithItself()
+    {
+        AddHub("acme/split", "Q4_K_M/model-Q4_K_M.gguf", 100, mirror: true);   // mirror: models/acme/split/model-Q4_K_M.gguf
+
+        var listed = ModelResolver.EnumerateLocal(Mirror, Hub);
+        Assert.Single(listed);
+        Assert.Equal("acme/split/Q4_K_M/model-Q4_K_M.gguf", ModelResolver.IdFor(listed[0]));   // the structural (snapshot) id wins
+        Assert.NotNull(ModelResolver.ResolveLocal("model-Q4_K_M", null, Mirror, Hub));         // no self-ambiguity
+        Assert.NotNull(ModelResolver.ResolveLocal("acme/split/model-Q4_K_M.gguf", null, Mirror, Hub));   // the flat id still resolves
+    }
+
+    /// <summary>Review of #1021: the id must not depend on which copy of a file was resolved (it was a stem for the losing copy).</summary>
+    [Fact]
+    public void IdForPath_IsTheSameForEitherCopyOfAFile()
+    {
+        string snap = AddHub("acme/split", "Q4_K_M/model-Q4_K_M.gguf", 100, mirror: true);
+        string mirror = HubCache.MirrorPath("acme/split", "Q4_K_M/model-Q4_K_M.gguf", Mirror);
+        Assert.True(File.Exists(mirror));
+
+        Assert.Equal("acme/split/Q4_K_M/model-Q4_K_M.gguf", ModelResolver.IdForPath(snap, Mirror, Hub));
+        Assert.Equal("acme/split/Q4_K_M/model-Q4_K_M.gguf", ModelResolver.IdForPath(mirror, Mirror, Hub));
+    }
+
+    [Fact]
+    public void Ambiguity_HasItsOwnErrorCode()
+    {
+        var ex = new AmbiguousModelReferenceException("q4_k_m", ["a/b/q4_k_m.gguf", "c/d/q4_k_m.gguf"]);
+        Assert.Equal("ambiguous_model", AmbiguousModelReferenceException.CodeFor(ex.Message));
+        Assert.Equal("model_not_found", AmbiguousModelReferenceException.CodeFor("Model not found: x"));
     }
 }
