@@ -334,4 +334,55 @@ public sealed class ModelResolverTests : IDisposable
         Assert.Equal("ambiguous_model", AmbiguousModelReferenceException.CodeFor(ex.Message));
         Assert.Equal("model_not_found", AmbiguousModelReferenceException.CodeFor("Model not found: x"));
     }
+
+    /// <summary>A file in snapshot <paramref name="commit"/>, last written at <paramref name="writtenUtc"/>; optionally hard-linked into the mirror.</summary>
+    private string AddRevision(string repo, string commit, string file, int size, DateTime writtenUtc, bool mirror = false)
+    {
+        string blob = Path.Combine(HubCache.RepoDirectory(repo, Hub), "blobs", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.GetDirectoryName(blob)!);
+        File.WriteAllBytes(blob, new byte[size]);
+        File.SetLastWriteTimeUtc(blob, writtenUtc);
+        string snap = HubCache.SnapshotFilePath(repo, commit, file, Hub);
+        Directory.CreateDirectory(Path.GetDirectoryName(snap)!);
+        HubCache.LinkOrCopy(blob, snap);
+        File.SetLastWriteTimeUtc(snap, writtenUtc);
+        if (mirror)
+        {
+            string m = HubCache.MirrorPath(repo, file, Mirror);
+            Directory.CreateDirectory(Path.GetDirectoryName(m)!);
+            if (File.Exists(m)) File.Delete(m);
+            HubCache.LinkOrCopy(blob, m);
+            File.SetLastWriteTimeUtc(m, writtenUtc);
+        }
+        return snap;
+    }
+
+    /// <summary>
+    /// Review round 2 of #1021: a re-upload leaves the old snapshot behind, usually with a different size. Both revisions share one id,
+    /// so they must be ONE entry and every resolution path must reach the NEWEST - a size-including key listed both and let enumeration
+    /// order pick, which could silently load the stale revision.
+    /// </summary>
+    [Fact]
+    public void TwoSnapshotRevisionsOfOneFile_AreOneModel_AndEveryPathResolvesTheNewest()
+    {
+        AddRevision("acme/rev", "0ld", "Q4_K_M/m-Q4_K_M.gguf", 300, DateTime.UtcNow.AddDays(-3));            // stale and LARGER
+        string fresh = AddRevision("acme/rev", "n3w", "Q4_K_M/m-Q4_K_M.gguf", 200, DateTime.UtcNow, mirror: true);
+
+        var listed = ModelResolver.EnumerateLocal(Mirror, Hub).Where(m => m.RepoId == "acme/rev").ToList();
+        Assert.Single(listed);
+        Assert.Equal(fresh, listed[0].FullPath);
+
+        foreach (string reference in new[] { "m-Q4_K_M", "m-Q4_K_M.gguf", "acme/rev/Q4_K_M/m-Q4_K_M.gguf", "acme/rev", "acme/rev:Q4_K_M", "acme/rev/m-Q4_K_M.gguf" })
+            Assert.Equal(200, ModelResolver.FileLength(ModelResolver.ResolveLocal(reference, null, Mirror, Hub)!));
+    }
+
+    /// <summary>Review round 2 of #1021: equal name and size in DIFFERENT subfolders are different files, not one.</summary>
+    [Fact]
+    public void SameNameAndSize_InDifferentSubfolders_AreTwoModels()
+    {
+        AddRevision("acme/two", "c0ffee", "a/x.gguf", 100, DateTime.UtcNow);
+        AddRevision("acme/two", "c0ffee", "b/x.gguf", 100, DateTime.UtcNow);
+
+        Assert.Equal(2, ModelResolver.EnumerateLocal(Mirror, Hub).Count(m => m.RepoId == "acme/two"));
+    }
 }
