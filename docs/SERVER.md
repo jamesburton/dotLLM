@@ -299,12 +299,19 @@ candidate ids, and nothing is loaded:
 
 ```json
 {"type":"error","error":{"message":"Model name 'q4_k_m' is ambiguous: it matches 2 local models. Use the full id of one of: Hcompany/Holo4-27B-GGUF/q4_k_m.gguf, Hcompany/Holo4-35B-A3B-GGUF/q4_k_m.gguf",
-  "type":"invalid_request_error","param":"model","code":"model_not_found"}}
+  "type":"invalid_request_error","param":"model","code":"ambiguous_model"}}
 ```
 
 (HTTP 400; ollama's `/api/*` uses its own `{"error": "..."}` shape.) It used to resolve to the highest-ranked file (quant preference, then the
 largest), which loaded a 35B model the client never named. `owner/repo[:tag]` is unaffected: choosing the default quant within one repo is a
-choice among quants of one model, not an ambiguity.
+choice among quants of one model, not an ambiguity. The OpenAI-shaped surfaces use `code: "ambiguous_model"` (a missing model is still
+`model_not_found`); the Anthropic surface has no code field. One physical file reachable through both the flat mirror and the hub
+snapshot (where it may sit in a subfolder) is one model, never ambiguous with itself.
+
+**Stable ids.** An id is derived from the file's place in the stores - `owner/repo/<path in the snapshot>` - so it is the same whichever
+copy was opened and across reloads; a file outside the stores (`dotllm serve C:\x\model.gguf`, `model_path` on `/v1/models/load`) is
+identified by its full path, never a bare stem a client could persist and later see resolve to a different file. The server also remembers
+every id it has handed out and maps it back to that exact file first, before any name resolution.
 
 Local models are found in **both** the flat mirror (`~/.dotllm/models/{owner}/{repo}`) and the Hugging Face hub cache
 (`HF_HUB_CACHE` / `HF_HOME/hub` / `~/.cache/huggingface/hub`, symlinked or hard-linked snapshots), so files fetched by `hf download` or another
