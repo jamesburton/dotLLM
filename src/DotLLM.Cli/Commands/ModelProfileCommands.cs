@@ -98,7 +98,15 @@ internal sealed class ModelCreateCommand : Command<ModelCreateCommand.Settings>
         }
 
         var resolved = ModelProfileStore.Resolve(name)!.Value.BaseReference;
-        bool local = ModelResolver.ResolveLocal(resolved) is not null;
+        bool local;
+        try { local = ModelResolver.ResolveLocal(resolved) is not null; }
+        catch (AmbiguousModelReferenceException ex)
+        {
+            // (#1021) A base that names several local models would load whichever ranked first: undo, and say which to use.
+            if (previous is not null) ModelProfileStore.Save(name, previous); else ModelProfileStore.Delete(name);
+            GgufFileResolver.PrintAmbiguous(ex);
+            return 1;
+        }
         AnsiConsole.MarkupLine($"[green]Created[/] [bold]{name.EscapeMarkup()}[/] from {s.From.EscapeMarkup()}" +
                                (local ? "" : " [yellow](base model is not downloaded yet; it is pulled on first 'run'/'serve', or use --auto-pull on a server)[/]"));
         return 0;
@@ -119,7 +127,9 @@ internal sealed class ModelShowCommand : Command<ModelShowCommand.Settings>
     {
         var resolvedProfile = ModelProfileStore.Resolve(s.Model);
         string reference = resolvedProfile?.BaseReference ?? s.Model;
-        string? path = ModelResolver.ResolveLocal(reference);
+        string? path;
+        try { path = ModelResolver.ResolveLocal(reference); }
+        catch (AmbiguousModelReferenceException ex) { GgufFileResolver.PrintAmbiguous(ex); return 1; }
 
         var table = new Table().Border(TableBorder.Rounded).HideHeaders().AddColumn("k").AddColumn("v");
         table.AddRow("[bold]Name[/]", s.Model.EscapeMarkup());
@@ -177,7 +187,10 @@ internal sealed class ModelCopyCommand : Command<ModelCopyCommand.Settings>
         }
         var source = ModelProfileStore.TryGet(s.Source);
         var copy = source is not null ? source : new ModelProfile { From = s.Source };
-        if (source is null && ModelResolver.ResolveLocal(s.Source) is null && !ModelResolver.Parse(s.Source).IsRepo)
+        string? sourcePath;
+        try { sourcePath = source is null ? ModelResolver.ResolveLocal(s.Source) : null; }
+        catch (AmbiguousModelReferenceException ex) { GgufFileResolver.PrintAmbiguous(ex); return 1; }
+        if (source is null && sourcePath is null && !ModelResolver.Parse(s.Source).IsRepo)
         {
             AnsiConsole.MarkupLine($"[red]No profile or local model named '{s.Source.EscapeMarkup()}'.[/]");
             return 1;

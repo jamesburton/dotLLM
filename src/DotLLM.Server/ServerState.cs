@@ -34,6 +34,40 @@ public sealed class ServerState : IDisposable
 {
     private readonly SemaphoreSlim _requestGate = new(1, 1);
 
+    /// <summary>Who holds <see cref="_requestGate"/> (<c>req#3 generate</c>), for the lock-wait log line (#1021). Null when free.</summary>
+    private volatile string? _gateHolder;
+
+    /// <summary>Every model id this server has handed out, mapped to the exact file it was minted for (#1021).</summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> _issuedIds = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Records that <paramref name="modelId"/> was handed out for <paramref name="path"/> (#1021). Name resolution consults this first,
+    /// so a client sending back an id it was given reaches exactly that file - never whatever the name would resolve to today.
+    /// </summary>
+    /// <param name="modelId">The id reported to clients.</param>
+    /// <param name="path">The GGUF it was loaded from.</param>
+    /// <remarks>
+    /// Only FILE ids are recorded. A profile name (or an ollama name) is an alias whose target can change - <c>dotllm model profile set
+    /// myprof --base other/repo</c> - so pinning it to the file it named at load time would reload the old file; it is always resolved
+    /// afresh instead.
+    /// </remarks>
+    public void RememberIssuedId(string modelId, string path)
+    {
+        if (string.IsNullOrEmpty(modelId) || modelId == "none" || string.IsNullOrEmpty(path) || IsAlias(modelId)
+            || OllamaStore.IsBlobPath(path)) return;   // an ollama name is an alias too: a re-pull re-points it at a new blob
+        _issuedIds[modelId] = path;
+    }
+
+    /// <summary>True when <paramref name="modelId"/> is a profile name - an alias, re-resolved on every use.</summary>
+    private static bool IsAlias(string modelId) =>
+        ModelProfileStore.NormalizeName(modelId) is { } n && ModelProfileStore.TryGet(n) is not null;
+
+    /// <summary>The file an id this server handed out was minted for, when it still exists; otherwise null.</summary>
+    /// <param name="modelId">A model id.</param>
+    /// <returns>The path, or null.</returns>
+    public string? PathForIssuedId(string modelId) =>
+        !IsAlias(modelId) && _issuedIds.TryGetValue(modelId, out var path) && File.Exists(path) ? path : null;
+
     /// <summary>Server startup options (updated on model swap).</summary>
     public required ServerOptions Options { get; set; }
 
@@ -252,7 +286,7 @@ public sealed class ServerState : IDisposable
     /// </remarks>
     public async Task ExecuteAsync(Func<Task> work, CancellationToken ct)
     {
-        await _requestGate.WaitAsync(ct);
+        await AcquireGateAsync("generate", ct).ConfigureAwait(false);
         try
         {
             using var lease = Scheduler is { } scheduler
@@ -260,7 +294,39 @@ public sealed class ServerState : IDisposable
                 : null;
             await work();
         }
-        finally { _requestGate.Release(); }
+        finally { ReleaseGate(); }
+    }
+
+    /// <summary>
+    /// Takes <see cref="_requestGate"/>, logging (#1021) when it is not immediately free: who holds it, then how long the wait took.
+    /// An uncontended acquire logs nothing.
+    /// </summary>
+    private async Task AcquireGateAsync(string purpose, CancellationToken ct)
+    {
+        string me = ServerLog.RequestTag is { } tag ? $"{tag} {purpose}" : purpose;
+        if (!_requestGate.Wait(0))
+        {
+            ServerLog.Info($"waiting for the server lock ({purpose}); held by {_gateHolder ?? "?"}");
+            long start = System.Diagnostics.Stopwatch.GetTimestamp();
+            try
+            {
+                await _requestGate.WaitAsync(ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                ServerLog.Info($"gave up waiting for the server lock after {ServerLog.Duration(System.Diagnostics.Stopwatch.GetElapsedTime(start))} (cancelled)");
+                throw;
+            }
+            ServerLog.Info($"acquired the server lock after {ServerLog.Duration(System.Diagnostics.Stopwatch.GetElapsedTime(start))}");
+        }
+        _gateHolder = me;
+    }
+
+    /// <summary>Releases <see cref="_requestGate"/> taken by <see cref="AcquireGateAsync"/>.</summary>
+    private void ReleaseGate()
+    {
+        _gateHolder = null;
+        _requestGate.Release();
     }
 
     /// <summary>
@@ -275,8 +341,10 @@ public sealed class ServerState : IDisposable
     /// </summary>
     public async Task SwapModelAsync(Func<Task> loadAction, CancellationToken ct)
     {
-        await _requestGate.WaitAsync(ct);
+        await AcquireGateAsync("model load", ct).ConfigureAwait(false);
         IsReady = false;
+        long start = System.Diagnostics.Stopwatch.GetTimestamp();
+        ServerLog.Info("model load started (POST /v1/models/load)");
         try
         {
             await StopSchedulerAsync().ConfigureAwait(false);
@@ -285,10 +353,16 @@ public sealed class ServerState : IDisposable
             await loadAction();
             IsReady = true;
             LastUsedUtc = DateTimeOffset.UtcNow;
+            ServerLog.Info($"model loaded: {Options.ModelId} in {ServerLog.Duration(System.Diagnostics.Stopwatch.GetElapsedTime(start))}");
 
             Residency.EnforceBudget(EstimatedBytes);
         }
-        finally { _requestGate.Release(); }
+        catch (Exception ex)
+        {
+            ServerLog.Info($"model load failed after {ServerLog.Duration(System.Diagnostics.Stopwatch.GetElapsedTime(start))}: {ex.Message}");
+            throw;
+        }
+        finally { ReleaseGate(); }
     }
 
     /// <summary>
@@ -307,13 +381,17 @@ public sealed class ServerState : IDisposable
     /// <param name="ct">Cancellation token for the load/reload, if one is needed.</param>
     public async Task<string?> EnsureActiveAsync(string? requestedModel, double? keepAliveOverride, CancellationToken ct)
     {
+        if (ServerLog.RequestTag is not null)
+            ServerLog.Info($"model={(string.IsNullOrWhiteSpace(requestedModel) ? "(active)" : requestedModel)}");
+
         if (MatchesActiveAndReady(requestedModel))
         {
             Touch(keepAliveOverride);
             return null;
         }
 
-        await _requestGate.WaitAsync(ct);
+        await AcquireGateAsync("model activation", ct).ConfigureAwait(false);
+        long loadStart = 0;
         try
         {
             if (MatchesActiveAndReady(requestedModel))
@@ -345,7 +423,9 @@ public sealed class ServerState : IDisposable
             string reloadPath;
             ServerOptions loadOptions;
             long incomingBytes;
-            if (string.Equals(targetKey, Options.ModelId, StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(LoadedModelPath))
+            // A profile is re-resolved even when it was the last model: its base may have changed since (#1021 review).
+            if (string.Equals(targetKey, Options.ModelId, StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(LoadedModelPath)
+                && ModelProfileStore.Resolve(targetKey) is null)
             {
                 // Same model as before, just idled out - reload from the same path/options.
                 reloadPath = LoadedModelPath;
@@ -354,7 +434,9 @@ public sealed class ServerState : IDisposable
             }
             else
             {
-                var resolvedPath = await ServerStartup.ResolveOrPullAsync(targetKey, quant: null, Options.AutoPull, ct).ConfigureAwait(false);
+                // (#1021) An id this server handed out goes back to the exact file it was minted for, never re-resolved by name.
+                string? issued = PathForIssuedId(targetKey);
+                var resolvedPath = issued ?? await ServerStartup.ResolveOrPullAsync(targetKey, quant: null, Options.AutoPull, ct).ConfigureAwait(false);
                 if (resolvedPath is null)
                     return ServerStartup.NotFoundMessage(targetKey);
 
@@ -373,7 +455,7 @@ public sealed class ServerState : IDisposable
                 {
                     Model = targetKey,
                     Quant = null,
-                    ModelId = ServerStartup.ModelIdFor(targetKey, resolvedPath),
+                    ModelId = issued is not null ? targetKey : ServerStartup.ModelIdFor(targetKey, resolvedPath),
                     Device = profile?.Device ?? Options.Device,
                     GpuLayers = profile?.GpuLayers ?? Options.GpuLayers,
                 };
@@ -381,20 +463,25 @@ public sealed class ServerState : IDisposable
                 incomingBytes = SafeFileLength(resolvedPath);
             }
 
+            ServerLog.Info($"loading {loadOptions.ModelId} from {reloadPath} (active: {(Model is null ? "none" : Options.ModelId)})");
+            loadStart = System.Diagnostics.Stopwatch.GetTimestamp();
             var loaded = await Task.Run(() => ServerStartup.LoadModel(reloadPath, loadOptions), ct).ConfigureAwait(false);
 
             await StopSchedulerAsync().ConfigureAwait(false);
             StashOrDropActiveLocked();
             InstallLoadedModelLocked(loaded, incomingBytes, keepAliveOverride);
             Residency.EnforceBudget(EstimatedBytes);
+            ServerLog.Info($"loaded {Options.ModelId} in {ServerLog.Duration(System.Diagnostics.Stopwatch.GetElapsedTime(loadStart))}");
             return null;
         }
         catch (Exception ex)
         {
+            if (loadStart != 0)
+                ServerLog.Info($"load failed after {ServerLog.Duration(System.Diagnostics.Stopwatch.GetElapsedTime(loadStart))}: {ex.Message}");
             IsReady = Model is not null;
             return ex.Message;
         }
-        finally { _requestGate.Release(); }
+        finally { ReleaseGate(); }
     }
 
     /// <summary>
@@ -436,16 +523,18 @@ public sealed class ServerState : IDisposable
         if (!IsActiveExpired()) return;
 
         if (!await _requestGate.WaitAsync(0).ConfigureAwait(false)) return; // busy - try again next tick
+        _gateHolder = "idle sweep";
         try
         {
             if (!IsReady || Model is null) return;
             if (!IsActiveExpired()) return;
 
+            ServerLog.Info($"keep-alive expired: unloading {Options.ModelId}");
             await StopSchedulerAsync().ConfigureAwait(false);
             DisposeActiveLiveFieldsKeepPathAndOptions();
             IsReady = false;
         }
-        finally { _requestGate.Release(); }
+        finally { ReleaseGate(); }
     }
 
     /// <summary>Background loop calling <see cref="SweepIdleAsync"/> on <paramref name="interval"/>. Runs
@@ -512,18 +601,19 @@ public sealed class ServerState : IDisposable
 
         if (targetsActive && Model is not null)
         {
-            await _requestGate.WaitAsync(ct).ConfigureAwait(false);
+            await AcquireGateAsync("unload", ct).ConfigureAwait(false);
             try
             {
                 if (Model is not null)
                 {
+                    ServerLog.Info($"unloading {Options.ModelId}");
                     await StopSchedulerAsync().ConfigureAwait(false);
                     DisposeActiveLiveFieldsKeepPathAndOptions();
                     IsReady = false;
                     unloaded.Add(Options.ModelId);
                 }
             }
-            finally { _requestGate.Release(); }
+            finally { ReleaseGate(); }
         }
 
         return unloaded;
@@ -681,6 +771,7 @@ public sealed class ServerState : IDisposable
         DraftGguf = loaded.DraftGguf;
         MtpActive = loaded.MtpActive;
         MtpStatus = loaded.MtpStatus;
+        RememberIssuedId(Options.ModelId, LoadedModelPath);
         EstimatedBytes = estimatedBytes;
         KeepAliveSecondsOverride = keepAliveOverride;
         IsReady = true;

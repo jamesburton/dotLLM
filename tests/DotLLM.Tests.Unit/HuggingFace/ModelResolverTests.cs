@@ -212,13 +212,83 @@ public sealed class ModelResolverTests : IDisposable
     }
 
     [Fact]
-    public void IdForPath_FileOutsideTheStores_FallsBackToItsStem()
+    public void IdForPath_FileOutsideTheStores_IsItsFullPath_NeverABareStem()
     {
         string loose = Path.Combine(_root, "loose", "my-model.gguf");
         Directory.CreateDirectory(Path.GetDirectoryName(loose)!);
         File.WriteAllBytes(loose, new byte[10]);
 
-        Assert.Equal("my-model", ModelResolver.IdForPath(loose, Mirror, Hub));
+        // #1021: a bare stem would be persisted by clients and could later resolve to a different (store) file of that name.
+        string id = ModelResolver.IdForPath(loose, Mirror, Hub);
+        Assert.Equal(Path.GetFullPath(loose), id);
+        Assert.Equal(Path.GetFullPath(loose), ModelResolver.ResolveLocal(id, null, Mirror, Hub));
+    }
+
+    /// <summary>
+    /// #1021: two repos' <c>q4_k_m.gguf</c> under one bare name. It used to resolve to the larger file (a model the client never named,
+    /// which then hung loading); it must fail and list both repo-qualified ids instead.
+    /// </summary>
+    [Theory]
+    [InlineData("q4_k_m")]
+    [InlineData("Q4_K_M")]
+    [InlineData("q4_k_m.gguf")]
+    public void ResolveLocal_BareNameMatchingTwoRepos_IsAmbiguous_AndListsEveryCandidate(string bare)
+    {
+        AddHub("Hcompany/Holo4-27B-GGUF", "q4_k_m.gguf", 100);
+        AddHub("Hcompany/Holo4-35B-A3B-GGUF", "q4_k_m.gguf", 200);
+
+        var ex = Assert.Throws<AmbiguousModelReferenceException>(() => ModelResolver.ResolveLocal(bare, null, Mirror, Hub));
+
+        Assert.Equal(bare, ex.Reference);
+        Assert.Equal(["Hcompany/Holo4-27B-GGUF/q4_k_m.gguf", "Hcompany/Holo4-35B-A3B-GGUF/q4_k_m.gguf"], ex.Candidates);
+        Assert.Contains("Hcompany/Holo4-27B-GGUF/q4_k_m.gguf", ex.Message);
+        Assert.Contains("Hcompany/Holo4-35B-A3B-GGUF/q4_k_m.gguf", ex.Message);
+    }
+
+    [Fact]
+    public void ResolveLocal_AmbiguousBareName_EachCandidateIdStillResolvesToItsOwnFile()
+    {
+        string small = AddHub("Hcompany/Holo4-27B-GGUF", "q4_k_m.gguf", 100);
+        string large = AddHub("Hcompany/Holo4-35B-A3B-GGUF", "q4_k_m.gguf", 200);
+
+        var ex = Assert.Throws<AmbiguousModelReferenceException>(() => ModelResolver.ResolveLocal("q4_k_m", null, Mirror, Hub));
+
+        // The listed ids are the way out: each must resolve, and to the right file.
+        Assert.Equal(small, ModelResolver.ResolveLocal(ex.Candidates[0], null, Mirror, Hub));
+        Assert.Equal(large, ModelResolver.ResolveLocal(ex.Candidates[1], null, Mirror, Hub));
+    }
+
+    [Fact]
+    public void ResolveLocal_SameFileReachableThroughMirrorAndHub_IsOneModel_NotAmbiguous()
+    {
+        // The flat mirror and the hub snapshot are two paths to ONE model - that must not count as two candidates.
+        AddHub("acme/linked", "q6_k.gguf", 100, mirror: true);
+
+        Assert.NotNull(ModelResolver.ResolveLocal("q6_k", null, Mirror, Hub));   // either path to the one file; no exception
+    }
+
+    [Fact]
+    public void ResolveLocal_AmbiguityIsPerName_NotPerSharedQuant()
+    {
+        // Only files sharing the requested NAME compete: model-Q4_K_M is a different name, so it neither joins nor breaks the tie.
+        AddHub("acme/a", "model-Q4_K_M.gguf", 100);
+        string q8 = AddHub("acme/b", "model-Q8_0.gguf", 100);
+        AddHub("acme/c", "model-Q8_0.gguf", 100);
+
+        var ex = Assert.Throws<AmbiguousModelReferenceException>(() => ModelResolver.ResolveLocal("model-Q8_0", null, Mirror, Hub));
+        Assert.Equal(2, ex.Candidates.Count);
+        Assert.NotNull(ModelResolver.ResolveLocal("model-Q4_K_M", null, Mirror, Hub));
+        Assert.Equal(q8, ModelResolver.ResolveLocal("acme/b/model-Q8_0.gguf", null, Mirror, Hub));
+    }
+
+    [Fact]
+    public void ResolveLocal_RepoReference_KeepsDefaultQuantChoice_NotAnAmbiguity()
+    {
+        // owner/repo names ONE model with several quants: choosing the default quant is documented behaviour, not a guess.
+        string q4 = AddHub("acme/one-model", "m-Q4_K_M.gguf", 100);
+        AddHub("acme/one-model", "m-Q8_0.gguf", 300);
+
+        Assert.Equal(q4, ModelResolver.ResolveLocal("acme/one-model", null, Mirror, Hub));
     }
 
     [Fact]
@@ -227,5 +297,92 @@ public sealed class ModelResolverTests : IDisposable
         string only = AddHub("acme/solo-stem", "q5_k_m.gguf", 100);
 
         Assert.Equal(only, ModelResolver.ResolveLocal("q5_k_m", null, Mirror, Hub));
+    }
+
+    /// <summary>
+    /// Review of #1021: the flat mirror keeps only the file NAME while the hub snapshot keeps its subfolder, so one file was listed twice
+    /// and a bare name reported it as ambiguous with itself.
+    /// </summary>
+    [Fact]
+    public void SubfolderSnapshotPlusFlatMirror_IsOneModel_ListedOnce_AndNotAmbiguousWithItself()
+    {
+        AddHub("acme/split", "Q4_K_M/model-Q4_K_M.gguf", 100, mirror: true);   // mirror: models/acme/split/model-Q4_K_M.gguf
+
+        var listed = ModelResolver.EnumerateLocal(Mirror, Hub);
+        Assert.Single(listed);
+        Assert.Equal("acme/split/Q4_K_M/model-Q4_K_M.gguf", ModelResolver.IdFor(listed[0]));   // the structural (snapshot) id wins
+        Assert.NotNull(ModelResolver.ResolveLocal("model-Q4_K_M", null, Mirror, Hub));         // no self-ambiguity
+        Assert.NotNull(ModelResolver.ResolveLocal("acme/split/model-Q4_K_M.gguf", null, Mirror, Hub));   // the flat id still resolves
+    }
+
+    /// <summary>Review of #1021: the id must not depend on which copy of a file was resolved (it was a stem for the losing copy).</summary>
+    [Fact]
+    public void IdForPath_IsTheSameForEitherCopyOfAFile()
+    {
+        string snap = AddHub("acme/split", "Q4_K_M/model-Q4_K_M.gguf", 100, mirror: true);
+        string mirror = HubCache.MirrorPath("acme/split", "Q4_K_M/model-Q4_K_M.gguf", Mirror);
+        Assert.True(File.Exists(mirror));
+
+        Assert.Equal("acme/split/Q4_K_M/model-Q4_K_M.gguf", ModelResolver.IdForPath(snap, Mirror, Hub));
+        Assert.Equal("acme/split/Q4_K_M/model-Q4_K_M.gguf", ModelResolver.IdForPath(mirror, Mirror, Hub));
+    }
+
+    [Fact]
+    public void Ambiguity_HasItsOwnErrorCode()
+    {
+        var ex = new AmbiguousModelReferenceException("q4_k_m", ["a/b/q4_k_m.gguf", "c/d/q4_k_m.gguf"]);
+        Assert.Equal("ambiguous_model", AmbiguousModelReferenceException.CodeFor(ex.Message));
+        Assert.Equal("model_not_found", AmbiguousModelReferenceException.CodeFor("Model not found: x"));
+    }
+
+    /// <summary>A file in snapshot <paramref name="commit"/>, last written at <paramref name="writtenUtc"/>; optionally hard-linked into the mirror.</summary>
+    private string AddRevision(string repo, string commit, string file, int size, DateTime writtenUtc, bool mirror = false)
+    {
+        string blob = Path.Combine(HubCache.RepoDirectory(repo, Hub), "blobs", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.GetDirectoryName(blob)!);
+        File.WriteAllBytes(blob, new byte[size]);
+        File.SetLastWriteTimeUtc(blob, writtenUtc);
+        string snap = HubCache.SnapshotFilePath(repo, commit, file, Hub);
+        Directory.CreateDirectory(Path.GetDirectoryName(snap)!);
+        HubCache.LinkOrCopy(blob, snap);
+        File.SetLastWriteTimeUtc(snap, writtenUtc);
+        if (mirror)
+        {
+            string m = HubCache.MirrorPath(repo, file, Mirror);
+            Directory.CreateDirectory(Path.GetDirectoryName(m)!);
+            if (File.Exists(m)) File.Delete(m);
+            HubCache.LinkOrCopy(blob, m);
+            File.SetLastWriteTimeUtc(m, writtenUtc);
+        }
+        return snap;
+    }
+
+    /// <summary>
+    /// Review round 2 of #1021: a re-upload leaves the old snapshot behind, usually with a different size. Both revisions share one id,
+    /// so they must be ONE entry and every resolution path must reach the NEWEST - a size-including key listed both and let enumeration
+    /// order pick, which could silently load the stale revision.
+    /// </summary>
+    [Fact]
+    public void TwoSnapshotRevisionsOfOneFile_AreOneModel_AndEveryPathResolvesTheNewest()
+    {
+        AddRevision("acme/rev", "0ld", "Q4_K_M/m-Q4_K_M.gguf", 300, DateTime.UtcNow.AddDays(-3));            // stale and LARGER
+        string fresh = AddRevision("acme/rev", "n3w", "Q4_K_M/m-Q4_K_M.gguf", 200, DateTime.UtcNow, mirror: true);
+
+        var listed = ModelResolver.EnumerateLocal(Mirror, Hub).Where(m => m.RepoId == "acme/rev").ToList();
+        Assert.Single(listed);
+        Assert.Equal(fresh, listed[0].FullPath);
+
+        foreach (string reference in new[] { "m-Q4_K_M", "m-Q4_K_M.gguf", "acme/rev/Q4_K_M/m-Q4_K_M.gguf", "acme/rev", "acme/rev:Q4_K_M", "acme/rev/m-Q4_K_M.gguf" })
+            Assert.Equal(200, ModelResolver.FileLength(ModelResolver.ResolveLocal(reference, null, Mirror, Hub)!));
+    }
+
+    /// <summary>Review round 2 of #1021: equal name and size in DIFFERENT subfolders are different files, not one.</summary>
+    [Fact]
+    public void SameNameAndSize_InDifferentSubfolders_AreTwoModels()
+    {
+        AddRevision("acme/two", "c0ffee", "a/x.gguf", 100, DateTime.UtcNow);
+        AddRevision("acme/two", "c0ffee", "b/x.gguf", 100, DateTime.UtcNow);
+
+        Assert.Equal(2, ModelResolver.EnumerateLocal(Mirror, Hub).Count(m => m.RepoId == "acme/two"));
     }
 }

@@ -778,6 +778,9 @@ public static class ServerStartup
         app.UseDeveloperExceptionPage();
         app.UseCors();
 
+        // (#1021) "[dotllm] req#N POST /v1/chat/completions" ... "done 200 in 3.2s" / "cancelled after 600.0s".
+        app.UseRequestLifecycleLog();
+
         // SDK observability headers (#452) — x-request-id, openai-processing-ms and the
         // x-ratelimit-* trio. Registered unconditionally and OUTSIDE the limiter so the headers
         // also land on its 429 short-circuit; the manager is null when limiting is off, in which
@@ -795,6 +798,9 @@ public static class ServerStartup
             app.UseDotLLMRateLimiting(rlm, apiKeyResolver!);
 
         app.MapDotLLMEndpoints(serveUi);
+
+        // (#1021) The startup model's id is one the server hands out too.
+        state.RememberIssuedId(state.Options.ModelId, state.LoadedModelPath);
 
         var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
         state.ShutdownToken = lifetime.ApplicationStopping;

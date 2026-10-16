@@ -303,6 +303,9 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
     /// <inheritdoc/>
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
     {
+        // Timestamp every "[dotllm] ..." line from here on, startup load included (#1021).
+        DotLLM.Server.ServerLog.InstallTimestamps();
+
         // Reject an unrecognised --device up front instead of serving on the CPU (#468/#790).
         if (DeviceSpec.TryParse(settings.Device, out _, out string? deviceError) is false)
         {
@@ -387,7 +390,8 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             if (resolvedPath is null)
                 return 1;
 
-            // The same key a later load/request of this file produces (repo-qualified), so /v1/models never reports a bare quant stem.
+            // The stable id of this file (#1021): owner/repo/rel for a store file, the full path for a file outside the stores - the same
+            // key a later load/request of it produces, and never a bare stem a client could persist and later see resolve elsewhere.
             serverOptions = serverOptions with { ModelId = ServerStartup.ModelIdFor(settings.Model, resolvedPath) };
 
             try

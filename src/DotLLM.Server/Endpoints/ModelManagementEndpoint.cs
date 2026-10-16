@@ -69,9 +69,20 @@ public static class ModelManagementEndpoint
             // An explicit file wins: resolving by repo+quant can pick a different GGUF from the same repo directory than the one the UI inspected.
             if (!string.IsNullOrEmpty(request.ModelPath) && ResolveExactPath(request.ModelPath, state) is null)
                 return Results.BadRequest(ErrorResponse.InvalidRequest($"Model file not found or not allowed: {request.ModelPath}", param: "path", code: "model_not_found"));
-            var resolvedPath = !string.IsNullOrEmpty(request.ModelPath)
-                ? ResolveExactPath(request.ModelPath, state)
-                : await ServerStartup.ResolveOrPullAsync(request.Model, request.Quant, state.Options.AutoPull, ct);
+            string? resolvedPath;
+            try
+            {
+                resolvedPath = !string.IsNullOrEmpty(request.ModelPath)
+                    ? ResolveExactPath(request.ModelPath, state)
+                    // An id this server handed out maps to the exact file it was minted for (#1021).
+                    : (request.Quant is null ? state.PathForIssuedId(request.Model) : null)
+                      ?? await ServerStartup.ResolveOrPullAsync(request.Model, request.Quant, state.Options.AutoPull, ct);
+            }
+            catch (AmbiguousModelReferenceException ex)
+            {
+                // (#1021) Two repos' q4_k_m.gguf: name one, never guess.
+                return Results.BadRequest(ErrorResponse.InvalidRequest(ex.Message, param: "model", code: AmbiguousModelReferenceException.ErrorCode));
+            }
             if (resolvedPath is null)
                 return Results.BadRequest(ErrorResponse.InvalidRequest(ServerStartup.NotFoundMessage(request.Model), param: "model", code: "model_not_found"));
 
@@ -124,6 +135,7 @@ public static class ModelManagementEndpoint
                     state.PrefixTrieManager = newState.PrefixTrieManager;
                     state.PagedFactory = newState.PagedFactory;
                     state.LoadedModelPath = resolvedPath;
+                    state.RememberIssuedId(state.Options.ModelId, resolvedPath);
                     state.CurrentGguf = newState.CurrentGguf;
                     state.DraftModel = newState.DraftModel;
                     state.DraftModelPath = newState.DraftModelPath;

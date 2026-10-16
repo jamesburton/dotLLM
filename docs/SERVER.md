@@ -258,6 +258,26 @@ disagree with list — including on a bare server, where the configured-but-unlo
 retrieves rather than 404s. An unknown id returns `404` with
 `{"error": {"type": "not_found_error", "code": "model_not_found", "param": "model", ...}}`.
 
+## Server console log (#1021)
+
+`dotllm serve` timestamps every `[dotllm]` line (local time) and logs each `POST` request's lifecycle tersely, so an incident can be
+reconstructed from the console:
+
+```
+2026-10-16 16:08:27.406 [dotllm] req#1 POST /v1/chat/completions
+2026-10-16 16:08:27.459 [dotllm] req#1 model=QuantFactory/SmolLM-135M-GGUF/SmolLM-135M.Q8_0.gguf
+2026-10-16 16:08:27.677 [dotllm] req#1 loading QuantFactory/SmolLM-135M-GGUF/SmolLM-135M.Q8_0.gguf from C:\...\SmolLM-135M.Q8_0.gguf (active: none)
+2026-10-16 16:08:41.207 [dotllm] req#1 loaded QuantFactory/SmolLM-135M-GGUF/SmolLM-135M.Q8_0.gguf in 13.5s
+2026-10-16 16:08:42.160 [dotllm] req#1 done 200 in 14.8s
+2026-10-16 16:09:02.446 [dotllm] req#6 waiting for the server lock (generate); held by req#5 generate
+2026-10-16 16:09:04.454 [dotllm] req#6 gave up waiting for the server lock after 2.0s (cancelled)
+2026-10-16 16:09:04.454 [dotllm] req#6 cancelled (client disconnected) after 2.0s
+```
+
+Logged: arrival (method + path), the requested `model`, lock waits (only when contended, naming the holder), model loads (start, end,
+duration, or the failure), idle-unload / explicit unload, and completion (status + duration) or cancellation. `GET`s (health / props polling)
+are not logged. Spectre.Console output (banner, spinners) is not stamped.
+
 ## Model names, the hub cache and pulling (#714)
 
 One resolver (`DotLLM.HuggingFace.ModelResolver`) turns a model name into a GGUF everywhere - `dotllm run|chat|serve|bench`, a request's `model`
@@ -270,7 +290,28 @@ field, and `POST /v1/models/load`:
 | `owner/repo:Q8_0` | the file whose name contains the tag (`:latest` = the default); the legacy `--quant` is the same thing |
 | `owner/repo/file.gguf` | that file |
 | `hf.co/owner/repo:tag`, `hf://owner/repo` | same as `owner/repo[:tag]` |
-| `Tev1-4B-experimental-Q4_K_M` | a local file by stem or filename - the key `GET /v1/models` reports |
+| `Tev1-4B-experimental-Q4_K_M` | a local file by stem or filename, **only when exactly one local model has that name** (see below) |
+
+**Ambiguous bare names are an error (#1021).** Ids are repo-qualified (`owner/repo/file.gguf`), but a bare stem or filename is still accepted
+for clients holding an old id. When it matches more than one local model - typically a quant filename such as `q4_k_m.gguf` shipped by several
+repos - nothing is guessed: every surface (chat, completions, messages, embeddings, `/api/*`, `POST /v1/models/load`, and the CLI) fails with the
+candidate ids, and nothing is loaded:
+
+```json
+{"type":"error","error":{"message":"Model name 'q4_k_m' is ambiguous: it matches 2 local models. Use the full id of one of: Hcompany/Holo4-27B-GGUF/q4_k_m.gguf, Hcompany/Holo4-35B-A3B-GGUF/q4_k_m.gguf",
+  "type":"invalid_request_error","param":"model","code":"ambiguous_model"}}
+```
+
+(HTTP 400; ollama's `/api/*` uses its own `{"error": "..."}` shape.) It used to resolve to the highest-ranked file (quant preference, then the
+largest), which loaded a 35B model the client never named. `owner/repo[:tag]` is unaffected: choosing the default quant within one repo is a
+choice among quants of one model, not an ambiguity. The OpenAI-shaped surfaces use `code: "ambiguous_model"` (a missing model is still
+`model_not_found`); the Anthropic surface has no code field. One physical file reachable through both the flat mirror and the hub
+snapshot (where it may sit in a subfolder) is one model, never ambiguous with itself.
+
+**Stable ids.** An id is derived from the file's place in the stores - `owner/repo/<path in the snapshot>` - so it is the same whichever
+copy was opened and across reloads; a file outside the stores (`dotllm serve C:\x\model.gguf`, `model_path` on `/v1/models/load`) is
+identified by its full path, never a bare stem a client could persist and later see resolve to a different file. The server also remembers
+every id it has handed out and maps it back to that exact file first, before any name resolution.
 
 Local models are found in **both** the flat mirror (`~/.dotllm/models/{owner}/{repo}`) and the Hugging Face hub cache
 (`HF_HUB_CACHE` / `HF_HOME/hub` / `~/.cache/huggingface/hub`, symlinked or hard-linked snapshots), so files fetched by `hf download` or another

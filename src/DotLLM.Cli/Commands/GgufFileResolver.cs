@@ -24,7 +24,18 @@ internal static class GgufFileResolver
         if (File.Exists(fileArg))
             return Path.GetFullPath(fileArg);
 
-        string? local = ModelResolver.ResolveLocal(fileArg, quant, includeOllama: true);
+        string? local;
+        try
+        {
+            local = ModelResolver.ResolveLocal(fileArg, quant, includeOllama: true);
+        }
+        catch (AmbiguousModelReferenceException ex)
+        {
+            // (#1021) Several local models share this name: list them rather than load whichever is largest.
+            PrintAmbiguous(ex);
+            return null;
+        }
+
         if (local is not null)
             return local;
 
@@ -57,6 +68,14 @@ internal static class GgufFileResolver
             ? $"[grey]Download it with:[/] dotllm model pull {fileArg.EscapeMarkup()}"
             : "[grey]Pass a .gguf path, an 'owner/repo[:quant]' Hugging Face reference, or the name of a model from 'dotllm model list'.[/]");
         return null;
+    }
+
+    /// <summary>Prints an ambiguous-name error with one candidate id per line (#1021).</summary>
+    internal static void PrintAmbiguous(AmbiguousModelReferenceException ex)
+    {
+        AnsiConsole.MarkupLine($"[red]Model name '{ex.Reference.EscapeMarkup()}' is ambiguous[/] - it matches {ex.Candidates.Count} local models. Use one of:");
+        foreach (string id in ex.Candidates)
+            AnsiConsole.MarkupLine($"  {id.EscapeMarkup()}");
     }
 
     internal static string PullOllamaWithProgress(OllamaRef reference)

@@ -80,16 +80,61 @@ public static class ModelResolver
             : $"{model.RepoId}/{model.Filename}";
 
     /// <summary>
-    /// <see cref="IdFor(LocalModel)"/> for a resolved file path: the qualified id when the file is a known local model, else the file stem
-    /// (an explicit path outside the model stores has no repo to qualify it with).
+    /// <see cref="IdFor(LocalModel)"/> for a resolved file path, derived from the file's place in the stores so it is the SAME id however
+    /// the file was reached (#1021): the listed model at that path; else the hub-cache layout (<c>models--o--r/snapshots/rev/rel</c> ->
+    /// <c>o/r/rel</c>) or the mirror layout (<c>{modelsDir}/o/r/f</c> -> the listed id of that repo's file, else <c>o/r/f</c>). A file
+    /// outside the stores gets its full path - never a bare stem, which a client would persist and which could later name another file.
     /// </summary>
+    /// <param name="path">The resolved GGUF path.</param>
+    /// <param name="modelsDir">The flat mirror root; the default when null.</param>
+    /// <param name="cacheRoot">The hub cache root; the default when null.</param>
+    /// <returns>The stable id.</returns>
     public static string IdForPath(string path, string? modelsDir = null, string? cacheRoot = null)
     {
         string full;
-        try { full = Path.GetFullPath(path); } catch { return Path.GetFileNameWithoutExtension(path); }
-        var match = EnumerateLocal(modelsDir, cacheRoot).FirstOrDefault(m =>
-            string.Equals(SafeFullPath(m.FullPath), full, StringComparison.OrdinalIgnoreCase));
-        return match is null ? Path.GetFileNameWithoutExtension(path) : IdFor(match);
+        try { full = Path.GetFullPath(path); } catch { return path; }
+        var all = EnumerateLocal(modelsDir, cacheRoot);
+        var match = all.FirstOrDefault(m => string.Equals(SafeFullPath(m.FullPath), full, StringComparison.OrdinalIgnoreCase));
+        if (match is not null) return IdFor(match);
+
+        if (TryRelativeTo(full, cacheRoot ?? HubCache.CacheRoot, out var hub) && hub.Length >= 4
+            && hub[0].StartsWith("models--", StringComparison.Ordinal) && hub[1] == "snapshots")
+        {
+            string folder = hub[0]["models--".Length..];
+            int sep = folder.IndexOf("--", StringComparison.Ordinal);
+            if (sep > 0)
+                return $"{folder[..sep]}/{folder[(sep + 2)..]}/{string.Join('/', hub[3..])}";
+        }
+
+        if (TryRelativeTo(full, modelsDir ?? HuggingFaceDownloader.DefaultModelsDirectory, out var mirror) && mirror.Length >= 3)
+        {
+            string repo = $"{mirror[0]}/{mirror[1]}";
+            long length = SafeLength(full);
+            // The flat mirror keeps only the file name; the listed (snapshot) copy of the same file may sit in a subfolder.
+            var same = all.FirstOrDefault(m => m.RepoId.Equals(repo, StringComparison.OrdinalIgnoreCase)
+                && Path.GetFileName(m.Filename).Equals(mirror[^1], StringComparison.OrdinalIgnoreCase) && m.SizeBytes == length);
+            return same is not null ? IdFor(same) : $"{repo}/{string.Join('/', mirror[2..])}";
+        }
+
+        return full;
+    }
+
+    private static bool TryRelativeTo(string full, string root, out string[] segments)
+    {
+        segments = [];
+        try
+        {
+            string rel = Path.GetRelativePath(Path.GetFullPath(root), full);
+            if (rel.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(rel)) return false;
+            segments = rel.Split(['/', '\\'], StringSplitOptions.RemoveEmptyEntries);
+            return true;
+        }
+        catch { return false; }
+    }
+
+    private static long SafeLength(string path)
+    {
+        try { return FileLength(path); } catch { return -1; }
     }
 
     /// <summary>True when <paramref name="name"/> addresses <paramref name="model"/> by its id, file stem, or filename.</summary>
@@ -107,17 +152,28 @@ public static class ModelResolver
     /// <summary>Every local GGUF (mirror + hub cache), de-duplicated by repo and filename. Never throws.</summary>
     public static List<LocalModel> EnumerateLocal(string? modelsDir = null, string? cacheRoot = null, bool includeOllama = false, string? ollamaRoot = null)
     {
+        // Keyed on repo + RELATIVE path, newest wins: two snapshot revisions of one file (a re-upload leaves the old snapshot dir behind,
+        // usually with a different size) are one id, and the newest revision is the one every resolution path sees.
         var byKey = new Dictionary<string, LocalModel>(StringComparer.OrdinalIgnoreCase);
+        static LocalModel? Normalise(LocalModel m)
+        {
+            if (Path.GetFileName(m.Filename).StartsWith("mmproj", StringComparison.OrdinalIgnoreCase)) return null;   // multimodal projector, not a model
+            if (SplitGguf.IsLaterShard(m.Filename)) return null;   // shard 2..N is part of the set listed under shard 1 (#756)
+            return SplitGguf.IsFirstShard(m.Filename) ? m with { SizeBytes = SplitGguf.TotalLength(m.FullPath) } : m;
+        }
         void Add(LocalModel m)
         {
-            if (Path.GetFileName(m.Filename).StartsWith("mmproj", StringComparison.OrdinalIgnoreCase)) return;   // multimodal projector, not a model
-            if (SplitGguf.IsLaterShard(m.Filename)) return;   // shard 2..N is part of the set listed under shard 1 (#756)
-            if (SplitGguf.IsFirstShard(m.Filename)) m = m with { SizeBytes = SplitGguf.TotalLength(m.FullPath) };
-            string key = m.RepoId + "|" + m.Filename;
-            if (!byKey.TryGetValue(key, out var have) || m.DownloadedAt > have.DownloadedAt) byKey[key] = m;
+            if (Normalise(m) is not { } n) return;
+            string key = n.RepoId + "|" + n.Filename;
+            if (!byKey.TryGetValue(key, out var have) || n.DownloadedAt > have.DownloadedAt) byKey[key] = n;
         }
 
-        try { foreach (var m in HuggingFaceDownloader.ListLocalModels(modelsDir)) Add(m); } catch { /* unreadable mirror: skip */ }
+        // The flat mirror is merged AFTER the hub cache: it keeps only the file NAME, while the snapshot may keep a subfolder
+        // ("Q4_K_M/model-00001-of-00002.gguf"). A mirror entry with the same repo, file name and SIZE as a subfolder snapshot entry is
+        // that same file (#1021): it is not listed again, so a bare name is never ambiguous with itself and the id stays the snapshot's.
+        // Size is used only for this mirror-to-snapshot match, never between snapshots (where it would split revisions).
+        var mirror = new List<LocalModel>();
+        try { foreach (var m in HuggingFaceDownloader.ListLocalModels(modelsDir)) if (Normalise(m) is { } n) mirror.Add(n); } catch { /* unreadable mirror: skip */ }
 
         try
         {
@@ -148,6 +204,14 @@ public static class ModelResolver
         }
         catch { /* unreadable cache: skip */ }
 
+        foreach (var m in mirror)
+        {
+            bool sameAsSnapshot = !byKey.ContainsKey(m.RepoId + "|" + m.Filename) && byKey.Values.Any(h =>
+                h.RepoId.Equals(m.RepoId, StringComparison.OrdinalIgnoreCase) && h.Filename.Contains('/')
+                && Path.GetFileName(h.Filename).Equals(m.Filename, StringComparison.OrdinalIgnoreCase) && h.SizeBytes == m.SizeBytes);
+            if (!sameAsSnapshot) Add(m);
+        }
+
         if (includeOllama)
         {
             // Models of an existing ollama installation, read in place (no copy): repo "ollama/{name}", file "{name}-{tag}.gguf".
@@ -165,6 +229,9 @@ public static class ModelResolver
     /// Resolves a reference to a local GGUF path, or null when nothing local matches (the caller may then pull).
     /// <paramref name="quant"/> (the legacy <c>--quant</c> option) is equivalent to a <c>:tag</c>.
     /// </summary>
+    /// <exception cref="AmbiguousModelReferenceException">
+    /// A bare name (file stem or filename, no repo) matches more than one local model; the exception lists their ids (#1021).
+    /// </exception>
     public static string? ResolveLocal(string arg, string? quant = null, string? modelsDir = null, string? cacheRoot = null,
         bool includeOllama = false, string? ollamaRoot = null)
     {
@@ -197,15 +264,32 @@ public static class ModelResolver
             if (r.Filename is not null)
             {
                 var exact = inRepo.FirstOrDefault(m => m.Filename.Equals(r.Filename, StringComparison.OrdinalIgnoreCase));
-                return exact?.FullPath;
+                if (exact is not null) return exact.FullPath;
+                // An id minted from the flat mirror (no subfolder) still names the one file of that name in the repo.
+                var byName = inRepo.Where(m => Path.GetFileName(m.Filename).Equals(r.Filename, StringComparison.OrdinalIgnoreCase)).ToList();
+                return byName.Count == 1 ? byName[0].FullPath : null;
             }
             return ChooseFile(inRepo, tag)?.FullPath;
         }
 
         // Bare name: a file stem (the id /v1/models reported before ids were repo-qualified), or the full filename.
+        // Unlike a repo reference (one model, several quants: picking the default quant is the documented behaviour), several
+        // matches here are DIFFERENT models that merely share a filename - e.g. two repos both shipping q4_k_m.gguf. Picking one
+        // (it used to be the largest) loads a model the caller never named, so it is an error that lists the unambiguous ids (#1021).
         string name = r.Filename ?? arg;
-        var named = all.Where(m => IsNamedBy(m, name)).ToList();
+        var named = Eligible(all.Where(m => IsNamedBy(m, name)), tag)
+            .GroupBy(IdFor, StringComparer.OrdinalIgnoreCase).Select(g => g.First()).ToList();   // one id = one model, never ambiguous with itself
+        if (named.Count > 1)
+            throw new AmbiguousModelReferenceException(arg, named.Select(IdFor).ToList());
         return ChooseFile(named, tag)?.FullPath;
+    }
+
+    /// <summary>The candidates <see cref="ChooseFile"/> chooses among: shard 2..N dropped, then filtered to <paramref name="tag"/> when given.</summary>
+    private static List<LocalModel> Eligible(IEnumerable<LocalModel> candidates, string? tag)
+    {
+        var pool = candidates.Where(m => !IsLaterShard(m.Filename));
+        if (tag is not null) pool = pool.Where(m => m.Filename.Contains(tag, StringComparison.OrdinalIgnoreCase));
+        return pool.ToList();
     }
 
     private static bool HasGgufMagic(string path)
@@ -240,8 +324,7 @@ public static class ModelResolver
     /// </summary>
     public static LocalModel? ChooseFile(IReadOnlyList<LocalModel> candidates, string? tag)
     {
-        var pool = candidates.Where(m => !IsLaterShard(m.Filename)).ToList();
-        if (tag is not null) pool = pool.Where(m => m.Filename.Contains(tag, StringComparison.OrdinalIgnoreCase)).ToList();
+        var pool = Eligible(candidates, tag);
         if (pool.Count == 0) return null;
         return pool.OrderBy(m => QuantRank(m.Filename)).ThenByDescending(m => m.SizeBytes).First();
     }
