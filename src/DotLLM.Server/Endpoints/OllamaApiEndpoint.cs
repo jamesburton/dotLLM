@@ -181,7 +181,9 @@ public static class OllamaApiEndpoint
         var result = new List<(string, string, long, DateTimeOffset, string?)>();
         foreach (var (name, profile) in ModelProfileStore.List())
         {
-            string? path = ModelResolver.ResolveLocal(profile.From ?? "", null, includeOllama: true);
+            string? path;
+            try { path = ModelResolver.ResolveLocal(profile.From ?? "", null, includeOllama: true); }
+            catch (AmbiguousModelReferenceException) { path = null; }   // listed unresolved; a request naming it gets the candidate list (#1021)
             long size = path is null ? 0 : ModelResolver.FileLength(path);
             result.Add((name, path ?? profile.From ?? "", size, path is null ? DateTimeOffset.UtcNow : File.GetLastWriteTimeUtc(path), QuantOf(path ?? profile.From)));
         }
@@ -263,7 +265,9 @@ public static class OllamaApiEndpoint
 
         var profileChain = ModelProfileStore.Resolve(name);
         var profile = profileChain is { } rc ? ModelProfileStore.Merge(rc.Chain) : null;
-        string? path = ServerStartup.ResolveModelPath(name, null);
+        string? path;
+        try { path = ServerStartup.ResolveModelPath(name, null); }
+        catch (AmbiguousModelReferenceException ex) { await Error(c, 400, ex.Message); return; }
         if (path is null) { await Error(c, 404, $"model '{name}' not found"); return; }
 
         var mf = new StringBuilder($"FROM {profile?.From ?? path}\n");

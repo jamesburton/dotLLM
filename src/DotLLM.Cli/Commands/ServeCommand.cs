@@ -303,6 +303,9 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
     /// <inheritdoc/>
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
     {
+        // Timestamp every "[dotllm] ..." line from here on, startup load included (#1021).
+        DotLLM.Server.ServerLog.InstallTimestamps();
+
         // Reject an unrecognised --device up front instead of serving on the CPU (#468/#790).
         if (DeviceSpec.TryParse(settings.Device, out _, out string? deviceError) is false)
         {

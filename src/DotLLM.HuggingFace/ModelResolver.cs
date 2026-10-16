@@ -165,6 +165,9 @@ public static class ModelResolver
     /// Resolves a reference to a local GGUF path, or null when nothing local matches (the caller may then pull).
     /// <paramref name="quant"/> (the legacy <c>--quant</c> option) is equivalent to a <c>:tag</c>.
     /// </summary>
+    /// <exception cref="AmbiguousModelReferenceException">
+    /// A bare name (file stem or filename, no repo) matches more than one local model; the exception lists their ids (#1021).
+    /// </exception>
     public static string? ResolveLocal(string arg, string? quant = null, string? modelsDir = null, string? cacheRoot = null,
         bool includeOllama = false, string? ollamaRoot = null)
     {
@@ -203,9 +206,22 @@ public static class ModelResolver
         }
 
         // Bare name: a file stem (the id /v1/models reported before ids were repo-qualified), or the full filename.
+        // Unlike a repo reference (one model, several quants: picking the default quant is the documented behaviour), several
+        // matches here are DIFFERENT models that merely share a filename - e.g. two repos both shipping q4_k_m.gguf. Picking one
+        // (it used to be the largest) loads a model the caller never named, so it is an error that lists the unambiguous ids (#1021).
         string name = r.Filename ?? arg;
-        var named = all.Where(m => IsNamedBy(m, name)).ToList();
+        var named = Eligible(all.Where(m => IsNamedBy(m, name)), tag);
+        if (named.Count > 1)
+            throw new AmbiguousModelReferenceException(arg, named.Select(IdFor).ToList());
         return ChooseFile(named, tag)?.FullPath;
+    }
+
+    /// <summary>The candidates <see cref="ChooseFile"/> chooses among: shard 2..N dropped, then filtered to <paramref name="tag"/> when given.</summary>
+    private static List<LocalModel> Eligible(IEnumerable<LocalModel> candidates, string? tag)
+    {
+        var pool = candidates.Where(m => !IsLaterShard(m.Filename));
+        if (tag is not null) pool = pool.Where(m => m.Filename.Contains(tag, StringComparison.OrdinalIgnoreCase));
+        return pool.ToList();
     }
 
     private static bool HasGgufMagic(string path)
@@ -240,8 +256,7 @@ public static class ModelResolver
     /// </summary>
     public static LocalModel? ChooseFile(IReadOnlyList<LocalModel> candidates, string? tag)
     {
-        var pool = candidates.Where(m => !IsLaterShard(m.Filename)).ToList();
-        if (tag is not null) pool = pool.Where(m => m.Filename.Contains(tag, StringComparison.OrdinalIgnoreCase)).ToList();
+        var pool = Eligible(candidates, tag);
         if (pool.Count == 0) return null;
         return pool.OrderBy(m => QuantRank(m.Filename)).ThenByDescending(m => m.SizeBytes).First();
     }

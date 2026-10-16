@@ -34,6 +34,9 @@ public sealed class ServerState : IDisposable
 {
     private readonly SemaphoreSlim _requestGate = new(1, 1);
 
+    /// <summary>Who holds <see cref="_requestGate"/> (<c>req#3 generate</c>), for the lock-wait log line (#1021). Null when free.</summary>
+    private volatile string? _gateHolder;
+
     /// <summary>Server startup options (updated on model swap).</summary>
     public required ServerOptions Options { get; set; }
 
@@ -252,7 +255,7 @@ public sealed class ServerState : IDisposable
     /// </remarks>
     public async Task ExecuteAsync(Func<Task> work, CancellationToken ct)
     {
-        await _requestGate.WaitAsync(ct);
+        await AcquireGateAsync("generate", ct).ConfigureAwait(false);
         try
         {
             using var lease = Scheduler is { } scheduler
@@ -260,7 +263,39 @@ public sealed class ServerState : IDisposable
                 : null;
             await work();
         }
-        finally { _requestGate.Release(); }
+        finally { ReleaseGate(); }
+    }
+
+    /// <summary>
+    /// Takes <see cref="_requestGate"/>, logging (#1021) when it is not immediately free: who holds it, then how long the wait took.
+    /// An uncontended acquire logs nothing.
+    /// </summary>
+    private async Task AcquireGateAsync(string purpose, CancellationToken ct)
+    {
+        string me = ServerLog.RequestTag is { } tag ? $"{tag} {purpose}" : purpose;
+        if (!_requestGate.Wait(0))
+        {
+            ServerLog.Info($"waiting for the server lock ({purpose}); held by {_gateHolder ?? "?"}");
+            long start = System.Diagnostics.Stopwatch.GetTimestamp();
+            try
+            {
+                await _requestGate.WaitAsync(ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                ServerLog.Info($"gave up waiting for the server lock after {ServerLog.Duration(System.Diagnostics.Stopwatch.GetElapsedTime(start))} (cancelled)");
+                throw;
+            }
+            ServerLog.Info($"acquired the server lock after {ServerLog.Duration(System.Diagnostics.Stopwatch.GetElapsedTime(start))}");
+        }
+        _gateHolder = me;
+    }
+
+    /// <summary>Releases <see cref="_requestGate"/> taken by <see cref="AcquireGateAsync"/>.</summary>
+    private void ReleaseGate()
+    {
+        _gateHolder = null;
+        _requestGate.Release();
     }
 
     /// <summary>
@@ -275,8 +310,10 @@ public sealed class ServerState : IDisposable
     /// </summary>
     public async Task SwapModelAsync(Func<Task> loadAction, CancellationToken ct)
     {
-        await _requestGate.WaitAsync(ct);
+        await AcquireGateAsync("model load", ct).ConfigureAwait(false);
         IsReady = false;
+        long start = System.Diagnostics.Stopwatch.GetTimestamp();
+        ServerLog.Info("model load started (POST /v1/models/load)");
         try
         {
             await StopSchedulerAsync().ConfigureAwait(false);
@@ -285,10 +322,16 @@ public sealed class ServerState : IDisposable
             await loadAction();
             IsReady = true;
             LastUsedUtc = DateTimeOffset.UtcNow;
+            ServerLog.Info($"model loaded: {Options.ModelId} in {ServerLog.Duration(System.Diagnostics.Stopwatch.GetElapsedTime(start))}");
 
             Residency.EnforceBudget(EstimatedBytes);
         }
-        finally { _requestGate.Release(); }
+        catch (Exception ex)
+        {
+            ServerLog.Info($"model load failed after {ServerLog.Duration(System.Diagnostics.Stopwatch.GetElapsedTime(start))}: {ex.Message}");
+            throw;
+        }
+        finally { ReleaseGate(); }
     }
 
     /// <summary>
@@ -307,13 +350,17 @@ public sealed class ServerState : IDisposable
     /// <param name="ct">Cancellation token for the load/reload, if one is needed.</param>
     public async Task<string?> EnsureActiveAsync(string? requestedModel, double? keepAliveOverride, CancellationToken ct)
     {
+        if (ServerLog.RequestTag is not null)
+            ServerLog.Info($"model={(string.IsNullOrWhiteSpace(requestedModel) ? "(active)" : requestedModel)}");
+
         if (MatchesActiveAndReady(requestedModel))
         {
             Touch(keepAliveOverride);
             return null;
         }
 
-        await _requestGate.WaitAsync(ct);
+        await AcquireGateAsync("model activation", ct).ConfigureAwait(false);
+        long loadStart = 0;
         try
         {
             if (MatchesActiveAndReady(requestedModel))
@@ -381,20 +428,25 @@ public sealed class ServerState : IDisposable
                 incomingBytes = SafeFileLength(resolvedPath);
             }
 
+            ServerLog.Info($"loading {loadOptions.ModelId} from {reloadPath} (active: {(Model is null ? "none" : Options.ModelId)})");
+            loadStart = System.Diagnostics.Stopwatch.GetTimestamp();
             var loaded = await Task.Run(() => ServerStartup.LoadModel(reloadPath, loadOptions), ct).ConfigureAwait(false);
 
             await StopSchedulerAsync().ConfigureAwait(false);
             StashOrDropActiveLocked();
             InstallLoadedModelLocked(loaded, incomingBytes, keepAliveOverride);
             Residency.EnforceBudget(EstimatedBytes);
+            ServerLog.Info($"loaded {Options.ModelId} in {ServerLog.Duration(System.Diagnostics.Stopwatch.GetElapsedTime(loadStart))}");
             return null;
         }
         catch (Exception ex)
         {
+            if (loadStart != 0)
+                ServerLog.Info($"load failed after {ServerLog.Duration(System.Diagnostics.Stopwatch.GetElapsedTime(loadStart))}: {ex.Message}");
             IsReady = Model is not null;
             return ex.Message;
         }
-        finally { _requestGate.Release(); }
+        finally { ReleaseGate(); }
     }
 
     /// <summary>
@@ -436,16 +488,18 @@ public sealed class ServerState : IDisposable
         if (!IsActiveExpired()) return;
 
         if (!await _requestGate.WaitAsync(0).ConfigureAwait(false)) return; // busy - try again next tick
+        _gateHolder = "idle sweep";
         try
         {
             if (!IsReady || Model is null) return;
             if (!IsActiveExpired()) return;
 
+            ServerLog.Info($"keep-alive expired: unloading {Options.ModelId}");
             await StopSchedulerAsync().ConfigureAwait(false);
             DisposeActiveLiveFieldsKeepPathAndOptions();
             IsReady = false;
         }
-        finally { _requestGate.Release(); }
+        finally { ReleaseGate(); }
     }
 
     /// <summary>Background loop calling <see cref="SweepIdleAsync"/> on <paramref name="interval"/>. Runs
@@ -512,18 +566,19 @@ public sealed class ServerState : IDisposable
 
         if (targetsActive && Model is not null)
         {
-            await _requestGate.WaitAsync(ct).ConfigureAwait(false);
+            await AcquireGateAsync("unload", ct).ConfigureAwait(false);
             try
             {
                 if (Model is not null)
                 {
+                    ServerLog.Info($"unloading {Options.ModelId}");
                     await StopSchedulerAsync().ConfigureAwait(false);
                     DisposeActiveLiveFieldsKeepPathAndOptions();
                     IsReady = false;
                     unloaded.Add(Options.ModelId);
                 }
             }
-            finally { _requestGate.Release(); }
+            finally { ReleaseGate(); }
         }
 
         return unloaded;

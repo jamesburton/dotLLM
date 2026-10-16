@@ -221,6 +221,73 @@ public sealed class ModelResolverTests : IDisposable
         Assert.Equal("my-model", ModelResolver.IdForPath(loose, Mirror, Hub));
     }
 
+    /// <summary>
+    /// #1021: two repos' <c>q4_k_m.gguf</c> under one bare name. It used to resolve to the larger file (a model the client never named,
+    /// which then hung loading); it must fail and list both repo-qualified ids instead.
+    /// </summary>
+    [Theory]
+    [InlineData("q4_k_m")]
+    [InlineData("Q4_K_M")]
+    [InlineData("q4_k_m.gguf")]
+    public void ResolveLocal_BareNameMatchingTwoRepos_IsAmbiguous_AndListsEveryCandidate(string bare)
+    {
+        AddHub("Hcompany/Holo4-27B-GGUF", "q4_k_m.gguf", 100);
+        AddHub("Hcompany/Holo4-35B-A3B-GGUF", "q4_k_m.gguf", 200);
+
+        var ex = Assert.Throws<AmbiguousModelReferenceException>(() => ModelResolver.ResolveLocal(bare, null, Mirror, Hub));
+
+        Assert.Equal(bare, ex.Reference);
+        Assert.Equal(["Hcompany/Holo4-27B-GGUF/q4_k_m.gguf", "Hcompany/Holo4-35B-A3B-GGUF/q4_k_m.gguf"], ex.Candidates);
+        Assert.Contains("Hcompany/Holo4-27B-GGUF/q4_k_m.gguf", ex.Message);
+        Assert.Contains("Hcompany/Holo4-35B-A3B-GGUF/q4_k_m.gguf", ex.Message);
+    }
+
+    [Fact]
+    public void ResolveLocal_AmbiguousBareName_EachCandidateIdStillResolvesToItsOwnFile()
+    {
+        string small = AddHub("Hcompany/Holo4-27B-GGUF", "q4_k_m.gguf", 100);
+        string large = AddHub("Hcompany/Holo4-35B-A3B-GGUF", "q4_k_m.gguf", 200);
+
+        var ex = Assert.Throws<AmbiguousModelReferenceException>(() => ModelResolver.ResolveLocal("q4_k_m", null, Mirror, Hub));
+
+        // The listed ids are the way out: each must resolve, and to the right file.
+        Assert.Equal(small, ModelResolver.ResolveLocal(ex.Candidates[0], null, Mirror, Hub));
+        Assert.Equal(large, ModelResolver.ResolveLocal(ex.Candidates[1], null, Mirror, Hub));
+    }
+
+    [Fact]
+    public void ResolveLocal_SameFileReachableThroughMirrorAndHub_IsOneModel_NotAmbiguous()
+    {
+        // The flat mirror and the hub snapshot are two paths to ONE model - that must not count as two candidates.
+        AddHub("acme/linked", "q6_k.gguf", 100, mirror: true);
+
+        Assert.NotNull(ModelResolver.ResolveLocal("q6_k", null, Mirror, Hub));   // either path to the one file; no exception
+    }
+
+    [Fact]
+    public void ResolveLocal_AmbiguityIsPerName_NotPerSharedQuant()
+    {
+        // Only files sharing the requested NAME compete: model-Q4_K_M is a different name, so it neither joins nor breaks the tie.
+        AddHub("acme/a", "model-Q4_K_M.gguf", 100);
+        string q8 = AddHub("acme/b", "model-Q8_0.gguf", 100);
+        AddHub("acme/c", "model-Q8_0.gguf", 100);
+
+        var ex = Assert.Throws<AmbiguousModelReferenceException>(() => ModelResolver.ResolveLocal("model-Q8_0", null, Mirror, Hub));
+        Assert.Equal(2, ex.Candidates.Count);
+        Assert.NotNull(ModelResolver.ResolveLocal("model-Q4_K_M", null, Mirror, Hub));
+        Assert.Equal(q8, ModelResolver.ResolveLocal("acme/b/model-Q8_0.gguf", null, Mirror, Hub));
+    }
+
+    [Fact]
+    public void ResolveLocal_RepoReference_KeepsDefaultQuantChoice_NotAnAmbiguity()
+    {
+        // owner/repo names ONE model with several quants: choosing the default quant is documented behaviour, not a guess.
+        string q4 = AddHub("acme/one-model", "m-Q4_K_M.gguf", 100);
+        AddHub("acme/one-model", "m-Q8_0.gguf", 300);
+
+        Assert.Equal(q4, ModelResolver.ResolveLocal("acme/one-model", null, Mirror, Hub));
+    }
+
     [Fact]
     public void ResolveLocal_BareStemStillResolves_ForClientsHoldingAnOldId()
     {
