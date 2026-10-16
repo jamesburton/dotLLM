@@ -156,7 +156,7 @@ public sealed class OllamaInteropTests : IDisposable
             Environment.SetEnvironmentVariable("OLLAMA_MODELS", Store);
             Assert.Equal("tiny:3b", ServerStartup.ModelIdFor("tiny:3b", blob));
             Assert.Equal("tiny:3b", ServerStartup.ModelIdFor("ollama:tiny:3b", blob));
-            Assert.StartsWith("sha256-", ServerStartup.ModelIdFor(blob, blob));   // addressed by path: nothing better to call it
+            Assert.Equal(Path.GetFullPath(blob), ServerStartup.ModelIdFor(blob, blob));   // addressed by path: its full path (#1021: never a bare stem)
         }
         finally { Environment.SetEnvironmentVariable("OLLAMA_MODELS", prev); }
     }

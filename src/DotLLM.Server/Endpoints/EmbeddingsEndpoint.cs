@@ -243,7 +243,9 @@ public static class EmbeddingsEndpoint
     {
         httpContext.Response.StatusCode = statusCode;
         return httpContext.Response.WriteAsJsonAsync(
-            ErrorForStatus(statusCode, message),
+            DotLLM.HuggingFace.AmbiguousModelReferenceException.IsMessage(message)
+                ? ErrorResponse.InvalidRequest(message, param: "model", code: DotLLM.HuggingFace.AmbiguousModelReferenceException.ErrorCode)
+                : ErrorForStatus(statusCode, message),
             ServerJsonContext.Default.ErrorResponse,
             contentType: null,
             httpContext.RequestAborted);

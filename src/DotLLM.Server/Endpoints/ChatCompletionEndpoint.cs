@@ -34,7 +34,7 @@ public static class ChatCompletionEndpoint
         var activationError = await state.EnsureActiveAsync(request.Model, request.KeepAlive, httpContext.RequestAborted);
         if (activationError is not null)
         {
-            await WriteErrorAsync(httpContext, 400, ErrorResponse.InvalidRequest(activationError, param: "model", code: "model_not_found"), keepAlive);
+            await WriteErrorAsync(httpContext, 400, ErrorResponse.InvalidRequest(activationError, param: "model", code: DotLLM.HuggingFace.AmbiguousModelReferenceException.CodeFor(activationError)), keepAlive);
             return;
         }
 

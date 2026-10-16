@@ -26,7 +26,7 @@ public static class CompletionEndpoint
         {
             httpContext.Response.StatusCode = 400;
             await httpContext.Response.WriteAsJsonAsync(
-                ErrorResponse.InvalidRequest(activationError, param: "model", code: "model_not_found"),
+                ErrorResponse.InvalidRequest(activationError, param: "model", code: DotLLM.HuggingFace.AmbiguousModelReferenceException.CodeFor(activationError)),
                 ServerJsonContext.Default.ErrorResponse,
                 contentType: null,
                 httpContext.RequestAborted);

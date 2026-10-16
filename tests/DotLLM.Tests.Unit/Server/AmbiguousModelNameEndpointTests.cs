@@ -89,6 +89,28 @@ public sealed class AmbiguousModelNameEndpointTests : IAsyncLifetime
         Assert.Contains(IdA, text);
         Assert.Contains(IdB, text);
         Assert.Null(_state!.Model);   // nothing was loaded
+        if (path.StartsWith("/v1/", StringComparison.Ordinal) && !path.StartsWith("/v1/messages", StringComparison.Ordinal))
+            Assert.Contains("\"code\":\"ambiguous_model\"", text);   // its own code, not model_not_found (OpenAI envelope only)
+    }
+
+    /// <summary>
+    /// Review of #1021: an id the server handed out goes back to the exact file it was minted for, not to whatever the name resolves to.
+    /// "minted-1021" resolves to nothing by name, so reaching the (unparseable) fixture - a load error, not "not found" - proves the
+    /// issued-id map was consulted.
+    /// </summary>
+    [Fact]
+    public async Task IssuedId_ReactivatesFromTheExactPathItWasMintedFor()
+    {
+        string file = HubCache.SnapshotFilePath("Hcompany/Holo4-27B-GGUF", "c0ffee", "q4_k_m.gguf", Path.Combine(_root, "hub"));
+        Assert.NotNull(await _state!.EnsureActiveAsync("minted-1021", keepAliveOverride: null, CancellationToken.None) is { } before
+            && before.Contains("not found", StringComparison.OrdinalIgnoreCase) ? before : null);
+
+        _state.RememberIssuedId("minted-1021", file);
+        string? error = await _state.EnsureActiveAsync("minted-1021", keepAliveOverride: null, CancellationToken.None);
+
+        Assert.NotNull(error);
+        Assert.DoesNotContain("not found", error!, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("ambiguous", error!, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

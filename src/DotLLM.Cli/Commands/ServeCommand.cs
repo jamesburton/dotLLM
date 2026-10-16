@@ -390,7 +390,8 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             if (resolvedPath is null)
                 return 1;
 
-            // The same key a later load/request of this file produces (repo-qualified), so /v1/models never reports a bare quant stem.
+            // The stable id of this file (#1021): owner/repo/rel for a store file, the full path for a file outside the stores - the same
+            // key a later load/request of it produces, and never a bare stem a client could persist and later see resolve elsewhere.
             serverOptions = serverOptions with { ModelId = ServerStartup.ModelIdFor(settings.Model, resolvedPath) };
 
             try
