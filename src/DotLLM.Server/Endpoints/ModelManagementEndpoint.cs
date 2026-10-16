@@ -93,17 +93,22 @@ public static class ModelManagementEndpoint
             if (!state.Catalog.IsEnabled(request.Model) || !state.Catalog.IsEnabled(loadKey))
                 return Results.BadRequest(ErrorResponse.InvalidRequest($"Model is disabled: {request.Model}", param: "model", code: "model_disabled"));
 
+            // (#1023 review) The placement this load will actually use - computed ONCE, so the pre-free fit check judges the same device
+            // and layer count the load uses (request, then profile, then server default), not the current model's.
+            var loadProfile = ModelProfileStore.Resolve(request.Model) is { } lp ? ModelProfileStore.Merge(lp.Chain) : null;
+            string loadDevice = request.Device ?? loadProfile?.Device ?? state.Options.Device;
+            int? loadGpuLayers = ResolveRequestedGpuLayers(request.GpuLayers, loadProfile?.GpuLayers, state.Options.GpuLayers);
+
             try
             {
                 await state.SwapModelAsync(async () =>
                 {
-                    var loadProfile = ModelProfileStore.Resolve(request.Model) is { } lp ? ModelProfileStore.Merge(lp.Chain) : null;
                     var newOptions = state.Options with
                     {
                         Model = request.Model,
                         Quant = request.Quant,
-                        Device = request.Device ?? loadProfile?.Device ?? state.Options.Device,
-                        GpuLayers = ResolveRequestedGpuLayers(request.GpuLayers, loadProfile?.GpuLayers, state.Options.GpuLayers),
+                        Device = loadDevice,
+                        GpuLayers = loadGpuLayers,
                         CacheTypeK = request.CacheTypeK ?? state.Options.CacheTypeK,
                         CacheTypeV = request.CacheTypeV ?? state.Options.CacheTypeV,
                         Threads = request.Threads ?? state.Options.Threads,
@@ -157,7 +162,7 @@ public static class ModelManagementEndpoint
 
                     await Task.CompletedTask;
                 }, ct, incomingModelId: loadKey, incomingBytes: SafeFileLength(resolvedPath),   // (#1023) free before loading
-                    incomingDevice: request.Device ?? state.Options.Device);
+                    incomingPlacement: (loadDevice, loadGpuLayers));
 
                 return Results.Ok(new ModelLoadResponse
                 {

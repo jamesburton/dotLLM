@@ -573,18 +573,21 @@ public sealed class ServerState : IDisposable
     /// <param name="incomingModelId">The id being loaded, for <see cref="GetStatus"/>; null = unknown.</param>
     /// <param name="incomingBytes">The incoming model's size; 0 = unknown (no budget enforcement before the load).</param>
     /// <returns>A task that completes when the swap has.</returns>
-    /// <param name="incomingDevice">The device the load targets, for the fit check and device-local eviction; the current device when null.</param>
+    /// <param name="incomingPlacement">
+    /// The device and GPU-layer count the load will use, for the fit check and device-local eviction (#1023 review: the CURRENT model's
+    /// placement wrongly refused e.g. a partial offload). The current model's when null.
+    /// </param>
     /// <exception cref="InvalidOperationException">The model cannot fit the target GPU even after freeing everything (nothing is freed).</exception>
     public async Task SwapModelAsync(Func<Task> loadAction, CancellationToken ct, string? incomingModelId = null, long incomingBytes = 0,
-        string? incomingDevice = null)
+        (string Device, int? GpuLayers)? incomingPlacement = null)
     {
         await AcquireGateAsync("model load", ct).ConfigureAwait(false);
         long start = System.Diagnostics.Stopwatch.GetTimestamp();
         try
         {
             ct.ThrowIfCancellationRequested();   // (#1023) the caller has gone: do not free or load anything
-            string device = incomingDevice ?? Options.Device;
-            if (incomingBytes > 0 && CannotFitReason(incomingBytes, device, Options.GpuLayers) is { } cannotFit)
+            var (device, gpuLayers) = incomingPlacement ?? (Options.Device, Options.GpuLayers);
+            if (incomingBytes > 0 && CannotFitReason(incomingBytes, device, gpuLayers) is { } cannotFit)
                 throw new InvalidOperationException(cannotFit);   // (#1023 review) refused BEFORE anything is freed
             IsReady = false;
             _loading = new LoadingInfo(incomingModelId ?? "(explicit load)", DateTimeOffset.UtcNow, ServerLog.RequestTag);

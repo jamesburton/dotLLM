@@ -160,4 +160,28 @@ public sealed class ModelSwapReviewTests : IAsyncLifetime
         Assert.True(residency.Contains("cpu-model"));
         Assert.Equal(0, residency.StashedBytes(s => s.Options.ResolvedDevice == "gpu:0"));
     }
+
+    /// <summary>
+    /// Review round 2 of #1023, on the endpoint path: <c>/v1/models/load</c>'s pre-free fit check must judge the placement the load will
+    /// USE (request, then profile, then server default) - it used the current model's gpu_layers and ignored a profile's device, so a
+    /// partial offload of a big model was refused and a profile pinned elsewhere was checked against the wrong device.
+    /// </summary>
+    [Theory]
+    [InlineData("{\"model\":\"acme/big-GGUF/big.gguf\"}", true)]                       // full offload of 4 KiB onto a 1 KiB "GPU": refused
+    [InlineData("{\"model\":\"acme/big-GGUF/big.gguf\",\"gpu_layers\":20}", false)]  // partial offload: the loader decides, not the fit check
+    [InlineData("{\"model\":\"pinned-cpu-1023\"}", false)]                              // the profile pins the CPU: no GPU fit check applies
+    public async Task ModelsLoad_FitCheckUsesTheLoadsOwnPlacement(string body, bool refused)
+    {
+        string file = DotLLM.HuggingFace.HubCache.SnapshotFilePath("acme/big-GGUF", "c0ffee", "big.gguf", Path.Combine(_root, "hub"));
+        Directory.CreateDirectory(Path.GetDirectoryName(file)!);
+        File.WriteAllBytes(file, "GGUF"u8.ToArray().Concat(new byte[4092]).ToArray());
+        DotLLM.HuggingFace.ModelProfileStore.Save("pinned-cpu-1023", new DotLLM.HuggingFace.ModelProfile { From = "acme/big-GGUF/big.gguf", Device = "cpu" });
+        _state!.Options = _state.Options with { Device = "gpu", AllowModelAdminApi = true };
+        _state.CudaMemoryProbe = _ => (Free: 1, Total: 1024);
+
+        var response = await _http.PostAsync("/v1/models/load", new StringContent(body, Encoding.UTF8, "application/json"));
+        string text = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(refused, text.Contains("cannot load there", StringComparison.Ordinal));
+    }
 }

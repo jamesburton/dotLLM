@@ -89,7 +89,9 @@ internal sealed class SseKeepAlive : IAsyncDisposable
             }
             finally
             {
-                await keepAlive.StopAsync();
+                // One this wrapper started is disposed (its linked token source too); a caller's own is only stopped.
+                if (existing is null) await keepAlive.DisposeAsync();
+                else await keepAlive.StopAsync();
             }
         };
 
