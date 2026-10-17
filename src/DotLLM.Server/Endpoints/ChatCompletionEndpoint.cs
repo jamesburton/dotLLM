@@ -223,7 +223,7 @@ public static class ChatCompletionEndpoint
                 // (#1023) The generator is the one current under the gate, not one captured before a queued swap.
                 await state.ExecuteAsync(modelId, generator =>
                 {
-                    one = generator.Generate(prompt, choiceOptions, adapter: adapter);
+                    one = generator.Generate(prompt, choiceOptions, adapter: adapter, cancellationToken: ct);
                     return Task.CompletedTask;
                 }, ct);
                 results[i] = one!;

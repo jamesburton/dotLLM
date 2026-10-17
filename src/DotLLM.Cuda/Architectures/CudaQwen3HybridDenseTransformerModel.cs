@@ -1579,6 +1579,10 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// <summary>Tile size in force for this thread: the override, else the environment/default.</summary>
     internal static int PrefillChunkTokens => PrefillChunkOverride ?? PrefillChunkFromEnv;
 
+    /// <inheritdoc/>
+    /// <remarks>The <see cref="ForwardCore"/> tile, so an engine that chunks at it splits exactly where this model would (issue #1025).</remarks>
+    public int PreferredPrefillChunkTokens => PrefillChunkTokens;
+
     /// <summary>
     /// Core forward pass. Tiles a long prefill over tokens (issue #494) so peak VRAM is bounded by
     /// <see cref="PrefillChunkTokens"/> rather than by the prompt length, then delegates each tile

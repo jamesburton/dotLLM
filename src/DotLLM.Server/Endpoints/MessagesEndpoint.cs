@@ -186,7 +186,7 @@ public static class MessagesEndpoint
             // (#1023) The generator current under the gate, not the one captured before a possible queued swap.
             await state.ExecuteAsync(modelId, current =>
             {
-                result = current.Generate(prompt, options);
+                result = current.Generate(prompt, options, cancellationToken: ct);
                 return Task.CompletedTask;
             }, ct);
         }

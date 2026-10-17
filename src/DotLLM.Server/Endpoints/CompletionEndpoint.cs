@@ -128,7 +128,7 @@ public static class CompletionEndpoint
             // (#1023) The generator current under the gate, not the one captured before a possible queued swap.
             await state.ExecuteAsync(modelId, current =>
             {
-                result = current.Generate(prompt, options, adapter: adapter);
+                result = current.Generate(prompt, options, adapter: adapter, cancellationToken: ct);
                 return Task.CompletedTask;
             }, ct);
         }

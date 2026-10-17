@@ -167,6 +167,12 @@ public sealed class TextGenerator
     public int PrefillChunkSize => _prefillChunkSize;
 
     /// <summary>
+    /// Chunk size the prompt prefill actually uses: the configured <see cref="PrefillChunkSize"/>, else the model's
+    /// <see cref="IModel.PreferredPrefillChunkTokens"/> (0 = one forward pass).
+    /// </summary>
+    internal int EffectivePrefillChunkSize => _prefillChunkSize > 0 ? _prefillChunkSize : Math.Max(0, _model.PreferredPrefillChunkTokens);
+
+    /// <summary>
     /// Generates text from the given prompt using the specified options.
     /// </summary>
     /// <param name="prompt">Input text prompt.</param>
@@ -203,11 +209,16 @@ public sealed class TextGenerator
     /// The span is only valid for the duration of the call — copy it if you need to retain it.
     /// </para>
     /// </param>
+    /// <param name="cancellationToken">
+    /// Cancels generation cooperatively: between prefill chunks (see <see cref="IModel.PreferredPrefillChunkTokens"/>)
+    /// and between decode steps. Throws <see cref="OperationCanceledException"/>.
+    /// </param>
     /// <returns>The inference response with generated text, metadata, and timings.</returns>
     public InferenceResponse Generate(string prompt, InferenceOptions? options = null,
         Action<int>? onTokenGenerated = null,
         ILoraAdapter? adapter = null,
-        Action<ReadOnlySpan<char>>? onTextGenerated = null)
+        Action<ReadOnlySpan<char>>? onTextGenerated = null,
+        CancellationToken cancellationToken = default)
     {
         options ??= new InferenceOptions();
 
@@ -411,7 +422,8 @@ public sealed class TextGenerator
                     // Prefill suffix tokens — chunked when a prefill chunk size is configured
                     // (llama.cpp -ub analog); otherwise a single forward pass, as before.
                     using (ITensor prefillLogits = ForwardPrefill(promptIds, prefillStart, prefillLen, kvCache, adapter, mtpState,
-                        snapshotAt, () => { TakeRecurrentSnapshot(promptIds, snapshotAt, kvCache); ownsKvCache = false; }))
+                        snapshotAt, () => { TakeRecurrentSnapshot(promptIds, snapshotAt, kvCache); ownsKvCache = false; },
+                        cancellationToken))
                     {
                         long ts1 = Stopwatch.GetTimestamp();
                         prefillTicks = ts1 - ts0;
@@ -547,6 +559,8 @@ public sealed class TextGenerator
                     int step = 1;
                     while (step < maxTokens)
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
+
                         int pos = promptLen + step - 1;
                         if (pos >= cacheSize) break;
 
@@ -624,6 +638,8 @@ public sealed class TextGenerator
                     int step = 1;
                     while (step < maxTokens)
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
+
                         int pos = promptLen + step - 1;
                         if (pos >= cacheSize) break;
 
@@ -708,6 +724,8 @@ public sealed class TextGenerator
                 // ── Standard decode loop: one token at a time ──
                 for (int step = mtpFallbackStep > 0 ? mtpFallbackStep : 1; step < maxTokens; step++)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
+
                     int pos = promptLen + step - 1;
                     if (pos >= cacheSize)
                         break;
@@ -959,7 +977,8 @@ public sealed class TextGenerator
                     // Prefill suffix tokens — chunked when a prefill chunk size is configured
                     // (llama.cpp -ub analog); otherwise a single forward pass, as before.
                     using (ITensor prefillLogits = ForwardPrefill(promptIds, prefillStart, prefillLen, kvCache, adapter, mtpState,
-                        snapshotAt, () => { TakeRecurrentSnapshot(promptIds, snapshotAt, kvCache); ownsKvCache = false; }))
+                        snapshotAt, () => { TakeRecurrentSnapshot(promptIds, snapshotAt, kvCache); ownsKvCache = false; },
+                        cancellationToken))
                     {
                         long ts1 = Stopwatch.GetTimestamp();
                         prefillTicks = ts1 - ts0;
@@ -1700,12 +1719,17 @@ public sealed class TextGenerator
     /// Every chunk opts in to <c>lastTokenLogitsOnly</c> (issue #493) — only row
     /// <c>Shape[0] - 1</c> of the final chunk is ever read, so the caller must index the last row
     /// by shape and never assume one row per input token.
+    /// <para>With no chunk size configured, the model's own <see cref="IModel.PreferredPrefillChunkTokens"/>
+    /// applies (issue #1025). The engine then splits exactly where the model would split internally, so the
+    /// result is unchanged, and <paramref name="cancellationToken"/> is checked before every chunk. Without
+    /// that, a cancelled request (client gone, shutdown) ran a long prefill to completion.</para>
     /// </summary>
     private ITensor ForwardPrefill(int[] promptIds, int prefillStart, int prefillLen,
         Core.Attention.IKvCache kvCache, ILoraAdapter? adapter, DotLLM.Core.Models.IMtpState? mtpState = null,
-        int snapshotAt = -1, Action? onSnapshotPoint = null)
+        int snapshotAt = -1, Action? onSnapshotPoint = null, CancellationToken cancellationToken = default)
     {
-        int chunkSize = _prefillChunkSize > 0 ? Math.Min(_prefillChunkSize, prefillLen) : prefillLen;
+        int configured = EffectivePrefillChunkSize;
+        int chunkSize = configured > 0 ? Math.Min(configured, prefillLen) : prefillLen;
         int[] positionsArray = ArrayPool<int>.Shared.Rent(chunkSize);
         ITensor? logits = null;
         try
@@ -1713,6 +1737,7 @@ public sealed class TextGenerator
             int offset = 0;
             while (offset < prefillLen)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 int len = Math.Min(chunkSize, prefillLen - offset);
                 // A recurrent-prefix snapshot needs a forward boundary exactly at snapshotAt.
                 int absolute = prefillStart + offset;

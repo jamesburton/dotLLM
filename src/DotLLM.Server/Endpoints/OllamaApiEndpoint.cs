@@ -456,7 +456,7 @@ public static class OllamaApiEndpoint
                 }, ct);
             }
             else
-                await state.ExecuteAsync(modelId, g => { result = g.Generate(finalPrompt, options); return Task.CompletedTask; }, ct);
+                await state.ExecuteAsync(modelId, g => { result = g.Generate(finalPrompt, options, cancellationToken: ct); return Task.CompletedTask; }, ct);
 
             RateLimitMiddleware.GetLease(c)?.ReportActualTokens(result!.PromptTokenCount + result.GeneratedTokenCount);
             c.Response.ContentType = "application/json; charset=utf-8";
