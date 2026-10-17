@@ -1573,6 +1573,9 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     [ThreadStatic]
     internal static int? PrefillChunkOverride;
 
+    /// <summary>Rows the per-token forward buffers are sized for: bounded by the prefill tile when tiling applies (issue #1025).</summary>
+    internal int ForwardStateSequenceCapacity => _state.SequenceCapacity;
+
     /// <summary>Tile size in force for this thread: the override, else the environment/default.</summary>
     internal static int PrefillChunkTokens => PrefillChunkOverride ?? PrefillChunkFromEnv;
 
@@ -1591,7 +1594,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// <c>--depth</c> walk chunks, via <c>BenchRunner</c>'s own <c>DepthExtensionChunkSize</c>), and
     /// so does any direct <c>IModel</c> caller. The engine knob remains the user-facing <c>-ub</c>
     /// analog; this is the backend defending its own VRAM ceiling.</para>
-    /// <para>Four gates keep it off where it would change behaviour rather than just memory:</para>
+    /// <para>Three gates keep it off where it would change behaviour rather than just memory:</para>
     /// <list type="bullet">
     /// <item><c>kvCache is null</c> — later tiles would have nothing to attend to. A cacheless
     /// caller (<c>PerplexityEvaluator</c>, <c>debug forward-pass</c>) also wants every row, so it
@@ -1599,14 +1602,18 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// <item><c>!lastTokenLogitsOnly</c> — the caller wants a row per position, which a tile loop
     /// would have to reassemble. Every long-prompt caller opts into the hint (issue #493); the
     /// all-rows callers submit short batches (a speculative verify is K+1 tokens).</item>
-    /// <item><c>mtpCapture is not null</c> — the per-tile capture/absorb sequence is very probably
-    /// equivalent (each tile seeds the carry from its own last row, which is what the next tile's
-    /// token 0 pairs with), but that equivalence is UNTESTED and the #469 absorb path is owned
-    /// elsewhere. An MTP prefill therefore keeps the single-call behaviour.</item>
     /// <item><c>_rowSnapshotRequestRows &gt; 0</c> — <c>ForwardWithRecurrentSnapshots</c> (#473)
     /// records a GDN snapshot per input row; a tile loop would leave only the last tile's rows
     /// valid.</item>
     /// </list>
+    /// <para><b>An MTP prefill is tiled too</b> (issue #1025). It used to be exempt, so an MTP request
+    /// sized every per-token buffer for the whole prompt. On Bonsai 2 27B that is ~600 KB/token: a
+    /// 5.8k-token agent prompt oversubscribed a 12 GB card, spilled to shared memory and prefilled
+    /// for tens of minutes, which is the #494 thrash again. Each MTP tile runs the full tail
+    /// (final norm over its rows, capture, absorb, carry seeded from its last row). That is the same
+    /// sequence of calls a decode/verify loop already makes, and
+    /// <c>CudaQwen3HybridDenseMtpPrefillTilingTests</c> pins it against the single call. Its
+    /// non-final tiles still project their last row through the LM head: one row per tile.</para>
     /// <para><b>Not bit-identical</b> to the single call: each layer's GEMMs run with a different
     /// M per tile and cuBLAS selects per-M algorithms, so the last row's logits agree only to the
     /// usual accumulation-order tolerance — the same caveat
@@ -1621,7 +1628,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         int chunk = PrefillChunkTokens;
         int total = tokenIds.Length;
         if (chunk <= 0 || total <= chunk || kvCache is null || !lastTokenLogitsOnly
-            || mtpCapture is not null || _rowSnapshotRequestRows > 0)
+            || _rowSnapshotRequestRows > 0)
         {
             return ForwardTile(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly,
                                mtpCapture, produceLogits: true)!;
@@ -1636,10 +1643,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                 bool isFinal = offset + len >= total;
                 // Non-final tiles skip the final norm, the LM-head GEMM and the D2H copy entirely:
                 // the caller asked for the last row only, so their logits would be discarded. That
-                // is a prefill-time win on top of the VRAM one.
+                // is a prefill-time win on top of the VRAM one. An MTP tile cannot skip the tail,
+                // because the capture and absorb live there (issue #1025), so it keeps it and its
+                // one-row logits are dropped when the next tile starts.
+                logits?.Dispose();
                 logits = ForwardTile(tokenIds.Slice(offset, len), positions.Slice(offset, len),
                                      deviceId, kvCache, lastTokenLogitsOnly: true,
-                                     mtpCapture: null, produceLogits: isFinal);
+                                     mtpCapture, produceLogits: isFinal || mtpCapture is not null);
             }
             return logits!;
         }
