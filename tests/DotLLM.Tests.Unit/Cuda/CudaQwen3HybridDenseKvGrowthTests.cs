@@ -13,8 +13,9 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// survive the growth, or the hit attends over zeros.
 /// </summary>
 /// <remarks>
-/// Mutant: resetting the live length (or skipping the row copy) in <c>EnsureF16KvCache</c>'s growth path makes the
-/// second forward's logits diverge from the never-grown reference by O(1).
+/// Mutant: skipping the row copy in <c>EnsureF16KvCache</c>'s growth path moves the second forward's logits away from the
+/// never-grown reference (measured: logits[0] -0.1567 vs -0.1656). Resetting the live length alone is an equivalent
+/// mutant, because the next write's <c>LengthAfterWrite</c> re-covers the copied rows.
 /// </remarks>
 [Trait("Category", "GPU")]
 [Collection(CudaCollection.Name)]
