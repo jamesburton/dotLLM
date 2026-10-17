@@ -548,7 +548,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// cache) — the returned handle only communicates the capacity to
     /// <see cref="Forward(System.ReadOnlySpan{int}, System.ReadOnlySpan{int}, int, IKvCache?)"/>.
     /// </summary>
-    public CudaHybridKvCacheHandle CreateKvCache(int maxSeqLen) => new(maxSeqLen);
+    public CudaHybridKvCacheHandle CreateKvCache(int maxSeqLen) => new(maxSeqLen, growable: true);   // EnsureF16KvCache keeps rows on growth (#1025)
 
     /// <inheritdoc/>
     /// <remarks>
@@ -3524,16 +3524,25 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     //  Per-attention-layer F16 KV cache (model-private) — verbatim.
     // ──────────────────────────────────────────────────────────────────────
 
+    /// <remarks>
+    /// Growth keeps the live rows <c>[0, _f16CacheCurrentLength)</c> (issue #1025): a recurrent-prefix hit grows its
+    /// handle (<see cref="CudaHybridKvCacheHandle.TryGrowTo"/>) rather than re-prefilling, and the prefix it reuses
+    /// lives in this storage. A new handle has already reset the live length to 0 (see <c>_lastForwardKvCache</c>),
+    /// so nothing is copied for an unrelated sequence, and the old storage is freed before the new one is allocated, as
+    /// before. Only a copy makes old and new storage coexist briefly.
+    /// </remarks>
     private void EnsureF16KvCache(int maxSeqLen, int numKvHeads, int headDim)
     {
         if (_f16KCache is not null && maxSeqLen <= _f16CacheMaxSeqLen) return;
-
-        FreeKvStorage();
 
         int kvElems = numKvHeads * headDim;
         if ((IsQuantKv(_kvKeyDType) || IsQuantKv(_kvValueDType)) && kvElems % 32 != 0)
             throw new NotSupportedException(
                 $"Quantized KV storage needs numKvHeads*headDim ({kvElems}) to be a multiple of 32.");
+
+        int keepRows = _f16KCache is null ? 0 : Math.Min(_f16CacheCurrentLength, _f16CacheMaxSeqLen);
+        if (keepRows == 0) FreeKvStorage();   // nothing to keep: free first, so peak VRAM is the new size alone
+        nint[]? oldK = _f16KCache, oldV = _f16VCache, oldKQ = _kQuant, oldVQ = _vQuant;
 
         _f16KCache = new nint[_attentionLayerCount];
         _f16VCache = new nint[_attentionLayerCount];
@@ -3549,33 +3558,56 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             if (IsQuantKv(_kvValueDType)) _vQuant[i] = AllocDevice(vBytes);
             else _f16VCache[i] = AllocDevice(f16Bytes);
         }
+        if (keepRows > 0)
+        {
+            long f16Row = (long)kvElems * sizeof(ushort);
+            long kRow = QuantRowBytes(_kvKeyDType, kvElems);
+            long vRow = QuantRowBytes(_kvValueDType, kvElems);
+            nint streamH = _stream.Handle;
+            for (int i = 0; i < _attentionLayerCount; i++)
+            {
+                CopyRows(oldK![i], _f16KCache[i], keepRows * f16Row, streamH);
+                CopyRows(oldV![i], _f16VCache[i], keepRows * f16Row, streamH);
+                CopyRows(oldKQ![i], _kQuant[i], keepRows * kRow, streamH);
+                CopyRows(oldVQ![i], _vQuant[i], keepRows * vRow, streamH);
+            }
+            _stream.Synchronize();   // the old buffers are freed below
+        }
+        FreeKvStorage(oldK, oldV, oldKQ, oldVQ);
+
         _f16CacheMaxSeqLen = maxSeqLen;
-        _f16CacheCurrentLength = 0;
+        _f16CacheCurrentLength = keepRows;
+
+        static void CopyRows(nint src, nint dst, long bytes, nint stream)
+        {
+            if (src != 0 && dst != 0 && bytes > 0)
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(dst, src, (nuint)bytes, stream).ThrowOnError();
+        }
     }
 
     /// <summary>Frees the per-slot KV storage (F16 and quantized) and the shared dequant scratch.</summary>
     private void FreeKvStorage()
     {
-        if (_f16KCache is not null)
-        {
-            for (int i = 0; i < _f16KCache.Length; i++)
-            {
-                if (_f16KCache[i] != 0) CudaDriverApi.cuMemFree_v2(_f16KCache[i]);
-                if (_f16VCache![i] != 0) CudaDriverApi.cuMemFree_v2(_f16VCache[i]);
-            }
-        }
-        if (_kQuant is not null)
-        {
-            for (int i = 0; i < _kQuant.Length; i++)
-            {
-                if (_kQuant[i] != 0) CudaDriverApi.cuMemFree_v2(_kQuant[i]);
-                if (_vQuant![i] != 0) CudaDriverApi.cuMemFree_v2(_vQuant[i]);
-            }
-        }
+        FreeKvStorage(_f16KCache, _f16VCache, _kQuant, _vQuant);
         _f16KCache = null;
         _f16VCache = null;
         _kQuant = null;
         _vQuant = null;
+    }
+
+    private static void FreeKvStorage(nint[]? k, nint[]? v, nint[]? kq, nint[]? vq)
+    {
+        FreeAll(k);
+        FreeAll(v);
+        FreeAll(kq);
+        FreeAll(vq);
+
+        static void FreeAll(nint[]? buffers)
+        {
+            if (buffers is null) return;
+            foreach (nint p in buffers)
+                if (p != 0) CudaDriverApi.cuMemFree_v2(p);
+        }
     }
 
     /// <summary>

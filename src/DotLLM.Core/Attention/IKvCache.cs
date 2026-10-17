@@ -56,4 +56,20 @@ public interface IKvCache : IDisposable
     /// </summary>
     /// <param name="length">The new current length (must be &lt;= <see cref="CurrentLength"/>).</param>
     void Rollback(int length);
+
+    /// <summary>
+    /// Grows <see cref="MaxLength"/> to at least <paramref name="maxLength"/> and keeps the committed rows. The engine uses it
+    /// when a later, longer prompt reuses a cached prefix (issue #1025). The default only reports whether the cache is
+    /// already large enough: a cache that cannot grow returns <see langword="false"/> and the caller allocates a new one.
+    /// </summary>
+    /// <param name="maxLength">Positions the cache must hold.</param>
+    /// <returns><see langword="true"/> when <see cref="MaxLength"/> is now at least <paramref name="maxLength"/>.</returns>
+    bool TryGrowTo(int maxLength) => maxLength <= MaxLength;
+
+    /// <summary>
+    /// <see langword="false"/> when this cache is a view over storage that another cache's forwards overwrite, for example
+    /// a model-owned single-slot KV behind a length-only handle. Its rows are then valid only until a forward runs on a
+    /// different cache, so a cached prefix held in it must be dropped at that point (issue #1025).
+    /// </summary>
+    bool HasExclusiveStorage => true;
 }

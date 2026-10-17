@@ -60,9 +60,12 @@ public sealed class TextGenerator
 
         public void Dispose()
         {
-            (Checkpoint as IDisposable)?.Dispose();
+            DisposeCheckpoint();
             Kv.Dispose();
         }
+
+        /// <summary>Releases only the state checkpoint, for when a newer entry takes over the same KV cache.</summary>
+        public void DisposeCheckpoint() => (Checkpoint as IDisposable)?.Dispose();
     }
 
     /// <summary>
@@ -1593,24 +1596,23 @@ public sealed class TextGenerator
     /// prefill to snapshot at that boundary. The shared prefix of two consecutive requests is, for a classifier, the
     /// fixed system prompt, so the cost is one extra checkpoint and the saving is that prefix's prefill on every later request.
     /// </summary>
+    /// <remarks>
+    /// <para>Agent loops (issue #1025), where each prompt extends the previous one by an assistant turn and tool results:</para>
+    /// <list type="bullet">
+    /// <item>A hit whose KV is too small for this request grows it (<see cref="Core.Attention.IKvCache.TryGrowTo"/>, rows
+    /// kept). It used to miss: the KV had 256 positions of headroom and an agent step adds more, so every step re-prefilled
+    /// the whole conversation.</item>
+    /// <item>A hit also moves the snapshot forward to what this prompt shares with the previous one, so the next step
+    /// prefills only the last two turns rather than everything since the first snapshot.</item>
+    /// <item>A miss on a KV without exclusive storage (<see cref="Core.Attention.IKvCache.HasExclusiveStorage"/>) drops the
+    /// snapshot. This request's forwards overwrite those rows, and a later hit would attend over them.</item>
+    /// </list>
+    /// </remarks>
     private (Core.Attention.IKvCache KvCache, int CachedTokenCount, bool OwnsKvCache) ResolveRecurrentPrefix(
         int[] promptIds, int promptLen, int maxTokens, out int snapshotAt)
     {
         snapshotAt = -1;
         int needed = promptLen + maxTokens;
-        var entry = _recurrentPrefix;
-        if (entry is not null
-            && promptLen > entry.Tokens.Length                      // at least one suffix token must run to produce logits
-            && entry.Kv.MaxLength >= needed
-            && promptIds.AsSpan(0, entry.Tokens.Length).SequenceEqual(entry.Tokens))
-        {
-            entry.Kv.Rollback(entry.Tokens.Length);
-            _model.RestoreRecurrentState(entry.Checkpoint);
-            _recurrentPrefixLastPrompt = promptIds;
-            return (entry.Kv, entry.Tokens.Length, false);
-        }
-
-        _model.ResetSequenceState();
         int shared = _recurrentPrefixLastPrompt is null
             ? 0
             : promptIds.AsSpan().CommonPrefixLength(_recurrentPrefixLastPrompt);
@@ -1619,6 +1621,27 @@ public sealed class TextGenerator
         // Leave at least one suffix token to run (it produces the logits), so an exact repeat of the previous prompt
         // snapshots one token short of its end.
         int boundary = Math.Min(shared, promptLen - 1);
+
+        var entry = _recurrentPrefix;
+        if (entry is not null
+            && promptLen > entry.Tokens.Length                      // at least one suffix token must run to produce logits
+            && promptIds.AsSpan(0, entry.Tokens.Length).SequenceEqual(entry.Tokens)
+            && EnsureRecurrentPrefixKvCapacity(entry.Kv, needed))
+        {
+            entry.Kv.Rollback(entry.Tokens.Length);
+            _model.RestoreRecurrentState(entry.Checkpoint);
+            if (boundary >= entry.Tokens.Length + RecurrentPrefixMinTokens)
+                snapshotAt = boundary;
+            return (entry.Kv, entry.Tokens.Length, false);
+        }
+
+        _model.ResetSequenceState();
+        if (entry is not null && !entry.Kv.HasExclusiveStorage)
+        {
+            _recurrentPrefix = null;
+            entry.Dispose();
+        }
+
         bool snapshot = boundary >= RecurrentPrefixMinTokens;
         int cacheSize = Math.Min(_model.Config.MaxSequenceLength, needed + (snapshot ? RecurrentPrefixKvHeadroom : 0));
         var kv = AllocateKvCache(cacheSize);
@@ -1627,12 +1650,28 @@ public sealed class TextGenerator
         return (kv, 0, true);
     }
 
+    /// <summary>
+    /// True when <paramref name="kv"/> holds <paramref name="needed"/> positions, growing it when needed: by a quarter more
+    /// than asked (at least <see cref="RecurrentPrefixKvHeadroom"/>), so a growing agent conversation does not reallocate on
+    /// every step. Capped at the context window.
+    /// </summary>
+    private bool EnsureRecurrentPrefixKvCapacity(Core.Attention.IKvCache kv, int needed)
+    {
+        if (kv.MaxLength >= needed) return true;
+        int maxSeq = _model.Config.MaxSequenceLength;
+        if (needed > maxSeq) return false;
+        int target = (int)Math.Min(maxSeq, needed + Math.Max(RecurrentPrefixKvHeadroom, needed / 4L));
+        return kv.TryGrowTo(target);
+    }
+
     private void TakeRecurrentSnapshot(int[] promptIds, int boundary, Core.Attention.IKvCache kvCache)
     {
         object? checkpoint = _model.CheckpointRecurrentState();
         var old = _recurrentPrefix;
         _recurrentPrefix = new RecurrentPrefixEntry(promptIds.AsSpan(0, boundary).ToArray(), kvCache, checkpoint);
-        old?.Dispose();
+        // A hit that moves its snapshot forward hands the same KV to the new entry: release only the old checkpoint.
+        if (old is not null && ReferenceEquals(old.Kv, kvCache)) old.DisposeCheckpoint();
+        else old?.Dispose();
     }
 
     /// <summary>Releases the recurrent prefix snapshot (its KV cache and state checkpoint). Call when the model is unloaded.</summary>

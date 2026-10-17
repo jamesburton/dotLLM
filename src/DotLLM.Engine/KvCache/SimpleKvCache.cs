@@ -17,7 +17,7 @@ public sealed unsafe class SimpleKvCache : IKvCache, IPerLayerKvCache
     private readonly KvGeometry _geom;   // per-layer KV row width (numKvHeads(l) * headDim(l))
     private readonly bool _uniform;      // _geom.IsUniform, hoisted for the hot path
     private readonly int _uniformStride; // _geom.UniformStride when _uniform; else 0
-    private readonly int _maxSeqLen;
+    private int _maxSeqLen;
     private int _currentLength;
     private bool _disposed;
 
@@ -221,6 +221,32 @@ public sealed unsafe class SimpleKvCache : IKvCache, IPerLayerKvCache
         if ((uint)length > (uint)_currentLength)
             throw new ArgumentOutOfRangeException(nameof(length));
         _currentLength = length;
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>Reallocates every layer's buffers and copies the committed rows (issue #1025). Pointers from earlier <c>Get*Ref</c> calls are invalidated.</remarks>
+    public bool TryGrowTo(int maxLength)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (maxLength <= _maxSeqLen) return true;
+        for (int i = 0; i < _numLayers; i++)
+        {
+            long stride = _geom.KvStrideOf(i);
+            nuint newBytes = (nuint)(maxLength * stride * sizeof(float));
+            nuint keepBytes = (nuint)(_currentLength * stride * sizeof(float));
+            _keys[i] = Regrow(_keys[i], newBytes, keepBytes);
+            _values[i] = Regrow(_values[i], newBytes, keepBytes);
+        }
+        _maxSeqLen = maxLength;
+        return true;
+
+        static nint Regrow(nint old, nuint newBytes, nuint keepBytes)
+        {
+            void* p = NativeMemory.AlignedAlloc(newBytes, 64);
+            Buffer.MemoryCopy((void*)old, p, newBytes, keepBytes);
+            NativeMemory.AlignedFree((void*)old);
+            return (nint)p;
+        }
     }
 
     /// <inheritdoc/>
