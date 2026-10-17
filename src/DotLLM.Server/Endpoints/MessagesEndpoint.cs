@@ -454,7 +454,8 @@ public static class MessagesEndpoint
         {
             await execute(async () =>
             {
-                await foreach (var token in tokenSource(ct))
+                // (#1025) Keep-alive comments while the prefill runs, until the first token.
+                await foreach (var token in SseKeepAlive.UntilFirstItem(httpContext, tokenSource(ct), ct: ct))
                 {
                     if (token.Text.Length > 0)
                     {

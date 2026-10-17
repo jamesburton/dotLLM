@@ -45,12 +45,16 @@ public sealed class ModelSwapRobustnessTests
     private static Task<string> StreamAsync(Func<Func<Task>, CancellationToken, Task> gate, TimeSpan? interval) =>
         StreamAsync(gate, interval, new RecordingStream());
 
-    private static async Task<string> StreamAsync(Func<Func<Task>, CancellationToken, Task> gate, TimeSpan? interval, RecordingStream body)
+    private static Task<string> StreamAsync(Func<Func<Task>, CancellationToken, Task> gate, TimeSpan? interval, RecordingStream body) =>
+        StreamAsync(gate, interval, body, _ => Script("hi"));
+
+    private static async Task<string> StreamAsync(Func<Func<Task>, CancellationToken, Task> gate, TimeSpan? interval, RecordingStream body,
+        Func<CancellationToken, IAsyncEnumerable<GenerationToken>> tokens)
     {
         var ctx = new DefaultHttpContext();
         ctx.Response.Body = body;
         await ChatCompletionEndpoint.WriteChatStreamAsync(
-            new ChatCompletionRequest { Messages = [], Stream = true }, ctx, _ => Script("hi"), gate, "chatcmpl-1", "m",
+            new ChatCompletionRequest { Messages = [], Stream = true }, ctx, tokens, gate, "chatcmpl-1", "m",
             tools: null, toolParser: null, ReasoningPlan.Disabled, CancellationToken.None,
             waitReason: () => "loading owner/repo/x.gguf", keepAliveInterval: interval);
         return Encoding.UTF8.GetString(body.ToArray());
@@ -81,6 +85,41 @@ public sealed class ModelSwapRobustnessTests
         int role = raw.IndexOf("\"role\":\"assistant\"", StringComparison.Ordinal);
         Assert.True(role > lastComment, "the role chunk (and its response id) must follow every keep-alive: it is sent only under the gate");
         Assert.True(raw.Split(": waiting for").Length - 1 >= 2, raw);
+        Assert.EndsWith("data: [DONE]\n\n", raw);
+    }
+
+    [Fact]
+    public async Task LongPrefill_GetsKeepAliveComments_BetweenTheRoleChunkAndTheFirstToken()
+    {
+        // Issue #1025: the role chunk goes out when the gate is taken, then the prefill runs before the first token. Here the
+        // source blocks its caller SYNCHRONOUSLY, like the real prefill inside the first MoveNextAsync, until two comments
+        // have been written after the role chunk. It waits on that observable outcome, not a fixed delay.
+        var body = new RecordingStream();
+        int CommentsAfterRole()
+        {
+            string t = body.Text;
+            int at = t.IndexOf("\"role\":\"assistant\"", StringComparison.Ordinal);
+            return at < 0 ? 0 : t[at..].Split(": waiting for prompt processing").Length - 1;
+        }
+
+        async IAsyncEnumerable<GenerationToken> SlowPrefill([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(30);
+            while (CommentsAfterRole() < 2 && DateTime.UtcNow < deadline)
+                Thread.Sleep(10);
+            yield return new GenerationToken(0, "hi", FinishReason.Stop);
+            await Task.CompletedTask;
+        }
+
+        string raw = await StreamAsync((work, _) => work(), TimeSpan.FromMilliseconds(50), body, SlowPrefill);
+
+        int role = raw.IndexOf("\"role\":\"assistant\"", StringComparison.Ordinal);
+        int firstComment = raw.IndexOf(": waiting for prompt processing", StringComparison.Ordinal);
+        int lastComment = raw.LastIndexOf(": waiting for prompt processing", StringComparison.Ordinal);
+        int content = raw.IndexOf("\"content\":\"hi\"", StringComparison.Ordinal);
+        Assert.True(role >= 0 && firstComment > role, raw);
+        Assert.True(content > lastComment, "no keep-alive may follow the first token: " + raw);
+        Assert.True(raw.Split(": waiting for prompt processing").Length - 1 >= 2, raw);
         Assert.EndsWith("data: [DONE]\n\n", raw);
     }
 

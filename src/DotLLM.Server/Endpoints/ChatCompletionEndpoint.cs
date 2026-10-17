@@ -503,7 +503,8 @@ public static class ChatCompletionEndpoint
         await execute(async () =>
         {
             await WriteSseChunk(httpContext, roleChunk, ct);
-            await foreach (var token in tokenSource(ct))
+            // (#1025) Keep-alive comments while the prefill runs, until the first token.
+            await foreach (var token in SseKeepAlive.UntilFirstItem(httpContext, tokenSource(ct), keepAliveInterval, ct))
             {
                 if (token.Text.Length > 0)
                 {
