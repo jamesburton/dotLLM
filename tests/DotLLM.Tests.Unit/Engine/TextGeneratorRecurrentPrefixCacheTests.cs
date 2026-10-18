@@ -104,6 +104,52 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
     }
 
     [Fact]
+    public void FailedRequest_DropsTheSnapshot_SoTheNextRequestDoesNotRetryTheSameFailure()
+    {
+        // PR #1026 re-review: a hit that grew its handle and then failed (a real OOM after the free-VRAM admission, say) left
+        // the snapshot holding a handle whose MaxLength was already raised. The next same-prefix request then skipped the
+        // admission and retried the same allocation, failing on every agent step. A failed request now drops the snapshot.
+        var (cached, plain, model) = Build();
+        Check(cached, plain, model, Prompt(30));
+        Check(cached, plain, model, Prompt(31));                     // snapshot
+        Assert.Equal(PrefixLen, Check(cached, plain, model, Prompt(32)).Timings.CachedTokenCount);
+
+        model.FailNextForward = true;
+        Assert.Throws<InvalidOperationException>(() => cached.Generate(Prompt(33), Opts));
+
+        var after = Check(cached, plain, model, Prompt(34));
+        Assert.Equal(0, after.Timings.CachedTokenCount);
+    }
+
+    [Fact]
+    public async Task FailedStreamingRequest_DropsTheSnapshot()
+    {
+        var (cached, plain, model) = Build();
+        Check(cached, plain, model, Prompt(30));
+        Check(cached, plain, model, Prompt(31));
+
+        model.FailNextForward = true;
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+        {
+            await foreach (var _ in cached.GenerateStreamingTokensAsync(Prompt(33), Opts)) { }
+        });
+
+        Assert.Equal(0, Check(cached, plain, model, Prompt(34)).Timings.CachedTokenCount);
+    }
+
+    [Fact]
+    public async Task CompletedStreamingRequest_KeepsTheSnapshot()
+    {
+        var (cached, plain, model) = Build();
+        Check(cached, plain, model, Prompt(30));
+        Check(cached, plain, model, Prompt(31));
+
+        await foreach (var _ in cached.GenerateStreamingTokensAsync(Prompt(33), Opts)) { }
+
+        Assert.Equal(PrefixLen, Check(cached, plain, model, Prompt(34)).Timings.CachedTokenCount);
+    }
+
+    [Fact]
     public void ExclusiveKvStorage_KeepsTheSnapshot_AcrossAnUnrelatedRequest()
     {
         var (cached, plain, model) = Build();
@@ -242,6 +288,9 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
         /// <summary>Token count of every Forward call, in order.</summary>
         public List<int> Calls { get; } = [];
 
+        /// <summary>When set, the next Forward throws (and clears the flag), like an OOM mid-request.</summary>
+        public bool FailNextForward { get; set; }
+
         /// <summary>Forwards whose KV cache length differed from their first position (a stale or un-rolled-back KV).</summary>
         public List<string> KvLengthMismatches { get; } = [];
 
@@ -271,6 +320,11 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
         private unsafe ITensor Core(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache)
         {
             int seqLen = tokenIds.Length;
+            if (FailNextForward)
+            {
+                FailNextForward = false;
+                throw new InvalidOperationException("injected forward failure");
+            }
             Calls.Add(seqLen);
             if (kvCache is not null && kvCache.CurrentLength != positions[0])
                 KvLengthMismatches.Add($"kv length {kvCache.CurrentLength} but forward starts at position {positions[0]}");

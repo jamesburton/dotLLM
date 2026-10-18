@@ -46,6 +46,10 @@ public sealed class TextGenerator
     private RecurrentPrefixEntry? _recurrentPrefix;
     private int[]? _recurrentPrefixLastPrompt;
 
+    // True from ResolveKvCache until the request reaches a normal end (StoreInPrefixCache). Still set in the request's finally
+    // means it failed or was abandoned, so the snapshot is dropped (PR #1026 re-review).
+    private bool _recurrentPrefixRequestPending;
+
     /// <summary>Shortest shared prefix worth snapshotting (tokens).</summary>
     public const int RecurrentPrefixMinTokens = 16;
 
@@ -294,6 +298,7 @@ public sealed class TextGenerator
 
         // Resolve KV-cache: reuse from prefix cache or allocate fresh
         var (kvCache, cachedTokenCount, ownsKvCache) = ResolveKvCache(promptIds, promptLen, maxTokens, out int snapshotAt);
+        _recurrentPrefixRequestPending = _recurrentPrefixEnabled;
 
         // Hybrid mode is enabled when a strategy is wired up, the prompt is short enough,
         // and we have a clean cache (no prefix-cache reuse, no speculative draft model, no MTP).
@@ -814,6 +819,7 @@ public sealed class TextGenerator
         }
         finally
         {
+            DropRecurrentPrefixIfRequestFailed();
             ArrayPool<char>.Shared.Return(stopScratch);
             mtpState?.Dispose();
             if (ownsKvCache)
@@ -894,6 +900,7 @@ public sealed class TextGenerator
 
         // Resolve KV-cache: reuse from prefix cache or allocate fresh
         var (kvCache, cachedTokenCount, ownsKvCache) = ResolveKvCache(promptIds, promptLen, maxTokens, out int snapshotAt);
+        _recurrentPrefixRequestPending = _recurrentPrefixEnabled;
         long kvBytes = GetKvCacheBytes(kvCache);
 
         // Hybrid mode: same gating as the non-streaming path.
@@ -1370,6 +1377,7 @@ public sealed class TextGenerator
                 decodeTicks * 1000.0 / Stopwatch.Frequency,
                 FinishReason.Length);
             RecordMtpGate(mtpGate, useMtp, generatedIds.Count, mtpTicks, mtpTokens, decodeTicks, samplerTicks);
+            DropRecurrentPrefixIfRequestFailed();
             ArrayPool<char>.Shared.Return(stopScratch);
             mtpState?.Dispose();
             if (ownsKvCache)
@@ -1493,6 +1501,9 @@ public sealed class TextGenerator
     private void StoreInPrefixCache(Core.Attention.IKvCache kvCache, int[] promptIds,
         List<int> generatedIds, ref bool ownsKvCache)
     {
+        // Every normal end of a request passes through here (before its terminal token is yielded): the request succeeded.
+        _recurrentPrefixRequestPending = false;
+
         // Recurrent models never reuse a KV-only prefix (see ResolveKvCache): nothing to store.
         if (_model.RequiresPerSequenceState)
             return;
@@ -1677,6 +1688,19 @@ public sealed class TextGenerator
         // A hit that moves its snapshot forward hands the same KV to the new entry: release only the old checkpoint.
         if (old is not null && ReferenceEquals(old.Kv, kvCache)) old.DisposeCheckpoint();
         else old?.Dispose();
+    }
+
+    /// <summary>
+    /// Drops the recurrent prefix snapshot when the request that used or produced it did not finish normally: a throw (for
+    /// example an OOM growing the KV after the free-VRAM admission had passed) or an abandoned stream. A grow-hit has already
+    /// raised the handle's MaxLength, so keeping the snapshot would make the next same-prefix request skip the admission and
+    /// retry the same failing allocation on every agent step (PR #1026 re-review).
+    /// </summary>
+    private void DropRecurrentPrefixIfRequestFailed()
+    {
+        if (!_recurrentPrefixRequestPending) return;
+        _recurrentPrefixRequestPending = false;
+        ClearRecurrentPrefixCache();
     }
 
     /// <summary>Releases the recurrent prefix snapshot (its KV cache and state checkpoint). Call when the model is unloaded.</summary>

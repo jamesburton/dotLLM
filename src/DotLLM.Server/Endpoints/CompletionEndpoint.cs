@@ -237,10 +237,11 @@ public static class CompletionEndpoint
                 }
             }, ct);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException and not ModelUnavailableException)
+        catch (Exception ex) when (ex is not OperationCanceledException and not ModelUnavailableException && !ct.IsCancellationRequested)
         {
             // PR #1026 review: once a keep-alive (or a chunk) has committed the SSE response there is no status left to set,
-            // and a bare truncation reads as a dropped connection. Report it in-stream, as chat and messages do.
+            // and a bare truncation reads as a dropped connection. Report it in-stream, as /v1/messages does for its own errors
+            // (chat does not yet).
             await SseResponse.WriteOpenAiErrorAsync(httpContext, 500, ErrorResponse.Internal(ex.Message));
             return;
         }
