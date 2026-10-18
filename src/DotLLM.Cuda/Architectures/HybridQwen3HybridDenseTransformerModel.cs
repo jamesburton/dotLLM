@@ -257,6 +257,9 @@ public sealed class Qwen3HybridDenseSplitKvCache : IKvCache
     /// <inheritdoc/>
     public int MaxLength => CpuCache.MaxLength;
 
+    /// <summary>The GPU half lives in the head model's single-slot storage, so this is the GPU handle's answer (false). PR #1026 review.</summary>
+    public bool HasExclusiveStorage => GpuHandle.HasExclusiveStorage;
+
     /// <inheritdoc/>
     public void Update(ITensor keys, ITensor values, ReadOnlySpan<int> positions, int layerIndex)
         => throw new NotSupportedException(

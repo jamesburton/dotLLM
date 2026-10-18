@@ -31,6 +31,9 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
 
     public long AllocatedBytes { get; private set; }
 
+    /// <summary>Rows every per-token buffer currently holds (0 before the first forward). Tests use it to observe the prefill tile bound (issue #1025).</summary>
+    internal int SequenceCapacity => _currentSeqLen;
+
     // ── Shared across all sub-layers ──────────────────────────────────────────
     public nint HiddenState;
     public nint Residual;

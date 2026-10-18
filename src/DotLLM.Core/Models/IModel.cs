@@ -509,6 +509,14 @@ public interface IModel : IDisposable
     bool TrySetAllRowLogitsLimit(int maxSeqLen) => false;
 
     /// <summary>
+    /// Tile size, in tokens, that this model already splits a long last-row-only prefill into internally, or 0 when
+    /// it runs a prefill as one pass. An engine with no chunk size configured prefills in chunks of this size
+    /// (issue #1025). It splits exactly where the model would, so the logits do not change, and it can observe
+    /// cancellation between chunks instead of waiting for the whole prompt.
+    /// </summary>
+    int PreferredPrefillChunkTokens => 0;
+
+    /// <summary>
     /// Allocates a fresh <see cref="IMtpState"/> — the MTP head's own tiny KV-cache plus pending
     /// hidden-state handoff — or <see langword="null"/> when <see cref="SupportsMtp"/> is
     /// <see langword="false"/>. The caller owns the returned state's lifetime (one per in-flight

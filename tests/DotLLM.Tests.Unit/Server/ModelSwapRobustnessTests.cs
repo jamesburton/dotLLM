@@ -45,12 +45,16 @@ public sealed class ModelSwapRobustnessTests
     private static Task<string> StreamAsync(Func<Func<Task>, CancellationToken, Task> gate, TimeSpan? interval) =>
         StreamAsync(gate, interval, new RecordingStream());
 
-    private static async Task<string> StreamAsync(Func<Func<Task>, CancellationToken, Task> gate, TimeSpan? interval, RecordingStream body)
+    private static Task<string> StreamAsync(Func<Func<Task>, CancellationToken, Task> gate, TimeSpan? interval, RecordingStream body) =>
+        StreamAsync(gate, interval, body, _ => Script("hi"));
+
+    private static async Task<string> StreamAsync(Func<Func<Task>, CancellationToken, Task> gate, TimeSpan? interval, RecordingStream body,
+        Func<CancellationToken, IAsyncEnumerable<GenerationToken>> tokens)
     {
         var ctx = new DefaultHttpContext();
         ctx.Response.Body = body;
         await ChatCompletionEndpoint.WriteChatStreamAsync(
-            new ChatCompletionRequest { Messages = [], Stream = true }, ctx, _ => Script("hi"), gate, "chatcmpl-1", "m",
+            new ChatCompletionRequest { Messages = [], Stream = true }, ctx, tokens, gate, "chatcmpl-1", "m",
             tools: null, toolParser: null, ReasoningPlan.Disabled, CancellationToken.None,
             waitReason: () => "loading owner/repo/x.gguf", keepAliveInterval: interval);
         return Encoding.UTF8.GetString(body.ToArray());
@@ -82,6 +86,112 @@ public sealed class ModelSwapRobustnessTests
         Assert.True(role > lastComment, "the role chunk (and its response id) must follow every keep-alive: it is sent only under the gate");
         Assert.True(raw.Split(": waiting for").Length - 1 >= 2, raw);
         Assert.EndsWith("data: [DONE]\n\n", raw);
+    }
+
+    [Fact]
+    public async Task LongPrefill_GetsKeepAliveComments_BetweenTheRoleChunkAndTheFirstToken()
+    {
+        // Issue #1025: the role chunk goes out when the gate is taken, then the prefill runs before the first token. Here the
+        // source blocks its caller SYNCHRONOUSLY, like the real prefill inside the first MoveNextAsync, until two comments
+        // have been written after the role chunk. It waits on that observable outcome, not a fixed delay.
+        var body = new RecordingStream();
+        string raw = await StreamAsync((work, _) => work(), TimeSpan.FromMilliseconds(50), body,
+            _ => SlowPrefill(body, "\"role\":\"assistant\""));
+
+        int role = raw.IndexOf("\"role\":\"assistant\"", StringComparison.Ordinal);
+        int firstComment = raw.IndexOf(": waiting for prompt processing", StringComparison.Ordinal);
+        int lastComment = raw.LastIndexOf(": waiting for prompt processing", StringComparison.Ordinal);
+        int content = raw.IndexOf("\"content\":\"hi\"", StringComparison.Ordinal);
+        Assert.True(role >= 0 && firstComment > role, raw);
+        Assert.True(content > lastComment, "no keep-alive may follow the first token: " + raw);
+        Assert.True(raw.Split(": waiting for prompt processing").Length - 1 >= 2, raw);
+        Assert.EndsWith("data: [DONE]\n\n", raw);
+    }
+
+    /// <summary>
+    /// A token source whose first item blocks its caller SYNCHRONOUSLY, like the real prefill inside the first MoveNextAsync,
+    /// until two prefill keep-alives have been written after <paramref name="marker"/>. It waits on that observable
+    /// outcome, not a fixed delay, so a starved thread pool cannot make it flaky.
+    /// </summary>
+    private static async IAsyncEnumerable<GenerationToken> SlowPrefill(RecordingStream body, string marker, bool fail = false)
+    {
+        int CommentsAfterMarker()
+        {
+            string t = body.Text;
+            int at = t.IndexOf(marker, StringComparison.Ordinal);
+            return at < 0 ? 0 : t[at..].Split(": waiting for prompt processing").Length - 1;
+        }
+
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+        while (CommentsAfterMarker() < 2 && DateTime.UtcNow < deadline)
+            Thread.Sleep(10);
+        if (fail)
+            throw new InvalidOperationException("prefill exploded");
+        yield return new GenerationToken(0, "hi", FinishReason.Stop);
+        await Task.CompletedTask;
+    }
+
+    [Fact]
+    public async Task MessagesStream_LongPrefill_GetsKeepAliveComments_AfterMessageStart()
+    {
+        // PR #1026 review: the same prefill keep-alive on /v1/messages, at the interval it is given.
+        var body = new RecordingStream();
+        var ctx = new DefaultHttpContext { Response = { Body = body } };
+
+        await MessagesEndpoint.WriteMessageStreamAsync(ctx, _ => SlowPrefill(body, "message_start"), (work, _) => work(),
+            toolCallParser: null, requestStopSequences: null, messageId: "msg_1", modelId: "m", promptTokenCount: 3,
+            CancellationToken.None, keepAliveInterval: TimeSpan.FromMilliseconds(50));
+
+        string raw = body.Text;
+        int start = raw.IndexOf("message_start", StringComparison.Ordinal);
+        int firstComment = raw.IndexOf(": waiting for prompt processing", StringComparison.Ordinal);
+        int lastComment = raw.LastIndexOf(": waiting for prompt processing", StringComparison.Ordinal);
+        int delta = raw.IndexOf("content_block_delta", StringComparison.Ordinal);
+        Assert.True(start >= 0 && firstComment > start, raw);
+        Assert.True(delta > lastComment, "no keep-alive may follow the first token: " + raw);
+        Assert.Contains("message_stop", raw);
+    }
+
+    [Fact]
+    public async Task CompletionsStream_LongPrefill_GetsKeepAliveComments_BeforeTheFirstChunk()
+    {
+        var body = new RecordingStream();
+        var ctx = new DefaultHttpContext { Response = { Body = body } };
+
+        // No marker precedes the first keep-alive here (completions has no role chunk), so count from the start.
+        await CompletionEndpoint.WriteCompletionStreamAsync(ctx, _ => SlowPrefill(body, ""), (work, _) => work(),
+            "cmpl-1", "m", includeUsageChunk: false, CancellationToken.None, TimeSpan.FromMilliseconds(50));
+
+        string raw = body.Text;
+        Assert.StartsWith(": waiting for prompt processing", raw);
+        Assert.True(raw.IndexOf("\"text\":\"hi\"", StringComparison.Ordinal) > raw.LastIndexOf(": waiting", StringComparison.Ordinal), raw);
+        Assert.EndsWith("data: [DONE]\n\n", raw);
+    }
+
+    [Fact]
+    public async Task CompletionsStream_FailureAfterAKeepAlive_IsReportedInStream_NotTruncated()
+    {
+        // PR #1026 review: a keep-alive commits the 200 + text/event-stream, so a later failure can no longer set a status.
+        // It used to end the stream bare, which a client reads as a dropped connection.
+        var body = new RecordingStream();
+        var ctx = new DefaultHttpContext();
+        // DefaultHttpContext never reports a started response; a real server does after the first byte.
+        ctx.Features.Set<Microsoft.AspNetCore.Http.Features.IHttpResponseFeature>(new StartsOnWriteFeature(body));
+        ctx.Response.Body = body;
+
+        await CompletionEndpoint.WriteCompletionStreamAsync(ctx, _ => SlowPrefill(body, "", fail: true), (work, _) => work(),
+            "cmpl-1", "m", includeUsageChunk: false, CancellationToken.None, TimeSpan.FromMilliseconds(50));
+
+        string raw = body.Text;
+        Assert.StartsWith(": waiting for prompt processing", raw);
+        Assert.True(raw.Contains("\"error\":{\"message\":\"prefill exploded\"", StringComparison.Ordinal), raw);
+        Assert.Contains("prefill exploded", raw);
+        Assert.EndsWith("data: [DONE]\n\n", raw);
+    }
+
+    private sealed class StartsOnWriteFeature(RecordingStream body) : Microsoft.AspNetCore.Http.Features.HttpResponseFeature
+    {
+        public override bool HasStarted => body.Length > 0;
     }
 
     [Fact]

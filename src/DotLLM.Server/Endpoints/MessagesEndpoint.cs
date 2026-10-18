@@ -186,7 +186,7 @@ public static class MessagesEndpoint
             // (#1023) The generator current under the gate, not the one captured before a possible queued swap.
             await state.ExecuteAsync(modelId, current =>
             {
-                result = current.Generate(prompt, options);
+                result = current.Generate(prompt, options, cancellationToken: ct);
                 return Task.CompletedTask;
             }, ct);
         }
@@ -293,7 +293,7 @@ public static class MessagesEndpoint
                 state.DescribeWait, state.KeepAliveInterval),
             toolCallParser,
             request.StopSequences,
-            messageId, modelId, promptTokenCount, ct, forcedToolCall, plan, tools);
+            messageId, modelId, promptTokenCount, ct, forcedToolCall, plan, tools, state.KeepAliveInterval);
     }
 
     /// <summary>
@@ -322,7 +322,8 @@ public static class MessagesEndpoint
         CancellationToken ct,
         bool forcedToolCall = false,
         ReasoningPlan? plan = null,
-        IReadOnlyList<ToolDefinition>? tools = null)
+        IReadOnlyList<ToolDefinition>? tools = null,
+        TimeSpan? keepAliveInterval = null)
     {
         // (#1023 review) Stop the activation-phase keep-alive before touching headers (it commits them itself).
         await SseKeepAlive.StopForAsync(httpContext);
@@ -454,7 +455,8 @@ public static class MessagesEndpoint
         {
             await execute(async () =>
             {
-                await foreach (var token in tokenSource(ct))
+                // (#1025) Keep-alive comments while the prefill runs, until the first token.
+                await foreach (var token in SseKeepAlive.UntilFirstItem(httpContext, tokenSource(ct), keepAliveInterval, ct))
                 {
                     if (token.Text.Length > 0)
                     {

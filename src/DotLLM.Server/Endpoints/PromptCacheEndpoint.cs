@@ -82,7 +82,7 @@ public static class PromptCacheEndpoint
                     MaxTokens = 1,
                 };
                 var prompt = request.Prompt ?? state.Tokenizer.Decode(tokens);
-                state.Generator.Generate(prompt, opts);
+                state.Generator.Generate(prompt, opts, cancellationToken: ctx.RequestAborted);
                 await Task.CompletedTask;
             }, ctx.RequestAborted);
 

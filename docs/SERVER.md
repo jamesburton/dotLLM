@@ -343,6 +343,17 @@ in-stream: on the OpenAI surfaces as `data: {"error":{...}}` followed by `data: 
 `event: error` / `data: {"type":"error","error":{"type":"...","message":"..."}}` (no `[DONE]`). Ollama's NDJSON `/api/*` streams get no
 keep-alive (NDJSON has no comment syntax).
 
+**Prefill keep-alive (#1025).** Once the request holds the lock, the same comments continue until the first token. The prompt's
+prefill runs before it, which takes minutes for a long agent conversation:
+
+```text
+: waiting for prompt processing (40s)
+
+```
+
+A client that disconnects (or a server shutdown) stops the prefill at the next chunk boundary: 1,024 tokens on the CUDA Qwen3
+hybrids (`IModel.PreferredPrefillChunkTokens`), or `--prefill-chunk-size`. Non-streaming requests observe the same cancellation.
+
 ## Model names, the hub cache and pulling (#714)
 
 One resolver (`DotLLM.HuggingFace.ModelResolver`) turns a model name into a GGUF everywhere - `dotllm run|chat|serve|bench`, a request's `model`

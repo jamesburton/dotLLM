@@ -95,6 +95,45 @@ internal sealed class SseKeepAlive : IAsyncDisposable
             }
         };
 
+    /// <summary>
+    /// Passes <paramref name="source"/> through and sends keep-alive comments until its first item arrives (issue #1025). The
+    /// role chunk goes out when the request takes the gate, but the first token waits for the prompt prefill, which takes
+    /// minutes on a long agent prompt. Without this the stream was silent all that time, so a client could not tell a
+    /// long prefill from a dead server, and a read timeout dropped it.
+    /// </summary>
+    /// <typeparam name="T">Item type.</typeparam>
+    /// <param name="context">The streaming request, whose response has already started.</param>
+    /// <param name="source">The token source. Its first <c>MoveNextAsync</c> runs the prefill.</param>
+    /// <param name="interval">Interval between comments; <see cref="DefaultInterval"/> when null.</param>
+    /// <param name="ct">Cancels the enumeration.</param>
+    /// <returns>The items of <paramref name="source"/>, unchanged.</returns>
+    public static async IAsyncEnumerable<T> UntilFirstItem<T>(
+        HttpContext context, IAsyncEnumerable<T> source, TimeSpan? interval = null,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        await StopForAsync(context);   // never two writers on one response
+        long started = System.Diagnostics.Stopwatch.GetTimestamp();
+        SseKeepAlive? keepAlive = Start(context,
+            () => $"prompt processing ({System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalSeconds:F0}s)", interval);
+        try
+        {
+            await foreach (var item in source.WithCancellation(ct).ConfigureAwait(false))
+            {
+                if (keepAlive is not null)
+                {
+                    // Waits for an in-flight comment, so the first real event never interleaves with one.
+                    await keepAlive.DisposeAsync().ConfigureAwait(false);
+                    keepAlive = null;
+                }
+                yield return item;
+            }
+        }
+        finally
+        {
+            if (keepAlive is not null) await keepAlive.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
     /// <summary>Stops the keep-alives and waits for any in-flight write. Idempotent.</summary>
     /// <returns>A task that completes when no keep-alive can be written any more.</returns>
     public async Task StopAsync()

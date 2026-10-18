@@ -548,7 +548,32 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// cache) — the returned handle only communicates the capacity to
     /// <see cref="Forward(System.ReadOnlySpan{int}, System.ReadOnlySpan{int}, int, IKvCache?)"/>.
     /// </summary>
-    public CudaHybridKvCacheHandle CreateKvCache(int maxSeqLen) => new(maxSeqLen);
+    public CudaHybridKvCacheHandle CreateKvCache(int maxSeqLen) => new(maxSeqLen, CanGrowKvStorageTo);   // EnsureF16KvCache keeps rows on growth (#1025)
+
+    /// <summary>Free device memory a copying KV growth must leave beyond the new storage (PR #1026 review): forward scratch, cuBLAS workspace, other processes.</summary>
+    internal const long KvGrowthVramMarginBytes = 512L << 20;
+
+    /// <summary>
+    /// Admission for <see cref="CudaHybridKvCacheHandle.TryGrowTo"/>. A growth past the allocated storage copies the live rows, so old and new
+    /// storage briefly coexist. The pre-#1025 miss path freed first. When the new storage plus
+    /// <see cref="KvGrowthVramMarginBytes"/> does not fit in free device memory, refuse, and the engine falls back to that miss path instead of
+    /// pushing the card into the shared-memory spill #1025 was about.
+    /// </summary>
+    /// <param name="maxLength">The handle's requested length.</param>
+    /// <returns><see langword="true"/> when the growth may proceed.</returns>
+    internal bool CanGrowKvStorageTo(int maxLength)
+    {
+        if (_f16KCache is null || maxLength <= _f16CacheMaxSeqLen) return true;   // nothing to copy: allocated (free-first) on demand
+        long free = FreeVramOverride ?? QueryFreeDeviceBytes();
+        return free >= ComputeKvBytes(maxLength) + KvGrowthVramMarginBytes;
+    }
+
+    private long QueryFreeDeviceBytes()
+    {
+        _context.MakeCurrent();
+        CudaDriverApi.cuMemGetInfo_v2(out nuint free, out _).ThrowOnError();
+        return (long)free;
+    }
 
     /// <inheritdoc/>
     /// <remarks>
@@ -1573,8 +1598,26 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     [ThreadStatic]
     internal static int? PrefillChunkOverride;
 
+    /// <summary>
+    /// Test hook (PR #1026 review): when set, the KV storage allocation after this many successful buffer allocations
+    /// throws, as a real OOM partway through <c>EnsureF16KvCache</c> would. Thread-static, like <see cref="PrefillChunkOverride"/>.
+    /// </summary>
+    [ThreadStatic]
+    internal static int? KvAllocFailureAfter;
+
+    /// <summary>Test hook (PR #1026 review): when set, the free device memory the KV growth admission sees, in bytes.</summary>
+    [ThreadStatic]
+    internal static long? FreeVramOverride;
+
+    /// <summary>Rows the per-token forward buffers are sized for: bounded by the prefill tile when tiling applies (issue #1025).</summary>
+    internal int ForwardStateSequenceCapacity => _state.SequenceCapacity;
+
     /// <summary>Tile size in force for this thread: the override, else the environment/default.</summary>
     internal static int PrefillChunkTokens => PrefillChunkOverride ?? PrefillChunkFromEnv;
+
+    /// <inheritdoc/>
+    /// <remarks>The <see cref="ForwardCore"/> tile, so an engine that chunks at it splits exactly where this model would (issue #1025).</remarks>
+    public int PreferredPrefillChunkTokens => PrefillChunkTokens;
 
     /// <summary>
     /// Core forward pass. Tiles a long prefill over tokens (issue #494) so peak VRAM is bounded by
@@ -1591,7 +1634,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// <c>--depth</c> walk chunks, via <c>BenchRunner</c>'s own <c>DepthExtensionChunkSize</c>), and
     /// so does any direct <c>IModel</c> caller. The engine knob remains the user-facing <c>-ub</c>
     /// analog; this is the backend defending its own VRAM ceiling.</para>
-    /// <para>Four gates keep it off where it would change behaviour rather than just memory:</para>
+    /// <para>Three gates keep it off where it would change behaviour rather than just memory:</para>
     /// <list type="bullet">
     /// <item><c>kvCache is null</c> — later tiles would have nothing to attend to. A cacheless
     /// caller (<c>PerplexityEvaluator</c>, <c>debug forward-pass</c>) also wants every row, so it
@@ -1599,14 +1642,18 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// <item><c>!lastTokenLogitsOnly</c> — the caller wants a row per position, which a tile loop
     /// would have to reassemble. Every long-prompt caller opts into the hint (issue #493); the
     /// all-rows callers submit short batches (a speculative verify is K+1 tokens).</item>
-    /// <item><c>mtpCapture is not null</c> — the per-tile capture/absorb sequence is very probably
-    /// equivalent (each tile seeds the carry from its own last row, which is what the next tile's
-    /// token 0 pairs with), but that equivalence is UNTESTED and the #469 absorb path is owned
-    /// elsewhere. An MTP prefill therefore keeps the single-call behaviour.</item>
     /// <item><c>_rowSnapshotRequestRows &gt; 0</c> — <c>ForwardWithRecurrentSnapshots</c> (#473)
     /// records a GDN snapshot per input row; a tile loop would leave only the last tile's rows
     /// valid.</item>
     /// </list>
+    /// <para><b>An MTP prefill is tiled too</b> (issue #1025). It used to be exempt, so an MTP request
+    /// sized every per-token buffer for the whole prompt. On Bonsai 2 27B that is ~600 KB/token: a
+    /// 5.8k-token agent prompt oversubscribed a 12 GB card, spilled to shared memory and prefilled
+    /// for tens of minutes, which is the #494 thrash again. Each MTP tile runs the full tail
+    /// (final norm over its rows, capture, absorb, carry seeded from its last row). That is the same
+    /// sequence of calls a decode/verify loop already makes, and
+    /// <c>CudaQwen3HybridDenseMtpPrefillTilingTests</c> pins it against the single call. Its
+    /// non-final tiles still project their last row through the LM head: one row per tile.</para>
     /// <para><b>Not bit-identical</b> to the single call: each layer's GEMMs run with a different
     /// M per tile and cuBLAS selects per-M algorithms, so the last row's logits agree only to the
     /// usual accumulation-order tolerance — the same caveat
@@ -1621,7 +1668,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         int chunk = PrefillChunkTokens;
         int total = tokenIds.Length;
         if (chunk <= 0 || total <= chunk || kvCache is null || !lastTokenLogitsOnly
-            || mtpCapture is not null || _rowSnapshotRequestRows > 0)
+            || _rowSnapshotRequestRows > 0)
         {
             return ForwardTile(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly,
                                mtpCapture, produceLogits: true)!;
@@ -1636,10 +1683,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                 bool isFinal = offset + len >= total;
                 // Non-final tiles skip the final norm, the LM-head GEMM and the D2H copy entirely:
                 // the caller asked for the last row only, so their logits would be discarded. That
-                // is a prefill-time win on top of the VRAM one.
+                // is a prefill-time win on top of the VRAM one. An MTP tile cannot skip the tail,
+                // because the capture and absorb live there (issue #1025), so it keeps it and its
+                // one-row logits are dropped when the next tile starts.
+                logits?.Dispose();
                 logits = ForwardTile(tokenIds.Slice(offset, len), positions.Slice(offset, len),
                                      deviceId, kvCache, lastTokenLogitsOnly: true,
-                                     mtpCapture: null, produceLogits: isFinal);
+                                     mtpCapture, produceLogits: isFinal || mtpCapture is not null);
             }
             return logits!;
         }
@@ -3510,58 +3560,116 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     //  Per-attention-layer F16 KV cache (model-private) — verbatim.
     // ──────────────────────────────────────────────────────────────────────
 
+    /// <remarks>
+    /// Growth keeps the live rows <c>[0, _f16CacheCurrentLength)</c> (issue #1025): a recurrent-prefix hit grows its
+    /// handle (<see cref="CudaHybridKvCacheHandle.TryGrowTo"/>) rather than re-prefilling, and the prefix it reuses
+    /// lives in this storage. A new handle has already reset the live length to 0 (see <c>_lastForwardKvCache</c>),
+    /// so nothing is copied for an unrelated sequence, and the old storage is freed before the new one is allocated, as
+    /// before. Only a copy makes old and new storage coexist briefly.
+    /// </remarks>
     private void EnsureF16KvCache(int maxSeqLen, int numKvHeads, int headDim)
     {
         if (_f16KCache is not null && maxSeqLen <= _f16CacheMaxSeqLen) return;
-
-        FreeKvStorage();
 
         int kvElems = numKvHeads * headDim;
         if ((IsQuantKv(_kvKeyDType) || IsQuantKv(_kvValueDType)) && kvElems % 32 != 0)
             throw new NotSupportedException(
                 $"Quantized KV storage needs numKvHeads*headDim ({kvElems}) to be a multiple of 32.");
 
-        _f16KCache = new nint[_attentionLayerCount];
-        _f16VCache = new nint[_attentionLayerCount];
-        _kQuant = new nint[_attentionLayerCount];
-        _vQuant = new nint[_attentionLayerCount];
+        int keepRows = _f16KCache is null ? 0 : Math.Min(_f16CacheCurrentLength, _f16CacheMaxSeqLen);
+        if (keepRows == 0)
+        {
+            // Nothing to keep: free first, so peak VRAM is the new size alone. A failure below then leaves no storage
+            // at all (_f16KCache null), which the next call simply allocates.
+            FreeKvStorage();
+            _f16CacheMaxSeqLen = 0;
+            _f16CacheCurrentLength = 0;
+        }
+
+        // Allocate into locals and publish only once every buffer exists (PR #1026 review). An OOM partway through used to
+        // leave half-zero arrays in the fields and leak the old storage, and the retry then "kept" rows copied out of
+        // buffers that were never filled. Now a failure frees what it allocated, and the old storage stays valid.
+        var newK = new nint[_attentionLayerCount];
+        var newV = new nint[_attentionLayerCount];
+        var newKQ = new nint[_attentionLayerCount];
+        var newVQ = new nint[_attentionLayerCount];
         long f16Bytes = (long)maxSeqLen * kvElems * sizeof(ushort);
         long kBytes = (long)maxSeqLen * QuantRowBytes(_kvKeyDType, kvElems);
         long vBytes = (long)maxSeqLen * QuantRowBytes(_kvValueDType, kvElems);
-        for (int i = 0; i < _attentionLayerCount; i++)
+        try
         {
-            if (IsQuantKv(_kvKeyDType)) _kQuant[i] = AllocDevice(kBytes);
-            else _f16KCache[i] = AllocDevice(f16Bytes);
-            if (IsQuantKv(_kvValueDType)) _vQuant[i] = AllocDevice(vBytes);
-            else _f16VCache[i] = AllocDevice(f16Bytes);
+            for (int i = 0; i < _attentionLayerCount; i++)
+            {
+                if (IsQuantKv(_kvKeyDType)) newKQ[i] = AllocKvDevice(kBytes);
+                else newK[i] = AllocKvDevice(f16Bytes);
+                if (IsQuantKv(_kvValueDType)) newVQ[i] = AllocKvDevice(vBytes);
+                else newV[i] = AllocKvDevice(f16Bytes);
+            }
+            if (keepRows > 0)
+            {
+                long f16Row = (long)kvElems * sizeof(ushort);
+                long kRow = QuantRowBytes(_kvKeyDType, kvElems);
+                long vRow = QuantRowBytes(_kvValueDType, kvElems);
+                nint streamH = _stream.Handle;
+                for (int i = 0; i < _attentionLayerCount; i++)
+                {
+                    CopyRows(_f16KCache![i], newK[i], keepRows * f16Row, streamH);
+                    CopyRows(_f16VCache![i], newV[i], keepRows * f16Row, streamH);
+                    CopyRows(_kQuant![i], newKQ[i], keepRows * kRow, streamH);
+                    CopyRows(_vQuant![i], newVQ[i], keepRows * vRow, streamH);
+                }
+                _stream.Synchronize();   // the old buffers are freed below
+            }
         }
+        catch
+        {
+            if (keepRows > 0)
+            {
+                try { _stream.Synchronize(); }   // no copy may still be reading or writing what is freed next
+                catch { /* a faulted stream: free regardless */ }
+            }
+            FreeKvStorage(newK, newV, newKQ, newVQ);
+            throw;
+        }
+
+        FreeKvStorage();   // the old storage (already null when nothing was kept)
+        _f16KCache = newK;
+        _f16VCache = newV;
+        _kQuant = newKQ;
+        _vQuant = newVQ;
         _f16CacheMaxSeqLen = maxSeqLen;
-        _f16CacheCurrentLength = 0;
+        _f16CacheCurrentLength = keepRows;
+
+        static void CopyRows(nint src, nint dst, long bytes, nint stream)
+        {
+            if (src != 0 && dst != 0 && bytes > 0)
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(dst, src, (nuint)bytes, stream).ThrowOnError();
+        }
     }
 
     /// <summary>Frees the per-slot KV storage (F16 and quantized) and the shared dequant scratch.</summary>
     private void FreeKvStorage()
     {
-        if (_f16KCache is not null)
-        {
-            for (int i = 0; i < _f16KCache.Length; i++)
-            {
-                if (_f16KCache[i] != 0) CudaDriverApi.cuMemFree_v2(_f16KCache[i]);
-                if (_f16VCache![i] != 0) CudaDriverApi.cuMemFree_v2(_f16VCache[i]);
-            }
-        }
-        if (_kQuant is not null)
-        {
-            for (int i = 0; i < _kQuant.Length; i++)
-            {
-                if (_kQuant[i] != 0) CudaDriverApi.cuMemFree_v2(_kQuant[i]);
-                if (_vQuant![i] != 0) CudaDriverApi.cuMemFree_v2(_vQuant[i]);
-            }
-        }
+        FreeKvStorage(_f16KCache, _f16VCache, _kQuant, _vQuant);
         _f16KCache = null;
         _f16VCache = null;
         _kQuant = null;
         _vQuant = null;
+    }
+
+    private static void FreeKvStorage(nint[]? k, nint[]? v, nint[]? kq, nint[]? vq)
+    {
+        FreeAll(k);
+        FreeAll(v);
+        FreeAll(kq);
+        FreeAll(vq);
+
+        static void FreeAll(nint[]? buffers)
+        {
+            if (buffers is null) return;
+            foreach (nint p in buffers)
+                if (p != 0) CudaDriverApi.cuMemFree_v2(p);
+        }
     }
 
     /// <summary>
@@ -4428,6 +4536,18 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         CudaDriverApi.cuMemAlloc_v2(out nint ptr, (nuint)bytes).ThrowOnError();
         allocs?.Add(ptr);
         return ptr;
+    }
+
+    /// <summary><see cref="AllocDevice"/> for KV storage, honouring <see cref="KvAllocFailureAfter"/>.</summary>
+    private static nint AllocKvDevice(long bytes)
+    {
+        if (KvAllocFailureAfter is int left)
+        {
+            if (left <= 0)
+                throw new InvalidOperationException("Injected KV allocation failure (test hook KvAllocFailureAfter).");
+            KvAllocFailureAfter = left - 1;
+        }
+        return AllocDevice(bytes);
     }
 
     private static void CopyHtoD(nint dst, nint src, long bytes)

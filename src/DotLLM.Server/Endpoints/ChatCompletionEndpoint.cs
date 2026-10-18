@@ -223,7 +223,7 @@ public static class ChatCompletionEndpoint
                 // (#1023) The generator is the one current under the gate, not one captured before a queued swap.
                 await state.ExecuteAsync(modelId, generator =>
                 {
-                    one = generator.Generate(prompt, choiceOptions, adapter: adapter);
+                    one = generator.Generate(prompt, choiceOptions, adapter: adapter, cancellationToken: ct);
                     return Task.CompletedTask;
                 }, ct);
                 results[i] = one!;
@@ -503,7 +503,8 @@ public static class ChatCompletionEndpoint
         await execute(async () =>
         {
             await WriteSseChunk(httpContext, roleChunk, ct);
-            await foreach (var token in tokenSource(ct))
+            // (#1025) Keep-alive comments while the prefill runs, until the first token.
+            await foreach (var token in SseKeepAlive.UntilFirstItem(httpContext, tokenSource(ct), keepAliveInterval, ct))
             {
                 if (token.Text.Length > 0)
                 {
