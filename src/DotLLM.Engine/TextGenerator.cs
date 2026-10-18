@@ -52,6 +52,9 @@ public sealed class TextGenerator
     /// <summary>Extra KV positions allocated beyond the request when a prefix snapshot is taken, so a slightly longer later prompt can still reuse it.</summary>
     private const int RecurrentPrefixKvHeadroom = 256;
 
+    /// <summary>Most positions a recurrent-prefix KV growth adds beyond the request (PR #1026 review: the CUDA hybrid's storage never shrinks).</summary>
+    private const int RecurrentPrefixMaxGrowthHeadroom = 2048;
+
     private sealed class RecurrentPrefixEntry(int[] tokens, Core.Attention.IKvCache kv, object? checkpoint)
     {
         public readonly int[] Tokens = tokens;
@@ -1651,16 +1654,18 @@ public sealed class TextGenerator
     }
 
     /// <summary>
-    /// True when <paramref name="kv"/> holds <paramref name="needed"/> positions, growing it when needed: by a quarter more
-    /// than asked (at least <see cref="RecurrentPrefixKvHeadroom"/>), so a growing agent conversation does not reallocate on
-    /// every step. Capped at the context window.
+    /// True when <paramref name="kv"/> holds <paramref name="needed"/> positions, growing it when needed. The headroom is an
+    /// eighth of the request, at least <see cref="RecurrentPrefixKvHeadroom"/> and at most <see cref="RecurrentPrefixMaxGrowthHeadroom"/>,
+    /// so a growing agent conversation does not reallocate on every step. It is capped because model-owned storage (the CUDA hybrid)
+    /// never shrinks. Capped at the context window too. A cache may refuse (no room for the copy): the caller then misses.
     /// </summary>
     private bool EnsureRecurrentPrefixKvCapacity(Core.Attention.IKvCache kv, int needed)
     {
         if (kv.MaxLength >= needed) return true;
         int maxSeq = _model.Config.MaxSequenceLength;
         if (needed > maxSeq) return false;
-        int target = (int)Math.Min(maxSeq, needed + Math.Max(RecurrentPrefixKvHeadroom, needed / 4L));
+        int headroom = Math.Clamp(needed / 8, RecurrentPrefixKvHeadroom, RecurrentPrefixMaxGrowthHeadroom);
+        int target = (int)Math.Min(maxSeq, (long)needed + headroom);
         return kv.TryGrowTo(target);
     }
 

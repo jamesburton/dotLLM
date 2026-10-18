@@ -88,6 +88,37 @@ public sealed class CudaQwen3HybridDenseKvGrowthTests : IDisposable
                 $"logits[{i}]: never-grown {reference[i]:R} vs retried after a failed growth {retried[i]:R}");
     }
 
+    [SkippableFact]
+    public void Growth_IsRefused_WhenOldPlusNewStorageWouldNotFitInFreeVram()
+    {
+        // PR #1026 review (SF2): a copying growth holds old and new storage at once, where the pre-#1025 miss freed first.
+        // When that would not fit, TryGrowTo says no, and the engine takes the miss path (free, then allocate).
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir is null, "PTX files not found");
+        string path = SyntheticQwen35HybridDenseMtpGguf.Write(Path.Combine(_scratch, "v.gguf"), withMtp: false);
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var model = CudaQwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ptxDir!);
+        using var kv = model.CreateKvCache(6);
+        using (ITensor _ = model.Forward([1, 4, 7], [0, 1, 2], deviceId: -1, kv, lastTokenLogitsOnly: true)) { }
+
+        CudaQwen3HybridDenseTransformerModel.FreeVramOverride = 0;
+        try
+        {
+            Assert.False(kv.TryGrowTo(16));
+            Assert.Equal(6, kv.MaxLength);
+            Assert.True(kv.TryGrowTo(6));   // no growth needed: always fine
+        }
+        finally
+        {
+            CudaQwen3HybridDenseTransformerModel.FreeVramOverride = null;
+        }
+
+        Assert.True(kv.TryGrowTo(16));      // the real card has room for a few KiB
+        Assert.Equal(16, kv.MaxLength);
+    }
+
     private static unsafe float[] Run(string path, string ptxDir, int initialLength, bool grow)
     {
         using var gguf = GgufFile.Open(path);

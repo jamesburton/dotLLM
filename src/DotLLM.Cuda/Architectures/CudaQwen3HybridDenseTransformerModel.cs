@@ -548,7 +548,32 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// cache) — the returned handle only communicates the capacity to
     /// <see cref="Forward(System.ReadOnlySpan{int}, System.ReadOnlySpan{int}, int, IKvCache?)"/>.
     /// </summary>
-    public CudaHybridKvCacheHandle CreateKvCache(int maxSeqLen) => new(maxSeqLen, growable: true);   // EnsureF16KvCache keeps rows on growth (#1025)
+    public CudaHybridKvCacheHandle CreateKvCache(int maxSeqLen) => new(maxSeqLen, CanGrowKvStorageTo);   // EnsureF16KvCache keeps rows on growth (#1025)
+
+    /// <summary>Free device memory a copying KV growth must leave beyond the new storage (PR #1026 review): forward scratch, cuBLAS workspace, other processes.</summary>
+    internal const long KvGrowthVramMarginBytes = 512L << 20;
+
+    /// <summary>
+    /// Admission for <see cref="CudaHybridKvCacheHandle.TryGrowTo"/>. A growth past the allocated storage copies the live rows, so old and new
+    /// storage briefly coexist. The pre-#1025 miss path freed first. When the new storage plus
+    /// <see cref="KvGrowthVramMarginBytes"/> does not fit in free device memory, refuse, and the engine falls back to that miss path instead of
+    /// pushing the card into the shared-memory spill #1025 was about.
+    /// </summary>
+    /// <param name="maxLength">The handle's requested length.</param>
+    /// <returns><see langword="true"/> when the growth may proceed.</returns>
+    internal bool CanGrowKvStorageTo(int maxLength)
+    {
+        if (_f16KCache is null || maxLength <= _f16CacheMaxSeqLen) return true;   // nothing to copy: allocated (free-first) on demand
+        long free = FreeVramOverride ?? QueryFreeDeviceBytes();
+        return free >= ComputeKvBytes(maxLength) + KvGrowthVramMarginBytes;
+    }
+
+    private long QueryFreeDeviceBytes()
+    {
+        _context.MakeCurrent();
+        CudaDriverApi.cuMemGetInfo_v2(out nuint free, out _).ThrowOnError();
+        return (long)free;
+    }
 
     /// <inheritdoc/>
     /// <remarks>
@@ -1579,6 +1604,10 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// </summary>
     [ThreadStatic]
     internal static int? KvAllocFailureAfter;
+
+    /// <summary>Test hook (PR #1026 review): when set, the free device memory the KV growth admission sees, in bytes.</summary>
+    [ThreadStatic]
+    internal static long? FreeVramOverride;
 
     /// <summary>Rows the per-token forward buffers are sized for: bounded by the prefill tile when tiling applies (issue #1025).</summary>
     internal int ForwardStateSequenceCapacity => _state.SequenceCapacity;
