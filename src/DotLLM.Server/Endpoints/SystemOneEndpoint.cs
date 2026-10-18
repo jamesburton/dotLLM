@@ -227,7 +227,7 @@ public static class SystemOneEndpoint
         InferenceResponse? result = null;
         await state.ExecuteAsync(() =>
         {
-            result = state.Generator!.Generate(prompt, options);
+            result = state.Generator!.Generate(prompt, options, cancellationToken: ct);
             return Task.CompletedTask;
         }, ct);
         return result!;

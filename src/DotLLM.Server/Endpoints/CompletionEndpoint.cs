@@ -89,8 +89,17 @@ public static class CompletionEndpoint
         options = options with { MaxTokens = effectiveMaxTokens };
 
         if (request.Stream)
-            await HandleStreamingAsync(state, httpContext, request.Prompt, options,
-                requestId, modelId, adapter, request.WantsUsageChunk, ct);
+        {
+            // (#1023) ": waiting for ..." keep-alive comments while the gate is contended; the generator is read once it is held.
+            TextGenerator? current = null;
+            string prompt = request.Prompt;
+            await WriteCompletionStreamAsync(httpContext,
+                innerCt => current!.GenerateStreamingTokensAsync(prompt, options, innerCt, adapter),
+                SseKeepAlive.Wrap(httpContext,
+                    (work, gateCt) => state.ExecuteAsync(modelId, g => { current = g; return work(); }, gateCt),
+                    state.DescribeWait, state.KeepAliveInterval),
+                requestId, modelId, request.WantsUsageChunk, ct, state.KeepAliveInterval);
+        }
         else
             await HandleNonStreamingAsync(state, httpContext, request.Prompt, options,
                 requestId, modelId, adapter, ct);
@@ -164,13 +173,27 @@ public static class CompletionEndpoint
         await JsonSerializer.SerializeAsync(httpContext.Response.Body, response, ServerJsonContext.Default.CompletionResponse, ct);
     }
 
-    private static async Task HandleStreamingAsync(
-        ServerState state, HttpContext httpContext,
-        string prompt, DotLLM.Core.Configuration.InferenceOptions options,
+    /// <summary>
+    /// Emits the OpenAI legacy-completions SSE stream for one request. The token source and the model gate are injected, as in
+    /// <see cref="ChatCompletionEndpoint.WriteChatStreamAsync"/>, so keep-alives and error handling can be tested without a model.
+    /// </summary>
+    /// <param name="httpContext">The streaming request.</param>
+    /// <param name="tokenSource">Generation, started under the gate. Its first item waits for the prefill.</param>
+    /// <param name="execute">The model gate.</param>
+    /// <param name="requestId">The <c>cmpl-...</c> id.</param>
+    /// <param name="modelId">The model id reported in each chunk.</param>
+    /// <param name="includeUsageChunk">Whether to end with a usage-only chunk (<c>stream_options.include_usage</c>).</param>
+    /// <param name="ct">The request token.</param>
+    /// <param name="keepAliveInterval">Interval between keep-alive comments; the default when null.</param>
+    /// <returns>A task that completes when the stream is written.</returns>
+    internal static async Task WriteCompletionStreamAsync(
+        HttpContext httpContext,
+        Func<CancellationToken, IAsyncEnumerable<GenerationToken>> tokenSource,
+        Func<Func<Task>, CancellationToken, Task> execute,
         string requestId, string modelId,
-        DotLLM.Core.Lora.ILoraAdapter? adapter,
         bool includeUsageChunk,
-        CancellationToken ct)
+        CancellationToken ct,
+        TimeSpan? keepAliveInterval = null)
     {
         // (#1023 review) Stop the activation-phase keep-alive before touching headers (it commits them itself).
         await SseKeepAlive.StopForAsync(httpContext);
@@ -181,42 +204,46 @@ public static class CompletionEndpoint
         int completionTokens = 0;
         int promptTokens = 0;
 
-        // (#1023) ": waiting for ..." keep-alive comments while the gate is contended; the generator is read once it is held.
-        TextGenerator? current = null;
-        var execute = SseKeepAlive.Wrap(httpContext,
-            (work, gateCt) => state.ExecuteAsync(modelId, g => { current = g; return work(); }, gateCt),
-            state.DescribeWait, state.KeepAliveInterval);
-        await execute(async () =>
+        try
         {
-            // (#1025) Keep-alive comments while the prefill runs, until the first token.
-            await foreach (var token in SseKeepAlive.UntilFirstItem(httpContext,
-                current!.GenerateStreamingTokensAsync(prompt, options, ct, adapter), state.KeepAliveInterval, ct))
+            await execute(async () =>
             {
-                if (token.Text.Length > 0) completionTokens++;
-                if (token.Timings.HasValue) promptTokens = token.Timings.Value.PrefillTokenCount;
-
-                var tokenLogprobs = token.Logprobs.HasValue
-                    ? RequestConverter.ToLogprobsDto(token.Logprobs.Value)
-                    : null;
-                var chunk = new CompletionChunk
+                // (#1025) Keep-alive comments while the prefill runs, until the first token.
+                await foreach (var token in SseKeepAlive.UntilFirstItem(httpContext, tokenSource(ct), keepAliveInterval, ct))
                 {
-                    Id = requestId,
-                    Model = modelId,
-                    Choices = [new CompletionChunkChoiceDto
+                    if (token.Text.Length > 0) completionTokens++;
+                    if (token.Timings.HasValue) promptTokens = token.Timings.Value.PrefillTokenCount;
+
+                    var tokenLogprobs = token.Logprobs.HasValue
+                        ? RequestConverter.ToLogprobsDto(token.Logprobs.Value)
+                        : null;
+                    var chunk = new CompletionChunk
                     {
-                        Text = token.Text,
-                        Logprobs = tokenLogprobs,
-                        FinishReason = token.FinishReason.HasValue
-                            ? RequestConverter.ToFinishReasonString(token.FinishReason.Value)
-                            : null,
-                    }],
-                };
-                await httpContext.Response.WriteAsync("data: ", ct);
-                await JsonSerializer.SerializeAsync(httpContext.Response.Body, chunk, ServerJsonContext.Default.CompletionChunk, ct);
-                await httpContext.Response.WriteAsync("\n\n", ct);
-                await httpContext.Response.Body.FlushAsync(ct);
-            }
-        }, ct);
+                        Id = requestId,
+                        Model = modelId,
+                        Choices = [new CompletionChunkChoiceDto
+                        {
+                            Text = token.Text,
+                            Logprobs = tokenLogprobs,
+                            FinishReason = token.FinishReason.HasValue
+                                ? RequestConverter.ToFinishReasonString(token.FinishReason.Value)
+                                : null,
+                        }],
+                    };
+                    await httpContext.Response.WriteAsync("data: ", ct);
+                    await JsonSerializer.SerializeAsync(httpContext.Response.Body, chunk, ServerJsonContext.Default.CompletionChunk, ct);
+                    await httpContext.Response.WriteAsync("\n\n", ct);
+                    await httpContext.Response.Body.FlushAsync(ct);
+                }
+            }, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException and not ModelUnavailableException)
+        {
+            // PR #1026 review: once a keep-alive (or a chunk) has committed the SSE response there is no status left to set,
+            // and a bare truncation reads as a dropped connection. Report it in-stream, as chat and messages do.
+            await SseResponse.WriteOpenAiErrorAsync(httpContext, 500, ErrorResponse.Internal(ex.Message));
+            return;
+        }
 
         // Report actuals to the rate-limit lease so unused token budget is refunded.
         RateLimitMiddleware.GetLease(httpContext)
