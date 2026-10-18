@@ -47,6 +47,47 @@ public sealed class CudaQwen3HybridDenseKvGrowthTests : IDisposable
         Assert.Contains(grown, v => v != 0f);
     }
 
+    [SkippableFact]
+    public unsafe void FailedGrowthAllocation_LeavesTheOldStorageIntact_AndARetryKeepsTheRows()
+    {
+        // PR #1026 review (SF1): the new storage arrays used to be swapped in before the allocation loop. An OOM partway
+        // through leaked the old KV and left half-zero arrays, so the retry "kept" rows copied out of never-filled
+        // buffers: a silently corrupted prefix.
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir is null, "PTX files not found");
+        string path = SyntheticQwen35HybridDenseMtpGguf.Write(Path.Combine(_scratch, "f.gguf"), withMtp: false);
+        float[] reference = Run(path, ptxDir!, initialLength: 16, grow: false);
+
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var model = CudaQwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ptxDir!);
+        using var kv = model.CreateKvCache(6);
+        using (ITensor _ = model.Forward([1, 4, 7, 2, 9, 3], [0, 1, 2, 3, 4, 5], deviceId: -1, kv, lastTokenLogitsOnly: true)) { }
+        Assert.True(kv.TryGrowTo(16));
+        object? state = model.CheckpointRecurrentState();
+
+        CudaQwen3HybridDenseTransformerModel.KvAllocFailureAfter = 1;   // the 2nd KV buffer allocation fails
+        try
+        {
+            Assert.ThrowsAny<Exception>(() => model.Forward([5, 8, 6], [6, 7, 8], deviceId: -1, kv, lastTokenLogitsOnly: true));
+        }
+        finally
+        {
+            CudaQwen3HybridDenseTransformerModel.KvAllocFailureAfter = null;
+        }
+
+        // The engine's view of a failed request: roll the KV and the recurrent state back, then run it again.
+        kv.Rollback(6);
+        model.RestoreRecurrentState(state);
+        (state as IDisposable)?.Dispose();
+        using ITensor logits = model.Forward([5, 8, 6], [6, 7, 8], deviceId: -1, kv, lastTokenLogitsOnly: true);
+        float[] retried = new ReadOnlySpan<float>((void*)logits.DataPointer, config.VocabSize).ToArray();
+        for (int i = 0; i < reference.Length; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(reference[i]) == BitConverter.SingleToInt32Bits(retried[i]),
+                $"logits[{i}]: never-grown {reference[i]:R} vs retried after a failed growth {retried[i]:R}");
+    }
+
     private static unsafe float[] Run(string path, string ptxDir, int initialLength, bool grow)
     {
         using var gguf = GgufFile.Open(path);

@@ -1573,6 +1573,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     [ThreadStatic]
     internal static int? PrefillChunkOverride;
 
+    /// <summary>
+    /// Test hook (PR #1026 review): when set, the KV storage allocation after this many successful buffer allocations
+    /// throws, as a real OOM partway through <c>EnsureF16KvCache</c> would. Thread-static, like <see cref="PrefillChunkOverride"/>.
+    /// </summary>
+    [ThreadStatic]
+    internal static int? KvAllocFailureAfter;
+
     /// <summary>Rows the per-token forward buffers are sized for: bounded by the prefill tile when tiling applies (issue #1025).</summary>
     internal int ForwardStateSequenceCapacity => _state.SequenceCapacity;
 
@@ -3541,40 +3548,66 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                 $"Quantized KV storage needs numKvHeads*headDim ({kvElems}) to be a multiple of 32.");
 
         int keepRows = _f16KCache is null ? 0 : Math.Min(_f16CacheCurrentLength, _f16CacheMaxSeqLen);
-        if (keepRows == 0) FreeKvStorage();   // nothing to keep: free first, so peak VRAM is the new size alone
-        nint[]? oldK = _f16KCache, oldV = _f16VCache, oldKQ = _kQuant, oldVQ = _vQuant;
+        if (keepRows == 0)
+        {
+            // Nothing to keep: free first, so peak VRAM is the new size alone. A failure below then leaves no storage
+            // at all (_f16KCache null), which the next call simply allocates.
+            FreeKvStorage();
+            _f16CacheMaxSeqLen = 0;
+            _f16CacheCurrentLength = 0;
+        }
 
-        _f16KCache = new nint[_attentionLayerCount];
-        _f16VCache = new nint[_attentionLayerCount];
-        _kQuant = new nint[_attentionLayerCount];
-        _vQuant = new nint[_attentionLayerCount];
+        // Allocate into locals and publish only once every buffer exists (PR #1026 review). An OOM partway through used to
+        // leave half-zero arrays in the fields and leak the old storage, and the retry then "kept" rows copied out of
+        // buffers that were never filled. Now a failure frees what it allocated, and the old storage stays valid.
+        var newK = new nint[_attentionLayerCount];
+        var newV = new nint[_attentionLayerCount];
+        var newKQ = new nint[_attentionLayerCount];
+        var newVQ = new nint[_attentionLayerCount];
         long f16Bytes = (long)maxSeqLen * kvElems * sizeof(ushort);
         long kBytes = (long)maxSeqLen * QuantRowBytes(_kvKeyDType, kvElems);
         long vBytes = (long)maxSeqLen * QuantRowBytes(_kvValueDType, kvElems);
-        for (int i = 0; i < _attentionLayerCount; i++)
+        try
         {
-            if (IsQuantKv(_kvKeyDType)) _kQuant[i] = AllocDevice(kBytes);
-            else _f16KCache[i] = AllocDevice(f16Bytes);
-            if (IsQuantKv(_kvValueDType)) _vQuant[i] = AllocDevice(vBytes);
-            else _f16VCache[i] = AllocDevice(f16Bytes);
-        }
-        if (keepRows > 0)
-        {
-            long f16Row = (long)kvElems * sizeof(ushort);
-            long kRow = QuantRowBytes(_kvKeyDType, kvElems);
-            long vRow = QuantRowBytes(_kvValueDType, kvElems);
-            nint streamH = _stream.Handle;
             for (int i = 0; i < _attentionLayerCount; i++)
             {
-                CopyRows(oldK![i], _f16KCache[i], keepRows * f16Row, streamH);
-                CopyRows(oldV![i], _f16VCache[i], keepRows * f16Row, streamH);
-                CopyRows(oldKQ![i], _kQuant[i], keepRows * kRow, streamH);
-                CopyRows(oldVQ![i], _vQuant[i], keepRows * vRow, streamH);
+                if (IsQuantKv(_kvKeyDType)) newKQ[i] = AllocKvDevice(kBytes);
+                else newK[i] = AllocKvDevice(f16Bytes);
+                if (IsQuantKv(_kvValueDType)) newVQ[i] = AllocKvDevice(vBytes);
+                else newV[i] = AllocKvDevice(f16Bytes);
             }
-            _stream.Synchronize();   // the old buffers are freed below
+            if (keepRows > 0)
+            {
+                long f16Row = (long)kvElems * sizeof(ushort);
+                long kRow = QuantRowBytes(_kvKeyDType, kvElems);
+                long vRow = QuantRowBytes(_kvValueDType, kvElems);
+                nint streamH = _stream.Handle;
+                for (int i = 0; i < _attentionLayerCount; i++)
+                {
+                    CopyRows(_f16KCache![i], newK[i], keepRows * f16Row, streamH);
+                    CopyRows(_f16VCache![i], newV[i], keepRows * f16Row, streamH);
+                    CopyRows(_kQuant![i], newKQ[i], keepRows * kRow, streamH);
+                    CopyRows(_vQuant![i], newVQ[i], keepRows * vRow, streamH);
+                }
+                _stream.Synchronize();   // the old buffers are freed below
+            }
         }
-        FreeKvStorage(oldK, oldV, oldKQ, oldVQ);
+        catch
+        {
+            if (keepRows > 0)
+            {
+                try { _stream.Synchronize(); }   // no copy may still be reading or writing what is freed next
+                catch { /* a faulted stream: free regardless */ }
+            }
+            FreeKvStorage(newK, newV, newKQ, newVQ);
+            throw;
+        }
 
+        FreeKvStorage();   // the old storage (already null when nothing was kept)
+        _f16KCache = newK;
+        _f16VCache = newV;
+        _kQuant = newKQ;
+        _vQuant = newVQ;
         _f16CacheMaxSeqLen = maxSeqLen;
         _f16CacheCurrentLength = keepRows;
 
@@ -4474,6 +4507,18 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         CudaDriverApi.cuMemAlloc_v2(out nint ptr, (nuint)bytes).ThrowOnError();
         allocs?.Add(ptr);
         return ptr;
+    }
+
+    /// <summary><see cref="AllocDevice"/> for KV storage, honouring <see cref="KvAllocFailureAfter"/>.</summary>
+    private static nint AllocKvDevice(long bytes)
+    {
+        if (KvAllocFailureAfter is int left)
+        {
+            if (left <= 0)
+                throw new InvalidOperationException("Injected KV allocation failure (test hook KvAllocFailureAfter).");
+            KvAllocFailureAfter = left - 1;
+        }
+        return AllocDevice(bytes);
     }
 
     private static void CopyHtoD(nint dst, nint src, long bytes)
