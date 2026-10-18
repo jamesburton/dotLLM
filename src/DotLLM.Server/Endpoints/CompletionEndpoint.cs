@@ -188,7 +188,9 @@ public static class CompletionEndpoint
             state.DescribeWait, state.KeepAliveInterval);
         await execute(async () =>
         {
-            await foreach (var token in current!.GenerateStreamingTokensAsync(prompt, options, ct, adapter))
+            // (#1025) Keep-alive comments while the prefill runs, until the first token.
+            await foreach (var token in SseKeepAlive.UntilFirstItem(httpContext,
+                current!.GenerateStreamingTokensAsync(prompt, options, ct, adapter), state.KeepAliveInterval, ct))
             {
                 if (token.Text.Length > 0) completionTokens++;
                 if (token.Timings.HasValue) promptTokens = token.Timings.Value.PrefillTokenCount;
