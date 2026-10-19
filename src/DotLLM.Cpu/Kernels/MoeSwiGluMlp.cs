@@ -565,7 +565,7 @@ public static unsafe partial class MoeSwiGluMlp
                         upExpsRawBase, upExpsQt, upExpsRowBytes,
                         downExpsRawBase, downExpsQt, downExpsRowBytes,
                         bucketCursors, bucketSlots, uniqueExperts, uniqueExpertCount,
-                        numExpertsPerTok, hiddenSize, intermediateSize, useGeGLU, threadPool))
+                        numExpertsPerTok, hiddenSize, intermediateSize, useGeGLU, threadPool, packedLegacyExperts))
                 {
                     // Decode fast path ran: two pool dispatches for the whole layer (see TryExecuteRoutedDecodeN1).
                 }
@@ -791,7 +791,7 @@ public static unsafe partial class MoeSwiGluMlp
         bool gateUpUsesF32Resolved = (ctx.GateExpsQt == QuantizationType.F32 && gateExpsF32Ptrs.Length > e)
                                   || (ctx.UpExpsQt == QuantizationType.F32 && upExpsF32Ptrs.Length > e);
         bool gateUpShareQt = !gateUpUsesF32Resolved && ctx.GateExpsQt == ctx.UpExpsQt;
-        int prequantBytes = gateUpShareQt
+        int prequantBytes = gateUpShareQt && (ctx.PackedLegacy || !IsPackedLegacyQuant(ctx.GateExpsQt))
             ? ComputePrequantBytes(ctx.GateExpsQt, hiddenSize, batch)
             : 0;
         // Always rent at least 1 byte so the fixed-pointer pin is well-defined; we only
@@ -921,6 +921,9 @@ public static unsafe partial class MoeSwiGluMlp
         }
     }
 
+    private static bool IsPackedLegacyQuant(QuantizationType qt)
+        => qt is QuantizationType.Q4_0 or QuantizationType.Q4_1 or QuantizationType.Q5_1 or QuantizationType.IQ4_NL;
+
     /// <summary>
     /// Total byte size of a pre-quantized batch of <paramref name="batch"/> rows
     /// of <paramref name="k"/> elements for the Q8 staging type that pairs with
@@ -936,7 +939,11 @@ public static unsafe partial class MoeSwiGluMlp
                 if (k % 32 != 0) return 0;
                 return batch * (k / 32) * 34;
             case QuantizationType.Q5_0:
-                // Q5_0 weight × Q8_1 input: 36 bytes per 32-element block.
+            case QuantizationType.Q4_0:
+            case QuantizationType.Q4_1:
+            case QuantizationType.Q5_1:
+            case QuantizationType.IQ4_NL:
+                // Legacy weights × Q8_1 input: 36 bytes per 32-element block.
                 if (k % 32 != 0) return 0;
                 return batch * (k / 32) * 36;
             case QuantizationType.Q2_K:
@@ -978,6 +985,10 @@ public static unsafe partial class MoeSwiGluMlp
                     break;
                 }
             case QuantizationType.Q5_0:
+            case QuantizationType.Q4_0:
+            case QuantizationType.Q4_1:
+            case QuantizationType.Q5_1:
+            case QuantizationType.IQ4_NL:
                 {
                     int rowBytes = (k / 32) * 36;
                     for (int b = 0; b < batch; b++)
@@ -1042,11 +1053,9 @@ public static unsafe partial class MoeSwiGluMlp
         }
         // #1015: Q4_0 / Q4_1 / Q5_1 / IQ4_NL expert banks: packed x Q8_1 dot (llama.cpp quantises the activations to Q8 for these
         // banks too; the dequantise-to-F32 fallback below is ~10x slower and numerically differs from the reference).
-        if (packedLegacy && qt is QuantizationType.Q4_0 or QuantizationType.Q4_1 or QuantizationType.Q5_1 or QuantizationType.IQ4_NL)
+        if (packedLegacy && IsPackedLegacyQuant(qt))
         {
-            // The kernel quantises the activations to Q8_1 itself: the pre-quant staging buffer is Q8_0/Q8_K-shaped and has
-            // no Q4_0/Q4_1/Q5_1/IQ4_NL entry (ComputePrequantBytes returns 0), so a caller-supplied buffer must not be consumed.
-            MatMul.GemmLegacyQuant((byte*)weights, qt, b, c, m, k, n, pool, null);
+            MatMul.GemmLegacyQuant((byte*)weights, qt, b, c, m, k, n, pool, preQuantizedInput);
             return;
         }
         switch (qt)
