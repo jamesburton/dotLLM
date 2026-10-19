@@ -237,8 +237,7 @@ public sealed partial class NumaTopology
             CoreType coreType;
             if (efficiencyMap.Count > 0 && efficiencyMap.Values.Distinct().Count() > 1)
             {
-                byte maxEff = efficiencyMap.Values.Max();
-                coreType = eff == maxEff ? CoreType.Performance : CoreType.Efficiency;
+                coreType = ClassifyHybrid(eff, efficiencyMap.Values);
             }
             else
             {
@@ -374,6 +373,17 @@ public sealed partial class NumaTopology
     }
 
     /// <summary>Parses a Linux cpulist format string (e.g., "0-3,5,7-9") into individual CPU IDs.</summary>
+    /// <summary>
+    /// Classifies one logical processor on a hybrid CPU from its Windows <c>EfficiencyClass</c>: HIGHER is the
+    /// higher-performing core, so the cores carrying the maximum class are the P-cores and everything below is an
+    /// efficiency core (including Meteor Lake's LP-E cores).
+    /// </summary>
+    /// <param name="efficiencyClass">This processor's efficiency class.</param>
+    /// <param name="allClasses">Every processor's efficiency class (at least two distinct values).</param>
+    /// <returns><see cref="CoreType.Performance"/> for the max class, else <see cref="CoreType.Efficiency"/>.</returns>
+    internal static CoreType ClassifyHybrid(byte efficiencyClass, IEnumerable<byte> allClasses)
+        => efficiencyClass == allClasses.Max() ? CoreType.Performance : CoreType.Efficiency;
+
     internal static IEnumerable<int> ParseCpuList(string cpulist)
     {
         foreach (var part in cpulist.Split(',', StringSplitOptions.RemoveEmptyEntries))
