@@ -1,6 +1,7 @@
 using System.Runtime.InteropServices;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
+using DotLLM.Core.Tensors;
 using DotLLM.Models.Architectures;
 using Architecture = DotLLM.Core.Configuration.Architecture;
 using Xunit;
@@ -29,8 +30,11 @@ public sealed class NemotronHMoeForwardTests
     private const float Eps = 1e-5f;
     private const float WScale = 2.5f;
 
-    [Fact]
-    public unsafe void MoeLayer_MatchesLlamaCppReferenceSemantics()
+    /// <param name="grouped">true = grouped-by-expert prefill body (#1039); false = per-token body.</param>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public unsafe void MoeLayer_MatchesLlamaCppReferenceSemantics(bool grouped)
     {
         var rng = new Random(375);
         float[] embed = Rand(rng, Vocab * Hidden, 0.4f);
@@ -188,7 +192,12 @@ public sealed class NemotronHMoeForwardTests
                 Pin(embed), QuantizationType.F32,
                 Pin(wOut), QuantizationType.F32, Vocab, Hidden);
 
-            using var logits = model.Forward(tokens, positions, deviceId: 0);
+            bool savedGrouped = NemotronHTransformerModel.GroupedMoePrefill;
+            NemotronHTransformerModel.GroupedMoePrefill = grouped;
+            ITensor logitsT;
+            try { logitsT = model.Forward(tokens, positions, deviceId: 0); }
+            finally { NemotronHTransformerModel.GroupedMoePrefill = savedGrouped; }
+            using var logits = logitsT;
             float* lp = (float*)logits.DataPointer;
 
             for (int t = 0; t < tokens.Length; t++)

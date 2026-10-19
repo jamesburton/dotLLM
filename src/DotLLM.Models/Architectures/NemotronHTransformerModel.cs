@@ -621,7 +621,10 @@ public sealed unsafe class NemotronHTransformerModel : IModel
             switch (kinds[layer])
             {
                 case HybridLayerKind.Ffn when lw.Moe is not null:
-                    ForwardMoeFfnBody(lw.Moe, seqLen, hiddenSize, normOut);
+                    if (seqLen > 1 && GroupedMoePrefill)
+                        ForwardMoeFfnBodyGrouped(lw.Moe, seqLen, hiddenSize, normOut);
+                    else
+                        ForwardMoeFfnBody(lw.Moe, seqLen, hiddenSize, normOut);
                     kindTag = 'M';
                     break;
                 case HybridLayerKind.Ffn:
@@ -829,42 +832,9 @@ public sealed unsafe class NemotronHTransformerModel : IModel
                     new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize)
                         .CopyTo(hBuf.AsSpan(0, hiddenSize));
 
-                    // Router logits on the FULL hidden input, then sigmoid probabilities.
+                    // Router logits on the FULL hidden input, then routing.
                     Gemm(moe.GateInpWeight, moe.GateInpQuantType, h, logits, nExpert, hiddenSize, 1, null);
-                    System.Numerics.Tensors.TensorPrimitives.Sigmoid(
-                        logitsBuf.AsSpan(0, nExpert), logitsBuf.AsSpan(0, nExpert));
-
-                    // Selection scores = probs + bias. The bias biases SELECTION ONLY —
-                    // gating weights below read the unbiased probabilities.
-                    for (int e = 0; e < nExpert; e++)
-                        selBuf[e] = logitsBuf[e] + moe.SelectionBias[e];
-
-                    // Top-k selection (k = 6 over 128; simple selection is fine here).
-                    for (int k2 = 0; k2 < topK; k2++)
-                    {
-                        int best = -1;
-                        float bestV = float.NegativeInfinity;
-                        for (int e = 0; e < nExpert; e++)
-                        {
-                            if (selBuf[e] > bestV) { bestV = selBuf[e]; best = e; }
-                        }
-                        topIdx[k2] = best;
-                        selBuf[best] = float.NegativeInfinity;
-                    }
-
-                    // Gating weights from the UNBIASED probabilities; optional renorm
-                    // (llama.cpp clamps the denominator to the smallest normal F16), then scale.
-                    float sum = 0f;
-                    for (int k2 = 0; k2 < topK; k2++) { w[k2] = logitsBuf[topIdx[k2]]; sum += w[k2]; }
-                    if (moe.NormalizeWeights)
-                    {
-                        float denom = MathF.Max(sum, 6.103515625e-5f);
-                        for (int k2 = 0; k2 < topK; k2++) w[k2] /= denom;
-                    }
-                    if (moe.WeightsScale != 0f && moe.WeightsScale != 1f)
-                    {
-                        for (int k2 = 0; k2 < topK; k2++) w[k2] *= moe.WeightsScale;
-                    }
+                    RouteToken(moe, logitsBuf.AsSpan(0, nExpert), selBuf.AsSpan(0, nExpert), topIdx, w);
 
                     if (latent > 0)
                         Gemm(moe.LatentDownWeight, moe.LatentDownQuantType, h, xLatent, latent, hiddenSize, 1, null);
@@ -910,6 +880,201 @@ public sealed unsafe class NemotronHTransformerModel : IModel
             pool.Return(midBuf); pool.Return(outBuf); pool.Return(accBuf);
         }
     }
+
+    /// <summary>
+    /// nemotron_h_moe routing for one token (llama.cpp <c>build_moe_ffn</c>, sigmoid gating):
+    /// sigmoid over the router logits, top-k on probabilities + selection bias (the bias
+    /// biases SELECTION ONLY), gating weights = the UNBIASED probabilities of the chosen
+    /// experts, optional renorm by their sum (denominator clamped to the smallest normal F16,
+    /// as llama.cpp does), then the weights scale. Shared by the per-token and the grouped
+    /// (#1039) MoE bodies so both route identically.
+    /// </summary>
+    /// <param name="moe">The layer's MoE weights (bias, top-k, renorm and scale).</param>
+    /// <param name="logits">Router logits for the token; overwritten with sigmoid probabilities.</param>
+    /// <param name="selScratch">Scratch of length <c>NumExperts</c> for the selection scores.</param>
+    /// <param name="topIdx">Receives the selected expert ids, in selection order.</param>
+    /// <param name="weights">Receives the gating weight of each selected expert.</param>
+    private static void RouteToken(
+        NemotronHMoeWeights moe, Span<float> logits, Span<float> selScratch, Span<int> topIdx, Span<float> weights)
+    {
+        int nExpert = moe.NumExperts;
+        int topK = moe.NumExpertsPerTok;
+        System.Numerics.Tensors.TensorPrimitives.Sigmoid(logits, logits);
+
+        for (int e = 0; e < nExpert; e++)
+            selScratch[e] = logits[e] + moe.SelectionBias[e];
+
+        // Top-k by repeated max-scan; ties go to the lower expert id.
+        for (int k2 = 0; k2 < topK; k2++)
+        {
+            int best = -1;
+            float bestV = float.NegativeInfinity;
+            for (int e = 0; e < nExpert; e++)
+            {
+                if (selScratch[e] > bestV) { bestV = selScratch[e]; best = e; }
+            }
+            topIdx[k2] = best;
+            selScratch[best] = float.NegativeInfinity;
+        }
+
+        float sum = 0f;
+        for (int k2 = 0; k2 < topK; k2++) { weights[k2] = logits[topIdx[k2]]; sum += weights[k2]; }
+        if (moe.NormalizeWeights)
+        {
+            float denom = MathF.Max(sum, 6.103515625e-5f);
+            for (int k2 = 0; k2 < topK; k2++) weights[k2] /= denom;
+        }
+        if (moe.WeightsScale != 0f && moe.WeightsScale != 1f)
+        {
+            for (int k2 = 0; k2 < topK; k2++) weights[k2] *= moe.WeightsScale;
+        }
+    }
+
+    /// <summary>
+    /// <c>DOTLLM_NEMOTRON_MOE_GROUPED=0</c> forces the per-token MoE body for every batch size
+    /// (the reference arm for #1039). Settable from tests.
+    /// </summary>
+    internal static bool GroupedMoePrefill { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_NEMOTRON_MOE_GROUPED") != "0";
+
+    /// <summary>Token block size for the grouped MoE body; bounds its scratch to O(block x topK x expertDim).</summary>
+    internal static int GroupedMoeBlockTokens { get; set; } = 512;
+
+    /// <summary>
+    /// Grouped-by-expert MoE FFN body for prefill (issue #1039): same maths as
+    /// <see cref="ForwardMoeFfnBody"/>, but the router, shared expert and latent projections run
+    /// as one GEMM over the whole token block, and each USED routed expert runs one up/down GEMM
+    /// over all tokens routed to it (the grouping llama.cpp's <c>ggml_mul_mat_id</c> does) instead
+    /// of one GEMV per (token, slot). Slot outputs are summed per token in slot order, the same
+    /// order as the per-token body.
+    /// </summary>
+    private void ForwardMoeFfnBodyGrouped(NemotronHMoeWeights moe, int seqLen, int hiddenSize, float* normOut)
+    {
+        for (int start = 0; start < seqLen; start += GroupedMoeBlockTokens)
+        {
+            int len = Math.Min(GroupedMoeBlockTokens, seqLen - start);
+            ForwardMoeFfnBlockGrouped(moe, len, hiddenSize, normOut + (long)start * hiddenSize);
+        }
+    }
+
+    [SkipLocalsInit]
+    private void ForwardMoeFfnBlockGrouped(NemotronHMoeWeights moe, int n, int hiddenSize, float* normOut)
+    {
+        int nExpert = moe.NumExperts;
+        int topK = moe.NumExpertsPerTok;
+        int moeInter = moe.MoeIntermediateSize;
+        int sharedInter = moe.SharedIntermediateSize;
+        int latent = moe.LatentSize;
+        int expertDim = latent > 0 ? latent : hiddenSize;
+        int slots = n * topK;
+
+        // One native scratch block, carved into the buffers below (all float-sized).
+        long inF = (long)n * hiddenSize, logitsF = (long)n * nExpert, latF = latent > 0 ? (long)n * latent : 0;
+        long shMidF = (long)n * Math.Max(sharedInter, 1), shOutF = (long)n * hiddenSize;
+        long wF = slots, slotOutF = (long)slots * expertDim, gInF = (long)n * expertDim;
+        long gMidF = (long)n * moeInter, gOutF = (long)n * expertDim, accF = (long)n * expertDim;
+        long selF = nExpert;
+        long total = inF + logitsF + latF + shMidF + shOutF + wF + slotOutF + gInF + gMidF + gOutF + accF + selF;
+        float* block = (float*)System.Runtime.InteropServices.NativeMemory.AlignedAlloc((nuint)(total * sizeof(float)), 64);
+        int[] topIdx = System.Buffers.ArrayPool<int>.Shared.Rent(slots);
+        int[] counts = System.Buffers.ArrayPool<int>.Shared.Rent(nExpert + 1);
+        int[] fill = System.Buffers.ArrayPool<int>.Shared.Rent(nExpert);
+        int[] order = System.Buffers.ArrayPool<int>.Shared.Rent(slots);
+        try
+        {
+            float* x = block;                    // [n, hidden]  copy of the input (normOut is the output)
+            float* logits = x + inF;             // [n, nExpert]
+            float* xl = logits + logitsF;        // [n, latent]  latent_down(x), when present
+            float* shMid = xl + latF;            // [n, sharedInter]
+            float* shOut = shMid + shMidF;       // [n, hidden]
+            float* w = shOut + shOutF;           // [n, topK]
+            float* slotOut = w + wF;             // [n*topK, expertDim]
+            float* gIn = slotOut + slotOutF;     // [<=n, expertDim] gathered expert inputs
+            float* gMid = gIn + gInF;            // [<=n, moeInter]
+            float* gOut = gMid + gMidF;          // [<=n, expertDim]
+            float* acc = gOut + gOutF;           // [n, expertDim]
+            float* sel = acc + accF;             // [nExpert]
+
+            new ReadOnlySpan<float>(normOut, (int)inF).CopyTo(new Span<float>(x, (int)inF));
+
+            // Batched dense parts: router, latent_down, shared expert.
+            Gemm(moe.GateInpWeight, moe.GateInpQuantType, x, logits, nExpert, hiddenSize, n, null);
+            if (latent > 0)
+                Gemm(moe.LatentDownWeight, moe.LatentDownQuantType, x, xl, latent, hiddenSize, n, null);
+            Gemm(moe.UpShexpWeight, moe.UpShexpQuantType, x, shMid, sharedInter, hiddenSize, n, null);
+            ReluSquared.Execute(new Span<float>(shMid, n * sharedInter), new Span<float>(shMid, n * sharedInter));
+            Gemm(moe.DownShexpWeight, moe.DownShexpQuantType, shMid, shOut, hiddenSize, sharedInter, n, null);
+            float* expertIn = latent > 0 ? xl : x;
+
+            // Per-token routing, then a counting sort of the (token, slot) pairs by expert.
+            var selSpan = new Span<float>(sel, nExpert);
+            Array.Clear(counts, 0, nExpert + 1);
+            for (int t = 0; t < n; t++)
+            {
+                RouteToken(moe, new Span<float>(logits + (long)t * nExpert, nExpert), selSpan,
+                    topIdx.AsSpan(t * topK, topK), new Span<float>(w + (long)t * topK, topK));
+                for (int k2 = 0; k2 < topK; k2++) counts[topIdx[t * topK + k2] + 1]++;
+            }
+            for (int e = 0; e < nExpert; e++) counts[e + 1] += counts[e];   // counts[e] = first slot of expert e
+            Array.Copy(counts, fill, nExpert);
+            for (int s = 0; s < slots; s++) order[fill[topIdx[s]]++] = s;   // slot ids grouped by expert, ascending
+
+            // One up -> relu2 -> down GEMM pair per used expert, over all of its tokens.
+            for (int e = 0; e < nExpert; e++)
+            {
+                int begin = counts[e], cnt = counts[e + 1] - begin;
+                if (cnt == 0) continue;
+                for (int j = 0; j < cnt; j++)
+                {
+                    int t = order[begin + j] / topK;
+                    new ReadOnlySpan<float>(expertIn + (long)t * expertDim, expertDim)
+                        .CopyTo(new Span<float>(gIn + (long)j * expertDim, expertDim));
+                }
+                nint upPtr = moe.UpExpsWeight + (nint)(e * moe.UpPerExpertBytes);
+                nint downPtr = moe.DownExpsWeight + (nint)(e * moe.DownPerExpertBytes);
+                Gemm(upPtr, moe.UpExpsQuantType, gIn, gMid, moeInter, expertDim, cnt, null);
+                ReluSquared.Execute(new Span<float>(gMid, cnt * moeInter), new Span<float>(gMid, cnt * moeInter));
+                Gemm(downPtr, moe.DownExpsQuantType, gMid, gOut, expertDim, moeInter, cnt, null);
+                for (int j = 0; j < cnt; j++)
+                {
+                    int s = order[begin + j];
+                    new ReadOnlySpan<float>(gOut + (long)j * expertDim, expertDim)
+                        .CopyTo(new Span<float>(slotOut + (long)s * expertDim, expertDim));
+                }
+            }
+
+            // Weighted sum per token in slot order (same order as the per-token body).
+            for (int t = 0; t < n; t++)
+            {
+                float* a = acc + (long)t * expertDim;
+                new Span<float>(a, expertDim).Clear();
+                for (int k2 = 0; k2 < topK; k2++)
+                {
+                    float wk = w[t * topK + k2];
+                    float* o = slotOut + (long)(t * topK + k2) * expertDim;
+                    for (int i = 0; i < expertDim; i++) a[i] += wk * o[i];
+                }
+            }
+
+            // Back to the hidden size (latent_up) straight into the output, then add the shared expert.
+            if (latent > 0)
+                Gemm(moe.LatentUpWeight, moe.LatentUpQuantType, acc, normOut, hiddenSize, latent, n, null);
+            else
+                new ReadOnlySpan<float>(acc, (int)inF).CopyTo(new Span<float>(normOut, (int)inF));
+            System.Numerics.Tensors.TensorPrimitives.Add(
+                new ReadOnlySpan<float>(normOut, (int)inF), new ReadOnlySpan<float>(shOut, (int)inF),
+                new Span<float>(normOut, (int)inF));
+        }
+        finally
+        {
+            System.Runtime.InteropServices.NativeMemory.AlignedFree(block);
+            System.Buffers.ArrayPool<int>.Shared.Return(topIdx);
+            System.Buffers.ArrayPool<int>.Shared.Return(counts);
+            System.Buffers.ArrayPool<int>.Shared.Return(fill);
+            System.Buffers.ArrayPool<int>.Shared.Return(order);
+        }
+    }
+
 
     private void ForwardAttentionBody(
         NemotronHAttentionWeights attn, int layer, int seqLen, ReadOnlySpan<int> positions,

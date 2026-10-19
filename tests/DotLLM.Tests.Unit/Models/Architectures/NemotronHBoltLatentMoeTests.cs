@@ -39,8 +39,10 @@ public sealed class NemotronHBoltLatentMoeTests : IDisposable
     private static readonly int[] TopK = [2, 3];
     private static readonly int[] Inter = [8, 6];
 
-    private static readonly int[] Ids = [3, 7, 1];
-    private static readonly int[] Pos = [0, 1, 2];
+    // Seven tokens over 4/6 experts with top-2/3: the grouped prefill (#1039) sees experts with
+    // zero, one and several tokens in the same block.
+    private static readonly int[] Ids = [3, 7, 1, 11, 0, 5, 9];
+    private static readonly int[] Pos = [0, 1, 2, 3, 4, 5, 6];
 
     private readonly string _scratch;
 
@@ -88,15 +90,31 @@ public sealed class NemotronHBoltLatentMoeTests : IDisposable
         Assert.Equal(8, moe.IntermediateSizeForLayer(1));
     }
 
-    [Fact]
-    public unsafe void Forward_LatentHeterogeneousMoe_MatchesLlamaCppReference()
+    /// <param name="grouped">true = grouped-by-expert prefill body (#1039); false = per-token body.</param>
+    /// <param name="blockTokens">Grouped-body token block; 3 forces several blocks over the 7 tokens.</param>
+    [Theory]
+    [InlineData(false, 512)]
+    [InlineData(true, 512)]
+    [InlineData(true, 3)]
+    public unsafe void Forward_LatentHeterogeneousMoe_MatchesLlamaCppReference(bool grouped, int blockTokens)
     {
         var (path, w) = WriteFixture(seed: 1037);
         using var gguf = GgufFile.Open(path);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
 
+        bool savedGrouped = NemotronHTransformerModel.GroupedMoePrefill;
+        int savedBlock = NemotronHTransformerModel.GroupedMoeBlockTokens;
+        NemotronHTransformerModel.GroupedMoePrefill = grouped;
+        NemotronHTransformerModel.GroupedMoeBlockTokens = blockTokens;
         using var model = NemotronHTransformerModel.LoadFromGguf(gguf, config, ThreadingConfig.SingleThreaded);
-        using ITensor logits = model.Forward(Ids, Pos, deviceId: -1);
+        ITensor logits;
+        try { logits = model.Forward(Ids, Pos, deviceId: -1); }
+        finally
+        {
+            NemotronHTransformerModel.GroupedMoePrefill = savedGrouped;
+            NemotronHTransformerModel.GroupedMoeBlockTokens = savedBlock;
+        }
+        using var _ = logits;
         float* lp = (float*)logits.DataPointer;
 
         float[][] expected = Reference(w);
