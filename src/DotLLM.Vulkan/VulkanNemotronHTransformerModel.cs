@@ -87,6 +87,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     // QuantizationType.
     // NVFP4 GEMV + GEMM (#1038); applies the per-tensor X.scale. Set by BuildFromPrebuiltWeights.
     private MatMulNvfp4F32Kernel? _matmulNvfp4;
+    // Prefill (n >= MinTokens) for NVFP4 and the IQ1/IQ2/IQ3 family (#1060): dequantise once to F16, then the F16 coopmat GEMM.
+    // Null without a coopmat F16 GEMM; the scalar GEMMs above then stay in use.
+    private IqF16PrefillMatmul? _iqF16Prefill;
     private readonly MatMulIq4NlGemvF32Kernel _matmulIq4Nl;
     private readonly MatMulIq4NlGemmF32Kernel _matmulIq4NlGemm;
     private readonly MatMulIq4XsGemvF32Kernel _matmulIq4Xs;
@@ -604,6 +607,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             ssmSplitXbc,
             submit);
         created._moe = moeKernels;
+        created._iqF16Prefill = IqF16PrefillMatmul.TryCreate(device, spvDir, matmulF16GemmCoopmat, MaxF16PrefillElements(weights));
         try
         {
             created._matmulNvfp4 = MatMulNvfp4F32Kernel.Create(device, spvDir);
@@ -2054,6 +2058,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulIq4Nl.InvalidateDescriptorCache();
         _matmulIq4NlGemm.InvalidateDescriptorCache();
         _matmulNvfp4?.InvalidateDescriptorCache();
+        _iqF16Prefill?.InvalidateDescriptorCache();
         _matmulIq4Xs.InvalidateDescriptorCache();
         _matmulIq4XsGemm.InvalidateDescriptorCache();
         _matmulIq2Xxs.InvalidateDescriptorCache();
@@ -2092,6 +2097,47 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     }
 
     /// <summary>
+    /// Largest <c>m * k</c> of any projection whose device storage <see cref="IqF16PrefillMatmul"/> serves (#1060): the F16 scratch
+    /// capacity. Routed expert banks are excluded (they have their own grouped kernels).
+    /// </summary>
+    /// <param name="weights">The uploaded layer buffers.</param>
+    /// <returns>The capacity in elements, at least 1.</returns>
+    private static long MaxF16PrefillElements(VulkanNemotronHWeights weights)
+    {
+        long max = 1;
+        void Take(QuantizationType qt, int m, int k)
+        {
+            if (IqF16PrefillMatmul.Handles(qt)) max = Math.Max(max, (long)m * k);
+        }
+        foreach (var layer in weights.Layers)
+        {
+            if (layer.Ssm is { } s)
+            {
+                Take(s.InDeviceQuantType, s.InOutputDim, s.InInputDim);
+                Take(s.OutDeviceQuantType, s.OutOutputDim, s.OutInputDim);
+            }
+            if (layer.Attention is { } a)
+            {
+                Take(a.QDeviceQuantType, a.QOutputDim, a.QInputDim);
+                Take(a.KDeviceQuantType, a.KOutputDim, a.KInputDim);
+                Take(a.VDeviceQuantType, a.VOutputDim, a.VInputDim);
+                Take(a.ODeviceQuantType, a.OOutputDim, a.OInputDim);
+            }
+            if (layer.Ffn is { } f)
+            {
+                Take(f.UpDeviceQuantType, f.UpOutputDim, f.UpInputDim);
+                Take(f.DownDeviceQuantType, f.DownOutputDim, f.DownInputDim);
+            }
+            if (layer.Moe is { } m)
+            {
+                Take(m.SharedUpDeviceQuantType, m.SharedIntermediateSize, weights.HiddenSize);
+                Take(m.SharedDownDeviceQuantType, weights.HiddenSize, m.SharedIntermediateSize);
+            }
+        }
+        return max;
+    }
+
+    /// <summary>
     /// Dispatches a matmul for a single linear projection: chooses
     /// <see cref="MatMulQ8_0Kernel"/> (decode-path GEMV) when the device-side weight is
     /// Q8_0 and <paramref name="seqLen"/>==1, the batched <see cref="MatMulQ8_0GemmKernel"/>
@@ -2111,6 +2157,11 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         VulkanDevice.Buffer input, VulkanDevice.Buffer output,
         int outputDim, int inputDim, int seqLen, float scale = 1.0f)
     {
+        // #1060: prefill on an NVFP4 or IQ1/IQ2/IQ3 projection dequantises it to F16 once and runs the coopmat GEMM (the scale, if
+        // any, multiplies the output); the scalar GEMMs below were ~20x slower on NVIDIA's Bolt GGUF.
+        if (seqLen > 1 && _iqF16Prefill is not null
+            && _iqF16Prefill.TryRecord(cmdBuf, weightQt, weights, input, output, outputDim, inputDim, seqLen, scale))
+            return;
         if (weightQt == QuantizationType.NVFP4)
         {
             // #1038: the only kernel that takes the per-tensor X.scale.
@@ -2444,6 +2495,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulIq4NlGemm.Dispose();
         _matmulIq4Nl.Dispose();
         _matmulNvfp4?.Dispose();
+        _iqF16Prefill?.Dispose();
         _matmulIq3SGemm.Dispose();
         _matmulIq3S.Dispose();
         _matmulIq3XxsGemm.Dispose();
