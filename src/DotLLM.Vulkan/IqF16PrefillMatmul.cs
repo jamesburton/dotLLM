@@ -72,6 +72,10 @@ internal sealed class IqF16PrefillMatmul : IDisposable
     /// <summary>Smallest token count routed here.</summary>
     public int MinTokens { get; }
 
+    /// <summary>Bytes of the F16 scratch allocated so far (0 until the first served matmul); read by tests to prove the native NVFP4
+    /// GEMM (#1064) leaves it unallocated.</summary>
+    internal long ScratchBytes => _scratch?.Size ?? 0;
+
     /// <summary>True for the formats this path serves: the IQ1/IQ2/IQ3 family and NVFP4 (#1060).</summary>
     public static bool Handles(QuantizationType qt) =>
         qt is QuantizationType.IQ1_S or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS

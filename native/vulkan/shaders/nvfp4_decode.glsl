@@ -24,3 +24,14 @@ float ue4m3_half(uint x) {
     float raw = (e == 0) ? ldexp(m, -9) : ldexp(1.0 + m / 8.0, e - 7);
     return raw * 0.5;
 }
+
+// |E2M1| doubled = {0,1,2,3,4,6,8,12} as bytes: the same values as KVALUES_FP4 with two shifts instead of an indexed constant array
+// (#1064). Bit 3 of the nibble is the sign.
+const uint NVFP4_KV_LO = 0x03020100u;   // codes 0..3
+const uint NVFP4_KV_HI = 0x0C080604u;   // codes 4..7
+
+float e2m1Doubled(uint nib) {
+    uint c = nib & 7u;
+    float mag = float(((c < 4u ? NVFP4_KV_LO : NVFP4_KV_HI) >> ((c & 3u) * 8u)) & 0xFFu);
+    return (nib & 8u) != 0u ? -mag : mag;
+}
