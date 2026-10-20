@@ -19,6 +19,7 @@ namespace DotLLM.Tests.Unit.Models.Architectures;
 /// unbiased WEIGHTS differ — so an implementation that conflates the two (either
 /// direction) fails, as does one that skips renorm or the 2.5 scale.
 /// </summary>
+[Collection("NemotronHMoeStatics")]
 public sealed class NemotronHMoeForwardTests
 {
     private const int Vocab = 16;

@@ -24,6 +24,7 @@ namespace DotLLM.Tests.Unit.Models.Architectures;
 /// width (8 vs 6), so using the global maximum for any of them, or skipping either latent
 /// projection, changes the logits or fails the load.
 /// </summary>
+[Collection("NemotronHMoeStatics")]
 public sealed class NemotronHBoltLatentMoeTests : IDisposable
 {
     private const string Arch = "nemotron_h_moe";
