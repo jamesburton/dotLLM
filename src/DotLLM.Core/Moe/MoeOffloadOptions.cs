@@ -77,6 +77,12 @@ public sealed record MoeOffloadOptions
     /// </summary>
     public long? ReserveMib { get; init; }
 
+    /// <summary>
+    /// Context length the device budget reserves KV cache for; <see langword="null"/> = the model's maximum context (the
+    /// #1063 addendum's worst case). Lower it when the caller never allocates a cache that long.
+    /// </summary>
+    public int? ContextTokens { get; init; }
+
     /// <summary>Optional sink for load-time notes and warnings (clamped cache size, spill probe results); null = stderr.</summary>
     public Action<string>? Log { get; init; }
 

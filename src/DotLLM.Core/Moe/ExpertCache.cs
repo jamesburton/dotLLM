@@ -138,6 +138,11 @@ public sealed class ExpertCache
     /// <returns>The pool index.</returns>
     public int PoolOf(int layer) => _poolOfLayer[layer];
 
+    /// <summary>Experts of <paramref name="layer"/> (0 for a layer without experts).</summary>
+    /// <param name="layer">Layer index.</param>
+    /// <returns>The expert count.</returns>
+    public int ExpertsIn(int layer) => _layerExperts[layer];
+
     /// <summary>Slots of pool <paramref name="pool"/>.</summary>
     /// <param name="pool">Pool index.</param>
     /// <returns>The slot count.</returns>

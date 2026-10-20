@@ -250,6 +250,16 @@ internal static partial class CudaDriverApi
     [LibraryImport(LibName)]
     internal static partial int cuStreamSynchronize(nint stream);
 
+    /// <summary>CU_STREAM_NON_BLOCKING: the stream does not synchronize with the legacy NULL stream.</summary>
+    internal const uint CU_STREAM_NON_BLOCKING = 1;
+
+    /// <summary>
+    /// Makes all future work submitted to <paramref name="stream"/> wait until <paramref name="evt"/> completes (GPU-side; the
+    /// host does not block). Used by the MoE expert copy stream (#1070).
+    /// </summary>
+    [LibraryImport(LibName)]
+    internal static partial int cuStreamWaitEvent(nint stream, nint evt, uint flags);
+
     // ── Graphs (capture + replay) ──────────────────────────────────────
     //
     // Capture path: cuStreamBeginCapture_v2 → run normal stream operations →
@@ -299,6 +309,9 @@ internal static partial class CudaDriverApi
 
     [LibraryImport(LibName)]
     internal static partial int cuEventElapsedTime(out float milliseconds, nint start, nint end);
+
+    /// <summary>CU_EVENT_DISABLE_TIMING: no timestamp (cheaper to record and wait on).</summary>
+    internal const uint CU_EVENT_DISABLE_TIMING = 2;
 
     // ── External semaphores (cross-API sync: Vulkan → CUDA) ─────────────
     //

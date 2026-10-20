@@ -3,6 +3,7 @@ using System.Runtime.CompilerServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
+using DotLLM.Core.Moe;
 using DotLLM.Core.Tensors;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Cuda.Interop;
@@ -224,8 +225,14 @@ public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
     /// resolution and shape validation, then uploads the resulting weights to device memory —
     /// see this task's "Design decision" note for why.
     /// </summary>
+    /// <param name="gguf">Opened GGUF file; must outlive the model (offloaded experts are read from its mapping).</param>
+    /// <param name="config">Model configuration extracted from <paramref name="gguf"/>.</param>
+    /// <param name="deviceId">CUDA device ordinal.</param>
+    /// <param name="ptxDir">PTX directory, or null to auto-detect.</param>
+    /// <param name="moeOffload">Routed-expert offload options for <c>nemotron_h_moe</c> (#1070); null = defaults plus the
+    /// <c>DOTLLM_MOE_*</c> environment variables.</param>
     public static CudaNemotronHTransformerModel LoadFromGguf(
-        GgufFile gguf, ModelConfig config, int deviceId = 0, string? ptxDir = null)
+        GgufFile gguf, ModelConfig config, int deviceId = 0, string? ptxDir = null, MoeOffloadOptions? moeOffload = null)
     {
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
@@ -250,7 +257,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
                 config, cpuLayers, outputNormWeight,
                 outputPtr, outputQt, outputM, outputK,
                 tokenEmbedPtr, tokenEmbedQt,
-                deviceId, ptxDir);
+                deviceId, ptxDir, moeOffload);
             model._cpuModel = cpuModel;
             return model;
         }
@@ -419,7 +426,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
         float[] outputNormWeight,
         nint outputWeight, QuantizationType outputQt, int outputOutputDim, int outputInputDim,
         nint tokenEmbedWeight, QuantizationType tokenEmbedQt,
-        int deviceId = 0, string? ptxDir = null)
+        int deviceId = 0, string? ptxDir = null, MoeOffloadOptions? moeOffload = null)
     {
         ArgumentNullException.ThrowIfNull(config);
         ArgumentNullException.ThrowIfNull(cpuLayers);
@@ -469,11 +476,18 @@ public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
 
             // nemotron_h_moe (#403): check the whole device footprint against free VRAM before uploading anything, and
             // size the routed scratch once for the largest prefill block (#1063 addendum: WDDM spills, it does not fail).
+            // #1070: a model that does not fit (or --moe-offload on) keeps its routed experts on the host instead.
             bool hasMoe = cpuLayers.Any(l => l.Moe is not null);
             int moeBlock = Math.Max(1, Math.Min(MoeBlockTokens, config.MaxSequenceLength));
+            var moeOptions = moeOffload ?? MoeOffloadOptions.WithEnvironmentFallback(null);
+            bool offloadExperts = false;
+            long gemmMaxK = 0, gemmMaxM = 0;
             if (hasMoe)
-                ThrowIfMoeModelDoesNotFit(EstimateDeviceBytes(
-                    config, cpuLayers, outputQt, outputOutputDim, outputInputDim, planTokens: moeBlock, moeBlockTokens: moeBlock));
+            {
+                var estimate = EstimateDeviceBytes(config, cpuLayers, outputQt, outputOutputDim, outputInputDim,
+                    planTokens: moeBlock, moeBlockTokens: moeBlock, out gemmMaxK, out gemmMaxM);
+                offloadExperts = DecideMoeOffload(estimate, moeOptions);
+            }
 
             long maxTileFloats = 0;
 
@@ -515,7 +529,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
                         kvSlotForLayer[i] = attentionLayerCount++;
                         break;
                     case HybridLayerKind.Ffn when cpuLayer.Moe is not null:
-                        moeDev = UploadDeviceMoeLayer(cpuLayer.Moe, i, hiddenSize, ref maxTileFloats, allocs);
+                        moeDev = UploadDeviceMoeLayer(cpuLayer.Moe, i, hiddenSize, ref maxTileFloats, allocs, offloadExperts);
                         break;
                     case HybridLayerKind.Ffn:
                         ffnDev = UploadDeviceFfnLayer(cpuLayer.Ffn!, ref maxTileFloats, allocs);
@@ -571,7 +585,16 @@ public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
                 state, ssmCache, stream, cublas, context, kernels, deviceId, dequantScratchDevice);
             model._moeSpec = ComputeMoeSpec(layers, hiddenSize);
             if (hasMoe)
+            {
                 model.AllocateMoeScratch(moeBlock);
+
+                // #1063 addendum / #1070: every lazily grown buffer is grown to its worst case for one block now, so a long
+                // prompt cannot push the process over the budget mid-run (and the offload budget below measures it).
+                model._state.EnsureCapacity(moeBlock);
+                model.EnsureActivF16InScratch(moeBlock * gemmMaxK);
+                model.EnsureActivF16OutScratch(moeBlock * gemmMaxM);
+                if (offloadExperts) model.InitializeMoeOffload(cpuLayers, moeOptions);
+            }
             return model;
         }
         catch
@@ -1077,6 +1100,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
         _context.MakeCurrent();
         _state.EnsureCapacity(seqLen);
         nint streamH = _stream.Handle;
+        if (_offload is not null) MoeTelemetry.RecordTokens(seqLen);
 
         UploadPositions(positions);
         Embed(tokenIds, _state.HiddenState, hiddenSize);
@@ -1131,6 +1155,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
         // cuMemcpyDtoH_v2 does not implicitly wait for this model's non-default _stream —
         // synchronize first (mirrors CudaQwen3HybridDenseTransformerModel's identical D2H tail).
         _stream.Synchronize();
+        _offload?.HarvestCopyWait();
 
         var shape = new TensorShape(seqLen, vocabSize);
         var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
@@ -1184,6 +1209,14 @@ public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
         _context.MakeCurrent();
         _ssmCache.Reset();
     }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// With offloaded experts (#1070) the device budget is planned for one MoE block of prompt tokens, so an engine with no
+    /// chunk size of its own prefills in blocks of that size and the forward state never grows past what the cache budget
+    /// left free. Resident models prefill in one pass (0).
+    /// </remarks>
+    public int PreferredPrefillChunkTokens => _offload is null ? 0 : _moeScratchTokens;
 
     /// <inheritdoc/>
     public bool RequiresPerSequenceState => true;
