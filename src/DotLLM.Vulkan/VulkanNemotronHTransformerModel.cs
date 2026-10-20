@@ -1462,47 +1462,6 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             LatentSize: Math.Max(c.LatentSize, layer.HasLatent ? layer.LatentSize : 0));
     }
 
-    /// <summary>
-    /// Largest <c>m * k</c> of any projection whose device storage <see cref="IqF16PrefillMatmul"/> serves (#1060): the F16 scratch
-    /// capacity. Routed expert banks are excluded (they have their own grouped kernels).
-    /// </summary>
-    /// <param name="weights">The uploaded layer buffers.</param>
-    /// <returns>The capacity in elements, at least 1.</returns>
-    private static long MaxF16PrefillElements(VulkanNemotronHWeights weights)
-    {
-        long max = 1;
-        void Take(QuantizationType qt, int m, int k)
-        {
-            if (IqF16PrefillMatmul.Handles(qt)) max = Math.Max(max, (long)m * k);
-        }
-        foreach (var layer in weights.Layers)
-        {
-            if (layer.Ssm is { } s)
-            {
-                Take(s.InDeviceQuantType, s.InOutputDim, s.InInputDim);
-                Take(s.OutDeviceQuantType, s.OutOutputDim, s.OutInputDim);
-            }
-            if (layer.Attention is { } a)
-            {
-                Take(a.QDeviceQuantType, a.QOutputDim, a.QInputDim);
-                Take(a.KDeviceQuantType, a.KOutputDim, a.KInputDim);
-                Take(a.VDeviceQuantType, a.VOutputDim, a.VInputDim);
-                Take(a.ODeviceQuantType, a.OOutputDim, a.OInputDim);
-            }
-            if (layer.Ffn is { } f)
-            {
-                Take(f.UpDeviceQuantType, f.UpOutputDim, f.UpInputDim);
-                Take(f.DownDeviceQuantType, f.DownOutputDim, f.DownInputDim);
-            }
-            if (layer.Moe is { } m)
-            {
-                Take(m.SharedUpDeviceQuantType, m.SharedIntermediateSize, weights.HiddenSize);
-                Take(m.SharedDownDeviceQuantType, weights.HiddenSize, m.SharedIntermediateSize);
-            }
-        }
-        return max;
-    }
-
     private static MoeKernelSet CreateMoeKernels(VulkanDevice device, string spvDir, int numExperts)
     {
         var ones = device.AllocateDeviceLocal((long)numExperts * sizeof(float));
@@ -2048,6 +2007,47 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _reluSquared.InvalidateDescriptorCache();
         _ssmSplitXbc.InvalidateDescriptorCache();
         _moe?.Invalidate();
+    }
+
+    /// <summary>
+    /// Largest <c>m * k</c> of any projection whose device storage <see cref="IqF16PrefillMatmul"/> serves (#1060): the F16 scratch
+    /// capacity. Routed expert banks are excluded (they have their own grouped kernels).
+    /// </summary>
+    /// <param name="weights">The uploaded layer buffers.</param>
+    /// <returns>The capacity in elements, at least 1.</returns>
+    private static long MaxF16PrefillElements(VulkanNemotronHWeights weights)
+    {
+        long max = 1;
+        void Take(QuantizationType qt, int m, int k)
+        {
+            if (IqF16PrefillMatmul.Handles(qt)) max = Math.Max(max, (long)m * k);
+        }
+        foreach (var layer in weights.Layers)
+        {
+            if (layer.Ssm is { } s)
+            {
+                Take(s.InDeviceQuantType, s.InOutputDim, s.InInputDim);
+                Take(s.OutDeviceQuantType, s.OutOutputDim, s.OutInputDim);
+            }
+            if (layer.Attention is { } a)
+            {
+                Take(a.QDeviceQuantType, a.QOutputDim, a.QInputDim);
+                Take(a.KDeviceQuantType, a.KOutputDim, a.KInputDim);
+                Take(a.VDeviceQuantType, a.VOutputDim, a.VInputDim);
+                Take(a.ODeviceQuantType, a.OOutputDim, a.OInputDim);
+            }
+            if (layer.Ffn is { } f)
+            {
+                Take(f.UpDeviceQuantType, f.UpOutputDim, f.UpInputDim);
+                Take(f.DownDeviceQuantType, f.DownOutputDim, f.DownInputDim);
+            }
+            if (layer.Moe is { } m)
+            {
+                Take(m.SharedUpDeviceQuantType, m.SharedIntermediateSize, weights.HiddenSize);
+                Take(m.SharedDownDeviceQuantType, weights.HiddenSize, m.SharedIntermediateSize);
+            }
+        }
+        return max;
     }
 
     /// <summary>
