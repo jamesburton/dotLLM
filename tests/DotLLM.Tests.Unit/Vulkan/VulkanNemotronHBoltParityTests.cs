@@ -158,7 +158,7 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
                 NumAttentionHeads = 1,
                 NumKvHeads = 1,
                 HeadDim = Hidden,
-                MaxSequenceLength = 16,
+                MaxSequenceLength = 64,
                 AttentionType = AttentionType.GQA,
                 PositionEncodingType = PositionEncodingType.None,
                 ActivationFunction = ActivationFunction.ReluSquared,
