@@ -172,7 +172,11 @@ public sealed class RecurrentPrefixDiskCacheTests : IDisposable
             Assert.True(security.AreAccessRulesProtected);
             var rules = security.GetAccessRules(true, true, typeof(SecurityIdentifier)).Cast<FileSystemAccessRule>().ToArray();
             Assert.NotEmpty(rules);
-            Assert.All(rules, rule => { Assert.Equal(user, rule.IdentityReference); Assert.Equal(AccessControlType.Allow, rule.AccessControlType); });
+            foreach (var rule in rules)
+            {
+                Assert.Equal(user, rule.IdentityReference);
+                Assert.Equal(AccessControlType.Allow, rule.AccessControlType);
+            }
         }
         else
         {
