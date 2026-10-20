@@ -104,9 +104,58 @@ public sealed class VulkanNvfp4Tests : IDisposable
     [InlineData(33, 128, 64, 1.0f)]      // no scale
     public void F16Prefill_MatchesCpuDequantReference(int m, int k, int n, float scale)
     {
-        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         var (w, x, expected) = MakeCase(m, k, n, scale);
+        float[] actual = RunF16Prefill(w, x, m, k, n, scale);
 
+        float maxAbs = expected.Max(MathF.Abs);
+        for (int i = 0; i < actual.Length; i++)
+            Assert.True(MathF.Abs(actual[i] - expected[i]) <= 4e-3f * maxAbs,
+                $"m={m} k={k} n={n} [{i}]: expected {expected[i]}, vulkan {actual[i]} (max |y| {maxAbs})");
+    }
+
+    /// <summary>
+    /// #1060 regression guard for the #1059 trap (a tiny per-tensor scale applied after an F16 intermediate): at Bolt's scale (~1e-4) the
+    /// UNSCALED products are ~1e4 x the real outputs, so here every unscaled dot product lies far beyond F16's 65504 (large sub-block
+    /// scales, same-sign weights and activations) while the scaled result is ordinary. Passes only while the GEMM accumulates and writes
+    /// F32 and the scale multiplies that F32 output; an F16 accumulator, an F16 output or an F16 copy before the scale is inf/NaN here.
+    /// </summary>
+    [SkippableFact]
+    public void F16Prefill_BoltScale_UnscaledSumsBeyondF16Range_StayFinite()
+    {
+        const int m = 48, k = 4096, n = 24;
+        const float scale = 1.0e-4f;
+        var rng = new Random(1060);
+        int blocks = m * (k / 64);
+        byte[] w = new byte[blocks * 36];
+        for (int b = 0; b < blocks; b++)
+        {
+            for (int s = 0; s < 4; s++) w[b * 36 + s] = (byte)rng.Next(0x70, 0x7F);   // UE4M3 64..224 (0x7F would decode to 0)
+            for (int q = 4; q < 36; q++) w[b * 36 + q] = (byte)(rng.Next(5, 8) | (rng.Next(5, 8) << 4)); // positive E2M1 6, 8, 12
+        }
+        float[] x = new float[n * k];
+        for (int i = 0; i < x.Length; i++) x[i] = (float)(0.25 + 0.75 * rng.NextDouble());
+        float[] expected = Reference(w, x, m, k, n, scale);
+
+        float minUnscaled = expected.Min(MathF.Abs) / scale;
+        Assert.True(minUnscaled > 10 * 65504f, $"premise: the smallest unscaled dot product {minUnscaled:E3} is not far beyond F16's range");
+
+        float[] actual = RunF16Prefill(w, x, m, k, n, scale);
+        for (int i = 0; i < actual.Length; i++)
+            Assert.True(float.IsFinite(actual[i]) && MathF.Abs(actual[i] - expected[i]) <= 4e-3f * MathF.Abs(expected[i]),
+                $"[{i}]: expected {expected[i]}, vulkan {actual[i]}");
+    }
+
+    /// <summary>Runs <see cref="IqF16PrefillMatmul"/>'s NVFP4 arm once and checks the path counter.</summary>
+    /// <param name="w">Packed NVFP4 weights, <c>[m, k]</c>.</param>
+    /// <param name="x">F32 activations, <c>[n, k]</c>.</param>
+    /// <param name="m">Output rows.</param>
+    /// <param name="k">Input width.</param>
+    /// <param name="n">Tokens.</param>
+    /// <param name="scale">Per-tensor scale.</param>
+    /// <returns>The F32 output, <c>[n, m]</c>.</returns>
+    private static float[] RunF16Prefill(byte[] w, float[] x, int m, int k, int n, float scale)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
         Skip.IfNot(device.HasCooperativeMatrix, "no cooperative-matrix F16 GEMM on this device");
         using var gemm = MatMulF16GemmCoopmatKernel.Create(device, spvDir);
@@ -128,11 +177,7 @@ public sealed class VulkanNvfp4Tests : IDisposable
         Assert.Equal(1, Interlocked.Read(ref IqF16PrefillMatmul.Counters.Nvfp4));
         float[] actual = new float[n * m];
         device.Download(bufY, actual);
-
-        float maxAbs = expected.Max(MathF.Abs);
-        for (int i = 0; i < actual.Length; i++)
-            Assert.True(MathF.Abs(actual[i] - expected[i]) <= 4e-3f * maxAbs,
-                $"m={m} k={k} n={n} [{i}]: expected {expected[i]}, vulkan {actual[i]} (max |y| {maxAbs})");
+        return actual;
     }
 
     /// <summary>Random NVFP4 blocks (sub-block scales sprinkled with the UE4M3 edge bytes), activations and the double-precision product.</summary>
@@ -149,6 +194,12 @@ public sealed class VulkanNvfp4Tests : IDisposable
         float[] x = new float[n * k];
         for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
 
+        return (w, x, Reference(w, x, m, k, n, scale));
+    }
+
+    /// <summary>Double-precision <c>scale * (x . dequant(w)^T)</c>, <c>[n, m]</c>.</summary>
+    private static float[] Reference(byte[] w, float[] x, int m, int k, int n, float scale)
+    {
         float[] wf = Dequant(w, m * k);
         float[] expected = new float[n * m];
         for (int t = 0; t < n; t++)
@@ -158,7 +209,7 @@ public sealed class VulkanNvfp4Tests : IDisposable
                 for (int c = 0; c < k; c++) acc += (double)wf[r * k + c] * x[t * k + c];
                 expected[t * m + r] = (float)(acc * scale);
             }
-        return (w, x, expected);
+        return expected;
     }
 
     private static unsafe float[] Dequant(byte[] w, int elements)

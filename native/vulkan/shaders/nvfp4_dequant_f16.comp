@@ -6,7 +6,8 @@
 // matrix once into F16 scratch, then run the F16 cooperative-matrix GEMM.
 //
 // EXACT in F16: an element is KVALUES_FP4[nibble] (at most 2 significant bits, |v| <= 12) times ue4m3_half(d) (4 significant bits,
-// 2^-10 .. 224), so the product needs at most 6 mantissa bits and lies in [2^-10, 2688], inside F16's normal range. The per-tensor
+// 2^-10 .. 240; 0xFF decodes to 240 because bit 7 is ignored), so the product needs at most 6 mantissa bits and lies in [2^-10, 2880],
+// inside F16's normal range. The per-tensor
 // X.scale (~1e-4 in Bolt) is NOT applied here: scaled, the smallest weights would fall below F16's subnormal range. The caller
 // multiplies the F32 GEMM output by it.
 //
