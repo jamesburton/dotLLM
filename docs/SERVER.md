@@ -569,8 +569,10 @@ The CUDA hybrid model (Qwen3HybridDense: Bonsai, Qwen3.5/3.6 dense) now refuses 
 - **Admission.** Every device buffer that grows with the context (the KV cache in any storage format, the F16 dequant
   scratch for quantized KV, the F32 attention staging, the MTP head's KV cache, recurrent-state checkpoints and row
   snapshots) is checked against free VRAM before it is allocated. A growth that would not leave a reserve free fails the
-  request with a clear error naming the buffer, the size and the free memory, rather than spilling. The reserve is
-  512 MiB; `DOTLLM_CUDA_VRAM_RESERVE_MB` changes it.
+  request with a clear error naming the buffer, the size and the free memory, rather than spilling. The server answers
+  it as `400 context_length_exceeded`, so agent clients compact and retry. The reserve is 256 MiB on top of CUDA's own
+  free figure; `DOTLLM_CUDA_VRAM_RESERVE_MB` changes it. On WDDM, CUDA's free figure is the DXGI per-process budget minus
+  usage, and on an RTX 3060 the spill began about 280 MiB past that budget, so the effective margin is about 0.5 GB.
 - **Detection.** The server polls this process's `\GPU Process Memory(pid_*)\Shared Usage` counter (at most every 5 s,
   and after every KV growth) and logs a `WARNING: GPU memory has spilled into shared system memory` line each time it rises
   another 256 MiB above its post-load level. That catches a spill admission cannot prevent, for example when another

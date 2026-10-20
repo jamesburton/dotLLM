@@ -22,10 +22,10 @@ public sealed class DeviceMemoryBudgetTests
         => Assert.Equal(expected, DeviceMemoryBudget.Fits(free * MiB, required * MiB, reserve * MiB));
 
     [Theory]
-    [InlineData(null, 512)]
-    [InlineData("", 512)]
-    [InlineData("abc", 512)]
-    [InlineData("-1", 512)]
+    [InlineData(null, 256)]
+    [InlineData("", 256)]
+    [InlineData("abc", 256)]
+    [InlineData("-1", 256)]
     [InlineData("0", 0)]
     [InlineData("1024", 1024)]
     public void ResolveReserveBytes_ParsesMiB_AndFallsBackToTheDefault(string? env, long expectedMiB)

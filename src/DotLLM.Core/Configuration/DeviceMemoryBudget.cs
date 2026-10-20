@@ -10,8 +10,12 @@ namespace DotLLM.Core.Configuration;
 /// </summary>
 public static class DeviceMemoryBudget
 {
-    /// <summary>Default free VRAM a growth must leave untouched: cuBLAS workspace, the display, other processes.</summary>
-    public const long DefaultReserveBytes = 512L << 20;
+    /// <summary>
+    /// Default free VRAM a growth must leave untouched: cuBLAS workspace, transient allocations, another process's growth.
+    /// Measured on an RTX 3060 12 GB under WDDM (issue #1068): CUDA's free figure equals the DXGI per-process budget minus
+    /// usage, and shared-memory spill begins ~280 MiB past that budget, so this reserve sits on top of that slack.
+    /// </summary>
+    public const long DefaultReserveBytes = 256L << 20;
 
     /// <summary>Environment variable overriding <see cref="DefaultReserveBytes"/>, in MiB.</summary>
     public const string ReserveEnvVar = "DOTLLM_CUDA_VRAM_RESERVE_MB";

@@ -26,6 +26,8 @@ public sealed class ModelUnavailableException : Exception
     /// <summary>
     /// Maps <see cref="ModelUnavailableException"/> to a response: a 503 JSON error before the response has started, or - once an SSE
     /// stream has begun (keep-alive comments) - an OpenAI-style <c>data: {"error":...}</c> event followed by <c>data: [DONE]</c>.
+    /// Maps <see cref="DotLLM.Core.Configuration.DeviceMemoryAdmissionException"/> the same way as a 400 <c>context_length_exceeded</c>
+    /// (issue #1068).
     /// </summary>
     /// <param name="app">The application.</param>
     /// <returns><paramref name="app"/>.</returns>
@@ -47,6 +49,20 @@ public sealed class ModelUnavailableException : Exception
                 }
                 var error = ErrorResponse.Internal(ex.Message, code: "model_not_loaded");
                 await Endpoints.SseResponse.WriteOpenAiErrorAsync(context, 503, error);
+            }
+            catch (DotLLM.Core.Configuration.DeviceMemoryAdmissionException ex) when (!context.RequestAborted.IsCancellationRequested)
+            {
+                // Issue #1068: the context this request needs does not fit in free GPU memory, and growing into shared system
+                // memory was refused. Reported as context_length_exceeded so agent clients compact and retry, instead of the
+                // connection dropping mid-stream.
+                ServerLog.Info(ex.Message);
+                if (context.Request.Path.StartsWithSegments("/v1/messages"))
+                {
+                    await Endpoints.MessagesEndpoint.WriteErrorAsync(context, 400, "invalid_request_error", ex.Message);
+                    return;
+                }
+                var error = ErrorResponse.InvalidRequest(ex.Message, param: "messages", code: "context_length_exceeded");
+                await Endpoints.SseResponse.WriteOpenAiErrorAsync(context, 400, error);
             }
         });
 }
