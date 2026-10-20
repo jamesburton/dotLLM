@@ -115,6 +115,54 @@ public sealed unsafe class CudaNvfp4Tests : IDisposable
         }
     }
 
+    /// <summary>
+    /// The dp4a GEMV (#1061) on activations quantized by the house F32 → int8 quantizer, against the CPU's
+    /// NVFP4 × Q8_0 GEMM (<see cref="MatMul.GemmNvfp4"/>, llama.cpp's <c>ggml_vec_dot_nvfp4_q8_0</c>) times
+    /// the scale. The activation quantization is byte-exact and each sub-block's int32 sum is exact, so only
+    /// FP32 summation order differs: the bar is the FP32 GEMV's 1e-5 · max|y|. Covers K tails (fewer units
+    /// than lanes; a partial last warp step), row tails (odd m: half a warp's row pair, a partial CUDA block),
+    /// all-zero activation blocks and the UE4M3 edge bytes.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(1, 64, 1.0f)]          // one block: 2 units, 30 idle lanes
+    [InlineData(70, 192, 0.37f)]       // 6 units
+    [InlineData(301, 1088, 0.8f)]      // 34 units: one full warp step + 2; 301 rows: 37 full blocks of 8 + 5
+    [InlineData(300, 4096, 1.3e-4f)]   // Bolt ssm_in K and scale
+    [InlineData(67, 8192, 2.5f)]       // Bolt ssm_out K
+    public void Dp4aGemv_MatchesCpuNvfp4Q8_0_WithScale(int m, int k, float scale)
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        var rng = new Random(m * 31 + k);
+        byte[] w = RandomBlocks(rng, m * (k / 64));
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = (float)(rng.NextDouble() * 2 - 1) * (i % 97 == 0 ? 40f : 1f);
+        if (k >= 128) Array.Clear(x, 64, 32);   // an all-zero activation block (scale 0)
+        float[] expected = CpuGemmNvfp4Q8_0(w, x, m, k, scale);
+
+        using var context = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        using var kernels = new CudaKernels(ResolvePtxDir());
+        Assert.True(kernels.HasNvfp4Dp4a, "NVFP4 dp4a GEMV or the pq2_0 activation quantizer not loaded");
+        nint dW = Upload(w), dX = UploadF32(x), dQ = Alloc(k), dMeta = Alloc(k / 32 * 8L), dY = Alloc(m * 4L);
+        try
+        {
+            kernels.LaunchPQ2_0Dp4aQuantizeX(dX, dQ, dMeta, k, stream.Handle);
+            CudaDriverApi.cuMemsetD8_v2(dY, 0xFF, (nuint)(m * 4L)).ThrowOnError();   // NaN: every row must be written
+            kernels.LaunchNvfp4GemvQ8(dW, dQ, dMeta, dY, m, k, scale, stream.Handle);
+            stream.Synchronize();
+            float[] actual = DownloadF32(dY, m);
+            float maxAbs = expected.Max(MathF.Abs);
+            Assert.True(maxAbs > 0, "degenerate fixture");
+            for (int i = 0; i < m; i++)
+                Assert.True(MathF.Abs(actual[i] - expected[i]) <= 1e-5f * maxAbs + 1e-6f * MathF.Abs(expected[i]),
+                    $"m={m} k={k} row {i}: cpu {expected[i]}, cuda {actual[i]}");
+        }
+        finally
+        {
+            Free(dW); Free(dX); Free(dQ); Free(dMeta); Free(dY);
+        }
+    }
+
     [SkippableFact]
     public void ScaleInplace_MultipliesEveryElement()
     {
@@ -142,15 +190,111 @@ public sealed unsafe class CudaNvfp4Tests : IDisposable
     /// The Bolt-shaped NVFP4 fixture (two Mamba-2 layers, NVFP4 <c>ssm_in</c>/<c>ssm_out</c>, per-tensor
     /// scales 0.05..3) through <see cref="CudaModelLoader.CreateFromGguf"/>: a 5-token prefill (dequant +
     /// cuBLAS + scale kernel) and then one decode step (NVFP4 GEMV with the scale), each against the CPU
-    /// model on the F32 twin. A dropped scale on either path is off by a multiple of the logits.
+    /// model on the F32 twin. A dropped scale on either path is off by a multiple of the logits. On the dp4a
+    /// GEMV (#1061) the decode step carries the Q8_0 activation rounding the CPU NVFP4 model itself carries
+    /// against this twin, so it gets that model's bar (see <see cref="Dp4aDecodeVsF32TwinTolerance"/>);
+    /// <see cref="NemotronH_Nvfp4Ssm_TokenByTokenDecodeMatchesCpuNvfp4"/> is the tight check of that path.
     /// </summary>
     [SkippableTheory]
-    [InlineData(Variant.Nvfp4Scaled)]
-    [InlineData(Variant.F32Reference)] // control: the same model with F32 SSM weights on CUDA
-    [InlineData(Variant.Nvfp4ScaledBoltMagnitude)] // unscaled prefill GEMM output beyond FP16 range, as in Bolt
-    public void NemotronH_Nvfp4Ssm_PrefillAndDecodeMatchCpuF32Twin(Variant cudaVariant)
+    [InlineData(Variant.Nvfp4Scaled, true)]   // decode on the dp4a GEMV (#1061)
+    [InlineData(Variant.Nvfp4Scaled, false)]  // decode on #1038's FP32-activation GEMV
+    [InlineData(Variant.F32Reference, true)]  // control: the same model with F32 SSM weights on CUDA
+    [InlineData(Variant.Nvfp4ScaledBoltMagnitude, true)]  // unscaled prefill GEMM output beyond FP16 range, as in Bolt
+    [InlineData(Variant.Nvfp4ScaledBoltMagnitude, false)]
+    public void NemotronH_Nvfp4Ssm_PrefillAndDecodeMatchCpuF32Twin(Variant cudaVariant, bool dp4a)
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        if (dp4a)
+        {
+            using var probeContext = CudaContext.Create(0);
+            using var probe = new CudaKernels(ResolvePtxDir());
+            Assert.True(probe.HasNvfp4Dp4a, "dp4a decode requested but the NVFP4 dp4a kernels are not loaded");
+        }
+
+        float decodeTolerance = dp4a && cudaVariant != Variant.F32Reference ? Dp4aDecodeVsF32TwinTolerance : 1e-2f;
+        WithNvfp4Dp4a(dp4a, () => RunNemotronHNvfp4Fixture(cudaVariant, decodeTolerance));
+    }
+
+    /// <summary>
+    /// Bar for a dp4a decode step against the F32 twin: the 0.06 · max|logit| that
+    /// <c>NemotronHNvfp4SsmTests</c> holds the CPU NVFP4 model to (measured 0.035 there, all of it Q8_0
+    /// activation rounding). Measured on CUDA: 0.026.
+    /// </summary>
+    private const float Dp4aDecodeVsF32TwinTolerance = 0.06f;
+
+    /// <summary>
+    /// The dp4a decode path end to end against the CPU model on the SAME NVFP4 weights (#1061): every token
+    /// of the fixture is fed alone, so every SSM projection on both sides is an NVFP4 × Q8_0 GEMV with the
+    /// same activation rounding, and the logits of every step must agree far more tightly than either does with
+    /// the F32 twin. #1038's FP32-activation GEMV misses this bar by the Q8_0 rounding (see the PR).
+    /// </summary>
+    [SkippableFact]
+    public void NemotronH_Nvfp4Ssm_TokenByTokenDecodeMatchesCpuNvfp4()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        int[] ids = NemotronHNvfp4SsmTests.Ids;
+        int[] pos = NemotronHNvfp4SsmTests.Pos;
+        int vocab = NemotronHNvfp4SsmTests.Vocab;
+        string fixture = NemotronHNvfp4SsmTests.WriteFixture(_scratch, Variant.Nvfp4Scaled);
+
+        var cpu = new List<float[]>();
+        using (var gguf = GgufFile.Open(fixture))
+        {
+            var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            using var model = ModelLoader.CreateCpuModelFromGguf(gguf, config);
+            for (int t = 0; t < ids.Length; t++)
+                using (ITensor l = model.Forward(ids[t..(t + 1)], pos[t..(t + 1)], deviceId: -1)) cpu.Add(LastRow(l, vocab));
+        }
+
+        using (var probeContext = CudaContext.Create(0))
+        using (var probe = new CudaKernels(ResolvePtxDir()))
+            Assert.True(probe.HasNvfp4Dp4a, "NVFP4 dp4a kernels not loaded");
+
+        var cuda = new List<float[]>();
+        WithNvfp4Dp4a(true, () =>
+        {
+            using var gguf = GgufFile.Open(fixture);
+            var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            var (model, kvFactory) = CudaModelLoader.CreateFromGguf(gguf, config, deviceId: 0, ptxDir: ResolvePtxDir());
+            using (model)
+            {
+                using var kv = kvFactory(16);
+                for (int t = 0; t < ids.Length; t++)
+                    using (ITensor l = model.Forward(ids[t..(t + 1)], pos[t..(t + 1)], deviceId: -1, kv)) cuda.Add(LastRow(l, vocab));
+            }
+        });
+
+        for (int t = 0; t < ids.Length; t++)
+            AssertClose(cpu[t], cuda[t], $"token {t} (CPU NVFP4 x Q8_0 vs CUDA dp4a)", TokenByTokenTolerance);
+    }
+
+    /// <summary>
+    /// Bar for <see cref="NemotronH_Nvfp4Ssm_TokenByTokenDecodeMatchesCpuNvfp4"/>: both sides round the
+    /// activations identically, so what is left is FP32 summation order through two layers.
+    /// </summary>
+    private const float TokenByTokenTolerance = 1e-4f;
+
+    /// <summary>
+    /// Runs <paramref name="body"/> with every NVFP4 decode GEMV forced onto the dp4a kernel or onto the FP32 one
+    /// (the fixture's weights are far below <see cref="CudaKernels.Nvfp4Dp4aMinWeightBytes"/>, so
+    /// <see cref="Nvfp4DecodeGemv.Auto"/> would never pick dp4a), then restores the mode.
+    /// </summary>
+    private static void WithNvfp4Dp4a(bool enabled, Action body)
+    {
+        Nvfp4DecodeGemv was = CudaKernels.Nvfp4DecodeGemvMode;
+        CudaKernels.Nvfp4DecodeGemvMode = enabled ? Nvfp4DecodeGemv.Dp4a : Nvfp4DecodeGemv.F32;
+        try
+        {
+            body();
+        }
+        finally
+        {
+            CudaKernels.Nvfp4DecodeGemvMode = was;
+        }
+    }
+
+    private void RunNemotronHNvfp4Fixture(Variant cudaVariant, float decodeTolerance)
+    {
         int[] ids = NemotronHNvfp4SsmTests.Ids;
         int[] pos = NemotronHNvfp4SsmTests.Pos;
         int vocab = NemotronHNvfp4SsmTests.Vocab;
@@ -180,14 +324,83 @@ public sealed unsafe class CudaNvfp4Tests : IDisposable
             }
         }
 
-        AssertClose(cpuPrefill, cudaPrefill, "prefill (dequant F16 + cuBLAS + scale)");
-        AssertClose(cpuDecode, cudaDecode, "decode (NVFP4 GEMV with scale)");
+        AssertClose(cpuPrefill, cudaPrefill, "prefill (dequant F16 + cuBLAS + scale)", 1e-2f);
+        AssertClose(cpuDecode, cudaDecode, "decode (NVFP4 GEMV with scale)", decodeTolerance);
     }
 
     /// <summary>
-    /// Bandwidth of the NVFP4 decode GEMV and the prefill dequant on Bolt's SSM shapes (ssm_in 4096 -> 18560,
-    /// ssm_out 8192 -> 4096). Prints numbers only; nothing is asserted beyond the kernels running.
+    /// Decode GEMV bandwidth (#1061): #1038's FP32-activation GEMV against the dp4a GEMV and its per-token
+    /// activation quantize, on Bolt's SSM shapes and a sweep, and which one <see cref="Nvfp4DecodeGemv.Auto"/>
+    /// picks. Times are a host loop of back-to-back launches (best of 3 x 300): GPU-bound from a few MB of
+    /// weights up, launch-bound below (T5500 floors at ~16 us per launch; per-launch CUDA-event timing there
+    /// carries a ~20 us WDDM overhead, so it is not used). GB/s counts NVFP4 weight bytes only; shapes under
+    /// ~3 MB of weights sit in the RTX 3060's L2. Prints numbers only.
     /// </summary>
+    [SkippableTheory]
+    [Trait("Category", "Benchmark")]
+    [InlineData(18560, 4096)]   // Bolt ssm_in
+    [InlineData(4096, 8192)]    // Bolt ssm_out
+    [InlineData(1024, 1024)]
+    [InlineData(4096, 1024)]
+    [InlineData(1024, 4096)]
+    [InlineData(2048, 4096)]
+    [InlineData(4096, 4096)]
+    [InlineData(8192, 4096)]
+    [InlineData(2048, 8192)]
+    [InlineData(18560, 8192)]
+    [InlineData(4096, 18560)]
+    [InlineData(32768, 4096)]
+    public void Benchmark_Dp4aGemvSweep(int m, int k)
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        var rng = new Random(2);
+        byte[] w = RandomBlocks(rng, m * (k / 64));
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
+        using var context = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        using var kernels = new CudaKernels(ResolvePtxDir());
+        Assert.True(kernels.HasNvfp4Dp4a, "NVFP4 dp4a kernels not loaded");
+        nint dW = Upload(w), dX = UploadF32(x), dQ = Alloc(k), dMeta = Alloc(k / 32 * 8L), dY = Alloc(m * 4L);
+        try
+        {
+            double Loop(Action a)
+            {
+                const int Iters = 300;
+                for (int i = 0; i < 10; i++) a();
+                stream.Synchronize();
+                double best = double.MaxValue;
+                for (int rep = 0; rep < 3; rep++)
+                {
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    for (int i = 0; i < Iters; i++) a();
+                    stream.Synchronize();
+                    best = Math.Min(best, sw.Elapsed.TotalMilliseconds * 1000 / Iters);
+                }
+                return best;   // microseconds
+            }
+            string Gbs(double us) => $"{w.Length / us / 1e3,5:F0}";
+            void Quant() => kernels.LaunchPQ2_0Dp4aQuantizeX(dX, dQ, dMeta, k, stream.Handle);
+            void Dp4a() => kernels.LaunchNvfp4GemvQ8(dW, dQ, dMeta, dY, m, k, 1.3e-4f, stream.Handle);
+
+            double f32 = Loop(() => kernels.LaunchNvfp4GemvF32(dW, dX, dY, m, k, 1.3e-4f, stream.Handle));
+            double quant = Loop(Quant), gemv = Loop(Dp4a), both = Loop(() => { Quant(); Dp4a(); });
+            bool auto;
+            Nvfp4DecodeGemv was = CudaKernels.Nvfp4DecodeGemvMode;
+            CudaKernels.Nvfp4DecodeGemvMode = Nvfp4DecodeGemv.Auto;
+            try { auto = kernels.UseNvfp4Dp4a(m, k); }
+            finally { CudaKernels.Nvfp4DecodeGemvMode = was; }
+            Console.WriteLine(
+                $"NVFP4 {m,5}x{k,5} ({w.Length / 1e6,4:F1} MB): f32 {f32,6:F1} us {Gbs(f32)} GB/s | "
+                + $"quant {quant,4:F1} us | dp4a {gemv,6:F1} us {Gbs(gemv)} GB/s | quant+dp4a {both,6:F1} us {Gbs(both)} GB/s | "
+                + $"x{f32 / both,4:F2} | auto: {(auto ? "dp4a" : "f32")}");
+        }
+        finally
+        {
+            Free(dW); Free(dX); Free(dQ); Free(dMeta); Free(dY);
+        }
+    }
+
     [SkippableTheory]
     [Trait("Category", "Benchmark")]
     [InlineData(18560, 4096)]
@@ -224,14 +437,16 @@ public sealed unsafe class CudaNvfp4Tests : IDisposable
 
     // ───────────────────────── helpers ─────────────────────────
 
-    private static void AssertClose(float[] cpu, float[] cuda, string what)
+    /// <summary>Asserts every logit is within <paramref name="tolerance"/> · max|cpu logit| (the prefill path's F16 bar is 1e-2).</summary>
+    private static void AssertClose(float[] cpu, float[] cuda, string what, float tolerance)
     {
         float maxAbs = cpu.Max(MathF.Abs);
         Assert.True(maxAbs > 0.5f, $"degenerate fixture: max |logit| {maxAbs}");
-        // The prefill path runs F16 weights/activations through cuBLAS, so the bar is F16-sized.
+        float maxDiff = cpu.Zip(cuda, (a, b) => MathF.Abs(a - b)).Max();
+        Console.WriteLine($"{what}: max |diff| {maxDiff} = {maxDiff / maxAbs:E2} x max|logit| (bar {tolerance:E1})");
         for (int i = 0; i < cpu.Length; i++)
-            Assert.True(MathF.Abs(cpu[i] - cuda[i]) <= 1e-2f * maxAbs,
-                $"{what} logit {i}: cpu(F32 twin) {cpu[i]}, cuda(NVFP4) {cuda[i]} (max |logit| {maxAbs})");
+            Assert.True(MathF.Abs(cpu[i] - cuda[i]) <= tolerance * maxAbs,
+                $"{what} logit {i}: cpu {cpu[i]}, cuda {cuda[i]} (max |logit| {maxAbs}, bar {tolerance} x)");
     }
 
     private static float[] LastRow(ITensor logits, int vocab)
@@ -249,6 +464,17 @@ public sealed unsafe class CudaNvfp4Tests : IDisposable
             for (int s = 0; s < 4; s++)
                 w[b * 36 + s] = rng.Next(8) == 0 ? edge[rng.Next(edge.Length)] : (byte)rng.Next(0x20, 0x50);
         return w;
+    }
+
+    /// <summary>The CPU NVFP4 × Q8_0 GEMV (<see cref="MatMul.GemmNvfp4"/>) for one token, times <paramref name="scale"/>.</summary>
+    private static float[] CpuGemmNvfp4Q8_0(byte[] w, float[] x, int m, int k, float scale)
+    {
+        float[] y = new float[m];
+        fixed (byte* pw = w)
+        fixed (float* px = x, py = y)
+            MatMul.GemmNvfp4(pw, px, py, m, k, 1, pool: null);
+        for (int i = 0; i < m; i++) y[i] *= scale;
+        return y;
     }
 
     private static float[] CpuDequant(byte[] w)

@@ -331,6 +331,9 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _nvfp4GemvF32Func;
     private readonly nint _scaleF32InplaceFunc;
 
+    // NVFP4 dp4a decode GEMV on int8 activations (#1061).
+    private readonly nint _nvfp4GemvQ8Func;
+
     private readonly CudaModule? _quantKvModule;
     private readonly nint _quantKvQ8_0Func;
     private readonly nint _quantKvQ4_0Func;
@@ -1098,6 +1101,7 @@ public sealed unsafe class CudaKernels : IDisposable
             _dequantNVFP4F32Func = _nvfp4Module.TryGetFunction("dequant_nvfp4_f32");
             _nvfp4GemvF32Func = _nvfp4Module.TryGetFunction("nvfp4_gemv_f32");
             _scaleF32InplaceFunc = _nvfp4Module.TryGetFunction("scale_f32_inplace");
+            _nvfp4GemvQ8Func = _nvfp4Module.TryGetFunction("nvfp4_gemv_q8");
         }
 
         // KV-cache quantization (optional — PTX may not be compiled yet)
@@ -5148,6 +5152,82 @@ public sealed unsafe class CudaKernels : IDisposable
 
     /// <summary>True when the NVFP4 kernels (nvfp4.ptx) are loaded (#1038).</summary>
     public bool HasNvfp4 => _nvfp4GemvF32Func != 0 && _scaleF32InplaceFunc != 0 && _dequantNVFP4Func != 0;
+
+    /// <summary>Output rows per CUDA block of the NVFP4 dp4a GEMV: <c>NV4D_WARPS_PER_BLOCK × NV4D_ROWS_PER_WARP</c> in nvfp4.cu.</summary>
+    private const int Nvfp4GemvQ8RowsPerBlock = 4 * 2;
+
+    /// <summary>
+    /// Smallest NVFP4 weight (bytes) whose decode GEMV takes the dp4a path under
+    /// <see cref="Nvfp4DecodeGemv.Auto"/> (#1061). The dp4a GEMV is never slower on the GPU, but it costs a
+    /// second launch (the activation quantize). On T5500's RTX 3060, a host loop of quantize + dp4a lost to the
+    /// single FP32-activation GEMV at 0.6-2.4 MB of weights (launch-bound: 0.51-0.99x), won 1.47x at 4.7 MB and
+    /// 2.4-3.2x from 9.4 MB up. Bolt's SSM projections are 18.9 and 42.8 MB.
+    /// </summary>
+    public const long Nvfp4Dp4aMinWeightBytes = 4L << 20;
+
+    /// <summary>
+    /// Which NVFP4 decode GEMV <see cref="UseNvfp4Dp4a"/> picks (#1061). Environment variable
+    /// <c>DOTLLM_NVFP4_DECODE_GEMV=auto|dp4a|f32</c>; anything else is <see cref="Nvfp4DecodeGemv.Auto"/>.
+    /// </summary>
+    public static Nvfp4DecodeGemv Nvfp4DecodeGemvMode { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_NVFP4_DECODE_GEMV")?.ToLowerInvariant() switch
+        {
+            "dp4a" => Nvfp4DecodeGemv.Dp4a,
+            "f32" => Nvfp4DecodeGemv.F32,
+            _ => Nvfp4DecodeGemv.Auto,
+        };
+
+    /// <summary>
+    /// True when the NVFP4 dp4a decode GEMV and the F32 → int8 activation quantizer it consumes
+    /// (<see cref="LaunchPQ2_0Dp4aQuantizeX"/>) are both loaded (#1061).
+    /// </summary>
+    public bool HasNvfp4Dp4a => _nvfp4GemvQ8Func != 0 && _pq2_0Dp4aQuantizeFunc != 0;
+
+    /// <summary>
+    /// Whether an <c>m × k</c> NVFP4 decode GEMV should run on the dp4a kernel (quantize + <see cref="LaunchNvfp4GemvQ8"/>)
+    /// rather than <see cref="LaunchNvfp4GemvF32"/>, per <see cref="Nvfp4DecodeGemvMode"/> (#1061).
+    /// </summary>
+    /// <param name="m">Output rows.</param>
+    /// <param name="k">Contraction length.</param>
+    /// <returns>True for the dp4a path; never true when <see cref="HasNvfp4Dp4a"/> is false.</returns>
+    public bool UseNvfp4Dp4a(int m, int k) => HasNvfp4Dp4a && Nvfp4DecodeGemvMode switch
+    {
+        Nvfp4DecodeGemv.Dp4a => true,
+        Nvfp4DecodeGemv.F32 => false,
+        _ => (long)m * (k / QuantFormat.Nvfp4GroupSize) * QuantFormat.Nvfp4BlockBytes >= Nvfp4Dp4aMinWeightBytes,
+    };
+
+    /// <summary>
+    /// NVFP4 decode GEMV on int8 activations (#1061): <c>y[m] = scale · Σ_k W[m, k] · x[k]</c>, with
+    /// <c>x</c> already quantized by <see cref="LaunchPQ2_0Dp4aQuantizeX"/> over its <paramref name="k"/>
+    /// elements — the CPU's Q8_0 activation quantizer, byte for byte. Numerically the CPU's NVFP4 × Q8_0
+    /// GEMV (<c>MatMul.GemmNvfp4</c>, llama.cpp's <c>ggml_vec_dot_nvfp4_q8_0</c>); only the FP32
+    /// summation order differs. The per-tensor <c>X.scale</c> is applied once, in the kernel.
+    /// </summary>
+    /// <param name="weight">Packed NVFP4 weights, <paramref name="m"/> rows of <c>k / 64</c> 36-byte blocks.</param>
+    /// <param name="xQ8">Quantized activations (int8, permuted layout), <paramref name="k"/> bytes, 16-byte aligned.</param>
+    /// <param name="xMeta">Activation block metadata, <c>k / 32</c> 8-byte pairs.</param>
+    /// <param name="y">FP32 output, length <paramref name="m"/>.</param>
+    /// <param name="m">Output rows.</param>
+    /// <param name="k">Contraction length; a multiple of 64.</param>
+    /// <param name="scale">The weight's per-tensor <c>X.scale</c> (1 when absent).</param>
+    /// <param name="stream">CUDA stream.</param>
+    /// <exception cref="InvalidOperationException">The kernel is not loaded.</exception>
+    /// <exception cref="ArgumentException"><paramref name="k"/> is not a multiple of 64.</exception>
+    public void LaunchNvfp4GemvQ8(nint weight, nint xQ8, nint xMeta, nint y, int m, int k, float scale, nint stream)
+    {
+        if (k % QuantFormat.Nvfp4GroupSize != 0)
+            throw new ArgumentException($"NVFP4 k must be a multiple of {QuantFormat.Nvfp4GroupSize}, got {k}.", nameof(k));
+        if (_nvfp4GemvQ8Func == 0)
+            throw new InvalidOperationException("NVFP4 dp4a GEMV kernel not present — rebuild nvfp4.ptx (#1061).");
+        nint wArg = weight, qArg = xQ8, mtArg = xMeta, yArg = y;
+        int mArg = m, bArg = k / QuantFormat.Nvfp4GroupSize;
+        float sArg = scale;
+        void** args = stackalloc void*[] {&wArg, &qArg, &mtArg, &yArg, &mArg, &bArg, &sArg};
+        CudaDriverApi.cuLaunchKernel(_nvfp4GemvQ8Func,
+                (uint)((m + Nvfp4GemvQ8RowsPerBlock - 1) / Nvfp4GemvQ8RowsPerBlock), 1, 1, 128, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
 
     /// <summary>
     /// NVFP4 decode GEMV with FP32 activations: <c>y[m] = scale · Σ_k W[m, k] · x[k]</c> (#1038).
