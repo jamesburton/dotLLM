@@ -57,13 +57,19 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         public readonly int OutInputDim;
         public readonly int OutOutputDim;
 
+        /// <summary>Per-tensor ssm_in / ssm_out output scales (#1038; 1 when the GGUF has none).</summary>
+        public readonly float InScale;
+        public readonly float OutScale;
+
         public SsmLayerBuffers(
             VulkanDevice.Buffer inWeight, QuantizationType inDeviceQt, int inInputDim, int inOutputDim,
             VulkanDevice.Buffer conv1dWeight, VulkanDevice.Buffer conv1dBias,
             VulkanDevice.Buffer a, VulkanDevice.Buffer d, VulkanDevice.Buffer dtBias,
             VulkanDevice.Buffer normWeight,
-            VulkanDevice.Buffer outWeight, QuantizationType outDeviceQt, int outInputDim, int outOutputDim)
+            VulkanDevice.Buffer outWeight, QuantizationType outDeviceQt, int outInputDim, int outOutputDim,
+            float inScale = 1.0f, float outScale = 1.0f)
         {
+            InScale = inScale; OutScale = outScale;
             InWeight = inWeight; InDeviceQuantType = inDeviceQt;
             InInputDim = inInputDim; InOutputDim = inOutputDim;
             Conv1dWeight = conv1dWeight;
@@ -400,6 +406,22 @@ internal sealed class VulkanNemotronHWeights : IDisposable
 
     /// <summary>True iff an IQ4_NL source projection can be kept on device as raw
     /// 18-byte blocks — gated on the input dim being a multiple of 32.</summary>
+    /// <summary>True iff an NVFP4 projection can stay packed on device (36-byte blocks of 64, #1038).</summary>
+    private static bool KeepNvfp4OnDevice(QuantizationType qt, int inputDim)
+        => qt == QuantizationType.NVFP4 && (inputDim % QuantFormat.Nvfp4GroupSize) == 0;
+
+    /// <summary>
+    /// Refuses a per-tensor output scale on a projection whose device storage has no kernel that applies
+    /// it — only the NVFP4 matmul takes one (#1038).
+    /// </summary>
+    internal static void ThrowIfScaleUnsupported(string what, float scale, QuantizationType deviceQt)
+    {
+        if (scale != 1.0f && deviceQt != QuantizationType.NVFP4)
+            throw new NotSupportedException(
+                $"Nemotron-H {what} carries a per-tensor scale ({scale}) but is stored as {deviceQt} on Vulkan; " +
+                "only the NVFP4 matmul applies X.scale (#1038). Use --device cpu.");
+    }
+
     private static bool KeepIq4NlOnDevice(QuantizationType qt, int inputDim)
         => qt == QuantizationType.IQ4_NL && (inputDim % 32) == 0;
 
@@ -461,6 +483,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         || KeepQ4KOnDevice(qt, inputDim)
         || KeepQ5KOnDevice(qt, inputDim)
         || KeepQ6KOnDevice(qt, inputDim)
+        || KeepNvfp4OnDevice(qt, inputDim)
         || KeepIq4NlOnDevice(qt, inputDim)
         || KeepIq4XsOnDevice(qt, inputDim)
         || KeepIq2XxsOnDevice(qt, inputDim)
@@ -484,6 +507,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         if (KeepQ4KOnDevice(qt, inputDim)) return QuantizationType.Q4_K;
         if (KeepQ5KOnDevice(qt, inputDim)) return QuantizationType.Q5_K;
         if (KeepQ6KOnDevice(qt, inputDim)) return QuantizationType.Q6_K;
+        if (KeepNvfp4OnDevice(qt, inputDim)) return QuantizationType.NVFP4;
         if (KeepIq4NlOnDevice(qt, inputDim)) return QuantizationType.IQ4_NL;
         if (KeepIq4XsOnDevice(qt, inputDim)) return QuantizationType.IQ4_XS;
         if (KeepIq2XxsOnDevice(qt, inputDim)) return QuantizationType.IQ2_XXS;
@@ -595,7 +619,10 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         VulkanDevice device, VulkanStagingBuffer staging,
         NemotronHSsmWeights ssmW, out long uploadedBytes)
     {
-        ssmW.ThrowIfNvfp4OrScaled("Vulkan"); // #1038: no NVFP4 kernel and no X.scale multiply on this path yet
+        // #1038: only the NVFP4 kernel multiplies by a per-tensor X.scale; a scale on any other device
+        // storage would run unscaled. Checked before anything is allocated.
+        ThrowIfScaleUnsupported("ssm_in", ssmW.InScale, DeviceQuantTypeFor(ssmW.InQuantType, ssmW.InInputDim));
+        ThrowIfScaleUnsupported("ssm_out", ssmW.OutScale, DeviceQuantTypeFor(ssmW.OutQuantType, ssmW.OutInputDim));
         uploadedBytes = 0;
         var inBuf = UploadProjectionMatrix(device, staging,
             ssmW.InWeight, ssmW.InQuantType, ssmW.InOutputDim, ssmW.InInputDim,
@@ -627,7 +654,8 @@ internal sealed class VulkanNemotronHWeights : IDisposable
             conv1dWeight, conv1dBias,
             a, d, dtBias,
             norm,
-            outBuf, outDeviceQt, ssmW.OutInputDim, ssmW.OutOutputDim);
+            outBuf, outDeviceQt, ssmW.OutInputDim, ssmW.OutOutputDim,
+            ssmW.InScale, ssmW.OutScale);
     }
 
     private static AttentionLayerBuffers UploadAttentionLayer(
