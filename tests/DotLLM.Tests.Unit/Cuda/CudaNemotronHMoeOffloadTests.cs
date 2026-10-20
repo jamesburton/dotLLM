@@ -68,6 +68,9 @@ public sealed class CudaNemotronHMoeOffloadTests : IDisposable
         var trace = new List<(int Layer, int[] Ids)>();
         CudaNemotronHTransformerModel.MoeBlockTokens = blockTokens;
         CudaNemotronHTransformerModel.MoeArenaWaveExpertsOverride = waveExperts;
+        // Hold the copy stream back (~10 ms per copy batch at PCIe 2.0) so a missing compute-stream wait on the copy event
+        // makes the kernels read stale slots; the small synthetic experts otherwise always land first.
+        CudaNemotronHTransformerModel.MoeCopyStreamDelayBytesForTests = 64L << 20;
         try
         {
             CudaNemotronHTransformerModel.MoePathCounters.Reset();
@@ -124,6 +127,7 @@ public sealed class CudaNemotronHMoeOffloadTests : IDisposable
         {
             CudaNemotronHTransformerModel.MoeBlockTokens = savedBlock;
             CudaNemotronHTransformerModel.MoeArenaWaveExpertsOverride = savedWave;
+            CudaNemotronHTransformerModel.MoeCopyStreamDelayBytesForTests = 0;
             CudaNemotronHTransformerModel.MoeLookupTraceHook = null;
         }
     }

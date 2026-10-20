@@ -51,6 +51,13 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
     /// </summary>
     internal static Action<int, int[]>? MoeLookupTraceHook { get; set; }
 
+    /// <summary>
+    /// Test hook: bytes of a dummy host-to-device copy queued on the copy stream ahead of every batch of expert copies, so
+    /// the expert copies land well after the compute stream reaches the expert kernels. With small synthetic experts the
+    /// copies otherwise finish first, which would hide a missing compute-stream wait on the copy event.
+    /// </summary>
+    internal static long MoeCopyStreamDelayBytesForTests { get; set; }
+
     private MoeOffloadState? _offload;
 
     /// <summary>The offload decision, or null when every expert is resident.</summary>
@@ -565,6 +572,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
         {
             CudaDriverApi.cuStreamWaitEvent(_copyStream, routerEvent, 0).ThrowOnError();
             if (_readyInsertedCount == 0) return 0;
+            DelayCopyStreamForTests();
             int pool = _poolOfLayer[moe.LayerIndex];
             var layout = _layouts[pool];
             for (int i = 0; i < _readyInsertedCount; i++)
@@ -580,12 +588,38 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
         {
             var layout = _layouts[_poolOfLayer[moe.LayerIndex]];
             int first = wave * WaveExperts, last = Math.Min(first + WaveExperts, BypassCount);
+            if (last > first) DelayCopyStreamForTests();
             for (int j = first; j < last; j++)
             {
                 nint b = ArenaSlot(j);
                 CopyExpert(moe, _bypassExperts[j], b, b + (nint)layout.DownOffset);
             }
             return RecordCopyEvent();
+        }
+
+        private nint _delayHost, _delayDevice;
+        private long _delayBytes;
+
+        /// <summary>Queues <see cref="MoeCopyStreamDelayBytesForTests"/> bytes of dummy copy on the copy stream (tests only).</summary>
+        private void DelayCopyStreamForTests()
+        {
+            long bytes = MoeCopyStreamDelayBytesForTests;
+            if (bytes <= 0) return;
+            if (bytes != _delayBytes)
+            {
+                FreeDelayBuffers();
+                CudaDriverApi.cuMemHostAlloc(out _delayHost, (nuint)bytes, 0).ThrowOnError();
+                CudaDriverApi.cuMemAlloc_v2(out _delayDevice, (nuint)bytes).ThrowOnError();
+                _delayBytes = bytes;
+            }
+            CudaDriverApi.cuMemcpyHtoDAsync_v2(_delayDevice, _delayHost, (nuint)bytes, _copyStream).ThrowOnError();
+        }
+
+        private void FreeDelayBuffers()
+        {
+            if (_delayHost != 0) { CudaDriverApi.cuMemFreeHost(_delayHost); _delayHost = 0; }
+            FreeIfNonZero(ref _delayDevice);
+            _delayBytes = 0;
         }
 
         private void CopyExpert(DeviceMoe moe, int expert, nint dstUp, nint dstDown)
@@ -668,6 +702,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
             }
             FreePools();
             FreeIfNonZero(ref _arena);
+            FreeDelayBuffers();
             foreach (nint e in _events) CudaDriverApi.cuEventDestroy_v2(e);
             _events.Clear();
             foreach (var (a, b) in _timingPending.Concat(_timingFree))
