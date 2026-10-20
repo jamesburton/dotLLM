@@ -70,6 +70,12 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
     private nint _activF16OutScratch;
     private long _activF16OutScratchElems;
 
+    // NVFP4 dp4a decode (#1061): the token's activations quantized to int8 (permuted) plus one
+    // { scale bits, sum } pair per 32 elements, sized for the largest k seen.
+    private nint _nvfp4XQ8Scratch;
+    private nint _nvfp4XMetaScratch;
+    private long _nvfp4XQ8ScratchElems;
+
     // Caller-supplied per-sequence SSM state for the in-flight Forward — see Task 11.
     private CudaNemotronHSsmStateCache? _activeSsm;
 
@@ -290,6 +296,8 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
         FreeIfNonZero(ref _dequantScratchF16Weight);
         FreeIfNonZero(ref _activF16InScratch);
         FreeIfNonZero(ref _activF16OutScratch);
+        FreeIfNonZero(ref _nvfp4XQ8Scratch);
+        FreeIfNonZero(ref _nvfp4XMetaScratch);
 
         for (int i = 0; i < _layers.Length; i++)
             FreeLayer(_layers[i]);
@@ -660,8 +668,19 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
 
         if (qt == QuantizationType.NVFP4 && seqLen == 1)
         {
-            // #1038: packed decode GEMV, FP32 activations, scale folded into the kernel.
-            _kernels.LaunchNvfp4GemvF32(weight, x, y, m, k, scale, streamH);
+            // #1061: quantize the token to int8 once (the CPU's Q8_0 activation quantizer, byte for byte),
+            // then the dp4a GEMV; #1038's FP32-activation GEMV for small (launch-bound) weights or when the
+            // dp4a kernels are not loaded. Either way the per-tensor scale is folded into the kernel.
+            if (_kernels.UseNvfp4Dp4a(m, k))
+            {
+                EnsureNvfp4Q8Scratch(k);
+                _kernels.LaunchPQ2_0Dp4aQuantizeX(x, _nvfp4XQ8Scratch, _nvfp4XMetaScratch, k, streamH);
+                _kernels.LaunchNvfp4GemvQ8(weight, _nvfp4XQ8Scratch, _nvfp4XMetaScratch, y, m, k, scale, streamH);
+            }
+            else
+            {
+                _kernels.LaunchNvfp4GemvF32(weight, x, y, m, k, scale, streamH);
+            }
             scaleApplied = true;
             return;
         }
@@ -740,6 +759,17 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
         FreeIfNonZero(ref _activF16InScratch);
         CudaDriverApi.cuMemAlloc_v2(out _activF16InScratch, (nuint)(halfs * sizeof(ushort))).ThrowOnError();
         _activF16InScratchElems = halfs;
+    }
+
+    private void EnsureNvfp4Q8Scratch(long elems)
+    {
+        if (elems <= _nvfp4XQ8ScratchElems) return;
+        FreeIfNonZero(ref _nvfp4XQ8Scratch);
+        FreeIfNonZero(ref _nvfp4XMetaScratch);
+        CudaDriverApi.cuMemAlloc_v2(out _nvfp4XQ8Scratch, (nuint)elems).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out _nvfp4XMetaScratch,
+            (nuint)(elems / CudaKernels.Pq2_0Dp4aQuantBlock * 8)).ThrowOnError();
+        _nvfp4XQ8ScratchElems = elems;
     }
 
     private void EnsureActivF16OutScratch(long halfs)
