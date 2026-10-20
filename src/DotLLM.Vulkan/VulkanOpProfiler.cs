@@ -118,6 +118,12 @@ internal sealed class VulkanOpProfiler : IDisposable
 
         /// <summary>#471: the MTP head's <c>eh_proj</c> fusion of the embedding and hidden rows.</summary>
         MtpEhProj,
+
+        /// <summary>#1048: nemotron_h_moe routed experts (top-k, gather / grouping, expert up, relu^2, expert down, weighted scatter).</summary>
+        MoeRouted,
+
+        /// <summary>#1048: nemotron_h_moe dense MoE projections (router, shared expert up / down, LatentMoE down / up) and the shared add.</summary>
+        MoeDense,
     }
 
     /// <summary>
@@ -140,6 +146,8 @@ internal sealed class VulkanOpProfiler : IDisposable
         "gdn_scan_core", "gdn_postgate", "attn_rope", "attn_kvupdate", "attn_core", "attn_gate",
         // #471 MTP draft step.
         "mtp_eh_proj",
+        // #1048 nemotron_h_moe.
+        "moe_routed", "moe_dense",
     };
 
     // 64 layers x ~14 marks would overflow a per-forward pool, so the pool is reset and

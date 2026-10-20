@@ -125,6 +125,26 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         }
     }
 
+    /// <summary>#1048: the per-layer-submit profiling mode must attribute the MoE buckets and must not change a single logit.</summary>
+    [SkippableFact]
+    public void Profile_AttributesMoeBuckets_AndLeavesLogitsBitIdentical()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        using var fx = new Fixture(zeroBias: false);
+        float[] plain = fx.Vulkan(device, spvDir, Tokens, Positions, profile: false, out var none);
+        float[] profiled = fx.Vulkan(device, spvDir, Tokens, Positions, profile: true, out var report);
+        Assert.Null(none);
+        Assert.NotNull(report);
+        output.WriteLine(report!.Format("nemotron-profile"));
+        for (int i = 0; i < plain.Length; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(plain[i]) == BitConverter.SingleToInt32Bits(profiled[i]),
+                $"logit {i}: {plain[i]:G9} unprofiled vs {profiled[i]:G9} profiled");
+        Assert.True(report.ByCategory.GetValueOrDefault("moe_routed") > 0, "routed experts not attributed");
+        Assert.True(report.ByCategory.GetValueOrDefault("moe_dense") > 0, "dense MoE projections not attributed");
+        Assert.True(report.ByCategory.GetValueOrDefault("lm_head") > 0, "LM head not attributed");
+    }
+
     private static float MaxDiff(float[] a, float[] b)
     {
         Assert.Equal(a.Length, b.Length);
@@ -188,12 +208,18 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         }
 
         public float[] Vulkan(VulkanDevice device, string spvDir, int[] tokens, int[] positions)
+            => Vulkan(device, spvDir, tokens, positions, profile: false, out _);
+
+        public float[] Vulkan(VulkanDevice device, string spvDir, int[] tokens, int[] positions, bool profile,
+            out DotLLM.Vulkan.VulkanOpProfileReport? report)
         {
             using var model = VulkanNemotronHTransformerModel.BuildFromPrebuiltWeights(
                 device, _config, _layers, _outNorm, Pin(_wOut), QuantizationType.F32, Vocab, Hidden,
                 Pin(_embed), QuantizationType.F32, spvDir);
+            model.ProfileOverride = profile;
             model.TrySetAllRowLogitsLimit(tokens.Length + 1);
             using var logits = model.Forward(tokens, positions, deviceId: 0);
+            report = model.LastProfile;
             return Copy((float*)logits.DataPointer, logits.ElementCount);
         }
 
