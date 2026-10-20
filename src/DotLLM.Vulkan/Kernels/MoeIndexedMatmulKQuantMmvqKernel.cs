@@ -32,7 +32,7 @@ public sealed class MoeIndexedMatmulKQuantMmvqKernel : IDisposable
     private bool _disposed;
     private readonly int _rowsPerGroup;
 
-    /// <summary>Output rows each workgroup produces (1 = one cell per workgroup; &gt; 1 = the multi-row variant, #876; Q4_K only).</summary>
+    /// <summary>Output rows each workgroup produces (1 = one cell per workgroup; &gt; 1 = the multi-row variant, #876 Q4_K / #1049 Q5_K).</summary>
     public int RowsPerGroup => _rowsPerGroup;
 
     private MoeIndexedMatmulKQuantMmvqKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, int blockBytes, int rowsPerGroup)
@@ -47,7 +47,7 @@ public sealed class MoeIndexedMatmulKQuantMmvqKernel : IDisposable
     }
 
     /// <summary>
-    /// Loads <c>moe_indexed_matmul_{q4_k_xdiv,q5_k,q6_k}_mmvq.spv</c> from <paramref name="spvDir"/> and builds the pipeline. Returns
+    /// Loads <c>moe_indexed_matmul_{q4_k_xdiv,q5_k,q6_k}_mmvq.spv</c> (or the Q4_K / Q5_K multi-row <c>_mr</c> variant) from <paramref name="spvDir"/> and builds the pipeline. Returns
     /// <c>null</c> when the SPV is missing or the device lacks integer-dot-product support (callers keep their scalar/MMQ fallback).
     /// </summary>
     public static MoeIndexedMatmulKQuantMmvqKernel? TryCreate(VulkanDevice device, string spvDir, MoeGroupedKQuant quant, int rowsPerGroup = 1)
@@ -58,9 +58,12 @@ public sealed class MoeIndexedMatmulKQuantMmvqKernel : IDisposable
         (string name, int blockBytes) = quant switch
         {
             MoeGroupedKQuant.Q4_K => (rowsPerGroup > 1 ? "moe_indexed_matmul_q4_k_mmvq_xdiv_mr.spv" : "moe_indexed_matmul_q4_k_mmvq_xdiv.spv", QuantFormat.Q4_KBlockBytes),
-            MoeGroupedKQuant.Q5_K => ("moe_indexed_matmul_q5_k_mmvq.spv", 176),
+            MoeGroupedKQuant.Q5_K => (rowsPerGroup > 1 ? "moe_indexed_matmul_q5_k_mmvq_mr.spv" : "moe_indexed_matmul_q5_k_mmvq.spv", 176),
             _ => ("moe_indexed_matmul_q6_k_mmvq.spv", 210),
         };
+        // Multi-row variants exist for Q4_K (#876) and Q5_K (#1049) only.
+        if (rowsPerGroup > 1 && quant == MoeGroupedKQuant.Q6_K)
+            return null;
         string path = Path.Combine(spvDir, name);
         if (!File.Exists(path))
             return null;
