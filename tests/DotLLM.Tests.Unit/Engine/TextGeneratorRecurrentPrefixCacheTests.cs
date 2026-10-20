@@ -29,14 +29,14 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
 
     private static InferenceOptions Opts => new() { Temperature = 0f, MaxTokens = 4 };
 
-    private static (TextGenerator Cached, TextGenerator Plain, HistoryModel Model) Build(bool sharedStorage = false)
+    private static (TextGenerator Cached, TextGenerator Plain, HistoryModel Model) Build(bool sharedStorage = false, DotLLM.Engine.PromptCache.RecurrentPrefixCacheOptions? snapshots = null)
     {
         var model = new HistoryModel();
         var tok = new CsvTokenizer();
         Func<ModelConfig, int, IKvCache> kv = sharedStorage
             ? (cfg, size) => new SharedStorageKv(new SimpleKvCache(KvGeometry.FromConfig(cfg), size))
             : (cfg, size) => new SimpleKvCache(KvGeometry.FromConfig(cfg), size);
-        return (new TextGenerator(model, tok, kv, recurrentPrefixCache: true),
+        return (new TextGenerator(model, tok, kv, recurrentPrefixCache: true, recurrentPrefixCacheOptions: snapshots),
                 new TextGenerator(model, tok, kv), model);
     }
 
@@ -246,6 +246,38 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
             Assert.Equal(0, plain.Generate(Prompt(30 + i), Opts).Timings.CachedTokenCount);
     }
 
+    [Fact]
+    public void MultiSlot_AlternatingUnrelatedConversationsWarmOnFirstSightAndMatchColdReplay()
+    {
+        var (cached, plain, model) = Build(sharedStorage: true, snapshots: new() { MaxEntries = 2, HostBudgetBytes = 100000 });
+        string a = Prompt(30), b = string.Join(",", Enumerable.Range(35, PrefixLen + 1));
+        Assert.Equal(0, Check(cached, plain, model, a).Timings.CachedTokenCount);
+        Assert.Equal(0, Check(cached, plain, model, b).Timings.CachedTokenCount);
+        for (int i = 0; i < 3; i++)
+        {
+            var gotA = Check(cached, plain, model, a); Assert.Equal(PrefixLen, gotA.Timings.CachedTokenCount);
+            var gotB = Check(cached, plain, model, b); Assert.Equal(PrefixLen, gotB.Timings.CachedTokenCount);
+        }
+        Assert.Equal(2, cached.RecurrentPrefixStatistics.Entries);
+        Assert.Equal(6, cached.RecurrentPrefixStatistics.HostHits);
+        cached.ClearRecurrentPrefixCache();
+    }
+    [Fact]
+    public void MultiSlot_AlternatingGrowingConversationsReplaceTheirOwnBoundary()
+    {
+        var (cached, plain, model) = Build(snapshots: new() { MaxEntries = 2, HostBudgetBytes = 100000 });
+        int[] a = Enumerable.Range(2, PrefixLen + 1).ToArray(), b = Enumerable.Range(35, PrefixLen + 1).ToArray();
+        Check(cached, plain, model, string.Join(",", a)); Check(cached, plain, model, string.Join(",", b));
+        for (int turn = 0; turn < 3; turn++)
+        {
+            int oldA = a.Length, oldB = b.Length;
+            a = [.. a, .. Enumerable.Repeat(20 + turn, 20)];
+            b = [.. b, .. Enumerable.Repeat(40 + turn, 20)];
+            Assert.Equal(oldA - 1, Check(cached, plain, model, string.Join(",", a)).Timings.CachedTokenCount);
+            Assert.Equal(oldB - 1, Check(cached, plain, model, string.Join(",", b)).Timings.CachedTokenCount);
+        }
+        cached.ClearRecurrentPrefixCache();
+    }
     // ── fakes ──
 
     /// <summary>A KV whose storage another cache's forwards overwrite, like the CUDA hybrid's model-owned handle.</summary>
@@ -281,7 +313,7 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
     /// A recurrent model: state S = (S * 31 + token + 1) mod 9973 after every token; the next-token logits are one-hot on
     /// S mod (Vocab - 1) (never EOS). Supports checkpoint/restore like the GDN hybrids.
     /// </summary>
-    private sealed class HistoryModel : IModel
+    private sealed class HistoryModel : IModel, IRecurrentPrefixSnapshotProvider
     {
         private int _state;
 
@@ -317,6 +349,35 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
         public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IKvCache? kv, ILoraAdapter? a, IMtpState? m) => Core(t, p, d, kv);
         public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IKvCache? kv, ILoraAdapter? a, IMtpState? m, bool last) => Core(t, p, d, kv);
 
+        public string PrefixSnapshotIdentity => "history-model-fixed-config";
+        public bool SupportsPrefixSnapshotStorage(RecurrentPrefixSnapshotStorage storage) => storage == RecurrentPrefixSnapshotStorage.Host;
+        public long EstimatePrefixSnapshotBytes(IKvCache kvCache, int prefixLength) => 4 + prefixLength * 4L * 8;
+        public IRecurrentPrefixSnapshot CapturePrefixSnapshot(IKvCache kvCache, int prefixLength, RecurrentPrefixSnapshotStorage storage)
+        {
+            var copy = new SimpleKvCache(1, 1, 4, prefixLength);
+            var keys = kvCache.GetKeysRef(0); var values = kvCache.GetValuesRef(0);
+            copy.Update(new TensorRef(prefixLength, 4, DType.Float32, -1, keys.DataPointer),
+                new TensorRef(prefixLength, 4, DType.Float32, -1, values.DataPointer), Enumerable.Range(0, prefixLength).ToArray(), 0);
+            return new PrefixSnapshot(copy, _state, prefixLength, PrefixSnapshotIdentity);
+        }
+        public IRecurrentPrefixSnapshot TransferPrefixSnapshot(IRecurrentPrefixSnapshot source, RecurrentPrefixSnapshotStorage storage) => throw new NotSupportedException();
+        public void RestorePrefixSnapshot(IRecurrentPrefixSnapshot snapshot, IKvCache kvCache)
+        {
+            var snap = (PrefixSnapshot)snapshot;
+            kvCache.Rollback(0);
+            kvCache.Update(snap.Kv.GetKeysRef(0), snap.Kv.GetValuesRef(0), Enumerable.Range(0, snap.PrefixLength).ToArray(), 0);
+            _state = snap.State;
+        }
+        private sealed class PrefixSnapshot(SimpleKvCache kv, int state, int length, string identity) : IRecurrentPrefixSnapshot
+        {
+            public SimpleKvCache Kv => kv;
+            public int State => state;
+            public int PrefixLength => length;
+            public long ByteCount => 4 + length * 4L * 8;
+            public string Identity => identity;
+            public RecurrentPrefixSnapshotStorage Storage => RecurrentPrefixSnapshotStorage.Host;
+            public void Dispose() => kv.Dispose();
+        }
         private unsafe ITensor Core(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache)
         {
             int seqLen = tokenIds.Length;

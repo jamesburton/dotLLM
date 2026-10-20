@@ -50,6 +50,11 @@ public sealed record ChatChoiceDto
 /// </summary>
 public sealed record UsageDto
 {
+    /// <summary>Breakdown of prompt tokens served from a reusable prefix.</summary>
+    [JsonPropertyName("prompt_tokens_details")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public PromptTokensDetailsDto? PromptTokensDetails { get; init; }
+
     [JsonPropertyName("prompt_tokens")]
     public int PromptTokens { get; init; }
 
@@ -74,4 +79,12 @@ public sealed record CompletionTokensDetailsDto
     /// <summary>Tokens spent on reasoning (everything up to and including <c>&lt;/think&gt;</c>).</summary>
     [JsonPropertyName("reasoning_tokens")]
     public int ReasoningTokens { get; init; }
+}
+
+/// <summary>OpenAI <c>usage.prompt_tokens_details</c>.</summary>
+public sealed record PromptTokensDetailsDto
+{
+    /// <summary>Prompt tokens restored from a cache rather than prefilled again.</summary>
+    [JsonPropertyName("cached_tokens")]
+    public int CachedTokens { get; init; }
 }

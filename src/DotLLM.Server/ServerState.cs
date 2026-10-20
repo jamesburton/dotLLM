@@ -1220,6 +1220,7 @@ public sealed class ServerState : IDisposable
         catch { /* shutdown best-effort */ }
         RateLimitManager?.Dispose();
         PullManager.Dispose();
+        Generator?.ClearRecurrentPrefixCache();
         PrefixCache?.Dispose();
         PrefixTrieManager?.Dispose();
         PagedFactory?.Dispose();

@@ -39,6 +39,11 @@ public sealed record PromptCacheResponse
 /// </summary>
 public sealed record PromptCacheStatsResponse
 {
+    /// <summary>Independent recurrent-prefix snapshots, including CUDA models without a paged trie.</summary>
+    [JsonPropertyName("recurrent")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public DotLLM.Engine.PromptCache.RecurrentPrefixCacheStatistics? Recurrent { get; init; }
+
     [JsonPropertyName("enabled")]
     public required bool Enabled { get; init; }
 

@@ -38,7 +38,7 @@ namespace DotLLM.Cuda.Architectures;
 /// prefill dequant-then-cuBLAS-HGEMM path (seqLen &gt; 1) still stages through F16.
 /// </para>
 /// </remarks>
-public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
+public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel, IRecurrentPrefixSnapshotProvider
 {
     private readonly CudaQwen3HybridDenseForwardState _state;
     private readonly CudaGdnStateCache _gdnCache;

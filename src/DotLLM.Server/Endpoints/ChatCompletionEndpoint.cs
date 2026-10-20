@@ -356,6 +356,10 @@ public static class ChatCompletionEndpoint
             PromptTokens = promptTokens,
             CompletionTokens = completionTokens,
             TotalTokens = promptTokens + completionTokens,
+            PromptTokensDetails = new PromptTokensDetailsDto
+            {
+                CachedTokens = results.Count == 0 ? 0 : Math.Clamp(results[0].Timings.CachedTokenCount, 0, promptTokens),
+            },
         };
     }
 
@@ -586,20 +590,7 @@ public static class ChatCompletionEndpoint
             // chunk as well produced two usage-bearing chunks when requested and one when not
             // — the conformance rows openai/usage.stream{,.unrequested} caught both.
             // Timings stays: it is our own extension and no OpenAI client looks for it.
-            Timings = timings.HasValue ? new TimingsDto
-            {
-                PrefillTimeMs = timings.Value.PrefillTimeMs,
-                DecodeTimeMs = timings.Value.DecodeTimeMs,
-                SamplingTimeMs = timings.Value.SamplingTimeMs,
-                PrefillTokensPerSec = timings.Value.PrefillTokensPerSec,
-                DecodeTokensPerSec = timings.Value.DecodeTokensPerSec,
-                PromptTokens = timings.Value.PrefillTokenCount,
-                GeneratedTokens = timings.Value.DecodeTokenCount,
-                CachedTokens = timings.Value.CachedTokenCount,
-                SpeculativeDraftTokens = timings.Value.SpeculativeDraftTokens,
-                SpeculativeAcceptedTokens = timings.Value.SpeculativeAcceptedTokens,
-                SpeculativeAcceptanceRate = timings.Value.SpeculativeAcceptanceRate,
-            } : null,
+            Timings = timings.HasValue ? TimingsDto.From(timings.Value) : null,
         };
         await WriteSseChunk(httpContext, finalChunk, ct);
 
@@ -607,7 +598,7 @@ public static class ChatCompletionEndpoint
         // (choices: []). The finish_reason chunk above also carries usage as a long-standing
         // dotLLM extension; this adds the shape the SDKs actually look for, without removing it.
         if (request.WantsUsageChunk)
-            await WriteSseChunk(httpContext, BuildUsageChunk(requestId, modelId, promptTokens, completionTokens, reasoningTokens), ct);
+            await WriteSseChunk(httpContext, BuildUsageChunk(requestId, modelId, promptTokens, completionTokens, reasoningTokens, timings?.CachedTokenCount ?? 0), ct);
 
         // [DONE] sentinel
         await httpContext.Response.WriteAsync("data: [DONE]\n\n", ct);
@@ -620,7 +611,7 @@ public static class ChatCompletionEndpoint
     /// load-bearing and not merely cosmetic.
     /// </summary>
     internal static ChatCompletionChunk BuildUsageChunk(
-        string requestId, string modelId, int promptTokens, int completionTokens, int reasoningTokens = 0) =>
+        string requestId, string modelId, int promptTokens, int completionTokens, int reasoningTokens = 0, int cachedTokens = 0) =>
         new()
         {
             Id = requestId,
@@ -632,6 +623,7 @@ public static class ChatCompletionEndpoint
                 CompletionTokens = completionTokens,
                 TotalTokens = promptTokens + completionTokens,
                 CompletionTokensDetails = ReasoningSupport.Details(reasoningTokens),
+                PromptTokensDetails = new PromptTokensDetailsDto { CachedTokens = Math.Clamp(cachedTokens, 0, promptTokens) },
             },
         };
 
