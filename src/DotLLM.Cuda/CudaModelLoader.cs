@@ -57,6 +57,9 @@ public static class CudaModelLoader
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
 
+        // #1038: no NVFP4 kernels on CUDA yet. Refuse before any upload.
+        Nvfp4Support.RejectAny(gguf.TensorsByName, "CUDA");
+
         switch (config.Architecture)
         {
             case Architecture.Qwen3HybridDense:
@@ -182,6 +185,7 @@ public static class CudaModelLoader
                 return CreateFromGguf(gguf, config, deviceId);
 
             case GpuOffloadMode.Partial:
+                Nvfp4Support.RejectAny(gguf.TensorsByName, "CUDA"); // #1038, as in CreateFromGguf
                 if (config.Architecture == Architecture.Qwen3HybridDense)
                 {
                     // Issue #291: architecture-aware GPU-head/CPU-tail split (GDN layers have no attn_output).

@@ -576,6 +576,7 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
 
     private static DeviceSsm UploadDeviceSsmLayer(NemotronHSsmWeights w, ref long maxTileFloats, List<nint> allocs)
     {
+        w.ThrowIfNvfp4OrScaled("CUDA"); // #1038: no NVFP4 kernel and no X.scale multiply on this path yet
         nint inDevice = UploadRawTensorFromHost(w.InWeight, w.InQuantType, w.InOutputDim, w.InInputDim, allocs);
         nint outDevice = UploadRawTensorFromHost(w.OutWeight, w.OutQuantType, w.OutOutputDim, w.OutInputDim, allocs);
         UpdateMaxTile(ref maxTileFloats, (long)w.InOutputDim * w.InInputDim);
