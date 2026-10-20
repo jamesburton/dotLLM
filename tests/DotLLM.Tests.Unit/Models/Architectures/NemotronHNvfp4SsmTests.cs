@@ -171,6 +171,22 @@ public sealed class NemotronHNvfp4SsmTests : IDisposable
     }
 
     /// <summary>
+    /// CUDA runs NVFP4 on the Nemotron-H path only, so <c>CudaModelLoader.CreateFromGguf</c>'s refusal is now
+    /// conditional on the architecture (the source scan below only counts the call). Any other architecture
+    /// must still be refused, before any CUDA call, so this needs no GPU.
+    /// </summary>
+    [Fact]
+    public void CudaCreateFromGguf_RefusesNvfp4OutsideNemotronH()
+    {
+        using var gguf = GgufFile.Open(WriteFixture(Variant.Nvfp4Scaled));
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata) with { Architecture = Architecture.Llama };
+        var ex = Assert.Throws<NotSupportedException>(
+            () => DotLLM.Cuda.CudaModelLoader.CreateFromGguf(gguf, config, deviceId: 0));
+        // The loader's own refusal, not the shared weight loader's unapplied-scale one further down.
+        Assert.Contains("The CUDA backend has no NVFP4", ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// Every GGUF loader in <c>DotLLM.Models/Architectures</c> that reads the tensor table must name the
     /// NVFP4 scales it applies (or none) — a new loader that forgets would run Bolt-style files unscaled.
     /// The match is the call statement itself, not a mention in a comment.
