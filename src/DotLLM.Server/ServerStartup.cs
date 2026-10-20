@@ -141,7 +141,8 @@ public static class ServerStartup
             string name = ModelIdFor(options.Model, resolvedPath);
             if (spec.IsGpu)
             {
-                var plan = DeviceSelector.Plan(spec, bytes, Endpoints.DeviceEndpoint.Describe(), fullOffload: options.GpuLayers is null or < 0);
+                var plan = DeviceSelector.Plan(spec, bytes, Endpoints.DeviceEndpoint.Describe(),
+                    fullOffload: options.GpuLayers is null or < 0 && !ExpertOffloadPossible(resolvedPath, options.MoeOffload));
                 if (plan.Error is not null)
                     throw new DeviceUnavailableException(DeviceSelector.ExplicitFailureMessage(options.Device, name, bytes, plan.Error));
             }
@@ -300,6 +301,23 @@ public static class ServerStartup
         return served;
     }
 
+    /// <summary>
+    /// Whether the GGUF at <paramref name="path"/> is a <c>nemotron_h_moe</c> model whose routed experts may be offloaded
+    /// (#1070), read from its metadata; false when the file cannot be read.
+    /// </summary>
+    private static bool ExpertOffloadPossible(string path, DotLLM.Core.Moe.MoeOffloadOptions? moeOffload)
+    {
+        try
+        {
+            using var gguf = GgufFile.Open(path);
+            return DeviceModelLoader.ExpertOffloadPossible(GgufModelConfigExtractor.Extract(gguf.Metadata), moeOffload);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private static ServerState LoadModelCore(string resolvedPath, ServerOptions options)
     {
         Console.WriteLine($"[dotllm] Loading model from {resolvedPath}...");
@@ -322,7 +340,8 @@ public static class ServerStartup
         var (model, deviceKvFactory) = DeviceModelLoader.LoadExact(
             gguf, config, options.Device, options.GpuLayers, threading,
             msg => Console.WriteLine($"[dotllm] {msg}"),
-            w => Console.WriteLine($"[dotllm] WARNING: {w}"));
+            w => Console.WriteLine($"[dotllm] WARNING: {w}"),
+            options.MoeOffload);
         // Only the Vulkan models' KV factory is wired here (CUDA/hybrid models keep their own per-request caches).
         Func<int, IKvCache>? vulkanKvFactory = DeviceSpec.Parse(options.Device).Kind == DeviceKind.Vulkan ? deviceKvFactory : null;
 

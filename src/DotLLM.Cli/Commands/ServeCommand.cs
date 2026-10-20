@@ -42,6 +42,21 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [Description("Number of transformer layers to offload to GPU.")]
         public int? GpuLayers { get; set; }
 
+        /// <summary>Routed-expert placement on CUDA (issue #1070).</summary>
+        [CommandOption(DotLLM.Cli.Helpers.MoeOffloadCli.ModeOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.ModeHelp)]
+        public string? MoeOffload { get; set; }
+
+        /// <summary>VRAM expert-cache size in MiB (issue #1070).</summary>
+        [CommandOption(DotLLM.Cli.Helpers.MoeOffloadCli.CacheMibOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CacheMibHelp)]
+        public string? MoeCacheMib { get; set; }
+
+        /// <summary>Expert-cache replacement policy (issue #1070).</summary>
+        [CommandOption(DotLLM.Cli.Helpers.MoeOffloadCli.PolicyOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.PolicyHelp)]
+        public string? MoeCachePolicy { get; set; }
+
         /// <summary>CPU thread count.</summary>
         [CommandOption("--threads")]
         [Description("Number of CPU threads for inference. 0 = auto.")]
@@ -347,6 +362,11 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             AnsiConsole.MarkupLine($"[red]{Markup.Escape(deviceError!)}[/]");
             return 1;
         }
+        if (DotLLM.Cli.Helpers.MoeOffloadCli.Validate(settings.MoeOffload, settings.MoeCacheMib, settings.MoeCachePolicy) is { } moeError)
+        {
+            AnsiConsole.MarkupLine($"[red]{Markup.Escape(moeError)}[/]");
+            return 1;
+        }
 
         // #967: --kv-quant-k/-v are synonyms of --cache-type-k/-v; reject conflicts and bad values up front.
         if (!DotLLM.Cli.Helpers.KvStorageCli.TryBuild(settings.CacheTypeK, settings.CacheTypeV,
@@ -379,6 +399,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             Quant = settings.Quant,
             Device = settings.Device,
             GpuLayers = settings.GpuLayers,
+            MoeOffload = DotLLM.Cli.Helpers.MoeOffloadCli.Build(settings.MoeOffload, settings.MoeCacheMib, settings.MoeCachePolicy),
             Threads = settings.Threads,
             DecodeThreads = settings.DecodeThreads,
             Host = settings.Host,

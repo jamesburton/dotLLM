@@ -127,6 +127,21 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                      "Omit for default (all layers on a GPU device, 0 with --device cpu). Ignored on vulkan (whole model is device-resident).")]
         public int? GpuLayers { get; set; }
 
+        /// <summary>Routed-expert placement on CUDA (issue #1070).</summary>
+        [CommandOption(MoeOffloadCli.ModeOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.ModeHelp)]
+        public string? MoeOffload { get; set; }
+
+        /// <summary>VRAM expert-cache size in MiB (issue #1070).</summary>
+        [CommandOption(MoeOffloadCli.CacheMibOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CacheMibHelp)]
+        public string? MoeCacheMib { get; set; }
+
+        /// <summary>Expert-cache replacement policy (issue #1070).</summary>
+        [CommandOption(MoeOffloadCli.PolicyOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.PolicyHelp)]
+        public string? MoeCachePolicy { get; set; }
+
         /// <summary>Quantization filter.</summary>
         [CommandOption("--quant|-q")]
         [Description("Quantization filter when multiple GGUF files exist (e.g., Q4_K_M, Q8_0).")]
@@ -273,6 +288,11 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             DeviceCli.PrintError(deviceError, json: false);
             return 1;
         }
+        if (MoeOffloadCli.Validate(settings.MoeOffload, settings.MoeCacheMib, settings.MoeCachePolicy) is { } moeError)
+        {
+            DeviceCli.PrintError(moeError, json: false);
+            return 1;
+        }
 
         // Resolve before loading the model so a bad path fails fast.
         if (!TextArgument.TryResolve(settings.SystemPrompt, settings.SystemPromptFile,
@@ -349,7 +369,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                 DotLLM.Server.DeviceLoadResult loaded;
                 (loaded, deviceOutcome) = DeviceCli.Load(gguf, config, settings.Device, settings.GpuLayers,
                     new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly),
-                    resolvedPath);
+                    resolvedPath, MoeOffloadCli.Build(settings.MoeOffload, settings.MoeCacheMib, settings.MoeCachePolicy));
                 model = loaded.Model;
                 vulkanKv = loaded.IsVulkan ? loaded.KvCacheFactory : null;   // CUDA/hybrid models build their caches from the model type below
                 if (!settings.NoMtp)

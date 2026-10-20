@@ -1,6 +1,7 @@
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
+using DotLLM.Core.Moe;
 using DotLLM.Models;
 using DotLLM.Models.Gguf;
 using DotLLM.Server.Models;
@@ -112,9 +113,18 @@ public static class DeviceModelLoader
     /// <summary>
     /// Loads <paramref name="gguf"/> on exactly <paramref name="canonicalDevice"/> (<c>cpu</c>, <c>gpu:N</c> or <c>vulkan</c>); no fallback.
     /// </summary>
+    /// <param name="gguf">Opened GGUF file; must outlive the model.</param>
+    /// <param name="config">Model configuration.</param>
+    /// <param name="canonicalDevice"><c>cpu</c>, <c>gpu:N</c> or <c>vulkan</c>.</param>
+    /// <param name="requestedGpuLayers">Requested GPU layers (CUDA), or null.</param>
+    /// <param name="threading">CPU threading.</param>
+    /// <param name="log">Informational messages.</param>
+    /// <param name="warn">Warnings.</param>
+    /// <param name="moeOffload">Routed-expert offload (CUDA <c>nemotron_h_moe</c>, #1070); null = defaults plus environment.</param>
+    /// <returns>The model and its KV-cache factory (null for the CPU model).</returns>
     public static (IModel Model, Func<int, IKvCache>? KvCacheFactory) LoadExact(
         GgufFile gguf, ModelConfig config, string canonicalDevice, int? requestedGpuLayers,
-        ThreadingConfig threading, Action<string> log, Action<string> warn)
+        ThreadingConfig threading, Action<string> log, Action<string> warn, MoeOffloadOptions? moeOffload = null)
     {
         var spec = DeviceSpec.Parse(canonicalDevice);
         if (spec.Kind == DeviceKind.Auto)
@@ -138,7 +148,8 @@ public static class DeviceModelLoader
             GpuOffloadMode.Partial => $"Hybrid inference ({gpuLayers} GPU + {config.NumLayers - gpuLayers} CPU layers)",
             _ => $"GPU {spec.Ordinal} inference (partial offload unsupported for {config.Architecture}; all layers must fit)",
         });
-        return DotLLM.Cuda.CudaModelLoader.CreateForGpuLayers(gguf, config, gpuLayers, spec.Ordinal, threading, warn);
+        return DotLLM.Cuda.CudaModelLoader.CreateForGpuLayers(gguf, config, gpuLayers, spec.Ordinal, threading, warn,
+            (moeOffload ?? MoeOffloadOptions.WithEnvironmentFallback(null)) is var moe ? moe with { Log = moe.Log ?? log } : null);
     }
 
     /// <summary>
@@ -146,18 +157,42 @@ public static class DeviceModelLoader
     /// the CPU; an explicit device that cannot be honoured throws <see cref="DeviceUnavailableException"/> (never CPU).
     /// </summary>
     /// <exception cref="ArgumentException">The device string is not recognised.</exception>
+    /// <param name="gguf">Opened GGUF file; must outlive the model.</param>
+    /// <param name="config">Model configuration.</param>
+    /// <param name="requestedDevice">The raw <c>--device</c> value.</param>
+    /// <param name="requestedGpuLayers">Requested GPU layers (CUDA), or null.</param>
+    /// <param name="threading">CPU threading.</param>
+    /// <param name="modelBytes">Size of the model's weights.</param>
+    /// <param name="modelName">Model name for messages.</param>
+    /// <param name="log">Informational messages.</param>
+    /// <param name="warn">Warnings.</param>
+    /// <param name="moeOffload">Routed-expert offload (CUDA <c>nemotron_h_moe</c>, #1070); null = defaults plus environment.</param>
+    /// <returns>The load result.</returns>
     public static DeviceLoadResult Load(
         GgufFile gguf, ModelConfig config, string requestedDevice, int? requestedGpuLayers,
-        ThreadingConfig threading, long modelBytes, string modelName, Action<string> log, Action<string> warn)
+        ThreadingConfig threading, long modelBytes, string modelName, Action<string> log, Action<string> warn,
+        MoeOffloadOptions? moeOffload = null)
         => LoadWith(gguf, config, requestedDevice, requestedGpuLayers, threading, modelBytes, modelName, log, warn,
             Endpoints.DeviceEndpoint.Describe(),
-            (device, layers) => LoadExact(gguf, config, device, layers, threading, log, warn));
+            (device, layers) => LoadExact(gguf, config, device, layers, threading, log, warn, moeOffload), moeOffload);
+
+    /// <summary>
+    /// True when a CUDA load of this model may keep its routed experts on the host (#1070: <c>nemotron_h_moe</c> with
+    /// <c>--moe-offload</c> not <c>off</c>), so weights larger than free VRAM are not by themselves a reason to refuse it.
+    /// </summary>
+    /// <param name="config">Model configuration (null = unknown, false).</param>
+    /// <param name="moeOffload">Offload options, or null for the defaults plus environment.</param>
+    /// <returns>True when expert offload can apply.</returns>
+    public static bool ExpertOffloadPossible(ModelConfig? config, MoeOffloadOptions? moeOffload)
+        => config?.Architecture == Architecture.NemotronHMoe
+           && (moeOffload ?? MoeOffloadOptions.WithEnvironmentFallback(null)).Mode != MoeOffloadMode.Off;
 
     /// <summary>Same, with the device inventory and the per-device loader injected (testable without hardware).</summary>
     internal static DeviceLoadResult LoadWith(
         GgufFile gguf, ModelConfig config, string requestedDevice, int? requestedGpuLayers,
         ThreadingConfig threading, long modelBytes, string modelName, Action<string> log, Action<string> warn,
-        DeviceListResponse devices, Func<string, int?, (IModel Model, Func<int, IKvCache>? Kv)> loadExact)
+        DeviceListResponse devices, Func<string, int?, (IModel Model, Func<int, IKvCache>? Kv)> loadExact,
+        MoeOffloadOptions? moeOffload = null)
     {
         var spec = DeviceSpec.Parse(requestedDevice);
 
@@ -165,7 +200,9 @@ public static class DeviceModelLoader
         if (spec.Kind == DeviceKind.Auto && requestedGpuLayers == 0)
             spec = new(DeviceKind.Cpu, 0);
 
-        var plan = DeviceSelector.Plan(spec, modelBytes, devices, fullOffload: requestedGpuLayers is null or < 0);
+        // An offloadable MoE (#1070) is exempt from the weights-vs-free-VRAM refusal, like a partial --gpu-layers offload.
+        var plan = DeviceSelector.Plan(spec, modelBytes, devices,
+            fullOffload: requestedGpuLayers is null or < 0 && !ExpertOffloadPossible(config, moeOffload));
         if (plan.Error is not null)
             throw new DeviceUnavailableException(DeviceSelector.ExplicitFailureMessage(requestedDevice, modelName, modelBytes, plan.Error));
 

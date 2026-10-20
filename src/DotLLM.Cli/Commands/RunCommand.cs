@@ -181,6 +181,27 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                      "Omit for default (all layers on a GPU device, 0 with --device cpu). Ignored on vulkan (whole model is device-resident).")]
         public int? GpuLayers { get; set; }
 
+        /// <summary>Routed-expert placement on CUDA (issue #1070).</summary>
+        [CommandOption(MoeOffloadCli.ModeOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.ModeHelp)]
+        public string? MoeOffload { get; set; }
+
+        /// <summary>VRAM expert-cache size in MiB (issue #1070).</summary>
+        [CommandOption(MoeOffloadCli.CacheMibOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CacheMibHelp)]
+        public string? MoeCacheMib { get; set; }
+
+        /// <summary>Expert-cache replacement policy (issue #1070).</summary>
+        [CommandOption(MoeOffloadCli.PolicyOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.PolicyHelp)]
+        public string? MoeCachePolicy { get; set; }
+
+        /// <summary>Print extra diagnostics after the run.</summary>
+        [CommandOption("--verbose")]
+        [Description("Print extra diagnostics after the run (e.g. the MoE expert-offload summary: cache size, hit rate, H2D MB/token, copy wait).")]
+        [DefaultValue(false)]
+        public bool Verbose { get; set; }
+
         [CommandOption("--quant|-q")]
         [Description("Quantization filter when multiple GGUF files exist (e.g., Q4_K_M, Q8_0).")]
         public string? Quant { get; set; }
@@ -304,6 +325,11 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             DeviceCli.PrintError(deviceError, settings.Json);
             return 1;
         }
+        if (MoeOffloadCli.Validate(settings.MoeOffload, settings.MoeCacheMib, settings.MoeCachePolicy) is { } moeError)
+        {
+            DeviceCli.PrintError(moeError, settings.Json);
+            return 1;
+        }
 
         // #967: --kv-quant-k/-v and --cache-type-k/-v are synonyms; bad values fail before anything loads.
         if (!DotLLM.Cli.Helpers.KvStorageCli.TryBuild(settings.CacheTypeK, settings.CacheTypeV,
@@ -372,7 +398,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             DotLLM.Server.DeviceLoadResult loaded;
             (loaded, deviceOutcome) = DeviceCli.Load(gguf, config, settings.Device, settings.GpuLayers,
                 new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly),
-                resolvedPath);
+                resolvedPath, MoeOffloadCli.Build(settings.MoeOffload, settings.MoeCacheMib, settings.MoeCachePolicy));
             model = loaded.Model;
             vulkanKv = loaded.IsVulkan ? loaded.KvCacheFactory : null;   // CUDA/hybrid models build their caches from the model type below
             if (!settings.NoMtp)
@@ -417,6 +443,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 
         // Resolved device line + (for auto on the CPU) the prominent warning, printed after the spinner so it stays visible.
         DeviceCli.Report(deviceOutcome, settings.Json);
+        var moeStart = DotLLM.Core.Moe.MoeTelemetry.Snapshot();   // --verbose: expert-offload summary of this run (#1070)
 
         // #967: apply the KV storage request to models that own their KV (CUDA hybrid-dense) and warn - never silently
         // ignore - when the selected model/backend cannot honour a flag.
@@ -985,6 +1012,8 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 
                 AnsiConsole.Write(panel);
             }
+            if (settings.Verbose)
+                MoeOffloadCli.PrintSummary(moeStart, settings.Json);
         }
         finally
         {
