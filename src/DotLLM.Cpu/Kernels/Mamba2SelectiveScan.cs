@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using DotLLM.Cpu.Threading;
 
 namespace DotLLM.Cpu.Kernels;
 
@@ -35,7 +36,7 @@ namespace DotLLM.Cpu.Kernels;
 /// <c>[T, d_inner]</c> row-major tensor.
 /// </para>
 /// </remarks>
-public static class Mamba2SelectiveScan
+public static unsafe class Mamba2SelectiveScan
 {
     /// <summary>
     /// Runs the selective scan over <paramref name="seqLen"/> tokens.
@@ -55,6 +56,12 @@ public static class Mamba2SelectiveScan
     /// <param name="dState">SSM state width (typically 128).</param>
     /// <param name="nGroup">Number of B/C groups.</param>
     /// <param name="seqLen">Number of tokens in this step.</param>
+    /// <param name="pool">
+    /// Optional thread pool (#1042). Heads are independent (each owns its state slice and its
+    /// <paramref name="y"/> columns), so they are partitioned across the pool. Every head runs
+    /// exactly the serial loop body in the same order, so the result is bit-identical to
+    /// <see langword="null"/> (serial).
+    /// </param>
     [SkipLocalsInit]
     public static void Execute(
         Span<float> state,
@@ -68,7 +75,8 @@ public static class Mamba2SelectiveScan
         int headDim,
         int dState,
         int nGroup,
-        int seqLen)
+        int seqLen,
+        ComputeThreadPool? pool = null)
     {
         if (nHead <= 0) throw new ArgumentOutOfRangeException(nameof(nHead));
         if (headDim <= 0) throw new ArgumentOutOfRangeException(nameof(headDim));
@@ -96,18 +104,65 @@ public static class Mamba2SelectiveScan
         if (y.Length < (long)seqLen * dInner)
             throw new ArgumentException("y span too small.", nameof(y));
 
+        fixed (float* pState = state, pX = x, pDt = dt, pA = a, pB = b, pC = c, pY = y)
+        {
+            var ctx = new ScanCtx
+            {
+                State = pState, X = pX, Dt = pDt, A = pA, B = pB, C = pC, Y = pY,
+                NHead = nHead, HeadDim = headDim, DState = dState, NGroup = nGroup, SeqLen = seqLen,
+            };
+
+            // One head of work is ~seqLen*headDim*dState FMAs; below a couple of heads per thread
+            // the dispatch costs more than it saves (single-token decode on a tiny model).
+            if (pool is null || pool.ThreadCount <= 1 || seqLen == 0 || (seqLen == 1 && nHead < 2 * pool.ThreadCount))
+                ScanHeads(ref ctx, 0, nHead);
+            else
+                pool.Dispatch((nint)(&ctx), &ScanWorker);
+        }
+    }
+
+    /// <summary>Per-dispatch arguments for <see cref="ScanWorker"/>; lives on the caller's stack.</summary>
+    private struct ScanCtx
+    {
+        public float* State, X, Dt, A, B, C, Y;
+        public int NHead, HeadDim, DState, NGroup, SeqLen;
+    }
+
+    /// <summary>Pool worker: scans a contiguous range of heads.</summary>
+    private static void ScanWorker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        ref ScanCtx ctx = ref *(ScanCtx*)ctxPtr;
+        int start = (int)((long)ctx.NHead * threadIdx / threadCount);
+        int end = (int)((long)ctx.NHead * (threadIdx + 1) / threadCount);
+        if (start < end)
+            ScanHeads(ref ctx, start, end);
+    }
+
+    /// <summary>
+    /// The serial scan restricted to heads [<paramref name="hStart"/>, <paramref name="hEnd"/>):
+    /// for each head, the time loop runs in order and the inner arithmetic is unchanged.
+    /// </summary>
+    [SkipLocalsInit]
+    private static void ScanHeads(ref ScanCtx ctx, int hStart, int hEnd)
+    {
+        int nHead = ctx.NHead, headDim = ctx.HeadDim, dState = ctx.DState, nGroup = ctx.NGroup;
+        int dInner = nHead * headDim;
+        int headsPerGroup = nHead / nGroup;
+
         // Per-head state stride into the [n_head, head_dim, d_state] buffer.
         int stateStrideHead = headDim * dState;
+        var state = new Span<float>(ctx.State, nHead * stateStrideHead);
+        var a = new ReadOnlySpan<float>(ctx.A, nHead);
 
-        for (int t = 0; t < seqLen; t++)
+        for (int t = 0; t < ctx.SeqLen; t++)
         {
-            ReadOnlySpan<float> xRow = x.Slice(t * dInner, dInner);
-            ReadOnlySpan<float> dtRow = dt.Slice(t * nHead, nHead);
-            ReadOnlySpan<float> bRow = b.Slice(t * nGroup * dState, nGroup * dState);
-            ReadOnlySpan<float> cRow = c.Slice(t * nGroup * dState, nGroup * dState);
-            Span<float> yRow = y.Slice(t * dInner, dInner);
+            var xRow = new ReadOnlySpan<float>(ctx.X + (long)t * dInner, dInner);
+            var dtRow = new ReadOnlySpan<float>(ctx.Dt + (long)t * nHead, nHead);
+            var bRow = new ReadOnlySpan<float>(ctx.B + (long)t * nGroup * dState, nGroup * dState);
+            var cRow = new ReadOnlySpan<float>(ctx.C + (long)t * nGroup * dState, nGroup * dState);
+            var yRow = new Span<float>(ctx.Y + (long)t * dInner, dInner);
 
-            for (int h = 0; h < nHead; h++)
+            for (int h = hStart; h < hEnd; h++)
             {
                 float dtSp = SoftPlus(dtRow[h]);
                 // A is stored negative by the GGUF converter; exp(dtSp * A[h]) is in (0,1) -> stable decay.
