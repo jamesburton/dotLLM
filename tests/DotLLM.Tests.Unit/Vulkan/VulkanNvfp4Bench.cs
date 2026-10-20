@@ -86,9 +86,9 @@ public sealed class VulkanNvfp4Bench
     }
 
     /// <summary>
-    /// #1065: decode GEMV, #1038's one-block-per-lane kernel against builds of the coalesced kernel with 1, 2 (shipped), 4 and 8 rows
+    /// #1065: decode GEMV, #1038's one-block-per-lane kernel against builds of the coalesced kernel with 1 (shipped), 2, 4 and 8 rows
     /// per workgroup, with the Q8_0 coalesced GEMV at the same shapes as the bandwidth yardstick. The ROWS builds other than the
-    /// shipped one are compiled by hand into the test output (<c>matmul_nvfp4_gemv_coalesced_r{1,4,8}.spv</c>) and skipped if absent.
+    /// shipped one are compiled by hand into the test output (<c>matmul_nvfp4_gemv_coalesced_r{2,4,8}.spv</c>, <c>matmul_nvfp4_mmvq_r{2,4}.spv</c>) and skipped if absent.
     /// </summary>
     [SkippableFact]
     public void Bench_DecodeGemv_Variants()
@@ -104,7 +104,7 @@ public sealed class VulkanNvfp4Bench
         };
         foreach (var (file, rows) in new[]
                  {
-                     ("matmul_nvfp4_gemv_coalesced_r1.spv", 1), (MatMulNvfp4F32Kernel.CoalescedGemvSpvFileName, MatMulNvfp4F32Kernel.CoalescedGemvRows),
+                     (MatMulNvfp4F32Kernel.CoalescedGemvSpvFileName, MatMulNvfp4F32Kernel.CoalescedGemvRows), ("matmul_nvfp4_gemv_coalesced_r2.spv", 2),
                      ("matmul_nvfp4_gemv_coalesced_r4.spv", 4), ("matmul_nvfp4_gemv_coalesced_r8.spv", 8),
                  })
         {
@@ -116,7 +116,7 @@ public sealed class VulkanNvfp4Bench
             // MMVQ timings include the per-call Q8_1 quantise of the activation row and its two barriers, as in production.
             foreach (var (file, rows) in new[]
                      {
-                         ("matmul_nvfp4_mmvq_r1.spv", 1), (MatMulNvfp4F32Kernel.MmvqSpvFileName, MatMulNvfp4F32Kernel.MmvqRows),
+                         (MatMulNvfp4F32Kernel.MmvqSpvFileName, MatMulNvfp4F32Kernel.MmvqRows), ("matmul_nvfp4_mmvq_r2.spv", 2),
                          ("matmul_nvfp4_mmvq_r4.spv", 4),
                      })
             {

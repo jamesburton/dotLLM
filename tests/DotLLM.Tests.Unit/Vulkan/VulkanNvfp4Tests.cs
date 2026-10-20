@@ -67,7 +67,7 @@ public sealed class VulkanNvfp4Tests : IDisposable
     /// #1066: the three decode GEMVs against the CPU dequant reference. The FP32 ones (coalesced multi-row, and #1038's
     /// one-block-per-lane) match the double-precision product to F32 rounding. The MMVQ quantises the activations to Q8_1 first, so it
     /// is held tightly to the product with the activations quantised exactly as <c>quantize_q8_1.comp</c> does (ties aside), and
-    /// loosely to the unquantised one. Odd M leaves the last 2-row workgroup with one valid row; K covers one block, a window tail
+    /// loosely to the unquantised one. Odd M covers the row guard of multi-row builds; K covers one block, a window tail
     /// (3 blocks), and Bolt's ssm_in / ssm_out widths with their per-tensor scales.
     /// </summary>
     [SkippableTheory]

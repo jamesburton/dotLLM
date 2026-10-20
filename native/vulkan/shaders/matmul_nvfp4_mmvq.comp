@@ -22,7 +22,7 @@
 // Dispatch: ceil(M / ROWS) workgroups of 64 threads.
 
 #ifndef ROWS
-#define ROWS 2u
+#define ROWS 1u
 #endif
 #define WG_SIZE 64u
 

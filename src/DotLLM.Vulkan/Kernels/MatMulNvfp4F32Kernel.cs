@@ -33,7 +33,7 @@ public sealed class MatMulNvfp4F32Kernel : IDisposable
     public const string CoalescedGemvSpvFileName = "matmul_nvfp4_gemv_coalesced.spv";
 
     /// <summary>Weight rows per workgroup of <see cref="CoalescedGemvSpvFileName"/> (its <c>ROWS</c>).</summary>
-    public const int CoalescedGemvRows = 2;
+    public const int CoalescedGemvRows = 1;
 
     /// <summary>Environment variable that forces the #1038 one-block-per-lane GEMV (A/B); it also disables the MMVQ.</summary>
     public const string LegacyGemvEnvVar = "DOTLLM_VK_NVFP4_GEMV_LEGACY";
@@ -42,7 +42,7 @@ public sealed class MatMulNvfp4F32Kernel : IDisposable
     public const string MmvqSpvFileName = "matmul_nvfp4_mmvq.spv";
 
     /// <summary>Weight rows per workgroup of <see cref="MmvqSpvFileName"/> (its <c>ROWS</c>).</summary>
-    public const int MmvqRows = 2;
+    public const int MmvqRows = 1;
 
     /// <summary>Environment variable that disables the MMVQ (A/B against the FP32 GEMVs).</summary>
     public const string DisableMmvqEnvVar = "DOTLLM_VK_NVFP4_MMVQ_DISABLE";
