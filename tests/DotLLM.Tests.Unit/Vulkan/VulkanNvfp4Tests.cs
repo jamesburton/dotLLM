@@ -329,7 +329,7 @@ public sealed class VulkanNvfp4Tests : IDisposable
         using var nativeOff = path != Nvfp4PrefillPath.Native ? new EnvVarScope(MatMulNvfp4GemmCoopmatKernel.LegacyEnvVar, "1") : null;
         IqF16PrefillMatmul.Counters.Reset();
         Interlocked.Exchange(ref MatMulNvfp4GemmCoopmatKernel.Dispatches, 0);
-        long scratchBytes = -1;
+        long scratchBytes = -1, scratchCapacity = -1;
 
         float[] cpu;
         using (var gguf = GgufFile.Open(NemotronHNvfp4SsmTests.WriteFixture(_scratch, Variant.F32Reference)))
@@ -351,7 +351,9 @@ public sealed class VulkanNvfp4Tests : IDisposable
                 Assert.IsType<VulkanNemotronHTransformerModel>(model);
                 using ITensor logits = model.Forward(NemotronHNvfp4SsmTests.Ids, NemotronHNvfp4SsmTests.Pos, deviceId: -1);
                 vk = LastRow(logits);
-                scratchBytes = ((VulkanNemotronHTransformerModel)model).F16PrefillScratchBytes;
+                var nemotron = (VulkanNemotronHTransformerModel)model;
+                scratchBytes = nemotron.F16PrefillScratchBytes;
+                scratchCapacity = nemotron.F16PrefillScratchCapacityBytes;
             }
         }
 
@@ -362,12 +364,15 @@ public sealed class VulkanNvfp4Tests : IDisposable
             case Nvfp4PrefillPath.Native:
                 Assert.True(viaNative > 0, "the NVFP4 projections did not take the native coopmat GEMM");
                 Assert.Equal(0, viaF16);
-                Assert.Equal(0, scratchBytes);   // #1064: no F16 staging buffer exists
+                Assert.Equal(0, scratchBytes);   // #1064: no F16 staging buffer exists ...
+                Assert.True(scratchCapacity <= sizeof(ushort),   // ... nor is one sized for NVFP4 (the fixture has no IQ projection)
+                    $"F16 scratch sized to {scratchCapacity} bytes for an NVFP4-only model with the native GEMM");
                 break;
             case Nvfp4PrefillPath.F16Dequant:
                 Assert.True(viaF16 > 0, "the NVFP4 projections did not take the F16 prefill path");
                 Assert.Equal(0, viaNative);
                 Assert.True(scratchBytes > 0, "the F16 path ran without its scratch");
+                Assert.Equal(scratchCapacity, scratchBytes);
                 break;
             default:
                 Assert.Equal(0, viaF16);

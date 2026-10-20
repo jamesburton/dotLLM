@@ -76,6 +76,9 @@ internal sealed class IqF16PrefillMatmul : IDisposable
     /// GEMM (#1064) leaves it unallocated.</summary>
     internal long ScratchBytes => _scratch?.Size ?? 0;
 
+    /// <summary>Capacity of the F16 scratch in elements: what <see cref="ScratchBytes"/> becomes (x2) on the first served matmul.</summary>
+    internal long CapacityElements => _capacityElements;
+
     /// <summary>True for the formats this path serves: the IQ1/IQ2/IQ3 family and NVFP4 (#1060).</summary>
     public static bool Handles(QuantizationType qt) =>
         qt is QuantizationType.IQ1_S or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS

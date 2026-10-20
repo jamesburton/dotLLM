@@ -96,6 +96,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
     /// <summary>Bytes of the shared F16 prefill scratch allocated so far (#1060, #1064); 0 when nothing has used it.</summary>
     internal long F16PrefillScratchBytes => _iqF16Prefill?.ScratchBytes ?? 0;
+
+    /// <summary>Bytes the F16 prefill scratch is sized to (allocated on its first use); 0 without the helper.</summary>
+    internal long F16PrefillScratchCapacityBytes => (_iqF16Prefill?.CapacityElements ?? 0) * sizeof(ushort);
     private readonly MatMulIq4NlGemvF32Kernel _matmulIq4Nl;
     private readonly MatMulIq4NlGemmF32Kernel _matmulIq4NlGemm;
     private readonly MatMulIq4XsGemvF32Kernel _matmulIq4Xs;
