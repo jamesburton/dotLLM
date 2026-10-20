@@ -87,6 +87,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     // QuantizationType.
     // NVFP4 GEMV + GEMM (#1038); applies the per-tensor X.scale. Set by BuildFromPrebuiltWeights.
     private MatMulNvfp4F32Kernel? _matmulNvfp4;
+    // Prefill (n >= MinTokens) for NVFP4 and the IQ1/IQ2/IQ3 family (#1060): dequantise once to F16, then the F16 coopmat GEMM.
+    // Null without a coopmat F16 GEMM; the scalar GEMMs above then stay in use.
+    private IqF16PrefillMatmul? _iqF16Prefill;
     private readonly MatMulIq4NlGemvF32Kernel _matmulIq4Nl;
     private readonly MatMulIq4NlGemmF32Kernel _matmulIq4NlGemm;
     private readonly MatMulIq4XsGemvF32Kernel _matmulIq4Xs;
@@ -572,7 +575,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
         var submit = device.CreateSubmitContext();
 
-        MoeKernelSet? moeKernels = moeSpec is { } spec ? CreateMoeKernels(device, spvDir, spec.NumExperts) : null;
+        MoeKernelSet? moeKernels = moeSpec is { } spec
+            ? CreateMoeKernels(device, spvDir, spec.NumExperts, IqBankFormats(weights), iq2Codebooks, iq3Codebooks)
+            : null;
 
         var created = new VulkanNemotronHTransformerModel(
             device, ownsDevice: false,
@@ -602,6 +607,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             ssmSplitXbc,
             submit);
         created._moe = moeKernels;
+        created._iqF16Prefill = IqF16PrefillMatmul.TryCreate(device, spvDir, matmulF16GemmCoopmat, MaxF16PrefillElements(weights));
         try
         {
             created._matmulNvfp4 = MatMulNvfp4F32Kernel.Create(device, spvDir);
@@ -1336,8 +1342,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
     /// <summary>
     /// Kernels of the nemotron_h_moe routed layer (#402). Created only when the model has a router tensor; the dense Nemotron-H path never
-    /// touches them. Expert banks are Q8_0 / Q5_1 (Q5_0 repacked at upload) or the K-quants Q4_K / Q5_K / Q6_K (#1045, Nemotron 3.5 Bolt),
-    /// so only those indexed matmuls exist here.
+    /// touches them. Expert banks are Q8_0 / Q5_1 (Q5_0 repacked at upload), the K-quants Q4_K / Q5_K / Q6_K (#1045, Nemotron 3.5 Bolt)
+    /// or the IQ family (#1057, NVIDIA's official IQ2_XXS Bolt file), so only those indexed matmuls exist here.
     /// </summary>
     private sealed class MoeKernelSet : IDisposable
     {
@@ -1373,6 +1379,17 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         public MoeGroupedMatmulKQuantCoopmatKernel? GroupedCoopmatQ5_K { get; init; }
         public MoeGroupedMatmulKQuantCoopmatKernel? GroupedCoopmatQ6_K { get; init; }
 
+        // IQ-family banks (#1057, NVIDIA's official IQ2_XXS Bolt file): one indexed dp4a MMVQ kernel per bank format present in the model
+        // (mandatory: there is no F32-activation IQ arm) and, where the device has them, the grouped coopmat prefill kernels.
+        public required IReadOnlyDictionary<MoeIqQuant, MoeIndexedMatmulIqMmvqKernel> MmvqIq { get; init; }
+        public required IReadOnlyDictionary<MoeIqQuant, MoeGroupedMatmulIqCoopmatKernel> GroupedCoopmatIq { get; init; }
+        /// <summary>The iq1s grid for IQ1_M banks; owned here because the host's dense kernels never need it.</summary>
+        public Iq1Codebooks? Iq1 { get; init; }
+
+        /// <summary>The indexed IQ MMVQ kernel for a bank of type <paramref name="qt"/>, or null when <paramref name="qt"/> is not an IQ bank.</summary>
+        public MoeIndexedMatmulIqMmvqKernel? IqMmvq(QuantizationType qt)
+            => MoeIqFormats.FromQuantizationType(qt) is { } f && MmvqIq.TryGetValue(f, out var kernel) ? kernel : null;
+
         /// <summary>Whether the shared grouped glue (offsets, F32/Q8_1 gather, grouped scatter) exists.</summary>
         public bool HasGroupedGlue => ExpertOffsets is not null && ScatterGrouped is not null;
 
@@ -1384,13 +1401,13 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             _ => null,
         };
 
-        /// <summary>The coopmat grouped kernel for a bank of type <paramref name="qt"/>, or null.</summary>
-        public MoeGroupedMatmulKQuantCoopmatKernel? GroupedCoopmat(QuantizationType qt) => qt switch
+        /// <summary>The coopmat grouped kernel (F32 activations) for a bank of type <paramref name="qt"/>: K-quant or IQ family (#1057), or null.</summary>
+        public IMoeGroupedF32Kernel? GroupedCoopmat(QuantizationType qt) => qt switch
         {
             QuantizationType.Q4_K => GroupedCoopmatQ4_K,
             QuantizationType.Q5_K => GroupedCoopmatQ5_K,
             QuantizationType.Q6_K => GroupedCoopmatQ6_K,
-            _ => null,
+            _ => MoeIqFormats.FromQuantizationType(qt) is { } f && GroupedCoopmatIq.TryGetValue(f, out var iq) ? iq : null,
         };
 
         /// <summary>True when a bank of type <paramref name="bankQt"/> has a dp4a MMVQ kernel (and the Q8_1 activation quantizer exists).</summary>
@@ -1401,7 +1418,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             QuantizationType.Q4_K => MmvqQ4_K is not null,
             QuantizationType.Q5_K => MmvqQ5_K is not null,
             QuantizationType.Q6_K => MmvqQ6_K is not null,
-            _ => false,
+            _ => IqMmvq(bankQt) is not null,
         };
 
         public void Invalidate()
@@ -1416,6 +1433,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             GatherGroupF32?.InvalidateDescriptorCache(); GatherGroupQ8_1?.InvalidateDescriptorCache(); ScatterGrouped?.InvalidateDescriptorCache();
             GroupedMmqQ4_K?.InvalidateDescriptorCache(); GroupedMmqQ5_K?.InvalidateDescriptorCache();
             GroupedCoopmatQ4_K?.InvalidateDescriptorCache(); GroupedCoopmatQ5_K?.InvalidateDescriptorCache(); GroupedCoopmatQ6_K?.InvalidateDescriptorCache();
+            foreach (var kernel in MmvqIq.Values) kernel.InvalidateDescriptorCache();
+            foreach (var kernel in GroupedCoopmatIq.Values) kernel.InvalidateDescriptorCache();
         }
 
         public void Dispose()
@@ -1427,6 +1446,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             ExpertOffsets?.Dispose(); BuildTileList?.Dispose(); GatherGroupF32?.Dispose(); GatherGroupQ8_1?.Dispose(); ScatterGrouped?.Dispose();
             GroupedMmqQ4_K?.Dispose(); GroupedMmqQ5_K?.Dispose();
             GroupedCoopmatQ4_K?.Dispose(); GroupedCoopmatQ5_K?.Dispose(); GroupedCoopmatQ6_K?.Dispose();
+            foreach (var kernel in MmvqIq.Values) kernel.Dispose();
+            foreach (var kernel in GroupedCoopmatIq.Values) kernel.Dispose();
+            Iq1?.Dispose();
             UnitScale.Dispose();
         }
     }
@@ -1458,16 +1480,59 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             LatentSize: Math.Max(c.LatentSize, layer.HasLatent ? layer.LatentSize : 0));
     }
 
-    private static MoeKernelSet CreateMoeKernels(VulkanDevice device, string spvDir, int numExperts)
+    /// <summary>The IQ-family formats (#1057) among the routed banks of <paramref name="weights"/>.</summary>
+    /// <param name="weights">The uploaded layer buffers.</param>
+    /// <returns>The distinct IQ bank formats; empty for a K-quant / legacy-quant model.</returns>
+    private static HashSet<MoeIqQuant> IqBankFormats(VulkanNemotronHWeights weights)
+    {
+        var set = new HashSet<MoeIqQuant>();
+        foreach (var layer in weights.Layers)
+        {
+            if (layer.Moe is not { } m) continue;
+            if (MoeIqFormats.FromQuantizationType(m.UpBankQuantType) is { } up) set.Add(up);
+            if (MoeIqFormats.FromQuantizationType(m.DownBankQuantType) is { } down) set.Add(down);
+        }
+        return set;
+    }
+
+    /// <summary>
+    /// Creates the routed-MoE kernels. IQ-family banks (#1057) always get the dp4a MMVQ kernel, whatever <see cref="MoeMmvqEnabled"/> says:
+    /// no other indexed arm reads them, so a missing kernel refuses the model instead of leaving the layer without one.
+    /// </summary>
+    /// <param name="device">Target device.</param>
+    /// <param name="spvDir">SPIR-V directory.</param>
+    /// <param name="numExperts">Largest expert count of any layer (sizes the unit scale).</param>
+    /// <param name="iqFormats">IQ bank formats present in the model.</param>
+    /// <param name="iq2">The host's IQ2 codebooks (grid + ksigns); the caller keeps ownership.</param>
+    /// <param name="iq3">The host's IQ3 codebooks; the caller keeps ownership.</param>
+    /// <returns>The kernel set.</returns>
+    private static MoeKernelSet CreateMoeKernels(VulkanDevice device, string spvDir, int numExperts,
+        IReadOnlyCollection<MoeIqQuant> iqFormats, Iq2Codebooks iq2, Iq3Codebooks iq3)
     {
         var ones = device.AllocateDeviceLocal((long)numExperts * sizeof(float));
         var host = new float[numExperts];
         Array.Fill(host, 1.0f);
         device.Upload(host, ones);
         bool mmvq = MoeMmvqEnabled && device.HasIntegerDotProduct;
+        bool iqBanks = iqFormats.Count > 0;
         var g = MoeGroupedEnabled ? CreateGroupedMoeKernels(device, spvDir, mmvq) : default;
+
+        var iq1 = iqFormats.Contains(MoeIqQuant.IQ1_M) ? Iq1Codebooks.Create(device) : null;
+        var mmvqIq = new Dictionary<MoeIqQuant, MoeIndexedMatmulIqMmvqKernel>();
+        var groupedIq = new Dictionary<MoeIqQuant, MoeGroupedMatmulIqCoopmatKernel>();
+        foreach (var f in iqFormats)
+        {
+            mmvqIq[f] = MoeIndexedMatmulIqMmvqKernel.TryCreate(device, spvDir, f, iq3, iq2, iq1)
+                ?? throw new NotSupportedException(
+                    $"nemotron_h_moe has {f} expert banks, but the indexed {f} MMVQ kernel is unavailable (integer dot product or " +
+                    $"{MoeIndexedMatmulIqMmvqKernel.ShaderName(f)}.spv missing). No other Vulkan arm reads IQ banks; use --device cpu.");
+            if (MoeGroupedEnabled && g.Offsets is not null && MoeGroupedMatmulIqCoopmatKernel.IsSupportedOn(device, spvDir, f))
+                groupedIq[f] = MoeGroupedMatmulIqCoopmatKernel.Create(device, spvDir, f, iq3, iq2, iq1);
+        }
+
         return new MoeKernelSet
         {
+            MmvqIq = mmvqIq, GroupedCoopmatIq = groupedIq, Iq1 = iq1,
             ExpertOffsets = g.Offsets, BuildTileList = g.Tiles, GatherGroupF32 = g.GatherF32, GatherGroupQ8_1 = g.GatherQ8,
             ScatterGrouped = g.Scatter, GroupedMmqQ4_K = g.Mmq4, GroupedMmqQ5_K = g.Mmq5,
             GroupedCoopmatQ4_K = g.Cm4, GroupedCoopmatQ5_K = g.Cm5, GroupedCoopmatQ6_K = g.Cm6,
@@ -1479,7 +1544,11 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             IndexedQ4_K = MoeIndexedMatmulQ4_KF32Kernel.Create(device, spvDir),
             IndexedQ5_K = MoeIndexedMatmulQ5_KF32Kernel.Create(device, spvDir),
             IndexedQ6_K = MoeIndexedMatmulQ6_KF32Kernel.Create(device, spvDir),
-            Quantize = mmvq ? QuantizeQ8_1RowsKernel.TryCreate(device, spvDir) : null,
+            // IQ banks run on MMVQ only, so they need the Q8_1 activation quantizer even with the K-quant MMVQ arm switched off.
+            Quantize = mmvq || iqBanks
+                ? QuantizeQ8_1RowsKernel.TryCreate(device, spvDir)
+                    ?? (iqBanks ? throw new NotSupportedException("nemotron_h_moe IQ expert banks need the Q8_1 row quantizer (quantize_q8_1_rows.spv missing).") : null)
+                : null,
             MmvqQ5_1 = mmvq ? MoeIndexedMatmulQ5_1MmvqKernel.TryCreate(device, spvDir) : null,
             MmvqQ8_0 = mmvq ? MoeIndexedMatmulQ8_0MmvqKernel.TryCreate(device, spvDir) : null,
             MmvqQ4_K = mmvq ? MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q4_K) : null,
@@ -1506,8 +1575,13 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         public static long MultiRowUp;
         /// <summary>Indexed projections (the down projection) run on the multi-row Q5_K MMVQ (#1049).</summary>
         public static long MultiRowDown;
+        /// <summary>Indexed projections run on an IQ-family MMVQ kernel (#1057).</summary>
+        public static long IqMmvq;
+        /// <summary>Routed layers run on the IQ-family grouped coopmat prefill (#1057); also counted in <see cref="GroupedCoopmat"/>.</summary>
+        public static long GroupedIqCoopmat;
         public static void Reset()
         {
+            Interlocked.Exchange(ref IqMmvq, 0); Interlocked.Exchange(ref GroupedIqCoopmat, 0);
             Interlocked.Exchange(ref XDivUp, 0); Interlocked.Exchange(ref MultiRowUp, 0); Interlocked.Exchange(ref MultiRowDown, 0);
             Interlocked.Exchange(ref Mmvq, 0); Interlocked.Exchange(ref F32Indexed, 0);
             Interlocked.Exchange(ref GroupedMmq, 0); Interlocked.Exchange(ref GroupedCoopmat, 0);
@@ -1629,8 +1703,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         var grouped = seqLen >= MoeGroupedMinTokens ? SelectGroupedPath(k, m, expertDim) : GroupedPath.None;
         // #1049: a K-quant up bank on the MMVQ arm reads the per-token rows directly (xDiv = topK), so neither the topK-fold broadcast
         // nor the topK-fold quantize is needed.
+        // #1057: so does an IQ-family up bank (its MMVQ kernel takes the same xDiv).
         bool xdivUp = grouped == GroupedPath.None && MoeXDivEnabled && k.CanMmvq(m.UpBankQuantType)
-            && m.UpBankQuantType is QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K;
+            && (m.UpBankQuantType is QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K || k.IqMmvq(m.UpBankQuantType) is not null);
         if (grouped == GroupedPath.None && !xdivUp)
             k.Broadcast.Record(cmdBuf, expertIn, _state.MoeExpandedInput!, seqLen: seqLen, topK: topK, hidden: expertDim);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
@@ -1699,6 +1774,13 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         Interlocked.Increment(ref MoePathCounters.XDivUp);
         k.Quantize!.Record(cmdBuf, expertIn, _state.MoeTokenXq!, _state.MoeTokenXds!, n: seqLen, k: expertDim);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        if (k.IqMmvq(m.UpBankQuantType) is { } iq)
+        {
+            Interlocked.Increment(ref MoePathCounters.IqMmvq);
+            iq.Record(cmdBuf, m.UpBank, _state.MoeTokenXq!, _state.MoeTokenXds!, _state.MoeTopkIndices!, _state.MoeUpInter!,
+                m: inter, k: expertDim, n: seqLen * topK, numExperts: m.NumExperts, xDiv: topK);
+            return;
+        }
         var kernel = m.UpBankQuantType switch
         {
             QuantizationType.Q4_K when k.MmvqQ4_KMr is { } mr && inter % mr.RowsPerGroup == 0 => mr,
@@ -1717,7 +1799,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
     /// <summary>
     /// Picks the grouped prefill for a layer: dp4a MMQ when both banks have an MMQ kernel (Q4_K / Q5_K), else coopmat when both have a coopmat
-    /// kernel (Q4_K / Q5_K / Q6_K), else none (the layer keeps the indexed kernels, e.g. Q8_0 / Q5_1 banks). K must be whole 256-blocks.
+    /// kernel (Q4_K / Q5_K / Q6_K, or an IQ format #1057), else none (the layer keeps the indexed kernels, e.g. Q8_0 / Q5_1 banks). K must be whole 256-blocks.
     /// </summary>
     private static GroupedPath SelectGroupedPath(MoeKernelSet k, VulkanNemotronHWeights.MoeLayerBuffers m, int expertDim)
     {
@@ -1726,7 +1808,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         if (k.GatherGroupQ8_1 is not null && k.Quantize is not null
             && k.GroupedMmq(m.UpBankQuantType) is not null && k.GroupedMmq(m.DownBankQuantType) is not null)
             return GroupedPath.Mmq;
-        if (k.GatherGroupF32 is not null && k.GroupedCoopmat(m.UpBankQuantType) is not null && k.GroupedCoopmat(m.DownBankQuantType) is not null)
+        // One tile list serves up and down, so the two kernels must share a row tile (a K-quant row-pair kernel is 32 rows, IQ is 16).
+        if (k.GatherGroupF32 is not null && k.GroupedCoopmat(m.UpBankQuantType) is { } up && k.GroupedCoopmat(m.DownBankQuantType) is { } down
+            && up.RowTile == down.RowTile)
             return GroupedPath.Coopmat;
         return GroupedPath.None;
     }
@@ -1793,6 +1877,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             Interlocked.Increment(ref MoePathCounters.GroupedCoopmat);
             var upK = k.GroupedCoopmat(m.UpBankQuantType)!;
             var downK = k.GroupedCoopmat(m.DownBankQuantType)!;
+            if (upK is MoeGroupedMatmulIqCoopmatKernel || downK is MoeGroupedMatmulIqCoopmatKernel)
+                Interlocked.Increment(ref MoePathCounters.GroupedIqCoopmat);
 
             k.GatherGroupF32!.Record(cmdBuf, expertIn, indices, _state.MoeGroupOffsets!, _state.MoeGroupCounters!,
                 _state.MoeExpandedInput!, _state.MoeGroupPerm!, _state.MoeGroupInvPerm!,
@@ -1841,7 +1927,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     /// <summary>
     /// One routed-expert projection over <paramref name="rows"/> (token, slot) rows: dp4a MMVQ on a Q8_1-quantized copy of the input when
     /// the bank type has one (the decode / default arm), else the F32-activation indexed kernel. <see cref="MoePathCounters"/> records which ran.
-    /// Bank types: Q5_1, Q8_0 and the K-quants Q4_K / Q5_K / Q6_K (#1045).
+    /// Bank types: Q5_1, Q8_0, the K-quants Q4_K / Q5_K / Q6_K (#1045) and the IQ family (#1057, MMVQ only).
     /// </summary>
     private void RecordExpertMatmul(
         nint cmdBuf, MoeKernelSet k, QuantizationType bankQt, VulkanDevice.Buffer bank,
@@ -1861,6 +1947,11 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                     break;
                 case QuantizationType.Q8_0:
                     k.MmvqQ8_0!.Record(cmdBuf, bank, xq, xds, indices, y, m: mDim, k: kDim, n: rows, numExperts: numExperts);
+                    break;
+                case var _ when k.IqMmvq(bankQt) is { } iq:
+                    // #1057: IQ-family bank (NVIDIA's official Bolt GGUF is IQ2_XXS).
+                    Interlocked.Increment(ref MoePathCounters.IqMmvq);
+                    iq.Record(cmdBuf, bank, xq, xds, indices, y, m: mDim, k: kDim, n: rows, numExperts: numExperts);
                     break;
                 default:
                     var kq = bankQt switch
@@ -1967,6 +2058,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulIq4Nl.InvalidateDescriptorCache();
         _matmulIq4NlGemm.InvalidateDescriptorCache();
         _matmulNvfp4?.InvalidateDescriptorCache();
+        _iqF16Prefill?.InvalidateDescriptorCache();
         _matmulIq4Xs.InvalidateDescriptorCache();
         _matmulIq4XsGemm.InvalidateDescriptorCache();
         _matmulIq2Xxs.InvalidateDescriptorCache();
@@ -2005,6 +2097,47 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     }
 
     /// <summary>
+    /// Largest <c>m * k</c> of any projection whose device storage <see cref="IqF16PrefillMatmul"/> serves (#1060): the F16 scratch
+    /// capacity. Routed expert banks are excluded (they have their own grouped kernels).
+    /// </summary>
+    /// <param name="weights">The uploaded layer buffers.</param>
+    /// <returns>The capacity in elements, at least 1.</returns>
+    private static long MaxF16PrefillElements(VulkanNemotronHWeights weights)
+    {
+        long max = 1;
+        void Take(QuantizationType qt, int m, int k)
+        {
+            if (IqF16PrefillMatmul.Handles(qt)) max = Math.Max(max, (long)m * k);
+        }
+        foreach (var layer in weights.Layers)
+        {
+            if (layer.Ssm is { } s)
+            {
+                Take(s.InDeviceQuantType, s.InOutputDim, s.InInputDim);
+                Take(s.OutDeviceQuantType, s.OutOutputDim, s.OutInputDim);
+            }
+            if (layer.Attention is { } a)
+            {
+                Take(a.QDeviceQuantType, a.QOutputDim, a.QInputDim);
+                Take(a.KDeviceQuantType, a.KOutputDim, a.KInputDim);
+                Take(a.VDeviceQuantType, a.VOutputDim, a.VInputDim);
+                Take(a.ODeviceQuantType, a.OOutputDim, a.OInputDim);
+            }
+            if (layer.Ffn is { } f)
+            {
+                Take(f.UpDeviceQuantType, f.UpOutputDim, f.UpInputDim);
+                Take(f.DownDeviceQuantType, f.DownOutputDim, f.DownInputDim);
+            }
+            if (layer.Moe is { } m)
+            {
+                Take(m.SharedUpDeviceQuantType, m.SharedIntermediateSize, weights.HiddenSize);
+                Take(m.SharedDownDeviceQuantType, weights.HiddenSize, m.SharedIntermediateSize);
+            }
+        }
+        return max;
+    }
+
+    /// <summary>
     /// Dispatches a matmul for a single linear projection: chooses
     /// <see cref="MatMulQ8_0Kernel"/> (decode-path GEMV) when the device-side weight is
     /// Q8_0 and <paramref name="seqLen"/>==1, the batched <see cref="MatMulQ8_0GemmKernel"/>
@@ -2024,6 +2157,11 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         VulkanDevice.Buffer input, VulkanDevice.Buffer output,
         int outputDim, int inputDim, int seqLen, float scale = 1.0f)
     {
+        // #1060: prefill on an NVFP4 or IQ1/IQ2/IQ3 projection dequantises it to F16 once and runs the coopmat GEMM (the scale, if
+        // any, multiplies the output); the scalar GEMMs below were ~20x slower on NVIDIA's Bolt GGUF.
+        if (seqLen > 1 && _iqF16Prefill is not null
+            && _iqF16Prefill.TryRecord(cmdBuf, weightQt, weights, input, output, outputDim, inputDim, seqLen, scale))
+            return;
         if (weightQt == QuantizationType.NVFP4)
         {
             // #1038: the only kernel that takes the per-tensor X.scale.
@@ -2357,6 +2495,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulIq4NlGemm.Dispose();
         _matmulIq4Nl.Dispose();
         _matmulNvfp4?.Dispose();
+        _iqF16Prefill?.Dispose();
         _matmulIq3SGemm.Dispose();
         _matmulIq3S.Dispose();
         _matmulIq3XxsGemm.Dispose();

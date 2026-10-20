@@ -9,7 +9,7 @@ namespace DotLLM.Vulkan.Kernels;
 /// <c>native/vulkan/gen_moe_grouped_iq.py</c> from one skeleton; one class serves every <see cref="MoeIqQuant"/>.
 /// K must be a multiple of <see cref="MoeIndexedMatmulIqMmvqKernel.GroupSize"/> (256 for IQ3_S / IQ4_XS, 64 for IQ4_NL: one staging round).
 /// </summary>
-public sealed class MoeGroupedMatmulIqCoopmatKernel : IDisposable
+public sealed class MoeGroupedMatmulIqCoopmatKernel : IDisposable, IMoeGroupedF32Kernel
 {
     private const int TileN = 16;
     private const int TileM = 64;

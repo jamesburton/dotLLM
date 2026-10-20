@@ -76,11 +76,11 @@ public static class Nvfp4Support
         throw new NotSupportedException(
             $"{loader} cannot apply the per-tensor scales of {unapplied.Count} NVFP4 weight(s) " +
             $"(first: '{unapplied[0]}'); running without them would scale those projections by ~1/scale. " +
-            "NVFP4 is implemented for the Nemotron-H SSM projections on the CPU backend only (#1038).");
+            "NVFP4 is implemented for the Nemotron-H SSM projections only (CPU, Vulkan and CUDA) (#1038).");
     }
 
     /// <summary>
-    /// Refuses the file when it holds any NVFP4 tensor. For backends with no NVFP4 kernels yet.
+    /// Refuses the file when it holds any NVFP4 tensor. For backend paths with no NVFP4 support.
     /// </summary>
     /// <param name="tensors">The GGUF tensor table.</param>
     /// <param name="backend">The backend's name, for the message.</param>
@@ -103,7 +103,7 @@ public static class Nvfp4Support
             return;
 
         throw new NotSupportedException(
-            $"The {backend} backend has no NVFP4 (GGUF type 40) kernels yet, and this model has {count} NVFP4 " +
+            $"The {backend} backend has no NVFP4 (GGUF type 40) path for this model, which has {count} NVFP4 " +
             $"tensor(s) (first: '{first}'). Use --device cpu (#1038).");
     }
 }

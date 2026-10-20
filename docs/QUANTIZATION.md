@@ -106,13 +106,22 @@ NVIDIA FP4. A tensor `X.weight` stored as NVFP4 usually has a sibling `X.scale`
 GGUF these are about 1e-4, so a loader that drops one is off by ~4 orders of
 magnitude. `Nvfp4Support` makes every GGUF loader name the scales it applies and
 refuse the rest. Today only the Nemotron-H SSM projections (`ssm_in`, `ssm_out`) apply
-them, on CPU and Vulkan; every other architecture refuses scaled NVFP4 weights, Vulkan
-refuses NVFP4 outside Nemotron-H, and CUDA refuses NVFP4 entirely.
+them, on CPU, Vulkan and CUDA; every other architecture refuses scaled NVFP4 weights, and
+the Vulkan and CUDA loaders refuse NVFP4 outside Nemotron-H.
 
 The CPU vec_dot pairs NVFP4 with Q8_0 activations (two Q8_0 blocks per NVFP4 block),
 a transcription of llama.cpp's `ggml_vec_dot_nvfp4_q8_0` (scalar + AVX2). Vulkan keeps
 the blocks packed and dequantizes in the shader against FP32 activations
 (`matmul_nvfp4_f32_gemv/gemm`, shared `nvfp4_decode.glsl`), applying `X.scale` to the output.
+CUDA (`native/kernels/nvfp4.cu`) decodes with a dp4a GEMV (`nvfp4_gemv_q8`, #1061): the token
+is quantized to int8 once by the house F32 activation quantizer (`pq2_0_dp4a_quantize_x`,
+byte-exact with the CPU's Q8_0 activation quantizer), the E2M1 codes are looked up as int8 with
+`__byte_perm`, and `X.scale` is folded in. That is the CPU's NVFP4 × Q8_0 numerics (only the FP32
+summation order differs) at ~315 GB/s of weights on an RTX 3060 at Bolt's `ssm_in` shape
+(136 µs, against 431 µs / 99 GB/s for #1038's FP32-activation GEMV). The FP32-activation GEMV
+remains for weights under 4 MiB, where the extra quantize launch costs more than it saves
+(`DOTLLM_NVFP4_DECODE_GEMV=auto|dp4a|f32`). Prefill goes through dequant-to-F16 + cuBLAS
+followed by an in-place scale kernel.
 
 ### I2_S (BitNet b1.58 ternary, ~2 bits/weight, GGUF type 36)
 
