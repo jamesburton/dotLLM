@@ -41,6 +41,12 @@ public sealed class ServedContextFitTests
         Assert.Equal(98304, ServerStartup.ChooseServedContext(98304, fit: 61440, native: 262144, out string? above));
         Assert.Contains("exceeds the 61440 tokens", above);
 
+        // The boundary: exactly the fit is silent, one token past it warns.
+        ServerStartup.ChooseServedContext(61440, fit: 61440, native: 262144, out string? atFit);
+        Assert.Null(atFit);
+        ServerStartup.ChooseServedContext(61441, fit: 61440, native: 262144, out string? pastFit);
+        Assert.NotNull(pastFit);
+
         Assert.Equal(262144, ServerStartup.ChooseServedContext(1_000_000, fit: 300_000, native: 262144, out _));
     }
 
