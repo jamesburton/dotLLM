@@ -30,6 +30,12 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
     private const int Vocab = 16, Hidden = 512, Latent = 256, SharedInter = 64;
     private const float Eps = 1e-5f, WScale = 5.0f;
 
+    /// <summary>Smallest top-k selection margin (sigmoid probability + bias) a fixture may have past layer 0; see <see cref="RunParity"/>.</summary>
+    private const double RequiredRoutingMargin = 0.02;
+
+    /// <summary>Weight seeds of the two fixtures; each draw is checked for near-tie routing by <see cref="RunParity"/>.</summary>
+    private const int KQuantSeed = 1045, IqSeed = 1045;
+
     private static readonly LayerSpec[] Layers =
     [
         new(Experts: 4, TopK: 2, Inter: 512, Latent: Latent, UpQt: QuantizationType.Q4_K, DownQt: QuantizationType.Q5_K),
@@ -77,7 +83,7 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         using var device = VulkanDevice.Create();
         Skip.If(mmvq && !device.HasIntegerDotProduct, "device lacks integer dot product");
 
-        RunParity(device, spvDir, Layers, mmvq, grouped, xdiv, () =>
+        RunParity(device, spvDir, Layers, KQuantSeed, mmvq, grouped, xdiv, () =>
         {
             long viaMmvq = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.Mmvq);
             long viaF32 = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.F32Indexed);
@@ -134,7 +140,7 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         Skip.If(!device.HasIntegerDotProduct, "IQ expert banks need integer dot product (the host refuses them otherwise)");
         bool iqGrouped = MoeGroupedMatmulIqCoopmatKernel.IsSupportedOn(device, spvDir, MoeIqQuant.IQ2_XXS);
 
-        RunParity(device, spvDir, IqLayers, mmvq, grouped, xdiv, () =>
+        RunParity(device, spvDir, IqLayers, IqSeed, mmvq, grouped, xdiv, () =>
         {
             long viaIq = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.IqMmvq);
             long viaF32 = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.F32Indexed);
@@ -165,26 +171,25 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
     /// given arm switches, lets <paramref name="assertPaths"/> check the path counters of that one forward, then holds the batched and the
     /// single-token Vulkan logits to the double-precision reference and to the CPU forward.
     /// </summary>
-    private void RunParity(VulkanDevice device, string spvDir, LayerSpec[] specs, bool mmvq, bool grouped, bool xdiv, Action assertPaths)
+    private void RunParity(VulkanDevice device, string spvDir, LayerSpec[] specs, int seed, bool mmvq, bool grouped, bool xdiv, Action assertPaths)
     {
-        using var fx = new Fixture(zeroBias: false, specs);
+        using var fx = new Fixture(zeroBias: false, specs, seed);
         float[] cpu = fx.Cpu(Tokens, Positions);
         float[] exact = fx.Reference(Tokens);
-        output.WriteLine($"min routing margin {fx.MinRoutingMargin:E3}");
+        // Every routing decision past layer 0 must clear the rounding the arms legitimately differ by, or a flip there (worth about the
+        // bias effect in logits) says nothing about the kernels. Measured: a 7.5e-3 margin flipped between arms on an early IQ2_XXS draw.
+        output.WriteLine($"min routing margin {fx.MinRoutingMargin:E3} (token {fx.MinMarginAt.Token}, layer {fx.MinMarginAt.Layer})");
+        Assert.True(fx.MinRoutingMargin > RequiredRoutingMargin,
+            $"fixture has a near-tie top-k decision: margin {fx.MinRoutingMargin:E3} at token {fx.MinMarginAt.Token}, layer {fx.MinMarginAt.Layer}");
         float[] cpuNoBias;
-        using (var noBias = new Fixture(zeroBias: true, specs)) cpuNoBias = noBias.Cpu(Tokens, Positions);
+        using (var noBias = new Fixture(zeroBias: true, specs, seed)) cpuNoBias = noBias.Cpu(Tokens, Positions);
 
         // Control: the fixture must be sensitive to the selection bias, or "matches CPU" proves nothing about the routing.
         float control = MaxDiff(cpu, cpuNoBias);
         Assert.True(control > 0.05f, $"fixture insensitive to the selection bias (max logit delta {control:E3})");
-        // The CPU oracle quantizes its IQ dot activations to Q8_K (one scale per 256 elements, as llama.cpp's CPU IQ2_XXS dot does), and
-        // the down projection reads a relu^2 output whose small values that rounding crushes: on IQ2_XXS banks it sits ~1.1 from the
-        // reference against a ~3.4 bias effect (K-quant banks: ~0.5), so it is held to half the bias effect there, a quarter otherwise.
-        // Vulkan itself is held to the reference at the tight tolerance below on every bank type.
         bool iqBanks = specs.Any(s => s.UpQt == QuantizationType.IQ2_XXS || s.DownQt == QuantizationType.IQ2_XXS);
-        int cpuMargin = iqBanks ? 2 : 4;
         float cpuVsExact = MaxDiff(exact, cpu);
-        Assert.True(cpuVsExact * cpuMargin < control, $"CPU oracle vs reference {cpuVsExact:E3} is not small against the bias effect {control:E3}");
+        Assert.True(cpuVsExact * 4 < control, $"CPU oracle vs reference {cpuVsExact:E3} is not small against the bias effect {control:E3}");
 
         bool saved = VulkanNemotronHTransformerModel.MoeMmvqEnabled, savedGrouped = VulkanNemotronHTransformerModel.MoeGroupedEnabled;
         VulkanNemotronHTransformerModel.MoeMmvqEnabled = mmvq;
@@ -219,7 +224,7 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
             Assert.True(tol * 10 < control, $"tolerance {tol} is not small against the bias effect {control:E3}");
             Assert.True(vsExact <= tol, $"max |reference - vulkan(batched, mmvq={mmvq})| = {vsExact:E3} > {tol}");
             Assert.True(rowsVsExact <= tol, $"max |reference - vulkan(single-token, mmvq={mmvq})| = {rowsVsExact:E3} > {tol}");
-            Assert.True(vsCpu * cpuMargin < control, $"max |cpu - vulkan| = {vsCpu:E3} is not small against the bias effect {control:E3}");
+            Assert.True(vsCpu * 4 < control, $"max |cpu - vulkan| = {vsCpu:E3} is not small against the bias effect {control:E3}");
         }
         finally
         {
@@ -235,7 +240,7 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
-        using var fx = new Fixture(zeroBias: false, Layers);
+        using var fx = new Fixture(zeroBias: false, Layers, KQuantSeed);
         float[] plain = fx.Vulkan(device, spvDir, Tokens, Positions, profile: false, out var none);
         float[] profiled = fx.Vulkan(device, spvDir, Tokens, Positions, profile: true, out var report);
         Assert.Null(none);
@@ -267,17 +272,20 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         private readonly ModelConfig _config;
 
         /// <summary>
-        /// Smallest gap, over every token and layer of the last <see cref="Reference"/> call, between the k-th and (k+1)-th selection
+        /// Smallest gap, over every token and every layer after the first of the last <see cref="Reference"/> call, between the k-th and (k+1)-th selection
         /// scores (sigmoid probability + bias). A near-tie lets rounding that is legitimate on one arm (int8 activations, GEMV vs GEMM
         /// summation order) pick a different expert, which moves the logits by about the bias effect; parity is only meaningful when
         /// every routing decision clears that rounding.
         /// </summary>
         public double MinRoutingMargin { get; private set; } = double.PositiveInfinity;
 
-        public Fixture(bool zeroBias, LayerSpec[] specs)
+        /// <summary>Where <see cref="MinRoutingMargin"/> was found.</summary>
+        public (int Token, int Layer) MinMarginAt { get; private set; }
+
+        public Fixture(bool zeroBias, LayerSpec[] specs, int seed)
         {
             _specs = specs;
-            var rng = new Random(1045);
+            var rng = new Random(seed);
             _embed = Rand(rng, Vocab * Hidden, 0.5f);
             _outNorm = RandPos(rng, Hidden);
             _wOut = Rand(rng, Vocab * Hidden, 0.08f);
@@ -344,8 +352,9 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         public float[] Reference(int[] tokens)
         {
             var result = new List<float>();
-            foreach (int tok in tokens)
+            for (int t = 0; t < tokens.Length; t++)
             {
+                int tok = tokens[t];
                 double[] x = new double[Hidden];
                 for (int i = 0; i < Hidden; i++) x[i] = _embed[tok * Hidden + i];
                 for (int l = 0; l < _layers.Length; l++)
@@ -364,9 +373,15 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
                     }
                     int[] ranked = Enumerable.Range(0, n).OrderByDescending(e => probs[e] + moe.SelectionBias[e]).ThenBy(e => e).ToArray();
                     int[] top = ranked.Take(topK).ToArray();
-                    if (topK < n)
-                        MinRoutingMargin = Math.Min(MinRoutingMargin,
-                            probs[ranked[topK - 1]] + moe.SelectionBias[ranked[topK - 1]] - probs[ranked[topK]] - moe.SelectionBias[ranked[topK]]);
+                    // Layer 0 reads the embedding row, identical on every arm, so only later layers can flip on arm rounding.
+                    double margin = topK < n
+                        ? probs[ranked[topK - 1]] + moe.SelectionBias[ranked[topK - 1]] - probs[ranked[topK]] - moe.SelectionBias[ranked[topK]]
+                        : double.PositiveInfinity;
+                    if (l > 0 && margin < MinRoutingMargin)
+                    {
+                        MinRoutingMargin = margin;
+                        MinMarginAt = (t, l);
+                    }
                     double sum = top.Sum(e => probs[e]);
                     double[] w = top.Select(e => probs[e] / Math.Max(sum, 6.103515625e-5) * moe.WeightsScale).ToArray();
 
