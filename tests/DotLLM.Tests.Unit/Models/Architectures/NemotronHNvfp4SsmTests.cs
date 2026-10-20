@@ -183,10 +183,18 @@ public sealed class NemotronHNvfp4SsmTests : IDisposable
         Assert.True(loaders >= 7, $"scan found only {loaders} GGUF loaders; the scan itself is broken");
         Assert.True(missing.Count == 0, "GGUF loaders without an NVFP4 scale guard: " + string.Join(", ", missing));
 
-        foreach (var (file, backend) in new[] { ("src/DotLLM.Vulkan/VulkanModelLoader.cs", "Vulkan"), ("src/DotLLM.Cuda/CudaModelLoader.cs", "CUDA") })
+        // Every public GGUF entry point of a backend without NVFP4 kernels: CudaModelLoader has three (CreateFromGguf, its Partial
+        // branch and the path-based LoadFromGguf), the Vulkan|CUDA hybrid one.
+        foreach (var (file, backend, calls) in new[]
+        {
+            ("src/DotLLM.Vulkan/VulkanModelLoader.cs", "Vulkan", 1),
+            ("src/DotLLM.Cuda/CudaModelLoader.cs", "CUDA", 3),
+            ("src/DotLLM.Cuda/HybridVulkanCudaTransformerModel.cs", "Vulkan/CUDA hybrid", 1),
+        })
         {
             string src = File.ReadAllText(Path.Combine(root, file));
-            Assert.Matches(new Regex($@"^\s*Nvfp4Support\.RejectAny\(gguf\.TensorsByName, ""{backend}""\);", RegexOptions.Multiline, TimeSpan.FromSeconds(5)), src);
+            var guard = new Regex($@"^\s*Nvfp4Support\.RejectAny\(gguf\.TensorsByName, ""{Regex.Escape(backend)}""\);", RegexOptions.Multiline, TimeSpan.FromSeconds(5));
+            Assert.True(guard.Matches(src).Count == calls, $"{file}: expected {calls} NVFP4 refusal call(s), found {guard.Matches(src).Count}");
         }
     }
 
