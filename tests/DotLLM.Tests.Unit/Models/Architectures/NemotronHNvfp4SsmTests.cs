@@ -27,15 +27,15 @@ public sealed class NemotronHNvfp4SsmTests : IDisposable
     private const int NHead = 2;
     private const int DState = 8;
     private const int DConv = 4;
-    private const int Vocab = 16;
+    internal const int Vocab = 16;
     private const float Eps = 1e-5f;
     private static readonly float[] InScale = [0.05f, 0.08f];
     private static readonly float[] OutScale = [3.0f, 2.0f];
-    private static readonly int[] Ids = [3, 7, 1, 11, 0];
-    private static readonly int[] Pos = [0, 1, 2, 3, 4];
+    internal static readonly int[] Ids = [3, 7, 1, 11, 0];
+    internal static readonly int[] Pos = [0, 1, 2, 3, 4];
     private static readonly sbyte[] KValues = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 
-    private enum Variant
+    internal enum Variant
     {
         /// <summary>SSM projections NVFP4 with their X.scale tensors (the Bolt layout).</summary>
         Nvfp4Scaled,
@@ -214,7 +214,10 @@ public sealed class NemotronHNvfp4SsmTests : IDisposable
 
     // ───────────────────────── fixture ─────────────────────────
 
-    private string WriteFixture(Variant variant)
+    private string WriteFixture(Variant variant) => WriteFixture(_scratch, variant);
+
+    /// <summary>Writes the fixture GGUF for <paramref name="variant"/> into <paramref name="dir"/> (shared with the GPU tests).</summary>
+    internal static string WriteFixture(string dir, Variant variant)
     {
         var rng = new Random(1038);
         var g = new GgufWriter();
@@ -264,7 +267,7 @@ public sealed class NemotronHNvfp4SsmTests : IDisposable
             F32(g, "output.weight", [Hidden, Vocab], Rand(rng, Hidden * Vocab, 0.5f));
         }
 
-        string path = Path.Combine(_scratch, $"nvfp4-{variant}.gguf");
+        string path = Path.Combine(dir, $"nvfp4-{variant}.gguf");
         File.WriteAllBytes(path, g.Build());
         return path;
     }

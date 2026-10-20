@@ -57,8 +57,10 @@ public static class CudaModelLoader
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
 
-        // #1038: no NVFP4 kernels on CUDA yet. Refuse before any upload.
-        Nvfp4Support.RejectAny(gguf.TensorsByName, "CUDA");
+        // #1038: CUDA NVFP4 runs on the Nemotron-H path only (dequant/GEMV kernels + X.scale). Every
+        // other architecture would widen it and drop the scale, so refuse before any upload.
+        if (config.Architecture is not (Architecture.NemotronH or Architecture.NemotronHMoe))
+            Nvfp4Support.RejectAny(gguf.TensorsByName, "CUDA");
 
         switch (config.Architecture)
         {

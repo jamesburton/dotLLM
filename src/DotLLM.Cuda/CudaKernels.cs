@@ -323,6 +323,14 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _dequantMXFP4Func;
     private readonly nint _dequantMXFP4F32Func;
 
+    // NVFP4 (nvfp4.ptx) — issue #1038: dequant to F16/F32, the F32 decode GEMV with the per-tensor
+    // X.scale, and the in-place scale applied after the dequant + cuBLAS prefill GEMM.
+    private readonly CudaModule? _nvfp4Module;
+    private readonly nint _dequantNVFP4Func;
+    private readonly nint _dequantNVFP4F32Func;
+    private readonly nint _nvfp4GemvF32Func;
+    private readonly nint _scaleF32InplaceFunc;
+
     private readonly CudaModule? _quantKvModule;
     private readonly nint _quantKvQ8_0Func;
     private readonly nint _quantKvQ4_0Func;
@@ -1079,6 +1087,17 @@ public sealed unsafe class CudaKernels : IDisposable
             _dequantBF16F32Func = _dequantBf16Mxfp4Module.TryGetFunction("dequant_bf16_f32");
             _dequantMXFP4Func = _dequantBf16Mxfp4Module.TryGetFunction("dequant_mxfp4_f16");
             _dequantMXFP4F32Func = _dequantBf16Mxfp4Module.TryGetFunction("dequant_mxfp4_f32");
+        }
+
+        // NVFP4 — issue #1038.
+        string nvfp4Path = Path.Combine(ptxDir, "nvfp4.ptx");
+        if (File.Exists(nvfp4Path))
+        {
+            _nvfp4Module = CudaModule.LoadFromFile(nvfp4Path);
+            _dequantNVFP4Func = _nvfp4Module.TryGetFunction("dequant_nvfp4_f16");
+            _dequantNVFP4F32Func = _nvfp4Module.TryGetFunction("dequant_nvfp4_f32");
+            _nvfp4GemvF32Func = _nvfp4Module.TryGetFunction("nvfp4_gemv_f32");
+            _scaleF32InplaceFunc = _nvfp4Module.TryGetFunction("scale_f32_inplace");
         }
 
         // KV-cache quantization (optional — PTX may not be compiled yet)
@@ -5127,6 +5146,53 @@ public sealed unsafe class CudaKernels : IDisposable
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
+    /// <summary>True when the NVFP4 kernels (nvfp4.ptx) are loaded (#1038).</summary>
+    public bool HasNvfp4 => _nvfp4GemvF32Func != 0 && _scaleF32InplaceFunc != 0 && _dequantNVFP4Func != 0;
+
+    /// <summary>
+    /// NVFP4 decode GEMV with FP32 activations: <c>y[m] = scale · Σ_k W[m, k] · x[k]</c> (#1038).
+    /// </summary>
+    /// <param name="weight">Packed NVFP4 weights, <paramref name="m"/> rows of <c>k / 64</c> 36-byte blocks.</param>
+    /// <param name="x">FP32 input, length <paramref name="k"/>.</param>
+    /// <param name="y">FP32 output, length <paramref name="m"/>.</param>
+    /// <param name="m">Output rows.</param>
+    /// <param name="k">Contraction length; a multiple of 64.</param>
+    /// <param name="scale">The weight's per-tensor <c>X.scale</c> (1 when absent).</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchNvfp4GemvF32(nint weight, nint x, nint y, int m, int k, float scale, nint stream)
+    {
+        if (_nvfp4GemvF32Func == 0)
+            throw new InvalidOperationException("NVFP4 GEMV kernel not present — rebuild nvfp4.ptx (#1038).");
+        if (k % QuantFormat.Nvfp4GroupSize != 0)
+            throw new ArgumentException($"NVFP4 k must be a multiple of {QuantFormat.Nvfp4GroupSize}, got {k}.", nameof(k));
+        nint wArg = weight, xArg = x, yArg = y;
+        int mArg = m, bArg = k / QuantFormat.Nvfp4GroupSize;
+        float sArg = scale;
+        void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &mArg, &bArg, &sArg};
+        CudaDriverApi.cuLaunchKernel(_nvfp4GemvF32Func,
+                (uint)m, 1, 1, 128, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>In place <c>y[i] *= scale</c> over <paramref name="n"/> floats — a weight's per-tensor <c>X.scale</c> (#1038).</summary>
+    /// <param name="y">FP32 buffer.</param>
+    /// <param name="n">Element count.</param>
+    /// <param name="scale">Multiplier.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchScaleF32Inplace(nint y, int n, float scale, nint stream)
+    {
+        if (_scaleF32InplaceFunc == 0)
+            throw new InvalidOperationException("scale_f32_inplace kernel not present — rebuild nvfp4.ptx (#1038).");
+        nint yArg = y;
+        int nArg = n;
+        float sArg = scale;
+        void** args = stackalloc void*[] {&yArg, &nArg, &sArg};
+        uint gridDim = (uint)Math.Min((n + BlockSize - 1) / BlockSize, 1024);
+        CudaDriverApi.cuLaunchKernel(_scaleF32InplaceFunc,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
     /// <summary>Quantized GEMV: y[n] = W_quant[n,k] @ x[k]. Operates directly on quantized weights.</summary>
     public void LaunchQuantizedGemv(nint quantWeight, QuantizationType qt,
                                       nint x, nint y, int n, int k, nint stream)
@@ -6242,6 +6308,21 @@ public sealed unsafe class CudaKernels : IDisposable
                 return;
             }
 
+            case QuantizationType.NVFP4:
+            {
+                if (_dequantNVFP4F32Func == 0)
+                    break;
+                int totalBlocks = totalElements / QuantFormat.Nvfp4GroupSize;
+                int tbArg = totalBlocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tbArg};
+                // Each 256-thread CUDA block covers 4 NVFP4 blocks (64 elements each).
+                uint gridDim = (uint)Math.Min((totalBlocks + 3) / 4, MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(_dequantNVFP4F32Func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+
             case QuantizationType.MXFP4:
             {
                 if (_dequantMXFP4F32Func == 0)
@@ -6553,6 +6634,21 @@ public sealed unsafe class CudaKernels : IDisposable
                 uint gridDim = (uint)Math.Min((totalElements + (int)BlockSize - 1) / (int)BlockSize,
                     MaxDequantGridSize);
                 CudaDriverApi.cuLaunchKernel(_dequantBF16Func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+
+            case QuantizationType.NVFP4:
+            {
+                if (_dequantNVFP4Func == 0)
+                    throw new InvalidOperationException(
+                        "NVFP4 dequant kernel not present — rebuild nvfp4.ptx from native/kernels/nvfp4.cu (#1038).");
+                int totalBlocks = totalElements / QuantFormat.Nvfp4GroupSize;
+                int tbArg = totalBlocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tbArg};
+                uint gridDim = (uint)Math.Min((totalBlocks + 3) / 4, MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(_dequantNVFP4Func,
                         gridDim, 1, 1, BlockSize, 1, 1,
                         0, stream, (nint)args, 0).ThrowOnError();
                 return;
@@ -7389,6 +7485,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _dequantIQ3Module?.Dispose();
         _dequantIQ1Module?.Dispose();
         _dequantBf16Mxfp4Module?.Dispose();
+        _nvfp4Module?.Dispose();
         _quantizedGemvModule.Dispose();
         _fusedAddRmsNormModule.Dispose();
         _rmsnormF32InModule.Dispose();
