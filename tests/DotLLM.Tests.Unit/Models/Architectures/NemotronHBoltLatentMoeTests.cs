@@ -143,15 +143,37 @@ public sealed class NemotronHBoltLatentMoeTests : IDisposable
     }
 
     [Fact]
-    public void VulkanGuard_RefusesLatentAndHeterogeneousLayers()
+    public void VulkanScratchSpec_TakesThePerLayerMaximaOfEveryDimension()
     {
-        Assert.Throws<NotSupportedException>(() =>
-            DotLLM.Vulkan.VulkanNemotronHTransformerModel.ThrowIfMoeLayerUnsupported(0, hasLatent: true, null, (4, 2, 8)));
-        Assert.Throws<NotSupportedException>(() =>
-            DotLLM.Vulkan.VulkanNemotronHTransformerModel.ThrowIfMoeLayerUnsupported(1, hasLatent: false, (4, 2, 8), (6, 3, 6)));
+        // #1045: Vulkan now runs Bolt. Its MoE scratch must cover the widest layer in EACH dimension independently: here the
+        // most experts and top-k come from layer 1, the widest intermediate from layer 0, and only layer 1 is latent.
+        var (path, _) = WriteFixture(seed: 1);
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var model = NemotronHTransformerModel.LoadFromGguf(gguf, config, ThreadingConfig.SingleThreaded);
+        var layers = (NemotronHLayerWeights[])typeof(NemotronHTransformerModel)
+            .GetField("_layers", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!.GetValue(model)!;
 
-        // Homogeneous, non-latent layers (Lightning) still pass.
-        DotLLM.Vulkan.VulkanNemotronHTransformerModel.ThrowIfMoeLayerUnsupported(1, hasLatent: false, (4, 2, 8), (4, 2, 8));
+        DotLLM.Vulkan.NemotronHMoeScratchSpec? spec = null;
+        foreach (var l in layers)
+            if (l.Moe is { } moe)
+                spec = DotLLM.Vulkan.VulkanNemotronHTransformerModel.WidenMoeSpec(spec, moe, Hidden);
+
+        // Both fixture layers are latent: expert input width is the latent size, not the hidden size.
+        Assert.Equal(new DotLLM.Vulkan.NemotronHMoeScratchSpec(NumExperts: 6, TopK: 3, MoeIntermediate: 8, ExpertDim: Latent, LatentSize: Latent), spec);
+
+        // A non-latent layer widens the expert input to the hidden size and leaves the latent width alone.
+        var nonLatent = new NemotronHMoeWeights
+        {
+            GateInpWeight = 1, GateInpQuantType = QuantizationType.F32, SelectionBias = new float[2],
+            UpExpsWeight = 1, UpExpsQuantType = QuantizationType.F32, UpPerExpertBytes = 4,
+            DownExpsWeight = 1, DownExpsQuantType = QuantizationType.F32, DownPerExpertBytes = 4,
+            UpShexpWeight = 1, UpShexpQuantType = QuantizationType.F32, DownShexpWeight = 1, DownShexpQuantType = QuantizationType.F32,
+            NumExperts = 2, NumExpertsPerTok = 1, MoeIntermediateSize = 3, SharedIntermediateSize = 1,
+            NormalizeWeights = true, WeightsScale = 1f,
+        };
+        Assert.Equal(new DotLLM.Vulkan.NemotronHMoeScratchSpec(6, 3, 8, Hidden, Latent),
+            DotLLM.Vulkan.VulkanNemotronHTransformerModel.WidenMoeSpec(spec, nonLatent, Hidden));
     }
 
     // ───────────────────────── fixture ─────────────────────────
