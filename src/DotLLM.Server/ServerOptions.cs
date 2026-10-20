@@ -53,22 +53,50 @@ public sealed record ServerOptions
     /// <summary>Maximum page-locked host snapshot bytes. Zero disables host retention.</summary>
     public long PrefixSnapshotHostBudgetBytes { get; init; }
 
+    /// <summary>Parent directory for ephemeral recurrent snapshot spill files.</summary>
+    public string? PrefixSnapshotDiskDirectory { get; init; }
+
+    /// <summary>Maximum snapshot spill bytes. Zero disables the disk tier.</summary>
+    public long PrefixSnapshotDiskBudgetBytes { get; init; }
+
     /// <summary>Validates and resolves recurrent snapshot limits for this server.</summary>
     public RecurrentPrefixCacheOptions GetPrefixSnapshotOptions()
     {
         int count = PrefixSnapshots ?? 1;
         if (count < 1) throw new ArgumentOutOfRangeException(nameof(PrefixSnapshots), "--prefix-snapshots must be at least 1.");
         if (PrefixSnapshotHostBudgetBytes < 0) throw new ArgumentOutOfRangeException(nameof(PrefixSnapshotHostBudgetBytes));
-        return new() { MaxEntries = count, HostBudgetBytes = PrefixSnapshotHostBudgetBytes };
+        if (PrefixSnapshotDiskBudgetBytes < 0) throw new ArgumentOutOfRangeException(nameof(PrefixSnapshotDiskBudgetBytes));
+        string? directory = PrefixSnapshotDiskDirectory;
+        if (directory is not null && string.IsNullOrWhiteSpace(directory))
+            throw new ArgumentException("--prefix-snapshot-disk-dir must name a directory.");
+        if ((directory is null) != (PrefixSnapshotDiskBudgetBytes == 0))
+            throw new ArgumentException("--prefix-snapshot-disk-dir and a positive --prefix-snapshot-disk-budget must be supplied together.");
+        if (directory is not null)
+        {
+            try { directory = Path.GetFullPath(directory); }
+            catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+            { throw new ArgumentException("--prefix-snapshot-disk-dir is not a valid directory path.", ex); }
+        }
+        return new() { MaxEntries = count, HostBudgetBytes = PrefixSnapshotHostBudgetBytes,
+            DiskDirectory = directory, DiskBudgetBytes = PrefixSnapshotDiskBudgetBytes };
     }
 
     /// <summary>Resolves CLI count and human-readable host byte budget before loading a model.</summary>
-    public static RecurrentPrefixCacheOptions BuildPrefixSnapshotOptions(int? count, string? hostBudget)
-        => new ServerOptions { Model = "", PrefixSnapshots = count, PrefixSnapshotHostBudgetBytes = ParsePrefixSnapshotHostBudget(hostBudget) }
+    public static RecurrentPrefixCacheOptions BuildPrefixSnapshotOptions(int? count, string? hostBudget,
+        string? diskDirectory = null, string? diskBudget = null)
+        => new ServerOptions { Model = "", PrefixSnapshots = count, PrefixSnapshotHostBudgetBytes = ParsePrefixSnapshotHostBudget(hostBudget),
+            PrefixSnapshotDiskDirectory = diskDirectory, PrefixSnapshotDiskBudgetBytes = ParsePrefixSnapshotDiskBudget(diskBudget) }
             .GetPrefixSnapshotOptions();
 
     /// <summary>Parses nonnegative bytes or decimal/binary units, for example 8000000, 8GB or 8GiB.</summary>
     public static long ParsePrefixSnapshotHostBudget(string? value)
+        => ParsePrefixSnapshotByteBudget(value, "--prefix-snapshot-host-budget");
+
+    /// <summary>Parses the nonnegative spill budget using the same decimal/binary byte units as the host tier.</summary>
+    public static long ParsePrefixSnapshotDiskBudget(string? value)
+        => ParsePrefixSnapshotByteBudget(value, "--prefix-snapshot-disk-budget");
+
+    private static long ParsePrefixSnapshotByteBudget(string? value, string flag)
     {
         if (value is null) return 0;
         string number = value.Trim();
@@ -87,10 +115,10 @@ public sealed record ServerOptions
         if (!decimal.TryParse(number, System.Globalization.NumberStyles.AllowDecimalPoint,
                 System.Globalization.CultureInfo.InvariantCulture, out decimal amount)
             || amount < 0 || amount > long.MaxValue / (decimal)multiplier)
-            throw new ArgumentException("--prefix-snapshot-host-budget must be a nonnegative byte size, such as 8GiB.", nameof(value));
+            throw new ArgumentException($"{flag} must be a nonnegative byte size, such as 8GiB.", nameof(value));
         decimal bytes = amount * multiplier;
         if (bytes != decimal.Truncate(bytes))
-            throw new ArgumentException("--prefix-snapshot-host-budget must resolve to a whole number of bytes.", nameof(value));
+            throw new ArgumentException($"{flag} must resolve to a whole number of bytes.", nameof(value));
         return (long)bytes;
     }
 
@@ -318,6 +346,7 @@ public sealed record ServerOptions
         int promptCacheSize = 4;
         int? prefixSnapshots = null;
         string? prefixSnapshotHostBudget = null;
+        string? prefixSnapshotDiskDirectory = null, prefixSnapshotDiskBudget = null;
         bool usePaged = true;
         bool warmupEnabled = true;
         int warmupIterations = 3;
@@ -402,6 +431,10 @@ public sealed record ServerOptions
                     prefixSnapshots = int.Parse(next ?? throw new ArgumentException("--prefix-snapshots requires a count."), System.Globalization.CultureInfo.InvariantCulture); i++; break;
                 case "--prefix-snapshot-host-budget":
                     prefixSnapshotHostBudget = next ?? throw new ArgumentException("--prefix-snapshot-host-budget requires a size."); i++; break;
+                case "--prefix-snapshot-disk-dir":
+                    prefixSnapshotDiskDirectory = next ?? throw new ArgumentException("--prefix-snapshot-disk-dir requires a path."); i++; break;
+                case "--prefix-snapshot-disk-budget":
+                    prefixSnapshotDiskBudget = next ?? throw new ArgumentException("--prefix-snapshot-disk-budget requires a size."); i++; break;
                 case "--rope-scaling":
                     ropeScaling = next; i++; break;
                 case "--rope-freq-base":
@@ -446,7 +479,7 @@ public sealed record ServerOptions
         if (model.Contains('/'))
             modelId = model.Split('/')[^1]; // last segment of repo
 
-        var snapshotOptions = BuildPrefixSnapshotOptions(prefixSnapshots, prefixSnapshotHostBudget);
+        var snapshotOptions = BuildPrefixSnapshotOptions(prefixSnapshots, prefixSnapshotHostBudget, prefixSnapshotDiskDirectory, prefixSnapshotDiskBudget);
         return new ServerOptions
         {
             Model = model,
@@ -463,6 +496,8 @@ public sealed record ServerOptions
             PromptCacheSize = promptCacheSize,
             PrefixSnapshots = snapshotOptions.MaxEntries,
             PrefixSnapshotHostBudgetBytes = snapshotOptions.HostBudgetBytes,
+            PrefixSnapshotDiskDirectory = snapshotOptions.DiskDirectory,
+            PrefixSnapshotDiskBudgetBytes = snapshotOptions.DiskBudgetBytes,
             UsePaged = usePaged,
             Warmup = new WarmupOptions
             {

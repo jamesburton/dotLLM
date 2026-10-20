@@ -206,10 +206,20 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [Description("Page-locked host snapshot budget, such as 8GiB. Default 0 disables host retention.")]
         public string? PrefixSnapshotHostBudget { get; set; }
 
+        /// <summary>Directory for ephemeral recurrent prefix spill files.</summary>
+        [CommandOption("--prefix-snapshot-disk-dir")]
+        [Description("Directory for recurrent prefix spill files; requires a positive disk budget.")]
+        public string? PrefixSnapshotDiskDirectory { get; set; }
+
+        /// <summary>Maximum disk snapshot bytes.</summary>
+        [CommandOption("--prefix-snapshot-disk-budget")]
+        [Description("Snapshot spill budget, such as 32GiB; requires a disk directory. Default 0 disables disk retention.")]
+        public string? PrefixSnapshotDiskBudget { get; set; }
+
         /// <inheritdoc/>
         public override ValidationResult Validate()
         {
-            try { ServerOptions.BuildPrefixSnapshotOptions(PrefixSnapshots, PrefixSnapshotHostBudget); }
+            try { ServerOptions.BuildPrefixSnapshotOptions(PrefixSnapshots, PrefixSnapshotHostBudget, PrefixSnapshotDiskDirectory, PrefixSnapshotDiskBudget); }
             catch (ArgumentException ex) { return ValidationResult.Error(ex.Message); }
             return base.Validate();
         }
@@ -385,6 +395,8 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             PrefillChunkSize = settings.PrefillChunkSize,
             PrefixSnapshots = settings.PrefixSnapshots,
             PrefixSnapshotHostBudgetBytes = ServerOptions.ParsePrefixSnapshotHostBudget(settings.PrefixSnapshotHostBudget),
+            PrefixSnapshotDiskDirectory = settings.PrefixSnapshotDiskDirectory,
+            PrefixSnapshotDiskBudgetBytes = ServerOptions.ParsePrefixSnapshotDiskBudget(settings.PrefixSnapshotDiskBudget),
             KeepAliveSeconds = settings.KeepAlive,
             MaxResidentModels = settings.MaxResidentModels,
             ResidentMemoryBudgetBytes = settings.ResidentMemoryBudgetBytes,

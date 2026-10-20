@@ -1011,3 +1011,19 @@ The streaming `timings` extension reports `cache_tier` and `cache_restore_ms` al
 The prompt-cache administration endpoint reports recurrent entries, host bytes, hits by
 tier and restore failures. Clearing the prompt cache also clears recurrent snapshots;
 model changes invalidate them. Disk retention is the separate #1034 follow-up.
+
+### Recurrent prefix disk spill
+
+Add `--prefix-snapshot-disk-dir PATH --prefix-snapshot-disk-budget 40GiB` to the
+multi-slot/host configuration above to enable bounded ephemeral spill. The directory
+and positive budget are required together; decimal and binary byte suffixes use the
+same syntax as the host budget. Startup logs the implemented disk transport once.
+The current `file-stream` fallback uses pinned CUDA copies where the provider supports
+them; native DirectStorage/cuFile paths are not implemented.
+
+Streaming timings identify disk hits with `cache_tier: disk`; cached tokens also appear
+in OpenAI `usage.prompt_tokens_details.cached_tokens`. `/v1/prompt-cache` exposes disk
+occupancy, budget and hit counts. Clearing the cache or unloading its model removes its
+owned files. Files are private to the cache instance and are not reused after restart;
+see [KV cache disk spill](KV_CACHE.md#disk-spill-below-the-host-tier-1034) for transient
+budget headroom and crash-orphan cleanup.

@@ -163,7 +163,7 @@ public sealed partial class TextGenerator
         var snapshots = recurrentPrefixCacheOptions ?? new RecurrentPrefixCacheOptions();
         ArgumentOutOfRangeException.ThrowIfLessThan(snapshots.MaxEntries, 1);
         ArgumentOutOfRangeException.ThrowIfNegative(snapshots.HostBudgetBytes);
-        if (_recurrentPrefixEnabled && model is IRecurrentPrefixSnapshotProvider provider && (snapshots.MaxEntries > 1 || snapshots.HostBudgetBytes > 0))
+        if (_recurrentPrefixEnabled && model is IRecurrentPrefixSnapshotProvider provider && (snapshots.MaxEntries > 1 || snapshots.HostBudgetBytes > 0 || snapshots.DiskBudgetBytes > 0))
             _tieredSnapshots = new RecurrentPrefixSnapshotCache(provider, snapshots);
         _mtpGate = mtpAdaptive && MtpAdaptiveGate.EnabledByEnvironment ? new MtpAdaptiveGate(model.MtpGatePriorBytes) : null;
         _mtpGateSampled = _mtpGate is null ? null : new MtpAdaptiveGate(model.MtpGatePriorBytes);
