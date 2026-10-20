@@ -41,6 +41,9 @@ public sealed class CudaMtpState : IMtpState, IDisposable
     private int _currentLength;
     private bool _disposed;
 
+    // Issue #1068: admission for the lazy KV growth (null = unchecked, for direct test construction).
+    private readonly Action<long, string>? _admitGrowth;
+
     /// <summary>
     /// Hard ceiling on the positions this state can hold (the <c>maxSteps</c> it was created with).
     /// Exceeding it throws <see cref="InvalidOperationException"/> before any device write.
@@ -74,7 +77,11 @@ public sealed class CudaMtpState : IMtpState, IDisposable
     /// <param name="numKvHeads">KV head count for the MTP block's own attention.</param>
     /// <param name="headDim">Per-head dimension for the MTP block's own attention.</param>
     /// <param name="maxSteps">Maximum autoregressive MTP draft steps to size the KV-cache for (typically the max candidate count K).</param>
-    public CudaMtpState(int hiddenSize, int numKvHeads, int headDim, int maxSteps)
+    /// <param name="admitGrowth">
+    /// Called with the bytes and purpose of each lazy KV growth before it allocates (issue #1068); it throws to refuse. The owning
+    /// model passes its free-VRAM admission so the head's cache cannot grow into shared system memory. Null skips the check.
+    /// </param>
+    public CudaMtpState(int hiddenSize, int numKvHeads, int headDim, int maxSteps, Action<long, string>? admitGrowth = null)
     {
         if (hiddenSize <= 0) throw new ArgumentOutOfRangeException(nameof(hiddenSize));
         if (numKvHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numKvHeads));
@@ -86,6 +93,7 @@ public sealed class CudaMtpState : IMtpState, IDisposable
         _headDim = headDim;
         _maxSteps = maxSteps;
         _kvStride = numKvHeads * headDim;
+        _admitGrowth = admitGrowth;
 
         // Lazy KV (issue #966): allocate min(ceiling, 1024) positions now and grow as positions are
         // reached. An F32 head cache is 8 KiB/position on Bonsai 2 (4 KV heads x 256 dim), i.e. 512 MiB
@@ -140,6 +148,8 @@ public sealed class CudaMtpState : IMtpState, IDisposable
 
         long newKvBytes = (long)target * _kvStride * sizeof(float);
         long keepBytes = (long)Math.Min(_currentLength, _capacity) * _kvStride * sizeof(float);
+        // Old and new buffers coexist during the copy, so the whole new size is admitted. A refusal leaves the state valid.
+        _admitGrowth?.Invoke(2 * newKvBytes + (long)target * sizeof(int), $"MTP head KV cache for {target} positions");
         nint newKey = 0, newValue = 0, newIota = 0;
         try
         {

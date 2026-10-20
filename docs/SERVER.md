@@ -556,6 +556,35 @@ SPIR-V missing, load failure) fails with what/why/model-vs-device-memory and the
 `auto` ending on the CPU always sets `device_fallback_warning` in `/props` (no GPU servable, or the GPU load failed and why) and prints it at startup.
 `/props` reports `device` (as requested) and `resolved_device` (as loaded) for every load path, explicit or `auto`; `dotllm ps` shows the same.
 
+## GPU memory on Windows: no silent spill into system RAM (#1068)
+
+On Windows the NVIDIA driver (WDDM) does not fail a CUDA allocation that exceeds dedicated VRAM by default. It backs the
+excess with **shared system memory** ("sysmem fallback"), and every kernel that touches those buffers then reads them over
+PCIe. On a 12 GB RTX 3060 serving Bonsai-2 27B (7.1 GB of weights) a long agent conversation grew its KV cache past VRAM
+this way and requests went from minutes to hours: `nvidia-smi` showed 100% GPU utilization but a 0-3% memory-controller
+load, and the Windows `GPU Process Memory` counter showed ~2 GB of *Shared Usage* for the server process.
+
+The CUDA hybrid model (Qwen3HybridDense: Bonsai, Qwen3.5/3.6 dense) now refuses that instead:
+
+- **Admission.** Every device buffer that grows with the context (the KV cache in any storage format, the F16 dequant
+  scratch for quantized KV, the F32 attention staging, the MTP head's KV cache, recurrent-state checkpoints and row
+  snapshots) is checked against free VRAM before it is allocated. A growth that would not leave a reserve free fails the
+  request with a clear error naming the buffer, the size and the free memory, rather than spilling. The reserve is
+  512 MiB; `DOTLLM_CUDA_VRAM_RESERVE_MB` changes it.
+- **Detection.** The server polls this process's `\GPU Process Memory(pid_*)\Shared Usage` counter (at most every 5 s,
+  and after every KV growth) and logs a `WARNING: GPU memory has spilled into shared system memory` line each time it rises
+  another 256 MiB above its post-load level. That catches a spill admission cannot prevent, for example when another
+  program takes the VRAM the server was counting on.
+
+### Turning sysmem fallback off in the driver
+
+For a dedicated inference box, make the driver fail the allocation instead of spilling. In **NVIDIA Control Panel >
+Manage 3D settings** (Global, or Program Settings for `dotllm.exe` / `DotLLM.Cli.exe` / the `dotnet` host that runs it),
+set **CUDA - Sysmem Fallback Policy** to **Prefer No Sysmem Fallback** (driver 536.40 or later). With it set, an
+over-allocation surfaces as `CUDA_ERROR_OUT_OF_MEMORY` and fails that request, which is what you want: a failed request
+is visible and retryable, a spilled one silently takes hours. Leave it on *Driver Default* if other applications on the
+same GPU rely on oversubscription. Linux drivers never spill this way.
+
 ## MTP self-speculation is on by default (#757)
 
 When the loaded GGUF carries an embedded MTP head (`SupportsMtp`; e.g. Qwen3.6-MTP builds), `dotllm serve` enables MTP self-speculative decoding
