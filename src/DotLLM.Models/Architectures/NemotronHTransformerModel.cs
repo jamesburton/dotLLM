@@ -1015,7 +1015,8 @@ public sealed unsafe class NemotronHTransformerModel : IModel
             headDim: headDim,
             dState: dState,
             nGroup: nGroup,
-            seqLen: seqLen);
+            seqLen: seqLen,
+            pool: _threadPool); // #1042: heads split across the pool, bit-identical to serial
 
         if (traceSsm)
             NemotronHDiagnostics.DumpStats($"L{absoluteLayerIndex:D2}S ssm.y_post_scan[last]",
