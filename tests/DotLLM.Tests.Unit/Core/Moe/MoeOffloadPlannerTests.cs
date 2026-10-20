@@ -100,7 +100,7 @@ public sealed class MoeOffloadPlannerTests
     [Fact]
     public void Options_FromCli_ExplicitValuesWin_UnsetValuesFallBackToEnvironment()
     {
-        var env = new Dictionary<string, string>
+        var env = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             [MoeOffloadOptions.ModeEnvVar] = "on",
             [MoeOffloadOptions.CacheMibEnvVar] = "4096",

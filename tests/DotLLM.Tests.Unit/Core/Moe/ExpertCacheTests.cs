@@ -174,6 +174,7 @@ public sealed class ExpertCacheTests
         var c = new ExpertCache([4, 4, 4], [0, 1, 0], [2, 1], ExpertCachePolicy.Lru);
         Assert.Equal(0, c.PoolOf(0));
         Assert.Equal(1, c.PoolOf(1));
+        Assert.Equal(4, c.ExpertsIn(2));
         Assert.Equal(3, c.TotalSlots);
 
         Look(c, 0, 0, 1);                                   // pool 0: (0,0) (0,1)
