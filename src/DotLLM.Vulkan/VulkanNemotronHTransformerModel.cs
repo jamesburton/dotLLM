@@ -1597,7 +1597,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         {
             // Profiling only: separate the shared-expert down from the routed experts it normally overlaps with.
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
-            ProfMark(cmdBuf, VulkanOpProfiler.Cat.MoeRouted);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.Hadamard);
         }
         RecordMatmul(cmdBuf, m.SharedDown, m.SharedDownDeviceQuantType, _state.FfnIntermediate, _state.MoeSharedOut!,
             outputDim: hidden, inputDim: sharedInter, seqLen: seqLen);
@@ -1615,13 +1615,16 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         RecordExpertMatmul(cmdBuf, k, m.UpBankQuantType, m.UpBank, _state.MoeExpandedInput!, _state.MoeExpandedInputXq!, _state.MoeExpandedInputXds!,
             _state.MoeUpInter!, mDim: inter, kDim: expertDim, rows: rows, numExperts: numE);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.FfnAct);
 
         _reluSquared.Record(cmdBuf, _state.MoeUpInter!, n: rows * inter);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.AttnGate);
 
         RecordExpertMatmul(cmdBuf, k, m.DownBankQuantType, m.DownBank, _state.MoeUpInter!, _state.MoeUpInterXq!, _state.MoeUpInterXds!,
             _state.MoeDownRows!, mDim: expertDim, kDim: inter, rows: rows, numExperts: numE);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.MtpEhProj);
 
         k.Scatter.Record(cmdBuf, _state.MoeDownRows!, _state.MoeTopkWeights!, routedOut, seqLen: seqLen, topK: topK, hiddenSize: expertDim);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
@@ -1784,6 +1787,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             Interlocked.Increment(ref MoePathCounters.Mmvq);
             k.Quantize!.Record(cmdBuf, x, xq, xds, n: rows, k: kDim);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.AttnKvUpdate);
             switch (bankQt)
             {
                 case QuantizationType.Q5_1:
