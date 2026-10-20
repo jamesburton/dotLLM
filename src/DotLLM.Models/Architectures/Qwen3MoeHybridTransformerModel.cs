@@ -179,6 +179,7 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
 
         var dataBase = new GgufDataBase(gguf);
         var tensors = gguf.TensorsByName;
+        Nvfp4Support.RejectUnappliedScales(tensors, consumedScales: null, "The Qwen3 MoE-hybrid loader"); // #1038
         var layout = config.HybridLayout;
 
         var embDesc = tensors["token_embd.weight"];

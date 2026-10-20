@@ -49,6 +49,8 @@ public static class QuantizationTypeExtensions
         QuantizationType.I2_S => elementCount / 4 + 4,
         // MXFP4: e(1, E8M0 scale) + qs[16] = 17 bytes / 32 elements (4.25 bpw).
         QuantizationType.MXFP4 => elementCount / 32 * 17,
+        // NVFP4: d[4] (UE4M3 sub-block scales) + qs[32] = 36 bytes / 64 elements (4.5 bpw).
+        QuantizationType.NVFP4 => elementCount / 64 * 36,
         // Upstream ggml Q2_0: fp16 d + qs[16] = 18 bytes / 64 elements (2.25 bpw).
         QuantizationType.Q2_0 => elementCount / 64 * 18,
         // PQ2_0: scale(Half, 2 bytes) + codes[32](uint8, 4 codes/byte) = 34 bytes / 128

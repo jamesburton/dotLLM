@@ -195,6 +195,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         var dataBase = new GgufDataBase(gguf);
         var tensors = gguf.TensorsByName;
         var layout = config.HybridLayout;
+        Nvfp4Support.RejectUnappliedScales(tensors, consumedScales: null, "The Qwen3 hybrid-dense loader"); // #1038
 
         var embDesc = tensors["token_embd.weight"];
         nint embPtr = dataBase.Of(embDesc);

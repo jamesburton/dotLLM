@@ -41,6 +41,12 @@ public static class QuantFormat
     public const int Q8_1BlockBytes = 36;
     /// <summary>block_mxfp4: E8M0 scale byte + 16 nibble bytes.</summary>
     public const int Mxfp4BlockBytes = 17;
+    /// <summary>block_nvfp4: 4 UE4M3 sub-block scale bytes + 32 nibble bytes (#1038).</summary>
+    public const int Nvfp4BlockBytes = 36;
+    /// <summary>Elements per NVFP4 block (<c>QK_NVFP4</c>).</summary>
+    public const int Nvfp4GroupSize = 64;
+    /// <summary>Elements per NVFP4 sub-block sharing one UE4M3 scale (<c>QK_NVFP4_SUB</c>).</summary>
+    public const int Nvfp4SubBlockSize = 16;
     /// <summary>Upstream ggml Q2_0: fp16 d + 16 code bytes per 64 elements (#823).</summary>
     public const int Q2_0BlockBytes = 18;
     /// <summary>Elements per upstream Q2_0 block.</summary>
@@ -131,6 +137,7 @@ public static class QuantFormat
         QuantizationType.Q5_1 => new Info(type, Q5_1BlockBytes, LegacyGroupSize, HasMin: true),
         QuantizationType.Q8_0 => new Info(type, Q8_0BlockBytes, LegacyGroupSize, HasMin: false),
         QuantizationType.MXFP4 => new Info(type, Mxfp4BlockBytes, LegacyGroupSize, HasMin: false),
+        QuantizationType.NVFP4 => new Info(type, Nvfp4BlockBytes, Nvfp4GroupSize, HasMin: false),
         QuantizationType.IQ4_NL => new Info(type, IQ4_NLBlockBytes, LegacyGroupSize, HasMin: false),
         QuantizationType.Q2_0 => new Info(type, Q2_0BlockBytes, Q2_0GroupSize, HasMin: false),
         QuantizationType.Q2_K => new Info(type, Q2_KBlockBytes, KQuantGroupSize, HasMin: true),
@@ -158,7 +165,7 @@ public static class QuantFormat
     public static ReadOnlySpan<QuantizationType> BlockFormats =>
     [
         QuantizationType.Q4_0, QuantizationType.Q4_1, QuantizationType.Q5_0,
-        QuantizationType.Q5_1, QuantizationType.Q8_0, QuantizationType.MXFP4,
+        QuantizationType.Q5_1, QuantizationType.Q8_0, QuantizationType.MXFP4, QuantizationType.NVFP4,
         QuantizationType.IQ4_NL, QuantizationType.Q2_0,
         QuantizationType.Q2_K, QuantizationType.Q3_K, QuantizationType.Q4_K,
         QuantizationType.Q5_K, QuantizationType.Q6_K,

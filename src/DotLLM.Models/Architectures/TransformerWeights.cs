@@ -1334,6 +1334,7 @@ internal sealed class TransformerWeights : IDisposable
 
         var dataBase = new GgufDataBase(gguf);
         var tensors = gguf.TensorsByName;
+        Nvfp4Support.RejectUnappliedScales(tensors, consumedScales: null, "The shared transformer weight loader"); // #1038
 
         // Community NanoQuant GGUF (issue #869): factorised linears, CPU + dense Qwen3 only. Every other consumer of this
         // shared loader (Vulkan, CUDA, HIP, other architectures) must fail loudly rather than die on a missing tensor.

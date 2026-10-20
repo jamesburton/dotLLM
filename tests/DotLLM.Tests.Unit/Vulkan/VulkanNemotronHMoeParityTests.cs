@@ -119,7 +119,8 @@ public sealed class VulkanNemotronHMoeParityTests(Xunit.Abstractions.ITestOutput
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
-        var fx = new Fixture(BiasMode.Real, upQt: QuantizationType.Q4_K);   // no indexed Q4_K bank path in this model
+        // Q4_K banks are served since #1045, but only whole 256-element super-blocks: K = 64 here cannot be, and must not widen to F32.
+        var fx = new Fixture(BiasMode.Real, upQt: QuantizationType.Q4_K);
         var ex = Assert.ThrowsAny<NotSupportedException>(() => fx.Vulkan(device, spvDir, [1], [0]));
         Assert.Contains("ffn_up_exps", ex.Message, StringComparison.Ordinal);
     }

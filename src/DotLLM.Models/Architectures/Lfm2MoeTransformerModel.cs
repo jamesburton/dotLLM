@@ -113,6 +113,7 @@ public sealed unsafe class Lfm2MoeTransformerModel : IModel
 
         var dataBase = new GgufDataBase(gguf);
         var tensors = gguf.TensorsByName;
+        Nvfp4Support.RejectUnappliedScales(tensors, consumedScales: null, "The LFM2-MoE loader"); // #1038
         var layout = config.HybridLayout;
         int hidden = config.HiddenSize;
 
