@@ -48,11 +48,14 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
     /// <param name="mmvq">dp4a MMVQ indexed arm (int8 activations) vs the F32-activation indexed arm.</param>
     /// <param name="grouped">Expert-grouped prefill (#1046): layer 0 (Q4_K/Q5_K) takes the dp4a MMQ kernels, layer 1 (Q6_K/Q6_K) the coopmat
     /// kernels, layer 2 (Q8_0 down) stays indexed. Single-token forwards are below the threshold, so they check the indexed decode arm.</param>
+    /// <param name="xdiv">#1049: K-quant up projections on the MMVQ arm read the per-token rows (xDiv = topK, multi-row Q4_K kernel) instead
+    /// of a topK-fold broadcast.</param>
     [SkippableTheory]
-    [InlineData(true, false)]
-    [InlineData(false, false)]
-    [InlineData(true, true)]
-    public void Forward_BoltLatentHeterogeneousKQuant_MatchesCpuAndReference(bool mmvq, bool grouped)
+    [InlineData(true, false, true)]
+    [InlineData(true, false, false)]
+    [InlineData(false, false, true)]
+    [InlineData(true, true, true)]
+    public void Forward_BoltLatentHeterogeneousKQuant_MatchesCpuAndReference(bool mmvq, bool grouped, bool xdiv)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
@@ -73,6 +76,8 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         bool saved = VulkanNemotronHTransformerModel.MoeMmvqEnabled, savedGrouped = VulkanNemotronHTransformerModel.MoeGroupedEnabled;
         VulkanNemotronHTransformerModel.MoeMmvqEnabled = mmvq;
         VulkanNemotronHTransformerModel.MoeGroupedEnabled = grouped;
+        bool savedXDiv = VulkanNemotronHTransformerModel.MoeXDivEnabled;
+        VulkanNemotronHTransformerModel.MoeXDivEnabled = xdiv;
         VulkanNemotronHTransformerModel.MoePathCounters.Reset();
         try
         {
@@ -81,7 +86,16 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
             long viaF32 = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.F32Indexed);
             long viaMmq = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.GroupedMmq);
             long viaCoopmat = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.GroupedCoopmat);
-            output.WriteLine($"paths: mmvq={viaMmvq} f32={viaF32} groupedMmq={viaMmq} groupedCoopmat={viaCoopmat}");
+            long viaXDiv = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.XDivUp);
+            long viaMr = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.MultiRowUp);
+            output.WriteLine($"paths: mmvq={viaMmvq} f32={viaF32} groupedMmq={viaMmq} groupedCoopmat={viaCoopmat} xdivUp={viaXDiv} multiRowUp={viaMr}");
+            if (!grouped && mmvq && xdiv && device.HasIntegerDotProduct)
+            {
+                // Every layer's up bank is a K-quant: all three take the xDiv MMVQ; layer 0 (Q4_K, width 512) the multi-row kernel.
+                Assert.Equal(3, viaXDiv);
+                if (VulkanNemotronHTransformerModel.MoeUpMultiRow > 1) Assert.Equal(1, viaMr);
+            }
+            if (!xdiv || !mmvq) Assert.Equal(0, viaXDiv);
             if (grouped)
             {
                 // One forward: layer 0 on MMQ, layer 1 on coopmat (where the device has them), layer 2 (Q8_0 down) indexed.
@@ -119,6 +133,7 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         {
             VulkanNemotronHTransformerModel.MoeMmvqEnabled = saved;
             VulkanNemotronHTransformerModel.MoeGroupedEnabled = savedGrouped;
+            VulkanNemotronHTransformerModel.MoeXDivEnabled = savedXDiv;
         }
     }
 
