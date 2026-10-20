@@ -64,6 +64,172 @@ public sealed class VulkanNvfp4Tests : IDisposable
     }
 
     /// <summary>
+    /// #1066: the three decode GEMVs against the CPU dequant reference. The FP32 ones (coalesced multi-row, and #1038's
+    /// one-block-per-lane) match the double-precision product to F32 rounding. The MMVQ quantises the activations to Q8_1 first, so it
+    /// is held tightly to the product with the activations quantised exactly as <c>quantize_q8_1.comp</c> does (ties aside), and
+    /// loosely to the unquantised one. Odd M covers the row guard of multi-row builds; K covers one block, a window tail
+    /// (3 blocks), and Bolt's ssm_in / ssm_out widths with their per-tensor scales.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(1, 64, 1.0f, GemvVariant.Coalesced)]
+    [InlineData(71, 192, 0.37f, GemvVariant.Coalesced)]
+    [InlineData(300, 4096, 1.3e-4f, GemvVariant.Coalesced)]
+    [InlineData(77, 8192, 3.3e-4f, GemvVariant.Coalesced)]
+    [InlineData(71, 192, 0.37f, GemvVariant.Legacy)]
+    [InlineData(77, 8192, 3.3e-4f, GemvVariant.Legacy)]
+    [InlineData(1, 64, 1.0f, GemvVariant.Mmvq)]
+    [InlineData(71, 192, 0.37f, GemvVariant.Mmvq)]
+    [InlineData(300, 4096, 1.3e-4f, GemvVariant.Mmvq)]
+    [InlineData(77, 8192, 3.3e-4f, GemvVariant.Mmvq)]
+    public void Gemv_Variants_MatchCpuDequantReference(int m, int k, float scale, GemvVariant variant)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        var (w, x, expected) = MakeCase(m, k, 1, scale);
+
+        using var device = VulkanDevice.Create();
+        if (variant != GemvVariant.Legacy) Skip.IfNot(device.HasSubgroupArithmetic, "no subgroup arithmetic");
+        if (variant == GemvVariant.Mmvq) Skip.IfNot(device.HasIntegerDotProduct, "no integer dot product");
+        using var kernel = MatMulNvfp4F32Kernel.Create(device, spvDir,
+            variant == GemvVariant.Legacy ? null : MatMulNvfp4F32Kernel.CoalescedGemvSpvFileName, MatMulNvfp4F32Kernel.CoalescedGemvRows,
+            variant == GemvVariant.Mmvq ? MatMulNvfp4F32Kernel.MmvqSpvFileName : null, mmvqMinWeightBytes: 0);
+        Assert.Equal(variant != GemvVariant.Legacy, kernel.UsesCoalescedGemv);
+        Assert.Equal(variant == GemvVariant.Mmvq, kernel.HasMmvq);
+        using var bufW = device.Allocate(w.Length);
+        using var bufX = device.Allocate((long)x.Length * sizeof(float));
+        using var bufY = device.Allocate((long)m * sizeof(float));
+        device.Upload(new ReadOnlySpan<byte>(w), bufW);
+        device.Upload(x, bufX);
+        long coalescedBefore = Interlocked.Read(ref MatMulNvfp4F32Kernel.CoalescedGemvDispatches);
+        long mmvqBefore = Interlocked.Read(ref MatMulNvfp4F32Kernel.MmvqDispatches);
+        kernel.Launch(bufW, bufX, bufY, m, k, 1, scale);
+        Assert.Equal(variant == GemvVariant.Coalesced ? 1 : 0,
+            Interlocked.Read(ref MatMulNvfp4F32Kernel.CoalescedGemvDispatches) - coalescedBefore);
+        Assert.Equal(variant == GemvVariant.Mmvq ? 1 : 0, Interlocked.Read(ref MatMulNvfp4F32Kernel.MmvqDispatches) - mmvqBefore);
+        float[] actual = new float[m];
+        device.Download(bufY, actual);
+
+        float maxAbs = expected.Max(MathF.Abs);
+        if (variant == GemvVariant.Mmvq)
+        {
+            float[] expectedQ8 = ReferenceWithQ8_1Activations(w, x, m, k, scale);
+            for (int i = 0; i < m; i++)
+            {
+                Assert.True(MathF.Abs(actual[i] - expectedQ8[i]) <= 2e-3f * maxAbs,
+                    $"m={m} k={k} mmvq [{i}]: Q8_1-activation reference {expectedQ8[i]}, vulkan {actual[i]} (max |y| {maxAbs})");
+                Assert.True(MathF.Abs(actual[i] - expected[i]) <= 3e-2f * maxAbs,
+                    $"m={m} k={k} mmvq [{i}]: F32 reference {expected[i]}, vulkan {actual[i]} (max |y| {maxAbs})");
+            }
+            return;
+        }
+        for (int i = 0; i < m; i++)
+            Assert.True(MathF.Abs(actual[i] - expected[i]) <= 1e-4f * maxAbs + 1e-6f * MathF.Abs(expected[i]),
+                $"m={m} k={k} {variant} [{i}]: expected {expected[i]}, vulkan {actual[i]} (max |y| {maxAbs})");
+    }
+
+    /// <summary>The decode GEMV a test forces.</summary>
+    public enum GemvVariant
+    {
+        /// <summary>#1038's one-block-per-lane FP32 GEMV.</summary>
+        Legacy,
+
+        /// <summary>The coalesced multi-row FP32 GEMV (#1066).</summary>
+        Coalesced,
+
+        /// <summary>The Q8_1-activation integer-dot MMVQ (#1066).</summary>
+        Mmvq,
+    }
+
+    /// <summary>
+    /// <c>scale * dequant(W) . x</c> with x quantised as <c>quantize_q8_1.comp</c> does: per 32 elements d = amax / 127 (F32),
+    /// q = round(x / d) (computed as x * (1 / d)), then dequantised back to q * d.
+    /// </summary>
+    private static float[] ReferenceWithQ8_1Activations(byte[] w, float[] x, int m, int k, float scale)
+    {
+        float[] xd = new float[k];
+        for (int b = 0; b < k; b += 32)
+        {
+            float amax = 0f;
+            for (int i = 0; i < 32; i++) amax = MathF.Max(amax, MathF.Abs(x[b + i]));
+            float d = amax / 127f;
+            float id = d != 0f ? 1f / d : 0f;
+            for (int i = 0; i < 32; i++) xd[b + i] = MathF.Round(x[b + i] * id, MidpointRounding.AwayFromZero) * d;
+        }
+        float[] wf = Dequant(w, m * k);
+        float[] y = new float[m];
+        for (int r = 0; r < m; r++)
+        {
+            double acc = 0;
+            for (int c = 0; c < k; c++) acc += (double)wf[r * k + c] * xd[c];
+            y[r] = (float)(acc * scale);
+        }
+        return y;
+    }
+
+    /// <summary>
+    /// #1066: the Bolt-shaped NVFP4 Nemotron-H fixture, prefilled for 4 tokens and then DECODED for the 5th (so the NVFP4 SSM
+    /// projections run as GEMVs), against the CPU F32 twin's 5-token prefill. Covers both GEMVs; the decode path's counter proves
+    /// which ran.
+    /// </summary>
+    /// <param name="variant">The GEMV that must run: the MMVQ (opted in, its size gate lowered to 0 for the small fixture), the
+    /// coalesced FP32 GEMV (the default), or #1038's (forced by its legacy variable).</param>
+    [SkippableTheory]
+    [InlineData(GemvVariant.Mmvq)]
+    [InlineData(GemvVariant.Coalesced)]
+    [InlineData(GemvVariant.Legacy)]
+    public void NemotronH_Nvfp4Ssm_DecodeMatchesCpuF32Twin(GemvVariant variant)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using (var probe = VulkanDevice.Create())
+        {
+            if (variant != GemvVariant.Legacy) Skip.IfNot(probe.HasSubgroupArithmetic, "no subgroup arithmetic");
+            if (variant == GemvVariant.Mmvq) Skip.IfNot(probe.HasIntegerDotProduct, "no integer dot product");
+        }
+        using var legacy = variant == GemvVariant.Legacy ? new EnvVarScope(MatMulNvfp4F32Kernel.LegacyGemvEnvVar, "1") : null;
+        using var mmvqOn = variant == GemvVariant.Mmvq ? new EnvVarScope(MatMulNvfp4F32Kernel.EnableMmvqEnvVar, "1") : null;
+        using var mmvqGate = variant == GemvVariant.Mmvq ? new EnvVarScope(MatMulNvfp4F32Kernel.MmvqMinBytesEnvVar, "0") : null;
+        int[] ids = NemotronHNvfp4SsmTests.Ids, pos = NemotronHNvfp4SsmTests.Pos;
+        int last = ids.Length - 1;
+
+        float[] cpu;
+        using (var gguf = GgufFile.Open(NemotronHNvfp4SsmTests.WriteFixture(_scratch, Variant.F32Reference)))
+        {
+            var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            using var model = ModelLoader.CreateCpuModelFromGguf(gguf, config);
+            using ITensor logits = model.Forward(ids, pos, deviceId: -1);
+            cpu = LastRow(logits);
+        }
+
+        float[] vk;
+        long before = Interlocked.Read(ref MatMulNvfp4F32Kernel.CoalescedGemvDispatches);
+        long mmvqBefore = Interlocked.Read(ref MatMulNvfp4F32Kernel.MmvqDispatches);
+        using (var gguf = GgufFile.Open(NemotronHNvfp4SsmTests.WriteFixture(_scratch, Variant.Nvfp4Scaled)))
+        {
+            var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            using var device = VulkanDevice.Create();
+            var (model, kvFactory) = VulkanModelLoader.CreateFromGguf(device, gguf, config, spvDir);
+            using (model)
+            {
+                using var kv = kvFactory(16);
+                using (model.Forward(ids[..last], pos[..last], deviceId: -1, kvCache: kv)) { }
+                using ITensor logits = model.Forward(ids[last..], pos[last..], deviceId: -1, kvCache: kv);
+                vk = LastRow(logits);
+            }
+        }
+        long viaCoalesced = Interlocked.Read(ref MatMulNvfp4F32Kernel.CoalescedGemvDispatches) - before;
+        long viaMmvq = Interlocked.Read(ref MatMulNvfp4F32Kernel.MmvqDispatches) - mmvqBefore;
+        Assert.True(variant == GemvVariant.Coalesced ? viaCoalesced > 0 : viaCoalesced == 0, $"coalesced GEMV dispatches: {viaCoalesced}");
+        Assert.True(variant == GemvVariant.Mmvq ? viaMmvq > 0 : viaMmvq == 0, $"MMVQ dispatches: {viaMmvq}");
+
+        float maxAbs = cpu.Max(MathF.Abs);
+        Assert.True(maxAbs > 0.5f, $"degenerate fixture: max |logit| {maxAbs}");
+        float tol = variant == GemvVariant.Mmvq ? 3e-2f : 1e-2f;   // MMVQ: activations rounded to 8 bits per 32
+        Assert.Equal(Array.IndexOf(cpu, cpu.Max()), Array.IndexOf(vk, vk.Max()));
+        for (int i = 0; i < cpu.Length; i++)
+            Assert.True(MathF.Abs(cpu[i] - vk[i]) <= tol * maxAbs,
+                $"logit {i}: cpu(F32 twin) {cpu[i]}, vulkan(NVFP4 decode) {vk[i]} (max |logit| {maxAbs})");
+    }
+
+    /// <summary>
     /// #1060: the NVFP4 to F16 dequant is exact (E2M1 x UE4M3 needs at most 6 mantissa bits, inside F16's normal range), so it must
     /// equal the CPU dequantizer bit for bit, UE4M3 edge bytes included.
     /// </summary>

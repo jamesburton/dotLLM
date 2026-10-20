@@ -85,6 +85,83 @@ public sealed class VulkanNvfp4Bench
         }
     }
 
+    /// <summary>
+    /// #1065: decode GEMV, #1038's one-block-per-lane kernel against builds of the coalesced kernel with 1 (shipped), 2, 4 and 8 rows
+    /// per workgroup, with the Q8_0 coalesced GEMV at the same shapes as the bandwidth yardstick. The ROWS builds other than the
+    /// shipped one are compiled by hand into the test output (<c>matmul_nvfp4_gemv_coalesced_r{2,4,8}.spv</c>, <c>matmul_nvfp4_mmvq_r{2,4}.spv</c>) and skipped if absent.
+    /// </summary>
+    [SkippableFact]
+    public void Bench_DecodeGemv_Variants()
+    {
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_NVFP4_BENCH"), "1", StringComparison.Ordinal), "DOTLLM_NVFP4_BENCH=1 to enable.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(device.HasSubgroupArithmetic, "no subgroup arithmetic");
+
+        var variants = new List<(string Name, MatMulNvfp4F32Kernel Kernel)>
+        {
+            ("legacy #1038", MatMulNvfp4F32Kernel.Create(device, spvDir, null, 1)),
+        };
+        foreach (var (file, rows) in new[]
+                 {
+                     (MatMulNvfp4F32Kernel.CoalescedGemvSpvFileName, MatMulNvfp4F32Kernel.CoalescedGemvRows), ("matmul_nvfp4_gemv_coalesced_r2.spv", 2),
+                     ("matmul_nvfp4_gemv_coalesced_r4.spv", 4), ("matmul_nvfp4_gemv_coalesced_r8.spv", 8),
+                 })
+        {
+            if (File.Exists(Path.Combine(spvDir, file)))
+                variants.Add(($"coalesced ROWS={rows}", MatMulNvfp4F32Kernel.Create(device, spvDir, file, rows)));
+        }
+        if (device.HasIntegerDotProduct)
+        {
+            // MMVQ timings include the per-call Q8_1 quantise of the activation row and its two barriers, as in production.
+            foreach (var (file, rows) in new[]
+                     {
+                         (MatMulNvfp4F32Kernel.MmvqSpvFileName, MatMulNvfp4F32Kernel.MmvqRows), ("matmul_nvfp4_mmvq_r2.spv", 2),
+                         ("matmul_nvfp4_mmvq_r4.spv", 4),
+                     })
+            {
+                if (File.Exists(Path.Combine(spvDir, file)))
+                    variants.Add(($"MMVQ ROWS={rows}", MatMulNvfp4F32Kernel.Create(device, spvDir, MatMulNvfp4F32Kernel.CoalescedGemvSpvFileName,
+                        MatMulNvfp4F32Kernel.CoalescedGemvRows, file, rows, mmvqMinWeightBytes: 0)));
+            }
+        }
+        using var q8 = MatMulQ8_0Kernel.Create(device, spvDir);
+
+        try
+        {
+            _output.WriteLine($"Device: {device.DeviceName}  SubgroupSize: {device.SubgroupSize}");
+            _output.WriteLine("| shape | kernel | us | GB/s (weights) |");
+            _output.WriteLine("|---|---|---:|---:|");
+            var rng = new Random(1065);
+            foreach (var (tag, m, k) in BoltShapes)
+            {
+                long wBytes = (long)m * (k / QuantFormat.Nvfp4GroupSize) * QuantFormat.Nvfp4BlockBytes;
+                using var bufW = UploadRandomWeights(device, rng, m, k);
+                using var bufX = device.Allocate((long)k * sizeof(float));
+                using var bufY = device.Allocate((long)m * sizeof(float));
+                device.Upload(RandomActivations(rng, k), bufX);
+                foreach (var (name, kernel) in variants)
+                {
+                    double us = MeasureMedian(device, 64, cb => kernel.Record(cb, bufW, bufX, bufY, m, k, 1, 1.3e-4f));
+                    _output.WriteLine($"| {tag} | {name} | {us:F1} | {wBytes / (us * 1e-6) / 1e9:F1} |");
+                }
+
+                long q8Bytes = (long)m * (k / 32) * 34;
+                byte[] q8w = new byte[q8Bytes];
+                rng.NextBytes(q8w);
+                for (long b = 0; b < q8Bytes; b += 34) { q8w[b] = 0x00; q8w[b + 1] = 0x20; }   // fp16 scale 2^-7, finite
+                using var bufQ8 = device.Allocate(q8Bytes);
+                device.Upload(new ReadOnlySpan<byte>(q8w), bufQ8);
+                double q8Us = MeasureMedian(device, 64, cb => q8.Record(cb, bufQ8, bufX, bufY, m, k));
+                _output.WriteLine($"| {tag} | Q8_0 coalesced (yardstick) | {q8Us:F1} | {q8Bytes / (q8Us * 1e-6) / 1e9:F1} |");
+            }
+        }
+        finally
+        {
+            foreach (var (_, kernel) in variants) kernel.Dispose();
+        }
+    }
+
     internal static VulkanDevice.Buffer UploadRandomWeights(VulkanDevice device, Random rng, int m, int k)
     {
         byte[] w = new byte[(long)m * (k / QuantFormat.Nvfp4GroupSize) * QuantFormat.Nvfp4BlockBytes];
