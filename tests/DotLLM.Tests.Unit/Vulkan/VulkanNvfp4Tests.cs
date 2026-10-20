@@ -170,8 +170,8 @@ public sealed class VulkanNvfp4Tests : IDisposable
     /// projections run as GEMVs), against the CPU F32 twin's 5-token prefill. Covers both GEMVs; the decode path's counter proves
     /// which ran.
     /// </summary>
-    /// <param name="variant">The GEMV that must run: the MMVQ (its size gate lowered to 0 for the small fixture), the coalesced FP32
-    /// GEMV (MMVQ disabled), or #1038's (forced by its legacy variable).</param>
+    /// <param name="variant">The GEMV that must run: the MMVQ (opted in, its size gate lowered to 0 for the small fixture), the
+    /// coalesced FP32 GEMV (the default), or #1038's (forced by its legacy variable).</param>
     [SkippableTheory]
     [InlineData(GemvVariant.Mmvq)]
     [InlineData(GemvVariant.Coalesced)]
@@ -185,7 +185,7 @@ public sealed class VulkanNvfp4Tests : IDisposable
             if (variant == GemvVariant.Mmvq) Skip.IfNot(probe.HasIntegerDotProduct, "no integer dot product");
         }
         using var legacy = variant == GemvVariant.Legacy ? new EnvVarScope(MatMulNvfp4F32Kernel.LegacyGemvEnvVar, "1") : null;
-        using var noMmvq = variant == GemvVariant.Coalesced ? new EnvVarScope(MatMulNvfp4F32Kernel.DisableMmvqEnvVar, "1") : null;
+        using var mmvqOn = variant == GemvVariant.Mmvq ? new EnvVarScope(MatMulNvfp4F32Kernel.EnableMmvqEnvVar, "1") : null;
         using var mmvqGate = variant == GemvVariant.Mmvq ? new EnvVarScope(MatMulNvfp4F32Kernel.MmvqMinBytesEnvVar, "0") : null;
         int[] ids = NemotronHNvfp4SsmTests.Ids, pos = NemotronHNvfp4SsmTests.Pos;
         int last = ids.Length - 1;

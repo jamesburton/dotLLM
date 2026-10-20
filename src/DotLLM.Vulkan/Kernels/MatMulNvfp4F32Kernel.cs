@@ -7,9 +7,9 @@ namespace DotLLM.Vulkan.Kernels;
 /// NVFP4 matmul (issue #1038): <c>C[N, M] = scale · (B[N, K] @ W_nvfp4[M, K]ᵀ)</c>, with a GEMV for <c>N == 1</c> and the
 /// 16x16-tiled GEMM (<c>matmul_nvfp4_f32_gemm.spv</c>) otherwise. For <c>N == 1</c>, in order of preference (#1066):
 /// <list type="number">
-/// <item>the integer-dot MMVQ (<c>matmul_nvfp4_mmvq.spv</c>): the activation row is quantised to Q8_1 into a scratch owned here,
-/// then dotted as int8 against the E2M1 codes; used for weights of at least <see cref="DefaultMmvqMinWeightBytes"/> (by default) on devices with
-/// integer dot product;</item>
+/// <item>opt-in (<see cref="EnableMmvqEnvVar"/>), the integer-dot MMVQ (<c>matmul_nvfp4_mmvq.spv</c>): the activation row is
+/// quantised to Q8_1 into a scratch owned here, then dotted as int8 against the E2M1 codes; used for weights of at least
+/// <see cref="DefaultMmvqMinWeightBytes"/> (by default) on devices with integer dot product;</item>
 /// <item>the coalesced multi-row FP32 GEMV (<c>matmul_nvfp4_gemv_coalesced.spv</c>) on devices with subgroup arithmetic;</item>
 /// <item>the one-block-per-lane FP32 GEMV (<c>matmul_nvfp4_f32_gemv.spv</c>, #1038).</item>
 /// </list>
@@ -44,8 +44,13 @@ public sealed class MatMulNvfp4F32Kernel : IDisposable
     /// <summary>Weight rows per workgroup of <see cref="MmvqSpvFileName"/> (its <c>ROWS</c>).</summary>
     public const int MmvqRows = 1;
 
-    /// <summary>Environment variable that disables the MMVQ (A/B against the FP32 GEMVs).</summary>
-    public const string DisableMmvqEnvVar = "DOTLLM_VK_NVFP4_MMVQ_DISABLE";
+    /// <summary>
+    /// Environment variable that enables the MMVQ (<c>1</c>). Off by default: on Strix (Radeon 8060S) at Bolt's shapes it is no faster
+    /// than the coalesced FP32 GEMV (248 vs 250 us per Mamba layer, 27.3 tok/s either way), while its int8 activations move greedy
+    /// decoding off llama.cpp Vulkan's (FP32-activation) output on one of the six #1035 prompts. Worth enabling on devices where
+    /// activation bandwidth, not weight bandwidth, bounds the FP32 GEMV.
+    /// </summary>
+    public const string EnableMmvqEnvVar = "DOTLLM_VK_NVFP4_MMVQ";
 
     /// <summary>Environment variable overriding <see cref="DefaultMmvqMinWeightBytes"/>.</summary>
     public const string MmvqMinBytesEnvVar = "DOTLLM_VK_NVFP4_MMVQ_MIN_BYTES";
@@ -99,7 +104,7 @@ public sealed class MatMulNvfp4F32Kernel : IDisposable
         bool coalesced = device.HasSubgroupArithmetic && !legacy
             && File.Exists(Path.Combine(spvDir, CoalescedGemvSpvFileName));
         bool mmvq = coalesced && device.HasIntegerDotProduct
-            && Environment.GetEnvironmentVariable(DisableMmvqEnvVar) != "1"
+            && Environment.GetEnvironmentVariable(EnableMmvqEnvVar) == "1"
             && File.Exists(Path.Combine(spvDir, MmvqSpvFileName));
         long minBytes = long.TryParse(Environment.GetEnvironmentVariable(MmvqMinBytesEnvVar), out long v) && v >= 0
             ? v : DefaultMmvqMinWeightBytes;
