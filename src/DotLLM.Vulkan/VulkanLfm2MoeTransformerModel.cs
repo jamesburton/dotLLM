@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
+using DotLLM.Core.Lora;
 using DotLLM.Core.Tensors;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Models.Architectures;
@@ -289,6 +290,15 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
     /// <summary>Forward with a caller-supplied per-sequence conv state (null = model-owned default).</summary>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache, ISsmState? ssmState)
         => ForwardCore(tokenIds, positions, deviceId, kvCache, ResolveState(ssmState));
+
+    /// <inheritdoc/>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                           IKvCache? kvCache, ILoraAdapter? adapter)
+    {
+        if (adapter is not null)
+            throw new NotSupportedException("VulkanLfm2MoeTransformerModel does not support LoRA adapters.");
+        return ForwardCore(tokenIds, positions, deviceId, kvCache, null);
+    }
 
     private VulkanLfm2ConvStateCache? ResolveState(ISsmState? s)
     {

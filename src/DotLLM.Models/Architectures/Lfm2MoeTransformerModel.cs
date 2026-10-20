@@ -5,6 +5,7 @@ using NativeMemory = System.Runtime.InteropServices.NativeMemory;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
+using DotLLM.Core.Lora;
 using DotLLM.Core.Tensors;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Cpu.Threading;
@@ -48,6 +49,7 @@ public sealed unsafe class Lfm2MoeTransformerModel : IModel
     private readonly bool _ownsThreadPool;
     private readonly Lfm2Scratch _s = new();
     private Lfm2ConvStateCache? _activeState;
+    private ILoraAdapter? _activeAdapter;
 
     /// <inheritdoc/>
     public ModelConfig Config { get; }
@@ -257,6 +259,11 @@ public sealed unsafe class Lfm2MoeTransformerModel : IModel
                            IKvCache? kvCache, ISsmState? ssmState)
         => ForwardCore(tokenIds, positions, deviceId, kvCache, ResolveState(ssmState), false);
 
+    /// <inheritdoc/>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                           IKvCache? kvCache, ILoraAdapter? adapter)
+        => ForwardCore(tokenIds, positions, deviceId, kvCache, null, false, adapter);
+
     private Lfm2ConvStateCache? ResolveState(ISsmState? s)
     {
         if (s is null) return null;
@@ -284,18 +291,16 @@ public sealed unsafe class Lfm2MoeTransformerModel : IModel
         for (int i = 0; i < requests.Count; i++)
         {
             var r = requests[i];
-            if (r.Adapter is not null)
-                throw new NotSupportedException("Lfm2MoeTransformerModel does not support LoRA adapters.");
             if (requests.Count > 1 && r.SsmState is null)
                 throw new ArgumentException($"ForwardBatch with {requests.Count} requests requires a per-seq SsmState; request[{i}] has none.");
-            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.SsmState);
+            results[i] = ForwardCore(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, ResolveState(r.SsmState), false, r.Adapter);
         }
         return results;
     }
 
     [SkipLocalsInit]
     private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
-                                IKvCache? kvCache, Lfm2ConvStateCache? state, bool lastOnly)
+                                IKvCache? kvCache, Lfm2ConvStateCache? state, bool lastOnly, ILoraAdapter? adapter = null)
     {
         int T = tokenIds.Length;
         if (T == 0 || T != positions.Length)
@@ -306,6 +311,9 @@ public sealed unsafe class Lfm2MoeTransformerModel : IModel
             if ((uint)positions[i] >= (uint)Config.MaxSequenceLength)
                 throw new ArgumentOutOfRangeException(nameof(positions), $"Position {positions[i]} at index {i} exceeds max sequence length {Config.MaxSequenceLength}.");
 
+        if (adapter is not null) Lfm2Lora.Validate(adapter, Config);
+        var prevAdapter = _activeAdapter;
+        _activeAdapter = adapter;
         var prevState = _activeState;
         _activeState = state ?? _defaultState;
         try
@@ -333,7 +341,7 @@ public sealed unsafe class Lfm2MoeTransformerModel : IModel
                 new Span<float>(hidden, T * H).CopyTo(new Span<float>(residual, T * H));
                 RmsRows(hidden, lw.FfnNorm, eps, normOut, T, H);
                 if (lw.Moe is not null) ForwardMoe(lw.Moe, layer, T, H, normOut);
-                else ForwardDense(lw, T, H, normOut);
+                else ForwardDense(lw, layer, T, H, normOut);
                 if (TensorDump.Enabled) TensorDump.Dump2D($"blk.{layer}.ffn_out", normOut, T, H);
                 AddRows(residual, normOut, hidden, T * H);
                 if (TensorDump.Enabled) TensorDump.Dump2D($"blk.{layer}.l_out", hidden, T, H);
@@ -352,6 +360,7 @@ public sealed unsafe class Lfm2MoeTransformerModel : IModel
         finally
         {
             _activeState = prevState;
+            _activeAdapter = prevAdapter;
         }
     }
 
@@ -364,6 +373,7 @@ public sealed unsafe class Lfm2MoeTransformerModel : IModel
         float* buf = _s.ConvBuf;         // [(L-1+T), H]
         float* y = _s.ConvOut;           // [T, H]
         Gemm(lw.InProj.Ptr, lw.InProj.Qt, normOut, proj, lw.InProj.OutDim, lw.InProj.InDim, T);
+        ApplyLora(layer, "in_proj", normOut, proj, T, lw.InProj.InDim, lw.InProj.OutDim);
 
         float* st = _activeState!.Layer(convOrdinal);
         new Span<float>(st, (L - 1) * H).CopyTo(new Span<float>(buf, (L - 1) * H));
@@ -386,6 +396,7 @@ public sealed unsafe class Lfm2MoeTransformerModel : IModel
         new Span<float>(buf + (long)T * H, (L - 1) * H).CopyTo(new Span<float>(st, (L - 1) * H));
         if (TensorDump.Enabled) TensorDump.Dump2D($"blk.{layer}.conv_y", y, T, H);
         Gemm(lw.OutProj.Ptr, lw.OutProj.Qt, y, normOut, lw.OutProj.OutDim, lw.OutProj.InDim, T);
+        ApplyLora(layer, "out_proj", y, normOut, T, lw.OutProj.InDim, lw.OutProj.OutDim);
     }
 
     private void ForwardAttention(Qwen3FullAttnWeights a, int layer, int T, ReadOnlySpan<int> positions, float* normOut, IKvCache? kvCache)
@@ -394,8 +405,11 @@ public sealed unsafe class Lfm2MoeTransformerModel : IModel
         int qE = nh * hd, kvE = nkv * hd;
         float* q = _s.Q, k = _s.K, v = _s.V, attnOut = _s.AttnOut;
         Gemm(a.QWeight, a.QQuantType, normOut, q, a.QOutputDim, a.QInputDim, T);
+        ApplyLora(layer, "q_proj", normOut, q, T, a.QInputDim, a.QOutputDim);
         Gemm(a.KWeight, a.KQuantType, normOut, k, a.KOutputDim, a.KInputDim, T);
+        ApplyLora(layer, "k_proj", normOut, k, T, a.KInputDim, a.KOutputDim);
         Gemm(a.VWeight, a.VQuantType, normOut, v, a.VOutputDim, a.VInputDim, T);
+        ApplyLora(layer, "v_proj", normOut, v, T, a.VInputDim, a.VOutputDim);
         Mamba3QkNorm.Execute(new Span<float>(q, T * qE), a.QNormWeight, Config.NormEpsilon, T, nh, hd);
         Mamba3QkNorm.Execute(new Span<float>(k, T * kvE), a.KNormWeight, Config.NormEpsilon, T, nkv, hd);
         RoPE.Execute(new Span<float>(q, T * qE), new Span<float>(k, T * kvE), positions, nh, nkv, hd, _ropeDim,
@@ -417,18 +431,22 @@ public sealed unsafe class Lfm2MoeTransformerModel : IModel
             Attention.Execute(q, k, v, attnOut, T, T, nh, nkv, hd, 0, pool: null, slidingWindowSize: null);
         }
         Gemm(a.OWeight, a.OQuantType, attnOut, normOut, a.OOutputDim, a.OInputDim, T);
+        ApplyLora(layer, "o_proj", attnOut, normOut, T, a.OInputDim, a.OOutputDim);
     }
 
-    private void ForwardDense(Lfm2Layer lw, int T, int H, float* normOut)
+    private void ForwardDense(Lfm2Layer lw, int layer, int T, int H, float* normOut)
     {
         int F = lw.DenseGate.OutDim;
         float* g = _s.FfnGate, u = _s.FfnUp;
         Gemm(lw.DenseGate.Ptr, lw.DenseGate.Qt, normOut, g, F, H, T);
+        ApplyLora(layer, "gate_proj", normOut, g, T, H, F);
         Gemm(lw.DenseUp.Ptr, lw.DenseUp.Qt, normOut, u, lw.DenseUp.OutDim, H, T);
+        ApplyLora(layer, "up_proj", normOut, u, T, H, lw.DenseUp.OutDim);
         var gs = new Span<float>(g, T * F);
         SiLu.Execute(gs, gs);
         TensorPrimitives.Multiply(gs, new ReadOnlySpan<float>(u, T * F), gs);
         Gemm(lw.DenseDown.Ptr, lw.DenseDown.Qt, g, normOut, lw.DenseDown.OutDim, F, T);
+        ApplyLora(layer, "down_proj", g, normOut, T, F, lw.DenseDown.OutDim);
     }
 
     private void ForwardMoe(MoeLayerWeights moe, int layer, int T, int H, float* normOut)
@@ -472,11 +490,14 @@ public sealed unsafe class Lfm2MoeTransformerModel : IModel
             numExperts: E, numExpertsPerTok: K, hiddenSize: H, intermediateSize: I, seqLen: T,
             sharedGateProj: moe.SharedGateProj, sharedUpProj: moe.SharedUpProj, sharedDownProj: moe.SharedDownProj,
             sharedIntermediateSize: moe.SharedIntermediateSize, sharedExpertGate: ReadOnlySpan<float>.Empty,
-            loraAdapter: null, loraLayer: layer, threadPool: _threadPool,
+            loraAdapter: _activeAdapter, loraLayer: layer, threadPool: _threadPool,
             packedLegacyExperts: LegacyPacked);
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
+
+    private void ApplyLora(int layer, string proj, float* x, float* y, int tokens, int input, int output)
+        => LoraProjection.Apply(_activeAdapter, layer, proj, x, y, tokens, input, output, _threadPool);
 
     private static void RmsRows(float* src, float[] w, float eps, float* dst, int rows, int H)
     {
