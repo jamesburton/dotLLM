@@ -622,19 +622,25 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         int headRows = tokenIds.Length <= _allRowLogitsLimit ? tokenIds.Length : 1;
         var logitsBuf = headRows == 1 ? _state.Logits : EnsureMultiRowLogits(headRows, vocabSize);
 
+        ProfBeginForward(tokenIds.Length);
         RunForwardCore(tokenIds, positions, kvCache,
             captureLastNormedRowTo: null, captureSlot: 0, headRows: headRows);
 
         _submit.Begin();
         nint cmdBuf = _submit.CommandBuffer;
+        _prof?.BeginSubmit(cmdBuf);
         KernelSupport.HostToComputeBarrier(cmdBuf);
 
         RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType,
             _state.NormOutput, logitsBuf,
             outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: headRows);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.LmHead);
 
         KernelSupport.ComputeToHostBarrier(cmdBuf);
+        _prof?.BeforeSubmit(cmdBuf);
         _submit.SubmitAndWait();
+        _prof?.AfterSubmit();
+        ProfEndForward();
 
         var shape = new TensorShape(headRows, vocabSize);
         var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
@@ -768,11 +774,13 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
         _submit.Begin();
         nint cmdBuf = _submit.CommandBuffer;
+        _prof?.BeginSubmit(cmdBuf);
         KernelSupport.HostToComputeBarrier(cmdBuf);
 
         _state.ResetHiddenSlot();
         RecordEmbeddingGather(cmdBuf, tokenIds);
         KernelSupport.TransferToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.Embed);
 
         var kinds = _layout.LayerKind;
         for (int layer = 0; layer < Config.NumLayers; layer++)
@@ -783,6 +791,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             _rmsnorm.Record(cmdBuf, _state.HiddenState, lw.AttnNormWeight, _state.NormOutput,
                 rowCount: seqLen, n: hiddenSize, eps: eps);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.Norm);
 
             switch (kinds[layer])
             {
@@ -810,9 +819,24 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             // (same slot); the add writes into AddScratch (alternate slot); we then rotate.
             _add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch, seqLen * hiddenSize);
             _state.RotateHiddenSlot();
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.Resid);
 
             if (layer < Config.NumLayers - 1)
+            {
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                if (_prof is not null)
+                {
+                    // Profiling submits per layer: the query pool holds one submit's marks (#1048). Changes timing, not results.
+                    KernelSupport.ComputeToHostBarrier(cmdBuf);
+                    _prof.BeforeSubmit(cmdBuf);
+                    _submit.SubmitAndWait();
+                    _prof.AfterSubmit();
+                    _submit.Begin();
+                    cmdBuf = _submit.CommandBuffer;
+                    _prof.BeginSubmit(cmdBuf);
+                    KernelSupport.HostToComputeBarrier(cmdBuf);
+                }
+            }
         }
 
         // Final RMSNorm on the last headRows tokens (1 unless all-row logits were requested).
@@ -825,6 +849,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
         _rmsnorm.Record(cmdBuf, _state.NormOutput, _weights.OutputNormWeight, _state.NormOutput,
             rowCount: headRows, n: hiddenSize, eps: eps);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.Norm);
 
         // Optionally snapshot the normed last row into a caller-owned scratch buffer at
         // the given slot. Used by ForwardBatch to gather every simple seq's last hidden
@@ -841,7 +866,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         }
 
         KernelSupport.ComputeToHostBarrier(cmdBuf);
+        _prof?.BeforeSubmit(cmdBuf);
         _submit.SubmitAndWait();
+        _prof?.AfterSubmit();
     }
 
     /// <inheritdoc/>
@@ -1053,6 +1080,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         RecordMatmul(cmdBuf, ssmW.InWeight, ssmW.InDeviceQuantType, _state.NormOutput, _state.Zxbcdt,
             outputDim: ssmW.InOutputDim, inputDim: ssmW.InInputDim, seqLen: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.ProjGdn);
 
         // 2. ConvInput = concat(conv_state[(d_conv-1)*conv_dim], xBC rows from Zxbcdt)
         //    Step (a): copy cached conv_state into ConvInput[0 .. (d_conv-1)*conv_dim).
@@ -1075,6 +1103,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                 srcOffset: srcOff, dstOffset: dstOff, size: (ulong)convDimBytes);
         }
         KernelSupport.TransferToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.CopyFanout);
 
         // 3. Conv1d causal → XBC.
         _conv1dCausal.Record(cmdBuf, _state.ConvInput, ssmW.Conv1dWeight, ssmW.Conv1dBias, _state.XBC,
@@ -1098,6 +1127,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             KernelSupport.TransferToComputeBarrier(cmdBuf);
         }
 
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.GdnPre);
+
         // 6. dt = Zxbcdt[:, dtOffset..dtOffset+nHead] + DtBias.
         //    Per-token copy Zxbcdt slice → DtBuf, then BiasAdd in place.
         KernelSupport.ComputeToTransferBarrier(cmdBuf);
@@ -1110,6 +1141,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                 srcOffset: srcOff, dstOffset: dstOff, size: (ulong)dtRowBytes);
         }
         KernelSupport.TransferToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.CopyFanout);
         _biasAdd.Record(cmdBuf, _state.DtBuf, ssmW.DtBias, seqLen, nHead);
         // The mamba2Scan call below is the consumer of DtBuf; the split kernel below
         // doesn't touch DtBuf, so it can run concurrently. The compute→compute barrier
@@ -1125,6 +1157,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _ssmSplitXbc.Record(cmdBuf, _state.XBC, _state.SsmX, _state.SsmB, _state.SsmC,
             seqLen: seqLen, dInner: dInner, bcDim: bcDim);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.GdnPre);
 
         // 8. Mamba2 selective scan: state, SsmX, DtBuf, A, SsmB, SsmC -> SsmY.
         if (_mamba2ScanRegs is not null && Mamba2SelectiveScanRegsF32Kernel.IsEligible(headDim, dState))
@@ -1142,11 +1175,13 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                 nHead: nHead, headDim: headDim, dState: dState, nGroup: nGroup, seqLen: seqLen);
         }
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.GdnScanCore);
 
         // 9. SsmY += SsmX * D
         _ssmDSkip.Record(cmdBuf, _state.SsmY, _state.SsmX, ssmW.D,
             seqLen: seqLen, nHead: nHead, headDim: headDim);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.GdnPre);
 
         // 10. Extract z = Zxbcdt[t, 0..dInner] into SsmZ, then SwiGLU(SsmZ, SsmY) → SsmY.
         //     Per-token copy of dInner-wide slice from row offset 0.
@@ -1160,6 +1195,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                 srcOffset: srcOff, dstOffset: dstOff, size: (ulong)ssmXRowBytes);
         }
         KernelSupport.TransferToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.CopyFanout);
 
         // SwiGLU computes silu(gate) * up — feed z as gate, SsmY as up. The kernel
         // requires distinct buffers, so we route the result back through SsmZ then
@@ -1176,10 +1212,12 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _groupRmsNorm.Record(cmdBuf, _state.SsmY, ssmW.NormWeight,
             seqLen: seqLen, nGroup: nGroup, groupDim: groupDim, eps: eps);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.GdnPostGate);
 
         // 12. ssm_out matmul: SsmY @ OutWeight^T → NormOutput.
         RecordMatmul(cmdBuf, ssmW.OutWeight, ssmW.OutDeviceQuantType, _state.SsmY, _state.NormOutput,
             outputDim: ssmW.OutOutputDim, inputDim: ssmW.OutInputDim, seqLen: seqLen);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.ProjGdn);
     }
 
     /// <summary>
@@ -1201,6 +1239,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         RecordMatmul(cmdBuf, attnW.V, attnW.VDeviceQuantType, _state.NormOutput, _state.V,
             outputDim: attnW.VOutputDim, inputDim: attnW.VInputDim, seqLen: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.ProjAttn);
 
         // NO position encoding here (issue #372): llama.cpp's nemotron-h.cpp and HF's
         // NemotronHAttention rotate nothing — position information comes entirely
@@ -1256,9 +1295,11 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         }
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.AttnCore);
         // Output projection → NormOutput (mirrors the GQA contract for the residual add).
         RecordMatmul(cmdBuf, attnW.O, attnW.ODeviceQuantType, _state.AttnOutput, _state.NormOutput,
             outputDim: attnW.OOutputDim, inputDim: attnW.OInputDim, seqLen: seqLen);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.ProjAttn);
     }
 
     /// <summary>
@@ -1279,6 +1320,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
         RecordMatmul(cmdBuf, ffnW.Down, ffnW.DownDeviceQuantType, _state.FfnIntermediate, _state.NormOutput,
             outputDim: ffnW.DownOutputDim, inputDim: ffnW.DownInputDim, seqLen: seqLen);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.ProjFfn);
     }
 
     /// <summary>
@@ -1541,6 +1583,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             RecordMatmul(cmdBuf, m.LatentDown!, m.LatentDownDeviceQuantType, _state.NormOutput, _state.MoeLatentIn!,
                 outputDim: m.LatentSize, inputDim: hidden, seqLen: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.MoeDense);
 
         _reluSquared.Record(cmdBuf, _state.FfnIntermediate, n: seqLen * sharedInter);
         k.Router.Record(cmdBuf, _state.MoeRouterLogits!, m.SelectionBias, _state.MoeTopkIndices!, _state.MoeTopkWeights!,
@@ -1550,8 +1593,19 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             k.Broadcast.Record(cmdBuf, expertIn, _state.MoeExpandedInput!, seqLen: seqLen, topK: topK, hidden: expertDim);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
+        if (_prof is not null)
+        {
+            // Profiling only: separate the shared-expert down from the routed experts it normally overlaps with.
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.MoeRouted);
+        }
         RecordMatmul(cmdBuf, m.SharedDown, m.SharedDownDeviceQuantType, _state.FfnIntermediate, _state.MoeSharedOut!,
             outputDim: hidden, inputDim: sharedInter, seqLen: seqLen);
+        if (_prof is not null)
+        {
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.MoeDense);
+        }
         if (grouped != GroupedPath.None)
         {
             RecordGroupedExperts(cmdBuf, k, m, grouped, expertIn, routedOut, seqLen, expertDim);
@@ -1573,6 +1627,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         }
 
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.MoeRouted);
         if (latent)
         {
             // Back from the latent: NormOutput = latent_up(weighted expert sum). NormOutput's last readers (shared up, router, latent_down)
@@ -1584,6 +1639,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
         // Shared expert added unweighted (elementwise, so the in-place a = a + b alias is safe).
         _add.Record(cmdBuf, _state.NormOutput, _state.MoeSharedOut!, _state.NormOutput, seqLen * hidden);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.MoeDense);
     }
 
     /// <summary>Which expert-grouped prefill a routed layer takes (#1046).</summary>
@@ -1770,6 +1826,49 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                 throw new InvalidOperationException($"No indexed expert kernel for a resident {bankQt} bank (upload should have refused it).");
         }
     }
+
+    // ── #1048: per-op GPU attribution (env-gated; zero cost when off) ───────────────────────────────────────────────
+    // DOTLLM_VK_NEMOTRON_PROFILE=1 times every Forward with BOTTOM_OF_PIPE timestamps per op category (VulkanOpProfiler, #434),
+    // submitting per layer so one query pool covers each submit. The table goes to stderr (and appends to
+    // DOTLLM_VK_NEMOTRON_PROFILE_OUT). Buckets: proj_gdn = SSM in/out, gdn_pre = conv1d/silu/dt/split/D-skip, gdn_scan_core = the
+    // selective scan, gdn_postgate = silu(z) gate + group norm, copy_fanout = the per-token copies, moe_dense = router / shared expert /
+    // latent projections, moe_routed = routed experts.
+
+    private static readonly bool ProfileEnabledFromEnv = Environment.GetEnvironmentVariable("DOTLLM_VK_NEMOTRON_PROFILE") == "1";
+
+    /// <summary>Test hook: profile irrespective of the environment.</summary>
+    internal bool ProfileOverride { get; set; }
+
+    /// <summary>The most recent completed profile, or null.</summary>
+    internal VulkanOpProfileReport? LastProfile { get; private set; }
+
+    private VulkanOpProfiler? _profiler;
+    private VulkanOpProfiler? _prof;
+
+    private void ProfBeginForward(int seqLen)
+    {
+        if (!(ProfileEnabledFromEnv || ProfileOverride)) { _prof = null; return; }
+        _profiler ??= new VulkanOpProfiler(_device, _submit);
+        _prof = _profiler;
+        _prof.BeginForward(seqLen, Config.NumLayers);
+    }
+
+    private void ProfEndForward()
+    {
+        if (_prof is null) return;
+        var report = _prof.EndForward();
+        _prof = null;
+        LastProfile = report;
+        string text = report.Format("nemotron-profile");
+        if (ProfileEnabledFromEnv) Console.Error.Write(text);
+        if (Environment.GetEnvironmentVariable("DOTLLM_VK_NEMOTRON_PROFILE_OUT") is { Length: > 0 } path)
+        {
+            try { File.AppendAllText(path, text); }
+            catch (IOException) { /* diagnostics only */ }
+        }
+    }
+
+    private void ProfMark(nint cmdBuf, VulkanOpProfiler.Cat cat) => _prof?.Mark(cmdBuf, cat);
 
     private void InvalidateKernelCaches()
     {
@@ -2146,6 +2245,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _cpuModel?.Dispose();
 
         _moe?.Dispose();
+        _profiler?.Dispose();
         _ssmSplitXbc.Dispose();
         _reluSquared.Dispose();
         _groupRmsNorm.Dispose();
