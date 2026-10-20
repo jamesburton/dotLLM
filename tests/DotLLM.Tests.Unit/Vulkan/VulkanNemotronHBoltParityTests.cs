@@ -33,8 +33,11 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
     /// <summary>Smallest top-k selection margin (sigmoid probability + bias) a fixture may have past layer 0; see <see cref="RunParity"/>.</summary>
     private const double RequiredRoutingMargin = 0.02;
 
-    /// <summary>Weight seeds of the two fixtures; each draw is checked for near-tie routing by <see cref="RunParity"/>.</summary>
-    private const int KQuantSeed = 1045, IqSeed = 1045;
+    /// <summary>
+    /// Weight seeds of the two fixtures, chosen so every routing decision past layer 0 clears <see cref="RequiredRoutingMargin"/>
+    /// (min 0.052 and 0.028); <see cref="RunParity"/> re-checks. Of 40 consecutive seeds, about one in six qualifies.
+    /// </summary>
+    private const int KQuantSeed = 1077, IqSeed = 1052;
 
     private static readonly LayerSpec[] Layers =
     [
