@@ -180,6 +180,88 @@ public sealed class VulkanNvfp4Tests : IDisposable
         return actual;
     }
 
+    /// <summary>
+    /// #1064: the native NVFP4 coopmat GEMM (decode into shared memory, F32 accumulation, X.scale on the F32 accumulator) against the
+    /// double-precision reference. Activations round to F16 as in every coopmat GEMM, hence the F16-prefill bound. Shapes cover partial
+    /// M and N tiles on both sides of the 128 tile, a single-block K, an odd number of 32-wide K chunks per block pair, and Bolt's K.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(70, 192, 32, 0.37f)]      // partial M and N tiles, 3 blocks, scale
+    [InlineData(64, 4096, 40, 1.3e-4f)]   // Bolt-like K and scale
+    [InlineData(33, 128, 64, 1.0f)]       // no scale
+    [InlineData(130, 64, 129, 1.0f)]      // one block of K; M and N each cross a 128 tile by one
+    [InlineData(256, 4096, 256, 2.2e-4f)] // whole tiles only (the direct-store path)
+    [InlineData(70, 192, 2, 0.5f)]        // the smallest batch the Nemotron-H host routes here
+    public void NativeGemm_MatchesCpuDequantReference(int m, int k, int n, float scale)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        var (w, x, expected) = MakeCase(m, k, n, scale);
+
+        float[] actual = RunNativeGemm(spvDir, w, x, m, k, n, scale);
+
+        float maxAbs = expected.Max(MathF.Abs);
+        for (int i = 0; i < actual.Length; i++)
+            Assert.True(MathF.Abs(actual[i] - expected[i]) <= 4e-3f * maxAbs,
+                $"m={m} k={k} n={n} [{i}]: expected {expected[i]}, vulkan {actual[i]} (max |y| {maxAbs})");
+    }
+
+    /// <summary>
+    /// #1064 regression fixture for #1059's overflow class, at Bolt magnitudes: every weight is the largest NVFP4 value under a canonical E4M3 scale
+    /// (code 7 = 12, times UE4M3 0x7E = 224, i.e. 2688) and every activation 16, over Bolt's K = 4096, so each unscaled dot product
+    /// is 4096 x 2688 x 16 = 176 160 768, far past F16's 65 504. Scaled by ~1e-4 it is ~2.3e4. The products and their partial sums
+    /// are multiples of 2^11 below 2^28, so F32 accumulation is exact and the only rounding is the one F32 multiply by the scale. An
+    /// F16 accumulator or an F16 write before the scale gives Inf/NaN; an F16 write after it is off by up to 2^-11; a scale applied
+    /// twice or not at all is off by ~1e4x. Odd rows use the negative code so the sign path is covered too. Tails on both M and N.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(1.3e-4f)]
+    [InlineData(3.3e-4f)]
+    public void NativeGemm_BoltScaleMagnitudes_AccumulatesAndScalesInF32(float scale)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        const int m = 130, k = 4096, n = 129, blocksPerRow = k / 64;
+        byte[] w = new byte[m * blocksPerRow * 36];
+        for (int r = 0; r < m; r++)
+            for (int b = 0; b < blocksPerRow; b++)
+            {
+                int o = (r * blocksPerRow + b) * 36;
+                w.AsSpan(o, 4).Fill(0x7E);                                          // UE4M3 0x7E -> 224 (the x0.5 folded in)
+                w.AsSpan(o + 4, 32).Fill((r & 1) == 0 ? (byte)0x77 : (byte)0xFF); // code 7 (+12) or 15 (-12) in both nibbles
+            }
+        float[] x = new float[n * k];
+        x.AsSpan().Fill(16f);
+
+        float[] actual = RunNativeGemm(spvDir, w, x, m, k, n, scale);
+
+        const float unscaled = 4096f * 2688f * 16f;
+        Assert.True(unscaled > 65504f * 1000f, "the fixture must overflow any F16 intermediate");
+        for (int t = 0; t < n; t++)
+            for (int r = 0; r < m; r++)
+            {
+                float expected = ((r & 1) == 0 ? unscaled : -unscaled) * scale;   // one F32 multiply, as the epilogue does
+                float got = actual[t * m + r];
+                Assert.True(float.IsFinite(got), $"[t={t}, r={r}] is {got}: an F16 intermediate overflowed");
+                Assert.True(MathF.Abs(got - expected) <= 1e-6f * MathF.Abs(expected),
+                    $"[t={t}, r={r}]: expected {expected}, vulkan {got}");
+            }
+    }
+
+    private static float[] RunNativeGemm(string spvDir, byte[] w, float[] x, int m, int k, int n, float scale)
+    {
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(MatMulNvfp4GemmCoopmatKernel.IsSupportedOn(device, spvDir), "no wave64 cooperative-matrix device");
+        using var kernel = MatMulNvfp4GemmCoopmatKernel.Create(device, spvDir);
+        using var bufW = device.Allocate(w.Length);
+        using var bufX = device.Allocate((long)x.Length * sizeof(float));
+        using var bufY = device.Allocate((long)n * m * sizeof(float));
+        device.Upload(new ReadOnlySpan<byte>(w), bufW);
+        device.Upload(x, bufX);
+        kernel.Launch(bufW, bufX, bufY, m, k, n, scale);
+        float[] actual = new float[n * m];
+        device.Download(bufY, actual);
+        return actual;
+    }
+
     /// <summary>Random NVFP4 blocks (sub-block scales sprinkled with the UE4M3 edge bytes), activations and the double-precision product.</summary>
     private static (byte[] W, float[] X, float[] Expected) MakeCase(int m, int k, int n, float scale)
     {
@@ -226,21 +308,28 @@ public sealed class VulkanNvfp4Tests : IDisposable
     /// <c>scale · dequant(W)</c>. Vulkan uses FP32 activations, so this is tight; a dropped scale, a wrong
     /// nibble order or a widened-and-unscaled upload is off by a multiple of the logits.
     /// </summary>
-    /// <param name="f16Prefill">#1060: lower the F16-prefill threshold so the 5-token prompt's NVFP4 projections take the F16
-    /// dequant + coopmat GEMM (activations rounded to F16: a looser bound); otherwise the packed NVFP4 GEMM runs.</param>
+    /// <param name="path">Which prefill GEMM the 5-token prompt's NVFP4 projections must take: the native coopmat GEMM (#1064, the
+    /// default; activations rounded to F16: a looser bound), the F16 dequant + coopmat GEMM (#1060, native disabled and its threshold
+    /// lowered), or the packed scalar NVFP4 GEMM (#1038, both disabled).</param>
     [SkippableTheory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void NemotronH_Nvfp4Ssm_ForwardMatchesCpuF32Twin(bool f16Prefill)
+    [InlineData(Nvfp4PrefillPath.Scalar)]
+    [InlineData(Nvfp4PrefillPath.F16Dequant)]
+    [InlineData(Nvfp4PrefillPath.Native)]
+    public void NemotronH_Nvfp4Ssm_ForwardMatchesCpuF32Twin(Nvfp4PrefillPath path)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
-        if (f16Prefill)
+        if (path != Nvfp4PrefillPath.Scalar)
         {
             using var probe = VulkanDevice.Create();
             Skip.IfNot(probe.HasCooperativeMatrix, "no cooperative-matrix F16 GEMM on this device");
+            if (path == Nvfp4PrefillPath.Native)
+                Skip.IfNot(MatMulNvfp4GemmCoopmatKernel.IsSupportedOn(probe, spvDir), "no wave64 cooperative-matrix device");
         }
-        using var scope = f16Prefill ? new F16PrefillTestScope() : null;
+        using var f16Scope = path == Nvfp4PrefillPath.F16Dequant ? new F16PrefillTestScope() : null;
+        using var nativeOff = path != Nvfp4PrefillPath.Native ? new EnvVarScope(MatMulNvfp4GemmCoopmatKernel.LegacyEnvVar, "1") : null;
         IqF16PrefillMatmul.Counters.Reset();
+        Interlocked.Exchange(ref MatMulNvfp4GemmCoopmatKernel.Dispatches, 0);
+        long scratchBytes = -1, scratchCapacity = -1;
 
         float[] cpu;
         using (var gguf = GgufFile.Open(NemotronHNvfp4SsmTests.WriteFixture(_scratch, Variant.F32Reference)))
@@ -262,19 +351,53 @@ public sealed class VulkanNvfp4Tests : IDisposable
                 Assert.IsType<VulkanNemotronHTransformerModel>(model);
                 using ITensor logits = model.Forward(NemotronHNvfp4SsmTests.Ids, NemotronHNvfp4SsmTests.Pos, deviceId: -1);
                 vk = LastRow(logits);
+                scratchBytes = ((VulkanNemotronHTransformerModel)model).F16PrefillScratchBytes;
+                scratchCapacity = ((VulkanNemotronHTransformerModel)model).F16PrefillScratchCapacityBytes;
             }
         }
 
         long viaF16 = Interlocked.Read(ref IqF16PrefillMatmul.Counters.Nvfp4);
-        if (f16Prefill) Assert.True(viaF16 > 0, "the NVFP4 projections did not take the F16 prefill path");
-        else Assert.Equal(0, viaF16);
+        long viaNative = Interlocked.Read(ref MatMulNvfp4GemmCoopmatKernel.Dispatches);
+        switch (path)
+        {
+            case Nvfp4PrefillPath.Native:
+                Assert.True(viaNative > 0, "the NVFP4 projections did not take the native coopmat GEMM");
+                Assert.Equal(0, viaF16);
+                Assert.Equal(0, scratchBytes);   // #1064: no F16 staging buffer exists ...
+                Assert.True(scratchCapacity <= sizeof(ushort),   // ... nor is one sized for NVFP4 (the fixture has no IQ projection)
+                    $"F16 scratch sized to {scratchCapacity} bytes for an NVFP4-only model with the native GEMM");
+                break;
+            case Nvfp4PrefillPath.F16Dequant:
+                Assert.True(viaF16 > 0, "the NVFP4 projections did not take the F16 prefill path");
+                Assert.Equal(0, viaNative);
+                Assert.True(scratchBytes > 0, "the F16 path ran without its scratch");
+                Assert.Equal(scratchCapacity, scratchBytes);
+                break;
+            default:
+                Assert.Equal(0, viaF16);
+                Assert.Equal(0, viaNative);
+                break;
+        }
 
         float maxAbs = cpu.Max(MathF.Abs);
-        float tol = f16Prefill ? 1e-2f : 2e-3f;
+        float tol = path == Nvfp4PrefillPath.Scalar ? 2e-3f : 1e-2f;
         Assert.True(maxAbs > 0.5f, $"degenerate fixture: max |logit| {maxAbs}");
         for (int i = 0; i < cpu.Length; i++)
             Assert.True(MathF.Abs(cpu[i] - vk[i]) <= tol * maxAbs,
                 $"logit {i}: cpu(F32 twin) {cpu[i]}, vulkan(NVFP4) {vk[i]} (max |logit| {maxAbs})");
+    }
+
+    /// <summary>The NVFP4 prefill GEMM a test forces on the Nemotron-H host.</summary>
+    public enum Nvfp4PrefillPath
+    {
+        /// <summary>The packed scalar 16x16 NVFP4 GEMM (#1038).</summary>
+        Scalar,
+
+        /// <summary>Whole-matrix NVFP4 to F16 dequant, then the F16 coopmat GEMM (#1060).</summary>
+        F16Dequant,
+
+        /// <summary>The native NVFP4 coopmat GEMM (#1064).</summary>
+        Native,
     }
 
     [Fact]
