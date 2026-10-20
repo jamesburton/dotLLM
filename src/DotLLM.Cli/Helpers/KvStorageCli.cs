@@ -155,7 +155,7 @@ internal static class KvStorageCli
         {
             CudaQwen3HybridDenseTransformerModel => KvFlagTarget.CudaHybridDense,
             HybridQwen3HybridDenseTransformerModel or DotLLM.Cuda.HybridTransformerModel
-                or CudaQwen3MoeHybridTransformerModel or CudaNemotronHTransformerModel => KvFlagTarget.OwnCacheUnsupported,
+                or CudaQwen3MoeHybridTransformerModel or CudaNemotronHTransformerModel or CudaLfm2MoeTransformerModel => KvFlagTarget.OwnCacheUnsupported,
             DotLLM.Cuda.CudaTransformerModel => KvFlagTarget.CudaPlain,
             _ when model.GetType().Namespace?.StartsWith("DotLLM.Vulkan", StringComparison.Ordinal) == true => KvFlagTarget.Vulkan,
             _ when model.GetType().Namespace?.StartsWith("DotLLM.Cuda", StringComparison.Ordinal) == true => KvFlagTarget.OwnCacheUnsupported,
@@ -169,6 +169,8 @@ internal static class KvStorageCli
     /// </summary>
     public static void Apply(IModel model, KvStorageRequest request)
     {
+        if (model is CudaLfm2MoeTransformerModel)
+            CudaLfm2MoeTransformerModel.ValidateKvStorage(request.Key ?? KvCacheDType.F32, request.Value ?? KvCacheDType.F32, request.CacheWindow);
         if (model is CudaQwen3HybridDenseTransformerModel dense && (request.Key is not null || request.Value is not null))
             dense.ConfigureKvStorage(request.Key, request.Value);
     }

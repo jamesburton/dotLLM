@@ -83,11 +83,23 @@ public static unsafe class CudaMoeFfn
     /// BOTH GPU paths without spawning separate processes. Ignored for non-BitNetI2S precisions.
     /// </param>
     public static void Forward(
-        nint hiddenF32, nint outputF32,
-        int seqLen,
-        CudaMoeLayerWeights weights,
+        nint hiddenF32, nint outputF32, int seqLen, CudaMoeLayerWeights weights,
         CudaMoeScratch scratch, nint cublasHandle, CudaKernels kernels, nint stream,
         bool? forceUseI2SBatchedGemm = null)
+        => ForwardCore(hiddenF32, outputF32, seqLen, weights, scratch, cublasHandle, kernels, stream, forceUseI2SBatchedGemm, false, null);
+
+    /// <summary>Runs the expert body after architecture-specific routing populated scratch TopkIdx/TopkWeight.</summary>
+    internal static void ForwardWithPrecomputedRouting(
+        nint hiddenF32, nint outputF32, int seqLen, CudaMoeLayerWeights weights,
+        CudaMoeScratch scratch, nint cublasHandle, CudaKernels kernels, nint stream,
+        Action<nint, nint, nint, int, int, int, nint>? packedQ4Projection = null)
+        => ForwardCore(hiddenF32, outputF32, seqLen, weights, scratch, cublasHandle, kernels, stream, null, true, packedQ4Projection);
+
+    private static void ForwardCore(
+        nint hiddenF32, nint outputF32, int seqLen, CudaMoeLayerWeights weights,
+        CudaMoeScratch scratch, nint cublasHandle, CudaKernels kernels, nint stream,
+        bool? forceUseI2SBatchedGemm, bool routingAlreadyComputed,
+        Action<nint, nint, nint, int, int, int, nint>? packedQ4Projection)
     {
         if (!kernels.HasMoeKernels)
             throw new InvalidOperationException(
@@ -118,35 +130,39 @@ public static unsafe class CudaMoeFfn
         // ── Step 1: clear output ──
         kernels.LaunchMoeZeroF32(outputF32, seqLen * hidden, stream);
 
-        // ── Step 2: routing GEMV — logits[seqLen, numExperts] = hidden @ router^T ──
-        CudaGemm.LinearF32(
-            cublasHandle, hiddenF32, weights.Router, scratch.Logits,
-            seqLen, hidden, E, stream);
-
-        // ── Step 2b: additive router bias (gpt-oss, issue #348) ──
-        // MUST run before softmax/top-k — same ordering as ForwardBitNetI2S's identity-MoTE
-        // router bias (bias shifts both the top-k argmax AND the softmax probabilities).
-        // RouterBiasF32 (gpt-oss, #348) and GateBiasF32 (identity-MoTE/BitNet, #246) are both
-        // additive router biases; Forward (unlike ForwardBitNetI2S) may see either depending on
-        // which loader populated this layer, so check both.
-        nint effectiveRouterBias = weights.RouterBiasF32 != 0 ? weights.RouterBiasF32 : weights.GateBiasF32;
-        if (effectiveRouterBias != 0)
+        if (!routingAlreadyComputed)
         {
-            if (!kernels.HasMoeGateBiasAdd)
-                throw new InvalidOperationException(
-                    "MoE layer has a router bias but moe_gate_bias_add_f32 is not available. " +
-                    "Recompile native/kernels/moe_ffn.cu to PTX.");
-            kernels.LaunchMoeGateBiasAddF32(scratch.Logits, effectiveRouterBias, seqLen, E, stream);
+            // ── Step 2: routing GEMV — logits[seqLen, numExperts] = hidden @ router^T ──
+            CudaGemm.LinearF32(
+                cublasHandle, hiddenF32, weights.Router, scratch.Logits,
+                seqLen, hidden, E, stream);
+
+            // ── Step 2b: additive router bias (gpt-oss, issue #348) ──
+            // MUST run before softmax/top-k — same ordering as ForwardBitNetI2S's identity-MoTE
+            // router bias (bias shifts both the top-k argmax AND the softmax probabilities).
+            // RouterBiasF32 (gpt-oss, #348) and GateBiasF32 (identity-MoTE/BitNet, #246) are both
+            // additive router biases; Forward (unlike ForwardBitNetI2S) may see either depending on
+            // which loader populated this layer, so check both.
+            nint effectiveRouterBias = weights.RouterBiasF32 != 0 ? weights.RouterBiasF32 : weights.GateBiasF32;
+            if (effectiveRouterBias != 0)
+            {
+                if (!kernels.HasMoeGateBiasAdd)
+                    throw new InvalidOperationException(
+                        "MoE layer has a router bias but moe_gate_bias_add_f32 is not available. " +
+                        "Recompile native/kernels/moe_ffn.cu to PTX.");
+                kernels.LaunchMoeGateBiasAddF32(scratch.Logits, effectiveRouterBias, seqLen, E, stream);
+            }
+
+            // ── Step 3: per-token softmax + top-k selection → device buffers ──
+            kernels.LaunchMoeSoftmaxTopk(
+                scratch.Logits, scratch.TopkIdx, scratch.TopkWeight,
+                seqLen, E, K, stream);
+
+            // ── Step 4: optional renorm of top-k weights ──
+            if (weights.NormTopKProb)
+                kernels.LaunchMoeRenormTopk(scratch.TopkWeight, seqLen, K, stream);
+
         }
-
-        // ── Step 3: per-token softmax + top-k selection → device buffers ──
-        kernels.LaunchMoeSoftmaxTopk(
-            scratch.Logits, scratch.TopkIdx, scratch.TopkWeight,
-            seqLen, E, K, stream);
-
-        // ── Step 4: optional renorm of top-k weights ──
-        if (weights.NormTopKProb)
-            kernels.LaunchMoeRenormTopk(scratch.TopkWeight, seqLen, K, stream);
 
         // ── Step 5: download top-k indices to host so we can dispatch
         // per-expert grouped batches. Per-token weights stay device-resident —
@@ -311,7 +327,7 @@ public static unsafe class CudaMoeFfn
                     weightQuant: weights.GateProj[e], weightQt: weights.GateProjQuantType,
                     dequantF16: scratch.DequantF16, dequantF32: scratch.DequantF32,
                     gemvInputF16: scratch.GemvInputF16, gemvOutputF16: scratch.GemvOutputF16,
-                    outputF32: scratch.GateBatch);
+                    outputF32: scratch.GateBatch, packedQ4Projection: packedQ4Projection);
                 if (weights.GateExpsBiasF32 != 0)
                     kernels.LaunchMoeGateBiasAddF32(
                         scratch.GateBatch, weights.GateExpsBiasF32 + (nint)((long)e * I * sizeof(float)),
@@ -322,7 +338,7 @@ public static unsafe class CudaMoeFfn
                     weightQuant: weights.UpProj[e], weightQt: weights.UpProjQuantType,
                     dequantF16: scratch.DequantF16, dequantF32: scratch.DequantF32,
                     gemvInputF16: scratch.GemvInputF16, gemvOutputF16: scratch.GemvOutputF16,
-                    outputF32: scratch.UpBatch);
+                    outputF32: scratch.UpBatch, packedQ4Projection: packedQ4Projection);
                 if (weights.UpExpsBiasF32 != 0)
                     kernels.LaunchMoeGateBiasAddF32(
                         scratch.UpBatch, weights.UpExpsBiasF32 + (nint)((long)e * I * sizeof(float)),
@@ -380,7 +396,7 @@ public static unsafe class CudaMoeFfn
                 weightQuant: weights.DownProj[e], weightQt: weights.DownProjQuantType,
                 dequantF16: scratch.DequantF16, dequantF32: scratch.DequantF32,
                 gemvInputF16: scratch.GemvInputF16, gemvOutputF16: scratch.GemvOutputF16,
-                outputF32: scratch.DownBatch);
+                outputF32: scratch.DownBatch, packedQ4Projection: packedQ4Projection);
             if (weights.DownExpsBiasF32 != 0)
                 kernels.LaunchMoeGateBiasAddF32(
                     scratch.DownBatch, weights.DownExpsBiasF32 + (nint)((long)e * hidden * sizeof(float)),
@@ -416,14 +432,14 @@ public static unsafe class CudaMoeFfn
                     weightQuant: weights.SharedGateProj[s], weightQt: weights.SharedGateProjQuantType,
                     dequantF16: scratch.DequantF16, dequantF32: scratch.DequantF32,
                 gemvInputF16: scratch.GemvInputF16, gemvOutputF16: scratch.GemvOutputF16,
-                    outputF32: scratch.SharedGateBatch);
+                    outputF32: scratch.SharedGateBatch, packedQ4Projection: packedQ4Projection);
                 ProjectF32OrQuant(weights.Precision, cublasHandle, kernels, stream,
                     hiddenF32, seqLen, K: hidden, M: sI,
                     weightF32: weights.SharedUpProj[s],
                     weightQuant: weights.SharedUpProj[s], weightQt: weights.SharedUpProjQuantType,
                     dequantF16: scratch.DequantF16, dequantF32: scratch.DequantF32,
                 gemvInputF16: scratch.GemvInputF16, gemvOutputF16: scratch.GemvOutputF16,
-                    outputF32: scratch.SharedUpBatch);
+                    outputF32: scratch.SharedUpBatch, packedQ4Projection: packedQ4Projection);
                 kernels.LaunchSwiGLUF32(
                     scratch.SharedGateBatch, scratch.SharedUpBatch, scratch.SharedSiluBatch,
                     sI, seqLen, stream);
@@ -433,7 +449,7 @@ public static unsafe class CudaMoeFfn
                     weightQuant: weights.SharedDownProj[s], weightQt: weights.SharedDownProjQuantType,
                     dequantF16: scratch.DequantF16, dequantF32: scratch.DequantF32,
                 gemvInputF16: scratch.GemvInputF16, gemvOutputF16: scratch.GemvOutputF16,
-                    outputF32: scratch.SharedDownBatch);
+                    outputF32: scratch.SharedDownBatch, packedQ4Projection: packedQ4Projection);
 
                 if (hasGate)
                 {
@@ -784,8 +800,11 @@ public static unsafe class CudaMoeFfn
         nint inputF32, int batch, int K, int M,
         nint weightF32, nint weightQuant, QuantizationType weightQt,
         nint dequantF16, nint dequantF32, nint outputF32,
-        nint gemvInputF16, nint gemvOutputF16)
+        nint gemvInputF16, nint gemvOutputF16,
+        Action<nint, nint, nint, int, int, int, nint>? packedQ4Projection = null)
     {
+        if (precision == MoePrecision.Quantized && weightQt == QuantizationType.Q4_0 && packedQ4Projection is not null)
+        { packedQ4Projection(weightQuant, inputF32, outputF32, M, K, batch, stream); return; }
         if (precision == MoePrecision.Quantized)
         {
             // Fast path: direct quantized GEMV when batch=1, K satisfies the

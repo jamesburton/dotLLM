@@ -66,6 +66,12 @@ public static class CudaModelLoader
                 return (dense, size => dense.CreateKvCache(size));
             }
 
+            case Architecture.Lfm2Moe:
+            {
+                var lfm = Architectures.CudaLfm2MoeTransformerModel.LoadFromGguf(gguf, config, deviceId, ptxDir);
+                return (lfm, size => lfm.CreateKvCache(size));
+            }
+
             case Architecture.Qwen3MoeHybrid:
             {
                 var moe = Architectures.CudaQwen3MoeHybridTransformerModel
