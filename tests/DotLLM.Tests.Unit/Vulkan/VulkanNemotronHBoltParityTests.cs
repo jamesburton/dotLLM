@@ -91,9 +91,14 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
             output.WriteLine($"paths: mmvq={viaMmvq} f32={viaF32} groupedMmq={viaMmq} groupedCoopmat={viaCoopmat} xdivUp={viaXDiv} multiRowUp={viaMr}");
             if (!grouped && mmvq && xdiv && device.HasIntegerDotProduct)
             {
-                // Every layer's up bank is a K-quant: all three take the xDiv MMVQ; layer 0 (Q4_K, width 512) the multi-row kernel.
+                // Every layer's up bank is a K-quant: all three take the xDiv MMVQ; layers 0 (Q4_K) and 2 (Q5_K) the multi-row kernel,
+                // and layer 0's Q5_K down bank the multi-row Q5_K kernel.
                 Assert.Equal(3, viaXDiv);
-                if (VulkanNemotronHTransformerModel.MoeUpMultiRow > 1) Assert.Equal(1, viaMr);
+                if (VulkanNemotronHTransformerModel.MoeUpMultiRow > 1)
+                {
+                    Assert.Equal(2, viaMr);
+                    Assert.Equal(1, Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.MultiRowDown));
+                }
             }
             if (!xdiv || !mmvq) Assert.Equal(0, viaXDiv);
             if (grouped)

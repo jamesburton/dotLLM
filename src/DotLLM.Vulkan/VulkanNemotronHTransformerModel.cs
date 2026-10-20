@@ -1346,6 +1346,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         public MoeIndexedMatmulKQuantMmvqKernel? MmvqQ6_K { get; init; }
         /// <summary>Multi-row (NR output rows per workgroup) Q4_K MMVQ with the xDiv broadcast (#1049); null when disabled or missing.</summary>
         public MoeIndexedMatmulKQuantMmvqKernel? MmvqQ4_KMr { get; init; }
+        /// <summary>Multi-row Q5_K MMVQ (#1049), the down-projection twin; null when disabled or missing.</summary>
+        public MoeIndexedMatmulKQuantMmvqKernel? MmvqQ5_KMr { get; init; }
         public required VulkanDevice.Buffer UnitScale { get; init; }   // per-expert output scale, all ones
 
         // Expert-grouped prefill (#1046); null when the device / SPIR-V set lacks them (the layer keeps the indexed path).
@@ -1398,7 +1400,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             IndexedQ4_K.InvalidateDescriptorCache(); IndexedQ5_K.InvalidateDescriptorCache(); IndexedQ6_K.InvalidateDescriptorCache();
             Quantize?.InvalidateDescriptorCache(); MmvqQ5_1?.InvalidateDescriptorCache(); MmvqQ8_0?.InvalidateDescriptorCache();
             MmvqQ4_K?.InvalidateDescriptorCache(); MmvqQ5_K?.InvalidateDescriptorCache(); MmvqQ6_K?.InvalidateDescriptorCache();
-            MmvqQ4_KMr?.InvalidateDescriptorCache();
+            MmvqQ4_KMr?.InvalidateDescriptorCache(); MmvqQ5_KMr?.InvalidateDescriptorCache();
             ExpertOffsets?.InvalidateDescriptorCache(); BuildTileList?.InvalidateDescriptorCache();
             GatherGroupF32?.InvalidateDescriptorCache(); GatherGroupQ8_1?.InvalidateDescriptorCache(); ScatterGrouped?.InvalidateDescriptorCache();
             GroupedMmqQ4_K?.InvalidateDescriptorCache(); GroupedMmqQ5_K?.InvalidateDescriptorCache();
@@ -1410,7 +1412,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             Router.Dispose(); Broadcast.Dispose(); Scatter.Dispose(); IndexedQ5_1.Dispose(); IndexedQ8_0.Dispose();
             IndexedQ4_K.Dispose(); IndexedQ5_K.Dispose(); IndexedQ6_K.Dispose();
             Quantize?.Dispose(); MmvqQ5_1?.Dispose(); MmvqQ8_0?.Dispose();
-            MmvqQ4_K?.Dispose(); MmvqQ5_K?.Dispose(); MmvqQ6_K?.Dispose(); MmvqQ4_KMr?.Dispose();
+            MmvqQ4_K?.Dispose(); MmvqQ5_K?.Dispose(); MmvqQ6_K?.Dispose(); MmvqQ4_KMr?.Dispose(); MmvqQ5_KMr?.Dispose();
             ExpertOffsets?.Dispose(); BuildTileList?.Dispose(); GatherGroupF32?.Dispose(); GatherGroupQ8_1?.Dispose(); ScatterGrouped?.Dispose();
             GroupedMmqQ4_K?.Dispose(); GroupedMmqQ5_K?.Dispose();
             GroupedCoopmatQ4_K?.Dispose(); GroupedCoopmatQ5_K?.Dispose(); GroupedCoopmatQ6_K?.Dispose();
@@ -1473,6 +1475,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             MmvqQ5_K = mmvq ? MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q5_K) : null,
             MmvqQ6_K = mmvq ? MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q6_K) : null,
             MmvqQ4_KMr = mmvq && MoeUpMultiRow > 1 ? MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q4_K, MoeUpMultiRow) : null,
+            MmvqQ5_KMr = mmvq && MoeUpMultiRow > 1 ? MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q5_K, MoeUpMultiRow) : null,
             UnitScale = ones,
         };
     }
@@ -1490,9 +1493,11 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         public static long XDivUp;
         /// <summary>Up projections run on the multi-row Q4_K MMVQ (#1049).</summary>
         public static long MultiRowUp;
+        /// <summary>Indexed projections (the down projection) run on the multi-row Q5_K MMVQ (#1049).</summary>
+        public static long MultiRowDown;
         public static void Reset()
         {
-            Interlocked.Exchange(ref XDivUp, 0); Interlocked.Exchange(ref MultiRowUp, 0);
+            Interlocked.Exchange(ref XDivUp, 0); Interlocked.Exchange(ref MultiRowUp, 0); Interlocked.Exchange(ref MultiRowDown, 0);
             Interlocked.Exchange(ref Mmvq, 0); Interlocked.Exchange(ref F32Indexed, 0);
             Interlocked.Exchange(ref GroupedMmq, 0); Interlocked.Exchange(ref GroupedCoopmat, 0);
         }
@@ -1687,6 +1692,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         {
             QuantizationType.Q4_K when k.MmvqQ4_KMr is { } mr && inter % mr.RowsPerGroup == 0 => mr,
             QuantizationType.Q4_K => k.MmvqQ4_K!,
+            QuantizationType.Q5_K when k.MmvqQ5_KMr is { } mr5 && inter % mr5.RowsPerGroup == 0 => mr5,
             QuantizationType.Q5_K => k.MmvqQ5_K!,
             _ => k.MmvqQ6_K!,
         };
@@ -1849,9 +1855,12 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                     var kq = bankQt switch
                     {
                         QuantizationType.Q4_K => k.MmvqQ4_K!,
+                        // #1049: the multi-row Q5_K kernel (the down projection of most Bolt Q4_K_M layers).
+                        QuantizationType.Q5_K when k.MmvqQ5_KMr is { } mr5 && mDim % mr5.RowsPerGroup == 0 => mr5,
                         QuantizationType.Q5_K => k.MmvqQ5_K!,
                         _ => k.MmvqQ6_K!,
                     };
+                    if (kq.RowsPerGroup > 1) Interlocked.Increment(ref MoePathCounters.MultiRowDown);
                     kq.Record(cmdBuf, bank, xq, xds, indices, y, m: mDim, k: kDim, n: rows, numExperts: numExperts);
                     break;
             }
