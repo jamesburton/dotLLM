@@ -369,6 +369,13 @@ public static class ServerStartup
                 Console.WriteLine($"[dotllm] WARNING: --cache-type-k/-v (K:{kvConfig.KeyDType} V:{kvConfig.ValueDType}) is ignored: the split GPU/CPU model owns its KV cache and has no quantized storage (model {config.Architecture}).");
             kvFactory = (cfg, size) => qwen3SplitModel.CreateKvCache(size);
         }
+        else if (model is DotLLM.Cuda.Architectures.CudaLfm2MoeTransformerModel lfmModel)
+        {
+            DotLLM.Cuda.Architectures.CudaLfm2MoeTransformerModel.ValidateKvStorage(kvConfig.KeyDType, kvConfig.ValueDType);
+            if (options.UsePaged)
+                Console.WriteLine("[dotllm] Paged KV-cache not supported for CUDA LFM2; using the model's own sparse cache.");
+            kvFactory = (cfg, size) => lfmModel.CreateKvCache(size);
+        }
         else if (model is DotLLM.Cuda.Architectures.CudaNemotronHTransformerModel nemotronHModel)
         {
             // #729: the all-GPU fallback for a partial request on Nemotron-H; sparse attention-only KV.

@@ -681,6 +681,13 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                     Console.Error.WriteLine("WARNING: Paged KV-cache not supported for the CUDA hybrid-dense model, using its own KV cache.");
                 kvFactory = (cfg, size) => qwen35DenseGpu.CreateKvCache(size);
             }
+            else if (model is DotLLM.Cuda.Architectures.CudaLfm2MoeTransformerModel lfmGpu)
+            {
+                DotLLM.Cuda.Architectures.CudaLfm2MoeTransformerModel.ValidateKvStorage(kvConfig.KeyDType, kvConfig.ValueDType, settings.CacheWindow);
+                if (settings.Paged)
+                    Console.Error.WriteLine("WARNING: Paged KV-cache not supported for CUDA LFM2; using the model's own sparse cache.");
+                kvFactory = (cfg, size) => lfmGpu.CreateKvCache(size);
+            }
             else if (model is DotLLM.Cuda.Architectures.CudaNemotronHTransformerModel nemotronHGpu)
             {
                 // #729: all-GPU fallback for a partial request on Nemotron-H (sparse attention-only KV).

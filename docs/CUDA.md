@@ -1218,3 +1218,36 @@ Parity: v2 vs F64 reference max abs error ~1e-5 at seqKv in {1,15,16,17,255,256,
   length: prefill is bound by the weight GEMMs, not attention).
 - **Not done**: fused quantized-KV load (quantized KV still dequantizes to the F16 scratch first);
   group 7/8 would need a smaller Q tile or KV_TILE (smem); no sliding-window / sinks / soft-cap variants.
+
+## LFM2 / LFM2.5 MoE CUDA host (#1032)
+
+`CudaModelLoader.CreateFromGguf` routes `lfm2moe` to
+`CudaLfm2MoeTransformerModel`. The dedicated host implements fused B/C/X short
+convolution with persistent causal history, QK-normalized NeoX GQA attention,
+leading dense SwiGLU FFNs, and sigmoid MoE routing. Expert correction bias affects
+selection only; selected weights use the unbiased sigmoid scores and normalize to
+one. Other CUDA models retain their existing softmax router.
+
+Weights stay in their original quantization on device. Q4_0 embedding lookup reads
+packed weights directly. Dense and routed-expert Q4_0 projections prequantize F32
+activations to Q8_1 once per projection and run packed integer dot products with the
+separately rounded Half scale/sum correction used by CPU execution. This avoids
+expanding expert banks or the tied embedding/head to F16/F32. Other quantization
+types reuse the existing CUDA projection and expert paths. No whole-model speed
+claim has been established for the initial Q4_0 kernel.
+
+The official QAD checkpoint uses Q6_K embedding/head weights. These currently use
+the existing F16 embedding mirror and projection fallback; native Q6_K decode
+optimization and full-checkpoint validation remain follow-up work.
+
+Attention KV storage is sparse by layer and F32. The initial host supports one
+model-owned recurrent sequence and one active KV handle; resuming an overwritten
+handle, batched recurrent sequences and LoRA are rejected. CUDA recurrent snapshots,
+partial offload and CUDA LoRA remain follow-up work.
+
+The official QAD-Q4_0 checkpoint has about 13.6 GB of raw weights and cannot fit the
+local 12 GiB RTX 3060 before scratch/KV allocations. Validation uses small synthetic
+hybrid checkpoints and representative kernel shapes; no full-checkpoint CUDA speed
+or quality result is implied. The committed PTX uses ISA 8.7 / `compute_75`, compiled with CUDA 12.8.93
+and `-fmad=false`, preserving the existing driver compatibility baseline. Local
+validation uses NVIDIA driver 610.88.
