@@ -515,6 +515,13 @@ public sealed unsafe class NemotronHTransformerModel : IModel
             if (!hasDown || !hasUp)
                 throw new InvalidDataException(
                     $"{prefix}: moe_latent_size={latent} but ffn_latent_down/ffn_latent_up are missing.");
+            if (latent > hidden)
+            {
+                // The per-token MoE body sizes its expert-output scratch by the hidden size; a
+                // latent wider than hidden is not a bottleneck and would overrun that scratch.
+                throw new InvalidDataException(
+                    $"{prefix}: moe_latent_size={latent} exceeds the hidden size {hidden}.");
+            }
             if (latentDownDesc!.Shape.Rank != 2 || latentDownDesc.Shape[0] != hidden || latentDownDesc.Shape[1] != latent)
                 throw new InvalidDataException(
                     $"{prefix}.ffn_latent_down.weight has unexpected shape; expected [{hidden},{latent}].");
