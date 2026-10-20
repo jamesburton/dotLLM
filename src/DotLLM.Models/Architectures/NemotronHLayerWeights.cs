@@ -77,6 +77,24 @@ internal sealed class NemotronHMoeWeights
     public required bool NormalizeWeights { get; init; }
     /// <summary>llama.cpp <c>expert_weights_scale</c> — 2.5 in the shipping checkpoint.</summary>
     public required float WeightsScale { get; init; }
+
+    /// <summary>LatentMoE bottleneck width (issue #1037), or 0 when the routed experts read the
+    /// full hidden state. When non-zero, the expert banks are <c>[LatentSize, moeIntermediate, n]</c>
+    /// / <c>[moeIntermediate, LatentSize, n]</c> and the two latent projections below are set.</summary>
+    public int LatentSize { get; init; }
+
+    /// <summary>ffn_latent_down.weight [hiddenSize, LatentSize] — projects the hidden state into the
+    /// latent before the routed experts. Zero when <see cref="LatentSize"/> is 0.</summary>
+    public nint LatentDownWeight { get; init; }
+    public QuantizationType LatentDownQuantType { get; init; }
+
+    /// <summary>ffn_latent_up.weight [LatentSize, hiddenSize] — projects the routed experts'
+    /// weighted sum back to the hidden size. Zero when <see cref="LatentSize"/> is 0.</summary>
+    public nint LatentUpWeight { get; init; }
+    public QuantizationType LatentUpQuantType { get; init; }
+
+    /// <summary>Whether the routed experts run in a latent space (issue #1037).</summary>
+    public bool HasLatent => LatentSize > 0;
 }
 
 /// <summary>

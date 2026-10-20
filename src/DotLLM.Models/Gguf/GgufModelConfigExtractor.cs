@@ -551,10 +551,25 @@ public static partial class GgufModelConfigExtractor
     /// </summary>
     private static MoeConfig ExtractNemotronHMoeConfig(GgufMetadata metadata, string arch, int denseIntermediate)
     {
+        // expert_count is the MAXIMUM routed-expert count. Puzzle derivatives (Nemotron 3.5
+        // Bolt, #1037) vary the count per layer; the loader takes each layer's count from its
+        // expert-bank tensor shape, as llama.cpp does (ffn_up_exps->ne[2]).
         int expertCount = (int)metadata.GetUInt32($"{arch}.expert_count");
-        int expertUsed = (int)metadata.GetUInt32($"{arch}.expert_used_count");
-        int moeIntermediate = (int)metadata.GetUInt32OrDefault(
-            $"{arch}.expert_feed_forward_length", (uint)denseIntermediate);
+
+        // Bolt ships expert_used_count / expert_feed_forward_length as per-layer arrays
+        // (0 on non-MoE layers); Lightning ships scalars. Accept either form.
+        int[]? perLayerUsed = TryGetPerLayerArray(metadata, $"{arch}.expert_used_count");
+        int[]? perLayerInter = TryGetPerLayerArray(metadata, $"{arch}.expert_feed_forward_length");
+        int expertUsed = perLayerUsed is not null
+            ? perLayerUsed.Max()
+            : (int)metadata.GetUInt32($"{arch}.expert_used_count");
+        int moeIntermediate = perLayerInter is not null
+            ? perLayerInter.Max()
+            : (int)metadata.GetUInt32OrDefault($"{arch}.expert_feed_forward_length", (uint)denseIntermediate);
+        if (expertUsed <= 0 || expertUsed > expertCount)
+            throw new InvalidDataException(
+                $"nemotron_h_moe expert_used_count={expertUsed} is out of range for expert_count={expertCount}.");
+        int latentSize = (int)metadata.GetUInt32OrDefault($"{arch}.moe_latent_size", 0);
         int sharedFf = (int)metadata.GetUInt32OrDefault($"{arch}.expert_shared_feed_forward_length", 0);
         int sharedCount = (int)metadata.GetUInt32OrDefault($"{arch}.expert_shared_count", (uint)(sharedFf > 0 ? 1 : 0));
 
@@ -590,7 +605,25 @@ public static partial class GgufModelConfigExtractor
             NormalizeExpertWeights = metadata.GetBoolOrDefault($"{arch}.expert_weights_norm", false),
             ExpertWeightsScale = metadata.GetFloat32OrDefault($"{arch}.expert_weights_scale", 1.0f),
             UngatedReluSquaredExperts = true,
+            PerLayerNumExpertsPerTok = perLayerUsed,
+            PerLayerMoeIntermediateSize = perLayerInter,
+            LatentSize = latentSize,
         };
+    }
+
+    /// <summary>
+    /// Returns the per-layer array stored under <paramref name="key"/>, or <see langword="null"/>
+    /// when the key is absent or scalar. Tolerates the Int32 and UInt32 element encodings.
+    /// </summary>
+    /// <param name="metadata">GGUF metadata.</param>
+    /// <param name="key">Fully-qualified metadata key.</param>
+    /// <returns>The array, or <see langword="null"/> when the key is not an array.</returns>
+    private static int[]? TryGetPerLayerArray(GgufMetadata metadata, string key)
+    {
+        if (!metadata.TryGetValue(key, out var entry) || entry.Type != GgufValueType.Array)
+            return null;
+        int[] values = GetIntArrayOrEmpty(metadata, key);
+        return values.Length > 0 ? values : null;
     }
 
     private static MoeConfig? TryExtractDeepseekMoeConfig(GgufMetadata metadata, string arch,
