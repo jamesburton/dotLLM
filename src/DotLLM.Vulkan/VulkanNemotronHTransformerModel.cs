@@ -600,6 +600,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             ssmSplitXbc,
             submit);
         created._moe = moeKernels;
+        created._denseQ8 = CreateDenseQ8(device, spvDir,
+            maxK: Math.Max(Math.Max(config.HiddenSize, ssm.DInner), Math.Max(config.NumAttentionHeads * config.HeadDim, maxIntermediate)));
         return created;
     }
 
@@ -1193,13 +1195,14 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     {
         int kvStride = numKvHeads * headDim;
 
-        // Q/K/V projections — read NormOutput, write Q/K/V.
+        // Q/K/V projections — read NormOutput, write Q/K/V. One Q8_1 quantize of the decode row serves all three (#1047).
+        bool qkvXq = PrepareDenseQ8(cmdBuf, _state.NormOutput, attnW.QInputDim, seqLen);
         RecordMatmul(cmdBuf, attnW.Q, attnW.QDeviceQuantType, _state.NormOutput, _state.Q,
-            outputDim: attnW.QOutputDim, inputDim: attnW.QInputDim, seqLen: seqLen);
+            outputDim: attnW.QOutputDim, inputDim: attnW.QInputDim, seqLen: seqLen, xqReady: qkvXq);
         RecordMatmul(cmdBuf, attnW.K, attnW.KDeviceQuantType, _state.NormOutput, _state.K,
-            outputDim: attnW.KOutputDim, inputDim: attnW.KInputDim, seqLen: seqLen);
+            outputDim: attnW.KOutputDim, inputDim: attnW.KInputDim, seqLen: seqLen, xqReady: qkvXq);
         RecordMatmul(cmdBuf, attnW.V, attnW.VDeviceQuantType, _state.NormOutput, _state.V,
-            outputDim: attnW.VOutputDim, inputDim: attnW.VInputDim, seqLen: seqLen);
+            outputDim: attnW.VOutputDim, inputDim: attnW.VInputDim, seqLen: seqLen, xqReady: qkvXq);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // NO position encoding here (issue #372): llama.cpp's nemotron-h.cpp and HF's
@@ -1532,14 +1535,16 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         var expertIn = latent ? _state.MoeLatentIn! : _state.NormOutput;
         var routedOut = latent ? _state.MoeLatentOut! : _state.NormOutput;
 
-        // Independent readers of NormOutput: shared-expert up, the router and (LatentMoE) latent_down.
+        // Independent readers of NormOutput: shared-expert up, the router and (LatentMoE) latent_down. One Q8_1 quantize of a decode row
+        // serves the Q8_0 ones (#1047).
+        bool normXq = PrepareDenseQ8(cmdBuf, _state.NormOutput, hidden, seqLen);
         RecordMatmul(cmdBuf, m.SharedUp, m.SharedUpDeviceQuantType, _state.NormOutput, _state.FfnIntermediate,
-            outputDim: sharedInter, inputDim: hidden, seqLen: seqLen);
+            outputDim: sharedInter, inputDim: hidden, seqLen: seqLen, xqReady: normXq);
         RecordMatmul(cmdBuf, m.Router, m.RouterDeviceQuantType, _state.NormOutput, _state.MoeRouterLogits!,
             outputDim: numE, inputDim: hidden, seqLen: seqLen);
         if (latent)
             RecordMatmul(cmdBuf, m.LatentDown!, m.LatentDownDeviceQuantType, _state.NormOutput, _state.MoeLatentIn!,
-                outputDim: m.LatentSize, inputDim: hidden, seqLen: seqLen);
+                outputDim: m.LatentSize, inputDim: hidden, seqLen: seqLen, xqReady: normXq);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         _reluSquared.Record(cmdBuf, _state.FfnIntermediate, n: seqLen * sharedInter);
@@ -1771,6 +1776,63 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         }
     }
 
+    /// <summary>
+    /// Single-row Q8_0 projections on the dp4a MMVQ GEMV (#1047): the activation row is quantized to Q8_1 once into a model-owned scratch and
+    /// every Q8_0 decode projection reads it through integer dot products, the way the Qwen3-MoE host's decode does. Nemotron 3.5 Bolt keeps
+    /// every dense projection in Q8_0 (SSM in/out, attention, shared expert, latent down/up, LM head), so this is most of its decode traffic.
+    /// </summary>
+    private sealed class DenseQ8 : IDisposable
+    {
+        public required MatMulQ8_0MmvqKernel Mmvq { get; init; }
+        public required QuantizeQ8_1RowsKernel Quantize { get; init; }
+        public required VulkanDevice.Buffer Xq { get; init; }
+        public required VulkanDevice.Buffer Xds { get; init; }
+        public required int MaxK { get; init; }
+
+        public void Invalidate() { Mmvq.InvalidateDescriptorCache(); Quantize.InvalidateDescriptorCache(); }
+
+        public void Dispose() { Mmvq.Dispose(); Quantize.Dispose(); Xq.Dispose(); Xds.Dispose(); }
+    }
+
+    private DenseQ8? _denseQ8;
+
+    /// <summary><c>DOTLLM_VK_NEMOTRON_Q8_MMVQ=0</c> keeps single-row Q8_0 projections on the F32-activation GEMV (#1047).</summary>
+    internal static bool DenseQ8MmvqEnabled { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_VK_NEMOTRON_Q8_MMVQ") != "0";
+
+    /// <summary>Single-row Q8_0 projections recorded on the dp4a MMVQ GEMV since the last reset; read by tests to prove the arm ran.</summary>
+    internal static long DenseQ8MmvqCalls;
+
+    private static DenseQ8? CreateDenseQ8(VulkanDevice device, string spvDir, int maxK)
+    {
+        if (!DenseQ8MmvqEnabled) return null;
+        var mmvq = MatMulQ8_0MmvqKernel.TryCreate(device, spvDir);
+        if (mmvq is null) return null;
+        var quant = QuantizeQ8_1RowsKernel.TryCreate(device, spvDir);
+        if (quant is null) { mmvq.Dispose(); return null; }
+        int k = (maxK + 31) / 32 * 32;
+        return new DenseQ8
+        {
+            Mmvq = mmvq, Quantize = quant, MaxK = k,
+            Xq = device.AllocateDeviceLocal(QuantizeQ8_1RowsKernel.PackedBytes(1, k)),
+            Xds = device.AllocateDeviceLocal(QuantizeQ8_1RowsKernel.ScaleBytes(1, k)),
+        };
+    }
+
+    /// <summary>
+    /// Quantizes a single activation row into the dense Q8_1 scratch when the next Q8_0 projections of it will take the MMVQ GEMV; one call
+    /// serves every projection that shares the input (pass <c>xqReady: true</c> to <see cref="RecordMatmul"/>). The leading barrier retires
+    /// the previous readers of the scratch. Returns false (nothing recorded) when the MMVQ arm does not apply.
+    /// </summary>
+    private bool PrepareDenseQ8(nint cmdBuf, VulkanDevice.Buffer input, int inputDim, int seqLen)
+    {
+        if (seqLen != 1 || _denseQ8 is not { } dq || (inputDim & 31) != 0 || inputDim > dq.MaxK) return false;
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        dq.Quantize.Record(cmdBuf, input, dq.Xq, dq.Xds, n: 1, k: inputDim);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        return true;
+    }
+
     private void InvalidateKernelCaches()
     {
         _matmul.InvalidateDescriptorCache();
@@ -1829,6 +1891,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _reluSquared.InvalidateDescriptorCache();
         _ssmSplitXbc.InvalidateDescriptorCache();
         _moe?.Invalidate();
+        _denseQ8?.Invalidate();
     }
 
     /// <summary>
@@ -1849,11 +1912,16 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         nint cmdBuf,
         VulkanDevice.Buffer weights, QuantizationType weightQt,
         VulkanDevice.Buffer input, VulkanDevice.Buffer output,
-        int outputDim, int inputDim, int seqLen)
+        int outputDim, int inputDim, int seqLen, bool xqReady = false)
     {
         if (weightQt == QuantizationType.Q8_0)
         {
-            if (seqLen == 1)
+            if (seqLen == 1 && _denseQ8 is { } dq && (xqReady || PrepareDenseQ8(cmdBuf, input, inputDim, seqLen)))
+            {
+                Interlocked.Increment(ref DenseQ8MmvqCalls);
+                dq.Mmvq.Record(cmdBuf, weights, dq.Xq, dq.Xds, output, m: outputDim, k: inputDim);
+            }
+            else if (seqLen == 1)
             {
                 _matmulQ8.Record(cmdBuf, weights, input, output,
                     m: outputDim, k: inputDim);
@@ -2146,6 +2214,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _cpuModel?.Dispose();
 
         _moe?.Dispose();
+        _denseQ8?.Dispose();
         _ssmSplitXbc.Dispose();
         _reluSquared.Dispose();
         _groupRmsNorm.Dispose();
