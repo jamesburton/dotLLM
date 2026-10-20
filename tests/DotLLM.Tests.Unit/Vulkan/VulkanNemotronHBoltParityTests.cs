@@ -4,6 +4,7 @@ using DotLLM.Core.Models;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Models.Architectures;
 using DotLLM.Vulkan;
+using DotLLM.Vulkan.Kernels;
 using Architecture = DotLLM.Core.Configuration.Architecture;
 using Xunit;
 
@@ -39,6 +40,18 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         new(Experts: 4, TopK: 2, Inter: 256, Latent: 0, UpQt: QuantizationType.Q4_K, DownQt: QuantizationType.Q5_K),
     ];
 
+    /// <summary>
+    /// #1057: the same per-layer geometry with IQ2_XXS banks, the routed-expert type of NVIDIA's official Bolt GGUF. Layer 2 pairs an IQ2_XXS
+    /// up bank with a Q8_0 down bank, so the kernel is chosen per bank and that layer stays indexed under the grouped prefill.
+    /// </summary>
+    private static readonly LayerSpec[] IqLayers =
+    [
+        new(Experts: 4, TopK: 2, Inter: 512, Latent: Latent, UpQt: QuantizationType.IQ2_XXS, DownQt: QuantizationType.IQ2_XXS),
+        new(Experts: 6, TopK: 3, Inter: 256, Latent: Latent, UpQt: QuantizationType.IQ2_XXS, DownQt: QuantizationType.IQ2_XXS),
+        new(Experts: 5, TopK: 1, Inter: 256, Latent: 0, UpQt: QuantizationType.IQ2_XXS, DownQt: QuantizationType.Q8_0),
+        new(Experts: 4, TopK: 2, Inter: 256, Latent: 0, UpQt: QuantizationType.IQ2_XXS, DownQt: QuantizationType.IQ2_XXS),
+    ];
+
     // 20 rows: at the grouped-prefill threshold (16) and enough that experts receive zero, one and many routed rows.
     private static readonly int[] Tokens = [3, 9, 1, 14, 6, 0, 11, 5, 15, 2, 8, 12, 7, 4, 13, 10, 3, 9, 6, 1];
     private static readonly int[] Positions = [.. Enumerable.Range(0, 20)];
@@ -64,34 +77,14 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         using var device = VulkanDevice.Create();
         Skip.If(mmvq && !device.HasIntegerDotProduct, "device lacks integer dot product");
 
-        using var fx = new Fixture(zeroBias: false);
-        float[] cpu = fx.Cpu(Tokens, Positions);
-        float[] exact = fx.Reference(Tokens);
-        float[] cpuNoBias;
-        using (var noBias = new Fixture(zeroBias: true)) cpuNoBias = noBias.Cpu(Tokens, Positions);
-
-        // Control: the fixture must be sensitive to the selection bias, or "matches CPU" proves nothing about the routing.
-        float control = MaxDiff(cpu, cpuNoBias);
-        Assert.True(control > 0.05f, $"fixture insensitive to the selection bias (max logit delta {control:E3})");
-        float cpuVsExact = MaxDiff(exact, cpu);
-        Assert.True(cpuVsExact * 4 < control, $"CPU oracle vs reference {cpuVsExact:E3} is not small against the bias effect {control:E3}");
-
-        bool saved = VulkanNemotronHTransformerModel.MoeMmvqEnabled, savedGrouped = VulkanNemotronHTransformerModel.MoeGroupedEnabled;
-        VulkanNemotronHTransformerModel.MoeMmvqEnabled = mmvq;
-        VulkanNemotronHTransformerModel.MoeGroupedEnabled = grouped;
-        bool savedXDiv = VulkanNemotronHTransformerModel.MoeXDivEnabled;
-        VulkanNemotronHTransformerModel.MoeXDivEnabled = xdiv;
-        VulkanNemotronHTransformerModel.MoePathCounters.Reset();
-        try
+        RunParity(device, spvDir, Layers, mmvq, grouped, xdiv, () =>
         {
-            float[] vk = fx.Vulkan(device, spvDir, Tokens, Positions);
             long viaMmvq = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.Mmvq);
             long viaF32 = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.F32Indexed);
             long viaMmq = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.GroupedMmq);
             long viaCoopmat = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.GroupedCoopmat);
             long viaXDiv = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.XDivUp);
             long viaMr = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.MultiRowUp);
-            output.WriteLine($"paths: mmvq={viaMmvq} f32={viaF32} groupedMmq={viaMmq} groupedCoopmat={viaCoopmat} xdivUp={viaXDiv} multiRowUp={viaMr}");
             if (!grouped && mmvq && xdiv && device.HasIntegerDotProduct)
             {
                 // Every layer's up bank is a K-quant: all four take the xDiv MMVQ; layers 0 (Q4_K), 2 (Q5_K) and 3 (Q4_K) the multi-row kernel,
@@ -117,6 +110,90 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
                 if (mmvq) Assert.True(viaMmvq > 0 && viaF32 == 0, $"MMVQ arm did not run for every bank (mmvq={viaMmvq}, f32={viaF32})");
                 else Assert.True(viaF32 > 0 && viaMmvq == 0, $"F32 indexed arm did not run for every bank (mmvq={viaMmvq}, f32={viaF32})");
             }
+            Assert.Equal(0, Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.IqMmvq));
+        });
+    }
+
+    /// <summary>
+    /// #1057: IQ2_XXS routed banks (NVIDIA's official Bolt GGUF) on every arm. IQ banks have no F32-activation indexed kernel, so they stay
+    /// on the dp4a MMVQ even with <c>MoeMmvqEnabled</c> off (only the Q8_0 down bank of layer 2 moves to the F32 arm); the grouped prefill
+    /// takes the IQ coopmat kernels where the device has them.
+    /// </summary>
+    /// <param name="mmvq">The K-quant / legacy MMVQ switch (IQ banks ignore it).</param>
+    /// <param name="grouped">Expert-grouped prefill (#1046) for the batched forward.</param>
+    /// <param name="xdiv">IQ up projections read the per-token rows (xDiv = topK) instead of a topK-fold broadcast.</param>
+    [SkippableTheory]
+    [InlineData(true, false, true)]
+    [InlineData(true, false, false)]
+    [InlineData(false, false, true)]
+    [InlineData(true, true, true)]
+    public void Forward_BoltIq2XxsBanks_MatchesCpuAndReference(bool mmvq, bool grouped, bool xdiv)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        Skip.If(!device.HasIntegerDotProduct, "IQ expert banks need integer dot product (the host refuses them otherwise)");
+        bool iqGrouped = MoeGroupedMatmulIqCoopmatKernel.IsSupportedOn(device, spvDir, MoeIqQuant.IQ2_XXS);
+
+        RunParity(device, spvDir, IqLayers, mmvq, grouped, xdiv, () =>
+        {
+            long viaIq = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.IqMmvq);
+            long viaF32 = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.F32Indexed);
+            long viaXDiv = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.XDivUp);
+            long viaGroupedIq = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.GroupedIqCoopmat);
+            long viaMmq = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.GroupedMmq);
+            Assert.Equal(0, viaMmq);
+            if (grouped && iqGrouped)
+            {
+                // Layers 0, 1 and 3 (IQ2_XXS up and down) take the grouped IQ coopmat; layer 2 (Q8_0 down) stays indexed: one IQ MMVQ up.
+                Assert.Equal(3, viaGroupedIq);
+                Assert.Equal(1, viaIq);
+            }
+            else
+            {
+                Assert.Equal(0, viaGroupedIq);
+                // Four IQ up projections and three IQ down projections, on MMVQ whatever the K-quant switch says.
+                Assert.Equal(7, viaIq);
+                Assert.Equal(xdiv ? 4 : 0, viaXDiv);
+                // Only layer 2's Q8_0 down bank follows the switch to the F32-activation arm.
+                Assert.Equal(mmvq ? 0 : 1, viaF32);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Builds the fixture for <paramref name="specs"/>, checks it is sensitive to the selection bias, runs the batched Vulkan forward with the
+    /// given arm switches, lets <paramref name="assertPaths"/> check the path counters of that one forward, then holds the batched and the
+    /// single-token Vulkan logits to the double-precision reference and to the CPU forward.
+    /// </summary>
+    private void RunParity(VulkanDevice device, string spvDir, LayerSpec[] specs, bool mmvq, bool grouped, bool xdiv, Action assertPaths)
+    {
+        using var fx = new Fixture(zeroBias: false, specs);
+        float[] cpu = fx.Cpu(Tokens, Positions);
+        float[] exact = fx.Reference(Tokens);
+        float[] cpuNoBias;
+        using (var noBias = new Fixture(zeroBias: true, specs)) cpuNoBias = noBias.Cpu(Tokens, Positions);
+
+        // Control: the fixture must be sensitive to the selection bias, or "matches CPU" proves nothing about the routing.
+        float control = MaxDiff(cpu, cpuNoBias);
+        Assert.True(control > 0.05f, $"fixture insensitive to the selection bias (max logit delta {control:E3})");
+        float cpuVsExact = MaxDiff(exact, cpu);
+        Assert.True(cpuVsExact * 4 < control, $"CPU oracle vs reference {cpuVsExact:E3} is not small against the bias effect {control:E3}");
+
+        bool saved = VulkanNemotronHTransformerModel.MoeMmvqEnabled, savedGrouped = VulkanNemotronHTransformerModel.MoeGroupedEnabled;
+        VulkanNemotronHTransformerModel.MoeMmvqEnabled = mmvq;
+        VulkanNemotronHTransformerModel.MoeGroupedEnabled = grouped;
+        bool savedXDiv = VulkanNemotronHTransformerModel.MoeXDivEnabled;
+        VulkanNemotronHTransformerModel.MoeXDivEnabled = xdiv;
+        VulkanNemotronHTransformerModel.MoePathCounters.Reset();
+        try
+        {
+            float[] vk = fx.Vulkan(device, spvDir, Tokens, Positions);
+            output.WriteLine(
+                $"paths: mmvq={VulkanNemotronHTransformerModel.MoePathCounters.Mmvq} f32={VulkanNemotronHTransformerModel.MoePathCounters.F32Indexed} " +
+                $"groupedMmq={VulkanNemotronHTransformerModel.MoePathCounters.GroupedMmq} groupedCoopmat={VulkanNemotronHTransformerModel.MoePathCounters.GroupedCoopmat} " +
+                $"groupedIq={VulkanNemotronHTransformerModel.MoePathCounters.GroupedIqCoopmat} iqMmvq={VulkanNemotronHTransformerModel.MoePathCounters.IqMmvq} " +
+                $"xdivUp={VulkanNemotronHTransformerModel.MoePathCounters.XDivUp} multiRowUp={VulkanNemotronHTransformerModel.MoePathCounters.MultiRowUp}");
+            assertPaths();
 
             // Single-token forwards (the decode dispatch shapes) must agree with the batched forward row for row: the model has no
             // attention or SSM layer, so every row is independent.
@@ -130,8 +207,9 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
             // Both arms are held to the double-precision reference. The F32-activation arm is exact up to F32 / F16-GEMM rounding; the dp4a
             // arm rounds every expert activation to int8 per 32-block, which relu^2 and the x5 routing scale amplify (measured ~0.05 on
             // logits of this fixture; the CPU oracle, which quantizes its K-quant dot activations to Q8_K, sits ~0.5 from the reference).
-            // The grouped kernels round activations to Q8_1 (MMQ) or F16 (coopmat): the dp4a tolerance.
-            float tol = mmvq || grouped ? 0.1f : 5e-3f;
+            // The grouped kernels round activations to Q8_1 (MMQ) or F16 (coopmat): the dp4a tolerance. So do IQ banks on every arm (#1057).
+            bool iqBanks = specs.Any(s => s.UpQt == QuantizationType.IQ2_XXS || s.DownQt == QuantizationType.IQ2_XXS);
+            float tol = mmvq || grouped || iqBanks ? 0.1f : 5e-3f;
             Assert.True(tol * 10 < control, $"tolerance {tol} is not small against the bias effect {control:E3}");
             Assert.True(vsExact <= tol, $"max |reference - vulkan(batched, mmvq={mmvq})| = {vsExact:E3} > {tol}");
             Assert.True(rowsVsExact <= tol, $"max |reference - vulkan(single-token, mmvq={mmvq})| = {rowsVsExact:E3} > {tol}");
@@ -151,7 +229,7 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
-        using var fx = new Fixture(zeroBias: false);
+        using var fx = new Fixture(zeroBias: false, Layers);
         float[] plain = fx.Vulkan(device, spvDir, Tokens, Positions, profile: false, out var none);
         float[] profiled = fx.Vulkan(device, spvDir, Tokens, Positions, profile: true, out var report);
         Assert.Null(none);
@@ -173,23 +251,25 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         return worst;
     }
 
-    /// <summary>Three Bolt-shaped nemotron_h_moe layers from random weights, shared by the CPU oracle, the reference and the Vulkan model.</summary>
+    /// <summary>Bolt-shaped nemotron_h_moe layers from random weights, shared by the CPU oracle, the reference and the Vulkan model.</summary>
     private sealed unsafe class Fixture : IDisposable
     {
         private readonly float[] _embed, _outNorm, _wOut;
         private readonly List<GCHandle> _pins = [];
+        private readonly LayerSpec[] _specs;
         private readonly NemotronHLayerWeights[] _layers;
         private readonly ModelConfig _config;
 
-        public Fixture(bool zeroBias)
+        public Fixture(bool zeroBias, LayerSpec[] specs)
         {
+            _specs = specs;
             var rng = new Random(1045);
             _embed = Rand(rng, Vocab * Hidden, 0.5f);
             _outNorm = RandPos(rng, Hidden);
             _wOut = Rand(rng, Vocab * Hidden, 0.08f);
-            _layers = new NemotronHLayerWeights[Layers.Length];
-            for (int l = 0; l < Layers.Length; l++)
-                _layers[l] = BuildLayer(rng, Layers[l], zeroBias);
+            _layers = new NemotronHLayerWeights[specs.Length];
+            for (int l = 0; l < specs.Length; l++)
+                _layers[l] = BuildLayer(rng, specs[l], zeroBias);
 
             _config = new ModelConfig
             {
@@ -197,7 +277,7 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
                 VocabSize = Vocab,
                 HiddenSize = Hidden,
                 IntermediateSize = 512,
-                NumLayers = Layers.Length,
+                NumLayers = _specs.Length,
                 NumAttentionHeads = 1,
                 NumKvHeads = 1,
                 HeadDim = Hidden,
@@ -210,9 +290,9 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
                 TiedEmbeddings = false,
                 HybridLayout = new HybridLayerLayout
                 {
-                    LayerKind = [.. Layers.Select(_ => HybridLayerKind.Ffn)],
-                    HeadCountKv = [.. Layers.Select(_ => 0)],
-                    FeedForwardLength = [.. Layers.Select(s => s.Inter)],
+                    LayerKind = [.. _specs.Select(_ => HybridLayerKind.Ffn)],
+                    HeadCountKv = [.. _specs.Select(_ => 0)],
+                    FeedForwardLength = [.. _specs.Select(s => s.Inter)],
                 },
                 SsmConfig = new MambaSsmConfig(DConv: 4, DInner: 8, DState: 4, NGroup: 1, NHead: 1),
                 ChatTemplate = null,
@@ -256,7 +336,7 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
                 for (int i = 0; i < Hidden; i++) x[i] = _embed[tok * Hidden + i];
                 for (int l = 0; l < _layers.Length; l++)
                 {
-                    var spec = Layers[l];
+                    var spec = _specs[l];
                     var moe = _layers[l].Moe!;
                     int n = spec.Experts, topK = spec.TopK, ff = spec.Inter, ed = spec.ExpertDim;
                     double[] h = RmsNorm(x, _layers[l].AttnNormWeight);
@@ -306,15 +386,15 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
             // Bias of the order of the sigmoid probabilities' spread, so it flips top-k for a good share of tokens.
             float[] bias = new float[n];
             for (int e = 0; e < n; e++) bias[e] = zeroBias ? 0f : (e % 2 == 0 ? 1 : -1) * (0.05f + 0.15f * e);
-            nint up = PinBytes(QuantBank(Rand(rng, n * ff * ed, 0.12f), n * ff, ed, spec.UpQt), out long upBytes);
-            nint down = PinBytes(QuantBank(Rand(rng, n * ed * ff, 0.06f), n * ed, ff, spec.DownQt), out long downBytes);
-            nint shUp = PinBytes(QuantBank(Rand(rng, SharedInter * Hidden, 0.08f), SharedInter, Hidden, QuantizationType.Q8_0), out _);
-            nint shDown = PinBytes(QuantBank(Rand(rng, Hidden * SharedInter, 0.2f), Hidden, SharedInter, QuantizationType.Q8_0), out _);
+            nint up = PinBytes(QuantBank(rng, n * ff, ed, 0.12f, spec.UpQt), out long upBytes);
+            nint down = PinBytes(QuantBank(rng, n * ed, ff, 0.06f, spec.DownQt), out long downBytes);
+            nint shUp = PinBytes(QuantBank(rng, SharedInter, Hidden, 0.08f, QuantizationType.Q8_0), out _);
+            nint shDown = PinBytes(QuantBank(rng, Hidden, SharedInter, 0.2f, QuantizationType.Q8_0), out _);
             nint latDown = 0, latUp = 0;
             if (spec.Latent > 0)
             {
-                latDown = PinBytes(QuantBank(Rand(rng, spec.Latent * Hidden, 0.1f), spec.Latent, Hidden, QuantizationType.Q8_0), out _);
-                latUp = PinBytes(QuantBank(Rand(rng, Hidden * spec.Latent, 0.1f), Hidden, spec.Latent, QuantizationType.Q8_0), out _);
+                latDown = PinBytes(QuantBank(rng, spec.Latent, Hidden, 0.1f, QuantizationType.Q8_0), out _);
+                latUp = PinBytes(QuantBank(rng, Hidden, spec.Latent, 0.1f, QuantizationType.Q8_0), out _);
             }
             return new NemotronHLayerWeights
             {
@@ -340,13 +420,24 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
             };
         }
 
-        private static byte[] QuantBank(float[] values, int rows, int cols, QuantizationType qt) => qt switch
+        /// <summary>
+        /// A <c>[rows, cols]</c> bank of type <paramref name="qt"/> with weights of magnitude about <paramref name="scale"/> / 2: uniform values
+        /// in [-scale, scale] quantized, or (IQ2_XXS, which has no fast quantizer) random valid blocks of the same mean magnitude (#1057).
+        /// </summary>
+        private static byte[] QuantBank(Random rng, int rows, int cols, float scale, QuantizationType qt)
         {
-            QuantizationType.Q4_K => Q4KFixture.QuantizeRows(values, rows, cols),
-            QuantizationType.Q5_K => Q5KFixture.QuantizeRows(values, rows, cols),
-            QuantizationType.Q6_K => Q6KFixture.QuantizeRows(values, rows, cols),
-            _ => QuantRows(values, rows, cols, qt),
-        };
+            // IQ2_XXS weights average about 50 x d (Iq2Fixture.QuantizeRowsIq2XxsFast); d averages 0.6 x dMax.
+            if (qt == QuantizationType.IQ2_XXS)
+                return Iq2Fixture.QuantizeRowsIq2XxsFast(rng, rows, cols, dMax: scale / 2 / 50 / 0.6f);
+            float[] values = Rand(rng, rows * cols, scale);
+            return qt switch
+            {
+                QuantizationType.Q4_K => Q4KFixture.QuantizeRows(values, rows, cols),
+                QuantizationType.Q5_K => Q5KFixture.QuantizeRows(values, rows, cols),
+                QuantizationType.Q6_K => Q6KFixture.QuantizeRows(values, rows, cols),
+                _ => QuantRows(values, rows, cols, qt),
+            };
+        }
 
         private static byte[] QuantRows(float[] values, int rows, int cols, QuantizationType qt)
         {
