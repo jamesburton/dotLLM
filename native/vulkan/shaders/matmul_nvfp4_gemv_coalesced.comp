@@ -1,0 +1,107 @@
+#version 450
+#extension GL_GOOGLE_include_directive       : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes    : require
+// NVFP4 decode GEMV, coalesced and multi-row (issue #1066; layout after matmul_q8_0_coalesced.comp, #471).
+//
+//   y[m] = scale * sum_k W_nvfp4[m, k] * x[k]          (FP32 x and y; no activation quantization)
+//
+// matmul_nvfp4_f32_gemv.comp (#1038) maps one 128-thread workgroup to a row and one lane to a whole 36-byte block: at Bolt's
+// ssm_in K = 4096 (64 blocks) half the lanes idle, the lanes of a wave read words 36 bytes apart, x is read one float at a time and
+// the row ends in a 7-step shared-memory tree. Here:
+//   * lane L owns sub-block (L & 3) of block (L >> 2) of a WINDOW of 16 blocks: a wave reads 16 contiguous blocks (576 bytes) per row
+//     per step, each lane two qs words, and the scale word is read uniformly by a block's four lanes;
+//   * the lane's 16 activations are four 16-byte loads, reused for ROWS weight rows (x is read once per ROWS rows);
+//   * each row reduces with one subgroupAdd (plus a shared pass when the 64-thread workgroup spans two 32-wide subgroups).
+// The per-tensor X.scale multiplies the F32 sum once; nothing is ever rounded below F32.
+//
+// Element order (nvfp4_decode.glsl): sub-block s owns qs words 1+2s (bytes 8s..8s+3) and 2+2s (bytes 8s+4..8s+7); byte j gives
+// element 16s+j (low nibble) and 16s+8+j (high nibble). So the low nibbles of word 1+2s are elements 0..3 of the sub-block, of word
+// 2+2s elements 4..7, and the high nibbles elements 8..11 and 12..15: exactly four consecutive vec4 of x.
+//
+// Dispatch: ceil(M / ROWS) workgroups of 64 threads.
+
+#ifndef ROWS
+#define ROWS 2u
+#endif
+#define WG_SIZE 64u
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint weight[]; };  // NVFP4 blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { vec4 x4[]; };      // [K/4]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };      // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint  M;
+    uint  K;             // multiple of 64
+    uint  blocksPerRow;  // K / 64
+    float scale;         // per-tensor X.scale
+} pc;
+
+#include "nvfp4_decode.glsl"
+
+const uint WINDOW_BLOCKS = WG_SIZE / 4u;
+
+// The four nibbles at bits 0..3 of each byte of `u`, decoded (doubled E2M1), byte 0 first.
+vec4 decode4(uint u) {
+    return vec4(e2m1Doubled(u & 0xFu), e2m1Doubled((u >> 8u) & 0xFu), e2m1Doubled((u >> 16u) & 0xFu), e2m1Doubled((u >> 24u) & 0xFu));
+}
+
+shared float partials[ROWS * (WG_SIZE / 8u)];   // room for subgroups as narrow as 8
+
+void main() {
+    uint row0 = gl_WorkGroupID.x * ROWS;
+    uint lane = gl_LocalInvocationID.x;
+    uint blockInWindow = lane >> 2u;
+    uint s = lane & 3u;
+
+    float acc[ROWS];
+    [[unroll]] for (uint r = 0u; r < ROWS; r++) acc[r] = 0.0;
+
+    for (uint w0 = 0u; w0 < pc.blocksPerRow; w0 += WINDOW_BLOCKS) {
+        uint blk = w0 + blockInWindow;
+        if (blk >= pc.blocksPerRow)
+            continue;
+
+        uint xi = blk * 16u + 4u * s;           // vec4 index of element 16s of the block
+        vec4 x0 = x4[xi], x1 = x4[xi + 1u], x2 = x4[xi + 2u], x3 = x4[xi + 3u];
+
+        [[unroll]] for (uint r = 0u; r < ROWS; r++) {
+            uint m = row0 + r;
+            if (m >= pc.M)
+                break;
+            uint base = (m * pc.blocksPerRow + blk) * NVFP4_BLOCK_UINTS;
+            float d = ue4m3_half((weight[base] >> (8u * s)) & 0xFFu);
+            uint q0 = weight[base + 1u + 2u * s];
+            uint q1 = weight[base + 2u + 2u * s];
+            acc[r] += d * (dot(decode4(q0), x0) + dot(decode4(q1), x1)
+                         + dot(decode4(q0 >> 4u), x2) + dot(decode4(q1 >> 4u), x3));
+        }
+    }
+
+    float sums[ROWS];
+    [[unroll]] for (uint r = 0u; r < ROWS; r++) sums[r] = subgroupAdd(acc[r]);
+
+    if (gl_NumSubgroups == 1u) {
+        if (subgroupElect()) {
+            [[unroll]] for (uint r = 0u; r < ROWS; r++)
+                if (row0 + r < pc.M) y[row0 + r] = sums[r] * pc.scale;
+        }
+        return;
+    }
+
+    if (subgroupElect()) {
+        [[unroll]] for (uint r = 0u; r < ROWS; r++) partials[r * gl_NumSubgroups + gl_SubgroupID] = sums[r];
+    }
+    barrier();
+    if (lane == 0u) {
+        [[unroll]] for (uint r = 0u; r < ROWS; r++) {
+            if (row0 + r >= pc.M) break;
+            float total = 0.0;
+            for (uint i = 0u; i < gl_NumSubgroups; i++) total += partials[r * gl_NumSubgroups + i];
+            y[row0 + r] = total * pc.scale;
+        }
+    }
+}
