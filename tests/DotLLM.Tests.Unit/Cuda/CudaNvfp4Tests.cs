@@ -163,6 +163,40 @@ public sealed unsafe class CudaNvfp4Tests : IDisposable
         }
     }
 
+    /// <summary>
+    /// The measured decode-kernel choice (#1061): under <see cref="Nvfp4DecodeGemv.Auto"/>, Bolt's SSM projections
+    /// (18.9 and 42.8 MB of weights) take the dp4a GEMV and launch-bound small weights keep the FP32 one; the
+    /// explicit modes override it both ways.
+    /// </summary>
+    [SkippableFact]
+    public void UseNvfp4Dp4a_AutoPicksDp4aForLargeWeightsOnly_ModesOverride()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        using var context = CudaContext.Create(0);
+        using var kernels = new CudaKernels(ResolvePtxDir());
+        Assert.True(kernels.HasNvfp4Dp4a, "NVFP4 dp4a kernels not loaded");
+
+        Nvfp4DecodeGemv was = CudaKernels.Nvfp4DecodeGemvMode;
+        try
+        {
+            CudaKernels.Nvfp4DecodeGemvMode = Nvfp4DecodeGemv.Auto;
+            Assert.True(kernels.UseNvfp4Dp4a(18560, 4096));    // Bolt ssm_in, 42.8 MB
+            Assert.True(kernels.UseNvfp4Dp4a(4096, 8192));     // Bolt ssm_out, 18.9 MB
+            Assert.True(kernels.UseNvfp4Dp4a(2048, 4096));     // 4.7 MB: measured 1.47x
+            Assert.False(kernels.UseNvfp4Dp4a(1024, 4096));    // 2.4 MB: measured 0.88x
+            Assert.False(kernels.UseNvfp4Dp4a(1024, 1024));    // 0.6 MB: measured 0.51x
+
+            CudaKernels.Nvfp4DecodeGemvMode = Nvfp4DecodeGemv.Dp4a;
+            Assert.True(kernels.UseNvfp4Dp4a(1024, 1024));
+            CudaKernels.Nvfp4DecodeGemvMode = Nvfp4DecodeGemv.F32;
+            Assert.False(kernels.UseNvfp4Dp4a(18560, 4096));
+        }
+        finally
+        {
+            CudaKernels.Nvfp4DecodeGemvMode = was;
+        }
+    }
+
     [SkippableFact]
     public void ScaleInplace_MultipliesEveryElement()
     {
