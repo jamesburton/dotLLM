@@ -45,7 +45,20 @@ public sealed class NemotronHNvfp4SsmTests : IDisposable
 
         /// <summary>Nvfp4Scaled plus an NVFP4 output head with an output.scale this model does not apply.</summary>
         ScaledNvfp4OutputHead,
+
+        /// <summary>
+        /// The same model as <see cref="Nvfp4Scaled"/> at Bolt's magnitudes: UE4M3 sub-block scales 256x larger
+        /// (Bolt's are around 0x62), SSM input norms 16x larger, and X.scale smaller by the same 4096x, so the
+        /// unscaled GEMM output (before X.scale) is far beyond FP16 range while the scaled output is unchanged.
+        /// </summary>
+        Nvfp4ScaledBoltMagnitude,
     }
+
+    /// <summary>Factor by which <see cref="Variant.Nvfp4ScaledBoltMagnitude"/> raises the UE4M3 sub-block scales.</summary>
+    private const int BoltUe4m3Boost = 256;     // +8 on the UE4M3 exponent
+
+    /// <summary>Factor by which <see cref="Variant.Nvfp4ScaledBoltMagnitude"/> raises the SSM input norm weights.</summary>
+    private const float BoltNormBoost = 16f;
 
     private readonly string _scratch;
 
@@ -61,11 +74,12 @@ public sealed class NemotronHNvfp4SsmTests : IDisposable
     }
 
     [Theory]
-    [InlineData(1)]
-    [InlineData(4)]
-    public void Forward_Nvfp4ScaledSsm_MatchesF32ScaledDequantReference(int threads)
+    [InlineData(1, Variant.Nvfp4Scaled)]
+    [InlineData(4, Variant.Nvfp4Scaled)]
+    [InlineData(1, Variant.Nvfp4ScaledBoltMagnitude)] // the same model at Bolt magnitudes (pins the variant the CUDA test uses)
+    public void Forward_Nvfp4ScaledSsm_MatchesF32ScaledDequantReference(int threads, Variant variant)
     {
-        float[] nv = Logits(WriteFixture(Variant.Nvfp4Scaled), threads);
+        float[] nv = Logits(WriteFixture(variant), threads);
         float[] f32 = Logits(WriteFixture(Variant.F32Reference), threads);
 
         float maxAbs = f32.Max(MathF.Abs);
@@ -253,14 +267,14 @@ public sealed class NemotronHNvfp4SsmTests : IDisposable
         for (int l = 0; l < 2; l++)
         {
             string p = $"blk.{l}";
-            F32(g, $"{p}.attn_norm.weight", [Hidden], Ones(rng, Hidden));
+            F32(g, $"{p}.attn_norm.weight", [Hidden], Boost(variant, Ones(rng, Hidden)));
             Projection(g, rng, variant, $"{p}.ssm_in", Hidden, inProj, InScale[l]);
             F32(g, $"{p}.ssm_conv1d.weight", [DConv, convDim], Rand(rng, DConv * convDim, 0.5f));
             F32(g, $"{p}.ssm_conv1d.bias", [convDim], Rand(rng, convDim, 0.1f));
             F32(g, $"{p}.ssm_a", [1, NHead], Enumerable.Range(0, NHead).Select(_ => -(float)(rng.NextDouble() * 0.5 + 0.2)).ToArray());
             F32(g, $"{p}.ssm_d", [1, NHead], Rand(rng, NHead, 0.5f));
             F32(g, $"{p}.ssm_dt.bias", [NHead], Rand(rng, NHead, 0.5f));
-            F32(g, $"{p}.ssm_norm.weight", [DInner, 1], Ones(rng, DInner));
+            F32(g, $"{p}.ssm_norm.weight", [DInner, 1], Boost(variant, Ones(rng, DInner)));
             Projection(g, rng, variant, $"{p}.ssm_out", DInner, Hidden, OutScale[l]);
         }
 
@@ -293,11 +307,29 @@ public sealed class NemotronHNvfp4SsmTests : IDisposable
             for (int i = 0; i < w.Length; i++) w[i] *= scale;
             F32(g, $"{name}.weight", [inK, outM], w);
         }
+        else if (variant == Variant.Nvfp4ScaledBoltMagnitude)
+        {
+            // Raise every UE4M3 exponent by 8 (x256; the bytes stay below 0x7F) and fold that and the 16x input
+            // norm into X.scale, so scale . dequant(W) . x is the same model as the other variants.
+            for (int blk = 0; blk < nvfp4.Length; blk += 36)
+                for (int s = 0; s < 4; s++)
+                    nvfp4[blk + s] = checked((byte)(nvfp4[blk + s] + 0x40));
+            g.AddTensor($"{name}.weight", [inK, outM], (uint)QuantizationType.NVFP4, nvfp4);
+            F32(g, $"{name}.scale", [1], [scale / (BoltUe4m3Boost * BoltNormBoost)]);
+        }
         else
         {
             g.AddTensor($"{name}.weight", [inK, outM], (uint)QuantizationType.NVFP4, nvfp4);
             F32(g, $"{name}.scale", [1], [scale]);
         }
+    }
+
+    /// <summary>Multiplies the SSM input norm weights by <see cref="BoltNormBoost"/> for the Bolt-magnitude variant.</summary>
+    private static float[] Boost(Variant variant, float[] norm)
+    {
+        if (variant == Variant.Nvfp4ScaledBoltMagnitude)
+            for (int i = 0; i < norm.Length; i++) norm[i] *= BoltNormBoost;
+        return norm;
     }
 
     /// <summary>Random NVFP4 blocks with UE4M3 scale bytes in 0x28..0x37 (0.0625 .. 0.47 after halving).</summary>

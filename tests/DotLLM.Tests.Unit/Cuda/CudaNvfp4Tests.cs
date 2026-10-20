@@ -147,6 +147,7 @@ public sealed unsafe class CudaNvfp4Tests : IDisposable
     [SkippableTheory]
     [InlineData(Variant.Nvfp4Scaled)]
     [InlineData(Variant.F32Reference)] // control: the same model with F32 SSM weights on CUDA
+    [InlineData(Variant.Nvfp4ScaledBoltMagnitude)] // unscaled prefill GEMM output beyond FP16 range, as in Bolt
     public void NemotronH_Nvfp4Ssm_PrefillAndDecodeMatchCpuF32Twin(Variant cudaVariant)
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");

@@ -719,6 +719,16 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
 
         _kernels.LaunchDequantToF16(weight, qt, _dequantScratchF16Weight, totalElemsI, streamH);
         _kernels.LaunchConvertF32ToF16(x, _activF16InScratch, activInElems, streamH);
+
+        if (qt == QuantizationType.NVFP4)
+        {
+            // #1038: the product before X.scale (~1e-4 in Bolt) is ~10^4 x the real output and overflows an
+            // FP16 output or FP16 accumulation (NaN logits). Accumulate and write FP32; Gemm then scales.
+            CudaGemm.LinearF16InF32Out(_cublas.Handle, _activF16InScratch, _dequantScratchF16Weight,
+                y, seqLen, k, m, streamH);
+            return;
+        }
+
         CudaGemm.LinearF16(_cublas.Handle, _activF16InScratch, _dequantScratchF16Weight,
             _activF16OutScratch, seqLen, k, m, streamH);
         _kernels.LaunchConvertF16ToF32(_activF16OutScratch, y, activOutElems, streamH);
