@@ -82,6 +82,7 @@ public sealed class CudaNemotronHMoeOffloadTests : IDisposable
             var options = new MoeOffloadOptions
             {
                 Mode = MoeOffloadMode.On,
+                Cold = MoeColdMode.Copy,   // #1071: this suite pins copy-on-miss
                 CacheMib = 1,
                 Policy = policy,
                 PinBudgetFraction = pinned ? MoeOffloadOptions.DefaultPinBudgetFraction : 0,
@@ -153,7 +154,7 @@ public sealed class CudaNemotronHMoeOffloadTests : IDisposable
 
             // On, with a 1 MiB request: the cache stays within it and the device keeps the reserve free after the load.
             var (model, _) = CudaModelLoader.CreateFromGguf(gguf, config, deviceId: 0, ptxDir,
-                new MoeOffloadOptions { Mode = MoeOffloadMode.On, CacheMib = 1, Log = _output.WriteLine });
+                new MoeOffloadOptions { Mode = MoeOffloadMode.On, Cold = MoeColdMode.Copy, CacheMib = 1, Log = _output.WriteLine });
             using (model)
             {
                 var info = Assert.IsType<CudaNemotronHTransformerModel>(model).MoeOffload!;
@@ -168,7 +169,7 @@ public sealed class CudaNemotronHMoeOffloadTests : IDisposable
             // A request far above the measured budget is clamped (with a log line), never honoured.
             var log = new List<string>();
             var (big, _) = CudaModelLoader.CreateFromGguf(gguf, config, deviceId: 0, ptxDir,
-                new MoeOffloadOptions { Mode = MoeOffloadMode.On, CacheMib = 1L << 30, Log = log.Add });
+                new MoeOffloadOptions { Mode = MoeOffloadMode.On, Cold = MoeColdMode.Copy, CacheMib = 1L << 30, Log = log.Add });
             using (big)
             {
                 var info = Assert.IsType<CudaNemotronHTransformerModel>(big).MoeOffload!;
