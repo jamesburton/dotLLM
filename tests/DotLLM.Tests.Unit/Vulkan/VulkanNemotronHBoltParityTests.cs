@@ -36,7 +36,7 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
     /// <summary>
     /// Weight seeds of the two fixtures, chosen so every routing decision past layer 0 clears <see cref="RequiredRoutingMargin"/>
     /// (min 0.052 and 0.028); <see cref="RunParity"/> re-checks. Of 40 consecutive seeds, about one in six qualifies.
-    /// </summary>
+    /// </summary>
     private const int KQuantSeed = 1077, IqSeed = 1052;
 
     private static readonly LayerSpec[] Layers =
