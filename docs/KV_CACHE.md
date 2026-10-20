@@ -537,3 +537,37 @@ The initial independent CUDA transport covers the Qwen3 hybrid dense model famil
 including Bonsai. Models without the snapshot-provider capability retain their existing
 single-slot behavior even when a larger entry count is requested; these flags do not add
 transport support to another backend or architecture.
+
+## Disk spill below the host tier (#1034)
+
+Use all three limits to retain more conversations than fit in pinned memory:
+
+```shell
+dotllm serve --model MODEL --device gpu --prefix-snapshots 20 --prefix-snapshot-host-budget 8GiB --prefix-snapshot-disk-dir ./prefix-cache --prefix-snapshot-disk-budget 40GiB
+```
+
+The disk directory and a positive disk budget must be supplied together. Cold snapshots
+spill as raw packed KV plus recurrent state; their token sequences remain indexed in
+memory, so prefix matching performs no disk reads. Successful reloads report
+`cache_tier: disk`. Recurrent statistics include `disk_entries`, `disk_bytes`,
+`disk_budget_bytes`, `disk_hits` and the implemented `disk_transport`.
+
+The current transport is `file-stream`: overlapped file handles with provider-owned
+pinned CUDA transfers. Native DirectStorage/CUDA external-memory and cuFile integration
+remain unavailable in this implementation. Startup reports the selected disk transport
+or that disk caching is unavailable for the provider or directory. This path does not
+claim a CPU-free GPU read.
+
+Disk accounting includes metadata and temporary writes. Leave enough disk budget for
+an atomic spill while a protected reload is in progress; a capacity calculation based
+only on final snapshot payloads can require additional evictions. Host accounting also
+reserves incoming snapshot bytes before import. Corrupt, truncated, mismatched or failed
+reads become cache misses and trigger ordinary prefill.
+
+Each cache owns a private session subdirectory. Files are written to temporary names,
+flushed and atomically renamed; checksums and bounded metadata are validated before
+state import. Clear, eviction and model changes remove owned files. Restart persistence
+is disabled: a new process creates a new session directory and does not load old files.
+An abrupt process termination can leave an orphaned session directory; after confirming
+its process has stopped, remove that directory manually. Live-instance budgets do not
+include orphaned files from earlier processes.

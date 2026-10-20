@@ -239,10 +239,20 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         [Description("Page-locked host snapshot budget, such as 8GiB. Default 0 disables host retention.")]
         public string? PrefixSnapshotHostBudget { get; set; }
 
+        /// <summary>Directory for ephemeral recurrent prefix spill files.</summary>
+        [CommandOption("--prefix-snapshot-disk-dir")]
+        [Description("Directory for recurrent prefix spill files; requires a positive disk budget.")]
+        public string? PrefixSnapshotDiskDirectory { get; set; }
+
+        /// <summary>Maximum disk snapshot bytes.</summary>
+        [CommandOption("--prefix-snapshot-disk-budget")]
+        [Description("Snapshot spill budget, such as 32GiB; requires a disk directory. Default 0 disables disk retention.")]
+        public string? PrefixSnapshotDiskBudget { get; set; }
+
         /// <inheritdoc/>
         public override ValidationResult Validate()
         {
-            try { DotLLM.Server.ServerOptions.BuildPrefixSnapshotOptions(PrefixSnapshots, PrefixSnapshotHostBudget); }
+            try { DotLLM.Server.ServerOptions.BuildPrefixSnapshotOptions(PrefixSnapshots, PrefixSnapshotHostBudget, PrefixSnapshotDiskDirectory, PrefixSnapshotDiskBudget); }
             catch (ArgumentException ex) { return ValidationResult.Error(ex.Message); }
             return base.Validate();
         }
@@ -618,7 +628,10 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,
             mtpEnabled: !settings.NoMtp, mtpAdaptive: true, recurrentPrefixCache: !settings.NoPromptCache,
             prefillChunkSize: settings.PrefillChunkSize,
-            recurrentPrefixCacheOptions: DotLLM.Server.ServerOptions.BuildPrefixSnapshotOptions(settings.PrefixSnapshots, settings.PrefixSnapshotHostBudget));
+            recurrentPrefixCacheOptions: DotLLM.Server.ServerOptions.BuildPrefixSnapshotOptions(settings.PrefixSnapshots, settings.PrefixSnapshotHostBudget, settings.PrefixSnapshotDiskDirectory, settings.PrefixSnapshotDiskBudget));
+
+        if (settings.PrefixSnapshotDiskDirectory is not null)
+            Console.WriteLine($"[dotllm] Prefix snapshot disk transport: {generator.RecurrentPrefixStatistics.DiskTransport ?? "unavailable (provider or directory)"} (restart persistence disabled)");
 
         try
         {

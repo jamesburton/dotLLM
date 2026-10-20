@@ -529,6 +529,8 @@ public static class ServerStartup
             recurrentPrefixCacheOptions: options.GetPrefixSnapshotOptions());
         if (options.PrefillChunkSize > 0)
             Console.WriteLine($"[dotllm] Prefill chunk size: {options.PrefillChunkSize} tokens per forward pass");
+        if (options.PrefixSnapshotDiskDirectory is not null)
+            Console.WriteLine($"[dotllm] Prefix snapshot disk transport: {generator.RecurrentPrefixStatistics.DiskTransport ?? "unavailable (provider or directory)"} (restart persistence disabled)");
 
         // Diffusion models (DiffusionGemma) route chat completions through a masked-canvas
         // diffusion generator instead of the autoregressive TextGenerator. Built only when the
