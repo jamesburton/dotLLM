@@ -31,8 +31,11 @@ public sealed class CudaQwen3HybridDensePerRowKvqVerifyTests
 
     public CudaQwen3HybridDensePerRowKvqVerifyTests(ITestOutputHelper output) => _out = output;
 
-    [SkippableFact]
-    public void VerifyRows_OverQ8Kv_MatchTheDequantScratchPath_WithoutDequantizing()
+    [SkippableTheory]
+    [InlineData(KvCacheDType.Q8_0, KvCacheDType.Q8_0)]
+    [InlineData(KvCacheDType.Q4_0, KvCacheDType.Q4_0)]
+    [InlineData(KvCacheDType.Q8_0, KvCacheDType.Q4_0)]   // mixed: each side's block scale read with its own layout
+    public void VerifyRows_OverQuantizedKv_MatchTheDequantScratchPath_WithoutDequantizing(KvCacheDType keys, KvCacheDType values)
     {
         string? path = FindCheckpoint();
         Skip.If(path is null, "Bonsai 2 MTP checkpoint not found (set DOTLLM_BONSAI2_MTP_GGUF).");
@@ -41,7 +44,7 @@ public sealed class CudaQwen3HybridDensePerRowKvqVerifyTests
         using var gguf = GgufFile.Open(path!);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         using var model = CudaQwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ptxDir!);
-        model.SetKvStorageForTest(KvCacheDType.Q8_0, KvCacheDType.Q8_0);
+        model.SetKvStorageForTest(keys, values);
         Skip.IfNot(model.FuseQuantKvDecodeForTest, "fused quantized-KV decode kernel not loaded on this device");
         using var kv = model.CreateKvCache(1024);
 
@@ -71,7 +74,7 @@ public sealed class CudaQwen3HybridDensePerRowKvqVerifyTests
         for (int r = 0; r < Rows; r++)
         {
             double cos = Cosine(perRow[r], scratch[r]);
-            _out.WriteLine($"row {r}: cosine(per-row, scratch) = {cos:F7}, argmax {ArgMax(perRow[r])} vs {ArgMax(scratch[r])}");
+            _out.WriteLine($"{keys}/{values} row {r}: cosine(per-row, scratch) = {cos:F7}, argmax {ArgMax(perRow[r])} vs {ArgMax(scratch[r])}");
             Assert.True(cos > 0.9999, $"row {r}: cosine {cos}");
             Assert.Equal(ArgMax(scratch[r]), ArgMax(perRow[r]));
         }
