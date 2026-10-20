@@ -94,6 +94,7 @@ public static unsafe partial class Dequantize
         // I2_S: packed 2-bit row stride only (k/4). The per-tensor scale lives at the tensor tail.
         QuantizationType.I2_S => elementCount / 4,
         QuantizationType.MXFP4 => elementCount / Mxfp4GroupSize * Mxfp4BlockBytes,
+        QuantizationType.NVFP4 => elementCount / Nvfp4GroupSize * Nvfp4BlockBytes,
         QuantizationType.Q2_0 => elementCount / QuantFormat.Q2_0GroupSize * QuantFormat.Q2_0BlockBytes,
         // PQ2_0: scale is per-group (interleaved), so row stride includes it — contrast I2_S.
         QuantizationType.PQ2_0 => elementCount / PQ2_0GroupSize * PQ2_0GroupBytes,
@@ -193,6 +194,9 @@ public static unsafe partial class Dequantize
                 break;
             case QuantizationType.MXFP4:
                 DequantizeMxfp4Scalar(src, elementCount, dest);
+                break;
+            case QuantizationType.NVFP4:
+                DequantizeNvfp4(src, elementCount, dest);
                 break;
             case QuantizationType.PQ2_0:
                 DequantizePQ2_0(src, elementCount, dest);

@@ -157,6 +157,15 @@ public enum QuantizationType
     MXFP4 = 39,
 
     /// <summary>
+    /// NVFP4 (NVIDIA FP4, issue #1038): blocks of 64 elements stored as <c>d[4]</c> (one unsigned
+    /// UE4M3 scale per 16-element sub-block) followed by <c>qs[32]</c> (E2M1 nibbles indexing the same
+    /// doubled table as <see cref="MXFP4"/>) — 36 bytes, 4.5 bpw. Matches llama.cpp's
+    /// <c>GGML_TYPE_NVFP4</c> = 40. A tensor of this type usually has a sibling <c>X.scale</c>
+    /// (F32, one element) that multiplies the matmul output; loaders that do not apply it must refuse.
+    /// </summary>
+    NVFP4 = 40,
+
+    /// <summary>
     /// PrismML ternary weights (Bonsai model family). Same 2-bit code packing as
     /// <see cref="I2_S"/> (4 codes/byte, codes 0→-1, 1→0, 2→+1) but with a per-128-element
     /// <c>fp16</c> scale instead of I2_S's single per-tensor <c>fp32</c> scale — block layout

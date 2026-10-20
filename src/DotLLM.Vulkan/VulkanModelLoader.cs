@@ -93,6 +93,9 @@ public static class VulkanModelLoader
         ArgumentNullException.ThrowIfNull(config);
         ArgumentNullException.ThrowIfNull(spvDir);
 
+        // #1038: no NVFP4 kernels on Vulkan yet. Refuse before any upload rather than widen and mis-scale.
+        Nvfp4Support.RejectAny(gguf.TensorsByName, "Vulkan");
+
         switch (config.Architecture)
         {
             case Architecture.Qwen3MoeHybrid:

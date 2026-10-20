@@ -109,6 +109,12 @@ internal sealed class NemotronHSsmWeights
     public required int InInputDim { get; init; }
     public required int InOutputDim { get; init; }
 
+    /// <summary>
+    /// ssm_in.scale — per-tensor multiplier on the ssm_in GEMM output (llama.cpp <c>ssm_in_s</c>; the NVFP4
+    /// "scale2", #1038). 1 when the GGUF has no such tensor.
+    /// </summary>
+    public float InScale { get; init; } = 1.0f;
+
     /// <summary>ssm_conv1d.weight [d_conv, conv_dim]. F32.</summary>
     public required float[] Conv1dWeight { get; init; }
 
@@ -132,6 +138,27 @@ internal sealed class NemotronHSsmWeights
     public required QuantizationType OutQuantType { get; init; }
     public required int OutInputDim { get; init; }
     public required int OutOutputDim { get; init; }
+
+    /// <summary>ssm_out.scale — per-tensor multiplier on the ssm_out GEMM output (#1038). 1 when absent.</summary>
+    public float OutScale { get; init; } = 1.0f;
+
+    /// <summary>
+    /// For GPU backends whose Nemotron-H path has neither an NVFP4 matmul nor the per-tensor projection
+    /// scales (#1038): throws instead of uploading weights the forward would misread or run unscaled.
+    /// </summary>
+    /// <param name="backend">Backend name for the message.</param>
+    /// <exception cref="NotSupportedException">A projection is NVFP4 or carries a per-tensor scale.</exception>
+    public void ThrowIfNvfp4OrScaled(string backend)
+    {
+        if (InQuantType != QuantizationType.NVFP4 && OutQuantType != QuantizationType.NVFP4
+            && InScale == 1.0f && OutScale == 1.0f)
+            return;
+
+        throw new NotSupportedException(
+            $"The {backend} Nemotron-H path cannot run SSM projections stored as NVFP4 or carrying a per-tensor " +
+            $"X.scale (ssm_in: {InQuantType}, scale {InScale}; ssm_out: {OutQuantType}, scale {OutScale}). " +
+            "NVFP4 runs on the CPU backend only for now; use --device cpu (#1038).");
+    }
 }
 
 /// <summary>Standard GQA attention per-layer weights (no bias on any projection for Nemotron-H).</summary>

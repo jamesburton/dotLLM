@@ -28,6 +28,9 @@ public sealed unsafe class NemotronHTransformerModel : IModel
 
     private readonly GgufFile? _gguf; // keep alive (null when constructed from prebuilt weights)
     private readonly NemotronHLayerWeights[] _layers;
+
+    /// <summary>Per-layer weights as loaded (read-only view for tests and diagnostics).</summary>
+    internal IReadOnlyList<NemotronHLayerWeights> LayerWeights => _layers;
     private readonly float[] _outputNormWeight;
 
     private readonly nint _tokenEmbedWeight;
@@ -162,6 +165,10 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         var tensors = gguf.TensorsByName;
         var layout = config.HybridLayout;
         var ssm = config.SsmConfig.Value;
+
+        // #1038: NVFP4 weights carry a per-tensor X.scale. This model applies the SSM projections' scales
+        // (ForwardSsmBody); a scaled NVFP4 weight anywhere else would run unscaled, so refuse it here.
+        Nvfp4Support.RejectUnappliedScales(tensors, SsmProjectionScaleNames(tensors), "The Nemotron-H CPU model");
 
         var embDesc = tensors["token_embd.weight"];
         nint embPtr = dataBase.Of(embDesc);
@@ -375,8 +382,32 @@ public sealed unsafe class NemotronHTransformerModel : IModel
             OutQuantType = outDesc.QuantizationType,
             OutInputDim = outDesc.Shape[0],
             OutOutputDim = outDesc.Shape[1],
+            InScale = ReadOptionalScale(dataBase, tensors, $"{prefix}.ssm_in.weight"),
+            OutScale = ReadOptionalScale(dataBase, tensors, $"{prefix}.ssm_out.weight"),
         };
     }
+
+    /// <summary>
+    /// The per-tensor <c>X.scale</c> of <paramref name="weightName"/> (llama.cpp loads these optionally for
+    /// every projection and multiplies them into the matmul output), or 1 when the GGUF has none.
+    /// </summary>
+    private static float ReadOptionalScale(GgufDataBase dataBase,
+        IReadOnlyDictionary<string, GgufTensorDescriptor> tensors, string weightName)
+    {
+        if (!tensors.TryGetValue(Nvfp4Support.ScaleNameFor(weightName), out var desc))
+            return 1.0f;
+        if (desc.Shape.ElementCount != 1)
+            throw new InvalidDataException(
+                $"{desc.Name} has {desc.Shape.ElementCount} elements; a per-tensor weight scale has exactly 1.");
+        return DequantizeF32(dataBase, desc, 1)[0];
+    }
+
+    /// <summary>The <c>ssm_in.scale</c> / <c>ssm_out.scale</c> names present in the file — the scales this model applies.</summary>
+    private static HashSet<string> SsmProjectionScaleNames(IReadOnlyDictionary<string, GgufTensorDescriptor> tensors)
+        => tensors.Keys
+            .Where(n => n.StartsWith("blk.", StringComparison.Ordinal)
+                && (n.EndsWith(".ssm_in.scale", StringComparison.Ordinal) || n.EndsWith(".ssm_out.scale", StringComparison.Ordinal)))
+            .ToHashSet(StringComparer.Ordinal);
 
     private static NemotronHAttentionWeights LoadAttentionLayer(
         string prefix, GgufDataBase dataBase,
@@ -1169,6 +1200,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         // 1. ssm_in GEMM
         Gemm(ssmW.InWeight, ssmW.InQuantType, normOut, zxbcdt,
              inProjDim, hiddenSize, seqLen, preQuantizedInput: null);
+        ScaleInPlace(zxbcdt, (long)seqLen * inProjDim, ssmW.InScale);
 
         if (traceSsm)
         {
@@ -1316,6 +1348,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         // 10. ssm_out projection into normOut
         Gemm(ssmW.OutWeight, ssmW.OutQuantType, yBuf, normOut,
              hiddenSize, dInner, seqLen, preQuantizedInput: null);
+        ScaleInPlace(normOut, (long)seqLen * hiddenSize, ssmW.OutScale);
 
         if (traceSsm)
             NemotronHDiagnostics.DumpStats($"L{absoluteLayerIndex:D2}S ssm.out[last]",
@@ -1354,6 +1387,17 @@ public sealed unsafe class NemotronHTransformerModel : IModel
                 Dequantize.ToFloat32(rowPtr, hiddenSize, qt, destSpan);
             }
         }
+    }
+
+    /// <summary>
+    /// Multiplies a GEMM output by its weight's per-tensor scale (#1038), as llama.cpp's
+    /// <c>build_lora_mm</c> does after <c>mul_mat</c>. A scale of exactly 1 (no <c>X.scale</c> tensor) is a no-op.
+    /// </summary>
+    private static void ScaleInPlace(float* data, long count, float scale)
+    {
+        if (scale == 1.0f) return;
+        var span = new Span<float>(data, checked((int)count));
+        TensorPrimitives.Multiply(span, scale, span);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -1399,6 +1443,10 @@ public sealed unsafe class NemotronHTransformerModel : IModel
                 return;
             case QuantizationType.F32:
                 MatMul.GemmF32((float*)weights, b, c, m, k, n, _threadPool);
+                return;
+            case QuantizationType.NVFP4:
+                // #1038: packed NVFP4 x Q8_0 (llama.cpp's CPU vec_dot); the caller applies the X.scale.
+                MatMul.GemmNvfp4((byte*)weights, b, c, m, k, n, _threadPool);
                 return;
             case QuantizationType.F16:
                 MatMul.GemmF16(weights, b, c, m, k, n, _threadPool);

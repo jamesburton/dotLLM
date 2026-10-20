@@ -111,6 +111,7 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
 
         var dataBase = new GgufDataBase(gguf);
         var t = gguf.TensorsByName;
+        Nvfp4Support.RejectUnappliedScales(t, consumedScales: null, "The BERT encoder loader"); // #1038
         int h = config.HiddenSize;
         bool nomic = config.Architecture == Architecture.NomicBert;
 

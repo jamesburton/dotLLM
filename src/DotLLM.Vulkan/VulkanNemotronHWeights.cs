@@ -619,6 +619,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         VulkanDevice device, VulkanStagingBuffer staging,
         NemotronHSsmWeights ssmW, out long uploadedBytes)
     {
+        ssmW.ThrowIfNvfp4OrScaled("Vulkan"); // #1038: no NVFP4 kernel and no X.scale multiply on this path yet
         uploadedBytes = 0;
         var inBuf = UploadProjectionMatrix(device, staging,
             ssmW.InWeight, ssmW.InQuantType, ssmW.InOutputDim, ssmW.InInputDim,

@@ -32,6 +32,8 @@ public class QuantFormatTests
     [InlineData(QuantizationType.Q8_0, 2 + 32, 32)]                 // d + qs[QK8_0]
     [InlineData(QuantizationType.MXFP4, 1 + 16, 32)]                // e8m0 scale + qs
     [InlineData(QuantizationType.IQ4_NL, 2 + 16, 32)]               // d + qs
+    // NVFP4 64-element blocks (#1038)
+    [InlineData(QuantizationType.NVFP4, 4 + 32, 64)]                // d[QK_NVFP4/QK_NVFP4_SUB] (UE4M3) + qs[QK_NVFP4/2]
     // K-quant / IQ 256-element super-blocks
     [InlineData(QuantizationType.Q2_K, 16 + 64 + 2 + 2, 256)]       // scales[QK_K/16] + qs[QK_K/4] + d + dmin
     [InlineData(QuantizationType.Q3_K, 32 + 64 + 12 + 2, 256)]      // hmask[QK_K/8] + qs[QK_K/4] + scales[12] + d

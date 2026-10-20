@@ -154,6 +154,7 @@ public sealed unsafe partial class Qwen4ExpTransformerModel : IModel
             || config.GdnConfig is null || config.Moe is null || config.HybridLayout is null)
             throw new ArgumentException("Qwen4ExpTransformerModel requires a fully populated Architecture.Qwen4Exp configuration.", nameof(config));
         var tensors = gguf.TensorsByName;
+        Nvfp4Support.RejectUnappliedScales(tensors, consumedScales: null, "The qwen4exp loader"); // #1038
         var problems = Qwen4ExpTensors.FindProblems(tensors, config, includeTrunk: true, includeMtp: config.NextnPredictLayers > 0);
         if (problems.Count > 0)
             throw new InvalidDataException("qwen4exp tensor table does not match the model contract: " +
