@@ -314,7 +314,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
                 new NemotronHLayerWeights
                 {
                     AttnNormWeight = attnNormWeight,
-                    Moe = LoadMoeLayer(prefix, dataBase, tensors, config),
+                    Moe = LoadMoeLayer(prefix, layerIdx, dataBase, tensors, config),
                 },
             HybridLayerKind.Ffn => new NemotronHLayerWeights
             {
@@ -450,7 +450,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     /// up/down expert banks, and the shared expert's up/down.
     /// </summary>
     private static NemotronHMoeWeights LoadMoeLayer(
-        string prefix, GgufDataBase dataBase,
+        string prefix, int layerIdx, GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config)
     {
@@ -466,20 +466,73 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         var downShexp = tensors[$"{prefix}.ffn_down_shexp.weight"];
 
         int hidden = config.HiddenSize;
-        int moeInter = moeCfg.MoeIntermediateSize;
-        int nExpert = moeCfg.NumExperts;
+        int moeInter = moeCfg.IntermediateSizeForLayer(layerIdx);
+        int topK = moeCfg.ExpertsPerTokForLayer(layerIdx);
+        int latent = moeCfg.LatentSize;
 
-        if (upExps.Shape.Rank != 3 || upExps.Shape[0] != hidden || upExps.Shape[1] != moeInter || upExps.Shape[2] != nExpert)
+        // With LatentMoE (#1037) the routed experts read and write the latent, not the hidden state.
+        int expertDim = latent > 0 ? latent : hidden;
+        bool hasDown = tensors.TryGetValue($"{prefix}.ffn_latent_down.weight", out var latentDownDesc);
+        bool hasUp = tensors.TryGetValue($"{prefix}.ffn_latent_up.weight", out var latentUpDesc);
+        if (latent == 0 && (hasDown || hasUp))
+        {
+            // Latent tensors without moe_latent_size: running the experts on the full hidden
+            // state would read the banks with the wrong row width. Refuse rather than guess.
             throw new InvalidDataException(
-                $"{prefix}.ffn_up_exps.weight has unexpected shape; expected [{hidden},{moeInter},{nExpert}].");
-        if (downExps.Shape.Rank != 3 || downExps.Shape[0] != moeInter || downExps.Shape[1] != hidden || downExps.Shape[2] != nExpert)
+                $"{prefix}: ffn_latent_down/ffn_latent_up present but moe_latent_size is 0 or missing.");
+        }
+
+        // The expert count is per layer on Puzzle derivatives (Nemotron 3.5 Bolt: 240..496,
+        // with expert_count = the maximum) — take it from the bank, as llama.cpp does
+        // (ffn_up_exps->ne[2]), and bound it by the metadata maximum.
+        int nExpert = upExps.Shape.Rank == 3 ? upExps.Shape[2] : -1;
+        if (nExpert <= 0 || nExpert > moeCfg.NumExperts)
             throw new InvalidDataException(
-                $"{prefix}.ffn_down_exps.weight has unexpected shape; expected [{moeInter},{hidden},{nExpert}].");
+                $"{prefix}.ffn_up_exps.weight expert dimension {nExpert} is outside 1..expert_count ({moeCfg.NumExperts}).");
+        if (topK <= 0 || topK > nExpert)
+            throw new InvalidDataException(
+                $"{prefix}: expert_used_count {topK} is out of range for this layer's {nExpert} experts.");
+
+        if (upExps.Shape[0] != expertDim || upExps.Shape[1] != moeInter)
+            throw new InvalidDataException(
+                $"{prefix}.ffn_up_exps.weight has unexpected shape; expected [{expertDim},{moeInter},{nExpert}].");
+        if (downExps.Shape.Rank != 3 || downExps.Shape[0] != moeInter || downExps.Shape[1] != expertDim || downExps.Shape[2] != nExpert)
+            throw new InvalidDataException(
+                $"{prefix}.ffn_down_exps.weight has unexpected shape; expected [{moeInter},{expertDim},{nExpert}].");
+        if (gateInp.Shape.Rank != 2 || gateInp.Shape[0] != hidden || gateInp.Shape[1] != nExpert)
+            throw new InvalidDataException(
+                $"{prefix}.ffn_gate_inp.weight has unexpected shape; expected [{hidden},{nExpert}].");
         if (probsB.Shape.ElementCount != nExpert)
             throw new InvalidDataException(
                 $"{prefix}.exp_probs_b.bias length {probsB.Shape.ElementCount}, expected {nExpert}.");
 
         int sharedInter = upShexp.Shape[1];
+
+        nint latentDown = 0, latentUp = 0;
+        QuantizationType latentDownQt = default, latentUpQt = default;
+        if (latent > 0)
+        {
+            if (!hasDown || !hasUp)
+                throw new InvalidDataException(
+                    $"{prefix}: moe_latent_size={latent} but ffn_latent_down/ffn_latent_up are missing.");
+            if (latent > hidden)
+            {
+                // The per-token MoE body sizes its expert-output scratch by the hidden size; a
+                // latent wider than hidden is not a bottleneck and would overrun that scratch.
+                throw new InvalidDataException(
+                    $"{prefix}: moe_latent_size={latent} exceeds the hidden size {hidden}.");
+            }
+            if (latentDownDesc!.Shape.Rank != 2 || latentDownDesc.Shape[0] != hidden || latentDownDesc.Shape[1] != latent)
+                throw new InvalidDataException(
+                    $"{prefix}.ffn_latent_down.weight has unexpected shape; expected [{hidden},{latent}].");
+            if (latentUpDesc!.Shape.Rank != 2 || latentUpDesc.Shape[0] != latent || latentUpDesc.Shape[1] != hidden)
+                throw new InvalidDataException(
+                    $"{prefix}.ffn_latent_up.weight has unexpected shape; expected [{latent},{hidden}].");
+            latentDown = dataBase.Of(latentDownDesc);
+            latentDownQt = latentDownDesc.QuantizationType;
+            latentUp = dataBase.Of(latentUpDesc);
+            latentUpQt = latentUpDesc.QuantizationType;
+        }
 
         return new NemotronHMoeWeights
         {
@@ -488,20 +541,25 @@ public sealed unsafe class NemotronHTransformerModel : IModel
             SelectionBias = DequantizeF32(dataBase, probsB, nExpert),
             UpExpsWeight = dataBase.Of(upExps),
             UpExpsQuantType = upExps.QuantizationType,
-            UpPerExpertBytes = Dequantize.RowByteSize(hidden, upExps.QuantizationType) * moeInter,
+            UpPerExpertBytes = Dequantize.RowByteSize(expertDim, upExps.QuantizationType) * moeInter,
             DownExpsWeight = dataBase.Of(downExps),
             DownExpsQuantType = downExps.QuantizationType,
-            DownPerExpertBytes = Dequantize.RowByteSize(moeInter, downExps.QuantizationType) * hidden,
+            DownPerExpertBytes = Dequantize.RowByteSize(moeInter, downExps.QuantizationType) * expertDim,
             UpShexpWeight = dataBase.Of(upShexp),
             UpShexpQuantType = upShexp.QuantizationType,
             DownShexpWeight = dataBase.Of(downShexp),
             DownShexpQuantType = downShexp.QuantizationType,
             NumExperts = nExpert,
-            NumExpertsPerTok = moeCfg.NumExpertsPerTok,
+            NumExpertsPerTok = topK,
             MoeIntermediateSize = moeInter,
             SharedIntermediateSize = sharedInter,
             NormalizeWeights = moeCfg.NormalizeExpertWeights,
             WeightsScale = moeCfg.ExpertWeightsScale,
+            LatentSize = latent,
+            LatentDownWeight = latentDown,
+            LatentDownQuantType = latentDownQt,
+            LatentUpWeight = latentUp,
+            LatentUpQuantType = latentUpQt,
         };
     }
 
@@ -751,8 +809,14 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         int moeInter = moe.MoeIntermediateSize;
         int sharedInter = moe.SharedIntermediateSize;
 
+        // LatentMoE (#1037): the routed experts read latent_down(h) and their weighted sum is
+        // projected back by latent_up; the router and shared expert keep the full hidden h.
+        int latent = moe.LatentSize;
+        int expertDim = latent > 0 ? latent : hiddenSize;
+
         var pool = System.Buffers.ArrayPool<float>.Shared;
         float[] hBuf = pool.Rent(hiddenSize);
+        float[] latentBuf = pool.Rent(Math.Max(latent, 1));
         float[] logitsBuf = pool.Rent(nExpert);
         float[] selBuf = pool.Rent(nExpert);
         float[] midBuf = pool.Rent(Math.Max(moeInter, sharedInter));
@@ -761,8 +825,10 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         int[] topIdx = new int[topK];
         try
         {
-            fixed (float* h = hBuf, logits = logitsBuf, mid = midBuf, expOut = outBuf)
+            fixed (float* h = hBuf, logits = logitsBuf, mid = midBuf, expOut = outBuf, xLatent = latentBuf, acc = accBuf)
             {
+                // Routed experts read this: the latent projection when present, else h itself.
+                float* expertIn = latent > 0 ? xLatent : h;
                 Span<float> w = stackalloc float[topK];
                 for (int t = 0; t < seqLen; t++)
                 {
@@ -807,21 +873,32 @@ public sealed unsafe class NemotronHTransformerModel : IModel
                         for (int k2 = 0; k2 < topK; k2++) w[k2] *= moe.WeightsScale;
                     }
 
-                    accBuf.AsSpan(0, hiddenSize).Clear();
+                    if (latent > 0)
+                        Gemm(moe.LatentDownWeight, moe.LatentDownQuantType, h, xLatent, latent, hiddenSize, 1, null);
 
-                    // Routed experts: ungated relu-squared MLP per selected expert, weighted sum.
+                    accBuf.AsSpan(0, expertDim).Clear();
+
+                    // Routed experts: ungated relu-squared MLP per selected expert, weighted sum
+                    // (accumulated in the latent space when the layer has one).
                     for (int k2 = 0; k2 < topK; k2++)
                     {
                         int e = topIdx[k2];
                         nint upPtr = moe.UpExpsWeight + (nint)(e * moe.UpPerExpertBytes);
                         nint downPtr = moe.DownExpsWeight + (nint)(e * moe.DownPerExpertBytes);
 
-                        Gemm(upPtr, moe.UpExpsQuantType, h, mid, moeInter, hiddenSize, 1, null);
+                        Gemm(upPtr, moe.UpExpsQuantType, expertIn, mid, moeInter, expertDim, 1, null);
                         ReluSquared.Execute(midBuf.AsSpan(0, moeInter), midBuf.AsSpan(0, moeInter));
-                        Gemm(downPtr, moe.DownExpsQuantType, mid, expOut, hiddenSize, moeInter, 1, null);
+                        Gemm(downPtr, moe.DownExpsQuantType, mid, expOut, expertDim, moeInter, 1, null);
 
                         float wk = w[k2];
-                        for (int i = 0; i < hiddenSize; i++) accBuf[i] += wk * expOut[i];
+                        for (int i = 0; i < expertDim; i++) accBuf[i] += wk * expOut[i];
+                    }
+
+                    if (latent > 0)
+                    {
+                        // Back to the hidden size: acc[0..latent) -> expOut[0..hidden) -> acc.
+                        Gemm(moe.LatentUpWeight, moe.LatentUpQuantType, acc, expOut, hiddenSize, latent, 1, null);
+                        new ReadOnlySpan<float>(expOut, hiddenSize).CopyTo(accBuf.AsSpan(0, hiddenSize));
                     }
 
                     // Shared expert (same ungated relu-squared, on the full input), added unweighted.
@@ -836,7 +913,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         }
         finally
         {
-            pool.Return(hBuf); pool.Return(logitsBuf); pool.Return(selBuf);
+            pool.Return(hBuf); pool.Return(latentBuf); pool.Return(logitsBuf); pool.Return(selBuf);
             pool.Return(midBuf); pool.Return(outBuf); pool.Return(accBuf);
         }
     }

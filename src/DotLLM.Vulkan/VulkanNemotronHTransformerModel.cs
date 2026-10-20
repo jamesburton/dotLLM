@@ -443,7 +443,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                 {
                     // The shared expert's intermediate rides FfnIntermediate; routed rows have their own scratch.
                     if (moeLayer.SharedIntermediateSize > maxIntermediate) maxIntermediate = moeLayer.SharedIntermediateSize;
-                    moeSpec = (moeLayer.NumExperts, moeLayer.NumExpertsPerTok, moeLayer.MoeIntermediateSize);
+                    var layerSpec = (moeLayer.NumExperts, moeLayer.NumExpertsPerTok, moeLayer.MoeIntermediateSize);
+                    ThrowIfMoeLayerUnsupported(i, moeLayer.HasLatent, moeSpec, layerSpec);
+                    moeSpec = layerSpec;
                 }
                 else
                 {
@@ -1316,6 +1318,32 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     /// <summary><c>DOTLLM_VK_NEMOTRON_MOE_MMVQ=0</c> routes the routed experts through the F32-activation indexed kernels (exact reference arm) instead of dp4a MMVQ.</summary>
     internal static bool MoeMmvqEnabled { get; set; } =
         Environment.GetEnvironmentVariable("DOTLLM_VK_NEMOTRON_MOE_MMVQ") != "0";
+
+    /// <summary>
+    /// Refuses the two Nemotron 3.5 Bolt features (#1037) the Vulkan MoE path does not implement:
+    /// LatentMoE projections and per-layer heterogeneous routed-MoE geometry. Its kernels and
+    /// scratch are sized from a single MoE spec, so either would compute wrong output silently.
+    /// </summary>
+    /// <param name="layer">Block index of the MoE layer being checked.</param>
+    /// <param name="hasLatent">Whether the layer carries <c>ffn_latent_down</c>/<c>ffn_latent_up</c>.</param>
+    /// <param name="previous">The (experts, top-k, intermediate) spec of the previous MoE layer, if any.</param>
+    /// <param name="current">The (experts, top-k, intermediate) spec of this layer.</param>
+    /// <exception cref="NotSupportedException">The layer needs a feature this backend lacks.</exception>
+    internal static void ThrowIfMoeLayerUnsupported(
+        int layer, bool hasLatent,
+        (int NumExperts, int TopK, int MoeIntermediate)? previous,
+        (int NumExperts, int TopK, int MoeIntermediate) current)
+    {
+        if (hasLatent)
+            throw new NotSupportedException(
+                $"nemotron_h_moe layer {layer} uses LatentMoE (ffn_latent_down/up, Nemotron 3.5 Bolt), which the "
+                + "Vulkan backend does not implement yet. Use the CPU backend. Tracked in issues #1035/#1037.");
+        if (previous is { } p && p != current)
+            throw new NotSupportedException(
+                $"nemotron_h_moe layer {layer} has routed-MoE geometry {current} but an earlier layer has {p}; "
+                + "per-layer expert counts/widths (Nemotron 3.5 Bolt) are not implemented on Vulkan yet. "
+                + "Use the CPU backend. Tracked in issues #1035/#1037.");
+    }
 
     private static MoeKernelSet CreateMoeKernels(VulkanDevice device, string spvDir, int numExperts)
     {
