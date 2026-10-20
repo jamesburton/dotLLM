@@ -516,9 +516,10 @@ public static class ServerStartup
 
         var generator = new TextGenerator(model, tokenizer, kvFactory, prefixCache,
             draftModel: draftModel, speculativeCandidates: options.SpeculativeCandidates,
-            mtpEnabled: options.MtpEnabled, mtpAdaptive: true, recurrentPrefixCache: true,
+            mtpEnabled: options.MtpEnabled, mtpAdaptive: true, recurrentPrefixCache: options.PromptCacheEnabled,
             prefixTrieManager: prefixTrieManager,
-            prefillChunkSize: options.PrefillChunkSize);
+            prefillChunkSize: options.PrefillChunkSize,
+            recurrentPrefixCacheOptions: options.GetPrefixSnapshotOptions());
         if (options.PrefillChunkSize > 0)
             Console.WriteLine($"[dotllm] Prefill chunk size: {options.PrefillChunkSize} tokens per forward pass");
 

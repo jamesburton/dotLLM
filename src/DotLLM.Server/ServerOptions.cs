@@ -1,5 +1,6 @@
 using DotLLM.Core.Configuration;
 using DotLLM.Engine;
+using DotLLM.Engine.PromptCache;
 using DotLLM.Engine.Scheduler;
 using DotLLM.Server.RateLimiting;
 
@@ -45,6 +46,53 @@ public sealed record ServerOptions
 
     /// <summary>Maximum number of cached sessions for prompt caching.</summary>
     public int PromptCacheSize { get; init; } = 4;
+
+    /// <summary>Maximum recurrent prefix snapshots. Null preserves the single-slot default.</summary>
+    public int? PrefixSnapshots { get; init; }
+
+    /// <summary>Maximum page-locked host snapshot bytes. Zero disables host retention.</summary>
+    public long PrefixSnapshotHostBudgetBytes { get; init; }
+
+    /// <summary>Validates and resolves recurrent snapshot limits for this server.</summary>
+    public RecurrentPrefixCacheOptions GetPrefixSnapshotOptions()
+    {
+        int count = PrefixSnapshots ?? 1;
+        if (count < 1) throw new ArgumentOutOfRangeException(nameof(PrefixSnapshots), "--prefix-snapshots must be at least 1.");
+        if (PrefixSnapshotHostBudgetBytes < 0) throw new ArgumentOutOfRangeException(nameof(PrefixSnapshotHostBudgetBytes));
+        return new() { MaxEntries = count, HostBudgetBytes = PrefixSnapshotHostBudgetBytes };
+    }
+
+    /// <summary>Resolves CLI count and human-readable host byte budget before loading a model.</summary>
+    public static RecurrentPrefixCacheOptions BuildPrefixSnapshotOptions(int? count, string? hostBudget)
+        => new ServerOptions { Model = "", PrefixSnapshots = count, PrefixSnapshotHostBudgetBytes = ParsePrefixSnapshotHostBudget(hostBudget) }
+            .GetPrefixSnapshotOptions();
+
+    /// <summary>Parses nonnegative bytes or decimal/binary units, for example 8000000, 8GB or 8GiB.</summary>
+    public static long ParsePrefixSnapshotHostBudget(string? value)
+    {
+        if (value is null) return 0;
+        string number = value.Trim();
+        long multiplier = 1;
+        foreach (var (suffix, scale) in new (string, long)[]
+        {
+            ("TiB", 1L << 40), ("GiB", 1L << 30), ("MiB", 1L << 20), ("KiB", 1L << 10),
+            ("TB", 1_000_000_000_000L), ("GB", 1_000_000_000L), ("MB", 1_000_000L), ("KB", 1_000L), ("B", 1L),
+        })
+        {
+            if (!number.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)) continue;
+            number = number[..^suffix.Length].TrimEnd();
+            multiplier = scale;
+            break;
+        }
+        if (!decimal.TryParse(number, System.Globalization.NumberStyles.AllowDecimalPoint,
+                System.Globalization.CultureInfo.InvariantCulture, out decimal amount)
+            || amount < 0 || amount > long.MaxValue / (decimal)multiplier)
+            throw new ArgumentException("--prefix-snapshot-host-budget must be a nonnegative byte size, such as 8GiB.", nameof(value));
+        decimal bytes = amount * multiplier;
+        if (bytes != decimal.Truncate(bytes))
+            throw new ArgumentException("--prefix-snapshot-host-budget must resolve to a whole number of bytes.", nameof(value));
+        return (long)bytes;
+    }
 
     /// <summary>Whether to use paged KV-cache (block-based allocation). Default true for serve.</summary>
     public bool UsePaged { get; init; } = true;
@@ -268,6 +316,8 @@ public sealed record ServerOptions
         string cacheTypeV = "f32";
         bool promptCacheEnabled = true;
         int promptCacheSize = 4;
+        int? prefixSnapshots = null;
+        string? prefixSnapshotHostBudget = null;
         bool usePaged = true;
         bool warmupEnabled = true;
         int warmupIterations = 3;
@@ -348,6 +398,10 @@ public sealed record ServerOptions
                     reasoningFormat = DotLLM.Tokenizers.Reasoning.ReasoningFormats.Parse(next ?? ""); i++; break;
                 case "--prefill-chunk-size" or "--ubatch-size":
                     prefillChunkSize = int.Parse(next!); i++; break;
+                case "--prefix-snapshots":
+                    prefixSnapshots = int.Parse(next ?? throw new ArgumentException("--prefix-snapshots requires a count."), System.Globalization.CultureInfo.InvariantCulture); i++; break;
+                case "--prefix-snapshot-host-budget":
+                    prefixSnapshotHostBudget = next ?? throw new ArgumentException("--prefix-snapshot-host-budget requires a size."); i++; break;
                 case "--rope-scaling":
                     ropeScaling = next; i++; break;
                 case "--rope-freq-base":
@@ -392,6 +446,7 @@ public sealed record ServerOptions
         if (model.Contains('/'))
             modelId = model.Split('/')[^1]; // last segment of repo
 
+        var snapshotOptions = BuildPrefixSnapshotOptions(prefixSnapshots, prefixSnapshotHostBudget);
         return new ServerOptions
         {
             Model = model,
@@ -406,6 +461,8 @@ public sealed record ServerOptions
             CacheTypeV = cacheTypeV,
             PromptCacheEnabled = promptCacheEnabled,
             PromptCacheSize = promptCacheSize,
+            PrefixSnapshots = snapshotOptions.MaxEntries,
+            PrefixSnapshotHostBudgetBytes = snapshotOptions.HostBudgetBytes,
             UsePaged = usePaged,
             Warmup = new WarmupOptions
             {

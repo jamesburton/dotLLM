@@ -210,6 +210,11 @@ public sealed record CompletionChunk
     [JsonPropertyName("model")]
     public required string Model { get; init; }
 
+    /// <summary>Final generation timing and prefix-cache restoration measurements.</summary>
+    [JsonPropertyName("timings")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public TimingsDto? Timings { get; init; }
+
     [JsonPropertyName("choices")]
     public required CompletionChunkChoiceDto[] Choices { get; init; }
 

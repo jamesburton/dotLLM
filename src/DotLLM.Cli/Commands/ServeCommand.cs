@@ -196,6 +196,24 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [DefaultValue(0)]
         public int PrefillChunkSize { get; set; }
 
+        /// <summary>Maximum recurrent prefix snapshots.</summary>
+        [CommandOption("--prefix-snapshots")]
+        [Description("Maximum recurrent prefix snapshots (default 1). Use with --prefix-snapshot-host-budget for alternating sessions.")]
+        public int? PrefixSnapshots { get; set; }
+
+        /// <summary>Page-locked host byte budget for recurrent prefix snapshots.</summary>
+        [CommandOption("--prefix-snapshot-host-budget")]
+        [Description("Page-locked host snapshot budget, such as 8GiB. Default 0 disables host retention.")]
+        public string? PrefixSnapshotHostBudget { get; set; }
+
+        /// <inheritdoc/>
+        public override ValidationResult Validate()
+        {
+            try { ServerOptions.BuildPrefixSnapshotOptions(PrefixSnapshots, PrefixSnapshotHostBudget); }
+            catch (ArgumentException ex) { return ValidationResult.Error(ex.Message); }
+            return base.Validate();
+        }
+
         [CommandOption("--rope-scaling")]
         [Description("RoPE scaling override: 'none', 'linear', 'yarn', 'ntk', 'dynamic'. Overrides the GGUF-derived value.")]
         public string? RopeScaling { get; set; }
@@ -365,6 +383,8 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             MtpHeadPath = settings.MtpHead,
             ReasoningFormat = DotLLM.Tokenizers.Reasoning.ReasoningFormats.Parse(settings.ReasoningFormat),
             PrefillChunkSize = settings.PrefillChunkSize,
+            PrefixSnapshots = settings.PrefixSnapshots,
+            PrefixSnapshotHostBudgetBytes = ServerOptions.ParsePrefixSnapshotHostBudget(settings.PrefixSnapshotHostBudget),
             KeepAliveSeconds = settings.KeepAlive,
             MaxResidentModels = settings.MaxResidentModels,
             ResidentMemoryBudgetBytes = settings.ResidentMemoryBudgetBytes,

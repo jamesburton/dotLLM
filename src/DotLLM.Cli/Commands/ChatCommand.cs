@@ -229,6 +229,24 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         [DefaultValue(0)]
         public int PrefillChunkSize { get; set; }
 
+        /// <summary>Maximum recurrent prefix snapshots.</summary>
+        [CommandOption("--prefix-snapshots")]
+        [Description("Maximum recurrent prefix snapshots (default 1).")]
+        public int? PrefixSnapshots { get; set; }
+
+        /// <summary>Page-locked host byte budget for recurrent prefix snapshots.</summary>
+        [CommandOption("--prefix-snapshot-host-budget")]
+        [Description("Page-locked host snapshot budget, such as 8GiB. Default 0 disables host retention.")]
+        public string? PrefixSnapshotHostBudget { get; set; }
+
+        /// <inheritdoc/>
+        public override ValidationResult Validate()
+        {
+            try { DotLLM.Server.ServerOptions.BuildPrefixSnapshotOptions(PrefixSnapshots, PrefixSnapshotHostBudget); }
+            catch (ArgumentException ex) { return ValidationResult.Error(ex.Message); }
+            return base.Validate();
+        }
+
         /// <summary>Verbose debug output.</summary>
         [CommandOption("--verbose|-v")]
         [Description("Show debug info: finish reason, raw text before stop-sequence stripping, tool call detection details.")]
@@ -591,8 +609,9 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
 
         var generator = new TextGenerator(model!, tokenizer!, kvFactory, prefixCache,
             draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,
-            mtpEnabled: !settings.NoMtp, mtpAdaptive: true, recurrentPrefixCache: true,
-            prefillChunkSize: settings.PrefillChunkSize);
+            mtpEnabled: !settings.NoMtp, mtpAdaptive: true, recurrentPrefixCache: !settings.NoPromptCache,
+            prefillChunkSize: settings.PrefillChunkSize,
+            recurrentPrefixCacheOptions: DotLLM.Server.ServerOptions.BuildPrefixSnapshotOptions(settings.PrefixSnapshots, settings.PrefixSnapshotHostBudget));
 
         try
         {
@@ -600,6 +619,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         }
         finally
         {
+            generator.ClearRecurrentPrefixCache();
             pagedFactory?.Dispose();
             cudaPagedFactory?.Dispose();
             draftModel?.Dispose();

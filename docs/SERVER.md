@@ -986,3 +986,28 @@ Vulkan hybrid models (Qwen3.5 / Tev1, Qwen3.6) serve through the serial per-requ
 (N >= 5) to serve them through the continuous-batch scheduler instead: measured on Tev1-4B, aggregate decode throughput at 8 concurrent
 streams is +73% (102 vs 59 tok/s), parity at 4 or fewer and for a single stream. It is off when MTP (default-on for embedded-head models) or a draft model is active, and a
 repeated identical prompt is slower than on the serial path (which has the whole-prompt cache). `DOTLLM_VK_SCHEDULER=0|1` overrides the hint.
+# Multi-session recurrent prefix caching (#1033)
+
+For serialized agent workloads that alternate between conversations, configure independent
+recurrent-prefix snapshots rather than repeatedly prefilling each full conversation:
+
+```text
+dotllm serve <model.gguf> --prefix-snapshots 20 --prefix-snapshot-host-budget 8GiB
+```
+
+`--prefix-snapshots` bounds the number of retained entries (default 1).
+`--prefix-snapshot-host-budget` bounds page-locked host retention (default 0, disabled),
+accepting bytes or units such as `MiB` and `GiB`. The same flags are accepted by the
+standalone server and interactive `chat`. Snapshot transport must be supported by the
+loaded model; inspect `GET /v1/prompt-cache` for the effective state and occupancy.
+
+For example, a 30,000-token prefix at 64 KiB of KV per token plus 150 MiB of recurrent
+state occupies about 1.98 GiB. An 8 GiB host budget holds approximately four such snapshots;
+the exact count depends on KV quantization, layer geometry and prefix lengths. More tracked
+entries do not imply that all of them remain resident when the byte budget is exhausted.
+
+The streaming `timings` extension reports `cache_tier` and `cache_restore_ms` alongside
+`cached_tokens`. OpenAI usage responses include `prompt_tokens_details.cached_tokens`.
+The prompt-cache administration endpoint reports recurrent entries, host bytes, hits by
+tier and restore failures. Clearing the prompt cache also clears recurrent snapshots;
+model changes invalidate them. Disk retention is the separate #1034 follow-up.

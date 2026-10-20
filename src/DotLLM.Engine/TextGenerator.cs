@@ -23,7 +23,7 @@ namespace DotLLM.Engine;
 /// Autoregressive text generator: encodes a prompt, runs prefill + decode loop
 /// with sampling and stop conditions, and returns the generated text.
 /// </summary>
-public sealed class TextGenerator
+public sealed partial class TextGenerator
 {
     private readonly IModel _model;
     private readonly ITokenizer _tokenizer;
@@ -130,6 +130,7 @@ public sealed class TextGenerator
     /// uncached suffix in a single forward pass — behavior unchanged. Ignored on the hybrid
     /// CPU-prefill/GPU-decode path, whose <see cref="HybridPrefillDecodeStrategy.RunPrefill"/>
     /// processes the full prompt itself.</param>
+    /// <param name="recurrentPrefixCacheOptions">Optional independent recurrent snapshot count and pinned host memory budget.</param>
     public TextGenerator(IModel model, ITokenizer tokenizer,
                           Func<ModelConfig, int, Core.Attention.IKvCache>? kvCacheFactory = null,
                           PrefixCache? prefixCache = null,
@@ -141,7 +142,8 @@ public sealed class TextGenerator
                           PrefixTrieManager? prefixTrieManager = null,
                           int prefillChunkSize = 0,
                           bool mtpAdaptive = false,
-                          bool recurrentPrefixCache = false)
+                          bool recurrentPrefixCache = false,
+                          RecurrentPrefixCacheOptions? recurrentPrefixCacheOptions = null)
     {
         _model = model;
         _tokenizer = tokenizer;
@@ -158,6 +160,11 @@ public sealed class TextGenerator
         _prefillChunkSize = prefillChunkSize;
         _recurrentPrefixEnabled = recurrentPrefixCache && draftModel is null
             && model.RequiresPerSequenceState && model.SupportsRecurrentStateCheckpoint;
+        var snapshots = recurrentPrefixCacheOptions ?? new RecurrentPrefixCacheOptions();
+        ArgumentOutOfRangeException.ThrowIfLessThan(snapshots.MaxEntries, 1);
+        ArgumentOutOfRangeException.ThrowIfNegative(snapshots.HostBudgetBytes);
+        if (_recurrentPrefixEnabled && model is IRecurrentPrefixSnapshotProvider provider && (snapshots.MaxEntries > 1 || snapshots.HostBudgetBytes > 0))
+            _tieredSnapshots = new RecurrentPrefixSnapshotCache(provider, snapshots);
         _mtpGate = mtpAdaptive && MtpAdaptiveGate.EnabledByEnvironment ? new MtpAdaptiveGate(model.MtpGatePriorBytes) : null;
         _mtpGateSampled = _mtpGate is null ? null : new MtpAdaptiveGate(model.MtpGatePriorBytes);
 
@@ -224,7 +231,7 @@ public sealed class TextGenerator
     /// and between decode steps. Throws <see cref="OperationCanceledException"/>.
     /// </param>
     /// <returns>The inference response with generated text, metadata, and timings.</returns>
-    public InferenceResponse Generate(string prompt, InferenceOptions? options = null,
+    private InferenceResponse GenerateCore(string prompt, InferenceOptions? options = null,
         Action<int>? onTokenGenerated = null,
         ILoraAdapter? adapter = null,
         Action<ReadOnlySpan<char>>? onTextGenerated = null,
@@ -297,7 +304,7 @@ public sealed class TextGenerator
         }
 
         // Resolve KV-cache: reuse from prefix cache or allocate fresh
-        var (kvCache, cachedTokenCount, ownsKvCache) = ResolveKvCache(promptIds, promptLen, maxTokens, out int snapshotAt);
+        var (kvCache, cachedTokenCount, ownsKvCache) = ResolveKvCache(promptIds, promptLen, maxTokens, out int snapshotAt, adapter);
         _recurrentPrefixRequestPending = _recurrentPrefixEnabled;
 
         // Hybrid mode is enabled when a strategy is wired up, the prompt is short enough,
@@ -433,7 +440,7 @@ public sealed class TextGenerator
                     // Prefill suffix tokens — chunked when a prefill chunk size is configured
                     // (llama.cpp -ub analog); otherwise a single forward pass, as before.
                     using (ITensor prefillLogits = ForwardPrefill(promptIds, prefillStart, prefillLen, kvCache, adapter, mtpState,
-                        snapshotAt, () => { TakeRecurrentSnapshot(promptIds, snapshotAt, kvCache); ownsKvCache = false; },
+                        snapshotAt, () => { TakeRecurrentSnapshot(promptIds, snapshotAt, kvCache); if (_tieredSnapshots is null) ownsKvCache = false; },
                         cancellationToken))
                     {
                         long ts1 = Stopwatch.GetTimestamp();
@@ -837,7 +844,7 @@ public sealed class TextGenerator
     /// <param name="cancellationToken">Token to cancel generation cooperatively between decode steps.</param>
     /// <param name="adapter">Optional LoRA adapter to apply during the forward passes (Phase 4c).</param>
     /// <returns>An async enumerable of <see cref="GenerationToken"/> values.</returns>
-    public async IAsyncEnumerable<GenerationToken> GenerateStreamingTokensAsync(
+    private async IAsyncEnumerable<GenerationToken> GenerateStreamingTokensCoreAsync(
         string prompt,
         InferenceOptions? options = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default,
@@ -899,7 +906,7 @@ public sealed class TextGenerator
         }
 
         // Resolve KV-cache: reuse from prefix cache or allocate fresh
-        var (kvCache, cachedTokenCount, ownsKvCache) = ResolveKvCache(promptIds, promptLen, maxTokens, out int snapshotAt);
+        var (kvCache, cachedTokenCount, ownsKvCache) = ResolveKvCache(promptIds, promptLen, maxTokens, out int snapshotAt, adapter);
         _recurrentPrefixRequestPending = _recurrentPrefixEnabled;
         long kvBytes = GetKvCacheBytes(kvCache);
 
@@ -990,7 +997,7 @@ public sealed class TextGenerator
                     // Prefill suffix tokens — chunked when a prefill chunk size is configured
                     // (llama.cpp -ub analog); otherwise a single forward pass, as before.
                     using (ITensor prefillLogits = ForwardPrefill(promptIds, prefillStart, prefillLen, kvCache, adapter, mtpState,
-                        snapshotAt, () => { TakeRecurrentSnapshot(promptIds, snapshotAt, kvCache); ownsKvCache = false; },
+                        snapshotAt, () => { TakeRecurrentSnapshot(promptIds, snapshotAt, kvCache); if (_tieredSnapshots is null) ownsKvCache = false; },
                         cancellationToken))
                     {
                         long ts1 = Stopwatch.GetTimestamp();
@@ -1409,9 +1416,11 @@ public sealed class TextGenerator
     /// Returns the cache, number of cached tokens, and whether the caller owns (should dispose) the cache.
     /// </summary>
     private (Core.Attention.IKvCache KvCache, int CachedTokenCount, bool OwnsKvCache) ResolveKvCache(
-        int[] promptIds, int promptLen, int maxTokens, out int snapshotAt)
+        int[] promptIds, int promptLen, int maxTokens, out int snapshotAt, ILoraAdapter? adapter = null)
     {
         snapshotAt = -1;
+        LastPrefixCacheTier = null; LastPrefixRestoreMilliseconds = 0;
+        if (adapter is not null) ClearRecurrentPrefixCacheCore();
         // A recurrent (Gated DeltaNet / SSM) model carries per-sequence state that has no position
         // addressing: reusing only the KV half of a cached prefix would leave that state at the END of
         // the previous request. So recurrent models never take a KV-only prefix hit, and every
@@ -1421,7 +1430,9 @@ public sealed class TextGenerator
         bool recurrent = _model.RequiresPerSequenceState;
         if (recurrent)
         {
-            if (_recurrentPrefixEnabled)
+            if (_recurrentPrefixEnabled && adapter is null && _tieredSnapshots is not null)
+                return ResolveTieredRecurrentPrefix(promptIds, promptLen, maxTokens, out snapshotAt);
+            if (_recurrentPrefixEnabled && adapter is null)
                 return ResolveRecurrentPrefix(promptIds, promptLen, maxTokens, out snapshotAt);
             _model.ResetSequenceState();
         }
@@ -1642,13 +1653,18 @@ public sealed class TextGenerator
             && promptIds.AsSpan(0, entry.Tokens.Length).SequenceEqual(entry.Tokens)
             && EnsureRecurrentPrefixKvCapacity(entry.Kv, needed))
         {
+            long restoreStart = Stopwatch.GetTimestamp();
             entry.Kv.Rollback(entry.Tokens.Length);
             _model.RestoreRecurrentState(entry.Checkpoint);
+            LastPrefixCacheTier = "vram";
+            LastPrefixRestoreMilliseconds = Stopwatch.GetElapsedTime(restoreStart).TotalMilliseconds;
+            _legacyPrefixHits++;
             if (boundary >= entry.Tokens.Length + RecurrentPrefixMinTokens)
                 snapshotAt = boundary;
             return (entry.Kv, entry.Tokens.Length, false);
         }
 
+        _legacyPrefixMisses++;
         _model.ResetSequenceState();
         if (entry is not null && !entry.Kv.HasExclusiveStorage)
         {
@@ -1682,6 +1698,7 @@ public sealed class TextGenerator
 
     private void TakeRecurrentSnapshot(int[] promptIds, int boundary, Core.Attention.IKvCache kvCache)
     {
+        if (_tieredSnapshots is not null) { _tieredSnapshots.TryCapture(promptIds, kvCache, boundary); return; }
         object? checkpoint = _model.CheckpointRecurrentState();
         var old = _recurrentPrefix;
         _recurrentPrefix = new RecurrentPrefixEntry(promptIds.AsSpan(0, boundary).ToArray(), kvCache, checkpoint);
@@ -1700,12 +1717,20 @@ public sealed class TextGenerator
     {
         if (!_recurrentPrefixRequestPending) return;
         _recurrentPrefixRequestPending = false;
-        ClearRecurrentPrefixCache();
+        ClearRecurrentPrefixCacheCore();
     }
 
     /// <summary>Releases the recurrent prefix snapshot (its KV cache and state checkpoint). Call when the model is unloaded.</summary>
     public void ClearRecurrentPrefixCache()
     {
+        _generationGate.Wait();
+        try { ClearRecurrentPrefixCacheCore(); }
+        finally { _generationGate.Release(); }
+    }
+
+    private void ClearRecurrentPrefixCacheCore()
+    {
+        _tieredSnapshots?.Clear();
         var entry = _recurrentPrefix;
         _recurrentPrefix = null;
         _recurrentPrefixLastPrompt = null;
@@ -1923,7 +1948,7 @@ public sealed class TextGenerator
         };
     }
 
-    private static InferenceTimings BuildTimings(int promptLen, int generatedCount,
+    private InferenceTimings BuildTimings(int promptLen, int generatedCount,
         long prefillTicks, long decodeTicks, long samplerTicks, long kvCacheBytes = 0,
         int cachedTokenCount = 0, int specDrafted = 0, int specAccepted = 0)
     {
@@ -1939,6 +1964,8 @@ public sealed class TextGenerator
             DecodeTokenCount = decodeSteps,
             KvCacheBytes = kvCacheBytes,
             CachedTokenCount = cachedTokenCount,
+            CacheTier = LastPrefixCacheTier,
+            CacheRestoreMilliseconds = LastPrefixRestoreMilliseconds,
             SpeculativeDraftTokens = specDrafted,
             SpeculativeAcceptedTokens = specAccepted
         };

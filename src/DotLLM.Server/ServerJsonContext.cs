@@ -21,6 +21,7 @@ namespace DotLLM.Server;
 [JsonSerializable(typeof(ModelInfoDto))]
 [JsonSerializable(typeof(StreamOptionsDto))]
 [JsonSerializable(typeof(CompletionTokensDetailsDto))]
+[JsonSerializable(typeof(PromptTokensDetailsDto))]
 [JsonSerializable(typeof(PropsResponse))]
 [JsonSerializable(typeof(ServerStatusResponse))]
 [JsonSerializable(typeof(SamplingDefaultsDto))]

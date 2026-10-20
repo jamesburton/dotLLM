@@ -61,6 +61,15 @@ public sealed record TimingsDto
     [JsonPropertyName("cached_tokens")]
     public int CachedTokens { get; init; }
 
+    /// <summary>Storage tier used to restore the cached prefix.</summary>
+    [JsonPropertyName("cache_tier")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? CacheTier { get; init; }
+
+    /// <summary>Time spent restoring the cached prefix, in milliseconds.</summary>
+    [JsonPropertyName("cache_restore_ms")]
+    public double CacheRestoreMilliseconds { get; init; }
+
     [JsonPropertyName("speculative_draft_tokens")]
     public int SpeculativeDraftTokens { get; init; }
 
@@ -69,6 +78,24 @@ public sealed record TimingsDto
 
     [JsonPropertyName("speculative_acceptance_rate")]
     public float SpeculativeAcceptanceRate { get; init; }
+
+    /// <summary>Maps engine measurements to the streaming timing extension.</summary>
+    public static TimingsDto From(DotLLM.Engine.InferenceTimings timings) => new()
+    {
+        PrefillTimeMs = timings.PrefillTimeMs,
+        DecodeTimeMs = timings.DecodeTimeMs,
+        SamplingTimeMs = timings.SamplingTimeMs,
+        PrefillTokensPerSec = timings.PrefillTokensPerSec,
+        DecodeTokensPerSec = timings.DecodeTokensPerSec,
+        PromptTokens = timings.PrefillTokenCount,
+        GeneratedTokens = timings.DecodeTokenCount,
+        CachedTokens = timings.CachedTokenCount,
+        CacheTier = timings.CacheTier,
+        CacheRestoreMilliseconds = timings.CacheRestoreMilliseconds,
+        SpeculativeDraftTokens = timings.SpeculativeDraftTokens,
+        SpeculativeAcceptedTokens = timings.SpeculativeAcceptedTokens,
+        SpeculativeAcceptanceRate = timings.SpeculativeAcceptanceRate,
+    };
 }
 
 /// <summary>

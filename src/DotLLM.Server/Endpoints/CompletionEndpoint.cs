@@ -162,6 +162,7 @@ public static class CompletionEndpoint
                 PromptTokens = result.PromptTokenCount,
                 CompletionTokens = result.GeneratedTokenCount,
                 TotalTokens = result.PromptTokenCount + result.GeneratedTokenCount,
+                PromptTokensDetails = new PromptTokensDetailsDto { CachedTokens = Math.Clamp(result.Timings.CachedTokenCount, 0, result.PromptTokenCount) },
             },
         };
 
@@ -203,6 +204,7 @@ public static class CompletionEndpoint
 
         int completionTokens = 0;
         int promptTokens = 0;
+        int cachedTokens = 0;
 
         try
         {
@@ -212,7 +214,11 @@ public static class CompletionEndpoint
                 await foreach (var token in SseKeepAlive.UntilFirstItem(httpContext, tokenSource(ct), keepAliveInterval, ct))
                 {
                     if (token.Text.Length > 0) completionTokens++;
-                    if (token.Timings.HasValue) promptTokens = token.Timings.Value.PrefillTokenCount;
+                    if (token.Timings.HasValue)
+                    {
+                        promptTokens = token.Timings.Value.PrefillTokenCount;
+                        cachedTokens = token.Timings.Value.CachedTokenCount;
+                    }
 
                     var tokenLogprobs = token.Logprobs.HasValue
                         ? RequestConverter.ToLogprobsDto(token.Logprobs.Value)
@@ -221,6 +227,7 @@ public static class CompletionEndpoint
                     {
                         Id = requestId,
                         Model = modelId,
+                        Timings = token.Timings.HasValue ? TimingsDto.From(token.Timings.Value) : null,
                         Choices = [new CompletionChunkChoiceDto
                         {
                             Text = token.Text,
@@ -264,6 +271,7 @@ public static class CompletionEndpoint
                     PromptTokens = promptTokens,
                     CompletionTokens = completionTokens,
                     TotalTokens = promptTokens + completionTokens,
+                    PromptTokensDetails = new PromptTokensDetailsDto { CachedTokens = Math.Clamp(cachedTokens, 0, promptTokens) },
                 },
             };
             await httpContext.Response.WriteAsync("data: ", ct);

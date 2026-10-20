@@ -492,3 +492,48 @@ Decode sweep (Q4_0, 64 tokens per point): 18.9 tok/s at ctx 512, 19.5 at 4k, 19.
 **Recommendation (12 GB card):** Q8_0 up to ~36k (indistinguishable from F16, 1 GB headroom). Beyond that
 prefer K8V4 (+0.18% PPL, 11.5 GB at 72k) or Q4_0 (10.95 GB) - Q8_0 at 72k peaks at 12.08 GB of 12.29 and is
 one allocation from WDDM paging. Needle retrieval is a coarse test; the PPL deltas are the fine-grained signal.
+# Recurrent prefix snapshots with a host tier (#1033)
+
+Recurrent and hybrid models need both attention KV rows and recurrent state to reuse a
+conversation prefix. Retaining only KV rows is insufficient. Multi-slot snapshots keep
+independent copies of both, match the longest token prefix, and evict least-recently-used
+entries when the configured entry or memory limits are reached. A request still forwards
+at least one suffix token to produce its next-token logits.
+
+`--prefix-snapshots 20 --prefix-snapshot-host-budget 8GiB` enables bounded multi-session
+retention on models with snapshot transport support. The default remains one snapshot and
+no host tier. The host budget counts snapshot buffers, including recurrent state; it does
+not include model weights or the active device KV cache. Pinned host memory cannot be
+paged out, so configure a budget appropriate to the machine's available RAM.
+
+The active snapshot uses device storage when admitted by the backend's memory policy.
+Cold snapshots can use page-locked host memory and restore their exact stored bytes instead
+of prefilling the conversation again. A model/configuration change invalidates snapshots;
+failed restores are discarded as misses. Transfers and generation remain serialized around
+the live state. `DELETE /v1/prompt-cache` clears recurrent snapshots as well as the attention
+prefix trie.
+
+For a representative F16 layout, 16 attention layers × two K/V tensors × 1,024 elements ×
+two bytes gives 64 KiB per token. Use the loaded model's reported KV geometry and
+snapshot byte counts for budgeting. That layout needs about 1.83 GiB for
+30,000 tokens, plus recurrent state (about 150 MiB in the issue's example), so an 8 GiB
+host budget holds roughly four such snapshots. Quantized KV retains its raw packed format
+and reduces this storage proportionally to the actual format block size.
+
+Streaming timing extensions expose `cached_tokens`, `cache_tier` and `cache_restore_ms`.
+`GET /v1/prompt-cache` includes recurrent occupancy, host bytes and tier-specific hit
+counters even when no paged prefix trie is active. The NVMe spill tier is tracked separately
+in #1034; configuring the host tier does not enable disk persistence.
+
+CUDA transport retains raw F16, Q8 or Q4 KV rows and independent convolution/GDN state;
+it does not expand quantized rows to F32. Device admission reserves at least 512 MiB of
+free VRAM beyond the snapshot allocation. Multi-slot mode captures a first-seen prompt
+at its penultimate token so alternating conversations can reuse their first visit.
+Cached-prefix requests leave MTP disabled and rerun a suffix token to regenerate logits.
+Snapshot ownership is tied to the model instance and forward settings. Entries do not
+survive a process restart; persistent storage belongs to #1034.
+
+The initial independent CUDA transport covers the Qwen3 hybrid dense model family,
+including Bonsai. Models without the snapshot-provider capability retain their existing
+single-slot behavior even when a larger entry count is requested; these flags do not add
+transport support to another backend or architecture.

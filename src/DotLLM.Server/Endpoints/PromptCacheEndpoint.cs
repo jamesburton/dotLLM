@@ -18,27 +18,7 @@ public static class PromptCacheEndpoint
     public static void Map(WebApplication app)
     {
         app.MapGet("/v1/prompt-cache", (ServerState state) =>
-        {
-            var mgr = state.PrefixTrieManager;
-            if (mgr is null)
-                return Results.Ok(EmptyStats());
-
-            var stats = mgr.GetStats();
-            return Results.Ok(new PromptCacheStatsResponse
-            {
-                Enabled = stats.Enabled,
-                BlockSize = stats.BlockSize,
-                Nodes = stats.NodeCount,
-                HitTokens = stats.HitTokens,
-                MissTokens = stats.MissTokens,
-                Lookups = stats.Lookups,
-                Hits = stats.Hits,
-                Misses = stats.Misses,
-                EvictionRefusals = stats.EvictionRefusals,
-                FreeBlocks = stats.FreeBlocks,
-                TotalBlocks = stats.TotalBlocks,
-            });
-        });
+            Results.Ok(BuildStats(state.PrefixTrieManager, state.Generator?.RecurrentPrefixStatistics)));
 
         app.MapGet("/v1/prompt-cache/{id}", (string id, ServerState state) =>
         {
@@ -120,11 +100,31 @@ public static class PromptCacheEndpoint
                 : Results.NotFound(ErrorResponse.NotFound($"prefix_id '{id}' not registered.", param: "prefix_id"));
         });
 
-        app.MapDelete("/v1/prompt-cache", (ServerState state) =>
+        app.MapDelete("/v1/prompt-cache", async (ServerState state, CancellationToken ct) =>
         {
-            state.PrefixTrieManager?.Trie.Clear();
+            await state.ExecuteAsync(() =>
+            {
+                state.PrefixTrieManager?.Trie.Clear();
+                state.Generator?.ClearRecurrentPrefixCache();
+                return Task.CompletedTask;
+            }, ct);
             return Results.Ok(new StatusResponse { Status = "cleared" });
         });
+    }
+
+    internal static PromptCacheStatsResponse BuildStats(PrefixTrieManager? manager, RecurrentPrefixCacheStatistics? recurrent)
+    {
+        if (manager is null)
+            return EmptyStats() with { Enabled = recurrent?.Enabled == true, Recurrent = recurrent };
+        var stats = manager.GetStats();
+        return new PromptCacheStatsResponse
+        {
+            Enabled = stats.Enabled || recurrent?.Enabled == true,
+            BlockSize = stats.BlockSize, Nodes = stats.NodeCount, HitTokens = stats.HitTokens,
+            MissTokens = stats.MissTokens, Lookups = stats.Lookups, Hits = stats.Hits, Misses = stats.Misses,
+            EvictionRefusals = stats.EvictionRefusals, FreeBlocks = stats.FreeBlocks, TotalBlocks = stats.TotalBlocks,
+            Recurrent = recurrent,
+        };
     }
 
     private static PromptCacheStatsResponse EmptyStats() => new()

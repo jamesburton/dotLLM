@@ -64,6 +64,7 @@ public sealed class ResidentModelSnapshot : IDisposable
     /// <summary>Disposes every owned live object.</summary>
     public void Dispose()
     {
+        Generator?.ClearRecurrentPrefixCache();
         PrefixCache?.Dispose();
         PrefixTrieManager?.Dispose();
         PagedFactory?.Dispose();
