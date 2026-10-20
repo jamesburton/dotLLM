@@ -86,6 +86,32 @@ weights. CPU vec_dot pairs MXFP4 weights with Q8_0-quantized activations
 (nibble→sbyte pshufb LUT + integer MAC), mirroring llama.cpp's
 `ggml_vec_dot_mxfp4_q8_0`.
 
+### NVFP4 (4.5 bits/weight, GGUF type 40, #1038)
+
+```
+struct block_nvfp4 {         // 36 bytes, 64 values (QK_NVFP4 = 64, QK_NVFP4_SUB = 16)
+    uint8_t d[4];            // one UE4M3 scale per 16-element sub-block
+    uint8_t qs[32];          // 64 x 4-bit e2m1 indices
+};
+Value table: the doubled e2m1 table shared with MXFP4
+UE4M3: unsigned, 4 exponent bits (bias 7), 3 mantissa bits, returned halved;
+       0x00 and 0x7F decode to 0, bit 7 is ignored (ggml_ue4m3_to_fp32)
+Unpack: sub-block s owns qs[8s..8s+7]; byte j -> element 16s+j (low nibble), 16s+8+j (high nibble)
+Dequantize: val = kvalues[nibble] * ue4m3_half(d[s])
+```
+
+NVIDIA FP4. A tensor `X.weight` stored as NVFP4 usually has a sibling `X.scale`
+(F32, one element, NVIDIA's "scale2") that multiplies the matmul **output**
+(llama.cpp `build_lora_mm`: `mul_mat(w, x) * w_s`). In NVIDIA's Nemotron 3.5 Bolt
+GGUF these are about 1e-4, so a loader that drops one is off by ~4 orders of
+magnitude. `Nvfp4Support` makes every GGUF loader name the scales it applies and
+refuse the rest. Today only the Nemotron-H SSM projections (`ssm_in`, `ssm_out`) on
+the CPU backend apply them; every other architecture refuses scaled NVFP4 weights,
+and the Vulkan and CUDA loaders refuse NVFP4 entirely.
+
+The CPU vec_dot pairs NVFP4 with Q8_0 activations (two Q8_0 blocks per NVFP4 block),
+a transcription of llama.cpp's `ggml_vec_dot_nvfp4_q8_0` (scalar + AVX2).
+
 ### I2_S (BitNet b1.58 ternary, ~2 bits/weight, GGUF type 36)
 
 ```
