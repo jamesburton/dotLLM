@@ -106,13 +106,16 @@ NVIDIA FP4. A tensor `X.weight` stored as NVFP4 usually has a sibling `X.scale`
 GGUF these are about 1e-4, so a loader that drops one is off by ~4 orders of
 magnitude. `Nvfp4Support` makes every GGUF loader name the scales it applies and
 refuse the rest. Today only the Nemotron-H SSM projections (`ssm_in`, `ssm_out`) apply
-them, on CPU and Vulkan; every other architecture refuses scaled NVFP4 weights, Vulkan
-refuses NVFP4 outside Nemotron-H, and CUDA refuses NVFP4 entirely.
+them, on CPU, Vulkan and CUDA; every other architecture refuses scaled NVFP4 weights, and
+the Vulkan and CUDA loaders refuse NVFP4 outside Nemotron-H.
 
 The CPU vec_dot pairs NVFP4 with Q8_0 activations (two Q8_0 blocks per NVFP4 block),
 a transcription of llama.cpp's `ggml_vec_dot_nvfp4_q8_0` (scalar + AVX2). Vulkan keeps
 the blocks packed and dequantizes in the shader against FP32 activations
 (`matmul_nvfp4_f32_gemv/gemm`, shared `nvfp4_decode.glsl`), applying `X.scale` to the output.
+CUDA (`native/kernels/nvfp4.cu`) decodes with an FP32-activation GEMV that folds in `X.scale`
+(warp per row, ~95 GB/s of weights on an RTX 3060 at Bolt's `ssm_in` shape) and prefills
+through dequant-to-F16 + cuBLAS followed by an in-place scale kernel.
 
 ### I2_S (BitNet b1.58 ternary, ~2 bits/weight, GGUF type 36)
 

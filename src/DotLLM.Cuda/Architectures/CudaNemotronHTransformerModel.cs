@@ -116,6 +116,9 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
         public required QuantizationType OutQt { get; init; }
         public required int OutInputDim { get; init; }
         public required int OutOutputDim { get; init; }
+        /// <summary>Per-tensor ssm_in / ssm_out output scales (#1038; 1 when the GGUF has none).</summary>
+        public required float InScale { get; init; }
+        public required float OutScale { get; init; }
     }
 
     private readonly struct DeviceAttn
@@ -576,7 +579,6 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
 
     private static DeviceSsm UploadDeviceSsmLayer(NemotronHSsmWeights w, ref long maxTileFloats, List<nint> allocs)
     {
-        w.ThrowIfNvfp4OrScaled("CUDA"); // #1038: no NVFP4 kernel and no X.scale multiply on this path yet
         nint inDevice = UploadRawTensorFromHost(w.InWeight, w.InQuantType, w.InOutputDim, w.InInputDim, allocs);
         nint outDevice = UploadRawTensorFromHost(w.OutWeight, w.OutQuantType, w.OutOutputDim, w.OutInputDim, allocs);
         UpdateMaxTile(ref maxTileFloats, (long)w.InOutputDim * w.InInputDim);
@@ -592,6 +594,7 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
             DtBiasDevice = UploadF32ArrayFrom(w.DtBias, allocs),
             NormWeightDevice = UploadF32ArrayFrom(w.NormWeight, allocs),
             OutWeight = outDevice, OutQt = w.OutQuantType, OutInputDim = w.OutInputDim, OutOutputDim = w.OutOutputDim,
+            InScale = w.InScale, OutScale = w.OutScale,
         };
     }
 
@@ -638,9 +641,30 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
     /// <c>CudaQwen3HybridDenseTransformerModel.Gemm</c> minus its I2_S/PQ2_0 branches (NemotronH
     /// GGUFs never carry ternary/PQ2_0 tensors).
     /// </summary>
-    private void Gemm(nint weight, QuantizationType qt, nint x, nint y, int m, int k, int seqLen)
+    /// <summary>
+    /// <c>y[seqLen, m] = scale · (x[seqLen, k] @ W[m, k]ᵀ)</c>. <paramref name="scale"/> is the weight's
+    /// per-tensor <c>X.scale</c> (#1038), applied to the output as llama.cpp's <c>build_lora_mm</c> does.
+    /// </summary>
+    private void Gemm(nint weight, QuantizationType qt, nint x, nint y, int m, int k, int seqLen, float scale = 1.0f)
+    {
+        GemmUnscaled(weight, qt, x, y, m, k, seqLen, scale, out bool scaleApplied);
+        if (!scaleApplied && scale != 1.0f)
+            _kernels.LaunchScaleF32Inplace(y, checked(seqLen * m), scale, _stream.Handle);
+    }
+
+    private void GemmUnscaled(nint weight, QuantizationType qt, nint x, nint y, int m, int k, int seqLen,
+                              float scale, out bool scaleApplied)
     {
         nint streamH = _stream.Handle;
+        scaleApplied = false;
+
+        if (qt == QuantizationType.NVFP4 && seqLen == 1)
+        {
+            // #1038: packed decode GEMV, FP32 activations, scale folded into the kernel.
+            _kernels.LaunchNvfp4GemvF32(weight, x, y, m, k, scale, streamH);
+            scaleApplied = true;
+            return;
+        }
 
         if (qt == QuantizationType.F32)
         {
@@ -695,6 +719,16 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
 
         _kernels.LaunchDequantToF16(weight, qt, _dequantScratchF16Weight, totalElemsI, streamH);
         _kernels.LaunchConvertF32ToF16(x, _activF16InScratch, activInElems, streamH);
+
+        if (qt == QuantizationType.NVFP4)
+        {
+            // #1038: the product before X.scale (~1e-4 in Bolt) is ~10^4 x the real output and overflows an
+            // FP16 output or FP16 accumulation (NaN logits). Accumulate and write FP32; Gemm then scales.
+            CudaGemm.LinearF16InF32Out(_cublas.Handle, _activF16InScratch, _dequantScratchF16Weight,
+                y, seqLen, k, m, streamH);
+            return;
+        }
+
         CudaGemm.LinearF16(_cublas.Handle, _activF16InScratch, _dequantScratchF16Weight,
             _activF16OutScratch, seqLen, k, m, streamH);
         _kernels.LaunchConvertF16ToF32(_activF16OutScratch, y, activOutElems, streamH);
@@ -788,7 +822,7 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
         nint ssmStatePtr = activeSsm.GetSsmStatePtr(ssmOrdinal);
 
         // 1. ssm_in GEMM: NormOutput[seqLen, hiddenSize] -> Zxbcdt[seqLen, inProjDim].
-        Gemm(ssmW.InWeight, ssmW.InQt, _state.NormOutput, _state.Zxbcdt, inProjDim, hiddenSize, seqLen);
+        Gemm(ssmW.InWeight, ssmW.InQt, _state.NormOutput, _state.Zxbcdt, inProjDim, hiddenSize, seqLen, ssmW.InScale);
 
         // 2. ConvInput = concat(conv_state, xBC rows sliced out of Zxbcdt).
         long convDimBytes = (long)convDim * sizeof(float);
@@ -867,7 +901,7 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
         _kernels.LaunchGroupRmsNormF32(_state.SsmY, ssmW.NormWeightDevice, eps, seqLen, nGroup, groupDim, streamH);
 
         // 12. ssm_out projection into NormOutput.
-        Gemm(ssmW.OutWeight, ssmW.OutQt, _state.SsmY, _state.NormOutput, hiddenSize, dInner, seqLen);
+        Gemm(ssmW.OutWeight, ssmW.OutQt, _state.SsmY, _state.NormOutput, hiddenSize, dInner, seqLen, ssmW.OutScale);
     }
 
     /// <summary>
