@@ -12,7 +12,7 @@
 // s = 2h + L into columns 16L .. 16L+15 of the staged row.
 //
 // NUMERICS (the #1059 overflow class, and llama.cpp b11739 mul_mm_funcs.glsl DATA_A_NVFP4 as the reference):
-//   * The staged F16 operand is KVALUES_FP4[nibble] * ue4m3_half(d): at most 6 significant bits, |v| in [2^-10, 2688], so it is EXACT
+//   * The staged F16 operand is KVALUES_FP4[nibble] * ue4m3_half(d): at most 6 significant bits, |v| in [2^-10, 2880] (0xFF decodes to 240: bit 7 is ignored), so it is EXACT
 //     in F16 (#1060's argument; DequantF16_IsBitExactVsCpu pins it). llama.cpp stages the same unscaled product as FLOAT_TYPE.
 //   * Activations round to F16 when staged, exactly as every other coopmat GEMM here (and llama.cpp's mul_mm) does.
 //   * Products accumulate in F32 coopmat accumulators across the whole K loop.

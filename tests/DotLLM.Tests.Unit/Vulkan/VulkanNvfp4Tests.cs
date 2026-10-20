@@ -206,7 +206,7 @@ public sealed class VulkanNvfp4Tests : IDisposable
     }
 
     /// <summary>
-    /// #1064 regression fixture for #1059's overflow class, at Bolt magnitudes: every weight is the largest NVFP4 value
+    /// #1064 regression fixture for #1059's overflow class, at Bolt magnitudes: every weight is the largest NVFP4 value under a canonical E4M3 scale
     /// (code 7 = 12, times UE4M3 0x7E = 224, i.e. 2688) and every activation 16, over Bolt's K = 4096, so each unscaled dot product
     /// is 4096 x 2688 x 16 = 176 160 768, far past F16's 65 504. Scaled by ~1e-4 it is ~2.3e4. The products and their partial sums
     /// are multiples of 2^11 below 2^28, so F32 accumulation is exact and the only rounding is the one F32 multiply by the scale. An
