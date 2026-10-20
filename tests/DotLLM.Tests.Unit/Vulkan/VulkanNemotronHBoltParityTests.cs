@@ -16,8 +16,8 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// <list type="bullet">
 ///   <item><b>LatentMoE</b>: layers 0 and 1 run their experts on <c>ffn_latent_down(x)</c> and send the weighted sum through
 ///   <c>ffn_latent_up</c>; the router and the shared expert read the full x.</item>
-///   <item><b>Per-layer geometry</b>: the three MoE layers differ in expert count (4 / 6 / 5), top-k (2 / 3 / 1) and width
-///   (512 / 256 / 256), and layer 2 is NOT latent (its experts read the hidden size), so a scratch or dispatch sized from any one
+///   <item><b>Per-layer geometry</b>: the four MoE layers differ in expert count (4 / 6 / 5 / 4), top-k (2 / 3 / 1 / 2) and width
+///   (512 / 256 / 256 / 256), and layers 2 and 3 are NOT latent (its experts read the hidden size), so a scratch or dispatch sized from any one
 ///   layer, or a latent switch applied model-wide, is wrong somewhere.</item>
 ///   <item><b>K-quant expert banks</b>: Q4_K / Q5_K / Q6_K / Q8_0, the AD-Q4_K_M and AD-Q6_K mix.</item>
 /// </list>
@@ -34,20 +34,28 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         new(Experts: 4, TopK: 2, Inter: 512, Latent: Latent, UpQt: QuantizationType.Q4_K, DownQt: QuantizationType.Q5_K),
         new(Experts: 6, TopK: 3, Inter: 256, Latent: Latent, UpQt: QuantizationType.Q6_K, DownQt: QuantizationType.Q6_K),
         new(Experts: 5, TopK: 1, Inter: 256, Latent: 0, UpQt: QuantizationType.Q5_K, DownQt: QuantizationType.Q8_0),
+        // A non-latent K-quant layer on the grouped MMQ prefill: its expert output (hidden, 512) is WIDER than its intermediate (256),
+        // so the down projection's tile grid and scratch strides must follow the expert width, not the intermediate.
+        new(Experts: 4, TopK: 2, Inter: 256, Latent: 0, UpQt: QuantizationType.Q4_K, DownQt: QuantizationType.Q5_K),
     ];
 
-    private static readonly int[] Tokens = [3, 9, 1, 14, 6];
-    private static readonly int[] Positions = [0, 1, 2, 3, 4];
+    // 20 rows: at the grouped-prefill threshold (16) and enough that experts receive zero, one and many routed rows.
+    private static readonly int[] Tokens = [3, 9, 1, 14, 6, 0, 11, 5, 15, 2, 8, 12, 7, 4, 13, 10, 3, 9, 6, 1];
+    private static readonly int[] Positions = [.. Enumerable.Range(0, 20)];
 
     private sealed record LayerSpec(int Experts, int TopK, int Inter, int Latent, QuantizationType UpQt, QuantizationType DownQt)
     {
         public int ExpertDim => Latent > 0 ? Latent : Hidden;
     }
 
+    /// <param name="mmvq">dp4a MMVQ indexed arm (int8 activations) vs the F32-activation indexed arm.</param>
+    /// <param name="grouped">Expert-grouped prefill (#1046): layer 0 (Q4_K/Q5_K) takes the dp4a MMQ kernels, layer 1 (Q6_K/Q6_K) the coopmat
+    /// kernels, layer 2 (Q8_0 down) stays indexed, layer 3 (non-latent Q4_K/Q5_K) takes MMQ with a down width above its intermediate. Single-token forwards are below the threshold, so they check the indexed decode arm.</param>
     [SkippableTheory]
-    [InlineData(true)]    // dp4a MMVQ arm (the default; int8-quantized activations)
-    [InlineData(false)]   // F32-activation indexed arm (tight)
-    public void Forward_BoltLatentHeterogeneousKQuant_MatchesCpuAndReference(bool mmvq)
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    public void Forward_BoltLatentHeterogeneousKQuant_MatchesCpuAndReference(bool mmvq, bool grouped)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
@@ -65,16 +73,31 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         float cpuVsExact = MaxDiff(exact, cpu);
         Assert.True(cpuVsExact * 4 < control, $"CPU oracle vs reference {cpuVsExact:E3} is not small against the bias effect {control:E3}");
 
-        bool saved = VulkanNemotronHTransformerModel.MoeMmvqEnabled;
+        bool saved = VulkanNemotronHTransformerModel.MoeMmvqEnabled, savedGrouped = VulkanNemotronHTransformerModel.MoeGroupedEnabled;
         VulkanNemotronHTransformerModel.MoeMmvqEnabled = mmvq;
+        VulkanNemotronHTransformerModel.MoeGroupedEnabled = grouped;
         VulkanNemotronHTransformerModel.MoePathCounters.Reset();
         try
         {
             float[] vk = fx.Vulkan(device, spvDir, Tokens, Positions);
             long viaMmvq = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.Mmvq);
             long viaF32 = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.F32Indexed);
-            if (mmvq) Assert.True(viaMmvq > 0 && viaF32 == 0, $"MMVQ arm did not run for every bank (mmvq={viaMmvq}, f32={viaF32})");
-            else Assert.True(viaF32 > 0 && viaMmvq == 0, $"F32 indexed arm did not run for every bank (mmvq={viaMmvq}, f32={viaF32})");
+            long viaMmq = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.GroupedMmq);
+            long viaCoopmat = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.GroupedCoopmat);
+            output.WriteLine($"paths: mmvq={viaMmvq} f32={viaF32} groupedMmq={viaMmq} groupedCoopmat={viaCoopmat}");
+            if (grouped)
+            {
+                // One forward: layers 0 and 3 on MMQ, layer 1 on coopmat (where the device has them), layer 2 (Q8_0 down) indexed.
+                if (device.HasIntegerDotProduct) Assert.Equal(2, viaMmq);
+                if (device.HasCooperativeMatrix) Assert.Equal(1, viaCoopmat);
+                Assert.True(viaMmq + viaCoopmat > 0, "no layer took the grouped prefill");
+            }
+            else
+            {
+                Assert.True(viaMmq + viaCoopmat == 0, $"grouped prefill ran while disabled (mmq={viaMmq}, coopmat={viaCoopmat})");
+                if (mmvq) Assert.True(viaMmvq > 0 && viaF32 == 0, $"MMVQ arm did not run for every bank (mmvq={viaMmvq}, f32={viaF32})");
+                else Assert.True(viaF32 > 0 && viaMmvq == 0, $"F32 indexed arm did not run for every bank (mmvq={viaMmvq}, f32={viaF32})");
+            }
 
             // Single-token forwards (the decode dispatch shapes) must agree with the batched forward row for row: the model has no
             // attention or SSM layer, so every row is independent.
@@ -88,13 +111,18 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
             // Both arms are held to the double-precision reference. The F32-activation arm is exact up to F32 / F16-GEMM rounding; the dp4a
             // arm rounds every expert activation to int8 per 32-block, which relu^2 and the x5 routing scale amplify (measured ~0.05 on
             // logits of this fixture; the CPU oracle, which quantizes its K-quant dot activations to Q8_K, sits ~0.5 from the reference).
-            float tol = mmvq ? 0.1f : 5e-3f;
+            // The grouped kernels round activations to Q8_1 (MMQ) or F16 (coopmat): the dp4a tolerance.
+            float tol = mmvq || grouped ? 0.1f : 5e-3f;
             Assert.True(tol * 10 < control, $"tolerance {tol} is not small against the bias effect {control:E3}");
             Assert.True(vsExact <= tol, $"max |reference - vulkan(batched, mmvq={mmvq})| = {vsExact:E3} > {tol}");
             Assert.True(rowsVsExact <= tol, $"max |reference - vulkan(single-token, mmvq={mmvq})| = {rowsVsExact:E3} > {tol}");
             Assert.True(vsCpu * 4 < control, $"max |cpu - vulkan| = {vsCpu:E3} is not small against the bias effect {control:E3}");
         }
-        finally { VulkanNemotronHTransformerModel.MoeMmvqEnabled = saved; }
+        finally
+        {
+            VulkanNemotronHTransformerModel.MoeMmvqEnabled = saved;
+            VulkanNemotronHTransformerModel.MoeGroupedEnabled = savedGrouped;
+        }
     }
 
     private static float MaxDiff(float[] a, float[] b)
@@ -133,7 +161,7 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
                 NumAttentionHeads = 1,
                 NumKvHeads = 1,
                 HeadDim = Hidden,
-                MaxSequenceLength = 16,
+                MaxSequenceLength = 64,
                 AttentionType = AttentionType.GQA,
                 PositionEncodingType = PositionEncodingType.None,
                 ActivationFunction = ActivationFunction.ReluSquared,
