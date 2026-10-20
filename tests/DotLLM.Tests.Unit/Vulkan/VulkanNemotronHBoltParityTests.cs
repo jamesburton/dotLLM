@@ -176,8 +176,14 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         // Control: the fixture must be sensitive to the selection bias, or "matches CPU" proves nothing about the routing.
         float control = MaxDiff(cpu, cpuNoBias);
         Assert.True(control > 0.05f, $"fixture insensitive to the selection bias (max logit delta {control:E3})");
+        // The CPU oracle quantizes its IQ dot activations to Q8_K (one scale per 256 elements, as llama.cpp's CPU IQ2_XXS dot does), and
+        // the down projection reads a relu^2 output whose small values that rounding crushes: on IQ2_XXS banks it sits ~1.1 from the
+        // reference against a ~3.4 bias effect (K-quant banks: ~0.5), so it is held to half the bias effect there, a quarter otherwise.
+        // Vulkan itself is held to the reference at the tight tolerance below on every bank type.
+        bool iqBanks = specs.Any(s => s.UpQt == QuantizationType.IQ2_XXS || s.DownQt == QuantizationType.IQ2_XXS);
+        int cpuMargin = iqBanks ? 2 : 4;
         float cpuVsExact = MaxDiff(exact, cpu);
-        Assert.True(cpuVsExact * 4 < control, $"CPU oracle vs reference {cpuVsExact:E3} is not small against the bias effect {control:E3}");
+        Assert.True(cpuVsExact * cpuMargin < control, $"CPU oracle vs reference {cpuVsExact:E3} is not small against the bias effect {control:E3}");
 
         bool saved = VulkanNemotronHTransformerModel.MoeMmvqEnabled, savedGrouped = VulkanNemotronHTransformerModel.MoeGroupedEnabled;
         VulkanNemotronHTransformerModel.MoeMmvqEnabled = mmvq;
@@ -208,12 +214,11 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
             // arm rounds every expert activation to int8 per 32-block, which relu^2 and the x5 routing scale amplify (measured ~0.05 on
             // logits of this fixture; the CPU oracle, which quantizes its K-quant dot activations to Q8_K, sits ~0.5 from the reference).
             // The grouped kernels round activations to Q8_1 (MMQ) or F16 (coopmat): the dp4a tolerance. So do IQ banks on every arm (#1057).
-            bool iqBanks = specs.Any(s => s.UpQt == QuantizationType.IQ2_XXS || s.DownQt == QuantizationType.IQ2_XXS);
             float tol = mmvq || grouped || iqBanks ? 0.1f : 5e-3f;
             Assert.True(tol * 10 < control, $"tolerance {tol} is not small against the bias effect {control:E3}");
             Assert.True(vsExact <= tol, $"max |reference - vulkan(batched, mmvq={mmvq})| = {vsExact:E3} > {tol}");
             Assert.True(rowsVsExact <= tol, $"max |reference - vulkan(single-token, mmvq={mmvq})| = {rowsVsExact:E3} > {tol}");
-            Assert.True(vsCpu * 4 < control, $"max |cpu - vulkan| = {vsCpu:E3} is not small against the bias effect {control:E3}");
+            Assert.True(vsCpu * cpuMargin < control, $"max |cpu - vulkan| = {vsCpu:E3} is not small against the bias effect {control:E3}");
         }
         finally
         {
