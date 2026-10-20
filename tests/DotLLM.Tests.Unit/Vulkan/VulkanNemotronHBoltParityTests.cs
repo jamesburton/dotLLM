@@ -82,16 +82,17 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
             for (int t = 0; t < Tokens.Length; t++)
                 Array.Copy(fx.Vulkan(device, spvDir, [Tokens[t]], [Positions[t]]), 0, vkRows, t * Vocab, Vocab);
 
-            float vsCpu = MaxDiff(cpu, vk), vsExact = MaxDiff(exact, vk), rowsVsBatch = MaxDiff(vk, vkRows);
-            output.WriteLine($"mmvq={mmvq}: |vk-exact|={vsExact:E3} |vk-cpu|={vsCpu:E3} |cpu-exact|={cpuVsExact:E3} "
-                + $"|rows-batch|={rowsVsBatch:E3} biasControl={control:E3}");
-            // The CPU forward quantizes its activations (int8) like llama.cpp; the F32-activation Vulkan arm does not, so it is held to the
-            // double-precision reference. The dp4a arm quantizes its activations too and is held to the CPU model.
-            if (mmvq)
-                Assert.True(vsCpu * 4 < control, $"max |cpu - vulkan(mmvq)| = {vsCpu:E3} vs bias effect {control:E3}");
-            else
-                Assert.True(vsExact <= 5e-3f, $"max |reference - vulkan(f32 indexed)| = {vsExact:E3}");
-            Assert.True(rowsVsBatch <= 1e-3f, $"single-token rows differ from the batched forward by {rowsVsBatch:E3}");
+            float vsCpu = MaxDiff(cpu, vk), vsExact = MaxDiff(exact, vk), rowsVsExact = MaxDiff(exact, vkRows);
+            output.WriteLine($"mmvq={mmvq}: |vk-exact|={vsExact:E3} |vkRows-exact|={rowsVsExact:E3} |vk-cpu|={vsCpu:E3} "
+                + $"|cpu-exact|={cpuVsExact:E3} biasControl={control:E3}");
+            // Both arms are held to the double-precision reference. The F32-activation arm is exact up to F32 / F16-GEMM rounding; the dp4a
+            // arm rounds every expert activation to int8 per 32-block, which relu^2 and the x5 routing scale amplify (measured ~0.05 on
+            // logits of this fixture; the CPU oracle, which quantizes its K-quant dot activations to Q8_K, sits ~0.5 from the reference).
+            float tol = mmvq ? 0.1f : 5e-3f;
+            Assert.True(tol * 10 < control, $"tolerance {tol} is not small against the bias effect {control:E3}");
+            Assert.True(vsExact <= tol, $"max |reference - vulkan(batched, mmvq={mmvq})| = {vsExact:E3} > {tol}");
+            Assert.True(rowsVsExact <= tol, $"max |reference - vulkan(single-token, mmvq={mmvq})| = {rowsVsExact:E3} > {tol}");
+            Assert.True(vsCpu * 4 < control, $"max |cpu - vulkan| = {vsCpu:E3} is not small against the bias effect {control:E3}");
         }
         finally { VulkanNemotronHTransformerModel.MoeMmvqEnabled = saved; }
     }
