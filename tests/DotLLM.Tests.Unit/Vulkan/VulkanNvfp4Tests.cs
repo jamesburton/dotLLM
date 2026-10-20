@@ -351,9 +351,8 @@ public sealed class VulkanNvfp4Tests : IDisposable
                 Assert.IsType<VulkanNemotronHTransformerModel>(model);
                 using ITensor logits = model.Forward(NemotronHNvfp4SsmTests.Ids, NemotronHNvfp4SsmTests.Pos, deviceId: -1);
                 vk = LastRow(logits);
-                var nemotron = (VulkanNemotronHTransformerModel)model;
-                scratchBytes = nemotron.F16PrefillScratchBytes;
-                scratchCapacity = nemotron.F16PrefillScratchCapacityBytes;
+                scratchBytes = ((VulkanNemotronHTransformerModel)model).F16PrefillScratchBytes;
+                scratchCapacity = ((VulkanNemotronHTransformerModel)model).F16PrefillScratchCapacityBytes;
             }
         }
 
