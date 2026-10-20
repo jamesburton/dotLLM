@@ -170,6 +170,7 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         using var fx = new Fixture(zeroBias: false, specs);
         float[] cpu = fx.Cpu(Tokens, Positions);
         float[] exact = fx.Reference(Tokens);
+        output.WriteLine($"min routing margin {fx.MinRoutingMargin:E3}");
         float[] cpuNoBias;
         using (var noBias = new Fixture(zeroBias: true, specs)) cpuNoBias = noBias.Cpu(Tokens, Positions);
 
@@ -265,6 +266,14 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         private readonly NemotronHLayerWeights[] _layers;
         private readonly ModelConfig _config;
 
+        /// <summary>
+        /// Smallest gap, over every token and layer of the last <see cref="Reference"/> call, between the k-th and (k+1)-th selection
+        /// scores (sigmoid probability + bias). A near-tie lets rounding that is legitimate on one arm (int8 activations, GEMV vs GEMM
+        /// summation order) pick a different expert, which moves the logits by about the bias effect; parity is only meaningful when
+        /// every routing decision clears that rounding.
+        /// </summary>
+        public double MinRoutingMargin { get; private set; } = double.PositiveInfinity;
+
         public Fixture(bool zeroBias, LayerSpec[] specs)
         {
             _specs = specs;
@@ -353,7 +362,11 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
                         for (int i = 0; i < Hidden; i++) s += router[e * Hidden + i] * h[i];
                         probs[e] = 1.0 / (1.0 + Math.Exp(-s));
                     }
-                    int[] top = Enumerable.Range(0, n).OrderByDescending(e => probs[e] + moe.SelectionBias[e]).ThenBy(e => e).Take(topK).ToArray();
+                    int[] ranked = Enumerable.Range(0, n).OrderByDescending(e => probs[e] + moe.SelectionBias[e]).ThenBy(e => e).ToArray();
+                    int[] top = ranked.Take(topK).ToArray();
+                    if (topK < n)
+                        MinRoutingMargin = Math.Min(MinRoutingMargin,
+                            probs[ranked[topK - 1]] + moe.SelectionBias[ranked[topK - 1]] - probs[ranked[topK]] - moe.SelectionBias[ranked[topK]]);
                     double sum = top.Sum(e => probs[e]);
                     double[] w = top.Select(e => probs[e] / Math.Max(sum, 6.103515625e-5) * moe.WeightsScale).ToArray();
 
