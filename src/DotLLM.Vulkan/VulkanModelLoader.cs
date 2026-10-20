@@ -93,8 +93,10 @@ public static class VulkanModelLoader
         ArgumentNullException.ThrowIfNull(config);
         ArgumentNullException.ThrowIfNull(spvDir);
 
-        // #1038: no NVFP4 kernels on Vulkan yet. Refuse before any upload rather than widen and mis-scale.
-        Nvfp4Support.RejectAny(gguf.TensorsByName, "Vulkan");
+        // #1038: Vulkan NVFP4 runs on the Nemotron-H path only (packed matmul + X.scale). Every other
+        // architecture would widen it and drop the scale, so refuse before any upload.
+        if (config.Architecture is not (Architecture.NemotronH or Architecture.NemotronHMoe))
+            Nvfp4Support.RejectAny(gguf.TensorsByName, "Vulkan");
 
         switch (config.Architecture)
         {

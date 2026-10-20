@@ -85,6 +85,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     // IQ4_NL / IQ4_XS matmul kernels — IQ-family follow-up to the K-quant
     // Phase 1 work. Always created; dispatcher routes per device-side
     // QuantizationType.
+    // NVFP4 GEMV + GEMM (#1038); applies the per-tensor X.scale. Set by BuildFromPrebuiltWeights.
+    private MatMulNvfp4F32Kernel? _matmulNvfp4;
     private readonly MatMulIq4NlGemvF32Kernel _matmulIq4Nl;
     private readonly MatMulIq4NlGemmF32Kernel _matmulIq4NlGemm;
     private readonly MatMulIq4XsGemvF32Kernel _matmulIq4Xs;
@@ -600,6 +602,15 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             ssmSplitXbc,
             submit);
         created._moe = moeKernels;
+        try
+        {
+            created._matmulNvfp4 = MatMulNvfp4F32Kernel.Create(device, spvDir);
+        }
+        catch
+        {
+            created.Dispose();
+            throw;
+        }
         return created;
     }
 
@@ -1078,7 +1089,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
         // 1. ssm_in matmul: NormOutput[seqLen, hidden] @ InWeight^T → Zxbcdt[seqLen, inProjDim]
         RecordMatmul(cmdBuf, ssmW.InWeight, ssmW.InDeviceQuantType, _state.NormOutput, _state.Zxbcdt,
-            outputDim: ssmW.InOutputDim, inputDim: ssmW.InInputDim, seqLen: seqLen);
+            outputDim: ssmW.InOutputDim, inputDim: ssmW.InInputDim, seqLen: seqLen, scale: ssmW.InScale);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.ProjGdn);
 
@@ -1216,7 +1227,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
         // 12. ssm_out matmul: SsmY @ OutWeight^T → NormOutput.
         RecordMatmul(cmdBuf, ssmW.OutWeight, ssmW.OutDeviceQuantType, _state.SsmY, _state.NormOutput,
-            outputDim: ssmW.OutOutputDim, inputDim: ssmW.OutInputDim, seqLen: seqLen);
+            outputDim: ssmW.OutOutputDim, inputDim: ssmW.OutInputDim, seqLen: seqLen, scale: ssmW.OutScale);
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.ProjGdn);
     }
 
@@ -1955,6 +1966,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulQ6KGemmCoopmat?.InvalidateDescriptorCache();
         _matmulIq4Nl.InvalidateDescriptorCache();
         _matmulIq4NlGemm.InvalidateDescriptorCache();
+        _matmulNvfp4?.InvalidateDescriptorCache();
         _matmulIq4Xs.InvalidateDescriptorCache();
         _matmulIq4XsGemm.InvalidateDescriptorCache();
         _matmulIq2Xxs.InvalidateDescriptorCache();
@@ -2010,8 +2022,18 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         nint cmdBuf,
         VulkanDevice.Buffer weights, QuantizationType weightQt,
         VulkanDevice.Buffer input, VulkanDevice.Buffer output,
-        int outputDim, int inputDim, int seqLen)
+        int outputDim, int inputDim, int seqLen, float scale = 1.0f)
     {
+        if (weightQt == QuantizationType.NVFP4)
+        {
+            // #1038: the only kernel that takes the per-tensor X.scale.
+            (_matmulNvfp4 ?? throw new InvalidOperationException("NVFP4 matmul kernel was not created."))
+                .Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen, scale: scale);
+            return;
+        }
+
+        VulkanNemotronHWeights.ThrowIfScaleUnsupported("projection", scale, weightQt);
+
         if (weightQt == QuantizationType.Q8_0)
         {
             if (seqLen == 1)
@@ -2334,6 +2356,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulIq4Xs.Dispose();
         _matmulIq4NlGemm.Dispose();
         _matmulIq4Nl.Dispose();
+        _matmulNvfp4?.Dispose();
         _matmulIq3SGemm.Dispose();
         _matmulIq3S.Dispose();
         _matmulIq3XxsGemm.Dispose();
