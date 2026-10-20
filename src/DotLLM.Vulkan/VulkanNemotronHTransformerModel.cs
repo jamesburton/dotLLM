@@ -1304,6 +1304,38 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         public MoeIndexedMatmulKQuantMmvqKernel? MmvqQ6_K { get; init; }
         public required VulkanDevice.Buffer UnitScale { get; init; }   // per-expert output scale, all ones
 
+        // Expert-grouped prefill (#1046); null when the device / SPIR-V set lacks them (the layer keeps the indexed path).
+        public MoeExpertOffsetsKernel? ExpertOffsets { get; init; }
+        public MoeBuildTileListKernel? BuildTileList { get; init; }
+        public MoeExpandGatherGroupF32Kernel? GatherGroupF32 { get; init; }
+        public MoeExpandGatherGroupQ8_1Kernel? GatherGroupQ8_1 { get; init; }
+        public MoeWeightedScatterGroupedF32Kernel? ScatterGrouped { get; init; }
+        public MoeGroupedMatmulKQuantMmqKernel? GroupedMmqQ4_K { get; init; }
+        public MoeGroupedMatmulKQuantMmqKernel? GroupedMmqQ5_K { get; init; }
+        public MoeGroupedMatmulKQuantCoopmatKernel? GroupedCoopmatQ4_K { get; init; }
+        public MoeGroupedMatmulKQuantCoopmatKernel? GroupedCoopmatQ5_K { get; init; }
+        public MoeGroupedMatmulKQuantCoopmatKernel? GroupedCoopmatQ6_K { get; init; }
+
+        /// <summary>Whether the shared grouped glue (offsets, F32/Q8_1 gather, grouped scatter) exists.</summary>
+        public bool HasGroupedGlue => ExpertOffsets is not null && ScatterGrouped is not null;
+
+        /// <summary>The dp4a grouped MMQ kernel for a bank of type <paramref name="qt"/>, or null.</summary>
+        public MoeGroupedMatmulKQuantMmqKernel? GroupedMmq(QuantizationType qt) => qt switch
+        {
+            QuantizationType.Q4_K => GroupedMmqQ4_K,
+            QuantizationType.Q5_K => GroupedMmqQ5_K,
+            _ => null,
+        };
+
+        /// <summary>The coopmat grouped kernel for a bank of type <paramref name="qt"/>, or null.</summary>
+        public MoeGroupedMatmulKQuantCoopmatKernel? GroupedCoopmat(QuantizationType qt) => qt switch
+        {
+            QuantizationType.Q4_K => GroupedCoopmatQ4_K,
+            QuantizationType.Q5_K => GroupedCoopmatQ5_K,
+            QuantizationType.Q6_K => GroupedCoopmatQ6_K,
+            _ => null,
+        };
+
         /// <summary>True when a bank of type <paramref name="bankQt"/> has a dp4a MMVQ kernel (and the Q8_1 activation quantizer exists).</summary>
         public bool CanMmvq(QuantizationType bankQt) => Quantize is not null && bankQt switch
         {
@@ -1322,6 +1354,10 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             IndexedQ4_K.InvalidateDescriptorCache(); IndexedQ5_K.InvalidateDescriptorCache(); IndexedQ6_K.InvalidateDescriptorCache();
             Quantize?.InvalidateDescriptorCache(); MmvqQ5_1?.InvalidateDescriptorCache(); MmvqQ8_0?.InvalidateDescriptorCache();
             MmvqQ4_K?.InvalidateDescriptorCache(); MmvqQ5_K?.InvalidateDescriptorCache(); MmvqQ6_K?.InvalidateDescriptorCache();
+            ExpertOffsets?.InvalidateDescriptorCache(); BuildTileList?.InvalidateDescriptorCache();
+            GatherGroupF32?.InvalidateDescriptorCache(); GatherGroupQ8_1?.InvalidateDescriptorCache(); ScatterGrouped?.InvalidateDescriptorCache();
+            GroupedMmqQ4_K?.InvalidateDescriptorCache(); GroupedMmqQ5_K?.InvalidateDescriptorCache();
+            GroupedCoopmatQ4_K?.InvalidateDescriptorCache(); GroupedCoopmatQ5_K?.InvalidateDescriptorCache(); GroupedCoopmatQ6_K?.InvalidateDescriptorCache();
         }
 
         public void Dispose()
@@ -1330,6 +1366,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             IndexedQ4_K.Dispose(); IndexedQ5_K.Dispose(); IndexedQ6_K.Dispose();
             Quantize?.Dispose(); MmvqQ5_1?.Dispose(); MmvqQ8_0?.Dispose();
             MmvqQ4_K?.Dispose(); MmvqQ5_K?.Dispose(); MmvqQ6_K?.Dispose();
+            ExpertOffsets?.Dispose(); BuildTileList?.Dispose(); GatherGroupF32?.Dispose(); GatherGroupQ8_1?.Dispose(); ScatterGrouped?.Dispose();
+            GroupedMmqQ4_K?.Dispose(); GroupedMmqQ5_K?.Dispose();
+            GroupedCoopmatQ4_K?.Dispose(); GroupedCoopmatQ5_K?.Dispose(); GroupedCoopmatQ6_K?.Dispose();
             UnitScale.Dispose();
         }
     }
@@ -1368,8 +1407,12 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         Array.Fill(host, 1.0f);
         device.Upload(host, ones);
         bool mmvq = MoeMmvqEnabled && device.HasIntegerDotProduct;
+        var g = MoeGroupedEnabled ? CreateGroupedMoeKernels(device, spvDir, mmvq) : default;
         return new MoeKernelSet
         {
+            ExpertOffsets = g.Offsets, BuildTileList = g.Tiles, GatherGroupF32 = g.GatherF32, GatherGroupQ8_1 = g.GatherQ8,
+            ScatterGrouped = g.Scatter, GroupedMmqQ4_K = g.Mmq4, GroupedMmqQ5_K = g.Mmq5,
+            GroupedCoopmatQ4_K = g.Cm4, GroupedCoopmatQ5_K = g.Cm5, GroupedCoopmatQ6_K = g.Cm6,
             Router = MoeTopKSigmoidBiasF32Kernel.Create(device, spvDir),
             Broadcast = MoeBroadcastF32Kernel.Create(device, spvDir),
             Scatter = MoeWeightedScatterF32Kernel.Create(device, spvDir),
@@ -1393,7 +1436,79 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     {
         public static long Mmvq;
         public static long F32Indexed;
-        public static void Reset() { Interlocked.Exchange(ref Mmvq, 0); Interlocked.Exchange(ref F32Indexed, 0); }
+        /// <summary>Routed layers run on the expert-grouped dp4a MMQ prefill (#1046).</summary>
+        public static long GroupedMmq;
+        /// <summary>Routed layers run on the expert-grouped coopmat prefill (#1046).</summary>
+        public static long GroupedCoopmat;
+        public static void Reset()
+        {
+            Interlocked.Exchange(ref Mmvq, 0); Interlocked.Exchange(ref F32Indexed, 0);
+            Interlocked.Exchange(ref GroupedMmq, 0); Interlocked.Exchange(ref GroupedCoopmat, 0);
+        }
+    }
+
+    /// <summary><c>DOTLLM_VK_NEMOTRON_MOE_GROUPED=0</c> keeps every routed layer on the indexed (per-row) expert kernels (#1046).</summary>
+    internal static bool MoeGroupedEnabled { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_VK_NEMOTRON_MOE_GROUPED") != "0";
+
+    /// <summary>Smallest batch that takes the grouped prefill; below it the indexed MMVQ wins (same threshold as the Qwen3-MoE host).</summary>
+    internal static int MoeGroupedMinTokens { get; set; } =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_NEMOTRON_MOE_GROUPED_MIN_TOKENS"), out int t) && t > 0 ? t : 16;
+
+    private readonly record struct GroupedMoeKernels(
+        MoeExpertOffsetsKernel? Offsets, MoeBuildTileListKernel? Tiles, MoeExpandGatherGroupF32Kernel? GatherF32,
+        MoeExpandGatherGroupQ8_1Kernel? GatherQ8, MoeWeightedScatterGroupedF32Kernel? Scatter,
+        MoeGroupedMatmulKQuantMmqKernel? Mmq4, MoeGroupedMatmulKQuantMmqKernel? Mmq5,
+        MoeGroupedMatmulKQuantCoopmatKernel? Cm4, MoeGroupedMatmulKQuantCoopmatKernel? Cm5, MoeGroupedMatmulKQuantCoopmatKernel? Cm6);
+
+    /// <summary>
+    /// Creates the expert-grouped prefill kernels (#1046), mirroring the Qwen3-MoE host's set (#637 / #691 / #986): the shared glue, the dp4a
+    /// MMQ grouped kernels (Q4_K / Q5_K, Q8_1 activations, needs integer dot product) and the coopmat grouped kernels (Q4_K / Q5_K / Q6_K, F16
+    /// activations, needs cooperative matrices). Anything missing stays null and the layers it would serve keep the indexed path.
+    /// </summary>
+    private static GroupedMoeKernels CreateGroupedMoeKernels(VulkanDevice device, string spvDir, bool dp4a)
+    {
+        if (!MoeExpandGatherGroupF32Kernel.IsSupportedOn(spvDir) || !MoeWeightedScatterGroupedF32Kernel.IsSupportedOn(spvDir))
+            return default;
+        var offsets = MoeExpertOffsetsKernel.Create(device, spvDir);
+        var tiles = MoeBuildTileListKernel.IsSupportedOn(spvDir) ? MoeBuildTileListKernel.Create(device, spvDir) : null;
+        var gatherF32 = MoeExpandGatherGroupF32Kernel.Create(device, spvDir);
+        var scatter = MoeWeightedScatterGroupedF32Kernel.Create(device, spvDir);
+
+        MoeExpandGatherGroupQ8_1Kernel? gatherQ8 = null;
+        MoeGroupedMatmulKQuantMmqKernel? mmq4 = null, mmq5 = null;
+        if (dp4a && MoeExpandGatherGroupQ8_1Kernel.IsSupportedOn(spvDir))
+        {
+            gatherQ8 = MoeExpandGatherGroupQ8_1Kernel.Create(device, spvDir);
+            if (MoeGroupedMatmulKQuantMmqKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q4_K))
+                mmq4 = MoeGroupedMatmulKQuantMmqKernel.Create(device, spvDir, MoeGroupedKQuant.Q4_K);
+            if (MoeGroupedMatmulKQuantMmqKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q5_K))
+                mmq5 = MoeGroupedMatmulKQuantMmqKernel.Create(device, spvDir, MoeGroupedKQuant.Q5_K);
+        }
+
+        MoeGroupedMatmulKQuantCoopmatKernel? cm4 = null, cm5 = null, cm6 = null;
+        if (MoeGroupedMatmulKQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q4_K)
+            && MoeGroupedMatmulKQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q5_K))
+        {
+            // Row-pair shaders (#691) need the indirect tile list; one tile list serves up and down, so all three share one row tile.
+            bool rowPair = tiles is not null
+                && File.Exists(Path.Combine(spvDir, "moe_grouped_matmul_q4_k_coopmat_m64r2.spv"))
+                && File.Exists(Path.Combine(spvDir, "moe_grouped_matmul_q5_k_coopmat_m64r2.spv"))
+                && File.Exists(Path.Combine(spvDir, "moe_grouped_matmul_q6_k_coopmat_m64r2.spv"));
+            bool q6 = MoeGroupedMatmulKQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q6_K);
+            cm4 = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q4_K, rowPair: rowPair);
+            cm5 = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q5_K, rowPair: rowPair);
+            cm6 = q6 ? MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q6_K, rowPair: rowPair) : null;
+            if (cm4.RowTile != cm5.RowTile || (cm6 is not null && cm6.RowTile != cm4.RowTile))
+            {
+                // One kernel fell back to the 16-row shader: rebuild all on the 16-row form so one tile list fits every pair.
+                cm4.Dispose(); cm5.Dispose(); cm6?.Dispose();
+                cm4 = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q4_K);
+                cm5 = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q5_K);
+                cm6 = q6 ? MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q6_K) : null;
+            }
+        }
+        return new GroupedMoeKernels(offsets, tiles, gatherF32, gatherQ8, scatter, mmq4, mmq5, cm4, cm5, cm6);
     }
 
     /// <summary>
@@ -1430,11 +1545,19 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _reluSquared.Record(cmdBuf, _state.FfnIntermediate, n: seqLen * sharedInter);
         k.Router.Record(cmdBuf, _state.MoeRouterLogits!, m.SelectionBias, _state.MoeTopkIndices!, _state.MoeTopkWeights!,
             seqLen: seqLen, numExperts: numE, k: topK, normTopKProb: m.NormalizeWeights, weightsScale: m.WeightsScale);
-        k.Broadcast.Record(cmdBuf, expertIn, _state.MoeExpandedInput!, seqLen: seqLen, topK: topK, hidden: expertDim);
+        var grouped = seqLen >= MoeGroupedMinTokens ? SelectGroupedPath(k, m, expertDim) : GroupedPath.None;
+        if (grouped == GroupedPath.None)
+            k.Broadcast.Record(cmdBuf, expertIn, _state.MoeExpandedInput!, seqLen: seqLen, topK: topK, hidden: expertDim);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         RecordMatmul(cmdBuf, m.SharedDown, m.SharedDownDeviceQuantType, _state.FfnIntermediate, _state.MoeSharedOut!,
             outputDim: hidden, inputDim: sharedInter, seqLen: seqLen);
+        if (grouped != GroupedPath.None)
+        {
+            RecordGroupedExperts(cmdBuf, k, m, grouped, expertIn, routedOut, seqLen, expertDim);
+        }
+        else
+        {
         RecordExpertMatmul(cmdBuf, k, m.UpBankQuantType, m.UpBank, _state.MoeExpandedInput!, _state.MoeExpandedInputXq!, _state.MoeExpandedInputXds!,
             _state.MoeUpInter!, mDim: inter, kDim: expertDim, rows: rows, numExperts: numE);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
@@ -1448,6 +1571,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
         k.Scatter.Record(cmdBuf, _state.MoeDownRows!, _state.MoeTopkWeights!, routedOut, seqLen: seqLen, topK: topK, hiddenSize: expertDim);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
 
         if (latent)
         {
@@ -1460,6 +1584,132 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
         // Shared expert added unweighted (elementwise, so the in-place a = a + b alias is safe).
         _add.Record(cmdBuf, _state.NormOutput, _state.MoeSharedOut!, _state.NormOutput, seqLen * hidden);
+    }
+
+    /// <summary>Which expert-grouped prefill a routed layer takes (#1046).</summary>
+    private enum GroupedPath { None, Mmq, Coopmat }
+
+    /// <summary>
+    /// Picks the grouped prefill for a layer: dp4a MMQ when both banks have an MMQ kernel (Q4_K / Q5_K), else coopmat when both have a coopmat
+    /// kernel (Q4_K / Q5_K / Q6_K), else none (the layer keeps the indexed kernels, e.g. Q8_0 / Q5_1 banks). K must be whole 256-blocks.
+    /// </summary>
+    private static GroupedPath SelectGroupedPath(MoeKernelSet k, VulkanNemotronHWeights.MoeLayerBuffers m, int expertDim)
+    {
+        if (!k.HasGroupedGlue || expertDim % 256 != 0 || m.MoeIntermediateSize % 256 != 0)
+            return GroupedPath.None;
+        if (k.GatherGroupQ8_1 is not null && k.Quantize is not null
+            && k.GroupedMmq(m.UpBankQuantType) is not null && k.GroupedMmq(m.DownBankQuantType) is not null)
+            return GroupedPath.Mmq;
+        if (k.GatherGroupF32 is not null && k.GroupedCoopmat(m.UpBankQuantType) is not null && k.GroupedCoopmat(m.DownBankQuantType) is not null)
+            return GroupedPath.Coopmat;
+        return GroupedPath.None;
+    }
+
+    /// <summary>
+    /// Expert-grouped routed experts for a prefill batch (#1046): sort the (token, slot) rows by expert, run each used expert's up and down
+    /// projections as one grouped GEMM over its row tiles (the weights are read once per tile, not once per routed row), and combine through
+    /// the inverse permutation. The routed sum lands in <paramref name="routedOut"/> (<c>[seqLen, expertDim]</c>), exactly where the indexed
+    /// path's weighted scatter writes it. Buffer reuse: packed input in <c>MoeExpandedInput</c> (F32) or <c>MoeExpandedInputXq/Xds</c> (Q8_1),
+    /// packed up rows in <c>MoeUpInter</c>, packed down rows in <c>MoeDownRows</c>.
+    /// </summary>
+    private void RecordGroupedExperts(
+        nint cmdBuf, MoeKernelSet k, VulkanNemotronHWeights.MoeLayerBuffers m, GroupedPath path,
+        VulkanDevice.Buffer expertIn, VulkanDevice.Buffer routedOut, int seqLen, int expertDim)
+    {
+        int numE = m.NumExperts, topK = m.NumExpertsPerTok, inter = m.MoeIntermediateSize;
+        int rows = seqLen * topK;
+        var indices = _state.MoeTopkIndices!;
+
+        // Rows per expert and their prefix offsets (also resets the scatter cursors).
+        k.ExpertOffsets!.Record(cmdBuf, indices, _state.MoeGroupCounts!, _state.MoeGroupOffsets!, _state.MoeGroupCounters!,
+            rows: rows, numExperts: numE);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        if (path == GroupedPath.Mmq)
+        {
+            Interlocked.Increment(ref MoePathCounters.GroupedMmq);
+            var upK = k.GroupedMmq(m.UpBankQuantType)!;
+            var downK = k.GroupedMmq(m.DownBankQuantType)!;
+            int tileN = upK.SelectRowTile(seqLen);
+
+            // Quantize the [seqLen, expertDim] token rows ONCE, then gather them (as Q8_1) into expert order: topK x less quantize work.
+            k.Quantize!.Record(cmdBuf, expertIn, _state.MoeTokenXq!, _state.MoeTokenXds!, n: seqLen, k: expertDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            k.GatherGroupQ8_1!.Record(cmdBuf, _state.MoeTokenXq!, _state.MoeTokenXds!, indices, _state.MoeGroupOffsets!, _state.MoeGroupCounters!,
+                _state.MoeExpandedInputXq!, _state.MoeExpandedInputXds!, _state.MoeGroupPerm!, _state.MoeGroupInvPerm!,
+                rows: rows, k: expertDim, numExperts: numE, topK: topK);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+            bool indirect = BuildTiles(cmdBuf, k, numE, upK.MTiles(inter), downK.MTiles(expertDim), tileN);
+            if (indirect)
+                upK.RecordIndirect(cmdBuf, m.UpBank, _state.MoeExpandedInputXq!, _state.MoeExpandedInputXds!, _state.MoeGroupOffsets!,
+                    _state.MoeUpInter!, _state.MoeGroupDispatchArgs!, 0, m: inter, k: expertDim, rows: rows, numExperts: numE, tileN: tileN);
+            else
+                upK.Record(cmdBuf, m.UpBank, _state.MoeExpandedInputXq!, _state.MoeExpandedInputXds!, _state.MoeGroupOffsets!,
+                    _state.MoeUpInter!, m: inter, k: expertDim, rows: rows, numExperts: numE, tileN: tileN, maxRowsPerExpert: seqLen);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+            _reluSquared.Record(cmdBuf, _state.MoeUpInter!, n: rows * inter);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            k.Quantize!.Record(cmdBuf, _state.MoeUpInter!, _state.MoeUpInterXq!, _state.MoeUpInterXds!, n: rows, k: inter);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+            if (indirect)
+                downK.RecordIndirect(cmdBuf, m.DownBank, _state.MoeUpInterXq!, _state.MoeUpInterXds!, _state.MoeGroupOffsets!,
+                    _state.MoeDownRows!, _state.MoeGroupDispatchArgs!, MoeBuildTileListKernel.ArgsStrideBytes,
+                    m: expertDim, k: inter, rows: rows, numExperts: numE, tileN: tileN);
+            else
+                downK.Record(cmdBuf, m.DownBank, _state.MoeUpInterXq!, _state.MoeUpInterXds!, _state.MoeGroupOffsets!,
+                    _state.MoeDownRows!, m: expertDim, k: inter, rows: rows, numExperts: numE, tileN: tileN, maxRowsPerExpert: seqLen);
+        }
+        else
+        {
+            Interlocked.Increment(ref MoePathCounters.GroupedCoopmat);
+            var upK = k.GroupedCoopmat(m.UpBankQuantType)!;
+            var downK = k.GroupedCoopmat(m.DownBankQuantType)!;
+
+            k.GatherGroupF32!.Record(cmdBuf, expertIn, indices, _state.MoeGroupOffsets!, _state.MoeGroupCounters!,
+                _state.MoeExpandedInput!, _state.MoeGroupPerm!, _state.MoeGroupInvPerm!,
+                rows: rows, hidden: expertDim, numExperts: numE, topK: topK);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+            bool indirect = BuildTiles(cmdBuf, k, numE, upK.MTiles(inter), downK.MTiles(expertDim), upK.RowTile);
+            if (indirect)
+                upK.RecordIndirect(cmdBuf, m.UpBank, _state.MoeExpandedInput!, _state.MoeGroupOffsets!, _state.MoeUpInter!,
+                    _state.MoeGroupDispatchArgs!, 0, m: inter, k: expertDim, rows: rows, numExperts: numE);
+            else
+                upK.Record(cmdBuf, m.UpBank, _state.MoeExpandedInput!, _state.MoeGroupOffsets!, _state.MoeUpInter!,
+                    m: inter, k: expertDim, rows: rows, numExperts: numE, maxRowsPerExpert: seqLen);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+            _reluSquared.Record(cmdBuf, _state.MoeUpInter!, n: rows * inter);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+            if (indirect)
+                downK.RecordIndirect(cmdBuf, m.DownBank, _state.MoeUpInter!, _state.MoeGroupOffsets!, _state.MoeDownRows!,
+                    _state.MoeGroupDispatchArgs!, MoeBuildTileListKernel.ArgsStrideBytes, m: expertDim, k: inter, rows: rows, numExperts: numE);
+            else
+                downK.Record(cmdBuf, m.DownBank, _state.MoeUpInter!, _state.MoeGroupOffsets!, _state.MoeDownRows!,
+                    m: expertDim, k: inter, rows: rows, numExperts: numE, maxRowsPerExpert: seqLen);
+        }
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // out[t] = sum_slot w[t, slot] * downPacked[invPerm[t * topK + slot]]: no ungroup pass.
+        k.ScatterGrouped!.Record(cmdBuf, _state.MoeDownRows!, _state.MoeGroupInvPerm!, _state.MoeTopkWeights!, routedOut,
+            seqLen: seqLen, topK: topK, hiddenSize: expertDim);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+    }
+
+    /// <summary>
+    /// Builds the indirect (expert, row-tile) work list for one grouped layer when the kernel exists; returns false when the grouped GEMMs must
+    /// use the dense legacy grid instead.
+    /// </summary>
+    private bool BuildTiles(nint cmdBuf, MoeKernelSet k, int numE, int upMTiles, int downMTiles, int tileRows)
+    {
+        if (k.BuildTileList is null) return false;
+        k.BuildTileList.Record(cmdBuf, _state.MoeGroupOffsets!, _state.MoeGroupDispatchArgs!, numE, upMTiles, downMTiles, tileRows: tileRows);
+        KernelSupport.ComputeToIndirectAndComputeBarrier(cmdBuf);
+        return true;
     }
 
     /// <summary>

@@ -36,18 +36,23 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         new(Experts: 5, TopK: 1, Inter: 256, Latent: 0, UpQt: QuantizationType.Q5_K, DownQt: QuantizationType.Q8_0),
     ];
 
-    private static readonly int[] Tokens = [3, 9, 1, 14, 6];
-    private static readonly int[] Positions = [0, 1, 2, 3, 4];
+    // 20 rows: at the grouped-prefill threshold (16) and enough that experts receive zero, one and many routed rows.
+    private static readonly int[] Tokens = [3, 9, 1, 14, 6, 0, 11, 5, 15, 2, 8, 12, 7, 4, 13, 10, 3, 9, 6, 1];
+    private static readonly int[] Positions = [.. Enumerable.Range(0, 20)];
 
     private sealed record LayerSpec(int Experts, int TopK, int Inter, int Latent, QuantizationType UpQt, QuantizationType DownQt)
     {
         public int ExpertDim => Latent > 0 ? Latent : Hidden;
     }
 
+    /// <param name="mmvq">dp4a MMVQ indexed arm (int8 activations) vs the F32-activation indexed arm.</param>
+    /// <param name="grouped">Expert-grouped prefill (#1046): layer 0 (Q4_K/Q5_K) takes the dp4a MMQ kernels, layer 1 (Q6_K/Q6_K) the coopmat
+    /// kernels, layer 2 (Q8_0 down) stays indexed. Single-token forwards are below the threshold, so they check the indexed decode arm.</param>
     [SkippableTheory]
-    [InlineData(true)]    // dp4a MMVQ arm (the default; int8-quantized activations)
-    [InlineData(false)]   // F32-activation indexed arm (tight)
-    public void Forward_BoltLatentHeterogeneousKQuant_MatchesCpuAndReference(bool mmvq)
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    public void Forward_BoltLatentHeterogeneousKQuant_MatchesCpuAndReference(bool mmvq, bool grouped)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
@@ -65,16 +70,31 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         float cpuVsExact = MaxDiff(exact, cpu);
         Assert.True(cpuVsExact * 4 < control, $"CPU oracle vs reference {cpuVsExact:E3} is not small against the bias effect {control:E3}");
 
-        bool saved = VulkanNemotronHTransformerModel.MoeMmvqEnabled;
+        bool saved = VulkanNemotronHTransformerModel.MoeMmvqEnabled, savedGrouped = VulkanNemotronHTransformerModel.MoeGroupedEnabled;
         VulkanNemotronHTransformerModel.MoeMmvqEnabled = mmvq;
+        VulkanNemotronHTransformerModel.MoeGroupedEnabled = grouped;
         VulkanNemotronHTransformerModel.MoePathCounters.Reset();
         try
         {
             float[] vk = fx.Vulkan(device, spvDir, Tokens, Positions);
             long viaMmvq = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.Mmvq);
             long viaF32 = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.F32Indexed);
-            if (mmvq) Assert.True(viaMmvq > 0 && viaF32 == 0, $"MMVQ arm did not run for every bank (mmvq={viaMmvq}, f32={viaF32})");
-            else Assert.True(viaF32 > 0 && viaMmvq == 0, $"F32 indexed arm did not run for every bank (mmvq={viaMmvq}, f32={viaF32})");
+            long viaMmq = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.GroupedMmq);
+            long viaCoopmat = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.GroupedCoopmat);
+            output.WriteLine($"paths: mmvq={viaMmvq} f32={viaF32} groupedMmq={viaMmq} groupedCoopmat={viaCoopmat}");
+            if (grouped)
+            {
+                // One forward: layer 0 on MMQ, layer 1 on coopmat (where the device has them), layer 2 (Q8_0 down) indexed.
+                if (device.HasIntegerDotProduct) Assert.Equal(1, viaMmq);
+                if (device.HasCooperativeMatrix) Assert.Equal(1, viaCoopmat);
+                Assert.True(viaMmq + viaCoopmat > 0, "no layer took the grouped prefill");
+            }
+            else
+            {
+                Assert.True(viaMmq + viaCoopmat == 0, $"grouped prefill ran while disabled (mmq={viaMmq}, coopmat={viaCoopmat})");
+                if (mmvq) Assert.True(viaMmvq > 0 && viaF32 == 0, $"MMVQ arm did not run for every bank (mmvq={viaMmvq}, f32={viaF32})");
+                else Assert.True(viaF32 > 0 && viaMmvq == 0, $"F32 indexed arm did not run for every bank (mmvq={viaMmvq}, f32={viaF32})");
+            }
 
             // Single-token forwards (the decode dispatch shapes) must agree with the batched forward row for row: the model has no
             // attention or SSM layer, so every row is independent.
@@ -88,13 +108,18 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
             // Both arms are held to the double-precision reference. The F32-activation arm is exact up to F32 / F16-GEMM rounding; the dp4a
             // arm rounds every expert activation to int8 per 32-block, which relu^2 and the x5 routing scale amplify (measured ~0.05 on
             // logits of this fixture; the CPU oracle, which quantizes its K-quant dot activations to Q8_K, sits ~0.5 from the reference).
-            float tol = mmvq ? 0.1f : 5e-3f;
+            // The grouped kernels round activations to Q8_1 (MMQ) or F16 (coopmat): the dp4a tolerance.
+            float tol = mmvq || grouped ? 0.1f : 5e-3f;
             Assert.True(tol * 10 < control, $"tolerance {tol} is not small against the bias effect {control:E3}");
             Assert.True(vsExact <= tol, $"max |reference - vulkan(batched, mmvq={mmvq})| = {vsExact:E3} > {tol}");
             Assert.True(rowsVsExact <= tol, $"max |reference - vulkan(single-token, mmvq={mmvq})| = {rowsVsExact:E3} > {tol}");
             Assert.True(vsCpu * 4 < control, $"max |cpu - vulkan| = {vsCpu:E3} is not small against the bias effect {control:E3}");
         }
-        finally { VulkanNemotronHTransformerModel.MoeMmvqEnabled = saved; }
+        finally
+        {
+            VulkanNemotronHTransformerModel.MoeMmvqEnabled = saved;
+            VulkanNemotronHTransformerModel.MoeGroupedEnabled = savedGrouped;
+        }
     }
 
     private static float MaxDiff(float[] a, float[] b)
