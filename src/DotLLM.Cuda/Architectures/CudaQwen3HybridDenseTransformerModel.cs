@@ -334,7 +334,105 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     private readonly bool _isHeadOnly;
 
     /// <inheritdoc/>
-    public ModelConfig Config { get; }
+    public ModelConfig Config { get; private set; }
+
+    /// <summary>The checkpoint's own context window, before any <see cref="LimitContextLength"/> (issue #1068).</summary>
+    public int NativeMaxSequenceLength { get; }
+
+    /// <summary>
+    /// Lowers the served context window to <paramref name="maxSequenceLength"/> tokens (issue #1068): <see cref="Config"/>'s
+    /// <c>MaxSequenceLength</c> then bounds every position, KV handle and MTP ceiling, and the server reports it in
+    /// <c>/props</c> so clients compact before they reach it.
+    /// </summary>
+    /// <param name="maxSequenceLength">The new window, 1..<see cref="NativeMaxSequenceLength"/>.</param>
+    public void LimitContextLength(int maxSequenceLength)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxSequenceLength);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(maxSequenceLength, NativeMaxSequenceLength);
+        Config = Config with { MaxSequenceLength = maxSequenceLength };
+    }
+
+    /// <summary>
+    /// Peak device bytes one context token costs while serving (issue #1068): its K/V rows in every attention slot under the
+    /// effective storage, the F16 dequant scratch a quantized-KV prefill tile fills over the whole history, the F32 staging
+    /// when the flash-prefill kernel cannot run, and, with MTP, the head's F32 K/V counted twice because a lazy growth
+    /// copies into a new buffer while the old one is still allocated.
+    /// </summary>
+    /// <param name="mtp">Whether MTP self-speculation will run.</param>
+    /// <returns>Bytes per token.</returns>
+    public long ContextBytesPerToken(bool mtp)
+    {
+        int kvElems = Config.NumKvHeads * Config.HeadDim;
+        long bytes = ComputeKvBytes(1);
+        int quantSides = (IsQuantKv(_kvKeyDType) ? 1 : 0) + (IsQuantKv(_kvValueDType) ? 1 : 0);
+        bytes += (long)quantSides * kvElems * sizeof(ushort);
+        bool flashPrefill = FlashPrefillHd256ForTest && _kernels.HasAttentionFlashPrefillHd256
+            && CudaKernels.IsAttentionFlashPrefillHd256Shape(Config.NumAttentionHeads, Config.NumKvHeads, Config.HeadDim);
+        if (!flashPrefill)
+            bytes += 2L * kvElems * sizeof(float);
+        if (mtp && _mtpHead is { } head)
+            bytes += 2 * (2L * head.Layer.FullAttn!.Value.NumKvHeads * Config.HeadDim * sizeof(float) + sizeof(int));
+        return bytes;
+    }
+
+    /// <summary>
+    /// Measures the longest context that fits in free VRAM for serving (issue #1068). First it runs one prefill tile and,
+    /// with MTP, one verify-shaped forward, so every context-independent buffer (forward scratch at the tile size, weight
+    /// dequant scratch, row snapshots, a spare checkpoint) is allocated at its serving size and already out of the free
+    /// figure. Then it releases the context-sized buffers that forward grew, reads free VRAM, and divides what is left after
+    /// <see cref="VramReserveBytes"/> and one more checkpoint (the recurrent-prefix entry keeps one while the decoder takes
+    /// another per round) by <see cref="ContextBytesPerToken"/>. Resets the sequence state.
+    /// </summary>
+    /// <param name="mtp">Whether MTP self-speculation will run.</param>
+    /// <param name="verifyRows">Rows of one speculative verify (K + 1); ignored without MTP.</param>
+    /// <returns>The fit and the numbers behind it.</returns>
+    public HybridContextFit MeasureServingContextFit(bool mtp, int verifyRows)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _context.MakeCurrent();
+        string? sizingError = null;
+        int tile = Math.Min(PrefillChunkTokens > 0 ? PrefillChunkTokens : DefaultPrefillChunkTokens,
+                            Math.Max(1, NativeMaxSequenceLength - Math.Max(verifyRows, 1)));
+        try
+        {
+            using var kv = CreateKvCache(tile + Math.Max(verifyRows, 1));
+            int[] tokens = new int[tile];
+            int[] positions = new int[tile];
+            for (int i = 0; i < tile; i++) { tokens[i] = i % Config.VocabSize; positions[i] = i; }
+            Forward(tokens, positions, deviceId: -1, kv, lastTokenLogitsOnly: true)?.Dispose();
+            if (mtp && verifyRows > 1 && SupportsRecurrentRowSnapshots)
+            {
+                int[] rowPositions = Enumerable.Range(tile, verifyRows).ToArray();
+                ForwardWithRecurrentSnapshots(tokens.AsSpan(0, verifyRows), rowPositions, deviceId: -1, kv, mtpState: null).Dispose();
+            }
+            using (CheckpointRecurrentState() as IDisposable) { }   // allocates the pooled spare
+        }
+        catch (DeviceMemoryAdmissionException ex)
+        {
+            sizingError = ex.Message;
+        }
+        finally
+        {
+            ResetSequenceState();
+            _stream.Synchronize();
+            FreeKvStorage();
+            _f16CacheMaxSeqLen = 0;
+            _f16CacheCurrentLength = 0;
+            _lastForwardKvCache = null;
+            FreeIfNonZero(ref _kvF16ScratchK);
+            FreeIfNonZero(ref _kvF16ScratchV);
+            _kvF16ScratchElems = 0;
+            FreeIfNonZero(ref _f32KvStageK);
+            FreeIfNonZero(ref _f32KvStageV);
+            _f32KvStageElems = 0;
+        }
+
+        long free = FreeVramOverride ?? QueryFreeDeviceBytes();
+        long fixedBytes = _gdnCache.AllocatedBytes;
+        long perToken = ContextBytesPerToken(mtp);
+        int fit = DeviceMemoryBudget.MaxFittingContext(free, VramReserveBytes, fixedBytes, perToken, NativeMaxSequenceLength);
+        return new HybridContextFit(fit, free, VramReserveBytes, fixedBytes, perToken, sizingError);
+    }
 
     /// <inheritdoc/>
     public bool SupportsMtp => _mtpHead is not null;
@@ -676,6 +774,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
 
         Config = config;
         _spillMonitor = new GpuSpillMonitor(() => $"KV allocated for {_f16CacheMaxSeqLen} tokens");
+        NativeMaxSequenceLength = config.MaxSequenceLength;
         _isHeadOnly = isHeadOnly;
         _gguf = gguf;
         _layers = layers;

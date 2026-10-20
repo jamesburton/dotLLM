@@ -191,6 +191,12 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         public int DecisionOrderings { get; set; }
 
         /// <summary>Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog).</summary>
+        [CommandOption("--ctx-size|-c")]
+        [Description("Served context window in tokens (llama.cpp -c). Default: the CUDA hybrid model (Bonsai, Qwen3.5/3.6 dense) fits it to free VRAM " +
+                     "at load and reports it in /props as max_sequence_length; other models keep the checkpoint's window. A value overrides the fit " +
+                     "(capped at the checkpoint's window); past the fit, requests are refused with an out-of-memory error instead of spilling into system RAM.")]
+        public int? CtxSize { get; set; }
+
         [CommandOption("--prefill-chunk-size|--ubatch-size")]
         [Description("Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog). 0 = whole prompt in one pass (default). With the continuous-batch scheduler this caps prefill tokens admitted per step instead.")]
         [DefaultValue(0)]
@@ -397,6 +403,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             PrefixSnapshotHostBudgetBytes = ServerOptions.ParsePrefixSnapshotHostBudget(settings.PrefixSnapshotHostBudget),
             PrefixSnapshotDiskDirectory = settings.PrefixSnapshotDiskDirectory,
             PrefixSnapshotDiskBudgetBytes = ServerOptions.ParsePrefixSnapshotDiskBudget(settings.PrefixSnapshotDiskBudget),
+            ContextSize = settings.CtxSize is > 0 ? settings.CtxSize : null,
             KeepAliveSeconds = settings.KeepAlive,
             MaxResidentModels = settings.MaxResidentModels,
             ResidentMemoryBudgetBytes = settings.ResidentMemoryBudgetBytes,

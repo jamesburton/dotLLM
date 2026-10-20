@@ -578,6 +578,23 @@ The CUDA hybrid model (Qwen3HybridDense: Bonsai, Qwen3.5/3.6 dense) now refuses 
   another 256 MiB above its post-load level. That catches a spill admission cannot prevent, for example when another
   program takes the VRAM the server was counting on.
 
+### The served context is fitted to free VRAM
+
+The checkpoint's window (262,144 tokens for Bonsai-2) is far more than a 12 GB card holds next to 7 GB of weights, and a
+client that believes it keeps the conversation growing until the KV cache no longer fits. So at load, after warm-up, the
+server runs one prefill tile (and, with MTP, one verify) to allocate every fixed-size buffer, then divides the free VRAM
+left after the reserve by the per-token cost (KV rows in every attention layer under the chosen `--kv-quant-k/-v`, the
+quantized-KV dequant scratch, and the MTP head's KV) and serves that many tokens, rounded down to 1024:
+
+```
+[dotllm] Context window: 61440 of 262144 tokens, fitted to free VRAM (2610 MiB free after load, 512 MiB reserve, 144 MiB fixed, 46.1 KiB/token, q8_0 KV + MTP). Set --ctx-size to override.
+```
+
+`GET /props` reports it as `max_sequence_length`, and requests are validated against it (a prompt past it is rejected as
+`context_length_exceeded`, and `max_tokens` is clamped to what remains), so agent clients such as CodeSharp compact in
+time. `--ctx-size N` (`-c N`) sets the window explicitly, capped at the checkpoint's; a value above the fit is logged as a
+warning, and a request that then outgrows VRAM fails with an out-of-memory error rather than spilling.
+
 ### Turning sysmem fallback off in the driver
 
 For a dedicated inference box, make the driver fail the allocation instead of spilling. In **NVIDIA Control Panel >
