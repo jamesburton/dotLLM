@@ -112,6 +112,30 @@ public sealed class CudaQwen3HybridDenseVramAdmissionTests : IDisposable
         Assert.Contains("checkpoint", ex.Message);
     }
 
+    [SkippableFact]
+    public void PrefixSnapshots_UseTheSharedAdmission_ForDeviceCopiesAndRequestHeadroom()
+    {
+        // Rebase onto the #1033/#1034 prefix cache: a device snapshot and the restore headroom check each kept their own 512 MiB
+        // margin and read cuMemGetInfo directly. Both now go through the shared reserve, so the override drives them too.
+        using var l = Load(withMtp: false, contextLength: 64);
+        var model = l.Model;
+        var provider = (DotLLM.Core.Models.IRecurrentPrefixSnapshotProvider)model;
+        using var kv = model.CreateKvCache(16);
+        using (ITensor _ = model.Forward([1, 4, 7], [0, 1, 2], deviceId: -1, kv, lastTokenLogitsOnly: true)) { }
+        using var larger = model.CreateKvCache(64);
+
+        CudaQwen3HybridDenseTransformerModel.FreeVramOverride = Reserve;
+        Assert.Throws<DeviceMemoryAdmissionException>(
+            () => provider.CapturePrefixSnapshot(kv, 3, DotLLM.Core.Models.RecurrentPrefixSnapshotStorage.Device));
+        Assert.False(model.HasPrefixSnapshotRequestHeadroom(larger));
+
+        CudaQwen3HybridDenseTransformerModel.FreeVramOverride = Reserve + model.ComputeKvBytes(64);
+        Assert.True(model.HasPrefixSnapshotRequestHeadroom(larger));
+        CudaQwen3HybridDenseTransformerModel.FreeVramOverride = null;   // the real card has room for a few KiB
+        using var snapshot = provider.CapturePrefixSnapshot(kv, 3, DotLLM.Core.Models.RecurrentPrefixSnapshotStorage.Device);
+        Assert.Equal(3, snapshot.PrefixLength);
+    }
+
     private Loaded Load(bool withMtp, int contextLength = 16)
     {
         Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");

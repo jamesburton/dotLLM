@@ -53,11 +53,45 @@ public sealed class DeviceMemoryAdmissionResponseTests
         Assert.DoesNotContain("[DONE]", raw);
     }
 
-    private static async Task Run(HttpContext ctx)
+    [Fact]
+    public async Task ARefusalMidMessagesStream_ReachesTheHandler_AsInvalidRequest_NotApiError()
+    {
+        // The endpoint's own catch-all used to swallow the refusal as an api_error, which the Anthropic SDK retries.
+        var (ctx, body) = Context("/v1/messages", started: true);
+        await Run(ctx, c => DotLLM.Server.Endpoints.MessagesEndpoint.WriteMessageStreamAsync(
+            c, _ => RefusingTokens(), (work, _) => work(), null, null, "msg_1", "m", 7, CancellationToken.None));
+
+        string raw = Encoding.UTF8.GetString(body.ToArray());
+        Assert.Contains("\"type\":\"invalid_request_error\"", raw);
+        Assert.DoesNotContain("api_error", raw);
+    }
+
+    [Fact]
+    public async Task ARefusalMidCompletionsStream_ReachesTheHandler_AsContextLengthExceeded_Not500()
+    {
+        var (ctx, body) = Context("/v1/completions", started: true);
+        await Run(ctx, c => DotLLM.Server.Endpoints.CompletionEndpoint.WriteCompletionStreamAsync(
+            c, _ => RefusingTokens(), (work, _) => work(), "cmpl-1", "m", includeUsageChunk: false, CancellationToken.None));
+
+        string raw = Encoding.UTF8.GetString(body.ToArray());
+        Assert.Contains("context_length_exceeded", raw);
+        Assert.DoesNotContain("api_error", raw);
+    }
+
+    private static async IAsyncEnumerable<DotLLM.Engine.GenerationToken> RefusingTokens()
+    {
+        await Task.Yield();
+        yield return new DotLLM.Engine.GenerationToken(0, "tok", null);
+        throw new DeviceMemoryAdmissionException(Refusal);
+    }
+
+    private static Task Run(HttpContext ctx) => Run(ctx, _ => throw new DeviceMemoryAdmissionException(Refusal));
+
+    private static async Task Run(HttpContext ctx, RequestDelegate endpoint)
     {
         var app = new ApplicationBuilder(new ServiceCollection().BuildServiceProvider());
         ModelUnavailableException.UseModelUnavailableHandler(app);
-        app.Run(_ => throw new DeviceMemoryAdmissionException(Refusal));
+        app.Run(endpoint);
         await app.Build()(ctx);
     }
 

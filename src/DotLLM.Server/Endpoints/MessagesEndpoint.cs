@@ -475,8 +475,10 @@ public static class MessagesEndpoint
                     await EmitAsync(splitter.Finish());
             }, ct);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException and not DotLLM.Core.Configuration.DeviceMemoryAdmissionException)
         {
+            // A GPU-memory refusal (issue #1068) escapes to UseModelUnavailableHandler, which writes it as an
+            // invalid_request_error: an api_error would make the Anthropic SDK retry the same over-sized request.
             // The headers and message_start are already on the wire, so there is no status code
             // left to set. The Anthropic stream protocol covers exactly this: a named `error`
             // event carrying the usual envelope, which the SDK turns back into an APIStatusError.
