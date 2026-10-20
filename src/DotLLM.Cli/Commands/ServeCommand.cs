@@ -57,6 +57,42 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [Description(DotLLM.Core.Moe.MoeOffloadOptions.PolicyHelp)]
         public string? MoeCachePolicy { get; set; }
 
+        /// <summary>Where uncached offloaded experts run (issue #1071).</summary>
+        [CommandOption(DotLLM.Cli.Helpers.MoeOffloadCli.ColdOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.ColdHelp)]
+        public string? MoeCold { get; set; }
+
+        /// <summary>CPU cold-expert worker threads (issue #1071).</summary>
+        [CommandOption(DotLLM.Cli.Helpers.MoeOffloadCli.CpuThreadsOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CpuThreadsHelp)]
+        public int? MoeCpuThreads { get; set; }
+
+        /// <summary>llama.cpp <c>--cpu-moe</c>: every MoE layer's experts on the CPU (issue #1071).</summary>
+        [CommandOption(DotLLM.Cli.Helpers.MoeOffloadCli.CpuMoeOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CpuMoeHelp)]
+        [DefaultValue(false)]
+        public bool CpuMoe { get; set; }
+
+        /// <summary>llama.cpp <c>--n-cpu-moe N</c>: the first N layers' experts on the CPU (issue #1071).</summary>
+        [CommandOption(DotLLM.Cli.Helpers.MoeOffloadCli.NCpuMoeOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.NCpuMoeHelp)]
+        public int? NCpuMoe { get; set; }
+
+        /// <summary>Re-run the MoE offload cost calibration (issue #1071).</summary>
+        [CommandOption(DotLLM.Cli.Helpers.MoeOffloadCli.CalibrateOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CalibrateHelp)]
+        [DefaultValue(false)]
+        public bool MoeCalibrate { get; set; }
+
+        /// <summary>Context the MoE offload VRAM budget reserves KV cache for (issue #1071).</summary>
+        [CommandOption(DotLLM.Cli.Helpers.MoeOffloadCli.ContextOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.ContextHelp)]
+        public int? CtxSize { get; set; }
+
+        /// <summary>The raw MoE offload option values (issues #1070, #1071).</summary>
+        public DotLLM.Core.Moe.MoeCliValues MoeValues => new(MoeOffload, MoeCacheMib, MoeCachePolicy, MoeCold, MoeCpuThreads,
+            CpuMoe, NCpuMoe, MoeCalibrate, CtxSize);
+
         /// <summary>CPU thread count.</summary>
         [CommandOption("--threads")]
         [Description("Number of CPU threads for inference. 0 = auto.")]
@@ -362,7 +398,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             AnsiConsole.MarkupLine($"[red]{Markup.Escape(deviceError!)}[/]");
             return 1;
         }
-        if (DotLLM.Cli.Helpers.MoeOffloadCli.Validate(settings.MoeOffload, settings.MoeCacheMib, settings.MoeCachePolicy) is { } moeError)
+        if (DotLLM.Cli.Helpers.MoeOffloadCli.Validate(settings.MoeValues) is { } moeError)
         {
             AnsiConsole.MarkupLine($"[red]{Markup.Escape(moeError)}[/]");
             return 1;
@@ -399,7 +435,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             Quant = settings.Quant,
             Device = settings.Device,
             GpuLayers = settings.GpuLayers,
-            MoeOffload = DotLLM.Cli.Helpers.MoeOffloadCli.Build(settings.MoeOffload, settings.MoeCacheMib, settings.MoeCachePolicy),
+            MoeOffload = DotLLM.Cli.Helpers.MoeOffloadCli.Build(settings.MoeValues),
             Threads = settings.Threads,
             DecodeThreads = settings.DecodeThreads,
             Host = settings.Host,

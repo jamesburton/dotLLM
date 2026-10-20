@@ -4,8 +4,8 @@ using Spectre.Console;
 namespace DotLLM.Cli.Helpers;
 
 /// <summary>
-/// CLI glue for routed-expert offload (issue #1070), shared by <c>run</c>, <c>chat</c>, <c>serve</c> and <c>bench</c>: the
-/// option text, validation, the options record, and the one-line telemetry summary.
+/// CLI glue for routed-expert offload (issues #1070, #1071), shared by <c>run</c>, <c>chat</c>, <c>serve</c> and <c>bench</c>:
+/// the option names, validation, the options record, and the one-line telemetry summary.
 /// </summary>
 internal static class MoeOffloadCli
 {
@@ -18,34 +18,33 @@ internal static class MoeOffloadCli
     /// <summary>Option name of the policy.</summary>
     public const string PolicyOption = "--moe-cache-policy";
 
-    /// <summary>Returns a user-facing error for invalid values, else null.</summary>
-    /// <param name="mode"><c>--moe-offload</c>.</param>
-    /// <param name="cacheMib"><c>--moe-cache-mib</c>.</param>
-    /// <param name="policy"><c>--moe-cache-policy</c>.</param>
-    /// <returns>The error, or null.</returns>
-    public static string? Validate(string? mode, string? cacheMib, string? policy)
-    {
-        string? error = MoeOffloadOptions.Validate(mode, cacheMib, policy);
-        if (error is not null) return error;
-        // The environment fallbacks are parsed too, so a bad DOTLLM_MOE_* fails before the load rather than inside it.
-        try
-        {
-            MoeOffloadOptions.FromCli(mode, cacheMib, policy);
-            return null;
-        }
-        catch (ArgumentException ex)
-        {
-            return ex.Message.Split(" (Parameter", 2)[0];
-        }
-    }
+    /// <summary>Option name of the cold-expert mode (#1071).</summary>
+    public const string ColdOption = "--moe-cold";
 
-    /// <summary>The options for the three CLI values (each unset one falls back to its <c>DOTLLM_MOE_*</c> variable).</summary>
-    /// <param name="mode"><c>--moe-offload</c>.</param>
-    /// <param name="cacheMib"><c>--moe-cache-mib</c>.</param>
-    /// <param name="policy"><c>--moe-cache-policy</c>.</param>
+    /// <summary>Option name of the CPU cold-leg thread count (#1071).</summary>
+    public const string CpuThreadsOption = "--moe-cpu-threads";
+
+    /// <summary>Option name of llama.cpp's <c>--cpu-moe</c> (#1071).</summary>
+    public const string CpuMoeOption = "--cpu-moe";
+
+    /// <summary>Option name of llama.cpp's <c>--n-cpu-moe</c> (#1071; bench's #370 option).</summary>
+    public const string NCpuMoeOption = "--n-cpu-moe";
+
+    /// <summary>Option name of the forced re-calibration (#1071).</summary>
+    public const string CalibrateOption = "--moe-calibrate";
+
+    /// <summary>Option name of the context size the offload budget reserves KV cache for (#1071).</summary>
+    public const string ContextOption = "--ctx-size|--ctx";
+
+    /// <summary>Returns a user-facing error for invalid values (CLI or their <c>DOTLLM_MOE_*</c> fallbacks), else null.</summary>
+    /// <param name="values">The raw option values.</param>
+    /// <returns>The error, or null.</returns>
+    public static string? Validate(MoeCliValues values) => MoeOffloadOptions.Validate(values);
+
+    /// <summary>The options for the CLI values (each unset one falls back to its <c>DOTLLM_MOE_*</c> variable).</summary>
+    /// <param name="values">The raw option values.</param>
     /// <returns>The options.</returns>
-    public static MoeOffloadOptions Build(string? mode, string? cacheMib, string? policy)
-        => MoeOffloadOptions.FromCli(mode, cacheMib, policy);
+    public static MoeOffloadOptions Build(MoeCliValues values) => MoeOffloadOptions.FromCli(values);
 
     /// <summary>
     /// Prints the offload summary for the work since <paramref name="start"/> (nothing when no offloaded model is active).
