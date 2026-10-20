@@ -54,6 +54,11 @@ public sealed class CudaNemotronHMoeParityTests : IDisposable
 
     private sealed record MoeSpec(int Experts, int TopK, int Inter, QuantizationType UpQt, QuantizationType DownQt);
 
+    /// <summary>Top-k of fixture layer <paramref name="layer"/> (an MoE layer of <see cref="Layers"/>).</summary>
+    /// <param name="layer">Layer index in the fixture.</param>
+    /// <returns>The number of experts each token of that layer routes to.</returns>
+    internal static int TopKOfLayer(int layer) => Layers[layer]!.TopK;
+
     private readonly ITestOutputHelper _output;
     private readonly string _scratch;
 
