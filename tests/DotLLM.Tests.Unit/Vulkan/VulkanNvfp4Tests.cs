@@ -122,7 +122,7 @@ public sealed class VulkanNvfp4Tests : IDisposable
     [SkippableFact]
     public void F16Prefill_BoltScale_UnscaledSumsBeyondF16Range_StayFinite()
     {
-        const int m = 48, k = 4096, n = 24;
+        const int m = 48, k = 4096, n = IqF16PrefillMatmul.DefaultMinTokens + 8; // at or above the F16-prefill threshold
         const float scale = 1.0e-4f;
         var rng = new Random(1060);
         int blocks = m * (k / 64);
