@@ -73,9 +73,10 @@ extern "C" __global__ void __launch_bounds__(256) dequant_nvfp4_f32(
     }
 }
 
-// Decode GEMV: y[m] = scale * sum_k W[m, k] * x[k]. One 128-thread CUDA block per output row; each
-// thread walks whole 64-element blocks (one sub-block scale decode per 16 elements), then a
-// warp-shuffle + shared-memory reduce. FP32 activations (no Q8_0 rounding).
+// Decode GEMV: y[m] = scale * sum_k W[m, k] * x[k]. One warp per output row (4 rows per 128-thread
+// CUDA block); each lane walks whole 64-element blocks, reading the 36-byte block as nine aligned 32-bit
+// words (blocks and rows are 4-byte aligned) and x as float4s, then a warp-shuffle reduce. FP32
+// activations (no Q8_0 rounding).
 extern "C" __global__ void __launch_bounds__(128) nvfp4_gemv_f32(
     const uint8_t* __restrict__ w,
     const float* __restrict__ x,
@@ -84,24 +85,39 @@ extern "C" __global__ void __launch_bounds__(128) nvfp4_gemv_f32(
     const int blocks_per_row,
     const float scale)
 {
-    int row = blockIdx.x;
+    // Per-lane divergent indices into __constant__ memory serialize, so the 16 code points live in
+    // shared memory (bank-conflict-free broadcast-or-distinct reads) for the inner loop.
+    // The 256 UE4M3 scale decodes are tabled the same way (two entries per thread).
+    __shared__ float kv[16];
+    __shared__ float ue[256];
+    if (threadIdx.x < 16) kv[threadIdx.x] = (float)kvalues_nvfp4_device[threadIdx.x];
+    ue[threadIdx.x] = ue4m3_half(threadIdx.x);
+    ue[threadIdx.x + 128] = ue4m3_half(threadIdx.x + 128);
+    __syncthreads();
+
+    int row = blockIdx.x * 4 + (threadIdx.x >> 5);
+    int lane = threadIdx.x & 31;
     if (row >= m) return;
-    const uint8_t* wrow = w + (size_t)row * blocks_per_row * NVFP4_BLOCK_BYTES;
+    const uint32_t* wrow = reinterpret_cast<const uint32_t*>(w + (size_t)row * blocks_per_row * NVFP4_BLOCK_BYTES);
 
     float acc = 0.0f;
-    for (int b = threadIdx.x; b < blocks_per_row; b += blockDim.x) {
-        const uint8_t* blk = wrow + (size_t)b * NVFP4_BLOCK_BYTES;
-        const float* xb = x + (size_t)b * NVFP4_BLOCK_SIZE;
+    for (int b = lane; b < blocks_per_row; b += 32) {
+        const uint32_t* blk = wrow + (size_t)b * (NVFP4_BLOCK_BYTES / 4);
+        const float4* xb = reinterpret_cast<const float4*>(x + (size_t)b * NVFP4_BLOCK_SIZE);
+        uint32_t scales = blk[0];
+        #pragma unroll
         for (int s = 0; s < 4; s++) {
-            float d = ue4m3_half(blk[s]);
-            const uint8_t* qs = blk + 4 + 8 * s;
-            const float* xs = xb + 16 * s;
+            float d = ue[(scales >> (8 * s)) & 0xFFu];
             float sub = 0.0f;
             #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                uint8_t p = qs[j];
-                sub += xs[j] * (float)kvalues_nvfp4_device[p & 0x0F]
-                     + xs[j + 8] * (float)kvalues_nvfp4_device[p >> 4];
+            for (int h = 0; h < 2; h++) {                 // bytes 4h..4h+3 of this sub-block's qs
+                uint32_t q = blk[1 + 2 * s + h];
+                float4 lo = xb[4 * s + h];                // elements 16s + 4h .. +3      (low nibbles)
+                float4 hi = xb[4 * s + 2 + h];            // elements 16s + 8 + 4h .. +3  (high nibbles)
+                sub += lo.x * kv[(q      ) & 0xF] + hi.x * kv[(q >>  4) & 0xF]
+                     + lo.y * kv[(q >>  8) & 0xF] + hi.y * kv[(q >> 12) & 0xF]
+                     + lo.z * kv[(q >> 16) & 0xF] + hi.z * kv[(q >> 20) & 0xF]
+                     + lo.w * kv[(q >> 24) & 0xF] + hi.w * kv[(q >> 28) & 0xF];
             }
             acc += d * sub;
         }
@@ -109,14 +125,8 @@ extern "C" __global__ void __launch_bounds__(128) nvfp4_gemv_f32(
 
     for (int off = 16; off > 0; off >>= 1)
         acc += __shfl_down_sync(0xffffffffu, acc, off);
-
-    __shared__ float warp_sums[4];
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    if (lane == 0) warp_sums[warp] = acc;
-    __syncthreads();
-    if (threadIdx.x == 0)
-        y[row] = (warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3]) * scale;
+    if (lane == 0)
+        y[row] = acc * scale;
 }
 
 // y[i] *= scale — the per-tensor X.scale after the dequant + cuBLAS prefill GEMM.

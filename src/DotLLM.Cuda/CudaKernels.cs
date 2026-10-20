@@ -5169,8 +5169,9 @@ public sealed unsafe class CudaKernels : IDisposable
         int mArg = m, bArg = k / QuantFormat.Nvfp4GroupSize;
         float sArg = scale;
         void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &mArg, &bArg, &sArg};
+        // One warp per row, four rows per 128-thread block.
         CudaDriverApi.cuLaunchKernel(_nvfp4GemvF32Func,
-                (uint)m, 1, 1, 128, 1, 1,
+                (uint)((m + 3) / 4), 1, 1, 128, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 

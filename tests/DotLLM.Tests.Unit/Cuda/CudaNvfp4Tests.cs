@@ -183,6 +183,44 @@ public sealed unsafe class CudaNvfp4Tests : IDisposable
         AssertClose(cpuDecode, cudaDecode, "decode (NVFP4 GEMV with scale)");
     }
 
+    /// <summary>
+    /// Bandwidth of the NVFP4 decode GEMV and the prefill dequant on Bolt's SSM shapes (ssm_in 4096 -> 18560,
+    /// ssm_out 8192 -> 4096). Prints numbers only; nothing is asserted beyond the kernels running.
+    /// </summary>
+    [SkippableTheory]
+    [Trait("Category", "Benchmark")]
+    [InlineData(18560, 4096)]
+    [InlineData(4096, 8192)]
+    public void Benchmark_BoltSsmShapes(int m, int k)
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        byte[] w = RandomBlocks(new Random(1), m * (k / 64));
+        using var context = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        using var kernels = new CudaKernels(ResolvePtxDir());
+        nint dW = Upload(w), dX = UploadF32(new float[k]), dY = Alloc(m * 4L), dF16 = Alloc((long)m * k * 2);
+        try
+        {
+            const int Iters = 200;
+            double Time(Action a)
+            {
+                a(); stream.Synchronize();
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                for (int i = 0; i < Iters; i++) a();
+                stream.Synchronize();
+                return sw.Elapsed.TotalMilliseconds / Iters;
+            }
+            double gemv = Time(() => kernels.LaunchNvfp4GemvF32(dW, dX, dY, m, k, 1.3e-4f, stream.Handle));
+            double deq = Time(() => kernels.LaunchDequantToF16(dW, QuantizationType.NVFP4, dF16, m * k, stream.Handle));
+            Console.WriteLine($"NVFP4 {m}x{k}: GEMV {gemv * 1000:F1} us ({w.Length / gemv / 1e6:F1} GB/s of weights); "
+                + $"dequant->F16 {deq * 1000:F1} us ({(w.Length + 2.0 * m * k) / deq / 1e6:F1} GB/s read+write)");
+        }
+        finally
+        {
+            Free(dW); Free(dX); Free(dY); Free(dF16);
+        }
+    }
+
     // ───────────────────────── helpers ─────────────────────────
 
     private static void AssertClose(float[] cpu, float[] cuda, string what)
