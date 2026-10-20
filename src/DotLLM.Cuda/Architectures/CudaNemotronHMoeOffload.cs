@@ -20,9 +20,14 @@ namespace DotLLM.Cuda.Architectures;
 /// <param name="ArenaWaveExperts">Experts per staging wave (the arena holds two waves).</param>
 /// <param name="ArenaBytes">Device bytes of the staging arena.</param>
 /// <param name="SpillRetries">Times the spill probe shrank the cache.</param>
+/// <param name="Cold">Where uncached experts run (#1071); <see cref="MoeColdMode.Copy"/> when no cost model could be measured in auto.</param>
+/// <param name="CpuThreads">CPU cold-leg threads (including the forward's own thread); 0 when the CPU leg is off.</param>
+/// <param name="StaticCpuLayers">MoE layers statically on the CPU (<c>--cpu-moe</c> / <c>--n-cpu-moe</c>).</param>
+/// <param name="CostModel">The calibrated cost model, or null.</param>
 public sealed record CudaMoeOffloadInfo(long CacheBytes, int CacheSlots, int Pools, ExpertCachePolicy Policy, bool PinnedStore,
     long StoreBytes, long BudgetBytes, bool RequestClamped, long ReserveBytes, long FreeBytesAfterLoad, int ArenaWaveExperts,
-    long ArenaBytes, int SpillRetries);
+    long ArenaBytes, int SpillRetries, MoeColdMode Cold = MoeColdMode.Copy, int CpuThreads = 0, int StaticCpuLayers = 0,
+    MoeCostModel? CostModel = null);
 
 /// <summary>
 /// Routed-expert offload for <c>nemotron_h_moe</c> on CUDA (issue #1070; design #1063 sections 8b and 8d, and the addendum's
@@ -74,7 +79,8 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
     /// </summary>
     private static bool DecideMoeOffload(DeviceBudget estimate, MoeOffloadOptions options)
     {
-        if (options.Mode == MoeOffloadMode.On) return true;
+        // --cpu-moe / --n-cpu-moe (#1071) keep those layers' experts on the host, which only the offload path does.
+        if (options.Mode == MoeOffloadMode.On || options.CpuMoeLayers > 0) return true;
         CudaDriverApi.cuMemGetInfo_v2(out nuint free, out _).ThrowOnError();
         bool fits = estimate.Total <= (long)free - ReserveBytes(options);
         if (fits) return false;
@@ -132,8 +138,8 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
     /// first, then the streamed ones by wave) in <paramref name="groupExperts"/>, and writes each group's weight pointers.
     /// </summary>
     /// <returns>Number of leading groups that need no staging wave.</returns>
-    private int PlanOffloadedGroups(DeviceMoe moe, int[] groupExperts, int groups, long[] groupUp, long[] groupDown)
-        => _offload!.Plan(moe, groupExperts, groups, groupUp, groupDown);
+    private int PlanOffloadedGroups(DeviceMoe moe, int[] groupExperts, int groups, int[] counts, long[] groupUp, long[] groupDown)
+        => _offload!.Plan(moe, groupExperts, groups, counts, groupUp, groupDown);
 
     /// <summary>
     /// Runs the expert-grouped up (+relu²) and down GEMVs for groups <c>[g0, g0 + count)</c> of the uploaded schedule.
@@ -171,6 +177,8 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
         for (int w = 0; w < Math.Min(2, waves); w++) waveEvents[w] = off.EnqueueWaveCopies(moe, w);
 
         if (readyEvent != 0) off.WaitForCopies(streamH, readyEvent);
+        // A hit on an expert promoted by an earlier call (#1071) waits for that promotion's copy (usually long finished).
+        if (off.PromotionWaitEvent != 0) off.WaitForCopies(streamH, off.PromotionWaitEvent);
         LaunchExpertGroups(moe, sched, 0, off.ReadyGroups, expertIn, expertDim, streamH);
 
         int perWave = off.WaveExperts;
@@ -189,6 +197,10 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
                 waveEvents[w + 2] = off.EnqueueWaveCopies(moe, w + 2);
             }
         }
+
+        // Promote-only admission (#1071): the experts this call computes on the CPU and admitted to the cache are copied behind
+        // everything else on the copy stream. Nothing in this call reads their slots; a later hit waits on the event.
+        off.EnqueuePromotionCopies(moe);
     }
 
     // ───────────────────────── load ─────────────────────────
@@ -237,6 +249,22 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
         private int _readyInsertedCount;
         private int[] _bypassExperts = [];
 
+        // Cold experts (#1071).
+        private readonly MoeOffloadOptions _options;
+        private int[] _cpuExperts = [];
+        private int[] _coldExperts = [];
+        private int[] _coldTokens = [];
+        private ColdExpertCost[] _coldCosts = [];
+        private bool[] _coldOnCpu = [];
+        private int[] _promoExperts = [], _promoSlots = [];
+        private int _promoCount;
+        private readonly List<(nint Event, int Pool, int[] Slots)> _promotionsInFlight = [];   // one entry per call that promoted
+        private readonly Stack<nint> _promotionEventsFree = new();
+        private readonly List<(nint Start, nint End)> _cpuWaitPending = [];
+        private long _forwardStart;
+        private double _lastTokenUs;
+        private long _maxExpertBytes;
+
         public ExpertCache Cache { get; private set; } = null!;
         public CudaMoeOffloadInfo Info { get; private set; } = null!;
         public nint CopyStream => _copyStream;
@@ -246,7 +274,25 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
         public int Waves => (BypassCount + WaveExperts - 1) / WaveExperts;
         public nint[] WaveEvents { get; private set; } = [];
 
-        private MoeOffloadState(int layers, int waveExperts, ExpertLayout[] layouts, int[] poolOfLayer)
+        /// <summary>Where uncached experts run (copy when auto could not calibrate).</summary>
+        public MoeColdMode Cold { get; private set; }
+
+        /// <summary>The CPU leg's workers, or null when no layer can use the CPU.</summary>
+        public CpuColdLeg? CpuLeg { get; private set; }
+
+        /// <summary>Promote-only admission (cold modes cpu and auto), or null.</summary>
+        public IExpertAdmission? Admission { get; private set; }
+
+        /// <summary>The calibrated cost model, or null.</summary>
+        public MoeCostModel? Cost { get; private set; }
+
+        /// <summary>Groups of the current call planned for the CPU (the last ones of the schedule).</summary>
+        public int CpuGroups { get; private set; }
+
+        /// <summary>Event a hit of the current call on a recently promoted slot must wait for, or 0.</summary>
+        public nint PromotionWaitEvent { get; private set; }
+
+        private MoeOffloadState(int layers, int waveExperts, ExpertLayout[] layouts, int[] poolOfLayer, MoeOffloadOptions options)
         {
             _layouts = layouts;
             _poolOfLayer = poolOfLayer;
@@ -254,7 +300,12 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
             _upHost = new nint[layers];
             _downHost = new nint[layers];
             WaveExperts = waveExperts;
+            _options = options;
+            Cold = options.Cold;
         }
+
+        /// <summary>True when <paramref name="layer"/> may compute experts on the CPU (static CPU layer, or a cold mode other than copy).</summary>
+        public bool MayUseCpu(int layer) => _options.IsStaticCpuLayer(layer) || (Cold != MoeColdMode.Copy && CpuLeg is not null);
 
         public static MoeOffloadState Create(CudaNemotronHTransformerModel model, NemotronHLayerWeights[] cpuLayers,
             MoeOffloadOptions options)
@@ -270,10 +321,17 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
             var expertsPerLayout = new List<int>();
             long storeBytes = 0;
             int maxTopK = 1;
+            int staticCpu = 0;
             for (int l = 0; l < layers; l++)
             {
                 poolOfLayer[l] = -1;
                 if (cpuLayers[l].Moe is not { } m) continue;
+                if (options.IsStaticCpuLayer(l))
+                {
+                    // --cpu-moe / --n-cpu-moe (#1071): never cached, never copied, always computed from the mapped file.
+                    staticCpu++;
+                    continue;
+                }
                 var layout = new ExpertLayout(m.UpPerExpertBytes, m.DownPerExpertBytes);
                 if (!layoutIndex.TryGetValue(layout, out int p))
                 {
@@ -297,17 +355,28 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
             MoeOffloadState? state = null;
             try
             {
-                state = new MoeOffloadState(layers, waveExperts, layouts, poolOfLayer);
-                if (pin) pin = state.TryPinStore(cpuLayers, log);
+                state = new MoeOffloadState(layers, waveExperts, layouts, poolOfLayer, options);
+                state._maxExpertBytes = layouts.Length == 0 ? 0 : layouts.Max(l => l.UpBytes + l.DownBytes);
+                if (pin) pin = state.TryPinStore(cpuLayers, options, log);
                 if (!pin)
                 {
                     state._ring = new StagingRing(StagingChunks, StagingChunkBytes);
-                    state.UseMmapStore(cpuLayers);
+                    state.UseMmapStore(cpuLayers, options);
                 }
 
                 CudaDriverApi.cuStreamCreate(out state._copyStream, CudaDriverApi.CU_STREAM_NON_BLOCKING).ThrowOnError();
+                state.SetUpColdExperts(model, cpuLayers, options, staticCpu, log);
                 state.AllocateCache(model, options, layouts, expertsPerLayout.ToArray(), expertsPerLayer, poolOfLayer,
                     storeBytes, pin, log);
+                if (state.Cold != MoeColdMode.Copy)
+                    state.Admission = new WindowedPromotionAdmission(state.Cache);
+                state.Info = state.Info with
+                {
+                    Cold = state.Cold,
+                    CpuThreads = state.CpuLeg?.Threads ?? 0,
+                    StaticCpuLayers = staticCpu,
+                    CostModel = state.Cost,
+                };
                 return state;
             }
             catch
@@ -318,13 +387,13 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
         }
 
         /// <summary>Copies every offloaded bank into page-locked host memory; false (nothing kept) when pinning fails.</summary>
-        private bool TryPinStore(NemotronHLayerWeights[] cpuLayers, Action<string> log)
+        private bool TryPinStore(NemotronHLayerWeights[] cpuLayers, MoeOffloadOptions options, Action<string> log)
         {
             try
             {
                 for (int l = 0; l < cpuLayers.Length; l++)
                 {
-                    if (cpuLayers[l].Moe is not { } m) continue;
+                    if (cpuLayers[l].Moe is not { } m || options.IsStaticCpuLayer(l)) continue;
                     long up = m.UpPerExpertBytes * m.NumExperts, down = m.DownPerExpertBytes * m.NumExperts;
                     _upHost[l] = PinCopy(m.UpExpsWeight, up);
                     _downHost[l] = PinCopy(m.DownExpsWeight, down);
@@ -348,11 +417,11 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
             return p;
         }
 
-        private void UseMmapStore(NemotronHLayerWeights[] cpuLayers)
+        private void UseMmapStore(NemotronHLayerWeights[] cpuLayers, MoeOffloadOptions options)
         {
             for (int l = 0; l < cpuLayers.Length; l++)
             {
-                if (cpuLayers[l].Moe is not { } m) continue;
+                if (cpuLayers[l].Moe is not { } m || options.IsStaticCpuLayer(l)) continue;
                 _upHost[l] = m.UpExpsWeight;
                 _downHost[l] = m.DownExpsWeight;
             }
@@ -371,9 +440,9 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
             int kvTokens = Math.Clamp(options.ContextTokens ?? cfg.MaxSequenceLength, 1, cfg.MaxSequenceLength);
             long kv = KvCacheBytes(model._attentionLayerCount, cfg.NumKvHeads, cfg.HeadDim, kvTokens);
 
-            _arenaSlotBytes = layouts.Max(l => l.SlotBytes);
+            _arenaSlotBytes = layouts.Length == 0 ? 0 : layouts.Max(l => l.SlotBytes);   // --cpu-moe: nothing is ever copied
             long arenaBytes = 2L * WaveExperts * _arenaSlotBytes;
-            CudaDriverApi.cuMemAlloc_v2(out _arena, (nuint)arenaBytes).ThrowOnError();
+            if (arenaBytes > 0) CudaDriverApi.cuMemAlloc_v2(out _arena, (nuint)arenaBytes).ThrowOnError();
 
             // Free memory is measured now, after every other allocation (weights, forward state, scratch at its worst case
             // and the arena), so only the KV cache the caller allocates later remains to be subtracted.
@@ -454,7 +523,8 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
             var regions = new List<(nint Ptr, long Bytes)>();
             for (int p = 0; p < layouts.Length; p++)
                 if (_poolBase[p] != 0) regions.Add((_poolBase[p], (long)slots[p] * layouts[p].SlotBytes));
-            regions.Add((_arena, 2L * WaveExperts * _arenaSlotBytes));
+            if (_arena != 0) regions.Add((_arena, 2L * WaveExperts * _arenaSlotBytes));
+            if (regions.Count == 0) return null;
             foreach (var (ptr, bytes) in regions) CudaDriverApi.cuMemsetD8_v2(ptr, 0, (nuint)bytes).ThrowOnError();
             // The memsets run on the legacy NULL stream, which the non-blocking copy stream does not wait for: finish them first
             // so they cannot overlap (and slow) the timed reads.
@@ -520,7 +590,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
         // ── per call ──
 
         /// <summary>See <see cref="PlanOffloadedGroups"/>.</summary>
-        public int Plan(DeviceMoe moe, int[] groupExperts, int groups, long[] groupUp, long[] groupDown)
+        public int Plan(DeviceMoe moe, int[] groupExperts, int groups, int[] counts, long[] groupUp, long[] groupDown)
         {
             _eventCursor = 0;
             if (_lookupSlots.Length < groups)
@@ -531,18 +601,46 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
                 _readyInsertedExperts = new int[groups];
                 _readyInsertedSlots = new int[groups];
                 _bypassExperts = new int[groups];
+                _cpuExperts = new int[groups];
+                _coldExperts = new int[groups];
+                _coldTokens = new int[groups];
+                _coldCosts = new ColdExpertCost[groups];
+                _coldOnCpu = new bool[groups];
+                _promoExperts = new int[groups];
+                _promoSlots = new int[groups];
             }
 
             int layer = moe.LayerIndex;
+            _readyInsertedCount = 0;
+            _promoCount = 0;
+            BypassCount = 0;
+            CpuGroups = 0;
+            PromotionWaitEvent = 0;
+
+            // --cpu-moe / --n-cpu-moe: every expert of a static layer runs on the CPU; the cache never sees the layer.
+            if (_options.IsStaticCpuLayer(layer))
+            {
+                for (int g = 0; g < groups; g++)
+                {
+                    groupUp[g] = 0;
+                    groupDown[g] = 0;
+                }
+                CpuGroups = groups;
+                ReadyGroups = 0;
+                MoeTelemetry.RecordRouted(groups, groups);
+                return 0;
+            }
+
             MoeLookupTraceHook?.Invoke(layer, groupExperts.AsSpan(0, groups).ToArray());
             long evictionsBefore = Cache.Evictions;
-            Cache.Lookup(layer, groupExperts.AsSpan(0, groups), _lookupSlots, _lookupResults);
+            bool admitAll = Cold == MoeColdMode.Copy;
+            Cache.Lookup(layer, groupExperts.AsSpan(0, groups), _lookupSlots, _lookupResults, admitAll);
 
             int pool = _poolOfLayer[layer];
             var layout = _layouts[pool];
+            if (!admitAll) PlaceColdMisses(moe, groupExperts, groups, counts, layout);
+
             int ready = 0, hits = 0;
-            _readyInsertedCount = 0;
-            BypassCount = 0;
             for (int g = 0; g < groups; g++)
             {
                 int e = groupExperts[g];
@@ -557,11 +655,15 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
                         _readyInsertedExperts[_readyInsertedCount] = e;
                         _readyInsertedSlots[_readyInsertedCount++] = _lookupSlots[g];
                         break;
-                    default:
+                    case ExpertLookupResult.Bypass:
                         _bypassExperts[BypassCount++] = e;
+                        break;
+                    default:
+                        _cpuExperts[CpuGroups++] = e;
                         break;
                 }
             }
+            if (hits > 0) PromotionWaitEvent = PendingPromotionEvent(pool, groupExperts, groups, layer);
 
             // Group order: ready groups (ascending expert), then streamed groups (ascending expert, wave by wave).
             int gi = 0;
@@ -583,13 +685,193 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
                 groupDown[gi] = b + (nint)layout.DownOffset;
                 gi++;
             }
+            for (int j = 0; j < CpuGroups; j++)
+            {
+                groupExperts[gi] = _cpuExperts[j];
+                groupUp[gi] = 0;
+                groupDown[gi] = 0;
+                gi++;
+            }
             ReadyGroups = ready;
             if (WaveEvents.Length < Waves) WaveEvents = new nint[Math.Max(Waves, 2)];
 
+            // Bytes actually copied: admitted misses, streamed misses and promotions (#1071; copy mode: every miss).
             int misses = groups - hits;
+            long copies = _readyInsertedCount + BypassCount + _promoCount;
             MoeTelemetry.RecordLookups(hits, misses, Cache.Evictions - evictionsBefore,
-                (long)misses * (moe.UpPerExpertBytes + moe.DownPerExpertBytes));
+                copies * (moe.UpPerExpertBytes + moe.DownPerExpertBytes));
+            MoeTelemetry.RecordRouted(groups, CpuGroups);
+            MoeTelemetry.RecordPromotions(_promoCount);
             return ready;
+        }
+
+        /// <summary>
+        /// Cold modes cpu and auto (#1071): the lookup left every miss cold. Decides which go to the device (admitted by the cache's
+        /// policy: <see cref="ExpertLookupResult.Inserted"/> or <see cref="ExpertLookupResult.Bypass"/>) and which stay on the CPU,
+        /// then offers the CPU ones to promote-only admission. Rewrites <c>_lookupResults</c> / <c>_lookupSlots</c> in place.
+        /// </summary>
+        private void PlaceColdMisses(DeviceMoe moe, int[] groupExperts, int groups, int[] counts, ExpertLayout layout)
+        {
+            int layer = moe.LayerIndex;
+            int cold = 0;
+            double residentUs = 0;
+            for (int g = 0; g < groups; g++)
+            {
+                int e = groupExperts[g];
+                if (_lookupResults[g] == ExpertLookupResult.Cold)
+                {
+                    _coldExperts[cold] = g;   // group index
+                    _coldTokens[cold] = counts[e];
+                    cold++;
+                }
+                else if (Cost is not null)
+                {
+                    residentUs += Cost.ResidentGpuUs(layout, counts[e]);
+                }
+            }
+
+            // Auto: Fiddler + greedy balance by the calibrated costs. Cpu: everything uncached on the CPU.
+            if (Cold == MoeColdMode.Auto && Cost is not null)
+            {
+                for (int i = 0; i < cold; i++) _coldCosts[i] = Cost.ColdCost(layout, _coldTokens[i]);
+                MoeColdAssignment.Assign(_coldCosts.AsSpan(0, cold), residentUs, CpuLeg!.Threads, Cost.SyncRoundTripUs,
+                    _coldOnCpu.AsSpan(0, cold));
+            }
+            else
+            {
+                _coldOnCpu.AsSpan(0, cold).Fill(true);
+            }
+
+            for (int i = 0; i < cold; i++)
+            {
+                if (_coldOnCpu[i]) continue;
+                int g = _coldExperts[i];
+                int s = Cache.Admit(layer, groupExperts[g], out _);
+                _lookupSlots[g] = s;
+                _lookupResults[g] = s >= 0 ? ExpertLookupResult.Inserted : ExpertLookupResult.Bypass;
+            }
+
+            // Promote-only admission sees the whole call's routing first, then is offered each CPU expert.
+            if (Admission is null) return;
+            Admission.Observe(layer, groupExperts.AsSpan(0, groups), CountsOf(groupExperts, groups, counts));
+            long bytes = moe.UpPerExpertBytes + moe.DownPerExpertBytes;
+            for (int i = 0; i < cold; i++)
+            {
+                if (!_coldOnCpu[i]) continue;
+                int e = groupExperts[_coldExperts[i]];
+                int slot = Admission.TryPromote(layer, e, bytes, out _);
+                if (slot < 0) continue;
+                _promoExperts[_promoCount] = e;
+                _promoSlots[_promoCount++] = slot;
+            }
+        }
+
+        private int[] _countScratch = [];
+
+        private ReadOnlySpan<int> CountsOf(int[] groupExperts, int groups, int[] counts)
+        {
+            if (_countScratch.Length < groups) _countScratch = new int[groups];
+            for (int g = 0; g < groups; g++) _countScratch[g] = counts[groupExperts[g]];
+            return _countScratch.AsSpan(0, groups);
+        }
+
+        /// <summary>
+        /// Recycles finished promotion copies and returns the latest unfinished one whose slot a hit of this call reads, or 0.
+        /// </summary>
+        private nint PendingPromotionEvent(int pool, int[] groupExperts, int groups, int layer)
+        {
+            nint wait = 0;
+            for (int i = _promotionsInFlight.Count - 1; i >= 0; i--)   // newest first
+            {
+                var (evt, p, slots) = _promotionsInFlight[i];
+                if (CudaDriverApi.cuEventQuery(evt) == 0)
+                {
+                    _promotionsInFlight.RemoveAt(i);
+                    _promotionEventsFree.Push(evt);
+                    continue;
+                }
+                if (wait != 0 || p != pool) continue;
+                for (int g = 0; g < groups && wait == 0; g++)
+                    if (_lookupResults[g] == ExpertLookupResult.Hit && Array.IndexOf(slots, _lookupSlots[g]) >= 0)
+                        wait = evt;   // in-order copy stream: the newest pending event covers every earlier one
+            }
+            return wait;
+        }
+
+        /// <summary>Enqueues this call's promotion copies (after every other copy of the call) and records their event.</summary>
+        public void EnqueuePromotionCopies(DeviceMoe moe)
+        {
+            if (_promoCount == 0) return;
+            int pool = _poolOfLayer[moe.LayerIndex];
+            var layout = _layouts[pool];
+            for (int i = 0; i < _promoCount; i++)
+            {
+                nint slotBase = _poolBase[pool] + (nint)(_promoSlots[i] * layout.SlotBytes);
+                CopyExpert(moe, _promoExperts[i], slotBase, slotBase + (nint)layout.DownOffset);
+            }
+            _ring?.Close(_copyStream);
+            nint evt;
+            if (_promotionEventsFree.Count > 0) evt = _promotionEventsFree.Pop();
+            else CudaDriverApi.cuEventCreate(out evt, CudaDriverApi.CU_EVENT_DISABLE_TIMING).ThrowOnError();
+            CudaDriverApi.cuEventRecord(evt, _copyStream).ThrowOnError();
+            _promotionsInFlight.Add((evt, pool, _promoSlots.AsSpan(0, _promoCount).ToArray()));
+        }
+
+        // ── CPU leg timing and admission clock ──
+
+        /// <summary>Records the start of the compute stream's wait for the CPU rows (after the device's groups).</summary>
+        public (nint Start, nint End) BeginCpuWait(nint computeStream)
+        {
+            var pair = _timingFree.Count > 0 ? _timingFree.Pop() : NewTimingPair();
+            CudaDriverApi.cuEventRecord(pair.Start, computeStream).ThrowOnError();
+            return pair;
+        }
+
+        /// <summary>Records the end of the wait (after the CPU rows' copy); harvested into <c>cpu_wait_us</c>.</summary>
+        public void EndCpuWait((nint Start, nint End) pair, nint computeStream)
+        {
+            CudaDriverApi.cuEventRecord(pair.End, computeStream).ThrowOnError();
+            _cpuWaitPending.Add(pair);
+        }
+
+        /// <summary>
+        /// Starts a forward of <paramref name="tokens"/> tokens: refills promote-only admission's copy budget from the link and the
+        /// previous forward's time per token (design 8c: what the link moves in about 25 % of a token's time).
+        /// </summary>
+        public void BeginForward(int tokens)
+        {
+            _forwardStart = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (Admission is null) return;
+            long budget = Cost?.PromotionBudgetBytes(tokens, _lastTokenUs, minimumBytes: _maxExpertBytes) ?? _maxExpertBytes;
+            Admission.BeginForward(tokens, budget);
+        }
+
+        /// <summary>Ends a forward (after its stream synchronize): the per-token time the next budget is based on.</summary>
+        public void EndForward(int tokens)
+        {
+            if (_forwardStart == 0 || tokens <= 0) return;
+            _lastTokenUs = System.Diagnostics.Stopwatch.GetElapsedTime(_forwardStart).TotalMicroseconds / tokens;
+        }
+
+        /// <summary>
+        /// The cold-expert set-up at load (#1071): the CPU worker pool when any layer may use the CPU, and in auto / cpu mode the
+        /// cost model (calibrated or cached). Auto without a cost model falls back to copy.
+        /// </summary>
+        private void SetUpColdExperts(CudaNemotronHTransformerModel model, NemotronHLayerWeights[] cpuLayers,
+            MoeOffloadOptions options, int staticCpu, Action<string> log)
+        {
+            bool anyCpu = staticCpu > 0 || Cold != MoeColdMode.Copy;
+            if (!anyCpu) return;
+            int threads = options.EffectiveCpuThreads;
+            CpuLeg = new CpuColdLeg(threads);
+            if (Cold != MoeColdMode.Copy && _layouts.Length > 0)
+            {
+                Cost = model.CalibrateMoeCold(cpuLayers, options, threads, _copyStream, log);
+                if (Cost is null && Cold == MoeColdMode.Auto) Cold = MoeColdMode.Copy;
+            }
+            if (_layouts.Length == 0 && Cold != MoeColdMode.Copy) Cold = MoeColdMode.Cpu;   // --cpu-moe: nothing is ever cached
+            log($"MoE cold experts: {Cold.ToString().ToLowerInvariant()} mode, {threads} CPU thread(s)" +
+                (staticCpu > 0 ? $", {staticCpu} MoE layer(s) statically on the CPU" : "") + ".");
         }
 
         private nint ArenaSlot(int bypassIndex)
@@ -716,15 +998,21 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
         /// </summary>
         public void HarvestCopyWait()
         {
-            if (_timingPending.Count == 0) return;
+            MoeTelemetry.RecordCopyWait(Harvest(_timingPending));
+            MoeTelemetry.RecordCpuWait(Harvest(_cpuWaitPending));
+        }
+
+        private long Harvest(List<(nint Start, nint End)> pending)
+        {
+            if (pending.Count == 0) return 0;
             double micros = 0;
-            foreach (var pair in _timingPending)
+            foreach (var pair in pending)
             {
                 if (CudaDriverApi.cuEventElapsedTime(out float ms, pair.Start, pair.End) == 0) micros += ms * 1000.0;
                 _timingFree.Push(pair);
             }
-            _timingPending.Clear();
-            MoeTelemetry.RecordCopyWait((long)micros);
+            pending.Clear();
+            return (long)micros;
         }
 
         public void Dispose()
@@ -740,13 +1028,19 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
             FreeDelayBuffers();
             foreach (nint e in _events) CudaDriverApi.cuEventDestroy_v2(e);
             _events.Clear();
-            foreach (var (a, b) in _timingPending.Concat(_timingFree))
+            foreach (var (a, b) in _timingPending.Concat(_cpuWaitPending).Concat(_timingFree))
             {
                 CudaDriverApi.cuEventDestroy_v2(a);
                 CudaDriverApi.cuEventDestroy_v2(b);
             }
             _timingPending.Clear();
+            _cpuWaitPending.Clear();
             _timingFree.Clear();
+            foreach (var (e, _, _) in _promotionsInFlight) _promotionEventsFree.Push(e);
+            _promotionsInFlight.Clear();
+            foreach (nint e in _promotionEventsFree) CudaDriverApi.cuEventDestroy_v2(e);
+            _promotionEventsFree.Clear();
+            CpuLeg?.Dispose();
             foreach (nint p in _pinned) CudaDriverApi.cuMemFreeHost(p);
             _pinned.Clear();
             _ring?.Dispose();

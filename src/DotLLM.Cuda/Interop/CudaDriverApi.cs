@@ -310,6 +310,16 @@ internal static partial class CudaDriverApi
     [LibraryImport(LibName)]
     internal static partial int cuEventElapsedTime(out float milliseconds, nint start, nint end);
 
+    /// <summary>
+    /// Non-blocking completion check of <paramref name="evt"/>: 0 (CUDA_SUCCESS) when the work before its record has finished,
+    /// <see cref="CUDA_ERROR_NOT_READY"/> while it is pending (#1071: recycling promotion-copy events).
+    /// </summary>
+    [LibraryImport(LibName)]
+    internal static partial int cuEventQuery(nint evt);
+
+    /// <summary>CUDA_ERROR_NOT_READY: the queried work has not completed yet.</summary>
+    internal const int CUDA_ERROR_NOT_READY = 600;
+
     /// <summary>CU_EVENT_DISABLE_TIMING: no timestamp (cheaper to record and wait on).</summary>
     internal const uint CU_EVENT_DISABLE_TIMING = 2;
 
