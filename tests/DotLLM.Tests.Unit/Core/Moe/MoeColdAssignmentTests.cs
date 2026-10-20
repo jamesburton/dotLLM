@@ -56,6 +56,17 @@ public sealed class MoeColdAssignmentTests
     }
 
     [Fact]
+    public void FiddlerRule_CpuWhenCheaperThanCopyPlusGpu()
+    {
+        bool[] onCpu = new bool[4];
+        // CPU 300 < 900; CPU 2000 > 900; equal costs stay on the device; an infinite device cost goes to the CPU.
+        int n = MoeColdAssignment.Fiddler([new(300, 800, 100), new(2000, 800, 100), new(900, 800, 100),
+            new(5000, double.PositiveInfinity, 100)], onCpu);
+        Assert.Equal(2, n);
+        Assert.Equal([true, false, false, true], onCpu);
+    }
+
+    [Fact]
     public void GreedyBalance_MovesExpertsOffAnOverloadedCpu()
     {
         // Six experts that Fiddler sends to the CPU (500 < 600 each). One CPU worker: CPU span 3000 vs device 0. The greedy pass

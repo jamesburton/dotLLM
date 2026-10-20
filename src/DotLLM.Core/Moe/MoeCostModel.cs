@@ -164,7 +164,7 @@ public static class MoeColdAssignment
 
         // 1. Fiddler. The greedy pass only accepts improving single moves, so it starts from the best of the Fiddler assignment
         //    and the two one-sided ones (every expert that can run there on the device, or on the CPU).
-        for (int i = 0; i < n; i++) onCpu[i] = costs[i].CpuUs < costs[i].DeviceUs;
+        Fiddler(costs, onCpu);
         double start = Makespan(costs, onCpu, residentGpuUs, cpuWorkers, cpuLegOverheadUs);
         Span<bool> trial = n <= 256 ? stackalloc bool[n] : new bool[n];
         for (int side = 0; side < 2; side++)
@@ -208,6 +208,21 @@ public static class MoeColdAssignment
 
         int cpu = 0;
         for (int i = 0; i < n; i++) if (onCpu[i]) cpu++;
+        return cpu;
+    }
+
+    /// <summary>
+    /// The Fiddler rule alone (arXiv 2402.07033): an expert goes to the CPU exactly when computing it there is cheaper than copying
+    /// it and computing it on the device. <see cref="Assign"/> starts its balance from this (or a better one-sided) assignment.
+    /// </summary>
+    /// <param name="costs">Costs of the uncached experts.</param>
+    /// <param name="onCpu">Receives true for each expert the rule places on the CPU.</param>
+    /// <returns>Experts placed on the CPU.</returns>
+    public static int Fiddler(ReadOnlySpan<ColdExpertCost> costs, Span<bool> onCpu)
+    {
+        int cpu = 0;
+        for (int i = 0; i < costs.Length; i++)
+            if (onCpu[i] = costs[i].CpuUs < costs[i].DeviceUs) cpu++;
         return cpu;
     }
 
