@@ -200,6 +200,31 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
 
     /// <summary>Test-only: decode attention calls served by the fused quantized-KV kernel.</summary>
     internal int DebugFusedKvqAttentionCallsForTest { get; private set; }
+
+    /// <summary>
+    /// Most rows a forward may have and still take the per-row fused quantized-KV attention (issue #1068): an MTP or
+    /// speculative verify is K+1 rows (4 at the default K=3). Each row re-reads the quantized history once, so the cost is
+    /// <c>rows x 2.1</c> bytes per element-token against ~10 for dequant-to-scratch + the F16 kernel.
+    /// </summary>
+    internal const int PerRowKvqMaxRows = 8;
+
+    // Issue #1068: per-row fused quantized-KV attention for short multi-row forwards. Default ON wherever the fused decode
+    // tier is on; DOTLLM_HYBRID_KVQ_PER_ROW=0 restores dequant-to-scratch for A/B measurement.
+    private static readonly bool s_perRowKvqEnv = Environment.GetEnvironmentVariable("DOTLLM_HYBRID_KVQ_PER_ROW") != "0";
+    private bool? _perRowKvqOverride;
+
+    /// <summary>Test seam for the per-row quantized-KV verify tier (issue #1068).</summary>
+    internal bool PerRowKvqForTest
+    {
+        get => _perRowKvqOverride ?? s_perRowKvqEnv;
+        set => _perRowKvqOverride = value;
+    }
+
+    /// <summary>Test-only: attention calls (one per row) served by the per-row fused quantized-KV tier.</summary>
+    internal int DebugPerRowKvqAttentionCallsForTest { get; private set; }
+
+    /// <summary>Test-only: quantized-KV history dequantizations into the F16 scratch (one per K or V side per layer call).</summary>
+    internal int DebugKvDequantCallsForTest { get; private set; }
     private nint _kvF16ScratchK;
     private nint _kvF16ScratchV;
     private long _kvF16ScratchElems;
@@ -3528,21 +3553,39 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
             // kF16/vF16, so the fused quantized-KV path (which never resolves them) must stand down.
             if (useSplitKvHpAttn) fusedKvqDecode = false;
 
+            // Issue #1068: a short multi-row forward over quantized KV (an MTP or speculative verify, K+1 rows every round)
+            // used to dequantize the WHOLE history [0, seqKv) of K and V into F16 scratch in every attention layer, then run
+            // the prefill kernel over it: O(context) extra writes and reads per round, plus a scratch that grows with the
+            // context (and, once VRAM ran out, spilled into shared memory and ran at PCIe speed). Instead run the fused
+            // dequant-in-load decode kernel once per row, each row attending to its own causal prefix [0, position + 1).
+            // That is exact causal attention (the rows' K/V were written above) and needs no scratch at all.
+            int perRowFirstSeqKv = positionOffset + 1;
+            bool perRowKvq = !useMmaDecodeGqaSplitAttn
+                && seqLen > 1 && seqLen <= PerRowKvqMaxRows
+                && PerRowKvqForTest && FuseQuantKvDecodeForTest
+                && IsQuantKv(_kvKeyDType) && IsQuantKv(_kvValueDType)
+                && numKvHeads < numHeads
+                && perRowFirstSeqKv >= CudaKernels.AttentionGqaSplitMinSeqKv
+                && IsContiguous(positions)
+                && _mmaDecodeGqaSplit.CanUseKvq(_kvKeyDType, _kvValueDType, 1, perRowFirstSeqKv, 0,
+                                                numHeads, numKvHeads, headDim)
+                && _mmaDecodeGqaSplit.ComputeSafeKvSplitKvq(_kvKeyDType, _kvValueDType, numKvHeads, perRowFirstSeqKv) >= 1;
+
             // F32 K/V read-staging (issue #956): needed only by the F32-consuming tiers. The mma
             // decode kernel below reads the F16 cache directly, so on the default decode path no
             // F32 copy is allocated or converted at all. Tier precedence mirrors the dispatch
             // chain: the #226 fp64-combine toggle wins over mma, then mma, then the F32 tiers.
             // Issue #962: tensor-core flash prefill (head_dim 256) reads the F16 view directly too.
-            bool useFlashPrefillHd256 = seqLen > 1
+            bool useFlashPrefillHd256 = seqLen > 1 && !perRowKvq
                 && FlashPrefillHd256ForTest
                 && _kernels.HasAttentionFlashPrefillHd256
                 && CudaKernels.IsAttentionFlashPrefillHd256Shape(numHeads, numKvHeads, headDim);
-            bool needF32Stage = !useFlashPrefillHd256 && (useSplitKvHpAttn || !useMmaDecodeGqaSplitAttn);
+            bool needF32Stage = !useFlashPrefillHd256 && !perRowKvq && (useSplitKvHpAttn || !useMmaDecodeGqaSplitAttn);
             nint kStage = 0, vStage = 0;
             // F16 view of K/V history: the persistent cache, or a fresh dequant into the shared
             // scratch when KV storage is quantized (Phase 2).
             nint kF16 = 0, vF16 = 0;
-            if (!fusedKvqDecode)
+            if (!fusedKvqDecode && !perRowKvq)
             {
                 kF16 = ResolveKvF16(slot, isKey: true, seqKv, kvElems, streamH);
                 vF16 = ResolveKvF16(slot, isKey: false, seqKv, kvElems, streamH);
@@ -3572,7 +3615,28 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
                     $"state+gdn {ComputeMemoryBytes / 1048576.0:F0} MiB");
             }
 
-            if (useFlashPrefillHd256)
+            if (perRowKvq)
+            {
+                int maxSplit = 1;   // the partial scratch must hold the widest split any row uses
+                for (int r = 0; r < seqLen; r++)
+                    maxSplit = Math.Max(maxSplit, _mmaDecodeGqaSplit.ComputeSafeKvSplitKvq(_kvKeyDType, _kvValueDType,
+                                                                                           numKvHeads, positionOffset + r + 1));
+                EnsureAttentionMmaDecodeQF16Scratch(numHeads, headDim, rows: seqLen);
+                EnsureAttentionGqaSplitScratch(numHeads, headDim, maxSplit);
+                _kernels.LaunchConvertF32ToF16(q, _attnMmaDecodeQF16, seqLen * qElems, streamH);
+                for (int r = 0; r < seqLen; r++)
+                {
+                    int rowSeqKv = positionOffset + r + 1;   // causal: row r sees positions [0, positionOffset + r]
+                    int split = _mmaDecodeGqaSplit.ComputeSafeKvSplitKvq(_kvKeyDType, _kvValueDType, numKvHeads, rowSeqKv);
+                    _mmaDecodeGqaSplit.RunKvq(_attnMmaDecodeQF16 + (nint)((long)r * qElems * sizeof(ushort)),
+                        _kQuant![slot], _vQuant![slot], _kvKeyDType, _kvValueDType,
+                        attnOut + (nint)((long)r * qElems * sizeof(float)),
+                        rowSeqKv, numHeads, numKvHeads, split,
+                        _attnGqaSplitPartialMax, _attnGqaSplitPartialSum, _attnGqaSplitPartialOut, streamH);
+                    DebugPerRowKvqAttentionCallsForTest++;
+                }
+            }
+            else if (useFlashPrefillHd256)
             {
                 long qElemsAll = (long)seqLen * numHeads * headDim;
                 if (qElemsAll > _attnFlashPrefillQF16ElemsAllocated)
@@ -3847,7 +3911,16 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         nint scratch = isKey ? _kvF16ScratchK : _kvF16ScratchV;
         nint quant = isKey ? _kQuant![slot] : _vQuant![slot];
         _kernels.LaunchKvDequantToF16(quant, dt, scratch, seqKv * kvElems, stream);
+        DebugKvDequantCallsForTest++;
         return scratch;
+    }
+
+    /// <summary>True when <paramref name="positions"/> are consecutive (each one more than the last).</summary>
+    private static bool IsContiguous(ReadOnlySpan<int> positions)
+    {
+        for (int i = 1; i < positions.Length; i++)
+            if (positions[i] != positions[i - 1] + 1) return false;
+        return true;
     }
 
     private void EnsureF16KvWriteStaging(int seqLen, int kvElems)
@@ -3943,9 +4016,9 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     /// <see cref="CudaKernels.LaunchAttentionMmaDecodeGqaSplit"/> requires FP16 Q, but this
     /// model's projected Q (<c>_state.QScratch</c>) is F32 like every other attention tier
     /// here, so it needs its own one-shot conversion immediately before that launch.</summary>
-    private void EnsureAttentionMmaDecodeQF16Scratch(int numHeads, int headDim)
+    private void EnsureAttentionMmaDecodeQF16Scratch(int numHeads, int headDim, int rows = 1)
     {
-        long needed = (long)numHeads * headDim;
+        long needed = (long)rows * numHeads * headDim;
         if (needed <= _attnMmaDecodeQF16ElemsAllocated) return;
 
         FreeIfNonZero(ref _attnMmaDecodeQF16);
