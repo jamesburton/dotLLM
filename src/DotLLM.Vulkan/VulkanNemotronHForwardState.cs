@@ -58,18 +58,22 @@ internal sealed class VulkanNemotronHForwardState : IDisposable
     public VulkanDevice.Buffer FfnIntermediate { get; private set; } = null!;
 
     // ── MoE scratch (nemotron_h_moe, #402); null when the model has no routed layers ─────────────────────────
-    private readonly (int NumExperts, int TopK, int MoeIntermediate)? _moe;
+    // Sized from the per-layer MAXIMA (#1045): Nemotron 3.5 Bolt varies experts / top-k / width per layer, and its LatentMoE
+    // experts read a [seqLen, latent] input instead of the hidden state. ExpertDim is the widest expert input (latent or hidden).
+    private readonly NemotronHMoeScratchSpec? _moe;
     public VulkanDevice.Buffer? MoeRouterLogits { get; private set; }      // [seqLen, numExperts]
     public VulkanDevice.Buffer? MoeTopkIndices { get; private set; }       // [seqLen, topK] int32
     public VulkanDevice.Buffer? MoeTopkWeights { get; private set; }       // [seqLen, topK]
-    public VulkanDevice.Buffer? MoeExpandedInput { get; private set; }     // [seqLen*topK, hidden]  (token row repeated per slot)
+    public VulkanDevice.Buffer? MoeExpandedInput { get; private set; }     // [seqLen*topK, expertDim]  (token row repeated per slot)
     public VulkanDevice.Buffer? MoeExpandedInputXq { get; private set; }   // Q8_1 packed int8 of MoeExpandedInput (MMVQ decode path)
     public VulkanDevice.Buffer? MoeExpandedInputXds { get; private set; }
     public VulkanDevice.Buffer? MoeUpInter { get; private set; }           // [seqLen*topK, moeIntermediate]
     public VulkanDevice.Buffer? MoeUpInterXq { get; private set; }         // Q8_1 packed int8 of the relu^2 output (MMVQ down)
     public VulkanDevice.Buffer? MoeUpInterXds { get; private set; }
-    public VulkanDevice.Buffer? MoeDownRows { get; private set; }          // [seqLen*topK, hidden]
+    public VulkanDevice.Buffer? MoeDownRows { get; private set; }          // [seqLen*topK, expertDim]
     public VulkanDevice.Buffer? MoeSharedOut { get; private set; }         // [seqLen, hidden] shared-expert output
+    public VulkanDevice.Buffer? MoeLatentIn { get; private set; }          // [seqLen, latent] ffn_latent_down(x); null without LatentMoE
+    public VulkanDevice.Buffer? MoeLatentOut { get; private set; }         // [seqLen, latent] weighted expert sum before ffn_latent_up
 
     // ── Logits + positions ────────────────────────────────────────────────
     public VulkanDevice.Buffer Logits { get; private set; }
@@ -85,7 +89,7 @@ internal sealed class VulkanNemotronHForwardState : IDisposable
         int qElems, int kvElems,
         MambaSsmConfig ssm,
         int initialSeqLen,
-        (int NumExperts, int TopK, int MoeIntermediate)? moe = null)
+        NemotronHMoeScratchSpec? moe = null)
     {
         _device = device;
         _moe = moe;
@@ -157,20 +161,27 @@ internal sealed class VulkanNemotronHForwardState : IDisposable
         if (_moe is { } moe)
         {
             long rows = (long)seqLen * moe.TopK;
+            int expertDim = moe.ExpertDim;
             MoeRouterLogits = _device.AllocateDeviceLocal((long)seqLen * moe.NumExperts * sizeof(float));
             MoeTopkIndices = _device.AllocateDeviceLocal(rows * sizeof(int));
             MoeTopkWeights = _device.AllocateDeviceLocal(rows * sizeof(float));
-            MoeExpandedInput = _device.AllocateDeviceLocal(rows * _hiddenSize * sizeof(float));
-            MoeExpandedInputXq = _device.AllocateDeviceLocal(Kernels.QuantizeQ8_1RowsKernel.PackedBytes((int)rows, _hiddenSize));
-            MoeExpandedInputXds = _device.AllocateDeviceLocal(Kernels.QuantizeQ8_1RowsKernel.ScaleBytes((int)rows, _hiddenSize));
+            MoeExpandedInput = _device.AllocateDeviceLocal(rows * expertDim * sizeof(float));
+            MoeExpandedInputXq = _device.AllocateDeviceLocal(Kernels.QuantizeQ8_1RowsKernel.PackedBytes((int)rows, expertDim));
+            MoeExpandedInputXds = _device.AllocateDeviceLocal(Kernels.QuantizeQ8_1RowsKernel.ScaleBytes((int)rows, expertDim));
             MoeUpInter = _device.AllocateDeviceLocal(rows * moe.MoeIntermediate * sizeof(float));
             MoeUpInterXq = _device.AllocateDeviceLocal(Kernels.QuantizeQ8_1RowsKernel.PackedBytes((int)rows, moe.MoeIntermediate));
             MoeUpInterXds = _device.AllocateDeviceLocal(Kernels.QuantizeQ8_1RowsKernel.ScaleBytes((int)rows, moe.MoeIntermediate));
-            MoeDownRows = _device.AllocateDeviceLocal(rows * _hiddenSize * sizeof(float));
+            MoeDownRows = _device.AllocateDeviceLocal(rows * expertDim * sizeof(float));
             MoeSharedOut = _device.AllocateDeviceLocal(hiddenBytes);
             moeBytes = MoeRouterLogits.Size + MoeTopkIndices.Size + MoeTopkWeights.Size + MoeExpandedInput.Size
                      + MoeExpandedInputXq.Size + MoeExpandedInputXds.Size + MoeUpInter.Size + MoeUpInterXq.Size
                      + MoeUpInterXds.Size + MoeDownRows.Size + MoeSharedOut.Size;
+            if (moe.LatentSize > 0)
+            {
+                MoeLatentIn = _device.AllocateDeviceLocal((long)seqLen * moe.LatentSize * sizeof(float));
+                MoeLatentOut = _device.AllocateDeviceLocal((long)seqLen * moe.LatentSize * sizeof(float));
+                moeBytes += MoeLatentIn.Size + MoeLatentOut.Size;
+            }
         }
 
         // Resize positions buffer (host writes positions per forward).
@@ -209,6 +220,7 @@ internal sealed class VulkanNemotronHForwardState : IDisposable
         MoeExpandedInput?.Dispose(); MoeExpandedInputXq?.Dispose(); MoeExpandedInputXds?.Dispose();
         MoeUpInter?.Dispose(); MoeUpInterXq?.Dispose(); MoeUpInterXds?.Dispose();
         MoeDownRows?.Dispose(); MoeSharedOut?.Dispose();
+        MoeLatentIn?.Dispose(); MoeLatentOut?.Dispose();
     }
 
     public void Dispose()
@@ -221,3 +233,14 @@ internal sealed class VulkanNemotronHForwardState : IDisposable
         PositionsBuffer?.Dispose();
     }
 }
+
+/// <summary>
+/// Routed-MoE scratch geometry of a nemotron_h_moe model: the MAXIMUM over its MoE layers of each dimension, since Nemotron 3.5 Bolt
+/// varies them per layer (#1045). Every layer dispatches with its own geometry inside these buffers.
+/// </summary>
+/// <param name="NumExperts">Largest routed-expert count of any layer (router-logit row width).</param>
+/// <param name="TopK">Largest experts-per-token of any layer.</param>
+/// <param name="MoeIntermediate">Widest routed-expert intermediate of any layer.</param>
+/// <param name="ExpertDim">Widest routed-expert input: the LatentMoE width for a latent layer, the hidden size otherwise.</param>
+/// <param name="LatentSize">Largest LatentMoE width of any layer, or 0 when no layer is latent.</param>
+internal readonly record struct NemotronHMoeScratchSpec(int NumExperts, int TopK, int MoeIntermediate, int ExpertDim, int LatentSize);

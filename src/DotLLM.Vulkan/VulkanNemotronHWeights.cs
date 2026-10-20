@@ -168,17 +168,35 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         public readonly bool NormalizeWeights;
         public readonly float WeightsScale;
 
+        /// <summary>LatentMoE width (#1045, Nemotron 3.5 Bolt), or 0 when the routed experts read the full hidden state.</summary>
+        public readonly int LatentSize;
+        /// <summary>ffn_latent_down [latent, hidden] dense projection; null when <see cref="LatentSize"/> is 0.</summary>
+        public readonly VulkanDevice.Buffer? LatentDown;
+        public readonly QuantizationType LatentDownDeviceQuantType;
+        /// <summary>ffn_latent_up [hidden, latent] dense projection; null when <see cref="LatentSize"/> is 0.</summary>
+        public readonly VulkanDevice.Buffer? LatentUp;
+        public readonly QuantizationType LatentUpDeviceQuantType;
+
+        /// <summary>Whether the routed experts run in the LatentMoE bottleneck.</summary>
+        public bool HasLatent => LatentSize > 0;
+
         public MoeLayerBuffers(
             VulkanDevice.Buffer router, QuantizationType routerQt, VulkanDevice.Buffer selectionBias,
             VulkanDevice.Buffer upBank, QuantizationType upQt, VulkanDevice.Buffer downBank, QuantizationType downQt,
             VulkanDevice.Buffer sharedUp, QuantizationType sharedUpQt, VulkanDevice.Buffer sharedDown, QuantizationType sharedDownQt,
-            int numExperts, int topK, int moeInter, int sharedInter, bool normalize, float scale)
+            int numExperts, int topK, int moeInter, int sharedInter, bool normalize, float scale,
+            int latentSize = 0,
+            VulkanDevice.Buffer? latentDown = null, QuantizationType latentDownQt = QuantizationType.F32,
+            VulkanDevice.Buffer? latentUp = null, QuantizationType latentUpQt = QuantizationType.F32)
         {
             Router = router; RouterDeviceQuantType = routerQt; SelectionBias = selectionBias;
             UpBank = upBank; UpBankQuantType = upQt; DownBank = downBank; DownBankQuantType = downQt;
             SharedUp = sharedUp; SharedUpDeviceQuantType = sharedUpQt; SharedDown = sharedDown; SharedDownDeviceQuantType = sharedDownQt;
             NumExperts = numExperts; NumExpertsPerTok = topK; MoeIntermediateSize = moeInter; SharedIntermediateSize = sharedInter;
             NormalizeWeights = normalize; WeightsScale = scale;
+            LatentSize = latentSize;
+            LatentDown = latentDown; LatentDownDeviceQuantType = latentDownQt;
+            LatentUp = latentUp; LatentUpDeviceQuantType = latentUpQt;
         }
 
         public void Dispose()
@@ -186,6 +204,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
             Router.Dispose(); SelectionBias.Dispose();
             UpBank.Dispose(); DownBank.Dispose();
             SharedUp.Dispose(); SharedDown.Dispose();
+            LatentDown?.Dispose(); LatentUp?.Dispose();
         }
     }
 
@@ -584,6 +603,11 @@ internal sealed class VulkanNemotronHWeights : IDisposable
                 max = Math.Max(max, (long)m.SelectionBias.Length * sizeof(float));
                 max = Math.Max(max, ProjectionUploadBytes(m.SharedIntermediateSize, h, m.UpShexpQuantType));
                 max = Math.Max(max, ProjectionUploadBytes(h, m.SharedIntermediateSize, m.DownShexpQuantType));
+                if (m.HasLatent)
+                {
+                    max = Math.Max(max, ProjectionUploadBytes(m.LatentSize, h, m.LatentDownQuantType));
+                    max = Math.Max(max, ProjectionUploadBytes(h, m.LatentSize, m.LatentUpQuantType));
+                }
                 // Expert banks stream row by row (UploadRows), so one destination row is the only hard requirement.
                 max = Math.Max(max, Dequantize.RowByteSize(Math.Max(h, m.MoeIntermediateSize), QuantizationType.Q5_1));
             }
@@ -658,8 +682,9 @@ internal sealed class VulkanNemotronHWeights : IDisposable
 
     /// <summary>
     /// Uploads one nemotron_h_moe MoE layer. The routed banks stay quantized (the F32 expansion of the published files is
-    /// ~100 GB), in a form an indexed matmul kernel reads: Q8_0 and Q5_1 as stored, Q5_0 exactly repacked to Q5_1.
-    /// Any other expert quantization throws instead of silently widening (IQ4_NL / Q4_0 / K-quant / MXFP4 banks: see #407, #402).
+    /// ~100 GB), in a form an indexed matmul kernel reads: Q8_0, Q5_1 and the K-quants Q4_K / Q5_K / Q6_K as stored (#1045, the
+    /// Nemotron 3.5 Bolt AD-Q4_K_M / AD-Q6_K banks), Q5_0 exactly repacked to Q5_1.
+    /// Any other expert quantization throws instead of silently widening (IQ4_NL / Q4_0 / MXFP4 banks: see #407, #402).
     /// </summary>
     private static VulkanDevice.Buffer UploadExpertBank(
         VulkanDevice device, VulkanStagingBuffer staging,
@@ -673,6 +698,13 @@ internal sealed class VulkanNemotronHWeights : IDisposable
 
         switch (srcQt)
         {
+            case QuantizationType.Q4_K:
+            case QuantizationType.Q5_K:
+            case QuantizationType.Q6_K:
+                // K-quant super-blocks span 256 elements; every indexed K-quant kernel (MMVQ and F32-in) assumes whole blocks per row.
+                if (kDim % 256 != 0)
+                    throw new NotSupportedException($"nemotron_h_moe {what} is {srcQt} with K={kDim}, not a multiple of the 256-element K-quant block.");
+                goto case QuantizationType.Q8_0;
             case QuantizationType.Q8_0:
             case QuantizationType.Q5_1:
             {
@@ -703,8 +735,8 @@ internal sealed class VulkanNemotronHWeights : IDisposable
             }
             default:
                 throw new NotSupportedException(
-                    $"nemotron_h_moe {what} is {srcQt}: the Vulkan expert-indexed kernels cover Q8_0, Q5_1 and Q5_0 (repacked to Q5_1) banks only. " +
-                    "Widening the banks to F32 would need ~100 GB. IQ4_NL / Q4_0 / K-quant / MXFP4 expert banks are tracked in #407 and #402; use --device cpu.");
+                    $"nemotron_h_moe {what} is {srcQt}: the Vulkan expert-indexed kernels cover Q8_0, Q5_1, Q5_0 (repacked to Q5_1) and Q4_K / Q5_K / Q6_K banks only. " +
+                    "Widening the banks to F32 would need ~100 GB. IQ4_NL / Q4_0 / MXFP4 expert banks are tracked in #407 and #402; use --device cpu.");
         }
     }
 
@@ -714,23 +746,39 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         int numE = moe.NumExperts;
         int inter = moe.MoeIntermediateSize;
         int sharedInter = moe.SharedIntermediateSize;
+        // LatentMoE (#1045): the routed banks are [latent -> inter] / [inter -> latent]; the router and shared expert keep the hidden.
+        int expertDim = moe.HasLatent ? moe.LatentSize : hidden;
 
         var router = UploadProjectionMatrix(device, staging, moe.GateInpWeight, moe.GateInpQuantType, numE, hidden,
             forceF32: false, out var routerQt, out long routerBytes);
         var bias = UploadFloatArray(device, staging, moe.SelectionBias);
-        var up = UploadExpertBank(device, staging, moe.UpExpsWeight, moe.UpExpsQuantType, numE, inter, hidden,
+        var up = UploadExpertBank(device, staging, moe.UpExpsWeight, moe.UpExpsQuantType, numE, inter, expertDim,
             "ffn_up_exps", out var upQt, out long upBytes);
-        var down = UploadExpertBank(device, staging, moe.DownExpsWeight, moe.DownExpsQuantType, numE, hidden, inter,
+        var down = UploadExpertBank(device, staging, moe.DownExpsWeight, moe.DownExpsQuantType, numE, expertDim, inter,
             "ffn_down_exps", out var downQt, out long downBytes);
         var sharedUp = UploadProjectionMatrix(device, staging, moe.UpShexpWeight, moe.UpShexpQuantType, sharedInter, hidden,
             forceF32: false, out var sharedUpQt, out long sharedUpBytes);
         var sharedDown = UploadProjectionMatrix(device, staging, moe.DownShexpWeight, moe.DownShexpQuantType, hidden, sharedInter,
             forceF32: false, out var sharedDownQt, out long sharedDownBytes);
 
-        uploadedBytes = routerBytes + (long)moe.SelectionBias.Length * sizeof(float) + upBytes + downBytes + sharedUpBytes + sharedDownBytes;
+        VulkanDevice.Buffer? latentDown = null, latentUp = null;
+        QuantizationType latentDownQt = QuantizationType.F32, latentUpQt = QuantizationType.F32;
+        long latentBytes = 0;
+        if (moe.HasLatent)
+        {
+            latentDown = UploadProjectionMatrix(device, staging, moe.LatentDownWeight, moe.LatentDownQuantType, moe.LatentSize, hidden,
+                forceF32: false, out latentDownQt, out long latentDownBytes);
+            latentUp = UploadProjectionMatrix(device, staging, moe.LatentUpWeight, moe.LatentUpQuantType, hidden, moe.LatentSize,
+                forceF32: false, out latentUpQt, out long latentUpBytes);
+            latentBytes = latentDownBytes + latentUpBytes;
+        }
+
+        uploadedBytes = routerBytes + (long)moe.SelectionBias.Length * sizeof(float) + upBytes + downBytes + sharedUpBytes + sharedDownBytes
+                      + latentBytes;
         return new MoeLayerBuffers(router, routerQt, bias, up, upQt, down, downQt,
             sharedUp, sharedUpQt, sharedDown, sharedDownQt,
-            numE, moe.NumExpertsPerTok, inter, sharedInter, moe.NormalizeWeights, moe.WeightsScale);
+            numE, moe.NumExpertsPerTok, inter, sharedInter, moe.NormalizeWeights, moe.WeightsScale,
+            moe.LatentSize, latentDown, latentDownQt, latentUp, latentUpQt);
     }
 
     private static FfnLayerBuffers UploadFfnLayer(

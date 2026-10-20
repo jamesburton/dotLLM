@@ -429,7 +429,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         int ssmOrdinal = 0;
         int attentionLayerCount = 0;
         int maxIntermediate = 0;
-        (int NumExperts, int TopK, int MoeIntermediate)? moeSpec = null;
+        // Routed-MoE scratch is sized from the per-layer MAXIMA (#1045): Nemotron 3.5 Bolt varies experts / top-k / width per layer
+        // and runs its experts in a LatentMoE bottleneck. Each layer dispatches with its own geometry.
+        NemotronHMoeScratchSpec? moeSpec = null;
         for (int i = 0; i < config.NumLayers; i++)
         {
             ssmLayerOrdinal[i] = layout.LayerKind[i] == HybridLayerKind.Ssm ? ssmOrdinal++ : -1;
@@ -443,9 +445,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                 {
                     // The shared expert's intermediate rides FfnIntermediate; routed rows have their own scratch.
                     if (moeLayer.SharedIntermediateSize > maxIntermediate) maxIntermediate = moeLayer.SharedIntermediateSize;
-                    var layerSpec = (moeLayer.NumExperts, moeLayer.NumExpertsPerTok, moeLayer.MoeIntermediateSize);
-                    ThrowIfMoeLayerUnsupported(i, moeLayer.HasLatent, moeSpec, layerSpec);
-                    moeSpec = layerSpec;
+                    moeSpec = WidenMoeSpec(moeSpec, moeLayer, config.HiddenSize);
                 }
                 else
                 {
@@ -1283,7 +1283,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
     /// <summary>
     /// Kernels of the nemotron_h_moe routed layer (#402). Created only when the model has a router tensor; the dense Nemotron-H path never
-    /// touches them. Expert banks are Q8_0 / Q5_1 (Q5_0 repacked at upload), so only those indexed matmuls exist here.
+    /// touches them. Expert banks are Q8_0 / Q5_1 (Q5_0 repacked at upload) or the K-quants Q4_K / Q5_K / Q6_K (#1045, Nemotron 3.5 Bolt),
+    /// so only those indexed matmuls exist here.
     /// </summary>
     private sealed class MoeKernelSet : IDisposable
     {
@@ -1292,24 +1293,44 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         public required MoeWeightedScatterF32Kernel Scatter { get; init; }
         public required MoeIndexedMatmulQ5_1F32Kernel IndexedQ5_1 { get; init; }
         public required MoeIndexedMatmulQ8_0F32Kernel IndexedQ8_0 { get; init; }
+        public required MoeIndexedMatmulQ4_KF32Kernel IndexedQ4_K { get; init; }
+        public required MoeIndexedMatmulQ5_KF32Kernel IndexedQ5_K { get; init; }
+        public required MoeIndexedMatmulQ6_KF32Kernel IndexedQ6_K { get; init; }
         public QuantizeQ8_1RowsKernel? Quantize { get; init; }
         public MoeIndexedMatmulQ5_1MmvqKernel? MmvqQ5_1 { get; init; }
         public MoeIndexedMatmulQ8_0MmvqKernel? MmvqQ8_0 { get; init; }
+        public MoeIndexedMatmulKQuantMmvqKernel? MmvqQ4_K { get; init; }
+        public MoeIndexedMatmulKQuantMmvqKernel? MmvqQ5_K { get; init; }
+        public MoeIndexedMatmulKQuantMmvqKernel? MmvqQ6_K { get; init; }
         public required VulkanDevice.Buffer UnitScale { get; init; }   // per-expert output scale, all ones
 
-        public bool CanMmvq => Quantize is not null && MmvqQ5_1 is not null && MmvqQ8_0 is not null;
+        /// <summary>True when a bank of type <paramref name="bankQt"/> has a dp4a MMVQ kernel (and the Q8_1 activation quantizer exists).</summary>
+        public bool CanMmvq(QuantizationType bankQt) => Quantize is not null && bankQt switch
+        {
+            QuantizationType.Q5_1 => MmvqQ5_1 is not null,
+            QuantizationType.Q8_0 => MmvqQ8_0 is not null,
+            QuantizationType.Q4_K => MmvqQ4_K is not null,
+            QuantizationType.Q5_K => MmvqQ5_K is not null,
+            QuantizationType.Q6_K => MmvqQ6_K is not null,
+            _ => false,
+        };
 
         public void Invalidate()
         {
             Router.InvalidateDescriptorCache(); Broadcast.InvalidateDescriptorCache(); Scatter.InvalidateDescriptorCache();
             IndexedQ5_1.InvalidateDescriptorCache(); IndexedQ8_0.InvalidateDescriptorCache();
+            IndexedQ4_K.InvalidateDescriptorCache(); IndexedQ5_K.InvalidateDescriptorCache(); IndexedQ6_K.InvalidateDescriptorCache();
             Quantize?.InvalidateDescriptorCache(); MmvqQ5_1?.InvalidateDescriptorCache(); MmvqQ8_0?.InvalidateDescriptorCache();
+            MmvqQ4_K?.InvalidateDescriptorCache(); MmvqQ5_K?.InvalidateDescriptorCache(); MmvqQ6_K?.InvalidateDescriptorCache();
         }
 
         public void Dispose()
         {
             Router.Dispose(); Broadcast.Dispose(); Scatter.Dispose(); IndexedQ5_1.Dispose(); IndexedQ8_0.Dispose();
-            Quantize?.Dispose(); MmvqQ5_1?.Dispose(); MmvqQ8_0?.Dispose(); UnitScale.Dispose();
+            IndexedQ4_K.Dispose(); IndexedQ5_K.Dispose(); IndexedQ6_K.Dispose();
+            Quantize?.Dispose(); MmvqQ5_1?.Dispose(); MmvqQ8_0?.Dispose();
+            MmvqQ4_K?.Dispose(); MmvqQ5_K?.Dispose(); MmvqQ6_K?.Dispose();
+            UnitScale.Dispose();
         }
     }
 
@@ -1320,29 +1341,24 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         Environment.GetEnvironmentVariable("DOTLLM_VK_NEMOTRON_MOE_MMVQ") != "0";
 
     /// <summary>
-    /// Refuses the two Nemotron 3.5 Bolt features (#1037) the Vulkan MoE path does not implement:
-    /// LatentMoE projections and per-layer heterogeneous routed-MoE geometry. Its kernels and
-    /// scratch are sized from a single MoE spec, so either would compute wrong output silently.
+    /// Widens the routed-MoE scratch spec to cover one more MoE layer (#1045). Nemotron 3.5 Bolt varies the expert count, top-k and
+    /// width per layer and runs its experts in a LatentMoE bottleneck, so the scratch takes the maximum of each dimension and every
+    /// layer dispatches with its own geometry.
     /// </summary>
-    /// <param name="layer">Block index of the MoE layer being checked.</param>
-    /// <param name="hasLatent">Whether the layer carries <c>ffn_latent_down</c>/<c>ffn_latent_up</c>.</param>
-    /// <param name="previous">The (experts, top-k, intermediate) spec of the previous MoE layer, if any.</param>
-    /// <param name="current">The (experts, top-k, intermediate) spec of this layer.</param>
-    /// <exception cref="NotSupportedException">The layer needs a feature this backend lacks.</exception>
-    internal static void ThrowIfMoeLayerUnsupported(
-        int layer, bool hasLatent,
-        (int NumExperts, int TopK, int MoeIntermediate)? previous,
-        (int NumExperts, int TopK, int MoeIntermediate) current)
+    /// <param name="current">The spec covering the MoE layers seen so far, or null before the first one.</param>
+    /// <param name="layer">The MoE layer to cover.</param>
+    /// <param name="hiddenSize">Model hidden size: the expert input width of a non-latent layer.</param>
+    /// <returns>The widened spec.</returns>
+    internal static NemotronHMoeScratchSpec WidenMoeSpec(NemotronHMoeScratchSpec? current, NemotronHMoeWeights layer, int hiddenSize)
     {
-        if (hasLatent)
-            throw new NotSupportedException(
-                $"nemotron_h_moe layer {layer} uses LatentMoE (ffn_latent_down/up, Nemotron 3.5 Bolt), which the "
-                + "Vulkan backend does not implement yet. Use the CPU backend. Tracked in issues #1035/#1037.");
-        if (previous is { } p && p != current)
-            throw new NotSupportedException(
-                $"nemotron_h_moe layer {layer} has routed-MoE geometry {current} but an earlier layer has {p}; "
-                + "per-layer expert counts/widths (Nemotron 3.5 Bolt) are not implemented on Vulkan yet. "
-                + "Use the CPU backend. Tracked in issues #1035/#1037.");
+        int expertDim = layer.HasLatent ? layer.LatentSize : hiddenSize;
+        var c = current ?? default;
+        return new NemotronHMoeScratchSpec(
+            NumExperts: Math.Max(c.NumExperts, layer.NumExperts),
+            TopK: Math.Max(c.TopK, layer.NumExpertsPerTok),
+            MoeIntermediate: Math.Max(c.MoeIntermediate, layer.MoeIntermediateSize),
+            ExpertDim: Math.Max(c.ExpertDim, expertDim),
+            LatentSize: Math.Max(c.LatentSize, layer.HasLatent ? layer.LatentSize : 0));
     }
 
     private static MoeKernelSet CreateMoeKernels(VulkanDevice device, string spvDir, int numExperts)
@@ -1359,9 +1375,15 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             Scatter = MoeWeightedScatterF32Kernel.Create(device, spvDir),
             IndexedQ5_1 = MoeIndexedMatmulQ5_1F32Kernel.Create(device, spvDir),
             IndexedQ8_0 = MoeIndexedMatmulQ8_0F32Kernel.Create(device, spvDir),
+            IndexedQ4_K = MoeIndexedMatmulQ4_KF32Kernel.Create(device, spvDir),
+            IndexedQ5_K = MoeIndexedMatmulQ5_KF32Kernel.Create(device, spvDir),
+            IndexedQ6_K = MoeIndexedMatmulQ6_KF32Kernel.Create(device, spvDir),
             Quantize = mmvq ? QuantizeQ8_1RowsKernel.TryCreate(device, spvDir) : null,
             MmvqQ5_1 = mmvq ? MoeIndexedMatmulQ5_1MmvqKernel.TryCreate(device, spvDir) : null,
             MmvqQ8_0 = mmvq ? MoeIndexedMatmulQ8_0MmvqKernel.TryCreate(device, spvDir) : null,
+            MmvqQ4_K = mmvq ? MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q4_K) : null,
+            MmvqQ5_K = mmvq ? MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q5_K) : null,
+            MmvqQ6_K = mmvq ? MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q6_K) : null,
             UnitScale = ones,
         };
     }
@@ -1376,10 +1398,12 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
     /// <summary>
     /// nemotron_h_moe routed-MoE FFN (#402), the Vulkan twin of <c>NemotronHTransformerModel.ForwardMoeFfnBody</c> (llama.cpp
-    /// <c>build_moe_ffn</c>): router on the full normed input, sigmoid + selection-only bias, top-k, weights from the unbiased
-    /// probabilities (renorm, x scale), ungated relu-squared routed experts, plus the unweighted ungated relu-squared shared expert.
-    /// Reads the pre-normed activations from <c>NormOutput</c>, leaves the result there. The shared expert runs first: it reads
-    /// <c>NormOutput</c>, which the routed scatter overwrites.
+    /// <c>build_ffn_layer</c> / <c>build_moe_ffn</c>): router on the full normed input, sigmoid + selection-only bias, top-k, weights from the
+    /// unbiased probabilities (renorm, x scale), ungated relu-squared routed experts, plus the unweighted ungated relu-squared shared expert.
+    /// LatentMoE layers (#1045, Nemotron 3.5 Bolt) run the routed experts on <c>ffn_latent_down(x)</c> and send their weighted sum through
+    /// <c>ffn_latent_up</c>; the router and the shared expert still read the full x. Every dimension (experts, top-k, width, latent) is
+    /// this layer's own. Reads the pre-normed activations from <c>NormOutput</c>, leaves the result there. The shared expert and
+    /// <c>latent_down</c> run first: they read <c>NormOutput</c>, which the routed output overwrites.
     /// </summary>
     private void RecordMoeFfnLayer(nint cmdBuf, VulkanNemotronHWeights.MoeLayerBuffers m, int seqLen)
     {
@@ -1387,35 +1411,52 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         int hidden = Config.HiddenSize;
         int numE = m.NumExperts, topK = m.NumExpertsPerTok, inter = m.MoeIntermediateSize, sharedInter = m.SharedIntermediateSize;
         int rows = seqLen * topK;
+        bool latent = m.HasLatent;
+        // Routed experts read (and write) the latent width on a LatentMoE layer, the hidden width otherwise.
+        int expertDim = latent ? m.LatentSize : hidden;
+        var expertIn = latent ? _state.MoeLatentIn! : _state.NormOutput;
+        var routedOut = latent ? _state.MoeLatentOut! : _state.NormOutput;
 
-        // Independent readers of NormOutput: shared-expert up and the router.
+        // Independent readers of NormOutput: shared-expert up, the router and (LatentMoE) latent_down.
         RecordMatmul(cmdBuf, m.SharedUp, m.SharedUpDeviceQuantType, _state.NormOutput, _state.FfnIntermediate,
             outputDim: sharedInter, inputDim: hidden, seqLen: seqLen);
         RecordMatmul(cmdBuf, m.Router, m.RouterDeviceQuantType, _state.NormOutput, _state.MoeRouterLogits!,
             outputDim: numE, inputDim: hidden, seqLen: seqLen);
+        if (latent)
+            RecordMatmul(cmdBuf, m.LatentDown!, m.LatentDownDeviceQuantType, _state.NormOutput, _state.MoeLatentIn!,
+                outputDim: m.LatentSize, inputDim: hidden, seqLen: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         _reluSquared.Record(cmdBuf, _state.FfnIntermediate, n: seqLen * sharedInter);
         k.Router.Record(cmdBuf, _state.MoeRouterLogits!, m.SelectionBias, _state.MoeTopkIndices!, _state.MoeTopkWeights!,
             seqLen: seqLen, numExperts: numE, k: topK, normTopKProb: m.NormalizeWeights, weightsScale: m.WeightsScale);
-        k.Broadcast.Record(cmdBuf, _state.NormOutput, _state.MoeExpandedInput!, seqLen: seqLen, topK: topK, hidden: hidden);
+        k.Broadcast.Record(cmdBuf, expertIn, _state.MoeExpandedInput!, seqLen: seqLen, topK: topK, hidden: expertDim);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         RecordMatmul(cmdBuf, m.SharedDown, m.SharedDownDeviceQuantType, _state.FfnIntermediate, _state.MoeSharedOut!,
             outputDim: hidden, inputDim: sharedInter, seqLen: seqLen);
         RecordExpertMatmul(cmdBuf, k, m.UpBankQuantType, m.UpBank, _state.MoeExpandedInput!, _state.MoeExpandedInputXq!, _state.MoeExpandedInputXds!,
-            _state.MoeUpInter!, mDim: inter, kDim: hidden, rows: rows, numExperts: numE);
+            _state.MoeUpInter!, mDim: inter, kDim: expertDim, rows: rows, numExperts: numE);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         _reluSquared.Record(cmdBuf, _state.MoeUpInter!, n: rows * inter);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         RecordExpertMatmul(cmdBuf, k, m.DownBankQuantType, m.DownBank, _state.MoeUpInter!, _state.MoeUpInterXq!, _state.MoeUpInterXds!,
-            _state.MoeDownRows!, mDim: hidden, kDim: inter, rows: rows, numExperts: numE);
+            _state.MoeDownRows!, mDim: expertDim, kDim: inter, rows: rows, numExperts: numE);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-        k.Scatter.Record(cmdBuf, _state.MoeDownRows!, _state.MoeTopkWeights!, _state.NormOutput, seqLen: seqLen, topK: topK, hiddenSize: hidden);
+        k.Scatter.Record(cmdBuf, _state.MoeDownRows!, _state.MoeTopkWeights!, routedOut, seqLen: seqLen, topK: topK, hiddenSize: expertDim);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        if (latent)
+        {
+            // Back from the latent: NormOutput = latent_up(weighted expert sum). NormOutput's last readers (shared up, router, latent_down)
+            // are behind the barriers above.
+            RecordMatmul(cmdBuf, m.LatentUp!, m.LatentUpDeviceQuantType, _state.MoeLatentOut!, _state.NormOutput,
+                outputDim: hidden, inputDim: m.LatentSize, seqLen: seqLen);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
 
         // Shared expert added unweighted (elementwise, so the in-place a = a + b alias is safe).
         _add.Record(cmdBuf, _state.NormOutput, _state.MoeSharedOut!, _state.NormOutput, seqLen * hidden);
@@ -1423,7 +1464,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
     /// <summary>
     /// One routed-expert projection over <paramref name="rows"/> (token, slot) rows: dp4a MMVQ on a Q8_1-quantized copy of the input when
-    /// available (the decode / default arm), else the F32-activation indexed kernel. <see cref="MoePathCounters"/> records which ran.
+    /// the bank type has one (the decode / default arm), else the F32-activation indexed kernel. <see cref="MoePathCounters"/> records which ran.
+    /// Bank types: Q5_1, Q8_0 and the K-quants Q4_K / Q5_K / Q6_K (#1045).
     /// </summary>
     private void RecordExpertMatmul(
         nint cmdBuf, MoeKernelSet k, QuantizationType bankQt, VulkanDevice.Buffer bank,
@@ -1431,15 +1473,29 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         int mDim, int kDim, int rows, int numExperts)
     {
         var indices = _state.MoeTopkIndices!;
-        if (k.CanMmvq && bankQt is QuantizationType.Q5_1 or QuantizationType.Q8_0)
+        if (k.CanMmvq(bankQt))
         {
             Interlocked.Increment(ref MoePathCounters.Mmvq);
             k.Quantize!.Record(cmdBuf, x, xq, xds, n: rows, k: kDim);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
-            if (bankQt == QuantizationType.Q5_1)
-                k.MmvqQ5_1!.Record(cmdBuf, bank, xq, xds, indices, y, k.UnitScale, m: mDim, k: kDim, n: rows, numExperts: numExperts);
-            else
-                k.MmvqQ8_0!.Record(cmdBuf, bank, xq, xds, indices, y, m: mDim, k: kDim, n: rows, numExperts: numExperts);
+            switch (bankQt)
+            {
+                case QuantizationType.Q5_1:
+                    k.MmvqQ5_1!.Record(cmdBuf, bank, xq, xds, indices, y, k.UnitScale, m: mDim, k: kDim, n: rows, numExperts: numExperts);
+                    break;
+                case QuantizationType.Q8_0:
+                    k.MmvqQ8_0!.Record(cmdBuf, bank, xq, xds, indices, y, m: mDim, k: kDim, n: rows, numExperts: numExperts);
+                    break;
+                default:
+                    var kq = bankQt switch
+                    {
+                        QuantizationType.Q4_K => k.MmvqQ4_K!,
+                        QuantizationType.Q5_K => k.MmvqQ5_K!,
+                        _ => k.MmvqQ6_K!,
+                    };
+                    kq.Record(cmdBuf, bank, xq, xds, indices, y, m: mDim, k: kDim, n: rows, numExperts: numExperts);
+                    break;
+            }
             return;
         }
         Interlocked.Increment(ref MoePathCounters.F32Indexed);
@@ -1450,6 +1506,15 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                 break;
             case QuantizationType.Q8_0:
                 k.IndexedQ8_0.Record(cmdBuf, bank, x, indices, y, m: mDim, k: kDim, n: rows, numExperts: numExperts);
+                break;
+            case QuantizationType.Q4_K:
+                k.IndexedQ4_K.Record(cmdBuf, bank, x, indices, y, m: mDim, k: kDim, n: rows, numExperts: numExperts);
+                break;
+            case QuantizationType.Q5_K:
+                k.IndexedQ5_K.Record(cmdBuf, bank, x, indices, y, m: mDim, k: kDim, n: rows, numExperts: numExperts);
+                break;
+            case QuantizationType.Q6_K:
+                k.IndexedQ6_K.Record(cmdBuf, bank, x, indices, y, m: mDim, k: kDim, n: rows, numExperts: numExperts);
                 break;
             default:
                 throw new InvalidOperationException($"No indexed expert kernel for a resident {bankQt} bank (upload should have refused it).");
