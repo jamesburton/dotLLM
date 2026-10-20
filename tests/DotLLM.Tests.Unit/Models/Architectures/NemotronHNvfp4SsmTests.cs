@@ -35,7 +35,7 @@ public sealed class NemotronHNvfp4SsmTests : IDisposable
     internal static readonly int[] Pos = [0, 1, 2, 3, 4];
     private static readonly sbyte[] KValues = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 
-    internal enum Variant
+    public enum Variant
     {
         /// <summary>SSM projections NVFP4 with their X.scale tensors (the Bolt layout).</summary>
         Nvfp4Scaled,

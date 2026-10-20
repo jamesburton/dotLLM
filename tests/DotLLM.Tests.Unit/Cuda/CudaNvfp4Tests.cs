@@ -144,8 +144,10 @@ public sealed unsafe class CudaNvfp4Tests : IDisposable
     /// cuBLAS + scale kernel) and then one decode step (NVFP4 GEMV with the scale), each against the CPU
     /// model on the F32 twin. A dropped scale on either path is off by a multiple of the logits.
     /// </summary>
-    [SkippableFact]
-    public void NemotronH_Nvfp4Ssm_PrefillAndDecodeMatchCpuF32Twin()
+    [SkippableTheory]
+    [InlineData(Variant.Nvfp4Scaled)]
+    [InlineData(Variant.F32Reference)] // control: the same model with F32 SSM weights on CUDA
+    public void NemotronH_Nvfp4Ssm_PrefillAndDecodeMatchCpuF32Twin(Variant cudaVariant)
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
         int[] ids = NemotronHNvfp4SsmTests.Ids;
@@ -156,13 +158,16 @@ public sealed unsafe class CudaNvfp4Tests : IDisposable
         using (var gguf = GgufFile.Open(NemotronHNvfp4SsmTests.WriteFixture(_scratch, Variant.F32Reference)))
         {
             var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            // Same prefill(4) + decode(1) sequence as the CUDA side. The fixture has no attention layers,
+            // and the model's recurrent SSM state carries from one call to the next, so the second call
+            // is a true decode step (two independent full forwards would need a ResetSequenceState()).
             using var model = ModelLoader.CreateCpuModelFromGguf(gguf, config);
             using (ITensor a = model.Forward(ids[..4], pos[..4], deviceId: -1)) cpuPrefill = LastRow(a, vocab);
-            using (ITensor all = model.Forward(ids, pos, deviceId: -1)) cpuDecode = LastRow(all, vocab);
+            using (ITensor b = model.Forward(ids[4..], pos[4..], deviceId: -1)) cpuDecode = LastRow(b, vocab);
         }
 
         float[] cudaPrefill, cudaDecode;
-        using (var gguf = GgufFile.Open(NemotronHNvfp4SsmTests.WriteFixture(_scratch, Variant.Nvfp4Scaled)))
+        using (var gguf = GgufFile.Open(NemotronHNvfp4SsmTests.WriteFixture(_scratch, cudaVariant)))
         {
             var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
             var (model, kvFactory) = CudaModelLoader.CreateFromGguf(gguf, config, deviceId: 0, ptxDir: ResolvePtxDir());
