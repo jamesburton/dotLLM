@@ -114,6 +114,58 @@ public sealed class VulkanMoeIndexedMatmulKQuantMmvqKernelTests
             Assert.True(viaBroadcast[i].Equals(viaReplicated[i]), $"{quantType} cell {i}: broadcast {viaBroadcast[i]:G9} != replicated {viaReplicated[i]:G9}.");
     }
 
+    /// <summary>
+    /// #1049: the multi-row Q5_K kernel (NR output rows per workgroup, shared activation loads) against the one-row kernel and the CPU
+    /// reference, with the xDiv broadcast and with per-row inputs, at the Bolt down shape (M = latent 1024, K = expert width 2560) and a small one.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(2, 9, 12, 1024, 2560, 9)]   // Bolt decode down: 9 routed rows of one token, xDiv = topK would not apply (per-row input)
+    [InlineData(2, 9, 12, 1024, 2560, 1)]
+    [InlineData(4, 6, 5, 96, 512, 3)]       // NR 4, broadcast rows
+    [InlineData(2, 7, 5, 12, 768, 1)]
+    public void Q5_KMultiRow_MatchesOneRowKernelAndCpu(int nr, int n, int numExperts, int m, int k, int xDiv)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(device.HasIntegerDotProduct, "integer-dot-product unavailable.");
+        using var quant = QuantizeQ8_1RowsKernel.TryCreate(device, spvDir) ?? throw new Xunit.Sdk.XunitException("quantize_q8_1_rows.spv missing.");
+        using var one = MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q5_K) ?? throw new Xunit.Sdk.XunitException("spv missing.");
+        using var mr = MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q5_K, rowsPerGroup: nr)
+            ?? throw new Xunit.Sdk.XunitException("moe_indexed_matmul_q5_k_mmvq_mr.spv missing.");
+        Assert.Equal(nr, mr.RowsPerGroup);
+
+        var rng = new Random(0x1049 + nr * 7 + m);
+        var experts = Enumerable.Range(0, numExperts).Select(_ => Q5KFixture.QuantizeRows(Q4KFixture.RandomFloats(rng, m * k, 0.1f), m, k)).ToArray();
+        byte[] bank = experts.SelectMany(b => b).ToArray();
+        int xRows = (n + xDiv - 1) / xDiv;
+        float[] x = Q4KFixture.RandomFloats(rng, xRows * k, 1f);
+        int[] indices = Enumerable.Range(0, n).Select(i => (i * 3 + 1) % numExperts).ToArray();
+
+        float[] viaOne = Launch(device, quant, one, bank, x, indices, m, k, n, numExperts, xDiv);
+        float[] viaMr = Launch(device, quant, mr, bank, x, indices, m, k, n, numExperts, xDiv);
+        float scale = viaOne.Max(MathF.Abs);
+        for (int i = 0; i < viaOne.Length; i++)
+            Assert.True(MathF.Abs(viaOne[i] - viaMr[i]) <= 1e-5f * scale + 1e-6f,
+                $"cell {i}: one-row {viaOne[i]:G9} vs multi-row {viaMr[i]:G9} (same accumulation order; only FMA contraction may differ)");
+
+        // And against the CPU dequant reference (the int8 activations bound the error, as for the one-row kernel).
+        for (int r = 0; r < n; r++)
+        {
+            float[] cpu = Q5KFixture.CpuGemmQ5K(experts[indices[r]], x.AsSpan((r / xDiv) * k, k).ToArray(), m, k, 1);
+            for (int c = 0; c < m; c++)
+                Assert.True(MathF.Abs(cpu[c] - viaMr[r * m + c]) <= 0.02f * scale + 1e-3f, $"row {r} col {c}: cpu {cpu[c]:G6} vs multi-row {viaMr[r * m + c]:G6}");
+        }
+    }
+
+    [SkippableFact]
+    public void Q6_KMultiRow_IsNotOffered()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(device.HasIntegerDotProduct, "integer-dot-product unavailable.");
+        Assert.Null(MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q6_K, rowsPerGroup: 2));
+    }
+
     private static float[] Launch(VulkanDevice device, QuantizeQ8_1RowsKernel quant, MoeIndexedMatmulKQuantMmvqKernel kernel,
         byte[] bank, float[] x, int[] indices, int m, int k, int n, int numExperts, int xDiv = 1)
     {

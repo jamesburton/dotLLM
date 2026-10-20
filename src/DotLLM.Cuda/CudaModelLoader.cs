@@ -24,6 +24,17 @@ public static class CudaModelLoader
         string path, int deviceId = 0, string? ptxDir = null)
     {
         var gguf = GgufFile.Open(path);
+        try
+        {
+            // #1038: the plain CudaTransformerModel has no NVFP4 path (only Nemotron-H does, via CreateFromGguf). Refuse before any upload.
+            Nvfp4Support.RejectAny(gguf.TensorsByName, "CUDA");
+        }
+        catch
+        {
+            gguf.Dispose();
+            throw;
+        }
+
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var model = CudaTransformerModel.LoadFromGguf(gguf, config, deviceId, ptxDir);
         return (model, gguf, config);
