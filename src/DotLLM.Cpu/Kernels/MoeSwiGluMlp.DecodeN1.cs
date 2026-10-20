@@ -28,6 +28,7 @@ public static unsafe partial class MoeSwiGluMlp
     {
         public int Segments;          // number of (expert, projection) segments
         public int RowsPerSegment;    // M of every segment in this dispatch
+        public int RowAlignment;      // legacy four-row kernels must retain their grouped-path row boundaries
         public int BlockCount;
         public long WeightRowBytes0, WeightRowBytes1; // per projection kind (gate/up share a quant family but may differ in qt)
         public delegate*<byte*, byte*, float*, int, int, void> Rows0;
@@ -41,19 +42,22 @@ public static unsafe partial class MoeSwiGluMlp
     private static void DecodeN1Worker(nint ctxPtr, int threadIdx, int threadCount)
     {
         ref var c = ref Unsafe.AsRef<DecodeN1Ctx>((void*)ctxPtr);
-        long total = (long)c.Segments * c.RowsPerSegment;
+        int groupsPerSegment = (c.RowsPerSegment + c.RowAlignment - 1) / c.RowAlignment;
+        long total = (long)c.Segments * groupsPerSegment;
         long start = total * threadIdx / threadCount;
         long end = total * (threadIdx + 1) / threadCount;
         while (start < end)
         {
-            int seg = (int)(start / c.RowsPerSegment);
-            int row = (int)(start - (long)seg * c.RowsPerSegment);
-            int n = (int)Math.Min(c.RowsPerSegment - row, end - start);
+            int seg = (int)(start / groupsPerSegment);
+            int group = (int)(start - (long)seg * groupsPerSegment);
+            int groups = (int)Math.Min(groupsPerSegment - group, end - start);
+            int row = group * c.RowAlignment;
+            int n = Math.Min(c.RowsPerSegment - row, groups * c.RowAlignment);
             bool k1 = c.SegKind[seg] != 0;
             long rb = k1 ? c.WeightRowBytes1 : c.WeightRowBytes0;
             var fn = k1 ? c.Rows1 : c.Rows0;
             fn(c.SegWeights[seg] + row * rb, c.SegInput[seg], c.SegResults[seg] + row, n, c.BlockCount);
-            start += n;
+            start += groups;
         }
     }
 
@@ -69,9 +73,11 @@ public static unsafe partial class MoeSwiGluMlp
         nint downBase, QuantizationType downQt, long downExpBytes,
         ReadOnlySpan<int> bucketCursors, ReadOnlySpan<int> bucketSlots,
         ReadOnlySpan<int> uniqueExperts, int uniqueCount,
-        int numExpertsPerTok, int hiddenSize, int intermediateSize, bool useGeGLU, ComputeThreadPool pool)
+        int numExpertsPerTok, int hiddenSize, int intermediateSize, bool useGeGLU, ComputeThreadPool pool, bool packedLegacy)
     {
         if (!DecodeN1Enabled || DiagF32Activations || uniqueCount < 1) return false;
+        // Legacy rows quantize activations. Preserve the explicitly selected F32-activation fallback.
+        if (!packedLegacy && (IsPackedLegacyQuant(gateQt) || IsPackedLegacyQuant(upQt) || IsPackedLegacyQuant(downQt))) return false;
         if (gateQt == QuantizationType.IQ1_M && !Iq1MPackedEnabled) return false;
         if (upQt == QuantizationType.IQ1_M && !Iq1MPackedEnabled) return false;
         if (!MatMul.TryGetDecodeRowKernel(gateQt, hiddenSize, out var gateRows, out long gateRowBytes, out int hBlocks, out int gateFam)) return false;
@@ -125,6 +131,7 @@ public static unsafe partial class MoeSwiGluMlp
                 var ctx = new DecodeN1Ctx
                 {
                     Segments = segs, RowsPerSegment = inter, BlockCount = hBlocks,
+                    RowAlignment = IsPackedLegacyQuant(gateQt) || IsPackedLegacyQuant(upQt) ? 4 : 1,
                     WeightRowBytes0 = gateRowBytes, WeightRowBytes1 = upRowBytes, Rows0 = gateRows, Rows1 = upRows,
                     SegWeights = segW, SegResults = segR, SegInput = segI, SegKind = kind,
                 };
@@ -152,6 +159,7 @@ public static unsafe partial class MoeSwiGluMlp
                 var ctxB = new DecodeN1Ctx
                 {
                     Segments = u, RowsPerSegment = hiddenSize, BlockCount = iBlocks,
+                    RowAlignment = IsPackedLegacyQuant(downQt) ? 4 : 1,
                     WeightRowBytes0 = downRowBytes, WeightRowBytes1 = downRowBytes, Rows0 = downRows, Rows1 = downRows,
                     SegWeights = segW, SegResults = segR, SegInput = segI, SegKind = kind,
                 };
