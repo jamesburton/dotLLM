@@ -41,7 +41,7 @@ public sealed class VulkanNvfp4Bench
     [SkippableFact]
     public void Bench_PrefillGemm_NativeVsF16Dequant()
     {
-        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_NVFP4_BENCH") == "1", "DOTLLM_NVFP4_BENCH=1 to enable.");
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_NVFP4_BENCH"), "1", StringComparison.Ordinal), "DOTLLM_NVFP4_BENCH=1 to enable.");
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
         Skip.IfNot(MatMulNvfp4GemmCoopmatKernel.IsSupportedOn(device, spvDir), "no wave64 cooperative-matrix device");
