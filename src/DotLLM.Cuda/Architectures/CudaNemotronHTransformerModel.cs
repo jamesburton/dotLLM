@@ -467,6 +467,14 @@ public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
 
             kernels = new CudaKernels(ptxDir);
 
+            // nemotron_h_moe (#403): check the whole device footprint against free VRAM before uploading anything, and
+            // size the routed scratch once for the largest prefill block (#1063 addendum: WDDM spills, it does not fail).
+            bool hasMoe = cpuLayers.Any(l => l.Moe is not null);
+            int moeBlock = Math.Max(1, Math.Min(MoeBlockTokens, config.MaxSequenceLength));
+            if (hasMoe)
+                ThrowIfMoeModelDoesNotFit(EstimateDeviceBytes(
+                    config, cpuLayers, outputQt, outputOutputDim, outputInputDim, planTokens: moeBlock, moeBlockTokens: moeBlock));
+
             long maxTileFloats = 0;
 
             // Output norm — always F32 [hiddenSize].
@@ -562,6 +570,8 @@ public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
                 kvSlotForLayer, attentionLayerCount,
                 state, ssmCache, stream, cublas, context, kernels, deviceId, dequantScratchDevice);
             model._moeSpec = ComputeMoeSpec(layers, hiddenSize);
+            if (hasMoe)
+                model.AllocateMoeScratch(moeBlock);
             return model;
         }
         catch

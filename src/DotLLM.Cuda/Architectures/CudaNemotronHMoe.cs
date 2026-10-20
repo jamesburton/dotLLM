@@ -1,5 +1,6 @@
 // src/DotLLM.Cuda/Architectures/CudaNemotronHMoe.cs
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Models;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Cuda.Interop;
 using DotLLM.Models.Architectures;
@@ -28,6 +29,160 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
     /// <c>GroupedMoeBlockTokens</c>. Settable from tests (a small value forces several blocks per prefill).
     /// </summary>
     internal static int MoeBlockTokens { get; set; } = 512;
+
+    /// <summary>
+    /// VRAM kept free when deciding whether a <c>nemotron_h_moe</c> model fits (issue #1063 addendum): the CUDA
+    /// context, cuBLAS workspace and driver allocations live outside the estimate. Windows WDDM spills over-committed
+    /// VRAM into shared system memory instead of failing allocations, so the fit is checked up front.
+    /// </summary>
+    internal const long MoeVramReserveBytes = 512L * 1024 * 1024;
+
+    /// <summary>Device bytes a Nemotron-H model will allocate, by category (see <see cref="EstimateDeviceBytes"/>).</summary>
+    /// <param name="Weights">Every uploaded weight, including all expert banks.</param>
+    /// <param name="ForwardState">Forward activations at the planning token count, plus the SSM recurrent state.</param>
+    /// <param name="MoeScratch">Routed-MoE scratch and schedule buffer for one token block.</param>
+    /// <param name="GemmScratch">The F16 dequant tile and the F16 activation in/out scratch of the GEMM dispatcher.</param>
+    internal readonly record struct DeviceBudget(long Weights, long ForwardState, long MoeScratch, long GemmScratch)
+    {
+        /// <summary>Sum of every category.</summary>
+        public long Total => Weights + ForwardState + MoeScratch + GemmScratch;
+    }
+
+    /// <summary>
+    /// Pure estimate of the device memory <see cref="BuildFromPrebuiltWeights"/> and a forward of
+    /// <paramref name="planTokens"/> tokens allocate: the weights (as the upload sizes them), the forward state and SSM
+    /// cache (as <c>CudaNemotronHForwardState</c> / <c>CudaNemotronHSsmStateCache</c> size them, including the state's
+    /// power-of-two row rounding), the routed-MoE scratch for a block of <c>min(planTokens, moeBlockTokens)</c> tokens, and
+    /// the GEMM dispatcher's F16 scratch. Longer prompts grow the forward state beyond this.
+    /// </summary>
+    /// <param name="config">Model configuration (hybrid layout and SSM config populated).</param>
+    /// <param name="cpuLayers">Per-layer CPU weights (only shapes and types are read).</param>
+    /// <param name="outputQt">LM-head quantization type.</param>
+    /// <param name="outputM">LM-head rows (vocab).</param>
+    /// <param name="outputK">LM-head row length (hidden).</param>
+    /// <param name="planTokens">Tokens per forward to plan for.</param>
+    /// <param name="moeBlockTokens">MoE token block.</param>
+    /// <returns>The estimate, by category.</returns>
+    internal static DeviceBudget EstimateDeviceBytes(ModelConfig config, NemotronHLayerWeights[] cpuLayers,
+        QuantizationType outputQt, int outputM, int outputK, int planTokens, int moeBlockTokens)
+    {
+        int hidden = config.HiddenSize;
+        var ssm = config.SsmConfig!.Value;
+        const long F = sizeof(float);
+
+        long weights = hidden * F + Raw(outputQt, outputM, outputK);
+        long maxTile = (long)outputM * outputK;
+        long maxK = outputK, maxM = outputM;
+        int maxInter = 0, numSsm = 0;
+        var moeSpec = default(MoeScratchSpec);
+
+        foreach (var l in cpuLayers)
+        {
+            weights += hidden * F;
+            if (l.Ssm is { } s)
+            {
+                numSsm++;
+                weights += Raw(s.InQuantType, s.InOutputDim, s.InInputDim) + Raw(s.OutQuantType, s.OutOutputDim, s.OutInputDim);
+                weights += F * ((long)s.Conv1dWeight.Length + s.Conv1dBias.Length + s.A.Length + s.D.Length
+                    + s.DtBias.Length + s.NormWeight.Length);
+                Tile(s.InOutputDim, s.InInputDim);
+                Tile(s.OutOutputDim, s.OutInputDim);
+            }
+            if (l.Attention is { } a)
+            {
+                weights += Raw(a.QQuantType, a.QOutputDim, a.QInputDim) + Raw(a.KQuantType, a.KOutputDim, a.KInputDim)
+                         + Raw(a.VQuantType, a.VOutputDim, a.VInputDim) + Raw(a.OQuantType, a.OOutputDim, a.OInputDim);
+                Tile(a.QOutputDim, a.QInputDim);
+                Tile(a.KOutputDim, a.KInputDim);
+                Tile(a.VOutputDim, a.VInputDim);
+                Tile(a.OOutputDim, a.OInputDim);
+            }
+            if (l.Ffn is { } f)
+            {
+                weights += Raw(f.UpQuantType, f.UpOutputDim, f.UpInputDim) + Raw(f.DownQuantType, f.DownOutputDim, f.DownInputDim);
+                Tile(f.UpOutputDim, f.UpInputDim);
+                Tile(f.DownOutputDim, f.DownInputDim);
+                maxInter = Math.Max(maxInter, f.UpOutputDim);
+            }
+            if (l.Moe is { } m)
+            {
+                weights += Raw(m.GateInpQuantType, m.NumExperts, hidden)
+                         + Raw(m.UpShexpQuantType, m.SharedIntermediateSize, hidden)
+                         + Raw(m.DownShexpQuantType, hidden, m.SharedIntermediateSize)
+                         + m.UpPerExpertBytes * m.NumExperts + m.DownPerExpertBytes * m.NumExperts;
+                Tile(m.NumExperts, hidden);
+                Tile(m.SharedIntermediateSize, hidden);
+                Tile(hidden, m.SharedIntermediateSize);
+                if (m.HasLatent)
+                {
+                    weights += Raw(m.LatentDownQuantType, m.LatentSize, hidden) + Raw(m.LatentUpQuantType, hidden, m.LatentSize);
+                    Tile(m.LatentSize, hidden);
+                    Tile(hidden, m.LatentSize);
+                }
+                moeSpec = MoeScratchSpec.Widen(moeSpec, m, hidden);
+            }
+        }
+        if (maxInter == 0) maxInter = hidden;
+        maxTile = Math.Max(maxTile, maxInter);
+
+        // CudaNemotronHForwardState: rows rounded up to a power of two, ConvInput carries dConv-1 extra rows, and two
+        // int[maxSeqLen] buffers (token ids, positions). Then the SSM cache's conv + recurrent state per SSM layer.
+        long rows = (long)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)Math.Max(planTokens, 1));
+        long q = (long)config.NumAttentionHeads * config.HeadDim, kv = (long)config.NumKvHeads * config.HeadDim;
+        long bc = (long)ssm.NGroup * ssm.DState;
+        long perRow = 3L * hidden + maxInter + config.VocabSize + 2 * q + 2 * kv
+                    + ssm.InputProjectionDim + 2L * ssm.ConvDim + ssm.NHead + 3L * ssm.DInner + 2 * bc;
+        long state = F * (rows * perRow + (long)(ssm.DConv - 1) * ssm.ConvDim) + 2L * sizeof(int) * config.MaxSequenceLength;
+        state += F * numSsm * ((long)ssm.ConvStateElements + ssm.SsmStateElements);
+
+        long moe = moeSpec.NumExperts > 0
+            ? MoeScratchBytes(moeSpec, hidden, Math.Min(Math.Max(planTokens, 1), Math.Max(moeBlockTokens, 1)))
+            : 0;
+
+        // Dequant tile (F16) plus the F16 activation in / out scratch of a planTokens-row GEMM.
+        long gemm = 2L * maxTile + 2L * planTokens * (maxK + maxM);
+        return new DeviceBudget(weights, state, moe, gemm);
+
+        static long Raw(QuantizationType qt, long rowCount, long cols) => Dequantize.RowByteSize(cols, qt) * rowCount;
+
+        void Tile(long m, long k)
+        {
+            maxTile = Math.Max(maxTile, m * k);
+            maxM = Math.Max(maxM, m);
+            maxK = Math.Max(maxK, k);
+        }
+    }
+
+    /// <summary>Device bytes of the routed-MoE scratch for <paramref name="tokens"/> tokens per block (mirrors <see cref="AllocateMoeScratch"/>).</summary>
+    private static long MoeScratchBytes(MoeScratchSpec s, int hidden, int tokens)
+    {
+        long slots = (long)tokens * s.TopK;
+        long floats = Math.Max((long)tokens * s.NumExperts, 1)
+                    + (s.LatentSize > 0 ? Math.Max((long)tokens * s.LatentSize, 1) : 0)
+                    + Math.Max((long)tokens * Math.Max(s.SharedIntermediate, 1), 1)
+                    + Math.Max((long)tokens * hidden, 1)
+                    + Math.Max(slots * s.MoeIntermediate, 1)
+                    + Math.Max(slots * s.ExpertDim, 1)
+                    + Math.Max((long)tokens * s.ExpertDim, 1);
+        return floats * sizeof(float) + MoeScheduleBytes(s.NumExperts, checked((int)slots));
+    }
+
+    /// <summary>
+    /// Throws when <paramref name="budget"/> exceeds free VRAM minus <see cref="MoeVramReserveBytes"/>, before anything is
+    /// allocated (WDDM would otherwise spill silently into shared system memory rather than fail an allocation).
+    /// </summary>
+    private static void ThrowIfMoeModelDoesNotFit(DeviceBudget budget)
+    {
+        CudaDriverApi.cuMemGetInfo_v2(out nuint free, out nuint total).ThrowOnError();
+        if (budget.Total <= (long)free - MoeVramReserveBytes) return;
+        const double GiB = 1024.0 * 1024 * 1024;
+        throw new NotSupportedException(
+            $"This nemotron_h_moe model needs {budget.Total / GiB:F2} GiB of VRAM (weights {budget.Weights / GiB:F2}, " +
+            $"forward state {budget.ForwardState / GiB:F2}, MoE scratch {budget.MoeScratch / GiB:F2}, GEMM scratch " +
+            $"{budget.GemmScratch / GiB:F2}), {(long)free / GiB:F2} GiB free of {(long)total / GiB:F2} GiB " +
+            $"({MoeVramReserveBytes / (1024 * 1024)} MiB kept in reserve). The CUDA backend keeps every expert resident; " +
+            "expert offload is tracked in #1063. Use --device cpu or vulkan meanwhile.");
+    }
 
     /// <summary>Which MoE kernels ran; read by tests to prove the intended path executed (issue #403).</summary>
     internal static class MoePathCounters
@@ -108,18 +263,18 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
     private readonly record struct MoeScratchSpec(
         int NumExperts, int TopK, int MoeIntermediate, int ExpertDim, int LatentSize, int SharedIntermediate)
     {
-        public static MoeScratchSpec Widen(MoeScratchSpec c, DeviceMoe m, int hiddenSize) => new(
+        public static MoeScratchSpec Widen(MoeScratchSpec c, NemotronHMoeWeights m, int hiddenSize) => new(
             Math.Max(c.NumExperts, m.NumExperts),
             Math.Max(c.TopK, m.NumExpertsPerTok),
             Math.Max(c.MoeIntermediate, m.MoeIntermediateSize),
-            Math.Max(c.ExpertDim, m.ExpertDim(hiddenSize)),
+            Math.Max(c.ExpertDim, m.HasLatent ? m.LatentSize : hiddenSize),
             Math.Max(c.LatentSize, m.LatentSize),
             Math.Max(c.SharedIntermediate, m.SharedIntermediateSize));
     }
 
     private MoeScratchSpec _moeSpec;
 
-    // Routed scratch, sized for _moeScratchTokens tokens per block; grown (after a stream sync) when a block needs more.
+    // Routed scratch, allocated once at load for blocks of _moeScratchTokens tokens (no lazy growth, #1063 addendum).
     private int _moeScratchTokens;
     private nint _moeRouterLogits;   // [n, maxExperts]
     private nint _moeXLatent;        // [n, maxLatent]
@@ -237,7 +392,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
     {
         var spec = default(MoeScratchSpec);
         foreach (var l in layers)
-            if (l.Moe is { } m) spec = MoeScratchSpec.Widen(spec, m, hiddenSize);
+            if (l.Moe is { } m) spec = MoeScratchSpec.Widen(spec, m.Host, hiddenSize);
         return spec;
     }
 
@@ -245,14 +400,25 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
     private static long MoeScheduleBytes(int experts, int slots)
         => 2L * experts * sizeof(long) + (experts + 1L) * sizeof(int) + 3L * slots * sizeof(int);
 
-    private void EnsureMoeScratch(int tokens)
+    /// <summary>
+    /// Allocates the routed-MoE scratch once, at load, for blocks of <paramref name="tokens"/> tokens, sized from the
+    /// per-layer maxima (no lazy growth). Frees whatever it allocated if an allocation fails.
+    /// </summary>
+    private void AllocateMoeScratch(int tokens)
     {
-        if (tokens <= _moeScratchTokens) return;
+        try
+        {
+            AllocateMoeScratchCore(tokens);
+        }
+        catch
+        {
+            DisposeMoe();
+            throw;
+        }
+    }
 
-        // Buffers may still be in use by queued work (and pinned memory by an async copy): drain first.
-        _stream.Synchronize();
-        FreeMoeScratch();
-
+    private void AllocateMoeScratchCore(int tokens)
+    {
         var s = _moeSpec;
         int hidden = Config.HiddenSize;
         long slots = (long)tokens * s.TopK;
@@ -312,8 +478,8 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
     /// </summary>
     private void ForwardMoeBody(DeviceMoe moe, int seqLen, int hiddenSize)
     {
-        int block = Math.Max(1, MoeBlockTokens);
-        EnsureMoeScratch(Math.Min(seqLen, block));
+        // The scratch was sized at load for blocks of _moeScratchTokens tokens.
+        int block = _moeScratchTokens;
         for (int start = 0; start < seqLen; start += block)
         {
             int n = Math.Min(block, seqLen - start);
