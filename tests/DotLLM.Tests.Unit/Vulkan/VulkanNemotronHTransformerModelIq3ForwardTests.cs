@@ -123,6 +123,14 @@ public sealed class VulkanNemotronHTransformerModelIq3ForwardTests
         }
     }
 
+    /// <summary>#1069 control: the all-IQ2_XXS mini Nemotron-H at one token (GEMVs only, no prefill GEMM) against the CPU forward.</summary>
+    [SkippableFact]
+    public void Forward_Iq2Xxs_AttentionThenSsmThenFfn_SingleToken_MatchesCpuReference()
+    {
+        var kinds = new[] { HybridLayerKind.Attention, HybridLayerKind.Ssm, HybridLayerKind.Ffn };
+        AssertVulkanMatchesCpu(QuantizationType.IQ2_XXS, kinds, seqLen: 1, seed: 1069);
+    }
+
     /// <summary>
     /// #1069: a 4-token prompt on an all-IQ2_XXS mini Nemotron-H takes the native IQ2_XXS coopmat GEMM on every prefill projection
     /// (no F16 scratch sized), or with the native kernel disabled the #1060 F16 path; both must match the CPU forward.
@@ -162,7 +170,7 @@ public sealed class VulkanNemotronHTransformerModelIq3ForwardTests
     }
 
     /// <summary>
-    /// Random but valid IQ2_XXS rows: fp16 d in [1e-3, 3e-3) per super-block, random grid / sign indices and 4-bit scales.
+    /// Random but valid IQ2_XXS rows: fp16 d in [2.5e-4, 7.5e-4) per super-block (weights of the same order as the IQ3 fixture's ±0.05), random grid / sign indices and 4-bit scales.
     /// </summary>
     internal static byte[] RandomIq2XxsRows(Random rng, int rows, int cols)
     {
@@ -170,7 +178,7 @@ public sealed class VulkanNemotronHTransformerModelIq3ForwardTests
         byte[] bytes = new byte[blocks * 66];
         rng.NextBytes(bytes);
         for (int b = 0; b < blocks; b++)
-            BitConverter.TryWriteBytes(bytes.AsSpan(b * 66, 2), (Half)(1e-3 + rng.NextDouble() * 2e-3));
+            BitConverter.TryWriteBytes(bytes.AsSpan(b * 66, 2), (Half)(2.5e-4 + rng.NextDouble() * 5e-4));
         return bytes;
     }
 
