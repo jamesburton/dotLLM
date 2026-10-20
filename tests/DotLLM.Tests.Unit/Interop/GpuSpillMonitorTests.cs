@@ -51,21 +51,18 @@ public sealed class GpuSpillMonitorTests
     }
 
     [Fact]
-    public void Poll_IsThrottled()
+    public void AThrowingCounterRead_IsSwallowed()
     {
-        int reads = 0;
-        var monitor = new GpuSpillMonitor(() => { reads++; return 0; }, _ => { });
-        monitor.Poll("1");
-        monitor.Poll("2");
-        monitor.Poll("3");
-        Assert.Equal(1, reads);
+        var monitor = new GpuSpillMonitor(() => throw new InvalidOperationException("pdh"), _ => { });
+        monitor.Check("a");
+        Assert.Equal(0, monitor.SpilledBytes);
     }
 
     [Fact]
     public void RealReader_OnThisMachine_DoesNotThrow()
     {
         // Constructs the PDH reader (Windows) or nothing (elsewhere) and reads once. No GPU work is done.
-        using var monitor = new GpuSpillMonitor();
+        using var monitor = new GpuSpillMonitor(() => "test");
         monitor.Check("smoke");
         monitor.Check("smoke");
         Assert.True(monitor.SpilledBytes >= 0);

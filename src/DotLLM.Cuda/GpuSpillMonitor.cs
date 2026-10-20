@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 
 namespace DotLLM.Cuda;
@@ -7,31 +6,37 @@ namespace DotLLM.Cuda;
 /// Detects WDDM "sysmem fallback" at runtime (issue #1068). On Windows, when a CUDA process allocates past dedicated
 /// VRAM the driver backs the excess with shared system memory instead of failing the allocation, and every kernel that
 /// touches it then reads over PCIe. Nothing in CUDA reports this; Windows' <c>GPU Process Memory</c> performance counters
-/// do (<c>Shared Usage</c> per process). This polls that counter at most every <see cref="PollInterval"/> and logs a loud
-/// warning each time this process's shared usage rises another <see cref="WarnStepBytes"/> above its first reading.
-/// A no-op off Windows (Linux has no such fallback: the allocation fails instead).
+/// do (<c>Shared Usage</c> per process). This reads that counter on a background timer every <see cref="PollInterval"/>
+/// (never on the inference thread), and on demand via <see cref="Check"/>, and logs a loud warning each time this process's
+/// shared usage rises another <see cref="WarnStepBytes"/> above its first reading. A no-op off Windows (Linux has no such
+/// fallback: the allocation fails instead).
 /// </summary>
 public sealed partial class GpuSpillMonitor : IDisposable
 {
     /// <summary>Growth of shared usage above the baseline that triggers each warning.</summary>
     public const long WarnStepBytes = 256L << 20;
 
-    /// <summary>Minimum time between two counter reads; a read costs a PDH collection.</summary>
+    /// <summary>Period of the background counter read; a read costs a PDH collection (milliseconds).</summary>
     public static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(5);
 
     private readonly Func<long?> _readSharedBytes;
     private readonly Action<string> _warn;
-    private readonly Stopwatch _sinceLastPoll = new();
+    private readonly object _gate = new();
+    private readonly Timer? _timer;
     private long? _baseline;
     private long _warnedAbove;
     private PdhSharedUsageReader? _reader;
 
-    /// <summary>Creates a monitor for the current process, warning on stderr.</summary>
-    public GpuSpillMonitor()
+    /// <summary>Creates a monitor for the current process that polls in the background and warns on stderr.</summary>
+    /// <param name="describeState">Describes the owner's state for a warning raised by the background poll (e.g. the KV size).</param>
+    public GpuSpillMonitor(Func<string> describeState)
     {
         _reader = OperatingSystem.IsWindows() ? PdhSharedUsageReader.TryCreate(Environment.ProcessId) : null;
         _readSharedBytes = () => _reader?.Read();
         _warn = message => Console.Error.WriteLine(message);
+        if (_reader is null) return;
+        Check("load");   // baseline: the weights are resident, nothing context-sized yet
+        _timer = new Timer(_ => Check($"periodic check; {describeState()}"), null, PollInterval, PollInterval);
     }
 
     /// <summary>Test seam: a monitor reading <paramref name="readSharedBytes"/> and reporting to <paramref name="warn"/>.</summary>
@@ -46,20 +51,19 @@ public sealed partial class GpuSpillMonitor : IDisposable
     /// <summary>Shared usage above the baseline at the last read, in bytes (0 before two reads).</summary>
     public long SpilledBytes { get; private set; }
 
-    /// <summary>Reads the counter unless the last read was less than <see cref="PollInterval"/> ago.</summary>
-    /// <param name="context">What just happened, for the warning (e.g. "KV growth to 98304 tokens").</param>
-    public void Poll(string context)
-    {
-        if (_sinceLastPoll.IsRunning && _sinceLastPoll.Elapsed < PollInterval) return;
-        _sinceLastPoll.Restart();
-        Check(context);
-    }
-
-    /// <summary>Reads the counter now and warns if shared usage has crossed a new <see cref="WarnStepBytes"/> step.</summary>
-    /// <param name="context">What just happened, for the warning.</param>
+    /// <summary>Reads the counter now and warns if shared usage has crossed a new <see cref="WarnStepBytes"/> step. Thread-safe.</summary>
+    /// <param name="context">What just happened, for the warning (e.g. "KV cache grown to 98304 tokens").</param>
     public void Check(string context)
     {
-        long? shared = _readSharedBytes();
+        lock (_gate)
+            CheckLocked(context);
+    }
+
+    private void CheckLocked(string context)
+    {
+        long? shared;
+        try { shared = _readSharedBytes(); }
+        catch (Exception) { return; }   // a diagnostics read must never fail inference
         if (shared is not long now) return;
         if (_baseline is not long baseline)
         {
@@ -82,8 +86,12 @@ public sealed partial class GpuSpillMonitor : IDisposable
     /// <inheritdoc/>
     public void Dispose()
     {
-        _reader?.Dispose();
-        _reader = null;
+        _timer?.Dispose();
+        lock (_gate)
+        {
+            _reader?.Dispose();
+            _reader = null;
+        }
     }
 
     /// <summary>

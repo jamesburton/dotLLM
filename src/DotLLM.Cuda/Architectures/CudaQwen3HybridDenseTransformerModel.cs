@@ -564,8 +564,8 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         DeviceMemoryBudget.ResolveReserveBytes(Environment.GetEnvironmentVariable(DeviceMemoryBudget.ReserveEnvVar));
 
     // Issue #1068: warns when this process's device memory spills into shared system memory anyway (another process took
-    // the headroom, or an allocation outside the admitted paths). Polled from ForwardCore, checked after each KV growth.
-    private readonly GpuSpillMonitor _spillMonitor = new();
+    // the headroom, or an allocation outside the admitted paths). Polled on a background timer, checked after each KV growth.
+    private readonly GpuSpillMonitor _spillMonitor;
 
     /// <summary>
     /// Admission for <see cref="CudaHybridKvCacheHandle.TryGrowTo"/>. A growth past the allocated storage copies the live rows, so old and new
@@ -675,6 +675,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
             throw new ArgumentException("The Hadamard transform does not belong to this model's config.", nameof(hadamard));
 
         Config = config;
+        _spillMonitor = new GpuSpillMonitor(() => $"KV allocated for {_f16CacheMaxSeqLen} tokens");
         _isHeadOnly = isHeadOnly;
         _gguf = gguf;
         _layers = layers;
@@ -1699,7 +1700,6 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
                            int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly,
                            CudaMtpState? mtpCapture)
     {
-        _spillMonitor.Poll($"forward at position {(positions.Length > 0 ? positions[0] : 0)}, KV allocated for {_f16CacheMaxSeqLen} tokens");
         int chunk = PrefillChunkTokens;
         int total = tokenIds.Length;
         if (chunk <= 0 || total <= chunk || kvCache is null || !lastTokenLogitsOnly
