@@ -71,7 +71,12 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         Assert.True(cpuVsExact * 4 < control, $"CPU oracle vs reference {cpuVsExact:E3} is not small against the bias effect {control:E3}");
 
         bool saved = VulkanNemotronHTransformerModel.MoeMmvqEnabled, savedGrouped = VulkanNemotronHTransformerModel.MoeGroupedEnabled;
+        bool savedDense = VulkanNemotronHTransformerModel.DenseQ8MmvqEnabled;
         VulkanNemotronHTransformerModel.MoeMmvqEnabled = mmvq;
+        // The dp4a arms also put the single-row Q8_0 projections (shared expert, latent down/up) on the dp4a GEMV (#1047); the F32 arm keeps
+        // every activation in F32 so it can be held to the tight tolerance.
+        VulkanNemotronHTransformerModel.DenseQ8MmvqEnabled = mmvq;
+        Interlocked.Exchange(ref VulkanNemotronHTransformerModel.DenseQ8MmvqCalls, 0);
         VulkanNemotronHTransformerModel.MoeGroupedEnabled = grouped;
         VulkanNemotronHTransformerModel.MoePathCounters.Reset();
         try
@@ -102,6 +107,11 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
             for (int t = 0; t < Tokens.Length; t++)
                 Array.Copy(fx.Vulkan(device, spvDir, [Tokens[t]], [Positions[t]]), 0, vkRows, t * Vocab, Vocab);
 
+            long denseQ8 = Interlocked.Read(ref VulkanNemotronHTransformerModel.DenseQ8MmvqCalls);
+            output.WriteLine($"dense Q8_0 MMVQ calls: {denseQ8}");
+            if (mmvq && device.HasIntegerDotProduct) Assert.True(denseQ8 > 0, "single-row Q8_0 projections did not take the dp4a GEMV");
+            if (!mmvq) Assert.Equal(0, denseQ8);
+
             float vsCpu = MaxDiff(cpu, vk), vsExact = MaxDiff(exact, vk), rowsVsExact = MaxDiff(exact, vkRows);
             output.WriteLine($"mmvq={mmvq}: |vk-exact|={vsExact:E3} |vkRows-exact|={rowsVsExact:E3} |vk-cpu|={vsCpu:E3} "
                 + $"|cpu-exact|={cpuVsExact:E3} biasControl={control:E3}");
@@ -119,6 +129,7 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         {
             VulkanNemotronHTransformerModel.MoeMmvqEnabled = saved;
             VulkanNemotronHTransformerModel.MoeGroupedEnabled = savedGrouped;
+            VulkanNemotronHTransformerModel.DenseQ8MmvqEnabled = savedDense;
         }
     }
 
