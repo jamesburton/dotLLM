@@ -230,6 +230,42 @@ internal static unsafe class Iq2Fixture
         }
     }
 
+    /// <summary>
+    /// Directly packs random-but-VALID IQ2_XXS block bytes (grid index in [0,255], 7-bit sign index, scale nibble in [0,15]) without the
+    /// nearest-pair search of <see cref="QuantizeRowsIq2Xxs"/>, which is far too slow for multi-expert banks (#1057). The parity oracles
+    /// dequantize these same bytes, so the fixture does not need to approximate any FP32 source.
+    /// </summary>
+    /// <param name="rng">Seeded generator.</param>
+    /// <param name="m">Rows.</param>
+    /// <param name="k">Columns; a multiple of 256.</param>
+    /// <param name="dMax">Upper bound of the per-block fp16 scale <c>d</c> (drawn from [0.2, 1] x dMax). A weight is
+    /// <c>d * (0.5 + s4) / 4 * grid</c> with grid bytes in {8, 25, 43}, so its mean magnitude is about 50 x d.</param>
+    /// <returns>The packed <c>[m, k]</c> IQ2_XXS matrix.</returns>
+    public static byte[] QuantizeRowsIq2XxsFast(Random rng, int m, int k, float dMax)
+    {
+        if ((k % Iq2GroupSize) != 0)
+            throw new ArgumentException($"k must be a multiple of {Iq2GroupSize}, got {k}", nameof(k));
+
+        int blocksPerRow = k / Iq2GroupSize;
+        int rowBytes = blocksPerRow * Iq2XxsBlockBytes;
+        var dst = new byte[m * rowBytes];
+        for (int blk = 0; blk < m * blocksPerRow; blk++)
+        {
+            int off = blk * Iq2XxsBlockBytes;
+            Unsafe.WriteUnaligned(ref dst[off], (Half)(dMax * (0.2f + 0.8f * (float)rng.NextDouble())));
+
+            // Per 32-element sub-block: four grid bytes, then a uint32 of four 7-bit sign indices and the 4-bit scale on top.
+            for (int ib32 = 0; ib32 < Iq2NumSubBlocks; ib32++)
+            {
+                int qs = off + 2 + 8 * ib32;
+                for (int l = 0; l < 4; l++) dst[qs + l] = (byte)rng.Next(0, 256);
+                uint a1 = (uint)rng.Next(0, 1 << 28) | ((uint)rng.Next(0, 16) << 28);
+                Unsafe.WriteUnaligned(ref dst[qs + 4], a1);
+            }
+        }
+        return dst;
+    }
+
     public static void AssertFixtureRoundtripIq2Xxs(float[] srcF32, byte[] q2Bytes, int m, int k)
         => AssertRoundtrip(srcF32, q2Bytes, m, k, QuantizationType.IQ2_XXS, "IQ2_XXS");
 

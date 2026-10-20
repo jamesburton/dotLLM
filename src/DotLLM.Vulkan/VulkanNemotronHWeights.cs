@@ -3,6 +3,7 @@ using DotLLM.Core.Models;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Models.Architectures;
 using DotLLM.Vulkan.Interop;
+using DotLLM.Vulkan.Kernels;
 
 namespace DotLLM.Vulkan;
 
@@ -712,8 +713,8 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     /// <summary>
     /// Uploads one nemotron_h_moe MoE layer. The routed banks stay quantized (the F32 expansion of the published files is
     /// ~100 GB), in a form an indexed matmul kernel reads: Q8_0, Q5_1 and the K-quants Q4_K / Q5_K / Q6_K as stored (#1045, the
-    /// Nemotron 3.5 Bolt AD-Q4_K_M / AD-Q6_K banks), Q5_0 exactly repacked to Q5_1.
-    /// Any other expert quantization throws instead of silently widening (IQ4_NL / Q4_0 / MXFP4 banks: see #407, #402).
+    /// Nemotron 3.5 Bolt AD-Q4_K_M / AD-Q6_K banks), the IQ family as stored (#1057, NVIDIA's official IQ2_XXS Bolt file; needs integer dot
+    /// product), Q5_0 exactly repacked to Q5_1. Any other expert quantization throws instead of silently widening (MXFP4 / NVFP4 banks).
     /// </summary>
     private static VulkanDevice.Buffer UploadExpertBank(
         VulkanDevice device, VulkanStagingBuffer staging,
@@ -736,15 +737,22 @@ internal sealed class VulkanNemotronHWeights : IDisposable
                 goto case QuantizationType.Q8_0;
             case QuantizationType.Q8_0:
             case QuantizationType.Q5_1:
-            {
                 deviceQt = srcQt;
-                bytes = srcRowBytes * rows;
-                if (VulkanWeightImportPolicy.TryImport(device, srcPtr, bytes, out var imported))
-                    return imported!;
-                var buf = device.AllocateDeviceLocal(bytes);
-                staging.UploadBytes(srcPtr, bytes, buf);
-                VulkanWeightImportPolicy.NoteStaged(srcPtr, bytes);
-                return buf;
+                return UploadAsStored(device, staging, srcPtr, srcRowBytes * rows, out bytes);
+            case var _ when MoeIqFormats.FromQuantizationType(srcQt) is { } iq:
+            {
+                // #1057: IQ-family banks (NVIDIA's official Bolt GGUF is IQ2_XXS) stay packed for the IQ MMVQ / grouped coopmat kernels (#823).
+                // There is no F32-activation indexed IQ kernel, and widening would cost ~4 bytes per weight (~265 GB for Bolt), so a device
+                // without integer dot product refuses here, before anything is allocated.
+                int group = MoeIqFormats.Describe(iq).GroupSize;
+                if (kDim % group != 0)
+                    throw new NotSupportedException($"nemotron_h_moe {what} is {srcQt} with K={kDim}, not a multiple of its {group}-element block.");
+                if (!device.HasIntegerDotProduct)
+                    throw new NotSupportedException(
+                        $"nemotron_h_moe {what} is {srcQt}: the Vulkan IQ expert kernels need integer dot product (dp4a), which this device lacks. " +
+                        "Widening the banks to F32 is not an option at this size; use --device cpu.");
+                deviceQt = srcQt;
+                return UploadAsStored(device, staging, srcPtr, srcRowBytes * rows, out bytes);
             }
             case QuantizationType.Q5_0:
             {
@@ -764,9 +772,29 @@ internal sealed class VulkanNemotronHWeights : IDisposable
             }
             default:
                 throw new NotSupportedException(
-                    $"nemotron_h_moe {what} is {srcQt}: the Vulkan expert-indexed kernels cover Q8_0, Q5_1, Q5_0 (repacked to Q5_1) and Q4_K / Q5_K / Q6_K banks only. " +
-                    "Widening the banks to F32 would need ~100 GB. IQ4_NL / Q4_0 / MXFP4 expert banks are tracked in #407 and #402; use --device cpu.");
+                    $"nemotron_h_moe {what} is {srcQt}: the Vulkan expert-indexed kernels cover Q8_0, Q5_1, Q5_0 (repacked to Q5_1), Q4_K / Q5_K / Q6_K " +
+                    "and the IQ family (IQ1_M, IQ2_XXS / IQ2_XS / IQ2_S, IQ3_XXS / IQ3_S, IQ4_NL / IQ4_XS, Q2_0, Q4_0) only. " +
+                    "Widening the banks to F32 would need ~100 GB. MXFP4 / NVFP4 expert banks are not implemented (#402, #1038); use --device cpu.");
         }
+    }
+
+    /// <summary>Uploads (or imports zero-copy) <paramref name="byteCount"/> bytes of an expert bank exactly as stored.</summary>
+    /// <param name="device">Target device.</param>
+    /// <param name="staging">Staging buffer for the copy path.</param>
+    /// <param name="srcPtr">Host pointer to the bank (mmapped GGUF data).</param>
+    /// <param name="byteCount">Bank size in bytes.</param>
+    /// <param name="bytes">Receives <paramref name="byteCount"/>, the bytes the bank occupies on the device.</param>
+    /// <returns>The device buffer holding the bank.</returns>
+    private static VulkanDevice.Buffer UploadAsStored(
+        VulkanDevice device, VulkanStagingBuffer staging, nint srcPtr, long byteCount, out long bytes)
+    {
+        bytes = byteCount;
+        if (VulkanWeightImportPolicy.TryImport(device, srcPtr, byteCount, out var imported))
+            return imported!;
+        var buf = device.AllocateDeviceLocal(byteCount);
+        staging.UploadBytes(srcPtr, byteCount, buf);
+        VulkanWeightImportPolicy.NoteStaged(srcPtr, byteCount);
+        return buf;
     }
 
     private static MoeLayerBuffers UploadMoeLayer(

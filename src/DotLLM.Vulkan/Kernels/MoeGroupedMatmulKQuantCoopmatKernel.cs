@@ -18,7 +18,7 @@ public enum MoeGroupedKQuant
 /// (see <see cref="MoeExpertOffsetsKernel"/> / <see cref="MoeExpandGroupByExpertF32Kernel"/>); each 16-row tile dequantises its expert's weight
 /// sub-blocks into the F16 A operand once, instead of the indexed MMQ kernel re-reading the weights per routed row.
 /// </summary>
-public sealed class MoeGroupedMatmulKQuantCoopmatKernel : IDisposable
+public sealed class MoeGroupedMatmulKQuantCoopmatKernel : IDisposable, IMoeGroupedF32Kernel
 {
     /// <summary>K must be a multiple of this (one super-block).</summary>
     public const int KGroup = 256;
