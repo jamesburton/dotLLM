@@ -44,32 +44,7 @@ public sealed class VulkanNvfp4Tests : IDisposable
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
-        var rng = new Random(m * 131 + k * 7 + n);
-        int blocks = m * (k / 64);
-        byte[] w = new byte[blocks * 36];
-        rng.NextBytes(w);
-        byte[] edge = [0x00, 0x7F, 0xFF, 0x01, 0x80, 0x7E];
-        for (int b = 0; b < blocks; b++)
-            for (int s = 0; s < 4; s++)
-                w[b * 36 + s] = rng.Next(8) == 0 ? edge[rng.Next(edge.Length)] : (byte)rng.Next(0x20, 0x50);
-        float[] x = new float[n * k];
-        for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
-
-        float[] wf = new float[m * k];
-        unsafe
-        {
-            fixed (byte* pw = w)
-                Dequantize.ToFloat32((nint)pw, wf.Length, QuantizationType.NVFP4, wf);
-        }
-
-        float[] expected = new float[n * m];
-        for (int t = 0; t < n; t++)
-            for (int r = 0; r < m; r++)
-            {
-                double acc = 0;
-                for (int c = 0; c < k; c++) acc += (double)wf[r * k + c] * x[t * k + c];
-                expected[t * m + r] = (float)(acc * scale);
-            }
+        var (w, x, expected) = MakeCase(m, k, n, scale);
 
         using var device = VulkanDevice.Create();
         using var kernel = MatMulNvfp4F32Kernel.Create(device, spvDir);
@@ -89,15 +64,132 @@ public sealed class VulkanNvfp4Tests : IDisposable
     }
 
     /// <summary>
+    /// #1060: the NVFP4 to F16 dequant is exact (E2M1 x UE4M3 needs at most 6 mantissa bits, inside F16's normal range), so it must
+    /// equal the CPU dequantizer bit for bit, UE4M3 edge bytes included.
+    /// </summary>
+    [SkippableFact]
+    public void DequantF16_IsBitExactVsCpu()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        const int m = 37, k = 320;
+        var (w, _, _) = MakeCase(m, k, n: 1, scale: 1f);
+        float[] cpu = Dequant(w, m * k);
+
+        using var device = VulkanDevice.Create();
+        using var kernel = Nvfp4DequantF16Kernel.Create(device, spvDir);
+        using var bufW = device.Allocate(w.Length);
+        using var bufY = device.Allocate((long)m * k * sizeof(ushort));
+        device.Upload(new ReadOnlySpan<byte>(w), bufW);
+        kernel.Launch(bufW, bufY, m * k / 64);
+        float[] raw = new float[m * k / 2];   // two F16 per float word; Download reads float spans only
+        device.Download(bufY, raw);
+        ushort[] bits = System.Runtime.InteropServices.MemoryMarshal.Cast<float, ushort>(raw).ToArray();
+
+        for (int i = 0; i < cpu.Length; i++)
+        {
+            Assert.True((float)(Half)cpu[i] == cpu[i], $"[{i}]: CPU value {cpu[i]} is not exact in F16, so the premise is wrong");
+            Assert.True(BitConverter.HalfToUInt16Bits((Half)cpu[i]) == bits[i] || (cpu[i] == 0 && (bits[i] & 0x7FFF) == 0),
+                $"[{i}]: cpu {cpu[i]}, vulkan {BitConverter.UInt16BitsToHalf(bits[i])}");
+        }
+    }
+
+    /// <summary>
+    /// #1060: <see cref="IqF16PrefillMatmul"/>'s NVFP4 arm (exact F16 dequant, F16 coopmat GEMM with F32 accumulation, then the
+    /// per-tensor scale on the F32 output) against the double-precision reference. The activations round to F16, so the bound is
+    /// looser than the F32 GEMM's.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(70, 192, 32, 0.37f)]     // partial tiles, scale
+    [InlineData(64, 4096, 40, 1.3e-4f)]  // Bolt-like K and scale
+    [InlineData(33, 128, 64, 1.0f)]      // no scale
+    public void F16Prefill_MatchesCpuDequantReference(int m, int k, int n, float scale)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        var (w, x, expected) = MakeCase(m, k, n, scale);
+
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(device.HasCooperativeMatrix, "no cooperative-matrix F16 GEMM on this device");
+        using var gemm = MatMulF16GemmCoopmatKernel.Create(device, spvDir);
+        using var prefill = IqF16PrefillMatmul.TryCreate(device, spvDir, gemm, (long)m * k)
+            ?? throw new InvalidOperationException("F16 prefill helper unavailable");
+        using var bufW = device.Allocate(w.Length);
+        using var bufX = device.Allocate((long)x.Length * sizeof(float));
+        using var bufY = device.Allocate((long)n * m * sizeof(float));
+        device.Upload(new ReadOnlySpan<byte>(w), bufW);
+        device.Upload(x, bufX);
+        IqF16PrefillMatmul.Counters.Reset();
+        using (var ctx = device.CreateSubmitContext())
+        {
+            ctx.Begin();
+            Assert.True(prefill.TryRecord(ctx.CommandBuffer, QuantizationType.NVFP4, bufW, bufX, bufY, m, k, n, scale),
+                "the F16 prefill declined an NVFP4 matmul");
+            ctx.SubmitAndWait();
+        }
+        Assert.Equal(1, Interlocked.Read(ref IqF16PrefillMatmul.Counters.Nvfp4));
+        float[] actual = new float[n * m];
+        device.Download(bufY, actual);
+
+        float maxAbs = expected.Max(MathF.Abs);
+        for (int i = 0; i < actual.Length; i++)
+            Assert.True(MathF.Abs(actual[i] - expected[i]) <= 4e-3f * maxAbs,
+                $"m={m} k={k} n={n} [{i}]: expected {expected[i]}, vulkan {actual[i]} (max |y| {maxAbs})");
+    }
+
+    /// <summary>Random NVFP4 blocks (sub-block scales sprinkled with the UE4M3 edge bytes), activations and the double-precision product.</summary>
+    private static (byte[] W, float[] X, float[] Expected) MakeCase(int m, int k, int n, float scale)
+    {
+        var rng = new Random(m * 131 + k * 7 + n);
+        int blocks = m * (k / 64);
+        byte[] w = new byte[blocks * 36];
+        rng.NextBytes(w);
+        byte[] edge = [0x00, 0x7F, 0xFF, 0x01, 0x80, 0x7E];
+        for (int b = 0; b < blocks; b++)
+            for (int s = 0; s < 4; s++)
+                w[b * 36 + s] = rng.Next(8) == 0 ? edge[rng.Next(edge.Length)] : (byte)rng.Next(0x20, 0x50);
+        float[] x = new float[n * k];
+        for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        float[] wf = Dequant(w, m * k);
+        float[] expected = new float[n * m];
+        for (int t = 0; t < n; t++)
+            for (int r = 0; r < m; r++)
+            {
+                double acc = 0;
+                for (int c = 0; c < k; c++) acc += (double)wf[r * k + c] * x[t * k + c];
+                expected[t * m + r] = (float)(acc * scale);
+            }
+        return (w, x, expected);
+    }
+
+    private static unsafe float[] Dequant(byte[] w, int elements)
+    {
+        float[] wf = new float[elements];
+        fixed (byte* pw = w)
+            Dequantize.ToFloat32((nint)pw, wf.Length, QuantizationType.NVFP4, wf);
+        return wf;
+    }
+
+    /// <summary>
     /// The Bolt-shaped fixture (NVFP4 ssm_in/ssm_out with per-tensor scales 0.05..3) through
     /// <see cref="VulkanModelLoader.CreateFromGguf"/>, against the CPU model on the F32 twin whose SSM weights are
     /// <c>scale · dequant(W)</c>. Vulkan uses FP32 activations, so this is tight; a dropped scale, a wrong
     /// nibble order or a widened-and-unscaled upload is off by a multiple of the logits.
     /// </summary>
-    [SkippableFact]
-    public void NemotronH_Nvfp4Ssm_ForwardMatchesCpuF32Twin()
+    /// <param name="f16Prefill">#1060: lower the F16-prefill threshold so the 5-token prompt's NVFP4 projections take the F16
+    /// dequant + coopmat GEMM (activations rounded to F16: a looser bound); otherwise the packed NVFP4 GEMM runs.</param>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void NemotronH_Nvfp4Ssm_ForwardMatchesCpuF32Twin(bool f16Prefill)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        if (f16Prefill)
+        {
+            using var probe = VulkanDevice.Create();
+            Skip.IfNot(probe.HasCooperativeMatrix, "no cooperative-matrix F16 GEMM on this device");
+        }
+        using var scope = f16Prefill ? new F16PrefillTestScope() : null;
+        IqF16PrefillMatmul.Counters.Reset();
 
         float[] cpu;
         using (var gguf = GgufFile.Open(NemotronHNvfp4SsmTests.WriteFixture(_scratch, Variant.F32Reference)))
@@ -122,10 +214,15 @@ public sealed class VulkanNvfp4Tests : IDisposable
             }
         }
 
+        long viaF16 = Interlocked.Read(ref IqF16PrefillMatmul.Counters.Nvfp4);
+        if (f16Prefill) Assert.True(viaF16 > 0, "the NVFP4 projections did not take the F16 prefill path");
+        else Assert.Equal(0, viaF16);
+
         float maxAbs = cpu.Max(MathF.Abs);
+        float tol = f16Prefill ? 1e-2f : 2e-3f;
         Assert.True(maxAbs > 0.5f, $"degenerate fixture: max |logit| {maxAbs}");
         for (int i = 0; i < cpu.Length; i++)
-            Assert.True(MathF.Abs(cpu[i] - vk[i]) <= 2e-3f * maxAbs,
+            Assert.True(MathF.Abs(cpu[i] - vk[i]) <= tol * maxAbs,
                 $"logit {i}: cpu(F32 twin) {cpu[i]}, vulkan(NVFP4) {vk[i]} (max |logit| {maxAbs})");
     }
 

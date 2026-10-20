@@ -102,6 +102,26 @@ public sealed class VulkanNemotronHTransformerModelIq3ForwardTests
         AssertVulkanMatchesCpu(QuantizationType.IQ3_XXS, kinds, seqLen: 1, seed: 113);
     }
 
+    /// <summary>
+    /// #1060: a prompt at the F16-prefill threshold (lowered to 2 here) takes <see cref="IqF16PrefillMatmul"/> on every IQ3
+    /// projection (dequantise to F16, coopmat GEMM) instead of the scalar IQ3 GEMM, and must still match the CPU forward.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(QuantizationType.IQ3_XXS, 307)]
+    [InlineData(QuantizationType.IQ3_S, 313)]
+    public void Forward_Iq3_AttentionThenSsmThenFfn_F16Prefill_MatchesCpuReference(QuantizationType qt, int seed)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out _);
+        using (var probe = VulkanDevice.Create())
+            Skip.IfNot(probe.HasCooperativeMatrix, "no cooperative-matrix F16 GEMM on this device: the F16 prefill path does not exist here");
+        var kinds = new[] { HybridLayerKind.Attention, HybridLayerKind.Ssm, HybridLayerKind.Ffn };
+        using (new F16PrefillTestScope())
+        {
+            AssertVulkanMatchesCpu(qt, kinds, seqLen: 4, seed: seed);
+            Assert.True(Interlocked.Read(ref IqF16PrefillMatmul.Counters.Iq) > 0, "the IQ projections did not take the F16 prefill path");
+        }
+    }
+
     [SkippableFact]
     public void Forward_IQ3_S_AllSsmLayers_MatchesCpuReference()
     {
