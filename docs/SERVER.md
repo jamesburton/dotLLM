@@ -587,13 +587,27 @@ left after the reserve by the per-token cost (KV rows in every attention layer u
 quantized-KV dequant scratch, and the MTP head's KV) and serves that many tokens, rounded down to 1024:
 
 ```
-[dotllm] Context window: 61440 of 262144 tokens, fitted to free VRAM (2610 MiB free after load, 512 MiB reserve, 144 MiB fixed, 46.1 KiB/token, q8_0 KV + MTP). Set --ctx-size to override.
+[dotllm] Context window: 26624 of 262144 tokens, fitted to free VRAM (1826 MiB free after load, 256 MiB reserve, 149 MiB fixed, 54.0 KiB/token, q8_0 KV + MTP). Set --ctx-size to override.
 ```
 
 `GET /props` reports it as `max_sequence_length`, and requests are validated against it (a prompt past it is rejected as
 `context_length_exceeded`, and `max_tokens` is clamped to what remains), so agent clients such as CodeSharp compact in
 time. `--ctx-size N` (`-c N`) sets the window explicitly, capped at the checkpoint's; a value above the fit is logged as a
 warning, and a request that then outgrows VRAM fails with an out-of-memory error rather than spilling.
+
+Measured on an RTX 3060 12 GB (desktop on the same card) with Bonsai-2 27B PQ2_0-MTP. The window counts the prompt plus
+`max_tokens`:
+
+| Flags | Fitted window | Cost per token |
+|---|---|---|
+| `--kv-quant-k q8_0 --kv-quant-v q8_0` (MTP on) | 26,624 | 54 KiB (KV 34, dequant scratch 4, MTP head 2 x 8) |
+| same, plus `DOTLLM_CUDA_PREFILL_CHUNK=512` | 35,840 | 54 KiB, but ~480 MiB less fixed prefill scratch |
+| `--kv-quant-k q8_0 --kv-quant-v q8_0 --no-mtp` | 53,248 | 38 KiB |
+| f16 KV (MTP on) | 14,336 | 80 KiB |
+
+The 512-token prefill tile costs about 15% of prefill speed. `--no-mtp` doubles the window at the cost of MTP's decode
+speed-up. An agent client that sends a large `max_tokens` (CodeSharp sends 16,384) spends that much of the window on
+the reply, so its prompts must compact well below the window.
 
 ### Turning sysmem fallback off in the driver
 
