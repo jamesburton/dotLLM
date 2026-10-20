@@ -16,8 +16,8 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// <list type="bullet">
 ///   <item><b>LatentMoE</b>: layers 0 and 1 run their experts on <c>ffn_latent_down(x)</c> and send the weighted sum through
 ///   <c>ffn_latent_up</c>; the router and the shared expert read the full x.</item>
-///   <item><b>Per-layer geometry</b>: the three MoE layers differ in expert count (4 / 6 / 5), top-k (2 / 3 / 1) and width
-///   (512 / 256 / 256), and layer 2 is NOT latent (its experts read the hidden size), so a scratch or dispatch sized from any one
+///   <item><b>Per-layer geometry</b>: the four MoE layers differ in expert count (4 / 6 / 5 / 4), top-k (2 / 3 / 1 / 2) and width
+///   (512 / 256 / 256 / 256), and layers 2 and 3 are NOT latent (its experts read the hidden size), so a scratch or dispatch sized from any one
 ///   layer, or a latent switch applied model-wide, is wrong somewhere.</item>
 ///   <item><b>K-quant expert banks</b>: Q4_K / Q5_K / Q6_K / Q8_0, the AD-Q4_K_M and AD-Q6_K mix.</item>
 /// </list>
@@ -34,6 +34,9 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         new(Experts: 4, TopK: 2, Inter: 512, Latent: Latent, UpQt: QuantizationType.Q4_K, DownQt: QuantizationType.Q5_K),
         new(Experts: 6, TopK: 3, Inter: 256, Latent: Latent, UpQt: QuantizationType.Q6_K, DownQt: QuantizationType.Q6_K),
         new(Experts: 5, TopK: 1, Inter: 256, Latent: 0, UpQt: QuantizationType.Q5_K, DownQt: QuantizationType.Q8_0),
+        // A non-latent K-quant layer on the grouped MMQ prefill: its expert output (hidden, 512) is WIDER than its intermediate (256),
+        // so the down projection's tile grid and scratch strides must follow the expert width, not the intermediate.
+        new(Experts: 4, TopK: 2, Inter: 256, Latent: 0, UpQt: QuantizationType.Q4_K, DownQt: QuantizationType.Q5_K),
     ];
 
     // 20 rows: at the grouped-prefill threshold (16) and enough that experts receive zero, one and many routed rows.
@@ -47,7 +50,7 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
 
     /// <param name="mmvq">dp4a MMVQ indexed arm (int8 activations) vs the F32-activation indexed arm.</param>
     /// <param name="grouped">Expert-grouped prefill (#1046): layer 0 (Q4_K/Q5_K) takes the dp4a MMQ kernels, layer 1 (Q6_K/Q6_K) the coopmat
-    /// kernels, layer 2 (Q8_0 down) stays indexed. Single-token forwards are below the threshold, so they check the indexed decode arm.</param>
+    /// kernels, layer 2 (Q8_0 down) stays indexed, layer 3 (non-latent Q4_K/Q5_K) takes MMQ with a down width above its intermediate. Single-token forwards are below the threshold, so they check the indexed decode arm.</param>
     /// <param name="xdiv">#1049: K-quant up projections on the MMVQ arm read the per-token rows (xDiv = topK, multi-row Q4_K kernel) instead
     /// of a topK-fold broadcast.</param>
     [SkippableTheory]
@@ -91,20 +94,20 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
             output.WriteLine($"paths: mmvq={viaMmvq} f32={viaF32} groupedMmq={viaMmq} groupedCoopmat={viaCoopmat} xdivUp={viaXDiv} multiRowUp={viaMr}");
             if (!grouped && mmvq && xdiv && device.HasIntegerDotProduct)
             {
-                // Every layer's up bank is a K-quant: all three take the xDiv MMVQ; layers 0 (Q4_K) and 2 (Q5_K) the multi-row kernel,
-                // and layer 0's Q5_K down bank the multi-row Q5_K kernel.
-                Assert.Equal(3, viaXDiv);
+                // Every layer's up bank is a K-quant: all four take the xDiv MMVQ; layers 0 (Q4_K), 2 (Q5_K) and 3 (Q4_K) the multi-row kernel,
+                // and the Q5_K down banks of layers 0 and 3 the multi-row Q5_K kernel.
+                Assert.Equal(4, viaXDiv);
                 if (VulkanNemotronHTransformerModel.MoeUpMultiRow > 1)
                 {
-                    Assert.Equal(2, viaMr);
-                    Assert.Equal(1, Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.MultiRowDown));
+                    Assert.Equal(3, viaMr);
+                    Assert.Equal(2, Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.MultiRowDown));
                 }
             }
             if (!xdiv || !mmvq) Assert.Equal(0, viaXDiv);
             if (grouped)
             {
-                // One forward: layer 0 on MMQ, layer 1 on coopmat (where the device has them), layer 2 (Q8_0 down) indexed.
-                if (device.HasIntegerDotProduct) Assert.Equal(1, viaMmq);
+                // One forward: layers 0 and 3 on MMQ, layer 1 on coopmat (where the device has them), layer 2 (Q8_0 down) indexed.
+                if (device.HasIntegerDotProduct) Assert.Equal(2, viaMmq);
                 if (device.HasCooperativeMatrix) Assert.Equal(1, viaCoopmat);
                 Assert.True(viaMmq + viaCoopmat > 0, "no layer took the grouped prefill");
             }
