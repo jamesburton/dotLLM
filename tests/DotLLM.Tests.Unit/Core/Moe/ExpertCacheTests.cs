@@ -83,6 +83,20 @@ public sealed class ExpertCacheTests
     }
 
     [Fact]
+    public void Slru_ProtectedCapacityRoundsDown()
+    {
+        // 3 slots at fraction 0.5: protected capacity floor(1.5) = 1 (rounding up to 2 keeps 0 protected and evicts 3 instead).
+        var c = Single(6, 3, ExpertCachePolicy.Slru, protectedFraction: 0.5);
+        Look(c, 0, 0, 1, 2);    // probation: 0, 1, 2
+        Look(c, 0, 0);          // protected: 0
+        Look(c, 0, 1);          // protected: 0, 1 over capacity 1 -> demote 0      probation: 2, 0
+        Look(c, 0, 3);          // evicts 2                                          probation: 0, 3
+        Look(c, 0, 4);          // evicts 0 (the probation head)
+        Assert.Equal(-1, c.SlotOf(0, 0));
+        Assert.Equal([1, 3, 4], Resident(c, 0, 6));
+    }
+
+    [Fact]
     public void Slru_ZeroProtectedCapacity_BehavesAsLru()
     {
         int[][] trace = [[0, 1, 2], [0], [1], [3], [4], [2], [0]];
