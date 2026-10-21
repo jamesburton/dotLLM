@@ -102,6 +102,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MatMulQ4_0MmvqKernel? MatMulQ4_0Mmvq { get; private set; }
     /// <summary>Dense native Q4_0 prefill GEMM on the 128x128x4 coopmat tile (#1018). Null without cooperative matrices / wave64.</summary>
     public MatMulQ4_0GemmCoopmatKernel? MatMulQ4_0GemmCoopmat { get; private set; }
+    /// <summary>Portable packed Q4_0 GEMM fallback when cooperative matrices are unavailable.</summary>
+    public MatMulQ4_0GemmF32Kernel? MatMulQ4_0Gemm { get; private set; }
     /// <summary>Grouped coopmat Q5_1 prefill kernel (16-row tiles).</summary>
     public MoeGroupedMatmulLegacyQuantCoopmatKernel? MoeGroupedQ5_1 { get; private set; }
     /// <summary>Grouped coopmat Q8_0 prefill kernel (16-row tiles).</summary>
@@ -651,6 +653,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             if (VulkanQwen3MoeMoeUpload.Q4_0NativeEnabled)
             {
                 kernels.MatMulQ4_0Mmvq = MatMulQ4_0MmvqKernel.TryCreate(device, spvDir);
+                if (File.Exists(Path.Combine(spvDir, "matmul_q4_0_f32_gemm.spv")))
+                    kernels.MatMulQ4_0Gemm = MatMulQ4_0GemmF32Kernel.Create(device, spvDir);
                 if (MatMulQ4_0GemmCoopmatKernel.IsSupportedOn(device, spvDir))
                     kernels.MatMulQ4_0GemmCoopmat = MatMulQ4_0GemmCoopmatKernel.Create(device, spvDir);
             }
@@ -784,6 +788,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeMmvqQ8_0?.InvalidateDescriptorCache();
         MatMulQ4_0Mmvq?.InvalidateDescriptorCache();
         MatMulQ4_0GemmCoopmat?.InvalidateDescriptorCache();
+        MatMulQ4_0Gemm?.InvalidateDescriptorCache();
         MoeGroupedQ5_1?.InvalidateDescriptorCache();
         MoeGroupedQ8_0?.InvalidateDescriptorCache();
         MoeGroupedQ4K16?.InvalidateDescriptorCache();
@@ -792,6 +797,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
 
     public void Dispose()
     {
+        MatMulQ4_0Gemm?.Dispose();
         foreach (var gk in _iqGrouped.Values) gk.Dispose();
         foreach (var mk in _iqMmvq.Values) mk.Dispose();
         MoeIndexedMatmulQ5_1?.Dispose(); MoeIndexedMatmulQ8_0?.Dispose(); MoeMmvqQ5_1?.Dispose(); MoeMmvqQ8_0?.Dispose(); MatMulQ4_0Mmvq?.Dispose(); MatMulQ4_0GemmCoopmat?.Dispose(); MoeMmvqQ4KMr?.Dispose(); MoeMmvqQ5_1Mr?.Dispose();

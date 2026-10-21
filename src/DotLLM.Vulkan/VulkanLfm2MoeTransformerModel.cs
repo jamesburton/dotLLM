@@ -20,11 +20,9 @@ namespace DotLLM.Vulkan;
 /// is borrowed from <see cref="VulkanQwen3MoeHybridTransformerModel"/> through a layer-less host.
 /// </summary>
 /// <remarks>
-/// <para><b>Q4_0 weights.</b> The Vulkan backend has no Q4_0 matmul kernels (and a Q4_0 routed bank widens to F32, ~96 GB for this model).
-/// Q4_0 and Q8_0 share the block grid (32 elements, f16 scale) and every Q4_0 value <c>(n - 8) * d</c> is an exact int8, so each Q4_0
-/// tensor is transcoded on load to the bit-equivalent Q8_0 block (<c>qs[j] = n_j - 8</c>, same scale) and served by the existing Q8_0 kernels,
-/// including the Q8_0 routed-expert banks. Numerics are unchanged (the weights are identical); the cost is bytes: 8.5 vs 4.5 bits per weight,
-/// which is exactly lever #1 of the stage profile (a native Q4_0 MMVQ halves the weight traffic).</para>
+/// <para><b>Q4_0 weights.</b> Packed dense and routed kernels keep Q4_0 at 4.5 bits per weight when integer-dot-product kernels are available.
+/// Dense prefill uses cooperative matrices when supported, otherwise the portable packed GEMM. Without the required kernels, or with
+/// <c>DOTLLM_VK_Q4_0_NATIVE=0</c>, Q4_0 is transcoded exactly to Q8_0 (8.5 bits per weight, identical decoded weights).</para>
 /// </remarks>
 public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
 {
@@ -45,6 +43,7 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
     private long _deviceWeightBytes;
 
     private VulkanDevice.Buffer? _denseGate, _denseUp;
+    private VulkanDevice.Buffer? _convProj;
     private int _denseCapacity;
     private VulkanDevice.Buffer? _multiRowLogits;
     private int _multiRowLogitsRows;
@@ -54,7 +53,8 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
     public ModelConfig Config { get; }
 
     /// <inheritdoc/>
-    public long ComputeMemoryBytes => _host.ComputeMemoryBytes + _deviceWeightBytes + _defaultState.AllocatedBytes;
+    public long ComputeMemoryBytes => _host.ComputeMemoryBytes + _deviceWeightBytes + _defaultState.AllocatedBytes
+        + (_convProj?.Size ?? 0);
 
     /// <summary>Number of full-attention layers.</summary>
     public int AttentionLayerCount => _host.AttentionLayerCount;
@@ -582,12 +582,14 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
     private bool EnsureDense(int T)
     {
         if (_denseGate is not null && _denseCapacity >= T) return false;
-        _denseGate?.Dispose(); _denseUp?.Dispose();
+        _denseGate?.Dispose(); _denseUp?.Dispose(); _convProj?.Dispose();
         int cap = 1;
         while (cap < T) cap *= 2;
         long f = Config.IntermediateSize;
         _denseGate = _device.AllocateDeviceLocal((long)cap * f * sizeof(float));
         _denseUp = _device.AllocateDeviceLocal((long)cap * f * sizeof(float));
+        // Conv emits [B | C | X], independent of routing top-k. MoE scratch can be smaller than 3H.
+        _convProj = _device.AllocateDeviceLocal((long)cap * 3 * Config.HiddenSize * sizeof(float));
         _denseCapacity = cap;
         return true;
     }
@@ -607,7 +609,7 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
         var st = _host.Q4State;
         var conv = _host.Q4Kernels.Lfm2ShortConv!;
         var state = _activeState!.GetBuffer(ordinal);
-        var proj = st.MoeExpandedInput;   // [T, 4*H] scratch >= [T, 3*H]: free while a conv layer runs
+        var proj = _convProj!;            // [T, 3*H], independent of routing top-k
         var y = st.AttnOutput;            // [T, H]
         _host.Q4RecordMatmul(cmd, ld.InProj!, ld.InProjQt, st.NormOutput, proj, 3 * H, H, T);
         cmd = Stage(cmd, "conv_inproj");
@@ -705,7 +707,7 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
             l.Gate?.Dispose(); l.Up?.Dispose(); l.Down?.Dispose();
             l.Moe?.Dispose();
         }
-        _denseGate?.Dispose(); _denseUp?.Dispose(); _multiRowLogits?.Dispose();
+        _denseGate?.Dispose(); _denseUp?.Dispose(); _convProj?.Dispose(); _multiRowLogits?.Dispose();
         _host.Dispose();
         foreach (nint p in _ownedHost) NativeMemory.AlignedFree((void*)p);
         _ownedHost.Clear();
