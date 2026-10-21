@@ -609,6 +609,37 @@ The 512-token prefill tile costs about 15% of prefill speed. `--no-mtp` doubles 
 speed-up. An agent client that sends a large `max_tokens` (CodeSharp sends 16,384) spends that much of the window on
 the reply, so its prompts must compact well below the window.
 
+### Prefix reuse across agent turns (#1080)
+
+An agent client resends the whole conversation every turn. The server keeps one recurrent-prefix snapshot (the GDN state
+at a token boundary, plus the KV rows before it), and a turn that starts with it prefills only the rest. Two things used to
+defeat that on the CUDA hybrid:
+
+- **The KV growth needed twice the KV.** A turn needs a longer KV than the last one, and growing the model-owned storage
+  copied it, so the old and new storage coexisted. Near the fitted window that never fits, the admission refused it, and the
+  turn re-prefilled everything (`cached_tokens` 0). The KV now grows **in place** with CUDA virtual memory: each attention
+  layer's K and V range is reserved once for the window (`cuMemAddressReserve`), and physical pages are mapped in as it
+  grows (`cuMemCreate` + `cuMemMap`). Nothing is copied and a growth costs only the added pages (2 MiB granules), so it fits
+  whenever the window does. Devices or drivers without the VMM API keep the copying growth; `DOTLLM_CUDA_KV_VMM=0` forces it.
+- **The snapshot lagged a turn.** It sat at what a prompt shared with the previous one, so each hit reused the prompt from
+  two turns back. A prompt that extends the whole previous one is now snapshotted at its own end, so the next turn prefills
+  only what it adds. Other prompts (a fixed system prompt with different questions) keep the shared-prefix boundary.
+
+Measured on an RTX 3060 12 GB (T5500, PCIe 2.0, desktop on the card) with Bonsai-2 27B PQ2_0-MTP, `--kv-quant-k q8_0
+--kv-quant-v q8_0`, replaying an agent conversation that grows about 3.5k tokens a turn (`max_tokens` 4096, greedy):
+
+| MTP | prompt | before: cached / time to first token | after: cached / time to first token |
+|---|---|---|---|
+| on (window 26,624) | 11,196 | 3,861 / 52 s | 7,568 / 27 s |
+| on | 18,369 | 0 / 138 s | 14,696 / 28 s |
+| off (window 53,248) | 25,102 | 0 / 195 s | 21,716 / 28 s |
+| off | 35,751 | 0 / 286 s | 32,127 / 31 s |
+| off | 46,481 | 0 / 385 s | 42,854 / 33 s |
+
+Shared GPU memory stayed at its idle level (74-78 MiB) in every run; peak dedicated memory rose by 56-214 MiB, because the
+KV is kept rather than freed and re-made. A turn that hits the prefix runs without MTP speculation (the MTP head needs the
+whole sequence absorbed), so decode on those turns is at the plain rate (43-51 ms/token here).
+
 ### Turning sysmem fallback off in the driver
 
 For a dedicated inference box, make the driver fail the allocation instead of spilling. In **NVIDIA Control Panel >

@@ -88,8 +88,11 @@ length-only `CudaHybridKvCacheHandle`. Per full-attention slot (16 of 64 layers 
 
 - **One slot, growable (#1025).** The storage is single-slot: a forward on a different handle overwrites it from position 0,
   so the handle reports `HasExclusiveStorage = false`, and the engine's recurrent prefix snapshot is dropped when another
-  request runs. Growing a handle (`TryGrowTo`, used when a longer follow-up prompt reuses that snapshot) reallocates the
-  storage and copies the live rows. Old and new storage coexist only during that copy.
+  request runs. Growing a handle (`TryGrowTo`, used when a longer follow-up prompt reuses that snapshot) keeps the live
+  rows. Since #1080 it grows **in place**: each slot's K and V address range is reserved for the context window
+  (`cuMemAddressReserve`) and physical pages are mapped in as it grows (`CudaGrowableDeviceBuffer`), so nothing is copied
+  and a growth admits only the added 2 MiB pages. Without the CUDA VMM API (or with `DOTLLM_CUDA_KV_VMM=0`) it falls back
+  to reallocating and copying, where old and new storage coexist during the copy.
 - **F32 staging is shared and on demand.** Only the F32-consuming tiers (prefill `attention_f32`, opt-in/fallback decode
   tiers) read F32 K/V. They get ONE staging pair shared by all layers, fully reconverted per use (512 MiB at 64k). The
   default mma decode kernel reads the F16 cache directly and stages nothing. Before #956 every slot kept a persistent F32

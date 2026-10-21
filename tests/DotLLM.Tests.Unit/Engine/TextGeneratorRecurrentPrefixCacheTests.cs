@@ -69,23 +69,41 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
     }
 
     [Fact]
-    public void Hit_MovesTheSnapshotForward_SoAnAgentLoopPrefillsOnlyRecentTurns()
+    public void Hit_MovesTheSnapshotForward_SoAnAgentLoopPrefillsOnlyItsNewTurn()
     {
         // Issue #1025: a hit never re-snapshotted, so every later request re-prefilled everything since the FIRST snapshot.
+        // Issue #1080: the snapshot then sat at what a prompt shared with the previous one, so each hit reused the prompt from
+        // two turns back and re-prefilled the last two turns. A prompt that extends the whole previous one is an agent loop:
+        // the snapshot goes at its own end (one token short, to produce logits), and the next turn prefills only its new part.
         // Each step's prompt extends the previous one by 20 tokens.
         var (cached, plain, model) = Build();
         int[] turn = [30, 31];
         Check(cached, plain, model, Prompt(turn));                    // r1: nothing to share yet
         turn = [.. turn, .. Run(100, 20)];
-        Check(cached, plain, model, Prompt(turn));                    // r2: snapshot at |r1| = 22
+        Check(cached, plain, model, Prompt(turn));                    // r2 extends r1: snapshot at |r2| - 1 = 41
         turn = [.. turn, .. Run(200, 20)];
-        Assert.Equal(PrefixLen + 2, Check(cached, plain, model, Prompt(turn)).Timings.CachedTokenCount);   // r3 hits 22, moves it to |r2| = 42
+        Assert.Equal(PrefixLen + 21, Check(cached, plain, model, Prompt(turn)).Timings.CachedTokenCount);   // r3 hits 41, moves it to |r3| - 1 = 61
         turn = [.. turn, .. Run(300, 20)];
 
         var r4 = Check(cached, plain, model, Prompt(turn));
 
-        Assert.Equal(PrefixLen + 22, r4.Timings.CachedTokenCount);
-        Assert.Equal(40, model.Calls.Take(2).Sum());                  // only r3's and r4's new tokens ran (split at the new snapshot)
+        Assert.Equal(PrefixLen + 41, r4.Timings.CachedTokenCount);
+        Assert.Equal(21, model.Calls.Take(2).Sum());                  // only r4's new turn ran, plus the token held back for logits
+    }
+
+    [Fact]
+    public void PromptThatDoesNotExtendThePreviousOne_StillSnapshotsTheSharedPrefix()
+    {
+        // The classifier shape (issue #1025's first case): a fixed system prompt and a different question each time. Snapshotting
+        // at a prompt's end would never hit; the shared prefix does.
+        var (cached, plain, model) = Build();
+        Check(cached, plain, model, Prompt(30, 31));
+        Check(cached, plain, model, Prompt(40, 41));                  // shares PrefixLen with the previous prompt but does not extend it
+
+        var got = Check(cached, plain, model, Prompt(50, 51));
+
+        Assert.Equal(PrefixLen, got.Timings.CachedTokenCount);
+        Assert.Equal(2, model.Calls[0]);
     }
 
     [Fact]

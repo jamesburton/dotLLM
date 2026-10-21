@@ -132,6 +132,19 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     private int _f16CacheMaxSeqLen;
     private int _f16CacheCurrentLength;
 
+    // Issue #1080: in-place KV growth. When the device supports CUDA virtual memory, each attention slot's K and V storage
+    // (quantized or F16, whichever that side keeps) is a growable buffer: its address range is reserved for the context window
+    // and physical memory is mapped in as the handle grows. A growth then keeps its rows where they are and costs only the
+    // added bytes, where the copying growth needed old + new at once and so was refused near the fitted window (every agent
+    // turn re-prefilled). Null when the API is unavailable or DOTLLM_CUDA_KV_VMM=0: the copying growth below stays as the
+    // fallback. _kvGrowK/_kvGrowV are null until the first allocation; _f16KCache/_kQuant (and V) then hold their pointers.
+    private ICudaVirtualMemory? _kvVirtualMemory;
+    private CudaGrowableDeviceBuffer[]? _kvGrowK;
+    private CudaGrowableDeviceBuffer[]? _kvGrowV;
+
+    /// <summary>Environment switch for in-place KV growth (issue #1080): <c>0</c> keeps the copying growth.</summary>
+    internal const string KvVirtualMemoryEnvVar = "DOTLLM_CUDA_KV_VMM";
+
     // Identity of the IKvCache instance last seen by ForwardFullAttnBody (issue #185). A fresh
     // Forward call whose kvCache is a DIFFERENT instance than last time means "new/unrelated
     // sequence" even when its MaxLength happens to match the previous cache's -- EnsureF16KvCache's
@@ -691,11 +704,10 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     private readonly GpuSpillMonitor _spillMonitor;
 
     /// <summary>
-    /// Admission for <see cref="CudaHybridKvCacheHandle.TryGrowTo"/>. A growth past the allocated storage copies the live rows, so old and new
-    /// storage briefly coexist. The pre-#1025 miss path freed first. When the new storage plus
-    /// <see cref="VramReserveBytes"/> does not fit in free device memory, refuse, and the engine falls back to that miss path instead of
-    /// pushing the card into the shared-memory spill #1025 was about. The miss path's own allocation is admitted by
-    /// <see cref="AdmitDeviceGrowth"/> (issue #1068).
+    /// Admission for <see cref="CudaHybridKvCacheHandle.TryGrowTo"/>. When <see cref="KvStorageGrowthBytes"/> plus
+    /// <see cref="VramReserveBytes"/> does not fit in free device memory, refuse, and the engine falls back to the miss path
+    /// (free, then allocate) instead of pushing the card into the shared-memory spill #1025 was about. The miss path's own
+    /// allocation is admitted by <see cref="AdmitDeviceGrowth"/> (issue #1068).
     /// </summary>
     /// <param name="maxLength">The handle's requested length.</param>
     /// <returns><see langword="true"/> when the growth may proceed.</returns>
@@ -703,7 +715,44 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     {
         if (maxLength <= _f16CacheMaxSeqLen) return true;
         long free = FreeVramOverride ?? QueryFreeDeviceBytes();
-        return DeviceMemoryBudget.Fits(free, ComputeKvBytes(maxLength), VramReserveBytes);
+        return DeviceMemoryBudget.Fits(free, KvStorageGrowthBytes(maxLength), VramReserveBytes);
+    }
+
+    /// <summary>True when the KV storage grows in place, through CUDA virtual memory (issue #1080).</summary>
+    internal bool KvGrowsInPlace => _kvVirtualMemory is not null;
+
+    /// <summary>
+    /// Device bytes a growth of the KV storage to <paramref name="maxLength"/> tokens must newly allocate while keeping its rows.
+    /// In place (issue #1080) that is only the added pages: the physical memory mapped behind each slot's K and V range, rounded
+    /// up to the allocation granularity. A copying growth allocates the whole new storage while the old is still held, which near
+    /// the fitted window does not fit.
+    /// </summary>
+    /// <param name="maxLength">Tokens the storage must hold.</param>
+    /// <returns>Bytes to allocate; zero when the storage already holds them.</returns>
+    internal long KvStorageGrowthBytes(int maxLength)
+    {
+        if (_kvVirtualMemory is not { } vm) return maxLength <= _f16CacheMaxSeqLen ? 0 : ComputeKvBytes(maxLength);
+        int kvElems = Config.NumKvHeads * Config.HeadDim;
+        long kBytes = (long)maxLength * QuantRowBytes(_kvKeyDType, kvElems);
+        long vBytes = (long)maxLength * QuantRowBytes(_kvValueDType, kvElems);
+        if (_kvGrowK is null || _kvGrowV is null)
+            return _attentionLayerCount * (CudaGrowableDeviceBuffer.RoundUp(kBytes, vm.Granularity)
+                                           + CudaGrowableDeviceBuffer.RoundUp(vBytes, vm.Granularity));
+        long total = 0;
+        for (int i = 0; i < _attentionLayerCount; i++)
+            total += _kvGrowK[i].GrowthBytes(kBytes) + _kvGrowV[i].GrowthBytes(vBytes);
+        return total;
+    }
+
+    /// <summary>Test-only (issue #1080): device address of attention slot <paramref name="slot"/>'s K storage, or 0 before allocation.</summary>
+    internal nint DebugKeyStoragePointerForTest(int slot)
+        => _f16KCache is null ? 0 : IsQuantKv(_kvKeyDType) ? _kQuant![slot] : _f16KCache[slot];
+
+    /// <summary>Test hook (issue #1080): keep the copying KV growth on this model. Call before the first attention forward.</summary>
+    internal void UseCopyingKvGrowthForTest()
+    {
+        if (_f16KCache is not null) throw new InvalidOperationException("KV storage is already allocated.");
+        _kvVirtualMemory = null;
     }
 
     /// <summary>
@@ -830,6 +879,9 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         _context = context;
         _kernels = kernels;
         _deviceId = deviceId;
+        _kvVirtualMemory = Environment.GetEnvironmentVariable(KvVirtualMemoryEnvVar) == "0"
+            ? null
+            : CudaDriverVirtualMemory.TryCreate(deviceId);
         _mmaDecodeGqaSplit = new DotLLM.Cuda.CudaAttentionMmaDecodeGqaSplit(kernels);
 
         _gdnLayerOrdinal = new int[config.NumLayers];
@@ -3774,6 +3826,12 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
             throw new NotSupportedException(
                 $"Quantized KV storage needs numKvHeads*headDim ({kvElems}) to be a multiple of 32.");
 
+        if (_kvVirtualMemory is not null)
+        {
+            GrowKvStorageInPlace(maxSeqLen, kvElems);
+            return;
+        }
+
         int keepRows = _f16KCache is null ? 0 : Math.Min(_f16CacheCurrentLength, _f16CacheMaxSeqLen);
         if (keepRows == 0)
         {
@@ -3850,9 +3908,107 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         }
     }
 
+    /// <summary>
+    /// Grows the KV storage to <paramref name="maxSeqLen"/> tokens in place (issue #1080): every slot's K and V buffer maps the
+    /// added pages behind its existing rows, so the live rows <c>[0, _f16CacheCurrentLength)</c> stay put and peak VRAM is the
+    /// new size alone. The address ranges are reserved for the context window on first use; a request past it moves the same
+    /// physical pages to a larger range, still without copying. A failure (an admission refusal or an allocation error) leaves
+    /// the storage valid at its old length: buffers that did grow keep their extra pages for the next attempt.
+    /// </summary>
+    private void GrowKvStorageInPlace(int maxSeqLen, int kvElems)
+    {
+        ICudaVirtualMemory vm = _kvVirtualMemory!;
+        AdmitDeviceGrowth(KvStorageGrowthBytes(maxSeqLen), $"KV cache ({KvStorageLabel}) for {maxSeqLen} tokens");
+
+        long kRow = QuantRowBytes(_kvKeyDType, kvElems);
+        long vRow = QuantRowBytes(_kvValueDType, kvElems);
+        if (_kvGrowK is null || _kvGrowV is null)
+        {
+            // Reserving address space costs no memory, so cover the whole window: later growths then never move the pointers.
+            long reserveTokens = Math.Max(maxSeqLen, Config.MaxSequenceLength);
+            var newK = new CudaGrowableDeviceBuffer[_attentionLayerCount];
+            var newV = new CudaGrowableDeviceBuffer[_attentionLayerCount];
+            try
+            {
+                for (int i = 0; i < _attentionLayerCount; i++)
+                {
+                    newK[i] = new CudaGrowableDeviceBuffer(vm, reserveTokens * kRow);
+                    newV[i] = new CudaGrowableDeviceBuffer(vm, reserveTokens * vRow);
+                }
+            }
+            catch
+            {
+                DisposeAll(newK);
+                DisposeAll(newV);
+                throw;
+            }
+            _kvGrowK = newK;
+            _kvGrowV = newV;
+            _f16KCache = new nint[_attentionLayerCount];
+            _f16VCache = new nint[_attentionLayerCount];
+            _kQuant = new nint[_attentionLayerCount];
+            _vQuant = new nint[_attentionLayerCount];
+            _f16CacheMaxSeqLen = 0;
+            _f16CacheCurrentLength = 0;
+        }
+
+        // Kernels in flight may still address the old ranges if a growth past the reservation moves them.
+        _stream.Synchronize();
+        try
+        {
+            for (int i = 0; i < _attentionLayerCount; i++)
+            {
+                CountKvAllocation();
+                _kvGrowK[i].EnsureCapacity(maxSeqLen * kRow);
+                CountKvAllocation();
+                _kvGrowV[i].EnsureCapacity(maxSeqLen * vRow);
+            }
+        }
+        finally
+        {
+            PublishKvPointers();
+        }
+
+        _f16CacheMaxSeqLen = maxSeqLen;
+        _spillMonitor.Check($"KV cache ({KvStorageLabel}) grown in place to {maxSeqLen} tokens");
+
+        static void DisposeAll(CudaGrowableDeviceBuffer?[] buffers)
+        {
+            foreach (var b in buffers) b?.Dispose();
+        }
+    }
+
+    /// <summary>Points the per-slot K/V arrays at the growable buffers: each side is quantized or F16, and the other array holds 0.</summary>
+    private void PublishKvPointers()
+    {
+        bool kq = IsQuantKv(_kvKeyDType), vq = IsQuantKv(_kvValueDType);
+        for (int i = 0; i < _attentionLayerCount; i++)
+        {
+            nint k = _kvGrowK![i].Pointer, v = _kvGrowV![i].Pointer;
+            _kQuant![i] = kq ? k : 0;
+            _f16KCache![i] = kq ? 0 : k;
+            _vQuant![i] = vq ? v : 0;
+            _f16VCache![i] = vq ? 0 : v;
+        }
+    }
+
     /// <summary>Frees the per-slot KV storage (F16 and quantized) and the shared dequant scratch.</summary>
     private void FreeKvStorage()
     {
+        if (_kvGrowK is not null || _kvGrowV is not null)
+        {
+            // Unmapping is not ordered on the stream: nothing may still be reading or writing these ranges.
+            _stream.Synchronize();
+            foreach (var b in _kvGrowK ?? []) b?.Dispose();
+            foreach (var b in _kvGrowV ?? []) b?.Dispose();
+            _kvGrowK = null;
+            _kvGrowV = null;
+            _f16KCache = null;
+            _f16VCache = null;
+            _kQuant = null;
+            _vQuant = null;
+            return;
+        }
         FreeKvStorage(_f16KCache, _f16VCache, _kQuant, _vQuant);
         _f16KCache = null;
         _f16VCache = null;
@@ -4759,13 +4915,19 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     /// <summary><see cref="AllocDevice"/> for KV storage, honouring <see cref="KvAllocFailureAfter"/>.</summary>
     private static nint AllocKvDevice(long bytes)
     {
+        CountKvAllocation();
+        return AllocDevice(bytes);
+    }
+
+    /// <summary>Counts one KV buffer allocation or growth against <see cref="KvAllocFailureAfter"/>, throwing when it is exhausted.</summary>
+    private static void CountKvAllocation()
+    {
         if (KvAllocFailureAfter is int left)
         {
             if (left <= 0)
                 throw new InvalidOperationException("Injected KV allocation failure (test hook KvAllocFailureAfter).");
             KvAllocFailureAfter = left - 1;
         }
-        return AllocDevice(bytes);
     }
 
     private static void CopyHtoD(nint dst, nint src, long bytes)
