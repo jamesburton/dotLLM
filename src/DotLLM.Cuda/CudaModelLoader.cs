@@ -126,14 +126,9 @@ public static class CudaModelLoader
             case Architecture.MiMoV2:
                 throw new NotSupportedException(ModelConfig.MiMoV2UnsupportedMessage("CUDA"));
 
-            case Architecture.NemotronHMoe:
-                throw new NotSupportedException(
-                    "nemotron_h_moe (Nemotron 3.5 Lightning) is recognized but not yet runnable on "
-                    + "CUDA: the DeepSeek-V3-style MoE forward is not implemented. Note the smallest "
-                    + "published GGUF is ~17.6 GiB — larger than most single consumer GPUs. Tracked "
-                    + "in issue #375.");
-
-            case Architecture.NemotronH:
+            // nemotron_h_moe (Nemotron 3.5 Bolt / Lightning, #403) runs on the same host: its MoE FFN layers
+            // keep every expert resident in VRAM (offload for smaller GPUs: #1063).
+            case Architecture.NemotronH or Architecture.NemotronHMoe:
             {
                 var nemotronH = Architectures.CudaNemotronHTransformerModel
                     .LoadFromGguf(gguf, config, deviceId, ptxDir);

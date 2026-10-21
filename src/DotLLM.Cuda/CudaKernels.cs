@@ -7,7 +7,7 @@ namespace DotLLM.Cuda;
 /// Loads all PTX kernel modules and provides typed launch methods for each kernel.
 /// Arguments are marshaled as pointer arrays for <see cref="CudaDriverApi.cuLaunchKernel"/>.
 /// </summary>
-public sealed unsafe class CudaKernels : IDisposable
+public sealed unsafe partial class CudaKernels : IDisposable
 {
     private const int BlockSize = 256;
 
@@ -620,7 +620,7 @@ public sealed unsafe class CudaKernels : IDisposable
         "attention_f32.ptx", "swiglu_f32.ptx", "bias_add_f32.ptx", "per_head_rmsnorm_f32.ptx",
         "rmsnorm_f32.ptx", "quantized_gemv_f32in.ptx", "i2_s_gemv.ptx", "dequant_i2_s.ptx",
         "pq2_0_gemv.ptx", "dequant_pq2_0.ptx", "pq2_0_repack.ptx", "relu2.ptx", "relu2_f32.ptx",
-        "relu2_glu_rmsnorm.ptx", "fused_add_rmsnorm_f32res.ptx",
+        "relu2_glu_rmsnorm.ptx", "fused_add_rmsnorm_f32res.ptx", "nemotron_moe.ptx",
     ];
 
     /// <summary>
@@ -722,6 +722,8 @@ public sealed unsafe class CudaKernels : IDisposable
         _relu2F32Module = CudaModule.LoadFromFile(Path.Combine(ptxDir, "relu2_f32.ptx"));
         _relu2GluRmsNormModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "relu2_glu_rmsnorm.ptx"));
         _fusedAddRmsNormF32ResModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "fused_add_rmsnorm_f32res.ptx"));
+        _nemotronMoeModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "nemotron_moe.ptx"));
+        LoadNemotronMoeFunctions();
 
         // Query the device's opt-in dynamic shared-memory cap ONCE, unconditionally (not gated
         // on the optional MMQ PTX below) — the always-loaded I2_S GEMV kernels need it too (see
@@ -7590,6 +7592,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _relu2F32Module.Dispose();
         _relu2GluRmsNormModule.Dispose();
         _fusedAddRmsNormF32ResModule.Dispose();
+        _nemotronMoeModule?.Dispose();
         _quantKvModule?.Dispose();
         _turboquantModule?.Dispose();
         _hadamardFwhtModule?.Dispose();

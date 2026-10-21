@@ -56,9 +56,9 @@ public enum Architecture
     /// dense MLP replaced by a DeepSeek-V3-style MoE (sigmoid router with per-expert
     /// bias, expert-weight norm + scale, ungated squared-ReLU experts, one shared
     /// expert) plus an optional MTP head layer. Used by Nemotron 3.5 Lightning
-    /// (30B-A3B). GGUF architecture string: <c>nemotron_h_moe</c> — a separate
-    /// llama.cpp arch from <c>nemotron_h</c>. Recognition and layout parsing are
-    /// implemented; the MoE forward is not yet (issue #375).
+    /// (30B-A3B) and Bolt (74B-A9B, LatentMoE). GGUF architecture string: <c>nemotron_h_moe</c> — a separate
+    /// llama.cpp arch from <c>nemotron_h</c>. The MoE forward runs on CPU (#375), Vulkan (#1045)
+    /// and CUDA (#403, experts resident in VRAM).
     /// </summary>
     NemotronHMoe,
 

@@ -932,7 +932,8 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     /// <param name="selScratch">Scratch of length <c>NumExperts</c> for the selection scores.</param>
     /// <param name="topIdx">Receives the selected expert ids, in selection order.</param>
     /// <param name="weights">Receives the gating weight of each selected expert.</param>
-    private static void RouteToken(
+    /// <remarks>Internal so the CUDA model routes on the host with this exact code (#403).</remarks>
+    internal static void RouteToken(
         NemotronHMoeWeights moe, Span<float> logits, Span<float> selScratch, Span<int> topIdx, Span<float> weights)
     {
         int nExpert = moe.NumExperts;

@@ -24,7 +24,7 @@ namespace DotLLM.Cuda.Architectures;
 /// <c>NemotronHTransformerModel.Forward</c> (CPU) for the authoritative per-layer sequence this
 /// class's <c>Forward</c> (Task 11) mirrors.
 /// </remarks>
-public sealed unsafe class CudaNemotronHTransformerModel : IModel
+public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
 {
     private readonly CudaNemotronHForwardState _state;
     private readonly CudaNemotronHSsmStateCache _ssmCache;
@@ -167,6 +167,8 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
         public DeviceSsm? Ssm { get; init; }
         public DeviceAttn? Attention { get; init; }
         public DeviceFfn? Ffn { get; init; }
+        /// <summary>Routed-MoE weights (nemotron_h_moe, #403); set instead of <see cref="Ffn"/> on an MoE FFN layer.</summary>
+        public DeviceMoe? Moe { get; init; }
     }
 
     private CudaNemotronHTransformerModel(
@@ -227,9 +229,9 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
     {
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
-        if (config.Architecture != Architecture.NemotronH)
+        if (config.Architecture is not (Architecture.NemotronH or Architecture.NemotronHMoe))
             throw new ArgumentException(
-                $"CudaNemotronHTransformerModel requires Architecture.NemotronH, got {config.Architecture}.",
+                $"CudaNemotronHTransformerModel requires Architecture.NemotronH/NemotronHMoe, got {config.Architecture}.",
                 nameof(config));
         if (config.HybridLayout is null)
             throw new ArgumentException("NemotronH config must have HybridLayout populated.", nameof(config));
@@ -298,6 +300,7 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
         FreeIfNonZero(ref _activF16OutScratch);
         FreeIfNonZero(ref _nvfp4XQ8Scratch);
         FreeIfNonZero(ref _nvfp4XMetaScratch);
+        DisposeMoe();
 
         for (int i = 0; i < _layers.Length; i++)
             FreeLayer(_layers[i]);
@@ -348,6 +351,7 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
             nint up = ff.UpWeight; FreeIfNonZero(ref up);
             nint down = ff.DownWeight; FreeIfNonZero(ref down);
         }
+        if (layer.Moe is { } moe) FreeMoe(moe);
     }
 
     // ── Shared device-upload primitives (reused by BuildFromPrebuiltWeights, Task 8) ────────
@@ -420,9 +424,9 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
         ArgumentNullException.ThrowIfNull(config);
         ArgumentNullException.ThrowIfNull(cpuLayers);
         ArgumentNullException.ThrowIfNull(outputNormWeight);
-        if (config.Architecture != Architecture.NemotronH)
+        if (config.Architecture is not (Architecture.NemotronH or Architecture.NemotronHMoe))
             throw new ArgumentException(
-                $"CudaNemotronHTransformerModel requires Architecture.NemotronH, got {config.Architecture}.",
+                $"CudaNemotronHTransformerModel requires Architecture.NemotronH/NemotronHMoe, got {config.Architecture}.",
                 nameof(config));
         if (config.HybridLayout is null)
             throw new ArgumentException("NemotronH config must have HybridLayout populated.", nameof(config));
@@ -463,6 +467,14 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
 
             kernels = new CudaKernels(ptxDir);
 
+            // nemotron_h_moe (#403): check the whole device footprint against free VRAM before uploading anything, and
+            // size the routed scratch once for the largest prefill block (#1063 addendum: WDDM spills, it does not fail).
+            bool hasMoe = cpuLayers.Any(l => l.Moe is not null);
+            int moeBlock = Math.Max(1, Math.Min(MoeBlockTokens, config.MaxSequenceLength));
+            if (hasMoe)
+                ThrowIfMoeModelDoesNotFit(EstimateDeviceBytes(
+                    config, cpuLayers, outputQt, outputOutputDim, outputInputDim, planTokens: moeBlock, moeBlockTokens: moeBlock));
+
             long maxTileFloats = 0;
 
             // Output norm — always F32 [hiddenSize].
@@ -490,6 +502,7 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
                 DeviceSsm? ssmDev = null;
                 DeviceAttn? attnDev = null;
                 DeviceFfn? ffnDev = null;
+                DeviceMoe? moeDev = null;
 
                 switch (layout.LayerKind[i])
                 {
@@ -500,6 +513,9 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
                     case HybridLayerKind.Attention:
                         attnDev = UploadDeviceAttentionLayer(cpuLayer.Attention!, ref maxTileFloats, allocs);
                         kvSlotForLayer[i] = attentionLayerCount++;
+                        break;
+                    case HybridLayerKind.Ffn when cpuLayer.Moe is not null:
+                        moeDev = UploadDeviceMoeLayer(cpuLayer.Moe, i, hiddenSize, ref maxTileFloats, allocs);
                         break;
                     case HybridLayerKind.Ffn:
                         ffnDev = UploadDeviceFfnLayer(cpuLayer.Ffn!, ref maxTileFloats, allocs);
@@ -518,6 +534,7 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
                     Ssm = ssmDev,
                     Attention = attnDev,
                     Ffn = ffnDev,
+                    Moe = moeDev,
                 };
             }
             if (maxIntermediate == 0) maxIntermediate = hiddenSize;
@@ -545,13 +562,17 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
             UpdateMaxTile(ref maxTileFloats, maxIntermediate); // dequant scratch floor for tiny models
             nint dequantScratchDevice = AllocDevice(maxTileFloats * sizeof(ushort), allocs);
 
-            return new CudaNemotronHTransformerModel(
+            var model = new CudaNemotronHTransformerModel(
                 config, layers,
                 tokenEmbedWeight, tokenEmbedQt, tokenEmbedRowBytes,
                 outputNormDevice,
                 outputDevice, outputQt, outputOutputDim, outputInputDim, ownsOutputDevice: true,
                 kvSlotForLayer, attentionLayerCount,
                 state, ssmCache, stream, cublas, context, kernels, deviceId, dequantScratchDevice);
+            model._moeSpec = ComputeMoeSpec(layers, hiddenSize);
+            if (hasMoe)
+                model.AllocateMoeScratch(moeBlock);
+            return model;
         }
         catch
         {
@@ -1073,6 +1094,9 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
 
             switch (lw.Kind)
             {
+                case HybridLayerKind.Ffn when lw.Moe is not null:
+                    ForwardMoeBody(lw.Moe, seqLen, hiddenSize);
+                    break;
                 case HybridLayerKind.Ffn:
                     ForwardFfnBody(lw.Ffn!.Value, seqLen, hiddenSize);
                     break;
