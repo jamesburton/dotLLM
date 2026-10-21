@@ -1,4 +1,5 @@
 using DotLLM.Core.Attention;
+using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Vulkan.Interop;
 
@@ -184,6 +185,23 @@ public sealed class VulkanNemotronHKvCache : IKvCache
 
     /// <summary>Returns the device buffer holding cached values for the given (absolute) layer index.</summary>
     internal VulkanDevice.Buffer GetValuesBuffer(int absoluteLayerIndex) => _values[RequireSlot(absoluteLayerIndex)];
+
+    internal void ValidateSnapshotLayout(VulkanDevice device, ReadOnlySpan<HybridLayerKind> layerKinds, int numKvHeads, int headDim)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!ReferenceEquals(_device, device) || _storage != VulkanKvStorage.F32 ||
+            _numKvHeads != numKvHeads || _headDim != headDim || _kvSlotForLayer.Length != layerKinds.Length)
+            throw new ArgumentException("KV snapshot device, storage or geometry mismatch.");
+        int slot = 0;
+        for (int i = 0; i < layerKinds.Length; i++)
+        {
+            int expected = layerKinds[i] == HybridLayerKind.Attention ? slot++ : -1;
+            if (_kvSlotForLayer[i] != expected)
+                throw new ArgumentException("KV snapshot layer mapping mismatch.");
+        }
+        if (slot != _attentionLayerCount)
+            throw new ArgumentException("KV snapshot attention layer count mismatch.");
+    }
 
     /// <summary>
     /// Appends K/V copy commands onto the supplied <paramref name="cmdBuf"/>. Caller is

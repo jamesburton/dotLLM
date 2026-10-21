@@ -24,7 +24,7 @@ namespace DotLLM.Models.Architectures;
 /// a dense SwiGLU for the leading dense layers and a sigmoid + selection-bias, renormalised top-k SwiGLU MoE afterwards.
 /// The LM head is tied to the token embedding and the final norm is stored as <c>token_embd_norm.weight</c>.
 /// </remarks>
-public sealed unsafe class Lfm2MoeTransformerModel : IModel
+public sealed unsafe partial class Lfm2MoeTransformerModel : IModel
 {
     private readonly GgufFile? _gguf;
     private readonly Lfm2Layer[] _layers;
@@ -268,7 +268,7 @@ public sealed unsafe class Lfm2MoeTransformerModel : IModel
     private Lfm2ConvStateCache? ResolveState(ISsmState? s)
     {
         if (s is null) return null;
-        if (s is Lfm2ConvStateCache c && c.NumSsmLayers == _convLayerCount) return c;
+        if (s is Lfm2ConvStateCache c && c.NumSsmLayers == _convLayerCount && c.StateSlots == _lCache - 1 && c.HiddenSize == Config.HiddenSize) return c;
         throw new ArgumentException($"Lfm2MoeTransformerModel requires an {nameof(Lfm2ConvStateCache)} with {_convLayerCount} layers; got {s.GetType().Name}.", nameof(s));
     }
 

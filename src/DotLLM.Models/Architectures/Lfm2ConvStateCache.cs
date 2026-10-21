@@ -47,11 +47,17 @@ public sealed unsafe class Lfm2ConvStateCache : ISsmState
     public long AllocatedBytes => (long)_numLayers * _perLayerElements * sizeof(float);
 
     /// <summary>Pointer to the <c>[StateSlots, HiddenSize]</c> state of conv-layer ordinal <paramref name="convOrdinal"/>.</summary>
-    public float* Layer(int convOrdinal) => (float*)_data + (long)convOrdinal * _perLayerElements;
+    public float* Layer(int convOrdinal)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if ((uint)convOrdinal >= (uint)_numLayers) throw new ArgumentOutOfRangeException(nameof(convOrdinal));
+        return (float*)_data + (long)convOrdinal * _perLayerElements;
+    }
 
     /// <inheritdoc/>
     public void Reset()
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         if (_data != 0)
             NativeMemory.Clear((void*)_data, (nuint)AllocatedBytes);
     }
@@ -59,12 +65,25 @@ public sealed unsafe class Lfm2ConvStateCache : ISsmState
     /// <summary>Copies another cache's contents into this one (same geometry).</summary>
     public void CopyFrom(Lfm2ConvStateCache other)
     {
-        if (other._numLayers != _numLayers || other._perLayerElements != _perLayerElements)
+        ArgumentNullException.ThrowIfNull(other);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(other._disposed, other);
+        if (other._numLayers != _numLayers || other.StateSlots != StateSlots || other.HiddenSize != HiddenSize)
             throw new ArgumentException("State geometry mismatch.", nameof(other));
         if (_data != 0)
             Buffer.MemoryCopy((void*)other._data, (void*)_data, AllocatedBytes, AllocatedBytes);
     }
 
+    internal void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);
+
+    /// <summary>Creates an independent copy with the same geometry.</summary>
+    public Lfm2ConvStateCache Clone()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var copy = new Lfm2ConvStateCache(_numLayers, StateSlots, HiddenSize);
+        copy.CopyFrom(this);
+        return copy;
+    }
     /// <inheritdoc/>
     public void Dispose()
     {

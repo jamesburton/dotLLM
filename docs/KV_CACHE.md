@@ -495,7 +495,30 @@ Decode sweep (Q4_0, 64 tokens per point): 18.9 tok/s at ctx 512, 19.5 at 4k, 19.
 **Recommendation (12 GB card):** Q8_0 up to ~36k (indistinguishable from F16, 1 GB headroom). Beyond that
 prefer K8V4 (+0.18% PPL, 11.5 GB at 72k) or Q4_0 (10.95 GB) - Q8_0 at 72k peaks at 12.08 GB of 12.29 and is
 one allocation from WDDM paging. Needle retrieval is a coarse test; the PPL deltas are the fine-grained signal.
-# Recurrent prefix snapshots with a host tier (#1033)
+# Recurrent prefix snapshots
+
+## LFM2 convolution checkpoints and sequence prefixes (#1028)
+
+CPU and Vulkan LFM2 models implement model-owned recurrent checkpoint/restore and
+independent per-sequence prefix snapshots. A prefix snapshot owns both the attention
+KV prefix and the short-convolution history; restoring it into another sequence leaves
+the KV cache at the captured length. The caller must capture recurrent state immediately
+after exactly that prefix has been consumed. Both backends support interleaved sequences
+through serialized `ForwardBatch` calls; this does not make simultaneous calls on one
+model instance thread-safe.
+
+The initial CPU path supports `SimpleKvCache` host F32 storage. The
+`IKvCache.SupportsExactF32PrefixCopy` capability opts a cache into complete, lossless
+F32 copying with explicit per-layer geometry. Compressed and paged caches have not
+opted in: capture returns null and restore rejects them before changing the destination.
+Vulkan snapshots retain F32 KV and convolution buffers on the same device. Snapshot
+ownership, state/cache geometry, device identity and disposed resources are validated.
+Callers own and dispose snapshots; they can restore an intact snapshot repeatedly.
+
+These APIs do not implement per-row recurrent snapshots, add an LFM MTP head, or add
+the host/disk transport described below to LFM models.
+
+## Host tier for models with snapshot transport (#1033)
 
 Recurrent and hybrid models need both attention KV rows and recurrent state to reuse a
 conversation prefix. Retaining only KV rows is insufficient. Multi-slot snapshots keep

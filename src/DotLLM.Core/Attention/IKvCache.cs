@@ -72,4 +72,12 @@ public interface IKvCache : IDisposable
     /// different cache, so a cached prefix held in it must be dropped at that point (issue #1025).
     /// </summary>
     bool HasExclusiveStorage => true;
+
+    /// <summary>
+    /// True when <see cref="GetKeysRef"/> and <see cref="GetValuesRef"/> expose all live positions
+    /// as contiguous host F32 rows and <see cref="Update(TensorRef, TensorRef, ReadOnlySpan{int}, int)"/>
+    /// restores those rows without loss. Implementations must also expose <see cref="IPerLayerKvCache"/>
+    /// geometry. Compressed, windowed and device caches default to false even if they expose F32 scratch views.
+    /// </summary>
+    bool SupportsExactF32PrefixCopy => false;
 }

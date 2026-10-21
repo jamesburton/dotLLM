@@ -11,6 +11,9 @@ namespace DotLLM.Engine.KvCache;
 /// </summary>
 public sealed unsafe class SimpleKvCache : IKvCache, IPerLayerKvCache
 {
+    /// <inheritdoc/>
+    public bool SupportsExactF32PrefixCopy => true;
+
     private readonly nint[] _keys;   // [numLayers] pointers to K buffers
     private readonly nint[] _values; // [numLayers] pointers to V buffers
     private readonly int _numLayers;

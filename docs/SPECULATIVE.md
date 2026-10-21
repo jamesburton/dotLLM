@@ -109,6 +109,10 @@ have not implemented the checkpoint pair yet — `SupportsRecurrentStateCheckpoi
 un-audited model; extending this fix to them is follow-up work if/when they gain a real
 speculative-decoding caller.
 
+LFM2 CPU and Vulkan models also implement this checkpoint pair for short-convolution
+history (#1028), with independent per-sequence KV+convolution prefix snapshots described
+in [KV_CACHE.md](KV_CACHE.md). This does not add an MTP head or per-row snapshots to LFM2.
+
 **An asymmetry between the two decoders, worth knowing before touching either rollback path
 again.** `MtpSpeculativeDecoder` forwards `lastToken` via a separate, always-legitimate "catchup"
 call BEFORE taking its checkpoint, so on rollback only the accepted draft-token prefix needs
