@@ -1,7 +1,10 @@
 using System.Diagnostics;
+using System.Globalization;
+using System.IO.MemoryMappedFiles;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Configuration;
 using DotLLM.Models.Architectures;
+using DotLLM.Models.Gguf;
 using DotLLM.Vulkan.Interop;
 using DotLLM.Vulkan.Kernels;
 
@@ -16,7 +19,9 @@ namespace DotLLM.Vulkan;
 ///   <item><b>Banks</b>: each layer's up / down expert banks are imported <b>zero-copy</b> from the host pointers (the memory-mapped GGUF
 ///   slices; <see cref="VulkanWeightImportPolicy"/>), so on UMA the iGPU reads the very pages the CPU leg reads. A refused import falls
 ///   back to a staged copy within a byte budget and says so in the log; past the budget, or for a bank type the Vulkan expert kernels
-///   cannot read, the layer is refused (<see cref="Supports"/> is false and the caller keeps it on the CPU).</item>
+///   cannot read, the layer is refused (<see cref="Supports"/> is false and the caller keeps it on the CPU). With the GGUF mapped
+///   read-only (the default) drivers refuse the import, so every bank is staged: a second copy in the same RAM
+///   (<see cref="DescribeStagedBanks"/>; the first quiet window on the dev box's Arc, 2026-10-21).</item>
 ///   <item><b>Kernels</b>: the routed-expert kernels of <see cref="VulkanNemotronHTransformerModel"/> (its <c>MoeKernelSet</c>): the
 ///   indexed dp4a MMVQ (or F32) arm for small calls, the expert-grouped MMQ / coopmat prefill from
 ///   <see cref="VulkanNemotronHTransformerModel.MoeGroupedMinTokens"/> rows, the IQ banks of #1057. Recorded through the model's own
@@ -47,9 +52,8 @@ internal sealed unsafe class VulkanNemotronHMoeExpertService : IDisposable
     private readonly HostRows _input, _output, _indices;
     private readonly int _maxRows;
 
-    // The submission in flight (between Begin and End).
-    private int _inFlightRows, _inFlightExpertDim;
-    private long _beginTimestamp;
+    // The submission in flight (between Begin and End), and the fence-before-read rule of End.
+    private readonly FencedHostRows _fenced;
     private bool _disposed;
 
     private readonly record struct LayerBanks(VulkanNemotronHTransformerModel.MoeRoutedBanks Banks, int ExpertDim, NemotronHMoeWeights Host);
@@ -60,7 +64,10 @@ internal sealed unsafe class VulkanNemotronHMoeExpertService : IDisposable
     /// <summary>A short identity of the device for logs and the calibration key (name and Vulkan device type).</summary>
     public string DeviceDescription => $"{_device.DeviceName} (vk type {_device.DeviceType})";
 
-    /// <summary>Most rows (expert, token pairs) one submission may carry.</summary>
+    /// <summary>
+    /// Most rows (expert, token pairs) one submission may carry: the host-visible input / output and the routed scratch are sized
+    /// for it at creation. Size it with <see cref="MaxRowsFor"/>; the service does not split a larger call.
+    /// </summary>
     public int MaxRows => _maxRows;
 
     /// <summary>Banks imported zero-copy.</summary>
@@ -73,13 +80,13 @@ internal sealed unsafe class VulkanNemotronHMoeExpertService : IDisposable
     public long StagedBytes { get; }
 
     /// <summary>Microseconds from the last <see cref="Begin"/> until <see cref="End"/> observed its fence.</summary>
-    public double LastComputeUs { get; private set; }
+    public double LastComputeUs => _fenced.LastComputeUs;
 
     /// <summary>Microseconds the last <see cref="End"/> blocked on the fence.</summary>
-    public double LastWaitUs { get; private set; }
+    public double LastWaitUs => _fenced.LastWaitUs;
 
     /// <summary>True between <see cref="Begin"/> and <see cref="End"/>.</summary>
-    public bool InFlight => _inFlightRows > 0;
+    public bool InFlight => _fenced.InFlight;
 
     private VulkanNemotronHMoeExpertService(VulkanDevice device, bool ownsDevice, string spvDir,
         IReadOnlyList<(int Layer, NemotronHMoeWeights Moe)> layers, int hiddenSize, int maxRows, long stagingBudgetBytes, Action<string> log)
@@ -87,6 +94,7 @@ internal sealed unsafe class VulkanNemotronHMoeExpertService : IDisposable
         _device = device;
         _ownsDevice = ownsDevice;
         _maxRows = maxRows;
+        _fenced = new FencedHostRows(() => _submit!.WaitFence());   // _submit is set below, before any submission
         bool ok = false;
         try
         {
@@ -124,9 +132,8 @@ internal sealed unsafe class VulkanNemotronHMoeExpertService : IDisposable
                             else stagedBanks++;
                         }
                         if (staged > stagedBefore)
-                            log($"MoE iGPU: blk.{layer} expert banks: the zero-copy import was refused " +
-                                $"({VulkanWeightImportPolicy.LastFallbackReason}); staged {(staged - stagedBefore) / (1024.0 * 1024.0):F0} MiB " +
-                                "into device memory instead (a second copy in RAM on a UMA device).");
+                            log(DescribeStagedBanks(layer, VulkanWeightImportPolicy.LastFallbackReason, staged - stagedBefore,
+                                staged, stagingBudgetBytes, GgufFile.MappingAccess == MemoryMappedFileAccess.Read));
                         _bankBuffers.Add(up);
                         _bankBuffers.Add(down);
                         _layers[layer] = new LayerBanks(
@@ -178,7 +185,7 @@ internal sealed unsafe class VulkanNemotronHMoeExpertService : IDisposable
     /// <param name="spvDir">SPIR-V directory.</param>
     /// <param name="layers">The MoE layers (model layer index and CPU-side weights; the banks are read in place).</param>
     /// <param name="hiddenSize">Model hidden size (the expert width of a layer without a latent).</param>
-    /// <param name="maxRows">Most rows one submission carries (block tokens × top-k of the caller).</param>
+    /// <param name="maxRows">Most rows one submission carries: <see cref="MaxRowsFor"/> of the caller's block.</param>
     /// <param name="log">Sink for load notes and refusals.</param>
     /// <param name="stagingBudgetBytes">Bytes a refused import may copy instead; null = <see cref="DefaultStagingBudgetFraction"/> of RAM.</param>
     /// <returns>The service.</returns>
@@ -234,6 +241,53 @@ internal sealed unsafe class VulkanNemotronHMoeExpertService : IDisposable
         }
     }
 
+    /// <summary>
+    /// The <c>maxRows</c> a caller must create the service with to submit any block of up to <paramref name="blockTokens"/> tokens of
+    /// any of <paramref name="layers"/>: tokens × the <b>largest</b> top-k among them. A layer call routes each token to its own
+    /// top-k experts, so its rows are at most <c>tokens · topK(layer)</c>, all of them when every expert of the call runs here.
+    /// Per-layer top-k differs (Bolt's synthetic fixture has 1 to 4), so sizing by one layer's, or by a guess, under-sizes the
+    /// others: 17 tokens at top-k 4 is 68 rows (#1083, the first quiet window's one failure).
+    /// </summary>
+    /// <param name="blockTokens">Most tokens one layer call carries (the caller's MoE block).</param>
+    /// <param name="layers">The MoE layers the service will run.</param>
+    /// <returns>The row capacity (at least 1).</returns>
+    public static int MaxRowsFor(int blockTokens, IEnumerable<NemotronHMoeWeights> layers)
+    {
+        ArgumentNullException.ThrowIfNull(layers);
+        ArgumentOutOfRangeException.ThrowIfLessThan(blockTokens, 1);
+        int topK = 1;
+        foreach (var m in layers) topK = Math.Max(topK, m.NumExpertsPerTok);
+        return checked(blockTokens * topK);
+    }
+
+    /// <summary>
+    /// The load-log line for a layer whose banks were staged because the zero-copy import was refused (#1083): what it costs (on a
+    /// UMA device the staged copy is a second copy of the banks in the same RAM), how much of the staging budget is gone (past
+    /// it, layers are refused and their cold experts stay on the CPU), and, when the GGUF is mapped read-only, the likely cause
+    /// and the remedy: drivers refuse to import read-only pages (#508, measured on gfx1151/amdvlk; the dev box's Arc refused every
+    /// bank at <c>vkAllocateMemory</c>), which <c>DOTLLM_GGUF_MAP_COW=1</c> avoids. Pure.
+    /// </summary>
+    /// <param name="layer">Model layer index.</param>
+    /// <param name="reason">The import policy's fallback reason.</param>
+    /// <param name="layerBytes">Bytes staged for this layer.</param>
+    /// <param name="totalBytes">Bytes staged so far, this layer included.</param>
+    /// <param name="budgetBytes">The staging budget.</param>
+    /// <param name="ggufReadOnly">True when the GGUF is mapped read-only (<see cref="GgufFile.MappingAccess"/>).</param>
+    /// <returns>The line.</returns>
+    internal static string DescribeStagedBanks(int layer, string reason, long layerBytes, long totalBytes, long budgetBytes,
+        bool ggufReadOnly)
+    {
+        const double MiB = 1024.0 * 1024.0;
+        string line = string.Format(CultureInfo.InvariantCulture,
+            "MoE iGPU: blk.{0} expert banks: the zero-copy import was refused ({1}); staged {2:F1} MiB into device memory instead, " +
+            "a second copy in RAM on a UMA device ({3:F0} of {4:F0} MiB staging budget used; past it, layers stay on the CPU).",
+            layer, reason, layerBytes / MiB, totalBytes / MiB, budgetBytes / MiB);
+        if (ggufReadOnly)
+            line += " The GGUF is mapped read-only (the default), and drivers refuse to import read-only pages (#508); " +
+                "DOTLLM_GGUF_MAP_COW=1 maps it copy-on-write, which they accept without a copy.";
+        return line;
+    }
+
     /// <summary>True when the experts of <paramref name="layer"/> can run here (its banks were imported or staged).</summary>
     /// <param name="layer">Model layer index.</param>
     /// <returns>True when supported.</returns>
@@ -285,18 +339,24 @@ internal sealed unsafe class VulkanNemotronHMoeExpertService : IDisposable
     /// <param name="rowTokens">Input row (token) of each row, into <paramref name="inRows"/>.</param>
     /// <param name="inRows">The caller's input rows, <c>[tokens, ExpertDim(layer)]</c> F32.</param>
     /// <exception cref="InvalidOperationException">A submission is already in flight, or the layer is not supported.</exception>
-    /// <exception cref="ArgumentOutOfRangeException">No rows, more than <see cref="MaxRows"/>, or an expert out of range.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// No rows, more than <see cref="MaxRows"/> (the service was created for smaller blocks; see <see cref="MaxRowsFor"/>), or an
+    /// expert out of range.
+    /// </exception>
     public void Begin(int layer, ReadOnlySpan<int> rowExperts, ReadOnlySpan<int> rowTokens, float* inRows)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (InFlight) throw new InvalidOperationException("An iGPU expert submission is already in flight; call End first.");
+        _fenced.ThrowIfInFlight();
         if (!_layers.TryGetValue(layer, out var l))
             throw new InvalidOperationException($"blk.{layer} is not on the iGPU: {RefusalReason(layer) ?? "not an offloaded MoE layer"}.");
         int rows = rowExperts.Length;
-        if (rows < 1 || rows > _maxRows) throw new ArgumentOutOfRangeException(nameof(rowExperts), $"{rows} rows (1..{_maxRows}).");
+        if (rows < 1 || rows > _maxRows)
+            throw new ArgumentOutOfRangeException(nameof(rowExperts),
+                $"{rows} rows (1..{_maxRows}): the service was created for fewer rows per submission than this call carries; " +
+                "create it with MaxRowsFor(block tokens, layers).");
         if (rowTokens.Length != rows) throw new ArgumentException("rowTokens and rowExperts differ in length.", nameof(rowTokens));
 
-        _beginTimestamp = Stopwatch.GetTimestamp();
+        long beginTimestamp = Stopwatch.GetTimestamp();
         int ed = l.ExpertDim, numE = l.Banks.NumExperts;
         int* idx = (int*)_indices.Pointer;
         float* x = (float*)_input.Pointer;
@@ -314,37 +374,18 @@ internal sealed unsafe class VulkanNemotronHMoeExpertService : IDisposable
         Record(cmd, l, rows);
         KernelSupport.ComputeToHostBarrier(cmd);
         _submit.Submit();
-        _inFlightRows = rows;
-        _inFlightExpertDim = ed;
+        _fenced.Submitted(rows, ed, beginTimestamp);
     }
 
     /// <summary>
     /// Waits for the submission of <see cref="Begin"/> and copies its rows, <c>[rows, ExpertDim]</c>, to <paramref name="outRows"/>
-    /// (row r = row r of the <see cref="Begin"/> call). Sets <see cref="LastComputeUs"/> and <see cref="LastWaitUs"/>.
+    /// (row r = row r of the <see cref="Begin"/> call). Sets <see cref="LastComputeUs"/> and <see cref="LastWaitUs"/>. The fence is
+    /// observed before the output is read, and even a failed wait ends the submission (<see cref="FencedHostRows.Collect"/>).
     /// </summary>
     /// <param name="outRows">Destination, at least <c>rows · ExpertDim</c> floats.</param>
     /// <returns>Rows copied.</returns>
     /// <exception cref="InvalidOperationException">Nothing is in flight.</exception>
-    public int End(float* outRows)
-    {
-        if (!InFlight) throw new InvalidOperationException("No iGPU expert submission is in flight.");
-        int rows = _inFlightRows;
-        long w = Stopwatch.GetTimestamp();
-        try
-        {
-            _submit.WaitFence();
-        }
-        finally
-        {
-            // Even a failed wait ends the submission: the next Begin must not see one in flight.
-            _inFlightRows = 0;
-            LastWaitUs = Stopwatch.GetElapsedTime(w).TotalMicroseconds;
-            LastComputeUs = Stopwatch.GetElapsedTime(_beginTimestamp).TotalMicroseconds;
-        }
-        long bytes = (long)rows * _inFlightExpertDim * sizeof(float);
-        Buffer.MemoryCopy(_output.Pointer, outRows, bytes, bytes);
-        return rows;
-    }
+    public int End(float* outRows) => _fenced.Collect((float*)_output.Pointer, outRows);
 
     /// <summary><see cref="Begin"/> then <see cref="End"/>.</summary>
     /// <param name="layer">Model layer index.</param>
@@ -550,8 +591,9 @@ internal sealed unsafe class VulkanNemotronHMoeExpertService : IDisposable
             bytes = Math.Max(bytes, 16);
             if (device.HasExternalMemoryHost && device.PhysicalDeviceTypeValue is VkPhysicalDeviceType.IntegratedGpu)
             {
+                // A whole number of import granules (and at least a page), so the import neither starts nor ends mid-granule.
                 ulong align = Math.Max(4096UL, device.MinImportedHostPointerAlignment);
-                long size = (long)(((ulong)bytes + align - 1) / align * align);
+                long size = (long)HostImportRange.RoundUp((ulong)bytes, align);
                 nint p = (nint)NativeMemory.AlignedAlloc((nuint)size, (nuint)align);
                 new Span<byte>((void*)p, (int)Math.Min(size, int.MaxValue)).Clear();
                 var imported = device.TryWrapHostVisible(p, size);
@@ -591,11 +633,7 @@ internal sealed unsafe class VulkanNemotronHMoeExpertService : IDisposable
 
     private void DisposeCore()
     {
-        if (InFlight)
-        {
-            try { _submit.WaitFence(); } catch (VulkanException) { /* device lost: nothing left to wait for */ }
-            _inFlightRows = 0;
-        }
+        _fenced.DrainForDispose<VulkanException>();
         _input?.Dispose();
         _output?.Dispose();
         _indices?.Dispose();

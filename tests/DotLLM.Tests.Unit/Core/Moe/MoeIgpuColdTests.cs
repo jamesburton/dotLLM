@@ -304,6 +304,38 @@ public sealed class MoeIgpuColdTests : IDisposable
         Assert.Equal(0.3, s.ColdIgpuFraction, 9);
     }
 
+    [Fact]
+    public void TelemetrySummary_NamesTheStagedBanksRamCost_AndSinceKeepsTheGauges()
+    {
+        // Every bank refused (the first quiet window on the dev box's Arc): the summary must say what that costs in RAM.
+        var s = new MoeTelemetrySnapshot(Hits: 1, Misses: 1, Evictions: 0, BytesH2D: 0, CopyWaitMicros: 0, Tokens: 1,
+            CacheSlots: 1, CacheBytes: 1L << 30, Policy: ExpertCachePolicy.Slru, IgpuBanksImported: 2, IgpuBanksStaged: 78,
+            IgpuStagedBytes: 9L << 30);
+        Assert.EndsWith("; iGPU banks staged 78 of 80 (9.0 GiB, a second copy in RAM), 2 zero-copy", s.FormatSummary(),
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("staged", (s with { IgpuBanksStaged = 0, IgpuStagedBytes = 0 }).FormatSummary(), StringComparison.Ordinal);
+
+        // Gauges, like the cache size: an interval keeps the current values instead of subtracting them.
+        var d = s.Since(s with { IgpuBanksStaged = 5, IgpuStagedBytes = 1 });
+        Assert.Equal((2L, 78L, 9L << 30), (d.IgpuBanksImported, d.IgpuBanksStaged, d.IgpuStagedBytes));
+    }
+
+    [Fact]
+    public void Telemetry_SetIgpuBanks_IsSnapshotted()
+    {
+        // (Not ClearCache: it also clears the cache policy, which a CUDA test running alongside may be reading.)
+        try
+        {
+            MoeTelemetry.SetIgpuBanks(3, 77, 12345);
+            var s = MoeTelemetry.Snapshot();
+            Assert.Equal((3L, 77L, 12345L), (s.IgpuBanksImported, s.IgpuBanksStaged, s.IgpuStagedBytes));
+        }
+        finally
+        {
+            MoeTelemetry.SetIgpuBanks(0, 0, 0);
+        }
+    }
+
     // ───────────────────────── device choice ─────────────────────────
 
     private static readonly VulkanPhysicalDeviceInfo Rtx = new(0, "NVIDIA GeForce RTX 3060", DeviceType: 2, VendorId: 0x10DE);

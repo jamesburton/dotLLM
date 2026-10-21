@@ -23,10 +23,15 @@ namespace DotLLM.Core.Moe;
 /// <param name="ColdExpertsIgpu">Routed experts computed on the integrated GPU (#1083).</param>
 /// <param name="IgpuComputeMicros">Wall microseconds of the iGPU legs, from the start of each submission until its fence was observed.</param>
 /// <param name="IgpuWaitMicros">Microseconds the forward thread blocked on an iGPU fence after its own (CPU-leg) work was done.</param>
+/// <param name="IgpuBanksImported">Expert banks of the active iGPU leg imported zero-copy (a gauge, like the cache size).</param>
+/// <param name="IgpuBanksStaged">Expert banks of the active iGPU leg copied into device memory because the import was refused.</param>
+/// <param name="IgpuStagedBytes">
+/// Bytes of those staged banks: on a UMA iGPU, a second copy of them in the same RAM the memory-mapped GGUF already occupies.
+/// </param>
 public readonly record struct MoeTelemetrySnapshot(long Hits, long Misses, long Evictions, long BytesH2D, long CopyWaitMicros,
     long Tokens, long CacheSlots, long CacheBytes, ExpertCachePolicy? Policy, long Routed = 0, long ColdExpertsCpu = 0,
     long CpuComputeMicros = 0, long CpuWaitMicros = 0, long Promotions = 0, long ColdExpertsIgpu = 0, long IgpuComputeMicros = 0,
-    long IgpuWaitMicros = 0)
+    long IgpuWaitMicros = 0, long IgpuBanksImported = 0, long IgpuBanksStaged = 0, long IgpuStagedBytes = 0)
 {
     /// <summary>Share of routed experts computed on the CPU (0 when none were routed).</summary>
     public double ColdCpuFraction => Routed == 0 ? 0 : (double)ColdExpertsCpu / Routed;
@@ -62,8 +67,9 @@ public readonly record struct MoeTelemetrySnapshot(long Hits, long Misses, long 
     /// The one-line summary printed by <c>bench</c> and <c>run --verbose</c>, e.g.
     /// <c>MoE offload: cache 6.1 GiB (812 slots, SLRU), hit 81.2%, H2D 71.3 MB/token, copy wait 9.8 ms/token</c>, followed by
     /// <c>; cold: CPU 41% of routed, CPU wait 3.2 ms/token, promotions 12</c> when a CPU leg ran (#1071), and
-    /// <c>; iGPU 30% of routed, iGPU compute 4.1 ms/token, iGPU wait 0.6 ms/token</c> when an iGPU leg ran (#1083); null when no
-    /// offloaded model is active.
+    /// <c>; iGPU 30% of routed, iGPU compute 4.1 ms/token, iGPU wait 0.6 ms/token</c> when an iGPU leg ran (#1083), and
+    /// <c>; iGPU banks staged 80 of 80 (9.2 GiB, a second copy in RAM), 0 zero-copy</c> when the iGPU leg holds staged banks; null
+    /// when no offloaded model is active.
     /// </summary>
     /// <returns>The line, or null.</returns>
     public string? FormatSummary()
@@ -81,6 +87,9 @@ public readonly record struct MoeTelemetrySnapshot(long Hits, long Misses, long 
         if (ColdExpertsIgpu > 0)
             line += string.Format(c, "; iGPU {0:F0}% of routed, iGPU compute {1:F1} ms/token, iGPU wait {2:F1} ms/token",
                 ColdIgpuFraction * 100, IgpuComputeMicros / 1000.0 / perToken, IgpuWaitMicros / 1000.0 / perToken);
+        if (IgpuBanksStaged > 0)
+            line += string.Format(c, "; iGPU banks staged {0} of {1} ({2:F1} GiB, a second copy in RAM), {3} zero-copy",
+                IgpuBanksStaged, IgpuBanksStaged + IgpuBanksImported, IgpuStagedBytes / (1024.0 * 1024 * 1024), IgpuBanksImported);
         return line;
     }
 }
@@ -98,6 +107,7 @@ public static class MoeTelemetry
     private static long s_hits, s_misses, s_evictions, s_bytesH2D, s_copyWaitMicros, s_tokens, s_cacheSlots, s_cacheBytes;
     private static long s_routed, s_coldCpu, s_cpuComputeMicros, s_cpuWaitMicros, s_promotions;
     private static long s_coldIgpu, s_igpuComputeMicros, s_igpuWaitMicros;
+    private static long s_igpuBanksImported, s_igpuBanksStaged, s_igpuStagedBytes;
     private static int s_policy = -1;
 
     private static readonly Meter s_meter = new(MeterName);
@@ -117,6 +127,9 @@ public static class MoeTelemetry
     private static readonly ObservableCounter<long> s_coldIgpuC = s_meter.CreateObservableCounter("dotllm.moe.cold_experts_igpu", () => Volatile.Read(ref s_coldIgpu), "experts");
     private static readonly ObservableCounter<long> s_igpuComputeC = s_meter.CreateObservableCounter("dotllm.moe.igpu_compute_us", () => Volatile.Read(ref s_igpuComputeMicros), "us");
     private static readonly ObservableCounter<long> s_igpuWaitC = s_meter.CreateObservableCounter("dotllm.moe.igpu_wait_us", () => Volatile.Read(ref s_igpuWaitMicros), "us");
+    private static readonly ObservableGauge<long> s_igpuImportedG = s_meter.CreateObservableGauge("dotllm.moe.igpu_banks_imported", () => Volatile.Read(ref s_igpuBanksImported), "banks");
+    private static readonly ObservableGauge<long> s_igpuStagedG = s_meter.CreateObservableGauge("dotllm.moe.igpu_banks_staged", () => Volatile.Read(ref s_igpuBanksStaged), "banks");
+    private static readonly ObservableGauge<long> s_igpuStagedBytesG = s_meter.CreateObservableGauge("dotllm.moe.igpu_staged_bytes", () => Volatile.Read(ref s_igpuStagedBytes), "By");
 
     /// <summary>Records one layer call's lookups.</summary>
     /// <param name="hits">Experts found resident.</param>
@@ -201,12 +214,27 @@ public static class MoeTelemetry
         Volatile.Write(ref s_policy, (int)policy);
     }
 
-    /// <summary>Clears the active-cache gauges (the offloaded model was disposed).</summary>
+    /// <summary>
+    /// Publishes the expert banks of the active iGPU leg (#1083): how many were imported zero-copy and how many staged, with the
+    /// staged bytes. On a UMA iGPU every staged byte is RAM spent twice (the mapped GGUF and the copy); zeros when no leg is open.
+    /// </summary>
+    /// <param name="imported">Banks imported zero-copy.</param>
+    /// <param name="staged">Banks staged because the import was refused.</param>
+    /// <param name="stagedBytes">Bytes of the staged banks.</param>
+    public static void SetIgpuBanks(long imported, long staged, long stagedBytes)
+    {
+        Volatile.Write(ref s_igpuBanksImported, imported);
+        Volatile.Write(ref s_igpuBanksStaged, staged);
+        Volatile.Write(ref s_igpuStagedBytes, stagedBytes);
+    }
+
+    /// <summary>Clears the active-cache gauges and the iGPU bank gauges (the offloaded model was disposed).</summary>
     public static void ClearCache()
     {
         Volatile.Write(ref s_cacheSlots, 0);
         Volatile.Write(ref s_cacheBytes, 0);
         Volatile.Write(ref s_policy, -1);
+        SetIgpuBanks(0, 0, 0);
     }
 
     /// <summary>Current totals.</summary>
@@ -219,13 +247,14 @@ public static class MoeTelemetry
             Volatile.Read(ref s_cacheSlots), Volatile.Read(ref s_cacheBytes), p < 0 ? null : (ExpertCachePolicy)p,
             Volatile.Read(ref s_routed), Volatile.Read(ref s_coldCpu), Volatile.Read(ref s_cpuComputeMicros),
             Volatile.Read(ref s_cpuWaitMicros), Volatile.Read(ref s_promotions), Volatile.Read(ref s_coldIgpu),
-            Volatile.Read(ref s_igpuComputeMicros), Volatile.Read(ref s_igpuWaitMicros));
+            Volatile.Read(ref s_igpuComputeMicros), Volatile.Read(ref s_igpuWaitMicros), Volatile.Read(ref s_igpuBanksImported),
+            Volatile.Read(ref s_igpuBanksStaged), Volatile.Read(ref s_igpuStagedBytes));
     }
 
     /// <summary>Keeps the instrument fields referenced (they are observed through the meter, never read directly).</summary>
     internal static int InstrumentCount => new object[]
     {
         s_hitsC, s_missC, s_evictC, s_bytesC, s_waitC, s_slotsG, s_bytesG, s_coldCpuC, s_cpuComputeC, s_cpuWaitC, s_promoC,
-        s_coldIgpuC, s_igpuComputeC, s_igpuWaitC,
+        s_coldIgpuC, s_igpuComputeC, s_igpuWaitC, s_igpuImportedG, s_igpuStagedG, s_igpuStagedBytesG,
     }.Length;
 }

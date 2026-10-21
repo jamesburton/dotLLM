@@ -28,10 +28,14 @@ namespace DotLLM.Cuda.Architectures;
 /// <param name="CostModel">The calibrated cost model, or null.</param>
 /// <param name="IgpuDevice">The integrated GPU of the iGPU cold leg (#1083), or null when there is none.</param>
 /// <param name="IgpuLayers">Offloaded MoE layers whose experts the iGPU can run (its banks were imported or staged).</param>
+/// <param name="IgpuImportedBanks">iGPU expert banks imported zero-copy.</param>
+/// <param name="IgpuStagedBanks">iGPU expert banks staged because the import was refused.</param>
+/// <param name="IgpuStagedBytes">Bytes of the staged banks: on a UMA iGPU, a second copy in RAM.</param>
 public sealed record CudaMoeOffloadInfo(long CacheBytes, int CacheSlots, int Pools, ExpertCachePolicy Policy, bool PinnedStore,
     long StoreBytes, long BudgetBytes, bool RequestClamped, long ReserveBytes, long FreeBytesAfterLoad, int ArenaWaveExperts,
     long ArenaBytes, int SpillRetries, MoeColdMode Cold = MoeColdMode.Copy, int CpuThreads = 0, int StaticCpuLayers = 0,
-    MoeCostModel? CostModel = null, string? IgpuDevice = null, int IgpuLayers = 0);
+    MoeCostModel? CostModel = null, string? IgpuDevice = null, int IgpuLayers = 0, int IgpuImportedBanks = 0,
+    int IgpuStagedBanks = 0, long IgpuStagedBytes = 0);
 
 /// <summary>
 /// Routed-expert offload for <c>nemotron_h_moe</c> on CUDA (issue #1070; design #1063 sections 8b and 8d, and the addendum's
@@ -402,6 +406,9 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
                     CostModel = state.Cost,
                     IgpuDevice = state.IgpuLeg?.DeviceDescription,
                     IgpuLayers = state.IgpuLeg is { } ig ? Enumerable.Range(0, layers).Count(ig.Supports) : 0,
+                    IgpuImportedBanks = state.IgpuLeg?.ImportedBanks ?? 0,
+                    IgpuStagedBanks = state.IgpuLeg?.StagedBanks ?? 0,
+                    IgpuStagedBytes = state.IgpuLeg?.StagedBytes ?? 0,
                 };
                 return state;
             }
@@ -952,6 +959,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
                 // Auto fell back to copy: nothing will ever run on the iGPU.
                 IgpuLeg.Dispose();
                 IgpuLeg = null;
+                MoeTelemetry.SetIgpuBanks(0, 0, 0);
             }
             if (_layouts.Length == 0 && Cold != MoeColdMode.Copy) Cold = MoeColdMode.Cpu;   // --cpu-moe: nothing is ever cached
             log($"MoE cold experts: {MoeOffloadOptions.FormatCold(Cold)} mode, {threads} CPU thread(s)" +
@@ -981,7 +989,9 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
             var layers = new List<(int Layer, NemotronHMoeWeights Moe)>();
             for (int l = 0; l < cpuLayers.Length; l++)
                 if (cpuLayers[l].Moe is { } m && _poolOfLayer[l] >= 0) layers.Add((l, m));
-            int maxRows = Math.Max(1, model._moeScratchTokens * Math.Max(1, model._moeSpec.TopK));
+            // Every layer call is a block of at most _moeScratchTokens tokens (ForwardMoeBody), and its iGPU rows are a subset of its
+            // tokens x top-k slots, so this capacity covers any call; Begin refuses (it does not split) a larger one.
+            int maxRows = VulkanNemotronHMoeExpertService.MaxRowsFor(Math.Max(1, model._moeScratchTokens), layers.Select(l => l.Moe));
 
             string reason;
             VulkanNemotronHMoeExpertService? leg;
@@ -1025,8 +1035,10 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
             IgpuRowExperts = new int[leg.MaxRows];
             IgpuRowTokens = new int[leg.MaxRows];
             int supported = layers.Count(l => leg.Supports(l.Layer));
+            MoeTelemetry.SetIgpuBanks(leg.ImportedBanks, leg.StagedBanks, leg.StagedBytes);
             log($"MoE iGPU: {leg.DeviceDescription} ({reason}); {supported} of {layers.Count} offloaded MoE layer(s), " +
-                $"{leg.ImportedBanks} bank(s) imported zero-copy, {leg.StagedBanks} staged ({leg.StagedBytes / (1024.0 * 1024.0):F0} MiB).");
+                $"{leg.ImportedBanks} bank(s) imported zero-copy, {leg.StagedBanks} staged ({leg.StagedBytes / (1024.0 * 1024.0):F0} MiB" +
+                (leg.StagedBanks > 0 ? ", a second copy of those banks in RAM on a UMA iGPU" : "") + ").");
         }
 
         private nint ArenaSlot(int bypassIndex)

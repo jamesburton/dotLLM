@@ -135,8 +135,12 @@ public sealed unsafe class VulkanNemotronHMoeExpertServiceTests(ITestOutputHelpe
                         if (cpu.LayerWeights[l].Moe is { } m) layers.Add((l, m));
                     Assert.Equal(4, layers.Count);
 
+                    // Sized as production sizes it (#1083): the largest block below, at the largest per-layer top-k (the IQ2_XXS
+                    // layer's 4: 17 x 4 = 68 rows; a fixed 64 failed in the first quiet window).
+                    int[] blockTokens = [1, 3, 17];
+                    int maxRows = VulkanNemotronHMoeExpertService.MaxRowsFor(blockTokens.Max(), layers.Select(l => l.Item2));
                     using var service = VulkanNemotronHMoeExpertService.Create(device, ownsDevice: false, spvDir, layers, config.HiddenSize,
-                        maxRows: 64, log: output.WriteLine);
+                        maxRows, log: output.WriteLine);
                     foreach (var (layer, moe) in layers)
                     {
                         if (!service.Supports(layer))
@@ -148,7 +152,7 @@ public sealed unsafe class VulkanNemotronHMoeExpertServiceTests(ITestOutputHelpe
                         }
                         int ed = NemotronHMoeExpertCompute.ExpertDim(moe, config.HiddenSize);
                         Assert.Equal(ed, service.ExpertDim(layer));
-                        foreach (int tokens in new[] { 1, 3, 17 })
+                        foreach (int tokens in blockTokens)
                         {
                             float* x = Floats(tokens * ed, seed: layer * 100 + tokens);
                             int rows = tokens * moe.NumExpertsPerTok;
