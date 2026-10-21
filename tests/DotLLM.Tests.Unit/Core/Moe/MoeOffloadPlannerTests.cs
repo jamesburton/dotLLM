@@ -98,6 +98,19 @@ public sealed class MoeOffloadPlannerTests
     }
 
     [Fact]
+    public void FitsPinCommit_LeavesTheReserveFree_AndAllowsAnUnknownCommit()
+    {
+        // #1083: AD-Q4_K_M's 40.17 GiB store passed the RAM fraction on the 96 GB dev box (43 GiB) but other processes had ~57 GB
+        // committed of a 111.5 GB limit; pinning it exhausted the commit mid-run.
+        long store = (long)(40.17 * GiB);
+        Assert.False(MoeOffloadPlanner.FitsPinCommit(store, (long)(42.5 * GiB)));   // the dev box at load: fits RAM, not commit
+        Assert.True(MoeOffloadPlanner.FitsPinCommit(16 * GiB, (long)(42.5 * GiB)));  // NVIDIA Bolt's 16 GiB store on the same box
+        Assert.True(MoeOffloadPlanner.FitsPinCommit(store, store + MoeOffloadPlanner.PinCommitReserveBytes));   // exactly the reserve left
+        Assert.False(MoeOffloadPlanner.FitsPinCommit(store, store + MoeOffloadPlanner.PinCommitReserveBytes - 1));
+        Assert.True(MoeOffloadPlanner.FitsPinCommit(store, 0));   // unknown commit (non-Windows): the RAM fraction decides alone
+    }
+
+    [Fact]
     public void Options_FromCli_ExplicitValuesWin_UnsetValuesFallBackToEnvironment()
     {
         var env = new Dictionary<string, string>(StringComparer.Ordinal)

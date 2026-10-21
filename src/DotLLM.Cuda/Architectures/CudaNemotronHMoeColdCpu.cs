@@ -109,7 +109,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
             if (off.CpuGroups > 0)
             {
                 long t0 = Stopwatch.GetTimestamp();
-                off.CpuLeg!.Run(moe.Host, expertDim, topK, _moeGroupExperts, firstCold, firstIgpu, groupStart, slotIds,
+                off.CpuLeg!.Run(off.ColdWeights(moe.LayerIndex)!, expertDim, topK, _moeGroupExperts, firstCold, firstIgpu, groupStart, slotIds,
                     ColdInputRows, outRows);
                 MoeTelemetry.RecordCpuCompute((long)Stopwatch.GetElapsedTime(t0).TotalMicroseconds);
             }
@@ -277,7 +277,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
     /// layout at n = 1 and 8, and with an iGPU leg (#1083) its empty-submission round trip and one-expert submissions at n = 1 and 8),
     /// written back to the cache. Null when it cannot be measured (the caller then copies every miss).
     /// </summary>
-    private MoeCostModel? CalibrateMoeCold(NemotronHLayerWeights[] cpuLayers, MoeOffloadOptions options, int cpuThreads,
+    private MoeCostModel? CalibrateMoeCold(IReadOnlyList<NemotronHMoeWeights?> coldWeights, MoeOffloadOptions options, int cpuThreads,
         nint copyStream, VulkanNemotronHMoeExpertService? igpu, Action<string> log)
     {
         if (options.CostModelOverride is { } fixedModel)
@@ -288,9 +288,9 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
 
         // One representative expert per layout: the first layer that has it (for the iGPU, the first layer whose banks it holds).
         var samples = new List<(ExpertLayout Layout, NemotronHMoeWeights Moe, int IgpuLayer)>();
-        for (int li = 0; li < cpuLayers.Length; li++)
+        for (int li = 0; li < coldWeights.Count; li++)
         {
-            if (cpuLayers[li].Moe is not { } m) continue;
+            if (coldWeights[li] is not { } m) continue;
             var layout = new ExpertLayout(m.UpPerExpertBytes, m.DownPerExpertBytes);
             int at = samples.FindIndex(s => s.Layout == layout);
             int igpuLayer = igpu is not null && igpu.Supports(li) ? li : -1;

@@ -237,6 +237,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
         private readonly int[] _poolOfLayer;
         private readonly nint[] _poolBase;
         private readonly nint[] _upHost, _downHost;     // per layer: host base of the up / down bank (pinned copy or mmap)
+        private NemotronHMoeWeights?[] _coldWeights = [];   // per layer: the weights the CPU / iGPU cold legs read (see ColdWeights)
         private readonly List<nint> _pinned = [];
         private StagingRing? _ring;
         private nint _arena;
@@ -286,6 +287,17 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
 
         /// <summary>Where uncached experts run (copy when auto could not calibrate).</summary>
         public MoeColdMode Cold { get; private set; }
+
+        /// <summary>
+        /// The weights the cold legs (CPU and iGPU) and the calibration read for <paramref name="layer"/>, or null for a non-MoE layer.
+        /// With a pinned store their routed banks are the pinned copy, not the memory-mapped GGUF: reading the mmap there would page a
+        /// second copy of every bank the CPU touches into RAM (and make the iGPU stage a third), where the pinned copy is resident anyway
+        /// and, being private read-write memory, is also what an iGPU can import zero-copy. Static CPU layers and a mmap store keep the
+        /// GGUF's banks, which are then the only copy.
+        /// </summary>
+        /// <param name="layer">Layer index.</param>
+        /// <returns>The layer's cold-leg weights.</returns>
+        public NemotronHMoeWeights? ColdWeights(int layer) => _coldWeights[layer];
 
         /// <summary>The CPU leg's workers, or null when no layer can use the CPU.</summary>
         public CpuColdLeg? CpuLeg { get; private set; }
@@ -377,9 +389,21 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
             var layouts = layoutList.ToArray();
             int waveExperts = Math.Max(1, MoeArenaWaveExpertsOverride ?? maxTopK);
 
-            // Host store: one pinned copy when it fits the pin budget, else a pinned staging ring over the mmap.
+            // Host store: one pinned copy when it fits the pin budget and the remaining commit, else a pinned staging ring over the mmap.
             long ram = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
             bool pin = MoeOffloadPlanner.FitsPinBudget(storeBytes, ram, options.PinBudgetFraction);
+            if (pin)
+            {
+                long commit = RepackBudget.QueryAvailableCommitBytes();
+                if (!MoeOffloadPlanner.FitsPinCommit(storeBytes, commit))
+                {
+                    pin = false;
+                    log(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                        "MoE offload: a pinned copy of the {0:F2} GiB expert store would leave less than {1} GiB of the machine's {2:F1} GiB " +
+                        "remaining commit; streaming the experts from the memory-mapped file instead (one copy, no commit).",
+                        storeBytes / (double)(1L << 30), MoeOffloadPlanner.PinCommitReserveBytes >> 30, commit / (double)(1L << 30)));
+                }
+            }
             MoeOffloadState? state = null;
             try
             {
@@ -391,9 +415,10 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
                     state._ring = new StagingRing(StagingChunks, StagingChunkBytes);
                     state.UseMmapStore(cpuLayers, options);
                 }
+                state._coldWeights = state.BuildColdWeights(cpuLayers, pin, options);
 
                 CudaDriverApi.cuStreamCreate(out state._copyStream, CudaDriverApi.CU_STREAM_NON_BLOCKING).ThrowOnError();
-                state.SetUpColdExperts(model, cpuLayers, options, staticCpu, log);
+                state.SetUpColdExperts(model, options, staticCpu, log);
                 state.AllocateCache(model, options, layouts, expertsPerLayout.ToArray(), expertsPerLayer, poolOfLayer,
                     storeBytes, pin, log);
                 if (state.Cold != MoeColdMode.Copy)
@@ -442,12 +467,31 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
             }
         }
 
+        /// <summary>
+        /// Copies one bank into page-locked memory, then drops the GGUF pages it just read from this process's working set. Every
+        /// reader uses the pinned copy from here on (<see cref="ColdWeights"/>), so leaving them would hold the bank twice: on a 40 GiB
+        /// AD-Q4_K_M store the load reached a 60 GiB working set before the drop was per bank. The pages only move to the standby cache,
+        /// so the mmap store that takes over after a failed pin re-reads them cheaply.
+        /// </summary>
         private nint PinCopy(nint src, long bytes)
         {
             CudaDriverApi.cuMemHostAlloc(out nint p, (nuint)bytes, 0).ThrowOnError();
             _pinned.Add(p);
             Buffer.MemoryCopy((void*)src, (void*)p, bytes, bytes);
+            VulkanWeightReadAhead.ReleaseSource(src, bytes);
             return p;
+        }
+
+        /// <summary>Per layer, the weights of <see cref="ColdWeights"/>: rebased onto the pinned banks when <paramref name="pinned"/>.</summary>
+        private NemotronHMoeWeights?[] BuildColdWeights(NemotronHLayerWeights[] cpuLayers, bool pinned, MoeOffloadOptions options)
+        {
+            var cold = new NemotronHMoeWeights?[cpuLayers.Length];
+            for (int l = 0; l < cpuLayers.Length; l++)
+            {
+                if (cpuLayers[l].Moe is not { } m) continue;
+                cold[l] = pinned && !options.IsStaticCpuLayer(l) ? m.WithExpertBanks(_upHost[l], _downHost[l]) : m;
+            }
+            return cold;
         }
 
         private void UseMmapStore(NemotronHLayerWeights[] cpuLayers, MoeOffloadOptions options)
@@ -934,18 +978,17 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
         /// iGPU leg's fallback), the iGPU leg when the mode may use one, and in every mode but copy the cost model (calibrated or
         /// cached). Auto without a cost model falls back to copy; cpu+igpu without one to igpu.
         /// </summary>
-        private void SetUpColdExperts(CudaNemotronHTransformerModel model, NemotronHLayerWeights[] cpuLayers,
-            MoeOffloadOptions options, int staticCpu, Action<string> log)
+        private void SetUpColdExperts(CudaNemotronHTransformerModel model, MoeOffloadOptions options, int staticCpu, Action<string> log)
         {
             bool anyCpu = staticCpu > 0 || Cold != MoeColdMode.Copy;
             if (!anyCpu) return;
             int threads = options.EffectiveCpuThreads;
             CpuLeg = new CpuColdLeg(threads);
             if (options.MayUseIgpuLeg && _layouts.Length > 0)
-                SetUpIgpuLeg(model, cpuLayers, options, log);
+                SetUpIgpuLeg(model, options, log);
             if (Cold != MoeColdMode.Copy && _layouts.Length > 0)
             {
-                Cost = model.CalibrateMoeCold(cpuLayers, options, threads, _copyStream, IgpuLeg, log);
+                Cost = model.CalibrateMoeCold(_coldWeights, options, threads, _copyStream, IgpuLeg, log);
                 if (Cost is null && Cold == MoeColdMode.Auto) Cold = MoeColdMode.Copy;
                 if (Cost is null && Cold == MoeColdMode.CpuIgpu)
                 {
@@ -979,16 +1022,17 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
         /// non-static MoE layer imported zero-copy. In auto mode a missing iGPU, a failure, or a fixed cost model without iGPU costs
         /// just means no iGPU leg; <c>igpu</c> and <c>cpu+igpu</c> fail the load instead.
         /// </summary>
-        private void SetUpIgpuLeg(CudaNemotronHTransformerModel model, NemotronHLayerWeights[] cpuLayers, MoeOffloadOptions options,
-            Action<string> log)
+        private void SetUpIgpuLeg(CudaNemotronHTransformerModel model, MoeOffloadOptions options, Action<string> log)
         {
             bool required = options.RequiresIgpuLeg;
             if (!required && options.CostModelOverride is { HasIgpu: false })
                 return;   // a caller-fixed cost model that never puts anything on an iGPU: do not touch one
 
             var layers = new List<(int Layer, NemotronHMoeWeights Moe)>();
-            for (int l = 0; l < cpuLayers.Length; l++)
-                if (cpuLayers[l].Moe is { } m && _poolOfLayer[l] >= 0) layers.Add((l, m));
+            // The cold-leg weights: with a pinned store the iGPU imports the pinned banks (private memory, which it accepts zero-copy)
+            // rather than the read-only mmap (which it refuses, and would then stage as another copy).
+            for (int l = 0; l < _coldWeights.Length; l++)
+                if (_coldWeights[l] is { } m && _poolOfLayer[l] >= 0) layers.Add((l, m));
             // Every layer call is a block of at most _moeScratchTokens tokens (ForwardMoeBody), and its iGPU rows are a subset of its
             // tokens x top-k slots, so this capacity covers any call; Begin refuses (it does not split) a larger one.
             int maxRows = VulkanNemotronHMoeExpertService.MaxRowsFor(Math.Max(1, model._moeScratchTokens), layers.Select(l => l.Moe));
@@ -1207,6 +1251,8 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
             _promotionsInFlight.Clear();
             foreach (nint e in _promotionEventsFree) CudaDriverApi.cuEventDestroy_v2(e);
             _promotionEventsFree.Clear();
+
+            // Order matters: the iGPU leg may have imported the pinned banks zero-copy (ColdWeights), so it goes before they are freed.
             IgpuLeg?.Dispose();
             IgpuLeg = null;
             CpuLeg?.Dispose();

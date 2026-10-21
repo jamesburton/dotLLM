@@ -145,4 +145,20 @@ public static class MoeOffloadPlanner
     /// <returns>True to pin the whole store.</returns>
     public static bool FitsPinBudget(long offloadedBytes, long physicalRamBytes, double pinBudgetFraction)
         => physicalRamBytes > 0 && offloadedBytes <= physicalRamBytes * pinBudgetFraction;
+
+    /// <summary>Commit the process must still have after pinning the store (the rest of the load, the forward, the GC heap).</summary>
+    public const long PinCommitReserveBytes = 4L << 30;
+
+    /// <summary>
+    /// Whether the pinned store also fits the machine's remaining commit (#1083). Pinned memory is committed private memory, so on a
+    /// busy box a store well inside the RAM fraction can still exhaust the commit limit: AD-Q4_K_M's 40 GiB store on the 96 GB dev
+    /// box with 57 GB already committed by other processes ran out mid-run (a managed <see cref="OutOfMemoryException"/>). Without the
+    /// copy the banks stream from the mmap through the staging ring, which costs no commit and keeps a single copy.
+    /// </summary>
+    /// <param name="offloadedBytes">Total bytes of the offloaded expert banks.</param>
+    /// <param name="availableCommitBytes">The OS's remaining commit (Windows <c>ullAvailPageFile</c>); <c>&lt;= 0</c> = unknown.</param>
+    /// <param name="reserveBytes">Commit to leave free after pinning.</param>
+    /// <returns>True when the store fits, or when the remaining commit is unknown.</returns>
+    public static bool FitsPinCommit(long offloadedBytes, long availableCommitBytes, long reserveBytes = PinCommitReserveBytes)
+        => availableCommitBytes <= 0 || offloadedBytes <= availableCommitBytes - reserveBytes;
 }

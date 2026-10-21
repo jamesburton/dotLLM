@@ -95,6 +95,42 @@ internal sealed class NemotronHMoeWeights
 
     /// <summary>Whether the routed experts run in a latent space (issue #1037).</summary>
     public bool HasLatent => LatentSize > 0;
+
+    /// <summary>
+    /// A copy of these weights whose routed expert banks live at <paramref name="upExps"/> / <paramref name="downExps"/>, with every
+    /// other field unchanged. The CUDA MoE offload (#1083) uses it to point the CPU and iGPU cold legs at its pinned copy of the banks
+    /// instead of the memory-mapped GGUF, so the banks are resident once rather than twice.
+    /// </summary>
+    /// <param name="upExps">Base of a byte-identical copy of the <see cref="UpExpsWeight"/> bank.</param>
+    /// <param name="downExps">Base of a byte-identical copy of the <see cref="DownExpsWeight"/> bank.</param>
+    /// <returns>The rebased copy; this instance is not modified.</returns>
+    public NemotronHMoeWeights WithExpertBanks(nint upExps, nint downExps) => new()
+    {
+        GateInpWeight = GateInpWeight,
+        GateInpQuantType = GateInpQuantType,
+        SelectionBias = SelectionBias,
+        UpExpsWeight = upExps,
+        UpExpsQuantType = UpExpsQuantType,
+        UpPerExpertBytes = UpPerExpertBytes,
+        DownExpsWeight = downExps,
+        DownExpsQuantType = DownExpsQuantType,
+        DownPerExpertBytes = DownPerExpertBytes,
+        UpShexpWeight = UpShexpWeight,
+        UpShexpQuantType = UpShexpQuantType,
+        DownShexpWeight = DownShexpWeight,
+        DownShexpQuantType = DownShexpQuantType,
+        NumExperts = NumExperts,
+        NumExpertsPerTok = NumExpertsPerTok,
+        MoeIntermediateSize = MoeIntermediateSize,
+        SharedIntermediateSize = SharedIntermediateSize,
+        NormalizeWeights = NormalizeWeights,
+        WeightsScale = WeightsScale,
+        LatentSize = LatentSize,
+        LatentDownWeight = LatentDownWeight,
+        LatentDownQuantType = LatentDownQuantType,
+        LatentUpWeight = LatentUpWeight,
+        LatentUpQuantType = LatentUpQuantType,
+    };
 }
 
 /// <summary>

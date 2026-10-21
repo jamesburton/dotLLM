@@ -92,6 +92,7 @@ public sealed class CudaNemotronHMoeColdIgpuTests : IDisposable
                 $"promotions {cache.Promotions}, CPU {tel.ColdExpertsCpu} / iGPU {tel.ColdExpertsIgpu} of {tel.Routed}; {tel.FormatSummary()}");
 
             CudaNemotronHMoeColdCpuTests.AssertSameSelection(_output, residentTrace, coldTrace);
+            AssertPinnedBanksImportedZeroCopy(info);
             Assert.True(tel.ColdExpertsIgpu > 0, "no expert ran on the iGPU");
             if (cold == MoeColdMode.CpuIgpu) Assert.True(tel.ColdExpertsCpu > 0, "cpu+igpu never used the CPU leg");
             // igpu: only the layers the iGPU refused (none on a device with integer dot product) fall back to the CPU.
@@ -109,6 +110,20 @@ public sealed class CudaNemotronHMoeColdIgpuTests : IDisposable
             CudaNemotronHTransformerModel.MoeBlockTokens = savedBlock;
             CudaNemotronHTransformerModel.MoeRoutingTraceHook = null;
         }
+    }
+
+    /// <summary>
+    /// With a pinned host store the iGPU must import the pinned banks, not the mmap (#1083 window 2): the pinned copy is private
+    /// read-write memory, which the Arc imports zero-copy, whereas the default read-only GGUF mapping is refused and staged, a third copy
+    /// of the banks in RAM. So every bank of every iGPU layer is imported and none is staged, whatever the GGUF's mapping mode.
+    /// </summary>
+    /// <param name="info">The offloaded model's info.</param>
+    internal static void AssertPinnedBanksImportedZeroCopy(CudaMoeOffloadInfo info)
+    {
+        if (!info.PinnedStore) return;
+        Assert.Equal(0, info.IgpuStagedBanks);
+        Assert.Equal(0L, info.IgpuStagedBytes);
+        Assert.Equal(2 * info.IgpuLayers, info.IgpuImportedBanks);
     }
 
     /// <summary>
@@ -174,6 +189,7 @@ public sealed class CudaNemotronHMoeColdIgpuTests : IDisposable
             _output.WriteLine($"{MoeOffloadOptions.FormatCold(cold)} block {blockTokens}: iGPU {info.IgpuDevice} ({info.IgpuLayers} layers), " +
                 $"{info.CacheSlots} slots, hits {cache.Hits}, cold {cache.ColdMisses}; {tel.FormatSummary()}");
             Assert.NotNull(info.IgpuDevice);
+            AssertPinnedBanksImportedZeroCopy(info);
             Assert.True(tel.ColdExpertsIgpu > 0 || cold == MoeColdMode.CpuIgpu, "no expert ran on the iGPU");
             Assert.True(tel.ColdExpertsIgpu + tel.ColdExpertsCpu > 0, "nothing ran cold");
 
