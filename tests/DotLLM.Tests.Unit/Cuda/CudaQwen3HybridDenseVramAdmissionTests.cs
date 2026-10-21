@@ -59,10 +59,13 @@ public sealed class CudaQwen3HybridDenseVramAdmissionTests : IDisposable
     {
         // The F32 staging pair (and, for quantized KV, the F16 dequant scratch) is sized seqKv * kvElems and grew with no check.
         // The synthetic model's head_dim is 16, so its prefill takes the F32 staging tier.
+        // The free-VRAM override is a fixed figure, so the KV must cost less than the staging: the copying KV (exact bytes) does,
+        // the in-place KV (whole 2 MiB pages, issue #1080) does not.
         using var l = Load(withMtp: false);
         var model = l.Model;
+        model.UseCopyingKvGrowthForTest();
         using var kv = model.CreateKvCache(16);
-        CudaQwen3HybridDenseTransformerModel.FreeVramOverride = Reserve + model.KvStorageGrowthBytes(16) + 1024;   // #1080: what the KV adds
+        CudaQwen3HybridDenseTransformerModel.FreeVramOverride = Reserve + model.ComputeKvBytes(16) + 1024;
         var ex = Assert.Throws<DeviceMemoryAdmissionException>(
             () => model.Forward([1, 4, 7], [0, 1, 2], deviceId: -1, kv, lastTokenLogitsOnly: true));
         Assert.Contains("F32 attention staging", ex.Message);
