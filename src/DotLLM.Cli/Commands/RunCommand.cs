@@ -228,9 +228,14 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         [Description(DotLLM.Core.Moe.MoeOffloadOptions.ContextHelp)]
         public int? CtxSize { get; set; }
 
-        /// <summary>The raw MoE offload option values (issues #1070, #1071).</summary>
+        /// <summary>Vulkan device of the MoE iGPU cold leg (issue #1083).</summary>
+        [CommandOption(MoeOffloadCli.IgpuDeviceOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.IgpuDeviceHelp)]
+        public string? MoeIgpuDevice { get; set; }
+
+        /// <summary>The raw MoE offload option values (issues #1070, #1071, #1083).</summary>
         public DotLLM.Core.Moe.MoeCliValues MoeValues => new(MoeOffload, MoeCacheMib, MoeCachePolicy, MoeCold, MoeCpuThreads,
-            CpuMoe, NCpuMoe, MoeCalibrate, CtxSize);
+            CpuMoe, NCpuMoe, MoeCalibrate, CtxSize, MoeIgpuDevice);
 
         /// <summary>Print extra diagnostics after the run.</summary>
         [CommandOption("--verbose")]
