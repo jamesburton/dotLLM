@@ -20,7 +20,7 @@ namespace DotLLM.Tests.Unit.Engine;
 /// </summary>
 public sealed class ContinuousBatchSchedulerRecurrentPrefixTests
 {
-    private const int Vocab = 64, HiddenSize = 8, HeadDim = 4, MaxSeqLen = 512, PrefixLen = 20;
+    private const int Vocab = 64, HiddenSize = 8, HeadDim = 4, MaxSeqLen = 8192, PrefixLen = 20;
     private const string GenerationSuffix = "90,91";
     private static readonly int[] G = [90, 91];
     private static readonly int[] P1 = [.. Enumerable.Range(2, PrefixLen), 30, 31];
@@ -119,6 +119,56 @@ public sealed class ContinuousBatchSchedulerRecurrentPrefixTests
         Assert.Single(model.Snapshots);
     }
 
+    // ── refused growth (issue #1093) ──
+
+    [Fact]
+    public async Task UndersizedKv_GrowsExactlyToTheRequest_AndKeepsTheHit()
+    {
+        // The scheduler sizes each sequence's KV at exactly prompt + max_tokens, so there is no headroom to refuse. A KV that
+        // arrives smaller than the matching snapshot must grow to exactly that size before the hit is given up; it used to be
+        // skipped, a miss.
+        using var model = new ThreadedHistoryModel();
+        int cap = int.MaxValue, limit = int.MaxValue;
+        Func<ModelConfig, int, IKvCache> kvf = (cfg, size) =>
+            new LimitedGrowthKv(new SimpleKvCache(KvGeometry.FromConfig(cfg), Math.Min(size, cap)), limit);
+        using var scheduler = new ContinuousBatchScheduler(model, new CsvTokenizer(), kvf,
+            new ContinuousBatchSchedulerOptions { RecurrentPrefixCacheEntries = 4 });
+        // Long enough that the pooled KV of turn 1 (128 positions) does not fit, so turn 2's comes from the factory.
+        int[] h2 = [.. P1, .. Run(100, 100), .. Run(300, 100)];
+        await RunOne(scheduler, [.. P1, .. G], HintedOpts);           // snapshot just before G: P1
+        cap = 10;
+        limit = h2.Length + G.Length + HintedOpts.MaxTokens;
+        model.Calls.Clear();
+
+        var turn2 = await RunOne(scheduler, [.. h2, .. G], HintedOpts);
+
+        Assert.Equal(P1.Length, turn2.Timings.CachedTokenCount);
+        Assert.DoesNotContain(model.Calls, c => c.Start < P1.Length);  // nothing before the snapshot ran again
+        await AssertMatchesColdRun([.. h2, .. G], turn2, Kvf, HintedOpts);
+    }
+
+    [Fact]
+    public async Task RefusedExactGrowth_OnALongPrompt_ThrowsDeviceMemoryAdmission()
+    {
+        // When even the exact size is refused, a long prompt fails with the context error instead of re-prefilling.
+        using var model = new ThreadedHistoryModel();
+        int cap = int.MaxValue, limit = int.MaxValue;
+        Func<ModelConfig, int, IKvCache> kvf = (cfg, size) =>
+            new LimitedGrowthKv(new SimpleKvCache(KvGeometry.FromConfig(cfg), Math.Min(size, cap)), limit);
+        using var scheduler = new ContinuousBatchScheduler(model, new CsvTokenizer(), kvf,
+            new ContinuousBatchSchedulerOptions { RecurrentPrefixCacheEntries = 4 });
+        int[] head = Run(2, 4100);
+        int[] turn2 = [.. head, .. Run(5000, 200), .. G];             // past turn 1's pooled KV (4224), so from the factory
+        await RunOne(scheduler, [.. head, .. G], HintedOpts);         // snapshot at 4100
+        cap = 10;
+        limit = turn2.Length + HintedOpts.MaxTokens - 1;
+        model.Calls.Clear();
+
+        await Assert.ThrowsAsync<DeviceMemoryAdmissionException>(() => RunOne(scheduler, turn2, HintedOpts));
+
+        Assert.Empty(model.Calls);
+    }
+
     private static readonly Func<ModelConfig, int, IKvCache> Kvf = (cfg, size) => new SimpleKvCache(KvGeometry.FromConfig(cfg), size);
     private static InferenceOptions PlainOpts => new() { Temperature = 0f, MaxTokens = 4 };
     private static InferenceOptions HintedOpts => PlainOpts with { GenerationPromptSuffix = GenerationSuffix };
@@ -200,6 +250,9 @@ public sealed class ContinuousBatchSchedulerRecurrentPrefixTests
             return snapshot;
         }
 
+        /// <summary>Every forward's first position and token count, in order.</summary>
+        public List<(int Start, int Length)> Calls { get; } = [];
+
         /// <summary>Every snapshot taken, in order.</summary>
         public List<PrefixSnapshot> Snapshots { get; } = [];
 
@@ -228,12 +281,13 @@ public sealed class ContinuousBatchSchedulerRecurrentPrefixTests
         public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IKvCache? kv, ILoraAdapter? a, IMtpState? m) => Fail();
         public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IKvCache? kv, ILoraAdapter? a, IMtpState? m, bool last) => Fail();
 
-        private static unsafe ITensor Core(SequenceForwardRequest request, int deviceId)
+        private unsafe ITensor Core(SequenceForwardRequest request, int deviceId)
         {
             var state = (HashState)request.GdnState!;
             var tokens = request.TokenIds.Span;
             var positions = request.Positions.Span;
             Assert.Equal(positions[0], request.KvCache.CurrentLength);   // a stale or un-rolled-back KV
+            Calls.Add((positions[0], tokens.Length));
             int seqLen = tokens.Length;
 
             nint ptr = (nint)NativeMemory.AlignedAlloc((nuint)((long)seqLen * Vocab * sizeof(float)), 64);

@@ -21,7 +21,7 @@ namespace DotLLM.Tests.Unit.Engine;
 public sealed class TextGeneratorRecurrentPrefixCacheTests
 {
     private const int Vocab = 64;
-    private const int HiddenSize = 8, NumKvHeads = 1, HeadDim = 4, MaxSeqLen = 512;
+    private const int HiddenSize = 8, NumKvHeads = 1, HeadDim = 4, MaxSeqLen = 8192;
     private const int PrefixLen = 20;
 
     private static string Prompt(params int[] suffix)
@@ -451,6 +451,97 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
         Assert.Equal(PrefixLen, got.Timings.CachedTokenCount);
     }
 
+    // ── refused growth (issue #1093) ──
+
+    /// <summary>A generator whose KVs refuse to grow past <paramref name="limit"/>, and the KVs it has created.</summary>
+    private static (TextGenerator Cached, TextGenerator Plain, HistoryModel Model, List<LimitedGrowthKv> Kvs) BuildLimited(int limit)
+    {
+        var model = new HistoryModel();
+        var kvs = new List<LimitedGrowthKv>();
+        var cached = new TextGenerator(model, new CsvTokenizer(), (cfg, size) =>
+        {
+            var kv = new LimitedGrowthKv(new SimpleKvCache(KvGeometry.FromConfig(cfg), size), limit);
+            kvs.Add(kv);
+            return kv;
+        }, recurrentPrefixCache: true);
+        var plain = new TextGenerator(model, new CsvTokenizer(), (cfg, size) => new SimpleKvCache(KvGeometry.FromConfig(cfg), size));
+        return (cached, plain, model, kvs);
+    }
+
+    [Fact]
+    public void RefusedHeadroomGrowth_RetriesExactSize_AndKeepsTheHit()
+    {
+        // The measured defect: at 112k the hit asked for needed + an eighth of headroom, the admission refused that, and the
+        // hit became a miss that re-prefilled everything (916 s). The exact size fits, so the hit must ask for it before missing.
+        // r1 = 21 tokens snapshots its end (20) in a KV of 21 + 4 + 256 = 281; r2 = 421 tokens needs 425; headroom asks 681.
+        int[] r2 = [30, .. Run(100, 400)];
+        int needed = PrefixLen + r2.Length + Opts.MaxTokens;
+        var (cached, plain, model, kvs) = BuildLimited(limit: needed);
+        Check(cached, plain, model, Prompt(30));
+
+        var got = Check(cached, plain, model, Prompt(r2));
+
+        Assert.Equal(PrefixLen, got.Timings.CachedTokenCount);
+        Assert.Equal(r2.Length, model.Calls.Take(2).Sum());           // only the suffix ran (split where it snapshots)
+        Assert.Equal(new[] { needed + 256, needed }, kvs[0].GrowthRequests);
+    }
+
+    [Fact]
+    public void RefusedExactGrowth_OnALongPrompt_ThrowsDeviceMemoryAdmission()
+    {
+        // Re-prefilling a long prompt instead of growing is the silent 15-minute turn. When even the exact size is refused the
+        // request fails with the context error (HTTP 400 context_length_exceeded), and nothing has run.
+        int[] head = Run(100, 4080);                                  // r1 = 4100 tokens: KV of 4100 + 4 + 256 = 4360
+        int[] r2 = [.. head, .. Run(5000, 400)];                      // 4500 tokens: needs 4504
+        var (cached, plain, model, kvs) = BuildLimited(limit: 4503);
+        Check(cached, plain, model, Prompt(head));
+        model.Calls.Clear();
+
+        var ex = Assert.Throws<DeviceMemoryAdmissionException>(() => cached.Generate(Prompt(r2), Opts));
+
+        Assert.Empty(model.Calls);
+        Assert.Contains("4504", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("4360", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(4504, kvs[0].GrowthRequests[^1]);
+
+        // The refusal changed nothing (the KV did not grow), so the snapshot stays: a request that fits still hits it rather
+        // than re-prefilling 4k tokens.
+        var fits = Check(cached, plain, model, Prompt([.. head, .. Run(5000, 200)]));
+        Assert.Equal(PrefixLen + head.Length - 1, fits.Timings.CachedTokenCount);
+    }
+
+    [Fact]
+    public void RefusedExactGrowth_OnAShortPrompt_FallsBackToAMiss()
+    {
+        // Below RecurrentPrefixRefillMissMaxTokens a re-prefill is cheap, so a refused growth still misses, as before.
+        int[] r2 = [30, .. Run(100, 400)];
+        var (cached, plain, model, _) = BuildLimited(limit: 300);
+        Check(cached, plain, model, Prompt(30));
+
+        var got = Check(cached, plain, model, Prompt(r2));
+
+        Assert.Equal(0, got.Timings.CachedTokenCount);
+    }
+
+    [Fact]
+    public void RefusedRestoreAdmission_OnTheTieredPath_ThrowsDeviceMemoryAdmission()
+    {
+        // The tiered path never grows: it restores into a fresh KV, which the provider admits. A refusal used to count as a
+        // failed restore, a miss, and a full prefill. A cold prefill needs the same storage, so it is the context error, and
+        // the snapshot (whose copy never started) stays for the next request.
+        var (cached, plain, model) = Build(snapshots: new() { MaxEntries = 2, HostBudgetBytes = 100000 });
+        Check(cached, plain, model, Prompt(30));
+        Assert.Equal(PrefixLen, Check(cached, plain, model, Prompt(31)).Timings.CachedTokenCount);
+        model.RefuseNextRestore = true;
+        model.Calls.Clear();
+
+        Assert.Throws<DeviceMemoryAdmissionException>(() => cached.Generate(Prompt(32), Opts));
+
+        Assert.Empty(model.Calls);
+        Assert.Equal(PrefixLen, Check(cached, plain, model, Prompt(33)).Timings.CachedTokenCount);
+        cached.ClearRecurrentPrefixCache();
+    }
+
     // ── fakes ──
 
     /// <summary>A KV whose storage another cache's forwards overwrite, like the CUDA hybrid's model-owned handle.</summary>
@@ -496,6 +587,9 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
         /// <summary>When set, the next Forward throws (and clears the flag), like an OOM mid-request.</summary>
         public bool FailNextForward { get; set; }
 
+        /// <summary>When set, the next prefix-snapshot restore is refused by the device-memory admission (and clears the flag).</summary>
+        public bool RefuseNextRestore { get; set; }
+
         /// <summary>Forwards whose KV cache length differed from their first position (a stale or un-rolled-back KV).</summary>
         public List<string> KvLengthMismatches { get; } = [];
 
@@ -536,6 +630,11 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
         public IRecurrentPrefixSnapshot TransferPrefixSnapshot(IRecurrentPrefixSnapshot source, RecurrentPrefixSnapshotStorage storage) => throw new NotSupportedException();
         public void RestorePrefixSnapshot(IRecurrentPrefixSnapshot snapshot, IKvCache kvCache)
         {
+            if (RefuseNextRestore)
+            {
+                RefuseNextRestore = false;
+                throw new DeviceMemoryAdmissionException("injected restore refusal");
+            }
             var snap = (PrefixSnapshot)snapshot;
             kvCache.Rollback(0);
             kvCache.Update(snap.Kv.GetKeysRef(0), snap.Kv.GetValuesRef(0), Enumerable.Range(0, snap.PrefixLength).ToArray(), 0);

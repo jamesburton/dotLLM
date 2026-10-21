@@ -887,6 +887,24 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         return _kvCacheFactory(_model.Config, rounded);
     }
 
+    /// <summary>The longest snapshot <paramref name="promptIds"/> starts with, leaving at least one suffix token, of at most <paramref name="maxTokens"/> tokens.</summary>
+    /// <param name="promptIds">The sequence's prompt.</param>
+    /// <param name="maxTokens">The longest snapshot the sequence's KV can hold.</param>
+    /// <returns>The entry, or null when none matches.</returns>
+    private RecurrentPrefixEntry? LongestRecurrentPrefix(int[] promptIds, int maxTokens)
+    {
+        RecurrentPrefixEntry? best = null;
+        foreach (var e in _recurrentPrefixes)
+        {
+            if (e.Tokens.Length < promptIds.Length
+                && e.Tokens.Length <= maxTokens
+                && (best is null || e.Tokens.Length > best.Tokens.Length)
+                && promptIds.AsSpan(0, e.Tokens.Length).SequenceEqual(e.Tokens))
+                best = e;
+        }
+        return best;
+    }
+
     /// <summary>
     /// Recurrent prefix reuse for one newly admitted sequence. HIT: restore the longest snapshotted prefix that the prompt
     /// starts with (and that leaves at least one suffix token to produce logits) and return its length. MISS: when the prompt
@@ -903,14 +921,17 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
     private int ResolveRecurrentPrefix(SchedulerRequest seq, int[] promptIds)
     {
         int promptLen = promptIds.Length;
-        RecurrentPrefixEntry? best = null;
-        foreach (var e in _recurrentPrefixes)
+        var kv = seq.KvCache!;
+        RecurrentPrefixEntry? best = LongestRecurrentPrefix(promptIds, int.MaxValue);
+
+        // Issue #1093: a KV smaller than the request (a factory that handed out less than asked) grows to exactly the request
+        // before the hit is given up. Refused, a long prompt fails with the context error rather than re-prefilling; a short
+        // one falls back to the longest snapshot the KV holds, or a miss, as before.
+        int needed = Math.Min(_model.Config.MaxSequenceLength, promptLen + seq.MaxTokens);
+        if (best is not null && kv.MaxLength < needed && !kv.TryGrowTo(needed) && best.Tokens.Length > kv.MaxLength)
         {
-            if (e.Tokens.Length < promptLen
-                && (best is null || e.Tokens.Length > best.Tokens.Length)
-                && promptIds.AsSpan(0, e.Tokens.Length).SequenceEqual(e.Tokens)
-                && e.Tokens.Length <= seq.KvCache!.MaxLength)
-                best = e;
+            TextGenerator.ThrowIfRecurrentRefillTooLong(promptLen, needed, kv.MaxLength);
+            best = LongestRecurrentPrefix(promptIds, kv.MaxLength);
         }
 
         int shared = _recurrentPrefixLastPrompt is null

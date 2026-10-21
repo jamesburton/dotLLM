@@ -49,10 +49,24 @@ public sealed partial class TextGenerator
         int[] promptIds, int promptLen, int maxTokens, string? generationPromptSuffix, out int snapshotAt)
     {
         int[]? previous = _recurrentPrefixLastPrompt;
-        _recurrentPrefixLastPrompt = promptIds;
         int needed = Math.Min(_model.Config.MaxSequenceLength, checked(promptLen + maxTokens));
         var kv = AllocateKvCache(needed);
-        int cached = _tieredSnapshots!.TryRestore(promptIds, kv, out string? tier, out double milliseconds);
+        int cached;
+        string? tier;
+        double milliseconds;
+        try
+        {
+            // This path never grows a KV: it restores into a fresh one. When the device refuses that KV's storage
+            // (DeviceMemoryAdmissionException) the restore rethrows rather than missing, because a cold prefill needs the same
+            // storage; the request then fails with the context error (issue #1093), not a full re-prefill into the same refusal.
+            cached = _tieredSnapshots!.TryRestore(promptIds, kv, out tier, out milliseconds);
+        }
+        catch
+        {
+            kv.Dispose();
+            throw;
+        }
+        _recurrentPrefixLastPrompt = promptIds;
         LastPrefixCacheTier = tier; LastPrefixRestoreMilliseconds = milliseconds;
         if (cached == 0)
         {

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using DotLLM.Core.Attention;
+using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 
 namespace DotLLM.Engine.PromptCache;
@@ -78,6 +79,14 @@ internal sealed class RecurrentPrefixSnapshotCache : IDisposable
                 else if (entry.Snapshot!.Storage == RecurrentPrefixSnapshotStorage.Host) { _hostHits++; tier = "host"; }
                 else { _vramHits++; tier = "vram"; }
                 return entry.Tokens.Length;
+            }
+            catch (DeviceMemoryAdmissionException)
+            {
+                // Issue #1093: the request's KV storage was refused before any row was copied, so the entry is intact. A cold
+                // prefill needs the same storage, so a miss would only re-prefill into the same refusal: let the request fail
+                // with the context error and keep the entry for one that fits.
+                _misses++;
+                throw;
             }
             catch (Exception)
             {
