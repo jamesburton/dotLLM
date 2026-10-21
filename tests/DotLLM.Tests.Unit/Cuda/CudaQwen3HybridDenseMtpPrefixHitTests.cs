@@ -16,9 +16,10 @@ namespace DotLLM.Tests.Unit.Cuda;
 [Collection(CudaCollection.Name)]
 public sealed class CudaQwen3HybridDenseMtpPrefixHitTests(ITestOutputHelper output) : IDisposable
 {
-    // The hit prefills only the suffix and the cold run the whole prompt, so the trunk's GEMMs run at different row counts
-    // and the head's inputs differ in the last bits. A wrong carry row, length or rows moves the logits far more.
-    private const float DraftLogitTolerance = 2e-3f;
+    // Measured on an RTX 3060: the hit's draft logits are within 1.2e-7 of the cold run's (the same as two cold runs differ).
+    // The synthetic head's logits are small, so a wrong head moves them little (a stale carry row moved the CPU twin's by
+    // 2e-4 to 7e-4): the tolerance must stay far below that.
+    private const float DraftLogitTolerance = 1e-5f;
 
     private readonly string _scratch = Directory.CreateTempSubdirectory("dotllm-cuda-prefix-mtp-").FullName;
 
