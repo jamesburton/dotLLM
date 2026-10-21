@@ -28,7 +28,7 @@ public sealed class CudaNemotronHBoltBlk9ColdCpuRealModelTests(ITestOutputHelper
     private const int MaxSeq = 64;
     private const long CacheMib = 256;   // about an eighth of blk9's ~2 GiB of routed experts
 
-    private static readonly int[] Prompt = [1, 1784, 4237, 1278, 6542, 1307, 1278, 2524, 1044, 1531, 1395, 1636, 1317, 2036, 1294, 1278];
+    internal static readonly int[] Prompt = [1, 1784, 4237, 1278, 6542, 1307, 1278, 2524, 1044, 1531, 1395, 1636, 1317, 2036, 1294, 1278];
 
     private readonly string _scratch = Directory.CreateTempSubdirectory("dotllm-blk9-cold-").FullName;
 
@@ -101,9 +101,9 @@ public sealed class CudaNemotronHBoltBlk9ColdCpuRealModelTests(ITestOutputHelper
         }
     }
 
-    private sealed record CacheStats(long Hits, long ColdMisses, long Promotions);
+    internal sealed record CacheStats(long Hits, long ColdMisses, long Promotions);
 
-    private static (List<float[]> Rows, List<int> DecodeTokens) Run(GgufFile gguf, ModelConfig config, string ptxDir,
+    internal static (List<float[]> Rows, List<int> DecodeTokens) Run(GgufFile gguf, ModelConfig config, string ptxDir,
         MoeOffloadOptions options, List<int>? decodeTokens, out CudaMoeOffloadInfo info, out CacheStats cache)
     {
         int vocab = config.VocabSize;
@@ -137,7 +137,7 @@ public sealed class CudaNemotronHBoltBlk9ColdCpuRealModelTests(ITestOutputHelper
         return rows;
     }
 
-    private static int ArgMax(float[] v)
+    internal static int ArgMax(float[] v)
     {
         int best = 0;
         for (int i = 1; i < v.Length; i++) if (v[i] > v[best]) best = i;
@@ -145,7 +145,7 @@ public sealed class CudaNemotronHBoltBlk9ColdCpuRealModelTests(ITestOutputHelper
     }
 
     /// <summary>KL(softmax(p) || softmax(q)) in double.</summary>
-    private static double Kl(float[] p, float[] q)
+    internal static double Kl(float[] p, float[] q)
     {
         double mp = p.Max(), mq = q.Max(), zp = 0, zq = 0;
         for (int i = 0; i < p.Length; i++) { zp += Math.Exp(p[i] - mp); zq += Math.Exp(q[i] - mq); }

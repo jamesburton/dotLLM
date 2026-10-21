@@ -89,28 +89,7 @@ public sealed class CudaNemotronHMoeColdCpuTests : IDisposable
                 $"hits {cache.Hits}, cold misses {cache.ColdMisses}, promotions {cache.Promotions}, CPU experts {tel.ColdExpertsCpu} " +
                 $"of {tel.Routed}; {tel.FormatSummary()}");
 
-            // Selection: the same layer calls in the same order. Per token the selected SET of experts must match, except where
-            // the CPU leg's rounding moved a hidden state across a near-tie of the selection scores. Those flips are legitimate
-            // cross-backend noise (T5500 showed one top-k ORDER swap on the non-latent fixture), so a small share is allowed;
-            // a broken CPU leg changes the hidden states of every later layer and flips far more.
-            Assert.Equal(residentTrace.Count, coldTrace.Count);
-            int tokens = 0, setMismatches = 0;
-            for (int i = 0; i < residentTrace.Count; i++)
-            {
-                Assert.Equal(residentTrace[i].Item1, coldTrace[i].Item1);
-                int[] r = residentTrace[i].Item2, c = coldTrace[i].Item2;
-                Assert.Equal(r.Length, c.Length);
-                int topK = CudaNemotronHMoeParityTests.TopKOfLayer(residentTrace[i].Item1);
-                for (int s = 0; s + topK <= r.Length; s += topK)
-                {
-                    tokens++;
-                    if (!r.AsSpan(s, topK).ToArray().Order().SequenceEqual(c.AsSpan(s, topK).ToArray().Order()))
-                        setMismatches++;
-                }
-            }
-            _output.WriteLine($"selection: {setMismatches} of {tokens} token routings differ as sets");
-            Assert.True(setMismatches * 20 <= tokens, $"{setMismatches} of {tokens} token routings changed expert set");
-
+            AssertSameSelection(_output, residentTrace, coldTrace);
             // The CPU leg ran, the cache was used and promote-only admission copied something in.
             Assert.True(tel.ColdExpertsCpu > 0, "no expert ran on the CPU");
             Assert.True(cache.ColdMisses > 0, "no cold miss");
@@ -119,25 +98,7 @@ public sealed class CudaNemotronHMoeColdCpuTests : IDisposable
             Assert.Equal(tel.Routed, cache.Hits + cache.Misses);   // every routed expert went through the cache
             Assert.Equal(cache.ColdMisses, tel.ColdExpertsCpu);
 
-            // Logits: the cross-backend bound (PR A: CUDA vs the CPU oracle is small against the bias control), and the CPU leg
-            // cannot be further from the resident run than the CPU oracle is from the exact F32-bank oracle plus CUDA's own error.
-            float vsResident = MaxDiff(resident, cold);
-            float residentVsExact = MaxDiff(resident, cpuExact);
-            _output.WriteLine($"|cold-resident| {vsResident:E3}, |resident-exact| {residentVsExact:E3}, |cpu-exact| {cpuVsExact:E3}, " +
-                $"control {control:E3}");
-            Assert.True(vsResident * 4 < control, $"|cold - resident| {vsResident:E3} is not small against the bias effect {control:E3}");
-            Assert.True(vsResident <= 2 * (cpuVsExact + residentVsExact) + 1e-3f,
-                $"|cold - resident| {vsResident:E3} exceeds the CPU and CUDA oracle errors ({cpuVsExact:E3} + {residentVsExact:E3})");
-            Assert.True(vsResident > 0, "bit-identical to resident: the CPU leg did not run its own kernels");
-            // Greedy token: identical wherever the resident top-1 leads top-2 by more than the measured logit error; a flip
-            // inside that margin is a near-tie the error explains (the 16-token synthetic vocabulary has such rows).
-            for (int row = 0; row < resident.Length / Vocab; row++)
-            {
-                int a = ArgMax(resident, row), b = ArgMax(cold, row);
-                if (a != b)
-                    Assert.True(Margin(resident, row) <= 2 * vsResident,
-                        $"row {row}: argmax {a} -> {b} with resident top-1 margin {Margin(resident, row):E3} > 2 x error {vsResident:E3}");
-            }
+            AssertLogitsWithinTheCrossBackendBound(_output, resident, cold, cpuExact, control, cpuVsExact);
         }
         finally
         {
@@ -230,6 +191,75 @@ public sealed class CudaNemotronHMoeColdCpuTests : IDisposable
         Assert.True(tel.ColdExpertsCpu > 0);
     }
 
+    // ───────────────────────── shared parity checks (#1071; reused by the iGPU cold leg, #1083) ─────────────────────────
+
+    /// <summary>
+    /// The same layer calls in the same order and, per token, the same selected expert SET, except for a small share of near-tie
+    /// flips the cold leg's legitimate rounding explains (see the comments).
+    /// </summary>
+    /// <param name="output">Test output.</param>
+    /// <param name="residentTrace">Routing of the resident run.</param>
+    /// <param name="coldTrace">Routing of the cold run.</param>
+    internal static void AssertSameSelection(ITestOutputHelper output, List<(int, int[])> residentTrace, List<(int, int[])> coldTrace)
+    {
+        // Selection: the same layer calls in the same order. Per token the selected SET of experts must match, except where
+        // the CPU leg's rounding moved a hidden state across a near-tie of the selection scores. Those flips are legitimate
+        // cross-backend noise (T5500 showed one top-k ORDER swap on the non-latent fixture), so a small share is allowed;
+        // a broken CPU leg changes the hidden states of every later layer and flips far more.
+        Assert.Equal(residentTrace.Count, coldTrace.Count);
+        int tokens = 0, setMismatches = 0;
+        for (int i = 0; i < residentTrace.Count; i++)
+        {
+            Assert.Equal(residentTrace[i].Item1, coldTrace[i].Item1);
+            int[] r = residentTrace[i].Item2, c = coldTrace[i].Item2;
+            Assert.Equal(r.Length, c.Length);
+            int topK = CudaNemotronHMoeParityTests.TopKOfLayer(residentTrace[i].Item1);
+            for (int s = 0; s + topK <= r.Length; s += topK)
+            {
+                tokens++;
+                if (!r.AsSpan(s, topK).ToArray().Order().SequenceEqual(c.AsSpan(s, topK).ToArray().Order()))
+                    setMismatches++;
+            }
+        }
+        output.WriteLine($"selection: {setMismatches} of {tokens} token routings differ as sets");
+        Assert.True(setMismatches * 20 <= tokens, $"{setMismatches} of {tokens} token routings changed expert set");
+    }
+
+    /// <summary>
+    /// The cold run's logits within the cross-backend bound of the resident run: small against the selection-bias control, within
+    /// twice the CPU and CUDA oracle errors, not bit-identical (the cold leg ran its own kernels), and greedy-identical except at
+    /// near-ties inside the measured error.
+    /// </summary>
+    /// <param name="output">Test output.</param>
+    /// <param name="resident">Resident logits.</param>
+    /// <param name="cold">Cold-leg logits.</param>
+    /// <param name="cpuExact">The CPU oracle on the F32-bank fixture.</param>
+    /// <param name="control">The selection-bias control (max logit delta with the bias zeroed).</param>
+    /// <param name="cpuVsExact">The CPU oracle's own error against the F32-bank oracle.</param>
+    internal static void AssertLogitsWithinTheCrossBackendBound(ITestOutputHelper output, float[] resident, float[] cold, float[] cpuExact,
+        float control, float cpuVsExact)
+    {
+        // Logits: the cross-backend bound (PR A: CUDA vs the CPU oracle is small against the bias control), and the CPU leg
+        // cannot be further from the resident run than the CPU oracle is from the exact F32-bank oracle plus CUDA's own error.
+        float vsResident = MaxDiff(resident, cold);
+        float residentVsExact = MaxDiff(resident, cpuExact);
+        output.WriteLine($"|cold-resident| {vsResident:E3}, |resident-exact| {residentVsExact:E3}, |cpu-exact| {cpuVsExact:E3}, " +
+            $"control {control:E3}");
+        Assert.True(vsResident * 4 < control, $"|cold - resident| {vsResident:E3} is not small against the bias effect {control:E3}");
+        Assert.True(vsResident <= 2 * (cpuVsExact + residentVsExact) + 1e-3f,
+            $"|cold - resident| {vsResident:E3} exceeds the CPU and CUDA oracle errors ({cpuVsExact:E3} + {residentVsExact:E3})");
+        Assert.True(vsResident > 0, "bit-identical to resident: the CPU leg did not run its own kernels");
+        // Greedy token: identical wherever the resident top-1 leads top-2 by more than the measured logit error; a flip
+        // inside that margin is a near-tie the error explains (the 16-token synthetic vocabulary has such rows).
+        for (int row = 0; row < resident.Length / Vocab; row++)
+        {
+            int a = ArgMax(resident, row), b = ArgMax(cold, row);
+            if (a != b)
+                Assert.True(Margin(resident, row) <= 2 * vsResident,
+                    $"row {row}: argmax {a} -> {b} with resident top-1 margin {Margin(resident, row):E3} > 2 x error {vsResident:E3}");
+        }
+    }
+
     // ───────────────────────── helpers ─────────────────────────
 
     private MoeOffloadOptions Options(MoeColdMode cold, int threads, bool pinned) => new()
@@ -243,7 +273,7 @@ public sealed class CudaNemotronHMoeColdCpuTests : IDisposable
         Log = _output.WriteLine,
     };
 
-    private static string RequireCuda()
+    internal static string RequireCuda()
     {
         Skip.IfNot(CudaNemotronMoeTestSupport.IsCudaAvailable(), "No CUDA GPU available");
         string? ptxDir = CudaNemotronMoeTestSupport.FindPtxDir();
@@ -252,7 +282,7 @@ public sealed class CudaNemotronHMoeColdCpuTests : IDisposable
     }
 
     /// <summary>The distinct expert layouts of the fixture (read from the CPU model's layer weights).</summary>
-    private static List<ExpertLayout> ExpertLayouts(string path)
+    internal static List<ExpertLayout> ExpertLayouts(string path)
     {
         using var gguf = GgufFile.Open(path);
         using var cpu = NemotronHTransformerModel.LoadFromGguf(gguf, GgufModelConfigExtractor.Extract(gguf.Metadata),
@@ -262,11 +292,11 @@ public sealed class CudaNemotronHMoeColdCpuTests : IDisposable
     }
 
     /// <summary>Cache counters and shape after a run (read before the model is disposed).</summary>
-    private sealed record CacheCounters(long Hits, long Misses, long Insertions, long Bypasses, long ColdMisses, long Promotions,
+    internal sealed record CacheCounters(long Hits, long Misses, long Insertions, long Bypasses, long ColdMisses, long Promotions,
         int[] ExpertsPerLayer);
 
     /// <summary>Prompt prefill then <see cref="DecodeTokens"/> one at a time; rows = prompt rows + one per decode step.</summary>
-    private static unsafe float[] Run(string path, string ptxDir, MoeOffloadOptions options, out CudaMoeOffloadInfo? info,
+    internal static unsafe float[] Run(string path, string ptxDir, MoeOffloadOptions options, out CudaMoeOffloadInfo? info,
         out CacheCounters counters)
     {
         using var gguf = GgufFile.Open(path);
@@ -295,7 +325,7 @@ public sealed class CudaNemotronHMoeColdCpuTests : IDisposable
     }
 
     /// <summary>The CPU model on the same file: prompt prefill then the decode tokens (cacheless; the SSM state carries).</summary>
-    private static unsafe float[] RunCpu(string path)
+    internal static unsafe float[] RunCpu(string path)
     {
         using var gguf = GgufFile.Open(path);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
@@ -311,7 +341,7 @@ public sealed class CudaNemotronHMoeColdCpuTests : IDisposable
         return [.. rows];
     }
 
-    private static float MaxDiff(float[] a, float[] b)
+    internal static float MaxDiff(float[] a, float[] b)
     {
         Assert.Equal(a.Length, b.Length);
         float worst = 0;
