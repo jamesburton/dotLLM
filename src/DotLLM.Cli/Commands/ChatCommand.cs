@@ -142,6 +142,42 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         [Description(DotLLM.Core.Moe.MoeOffloadOptions.PolicyHelp)]
         public string? MoeCachePolicy { get; set; }
 
+        /// <summary>Where uncached offloaded experts run (issue #1071).</summary>
+        [CommandOption(MoeOffloadCli.ColdOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.ColdHelp)]
+        public string? MoeCold { get; set; }
+
+        /// <summary>CPU cold-expert worker threads (issue #1071).</summary>
+        [CommandOption(MoeOffloadCli.CpuThreadsOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CpuThreadsHelp)]
+        public int? MoeCpuThreads { get; set; }
+
+        /// <summary>llama.cpp <c>--cpu-moe</c>: every MoE layer's experts on the CPU (issue #1071).</summary>
+        [CommandOption(MoeOffloadCli.CpuMoeOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CpuMoeHelp)]
+        [DefaultValue(false)]
+        public bool CpuMoe { get; set; }
+
+        /// <summary>llama.cpp <c>--n-cpu-moe N</c>: the first N layers' experts on the CPU (issue #1071).</summary>
+        [CommandOption(MoeOffloadCli.NCpuMoeOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.NCpuMoeHelp)]
+        public int? NCpuMoe { get; set; }
+
+        /// <summary>Re-run the MoE offload cost calibration (issue #1071).</summary>
+        [CommandOption(MoeOffloadCli.CalibrateOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CalibrateHelp)]
+        [DefaultValue(false)]
+        public bool MoeCalibrate { get; set; }
+
+        /// <summary>Context the MoE offload VRAM budget reserves KV cache for (issue #1071).</summary>
+        [CommandOption(MoeOffloadCli.ContextOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.ContextHelp)]
+        public int? CtxSize { get; set; }
+
+        /// <summary>The raw MoE offload option values (issues #1070, #1071).</summary>
+        public DotLLM.Core.Moe.MoeCliValues MoeValues => new(MoeOffload, MoeCacheMib, MoeCachePolicy, MoeCold, MoeCpuThreads,
+            CpuMoe, NCpuMoe, MoeCalibrate, CtxSize);
+
         /// <summary>Quantization filter.</summary>
         [CommandOption("--quant|-q")]
         [Description("Quantization filter when multiple GGUF files exist (e.g., Q4_K_M, Q8_0).")]
@@ -288,7 +324,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             DeviceCli.PrintError(deviceError, json: false);
             return 1;
         }
-        if (MoeOffloadCli.Validate(settings.MoeOffload, settings.MoeCacheMib, settings.MoeCachePolicy) is { } moeError)
+        if (MoeOffloadCli.Validate(settings.MoeValues) is { } moeError)
         {
             DeviceCli.PrintError(moeError, json: false);
             return 1;
@@ -369,7 +405,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                 DotLLM.Server.DeviceLoadResult loaded;
                 (loaded, deviceOutcome) = DeviceCli.Load(gguf, config, settings.Device, settings.GpuLayers,
                     new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly),
-                    resolvedPath, MoeOffloadCli.Build(settings.MoeOffload, settings.MoeCacheMib, settings.MoeCachePolicy));
+                    resolvedPath, MoeOffloadCli.Build(settings.MoeValues));
                 model = loaded.Model;
                 vulkanKv = loaded.IsVulkan ? loaded.KvCacheFactory : null;   // CUDA/hybrid models build their caches from the model type below
                 if (!settings.NoMtp)

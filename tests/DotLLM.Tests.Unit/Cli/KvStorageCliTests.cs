@@ -218,4 +218,23 @@ public sealed class KvStorageCliTests
         Assert.Equal("q8_0", s.KvQuantV);
         Assert.Equal("q4_0", s.CacheTypeK);
     }
+
+    // ── serve --ctx-size (#1068) is also the MoE offload context (#1071): one option, one value ──
+
+    [Theory]
+    [InlineData("--ctx-size")]
+    [InlineData("-c")]
+    public void Serve_CtxSize_FeedsTheMoeOffloadContext(string flag)
+    {
+        var s = Parse<ServeCommand.Settings>("model.gguf", flag, "8192");
+        Assert.Equal(8192, s.CtxSize);
+        Assert.Equal(8192, s.MoeValues.ContextTokens);
+    }
+
+    [Fact]
+    public void Serve_CtxSizeZero_MeansFitToVram_AndLeavesTheMoeDefault()
+    {
+        Assert.Null(Parse<ServeCommand.Settings>("model.gguf", "--ctx-size", "0").MoeValues.ContextTokens);
+        Assert.Null(Parse<ServeCommand.Settings>("model.gguf").MoeValues.ContextTokens);
+    }
 }

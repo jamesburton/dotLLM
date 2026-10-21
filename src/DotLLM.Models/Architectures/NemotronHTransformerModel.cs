@@ -884,12 +884,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
                     for (int k2 = 0; k2 < topK; k2++)
                     {
                         int e = topIdx[k2];
-                        nint upPtr = moe.UpExpsWeight + (nint)(e * moe.UpPerExpertBytes);
-                        nint downPtr = moe.DownExpsWeight + (nint)(e * moe.DownPerExpertBytes);
-
-                        Gemm(upPtr, moe.UpExpsQuantType, expertIn, mid, moeInter, expertDim, 1, null);
-                        ReluSquared.Execute(midBuf.AsSpan(0, moeInter), midBuf.AsSpan(0, moeInter));
-                        Gemm(downPtr, moe.DownExpsQuantType, mid, expOut, expertDim, moeInter, 1, null);
+                        NemotronHMoeExpertCompute.Compute(moe, e, expertDim, expertIn, 1, mid, expOut, _threadPool);
 
                         float wk = w[k2];
                         for (int i = 0; i < expertDim; i++) accBuf[i] += wk * expOut[i];
@@ -1069,11 +1064,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
                     new ReadOnlySpan<float>(expertIn + (long)t * expertDim, expertDim)
                         .CopyTo(new Span<float>(gIn + (long)j * expertDim, expertDim));
                 }
-                nint upPtr = moe.UpExpsWeight + (nint)(e * moe.UpPerExpertBytes);
-                nint downPtr = moe.DownExpsWeight + (nint)(e * moe.DownPerExpertBytes);
-                Gemm(upPtr, moe.UpExpsQuantType, gIn, gMid, moeInter, expertDim, cnt, null);
-                ReluSquared.Execute(new Span<float>(gMid, cnt * moeInter), new Span<float>(gMid, cnt * moeInter));
-                Gemm(downPtr, moe.DownExpsQuantType, gMid, gOut, expertDim, moeInter, cnt, null);
+                NemotronHMoeExpertCompute.Compute(moe, e, expertDim, gIn, cnt, gMid, gOut, _threadPool);
                 for (int j = 0; j < cnt; j++)
                 {
                     int s = order[begin + j];
@@ -1404,25 +1395,44 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void Gemm(nint weights, QuantizationType qt, float* b, float* c,
                       int m, int k, int n, byte* preQuantizedInput)
+        => GemmDispatch(weights, qt, b, c, m, k, n, _threadPool, preQuantizedInput);
+
+    /// <summary>
+    /// The Nemotron-H GEMM dispatcher: <c>c[n, m] = b[n, k] · W[m, k]ᵀ</c> for every weight type the model reads. Shared by the
+    /// model (<paramref name="pool"/> = its compute pool) and the per-expert CPU compute of the CUDA offload's cold leg (#1071,
+    /// <paramref name="pool"/> = null: one expert per worker, single-threaded), so both run the same kernels. Pool-parallel
+    /// kernels are row-partitioned, so a null pool gives bit-identical results.
+    /// </summary>
+    /// <param name="weights">Weight matrix (quantized rows of length <paramref name="k"/>).</param>
+    /// <param name="qt">Weight type.</param>
+    /// <param name="b">Input rows <c>[n, k]</c>.</param>
+    /// <param name="c">Output rows <c>[n, m]</c>.</param>
+    /// <param name="m">Output width (weight rows).</param>
+    /// <param name="k">Input width.</param>
+    /// <param name="n">Rows (tokens).</param>
+    /// <param name="pool">Compute pool, or null for single-threaded.</param>
+    /// <param name="preQuantizedInput">Input already quantized for <paramref name="qt"/>'s dot, or null.</param>
+    internal static void GemmDispatch(nint weights, QuantizationType qt, float* b, float* c,
+                      int m, int k, int n, ComputeThreadPool? pool, byte* preQuantizedInput)
     {
         // #386: pool-aware GEMM dispatch — mirrors Qwen3HybridDenseTransformerModel.Gemm.
         // Row-partitioned across the pool, so results are bit-identical to serial.
         switch (qt)
         {
             case QuantizationType.Q8_0:
-                MatMul.GemmQ8_0((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+                MatMul.GemmQ8_0((byte*)weights, b, c, m, k, n, pool, preQuantizedInput);
                 return;
             case QuantizationType.Q5_0:
-                MatMul.GemmQ5_0((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+                MatMul.GemmQ5_0((byte*)weights, b, c, m, k, n, pool, preQuantizedInput);
                 return;
             case QuantizationType.Q2_K:
-                MatMul.GemmQ2_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+                MatMul.GemmQ2_K((byte*)weights, b, c, m, k, n, pool, preQuantizedInput);
                 return;
             case QuantizationType.Q3_K:
-                MatMul.GemmQ3_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+                MatMul.GemmQ3_K((byte*)weights, b, c, m, k, n, pool, preQuantizedInput);
                 return;
             case QuantizationType.IQ4_XS:
-                MatMul.GemmIQ4_XS((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+                MatMul.GemmIQ4_XS((byte*)weights, b, c, m, k, n, pool, preQuantizedInput);
                 return;
             case QuantizationType.IQ2_XXS:
             case QuantizationType.IQ2_XS:
@@ -1431,39 +1441,38 @@ public sealed unsafe class NemotronHTransformerModel : IModel
             case QuantizationType.IQ3_S:
             case QuantizationType.IQ1_M:
             case QuantizationType.IQ1_S:
-                MatMul.GemmIQCodebook(qt, (byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+                MatMul.GemmIQCodebook(qt, (byte*)weights, b, c, m, k, n, pool, preQuantizedInput);
                 return;
             case QuantizationType.Q4_K:
-                MatMul.GemmQ4_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+                MatMul.GemmQ4_K((byte*)weights, b, c, m, k, n, pool, preQuantizedInput);
                 return;
             case QuantizationType.Q5_K:
-                MatMul.GemmQ5_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+                MatMul.GemmQ5_K((byte*)weights, b, c, m, k, n, pool, preQuantizedInput);
                 return;
             case QuantizationType.Q6_K:
-                MatMul.GemmQ6_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+                MatMul.GemmQ6_K((byte*)weights, b, c, m, k, n, pool, preQuantizedInput);
                 return;
             case QuantizationType.F32:
-                MatMul.GemmF32((float*)weights, b, c, m, k, n, _threadPool);
+                MatMul.GemmF32((float*)weights, b, c, m, k, n, pool);
                 return;
             case QuantizationType.NVFP4:
                 // #1038: packed NVFP4 x Q8_0 (llama.cpp's CPU vec_dot); the caller applies the X.scale.
-                MatMul.GemmNvfp4((byte*)weights, b, c, m, k, n, _threadPool);
+                MatMul.GemmNvfp4((byte*)weights, b, c, m, k, n, pool);
                 return;
             case QuantizationType.F16:
-                MatMul.GemmF16(weights, b, c, m, k, n, _threadPool);
+                MatMul.GemmF16(weights, b, c, m, k, n, pool);
                 return;
             case QuantizationType.Q4_0:
             case QuantizationType.Q4_1:
             case QuantizationType.Q5_1:
             case QuantizationType.IQ4_NL:
                 // Packed x Q8_1 dot instead of dequantize-to-F32 (#489).
-                MatMul.GemmLegacyQuantOrDequant((byte*)weights, qt, b, c, m, k, n, _threadPool, preQuantizedInput);
+                MatMul.GemmLegacyQuantOrDequant((byte*)weights, qt, b, c, m, k, n, pool, preQuantizedInput);
                 return;
             default:
                 // Shared dequantize-and-dot fallback (#263): decodes each weight row once and
                 // reuses it across all n columns instead of re-decoding the matrix per token.
-                // This Gemm has no thread pool in scope, so it runs serially — bit-identical to
-                // the private copy it replaces.
+                // It runs serially whatever the pool — bit-identical to the private copy it replaces.
                 MatMul.GemmDequantRows((byte*)weights, qt, b, c, m, k, n, pool: null);
                 return;
         }

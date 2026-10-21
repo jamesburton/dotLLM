@@ -54,6 +54,7 @@ public sealed class CudaNemotronHBoltBlk9OffloadRealModelTests(ITestOutputHelper
             CudaNemotronHTransformerModel.MoePathCounters.Reset();
             var options = new MoeOffloadOptions
             {
+                Cold = MoeColdMode.Copy,   // #1071: this test pins copy-on-miss
                 Mode = MoeOffloadMode.On,
                 CacheMib = CacheMib,
                 PinBudgetFraction = pinned ? MoeOffloadOptions.DefaultPinBudgetFraction : 0,

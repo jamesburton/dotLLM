@@ -14,6 +14,12 @@ public enum ExpertLookupResult : byte
     /// and the cache does not change (prefill of a block that touches more experts than the pool holds).
     /// </summary>
     Bypass,
+
+    /// <summary>
+    /// Miss left uncached by a non-admitting lookup (#1071): the expert runs where its weights already live (the CPU), and enters
+    /// the cache only if <see cref="ExpertCache.Admit"/> or <see cref="ExpertCache.Promote"/> later places it.
+    /// </summary>
+    Cold,
 }
 
 /// <summary>
@@ -43,6 +49,7 @@ public sealed class ExpertCache
     private readonly SlotPool[] _pools;
     private readonly long[] _keyStamp;     // global key -> last call that named it (duplicate detection)
     private long _call;
+    private int _callLayer = -1;           // layer of the current call (Admit / Promote act on it)
 
     /// <summary>Creates an empty cache.</summary>
     /// <param name="expertsPerLayer">Experts of each layer (0 for a layer without experts).</param>
@@ -133,6 +140,27 @@ public sealed class ExpertCache
     /// <summary>Misses that found every slot of their pool pinned by the same call.</summary>
     public long Bypasses { get; private set; }
 
+    /// <summary>Misses a non-admitting lookup left uncached (computed elsewhere, #1071) and that were not admitted afterwards.</summary>
+    public long ColdMisses { get; private set; }
+
+    /// <summary>Cold misses copied into a chosen slot by promote-only admission (<see cref="Promote"/>).</summary>
+    public long Promotions { get; private set; }
+
+    /// <summary>Number of distinct (layer, expert) keys.</summary>
+    public int KeyCount => _keyLayer.Length;
+
+    /// <summary>Dense key of (<paramref name="layer"/>, <paramref name="expert"/>), in <c>[0, <see cref="KeyCount"/>)</c>.</summary>
+    /// <param name="layer">Layer index.</param>
+    /// <param name="expert">Expert index within the layer.</param>
+    /// <returns>The key.</returns>
+    public int KeyOf(int layer, int expert) => Key(layer, expert);
+
+    /// <summary>True when <paramref name="slot"/> of <paramref name="pool"/> is pinned by the current call (it must not be replaced).</summary>
+    /// <param name="pool">Pool index.</param>
+    /// <param name="slot">Slot index.</param>
+    /// <returns>True when pinned.</returns>
+    public bool IsPinned(int pool, int slot) => _pools[pool].IsPinned(slot, _call);
+
     /// <summary>Pool that serves <paramref name="layer"/>, or -1 when the layer has no experts.</summary>
     /// <param name="layer">Layer index.</param>
     /// <returns>The pool index.</returns>
@@ -179,9 +207,12 @@ public sealed class ExpertCache
     /// <param name="experts">Distinct expert ids of the call.</param>
     /// <param name="slots">Receives each expert's slot (-1 for a bypass); at least as long as <paramref name="experts"/>.</param>
     /// <param name="results">Receives each expert's outcome; at least as long as <paramref name="experts"/>.</param>
-    /// <returns>Number of misses (insertions plus bypasses).</returns>
+    /// <returns>Number of misses (insertions, bypasses and cold misses).</returns>
     /// <exception cref="ArgumentException">An id is out of range or repeated, or an output span is too short.</exception>
-    public int Lookup(int layer, ReadOnlySpan<int> experts, Span<int> slots, Span<ExpertLookupResult> results)
+    /// <param name="admitMisses">True (copy-on-miss, #1070) = place every miss now; false (#1071) = leave the misses
+    /// <see cref="ExpertLookupResult.Cold"/>: the caller computes them where their weights live, and may then place some of them
+    /// with <see cref="Admit"/> or <see cref="Promote"/> before the next call.</param>
+    public int Lookup(int layer, ReadOnlySpan<int> experts, Span<int> slots, Span<ExpertLookupResult> results, bool admitMisses = true)
     {
         if (slots.Length < experts.Length) throw new ArgumentException("slots is shorter than experts.", nameof(slots));
         if (results.Length < experts.Length) throw new ArgumentException("results is shorter than experts.", nameof(results));
@@ -189,6 +220,7 @@ public sealed class ExpertCache
         if (p < 0) throw new ArgumentException($"layer {layer} has no experts.", nameof(layer));
         var pool = _pools[p];
         long call = ++_call;
+        _callLayer = layer;
         int n = _layerExperts[layer];
 
         // Pass 1: validate, then touch and pin every resident expert, so no eviction in pass 2 can take a slot this call uses.
@@ -214,6 +246,12 @@ public sealed class ExpertCache
             if (slots[i] >= 0) continue;
             misses++;
             Misses++;
+            if (!admitMisses)
+            {
+                results[i] = ExpertLookupResult.Cold;
+                ColdMisses++;
+                continue;
+            }
             int s = pool.Admit(Key(layer, experts[i]), call, out bool evicted);
             slots[i] = s;
             if (s < 0)
@@ -229,6 +267,62 @@ public sealed class ExpertCache
         return misses;
     }
 
+    /// <summary>
+    /// Places a cold miss of the current call (the last non-admitting lookup) by the replacement policy, exactly as an admitting
+    /// lookup would have: a free slot or the policy's unpinned victim, pinned for the rest of the call; -1 (a bypass) when every
+    /// slot is pinned. The caller copies the expert in.
+    /// </summary>
+    /// <param name="layer">Layer of the current call.</param>
+    /// <param name="expert">An expert the current call left cold.</param>
+    /// <param name="evicted">True when the slot held another expert.</param>
+    /// <returns>The slot, or -1.</returns>
+    /// <exception cref="InvalidOperationException">The expert is not a cold miss of the current call.</exception>
+    public int Admit(int layer, int expert, out bool evicted)
+    {
+        var pool = ColdMissPool(layer, expert, out int key);
+        ColdMisses--;
+        int s = pool.Admit(key, _call, out evicted);
+        if (s < 0)
+        {
+            Bypasses++;
+            return -1;
+        }
+        Insertions++;
+        if (evicted) Evictions++;
+        return s;
+    }
+
+    /// <summary>
+    /// Promote-only admission (#1071): copies a cold miss of the current call into <paramref name="slot"/>, chosen by the caller
+    /// (the weakest resident by its own score), evicting whatever the slot holds. The slot is pinned for the rest of the call. The
+    /// miss stays counted as cold (it was computed elsewhere this call); <see cref="Promotions"/> counts the copy.
+    /// </summary>
+    /// <param name="layer">Layer of the current call.</param>
+    /// <param name="expert">An expert the current call left cold.</param>
+    /// <param name="slot">Target slot of the layer's pool; must not be pinned by the current call.</param>
+    /// <param name="evicted">True when the slot held another expert.</param>
+    /// <exception cref="InvalidOperationException">The expert is not a cold miss of the call, or the slot is pinned.</exception>
+    public void Promote(int layer, int expert, int slot, out bool evicted)
+    {
+        var pool = ColdMissPool(layer, expert, out int key);
+        if (pool.IsPinned(slot, _call))
+            throw new InvalidOperationException($"slot {slot} is pinned by the current call and cannot take a promotion.");
+        pool.PlaceAt(key, slot, _call, out evicted);
+        Promotions++;
+        if (evicted) Evictions++;
+    }
+
+    private SlotPool ColdMissPool(int layer, int expert, out int key)
+    {
+        if (layer != _callLayer)
+            throw new InvalidOperationException($"layer {layer} is not the current call's layer ({_callLayer}).");
+        key = Key(layer, expert);
+        var pool = _pools[_poolOfLayer[layer]];
+        if (_keyStamp[key] != _call || pool.SlotOfKey(key) >= 0)
+            throw new InvalidOperationException($"expert {expert} of layer {layer} is not a cold miss of the current call.");
+        return pool;
+    }
+
     /// <summary>Forgets every resident expert (slot contents are no longer valid). Counters are kept.</summary>
     public void Clear()
     {
@@ -236,7 +330,7 @@ public sealed class ExpertCache
     }
 
     /// <summary>Zeroes every counter.</summary>
-    public void ResetCounters() => Hits = Misses = Evictions = Insertions = Bypasses = 0;
+    public void ResetCounters() => Hits = Misses = Evictions = Insertions = Bypasses = ColdMisses = Promotions = 0;
 
     private int Key(int layer, int expert) => _layerOffset[layer] + expert;
 
@@ -277,6 +371,8 @@ public sealed class ExpertCache
         public int SlotOfKey(int key) => _slotOfKey[key];
 
         public int KeyOfSlot(int slot) => _keyOfSlot[slot];
+
+        public bool IsPinned(int slot, long call) => _pinStamp[slot] == call;
 
         public void Clear()
         {
@@ -344,6 +440,24 @@ public sealed class ExpertCache
                 PushTail(Probation, victim);
             }
             return victim;
+        }
+
+        /// <summary>Places <paramref name="key"/> in <paramref name="slot"/> (chosen by the caller), as a new arrival.</summary>
+        public void PlaceAt(int key, int slot, long call, out bool evicted)
+        {
+            int old = _keyOfSlot[slot];
+            evicted = old >= 0;
+            if (evicted) _slotOfKey[old] = -1;
+            _keyOfSlot[slot] = key;
+            _slotOfKey[key] = slot;
+            _pinStamp[slot] = call;
+            _lastUse[slot] = call;
+            _freq[slot] = 1;
+            if (_policy != ExpertCachePolicy.Lfu)
+            {
+                Unlink(slot);
+                PushTail(Probation, slot);
+            }
         }
 
         /// <summary>LRU / SLRU victim: the least recent unpinned slot of probation, then of protected. Free slots sort first.</summary>

@@ -245,6 +245,10 @@ public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
         if (config.SsmConfig is null)
             throw new ArgumentException("NemotronH config must have SsmConfig populated.", nameof(config));
 
+        // #1071: the model file keys the cold-expert calibration cache.
+        var moeOptions = moeOffload ?? MoeOffloadOptions.WithEnvironmentFallback(null);
+        moeOffload = moeOptions with { ModelPath = moeOptions.ModelPath ?? gguf.ShardPaths[0] };
+
         var cpuModel = NemotronHTransformerModel.LoadFromGguf(gguf, config);
         try
         {
@@ -586,7 +590,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
             model._moeSpec = ComputeMoeSpec(layers, hiddenSize);
             if (hasMoe)
             {
-                model.AllocateMoeScratch(moeBlock);
+                model.AllocateMoeScratch(moeBlock, coldLeg: offloadExperts && moeOptions.MayUseCpuLeg);
 
                 // #1063 addendum / #1070: every lazily grown buffer is grown to its worst case for one block now, so a long
                 // prompt cannot push the process over the budget mid-run (and the offload budget below measures it).
@@ -1103,7 +1107,11 @@ public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
         if (_offload is not null) AdmitOffloadForwardGrowth(seqLen);
         _state.EnsureCapacity(seqLen);
         nint streamH = _stream.Handle;
-        if (_offload is not null) MoeTelemetry.RecordTokens(seqLen);
+        if (_offload is not null)
+        {
+            MoeTelemetry.RecordTokens(seqLen);
+            _offload.BeginForward(seqLen);   // promote-only admission's copy budget for this forward (#1071)
+        }
 
         UploadPositions(positions);
         Embed(tokenIds, _state.HiddenState, hiddenSize);
@@ -1159,6 +1167,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
         // synchronize first (mirrors CudaQwen3HybridDenseTransformerModel's identical D2H tail).
         _stream.Synchronize();
         _offload?.HarvestCopyWait();
+        _offload?.EndForward(seqLen);
 
         var shape = new TensorShape(seqLen, vocabSize);
         var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);

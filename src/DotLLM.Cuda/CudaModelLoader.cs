@@ -133,6 +133,11 @@ public static class CudaModelLoader
             // expert resident in VRAM when the model fits, else stream them from a host store through a VRAM cache (#1070).
             case Architecture.NemotronH or Architecture.NemotronHMoe:
             {
+                // --ctx-size (#1071) is the served context: the offload budget reserves KV for exactly that many tokens, so
+                // the model's window is capped to it too, or a longer request would allocate KV past the budget (#1063 rule 1).
+                int? ctx = (moeOffload ?? MoeOffloadOptions.WithEnvironmentFallback(null)).ContextTokens;
+                if (config.Architecture == Architecture.NemotronHMoe && ctx is > 0 and int c && c < config.MaxSequenceLength)
+                    config = config with { MaxSequenceLength = c };
                 var nemotronH = Architectures.CudaNemotronHTransformerModel
                     .LoadFromGguf(gguf, config, deviceId, ptxDir, moeOffload);
                 return (nemotronH, size => nemotronH.CreateKvCache(size));

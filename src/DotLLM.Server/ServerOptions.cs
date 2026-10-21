@@ -25,7 +25,8 @@ public sealed record ServerOptions
 
     /// <summary>
     /// Routed-expert offload for CUDA <c>nemotron_h_moe</c> models (<c>--moe-offload</c>, <c>--moe-cache-mib</c>,
-    /// <c>--moe-cache-policy</c>; issue #1070). Null = defaults plus the <c>DOTLLM_MOE_*</c> environment variables.
+    /// <c>--moe-cache-policy</c>, issue #1070; <c>--moe-cold</c>, <c>--moe-cpu-threads</c>, <c>--cpu-moe</c>, <c>--n-cpu-moe</c>,
+    /// <c>--moe-calibrate</c>, <c>--ctx-size</c>, issue #1071). Null = defaults plus the <c>DOTLLM_MOE_*</c> environment variables.
     /// </summary>
     public DotLLM.Core.Moe.MoeOffloadOptions? MoeOffload { get; init; }
 
@@ -351,7 +352,9 @@ public sealed record ServerOptions
         string? quant = null;
         string device = "auto";
         int? gpuLayers = null;
-        string? moeOffloadMode = null, moeCacheMib = null, moeCachePolicy = null;
+        string? moeOffloadMode = null, moeCacheMib = null, moeCachePolicy = null, moeCold = null;
+        int? moeCpuThreads = null, nCpuMoe = null, ctxSize = null;
+        bool cpuMoe = false, moeCalibrate = false;
         int threads = 0;
         int decodeThreads = 0;
         string host = "localhost";
@@ -407,6 +410,18 @@ public sealed record ServerOptions
                     moeCacheMib = next; i++; break;
                 case "--moe-cache-policy":
                     moeCachePolicy = next; i++; break;
+                case "--moe-cold":
+                    moeCold = next; i++; break;
+                case "--moe-cpu-threads":
+                    moeCpuThreads = int.Parse(next!, System.Globalization.CultureInfo.InvariantCulture); i++; break;
+                case "--n-cpu-moe":
+                    nCpuMoe = int.Parse(next!, System.Globalization.CultureInfo.InvariantCulture); i++; break;
+                case "--ctx-size" or "--ctx":
+                    ctxSize = int.Parse(next!, System.Globalization.CultureInfo.InvariantCulture); i++; break;
+                case "--cpu-moe":
+                    cpuMoe = true; break;
+                case "--moe-calibrate":
+                    moeCalibrate = true; break;
                 case "--gpu-layers":
                     gpuLayers = int.Parse(next!); i++; break;
                 case "--threads":
@@ -508,7 +523,8 @@ public sealed record ServerOptions
             Quant = quant,
             Device = device,
             GpuLayers = gpuLayers,
-            MoeOffload = DotLLM.Core.Moe.MoeOffloadOptions.FromCli(moeOffloadMode, moeCacheMib, moeCachePolicy),
+            MoeOffload = DotLLM.Core.Moe.MoeOffloadOptions.FromCli(new DotLLM.Core.Moe.MoeCliValues(moeOffloadMode, moeCacheMib,
+                moeCachePolicy, moeCold, moeCpuThreads, cpuMoe, nCpuMoe, moeCalibrate, ctxSize)),
             Threads = threads,
             DecodeThreads = decodeThreads,
             Host = host,

@@ -83,15 +83,13 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         [DefaultValue(false)]
         public bool Json { get; set; }
 
-        [CommandOption("--n-cpu-moe")]
+        [CommandOption(MoeOffloadCli.NCpuMoeOption)]
         [Description(
-            "MoE CPU/GPU expert offload (#370, llama.cpp --n-cpu-moe equivalent, Vulkan " +
-            "Qwen3MoeHybrid only): put the first N MoE layers' routed experts on the CPU " +
-            "instead of the GPU, trading decode/prefill throughput for reduced device " +
-            "memory. 0 = fully GPU-resident/streaming (default). No-op on cpu/cuda backends " +
-            "or non-Qwen3MoeHybrid Vulkan models.")]
-        [DefaultValue(0)]
-        public int NCpuMoeLayers { get; set; }
+            "MoE CPU/GPU expert offload (llama.cpp --n-cpu-moe equivalent): put the routed experts of the first N layers on " +
+            "the CPU, trading throughput for device memory. Vulkan Qwen3MoeHybrid (#370): CPU expert compute for those layers. " +
+            "CUDA nemotron_h_moe (#1071): those layers' experts are never cached and always computed on the CPU. Unset = none " +
+            "(env fallback DOTLLM_N_CPU_MOE). No-op on the cpu backend.")]
+        public int? NCpuMoeLayers { get; set; }
 
         /// <summary>Routed-expert placement on CUDA (issue #1070).</summary>
         [CommandOption(MoeOffloadCli.ModeOption)]
@@ -107,6 +105,37 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         [CommandOption(MoeOffloadCli.PolicyOption)]
         [Description(DotLLM.Core.Moe.MoeOffloadOptions.PolicyHelp)]
         public string? MoeCachePolicy { get; set; }
+
+        /// <summary>Where uncached offloaded experts run (issue #1071).</summary>
+        [CommandOption(MoeOffloadCli.ColdOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.ColdHelp)]
+        public string? MoeCold { get; set; }
+
+        /// <summary>CPU cold-expert worker threads (issue #1071).</summary>
+        [CommandOption(MoeOffloadCli.CpuThreadsOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CpuThreadsHelp)]
+        public int? MoeCpuThreads { get; set; }
+
+        /// <summary>llama.cpp <c>--cpu-moe</c>: every MoE layer's experts on the CPU (issue #1071).</summary>
+        [CommandOption(MoeOffloadCli.CpuMoeOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CpuMoeHelp)]
+        [DefaultValue(false)]
+        public bool CpuMoe { get; set; }
+
+        /// <summary>Re-run the MoE offload cost calibration (issue #1071).</summary>
+        [CommandOption(MoeOffloadCli.CalibrateOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CalibrateHelp)]
+        [DefaultValue(false)]
+        public bool MoeCalibrate { get; set; }
+
+        /// <summary>Context the MoE offload VRAM budget reserves KV cache for (issue #1071).</summary>
+        [CommandOption(MoeOffloadCli.ContextOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.ContextHelp)]
+        public int? CtxSize { get; set; }
+
+        /// <summary>The raw MoE offload option values (issues #1070, #1071).</summary>
+        public DotLLM.Core.Moe.MoeCliValues MoeValues => new(MoeOffload, MoeCacheMib, MoeCachePolicy, MoeCold, MoeCpuThreads,
+            CpuMoe, NCpuMoeLayers, MoeCalibrate, CtxSize);
 
         [CommandOption("--depth-list")]
         [Description("Comma-separated context depths for multi-point sweep (e.g., 512,2048,8192). " +
@@ -137,7 +166,7 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
                 return ValidationResult.Error(parseError!);
             if (DeviceCli.Validate(Device) is { } deviceError)
                 return ValidationResult.Error(deviceError);
-            if (MoeOffloadCli.Validate(MoeOffload, MoeCacheMib, MoeCachePolicy) is { } moeError)
+            if (MoeOffloadCli.Validate(MoeValues) is { } moeError)
                 return ValidationResult.Error(moeError);
             return ValidationResult.Success();
         }
@@ -249,9 +278,13 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
                     // THE shared per-architecture CUDA dispatch (#259) — routes hybrid
                     // architectures (Qwen3MoeHybrid, Qwen3HybridDense) to their dedicated
                     // loaders; their GDN layers have no attn_output.weight.
+                    // Without --ctx-size the offload budget reserves KV for what this run uses, not the model's maximum (#1071).
                     (model, kvFactory) = DotLLM.Cuda.CudaModelLoader.CreateFromGguf(gguf, config, gpuId,
-                        moeOffload: MoeOffloadCli.Build(settings.MoeOffload, settings.MoeCacheMib, settings.MoeCachePolicy)
-                            with { Log = moeNotes.Add });
+                        moeOffload: MoeOffloadCli.Build(settings.MoeValues with
+                        {
+                            ContextTokens = settings.CtxSize ?? Math.Min(config.MaxSequenceLength,
+                                promptTokens.Length + maxDepth + settings.GenTokens + 8),
+                        }) with { Log = moeNotes.Add });
                     deviceLabel = DotLLM.Cuda.CudaDevice.GetDevice(gpuId).Name;
                     break;
 
@@ -260,7 +293,8 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
                     vulkanDevice = DotLLM.Vulkan.VulkanDevice.Create();
                     // THE shared per-architecture Vulkan dispatch (#259).
                     (model, kvFactory) = DotLLM.Vulkan.VulkanModelLoader.CreateFromGguf(
-                        vulkanDevice, gguf, config, ResolveSpvDir(), settings.NCpuMoeLayers);
+                        vulkanDevice, gguf, config, ResolveSpvDir(),
+                        DotLLM.Core.Moe.MoeOffloadOptions.ResolveCpuMoeLayers(settings.CpuMoe, settings.NCpuMoeLayers));
                     deviceLabel = vulkanDevice.DeviceName;
                     if (model is DotLLM.Vulkan.VulkanQwen3MoeHybridTransformerModel vkMoe
                         && vkMoe.NCpuMoeLayers > 0 && !settings.Json)
