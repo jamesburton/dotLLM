@@ -19,7 +19,7 @@
 - Build: Release with analyzers ON: `dotnet build -c Release -m:1 -nr:false -p:UseSharedCompilation=false -p:EnableSourceControlManagerQueries=false`.
 - No new full-tensor widen or copy of quantized KV or weights, including in any fallback the Bonsai shape reaches (user's critical rule). State per-token byte costs in each PR.
 - No numerical tolerance may be widened. Never spill into WDDM shared memory; refuse instead.
-- Zero allocations on the hot path. Use `[LibraryImport]`. `*.ptx` files are tracked: rebuild and commit them with kernel changes (`native/build_ptx.bat`; PTX `.version` 8.7; the four flash-mma kernels plus any new one are compute_86 + C++17).
+- Zero allocations on the hot path. Use `[LibraryImport]`. `*.ptx` files are tracked: rebuild and commit them with kernel changes (`native/build_ptx.bat`; PTX `.version` 8.7; the four flash-mma kernels plus any new one are compute_86 + C++17). **The local nvcc is CUDA 13.x and emits the wrong PTX version.** Build the compat (8.7) PTX on the T5500 instead (`ssh t5500`, Windows, `E:\CUDA_v12.8.1\bin\nvcc.exe`, CPU-only), or locally with `~/.dotllm/toolchains/cuda-12.8/cuda_nvcc-windows-x86_64-12.8.93-archive`. After PR E, kernel changes must also commit the latest (13.3) set.
 - XML docs on public APIs. StyleCop comment rules. File-scoped namespaces.
 - System.Text.Json source-gen DTOs: no initializers on `init` properties (use nullable + resolve in code). Add a new response-only DTO to `JsonContextDefaultsTests.ResponseOnly`.
 - Workflow: create a GitHub issue per PR. Branch `issue/{n}-{slug}` from `dev` (PR D from the merged result of B + C). Put `(#n)` in every commit. PR body says `Closes #n`. After verification, merge into `dev` and push (the user authorized this).
@@ -197,6 +197,45 @@
 - [ ] **Step 4: Run the new tests**, plus `CudaQwen3HybridDensePerRowKvqVerifyTests`, `CudaQwen3HybridDenseFlashPrefillHd256Test`, `CudaQwen3HybridDenseContextFitTests`, `CudaQwen3HybridDensePrefillChunkingTest`, `CudaQwen3HybridDenseMtpPrefillTilingTests` and `CudaQwen3HybridDenseMtpLongContextTests`. Expect all to pass.
 - [ ] **Step 5: Hardware fit check.** Run `scripts/context-fit-probe.ps1` with q4_0, no MTP and tile 512. Expect a fitted window of at least 131,072 (about 135k).
 - [ ] **Step 6: Commit** `cuda: route quantized-KV prefill and 9-row verifies to the fused kernel; drop the scratch from the fit (#B)`. Update `docs/ATTENTION.md` and `docs/KV_CACHE.md` with the removed 4 KiB/token. List any remaining `ResolveKvF16` callers and their costs in the PR body. Open the PR (Closes #B), merge into `dev`, and push.
+
+## PR E — latest-toolkit and compat PTX sets (spec C7, issue #1098)
+
+### Task 13: Dual PTX sets, loader and benchmark
+
+**Files:**
+- Modify: `native/build_ptx.bat`, `native/build.ps1`, `native/build.sh`. Add the set selection: `-Set compat|latest`, with the toolkit path and expected `.version` for each set.
+- Create: `native/ptx-latest/*.ptx`. These are all kernels built with CUDA 13.3 (`C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3`).
+- Create: `scripts/build-ptx-compat-remote.ps1`. It copies `native/kernels` to the T5500, runs the compat build there with CUDA 12.8, copies `native/ptx/*.ptx` back, and verifies `.version 8.7` for each file.
+- Modify: `src/DotLLM.Cuda/CudaKernels.cs`. The PTX directory resolution moves to one helper, `CudaPtxSet`. Modify `src/DotLLM.Cuda/DotLLM.Cuda.csproj` so it copies both sets to the output.
+- Create: `src/DotLLM.Cuda/CudaPtxSet.cs`
+- Test: `tests/DotLLM.Tests.Unit/Cuda/CudaPtxSetTests.cs`
+
+**Interfaces:**
+- Produces:
+  - `enum CudaPtxSetKind { Compat, Latest }`.
+  - `static class CudaPtxSet`, with:
+    - `static CudaPtxSetKind Choose(int driverVersion, int latestRequiredDriverVersion, string? overrideEnv)`.
+    - `static string ResolvePath(string ptxRoot, string fileName, CudaPtxSetKind preferred)`. It returns the latest file if it exists, otherwise the compat file.
+  - Env override: `DOTLLM_CUDA_PTX_SET=compat|latest`.
+  - The module load falls back to compat on `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`.
+  - A startup log line names the chosen set.
+
+- [ ] **Step 1: Failing tests.**
+  - `Choose_PicksLatest_WhenDriverIsNewEnough`, `Choose_PicksCompat_ForOlderDriver` and `Choose_HonoursOverride`.
+  - `ResolvePath_FallsBackToCompat_WhenLatestFileMissing`.
+  - Use temp directories, and inject the driver versions.
+- [ ] **Step 2: Fail. Step 3: Implement.**
+  - Build `native/ptx-latest` locally.
+  - Rebuild compat on the T5500 and confirm `git diff --stat native/ptx` is empty. The compat set must reproduce exactly.
+- [ ] **Step 4: Pass.** Run the full GPU test set twice, once with `DOTLLM_CUDA_PTX_SET=compat` and once with `latest`, and expect 0 failures both times.
+- [ ] **Step 5: Benchmark.** Compare latest against compat on the 3060 for these kernels:
+  - `Bench_Flash_vs_F32` (65536)
+  - `Bench_KvqPrefill_vs_ScratchDequant`
+  - `Microbench_Kvq_Fused_vs_Scratch`
+  - a Bonsai `dotllm bench` at pp512/tg128
+
+  Add the table to `docs/CUDA.md`, together with the build/contract update.
+- [ ] **Step 6: Commit** with the message `cuda: ship latest-toolkit and PTX 8.7 compat kernel sets; pick the newest the driver accepts (#1098)`. Open the PR (Closes #1098), merge it into `dev`, and push.
 
 ## PR C — MTP head KV grows in place (spec C6)
 
