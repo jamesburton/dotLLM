@@ -593,6 +593,8 @@ public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
                 model._state.EnsureCapacity(moeBlock);
                 model.EnsureActivF16InScratch(moeBlock * gemmMaxK);
                 model.EnsureActivF16OutScratch(moeBlock * gemmMaxM);
+                model._gemmMaxK = gemmMaxK;
+                model._gemmMaxM = gemmMaxM;
                 if (offloadExperts) model.InitializeMoeOffload(cpuLayers, moeOptions);
             }
             return model;
@@ -1098,6 +1100,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
         }
 
         _context.MakeCurrent();
+        if (_offload is not null) AdmitOffloadForwardGrowth(seqLen);
         _state.EnsureCapacity(seqLen);
         nint streamH = _stream.Handle;
         if (_offload is not null) MoeTelemetry.RecordTokens(seqLen);

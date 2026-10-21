@@ -1,4 +1,5 @@
 // src/DotLLM.Cuda/Architectures/CudaNemotronHMoeOffload.cs
+using DotLLM.Core.Configuration;
 using DotLLM.Core.Moe;
 using DotLLM.Cuda.Interop;
 using DotLLM.Models.Architectures;
@@ -81,8 +82,42 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
         return true;
     }
 
+    /// <summary>
+    /// Device memory kept free: an explicit <see cref="MoeOffloadOptions.ReserveMib"/>, else the larger of
+    /// <see cref="MoeVramReserveBytes"/> and the CUDA admission reserve every other growth honours (#1076,
+    /// <see cref="DeviceMemoryBudget.ReserveEnvVar"/>), so raising that reserve also shrinks the expert cache.
+    /// </summary>
     private static long ReserveBytes(MoeOffloadOptions o)
-        => o.ReserveMib is { } mib ? mib * MoeOffloadPlanner.MiB : MoeVramReserveBytes;
+        => o.ReserveMib is { } mib
+            ? mib * MoeOffloadPlanner.MiB
+            : Math.Max(MoeVramReserveBytes,
+                DeviceMemoryBudget.ResolveReserveBytes(Environment.GetEnvironmentVariable(DeviceMemoryBudget.ReserveEnvVar)));
+
+    // GEMM row maxima from the load-time estimate: the F16 activation scratch of a seqLen-row GEMM is seqLen times these.
+    private long _gemmMaxK, _gemmMaxM;
+
+    /// <summary>
+    /// With offloaded experts the expert cache was sized from the free VRAM left after one MoE block's worth of forward
+    /// state and GEMM scratch (#1063 addendum, rule 1). A forward of more rows than that (a caller that does not chunk its
+    /// prefill: an explicit larger prefill chunk, perplexity windows, tests) would grow those buffers into the reserve, and
+    /// WDDM spills rather than fails, so the growth is admitted against free VRAM first and refused with nothing allocated
+    /// (the model stays usable for shorter forwards) when it does not fit.
+    /// </summary>
+    /// <param name="seqLen">Rows of the coming forward.</param>
+    /// <exception cref="DeviceMemoryAdmissionException">The growth would not leave the reserve free.</exception>
+    private void AdmitOffloadForwardGrowth(int seqLen)
+    {
+        long growth = _state.GrowthBytes(seqLen)
+            + Math.Max(0, (long)seqLen * _gemmMaxK - _activF16InScratchElems) * sizeof(ushort)
+            + Math.Max(0, (long)seqLen * _gemmMaxM - _activF16OutScratchElems) * sizeof(ushort);
+        if (growth == 0) return;
+        CudaDriverApi.cuMemGetInfo_v2(out nuint free, out _).ThrowOnError();
+        long reserve = _offload!.Info.ReserveBytes;
+        if (DeviceMemoryBudget.Fits((long)free, growth, reserve)) return;
+        throw new DeviceMemoryAdmissionException(
+            DeviceMemoryBudget.DescribeRefusal($"a {seqLen}-token forward's activation buffers (experts offloaded)", growth, (long)free, reserve)
+            + $" Prefill in chunks of at most {_moeScratchTokens} tokens (the engine does this by default; check --prefill-chunk).");
+    }
 
     private void DisposeMoeOffload()
     {

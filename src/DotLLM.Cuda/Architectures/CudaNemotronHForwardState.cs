@@ -128,6 +128,28 @@ internal sealed class CudaNemotronHForwardState : IDisposable
     public bool EnsureCapacity(int seqLen)
     {
         if (seqLen <= _currentSeqLen) return false;
+        return GrowTo(seqLen);
+    }
+
+    /// <summary>
+    /// Device bytes <see cref="EnsureCapacity"/> would add for <paramref name="seqLen"/> rows (0 when the buffers already
+    /// hold that many). The growth frees the old buffers first, so this is the difference between the two sizes.
+    /// </summary>
+    /// <param name="seqLen">Rows the next forward needs.</param>
+    /// <returns>The extra device bytes.</returns>
+    public long GrowthBytes(int seqLen)
+    {
+        if (seqLen <= _currentSeqLen) return 0;
+        long cap = (long)BitOperations.RoundUpToPowerOf2((uint)seqLen);
+        return (BytesFor(cap) - BytesFor(_currentSeqLen)) * sizeof(float);
+    }
+
+    private long BytesFor(long cap)
+        => cap == 0 ? 0 : cap * (3L * _hiddenSize + _maxIntermediateSize + _vocabSize + 2L * _qElems + 2L * _kvElems
+            + _inputProjectionDim + 2L * _convDim + _nHead + 3L * _dInner + 2L * _bcDim) + (long)(_dConv - 1) * _convDim;
+
+    private bool GrowTo(int seqLen)
+    {
 
         int cap = (int)BitOperations.RoundUpToPowerOf2((uint)seqLen);
         FreeSeqBuffers();
