@@ -45,6 +45,7 @@ public sealed partial class TextGenerator
     private readonly bool _recurrentPrefixEnabled;
     private RecurrentPrefixEntry? _recurrentPrefix;
     private int[]? _recurrentPrefixLastPrompt;
+    private int? _recurrentPrefixLastSuffixBoundary;   // _recurrentPrefixLastPrompt's generation-prompt boundary (issue #1093)
 
     // True from ResolveKvCache until the request reaches a normal end (StoreInPrefixCache). Still set in the request's finally
     // means it failed or was abandoned, so the snapshot is dropped (PR #1026 re-review).
@@ -323,7 +324,7 @@ public sealed partial class TextGenerator
         }
 
         // Resolve KV-cache: reuse from prefix cache or allocate fresh
-        var (kvCache, cachedTokenCount, ownsKvCache) = ResolveKvCache(promptIds, promptLen, maxTokens, out int snapshotAt, adapter);
+        var (kvCache, cachedTokenCount, ownsKvCache) = ResolveKvCache(promptIds, promptLen, maxTokens, out int snapshotAt, options.GenerationPromptSuffix, adapter);
         _recurrentPrefixRequestPending = _recurrentPrefixEnabled;
 
         // Hybrid mode is enabled when a strategy is wired up, the prompt is short enough,
@@ -927,7 +928,7 @@ public sealed partial class TextGenerator
         }
 
         // Resolve KV-cache: reuse from prefix cache or allocate fresh
-        var (kvCache, cachedTokenCount, ownsKvCache) = ResolveKvCache(promptIds, promptLen, maxTokens, out int snapshotAt, adapter);
+        var (kvCache, cachedTokenCount, ownsKvCache) = ResolveKvCache(promptIds, promptLen, maxTokens, out int snapshotAt, options.GenerationPromptSuffix, adapter);
         _recurrentPrefixRequestPending = _recurrentPrefixEnabled;
         long kvBytes = GetKvCacheBytes(kvCache);
 
@@ -1436,7 +1437,8 @@ public sealed partial class TextGenerator
     /// Returns the cache, number of cached tokens, and whether the caller owns (should dispose) the cache.
     /// </summary>
     private (Core.Attention.IKvCache KvCache, int CachedTokenCount, bool OwnsKvCache) ResolveKvCache(
-        int[] promptIds, int promptLen, int maxTokens, out int snapshotAt, ILoraAdapter? adapter = null)
+        int[] promptIds, int promptLen, int maxTokens, out int snapshotAt, string? generationPromptSuffix,
+        ILoraAdapter? adapter = null)
     {
         snapshotAt = -1;
         _resumedMtp = null;
@@ -1452,9 +1454,9 @@ public sealed partial class TextGenerator
         if (recurrent)
         {
             if (_recurrentPrefixEnabled && adapter is null && _tieredSnapshots is not null)
-                return ResolveTieredRecurrentPrefix(promptIds, promptLen, maxTokens, out snapshotAt);
+                return ResolveTieredRecurrentPrefix(promptIds, promptLen, maxTokens, generationPromptSuffix, out snapshotAt);
             if (_recurrentPrefixEnabled && adapter is null)
-                return ResolveRecurrentPrefix(promptIds, promptLen, maxTokens, out snapshotAt);
+                return ResolveRecurrentPrefix(promptIds, promptLen, maxTokens, generationPromptSuffix, out snapshotAt);
             _model.ResetSequenceState();
         }
 
@@ -1656,20 +1658,28 @@ public sealed partial class TextGenerator
     /// </list>
     /// </remarks>
     private (Core.Attention.IKvCache KvCache, int CachedTokenCount, bool OwnsKvCache) ResolveRecurrentPrefix(
-        int[] promptIds, int promptLen, int maxTokens, out int snapshotAt)
+        int[] promptIds, int promptLen, int maxTokens, string? generationPromptSuffix, out int snapshotAt)
     {
         snapshotAt = -1;
         int needed = promptLen + maxTokens;
         int[]? previous = _recurrentPrefixLastPrompt;
+        int? previousSuffixBoundary = _recurrentPrefixLastSuffixBoundary;
         int shared = previous is null ? 0 : promptIds.AsSpan().CommonPrefixLength(previous);
+        int? suffixBoundary = RecurrentSnapshotBoundary.FromGenerationSuffix(promptIds, _tokenizer, generationPromptSuffix);
         _recurrentPrefixLastPrompt = promptIds;
+        _recurrentPrefixLastSuffixBoundary = suffixBoundary;
 
         // Leave at least one suffix token to run (it produces the logits), so an exact repeat of the previous prompt
         // snapshots one token short of its end. A prompt that extends the whole previous one is an agent loop, whose next
         // prompt will extend this one: snapshot at this prompt's end, so the next turn prefills only what it adds. Snapshotting
         // at the shared prefix made every agent hit reuse the prompt from two turns back (issue #1080).
+        // A chat turn that continues the previous one but re-renders its generation prompt differently (issue #1093) does
+        // not extend it: snapshot just before this prompt's generation prompt, which the next turn will share.
         bool extendsPrevious = previous is not null && shared == previous.Length;
-        int boundary = extendsPrevious ? promptLen - 1 : Math.Min(shared, promptLen - 1);
+        int boundary = RecurrentSnapshotBoundary.Choose(
+            extendsPrevious ? promptLen - 1 : Math.Min(shared, promptLen - 1),
+            RecurrentSnapshotBoundary.ForContinuation(suffixBoundary, shared, previousSuffixBoundary),
+            promptLen);
 
         var entry = _recurrentPrefix;
         if (entry is not null
@@ -1702,9 +1712,10 @@ public sealed partial class TextGenerator
         // Issue #1088: with no snapshot held there is nothing to evict. A prompt that shares nothing usable with the previous
         // one starts a conversation (the first request, or a new client), so snapshot its own end, betting that the next
         // prompt extends it: an agent's second turn then hits instead of re-prefilling its first. A prompt that does share a
-        // prefix keeps that boundary (the classifier case above).
+        // prefix keeps that boundary (the classifier case above). With a generation-prompt hint the bet is the start of the
+        // generation prompt instead (issue #1093): the next turn shares that much whether or not it re-renders the rest.
         if (_recurrentPrefix is null && shared < RecurrentPrefixMinTokens)
-            boundary = promptLen - 1;
+            boundary = suffixBoundary ?? promptLen - 1;
 
         bool snapshot = boundary >= RecurrentPrefixMinTokens;
         int cacheSize = Math.Min(_model.Config.MaxSequenceLength, needed + (snapshot ? RecurrentPrefixKvHeadroom : 0));
@@ -1847,6 +1858,7 @@ public sealed partial class TextGenerator
         var entry = _recurrentPrefix;
         _recurrentPrefix = null;
         _recurrentPrefixLastPrompt = null;
+        _recurrentPrefixLastSuffixBoundary = null;
         entry?.Dispose();
     }
 

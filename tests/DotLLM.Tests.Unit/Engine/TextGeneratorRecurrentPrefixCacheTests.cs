@@ -365,6 +365,92 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
         }
         cached.ClearRecurrentPrefixCache();
     }
+
+    // ── generation-prompt boundary (issue #1093) ──
+
+    /// <summary>The chat template's generation prompt G, as the text the server passes and the tokens it encodes to.</summary>
+    private const string GenerationSuffix = "90,91";
+    private static readonly int[] G = [90, 91];
+
+    /// <summary>The first user turn: the fixed prefix plus a short user message.</summary>
+    private static readonly int[] P1 = [.. Enumerable.Range(2, PrefixLen), 30, 31];
+
+    private static InferenceOptions HintedOpts => Opts with { GenerationPromptSuffix = GenerationSuffix };
+
+    private static TextGenerator BuildCached(HistoryModel model, bool tiered) =>
+        new(model, new CsvTokenizer(), (cfg, size) => new SimpleKvCache(KvGeometry.FromConfig(cfg), size), recurrentPrefixCache: true,
+            recurrentPrefixCacheOptions: tiered ? new() { MaxEntries = 2, HostBudgetBytes = 100000 } : null);
+
+    private static InferenceResponse CheckHinted(TextGenerator cached, TextGenerator plain, HistoryModel model, int[] prompt)
+    {
+        string text = string.Join(",", prompt);
+        var want = plain.Generate(text, Opts);
+        model.Calls.Clear();
+        var got = cached.Generate(text, HintedOpts);
+        Assert.Equal(want.GeneratedTokenIds, got.GeneratedTokenIds);
+        Assert.Empty(model.KvLengthMismatches);
+        return got;
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DivergingHistory_WithSuffixHint_HitsTheWholePreviousTurn(bool tiered)
+    {
+        // Bonsai's template with the client dropping reasoning: turn N renders as H + G, and turn N+1 re-renders turn N's
+        // reply as R, which differs from G at its first token. Snapshotting at a prompt's end (or one short of it) includes G
+        // and never matches again; the snapshot must sit just before G, and advance every turn.
+        using var model = new HistoryModel();
+        var cached = BuildCached(model, tiered);
+        var plain = new TextGenerator(model, new CsvTokenizer(), (cfg, size) => new SimpleKvCache(KvGeometry.FromConfig(cfg), size));
+        int[] h2 = [.. P1, .. Run(100, 20), .. Run(150, 20)];      // P1 + R1 + U2
+        int[] h3 = [.. h2, .. Run(200, 20), .. Run(250, 20)];      // + R2 + U3
+
+        Assert.Equal(0, CheckHinted(cached, plain, model, [.. P1, .. G]).Timings.CachedTokenCount);
+        var turn2 = CheckHinted(cached, plain, model, [.. h2, .. G]);
+        var turn3 = CheckHinted(cached, plain, model, [.. h3, .. G]);
+
+        Assert.Equal(P1.Length, turn2.Timings.CachedTokenCount);
+        Assert.Equal(h2.Length, turn3.Timings.CachedTokenCount);
+        cached.ClearRecurrentPrefixCache();
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ExactExtension_StillSnapshotsAtPromptEnd_WithSuffixHint(bool tiered)
+    {
+        // ChatML, or reasoning sent back: each prompt extends the whole previous one, G included. The later boundary wins,
+        // so the snapshot still sits one token short of the prompt's end, as without the hint.
+        using var model = new HistoryModel();
+        var cached = BuildCached(model, tiered);
+        var plain = new TextGenerator(model, new CsvTokenizer(), (cfg, size) => new SimpleKvCache(KvGeometry.FromConfig(cfg), size));
+        int[] t1 = [.. P1, .. G];
+        int[] t2 = [.. t1, .. Run(100, 20), .. Run(150, 20), .. G];
+        int[] t3 = [.. t2, .. Run(200, 20), .. Run(250, 20), .. G];
+
+        CheckHinted(cached, plain, model, t1);
+        Assert.True(CheckHinted(cached, plain, model, t2).Timings.CachedTokenCount >= P1.Length);
+        var turn3 = CheckHinted(cached, plain, model, t3);
+
+        Assert.Equal(t2.Length - 1, turn3.Timings.CachedTokenCount);
+        cached.ClearRecurrentPrefixCache();
+    }
+
+    [Fact]
+    public void Classifier_WithSuffixHint_StillSnapshotsTheSharedPrefix()
+    {
+        // A fixed system prompt and a different question each time, through a chat template. The prompt does not continue
+        // the previous one, so the generation-prompt boundary must not displace the shared-prefix one: it would never hit.
+        var (cached, plain, model) = Build();
+        CheckHinted(cached, plain, model, [.. Enumerable.Range(2, PrefixLen), 30, 31, .. G]);
+        CheckHinted(cached, plain, model, [.. Enumerable.Range(2, PrefixLen), 40, 41, .. G]);
+
+        var got = CheckHinted(cached, plain, model, [.. Enumerable.Range(2, PrefixLen), 50, 51, .. G]);
+
+        Assert.Equal(PrefixLen, got.Timings.CachedTokenCount);
+    }
+
     // ── fakes ──
 
     /// <summary>A KV whose storage another cache's forwards overwrite, like the CUDA hybrid's model-owned handle.</summary>
