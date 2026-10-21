@@ -97,6 +97,23 @@ public sealed class MtpAdaptiveGate
             return $"plain {_plainMsPerToken:F1} ms/tok (n={_plainSamples}), mtp {_mtpMsPerToken:F1} ms/tok (n={_mtpSamples}), since-reprobe {_sinceReprobe}/{_reprobeEvery}";
     }
 
+    /// <summary>
+    /// Forecasts, without counting a decision, whether the next request is likely to decode with MTP: MTP is unexplored or
+    /// plain is unmeasured, MTP is the measured winner, or the losing arm's re-probe falls on the next decision. A plain
+    /// request that takes the recurrent prefix snapshot reads this to decide whether to feed the MTP head through its
+    /// prefill. The feed costs time to first token on every such turn, and it only pays when a later hit drafts from the
+    /// head (#1088 review).
+    /// </summary>
+    /// <returns><see langword="true"/> when the next request is likely to use MTP.</returns>
+    public bool LikelyUsesMtpNext()
+    {
+        lock (_lock)
+        {
+            if (_mtpSamples == 0 || _plainSamples == 0) return true;   // an arm still to explore: MTP may well be tried next
+            return _mtpMsPerToken < _plainMsPerToken || _sinceReprobe + 1 >= _reprobeEvery;
+        }
+    }
+
     /// <summary>Decides whether the next request (with the given <c>max_tokens</c>) should use MTP.</summary>
     public bool ShouldUseMtp(int maxTokens)
     {

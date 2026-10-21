@@ -127,6 +127,23 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
     }
 
     [Fact]
+    public void NewConversation_SharingOnlyATemplateHeader_StillSnapshotsItsEnd()
+    {
+        // A real chat template starts every conversation with the same few tokens (BOS, the system role header). A new
+        // conversation that shares only those with the previous prompt, fewer than RecurrentPrefixMinTokens, must still snapshot
+        // its own end, or its second turn re-prefills everything (PR #1091 review: "shares nothing" means "nothing usable").
+        var (cached, plain, model) = Build(sharedStorage: true);
+        Check(cached, plain, model, Prompt(30));
+        Check(cached, plain, model, Prompt(31));
+        int[] other = [2, 3, 4, .. Enumerable.Range(40, 25)];          // Prompt() starts 2, 3, 4, ...
+        Assert.Equal(0, Check(cached, plain, model, string.Join(",", other)).Timings.CachedTokenCount);
+
+        var next = Check(cached, plain, model, string.Join(",", [.. other, .. Run(100, 10)]));
+
+        Assert.Equal(other.Length - 1, next.Timings.CachedTokenCount);
+    }
+
+    [Fact]
     public void PromptThatDoesNotExtendThePreviousOne_StillSnapshotsTheSharedPrefix()
     {
         // The classifier shape (issue #1025's first case): a fixed system prompt and a different question each time. Snapshotting

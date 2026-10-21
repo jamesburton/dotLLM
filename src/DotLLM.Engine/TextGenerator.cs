@@ -63,6 +63,10 @@ public sealed partial class TextGenerator
     // are the prefix's, so a hit resumes it at MtpMark and drafts without re-absorbing the prefix (issue #1088).
     private IMtpState? _resumedMtp;
 
+    // Whether this model's MTP head states can be marked and resumed (IMtpState.MarkPrefix), learned from the first state made;
+    // null until then. A plain turn never feeds a head that no hit could resume (PR #1091 review).
+    private bool? _mtpStatesResumable;
+
     private sealed class RecurrentPrefixEntry(int[] tokens, Core.Attention.IKvCache kv, object? checkpoint, IMtpState? mtp, object? mtpMark)
     {
         public readonly int[] Tokens = tokens;
@@ -344,8 +348,7 @@ public sealed partial class TextGenerator
         // the zero-GC-pressure guarantee on the inference hot path.
         int stopTailSize = ComputeStopTailSize(stopConditions);
         char[] stopScratch = ArrayPool<char>.Shared.Rent(stopTailSize);
-        DotLLM.Core.Models.IMtpState? mtpState = useMtp || TracksMtpHead(snapshotAt, cachedTokenCount, resumedMtp, useHybrid)
-            ? resumedMtp ?? CreateMtpState(kvCache) : null;
+        DotLLM.Core.Models.IMtpState? mtpState = AcquireRequestMtpState(useMtp, snapshotAt, cachedTokenCount, resumedMtp, useHybrid, mtpGate, kvCache);
 
         try
         {
@@ -947,8 +950,7 @@ public sealed partial class TextGenerator
         // normal completion, exception, or consumer-side cancellation (Dispose of the enumerator).
         int stopTailSize = ComputeStopTailSize(stopConditions);
         char[] stopScratch = ArrayPool<char>.Shared.Rent(stopTailSize);
-        DotLLM.Core.Models.IMtpState? mtpState = useMtp || TracksMtpHead(snapshotAt, cachedTokenCount, resumedMtp, useHybrid)
-            ? resumedMtp ?? CreateMtpState(kvCache) : null;
+        DotLLM.Core.Models.IMtpState? mtpState = AcquireRequestMtpState(useMtp, snapshotAt, cachedTokenCount, resumedMtp, useHybrid, mtpGate, kvCache);
         var generatedIds = new List<int>(maxTokens);
         long prefillTicks = 0;
         long decodeTicks = 0;
@@ -1752,14 +1754,56 @@ public sealed partial class TextGenerator
     /// True when a request that decodes plain should still carry the MTP head through its prefill (issue #1088): it takes a
     /// single-slot prefix snapshot, and a later hit on that snapshot can decode with MTP only if the head absorbed the prefix
     /// too. Without this, an adaptive gate that sends the first turn of an agent session to plain decode never sees MTP again,
-    /// because every later turn hits. The cost is the head's absorb of this prefill (one extra block per token) and its KV,
-    /// which the context fit already counts when MTP is on. A hit can carry the head only when it resumed one: the head cannot
-    /// start absorbing mid-sequence.
+    /// because every later turn hits. A hit can carry the head only when it resumed one: the head cannot start absorbing
+    /// mid-sequence.
     /// </summary>
-    private bool TracksMtpHead(int snapshotAt, int cachedTokenCount, IMtpState? resumedMtp, bool useHybrid)
+    /// <remarks>
+    /// The feed is not free: it adds the head's absorb to this request's prefill, so to its time to first token (about 0.2 ms
+    /// per token, 3% of the trunk prefill, for Bonsai-2 27B on an RTX 3060; PR #1091 review). So a plain turn feeds the head only
+    /// when the adaptive gate forecasts MTP for a coming request (<see cref="MtpAdaptiveGate.LikelyUsesMtpNext"/>). Once plain
+    /// decode measures faster, the session's later hits skip the feed and stay plain, as they did before #1088; the next miss
+    /// starts a fresh head. Its KV is already counted by the context fit when MTP is on. A backend whose head states cannot
+    /// resume (<see cref="IMtpState.MarkPrefix"/> returns null, the Vulkan states today) never feeds one.
+    /// </remarks>
+    /// <param name="snapshotAt">The prefill position at which this request snapshots, or -1.</param>
+    /// <param name="cachedTokenCount">Prompt tokens served from the prefix cache.</param>
+    /// <param name="resumedMtp">The head a prefix hit resumed, or null.</param>
+    /// <param name="useHybrid">Whether this request runs the hybrid prefill strategy.</param>
+    /// <param name="gate">The adaptive gate for this request's sampling kind, or null when MTP is not adaptive.</param>
+    /// <returns>True when the head should ride along this plain request's prefill.</returns>
+    private bool TracksMtpHead(int snapshotAt, int cachedTokenCount, IMtpState? resumedMtp, bool useHybrid, MtpAdaptiveGate? gate)
         => snapshotAt >= 0 && _tieredSnapshots is null && !useHybrid
-           && _mtpEnabled && _draftModel is null && _model.SupportsMtp
-           && (cachedTokenCount == 0 || resumedMtp is not null);
+           && _mtpEnabled && _draftModel is null && _model.SupportsMtp && _mtpStatesResumable != false
+           && (cachedTokenCount == 0 || resumedMtp is not null)
+           && (gate?.LikelyUsesMtpNext() ?? true);
+
+    /// <summary>
+    /// The MTP head state a request runs with: the one a prefix hit resumed, else a new one, when the request decodes with MTP
+    /// or carries the head for its snapshot (<see cref="TracksMtpHead"/>); otherwise null. The first state made tells whether
+    /// this model's states can resume. A head made only for the snapshot is dropped at once when they cannot.
+    /// </summary>
+    /// <param name="useMtp">Whether the request decodes with MTP.</param>
+    /// <param name="snapshotAt">The prefill position at which this request snapshots, or -1.</param>
+    /// <param name="cachedTokenCount">Prompt tokens served from the prefix cache.</param>
+    /// <param name="resumedMtp">The head a prefix hit resumed, or null.</param>
+    /// <param name="useHybrid">Whether this request runs the hybrid prefill strategy.</param>
+    /// <param name="gate">The adaptive gate for this request's sampling kind, or null.</param>
+    /// <param name="kvCache">The request's trunk KV cache, which sizes a new head.</param>
+    /// <returns>The head state, or null when the request runs without one.</returns>
+    private IMtpState? AcquireRequestMtpState(bool useMtp, int snapshotAt, int cachedTokenCount, IMtpState? resumedMtp,
+        bool useHybrid, MtpAdaptiveGate? gate, Core.Attention.IKvCache kvCache)
+    {
+        if (!useMtp && !TracksMtpHead(snapshotAt, cachedTokenCount, resumedMtp, useHybrid, gate))
+            return null;
+        if (resumedMtp is not null)
+            return resumedMtp;
+        var state = CreateMtpState(kvCache);
+        _mtpStatesResumable ??= state.MarkPrefix() is not null;
+        if (useMtp || _mtpStatesResumable == true)
+            return state;
+        state.Dispose();
+        return null;
+    }
 
     /// <summary>Hands the head state a prefix hit resumed to the request that resolved it (once), or null.</summary>
     private IMtpState? TakeResumedMtpState()

@@ -192,6 +192,62 @@ public sealed class TextGeneratorRecurrentPrefixMtpTests : IDisposable
         cached.ClearRecurrentPrefixCache();
     }
 
+    [SkippableFact]
+    public void AdaptiveGate_ThatMeasuresPlainFaster_FeedsNoHeadOnPlainTurns()
+    {
+        // PR #1091 review (T5500): feeding the head through a plain turn's prefill cost time to first token on every hit turn,
+        // for a head that no later turn drafted from once plain decode measured faster. With plain the clear winner and no
+        // re-probe due, a plain snapshot turn must not make or feed a head, and the hits stay plain and correct.
+        var (gguf, config) = Fixture("prefix-mtp-gate-plain.gguf");
+        using var _ = gguf;
+        using var inner = Load(gguf, config);
+        using var plainModel = Load(gguf, config);
+        var model = new DraftRecordingModel(inner);
+        var cached = new TextGenerator(model, new TokenIdsTokenizer(config.VocabSize), Kv(inner), mtpAdaptive: true, recurrentPrefixCache: true);
+        var plain = Generator(plainModel, Kv(plainModel), mtp: false, prefixCache: false);
+        Skip.If(cached.MtpGate is null, "DOTLLM_MTP_ADAPTIVE=0 disables the adaptive gate");
+        cached.MtpGate!.RecordSegment(false, 1000, 1.0);      // plain: 0.001 ms/token
+        cached.MtpGate!.RecordSegment(true, 1000, 1000.0);    // MTP: 1 ms/token
+        Assert.False(cached.MtpGate!.LikelyUsesMtpNext());
+        var options = new InferenceOptions { Temperature = 0f, RepetitionPenalty = 1f, MaxTokens = 2 * MtpAdaptiveGate.MinSampleTokens };
+        int[][] turns = AgentTurns(config.VocabSize);
+
+        for (int t = 0; t < turns.Length; t++)
+        {
+            var got = cached.Generate(Csv(turns[t]), options);
+            Assert.Equal(t == 0 ? 0 : turns[t - 1].Length - 1, got.Timings.CachedTokenCount);
+            Assert.Equal(0, got.Timings.SpeculativeDraftTokens);
+            Assert.Equal(plain.Generate(Csv(turns[t]), options).GeneratedTokenIds, got.GeneratedTokenIds);
+        }
+
+        Assert.Empty(model.CreatedStates);
+        cached.ClearRecurrentPrefixCache();
+    }
+
+    [Fact]
+    public void HeadsThatCannotResume_AreNotFedThroughPlainTurns()
+    {
+        // A head kept only for the snapshot is wasted work when no hit can resume it (the Vulkan states today). The first state
+        // made shows the model's states cannot resume; later plain snapshot turns make none.
+        var (gguf, config) = Fixture("prefix-mtp-unmarkable-plain.gguf");
+        using var _ = gguf;
+        using var inner = Load(gguf, config);
+        var model = new DraftRecordingModel(inner, hideMarks: true);
+        var cached = Generator(model, Kv(inner), mtp: true, prefixCache: true);
+        var logprobs = new InferenceOptions { Temperature = 0f, RepetitionPenalty = 1f, MaxTokens = NewTokens, Logprobs = true };
+        int[][] turns = AgentTurns(config.VocabSize);
+
+        for (int conversation = 0; conversation < 3; conversation++)
+        {
+            Assert.Equal(0, cached.Generate(Csv(turns[0]), logprobs).Timings.CachedTokenCount);   // a cold turn that snapshots
+            Assert.Equal(turns[0].Length - 1, cached.Generate(Csv(turns[1]), logprobs).Timings.CachedTokenCount);
+            cached.ClearRecurrentPrefixCache();
+        }
+
+        var only = Assert.Single(model.CreatedStates);
+        Assert.True(IsDisposed(only));   // the real state behind the unmarkable wrapper
+    }
+
     private static (int[] Ids, InferenceTimings Timings) Run(TextGenerator generator, string prompt)
     {
         var r = generator.Generate(prompt, Greedy);
