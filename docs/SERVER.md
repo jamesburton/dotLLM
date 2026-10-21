@@ -637,8 +637,87 @@ Measured on an RTX 3060 12 GB (T5500, PCIe 2.0, desktop on the card) with Bonsai
 | off | 46,481 | 0 / 385 s | 42,854 / 33 s |
 
 Shared GPU memory stayed at its idle level (74-78 MiB) in every run; peak dedicated memory rose by 56-214 MiB, because the
-KV is kept rather than freed and re-made. A turn that hits the prefix runs without MTP speculation (the MTP head needs the
-whole sequence absorbed), so decode on those turns is at the plain rate (43-51 ms/token here).
+KV is kept rather than freed and re-made. When #1080 landed, a turn that hit the prefix ran without MTP speculation (the MTP
+head needs the whole sequence absorbed), so decode on those turns ran at the plain rate (43-51 ms/token here). #1088,
+below, lifts that.
+
+### MTP on prefix-hit turns (#1088)
+
+The single-slot snapshot now keeps the MTP head that absorbed the prefix, so a hit rolls the head back with the trunk and
+drafts from it (see `KV_CACHE.md`, "MTP on a single-slot prefix hit"). Two related changes:
+
+- **The first turn snapshots too.** With no snapshot held, a prompt that shares nothing usable with the previous one (the
+  first turn of a conversation) now snapshots at its own end. The second agent turn then hits: `cached_tokens` is the
+  first prompt minus one, where it used to be 0.
+- **Plain turns keep the head in step.** A turn that takes the snapshot carries the head through its prefill even when it
+  decodes plain. The adaptive gate's size prior sends Bonsai-2's first request to plain decode, and before this fix that
+  left every later turn without a head, so the gate never tried MTP for the whole session.
+
+Measured on the T5500 (RTX 3060 12 GB, Bonsai-2 27B PQ2_0-MTP, `--cache-type-k q8_0 --cache-type-v q8_0`, fitted window
+28,672 in both builds). The replay is an agent conversation: a system prompt, then a C# source file of about 4k tokens as
+a tool result each turn, with the model's replies kept. Settings: `max_tokens` 1024, greedy, thinking off, streamed. MTP is
+forced (`DOTLLM_MTP_ADAPTIVE=0`) to show what the head does on hit turns. "Tokens per round" is committed tokens per verify
+round at K=3 (`3 x accepted / drafted`), so 1.0 means no draft was ever accepted.
+
+| turn | before: cached | before: TTFT | before: ms/token | before: tokens/round | after: cached | after: TTFT | after: ms/token | after: tokens/round |
+|---|---|---|---|---|---|---|---|---|
+| 0 | 0 | 19.6 s | 45.6 | 2.21 | 0 | 19.9 s | 43.0 | 2.41 |
+| 1 | **0** | **57.4 s** | 48.0 | 2.32 | **2,927** | **38.3 s** | 42.4 | 2.68 |
+| 2 | 7,551 | 29.1 s | 44.0 | plain | 7,911 | 34.2 s | 47.0 | **2.55** |
+| 3 | 11,378 | 35.8 s | 45.8 | plain | 12,177 | 40.1 s | 46.7 | **2.74** |
+| 4 | 15,871 | 32.0 s | 45.2 | plain | 17,090 | 36.0 s | 50.9 | **2.65** |
+| 5 | 19,797 | 42.9 s | 45.9 | plain | 21,353 | 48.3 s | 47.0 | **3.07** |
+
+- **Hit turns now speculate.** They accept as many drafts as a cold turn does or more (2.5-3.1 committed tokens per round,
+  against 2.2-2.4 on the cold turns), so the head resumed from the snapshot is the right one.
+- **Speculation does not pay on this card at these lengths.** The decode rate with MTP on hit turns (42-51 ms/token) is the
+  same as with MTP on cold turns (43-48), but plain decode is no slower (41-46 ms/token in the `--no-mtp` run of the same
+  build). The adaptive gate (the default) therefore tries MTP on the first hit, measures it, and falls back to plain. Its
+  warm-up measures MTP faster at a 16-token context (33-35 against 42-46 ms/token), so the loss comes from verifying K+1
+  rows against a long KV.
+- **TTFT.** The turn-1 hit cuts its time to first token from 57 s to 38 s. Later turns are within run-to-run noise
+  once the prompt lengths are matched: the replies differ between builds, so the prompts do too.
+- **GPU memory.** Idle is unchanged at 9,379 / 76 MiB (dedicated / shared). Peak dedicated rose from 10,597 to 10,827 MiB,
+  because the head's KV now stays allocated through hit turns. Peak shared was 78 MiB in both builds, so it never left idle.
+
+With the adaptive gate (the default, no environment overrides) the same replay runs as follows. "Drafts" counts draft tokens
+before the round controller fell back to plain decode. Before this change no hit turn could draft, and the size prior had
+already sent the cold turns to plain.
+
+| turn | before: prompt / cached | before: TTFT | before: ms/token | after: prompt / cached | after: TTFT | after: ms/token | after: drafts |
+|---|---|---|---|---|---|---|---|
+| 0 | 2,928 / 0 | 18.0 s | 39.6 | 2,928 / 0 | 18.6 s | 40.4 | 0 (prior: plain) |
+| 1 | 7,646 / **0** | **51.3 s** | 39.5 | 7,912 / **2,927** | **36.3 s** | 41.7 | 307, then plain |
+| 2 | 11,398 / 7,645 | 27.0 s | 42.3 | 11,856 / 7,911 | 30.8 s | 43.8 | 8, then plain |
+| 3 | 16,143 / 11,397 | 35.7 s | 42.8 | 16,557 / 11,855 | 37.5 s | 44.6 | 14, then plain |
+| 4 | 20,161 / 16,142 | 30.5 s | 44.1 | 20,820 / 16,556 | 35.3 s | 45.3 | 6, then plain |
+| 5 | 25,423 / 20,160 | 42.1 s | 45.0 | 26,420 / 20,819 | 47.9 s | 45.8 | 12, then plain |
+
+Peak GPU memory was 10,597 / 78 MiB before and 10,807 / 78 MiB after (dedicated / shared), against 9,379 / 76 MiB idle.
+On a card where MTP pays at agent-length contexts, the hit turns now keep it.
+
+**Time to first token on hit turns (PR #1091 review).** Feeding the head through a turn's prefill is not free: the CUDA
+absorb measured about 0.2 ms per prompt token on this card (3% of the trunk's prefill). In the first push of #1091, every
+plain turn that took the snapshot fed the head, so every hit turn paid it even after the gate had measured plain decode
+faster. A plain turn now feeds the head only while the gate forecasts MTP for a coming request
+(`MtpAdaptiveGate.LikelyUsesMtpNext`). Interleaved replay on the T5500 (default gate, q8_0 KV, MTP on; the assistant
+replies in the history are fixed text, so every build sees identical prompts; mean ± SD of TTFT in seconds over 6 `dev`
+runs and 4 runs of each branch build, alternating the build order every round):
+
+| turn | prompt / cached | `dev` @ 257605eb | first push | with the gated feed | first push - `dev` | gated feed - `dev` |
+|---|---|---|---|---|---|---|
+| 0 | 2,928 / 0 | 19.1 ± 0.9 | 20.3 ± 0.3 | 20.1 ± 0.4 | +1.2 | +1.1 |
+| 1 | 7,012 / 2,927 (`dev`: 0) | 51.5 ± 2.9 | 31.7 ± 0.4 | 31.6 ± 0.6 | -19.8 | -19.9 |
+| 2 | 10,376 / 7,011 | 25.3 ± 0.9 | 26.7 ± 0.3 | 25.8 ± 0.4 | +1.4 | +0.6 |
+| 3 | 14,388 / 10,375 | 30.0 ± 0.8 | 31.8 ± 0.2 | 30.6 ± 0.6 | +1.7 | +0.6 |
+| 4 | 17,750 / 14,387 | 26.2 ± 0.7 | 27.4 ± 0.4 | 26.6 ± 0.6 | +1.2 | +0.3 |
+| 5 | 22,449 / 17,749 | 37.2 ± 1.1 | 38.8 ± 0.5 | 37.6 ± 0.8 | +1.6 | +0.3 |
+
+- Turn 1 now hits, 20 s sooner. Its MTP exploration still pays the head's absorb, which is why turn 0 (a cold turn that
+  feeds the head so turn 1 can explore MTP) is about 1 s slower.
+- Hit turns 2-5 are within run-to-run noise of `dev`. The gate measured plain faster after turn 1, so the session's
+  later hits decode plain without a head, as on `dev`.
+- Shared GPU memory stayed at idle (78 MiB peak against 76 idle) in every run.
 
 ### Turning sysmem fallback off in the driver
 

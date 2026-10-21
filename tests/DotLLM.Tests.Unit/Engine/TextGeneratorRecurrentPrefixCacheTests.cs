@@ -91,6 +91,58 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
         Assert.Equal(21, model.Calls.Take(2).Sum());                  // only r4's new turn ran, plus the token held back for logits
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void FirstPrompt_SnapshotsAtItsEnd_SoTheSecondAgentTurnHits(bool sharedStorage)
+    {
+        // Issue #1088 (turn 1 of the #1087 replay): the first prompt had no previous one to share with, so nothing was
+        // snapshotted and the second agent turn re-prefilled everything. With no snapshot held, there is nothing to evict:
+        // snapshot the prompt's own end, betting that the next prompt extends it.
+        var (cached, plain, model) = Build(sharedStorage);
+        int[] turn = [30, 31];
+        Assert.Equal(0, Check(cached, plain, model, Prompt(turn)).Timings.CachedTokenCount);
+        turn = [.. turn, .. Run(100, 20)];
+
+        var r2 = Check(cached, plain, model, Prompt(turn));
+
+        Assert.Equal(PrefixLen + 1, r2.Timings.CachedTokenCount);    // |r1| - 1
+        Assert.Equal(21, model.Calls.Take(2).Sum());                 // r2's 20 new tokens plus r1's last, which r1 held back for its logits
+    }
+
+    [Fact]
+    public void UnrelatedPrompt_OnSharedStorage_StartsANewConversation_ThatItsNextTurnHits()
+    {
+        // On a model-owned KV a miss drops the snapshot, so an unrelated prompt (a new conversation) evicts nothing by
+        // snapshotting its own end, and that conversation's second turn hits.
+        var (cached, plain, model) = Build(sharedStorage: true);
+        Check(cached, plain, model, Prompt(30));
+        Check(cached, plain, model, Prompt(31));
+        int[] other = [.. Enumerable.Range(40, 25)];
+        Assert.Equal(0, Check(cached, plain, model, string.Join(",", other)).Timings.CachedTokenCount);
+
+        var next = Check(cached, plain, model, string.Join(",", [.. other, .. Run(100, 10)]));
+
+        Assert.Equal(other.Length - 1, next.Timings.CachedTokenCount);
+    }
+
+    [Fact]
+    public void NewConversation_SharingOnlyATemplateHeader_StillSnapshotsItsEnd()
+    {
+        // A real chat template starts every conversation with the same few tokens (BOS, the system role header). A new
+        // conversation that shares only those with the previous prompt, fewer than RecurrentPrefixMinTokens, must still snapshot
+        // its own end, or its second turn re-prefills everything (PR #1091 review: "shares nothing" means "nothing usable").
+        var (cached, plain, model) = Build(sharedStorage: true);
+        Check(cached, plain, model, Prompt(30));
+        Check(cached, plain, model, Prompt(31));
+        int[] other = [2, 3, 4, .. Enumerable.Range(40, 25)];          // Prompt() starts 2, 3, 4, ...
+        Assert.Equal(0, Check(cached, plain, model, string.Join(",", other)).Timings.CachedTokenCount);
+
+        var next = Check(cached, plain, model, string.Join(",", [.. other, .. Run(100, 10)]));
+
+        Assert.Equal(other.Length - 1, next.Timings.CachedTokenCount);
+    }
+
     [Fact]
     public void PromptThatDoesNotExtendThePreviousOne_StillSnapshotsTheSharedPrefix()
     {
@@ -107,6 +159,21 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
     }
 
     [Fact]
+    public void ClassifierOnSharedStorage_KeepsTheSharedPrefixBoundary_AfterTheFirstPromptsEndSnapshotMisses()
+    {
+        // Issue #1088: the first prompt snapshots its end, and on a model-owned KV the second (a different question) misses
+        // and drops it. That leaves no snapshot, but the second prompt does share the system prompt with the first, so it
+        // must snapshot there, not at its own end, or the third question misses too.
+        var (cached, plain, model) = Build(sharedStorage: true);
+        Check(cached, plain, model, Prompt(30, 31));
+        Assert.Equal(0, Check(cached, plain, model, Prompt(40, 41)).Timings.CachedTokenCount);
+
+        var got = Check(cached, plain, model, Prompt(50, 51));
+
+        Assert.Equal(PrefixLen, got.Timings.CachedTokenCount);
+    }
+
+    [Fact]
     public void SharedKvStorage_DropsTheSnapshot_WhenAnotherRequestRunsInBetween()
     {
         // Issue #1025: a model-owned KV (the CUDA hybrid's length-only handle) is overwritten by any other request's
@@ -116,7 +183,7 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
         Check(cached, plain, model, Prompt(31));                      // snapshot
         Assert.Equal(PrefixLen, Check(cached, plain, model, Prompt(32)).Timings.CachedTokenCount);
 
-        Check(cached, plain, model, string.Join(",", Enumerable.Range(40, 25)));   // unrelated: shares nothing, no snapshot
+        Check(cached, plain, model, string.Join(",", Enumerable.Range(40, 25)));   // unrelated: drops the snapshot (and takes its own)
 
         Assert.Equal(0, Check(cached, plain, model, Prompt(33)).Timings.CachedTokenCount);
     }
@@ -253,7 +320,9 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
         var after = cached.Generate(Prompt(34), Opts);
 
         Assert.Equal(0, after.Timings.CachedTokenCount);
-        Assert.Equal(PrefixLen + 1, model.Calls[0]);
+        // The whole prompt ran again. It runs as two forwards (split where the new first-prompt snapshot is taken, #1088),
+        // then 3 one-token decode steps for the 4 generated tokens.
+        Assert.Equal(PrefixLen + 1 + 3, model.Calls.Sum());
     }
 
     [Fact]

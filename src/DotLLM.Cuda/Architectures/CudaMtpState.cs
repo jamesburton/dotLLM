@@ -21,7 +21,7 @@ public sealed class CudaMtpState : IMtpState, IDisposable
     private readonly int _hiddenSize;
     private readonly int _numKvHeads;
     private readonly int _headDim;
-    private readonly int _maxSteps;   // hard ceiling on positions (the trunk KV-cache's MaxLength)
+    private int _maxSteps;            // hard ceiling on positions (the trunk KV-cache's MaxLength); raised by a resume (issue #1088)
     private int _capacity;            // rows currently allocated, <= _maxSteps; grows on demand (issue #966)
     private readonly int _kvStride; // numKvHeads * headDim
 
@@ -373,6 +373,33 @@ public sealed class CudaMtpState : IMtpState, IDisposable
             CudaDriverApi.cuMemcpyHtoD_v2(_pendingHiddenDevice, (nint)p,
                 (nuint)((long)_hiddenSize * sizeof(float))).ThrowOnError();
         }
+    }
+
+    /// <inheritdoc/>
+    public object? MarkPrefix()
+    {
+        ThrowIfDisposed();
+        // Nothing absorbed yet: h_{-1} is zero (matches SetPendingFromCarry).
+        float[] carry = _carryHidden.Length == _hiddenSize ? (float[])_carryHidden.Clone() : new float[_hiddenSize];
+        return new MtpPrefixMark(this, _currentLength, carry);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// The device K/V rows below the mark are the ones the marked request absorbed: nothing writes below a position it
+    /// absorbs from, and a lazy growth copies the committed rows. Only host-side fields change here, so no CUDA context
+    /// needs to be current: the next trunk forward's absorb pairs its first row with the restored carry and then seeds
+    /// the device pending hidden itself (<see cref="SeedFromCapturedRow"/>). A prefix hit always runs that forward.
+    /// </remarks>
+    public bool TryResumeAt(object mark, int maxSequenceLength)
+    {
+        ThrowIfDisposed();
+        if (MtpPrefixMark.For(mark, this, _hiddenSize) is not { } m || maxSequenceLength < m.Length)
+            return false;
+        _maxSteps = Math.Max(_maxSteps, maxSequenceLength);
+        _currentLength = m.Length;
+        _carryHidden = (float[])m.CarryHidden.Clone();
+        return true;
     }
 
     /// <summary>Total bytes allocated for this state's own KV-cache + pending-hidden buffer (device memory).</summary>

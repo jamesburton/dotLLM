@@ -59,20 +59,39 @@ public sealed partial class TextGenerator
     /// <summary>Most positions a recurrent-prefix KV growth adds beyond the request (PR #1026 review: the CUDA hybrid's storage never shrinks).</summary>
     private const int RecurrentPrefixMaxGrowthHeadroom = 2048;
 
-    private sealed class RecurrentPrefixEntry(int[] tokens, Core.Attention.IKvCache kv, object? checkpoint)
+    // The head state that decoded the request which took the snapshot, when it decoded with MTP: its rows [0, Tokens.Length)
+    // are the prefix's, so a hit resumes it at MtpMark and drafts without re-absorbing the prefix (issue #1088).
+    private IMtpState? _resumedMtp;
+
+    // Whether this model's MTP head states can be marked and resumed (IMtpState.MarkPrefix), learned from the first state made;
+    // null until then. A plain turn never feeds a head that no hit could resume (PR #1091 review).
+    private bool? _mtpStatesResumable;
+
+    private sealed class RecurrentPrefixEntry(int[] tokens, Core.Attention.IKvCache kv, object? checkpoint, IMtpState? mtp, object? mtpMark)
     {
         public readonly int[] Tokens = tokens;
         public readonly Core.Attention.IKvCache Kv = kv;
         public readonly object? Checkpoint = checkpoint;
 
-        public void Dispose()
-        {
-            DisposeCheckpoint();
-            Kv.Dispose();
-        }
+        /// <summary>The MTP head state whose rows <c>[0, Tokens.Length)</c> hold the prefix, or null (the request decoded plain).</summary>
+        public readonly IMtpState? Mtp = mtp;
 
-        /// <summary>Releases only the state checkpoint, for when a newer entry takes over the same KV cache.</summary>
-        public void DisposeCheckpoint() => (Checkpoint as IDisposable)?.Dispose();
+        /// <summary>The <see cref="IMtpState.MarkPrefix"/> mark of <see cref="Mtp"/> at the snapshot boundary.</summary>
+        public readonly object? MtpMark = mtpMark;
+
+        public void Dispose() => Release(keepKv: null, keepMtp: null);
+
+        /// <summary>
+        /// Releases the checkpoint, and the KV cache and head state unless a newer entry or the running request took them over.
+        /// </summary>
+        /// <param name="keepKv">A KV cache that stays in use: not disposed when it is this entry's.</param>
+        /// <param name="keepMtp">A head state that stays in use: not disposed when it is this entry's.</param>
+        public void Release(Core.Attention.IKvCache? keepKv, IMtpState? keepMtp)
+        {
+            (Checkpoint as IDisposable)?.Dispose();
+            if (Mtp is not null && !ReferenceEquals(Mtp, keepMtp)) Mtp.Dispose();
+            if (!ReferenceEquals(Kv, keepKv)) Kv.Dispose();
+        }
     }
 
     /// <summary>
@@ -309,10 +328,12 @@ public sealed partial class TextGenerator
 
         // Hybrid mode is enabled when a strategy is wired up, the prompt is short enough,
         // and we have a clean cache (no prefix-cache reuse, no speculative draft model, no MTP).
-        // MTP needs the whole sequence absorbed into its head from position 0 (issue #469), so a
-        // prefix-cache hit — which skips the cached prefix's forward — runs without it.
+        // MTP needs the whole sequence absorbed into its head from position 0 (issue #469). A
+        // prefix-cache hit skips the cached prefix's forward, so it decodes with MTP only when the
+        // snapshot kept the head state that absorbed that prefix (issue #1088).
         var mtpGate = GateFor(pipeline.IsStochastic);
-        bool useMtp = ShouldUseMtp(captureLogprobs) && cachedTokenCount == 0
+        var resumedMtp = TakeResumedMtpState();
+        bool useMtp = ShouldUseMtp(captureLogprobs) && (cachedTokenCount == 0 || resumedMtp is not null)
             && (mtpGate?.ShouldUseMtp(maxTokens) ?? true);
         TraceGate(mtpGate, pipeline.IsStochastic, useMtp, captureLogprobs, cachedTokenCount);
         if (useMtp)
@@ -327,7 +348,7 @@ public sealed partial class TextGenerator
         // the zero-GC-pressure guarantee on the inference hot path.
         int stopTailSize = ComputeStopTailSize(stopConditions);
         char[] stopScratch = ArrayPool<char>.Shared.Rent(stopTailSize);
-        DotLLM.Core.Models.IMtpState? mtpState = useMtp ? CreateMtpState(kvCache) : null;
+        DotLLM.Core.Models.IMtpState? mtpState = AcquireRequestMtpState(useMtp, snapshotAt, cachedTokenCount, resumedMtp, useHybrid, mtpGate, kvCache);
 
         try
         {
@@ -440,7 +461,7 @@ public sealed partial class TextGenerator
                     // Prefill suffix tokens — chunked when a prefill chunk size is configured
                     // (llama.cpp -ub analog); otherwise a single forward pass, as before.
                     using (ITensor prefillLogits = ForwardPrefill(promptIds, prefillStart, prefillLen, kvCache, adapter, mtpState,
-                        snapshotAt, () => { TakeRecurrentSnapshot(promptIds, snapshotAt, kvCache); if (_tieredSnapshots is null) ownsKvCache = false; },
+                        snapshotAt, () => { TakeRecurrentSnapshot(promptIds, snapshotAt, kvCache, mtpState); if (_tieredSnapshots is null) ownsKvCache = false; },
                         cancellationToken))
                     {
                         long ts1 = Stopwatch.GetTimestamp();
@@ -828,7 +849,7 @@ public sealed partial class TextGenerator
         {
             DropRecurrentPrefixIfRequestFailed();
             ArrayPool<char>.Shared.Return(stopScratch);
-            mtpState?.Dispose();
+            ReleaseRequestMtpState(mtpState);
             if (ownsKvCache)
                 kvCache.Dispose();
             telemetry.RequestSpan?.Dispose();
@@ -910,11 +931,10 @@ public sealed partial class TextGenerator
         _recurrentPrefixRequestPending = _recurrentPrefixEnabled;
         long kvBytes = GetKvCacheBytes(kvCache);
 
-        // Hybrid mode: same gating as the non-streaming path.
-        // MTP needs the whole sequence absorbed into its head from position 0 (issue #469), so a
-        // prefix-cache hit — which skips the cached prefix's forward — runs without it.
+        // Hybrid mode: same gating as the non-streaming path, MTP on a prefix hit included (issue #1088).
         var mtpGate = GateFor(pipeline.IsStochastic);
-        bool useMtp = ShouldUseMtp(captureLogprobs) && cachedTokenCount == 0
+        var resumedMtp = TakeResumedMtpState();
+        bool useMtp = ShouldUseMtp(captureLogprobs) && (cachedTokenCount == 0 || resumedMtp is not null)
             && (mtpGate?.ShouldUseMtp(maxTokens) ?? true);
         TraceGate(mtpGate, pipeline.IsStochastic, useMtp, captureLogprobs, cachedTokenCount);
         if (useMtp)
@@ -930,7 +950,7 @@ public sealed partial class TextGenerator
         // normal completion, exception, or consumer-side cancellation (Dispose of the enumerator).
         int stopTailSize = ComputeStopTailSize(stopConditions);
         char[] stopScratch = ArrayPool<char>.Shared.Rent(stopTailSize);
-        DotLLM.Core.Models.IMtpState? mtpState = useMtp ? CreateMtpState(kvCache) : null;
+        DotLLM.Core.Models.IMtpState? mtpState = AcquireRequestMtpState(useMtp, snapshotAt, cachedTokenCount, resumedMtp, useHybrid, mtpGate, kvCache);
         var generatedIds = new List<int>(maxTokens);
         long prefillTicks = 0;
         long decodeTicks = 0;
@@ -997,7 +1017,7 @@ public sealed partial class TextGenerator
                     // Prefill suffix tokens — chunked when a prefill chunk size is configured
                     // (llama.cpp -ub analog); otherwise a single forward pass, as before.
                     using (ITensor prefillLogits = ForwardPrefill(promptIds, prefillStart, prefillLen, kvCache, adapter, mtpState,
-                        snapshotAt, () => { TakeRecurrentSnapshot(promptIds, snapshotAt, kvCache); if (_tieredSnapshots is null) ownsKvCache = false; },
+                        snapshotAt, () => { TakeRecurrentSnapshot(promptIds, snapshotAt, kvCache, mtpState); if (_tieredSnapshots is null) ownsKvCache = false; },
                         cancellationToken))
                     {
                         long ts1 = Stopwatch.GetTimestamp();
@@ -1348,13 +1368,13 @@ public sealed partial class TextGenerator
                         {
                             generatedIds.RemoveAt(generatedIds.Count - 1);
                             StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
-                            var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount);
+                            var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
                             yield return new GenerationToken(nextTokenId, string.Empty, fr, timings, tokenLogprob);
                         }
                         else
                         {
                             StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
-                            var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount);
+                            var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
                             string text = detok.TakeDelta();
                             yield return new GenerationToken(nextTokenId, text, fr, timings, tokenLogprob);
                         }
@@ -1368,7 +1388,7 @@ public sealed partial class TextGenerator
                         if (isLastStep)
                         {
                             StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
-                            var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount);
+                            var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
                             yield return new GenerationToken(nextTokenId, text, FinishReason.Length, timings, tokenLogprob);
                             yield break;
                         }
@@ -1386,7 +1406,7 @@ public sealed partial class TextGenerator
             RecordMtpGate(mtpGate, useMtp, generatedIds.Count, mtpTicks, mtpTokens, decodeTicks, samplerTicks);
             DropRecurrentPrefixIfRequestFailed();
             ArrayPool<char>.Shared.Return(stopScratch);
-            mtpState?.Dispose();
+            ReleaseRequestMtpState(mtpState);
             if (ownsKvCache)
                 kvCache.Dispose();
         }
@@ -1419,6 +1439,7 @@ public sealed partial class TextGenerator
         int[] promptIds, int promptLen, int maxTokens, out int snapshotAt, ILoraAdapter? adapter = null)
     {
         snapshotAt = -1;
+        _resumedMtp = null;
         LastPrefixCacheTier = null; LastPrefixRestoreMilliseconds = 0;
         if (adapter is not null) ClearRecurrentPrefixCacheCore();
         // A recurrent (Gated DeltaNet / SSM) model carries per-sequence state that has no position
@@ -1659,6 +1680,9 @@ public sealed partial class TextGenerator
             long restoreStart = Stopwatch.GetTimestamp();
             entry.Kv.Rollback(entry.Tokens.Length);
             _model.RestoreRecurrentState(entry.Checkpoint);
+            // The head rolls back with the trunk. TryGrowTo may have grown the KV above, so the head's ceiling follows it.
+            if (entry.Mtp is { } mtp && entry.MtpMark is { } mark && mtp.TryResumeAt(mark, entry.Kv.MaxLength))
+                _resumedMtp = mtp;
             LastPrefixCacheTier = "vram";
             LastPrefixRestoreMilliseconds = Stopwatch.GetElapsedTime(restoreStart).TotalMilliseconds;
             _legacyPrefixHits++;
@@ -1674,6 +1698,13 @@ public sealed partial class TextGenerator
             _recurrentPrefix = null;
             entry.Dispose();
         }
+
+        // Issue #1088: with no snapshot held there is nothing to evict. A prompt that shares nothing usable with the previous
+        // one starts a conversation (the first request, or a new client), so snapshot its own end, betting that the next
+        // prompt extends it: an agent's second turn then hits instead of re-prefilling its first. A prompt that does share a
+        // prefix keeps that boundary (the classifier case above).
+        if (_recurrentPrefix is null && shared < RecurrentPrefixMinTokens)
+            boundary = promptLen - 1;
 
         bool snapshot = boundary >= RecurrentPrefixMinTokens;
         int cacheSize = Math.Min(_model.Config.MaxSequenceLength, needed + (snapshot ? RecurrentPrefixKvHeadroom : 0));
@@ -1699,15 +1730,94 @@ public sealed partial class TextGenerator
         return kv.TryGrowTo(target);
     }
 
-    private void TakeRecurrentSnapshot(int[] promptIds, int boundary, Core.Attention.IKvCache kvCache)
+    /// <summary>
+    /// Snapshots the recurrent state at <paramref name="boundary"/>, which the prefill has just reached. When the request
+    /// carries the MTP head (it decodes with MTP, or <see cref="TracksMtpHead"/>), the head has absorbed exactly
+    /// <c>[0, boundary)</c> too, so the entry keeps that head state and a mark of it (issue #1088). The head's rows below the mark stay valid for the same reason the trunk's KV rows do: every
+    /// later write of this request, and of a hit that resumes it, is at or beyond the boundary. The tiered cache copies
+    /// only the trunk, so its hits decode plain.
+    /// </summary>
+    private void TakeRecurrentSnapshot(int[] promptIds, int boundary, Core.Attention.IKvCache kvCache, IMtpState? mtpState)
     {
         if (_tieredSnapshots is not null) { _tieredSnapshots.TryCapture(promptIds, kvCache, boundary); return; }
         object? checkpoint = _model.CheckpointRecurrentState();
+        object? mtpMark = mtpState is not null && mtpState.CurrentLength == boundary ? mtpState.MarkPrefix() : null;
         var old = _recurrentPrefix;
-        _recurrentPrefix = new RecurrentPrefixEntry(promptIds.AsSpan(0, boundary).ToArray(), kvCache, checkpoint);
-        // A hit that moves its snapshot forward hands the same KV to the new entry: release only the old checkpoint.
-        if (old is not null && ReferenceEquals(old.Kv, kvCache)) old.DisposeCheckpoint();
-        else old?.Dispose();
+        _recurrentPrefix = new RecurrentPrefixEntry(promptIds.AsSpan(0, boundary).ToArray(), kvCache, checkpoint,
+            mtpMark is null ? null : mtpState, mtpMark);
+        // A hit that moves its snapshot forward hands the same KV (and, decoding with MTP, the same head state) to the new
+        // entry, and the request still runs on both: release only what nothing uses any more.
+        old?.Release(keepKv: kvCache, keepMtp: mtpState);
+    }
+
+    /// <summary>
+    /// True when a request that decodes plain should still carry the MTP head through its prefill (issue #1088): it takes a
+    /// single-slot prefix snapshot, and a later hit on that snapshot can decode with MTP only if the head absorbed the prefix
+    /// too. Without this, an adaptive gate that sends the first turn of an agent session to plain decode never sees MTP again,
+    /// because every later turn hits. A hit can carry the head only when it resumed one: the head cannot start absorbing
+    /// mid-sequence.
+    /// </summary>
+    /// <remarks>
+    /// The feed is not free: it adds the head's absorb to this request's prefill, so to its time to first token (about 0.2 ms
+    /// per token, 3% of the trunk prefill, for Bonsai-2 27B on an RTX 3060; PR #1091 review). So a plain turn feeds the head only
+    /// when the adaptive gate forecasts MTP for a coming request (<see cref="MtpAdaptiveGate.LikelyUsesMtpNext"/>). Once plain
+    /// decode measures faster, the session's later hits skip the feed and stay plain, as they did before #1088; the next miss
+    /// starts a fresh head. Its KV is already counted by the context fit when MTP is on. A backend whose head states cannot
+    /// resume (<see cref="IMtpState.MarkPrefix"/> returns null, the Vulkan states today) never feeds one.
+    /// </remarks>
+    /// <param name="snapshotAt">The prefill position at which this request snapshots, or -1.</param>
+    /// <param name="cachedTokenCount">Prompt tokens served from the prefix cache.</param>
+    /// <param name="resumedMtp">The head a prefix hit resumed, or null.</param>
+    /// <param name="useHybrid">Whether this request runs the hybrid prefill strategy.</param>
+    /// <param name="gate">The adaptive gate for this request's sampling kind, or null when MTP is not adaptive.</param>
+    /// <returns>True when the head should ride along this plain request's prefill.</returns>
+    private bool TracksMtpHead(int snapshotAt, int cachedTokenCount, IMtpState? resumedMtp, bool useHybrid, MtpAdaptiveGate? gate)
+        => snapshotAt >= 0 && _tieredSnapshots is null && !useHybrid
+           && _mtpEnabled && _draftModel is null && _model.SupportsMtp && _mtpStatesResumable != false
+           && (cachedTokenCount == 0 || resumedMtp is not null)
+           && (gate?.LikelyUsesMtpNext() ?? true);
+
+    /// <summary>
+    /// The MTP head state a request runs with: the one a prefix hit resumed, else a new one, when the request decodes with MTP
+    /// or carries the head for its snapshot (<see cref="TracksMtpHead"/>); otherwise null. The first state made tells whether
+    /// this model's states can resume. A head made only for the snapshot is dropped at once when they cannot.
+    /// </summary>
+    /// <param name="useMtp">Whether the request decodes with MTP.</param>
+    /// <param name="snapshotAt">The prefill position at which this request snapshots, or -1.</param>
+    /// <param name="cachedTokenCount">Prompt tokens served from the prefix cache.</param>
+    /// <param name="resumedMtp">The head a prefix hit resumed, or null.</param>
+    /// <param name="useHybrid">Whether this request runs the hybrid prefill strategy.</param>
+    /// <param name="gate">The adaptive gate for this request's sampling kind, or null.</param>
+    /// <param name="kvCache">The request's trunk KV cache, which sizes a new head.</param>
+    /// <returns>The head state, or null when the request runs without one.</returns>
+    private IMtpState? AcquireRequestMtpState(bool useMtp, int snapshotAt, int cachedTokenCount, IMtpState? resumedMtp,
+        bool useHybrid, MtpAdaptiveGate? gate, Core.Attention.IKvCache kvCache)
+    {
+        if (!useMtp && !TracksMtpHead(snapshotAt, cachedTokenCount, resumedMtp, useHybrid, gate))
+            return null;
+        if (resumedMtp is not null)
+            return resumedMtp;
+        var state = CreateMtpState(kvCache);
+        _mtpStatesResumable ??= state.MarkPrefix() is not null;
+        if (useMtp || _mtpStatesResumable == true)
+            return state;
+        state.Dispose();
+        return null;
+    }
+
+    /// <summary>Hands the head state a prefix hit resumed to the request that resolved it (once), or null.</summary>
+    private IMtpState? TakeResumedMtpState()
+    {
+        var mtp = _resumedMtp;
+        _resumedMtp = null;
+        return mtp;
+    }
+
+    /// <summary>Disposes a request's MTP state unless the recurrent prefix snapshot kept it for the next hit.</summary>
+    private void ReleaseRequestMtpState(IMtpState? mtpState)
+    {
+        if (mtpState is not null && !ReferenceEquals(_recurrentPrefix?.Mtp, mtpState))
+            mtpState.Dispose();
     }
 
     /// <summary>

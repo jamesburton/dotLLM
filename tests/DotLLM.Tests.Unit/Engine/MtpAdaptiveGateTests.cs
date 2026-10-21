@@ -85,4 +85,60 @@ public sealed class MtpAdaptiveGateTests
         g.Record(false, 65, 40 * 64);
         Assert.InRange(g.PlainMsPerToken, 20.5, 39.5);
     }
+
+    [Fact]
+    public void LikelyUsesMtpNext_IsTrueWhileAnArmIsUnexplored()
+    {
+        // A plain first turn (the size prior) must keep the head in step: the next request explores MTP.
+        var g = new MtpAdaptiveGate(Small);
+        Assert.True(g.LikelyUsesMtpNext());
+        Assert.False(g.ShouldUseMtp(64));
+        g.Record(false, 65, 27 * 64);
+        Assert.True(g.LikelyUsesMtpNext());
+        Assert.True(g.ShouldUseMtp(64));   // and the forecast was right
+
+        var mtpOnly = new MtpAdaptiveGate(Large);
+        mtpOnly.Record(true, 65, 55 * 64);
+        Assert.True(mtpOnly.LikelyUsesMtpNext());   // plain unmeasured: MTP may still win
+    }
+
+    [Fact]
+    public void LikelyUsesMtpNext_FollowsTheWinner_AndForeseesTheReprobe()
+    {
+        var mtpWins = new MtpAdaptiveGate(Large);
+        mtpWins.Record(false, 65, 45 * 64);
+        mtpWins.Record(true, 65, 22 * 64);
+        Assert.True(mtpWins.LikelyUsesMtpNext());
+
+        // Plain wins: no MTP forecast until the decision that re-probes MTP is the next one.
+        var g = new MtpAdaptiveGate(Small);
+        g.Record(false, 65, 27 * 64);
+        g.Record(true, 65, 55 * 64);
+        for (int i = 1; i < MtpAdaptiveGate.ReprobeEvery; i++)
+        {
+            Assert.False(g.LikelyUsesMtpNext(), $"decision {i}");
+            Assert.False(g.ShouldUseMtp(64));
+        }
+        Assert.True(g.LikelyUsesMtpNext());
+        Assert.True(g.ShouldUseMtp(64));   // the re-probe
+    }
+
+    [Fact]
+    public void LikelyUsesMtpNext_DoesNotCountAsADecision()
+    {
+        // Asking must not move the re-probe schedule: the engine asks once per plain snapshot turn.
+        var asked = new MtpAdaptiveGate(Small);
+        var silent = new MtpAdaptiveGate(Small);
+        foreach (var g in new[] { asked, silent })
+        {
+            g.Record(false, 65, 27 * 64);
+            g.Record(true, 65, 55 * 64);
+        }
+        for (int i = 0; i < 3 * MtpAdaptiveGate.ReprobeEvery; i++)
+        {
+            for (int k = 0; k < 5; k++) asked.LikelyUsesMtpNext();
+            Assert.Equal(silent.ShouldUseMtp(64), asked.ShouldUseMtp(64));
+        }
+        Assert.Equal(silent.Describe(), asked.Describe());
+    }
 }
