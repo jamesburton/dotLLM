@@ -16,7 +16,7 @@ public sealed unsafe class CpuMtpState : IMtpState, IDisposable
     private readonly int _hiddenSize;
     private readonly int _numKvHeads;
     private readonly int _headDim;
-    private readonly int _maxSteps;   // hard ceiling on positions (the trunk KV-cache's MaxLength)
+    private int _maxSteps;            // hard ceiling on positions (the trunk KV-cache's MaxLength); raised by a resume (issue #1088)
     private int _capacity;            // rows currently allocated, <= _maxSteps; grows on demand (issue #966)
     private readonly int _kvStride; // numKvHeads * headDim
 
@@ -256,6 +256,26 @@ public sealed unsafe class CpuMtpState : IMtpState, IDisposable
         var row = _capturedRows.AsSpan(rowIndex * _hiddenSize, _hiddenSize);
         row.CopyTo(_pendingHidden);
         row.CopyTo(_carryHidden);
+    }
+
+    /// <inheritdoc/>
+    public object? MarkPrefix()
+    {
+        ThrowIfDisposed();
+        return new MtpPrefixMark(this, _currentLength, (float[])_carryHidden.Clone());
+    }
+
+    /// <inheritdoc/>
+    public bool TryResumeAt(object mark, int maxSequenceLength)
+    {
+        ThrowIfDisposed();
+        if (MtpPrefixMark.For(mark, this, _hiddenSize) is not { } m || maxSequenceLength < m.Length)
+            return false;
+        _maxSteps = Math.Max(_maxSteps, maxSequenceLength);
+        _currentLength = m.Length;
+        m.CarryHidden.CopyTo(_carryHidden);
+        m.CarryHidden.CopyTo(_pendingHidden);
+        return true;
     }
 
     /// <summary>Total bytes allocated for this state's own KV-cache (excludes the small managed captured-rows buffer).</summary>

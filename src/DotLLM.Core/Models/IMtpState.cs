@@ -63,4 +63,43 @@ public interface IMtpState : IDisposable
     /// </summary>
     /// <param name="rowIndex">Row index into <see cref="CapturedHiddenRows"/>, clamped to <c>[0, CapturedRowCount)</c> by the caller.</param>
     void SeedFromCapturedRow(int rowIndex);
+
+    /// <summary>
+    /// Marks the head at its current length so a later request can resume from here (issue #1088): the recurrent
+    /// prefix snapshot keeps this state alive with the trunk's KV, and a prefix hit then drafts without re-absorbing
+    /// the cached prefix. The mark records <see cref="CurrentLength"/> and the trunk hidden row the next absorb pairs
+    /// its first token with. Rows <c>[0, CurrentLength)</c> must stay untouched until the resume, which holds because
+    /// every later write is at or beyond the mark.
+    /// </summary>
+    /// <returns>An opaque mark for <see cref="TryResumeAt"/>, or <see langword="null"/> when this state cannot resume.</returns>
+    object? MarkPrefix() => null;
+
+    /// <summary>
+    /// Rolls the head back to a mark taken by <see cref="MarkPrefix"/> on this same state and restores the hidden row the
+    /// next absorb pairs with, so the next trunk <c>Forward</c> absorbs from the mark exactly as a cold run would.
+    /// </summary>
+    /// <param name="mark">A mark from <see cref="MarkPrefix"/>.</param>
+    /// <param name="maxSequenceLength">The trunk KV's current <c>MaxLength</c>: the head's ceiling is raised to it, since a prefix hit may have grown the trunk's cache.</param>
+    /// <returns><see langword="false"/> when the mark is not this state's, or the head no longer covers it; the state is then unchanged.</returns>
+    bool TryResumeAt(object mark, int maxSequenceLength) => false;
+}
+
+/// <summary>
+/// The resume point <see cref="IMtpState.MarkPrefix"/> records (issue #1088): the head's length and the trunk hidden row
+/// at the last absorbed position (<c>h_{Length-1}</c>, zero when nothing was absorbed).
+/// </summary>
+/// <param name="Owner">The state the mark belongs to; another state's rows are not these.</param>
+/// <param name="Length">The head's <see cref="IMtpState.CurrentLength"/> when marked.</param>
+/// <param name="CarryHidden">A copy of the hidden row the next absorb pairs its first token with.</param>
+public sealed record MtpPrefixMark(IMtpState Owner, int Length, float[] CarryHidden)
+{
+    /// <summary>True when <paramref name="mark"/> is a mark of <paramref name="state"/> that its committed rows still cover.</summary>
+    /// <param name="mark">The candidate mark.</param>
+    /// <param name="state">The state being resumed.</param>
+    /// <param name="hiddenSize">The state's hidden size, which the carried row must match.</param>
+    /// <returns>The typed mark, or <see langword="null"/> when it cannot be resumed.</returns>
+    public static MtpPrefixMark? For(object mark, IMtpState state, int hiddenSize)
+        => mark is MtpPrefixMark m && ReferenceEquals(m.Owner, state) && m.Length <= state.CurrentLength
+           && m.CarryHidden.Length == hiddenSize
+            ? m : null;
 }
