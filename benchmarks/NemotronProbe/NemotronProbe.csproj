@@ -18,6 +18,7 @@
     <ProjectReference Include="..\..\src\DotLLM.Engine\DotLLM.Engine.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Tokenizers\DotLLM.Tokenizers.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Vulkan\DotLLM.Vulkan.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.Cuda\DotLLM.Cuda.csproj" />
   </ItemGroup>
 
 </Project>

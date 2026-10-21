@@ -6,9 +6,10 @@ Validation tooling for `nemotron_h_moe` (Nemotron 3.5 Lightning 30B-A3B, issue #
 |---|---|
 | `tok <gguf> <text>` | dotLLM token ids of a text file (compare with `llama-tokenize --ids --no-bos`) |
 | `render <gguf> <msgs.json> [tools.json]` | chat-template rendering with dotLLM's Jinja (compare with llama-server `/apply-template`) |
-| `logits <gguf> <ids> <prefix> <ctx> <chunks> [cpu\|vulkan]` | per-position logits (second half of each window) in `llama-perplexity --save-all-logits` layout |
+| `logits <gguf> <ids> <prefix> <ctx> <chunks> [cpu\|vulkan\|cuda]` (CUDA: `DOTLLM_MOE_*` configures expert offload) | per-position logits (second half of each window) in `llama-perplexity --save-all-logits` layout |
 | `consist <gguf> <ids> <M> [device]` | prefill vs prefill(M)+decode steps, same ids, with a KV cache |
 | `forced <gguf> <ids> <promptLen> [device]` | teacher-forced top-1 agreement over another engine's generated tokens |
+| `expert <gguf> [threads]` | CPU µs per routed expert (up → relu² → down) per expert layout at n = 1/4/16/64 tokens, banks pre-faulted, median — the CPU side of the #1063 offload cost model |
 | `next <gguf> <ids> [device]` | top-8 next-token logits after an id list |
 
 `nemprobe_kl.py ids|cmp` turns a llama.cpp `--save-all-logits` file into the ids to feed `logits`, then prints
