@@ -142,6 +142,21 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
     }
 
     [Fact]
+    public void ClassifierOnSharedStorage_KeepsTheSharedPrefixBoundary_AfterTheFirstPromptsEndSnapshotMisses()
+    {
+        // Issue #1088: the first prompt snapshots its end, and on a model-owned KV the second (a different question) misses
+        // and drops it. That leaves no snapshot, but the second prompt does share the system prompt with the first, so it
+        // must snapshot there, not at its own end, or the third question misses too.
+        var (cached, plain, model) = Build(sharedStorage: true);
+        Check(cached, plain, model, Prompt(30, 31));
+        Assert.Equal(0, Check(cached, plain, model, Prompt(40, 41)).Timings.CachedTokenCount);
+
+        var got = Check(cached, plain, model, Prompt(50, 51));
+
+        Assert.Equal(PrefixLen, got.Timings.CachedTokenCount);
+    }
+
+    [Fact]
     public void SharedKvStorage_DropsTheSnapshot_WhenAnotherRequestRunsInBetween()
     {
         // Issue #1025: a model-owned KV (the CUDA hybrid's length-only handle) is overwritten by any other request's

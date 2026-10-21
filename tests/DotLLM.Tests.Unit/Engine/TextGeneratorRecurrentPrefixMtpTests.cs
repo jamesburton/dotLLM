@@ -1,16 +1,14 @@
-using System.Globalization;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
-using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
-using DotLLM.Core.Tensors;
 using DotLLM.Engine;
 using DotLLM.Engine.KvCache;
 using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
-using DotLLM.Tokenizers;
 using Xunit;
+using Xunit.Abstractions;
+using static DotLLM.Tests.Unit.Engine.RecurrentPrefixMtpHarness;
 
 namespace DotLLM.Tests.Unit.Engine;
 
@@ -18,6 +16,7 @@ namespace DotLLM.Tests.Unit.Engine;
 /// Issue #1088: a turn that hits the recurrent prefix snapshot decodes with MTP. The head's KV for the cached prefix is kept
 /// with the snapshot (with the trunk hidden row the next absorb pairs with), so the head drafts on a hit exactly as it would
 /// after a cold prefill of the whole prompt. Runs the real CPU hybrid on the synthetic Qwen3.5 fixture with an MTP head.
+/// CUDA twin: <c>CudaQwen3HybridDenseMtpPrefixHitTests</c>.
 /// </summary>
 public sealed class TextGeneratorRecurrentPrefixMtpTests : IDisposable
 {
@@ -26,11 +25,12 @@ public sealed class TextGeneratorRecurrentPrefixMtpTests : IDisposable
     // missing or foreign rows, is off by orders of magnitude more.
     private const float DraftLogitTolerance = 1e-3f;
 
-    private const int NewTokens = 12;
     private readonly string _scratch;
+    private readonly ITestOutputHelper _out;
 
-    public TextGeneratorRecurrentPrefixMtpTests()
+    public TextGeneratorRecurrentPrefixMtpTests(ITestOutputHelper output)
     {
+        _out = output;
         _scratch = Path.Combine(Path.GetTempPath(), $"dotllm-prefix-mtp-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_scratch);
     }
@@ -38,15 +38,6 @@ public sealed class TextGeneratorRecurrentPrefixMtpTests : IDisposable
     public void Dispose()
     {
         try { Directory.Delete(_scratch, recursive: true); } catch { /* best-effort */ }
-    }
-
-    private static InferenceOptions Greedy => new() { Temperature = 0f, RepetitionPenalty = 1f, MaxTokens = NewTokens };
-
-    /// <summary>Three agent turns, each prompt extending the previous one.</summary>
-    private static int[][] AgentTurns(int vocab)
-    {
-        int[] all = MtpLongContextHarness.Prompt(112, vocab);
-        return [all[..40], all[..76], all[..112]];
     }
 
     private (GgufFile Gguf, ModelConfig Config) Fixture(string name)
@@ -58,14 +49,8 @@ public sealed class TextGeneratorRecurrentPrefixMtpTests : IDisposable
     private static Qwen3HybridDenseTransformerModel Load(GgufFile gguf, ModelConfig config)
         => (Qwen3HybridDenseTransformerModel)ModelLoader.CreateCpuModelFromGguf(gguf, config);
 
-    private static TextGenerator Generator(IModel model, bool mtp, bool prefixCache)
-        => new(model, new TokenIdsTokenizer(model.Config.VocabSize),
-            (cfg, size) => new SimpleKvCache(((Qwen3HybridDenseTransformerModel)Unwrap(model)).AttentionLayerCount, cfg.NumKvHeads, cfg.HeadDim, size),
-            mtpEnabled: mtp, recurrentPrefixCache: prefixCache);
-
-    private static IModel Unwrap(IModel model) => model is DraftRecordingModel r ? r.Inner : model;
-
-    private static string Csv(int[] ids) => string.Join(",", ids);
+    private static Func<ModelConfig, int, IKvCache> Kv(Qwen3HybridDenseTransformerModel model)
+        => (cfg, size) => new SimpleKvCache(model.AttentionLayerCount, cfg.NumKvHeads, cfg.HeadDim, size);
 
     [Theory]
     [InlineData(false)]
@@ -76,8 +61,8 @@ public sealed class TextGeneratorRecurrentPrefixMtpTests : IDisposable
         using var _ = gguf;
         using var cachedModel = Load(gguf, config);
         using var plainModel = Load(gguf, config);
-        var cached = Generator(cachedModel, mtp: true, prefixCache: true);
-        var plain = Generator(plainModel, mtp: false, prefixCache: false);
+        var cached = Generator(cachedModel, Kv(cachedModel), mtp: true, prefixCache: true);
+        var plain = Generator(plainModel, Kv(plainModel), mtp: false, prefixCache: false);
 
         int[][] turns = AgentTurns(config.VocabSize);
         for (int t = 0; t < turns.Length; t++)
@@ -86,9 +71,8 @@ public sealed class TextGeneratorRecurrentPrefixMtpTests : IDisposable
             var (ids, timings) = streaming ? await Stream(cached, Csv(turns[t])) : Run(cached, Csv(turns[t]));
 
             Assert.Equal(want.GeneratedTokenIds, ids);
-            Assert.True(timings.SpeculativeDraftTokens > 0, $"turn {t} decoded without MTP (cached {timings.CachedTokenCount}, generated [{string.Join(",", ids)}])");
-            if (t > 0)
-                Assert.Equal(turns[t - 1].Length - 1, timings.CachedTokenCount);   // the hit is what this test is about
+            Assert.True(timings.SpeculativeDraftTokens > 0, $"turn {t} decoded without MTP (cached {timings.CachedTokenCount})");
+            Assert.Equal(t == 0 ? 0 : turns[t - 1].Length - 1, timings.CachedTokenCount);   // the hit is what this test is about
         }
         cached.ClearRecurrentPrefixCache();
     }
@@ -96,40 +80,14 @@ public sealed class TextGeneratorRecurrentPrefixMtpTests : IDisposable
     [Fact]
     public void HitTurn_DraftsWhatAColdMtpRunOfTheSamePromptDrafts()
     {
-        // Verified output equals plain greedy however bad the drafts are, so this checks the head itself: on the hit, every
-        // draft step's logits must match a cold MTP run's. A head resumed with a zeroed or stale carry row, at the wrong
-        // length, or over another conversation's rows drafts differently.
+        // A head resumed with a zeroed or stale carry row, at the wrong length, below a grown KV's length, or over another
+        // conversation's rows drafts differently from the cold run (or throws).
         var (gguf, config) = Fixture("prefix-mtp-drafts.gguf");
         using var _ = gguf;
-        using var cachedInner = Load(gguf, config);
-        using var coldInner = Load(gguf, config);
-        var cachedModel = new DraftRecordingModel(cachedInner);
-        var coldModel = new DraftRecordingModel(coldInner);
-        var cached = Generator(cachedModel, mtp: true, prefixCache: true);
-        var cold = Generator(coldModel, mtp: true, prefixCache: false);
+        using var cachedModel = Load(gguf, config);
+        using var coldModel = Load(gguf, config);
 
-        int[][] turns = AgentTurns(config.VocabSize);
-        for (int t = 0; t < turns.Length; t++)
-        {
-            coldModel.Drafts.Clear();
-            var want = cold.Generate(Csv(turns[t]), Greedy);
-            cachedModel.Drafts.Clear();
-            var got = cached.Generate(Csv(turns[t]), Greedy);
-
-            Assert.Equal(want.GeneratedTokenIds, got.GeneratedTokenIds);
-            Assert.Equal(want.Timings.SpeculativeDraftTokens, got.Timings.SpeculativeDraftTokens);
-            Assert.Equal(want.Timings.SpeculativeAcceptedTokens, got.Timings.SpeculativeAcceptedTokens);
-            Assert.Equal(coldModel.Drafts.Count, cachedModel.Drafts.Count);
-            Assert.NotEmpty(cachedModel.Drafts);
-            for (int s = 0; s < coldModel.Drafts.Count; s++)
-            {
-                float worst = 0f;
-                for (int v = 0; v < config.VocabSize; v++)
-                    worst = Math.Max(worst, Math.Abs(coldModel.Drafts[s][v] - cachedModel.Drafts[s][v]));
-                Assert.True(worst <= DraftLogitTolerance, $"turn {t} (cached {got.Timings.CachedTokenCount}) draft step {s}: max |diff| {worst}");
-            }
-        }
-        cached.ClearRecurrentPrefixCache();
+        AssertHitTurnsDraftLikeColdRuns(cachedModel, Kv(cachedModel), coldModel, Kv(coldModel), DraftLogitTolerance, _out.WriteLine);
     }
 
     [Fact]
@@ -141,8 +99,8 @@ public sealed class TextGeneratorRecurrentPrefixMtpTests : IDisposable
         using var _ = gguf;
         using var cachedModel = Load(gguf, config);
         using var plainModel = Load(gguf, config);
-        var cached = Generator(cachedModel, mtp: true, prefixCache: true);
-        var plain = Generator(plainModel, mtp: false, prefixCache: false);
+        var cached = Generator(cachedModel, Kv(cachedModel), mtp: true, prefixCache: true);
+        var plain = Generator(plainModel, Kv(plainModel), mtp: false, prefixCache: false);
         int[][] turns = AgentTurns(config.VocabSize);
 
         cached.Generate(Csv(turns[0]), Greedy);
@@ -174,59 +132,5 @@ public sealed class TextGeneratorRecurrentPrefixMtpTests : IDisposable
             timings = token.Timings ?? timings;
         }
         return (ids.ToArray(), timings!.Value);
-    }
-
-    private sealed class TokenIdsTokenizer(int vocabSize) : ITokenizer
-    {
-        public int VocabSize => vocabSize;
-        public int BosTokenId => 1;
-        public int EosTokenId => -1;   // the 12-token fixture would otherwise stop on its own EOS within a few tokens
-        public int[] Encode(string text) => text.Split(',').Select(s => int.Parse(s, CultureInfo.InvariantCulture)).ToArray();
-        public int CountTokens(string text) => Encode(text).Length;
-        public string Decode(ReadOnlySpan<int> ids) => string.Join(",", ids.ToArray());
-        public string Decode(ReadOnlySpan<int> ids, bool stripBosSpace) => Decode(ids);
-        public string DecodeToken(int id) => id.ToString(CultureInfo.InvariantCulture);
-    }
-
-    /// <summary>Forwards everything to the real model and records a copy of every MTP draft step's logits.</summary>
-    private sealed class DraftRecordingModel(IModel inner) : IModel
-    {
-        public IModel Inner => inner;
-        public List<float[]> Drafts { get; } = [];
-
-        public ModelConfig Config => inner.Config;
-        public long ComputeMemoryBytes => inner.ComputeMemoryBytes;
-        public void Dispose() { }
-
-        public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d) => inner.Forward(t, p, d);
-        public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IKvCache? kv) => inner.Forward(t, p, d, kv);
-        public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IKvCache? kv, bool last) => inner.Forward(t, p, d, kv, last);
-        public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IKvCache? kv, ILoraAdapter? a) => inner.Forward(t, p, d, kv, a);
-        public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IKvCache? kv, ILoraAdapter? a, IMtpState? m) => inner.Forward(t, p, d, kv, a, m);
-        public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IKvCache? kv, ILoraAdapter? a, IMtpState? m, bool last) => inner.Forward(t, p, d, kv, a, m, last);
-
-        public bool RequiresPerSequenceState => inner.RequiresPerSequenceState;
-        public void ResetSequenceState() => inner.ResetSequenceState();
-        public bool SupportsRecurrentStateCheckpoint => inner.SupportsRecurrentStateCheckpoint;
-        public object? CheckpointRecurrentState() => inner.CheckpointRecurrentState();
-        public void RestoreRecurrentState(object? checkpoint) => inner.RestoreRecurrentState(checkpoint);
-        public bool SupportsRecurrentRowSnapshots => inner.SupportsRecurrentRowSnapshots;
-        public ITensor ForwardWithRecurrentSnapshots(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IKvCache? kv, IMtpState? m)
-            => inner.ForwardWithRecurrentSnapshots(t, p, d, kv, m);
-        public void RestoreRecurrentStateToRow(int row) => inner.RestoreRecurrentStateToRow(row);
-
-        public bool SupportsMtp => inner.SupportsMtp;
-        public int MaxAllRowLogitsLength => inner.MaxAllRowLogitsLength;
-        public bool TrySetAllRowLogitsLimit(int maxSeqLen) => inner.TrySetAllRowLogitsLimit(maxSeqLen);
-        public int PreferredPrefillChunkTokens => inner.PreferredPrefillChunkTokens;
-        public IMtpState? CreateMtpState() => inner.CreateMtpState();
-        public IMtpState? CreateMtpState(int maxSequenceLength) => inner.CreateMtpState(maxSequenceLength);
-
-        public unsafe ITensor ForwardMtp(IMtpState state, int tokenId, int position)
-        {
-            ITensor logits = inner.ForwardMtp(state, tokenId, position);
-            Drafts.Add(new ReadOnlySpan<float>((void*)logits.DataPointer, Config.VocabSize).ToArray());
-            return logits;
-        }
     }
 }
