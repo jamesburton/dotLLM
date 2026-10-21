@@ -1904,12 +1904,13 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     internal int GroupedMinTokens { get; set; } = GroupedMinTokensDefault;
 
     /// <summary>
-    /// True when this host can serve packed Q4_0 weights natively (#1018): the dense decode MMVQ + prefill coopmat GEMM and the indexed-MoE decode MMVQ
-    /// exist (integer-dot-product, wave64 coopmat, SPIR-V present, <c>DOTLLM_VK_Q4_0_NATIVE</c> not 0). The grouped coopmat prefill bank kernel is
+    /// True when this host can serve packed Q4_0 weights natively: dense decode MMVQ, portable or cooperative-matrix GEMM and indexed-MoE MMVQ
+    /// exist (integer-dot-product, SPIR-V present, <c>DOTLLM_VK_Q4_0_NATIVE</c> not 0). The grouped coopmat prefill bank kernel is
     /// optional (without it prefill rides the indexed MMVQ).
     /// </summary>
     internal bool SupportsNativeQ4_0
-        => VulkanQwen3MoeMoeUpload.Q4_0NativeEnabled && _kernels.MatMulQ4_0Mmvq is not null && _kernels.MatMulQ4_0GemmCoopmat is not null
+        => VulkanQwen3MoeMoeUpload.Q4_0NativeEnabled && _kernels.MatMulQ4_0Mmvq is not null
+           && (_kernels.MatMulQ4_0GemmCoopmat is not null || _kernels.MatMulQ4_0Gemm is not null)
            && _kernels.MoeMmvqIq(QuantizationType.Q4_0) is not null && _kernels.QuantizeQ8_1RowsActivations is not null;
 
     /// <summary>Opt-in (LFM2-MoE, #1015): decode-sized Q8_0 gate/up banks use the dp4a MMVQ kernel instead of the F32-in indexed kernel.</summary>
@@ -2782,11 +2783,14 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                     _kernels.MatMulQ8Gemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
             case QuantizationType.Q4_0:
-                // #1018 native Q4_0 (LFM2.5): the loader only keeps Q4_0 packed when both kernels exist.
+                // Keep packed weights on devices without wave64 cooperative matrices.
                 if (seqLen == 1 && _kernels.MatMulQ4_0Mmvq is not null && (xqReady || TryPrepareQ8Activations(cmdBuf, input, inputDim)))
                     _kernels.MatMulQ4_0Mmvq.Record(cmdBuf, weights, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, output, m: outputDim, k: inputDim);
+                else if (_kernels.MatMulQ4_0GemmCoopmat is not null)
+                    _kernels.MatMulQ4_0GemmCoopmat
+                        .Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
-                    (_kernels.MatMulQ4_0GemmCoopmat ?? throw new InvalidOperationException("Native Q4_0 projection without the Q4_0 coopmat GEMM kernel."))
+                    (_kernels.MatMulQ4_0Gemm ?? throw new InvalidOperationException("Native Q4_0 projection without a Q4_0 GEMM kernel."))
                         .Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
             case QuantizationType.Q2_K:

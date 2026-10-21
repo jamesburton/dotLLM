@@ -233,8 +233,18 @@ Differences between architectures are captured entirely in ModelConfig.
 - **State**: `Lfm2ConvStateCache` / `VulkanLfm2ConvStateCache` are `ISsmState`s (per sequence through `CreateSequenceState` / `ForwardBatch`); attention layers
   use the sparse hybrid KV cache (slots only for the 10 attention layers). No recurrent checkpoint/rollback yet (so no speculative draft/verify).
 - **Quantisation**: the QAD-Q4_0 file is Q4_0 + a Q6_K tied head. CPU routes Q4_0 expert banks through the packed x Q8_1 dot (opt-in
-  `packedLegacyExperts`, batch-invariant). Vulkan has no Q4_0 kernels: the loader transcodes Q4_0 -> Q8_0 exactly (same f16 scale, `q8 = nibble - 8`) and
-  uses the Q8_0 dense, MMVQ and grouped-coopmat paths (25.4 GB resident); native Q4_0 kernels are the follow-up. Router dump: `DOTLLM_TENSOR_DUMP_DIR`.
+  `packedLegacyExperts`, batch-invariant). Vulkan keeps Q4_0 dense and routed weights packed when integer-dot-product kernels are available.
+  Dense prefill uses cooperative matrices where supported, otherwise the portable packed F32 GEMM; wave64 is not required for packed residency.
+  `DOTLLM_VK_Q4_0_NATIVE=0` restores the exact Q4_0 -> Q8_0 weight transcode (same f16 scale, `q8 = nibble - 8`).
+  Dense portable prefill uses F32 activations while decode MMVQ and CPU packed execution quantize activations to Q8_1; identical weight values
+  do not imply identical arithmetic across these paths. A synthetic all-Q4 comparison against the Q8 transcode measured 0.58% normalized maximum
+  logit error; this is not a full-checkpoint quality result. Portable dense kernels are checked against dequantized F32 weights separately from
+  packed-expert parity. Short-convolution projection scratch holds `3 * HiddenSize` values per token independently of routing top-K.
+  Causal chunk/full parity is tested with `DOTLLM_VULKAN_DISABLE_COOPMAT_ATTENTION=1`, keeping attention in F32. Default fast attention retains
+  F16 cooperative-matrix prefill and F32 decode: the synthetic top-K-one fixture measured 0.277% normalized maximum logit difference between
+  a three-token prefill plus decode and a four-token prefill, including with the legacy Q8 transcode. Default-path packed/transcoded parity is
+  checked on identical schedules; strict cross-schedule parity for mixed attention precision remains unestablished. The default fast path is unchanged.
+  Router dump: `DOTLLM_TENSOR_DUMP_DIR`.
 - **Chat / tools**: always-thinking ChatML (`...assistant
 <think>`), Pythonic tool calls `<|tool_call_start|>[fn(a='x')]<|tool_call_end|>` parsed by
   `PythonicToolCallParser`. Raw `dotllm run` adds no BOS (prefix `<|startoftext|>` or use the chat/serve path).
