@@ -116,12 +116,31 @@ internal static class RecurrentPrefixMtpHarness
         public string DecodeToken(int id) => id.ToString(CultureInfo.InvariantCulture);
     }
 
-    /// <summary>Forwards everything to the real model and records a copy of every MTP draft step's logits.</summary>
+    /// <summary>
+    /// A head state that cannot be marked or resumed (the interface defaults), like the Vulkan backends' states: a snapshot taken
+    /// with it keeps no head, so a hit on it must decode plain.
+    /// </summary>
+    public sealed class UnmarkableMtpState(IMtpState inner) : IMtpState
+    {
+        public IMtpState Inner => inner;
+        public int CurrentLength => inner.CurrentLength;
+        public void Rollback(int length) => inner.Rollback(length);
+        public ReadOnlySpan<float> CapturedHiddenRows => inner.CapturedHiddenRows;
+        public int CapturedRowCount => inner.CapturedRowCount;
+        public int HiddenSize => inner.HiddenSize;
+        public void SeedFromCapturedRow(int rowIndex) => inner.SeedFromCapturedRow(rowIndex);
+        public void Dispose() => inner.Dispose();
+    }
+
+    /// <summary>
+    /// Forwards everything to the real model and records a copy of every MTP draft step's logits. With <c>hideMarks</c> it hands
+    /// out <see cref="UnmarkableMtpState"/> wrappers (unwrapped again on the way into the real model).
+    /// </summary>
     /// <remarks>
     /// <see cref="IModel.SupportsMtpArgMax"/> is deliberately not forwarded, so the decoder always calls
     /// <see cref="ForwardMtp"/> and every draft step is recorded.
     /// </remarks>
-    public sealed class DraftRecordingModel(IModel inner) : IModel
+    public sealed class DraftRecordingModel(IModel inner, bool hideMarks = false) : IModel
     {
         public List<float[]> Drafts { get; } = [];
 
@@ -136,8 +155,8 @@ internal static class RecurrentPrefixMtpHarness
         public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IKvCache? kv) => inner.Forward(t, p, d, kv);
         public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IKvCache? kv, bool last) => inner.Forward(t, p, d, kv, last);
         public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IKvCache? kv, ILoraAdapter? a) => inner.Forward(t, p, d, kv, a);
-        public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IKvCache? kv, ILoraAdapter? a, IMtpState? m) => inner.Forward(t, p, d, kv, a, m);
-        public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IKvCache? kv, ILoraAdapter? a, IMtpState? m, bool last) => inner.Forward(t, p, d, kv, a, m, last);
+        public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IKvCache? kv, ILoraAdapter? a, IMtpState? m) => inner.Forward(t, p, d, kv, a, Unwrap(m));
+        public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IKvCache? kv, ILoraAdapter? a, IMtpState? m, bool last) => inner.Forward(t, p, d, kv, a, Unwrap(m), last);
 
         public bool RequiresPerSequenceState => inner.RequiresPerSequenceState;
         public void ResetSequenceState() => inner.ResetSequenceState();
@@ -146,7 +165,7 @@ internal static class RecurrentPrefixMtpHarness
         public void RestoreRecurrentState(object? checkpoint) => inner.RestoreRecurrentState(checkpoint);
         public bool SupportsRecurrentRowSnapshots => inner.SupportsRecurrentRowSnapshots;
         public ITensor ForwardWithRecurrentSnapshots(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IKvCache? kv, IMtpState? m)
-            => inner.ForwardWithRecurrentSnapshots(t, p, d, kv, m);
+            => inner.ForwardWithRecurrentSnapshots(t, p, d, kv, Unwrap(m));
         public void RestoreRecurrentStateToRow(int row) => inner.RestoreRecurrentStateToRow(row);
 
         public bool SupportsMtp => inner.SupportsMtp;
@@ -157,13 +176,16 @@ internal static class RecurrentPrefixMtpHarness
         public IMtpState? CreateMtpState(int maxSequenceLength)
         {
             var state = inner.CreateMtpState(maxSequenceLength);
-            if (state is not null) CreatedStates.Add(state);
-            return state;
+            if (state is null) return null;
+            CreatedStates.Add(state);
+            return hideMarks ? new UnmarkableMtpState(state) : state;
         }
+
+        private static IMtpState? Unwrap(IMtpState? state) => state is UnmarkableMtpState u ? u.Inner : state;
 
         public unsafe ITensor ForwardMtp(IMtpState state, int tokenId, int position)
         {
-            ITensor logits = inner.ForwardMtp(state, tokenId, position);
+            ITensor logits = inner.ForwardMtp(Unwrap(state)!, tokenId, position);
             Drafts.Add(new ReadOnlySpan<float>((void*)logits.DataPointer, Config.VocabSize).ToArray());
             return logits;
         }

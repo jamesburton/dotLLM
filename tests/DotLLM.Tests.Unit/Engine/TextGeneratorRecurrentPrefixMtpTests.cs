@@ -129,6 +129,46 @@ public sealed class TextGeneratorRecurrentPrefixMtpTests : IDisposable
         Assert.True(IsDisposed(head));
     }
 
+    [Fact]
+    public void HeadThatCannotResume_HitsDecodePlain_AndStayCorrect()
+    {
+        // A backend whose head state cannot be marked (the Vulkan states today) keeps no head with the snapshot. A hit must then
+        // decode plain: a fresh head cannot start absorbing mid-sequence, and trying would fail the request.
+        var (gguf, config) = Fixture("prefix-mtp-unmarkable.gguf");
+        using var _ = gguf;
+        using var cachedInner = Load(gguf, config);
+        using var plainModel = Load(gguf, config);
+        var cached = Generator(new DraftRecordingModel(cachedInner, hideMarks: true), Kv(cachedInner), mtp: true, prefixCache: true);
+        var plain = Generator(plainModel, Kv(plainModel), mtp: false, prefixCache: false);
+        int[][] turns = AgentTurns(config.VocabSize);
+
+        for (int t = 0; t < 3; t++)
+        {
+            var got = cached.Generate(Csv(turns[t]), Greedy);
+            Assert.Equal(t == 0 ? 0 : turns[t - 1].Length - 1, got.Timings.CachedTokenCount);
+            Assert.Equal(t == 0, got.Timings.SpeculativeDraftTokens > 0);
+            Assert.Equal(plain.Generate(Csv(turns[t]), Greedy).GeneratedTokenIds, got.GeneratedTokenIds);
+        }
+        cached.ClearRecurrentPrefixCache();
+    }
+
+    [Fact]
+    public void PlainRequestThatTakesNoSnapshot_CreatesNoHead()
+    {
+        // The head rides along a plain request only to keep a snapshot usable; with no snapshot it would be pure waste.
+        var (gguf, config) = Fixture("prefix-mtp-no-snapshot.gguf");
+        using var _ = gguf;
+        using var inner = Load(gguf, config);
+        var model = new DraftRecordingModel(inner);
+        var cached = Generator(model, Kv(inner), mtp: true, prefixCache: true);
+        var logprobs = new InferenceOptions { Temperature = 0f, RepetitionPenalty = 1f, MaxTokens = NewTokens, Logprobs = true };
+
+        cached.Generate(Csv(AgentTurns(config.VocabSize)[0][..10]), logprobs);   // too short to snapshot (RecurrentPrefixMinTokens)
+
+        Assert.Empty(model.CreatedStates);
+        cached.ClearRecurrentPrefixCache();
+    }
+
     [SkippableFact]
     public void AdaptiveGate_ThatDecodesTheFirstTurnPlain_StillGetsMtpOnTheNextHit()
     {
