@@ -93,9 +93,21 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     // Native NVFP4 coopmat GEMM (#1064): decodes NVFP4 into shared memory inside the GEMM; null off wave64/coopmat devices, where
     // NVFP4 prefill falls back to _iqF16Prefill and then the packed scalar GEMM.
     private MatMulNvfp4GemmCoopmatKernel? _matmulNvfp4Coopmat;
+    // Native IQ2_XXS coopmat GEMM (#1069) for dense IQ2_XXS prefill (Bolt's shared expert); null off wave64/coopmat devices.
+    private MatMulIq2XxsGemmCoopmatKernel? _matmulIq2XxsCoopmat;
 
     /// <summary>Bytes of the shared F16 prefill scratch allocated so far (#1060, #1064); 0 when nothing has used it.</summary>
     internal long F16PrefillScratchBytes => _iqF16Prefill?.ScratchBytes ?? 0;
+
+    /// <summary>Whether a native coopmat prefill GEMM on this device serves <paramref name="qt"/> (#1064, #1069).</summary>
+    /// <param name="qt">Device storage type of a projection.</param>
+    /// <returns>True when prefill matmuls of that type bypass the F16 scratch.</returns>
+    private bool HasNativeCoopmatGemm(QuantizationType qt) => qt switch
+    {
+        QuantizationType.NVFP4 => _matmulNvfp4Coopmat is not null,
+        QuantizationType.IQ2_XXS => _matmulIq2XxsCoopmat is not null,
+        _ => false,
+    };
 
     /// <summary>Bytes the F16 prefill scratch is sized to (allocated on its first use); 0 without the helper.</summary>
     internal long F16PrefillScratchCapacityBytes => (_iqF16Prefill?.CapacityElements ?? 0) * sizeof(ushort);
@@ -620,9 +632,10 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         {
             created._matmulNvfp4 = MatMulNvfp4F32Kernel.Create(device, spvDir);
             created._matmulNvfp4Coopmat = MatMulNvfp4GemmCoopmatKernel.TryCreate(device, spvDir);
-            // #1064: with the native NVFP4 GEMM, the F16 scratch is sized only for the IQ projections it still serves.
+            created._matmulIq2XxsCoopmat = MatMulIq2XxsGemmCoopmatKernel.TryCreate(device, spvDir, iq2Codebooks);
+            // #1064 / #1069: formats with a native coopmat GEMM need no F16 scratch; it is sized only for what it still serves.
             created._iqF16Prefill = IqF16PrefillMatmul.TryCreate(device, spvDir, matmulF16GemmCoopmat,
-                MaxF16PrefillElements(weights, nativeNvfp4: created._matmulNvfp4Coopmat is not null));
+                MaxF16PrefillElements(weights, created.HasNativeCoopmatGemm));
         }
         catch
         {
@@ -2071,6 +2084,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulIq4NlGemm.InvalidateDescriptorCache();
         _matmulNvfp4?.InvalidateDescriptorCache();
         _matmulNvfp4Coopmat?.InvalidateDescriptorCache();
+        _matmulIq2XxsCoopmat?.InvalidateDescriptorCache();
         _iqF16Prefill?.InvalidateDescriptorCache();
         _matmulIq4Xs.InvalidateDescriptorCache();
         _matmulIq4XsGemm.InvalidateDescriptorCache();
@@ -2114,14 +2128,14 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     /// capacity. Routed expert banks are excluded (they have their own grouped kernels).
     /// </summary>
     /// <param name="weights">The uploaded layer buffers.</param>
-    /// <param name="nativeNvfp4">The native NVFP4 coopmat GEMM (#1064) serves NVFP4 prefill, so NVFP4 projections need no scratch.</param>
+    /// <param name="servedNatively">Formats a native coopmat GEMM serves at prefill (#1064 NVFP4, #1069 IQ2_XXS): they need no scratch.</param>
     /// <returns>The capacity in elements, at least 1.</returns>
-    internal static long MaxF16PrefillElements(VulkanNemotronHWeights weights, bool nativeNvfp4)
+    internal static long MaxF16PrefillElements(VulkanNemotronHWeights weights, Func<QuantizationType, bool> servedNatively)
     {
         long max = 1;
         void Take(QuantizationType qt, int m, int k)
         {
-            if (IqF16PrefillMatmul.Handles(qt) && !(nativeNvfp4 && qt == QuantizationType.NVFP4))
+            if (IqF16PrefillMatmul.Handles(qt) && !servedNatively(qt))
                 max = Math.Max(max, (long)m * k);
         }
         foreach (var layer in weights.Layers)
@@ -2177,6 +2191,14 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         if (seqLen > 1 && weightQt == QuantizationType.NVFP4 && _matmulNvfp4Coopmat is not null)
         {
             _matmulNvfp4Coopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen, scale: scale);
+            return;
+        }
+        // #1069: dense IQ2_XXS prefill (Bolt's shared expert) decodes in shared memory too. IQ2_XXS never carries an X.scale.
+        if (seqLen > 1 && weightQt == QuantizationType.IQ2_XXS && _matmulIq2XxsCoopmat is not null
+            && inputDim % MatMulIq2XxsGemmCoopmatKernel.GroupSize == 0)
+        {
+            VulkanNemotronHWeights.ThrowIfScaleUnsupported("projection", scale, weightQt);
+            _matmulIq2XxsCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
             return;
         }
         // #1060: prefill on an NVFP4 or IQ1/IQ2/IQ3 projection dequantises it to F16 once and runs the coopmat GEMM (the scale, if
@@ -2518,6 +2540,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulIq4Nl.Dispose();
         _matmulNvfp4?.Dispose();
         _matmulNvfp4Coopmat?.Dispose();
+        _matmulIq2XxsCoopmat?.Dispose();
         _iqF16Prefill?.Dispose();
         _matmulIq3SGemm.Dispose();
         _matmulIq3S.Dispose();

@@ -162,6 +162,49 @@ public sealed class VulkanNvfp4Bench
         }
     }
 
+    /// <summary>
+    /// #1069: pp512-shaped IQ2_XXS GEMM at Bolt's shared-expert shapes, native coopmat (decode in shared memory) against #1060's F16
+    /// path (whole-matrix dequant to F16 scratch + F16 coopmat GEMM).
+    /// </summary>
+    [SkippableFact]
+    public void Bench_Iq2XxsPrefillGemm_NativeVsF16Dequant()
+    {
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_NVFP4_BENCH"), "1", StringComparison.Ordinal), "DOTLLM_NVFP4_BENCH=1 to enable.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(MatMulIq2XxsGemmCoopmatKernel.IsSupportedOn(device, spvDir), "no wave64 cooperative-matrix device");
+        const int n = 512;
+        (string Tag, int M, int K)[] shapes = [("ffn_up_shexp 5376x4096", 5376, 4096), ("ffn_down_shexp 4096x5376", 4096, 5376)];
+
+        using var native = MatMulIq2XxsGemmCoopmatKernel.Create(device, spvDir);
+        using var f16Gemm = MatMulF16GemmCoopmatKernel.Create(device, spvDir);
+        using var f16Path = IqF16PrefillMatmul.TryCreate(device, spvDir, f16Gemm, shapes.Max(s => (long)s.M * s.K))
+            ?? throw new InvalidOperationException("F16 prefill helper unavailable");
+
+        _output.WriteLine($"Device: {device.DeviceName}  SubgroupSize: {device.SubgroupSize}  n = {n}");
+        _output.WriteLine("| shape | native ms | F16 path ms | native TFLOPS | F16 path / native |");
+        _output.WriteLine("|---|---:|---:|---:|---:|");
+        var rng = new Random(1069);
+        foreach (var (tag, m, k) in shapes)
+        {
+            byte[] w = VulkanNemotronHTransformerModelIq3ForwardTests.RandomIq2XxsRows(rng, m, k);
+            using var bufW = device.Allocate(w.Length);
+            device.Upload(new ReadOnlySpan<byte>(w), bufW);
+            using var bufX = device.Allocate((long)n * k * sizeof(float));
+            using var bufY = device.Allocate((long)n * m * sizeof(float));
+            device.Upload(RandomActivations(rng, n * k), bufX);
+
+            double nativeUs = MeasureMedian(device, 8, cb => native.Record(cb, bufW, bufX, bufY, m, k, n));
+            double f16Us = MeasureMedian(device, 8, cb =>
+            {
+                if (!f16Path.TryRecord(cb, QuantizationType.IQ2_XXS, bufW, bufX, bufY, m, k, n))
+                    throw new InvalidOperationException("the F16 path declined");
+            });
+            double tflops = 2.0 * m * k * n / (nativeUs * 1e-6) / 1e12;
+            _output.WriteLine($"| {tag} | {nativeUs / 1e3:F2} | {f16Us / 1e3:F2} | {tflops:F1} | {f16Us / nativeUs:F2}x |");
+        }
+    }
+
     internal static VulkanDevice.Buffer UploadRandomWeights(VulkanDevice device, Random rng, int m, int k)
     {
         byte[] w = new byte[(long)m * (k / QuantFormat.Nvfp4GroupSize) * QuantFormat.Nvfp4BlockBytes];
