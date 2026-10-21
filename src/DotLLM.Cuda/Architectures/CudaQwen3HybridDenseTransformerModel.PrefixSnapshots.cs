@@ -22,7 +22,10 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (kvCache is not CudaHybridKvCacheHandle) throw new ArgumentException("A CUDA hybrid KV handle is required.", nameof(kvCache));
         // Tiered requests overwrite the old active storage, so it can be freed before growing. Snapshot copies are separate.
-        long growth = Math.Max(0, checked(ComputeKvBytes(kvCache.MaxLength) - KvAllocatedBytes));
+        // In place (issue #1080) only the added pages are allocated.
+        long growth = KvGrowsInPlace
+            ? KvStorageGrowthBytes(kvCache.MaxLength)
+            : Math.Max(0, checked(ComputeKvBytes(kvCache.MaxLength) - KvAllocatedBytes));
         long free = FreeVramOverride ?? QueryFreeDeviceBytes();
         return DeviceMemoryBudget.Fits(free, growth, VramReserveBytes);   // issue #1068: the same reserve as every growth
     }

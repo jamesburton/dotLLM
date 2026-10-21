@@ -165,6 +165,84 @@ internal static partial class CudaDriverApi
     [SuppressGCTransition]
     internal static partial int cuMemFree_v2(nint devicePtr);
 
+    // ── Virtual memory management (issue #1080) ─────────────────────
+    // Reserve a device address range once, then back it with physical allocations as it grows. Growth maps more pages
+    // behind the same pointer, so nothing is copied and old and new storage never coexist.
+
+    /// <summary><c>CUmemLocation</c>: where an allocation lives or who may access it.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct CudaMemLocation
+    {
+        /// <summary><c>CUmemLocationType</c>; <see cref="CU_MEM_LOCATION_TYPE_DEVICE"/> here.</summary>
+        public int Type;
+
+        /// <summary>Device ordinal.</summary>
+        public int Id;
+    }
+
+    /// <summary><c>CUmemAllocationProp</c> (32 bytes on x64; the trailing <c>allocFlags</c> struct is 8 bytes).</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct CudaMemAllocationProp
+    {
+        /// <summary><c>CUmemAllocationType</c>; <see cref="CU_MEM_ALLOCATION_TYPE_PINNED"/>.</summary>
+        public int Type;
+
+        /// <summary><c>CUmemAllocationHandleType</c>; 0 = not exportable.</summary>
+        public int RequestedHandleTypes;
+
+        /// <summary>The device that backs the allocation.</summary>
+        public CudaMemLocation Location;
+
+        /// <summary>Windows security metadata for exportable handles; zero.</summary>
+        public nint Win32HandleMetaData;
+
+        /// <summary><c>allocFlags</c> (compression type, RDMA, usage, reserved); zero.</summary>
+        public ulong AllocFlags;
+    }
+
+    /// <summary><c>CUmemAccessDesc</c>: one location's access to a mapped range.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct CudaMemAccessDesc
+    {
+        /// <summary>Who gets access.</summary>
+        public CudaMemLocation Location;
+
+        /// <summary><c>CUmemAccess_flags</c>; <see cref="CU_MEM_ACCESS_FLAGS_PROT_READWRITE"/>.</summary>
+        public int Flags;
+    }
+
+    internal const int CU_MEM_ALLOCATION_TYPE_PINNED = 1;
+    internal const int CU_MEM_LOCATION_TYPE_DEVICE = 1;
+    internal const int CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 3;
+    internal const int CU_MEM_ALLOC_GRANULARITY_MINIMUM = 0;
+
+    /// <summary><c>CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED</c>: the cuMem* VMM calls below work on this device.</summary>
+    internal const int CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED = 102;
+
+    [LibraryImport(LibName)]
+    internal static partial int cuMemGetAllocationGranularity(out nuint granularity, in CudaMemAllocationProp prop, int option);
+
+    [LibraryImport(LibName)]
+    internal static partial int cuMemAddressReserve(out nint ptr, nuint size, nuint alignment, nint addr, ulong flags);
+
+    [LibraryImport(LibName)]
+    internal static partial int cuMemAddressFree(nint ptr, nuint size);
+
+    [LibraryImport(LibName)]
+    internal static partial int cuMemCreate(out ulong handle, nuint size, in CudaMemAllocationProp prop, ulong flags);
+
+    [LibraryImport(LibName)]
+    internal static partial int cuMemRelease(ulong handle);
+
+    [LibraryImport(LibName)]
+    internal static partial int cuMemMap(nint ptr, nuint size, nuint offset, ulong handle, ulong flags);
+
+    [LibraryImport(LibName)]
+    internal static partial int cuMemUnmap(nint ptr, nuint size);
+
+    [LibraryImport(LibName)]
+    internal static partial int cuMemSetAccess(nint ptr, nuint size, in CudaMemAccessDesc desc, nuint count);
+
     [LibraryImport(LibName)]
     internal static partial int cuMemcpyHtoD_v2(
         nint dstDevice, nint srcHost, nuint byteCount);

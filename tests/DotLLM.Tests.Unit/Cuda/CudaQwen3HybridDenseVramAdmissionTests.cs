@@ -79,7 +79,9 @@ public sealed class CudaQwen3HybridDenseVramAdmissionTests : IDisposable
         Assert.False(kv.TryGrowTo(16));
         Assert.Equal(6, kv.MaxLength);
 
-        CudaQwen3HybridDenseTransformerModel.FreeVramOverride = Reserve + model.ComputeKvBytes(16);
+        // Issue #1080: what a growth needs is the storage it adds (whole granules of each slot's K and V range when it grows in
+        // place, the whole new storage when it copies).
+        CudaQwen3HybridDenseTransformerModel.FreeVramOverride = Reserve + model.KvStorageGrowthBytes(16);
         Assert.True(kv.TryGrowTo(16));
     }
 
@@ -119,6 +121,7 @@ public sealed class CudaQwen3HybridDenseVramAdmissionTests : IDisposable
         // margin and read cuMemGetInfo directly. Both now go through the shared reserve, so the override drives them too.
         using var l = Load(withMtp: false, contextLength: 64);
         var model = l.Model;
+        model.UseCopyingKvGrowthForTest();   // issue #1080: in place, growing 16 -> 64 tokens stays inside the first page and needs nothing
         var provider = (DotLLM.Core.Models.IRecurrentPrefixSnapshotProvider)model;
         using var kv = model.CreateKvCache(16);
         using (ITensor _ = model.Forward([1, 4, 7], [0, 1, 2], deviceId: -1, kv, lastTokenLogitsOnly: true)) { }
