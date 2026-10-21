@@ -44,6 +44,8 @@ public sealed partial class TextGenerator
     // checkpointed right after them. See ResolveRecurrentPrefix.
     private readonly bool _recurrentPrefixEnabled;
     private RecurrentPrefixEntry? _recurrentPrefix;
+    // The previous request's prompt. Written by whichever recurrent path is active: the single-slot path (shared-prefix and
+    // extension boundaries) or the tiered path (exact-extension check, issue #1093). Only one of them runs per generator.
     private int[]? _recurrentPrefixLastPrompt;
     private int? _recurrentPrefixLastSuffixBoundary;   // _recurrentPrefixLastPrompt's generation-prompt boundary (issue #1093)
 

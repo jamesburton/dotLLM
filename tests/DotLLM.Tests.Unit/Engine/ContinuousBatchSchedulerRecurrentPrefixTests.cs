@@ -54,6 +54,78 @@ public sealed class ContinuousBatchSchedulerRecurrentPrefixTests
         await AssertMatchesColdRun([.. h3, .. G], turn3, kvf, opts);
     }
 
+    [Fact]
+    public async Task FourTurnConversation_WithSuffixHint_KeepsOneEntry_AndDisposesTheSupersededOnes()
+    {
+        // A hit that moves its snapshot forward replaces the entry it extended. Keeping it would fill the cache with nested
+        // copies of one conversation's history (at 128k, several near-full KV copies) and evict other sessions.
+        using var model = new ThreadedHistoryModel();
+        using var scheduler = NewScheduler(model);
+        int[] history = P1;
+        int expectedCached = 0;
+        for (int turn = 1; turn <= 4; turn++)
+        {
+            var got = await RunOne(scheduler, [.. history, .. G], HintedOpts);
+
+            Assert.Equal(expectedCached, got.Timings.CachedTokenCount);
+            Assert.Equal(1, scheduler.RecurrentPrefixEntryCount);
+            Assert.Equal(turn, model.Snapshots.Count);
+            Assert.All(model.Snapshots.Take(turn - 1), s => Assert.True(s.IsDisposed));
+            Assert.False(model.Snapshots[^1].IsDisposed);
+            expectedCached = history.Length;
+            history = [.. history, .. Run(100 * turn, 20), .. Run(100 * turn + 50, 20)];
+        }
+    }
+
+    [Fact]
+    public async Task ExactExtension_WithSuffixHint_HitsUpToThePreviousGenerationPrompt()
+    {
+        // ChatML, or reasoning sent back: each prompt extends the whole previous one, G included. The scheduler has no
+        // extension bet (it never had one), so it reuses the previous turn up to its generation prompt.
+        using var model = new ThreadedHistoryModel();
+        using var scheduler = NewScheduler(model);
+        int[] t1 = [.. P1, .. G];
+        int[] t2 = [.. t1, .. Run(100, 20), .. Run(150, 20), .. G];
+        int[] t3 = [.. t2, .. Run(200, 20), .. Run(250, 20), .. G];
+
+        Assert.Equal(0, (await RunOne(scheduler, t1, HintedOpts)).Timings.CachedTokenCount);
+        var turn2 = await RunOne(scheduler, t2, HintedOpts);
+        var turn3 = await RunOne(scheduler, t3, HintedOpts);
+
+        Assert.Equal(P1.Length, turn2.Timings.CachedTokenCount);
+        Assert.Equal(t2.Length - G.Length, turn3.Timings.CachedTokenCount);
+        Assert.Equal(1, scheduler.RecurrentPrefixEntryCount);
+        await AssertMatchesColdRun(t3, turn3, Kvf, HintedOpts);
+    }
+
+    [Fact]
+    public async Task DivergingHistory_WithoutHint_KeepsTodaysBehaviour()
+    {
+        // No hint: turn 1 shares nothing and is not snapshotted, turn 2 snapshots what it shares with turn 1 (P1), and
+        // turn 3 hits that without moving it forward.
+        using var model = new ThreadedHistoryModel();
+        using var scheduler = NewScheduler(model);
+        int[] h2 = [.. P1, .. Run(100, 20), .. Run(150, 20)];
+        int[] h3 = [.. h2, .. Run(200, 20), .. Run(250, 20)];
+
+        var turn1 = await RunOne(scheduler, [.. P1, .. G], PlainOpts);
+        var turn2 = await RunOne(scheduler, [.. h2, .. G], PlainOpts);
+        var turn3 = await RunOne(scheduler, [.. h3, .. G], PlainOpts);
+
+        Assert.Equal(0, turn1.Timings.CachedTokenCount);
+        Assert.Equal(0, turn2.Timings.CachedTokenCount);
+        Assert.Equal(P1.Length, turn3.Timings.CachedTokenCount);
+        Assert.Equal(1, scheduler.RecurrentPrefixEntryCount);
+        Assert.Single(model.Snapshots);
+    }
+
+    private static readonly Func<ModelConfig, int, IKvCache> Kvf = (cfg, size) => new SimpleKvCache(KvGeometry.FromConfig(cfg), size);
+    private static InferenceOptions PlainOpts => new() { Temperature = 0f, MaxTokens = 4 };
+    private static InferenceOptions HintedOpts => PlainOpts with { GenerationPromptSuffix = GenerationSuffix };
+
+    private static ContinuousBatchScheduler NewScheduler(ThreadedHistoryModel model)
+        => new(model, new CsvTokenizer(), Kvf, new ContinuousBatchSchedulerOptions { RecurrentPrefixCacheEntries = 4 });
+
     private static async Task AssertMatchesColdRun(int[] prompt, InferenceResponse got, Func<ModelConfig, int, IKvCache> kvf, InferenceOptions opts)
     {
         using var coldModel = new ThreadedHistoryModel();
@@ -95,7 +167,8 @@ public sealed class ContinuousBatchSchedulerRecurrentPrefixTests
     {
         public int State => state;
         public int Length => length;
-        public void Dispose() { }
+        public bool IsDisposed { get; private set; }
+        public void Dispose() => IsDisposed = true;
     }
 
     /// <summary>
@@ -122,12 +195,18 @@ public sealed class ContinuousBatchSchedulerRecurrentPrefixTests
         public IDisposable? SnapshotSequencePrefix(IKvCache kvCache, IRecurrentSequenceState? state, int prefixLen)
         {
             Assert.Equal(prefixLen, kvCache.CurrentLength);
-            return new PrefixSnapshot(((HashState)state!).Value, prefixLen);
+            var snapshot = new PrefixSnapshot(((HashState)state!).Value, prefixLen);
+            Snapshots.Add(snapshot);
+            return snapshot;
         }
+
+        /// <summary>Every snapshot taken, in order.</summary>
+        public List<PrefixSnapshot> Snapshots { get; } = [];
 
         public void RestoreSequencePrefix(IDisposable snapshot, IKvCache kvCache, IRecurrentSequenceState? state)
         {
             var snap = (PrefixSnapshot)snapshot;
+            Assert.False(snap.IsDisposed);   // a released entry must never be restored
             kvCache.Rollback(0);
             WriteKv(kvCache, [.. Enumerable.Range(0, snap.Length)]);
             ((HashState)state!).Value = snap.State;

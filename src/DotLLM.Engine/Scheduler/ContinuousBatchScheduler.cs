@@ -113,7 +113,10 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
     // Touched only from Step (single thread). Most-recently-used first.
     private readonly List<RecurrentPrefixEntry> _recurrentPrefixes = new();
     private int[]? _recurrentPrefixLastPrompt;
-    private int? _recurrentPrefixLastSuffixBoundary;   // _recurrentPrefixLastPrompt's generation-prompt boundary (issue #1093)
+    private int? _recurrentPrefixLastSuffixBoundary;
+
+    /// <summary>Recurrent prefix snapshots currently held. Read only from the thread that drives <see cref="Step"/>.</summary>
+    internal int RecurrentPrefixEntryCount => _recurrentPrefixes.Count;   // _recurrentPrefixLastPrompt's generation-prompt boundary (issue #1093)
 
     // Slot recycling for the recurrent-prefix path: a hybrid model's per-sequence state + KV are device allocations that cost
     // ~25 ms per request on Vulkan (more than the prefill they enable reuse of). Released slots are kept (dirty) and handed
@@ -967,6 +970,16 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         if (snapshot is not null)
         {
             _recurrentPrefixes.Insert(0, new RecurrentPrefixEntry(promptIds.AsSpan(0, boundary).ToArray(), snapshot));
+
+            // A hit that moved its snapshot forward supersedes the entry it extended (the conversation's next turn hits the
+            // longer one), so release it rather than let one conversation fill the cache with nested copies of its own history.
+            // The restore copied it into this sequence's own KV and state, so nothing else holds it.
+            if (best is not null)
+            {
+                _recurrentPrefixes.Remove(best);
+                best.Dispose();
+            }
+
             while (_recurrentPrefixes.Count > _options.RecurrentPrefixCacheEntries)
             {
                 _recurrentPrefixes[^1].Dispose();

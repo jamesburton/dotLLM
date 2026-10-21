@@ -430,7 +430,7 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
         int[] t3 = [.. t2, .. Run(200, 20), .. Run(250, 20), .. G];
 
         CheckHinted(cached, plain, model, t1);
-        Assert.True(CheckHinted(cached, plain, model, t2).Timings.CachedTokenCount >= P1.Length);
+        Assert.Equal(P1.Length, CheckHinted(cached, plain, model, t2).Timings.CachedTokenCount);   // turn 1 snapshotted before G
         var turn3 = CheckHinted(cached, plain, model, t3);
 
         Assert.Equal(t2.Length - 1, turn3.Timings.CachedTokenCount);
