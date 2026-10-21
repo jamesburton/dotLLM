@@ -460,6 +460,54 @@ public sealed class VulkanDevice : IDisposable
     }
 
     /// <summary>
+    /// Lists the physical devices the loader enumerates (index, name, type, PCI vendor) without creating a logical device, so a caller
+    /// can pick one (#1083: the MoE iGPU cold leg selects the integrated GPU of a box whose discrete GPU runs CUDA). Empty when no
+    /// loader or driver is present. Does not throw.
+    /// </summary>
+    /// <returns>The devices, in <c>vkEnumeratePhysicalDevices</c> order (the index <see cref="Create(int)"/> takes).</returns>
+    public static IReadOnlyList<VulkanPhysicalDeviceInfo> EnumeratePhysicalDevices()
+    {
+        if (!IsAvailable()) return [];
+        try { return ProbePhysicalDevices(); }
+        catch { return []; }
+    }
+
+    // Isolated so the JIT only resolves VulkanApi P/Invokes when the loader is confirmed present.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static List<VulkanPhysicalDeviceInfo> ProbePhysicalDevices()
+    {
+        VulkanLibraryResolver.Register();
+        s_lifecycleLock.EnterWriteLock();
+        try
+        {
+            nint inst = CreateInstance();
+            if (inst == 0) return [];
+            try
+            {
+                uint count = 0;
+                if (VulkanApi.vkEnumeratePhysicalDevices(inst, ref count, null) < 0 || count == 0) return [];
+                var devices = new nint[count];
+                if (VulkanApi.vkEnumeratePhysicalDevices(inst, ref count, devices) < 0) return [];
+                var list = new List<VulkanPhysicalDeviceInfo>((int)count);
+                for (int i = 0; i < count; i++)
+                {
+                    VulkanApi.vkGetPhysicalDeviceProperties(devices[i], out var props);
+                    list.Add(new VulkanPhysicalDeviceInfo(i, ReadDeviceName(props), props.deviceType, props.vendorID));
+                }
+                return list;
+            }
+            finally
+            {
+                VulkanApi.vkDestroyInstance(inst, 0);
+            }
+        }
+        finally
+        {
+            s_lifecycleLock.ExitWriteLock();
+        }
+    }
+
+    /// <summary>
     /// Creates a Vulkan device bound to the first suitable GPU.
     /// Selection order: discrete GPU (preferring AMD/NVIDIA over Intel) → integrated → first available.
     /// </summary>
@@ -3398,6 +3446,40 @@ public sealed class VulkanDevice : IDisposable
         }
 
         /// <summary>
+        /// Ends the command buffer and submits it with the fence, WITHOUT waiting (#1083: the MoE iGPU cold leg submits, lets the CPU
+        /// leg run, then waits). Pair every call with <see cref="WaitFence"/> (or <see cref="TryResetIfSignaled"/>) before the next
+        /// <see cref="Begin"/>.
+        /// </summary>
+        public unsafe void Submit()
+        {
+            _device.ActiveHazards = null;
+            VulkanApi.vkEndCommandBuffer(_cmdBuf).ThrowOnError("vkEndCommandBuffer Submit");
+            nint cmdBufLocal = _cmdBuf;
+            var submit = new VkSubmitInfo
+            {
+                sType = VkStructureType.SubmitInfo,
+                commandBufferCount = 1,
+                pCommandBuffers = (nint)(&cmdBufLocal),
+            };
+            VulkanApi.vkQueueSubmit(_device._queue, 1, submit, _fence).ThrowOnError("vkQueueSubmit Submit");
+        }
+
+        /// <summary>
+        /// Non-blocking check of the fence of a prior <see cref="Submit"/>: when it has signalled, resets it and returns true (the
+        /// command buffer is idle); otherwise returns false and leaves it armed.
+        /// </summary>
+        /// <returns>True when the submission has completed (and the fence was reset).</returns>
+        public bool TryResetIfSignaled()
+        {
+            int s = VulkanApi.vkGetFenceStatus(_device._device, _fence);
+            if (s == 1) return false;   // VK_NOT_READY
+            s.ThrowOnError("vkGetFenceStatus TryResetIfSignaled");
+            nint fenceLocal = _fence;
+            VulkanApi.vkResetFences(_device._device, 1, fenceLocal).ThrowOnError("vkResetFences TryResetIfSignaled");
+            return true;
+        }
+
+        /// <summary>
         /// Host-waits on the fence from a prior <see cref="SubmitAndSignal"/> and
         /// resets it for reuse. Call before the next <see cref="Begin"/> when the
         /// previous submission did not host-wait, to guarantee the command buffer
@@ -3467,6 +3549,20 @@ public sealed class VulkanDevice : IDisposable
 
         return new SubmitContext(this, cmdBuf, fence);
     }
+}
+
+/// <summary>One Vulkan physical device as the loader enumerates it (#1083).</summary>
+/// <param name="Index">Enumeration index (what <see cref="VulkanDevice.Create(int)"/> takes).</param>
+/// <param name="Name">Device name.</param>
+/// <param name="DeviceType">The <c>VkPhysicalDeviceType</c> value (1 = integrated, 2 = discrete).</param>
+/// <param name="VendorId">PCI vendor ID (0x10DE NVIDIA, 0x1002 AMD, 0x8086 Intel).</param>
+public readonly record struct VulkanPhysicalDeviceInfo(int Index, string Name, int DeviceType, uint VendorId)
+{
+    /// <summary>True for an integrated GPU (<c>VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU</c>).</summary>
+    public bool IsIntegrated => DeviceType == 1;
+
+    /// <summary>True for an NVIDIA device (PCI vendor 0x10DE).</summary>
+    public bool IsNvidia => VendorId == 0x10DE;
 }
 
 /// <summary>
