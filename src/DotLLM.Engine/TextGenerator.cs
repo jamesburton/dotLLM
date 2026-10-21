@@ -1366,13 +1366,13 @@ public sealed partial class TextGenerator
                         {
                             generatedIds.RemoveAt(generatedIds.Count - 1);
                             StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
-                            var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount);
+                            var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
                             yield return new GenerationToken(nextTokenId, string.Empty, fr, timings, tokenLogprob);
                         }
                         else
                         {
                             StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
-                            var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount);
+                            var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
                             string text = detok.TakeDelta();
                             yield return new GenerationToken(nextTokenId, text, fr, timings, tokenLogprob);
                         }
@@ -1386,7 +1386,7 @@ public sealed partial class TextGenerator
                         if (isLastStep)
                         {
                             StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
-                            var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount);
+                            var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
                             yield return new GenerationToken(nextTokenId, text, FinishReason.Length, timings, tokenLogprob);
                             yield break;
                         }
