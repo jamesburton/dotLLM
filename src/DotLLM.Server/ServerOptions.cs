@@ -23,6 +23,12 @@ public sealed record ServerOptions
     /// <summary>Number of GPU layers for hybrid offloading.</summary>
     public int? GpuLayers { get; init; }
 
+    /// <summary>
+    /// Routed-expert offload for CUDA <c>nemotron_h_moe</c> models (<c>--moe-offload</c>, <c>--moe-cache-mib</c>,
+    /// <c>--moe-cache-policy</c>; issue #1070). Null = defaults plus the <c>DOTLLM_MOE_*</c> environment variables.
+    /// </summary>
+    public DotLLM.Core.Moe.MoeOffloadOptions? MoeOffload { get; init; }
+
     /// <summary>CPU thread count (0 = auto).</summary>
     public int Threads { get; init; }
 
@@ -345,6 +351,7 @@ public sealed record ServerOptions
         string? quant = null;
         string device = "auto";
         int? gpuLayers = null;
+        string? moeOffloadMode = null, moeCacheMib = null, moeCachePolicy = null;
         int threads = 0;
         int decodeThreads = 0;
         string host = "localhost";
@@ -394,6 +401,12 @@ public sealed record ServerOptions
                     quant = next; i++; break;
                 case "--device" or "-d":
                     device = next ?? "cpu"; i++; break;
+                case "--moe-offload":
+                    moeOffloadMode = next; i++; break;
+                case "--moe-cache-mib":
+                    moeCacheMib = next; i++; break;
+                case "--moe-cache-policy":
+                    moeCachePolicy = next; i++; break;
                 case "--gpu-layers":
                     gpuLayers = int.Parse(next!); i++; break;
                 case "--threads":
@@ -495,6 +508,7 @@ public sealed record ServerOptions
             Quant = quant,
             Device = device,
             GpuLayers = gpuLayers,
+            MoeOffload = DotLLM.Core.Moe.MoeOffloadOptions.FromCli(moeOffloadMode, moeCacheMib, moeCachePolicy),
             Threads = threads,
             DecodeThreads = decodeThreads,
             Host = host,

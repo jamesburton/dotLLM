@@ -81,9 +81,9 @@ public sealed class CudaNemotronHMoeParityTests : IDisposable
         string? ptxDir = CudaNemotronMoeTestSupport.FindPtxDir();
         Skip.If(ptxDir is null, "PTX files not found");
 
-        string quantPath = WriteFixture(latent, zeroBias: false, f32Banks: false);
-        string noBiasPath = WriteFixture(latent, zeroBias: true, f32Banks: false);
-        string exactPath = WriteFixture(latent, zeroBias: false, f32Banks: true);
+        string quantPath = WriteFixture(_scratch, latent, zeroBias: false, f32Banks: false);
+        string noBiasPath = WriteFixture(_scratch, latent, zeroBias: true, f32Banks: false);
+        string exactPath = WriteFixture(_scratch, latent, zeroBias: false, f32Banks: true);
 
         float[] cpu = RunCpu(quantPath);
         float[] cpuNoBias = RunCpu(noBiasPath);
@@ -167,9 +167,9 @@ public sealed class CudaNemotronHMoeParityTests : IDisposable
     /// <summary>
     /// Writes the fixture GGUF. The RNG stream is identical across the three variants: <paramref name="zeroBias"/> only zeroes
     /// the (deterministic) selection bias, and <paramref name="f32Banks"/> writes the dequantized F32 values of the very same
-    /// quantized banks.
+    /// quantized banks. Shared with the expert-offload tests (#1070), which hold the offloaded model to the resident one.
     /// </summary>
-    private string WriteFixture(bool latent, bool zeroBias, bool f32Banks)
+    internal static string WriteFixture(string scratch, bool latent, bool zeroBias, bool f32Banks)
     {
         var rng = new Random(403);
         var g = new GgufWriter();
@@ -243,7 +243,7 @@ public sealed class CudaNemotronHMoeParityTests : IDisposable
         F32(g, "output_norm.weight", [Hidden], RandPos(rng, Hidden));
         F32(g, "output.weight", [Hidden, Vocab], Rand(rng, Vocab * Hidden, 0.08f));
 
-        string path = Path.Combine(_scratch, $"nemoe-{latent}-{zeroBias}-{f32Banks}.gguf");
+        string path = Path.Combine(scratch, $"nemoe-{latent}-{zeroBias}-{f32Banks}.gguf");
         File.WriteAllBytes(path, g.Build());
         return path;
     }

@@ -1,6 +1,7 @@
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
+using DotLLM.Core.Moe;
 using DotLLM.Models;
 using DotLLM.Models.Gguf;
 using DotLLM.Models.SafeTensors;
@@ -56,6 +57,8 @@ public static class CudaModelLoader
     /// <param name="ptxDir">Directory containing compiled PTX files. Null for auto-detect.
     /// Honoured only by the plain <see cref="CudaTransformerModel"/> path; the hybrid loaders
     /// auto-detect.</param>
+    /// <param name="moeOffload">Routed-expert offload for <c>nemotron_h_moe</c> (issue #1070); null = defaults plus the
+    /// <c>DOTLLM_MOE_*</c> environment variables. Ignored by every other architecture.</param>
     /// <returns>
     /// The loaded CUDA model together with a factory for the KV-cache it expects. The factory is
     /// returned rather than left to the caller because each architecture needs its own concrete
@@ -63,7 +66,7 @@ public static class CudaModelLoader
     /// the pairing in one place instead of forcing every call site to re-switch on the type.
     /// </returns>
     public static (IModel Model, Func<int, IKvCache> KvCacheFactory) CreateFromGguf(
-        GgufFile gguf, ModelConfig config, int deviceId = 0, string? ptxDir = null)
+        GgufFile gguf, ModelConfig config, int deviceId = 0, string? ptxDir = null, MoeOffloadOptions? moeOffload = null)
     {
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
@@ -126,12 +129,12 @@ public static class CudaModelLoader
             case Architecture.MiMoV2:
                 throw new NotSupportedException(ModelConfig.MiMoV2UnsupportedMessage("CUDA"));
 
-            // nemotron_h_moe (Nemotron 3.5 Bolt / Lightning, #403) runs on the same host: its MoE FFN layers
-            // keep every expert resident in VRAM (offload for smaller GPUs: #1063).
+            // nemotron_h_moe (Nemotron 3.5 Bolt / Lightning, #403) runs on the same host: its MoE FFN layers keep every
+            // expert resident in VRAM when the model fits, else stream them from a host store through a VRAM cache (#1070).
             case Architecture.NemotronH or Architecture.NemotronHMoe:
             {
                 var nemotronH = Architectures.CudaNemotronHTransformerModel
-                    .LoadFromGguf(gguf, config, deviceId, ptxDir);
+                    .LoadFromGguf(gguf, config, deviceId, ptxDir, moeOffload);
                 return (nemotronH, size => nemotronH.CreateKvCache(size));
             }
 
@@ -178,11 +181,13 @@ public static class CudaModelLoader
     /// <param name="deviceId">GPU device ordinal.</param>
     /// <param name="threading">CPU threading for the CPU layers (and the explicit CPU request).</param>
     /// <param name="warn">Receives user-facing warnings. May be <see langword="null"/>.</param>
+    /// <param name="moeOffload">Routed-expert offload for <c>nemotron_h_moe</c> (issue #1070); null = defaults plus the
+    /// <c>DOTLLM_MOE_*</c> environment variables.</param>
     /// <returns>The model and, for GPU-resident models, the KV-cache factory it needs
     /// (<see langword="null"/> for the CPU model).</returns>
     public static (IModel Model, Func<int, IKvCache>? KvCacheFactory) CreateForGpuLayers(
         GgufFile gguf, ModelConfig config, int requestedGpuLayers, int deviceId,
-        ThreadingConfig threading, Action<string>? warn = null)
+        ThreadingConfig threading, Action<string>? warn = null, MoeOffloadOptions? moeOffload = null)
     {
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
@@ -196,7 +201,7 @@ public static class CudaModelLoader
                 return (ModelLoader.CreateCpuModelFromGguf(gguf, config, threading), null);
 
             case GpuOffloadMode.FullGpu:
-                return CreateFromGguf(gguf, config, deviceId);
+                return CreateFromGguf(gguf, config, deviceId, moeOffload: moeOffload);
 
             case GpuOffloadMode.Partial:
                 Nvfp4Support.RejectAny(gguf.TensorsByName, "CUDA"); // #1038, as in CreateFromGguf
@@ -216,7 +221,7 @@ public static class CudaModelLoader
             default: // FullGpuOrFail
                 try
                 {
-                    return CreateFromGguf(gguf, config, deviceId);
+                    return CreateFromGguf(gguf, config, deviceId, moeOffload: moeOffload);
                 }
                 catch (Exception ex)
                 {

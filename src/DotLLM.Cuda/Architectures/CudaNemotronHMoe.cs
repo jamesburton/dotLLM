@@ -1,6 +1,7 @@
 // src/DotLLM.Cuda/Architectures/CudaNemotronHMoe.cs
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
+using DotLLM.Core.Moe;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Cuda.Interop;
 using DotLLM.Models.Architectures;
@@ -37,7 +38,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
     /// </summary>
     internal const long MoeVramReserveBytes = 512L * 1024 * 1024;
 
-    /// <summary>Device bytes a Nemotron-H model will allocate, by category (see <see cref="EstimateDeviceBytes"/>).</summary>
+    /// <summary>Device bytes a Nemotron-H model will allocate, by category (see <c>EstimateDeviceBytes</c>).</summary>
     /// <param name="Weights">Every uploaded weight, including all expert banks.</param>
     /// <param name="ForwardState">Forward activations at the planning token count, plus the SSM recurrent state.</param>
     /// <param name="MoeScratch">Routed-MoE scratch and schedule buffer for one token block.</param>
@@ -65,6 +66,14 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
     /// <returns>The estimate, by category.</returns>
     internal static DeviceBudget EstimateDeviceBytes(ModelConfig config, NemotronHLayerWeights[] cpuLayers,
         QuantizationType outputQt, int outputM, int outputK, int planTokens, int moeBlockTokens)
+        => EstimateDeviceBytes(config, cpuLayers, outputQt, outputM, outputK, planTokens, moeBlockTokens, out _, out _);
+
+    /// <summary>
+    /// <see cref="EstimateDeviceBytes(ModelConfig, NemotronHLayerWeights[], QuantizationType, int, int, int, int)"/>, also
+    /// returning the largest GEMM contraction length and output width (they size the F16 activation scratch, #1070).
+    /// </summary>
+    internal static DeviceBudget EstimateDeviceBytes(ModelConfig config, NemotronHLayerWeights[] cpuLayers,
+        QuantizationType outputQt, int outputM, int outputK, int planTokens, int moeBlockTokens, out long gemmMaxK, out long gemmMaxM)
     {
         int hidden = config.HiddenSize;
         var ssm = config.SsmConfig!.Value;
@@ -141,6 +150,8 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
 
         // Dequant tile (F16) plus the F16 activation in / out scratch of a planTokens-row GEMM.
         long gemm = 2L * maxTile + 2L * planTokens * (maxK + maxM);
+        gemmMaxK = maxK;
+        gemmMaxM = maxM;
         return new DeviceBudget(weights, state, moe, gemm);
 
         static long Raw(QuantizationType qt, long rowCount, long cols) => Dequantize.RowByteSize(cols, qt) * rowCount;
@@ -171,17 +182,17 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
     /// Throws when <paramref name="budget"/> exceeds free VRAM minus <see cref="MoeVramReserveBytes"/>, before anything is
     /// allocated (WDDM would otherwise spill silently into shared system memory rather than fail an allocation).
     /// </summary>
-    private static void ThrowIfMoeModelDoesNotFit(DeviceBudget budget)
+    private static void ThrowIfMoeModelDoesNotFit(DeviceBudget budget, long reserveBytes = MoeVramReserveBytes)
     {
         CudaDriverApi.cuMemGetInfo_v2(out nuint free, out nuint total).ThrowOnError();
-        if (budget.Total <= (long)free - MoeVramReserveBytes) return;
+        if (budget.Total <= (long)free - reserveBytes) return;
         const double GiB = 1024.0 * 1024 * 1024;
         throw new NotSupportedException(
             $"This nemotron_h_moe model needs {budget.Total / GiB:F2} GiB of VRAM (weights {budget.Weights / GiB:F2}, " +
             $"forward state {budget.ForwardState / GiB:F2}, MoE scratch {budget.MoeScratch / GiB:F2}, GEMM scratch " +
             $"{budget.GemmScratch / GiB:F2}), {(long)free / GiB:F2} GiB free of {(long)total / GiB:F2} GiB " +
-            $"({MoeVramReserveBytes / (1024 * 1024)} MiB kept in reserve). The CUDA backend keeps every expert resident; " +
-            "expert offload is tracked in #1063. Use --device cpu or vulkan meanwhile.");
+            $"({reserveBytes / (1024 * 1024)} MiB kept in reserve), and --moe-offload off keeps every expert resident. " +
+            "Use --moe-offload auto (the default) or on to stream the routed experts from host memory through a VRAM expert cache (#1070).");
     }
 
     /// <summary>Which MoE kernels ran; read by tests to prove the intended path executed (issue #403).</summary>
@@ -255,6 +266,14 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
         public required bool NormalizeWeights { get; init; }
         public required float WeightsScale { get; init; }
 
+        /// <summary>Model layer index (the expert cache's layer key).</summary>
+        public required int LayerIndex { get; init; }
+        /// <summary>
+        /// True when the routed banks stay on the host (#1070): <see cref="UpBank"/> / <see cref="DownBank"/> are 0, <see cref="Up"/> /
+        /// <see cref="Down"/> are empty, and each call's pointers come from the expert cache.
+        /// </summary>
+        public required bool Offloaded { get; init; }
+
         /// <summary>Width the routed experts read and write: the latent, or the hidden size when there is none.</summary>
         public int ExpertDim(int hiddenSize) => LatentSize > 0 ? LatentSize : hiddenSize;
     }
@@ -292,13 +311,17 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
     private float[] _moeWeights = [];
     private int[] _moeCounts = [];
     private int[] _moeFill = [];
+    private int[] _moeGroupExperts = [];   // expert of each schedule group, in schedule order
+    private long[] _moeGroupUp = [];       // device pointer of each group's up matrix
+    private long[] _moeGroupDown = [];     // device pointer of each group's down matrix
 
     /// <summary>
     /// Uploads one MoE layer. Throws <see cref="NotSupportedException"/> naming the type for a bank the expert kernel
     /// cannot read, and an <see cref="InvalidOperationException"/> pointing at #1063 when the banks do not fit in VRAM.
+    /// With <paramref name="offloadExperts"/> the routed banks are not uploaded (#1070: they stay in the host store).
     /// </summary>
     private static DeviceMoe UploadDeviceMoeLayer(NemotronHMoeWeights w, int layerIdx, int hiddenSize,
-        ref long maxTileFloats, List<nint> allocs)
+        ref long maxTileFloats, List<nint> allocs, bool offloadExperts = false)
     {
         int expertDim = w.HasLatent ? w.LatentSize : hiddenSize;
         ValidateBank(layerIdx, "ffn_up_exps", w.UpExpsQuantType, expertDim);
@@ -320,14 +343,19 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
             UpdateMaxTile(ref maxTileFloats, (long)w.LatentSize * hiddenSize);
         }
 
-        nint upBank = UploadBank(layerIdx, "ffn_up_exps", w.UpExpsWeight, w.UpPerExpertBytes * n, allocs);
-        nint downBank = UploadBank(layerIdx, "ffn_down_exps", w.DownExpsWeight, w.DownPerExpertBytes * n, allocs);
-        var up = new nint[n];
-        var down = new nint[n];
-        for (int e = 0; e < n; e++)
+        nint upBank = 0, downBank = 0;
+        nint[] up = [], down = [];
+        if (!offloadExperts)
         {
-            up[e] = upBank + (nint)(e * w.UpPerExpertBytes);
-            down[e] = downBank + (nint)(e * w.DownPerExpertBytes);
+            upBank = UploadBank(layerIdx, "ffn_up_exps", w.UpExpsWeight, w.UpPerExpertBytes * n, allocs);
+            downBank = UploadBank(layerIdx, "ffn_down_exps", w.DownExpsWeight, w.DownPerExpertBytes * n, allocs);
+            up = new nint[n];
+            down = new nint[n];
+            for (int e = 0; e < n; e++)
+            {
+                up[e] = upBank + (nint)(e * w.UpPerExpertBytes);
+                down[e] = downBank + (nint)(e * w.DownPerExpertBytes);
+            }
         }
 
         return new DeviceMoe
@@ -342,6 +370,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
             NumExperts = n, NumExpertsPerTok = w.NumExpertsPerTok, MoeIntermediateSize = w.MoeIntermediateSize,
             LatentSize = w.LatentSize, SharedIntermediateSize = w.SharedIntermediateSize,
             NormalizeWeights = w.NormalizeWeights, WeightsScale = w.WeightsScale,
+            LayerIndex = layerIdx, Offloaded = offloadExperts,
         };
     }
 
@@ -442,6 +471,9 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
         _moeWeights = new float[slots];
         _moeCounts = new int[s.NumExperts + 1];
         _moeFill = new int[s.NumExperts];
+        _moeGroupExperts = new int[s.NumExperts];
+        _moeGroupUp = new long[s.NumExperts];
+        _moeGroupDown = new long[s.NumExperts];
         _moeScratchTokens = tokens;
 
         static nint AllocScratch(long floats)
@@ -468,6 +500,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
     /// <summary>Frees the routed scratch, the pinned staging and the routing event (called from <see cref="Dispose"/>).</summary>
     private void DisposeMoe()
     {
+        DisposeMoeOffload();   // first: its copy stream may still read host memory or write device slots
         FreeMoeScratch();
         if (_moeEvent != 0) { CudaDriverApi.cuEventDestroy_v2(_moeEvent); _moeEvent = 0; }
     }
@@ -508,27 +541,22 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
         _kernels.LaunchReluSquaredInplaceF32(_moeShMid, n * moe.SharedIntermediateSize, streamH);
         Gemm(moe.DownShexp, moe.DownShexpQt, _moeShMid, _moeShOut, hiddenSize, moe.SharedIntermediateSize, n);
 
-        // 4-5. Route on the host (the CPU model's RouteToken) and send the CSR schedule.
+        // 4-5. Route on the host (the CPU model's RouteToken) and send the CSR schedule. Offloaded (#1070): the router
+        // event also means every earlier expert kernel has finished, so the copy-wait timings so far can be read.
         CudaDriverApi.cuEventSynchronize(_moeEvent).ThrowOnError();
+        _offload?.HarvestCopyWait();
         var sched = BuildMoeSchedule(moe, n);
         CudaDriverApi.cuMemcpyHtoDAsync_v2(_moeSchedDevice, _moePinned + (nint)_moePinnedScheduleOffset,
             (nuint)sched.TotalBytes, streamH).ThrowOnError();
-
-        nint upPtrs = _moeSchedDevice + (nint)sched.UpPtrsOffset;
-        nint downPtrs = _moeSchedDevice + (nint)sched.DownPtrsOffset;
-        nint groupStart = _moeSchedDevice + (nint)sched.GroupStartOffset;
-        nint slotIds = _moeSchedDevice + (nint)sched.SlotIdsOffset;
-        nint slotToken = _moeSchedDevice + (nint)sched.SlotTokenOffset;
         nint weights = _moeSchedDevice + (nint)sched.WeightsOffset;
 
         // 6. Routed experts: up (+relu^2) reads the token's row of the expert input, down reads the slot's own row.
+        // Offloaded: the same launches over group subsets, each after the copy of its experts (see RunOffloadedExperts).
         nint expertIn = moe.LatentSize > 0 ? _moeXLatent : h;
-        _kernels.LaunchMoeExpertGroupedGemvF32(moe.UpQt, upPtrs, groupStart, slotIds, slotToken,
-            expertIn, _moeMid, moe.MoeIntermediateSize, expertDim, sched.Groups, relu2: true, streamH);
-        MoePathCounters.CountLaunch(moe.UpQt, sched.Groups);
-        _kernels.LaunchMoeExpertGroupedGemvF32(moe.DownQt, downPtrs, groupStart, slotIds, xRow: 0,
-            _moeMid, _moeSlotOut, expertDim, moe.MoeIntermediateSize, sched.Groups, relu2: false, streamH);
-        MoePathCounters.CountLaunch(moe.DownQt, sched.Groups);
+        if (moe.Offloaded)
+            RunOffloadedExperts(moe, sched, expertIn, expertDim, streamH);
+        else
+            LaunchExpertGroups(moe, sched, 0, sched.Groups, expertIn, expertDim, streamH);
 
         // 7. Weighted sum in slot order, back to the hidden size (latent_up), then + the shared expert.
         if (moe.LatentSize > 0)
@@ -550,9 +578,11 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
 
     /// <summary>
     /// Routes the <paramref name="n"/> tokens whose router logits sit at the start of the pinned buffer and writes the CSR
-    /// schedule into the pinned staging area: per used expert (ascending id) its up and down device pointers and its slot
-    /// range; the slot ids grouped by expert (a counting sort, ascending slot within an expert, as the CPU grouped body);
-    /// per slot its token; per slot its gating weight. Slot id = <c>token · topK + k</c>.
+    /// schedule into the pinned staging area: per used expert its up and down device pointers and its slot range; the slot
+    /// ids grouped by expert (a counting sort, ascending slot within an expert, as the CPU grouped body); per slot its token;
+    /// per slot its gating weight. Slot id = <c>token · topK + k</c>. Resident: groups in ascending expert order, pointers into
+    /// the uploaded banks. Offloaded (#1070): the expert cache orders the groups (ready first, then the streamed waves) and
+    /// supplies the slot / arena pointers; each group's slots and arithmetic are unchanged.
     /// </summary>
     private MoeSchedule BuildMoeSchedule(DeviceMoe moe, int n)
     {
@@ -565,20 +595,34 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
         // The group count is not known until every token is routed, so route into managed arrays first.
         int[] topIdx = _moeTopIdx;
         float[] wSlot = _moeWeights;
-        int[] counts = _moeCounts;
-        Array.Clear(counts, 0, nExpert + 1);
+        int[] counts = _moeCounts;   // counts[e]: slots routed to expert e
+        Array.Clear(counts, 0, nExpert);
         var sel = _moeSelScratch.AsSpan(0, nExpert);
         for (int t = 0; t < n; t++)
         {
             NemotronHTransformerModel.RouteToken(moe.Host,
                 new Span<float>(logits + (long)t * nExpert, nExpert), sel,
                 topIdx.AsSpan(t * topK, topK), wSlot.AsSpan(t * topK, topK));
-            for (int k = 0; k < topK; k++) counts[topIdx[t * topK + k] + 1]++;
+            for (int k = 0; k < topK; k++) counts[topIdx[t * topK + k]]++;
         }
 
+        int[] groupExperts = _moeGroupExperts;
         int groups = 0;
-        for (int e = 0; e < nExpert; e++) if (counts[e + 1] > 0) groups++;
-        for (int e = 0; e < nExpert; e++) counts[e + 1] += counts[e];   // counts[e] = first slot of expert e
+        for (int e = 0; e < nExpert; e++) if (counts[e] > 0) groupExperts[groups++] = e;
+
+        long[] gUp = _moeGroupUp, gDown = _moeGroupDown;
+        if (moe.Offloaded)
+        {
+            PlanOffloadedGroups(moe, groupExperts, groups, gUp, gDown);
+        }
+        else
+        {
+            for (int g = 0; g < groups; g++)
+            {
+                gUp[g] = moe.Up[groupExperts[g]];
+                gDown[g] = moe.Down[groupExperts[g]];
+            }
+        }
 
         long upOff = 0;
         long downOff = upOff + (long)groups * sizeof(long);
@@ -597,19 +641,20 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
 
         wSlot.AsSpan(0, slots).CopyTo(new Span<float>(weights, slots));
 
-        int g = 0;
-        for (int e = 0; e < nExpert; e++)
+        // Group g's slot range follows the groups before it, in schedule order; fill[e] = next free position of expert e.
+        int[] fill = _moeFill;
+        int pos = 0;
+        for (int g = 0; g < groups; g++)
         {
-            if (counts[e + 1] == counts[e]) continue;
-            upPtrs[g] = moe.Up[e];
-            downPtrs[g] = moe.Down[e];
-            groupStart[g] = counts[e];
-            g++;
+            int e = groupExperts[g];
+            upPtrs[g] = gUp[g];
+            downPtrs[g] = gDown[g];
+            groupStart[g] = pos;
+            fill[e] = pos;
+            pos += counts[e];
         }
         groupStart[groups] = slots;
 
-        int[] fill = _moeFill;
-        Array.Copy(counts, fill, nExpert);
         for (int s = 0; s < slots; s++) slotIds[fill[topIdx[s]]++] = s;
         for (int s = 0; s < slots; s++) slotToken[s] = s / topK;
 

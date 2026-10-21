@@ -93,6 +93,21 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         [DefaultValue(0)]
         public int NCpuMoeLayers { get; set; }
 
+        /// <summary>Routed-expert placement on CUDA (issue #1070).</summary>
+        [CommandOption(MoeOffloadCli.ModeOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.ModeHelp)]
+        public string? MoeOffload { get; set; }
+
+        /// <summary>VRAM expert-cache size in MiB (issue #1070).</summary>
+        [CommandOption(MoeOffloadCli.CacheMibOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CacheMibHelp)]
+        public string? MoeCacheMib { get; set; }
+
+        /// <summary>Expert-cache replacement policy (issue #1070).</summary>
+        [CommandOption(MoeOffloadCli.PolicyOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.PolicyHelp)]
+        public string? MoeCachePolicy { get; set; }
+
         [CommandOption("--depth-list")]
         [Description("Comma-separated context depths for multi-point sweep (e.g., 512,2048,8192). " +
                      "Measures decode at each checkpoint in one process without reloading the model. " +
@@ -122,6 +137,8 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
                 return ValidationResult.Error(parseError!);
             if (DeviceCli.Validate(Device) is { } deviceError)
                 return ValidationResult.Error(deviceError);
+            if (MoeOffloadCli.Validate(MoeOffload, MoeCacheMib, MoeCachePolicy) is { } moeError)
+                return ValidationResult.Error(moeError);
             return ValidationResult.Success();
         }
 
@@ -214,6 +231,7 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         Func<int, IKvCache> kvFactory = null!;
         DotLLM.Vulkan.VulkanDevice? vulkanDevice = null;
         string deviceLabel = "";
+        var moeNotes = new List<string>();   // expert-offload load notes, printed after the spinner (#1070)
 
         void LoadModel()
         {
@@ -231,7 +249,9 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
                     // THE shared per-architecture CUDA dispatch (#259) — routes hybrid
                     // architectures (Qwen3MoeHybrid, Qwen3HybridDense) to their dedicated
                     // loaders; their GDN layers have no attn_output.weight.
-                    (model, kvFactory) = DotLLM.Cuda.CudaModelLoader.CreateFromGguf(gguf, config, gpuId);
+                    (model, kvFactory) = DotLLM.Cuda.CudaModelLoader.CreateFromGguf(gguf, config, gpuId,
+                        moeOffload: MoeOffloadCli.Build(settings.MoeOffload, settings.MoeCacheMib, settings.MoeCachePolicy)
+                            with { Log = moeNotes.Add });
                     deviceLabel = DotLLM.Cuda.CudaDevice.GetDevice(gpuId).Name;
                     break;
 
@@ -290,6 +310,11 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
             return 1;
         }
         loadSw.Stop();
+        foreach (string note in moeNotes)
+        {
+            if (settings.Json) Console.Error.WriteLine(note);
+            else AnsiConsole.MarkupLine($"[grey]{Markup.Escape(note)}[/]");
+        }
 
         // #967: apply --kv-quant-k/-v to a CUDA hybrid-dense model; warn (never silently ignore) elsewhere.
         if (kvRequest.IsSpecified)
@@ -317,7 +342,9 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         // after upload. Every device-resident weight was copied into a device buffer by
         // then; nothing in the Vulkan forward path reads a host pointer. If that premise
         // is wrong this faults, which is itself the answer.
-        if (Environment.GetEnvironmentVariable("DOTLLM_BENCH_RELEASE_GGUF") == "1")
+        // Offloaded experts (#1070) without a pinned copy are read from the mapping for the whole run: never unmap then.
+        bool readsMapping = model is DotLLM.Cuda.Architectures.CudaNemotronHTransformerModel { MoeOffload.PinnedStore: false };
+        if (Environment.GetEnvironmentVariable("DOTLLM_BENCH_RELEASE_GGUF") == "1" && !readsMapping)
         {
             gguf.Dispose();
             if (HostResidencyProbe.Enabled)
@@ -339,10 +366,15 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
             double loadMs = loadSw.Elapsed.TotalMilliseconds;
             int warmupReps = settings.EffectiveWarmup;
 
+            var moeStart = DotLLM.Core.Moe.MoeTelemetry.Snapshot();
             if (depthList is not null)
-                return ExecuteDepthList(settings, depthList, model, kvFactory, promptTokens, warmupReps,
+            {
+                int rc = ExecuteDepthList(settings, depthList, model, kvFactory, promptTokens, warmupReps,
                     loadMs, mapBase, mapLength, vulkanDevice,
                     ggufPath, quant, modelName, runtimeVersion, host, backend, deviceLabel, config);
+                MoeOffloadCli.PrintSummary(moeStart, settings.Json);
+                return rc;
+            }
 
             var result = BenchRunner.Run(
                 model, kvFactory, promptTokens,
@@ -377,6 +409,7 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
                 if (DotLLM.Cli.Helpers.KvStorageCli.Describe(model, result.PromptTokens + result.Depth + result.DecodeTokens) is { } kvInfo)
                     AnsiConsole.MarkupLine($"  [dim]{Markup.Escape(kvInfo.Text)}[/]");
             }
+            MoeOffloadCli.PrintSummary(moeStart, settings.Json);
 
             return 0;
         }
