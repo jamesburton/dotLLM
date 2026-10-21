@@ -141,9 +141,11 @@ public sealed class TextGeneratorRecurrentPrefixMtpTests : IDisposable
         var cached = new TextGenerator(model, new TokenIdsTokenizer(config.VocabSize), Kv(model), mtpAdaptive: true, recurrentPrefixCache: true);
         Skip.If(cached.MtpGate is null, "DOTLLM_MTP_ADAPTIVE=0 disables the adaptive gate");
         int[][] turns = AgentTurns(config.VocabSize);
+        // Long enough for the gate to record a sample (MtpAdaptiveGate.MinSampleTokens decode tokens).
+        var options = new InferenceOptions { Temperature = 0f, RepetitionPenalty = 1f, MaxTokens = 2 * MtpAdaptiveGate.MinSampleTokens };
 
-        Assert.Equal(0, cached.Generate(Csv(turns[0]), Greedy).Timings.SpeculativeDraftTokens);   // the size prior picks plain
-        var hit = cached.Generate(Csv(turns[1]), Greedy);
+        Assert.Equal(0, cached.Generate(Csv(turns[0]), options).Timings.SpeculativeDraftTokens);   // the size prior picks plain
+        var hit = cached.Generate(Csv(turns[1]), options);
 
         Assert.Equal(turns[0].Length - 1, hit.Timings.CachedTokenCount);
         Assert.True(hit.Timings.SpeculativeDraftTokens > 0, "the gate never tried MTP on the hit turn");
