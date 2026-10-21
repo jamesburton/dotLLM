@@ -641,6 +641,43 @@ KV is kept rather than freed and re-made. When #1080 landed, a turn that hit the
 head needs the whole sequence absorbed), so decode on those turns ran at the plain rate (43-51 ms/token here). #1088,
 below, lifts that.
 
+### Continuing sessions at 100k+ tokens (#1093)
+
+Two more things defeated prefix reuse on a long chat session on a hybrid (recurrent) model:
+
+- **The snapshot boundary sat inside the template tail.** A chat turn renders as `...assistant reply<end>` and the next turn
+  re-renders that reply, but the generation prompt that closed the previous request (for ChatML templates, `<|im_start|>assistant\n`) is not part of the re-rendered history. A snapshot taken at the end of the prompt therefore
+  covered tokens the next prompt does not contain, and the next turn matched only an older boundary. The server now renders the
+  chat template once without the generation prompt, takes the tail it adds (`ReasoningSupport.GenerationPromptSuffix`), and
+  passes it as `InferenceOptions.GenerationPromptSuffix`. The snapshot goes **just before that suffix**, on the single-slot,
+  tiered and scheduler paths, and the superseded entry is released when the boundary moves forward.
+- **A hit that needed to grow its KV could turn into a miss.** The growth asked for the needed size plus an eighth of
+  headroom. Near the window the device refused that, the hit became a miss, and the whole prompt was prefilled again
+  (916 s at 112k tokens). The growth now retries at exactly the needed size (capped at the window). If even that is refused,
+  a prompt that would have to **refill 4,096 or more tokens** fails with HTTP 400 `context_length_exceeded` instead of
+  silently re-prefilling for minutes; a shorter refill still misses and runs. The check happens before any state changes, so
+  the snapshot survives for a request that fits. The tiered path, which never grows, rethrows the refusal and keeps the entry.
+
+Measured on an RTX 3060 12 GB with Bonsai-2 27B PQ2_0-MTP, `--kv-quant-k q4_0 --kv-quant-v q4_0 --no-mtp --ctx-size 110592`,
+`DOTLLM_CUDA_PREFILL_CHUNK=512`, greedy, `max_tokens` 64. Each turn appends about 34,000 characters (roughly 8k tokens) of
+wikitext as a new user message and keeps the model's reply. Reproduce with `scripts/session-growth.py`
+(`--model <id from /v1/models> --turn-chars 34000 --turns 15 --out growth.tsv`); the fitted window for other KV settings
+comes from `scripts/context-fit-probe.ps1`.
+
+| turn | prompt | before: cached / prefill | after: cached / prefill |
+|---|---|---|---|
+| 2 | 17,037 | 7,822 / 64 s | 7,818 / 63 s |
+| 3 | 25,060 | 7,822 / 121 s | 17,032 / 57 s |
+| 4 | 32,934 | 17,036 / 115 s | 25,055 / 58 s |
+| 8 | 64,320 | 48,782 / 125 s | 56,406 / 64 s |
+| 13 | 104,149 | 89,111 / 144 s | 96,651 / 69 s |
+| 14 | 112,017 | **0 / 916 s** | refused: exceeds the 110,592-token window |
+
+After the change every turn reuses the whole previous prompt (cached is the previous prompt minus 5 tokens), so each turn
+prefills only the roughly 8k tokens it adds, at a flat 57-70 s. Before, the cached prefix lagged a turn and prefill time
+stretched to 115-144 s. With MTP on (window 51,200 on this card) the first three turns reuse the same way
+(0 / 7,818 / 17,032 cached) and decode at 21-25 tokens/s.
+
 ### MTP on prefix-hit turns (#1088)
 
 The single-slot snapshot now keeps the MTP head that absorbed the prefix, so a hit rolls the head back with the trunk and

@@ -1,0 +1,65 @@
+"""Grows one chat session turn by turn against a running dotllm server and records per-turn TTFT, prefix reuse,
+decode speed and VRAM. Each turn appends ~TURN_CHARS of wikitext as a new user message, keeps the assistant reply."""
+import argparse, json, subprocess, time, urllib.error, urllib.request
+
+ap = argparse.ArgumentParser(description=__doc__)
+ap.add_argument("--url", default="http://127.0.0.1:18080/v1/chat/completions", help="chat completions endpoint")
+ap.add_argument("--model", required=True, help="model id (GET /v1/models, data[0].id)")
+ap.add_argument("--corpus", default=r"C:\Development\dotLLM\.docs\corpora\wikitext2-test.raw", help="text to feed in parts")
+ap.add_argument("--turn-chars", type=int, default=34000, help="characters appended per turn (34000 is about 8k tokens)")
+ap.add_argument("--turns", type=int, default=18, help="maximum number of turns")
+ap.add_argument("--max-tokens", type=int, default=64)
+ap.add_argument("--out", default="growth.tsv")
+args = ap.parse_args()
+URL, TURN_CHARS, MAX_TURNS, OUT = args.url, args.turn_chars, args.turns, args.out
+
+text = open(args.corpus, encoding="utf-8").read()
+
+
+def vram():
+    q = "--query-gpu=memory.used --format=csv,noheader,nounits"
+    return int(subprocess.check_output("nvidia-smi " + q, shell=True).split()[0])
+
+
+msgs = [{"role": "system", "content": "You are reading a long document in parts. Answer briefly."}]
+with open(OUT, "w") as f:
+    f.write("turn\tprompt_tok\tcached_tok\tnew_tok\tttft_s\tprefill_ms\tprefill_tps\tdecode_tps\tgen_tok\tvram_mib\terror\n")
+    for turn in range(1, MAX_TURNS + 1):
+        chunk = text[(turn - 1) * TURN_CHARS: turn * TURN_CHARS]
+        msgs.append({"role": "user", "content": f"Part {turn} of the document:\n{chunk}\n\nIn one sentence, what is part {turn} about?"})
+        body = json.dumps({"model": args.model, "messages": msgs, "max_tokens": args.max_tokens, "temperature": 0, "stream": True,
+                           "stream_options": {"include_usage": True}}).encode()
+        req = urllib.request.Request(URL, data=body, headers={"Content-Type": "application/json"})
+        t0 = time.time(); ttft = None; reply = []; timings = {}; usage = {}; err = ""
+        try:
+            with urllib.request.urlopen(req, timeout=3600) as r:
+                for raw in r:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line.startswith("data:") or line == "data: [DONE]":
+                        continue
+                    d = json.loads(line[5:])
+                    if d.get("error"):
+                        err = json.dumps(d["error"])[:200]
+                    for c in d.get("choices") or []:
+                        delta = c.get("delta") or {}
+                        # Reasoning models stream reasoning_content first: either kind of delta is the first token.
+                        if (delta.get("content") or delta.get("reasoning_content")) and ttft is None:
+                            ttft = time.time() - t0
+                        if delta.get("content"):
+                            reply.append(delta["content"])
+                    timings = d.get("timings") or timings
+                    usage = d.get("usage") or usage
+        except urllib.error.HTTPError as e:
+            err = f"HTTP {e.code}: {e.read().decode()[:200]}"
+        except Exception as e:  # noqa: BLE001 - record and stop
+            err = repr(e)[:200]
+        cached = timings.get("cached_tokens", (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0))
+        prompt = timings.get("prompt_tokens", usage.get("prompt_tokens", 0))
+        row = [turn, prompt, cached, prompt - cached, f"{ttft or 0:.1f}", f"{timings.get('prefill_time_ms', 0):.0f}",
+               f"{timings.get('prefill_tokens_per_sec', 0):.0f}", f"{timings.get('decode_tokens_per_sec', 0):.1f}",
+               timings.get("generated_tokens", 0), vram(), err.replace("\t", " ")]
+        f.write("\t".join(map(str, row)) + "\n"); f.flush()
+        print("\t".join(map(str, row)), flush=True)
+        if err:
+            break
+        msgs.append({"role": "assistant", "content": "".join(reply)})
