@@ -244,8 +244,11 @@ public static class CompletionEndpoint
                 }
             }, ct);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException and not ModelUnavailableException && !ct.IsCancellationRequested)
+        catch (Exception ex) when (ex is not OperationCanceledException and not ModelUnavailableException
+                                   and not DotLLM.Core.Configuration.DeviceMemoryAdmissionException && !ct.IsCancellationRequested)
         {
+            // A GPU-memory refusal (issue #1068) escapes to UseModelUnavailableHandler, which reports it as a 400
+            // context_length_exceeded the client can act on, not a 500.
             // PR #1026 review: once a keep-alive (or a chunk) has committed the SSE response there is no status left to set,
             // and a bare truncation reads as a dropped connection. Report it in-stream, as /v1/messages does for its own errors
             // (chat does not yet).

@@ -1,4 +1,5 @@
 using DotLLM.Core.Attention;
+using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Cuda.Interop;
 
@@ -23,7 +24,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel
         // Tiered requests overwrite the old active storage, so it can be freed before growing. Snapshot copies are separate.
         long growth = Math.Max(0, checked(ComputeKvBytes(kvCache.MaxLength) - KvAllocatedBytes));
         long free = FreeVramOverride ?? QueryFreeDeviceBytes();
-        return free >= checked(growth + KvGrowthVramMarginBytes);
+        return DeviceMemoryBudget.Fits(free, growth, VramReserveBytes);   // issue #1068: the same reserve as every growth
     }
 
     private readonly record struct PrefixSegment(nint Pointer, long Bytes);
@@ -153,9 +154,11 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel
             CudaDriverApi.cuMemHostAlloc(out pointer, checked((nuint)bytes), 0).ThrowOnError();
         else
         {
-            CudaDriverApi.cuMemGetInfo_v2(out nuint free, out _).ThrowOnError();
-            if ((ulong)free < checked((ulong)bytes + 512UL * 1024 * 1024))
-                throw new InvalidOperationException("Device snapshot would leave less than 512 MiB free.");
+            // Issue #1068: the shared free-VRAM admission (reserve, test override). Quiet: the cache falls back to the host tier.
+            long free = FreeVramOverride ?? QueryFreeDeviceBytes();
+            if (!DeviceMemoryBudget.Fits(free, bytes, VramReserveBytes))
+                throw new DeviceMemoryAdmissionException(DeviceMemoryBudget.DescribeRefusal(
+                    $"device prefix snapshot of {length} tokens", bytes, free, VramReserveBytes));
             CudaDriverApi.cuMemAlloc_v2(out pointer, checked((nuint)bytes)).ThrowOnError();
         }
         return new CudaPrefixSnapshot(this, pointer, bytes, length, PrefixSnapshotIdentity, storage);

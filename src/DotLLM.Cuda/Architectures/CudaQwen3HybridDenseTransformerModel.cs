@@ -390,8 +390,12 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     public object? CheckpointRecurrentState()
     {
         _context.MakeCurrent();
-        CudaGdnStateCache snapshot = Interlocked.Exchange(ref _spareGdnCheckpoint, null)
-            ?? new CudaGdnStateCache(_gdn, _gdnCache.NumGdnLayers);
+        CudaGdnStateCache? snapshot = Interlocked.Exchange(ref _spareGdnCheckpoint, null);
+        if (snapshot is null)
+        {
+            AdmitDeviceGrowth(_gdnCache.AllocatedBytes, "recurrent-state checkpoint");
+            snapshot = new CudaGdnStateCache(_gdn, _gdnCache.NumGdnLayers);
+        }
         _gdnCache.CopyTo(snapshot);
         return new PooledGdnCheckpoint(this, snapshot);
     }
@@ -518,6 +522,8 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         if (rows <= _rowSnapCapacity) return;
         FreeRowSnapshots();
         int layers = _gdnCache.NumGdnLayers;
+        AdmitDeviceGrowth((long)rows * layers * (_gdnCache.GdnStateElements + _gdnCache.ConvStateElements) * sizeof(float),
+            $"recurrent row snapshots for a {rows + 1}-token verify");
         _rowSnapGdn = AllocDevice(Math.Max((long)rows * layers * _gdnCache.GdnStateElements * sizeof(float), 4));
         _rowSnapConv = AllocDevice(Math.Max((long)rows * layers * _gdnCache.ConvStateElements * sizeof(float), 4));
         _rowSnapCapacity = rows;
@@ -550,22 +556,49 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     /// </summary>
     public CudaHybridKvCacheHandle CreateKvCache(int maxSeqLen) => new(maxSeqLen, CanGrowKvStorageTo);   // EnsureF16KvCache keeps rows on growth (#1025)
 
-    /// <summary>Free device memory a copying KV growth must leave beyond the new storage (PR #1026 review): forward scratch, cuBLAS workspace, other processes.</summary>
-    internal const long KvGrowthVramMarginBytes = 512L << 20;
+    /// <summary>
+    /// Free device memory every context-sized growth must leave (issue #1068; PR #1026 introduced it for the KV copy alone):
+    /// forward scratch, cuBLAS workspace, the display, other processes. <c>DOTLLM_CUDA_VRAM_RESERVE_MB</c> overrides it.
+    /// </summary>
+    internal static readonly long VramReserveBytes =
+        DeviceMemoryBudget.ResolveReserveBytes(Environment.GetEnvironmentVariable(DeviceMemoryBudget.ReserveEnvVar));
+
+    // Issue #1068: warns when this process's device memory spills into shared system memory anyway (another process took
+    // the headroom, or an allocation outside the admitted paths). Polled on a background timer, checked after each KV growth.
+    private readonly GpuSpillMonitor _spillMonitor;
 
     /// <summary>
     /// Admission for <see cref="CudaHybridKvCacheHandle.TryGrowTo"/>. A growth past the allocated storage copies the live rows, so old and new
     /// storage briefly coexist. The pre-#1025 miss path freed first. When the new storage plus
-    /// <see cref="KvGrowthVramMarginBytes"/> does not fit in free device memory, refuse, and the engine falls back to that miss path instead of
-    /// pushing the card into the shared-memory spill #1025 was about.
+    /// <see cref="VramReserveBytes"/> does not fit in free device memory, refuse, and the engine falls back to that miss path instead of
+    /// pushing the card into the shared-memory spill #1025 was about. The miss path's own allocation is admitted by
+    /// <see cref="AdmitDeviceGrowth"/> (issue #1068).
     /// </summary>
     /// <param name="maxLength">The handle's requested length.</param>
     /// <returns><see langword="true"/> when the growth may proceed.</returns>
     internal bool CanGrowKvStorageTo(int maxLength)
     {
-        if (_f16KCache is null || maxLength <= _f16CacheMaxSeqLen) return true;   // nothing to copy: allocated (free-first) on demand
+        if (maxLength <= _f16CacheMaxSeqLen) return true;
         long free = FreeVramOverride ?? QueryFreeDeviceBytes();
-        return free >= ComputeKvBytes(maxLength) + KvGrowthVramMarginBytes;
+        return DeviceMemoryBudget.Fits(free, ComputeKvBytes(maxLength), VramReserveBytes);
+    }
+
+    /// <summary>
+    /// Admits a device allocation of <paramref name="bytes"/> that grows with the context, or refuses it loudly (issue #1068).
+    /// Without this, WDDM backs an allocation past dedicated VRAM with shared system memory instead of failing it, and every
+    /// kernel touching it then runs at PCIe speed: requests went from minutes to hours on a 12 GB card. Call it after any
+    /// free-first release, so the free figure includes the released bytes.
+    /// </summary>
+    /// <param name="bytes">Bytes about to be allocated.</param>
+    /// <param name="what">What they are for, for the error message.</param>
+    /// <exception cref="DeviceMemoryAdmissionException">The allocation would not leave <see cref="VramReserveBytes"/> free.</exception>
+    internal void AdmitDeviceGrowth(long bytes, string what)
+    {
+        long free = FreeVramOverride ?? QueryFreeDeviceBytes();
+        if (DeviceMemoryBudget.Fits(free, bytes, VramReserveBytes)) return;
+        string message = DeviceMemoryBudget.DescribeRefusal(what, bytes, free, VramReserveBytes);
+        Console.Error.WriteLine($"[dotllm] ERROR: {message}");
+        throw new DeviceMemoryAdmissionException(message);
     }
 
     private long QueryFreeDeviceBytes()
@@ -598,7 +631,8 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
             hiddenSize: Config.HiddenSize,
             numKvHeads: _mtpHead.Value.Layer.FullAttn!.Value.NumKvHeads,
             headDim: Config.HeadDim,
-            maxSteps: maxSequenceLength);
+            maxSteps: maxSequenceLength,
+            admitGrowth: AdmitDeviceGrowth);   // issue #1068: the head's F32 KV grows with the context too
     }
 
     /// <summary>
@@ -641,6 +675,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
             throw new ArgumentException("The Hadamard transform does not belong to this model's config.", nameof(hadamard));
 
         Config = config;
+        _spillMonitor = new GpuSpillMonitor(() => $"KV allocated for {_f16CacheMaxSeqLen} tokens");
         _isHeadOnly = isHeadOnly;
         _gguf = gguf;
         _layers = layers;
@@ -3589,6 +3624,10 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         // Allocate into locals and publish only once every buffer exists (PR #1026 review). An OOM partway through used to
         // leave half-zero arrays in the fields and leak the old storage, and the retry then "kept" rows copied out of
         // buffers that were never filled. Now a failure frees what it allocated, and the old storage stays valid.
+        // Issue #1068: a fresh (miss-path) allocation had no admission at all, so a long agent prompt plus its max_tokens
+        // grew the KV straight into shared memory. After the free-first release above, free includes the old storage.
+        AdmitDeviceGrowth(ComputeKvBytes(maxSeqLen), $"KV cache ({KvStorageLabel}) for {maxSeqLen} tokens");
+
         var newK = new nint[_attentionLayerCount];
         var newV = new nint[_attentionLayerCount];
         var newKQ = new nint[_attentionLayerCount];
@@ -3639,6 +3678,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         _vQuant = newVQ;
         _f16CacheMaxSeqLen = maxSeqLen;
         _f16CacheCurrentLength = keepRows;
+        _spillMonitor.Check($"KV cache ({KvStorageLabel}) grown to {maxSeqLen} tokens");
 
         static void CopyRows(nint src, nint dst, long bytes, nint stream)
         {
@@ -3685,6 +3725,9 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         long grown = ((long)seqKv + GrowTokens - 1) / GrowTokens * GrowTokens * kvElems;
         FreeIfNonZero(ref _kvF16ScratchK);
         FreeIfNonZero(ref _kvF16ScratchV);
+        _kvF16ScratchElems = 0;
+        int sides = (IsQuantKv(_kvKeyDType) ? 1 : 0) + (IsQuantKv(_kvValueDType) ? 1 : 0);
+        AdmitDeviceGrowth(sides * grown * sizeof(ushort), $"F16 dequant scratch for {seqKv} tokens of quantized KV history");
         if (IsQuantKv(_kvKeyDType)) _kvF16ScratchK = AllocDevice(grown * sizeof(ushort));
         if (IsQuantKv(_kvValueDType)) _kvF16ScratchV = AllocDevice(grown * sizeof(ushort));
         _kvF16ScratchElems = grown;
@@ -3737,6 +3780,8 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
 
         FreeIfNonZero(ref _f32KvStageK);
         FreeIfNonZero(ref _f32KvStageV);
+        _f32KvStageElems = 0;
+        AdmitDeviceGrowth(2 * grown * sizeof(float), $"F32 attention staging for {seqKv} tokens of KV history");
         _f32KvStageK = AllocDevice(grown * sizeof(float));
         _f32KvStageV = AllocDevice(grown * sizeof(float));
         _f32KvStageElems = grown;
@@ -4434,6 +4479,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         if (embPtr != 0) CudaDriverApi.cuMemFree_v2(embPtr);
 
         FreeKvStorage();
+        _spillMonitor.Dispose();
         FreeIfNonZero(ref _kvF16ScratchK);
         FreeIfNonZero(ref _kvF16ScratchV);
         _kvF16ScratchElems = 0;
