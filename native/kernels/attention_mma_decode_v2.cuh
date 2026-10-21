@@ -69,18 +69,40 @@ struct V2LoadF16
     }
 };
 
+// Element loaders for the block decoders below: global memory through the read-only path, or
+// plain loads (used on a raw block staged in shared memory by the flash prefill kvq kernel,
+// issue #1094). The decode arithmetic is the same code either way.
+struct V2GlobalLd
+{
+    __device__ __forceinline__ static __half h(const __half* p) { return __ldg(p); }
+    __device__ __forceinline__ static unsigned u16(const uint16_t* p) { return __ldg(p); }
+};
+struct V2PlainLd
+{
+    __device__ __forceinline__ static __half h(const __half* p) { return *p; }
+    __device__ __forceinline__ static unsigned u16(const uint16_t* p) { return *p; }
+};
+
 // KV-format Q8_0: 34 B / 32 elems (half scale + 32 int8). Blocks are 2-byte aligned only.
 struct V2LoadQ8
 {
+    static constexpr int kBlockBytes = 34;
+
     __device__ __forceinline__ static uint4 load8(const void* base, size_t elem)
     {
-        const uint8_t* b = reinterpret_cast<const uint8_t*>(base) + (elem >> 5) * 34;
-        const int j = (int)(elem & 31);
-        const float d = __half2float(__ldg(reinterpret_cast<const __half*>(b)));
+        return decode8<V2GlobalLd>(reinterpret_cast<const uint8_t*>(base) + (elem >> 5) * kBlockBytes,
+                                   (int)(elem & 31));
+    }
+
+    // b: block start; j: element offset within the block (multiple of 8).
+    template <class Ld>
+    __device__ __forceinline__ static uint4 decode8(const uint8_t* b, const int j)
+    {
+        const float d = __half2float(Ld::h(reinterpret_cast<const __half*>(b)));
         const uint16_t* p = reinterpret_cast<const uint16_t*>(b + 2 + j);
         unsigned w[4];
         #pragma unroll
-        for (int i = 0; i < 4; i++) w[i] = __ldg(p + i);
+        for (int i = 0; i < 4; i++) w[i] = Ld::u16(p + i);
         unsigned out[4];
         #pragma unroll
         for (int i = 0; i < 4; i++)
@@ -98,13 +120,21 @@ struct V2LoadQ8
 // of byte i, element 2i+1 = high nibble).
 struct V2LoadQ4
 {
+    static constexpr int kBlockBytes = 18;
+
     __device__ __forceinline__ static uint4 load8(const void* base, size_t elem)
     {
-        const uint8_t* b = reinterpret_cast<const uint8_t*>(base) + (elem >> 5) * 18;
-        const int j = (int)(elem & 31);
-        const float d = __half2float(__ldg(reinterpret_cast<const __half*>(b)));
+        return decode8<V2GlobalLd>(reinterpret_cast<const uint8_t*>(base) + (elem >> 5) * kBlockBytes,
+                                   (int)(elem & 31));
+    }
+
+    // b: block start; j: element offset within the block (multiple of 8).
+    template <class Ld>
+    __device__ __forceinline__ static uint4 decode8(const uint8_t* b, const int j)
+    {
+        const float d = __half2float(Ld::h(reinterpret_cast<const __half*>(b)));
         const uint16_t* p = reinterpret_cast<const uint16_t*>(b + 2 + (j >> 1));
-        unsigned w0 = __ldg(p), w1 = __ldg(p + 1);
+        unsigned w0 = Ld::u16(p), w1 = Ld::u16(p + 1);
         unsigned bytes[4] = { w0 & 0xFF, w0 >> 8, w1 & 0xFF, w1 >> 8 };
         unsigned out[4];
         #pragma unroll

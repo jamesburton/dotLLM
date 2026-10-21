@@ -1580,6 +1580,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
     /// <param name="stream">CUDA stream.</param>
     /// <param name="scale">Softmax scale; 0 means <c>1/sqrt(256)</c>.</param>
     /// <exception cref="InvalidOperationException">The kernel for this K/V pair is not loaded.</exception>
+    /// <exception cref="ArgumentException"><paramref name="k"/> or <paramref name="v"/> is not 16-byte aligned.</exception>
     public void LaunchAttentionFlashPrefillHd256Kvq(nint q, nint k, nint v, KvCacheDType kDtype, KvCacheDType vDtype,
         nint output, int seqQ, int seqKv, int numHeads, int numKvHeads, int positionOffset, nint stream,
         float scale = 0f)
@@ -1588,6 +1589,9 @@ public sealed unsafe partial class CudaKernels : IDisposable
         if (idx < 0 || _attentionFlashPrefillHd256KvqFuncs[idx] == 0)
             throw new InvalidOperationException(
                 $"attention_flash_mma_prefill_hd256_kvq kernel for {kDtype}/{vDtype} is not loaded.");
+        // The kernel cp.async-copies whole raw KV rows (272 / 144 B, multiples of 16) in 16-byte chunks.
+        if (((k | v) & 15) != 0)
+            throw new ArgumentException("Quantized K/V base pointers must be 16-byte aligned.");
         LaunchAttentionFlashPrefillHd256Core(_attentionFlashPrefillHd256KvqFuncs[idx], q, k, v, output,
             seqQ, seqKv, numHeads, numKvHeads, positionOffset, stream, scale);
     }

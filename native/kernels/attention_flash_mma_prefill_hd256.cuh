@@ -25,8 +25,9 @@
 //   * Each warp owns a 16 x 256 F32 O accumulator IN REGISTERS (128 regs/thread, mma C layout),
 //     plus per-row running max / sum (two rows per thread, quad-shuffled reductions).
 //   * Q (F16) lives in shared memory per warp (16 x 256, padded rows) and is re-read with
-//     ldmatrix for every KV tile; K and V tiles are double-buffered (cp.async for F16 KV; the
-//     quantized loaders dequantize synchronously into the same buffers, see the _kvq.cu).
+//     ldmatrix for every KV tile; K and V tiles are double-buffered with cp.async (the quantized
+//     loaders cp.async the raw block bytes into the same buffers and decode them in place, see
+//     the _kvq.cu).
 //   * QK^T: S[16 x KV_TILE] via mma.m16n8k16 (16 k-steps over d; B fragments from K rows with
 //     non-transposed ldmatrix.x4). Two accumulator sets (even/odd k-step) break the dependency
 //     chain.
@@ -70,6 +71,12 @@
 #define NT (KV_TILE / 8)             // n-subtiles of S per KV tile
 #define MAX_GROUP 8
 #define LOG2E 1.4426950408889634f
+#ifndef PREFILL_STAGE_NP0
+#define PREFILL_STAGE_NP0 3          // first PV np step after which a staged row pair is decoded
+#endif
+#ifndef PREFILL_STAGE_EVERY
+#define PREFILL_STAGE_EVERY 4        // PV np steps between staged row pairs
+#endif
 #define NEG_INF __int_as_float(0xff800000)
 
 __device__ __forceinline__ void ldmatrix_x4(unsigned (&r)[4], const void* p)
@@ -115,17 +122,49 @@ __device__ __forceinline__ unsigned pack_half2(float lo, float hi)
 //    tile at `dst` (16-byte aligned) from element `elem` (multiple of 8) of the logical
 //    [seq_kv, num_kv_heads*HEAD_DIM] KV grid at `base`. ──
 
+//    A loader with kStaged == true (the quantized-KV one) copies RAW bytes in chunk() and turns
+//    them into F16 in place with read_row(tile, r) / write_row(tile, r, h) (this lane's chunk of
+//    tile row r). The body calls them through stage_decode_row / stage_decode_tile, with the same
+//    thread -> (row, chunk) mapping as load_tile (i = threadIdx.x + s*blockDim.x, row i>>5, chunk
+//    i&31; blockDim is a multiple of 32, so each row belongs to exactly one warp): tile 0 before
+//    the first barrier, tile t+1 interleaved with tile t's PV MMAs. For F16 (kStaged == false)
+//    those calls are compiled out.
+
 // F16 KV: asynchronous 16-byte copy, completed by the body's cp.async commit / wait.
-// (A synchronous loader -- e.g. the quantized ones, which decode through registers -- simply
-// stores its chunk; the body's cp.async commit / wait are then no-ops and its __syncthreads
-// publish the tile, with the same double-buffer ordering.)
 struct PrefillTileLoadF16
 {
     __device__ __forceinline__ static void chunk(half* dst, const void* base, size_t elem)
     {
         cp_async16(dst, reinterpret_cast<const half*>(base) + elem);
     }
+
+    static constexpr bool kStaged = false;
+    static constexpr int kSlots = 1;
+    __device__ __forceinline__ static uint4 read_row(const half*, int) { return make_uint4(0, 0, 0, 0); }
+    __device__ __forceinline__ static void write_row(half*, int, uint4) {}
 };
+
+// In-place decode of row r of one K tile and one V tile (this warp's row; all 32 lanes): both
+// rows' staged raw bytes are read into registers, __syncwarp, then both F16 rows are written --
+// so no lane overwrites raw bytes another lane has yet to read.
+template <class KL, class VL>
+__device__ __forceinline__ void stage_decode_row(half* tk, half* tv, int r)
+{
+    const uint4 hk = KL::read_row(tk, r);
+    const uint4 hv = VL::read_row(tv, r);
+    __syncwarp();
+    KL::write_row(tk, r, hk);
+    VL::write_row(tv, r, hv);
+}
+
+// In-place decode of a whole K tile and V tile (tile 0, before the first barrier): this warp's rows.
+template <class KL, class VL>
+__device__ __forceinline__ void stage_decode_tile(half* tk, half* tv, int warp, int group)
+{
+    __syncwarp();   // this warp's completed cp.async (each lane waited on its own) visible warp-wide
+    for (int r = warp; r < KV_TILE; r += group)
+        stage_decode_row<KL, VL>(tk, tv, r);
+}
 
 // q       : [seq_q, num_heads*HEAD_DIM] F16 row-major
 // k, v    : [seq_kv, num_kv_heads*HEAD_DIM] KV cache, in the KL / VL loader's format
@@ -226,6 +265,14 @@ __device__ __forceinline__ void attn_flash_prefill_hd256_body(
             cp_async_commit();
             cp_async_wait<0>();
         }
+        // Loader hooks, after this thread's copies of tile t completed: a staging loader (the
+        // quantized-KV one) decodes tile t in place here -- every read of K and V before any write;
+        // no-ops for F16.
+        // Staging loaders decode tile 0 here; every later tile is decoded during the previous
+        // tile's compute (below). Compile-time false for F16.
+        if (KL::kStaged && t == 0)
+            stage_decode_tile<KL, VL>(sK + (size_t)buf * KV_TILE * SMEM_STRIDE,
+                                      sV + (size_t)buf * KV_TILE * SMEM_STRIDE, warp, group);
         __syncthreads();
 
         if (warp < group)
@@ -318,6 +365,17 @@ __device__ __forceinline__ void attn_flash_prefill_hd256_body(
                 pa[n >> 1][(n & 1) * 2 + 1] = pack_half2(p2, p3);
             }
 
+            // Staging loaders decode tile t+1 in place DURING this warp's PV MMAs: one K+V row pair
+            // of this warp after PV steps PREFILL_STAGE_NP0 + PREFILL_STAGE_EVERY*s (3, 7, 11), so
+            // the decode instructions issue while the tensor pipe works on the preceding HMMAs. Tile t+1's
+            // copies were issued at the top of this iteration and had the QK phase to land; its
+            // buffer is not read in this iteration and the closing barrier publishes it.
+            // Compile-time false for F16.
+            const bool stage_next = KL::kStaged && t + 1 < num_tiles;
+            half* const tk_next = sK + (size_t)((t + 1) & (NBUF - 1)) * KV_TILE * SMEM_STRIDE;
+            half* const tv_next = sV + (size_t)((t + 1) & (NBUF - 1)) * KV_TILE * SMEM_STRIDE;
+            if (stage_next) { cp_async_wait<0>(); __syncwarp(); }
+
             // ---- O += P . V ----
             #pragma unroll
             for (int kk = 0; kk < KV_TILE / 16; kk++)
@@ -330,7 +388,20 @@ __device__ __forceinline__ void attn_flash_prefill_hd256_body(
                                               + (np * 2 + (lane >> 4)) * 8);
                     mma_m16n8k16(o[2 * np], pa[kk], b[0], b[1]);
                     mma_m16n8k16(o[2 * np + 1], pa[kk], b[2], b[3]);
+                    if (stage_next && kk == 0 && np >= PREFILL_STAGE_NP0
+                        && (np - PREFILL_STAGE_NP0) % PREFILL_STAGE_EVERY == 0
+                        && np < PREFILL_STAGE_NP0 + PREFILL_STAGE_EVERY * KL::kSlots)
+                    {
+                        const int r = warp + (np - PREFILL_STAGE_NP0) / PREFILL_STAGE_EVERY * group;
+                        if (r < KV_TILE) stage_decode_row<KL, VL>(tk_next, tv_next, r);
+                    }
                 }
+            }
+            // Rows past the interleaved slots (group < 6 only).
+            if (stage_next)
+            {
+                for (int r = warp + KL::kSlots * group; r < KV_TILE; r += group)
+                    stage_decode_row<KL, VL>(tk_next, tv_next, r);
             }
         }
         __syncthreads();   // all warps done with this buffer before it is refilled
