@@ -1627,8 +1627,9 @@ public sealed partial class TextGenerator
     /// <item>A hit whose KV is too small for this request grows it (<see cref="Core.Attention.IKvCache.TryGrowTo"/>, rows
     /// kept). It used to miss: the KV had 256 positions of headroom and an agent step adds more, so every step re-prefilled
     /// the whole conversation.</item>
-    /// <item>A hit also moves the snapshot forward to what this prompt shares with the previous one, so the next step
-    /// prefills only the last two turns rather than everything since the first snapshot.</item>
+    /// <item>A hit also moves the snapshot forward, so the next step does not re-prefill everything since the first snapshot.
+    /// When the prompt extends the whole previous one (an agent loop) the snapshot goes at its own end and the next step
+    /// prefills only its new turn (issue #1080); otherwise at what it shares with the previous prompt.</item>
     /// <item>A miss on a KV without exclusive storage (<see cref="Core.Attention.IKvCache.HasExclusiveStorage"/>) drops the
     /// snapshot. This request's forwards overwrite those rows, and a later hit would attend over them.</item>
     /// </list>
@@ -1638,14 +1639,16 @@ public sealed partial class TextGenerator
     {
         snapshotAt = -1;
         int needed = promptLen + maxTokens;
-        int shared = _recurrentPrefixLastPrompt is null
-            ? 0
-            : promptIds.AsSpan().CommonPrefixLength(_recurrentPrefixLastPrompt);
+        int[]? previous = _recurrentPrefixLastPrompt;
+        int shared = previous is null ? 0 : promptIds.AsSpan().CommonPrefixLength(previous);
         _recurrentPrefixLastPrompt = promptIds;
 
         // Leave at least one suffix token to run (it produces the logits), so an exact repeat of the previous prompt
-        // snapshots one token short of its end.
-        int boundary = Math.Min(shared, promptLen - 1);
+        // snapshots one token short of its end. A prompt that extends the whole previous one is an agent loop, whose next
+        // prompt will extend this one: snapshot at this prompt's end, so the next turn prefills only what it adds. Snapshotting
+        // at the shared prefix made every agent hit reuse the prompt from two turns back (issue #1080).
+        bool extendsPrevious = previous is not null && shared == previous.Length;
+        int boundary = extendsPrevious ? promptLen - 1 : Math.Min(shared, promptLen - 1);
 
         var entry = _recurrentPrefix;
         if (entry is not null
