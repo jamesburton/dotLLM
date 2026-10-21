@@ -44,7 +44,10 @@ public sealed partial class TextGenerator
     // checkpointed right after them. See ResolveRecurrentPrefix.
     private readonly bool _recurrentPrefixEnabled;
     private RecurrentPrefixEntry? _recurrentPrefix;
+    // The previous request's prompt. Written by whichever recurrent path is active: the single-slot path (shared-prefix and
+    // extension boundaries) or the tiered path (exact-extension check, issue #1093). Only one of them runs per generator.
     private int[]? _recurrentPrefixLastPrompt;
+    private int? _recurrentPrefixLastSuffixBoundary;   // _recurrentPrefixLastPrompt's generation-prompt boundary (issue #1093)
 
     // True from ResolveKvCache until the request reaches a normal end (StoreInPrefixCache). Still set in the request's finally
     // means it failed or was abandoned, so the snapshot is dropped (PR #1026 re-review).
@@ -58,6 +61,21 @@ public sealed partial class TextGenerator
 
     /// <summary>Most positions a recurrent-prefix KV growth adds beyond the request (PR #1026 review: the CUDA hybrid's storage never shrinks).</summary>
     private const int RecurrentPrefixMaxGrowthHeadroom = 2048;
+
+    /// <summary>
+    /// Longest prompt (tokens) for which a recurrent-prefix hit whose KV cannot grow, even to the exact size, may still fall
+    /// back to a miss that re-prefills the whole prompt (issue #1093). At or above it the request fails with
+    /// <see cref="DeviceMemoryAdmissionException"/> (HTTP 400 <c>context_length_exceeded</c>) instead.
+    /// </summary>
+    /// <remarks>
+    /// Why 4096: a miss is still worth trying for a short prompt, because it frees before it allocates (a copying growth holds
+    /// the old and the new storage at once), so it can fit where the growth did not. And re-prefilling 4k tokens costs about
+    /// 30 s at the slowest measured long-context rate (Bonsai-2 on an RTX 3060, 110-150 tok/s), which is less than one turn of
+    /// a long session already spends on its own new content (about 8k tokens). Past that the cost grows with the prompt and
+    /// stops being a fallback: at 112k it was a silent 15-minute turn (916 s). Compared against the prompt length, the tokens a
+    /// miss would re-prefill.
+    /// </remarks>
+    internal const int RecurrentPrefixRefillMissMaxTokens = 4096;
 
     // The head state that decoded the request which took the snapshot, when it decoded with MTP: its rows [0, Tokens.Length)
     // are the prefix's, so a hit resumes it at MtpMark and drafts without re-absorbing the prefix (issue #1088).
@@ -323,7 +341,7 @@ public sealed partial class TextGenerator
         }
 
         // Resolve KV-cache: reuse from prefix cache or allocate fresh
-        var (kvCache, cachedTokenCount, ownsKvCache) = ResolveKvCache(promptIds, promptLen, maxTokens, out int snapshotAt, adapter);
+        var (kvCache, cachedTokenCount, ownsKvCache) = ResolveKvCache(promptIds, promptLen, maxTokens, out int snapshotAt, options.GenerationPromptSuffix, adapter);
         _recurrentPrefixRequestPending = _recurrentPrefixEnabled;
 
         // Hybrid mode is enabled when a strategy is wired up, the prompt is short enough,
@@ -927,7 +945,7 @@ public sealed partial class TextGenerator
         }
 
         // Resolve KV-cache: reuse from prefix cache or allocate fresh
-        var (kvCache, cachedTokenCount, ownsKvCache) = ResolveKvCache(promptIds, promptLen, maxTokens, out int snapshotAt, adapter);
+        var (kvCache, cachedTokenCount, ownsKvCache) = ResolveKvCache(promptIds, promptLen, maxTokens, out int snapshotAt, options.GenerationPromptSuffix, adapter);
         _recurrentPrefixRequestPending = _recurrentPrefixEnabled;
         long kvBytes = GetKvCacheBytes(kvCache);
 
@@ -1436,7 +1454,8 @@ public sealed partial class TextGenerator
     /// Returns the cache, number of cached tokens, and whether the caller owns (should dispose) the cache.
     /// </summary>
     private (Core.Attention.IKvCache KvCache, int CachedTokenCount, bool OwnsKvCache) ResolveKvCache(
-        int[] promptIds, int promptLen, int maxTokens, out int snapshotAt, ILoraAdapter? adapter = null)
+        int[] promptIds, int promptLen, int maxTokens, out int snapshotAt, string? generationPromptSuffix,
+        ILoraAdapter? adapter = null)
     {
         snapshotAt = -1;
         _resumedMtp = null;
@@ -1452,9 +1471,9 @@ public sealed partial class TextGenerator
         if (recurrent)
         {
             if (_recurrentPrefixEnabled && adapter is null && _tieredSnapshots is not null)
-                return ResolveTieredRecurrentPrefix(promptIds, promptLen, maxTokens, out snapshotAt);
+                return ResolveTieredRecurrentPrefix(promptIds, promptLen, maxTokens, generationPromptSuffix, out snapshotAt);
             if (_recurrentPrefixEnabled && adapter is null)
-                return ResolveRecurrentPrefix(promptIds, promptLen, maxTokens, out snapshotAt);
+                return ResolveRecurrentPrefix(promptIds, promptLen, maxTokens, generationPromptSuffix, out snapshotAt);
             _model.ResetSequenceState();
         }
 
@@ -1647,7 +1666,8 @@ public sealed partial class TextGenerator
     /// <list type="bullet">
     /// <item>A hit whose KV is too small for this request grows it (<see cref="Core.Attention.IKvCache.TryGrowTo"/>, rows
     /// kept). It used to miss: the KV had 256 positions of headroom and an agent step adds more, so every step re-prefilled
-    /// the whole conversation.</item>
+    /// the whole conversation. A refused growth is retried at the exact size; when that is refused too, a long prompt fails with
+    /// <see cref="DeviceMemoryAdmissionException"/> rather than re-prefilling (<see cref="RecurrentPrefixRefillMissMaxTokens"/>, issue #1093).</item>
     /// <item>A hit also moves the snapshot forward, so the next step does not re-prefill everything since the first snapshot.
     /// When the prompt extends the whole previous one (an agent loop) the snapshot goes at its own end and the next step
     /// prefills only its new turn (issue #1080); otherwise at what it shares with the previous prompt.</item>
@@ -1656,26 +1676,44 @@ public sealed partial class TextGenerator
     /// </list>
     /// </remarks>
     private (Core.Attention.IKvCache KvCache, int CachedTokenCount, bool OwnsKvCache) ResolveRecurrentPrefix(
-        int[] promptIds, int promptLen, int maxTokens, out int snapshotAt)
+        int[] promptIds, int promptLen, int maxTokens, string? generationPromptSuffix, out int snapshotAt)
     {
         snapshotAt = -1;
         int needed = promptLen + maxTokens;
         int[]? previous = _recurrentPrefixLastPrompt;
+        int? previousSuffixBoundary = _recurrentPrefixLastSuffixBoundary;
         int shared = previous is null ? 0 : promptIds.AsSpan().CommonPrefixLength(previous);
-        _recurrentPrefixLastPrompt = promptIds;
+        int? suffixBoundary = RecurrentSnapshotBoundary.FromGenerationSuffix(promptIds, _tokenizer, generationPromptSuffix);
 
         // Leave at least one suffix token to run (it produces the logits), so an exact repeat of the previous prompt
         // snapshots one token short of its end. A prompt that extends the whole previous one is an agent loop, whose next
         // prompt will extend this one: snapshot at this prompt's end, so the next turn prefills only what it adds. Snapshotting
         // at the shared prefix made every agent hit reuse the prompt from two turns back (issue #1080).
+        // A chat turn that continues the previous one but re-renders its generation prompt differently (issue #1093) does
+        // not extend it: snapshot just before this prompt's generation prompt, which the next turn will share.
         bool extendsPrevious = previous is not null && shared == previous.Length;
-        int boundary = extendsPrevious ? promptLen - 1 : Math.Min(shared, promptLen - 1);
+        int boundary = RecurrentSnapshotBoundary.Choose(
+            extendsPrevious ? promptLen - 1 : Math.Min(shared, promptLen - 1),
+            RecurrentSnapshotBoundary.ForContinuation(suffixBoundary, shared, previousSuffixBoundary),
+            promptLen);
 
         var entry = _recurrentPrefix;
-        if (entry is not null
+        bool hit = entry is not null
             && promptLen > entry.Tokens.Length                      // at least one suffix token must run to produce logits
-            && promptIds.AsSpan(0, entry.Tokens.Length).SequenceEqual(entry.Tokens)
-            && EnsureRecurrentPrefixKvCapacity(entry.Kv, needed))
+            && promptIds.AsSpan(0, entry.Tokens.Length).SequenceEqual(entry.Tokens);
+        if (entry is not null && hit && !EnsureRecurrentPrefixKvCapacity(entry.Kv, needed))
+        {
+            // Issue #1093: the growth was refused even at the exact size. A long prompt fails here, before anything changed, so
+            // the snapshot (whose KV did not grow) stays for a request that fits; a short one misses as before.
+            ThrowIfRecurrentRefillTooLong(promptLen, Math.Min(_model.Config.MaxSequenceLength, needed), entry.Kv.MaxLength);
+            hit = false;
+        }
+
+        // Recorded only once the request is going ahead, so a refused one leaves the next request's boundaries unchanged.
+        _recurrentPrefixLastPrompt = promptIds;
+        _recurrentPrefixLastSuffixBoundary = suffixBoundary;
+
+        if (entry is not null && hit)
         {
             long restoreStart = Stopwatch.GetTimestamp();
             entry.Kv.Rollback(entry.Tokens.Length);
@@ -1702,9 +1740,10 @@ public sealed partial class TextGenerator
         // Issue #1088: with no snapshot held there is nothing to evict. A prompt that shares nothing usable with the previous
         // one starts a conversation (the first request, or a new client), so snapshot its own end, betting that the next
         // prompt extends it: an agent's second turn then hits instead of re-prefilling its first. A prompt that does share a
-        // prefix keeps that boundary (the classifier case above).
+        // prefix keeps that boundary (the classifier case above). With a generation-prompt hint the bet is the start of the
+        // generation prompt instead (issue #1093): the next turn shares that much whether or not it re-renders the rest.
         if (_recurrentPrefix is null && shared < RecurrentPrefixMinTokens)
-            boundary = promptLen - 1;
+            boundary = suffixBoundary ?? promptLen - 1;
 
         bool snapshot = boundary >= RecurrentPrefixMinTokens;
         int cacheSize = Math.Min(_model.Config.MaxSequenceLength, needed + (snapshot ? RecurrentPrefixKvHeadroom : 0));
@@ -1718,16 +1757,37 @@ public sealed partial class TextGenerator
     /// True when <paramref name="kv"/> holds <paramref name="needed"/> positions, growing it when needed. The headroom is an
     /// eighth of the request, at least <see cref="RecurrentPrefixKvHeadroom"/> and at most <see cref="RecurrentPrefixMaxGrowthHeadroom"/>,
     /// so a growing agent conversation does not reallocate on every step. It is capped because model-owned storage (the CUDA hybrid)
-    /// never shrinks. Capped at the context window too. A cache may refuse (no room for the copy): the caller then misses.
+    /// never shrinks. Capped at the context window too, as is <paramref name="needed"/>: past the window the request decodes
+    /// until the window is full, as a miss sized to the window would. A cache may refuse the headroom (no room in free VRAM);
+    /// the growth is then retried at exactly the needed size (issue #1093: at 112k the headroom was refused, the hit missed and
+    /// re-prefilled everything, though the exact size fitted). False only when that is refused too.
     /// </summary>
     private bool EnsureRecurrentPrefixKvCapacity(Core.Attention.IKvCache kv, int needed)
     {
-        if (kv.MaxLength >= needed) return true;
         int maxSeq = _model.Config.MaxSequenceLength;
-        if (needed > maxSeq) return false;
+        int exact = Math.Min(maxSeq, needed);
+        if (kv.MaxLength >= exact) return true;
         int headroom = Math.Clamp(needed / 8, RecurrentPrefixKvHeadroom, RecurrentPrefixMaxGrowthHeadroom);
         int target = (int)Math.Min(maxSeq, (long)needed + headroom);
-        return kv.TryGrowTo(target);
+        return kv.TryGrowTo(target) || (target > exact && kv.TryGrowTo(exact));
+    }
+
+    /// <summary>
+    /// Fails a request whose recurrent-prefix KV could not grow to <paramref name="needed"/> positions when the fallback, a miss
+    /// that re-prefills the whole prompt, would be long (<see cref="RecurrentPrefixRefillMissMaxTokens"/>). Returns normally for
+    /// a short prompt, whose caller then misses. Shared by the single-slot path and the continuous-batch scheduler.
+    /// </summary>
+    /// <param name="promptLen">The request's prompt length: what a miss would re-prefill.</param>
+    /// <param name="needed">The positions the request needs (prompt + max_tokens, capped at the window).</param>
+    /// <param name="kvMaxLength">The positions the KV holds, which it could not grow past.</param>
+    /// <exception cref="DeviceMemoryAdmissionException">The prompt is at least <see cref="RecurrentPrefixRefillMissMaxTokens"/> tokens.</exception>
+    internal static void ThrowIfRecurrentRefillTooLong(int promptLen, int needed, int kvMaxLength)
+    {
+        if (promptLen < RecurrentPrefixRefillMissMaxTokens) return;
+        throw new DeviceMemoryAdmissionException(
+            $"The KV cache could not grow to the {needed} positions this request needs (prompt + max_tokens); it holds {kvMaxLength}. " +
+            $"Re-prefilling the {promptLen}-token prompt instead would be slow, so the request is refused: shorten the prompt or " +
+            "max_tokens, or free device memory.");
     }
 
     /// <summary>
@@ -1847,6 +1907,7 @@ public sealed partial class TextGenerator
         var entry = _recurrentPrefix;
         _recurrentPrefix = null;
         _recurrentPrefixLastPrompt = null;
+        _recurrentPrefixLastSuffixBoundary = null;
         entry?.Dispose();
     }
 

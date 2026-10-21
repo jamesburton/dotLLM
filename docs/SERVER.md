@@ -641,6 +641,57 @@ KV is kept rather than freed and re-made. When #1080 landed, a turn that hit the
 head needs the whole sequence absorbed), so decode on those turns ran at the plain rate (43-51 ms/token here). #1088,
 below, lifts that.
 
+### Continuing sessions at 100k+ tokens (#1093)
+
+Two more things defeated prefix reuse on a long chat session on a hybrid (recurrent) model:
+
+- **The snapshot boundary sat inside the template tail.** A chat turn renders as `...assistant reply<end>` and the next turn
+  re-renders that reply, but the generation prompt that closed the previous request (for ChatML templates,
+  `<|im_start|>assistant
+`) is not part of the re-rendered history. A snapshot taken at the end of the prompt therefore
+  covered tokens the next prompt does not contain, and the next turn matched only an older boundary. The rule:
+  - **The suffix.** The server renders the chat template twice, with `add_generation_prompt=true` and `=false`. The suffix is
+    the remainder of the `true` render after the `false` render, and is used only when the `false` render is a prefix of the
+    `true` one (`ReasoningSupport.GenerationPromptSuffix`). It reaches the engine as `InferenceOptions.GenerationPromptSuffix`.
+  - **The boundary.** The snapshot goes **just before the suffix's tokens** (`RecurrentSnapshotBoundary`). When the legacy
+    boundary (below) is also available, the later of the two wins, capped at prompt end - 1.
+  - **Fallback.** With no usable suffix the boundary is the #1080/#1091 behaviour: prompt end - 1 when the prompt extends the
+    previous one exactly, otherwise the prefix shared with the previous prompt. No usable suffix means: raw completions, a
+    template that cannot render both ways (or whose `false` render is not a prefix), an empty remainder, or suffix tokens
+    that are not the tail of the prompt's tokens (the suffix merged with the preceding text under BPE).
+  - **Paths.** It applies on the single-slot, tiered and scheduler paths, and the superseded entry is released when the
+    boundary moves forward. The single-slot and scheduler paths use the hint only when the prompt continues the previous
+    conversation (it shares everything before the previous prompt's own suffix), so a classifier-style prompt, with a fixed
+    system prompt and a different question each time, keeps its shared-prefix boundary. The scheduler also uses it when the
+    prompt shares less than the minimum snapshot length with the previous one (a conversation starting). The tiered path uses
+    it whenever a suffix boundary exists, falling back to prompt end - 1 when the prompt extends the previous one exactly.
+- **A hit that needed to grow its KV could turn into a miss.** The growth asked for the needed size plus an eighth of
+  headroom. Near the window the device refused that, the hit became a miss, and the whole prompt was prefilled again
+  (916 s at 112k tokens). The growth now retries at exactly the needed size (capped at the window). If even that is refused,
+  a prompt that would have to **refill 4,096 or more tokens** fails with HTTP 400 `context_length_exceeded` instead of
+  silently re-prefilling for minutes; a shorter refill still misses and runs. The check happens before any state changes, so
+  the snapshot survives for a request that fits. The tiered path, which never grows, rethrows the refusal and keeps the entry.
+
+Measured on an RTX 3060 12 GB with Bonsai-2 27B PQ2_0-MTP, `--kv-quant-k q4_0 --kv-quant-v q4_0 --no-mtp --ctx-size 110592`,
+`DOTLLM_CUDA_PREFILL_CHUNK=512`, greedy, `max_tokens` 64. Each turn appends about 34,000 characters (roughly 8k tokens) of
+wikitext as a new user message and keeps the model's reply. Reproduce with `scripts/session-growth.py`
+(`--model <id from /v1/models> --turn-chars 34000 --turns 15 --out growth.tsv`); the fitted window for other KV settings
+comes from `scripts/context-fit-probe.ps1`.
+
+| turn | prompt | before: cached / prefill | after: cached / prefill |
+|---|---|---|---|
+| 2 | 17,037 | 7,822 / 64 s | 7,818 / 63 s |
+| 3 | 25,060 | 7,822 / 121 s | 17,032 / 57 s |
+| 4 | 32,934 | 17,036 / 115 s | 25,055 / 58 s |
+| 8 | 64,320 | 48,782 / 125 s | 56,406 / 64 s |
+| 13 | 104,149 | 89,111 / 144 s | 96,651 / 69 s |
+| 14 | 112,017 | **0 / 916 s** | refused: exceeds the 110,592-token window |
+
+After the change every turn reuses the whole previous prompt (cached is the previous prompt minus 5 tokens), so each turn
+prefills only the roughly 8k tokens it adds, at 57-74 s. Before, the cached prefix lagged a turn and prefill time
+stretched to 115-144 s. With MTP on (window 51,200 on this card) the first three turns reuse the same way
+(0 / 7,818 / 17,032 cached) and decode at 21-25 tokens/s.
+
 ### MTP on prefix-hit turns (#1088)
 
 The single-slot snapshot now keeps the MTP head that absorbed the prefix, so a hit rolls the head back with the trunk and

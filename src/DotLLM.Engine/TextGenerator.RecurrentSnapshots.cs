@@ -46,18 +46,41 @@ public sealed partial class TextGenerator
     }
 
     private (Core.Attention.IKvCache KvCache, int CachedTokenCount, bool OwnsKvCache) ResolveTieredRecurrentPrefix(
-        int[] promptIds, int promptLen, int maxTokens, out int snapshotAt)
+        int[] promptIds, int promptLen, int maxTokens, string? generationPromptSuffix, out int snapshotAt)
     {
+        int[]? previous = _recurrentPrefixLastPrompt;
         int needed = Math.Min(_model.Config.MaxSequenceLength, checked(promptLen + maxTokens));
         var kv = AllocateKvCache(needed);
-        int cached = _tieredSnapshots!.TryRestore(promptIds, kv, out string? tier, out double milliseconds);
+        int cached;
+        string? tier;
+        double milliseconds;
+        try
+        {
+            // This path never grows a KV: it restores into a fresh one. When the device refuses that KV's storage
+            // (DeviceMemoryAdmissionException) the restore rethrows rather than missing, because a cold prefill needs the same
+            // storage; the request then fails with the context error (issue #1093), not a full re-prefill into the same refusal.
+            cached = _tieredSnapshots!.TryRestore(promptIds, kv, out tier, out milliseconds);
+        }
+        catch
+        {
+            kv.Dispose();
+            throw;
+        }
+        _recurrentPrefixLastPrompt = promptIds;
         LastPrefixCacheTier = tier; LastPrefixRestoreMilliseconds = milliseconds;
         if (cached == 0)
         {
             _model.ResetSequenceState();
             if (kv.CurrentLength > 0) kv.Rollback(0);
         }
-        int boundary = promptLen - 1;
+        // The snapshot bets that the next prompt extends this one, so it goes one token short of the end. With a
+        // generation-prompt hint (issue #1093) it goes just before the generation prompt instead, which the next turn shares
+        // even when it re-renders the rest; an exact extension of the previous prompt (an agent loop) keeps the later end.
+        int? suffixBoundary = RecurrentSnapshotBoundary.FromGenerationSuffix(promptIds, _tokenizer, generationPromptSuffix);
+        bool extendsPrevious = previous is not null && promptLen >= previous.Length
+            && promptIds.AsSpan(0, previous.Length).SequenceEqual(previous);
+        int boundary = RecurrentSnapshotBoundary.Choose(
+            suffixBoundary is null || extendsPrevious ? promptLen - 1 : -1, suffixBoundary, promptLen);
         snapshotAt = boundary >= RecurrentPrefixMinTokens && (cached == 0 || boundary >= cached + RecurrentPrefixMinTokens) ? boundary : -1;
         return (kv, cached, true);
     }

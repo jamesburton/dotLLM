@@ -113,6 +113,10 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
     // Touched only from Step (single thread). Most-recently-used first.
     private readonly List<RecurrentPrefixEntry> _recurrentPrefixes = new();
     private int[]? _recurrentPrefixLastPrompt;
+    private int? _recurrentPrefixLastSuffixBoundary;
+
+    /// <summary>Recurrent prefix snapshots currently held. Read only from the thread that drives <see cref="Step"/>.</summary>
+    internal int RecurrentPrefixEntryCount => _recurrentPrefixes.Count;   // _recurrentPrefixLastPrompt's generation-prompt boundary (issue #1093)
 
     // Slot recycling for the recurrent-prefix path: a hybrid model's per-sequence state + KV are device allocations that cost
     // ~25 ms per request on Vulkan (more than the prefill they enable reuse of). Released slots are kept (dirty) and handed
@@ -852,13 +856,11 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                 seq.PrefixCachedTokens = restored;
                 Interlocked.Add(ref _cachedPromptTokens, restored);
                 Interlocked.Add(ref _prefilledPromptTokens, -restored);
-                prefillStart = restored;
             }
-            else
-            {
-                // A miss may have run a snapshot prefix forward; those rows are already in the KV + state.
-                prefillStart = seq.KvCache!.CurrentLength;
-            }
+
+            // A miss, or a hit that moved its snapshot forward, may have run rows past the restored prefix; those rows are
+            // already in the KV + state.
+            prefillStart = seq.KvCache!.CurrentLength;
         }
         int prefillLen = promptLen - prefillStart;
 
@@ -885,6 +887,24 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         return _kvCacheFactory(_model.Config, rounded);
     }
 
+    /// <summary>The longest snapshot <paramref name="promptIds"/> starts with, leaving at least one suffix token, of at most <paramref name="maxTokens"/> tokens.</summary>
+    /// <param name="promptIds">The sequence's prompt.</param>
+    /// <param name="maxTokens">The longest snapshot the sequence's KV can hold.</param>
+    /// <returns>The entry, or null when none matches.</returns>
+    private RecurrentPrefixEntry? LongestRecurrentPrefix(int[] promptIds, int maxTokens)
+    {
+        RecurrentPrefixEntry? best = null;
+        foreach (var e in _recurrentPrefixes)
+        {
+            if (e.Tokens.Length < promptIds.Length
+                && e.Tokens.Length <= maxTokens
+                && (best is null || e.Tokens.Length > best.Tokens.Length)
+                && promptIds.AsSpan(0, e.Tokens.Length).SequenceEqual(e.Tokens))
+                best = e;
+        }
+        return best;
+    }
+
     /// <summary>
     /// Recurrent prefix reuse for one newly admitted sequence. HIT: restore the longest snapshotted prefix that the prompt
     /// starts with (and that leaves at least one suffix token to produce logits) and return its length. MISS: when the prompt
@@ -892,47 +912,73 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
     /// just that shared prefix (the same total work, split in two forwards), snapshot it, and return 0 — the KV cache then
     /// already holds the prefix and the caller continues from <c>KvCache.CurrentLength</c>.
     /// </summary>
+    /// <remarks>
+    /// With a generation-prompt hint (<see cref="InferenceOptions.GenerationPromptSuffix"/>, issue #1093) the boundary of a
+    /// chat turn is just before its generation prompt: on a new conversation, on a turn that continues the previous prompt,
+    /// and on a hit, which then moves its snapshot forward to that boundary (the same synchronous prefill + snapshot), so
+    /// the next turn reuses this whole turn even when it re-renders the generation prompt differently.
+    /// </remarks>
     private int ResolveRecurrentPrefix(SchedulerRequest seq, int[] promptIds)
     {
         int promptLen = promptIds.Length;
-        RecurrentPrefixEntry? best = null;
-        foreach (var e in _recurrentPrefixes)
+        var kv = seq.KvCache!;
+        RecurrentPrefixEntry? best = LongestRecurrentPrefix(promptIds, int.MaxValue);
+
+        // Issue #1093: a KV smaller than the request (a factory that handed out less than asked) grows to exactly the request
+        // before the hit is given up. Refused, a long prompt fails with the context error rather than re-prefilling; a short
+        // one falls back to the longest snapshot the KV holds, or a miss, as before.
+        int needed = Math.Min(_model.Config.MaxSequenceLength, promptLen + seq.MaxTokens);
+        if (best is not null && kv.MaxLength < needed && !kv.TryGrowTo(needed) && best.Tokens.Length > kv.MaxLength)
         {
-            if (e.Tokens.Length < promptLen
-                && (best is null || e.Tokens.Length > best.Tokens.Length)
-                && promptIds.AsSpan(0, e.Tokens.Length).SequenceEqual(e.Tokens)
-                && e.Tokens.Length <= seq.KvCache!.MaxLength)
-                best = e;
+            TextGenerator.ThrowIfRecurrentRefillTooLong(promptLen, needed, kv.MaxLength);
+            best = LongestRecurrentPrefix(promptIds, kv.MaxLength);
         }
 
         int shared = _recurrentPrefixLastPrompt is null
             ? 0
             : promptIds.AsSpan().CommonPrefixLength(_recurrentPrefixLastPrompt);
+        int? previousSuffixBoundary = _recurrentPrefixLastSuffixBoundary;
+        int? suffixBoundary = RecurrentSnapshotBoundary.FromGenerationSuffix(promptIds, _tokenizer, seq.Request.Options.GenerationPromptSuffix);
         _recurrentPrefixLastPrompt = promptIds;
+        _recurrentPrefixLastSuffixBoundary = suffixBoundary;
 
+        // A prompt that shares nothing usable with the previous one starts a conversation; one that shares everything before
+        // the previous prompt's generation prompt continues it. Either way its next turn will share this one up to its own
+        // generation prompt. Otherwise (a classifier's next question) the shared prefix is the boundary, as without a hint.
+        int? continuation = shared < RecurrentPrefixMinTokens
+            ? suffixBoundary
+            : RecurrentSnapshotBoundary.ForContinuation(suffixBoundary, shared, previousSuffixBoundary);
+        int boundary = RecurrentSnapshotBoundary.Choose(Math.Min(shared, promptLen - 1), continuation, promptLen);
+
+        int start = 0;
         if (best is not null)
         {
             _model.RestoreSequencePrefix(best.Snapshot, seq.KvCache!, seq.RecurrentState);
             seq.RecurrentStateDirty = false;   // fully overwritten by the snapshot
             _recurrentPrefixes.Remove(best);
             _recurrentPrefixes.Insert(0, best);   // MRU
-            return best.Tokens.Length;
-        }
+            start = best.Tokens.Length;
 
-        // Miss: the state must start from zero (a pooled slot still holds its previous sequence).
-        if (seq.RecurrentStateDirty)
+            // Without a hint a hit keeps its snapshot. With one, a hit that continues the conversation moves it forward.
+            if (continuation is null || boundary < start + RecurrentPrefixMinTokens || boundary > seq.KvCache!.MaxLength)
+                return start;
+        }
+        else
         {
-            seq.RecurrentState!.Reset();
-            seq.RecurrentStateDirty = false;
-        }
+            // Miss: the state must start from zero (a pooled slot still holds its previous sequence).
+            if (seq.RecurrentStateDirty)
+            {
+                seq.RecurrentState!.Reset();
+                seq.RecurrentStateDirty = false;
+            }
 
-        int boundary = Math.Min(shared, promptLen - 1);
-        if (boundary < RecurrentPrefixMinTokens || boundary > seq.KvCache!.MaxLength) return 0;
+            if (boundary < RecurrentPrefixMinTokens || boundary > seq.KvCache!.MaxLength) return 0;
+        }
 
         var request = new SequenceForwardRequest
         {
-            TokenIds = promptIds.AsMemory(0, boundary),
-            Positions = Enumerable.Range(0, boundary).ToArray().AsMemory(),
+            TokenIds = promptIds.AsMemory(start, boundary - start),
+            Positions = Enumerable.Range(start, boundary - start).ToArray().AsMemory(),
             KvCache = seq.KvCache!,
             MambaState = seq.RecurrentState as IMambaState,
             GdnState = seq.RecurrentState as IGdnState,
@@ -945,13 +991,23 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         if (snapshot is not null)
         {
             _recurrentPrefixes.Insert(0, new RecurrentPrefixEntry(promptIds.AsSpan(0, boundary).ToArray(), snapshot));
+
+            // A hit that moved its snapshot forward supersedes the entry it extended (the conversation's next turn hits the
+            // longer one), so release it rather than let one conversation fill the cache with nested copies of its own history.
+            // The restore copied it into this sequence's own KV and state, so nothing else holds it.
+            if (best is not null)
+            {
+                _recurrentPrefixes.Remove(best);
+                best.Dispose();
+            }
+
             while (_recurrentPrefixes.Count > _options.RecurrentPrefixCacheEntries)
             {
                 _recurrentPrefixes[^1].Dispose();
                 _recurrentPrefixes.RemoveAt(_recurrentPrefixes.Count - 1);
             }
         }
-        return 0;
+        return start;   // the rows past it are in the KV; the caller continues from its length
     }
 
     /// <summary>
