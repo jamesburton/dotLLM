@@ -51,7 +51,9 @@ internal interface ICudaVirtualMemory
 /// <remarks>
 /// <para>Growth past the reservation reserves a larger range and maps the same physical allocations into it, so even then
 /// nothing is copied. Only then does <see cref="Pointer"/> change; the caller must have no work in flight on the buffer.</para>
-/// <para>A failed growth leaves the buffer as it was: whatever it allocated or mapped is undone before the exception propagates.</para>
+/// <para>A failed growth keeps the buffer's contents and leaves no new physical memory behind: whatever it allocated or mapped
+/// is undone before the exception propagates. One thing can stay changed: when the re-reservation succeeded and the new chunk
+/// then failed, the buffer keeps the larger range, so <see cref="Pointer"/> has moved. Re-read it after a failed growth too.</para>
 /// <para>Not thread-safe. The owning CUDA context must be current for every call.</para>
 /// </remarks>
 internal sealed class CudaGrowableDeviceBuffer : IDisposable
