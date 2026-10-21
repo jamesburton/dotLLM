@@ -1,4 +1,4 @@
-# MoE expert offload on CUDA (issues #1070 and #1071, design #1063)
+# MoE expert offload on CUDA (issues #1070, #1071 and #1083, design #1063)
 
 Nemotron 3.5 Bolt's routed experts take 15.9 GiB (NVIDIA's IQ2_XXS file) or 40.2 GiB (AD-Q4_K_M), which does not fit a 12 GB GPU.
 On CUDA, a `nemotron_h_moe` model whose weights do not fit keeps its routed experts in host memory and runs them through a VRAM expert cache.
@@ -11,7 +11,8 @@ Everything else stays on the GPU: the SSM and attention layers, the router, `lat
 | `--moe-offload auto\|off\|on` | `DOTLLM_MOE_OFFLOAD` | `auto` | `auto`: keep the experts resident when the model fits, else offload them. `off`: refuse a model that does not fit (the previous behaviour). `on`: always offload, even when the model fits. |
 | `--moe-cache-mib N` | `DOTLLM_MOE_CACHE_MIB` | `auto` | Size of the VRAM expert cache. `auto` uses the whole measured budget. A larger request is clamped to the budget, with a warning. |
 | `--moe-cache-policy slru\|lru\|lfu` | `DOTLLM_MOE_CACHE_POLICY` | `slru` | Replacement policy. SLRU keeps a protected segment for experts that are hit again and a probation segment for new arrivals. |
-| `--moe-cold auto\|copy\|cpu` | `DOTLLM_MOE_COLD` | `auto` | Where an offloaded expert that is not in the cache runs. `auto`: CPU or copy-to-GPU per expert, by the calibrated cost model. `copy`: copy every miss into the cache (the #1070 behaviour). `cpu`: compute every uncached expert on the CPU. In `auto` and `cpu`, an expert enters the cache only through promote-only admission. |
+| `--moe-cold auto\|copy\|cpu\|igpu\|cpu+igpu` | `DOTLLM_MOE_COLD` | `auto` | Where an offloaded expert that is not in the cache runs. `auto`: copy-to-GPU, CPU or (#1083) the integrated GPU per expert, by the calibrated cost model; the iGPU only when an integrated Vulkan GPU exists. `copy`: copy every miss into the cache (the #1070 behaviour). `cpu`: compute every uncached expert on the CPU. `igpu`: on the integrated GPU (a layer it cannot read falls back to the CPU). `cpu+igpu`: split between the CPU and the iGPU by the calibrated costs, never copying on a miss. In every mode but `copy`, an expert enters the cache only through promote-only admission. `igpu` and `cpu+igpu` fail the load when there is no integrated GPU. |
+| `--moe-igpu-device N\|name` | `DOTLLM_MOE_IGPU_DEVICE` | first integrated GPU | The Vulkan device of the iGPU leg: an enumeration index or a case-insensitive name substring. An NVIDIA device is never used; a non-integrated pick is allowed with a warning (its banks are then read across its bus). |
 | `--moe-cpu-threads N` | `DOTLLM_MOE_CPU_THREADS` | physical cores − 1 | Threads of the CPU cold leg, including the forward's own thread. Each thread computes one expert at a time. |
 | `--cpu-moe` | `DOTLLM_CPU_MOE=1` | off | llama.cpp's `--cpu-moe`: the routed experts of every MoE layer stay on the CPU. They are never cached and never copied. |
 | `--n-cpu-moe N` | `DOTLLM_N_CPU_MOE` | 0 | llama.cpp's `--n-cpu-moe`: the same for the layers whose **index** is below N. On Bolt, layer 0 is a Mamba layer, so `--n-cpu-moe 2` places one MoE layer. `bench` also passes it to the Vulkan Qwen3MoeHybrid offload (#370). |
@@ -104,6 +105,70 @@ MoE cold experts: auto mode, 15 CPU thread(s).
 
 Expected outcomes, still to be measured: T5500 (PCIe 2.0 x16, pre-AVX Xeons) is expected to choose copy, and the dev box (PCIe 3.0 x4, AVX2) the CPU.
 
+### The dev box's link, measured (first quiet window, 2026-10-21)
+
+RTX 3060 on PCIe 3.0 x4 (`bw.exe`, 2000 reps):
+
+| Transfer | GB/s |
+|---|---|
+| Pinned H2D | 2.20 (flat from 1 to 256 MB) |
+| Pinned D2H | 2.86 |
+| Pageable H2D | 2.20 from 16 MB (1.6 to 1.9 below) |
+
+| Round trip | p10 | p50 | p90 | p99 |
+|---|---|---|---|---|
+| Latent cut: kernel, 4 KB D2H, sync, 4 KB H2D, kernel | 168 µs | 210 µs | 300 µs | 563 µs |
+| One-sync D2H | 132 µs | 164 µs | 224 µs | 478 µs |
+
+This confirms the design's dev-box assumption: copying a cold expert in is slow (a 2.6 MB Q4_K expert is about 1.2 ms at 2.2 GB/s), so the CPU and iGPU legs are the ones to win.
+
+The round trip is latency, not bandwidth: 4 KB moves in about 2 µs. Every offloaded MoE layer already pays one such round trip for host routing (router logits down, event sync, schedule up), with or without a cold leg. The cold legs add no second sync: their rows ride the same read-back and one asynchronous H2D. At 210 µs per layer, that is about **8.4 ms/token over 40 MoE layers** in decode.
+
+- **Batching layers cannot help one token.** Layer L+1's routing needs layer L's output, so the round trips of one token are serial.
+- **Batching tokens can.** Prefill blocks, several sequences, or MTP / speculative drafts spread one round trip over every token in the forward.
+- **Overlap hides little in decode.** The GPU work queued behind the router (latent_down and the shared expert) is tens of µs for one token, far short of 210 µs.
+- **Next to measure:** the wake-up path. The one-sync D2H alone is 164 µs, so most of the cost is waking a blocked host thread and launching the next kernel under WDDM. Polling a pinned flag written by `cuStreamWriteValue32` instead of `cuEventSynchronize`, and `cuStreamWaitValue32` for the return trip, would show how much of the 210 µs is avoidable.
+
+## Cold experts on the integrated GPU (issue #1083, design 8c′)
+
+The dev box's Core Ultra 7 155H has an Arc iGPU (Meteor Lake) that shares the 95 GB of system RAM, where the routed banks already are. The iGPU leg computes cold experts there, next to the CPU leg.
+
+- **Device.** `VulkanIgpuDeviceSelector` picks the first integrated Vulkan GPU (never NVIDIA), or `--moe-igpu-device`. CUDA↔Vulkan interop across adapters is not supported (it needs a matching device UUID/LUID), so the leg is staged through host memory.
+- **Banks, zero-copy (when the mapping allows it).** `VulkanNemotronHMoeExpertService` imports every offloaded MoE layer's up and down banks from the memory-mapped GGUF (`VK_EXT_external_memory_host`, `VulkanWeightImportPolicy`), so the iGPU reads the pages the CPU leg reads. If the import is refused, the bank is staged into device memory within a budget (10 % of RAM, a second copy on UMA), and the log says so. A layer over the budget, or with a bank type the Vulkan expert kernels cannot read (anything but Q4_K, Q5_K, Q6_K, Q8_0, Q5_0/Q5_1 and the IQ family; IQ banks need integer dot product), is refused loudly and its cold experts stay on the CPU.
+- **By default the import is refused, and the banks cost their size twice.** `GgufFile` maps read-only unless `DOTLLM_GGUF_MAP_COW=1`, and drivers refuse to import read-only pages. #508 measured this on gfx1151 / amdvlk (`VK_ERROR_INVALID_EXTERNAL_HANDLE`). The dev box's Arc (Core Ultra 7 155H) refused every bank of every layer in the first quiet window, at `vkAllocateMemory`, with `VK_ERROR_OUT_OF_DEVICE_MEMORY` (-2).
+  - **Why the mapping is the likely cause.** `vkGetMemoryHostPointerPropertiesEXT` had accepted the same pointer, so the handle type, the host-pointer alignment and the memory-type mask had already passed. The pointer is rounded down and the size up to `minImportedHostPointerAlignment` (`HostImportRange`, unit-tested). The memory type is the lowest host-visible index in the intersection of the buffer's and the pointer's `memoryTypeBits`.
+  - **What it costs.** Each staged bank is a second copy, in the same RAM, of pages the mapped GGUF already holds. The 10 % budget is 9.5 GB on the dev box (95 GB), well short of Bolt's expert banks. So most layers are refused and run their cold experts on the CPU, even in `--moe-cold igpu`.
+  - **Where it shows.** The load log gives each staged layer's MiB, the budget used and, for a read-only GGUF, the remedy. `CudaMoeOffloadInfo` carries `IgpuImportedBanks`, `IgpuStagedBanks` and `IgpuStagedBytes`, and the gauges and the summary line below report them.
+  - **What to run next.** In the next quiet window, run with `DOTLLM_GGUF_MAP_COW=1`, plus `VulkanHostImportMmapAccessModeTests` on the Arc, to confirm the cause before `--moe-cold igpu` is made to map copy-on-write. Copy-on-write reserves commit charge for the whole file; see `GgufFile.MappingAccess`.
+- **Kernels.** The service records the Vulkan Nemotron-H routed-expert kernels through the model's own (now static) recording code into its own scratch: the indexed dp4a MMVQ (or F32) arm below 16 rows, the expert-grouped MMQ / coopmat prefill from 16 rows, the IQ banks of #1058. It runs top-k 1 with unit weights, so every row comes back unweighted. No new shader.
+- **Capacity.** The service is created for `VulkanNemotronHMoeExpertService.MaxRowsFor(block tokens, layers)` rows per submission, which is the block's tokens × the **largest** per-layer top-k. Every layer call is one MoE block of at most that many tokens, and its iGPU rows are a subset of its slots, so no production call exceeds the capacity. `Begin` refuses a larger call; it does not split it.
+- **Rows.** The iGPU groups come last in the layer's schedule, after the CPU's. Before the CPU workers start, the host gathers each iGPU row's `x_latent` row from the pinned read-back into the iGPU's host-visible input (an imported host allocation on UMA: a memcpy into the iGPU's own memory), records and submits without waiting. The CPU leg runs, then the host waits on the fence and copies the iGPU's rows into the pinned cold-row buffer right after the CPU's. One H2D and the existing `moe_gather_token_rows_f32` serve both legs (the gather index already covers every cold row in schedule order); no new CUDA kernel. The compute stream waits for both.
+- **Not copied.** The output rows are copied once more on the host (iGPU host-visible output → pinned buffer) rather than written by the iGPU into the CUDA-pinned buffer: importing a sub-range of a `cuMemHostAlloc` allocation into Vulkan needs page alignment the buffer layout does not give. It is 4 KB per row.
+
+### Three-way assignment
+
+`MoeColdAssignment.Assign(costs, residentUs, cpuWorkers, coldLegOverheadUs, igpuSubmitUs, place)` extends #1071's to three sides:
+
+- **Makespan** = `max(device span, cold span)`. The cold span is zero with no cold expert, else the round trip plus `max(CPU span, iGPU span)`, because the legs run concurrently. The iGPU span is `submit + Σigpu` (one queue) and is zero when its set is empty, so a layer call that puts nothing on the iGPU never pays the submission.
+- **Fiddler** picks each expert's individually cheapest side (the device on a tie, then the CPU). The greedy pass starts from the best of Fiddler and the three one-sided assignments, visits experts in ascending order of the gap between their two cheapest sides, and moves each to whichever other side lowers the makespan most.
+- **Without an iGPU** (`igpuSubmitUs` infinite) the result is exactly #1071's two-way assignment (pinned by a randomized test).
+- `cpu+igpu` runs the same assignment with the copy cost set to infinity. `auto` uses the iGPU side only on layers whose banks the iGPU holds.
+
+### iGPU calibration
+
+When an iGPU leg exists, the calibration adds:
+
+| Measurement | How |
+|---|---|
+| Submit + fence round trip | An empty submission (two barriers), median of 30 |
+| iGPU time per expert layout | One expert in its own submission at n = 1 and n = 8 (gather, record, submit, fence, copy-out), median of 10 |
+
+The per-expert iGPU cost is fitted from those two measurements **minus** the empty round trip, which becomes `MoeCostModel.IgpuSubmitUs`, paid once per layer call that uses the iGPU. The cache key gains `|igpu:<device>`; a key without an iGPU is unchanged, so a cached CPU-only record stays valid. A cached record without iGPU timings for the layouts the iGPU holds is re-measured.
+
+`auto` opens the iGPU only when the cost model can use it: with the calibration, or with a `CostModelOverride` that has iGPU costs. When `auto` falls back to `copy`, the iGPU is closed again. `cpu+igpu` without a calibration becomes `igpu`.
+
+Expected outcomes, to be measured in the quiet window: decode similar to the CPU (both read the same DRAM) minus the submit cost; prefill well ahead of AVX2, and the CPU cores freed.
+
 ## Telemetry
 
 The `DotLLM.Moe` meter publishes the following instruments:
@@ -121,6 +186,12 @@ The `DotLLM.Moe` meter publishes the following instruments:
 | `dotllm.moe.cpu_compute_us` | counter |
 | `dotllm.moe.cpu_wait_us` | counter |
 | `dotllm.moe.promotions` | counter |
+| `dotllm.moe.cold_experts_igpu` | counter |
+| `dotllm.moe.igpu_compute_us` | counter |
+| `dotllm.moe.igpu_wait_us` | counter |
+| `dotllm.moe.igpu_banks_imported` | gauge |
+| `dotllm.moe.igpu_banks_staged` | gauge |
+| `dotllm.moe.igpu_staged_bytes` | gauge |
 
 `copy_wait_us` is the compute stream's stall on copy events, timed with event pairs.
 
@@ -129,6 +200,13 @@ The CPU-leg instruments (#1071):
 - `cpu_wait_us`: the compute stream's stall between the end of its own expert groups and the arrival of the CPU rows.
 - `cpu_compute_us`: the host wall time of the CPU legs.
 - `cold_experts_cpu`: routed experts computed on the CPU.
+
+The iGPU-leg instruments (#1083):
+
+- `cold_experts_igpu`: routed experts computed on the iGPU.
+- `igpu_compute_us`: from the start of each iGPU submission (gather and record included) until its fence was observed.
+- `igpu_wait_us`: how long the forward thread blocked on the fence after its own CPU-leg work. When both legs ran, `cpu_wait_us` is the compute stream's stall for both.
+- `igpu_banks_imported` / `igpu_banks_staged` / `igpu_staged_bytes`: the active iGPU leg's banks. On a UMA iGPU, `igpu_staged_bytes` is RAM spent twice: the mapped GGUF holds those banks too.
 
 `bench` prints a one-line summary for the measured run, and so does `run --verbose`:
 
@@ -140,6 +218,18 @@ When a CPU leg ran, the line continues:
 
 ```text
 ; cold: CPU 41% of routed, CPU compute 5.0 ms/token, CPU wait 3.2 ms/token, promotions 12
+```
+
+and when an iGPU leg ran:
+
+```text
+; iGPU 30% of routed, iGPU compute 4.1 ms/token, iGPU wait 0.6 ms/token
+```
+
+and when the iGPU leg holds staged banks:
+
+```text
+; iGPU banks staged 78 of 80 (9.0 GiB, a second copy in RAM), 2 zero-copy
 ```
 
 Hits and misses count one lookup per expert per layer call: a prefill block that routes 30 tokens to one expert counts as one lookup.
@@ -158,6 +248,8 @@ The GPU tests run on T5500.
   - `--n-cpu-moe` / `--cpu-moe`: those layers never reach the cache.
   - `auto` with a CPU that never wins is bit-identical to resident.
 - `CudaNemotronHBoltBlk9ColdCpuRealModelTests` compares CPU-cold experts with resident ones on blk9: mean KL ≤ 0.02 and top-1 agreement ≥ 90 %.
+- #1083, Vulkan only (an integrated GPU, no CUDA: Strix Halo or the dev-box Arc): `VulkanNemotronHMoeExpertServiceTests` holds the iGPU expert service to the CPU per-expert API on random Q4_K / Q5_K / Q6_K / Q8_0 / IQ2_XXS banks at n = 1, 3 and 17 tokens (2 to 34 rows: indexed and grouped arms) and on the synthetic Bolt fixture's banks, each against a double-precision reference within a per-element bound built from the actual activation rounding (block maxima) plus √K-scaled accumulation, propagated through relu² and the down projection.
+- #1083, CUDA + an integrated GPU (the dev box, quiet window): `CudaNemotronHMoeColdIgpuTests` runs `igpu` and `cpu+igpu` with a 1 MiB cache against resident on the synthetic fixture (PR C's selection and logit checks, shared), `auto`'s iGPU gating, and blk9 (`DOTLLM_BOLT_BLK9_GGUF`) within mean KL ≤ 0.02 and top-1 ≥ 90 %.
 
 The CPU tests cover:
 
@@ -166,3 +258,9 @@ The CPU tests cover:
 - non-admitting lookups and promote-only admission: `ExpertAdmissionTests`;
 - the calibration key, store and options: `MoeCalibrationTests`;
 - the per-expert CPU API and the cold leg's workers and gather index: `NemotronHMoeExpertComputeTests`. The API must be bit-identical to the kernels the CPU model used before, with or without a pool, and the leg must give the same rows for any thread count.
+- #1083: the three-way assignment, the iGPU calibration fields, the `igpu` / `cpu+igpu` options, the telemetry line and the iGPU device choice: `MoeIgpuColdTests`; the iGPU row list and the gather index over CPU + iGPU rows: `NemotronHMoeColdRowsTests`.
+- #1083, after the first quiet window: `NemotronHMoeIgpuLegTests` covers four things.
+  - The row capacity (`MaxRowsFor`) is the largest per-layer top-k × the block, and a full block covers it for every fixture layer.
+  - The fence comes before the read. A fake device writes its rows only when the host waits on the fence, so a missing or reordered wait reads stale rows deterministically.
+  - The import range arithmetic.
+  - The staged-banks log line.

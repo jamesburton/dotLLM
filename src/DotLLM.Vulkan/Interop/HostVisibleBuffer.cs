@@ -153,22 +153,15 @@ public sealed class HostVisibleBuffer : IDisposable
         if (!device.HasExternalMemoryHost) return null;
 
         ulong alignment = device.MinImportedHostPointerAlignment;
-        if (alignment == 0) return null;
 
-        // Round the imported pointer DOWN to the alignment boundary. The
-        // buffer is bound at `bindOffset` so kernels still see logical byte 0
-        // at the start of the descriptor.
-        ulong rawAddr = unchecked((ulong)hostPointer);
-        ulong alignedAddr = rawAddr & ~(alignment - 1);
-        long bindOffset = unchecked((long)(rawAddr - alignedAddr));
-
-        // The import size must also be a multiple of the alignment, and must
-        // cover the entire logical range starting at the page-aligned base.
-        long requestedEnd = bindOffset + size;
-        ulong alignedSize = ((ulong)requestedEnd + (alignment - 1)) & ~(alignment - 1);
-
-        // Sanity: integer overflow / pathological inputs.
-        if (alignedSize > (ulong)long.MaxValue) return null;
+        // Round the imported pointer DOWN to the alignment boundary and the end UP to it (the spec's
+        // multiple-of-alignment rules for pHostPointer and allocationSize). The buffer is bound at
+        // `bindOffset` so kernels still see logical byte 0 at the start of the descriptor. A zero or
+        // non-power-of-two alignment, or an overflowing range, refuses the import (HostImportRange).
+        if (!HostImportRange.TryCompute(unchecked((ulong)hostPointer), size, alignment, out var range)) return null;
+        ulong alignedAddr = range.Base;
+        long bindOffset = range.BindOffset;
+        ulong alignedSize = range.Size;
 
         // 1) Resolve vkGetMemoryHostPointerPropertiesEXT lazily.
         nint fn = VulkanApi.vkGetDeviceProcAddr(device.Handle, "vkGetMemoryHostPointerPropertiesEXT");
@@ -306,11 +299,7 @@ public sealed class HostVisibleBuffer : IDisposable
                 // AND a multiple of `minImportedHostPointerAlignment`. We already
                 // page-aligned alignedSize; pick max(alignedSize, req.size) and
                 // round up if necessary.
-                ulong allocSize = (ulong)alignedSize;
-                if (req.size > allocSize)
-                {
-                    allocSize = (req.size + alignment - 1) & ~(alignment - 1);
-                }
+                ulong allocSize = range.AllocationSize(req.size, alignment);
 
                 var mai = new VkMemoryAllocateInfo
                 {

@@ -120,6 +120,26 @@ internal static partial class RepackBudget
         return 0;
     }
 
+    /// <summary>
+    /// Machine-wide remaining commit in bytes (what further committed allocations, e.g. pinned memory, may still take before they fail),
+    /// or 0 when unknown. Windows: <c>GlobalMemoryStatusEx.ullAvailPageFile</c> (commit limit minus commit charge); other platforms: 0,
+    /// where overcommit makes the commit limit advisory.
+    /// </summary>
+    /// <returns>The remaining commit, or 0.</returns>
+    public static long QueryAvailableCommitBytes()
+    {
+        if (!OperatingSystem.IsWindows()) return 0;
+        try
+        {
+            var s = new MemoryStatusEx { dwLength = (uint)Marshal.SizeOf<MemoryStatusEx>() };
+            return GlobalMemoryStatusEx(ref s) ? (long)s.ullAvailPageFile : 0;
+        }
+        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException)
+        {
+            return 0;
+        }
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     private struct MemoryStatusEx
     {

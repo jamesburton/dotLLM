@@ -9,7 +9,7 @@ namespace DotLLM.Vulkan;
 /// scratch (Zxbcdt, ConvInput, XBC, DtBuf, SsmX, SsmB, SsmC, SsmY, SsmZ) and the FFN
 /// intermediate.
 /// </summary>
-internal sealed class VulkanNemotronHForwardState : IDisposable
+internal sealed class VulkanNemotronHForwardState : IDisposable, INemotronHMoeRoutedScratch
 {
     private readonly VulkanDevice _device;
     private readonly int _hiddenSize;
