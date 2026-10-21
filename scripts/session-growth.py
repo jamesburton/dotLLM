@@ -1,11 +1,12 @@
 """Grows one chat session turn by turn against a running dotllm server and records per-turn TTFT, prefix reuse,
 decode speed and VRAM. Each turn appends ~TURN_CHARS of wikitext as a new user message, keeps the assistant reply."""
-import argparse, json, subprocess, time, urllib.error, urllib.request
+import argparse, json, pathlib, subprocess, sys, time, urllib.error, urllib.request
 
 ap = argparse.ArgumentParser(description=__doc__)
 ap.add_argument("--url", default="http://127.0.0.1:18080/v1/chat/completions", help="chat completions endpoint")
 ap.add_argument("--model", required=True, help="model id (GET /v1/models, data[0].id)")
-ap.add_argument("--corpus", default=r"C:\Development\dotLLM\.docs\corpora\wikitext2-test.raw", help="text to feed in parts")
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+ap.add_argument("--corpus", default=str(REPO_ROOT / ".docs" / "corpora" / "wikitext2-test.raw"), help="text to feed in parts")
 ap.add_argument("--turn-chars", type=int, default=34000, help="characters appended per turn (34000 is about 8k tokens)")
 ap.add_argument("--turns", type=int, default=18, help="maximum number of turns")
 ap.add_argument("--max-tokens", type=int, default=64)
@@ -17,8 +18,13 @@ text = open(args.corpus, encoding="utf-8").read()
 
 
 def vram():
-    q = "--query-gpu=memory.used --format=csv,noheader,nounits"
-    return int(subprocess.check_output("nvidia-smi " + q, shell=True).split()[0])
+    """Used memory of the first GPU in MiB, or 0 when nvidia-smi is missing or fails."""
+    try:
+        out = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                                      text=True, stderr=subprocess.DEVNULL)
+        return int(out.splitlines()[0].strip())
+    except (OSError, subprocess.CalledProcessError, ValueError, IndexError):
+        return 0
 
 
 msgs = [{"role": "system", "content": "You are reading a long document in parts. Answer briefly."}]
@@ -26,6 +32,8 @@ with open(OUT, "w") as f:
     f.write("turn\tprompt_tok\tcached_tok\tnew_tok\tttft_s\tprefill_ms\tprefill_tps\tdecode_tps\tgen_tok\tvram_mib\terror\n")
     for turn in range(1, MAX_TURNS + 1):
         chunk = text[(turn - 1) * TURN_CHARS: turn * TURN_CHARS]
+        if not chunk:
+            sys.exit(f"corpus {args.corpus} ran out after {turn - 1} turns ({len(text)} chars); lower --turns or --turn-chars")
         msgs.append({"role": "user", "content": f"Part {turn} of the document:\n{chunk}\n\nIn one sentence, what is part {turn} about?"})
         body = json.dumps({"model": args.model, "messages": msgs, "max_tokens": args.max_tokens, "temperature": 0, "stream": True,
                            "stream_options": {"include_usage": True}}).encode()

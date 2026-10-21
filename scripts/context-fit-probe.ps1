@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory)][string]$Cli,
     [Parameter(Mandatory)][string]$Model,
     [string]$Tag = "fit",
+    [int]$Port = 18080,
     [string]$LogDir = (Join-Path $env:TEMP "dotllm-fit-probe"),
     # Name -> extra `serve` arguments; the default compares KV quantization with and without MTP.
     [System.Collections.IDictionary]$Configs = ([ordered]@{
@@ -16,9 +17,9 @@ param(
 New-Item -ItemType Directory -Force $LogDir | Out-Null
 foreach ($name in $Configs.Keys) {
     # Wait for the previous server's VRAM to drain.
-    for ($i = 0; $i -lt 60; $i++) { if ([int](nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits) -lt 300) { break }; Start-Sleep 2 }
+    for ($i = 0; $i -lt 60; $i++) { if ([int](@(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)[0]) -lt 300) { break }; Start-Sleep 2 }
     $out = "$LogDir\${Tag}_$name.out"; $err = "$LogDir\${Tag}_$name.err"
-    $a = @('serve', $Model, '-d', 'cuda', '-p', '18080') + $Configs[$name]
+    $a = @('serve', $Model, '-d', 'cuda', '-p', $Port) + $Configs[$name]
     $p = Start-Process -FilePath $Cli -ArgumentList $a -NoNewWindow -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
     $line = $null; $t0 = Get-Date
     while (-not $p.HasExited -and ((Get-Date) - $t0).TotalSeconds -lt 300) {
@@ -26,7 +27,7 @@ foreach ($name in $Configs.Keys) {
         if ($line) { break }
         Start-Sleep 2
     }
-    $vram = nvidia-smi --query-gpu=memory.used --format=csv,noheader
+    $vram = @(nvidia-smi --query-gpu=memory.used --format=csv,noheader)[0]
     if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
     "[$name] vram=$vram load_s=$([int]((Get-Date) - $t0).TotalSeconds) $($line.Line)"
 }

@@ -646,11 +646,25 @@ below, lifts that.
 Two more things defeated prefix reuse on a long chat session on a hybrid (recurrent) model:
 
 - **The snapshot boundary sat inside the template tail.** A chat turn renders as `...assistant reply<end>` and the next turn
-  re-renders that reply, but the generation prompt that closed the previous request (for ChatML templates, `<|im_start|>assistant\n`) is not part of the re-rendered history. A snapshot taken at the end of the prompt therefore
-  covered tokens the next prompt does not contain, and the next turn matched only an older boundary. The server now renders the
-  chat template once without the generation prompt, takes the tail it adds (`ReasoningSupport.GenerationPromptSuffix`), and
-  passes it as `InferenceOptions.GenerationPromptSuffix`. The snapshot goes **just before that suffix**, on the single-slot,
-  tiered and scheduler paths, and the superseded entry is released when the boundary moves forward.
+  re-renders that reply, but the generation prompt that closed the previous request (for ChatML templates,
+  `<|im_start|>assistant
+`) is not part of the re-rendered history. A snapshot taken at the end of the prompt therefore
+  covered tokens the next prompt does not contain, and the next turn matched only an older boundary. The rule:
+  - **The suffix.** The server renders the chat template twice, with `add_generation_prompt=true` and `=false`. The suffix is
+    the remainder of the `true` render after the `false` render, and is used only when the `false` render is a prefix of the
+    `true` one (`ReasoningSupport.GenerationPromptSuffix`). It reaches the engine as `InferenceOptions.GenerationPromptSuffix`.
+  - **The boundary.** The snapshot goes **just before the suffix's tokens** (`RecurrentSnapshotBoundary`). When the legacy
+    boundary (below) is also available, the later of the two wins, capped at prompt end - 1.
+  - **Fallback.** With no usable suffix the boundary is the #1080/#1091 behaviour: prompt end - 1 when the prompt extends the
+    previous one exactly, otherwise the prefix shared with the previous prompt. No usable suffix means: raw completions, a
+    template that cannot render both ways (or whose `false` render is not a prefix), an empty remainder, or suffix tokens
+    that are not the tail of the prompt's tokens (the suffix merged with the preceding text under BPE).
+  - **Paths.** It applies on the single-slot, tiered and scheduler paths, and the superseded entry is released when the
+    boundary moves forward. The single-slot and scheduler paths use the hint only when the prompt continues the previous
+    conversation (it shares everything before the previous prompt's own suffix), so a classifier-style prompt, with a fixed
+    system prompt and a different question each time, keeps its shared-prefix boundary. The scheduler also uses it when the
+    prompt shares less than the minimum snapshot length with the previous one (a conversation starting). The tiered path uses
+    it whenever a suffix boundary exists, falling back to prompt end - 1 when the prompt extends the previous one exactly.
 - **A hit that needed to grow its KV could turn into a miss.** The growth asked for the needed size plus an eighth of
   headroom. Near the window the device refused that, the hit became a miss, and the whole prompt was prefilled again
   (916 s at 112k tokens). The growth now retries at exactly the needed size (capped at the window). If even that is refused,
@@ -674,7 +688,7 @@ comes from `scripts/context-fit-probe.ps1`.
 | 14 | 112,017 | **0 / 916 s** | refused: exceeds the 110,592-token window |
 
 After the change every turn reuses the whole previous prompt (cached is the previous prompt minus 5 tokens), so each turn
-prefills only the roughly 8k tokens it adds, at a flat 57-70 s. Before, the cached prefix lagged a turn and prefill time
+prefills only the roughly 8k tokens it adds, at 57-74 s. Before, the cached prefix lagged a turn and prefill time
 stretched to 115-144 s. With MTP on (window 51,200 on this card) the first three turns reuse the same way
 (0 / 7,818 / 17,032 cached) and decode at 21-25 tokens/s.
 
