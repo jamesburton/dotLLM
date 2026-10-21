@@ -245,6 +245,7 @@ public sealed class TextGeneratorRecurrentPrefixMtpTests : IDisposable
         }
 
         var only = Assert.Single(model.CreatedStates);
+        Assert.Equal(0, only.CurrentLength);   // dropped before the prefill: it never absorbed a token
         Assert.True(IsDisposed(only));   // the real state behind the unmarkable wrapper
     }
 

@@ -555,16 +555,22 @@ live KV handle rather than copying it, and the head now gets the same treatment:
 - **What a hit does.** It rolls the head back to the mark with the trunk (`IMtpState.TryResumeAt`), raising the head's
   ceiling to the trunk KV's length when the hit grew it. The suffix prefill then absorbs from the mark exactly as a cold
   run would. The draft logits match a cold run's: bit for bit on the CPU, and within 1.2e-7 on CUDA.
-- **Plain turns keep the head in step.** A request that takes the snapshot carries the head through its prefill even
-  when it decodes plain, for example when the adaptive gate picks plain or logprobs are requested. Otherwise one plain
-  turn would leave every later hit without a head, and the gate could never try MTP again.
+- **Plain turns keep the head in step while MTP may be used.** A request that takes the snapshot carries the head
+  through its prefill even when it decodes plain (the adaptive gate picked plain, or logprobs were requested), as long as
+  the gate forecasts MTP for a coming request (`MtpAdaptiveGate.LikelyUsesMtpNext`: an arm still unexplored, MTP the
+  measured winner, or a re-probe due). Otherwise a plain first turn would leave every later hit without a head, and the
+  gate could never try MTP. Once plain decode measures faster, plain turns stop feeding the head and the session's later
+  hits stay plain; the next miss starts a fresh head.
 - **Why not copy or recompute it.** Copying the head's F32 KV into the snapshot costs about 8 KiB/token of extra memory
   and a copy on every turn, and the single slot already shares its storage. Recomputing it needs the trunk's hidden
   state at every cached position, which is the cost of the prefill the hit exists to skip.
 - **What it costs.** Memory: the head's KV now lives between requests and during hit turns, which the context fit
-  already counts when MTP is on. Compute: a plain turn that takes a snapshot pays the head's absorb.
+  already counts when MTP is on. Compute: a turn that feeds the head pays its absorb in the prefill, so in time to first
+  token. On Bonsai-2 27B on an RTX 3060 the CUDA absorb measured about 0.2 ms per prompt token (3% of the trunk's
+  prefill, 0.7-1.0 s on a 4k-token agent turn); hence the forecast above.
 - **Limits.** The multi-slot tiers (`--prefix-snapshots` > 1) copy only the trunk, so their hits stay plain. Backends
-  whose head state cannot mark (the Vulkan states) keep no head, so their hits stay plain too.
+  whose head state cannot mark (the Vulkan states) keep no head, so their hits stay plain too, and their plain turns
+  never feed one (the first head made shows the states cannot resume).
 
 With no snapshot held, a prompt that shares nothing usable with the previous one (the first turn of a conversation)
 now snapshots at its own end. The second agent turn then hits instead of re-prefilling the first.
