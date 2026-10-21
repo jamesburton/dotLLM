@@ -156,7 +156,8 @@ public sealed record MoeOffloadOptions
 
     /// <summary>
     /// Context length the device budget reserves KV cache for; <see langword="null"/> = the model's maximum context (the
-    /// #1063 addendum's worst case). Set from <c>--ctx-size</c>; lower it when the caller never allocates a cache that long.
+    /// #1063 addendum's worst case). Set from <c>--ctx-size</c>. The CUDA loader also caps a <c>nemotron_h_moe</c> model's
+    /// context to it, so no request allocates more KV than the budget reserved.
     /// </summary>
     public int? ContextTokens { get; init; }
 
@@ -445,6 +446,7 @@ public sealed record MoeOffloadOptions
 
     /// <summary>Help text of <c>--ctx-size</c>.</summary>
     public const string ContextHelp =
-        "Context length the MoE expert-offload VRAM budget reserves KV cache for (default: the model's maximum context, e.g. 262144 " +
-        "for Nemotron 3.5 Bolt). Lower it to leave more VRAM for the expert cache. Env fallback: " + ContextEnvVar + ".";
+        "Context window in tokens (llama.cpp -c). For nemotron_h_moe it caps the model's context and is what the MoE expert-offload " +
+        "VRAM budget reserves KV cache for (default: the model's maximum context, e.g. 262144 for Nemotron 3.5 Bolt). Lower it to " +
+        "leave more VRAM for the expert cache. Env fallback: " + ContextEnvVar + ".";
 }

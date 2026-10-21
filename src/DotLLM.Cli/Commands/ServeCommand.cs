@@ -84,14 +84,12 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [DefaultValue(false)]
         public bool MoeCalibrate { get; set; }
 
-        /// <summary>Context the MoE offload VRAM budget reserves KV cache for (issue #1071).</summary>
-        [CommandOption(DotLLM.Cli.Helpers.MoeOffloadCli.ContextOption)]
-        [Description(DotLLM.Core.Moe.MoeOffloadOptions.ContextHelp)]
-        public int? CtxSize { get; set; }
-
-        /// <summary>The raw MoE offload option values (issues #1070, #1071).</summary>
+        /// <summary>
+        /// The raw MoE offload option values (issues #1070, #1071). The served context (<see cref="CtxSize"/>, <c>--ctx-size</c>,
+        /// #1068) is also the context the offload budget reserves KV cache for; 0 or unset keeps the default.
+        /// </summary>
         public DotLLM.Core.Moe.MoeCliValues MoeValues => new(MoeOffload, MoeCacheMib, MoeCachePolicy, MoeCold, MoeCpuThreads,
-            CpuMoe, NCpuMoe, MoeCalibrate, CtxSize);
+            CpuMoe, NCpuMoe, MoeCalibrate, CtxSize is > 0 ? CtxSize : null);
 
         /// <summary>CPU thread count.</summary>
         [CommandOption("--threads")]
