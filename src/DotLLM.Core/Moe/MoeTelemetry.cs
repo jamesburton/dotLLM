@@ -16,14 +16,23 @@ namespace DotLLM.Core.Moe;
 /// <param name="Routed">Routed experts per layer call over every offloaded layer (cached, copied or computed on the CPU).</param>
 /// <param name="ColdExpertsCpu">Routed experts computed on the CPU (#1071).</param>
 /// <param name="CpuComputeMicros">Wall microseconds of the CPU cold legs (first worker start to last worker end).</param>
-/// <param name="CpuWaitMicros">Microseconds the compute stream waited for the CPU leg's results.</param>
+/// <param name="CpuWaitMicros">
+/// Microseconds the compute stream waited for the cold legs' results (the CPU leg's, and the iGPU leg's when one ran in the call).
+/// </param>
 /// <param name="Promotions">Cold experts promote-only admission copied into the cache.</param>
+/// <param name="ColdExpertsIgpu">Routed experts computed on the integrated GPU (#1083).</param>
+/// <param name="IgpuComputeMicros">Wall microseconds of the iGPU legs, from the start of each submission until its fence was observed.</param>
+/// <param name="IgpuWaitMicros">Microseconds the forward thread blocked on an iGPU fence after its own (CPU-leg) work was done.</param>
 public readonly record struct MoeTelemetrySnapshot(long Hits, long Misses, long Evictions, long BytesH2D, long CopyWaitMicros,
     long Tokens, long CacheSlots, long CacheBytes, ExpertCachePolicy? Policy, long Routed = 0, long ColdExpertsCpu = 0,
-    long CpuComputeMicros = 0, long CpuWaitMicros = 0, long Promotions = 0)
+    long CpuComputeMicros = 0, long CpuWaitMicros = 0, long Promotions = 0, long ColdExpertsIgpu = 0, long IgpuComputeMicros = 0,
+    long IgpuWaitMicros = 0)
 {
     /// <summary>Share of routed experts computed on the CPU (0 when none were routed).</summary>
     public double ColdCpuFraction => Routed == 0 ? 0 : (double)ColdExpertsCpu / Routed;
+
+    /// <summary>Share of routed experts computed on the integrated GPU (0 when none were routed; #1083).</summary>
+    public double ColdIgpuFraction => Routed == 0 ? 0 : (double)ColdExpertsIgpu / Routed;
 
     /// <summary>Hit rate over all lookups (0 when none).</summary>
     public double HitRate => Hits + Misses == 0 ? 0 : (double)Hits / (Hits + Misses);
@@ -44,13 +53,17 @@ public readonly record struct MoeTelemetrySnapshot(long Hits, long Misses, long 
         CpuComputeMicros = CpuComputeMicros - start.CpuComputeMicros,
         CpuWaitMicros = CpuWaitMicros - start.CpuWaitMicros,
         Promotions = Promotions - start.Promotions,
+        ColdExpertsIgpu = ColdExpertsIgpu - start.ColdExpertsIgpu,
+        IgpuComputeMicros = IgpuComputeMicros - start.IgpuComputeMicros,
+        IgpuWaitMicros = IgpuWaitMicros - start.IgpuWaitMicros,
     };
 
     /// <summary>
     /// The one-line summary printed by <c>bench</c> and <c>run --verbose</c>, e.g.
     /// <c>MoE offload: cache 6.1 GiB (812 slots, SLRU), hit 81.2%, H2D 71.3 MB/token, copy wait 9.8 ms/token</c>, followed by
-    /// <c>; cold: CPU 41% of routed, CPU wait 3.2 ms/token, promotions 12</c> when a CPU leg ran (#1071); null when no offloaded
-    /// model is active.
+    /// <c>; cold: CPU 41% of routed, CPU wait 3.2 ms/token, promotions 12</c> when a CPU leg ran (#1071), and
+    /// <c>; iGPU 30% of routed, iGPU compute 4.1 ms/token, iGPU wait 0.6 ms/token</c> when an iGPU leg ran (#1083); null when no
+    /// offloaded model is active.
     /// </summary>
     /// <returns>The line, or null.</returns>
     public string? FormatSummary()
@@ -62,9 +75,12 @@ public readonly record struct MoeTelemetrySnapshot(long Hits, long Misses, long 
             "MoE offload: cache {0:F1} GiB ({1} slots, {2}), hit {3:F1}%, H2D {4:F1} MB/token, copy wait {5:F1} ms/token, evictions {6}",
             CacheBytes / (1024.0 * 1024 * 1024), CacheSlots, policy.ToString().ToUpperInvariant(), HitRate * 100,
             BytesH2D / 1e6 / perToken, CopyWaitMicros / 1000.0 / perToken, Evictions);
-        if (ColdExpertsCpu > 0 || Promotions > 0)
+        if (ColdExpertsCpu > 0 || ColdExpertsIgpu > 0 || Promotions > 0)
             line += string.Format(c, "; cold: CPU {0:F0}% of routed, CPU compute {1:F1} ms/token, CPU wait {2:F1} ms/token, promotions {3}",
                 ColdCpuFraction * 100, CpuComputeMicros / 1000.0 / perToken, CpuWaitMicros / 1000.0 / perToken, Promotions);
+        if (ColdExpertsIgpu > 0)
+            line += string.Format(c, "; iGPU {0:F0}% of routed, iGPU compute {1:F1} ms/token, iGPU wait {2:F1} ms/token",
+                ColdIgpuFraction * 100, IgpuComputeMicros / 1000.0 / perToken, IgpuWaitMicros / 1000.0 / perToken);
         return line;
     }
 }
@@ -81,6 +97,7 @@ public static class MoeTelemetry
 
     private static long s_hits, s_misses, s_evictions, s_bytesH2D, s_copyWaitMicros, s_tokens, s_cacheSlots, s_cacheBytes;
     private static long s_routed, s_coldCpu, s_cpuComputeMicros, s_cpuWaitMicros, s_promotions;
+    private static long s_coldIgpu, s_igpuComputeMicros, s_igpuWaitMicros;
     private static int s_policy = -1;
 
     private static readonly Meter s_meter = new(MeterName);
@@ -97,6 +114,9 @@ public static class MoeTelemetry
     private static readonly ObservableCounter<long> s_cpuComputeC = s_meter.CreateObservableCounter("dotllm.moe.cpu_compute_us", () => Volatile.Read(ref s_cpuComputeMicros), "us");
     private static readonly ObservableCounter<long> s_cpuWaitC = s_meter.CreateObservableCounter("dotllm.moe.cpu_wait_us", () => Volatile.Read(ref s_cpuWaitMicros), "us");
     private static readonly ObservableCounter<long> s_promoC = s_meter.CreateObservableCounter("dotllm.moe.promotions", () => Volatile.Read(ref s_promotions), "experts");
+    private static readonly ObservableCounter<long> s_coldIgpuC = s_meter.CreateObservableCounter("dotllm.moe.cold_experts_igpu", () => Volatile.Read(ref s_coldIgpu), "experts");
+    private static readonly ObservableCounter<long> s_igpuComputeC = s_meter.CreateObservableCounter("dotllm.moe.igpu_compute_us", () => Volatile.Read(ref s_igpuComputeMicros), "us");
+    private static readonly ObservableCounter<long> s_igpuWaitC = s_meter.CreateObservableCounter("dotllm.moe.igpu_wait_us", () => Volatile.Read(ref s_igpuWaitMicros), "us");
 
     /// <summary>Records one layer call's lookups.</summary>
     /// <param name="hits">Experts found resident.</param>
@@ -111,13 +131,31 @@ public static class MoeTelemetry
         if (bytesH2D != 0) Interlocked.Add(ref s_bytesH2D, bytesH2D);
     }
 
-    /// <summary>Records one offloaded layer call's routed experts and how many of them ran on the CPU (#1071).</summary>
+    /// <summary>
+    /// Records one offloaded layer call's routed experts and how many of them ran on the CPU (#1071) and on the integrated GPU (#1083).
+    /// </summary>
     /// <param name="routed">Distinct experts the call routed to.</param>
     /// <param name="coldCpu">Of those, experts computed on the CPU.</param>
-    public static void RecordRouted(long routed, long coldCpu)
+    /// <param name="coldIgpu">Of those, experts computed on the integrated GPU.</param>
+    public static void RecordRouted(long routed, long coldCpu, long coldIgpu = 0)
     {
         if (routed != 0) Interlocked.Add(ref s_routed, routed);
         if (coldCpu != 0) Interlocked.Add(ref s_coldCpu, coldCpu);
+        if (coldIgpu != 0) Interlocked.Add(ref s_coldIgpu, coldIgpu);
+    }
+
+    /// <summary>Records one iGPU cold leg: submission start until its fence was observed (#1083).</summary>
+    /// <param name="micros">Microseconds.</param>
+    public static void RecordIgpuCompute(long micros)
+    {
+        if (micros > 0) Interlocked.Add(ref s_igpuComputeMicros, micros);
+    }
+
+    /// <summary>Records time the forward thread blocked on an iGPU fence after its own work (#1083).</summary>
+    /// <param name="micros">Microseconds.</param>
+    public static void RecordIgpuWait(long micros)
+    {
+        if (micros > 0) Interlocked.Add(ref s_igpuWaitMicros, micros);
     }
 
     /// <summary>Records one CPU cold leg: its wall time on the CPU (#1071).</summary>
@@ -180,12 +218,14 @@ public static class MoeTelemetry
             Volatile.Read(ref s_bytesH2D), Volatile.Read(ref s_copyWaitMicros), Volatile.Read(ref s_tokens),
             Volatile.Read(ref s_cacheSlots), Volatile.Read(ref s_cacheBytes), p < 0 ? null : (ExpertCachePolicy)p,
             Volatile.Read(ref s_routed), Volatile.Read(ref s_coldCpu), Volatile.Read(ref s_cpuComputeMicros),
-            Volatile.Read(ref s_cpuWaitMicros), Volatile.Read(ref s_promotions));
+            Volatile.Read(ref s_cpuWaitMicros), Volatile.Read(ref s_promotions), Volatile.Read(ref s_coldIgpu),
+            Volatile.Read(ref s_igpuComputeMicros), Volatile.Read(ref s_igpuWaitMicros));
     }
 
     /// <summary>Keeps the instrument fields referenced (they are observed through the meter, never read directly).</summary>
     internal static int InstrumentCount => new object[]
     {
         s_hitsC, s_missC, s_evictC, s_bytesC, s_waitC, s_slotsG, s_bytesG, s_coldCpuC, s_cpuComputeC, s_cpuWaitC, s_promoC,
+        s_coldIgpuC, s_igpuComputeC, s_igpuWaitC,
     }.Length;
 }

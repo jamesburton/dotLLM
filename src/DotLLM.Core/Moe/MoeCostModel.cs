@@ -25,22 +25,33 @@ public readonly record struct LinearCost(double A, double B)
 }
 
 /// <summary>
-/// Per-layout costs of the cold-expert decision: CPU time and device time per expert as a function of its token count.
+/// Per-layout costs of the cold-expert decision: CPU time, device time and (#1083) integrated-GPU time per expert as a function of
+/// its token count.
 /// </summary>
 /// <param name="Layout">The expert layout (up and down bytes) these costs belong to.</param>
 /// <param name="Cpu">CPU microseconds (single-threaded, one expert).</param>
 /// <param name="Gpu">Device microseconds once the expert is resident.</param>
-public sealed record MoeLayoutCost(ExpertLayout Layout, LinearCost Cpu, LinearCost Gpu);
+/// <param name="Igpu">
+/// Integrated-GPU microseconds of one expert inside an iGPU submission, without the submission's fixed round trip
+/// (<see cref="MoeCostModel.IgpuSubmitUs"/>); null when the layout was not measured on an iGPU (#1083).
+/// </param>
+public sealed record MoeLayoutCost(ExpertLayout Layout, LinearCost Cpu, LinearCost Gpu, LinearCost? Igpu = null);
 
 /// <summary>
-/// The cost model of the per-layer cold-expert assignment (issue #1071, design #1063 sections 6 and 8c), built from a load-time
-/// calibration: pinned host-to-device bandwidth, the device-host-device round trip the CPU leg adds, and per-layout CPU and
-/// device time per expert. Pure arithmetic; the backend measures the inputs.
+/// The cost model of the per-layer cold-expert assignment (issue #1071, design #1063 sections 6 and 8c; the iGPU leg: #1083, 8c′),
+/// built from a load-time calibration: pinned host-to-device bandwidth, the device-host-device round trip a cold leg adds,
+/// per-layout CPU, device and iGPU time per expert, and the iGPU's submit-plus-fence round trip. Pure arithmetic; the backend
+/// measures the inputs.
 /// </summary>
 /// <param name="H2DBytesPerSecond">Measured pinned host-to-device bandwidth.</param>
-/// <param name="SyncRoundTripUs">Median D2H + host-sync round trip in microseconds (one extra per layer that uses the CPU).</param>
+/// <param name="SyncRoundTripUs">Median D2H + host-sync round trip in microseconds (one extra per layer that uses a cold leg).</param>
 /// <param name="Layouts">Costs per expert layout.</param>
-public sealed record MoeCostModel(double H2DBytesPerSecond, double SyncRoundTripUs, IReadOnlyList<MoeLayoutCost> Layouts)
+/// <param name="IgpuSubmitUs">
+/// Fixed microseconds of one iGPU submission (record, submit, fence) whatever it computes; positive infinity (the default) when
+/// there is no iGPU leg, which keeps every expert off it.
+/// </param>
+public sealed record MoeCostModel(double H2DBytesPerSecond, double SyncRoundTripUs, IReadOnlyList<MoeLayoutCost> Layouts,
+    double IgpuSubmitUs = double.PositiveInfinity)
 {
     /// <summary>Effective device read bandwidth assumed for the expert GEMVs when they are not measured (RTX 3060 class).</summary>
     public const double DefaultDeviceBytesPerSecond = 300e9;
@@ -50,6 +61,9 @@ public sealed record MoeCostModel(double H2DBytesPerSecond, double SyncRoundTrip
 
     /// <summary>Default share of the last token's time the link may spend on promotion copies (design 8c: about 25 %).</summary>
     public const double DefaultPromotionLinkShare = 0.25;
+
+    /// <summary>True when the model has an iGPU leg (a finite <see cref="IgpuSubmitUs"/>).</summary>
+    public bool HasIgpu => !double.IsPositiveInfinity(IgpuSubmitUs) && !double.IsNaN(IgpuSubmitUs);
 
     /// <summary>
     /// Default device time of one expert: its bytes at <paramref name="deviceBytesPerSecond"/> per weight read, one read per
@@ -80,8 +94,9 @@ public sealed record MoeCostModel(double H2DBytesPerSecond, double SyncRoundTrip
     }
 
     /// <summary>
-    /// The three costs of one uncached expert of <paramref name="layout"/> with <paramref name="tokens"/> tokens. A layout that
-    /// was not calibrated costs infinity on the CPU (so it is copied, the #1070 behaviour).
+    /// The costs of one uncached expert of <paramref name="layout"/> with <paramref name="tokens"/> tokens. A layout that was not
+    /// calibrated costs infinity on the CPU (so it is copied, the #1070 behaviour) and on the iGPU; so does any layout when the
+    /// model has no iGPU leg.
     /// </summary>
     /// <param name="layout">Expert layout.</param>
     /// <param name="tokens">Tokens routed to the expert in this call.</param>
@@ -91,7 +106,8 @@ public sealed record MoeCostModel(double H2DBytesPerSecond, double SyncRoundTrip
         long bytes = layout.UpBytes + layout.DownBytes;
         var c = For(layout);
         double gpu = (c?.Gpu ?? DefaultGpuCost(bytes)).Us(tokens);
-        return new ColdExpertCost(c is null ? double.PositiveInfinity : c.Cpu.Us(tokens), CopyUs(bytes), gpu);
+        double igpu = HasIgpu && c?.Igpu is { } ig ? ig.Us(tokens) : double.PositiveInfinity;
+        return new ColdExpertCost(c is null ? double.PositiveInfinity : c.Cpu.Us(tokens), CopyUs(bytes), gpu, igpu);
     }
 
     /// <summary>
@@ -120,33 +136,63 @@ public sealed record MoeCostModel(double H2DBytesPerSecond, double SyncRoundTrip
     }
 }
 
+/// <summary>Where one uncached expert of a layer call runs (#1071, #1083).</summary>
+public enum ColdPlace : byte
+{
+    /// <summary>On the device (CUDA): copied into the cache or streamed, then computed there.</summary>
+    Device,
+
+    /// <summary>On the CPU, from the memory-mapped bank (#1071).</summary>
+    Cpu,
+
+    /// <summary>On the integrated GPU (Vulkan), from the zero-copy bank import (#1083).</summary>
+    Igpu,
+}
+
 /// <summary>The costs of one uncached expert in one layer call, in microseconds.</summary>
 /// <param name="CpuUs">Computing it on the CPU (single-threaded).</param>
 /// <param name="CopyUs">Copying its weights to the device.</param>
 /// <param name="GpuUs">Computing it on the device once copied.</param>
-public readonly record struct ColdExpertCost(double CpuUs, double CopyUs, double GpuUs)
+/// <param name="IgpuUs">Computing it on the integrated GPU inside a submission (#1083); infinity when there is no iGPU leg.</param>
+public readonly record struct ColdExpertCost(double CpuUs, double CopyUs, double GpuUs, double IgpuUs = double.PositiveInfinity)
 {
     /// <summary>The device-side cost: copy plus compute.</summary>
     public double DeviceUs => CopyUs + GpuUs;
+
+    /// <summary>The cost of running the expert at <paramref name="place"/>.</summary>
+    /// <param name="place">The side.</param>
+    /// <returns>Microseconds (infinity when it cannot run there).</returns>
+    public double Us(ColdPlace place) => place switch
+    {
+        ColdPlace.Device => DeviceUs,
+        ColdPlace.Cpu => CpuUs,
+        _ => IgpuUs,
+    };
 }
 
 /// <summary>
-/// The per-layer CPU / device assignment of uncached experts (issue #1071, design #1063 section 8c). Pure.
+/// The per-layer assignment of uncached experts to the device, the CPU and (#1083) the integrated GPU (issue #1071, design #1063
+/// sections 8c and 8c′). Pure.
 /// <list type="number">
-///   <item><b>Fiddler rule</b> (arXiv 2402.07033): an expert goes to the CPU when computing it there is cheaper than copying it
-///   and computing it on the device.</item>
-///   <item><b>DALI-style greedy balance</b> (arXiv 2602.03495): in ascending order of <c>|cpu − (copy + gpu)|</c>, each expert
-///   is moved to the other side when that lowers the layer's makespan <c>max(CPU span, device span)</c>.</item>
+///   <item><b>Fiddler rule</b> (arXiv 2402.07033), generalised to three sides: an expert goes to its individually cheapest side
+///   (device on a tie, then the CPU).</item>
+///   <item><b>DALI-style greedy balance</b> (arXiv 2602.03495): in ascending order of the gap between an expert's two cheapest sides,
+///   each expert is moved to the other side that lowers the layer's makespan most, until no single move helps.</item>
 /// </list>
-/// The CPU span is the expert-parallel makespan bound over the workers, <c>max(Σcpu / workers, max cpu)</c>, plus the extra round
-/// trip the CPU leg costs; the device span is the resident experts' time plus <c>Σ(copy + gpu)</c> of the copied ones.
+/// The makespan is <c>max(device span, cold span)</c>. The device span is the resident experts' time plus <c>Σ(copy + gpu)</c> of
+/// the copied ones. The cold span is zero when no expert is cold, else the cold legs' extra round trip plus
+/// <c>max(CPU span, iGPU span)</c>, because the CPU and iGPU legs run concurrently: the CPU span is the expert-parallel bound
+/// <c>max(Σcpu / workers, max cpu)</c>; the iGPU span is the submission's fixed cost plus <c>Σigpu</c> (one queue), and zero when no
+/// expert is on the iGPU, so an empty iGPU set never pays the submit.
 /// </summary>
 public static class MoeColdAssignment
 {
     /// <summary>Greedy passes at most (each pass visits every expert once).</summary>
     public const int MaxPasses = 4;
 
-    /// <summary>Assigns each expert of <paramref name="costs"/> to the CPU or the device.</summary>
+    private static readonly ColdPlace[] Sides = [ColdPlace.Device, ColdPlace.Cpu, ColdPlace.Igpu];
+
+    /// <summary>Assigns each expert of <paramref name="costs"/> to the CPU or the device (the #1071 two-way form; no iGPU).</summary>
     /// <param name="costs">Costs of the layer call's uncached experts.</param>
     /// <param name="residentGpuUs">Device time already committed to the cached experts of the call.</param>
     /// <param name="cpuWorkers">CPU leg workers (one expert each at a time).</param>
@@ -158,24 +204,50 @@ public static class MoeColdAssignment
         Span<bool> onCpu)
     {
         if (onCpu.Length < costs.Length) throw new ArgumentException("onCpu is shorter than costs.", nameof(onCpu));
-        int n = costs.Length;
-        if (n == 0) return 0;
-        cpuWorkers = Math.Max(1, cpuWorkers);
+        Span<ColdPlace> place = costs.Length <= 256 ? stackalloc ColdPlace[costs.Length] : new ColdPlace[costs.Length];
+        var (cpu, _) = Assign(costs, residentGpuUs, cpuWorkers, cpuLegOverheadUs, double.PositiveInfinity, place);
+        for (int i = 0; i < costs.Length; i++) onCpu[i] = place[i] == ColdPlace.Cpu;
+        return cpu;
+    }
 
-        // 1. Fiddler. The greedy pass only accepts improving single moves, so it starts from the best of the Fiddler assignment
-        //    and the two one-sided ones (every expert that can run there on the device, or on the CPU).
-        Fiddler(costs, onCpu);
-        double start = Makespan(costs, onCpu, residentGpuUs, cpuWorkers, cpuLegOverheadUs);
-        Span<bool> trial = n <= 256 ? stackalloc bool[n] : new bool[n];
-        for (int side = 0; side < 2; side++)
+    /// <summary>
+    /// Assigns each expert of <paramref name="costs"/> to the device, the CPU or the integrated GPU (#1083), minimising
+    /// <c>max(device + copy, cold-leg overhead + max(CPU, iGPU))</c> for the layer call (see the type remarks).
+    /// </summary>
+    /// <param name="costs">Costs of the layer call's uncached experts.</param>
+    /// <param name="residentGpuUs">Device time already committed to the cached experts of the call.</param>
+    /// <param name="cpuWorkers">CPU leg workers (one expert each at a time).</param>
+    /// <param name="coldLegOverheadUs">Fixed cost of any cold leg (the extra device-host-device round trip); paid once per call.</param>
+    /// <param name="igpuSubmitUs">Fixed cost of a non-empty iGPU submission; infinity disables the iGPU side.</param>
+    /// <param name="place">Receives each expert's side.</param>
+    /// <returns>Experts placed on the CPU and on the iGPU.</returns>
+    /// <exception cref="ArgumentException"><paramref name="place"/> is shorter than <paramref name="costs"/>.</exception>
+    public static (int Cpu, int Igpu) Assign(ReadOnlySpan<ColdExpertCost> costs, double residentGpuUs, int cpuWorkers,
+        double coldLegOverheadUs, double igpuSubmitUs, Span<ColdPlace> place)
+    {
+        if (place.Length < costs.Length) throw new ArgumentException("place is shorter than costs.", nameof(place));
+        int n = costs.Length;
+        if (n == 0) return (0, 0);
+        cpuWorkers = Math.Max(1, cpuWorkers);
+        bool igpu = IgpuEnabled(igpuSubmitUs);
+
+        // 1. Fiddler. The greedy pass only accepts improving single moves, so it starts from the best of the Fiddler assignment and
+        //    the one-sided ones (every expert that can run there on that side, the rest where Fiddler puts them).
+        Fiddler(costs, igpuSubmitUs, place);
+        double start = Makespan(costs, place, residentGpuUs, cpuWorkers, coldLegOverheadUs, igpuSubmitUs);
+        Span<ColdPlace> trial = n <= 256 ? stackalloc ColdPlace[n] : new ColdPlace[n];
+        Span<ColdPlace> fiddler = n <= 256 ? stackalloc ColdPlace[n] : new ColdPlace[n];
+        place[..n].CopyTo(fiddler);
+        foreach (var side in Sides)
         {
+            if (side == ColdPlace.Igpu && !igpu) continue;
             for (int i = 0; i < n; i++)
-                trial[i] = side == 0 ? double.IsPositiveInfinity(costs[i].DeviceUs) : !double.IsPositiveInfinity(costs[i].CpuUs);
-            double m = Makespan(costs, trial, residentGpuUs, cpuWorkers, cpuLegOverheadUs);
+                trial[i] = double.IsPositiveInfinity(costs[i].Us(side)) ? fiddler[i] : side;
+            double m = Makespan(costs, trial, residentGpuUs, cpuWorkers, coldLegOverheadUs, igpuSubmitUs);
             if (m < start - 1e-9)
             {
                 start = m;
-                trial.CopyTo(onCpu);
+                trial.CopyTo(place);
             }
         }
 
@@ -183,11 +255,7 @@ public static class MoeColdAssignment
         int[] order = new int[n];
         for (int i = 0; i < n; i++) order[i] = i;
         var keys = new double[n];
-        for (int i = 0; i < n; i++)
-        {
-            double d = Math.Abs(costs[i].CpuUs - costs[i].DeviceUs);
-            keys[i] = double.IsNaN(d) ? double.PositiveInfinity : d;
-        }
+        for (int i = 0; i < n; i++) keys[i] = TwoCheapestGap(costs[i], igpu);
         Array.Sort(order, (a, b) => keys[a] != keys[b] ? keys[a].CompareTo(keys[b]) : a.CompareTo(b));
 
         double best = start;
@@ -196,24 +264,39 @@ public static class MoeColdAssignment
             bool improved = false;
             foreach (int i in order)
             {
-                // Never move an expert onto a side where it cannot run at all (infinite cost).
-                if (onCpu[i] ? double.IsPositiveInfinity(costs[i].DeviceUs) : double.IsPositiveInfinity(costs[i].CpuUs)) continue;
-                onCpu[i] = !onCpu[i];
-                double m = Makespan(costs, onCpu, residentGpuUs, cpuWorkers, cpuLegOverheadUs);
-                if (m < best - 1e-9) { best = m; improved = true; }
-                else onCpu[i] = !onCpu[i];
+                var from = place[i];
+                var bestSide = from;
+                foreach (var to in Sides)
+                {
+                    // Never move an expert onto a side where it cannot run at all (infinite cost), or onto a disabled iGPU.
+                    if (to == from || (to == ColdPlace.Igpu && !igpu) || double.IsPositiveInfinity(costs[i].Us(to))) continue;
+                    place[i] = to;
+                    double m = Makespan(costs, place, residentGpuUs, cpuWorkers, coldLegOverheadUs, igpuSubmitUs);
+                    if (m < best - 1e-9)
+                    {
+                        best = m;
+                        bestSide = to;
+                    }
+                }
+                place[i] = bestSide;
+                if (bestSide != from) improved = true;
             }
             if (!improved) break;
         }
 
-        int cpu = 0;
-        for (int i = 0; i < n; i++) if (onCpu[i]) cpu++;
-        return cpu;
+        int cpu = 0, ig = 0;
+        for (int i = 0; i < n; i++)
+        {
+            if (place[i] == ColdPlace.Cpu) cpu++;
+            else if (place[i] == ColdPlace.Igpu) ig++;
+        }
+        return (cpu, ig);
     }
 
     /// <summary>
     /// The Fiddler rule alone (arXiv 2402.07033): an expert goes to the CPU exactly when computing it there is cheaper than copying
-    /// it and computing it on the device. <see cref="Assign"/> starts its balance from this (or a better one-sided) assignment.
+    /// it and computing it on the device. <see cref="Assign(ReadOnlySpan{ColdExpertCost}, double, int, double, Span{bool})"/> starts its
+    /// balance from this (or a better one-sided) assignment.
     /// </summary>
     /// <param name="costs">Costs of the uncached experts.</param>
     /// <param name="onCpu">Receives true for each expert the rule places on the CPU.</param>
@@ -226,7 +309,33 @@ public static class MoeColdAssignment
         return cpu;
     }
 
-    /// <summary>The layer makespan of an assignment (see the type remarks).</summary>
+    /// <summary>
+    /// The Fiddler rule over three sides (#1083): each expert goes to its individually cheapest side, the device on a tie, then the
+    /// CPU, then the iGPU. With the iGPU disabled (<paramref name="igpuSubmitUs"/> infinite) this is exactly
+    /// <see cref="Fiddler(ReadOnlySpan{ColdExpertCost}, Span{bool})"/>.
+    /// </summary>
+    /// <param name="costs">Costs of the uncached experts.</param>
+    /// <param name="igpuSubmitUs">Fixed cost of an iGPU submission; infinity disables the iGPU side.</param>
+    /// <param name="place">Receives each expert's side.</param>
+    /// <returns>Experts placed off the device.</returns>
+    public static int Fiddler(ReadOnlySpan<ColdExpertCost> costs, double igpuSubmitUs, Span<ColdPlace> place)
+    {
+        bool igpu = IgpuEnabled(igpuSubmitUs);
+        int cold = 0;
+        for (int i = 0; i < costs.Length; i++)
+        {
+            var c = costs[i];
+            var side = ColdPlace.Device;
+            double best = c.DeviceUs;
+            if (c.CpuUs < best) { side = ColdPlace.Cpu; best = c.CpuUs; }
+            if (igpu && c.IgpuUs < best) side = ColdPlace.Igpu;
+            place[i] = side;
+            if (side != ColdPlace.Device) cold++;
+        }
+        return cold;
+    }
+
+    /// <summary>The layer makespan of a two-way assignment (see the type remarks; no iGPU).</summary>
     /// <param name="costs">Costs of the uncached experts.</param>
     /// <param name="onCpu">The assignment.</param>
     /// <param name="residentGpuUs">Device time of the cached experts.</param>
@@ -236,22 +345,65 @@ public static class MoeColdAssignment
     public static double Makespan(ReadOnlySpan<ColdExpertCost> costs, ReadOnlySpan<bool> onCpu, double residentGpuUs,
         int cpuWorkers, double cpuLegOverheadUs)
     {
-        double cpuSum = 0, cpuMax = 0, device = residentGpuUs;
-        bool anyCpu = false;
+        Span<ColdPlace> place = costs.Length <= 256 ? stackalloc ColdPlace[costs.Length] : new ColdPlace[costs.Length];
+        for (int i = 0; i < costs.Length; i++) place[i] = onCpu[i] ? ColdPlace.Cpu : ColdPlace.Device;
+        return Makespan(costs, place, residentGpuUs, cpuWorkers, cpuLegOverheadUs, double.PositiveInfinity);
+    }
+
+    /// <summary>The layer makespan of a three-way assignment (see the type remarks).</summary>
+    /// <param name="costs">Costs of the uncached experts.</param>
+    /// <param name="place">The assignment.</param>
+    /// <param name="residentGpuUs">Device time of the cached experts.</param>
+    /// <param name="cpuWorkers">CPU leg workers.</param>
+    /// <param name="coldLegOverheadUs">Fixed cost of any non-empty cold leg (paid once).</param>
+    /// <param name="igpuSubmitUs">Fixed cost of a non-empty iGPU submission (infinity: an iGPU expert makes the span infinite).</param>
+    /// <returns>Microseconds.</returns>
+    public static double Makespan(ReadOnlySpan<ColdExpertCost> costs, ReadOnlySpan<ColdPlace> place, double residentGpuUs,
+        int cpuWorkers, double coldLegOverheadUs, double igpuSubmitUs)
+    {
+        double cpuSum = 0, cpuMax = 0, igpuSum = 0, device = residentGpuUs;
+        bool anyCpu = false, anyIgpu = false;
         for (int i = 0; i < costs.Length; i++)
         {
-            if (onCpu[i])
+            switch (place[i])
             {
-                anyCpu = true;
-                cpuSum += costs[i].CpuUs;
-                cpuMax = Math.Max(cpuMax, costs[i].CpuUs);
-            }
-            else
-            {
-                device += costs[i].DeviceUs;
+                case ColdPlace.Cpu:
+                    anyCpu = true;
+                    cpuSum += costs[i].CpuUs;
+                    cpuMax = Math.Max(cpuMax, costs[i].CpuUs);
+                    break;
+                case ColdPlace.Igpu:
+                    anyIgpu = true;
+                    igpuSum += costs[i].IgpuUs;
+                    break;
+                default:
+                    device += costs[i].DeviceUs;
+                    break;
             }
         }
-        double cpuSpan = anyCpu ? cpuLegOverheadUs + Math.Max(cpuSum / Math.Max(1, cpuWorkers), cpuMax) : 0;
-        return Math.Max(cpuSpan, device);
+        double cpuSpan = anyCpu ? Math.Max(cpuSum / Math.Max(1, cpuWorkers), cpuMax) : 0;
+        double igpuSpan = anyIgpu ? igpuSubmitUs + igpuSum : 0;
+        double coldSpan = anyCpu || anyIgpu ? coldLegOverheadUs + Math.Max(cpuSpan, igpuSpan) : 0;
+        return Math.Max(coldSpan, device);
+    }
+
+    private static bool IgpuEnabled(double igpuSubmitUs) => !double.IsPositiveInfinity(igpuSubmitUs) && !double.IsNaN(igpuSubmitUs);
+
+    /// <summary>
+    /// The gap between an expert's two cheapest available sides (the greedy order key; with the iGPU disabled it is
+    /// <c>|cpu − device|</c>, the #1071 key). NaN sorts last.
+    /// </summary>
+    private static double TwoCheapestGap(in ColdExpertCost c, bool igpu)
+    {
+        double a = c.DeviceUs, b = c.CpuUs;
+        double lo = Math.Min(a, b), hi = Math.Max(a, b);
+        if (igpu)
+        {
+            double g = c.IgpuUs;
+            if (g < lo) { hi = lo; lo = g; }
+            else if (g < hi) hi = g;
+        }
+        double d = Math.Abs(hi - lo);
+        return double.IsNaN(d) ? double.PositiveInfinity : d;
     }
 }

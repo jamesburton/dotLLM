@@ -46,6 +46,18 @@ public enum MoeColdMode
 
     /// <summary>Compute every uncached expert on the CPU; the cache changes only through promote-only admission.</summary>
     Cpu,
+
+    /// <summary>
+    /// Compute every uncached expert on the integrated GPU (Vulkan, zero-copy banks; #1083); a layer whose banks the iGPU cannot read
+    /// falls back to the CPU. The cache changes only through promote-only admission.
+    /// </summary>
+    Igpu,
+
+    /// <summary>
+    /// Split the uncached experts between the CPU and the integrated GPU by the calibrated costs (never copy on a miss; #1083). The
+    /// cache changes only through promote-only admission.
+    /// </summary>
+    CpuIgpu,
 }
 
 /// <summary>
@@ -61,9 +73,10 @@ public enum MoeColdMode
 /// <param name="NCpuMoe"><c>--n-cpu-moe</c>.</param>
 /// <param name="Calibrate"><c>--moe-calibrate</c> (true = re-run the load-time cost calibration).</param>
 /// <param name="ContextTokens"><c>--ctx-size</c>: context the device budget reserves KV cache for.</param>
+/// <param name="IgpuDevice"><c>--moe-igpu-device</c>: the Vulkan device of the iGPU leg, by index or name (#1083).</param>
 public sealed record MoeCliValues(
     string? Mode = null, string? CacheMib = null, string? Policy = null, string? Cold = null, int? CpuThreads = null,
-    bool CpuMoe = false, int? NCpuMoe = null, bool Calibrate = false, int? ContextTokens = null);
+    bool CpuMoe = false, int? NCpuMoe = null, bool Calibrate = false, int? ContextTokens = null, string? IgpuDevice = null);
 
 /// <summary>
 /// Options for routed-expert offload on a GPU backend (issue #1070, design #1063 section 8b/8d; cold experts on the CPU:
@@ -81,8 +94,11 @@ public sealed record MoeOffloadOptions
     /// <summary>Environment variable for <see cref="Policy"/> (<c>slru</c>, <c>lru</c> or <c>lfu</c>).</summary>
     public const string PolicyEnvVar = "DOTLLM_MOE_CACHE_POLICY";
 
-    /// <summary>Environment variable for <see cref="Cold"/> (<c>auto</c>, <c>copy</c> or <c>cpu</c>).</summary>
+    /// <summary>Environment variable for <see cref="Cold"/> (<c>auto</c>, <c>copy</c>, <c>cpu</c>, <c>igpu</c> or <c>cpu+igpu</c>).</summary>
     public const string ColdEnvVar = "DOTLLM_MOE_COLD";
+
+    /// <summary>Environment variable for <see cref="IgpuDevice"/> (a Vulkan device index or a name substring; #1083).</summary>
+    public const string IgpuDeviceEnvVar = "DOTLLM_MOE_IGPU_DEVICE";
 
     /// <summary>Environment variable for <see cref="CpuThreads"/> (a positive integer).</summary>
     public const string CpuThreadsEnvVar = "DOTLLM_MOE_CPU_THREADS";
@@ -143,6 +159,13 @@ public sealed record MoeOffloadOptions
     public bool Calibrate { get; init; }
 
     /// <summary>
+    /// The Vulkan device of the iGPU cold leg (#1083, <c>--moe-igpu-device</c>): a <c>vkEnumeratePhysicalDevices</c> index or a
+    /// case-insensitive substring of the device name; <see langword="null"/> = the first integrated GPU. An NVIDIA device (the
+    /// CUDA device's vendor) is never used.
+    /// </summary>
+    public string? IgpuDevice { get; init; }
+
+    /// <summary>
     /// Largest share of physical RAM the offloaded expert banks may occupy as a pinned (page-locked) host copy. Above it the
     /// banks stay in the memory-mapped file and reach the device through a small pinned staging ring.
     /// </summary>
@@ -179,8 +202,17 @@ public sealed record MoeOffloadOptions
     /// <summary>Optional sink for load-time notes and warnings (clamped cache size, spill probe results); null = stderr.</summary>
     public Action<string>? Log { get; init; }
 
-    /// <summary>True when offloaded experts may run on the CPU (a cold mode other than copy, or static CPU layers).</summary>
+    /// <summary>
+    /// True when offloaded experts may run off the device (a cold mode other than copy, or static CPU layers): the CPU leg, or the
+    /// iGPU leg with the CPU as its fallback for layers the iGPU cannot read (#1083).
+    /// </summary>
     public bool MayUseCpuLeg => Cold != MoeColdMode.Copy || CpuMoeLayers > 0;
+
+    /// <summary>True when the cold mode may put experts on an integrated GPU (<c>auto</c>, <c>igpu</c>, <c>cpu+igpu</c>; #1083).</summary>
+    public bool MayUseIgpuLeg => Cold is MoeColdMode.Auto or MoeColdMode.Igpu or MoeColdMode.CpuIgpu;
+
+    /// <summary>True when the cold mode requires an integrated GPU (<c>igpu</c>, <c>cpu+igpu</c>): the load fails without one (#1083).</summary>
+    public bool RequiresIgpuLeg => Cold is MoeColdMode.Igpu or MoeColdMode.CpuIgpu;
 
     /// <summary>True when <paramref name="layerIndex"/> is statically placed on the CPU (<see cref="CpuMoeLayers"/>).</summary>
     /// <param name="layerIndex">Model layer index.</param>
@@ -225,6 +257,8 @@ public sealed record MoeOffloadOptions
             o = o with { Cold = ParseCold(cold) };
         if (o.CpuThreads is null && getEnv(CpuThreadsEnvVar) is { Length: > 0 } threads)
             o = o with { CpuThreads = ParsePositive(threads, CpuThreadsEnvVar) };
+        if (o.IgpuDevice is null && getEnv(IgpuDeviceEnvVar) is { Length: > 0 } igpu)
+            o = o with { IgpuDevice = igpu.Trim() };
         if (o.CpuMoeLayers == 0)
             o = o with { CpuMoeLayers = ResolveCpuMoeLayers(false, null, getEnv) };
         if (!o.Calibrate && getEnv(CalibrateEnvVar) is "1" or "true")
@@ -287,17 +321,24 @@ public sealed record MoeOffloadOptions
         _ => throw new ArgumentException($"Unknown MoE cache policy '{value}'. Expected slru, lru or lfu.", nameof(value)),
     };
 
-    /// <summary>Parses <c>auto</c>, <c>copy</c> or <c>cpu</c> (case-insensitive).</summary>
+    /// <summary>Parses <c>auto</c>, <c>copy</c>, <c>cpu</c>, <c>igpu</c> or <c>cpu+igpu</c> (case-insensitive; <c>igpu+cpu</c> too).</summary>
     /// <param name="value">The text.</param>
     /// <returns>The cold mode.</returns>
-    /// <exception cref="ArgumentException">Not one of the three values.</exception>
+    /// <exception cref="ArgumentException">Not one of the values.</exception>
     public static MoeColdMode ParseCold(string value) => value.Trim().ToLowerInvariant() switch
     {
         "auto" => MoeColdMode.Auto,
         "copy" => MoeColdMode.Copy,
         "cpu" => MoeColdMode.Cpu,
-        _ => throw new ArgumentException($"Unknown MoE cold mode '{value}'. Expected auto, copy or cpu.", nameof(value)),
+        "igpu" => MoeColdMode.Igpu,
+        "cpu+igpu" or "igpu+cpu" => MoeColdMode.CpuIgpu,
+        _ => throw new ArgumentException($"Unknown MoE cold mode '{value}'. Expected auto, copy, cpu, igpu or cpu+igpu.", nameof(value)),
     };
+
+    /// <summary>The CLI spelling of <paramref name="mode"/> (<c>cpu+igpu</c> for <see cref="MoeColdMode.CpuIgpu"/>).</summary>
+    /// <param name="mode">The cold mode.</param>
+    /// <returns>The text <see cref="ParseCold"/> accepts.</returns>
+    public static string FormatCold(MoeColdMode mode) => mode == MoeColdMode.CpuIgpu ? "cpu+igpu" : mode.ToString().ToLowerInvariant();
 
     /// <summary>Parses a cache size in MiB: a positive integer, or <c>auto</c> for <see langword="null"/>.</summary>
     /// <param name="value">The text.</param>
@@ -356,6 +397,8 @@ public sealed record MoeOffloadOptions
             o = o with { CpuThreads = threads > 0 ? threads : throw new ArgumentException($"--moe-cpu-threads must be positive, got {threads}.", nameof(values)) };
         else if (getEnv(CpuThreadsEnvVar) is { Length: > 0 } envThreads)
             o = o with { CpuThreads = ParsePositive(envThreads, CpuThreadsEnvVar) };
+
+        if (Pick(values.IgpuDevice, IgpuDeviceEnvVar) is { } igpuDevice) o = o with { IgpuDevice = igpuDevice.Trim() };
 
         if (values.ContextTokens is { } ctx)
             o = o with { ContextTokens = ctx > 0 ? ctx : throw new ArgumentException($"--ctx-size must be positive, got {ctx}.", nameof(values)) };
@@ -419,9 +462,16 @@ public sealed record MoeOffloadOptions
 
     /// <summary>Help text of <c>--moe-cold</c>.</summary>
     public const string ColdHelp =
-        "Where offloaded experts that are not in the VRAM cache run: 'auto' (default: per expert, CPU or copy-to-GPU by a cost " +
-        "model calibrated at load), 'copy' (copy every miss into the cache), 'cpu' (compute every uncached expert on the CPU; " +
-        "an expert enters the cache only when its recent use beats the weakest cached one). Env fallback: " + ColdEnvVar + ".";
+        "Where offloaded experts that are not in the VRAM cache run: 'auto' (default: per expert, copy-to-GPU, CPU or integrated " +
+        "GPU by a cost model calibrated at load; the iGPU only when an integrated Vulkan GPU exists), 'copy' (copy every miss into " +
+        "the cache), 'cpu' (compute every uncached expert on the CPU), 'igpu' (on the integrated GPU, banks read zero-copy from " +
+        "RAM), 'cpu+igpu' (split between the CPU and the iGPU by the calibrated costs). In every mode but copy an expert enters the " +
+        "cache only when its recent use beats the weakest cached one. Env fallback: " + ColdEnvVar + ".";
+
+    /// <summary>Help text of <c>--moe-igpu-device</c>.</summary>
+    public const string IgpuDeviceHelp =
+        "Vulkan device of the MoE iGPU cold leg (--moe-cold igpu / cpu+igpu / auto): an enumeration index or a name substring. " +
+        "Default: the first integrated GPU; an NVIDIA device is never used. Env fallback: " + IgpuDeviceEnvVar + ".";
 
     /// <summary>Help text of <c>--moe-cpu-threads</c>.</summary>
     public const string CpuThreadsHelp =
@@ -441,7 +491,8 @@ public sealed record MoeOffloadOptions
 
     /// <summary>Help text of <c>--moe-calibrate</c>.</summary>
     public const string CalibrateHelp =
-        "Re-run the MoE offload cost calibration (PCIe bandwidth, sync latency, CPU time per expert) instead of reading the cached " +
+        "Re-run the MoE offload cost calibration (PCIe bandwidth, sync latency, CPU and iGPU time per expert, iGPU submit round " +
+        "trip) instead of reading the cached " +
         "record in %LOCALAPPDATA%/dotllm/moe-calibration.json. Env fallback: " + CalibrateEnvVar + "=1.";
 
     /// <summary>Help text of <c>--ctx-size</c>.</summary>
