@@ -135,6 +135,12 @@ public static class ChatCompletionEndpoint
             new DotLLM.Core.Configuration.ThreadingConfig(
                 state.Options.Threads, state.Options.DecodeThreads));
         options = plan.Gate(options with { MaxTokens = effectiveMaxTokens }, ReasoningSupport.UngatedStops);
+        // (#1093) Tell the engine where the generation prompt starts so the recurrent-prefix snapshot lands before it.
+        // Set once here: every dispatch below (scheduler, Generate, streaming) carries these options.
+        options = options with
+        {
+            GenerationPromptSuffix = ReasoningSupport.GenerationPromptSuffix(state.ChatTemplate, messages, templateOptions, prompt),
+        };
 
         // #456: tool_choice was parsed at the top of this method and then DISCARDED — the local
         // had exactly one reference, its own assignment — so required/none/named-function had no

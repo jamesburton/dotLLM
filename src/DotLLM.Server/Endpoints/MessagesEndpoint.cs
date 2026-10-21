@@ -102,7 +102,7 @@ public static class MessagesEndpoint
         // EnsureActiveAsync, Options.ModelId is the active model's key.
         var modelId = state.Options.ModelId;
 
-        string? prompt = BuildPrompt(request, state, out var tools, out bool constrained, out string? templateError);
+        string? prompt = BuildPrompt(request, state, out var tools, out bool constrained, out string? templateError, out string? generationPromptSuffix);
         if (prompt is null)
         {
             await WriteErrorAsync(httpContext, 400, "invalid_request_error", templateError!);
@@ -130,6 +130,8 @@ public static class MessagesEndpoint
             state.EffectiveSamplingDefaults,
             new DotLLM.Core.Configuration.ThreadingConfig(state.Options.Threads, state.Options.DecodeThreads));
         options = plan.Gate(options with { MaxTokens = effectiveMaxTokens }, ReasoningSupport.UngatedStops);
+        // (#1093) Same hint as the OpenAI surface; every dispatch below carries these options.
+        options = options with { GenerationPromptSuffix = generationPromptSuffix };
 
         // tool_choice was parsed and then dropped on the floor (#449): the prompt was built with
         // the tools but nothing constrained or suppressed the model, so `{"type":"tool"}` was
@@ -680,7 +682,7 @@ public static class MessagesEndpoint
     /// </summary>
     private static string? BuildPrompt(
         AnthropicMessagesRequest request, ServerState state, out ToolDefinition[]? tools,
-        out bool constrained, out string? error)
+        out bool constrained, out string? error, out string? generationPromptSuffix, bool wantSuffix = true)
     {
         var messages = ProfileSystemPrompt.Apply(state.ActiveProfile?.System, AnthropicConverter.ToMessages(request));
         tools = AnthropicConverter.ToTools(request.Tools);
@@ -692,8 +694,13 @@ public static class MessagesEndpoint
 
         var options = ReasoningSupport.BuildTemplateOptions(
             tools, request.ThinkingEnabled, reasoningEffort: null, request.ChatTemplateKwargs, constrained);
+        generationPromptSuffix = null;
         if (!ReasoningSupport.TryApply(state.ChatTemplate!, messages, options, out string prompt, out error, out _))
             return null;
+
+        // (#1093) count_tokens has no use for the suffix, so it skips the extra render.
+        if (wantSuffix)
+            generationPromptSuffix = ReasoningSupport.GenerationPromptSuffix(state.ChatTemplate!, messages, options, prompt);
         return prompt;
     }
 
@@ -741,7 +748,7 @@ public static class MessagesEndpoint
             return;
         }
 
-        string? prompt = BuildPrompt(request, state, out _, out _, out string? templateError);
+        string? prompt = BuildPrompt(request, state, out _, out _, out string? templateError, out _, wantSuffix: false);
         if (prompt is null)
         {
             await WriteErrorAsync(httpContext, 400, "invalid_request_error", templateError!);
