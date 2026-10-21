@@ -240,6 +240,66 @@ public static class ServerStartup
         };
     }
 
+    /// <summary>Fitted windows below this many tokens get a loud warning: agent clients cannot work in less.</summary>
+    internal const int SmallContextWarningTokens = 8192;
+
+    /// <summary>
+    /// Issue #1068: chooses the served context for the CUDA hybrid and applies it to the model. Without this the server
+    /// advertised the checkpoint's 262,144 tokens on a 12 GB card that fits a fraction of that, so clients never compacted,
+    /// the KV cache outgrew VRAM, and WDDM spilled it into system RAM (requests went from minutes to hours).
+    /// </summary>
+    /// <param name="model">The loaded, warmed-up model.</param>
+    /// <param name="options">Server options (<see cref="ServerOptions.ContextSize"/>).</param>
+    /// <param name="mtpActive">Whether MTP self-speculation will run.</param>
+    /// <param name="mtpK">MTP draft tokens per round.</param>
+    /// <returns>The model's config after the limit.</returns>
+    internal static ModelConfig ApplyHybridContextFit(
+        DotLLM.Cuda.Architectures.CudaQwen3HybridDenseTransformerModel model, ServerOptions options, bool mtpActive, int mtpK)
+    {
+        var fit = model.MeasureServingContextFit(mtpActive, mtpK + 1);
+        if (fit.SizingError is { } sizingError)
+            Console.WriteLine($"[dotllm] WARNING: the context sizing pass was refused: {sizingError}");
+        int native = model.NativeMaxSequenceLength;
+        int chosen = ChooseServedContext(options.ContextSize, fit.MaxContext, native, out string? warning);
+        if (warning is not null)
+            Console.WriteLine($"[dotllm] WARNING: {warning}");
+        if (chosen < native)
+            model.LimitContextLength(chosen);
+        string kv = model.KvStorageLabel + (mtpActive ? " KV + MTP" : " KV");
+        Console.WriteLine(options.ContextSize is > 0
+            ? $"[dotllm] Context window: {model.Config.MaxSequenceLength} tokens (--ctx-size; {fit.MaxContext} fit in free VRAM: {fit.Describe()}, {kv})."
+            : $"[dotllm] Context window: {model.Config.MaxSequenceLength} of {native} tokens, fitted to free VRAM ({fit.Describe()}, {kv}). " +
+              "Set --ctx-size to override.");
+        return model.Config;
+    }
+
+    /// <summary>
+    /// The served context: an explicit request (capped at the model's window) or the fit; never below one 1024-token granule.
+    /// </summary>
+    /// <param name="requested">The <c>--ctx-size</c> value, or null.</param>
+    /// <param name="fit">Tokens that fit in free VRAM.</param>
+    /// <param name="native">The checkpoint's window.</param>
+    /// <param name="warning">A warning to log, or null.</param>
+    /// <returns>The window to serve.</returns>
+    internal static int ChooseServedContext(int? requested, int fit, int native, out string? warning)
+    {
+        warning = null;
+        if (requested is > 0 and int r)
+        {
+            int chosen = Math.Min(r, native);
+            if (chosen > fit)
+                warning = $"--ctx-size {chosen} exceeds the {fit} tokens that fit in free VRAM. Requests that grow past the fit will be " +
+                          "refused with an out-of-memory error (they are not spilled into system RAM).";
+            return chosen;
+        }
+
+        int served = Math.Clamp(fit, Math.Min(DeviceMemoryBudget.ContextGranularity, native), native);
+        if (fit < SmallContextWarningTokens)
+            warning = $"only {fit} tokens of context fit in free VRAM (serving {served}). Use a smaller KV type " +
+                      "(--kv-quant-k/-v q8_0 or q4_0), --no-mtp, or free GPU memory.";
+        return served;
+    }
+
     private static ServerState LoadModelCore(string resolvedPath, ServerOptions options)
     {
         Console.WriteLine($"[dotllm] Loading model from {resolvedPath}...");
@@ -546,6 +606,10 @@ public static class ServerStartup
         else
             WarmupRunner.Run(generator, tokenizer, options.Warmup);
         prefixCache?.Clear(); // Discard warm-up KV-cache entries
+
+        // Issue #1068: size the CUDA hybrid's served context to free VRAM (after warm-up, so its buffers are counted).
+        if (model is DotLLM.Cuda.Architectures.CudaQwen3HybridDenseTransformerModel hybridDense)
+            config = ApplyHybridContextFit(hybridDense, options, mtpActive, mtpK);
 
         // Continuous-batch scheduler. Enabled when a paged factory is available and speculative
         // decoding is off — the scheduler doesn't support draft models (or MTP self-speculative

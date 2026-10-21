@@ -182,6 +182,15 @@ public sealed record ServerOptions
     /// </summary>
     public int PrefillChunkSize { get; init; }
 
+    /// <summary>
+    /// Served context window in tokens (<c>--ctx-size</c>, llama.cpp <c>-c</c>). Null or 0 (default): models that size their
+    /// own device memory (the CUDA hybrid) fit the window to free VRAM at load and report it in <c>/props</c>; others keep
+    /// the checkpoint's window. A value overrides the fit (capped at the checkpoint's window) and is logged with a warning
+    /// when it exceeds what fits: requests past the fit are then refused with an out-of-memory error rather than spilled
+    /// (issue #1068).
+    /// </summary>
+    public int? ContextSize { get; init; }
+
     /// <summary>Default for <see cref="EffectiveMaxMessages"/> when <see cref="MaxMessages"/> is unset.</summary>
     public const int DefaultMaxMessages = 8192;
 

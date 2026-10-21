@@ -578,6 +578,37 @@ The CUDA hybrid model (Qwen3HybridDense: Bonsai, Qwen3.5/3.6 dense) now refuses 
   another 256 MiB above its post-load level. That catches a spill admission cannot prevent, for example when another
   program takes the VRAM the server was counting on.
 
+### The served context is fitted to free VRAM
+
+The checkpoint's window (262,144 tokens for Bonsai-2) is far more than a 12 GB card holds next to 7 GB of weights, and a
+client that believes it keeps the conversation growing until the KV cache no longer fits. So at load, after warm-up, the
+server runs one prefill tile (and, with MTP, one verify) to allocate every fixed-size buffer, then divides the free VRAM
+left after the reserve by the per-token cost (KV rows in every attention layer under the chosen `--kv-quant-k/-v`, the
+quantized-KV dequant scratch, and the MTP head's KV) and serves that many tokens, rounded down to 1024:
+
+```
+[dotllm] Context window: 26624 of 262144 tokens, fitted to free VRAM (1826 MiB free after load, 256 MiB reserve, 149 MiB fixed, 54.0 KiB/token, q8_0 KV + MTP). Set --ctx-size to override.
+```
+
+`GET /props` reports it as `max_sequence_length`, and requests are validated against it (a prompt past it is rejected as
+`context_length_exceeded`, and `max_tokens` is clamped to what remains), so agent clients such as CodeSharp compact in
+time. `--ctx-size N` (`-c N`) sets the window explicitly, capped at the checkpoint's; a value above the fit is logged as a
+warning, and a request that then outgrows VRAM fails with an out-of-memory error rather than spilling.
+
+Measured on an RTX 3060 12 GB (desktop on the same card) with Bonsai-2 27B PQ2_0-MTP. The window counts the prompt plus
+`max_tokens`:
+
+| Flags | Fitted window | Cost per token |
+|---|---|---|
+| `--kv-quant-k q8_0 --kv-quant-v q8_0` (MTP on) | 26,624 | 54 KiB (KV 34, dequant scratch 4, MTP head 2 x 8) |
+| same, plus `DOTLLM_CUDA_PREFILL_CHUNK=512` | 35,840 | 54 KiB, but ~480 MiB less fixed prefill scratch |
+| `--kv-quant-k q8_0 --kv-quant-v q8_0 --no-mtp` | 53,248 | 38 KiB |
+| f16 KV (MTP on) | 14,336 | 80 KiB |
+
+The 512-token prefill tile costs about 15% of prefill speed. `--no-mtp` doubles the window at the cost of MTP's decode
+speed-up. An agent client that sends a large `max_tokens` (CodeSharp sends 16,384) spends that much of the window on
+the reply, so its prompts must compact well below the window.
+
 ### Turning sysmem fallback off in the driver
 
 For a dedicated inference box, make the driver fail the allocation instead of spilling. In **NVIDIA Control Panel >
