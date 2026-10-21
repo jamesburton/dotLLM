@@ -344,7 +344,8 @@ public sealed partial class TextGenerator
         // the zero-GC-pressure guarantee on the inference hot path.
         int stopTailSize = ComputeStopTailSize(stopConditions);
         char[] stopScratch = ArrayPool<char>.Shared.Rent(stopTailSize);
-        DotLLM.Core.Models.IMtpState? mtpState = useMtp ? resumedMtp ?? CreateMtpState(kvCache) : null;
+        DotLLM.Core.Models.IMtpState? mtpState = useMtp || TracksMtpHead(snapshotAt, cachedTokenCount, resumedMtp, useHybrid)
+            ? resumedMtp ?? CreateMtpState(kvCache) : null;
 
         try
         {
@@ -946,7 +947,8 @@ public sealed partial class TextGenerator
         // normal completion, exception, or consumer-side cancellation (Dispose of the enumerator).
         int stopTailSize = ComputeStopTailSize(stopConditions);
         char[] stopScratch = ArrayPool<char>.Shared.Rent(stopTailSize);
-        DotLLM.Core.Models.IMtpState? mtpState = useMtp ? resumedMtp ?? CreateMtpState(kvCache) : null;
+        DotLLM.Core.Models.IMtpState? mtpState = useMtp || TracksMtpHead(snapshotAt, cachedTokenCount, resumedMtp, useHybrid)
+            ? resumedMtp ?? CreateMtpState(kvCache) : null;
         var generatedIds = new List<int>(maxTokens);
         long prefillTicks = 0;
         long decodeTicks = 0;
@@ -1728,8 +1730,8 @@ public sealed partial class TextGenerator
 
     /// <summary>
     /// Snapshots the recurrent state at <paramref name="boundary"/>, which the prefill has just reached. When the request
-    /// decodes with MTP, its head has absorbed exactly <c>[0, boundary)</c> too, so the entry keeps that head state and a
-    /// mark of it (issue #1088). The head's rows below the mark stay valid for the same reason the trunk's KV rows do: every
+    /// carries the MTP head (it decodes with MTP, or <see cref="TracksMtpHead"/>), the head has absorbed exactly
+    /// <c>[0, boundary)</c> too, so the entry keeps that head state and a mark of it (issue #1088). The head's rows below the mark stay valid for the same reason the trunk's KV rows do: every
     /// later write of this request, and of a hit that resumes it, is at or beyond the boundary. The tiered cache copies
     /// only the trunk, so its hits decode plain.
     /// </summary>
@@ -1745,6 +1747,19 @@ public sealed partial class TextGenerator
         // entry, and the request still runs on both: release only what nothing uses any more.
         old?.Release(keepKv: kvCache, keepMtp: mtpState);
     }
+
+    /// <summary>
+    /// True when a request that decodes plain should still carry the MTP head through its prefill (issue #1088): it takes a
+    /// single-slot prefix snapshot, and a later hit on that snapshot can decode with MTP only if the head absorbed the prefix
+    /// too. Without this, an adaptive gate that sends the first turn of an agent session to plain decode never sees MTP again,
+    /// because every later turn hits. The cost is the head's absorb of this prefill (one extra block per token) and its KV,
+    /// which the context fit already counts when MTP is on. A hit can carry the head only when it resumed one: the head cannot
+    /// start absorbing mid-sequence.
+    /// </summary>
+    private bool TracksMtpHead(int snapshotAt, int cachedTokenCount, IMtpState? resumedMtp, bool useHybrid)
+        => snapshotAt >= 0 && _tieredSnapshots is null && !useHybrid
+           && _mtpEnabled && _draftModel is null && _model.SupportsMtp
+           && (cachedTokenCount == 0 || resumedMtp is not null);
 
     /// <summary>Hands the head state a prefix hit resumed to the request that resolved it (once), or null.</summary>
     private IMtpState? TakeResumedMtpState()
