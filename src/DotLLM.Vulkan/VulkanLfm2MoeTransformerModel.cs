@@ -25,7 +25,7 @@ namespace DotLLM.Vulkan;
 /// Dense prefill uses cooperative matrices when supported, otherwise the portable packed GEMM. Without the required kernels, or with
 /// <c>DOTLLM_VK_Q4_0_NATIVE=0</c>, Q4_0 is transcoded exactly to Q8_0 (8.5 bits per weight, identical decoded weights).</para>
 /// </remarks>
-public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
+public sealed unsafe partial class VulkanLfm2MoeTransformerModel : IModel
 {
     private readonly VulkanDevice _device;
     private readonly GgufFile? _gguf;
@@ -303,7 +303,12 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
     private VulkanLfm2ConvStateCache? ResolveState(ISsmState? s)
     {
         if (s is null) return null;
-        if (s is VulkanLfm2ConvStateCache c && c.NumSsmLayers == _convLayerCount) return c;
+        if (s is VulkanLfm2ConvStateCache c && c.NumSsmLayers == _convLayerCount &&
+            c.StateSlots == _lCache - 1 && c.HiddenSize == Config.HiddenSize && ReferenceEquals(c.Device, _device))
+        {
+            c.ThrowIfDisposed();
+            return c;
+        }
         throw new ArgumentException($"VulkanLfm2MoeTransformerModel requires a {nameof(VulkanLfm2ConvStateCache)} with {_convLayerCount} layers; got {s.GetType().Name}.", nameof(s));
     }
 
@@ -314,7 +319,7 @@ public sealed unsafe class VulkanLfm2MoeTransformerModel : IModel
     public bool RequiresPerSequenceState => true;
 
     /// <inheritdoc/>
-    public bool SupportsThreadedSequenceState => false;
+    public bool SupportsThreadedSequenceState => true;
 
     /// <inheritdoc/>
     public IRecurrentSequenceState? CreateSequenceState()
