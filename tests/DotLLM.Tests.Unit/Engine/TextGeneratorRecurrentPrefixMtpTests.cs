@@ -20,10 +20,10 @@ namespace DotLLM.Tests.Unit.Engine;
 /// </summary>
 public sealed class TextGeneratorRecurrentPrefixMtpTests : IDisposable
 {
-    // The hit prefills only the suffix, the cold run the whole prompt: the CPU GEMM tiles by row count, so the trunk rows
-    // (and the head's inputs) differ by a few ULPs. A head that pairs the suffix with the wrong trunk row, or attends over
-    // missing or foreign rows, is off by orders of magnitude more.
-    private const float DraftLogitTolerance = 1e-3f;
+    // Measured: the hit's draft logits equal the cold run's exactly (max |diff| 0 on every turn). The tolerance only allows
+    // for a CPU whose GEMM tiles the shorter suffix differently. The synthetic head's logits are small, so a wrong head moves
+    // them little: resuming with a stale carry row measured 2e-4 to 7e-4, which a 1e-3 tolerance let through.
+    private const float DraftLogitTolerance = 1e-5f;
 
     private readonly string _scratch;
     private readonly ITestOutputHelper _out;
@@ -97,9 +97,10 @@ public sealed class TextGeneratorRecurrentPrefixMtpTests : IDisposable
         // the snapshot forward, the head no longer covers the new boundary, so the next hit must not resume it.
         var (gguf, config) = Fixture("prefix-mtp-plain-move.gguf");
         using var _ = gguf;
-        using var cachedModel = Load(gguf, config);
+        using var cachedInner = Load(gguf, config);
         using var plainModel = Load(gguf, config);
-        var cached = Generator(cachedModel, Kv(cachedModel), mtp: true, prefixCache: true);
+        var cachedModel = new DraftRecordingModel(cachedInner);
+        var cached = Generator(cachedModel, Kv(cachedInner), mtp: true, prefixCache: true);
         var plain = Generator(plainModel, Kv(plainModel), mtp: false, prefixCache: false);
         int[][] turns = AgentTurns(config.VocabSize);
 
@@ -107,6 +108,8 @@ public sealed class TextGeneratorRecurrentPrefixMtpTests : IDisposable
         var plainHit = cached.Generate(Csv(turns[1]), new InferenceOptions { Temperature = 0f, RepetitionPenalty = 1f, MaxTokens = NewTokens, Logprobs = true });
         Assert.Equal(turns[0].Length - 1, plainHit.Timings.CachedTokenCount);
         Assert.Equal(0, plainHit.Timings.SpeculativeDraftTokens);
+        // The moved snapshot no longer holds the first turn's head, and nothing else does: it is released, not leaked.
+        Assert.True(IsDisposed(Assert.Single(cachedModel.CreatedStates)));
 
         var next = cached.Generate(Csv(turns[2]), Greedy);
 

@@ -90,6 +90,17 @@ internal static class RecurrentPrefixMtpHarness
         {
             cached.ClearRecurrentPrefixCache();
         }
+
+        // Every head state the cached generator made is released once the snapshot is: none leaked across the turns.
+        Assert.NotEmpty(cachedModel.CreatedStates);
+        Assert.All(cachedModel.CreatedStates, s => Assert.True(IsDisposed(s), "an MTP head state outlived the prefix cache"));
+    }
+
+    /// <summary>True when <paramref name="state"/> has been disposed (its <see cref="IMtpState.MarkPrefix"/> throws).</summary>
+    public static bool IsDisposed(IMtpState state)
+    {
+        try { state.MarkPrefix(); return false; }
+        catch (ObjectDisposedException) { return true; }
     }
 
     /// <summary>Prompts are comma-separated token ids; no EOS, so every turn generates <see cref="NewTokens"/> tokens.</summary>
@@ -113,6 +124,9 @@ internal static class RecurrentPrefixMtpHarness
     public sealed class DraftRecordingModel(IModel inner) : IModel
     {
         public List<float[]> Drafts { get; } = [];
+
+        /// <summary>Every head state this model created, in order.</summary>
+        public List<IMtpState> CreatedStates { get; } = [];
 
         public ModelConfig Config => inner.Config;
         public long ComputeMemoryBytes => inner.ComputeMemoryBytes;
@@ -140,7 +154,12 @@ internal static class RecurrentPrefixMtpHarness
         public bool TrySetAllRowLogitsLimit(int maxSeqLen) => inner.TrySetAllRowLogitsLimit(maxSeqLen);
         public int PreferredPrefillChunkTokens => inner.PreferredPrefillChunkTokens;
         public IMtpState? CreateMtpState() => inner.CreateMtpState();
-        public IMtpState? CreateMtpState(int maxSequenceLength) => inner.CreateMtpState(maxSequenceLength);
+        public IMtpState? CreateMtpState(int maxSequenceLength)
+        {
+            var state = inner.CreateMtpState(maxSequenceLength);
+            if (state is not null) CreatedStates.Add(state);
+            return state;
+        }
 
         public unsafe ITensor ForwardMtp(IMtpState state, int tokenId, int position)
         {
