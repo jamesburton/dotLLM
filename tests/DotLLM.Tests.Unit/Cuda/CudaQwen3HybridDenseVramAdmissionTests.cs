@@ -62,7 +62,7 @@ public sealed class CudaQwen3HybridDenseVramAdmissionTests : IDisposable
         using var l = Load(withMtp: false);
         var model = l.Model;
         using var kv = model.CreateKvCache(16);
-        CudaQwen3HybridDenseTransformerModel.FreeVramOverride = Reserve + model.ComputeKvBytes(16) + 1024;
+        CudaQwen3HybridDenseTransformerModel.FreeVramOverride = Reserve + model.KvStorageGrowthBytes(16) + 1024;   // #1080: what the KV adds
         var ex = Assert.Throws<DeviceMemoryAdmissionException>(
             () => model.Forward([1, 4, 7], [0, 1, 2], deviceId: -1, kv, lastTokenLogitsOnly: true));
         Assert.Contains("F32 attention staging", ex.Message);
