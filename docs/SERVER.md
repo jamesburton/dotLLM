@@ -696,6 +696,29 @@ already sent the cold turns to plain.
 Peak GPU memory was 10,597 / 78 MiB before and 10,807 / 78 MiB after (dedicated / shared), against 9,379 / 76 MiB idle.
 On a card where MTP pays at agent-length contexts, the hit turns now keep it.
 
+**Time to first token on hit turns (PR #1091 review).** Feeding the head through a turn's prefill is not free: the CUDA
+absorb measured about 0.2 ms per prompt token on this card (3% of the trunk's prefill). In the first push of #1091, every
+plain turn that took the snapshot fed the head, so every hit turn paid it even after the gate had measured plain decode
+faster. A plain turn now feeds the head only while the gate forecasts MTP for a coming request
+(`MtpAdaptiveGate.LikelyUsesMtpNext`). Interleaved replay on the T5500 (default gate, q8_0 KV, MTP on; the assistant
+replies in the history are fixed text, so every build sees identical prompts; mean ± SD of TTFT in seconds over 6 `dev`
+runs and 4 runs of each branch build, alternating the build order every round):
+
+| turn | prompt / cached | `dev` @ 257605eb | first push | with the gated feed | first push - `dev` | gated feed - `dev` |
+|---|---|---|---|---|---|---|
+| 0 | 2,928 / 0 | 19.1 ± 0.9 | 20.3 ± 0.3 | 20.1 ± 0.4 | +1.2 | +1.1 |
+| 1 | 7,012 / 2,927 (`dev`: 0) | 51.5 ± 2.9 | 31.7 ± 0.4 | 31.6 ± 0.6 | -19.8 | -19.9 |
+| 2 | 10,376 / 7,011 | 25.3 ± 0.9 | 26.7 ± 0.3 | 25.8 ± 0.4 | +1.4 | +0.6 |
+| 3 | 14,388 / 10,375 | 30.0 ± 0.8 | 31.8 ± 0.2 | 30.6 ± 0.6 | +1.7 | +0.6 |
+| 4 | 17,750 / 14,387 | 26.2 ± 0.7 | 27.4 ± 0.4 | 26.6 ± 0.6 | +1.2 | +0.3 |
+| 5 | 22,449 / 17,749 | 37.2 ± 1.1 | 38.8 ± 0.5 | 37.6 ± 0.8 | +1.6 | +0.3 |
+
+- Turn 1 now hits, 20 s sooner. Its MTP exploration still pays the head's absorb, which is why turn 0 (a cold turn that
+  feeds the head so turn 1 can explore MTP) is about 1 s slower.
+- Hit turns 2-5 are within run-to-run noise of `dev`. The gate measured plain faster after turn 1, so the session's
+  later hits decode plain without a head, as on `dev`.
+- Shared GPU memory stayed at idle (78 MiB peak against 76 idle) in every run.
+
 ### Turning sysmem fallback off in the driver
 
 For a dedicated inference box, make the driver fail the allocation instead of spilling. In **NVIDIA Control Panel >
