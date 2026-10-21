@@ -147,16 +147,20 @@ public static class MoeCalibrationStore
     /// <summary>The record cached for <paramref name="key"/>, or null.</summary>
     /// <param name="path">Cache file.</param>
     /// <param name="key">The key.</param>
-    /// <returns>The record, or null when absent or unreadable.</returns>
+    /// <returns>The record, or null when absent, unreadable, written by another format <see cref="Version"/>, or holding a
+    /// measurement no cost model can use (a non-positive or non-finite bandwidth, latency or CPU time).</returns>
     public static MoeCalibrationRecord? TryLoad(string path, MoeCalibrationKey key)
     {
         try
         {
             if (!File.Exists(path)) return null;
             using var doc = JsonDocument.Parse(File.ReadAllBytes(path));
+            if (!doc.RootElement.TryGetProperty("version", out var v) || v.ValueKind != JsonValueKind.Number
+                || v.GetInt32() != Version) return null;
             if (!doc.RootElement.TryGetProperty("entries", out var entries) || entries.ValueKind != JsonValueKind.Object) return null;
             if (!entries.TryGetProperty(key.ToString(), out var e) || e.ValueKind != JsonValueKind.Object) return null;
-            return Parse(e);
+            var r = Parse(e);
+            return IsUsable(r) ? r : null;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException
             or FormatException or KeyNotFoundException)
@@ -205,7 +209,7 @@ public static class MoeCalibrationStore
                 w.WriteEndObject();
             }
             Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
-            string tmp = path + ".tmp";
+            string tmp = $"{path}.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp";   // concurrent writers never share it
             File.WriteAllBytes(tmp, ms.ToArray());
             File.Move(tmp, path, overwrite: true);
             return true;
@@ -239,6 +243,14 @@ public static class MoeCalibrationStore
             w.WriteEndObject();
         }
         return Encoding.UTF8.GetString(ms.ToArray());
+    }
+
+    // A cached zero bandwidth would make every copy infinitely expensive (every cold expert to the CPU); re-measure instead.
+    private static bool IsUsable(MoeCalibrationRecord r)
+    {
+        static bool Pos(double x) => double.IsFinite(x) && x > 0;
+        return Pos(r.H2DBytesPerSecond) && double.IsFinite(r.SyncRoundTripUs) && r.SyncRoundTripUs >= 0
+            && r.Layouts.All(t => Pos(t.CpuUs1) && Pos(t.CpuUs8));
     }
 
     private static MoeCalibrationRecord Parse(JsonElement e)

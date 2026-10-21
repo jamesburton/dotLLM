@@ -75,6 +75,26 @@ public sealed class MoeCalibrationTests : IDisposable
     }
 
     [Fact]
+    public void Store_MissesOnAnotherFormatVersion_AndOnUnusableMeasurements()
+    {
+        string path = Path.Combine(_dir, "v", "moe-calibration.json");
+        var a = new MoeCalibrationKey("gpuA", "bus", "cpu", "a.gguf", 1, 2, 3);
+        Assert.True(MoeCalibrationStore.TrySave(path, a, Record()));
+        string json = File.ReadAllText(path);
+        Assert.Contains($"\"version\": {MoeCalibrationStore.Version}", json, StringComparison.Ordinal);
+
+        File.WriteAllText(path, json.Replace($"\"version\": {MoeCalibrationStore.Version}",
+            $"\"version\": {MoeCalibrationStore.Version + 1}", StringComparison.Ordinal));
+        Assert.Null(MoeCalibrationStore.TryLoad(path, a));
+
+        Assert.True(MoeCalibrationStore.TrySave(path, a, Record(h2d: 0)));
+        Assert.Null(MoeCalibrationStore.TryLoad(path, a));
+        Assert.True(MoeCalibrationStore.TrySave(path, a, Record()));
+        Assert.NotNull(MoeCalibrationStore.TryLoad(path, a));
+        Assert.Empty(Directory.GetFiles(Path.GetDirectoryName(path)!, "*.tmp"));
+    }
+
+    [Fact]
     public void Record_FitsTheCostModel_AndReportsCoverage()
     {
         var r = Record();
