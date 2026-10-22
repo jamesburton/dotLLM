@@ -144,7 +144,7 @@ public sealed class VulkanQwen3HybridDenseF16KvTests : IDisposable
 
     /// <summary>
     /// The scheduler's <c>ForwardBatch</c> over two F16 sequences gives each the logits its own serial <c>Forward</c> run does, bit for
-    /// bit: the batched path writes and reads each sequence's F16 cache with the same kernels.
+    /// bit: the batched path writes and reads each sequence's F16 cache with the same kernels (serial batch loop).
     /// </summary>
     [SkippableFact]
     public void ForwardBatch_TwoF16Sequences_MatchSerialForward()
@@ -185,7 +185,13 @@ public sealed class VulkanQwen3HybridDenseF16KvTests : IDisposable
                     };
                 }
 
-                var results = f.Model.ForwardBatch(requests, deviceId: -1);
+                // The serial batch loop (DOTLLM_VK_BATCH_FUSE=0): the fused one stacks the projection GEMMs, which is not
+                // bit-identical by design (#687) and has nothing to do with the KV.
+                string? savedFuse = Environment.GetEnvironmentVariable("DOTLLM_VK_BATCH_FUSE");
+                Environment.SetEnvironmentVariable("DOTLLM_VK_BATCH_FUSE", "0");
+                IReadOnlyList<ITensor> results;
+                try { results = f.Model.ForwardBatch(requests, deviceId: -1); }
+                finally { Environment.SetEnvironmentVariable("DOTLLM_VK_BATCH_FUSE", savedFuse); }
                 try
                 {
                     for (int s = 0; s < prompts.Length; s++) batched[s].Add(LastRow(results[s]));

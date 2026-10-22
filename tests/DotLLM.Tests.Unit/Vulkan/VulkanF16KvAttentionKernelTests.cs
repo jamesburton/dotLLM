@@ -42,19 +42,32 @@ public sealed class VulkanF16KvAttentionKernelTests
     /// <param name="numKvHeads">KV heads.</param>
     /// <param name="headDim">Head width.</param>
     /// <param name="positionOffset">The query's absolute position.</param>
+    /// <param name="gqa">Take the GQA-grouped pass (one workgroup per KV head) instead of the per-query-head pass.</param>
     [SkippableTheory]
-    [InlineData(777, 24, 4, 256, 776)]   // Bonsai 2 shape, ragged last split
-    [InlineData(1000, 8, 4, 256, 600)]   // query mid-cache: the masked tail spans later splits
-    [InlineData(4100, 24, 4, 256, 4099)] // splits wider than the 256-row tile
-    [InlineData(301, 6, 2, 64, 300)]     // a small head: lanes cover several elements per word pair
-    public void SplitKv_Decode_ReadsF16InPlace(int seqKv, int numHeads, int numKvHeads, int headDim, int positionOffset)
+    [InlineData(777, 24, 4, 256, 776, false)]   // Bonsai 2 shape, ragged last split
+    [InlineData(1000, 8, 4, 256, 600, false)]   // query mid-cache: the masked tail spans later splits
+    [InlineData(4100, 24, 4, 256, 4099, false)] // splits wider than the 256-row tile
+    [InlineData(301, 6, 2, 64, 300, false)]     // a small head: lanes cover several elements per word pair
+    [InlineData(777, 24, 4, 256, 776, true)]
+    [InlineData(1000, 8, 4, 256, 600, true)]
+    [InlineData(4100, 24, 4, 256, 4099, true)]  // splits wider than the grouped pass's 128-row tile
+    [InlineData(301, 6, 2, 64, 300, true)]
+    [InlineData(333, 32, 4, 128, 332, true)]    // the largest group the grouped pass serves (8)
+    public void SplitKv_Decode_ReadsF16InPlace(int seqKv, int numHeads, int numKvHeads, int headDim, int positionOffset, bool gqa)
     {
         Assert.True(VulkanSplitKvAttentionKernel.WouldSplit(seqKv, numHeads));
         RunParity(1, seqKv, numHeads, numKvHeads, headDim, positionOffset, AbsTol, RelTol,
             (device, spvDir, storage) =>
             {
                 var kernel = VulkanSplitKvAttentionKernel.Create(device, spvDir, storage);
-                return (kernel, (q, k, v, o) => kernel.Launch(q, k, v, o, 1, seqKv, numHeads, numKvHeads, headDim, positionOffset));
+                kernel.PreferGqa = gqa;
+                Assert.Equal(gqa, kernel.UsesGqa(numHeads, numKvHeads, headDim));
+                return (kernel, (q, k, v, o) =>
+                {
+                    long before = kernel.GqaDispatches;
+                    kernel.Launch(q, k, v, o, 1, seqKv, numHeads, numKvHeads, headDim, positionOffset);
+                    Assert.Equal(gqa ? before + 1 : before, kernel.GqaDispatches);
+                });
             });
     }
 

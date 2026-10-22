@@ -226,9 +226,23 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     {
         if (NarrowKv is { } existing && existing.Storage == storage) return existing;
         var made = VulkanNarrowKvAttentionKernels.Create(_device!, _spvDir!, headDim, storage);
+        if (_gqaDecode) made.SplitKvAttention?.EnableGqaByDefault();
         NarrowKv?.Dispose();
         NarrowKv = made;
         return made;
+    }
+
+    private bool _gqaDecode;
+
+    /// <summary>
+    /// Opts this host's split-KV decode kernels (the F32 set and any narrow set) into the GQA-grouped pass (issue #1102), which
+    /// reads each cached K / V element once per KV head instead of once per query head. <c>DOTLLM_VULKAN_SPLITKV_GQA</c> still wins.
+    /// </summary>
+    internal void EnableGqaDecode()
+    {
+        _gqaDecode = true;
+        SplitKvAttention?.EnableGqaByDefault();
+        NarrowKv?.SplitKvAttention?.EnableGqaByDefault();
     }
 
     /// <summary>Split-KV attention with per-row query offsets for 2..8-row verify forwards (null when its SPIR-V is missing or split decode is disabled).</summary>

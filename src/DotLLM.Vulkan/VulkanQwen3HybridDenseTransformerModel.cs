@@ -214,6 +214,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         _state = state;
         _gdnCache = gdnCache;
         _kernels = kernels;
+
+        // Issue #1102: Bonsai 2's 24 query heads share 4 KV heads; the grouped decode pass reads each cached row once, not 6 times.
+        _kernels.EnableGqaDecode();
         _layout = config.HybridLayout!;
         _gdn = config.GdnConfig!.Value;
         _kvSlotForLayer = kvSlotForLayer;

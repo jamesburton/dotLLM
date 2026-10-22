@@ -161,15 +161,22 @@ public class VulkanSplitKvAttentionKernelTests
         device.Upload(kh.AsSpan(), bufK);
         device.Upload(vh.AsSpan(), bufV);
 
-        kernel.Launch(bufQ, bufK, bufV, bufOut,
-            seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset,
-            slidingWindow: slidingWindow, useAlibi: useAlibi,
-            softCap: softCap, maskMode: maskMode, prefixLen: prefixLen);
+        // Issue #1102: both split passes, the per-query-head one and (where the shape allows) the GQA-grouped one, against the
+        // same CPU reference at the same tolerance.
+        foreach (bool gqa in new[] { false, true })
+        {
+            kernel.PreferGqa = gqa;
+            if (gqa && !kernel.UsesGqa(numHeads, numKvHeads, headDim)) continue;
+            kernel.Launch(bufQ, bufK, bufV, bufOut,
+                seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset,
+                slidingWindow: slidingWindow, useAlibi: useAlibi,
+                softCap: softCap, maskMode: maskMode, prefixLen: prefixLen);
 
-        float[] actual = new float[expected.Length];
-        device.Download(bufOut, actual);
+            float[] actual = new float[expected.Length];
+            device.Download(bufOut, actual);
 
-        AssertClose(expected, actual, seqQ, seqKv, numHeads, numKvHeads, headDim);
+            AssertClose(expected, actual, seqQ, seqKv, numHeads, numKvHeads, headDim);
+        }
     }
 
     private static float[] RandomFloats(Random rng, int count)
