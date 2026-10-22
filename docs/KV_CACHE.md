@@ -129,6 +129,22 @@ dotllm bench <bonsai> --device vulkan --kv-quant-k f32 --kv-quant-v f32   # expl
   refused at startup with a message, never stored as something else. **F16 is the default** (#1107: no F32 KV on hot
   paths). F32 is the explicit A/B and parity baseline only: `--cache-type-k/-v f32` on `run` / `bench`, or `DOTLLM_VK_KV=f32`
   (the server cannot tell an explicit `f32` from its option default).
+- **Measured on Strix** (`serve --device vulkan --no-mtp`, one session grown by ~8k-token turns with `scripts/session-growth.py`,
+  64 generated tokens per turn; prefix reuse on every turn after the first; no device loss to 128k with #1100's submit budget):
+
+  | context | decode tok/s, F32 KV | decode tok/s, F16 KV | prefill tok/s (new turn), F16 |
+  |---|---|---|---|
+  | 7.8k | 19.6 | 21.2 | 179 |
+  | 32.9k | 12.6 | 15.9 | 66 |
+  | 64.3k | 8.7 | 12.0 | 38 |
+  | 128.3k | 5.4 | **8.1** | 21 |
+
+  Process private bytes grew 134 KiB/token with F32 and 70 KiB/token with F16: the cache is 128 vs 64 KiB/token, plus the lazy
+  growth headroom. Both arms ran the GQA-grouped decode pass. In the per-layer kernel bench (ATTENTION.md) the per-query-head
+  pass is within 5 % of it for F32, so the F32 column is close to the old default.
+
+  The F16 arm ran the paired-load variant of that pass (#1113). The shipped per-element pass measures 6.13 instead of 5.37 ms
+  per layer at 128k, about 12 ms more per token (16 layers), so expect ~7.4 tok/s at 128k with the shipped kernels.
 - **Accuracy.** F16 rounds each K / V element once (relative error ≤ 2⁻¹¹). On the synthetic fixture the logits stay
   within the tolerance the Vulkan forward is held to against the CPU reference (abs 5e-3 + rel 1e-3).
 
