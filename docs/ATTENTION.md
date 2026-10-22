@@ -338,15 +338,16 @@ The dense hybrid host (`VulkanQwen3HybridDenseTransformerModel`, Bonsai 2) can s
 
   | Strix (8060S) | 8k | 32k | 64k | 128k | 128k unique GB/s |
   |---|---|---|---|---|---|
-  | F32, per-query-head | 0.64 | 2.52 | 4.92 | 10.00 | 107 |
-  | F32, GQA-grouped | 0.65 | 2.45 | 4.70 | 9.08 | 118 |
-  | F16, per-query-head | 0.54 | 2.36 | 4.64 | 9.38 | 57 |
-  | **F16, GQA-grouped** | **0.34** | **1.41** | **2.71** | **5.37** | 100 |
+  | F32, per-query-head | 0.69 | 2.48 | 4.89 | 9.62 | 112 |
+  | F32, GQA-grouped | 0.67 | 2.41 | 4.67 | 9.12 | 118 |
+  | F16, per-query-head | 0.53 | 2.35 | 4.63 | 9.26 | 58 |
+  | **F16, GQA-grouped** | **0.39** | **1.59** | **3.09** | **6.13** | 88 |
 
   F16 alone does not help the per-query-head pass: its six re-reads per KV head are served from cache, and the pass is
-  bound by issue, not DRAM. F16 needs the grouped pass to pay off. Together they are 1.86x faster than F32 at 128k, at about
-  100 GB/s of unique KV, close to the ~115 GB/s the F32 arms reach. Decode attention is now bandwidth-bound, which is what
-  q8_0 KV (the follow-up) would halve. On the Arc (8k / 32k) the grouped pass is 1.55-1.7x faster for both formats, and F16
+  bound by issue, not DRAM. F16 needs the grouped pass to pay off. Together they are 1.57x faster than F32 at 128k (88 GB/s of unique KV, against
+  the ~115 GB/s the F32 arms reach). A variant loading element pairs (one F16 word per lane) reached 5.37 ms / 100 GB/s on
+  Strix but computed wrong results on the Arc (Intel) and was withdrawn; it is a follow-up. Halving the bytes again is
+  what q8_0 KV (the next follow-up) would do. On the Arc (8k / 32k) the grouped pass is 1.55-1.7x faster for both formats, and F16
   adds little there: that decode is compute-bound.
 - **Mutants** (shader edits, run on Strix): swapping the half select, reading word `i` instead of `i >> 1`, and a
   `hq % numKvHeads` head broadcast in the F16 split-KV body. Each fails every test of the family it touches, and the

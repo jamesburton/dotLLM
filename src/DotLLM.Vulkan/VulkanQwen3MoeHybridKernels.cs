@@ -245,6 +245,15 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         NarrowKv?.SplitKvAttention?.EnableGqaByDefault();
     }
 
+    /// <summary>Test hook: forces the grouped decode pass on or off for every split-KV kernel of this set.</summary>
+    /// <param name="on">Whether the grouped pass may run.</param>
+    internal void SetGqaDecodeForTest(bool on)
+    {
+        _gqaDecode = on;
+        if (SplitKvAttention is { } f32) f32.PreferGqa = on;
+        if (NarrowKv?.SplitKvAttention is { } narrow) narrow.PreferGqa = on;
+    }
+
     /// <summary>Split-KV attention with per-row query offsets for 2..8-row verify forwards (null when its SPIR-V is missing or split decode is disabled).</summary>
     public VulkanSplitKvRowsAttentionKernel? SplitKvRowsAttention { get; private set; }
     public SwiGluF32Kernel SwiGlu { get; }

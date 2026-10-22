@@ -170,6 +170,10 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     /// </summary>
     internal int KvBufferInvalidationsForTest { get; private set; }
 
+    /// <summary>Test hook (issue #1102): forces the GQA-grouped split-KV decode pass on or off.</summary>
+    /// <param name="on">Whether the grouped pass may run.</param>
+    internal void SetGqaDecodeForTest(bool on) => _kernels.SetGqaDecodeForTest(on);
+
     /// <summary>Test hook (issue #1102): F32-to-F16 convert dispatches recorded for F16 KV rows.</summary>
     internal long F16KvRowWritesForTest => _kernels.NarrowKv?.Writer.Dispatches ?? 0;
 
