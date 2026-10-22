@@ -541,7 +541,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         // Longer prefills pack layers into submissions up to a GPU-time budget (issue #1100; see SubmitSchedule).
         int kvEnd = kvCache is VulkanNemotronHKvCache ? VulkanNemotronHKvCache.PositionsEnd(positions) : seqLen;
         var schedule = BeginSubmitSchedule(seqLen,
-            VulkanPrefillSubmitBudget.AttentionGflops(seqLen, kvEnd, numHeads, headDim));
+            VulkanPrefillSubmitBudget.AttentionGflops(VulkanPrefillSubmitBudget.EffectiveRows(seqLen), kvEnd, numHeads, headDim));
         bool fuse = schedule.Fuse;
         bool open = false;   // a command buffer is currently being recorded (not yet submitted)
         VulkanMtpState? mtpCapture = _mtpHead is not null ? mtpState as VulkanMtpState : null;
@@ -1305,6 +1305,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         {
             int len = offsets[i + 1] - offsets[i];
             int end = VulkanNemotronHKvCache.PositionsEnd(positionsAll.AsSpan(offsets[i], len));
+            // Per sequence at its own length: a batch of short sequences still fills the GPU as a whole.
             batchAttentionGflops += VulkanPrefillSubmitBudget.AttentionGflops(len, end, numHeads, headDim);
             batchKvEnd = Math.Max(batchKvEnd, end);
         }
