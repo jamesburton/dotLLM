@@ -122,4 +122,12 @@ public record InferenceOptions
 
     /// <summary>CPU threading configuration for parallel inference. Default: auto (all cores).</summary>
     public ThreadingConfig Threading { get; init; } = ThreadingConfig.Auto;
+
+    /// <summary>
+    /// The text the chat template appended to the prompt as its generation prompt (e.g. <c>&lt;|im_start|&gt;assistant\n</c>),
+    /// or <see langword="null"/> when unknown (raw completions, or a template that cannot render without it). A recurrent
+    /// model's prefix snapshot then lands just before it, so the next turn of the conversation reuses this whole turn even
+    /// when it re-renders the generation prompt differently (issue #1093). Null keeps the previous snapshot placement.
+    /// </summary>
+    public string? GenerationPromptSuffix { get; init; }
 }

@@ -166,6 +166,36 @@ internal static class ReasoningSupport
         }
     }
 
+    /// <summary>
+    /// The text the chat template appends after the last message when the generation prompt is on
+    /// (e.g. <c>&lt;|im_start|&gt;assistant\n&lt;think&gt;\n</c>), or <see langword="null"/> when it cannot be
+    /// determined. The engine places its recurrent-prefix snapshot just before this suffix so the next
+    /// turn's prompt continues from it (#1093).
+    /// </summary>
+    /// <param name="template">The chat template.</param>
+    /// <param name="messages">The messages that produced <paramref name="prompt"/>.</param>
+    /// <param name="options">The options that produced <paramref name="prompt"/> (generation prompt on).</param>
+    /// <param name="prompt">The prompt rendered with the generation prompt on.</param>
+    /// <returns>
+    /// <paramref name="prompt"/> minus the same render with the generation prompt off, when that render is
+    /// a strict prefix of it; otherwise <see langword="null"/> (also when the second render throws).
+    /// </returns>
+    internal static string? GenerationPromptSuffix(
+        IChatTemplate template, IReadOnlyList<ChatMessage> messages, ChatTemplateOptions options, string prompt)
+    {
+        try
+        {
+            string bare = template.Apply(messages, options with { AddGenerationPrompt = false });
+            return prompt.Length > bare.Length && prompt.StartsWith(bare, StringComparison.Ordinal)
+                ? prompt[bare.Length..]
+                : null;
+        }
+        catch (JinjaException)
+        {
+            return null;
+        }
+    }
+
     /// <summary>Whether tool_choice will install a decoding constraint (mirrors <c>ToolChoiceBinder.Apply</c>).</summary>
     internal static bool ToolChoiceConstrains(
         ToolChoice toolChoice, ToolDefinition[]? tools, IToolCallParser? modelParser)
