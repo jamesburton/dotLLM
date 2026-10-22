@@ -48,10 +48,23 @@ public static class CudaGemm
     /// Linear projection: Y_f16[m, n] = X_f16[m, k] × W_f16^T.
     /// FP32 accumulation by default; FP16 accumulation when DOTLLM_CUDA_GEMM_16F=1 (G1 experiment).
     /// </summary>
+    /// <param name="handle">cuBLAS handle.</param>
+    /// <param name="xF16">FP16 activations, row-major [m, k].</param>
+    /// <param name="wF16">FP16 weights, row-major [n, k].</param>
+    /// <param name="yF16">FP16 output, row-major [m, n] with row stride <paramref name="ldy"/>.</param>
+    /// <param name="m">Rows of X (tokens).</param>
+    /// <param name="k">Contraction length.</param>
+    /// <param name="n">Rows of W (output features).</param>
+    /// <param name="stream">CUDA stream.</param>
+    /// <param name="ldy">
+    /// Output row stride in elements; <c>0</c> means <paramref name="n"/> (dense). A larger stride
+    /// writes a column block of a wider output (issue #1099's row-tiled LM head).
+    /// </param>
     public static unsafe void LinearF16(nint handle, nint xF16, nint wF16, nint yF16,
-                                          int m, int k, int n, nint stream)
+                                          int m, int k, int n, nint stream, int ldy = 0)
     {
         CublasApi.cublasSetStream_v2(handle, stream).ThrowOnCublasError();
+        if (ldy == 0) ldy = n;
 
         if (Use16FCompute)
         {
@@ -64,7 +77,7 @@ public static class CudaGemm
                 wF16, CublasApi.CUDA_R_16F, k,
                 xF16, CublasApi.CUDA_R_16F, k,
                 (nint)(&halfZero),
-                yF16, CublasApi.CUDA_R_16F, n,
+                yF16, CublasApi.CUDA_R_16F, ldy,
                 CublasApi.CUBLAS_COMPUTE_16F,
                 CublasApi.CUBLAS_GEMM_DEFAULT
             ).ThrowOnCublasError();
@@ -82,7 +95,7 @@ public static class CudaGemm
             wF16, CublasApi.CUDA_R_16F, k,
             xF16, CublasApi.CUDA_R_16F, k,
             (nint)(&beta),
-            yF16, CublasApi.CUDA_R_16F, n,
+            yF16, CublasApi.CUDA_R_16F, ldy,
             CublasApi.CUBLAS_COMPUTE_32F,
             CublasApi.CUBLAS_GEMM_DEFAULT
         ).ThrowOnCublasError();
@@ -102,10 +115,12 @@ public static class CudaGemm
     /// <param name="k">Contraction length.</param>
     /// <param name="n">Rows of W (output features).</param>
     /// <param name="stream">CUDA stream.</param>
+    /// <param name="ldy">Output row stride in elements; <c>0</c> means <paramref name="n"/> (dense).</param>
     public static unsafe void LinearF16InF32Out(nint handle, nint xF16, nint wF16, nint yF32,
-                                                 int m, int k, int n, nint stream)
+                                                 int m, int k, int n, nint stream, int ldy = 0)
     {
         CublasApi.cublasSetStream_v2(handle, stream).ThrowOnCublasError();
+        if (ldy == 0) ldy = n;
 
         float alpha = FloatOne;
         float beta = FloatZero;
@@ -118,7 +133,7 @@ public static class CudaGemm
             wF16, CublasApi.CUDA_R_16F, k,
             xF16, CublasApi.CUDA_R_16F, k,
             (nint)(&beta),
-            yF32, CublasApi.CUDA_R_32F, n,
+            yF32, CublasApi.CUDA_R_32F, ldy,
             CublasApi.CUBLAS_COMPUTE_32F,
             CublasApi.CUBLAS_GEMM_DEFAULT
         ).ThrowOnCublasError();
