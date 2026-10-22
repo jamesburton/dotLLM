@@ -715,7 +715,9 @@ above, and on the Vulkan hybrid `--ctx-size` now lowers the window too (`[dotllm
 (--ctx-size).`); before #1101 Vulkan ignored the flag. The KV caches grow up to that window and no further.
 
 Cost: YaRN's rotation itself is free, but it also scales every position by `0.1·ln 4 + 1 = 1.139`, so short prompts produce
-slightly different output. Leave it off unless a session will pass 262,144 tokens. The KV is the real cost: F32
+slightly different output. Measured on Bonsai-2 (CUDA, wikitext-2, 16 × 512-token windows): perplexity 10.8345 off vs
+10.8297 on (±0.47), and greedy text that diverges after a few dozen tokens while staying coherent. Leave it off unless a
+session will pass 262,144 tokens. The KV is the real cost: F32
 128 KiB/token (300k ≈ 37 GiB, 1M = 128 GiB), F16 64 KiB/token, q8_0 about 34 KiB/token. See `docs/POSITION_ENCODING.md`
 for the math and `scripts/needle-in-haystack.py` for a retrieval check.
 
