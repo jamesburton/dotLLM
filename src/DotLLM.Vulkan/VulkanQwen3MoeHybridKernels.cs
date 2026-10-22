@@ -232,6 +232,49 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         return made;
     }
 
+    /// <summary>Gets or sets a value indicating whether <see cref="EnsureGqaFlash"/> returns null (an A/B and test switch).</summary>
+    internal bool GqaFlashDisabled { get; set; }
+
+    /// <summary>Gets the GQA-grouped prefill dispatches recorded so far, both KV formats.</summary>
+    internal long GqaFlashDispatches => (_gqaFlashF32?.Dispatches ?? 0) + (_gqaFlashF16?.Dispatches ?? 0);
+
+    private VulkanFlashAttentionGqaKernel? _gqaFlashF32;
+    private VulkanFlashAttentionGqaKernel? _gqaFlashF16;
+    private bool _gqaFlashF32Tried;
+    private bool _gqaFlashF16Tried;
+
+    /// <summary>
+    /// Returns the GQA-grouped tiled prefill attention for <paramref name="storage"/> (issue #441), building it on first use, or null
+    /// when it is disabled (<see cref="VulkanFlashAttentionGqaKernel.DisableEnvVar"/>, the flash opt-out), unavailable on this device,
+    /// or not worth it for this head width: heads of 128 or less keep the per-head flash kernels, which serve them well.
+    /// </summary>
+    /// <param name="storage">The KV storage the host's cache uses.</param>
+    /// <param name="headDim">The model's per-head dimension.</param>
+    /// <returns>The kernel, or null.</returns>
+    internal VulkanFlashAttentionGqaKernel? EnsureGqaFlash(VulkanKvStorage storage, int headDim)
+    {
+        if (GqaFlashDisabled) return null;
+        if (headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim || headDim > VulkanFlashAttentionGqaKernel.MaxHeadDim) return null;
+        bool f16 = storage == VulkanKvStorage.F16;
+        if (f16 ? _gqaFlashF16Tried : _gqaFlashF32Tried) return f16 ? _gqaFlashF16 : _gqaFlashF32;
+        VulkanFlashAttentionGqaKernel? made = VulkanTransformerModel.IsFlashAttentionDisabled()
+            ? null
+            : VulkanFlashAttentionGqaKernel.TryCreate(_device!, _spvDir!, storage,
+                allowCoopmat: !VulkanTransformerModel.IsCoopmatAttentionDisabled());
+        if (f16)
+        {
+            _gqaFlashF16 = made;
+            _gqaFlashF16Tried = true;
+        }
+        else
+        {
+            _gqaFlashF32 = made;
+            _gqaFlashF32Tried = true;
+        }
+
+        return made;
+    }
+
     private bool _gqaDecode;
 
     /// <summary>
@@ -762,6 +805,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         SplitKvAttention?.InvalidateDescriptorCache();
         SplitKvRowsAttention?.InvalidateDescriptorCache();
         NarrowKv?.InvalidateAll();
+        _gqaFlashF32?.InvalidateDescriptorCache();
+        _gqaFlashF16?.InvalidateDescriptorCache();
         SwiGlu.InvalidateDescriptorCache();
         Add.InvalidateDescriptorCache();
         SiluInplace.InvalidateDescriptorCache();
@@ -877,6 +922,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         SplitKvAttention?.Dispose();
         SplitKvRowsAttention?.Dispose();
         NarrowKv?.Dispose();
+        _gqaFlashF32?.Dispose();
+        _gqaFlashF16?.Dispose();
         FlashAttention?.Dispose();
         FlashAttentionCoopmat?.Dispose();
         Attention.Dispose();

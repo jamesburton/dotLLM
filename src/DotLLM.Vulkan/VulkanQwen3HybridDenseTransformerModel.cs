@@ -173,6 +173,16 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     /// <summary>Test hook (issue #1102): F32-to-F16 convert dispatches recorded for F16 KV rows.</summary>
     internal long F16KvRowWritesForTest => _kernels.NarrowKv?.Writer.Dispatches ?? 0;
 
+    /// <summary>Test hook (issue #441): GQA-grouped tiled prefill dispatches so far, both KV formats.</summary>
+    internal long GqaFlashDispatchesForTest => _kernels.GqaFlashDispatches;
+
+    /// <summary>Test hook (issue #441): route prefill attention around the GQA-grouped kernel (the pre-#441 path), for A/B parity.</summary>
+    internal bool GqaFlashDisabledForTest
+    {
+        get => _kernels.GqaFlashDisabled;
+        set => _kernels.GqaFlashDisabled = value;
+    }
+
     /// <summary>Drops every kernel's handle-keyed descriptor cache (after any buffer they may name was re-created or freed).</summary>
     private void InvalidateDescriptorCaches()
     {
@@ -1963,6 +1973,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         var flashAttentionCoopmat = narrow is null ? _kernels.FlashAttentionCoopmat : narrow.FlashAttentionCoopmat;
         var flashAttention = narrow is null ? _kernels.FlashAttention : narrow.FlashAttention;
         var attention = narrow is null ? _kernels.Attention : narrow.Attention;
+        var gqaFlash = seqLen > 1 ? _kernels.EnsureGqaFlash(narrow?.Storage ?? VulkanKvStorage.F32, headDim) : null;
         if (splitKvAttention is not null && seqLen == 1
             && headDim <= VulkanSplitKvAttentionKernel.MaxHeadDim
             && VulkanSplitKvAttentionKernel.WouldSplit(seqKv, numHeads))
@@ -1976,8 +1987,18 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: 0);
         }
+        else if (gqaFlash is not null && gqaFlash.CanDispatch(headDim, numHeads, numKvHeads))
+        {
+            // Issue #441: GQA-grouped tiled prefill (one K/V tile load per KV head for all its query heads).
+            ProfNote(gqaFlash.IsCoopmat ? "attn_flash_gqa_cm" : "attn_flash_gqa", m: numHeads, k: headDim, n: seqKv);
+            gqaFlash.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
+                seqQ: seqLen, seqKv: seqKv,
+                numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
+                positionOffset: positionOffset);
+        }
         else if (flashAttentionCoopmat is not null && seqLen > 1 && headDim <= flashAttentionCoopmat.SupportedMaxHeadDim)
         {
+            ProfNote("attn_flash_cm", m: numHeads, k: headDim, n: seqKv);
             flashAttentionCoopmat.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
@@ -1994,6 +2015,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         else
         {
             ProfNote("attn_naive", m: numHeads, k: headDim, n: seqKv);
+            if (seqLen > 1)
+                VulkanAttentionFallbackDiagnostics.ReportNaivePrefill("Qwen3HybridDense", seqLen, seqKv, headDim);
             attention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
