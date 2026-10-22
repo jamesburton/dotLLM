@@ -767,11 +767,28 @@ What the table shows:
 
 - **Prefix reuse.** Every turn after the first reuses the whole previous prompt (cached = previous prompt - 5), and there were
   no refusals or device losses.
-- **Memory.** It grows ~1 GiB a turn, the F32 KV's 128 KiB per token. These tables were measured with F32 KV. #1102 moves
-  the Vulkan KV default to F16 (64 KiB per token).
+- **Memory.** It grows ~1 GiB a turn, the F32 KV's 128 KiB per token. These tables were measured with F32 KV; #1102 made
+  F16 (64 KiB per token) the Vulkan default. Its table follows.
 - **Prefill and decode speed.** Both fall with depth because the attention reads the whole F32 history. Prefill attention runs
   at ~1 TFLOP/s on this hd256 path. Narrower KV (design V2) and a faster hd256 prefill kernel (V3, #441) are the next steps.
 - **Total time.** All 16 turns, from an empty session to 128k, took 63 minutes.
+
+**With F16 KV (#1102, now the default).** The same growth run, 64 KiB per token, with the GQA-grouped split-KV decode pass.
+The F32 arm is the same build with `--cache-type-k/-v f32`:
+
+| turn | prompt | decode tok/s F32 | decode tok/s F16 | prefill tok/s F16 | private F32 | private F16 |
+|---|---|---|---|---|---|---|
+| 1 | 7,823 | 19.6 | 21.2 | 179 | 10.2 GiB | 9.7 GiB |
+| 4 | 32,934 | 12.6 | 15.9 | 66 | 13.7 GiB | 11.6 GiB |
+| 8 | 64,320 | 8.7 | 12.0 | 38 | 17.6 GiB | 13.6 GiB |
+| 12 | 96,656 | 6.7 | 9.6 | 25 | 21.7 GiB | 15.8 GiB |
+| 16 | 128,254 | 5.4 | **8.1** | 21 | 25.6 GiB | **17.7 GiB** |
+
+- Memory grows 70 KiB per token with F16 against 134 KiB with F32.
+- Decode at 128k is 1.5x the F32 arm and 1.6x the table above.
+- Prefill barely moves: it is bound by the ~1 TFLOP/s hd256 attention (#441), not by KV bytes.
+- The F16 arm ran a paired-load variant of the grouped pass that is ~12 % faster per layer but wrong on Intel and was
+  withdrawn (#1113). With the shipped pass expect ~7.4 tok/s at 128k.
 
 ### MTP on prefix-hit turns (#1088)
 
