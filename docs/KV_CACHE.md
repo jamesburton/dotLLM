@@ -67,8 +67,8 @@ split Qwen3-hybrid model, the KV handoff paths and the CLI memory estimate now a
 ### Vulkan hybrid KV: element format and lazy growth (issue #898)
 
 `VulkanNemotronHKvCache` (shared by the Vulkan Nemotron-H, Qwen3.5/3.6/3.8 hybrids and Qwen4-Exp) takes two opt-in constructor arguments, both OFF by default so existing models are
-untouched: `storage: VulkanKvStorage.F16` (K/V rows written by a convert kernel, 2 bytes per element; only the Qwen4-Exp QSA gather kernel reads them, so it is created only through the
-Qwen4-Exp model) and `lazy: true` (buffers start empty and `EnsureCapacity(positions)` reallocates layer by layer, 25 % / >= 1024 positions at a time, copying the live prefix).
+untouched: `storage: VulkanKvStorage.F16` (K/V rows written by a convert kernel, 2 bytes per element; read by the Qwen4-Exp QSA gather kernel and,
+since #1102, by the `_kvf16` attention twins the dense hybrid selects; see the next section) and `lazy: true` (buffers start empty and `EnsureCapacity(positions)` reallocates layer by layer, 25 % / >= 1024 positions at a time, copying the live prefix).
 `MaxLength` is the logical limit, `AllocatedLength` the physical one. After `EnsureCapacity` returns true the CALLER must drop every descriptor cache that may name the freed buffers
 (handles are recycled; a stale cached set reads zeros without any error). Qwen4-Exp does this in `ForwardCore` before recording (`EnsureContext`), for the sequence's K/V and its indexer
 state. Switches and measurements: [ATTENTION.md](ATTENTION.md), "Lazy growth and F16 K/V".
@@ -97,8 +97,58 @@ was made with (a growing chat session needs that on almost every turn). The Vulk
 - **Snapshots.** `SnapshotPrefix` copies into an exactly-sized eager cache. `RestorePrefixFrom` grows a lazy destination first.
   A snapshot taken before a growth restores exactly after it (`VulkanQwen3HybridDenseKvGrowthTests`).
 - **Cost.** Growth, admission and snapshot copies size everything from the cache's `ElementBytes` / `BytesPerPosition`, never an
-  assumed F32. As of #1100 the storage is still F32: 128 KiB per token for Bonsai-2 (16 attention layers x 4 KV heads x 256 x K
-  and V x 4 B), so 16 GiB at 128k. #1102 moves the Vulkan default to F16, which halves it. A growth step is 25 % of what is held (at least 1,024 positions), plus one layer's K and V in transit.
+  assumed F32. Since #1102 the storage is F16 by default: 64 KiB per token for Bonsai-2 (16 attention layers x 4 KV heads x 256 x
+  K and V x 2 B), so 8 GiB at 128k (F32, the A/B baseline: 128 KiB, 16 GiB). A growth step is 25 % of what is held (at least
+  1,024 positions), plus one layer's K and V in transit.
+
+### Vulkan dense-hybrid (Bonsai 2) KV: F16 storage read in place (issue #1102)
+
+`VulkanQwen3HybridDenseTransformerModel` (Bonsai 2, Qwen3.5 / 3.6 dense hybrids) keeps its KV in a lazy, growable
+`VulkanNemotronHKvCache` (#1100) whose element format is selectable:
+
+```bash
+dotllm serve <bonsai> --device vulkan            # F16 KV by default
+dotllm bench <bonsai> --device vulkan --kv-quant-k f32 --kv-quant-v f32   # explicit F32 A/B baseline
+```
+
+| storage | bytes / element | Bonsai 2 per token (16 attn layers × 4 KV heads × 256 × K+V) | 128k | 262,144 | 1M (YaRN, #1101) |
+|---|---|---|---|---|---|
+| f32 (A/B baseline only) | 4 | 128 KiB | 16 GiB | 32 GiB | 128 GiB |
+| **f16 (default)** | 2 | 64 KiB | 8 GiB | 16 GiB | 64 GiB |
+
+- **Read in place, no widening.** Every attention kernel the model dispatches has an F16 twin (`*_kvf16.comp`) that
+  loads its K / V elements from the packed halves (`kv_load.glsl`, `unpackHalf2x16` in the load). No kernel converts the
+  history to an F32 scratch, so the device holds exactly the per-token cost above plus the existing per-forward
+  scratch. Decode reads 64 KiB per cached token instead of 128 KiB. Details and the kernel list:
+  [ATTENTION.md](ATTENTION.md), "Narrow (F16) KV on Vulkan".
+- **Writes.** The F32 K / V rows the projections produce are converted on the device by `convert_f32_to_f16_range.comp`
+  (round-to-nearest-even in the integer domain, saturating at ±65504), from contiguous positions only. That is every
+  forward the engine issues: prefill tiles, decode, MTP verify and each `ForwardBatch` sequence.
+- **Snapshots, restore, rollback, growth** copy whole rows byte for byte, so they keep the format and round-trip exactly
+  (`ValidateSnapshotLayout` no longer requires F32).
+- **Selection.** `ConfigureKvStorage(VulkanKvStorage)` sets the format of caches created afterwards; the forward picks
+  kernels per cache. The CLI and server accept `f16` / `fp16` and `f32`. q8_0, q4_0, TurboQuant and mixed K / V are
+  refused at startup with a message, never stored as something else. **F16 is the default** (#1107: no F32 KV on hot
+  paths). F32 is the explicit A/B and parity baseline only: `--cache-type-k/-v f32` on `run` / `bench`, or `DOTLLM_VK_KV=f32`
+  (the server cannot tell an explicit `f32` from its option default).
+- **Measured on Strix** (`serve --device vulkan --no-mtp`, one session grown by ~8k-token turns with `scripts/session-growth.py`,
+  64 generated tokens per turn; prefix reuse on every turn after the first; no device loss to 128k with #1100's submit budget):
+
+  | context | decode tok/s, F32 KV | decode tok/s, F16 KV | prefill tok/s (new turn), F16 |
+  |---|---|---|---|
+  | 7.8k | 19.6 | 21.2 | 179 |
+  | 32.9k | 12.6 | 15.9 | 66 |
+  | 64.3k | 8.7 | 12.0 | 38 |
+  | 128.3k | 5.4 | **8.1** | 21 |
+
+  Process private bytes grew 134 KiB/token with F32 and 70 KiB/token with F16: the cache is 128 vs 64 KiB/token, plus the lazy
+  growth headroom. Both arms ran the GQA-grouped decode pass. In the per-layer kernel bench (ATTENTION.md) the per-query-head
+  pass is within 5 % of it for F32, so the F32 column is close to the old default.
+
+  The F16 arm ran the paired-load variant of that pass (#1113). The shipped per-element pass measures 6.13 instead of 5.37 ms
+  per layer at 128k, about 12 ms more per token (16 layers), so expect ~7.4 tok/s at 128k with the shipped kernels.
+- **Accuracy.** F16 rounds each K / V element once (relative error ≤ 2⁻¹¹). On the synthetic fixture the logits stay
+  within the tolerance the Vulkan forward is held to against the CPU reference (abs 5e-3 + rel 1e-3).
 
 ### CUDA hybrid-dense KV: staging, quantized storage, fused decode (issue #956)
 

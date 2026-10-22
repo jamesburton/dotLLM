@@ -419,6 +419,19 @@ public static class ServerStartup
             }
             else
             {
+                if (model is DotLLM.Vulkan.VulkanQwen3HybridDenseTransformerModel vkDense)
+                {
+                    // #1102: the dense hybrid (Bonsai 2) stores its KV as f16 (the default) and reads it in place. "f32" is the
+                    // option default, so it means "not given" here; DOTLLM_VK_KV=f32 selects the F32 A/B baseline. q8_0 / q4_0 /
+                    // mixed K and V fail startup.
+                    static string? Given(string? v) => string.Equals(v?.Trim(), "f32", StringComparison.OrdinalIgnoreCase) ? null : v;
+                    vkDense.ConfigureKvStorage(DotLLM.Vulkan.VulkanKvStorageExtensions.ParseOptions(
+                        Given(options.CacheTypeK), Given(options.CacheTypeV)));
+                    Console.WriteLine(
+                        $"[dotllm] KV storage: {vkDense.KvStorage.ToString().ToLowerInvariant()} ({vkDense.KvBytesPerPosition / 1024.0:F0} KiB/token), " +
+                        $"~{vkDense.KvBytesPerPosition * (long)config.MaxSequenceLength / 1048576.0:F0} MiB at {config.MaxSequenceLength} tokens.");
+                }
+
                 var vkFactory = vulkanKvFactory;
                 kvFactory = (cfg, size) => vkFactory(size);
             }

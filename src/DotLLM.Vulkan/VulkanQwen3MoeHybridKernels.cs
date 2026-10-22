@@ -252,6 +252,54 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     /// </summary>
     public VulkanSplitKvAttentionKernel? SplitKvAttention { get; }
 
+    /// <summary>
+    /// The attention kernels for a narrow (F16) KV cache (issue #1102), or null until a host selects one with
+    /// <see cref="EnsureNarrowKv"/>. Owned here so <see cref="InvalidateAll"/> and <see cref="Dispose"/> cover them.
+    /// </summary>
+    public VulkanNarrowKvAttentionKernels? NarrowKv { get; private set; }
+
+    private VulkanDevice? _device;
+    private string? _spvDir;
+
+    /// <summary>
+    /// Returns the narrow-KV kernels for <paramref name="storage"/>, building them on first use (issue #1102).
+    /// </summary>
+    /// <param name="storage">The narrow storage the host's caches use.</param>
+    /// <param name="headDim">The model's per-head dimension (gates which prefill kernels are worth building).</param>
+    /// <returns>The kernel set.</returns>
+    /// <exception cref="NotSupportedException">The storage has no narrow kernels, or this build lacks their SPIR-V.</exception>
+    internal VulkanNarrowKvAttentionKernels EnsureNarrowKv(VulkanKvStorage storage, int headDim)
+    {
+        if (NarrowKv is { } existing && existing.Storage == storage) return existing;
+        var made = VulkanNarrowKvAttentionKernels.Create(_device!, _spvDir!, headDim, storage);
+        if (_gqaDecode) made.SplitKvAttention?.EnableGqaByDefault();
+        NarrowKv?.Dispose();
+        NarrowKv = made;
+        return made;
+    }
+
+    private bool _gqaDecode;
+
+    /// <summary>
+    /// Opts this host's split-KV decode kernels (the F32 set and any narrow set) into the GQA-grouped pass (issue #1102), which
+    /// reads each cached K / V element once per KV head instead of once per query head. <c>DOTLLM_VULKAN_SPLITKV_GQA</c> still wins.
+    /// </summary>
+    internal void EnableGqaDecode()
+    {
+        _gqaDecode = true;
+        SplitKvAttention?.EnableGqaByDefault();
+        NarrowKv?.SplitKvAttention?.EnableGqaByDefault();
+    }
+
+    /// <summary>Test hook: forces the grouped decode pass on or off for every split-KV kernel of this set.</summary>
+    /// <param name="on">Whether the grouped pass may run.</param>
+    internal void SetGqaDecodeForTest(bool on)
+    {
+        _gqaDecode = on;
+        if (SplitKvAttention is { } f32) f32.PreferGqa = on;
+        if (NarrowKv?.SplitKvAttention is { } narrow) narrow.PreferGqa = on;
+    }
+
     /// <summary>Split-KV attention with per-row query offsets for 2..8-row verify forwards (null when its SPIR-V is missing or split decode is disabled).</summary>
     public VulkanSplitKvRowsAttentionKernel? SplitKvRowsAttention { get; private set; }
     public SwiGluF32Kernel SwiGlu { get; }
@@ -563,6 +611,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             moeTopk, moeBroadcast, moeIndexed, moeIndexedQ6K, moeIndexedQ4K, moeIndexedQ5K,
             moeIndexedQ4KMmq, quantizeQ8_1Rows, moeIndexedQ5KMmq, moeScatter, moeSigmoidGatedAdd);
         kernels.SplitKvRowsAttention = splitKvAttention is null ? null : VulkanSplitKvRowsAttentionKernel.TryCreate(device, spvDir);
+        kernels._device = device;
+        kernels._spvDir = spvDir;
         kernels.Iq1CodebooksOwned = Iq1Codebooks.Create(device);   // #823: grid for the IQ1_M expert kernels
         kernels.MoeSharedGateAdd = moeSharedGateAdd;
         kernels.MatMulBf16Multi = matmulBf16Multi;
@@ -767,6 +817,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         FlashAttentionCoopmat?.InvalidateDescriptorCache();
         SplitKvAttention?.InvalidateDescriptorCache();
         SplitKvRowsAttention?.InvalidateDescriptorCache();
+        NarrowKv?.InvalidateAll();
         SwiGlu.InvalidateDescriptorCache();
         Add.InvalidateDescriptorCache();
         SiluInplace.InvalidateDescriptorCache();
@@ -882,6 +933,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         SwiGlu.Dispose();
         SplitKvAttention?.Dispose();
         SplitKvRowsAttention?.Dispose();
+        NarrowKv?.Dispose();
         FlashAttention?.Dispose();
         FlashAttentionCoopmat?.Dispose();
         Attention.Dispose();

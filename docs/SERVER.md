@@ -767,11 +767,28 @@ What the table shows:
 
 - **Prefix reuse.** Every turn after the first reuses the whole previous prompt (cached = previous prompt - 5), and there were
   no refusals or device losses.
-- **Memory.** It grows ~1 GiB a turn, the F32 KV's 128 KiB per token. These tables were measured with F32 KV. #1102 moves
-  the Vulkan KV default to F16 (64 KiB per token).
+- **Memory.** It grows ~1 GiB a turn, the F32 KV's 128 KiB per token. These tables were measured with F32 KV; #1102 made
+  F16 (64 KiB per token) the Vulkan default. Its table follows.
 - **Prefill and decode speed.** Both fall with depth because the attention reads the whole F32 history. Prefill attention runs
   at ~1 TFLOP/s on this hd256 path. Narrower KV (design V2) and a faster hd256 prefill kernel (V3, #441) are the next steps.
 - **Total time.** All 16 turns, from an empty session to 128k, took 63 minutes.
+
+**With F16 KV (#1102, now the default).** The same growth run, 64 KiB per token, with the GQA-grouped split-KV decode pass.
+The F32 arm is the same build with `--cache-type-k/-v f32`:
+
+| turn | prompt | decode tok/s F32 | decode tok/s F16 | prefill tok/s F16 | private F32 | private F16 |
+|---|---|---|---|---|---|---|
+| 1 | 7,823 | 19.6 | 21.2 | 179 | 10.2 GiB | 9.7 GiB |
+| 4 | 32,934 | 12.6 | 15.9 | 66 | 13.7 GiB | 11.6 GiB |
+| 8 | 64,320 | 8.7 | 12.0 | 38 | 17.6 GiB | 13.6 GiB |
+| 12 | 96,656 | 6.7 | 9.6 | 25 | 21.7 GiB | 15.8 GiB |
+| 16 | 128,254 | 5.4 | **8.1** | 21 | 25.6 GiB | **17.7 GiB** |
+
+- Memory grows 70 KiB per token with F16 against 134 KiB with F32.
+- Decode at 128k is 1.5x the F32 arm and 1.6x the table above.
+- Prefill barely moves: it is bound by the ~1 TFLOP/s hd256 attention (#441), not by KV bytes.
+- The F16 arm ran a paired-load variant of the grouped pass that is ~12 % faster per layer but wrong on Intel and was
+  withdrawn (#1113). With the shipped pass expect ~7.4 tok/s at 128k.
 
 ### Past 262,144 tokens: YaRN for Bonsai-2 / Qwen3.8 (#1101)
 
@@ -788,8 +805,9 @@ above, and on the Vulkan hybrid `--ctx-size` now lowers the window too (`[dotllm
 Cost: YaRN's rotation itself is free, but it also scales every position by `0.1·ln 4 + 1 = 1.139`, so short prompts produce
 slightly different output. Measured on Bonsai-2 (CUDA, wikitext-2, 16 × 512-token windows): perplexity 10.8345 off vs
 10.8297 on (±0.47), and greedy text that diverges after a few dozen tokens while staying coherent. Leave it off unless a
-session will pass 262,144 tokens. The KV is the real cost: F32
-128 KiB/token (300k ≈ 37 GiB, 1M = 128 GiB), F16 64 KiB/token, q8_0 about 34 KiB/token. See `docs/POSITION_ENCODING.md`
+session will pass 262,144 tokens. The KV is the real cost: F16 (the
+Vulkan default since #1102) 64 KiB/token (300k ≈ 18 GiB, 1M = 64 GiB), F32 128 KiB/token (1M = 128 GiB), q8_0 about
+34 KiB/token (#1112). See `docs/POSITION_ENCODING.md`
 for the math and `scripts/needle-in-haystack.py` for a retrieval check.
 
 ### MTP on prefix-hit turns (#1088)

@@ -296,6 +296,63 @@ Things worth probing on Strix Halo before tile sizes lock in:
 - **Q-tile transpose for memory coalescing.** Currently `qTile[r * head_dim + d]` is row-major; threads access `qTile[r][d]` strided by `d` across rows during the score loop, which is irregular. A `[d][r]` layout might give better LDS bank-conflict behaviour. Trace it before changing.
 - **Soft-cap fold into `scale`.** When `softCap > 0` and the raw score is far from saturation, the `tanh` is wasted work; could skip when score magnitude < softCap × 0.5. Marginal.
 
+### Narrow (F16) KV on Vulkan — issue #1102
+
+The dense hybrid host (`VulkanQwen3HybridDenseTransformerModel`, Bonsai 2) can store its KV as F16 (see
+[KV_CACHE.md](KV_CACHE.md), "Vulkan dense-hybrid (Bonsai 2) KV"). Every attention kernel it can dispatch reads those halves
+**in place**; nothing converts the history to an F32 scratch.
+
+- **One body, two pipelines.** Each KV-reading shader is a `.glsl` body plus thin `.comp` wrappers. The body includes
+  `kv_load.glsl`, which declares `BufK` / `BufV` (bindings 1 / 2) and reads elements through `KV_K(i)` / `KV_V(i)`. The F32
+  wrapper gets `float k[]` (its SPIR-V is byte-identical to the pre-#1102 shader). The `_kvf16` wrapper defines `KV_F16`
+  and gets uint-backed halves, two per word, with `unpackHalf2x16` in the load. No 16-bit-storage device feature is needed.
+
+  | path | F32 shader | F16 twin |
+  |---|---|---|
+  | decode (split-KV, seqKv ≥ 17) | `attention_f32_splitkv` | `attention_f32_splitkv_kvf16` |
+  | prefill, coopmat (Strix) | `attention_flash_f32_coopmat`, `_hd256` | `attention_flash_f32_coopmat_kvf16`, `_kvf16_hd256` |
+  | prefill, scalar flash (Arc) | `attention_flash_f32`, `_hd256_br{4,8,16}` | `attention_flash_f32_kvf16`, `_hd256_br{4,8,16}_kvf16` |
+  | per-token (short decode, fallback) | `attention_f32`, `_sg` | `attention_f32_kvf16`, `_sg_kvf16` (no coopmat twin) |
+
+  The kernel classes take a `VulkanKvStorage` and size-check K / V with its element bytes. `VulkanNarrowKvAttentionKernels`
+  holds the F16 set plus the row writer and is built with the same gates as the F32 set (env opt-outs, head_dim bounds).
+  The forward picks the set from the cache's `Storage`, so F32 and F16 caches can coexist.
+- **Numerics.** `unpackHalf2x16` is exact, so an F16 kernel computes on exactly the values its F32 twin reads from a
+  cache holding the F16-rounded rows. `VulkanF16KvAttentionKernelTests` asserts that equality **bit for bit**, for every
+  family, on Bonsai's GQA 24 / 4 and 8 / 4 at head_dim 256 (and 64 / 128), with position offsets and ragged tiles. It also
+  checks the CPU reference at each family's existing tolerance. In the coopmat hd256 kernel's hi/lo split, F16 K makes
+  `K_lo` exactly zero.
+- **Bytes per decoded token** (Bonsai 2, attention only): F32 reads 128 KiB per cached position, F16 reads 64 KiB.
+  At 128k that is 16 GiB vs 8 GiB per decoded token.
+- **GQA-grouped decode pass** (`attention_f32_splitkv_gqa[_kvf16]`). The split-KV partial pass ran one workgroup per
+  *query* head, so each of a KV head's G query heads streamed the same rows. For Bonsai 2 (24 / 4) that is 6 reads of every
+  cached byte per decoded token. The grouped pass runs one workgroup per (KV head, split). Each K element feeds G dot
+  products (one subgroup per position) and each V element feeds G register accumulators (thread per column). Each query
+  head keeps its own online softmax, handled by one subgroup. The partial layout per (query head, split) and the merge pass
+  are unchanged. It serves 2 ≤ G ≤ 8 and head_dim ≤ 256. The dense hybrid host opts in
+  (`VulkanQwen3MoeHybridKernels.EnableGqaDecode`); `DOTLLM_VULKAN_SPLITKV_GQA=1` / `0` forces it on or off on any host.
+  `VulkanSplitKvAttentionKernelTests` (ALiBi, soft-cap, sliding window, bidirectional, masked tails) and the F16 tests run
+  both passes. `VulkanSplitKvDecodeBench` (`DOTLLM_SPLITKV_DECODE_AB=1`) times all four arms at the Bonsai shape.
+- **Measured** (`VulkanSplitKvDecodeBench`, one layer's decode attention, Bonsai shape 24 / 4 / 256, minimum of 9 interleaved
+  runs, ms; "unique GB/s" counts each cached K / V byte once):
+
+  | Strix (8060S) | 8k | 32k | 64k | 128k | 128k unique GB/s |
+  |---|---|---|---|---|---|
+  | F32, per-query-head | 0.69 | 2.48 | 4.89 | 9.62 | 112 |
+  | F32, GQA-grouped | 0.67 | 2.41 | 4.67 | 9.12 | 118 |
+  | F16, per-query-head | 0.53 | 2.35 | 4.63 | 9.26 | 58 |
+  | **F16, GQA-grouped** | **0.39** | **1.59** | **3.09** | **6.13** | 88 |
+
+  F16 alone does not help the per-query-head pass: its six re-reads per KV head are served from cache, and the pass is
+  bound by issue, not DRAM. F16 needs the grouped pass to pay off. Together they are 1.57x faster than F32 at 128k (88 GB/s of unique KV, against
+  the ~115 GB/s the F32 arms reach). A variant loading element pairs (one F16 word per lane) reached 5.37 ms / 100 GB/s on
+  Strix but computed wrong results on the Arc (Intel) and was withdrawn (#1113). Halving the bytes again is
+  what q8_0 KV (#1112) would do. On the Arc (8k / 32k) the grouped pass is 1.55-1.7x faster for both formats, and F16
+  adds little there: that decode is compute-bound.
+- **Mutants** (shader edits, run on Strix): swapping the half select, reading word `i` instead of `i >> 1`, and a
+  `hq % numKvHeads` head broadcast in the F16 split-KV body. Each fails every test of the family it touches, and the
+  model-level F16-vs-F32 comparison as well.
+
 ## Qwen4-Exp QSA (query-sparse attention) on Vulkan — issue #819
 
 The 12 full-attention layers of `qwen4exp` attend a SELECTED subset of the context: an indexer pools the keys of every block of 4 tokens, scores
