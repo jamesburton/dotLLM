@@ -153,6 +153,57 @@ public sealed class VulkanQwen3HybridDenseKvGrowthTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// A prefill whose attention layer would exceed the submission budget runs as balanced row slices (issue #1100), and gives
+    /// bit-identical logits to the same slices forwarded by hand. With a near-zero budget every layer is its own submission; with
+    /// a huge one the whole layer stack is one.
+    /// </summary>
+    [SkippableFact]
+    public void OverBudgetPrefill_RunsAsRowSlices_MatchingManualTiles()
+    {
+        using var f = Open();
+        int[] prefix = Tokens(40, salt: 7);
+        int[] tile = Tokens(200, salt: 8);   // 200 rows over a 64-row minimum slice: four slices of 50
+        var generous = new VulkanPrefillSubmitBudget(1e6);
+        var tiny = new VulkanPrefillSubmitBudget(1e-9);
+
+        // Reference: the same four 50-row slices, forwarded one by one under a budget that never splits.
+        f.Model.SubmitBudgetForTest = generous;
+        float[] want;
+        using (var gdn = f.Model.CreateGdnStateCache())
+        using (var kv = f.Model.CreateKvCache(prefix.Length + tile.Length))
+        {
+            Forward(f, prefix, 0, kv, gdn);
+            Assert.Equal(1, f.Model.LastForwardLayerSubmissionsForTest);
+            int start = prefix.Length;
+            want = [];
+            for (int s = 0; s < 4; s++)
+            {
+                want = Forward(f, tile[(s * 50)..((s + 1) * 50)], start, kv, gdn);
+                start += 50;
+            }
+        }
+
+        f.Model.SubmitBudgetForTest = tiny;
+        int slicesBefore = f.Model.RowSliceForwardsForTest;
+        float[] got;
+        using (var gdn = f.Model.CreateGdnStateCache())
+        using (var kv = f.Model.CreateKvCache(prefix.Length + tile.Length))
+        {
+            Forward(f, prefix, 0, kv, gdn);                  // 40 rows: within the 64-row minimum, never split
+            Assert.Equal(f.Model.Config.NumLayers, f.Model.LastForwardLayerSubmissionsForTest);
+            got = Forward(f, tile, prefix.Length, kv, gdn);
+            Assert.Equal(prefix.Length + tile.Length, kv.CurrentLength);
+        }
+
+        Assert.Equal(4, f.Model.RowSliceForwardsForTest - slicesBefore);
+        for (int i = 0; i < Vocab; i++)
+        {
+            Assert.True(BitConverter.SingleToInt32Bits(want[i]) == BitConverter.SingleToInt32Bits(got[i]),
+                $"logits[{i}]: manual tiles {want[i]:R} vs row slices {got[i]:R}");
+        }
+    }
+
     private sealed class Fixture(GgufFile gguf, VulkanDevice device, VulkanQwen3HybridDenseTransformerModel model) : IDisposable
     {
         public VulkanQwen3HybridDenseTransformerModel Model { get; } = model;

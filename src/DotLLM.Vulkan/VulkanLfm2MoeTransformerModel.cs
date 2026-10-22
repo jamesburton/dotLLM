@@ -73,6 +73,12 @@ public sealed unsafe partial class VulkanLfm2MoeTransformerModel : IModel
     /// <summary><see cref="VulkanNemotronHKvCache.BufferEpoch"/> when this model last dropped its descriptor caches (issue #1100).</summary>
     private long _seenKvBufferEpoch = -1;
 
+    /// <summary>
+    /// Test hook (issue #1100): forwards that dropped the descriptor caches because a KV buffer was freed. Not every driver recycles a
+    /// freed handle fast enough for a stale set to show in the logits, so the tests pin the invalidation itself.
+    /// </summary>
+    internal int KvBufferInvalidationsForTest { get; private set; }
+
     /// <summary>Per-stage wall ms via split-submit (<c>DOTLLM_VK_LFM2_STAGE_PROFILE=1</c>): distorts decode (a fence round trip per stage).</summary>
     public static bool StageProfile { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_LFM2_STAGE_PROFILE") == "1";
 
@@ -475,7 +481,12 @@ public sealed unsafe partial class VulkanLfm2MoeTransformerModel : IModel
         bool resized = _host.Q4EnsureCapacity(T);
         resized |= EnsureDense(T);
         if (allRows) resized |= EnsureMultiRow(T, V);
-        resized |= VulkanNemotronHKvCache.PrepareForForward(kvCache, VulkanNemotronHKvCache.PositionsEnd(positions), ref _seenKvBufferEpoch);
+        if (VulkanNemotronHKvCache.PrepareForForward(kvCache, VulkanNemotronHKvCache.PositionsEnd(positions), ref _seenKvBufferEpoch))
+        {
+            KvBufferInvalidationsForTest++;
+            resized = true;
+        }
+
         if (resized) _host.Q4InvalidateCaches();
         _host.Q4UploadPositions(positions);
 

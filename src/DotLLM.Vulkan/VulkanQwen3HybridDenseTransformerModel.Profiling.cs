@@ -1,3 +1,6 @@
+using DotLLM.Core.Models;
+using DotLLM.Core.Tensors;
+
 namespace DotLLM.Vulkan;
 
 /// <content>
@@ -52,13 +55,156 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel
     /// <remarks>Bounds each forward the engine submits (issue #1100); see <see cref="PrefillChunkTokens"/>.</remarks>
     public int PreferredPrefillChunkTokens => PrefillChunkTokens;
 
-    /// <summary>Layers recorded per submission for a prefill longer than <see cref="FuseMaxSeqLen"/>. <c>DOTLLM_VK_PREFILL_LAYERS_PER_SUBMIT</c> overrides (1 = one per layer).</summary>
-    private static int PrefillLayersPerSubmit(int seqLen)
+    /// <summary>
+    /// Fixed layers per submission for a prefill longer than <see cref="FuseMaxSeqLen"/> when <c>DOTLLM_VK_PREFILL_LAYERS_PER_SUBMIT</c>
+    /// is set (1 = one per layer), else 0: the submissions are then bounded by <see cref="_submitBudget"/> (issue #1100).
+    /// </summary>
+    private static readonly int FixedPrefillLayersPerSubmit =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_PREFILL_LAYERS_PER_SUBMIT"), out int fixedLayers) && fixedLayers >= 1
+            ? fixedLayers
+            : 0;
+
+    /// <summary><c>DOTLLM_VK_PREFILL_SUBMIT_LOG=1</c>: one stderr line per budgeted prefill forward (submissions, longest, fitted rates).</summary>
+    private static readonly bool SubmitLogEnabled = Environment.GetEnvironmentVariable("DOTLLM_VK_PREFILL_SUBMIT_LOG") == "1";
+
+    /// <summary>GPU-time budget and fitted cost rates for prefill submissions (issue #1100), per model: the rates are per device.</summary>
+    private VulkanPrefillSubmitBudget _submitBudget = VulkanPrefillSubmitBudget.FromEnvironment();
+
+    private bool[]? _isAttentionLayer;
+
+    /// <summary>Test hook: the submission budget (replaceable, to force or forbid splitting).</summary>
+    internal VulkanPrefillSubmitBudget SubmitBudgetForTest
     {
-        if (int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_PREFILL_LAYERS_PER_SUBMIT"), out int n) && n >= 1) return n;
-        // Bounded GPU time per submission (watchdog): ~3 ms/layer at 128 tokens, ~25 ms/layer at 2k; 8 layers up to 1k tokens, 4 up to 2k, else per layer.
-        // Measured on Tev1-4B: pp64 +2.7%, pp128 +1.5%, pp512 +1.3% over one submission per layer.
-        return seqLen <= 1024 ? 8 : seqLen <= 2048 ? 4 : 1;
+        get => _submitBudget;
+        set => _submitBudget = value ?? throw new ArgumentNullException(nameof(value));
+    }
+
+    /// <summary>Test hook: layer submissions the last forward or batch made.</summary>
+    internal int LastForwardLayerSubmissionsForTest { get; private set; }
+
+    /// <summary>Test hook: row-slice forwards <see cref="ForwardInRowSlices"/> ran.</summary>
+    internal int RowSliceForwardsForTest { get; private set; }
+
+    /// <summary>Weight elements of one layer, for the dense cost estimate: the FFN plus an attention-sized mixer.</summary>
+    private double ParamsPerLayer
+        => (3.0 * Config.HiddenSize * Config.IntermediateSize)
+           + ((double)Config.HiddenSize * ((3.0 * Config.NumAttentionHeads) + (2.0 * Config.NumKvHeads)) * Config.HeadDim);
+
+    /// <summary>
+    /// Starts the layer-submission schedule of one forward (or batch) over <paramref name="rows"/> rows whose attention layers each do
+    /// <paramref name="attentionGflopsPerLayer"/> GFLOPs.
+    /// </summary>
+    /// <param name="rows">Rows in the forward.</param>
+    /// <param name="attentionGflopsPerLayer">Attention work of one attention layer.</param>
+    /// <returns>The schedule.</returns>
+    private SubmitSchedule BeginSubmitSchedule(int rows, double attentionGflopsPerLayer)
+    {
+        int fixedLayers = !FuseForwardEnabled || _prof is not null ? 1
+            : rows <= FuseMaxSeqLen ? int.MaxValue
+            : FixedPrefillLayersPerSubmit;
+        if (_isAttentionLayer is null)
+        {
+            var kinds = _layout.LayerKind;
+            var attention = new bool[kinds.Length];
+            for (int l = 0; l < kinds.Length; l++) attention[l] = kinds[l] == HybridLayerKind.Attention;
+            _isAttentionLayer = attention;
+        }
+
+        return new SubmitSchedule(this, fixedLayers, VulkanPrefillSubmitBudget.DenseGflops(ParamsPerLayer, rows), attentionGflopsPerLayer, rows);
+    }
+
+    /// <summary>
+    /// Splits a long prefill whose single attention layer would exceed the submission budget at this KV depth into row slices run as
+    /// consecutive forwards (issue #1100): the KV and recurrent state carry over between them exactly as between engine tiles.
+    /// </summary>
+    /// <returns>
+    /// The last slice's logits, or null when no split is needed or allowed: no KV cache to carry the rows, all-row logits wanted,
+    /// row snapshots requested, or a fixed submission override.
+    /// </returns>
+    private ITensor? ForwardInRowSlices(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                                        IKvCache? kvCache, IGdnState? gdnState, IMtpState? mtpState)
+    {
+        int rows = tokenIds.Length;
+        if (rows <= FuseMaxSeqLen || rows <= _allRowLogitsLimit || _rowSnapshotRequestRows > 0
+            || kvCache is not VulkanNemotronHKvCache || FixedPrefillLayersPerSubmit != 0 || !FuseForwardEnabled)
+            return null;
+        int kvEnd = VulkanNemotronHKvCache.PositionsEnd(positions);
+        int per = _submitBudget.RowsPerForward(rows, kvEnd, ParamsPerLayer, Config.NumAttentionHeads, Config.HeadDim);
+        if (per >= rows) return null;
+        int slices = (rows + per - 1) / per;
+        int baseLen = rows / slices, extra = rows % slices;
+        if (baseLen <= _allRowLogitsLimit) return null;   // a slice would return all-row logits: not this call's contract
+
+        RowSliceForwardsForTest += slices;
+        ITensor? last = null;
+        int start = 0;
+        for (int s = 0; s < slices; s++)
+        {
+            int len = baseLen + (s < extra ? 1 : 0);
+            last?.Dispose();
+            last = Forward(tokenIds.Slice(start, len), positions.Slice(start, len), deviceId, kvCache, gdnState, mtpState);
+            start += len;
+        }
+        return last;
+    }
+
+    /// <summary>
+    /// Where one forward's layer loop submits (issue #1100). Short forwards record every layer into one command buffer; with
+    /// profiling or <c>DOTLLM_VK_FUSE_FORWARD=0</c> each layer is its own submission; <c>DOTLLM_VK_PREFILL_LAYERS_PER_SUBMIT</c> fixes the
+    /// count; otherwise layers are packed up to the GPU-time budget and every submission's wall time recalibrates it.
+    /// </summary>
+    private struct SubmitSchedule(VulkanQwen3HybridDenseTransformerModel model, int fixedLayers, double denseGflops, double attentionGflops, int rows)
+    {
+        private int _lastLayer = -1;
+        private double _openDense;
+        private double _openAttention;
+        private int _submissions;
+        private double _longest;
+
+        /// <summary>Gets a value indicating whether layers share submissions (false: every layer and the embedding submit alone).</summary>
+        public readonly bool Fuse => fixedLayers != 1;
+
+        private readonly bool Budgeted => fixedLayers == 0;
+
+        /// <summary>Call as <paramref name="layer"/> starts recording.</summary>
+        /// <param name="layer">The layer.</param>
+        public void LayerStarted(int layer)
+        {
+            var attention = model._isAttentionLayer!;
+            if (Budgeted && layer > _lastLayer)
+                _lastLayer = layer + model._submitBudget.LayersInSubmission(attention, layer, denseGflops, attentionGflops) - 1;
+            _openDense += denseGflops;
+            if (attention[layer]) _openAttention += attentionGflops;
+        }
+
+        /// <summary>True when the command buffer must be submitted after <paramref name="layer"/>.</summary>
+        /// <param name="layer">The layer just recorded.</param>
+        /// <returns>Whether to submit now.</returns>
+        public readonly bool SubmitAfter(int layer)
+            => !Fuse || (Budgeted ? layer == _lastLayer : fixedLayers != int.MaxValue && (layer + 1) % fixedLayers == 0);
+
+        /// <summary>Records a layer submission's measured wall time and feeds it to the budget.</summary>
+        /// <param name="seconds">Wall time of the submit-and-wait.</param>
+        public void Submitted(double seconds)
+        {
+            _submissions++;
+            if (seconds > _longest) _longest = seconds;
+            if (Budgeted) model._submitBudget.Observe(_openDense, _openAttention, seconds);
+            _openDense = 0;
+            _openAttention = 0;
+        }
+
+        /// <summary>Call once the layer loop is done.</summary>
+        /// <param name="kvEnd">KV length after the forward (for the log line).</param>
+        public readonly void Finish(int kvEnd)
+        {
+            model.LastForwardLayerSubmissionsForTest = _submissions;
+            if (!Budgeted || !SubmitLogEnabled) return;
+            var b = model._submitBudget;
+            Console.Error.WriteLine(
+                $"[vk-prefill] rows={rows} kvEnd={kvEnd} submissions={_submissions} longest={_longest * 1000:F0}ms " +
+                $"budget={b.BudgetSeconds * 1000:F0}ms dense={1 / b.DenseSecondsPerGflop / 1000:F2}TF/s attn={1 / b.AttentionSecondsPerGflop / 1000:F2}TF/s");
+        }
     }
 
     private static readonly bool FuseForwardEnabled =
