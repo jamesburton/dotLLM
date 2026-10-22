@@ -48,15 +48,19 @@ public sealed unsafe class CudaPrecisionExperimentTests : IDisposable
 
     // ── flash prefill accumulators ──
 
-    /// <summary>Upper bound of each variant's relative RMS error vs the F32 kernel at 4,224 keys (measured, see the test).</summary>
+    /// <summary>
+    /// Upper bound of each variant's relative RMS error vs the F32 kernel at 4,224 keys. Measured on an RTX 3060
+    /// (F16 KV / Q4_0 KV): qk16 1.0e-3 / 2.1e-4, pv16 3.3e-3 / 2.8e-3, pv16t 2.5e-4 / 5.9e-5, qk16pv16 3.5e-3 / 2.8e-3;
+    /// the bounds sit ~3-4x above the F16-KV figure.
+    /// </summary>
     /// <param name="mode">Variant.</param>
     /// <returns>The bound.</returns>
     private static double FlashTol(FlashAccumulatorMode mode) => mode switch
     {
-        FlashAccumulatorMode.Qk16 => 2e-2,
-        FlashAccumulatorMode.Pv16 => 2e-2,
-        FlashAccumulatorMode.Pv16Tile => 2e-3,
-        _ => 3e-2,
+        FlashAccumulatorMode.Qk16 => 4e-3,
+        FlashAccumulatorMode.Pv16 => 1e-2,
+        FlashAccumulatorMode.Pv16Tile => 1e-3,
+        _ => 1.2e-2,
     };
 
     /// <summary>
