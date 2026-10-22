@@ -568,6 +568,13 @@ public sealed unsafe partial class CudaKernels : IDisposable
     private readonly CudaModule? _attentionFlashPrefillHd256Module;
     private readonly nint _attentionFlashPrefillHd256Func;
 
+    // Quantized-KV variants of the flash prefill kernel above (issue #1094 --
+    // native/kernels/attention_flash_mma_prefill_hd256_kvq.cu): Q8_0/Q4_0 K/V blocks are
+    // dequantized inside the tile load, so prefill needs no full-history F16 scratch. Indexed by
+    // KvqIndex (0 = q8q8, 1 = q4q4, 2 = q8q4, 3 = q4q8); same best-effort load as the F16 kernel.
+    private readonly CudaModule? _attentionFlashPrefillHd256KvqModule;
+    private readonly nint[] _attentionFlashPrefillHd256KvqFuncs = new nint[4];
+
     private readonly CudaModule? _attentionMmaDecodeKvqModule;
     private readonly nint[] _attentionMmaDecodeKvqFuncs = new nint[4];
     private readonly int[] _attentionMmaDecodeKvqMaxCoResident = { -1, -1, -1, -1 };
@@ -1438,6 +1445,37 @@ public sealed unsafe partial class CudaKernels : IDisposable
                 _attentionFlashPrefillHd256Func = 0;
             }
         }
+
+        // Quantized-KV flash prefill (issue #1094): same arch, geometry and shared-memory budget
+        // as the F16 kernel, so the same opt-in cap applies to every entry.
+        string attentionFlashPrefillHd256KvqPath = Path.Combine(ptxDir, "attention_flash_mma_prefill_hd256_kvq.ptx");
+        if (File.Exists(attentionFlashPrefillHd256KvqPath))
+        {
+            try
+            {
+                var m = CudaModule.LoadFromFile(attentionFlashPrefillHd256KvqPath);
+                string[] names =
+                {
+                    "attention_flash_mma_prefill_hd256_kvq_q8q8",
+                    "attention_flash_mma_prefill_hd256_kvq_q4q4",
+                    "attention_flash_mma_prefill_hd256_kvq_q8q4",
+                    "attention_flash_mma_prefill_hd256_kvq_q4q8",
+                };
+                for (int i = 0; i < names.Length; i++)
+                {
+                    nint f = m.TryGetFunction(names[i]);
+                    if (f != 0)
+                        SetMaxDynamicSharedBytes(f, AttentionFlashPrefillHd256MaxSmemBytes);
+                    _attentionFlashPrefillHd256KvqFuncs[i] = f;
+                }
+                _attentionFlashPrefillHd256KvqModule = m;
+            }
+            catch (CudaException)
+            {
+                _attentionFlashPrefillHd256KvqModule = null;
+                Array.Clear(_attentionFlashPrefillHd256KvqFuncs);
+            }
+        }
     }
 
     /// <summary>
@@ -1503,6 +1541,66 @@ public sealed unsafe partial class CudaKernels : IDisposable
     {
         if (_attentionFlashPrefillHd256Func == 0)
             throw new InvalidOperationException("attention_flash_mma_prefill_hd256 kernel is not loaded.");
+        LaunchAttentionFlashPrefillHd256Core(_attentionFlashPrefillHd256Func, q, k, v, output,
+            seqQ, seqKv, numHeads, numKvHeads, positionOffset, stream, scale);
+    }
+
+    /// <summary>
+    /// True when the quantized-KV flash prefill kernel (issue #1094,
+    /// <c>attention_flash_mma_prefill_hd256_kvq.ptx</c>) for this K/V format pair is loaded.
+    /// Supported pairs: every combination of <see cref="KvCacheDType.Q8_0"/> and <see cref="KvCacheDType.Q4_0"/>.
+    /// </summary>
+    /// <param name="k">K cache element format.</param>
+    /// <param name="v">V cache element format.</param>
+    /// <returns><see langword="true"/> when <see cref="LaunchAttentionFlashPrefillHd256Kvq"/> can run this pair.</returns>
+    public bool HasAttentionFlashPrefillHd256Kvq(KvCacheDType k, KvCacheDType v)
+    {
+        int i = KvqIndex(k, v);
+        return i >= 0 && _attentionFlashPrefillHd256KvqFuncs[i] != 0;
+    }
+
+    /// <summary>
+    /// <see cref="LaunchAttentionFlashPrefillHd256"/> reading the KV history straight from KV-format
+    /// Q8_0 / Q4_0 blocks (issue #1094): each K/V tile is dequantized into the kernel's shared
+    /// memory as it is loaded, so no full-history F16 scratch is needed. Same grid, block, shared
+    /// memory and output contract as the F16 kernel; bit-identical to
+    /// <see cref="LaunchKvDequantToF16"/> into scratch followed by the F16 kernel.
+    /// </summary>
+    /// <param name="q">F16 queries <c>[seqQ, numHeads*256]</c>.</param>
+    /// <param name="k">Raw K blocks, logical layout <c>[seqKv, numKvHeads*256]</c> in <paramref name="kDtype"/>.</param>
+    /// <param name="v">Raw V blocks, logical layout <c>[seqKv, numKvHeads*256]</c> in <paramref name="vDtype"/>.</param>
+    /// <param name="kDtype">K block format (Q8_0 or Q4_0).</param>
+    /// <param name="vDtype">V block format (Q8_0 or Q4_0).</param>
+    /// <param name="output">F32 output <c>[seqQ, numHeads*256]</c>.</param>
+    /// <param name="seqQ">Query rows.</param>
+    /// <param name="seqKv">KV rows (history including the query rows).</param>
+    /// <param name="numHeads">Query heads.</param>
+    /// <param name="numKvHeads">KV heads.</param>
+    /// <param name="positionOffset">Absolute position of query row 0.</param>
+    /// <param name="stream">CUDA stream.</param>
+    /// <param name="scale">Softmax scale; 0 means <c>1/sqrt(256)</c>.</param>
+    /// <exception cref="InvalidOperationException">The kernel for this K/V pair is not loaded.</exception>
+    /// <exception cref="ArgumentException"><paramref name="k"/> or <paramref name="v"/> is not 16-byte aligned.</exception>
+    public void LaunchAttentionFlashPrefillHd256Kvq(nint q, nint k, nint v, KvCacheDType kDtype, KvCacheDType vDtype,
+        nint output, int seqQ, int seqKv, int numHeads, int numKvHeads, int positionOffset, nint stream,
+        float scale = 0f)
+    {
+        int idx = KvqIndex(kDtype, vDtype);
+        if (idx < 0 || _attentionFlashPrefillHd256KvqFuncs[idx] == 0)
+            throw new InvalidOperationException(
+                $"attention_flash_mma_prefill_hd256_kvq kernel for {kDtype}/{vDtype} is not loaded.");
+        // The kernel cp.async-copies whole raw KV rows (272 / 144 B, multiples of 16) in 16-byte chunks.
+        if (((k | v) & 15) != 0)
+            throw new ArgumentException("Quantized K/V base pointers must be 16-byte aligned.");
+        LaunchAttentionFlashPrefillHd256Core(_attentionFlashPrefillHd256KvqFuncs[idx], q, k, v, output,
+            seqQ, seqKv, numHeads, numKvHeads, positionOffset, stream, scale);
+    }
+
+    // Shared launch for the F16 and quantized-KV flash prefill entries: identical argument list,
+    // grid (q tiles x KV heads), block (one warp per GQA query head) and dynamic shared memory.
+    private static void LaunchAttentionFlashPrefillHd256Core(nint func, nint q, nint k, nint v, nint output,
+        int seqQ, int seqKv, int numHeads, int numKvHeads, int positionOffset, nint stream, float scale)
+    {
         DotLLM.Core.Attention.AttentionSpanInvariant.AssertTight(seqKv, positionOffset, seqQ, "CUDA");
 
         int group = numHeads / numKvHeads;
@@ -1512,7 +1610,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
 
         void** args = stackalloc void*[] { &qArg, &kArg, &vArg, &oArg, &sqArg, &skvArg, &nhArg, &nkvArg, &poArg, &scArg };
         uint gridX = (uint)((seqQ + 15) / 16);
-        CudaDriverApi.cuLaunchKernel(_attentionFlashPrefillHd256Func,
+        CudaDriverApi.cuLaunchKernel(func,
                 gridX, (uint)numKvHeads, 1, (uint)(group * 32), 1, 1,
                 (uint)AttentionFlashPrefillHd256SmemBytes(group), stream, (nint)args, 0).ThrowOnError();
     }

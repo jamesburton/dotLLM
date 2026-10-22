@@ -66,6 +66,7 @@ public sealed class CudaQwen3HybridDensePerRowKvqVerifyTests
         kv.Rollback(Prefix);
         model.RestoreRecurrentState(afterPrefix);
         model.PerRowKvqForTest = false;
+        model.FlashPrefillHd256KvqForTest = false;   // the reference arm must be the F16-scratch path (the kvq tier would also skip the dequant)
         dequantBefore = model.DebugKvDequantCallsForTest;
         float[][] scratch = RunRows(model, kv, rows, rowPositions, config.VocabSize);
         Assert.Equal(2 * attentionLayers, model.DebugKvDequantCallsForTest - dequantBefore);

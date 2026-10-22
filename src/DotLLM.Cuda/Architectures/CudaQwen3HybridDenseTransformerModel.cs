@@ -330,6 +330,36 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     /// <summary>Test-only: prefill attention calls served by the head_dim-256 flash kernel.</summary>
     internal int DebugFlashPrefillHd256CallsForTest { get; private set; }
 
+    /// <summary>
+    /// Issue #1094: with both K and V quantized, serve the flash prefill through the kernel that reads the Q8_0 / Q4_0
+    /// blocks directly (dequantized per 16-row tile in shared memory), so no full-history F16 scratch is built. Default
+    /// ON; settable so tests can A/B it against dequant-to-scratch + the F16 kernel, which it matches bit for bit.
+    /// </summary>
+    internal bool FlashPrefillHd256KvqForTest { get; set; } = true;
+
+    /// <summary>Test-only: prefill attention calls served by the quantized-KV head_dim-256 flash kernel.</summary>
+    internal int DebugFlashPrefillHd256KvqCallsForTest { get; private set; }
+
+    /// <summary>Test-only: whether the quantized-KV flash prefill kernel is loaded for the effective K/V storage pair.</summary>
+    internal bool HasFlashPrefillHd256KvqKernelForTest => _kernels.HasAttentionFlashPrefillHd256Kvq(_kvKeyDType, _kvValueDType);
+
+    /// <summary>The head_dim-256 flash prefill kernel is enabled, loaded and fits the given head shape.</summary>
+    /// <param name="numHeads">Query heads of the attention layer.</param>
+    /// <param name="numKvHeads">KV heads of the attention layer.</param>
+    /// <param name="headDim">Head dimension.</param>
+    /// <returns><see langword="true"/> when a multi-row forward over this shape can use the flash prefill kernel.</returns>
+    private bool FlashPrefillHd256Eligible(int numHeads, int numKvHeads, int headDim) => FlashPrefillHd256ForTest
+        && _kernels.HasAttentionFlashPrefillHd256
+        && CudaKernels.IsAttentionFlashPrefillHd256Shape(numHeads, numKvHeads, headDim);
+
+    /// <summary>
+    /// Both K and V are quantized and the flash prefill kernel that reads those blocks directly is enabled and loaded
+    /// (issue #1094). Applies only where <see cref="FlashPrefillHd256Eligible"/> does.
+    /// </summary>
+    private bool FlashPrefillHd256KvqEligible => FlashPrefillHd256KvqForTest
+        && IsQuantKv(_kvKeyDType) && IsQuantKv(_kvValueDType)
+        && _kernels.HasAttentionFlashPrefillHd256Kvq(_kvKeyDType, _kvValueDType);
+
     private nint _attnFlashPrefillQF16;
     private long _attnFlashPrefillQF16ElemsAllocated;
 
@@ -401,7 +431,8 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
 
     /// <summary>
     /// Peak device bytes one context token costs while serving (issue #1068): its K/V rows in every attention slot under the
-    /// effective storage, the F16 dequant scratch a quantized-KV prefill tile fills over the whole history, the F32 staging
+    /// effective storage, the F16 dequant scratch a quantized-KV prefill tile fills over the whole history (none when the
+    /// quantized-KV flash prefill kernel serves it, issue #1094), the F32 staging
     /// when the flash-prefill kernel cannot run, and, with MTP, the head's F32 K/V counted twice because a lazy growth
     /// copies into a new buffer while the old one is still allocated.
     /// </summary>
@@ -411,10 +442,14 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     {
         int kvElems = Config.NumKvHeads * Config.HeadDim;
         long bytes = ComputeKvBytes(1);
-        int quantSides = (IsQuantKv(_kvKeyDType) ? 1 : 0) + (IsQuantKv(_kvValueDType) ? 1 : 0);
-        bytes += (long)quantSides * kvElems * sizeof(ushort);
-        bool flashPrefill = FlashPrefillHd256ForTest && _kernels.HasAttentionFlashPrefillHd256
-            && CudaKernels.IsAttentionFlashPrefillHd256Shape(Config.NumAttentionHeads, Config.NumKvHeads, Config.HeadDim);
+        bool flashPrefill = FlashPrefillHd256Eligible(Config.NumAttentionHeads, Config.NumKvHeads, Config.HeadDim);
+        // Issue #1094: the quantized-KV flash prefill builds no full-history F16 scratch. The decode tiers that still
+        // dequantize (short histories below the mma split minimum) need only a bounded scratch, not a per-token one.
+        if (!(flashPrefill && FlashPrefillHd256KvqEligible))
+        {
+            int quantSides = (IsQuantKv(_kvKeyDType) ? 1 : 0) + (IsQuantKv(_kvValueDType) ? 1 : 0);
+            bytes += (long)quantSides * kvElems * sizeof(ushort);
+        }
         if (!flashPrefill)
             bytes += 2L * kvElems * sizeof(float);
         if (mtp && _mtpHead is { } head)
@@ -3648,16 +3683,17 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
             // F32 copy is allocated or converted at all. Tier precedence mirrors the dispatch
             // chain: the #226 fp64-combine toggle wins over mma, then mma, then the F32 tiers.
             // Issue #962: tensor-core flash prefill (head_dim 256) reads the F16 view directly too.
-            bool useFlashPrefillHd256 = seqLen > 1 && !perRowKvq
-                && FlashPrefillHd256ForTest
-                && _kernels.HasAttentionFlashPrefillHd256
-                && CudaKernels.IsAttentionFlashPrefillHd256Shape(numHeads, numKvHeads, headDim);
+            bool useFlashPrefillHd256 = seqLen > 1 && !perRowKvq && FlashPrefillHd256Eligible(numHeads, numKvHeads, headDim);
+            // Issue #1094: over quantized K and V the flash prefill reads the blocks directly (one 16-row tile at a time,
+            // dequantized in shared memory), so neither a prefill tile nor a verify wider than the per-row tier builds the
+            // full-history F16 scratch.
+            bool useFlashPrefillHd256Kvq = useFlashPrefillHd256 && FlashPrefillHd256KvqEligible;
             bool needF32Stage = !useFlashPrefillHd256 && !perRowKvq && (useSplitKvHpAttn || !useMmaDecodeGqaSplitAttn);
             nint kStage = 0, vStage = 0;
             // F16 view of K/V history: the persistent cache, or a fresh dequant into the shared
             // scratch when KV storage is quantized (Phase 2).
             nint kF16 = 0, vF16 = 0;
-            if (!fusedKvqDecode && !perRowKvq)
+            if (!fusedKvqDecode && !perRowKvq && !useFlashPrefillHd256Kvq)
             {
                 kF16 = ResolveKvF16(slot, isKey: true, seqKv, kvElems, streamH);
                 vF16 = ResolveKvF16(slot, isKey: false, seqKv, kvElems, streamH);
@@ -3718,8 +3754,17 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
                     _attnFlashPrefillQF16ElemsAllocated = qElemsAll;
                 }
                 _kernels.LaunchConvertF32ToF16(q, _attnFlashPrefillQF16, (int)qElemsAll, streamH);
-                _kernels.LaunchAttentionFlashPrefillHd256(_attnFlashPrefillQF16, kF16, vF16, attnOut,
-                    seqLen, seqKv, numHeads, numKvHeads, positionOffset, streamH);
+                if (useFlashPrefillHd256Kvq)
+                {
+                    _kernels.LaunchAttentionFlashPrefillHd256Kvq(_attnFlashPrefillQF16, _kQuant![slot], _vQuant![slot],
+                        _kvKeyDType, _kvValueDType, attnOut, seqLen, seqKv, numHeads, numKvHeads, positionOffset, streamH);
+                    DebugFlashPrefillHd256KvqCallsForTest++;
+                }
+                else
+                {
+                    _kernels.LaunchAttentionFlashPrefillHd256(_attnFlashPrefillQF16, kF16, vF16, attnOut,
+                        seqLen, seqKv, numHeads, numKvHeads, positionOffset, streamH);
+                }
                 DebugFlashPrefillHd256CallsForTest++;
             }
             else if (useSplitKvHpAttn)
