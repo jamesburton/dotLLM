@@ -80,7 +80,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
         const long F = sizeof(float);
 
         long weights = hidden * F + Raw(outputQt, outputM, outputK);
-        long maxTile = (long)outputM * outputK;
+        long maxTile = 0;   // #1099: layers only — the LM head is dequantized in tiles of at most this
         long maxK = outputK, maxM = outputM;
         int maxInter = 0, numSsm = 0;
         var moeSpec = default(MoeScratchSpec);
