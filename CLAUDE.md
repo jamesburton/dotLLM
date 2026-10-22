@@ -125,6 +125,39 @@ dotLLM/
 - Tensor metadata (shape, stride, pointer): structs, not classes.
 - GC: Server GC, `SustainedLowLatency` mode during inference.
 
+## Precision & Expansion Rules (user decisions, 2026-10-22, #1107)
+
+These are hard rules. Breaking either one needs **strong measured evidence and the user's explicit sign-off**, recorded in
+the issue/PR. Reference/baseline comparisons (tests, oracles, A/B measurements) are the only standing exception.
+
+### 1. No FP32 tensor storage on hot paths
+
+- FP32 gives no meaningful accuracy gain over FP16/BF16 almost anywhere in LLM inference. It doubles memory and bandwidth,
+  and is slower on everything except legacy FP32-only hardware.
+- **FP16/BF16 is the widest default** for anything stored or streamed: KV caches, activations, staging and scratch buffers,
+  embedding/LM-head tables, recurrent/MTP state buffers, and inter-kernel tensors.
+- **Always evaluate formats below FP16 too** (q8_0, q4_0, FP8/MXFP4 where the hardware supports them). Pick on measured
+  memory *and* speed, and state per-token or per-tensor byte costs in the PR.
+- *Out of scope:* in-register accumulation inside a kernel (FP32 accumulators for dot products, softmax, norms) and single
+  scalars. Those are arithmetic, not stored data.
+- Model-declared FP32 state (e.g. an HF `mamba_ssm_dtype: float32`) is evidence to cite in the PR, not an automatic
+  exemption.
+- Existing FP32 stores on hot paths are tracked for removal in #1107 (e.g. Vulkan hybrid KV, CUDA MTP head KV, F32 staging,
+  F32-widened embedding tables, CPU `SimpleKvCache`). Don't add new ones.
+
+### 2. Quantized weights (and KV) run quantized — no expansion
+
+- A quantized model's kernels must **read the quantized blocks directly** (dequantize in registers or shared memory inside
+  the tile load), never expand weights or KV history into a wider stored copy: F16/F32 scratch, staged copies, or upload-time
+  transcodes to a wider type.
+- Expansion blows up VRAM/RAM and blocks models or contexts that should fit. Treat it as a **defect to remove, not a cost to
+  budget around**.
+- Where no in-place kernel exists yet for a quant type or shape, that is a gap to fill. Until it is filled, any expansion
+  fallback must be bounded, admitted against free device memory (never spill), logged, and listed with its byte cost in the
+  PR.
+- Known expansions being removed: the full-history KV dequant scratch (fixed for Bonsai-2 prefill in #1094), the LM head
+  over more than 8 rows (#1099), and the per-projection F16 weight dequant on prefill GEMMs (#495, audit in #1107).
+
 ## Model & Fixture Storage Rules
 
 **Model weights NEVER live in the repository, and are never committed.** They belong in the
