@@ -26,8 +26,8 @@
 // cell for any row of the workgroup takes a scalar P.V (`precise`, F32 accumulation over F16 P and V) instead of the matrix one,
 // gated by the REQUIRE_INVARIANT_PV specialization constant (0 on NVIDIA, which measured clean).
 //
-// KV storage (the .comp wrapper): KV_F16 reads F16 rows in place (BC = 32); the default reads F32 rows and splits K into hi/lo
-// halves for QK^T (BC = 16 so both K tiles fit). Nothing widens the history: each element is converted in the tile load. A future
+// KV storage (the .comp wrapper): KV_F16 reads F16 rows in place (BC = 32); the default reads F32 rows and splits K and V into
+// hi/lo halves (one more MMA each for QK^T and P.V; BC = 16 so both tiles fit), so the F32 baseline is not rounded to F16. Nothing widens the history: each element is converted in the tile load. A future
 // q8_0 cache is one more KV_LOAD_TILE body.
 //
 // LDS (KV_F16): K/V tile 32 x 264 f16 (16.5 KiB) + scores 4 x 16 x 36 f32 (9 KiB) + P 4 x 16 x 40 f16 (5 KiB) = 30.5 KiB, under
@@ -64,6 +64,9 @@
 #define NEG_INF         (-3.4e38)
 
 layout(constant_id = 0) const uint REQUIRE_INVARIANT_PV = 1u;
+// 1 (default): QK^T adds the Q lo-half term (see the header). 0 drops it: 1.6x faster at depth on Strix (6.1-6.3 vs 3.8 TFLOP/s),
+// but Q is then rounded to F16. Off only for a measured A/B (DOTLLM_VULKAN_FA_GQA_QLO=0) until perplexity parity is shown.
+layout(constant_id = 2) const uint QK_SPLIT_Q = 1u;
 layout(local_size_x_id = 1, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std430) readonly  buffer BufQ   { float q[]; };      // [seq_q, num_heads * head_dim] F32
@@ -94,7 +97,7 @@ layout(push_constant) uniform PushConstants {
 
 shared f16vec4   kvT[BC * T_STRIDE4];            // K tile (hi), then V tile
 #if !defined(KV_F16)
-shared f16vec4   kLoT[BC * T_STRIDE4];           // K lo halves (F32 K only)
+shared f16vec4   kLoT[BC * T_STRIDE4];           // K lo, then V lo halves (F32 KV only)
 #endif
 shared float     sS[NSTRIP * S_STRIP];
 shared float16_t sP[NSTRIP * P_STRIP];
@@ -105,29 +108,48 @@ bool isMasked(uint tkv, uint posQ) {
     return tkv > posQ;
 }
 
-// Stages K (which == 0) or V (which == 1) rows [tStart, tStart + tileLen) of KV head hkv; rows past tileLen and dims past
-// headDim are zero, so the 16-wide inner products never read garbage.
-void loadTile(uint which, uint tStart, uint tileLen, uint hkv, uint hd4, uint kvStride4) {
-    uint total = uint(BC) * uint(MAX_HEAD_DIM / 4);
-    for (uint idx = gl_LocalInvocationIndex; idx < total; idx += gl_WorkGroupSize.x) {
-        uint c  = idx / uint(MAX_HEAD_DIM / 4);
-        uint d4 = idx - c * uint(MAX_HEAD_DIM / 4);
-        uint dst = c * uint(T_STRIDE4) + d4;
-        if (c < tileLen && d4 < hd4) {
-            uint src = (tStart + c) * kvStride4 + hkv * hd4 + d4;
+// K / V tiles move global -> registers -> LDS in two steps so the global fetch of the NEXT tile is in flight while this tile is
+// being multiplied (fetch V during QK^T, fetch the next K during P.V). Rows past tileLen and dims past headDim are zero, so the
+// 16-wide inner products never read garbage.
 #if defined(KV_F16)
-            uvec2 w = (which == 0u) ? k4[src] : v4[src];
-            kvT[dst] = f16vec4(vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y)));
+#define KVREG uvec2
+#define KVREG_ZERO uvec2(0u)
 #else
-            vec4 x = (which == 0u) ? k4[src] : v4[src];
-            f16vec4 hi = f16vec4(x);
-            kvT[dst] = hi;
-            if (which == 0u) kLoT[dst] = f16vec4(x - vec4(hi));
+#define KVREG vec4
+#define KVREG_ZERO vec4(0.0)
 #endif
-        } else {
-            kvT[dst] = f16vec4(0.0);
-#if !defined(KV_F16)
-            if (which == 0u) kLoT[dst] = f16vec4(0.0);
+#define TILE_VEC4   (BC * (MAX_HEAD_DIM / 4))
+#define PF_MAX      (TILE_VEC4 / 128)          // per-invocation share at the smallest workgroup (4 x 32 lanes)
+KVREG pf[PF_MAX];
+
+void fetchTile(uint which, uint tStart, uint tileLen, uint hkv, uint hd4, uint kvStride4) {
+    [[unroll]] for (uint i = 0u; i < uint(PF_MAX); i++) {
+        uint idx = gl_LocalInvocationIndex + i * gl_WorkGroupSize.x;
+        KVREG x = KVREG_ZERO;
+        if (idx < uint(TILE_VEC4)) {
+            uint c  = idx / uint(MAX_HEAD_DIM / 4);
+            uint d4 = idx - c * uint(MAX_HEAD_DIM / 4);
+            if (c < tileLen && d4 < hd4) {
+                uint src = (tStart + c) * kvStride4 + hkv * hd4 + d4;
+                x = (which == 0u) ? k4[src] : v4[src];
+            }
+        }
+        pf[i] = x;
+    }
+}
+
+void storeTile() {
+    [[unroll]] for (uint i = 0u; i < uint(PF_MAX); i++) {
+        uint idx = gl_LocalInvocationIndex + i * gl_WorkGroupSize.x;
+        if (idx < uint(TILE_VEC4)) {
+            uint c  = idx / uint(MAX_HEAD_DIM / 4);
+            uint dst = c * uint(T_STRIDE4) + (idx - c * uint(MAX_HEAD_DIM / 4));
+#if defined(KV_F16)
+            kvT[dst] = f16vec4(vec4(unpackHalf2x16(pf[i].x), unpackHalf2x16(pf[i].y)));
+#else
+            f16vec4 hi = f16vec4(pf[i]);
+            kvT[dst] = hi;
+            kLoT[dst] = f16vec4(pf[i] - vec4(hi));   // K lo for QK^T, then V lo for P.V
 #endif
         }
     }
@@ -174,7 +196,7 @@ void main() {
         qh[dc] = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>(0.0);
         ql[dc] = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>(0.0);
         if (stripLive && dc < hdChunks) {
-            for (uint half_ = 0u; half_ < 2u; half_++) {
+            for (uint half_ = 0u; half_ < (QK_SPLIT_Q != 0u ? 2u : 1u); half_++) {
                 for (uint e = lane; e < 256u; e += sgSize) {
                     uint r = e >> 4u;
                     uint d = dc * 16u + (e & 15u);
@@ -213,15 +235,17 @@ void main() {
     uint wgFirstPos   = pc.positionOffset + wgRow0 / G;
     uint stripLastPos = pc.positionOffset + (stripLive ? (stripRowEnd - 1u) / G : 0u);
 
+    fetchTile(0u, 0u, min(uint(BC), kvEnd), hkv, hd4, kvStride4);
     for (uint tStart = 0u; tStart < kvEnd; tStart += uint(BC)) {
         uint tileLen = min(uint(BC), kvEnd - tStart);
         bool tileSafe = (REQUIRE_INVARIANT_PV == 0u)
             || (tileLen == uint(BC) && (pc.maskMode == 1u || (tStart + uint(BC)) <= wgFirstPos + 1u));
         bool stripOn = stripLive && (pc.maskMode != 0u || tStart <= stripLastPos);
 
-        // 2a. K tile.
-        loadTile(0u, tStart, tileLen, hkv, hd4, kvStride4);
+        // 2a. K tile (fetched during the previous tile's P.V); start fetching this tile's V.
+        storeTile();
         barrier();
+        fetchTile(1u, tStart, tileLen, hkv, hd4, kvStride4);
 
         float corr = 1.0;
         if (stripOn) {
@@ -234,7 +258,7 @@ void main() {
                         coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> kt;
                         coopMatLoad(kt, kvT, cf * 16u * uint(T_STRIDE4) + dc * 4u, uint(T_STRIDE4), gl_CooperativeMatrixLayoutColumnMajor);
                         acc = coopMatMulAdd(qh[dc], kt, acc);
-                        acc = coopMatMulAdd(ql[dc], kt, acc);
+                        if (QK_SPLIT_Q != 0u) acc = coopMatMulAdd(ql[dc], kt, acc);
 #if !defined(KV_F16)
                         coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> ktLo;
                         coopMatLoad(ktLo, kLoT, cf * 16u * uint(T_STRIDE4) + dc * 4u, uint(T_STRIDE4), gl_CooperativeMatrixLayoutColumnMajor);
@@ -305,9 +329,12 @@ void main() {
         }
         barrier();   // every strip is done with the K tile
 
-        // 2e. V tile.
-        loadTile(1u, tStart, tileLen, hkv, hd4, kvStride4);
+        // 2e. V tile; start fetching the next K tile.
+        storeTile();
         barrier();
+        if (tStart + uint(BC) < kvEnd) {
+            fetchTile(0u, tStart + uint(BC), min(uint(BC), kvEnd - tStart - uint(BC)), hkv, hd4, kvStride4);
+        }
 
         if (stripOn) {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> pm[CF];
@@ -322,6 +349,11 @@ void main() {
                             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> vm;
                             coopMatLoad(vm, kvT, cf * 16u * uint(T_STRIDE4) + j * 4u, uint(T_STRIDE4), gl_CooperativeMatrixLayoutRowMajor);
                             o[j] = coopMatMulAdd(pm[cf], vm, o[j]);
+#if !defined(KV_F16)
+                            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> vl;
+                            coopMatLoad(vl, kLoT, cf * 16u * uint(T_STRIDE4) + j * 4u, uint(T_STRIDE4), gl_CooperativeMatrixLayoutRowMajor);
+                            o[j] = coopMatMulAdd(pm[cf], vl, o[j]);
+#endif
                         }
                     }
                 }
@@ -335,7 +367,11 @@ void main() {
                             precise float acc = 0.0;
                             for (uint c = 0u; c < tileLen; c++) {
                                 f16vec4 v = kvT[c * uint(T_STRIDE4) + (d >> 2u)];
-                                acc += float(sP[pBase + r * uint(P_STRIDE) + c]) * float(v[d & 3u]);
+                                float vv = float(v[d & 3u]);
+#if !defined(KV_F16)
+                                vv += float(kLoT[c * uint(T_STRIDE4) + (d >> 2u)][d & 3u]);
+#endif
+                                acc += float(sP[pBase + r * uint(P_STRIDE) + c]) * vv;
                             }
                             sS[sBase + e] = acc;
                         }

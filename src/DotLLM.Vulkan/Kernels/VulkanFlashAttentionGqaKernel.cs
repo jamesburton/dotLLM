@@ -38,6 +38,12 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
     /// <summary>Environment variable: <c>scalar</c> forces the scalar implementation even on a cooperative-matrix device (A/B).</summary>
     public const string ForceScalarEnvVar = "DOTLLM_VULKAN_FA_GQA_SCALAR";
 
+    /// <summary>
+    /// Environment variable: <c>0</c> drops the cooperative-matrix QK^T's Q lo-half term (Q rounded to F16). Measured 1.6x faster at
+    /// depth on Strix; an accuracy A/B knob until Bonsai perplexity parity is shown, so the default keeps the split.
+    /// </summary>
+    public const string SplitQEnvVar = "DOTLLM_VULKAN_FA_GQA_QLO";
+
     private const string CoopmatShader = "attention_flash_gqa_cm";
     private const string ScalarShader = "attention_flash_gqa";
     private const int PushConstantBytes = 12 * sizeof(uint);
@@ -133,7 +139,8 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
         }
 
         uint gate = VulkanFlashAttentionCoopmatKernel.RequiresInvariantPv(device.VendorId);
-        ReadOnlySpan<uint> spec = [gate, 4 * sg];
+        uint splitQ = Environment.GetEnvironmentVariable(SplitQEnvVar) == "0" ? 0u : 1u;
+        ReadOnlySpan<uint> spec = [gate, 4 * sg, splitQ];
         return TryBuild(device, spvDir, kvStorage.ShaderName(CoopmatShader), pin, spec, isCoopmat: true, kvStorage);
     }
 

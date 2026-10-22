@@ -117,6 +117,7 @@ public sealed class VulkanFlashAttentionGqaKernelTests
 
         float absTol = impl == Impl.Coopmat ? CoopmatAbsTol : ScalarAbsTol;
         float relTol = impl == Impl.Coopmat ? CoopmatRelTol : ScalarRelTol;
+        var failures = new List<string>();
         foreach (VulkanKvStorage storage in new[] { VulkanKvStorage.F32, VulkanKvStorage.F16 })
         {
             using var kernel = impl == Impl.Coopmat
@@ -131,9 +132,12 @@ public sealed class VulkanFlashAttentionGqaKernelTests
             var (bk, bv) = storage == VulkanKvStorage.F16 ? (bufK16, bufV16) : (bufK32, bufV32);
             kernel.Launch(bufQ, bk, bv, bufOut, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset);
             device.Download(bufOut, actual);
-            AssertClose(storage == VulkanKvStorage.F16 ? expected16 : expected32, actual, absTol, relTol,
+            string? failure = Compare(storage == VulkanKvStorage.F16 ? expected16 : expected32, actual, absTol, relTol,
                 $"{impl} {storage} on {device.DeviceName}");
+            if (failure is not null) failures.Add(failure);
         }
+
+        Assert.True(failures.Count == 0, string.Join(Environment.NewLine, failures));
     }
 
     private static float[] RandomFloats(Random rng, int count, float scale)
@@ -143,7 +147,7 @@ public sealed class VulkanFlashAttentionGqaKernelTests
         return a;
     }
 
-    private static void AssertClose(float[] expected, float[] actual, float absTol, float relTol, string what)
+    private static string? Compare(float[] expected, float[] actual, float absTol, float relTol, string what)
     {
         int errors = 0, first = -1;
         float maxAbs = 0, maxRel = 0;
@@ -161,8 +165,8 @@ public sealed class VulkanFlashAttentionGqaKernelTests
             }
         }
 
-        Assert.True(errors == 0,
-            $"{what}: {errors}/{expected.Length} outside abs {absTol} / rel {relTol} (max abs {maxAbs:G6}, max rel {maxRel:G6}, " +
+        return errors == 0 ? null :
+            ($"{what}: {errors}/{expected.Length} outside abs {absTol} / rel {relTol} (max abs {maxAbs:G6}, max rel {maxRel:G6}, " +
             $"first [{first}] {(first >= 0 ? expected[first] : 0):G6} vs {(first >= 0 ? actual[first] : 0):G6})");
     }
 }
