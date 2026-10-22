@@ -113,6 +113,17 @@ length-only `CudaHybridKvCacheHandle`. Per full-attention slot (16 of 64 layers 
   MTP is 18 KiB/token (KV rows only). `CudaQwen3HybridDenseTransformerModel.FlashPrefillHd256KvqForTest` turns the tier off
   for A/B tests. Remaining `ResolveKvF16` callers (decode with `DOTLLM_HYBRID_KV_FUSED=0`, decode below the mma split
   minimum, the F32 fallback tiers) still allocate the scratch on demand, admitted against free VRAM.
+- **The MTP head's KV follows the trunk's type (#1095).** `CudaMtpState` used to keep the head's one attention layer in F32
+  (8 KiB/token on Bonsai-2) and grow it by copying, so the fit counted 16 KiB/token, more than the q4_0 trunk's 16 layers
+  together (18 KiB). The head now stores K/V in the trunk's type per side: Q8_0 / Q4_0 (and the mixed pairs) when the fused
+  quantized-KV decode kernel takes the head's shape, otherwise F16, never wider (#1107). Rows are written exactly like the
+  trunk's (F32 -> F16 staging -> `quant_f16_to_q{8,4}_0`), byte for byte. A draft step reads the history in place with
+  `attention_flash_mma_decode_gqa_split_kvq_*` (quantized) or the F16 tensor-core decode kernel; below their 256-key minimum
+  the short history goes through the dequant scratch and the F32 kernel, which that minimum bounds. The head's attention reads
+  are all single-row draft steps (the absorb writes K/V only), so the prefill and per-row verify tiers never see its cache.
+  K, V and the position iota grow **in place** with `CudaGrowableDeviceBuffer` (address range reserved for the ceiling, pages
+  mapped on growth); without the VMM API the copying growth remains. Per token on Bonsai-2: q4_0 **1,156 B** (2 x 576 + 4 iota),
+  q8_0 2,180 B, f16 4,100 B, against 16,392 B counted before. `DOTLLM_CUDA_MTP_KV=f32` restores F32 storage for A/B runs only.
 - **KV Q4_0 is not the GGUF Q4_0 layout.** KV blocks pack ADJACENT PAIRS (low nibble = even element), matching CPU
   `KvQuantize` and `quant_kv.cu`; the weight dequant (`dequant_q4_0_f16`) unpacks low/high HALVES. Always use
   `CudaKernels.LaunchKvDequantToF16` for KV data. (The eager `CudaQuantizedKvCache` path used the weight dequant until

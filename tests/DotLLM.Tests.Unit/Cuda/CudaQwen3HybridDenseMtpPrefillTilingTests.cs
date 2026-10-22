@@ -122,8 +122,9 @@ public sealed class CudaQwen3HybridDenseMtpPrefillTilingTests : IDisposable
             }
 
             int n = state.CurrentLength * state.KvStride;
-            float[] keys = Download(state.KeyCacheDevicePtr, n);
-            float[] values = Download(state.ValueCacheDevicePtr, n);
+            // Issue #1095: the head stores its KV in the trunk's type (F16 on this synthetic F16 trunk); widen on the host to compare.
+            float[] keys = DownloadRows(state.KeyCacheDevicePtr, n, state.KeyFormat);
+            float[] values = DownloadRows(state.ValueCacheDevicePtr, n, state.ValueFormat);
             float[] pending = Download(state.PendingHiddenDevicePtr, config.HiddenSize);
             using ITensor draft = model.ForwardMtp(state, 3, SeqLen);
             float[] draftLogits = new ReadOnlySpan<float>((void*)draft.DataPointer, config.VocabSize).ToArray();
@@ -148,6 +149,18 @@ public sealed class CudaQwen3HybridDenseMtpPrefillTilingTests : IDisposable
             Assert.True(MathF.Abs(expected[i] - actual[i]) <= tol,
                 $"{what}[{i}]: single call {expected[i]:R} vs tiled {actual[i]:R} (tolerance {tol})");
         }
+    }
+
+    /// <summary>Downloads <paramref name="count"/> head-cache elements stored as F32 or F16 and returns them as floats.</summary>
+    private static unsafe float[] DownloadRows(nint devicePtr, int count, CudaMtpKvFormat format)
+    {
+        if (format == CudaMtpKvFormat.F32)
+            return Download(devicePtr, count);
+        Assert.Equal(CudaMtpKvFormat.F16, format);
+        var halves = new Half[count];
+        fixed (Half* h = halves)
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)h, devicePtr, (nuint)((long)count * sizeof(ushort))).ThrowOnError();
+        return Array.ConvertAll(halves, x => (float)x);
     }
 
     private static unsafe float[] Download(nint devicePtr, int count)
