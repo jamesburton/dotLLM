@@ -324,6 +324,30 @@ The dense hybrid host (`VulkanQwen3HybridDenseTransformerModel`, Bonsai 2) can s
   `K_lo` exactly zero.
 - **Bytes per decoded token** (Bonsai 2, attention only): F32 reads 128 KiB per cached position, F16 reads 64 KiB.
   At 128k that is 16 GiB vs 8 GiB per decoded token.
+- **GQA-grouped decode pass** (`attention_f32_splitkv_gqa[_kvf16]`). The split-KV partial pass ran one workgroup per
+  *query* head, so each of a KV head's G query heads streamed the same rows. For Bonsai 2 (24 / 4) that is 6 reads of every
+  cached byte per decoded token. The grouped pass runs one workgroup per (KV head, split). Each K element feeds G dot
+  products (one subgroup per position) and each V element feeds G register accumulators (thread per column). Each query
+  head keeps its own online softmax, handled by one subgroup. The partial layout per (query head, split) and the merge pass
+  are unchanged. It serves 2 ≤ G ≤ 8 and head_dim ≤ 256. The dense hybrid host opts in
+  (`VulkanQwen3MoeHybridKernels.EnableGqaDecode`); `DOTLLM_VULKAN_SPLITKV_GQA=1` / `0` forces it on or off on any host.
+  `VulkanSplitKvAttentionKernelTests` (ALiBi, soft-cap, sliding window, bidirectional, masked tails) and the F16 tests run
+  both passes. `VulkanSplitKvDecodeBench` (`DOTLLM_SPLITKV_DECODE_AB=1`) times all four arms at the Bonsai shape.
+- **Measured** (`VulkanSplitKvDecodeBench`, one layer's decode attention, Bonsai shape 24 / 4 / 256, minimum of 9 interleaved
+  runs, ms; "unique GB/s" counts each cached K / V byte once):
+
+  | Strix (8060S) | 8k | 32k | 64k | 128k | 128k unique GB/s |
+  |---|---|---|---|---|---|
+  | F32, per-query-head | 0.64 | 2.52 | 4.92 | 10.00 | 107 |
+  | F32, GQA-grouped | 0.65 | 2.45 | 4.70 | 9.08 | 118 |
+  | F16, per-query-head | 0.54 | 2.36 | 4.64 | 9.38 | 57 |
+  | **F16, GQA-grouped** | **0.34** | **1.41** | **2.71** | **5.37** | 100 |
+
+  F16 alone does not help the per-query-head pass: its six re-reads per KV head are served from cache, and the pass is
+  bound by issue, not DRAM. F16 needs the grouped pass to pay off. Together they are 1.86x faster than F32 at 128k, at about
+  100 GB/s of unique KV, close to the ~115 GB/s the F32 arms reach. Decode attention is now bandwidth-bound, which is what
+  q8_0 KV (the follow-up) would halve. On the Arc (8k / 32k) the grouped pass is 1.55-1.7x faster for both formats, and F16
+  adds little there: that decode is compute-bound.
 - **Mutants** (shader edits, run on Strix): swapping the half select, reading word `i` instead of `i >> 1`, and a
   `hq % numKvHeads` head broadcast in the F16 split-KV body. Each fails every test of the family it touches, and the
   model-level F16-vs-F32 comparison as well.

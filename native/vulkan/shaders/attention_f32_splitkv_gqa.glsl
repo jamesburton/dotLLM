@@ -8,16 +8,17 @@
 // At long context those reads are the decode cost. Here one workgroup per (KV head, split) reads each K and V element ONCE
 // and applies it to all G query heads:
 //
-//   - scores: one subgroup per KV position, lanes across head_dim; one K load feeds G dot products (G subgroupAdds);
+//   - scores: one subgroup per KV position, lanes across element PAIRS of head_dim (one F16 word); one K load feeds G dot
+//     products (G subgroupAdds);
 //   - online softmax per query head: subgroup s owns heads s, s + nSub, ... (subgroupMax / subgroupAdd over the tile);
-//   - P.V: thread d owns column d (head_dim <= WG_SIZE) and keeps G accumulators in registers; one V load feeds G FMAs.
+//   - P.V: thread c owns columns 2c, 2c + 1 and keeps G vec2 accumulators in registers; one V pair load feeds G FMAs.
 //
 // It writes the same un-normalized partials, per (query head, split), as attention_f32_splitkv.glsl, so the same merge pass
 // (attention_f32_splitkv_merge.comp) finishes the row. Masking (causal / bidirectional / hybrid), sliding window, ALiBi,
 // soft-cap, scale override and kvStart follow attention_f32_splitkv.glsl. Push constants are identical; the dispatch is
 // numKvHeads * numSplits workgroups.
 //
-// Bounds: G <= MAX_GROUP, head_dim <= MAX_HEAD_DIM (= WG_SIZE). LDS: 8 KiB Q + 4 KiB scores.
+// Bounds: G <= MAX_GROUP, head_dim <= MAX_HEAD_DIM and EVEN (the host checks). LDS: 8 KiB Q + 4 KiB scores.
 
 #define TILE_KV      128
 #define MAX_HEAD_DIM 256
@@ -109,11 +110,12 @@ void main() {
     }
 
     float slopes[MAX_GROUP];
-    float acc[MAX_GROUP];
+    vec2 acc[MAX_GROUP];
     for (uint g = 0u; g < MAX_GROUP; g++) {
         slopes[g] = (pc.useAlibi != 0u && g < G) ? alibiSlope(hq0 + g, pc.numHeads) : 0.0;
-        acc[g] = 0.0;
+        acc[g] = vec2(0.0);
     }
+    uint halfDim = pc.headDim >> 1u;
     barrier();
 
     uint nSub   = gl_NumSubgroups;
@@ -142,10 +144,13 @@ void main() {
             float part[MAX_GROUP];
             for (uint g = 0u; g < MAX_GROUP; g++) part[g] = 0.0;
             uint kBase = tkv * kvStride + kvHeadBase;
-            for (uint d = lane; d < pc.headDim; d += sgSize) {
-                float kd = KV_K(kBase + d);
+            for (uint c = lane; c < halfDim; c += sgSize) {
+                vec2 kd = KV_K2(kBase + 2u * c);
                 for (uint g = 0u; g < MAX_GROUP; g++) {
-                    if (g < G) part[g] += qShared[g * MAX_HEAD_DIM + d] * kd;
+                    if (g < G) {
+                        uint qi = g * MAX_HEAD_DIM + 2u * c;
+                        part[g] += qShared[qi] * kd.x + qShared[qi + 1u] * kd.y;
+                    }
                 }
             }
             for (uint g = 0u; g < MAX_GROUP; g++) {
@@ -181,8 +186,9 @@ void main() {
         }
         barrier();
 
-        // 3. P.V: thread d owns column d; one V load feeds all G accumulators. A position every head masked is not read.
-        if (tid < pc.headDim) {
+        // 3. P.V: thread c owns columns 2c, 2c + 1; one V pair load feeds all G accumulators. A position every head masked
+        //    is not read.
+        if (tid < halfDim) {
             for (uint g = 0u; g < MAX_GROUP; g++) {
                 if (g < G) acc[g] *= corr[g];
             }
@@ -192,7 +198,7 @@ void main() {
                     if (g < G) wAny += scoreTile[g * TILE_KV + t];
                 }
                 if (wAny > 0.0) {
-                    float vd = KV_V((tStart + t) * kvStride + kvHeadBase + tid);
+                    vec2 vd = KV_V2((tStart + t) * kvStride + kvHeadBase + 2u * tid);
                     for (uint g = 0u; g < MAX_GROUP; g++) {
                         if (g < G) acc[g] += scoreTile[g * TILE_KV + t] * vd;
                     }
@@ -203,9 +209,13 @@ void main() {
     }
 
     // 4. Partials in the layout of attention_f32_splitkv.glsl: row (hq * numSplits + split).
-    if (tid < pc.headDim) {
+    if (tid < halfDim) {
         for (uint g = 0u; g < MAX_GROUP; g++) {
-            if (g < G) partOut[((hq0 + g) * pc.numSplits + splitId) * pc.headDim + tid] = acc[g];
+            if (g < G) {
+                uint o = ((hq0 + g) * pc.numSplits + splitId) * pc.headDim + 2u * tid;
+                partOut[o] = acc[g].x;
+                partOut[o + 1u] = acc[g].y;
+            }
         }
     }
     if (tid < G) {

@@ -79,6 +79,14 @@ public class VulkanSplitKvAttentionKernelTests
     }
 
     [SkippableFact]
+    public void Decode_Gqa_SplitWiderThanGroupedTile()
+    {
+        // Issue #1102: the GQA-grouped pass splits per KV head (8 here -> S=32), so seqKv=9000 gives 282 positions per split,
+        // three of its 128-row tiles: the cross-tile online-softmax rescale runs (a pass without it fails here).
+        RunOne(seqKv: 9000, numHeads: 32, numKvHeads: 8, headDim: 64, positionOffset: 8999);
+    }
+
+    [SkippableFact]
     public void Decode_Causal_MaskedTail_AcrossSplits()
     {
         // Causal with the query NOT at the last position: posQ=300, seqKv=600.

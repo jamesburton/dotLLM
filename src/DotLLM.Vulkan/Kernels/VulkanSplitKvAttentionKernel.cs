@@ -335,7 +335,7 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
     {
         if (_gqaPipeline is null || !PreferGqa || numKvHeads <= 0 || numHeads % numKvHeads != 0) return false;
         int group = numHeads / numKvHeads;
-        return group >= 2 && group <= GqaMaxGroup && headDim <= GqaMaxHeadDim;
+        return group >= 2 && group <= GqaMaxGroup && headDim <= GqaMaxHeadDim && (headDim & 1) == 0;   // element pairs
     }
 
     /// <summary>

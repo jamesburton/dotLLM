@@ -50,7 +50,8 @@ public sealed class VulkanF16KvAttentionKernelTests
     [InlineData(301, 6, 2, 64, 300, false)]     // a small head: lanes cover several elements per word pair
     [InlineData(777, 24, 4, 256, 776, true)]
     [InlineData(1000, 8, 4, 256, 600, true)]
-    [InlineData(4100, 24, 4, 256, 4099, true)]  // splits wider than the grouped pass's 128-row tile
+    [InlineData(4100, 24, 4, 256, 4099, true)]
+    [InlineData(20000, 24, 4, 256, 19999, true)] // 313 positions per split: three 128-row tiles, so the cross-tile rescale runs
     [InlineData(301, 6, 2, 64, 300, true)]
     [InlineData(333, 32, 4, 128, 332, true)]    // the largest group the grouped pass serves (8)
     public void SplitKv_Decode_ReadsF16InPlace(int seqKv, int numHeads, int numKvHeads, int headDim, int positionOffset, bool gqa)

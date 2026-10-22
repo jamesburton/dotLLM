@@ -42,11 +42,13 @@ public sealed class VulkanQwen3HybridDenseF16KvTests : IDisposable
         try { Directory.Delete(_scratch, recursive: true); } catch { /* best-effort */ }
     }
 
-    /// <summary>The configured storage reaches the caches, at half the bytes per position.</summary>
+    /// <summary>F16 is the default (#1107); the explicit F32 baseline costs twice the bytes per position.</summary>
     [SkippableFact]
-    public void ConfigureKvStorage_F16_HalvesTheBytesPerPosition()
+    public void ConfigureKvStorage_F16IsTheDefault_AndHalvesTheBytesPerPosition()
     {
         using var f = Open(pq2: false);
+        Assert.Equal(VulkanKvStorage.F16, f.Model.KvStorage);
+        f.Model.ConfigureKvStorage(VulkanKvStorage.F32);
         using var f32 = f.Model.CreateKvCache(64);
         long f32Bytes = f.Model.KvBytesPerPosition;
         f.Model.ConfigureKvStorage(VulkanKvStorage.F16);
@@ -222,7 +224,8 @@ public sealed class VulkanQwen3HybridDenseF16KvTests : IDisposable
     [Fact]
     public void ParseOptions_RefusesWhatTheCacheCannotStore()
     {
-        Assert.Equal(VulkanKvStorage.F32, VulkanKvStorageExtensions.ParseOptions(null, null));
+        if (Environment.GetEnvironmentVariable(VulkanKvStorageExtensions.EnvVar) is null)
+            Assert.Equal(VulkanKvStorage.F16, VulkanKvStorageExtensions.ParseOptions(null, null));   // the default (#1107)
         Assert.Equal(VulkanKvStorage.F16, VulkanKvStorageExtensions.ParseOptions("f16", null));
         Assert.Equal(VulkanKvStorage.F16, VulkanKvStorageExtensions.ParseOptions(null, "FP16"));
         Assert.Equal(VulkanKvStorage.F16, VulkanKvStorageExtensions.ParseOptions("f16", "f16"));
@@ -282,7 +285,7 @@ public sealed class VulkanQwen3HybridDenseF16KvTests : IDisposable
             pos += chunk.Length;
         }
 
-        f.Model.ConfigureKvStorage(VulkanKvStorage.F32);
+        f.Model.ConfigureKvStorage(VulkanKvStorage.F16);
         return rows;
     }
 

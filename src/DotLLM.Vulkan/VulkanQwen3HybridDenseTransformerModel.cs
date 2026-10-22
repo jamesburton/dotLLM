@@ -119,9 +119,13 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
                Config.NumKvHeads, Config.HeadDim, Math.Min(maxSeqLen, Config.MaxSequenceLength), _kvStorage, lazy: true,
                growthLimit: Config.MaxSequenceLength);
 
-    private VulkanKvStorage _kvStorage = VulkanKvStorage.F32;
+    // F16 by default (#1102, #1107: no F32 KV on hot paths). The F16 kernels are built on first use.
+    private VulkanKvStorage _kvStorage = VulkanKvStorage.F16;
 
-    /// <summary>Element format of the caches <see cref="CreateKvCache"/> makes (issue #1102; F32 unless configured).</summary>
+    /// <summary>
+    /// Element format of the caches <see cref="CreateKvCache"/> makes: F16 unless configured (issue #1102). F32 exists as the explicit
+    /// A/B and parity baseline only.
+    /// </summary>
     public VulkanKvStorage KvStorage => _kvStorage;
 
     /// <summary>Device bytes one cached position costs across every attention layer, K and V, in <see cref="KvStorage"/>.</summary>

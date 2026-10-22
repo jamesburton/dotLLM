@@ -105,13 +105,14 @@ was made with (a growing chat session needs that on almost every turn). The Vulk
 `VulkanNemotronHKvCache` (#1100) whose element format is selectable:
 
 ```bash
-dotllm serve <bonsai> --device vulkan --cache-type-k f16 --cache-type-v f16   # or --kv-quant-k/-v f16; run and bench too
+dotllm serve <bonsai> --device vulkan            # F16 KV by default
+dotllm bench <bonsai> --device vulkan --kv-quant-k f32 --kv-quant-v f32   # explicit F32 A/B baseline
 ```
 
 | storage | bytes / element | Bonsai 2 per token (16 attn layers × 4 KV heads × 256 × K+V) | 128k | 262,144 | 1M (YaRN, #1101) |
 |---|---|---|---|---|---|
-| f32 (default) | 4 | 128 KiB | 16 GiB | 32 GiB | 128 GiB |
-| f16 | 2 | 64 KiB | 8 GiB | 16 GiB | 64 GiB |
+| f32 (A/B baseline only) | 4 | 128 KiB | 16 GiB | 32 GiB | 128 GiB |
+| **f16 (default)** | 2 | 64 KiB | 8 GiB | 16 GiB | 64 GiB |
 
 - **Read in place, no widening.** Every attention kernel the model dispatches has an F16 twin (`*_kvf16.comp`) that
   loads its K / V elements from the packed halves (`kv_load.glsl`, `unpackHalf2x16` in the load). No kernel converts the
@@ -125,7 +126,9 @@ dotllm serve <bonsai> --device vulkan --cache-type-k f16 --cache-type-v f16   # 
   (`ValidateSnapshotLayout` no longer requires F32).
 - **Selection.** `ConfigureKvStorage(VulkanKvStorage)` sets the format of caches created afterwards; the forward picks
   kernels per cache. The CLI and server accept `f16` / `fp16` and `f32`. q8_0, q4_0, TurboQuant and mixed K / V are
-  refused at startup with a message, never stored as something else. The default stays F32.
+  refused at startup with a message, never stored as something else. **F16 is the default** (#1107: no F32 KV on hot
+  paths). F32 is the explicit A/B and parity baseline only: `--cache-type-k/-v f32` on `run` / `bench`, or `DOTLLM_VK_KV=f32`
+  (the server cannot tell an explicit `f32` from its option default).
 - **Accuracy.** F16 rounds each K / V element once (relative error ≤ 2⁻¹¹). On the synthetic fixture the logits stay
   within the tolerance the Vulkan forward is held to against the CPU reference (abs 5e-3 + rel 1e-3).
 

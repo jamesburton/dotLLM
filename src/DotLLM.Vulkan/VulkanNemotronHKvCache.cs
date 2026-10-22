@@ -48,7 +48,8 @@ public static class VulkanKvStorageExtensions
 
     /// <summary>
     /// Resolves the <c>--cache-type-k/-v</c> (<c>--kv-quant-k/-v</c>) values for a Vulkan host whose cache has one format for K and V
-    /// (issue #1102). A null or empty side is unspecified and follows the other side; both unspecified is F32 (the default).
+    /// (issue #1102). A null or empty side is unspecified and follows the other side. Both unspecified falls back to
+    /// <see cref="EnvVar"/> and then to F16, the default (#1107: no F32 KV on hot paths; F32 is the explicit A/B baseline only).
     /// </summary>
     /// <param name="key">The key-side value as given, or null.</param>
     /// <param name="value">The value-side value as given, or null.</param>
@@ -60,8 +61,14 @@ public static class VulkanKvStorageExtensions
         if (k is not null && v is not null && k != v)
             throw new NotSupportedException(
                 $"The Vulkan KV cache stores K and V in one format; got K {key} and V {value}. Pass the same value for both.");
-        return k ?? v ?? VulkanKvStorage.F32;
+        return k ?? v ?? ParseOne(Environment.GetEnvironmentVariable(EnvVar)) ?? VulkanKvStorage.F16;
     }
+
+    /// <summary>
+    /// Environment fallback for the Vulkan KV storage when no flag is given (<c>f16</c>, or <c>f32</c> for an explicit A/B baseline,
+    /// e.g. on the server, whose option default cannot say "f32" on purpose).
+    /// </summary>
+    public const string EnvVar = "DOTLLM_VK_KV";
 
     private static VulkanKvStorage? ParseOne(string? raw)
     {
