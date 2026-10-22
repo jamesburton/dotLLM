@@ -6,7 +6,8 @@ namespace DotLLM.Models.Gguf;
 /// Creates a <see cref="BpeTokenizer"/> from the tokenizer metadata embedded in a GGUF file.
 /// Reads the <c>tokenizer.ggml.*</c> metadata keys and dispatches to the appropriate
 /// tokenizer variant (SentencePiece for <c>"llama"</c>/<c>"mistral"</c>,
-/// tiktoken for <c>"gpt2"</c>/<c>"llama3"</c>).
+/// tiktoken for <c>"gpt2"</c>/<c>"llama3"</c>, SPM-style merge-ranked BPE for
+/// <c>"gemma4"</c>).
 /// </summary>
 public static class GgufBpeTokenizerFactory
 {
@@ -19,6 +20,10 @@ public static class GgufBpeTokenizerFactory
     public static BpeTokenizer Load(GgufMetadata metadata)
     {
         string model = metadata.GetStringOrDefault("tokenizer.ggml.model", "llama");
+        if (model == "bert")
+            throw new NotSupportedException(
+                "This GGUF carries a BERT WordPiece vocabulary (tokenizer.ggml.model = \"bert\"), which is "
+                + "not a BpeTokenizer. Load it with GgufTokenizerFactory.Load (returns an ITokenizer).");
         string[] tokens = metadata.GetStringArray("tokenizer.ggml.tokens");
 
         int[]? tokenTypes = metadata.ContainsKey("tokenizer.ggml.token_type")
@@ -28,11 +33,53 @@ public static class GgufBpeTokenizerFactory
         int bosId = (int)metadata.GetUInt32OrDefault("tokenizer.ggml.bos_token_id", 1u);
         int eosId = (int)metadata.GetUInt32OrDefault("tokenizer.ggml.eos_token_id", 2u);
 
+        var tokenizer = LoadByModel(metadata, model, tokens, tokenTypes, bosId, eosId);
+
+        // llama.cpp stops on eot / eom as well as eos (#797): GLM-4.x ends a turn with <|user|> (eot) and a
+        // tool call with <|observation|> (eom), neither of which is the declared eos (<|endoftext|>).
+        var extra = new List<int>(2);
+        foreach (string key in new[] { "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id" })
+        {
+            if (metadata.ContainsKey(key))
+            {
+                int id = (int)metadata.GetUInt32OrDefault(key, uint.MaxValue);
+                if (id >= 0 && id < tokens.Length && id != eosId && !extra.Contains(id))
+                    extra.Add(id);
+            }
+        }
+        tokenizer.ExtraEndOfGenerationTokenIds = extra.ToArray();
+
+        // Gemma 1 / CodeGemma / Gemma 2 are untrained-without-BOS: every consumer that calls
+        // Encode() on a plain prompt (run, bench, server completions) would otherwise feed a
+        // BOS-less stream and get garbage (Gemma 4 included: #784). Scoped to those architectures on purpose — the other
+        // SPM/BPE models keep the historical BOS-agnostic Encode (their chat templates carry BOS).
+        string arch = metadata.GetStringOrDefault("general.architecture", "");
+        if (arch is "gemma" or "gemma2" or "gemma3" or "gemma4")
+            tokenizer.AddBosToken = GgufAddBosResolver.Resolve(metadata);
+
+        return tokenizer;
+    }
+
+    private static BpeTokenizer LoadByModel(
+        GgufMetadata metadata, string model, string[] tokens, int[]? tokenTypes, int bosId, int eosId)
+    {
         return model switch
         {
             "gpt2" or "llama3" => LoadTiktoken(metadata, tokens, tokenTypes, bosId, eosId),
+            // gemma-4 GGUFs carry merge-ranked BPE (llama.cpp LLAMA_VOCAB_PRE_TYPE_GEMMA4:
+            // spaces escaped to ▁, newline-only pre-split, raw UTF-8). Files without a
+            // merge table keep the historical SentencePiece longest-match fallback.
+            "gemma4" when metadata.ContainsKey("tokenizer.ggml.merges") =>
+                LoadGemma4(metadata, tokens, tokenTypes, bosId, eosId),
             _ => LoadSentencePiece(metadata, tokens, tokenTypes, bosId, eosId),
         };
+    }
+
+    private static BpeTokenizer LoadGemma4(
+        GgufMetadata metadata, string[] tokens, int[]? tokenTypes, int bosId, int eosId)
+    {
+        string[] merges = metadata.GetStringArray("tokenizer.ggml.merges");
+        return BpeTokenizer.CreateGemma4(tokens, merges, tokenTypes, bosId, eosId);
     }
 
     private static BpeTokenizer LoadSentencePiece(
@@ -42,7 +89,13 @@ public static class GgufBpeTokenizerFactory
             ? metadata.GetFloat32Array("tokenizer.ggml.scores")
             : new float[tokens.Length];
 
-        return BpeTokenizer.CreateSentencePiece(tokens, scores, tokenTypes, bosId, eosId);
+        // tokenizer.ggml.add_space_prefix: SentencePiece defaults to prepending ▁
+        // to text that doesn't start with a space; gemma4 (and some Llama
+        // derivatives) explicitly disable it — "The" must encode to the bare 'The'
+        // token, not '▁The'. Absent key keeps the historical default (true).
+        bool addSpacePrefix = metadata.GetBoolOrDefault("tokenizer.ggml.add_space_prefix", true);
+
+        return BpeTokenizer.CreateSentencePiece(tokens, scores, tokenTypes, bosId, eosId, addSpacePrefix);
     }
 
     private static BpeTokenizer LoadTiktoken(
