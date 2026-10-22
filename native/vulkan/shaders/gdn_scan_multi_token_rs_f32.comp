@@ -1,0 +1,145 @@
+#version 450
+// GDN multi-token scan - ROW-SPLIT: each state column's d_state-row reduction is split across RG=4 lanes, state lives in REGISTERS.
+//
+// The LDS arms (#445) give every column to ONE lane, so each token walks 128 rows in four dependent passes (the retrieve/read sums are
+// 128-deep `precise` add chains) and the dispatch has only n_v_head * d_state / 32 half-empty wave64s. Here a 64-lane workgroup owns 16 columns
+// x 4 row groups: lane (c, rg) keeps rows [rg*32, rg*32+32) of column c in 32 registers (no LDS state traffic at all), the two reductions
+// shrink to 32-deep chains, and the dispatch has 4x the lanes (n_v_head * 8 FULL wave64s). The 4 partials per column are combined through
+// LDS in a fixed order ((p0+p1)+p2)+p3, so results are deterministic.
+//
+// NOT BIT-EXACT vs the sequential oracle: the 128-term sums are re-associated (4 partial sums), so results differ from
+// DotLLM.Cpu.Kernels.GatedDeltaNetScan by a few ULP of the reduction. Every `precise` qualifier is kept so the driver cannot fuse mul+add into fma.
+// Requires d_state == 128 (the only size shipping: qwen35 / Tev1 / Bonsai GDN heads).
+//
+// Dispatch: groupCount = (n_v_head, d_state / 16 = 8, 1), local_size_x = 64.
+
+#define COLS 16
+#define RG 4
+#define ROWS_PER 32
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430)           buffer BufState  { float st[];     };
+layout(set = 0, binding = 1, std430) readonly  buffer BufQ      { float q_buf[];  };
+layout(set = 0, binding = 2, std430) readonly  buffer BufK      { float k_buf[];  };
+layout(set = 0, binding = 3, std430) readonly  buffer BufV      { float v_buf[];  };
+layout(set = 0, binding = 4, std430) readonly  buffer BufG      { float g_buf[];  };
+layout(set = 0, binding = 5, std430) readonly  buffer BufBeta   { float beta_buf[]; };
+layout(set = 0, binding = 6, std430) writeonly buffer BufOut    { float out_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    int n_v_head;
+    int n_k_head;
+    int d_state;
+    int v_heads_per_k_head;
+    int seq_len;
+} pc;
+
+shared float k_shared[128];
+shared float q_shared[128];
+shared float partRetr[RG * COLS];
+shared float partRead[RG * COLS];
+
+void main() {
+    uint vh   = gl_WorkGroupID.x;
+    uint cblk = gl_WorkGroupID.y;
+    uint tid  = gl_LocalInvocationID.x;
+    if (int(vh) >= pc.n_v_head) return;       // workgroup-uniform
+
+    uint c   = tid % uint(COLS);
+    uint rg  = tid / uint(COLS);
+    uint dState = uint(pc.d_state);
+    uint col = cblk * uint(COLS) + c;         // d_state % 16 == 0, always < dState
+    uint row0 = rg * uint(ROWS_PER);
+
+    uint kh         = vh % uint(pc.n_k_head);
+    uint stateBase  = vh * dState * dState;
+    uint qkPerToken = uint(pc.n_k_head) * dState;
+    uint vPerToken  = uint(pc.n_v_head) * dState;
+    uint kvScale    = uint(pc.n_v_head);
+    float invSqrtD  = 1.0 / sqrt(float(pc.d_state));
+
+    float s[ROWS_PER];
+    for (uint i = 0u; i < uint(ROWS_PER); i++)
+        s[i] = st[stateBase + (row0 + i) * dState + col];
+
+    // Software prefetch (issue #697): this step's g / beta / k / q / v are independent of the recurrence, so step t + 1's loads are issued at the
+    // top of step t and consumed one step later. The per-token cost was dominated by the exposed global-load latency in front of two
+    // dependent 32-term chains (2.3 us per token per layer = ~1.4 TFLOPS); data movement only, the arithmetic is unchanged.
+    float gCur = 0.0, betaCur = 0.0, vCur = 0.0;
+    float kCur0 = 0.0, kCur1 = 0.0, qCur0 = 0.0, qCur1 = 0.0;
+    if (pc.seq_len > 0) {
+        uint gb0 = vh;
+        gCur = g_buf[gb0];
+        betaCur = beta_buf[gb0];
+        uint qk0 = kh * dState;
+        kCur0 = k_buf[qk0 + tid];
+        qCur0 = q_buf[qk0 + tid];
+        kCur1 = k_buf[qk0 + tid + 64u];
+        qCur1 = q_buf[qk0 + tid + 64u];
+        vCur = v_buf[vh * dState + col];
+    }
+
+    for (int t = 0; t < pc.seq_len; t++) {
+        uint vBase  = uint(t) * vPerToken + vh * dState;
+        float gVh    = gCur;
+        float betaVh = betaCur;
+        float vNow   = vCur;
+        k_shared[tid] = kCur0;
+        q_shared[tid] = qCur0;
+        k_shared[tid + 64u] = kCur1;
+        q_shared[tid + 64u] = qCur1;
+
+        if (t + 1 < pc.seq_len) {
+            uint tn = uint(t + 1);
+            uint gbn = tn * kvScale + vh;
+            gCur = g_buf[gbn];
+            betaCur = beta_buf[gbn];
+            uint qkn = tn * qkPerToken + kh * dState;
+            kCur0 = k_buf[qkn + tid];
+            qCur0 = q_buf[qkn + tid];
+            kCur1 = k_buf[qkn + tid + 64u];
+            qCur1 = q_buf[qkn + tid + 64u];
+            vCur = v_buf[tn * vPerToken + vh * dState + col];
+        }
+        barrier();
+
+        // decay + partial retrieve over this lane's 32 rows
+        precise float pr = 0.0;
+        for (uint i = 0u; i < uint(ROWS_PER); i++) {
+            float decayed = s[i] * gVh;
+            s[i] = decayed;
+            precise float prod = decayed * k_shared[row0 + i];
+            pr = pr + prod;
+        }
+        partRetr[rg * uint(COLS) + c] = pr;
+        barrier();
+        precise float retr = partRetr[c] + partRetr[uint(COLS) + c];
+        retr = retr + partRetr[2u * uint(COLS) + c];
+        retr = retr + partRetr[3u * uint(COLS) + c];
+
+        precise float diff = vNow - retr;
+        precise float delta = betaVh * diff;
+
+        // rank-1 update + partial read-out
+        precise float pa = 0.0;
+        for (uint i = 0u; i < uint(ROWS_PER); i++) {
+            precise float prod = k_shared[row0 + i] * delta;
+            precise float updated = s[i] + prod;
+            s[i] = updated;
+            precise float rprod = updated * q_shared[row0 + i];
+            pa = pa + rprod;
+        }
+        partRead[rg * uint(COLS) + c] = pa;
+        barrier();
+        if (rg == 0u) {
+            precise float acc = partRead[c] + partRead[uint(COLS) + c];
+            acc = acc + partRead[2u * uint(COLS) + c];
+            acc = acc + partRead[3u * uint(COLS) + c];
+            out_buf[vBase + col] = acc * invSqrtD;
+        }
+    }
+
+    for (uint i = 0u; i < uint(ROWS_PER); i++)
+        st[stateBase + (row0 + i) * dState + col] = s[i];
+}
