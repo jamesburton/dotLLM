@@ -124,6 +124,53 @@ public class GgufModelConfigExtractorRoPEOverrideTests
         Assert.Equal(1000000f, result.GlobalRoPEConfig!.Value.Theta);
     }
 
+    /// <summary>
+    /// Issue #1101: Qwen3.8's opt-in YaRN (factor 4 over 262,144) raises the window to 1,048,576, so the server fit,
+    /// <c>--ctx-size</c> and the KV growth limits (all read <c>MaxSequenceLength</c>) allow it.
+    /// </summary>
+    [Fact]
+    public void ApplyRoPEOverride_Yarn_RaisesWindowToFactorTimesOriginal()
+    {
+        var config = BaseConfig(new RoPEConfig(Theta: 1e7f, DimensionCount: 64, Type: RoPEType.NeoX)) with
+        {
+            Architecture = Architecture.Qwen3HybridDense,
+            MaxSequenceLength = 262144,
+        };
+        var overrides = new RoPEOverrideOptions
+        {
+            ScalingType = RoPEScalingType.YaRN,
+            ScalingFactor = 4.0f,
+            OrigMaxSeqLen = 262144,
+        };
+
+        var result = GgufModelConfigExtractor.ApplyRoPEOverride(config, overrides);
+
+        Assert.True(result.RoPEConfig!.Value.IsDenseYarnActive);
+        Assert.Equal(1_048_576, result.MaxSequenceLength);
+    }
+
+    /// <summary>A YaRN window below the checkpoint's own never lowers it; a non-YaRN override leaves it alone.</summary>
+    [Fact]
+    public void ApplyRoPEOverride_NeverLowersWindow_AndIgnoresNonYarn()
+    {
+        var config = BaseConfig(new RoPEConfig(Theta: 1e7f, DimensionCount: 64)) with { MaxSequenceLength = 262144 };
+
+        var smallYarn = GgufModelConfigExtractor.ApplyRoPEOverride(config, new RoPEOverrideOptions
+        {
+            ScalingType = RoPEScalingType.YaRN, ScalingFactor = 2.0f, OrigMaxSeqLen = 4096,
+        });
+        Assert.Equal(262144, smallYarn.MaxSequenceLength);
+
+        var linear = GgufModelConfigExtractor.ApplyRoPEOverride(config, new RoPEOverrideOptions
+        {
+            ScalingType = RoPEScalingType.Linear, ScalingFactor = 4.0f, OrigMaxSeqLen = 262144,
+        });
+        Assert.Equal(262144, linear.MaxSequenceLength);
+
+        var freqOnly = GgufModelConfigExtractor.ApplyRoPEOverride(config, new RoPEOverrideOptions { FreqBase = 5e6f });
+        Assert.Equal(262144, freqOnly.MaxSequenceLength);
+    }
+
     [Fact]
     public void RoPEOverrideOptions_HasAnyOverride_FalseWhenAllNull()
     {

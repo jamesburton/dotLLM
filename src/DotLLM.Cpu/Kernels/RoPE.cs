@@ -4,6 +4,8 @@ using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.PositionEncoding;
+using Architecture = DotLLM.Core.Configuration.Architecture;
 
 namespace DotLLM.Cpu.Kernels;
 
@@ -286,6 +288,49 @@ public static class RoPE
             //   inv_freq = freq_inter * linear_ramp + freq_extra * (1 - linear_ramp)
             invFreq[i] = freqInter * mask + freqExtra * (1.0f - mask);
         }
+    }
+
+    /// <summary>
+    /// Resolves the dense-YaRN rotation for a model whose RoPE rotates <paramref name="ropeDim"/> dims
+    /// (issue #1101): the ramped inverse frequencies and the cos/sin multiplier, or <c>(null, 1)</c> when
+    /// <see cref="RoPEConfig.IsDenseYarnActive"/> is false. The ramp runs over the ROTARY dim, as HF does
+    /// (<c>dim = head_dim * partial_rotary_factor</c>): for Bonsai-2 / Qwen3.8 that is 64, not the 256-wide head.
+    /// One helper for the CPU table, the CUDA upload and the Vulkan upload, so the hosts cannot drift.
+    /// </summary>
+    /// <param name="rope">The model's RoPE configuration, or null.</param>
+    /// <param name="architecture">Selects the mscale convention (<see cref="RoPEConfig.ComputeYarnMscaleMultiplier"/>).</param>
+    /// <param name="ropeDim">Rotated dims per head (even).</param>
+    /// <returns>The <c>ropeDim / 2</c> inverse frequencies (null when YaRN is off) and the cos/sin multiplier.</returns>
+    public static (float[]? InvFreq, float Mscale) ResolveDenseYarn(RoPEConfig? rope, Architecture architecture, int ropeDim)
+    {
+        if (rope is not { IsDenseYarnActive: true } r)
+            return (null, 1.0f);
+        float[] invFreq = new float[ropeDim / 2];
+        ComputeYarnInverseFrequencies(ropeDim, r.Theta, r.ScalingFactor, r.OrigMaxSeqLen, r.BetaFast, r.BetaSlow, invFreq);
+        return (invFreq, r.ComputeYarnMscaleMultiplier(architecture));
+    }
+
+    /// <summary>
+    /// Builds the position-indexed cos/sin tables a CPU host rotates with: the plain theta tables, or the YaRN
+    /// ones when <see cref="RoPEConfig.IsDenseYarnActive"/> holds (issue #1101). Each table is
+    /// <c>maxSeqLen * ropeDim / 2</c> floats.
+    /// </summary>
+    /// <param name="rope">The model's RoPE configuration, or null (theta 10000).</param>
+    /// <param name="architecture">Selects the YaRN mscale convention.</param>
+    /// <param name="maxSeqLen">Positions to tabulate.</param>
+    /// <param name="ropeDim">Rotated dims per head (even).</param>
+    /// <returns>The cosine and sine tables.</returns>
+    public static (float[] Cos, float[] Sin) BuildFrequencyTables(RoPEConfig? rope, Architecture architecture, int maxSeqLen, int ropeDim)
+    {
+        int halfRope = ropeDim / 2;
+        var cos = new float[(long)maxSeqLen * halfRope];
+        var sin = new float[(long)maxSeqLen * halfRope];
+        if (rope is { IsDenseYarnActive: true } r)
+            PrecomputeFrequencyTableYarn(maxSeqLen, ropeDim, r.Theta, r.ScalingFactor, r.OrigMaxSeqLen,
+                r.BetaFast, r.BetaSlow, r.ComputeYarnMscaleMultiplier(architecture), cos, sin);
+        else
+            PrecomputeFrequencyTable(maxSeqLen, ropeDim, rope?.Theta ?? 10000.0f, cos, sin);
+        return (cos, sin);
     }
 
     /// <summary>

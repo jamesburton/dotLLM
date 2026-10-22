@@ -57,6 +57,12 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     private readonly float[] _ropeSinTable;
     private readonly int _ropeDim;
 
+    /// <summary>Test hook (issue #1101): the position-indexed cos table, <c>[MaxSequenceLength, ropeDim / 2]</c>.</summary>
+    internal ReadOnlySpan<float> RopeCosTableForTest => _ropeCosTable;
+
+    /// <summary>Test hook (issue #1101): the position-indexed sin table, <c>[MaxSequenceLength, ropeDim / 2]</c>.</summary>
+    internal ReadOnlySpan<float> RopeSinTableForTest => _ropeSinTable;
+
     private readonly Qwen3HybridDenseForwardState _state;
 
     // PrismML Hadamard fold (prism.hadamard.*) — null for every checkpoint outside the Bonsai 2
@@ -240,11 +246,8 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
                 : -1;
         }
 
-        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
-        int halfRope = ropeDim / 2;
-        var ropeCos = new float[config.MaxSequenceLength * halfRope];
-        var ropeSin = new float[config.MaxSequenceLength * halfRope];
-        RoPE.PrecomputeFrequencyTable(config.MaxSequenceLength, ropeDim, ropeTheta, ropeCos, ropeSin);
+        // Plain theta tables, or YaRN's when --rope-scaling yarn is active (issue #1101).
+        var (ropeCos, ropeSin) = RoPE.BuildFrequencyTables(config.RoPEConfig, config.Architecture, config.MaxSequenceLength, ropeDim);
 
         ComputeThreadPool? pool = CreatePool(threading);
 
@@ -395,11 +398,8 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
                 : -1;
         }
 
-        float ropeTheta = fullConfig.RoPEConfig?.Theta ?? 10000.0f;
-        int halfRope = ropeDim / 2;
-        var ropeCos = new float[fullConfig.MaxSequenceLength * halfRope];
-        var ropeSin = new float[fullConfig.MaxSequenceLength * halfRope];
-        RoPE.PrecomputeFrequencyTable(fullConfig.MaxSequenceLength, ropeDim, ropeTheta, ropeCos, ropeSin);
+        // Plain theta tables, or YaRN's when --rope-scaling yarn is active (issue #1101).
+        var (ropeCos, ropeSin) = RoPE.BuildFrequencyTables(fullConfig.RoPEConfig, fullConfig.Architecture, fullConfig.MaxSequenceLength, ropeDim);
 
         ComputeThreadPool? pool = CreatePool(threading);
 
@@ -635,14 +635,10 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             throw new ArgumentException(
                 $"rope_dim={ropeDim} exceeds head_dim={config.HeadDim}.", nameof(config));
 
-        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
-        int halfRope = ropeDim / 2;
         float[] ropeCos, ropeSin;
         if (attentionLayerCount > 0)
         {
-            ropeCos = new float[config.MaxSequenceLength * halfRope];
-            ropeSin = new float[config.MaxSequenceLength * halfRope];
-            RoPE.PrecomputeFrequencyTable(config.MaxSequenceLength, ropeDim, ropeTheta, ropeCos, ropeSin);
+            (ropeCos, ropeSin) = RoPE.BuildFrequencyTables(config.RoPEConfig, config.Architecture, config.MaxSequenceLength, ropeDim);
         }
         else
         {

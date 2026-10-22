@@ -692,6 +692,23 @@ prefills only the roughly 8k tokens it adds, at 57-74 s. Before, the cached pref
 stretched to 115-144 s. With MTP on (window 51,200 on this card) the first three turns reuse the same way
 (0 / 7,818 / 17,032 cached) and decode at 21-25 tokens/s.
 
+### Past 262,144 tokens: YaRN for Bonsai-2 / Qwen3.8 (#1101)
+
+Bonsai-2 and Qwen3.8 train to 262,144 tokens and reach about 1M with opt-in YaRN (factor 4). Turn it on at load:
+
+```
+dotllm serve <bonsai> --device vulkan --no-mtp --rope-scaling yarn --rope-scale 4 --yarn-orig-ctx 262144 --ctx-size 327680
+```
+
+The window becomes 1,048,576 (`factor × original`), and `--ctx-size` caps it: on CUDA the VRAM fit and `--ctx-size` work as
+above, and on the Vulkan hybrid `--ctx-size` now lowers the window too (`[dotllm] Context window: 327680 of 1048576 tokens
+(--ctx-size).`); before #1101 Vulkan ignored the flag. The KV caches grow up to that window and no further.
+
+Cost: YaRN's rotation itself is free, but it also scales every position by `0.1·ln 4 + 1 = 1.139`, so short prompts produce
+slightly different output. Leave it off unless a session will pass 262,144 tokens. The KV is the real cost: F32
+128 KiB/token (300k ≈ 37 GiB, 1M = 128 GiB), F16 64 KiB/token, q8_0 about 34 KiB/token. See `docs/POSITION_ENCODING.md`
+for the math and `scripts/needle-in-haystack.py` for a retrieval check.
+
 ### MTP on prefix-hit turns (#1088)
 
 The single-slot snapshot now keeps the MTP head that absorbed the prefix, so a hit rolls the head back with the trunk and
