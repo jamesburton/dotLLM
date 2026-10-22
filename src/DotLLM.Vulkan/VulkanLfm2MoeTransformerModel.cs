@@ -60,8 +60,18 @@ public sealed unsafe partial class VulkanLfm2MoeTransformerModel : IModel
     /// <summary>Number of full-attention layers.</summary>
     public int AttentionLayerCount => _host.AttentionLayerCount;
 
-    /// <summary>Creates the sparse (attention-layers-only) KV cache this model expects.</summary>
-    public VulkanNemotronHKvCache CreateKvCache(int maxSeqLen) => _host.CreateKvCache(maxSeqLen);
+    /// <summary>
+    /// Creates the sparse (attention-layers-only), lazily allocated KV cache this model expects. It may grow up to the context window
+    /// (<see cref="IKvCache.TryGrowTo"/>, issue #1100), so a growing session keeps its recurrent-prefix hit.
+    /// </summary>
+    /// <param name="maxSeqLen">Initial logical capacity in positions (capped at the context window).</param>
+    /// <returns>The new cache.</returns>
+    public VulkanNemotronHKvCache CreateKvCache(int maxSeqLen)
+        => _host.CreateKvCache(Math.Min(maxSeqLen, Config.MaxSequenceLength), VulkanKvStorage.F32, lazy: true,
+                               growthLimit: Config.MaxSequenceLength);
+
+    /// <summary><see cref="VulkanNemotronHKvCache.BufferEpoch"/> when this model last dropped its descriptor caches (issue #1100).</summary>
+    private long _seenKvBufferEpoch = -1;
 
     /// <summary>Per-stage wall ms via split-submit (<c>DOTLLM_VK_LFM2_STAGE_PROFILE=1</c>): distorts decode (a fence round trip per stage).</summary>
     public static bool StageProfile { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_LFM2_STAGE_PROFILE") == "1";
@@ -465,6 +475,7 @@ public sealed unsafe partial class VulkanLfm2MoeTransformerModel : IModel
         bool resized = _host.Q4EnsureCapacity(T);
         resized |= EnsureDense(T);
         if (allRows) resized |= EnsureMultiRow(T, V);
+        resized |= VulkanNemotronHKvCache.PrepareForForward(kvCache, VulkanNemotronHKvCache.PositionsEnd(positions), ref _seenKvBufferEpoch);
         if (resized) _host.Q4InvalidateCaches();
         _host.Q4UploadPositions(positions);
 

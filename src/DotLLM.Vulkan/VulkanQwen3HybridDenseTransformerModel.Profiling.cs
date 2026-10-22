@@ -35,6 +35,23 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel
     /// <summary>Longest forward (tokens) recorded into a single command buffer. <c>DOTLLM_VK_FUSE_FORWARD=0</c> restores one submission per layer.</summary>
     private const int FuseMaxSeqLen = 32;
 
+    /// <summary>
+    /// Default prefill tile, in tokens (issue #1100). Without a tile a 16k-token Bonsai 2 prompt was one forward whose per-layer
+    /// submissions each covered all 16k rows, and Strix lost the device (Windows GPU watchdog). <c>DOTLLM_VULKAN_PREFILL_CHUNK</c>
+    /// overrides (0 = no tiling); <c>--prefill-chunk-size</c> overrides both.
+    /// </summary>
+    internal const int DefaultPrefillChunkTokens = 1024;
+
+    /// <summary>Tile in force: <c>DOTLLM_VULKAN_PREFILL_CHUNK</c> when it parses to a non-negative int, else <see cref="DefaultPrefillChunkTokens"/>.</summary>
+    internal static int PrefillChunkTokens { get; set; } =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_PREFILL_CHUNK"), out int chunk) && chunk >= 0
+            ? chunk
+            : DefaultPrefillChunkTokens;
+
+    /// <inheritdoc/>
+    /// <remarks>Bounds each forward the engine submits (issue #1100); see <see cref="PrefillChunkTokens"/>.</remarks>
+    public int PreferredPrefillChunkTokens => PrefillChunkTokens;
+
     /// <summary>Layers recorded per submission for a prefill longer than <see cref="FuseMaxSeqLen"/>. <c>DOTLLM_VK_PREFILL_LAYERS_PER_SUBMIT</c> overrides (1 = one per layer).</summary>
     private static int PrefillLayersPerSubmit(int seqLen)
     {

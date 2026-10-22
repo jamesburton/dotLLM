@@ -106,10 +106,51 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     /// <summary>Number of full-attention layers — the matching sparse KV-cache slot count.</summary>
     public int AttentionLayerCount => _attentionLayerCount;
 
-    /// <summary>Creates a sparse <see cref="VulkanNemotronHKvCache"/> sized for this model.</summary>
+    /// <summary>
+    /// Creates a sparse, lazily allocated <see cref="VulkanNemotronHKvCache"/> for this model. It may grow up to the context window
+    /// (<see cref="IKvCache.TryGrowTo"/>, issue #1100), so a growing session keeps its recurrent-prefix hit; the forward allocates the
+    /// rows it writes (<see cref="VulkanNemotronHKvCache.PrepareForForward"/>).
+    /// </summary>
+    /// <param name="maxSeqLen">Initial logical capacity in positions (capped at the context window).</param>
+    /// <returns>The new cache.</returns>
     public VulkanNemotronHKvCache CreateKvCache(int maxSeqLen)
         => new(_device, _kvSlotForLayer, _attentionLayerCount,
-               Config.NumKvHeads, Config.HeadDim, maxSeqLen);
+               Config.NumKvHeads, Config.HeadDim, Math.Min(maxSeqLen, Config.MaxSequenceLength), lazy: true,
+               growthLimit: Config.MaxSequenceLength);
+
+    /// <summary><see cref="VulkanNemotronHKvCache.BufferEpoch"/> when this model last dropped its descriptor caches.</summary>
+    private long _seenKvBufferEpoch = -1;
+
+    /// <summary>
+    /// Before recording a forward: see <see cref="VulkanNemotronHKvCache.PrepareForForward"/>. True when the descriptor caches must be
+    /// dropped because a KV buffer was freed.
+    /// </summary>
+    /// <param name="kvCache">The forward's cache, or null.</param>
+    /// <param name="positions">The forward's positions.</param>
+    /// <returns><see langword="true"/> when descriptor caches must be dropped.</returns>
+    private bool PrepareKvCache(IKvCache? kvCache, ReadOnlySpan<int> positions)
+    {
+        if (!VulkanNemotronHKvCache.PrepareForForward(kvCache, VulkanNemotronHKvCache.PositionsEnd(positions), ref _seenKvBufferEpoch))
+            return false;
+        KvBufferInvalidationsForTest++;
+        return true;
+    }
+
+    /// <summary>
+    /// Test hook (issue #1100): forwards that dropped the descriptor caches because a KV buffer was freed. Not every driver recycles a
+    /// freed handle fast enough for a stale set to show in the logits, so the tests pin the invalidation itself.
+    /// </summary>
+    internal int KvBufferInvalidationsForTest { get; private set; }
+
+    /// <summary>Drops every kernel's handle-keyed descriptor cache (after any buffer they may name was re-created or freed).</summary>
+    private void InvalidateDescriptorCaches()
+    {
+        _kernels.InvalidateAll();
+        _hadamard?.InvalidateDescriptorCache();
+        _embedGather?.InvalidateDescriptorCache();
+        _gdnSnapScan?.InvalidateDescriptorCache();
+        _iqF16Prefill?.InvalidateDescriptorCache();
+    }
 
     /// <summary>
     /// Creates a fresh per-sequence <see cref="VulkanGdnStateCache"/> sized for this
@@ -467,15 +508,12 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         int headRows = seqLen <= _allRowLogitsLimit ? seqLen : 1;
 
         bool resized = _state.EnsureCapacity(seqLen);
+        resized |= PrepareKvCache(kvCache, positions);
         if (resized)
         {
-            _kernels.InvalidateAll();
-            // The FWHT kernel keeps its own handle-keyed descriptor cache, and a freed buffer handle
-            // can be recycled into the new scratch allocation — which would bind the stale set.
-            _hadamard?.InvalidateDescriptorCache();
-            _embedGather?.InvalidateDescriptorCache();
-            _gdnSnapScan?.InvalidateDescriptorCache();
-            _iqF16Prefill?.InvalidateDescriptorCache();
+            // Every kernel (the FWHT one included) keeps a handle-keyed descriptor cache, and a freed buffer handle can be
+            // recycled into the new scratch or KV allocation — which would bind the stale set.
+            InvalidateDescriptorCaches();
         }
 
         var logitsBuf = headRows == 1 ? SingleRowLogits : EnsureMultiRowLogits(headRows, vocabSize);
@@ -1205,6 +1243,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         // Every (re)allocation happens BEFORE recording: a grow invalidates the handle-keyed descriptor caches (resets pools an open
         // command buffer may still reference).
         bool resized = _state.EnsureCapacity(sumN);
+        for (int i = 0; i < n; i++)
+            resized |= PrepareKvCache(requests[i].KvCache, requests[i].Positions.Span);
         if (_batchNorm is null || _batchNormRows < sumN)
         {
             _batchNorm?.Dispose();
@@ -1234,13 +1274,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             resized = true;
         }
         if (resized)
-        {
-            _kernels.InvalidateAll();
-            _hadamard?.InvalidateDescriptorCache();
-            _embedGather?.InvalidateDescriptorCache();
-            _gdnSnapScan?.InvalidateDescriptorCache();
-            _iqF16Prefill?.InvalidateDescriptorCache();
-        }
+            InvalidateDescriptorCaches();
         var logitsBuf = headTotal == 1 ? SingleRowLogits : EnsureMultiRowLogits(headTotal, vocabSize);
         var batchNorm = _batchNorm!;
 
