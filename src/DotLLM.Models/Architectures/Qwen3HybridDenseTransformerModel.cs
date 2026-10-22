@@ -53,15 +53,13 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     // GDN layer ordinal per layer index (-1 for attention layers).
     private readonly int[] _gdnLayerOrdinal;
 
-    private readonly float[] _ropeCosTable;
-    private readonly float[] _ropeSinTable;
+    // Issue #1101: inverse frequencies + mscale only; cos/sin rows are computed per forward for the positions in flight, so
+    // nothing here grows with the context window (YaRN takes it to ~1M; #1107 bars context-sized F32 tables).
+    private readonly RoPERotation _rope;
     private readonly int _ropeDim;
 
-    /// <summary>Test hook (issue #1101): the position-indexed cos table, <c>[MaxSequenceLength, ropeDim / 2]</c>.</summary>
-    internal ReadOnlySpan<float> RopeCosTableForTest => _ropeCosTable;
-
-    /// <summary>Test hook (issue #1101): the position-indexed sin table, <c>[MaxSequenceLength, ropeDim / 2]</c>.</summary>
-    internal ReadOnlySpan<float> RopeSinTableForTest => _ropeSinTable;
+    /// <summary>Test hook (issue #1101): the rotation the trunk and the MTP head use.</summary>
+    internal RoPERotation RopeForTest => _rope;
 
     private readonly Qwen3HybridDenseForwardState _state;
 
@@ -98,7 +96,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         nint tokenEmbedWeight, QuantizationType tokenEmbedQuantType,
         nint outputWeight, QuantizationType outputQuantType, int outputOutputDim, int outputInputDim,
         int[] kvSlotForLayer, int attentionLayerCount,
-        float[] ropeCosTable, float[] ropeSinTable, int ropeDim,
+        RoPERotation rope, int ropeDim,
         ComputeThreadPool? threadPool, bool ownsPool,
         MtpHeadWeights? mtpHead = null,
         int hadamardFirstLayer = 0, int hadamardFullLayerCount = 0)
@@ -118,8 +116,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         _gdn = config.GdnConfig!.Value;
         _kvSlotForLayer = kvSlotForLayer;
         _attentionLayerCount = attentionLayerCount;
-        _ropeCosTable = ropeCosTable;
-        _ropeSinTable = ropeSinTable;
+        _rope = rope;
         _ropeDim = ropeDim;
         _threadPool = threadPool;
         _ownsThreadPool = ownsPool;
@@ -246,8 +243,8 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
                 : -1;
         }
 
-        // Plain theta tables, or YaRN's when --rope-scaling yarn is active (issue #1101).
-        var (ropeCos, ropeSin) = RoPE.BuildFrequencyTables(config.RoPEConfig, config.Architecture, config.MaxSequenceLength, ropeDim);
+        // Plain theta rotation, or YaRN's when --rope-scaling yarn is active (issue #1101).
+        var rope = new RoPERotation(config.RoPEConfig, config.Architecture, ropeDim);
 
         ComputeThreadPool? pool = CreatePool(threading);
 
@@ -261,7 +258,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             embPtr, embDesc.QuantizationType,
             outputPtr, outputQt, outputM, outputK,
             kvSlotForLayer, attentionLayerCount,
-            ropeCos, ropeSin, ropeDim,
+            rope, ropeDim,
             pool, ownsPool: pool is not null,
             mtpHead);
     }
@@ -398,8 +395,8 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
                 : -1;
         }
 
-        // Plain theta tables, or YaRN's when --rope-scaling yarn is active (issue #1101).
-        var (ropeCos, ropeSin) = RoPE.BuildFrequencyTables(fullConfig.RoPEConfig, fullConfig.Architecture, fullConfig.MaxSequenceLength, ropeDim);
+        // Plain theta rotation, or YaRN's when --rope-scaling yarn is active (issue #1101).
+        var rope = new RoPERotation(fullConfig.RoPEConfig, fullConfig.Architecture, ropeDim);
 
         ComputeThreadPool? pool = CreatePool(threading);
 
@@ -408,7 +405,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             embPtr, embDesc.QuantizationType,
             outputPtr, outputQt, outputM, outputK,
             kvSlotForLayer, attentionLayerCount,
-            ropeCos, ropeSin, ropeDim,
+            rope, ropeDim,
             pool, ownsPool: pool is not null,
             mtpHead: null,
             hadamardFirstLayer: startLayer, hadamardFullLayerCount: fullConfig.NumLayers);
@@ -635,23 +632,14 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             throw new ArgumentException(
                 $"rope_dim={ropeDim} exceeds head_dim={config.HeadDim}.", nameof(config));
 
-        float[] ropeCos, ropeSin;
-        if (attentionLayerCount > 0)
-        {
-            (ropeCos, ropeSin) = RoPE.BuildFrequencyTables(config.RoPEConfig, config.Architecture, config.MaxSequenceLength, ropeDim);
-        }
-        else
-        {
-            ropeCos = Array.Empty<float>();
-            ropeSin = Array.Empty<float>();
-        }
+        var rope = new RoPERotation(config.RoPEConfig, config.Architecture, ropeDim);
 
         return new Qwen3HybridDenseTransformerModel(
             config, gguf: null, layers, outputNormWeight,
             tokenEmbedWeight, tokenEmbedQuantType,
             outputWeight, outputQuantType, outputOutputDim, outputInputDim,
             kvSlotForLayer, attentionLayerCount,
-            ropeCos, ropeSin, ropeDim,
+            rope, ropeDim,
             threadPool: null, ownsPool: false);
     }
 
@@ -1293,8 +1281,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
 
             var kSlab = new Span<float>(kDst, s * kvStride);
             Mamba3QkNorm.Execute(kSlab, attn.KNormWeight, eps, s, numKvHeads, headDim);
-            RoPE.Execute(Span<float>.Empty, kSlab, pos, /* numHeads */ 0, numKvHeads, headDim, _ropeDim,
-                _ropeCosTable, _ropeSinTable, RoPEType.NeoX);
+            _rope.Apply(Span<float>.Empty, kSlab, pos, /* numHeads */ 0, numKvHeads, headDim, RoPEType.NeoX);
 
             state.EndAbsorb(firstPosition + s);
         }
@@ -1889,12 +1876,11 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         //    synthetic CPU↔CUDA parity fixture in CudaQwen3MoeHybridParityTests.cs (shared attention
         //    implementation).
         int kvStride = numKvHeads * headDim;
-        RoPE.Execute(
+        _rope.Apply(
             new Span<float>(q, seqLen * qElems),
             new Span<float>(k, seqLen * kvStride),
             positions,
-            numHeads, numKvHeads, headDim, _ropeDim,
-            _ropeCosTable, _ropeSinTable, RoPEType.NeoX);
+            numHeads, numKvHeads, headDim, RoPEType.NeoX);
         if (TensorDump.Enabled)
         {
             TensorDump.Dump2D($"blk.{layer}.fa_q_postrope", q, seqLen, qElems);
@@ -2213,8 +2199,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
 
             Span<int> posSpan = stackalloc int[1];
             posSpan[0] = position;
-            RoPE.Execute(q, k, posSpan, numHeads, numKvHeads, headDim, _ropeDim,
-                _ropeCosTable, _ropeSinTable, RoPEType.NeoX);
+            _rope.Apply(q, k, posSpan, numHeads, numKvHeads, headDim, RoPEType.NeoX);
 
             // Append this step's K/V into the MTP head's own tiny cache and attend causally over
             // everything drafted so far in this round (NOT the trunk's KV-cache).

@@ -140,21 +140,69 @@ public sealed class RoPEYarnQwen35ReferenceTests
         => Assert.Equal(1_048_576, Bonsai2Yarn().YarnExtendedContextLength);
 
     /// <summary>
-    /// The CPU host's position-indexed tables (the cross-backend oracle) equal <c>cos/sin(pos · invFreq_HF) · mscale_HF</c>.
+    /// The CPU host's rotation (the cross-backend oracle) produces <c>cos/sin(pos · invFreq_HF) · mscale_HF</c>, including at
+    /// positions past the 262,144 native window, without any context-sized table.
     /// </summary>
     [Fact]
-    public void BuildFrequencyTables_Bonsai2_MatchesHfRotation()
+    public void RoPERotation_Bonsai2_MatchesHfRotation_PastNativeWindow()
     {
-        var (cos, sin) = RoPE.BuildFrequencyTables(Bonsai2Yarn(), Architecture.Qwen3HybridDense, maxSeqLen: 64, ropeDim: 64);
-        for (int pos = 0; pos < 64; pos += 7)
+        var rotation = new RoPERotation(Bonsai2Yarn(), Architecture.Qwen3HybridDense, ropeDim: 64);
+        Assert.Equal(HfAttentionFactorFactor4, rotation.Mscale);
+        AssertMatches(HfInvFreqBonsai2, rotation.InverseFrequencies.ToArray());
+
+        int[] positions = [0, 7, 262_143, 262_144, 300_000, 1_048_575];
+        var cos = new float[positions.Length * 32];
+        var sin = new float[positions.Length * 32];
+        rotation.FillRows(positions, cos, sin);
+        for (int t = 0; t < positions.Length; t++)
         {
             for (int i = 0; i < 32; i++)
             {
-                float angle = pos * HfInvFreqBonsai2[i];
-                Assert.Equal(MathF.Cos(angle) * HfAttentionFactorFactor4, cos[pos * 32 + i], 6);
-                Assert.Equal(MathF.Sin(angle) * HfAttentionFactorFactor4, sin[pos * 32 + i], 6);
+                // Same float32 angle product the hosts form; the bound covers a few ulps of inverse-frequency difference
+                // (MathF.Pow vs torch), which grows with the angle.
+                float angleF = positions[t] * HfInvFreqBonsai2[i];
+                float bar = 2e-6f * (1 + angleF);
+                Assert.True(MathF.Abs((float)(Math.Cos(angleF) * HfAttentionFactorFactor4) - cos[t * 32 + i]) <= bar,
+                    $"cos pos {positions[t]} pair {i}");
+                Assert.True(MathF.Abs((float)(Math.Sin(angleF) * HfAttentionFactorFactor4) - sin[t * 32 + i]) <= bar,
+                    $"sin pos {positions[t]} pair {i}");
             }
         }
+    }
+
+    /// <summary>Without YaRN the rotation's rows are bit-identical to the plain theta table the hosts used before #1101.</summary>
+    [Fact]
+    public void RoPERotation_YarnOff_IsBitIdenticalToPlainTable()
+    {
+        var plain = new RoPEConfig(Theta: 1e7f, DimensionCount: 64, Type: RoPEType.NeoX);
+        var rotation = new RoPERotation(plain, Architecture.Qwen3HybridDense, 64);
+        const int MaxPos = 600;
+        var tableCos = new float[MaxPos * 32];
+        var tableSin = new float[MaxPos * 32];
+        RoPE.PrecomputeFrequencyTable(MaxPos, 64, 1e7f, tableCos, tableSin);
+        int[] positions = Enumerable.Range(0, MaxPos).ToArray();
+        var cos = new float[MaxPos * 32];
+        var sin = new float[MaxPos * 32];
+        rotation.FillRows(positions, cos, sin);
+        Assert.True(cos.AsSpan().SequenceEqual(tableCos));
+        Assert.True(sin.AsSpan().SequenceEqual(tableSin));
+    }
+
+    /// <summary>With YaRN the rows are bit-identical to <see cref="RoPE.PrecomputeFrequencyTableYarn"/>'s table.</summary>
+    [Fact]
+    public void RoPERotation_Yarn_IsBitIdenticalToYarnTable()
+    {
+        var rotation = new RoPERotation(Bonsai2Yarn(), Architecture.Qwen3HybridDense, 64);
+        const int MaxPos = 600;
+        var tableCos = new float[MaxPos * 32];
+        var tableSin = new float[MaxPos * 32];
+        RoPE.PrecomputeFrequencyTableYarn(MaxPos, 64, 1e7f, 4.0f, 262144, 32.0f, 1.0f, HfAttentionFactorFactor4, tableCos, tableSin);
+        int[] positions = Enumerable.Range(0, MaxPos).ToArray();
+        var cos = new float[MaxPos * 32];
+        var sin = new float[MaxPos * 32];
+        rotation.FillRows(positions, cos, sin);
+        Assert.True(cos.AsSpan().SequenceEqual(tableCos));
+        Assert.True(sin.AsSpan().SequenceEqual(tableSin));
     }
 
     private static void AssertMatches(float[] expected, float[] actual)

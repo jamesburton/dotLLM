@@ -13,9 +13,9 @@ namespace DotLLM.Tests.Unit.Models.Architectures;
 /// fix it read only <c>RoPEConfig.Theta</c>, so the override was silently ignored and the window stayed at the native size.
 /// </summary>
 /// <remarks>
-/// Mutant runs (recorded in the PR): building the tables with the plain theta routine again fails
-/// <see cref="YarnOverride_TablesMatchHfReference"/> and <see cref="YarnOverride_ChangesLogits_AndRaisesWindow"/>; the
-/// pre-#1101 mscale convention (plain <c>AttnFactor</c>) fails the table test at every position.
+/// The mscale is checked on its own as well (<see cref="YarnOverride_ChangesLogits_AndRaisesWindow"/> cancels it with
+/// <c>--yarn-attn-factor</c>): a host that kept the plain <c>AttnFactor</c> convention would move the logits past the parity
+/// tests' tolerance.
 /// </remarks>
 public sealed class Qwen3HybridDenseYarnTests : IDisposable
 {
@@ -28,9 +28,12 @@ public sealed class Qwen3HybridDenseYarnTests : IDisposable
         try { Directory.Delete(_scratch, recursive: true); } catch { /* best-effort */ }
     }
 
-    /// <summary>The host's own cos/sin tables equal <c>cos/sin(pos · invFreq_HF) · attention_factor_HF</c> (HF constants).</summary>
+    /// <summary>
+    /// The host's rotation is HF's (inverse frequencies and attention factor checked in as constants), and it keeps no
+    /// context-sized table: a 2,048-token YaRN window costs the same 128 bytes of frequencies as a 512-token one.
+    /// </summary>
     [Fact]
-    public void YarnOverride_TablesMatchHfReference()
+    public void YarnOverride_RotationMatchesHfReference()
     {
         string path = HybridYarnParity.WriteDiscriminating(_scratch);
         using var gguf = GgufFile.Open(path);
@@ -38,23 +41,11 @@ public sealed class Qwen3HybridDenseYarnTests : IDisposable
         using var model = (Qwen3HybridDenseTransformerModel)ModelLoader.CreateCpuModelFromGguf(gguf, config);
 
         float[] inv = RoPEYarnQwen35ReferenceTests.HfInvFreqFixtureBase1e4Orig512;
-        float mscale = RoPEYarnQwen35ReferenceTests.HfAttentionFactorFactor4;
-        var cos = model.RopeCosTableForTest;
-        var sin = model.RopeSinTableForTest;
-        Assert.Equal(config.MaxSequenceLength * 32, cos.Length);
-        foreach (int pos in new[] { 0, 1, 511, 512, 1000, config.MaxSequenceLength - 1 })
-        {
-            for (int i = 0; i < 32; i++)
-            {
-                // The host forms the angle as a float32 product, as here; what remains is cos/sin rounding plus a few ulps of
-                // inverse-frequency difference (MathF.Pow vs torch), which grows with the angle.
-                float angleF = pos * inv[i];
-                double angle = angleF;
-                float bar = 2e-6f * (1 + angleF);
-                Assert.True(MathF.Abs((float)(Math.Cos(angle) * mscale) - cos[pos * 32 + i]) <= bar, $"cos pos {pos} pair {i}");
-                Assert.True(MathF.Abs((float)(Math.Sin(angle) * mscale) - sin[pos * 32 + i]) <= bar, $"sin pos {pos} pair {i}");
-            }
-        }
+        var rope = model.RopeForTest;
+        Assert.Equal(RoPEYarnQwen35ReferenceTests.HfAttentionFactorFactor4, rope.Mscale);
+        Assert.Equal(inv.Length, rope.InverseFrequencies.Length);
+        for (int i = 0; i < inv.Length; i++)
+            Assert.True(MathF.Abs(inv[i] - rope.InverseFrequencies[i]) <= 4 * 1.1920929e-7f * inv[i], $"invFreq[{i}]");
     }
 
     /// <summary>
@@ -118,20 +109,25 @@ public sealed class Qwen3HybridDenseYarnTests : IDisposable
     }
 
     /// <summary>
-    /// With YaRN off nothing changes: the tables are bit-identical to the plain theta tables the host built before #1101.
+    /// With YaRN off nothing changes: the host's rotation rows are bit-identical to the plain theta table it built before
+    /// #1101.
     /// </summary>
     [Fact]
-    public void YarnOff_TablesAreThePlainThetaTables()
+    public void YarnOff_RotationIsThePlainThetaTable()
     {
         string path = HybridYarnParity.WriteDiscriminating(_scratch);
         using var gguf = GgufFile.Open(path);
         var config = HybridYarnParity.Config(gguf, yarn: false);
         using var model = (Qwen3HybridDenseTransformerModel)ModelLoader.CreateCpuModelFromGguf(gguf, config);
-        var cos = new float[config.MaxSequenceLength * 32];
-        var sin = new float[config.MaxSequenceLength * 32];
-        DotLLM.Cpu.Kernels.RoPE.PrecomputeFrequencyTable(config.MaxSequenceLength, 64, config.RoPEConfig!.Value.Theta, cos, sin);
-        Assert.True(model.RopeCosTableForTest.SequenceEqual(cos));
-        Assert.True(model.RopeSinTableForTest.SequenceEqual(sin));
+        int n = config.MaxSequenceLength;
+        var tableCos = new float[n * 32];
+        var tableSin = new float[n * 32];
+        DotLLM.Cpu.Kernels.RoPE.PrecomputeFrequencyTable(n, 64, config.RoPEConfig!.Value.Theta, tableCos, tableSin);
+        var cos = new float[n * 32];
+        var sin = new float[n * 32];
+        model.RopeForTest.FillRows(Enumerable.Range(0, n).ToArray(), cos, sin);
+        Assert.True(cos.AsSpan().SequenceEqual(tableCos));
+        Assert.True(sin.AsSpan().SequenceEqual(tableSin));
     }
 
     private static HybridYarnParity.Result Run(string path, bool yarn, int promptLen, int decodeSteps = 0, int mtpSteps = 0,

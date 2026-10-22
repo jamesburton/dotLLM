@@ -311,29 +311,6 @@ public static class RoPE
     }
 
     /// <summary>
-    /// Builds the position-indexed cos/sin tables a CPU host rotates with: the plain theta tables, or the YaRN
-    /// ones when <see cref="RoPEConfig.IsDenseYarnActive"/> holds (issue #1101). Each table is
-    /// <c>maxSeqLen * ropeDim / 2</c> floats.
-    /// </summary>
-    /// <param name="rope">The model's RoPE configuration, or null (theta 10000).</param>
-    /// <param name="architecture">Selects the YaRN mscale convention.</param>
-    /// <param name="maxSeqLen">Positions to tabulate.</param>
-    /// <param name="ropeDim">Rotated dims per head (even).</param>
-    /// <returns>The cosine and sine tables.</returns>
-    public static (float[] Cos, float[] Sin) BuildFrequencyTables(RoPEConfig? rope, Architecture architecture, int maxSeqLen, int ropeDim)
-    {
-        int halfRope = ropeDim / 2;
-        var cos = new float[(long)maxSeqLen * halfRope];
-        var sin = new float[(long)maxSeqLen * halfRope];
-        if (rope is { IsDenseYarnActive: true } r)
-            PrecomputeFrequencyTableYarn(maxSeqLen, ropeDim, r.Theta, r.ScalingFactor, r.OrigMaxSeqLen,
-                r.BetaFast, r.BetaSlow, r.ComputeYarnMscaleMultiplier(architecture), cos, sin);
-        else
-            PrecomputeFrequencyTable(maxSeqLen, ropeDim, rope?.Theta ?? 10000.0f, cos, sin);
-        return (cos, sin);
-    }
-
-    /// <summary>
     /// HF <c>yarn_find_correction_dim</c>: returns the (real-valued) head-dim
     /// index at which a rotation count of <paramref name="numRotations"/> is
     /// reached given the base sequence length.

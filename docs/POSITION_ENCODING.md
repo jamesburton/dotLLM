@@ -55,7 +55,7 @@ Combines NTK with attention scaling. Per-dimension: high-freq unchanged, low-fre
 
 The ramp math lives in one place, `RoPE.ComputeYarnInverseFrequencies` (a port of HF `_compute_yarn_parameters`), and
 `RoPE.ResolveDenseYarn(rope, architecture, ropeDim)` hands every host the same inverse frequencies and cos/sin
-multiplier: the CPU tables (`RoPE.BuildFrequencyTables`), the CUDA upload (`LaunchRoPEF32(ropeInvFreq, ropeMscale)`) and
+multiplier: the CPU `RoPERotation`, the CUDA upload (`LaunchRoPEF32(ropeInvFreq, ropeMscale)`) and
 the Vulkan `rope_yarn_f32` kernel. Two details decide whether a host matches HF:
 
 - **The ramp runs over the rotary dim, not the head.** HF uses `dim = head_dim * partial_rotary_factor`. For Qwen3.5/3.8
@@ -85,8 +85,9 @@ dotllm serve <bonsai> --device vulkan --rope-scaling yarn --rope-scale 4 --yarn-
 - Verified against HF's own `_compute_yarn_parameters` (torch float32; script and output in
   `.docs/ctx128k/yarn/`), checked in as constants in `RoPEYarnQwen35ReferenceTests`; cross-backend parity at positions
   past the native window in `*Qwen3HybridDenseYarnParityTests`.
-- **Cost.** RoPE itself costs nothing extra (one 128-byte inverse-frequency buffer per model; the CPU oracle's
-  position-indexed tables grow with the window: 256 B/token, 256 MiB at 1M). The real cost is KV: Bonsai-2 keeps
+- **Cost.** RoPE itself costs nothing extra: every host keeps one 128-byte inverse-frequency vector. The CPU host
+  (`RoPERotation`) computes cos/sin rows only for the positions in flight, so nothing scales with the window (its old
+  position-indexed F32 tables would have been 256 MiB at 1M; #1107). The real cost is KV: Bonsai-2 keeps
   16 attention layers × 4 KV heads × 256 dims, so F32 KV is 128 KiB/token (300k ≈ 37 GiB, 1M = 128 GiB), F16 64 KiB/token,
   q8_0 about 34 KiB/token. And prefill: attention is quadratic, so a fresh prompt at that depth takes hours; the
   realistic use is a session grown turn by turn with prefix reuse.
