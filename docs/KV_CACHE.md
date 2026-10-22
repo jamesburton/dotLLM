@@ -96,8 +96,9 @@ was made with (a growing chat session needs that on almost every turn). The Vulk
   bit-identical logits against a cache allocated in one step.
 - **Snapshots.** `SnapshotPrefix` copies into an exactly-sized eager cache. `RestorePrefixFrom` grows a lazy destination first.
   A snapshot taken before a growth restores exactly after it (`VulkanQwen3HybridDenseKvGrowthTests`).
-- **Cost.** Storage stays F32: 128 KiB per token for Bonsai-2 (16 attention layers x 4 KV heads x 256 x K and V x 4 B), so
-  16 GiB at 128k. A growth step is 25 % of what is held (at least 1,024 positions), plus one layer's K and V in transit.
+- **Cost.** Growth, admission and snapshot copies size everything from the cache's `ElementBytes` / `BytesPerPosition`, never an
+  assumed F32. As of #1100 the storage is still F32: 128 KiB per token for Bonsai-2 (16 attention layers x 4 KV heads x 256 x K
+  and V x 4 B), so 16 GiB at 128k. #1102 moves the Vulkan default to F16, which halves it. A growth step is 25 % of what is held (at least 1,024 positions), plus one layer's K and V in transit.
 
 ### CUDA hybrid-dense KV: staging, quantized storage, fused decode (issue #956)
 
