@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Numerics.Tensors;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
@@ -24,6 +25,7 @@ namespace DotLLM.Benchmarks.Profile;
 /// <code>
 /// dotnet DotLLM.Benchmarks.dll precision-cpu isa
 /// dotnet DotLLM.Benchmarks.dll precision-cpu gemv [--threads 1,6] [--samples 9]
+/// dotnet DotLLM.Benchmarks.dll precision-cpu gemv-prod [--threads 1,12]   (production entry points; any ISA incl. SSE4.2)
 /// dotnet DotLLM.Benchmarks.dll precision-cpu gemm [--threads 6] [--n 64]
 /// dotnet DotLLM.Benchmarks.dll precision-cpu attn [--threads 6] [--ctx 4096,16384]
 /// dotnet DotLLM.Benchmarks.dll precision-cpu kl-act &lt;gguf&gt; [--windows 4] [--len 256] [--threads 6]
@@ -80,6 +82,7 @@ internal static unsafe class PrecisionCpuProfile
             switch (mode)
             {
                 case "gemv": GemvSuite(); break;
+                case "gemv-prod": GemvProdSuite(); break;
                 case "gemm": GemmSuite(n); break;
                 case "attn": foreach (int c in ctxs) AttnSuite(c); break;
                 case "kl-act": KlActivations(model!, windows, len, t); break;
@@ -129,7 +132,7 @@ internal static unsafe class PrecisionCpuProfile
             var sw = Stopwatch.StartNew();
             int c = 0;
             while (sw.Elapsed.TotalMilliseconds < 20) arms[a].Run(c++ % arms[a].Instances);
-            calls[a] = Math.Max(3, (int)(40 / (sw.Elapsed.TotalMilliseconds / c)));
+            calls[a] = Math.Max(2, (int)(15 / (sw.Elapsed.TotalMilliseconds / c)));
         }
 
         var times = arms.Select(_ => new List<double>()).ToArray();
@@ -150,14 +153,16 @@ internal static unsafe class PrecisionCpuProfile
     {
         int bi = baselineName is null ? -1 : Array.FindIndex(arms, a => a.Name == baselineName);
         double baseMed = bi >= 0 ? Median(times[bi]) : double.NaN;
+        double baseMin = bi >= 0 ? times[bi].Min() : double.NaN;
         Console.WriteLine($"### {title}  threads={_threads} samples={_samples}");
-        Console.WriteLine("| arm | weight MB | ns/call (median) | min..max | GFLOP/s | GB/s (weights) | speed vs baseline |");
-        Console.WriteLine("|---|---:|---:|---|---:|---:|---:|");
+        Console.WriteLine("| arm | weight MB | µs/call median | µs min..max | GB/s (weights, at min) | GFLOP/s (at min) | vs baseline (median) | vs baseline (min) |");
+        Console.WriteLine("|---|---:|---:|---|---:|---:|---:|---:|");
         for (int a = 0; a < arms.Length; a++)
         {
-            double med = Median(times[a]);
+            double med = Median(times[a]), mn = times[a].Min();
             string rel = bi >= 0 ? $"{baseMed / med:F2}x" : "";
-            Console.WriteLine($"| {arms[a].Name} | {arms[a].WeightBytes / 1048576.0:F1} | {med:F0} | {times[a].Min():F0}..{times[a].Max():F0} | {arms[a].Flops / med:F1} | {arms[a].WeightBytes / med:F1} | {rel} |");
+            string relMin = bi >= 0 ? $"{baseMin / mn:F2}x" : "";
+            Console.WriteLine($"| {arms[a].Name} | {arms[a].WeightBytes / 1048576.0:F1} | {med / 1000:F0} | {mn / 1000:F0}..{times[a].Max() / 1000:F0} | {arms[a].WeightBytes / mn:F1} | {arms[a].Flops / mn:F1} | {rel} | {relMin} |");
         }
 
         Console.WriteLine();
@@ -411,6 +416,80 @@ internal static unsafe class PrecisionCpuProfile
                 var arr = arms.ToArray();
                 var times = Interleave(arr);
                 Report($"GEMV {label} [{(cold ? $"COLD: {arr.Max(a => a.Instances)}+ copies cycled, DRAM-bound" : "HOT: one copy")}]", arr, times, "F32 w x F32 a (reference)");
+                foreach (var a in arr) a.Free();
+                Free((nint)x);
+            }
+        }
+    }
+
+    // ───────────────────────── GEMV through production entry points (portable) ─────────────────────────
+
+    /// <summary>BF16 × F32, 4 rows, 128-bit (SSE4.1 <c>pmovzxwd</c> + shift): the widen any x86-64 since Penryn can do.</summary>
+    private static void KBf16Sse(byte* w, nint rs, byte* x, int k, float* r)
+    {
+        for (int j = 0; j < 4; j++)
+        {
+            ushort* row = (ushort*)(w + j * rs);
+            var acc = System.Runtime.Intrinsics.Vector128<float>.Zero;
+            for (int i = 0; i < k; i += 4)
+            {
+                var wv = Sse2.ShiftLeftLogical(Sse41.ConvertToVector128Int32(row + i), 16).AsSingle();
+                acc = Sse.Add(acc, Sse.Multiply(wv, Sse.LoadVector128((float*)x + i)));
+            }
+
+            r[j] = System.Runtime.Intrinsics.Vector128.Sum(acc);
+        }
+    }
+
+    private static Arm ProdArm(string name, QuantizationType qt, int m, int k, bool cold, float[] master, float* x, Action<nint, nint> run)
+    {
+        nint w0 = Encode(master, m, k, qt, out long bytes);
+        int inst = cold ? (int)Math.Clamp(_coldBytes / bytes, 2, 256) : 1;
+        var ws = new nint[inst];
+        ws[0] = w0;
+        for (int i = 1; i < inst; i++)
+        {
+            ws[i] = Alloc(bytes);
+            Buffer.MemoryCopy((void*)w0, (void*)ws[i], bytes, bytes);
+        }
+
+        nint y = Alloc((long)m * 4 + 64);
+        return new Arm
+        {
+            Name = name, WeightBytes = bytes, Instances = inst, Flops = 2.0 * m * k,
+            Run = i => run(ws[i], y),
+            Free = () => { foreach (var p in ws) Free(p); Free(y); },
+        };
+    }
+
+    private static void GemvProdSuite()
+    {
+        (int M, int K, string Label)[] shapes = [(8192, 3072, "ffn gate/up 8192x3072"), (3072, 8192, "ffn down 3072x8192")];
+        foreach (bool cold in new[] { false, true })
+        {
+            foreach (var (m, k, label) in shapes)
+            {
+                float[] master = MakeF32(m, k, m + k);
+                float* x = (float*)Alloc((long)k * 4);
+                var rng = new Random(5);
+                for (int i = 0; i < k; i++) x[i] = (rng.NextSingle() - 0.5f) * 2f;
+                var arms = new List<Arm>
+                {
+                    ProdArm("F32 w x F32 a GemvF32 (reference)", QuantizationType.F32, m, k, cold, master, x, (w, y) => MatMul.GemvF32((float*)w, x, (float*)y, m, k, _pool)),
+                    ProdArm("F16 w x F32 a GemvF16 (prod)", QuantizationType.F16, m, k, cold, master, x, (w, y) => MatMul.GemvF16(w, x, (float*)y, m, k, _pool)),
+                    ProdArm("BF16 w x F32 a GemvDequantRows (prod fallback)", QuantizationType.BF16, m, k, cold, master, x, (w, y) => MatMul.GemvDequantRows((byte*)w, QuantizationType.BF16, x, (float*)y, m, k, _pool)),
+                };
+                if (Sse41.IsSupported)
+                    arms.Add(GemvArm("BF16 w x F32 a SSE4.1 shift widen (harness)", QuantizationType.BF16, Prep.F32, &KBf16Sse, m, k, cold, master, x));
+                arms.Add(ProdArm("Q8_0 w x F32 a GemvDequantRows (float tier)", QuantizationType.Q8_0, m, k, cold, master, x, (w, y) => MatMul.GemvDequantRows((byte*)w, QuantizationType.Q8_0, x, (float*)y, m, k, _pool)));
+                arms.Add(ProdArm("Q8_0 w x Q8_0 a GemvQ8_0 (prod int8)", QuantizationType.Q8_0, m, k, cold, master, x, (w, y) => MatMul.GemvQ8_0((byte*)w, x, (float*)y, m, k, _pool)));
+                arms.Add(ProdArm("Q4_0 w x F32 a GemvDequantRows (float tier)", QuantizationType.Q4_0, m, k, cold, master, x, (w, y) => MatMul.GemvDequantRows((byte*)w, QuantizationType.Q4_0, x, (float*)y, m, k, _pool)));
+                arms.Add(ProdArm("Q4_0 w x Q8_1 a GemvLegacyQuant (prod int8)", QuantizationType.Q4_0, m, k, cold, master, x, (w, y) => MatMul.GemvLegacyQuant((byte*)w, QuantizationType.Q4_0, x, (float*)y, m, k, _pool)));
+                arms.Add(ProdArm("Q4_K w x F32 a GemvDequantRows (float tier)", QuantizationType.Q4_K, m, k, cold, master, x, (w, y) => MatMul.GemvDequantRows((byte*)w, QuantizationType.Q4_K, x, (float*)y, m, k, _pool)));
+                arms.Add(ProdArm("Q4_K w x Q8_K a GemvQ4_K (prod int8)", QuantizationType.Q4_K, m, k, cold, master, x, (w, y) => MatMul.GemvQ4_K((byte*)w, x, (float*)y, m, k, _pool)));
+                var arr = arms.ToArray();
+                var times = Interleave(arr);
+                Report($"GEMV (production entry points) {label} [{(cold ? $"COLD: {arr.Max(a => a.Instances)}+ copies cycled" : "HOT: one copy")}]", arr, times, "F32 w x F32 a GemvF32 (reference)");
                 foreach (var a in arr) a.Free();
                 Free((nint)x);
             }
