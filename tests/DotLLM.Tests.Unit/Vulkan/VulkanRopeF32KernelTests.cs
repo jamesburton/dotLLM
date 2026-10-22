@@ -1,0 +1,376 @@
+using System.Runtime.InteropServices;
+using DotLLM.Cpu.Kernels;
+using DotLLM.Vulkan;
+using DotLLM.Vulkan.Kernels;
+using Xunit;
+
+namespace DotLLM.Tests.Unit.Vulkan;
+
+/// <summary>
+/// Numerical-parity test for the Vulkan FP32 RoPE kernel.
+/// </summary>
+/// <remarks>
+/// The Vulkan kernel mirrors <c>rope_f32.cu</c> — frequencies reconstructed on
+/// the GPU from <c>theta</c>, not from pre-computed tables. Compared against
+/// the scalar CPU reference <see cref="RoPE.ExecuteScalar"/> driven by a
+/// <see cref="RoPE.PrecomputeFrequencyTableScalar"/> table; any tolerance
+/// consumption comes from <c>cos/sin/pow</c> backend drift on the GPU.
+/// Only <c>Norm</c> (interleaved) variant is validated here — that is the
+/// convention used by Llama-family, SmolLM, and the CUDA reference kernel's
+/// default (<c>rope_type != 1</c>).
+/// </remarks>
+[Trait("Category", "GPU")]
+[Collection("VulkanKernels")]
+public class VulkanRopeF32KernelTests
+{
+    private const float AbsTol = 1e-4f;
+    private const float RelTol = 1e-3f;
+
+    [SkippableTheory]
+    // (seqLen, numHeads, numKvHeads, headDim, theta)
+    [InlineData(4, 2, 2, 64, 10000f)]       // short, MHA
+    [InlineData(4, 9, 3, 64, 10000f)]       // short, GQA (SmolLM shape fewer-tokens)
+    [InlineData(256, 9, 3, 64, 10000f)]     // long, GQA — SmolLM-135M prefill shape
+    [InlineData(1, 32, 8, 128, 500000f)]    // decode, Llama-3 style theta
+    public void Launch_MatchesCpuReference_Norm(int seqLen, int numHeads, int numKvHeads, int headDim, float theta)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        int ropeDim = headDim; // rotate the full head
+        int halfDim = ropeDim / 2;
+
+        var rng = new Random(0xABC + seqLen * 13 + numHeads * 7 + headDim);
+        float[] q = RandomFloats(rng, seqLen * numHeads * headDim);
+        float[] k = RandomFloats(rng, seqLen * numKvHeads * headDim);
+        int[] positions = new int[seqLen];
+        for (int i = 0; i < seqLen; i++) positions[i] = i;
+
+        // CPU reference via scalar path using pre-computed tables — matches
+        // the CUDA per-thread formula up to backend rounding.
+        float[] cosTable = new float[seqLen * halfDim];
+        float[] sinTable = new float[seqLen * halfDim];
+        RoPE.PrecomputeFrequencyTableScalar(seqLen, headDim, theta, cosTable, sinTable);
+
+        float[] qExpected = (float[])q.Clone();
+        float[] kExpected = (float[])k.Clone();
+        RoPE.ExecuteScalar(
+            qExpected.AsSpan(), kExpected.AsSpan(), positions,
+            numHeads, numKvHeads, headDim, ropeDim,
+            cosTable, sinTable);
+
+        // GPU path.
+        using var device = VulkanDevice.Create();
+        using var kernel = RopeF32Kernel.Create(device, spvDir);
+
+        using var bufQ = device.Allocate(q.Length * sizeof(float));
+        using var bufK = device.Allocate(k.Length * sizeof(float));
+        using var bufPos = device.Allocate((long)positions.Length * sizeof(int));
+
+        device.Upload(q.AsSpan(), bufQ);
+        device.Upload(k.AsSpan(), bufK);
+        device.Upload(MemoryMarshal.AsBytes(positions.AsSpan()), bufPos);
+
+        kernel.Launch(bufQ, bufK, bufPos,
+            seqLen, numHeads, numKvHeads, headDim, ropeDim, theta, RopeF32Kernel.Variant.Norm);
+
+        float[] qActual = new float[q.Length];
+        float[] kActual = new float[k.Length];
+        device.Download(bufQ, qActual);
+        device.Download(bufK, kActual);
+
+        AssertClose(qExpected, qActual, "Q");
+        AssertClose(kExpected, kActual, "K");
+    }
+
+    [SkippableTheory]
+    // NeoX / rotate-half variant — pair (i, i+halfRope). This is the HF
+    // safetensors convention (Llama-family via HF, Qwen2, Phi-3); the shader
+    // already supports it via is_neox push-constant but only Norm had an
+    // explicit parity test. The end-to-end VulkanTransformerModel calls this
+    // variant only when loading from HF safetensors (GGUF Llama uses Norm),
+    // but we validate it here to unblock non-GGUF model paths.
+    [InlineData(4, 2, 2, 64, 10000f)]
+    [InlineData(4, 9, 3, 64, 10000f)]
+    [InlineData(256, 9, 3, 64, 10000f)]
+    [InlineData(1, 32, 8, 128, 500000f)]
+    public void Launch_MatchesCpuReference_NeoX(int seqLen, int numHeads, int numKvHeads, int headDim, float theta)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        int ropeDim = headDim;
+        int halfDim = ropeDim / 2;
+
+        var rng = new Random(0xBEEF + seqLen * 13 + numHeads * 7 + headDim);
+        float[] q = RandomFloats(rng, seqLen * numHeads * headDim);
+        float[] k = RandomFloats(rng, seqLen * numKvHeads * headDim);
+        int[] positions = new int[seqLen];
+        for (int i = 0; i < seqLen; i++) positions[i] = i;
+
+        float[] cosTable = new float[seqLen * halfDim];
+        float[] sinTable = new float[seqLen * halfDim];
+        RoPE.PrecomputeFrequencyTableScalar(seqLen, headDim, theta, cosTable, sinTable);
+
+        float[] qExpected = (float[])q.Clone();
+        float[] kExpected = (float[])k.Clone();
+        RoPE.Execute(
+            qExpected.AsSpan(), kExpected.AsSpan(), positions,
+            numHeads, numKvHeads, headDim, ropeDim,
+            cosTable, sinTable,
+            DotLLM.Core.Configuration.RoPEType.NeoX);
+
+        using var device = VulkanDevice.Create();
+        using var kernel = RopeF32Kernel.Create(device, spvDir);
+
+        using var bufQ = device.Allocate(q.Length * sizeof(float));
+        using var bufK = device.Allocate(k.Length * sizeof(float));
+        using var bufPos = device.Allocate((long)positions.Length * sizeof(int));
+
+        device.Upload(q.AsSpan(), bufQ);
+        device.Upload(k.AsSpan(), bufK);
+        device.Upload(MemoryMarshal.AsBytes(positions.AsSpan()), bufPos);
+
+        kernel.Launch(bufQ, bufK, bufPos,
+            seqLen, numHeads, numKvHeads, headDim, ropeDim, theta, RopeF32Kernel.Variant.NeoX);
+
+        float[] qActual = new float[q.Length];
+        float[] kActual = new float[k.Length];
+        device.Download(bufQ, qActual);
+        device.Download(bufK, kActual);
+
+        AssertClose(qExpected, qActual, "Q");
+        AssertClose(kExpected, kActual, "K");
+    }
+
+    [SkippableTheory]
+    // PARTIAL NeoX, GEMMA-4 convention — rotate only the leading ropeDim dims,
+    // pairing each at the FULL head's half-dim (i, i + headDim/2), matching CPU
+    // RoPE.ExecutePartialNeoX. This is the Gemma-4 global-layer convention
+    // (partial_rotary_factor 0.25 over head_dim, e.g. headDim 64 → ropeDim 16).
+    // The caller MUST request this pairing explicitly via neoxPairOffset:headDim/2
+    // (the kernel default is the STANDARD ropeDim/2 — see _StandardRopeDimHalf below).
+    // (seqLen, numHeads, numKvHeads, headDim, ropeDim, theta)
+    [InlineData(4, 2, 2, 64, 16, 1_000_000f)]
+    [InlineData(4, 4, 1, 64, 16, 1_000_000f)]
+    [InlineData(256, 4, 1, 64, 16, 1_000_000f)]
+    [InlineData(1, 8, 2, 128, 32, 1_000_000f)]
+    public void Launch_MatchesCpuReference_PartialNeoX_GemmaFullHeadHalf(
+        int seqLen, int numHeads, int numKvHeads, int headDim, int ropeDim, float theta)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        int rotatedPairs = ropeDim / 2;
+
+        var rng = new Random(0x5EED + seqLen * 13 + numHeads * 7 + headDim + ropeDim);
+        float[] q = RandomFloats(rng, seqLen * numHeads * headDim);
+        float[] k = RandomFloats(rng, seqLen * numKvHeads * headDim);
+        int[] positions = new int[seqLen];
+        for (int i = 0; i < seqLen; i++) positions[i] = i;
+
+        // Frequency table for the rotated span only: ropeDim/2 entries per
+        // position, exponent 2*pair/ropeDim (built by passing ropeDim as the
+        // "headDim" arg) — matches the kernel's per-thread freq reconstruction.
+        float[] cosTable = new float[seqLen * rotatedPairs];
+        float[] sinTable = new float[seqLen * rotatedPairs];
+        RoPE.PrecomputeFrequencyTableScalar(seqLen, ropeDim, theta, cosTable, sinTable);
+
+        float[] qExpected = (float[])q.Clone();
+        float[] kExpected = (float[])k.Clone();
+        RoPE.ExecutePartialNeoX(
+            qExpected.AsSpan(), kExpected.AsSpan(), positions,
+            numHeads, numKvHeads, headDim, rotatedPairs,
+            cosTable, sinTable);
+
+        using var device = VulkanDevice.Create();
+        using var kernel = RopeF32Kernel.Create(device, spvDir);
+
+        using var bufQ = device.Allocate(q.Length * sizeof(float));
+        using var bufK = device.Allocate(k.Length * sizeof(float));
+        using var bufPos = device.Allocate((long)positions.Length * sizeof(int));
+
+        device.Upload(q.AsSpan(), bufQ);
+        device.Upload(k.AsSpan(), bufK);
+        device.Upload(MemoryMarshal.AsBytes(positions.AsSpan()), bufPos);
+
+        // Gemma-4 partial global rope: pair across the full-head halves (headDim/2).
+        kernel.Launch(bufQ, bufK, bufPos,
+            seqLen, numHeads, numKvHeads, headDim, ropeDim, theta,
+            RopeF32Kernel.Variant.NeoX, neoxPairOffset: headDim / 2);
+
+        float[] qActual = new float[q.Length];
+        float[] kActual = new float[k.Length];
+        device.Download(bufQ, qActual);
+        device.Download(bufK, kActual);
+
+        AssertClose(qExpected, qActual, "Q");
+        AssertClose(kExpected, kActual, "K");
+    }
+
+    [SkippableTheory]
+    // PARTIAL NeoX, STANDARD convention — rotate only the leading ropeDim dims,
+    // pairing each WITHIN the rotated block (i, i + ropeDim/2), matching CPU
+    // RoPE.Execute → ApplyRotationNeoX (a ropeDim-length head slice). This is the
+    // Qwen3 / NemotronH / Llama-family partial-rotary convention and the kernel
+    // DEFAULT (neoxPairOffset == null → ropeDim/2).
+    //
+    // DISCRIMINATING / regression guard: a prior change hardcoded the NeoX pairing
+    // offset to headDim/2, which silently mis-paired every partial-rotary model
+    // where ropeDim < headDim (surfaced as the Qwen3MoeHybrid IQ3 forward parity
+    // failure). With ropeDim < headDim and headDim/2 != ropeDim/2 these shapes are
+    // grossly wrong under the headDim/2 offset and bit-exact under the standard
+    // ropeDim/2 default — RED before, GREEN after.
+    // (seqLen, numHeads, numKvHeads, headDim, ropeDim, theta)
+    [InlineData(4, 4, 2, 64, 32, 10000f)]    // Qwen3MoeHybrid IQ3 fixture shape (headDim 64, ropeDim 32)
+    [InlineData(4, 2, 2, 64, 16, 1_000_000f)]
+    [InlineData(256, 4, 1, 64, 16, 1_000_000f)]
+    [InlineData(1, 8, 2, 128, 32, 1_000_000f)]
+    public void Launch_MatchesCpuReference_PartialNeoX_StandardRopeDimHalf(
+        int seqLen, int numHeads, int numKvHeads, int headDim, int ropeDim, float theta)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        int halfRope = ropeDim / 2;
+
+        var rng = new Random(0x515D + seqLen * 13 + numHeads * 7 + headDim + ropeDim);
+        float[] q = RandomFloats(rng, seqLen * numHeads * headDim);
+        float[] k = RandomFloats(rng, seqLen * numKvHeads * headDim);
+        int[] positions = new int[seqLen];
+        for (int i = 0; i < seqLen; i++) positions[i] = i;
+
+        // ropeDim/2 freq entries per position, exponent 2*pair/ropeDim — matches the
+        // kernel's per-thread freq reconstruction AND the CPU RoPE.Execute partial-
+        // rotary path (which slices each head to length ropeDim).
+        float[] cosTable = new float[seqLen * halfRope];
+        float[] sinTable = new float[seqLen * halfRope];
+        RoPE.PrecomputeFrequencyTableScalar(seqLen, ropeDim, theta, cosTable, sinTable);
+
+        float[] qExpected = (float[])q.Clone();
+        float[] kExpected = (float[])k.Clone();
+        RoPE.Execute(
+            qExpected.AsSpan(), kExpected.AsSpan(), positions,
+            numHeads, numKvHeads, headDim, ropeDim,
+            cosTable, sinTable,
+            DotLLM.Core.Configuration.RoPEType.NeoX);
+
+        using var device = VulkanDevice.Create();
+        using var kernel = RopeF32Kernel.Create(device, spvDir);
+
+        using var bufQ = device.Allocate(q.Length * sizeof(float));
+        using var bufK = device.Allocate(k.Length * sizeof(float));
+        using var bufPos = device.Allocate((long)positions.Length * sizeof(int));
+
+        device.Upload(q.AsSpan(), bufQ);
+        device.Upload(k.AsSpan(), bufK);
+        device.Upload(MemoryMarshal.AsBytes(positions.AsSpan()), bufPos);
+
+        // No neoxPairOffset → kernel default ropeDim/2 (the standard convention).
+        kernel.Launch(bufQ, bufK, bufPos,
+            seqLen, numHeads, numKvHeads, headDim, ropeDim, theta, RopeF32Kernel.Variant.NeoX);
+
+        float[] qActual = new float[q.Length];
+        float[] kActual = new float[k.Length];
+        device.Download(bufQ, qActual);
+        device.Download(bufK, kActual);
+
+        AssertClose(qExpected, qActual, "Q");
+        AssertClose(kExpected, kActual, "K");
+    }
+
+    [SkippableTheory]
+    // PARTIAL NeoX with the PRODUCTION frequency denominator = FULL head dim (NOT ropeDim).
+    // This mirrors the real Gemma-4 global-layer CPU path: the production forward builds its
+    // partial freq table via RoPE.PrecomputeFrequencyTablePartial(rotatedDim, fullHeadDim=headDim),
+    // so pair i rotates at angle pos / theta^(2i/headDim) — denominator headDim, NOT ropeDim.
+    // The Vulkan kernel must therefore be driven with freqDim = headDim.
+    //
+    // DISCRIMINATING (the bug this catches): the pre-fix shader (and the older PartialNeoX test
+    // above) used denominator = ropeDim, so at headDim 512 / ropeDim 128 the angles were computed
+    // with /128 instead of /512 — a large divergence that flipped the real-26B next token while
+    // the GlobalHeadDim=32 synthetic fixture's drift stayed below the argmax-flip threshold. With
+    // freqDim defaulting to ropeDim this test FAILS; with freqDim = headDim it passes.
+    // (seqLen, numHeads, numKvHeads, headDim, ropeDim, theta) — last row is the real 26B global config.
+    [InlineData(4, 2, 2, 64, 16, 1_000_000f)]
+    [InlineData(1, 8, 2, 128, 32, 1_000_000f)]
+    [InlineData(6, 16, 2, 512, 128, 1_000_000f)]
+    public void Launch_MatchesCpuReference_PartialNeoX_FullHeadFreqDenom(
+        int seqLen, int numHeads, int numKvHeads, int headDim, int ropeDim, float theta)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        int rotatedPairs = ropeDim / 2;
+
+        var rng = new Random(0xC0DE + seqLen * 13 + numHeads * 7 + headDim + ropeDim);
+        float[] q = RandomFloats(rng, seqLen * numHeads * headDim);
+        float[] k = RandomFloats(rng, seqLen * numKvHeads * headDim);
+        int[] positions = new int[seqLen];
+        for (int i = 0; i < seqLen; i++) positions[i] = i;
+
+        // PRODUCTION partial freq table: rotatedPairs (ropeDim/2) entries per position, but the
+        // exponent denominator is the FULL head dim (headDim), exactly as the real Gemma-4 forward.
+        float[] cosTable = new float[seqLen * rotatedPairs];
+        float[] sinTable = new float[seqLen * rotatedPairs];
+        RoPE.PrecomputeFrequencyTablePartial(seqLen, ropeDim, headDim, theta, cosTable, sinTable);
+
+        float[] qExpected = (float[])q.Clone();
+        float[] kExpected = (float[])k.Clone();
+        RoPE.ExecutePartialNeoX(
+            qExpected.AsSpan(), kExpected.AsSpan(), positions,
+            numHeads, numKvHeads, headDim, rotatedPairs,
+            cosTable, sinTable);
+
+        using var device = VulkanDevice.Create();
+        using var kernel = RopeF32Kernel.Create(device, spvDir);
+
+        using var bufQ = device.Allocate(q.Length * sizeof(float));
+        using var bufK = device.Allocate(k.Length * sizeof(float));
+        using var bufPos = device.Allocate((long)positions.Length * sizeof(int));
+
+        device.Upload(q.AsSpan(), bufQ);
+        device.Upload(k.AsSpan(), bufK);
+        device.Upload(MemoryMarshal.AsBytes(positions.AsSpan()), bufPos);
+
+        // Gemma-4 partial global rope: BOTH overrides — freqDim = headDim (freq denominator
+        // over the full head) AND neoxPairOffset = headDim/2 (pairing across the full-head
+        // halves) — together matching CPU PrecomputeFrequencyTablePartial + ExecutePartialNeoX.
+        kernel.Launch(bufQ, bufK, bufPos,
+            seqLen, numHeads, numKvHeads, headDim, ropeDim, theta,
+            RopeF32Kernel.Variant.NeoX, freqDim: headDim, neoxPairOffset: headDim / 2);
+
+        float[] qActual = new float[q.Length];
+        float[] kActual = new float[k.Length];
+        device.Download(bufQ, qActual);
+        device.Download(bufK, kActual);
+
+        AssertClose(qExpected, qActual, "Q");
+        AssertClose(kExpected, kActual, "K");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+
+    private static float[] RandomFloats(Random rng, int count)
+    {
+        var arr = new float[count];
+        for (int i = 0; i < count; i++)
+            arr[i] = (float)(rng.NextDouble() * 2.0 - 1.0); // [-1, 1]
+        return arr;
+    }
+
+    private static void AssertClose(float[] expected, float[] actual, string tensorName)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+        int errors = 0;
+        float maxAbs = 0, maxRel = 0;
+        for (int i = 0; i < expected.Length; i++)
+        {
+            float e = expected[i];
+            float a = actual[i];
+            float diff = MathF.Abs(e - a);
+            float rel = diff / MathF.Max(MathF.Abs(e), 1e-7f);
+            if (diff > maxAbs) maxAbs = diff;
+            if (rel > maxRel) maxRel = rel;
+            if (diff > AbsTol && rel > RelTol) errors++;
+        }
+        Assert.True(errors == 0,
+            $"{tensorName}: Numerical drift exceeded tolerance: " +
+            $"errors={errors}/{expected.Length}, maxAbs={maxAbs:G9}, maxRel={maxRel:G9}");
+    }
+}

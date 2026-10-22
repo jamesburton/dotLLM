@@ -96,6 +96,18 @@ public static unsafe class WeightRepacking
             or QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K;
 
     /// <summary>
+    /// Bytes <see cref="RepackR4"/> allocates for a [M, K] weight of <paramref name="qt"/> (equal to the source
+    /// size: the blocks are only rearranged). 0 when the type is not repackable or the shape is empty.
+    /// Lets a caller budget a repack before allocating anything (#792).
+    /// </summary>
+    internal static long RepackedSize(QuantizationType qt, int m, int k)
+    {
+        var (blockBytes, groupSize) = GetBlockInfo(qt);
+        if (blockBytes == 0 || m <= 0 || k <= 0 || k % groupSize != 0) return 0;
+        return (long)m * (k / groupSize) * blockBytes;
+    }
+
+    /// <summary>
     /// Repacks a [M, K] quantized weight matrix from row-major to R4 interleaved layout.
     /// For each group of 4 rows, blocks are stored column-by-column:
     /// [row0_blk0][row1_blk0][row2_blk0][row3_blk0][row0_blk1][row1_blk1]...

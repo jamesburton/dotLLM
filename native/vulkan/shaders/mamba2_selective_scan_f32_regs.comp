@@ -1,0 +1,97 @@
+#version 450
+// Mamba2 selective state-space scan, register-resident state (issue #572).
+//
+// Same math, bindings and push constants as mamba2_selective_scan_f32.comp -- see that file for the
+// recurrence. What changes is where the state lives and how the work maps to lanes:
+//
+//   * The (head, row) state vector s[0..dState) is held in REGISTERS for the whole sequence and
+//     touched in global memory exactly twice (load at entry, store at exit). The reference kernel
+//     reads and writes all dState floats of every row at every token -- that global-memory round trip
+//     is the entire cost (skipping the kernel took a 512-token Nemotron-9B prefill from 4.29 s to
+//     1.05 s).
+//   * Four lanes cooperate on one row, each owning KPL = dState / 4 = 32 consecutive state floats
+//     (dState == 128 only; the host falls back to the reference kernel otherwise). The per-row dot
+//     with C is finished with two subgroupShuffleXor steps, so no shared memory and no barriers.
+//   * A workgroup is 64 lanes = 16 rows x 4 k-slices, and the grid is nHead * headDim / 16, so all
+//     lanes are active for headDim in {64, 80, 128} (the reference kernel idled 16 of 64 lanes at
+//     headDim 80 and ran only nHead workgroups).
+//
+// Reduction order differs from the reference (four partial sums, then a pairwise merge), so results
+// agree to F32 rounding, not bit-for-bit.
+
+#extension GL_KHR_shader_subgroup_basic   : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+#define ROWS 16
+#define KSPLIT 4
+#define KPL 32          // state floats per lane; dState must equal KSPLIT * KPL = 128
+#define KPL4 8          // vec4 loads per lane
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430)          buffer BufState { vec4 st[];  };
+layout(set = 0, binding = 1, std430) readonly buffer BufX     { float x[];   };
+layout(set = 0, binding = 2, std430) readonly buffer BufDt    { float dt[];  };
+layout(set = 0, binding = 3, std430) readonly buffer BufA     { float a[];   };
+layout(set = 0, binding = 4, std430) readonly buffer BufB     { vec4 bcoef[]; };
+layout(set = 0, binding = 5, std430) readonly buffer BufC     { vec4 ccoef[]; };
+layout(set = 0, binding = 6, std430) writeonly buffer BufY    { float y[];   };
+
+layout(push_constant) uniform PushConstants {
+    uint nHead;
+    uint headDim;
+    uint dState;
+    uint nGroup;
+    uint seqLen;
+} pc;
+
+float softplusF(float v) {
+    if (v > 20.0)  return v;
+    if (v < -20.0) return exp(v);
+    return log(1.0 + exp(v));
+}
+
+void main() {
+    uint wgPerHead = pc.headDim / ROWS;
+    uint h = gl_WorkGroupID.x / wgPerHead;
+    if (h >= pc.nHead) return;
+    uint rowBlock = gl_WorkGroupID.x - h * wgPerHead;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint i   = rowBlock * ROWS + (tid >> 2);      // state row within the head
+    uint ks  = tid & 3u;                          // which quarter of dState this lane owns
+
+    uint dInner    = pc.nHead * pc.headDim;
+    uint headsPerG = pc.nHead / pc.nGroup;
+    uint g         = h / headsPerG;
+    float aH       = a[h];
+
+    // vec4 index of this lane's first state / B / C element.
+    uint stateBase4 = ((h * pc.headDim + i) * pc.dState + ks * KPL) >> 2;
+
+    vec4 s[KPL4];
+    for (uint j = 0u; j < KPL4; j++) s[j] = st[stateBase4 + j];
+
+    for (uint t = 0u; t < pc.seqLen; t++) {
+        float dtSp = softplusF(dt[t * pc.nHead + h]);
+        float dA   = exp(dtSp * aH);
+        float xDt  = x[t * dInner + h * pc.headDim + i] * dtSp;
+
+        uint bc4 = ((t * pc.nGroup + g) * pc.dState + ks * KPL) >> 2;
+
+        float part = 0.0;
+        for (uint j = 0u; j < KPL4; j++) {
+            vec4 bv = bcoef[bc4 + j];
+            vec4 cv = ccoef[bc4 + j];
+            s[j] = s[j] * dA + bv * xDt;
+            part += dot(s[j], cv);
+        }
+
+        part += subgroupShuffleXor(part, 1u);
+        part += subgroupShuffleXor(part, 2u);
+        if (ks == 0u)
+            y[t * dInner + h * pc.headDim + i] = part;
+    }
+
+    for (uint j = 0u; j < KPL4; j++) st[stateBase4 + j] = s[j];
+}
