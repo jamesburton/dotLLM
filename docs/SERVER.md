@@ -584,7 +584,8 @@ The checkpoint's window (262,144 tokens for Bonsai-2) is far more than a 12 GB c
 client that believes it keeps the conversation growing until the KV cache no longer fits. So at load, after warm-up, the
 server runs one prefill tile (and, with MTP, one verify) to allocate every fixed-size buffer, then divides the free VRAM
 left after the reserve by the per-token cost (KV rows in every attention layer under the chosen `--kv-quant-k/-v`, the
-quantized-KV dequant scratch, and the MTP head's KV) and serves that many tokens, rounded down to 1024:
+quantized-KV dequant scratch when a path still needs it, and the MTP head's KV) and serves that many tokens, rounded down to
+1024:
 
 ```
 [dotllm] Context window: 26624 of 262144 tokens, fitted to free VRAM (1826 MiB free after load, 256 MiB reserve, 149 MiB fixed, 54.0 KiB/token, q8_0 KV + MTP). Set --ctx-size to override.
@@ -604,6 +605,15 @@ Measured on an RTX 3060 12 GB (desktop on the same card) with Bonsai-2 27B PQ2_0
 | same, plus `DOTLLM_CUDA_PREFILL_CHUNK=512` | 35,840 | 54 KiB, but ~480 MiB less fixed prefill scratch |
 | `--kv-quant-k q8_0 --kv-quant-v q8_0 --no-mtp` | 53,248 | 38 KiB |
 | f16 KV (MTP on) | 14,336 | 80 KiB |
+
+Since #1094 the quantized-KV flash prefill reads the K/V blocks directly, so the 4 KiB/token dequant scratch is gone from
+every quantized row above: q4_0 without MTP costs **18.0 KiB/token** (was 22) and q4_0 with MTP 34 KiB (was 38). On the same
+card with nothing else on it (2,782 MiB free after load at the 512 tile), q4_0 / `--no-mtp` / 512 tile fits
+(2,782 − 256 − 149) MiB ÷ 18 KiB ≈ **134k** (was 110,592). The measured line on a card with another process holding ~0.9 GB:
+
+```
+[dotllm] Context window: 97280 of 262144 tokens, fitted to free VRAM (2130 MiB free after load, 256 MiB reserve, 149 MiB fixed, 18.0 KiB/token, q4_0 KV). Set --ctx-size to override.
+```
 
 The 512-token prefill tile costs about 15% of prefill speed. `--no-mtp` doubles the window at the cost of MTP's decode
 speed-up. An agent client that sends a large `max_tokens` (CodeSharp sends 16,384) spends that much of the window on
