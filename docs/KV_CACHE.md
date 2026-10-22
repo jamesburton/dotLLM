@@ -73,6 +73,32 @@ since #1102, by the `_kvf16` attention twins the dense hybrid selects; see the n
 (handles are recycled; a stale cached set reads zeros without any error). Qwen4-Exp does this in `ForwardCore` before recording (`EnsureContext`), for the sequence's K/V and its indexer
 state. Switches and measurements: [ATTENTION.md](ATTENTION.md), "Lazy growth and F16 K/V".
 
+#### Growable caches for a continuing session (issue #1100)
+
+The engine grows a sequence's KV with `IKvCache.TryGrowTo` when a recurrent-prefix hit needs more positions than the cache
+was made with (a growing chat session needs that on almost every turn). The Vulkan cache used to keep the interface default
+(never grows), so on Vulkan every turn after the first missed its prefix, and after #1093 a long one was refused.
+
+- **`TryGrowTo(n)`** raises `MaxLength` up to the `growthLimit` the cache was created with (the model's window; 0, the
+  default, means never). A lazy cache only raises the limit, and its buffers grow in the forward. An eager cache re-creates its
+  buffers at once, copying the live rows layer by layer, so the transient cost is one layer's K and V. Out of device memory
+  returns `false` and leaves the cache as it was.
+- **Hosts.** The Bonsai / Qwen3.5 dense hybrid (`VulkanQwen3HybridDenseTransformerModel`) and LFM2
+  (`VulkanLfm2MoeTransformerModel`) create **lazy** caches capped at the window. Before recording, each forward calls
+  `VulkanNemotronHKvCache.PrepareForForward(kv, positionsEnd, ref seenEpoch)`. It grows the buffers to cover the forward and maps
+  out-of-device-memory to `DeviceMemoryAdmissionException` (HTTP 400, not a crash). It returns true when the caller must drop
+  its descriptor caches.
+- **Descriptor epoch.** Kernels cache descriptor sets by buffer handle, and Vulkan recycles a freed handle into the next
+  allocation. Any cache of this type that frees buffers (a growth, per layer, or a dispose) bumps the process-wide
+  `BufferEpoch`. A model drops every descriptor cache when the epoch it last saw has moved. The check covers another sequence's
+  growth and a snapshot's dispose, not only this cache's. The Arc driver does not recycle a handle soon enough for a stale set
+  to change the logits. The tests therefore pin the invalidation itself (`KvBufferInvalidationsForTest`), as well as
+  bit-identical logits against a cache allocated in one step.
+- **Snapshots.** `SnapshotPrefix` copies into an exactly-sized eager cache. `RestorePrefixFrom` grows a lazy destination first.
+  A snapshot taken before a growth restores exactly after it (`VulkanQwen3HybridDenseKvGrowthTests`).
+- **Cost.** F32 storage (the default; F16 halves it, next section): 128 KiB per token for Bonsai-2 (16 attention layers x 4 KV heads x 256 x K and V x 4 B), so
+  16 GiB at 128k. A growth step is 25 % of what is held (at least 1,024 positions), plus one layer's K and V in transit.
+
 ### Vulkan dense-hybrid (Bonsai 2) KV: F16 storage read in place (issue #1102)
 
 `VulkanQwen3HybridDenseTransformerModel` (Bonsai 2, Qwen3.5 / 3.6 dense hybrids) keeps its KV in a lazy, growable
