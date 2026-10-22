@@ -757,7 +757,8 @@ What the table shows:
 
 - **Prefix reuse.** Every turn after the first reuses the whole previous prompt (cached = previous prompt - 5), and there were
   no refusals or device losses.
-- **Memory.** It grows ~1 GiB a turn, the F32 KV's 128 KiB per token.
+- **Memory.** It grows ~1 GiB a turn, the F32 KV's 128 KiB per token. These tables were measured with F32 KV. #1102 moves
+  the Vulkan KV default to F16 (64 KiB per token).
 - **Prefill and decode speed.** Both fall with depth because the attention reads the whole F32 history. Prefill attention runs
   at ~1 TFLOP/s on this hd256 path. Narrower KV (design V2) and a faster hd256 prefill kernel (V3, #441) are the next steps.
 - **Total time.** All 16 turns, from an empty session to 128k, took 63 minutes.
