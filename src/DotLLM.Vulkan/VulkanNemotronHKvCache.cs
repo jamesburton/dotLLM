@@ -38,7 +38,8 @@ public sealed class VulkanNemotronHKvCache : IKvCache
     private readonly int _attentionLayerCount;
     private readonly int _numKvHeads;
     private readonly int _headDim;
-    private readonly int _maxSeqLen;
+    private readonly int _growthLimit;
+    private int _maxSeqLen;
     private readonly int _kvStride;
     private readonly VulkanKvStorage _storage;
     private readonly int _elemBytes;
@@ -49,6 +50,16 @@ public sealed class VulkanNemotronHKvCache : IKvCache
 
     /// <summary>Smallest step a lazy cache grows by (positions); growth is otherwise 25% of what is held, rounded up to this.</summary>
     internal static int LazyGrowthQuantum { get; set; } = 1024;
+
+    private static long s_bufferEpoch;
+
+    /// <summary>
+    /// Bumped whenever any cache of this type frees device buffers (a growth re-creating them, or a dispose). Vulkan recycles a
+    /// freed buffer handle into later allocations, so a kernel's handle-keyed descriptor cache can then bind a set that names the
+    /// freed buffer and silently read zeros. A model that records against these caches drops its descriptor caches when the epoch
+    /// it last saw has moved (issue #1100).
+    /// </summary>
+    internal static long BufferEpoch => Interlocked.Read(ref s_bufferEpoch);
 
     /// <summary>Element format of the K/V rows.</summary>
     public VulkanKvStorage Storage => _storage;
@@ -83,9 +94,12 @@ public sealed class VulkanNemotronHKvCache : IKvCache
     /// <c>storage</c>: element format; <see cref="VulkanKvStorage.F16"/> halves the footprint but needs the QSA hook (see the enum).
     /// <c>lazy</c>: allocate nothing up front and grow with <see cref="EnsureCapacity"/> (the caller must call it, before recording, for every
     /// forward and then drop every descriptor cache that may name the old buffers); <see cref="MaxLength"/> stays the logical limit.
+    /// <c>growthLimit</c>: the largest <see cref="MaxLength"/> <see cref="TryGrowTo"/> may raise the cache to (the model's context window);
+    /// at most <c>maxSeqLen</c>, the default, means the cache never grows.
     /// </remarks>
     public VulkanNemotronHKvCache(VulkanDevice device, int[] kvSlotForLayer, int attentionLayerCount,
-        int numKvHeads, int headDim, int maxSeqLen, VulkanKvStorage storage = VulkanKvStorage.F32, bool lazy = false)
+        int numKvHeads, int headDim, int maxSeqLen, VulkanKvStorage storage = VulkanKvStorage.F32, bool lazy = false,
+        int growthLimit = 0)
     {
         ArgumentNullException.ThrowIfNull(device);
         ArgumentNullException.ThrowIfNull(kvSlotForLayer);
@@ -100,6 +114,7 @@ public sealed class VulkanNemotronHKvCache : IKvCache
         _numKvHeads = numKvHeads;
         _headDim = headDim;
         _maxSeqLen = maxSeqLen;
+        _growthLimit = Math.Max(maxSeqLen, growthLimit);
         _kvStride = numKvHeads * headDim;
         _storage = storage;
         _elemBytes = storage == VulkanKvStorage.F16 ? 2 : 4;
@@ -139,6 +154,84 @@ public sealed class VulkanNemotronHKvCache : IKvCache
         return true;
     }
 
+    /// <summary>
+    /// Raises <see cref="MaxLength"/> to <paramref name="maxLength"/>, up to the growth limit the cache was created with (issue #1100), so a
+    /// recurrent-prefix hit keeps its rows instead of re-prefilling. A lazy cache only raises the limit: the forward grows its buffers before
+    /// recording. An eager cache re-creates its buffers now, copying the live rows layer by layer; the caller's descriptor caches then go stale
+    /// (see <see cref="BufferEpoch"/>). Returns <see langword="false"/> above the limit or when the device cannot hold the larger buffers,
+    /// leaving the cache as it was.
+    /// </summary>
+    /// <param name="maxLength">Positions the cache must hold.</param>
+    /// <returns><see langword="true"/> when <see cref="MaxLength"/> is now at least <paramref name="maxLength"/>.</returns>
+    public bool TryGrowTo(int maxLength)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (maxLength <= _maxSeqLen) return true;
+        if (maxLength > _growthLimit) return false;
+        if (!_lazy && _attentionLayerCount > 0)
+        {
+            try { GrowTo(maxLength); }
+            catch (VulkanException e) when (e.ErrorCode is VulkanOutOfDeviceMemory or VulkanOutOfHostMemory)
+            {
+                return false;
+            }
+        }
+        else if (_attentionLayerCount == 0)
+        {
+            _allocLength = maxLength;
+        }
+
+        _maxSeqLen = maxLength;
+        return true;
+    }
+
+    /// <summary>
+    /// Call before recording a forward (issue #1100): grows a lazy <paramref name="kvCache"/> to hold <paramref name="positionsEnd"/>
+    /// positions, mapping a device allocation failure to <see cref="Core.Configuration.DeviceMemoryAdmissionException"/>. Returns
+    /// <see langword="true"/> when any cache of this type freed device buffers since <paramref name="seenEpoch"/> (this growth, another
+    /// cache's, a restore or a dispose); the caller must then drop its kernels' descriptor caches, because a recycled handle would bind a
+    /// set naming the freed buffer.
+    /// </summary>
+    /// <param name="kvCache">The forward's cache; anything but a <see cref="VulkanNemotronHKvCache"/> is only checked for the epoch.</param>
+    /// <param name="positionsEnd">One past the largest position the forward writes.</param>
+    /// <param name="seenEpoch">The caller's last seen <see cref="BufferEpoch"/>; updated.</param>
+    /// <returns><see langword="true"/> when descriptor caches must be dropped.</returns>
+    internal static bool PrepareForForward(IKvCache? kvCache, int positionsEnd, ref long seenEpoch)
+    {
+        if (kvCache is VulkanNemotronHKvCache vk)
+        {
+            try { vk.EnsureCapacity(positionsEnd); }
+            catch (VulkanException e) when (e.ErrorCode is VulkanOutOfDeviceMemory or VulkanOutOfHostMemory)
+            {
+                throw new Core.Configuration.DeviceMemoryAdmissionException(
+                    $"Out of device memory growing the KV cache to {positionsEnd} positions " +
+                    $"({vk.BytesPerPosition * (long)positionsEnd / (1024 * 1024)} MiB). Shorten the conversation or lower --ctx-size. " +
+                    $"({e.Message})");
+            }
+        }
+
+        long epoch = BufferEpoch;
+        if (epoch == seenEpoch) return false;
+        seenEpoch = epoch;
+        return true;
+    }
+
+    /// <summary>Largest value in <paramref name="positions"/> plus one: the KV length a forward over them needs.</summary>
+    /// <param name="positions">The forward's positions (non-empty; need not be ascending).</param>
+    /// <returns>One past the largest position.</returns>
+    internal static int PositionsEnd(ReadOnlySpan<int> positions)
+    {
+        int max = positions[0];
+        for (int i = 1; i < positions.Length; i++) if (positions[i] > max) max = positions[i];
+        return max + 1;
+    }
+
+    /// <summary><c>VK_ERROR_OUT_OF_DEVICE_MEMORY</c>.</summary>
+    internal const int VulkanOutOfDeviceMemory = -2;
+
+    /// <summary><c>VK_ERROR_OUT_OF_HOST_MEMORY</c>.</summary>
+    internal const int VulkanOutOfHostMemory = -1;
+
     private void GrowTo(int newLength)
     {
         long newBytes = (long)newLength * _kvStride * _elemBytes;
@@ -165,6 +258,9 @@ public sealed class VulkanNemotronHKvCache : IKvCache
             _values[i]?.Dispose();
             _keys[i] = nk;
             _values[i] = nv;
+
+            // Per layer, so a later layer's failed allocation still leaves the epoch past the handles freed so far.
+            Interlocked.Increment(ref s_bufferEpoch);
         }
         _allocLength = newLength;
     }
@@ -387,5 +483,6 @@ public sealed class VulkanNemotronHKvCache : IKvCache
             _keys[i]?.Dispose();
             _values[i]?.Dispose();
         }
+        Interlocked.Increment(ref s_bufferEpoch);
     }
 }
