@@ -115,6 +115,29 @@ public sealed class VulkanPrefillSubmitBudgetTests
         }
     }
 
+    /// <summary>
+    /// The Strix outlier: a 58-row tail at 32,826 positions ran as one 1.65 s submission because its FLOPs alone (~0.95 s at the
+    /// measured rates) fit the budget. Costed at <see cref="VulkanPrefillSubmitBudget.MinEffectiveRows"/>, it is split.
+    /// </summary>
+    [Fact]
+    public void ShortTail_IsCostedAtTheEffectiveRows_AndSplit()
+    {
+        var budget = Calibrated(StrixDense, StrixAttention);
+        bool[] kinds = Pattern(BonsaiLayers);
+        double flopDense = VulkanPrefillSubmitBudget.DenseGflops(BonsaiParamsPerLayer, 58);
+        double flopAttention = VulkanPrefillSubmitBudget.AttentionGflops(58, 32_826, Heads, HeadDim);
+        // By FLOPs alone the whole 64-layer stack is about one budget, so it went out in one or two submissions.
+        Assert.InRange(budget.EstimateSeconds(flopDense * BonsaiLayers, flopAttention * (BonsaiLayers / 4)), 0.8, 1.25);
+
+        int rows = VulkanPrefillSubmitBudget.EffectiveRows(58);
+        Assert.Equal(VulkanPrefillSubmitBudget.MinEffectiveRows, rows);
+        Assert.Equal(1024, VulkanPrefillSubmitBudget.EffectiveRows(1024));
+        int layers = budget.LayersInSubmission(kinds, 0,
+            VulkanPrefillSubmitBudget.DenseGflops(BonsaiParamsPerLayer, rows),
+            VulkanPrefillSubmitBudget.AttentionGflops(rows, 32_826, Heads, HeadDim));
+        Assert.True(layers < BonsaiLayers / 2, $"{layers} layers in the first submission");
+    }
+
     [Fact]
     public void Observe_RecoversBothRates()
     {

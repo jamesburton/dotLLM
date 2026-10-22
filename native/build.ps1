@@ -47,18 +47,33 @@ function Assert-PtxVersion {
 # else stays on the legacy fast-math path that this build script ships with.
 $bitPerfect = @('conv1d_causal', 'gated_delta_net_scan', 'hadamard_fwht')
 
+# Kernels that emit Ampere-only PTX (mma.sync / cp.async) and so MUST be built at
+# compute_86 instead of the global default (dispatch-gated to Ampere+ in C#).
+# Mirrors build_ptx.bat's ARCH_86 list.
+$arch86 = @('attention_flash_mma', 'attention_flash_mma_decode_gqa_split',
+    'attention_flash_mma_decode_gqa_split_kvq', 'attention_flash_mma_prefill_hd256',
+    'attention_flash_mma_prefill_hd256_kvq')
+
+# Kernels that #include <cooperative_groups.h> (libcu++ needs C++17).
+# Mirrors build_ptx.bat's CXX17 list.
+$cxx17 = @('gated_delta_net_scan', 'attention_f32', 'attention_flash_mma_decode_gqa_split',
+    'attention_flash_mma_decode_gqa_split_kvq', 'attention_flash_mma_prefill_hd256',
+    'attention_flash_mma_prefill_hd256_kvq')
+
 Write-Host "Compiling CUDA kernels -> PTX (target: $arch)..."
 
 foreach ($cuFile in Get-ChildItem "$kernelDir\*.cu") {
     $base = $cuFile.BaseName
+    $kArch = if ($arch86 -contains $base) { 'compute_86' } else { $arch }
+    $stdFlag = @(if ($cxx17 -contains $base) { '-std=c++17' })
 
     if ($bitPerfect -contains $base) {
-        & nvcc -ptx -arch=$arch `
+        & nvcc -ptx -arch=$kArch @stdFlag `
             -fmad=false `
             -o "$outDir\$base.ptx" `
             $cuFile.FullName
     } else {
-        & nvcc -ptx -arch=$arch `
+        & nvcc -ptx -arch=$kArch @stdFlag `
             --use_fast_math `
             -o "$outDir\$base.ptx" `
             $cuFile.FullName

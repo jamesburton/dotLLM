@@ -96,8 +96,10 @@ was made with (a growing chat session needs that on almost every turn). The Vulk
   bit-identical logits against a cache allocated in one step.
 - **Snapshots.** `SnapshotPrefix` copies into an exactly-sized eager cache. `RestorePrefixFrom` grows a lazy destination first.
   A snapshot taken before a growth restores exactly after it (`VulkanQwen3HybridDenseKvGrowthTests`).
-- **Cost.** F32 storage (the default; F16 halves it, next section): 128 KiB per token for Bonsai-2 (16 attention layers x 4 KV heads x 256 x K and V x 4 B), so
-  16 GiB at 128k. A growth step is 25 % of what is held (at least 1,024 positions), plus one layer's K and V in transit.
+- **Cost.** Growth, admission and snapshot copies size everything from the cache's `ElementBytes` / `BytesPerPosition`, never an
+  assumed F32. F16 is the default (#1102): 64 KiB per token for Bonsai-2 (16 attention layers x 4 KV heads x 256 x K and V x 2 B),
+  so 8 GiB at 128k; the F32 baseline doubles it. A growth step is 25 % of what is held (at least 1,024 positions), plus one
+  layer's K and V in transit.
 
 ### Vulkan dense-hybrid (Bonsai 2) KV: F16 storage read in place (issue #1102)
 
@@ -160,8 +162,18 @@ length-only `CudaHybridKvCacheHandle`. Per full-attention slot (16 of 64 layers 
   (`quant_f16_to_q{8,4}_0`, standard 32-element blocks) and read either by the **fused** decode kernel
   (`attention_flash_mma_decode_gqa_split_kvq_*`, dequant inside the K/V tile load, bit-identical to the scratch path;
   **default ON since #988's v2 kernels** — v1 fused measured slower than scratch, Q4_0 at ctx 16k 12.4 vs 13.3 tok/s, v2
-  reads whole blocks per quad and holds 18.5 tok/s flat from ctx 512 to 16k; `DOTLLM_HYBRID_KV_FUSED=0` opts out) or
-  by a dequant into one shared F16 scratch pair (used by prefill, the fallback tiers, and decode when fused is off).
+  reads whole blocks per quad and holds 18.5 tok/s flat from ctx 512 to 16k; `DOTLLM_HYBRID_KV_FUSED=0` opts out), by the
+  **fused flash prefill** (`attention_flash_mma_prefill_hd256_kvq_*`, issue #1094: prefill tiles and MTP verifies wider than
+  the 8-row per-row tier, dequantizing one 16-row K/V tile at a time in shared memory, bit-identical to the scratch path), or
+  by a dequant into one shared F16 scratch pair (the fallback tiers, shapes the hd256 kernels do not cover, and decode when
+  fused is off).
+- **No full-history F16 copy on the Bonsai path (#1094).** Before #1094, every quantized-KV prefill tile dequantized the
+  whole history of every attention layer into that scratch, which grows with the context: 2 bytes x 2 sides x
+  `numKvHeads * headDim` per token, **4 KiB/token on Bonsai-2, ~0.5 GiB at 128k**. It was what held a 12 GB RTX 3060 at a
+  110k fit (q4_0, no MTP, 512 tile). The served fit no longer counts it when the fused prefill applies: q4_0/q4_0 without
+  MTP is 18 KiB/token (KV rows only). `CudaQwen3HybridDenseTransformerModel.FlashPrefillHd256KvqForTest` turns the tier off
+  for A/B tests. Remaining `ResolveKvF16` callers (decode with `DOTLLM_HYBRID_KV_FUSED=0`, decode below the mma split
+  minimum, the F32 fallback tiers) still allocate the scratch on demand, admitted against free VRAM.
 - **KV Q4_0 is not the GGUF Q4_0 layout.** KV blocks pack ADJACENT PAIRS (low nibble = even element), matching CPU
   `KvQuantize` and `quant_kv.cu`; the weight dequant (`dequant_q4_0_f16`) unpacks low/high HALVES. Always use
   `CudaKernels.LaunchKvDequantToF16` for KV data. (The eager `CudaQuantizedKvCache` path used the weight dequant until

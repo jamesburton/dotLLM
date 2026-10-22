@@ -230,6 +230,18 @@ which would take it further, stays a follow-up.
 Acceptance: a test that growing the head's KV allocates no second copy (VMM path) and keeps its rows; the fit's per-token
 term drops by 8 KiB with MTP on; MTP greedy parity unchanged.
 
+### C7. Latest-toolkit and PTX 8.7 compat kernel sets (user decision, 2026-10-21; issue #1098)
+
+The user wants the kernels optimized for the **latest CUDA**, without dropping older drivers.
+
+- Ship two PTX sets:
+  - **latest**: built locally with CUDA 13.3. The PTX ISA is whatever 13.3 emits.
+  - **compat**: PTX 8.7 from CUDA 12.8. It is built on the T5500 (`ssh t5500`, `E:\CUDA_v12.8.1\bin\nvcc.exe`) and stays in `native/ptx/`, as the existing contract requires.
+- The loader picks the newest set the driver accepts, with a per-module fallback to compat, and logs its choice.
+- An env override forces either set, for tests and benchmarks.
+- Benchmark latest against compat on the 3060 for the hot kernels, and record the result in `docs/CUDA.md`.
+- Until the loader exists, kernel changes (C3) commit compat PTX only.
+
 ### C5. Measure and document
 
 - **Step 0, before any change:** re-run the growth table on current dev (#1091 included) to confirm the
