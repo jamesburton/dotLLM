@@ -112,6 +112,9 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     private int _dp4aGemvLaunches;      // test-visible launch counters (Dp4aLaunchCounts)
     private int _dp4aQuantizeLaunches;
     private int _pq2_0MmqLaunches;      // #490 (Pq2_0MmqLaunchCount)
+    private int _lmHeadRowChunks;       // #1099 (LmHeadLaunchCounts)
+    private int _lmHeadDequantTiles;    // #1099 (LmHeadLaunchCounts)
+    private bool _warnedLmHeadTiled;    // #1099: one notice per model that the head dequantizes in tiles
 #if DEBUG
     // What _activQ8InScratch currently holds — checked when a caller claims it pre-quantized x.
     private (nint X, int K, int SeqLen) _dp4aQuantizedFor;
@@ -2131,7 +2134,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
             headRot.RotateForward(lmHeadInput, headIn, logitsRows, _outputInputDim,
                 permuteGdnValueHeads: false, streamH);
         }
-        Gemm(_outputDevice, _outputQt, headIn, _state.Logits,
+        GemmLmHead(_outputDevice, _outputQt, headIn, _state.Logits,
              _outputOutputDim, _outputInputDim, logitsRows);
         ProfMark("lm-head");
         if (DebugTrace) { _stream.Synchronize(); Console.Error.WriteLine("[hybrid-debug] lm_head done"); Console.Error.Flush(); LogVram("after lm-head"); }
@@ -4483,6 +4486,98 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     }
 
     /// <summary>
+    /// The LM head over <paramref name="seqLen"/> rows (issue #1099). Wider than the small-row tiers,
+    /// <see cref="Gemm"/> would dequantize the whole <c>[vocab, hidden]</c> head to F16 — 2.5 GiB on
+    /// Bonsai 2 27B, more than every layer projection together needs — so instead:
+    /// <list type="bullet">
+    ///   <item>PQ2_0 / I2_S: the rows run in chunks through the packed kernels <see cref="Gemm"/>
+    ///   already uses at that width (<see cref="LmHeadRowChunk"/>), reading the packed head once per
+    ///   chunk. Bit-identical per row to an un-chunked launch of the same kernel (the dp4a and
+    ///   multi-column GEMVs compute each column independently).</item>
+    ///   <item>Other quant types, which have no packed multi-row kernel here: dequant + cuBLAS in
+    ///   output-row tiles bounded by the scratch the layers already use
+    ///   (<see cref="CudaWideProjection"/>), with any growth admitted.</item>
+    /// </list>
+    /// </summary>
+    private void GemmLmHead(nint weight, QuantizationType qt, nint x, nint y, int m, int k, int seqLen)
+    {
+        if (seqLen == 1 || qt == QuantizationType.F32 || CudaWideProjection.BoundedLmHeadOverride == false)
+        {
+            Gemm(weight, qt, x, y, m, k, seqLen);
+            return;
+        }
+
+        if (qt is QuantizationType.PQ2_0 or QuantizationType.I2_S)
+        {
+            int chunk = LmHeadRowChunk(qt, seqLen);
+            if (seqLen <= chunk)
+            {
+                Gemm(weight, qt, x, y, m, k, seqLen);
+                return;
+            }
+            long xRowBytes = (long)k * sizeof(float), yRowBytes = (long)m * sizeof(float);
+            for (int r0 = 0; r0 < seqLen; r0 += chunk)
+            {
+                Gemm(weight, qt, x + (nint)(r0 * xRowBytes), y + (nint)(r0 * yRowBytes), m, k,
+                    Math.Min(chunk, seqLen - r0));
+                _lmHeadRowChunks++;
+            }
+            return;
+        }
+
+        long bound = Math.Max(_dequantScratchF16WeightElems, CudaWideProjection.TileFloorElems);
+        if ((long)m * k <= bound || !CudaWideProjection.SupportsRowTiles(qt))
+        {
+            Gemm(weight, qt, x, y, m, k, seqLen);   // fits the bound, or not tileable: admitted growth
+            return;
+        }
+
+        int tileRows = CudaWideProjection.TileRows(m, k, bound);
+        if (!_warnedLmHeadTiled)
+        {
+            _warnedLmHeadTiled = true;
+            Console.Error.WriteLine(
+                $"[dotLLM.Cuda] LM head ({qt}) has no packed multi-row kernel: {seqLen}-row logits dequantize it in " +
+                $"{(m + tileRows - 1) / tileRows} tiles of {(long)tileRows * k * sizeof(ushort) >> 20} MiB F16 " +
+                $"instead of one {(long)m * k * sizeof(ushort) >> 20} MiB copy (issue #1099).");
+        }
+        nint streamH = _stream.Handle;
+        int activInElems = checked(seqLen * k);
+        int activOutElems = checked(seqLen * m);
+        EnsureActivF16InScratch(activInElems);
+        EnsureActivF16OutScratch(activOutElems);
+        EnsureDequantScratchF16Weight((long)tileRows * k);
+        _kernels.LaunchConvertF32ToF16(x, _activF16InScratch, activInElems, streamH);
+        _lmHeadDequantTiles += CudaWideProjection.RunTiled(_kernels, _cublas.Handle, weight, qt,
+            _activF16InScratch, _activF16OutScratch, f32Out: false, m, k, seqLen,
+            _dequantScratchF16Weight, tileRows, streamH);
+        _kernels.LaunchConvertF16ToF32(_activF16OutScratch, y, activOutElems, streamH);
+    }
+
+    /// <summary>
+    /// Rows per LM-head chunk for a packed weight (issue #1099): the multi-row width when
+    /// <paramref name="seqLen"/> rows would take a packed multi-row kernel at that width (the dp4a
+    /// GEMV, or #482's F16-activation one), otherwise one row, which always has a packed path for
+    /// PQ2_0 / I2_S. Returns <paramref name="seqLen"/> when the opt-in #490 packed GEMM covers the
+    /// whole width, so the head is not chunked at all.
+    /// </summary>
+    private int LmHeadRowChunk(QuantizationType qt, int seqLen)
+    {
+        if (Pq2_0MmqActive(qt, seqLen)) return seqLen;
+        int cols = CudaSmallSGemvDispatch.MaxColumns;
+        if (qt == QuantizationType.PQ2_0 && cols >= 2
+            && (Dp4aActive(qt, cols) || (CudaSmallSGemvDispatch.Covers(cols) && _kernels.HasPQ2_0GemvMulti)))
+            return cols;
+        return 1;
+    }
+
+    /// <summary>
+    /// Test hook (issue #1099): LM-head row chunks and dequant tiles launched since the model was
+    /// created, so a test can prove an all-logits forward took the bounded route.
+    /// </summary>
+    internal (int RowChunks, int DequantTiles) LmHeadLaunchCounts => (_lmHeadRowChunks, _lmHeadDequantTiles);
+
+    /// <summary>
     /// Multi-column PQ2_0 projection (issue #482): converts the <c>[seqLen, k]</c> F32 activations
     /// to F16 in the shared staging scratch (the same rounding the single-column kernel applies when
     /// it stages x) and runs one exact-width multi-column GEMV into <c>y[seqLen, m]</c>. Returns
@@ -4677,6 +4772,10 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         // not. 510 bytes of insurance against a shape that is not.
         halfs = (halfs + 255) & ~255L;
         FreeIfNonZero(ref _dequantScratchF16Weight);
+        _dequantScratchF16WeightElems = 0;
+        // #1099: admitted like every other growth (#1068), so a dequant that cannot fit is a clean
+        // refusal rather than a WDDM spill. Freed first, so the free figure includes the old buffer.
+        AdmitDeviceGrowth(halfs * sizeof(ushort), $"F16 weight-dequant scratch ({halfs:N0} elements)");
         _dequantScratchF16Weight = AllocDevice(halfs * sizeof(ushort));
         _dequantScratchF16WeightElems = halfs;
     }
