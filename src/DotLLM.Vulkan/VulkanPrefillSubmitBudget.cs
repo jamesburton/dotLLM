@@ -37,6 +37,13 @@ internal sealed class VulkanPrefillSubmitBudget
     /// <summary>Prior attention rate, seconds per GFLOP (0.25 TFLOP/s).</summary>
     internal const double PriorAttentionSecondsPerGflop = 4e-3;
 
+    /// <summary>
+    /// Fewest rows a forward is costed at. A tile shorter than this does not fill the GPU (too few query blocks per head, too few
+    /// GEMM row tiles), so its time does not fall in proportion to its FLOPs: on Strix a 58-row tail at 32k positions took 1.65 s,
+    /// against ~0.95 s estimated from its FLOPs at the rates the full tiles had just measured.
+    /// </summary>
+    internal const int MinEffectiveRows = 128;
+
     /// <summary>Smallest row slice <see cref="RowsPerForward"/> produces.</summary>
     internal const int MinRowsPerForward = 64;
 
@@ -87,6 +94,11 @@ internal sealed class VulkanPrefillSubmitBudget
 
     /// <summary>Longest observed submission, seconds (diagnostics).</summary>
     public double LongestObservedSeconds { get; private set; }
+
+    /// <summary>Rows a forward of <paramref name="rows"/> rows is costed at: at least <see cref="MinEffectiveRows"/>.</summary>
+    /// <param name="rows">Rows in the forward.</param>
+    /// <returns>Rows to cost.</returns>
+    public static int EffectiveRows(int rows) => Math.Max(rows, MinEffectiveRows);
 
     /// <summary>Dense GFLOPs of one layer over <paramref name="rows"/> rows.</summary>
     /// <param name="paramsPerLayer">Weight elements of one layer (projections + FFN).</param>
@@ -163,7 +175,8 @@ internal sealed class VulkanPrefillSubmitBudget
         }
         return best;
 
-        double LayerSeconds(int r) => EstimateSeconds(DenseGflops(paramsPerLayer, r), AttentionGflops(r, kvEnd, numHeads, headDim));
+        double LayerSeconds(int r)
+            => EstimateSeconds(DenseGflops(paramsPerLayer, EffectiveRows(r)), AttentionGflops(EffectiveRows(r), kvEnd, numHeads, headDim));
     }
 
     /// <summary>

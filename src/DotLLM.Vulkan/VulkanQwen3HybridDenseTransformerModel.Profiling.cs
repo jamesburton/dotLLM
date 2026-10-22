@@ -93,7 +93,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel
 
     /// <summary>
     /// Starts the layer-submission schedule of one forward (or batch) over <paramref name="rows"/> rows whose attention layers each do
-    /// <paramref name="attentionGflopsPerLayer"/> GFLOPs.
+    /// <paramref name="attentionGflopsPerLayer"/> GFLOPs. Dense work is costed at <see cref="VulkanPrefillSubmitBudget.EffectiveRows"/>.
     /// </summary>
     /// <param name="rows">Rows in the forward.</param>
     /// <param name="attentionGflopsPerLayer">Attention work of one attention layer.</param>
@@ -111,7 +111,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel
             _isAttentionLayer = attention;
         }
 
-        return new SubmitSchedule(this, fixedLayers, VulkanPrefillSubmitBudget.DenseGflops(ParamsPerLayer, rows), attentionGflopsPerLayer, rows);
+        return new SubmitSchedule(this, fixedLayers,
+            VulkanPrefillSubmitBudget.DenseGflops(ParamsPerLayer, VulkanPrefillSubmitBudget.EffectiveRows(rows)), attentionGflopsPerLayer, rows);
     }
 
     /// <summary>

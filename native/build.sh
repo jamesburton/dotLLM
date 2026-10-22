@@ -56,12 +56,26 @@ FAST_MATH_KERNELS="add add_f32 swiglu swiglu_f32 convert bias_add bias_add_f32 e
 # - quantized_gemv: feeds precision-sensitive downstream ops
 PRECISE_KERNELS="softmax rmsnorm rmsnorm_f32 rmsnorm_f32in rope rope_f32 attention attention_f32 fused_add_rmsnorm per_head_rmsnorm per_head_rmsnorm_f32 quantized_gemv quantized_gemv_f32in"
 
-is_fast_math_kernel() {
+# Kernels that emit Ampere-only PTX (mma.sync / cp.async) and so MUST be built at
+# compute_86 instead of the global default (dispatch-gated to Ampere+ in C#).
+# Mirrors build_ptx.bat's ARCH_86 list.
+ARCH_86_KERNELS="attention_flash_mma attention_flash_mma_decode_gqa_split attention_flash_mma_decode_gqa_split_kvq attention_flash_mma_prefill_hd256 attention_flash_mma_prefill_hd256_kvq"
+
+# Kernels that #include <cooperative_groups.h> (libcu++ needs C++17).
+# Mirrors build_ptx.bat's CXX17 list.
+CXX17_KERNELS="gated_delta_net_scan attention_f32 attention_flash_mma_decode_gqa_split attention_flash_mma_decode_gqa_split_kvq attention_flash_mma_prefill_hd256 attention_flash_mma_prefill_hd256_kvq"
+
+# in_list <name> <space-separated list> — success when name is in the list.
+in_list() {
     local name="$1"
-    for fm in $FAST_MATH_KERNELS; do
-        [ "$fm" = "$name" ] && return 0
+    for item in $2; do
+        [ "$item" = "$name" ] && return 0
     done
     return 1
+}
+
+is_fast_math_kernel() {
+    in_list "$1" "$FAST_MATH_KERNELS"
 }
 
 echo "Compiling CUDA kernels → PTX (target: $ARCH)..."
@@ -70,15 +84,20 @@ for cu_file in "$KERNEL_DIR"/*.cu; do
     [ -f "$cu_file" ] || continue
     base=$(basename "$cu_file" .cu)
 
+    karch="$ARCH"
+    in_list "$base" "$ARCH_86_KERNELS" && karch="compute_86"
+    cxx17=""
+    in_list "$base" "$CXX17_KERNELS" && cxx17="-std=c++17"
+
     if is_fast_math_kernel "$base"; then
-        nvcc -ptx -arch="$ARCH" \
+        nvcc -ptx -arch="$karch" $cxx17 \
              --use_fast_math \
              -o "$OUT_DIR/$base.ptx" \
              "$cu_file"
         assert_ptx_version "$OUT_DIR/$base.ptx"
         echo "  $base.cu → $base.ptx (fast_math)"
     else
-        nvcc -ptx -arch="$ARCH" \
+        nvcc -ptx -arch="$karch" $cxx17 \
              -o "$OUT_DIR/$base.ptx" \
              "$cu_file"
         assert_ptx_version "$OUT_DIR/$base.ptx"
