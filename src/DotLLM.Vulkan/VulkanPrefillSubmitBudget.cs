@@ -41,10 +41,12 @@ internal sealed class VulkanPrefillSubmitBudget
     internal const int MinRowsPerForward = 64;
 
     /// <summary>
-    /// Scale of the prior pseudo-observations, GFLOP: a fraction of one prefill submission's work (hundreds to thousands of GFLOP), so
-    /// observed work outweighs the prior within a few submissions while a kind of work seen only in trace amounts stays near its prior.
+    /// Scale of the prior pseudo-observations, GFLOP: small next to one prefill submission's work (hundreds to thousands of GFLOP),
+    /// so observed work outweighs the prior within a submission or two, while a kind of work seen only in trace amounts stays near
+    /// its prior. Kept small also because dense and attention work are correlated in real submissions: a heavier (slow) attention
+    /// prior leaks into the dense fit and makes it optimistic (300 gave dense 8 % fast in the calibration test, 100 about 1 %).
     /// </summary>
-    private const double PriorGflops = 300;
+    private const double PriorGflops = 100;
 
     /// <summary>Weight kept per new observation (exponential forgetting): the fit tracks the last ~10 submissions.</summary>
     private const double Forget = 0.9;

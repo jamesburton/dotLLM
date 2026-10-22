@@ -170,11 +170,14 @@ public sealed class VulkanPrefillSubmitBudgetTests
     /// <summary>A budget fitted to exact rates from many varied submissions.</summary>
     private static VulkanPrefillSubmitBudget Calibrated(double dense, double attention)
     {
+        // Work drawn afresh for every observation: with forgetting, only the last ~10 submissions count, and each kind of work
+        // must vary within them for its rate to be determined.
         var budget = new VulkanPrefillSubmitBudget();
+        var rng = new Random(42);
         for (int i = 0; i < 60; i++)
         {
-            double d = 1000 + (i * 97 % 4000);
-            double a = i * 53 % 2500;
+            double d = 1000 + (rng.NextDouble() * 4000);
+            double a = 500 + (rng.NextDouble() * 2500);
             budget.Observe(d, a, (d * dense) + (a * attention));
         }
 
