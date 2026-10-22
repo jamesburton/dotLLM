@@ -1,0 +1,80 @@
+#version 450
+// Q5_0 dequantization to FP32.
+//
+// Block layout (22 bytes, 32 elements), matching llama.cpp's block_q5_0 and
+// DotLLM.Cpu.Kernels.Dequantize.DequantizeQ5_0Scalar byte-for-byte:
+//   bytes [0,1]   = fp16 d
+//   bytes [2..5]  = qh (uint32) — the 5th bit of every element
+//   bytes [6..21] = qs[16]      — two 4-bit nibbles per byte
+//
+// Per-element decode, j in [0,16):
+//   lo = qs[j] & 0xF          high bit = (qh >> j)        & 1  -> element j
+//   hi = (qs[j] >> 4) & 0xF   high bit = (qh >> (j + 16)) & 1  -> element j + 16
+//   value = d * ((bit << 4 | nibble) - 16)
+//
+// The 5th bit living in a separate word is the same class of indexing Q3_K got
+// transposed, so this mapping is asserted against real GGUF bytes, not a fixture.
+//
+// Dispatch: one workgroup per 8 blocks (256 elements), 256 threads, one element each.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  src[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer BufY { float dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint totalBlocks;
+    uint srcUints;
+} pc;
+
+const uint Q5_0_BLOCK_BYTES = 22u;
+const uint Q5_0_GROUP_SIZE  = 32u;
+const uint BLOCKS_PER_WG    = 8u;
+
+uint readByte(uint absByteOff) {
+    uint u = src[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = src[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = src[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+uint readUint(uint absByteOff) {
+    return readByte(absByteOff)
+         | (readByte(absByteOff + 1u) << 8)
+         | (readByte(absByteOff + 2u) << 16)
+         | (readByte(absByteOff + 3u) << 24);
+}
+
+void main() {
+    uint local = gl_LocalInvocationID.x;          // 0..255
+    uint blockInWg = local / Q5_0_GROUP_SIZE;     // 0..7
+    uint t = local % Q5_0_GROUP_SIZE;             // 0..31
+    uint blockIdx = gl_WorkGroupID.x * BLOCKS_PER_WG + blockInWg;
+    if (blockIdx >= pc.totalBlocks) return;
+
+    uint base = blockIdx * Q5_0_BLOCK_BYTES;
+    float d = readHalf(base);
+    uint qh = readUint(base + 2u);
+
+    uint j = t & 15u;                             // nibble index 0..15
+    uint qsByte = readByte(base + 6u + j);
+    uint nibble = (t < 16u) ? (qsByte & 0xFu) : ((qsByte >> 4) & 0xFu);
+    uint bitPos = (t < 16u) ? j : (j + 16u);
+    uint bit5 = (qh >> bitPos) & 1u;
+
+    int q = int(nibble | (bit5 << 4)) - 16;
+    dst[blockIdx * Q5_0_GROUP_SIZE + t] = d * float(q);
+}

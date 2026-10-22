@@ -71,8 +71,16 @@ public static class SpeculativeConstants
 /// <param name="DraftTicks">Stopwatch ticks spent on draft model forward passes.</param>
 /// <param name="VerifyTicks">Stopwatch ticks spent on target model verification forward pass.</param>
 /// <param name="DraftedCount">Total number of draft tokens proposed (K).</param>
+/// <param name="TotalTicks">Wall-clock stopwatch ticks of the WHOLE round (draft + verify + accept + rollback/restore/absorb), 0 when the decoder
+/// does not measure it. <see cref="DraftTicks"/> + <see cref="VerifyTicks"/> omit the post-verify state restore, which on a recurrent trunk is
+/// a device submit per rejected round; speed comparisons against plain decode must use this, not the sum.</param>
 public readonly record struct SpeculativeResult(
     int AcceptedCount,
     long DraftTicks,
     long VerifyTicks,
-    int DraftedCount);
+    int DraftedCount,
+    long TotalTicks = 0)
+{
+    /// <summary>Round wall ticks: <see cref="TotalTicks"/> when measured, else the draft + verify sum.</summary>
+    public long RoundTicks => TotalTicks > 0 ? TotalTicks : DraftTicks + VerifyTicks;
+}

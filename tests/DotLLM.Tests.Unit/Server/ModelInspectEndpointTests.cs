@@ -5,6 +5,30 @@ using Xunit;
 
 namespace DotLLM.Tests.Unit.Server;
 
+/// <summary>Issue #729 inspect payload tests.</summary>
+public class ModelInspectPartialOffloadTests
+{
+    private static DotLLM.Core.Models.ModelConfig ConfigFor(DotLLM.Core.Configuration.Architecture arch) => new()
+    {
+        Architecture = arch, VocabSize = 32, HiddenSize = 8, IntermediateSize = 16, NumLayers = 52,
+        NumAttentionHeads = 2, NumKvHeads = 2, HeadDim = 4, MaxSequenceLength = 16, NormEpsilon = 1e-5f,
+    };
+
+    /// <summary>Issue #729: the inspect payload tells the UI whether the GPU-layers slider is meaningful.</summary>
+    [Theory]
+    [InlineData(DotLLM.Core.Configuration.Architecture.NemotronH, false)]
+    [InlineData(DotLLM.Core.Configuration.Architecture.Llama, true)]
+    public void BuildResponse_ExposesPartialOffloadSupport_AndSurvivesJsonRoundTrip(
+        DotLLM.Core.Configuration.Architecture arch, bool expected)
+    {
+        var response = ModelInspectEndpoint.BuildResponse(ConfigFor(arch), 123);
+        Assert.Equal(expected, response.SupportsPartialOffload);
+
+        string json = System.Text.Json.JsonSerializer.Serialize(response, ServerJsonContext.Default.ModelInspectResponse);
+        Assert.Contains($"\"supports_partial_offload\":{(expected ? "true" : "false")}", json, StringComparison.Ordinal);
+    }
+}
+
 /// <summary>
 /// Tests for <see cref="ModelInspectEndpoint"/> path traversal protection.
 /// Validates that only paths within allowed model directories are accepted.
@@ -23,7 +47,7 @@ public class ModelInspectEndpointTests
     [Fact]
     public void IsAllowedModelPath_RejectsAbsolutePathOutsideModelDirs()
     {
-        var state = CreateState();
+        using var state = CreateState();
 
         // Path outside of any allowed directory
         string outsidePath = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "evil.gguf"));
@@ -34,7 +58,7 @@ public class ModelInspectEndpointTests
     [Fact]
     public void IsAllowedModelPath_RejectsPathTraversal()
     {
-        var state = CreateState();
+        using var state = CreateState();
 
         // Attempt path traversal relative to models directory
         string modelsDir = HuggingFaceDownloader.DefaultModelsDirectory;
@@ -46,7 +70,7 @@ public class ModelInspectEndpointTests
     [Fact]
     public void IsAllowedModelPath_AcceptsPathInModelsDirectory()
     {
-        var state = CreateState();
+        using var state = CreateState();
 
         string modelsDir = HuggingFaceDownloader.DefaultModelsDirectory;
         string validPath = Path.GetFullPath(Path.Combine(modelsDir, "owner", "repo", "model.gguf"));
@@ -59,7 +83,7 @@ public class ModelInspectEndpointTests
     {
         string loadedModelDir = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "my-models"));
         string loadedModelPath = Path.Combine(loadedModelDir, "loaded.gguf");
-        var state = CreateState(loadedModelPath);
+        using var state = CreateState(loadedModelPath);
 
         // A different file in the same directory should be allowed
         string siblingPath = Path.GetFullPath(Path.Combine(loadedModelDir, "other.gguf"));
@@ -72,7 +96,7 @@ public class ModelInspectEndpointTests
     {
         string loadedModelDir = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "my-models"));
         string loadedModelPath = Path.Combine(loadedModelDir, "loaded.gguf");
-        var state = CreateState(loadedModelPath);
+        using var state = CreateState(loadedModelPath);
 
         // Traversal from loaded model directory
         string traversalPath = Path.GetFullPath(Path.Combine(loadedModelDir, "..", "secret.gguf"));
@@ -83,7 +107,7 @@ public class ModelInspectEndpointTests
     [Fact]
     public void IsAllowedModelPath_RejectsWhenNoModelLoaded_OutsideModelsDir()
     {
-        var state = CreateState(); // No loaded model
+        using var state = CreateState(); // No loaded model
 
         string outsidePath = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "probe.gguf"));
 
