@@ -206,6 +206,31 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     /// </summary>
     public VulkanSplitKvAttentionKernel? SplitKvAttention { get; }
 
+    /// <summary>
+    /// The attention kernels for a narrow (F16) KV cache (issue #1102), or null until a host selects one with
+    /// <see cref="EnsureNarrowKv"/>. Owned here so <see cref="InvalidateAll"/> and <see cref="Dispose"/> cover them.
+    /// </summary>
+    public VulkanNarrowKvAttentionKernels? NarrowKv { get; private set; }
+
+    private VulkanDevice? _device;
+    private string? _spvDir;
+
+    /// <summary>
+    /// Returns the narrow-KV kernels for <paramref name="storage"/>, building them on first use (issue #1102).
+    /// </summary>
+    /// <param name="storage">The narrow storage the host's caches use.</param>
+    /// <param name="headDim">The model's per-head dimension (gates which prefill kernels are worth building).</param>
+    /// <returns>The kernel set.</returns>
+    /// <exception cref="NotSupportedException">The storage has no narrow kernels, or this build lacks their SPIR-V.</exception>
+    internal VulkanNarrowKvAttentionKernels EnsureNarrowKv(VulkanKvStorage storage, int headDim)
+    {
+        if (NarrowKv is { } existing && existing.Storage == storage) return existing;
+        var made = VulkanNarrowKvAttentionKernels.Create(_device!, _spvDir!, headDim, storage);
+        NarrowKv?.Dispose();
+        NarrowKv = made;
+        return made;
+    }
+
     /// <summary>Split-KV attention with per-row query offsets for 2..8-row verify forwards (null when its SPIR-V is missing or split decode is disabled).</summary>
     public VulkanSplitKvRowsAttentionKernel? SplitKvRowsAttention { get; private set; }
     public SwiGluF32Kernel SwiGlu { get; }
@@ -517,6 +542,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             moeTopk, moeBroadcast, moeIndexed, moeIndexedQ6K, moeIndexedQ4K, moeIndexedQ5K,
             moeIndexedQ4KMmq, quantizeQ8_1Rows, moeIndexedQ5KMmq, moeScatter, moeSigmoidGatedAdd);
         kernels.SplitKvRowsAttention = splitKvAttention is null ? null : VulkanSplitKvRowsAttentionKernel.TryCreate(device, spvDir);
+        kernels._device = device;
+        kernels._spvDir = spvDir;
         kernels.Iq1CodebooksOwned = Iq1Codebooks.Create(device);   // #823: grid for the IQ1_M expert kernels
         kernels.MoeSharedGateAdd = moeSharedGateAdd;
         kernels.MatMulBf16Multi = matmulBf16Multi;
@@ -720,6 +747,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         FlashAttentionCoopmat?.InvalidateDescriptorCache();
         SplitKvAttention?.InvalidateDescriptorCache();
         SplitKvRowsAttention?.InvalidateDescriptorCache();
+        NarrowKv?.InvalidateAll();
         SwiGlu.InvalidateDescriptorCache();
         Add.InvalidateDescriptorCache();
         SiluInplace.InvalidateDescriptorCache();
@@ -834,6 +862,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         SwiGlu.Dispose();
         SplitKvAttention?.Dispose();
         SplitKvRowsAttention?.Dispose();
+        NarrowKv?.Dispose();
         FlashAttention?.Dispose();
         FlashAttentionCoopmat?.Dispose();
         Attention.Dispose();

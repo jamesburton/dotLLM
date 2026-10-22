@@ -117,9 +117,10 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
     private VulkanSplitKvAttentionKernel(
         VulkanDevice device,
         VulkanModule splitModule, ComputePipeline splitPipeline, nint splitPool,
-        VulkanModule mergeModule, ComputePipeline mergePipeline, nint mergePool)
+        VulkanModule mergeModule, ComputePipeline mergePipeline, nint mergePool, VulkanKvStorage kvStorage)
     {
         _device = device;
+        KvStorage = kvStorage;
         _splitModule = splitModule;
         _splitPipeline = splitPipeline;
         _splitPool = splitPool;
@@ -130,14 +131,32 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         _mergeCache = new DescriptorSetCache(device, mergePool, mergePipeline, buffersPerSet: 4);
     }
 
+    /// <summary>Element format of the K / V buffers this instance reads (issue #1102); fixed at creation.</summary>
+    public VulkanKvStorage KvStorage { get; }
+
     /// <summary>
     /// Loads <c>attention_f32_splitkv.spv</c> + <c>attention_f32_splitkv_merge.spv</c>
     /// and creates both pipelines. Throws if either SPV is missing — callers
-    /// wanting graceful fallback should use <see cref="TryCreate"/>.
+    /// wanting graceful fallback should use <see cref="TryCreate(VulkanDevice, string)"/>.
     /// </summary>
+    /// <param name="device">The device.</param>
+    /// <param name="spvDir">Directory holding the SPIR-V blobs.</param>
+    /// <returns>An instance reading F32 K / V.</returns>
     public static VulkanSplitKvAttentionKernel Create(VulkanDevice device, string spvDir)
+        => Create(device, spvDir, VulkanKvStorage.F32);
+
+    /// <summary>
+    /// Loads the split pass compiled for <paramref name="kvStorage"/> (<c>attention_f32_splitkv[_kvf16].spv</c>, issue #1102) and the
+    /// shared merge pass. The F16 split pass reads the cache's packed halves in place: no F32 copy of the history exists. Throws if
+    /// either SPV is missing.
+    /// </summary>
+    /// <param name="device">The device.</param>
+    /// <param name="spvDir">Directory holding the SPIR-V blobs.</param>
+    /// <param name="kvStorage">Element format of the K / V buffers <see cref="Record"/> will be given.</param>
+    /// <returns>The kernel.</returns>
+    public static VulkanSplitKvAttentionKernel Create(VulkanDevice device, string spvDir, VulkanKvStorage kvStorage)
     {
-        string splitPath = Path.Combine(spvDir, "attention_f32_splitkv.spv");
+        string splitPath = Path.Combine(spvDir, kvStorage.ShaderName("attention_f32_splitkv") + ".spv");
         string mergePath = Path.Combine(spvDir, "attention_f32_splitkv_merge.spv");
         if (!File.Exists(splitPath))
             throw new FileNotFoundException(
@@ -168,7 +187,7 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         nint splitPool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 5);
         nint mergePool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
         return new VulkanSplitKvAttentionKernel(
-            device, splitModule, splitPipeline, splitPool, mergeModule!, mergePipeline, mergePool);
+            device, splitModule, splitPipeline, splitPool, mergeModule!, mergePipeline, mergePool, kvStorage);
     }
 
     /// <summary>
@@ -177,10 +196,18 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
     /// back to the per-token / flash kernels.
     /// </summary>
     public static VulkanSplitKvAttentionKernel? TryCreate(VulkanDevice device, string spvDir)
+        => TryCreate(device, spvDir, VulkanKvStorage.F32);
+
+    /// <summary><see cref="Create(VulkanDevice, string, VulkanKvStorage)"/>, or <see langword="null"/> when an SPV is missing or a pipeline fails.</summary>
+    /// <param name="device">The device.</param>
+    /// <param name="spvDir">Directory holding the SPIR-V blobs.</param>
+    /// <param name="kvStorage">Element format of the K / V buffers.</param>
+    /// <returns>The kernel, or <see langword="null"/>.</returns>
+    public static VulkanSplitKvAttentionKernel? TryCreate(VulkanDevice device, string spvDir, VulkanKvStorage kvStorage)
     {
         try
         {
-            return Create(device, spvDir);
+            return Create(device, spvDir, kvStorage);
         }
         catch (FileNotFoundException)
         {
@@ -302,7 +329,7 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         if (prefixLen < 0) throw new ArgumentOutOfRangeException(nameof(prefixLen));
 
         long qBytes   = (long)numHeads   * headDim * sizeof(float);   // seqQ == 1
-        long kvBytes  = (long)seqKv * numKvHeads * headDim * sizeof(float);
+        long kvBytes  = (long)seqKv * numKvHeads * headDim * KvStorage.ElementBytes();
         if (q.Size      < qBytes)   throw new ArgumentException("Q buffer too small.",      nameof(q));
         if (k.Size      < kvBytes)  throw new ArgumentException("K buffer too small.",      nameof(k));
         if (v.Size      < kvBytes)  throw new ArgumentException("V buffer too small.",      nameof(v));

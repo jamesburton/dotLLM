@@ -106,19 +106,28 @@ public static class SyntheticQwen35HybridDenseMtpGguf
     /// Q8_0 MTP GEMV paths (single-row draft/absorb and the multi-column batched absorb). The head-local
     /// embedding / lm_head stay F32. Default <see langword="false"/> leaves the fixture unchanged.
     /// </param>
+    /// <param name="attentionHeads">
+    /// Overrides <see cref="NumAttentionHeads"/> (2). Issue #1102 needs a GQA shape that is not degenerate: with one KV head every
+    /// query head reads the same KV row, so a wrong head broadcast cannot show. Must be a multiple of <paramref name="kvHeads"/>.
+    /// </param>
+    /// <param name="kvHeads">Overrides <see cref="NumKvHeads"/> (1). See <paramref name="attentionHeads"/>.</param>
     public static byte[] Build(uint seed = 0xC0FFEEu, bool withMtp = true, bool mtpHasOwnHeadTensors = true,
         int fullAttnInterval = FullAttnInterval, int blockCount = BlockCount,
         int contextLength = ContextLength, int gdnKeyHeads = NKHead, int gdnValueHeads = NVHead,
-        bool pq2_0Projections = false, bool q8_0MtpHead = false)
+        bool pq2_0Projections = false, bool q8_0MtpHead = false,
+        int attentionHeads = NumAttentionHeads, int kvHeads = NumKvHeads)
     {
         if (gdnKeyHeads <= 0 || gdnValueHeads <= 0 || gdnValueHeads % gdnKeyHeads != 0)
             throw new ArgumentException(
                 $"GDN value heads ({gdnValueHeads}) must be a positive multiple of key heads ({gdnKeyHeads}).");
+        if (kvHeads <= 0 || attentionHeads <= 0 || attentionHeads % kvHeads != 0)
+            throw new ArgumentException(
+                $"Attention heads ({attentionHeads}) must be a positive multiple of KV heads ({kvHeads}).");
 
         var w = new GgufWriter();
         var rng = new SyntheticGemma4Gguf.Xorshift(seed);
         const string arch = "qwen35";
-        Dims d = pq2_0Projections || q8_0MtpHead ? Dims.Pq2_0 : Dims.Default;
+        Dims d = (pq2_0Projections || q8_0MtpHead ? Dims.Pq2_0 : Dims.Default) with { Heads = attentionHeads, KvHeads = kvHeads };
 
         // ── Metadata ──────────────────────────────────────────────────────
         w.AddString("general.architecture", arch);
@@ -129,8 +138,8 @@ public static class SyntheticQwen35HybridDenseMtpGguf
         w.AddUInt32($"{arch}.context_length", (uint)contextLength);
         w.AddUInt32($"{arch}.embedding_length", (uint)d.Hidden);
         w.AddUInt32($"{arch}.block_count", (uint)rawBlockCount);
-        w.AddUInt32($"{arch}.attention.head_count", NumAttentionHeads);
-        w.AddUInt32($"{arch}.attention.head_count_kv", NumKvHeads);
+        w.AddUInt32($"{arch}.attention.head_count", (uint)d.Heads);
+        w.AddUInt32($"{arch}.attention.head_count_kv", (uint)d.KvHeads);
         w.AddUInt32($"{arch}.attention.key_length", (uint)d.HeadDim);
         w.AddUInt32($"{arch}.feed_forward_length", (uint)d.Ffn);
         w.AddFloat32($"{arch}.attention.layer_norm_rms_epsilon", 1e-5f);
@@ -211,10 +220,11 @@ public static class SyntheticQwen35HybridDenseMtpGguf
     public static string Write(string path, uint seed = 0xC0FFEEu, bool withMtp = true, bool mtpHasOwnHeadTensors = true,
         int fullAttnInterval = FullAttnInterval, int blockCount = BlockCount,
         int contextLength = ContextLength, int gdnKeyHeads = NKHead, int gdnValueHeads = NVHead,
-        bool pq2_0Projections = false, bool q8_0MtpHead = false)
+        bool pq2_0Projections = false, bool q8_0MtpHead = false,
+        int attentionHeads = NumAttentionHeads, int kvHeads = NumKvHeads)
     {
         File.WriteAllBytes(path, Build(seed, withMtp, mtpHasOwnHeadTensors, fullAttnInterval, blockCount, contextLength,
-            gdnKeyHeads, gdnValueHeads, pq2_0Projections, q8_0MtpHead));
+            gdnKeyHeads, gdnValueHeads, pq2_0Projections, q8_0MtpHead, attentionHeads, kvHeads));
         return path;
     }
 
@@ -224,7 +234,7 @@ public static class SyntheticQwen35HybridDenseMtpGguf
     /// projections can be stored as PQ2_0: hidden 128, ffn 256, head_dim 256 and GDN state 128 (the
     /// last two are Bonsai 2's real values), giving input widths 128 / 256 / 512.
     /// </summary>
-    private readonly record struct Dims(int Hidden, int Ffn, int HeadDim, int DState)
+    private readonly record struct Dims(int Hidden, int Ffn, int HeadDim, int DState, int Heads = NumAttentionHeads, int KvHeads = NumKvHeads)
     {
         public static Dims Default => new(
             SyntheticQwen35HybridDenseMtpGguf.HiddenSize, SyntheticQwen35HybridDenseMtpGguf.IntermediateSize,
@@ -315,9 +325,9 @@ public static class SyntheticQwen35HybridDenseMtpGguf
     private static void AddFullAttnLayer(GgufWriter w, SyntheticGemma4Gguf.Xorshift rng, string p, Dims d, bool pq2,
         bool q8 = false)
     {
-        int qOut = 2 * NumAttentionHeads * d.HeadDim; // Q + Gate fused per head
-        int kvOut = NumKvHeads * d.HeadDim;
-        int oIn = NumAttentionHeads * d.HeadDim;
+        int qOut = 2 * d.Heads * d.HeadDim; // Q + Gate fused per head
+        int kvOut = d.KvHeads * d.HeadDim;
+        int oIn = d.Heads * d.HeadDim;
 
         AddProjection(w, rng, $"{p}.attn_q.weight", inK: d.Hidden, outM: qOut, 0.05f, pq2, q8);
         AddProjection(w, rng, $"{p}.attn_k.weight", inK: d.Hidden, outM: kvOut, 0.05f, pq2, q8);

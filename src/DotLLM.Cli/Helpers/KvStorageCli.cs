@@ -38,6 +38,8 @@ public enum KvFlagTarget
     VulkanQuantSupported,
     /// <summary>Vulkan: device-resident KV, no quantized storage.</summary>
     Vulkan,
+    /// <summary>Vulkan Qwen3HybridDense (Bonsai 2): owns its KV and honours f32 / f16 (issue #1102).</summary>
+    VulkanHybridDense,
     /// <summary>A model that owns its KV (split GPU/CPU, MoE-hybrid, Nemotron-H) and has no quantized storage.</summary>
     OwnCacheUnsupported,
     /// <summary>Unknown model type: handled by the generic engine cache path.</summary>
@@ -46,7 +48,8 @@ public enum KvFlagTarget
 
 /// <summary>A parsed KV storage request: which flags were given and what they resolved to.</summary>
 internal sealed record KvStorageRequest(
-    KvCacheDType? Key, KvCacheDType? Value, string? KeyFlag, string? ValueFlag, int CacheWindow = 0)
+    KvCacheDType? Key, KvCacheDType? Value, string? KeyFlag, string? ValueFlag, int CacheWindow = 0,
+    string? KeyText = null, string? ValueText = null)
 {
     /// <summary>True when any key/value flag (or a non-zero window) was supplied.</summary>
     public bool IsSpecified => Key is not null || Value is not null || CacheWindow > 0;
@@ -74,7 +77,9 @@ internal static class KvStorageCli
                     out var key, out var keyFlag, out error)) return false;
             if (!TrySide("value", "--cache-type-v", cacheTypeV, "--kv-quant-v", kvQuantV,
                     out var value, out var valueFlag, out error)) return false;
-            request = new KvStorageRequest(key, value, keyFlag, valueFlag, Math.Max(0, cacheWindow));
+            // The raw text keeps f16 apart from f32, which KvCacheDType folds together (the Vulkan host stores either, #1102).
+            request = new KvStorageRequest(key, value, keyFlag, valueFlag, Math.Max(0, cacheWindow),
+                KeyText: kvQuantK ?? cacheTypeK, ValueText: kvQuantV ?? cacheTypeV);
             return true;
         }
         catch (ArgumentException ex)
@@ -118,6 +123,7 @@ internal static class KvStorageCli
         bool honoured = target switch
         {
             KvFlagTarget.CudaHybridDense => true,
+            KvFlagTarget.VulkanHybridDense => true,   // Apply rejects what it cannot store (q8_0, q4_0, mixed K/V)
             KvFlagTarget.VulkanQuantSupported => true,
             KvFlagTarget.CudaPlain or KvFlagTarget.Cpu or KvFlagTarget.Other => engineCacheHonoured,
             _ => false,
@@ -140,8 +146,8 @@ internal static class KvStorageCli
                 list.Add($"{request.ValueFlag} {HybridKvStorage.Label(request.Value.Value, request.Value.Value)} is ignored: {Why()} (model {modelName}, backend {backend}).");
         }
 
-        if (request.CacheWindow > 0 && target == KvFlagTarget.CudaHybridDense)
-            list.Add($"--cache-window {request.CacheWindow} is ignored: the CUDA hybrid-dense model stores the whole KV in one format " +
+        if (request.CacheWindow > 0 && target is KvFlagTarget.CudaHybridDense or KvFlagTarget.VulkanHybridDense)
+            list.Add($"--cache-window {request.CacheWindow} is ignored: the hybrid-dense model stores the whole KV in one format " +
                      $"(no mixed-precision window) (model {modelName}, backend {backend}).");
         return list;
     }
@@ -150,7 +156,14 @@ internal static class KvStorageCli
     public static KvFlagTarget Classify(IModel model, bool isVulkan)
     {
         if (isVulkan)
-            return model is DotLLM.Vulkan.VulkanTransformerModel ? KvFlagTarget.VulkanQuantSupported : KvFlagTarget.Vulkan;
+        {
+            return model switch
+            {
+                DotLLM.Vulkan.VulkanTransformerModel => KvFlagTarget.VulkanQuantSupported,
+                DotLLM.Vulkan.VulkanQwen3HybridDenseTransformerModel => KvFlagTarget.VulkanHybridDense,
+                _ => KvFlagTarget.Vulkan,
+            };
+        }
         return model switch
         {
             CudaQwen3HybridDenseTransformerModel => KvFlagTarget.CudaHybridDense,
@@ -173,6 +186,8 @@ internal static class KvStorageCli
             CudaLfm2MoeTransformerModel.ValidateKvStorage(request.Key ?? KvCacheDType.F32, request.Value ?? KvCacheDType.F32, request.CacheWindow);
         if (model is CudaQwen3HybridDenseTransformerModel dense && (request.Key is not null || request.Value is not null))
             dense.ConfigureKvStorage(request.Key, request.Value);
+        if (model is DotLLM.Vulkan.VulkanQwen3HybridDenseTransformerModel vkDense && (request.KeyText is not null || request.ValueText is not null))
+            vkDense.ConfigureKvStorage(DotLLM.Vulkan.VulkanKvStorageExtensions.ParseOptions(request.KeyText, request.ValueText));
     }
 
     /// <summary>
@@ -181,6 +196,13 @@ internal static class KvStorageCli
     /// </summary>
     public static (string Label, long Bytes, string Text)? Describe(IModel model, int cacheTokens)
     {
+        if (model is DotLLM.Vulkan.VulkanQwen3HybridDenseTransformerModel vkDense)
+        {
+            string vkLabel = vkDense.KvStorage.ToString().ToLowerInvariant();
+            long vkBytes = vkDense.KvBytesPerPosition * cacheTokens;
+            return (vkLabel, vkBytes, $"KV {vkLabel} ({vkDense.KvBytesPerPosition / 1024.0:F0} KiB/token), {vkBytes / 1048576.0:F0} MiB");
+        }
+
         if (model is not CudaQwen3HybridDenseTransformerModel dense) return null;
         long bytes = dense.KvAllocatedBytes > 0 ? dense.KvAllocatedBytes : dense.ComputeKvBytes(cacheTokens);
         string label = dense.KvStorageLabel;
