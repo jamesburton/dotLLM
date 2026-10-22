@@ -256,6 +256,7 @@ public static unsafe partial class MatMul
 
         Vector256<float> acc = Vector256<float>.Zero;
         float offsetSum = 0;
+        bool vnni = LegacyVnniEnabled && AvxVnni.IsSupported;   // #1109 prototype, default off
 
         for (int block = 0; block < blockCount; block++)
         {
@@ -264,7 +265,9 @@ public static unsafe partial class MatMul
             Vector256<byte> q = UnpackLegacyAvx2(qt, wb, lut, out Vector256<sbyte> signSrc);
             Vector256<sbyte> q8v = Unsafe.ReadUnaligned<Vector256<sbyte>>(xb + 4);
             if (isIq4) q8v = Avx2.Sign(q8v, signSrc);
-            Vector256<int> p = Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(q, q8v), ones);
+            Vector256<int> p = vnni
+                ? AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, q, q8v)
+                : Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(q, q8v), ones);
 
             float d = (float)Unsafe.ReadUnaligned<Half>(wb);
             Vector256<float> scale = Vector256.Create(d * (float)Unsafe.ReadUnaligned<Half>(xb));
@@ -334,6 +337,7 @@ public static unsafe partial class MatMul
 
         Vector128<float> acc = Vector128<float>.Zero;
         Vector128<float> off = Vector128<float>.Zero;
+        bool vnni = LegacyVnniEnabled && AvxVnni.IsSupported;   // #1109 prototype, default off
 
         for (int block = 0; block < blockCount; block++)
         {
@@ -342,10 +346,10 @@ public static unsafe partial class MatMul
             Vector256<sbyte> q8v = Unsafe.ReadUnaligned<Vector256<sbyte>>(xb + 4);
 
             Vector128<int> s = Reduce4Avx2(
-                LegacyBlockDotAvx2(qt, wb, q8v, lut, ones, isIq4),
-                LegacyBlockDotAvx2(qt, wb + rowStride, q8v, lut, ones, isIq4),
-                LegacyBlockDotAvx2(qt, wb + 2 * rowStride, q8v, lut, ones, isIq4),
-                LegacyBlockDotAvx2(qt, wb + 3 * rowStride, q8v, lut, ones, isIq4));
+                LegacyBlockDotAvx2(qt, wb, q8v, lut, ones, isIq4, vnni),
+                LegacyBlockDotAvx2(qt, wb + rowStride, q8v, lut, ones, isIq4, vnni),
+                LegacyBlockDotAvx2(qt, wb + 2 * rowStride, q8v, lut, ones, isIq4, vnni),
+                LegacyBlockDotAvx2(qt, wb + 3 * rowStride, q8v, lut, ones, isIq4, vnni));
 
             Vector128<float> d = HalfToSingleSse2(LoadHalf4(wb, rowStride));
             Vector128<float> d8 = HalfToSingleSse2(Vector128.Create((int)Unsafe.ReadUnaligned<ushort>(xb)));
@@ -366,11 +370,16 @@ public static unsafe partial class MatMul
     /// <summary>Exact int32 lane partials of one block's <c>Σ q·q8</c> for <paramref name="qt"/>.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static Vector256<int> LegacyBlockDotAvx2(QuantizationType qt, byte* wb, Vector256<sbyte> q8v,
-        Vector256<sbyte> lut, Vector256<short> ones, bool isIq4)
+        Vector256<sbyte> lut, Vector256<short> ones, bool isIq4, bool vnni)
     {
         Vector256<byte> q = UnpackLegacyAvx2(qt, wb, lut, out Vector256<sbyte> signSrc);
         if (isIq4) q8v = Avx2.Sign(q8v, signSrc);
-        return Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(q, q8v), ones);
+
+        // vpdpbusd sums the same four adjacent byte products per int32 lane as the
+        // maddubs + madd(ones) pair, so the lanes are identical (#1109).
+        return vnni
+            ? AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, q, q8v)
+            : Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(q, q8v), ones);
     }
 
     // ──────────────────── Tier selection ────────────────────

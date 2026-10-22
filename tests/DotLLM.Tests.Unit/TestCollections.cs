@@ -50,3 +50,14 @@ public class CudaKernelsCollection
 public class NemotronHMoeStaticsCollection
 {
 }
+
+/// <summary>
+/// Marker for the #1109 precision-study tests that flip process-global switches
+/// (<c>MatMul.ReferenceF32Activations</c>, <c>MatMul.LegacyVnniEnabled</c>,
+/// <c>Attention.KvInt8QkEnabled</c>, <c>SimpleKvCache.SimulatedRounding</c>). Running them
+/// isolated keeps a flipped switch from leaking into a concurrently running model or kernel test.
+/// </summary>
+[CollectionDefinition("PrecisionStudyStatics", DisableParallelization = true)]
+public class PrecisionStudyStaticsCollection
+{
+}

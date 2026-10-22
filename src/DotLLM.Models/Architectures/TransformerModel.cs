@@ -3926,6 +3926,13 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void Gemv(nint weights, QuantizationType qt, float* x, float* y, int m, int k)
     {
+        if (MatMul.UsesReferenceF32Path(qt))
+        {
+            // #1109 precision-study reference arm: F32 activations x dequantized weights.
+            MatMul.GemvDequantRows((byte*)weights, qt, x, y, m, k, _threadPool);
+            return;
+        }
+
         if (qt == QuantizationType.Q8_0)
             MatMul.GemvQ8_0((byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.Q5_0)
@@ -3969,6 +3976,13 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     private void Gemm(nint weights, QuantizationType qt, float* b, float* c,
                       int m, int k, int n, byte* preQuantizedInput = null)
     {
+        if (MatMul.UsesReferenceF32Path(qt))
+        {
+            // #1109 precision-study reference arm: F32 activations x dequantized weights.
+            MatMul.GemmDequantRows((byte*)weights, qt, b, c, m, k, n, _threadPool);
+            return;
+        }
+
         if (qt == QuantizationType.LittleBit)
             GemmLittleBit(weights, b, c, m, k, n);
         else if (qt == QuantizationType.Q8_0)
@@ -4066,7 +4080,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     private void GemvInterleaved(nint origWeights, QuantizationType qt, float* x, float* y,
                                  int m, int k, in WeightRepacking.RepackedWeight rw)
     {
-        if (!UseR4(in rw, qt))
+        if (!UseR4(in rw, qt) || MatMul.UsesReferenceF32Path(qt))
         {
             Gemv(origWeights, qt, x, y, m, k);
             return;
@@ -4127,9 +4141,9 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                                  int m, int k, int n, byte* preQuantizedInput,
                                  in WeightRepacking.RepackedWeight rw)
     {
-        if (!UseR4(in rw, qt))
+        if (!UseR4(in rw, qt) || MatMul.UsesReferenceF32Path(qt))
         {
-            // No repacked copy, or rows too short for interleaving to pay: original path.
+            // No repacked copy (or the #1109 reference arm, which Gemm reroutes), or rows too short for interleaving to pay: original path.
             Gemm(origWeights, qt, b, c, m, k, n, preQuantizedInput);
             return;
         }

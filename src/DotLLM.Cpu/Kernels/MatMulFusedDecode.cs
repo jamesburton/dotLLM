@@ -90,7 +90,8 @@ public static unsafe partial class MatMul
     /// <returns><see langword="true"/> when a dedicated fused decode kernel exists.</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool SupportsFusedDecode(QuantizationType qt) =>
-        qt is QuantizationType.F32 or QuantizationType.F16 || GetComputeRowsFn(qt) != null;
+        (qt is QuantizationType.F32 or QuantizationType.F16 || GetComputeRowsFn(qt) != null)
+        && !UsesReferenceF32Path(qt);   // #1109 reference arm routes through the unfused F32 path
 
     /// <summary>
     /// Row-kernel descriptor for a quantised projection used by the MoE n=1 decode path: the <c>ComputeRows</c> function (the same one

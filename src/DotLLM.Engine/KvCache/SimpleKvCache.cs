@@ -120,9 +120,71 @@ public sealed unsafe class SimpleKvCache : IKvCache, IPerLayerKvCache
                 rowBytes, rowBytes);
         }
 
+        if (SimulatedRounding != SimulatedKvRounding.None)
+        {
+            for (int i = 0; i < seqLen; i++)
+            {
+                RoundRowInPlace(kDst + positions[i] * stride, stride, SimulatedRounding);
+                RoundRowInPlace(vDst + positions[i] * stride, stride, SimulatedRounding);
+            }
+        }
+
         int newLength = maxPos + 1;
         if (newLength > _currentLength)
             _currentLength = newLength;
+    }
+
+    /// <summary>Narrower storage formats <see cref="SimulatedRounding"/> can emulate.</summary>
+    public enum SimulatedKvRounding
+    {
+        /// <summary>Plain FP32 storage (default).</summary>
+        None,
+
+        /// <summary>Round every stored element to IEEE FP16 (round-to-nearest-even, saturating to ±inf).</summary>
+        F16,
+
+        /// <summary>Round every stored element to BF16 (round-to-nearest-even).</summary>
+        BF16,
+    }
+
+    /// <summary>
+    /// Precision-study switch (#1109), default <see cref="SimulatedKvRounding.None"/>: round each
+    /// K/V row to FP16 or BF16 as it is written, while still storing FP32. Widening FP16/BF16 to FP32
+    /// is exact, so attention then sees bit-for-bit what an FP16/BF16 cache would hand it; this
+    /// measures that format's accuracy without the storage change (#978). Reference/A-B use only —
+    /// it does not save memory. <c>DOTLLM_KV_SIM_ROUND=f16|bf16</c> sets it at startup.
+    /// </summary>
+    public static SimulatedKvRounding SimulatedRounding { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_KV_SIM_ROUND") switch
+        {
+            "f16" => SimulatedKvRounding.F16,
+            "bf16" => SimulatedKvRounding.BF16,
+            _ => SimulatedKvRounding.None,
+        };
+
+    /// <summary>Rounds <paramref name="count"/> floats at <paramref name="row"/> to the given format, in place.</summary>
+    /// <param name="row">Row start.</param>
+    /// <param name="count">Element count.</param>
+    /// <param name="mode">Target format.</param>
+    internal static void RoundRowInPlace(float* row, int count, SimulatedKvRounding mode)
+    {
+        if (mode == SimulatedKvRounding.F16)
+        {
+            for (int i = 0; i < count; i++)
+                row[i] = (float)(Half)row[i];
+            return;
+        }
+
+        uint* bits = (uint*)row;
+        for (int i = 0; i < count; i++)
+        {
+            uint u = bits[i];
+            if ((u & 0x7F800000u) == 0x7F800000u)
+                continue;   // inf / NaN pass through unchanged
+
+            u += 0x7FFFu + ((u >> 16) & 1u);
+            bits[i] = u & 0xFFFF0000u;
+        }
     }
 
     /// <inheritdoc/>

@@ -865,6 +865,17 @@ public static class Attention
 
     // ──────────────────── Quantized KV-cache attention ────────────────────
 
+    /// <summary>Largest head dimension the <see cref="KvInt8QkEnabled"/> prototype handles.</summary>
+    private const int MaxInt8QkHeadDim = 512;
+
+    /// <summary>
+    /// Prototype (#1109), default OFF: on the quantized-KV attention path, score <c>Q·Kᵀ</c> with an
+    /// integer dot over the stored Q8_0 K blocks (Q quantized once per row and head to Q8_0), instead of dequantizing each K tile to F32 scratch first. Softmax, its running max and
+    /// sum, and the PV accumulation stay F32. <c>DOTLLM_CPU_KV_INT8_QK=1</c> enables it.
+    /// </summary>
+    public static bool KvInt8QkEnabled { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_CPU_KV_INT8_QK") == "1";
+
     /// <summary>
     /// Attention with quantized KV-cache. Dequantizes tiles on-the-fly during attention
     /// computation, then processes the full-precision window region directly.
@@ -1024,6 +1035,15 @@ public static class Attention
         int window = slidingWindowSize;
         bool hasSink = !float.IsNegativeInfinity(sinkLogit);
 
+        // #1109 prototype (default off): integer QK^T over Q8_0 K. Q4_0 K is not covered: the KV
+        // Q4_0 rows interleave nibbles (element 2j / 2j+1 per byte), not the GGUF order (j / j+16)
+        // the legacy Q4_0 x Q8_1 dot kernels read.
+        bool int8Qk = KvInt8QkEnabled && keyDType == KvCacheDType.Q8_0
+            && headDim % 32 == 0 && headDim <= MaxInt8QkHeadDim;
+        int headBlocks = headDim / 32;
+        int kHeadQuantOffset = kvHeadIdx * headBlocks * KvQuantize.Q8_0BlockBytes;
+        byte* qQuant = stackalloc byte[MaxInt8QkHeadDim / 32 * KvQuantize.Q8_0BlockBytes];
+
         // Per-tile scratch for dequantized K and V rows
         // Budget: tileSize * headDim * sizeof(float) per buffer
         int scratchElems = tileSize * headDim;
@@ -1068,21 +1088,37 @@ public static class Attention
                 // ── Phase 1: Quantized region [visibleStart..min(quantLen, visibleEnd)) ──
                 int quantEnd = Math.Min(quantLen, visibleEnd);
                 int quantStart = Math.Max(visibleStart, 0);
+                if (int8Qk && quantEnd > quantStart)
+                    MatMul.QuantizeF32ToQ8_0(q + i * qStride + headIdx * headDim, qQuant, headDim);
 
                 for (int tileBase = quantStart; tileBase < quantEnd; tileBase += tileSize)
                 {
                     int tileLen = Math.Min(tileSize, quantEnd - tileBase);
                     var scores = tileScores.Slice(0, tileLen);
 
-                    // Dequantize tile of K for this head
-                    DequantTile(kQuant, tileBase, tileLen, kvStride, kQuantRowBytes,
-                                kvHeadIdx, headDim, keyDType, kScratch);
-
-                    // Compute scores: dot(qRow, kScratch[j*headDim .. (j+1)*headDim]) * scale
-                    for (int j = 0; j < tileLen; j++)
+                    if (int8Qk)
                     {
-                        var kRow = new ReadOnlySpan<float>(kScratch + j * headDim, headDim);
-                        scores[j] = TensorPrimitives.Dot(qRow, kRow) * scale;
+                        // #1109 prototype: integer QK^T straight off the quantized K blocks (the
+                        // llama.cpp CPU flash-attention shape: Q is quantized to K's vec-dot type
+                        // once per row/head). No K dequant, no K scratch.
+                        for (int j = 0; j < tileLen; j++)
+                        {
+                            byte* kRowQ = kQuant + (long)(tileBase + j) * kQuantRowBytes + kHeadQuantOffset;
+                            scores[j] = MatMul.VecDotQ8_0BestRow(kRowQ, qQuant, headBlocks) * scale;
+                        }
+                    }
+                    else
+                    {
+                        // Dequantize tile of K for this head
+                        DequantTile(kQuant, tileBase, tileLen, kvStride, kQuantRowBytes,
+                                    kvHeadIdx, headDim, keyDType, kScratch);
+
+                        // Compute scores: dot(qRow, kScratch[j*headDim .. (j+1)*headDim]) * scale
+                        for (int j = 0; j < tileLen; j++)
+                        {
+                            var kRow = new ReadOnlySpan<float>(kScratch + j * headDim, headDim);
+                            scores[j] = TensorPrimitives.Dot(qRow, kRow) * scale;
+                        }
                     }
 
                     // Online softmax update
