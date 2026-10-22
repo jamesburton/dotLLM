@@ -32,6 +32,30 @@ much over 8k can be prefilled at all**. The Vulkan Bonsai model reports `Preferr
 is one `Forward`. Long prefills submit one layer per command buffer, so a single submission covers every row of one layer:
 the projections plus the attention over the whole history. Past ~8k rows that exceeds the Windows GPU watchdog (TDR, 2 s).
 
+### After V1 + V1b (#1100, Strix, 2026-10-22)
+
+Same flags. Logs are in `C:\Users\james\dotllm-ctx\1100\run\` on Strix. The two gpt-oss servers were up for the 17k and 33k
+prompts and gone by the end of the 64k one. Full tables are in `docs/SERVER.md`, "Continuing sessions on Vulkan (#1100)".
+
+| request | before | after |
+|---|---|---|
+| fresh 17,003 tokens | device lost | 127.6 s (133 tok/s), decode 16.1 tok/s |
+| fresh 32,831 tokens | device lost | 344.6 s (95 tok/s), decode 12.2 tok/s |
+| fresh 64,077 tokens | not reached | 1,039.9 s (62 tok/s), decode 8.3 tok/s |
+| growth turn 2 (17,037) | refused | cached 7,818, TTFT 83.7 s |
+| growth turn 16 (128,254) | not reached | cached 120,381, TTFT 394.6 s (20 tok/s), decode 5.0 tok/s |
+| whole growth run, 16 turns to 128k | stops at turn 2 | 63 min, every turn cached = previous prompt - 5 |
+
+V1b needed more than the tile. With only the 1,024-token tile, the dev build plus `--prefill-chunk-size 1024` prefilled 17k,
+33k and 64k, but a fresh ~128k prompt still lost the device after ~30 min, at about 85k positions. There the fixed
+"8 layers per submission" (two attention layers) came to over 4 s of GPU time. `VulkanPrefillSubmitBudget` replaced the
+fixed table: submissions are bounded by estimated GPU time, refitted from measured submissions, and a tile runs as row
+slices when one attention layer alone exceeds the budget. Across the 282 prefill forwards of the growth run, the longest
+submission was 1.06 s.
+
+Still open: prefill attention runs at ~1 TFLOP/s and decode falls to 5 tok/s at 128k, both because F32 KV is read in full at
+depth. V2 (narrow KV) and V3 (tiled hd256) address these.
+
 ## What reading the code shows (to be confirmed by the baseline)
 
 1. **The Vulkan KV can never grow for a prefix hit.** `VulkanNemotronHKvCache` keeps the default

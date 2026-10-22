@@ -352,7 +352,7 @@ prefill runs before it, which takes minutes for a long agent conversation:
 ```
 
 A client that disconnects (or a server shutdown) stops the prefill at the next chunk boundary: 1,024 tokens on the CUDA Qwen3
-hybrids (`IModel.PreferredPrefillChunkTokens`), or `--prefill-chunk-size`. Non-streaming requests observe the same cancellation.
+hybrids and the Vulkan dense hybrid (Bonsai-2, #1100) (`IModel.PreferredPrefillChunkTokens`), or `--prefill-chunk-size`. Non-streaming requests observe the same cancellation.
 
 ## Model names, the hub cache and pulling (#714)
 
@@ -691,6 +691,76 @@ After the change every turn reuses the whole previous prompt (cached is the prev
 prefills only the roughly 8k tokens it adds, at 57-74 s. Before, the cached prefix lagged a turn and prefill time
 stretched to 115-144 s. With MTP on (window 51,200 on this card) the first three turns reuse the same way
 (0 / 7,818 / 17,032 cached) and decode at 21-25 tokens/s.
+
+### Continuing sessions on Vulkan (#1100)
+
+Two things kept a long Bonsai-2 session off the Vulkan backend:
+
+- **The KV never grew.** `VulkanNemotronHKvCache` kept the interface's never-grow `TryGrowTo`, and the model made an eager
+  cache of exactly the size a miss asked for (needed + 256). Every turn of a growing session needs more, so turn 2 was
+  refused ("could not grow to 17101 positions ... it holds 8143"). The Bonsai and LFM2 Vulkan hosts now make **lazy, growable**
+  caches capped at the window. The forward grows the buffers before recording and drops descriptor caches that may name freed
+  buffers (see `KV_CACHE.md`, "Growable caches for a continuing session").
+- **Long prefills lost the device.** The model reported no prefill tile, so a whole prompt was one forward, and each layer's
+  submission covered every row. A fresh ~16k prompt hit `VK_ERROR_DEVICE_LOST` after ~40 s. Two fixes:
+  - **Prefill tile.** The model now reports a 1,024-token tile (`PreferredPrefillChunkTokens`). `DOTLLM_VULKAN_PREFILL_CHUNK`
+    overrides it (0 = no tile), and `--prefill-chunk-size` overrides both.
+  - **Bounded submissions.** The tile alone was not enough: an attention layer's work grows with the depth, and a 1,024-row tile
+    still lost the device at about 85k positions (fresh ~128k prompt, two attention layers per submission). Submissions are
+    now **bounded by estimated GPU time** (`VulkanPrefillSubmitBudget`, 1 s, `DOTLLM_VK_SUBMIT_BUDGET_MS`). The cost model has
+    two terms:
+    - dense GFLOPs (2 x parameters x rows);
+    - causal attention GFLOPs (4 x rows x mean KV x heads x head dim).
+
+    Each term has its own rate, refitted from every submission's measured wall time; Strix fits 11-25 TFLOP/s dense (it varies with the tile) and
+    ~1 TFLOP/s attention. Layers are packed up to the budget. When one attention layer alone would exceed it, the tile runs as
+    row slices: 512 rows at 64k and ~233 at 128k on Strix. Tiles under 128 rows are costed as 128, because they do not fill the
+    GPU. `DOTLLM_VK_PREFILL_LAYERS_PER_SUBMIT` still fixes the count. `DOTLLM_VK_PREFILL_SUBMIT_LOG=1` prints one line per
+    prefill forward (submissions, longest, fitted rates).
+
+Measured on Strix Halo (Radeon 8060S, Vulkan) with Bonsai-2 27B PQ2_0-MTP, `--no-mtp --ctx-size 131072`, greedy, `max_tokens`
+64, F32 KV. Fresh single prompts of wikitext, server restarted between them:
+
+| prompt | before (dev `e2219f5a`) | after: prefill | prefill tok/s | decode tok/s | process working set |
+|---|---|---|---|---|---|
+| 17,003 | `VK_ERROR_DEVICE_LOST` | 127.6 s | 133 | 16.1 | 11.7 GiB |
+| 32,831 | `VK_ERROR_DEVICE_LOST` | 344.6 s | 95 | 12.2 | 13.1 GiB |
+| 64,077 | (not reached) | 1,039.9 s | 62 | 8.3 | 17.0 GiB |
+
+The longest single submission in those prefills was 1.05 s, except for one: the 58-row tail of the 33k prompt took 1.65 s
+before short tiles were costed at 128 rows.
+
+Growth run: `scripts/session-growth.py --turn-chars 34000 --turns 16 --pid <server>`, adding ~8k tokens of wikitext per turn.
+"Before" is dev `e2219f5a`. Working set and private bytes are the server process's after each turn. On this UMA device the KV
+shows up there and as "GPU shared" memory: 24.5 GiB at the end, with 291 MiB dedicated.
+
+| turn | prompt | before: cached | after: cached | new | TTFT | prefill tok/s | decode tok/s | working set | private |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 7,823 | 0 | 0 | 7,823 | 45.7 s | 172 | 19.4 | 10.0 GiB | 10.2 GiB |
+| 2 | 17,037 | **refused** | 7,818 | 9,219 | 83.7 s | 110 | 15.9 | 11.4 GiB | 11.5 GiB |
+| 3 | 25,060 | | 17,032 | 8,028 | 98.8 s | 81 | 13.8 | 12.6 GiB | 12.8 GiB |
+| 4 | 32,934 | | 25,055 | 7,879 | 119.5 s | 66 | 12.0 | 13.5 GiB | 13.7 GiB |
+| 5 | 41,026 | | 32,929 | 8,097 | 146.4 s | 55 | 10.7 | 14.6 GiB | 14.7 GiB |
+| 6 | 48,783 | | 41,021 | 7,762 | 163.4 s | 48 | 9.7 | 15.6 GiB | 15.7 GiB |
+| 7 | 56,411 | | 48,778 | 7,633 | 181.3 s | 42 | 8.9 | 16.5 GiB | 16.6 GiB |
+| 8 | 64,320 | | 56,406 | 7,914 | 212.0 s | 37 | 8.2 | 17.5 GiB | 17.6 GiB |
+| 9 | 72,287 | | 64,315 | 7,972 | 235.8 s | 34 | 7.6 | 18.6 GiB | 18.7 GiB |
+| 10 | 80,915 | | 72,282 | 8,633 | 281.6 s | 31 | 7.0 | 19.7 GiB | 19.8 GiB |
+| 11 | 89,112 | | 80,910 | 8,202 | 309.4 s | 27 | 6.6 | 20.7 GiB | 20.8 GiB |
+| 12 | 96,656 | | 89,107 | 7,549 | 307.4 s | 25 | 6.2 | 21.6 GiB | 21.7 GiB |
+| 13 | 104,149 | | 96,651 | 7,498 | 327.1 s | 23 | 5.8 | 22.5 GiB | 22.6 GiB |
+| 14 | 112,017 | | 104,144 | 7,873 | 352.1 s | 22 | 5.5 | 23.5 GiB | 23.5 GiB |
+| 15 | 120,386 | | 112,012 | 8,374 | 392.6 s | 21 | 5.2 | 24.6 GiB | 24.6 GiB |
+| 16 | 128,254 | | 120,381 | 7,873 | 394.6 s | 20 | 5.0 | 25.5 GiB | 25.5 GiB |
+
+What the table shows:
+
+- **Prefix reuse.** Every turn after the first reuses the whole previous prompt (cached = previous prompt - 5), and there were
+  no refusals or device losses.
+- **Memory.** It grows ~1 GiB a turn, the F32 KV's 128 KiB per token.
+- **Prefill and decode speed.** Both fall with depth because the attention reads the whole F32 history. Prefill attention runs
+  at ~1 TFLOP/s on this hd256 path. Narrower KV (design V2) and a faster hd256 prefill kernel (V3, #441) are the next steps.
+- **Total time.** All 16 turns, from an empty session to 128k, took 63 minutes.
 
 ### MTP on prefix-hit turns (#1088)
 
