@@ -119,7 +119,11 @@ extern "C" __global__ void __launch_bounds__(MAX_GROUP * 32, 1) NAME(           
         q, k, v, output, seq_q, seq_kv, num_heads, num_kv_heads, position_offset, scale);         \
 }
 
+// The issue #1109 accumulator-precision experiment (attention_flash_mma_prefill_hd256_xacc.cu) includes this file
+// for PrefillTileLoadStaged and defines HD256_KVQ_NO_ENTRIES so the shipped entries are not duplicated there.
+#ifndef HD256_KVQ_NO_ENTRIES
 KVQ_PREFILL_ENTRY(attention_flash_mma_prefill_hd256_kvq_q8q8, V2LoadQ8, V2LoadQ8)
 KVQ_PREFILL_ENTRY(attention_flash_mma_prefill_hd256_kvq_q4q4, V2LoadQ4, V2LoadQ4)
 KVQ_PREFILL_ENTRY(attention_flash_mma_prefill_hd256_kvq_q8q4, V2LoadQ8, V2LoadQ4)
 KVQ_PREFILL_ENTRY(attention_flash_mma_prefill_hd256_kvq_q4q8, V2LoadQ4, V2LoadQ8)
+#endif

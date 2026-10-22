@@ -44,6 +44,105 @@ public static class CudaGemm
             _ => deviceEligible,
         };
 
+    // Issue #1109 experiment: with COMPUTE_16F on, promote the F16 accumulator to F32 every
+    // DOTLLM_CUDA_GEMM_16F_CHUNK elements of K (0/unset = off, the default). Mutable for in-process A/B.
+    private static readonly int Promote16FChunkEnv =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_CUDA_GEMM_16F_CHUNK"), out int chunkEnv) && chunkEnv > 0
+            ? chunkEnv
+            : 0;
+
+    /// <summary>
+    /// K-chunk length after which an F16-accumulated partial is promoted into an F32 sum (issue #1109 experiment);
+    /// 0 disables. Only consulted by callers that own the partial scratch (see <see cref="LinearF16PromotedChunks"/>).
+    /// </summary>
+    internal static int Promote16FChunk = Promote16FChunkEnv;
+
+    /// <summary>
+    /// F16-accumulate GEMM with F32 promotion every <paramref name="chunk"/> elements of K (issue #1109 experiment):
+    /// one strided-batched <c>COMPUTE_16F</c> GEMM writes <c>k / chunk</c> F16 partials of <c>Y</c>, then a
+    /// <c>COMPUTE_32F</c> GEMV against a ones vector sums them. Same layout contract as <see cref="LinearF16"/>.
+    /// </summary>
+    /// <param name="handle">cuBLAS handle.</param>
+    /// <param name="xF16">FP16 activations, row-major [m, k].</param>
+    /// <param name="wF16">FP16 weights, row-major [n, k].</param>
+    /// <param name="yF16">FP16 output, row-major [m, n].</param>
+    /// <param name="m">Rows of X (tokens).</param>
+    /// <param name="k">Contraction length; must be a multiple of <paramref name="chunk"/>.</param>
+    /// <param name="n">Rows of W (output features).</param>
+    /// <param name="chunk">K elements accumulated in F16 before promotion.</param>
+    /// <param name="partialsF16">Scratch of at least <c>(k / chunk) * m * n</c> halves.</param>
+    /// <param name="onesF16">At least <c>k / chunk</c> halves of 1.0.</param>
+    /// <param name="stream">CUDA stream.</param>
+    /// <exception cref="ArgumentException"><paramref name="k"/> is not a multiple of <paramref name="chunk"/>.</exception>
+    internal static unsafe void LinearF16PromotedChunks(nint handle, nint xF16, nint wF16, nint yF16,
+                                                         int m, int k, int n, int chunk,
+                                                         nint partialsF16, nint onesF16, nint stream)
+    {
+        if (chunk <= 0 || k % chunk != 0)
+            throw new ArgumentException($"k={k} is not a multiple of the promotion chunk {chunk}.", nameof(chunk));
+        CublasApi.cublasSetStream_v2(handle, stream).ThrowOnCublasError();
+        int batches = k / chunk;
+        long mn = (long)m * n;
+
+        ushort halfOne = 0x3C00, halfZero = 0x0000;
+        CublasApi.cublasGemmStridedBatchedEx(
+            handle,
+            CublasApi.CUBLAS_OP_T, CublasApi.CUBLAS_OP_N,
+            n, m, chunk,
+            (nint)(&halfOne),
+            wF16, CublasApi.CUDA_R_16F, k, chunk,
+            xF16, CublasApi.CUDA_R_16F, k, chunk,
+            (nint)(&halfZero),
+            partialsF16, CublasApi.CUDA_R_16F, n, mn,
+            batches,
+            CublasApi.CUBLAS_COMPUTE_16F,
+            CublasApi.CUBLAS_GEMM_DEFAULT
+        ).ThrowOnCublasError();
+
+        // y[mn] = P[mn x batches] . ones[batches], F32 accumulate: the promotion step.
+        float one = FloatOne, zero = FloatZero;
+        CublasApi.cublasGemmEx(
+            handle,
+            CublasApi.CUBLAS_OP_N, CublasApi.CUBLAS_OP_N,
+            checked((int)mn), 1, batches,
+            (nint)(&one),
+            partialsF16, CublasApi.CUDA_R_16F, checked((int)mn),
+            onesF16, CublasApi.CUDA_R_16F, batches,
+            (nint)(&zero),
+            yF16, CublasApi.CUDA_R_16F, checked((int)mn),
+            CublasApi.CUBLAS_COMPUTE_32F,
+            CublasApi.CUBLAS_GEMM_DEFAULT
+        ).ThrowOnCublasError();
+    }
+
+    /// <summary>
+    /// <see cref="LinearF16"/> with the compute type chosen by the caller instead of <see cref="Use16FCompute"/>
+    /// (issue #1109 probe: runs both accumulators on the same operands).
+    /// </summary>
+    /// <param name="handle">cuBLAS handle.</param>
+    /// <param name="xF16">FP16 activations, row-major [m, k].</param>
+    /// <param name="wF16">FP16 weights, row-major [n, k].</param>
+    /// <param name="yF16">FP16 output, row-major [m, n].</param>
+    /// <param name="m">Rows of X (tokens).</param>
+    /// <param name="k">Contraction length.</param>
+    /// <param name="n">Rows of W (output features).</param>
+    /// <param name="compute16F">True for <c>COMPUTE_16F</c>, false for <c>COMPUTE_32F</c>.</param>
+    /// <param name="stream">CUDA stream.</param>
+    internal static void LinearF16WithCompute(nint handle, nint xF16, nint wF16, nint yF16,
+                                              int m, int k, int n, bool compute16F, nint stream)
+    {
+        bool prior = Use16FCompute;
+        Use16FCompute = compute16F;
+        try
+        {
+            LinearF16(handle, xF16, wF16, yF16, m, k, n, stream);
+        }
+        finally
+        {
+            Use16FCompute = prior;
+        }
+    }
+
     /// <summary>
     /// Linear projection: Y_f16[m, n] = X_f16[m, k] × W_f16^T.
     /// FP32 accumulation by default; FP16 accumulation when DOTLLM_CUDA_GEMM_16F=1 (G1 experiment).

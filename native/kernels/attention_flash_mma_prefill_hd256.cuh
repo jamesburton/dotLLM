@@ -103,6 +103,31 @@ __device__ __forceinline__ void mma_m16n8k16(float (&d)[4], const unsigned (&a)[
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
+// F16-accumulate variant (issue #1109 precision experiment, never used by the default entries):
+// D/C are two packed half2 registers with the same element mapping as the F32 form's d[0..1] (row
+// lane>>2) and d[2..3] (row +8). Runs at the full tensor-core rate on GeForce Ampere, where the F32
+// accumulate form is half rate.
+__device__ __forceinline__ void mma_m16n8k16_f16acc(unsigned (&d)[2], const unsigned (&a)[4],
+                                                    unsigned b0, unsigned b1)
+{
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+        "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+        : "+r"(d[0]), "+r"(d[1])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ float2 unpack_half2(unsigned u)
+{
+    return __half22float2(*reinterpret_cast<const __half2*>(&u));
+}
+
+__device__ __forceinline__ unsigned scale_half2(unsigned u, float c)
+{
+    __half2 h = __hmul2(*reinterpret_cast<const __half2*>(&u), __float2half2_rn(c));
+    return *reinterpret_cast<unsigned*>(&h);
+}
+
 __device__ __forceinline__ void cp_async16(void* smem_dst, const void* gmem_src)
 {
     unsigned a = static_cast<unsigned>(__cvta_generic_to_shared(smem_dst));
@@ -170,7 +195,16 @@ __device__ __forceinline__ void stage_decode_tile(half* tk, half* tv, int warp, 
 // k, v    : [seq_kv, num_kv_heads*HEAD_DIM] KV cache, in the KL / VL loader's format
 // output  : [seq_q, num_heads*HEAD_DIM] F32 row-major
 // scale   : softmax scale applied to Q.K (typically rsqrt(HEAD_DIM))
-template <class KL, class VL>
+// Accumulator precision (issue #1109 experiment; the shipped entries use the defaults = F32):
+//   QK_ACC 0 = F32 S accumulation; 1 = F16 S accumulation (.f16.f16.f16.f16). With F16 the softmax
+//              scale is folded into Q at the shared-memory load (1/16 for head_dim 256 is a power of
+//              two, so exact) so raw Q.K sums never approach the F16 range limit.
+//   PV_ACC 0 = F32 O accumulation; 1 = F16 O accumulated across the WHOLE key range (rescaled in
+//              F16); 2 = F16 within one KV tile (16 keys), promoted into the F32 O every tile.
+#define ACC_F32 0
+#define ACC_F16 1
+#define ACC_F16_TILE 2
+template <class KL, class VL, int QK_ACC = ACC_F32, int PV_ACC = ACC_F32>
 __device__ __forceinline__ void attn_flash_prefill_hd256_body(
     const half* __restrict__ q,
     const void* __restrict__ k,
@@ -210,6 +244,11 @@ __device__ __forceinline__ void attn_flash_prefill_hd256_body(
         if (qrow < seq_q)
             val = *reinterpret_cast<const uint4*>(
                 q + (size_t)qrow * q_stride + (size_t)(hkv * group + w) * HEAD_DIM + c * 8);
+        if constexpr (QK_ACC == ACC_F16)
+        {
+            val.x = scale_half2(val.x, scale); val.y = scale_half2(val.y, scale);
+            val.z = scale_half2(val.z, scale); val.w = scale_half2(val.w, scale);
+        }
         *reinterpret_cast<uint4*>(sQ + (size_t)(w * Q_TILE + r) * SMEM_STRIDE + c * 8) = val;
     }
 
@@ -238,10 +277,17 @@ __device__ __forceinline__ void attn_flash_prefill_hd256_body(
     float o[HEAD_DIM / 8][4];
     #pragma unroll
     for (int n = 0; n < HEAD_DIM / 8; n++) { o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f; }
+    [[maybe_unused]] unsigned oh[PV_ACC == ACC_F16 ? HEAD_DIM / 8 : 1][2];   // F16 O accumulator, PV_ACC == ACC_F16 only
+    if constexpr (PV_ACC == ACC_F16)
+    {
+        #pragma unroll
+        for (int n = 0; n < HEAD_DIM / 8; n++) { oh[n][0] = oh[n][1] = 0u; }
+    }
     float m_lo = NEG_INF, m_hi = NEG_INF;     // running max (log2 domain), rows lane>>2 and +8
     float l_lo = 0.0f, l_hi = 0.0f;               // per-lane partial denominators (quad-reduced at end)
 
-    const float scale_log2 = scale * LOG2E;
+    // F16 S accumulation pre-scaled Q, so only the log2e fold remains.
+    const float scale_log2 = (QK_ACC == ACC_F16 ? 1.0f : scale) * LOG2E;
     const int r_lo = lane >> 2;
     const int col_lo = (lane & 3) * 2;
     const int pos_lo = position_offset + qbase + r_lo;
@@ -287,26 +333,67 @@ __device__ __forceinline__ void attn_flash_prefill_hd256_body(
             for (int n = 0; n < NT; n++)
             { sa[n][0] = sa[n][1] = sa[n][2] = sa[n][3] = 0.f; sb[n][0] = sb[n][1] = sb[n][2] = sb[n][3] = 0.f; }
 
-            #pragma unroll
-            for (int ks = 0; ks < HEAD_DIM / 16; ks++)
+            if constexpr (QK_ACC == ACC_F16)
             {
-                unsigned a[4];
-                ldmatrix_x4(a, qw + (size_t)(lane & 15) * SMEM_STRIDE + ks * 16 + (lane >> 4) * 8);
+                unsigned ha[NT][2], hb[NT][2];
                 #pragma unroll
-                for (int np = 0; np < NT / 2; np++)
+                for (int n = 0; n < NT; n++) { ha[n][0] = ha[n][1] = hb[n][0] = hb[n][1] = 0u; }
+                #pragma unroll
+                for (int ks = 0; ks < HEAD_DIM / 16; ks++)
                 {
-                    unsigned b[4];
-                    ldmatrix_x4(b, kb + (size_t)(np * 16 + (lane & 7) + ((lane >> 4) & 1) * 8) * SMEM_STRIDE
-                                       + ks * 16 + ((lane >> 3) & 1) * 8);
-                    if ((ks & 1) == 0)
+                    unsigned a[4];
+                    ldmatrix_x4(a, qw + (size_t)(lane & 15) * SMEM_STRIDE + ks * 16 + (lane >> 4) * 8);
+                    #pragma unroll
+                    for (int np = 0; np < NT / 2; np++)
                     {
-                        mma_m16n8k16(sa[2 * np], a, b[0], b[1]);
-                        mma_m16n8k16(sa[2 * np + 1], a, b[2], b[3]);
+                        unsigned b[4];
+                        ldmatrix_x4(b, kb + (size_t)(np * 16 + (lane & 7) + ((lane >> 4) & 1) * 8) * SMEM_STRIDE
+                                           + ks * 16 + ((lane >> 3) & 1) * 8);
+                        if ((ks & 1) == 0)
+                        {
+                            mma_m16n8k16_f16acc(ha[2 * np], a, b[0], b[1]);
+                            mma_m16n8k16_f16acc(ha[2 * np + 1], a, b[2], b[3]);
+                        }
+                        else
+                        {
+                            mma_m16n8k16_f16acc(hb[2 * np], a, b[0], b[1]);
+                            mma_m16n8k16_f16acc(hb[2 * np + 1], a, b[2], b[3]);
+                        }
                     }
-                    else
+                }
+                // The two chains are summed in F16 too, so S is F16 end to end.
+                #pragma unroll
+                for (int n = 0; n < NT; n++)
+                {
+                    __half2 lo = __hadd2(*reinterpret_cast<__half2*>(&ha[n][0]), *reinterpret_cast<__half2*>(&hb[n][0]));
+                    __half2 hi = __hadd2(*reinterpret_cast<__half2*>(&ha[n][1]), *reinterpret_cast<__half2*>(&hb[n][1]));
+                    float2 flo = __half22float2(lo), fhi = __half22float2(hi);
+                    sa[n][0] = flo.x; sa[n][1] = flo.y; sa[n][2] = fhi.x; sa[n][3] = fhi.y;
+                }
+            }
+            else
+            {
+                #pragma unroll
+                for (int ks = 0; ks < HEAD_DIM / 16; ks++)
+                {
+                    unsigned a[4];
+                    ldmatrix_x4(a, qw + (size_t)(lane & 15) * SMEM_STRIDE + ks * 16 + (lane >> 4) * 8);
+                    #pragma unroll
+                    for (int np = 0; np < NT / 2; np++)
                     {
-                        mma_m16n8k16(sb[2 * np], a, b[0], b[1]);
-                        mma_m16n8k16(sb[2 * np + 1], a, b[2], b[3]);
+                        unsigned b[4];
+                        ldmatrix_x4(b, kb + (size_t)(np * 16 + (lane & 7) + ((lane >> 4) & 1) * 8) * SMEM_STRIDE
+                                           + ks * 16 + ((lane >> 3) & 1) * 8);
+                        if ((ks & 1) == 0)
+                        {
+                            mma_m16n8k16(sa[2 * np], a, b[0], b[1]);
+                            mma_m16n8k16(sa[2 * np + 1], a, b[2], b[3]);
+                        }
+                        else
+                        {
+                            mma_m16n8k16(sb[2 * np], a, b[0], b[1]);
+                            mma_m16n8k16(sb[2 * np + 1], a, b[2], b[3]);
+                        }
                     }
                 }
             }
@@ -344,9 +431,18 @@ __device__ __forceinline__ void attn_flash_prefill_hd256_body(
                 const float c_lo = exp2f(m_lo - mu_lo);   // exp2(-inf) = 0 on the first tile
                 const float c_hi = exp2f(m_hi - mu_hi);
                 l_lo *= c_lo; l_hi *= c_hi;
-                #pragma unroll
-                for (int n = 0; n < HEAD_DIM / 8; n++)
-                { o[n][0] *= c_lo; o[n][1] *= c_lo; o[n][2] *= c_hi; o[n][3] *= c_hi; }
+                if constexpr (PV_ACC == ACC_F16)
+                {
+                    #pragma unroll
+                    for (int n = 0; n < HEAD_DIM / 8; n++)
+                    { oh[n][0] = scale_half2(oh[n][0], c_lo); oh[n][1] = scale_half2(oh[n][1], c_hi); }
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int n = 0; n < HEAD_DIM / 8; n++)
+                    { o[n][0] *= c_lo; o[n][1] *= c_lo; o[n][2] *= c_hi; o[n][3] *= c_hi; }
+                }
             }
             m_lo = mn_lo; m_hi = mn_hi;
 
@@ -386,8 +482,27 @@ __device__ __forceinline__ void attn_flash_prefill_hd256_body(
                     unsigned b[4];
                     ldmatrix_x4_trans(b, vb + (size_t)(kk * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * SMEM_STRIDE
                                               + (np * 2 + (lane >> 4)) * 8);
-                    mma_m16n8k16(o[2 * np], pa[kk], b[0], b[1]);
-                    mma_m16n8k16(o[2 * np + 1], pa[kk], b[2], b[3]);
+                    if constexpr (PV_ACC == ACC_F16)
+                    {
+                        mma_m16n8k16_f16acc(oh[2 * np], pa[kk], b[0], b[1]);
+                        mma_m16n8k16_f16acc(oh[2 * np + 1], pa[kk], b[2], b[3]);
+                    }
+                    else if constexpr (PV_ACC == ACC_F16_TILE)
+                    {
+                        unsigned t0[2] = { 0u, 0u }, t1[2] = { 0u, 0u };
+                        mma_m16n8k16_f16acc(t0, pa[kk], b[0], b[1]);
+                        mma_m16n8k16_f16acc(t1, pa[kk], b[2], b[3]);
+                        const float2 a0 = unpack_half2(t0[0]), a1 = unpack_half2(t0[1]);
+                        const float2 c0 = unpack_half2(t1[0]), c1 = unpack_half2(t1[1]);
+                        o[2 * np][0] += a0.x; o[2 * np][1] += a0.y; o[2 * np][2] += a1.x; o[2 * np][3] += a1.y;
+                        o[2 * np + 1][0] += c0.x; o[2 * np + 1][1] += c0.y;
+                        o[2 * np + 1][2] += c1.x; o[2 * np + 1][3] += c1.y;
+                    }
+                    else
+                    {
+                        mma_m16n8k16(o[2 * np], pa[kk], b[0], b[1]);
+                        mma_m16n8k16(o[2 * np + 1], pa[kk], b[2], b[3]);
+                    }
                     if (stage_next && kk == 0 && np >= PREFILL_STAGE_NP0
                         && (np - PREFILL_STAGE_NP0) % PREFILL_STAGE_EVERY == 0
                         && np < PREFILL_STAGE_NP0 + PREFILL_STAGE_EVERY * KL::kSlots)
@@ -414,6 +529,16 @@ __device__ __forceinline__ void attn_flash_prefill_hd256_body(
     l_hi += __shfl_xor_sync(0xffffffffu, l_hi, 2);
     const float inv_lo = (l_lo > 0.0f) ? 1.0f / l_lo : 0.0f;
     const float inv_hi = (l_hi > 0.0f) ? 1.0f / l_hi : 0.0f;
+
+    if constexpr (PV_ACC == ACC_F16)
+    {
+        #pragma unroll
+        for (int n = 0; n < HEAD_DIM / 8; n++)
+        {
+            const float2 lo = unpack_half2(oh[n][0]), hi = unpack_half2(oh[n][1]);
+            o[n][0] = lo.x; o[n][1] = lo.y; o[n][2] = hi.x; o[n][3] = hi.y;
+        }
+    }
 
     if (warp < group)
     {

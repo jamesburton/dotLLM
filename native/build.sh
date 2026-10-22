@@ -59,11 +59,11 @@ PRECISE_KERNELS="softmax rmsnorm rmsnorm_f32 rmsnorm_f32in rope rope_f32 attenti
 # Kernels that emit Ampere-only PTX (mma.sync / cp.async) and so MUST be built at
 # compute_86 instead of the global default (dispatch-gated to Ampere+ in C#).
 # Mirrors build_ptx.bat's ARCH_86 list.
-ARCH_86_KERNELS="attention_flash_mma attention_flash_mma_decode_gqa_split attention_flash_mma_decode_gqa_split_kvq attention_flash_mma_prefill_hd256 attention_flash_mma_prefill_hd256_kvq"
+ARCH_86_KERNELS="attention_flash_mma attention_flash_mma_decode_gqa_split attention_flash_mma_decode_gqa_split_kvq attention_flash_mma_prefill_hd256 attention_flash_mma_prefill_hd256_kvq attention_flash_mma_prefill_hd256_xacc"
 
 # Kernels that #include <cooperative_groups.h> (libcu++ needs C++17).
 # Mirrors build_ptx.bat's CXX17 list.
-CXX17_KERNELS="gated_delta_net_scan attention_f32 attention_flash_mma_decode_gqa_split attention_flash_mma_decode_gqa_split_kvq attention_flash_mma_prefill_hd256 attention_flash_mma_prefill_hd256_kvq"
+CXX17_KERNELS="gated_delta_net_scan attention_f32 attention_flash_mma_decode_gqa_split attention_flash_mma_decode_gqa_split_kvq attention_flash_mma_prefill_hd256 attention_flash_mma_prefill_hd256_kvq attention_flash_mma_prefill_hd256_xacc"
 
 # in_list <name> <space-separated list> — success when name is in the list.
 in_list() {

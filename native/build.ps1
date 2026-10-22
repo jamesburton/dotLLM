@@ -52,13 +52,13 @@ $bitPerfect = @('conv1d_causal', 'gated_delta_net_scan', 'hadamard_fwht')
 # Mirrors build_ptx.bat's ARCH_86 list.
 $arch86 = @('attention_flash_mma', 'attention_flash_mma_decode_gqa_split',
     'attention_flash_mma_decode_gqa_split_kvq', 'attention_flash_mma_prefill_hd256',
-    'attention_flash_mma_prefill_hd256_kvq')
+    'attention_flash_mma_prefill_hd256_kvq', 'attention_flash_mma_prefill_hd256_xacc')
 
 # Kernels that #include <cooperative_groups.h> (libcu++ needs C++17).
 # Mirrors build_ptx.bat's CXX17 list.
 $cxx17 = @('gated_delta_net_scan', 'attention_f32', 'attention_flash_mma_decode_gqa_split',
     'attention_flash_mma_decode_gqa_split_kvq', 'attention_flash_mma_prefill_hd256',
-    'attention_flash_mma_prefill_hd256_kvq')
+    'attention_flash_mma_prefill_hd256_kvq', 'attention_flash_mma_prefill_hd256_xacc')
 
 Write-Host "Compiling CUDA kernels -> PTX (target: $arch)..."
 

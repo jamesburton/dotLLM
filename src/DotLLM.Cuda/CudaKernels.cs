@@ -7649,6 +7649,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
     /// <inheritdoc/>
     public void Dispose()
     {
+        DisposePrecisionExperimentModules();   // issue #1109 experiment module, lazily loaded
         _rmsnormModule.Dispose();
         _ropeModule.Dispose();
         _swigluModule.Dispose();

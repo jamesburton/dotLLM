@@ -3736,11 +3736,16 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
                 _kernels.LaunchConvertF32ToF16(q, _attnFlashPrefillQF16, (int)qElemsAll, streamH);
                 if (useFlashPrefillHd256Kvq)
                 {
-                    _kernels.LaunchAttentionFlashPrefillHd256Kvq(_attnFlashPrefillQF16, _kQuant![slot], _vQuant![slot],
-                        _kvKeyDType, _kvValueDType, attnOut, seqLen, seqKv, numHeads, numKvHeads, positionOffset, streamH);
+                    if (!TryLaunchFlashPrefillXacc(kvq: true, _attnFlashPrefillQF16, _kQuant![slot], _vQuant![slot], attnOut,
+                            seqLen, seqKv, numHeads, numKvHeads, positionOffset, streamH))
+                    {
+                        _kernels.LaunchAttentionFlashPrefillHd256Kvq(_attnFlashPrefillQF16, _kQuant![slot], _vQuant![slot],
+                            _kvKeyDType, _kvValueDType, attnOut, seqLen, seqKv, numHeads, numKvHeads, positionOffset, streamH);
+                    }
                     DebugFlashPrefillHd256KvqCallsForTest++;
                 }
-                else
+                else if (!TryLaunchFlashPrefillXacc(kvq: false, _attnFlashPrefillQF16, kF16, vF16, attnOut,
+                             seqLen, seqKv, numHeads, numKvHeads, positionOffset, streamH))
                 {
                     _kernels.LaunchAttentionFlashPrefillHd256(_attnFlashPrefillQF16, kF16, vF16, attnOut,
                         seqLen, seqKv, numHeads, numKvHeads, positionOffset, streamH);
@@ -4477,8 +4482,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
             _kernels.LaunchDequantToF16(weight, qt, _dequantScratchF16Weight, totalElemsI, streamH);
 
         _kernels.LaunchConvertF32ToF16(x, _activF16InScratch, activInElems, streamH);
-        CudaGemm.LinearF16(_cublas.Handle, _activF16InScratch, _dequantScratchF16Weight,
-            _activF16OutScratch, seqLen, k, m, streamH);
+        PrefillLinearF16(_activF16InScratch, _dequantScratchF16Weight, _activF16OutScratch, seqLen, k, m, streamH);
         _kernels.LaunchConvertF16ToF32(_activF16OutScratch, y, activOutElems, streamH);
     }
 
@@ -4836,6 +4840,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
 
         FreeIfNonZero(ref _dequantScratchF16Weight);
         _dequantScratchF16WeightElems = 0;
+        FreePrecisionExperimentScratch();   // issue #1109 experiment buffers (0 unless an experiment ran)
         FreeIfNonZero(ref _activF16InScratch);
         FreeIfNonZero(ref _activF16OutScratch);
         FreeIfNonZero(ref _activQ8InScratch);
