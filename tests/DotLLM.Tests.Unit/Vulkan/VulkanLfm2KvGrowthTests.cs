@@ -124,7 +124,7 @@ public sealed unsafe class VulkanLfm2KvGrowthTests : IDisposable
 
     private static float[] LastRow(ITensor logits)
     {
-        int vocab = logits.Shape[^1];
+        int vocab = logits.Shape[logits.Shape.Rank - 1];
         long rows = logits.ElementCount / vocab;
         return new ReadOnlySpan<float>((float*)logits.DataPointer + ((rows - 1) * vocab), vocab).ToArray();
     }
