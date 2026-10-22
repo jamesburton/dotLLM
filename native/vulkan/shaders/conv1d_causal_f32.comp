@@ -1,0 +1,57 @@
+#version 450
+// Depthwise causal 1-D convolution used by Mamba2 SSM layers (NVIDIA
+// Nemotron-H, Mamba-3). Each channel is convolved independently along
+// the time axis with a small kernel (kernel size d_conv, typically 4)
+// followed by a per-channel bias.
+//
+// Memory layout matches llama.cpp / GGUF exactly:
+//
+//   - input  : time-major rows, [d_conv-1+seqLen, channels].
+//              The caller prepends the cached conv_state (d_conv-1 rows)
+//              to the new activations (seqLen rows). Element (t, c) at
+//              flat index t * channels + c.
+//
+//   - weight : GGUF channel-major for ssm_conv1d.weight. GGUF shape
+//              [d_conv, channels] with ne[0] = d_conv places a single
+//              channel's d_conv taps at contiguous addresses — element
+//              (k, c) at flat index c * d_conv + k. Each thread does
+//              d_conv sequential loads from one channel column.
+//
+//   - bias   : per-channel, [channels].
+//
+//   - output : time-major rows, [seqLen, channels]. Element (t, c) at
+//              flat index t * channels + c.
+//
+// Per-cell math (t in [0, seqLen), c in [0, channels)):
+//
+//   y[t, c] = bias[c] + sum_{k=0..d_conv-1} input[t+k, c] * weight[c*d_conv + k]
+//
+// Dispatch: 2D grid, one thread per output cell (t, c). Workgroup
+// (16, 16). groupCount = (ceil(channels/16), ceil(seqLen/16)).
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufIn     { float inp[];    }; // [(d_conv-1+seqLen) * channels]
+layout(set = 0, binding = 1, std430) readonly  buffer BufWeight { float weight[]; }; // [d_conv * channels] channel-major
+layout(set = 0, binding = 2, std430) readonly  buffer BufBias   { float bias[];   }; // [channels]
+layout(set = 0, binding = 3, std430) writeonly buffer BufOut    { float outp[];   }; // [seqLen * channels]
+
+layout(push_constant) uniform PushConstants {
+    uint dConv;
+    uint channels;
+    uint seqLen;
+} pc;
+
+void main() {
+    uint c = gl_GlobalInvocationID.x; // 0..channels
+    uint t = gl_GlobalInvocationID.y; // 0..seqLen
+    if (c >= pc.channels || t >= pc.seqLen) return;
+
+    uint wBase = c * pc.dConv;
+    float acc = bias[c];
+    // Walk the kernel taps; input[(t+k), c] = input[(t+k)*channels + c].
+    for (uint k = 0u; k < pc.dConv; k++) {
+        acc += inp[(t + k) * pc.channels + c] * weight[wBase + k];
+    }
+    outp[t * pc.channels + c] = acc;
+}

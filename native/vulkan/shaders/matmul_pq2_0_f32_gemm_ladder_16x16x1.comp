@@ -1,0 +1,26 @@
+#version 450
+// Issue #439 ladder point (a) — THE CONTROL.
+//
+// 16x16 output tile from ONE wave64 subgroup: the same geometry the shipping
+// matmul_pq2_0_f32_gemm_coopmat32.comp emits, so the ONLY difference against production is
+// BK 128 -> 32, the wave width (this ladder is unpinned wave64, the shipping kernel is pinned
+// wave32), the shared LDS padding, and the coalesced B stage the template uses uniformly. It
+// exists so the ladder has a real control: whatever (b) and (c) gain over THIS is attributable
+// to arithmetic intensity alone, since all four of those differences are held constant across
+// the three ladder points.
+//
+//   MACs per staged K-chunk : 16 * 16 * 32       =   8,192
+//   bytes staged            : (16 + 16) * 32 * 2 =   2,048
+//   arithmetic intensity    :                        4.0 MAC/byte
+//   LDS                     : 2 * 16 * 40 * 2 + 1 * 256 * 4 = 2,560 + 1,024 = 3,584 B
+//
+// See matmul_pq2_0_f32_gemm_ladder.glsl for the full derivation and for why BK=32 is legal.
+#define BM 16
+#define BN 16
+#define WM 16
+#define WN 16
+#define NSG 1
+#define WAVE 64
+
+#extension GL_GOOGLE_include_directive : require
+#include "matmul_pq2_0_f32_gemm_ladder.glsl"

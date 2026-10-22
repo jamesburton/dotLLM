@@ -80,6 +80,7 @@ internal sealed class JinjaParser
             JinjaTokenType.If => ParseIf(),
             JinjaTokenType.For => ParseFor(),
             JinjaTokenType.Set => ParseSet(),
+            JinjaTokenType.Macro => ParseMacro(),
             _ => throw Error($"Unexpected statement keyword: {keyword.Type}")
         };
     }
@@ -141,9 +142,17 @@ internal sealed class JinjaParser
         }
 
         Expect(JinjaTokenType.In);
-        var iterable = ParseExpression();
-        // Handle optional filter on the iterable (e.g., "for x in items | reverse")
-        // Filters are already handled in ParseExpression -> ParsePostfix
+        // The iterable stops BEFORE a trailing "if": in a for header it is the per-item filter
+        // ("for k in d if k not in skip"), not a ternary on the sequence. ParseOr leaves "if" unconsumed;
+        // a parenthesised ternary still works as the iterable.
+        var iterable = ParseOr();
+        IExpression? filter = null;
+        if (CurrentIs(JinjaTokenType.If))
+        {
+            Advance();
+            filter = ParseOr();
+        }
+        // Filters ("for x in items | reverse") are already handled in ParseOr -> ... -> ParsePostfix
         Expect(JinjaTokenType.StmtEnd);
 
         // Check for optional recursive keyword - we don't support it but skip gracefully
@@ -163,7 +172,7 @@ internal sealed class JinjaParser
         Expect(JinjaTokenType.Endfor);
         Expect(JinjaTokenType.StmtEnd);
 
-        return new ForNode(varName, secondVar, iterable, body, elseBody);
+        return new ForNode(varName, secondVar, iterable, body, elseBody, filter);
     }
 
     private ITemplateNode ParseSet()
@@ -183,10 +192,75 @@ internal sealed class JinjaParser
             return new SetAttributeNode(name, attr, value);
         }
 
+        // Block set: {% set x %} ... {% endset %} (Gemma-4 template uses this).
+        if (CurrentIs(JinjaTokenType.StmtEnd))
+        {
+            Advance();
+            var blockBody = ParseBody(JinjaTokenType.EndSet);
+            Expect(JinjaTokenType.StmtStart);
+            Expect(JinjaTokenType.EndSet);
+            Expect(JinjaTokenType.StmtEnd);
+            return new SetBlockNode(name, blockBody);
+        }
+
         Expect(JinjaTokenType.Assign);
         var expr = ParseExpression();
         Expect(JinjaTokenType.StmtEnd);
         return new SetNode(name, expr);
+    }
+
+    /// <summary>
+    /// Parses <c>{% macro name(a, b=default) %} body {% endmacro %}</c>. Real-world templates
+    /// (e.g. Qwen3-family <c>render_content</c> helpers) define a macro once near the top of the
+    /// template and call it repeatedly later — so unlike a "skip and ignore" approach, the body
+    /// must be captured as a real node list for the evaluator to invoke per call site.
+    /// </summary>
+    private MacroNode ParseMacro()
+    {
+        Expect(JinjaTokenType.Macro);
+        string name = ExpectIdentifier();
+
+        Expect(JinjaTokenType.LeftParen);
+        var parameters = ParseMacroParamList();
+        Expect(JinjaTokenType.RightParen);
+        Expect(JinjaTokenType.StmtEnd);
+
+        var body = ParseBody(JinjaTokenType.EndMacro);
+
+        Expect(JinjaTokenType.StmtStart);
+        Expect(JinjaTokenType.EndMacro);
+        Expect(JinjaTokenType.StmtEnd);
+
+        return new MacroNode(name, parameters, body);
+    }
+
+    private List<(string Name, IExpression? Default)> ParseMacroParamList()
+    {
+        var parameters = new List<(string, IExpression?)>();
+        if (!CurrentIs(JinjaTokenType.RightParen))
+        {
+            parameters.Add(ParseMacroParam());
+            while (CurrentIs(JinjaTokenType.Comma))
+            {
+                Advance();
+                if (CurrentIs(JinjaTokenType.RightParen))
+                    break; // trailing comma
+                parameters.Add(ParseMacroParam());
+            }
+        }
+        return parameters;
+    }
+
+    private (string Name, IExpression? Default) ParseMacroParam()
+    {
+        string name = ExpectIdentifier();
+        IExpression? defaultValue = null;
+        if (CurrentIs(JinjaTokenType.Assign))
+        {
+            Advance();
+            defaultValue = ParseExpression();
+        }
+        return (name, defaultValue);
     }
 
     // ── Expression parsing with precedence climbing ──
@@ -194,7 +268,7 @@ internal sealed class JinjaParser
     private IExpression ParseExpression() => ParseConditional();
 
     /// <summary>
-    /// conditional → or_expr (IF or_expr ELSE conditional)?
+    /// conditional → or_expr (IF or_expr (ELSE conditional)?)?
     /// Jinja2 ternary: value_if_true if condition else value_if_false
     /// </summary>
     private IExpression ParseConditional()
@@ -205,8 +279,19 @@ internal sealed class JinjaParser
         {
             Advance();
             var condition = ParseOr();
-            Expect(JinjaTokenType.Else);
-            var falseValue = ParseConditional();
+            // Jinja2: the else branch is optional; when absent and the condition is false the
+            // result is undefined (renders empty). The Gemma-4 template relies on this
+            // ({{- ',' if not loop.last -}}).
+            IExpression falseValue;
+            if (CurrentIs(JinjaTokenType.Else))
+            {
+                Advance();
+                falseValue = ParseConditional();
+            }
+            else
+            {
+                falseValue = new LiteralExpr(JinjaEvaluator.Undefined);
+            }
             return new ConditionalExpr(expr, condition, falseValue);
         }
 
@@ -413,33 +498,35 @@ internal sealed class JinjaParser
                 continue;
             }
 
-            // Index/bracket access: [expr] or slice: [start:stop]
+            // Index/bracket access: [expr] or slice: [start:stop:step] (any part optional)
             if (CurrentIs(JinjaTokenType.LeftBracket))
             {
                 Advance();
 
                 IExpression? start = null;
                 IExpression? stop = null;
+                IExpression? step = null;
                 bool isSlice = false;
+
+                // start (absent for [:stop] / [::step] / [:])
+                if (!CurrentIs(JinjaTokenType.Colon))
+                    start = ParseExpression();
 
                 if (CurrentIs(JinjaTokenType.Colon))
                 {
-                    // [:stop] or [:]
+                    // first ':' makes this a slice
                     isSlice = true;
                     Advance();
-                    if (!CurrentIs(JinjaTokenType.RightBracket))
+                    // stop (absent for [start:] / [start::step] / [:])
+                    if (!CurrentIs(JinjaTokenType.Colon) && !CurrentIs(JinjaTokenType.RightBracket))
                         stop = ParseExpression();
-                }
-                else
-                {
-                    start = ParseExpression();
+
                     if (CurrentIs(JinjaTokenType.Colon))
                     {
-                        // [start:stop] or [start:]
-                        isSlice = true;
+                        // second ':' introduces the optional step
                         Advance();
                         if (!CurrentIs(JinjaTokenType.RightBracket))
-                            stop = ParseExpression();
+                            step = ParseExpression();
                     }
                 }
 
@@ -447,7 +534,7 @@ internal sealed class JinjaParser
 
                 if (isSlice)
                 {
-                    expr = new SliceExpr(expr, start, stop);
+                    expr = new SliceExpr(expr, start, stop, step);
                 }
                 else
                 {
@@ -534,10 +621,41 @@ internal sealed class JinjaParser
 
             case JinjaTokenType.LeftParen:
             {
+                // Grouping `(expr)` vs. tuple literal `(a, b, ...)` / `(a,)` / `()`.
+                //
+                // Jinja2/Python semantics: a comma inside the parens — including a lone
+                // trailing comma after a single item — makes this a tuple; a bare `(expr)`
+                // with no comma is plain grouping and evaluates to `expr` itself. Tuples are
+                // represented with the same <see cref="ListExpr"/> node used for `[...]`
+                // literals since the evaluator treats both as ordered sequences.
                 Advance();
-                var expr = ParseExpression();
+
+                if (CurrentIs(JinjaTokenType.RightParen))
+                {
+                    // `()` — empty tuple.
+                    Advance();
+                    return new ListExpr([]);
+                }
+
+                var first = ParseExpression();
+
+                if (CurrentIs(JinjaTokenType.Comma))
+                {
+                    var items = new List<IExpression> { first };
+                    while (CurrentIs(JinjaTokenType.Comma))
+                    {
+                        Advance();
+                        if (CurrentIs(JinjaTokenType.RightParen))
+                            break; // trailing comma
+                        items.Add(ParseExpression());
+                    }
+
+                    Expect(JinjaTokenType.RightParen);
+                    return new ListExpr(items);
+                }
+
                 Expect(JinjaTokenType.RightParen);
-                return expr;
+                return first;
             }
 
             case JinjaTokenType.LeftBracket:
