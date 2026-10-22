@@ -142,6 +142,76 @@ public sealed class VulkanQwen3HybridDenseF16KvTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// The scheduler's <c>ForwardBatch</c> over two F16 sequences gives each the logits its own serial <c>Forward</c> run does, bit for
+    /// bit: the batched path writes and reads each sequence's F16 cache with the same kernels.
+    /// </summary>
+    [SkippableFact]
+    public void ForwardBatch_TwoF16Sequences_MatchSerialForward()
+    {
+        using var f = Open(pq2: true);
+        f.Model.ConfigureKvStorage(VulkanKvStorage.F16);
+        int[][] prompts = [Tokens(23, salt: 7), Tokens(9, salt: 8)];
+        const int steps = 20;   // past the split-KV threshold for both
+
+        var serial = new List<float[]>[prompts.Length];
+        for (int s = 0; s < prompts.Length; s++)
+        {
+            using var gdn = f.Model.CreateGdnStateCache();
+            using var kv = f.Model.CreateKvCache(prompts[s].Length + steps);
+            serial[s] = [Forward(f, prompts[s], 0, kv, gdn)];
+            for (int t = 0; t < steps; t++)
+                serial[s].Add(Forward(f, [Argmax(serial[s][^1])], prompts[s].Length + t, kv, gdn));
+        }
+
+        var gdns = prompts.Select(_ => f.Model.CreateGdnStateCache()).ToArray();
+        var kvs = prompts.Select(p => f.Model.CreateKvCache(p.Length + steps)).ToArray();
+        try
+        {
+            var batched = prompts.Select(_ => new List<float[]>()).ToArray();
+            for (int t = 0; t <= steps; t++)
+            {
+                var requests = new Core.Models.SequenceForwardRequest[prompts.Length];
+                for (int s = 0; s < prompts.Length; s++)
+                {
+                    int[] ids = t == 0 ? prompts[s] : [Argmax(batched[s][^1])];
+                    int start = t == 0 ? 0 : prompts[s].Length + t - 1;
+                    requests[s] = new Core.Models.SequenceForwardRequest
+                    {
+                        TokenIds = ids.AsMemory(),
+                        Positions = Enumerable.Range(start, ids.Length).ToArray().AsMemory(),
+                        KvCache = kvs[s],
+                        GdnState = gdns[s],
+                    };
+                }
+
+                var results = f.Model.ForwardBatch(requests, deviceId: -1);
+                try
+                {
+                    for (int s = 0; s < prompts.Length; s++) batched[s].Add(LastRow(results[s]));
+                }
+                finally { foreach (var r in results) r.Dispose(); }
+            }
+
+            for (int s = 0; s < prompts.Length; s++)
+            {
+                for (int t = 0; t <= steps; t++)
+                {
+                    for (int i = 0; i < Vocab; i++)
+                    {
+                        Assert.True(BitConverter.SingleToInt32Bits(serial[s][t][i]) == BitConverter.SingleToInt32Bits(batched[s][t][i]),
+                            $"sequence {s} step {t} logits[{i}]: serial {serial[s][t][i]:R} vs batched {batched[s][t][i]:R}");
+                    }
+                }
+            }
+        }
+        finally
+        {
+            foreach (var kv in kvs) kv.Dispose();
+            foreach (var g in gdns) g.Dispose();
+        }
+    }
+
     /// <summary>q8_0 and mixed K / V requests are refused with a message, never silently stored as something else.</summary>
     [Fact]
     public void ParseOptions_RefusesWhatTheCacheCannotStore()
@@ -217,6 +287,19 @@ public sealed class VulkanQwen3HybridDenseF16KvTests : IDisposable
         using ITensor logits = f.Model.Forward(tokens, positions, deviceId: -1, kv, gdn, mtpState: null);
         int rows = logits.Shape[0];
         return new ReadOnlySpan<float>((float*)logits.DataPointer + (long)(rows - 1) * Vocab, Vocab).ToArray();
+    }
+
+    private static unsafe float[] LastRow(ITensor logits)
+    {
+        int rows = logits.Shape[0];
+        return new ReadOnlySpan<float>((float*)logits.DataPointer + (long)(rows - 1) * Vocab, Vocab).ToArray();
+    }
+
+    private static int Argmax(float[] row)
+    {
+        int best = 0;
+        for (int i = 1; i < row.Length; i++) if (row[i] > row[best]) best = i;
+        return best;
     }
 
     /// <summary>Deterministic token ids in [1, Vocab - 2] (never EOS).</summary>

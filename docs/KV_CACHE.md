@@ -67,11 +67,41 @@ split Qwen3-hybrid model, the KV handoff paths and the CLI memory estimate now a
 ### Vulkan hybrid KV: element format and lazy growth (issue #898)
 
 `VulkanNemotronHKvCache` (shared by the Vulkan Nemotron-H, Qwen3.5/3.6/3.8 hybrids and Qwen4-Exp) takes two opt-in constructor arguments, both OFF by default so existing models are
-untouched: `storage: VulkanKvStorage.F16` (K/V rows written by a convert kernel, 2 bytes per element; only the Qwen4-Exp QSA gather kernel reads them, so it is created only through the
-Qwen4-Exp model) and `lazy: true` (buffers start empty and `EnsureCapacity(positions)` reallocates layer by layer, 25 % / >= 1024 positions at a time, copying the live prefix).
+untouched: `storage: VulkanKvStorage.F16` (K/V rows written by a convert kernel, 2 bytes per element; read by the Qwen4-Exp QSA gather kernel and,
+since #1102, by the `_kvf16` attention twins the dense hybrid selects; see the next section) and `lazy: true` (buffers start empty and `EnsureCapacity(positions)` reallocates layer by layer, 25 % / >= 1024 positions at a time, copying the live prefix).
 `MaxLength` is the logical limit, `AllocatedLength` the physical one. After `EnsureCapacity` returns true the CALLER must drop every descriptor cache that may name the freed buffers
 (handles are recycled; a stale cached set reads zeros without any error). Qwen4-Exp does this in `ForwardCore` before recording (`EnsureContext`), for the sequence's K/V and its indexer
 state. Switches and measurements: [ATTENTION.md](ATTENTION.md), "Lazy growth and F16 K/V".
+
+### Vulkan dense-hybrid (Bonsai 2) KV: F16 storage read in place (issue #1102)
+
+`VulkanQwen3HybridDenseTransformerModel` (Bonsai 2, Qwen3.5 / 3.6 dense hybrids) keeps its KV in a lazy, growable
+`VulkanNemotronHKvCache` (#1100) whose element format is selectable:
+
+```bash
+dotllm serve <bonsai> --device vulkan --cache-type-k f16 --cache-type-v f16   # or --kv-quant-k/-v f16; run and bench too
+```
+
+| storage | bytes / element | Bonsai 2 per token (16 attn layers × 4 KV heads × 256 × K+V) | 128k | 262,144 | 1M (YaRN, #1101) |
+|---|---|---|---|---|---|
+| f32 (default) | 4 | 128 KiB | 16 GiB | 32 GiB | 128 GiB |
+| f16 | 2 | 64 KiB | 8 GiB | 16 GiB | 64 GiB |
+
+- **Read in place, no widening.** Every attention kernel the model dispatches has an F16 twin (`*_kvf16.comp`) that
+  loads its K / V elements from the packed halves (`kv_load.glsl`, `unpackHalf2x16` in the load). No kernel converts the
+  history to an F32 scratch, so the device holds exactly the per-token cost above plus the existing per-forward
+  scratch. Decode reads 64 KiB per cached token instead of 128 KiB. Details and the kernel list:
+  [ATTENTION.md](ATTENTION.md), "Narrow (F16) KV on Vulkan".
+- **Writes.** The F32 K / V rows the projections produce are converted on the device by `convert_f32_to_f16_range.comp`
+  (round-to-nearest-even in the integer domain, saturating at ±65504), from contiguous positions only. That is every
+  forward the engine issues: prefill tiles, decode, MTP verify and each `ForwardBatch` sequence.
+- **Snapshots, restore, rollback, growth** copy whole rows byte for byte, so they keep the format and round-trip exactly
+  (`ValidateSnapshotLayout` no longer requires F32).
+- **Selection.** `ConfigureKvStorage(VulkanKvStorage)` sets the format of caches created afterwards; the forward picks
+  kernels per cache. The CLI and server accept `f16` / `fp16` and `f32`. q8_0, q4_0, TurboQuant and mixed K / V are
+  refused at startup with a message, never stored as something else. The default stays F32.
+- **Accuracy.** F16 rounds each K / V element once (relative error ≤ 2⁻¹¹). On the synthetic fixture the logits stay
+  within the tolerance the Vulkan forward is held to against the CPU reference (abs 5e-3 + rel 1e-3).
 
 ### CUDA hybrid-dense KV: staging, quantized storage, fused decode (issue #956)
 
