@@ -138,8 +138,15 @@ the issue/PR. Reference/baseline comparisons (tests, oracles, A/B measurements) 
   embedding/LM-head tables, recurrent/MTP state buffers, and inter-kernel tensors.
 - **Always evaluate formats below FP16 too** (q8_0, q4_0, FP8/MXFP4 where the hardware supports them). Pick on measured
   memory *and* speed, and state per-token or per-tensor byte costs in the PR.
-- *Out of scope:* in-register accumulation inside a kernel (FP32 accumulators for dot products, softmax, norms) and single
-  scalars. Those are arithmetic, not stored data.
+- *Accumulation* (in registers; no storage, no extra pass):
+  - **Default F32** for norms (sum of squares), softmax and attention sums, long-KV attention, recurrent-state updates, and
+    the combine step of split reductions. FP16's 65,504 ceiling and swamping make overflow or bias structural there.
+  - **In compute-bound kernels** (tensor-core or packed-half GEMM), prefer F16 accumulation wherever it measures faster and
+    passes KL/PPL parity against an F32-accumulate reference. For long K, accumulate in F16 over chunks and promote to F32
+    every 64–256 terms.
+  - Integer dot products (dp4a, VNNI, int8 MMA) accumulate in int32 by construction.
+  - Stored F32 partials (split-K, split-KV) are storage and need this rule's sign-off.
+  - Evidence and per-device choices live in `docs/PRECISION.md`.
 - Model-declared FP32 state (e.g. an HF `mamba_ssm_dtype: float32`) is evidence to cite in the PR, not an automatic
   exemption.
 - Existing FP32 stores on hot paths are tracked for removal in #1107 (e.g. Vulkan hybrid KV, CUDA MTP head KV, F32 staging,
