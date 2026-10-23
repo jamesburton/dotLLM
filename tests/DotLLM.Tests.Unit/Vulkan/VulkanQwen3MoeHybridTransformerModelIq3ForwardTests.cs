@@ -162,16 +162,16 @@ public sealed class VulkanQwen3MoeHybridTransformerModelIq3ForwardTests
                 spvDir);
             using var kvCache = model.CreateKvCache(MaxSeqLen);
             using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1, kvCache);
-            Assert.Equal(1, logits.Shape[0]);
+            Assert.Equal(seqLen, logits.Shape[0]);   // #1188: a short batch returns every row's logits
             Assert.Equal(vocabSize, logits.Shape[1]);
             vkLogits = CopyLogits(logits);
         }
 
-        int lastRow = seqLen - 1;
-        for (int c = 0; c < vocabSize; c++)
+        for (int i = 0; i < seqLen * vocabSize; i++)
         {
-            float cpu = cpuLogits[lastRow * vocabSize + c];
-            float vk = vkLogits[c];
+            int c = i % vocabSize;
+            float cpu = cpuLogits[i];
+            float vk = vkLogits[i];
             Assert.True(float.IsFinite(cpu), $"non-finite CPU logit {iq3Type} seqLen={seqLen} col={c}: {cpu}");
             Assert.True(float.IsFinite(vk), $"non-finite Vulkan logit {iq3Type} seqLen={seqLen} col={c}: {vk}");
             float diff = MathF.Abs(cpu - vk);

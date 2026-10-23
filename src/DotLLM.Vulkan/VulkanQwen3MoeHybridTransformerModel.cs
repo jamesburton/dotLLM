@@ -722,6 +722,11 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         bool resized = _state.EnsureCapacity(seqLen);
         if (resized) { _kernels.InvalidateAll(); _iqF16Prefill?.InvalidateDescriptorCache(); }
 
+        // Rows the LM head covers (#1188): every row of a short batch (a speculative verify is K+1 rows and is indexed row by row), the last
+        // row of a long prefill. Resolved before any recording: growing the buffer invalidates the descriptor caches.
+        int headRows = seqLen <= MaxAllRowLogitsSeqLen ? seqLen : 1;
+        var logitsBuf = headRows == 1 ? _state.Logits : EnsureMultiRowLogits(headRows, vocabSize);
+
         UploadPositions(positions);
 
         var kinds = _layout.LayerKind;
@@ -777,24 +782,24 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             if (profActive) { _profMoeMs += ProfElapsedMs(ref profT0); }
         }
 
-        // ── 3. Final norm + LM head (single submission, last token only) ──────
+        // ── 3. Final norm + LM head (single submission, headRows trailing rows) ─
         _submit.Begin();
         cmdBuf = _submit.CommandBuffer;
         KernelSupport.HostToComputeBarrier(cmdBuf);
 
         long rowBytes = (long)hiddenSize * sizeof(float);
-        long lastRowOffset = (long)(seqLen - 1) * rowBytes;
+        long headSrcOffset = (long)(seqLen - headRows) * rowBytes;
         RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.NormOutput,
-            srcOffset: (ulong)lastRowOffset, dstOffset: 0, size: (ulong)rowBytes);
+            srcOffset: (ulong)headSrcOffset, dstOffset: 0, size: (ulong)(headRows * rowBytes));
         KernelSupport.TransferToComputeBarrier(cmdBuf);
 
         _kernels.RmsNorm.Record(cmdBuf, _state.NormOutput, _weights.OutputNormWeight, _state.NormOutput,
-            rowCount: 1, n: hiddenSize, eps: eps);
+            rowCount: headRows, n: hiddenSize, eps: eps);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType,
-            _state.NormOutput, _state.Logits,
-            outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: 1);
+            _state.NormOutput, logitsBuf,
+            outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: headRows);
         KernelSupport.ComputeToHostBarrier(cmdBuf);
         _submit.SubmitAndWait();
         if (profActive)
@@ -816,12 +821,12 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         }
 
         // ── 4. Download logits ─────────────────────────────────────────────────
-        var shape = new TensorShape(1, vocabSize);
+        var shape = new TensorShape(headRows, vocabSize);
         var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
         unsafe
         {
-            var dest = new Span<float>((void*)result.DataPointer, vocabSize);
-            _device.Download(_state.Logits, dest);
+            var dest = new Span<float>((void*)result.DataPointer, headRows * vocabSize);
+            _device.Download(logitsBuf, dest);
         }
         return result;
     }
@@ -2996,6 +3001,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     /// <inheritdoc/>
     public void Dispose()
     {
+        CloseCheckpoints();
         _submit.Dispose();
         // Resident MoE bundles outlive single forwards in the default mode;
         // free them here before kernels and the device go away.
