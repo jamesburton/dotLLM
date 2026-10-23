@@ -1,0 +1,5 @@
+#version 450
+// Flash-Attention-v2 style tiled attention over GQA. Each workgroup processes
+// Body: attention_flash_f32.glsl (issue #1102 split it out so the F32 and F16-KV pipelines share one source).
+#extension GL_GOOGLE_include_directive : require
+#include "attention_flash_f32.glsl"

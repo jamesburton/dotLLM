@@ -38,7 +38,7 @@ internal sealed class DebugGgufHeaderCommand : Command<DebugGgufHeaderCommand.Se
         table.AddRow("File", fileInfo.Name);
         table.AddRow("File size", FormatBytes(fileInfo.Length));
         table.AddRow("Version", gguf.Header.Version.ToString());
-        table.AddRow("Tensor count", gguf.Header.TensorCount.ToString("N0"));
+        table.AddRow("Tensor count", gguf.Tensors.Count.ToString("N0")); // unified over all shards of a split set (Header is the first shard's)
         table.AddRow("Metadata KV count", gguf.Header.MetadataKvCount.ToString("N0"));
         table.AddRow("Data section offset", $"0x{gguf.DataSectionOffset:X} ({gguf.DataSectionOffset:N0} bytes)");
 

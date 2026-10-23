@@ -10,6 +10,8 @@ namespace DotLLM.Engine.Samplers;
 /// </summary>
 public sealed class RepetitionPenaltyProcessor : ILogitProcessor
 {
+    private const int StackWindowThreshold = 256;
+
     /// <inheritdoc/>
     public void Process(Span<float> logits, IReadOnlyList<int> previousTokens, ProcessorContext context)
     {
@@ -21,36 +23,53 @@ public sealed class RepetitionPenaltyProcessor : ILogitProcessor
         int startIndex = window > 0 ? Math.Max(0, previousTokens.Count - window) : 0;
         int windowLength = previousTokens.Count - startIndex;
 
-        // Rent array, copy window tokens, sort for dedup without HashSet allocation
-        int[] rented = ArrayPool<int>.Shared.Rent(windowLength);
-        try
+        if (windowLength <= StackWindowThreshold)
         {
-            for (int i = 0; i < windowLength; i++)
-                rented[i] = previousTokens[startIndex + i];
-
-            Array.Sort(rented, 0, windowLength);
-
-            // Iterate sorted array, skip duplicates
-            int prev = -1;
-            for (int i = 0; i < windowLength; i++)
+            Span<int> scratch = stackalloc int[windowLength];
+            CopyWindow(previousTokens, startIndex, scratch);
+            ApplySortedPenalty(logits, scratch, penalty);
+        }
+        else
+        {
+            int[] rented = ArrayPool<int>.Shared.Rent(windowLength);
+            try
             {
-                int tokenId = rented[i];
-                if (tokenId == prev)
-                    continue;
-                prev = tokenId;
-
-                if ((uint)tokenId >= (uint)logits.Length)
-                    continue;
-
-                if (logits[tokenId] > 0f)
-                    logits[tokenId] /= penalty;
-                else
-                    logits[tokenId] *= penalty;
+                Span<int> scratch = rented.AsSpan(0, windowLength);
+                CopyWindow(previousTokens, startIndex, scratch);
+                ApplySortedPenalty(logits, scratch, penalty);
+            }
+            finally
+            {
+                ArrayPool<int>.Shared.Return(rented);
             }
         }
-        finally
+    }
+
+    private static void CopyWindow(IReadOnlyList<int> previousTokens, int startIndex, Span<int> scratch)
+    {
+        for (int i = 0; i < scratch.Length; i++)
+            scratch[i] = previousTokens[startIndex + i];
+    }
+
+    private static void ApplySortedPenalty(Span<float> logits, Span<int> tokenIds, float penalty)
+    {
+        tokenIds.Sort();
+
+        int prev = -1;
+        for (int i = 0; i < tokenIds.Length; i++)
         {
-            ArrayPool<int>.Shared.Return(rented);
+            int tokenId = tokenIds[i];
+            if (tokenId == prev)
+                continue;
+            prev = tokenId;
+
+            if ((uint)tokenId >= (uint)logits.Length)
+                continue;
+
+            if (logits[tokenId] > 0f)
+                logits[tokenId] /= penalty;
+            else
+                logits[tokenId] *= penalty;
         }
     }
 }

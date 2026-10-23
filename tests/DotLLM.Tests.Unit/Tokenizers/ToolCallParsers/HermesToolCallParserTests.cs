@@ -17,7 +17,7 @@ public class HermesToolCallParserTests
         Assert.NotNull(calls);
         Assert.Single(calls);
         Assert.Equal("get_weather", calls![0].FunctionName);
-        Assert.Contains("Berlin", calls[0].Arguments);
+        Assert.Contains("Berlin", calls[0].Arguments, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -90,8 +90,8 @@ public class HermesToolCallParserTests
 
         Assert.NotNull(calls);
         Assert.Single(calls);
-        Assert.Contains("nested", calls![0].Arguments);
-        Assert.Contains("[1,2,3]", calls[0].Arguments);
+        Assert.Contains("nested", calls![0].Arguments, StringComparison.Ordinal);
+        Assert.Contains("[1,2,3]", calls[0].Arguments, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -132,7 +132,7 @@ public class HermesToolCallParserTests
         Assert.NotNull(calls);
         Assert.Single(calls);
         Assert.Equal("get_weather", calls![0].FunctionName);
-        Assert.Contains("Paris", calls[0].Arguments);
+        Assert.Contains("Paris", calls[0].Arguments, StringComparison.Ordinal);
     }
 
     [Fact]

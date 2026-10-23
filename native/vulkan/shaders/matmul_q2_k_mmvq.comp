@@ -1,0 +1,137 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Q2_K MMVQ decode GEMV: integer-dot (dp4a) matrix-vector multiply.
+//
+//   y[m] = sum_k W_q2k[m,k] * x[k]
+//
+// The activation x[] is pre-quantized to Q8_1 (int8 qs + fp32 scale d_x, one
+// block per 32 elements). Q2_K reconstructs w = d·scale·q2 − dmin·dmCoef with a
+// per-256 super-block (d, dmin) and a per-16-element sub-block (4-bit scale,
+// 4-bit dmCoef). Per 16-element sub-block:
+//   sum_i w_i·x_i = d·scale·sum(q2·x) − dmin·dmCoef·sum(x)
+//                 = d·scale·d_x·dp4a(q2, xq) − dmin·dmCoef·d_x·sum(xq)
+// The min term needs the PER-16 activation sum (the Q8_1 block-sum s is per-32,
+// spanning two Q2_K sub-blocks with different dmCoef), so it is computed as
+// dp4a(0x01010101, xq) over this lane's slice.
+//
+// NOT bit-exact (x is int8-quantized); validated argmax + tolerance vs CPU F32.
+//
+// ── lane=K-position layout (issue #339, mirrors #338; re-derived for #498) ────
+// One wave32 subgroup computes one output row; the 32 lanes consume one 256-elem
+// super-block per iteration. 2 lanes share a sub-block: lane L → sub=L/2,
+// hlf=L%2, owning elements [hlf*8 .. hlf*8+8) (= 2 dp4a). The per-sub-block
+// min term is split across the sub-block's 2 lanes. Reduction: single subgroupAdd.
+//
+// Q2_K super-block layout (84 bytes / 256 elements; matches matmul_q2_k_f32_gemv.comp):
+//   [0..15]  = scales[16] (low nibble = 4-bit scale, high nibble = 4-bit dmCoef)
+//   [16..79] = qs[64] — 256 × 2-bit, 4 per byte, TRANSPOSED (issue #498):
+//              element t lives at byte 32*(t>>7) + (t&31), shift 2*((t>>5)&3).
+//              Authority: ggml-quants.c dequantize_row_q2_K.
+//   [80,81]  = fp16 d   [82,83] = fp16 dmin
+//   Row stride = (K/256) * 84 bytes (84 % 4 == 0 ⇒ word-aligned).
+//
+// NOTE (#498): this kernel previously assumed a sub-block's 16 two-bit values
+// occupied ONE qs uint (uint index == sub). That is false — under the real
+// layout a sub-block's 16 elements are 16 *contiguous bytes* (4 contiguous
+// uints) at one shared shift. Each lane therefore loads 2 uints instead of 1,
+// and lanes no longer read strictly consecutive words: the 4 distinct word
+// bases across the 16 sub-blocks are qsUint + {0, 4, 8, 12}, so a wave still
+// touches exactly the same one 64-byte qs region per super-block, but with
+// each word served to 4 lanes rather than 2.
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW   { uint  weight[]; }; // Q2_K blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq  { uint  xq[]; };      // [K/4] packed int8 activations
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds { vec2  xds[]; };     // [K/32] (d_x, s)
+layout(set = 0, binding = 3, std430) writeonly buffer BufY   { float y[]; };       // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint blocksPerRow; // = K / 256
+    uint pad;
+} pc;
+
+const uint Q2K_BLOCK_BYTES = 84u;
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    return (u >> ((absByteOff & 3u) * 8u)) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+// Load the element-order quartet `u` (elements 4u..4u+3 of the super-block)
+// from the transposed Q2_K qs blob and pack it as 4 int8 lanes (0..3 each)
+// ready for dp4a (issue #498).
+//
+// Derivation: element t = 4u+j (j<4) sits at byte 32*(t>>7) + (t&31) =
+// 4*(8*(u>>5) + (u&7)) + j, shift 2*((t>>5)&3) = 2*((u>>3)&3) — j-invariant.
+// So the quartet is exactly the 4 bytes of uint word 8*(u>>5) + (u&7), each
+// contributing its 2 bits at the same shift: (w >> shift) & 0x03030303.
+uint loadQ2Quartet(uint qsUintBase, uint u) {
+    uint w = weight[qsUintBase + 8u * (u >> 5u) + (u & 7u)];
+    return (w >> (((u >> 3u) & 3u) << 1u)) & 0x03030303u;
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint lane = gl_LocalInvocationID.x;   // 0..31
+    uint sub  = lane >> 1u;               // sub-block 0..15
+    uint hlf = lane & 1u;                // which 8-element hlf of the sub-block
+    // This lane's 8 elements are element-order quartets u = 4*sub + 2*hlf + {0,1}.
+    uint uBase = sub * 4u + hlf * 2u;
+
+    uint rowByteBase = m * pc.blocksPerRow * Q2K_BLOCK_BYTES;
+    float acc = 0.0;
+
+    for (uint b = 0u; b < pc.blocksPerRow; b++) {
+        uint blockByteBase = rowByteBase + b * Q2K_BLOCK_BYTES;
+        float d    = readHalf(blockByteBase + 80u);
+        float dmin = readHalf(blockByteBase + 82u);
+        uint scByte = readByte(blockByteBase + sub);
+        float sc = float(scByte & 0xFu);
+        float dmCoef = float((scByte >> 4u) & 0xFu);
+
+        // This lane's 8 elements = 2 element-order quartets (#498).
+        uint qsUintBase = (blockByteBase + 16u) >> 2u;
+        uint w0 = loadQ2Quartet(qsUintBase, uBase);
+        uint w1 = loadQ2Quartet(qsUintBase, uBase + 1u);
+
+        // Activations: element b*256 + sub*16 + hlf*8 → xq uint b*64 + sub*4 + hlf*2.
+        uint xqi = b * 64u + sub * 4u + hlf * 2u;
+        uint xa = xq[xqi];
+        uint xb = xq[xqi + 1u];
+        int dotI = dotPacked4x8AccSatEXT(int(w0), int(xa), 0);
+        dotI = dotPacked4x8AccSatEXT(int(w1), int(xb), dotI);
+
+        // Per-16 activation sum for the min term (this lane's 8 elements).
+        int sumXq = dotPacked4x8AccSatEXT(0x01010101, int(xa), 0);
+        sumXq = dotPacked4x8AccSatEXT(0x01010101, int(xb), sumXq);
+
+        // Q8_1 block index = b*8 + sub/2 (two sub-blocks share a 32-element block).
+        float dX = xds[b * 8u + (sub >> 1u)].x;
+        acc += (d * sc) * (dX * float(dotI)) - (dmin * dmCoef) * (dX * float(sumXq));
+    }
+
+    float total = subgroupAdd(acc);
+    if (subgroupElect())
+        y[m] = total;
+}

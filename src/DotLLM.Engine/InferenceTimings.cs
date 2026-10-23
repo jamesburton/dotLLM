@@ -26,6 +26,12 @@ public readonly record struct InferenceTimings
     /// <summary>Number of prompt tokens served from the prefix cache (skipped during prefill).</summary>
     public int CachedTokenCount { get; init; }
 
+    /// <summary>Snapshot storage tier used by the prefix hit, or null for a miss.</summary>
+    public string? CacheTier { get; init; }
+
+    /// <summary>Wall time spent restoring a cached prefix, in milliseconds.</summary>
+    public double CacheRestoreMilliseconds { get; init; }
+
     /// <summary>Total draft tokens proposed during speculative decoding. 0 when not using speculative decoding.</summary>
     public int SpeculativeDraftTokens { get; init; }
 
