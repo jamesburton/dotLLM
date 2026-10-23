@@ -104,6 +104,30 @@ MoE cold experts: auto mode, 15 CPU thread(s).
 
 Expected outcomes, still to be measured: T5500 (PCIe 2.0 x16, pre-AVX Xeons) is expected to choose copy, and the dev box (PCIe 3.0 x4, AVX2) the CPU.
 
+## Other MoE models on CUDA: CPU-expert layers (issue #1187)
+
+MoE models that load through the plain `CudaTransformerModel` (Recursive Flint, DeepSeek-V2, Qwen-MoE, ...) honour
+`--cpu-moe`, `--n-cpu-moe N` and `--moe-offload` too. There is no VRAM expert cache on this host yet: a layer's routed
+experts are either all resident or all on the CPU.
+
+- **Placement.** Layers whose index is below N keep their routed experts on the CPU (`--cpu-moe` = every MoE layer,
+  `--moe-offload on` = the same). Their router, shared expert and biases are still uploaded; the routed banks are not.
+- **Auto.** With `--moe-offload auto` (the default) and no explicit N, a model whose weights do not fit picks the smallest
+  N that leaves free VRAM for `ReserveMib` (default 1024 MiB on this host) plus an F16 KV cache of `--ctx-size` tokens
+  (default 4096). The load log says what it chose, for example
+  `MoE experts on CPU: 30 layer(s) (--n-cpu-moe 32), ... MiB read from the mmap'd GGUF, 15 CPU thread(s)`.
+  `auto` never moves the experts of a model with per-expert biases or `swiglu_oai` (gpt-oss): the CPU leg cannot run them,
+  and an explicit `--cpu-moe` on such a model is refused.
+- **The CPU leg** (`CudaMoeHostExperts`). Routing and top-k stay on the device. After the existing top-k read-back, the
+  F32 expert input and the top-k weights (`seqLen x (hidden + topK)` floats) are read back; the CPU model's own kernels
+  (`MoeSwiGluMlp.ExecuteRoutedFromAssignments`, Q8_1 activations, `--moe-cpu-threads` threads) compute the routed sum
+  **straight from the memory-mapped GGUF**; the sum (`seqLen x hidden` floats) is copied up and added. The device shared
+  expert is queued before the CPU leg starts, so the two overlap; `shared + routed` is one addition per element, so the
+  order matches the resident path.
+- **No second copy of the weights** (#1156). Unlike the Nemotron-H host store above, nothing is pinned or copied: the
+  CPU reads the OS page cache's pages of the file, which every process mapping the file shares. Only activations cross
+  the link.
+
 ## Telemetry
 
 The `DotLLM.Moe` meter publishes the following instruments:
