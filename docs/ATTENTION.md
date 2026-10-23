@@ -367,7 +367,9 @@ matches (max |s| ≤ 28). The unit case where a plain F16 Q·Kᵀ misses the coo
 Q ±12: per-row max |s| ≈ 37, split term 7.8e-3 median) is 2–3× beyond either model and now guards the opt-in split
 (`DOTLLM_VULKAN_FA_GQA_QLO=1`); `Prefill_DefaultNoSplit_MatchesCpuReference` pins the default at Bonsai magnitudes. The decision
 rests on RMS-normed q/k: re-run the stats variant before relying on it for a model without q/k norm. F16 S accumulation was
-rejected (5–9% over split-off, with a KL tail of 5.8e-2 at 64k).
+rejected (5–9% over split-off, with a KL tail of 5.8e-2 at 64k). Re-checked on the #1148 build (Strix, same 10 × 4096 Bonsai
+protocol): the new default gives 8.3259 (NLL 2.119376) and `DOTLLM_VULKAN_FA_GQA_QLO=1` gives 8.3260 (2.119382), identical to the
+table above, so the opt-in restores the old kernel exactly.
 
 TFLOP/s is still a third of the dense projections; the remaining limit is the QK^T MMA count and the B-fragment reload per MMA
 pair. Next lever: a 128-row workgroup once LDS allows.
