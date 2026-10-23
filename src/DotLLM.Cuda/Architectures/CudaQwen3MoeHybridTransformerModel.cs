@@ -80,6 +80,8 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     // projection a packed/GEMV path covers.
     private nint _dequantScratchF16Weight;
     private long _dequantScratchElems;
+    private int _lmHeadDequantTiles;    // #1099 (LmHeadDequantTiles)
+    private bool _warnedLmHeadTiled;    // #1099: one notice per model that the head dequantizes in tiles
 
     // Lazily allocated F16 activation staging buffers for the decode/prefill F16 GEMV/GEMM
     // path. Activations on this model live in F32, but the quantised GEMV kernels and
@@ -898,7 +900,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         }
         _kernels.LaunchRmsNormF32(_state.HiddenState, _outputNormDevice, _state.HiddenState,
             hiddenSize, eps, seqLen, streamH);
-        Gemm(_outputDevice, _outputQt, _state.HiddenState, _state.Logits,
+        GemmLmHead(_outputDevice, _outputQt, _state.HiddenState, _state.Logits,
              _outputOutputDim, _outputInputDim, seqLen);
 
         _stream.Synchronize();
@@ -1828,7 +1830,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             : _state.HiddenState + (nint)((long)(seqLen - 1) * hiddenSize * sizeof(float));
         _kernels.LaunchRmsNormF32(lmHeadInput, _outputNormDevice, lmHeadInput,
             hiddenSize, eps, logitsRows, streamH);
-        Gemm(_outputDevice, _outputQt, lmHeadInput, _state.Logits,
+        GemmLmHead(_outputDevice, _outputQt, lmHeadInput, _state.Logits,
              _outputOutputDim, _outputInputDim, logitsRows);
         if (DebugTrace) LogVram("after lm-head");
 
@@ -2842,9 +2844,75 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         // not. 510 bytes of insurance against a shape that is not.
         halfs = (halfs + 255) & ~255L;
         FreeIfNonZero(ref _dequantScratchF16Weight);
+        _dequantScratchElems = 0;
+        // #1099: admitted against free VRAM (freed first, so the figure includes the old buffer), so a
+        // dequant that cannot fit is a clean refusal rather than a WDDM spill into shared memory.
+        AdmitDeviceGrowth(halfs * sizeof(ushort), $"F16 weight-dequant scratch ({halfs:N0} elements)");
         _dequantScratchF16Weight = AllocDevice(halfs * sizeof(ushort));
         _dequantScratchElems = halfs;
     }
+
+    /// <summary>Free device memory a dequant-scratch growth must leave (<see cref="DeviceMemoryBudget.ReserveEnvVar"/>).</summary>
+    private static readonly long VramReserveBytes =
+        DeviceMemoryBudget.ResolveReserveBytes(Environment.GetEnvironmentVariable(DeviceMemoryBudget.ReserveEnvVar));
+
+    /// <summary>
+    /// Refuses a device allocation of <paramref name="bytes"/> that would not leave
+    /// <see cref="VramReserveBytes"/> free (issue #1099; the dense hybrid's #1068 admission).
+    /// </summary>
+    /// <param name="bytes">Bytes about to be allocated.</param>
+    /// <param name="what">What they are for, for the error message.</param>
+    /// <exception cref="DeviceMemoryAdmissionException">The allocation does not fit.</exception>
+    private void AdmitDeviceGrowth(long bytes, string what)
+    {
+        _context.MakeCurrent();
+        CudaDriverApi.cuMemGetInfo_v2(out nuint free, out _).ThrowOnError();
+        if (DeviceMemoryBudget.Fits((long)free, bytes, VramReserveBytes)) return;
+        string message = DeviceMemoryBudget.DescribeRefusal(what, bytes, (long)free, VramReserveBytes);
+        Console.Error.WriteLine($"[dotllm] ERROR: {message}");
+        throw new DeviceMemoryAdmissionException(message);
+    }
+
+    /// <summary>
+    /// The LM head over <paramref name="seqLen"/> rows (issue #1099). This host has no packed
+    /// multi-row kernel, so a multi-row head goes through dequant + cuBLAS — but in output-row tiles
+    /// bounded by the scratch the layers already use (<see cref="CudaWideProjection"/>), not as one
+    /// whole <c>[vocab, hidden]</c> F16 copy (~1 GiB for a 248k vocabulary at hidden 2048).
+    /// </summary>
+    private void GemmLmHead(nint weight, QuantizationType qt, nint x, nint y, int m, int k, int seqLen)
+    {
+        long bound = Math.Max(_dequantScratchElems, CudaWideProjection.TileFloorElems);
+        if (seqLen == 1 || (long)m * k <= bound || !CudaWideProjection.SupportsRowTiles(qt)
+            || CudaWideProjection.BoundedLmHeadOverride == false)
+        {
+            Gemm(weight, qt, x, y, m, k, seqLen);
+            return;
+        }
+
+        int tileRows = CudaWideProjection.TileRows(m, k, bound);
+        if (!_warnedLmHeadTiled)
+        {
+            _warnedLmHeadTiled = true;
+            Console.Error.WriteLine(
+                $"[dotLLM.Cuda] LM head ({qt}) has no packed multi-row kernel: {seqLen}-row logits dequantize it in " +
+                $"{(m + tileRows - 1) / tileRows} tiles of {(long)tileRows * k * sizeof(ushort) >> 20} MiB F16 " +
+                $"instead of one {(long)m * k * sizeof(ushort) >> 20} MiB copy (issue #1099).");
+        }
+        nint streamH = _stream.Handle;
+        int activInElems = checked(seqLen * k);
+        int activOutElems = checked(seqLen * m);
+        EnsureActivF16InScratch(activInElems);
+        EnsureActivF16OutScratch(activOutElems);
+        EnsureDequantScratchF16Weight((long)tileRows * k);
+        _kernels.LaunchConvertF32ToF16(x, _activF16InScratch, activInElems, streamH);
+        _lmHeadDequantTiles += CudaWideProjection.RunTiled(_kernels, _cublas.Handle, weight, qt,
+            _activF16InScratch, _activF16OutScratch, f32Out: false, m, k, seqLen,
+            _dequantScratchF16Weight, tileRows, streamH);
+        _kernels.LaunchConvertF16ToF32(_activF16OutScratch, y, activOutElems, streamH);
+    }
+
+    /// <summary>Test hook (issue #1099): LM-head dequant tiles launched since the model was created.</summary>
+    internal int LmHeadDequantTiles => _lmHeadDequantTiles;
 
     /// <summary>Device bytes currently held by the F16 weight-dequant scratch (issue #495).</summary>
     public long DequantScratchF16WeightBytes => _dequantScratchElems * sizeof(ushort);

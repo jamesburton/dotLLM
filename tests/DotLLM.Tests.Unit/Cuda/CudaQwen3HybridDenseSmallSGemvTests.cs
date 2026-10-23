@@ -93,10 +93,26 @@ public sealed class CudaQwen3HybridDenseSmallSGemvTests : IDisposable
         Assert.True(model.PQ2_0Dp4aAvailable, "pq2_0_gemv_dp4a.ptx present but the dp4a module did not load (stale PTX?)");
 
         string label = folded ? "folded fixture" : "fixture";
+
+        // The S = 3 forward's attention takes #962's head_dim-256 tensor-core flash prefill (F16 Q.K and P.V),
+        // the S = 1 forwards the F32 decode kernel: a by-design trunk difference (~4e-4 in these logits) that the int8-per-32
+        // activation rounding amplifies into independent quantization noise (see the Bonsai test's remarks).
+        // That is not what this test measures, so the arms below pin both widths to the same attention kernel;
+        // the remaining S = 3 vs S = 1 difference is then the projections' alone. The flash-on drift is logged.
+        model.FlashPrefillHd256ForTest = true;
+        Dp4aArms flashArms = RunDp4aArms(model, config.VocabSize, Prompt, Continuation);
+        _out.WriteLine($"{label}: with the flash prefill on, max|dp4a S=3 - 3x S=1| {MaxAbsDiff(flashArms.Dp4aSingles, flashArms.Dp4aBatched):E3}, " +
+                       $"F16 {MaxAbsDiff(flashArms.F16Singles, flashArms.F16Batched):E3} (not asserted: different attention kernels)");
+        model.FlashPrefillHd256ForTest = false;
         Dp4aArms arms = RunDp4aArms(model, config.VocabSize, Prompt, Continuation);
         AssertDp4aStructure(arms, label);
 
-        AssertRowsMatch(arms.Dp4aSingles, arms.Dp4aBatched, absTol: 2e-3f, relTol: 1e-2f, $"{label}: dp4a S=3 vs dp4a 3x S=1");
+        // With one attention kernel at both widths every other trunk kernel and the dp4a GEMV are S-independent, so the
+        // S = 3 forward is bit-identical to three S = 1 forwards — exact, which is stricter than the old drift tolerance.
+        Assert.True(BitwiseEqual(arms.Dp4aSingles, arms.Dp4aBatched),
+            $"{label}: dp4a S=3 differs from dp4a 3x S=1 (max|diff| {MaxAbsDiff(arms.Dp4aSingles, arms.Dp4aBatched):E3}) with the same attention kernel");
+        Assert.True(BitwiseEqual(arms.F16Singles, arms.F16Batched),
+            $"{label}: F16 S=3 differs from F16 3x S=1 (max|diff| {MaxAbsDiff(arms.F16Singles, arms.F16Batched):E3}) with the same attention kernel");
         float dp4aVsF16 = MaxAbsDiff(arms.F16Singles, arms.Dp4aSingles);
         _out.WriteLine($"{label}: dp4a vs F16 (S=1 arms): max|diff| {dp4aVsF16:E3}");
         AssertArgMaxWhereClear(arms.F16Singles, arms.Dp4aSingles, dp4aVsF16, $"{label}: dp4a vs F16 S=1");
