@@ -397,6 +397,14 @@ public static unsafe class CudaMoeFfn
             //    down[batch, hidden] = silu[batch, I] × W2[hidden, I]^T
             //    K=intermediate may not be 256-aligned (V2-Lite intermediate=1408)
             //    so down keeps using the dequant fallback. No grouped variant yet.
+            //    The packed Q4_0 x Q8_1 projection (LFM2) stores each block sum d * sum(q) in F16, which overflows once a
+            //    row's max|x| passes ~2047 (Flint's routed SwiGLU output reaches ~1.3e4). Mirror the CPU guard (#1158,
+            //    llama.cpp build_amax_src1_f16): rows above 1024 are divided by a power of two and the output multiplied
+            //    back, which is exact. The other quantized paths keep integer sums or F32 activations and need no guard.
+            bool downRescale = packedQ4Projection is not null && weights.Precision == MoePrecision.Quantized
+                && weights.DownProjQuantType == QuantizationType.Q4_0;
+            if (downRescale)
+                kernels.LaunchMoePow2RescaleRows(scratch.SiluBatch, scratch.DownRowScale, batch, I, stream);
             ProjectF32OrQuant(weights.Precision, cublasHandle, kernels, stream,
                 scratch.SiluBatch, batch, K: I, M: hidden,
                 weightF32: weights.DownProj[e],
@@ -404,6 +412,8 @@ public static unsafe class CudaMoeFfn
                 dequantF16: scratch.DequantF16, dequantF32: scratch.DequantF32,
                 gemvInputF16: scratch.GemvInputF16, gemvOutputF16: scratch.GemvOutputF16,
                 outputF32: scratch.DownBatch, packedQ4Projection: packedQ4Projection);
+            if (downRescale)
+                kernels.LaunchMoeScaleRows(scratch.DownBatch, scratch.DownRowScale, batch, hidden, stream);
             if (weights.DownExpsBiasF32 != 0)
                 kernels.LaunchMoeGateBiasAddF32(
                     scratch.DownBatch, weights.DownExpsBiasF32 + (nint)((long)e * hidden * sizeof(float)),
@@ -950,6 +960,7 @@ public sealed unsafe class CudaMoeScratch : IDisposable
     private nint _upBatch;           // [seqLen * topK, I]   F32
     private nint _siluBatch;         // [seqLen * topK, I]   F32
     private nint _downBatch;         // [seqLen * topK, hidden] F32
+    private nint _downRowScale;      // [seqLen * topK]      F32 (power-of-two down-input factors, #1172)
     private nint _sharedGateBatch;   // [seqLen, sI]         F32
     private nint _sharedUpBatch;
     private nint _sharedSiluBatch;
@@ -1004,6 +1015,7 @@ public sealed unsafe class CudaMoeScratch : IDisposable
     internal nint UpBatch => _upBatch;
     internal nint SiluBatch => _siluBatch;
     internal nint DownBatch => _downBatch;
+    internal nint DownRowScale => _downRowScale;
     internal nint SharedGateBatch => _sharedGateBatch;
     internal nint SharedUpBatch => _sharedUpBatch;
     internal nint SharedSiluBatch => _sharedSiluBatch;
@@ -1057,6 +1069,7 @@ public sealed unsafe class CudaMoeScratch : IDisposable
         _upBatch = AllocF32(maxBatch * _capI);
         _siluBatch = AllocF32(maxBatch * _capI);
         _downBatch = AllocF32(maxBatch * _capHidden);
+        _downRowScale = AllocF32(maxBatch);
 
         if (hasShared)
         {
@@ -1165,7 +1178,7 @@ public sealed unsafe class CudaMoeScratch : IDisposable
         FreeIf(ref _tokenIndices); FreeIf(ref _singleTokenScratch);
         FreeIf(ref _gatheredInput);
         FreeIf(ref _gateBatch); FreeIf(ref _upBatch);
-        FreeIf(ref _siluBatch); FreeIf(ref _downBatch);
+        FreeIf(ref _siluBatch); FreeIf(ref _downBatch); FreeIf(ref _downRowScale);
         FreeIf(ref _sharedGateBatch); FreeIf(ref _sharedUpBatch);
         FreeIf(ref _sharedSiluBatch); FreeIf(ref _sharedDownBatch);
         FreeIf(ref _sharedScale);

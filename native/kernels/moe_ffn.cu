@@ -279,6 +279,45 @@ extern "C" __global__ void __launch_bounds__(128) moe_sigmoid_topk_f32(
     }
 }
 
+// ── moe_pow2_rescale_rows_f32 / moe_scale_rows_f32 ──────────────────────────
+//
+// F16-safe MoE down input for Q8_1 paths that store the block sum d * sum(q) in F16 (#1172, mirrors the CPU
+// MoeSwiGluMlp.RescaleDownInputForF16Sums from #1158 and llama.cpp build_amax_src1_f16): a row whose max|x| exceeds
+// 1024 is divided by 2^k, k = clamp(ceil(log2(amax / 1024)), 0, 127), and factors[row] = 2^k is multiplied back into
+// the projected row by moe_scale_rows_f32. Power-of-two scaling is exact, so untouched rows (factor 1) are bit-identical.
+// One block (256 threads) per row.
+extern "C" __global__ void __launch_bounds__(256) moe_pow2_rescale_rows_f32(
+    float* __restrict__ x, float* __restrict__ factors, const int n)
+{
+    __shared__ float s_max[8];
+    float* row = x + (size_t)blockIdx.x * n;
+    float a = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) a = fmaxf(a, fabsf(row[i]));
+    for (int off = 16; off > 0; off >>= 1) a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFF, a, off));
+    if ((threadIdx.x & 31) == 0) s_max[threadIdx.x >> 5] = a;
+    __syncthreads();
+    a = s_max[0];
+    for (int w = 1; w < (int)(blockDim.x >> 5); w++) a = fmaxf(a, s_max[w]);
+    if (!(a > 1024.0f))
+    {
+        if (threadIdx.x == 0) factors[blockIdx.x] = 1.0f;
+        return;
+    }
+    int k = (int)ceilf(log2f(a / 1024.0f));
+    k = k < 0 ? 0 : (k > 127 ? 127 : k);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) row[i] = ldexpf(row[i], -k);
+    if (threadIdx.x == 0) factors[blockIdx.x] = ldexpf(1.0f, k);
+}
+
+extern "C" __global__ void __launch_bounds__(256) moe_scale_rows_f32(
+    float* __restrict__ y, const float* __restrict__ factors, const int n)
+{
+    float f = factors[blockIdx.x];
+    if (f == 1.0f) return;
+    float* row = y + (size_t)blockIdx.x * n;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) row[i] *= f;
+}
+
 // ── moe_renorm_topk_f32 ──────────────────────────────────────────────────
 //
 // In-place per-token renormalisation of the top-k weights so they sum to 1.0

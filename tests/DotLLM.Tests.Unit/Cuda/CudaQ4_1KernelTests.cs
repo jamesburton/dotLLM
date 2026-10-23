@@ -157,7 +157,76 @@ public sealed unsafe class CudaQ4_1KernelTests
         Assert.Equal(18, idx[topK + 1]);
     }
 
+    /// <summary>
+    /// The CUDA mirror of the CPU's F16-safe MoE down input (#1158): the LFM2 packed Q4_0 x Q8_1 GEMM stores each block
+    /// sum in F16, so a ~2e5 SwiGLU row turns into inf without the power-of-two rescale and matches the reference with it.
+    /// Also pins the threshold (1024 untouched, 1025 halved) and that the round trip is exact.
+    /// </summary>
+    [SkippableFact]
+    public void Pow2DownRescale_KeepsPackedQ4_0Q8_1Finite_AndIsExact()
+    {
+        using var g = Gpu.Open();
+        const int rows = 64, k = 512;
+        var rng = new Random(17);
+        var wf = new float[rows * k];
+        for (int i = 0; i < wf.Length; i++) wf[i] = (float)(rng.NextDouble() * 2 - 1) * 0.05f;
+        byte[] q4 = EncodeQ4_0(wf);
+        var deq = new float[wf.Length];
+        fixed (byte* p = q4) Dequantize.ToFloat32((nint)p, wf.Length, QuantizationType.Q4_0, deq);
+        var x = RandomActivations(1, k, seed: 3, scale: 2e5f);
+
+        using var lfm = new DotLLM.Cuda.Architectures.CudaLfm2Kernels(g.PtxDir);
+        nint dW = g.Upload(q4), dQ = g.Alloc(k / 32 * 36), dY = g.Alloc(rows * 4), dF = g.Alloc(4);
+
+        nint dX = g.UploadFloat(x);
+        lfm.QuantizeQ8(dX, dQ, k / 32, g.S.Handle);
+        lfm.GemmQ4Q8(dW, dQ, dY, rows, k, 1, g.S.Handle);
+        g.S.Synchronize();
+        Assert.Contains(g.DownloadFloat(dY, rows), v => !float.IsFinite(v));   // the hazard is real
+
+        dX = g.UploadFloat(x);
+        g.K.LaunchMoePow2RescaleRows(dX, dF, 1, k, g.S.Handle);
+        lfm.QuantizeQ8(dX, dQ, k / 32, g.S.Handle);
+        lfm.GemmQ4Q8(dW, dQ, dY, rows, k, 1, g.S.Handle);
+        g.K.LaunchMoeScaleRows(dY, dF, 1, rows, g.S.Handle);
+        g.S.Synchronize();
+        float[] y = g.DownloadFloat(dY, rows);
+        Assert.All(y, v => Assert.True(float.IsFinite(v)));
+        AssertClose(Reference(new Q4_1Matrix(q4, deq), x, 1, rows, k), y, relTol: 2e-2, "q4_0 x q8_1 with rescale");
+
+        // Threshold and exactness: 1024 stays, 1025 -> /2, and scaling back reproduces the input bit for bit.
+        float[] probe = [1024f, -3.5f, 1025f, 0.1f];
+        nint dP = g.UploadFloat(probe), dPf = g.Alloc(8);
+        g.K.LaunchMoePow2RescaleRows(dP, dPf, 2, 2, g.S.Handle);
+        g.S.Synchronize();
+        Assert.Equal([1f, 2f], g.DownloadFloat(dPf, 2));
+        Assert.Equal([1024f, -3.5f, 512.5f, 0.05f], g.DownloadFloat(dP, 4));
+        g.K.LaunchMoeScaleRows(dP, dPf, 2, 2, g.S.Handle);
+        g.S.Synchronize();
+        Assert.Equal(probe, g.DownloadFloat(dP, 4));
+    }
+
     // ── helpers ──
+
+    /// <summary>ggml block_q4_0: f16 d, 16 bytes of nibbles (element j low, j + 16 high); x = (q - 8) * d.</summary>
+    private static byte[] EncodeQ4_0(float[] data)
+    {
+        var bytes = new byte[data.Length / 32 * 18];
+        for (int b = 0; b < data.Length / 32; b++)
+        {
+            var x = data.AsSpan(b * 32, 32);
+            float amax = 0, max = 0;
+            foreach (float v in x) if (MathF.Abs(v) > amax) { amax = MathF.Abs(v); max = v; }
+            float d = max / -8f, id = d != 0 ? 1f / d : 0f;
+            BitConverter.TryWriteBytes(bytes.AsSpan(b * 18, 2), (Half)d);
+            for (int j = 0; j < 16; j++)
+            {
+                int lo = Math.Min(15, (int)(x[j] * id + 8.5f)), hi = Math.Min(15, (int)(x[j + 16] * id + 8.5f));
+                bytes[b * 18 + 2 + j] = (byte)(lo | (hi << 4));
+            }
+        }
+        return bytes;
+    }
 
     private sealed record Q4_1Matrix(byte[] Bytes, float[] Dequant);
 
@@ -215,13 +284,14 @@ public sealed unsafe class CudaQ4_1KernelTests
         private CudaContext? _ctx;
         public CudaStream S { get; private set; } = null!;
         public CudaKernels K { get; private set; } = null!;
+        public string PtxDir { get; private set; } = "";
 
         public static Gpu Open()
         {
             Skip.IfNot(DriverPresent(), "No CUDA GPU available");
             string? ptx = FindPtxDir();
             Skip.If(ptx is null, "PTX files not found");
-            var g = new Gpu { _ctx = CudaContext.Create(0) };
+            var g = new Gpu { _ctx = CudaContext.Create(0), PtxDir = ptx! };
             g.S = CudaStream.Create();
             g.K = new CudaKernels(ptx!);
             Skip.IfNot(g.K.HasQuantizedGemvKernel(QuantizationType.Q4_1), "Q4_1 GEMV not loaded (PTX may be stale)");

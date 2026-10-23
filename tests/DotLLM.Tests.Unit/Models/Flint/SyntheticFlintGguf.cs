@@ -42,6 +42,12 @@ internal static class SyntheticFlintGguf
 
         /// <summary>Attention / dense projection type (real Flint: Q4_1).</summary>
         public QuantizationType DenseQuant { get; init; } = QuantizationType.F32;
+
+        /// <summary>
+        /// Store every quantised tensor as F32 holding its exact dequantised values (same RNG stream, same weights): an
+        /// exact-arithmetic oracle for a backend that runs the quantised file (#1172).
+        /// </summary>
+        public bool F32Roundtrip { get; init; }
     }
 
     public static byte[] Build(Options? options = null)
@@ -49,6 +55,7 @@ internal static class SyntheticFlintGguf
         options ??= new Options();
         var rng = new Random(options.Seed);
         var w = new GgufWriter();
+        s_roundtrip = options.F32Roundtrip;
         const string arch = "flint";
         int headDim = options.HeadDim;
         w.AddString("general.architecture", arch);
@@ -126,6 +133,8 @@ internal static class SyntheticFlintGguf
         return w.Build();
     }
 
+    [ThreadStatic] private static bool s_roundtrip;
+
     private static double Gauss(Random r)
     {
         double u1 = 1.0 - r.NextDouble(), u2 = r.NextDouble();
@@ -138,14 +147,27 @@ internal static class SyntheticFlintGguf
     {
         var f = new float[(long)inK * outM];
         for (long i = 0; i < f.Length; i++) f[i] = (float)(Gauss(rng) * std);
-        w.AddTensor(name, [inK, outM], (uint)qt, Encode(f, inK, qt));
+        AddEncoded(w, name, [inK, outM], f, inK, qt);
     }
 
     private static void Bank(GgufWriter w, Random rng, string name, int inK, int outM, float std, QuantizationType qt)
     {
         var f = new float[(long)inK * outM * Experts];
         for (long i = 0; i < f.Length; i++) f[i] = (float)(Gauss(rng) * std);
-        w.AddTensor(name, [inK, outM, Experts], (uint)qt, Encode(f, inK, qt));
+        AddEncoded(w, name, [inK, outM, Experts], f, inK, qt);
+    }
+
+    private static unsafe void AddEncoded(GgufWriter w, string name, int[] shape, float[] f, int inK, QuantizationType qt)
+    {
+        byte[] bytes = Encode(f, inK, qt);
+        if (s_roundtrip && qt != QuantizationType.F32)
+        {
+            var deq = new float[f.Length];
+            fixed (byte* p = bytes) DotLLM.Cpu.Kernels.Dequantize.ToFloat32((nint)p, f.Length, qt, deq);
+            w.AddTensor(name, shape, (uint)QuantizationType.F32, Bytes(deq));
+            return;
+        }
+        w.AddTensor(name, shape, (uint)qt, bytes);
     }
 
     private static unsafe byte[] Encode(float[] data, int rowElems, QuantizationType qt)

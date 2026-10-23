@@ -448,6 +448,8 @@ public sealed unsafe partial class CudaKernels : IDisposable
     private readonly nint _quantizedGemmQ4_1F32Func;
     private readonly nint _moeGroupedGemvQ4_1Func;
     private readonly nint _moeSigmoidTopkF32Func;
+    private readonly nint _moePow2RescaleRowsF32Func;
+    private readonly nint _moeScaleRowsF32Func;
     private readonly nint _moeGroupedGemvQ2_KFunc;
     private readonly nint _moeGroupedGemvQ4_KFunc;
     private readonly nint _moeGroupedGemvQ5_KFunc;
@@ -1205,6 +1207,8 @@ public sealed unsafe partial class CudaKernels : IDisposable
             _moeFfnModule = CudaModule.LoadFromFile(moeFfnPath);
             _moeSoftmaxTopkF32Func = _moeFfnModule.TryGetFunction("moe_softmax_topk_f32");
             _moeSigmoidTopkF32Func = _moeFfnModule.TryGetFunction("moe_sigmoid_topk_f32");
+            _moePow2RescaleRowsF32Func = _moeFfnModule.TryGetFunction("moe_pow2_rescale_rows_f32");
+            _moeScaleRowsF32Func = _moeFfnModule.TryGetFunction("moe_scale_rows_f32");
             _moeRenormTopkF32Func = _moeFfnModule.TryGetFunction("moe_renorm_topk_f32");
             _moeZeroF32Func = _moeFfnModule.TryGetFunction("moe_zero_f32");
             _moeAxpyScaledRowF32Func = _moeFfnModule.TryGetFunction("moe_axpy_scaled_row_f32");
@@ -7357,6 +7361,40 @@ public sealed unsafe partial class CudaKernels : IDisposable
         CudaDriverApi.cuLaunchKernel(_moeSoftmaxTopkF32Func,
                 (uint)seqLen, 1, 1, block, 1, 1,
                 sharedBytes, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Divides each row of <paramref name="x"/> whose max|x| exceeds 1024 by a power of two in place and writes the factor
+    /// to undo it (1 for untouched rows) to <paramref name="factors"/>: the F16-safe MoE down input of the CPU
+    /// (<c>MoeSwiGluMlp.RescaleDownInputForF16Sums</c>, #1158) for Q8_1 paths with F16 block sums. Undo with
+    /// <see cref="LaunchMoeScaleRows"/> on the projected rows.
+    /// </summary>
+    /// <param name="x">F32 rows <c>[rows, n]</c>, rescaled in place.</param>
+    /// <param name="factors">F32 <c>[rows]</c> output factors.</param>
+    /// <param name="rows">Row count.</param>
+    /// <param name="n">Row length.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchMoePow2RescaleRows(nint x, nint factors, int rows, int n, nint stream)
+        => LaunchRowKernel(_moePow2RescaleRowsF32Func, "moe_pow2_rescale_rows_f32", x, factors, rows, n, stream);
+
+    /// <summary>Multiplies each row of <paramref name="y"/> by <paramref name="factors"/>[row] (skips rows whose factor is 1).</summary>
+    /// <param name="y">F32 rows <c>[rows, n]</c>, scaled in place.</param>
+    /// <param name="factors">F32 <c>[rows]</c> factors from <see cref="LaunchMoePow2RescaleRows"/>.</param>
+    /// <param name="rows">Row count.</param>
+    /// <param name="n">Row length.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchMoeScaleRows(nint y, nint factors, int rows, int n, nint stream)
+        => LaunchRowKernel(_moeScaleRowsF32Func, "moe_scale_rows_f32", y, factors, rows, n, stream);
+
+    private void LaunchRowKernel(nint func, string name, nint a0, nint a1, int rows, int n, nint stream)
+    {
+        if (func == 0)
+            throw new InvalidOperationException($"{name} not available. Recompile native/kernels/moe_ffn.cu to PTX.");
+        if (rows <= 0) return;
+        nint p0 = a0, p1 = a1;
+        int nArg = n;
+        void** args = stackalloc void*[] { &p0, &p1, &nArg };
+        CudaDriverApi.cuLaunchKernel(func, (uint)rows, 1, 1, BlockSize, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
     }
 
     /// <summary>True when the sigmoid top-k router kernel is loaded (moe_ffn.cu, #1172).</summary>
