@@ -162,7 +162,7 @@ Differences between architectures are captured entirely in ModelConfig.
   overflowed to inf (then NaN, then an out-of-range expert index in the next layer's routing). The routed down projection now divides
   each input row by `e = 2^ceil(log2(max|row| / 1024))` and multiplies the projected row back (llama.cpp `build_amax_src1_f16`). A
   power of two is exact, so rows at or below 1024 are untouched; it applies to every architecture.
-- **KV**: the CPU caches allocate full context on every layer (no 513-token ring yet, #1157 F2), so use a short `--ctx-size`.
+- **KV**: sliding layers keep only their recent rows on CPU (compact sliding-window KV, #1169, `docs/KV_CACHE.md`): at 262K the 14 full layers dominate (~14 GiB F32, ~3.7 GiB with `--cache-type-k q8_0 --cache-type-v q8_0 --cache-window 0`).
 - **GPU**: CUDA and Vulkan refuse `flint` (`ModelConfig.FlintUnsupportedMessage`); bring-up is #1157 F4 (Vulkan) / F6 (CUDA).
 - Verification: `FlintSyntheticGoldenTests` writes a random-weight `flint` GGUF (GQA 8:2, Q wider than hidden, window 4 over 16 tokens,
   NoPE on a MoE layer, sinks everywhere, shared expert) and compares against llama.cpp CPU logits on the same bytes: F32 max |dlogit|

@@ -224,6 +224,34 @@ length-only `CudaHybridKvCacheHandle`. Per full-attention slot (16 of 64 layers 
     `numKvHeads * headDim` is not a multiple of 32.
 - `DOTLLM_HYBRID_VRAM_LEDGER=1` logs the model-owned KV/staging/scratch bytes once after the first attention call.
 
+### Compact sliding-window KV on CPU (issue #1169)
+
+A sliding-window layer with window `W` only ever reads the last `W` positions, so the CPU caches keep only those rows.
+
+- **Opt-in by geometry.** `KvGeometry.FromConfig(config, compactSlidingWindows: true)` marks each sliding-window slot with its
+  window (`ModelConfig.SlidingWindowOf(layer)`: `PerLayerSlidingWindow`, else `SlidingWindowSize` with `SlidingWindowPattern`).
+  The plain `FromConfig(config)` is unchanged. Callers pass `model.SupportsCompactSlidingKv`, which only `TransformerModel`
+  returns true for; other CPU models and GPU upload paths (`HybridPrefillDecodeStrategy.KeysSpan`) read rows by absolute
+  position and never see a compact cache. TextGenerator's default cache, `run` / `chat` / `serve` quantized factories, `bench`
+  and `perplexity` all pass it.
+- **Layout.** A windowed layer gets `2 * (W - 1 + 64)` rows. When an append would overflow, the last `W - 1 + 64` committed rows
+  move to the front and the layer's row base advances (`SlidingWindowRows`). A chunk larger than the buffer grows it for that
+  chunk; the next compaction that fits shrinks it back. Full layers are untouched.
+- **Attention.** `IWindowedKvCache.RowBaseOf(layer)` gives the position in row 0. Callers pass `positionOffset - base` and
+  `seqKv - base`: masks are relative, K is stored after RoPE and sinks have no position, so the kernels are unchanged and the
+  output is bit-identical to a full cache. The quantized kernel applies the base itself; `TransformerModel.AttendCachedF32`
+  does it for F32.
+- **Formats.** `SimpleKvCache` (F32) and `QuantizedKvCache` in pure mode (`--cache-window 0`, Q8_0 / Q4_0). The FP32
+  mixed-precision window mode keeps full rows (rule 1: do not grow FP32 windows). There is no F16 CPU KV yet (#1107).
+- **Rollback and prefix reuse.** The 64-row margin lets speculative rollback and prefix truncation step back that far.
+  `CanTruncateTo(length)` is false once a windowed layer has dropped rows a query at `length` needs; `Rollback` then throws and
+  the prompt cache treats the hit as a miss. Truncating to 0 always works. `SupportsExactF32PrefixCopy` is false.
+  `KvCacheCopy.CopyContents` copies a windowed layer from its row base.
+- **Savings.** At 262K context Flint (35 of 49 layers windowed at 513) needs ~14 GiB F32 / ~3.7 GiB Q8_0 for its 14 full layers
+  plus ~0.15 GiB / ~0.04 GiB for the windowed ones, against ~49 GiB / ~13 GiB with full rows everywhere.
+- Tests: `SlidingWindowKvCacheTests` (bit-identical attention through compactions, an oversized chunk, rollback in and past the
+  margin, F32 / Q8_0 / Q4_0). Real weights: `NemotronProbe swa` runs one stream through a full and a compact cache.
+
 ## Paged KV-Cache
 
 Inspired by OS virtual memory paging. This is the **memory management** half of PagedAttention (vLLM): block-based allocation, ref counting, CoW. The **kernel** half (attention reading non-contiguous blocks directly) is opt-in on CUDA as of issue #200 (`DOTLLM_ATTN_PAGED_NATIVE=1`, decode only — see the CUDA section below); it remains a future step for CPU and any future Vulkan paged cache, where current kernels still see contiguous buffers via staging-buffer gather.

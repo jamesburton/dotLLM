@@ -68,7 +68,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     /// Byte-identical to the uniform constructor for every dense/GQA/MoE model and supplies
     /// distinct per-layer strides for Gemma-4. This is the constructor
     /// <see cref="VulkanTransformerModel.CreateKvCache"/> uses (via
-    /// <see cref="KvGeometry.FromConfig"/>), so the per-layer-stride derivation lives in one
+    /// <see cref="KvGeometry.FromConfig(DotLLM.Core.Models.ModelConfig)"/>), so the per-layer-stride derivation lives in one
     /// place (Core) rather than being rebuilt inline.
     /// </summary>
     public VulkanKvCache(VulkanDevice device, KvGeometry geometry, int maxSeqLen)

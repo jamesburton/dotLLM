@@ -1494,7 +1494,9 @@ public sealed partial class TextGenerator
                 // Cache hit — reuse existing KV-cache, truncate to matched prefix
                 switch (entry.KvCache)
                 {
-                    case SimpleKvCache simpleCache:
+                    // A compact sliding-window cache (#1169) can only cut back while it still holds the rows the
+                    // next query needs; past that the hit is a miss.
+                    case SimpleKvCache simpleCache when simpleCache.CanTruncateTo(matchedTokens):
                         simpleCache.SetCurrentLength(matchedTokens);
                         break;
                     case KvCache.PagedKvCache pagedCache:
@@ -1541,7 +1543,7 @@ public sealed partial class TextGenerator
             // (NumLayers, NumKvHeads, HeadDim) form for every uniform model and
             // supplies distinct per-layer strides for Gemma-4 (sliding vs global).
             : new SimpleKvCache(
-                Core.Attention.KvGeometry.FromConfig(_model.Config),
+                Core.Attention.KvGeometry.FromConfig(_model.Config, _model.SupportsCompactSlidingKv),
                 cacheSize);
     }
 
@@ -2079,7 +2081,7 @@ public sealed partial class TextGenerator
             return _draftKvCacheFactory(_draftModel!.Config, cacheSize);
 
         return new SimpleKvCache(
-            Core.Attention.KvGeometry.FromConfig(_draftModel!.Config),
+            Core.Attention.KvGeometry.FromConfig(_draftModel!.Config, _draftModel.SupportsCompactSlidingKv),
             cacheSize);
     }
 

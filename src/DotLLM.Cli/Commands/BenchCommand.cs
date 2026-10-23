@@ -270,7 +270,7 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
                     // THE shared per-architecture CPU dispatch (#135) — routes hybrid
                     // architectures (Nemotron-H, Qwen3MoeHybrid) to their dedicated loaders.
                     model = ModelLoader.CreateCpuModelFromGguf(gguf, config, threading);
-                    kvFactory = size => new SimpleKvCache(KvGeometry.FromConfig(config), size);
+                    kvFactory = size => new SimpleKvCache(KvGeometry.FromConfig(config, model.SupportsCompactSlidingKv), size);
                     deviceLabel = $"cpu-{threading.EffectiveThreadCount}t";
                     break;
 

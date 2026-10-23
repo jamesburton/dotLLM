@@ -354,7 +354,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         bool returnsAllRows = BackendPerplexityModel.Probe(model, forwardDeviceId, effectiveContext + 1);
         if (kvKeyDType is not null)
         {
-            var geom = KvGeometry.FromConfig(config);
+            var geom = KvGeometry.FromConfig(config, model.SupportsCompactSlidingKv);
             if (kvKeyDType == KvCacheDType.F32)
             {
                 kvCache = new SimpleKvCache(geom, effectiveContext);

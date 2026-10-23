@@ -103,6 +103,74 @@ internal static class Program
             }
             return 0;
         }
+        if (args[0] == "swa")
+        {
+            // swa <gguf> <ids-file> <promptLen> <chunk> [q8_0]: compact sliding-window KV (#1169) vs full-history KV on the
+            // same stream: prefill ids[0..promptLen) in chunks, then teacher-force the rest one token at a time. Logits of
+            // every chunk's last row and every decode step must be identical; prints KV bytes of both caches.
+            int[] sid = File.ReadAllText(args[2]).Split(new[] { ' ', '\n', '\r', ',', '[', ']' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(int.Parse).ToArray();
+            int promptLen = int.Parse(args[3]), chunk = int.Parse(args[4]);
+            bool q8 = args.Length > 5 && args[5] == "q8_0";
+            using var ms = ModelLoader.CreateCpuModelFromGguf(gguf, config, new ThreadingConfig(0));
+            int v = config.VocabSize, n = sid.Length;
+            DotLLM.Core.Attention.IKvCache Make(bool compact)
+            {
+                var g = DotLLM.Core.Attention.KvGeometry.FromConfig(config, compact);
+                return q8
+                    ? new DotLLM.Engine.KvCache.QuantizedKvCache(g, n + 8, KvCacheDType.Q8_0, KvCacheDType.Q8_0, 0)
+                    : new DotLLM.Engine.KvCache.SimpleKvCache(g, n + 8);
+            }
+            static long Bytes(DotLLM.Core.Attention.IKvCache c) => c switch
+            {
+                DotLLM.Engine.KvCache.SimpleKvCache s => s.AllocatedBytes,
+                DotLLM.Engine.KvCache.QuantizedKvCache q => q.AllocatedBytes,
+                _ => -1,
+            };
+            float[] Run(DotLLM.Core.Attention.IKvCache kv, out double seconds)
+            {
+                var sw = Stopwatch.StartNew();
+                var rows = new List<float>();
+                void Take(DotLLM.Core.Tensors.ITensor lg) { unsafe { rows.AddRange(new ReadOnlySpan<float>((float*)lg.DataPointer + (lg.ElementCount / v - 1) * v, v).ToArray()); } }
+                for (int p = 0; p < promptLen; p += chunk)
+                {
+                    int len = Math.Min(chunk, promptLen - p);
+                    using var lg = ms.Forward(sid.AsSpan(p, len), Enumerable.Range(p, len).ToArray(), -1, kv, lastTokenLogitsOnly: true);
+                    Take(lg);
+                }
+                for (int i = promptLen; i < n; i++)
+                {
+                    using var lg = ms.Forward(sid.AsSpan(i, 1), new[] { i }, -1, kv);
+                    Take(lg);
+                }
+                seconds = sw.Elapsed.TotalSeconds;
+                return rows.ToArray();
+            }
+            using var kvFull = Make(false);
+            using var kvCompact = Make(true);
+            var a = Run(kvFull, out double ta);
+            var b = Run(kvCompact, out double tb);
+            int steps = a.Length / v, flips = 0, firstDiff = -1;
+            double maxAbs = 0;
+            for (int s = 0; s < steps; s++)
+            {
+                var ra = a.AsSpan(s * v, v); var rb = b.AsSpan(s * v, v);
+                for (int t = 0; t < v; t++)
+                {
+                    double d = Math.Abs(ra[t] - rb[t]);
+                    if (d > 0 && firstDiff < 0) firstDiff = s;
+                    maxAbs = Math.Max(maxAbs, d);
+                }
+                if (ra.IndexOf(System.Linq.Enumerable.Max(ra.ToArray())) != rb.IndexOf(System.Linq.Enumerable.Max(rb.ToArray()))) flips++;
+            }
+            var wk = (DotLLM.Core.Attention.IWindowedKvCache)kvCompact;
+            int baseL = Enumerable.Range(0, config.NumLayers).Max(wk.RowBaseOf);
+            Console.WriteLine($"swa: n={n} prompt={promptLen} chunk={chunk} kv={(q8 ? "q8_0" : "f32")} steps={steps} identical={maxAbs == 0} "
+                + $"maxAbsLogitDiff={maxAbs:E3} firstDiffStep={firstDiff} top1Flips={flips}");
+            Console.WriteLine($"swa: KV bytes full={Bytes(kvFull) / 1048576.0:F1} MiB compact={Bytes(kvCompact) / 1048576.0:F1} MiB; "
+                + $"max row base={baseL}; time full={ta:F0}s compact={tb:F0}s");
+            return maxAbs == 0 ? 0 : 1;
+        }
         if (args[0] == "forced")
         {
             // forced <gguf> <ids-file> <promptLen> [cpu|vulkan]: teacher-forced top-1 agreement over positions promptLen-1..n-2
