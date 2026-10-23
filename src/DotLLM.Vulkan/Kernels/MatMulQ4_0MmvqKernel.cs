@@ -39,6 +39,19 @@ public sealed class MatMulQ4_0MmvqKernel : IDisposable
     /// <summary>True when this instance runs the V2 shader.</summary>
     public bool IsV2 { get; private set; }
 
+    /// <summary>The legacy 4-bit format this instance reads: <see cref="QuantizationType.Q4_0"/> (18 B blocks) or
+    /// <see cref="QuantizationType.Q4_1"/> (20 B blocks, issue #1171: same kernel shape, value <c>d * nibble + m</c>).</summary>
+    public QuantizationType Quant { get; private init; } = QuantizationType.Q4_0;
+
+    private int BlockBytes => Quant == QuantizationType.Q4_1 ? QuantFormat.Q4_1BlockBytes : QuantFormat.Q4_0BlockBytes;
+
+    private static string ShaderFor(string q4_0Name, QuantizationType quant) => quant switch
+    {
+        QuantizationType.Q4_0 => q4_0Name,
+        QuantizationType.Q4_1 => q4_0Name.Replace("q4_0", "q4_1", StringComparison.Ordinal),
+        _ => throw new ArgumentOutOfRangeException(nameof(quant), quant, "Only Q4_0 and Q4_1 are served by this kernel."),
+    };
+
     private MatMulQ4_0MmvqKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
     {
         _device = device;
@@ -48,15 +61,20 @@ public sealed class MatMulQ4_0MmvqKernel : IDisposable
         _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 4);
     }
 
-    /// <summary>Loads <c>matmul_q4_0_mmvq.spv</c>; null when the SPV is missing or the device
+    /// <summary>Loads <c>matmul_q4_0_mmvq[_v2].spv</c> (Q4_1: <c>matmul_q4_1_mmvq_v2.spv</c>, V2 only); null when the SPV is missing or the device
     /// lacks integer-dot-product support.</summary>
-    public static MatMulQ4_0MmvqKernel? TryCreate(VulkanDevice device, string spvDir, bool? v2 = null)
+    /// <param name="device">Vulkan device.</param>
+    /// <param name="spvDir">Directory holding the SPIR-V blobs.</param>
+    /// <param name="v2">Shader generation override (null = <see cref="V2Default"/>; ignored for Q4_1, which has only V2).</param>
+    /// <param name="quant"><see cref="QuantizationType.Q4_0"/> (default) or <see cref="QuantizationType.Q4_1"/>.</param>
+    /// <returns>The kernel, or null.</returns>
+    public static MatMulQ4_0MmvqKernel? TryCreate(VulkanDevice device, string spvDir, bool? v2 = null, QuantizationType quant = QuantizationType.Q4_0)
     {
         if (!device.HasIntegerDotProduct)
             return null;
 
-        bool wantV2 = v2 ?? V2Default;
-        string path = Path.Combine(spvDir, wantV2 ? "matmul_q4_0_mmvq_v2.spv" : "matmul_q4_0_mmvq.spv");
+        bool wantV2 = quant == QuantizationType.Q4_1 || (v2 ?? V2Default);
+        string path = Path.Combine(spvDir, ShaderFor(wantV2 ? "matmul_q4_0_mmvq_v2.spv" : "matmul_q4_0_mmvq.spv", quant));
         if (!File.Exists(path))
             return null;
 
@@ -84,7 +102,7 @@ public sealed class MatMulQ4_0MmvqKernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
-        return new MatMulQ4_0MmvqKernel(device, module, pipeline, pool) { IsV2 = wantV2 };
+        return new MatMulQ4_0MmvqKernel(device, module, pipeline, pool) { IsV2 = wantV2, Quant = quant };
     }
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
@@ -103,7 +121,7 @@ public sealed class MatMulQ4_0MmvqKernel : IDisposable
             throw new ArgumentException($"k must be a multiple of {Q4_0GroupSize}, got {k}", nameof(k));
 
         int blocksPerRow = k / Q4_0GroupSize;
-        long rowBytes = (long)blocksPerRow * Q4_0BlockBytes;
+        long rowBytes = (long)blocksPerRow * BlockBytes;
 
         if (weights.Size < (long)m * rowBytes)
             throw new ArgumentException("Weights buffer too small.", nameof(weights));

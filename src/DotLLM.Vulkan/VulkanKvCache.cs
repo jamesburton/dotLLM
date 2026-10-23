@@ -7,7 +7,7 @@ namespace DotLLM.Vulkan;
 
 /// <summary>
 /// Vulkan-side KV cache. Per-layer device-local buffers of shape
-/// <c>[maxSeqLen, numKvHeads * headDim]</c> FP32. The host never touches
+/// <c>[maxSeqLen, numKvHeads * headDim]</c>, FP32 or (issue #1171) FP16 (<see cref="Storage"/>). The host never touches
 /// cached K/V — updates are recorded as <c>vkCmdCopyBuffer</c> from the
 /// host-visible activation buffers to the device-local cache, either
 /// synchronously (legacy <see cref="UpdateDevice"/>) or appended to a caller-
@@ -44,6 +44,8 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     // and global layers carry different KV-head counts AND head dims (e.g. sliding
     // 8×256 vs global 2×512) — so each layer's cached K/V row is a different width.
     private readonly int[] _kvStride;
+    private readonly VulkanKvStorage _storage;
+    private readonly int _elemBytes;
     private int _currentLength;
     private bool _disposed;
 
@@ -52,6 +54,23 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
 
     /// <inheritdoc/>
     public int MaxLength => _maxSeqLen;
+
+    /// <summary>
+    /// Element format of the cached rows. <see cref="VulkanKvStorage.F16"/> rows are written by the F16 convert kernel and read in place by the
+    /// <c>_kvf16</c> attention twins; only models that create those twins (Flint, issue #1171) accept such a cache.
+    /// </summary>
+    public VulkanKvStorage Storage => _storage;
+
+    /// <summary>Device bytes held by the K and V buffers of every layer.</summary>
+    public long AllocatedBytes
+    {
+        get
+        {
+            long total = 0;
+            for (int i = 0; i < _numLayers; i++) total += 2L * _maxSeqLen * _kvStride[i] * _elemBytes;
+            return total;
+        }
+    }
 
     /// <summary>
     /// Creates the per-layer K/V buffers with a UNIFORM <c>numKvHeads × headDim</c>
@@ -76,6 +95,16 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     {
     }
 
+    /// <summary>As <see cref="VulkanKvCache(VulkanDevice, KvGeometry, int)"/> with an explicit element format (issue #1171).</summary>
+    /// <param name="device">The device.</param>
+    /// <param name="geometry">Per-layer KV geometry.</param>
+    /// <param name="maxSeqLen">Positions per layer.</param>
+    /// <param name="storage">Element format of the cached rows.</param>
+    public VulkanKvCache(VulkanDevice device, KvGeometry geometry, int maxSeqLen, VulkanKvStorage storage)
+        : this(device, ExtractStrides(geometry), maxSeqLen, storage)
+    {
+    }
+
     private static int[] ExtractStrides(KvGeometry geometry)
     {
         var strides = new int[geometry.LayerCount];
@@ -90,7 +119,11 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     /// layer). Used by Gemma-4, whose sliding and global layers have different
     /// KV-head counts and head dims, so each layer's cached row is a different width.
     /// </summary>
-    public VulkanKvCache(VulkanDevice device, int[] kvStridePerLayer, int maxSeqLen)
+    /// <param name="device">The device.</param>
+    /// <param name="kvStridePerLayer">Per-layer row width in elements.</param>
+    /// <param name="maxSeqLen">Positions per layer.</param>
+    /// <param name="storage">Element format of the cached rows (F16 needs an even row width: two halves per word).</param>
+    public VulkanKvCache(VulkanDevice device, int[] kvStridePerLayer, int maxSeqLen, VulkanKvStorage storage = VulkanKvStorage.F32)
     {
         ArgumentNullException.ThrowIfNull(device);
         ArgumentNullException.ThrowIfNull(kvStridePerLayer);
@@ -101,6 +134,8 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         _numLayers = kvStridePerLayer.Length;
         _maxSeqLen = maxSeqLen;
         _kvStride = (int[])kvStridePerLayer.Clone();
+        _storage = storage;
+        _elemBytes = storage.ElementBytes();
 
         _keys = new VulkanDevice.Buffer[_numLayers];
         _values = new VulkanDevice.Buffer[_numLayers];
@@ -110,7 +145,9 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
             if (_kvStride[i] <= 0)
                 throw new ArgumentOutOfRangeException(nameof(kvStridePerLayer),
                     $"Per-layer KV stride must be positive; layer {i} = {_kvStride[i]}.");
-            long bytesPerLayer = (long)maxSeqLen * _kvStride[i] * sizeof(float);
+            if (storage == VulkanKvStorage.F16 && (_kvStride[i] & 1) != 0)
+                throw new ArgumentOutOfRangeException(nameof(kvStridePerLayer), $"An F16 KV row must hold an even element count; layer {i} = {_kvStride[i]}.");
+            long bytesPerLayer = (long)maxSeqLen * _kvStride[i] * _elemBytes;
             _keys[i] = device.AllocateDeviceLocal(bytesPerLayer);
             _values[i] = device.AllocateDeviceLocal(bytesPerLayer);
         }
@@ -146,6 +183,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     {
         if (positions.Length != seqLen)
             throw new ArgumentException("positions.Length must equal seqLen", nameof(positions));
+        RequireF32("UpdateDevice");
 
         int rowBytes = _kvStride[layerIndex] * sizeof(float);
 
@@ -191,10 +229,12 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     /// written cache rows), and for advancing <see cref="CurrentLength"/>
     /// after the batch commits.
     /// </summary>
+    /// <remarks>An F16 cache is written by <paramref name="f16Writer"/> (a compute dispatch: the caller's following barrier is compute to compute).</remarks>
     internal unsafe void RecordUpdate(
         nint cmdBuf,
         VulkanDevice.Buffer kDev, VulkanDevice.Buffer vDev,
-        ReadOnlySpan<int> positions, int seqLen, int layerIndex)
+        ReadOnlySpan<int> positions, int seqLen, int layerIndex,
+        Kernels.IVulkanKvF16Writer? f16Writer = null)
     {
         if (positions.Length != seqLen)
             throw new ArgumentException("positions.Length must equal seqLen", nameof(positions));
@@ -202,6 +242,18 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         int rowBytes = _kvStride[layerIndex] * sizeof(float);
         int maxPos = ValidateAndFindMaxPos(positions, seqLen);
         bool contiguous = IsContiguousAscending(positions);
+
+        if (_storage == VulkanKvStorage.F16)
+        {
+            // The F32 rows the projections produced are converted on the device; there is no copy-engine path for F16.
+            if (!contiguous || f16Writer is null)
+                throw new InvalidOperationException("An F16 KV cache is written by the convert kernel from contiguous positions only.");
+            long elemOffset = (long)positions[0] * _kvStride[layerIndex], count = (long)seqLen * _kvStride[layerIndex];
+            f16Writer.RecordF32ToF16(cmdBuf, kDev, _keys[layerIndex], elemOffset, count);
+            f16Writer.RecordF32ToF16(cmdBuf, vDev, _values[layerIndex], elemOffset, count);
+            if (maxPos + 1 > _currentLength) _currentLength = maxPos + 1;
+            return;
+        }
 
         // Hazard-scoped barriers (issue #144): declare the append's access set
         // (reads the fresh K/V activations, writes the per-layer cache rows)
@@ -364,6 +416,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     public unsafe void IngestFromHost(int layerIndex, int length,
         ReadOnlySpan<float> keys, ReadOnlySpan<float> values)
     {
+        RequireF32("IngestFromHost");
         if ((uint)layerIndex >= (uint)_numLayers)
             throw new ArgumentOutOfRangeException(nameof(layerIndex));
         if (length <= 0)
@@ -432,6 +485,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     /// <inheritdoc/>
     public void DownloadLayer(int layerIndex, Span<float> keys, Span<float> values)
     {
+        RequireF32("DownloadLayer");
         if ((uint)layerIndex >= (uint)_numLayers)
             throw new ArgumentOutOfRangeException(nameof(layerIndex));
         int count = _currentLength * _kvStride[layerIndex];
@@ -446,6 +500,13 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     /// <inheritdoc/>
     public void UploadLayer(int layerIndex, int length, ReadOnlySpan<float> keys, ReadOnlySpan<float> values)
         => IngestFromHost(layerIndex, length, keys, values);
+
+    // shortcut: the host-staged F32 transport (handoff, ingest) has no F16 arm yet; add one when an F16 model needs cross-device handoff.
+    private void RequireF32(string operation)
+    {
+        if (_storage != VulkanKvStorage.F32)
+            throw new NotSupportedException($"VulkanKvCache.{operation} moves F32 rows; this cache stores {_storage}.");
+    }
 
     private unsafe void MapAndCopy(VulkanDevice.Buffer staging, ReadOnlySpan<float> source)
     {

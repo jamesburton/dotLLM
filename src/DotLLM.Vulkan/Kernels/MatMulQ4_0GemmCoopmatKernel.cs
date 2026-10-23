@@ -39,6 +39,19 @@ public sealed class MatMulQ4_0GemmCoopmatKernel : IDisposable
     private readonly DescriptorSetCache _descriptorCache;
     private bool _disposed;
 
+    /// <summary>The legacy 4-bit format this instance reads: <see cref="QuantizationType.Q4_0"/> (18 B blocks) or
+    /// <see cref="QuantizationType.Q4_1"/> (20 B blocks, issue #1171: same kernel shape, value <c>d * nibble + m</c>).</summary>
+    public QuantizationType Quant { get; private init; } = QuantizationType.Q4_0;
+
+    private int BlockBytes => Quant == QuantizationType.Q4_1 ? QuantFormat.Q4_1BlockBytes : QuantFormat.Q4_0BlockBytes;
+
+    private static string ShaderFor(string q4_0Name, QuantizationType quant) => quant switch
+    {
+        QuantizationType.Q4_0 => q4_0Name,
+        QuantizationType.Q4_1 => q4_0Name.Replace("q4_0", "q4_1", StringComparison.Ordinal),
+        _ => throw new ArgumentOutOfRangeException(nameof(quant), quant, "Only Q4_0 and Q4_1 are served by this kernel."),
+    };
+
     private MatMulQ4_0GemmCoopmatKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
     {
         _device = device;
@@ -52,16 +65,24 @@ public sealed class MatMulQ4_0GemmCoopmatKernel : IDisposable
     /// Whether the kernel can run on <paramref name="device"/>: cooperative matrix present, native
     /// wave64, the SPIR-V compiled, and not disabled by <see cref="LegacyEnvVar"/>.
     /// </summary>
-    public static bool IsSupportedOn(VulkanDevice device, string spvDir)
+    /// <param name="device">Vulkan device.</param>
+    /// <param name="spvDir">Directory holding the SPIR-V blobs.</param>
+    /// <param name="quant"><see cref="QuantizationType.Q4_0"/> (default) or <see cref="QuantizationType.Q4_1"/>.</param>
+    /// <returns>True when <see cref="Create"/> will succeed and the kernel should be used.</returns>
+    public static bool IsSupportedOn(VulkanDevice device, string spvDir, QuantizationType quant = QuantizationType.Q4_0)
         => Environment.GetEnvironmentVariable(LegacyEnvVar) != "1"
            && device.HasCooperativeMatrix
            && device.SubgroupSize == 64
-           && File.Exists(Path.Combine(spvDir, SpvFileName));
+           && File.Exists(Path.Combine(spvDir, ShaderFor(SpvFileName, quant)));
 
     /// <summary>Loads the SPIR-V and creates the pipeline. Check <see cref="IsSupportedOn"/> first.</summary>
-    public static MatMulQ4_0GemmCoopmatKernel Create(VulkanDevice device, string spvDir)
+    /// <param name="device">Vulkan device.</param>
+    /// <param name="spvDir">Directory holding the SPIR-V blobs.</param>
+    /// <param name="quant"><see cref="QuantizationType.Q4_0"/> (default) or <see cref="QuantizationType.Q4_1"/>.</param>
+    /// <returns>The kernel.</returns>
+    public static MatMulQ4_0GemmCoopmatKernel Create(VulkanDevice device, string spvDir, QuantizationType quant = QuantizationType.Q4_0)
     {
-        string path = Path.Combine(spvDir, SpvFileName);
+        string path = Path.Combine(spvDir, ShaderFor(SpvFileName, quant));
         if (!File.Exists(path))
             throw new FileNotFoundException(
                 $"Vulkan SPIR-V not found: {path}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");
@@ -85,7 +106,7 @@ public sealed class MatMulQ4_0GemmCoopmatKernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
-        return new MatMulQ4_0GemmCoopmatKernel(device, module, pipeline, pool);
+        return new MatMulQ4_0GemmCoopmatKernel(device, module, pipeline, pool) { Quant = quant };
     }
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
@@ -122,7 +143,7 @@ public sealed class MatMulQ4_0GemmCoopmatKernel : IDisposable
             throw new ArgumentException($"k must be a multiple of {Q4_0GroupSize}, got {k}", nameof(k));
 
         int blocksPerRow = k / Q4_0GroupSize;
-        long rowBytes = (long)blocksPerRow * Q4_0BlockBytes;
+        long rowBytes = (long)blocksPerRow * BlockBytes;
         int rowUints = (int)((rowBytes + 3) / 4);
 
         if (weightsQ4_0.Size < (long)m * rowBytes)

@@ -214,15 +214,17 @@ public sealed class FlintSyntheticGoldenTests : IDisposable
     }
 
     [Fact]
-    public void Gpu_Backends_Refuse_Loudly()
+    public void Gpu_Backends_Admit_Flint()
     {
+        // Vulkan (#1171, F4) and CUDA (#1172, F6) both run flint on their single-device hosts.
         using var gguf = GgufFile.Open(Write());
         ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        DotLLM.Vulkan.VulkanTransformerModel.RejectUnsupportedArchitecture(cfg, allowGptOss: true);
+        DotLLM.Cuda.CudaTransformerModel.RejectUnsupportedArchitecture(cfg);
+
+        // The pipeline-parallel / hybrid Vulkan hosts wire none of it and must still refuse.
         var vk = Assert.Throws<NotSupportedException>(() => DotLLM.Vulkan.VulkanTransformerModel.RejectUnsupportedArchitecture(cfg));
-        Assert.Contains("Flint", vk.Message);
         Assert.Contains("issues/1157", vk.Message);
-        var cu = Assert.Throws<NotSupportedException>(() => DotLLM.Cuda.CudaTransformerModel.RejectUnsupportedArchitecture(cfg));
-        Assert.Contains("Flint", cu.Message);
     }
 
     [Fact]

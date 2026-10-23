@@ -120,6 +120,7 @@ internal sealed class VulkanForwardState : IDisposable
     public VulkanDevice.Buffer? MoeGroupDispatchArgs { get; private set; }  // 2 x (x, y, z) uint32 indirect-dispatch triples
     public VulkanDevice.Buffer? MoeExpertCounters { get; private set; } // [numExperts] uint32
     public VulkanDevice.Buffer? MoePermutation { get; private set; }    // [seqLen * topK] uint32
+    public VulkanDevice.Buffer? MoeRowScale { get; private set; }       // [seqLen * topK] F32 power-of-two down-input scale (#1171)
     public VulkanDevice.Buffer? MoeGroupedHidden { get; private set; }  // [seqLen * topK, hidden]
     public VulkanDevice.Buffer? MoeGroupedGateInter { get; private set; } // [seqLen * topK, intermediate]
     public VulkanDevice.Buffer? MoeGroupedUpInter { get; private set; } // [seqLen * topK, intermediate]
@@ -480,6 +481,7 @@ internal sealed class VulkanForwardState : IDisposable
         MoeGroupDispatchArgs = _device.AllocateDeviceLocal(2 * Kernels.MoeBuildTileListKernel.ArgsStrideBytes);
         MoeExpertCounters = _device.AllocateDeviceLocal(expertCountsBytes);
         MoePermutation = _device.AllocateDeviceLocal(routedRowsBytes);
+        MoeRowScale = _device.AllocateDeviceLocal(routedRowsBytes);
         MoeGroupedHidden = _device.AllocateDeviceLocal(expandedBytes);
         MoeGroupedGateInter = _device.AllocateDeviceLocal(interBytes);
         MoeGroupedUpInter = _device.AllocateDeviceLocal(interBytes);
@@ -487,7 +489,7 @@ internal sealed class VulkanForwardState : IDisposable
         long total = routerBytes + topkIdxBytes + topkWtBytes + expandedBytes
                    + interBytes * 3 + downBytes
                    + expertCountsBytes * 2 + expertOffsetsBytes + routedRowsBytes
-                   + expandedBytes + interBytes * 2;
+                   + expandedBytes + interBytes * 2 + routedRowsBytes;
 
         // Indexed-MMVQ expanded-activation Q8_1 scratch (issue #137): sized
         // for seqLen*topK rows of the largest contraction dim (_q8_1MaxK
@@ -631,6 +633,7 @@ internal sealed class VulkanForwardState : IDisposable
         MoeGroupDispatchArgs?.Dispose(); MoeGroupDispatchArgs = null;
         MoeExpertCounters?.Dispose(); MoeExpertCounters = null;
         MoePermutation?.Dispose(); MoePermutation = null;
+        MoeRowScale?.Dispose(); MoeRowScale = null;
         MoeGroupedHidden?.Dispose(); MoeGroupedHidden = null;
         MoeGroupedGateInter?.Dispose(); MoeGroupedGateInter = null;
         MoeGroupedUpInter?.Dispose(); MoeGroupedUpInter = null;
