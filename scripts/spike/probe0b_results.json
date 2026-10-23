@@ -1,0 +1,46 @@
+{
+  "model": "microsoft/bitnet-b1.58-2B-4T-bf16",
+  "device": "cuda",
+  "dtype": "torch.bfloat16",
+  "L": 30, "p": 7, "q": 22, "slab_layers": 15, "rms_eps": 1e-05,
+  "gamma": 0.5, "N_values": [1, 2, 4, 8, 16], "gen_tokens": 24,
+  "note": "Tables below are the verified per-(variant,N) means from the run. The full-sweep script crashes the CUDA decode on the (damped, N=16) greedy step (see 'damped' N=16 note); that combo is already broken at the teacher-forcing level so the crash does not change the verdict.",
+  "sanity": {
+    "none":    {"max_abs_logit_diff": 0.0, "final_argmax_match": true},
+    "rescale": {"max_abs_logit_diff": 0.0, "final_argmax_match": true},
+    "rmsnorm": {"max_abs_logit_diff": 0.0, "final_argmax_match": true},
+    "damped":  {"max_abs_logit_diff": 0.0, "final_argmax_match": true}
+  },
+  "variants": ["none", "rescale", "rmsnorm", "damped"],
+  "tables": {
+    "none": [
+      {"N": 1,  "slab_norm_first": 167469, "slab_norm_last": 167469,  "growth": 1.00,  "ppl": 20.58,    "entropy": 1.697, "degenerate_prompts": 0},
+      {"N": 2,  "slab_norm_first": 167469, "slab_norm_last": 292159,  "growth": 1.74,  "ppl": 17.05,    "entropy": 1.807, "degenerate_prompts": 0},
+      {"N": 4,  "slab_norm_first": 167469, "slab_norm_last": 537268,  "growth": 3.21,  "ppl": 28.17,    "entropy": 1.931, "degenerate_prompts": 0},
+      {"N": 8,  "slab_norm_first": 167469, "slab_norm_last": 1002743, "growth": 5.99,  "ppl": 150.33,   "entropy": 2.167, "degenerate_prompts": 1},
+      {"N": 16, "slab_norm_first": 167469, "slab_norm_last": 1837072, "growth": 10.97, "ppl": 1301.34,  "entropy": 2.292, "degenerate_prompts": 4}
+    ],
+    "rescale": [
+      {"N": 1,  "slab_norm_first": 167469, "slab_norm_last": 167469, "growth": 1.00, "ppl": 20.58,      "entropy": 1.697, "degenerate_prompts": 0},
+      {"N": 2,  "slab_norm_first": 25510,  "slab_norm_last": 144762, "growth": 5.67, "ppl": 28.13,      "entropy": 3.765, "degenerate_prompts": 2},
+      {"N": 4,  "slab_norm_first": 25510,  "slab_norm_last": 124107, "growth": 4.86, "ppl": 553.81,     "entropy": 5.668, "degenerate_prompts": 5},
+      {"N": 8,  "slab_norm_first": 25510,  "slab_norm_last": 121108, "growth": 4.75, "ppl": 94209.21,   "entropy": 5.051, "degenerate_prompts": 2},
+      {"N": 16, "slab_norm_first": 25510,  "slab_norm_last": 123345, "growth": 4.84, "ppl": 321184.27,  "entropy": 5.406, "degenerate_prompts": 0}
+    ],
+    "rmsnorm": [
+      {"N": 1,  "slab_norm_first": 167469, "slab_norm_last": 167469, "growth": 1.00,    "ppl": 20.58,      "entropy": 1.697, "degenerate_prompts": 0},
+      {"N": 2,  "slab_norm_first": 51,     "slab_norm_last": 95722,  "growth": 1891.82, "ppl": 620948.33,  "entropy": 6.428, "degenerate_prompts": 2},
+      {"N": 4,  "slab_norm_first": 51,     "slab_norm_last": 96986,  "growth": 1916.81, "ppl": 236577.03,  "entropy": 7.159, "degenerate_prompts": 2},
+      {"N": 8,  "slab_norm_first": 51,     "slab_norm_last": 98799,  "growth": 1952.64, "ppl": 323367.20,  "entropy": 5.308, "degenerate_prompts": 1},
+      {"N": 16, "slab_norm_first": 51,     "slab_norm_last": 97643,  "growth": 1929.80, "ppl": 8274421.27, "entropy": 5.744, "degenerate_prompts": 1}
+    ],
+    "damped": [
+      {"N": 1,  "slab_norm_first": 167469, "slab_norm_last": 167469, "growth": 1.00, "ppl": 20.58, "entropy": 1.697, "degenerate_prompts": 0},
+      {"N": 2,  "slab_norm_first": 167469, "slab_norm_last": 229041, "growth": 1.37, "ppl": 17.89, "entropy": 1.769, "degenerate_prompts": 0},
+      {"N": 4,  "slab_norm_first": 167469, "slab_norm_last": 351812, "growth": 2.10, "ppl": 18.19, "entropy": 1.876, "degenerate_prompts": 0},
+      {"N": 8,  "slab_norm_first": 167469, "slab_norm_last": 593326, "growth": 3.54, "ppl": 35.93, "entropy": 2.000, "degenerate_prompts": 0},
+      {"N": 16, "slab_norm_first": null, "slab_norm_last": null, "growth": null, "ppl": null, "entropy": null, "degenerate_prompts": null,
+       "note": "BROKEN. Teacher-forcing already exploding per-prompt (prompt0 norm 156315->1022183 ppl=79.42; prompt1 norm 172946->1104221 ppl=409.22) and greedy decode degenerate (prompt0 looped=True). The 24-step x N=16 (~255 layers/step) greedy decode then hard-crashes the CUDA context (exit 255/127, no Python traceback -> Windows TDR / resource limit), so a clean 5-prompt mean is not collected. Combo is past breakdown regardless."}
+    ]
+  }
+}

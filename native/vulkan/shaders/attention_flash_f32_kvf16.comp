@@ -1,0 +1,6 @@
+#version 450
+// F16-KV twin of attention_flash_f32.comp (issue #1102): the same kernel reading K / V stored as F16 (two halves per 32-bit word,
+// see kv_load.glsl). Body: attention_flash_f32.glsl.
+#define KV_F16 1
+#extension GL_GOOGLE_include_directive : require
+#include "attention_flash_f32.glsl"

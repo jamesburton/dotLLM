@@ -2,6 +2,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Cpu.Kernels;
 
@@ -11,17 +12,23 @@ namespace DotLLM.Cpu.Kernels;
 /// </summary>
 public static unsafe partial class Dequantize
 {
+    /// <summary>Q2_K block size in bytes: 16(scales) + 64(qs) + 2(d) + 2(dmin) = 84.</summary>
+    internal const int Q2_K_BlockBytes = QuantFormat.Q2_KBlockBytes;
+
+    /// <summary>Q3_K block size in bytes: 32(hmask) + 64(qs) + 12(scales) + 2(d) = 110.</summary>
+    internal const int Q3_K_BlockBytes = QuantFormat.Q3_KBlockBytes;
+
     /// <summary>Q4_K block size in bytes: 2(d) + 2(dmin) + 12(scales) + 128(qs) = 144.</summary>
-    internal const int Q4_K_BlockBytes = 144;
+    internal const int Q4_K_BlockBytes = QuantFormat.Q4_KBlockBytes;
 
     /// <summary>Q5_K block size in bytes: 2(d) + 2(dmin) + 12(scales) + 32(qh) + 128(qs) = 176.</summary>
-    internal const int Q5_K_BlockBytes = 176;
+    internal const int Q5_K_BlockBytes = QuantFormat.Q5_KBlockBytes;
 
     /// <summary>Q6_K block size in bytes: 128(ql) + 64(qh) + 16(scales) + 2(d) = 210.</summary>
-    internal const int Q6_K_BlockBytes = 210;
+    internal const int Q6_K_BlockBytes = QuantFormat.Q6_KBlockBytes;
 
     /// <summary>Number of elements per K-quant super-block.</summary>
-    internal const int KQuantGroupSize = 256;
+    internal const int KQuantGroupSize = QuantFormat.KQuantGroupSize;
 
     // ──────────────────── Scale unpacking ────────────────────
 
@@ -45,6 +52,45 @@ public static unsafe partial class Dequantize
             outScales8[j] = (byte)((scales12[j + 4] & 0xF) | ((scales12[j - 4] >> 6) << 4));
             outMins8[j] = (byte)((scales12[j + 4] >> 4) | ((scales12[j] >> 6) << 4));
         }
+    }
+
+    /// <summary>
+    /// Unpacks Q3_K's 12 packed scale bytes into 16 <b>unsigned</b> 6-bit sub-block scales.
+    /// Callers apply the format's bias themselves: the signed scale is <c>dest16[sub] - 32</c>.
+    /// </summary>
+    /// <remarks>
+    /// Per llama.cpp <c>ggml-quants.c dequantize_row_q3_K</c> (the 32-bit <c>aux</c>/<c>kmask</c>
+    /// shuffle, written out per sub-block):
+    /// <code>
+    ///   scales[ 0+b] = (s[  b] &amp; 0xF) | (((s[8+b] >> 0) &amp; 3) &lt;&lt; 4)
+    ///   scales[ 4+b] = (s[4+b] &amp; 0xF) | (((s[8+b] >> 2) &amp; 3) &lt;&lt; 4)
+    ///   scales[ 8+b] = (s[  b] >>  4)  | (((s[8+b] >> 4) &amp; 3) &lt;&lt; 4)
+    ///   scales[12+b] = (s[4+b] >>  4)  | (((s[8+b] >> 6) &amp; 3) &lt;&lt; 4)     for b in 0..3
+    /// </code>
+    /// i.e. the low nibble comes from bytes 0..7 (low nibble for sub 0..7, high nibble for
+    /// sub 8..15) and the high 2 bits from byte <c>8 + (sub % 4)</c> at shift <c>2 * (sub / 4)</c>.
+    /// That byte/shift pair is <b>transposed</b> relative to the obvious-looking
+    /// <c>8 + sub/4 @ (sub%4)*2</c>; getting it the wrong way round scrambles 12 of the 16
+    /// sub-blocks. Shared by the dequantizer and the Q3_K × Q8_K dots so the two cannot drift.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void UnpackQ3KScales(byte* scales12, byte* dest16)
+    {
+        // llama.cpp's own 4-word form, not the per-sub-block loop: this runs once per 256-element
+        // super-block on the Q3_K dot's hot path, where a 16-iteration branchy loop was measurable
+        // (~2.3x the per-super-block cost of Q2_K, which has no such unpack). The byte order of
+        // the result is the sub-block order, so it is the same 16 values either way.
+        const uint kmask1 = 0x03030303u;  // the 2 high bits of each scale, packed 4-per-byte
+        const uint kmask2 = 0x0f0f0f0fu;  // the low nibble of each scale
+
+        uint a0 = Unsafe.ReadUnaligned<uint>(scales12);
+        uint a1 = Unsafe.ReadUnaligned<uint>(scales12 + 4);
+        uint tmp = Unsafe.ReadUnaligned<uint>(scales12 + 8);
+
+        Unsafe.WriteUnaligned(dest16, (a0 & kmask2) | (((tmp >> 0) & kmask1) << 4));
+        Unsafe.WriteUnaligned(dest16 + 4, (a1 & kmask2) | (((tmp >> 2) & kmask1) << 4));
+        Unsafe.WriteUnaligned(dest16 + 8, ((a0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4));
+        Unsafe.WriteUnaligned(dest16 + 12, ((a1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4));
     }
 
     // ──────────────────── Q6_K ────────────────────
@@ -205,6 +251,132 @@ public static unsafe partial class Dequantize
 
                 blockBase += Q6_K_BlockBytes;
             }
+        }
+    }
+
+    // ──────────────────── Q2_K ────────────────────
+
+    /// <summary>
+    /// Dequantizes Q2_K-quantized data to float32. Block layout:
+    /// scales[16] (4-bit scale + 4-bit dmin coef per sub-block, packed) +
+    /// qs[64] (2-bit elements, 4 per byte) + d (half) + dmin (half) = 84 bytes per 256 elements.
+    /// Per-element decode: <c>value = d × scale × q2 − dmin × dmin_coef</c>.
+    /// <para><b>Element ordering is transposed</b>, exactly as in Q3_K. Per llama.cpp
+    /// <c>dequantize_row_q2_K</c>, each 128-element half consumes 32 <c>qs</c> bytes and each byte
+    /// supplies FOUR elements 32 apart: element <c>e</c> reads bit-pair <c>(e&gt;&gt;5)&amp;3</c> of byte
+    /// <c>32·(e&gt;&gt;7) + (e&amp;31)</c>. Reading it as <c>e/4 @ (e%4)·2</c> — the obvious-looking layout
+    /// this kernel shipped with until issue #498 — permutes every element into the wrong sub-block
+    /// scale; decoded weights then correlate ~0.07 with the true values (measured on
+    /// <c>Llama-3.2-1B-pure-Q2_K</c> against Q8_0 of the same base; the correct layout scores 0.954).
+    /// The scale/dmin sub-block index <c>e&gt;&gt;4</c> was and remains correct.</para>
+    /// </summary>
+    [SkipLocalsInit]
+    internal static unsafe void DequantizeQ2_K(nint src, long elementCount, Span<float> dest)
+    {
+        if (elementCount % KQuantGroupSize != 0)
+            throw new ArgumentException(
+                $"Q2_K requires elementCount to be a multiple of {KQuantGroupSize}.", nameof(elementCount));
+
+        long superBlocks = elementCount / KQuantGroupSize;
+        byte* basePtr = (byte*)src;
+
+        for (long sb = 0; sb < superBlocks; sb++)
+        {
+            byte* block = basePtr + sb * Q2_K_BlockBytes;
+            byte* scales = block;          // 16 bytes
+            byte* qs = block + 16;         // 64 bytes
+            float d = (float)Unsafe.ReadUnaligned<Half>(block + 80);
+            float dmin = (float)Unsafe.ReadUnaligned<Half>(block + 82);
+
+            int outOffset = (int)(sb * KQuantGroupSize);
+            for (int t = 0; t < KQuantGroupSize; t++)
+            {
+                int sub = t >> 4;                        // t / 16 — scale sub-block
+                int byteIdx = ((t >> 7) << 5) | (t & 31); // 32*(t/128) + t%32
+                int bitOff = ((t >> 5) & 0x3) << 1;       // 2 * ((t/32) % 4)
+                int q2 = (qs[byteIdx] >> bitOff) & 0x3;
+                int scale = scales[sub] & 0xF;
+                int dmCoef = (scales[sub] >> 4) & 0xF;
+                dest[outOffset + t] = d * scale * q2 - dmin * dmCoef;
+            }
+        }
+    }
+
+    // ──────────────────── Q3_K ────────────────────
+
+    /// <summary>
+    /// Dispatches Q3_K dequantization. Block layout (per ggml-quants.h):
+    /// <c>hmask[32]</c> (1 high bit per element) + <c>qs[64]</c> (2 low bits
+    /// per element) + <c>scales[12]</c> (16 packed 6-bit signed-after-bias
+    /// scales) + <c>d[2]</c> (FP16 super-block delta). 110 bytes per 256
+    /// elements. Per-element value:
+    /// <c>d × (signedScale[sub]) × ((hbit&lt;&lt;2 | qbits) - 4)</c> where sub
+    /// = element_idx / 16.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void DequantizeQ3_K(nint src, long elementCount, Span<float> dest)
+    {
+        if (elementCount % KQuantGroupSize != 0)
+            throw new ArgumentException(
+                $"Q3_K element count must be a multiple of {KQuantGroupSize}, got {elementCount}",
+                nameof(elementCount));
+        DequantizeQ3_KScalar(src, elementCount, dest);
+    }
+
+    /// <summary>
+    /// Scalar Q3_K dequantization. Reference port of llama.cpp's
+    /// <c>dequantize_row_q3_K</c>. AVX2 acceleration is a future optimization;
+    /// at V2-Lite scale Q3_K is only used for token_embd.weight + output.weight
+    /// (not the per-call hot-path), so the scalar path is acceptable for now.
+    /// </summary>
+    internal static void DequantizeQ3_KScalar(nint src, long elementCount, Span<float> dest)
+    {
+        long numBlocks = elementCount / KQuantGroupSize;
+        byte* blockBase = (byte*)src;
+        long destOffset = 0;
+        byte* scales = stackalloc byte[16];
+
+        for (long b = 0; b < numBlocks; b++)
+        {
+            byte* hmask = blockBase;                 // [32 bytes]
+            byte* qs = blockBase + 32;               // [64 bytes]
+            byte* scales12 = blockBase + 32 + 64;    // [12 bytes]
+            ushort dHalf = *(ushort*)(blockBase + 32 + 64 + 12);
+            float d = (float)BitConverter.UInt16BitsToHalf(dHalf);
+
+            UnpackQ3KScales(scales12, scales);
+
+            // 16 sub-blocks × 16 elements = 256 elements per super-block.
+            //
+            // Element ordering (llama.cpp dequantize_row_q3_K): the 2-bit quants
+            // are NOT stored 4-consecutive-elements-per-byte. Each 128-element
+            // half of the super-block uses 32 qs bytes, and each byte supplies
+            // FOUR elements 32 apart — element e reads bit-pair (e/32)%4 of
+            // byte (e%32) + 32*(e/128). The hmask is likewise transposed: element
+            // e reads bit e/32 of byte e%32. Reading them as e/4 @ (e%4)*2 and
+            // e/8 @ e%8 (the old dotLLM layout) permutes every element of every
+            // super-block into the wrong sub-block scale — decoded weights
+            // correlate ~0.01 with the true values.
+            for (int sub = 0; sub < 16; sub++)
+            {
+                int signedScale = scales[sub] - 32;  // [-32, 31]
+                float scaleD = d * signedScale;
+                int eBase = sub * 16;
+                int qsSubBase = 32 * (sub >> 3) + 16 * (sub & 1);
+                int qShift = ((sub >> 1) & 3) * 2;
+                int hmSubBase = 16 * (sub & 1);
+                int hBitIdx = sub >> 1;
+                for (int l = 0; l < 16; l++)
+                {
+                    int qBits = (qs[qsSubBase + l] >> qShift) & 0x03;
+                    int hBit = (hmask[hmSubBase + l] >> hBitIdx) & 0x01;
+                    int signed3 = ((hBit << 2) | qBits) - 4;  // [-4, 3]
+                    dest[(int)(destOffset + eBase + l)] = scaleD * signed3;
+                }
+            }
+
+            blockBase += Q3_K_BlockBytes;
+            destOffset += KQuantGroupSize;
         }
     }
 

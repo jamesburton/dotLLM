@@ -53,6 +53,47 @@ Modifies base: `θ_new = θ × factor^(d/(d-2))`. Preserves local patterns bette
 ### YaRN
 Combines NTK with attention scaling. Per-dimension: high-freq unchanged, low-freq fully scaled, medium interpolated.
 
+The ramp math lives in one place, `RoPE.ComputeYarnInverseFrequencies` (a port of HF `_compute_yarn_parameters`), and
+`RoPE.ResolveDenseYarn(rope, architecture, ropeDim)` hands every host the same inverse frequencies and cos/sin
+multiplier: the CPU `RoPERotation`, the CUDA upload (`LaunchRoPEF32(ropeInvFreq, ropeMscale)`) and
+the Vulkan `rope_yarn_f32` kernel. Two details decide whether a host matches HF:
+
+- **The ramp runs over the rotary dim, not the head.** HF uses `dim = head_dim * partial_rotary_factor`. For Qwen3.5/3.8
+  and Bonsai-2 (head 256, rotary 64) the correction range is (14, 22) over the 64 rotary dims; over 256 it would be a
+  different curve entirely.
+- **mscale (`attention_factor`) multiplies cos and sin.** `RoPEConfig.ComputeYarnMscaleMultiplier` gives gpt-oss and the
+  Qwen3.5/3.8 family (`Qwen3HybridDense`, `Qwen3MoeHybrid`, `Qwen4Exp`) HF's default `0.1·ln(factor) + 1` (1.1386 at
+  factor 4), the llama.cpp `ggml_rope_ext` convention. SmolLM3 and Llama keep the plain `AttnFactor`. Because it scales
+  every position, YaRN changes short-context numerics too; that is why Qwen recommends enabling it only when needed.
+
+#### Bonsai-2 / Qwen3.8 past 262,144 tokens (#1101)
+
+Qwen3.8 (and Bonsai-2, built from it) trains to 262,144 tokens and supports about 1M with opt-in YaRN, factor 4. The
+GGUF carries no rope-scaling keys, so turn it on at load:
+
+```
+dotllm serve <bonsai> --device vulkan --rope-scaling yarn --rope-scale 4 --yarn-orig-ctx 262144 --ctx-size 327680
+```
+
+- `ApplyRoPEOverride` raises `MaxSequenceLength` to `factor × original` (1,048,576) whenever the result has dense YaRN
+  active. Everything that caps the window reads that value: the CUDA VRAM fit (`NativeMaxSequenceLength`), `--ctx-size`
+  (now honoured on the Vulkan hybrid as well, via `IContextLimitable`), the KV caches' growth limits and the prompt-length
+  checks. It never lowers a window.
+- All three hybrid hosts (CPU `Qwen3HybridDenseTransformerModel`, `CudaQwen3HybridDenseTransformerModel`,
+  `VulkanQwen3HybridDenseTransformerModel`) rotate the trunk and the MTP head through the YaRN path. Before #1101 they read
+  only `Theta` and silently ignored the override.
+- Verified against HF's own `_compute_yarn_parameters` (torch float32; script and output in
+  `.docs/ctx128k/yarn/`), checked in as constants in `RoPEYarnQwen35ReferenceTests`; cross-backend parity at positions
+  past the native window in `*Qwen3HybridDenseYarnParityTests`.
+- **Cost.** RoPE itself costs nothing extra: every host keeps one 128-byte inverse-frequency vector. The CPU host
+  (`RoPERotation`) computes cos/sin rows only for the positions in flight, so nothing scales with the window (its old
+  position-indexed F32 tables would have been 256 MiB at 1M; #1107). The real cost is KV: Bonsai-2 keeps
+  16 attention layers × 4 KV heads × 256 dims, so F32 KV is 128 KiB/token (300k ≈ 37 GiB, 1M = 128 GiB), F16 64 KiB/token,
+  q8_0 about 34 KiB/token. And prefill: attention is quadratic, so a fresh prompt at that depth takes hours; the
+  realistic use is a session grown turn by turn with prefix reuse.
+- **Leave it off below 262,144.** The mscale changes every position, so short prompts get (slightly) different output.
+- The `Qwen3MoeHybrid` (qwen35moe) and `Qwen4Exp` hosts get the same mscale convention but are not wired yet.
+
 ### Dynamic NTK
 Scales only when `seq_len > orig_max`. Requires recomputing tables dynamically.
 

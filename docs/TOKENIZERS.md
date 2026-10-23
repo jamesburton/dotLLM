@@ -10,6 +10,34 @@
 
 Implementation: Trie for prefix matching, compiled regex. Vocabulary loaded from GGUF `tokenizer.ggml.tokens` + `tokenizer.ggml.merges`.
 
+**`tokenizer.ggml.pre` policy (issue #373, mirrors llama.cpp `llama_vocab`):** the model-specific
+pipeline is selected in `TiktokenPreTokenizer.GetRegexes`.
+
+- **Absent/empty** → GPT-2 default pipeline (llama.cpp's "missing pre-tokenizer type, using:
+  'default'").
+- **Unknown value** → `InvalidDataException` at load (llama.cpp throws here too). Escape hatch:
+  `DOTLLM_ALLOW_UNKNOWN_PRETOKENIZER=1` proceeds with the GPT-2 default pipeline — never with
+  "no pre-tokenization", which silently mis-tokenizes.
+- Supported `pre` values (one row per pipeline; aliases share a pipeline exactly as they share
+  a `case` block in llama.cpp):
+
+  | Pipeline | `tokenizer.ggml.pre` values |
+  |---|---|
+  | GPT-2 default | `default`, `gpt2` (also the absent/empty and opt-out fallback) |
+  | Llama 3 | `llama3`, `llama-v3`, `llama-bpe`, `falcon3`, `falcon-h1`, `pixtral`, `midm-2.0`, `lfm2`, `jina-v5-nano` |
+  | StarCoder/SmolLM | `starcoder`, `refact`, `command-r`, `smollm`, `codeshell`, `exaone`, `minerva`, `minerva-7b`, `mellum2` |
+  | DeepSeek LLM | `deepseek-llm` |
+  | DeepSeek Coder | `deepseek-coder` |
+  | Qwen 2 | `qwen2`, `deepseek-r1-qwen`, `kormo`, `f2llmv2`, `megrez`, `stablelm2`, `hunyuan`, `solar-open` |
+  | Qwen 3.5 | `qwen35` |
+  | GPT-4o | `gpt-4o`, `llama4` |
+  | Tekken | `tekken` |
+
+  New values are sourced from llama.cpp `llama-vocab.cpp` (authoritative), never invented.
+  The Qwen pipelines differ from Llama 3 only in the digit alternative — a bare `\p{N}`
+  splits every digit — and Qwen 3.5 additionally folds combining marks into the letter run
+  (`[\p{L}\p{M}]+`). Any `pre` value not in this table throws; see the policy above.
+
 ### SentencePiece BPE (Llama 2)
 
 - Unicode code-point level (not byte-level).
@@ -19,11 +47,157 @@ Implementation: Trie for prefix matching, compiled regex. Vocabulary loaded from
 
 Vocabulary from GGUF: `tokenizer.ggml.tokens` + `tokenizer.ggml.scores`.
 
+### Gemma-4 SPM-style merge-ranked BPE (`tokenizer.ggml.model = "gemma4"`)
+
+Gemma-4 GGUFs (26B-A4B, E4B, DiffusionGemma) look SentencePiece-like (▁ space
+markers, `<0xNN>` byte tokens, flat −1000 `tokenizer.ggml.scores`) but tokenize
+with **merge-ranked BPE** over the `tokenizer.ggml.merges` table (~515k entries).
+Matches llama.cpp `LLAMA_VOCAB_PRE_TYPE_GEMMA4`:
+
+- **Normalize**: escape every space to `▁` (U+2581); NO `▁` prepend
+  (`tokenizer.ggml.add_space_prefix = false`).
+- **Pre-tokenize**: `[^\n]+|[\n]+` only — split newline runs off, no word-level
+  splitting; raw UTF-8 code points, no GPT-2 byte encoding.
+- **Newline-run shortcut** (llama.cpp PR #21343): a whole `\n`-run that exists in
+  the vocab is emitted directly, bypassing BPE.
+- **Merges**: rank-ordered (lowest first, leftmost tie-break); split each merge
+  entry at the first space at index ≥ 1. Byte fallback to `<0xNN>` for code
+  points outside the vocab.
+- llama.cpp also forces `add_bos = true` for this pre-type (the GGUFs already
+  carry `add_bos_token = true`).
+
+Implemented in `Gemma4SpmBpeEncoding` (`BpeTokenizer.CreateGemma4`); routed by
+`GgufBpeTokenizerFactory` when `tokenizer.ggml.model == "gemma4"` **and** merges
+are present (files without merges keep the SentencePiece longest-match fallback).
+Oracle-pinned parity tests: `Gemma4TokenizerParityTests` (integration, vs
+`llama-tokenize --ids`) and `Gemma4BpeTokenizerTests` (unit, synthetic vocab).
+
+### WordPiece (BERT, `tokenizer.ggml.model = "bert"`)
+
+`DotLLM.Tokenizers.WordPiece.WordPieceTokenizer` (issue #738) implements HF `BertTokenizer`
+semantics for embedding encoders: NFC, clean (drop NUL/U+FFFD/control, whitespace to space), CJK
+ideographs padded with spaces, optional lower-casing + accent stripping (NFD, drop `Mn`),
+punctuation split (all ASCII non-alphanumerics + Unicode `P*`), greedy longest-match with `##`
+continuation, whole word to `[UNK]` when unsegmentable or longer than 100 code points. `Encode`
+returns `[CLS] ... [SEP]`; literal `[CLS]`/`[SEP]`/`[MASK]`/... in the text map to their ids.
+
+- **GGUF**: llama.cpp stores the vocabulary in "WPM" form: word-initial pieces prefixed `▁`,
+  continuations bare (`##` stripped), bracketed specials untouched. `FromGgufTokens` converts to the
+  canonical form. CLS/SEP ids come from `cls_token_id`/`seperator_token_id` (sic) or, in older files,
+  `bos_token_id`/`eos_token_id`; anything missing is resolved by string. `GgufTokenizerFactory.Load`
+  dispatches `bert` to this tokenizer and everything else to the BPE factory.
+- **tokenizer.json**: `HfWordPieceLoader.Parse` (`model.type == "WordPiece"`; honours
+  `BertNormalizer` / `Lowercase` / `StripAccents`).
+- Validated: exact id parity with HF `tokenizers` on 18 sentences (accents, CJK, Korean, symbols,
+  control characters, over-long word, literal specials) through both paths
+  (`BertWordPieceParityTests`). llama.cpp b9016's `/tokenize` on the same GGUF was also measured on 9
+  sentences (incl. accents and CJK) and is id-identical to HF, so there is no known deviation from
+  llama.cpp either.
+
 ### HuggingFace tokenizer.json
 
 JSON format containing: model type, vocabulary, merges, pre-tokenizer config, normalizer, post-processor, added tokens. Full specification of the tokenization pipeline.
 
 Used when loading models from SafeTensors (which don't embed tokenizer in the weight file).
+
+#### Adapter: `HfTokenizerJsonParser` + `HfBpeTokenizerFactory`
+
+The `DotLLM.Tokenizers.Hf` namespace parses `tokenizer.json` and routes the
+pipeline to the matching BPE encoder. The parser strips down to the fields
+actually used for encode/decode (model vocab/merges, pre-tokenizer,
+normalizer, decoder, added tokens); post-processor / template logic is
+handled elsewhere.
+
+Two pipelines are supported today:
+
+| Pipeline | Pre-tokenizer (JSON) | Decoder (JSON) | Norm | BPE encoder | Checkpoints |
+|---|---|---|---|---|---|
+| **SentencePiece / Metaspace** | `Metaspace` or `null` | `Sequence[Replace, ByteFallback, Fuse, Strip]` | — | `BpeTokenizer.CreateSentencePiece` | Llama 1/2, Mistral, TinyLlama, Phi-3.5-mini, ib-ssm Mamba-3 |
+| **GPT-2 / ByteLevel** | `ByteLevel` **or** `Sequence[Split, ByteLevel]` | `ByteLevel` | NFC (Qwen) | `BpeTokenizer.CreateTiktoken{,WithRegex}` | Qwen2 / Qwen2.5, Granite-3 dense, GPT-2 proper |
+
+##### ByteLevel contract
+
+`ByteLevelPreTokenizer` owns the GPT-2 `bytes_to_unicode` mapping that
+defines the alphabet the BPE merges operate over:
+
+- Printable ASCII 33–126 and Latin-1 supplement 161–255 (minus 173) map to
+  their own code points.
+- All remaining bytes (0–32, 127–160, 173) — the control and whitespace
+  bytes — are pushed into `U+0100 + n` where `n` counts unassigned bytes in
+  ascending order. The effect is that BPE never has to merge across
+  boundaries caused by control bytes, because those bytes now live in a
+  private-range of valid Latin-extended characters.
+- UTF-8 continuation bytes are naturally handled: `é` = `0xC3 0xA9` →
+  `"Ã©"` in the byte-level alphabet, which the merge table resolves to a
+  single token if the vocabulary contains that byte pair.
+
+`ByteLevelDecoder` is the inverse: reverse each token's chars to bytes,
+concatenate across the full sequence, UTF-8 decode.
+
+##### Regex ordering (correctness-critical)
+
+HF `ByteLevel` applies its pre-tokenization regex to the **raw text**
+before byte-mapping. The dotLLM encoder mirrors that order — applying the
+regex to byte-mapped text would misclassify multi-byte chars (`é` splits
+to `Ã` + `©` across segment boundaries, losing the merge).
+
+Regex source priority inside the factory:
+
+1. If `Sequence[Split(regex=X), ByteLevel(use_regex=false)]` (Qwen2 shape),
+   use `X` compiled from the JSON. The Qwen2 pattern is
+   `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
+   — close to but distinct from the built-in GGUF `llama3` pattern.
+2. Else if standalone `ByteLevel(use_regex=true)` (Granite-3, GPT-2), use
+   the cached default GPT-2 pattern in `ByteLevelPreTokenizer.DefaultGpt2Regex`.
+3. Else (`use_regex=false` with no upstream Split), feed the whole byte-
+   mapped string to BPE as one segment.
+
+##### Normalizer
+
+When the JSON declares a `normalizer` of kind NFC/NFD/NFKC/NFKD, the
+factory wraps the inner tokenizer in a `NormalizingTokenizer` decorator
+that `text.Normalize(form)`s input before encode. Decode is untouched.
+Qwen2/Qwen2.5 declare NFC — necessary to keep composed vs decomposed
+forms of accented chars on the same code path the merge table was
+trained against.
+
+##### Architecture → pipeline map
+
+| Arch | Tokenizer | Pipeline |
+|---|---|---|
+| Llama 1 / 2 | SPM BPE | Metaspace |
+| Mistral | SPM BPE | Metaspace |
+| TinyLlama | SPM BPE | Metaspace |
+| Phi-3.5-mini | SPM BPE | Metaspace (not ByteLevel as some other Phi variants) |
+| Mamba-3 (ib-ssm) | SPM BPE | Metaspace |
+| Qwen2 / Qwen2.5 | GPT-2 BPE | `Sequence[Split, ByteLevel]` + NFC |
+| Llama 3 | GPT-2 BPE | ByteLevel (standalone, use_regex=true) |
+| Granite-3 dense | GPT-2 BPE | ByteLevel (standalone, use_regex=true) |
+| Granite-3 MoE | GPT-2 BPE (vocab.json, no tokenizer.json) | — out of adapter scope; uses slow-tokenizer path |
+| GPT-2 / GPT-4 | GPT-2 BPE | ByteLevel |
+
+##### Known gaps
+
+- **Multi-step Sequence pre-tokenizers.** DeepSeek-V2/V2-Lite uses
+  `Sequence[Split, Split, Split, Split, Split, Digits, ByteLevel]`. The
+  adapter only recognizes the `[Split, ByteLevel]` shape; other
+  compositions surface as `HfPreTokenizerKind.Sequence` and the factory
+  throws. Tracked as a P0.1 follow-up.
+- **Slow-tokenizer checkpoints.** Granite-3 MoE (and older Llama-family
+  models) ship `vocab.json` + `merges.txt` rather than `tokenizer.json`.
+  A separate parser path is required — not in scope for the
+  `tokenizer.json` adapter.
+- **Chat templates and post-processors** (BOS/EOS insertion, token type
+  IDs) are handled by callers, not the adapter.
+
+##### Entry points
+
+- `HfTokenizerJsonParser.Parse(jsonContent)` → `HfTokenizerSpec`.
+- `HfBpeTokenizerFactory.Create(spec, bosId=-1, eosId=-1)` → `ITokenizer`.
+- `HfBpeTokenizerFactory.TryLoadFromDirectory(dir)` → `ITokenizer?`
+  (one-liner for HF checkpoint dirs).
+- `ModelLoader.LoadTokenizerFromHfDirectory(path)` → same, from the model
+  loader's public API.
 
 ## ITokenizer Interface
 
@@ -73,11 +247,38 @@ ChatMessage:
   Content: string
   ToolCalls: ToolCall[]?     (for assistant messages with tool calls)
   ToolCallId: string?        (for tool result messages)
+  ReasoningContent: string?  (assistant reasoning; exposed as message.reasoning_content, #767)
 
 ChatTemplateOptions:
   AddGenerationPrompt: bool  (append assistant turn prefix)
   Tools: ToolDefinition[]?   (for tool-calling models)
+  EnableThinking: bool?      (-> enable_thinking; null = left undefined, the template default applies)
+  ReasoningEffort: string?   (-> reasoning_effort)
+  PreserveThinking: bool?    (-> preserve_thinking)
+  TemplateKwargs: IReadOnlyDictionary<string, JsonElement>?  (chat_template_kwargs; merged first, so the
+                             typed members above and the structural variables messages / tools /
+                             add_generation_prompt / bos_token / eos_token always win)
 ```
+
+The reasoning members are **only inserted into the Jinja context when set**: Qwen3.x tests
+`enable_thinking is undefined`, and a null-valued key is *defined*, so inserting nulls would silently turn thinking off.
+`JinjaQwen3_8_27BReasoningOptionsTests` renders the real Qwen3.x template through `JinjaChatTemplate.Apply` with these
+options (typed and as kwargs) and compares against the Python Jinja2 goldens in `Fixtures/qwen3.8-27b-render-cases.json`.
+
+### Reasoning split (`DotLLM.Tokenizers.Reasoning`, #767)
+
+Models that think emit `<think>…</think>` before the answer; many templates open the block in the generation prompt.
+`ReasoningFormats.PromptOpensThinking(prompt)` decides from the **rendered prompt** (last `<think>` after the last `</think>`, only
+whitespace after it) whether generation starts inside a block, and `ReasoningSplitter` is the incremental splitter the server drives
+(`Feed(text)` per token, `Finish()` at the end; non-streaming is the same machine fed once). It never emits part of a tag, drops the
+whitespace around the tags, treats an unclosed block as all reasoning, and recognises a model-emitted `<think>` only at the start of the output
+(`ReasoningFormat.Auto`) or anywhere (`Deepseek`). See [SERVER.md](SERVER.md#reasoning--thinking-models-767) for the wire behaviour.
+
+**Markups (#798).** The tag pair is per model: `ReasoningMarkups.Detect(templateSource)` returns `Think` (default), `Gemma4Channel`
+(`<|channel>thought` … `<channel|>`; `PromptOpensThinking(prompt, open, close)` handles the case where a tool-response generation prompt ends in an
+open channel) or `Harmony` (gpt-oss). `ReasoningSplitter` takes the tag pair as constructor arguments; `HarmonySplitter` is a separate state machine
+(Idle / Header / Body over channel messages) and both implement `IReasoningSplitter` (`Feed`, `Finish`, `InReasoning`, `SawReasoning`,
+`ReasoningRawLength`). The server asks `ReasoningPlan` for a splitter and never branches on the family itself.
 
 ### Known Template Formats
 

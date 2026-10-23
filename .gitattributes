@@ -1,0 +1,2 @@
+# Chat-template fixtures must stay byte-exact (LF) so reference renders match.
+tests/DotLLM.Tests.Unit/Tokenizers/ChatTemplates/Fixtures/* -text

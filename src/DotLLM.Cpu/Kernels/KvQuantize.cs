@@ -13,10 +13,10 @@ namespace DotLLM.Cpu.Kernels;
 public static unsafe partial class KvQuantize
 {
     /// <summary>Q8_0 block: 2 bytes (Half scale) + 32 bytes (int8 values) = 34 bytes.</summary>
-    public const int Q8_0BlockBytes = 34;
+    public const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
 
     /// <summary>Q4_0 block: 2 bytes (Half scale) + 16 bytes (packed nibbles) = 18 bytes.</summary>
-    public const int Q4_0BlockBytes = 18;
+    public const int Q4_0BlockBytes = QuantFormat.Q4_0BlockBytes;
 
     /// <summary>Elements per quantization block (both Q8_0 and Q4_0).</summary>
     public const int BlockSize = 32;
