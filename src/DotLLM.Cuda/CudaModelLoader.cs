@@ -57,8 +57,9 @@ public static class CudaModelLoader
     /// <param name="ptxDir">Directory containing compiled PTX files. Null for auto-detect.
     /// Honoured only by the plain <see cref="CudaTransformerModel"/> path; the hybrid loaders
     /// auto-detect.</param>
-    /// <param name="moeOffload">Routed-expert offload for <c>nemotron_h_moe</c> (issue #1070); null = defaults plus the
-    /// <c>DOTLLM_MOE_*</c> environment variables. Ignored by every other architecture.</param>
+    /// <param name="moeOffload">Routed-expert offload: the VRAM expert cache for <c>nemotron_h_moe</c> (issue #1070), CPU-expert
+    /// layers (<c>--cpu-moe</c> / <c>--n-cpu-moe</c> / auto) for MoE models on the plain <see cref="CudaTransformerModel"/>
+    /// (#1187); null = defaults plus the <c>DOTLLM_MOE_*</c> environment variables.</param>
     /// <returns>
     /// The loaded CUDA model together with a factory for the KV-cache it expects. The factory is
     /// returned rather than left to the caller because each architecture needs its own concrete
@@ -167,7 +168,8 @@ public static class CudaModelLoader
 
             default:
             {
-                var model = CudaTransformerModel.LoadFromGguf(gguf, config, deviceId, ptxDir);
+                // MoE models honour --cpu-moe / --n-cpu-moe and auto-place experts that do not fit on the CPU (#1187).
+                var model = CudaTransformerModel.LoadFromGguf(gguf, config, deviceId, ptxDir, moeOffload);
                 return (model, size => model.CreateKvCache(size));
             }
         }

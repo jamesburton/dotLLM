@@ -5,6 +5,7 @@ using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
+using DotLLM.Core.Moe;
 using DotLLM.Core.PositionEncoding;
 using DotLLM.Core.Tensors;
 using DotLLM.Cuda.Interop;
@@ -358,6 +359,21 @@ public sealed unsafe class CudaTransformerModel : IModel
     private nint _moeStagingOutF32;
     private int _moeStagingCapacityElems;
     private CudaMoeScratch? _moeScratch;
+    // CPU leg for MoE layers whose routed experts stay in the mmap'd GGUF (--cpu-moe / --n-cpu-moe, #1187). Null when
+    // every expert is device-resident.
+    private CudaMoeHostExperts? _moeHost;
+
+    /// <summary>
+    /// Layers below this index keep their routed experts on the CPU (<c>--n-cpu-moe</c> semantics, #1187); 0 when every
+    /// expert is device-resident. <see cref="MoeOffloadOptions.AllLayers"/> means every MoE layer.
+    /// </summary>
+    public int CpuMoeLayers { get; private set; }
+
+    /// <summary>Routed experts the CPU leg has computed (one per expert per layer call), for telemetry and tests.</summary>
+    public long CpuMoeExpertsComputed => _moeHost?.ExpertsComputed ?? 0;
+
+    /// <summary>Host wall time spent in the CPU leg, microseconds.</summary>
+    public long CpuMoeMicroseconds => _moeHost?.ComputeMicroseconds ?? 0;
 
     // F32 gemma4 dual-FFN scratch: dense-branch result, MoE-branch result, and the
     // custom-router input (rms(attn_out)·RouterScale·1/√H). Sized [seqLen × hidden].
@@ -520,8 +536,14 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// <param name="config">Model configuration extracted from GGUF metadata.</param>
     /// <param name="deviceId">GPU device ordinal (0-based).</param>
     /// <param name="ptxDir">Directory containing compiled PTX files. If null, auto-detects from assembly location.</param>
+    /// <param name="moeOffload">
+    /// Routed-expert placement (<c>--cpu-moe</c> / <c>--n-cpu-moe</c> / <c>--moe-offload</c>, #1187); null = defaults plus the
+    /// <c>DOTLLM_MOE_*</c> environment variables. In <c>auto</c> mode, an MoE model whose experts do not fit keeps the
+    /// experts of its first layers on the CPU.
+    /// </param>
     public static CudaTransformerModel LoadFromGguf(GgufFile gguf, ModelConfig config,
-                                                       int deviceId = 0, string? ptxDir = null)
+                                                       int deviceId = 0, string? ptxDir = null,
+                                                       MoeOffloadOptions? moeOffload = null)
     {
         // Dense Gemma-4 (E2B/E4B) is CPU-only: fail before any weight load / device work (#730).
         // Load CPU weights (mmap references only, no heavy allocation)
@@ -540,7 +562,63 @@ public sealed unsafe class CudaTransformerModel : IModel
             estimatedWeightBytes += Cpu.Kernels.Dequantize.RowByteSize(innerDim, t.QuantizationType) * outerDim;
         }
 
-        return LoadFromCpuWeights(cpuWeights, config, gguf, deviceId, ptxDir, estimatedWeightBytes);
+        CpuMoePlacementInput? placement = config.Moe is null || config.Gemma4DualFfn ? null
+            : new CpuMoePlacementInput(MoeOffloadOptions.WithEnvironmentFallback(moeOffload),
+                RoutedExpertBytes(gguf, config, out bool biased), !biased);
+        return LoadFromCpuWeights(cpuWeights, config, gguf, deviceId, ptxDir, estimatedWeightBytes, placement);
+    }
+
+    /// <summary>What the loader needs to place routed experts on the CPU (#1187).</summary>
+    /// <param name="Options">Resolved offload options.</param>
+    /// <param name="RoutedBytesPerLayer">Device bytes of each layer's routed expert banks (0 for a dense layer).</param>
+    /// <param name="AutoEligible">False when the CPU leg cannot run this model's experts, so <c>auto</c> never picks it.</param>
+    private sealed record CpuMoePlacementInput(MoeOffloadOptions Options, long[] RoutedBytesPerLayer, bool AutoEligible);
+
+    /// <summary>Bytes of each layer's <c>ffn_{gate,up,down}_exps</c> banks; <paramref name="biased"/> reports per-expert biases.</summary>
+    private static long[] RoutedExpertBytes(GgufFile gguf, ModelConfig config, out bool biased)
+    {
+        var bytes = new long[config.NumLayers];
+        biased = false;
+        string[] projections = ["gate", "up", "down"];
+        for (int l = 0; l < config.NumLayers; l++)
+        {
+            foreach (string p in projections)
+            {
+                if (gguf.TensorsByName.TryGetValue($"blk.{l}.ffn_{p}_exps.weight", out var t))
+                    bytes[l] += Cpu.Kernels.Dequantize.RowByteSize(t.Shape[0], t.QuantizationType) * ((long)t.Shape.ElementCount / t.Shape[0]);
+                biased |= gguf.TensorsByName.ContainsKey($"blk.{l}.ffn_{p}_exps.bias");
+            }
+        }
+        return bytes;
+    }
+
+    /// <summary>
+    /// The <c>--n-cpu-moe</c> value to load with (#1187): the explicit <c>--cpu-moe</c> / <c>--n-cpu-moe</c>, every layer for
+    /// <c>--moe-offload on</c>, 0 for <c>off</c>, and in <c>auto</c> the fewest leading layers whose routed experts, kept on
+    /// the CPU, bring the device-resident weights plus <paramref name="reserveBytes"/> under <paramref name="freeBytes"/>.
+    /// </summary>
+    /// <param name="options">Resolved offload options.</param>
+    /// <param name="routedBytesPerLayer">Device bytes of each layer's routed banks.</param>
+    /// <param name="autoEligible">Whether <c>auto</c> may place experts on the CPU at all.</param>
+    /// <param name="weightBytes">Device bytes of the whole model with every expert resident.</param>
+    /// <param name="freeBytes">Free device memory before the upload.</param>
+    /// <param name="reserveBytes">Device memory to leave for the KV cache, forward state and scratch.</param>
+    /// <returns>Layers whose index is below the result keep their experts on the CPU.</returns>
+    internal static int PlanCpuMoeLayers(MoeOffloadOptions options, ReadOnlySpan<long> routedBytesPerLayer, bool autoEligible,
+        long weightBytes, long freeBytes, long reserveBytes)
+    {
+        if (options.CpuMoeLayers > 0) return options.CpuMoeLayers;
+        if (options.Mode == MoeOffloadMode.On) return MoeOffloadOptions.AllLayers;
+        if (options.Mode == MoeOffloadMode.Off || !autoEligible || weightBytes <= 0 || freeBytes <= 0) return 0;
+        long over = weightBytes + reserveBytes - freeBytes;
+        if (over <= 0) return 0;
+        long freed = 0;
+        for (int l = 0; l < routedBytesPerLayer.Length; l++)
+        {
+            freed += routedBytesPerLayer[l];
+            if (routedBytesPerLayer[l] > 0 && freed >= over) return l + 1;
+        }
+        return MoeOffloadOptions.AllLayers;
     }
 
     /// <summary>
@@ -621,7 +699,7 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// </summary>
     private static CudaTransformerModel LoadFromCpuWeights(
         TransformerWeights cpuWeights, ModelConfig config, GgufFile? gguf,
-        int deviceId, string? ptxDir, long estimatedWeightBytes)
+        int deviceId, string? ptxDir, long estimatedWeightBytes, CpuMoePlacementInput? placement = null)
     {
         RejectUnsupportedArchitecture(config);
 
@@ -640,6 +718,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         CudaKernels? kernels = null;
         CudaWeights? weights = null;
         CudaForwardState? state = null;
+        CudaMoeHostExperts? moeHost = null;
         try
         {
         stream = CudaStream.Create();
@@ -647,6 +726,39 @@ public sealed unsafe class CudaTransformerModel : IModel
         cublas.SetStream(stream);
 
         kernels = new CudaKernels(ptxDir);
+
+        // Routed experts on the CPU (#1187): explicit --cpu-moe / --n-cpu-moe, or auto when the experts do not fit.
+        int cpuMoeLayers = 0;
+        if (placement is not null)
+        {
+            CudaDriverApi.cuMemGetInfo_v2(out nuint freeNow, out _).ThrowOnError();
+            // Leave the reserve plus an F16 KV cache for the served context (default 4096 tokens) to the forward.
+            int ctx = Math.Min(placement.Options.ContextTokens ?? 4096, config.MaxSequenceLength);
+            long kvBytes = (long)ctx * config.NumLayers * 2 * config.NumKvHeads * config.HeadDim * sizeof(ushort);
+            long reserve = (placement.Options.ReserveMib ?? 1024) * 1048576L + kvBytes;
+            cpuMoeLayers = PlanCpuMoeLayers(placement.Options, placement.RoutedBytesPerLayer, placement.AutoEligible,
+                estimatedWeightBytes, (long)freeNow, reserve);
+            if (cpuMoeLayers > 0)
+            {
+                long kept = 0;
+                int n = 0;
+                for (int l = 0; l < placement.RoutedBytesPerLayer.Length; l++)
+                {
+                    if (l < cpuMoeLayers && placement.RoutedBytesPerLayer[l] > 0)
+                    {
+                        kept += placement.RoutedBytesPerLayer[l];
+                        n++;
+                    }
+                }
+                estimatedWeightBytes -= kept;
+                int threads = placement.Options.EffectiveCpuThreads;
+                string nArg = cpuMoeLayers == MoeOffloadOptions.AllLayers ? "all" : cpuMoeLayers.ToString();
+                (placement.Options.Log ?? Console.Error.WriteLine)(
+                    $"MoE experts on CPU: {n} layer(s) (--n-cpu-moe {nArg}), {kept / 1048576} MiB read from the mmap'd GGUF, "
+                    + $"{threads} CPU thread(s); {estimatedWeightBytes / 1048576} MiB device weights.");
+                moeHost = new CudaMoeHostExperts(threads, packedLegacyExperts: config.Architecture == Architecture.Flint);
+            }
+        }
 
         string? vramWarning = null;
         if (estimatedWeightBytes > 0
@@ -685,7 +797,8 @@ public sealed unsafe class CudaTransformerModel : IModel
         }
 
         weights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle,
-            onHostTensorUploaded: onHostTensorUploaded);
+            onHostTensorUploaded: onHostTensorUploaded,
+            hostMoeLayer: cpuMoeLayers > 0 ? layer => layer < cpuMoeLayers : null);
         LastLoadStreamedHostFreeCount = streamedFreeCount;
 
         // Gemma-4 full-attention (global) layers may use a distinct head dim and
@@ -747,11 +860,15 @@ public sealed unsafe class CudaTransformerModel : IModel
         // interleaved" branch, silently mis-rotating every Qwen/Phi forward.
         int ropeType = CudaKernels.ToCudaRopeType(config.RoPEConfig?.Type ?? RoPEType.Norm);
 
-        return new CudaTransformerModel(config, weights, state, stream, cublas, context,
+        var model = new CudaTransformerModel(config, weights, state, stream, cublas, context,
             kernels, gguf, cpuWeights, deviceId, ropeTheta, ropeDim, ropeType, vramWarning);
+        model._moeHost = moeHost;
+        model.CpuMoeLayers = cpuMoeLayers;
+        return model;
         }
         catch
         {
+            moeHost?.Dispose();
             state?.Dispose();
             weights?.Dispose();
             kernels?.Dispose();
@@ -1484,7 +1601,7 @@ public sealed unsafe class CudaTransformerModel : IModel
                 _moeScratch.EnsureCapacity(seqLen, moeLayer);
                 int hiddenElems = seqLen * hiddenSize;
                 _kernels.LaunchConvertF16ToF32(_state.NormOutput, _moeStagingInF32, hiddenElems, s);
-                CudaMoeFfn.Forward(
+                CudaMoeFfn.ForwardWithHostExperts(
                     hiddenF32: _moeStagingInF32,
                     outputF32: _moeStagingOutF32,
                     seqLen: seqLen,
@@ -1492,7 +1609,8 @@ public sealed unsafe class CudaTransformerModel : IModel
                     scratch: _moeScratch,
                     cublasHandle: cublasH,
                     kernels: _kernels,
-                    stream: s);
+                    stream: s,
+                    hostExperts: _moeHost);
                 _kernels.LaunchConvertF32ToF16(_moeStagingOutF32, _state.NormOutput, hiddenElems, s);
                 MarkProfile(ProfileCategory.MlpUp);
                 MarkProfile(ProfileCategory.Swiglu);
@@ -4221,6 +4339,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         _mlaScratchF16?.Dispose();
         _mlaKvCache?.Dispose();
         _moeScratch?.Dispose();
+        _moeHost?.Dispose();
         _g3Attention.Dispose();
         _state.Dispose();
         _weights.Dispose();
