@@ -674,6 +674,19 @@ tensor, so the import is opportunistic, never load-bearing. What #508 changed is
 the earlier "the win arrives when the driver matures or when Linux Mesa radv is used" was wrong
 about the cause: the refusal was the read-only mapping, not a driver defect.
 
+### Weight arena: one allocation per tensor is not free (#1174)
+
+amdvlk on gfx1151 rounds every `vkAllocateMemory` between about 4 and 64 MiB up to a 2 MiB page. Nemotron 3.5 Bolt
+uploads 349 such tensors (4,044 MiB), and they cost **293 MiB** of process GPU memory beyond the bytes requested;
+replaying the exact allocation sizes with nothing else reproduces it (`DOTLLM_MEM_PROBE=1` prints `wddm(own)` and
+`untracked`, the part of the WDDM counter our own allocations do not explain). llama.cpp places tensors inside a few
+large buffers and pays none of it.
+
+`VulkanWeightArena` binds each tensor's own `VkBuffer` into a shared 64 MiB slab (a multiple of the 2 MiB page);
+tensors of 64 MiB or more keep a dedicated allocation. Kernels see an ordinary buffer. Sub-buffers report
+`IsHostVisible = false`, so host transfers stage instead of mapping memory another tensor shares. The Nemotron-H
+loader uses it; `DOTLLM_VULKAN_WEIGHT_ARENA=0` restores one allocation per tensor.
+
 ### Scope and anti-goals
 
 - **Scope**: raw quant-block weight uploads — whichever formats *the loader in use* keeps packed on device. For the dense `VulkanWeights` path that is every `QuantizationType` except Q4_0, Q4_1 and Q5_1; the four hybrid loaders each keep a strictly narrower set (see the per-loader table in [QUANTIZATION.md](QUANTIZATION.md#vulkan-backend-coverage)). When the contraction axis is aligned to the format's group size and the matrix is kept on device verbatim, the upload is a candidate for zero-copy import. Since #508 the decision lives in `VulkanWeightImportPolicy.TryImport`, used by all five weight loaders — `VulkanWeights`, `VulkanQwen3MoeHybridWeights` (Qwen3-MoE-hybrid, Bonsai 2 / Qwen3 hybrid dense, dense MTP head), `VulkanQwen3HybridDenseWeights`' packed PQ2_0 token embed, `VulkanNemotronHWeights`, and `VulkanMamba3Weights` — not just `VulkanWeights.UploadMatrix`.

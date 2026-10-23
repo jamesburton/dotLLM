@@ -484,7 +484,7 @@ PRs #1103, #1122, #1125, #1126.
 | V4 | Vulkan | MTP KV and hidden F32 | B2 8 → 4 KiB/token at F16, KL 3.4e-8 (E10b) | open; F16 measured invisible | #1141 |
 | V5 | Vulkan | split-KV partials, split-K slabs F32 | 5.24 MB per split-K | sign-off pending | #1144 |
 | V6 | Vulkan | logits `rows·V·4`; recurrent state; MLA KV; Q8_1 `(d,s)` and KV scales F32 | various | open | #1137, #1144, #1140, #1146 |
-| VX1 | Vulkan | token embedding → F32 for every type but Q8_0 | Qwen3.8-27B 5.09 GB vs ≈339 MB | open | #919 |
+| VX1 | Vulkan | token embedding → F32 for every type but Q8_0 | Qwen3.8-27B 4.85 GiB vs 682 MiB (Q4_K); Bolt 2 GiB vs 544 MiB (Q8_0) | **fixed for Nemotron-H and qwen35 dense** (#1174: Q8_0 / Q4_K / Q6_K / PQ2_0 gathered packed); dense `VulkanWeights` K-quants and `VulkanQwen3MoeHybrid` open | #919 |
 | VX2 | Vulkan | matrices outside `DeviceQuantTypeFor` → F32 | `m·k·4` | open | #921, #627 |
 | VX3 | Vulkan | quantized-KV / TurboQuant F32 full-history scratch | `2·maxSeq·stride·4` | open | #1139 (hybrid: #1112) |
 | VX4 | Vulkan | IQ1/2/3 (+ fallback NVFP4) prefill F16 scratch | L3B 50.3 MB + 4 B/weight traffic | open | #1146 (#1064, #1069) |
