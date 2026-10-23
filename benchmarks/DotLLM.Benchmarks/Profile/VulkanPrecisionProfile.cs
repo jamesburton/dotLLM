@@ -572,6 +572,7 @@ internal static class VulkanPrecisionProfile
                 foreach (var (e, v) in ArmEnv[arm]) Environment.SetEnvironmentVariable(e, v);
                 VulkanPrecisionExperiment.Gemm = VulkanPrecisionExperiment.ParseGemm(Environment.GetEnvironmentVariable(VulkanPrecisionExperiment.GemmEnvVar));
                 var (m, f) = VulkanModelLoader.CreateFromGguf(device, gguf, config, spv);
+                if (!m.TrySetAllRowLogitsLimit(256)) throw new InvalidOperationException($"{arm}: no all-row logits");
                 VulkanPrecisionExperiment.Gemm = GemmAccVariant.Default;
                 models.Add((arm, m, f));
                 Console.WriteLine($"arm {arm}: loaded {m.GetType().Name}");
