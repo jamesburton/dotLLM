@@ -407,6 +407,15 @@ public sealed unsafe class DFlashDrafterTests : IDisposable
         _out.WriteLine($"{checks} rounds matched; context {committed.Count} rows, window {drafter.Window}, ring {state.RingCapacity}");
     }
 
+    /// <summary>A target backend for the end-to-end gate: the model and a KV-cache for it.</summary>
+    internal delegate (IModel Model, Core.Attention.IKvCache Kv) BackendFactory(GgufFile gguf, ModelConfig config);
+
+    internal static (IModel, Core.Attention.IKvCache) Cpu(GgufFile gguf, ModelConfig config)
+    {
+        var m = (Qwen3HybridDenseTransformerModel)ModelLoader.CreateCpuModelFromGguf(gguf, config);
+        return (m, new SimpleKvCache(m.AttentionLayerCount, config.NumKvHeads, config.HeadDim, config.MaxSequenceLength));
+    }
+
     /// <summary>
     /// End-to-end gate: MTP-decoder rounds drafted by DFlash on a GDN + attention trunk (taps from a mid-trunk layer input
     /// and the last layer's output) emit exactly the plain greedy sequence, with per-row recurrent snapshots and with
@@ -416,8 +425,12 @@ public sealed unsafe class DFlashDrafterTests : IDisposable
     [InlineData(true)]
     [InlineData(false)]
     public void SpeculativeDecode_WithDFlash_IsTokenIdenticalToGreedy(bool snapshots)
+        => AssertTokenIdentical(_dir, Cpu, snapshots, _out);
+
+    /// <summary>The gate on any backend: the greedy reference is the same backend's plain decode.</summary>
+    internal static void AssertTokenIdentical(string dir, BackendFactory backend, bool snapshots, ITestOutputHelper output)
     {
-        string trunk = SyntheticQwen35HybridDenseMtpGguf.Write(Path.Combine(_dir, "trunk.gguf"), withMtp: false, contextLength: 96);
+        string trunk = SyntheticQwen35HybridDenseMtpGguf.Write(Path.Combine(dir, "trunk.gguf"), withMtp: false, contextLength: 96);
         int[] prompt = [1, 5, 3, 7, 2, 9];
         const int NewTokens = 40;
 
@@ -425,12 +438,14 @@ public sealed unsafe class DFlashDrafterTests : IDisposable
         using (var g = GgufFile.Open(trunk))
         {
             var cfg = GgufModelConfigExtractor.Extract(g.Metadata);
-            using var plain = (Qwen3HybridDenseTransformerModel)ModelLoader.CreateCpuModelFromGguf(g, cfg);
-            using var kv = new SimpleKvCache(plain.AttentionLayerCount, cfg.NumKvHeads, cfg.HeadDim, cfg.MaxSequenceLength);
-            greedy = [.. prompt];
-            using (var l = plain.Forward(prompt, Enumerable.Range(0, prompt.Length).ToArray(), -1, kv)) greedy.Add(ArgMaxLast(l, cfg.VocabSize));
-            while (greedy.Count < prompt.Length + NewTokens + Block)
-                using (var l = plain.Forward([greedy[^1]], [greedy.Count - 1], -1, kv)) greedy.Add(ArgMaxLast(l, cfg.VocabSize));
+            var (plain, kv) = backend(g, cfg);
+            using (plain as IDisposable) using (kv)
+            {
+                greedy = [.. prompt];
+                using (var l = plain.Forward(prompt, Enumerable.Range(0, prompt.Length).ToArray(), -1, kv)) greedy.Add(ArgMaxLast(l, cfg.VocabSize));
+                while (greedy.Count < prompt.Length + NewTokens + Block)
+                    using (var l = plain.Forward([greedy[^1]], [greedy.Count - 1], -1, kv)) greedy.Add(ArgMaxLast(l, cfg.VocabSize));
+            }
         }
 
         // A random drafter rarely agrees with the trunk; sweep seeds (each one must stay token-identical) until one also
@@ -439,28 +454,30 @@ public sealed unsafe class DFlashDrafterTests : IDisposable
         for (uint seed = 0xBEEFu; seed < 0xBEEFu + 32 && !(accepted && rejected); seed++)
         {
             var (bytes, _) = BuildDrafter(seed, dflash2: true);
-            string drafterPath = Path.Combine(_dir, $"drafter-{seed}.gguf");
+            string drafterPath = Path.Combine(dir, $"drafter-{seed}.gguf");
             File.WriteAllBytes(drafterPath, bytes);
-            var perRound = RunDFlash(trunk, drafterPath, prompt, NewTokens, snapshots, greedy);
+            var perRound = RunDFlash(trunk, drafterPath, backend, prompt, NewTokens, snapshots, greedy);
             accepted |= perRound.Any(n => n > 1);
             rejected |= perRound.Any(n => n < Block);
-            _out.WriteLine($"seed {seed:X}: emitted/round [{string.Join(",", perRound)}]");
+            output.WriteLine($"seed {seed:X}: emitted/round [{string.Join(",", perRound)}]");
         }
         Assert.True(accepted, "no seed got a draft accepted: the accept path never ran");
         Assert.True(rejected, "no round rejected a draft: the rollback path never ran");
     }
 
-    private static List<int> RunDFlash(string trunk, string drafterPath, int[] prompt, int newTokens, bool snapshots, List<int> greedy)
+    private static List<int> RunDFlash(string trunk, string drafterPath, BackendFactory backend, int[] prompt, int newTokens,
+        bool snapshots, List<int> greedy)
     {
         using var gguf = GgufFile.Open(trunk);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
-        using var model = (Qwen3HybridDenseTransformerModel)ModelLoader.CreateCpuModelFromGguf(gguf, config);
+        var (model, kvCache) = backend(gguf, config);
+        using var _m = model as IDisposable;
+        using var _k = kvCache;
         Assert.False(model.SupportsMtp);
-        model.AttachDFlashDrafter(drafterPath);
+        ((IDFlashDraftAttachable)model).AttachDFlashDrafter(drafterPath);
         Assert.True(model.SupportsMtp && model.SupportsMtpArgMax);
         Assert.Equal(Block - 1, model.MtpPreferredDraftTokens);
 
-        using var kvCache = new SimpleKvCache(model.AttentionLayerCount, config.NumKvHeads, config.HeadDim, config.MaxSequenceLength);
         using var mtp = model.CreateMtpState()!;
         Assert.IsType<DFlashMtpState>(mtp);
         var ids = new List<int>(prompt);
@@ -485,7 +502,7 @@ public sealed unsafe class DFlashDrafterTests : IDisposable
         return perRound;
     }
 
-    private static int ArgMaxLast(ITensor logits, int vocab)
+    internal static int ArgMaxLast(ITensor logits, int vocab)
     {
         var span = new ReadOnlySpan<float>((void*)logits.DataPointer, logits.Shape[0] * vocab).Slice((logits.Shape[0] - 1) * vocab, vocab);
         return System.Numerics.Tensors.TensorPrimitives.IndexOfMax(span);

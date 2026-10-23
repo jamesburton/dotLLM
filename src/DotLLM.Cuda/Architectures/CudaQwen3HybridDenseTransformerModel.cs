@@ -6,6 +6,7 @@ using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Cuda.Interop;
+using DotLLM.Models.Architectures.DFlash;
 using DotLLM.Models.Gguf;
 
 namespace DotLLM.Cuda.Architectures;
@@ -525,7 +526,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     }
 
     /// <inheritdoc/>
-    public bool SupportsMtp => _mtpHead is not null;
+    public bool SupportsMtp => _mtpHead is not null || _dflash is not null;
 
     /// <inheritdoc/>
     public long ComputeMemoryBytes => _state.AllocatedBytes + _gdnCache.AllocatedBytes;
@@ -669,7 +670,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         try
         {
             logits = ForwardCore(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly: false,
-                                 mtpCapture: mtpState as CudaMtpState);
+                                 mtpState: mtpState);
         }
         finally
         {
@@ -847,6 +848,8 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     /// <inheritdoc/>
     public IMtpState? CreateMtpState(int maxSequenceLength)
     {
+        if (_dflash is not null)
+            return new DFlashMtpState(_dflash);   // an attached DFlash drafter takes the MTP slot (#1175)
         if (_mtpHead is null)
             return null;
 
@@ -1873,7 +1876,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly)
-        => ForwardCore(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly, mtpCapture: null);
+        => ForwardCore(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly, mtpState: null);
 
     /// <inheritdoc/>
     /// <remarks>
@@ -1888,7 +1891,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache, ILoraAdapter? adapter, IMtpState? mtpState)
         => ForwardCore(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly: false,
-                        mtpCapture: mtpState as CudaMtpState);
+                        mtpState: mtpState);
 
     /// <inheritdoc/>
     /// <remarks>
@@ -1901,7 +1904,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
                            int deviceId, IKvCache? kvCache, ILoraAdapter? adapter,
                            IMtpState? mtpState, bool lastTokenLogitsOnly)
         => ForwardCore(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly,
-                        mtpCapture: mtpState as CudaMtpState);
+                        mtpState: mtpState);
 
     /// <summary>
     /// Default prefill tile, in tokens (issue #494). A prefill forward's working set — the F32
@@ -2001,6 +2004,16 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     /// </remarks>
     private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly,
+                           IMtpState? mtpState)
+    {
+        // DFlash (#1175): the state rides on a field for the call, every tile captures and injects its own taps.
+        _dflashCall = _dflash is not null ? mtpState as DFlashMtpState : null;
+        try { return ForwardCoreTiled(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly, mtpState as CudaMtpState); }
+        finally { _dflashCall = null; }
+    }
+
+    private ITensor ForwardCoreTiled(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly,
                            CudaMtpState? mtpCapture)
     {
         int chunk = PrefillChunkTokens;
@@ -2027,7 +2040,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
                 logits?.Dispose();
                 logits = ForwardTile(tokenIds.Slice(offset, len), positions.Slice(offset, len),
                                      deviceId, kvCache, lastTokenLogitsOnly: true,
-                                     mtpCapture, produceLogits: isFinal || mtpCapture is not null);
+                                     mtpCapture, produceLogits: isFinal || mtpCapture is not null || _dflashCall is not null);
             }
             return logits!;
         }
@@ -2132,11 +2145,14 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         if (ProfileTrace) _stream.Synchronize();
         ProfMark("setup-embed");
 
+        if (_dflashCall is not null) EnsureDFlashTapPinned(seqLen - DFlashTapFirst(seqLen));
         for (int layer = 0; layer < _layers.Length; layer++)
         {
+            if (_dflashCall is not null) QueueDFlashTap(layer, seqLen);
             RunSingleLayerBody(layer, seqLen, positions, hiddenSize,
                 numHeads, numKvHeads, headDim, eps, kvCache);
         }
+        if (_dflashCall is not null) QueueDFlashTap(_layers.Length, seqLen);
 
         // Issue #492: every layer is now queued on the stream and the host has nothing to wait for
         // until the MTP capture's synchronize below, so this is the one window in the call where
@@ -2240,6 +2256,8 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
 
         if (mtpCapture is not null && _mtpHead is { } absorbHead)
             AbsorbMtp(absorbHead, mtpCapture, tokenIds, positions);
+        if (_dflashCall is not null)
+            FinishDFlashTaps(positions);   // the logits copy above was synchronous: the taps have landed
 
         return result;
     }
@@ -2798,6 +2816,8 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     /// <inheritdoc/>
     public ITensor ForwardMtp(IMtpState state, int tokenId, int position)
     {
+        if (state is DFlashMtpState dflash)
+            return ForwardDFlashDraft(dflash, tokenId, position);
         var (mtpHead, mtp) = ValidateMtpCall(state);
         _context.MakeCurrent();
         return ForwardMtpCore(mtpHead, mtp, tokenId, position, MtpStepOutput.Logits, out _)!;
@@ -2834,11 +2854,13 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     /// decoder then takes an unconstrained greedy draft token from <see cref="ForwardMtpArgMax"/>
     /// instead of copying the 248k-float logits row to the host every draft step.
     /// </summary>
-    public bool SupportsMtpArgMax => !_disposed && _mtpHead is not null && EnsureMtpArgMax() is not null;
+    public bool SupportsMtpArgMax => !_disposed && (_dflash is not null || (_mtpHead is not null && EnsureMtpArgMax() is not null));
 
     /// <inheritdoc/>
     public int ForwardMtpArgMax(IMtpState state, int tokenId, int position)
     {
+        if (state is DFlashMtpState dflash)
+            return ForwardDFlashArgMax(dflash, tokenId, position);
         var (mtpHead, mtp) = ValidateMtpCall(state);
         if (EnsureMtpArgMax() is null)
             throw new NotSupportedException(
@@ -5192,6 +5214,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         if (_disposed) return;
         _disposed = true;
         _context.MakeCurrent();
+        DisposeDFlash();
 
         for (int i = 0; i < _layers.Length; i++)
         {

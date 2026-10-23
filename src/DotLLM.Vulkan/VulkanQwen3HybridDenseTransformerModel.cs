@@ -7,6 +7,7 @@ using Architecture = DotLLM.Core.Configuration.Architecture;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Models.Architectures;
+using DotLLM.Models.Architectures.DFlash;
 using DotLLM.Models.Gguf;
 using DotLLM.Vulkan.Interop;
 using DotLLM.Vulkan.Kernels;
@@ -523,7 +524,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
                            IKvCache? kvCache, IGdnState? gdnState, IMtpState? mtpState)
     {
-        if (mtpState is not null && mtpState is not VulkanMtpState)
+        if (mtpState is not null && mtpState is not VulkanMtpState && !(_dflash is not null && mtpState is DFlashMtpState))
             throw new ArgumentException(
                 $"VulkanQwen3HybridDenseTransformerModel requires a VulkanMtpState; got {mtpState.GetType().Name}.",
                 nameof(mtpState));
@@ -590,6 +591,12 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
 
         var logitsBuf = headRows == 1 ? SingleRowLogits : EnsureMultiRowLogits(headRows, vocabSize);
 
+        // DFlash (#1175): the drafter conditions on these layers' inputs; only the rows its context ring can hold are copied.
+        var dflashTaps = _dflash is not null ? mtpState as DFlashMtpState : null;
+        int tapFirst = dflashTaps is null ? 0 : Math.Max(0, seqLen - dflashTaps.RingCapacity);
+        int tapRows = seqLen - tapFirst;
+        if (dflashTaps is not null) EnsureDFlashTapBuffer(tapRows);
+
         // Any forward moves the model-owned GDN state on, so earlier row snapshots no longer
         // describe it (issue #473). ForwardWithRecurrentSnapshots re-validates after it returns.
         if (ReferenceEquals(gdnCache, _gdnCache))
@@ -650,6 +657,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
                 KernelSupport.HostToComputeBarrier(cmdBuf);
                 ProfBeginSubmit(cmdBuf);
             }
+
+            if (dflashTaps is not null)
+                RecordDFlashTap(cmdBuf, layer, tapFirst, tapRows);
 
             // ── 2a. Token mixing ────────────────────────────────────────────
             RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.Residual,
@@ -780,6 +790,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             ProfBeginSubmit(cmdBuf);
         }
 
+        if (dflashTaps is not null)
+            RecordDFlashTap(cmdBuf, kinds.Length, tapFirst, tapRows);
         RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.NormOutput,
             srcOffset: (ulong)headSrcOffset, dstOffset: 0, size: (ulong)((long)headRows * hiddenRowBytes));
         KernelSupport.TransferToComputeBarrier(cmdBuf);
@@ -803,6 +815,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             headIn, logitsBuf,
             outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: headRows);
         KernelSupport.ComputeToHostBarrier(cmdBuf);
+        if (dflashTaps is not null)
+            KernelSupport.TransferToHostBarrier(cmdBuf);
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.LmHead);
         ProfBeforeSubmit(cmdBuf);
         _submit.SubmitAndWait();
@@ -821,6 +835,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
 
         if (mtpCapture is not null)
             AbsorbMtp(_mtpHead!, mtpCapture, tokenIds, positions);
+        if (dflashTaps is not null)
+            FinishDFlashTaps(dflashTaps, positions.Slice(tapFirst), tapRows);
 
         return result;
     }
@@ -2265,7 +2281,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
     // ── MTP ("NextN") self-speculative decoding — issue #435 ─────────────────
 
     /// <inheritdoc/>
-    public bool SupportsMtp => _mtpHead is not null;
+    public bool SupportsMtp => _mtpHead is not null || _dflash is not null;
 
     /// <summary>
     /// Default MTP KV-cache depth, matching the CPU and CUDA hosts so a state created here holds
@@ -2284,6 +2300,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
     /// <inheritdoc/>
     public IMtpState? CreateMtpState(int maxSequenceLength)
     {
+        if (_dflash is not null)
+            return new DFlashMtpState(_dflash);   // an attached DFlash drafter takes the MTP slot (#1175)
         if (_mtpHead is null)
             return null;
         return new VulkanMtpState(_device,
@@ -2303,6 +2321,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
     public ITensor ForwardMtp(IMtpState state, int tokenId, int position)
     {
         ArgumentNullException.ThrowIfNull(state);
+        if (state is DFlashMtpState dflash)
+            return ForwardDFlashDraft(dflash, tokenId, position);
         if (_mtpHead is not { } mtpHead)
             throw new NotSupportedException(
                 $"{nameof(VulkanQwen3HybridDenseTransformerModel)} has no MTP head loaded (SupportsMtp=false).");
@@ -2889,6 +2909,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         _hadamard?.Dispose();
         _embedGather?.Dispose();
         _mtpHead?.Dispose();
+        DisposeDFlash();
         _mtpScratch?.Dispose();
         _mtpAbsorbScratch?.Dispose();
         _multiRowLogits?.Dispose();

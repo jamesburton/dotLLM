@@ -30,6 +30,11 @@ internal sealed unsafe class DFlashMtpState : IMtpState
     private int _draftCount;
     private bool _disposed;
 
+    // DOTLLM_DFLASH_TRACE=1: per-request draft / inject wall time on stderr at dispose.
+    private static readonly bool Trace = Environment.GetEnvironmentVariable("DOTLLM_DFLASH_TRACE") == "1";
+    private long _draftTicks, _injectTicks;
+    private int _drafts, _injects, _injectRows;
+
     /// <summary>Creates a state for <paramref name="drafter"/>.</summary>
     /// <param name="drafter">The drafter whose context this state holds.</param>
     public DFlashMtpState(DFlashDrafter drafter)
@@ -115,7 +120,11 @@ internal sealed unsafe class DFlashMtpState : IMtpState
     public void InjectCaptured(ReadOnlySpan<int> positions, DotLLM.Cpu.Threading.ComputeThreadPool? pool)
     {
         _draftStart = -1;   // the context changed: any cached block is stale
+        long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         _drafter.Inject(this, _taps, positions, pool);
+        _injectTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+        _injects++;
+        _injectRows += positions.Length;
     }
 
     internal Half* RingKeys(int layer) => (Half*)_ring + (long)layer * 2 * RingCapacity * _kvDim;
@@ -154,7 +163,10 @@ internal sealed unsafe class DFlashMtpState : IMtpState
         if (position == _length)
         {
             _draftCount = Math.Clamp(draftTokens, 1, _draft.Length);
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
             _drafter.Draft(this, target, tokenId, position, _draft.AsSpan(0, _draftCount));
+            _draftTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+            _drafts++;
             _draftStart = position;
             return _draft[0];
         }
@@ -173,6 +185,12 @@ internal sealed unsafe class DFlashMtpState : IMtpState
     {
         if (_disposed) return;
         _disposed = true;
+        if (Trace && (_drafts > 0 || _injects > 0))
+        {
+            double f = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            Console.Error.WriteLine($"[dflash] drafts={_drafts} draft_ms={_draftTicks * f / Math.Max(1, _drafts):F1}/draft " +
+                $"injects={_injects} rows={_injectRows} inject_ms={_injectTicks * f:F0} total ({_injectTicks * f / Math.Max(1, _injects):F1}/inject)");
+        }
         if (_ring != 0) { NativeMemory.AlignedFree((void*)_ring); _ring = 0; }
         if (_taps != null) { NativeMemory.AlignedFree(_taps); _taps = null; }
     }

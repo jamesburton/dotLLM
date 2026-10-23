@@ -94,6 +94,11 @@ internal sealed unsafe class DFlashDrafter : IDisposable
     /// <summary>Head dimension.</summary>
     public int HeadDim { get; }
 
+    /// <summary>Drafts per round: the block's <c>BlockSize - 1</c>, capped by <c>DOTLLM_DFLASH_DRAFT</c> when set.</summary>
+    public int DraftTokensPerRound
+        => int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_DFLASH_DRAFT"), out int n) && n >= 1
+            ? Math.Min(n, BlockSize - 1) : BlockSize - 1;
+
     /// <summary>True for a DFlash2 drafter (convolutions + selector).</summary>
     public bool IsDFlash2 => _selHidden is not null;
 
@@ -296,6 +301,22 @@ internal sealed unsafe class DFlashDrafter : IDisposable
             ulong[] a => Array.ConvertAll(a, x => checked((int)x)),
             _ => throw new InvalidOperationException($"DFlash '{key}' is not an integer array."),
         };
+    }
+
+    /// <summary>Tap slot per target layer input <c>0..numLayers</c> (-1 = not tapped).</summary>
+    /// <param name="numLayers">Target layer count.</param>
+    /// <returns>The slot map.</returns>
+    public int[] SlotForLayerInput(int numLayers)
+    {
+        var slots = new int[numLayers + 1];
+        Array.Fill(slots, -1);
+        for (int k = 0; k < TargetLayers.Length; k++)
+        {
+            if (slots[TargetLayers[k]] >= 0)
+                throw new InvalidOperationException($"DFlash target layer {TargetLayers[k]} is listed twice.");
+            slots[TargetLayers[k]] = k;
+        }
+        return slots;
     }
 
     /// <summary>Width of one captured tap row (<c>targets x hidden</c>).</summary>
