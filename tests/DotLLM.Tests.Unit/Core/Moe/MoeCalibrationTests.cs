@@ -178,7 +178,7 @@ public sealed class MoeCalibrationTests : IDisposable
     [Fact]
     public void Options_Validate_FlagsABadEnvironmentFallback()
     {
-        Assert.NotNull(MoeOffloadOptions.Validate(new MoeCliValues(), k => string.Equals(k, MoeOffloadOptions.ColdEnvVar, StringComparison.Ordinal) ? "igpu" : null));
+        Assert.NotNull(MoeOffloadOptions.Validate(new MoeCliValues(), k => string.Equals(k, MoeOffloadOptions.ColdEnvVar, StringComparison.Ordinal) ? "gpu" : null));
         Assert.NotNull(MoeOffloadOptions.Validate(new MoeCliValues(), k => string.Equals(k, MoeOffloadOptions.NCpuMoeEnvVar, StringComparison.Ordinal) ? "x" : null));
         Assert.Null(MoeOffloadOptions.Validate(new MoeCliValues(Cold: "auto", CpuThreads: 1, NCpuMoe: 0, ContextTokens: 1), _ => null));
     }

@@ -133,9 +133,14 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         [Description(DotLLM.Core.Moe.MoeOffloadOptions.ContextHelp)]
         public int? CtxSize { get; set; }
 
-        /// <summary>The raw MoE offload option values (issues #1070, #1071).</summary>
+        /// <summary>Vulkan device of the MoE iGPU cold leg (issue #1083).</summary>
+        [CommandOption(MoeOffloadCli.IgpuDeviceOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.IgpuDeviceHelp)]
+        public string? MoeIgpuDevice { get; set; }
+
+        /// <summary>The raw MoE offload option values (issues #1070, #1071, #1083).</summary>
         public DotLLM.Core.Moe.MoeCliValues MoeValues => new(MoeOffload, MoeCacheMib, MoeCachePolicy, MoeCold, MoeCpuThreads,
-            CpuMoe, NCpuMoeLayers, MoeCalibrate, CtxSize);
+            CpuMoe, NCpuMoeLayers, MoeCalibrate, CtxSize, MoeIgpuDevice);
 
         [CommandOption("--depth-list")]
         [Description("Comma-separated context depths for multi-point sweep (e.g., 512,2048,8192). " +

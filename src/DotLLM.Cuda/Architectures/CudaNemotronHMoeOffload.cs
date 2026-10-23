@@ -3,6 +3,8 @@ using DotLLM.Core.Configuration;
 using DotLLM.Core.Moe;
 using DotLLM.Cuda.Interop;
 using DotLLM.Models.Architectures;
+using DotLLM.Vulkan;
+using DotLLM.Vulkan.Interop;
 
 namespace DotLLM.Cuda.Architectures;
 
@@ -24,10 +26,12 @@ namespace DotLLM.Cuda.Architectures;
 /// <param name="CpuThreads">CPU cold-leg threads (including the forward's own thread); 0 when the CPU leg is off.</param>
 /// <param name="StaticCpuLayers">MoE layers statically on the CPU (<c>--cpu-moe</c> / <c>--n-cpu-moe</c>).</param>
 /// <param name="CostModel">The calibrated cost model, or null.</param>
+/// <param name="IgpuDevice">The integrated GPU of the iGPU cold leg (#1083), or null when there is none.</param>
+/// <param name="IgpuLayers">Offloaded MoE layers whose experts the iGPU can run (its banks were imported or staged).</param>
 public sealed record CudaMoeOffloadInfo(long CacheBytes, int CacheSlots, int Pools, ExpertCachePolicy Policy, bool PinnedStore,
     long StoreBytes, long BudgetBytes, bool RequestClamped, long ReserveBytes, long FreeBytesAfterLoad, int ArenaWaveExperts,
     long ArenaBytes, int SpillRetries, MoeColdMode Cold = MoeColdMode.Copy, int CpuThreads = 0, int StaticCpuLayers = 0,
-    MoeCostModel? CostModel = null);
+    MoeCostModel? CostModel = null, string? IgpuDevice = null, int IgpuLayers = 0);
 
 /// <summary>
 /// Routed-expert offload for <c>nemotron_h_moe</c> on CUDA (issue #1070; design #1063 sections 8b and 8d, and the addendum's
@@ -255,7 +259,9 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
         private int[] _coldExperts = [];
         private int[] _coldTokens = [];
         private ColdExpertCost[] _coldCosts = [];
-        private bool[] _coldOnCpu = [];
+        private ColdPlace[] _coldPlace = [];
+        private ColdPlace[] _groupPlace = [];   // per group: where a Cold lookup result runs (CPU or iGPU)
+        private int[] _igpuExperts = [];
         private int[] _promoExperts = [], _promoSlots = [];
         private int _promoCount;
         private readonly List<(nint Event, int Pool, int[] Slots)> _promotionsInFlight = [];   // one entry per call that promoted
@@ -280,14 +286,29 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
         /// <summary>The CPU leg's workers, or null when no layer can use the CPU.</summary>
         public CpuColdLeg? CpuLeg { get; private set; }
 
-        /// <summary>Promote-only admission (cold modes cpu and auto), or null.</summary>
+        /// <summary>The iGPU leg (#1083), or null when no integrated GPU is used.</summary>
+        public VulkanNemotronHMoeExpertService? IgpuLeg { get; private set; }
+
+        /// <summary>Scratch of the iGPU leg's row list (expert and token per row), <c>maxRows</c> entries.</summary>
+        public int[] IgpuRowExperts { get; private set; } = [];
+
+        /// <summary>See <see cref="IgpuRowExperts"/>.</summary>
+        public int[] IgpuRowTokens { get; private set; } = [];
+
+        /// <summary>Promote-only admission (every cold mode but copy), or null.</summary>
         public IExpertAdmission? Admission { get; private set; }
 
         /// <summary>The calibrated cost model, or null.</summary>
         public MoeCostModel? Cost { get; private set; }
 
-        /// <summary>Groups of the current call planned for the CPU (the last ones of the schedule).</summary>
+        /// <summary>Groups of the current call planned for the CPU (after the device's groups, before the iGPU's).</summary>
         public int CpuGroups { get; private set; }
+
+        /// <summary>Groups of the current call planned for the iGPU (#1083; the last ones of the schedule).</summary>
+        public int IgpuGroups { get; private set; }
+
+        /// <summary>Groups of the current call computed off the device: <see cref="CpuGroups"/> + <see cref="IgpuGroups"/>.</summary>
+        public int ColdGroups => CpuGroups + IgpuGroups;
 
         /// <summary>Event a hit of the current call on a recently promoted slot must wait for, or 0.</summary>
         public nint PromotionWaitEvent { get; private set; }
@@ -304,8 +325,11 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
             Cold = options.Cold;
         }
 
-        /// <summary>True when <paramref name="layer"/> may compute experts on the CPU (static CPU layer, or a cold mode other than copy).</summary>
-        public bool MayUseCpu(int layer) => _options.IsStaticCpuLayer(layer) || (Cold != MoeColdMode.Copy && CpuLeg is not null);
+        /// <summary>
+        /// True when <paramref name="layer"/> may compute experts off the device, on the CPU or the iGPU (static CPU layer, or a cold mode
+        /// other than copy): its layer calls read the expert input back.
+        /// </summary>
+        public bool MayUseColdLeg(int layer) => _options.IsStaticCpuLayer(layer) || (Cold != MoeColdMode.Copy && CpuLeg is not null);
 
         public static MoeOffloadState Create(CudaNemotronHTransformerModel model, NemotronHLayerWeights[] cpuLayers,
             MoeOffloadOptions options)
@@ -376,6 +400,8 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
                     CpuThreads = state.CpuLeg?.Threads ?? 0,
                     StaticCpuLayers = staticCpu,
                     CostModel = state.Cost,
+                    IgpuDevice = state.IgpuLeg?.DeviceDescription,
+                    IgpuLayers = state.IgpuLeg is { } ig ? Enumerable.Range(0, layers).Count(ig.Supports) : 0,
                 };
                 return state;
             }
@@ -605,7 +631,9 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
                 _coldExperts = new int[groups];
                 _coldTokens = new int[groups];
                 _coldCosts = new ColdExpertCost[groups];
-                _coldOnCpu = new bool[groups];
+                _coldPlace = new ColdPlace[groups];
+                _groupPlace = new ColdPlace[groups];
+                _igpuExperts = new int[groups];
                 _promoExperts = new int[groups];
                 _promoSlots = new int[groups];
             }
@@ -615,6 +643,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
             _promoCount = 0;
             BypassCount = 0;
             CpuGroups = 0;
+            IgpuGroups = 0;
             PromotionWaitEvent = 0;
 
             // --cpu-moe / --n-cpu-moe: every expert of a static layer runs on the CPU; the cache never sees the layer.
@@ -659,13 +688,16 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
                         _bypassExperts[BypassCount++] = e;
                         break;
                     default:
-                        _cpuExperts[CpuGroups++] = e;
+                        // Cold: the CPU, or the iGPU when PlaceColdMisses put it there (#1083).
+                        if (_groupPlace[g] == ColdPlace.Igpu) _igpuExperts[IgpuGroups++] = e;
+                        else _cpuExperts[CpuGroups++] = e;
                         break;
                 }
             }
             if (hits > 0) PromotionWaitEvent = PendingPromotionEvent(pool, groupExperts, groups, layer);
 
-            // Group order: ready groups (ascending expert), then streamed groups (ascending expert, wave by wave).
+            // Group order: ready groups (ascending expert), then streamed groups (ascending expert, wave by wave), then the CPU's
+            // groups, then the iGPU's (#1083): the cold rows land after the device rows in that order (see RunColdLegs).
             int gi = 0;
             for (int i = 0; i < ready; i++)
             {
@@ -692,6 +724,13 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
                 groupDown[gi] = 0;
                 gi++;
             }
+            for (int j = 0; j < IgpuGroups; j++)
+            {
+                groupExperts[gi] = _igpuExperts[j];
+                groupUp[gi] = 0;
+                groupDown[gi] = 0;
+                gi++;
+            }
             ReadyGroups = ready;
             if (WaveEvents.Length < Waves) WaveEvents = new nint[Math.Max(Waves, 2)];
 
@@ -700,15 +739,16 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
             long copies = _readyInsertedCount + BypassCount + _promoCount;
             MoeTelemetry.RecordLookups(hits, misses, Cache.Evictions - evictionsBefore,
                 copies * (moe.UpPerExpertBytes + moe.DownPerExpertBytes));
-            MoeTelemetry.RecordRouted(groups, CpuGroups);
+            MoeTelemetry.RecordRouted(groups, CpuGroups, IgpuGroups);
             MoeTelemetry.RecordPromotions(_promoCount);
             return ready;
         }
 
         /// <summary>
-        /// Cold modes cpu and auto (#1071): the lookup left every miss cold. Decides which go to the device (admitted by the cache's
-        /// policy: <see cref="ExpertLookupResult.Inserted"/> or <see cref="ExpertLookupResult.Bypass"/>) and which stay on the CPU,
-        /// then offers the CPU ones to promote-only admission. Rewrites <c>_lookupResults</c> / <c>_lookupSlots</c> in place.
+        /// Every cold mode but copy (#1071, #1083): the lookup left every miss cold. Decides which go to the device (admitted by the
+        /// cache's policy: <see cref="ExpertLookupResult.Inserted"/> or <see cref="ExpertLookupResult.Bypass"/>), which to the CPU and
+        /// which to the iGPU (<c>_groupPlace</c>), then offers the cold ones to promote-only admission. Rewrites <c>_lookupResults</c> /
+        /// <c>_lookupSlots</c> in place.
         /// </summary>
         private void PlaceColdMisses(DeviceMoe moe, int[] groupExperts, int groups, int[] counts, ExpertLayout layout)
         {
@@ -730,22 +770,13 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
                 }
             }
 
-            // Auto: Fiddler + greedy balance by the calibrated costs. Cpu: everything uncached on the CPU.
-            if (Cold == MoeColdMode.Auto && Cost is not null)
-            {
-                for (int i = 0; i < cold; i++) _coldCosts[i] = Cost.ColdCost(layout, _coldTokens[i]);
-                MoeColdAssignment.Assign(_coldCosts.AsSpan(0, cold), residentUs, CpuLeg!.Threads, Cost.SyncRoundTripUs,
-                    _coldOnCpu.AsSpan(0, cold));
-            }
-            else
-            {
-                _coldOnCpu.AsSpan(0, cold).Fill(true);
-            }
+            PlaceCold(layer, layout, cold, residentUs);
 
             for (int i = 0; i < cold; i++)
             {
-                if (_coldOnCpu[i]) continue;
                 int g = _coldExperts[i];
+                _groupPlace[g] = _coldPlace[i];
+                if (_coldPlace[i] != ColdPlace.Device) continue;
                 int s = Cache.Admit(layer, groupExperts[g], out _);
                 _lookupSlots[g] = s;
                 _lookupResults[g] = s >= 0 ? ExpertLookupResult.Inserted : ExpertLookupResult.Bypass;
@@ -757,12 +788,50 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
             long bytes = moe.UpPerExpertBytes + moe.DownPerExpertBytes;
             for (int i = 0; i < cold; i++)
             {
-                if (!_coldOnCpu[i]) continue;
+                if (_coldPlace[i] == ColdPlace.Device) continue;
                 int e = groupExperts[_coldExperts[i]];
                 int slot = Admission.TryPromote(layer, e, bytes, out _);
                 if (slot < 0) continue;
                 _promoExperts[_promoCount] = e;
                 _promoSlots[_promoCount++] = slot;
+            }
+        }
+
+        /// <summary>
+        /// Places the <paramref name="cold"/> uncached experts of a layer call (<c>_coldTokens</c>) into <c>_coldPlace</c> by the cold
+        /// mode (#1071, #1083):
+        /// <list type="bullet">
+        ///   <item>auto: the three-way assignment (device / CPU / iGPU) over the calibrated costs; the iGPU side only when this layer's
+        ///   banks are on the iGPU.</item>
+        ///   <item>cpu+igpu: the same assignment with copying ruled out (device cost infinite).</item>
+        ///   <item>igpu: everything on the iGPU; cpu: everything on the CPU. A layer the iGPU refused falls back to the CPU.</item>
+        /// </list>
+        /// </summary>
+        private void PlaceCold(int layer, ExpertLayout layout, int cold, double residentUs)
+        {
+            bool igpu = IgpuLeg is { } leg && leg.Supports(layer);
+            var places = _coldPlace.AsSpan(0, cold);
+            switch (Cold)
+            {
+                case MoeColdMode.Auto when Cost is not null:
+                case MoeColdMode.CpuIgpu when Cost is not null && igpu:
+                    bool noCopy = Cold == MoeColdMode.CpuIgpu;
+                    for (int i = 0; i < cold; i++)
+                    {
+                        var c = Cost.ColdCost(layout, _coldTokens[i]);
+                        if (!igpu) c = c with { IgpuUs = double.PositiveInfinity };
+                        if (noCopy) c = c with { CopyUs = double.PositiveInfinity };
+                        _coldCosts[i] = c;
+                    }
+                    MoeColdAssignment.Assign(_coldCosts.AsSpan(0, cold), residentUs, CpuLeg!.Threads, Cost.SyncRoundTripUs,
+                        igpu ? Cost.IgpuSubmitUs : double.PositiveInfinity, places);
+                    break;
+                case MoeColdMode.Igpu or MoeColdMode.CpuIgpu when igpu:
+                    places.Fill(ColdPlace.Igpu);
+                    break;
+                default:
+                    places.Fill(ColdPlace.Cpu);
+                    break;
             }
         }
 
@@ -854,8 +923,9 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
         }
 
         /// <summary>
-        /// The cold-expert set-up at load (#1071): the CPU worker pool when any layer may use the CPU, and in auto / cpu mode the
-        /// cost model (calibrated or cached). Auto without a cost model falls back to copy.
+        /// The cold-expert set-up at load (#1071, #1083): the CPU worker pool when any layer may compute off the device (it is also the
+        /// iGPU leg's fallback), the iGPU leg when the mode may use one, and in every mode but copy the cost model (calibrated or
+        /// cached). Auto without a cost model falls back to copy; cpu+igpu without one to igpu.
         /// </summary>
         private void SetUpColdExperts(CudaNemotronHTransformerModel model, NemotronHLayerWeights[] cpuLayers,
             MoeOffloadOptions options, int staticCpu, Action<string> log)
@@ -864,14 +934,99 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
             if (!anyCpu) return;
             int threads = options.EffectiveCpuThreads;
             CpuLeg = new CpuColdLeg(threads);
+            if (options.MayUseIgpuLeg && _layouts.Length > 0)
+                SetUpIgpuLeg(model, cpuLayers, options, log);
             if (Cold != MoeColdMode.Copy && _layouts.Length > 0)
             {
-                Cost = model.CalibrateMoeCold(cpuLayers, options, threads, _copyStream, log);
+                Cost = model.CalibrateMoeCold(cpuLayers, options, threads, _copyStream, IgpuLeg, log);
                 if (Cost is null && Cold == MoeColdMode.Auto) Cold = MoeColdMode.Copy;
+                if (Cost is null && Cold == MoeColdMode.CpuIgpu)
+                {
+                    log("MoE cold experts: cpu+igpu needs the calibrated costs to split the experts; without them every cold expert " +
+                        "goes to the iGPU (--moe-cold igpu).");
+                    Cold = MoeColdMode.Igpu;
+                }
+            }
+            if (Cold == MoeColdMode.Copy && IgpuLeg is not null)
+            {
+                // Auto fell back to copy: nothing will ever run on the iGPU.
+                IgpuLeg.Dispose();
+                IgpuLeg = null;
             }
             if (_layouts.Length == 0 && Cold != MoeColdMode.Copy) Cold = MoeColdMode.Cpu;   // --cpu-moe: nothing is ever cached
-            log($"MoE cold experts: {Cold.ToString().ToLowerInvariant()} mode, {threads} CPU thread(s)" +
+            log($"MoE cold experts: {MoeOffloadOptions.FormatCold(Cold)} mode, {threads} CPU thread(s)" +
+                (IgpuLeg is { } ig ? $", iGPU {ig.DeviceDescription}" : "") +
                 (staticCpu > 0 ? $", {staticCpu} MoE layer(s) statically on the CPU" : "") + ".");
+        }
+
+        /// <summary>
+        /// Test hook (#1083): replaces the integrated-GPU discovery. Receives the offloaded MoE layers, the hidden size, the row capacity
+        /// and the log, and returns the service (or null for "no iGPU").
+        /// </summary>
+        internal static Func<IReadOnlyList<(int Layer, NemotronHMoeWeights Moe)>, int, int, Action<string>, VulkanNemotronHMoeExpertService?>?
+            IgpuFactoryForTests { get; set; }
+
+        /// <summary>
+        /// Creates the iGPU leg (#1083): the integrated Vulkan GPU (or <c>--moe-igpu-device</c>), with the banks of every offloaded,
+        /// non-static MoE layer imported zero-copy. In auto mode a missing iGPU, a failure, or a fixed cost model without iGPU costs
+        /// just means no iGPU leg; <c>igpu</c> and <c>cpu+igpu</c> fail the load instead.
+        /// </summary>
+        private void SetUpIgpuLeg(CudaNemotronHTransformerModel model, NemotronHLayerWeights[] cpuLayers, MoeOffloadOptions options,
+            Action<string> log)
+        {
+            bool required = options.RequiresIgpuLeg;
+            if (!required && options.CostModelOverride is { HasIgpu: false })
+                return;   // a caller-fixed cost model that never puts anything on an iGPU: do not touch one
+
+            var layers = new List<(int Layer, NemotronHMoeWeights Moe)>();
+            for (int l = 0; l < cpuLayers.Length; l++)
+                if (cpuLayers[l].Moe is { } m && _poolOfLayer[l] >= 0) layers.Add((l, m));
+            int maxRows = Math.Max(1, model._moeScratchTokens * Math.Max(1, model._moeSpec.TopK));
+
+            string reason;
+            VulkanNemotronHMoeExpertService? leg;
+            try
+            {
+                if (IgpuFactoryForTests is { } factory)
+                {
+                    leg = factory(layers, model.Config.HiddenSize, maxRows, log);
+                    reason = leg is null ? "the test factory returned none" : "test factory";
+                }
+                else
+                {
+                    leg = VulkanNemotronHMoeExpertService.TryCreateOnIntegratedGpu(options.IgpuDevice, layers, model.Config.HiddenSize,
+                        maxRows, log, out reason);
+                }
+            }
+            catch (Exception ex) when (ex is VulkanException or InvalidOperationException or NotSupportedException
+                or DllNotFoundException or EntryPointNotFoundException or OutOfMemoryException)
+            {
+                leg = null;
+                reason = $"creating it failed: {ex.Message}";
+            }
+
+            if (leg is not null && layers.Count > 0 && !layers.Any(l => leg.Supports(l.Layer)))
+            {
+                reason = $"it refused every offloaded layer's banks ({leg.RefusalReason(layers[0].Layer)})";
+                leg.Dispose();
+                leg = null;
+            }
+            if (leg is null)
+            {
+                if (required)
+                    throw new InvalidOperationException(
+                        $"--moe-cold {MoeOffloadOptions.FormatCold(options.Cold)} needs an integrated Vulkan GPU for the MoE cold experts, " +
+                        $"but {reason}. Pass --moe-igpu-device, or use --moe-cold cpu (issue #1083).");
+                log($"MoE cold experts: no iGPU leg ({reason}).");
+                return;
+            }
+
+            IgpuLeg = leg;
+            IgpuRowExperts = new int[leg.MaxRows];
+            IgpuRowTokens = new int[leg.MaxRows];
+            int supported = layers.Count(l => leg.Supports(l.Layer));
+            log($"MoE iGPU: {leg.DeviceDescription} ({reason}); {supported} of {layers.Count} offloaded MoE layer(s), " +
+                $"{leg.ImportedBanks} bank(s) imported zero-copy, {leg.StagedBanks} staged ({leg.StagedBytes / (1024.0 * 1024.0):F0} MiB).");
         }
 
         private nint ArenaSlot(int bypassIndex)
@@ -1040,6 +1195,8 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
             _promotionsInFlight.Clear();
             foreach (nint e in _promotionEventsFree) CudaDriverApi.cuEventDestroy_v2(e);
             _promotionEventsFree.Clear();
+            IgpuLeg?.Dispose();
+            IgpuLeg = null;
             CpuLeg?.Dispose();
             foreach (nint p in _pinned) CudaDriverApi.cuMemFreeHost(p);
             _pinned.Clear();

@@ -5,6 +5,8 @@ using DotLLM.Core.Configuration;
 using DotLLM.Core.Moe;
 using DotLLM.Cuda.Interop;
 using DotLLM.Models.Architectures;
+using DotLLM.Vulkan;
+using DotLLM.Vulkan.Interop;
 
 namespace DotLLM.Cuda.Architectures;
 
@@ -20,8 +22,11 @@ namespace DotLLM.Cuda.Architectures;
 ///   <item>When the CPU set is done its rows are copied to the device next to the device-computed slot rows, and the existing
 ///   gather kernel assembles the slot-ordered buffer the unchanged weighted sum reads. The summation order is therefore the
 ///   resident order; only the CPU experts' GEMV rounding differs from the device's.</item>
+///   <item>#1083: a third set may go to the integrated GPU (<see cref="VulkanNemotronHMoeExpertService"/>, banks imported zero-copy).
+///   Its rows are submitted before the CPU workers start, so both legs run concurrently, and its per-slot rows join the CPU's in the
+///   same pinned buffer (after them, in schedule order), the same H2D and the same gather: no new kernel.</item>
 /// </list>
-/// A layer call whose CPU set is empty skips all of this after the read-back (no extra sync, no gather).
+/// A layer call whose cold sets are empty skips all of this after the read-back (no extra sync, no gather).
 /// </summary>
 public sealed unsafe partial class CudaNemotronHTransformerModel
 {
@@ -68,39 +73,66 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
     }
 
     /// <summary>
-    /// The CPU half of an offloaded layer call whose plan put <c>off.CpuGroups</c> experts on the CPU (the last groups of the
-    /// schedule): runs them on the worker pool while the device works through its own groups, sends their slot rows to the
-    /// device after the device-computed rows, and gathers both into slot order. Returns the slot buffer for the weighted sum.
+    /// The off-device half of an offloaded layer call whose plan put <c>off.CpuGroups</c> experts on the CPU and
+    /// <c>off.IgpuGroups</c> on the iGPU (the last groups of the schedule, CPU first): submits the iGPU's rows (#1083), runs the
+    /// CPU's on the worker pool meanwhile (the device works through its own groups too), waits for the iGPU, sends every cold slot
+    /// row to the device after the device-computed rows, and gathers them all into slot order. Returns the slot buffer for the
+    /// weighted sum.
     /// </summary>
-    private nint RunCpuColdLeg(DeviceMoe moe, in MoeSchedule sched, int n, int expertDim, nint streamH)
+    private nint RunColdLegs(DeviceMoe moe, in MoeSchedule sched, int n, int expertDim, nint streamH)
     {
         var off = _offload!;
         int topK = moe.NumExpertsPerTok;
         int slots = n * topK;
-        int firstCpu = sched.Groups - off.CpuGroups;
+        int firstCold = sched.Groups - off.ColdGroups;
+        int firstIgpu = sched.Groups - off.IgpuGroups;
         byte* stage = (byte*)_moePinned + _moePinnedScheduleOffset;
         int* groupStart = (int*)(stage + sched.GroupStartOffset);
         int* slotIds = (int*)(stage + sched.SlotIdsOffset);
-        int cpuStart = groupStart[firstCpu];
-        int cpuRows = slots - cpuStart;
+        int coldStart = groupStart[firstCold];
+        int coldRows = slots - coldStart;
         float* outRows = (float*)((byte*)_moeColdPinned + _moeColdOutOffset);
 
-        // The device's groups are queued; mark where they end so the stall of the stream on the CPU rows can be timed.
+        // The device's groups are queued; mark where they end so the stall of the stream on the cold rows can be timed.
         var waitTiming = off.BeginCpuWait(streamH);
 
-        long t0 = Stopwatch.GetTimestamp();
-        off.CpuLeg!.Run(moe.Host, expertDim, topK, _moeGroupExperts, firstCpu, sched.Groups, groupStart, slotIds,
-            ColdInputRows, outRows);
-        MoeTelemetry.RecordCpuCompute((long)Stopwatch.GetElapsedTime(t0).TotalMicroseconds);
+        // iGPU first (#1083): gather its rows' inputs from the read-back and submit, so it computes while the CPU does.
+        bool igpu = off.IgpuGroups > 0;
+        if (igpu)
+        {
+            int rows = VulkanNemotronHMoeExpertService.BuildRows(_moeGroupExperts, firstIgpu, sched.Groups, groupStart, slotIds, topK,
+                off.IgpuRowExperts, off.IgpuRowTokens);
+            off.IgpuLeg!.Begin(moe.LayerIndex, off.IgpuRowExperts.AsSpan(0, rows), off.IgpuRowTokens.AsSpan(0, rows), ColdInputRows);
+        }
+        try
+        {
+            if (off.CpuGroups > 0)
+            {
+                long t0 = Stopwatch.GetTimestamp();
+                off.CpuLeg!.Run(moe.Host, expertDim, topK, _moeGroupExperts, firstCold, firstIgpu, groupStart, slotIds,
+                    ColdInputRows, outRows);
+                MoeTelemetry.RecordCpuCompute((long)Stopwatch.GetElapsedTime(t0).TotalMicroseconds);
+            }
+        }
+        finally
+        {
+            // The iGPU's rows follow the CPU's in schedule order (and so in the pinned buffer).
+            if (igpu)
+            {
+                off.IgpuLeg!.End(outRows + (long)(groupStart[firstIgpu] - coldStart) * expertDim);
+                MoeTelemetry.RecordIgpuCompute((long)off.IgpuLeg.LastComputeUs);
+                MoeTelemetry.RecordIgpuWait((long)off.IgpuLeg.LastWaitUs);
+            }
+        }
 
         int* idx = (int*)((byte*)_moeColdPinned + _moeColdIdxOffset);
-        BuildColdGatherIndex(slotIds, cpuStart, slots, idx);
+        BuildColdGatherIndex(slotIds, coldStart, slots, idx);
 
-        // On the compute stream, after the device's groups: the CPU rows behind the device rows, the index, then the gather.
+        // On the compute stream, after the device's groups: the cold rows behind the device rows, the index, then the gather.
         // (The compute stream, not the copy stream: these few KB must not queue behind weight copies, and the weighted sum that
         // reads them is on the compute stream anyway.)
         nint rowsDst = _moeSlotOut + (nint)((long)slots * expertDim * sizeof(float));
-        CudaDriverApi.cuMemcpyHtoDAsync_v2(rowsDst, (nint)outRows, (nuint)((long)cpuRows * expertDim * sizeof(float)), streamH).ThrowOnError();
+        CudaDriverApi.cuMemcpyHtoDAsync_v2(rowsDst, (nint)outRows, (nuint)((long)coldRows * expertDim * sizeof(float)), streamH).ThrowOnError();
         CudaDriverApi.cuMemcpyHtoDAsync_v2(_moeColdIdxDevice, (nint)idx, (nuint)((long)slots * sizeof(int)), streamH).ThrowOnError();
         off.EndCpuWait(waitTiming, streamH);
         _kernels.LaunchMoeGatherTokenRowsF32(_moeSlotOut, _moeSlotMerged, _moeColdIdxDevice, slots, expertDim, streamH);
@@ -108,12 +140,13 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
     }
 
     /// <summary>
-    /// The gather index of a layer call with a CPU leg: slot s reads row <c>idx[s]</c> of the extended slot buffer, whose first
-    /// <paramref name="slots"/> rows are the device-computed slot rows (indexed by slot) and whose next rows are the CPU rows, in
-    /// schedule order (row <c>slots + (p − cpuStart)</c> holds the slot at schedule position p ≥ <paramref name="cpuStart"/>).
+    /// The gather index of a layer call with cold legs: slot s reads row <c>idx[s]</c> of the extended slot buffer, whose first
+    /// <paramref name="slots"/> rows are the device-computed slot rows (indexed by slot) and whose next rows are the cold rows (the
+    /// CPU's, then the iGPU's, #1083), in schedule order (row <c>slots + (p − cpuStart)</c> holds the slot at schedule position
+    /// p ≥ <paramref name="cpuStart"/>).
     /// </summary>
-    /// <param name="slotIds">Slot ids in schedule order (the CPU groups last, from position <paramref name="cpuStart"/>).</param>
-    /// <param name="cpuStart">First schedule position of the CPU groups.</param>
+    /// <param name="slotIds">Slot ids in schedule order (the cold groups last, from position <paramref name="cpuStart"/>).</param>
+    /// <param name="cpuStart">First schedule position of the cold (CPU, then iGPU) groups.</param>
     /// <param name="slots">Slots of the call (<c>n · topK</c>).</param>
     /// <param name="idx">Receives the index, <paramref name="slots"/> entries.</param>
     internal static void BuildColdGatherIndex(int* slotIds, int cpuStart, int slots, int* idx)
@@ -241,10 +274,11 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
     /// <summary>
     /// The cost model of the offloaded layers: <see cref="MoeOffloadOptions.CostModelOverride"/>, else the cached calibration of this
     /// machine and file, else a fresh measurement (pinned H2D bandwidth, the D2H + sync round trip, CPU time of one expert per
-    /// layout at n = 1 and 8), written back to the cache. Null when it cannot be measured (the caller then copies every miss).
+    /// layout at n = 1 and 8, and with an iGPU leg (#1083) its empty-submission round trip and one-expert submissions at n = 1 and 8),
+    /// written back to the cache. Null when it cannot be measured (the caller then copies every miss).
     /// </summary>
     private MoeCostModel? CalibrateMoeCold(NemotronHLayerWeights[] cpuLayers, MoeOffloadOptions options, int cpuThreads,
-        nint copyStream, Action<string> log)
+        nint copyStream, VulkanNemotronHMoeExpertService? igpu, Action<string> log)
     {
         if (options.CostModelOverride is { } fixedModel)
         {
@@ -252,21 +286,29 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
             return fixedModel;
         }
 
-        // One representative expert per layout: the first layer that has it.
-        var samples = new List<(ExpertLayout Layout, NemotronHMoeWeights Moe)>();
-        foreach (var l in cpuLayers)
-            if (l.Moe is { } m && samples.All(s => s.Layout != new ExpertLayout(m.UpPerExpertBytes, m.DownPerExpertBytes)))
-                samples.Add((new ExpertLayout(m.UpPerExpertBytes, m.DownPerExpertBytes), m));
+        // One representative expert per layout: the first layer that has it (for the iGPU, the first layer whose banks it holds).
+        var samples = new List<(ExpertLayout Layout, NemotronHMoeWeights Moe, int IgpuLayer)>();
+        for (int li = 0; li < cpuLayers.Length; li++)
+        {
+            if (cpuLayers[li].Moe is not { } m) continue;
+            var layout = new ExpertLayout(m.UpPerExpertBytes, m.DownPerExpertBytes);
+            int at = samples.FindIndex(s => s.Layout == layout);
+            int igpuLayer = igpu is not null && igpu.Supports(li) ? li : -1;
+            if (at < 0) samples.Add((layout, m, igpuLayer));
+            else if (samples[at].IgpuLayer < 0 && igpuLayer >= 0) samples[at] = samples[at] with { IgpuLayer = igpuLayer };
+        }
         if (samples.Count == 0) return null;
+        var igpuLayouts = igpu is null ? null : samples.Where(s => s.IgpuLayer >= 0).Select(s => s.Layout).ToList();
 
         string gpu = CudaDevice.GetDevice(_deviceId).Name;
         byte[] bus = new byte[32];
         string pci = CudaDriverApi.cuDeviceGetPCIBusId(bus, bus.Length, _deviceId) == 0
             ? System.Text.Encoding.ASCII.GetString(bus).TrimEnd('\0') : "unknown";
-        var key = MoeCalibrationKey.ForFile(gpu, pci, options.ModelPath, cpuThreads);
+        var key = MoeCalibrationKey.ForFile(gpu, pci, options.ModelPath, cpuThreads, igpu?.DeviceDescription);
         string path = options.CalibrationPath ?? MoeCalibrationStore.DefaultPath;
 
-        if (!options.Calibrate && MoeCalibrationStore.TryLoad(path, key) is { } cached && cached.Covers(samples.Select(s => s.Layout)))
+        if (!options.Calibrate && MoeCalibrationStore.TryLoad(path, key) is { } cached
+            && cached.Covers(samples.Select(s => s.Layout), igpuLayouts))
         {
             log($"MoE cold experts: cached calibration ({cached.MeasuredUtc:u}): {cached.Describe()}");
             return cached.ToCostModel();
@@ -279,20 +321,27 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
             double rtt = MeasureRoundTrip();
             var timings = new List<MoeLayoutTiming>();
             int hidden = Config.HiddenSize;
-            foreach (var (layout, moe) in samples)
+            double igpuSubmit = igpu?.MeasureSubmitRoundTripUs() ?? double.NaN;
+            foreach (var (layout, moe, igpuLayer) in samples)
             {
                 var (us1, us8) = MeasureCpuExpert(moe, NemotronHMoeExpertCompute.ExpertDim(moe, hidden));
-                timings.Add(new MoeLayoutTiming(layout.UpBytes, layout.DownBytes, us1, us8));
+                double ig1 = double.NaN, ig8 = double.NaN;
+                if (igpu is not null && igpuLayer >= 0)
+                {
+                    ig1 = igpu.MeasureExpertUs(igpuLayer, expert: 0, n: 1);
+                    ig8 = igpu.MeasureExpertUs(igpuLayer, expert: 0, n: 8);
+                }
+                timings.Add(new MoeLayoutTiming(layout.UpBytes, layout.DownBytes, us1, us8, ig1, ig8));
             }
-            var record = new MoeCalibrationRecord(h2d, rtt, timings, DateTime.UtcNow);
+            var record = new MoeCalibrationRecord(h2d, rtt, timings, DateTime.UtcNow, igpuSubmit);
             bool saved = MoeCalibrationStore.TrySave(path, key, record);
             log($"MoE cold experts: calibrated in {Stopwatch.GetElapsedTime(t0).TotalMilliseconds:F0} ms: {record.Describe()}" +
                 (saved ? $" (cached in {path})" : " (cache not writable)"));
             return record.ToCostModel();
         }
-        catch (Exception ex) when (ex is CudaException or InvalidOperationException or OutOfMemoryException)
+        catch (Exception ex) when (ex is CudaException or VulkanException or InvalidOperationException or OutOfMemoryException)
         {
-            log($"MoE cold experts: calibration failed ({ex.Message}); copying every miss instead (--moe-cold copy).");
+            log($"MoE cold experts: calibration failed ({ex.Message}); no calibrated cold-expert costs.");
             return null;
         }
     }

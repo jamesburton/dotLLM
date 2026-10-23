@@ -26,7 +26,7 @@ public sealed record ServerOptions
     /// <summary>
     /// Routed-expert offload for CUDA <c>nemotron_h_moe</c> models (<c>--moe-offload</c>, <c>--moe-cache-mib</c>,
     /// <c>--moe-cache-policy</c>, issue #1070; <c>--moe-cold</c>, <c>--moe-cpu-threads</c>, <c>--cpu-moe</c>, <c>--n-cpu-moe</c>,
-    /// <c>--moe-calibrate</c>, <c>--ctx-size</c>, issue #1071). Null = defaults plus the <c>DOTLLM_MOE_*</c> environment variables.
+    /// <c>--moe-calibrate</c>, <c>--ctx-size</c>, issue #1071; <c>--moe-igpu-device</c>, issue #1083). Null = defaults plus the <c>DOTLLM_MOE_*</c> environment variables.
     /// </summary>
     public DotLLM.Core.Moe.MoeOffloadOptions? MoeOffload { get; init; }
 
@@ -352,7 +352,7 @@ public sealed record ServerOptions
         string? quant = null;
         string device = "auto";
         int? gpuLayers = null;
-        string? moeOffloadMode = null, moeCacheMib = null, moeCachePolicy = null, moeCold = null;
+        string? moeOffloadMode = null, moeCacheMib = null, moeCachePolicy = null, moeCold = null, moeIgpuDevice = null;
         int? moeCpuThreads = null, nCpuMoe = null, ctxSize = null;
         bool cpuMoe = false, moeCalibrate = false;
         int threads = 0;
@@ -412,6 +412,8 @@ public sealed record ServerOptions
                     moeCachePolicy = next; i++; break;
                 case "--moe-cold":
                     moeCold = next; i++; break;
+                case "--moe-igpu-device":
+                    moeIgpuDevice = next; i++; break;
                 case "--moe-cpu-threads":
                     moeCpuThreads = int.Parse(next!, System.Globalization.CultureInfo.InvariantCulture); i++; break;
                 case "--n-cpu-moe":
@@ -524,7 +526,7 @@ public sealed record ServerOptions
             Device = device,
             GpuLayers = gpuLayers,
             MoeOffload = DotLLM.Core.Moe.MoeOffloadOptions.FromCli(new DotLLM.Core.Moe.MoeCliValues(moeOffloadMode, moeCacheMib,
-                moeCachePolicy, moeCold, moeCpuThreads, cpuMoe, nCpuMoe, moeCalibrate, ctxSize)),
+                moeCachePolicy, moeCold, moeCpuThreads, cpuMoe, nCpuMoe, moeCalibrate, ctxSize, moeIgpuDevice)),
             Threads = threads,
             DecodeThreads = decodeThreads,
             Host = host,

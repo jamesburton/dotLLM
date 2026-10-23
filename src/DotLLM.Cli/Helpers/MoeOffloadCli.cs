@@ -4,7 +4,7 @@ using Spectre.Console;
 namespace DotLLM.Cli.Helpers;
 
 /// <summary>
-/// CLI glue for routed-expert offload (issues #1070, #1071), shared by <c>run</c>, <c>chat</c>, <c>serve</c> and <c>bench</c>:
+/// CLI glue for routed-expert offload (issues #1070, #1071, #1083), shared by <c>run</c>, <c>chat</c>, <c>serve</c> and <c>bench</c>:
 /// the option names, validation, the options record, and the one-line telemetry summary.
 /// </summary>
 internal static class MoeOffloadCli
@@ -29,6 +29,9 @@ internal static class MoeOffloadCli
 
     /// <summary>Option name of llama.cpp's <c>--n-cpu-moe</c> (#1071; bench's #370 option).</summary>
     public const string NCpuMoeOption = "--n-cpu-moe";
+
+    /// <summary>Option name of the iGPU cold leg's Vulkan device (#1083).</summary>
+    public const string IgpuDeviceOption = "--moe-igpu-device";
 
     /// <summary>Option name of the forced re-calibration (#1071).</summary>
     public const string CalibrateOption = "--moe-calibrate";

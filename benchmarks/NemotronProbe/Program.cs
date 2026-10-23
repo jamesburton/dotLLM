@@ -3,13 +3,15 @@
 // `nemprobe_kl.py` can compute per-position KL / top-1 agreement against llama.cpp on IDENTICAL ids (#375).
 //
 //   NemotronProbe tok    <gguf> <text-file>                                  -> dotLLM token ids (stdout)
-//   NemotronProbe logits <gguf> <ids-file> <out-prefix> <ctx> <chunks> [cpu|vulkan]
+//   NemotronProbe expert <gguf> [threads]                                     -> CPU us per routed expert (MoE offload cost model, #1063)
+//   NemotronProbe logits <gguf> <ids-file> <out-prefix> <ctx> <chunks> [cpu|vulkan|cuda]
 //       window c = ids[c*ctx .. (c+1)*ctx), fresh sequence state; rows first..ctx-2 (first = ctx/2) are written to
 //       <out-prefix>.logits.f32 (chunk-major) and <out-prefix>.meta.txt ("ctx chunks vocab first").
 using System.Diagnostics;
 using DotLLM.Core.Models;
 using DotLLM.Models;
 using DotLLM.Models.Gguf;
+using DotLLM.Models.Architectures;
 using DotLLM.Tokenizers;
 using DotLLM.Tokenizers.ChatTemplates;
 using DotLLM.Core.Configuration;
@@ -26,6 +28,64 @@ internal static class Program
         {
             var tok = GgufBpeTokenizerFactory.Load(gguf.Metadata);
             Console.WriteLine(string.Join(' ', tok.EncodeRaw(File.ReadAllText(args[2]))));
+            return 0;
+        }
+        if (args[0] == "expert")
+        {
+            // expert <gguf> [threads] : CPU cost of ONE routed expert (up -> relu2 -> down) per MoE layer kind, for
+            // n = 1, 4, 16, 64 tokens. Feeds the MoE offload CPU-vs-copy crossover (Fiddler-style cost model).
+            int threads = args.Length > 2 ? int.Parse(args[2]) : 0;
+            using var em = (NemotronHTransformerModel)ModelLoader.CreateCpuModelFromGguf(gguf, config, new ThreadingConfig(threads));
+            var bf = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+            var layers = (System.Collections.IList)typeof(NemotronHTransformerModel).GetField("_layers", bf)!.GetValue(em)!;
+            var gemm = typeof(NemotronHTransformerModel).GetMethod("Gemm", bf)!;
+            var seen = new HashSet<string>();
+            Console.WriteLine("layer experts width upQt downQt expertMB | n=1 us  n=4 us  n=16 us  n=64 us | GB/s@n=1");
+            foreach (var lwo in layers)
+            {
+                var moe = lwo!.GetType().GetProperty("Moe")!.GetValue(lwo);
+                if (moe is null) continue;
+                dynamic d = new DynProps(moe);
+                int ne = d.NumExperts, w = d.MoeIntermediateSize, lat = d.LatentSize; int kin = lat > 0 ? lat : config.HiddenSize;
+                string key = $"{w}/{d.UpExpsQuantType}/{d.DownExpsQuantType}";
+                if (!seen.Add(key)) continue;
+                double mb = ((long)d.UpPerExpertBytes + (long)d.DownPerExpertBytes) / 1e6;
+                unsafe
+                {
+                    // Pre-fault both banks so the timing measures RAM, not first-touch mmap reads.
+                    long sum = 0;
+                    foreach (var (bp, bytes) in new[] { ((nint)d.UpExpsWeight, (long)d.UpPerExpertBytes * ne), ((nint)d.DownExpsWeight, (long)d.DownPerExpertBytes * ne) })
+                        for (long o = 0; o < bytes; o += 4096) sum += ((byte*)bp)[o];
+                    if (sum == 42) Console.Write("");
+                }
+                var res = new List<double>();
+                foreach (int n in new[] { 1, 4, 16, 64 })
+                {
+                    float[] x = new float[n * kin], mid = new float[n * w], y = new float[n * kin];
+                    var rnd = new Random(1); for (int i = 0; i < x.Length; i++) x[i] = (float)(rnd.NextDouble() - 0.5);
+                    var sw = new Stopwatch(); int reps = 0; long budget = Stopwatch.Frequency / 2; var times = new List<double>();
+                    unsafe
+                    {
+                        fixed (float* px = x, pm = mid, py = y)
+                        {
+                            for (int iter = -40; sw.ElapsedTicks < budget || reps < 25; iter++)
+                            {
+                                int e = (iter + 7919 * (iter & 1023)) % ne; if (e < 0) e += ne; // walk experts: cold-ish cache
+                                nint up = (nint)d.UpExpsWeight + (nint)(e * (long)d.UpPerExpertBytes);
+                                nint dn = (nint)d.DownExpsWeight + (nint)(e * (long)d.DownPerExpertBytes);
+                                if (iter == 0) sw.Start();
+                                long t0 = Stopwatch.GetTimestamp();
+                                gemm.Invoke(em, new object[] { up, d.UpExpsQuantType, System.Reflection.Pointer.Box(px, typeof(float*)), System.Reflection.Pointer.Box(pm, typeof(float*)), w, kin, n, System.Reflection.Pointer.Box(null, typeof(byte*)) });
+                                DotLLM.Cpu.Kernels.ReluSquared.Execute(mid, mid);
+                                gemm.Invoke(em, new object[] { dn, d.DownExpsQuantType, System.Reflection.Pointer.Box(pm, typeof(float*)), System.Reflection.Pointer.Box(py, typeof(float*)), kin, w, n, System.Reflection.Pointer.Box(null, typeof(byte*)) });
+                                if (iter >= 0) { reps++; times.Add((Stopwatch.GetTimestamp() - t0) * 1e6 / Stopwatch.Frequency); }
+                            }
+                        }
+                    }
+                    times.Sort(); res.Add(times[times.Count / 2]);
+                }
+                Console.WriteLine($"{ne,5} {w,5} {d.UpExpsQuantType}/{d.DownExpsQuantType} {mb,6:F2} | {res[0],7:F0} {res[1],7:F0} {res[2],7:F0} {res[3],7:F0} | {mb / 1e3 / (res[0] / 1e6),5:F1}");
+            }
             return 0;
         }
         if (args[0] == "render")
@@ -190,6 +250,12 @@ internal static class Program
             (model, _) = DotLLM.Vulkan.VulkanModelLoader.CreateSharedFromGguf(gguf, config);
             deviceId = 0;
         }
+        else if (device == "cuda")
+        {
+            // nemotron_h_moe expert offload (#1063) follows the DOTLLM_MOE_* environment variables (null options).
+            (model, _) = DotLLM.Cuda.CudaModelLoader.CreateFromGguf(gguf, config, deviceId: 0);
+            deviceId = 0;
+        }
         else
         {
             model = ModelLoader.CreateCpuModelFromGguf(gguf, config, new ThreadingConfig(0));
@@ -230,5 +296,17 @@ internal static class Program
             }
         }
         return 0;
+    }
+}
+
+/// <summary>Reads (public or non-public) instance properties of an internal object by name, for the expert benchmark.</summary>
+internal sealed class DynProps : System.Dynamic.DynamicObject
+{
+    private readonly object _o;
+    public DynProps(object o) => _o = o;
+    public override bool TryGetMember(System.Dynamic.GetMemberBinder b, out object? r)
+    {
+        r = _o.GetType().GetProperty(b.Name, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!.GetValue(_o);
+        return true;
     }
 }

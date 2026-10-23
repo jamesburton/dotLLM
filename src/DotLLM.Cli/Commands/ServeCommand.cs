@@ -84,12 +84,17 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [DefaultValue(false)]
         public bool MoeCalibrate { get; set; }
 
+        /// <summary>Vulkan device of the MoE iGPU cold leg (issue #1083).</summary>
+        [CommandOption(DotLLM.Cli.Helpers.MoeOffloadCli.IgpuDeviceOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.IgpuDeviceHelp)]
+        public string? MoeIgpuDevice { get; set; }
+
         /// <summary>
-        /// The raw MoE offload option values (issues #1070, #1071). The served context (<see cref="CtxSize"/>, <c>--ctx-size</c>,
+        /// The raw MoE offload option values (issues #1070, #1071, #1083). The served context (<see cref="CtxSize"/>, <c>--ctx-size</c>,
         /// #1068) is also the context the offload budget reserves KV cache for; 0 or unset keeps the default.
         /// </summary>
         public DotLLM.Core.Moe.MoeCliValues MoeValues => new(MoeOffload, MoeCacheMib, MoeCachePolicy, MoeCold, MoeCpuThreads,
-            CpuMoe, NCpuMoe, MoeCalibrate, CtxSize is > 0 ? CtxSize : null);
+            CpuMoe, NCpuMoe, MoeCalibrate, CtxSize is > 0 ? CtxSize : null, MoeIgpuDevice);
 
         /// <summary>CPU thread count.</summary>
         [CommandOption("--threads")]

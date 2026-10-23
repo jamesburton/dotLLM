@@ -534,8 +534,9 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
         Interlocked.Increment(ref MoePathCounters.LayerCalls);
 
         // 1-2. Router on the full h, logits to pinned host memory, then the event the host waits on. A layer that may compute
-        // experts on the CPU (#1071) runs latent_down first and reads the expert input back under the same event.
-        bool coldLeg = moe.Offloaded && _moeColdScratch && _offload!.MayUseCpu(moe.LayerIndex);
+        // experts off the device (the CPU, #1071, or the iGPU, #1083) runs latent_down first and reads the expert input back under
+        // the same event.
+        bool coldLeg = moe.Offloaded && _moeColdScratch && _offload!.MayUseColdLeg(moe.LayerIndex);
         nint expertIn = moe.LatentSize > 0 ? _moeXLatent : h;
         Gemm(moe.GateInp, moe.GateInpQt, h, _moeRouterLogits, nExpert, hiddenSize, n);
         if (coldLeg && moe.LatentSize > 0)
@@ -565,13 +566,13 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
 
         // 6. Routed experts: up (+relu^2) reads the token's row of the expert input, down reads the slot's own row.
         // Offloaded: the same launches over group subsets, each after the copy of its experts (see RunOffloadedExperts); the
-        // groups planned for the CPU (#1071) run on the host workers meanwhile and their rows are gathered into slot order.
+        // groups planned for the CPU (#1071) and the iGPU (#1083) run there meanwhile and their rows are gathered into slot order.
         nint slotOut = _moeSlotOut;
         if (moe.Offloaded)
         {
             RunOffloadedExperts(moe, sched, expertIn, expertDim, streamH);
-            if (_offload!.CpuGroups > 0)
-                slotOut = RunCpuColdLeg(moe, sched, n, expertDim, streamH);
+            if (_offload!.ColdGroups > 0)
+                slotOut = RunColdLegs(moe, sched, n, expertDim, streamH);
         }
         else
         {
@@ -602,8 +603,8 @@ public sealed unsafe partial class CudaNemotronHTransformerModel
     /// ids grouped by expert (a counting sort, ascending slot within an expert, as the CPU grouped body); per slot its token;
     /// per slot its gating weight. Slot id = <c>token · topK + k</c>. Resident: groups in ascending expert order, pointers into
     /// the uploaded banks. Offloaded (#1070): the expert cache orders the groups (ready first, then the streamed waves) and
-    /// supplies the slot / arena pointers; each group's slots and arithmetic are unchanged. Groups planned for the CPU (#1071)
-    /// come last, with null pointers (no device launch reads them).
+    /// supplies the slot / arena pointers; each group's slots and arithmetic are unchanged. Groups planned for the CPU (#1071),
+    /// then for the iGPU (#1083), come last, with null pointers (no device launch reads them).
     /// </summary>
     private MoeSchedule BuildMoeSchedule(DeviceMoe moe, int n)
     {

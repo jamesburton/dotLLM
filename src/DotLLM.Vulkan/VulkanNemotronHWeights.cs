@@ -715,11 +715,29 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     /// ~100 GB), in a form an indexed matmul kernel reads: Q8_0, Q5_1 and the K-quants Q4_K / Q5_K / Q6_K as stored (#1045, the
     /// Nemotron 3.5 Bolt AD-Q4_K_M / AD-Q6_K banks), the IQ family as stored (#1057, NVIDIA's official IQ2_XXS Bolt file; needs integer dot
     /// product), Q5_0 exactly repacked to Q5_1. Any other expert quantization throws instead of silently widening (MXFP4 / NVFP4 banks).
+    /// Shared with the MoE iGPU expert service (#1083), which passes <paramref name="mayStage"/> to bound what a refused zero-copy import
+    /// may copy instead.
     /// </summary>
-    private static VulkanDevice.Buffer UploadExpertBank(
+    /// <param name="device">Target device.</param>
+    /// <param name="staging">Staging buffer for the copy path.</param>
+    /// <param name="srcPtr">Host pointer to the bank.</param>
+    /// <param name="srcQt">Bank type as stored.</param>
+    /// <param name="numExperts">Experts in the bank.</param>
+    /// <param name="mDim">Output rows per expert.</param>
+    /// <param name="kDim">Row length.</param>
+    /// <param name="what">Tensor name for messages.</param>
+    /// <param name="deviceQt">Receives the bank type on the device.</param>
+    /// <param name="bytes">Receives the device bytes.</param>
+    /// <param name="mayStage">
+    /// Asked with the byte count before a staged copy (import refused, or a Q5_0 repack); false refuses the bank with a
+    /// <see cref="NotSupportedException"/>. Null = always stage.
+    /// </param>
+    /// <returns>The device buffer.</returns>
+    /// <exception cref="NotSupportedException">The bank type or shape is not supported, or <paramref name="mayStage"/> refused the copy.</exception>
+    internal static VulkanDevice.Buffer UploadExpertBank(
         VulkanDevice device, VulkanStagingBuffer staging,
         nint srcPtr, QuantizationType srcQt, int numExperts, int mDim, int kDim, string what,
-        out QuantizationType deviceQt, out long bytes)
+        out QuantizationType deviceQt, out long bytes, Func<long, bool>? mayStage = null)
     {
         long rows = (long)numExperts * mDim;
         long srcRowBytes = Dequantize.RowByteSize(kDim, srcQt);
@@ -738,7 +756,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
             case QuantizationType.Q8_0:
             case QuantizationType.Q5_1:
                 deviceQt = srcQt;
-                return UploadAsStored(device, staging, srcPtr, srcRowBytes * rows, out bytes);
+                return UploadAsStored(device, staging, srcPtr, srcRowBytes * rows, out bytes, mayStage, what);
             case var _ when MoeIqFormats.FromQuantizationType(srcQt) is { } iq:
             {
                 // #1057: IQ-family banks (NVIDIA's official Bolt GGUF is IQ2_XXS) stay packed for the IQ MMVQ / grouped coopmat kernels (#823).
@@ -752,13 +770,15 @@ internal sealed class VulkanNemotronHWeights : IDisposable
                         $"nemotron_h_moe {what} is {srcQt}: the Vulkan IQ expert kernels need integer dot product (dp4a), which this device lacks. " +
                         "Widening the banks to F32 is not an option at this size; use --device cpu.");
                 deviceQt = srcQt;
-                return UploadAsStored(device, staging, srcPtr, srcRowBytes * rows, out bytes);
+                return UploadAsStored(device, staging, srcPtr, srcRowBytes * rows, out bytes, mayStage, what);
             }
             case QuantizationType.Q5_0:
             {
                 deviceQt = QuantizationType.Q5_1;
                 long dstRowBytes = Dequantize.RowByteSize(kDim, QuantizationType.Q5_1);
                 bytes = dstRowBytes * rows;
+                if (mayStage is not null && !mayStage(bytes))
+                    throw new NotSupportedException($"nemotron_h_moe {what} is Q5_0, which must be repacked (copied) to Q5_1, and the copy budget refused {bytes} bytes.");
                 var buf = device.AllocateDeviceLocal(bytes);
                 int blocksPerRow = kDim / 32;
                 staging.UploadRows(rows, dstRowBytes, buf, 0, (chunkPtr, firstRow, rowCount) =>
@@ -784,13 +804,20 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     /// <param name="srcPtr">Host pointer to the bank (mmapped GGUF data).</param>
     /// <param name="byteCount">Bank size in bytes.</param>
     /// <param name="bytes">Receives <paramref name="byteCount"/>, the bytes the bank occupies on the device.</param>
+    /// <param name="mayStage">Asked before a staged copy when the import is refused; false throws. Null = always stage.</param>
+    /// <param name="what">Tensor name for messages.</param>
     /// <returns>The device buffer holding the bank.</returns>
     private static VulkanDevice.Buffer UploadAsStored(
-        VulkanDevice device, VulkanStagingBuffer staging, nint srcPtr, long byteCount, out long bytes)
+        VulkanDevice device, VulkanStagingBuffer staging, nint srcPtr, long byteCount, out long bytes,
+        Func<long, bool>? mayStage = null, string what = "")
     {
         bytes = byteCount;
         if (VulkanWeightImportPolicy.TryImport(device, srcPtr, byteCount, out var imported))
             return imported!;
+        if (mayStage is not null && !mayStage(byteCount))
+            throw new NotSupportedException(
+                $"nemotron_h_moe {what}: the zero-copy import was refused ({VulkanWeightImportPolicy.LastFallbackReason}) and a staged copy " +
+                $"of {byteCount / (1024.0 * 1024.0):F0} MiB exceeds the copy budget.");
         var buf = device.AllocateDeviceLocal(byteCount);
         staging.UploadBytes(srcPtr, byteCount, buf);
         VulkanWeightImportPolicy.NoteStaged(srcPtr, byteCount);

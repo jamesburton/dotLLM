@@ -951,6 +951,8 @@ public sealed unsafe class NemotronHTransformerModel : IModel
             selScratch[best] = float.NegativeInfinity;
         }
 
+        RouteTrace.Record(moe, topIdx[..topK]);
+
         float sum = 0f;
         for (int k2 = 0; k2 < topK; k2++) { weights[k2] = logits[topIdx[k2]]; sum += weights[k2]; }
         if (moe.NormalizeWeights)
