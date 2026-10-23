@@ -10,6 +10,9 @@ lane are issued before any of them is consumed. A wave covers 32 consecutive blo
 Math: sum_i (nibble_i - 8) * x_i = dot(nibble, x) - 8 * sum(x); the Q8_1 activation block already carries s = d_x * sum(x) (xds.y), so
    block = d * (d_x * dot(nibble, xq) - 8 * s)      (llama.cpp's vec_dot_q4_0_q8_1 form; nibbles 0..15 fit int8 for dp4a)
 
+Q4_1 (issue #1171, Recursive Flint) is the same lane layout on the 20-byte block (fp16 d, fp16 m, 16 qs bytes), which is word aligned, so
+the five loads need no funnel shift:  block = d * d_x * dot(nibble, xq) + m * s      (llama.cpp's vec_dot_q4_1_q8_1 form).
+
 Run from the repo root: python native/vulkan/gen_q4_0_mmvq_v2.py
 """
 import os
@@ -136,6 +139,49 @@ layout(push_constant) uniform PushConstants {
     store='y[n * pc.M + m] = total;')
 
 
+# Q4_1 rewrite of the rendered Q4_0 text: every (old, new) pair must match (checked in render_q4_1).
+Q4_1_EDITS = [
+    ('(issue #1018) - edit the generator', '(issues #1018, #1171) - edit the generator'),
+    (' Q4_0 MMVQ decode GEMV, V2: a lane owns a whole 32-element block (18 bytes = 5 aligned word loads)',
+     ' Q4_1 MMVQ decode GEMV, V2: a lane owns a whole 32-element block (20 bytes = 5 aligned word loads)'),
+    ('See the generator for the math (nibble dot minus 8 * Q8_1 block sum).',
+     'See the generator for the math (d * nibble dot + m * Q8_1 block sum).'),
+    ('// Q4_0 block (18 bytes, 2-byte aligned): [0,1] fp16 d | [2..17] qs[16]; byte j: low nibble = element j, high nibble = element j + 16.',
+     '// Q4_1 block (20 bytes, word aligned): [0,1] fp16 d | [2,3] fp16 m | [4..19] qs[16]; byte j: low nibble = element j, high = j + 16.'),
+    ('const uint BLOCK_BYTES = 18u;', 'const uint BLOCK_BYTES = 20u;'),
+    ('''            bool hi = (((rowByteBase + b * BLOCK_BYTES) & 2u) != 0u);
+            // qs word m = block bytes [2 + 4m, 6 + 4m): funnel of two stream words when the block starts word aligned, one stream word otherwise.
+            uint q0 = hi ? vq[s][1] : ((vq[s][0] >> 16u) | (vq[s][1] << 16u));
+            uint q1 = hi ? vq[s][2] : ((vq[s][1] >> 16u) | (vq[s][2] << 16u));
+            uint q2 = hi ? vq[s][3] : ((vq[s][2] >> 16u) | (vq[s][3] << 16u));
+            uint q3 = hi ? vq[s][4] : ((vq[s][3] >> 16u) | (vq[s][4] << 16u));
+''', '''            uint q0 = vq[s][1], q1 = vq[s][2], q2 = vq[s][3], q3 = vq[s][4];
+'''),
+    ('''            // d: bytes 0..1 of the block = the high half of stream word 0 when the block starts 2 bytes into it, else its low half.
+            float d = unpackHalf2x16(hi ? (vq[s][0] >> 16u) : (vq[s][0] & 0xFFFFu)).x;
+            float contrib = d * (ds[s].x * float(dot) - 8.0 * ds[s].y);
+''', '''            vec2 dm = unpackHalf2x16(vq[s][0]);
+            float contrib = dm.x * ds[s].x * float(dot) + dm.y * ds[s].y;
+'''),
+    ('// Q4_0 blob', '// Q4_1 blob'),
+    ('K/32 x 18 B]', 'K/32 x 20 B]'),
+]
+
+
+def render_q4_1(spec, u):
+    text = render(spec, u)
+    hit = False
+    for old, new in Q4_1_EDITS:
+        if old in text:
+            text = text.replace(old, new)
+            hit = True
+    assert hit
+    for old, _ in Q4_1_EDITS:
+        assert old not in text, old
+    assert 'Q4_0' not in text and '18 B' not in text, 'unconverted Q4_0 text left in the Q4_1 shader'
+    return text
+
+
 def render(spec, u):
     return (HEADER.replace('__TITLE__', spec['title']).replace('__BINDINGS__', spec['bindings']).replace('__ENTRY__', spec['entry'])
             .replace('__STORE__', spec['store']).replace('__U__', str(u)))
@@ -144,10 +190,11 @@ def render(spec, u):
 def main():
     u = int(os.environ.get('Q4_0_V2_U', '2'))
     for spec in (DENSE, MOE):
-        path = os.path.join(SHADERS, spec['name'] + '.comp')
-        with open(path, 'w', encoding='utf-8', newline='\n') as f:
-            f.write(render(spec, u))
-        print('wrote', path, 'U =', u)
+        for name, text in ((spec['name'], render(spec, u)), (spec['name'].replace('q4_0', 'q4_1'), render_q4_1(spec, u))):
+            path = os.path.join(SHADERS, name + '.comp')
+            with open(path, 'w', encoding='utf-8', newline='\n') as f:
+                f.write(text)
+            print('wrote', path, 'U =', u)
 
 
 if __name__ == '__main__':

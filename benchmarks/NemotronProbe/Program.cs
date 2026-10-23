@@ -171,6 +171,109 @@ internal static class Program
                 + $"max row base={baseL}; time full={ta:F0}s compact={tb:F0}s");
             return maxAbs == 0 ? 0 : 1;
         }
+        if (args[0] == "steps")
+        {
+            // steps <gguf> <ids-files> <promptLens> <chunk> <cpu|vulkan> <outs> [ctx] (#1171): for each id file, prefill ids[0..promptLen)
+            // in chunks through the backend's own KV cache, then teacher-force the rest one token at a time. Writes the last row of the final
+            // prefill chunk and every decode step ([steps, vocab] F32) for a cross-device KL; prints prefill / decode tok/s, KV bytes and
+            // memory. <ids-files>, <promptLens> and <outs> are comma-separated lists of equal length (one model load). promptLen 0 = no decode
+            // (prefill everything). ctx defaults to the longest stream + 8.
+            string[] idFilesS = args[2].Split(','), outsS = args[6].Split(',');
+            int[] promptLens = args[3].Split(',').Select(int.Parse).ToArray();
+            if (idFilesS.Length != promptLens.Length || idFilesS.Length != outsS.Length) { Console.Error.WriteLine("list lengths differ"); return 2; }
+            int[][] streams = idFilesS.Select(f => File.ReadAllText(f).Split(new[] { ' ', '\n', '\r', ',', '[', ']' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(int.Parse).ToArray()).ToArray();
+            int chunk = int.Parse(args[4]);
+            string dev = args[5];
+            int ctxLen = args.Length > 7 ? int.Parse(args[7]) : streams.Max(s => s.Length) + 8;
+            var swLoad = Stopwatch.StartNew();
+            IModel ms;
+            Func<int, DotLLM.Core.Attention.IKvCache> makeKv;
+            int did;
+            if (dev == "vulkan")
+            {
+                (ms, makeKv) = DotLLM.Vulkan.VulkanModelLoader.CreateSharedFromGguf(gguf, config);
+                did = 0;
+            }
+            else
+            {
+                ms = ModelLoader.CreateCpuModelFromGguf(gguf, config, new ThreadingConfig(0));
+                var cpuModel = ms;
+                makeKv = n => new DotLLM.Engine.KvCache.SimpleKvCache(DotLLM.Core.Attention.KvGeometry.FromConfig(config, cpuModel.SupportsCompactSlidingKv), n);
+                did = -1;
+            }
+            double loadS = swLoad.Elapsed.TotalSeconds;
+            if (dev == "vulkan")
+            {
+                // VulkanWeights is internal: read its per-load import / staging ledger by reflection (diagnostic tool only).
+                var vw = typeof(DotLLM.Vulkan.VulkanTransformerModel).Assembly.GetType("DotLLM.Vulkan.VulkanWeights")!;
+                object? P(string n) => vw.GetProperty(n, System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic)?.GetValue(null);
+                Console.WriteLine($"upload: zero-copy matrices={P("LastUploadZeroCopyMatrices")} bytes={Convert.ToInt64(P("LastUploadZeroCopyBytes") ?? 0L) / 1048576.0:F0} MiB "
+                    + $"staged matrices={P("LastUploadStagingMatrices")} lastFallback='{P("LastUploadFallbackReason")}'");
+                if (P("LastResidencyReport") is { } rep)
+                    Console.WriteLine(rep.GetType().GetMethod("Describe")!.Invoke(rep, null));
+            }
+            Console.WriteLine($"steps {dev}: load={loadS:F1}s");
+            using (ms)
+            {
+                int v = config.VocabSize;
+                var rowBuf = new byte[v * 4];
+                for (int si = 0; si < streams.Length; si++)
+                {
+                    int[] sid = streams[si];
+                    int n = sid.Length, promptLen = promptLens[si] == 0 ? n : promptLens[si];
+                    ms.ResetSequenceState();
+                    bool allRows = Environment.GetEnvironmentVariable("STEPS_ALLROWS") == "1";
+                    if (allRows) ms.TrySetAllRowLogitsLimit(chunk + 1);
+                    using var kv = makeKv(ctxLen);
+                    using var fs = File.Create(outsS[si]);
+                    void Take(DotLLM.Core.Tensors.ITensor lg)
+                    {
+                        unsafe { System.Buffer.BlockCopy(new ReadOnlySpan<float>((float*)lg.DataPointer + (lg.ElementCount / v - 1) * v, v).ToArray(), 0, rowBuf, 0, rowBuf.Length); }
+                        fs.Write(rowBuf, 0, rowBuf.Length);
+                    }
+                    var sw = Stopwatch.StartNew();
+                    for (int p = 0; p < promptLen; p += chunk)
+                    {
+                        int len = Math.Min(chunk, promptLen - p);
+                        using var lg = ms.Forward(sid.AsSpan(p, len), Enumerable.Range(p, len).ToArray(), did, kv);
+                        if (allRows)
+                        {
+                            // STEPS_ALLROWS=1: every prefill row (needs all-row logits), for locating where two runs diverge.
+                            for (int r = 0; r < len; r++)
+                            {
+                                unsafe { System.Buffer.BlockCopy(new ReadOnlySpan<float>((float*)lg.DataPointer + (long)r * v, v).ToArray(), 0, rowBuf, 0, rowBuf.Length); }
+                                fs.Write(rowBuf, 0, rowBuf.Length);
+                            }
+                        }
+                        else if (p + len >= promptLen) Take(lg);
+                    }
+                    double prefillS = sw.Elapsed.TotalSeconds;
+                    sw.Restart();
+                    for (int i = promptLen; i < n; i++)
+                    {
+                        using var lg = ms.Forward(sid.AsSpan(i, 1), new[] { i }, did, kv);
+                        Take(lg);
+                    }
+                    double decodeS = sw.Elapsed.TotalSeconds;
+                    int decodeSteps = n - promptLen;
+                    long kvBytes = kv switch
+                    {
+                        DotLLM.Vulkan.VulkanKvCache vc => vc.AllocatedBytes,
+                        DotLLM.Engine.KvCache.SimpleKvCache sc => sc.AllocatedBytes,
+                        _ => -1,
+                    };
+                    string kvKind = kv is DotLLM.Vulkan.VulkanKvCache vk2 ? $"vulkan {vk2.Storage}" : kv.GetType().Name;
+                    var proc = Process.GetCurrentProcess();
+                    proc.Refresh();
+                    string devMem = ms is DotLLM.Vulkan.VulkanTransformerModel vm ? $" deviceWeights+scratch={vm.ComputeMemoryBytes / 1048576.0:F0} MiB" : "";
+                    Console.WriteLine($"steps {dev} [{Path.GetFileName(idFilesS[si])}]: prompt={promptLen} chunk={chunk} prefill={promptLen / prefillS:F1} tok/s "
+                        + $"decode={decodeSteps}@{(decodeSteps > 0 ? decodeSteps / decodeS : 0):F2} tok/s kv={kvKind} {kvBytes / 1048576.0:F1} MiB (ctx {ctxLen}) "
+                        + $"private={proc.PrivateMemorySize64 / 1048576.0:F0} MiB peakWS={proc.PeakWorkingSet64 / 1048576.0:F0} MiB{devMem}");
+                }
+            }
+            return 0;
+        }
         if (args[0] == "forced")
         {
             // forced <gguf> <ids-file> <promptLen> [cpu|vulkan]: teacher-forced top-1 agreement over positions promptLen-1..n-2

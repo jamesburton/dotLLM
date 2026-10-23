@@ -227,6 +227,33 @@ Q4_0 = dict(
     layout='Bank layout: [E, M, K/32 blocks of 18 bytes]: fp16 d, qs[16] (low nibble of byte j = element j, high nibble = element j + 16);\n// value = d * (nibble - 8). Blocks are 18 bytes (not word aligned): each thread loads the 5 words covering its block and funnel-shifts them.',
     body=IQ4_NL['body'].replace(KV, '').replace('IQ4_NL_BLOCK_BYTES', 'Q4_0_BLOCK_BYTES').replace('d * float(KV[nib])', 'd * float(int(nib) - 8)'))
 
+# Q4_1 (issue #1171, Recursive Flint): 20-byte blocks (fp16 d, fp16 m, 16 nibble bytes), value = d * nibble + m. 20 bytes keeps every
+# block word aligned, so the 5 words are loaded straight (no funnel shift).
+Q4_1 = dict(
+    name='q4_1', fmt='Q4_1', kreq='64', extra='',
+    layout='Bank layout: [E, M, K/32 blocks of 20 bytes]: fp16 d, fp16 m, qs[16] (low nibble of byte j = element j, high nibble = element j + 16);\n// value = d * nibble + m. Blocks are 20 bytes, so every block starts word aligned.',
+    body='''const uint Q4_1_BLOCK_BYTES = 20u;
+
+struct Stage { uint aw[5]; vec4 bv; };   // aw[0]: d | m << 16, aw[1..4]: qs bytes 0..15
+
+''' + LOAD_SIG + '''    for (uint i = 0u; i < 5u; i++) st.aw[i] = 0u;
+    if (rowValid) {
+        uint wi = (rowBase + (sb * 2u + blk) * Q4_1_BLOCK_BYTES) >> 2u;
+        for (uint i = 0u; i < 5u; i++) st.aw[i] = weight[wi + i];
+    }
+''' + B_LOAD + '\n' + COMMIT_SIG + ZERO_A + '''        vec2 dm = unpackHalf2x16(st.aw[0]);
+        // this thread's half selects the low (elements 0..15) or high (16..31) nibbles.
+        uint shift = half_ * 4u;
+        for (uint w = 0u; w < 4u; w++) {
+            uint nw = st.aw[w + 1u];
+            for (uint jb = 0u; jb < 4u; jb++) {
+                uint nib = (nw >> (jb * 8u + shift)) & 0xFu;
+                sharedA[aBase + w * 4u + jb] = float16_t(dm.x * float(nib) + dm.y);
+            }
+        }
+    }
+''' + B_COMMIT)
+
 # ---------------------------------------------------------------------------------------------------------------------------------
 # IQ4_XS: 136-byte super-blocks (word aligned): d, scales_h, scales_l[4], qs[128]; sub-block s = ib32 of the super-block.
 IQ4_XS = dict(
@@ -536,7 +563,7 @@ struct Stage { uint sw0; uint sw1; uint qs2; uint qhb; uint ib; vec4 bv; };   //
     }
 ''' + B_COMMIT)
 
-SHADERS = [IQ4_NL, IQ4_XS, IQ3_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, Q2_0, IQ1_M, Q4_0]
+SHADERS = [IQ4_NL, IQ4_XS, IQ3_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, Q2_0, IQ1_M, Q4_0, Q4_1]
 
 
 def render(spec):

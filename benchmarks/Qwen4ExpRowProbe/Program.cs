@@ -30,6 +30,8 @@ if (args[0] == "tier") { TierRun.Run(args); return; }
 if (args[0] == "kbench") { KBench.Run(args); return; }
 if (args[0] == "iqbench") { IqKBench.Run(args); return; }
 if (args[0] == "mimobench") { MimoIqBench.Run(args); return; }
+if (args[0] == "q41bench") { Q41Bench.Run(args); return; }
+if (args[0] == "sinkf16") { SinkF16Probe.Run(args); return; }
 if (args[0] == "mimofwd") { MimoFwd.Run(args); return; }
 if (args[0] == "smlsweep") { SmlSweep.Run(args); return; }
 if (args[0] == "leakprobe") { LeakProbe.Run(args); return; }

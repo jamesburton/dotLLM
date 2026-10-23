@@ -533,10 +533,10 @@ public record ModelConfig
     /// <param name="backend">Backend name shown to the user.</param>
     /// <returns>The refusal message.</returns>
     public static string FlintUnsupportedMessage(string backend)
-        => $"The Flint architecture (GGUF 'flint', Recursive Flint) is not supported on the {backend} backend yet - only the CPU backend runs it: "
-         + "the GPU paths lack NoPE on the full-attention layers inside the MoE loop, a sliding-window KV ring, a quantised shared-expert "
-         + "path and, for the official file, Q4_1 MoE kernels. Use --device cpu. "
-         + "Tracked in https://github.com/jamesburton/dotLLM/issues/1157 (Vulkan F4, CUDA F6).";
+        => $"The Flint architecture (GGUF 'flint', Recursive Flint) is not supported on the {backend} backend yet - the CPU backend and the "
+         + "single-device Vulkan model run it: this path lacks NoPE on the full-attention layers inside the MoE loop, sinks on every layer, a "
+         + "quantised ungated shared-expert path and, for the official file, Q4_1 kernels. Use --device cpu or a single Vulkan device. "
+         + "Tracked in https://github.com/jamesburton/dotLLM/issues/1157 (Vulkan F4 #1171, CUDA F6).";
 
     /// <summary>Actionable message for backends that cannot run <see cref="IsGemma4DensePle"/> models.</summary>
     public static string Gemma4DensePleUnsupportedMessage(string backend)

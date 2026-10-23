@@ -36,6 +36,9 @@ public sealed class VulkanSplitKvRowsAttentionKernel : IDisposable
     /// <summary>Dispatch counter (test hook: proves the path ran).</summary>
     internal long RecordCount { get; private set; }
 
+    /// <summary>Element format of the K / V buffers this instance reads (issue #1171: F16 loads the <c>_kvf16</c> twin of the split pass).</summary>
+    public VulkanKvStorage KvStorage { get; private init; }
+
     private VulkanSplitKvRowsAttentionKernel(VulkanDevice device, VulkanModule splitModule, ComputePipeline splitPipeline, nint splitPool,
         VulkanModule mergeModule, ComputePipeline mergePipeline, nint mergePool)
     {
@@ -47,9 +50,13 @@ public sealed class VulkanSplitKvRowsAttentionKernel : IDisposable
     }
 
     /// <summary>Loads the rows split + merge SPIR-V; null when either is missing or the pipeline cannot be created.</summary>
-    public static VulkanSplitKvRowsAttentionKernel? TryCreate(VulkanDevice device, string spvDir)
+    /// <param name="device">Vulkan device.</param>
+    /// <param name="spvDir">Directory holding the SPIR-V blobs.</param>
+    /// <param name="kvStorage">Element format of the K / V buffers (the merge pass reads only the F32 partials, so it is shared).</param>
+    /// <returns>The kernel, or null.</returns>
+    public static VulkanSplitKvRowsAttentionKernel? TryCreate(VulkanDevice device, string spvDir, VulkanKvStorage kvStorage = VulkanKvStorage.F32)
     {
-        string splitPath = Path.Combine(spvDir, "attention_f32_splitkv_rows.spv");
+        string splitPath = Path.Combine(spvDir, kvStorage.ShaderName("attention_f32_splitkv_rows") + ".spv");
         string mergePath = Path.Combine(spvDir, "attention_f32_splitkv_rows_merge.spv");
         if (!File.Exists(splitPath) || !File.Exists(mergePath)) return null;
         VulkanModule? splitModule = null, mergeModule = null;
@@ -68,7 +75,10 @@ public sealed class VulkanSplitKvRowsAttentionKernel : IDisposable
         }
         nint splitPool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 5);
         nint mergePool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
-        return new VulkanSplitKvRowsAttentionKernel(device, splitModule, splitPipeline, splitPool, mergeModule, mergePipeline, mergePool);
+        return new VulkanSplitKvRowsAttentionKernel(device, splitModule, splitPipeline, splitPool, mergeModule, mergePipeline, mergePool)
+        {
+            KvStorage = kvStorage,
+        };
     }
 
     private static ComputePipeline CreatePipeline(VulkanModule module, int bindingCount, int pushConstantBytes)
@@ -103,7 +113,7 @@ public sealed class VulkanSplitKvRowsAttentionKernel : IDisposable
         if (sinks is not null && sinks.Size < (long)numHeads * sizeof(float)) throw new ArgumentException("Sinks buffer too small.", nameof(sinks));
         int seqKv = positionOffset + seqQ;
         long qBytes = (long)seqQ * numHeads * headDim * sizeof(float);
-        long kvBytes = (long)seqKv * numKvHeads * headDim * sizeof(float);
+        long kvBytes = (long)seqKv * numKvHeads * headDim * KvStorage.ElementBytes();
         if (q.Size < qBytes || output.Size < qBytes) throw new ArgumentException("Q / output buffer too small.");
         if (k.Size < kvBytes || v.Size < kvBytes) throw new ArgumentException("K / V buffer too small.");
 

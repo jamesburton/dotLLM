@@ -293,10 +293,15 @@ The Vulkan backend ships native matmul kernels (GEMV decode + GEMM prefill, with
 | IQ1_S | ✓ | ✓ | — | IQ-family — smallest GGUF quant (~1.5-1.7 bpw) |
 | I2_S | ✓ | ✓ | ✓ (`MatMulI2SGemmF32Kernel`) | BitNet b1.58 ternary |
 | PQ2_0 | ✓ | ✓ | ✓ (`MatMulPQ2_0GemmF32Kernel`) | PrismML ternary + per-group scale |
-| Q4_0 / Q4_1 / Q5_1 | — | — | — | **not shipped** — see below |
+| Q4_0 | ✓ (+ dp4a MMVQ) | ✓ | ✓ (`MatMulQ4_0GemmCoopmatKernel`, wave64) | #1018 |
+| Q4_1 | ✓ (+ dp4a MMVQ) | ✓ | ✓ (same classes, `quant: Q4_1`, wave64) | #1171 (Recursive Flint's official file) |
+| Q5_1 | — | — | — | **not shipped** as a dense projection — see below |
 
-**The unshipped set is exactly Q4_0, Q4_1 and Q5_1.** For those three the upload path falls back to
-F32 dequant, so weight memory is doubled / quadrupled; every other `QuantizationType` stays on device
+Routed MoE banks of Q4_0 / Q4_1 (and the IQ family) are read in place by `MoeIndexedMatmulIqMmvqKernel` (decode, any row count when
+no grouped kernel exists) and `MoeGroupedMatmulIqCoopmatKernel` (prefill, wave64 coopmat).
+
+**The unshipped dense set is exactly Q5_1** (and Q4_0 under `DOTLLM_VK_Q4_0_NATIVE=0`). For those the upload path falls back to
+F32 dequant, so weight memory is quadrupled; every other `QuantizationType` stays on device
 in its packed source form. The authority is `VulkanWeights.DeviceQuantTypeFor` — each
 `Keep*OnDevice` predicate there additionally requires the contraction axis to be a multiple of the
 format's group size, and a misaligned tensor of *any* format falls back to F32 regardless of kernel

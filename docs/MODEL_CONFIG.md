@@ -165,7 +165,14 @@ Differences between architectures are captured entirely in ModelConfig.
 - **KV**: sliding layers keep only their recent rows on CPU (compact sliding-window KV, #1169, `docs/KV_CACHE.md`): at 262K the 14 full layers dominate (~14 GiB F32, ~3.7 GiB with `--cache-type-k q8_0 --cache-type-v q8_0 --cache-window 0`).
 - **GPU**: CUDA runs `flint` on the generic FP16 MoE loop (#1172, F6: per-layer NoPE, sigmoid routing, in-place Q4_1 GEMV /
   GEMM / grouped MoE kernels; see `docs/CUDA.md`). The 26 GB Q4_1 file needs a >= 32 GB GPU until F7 (CPU-expert offload).
-  Vulkan refuses `flint` (`ModelConfig.FlintUnsupportedMessage`) until F4.
+- **Vulkan** (#1171, single-device `VulkanTransformerModel` only; pipeline / hybrid refuse): sinks required on every layer (the gpt-oss
+  sink kernels), NoPE through the generic `IsNoRopeLayer` path, the ungated shared expert through the existing shared-expert branch, sigmoid
+  top-6 on `moe_topk_sigmoid_bias_f32` with a zero bias, and Q4_1 read in place everywhere (dense MMVQ / GEMV / GEMM / coopmat, MoE indexed
+  MMVQ + grouped coopmat). KV is **F16** (`VulkanKvCache.Storage`, `DOTLLM_VK_KV=f32` for A/B) at full length for every layer: the compact
+  sliding-window ring is not on Vulkan yet (follow-up), so 98 KiB/token (28 KiB of it the 14 full layers).
+  The grouped coopmat MoE kernels fold the down input into an F16 operand; real Flint tokens exceed 65504 there (inf, then a NaN token that
+  an F16 KV cache spreads to every later row). `row_pow2_downscale_f32` / `row_scale_mul_f32` apply the CPU's power-of-two rescale around
+  the grouped down projection (all architectures; `DOTLLM_VK_MOE_DOWN_RESCALE=0` disables it for A/B).
 - Verification: `FlintSyntheticGoldenTests` writes a random-weight `flint` GGUF (GQA 8:2, Q wider than hidden, window 4 over 16 tokens,
   NoPE on a MoE layer, sinks everywhere, shared expert) and compares against llama.cpp CPU logits on the same bytes: F32 max |dlogit|
   2.1e-6, Q4_1 routed + Q8_0 shared 8.0e-6; NoPE, window, shared expert, renormalisation and sinks each move the logits by > 4.

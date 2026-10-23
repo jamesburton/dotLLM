@@ -32,6 +32,19 @@ public sealed class MatMulQ4_0GemmF32Kernel : IDisposable
     private readonly DescriptorSetCache _descriptorCache;
     private bool _disposed;
 
+    /// <summary>The legacy 4-bit format this instance reads: <see cref="QuantizationType.Q4_0"/> (18 B blocks) or
+    /// <see cref="QuantizationType.Q4_1"/> (20 B blocks, issue #1171: same kernel shape, value <c>d * nibble + m</c>).</summary>
+    public QuantizationType Quant { get; private init; } = QuantizationType.Q4_0;
+
+    private int BlockBytes => Quant == QuantizationType.Q4_1 ? QuantFormat.Q4_1BlockBytes : QuantFormat.Q4_0BlockBytes;
+
+    private static string ShaderFor(string q4_0Name, QuantizationType quant) => quant switch
+    {
+        QuantizationType.Q4_0 => q4_0Name,
+        QuantizationType.Q4_1 => q4_0Name.Replace("q4_0", "q4_1", StringComparison.Ordinal),
+        _ => throw new ArgumentOutOfRangeException(nameof(quant), quant, "Only Q4_0 and Q4_1 are served by this kernel."),
+    };
+
     private MatMulQ4_0GemmF32Kernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
     {
         _device = device;
@@ -41,10 +54,14 @@ public sealed class MatMulQ4_0GemmF32Kernel : IDisposable
         _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 3);
     }
 
-    /// <summary>Loads <c>matmul_q4_0_f32_gemm.spv</c> from the given directory and creates the pipeline.</summary>
-    public static MatMulQ4_0GemmF32Kernel Create(VulkanDevice device, string spvDir)
+    /// <summary>Loads <c>matmul_q4_0_f32_gemm.spv</c> (or the <c>q4_1</c> variant) from the given directory and creates the pipeline.</summary>
+    /// <param name="device">Vulkan device.</param>
+    /// <param name="spvDir">Directory holding the SPIR-V blobs.</param>
+    /// <param name="quant"><see cref="QuantizationType.Q4_0"/> (default) or <see cref="QuantizationType.Q4_1"/>.</param>
+    /// <returns>The kernel.</returns>
+    public static MatMulQ4_0GemmF32Kernel Create(VulkanDevice device, string spvDir, QuantizationType quant = QuantizationType.Q4_0)
     {
-        string path = Path.Combine(spvDir, "matmul_q4_0_f32_gemm.spv");
+        string path = Path.Combine(spvDir, ShaderFor("matmul_q4_0_f32_gemm.spv", quant));
         if (!File.Exists(path))
             throw new FileNotFoundException(
                 $"Vulkan SPIR-V not found: {path}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");
@@ -69,7 +86,7 @@ public sealed class MatMulQ4_0GemmF32Kernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
-        return new MatMulQ4_0GemmF32Kernel(device, module, pipeline, pool);
+        return new MatMulQ4_0GemmF32Kernel(device, module, pipeline, pool) { Quant = quant };
     }
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
@@ -99,7 +116,7 @@ public sealed class MatMulQ4_0GemmF32Kernel : IDisposable
             throw new ArgumentException($"k must be a multiple of {Q4_0GroupSize}, got {k}", nameof(k));
 
         int blocksPerRow = k / Q4_0GroupSize;
-        long rowBytes = (long)blocksPerRow * Q4_0BlockBytes;
+        long rowBytes = (long)blocksPerRow * BlockBytes;
         int rowUints = (int)((rowBytes + 3) / 4);
 
         long weightsMin = (long)m * rowBytes;

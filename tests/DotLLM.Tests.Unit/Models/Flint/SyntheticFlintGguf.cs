@@ -48,6 +48,24 @@ internal static class SyntheticFlintGguf
         /// exact-arithmetic oracle for a backend that runs the quantised file (#1172).
         /// </summary>
         public bool F32Roundtrip { get; init; }
+
+        /// <summary>Hidden size (real Flint: 2048). Vulkan's packed Q4_1 routed banks need multiples of 256 (#1171).</summary>
+        public int Hidden { get; init; } = SyntheticFlintGguf.Hidden;
+
+        /// <summary>Routed expert width (real Flint: 512); the shared expert is <see cref="SharedCount"/> times this.</summary>
+        public int MoeFf { get; init; } = SyntheticFlintGguf.MoeFf;
+
+        /// <summary>Leading dense FFN width (real Flint: 6144).</summary>
+        public int DenseFf { get; init; } = SyntheticFlintGguf.DenseFf;
+
+        /// <summary>When false the FULL-attention layers' sinks are -30 (no effect) while the sliding layers keep theirs (#1171 mutant).</summary>
+        public bool FullLayerSinks { get; init; } = true;
+
+        /// <summary>Std of the router logits weights (smaller = fewer near-tie expert flips between engines).</summary>
+        public float RouterStd { get; init; } = 0.6f;
+
+        /// <summary>Multiplier on the routed gate / up bank std: large values push the SwiGLU output (the down input) past the F16 range (#1171).</summary>
+        public float ExpertGateUpScale { get; init; } = 1f;
     }
 
     public static byte[] Build(Options? options = null)
@@ -58,12 +76,13 @@ internal static class SyntheticFlintGguf
         s_roundtrip = options.F32Roundtrip;
         const string arch = "flint";
         int headDim = options.HeadDim;
+        int hidden = options.Hidden, moeFf = options.MoeFf, sharedFf = moeFf * SharedCount, denseFf = options.DenseFf;
         w.AddString("general.architecture", arch);
         w.AddUInt32("general.alignment", 32);
         w.AddUInt32($"{arch}.context_length", Context);
-        w.AddUInt32($"{arch}.embedding_length", Hidden);
+        w.AddUInt32($"{arch}.embedding_length", (uint)hidden);
         w.AddUInt32($"{arch}.block_count", Layers);
-        w.AddUInt32($"{arch}.feed_forward_length", DenseFf);
+        w.AddUInt32($"{arch}.feed_forward_length", (uint)denseFf);
         w.AddUInt32($"{arch}.attention.head_count", Heads);
         w.AddUInt32($"{arch}.attention.head_count_kv", Kv);
         w.AddUInt32($"{arch}.attention.key_length", (uint)headDim);
@@ -77,9 +96,9 @@ internal static class SyntheticFlintGguf
         w.AddUInt32($"{arch}.leading_dense_block_count", LeadingDense);
         w.AddUInt32($"{arch}.expert_count", Experts);
         w.AddUInt32($"{arch}.expert_used_count", TopK);
-        w.AddUInt32($"{arch}.expert_feed_forward_length", MoeFf);
+        w.AddUInt32($"{arch}.expert_feed_forward_length", (uint)moeFf);
         w.AddUInt32($"{arch}.expert_shared_count", SharedCount);
-        w.AddUInt32($"{arch}.expert_shared_feed_forward_length", SharedFf);
+        w.AddUInt32($"{arch}.expert_shared_feed_forward_length", (uint)sharedFf);
         w.AddBool($"{arch}.expert_weights_norm", true);
         w.AddFloat32($"{arch}.expert_weights_scale", 1.0f);
         w.AddUInt32($"{arch}.expert_gating_func", 2);
@@ -93,42 +112,47 @@ internal static class SyntheticFlintGguf
         w.AddInt32Array("tokenizer.ggml.token_type", Enumerable.Repeat(1, Vocab).ToArray());
         w.AddStringArray("tokenizer.ggml.merges", []);
 
-        Matrix(w, rng, "token_embd.weight", Hidden, Vocab, 0.6f, QuantizationType.F32);
-        Norm(w, rng, "output_norm.weight", Hidden);
-        Matrix(w, rng, "output.weight", Hidden, Vocab, 0.25f, QuantizationType.F32);
+        Matrix(w, rng, "token_embd.weight", hidden, Vocab, 0.6f, QuantizationType.F32);
+        Norm(w, rng, "output_norm.weight", hidden);
+        Matrix(w, rng, "output.weight", hidden, Vocab, 0.25f, QuantizationType.F32);
 
         int qWidth = Heads * headDim;
         var dq = options.DenseQuant;
         for (int i = 0; i < Layers; i++)
         {
             string p = $"blk.{i}";
-            Norm(w, rng, $"{p}.attn_norm.weight", Hidden);
-            Matrix(w, rng, $"{p}.attn_q.weight", Hidden, qWidth, 1.4f / MathF.Sqrt(Hidden), dq);
-            Matrix(w, rng, $"{p}.attn_k.weight", Hidden, Kv * headDim, 1.4f / MathF.Sqrt(Hidden), dq);
-            Matrix(w, rng, $"{p}.attn_v.weight", Hidden, Kv * headDim, 1.4f / MathF.Sqrt(Hidden), dq);
-            Matrix(w, rng, $"{p}.attn_output.weight", qWidth, Hidden, 1.4f / MathF.Sqrt(qWidth), dq);
+            Norm(w, rng, $"{p}.attn_norm.weight", hidden);
+            Matrix(w, rng, $"{p}.attn_q.weight", hidden, qWidth, 1.4f / MathF.Sqrt(hidden), dq);
+            Matrix(w, rng, $"{p}.attn_k.weight", hidden, Kv * headDim, 1.4f / MathF.Sqrt(hidden), dq);
+            Matrix(w, rng, $"{p}.attn_v.weight", hidden, Kv * headDim, 1.4f / MathF.Sqrt(hidden), dq);
+            Matrix(w, rng, $"{p}.attn_output.weight", qWidth, hidden, 1.4f / MathF.Sqrt(qWidth), dq);
             Norm(w, rng, $"{p}.attn_q_norm.weight", headDim);
             Norm(w, rng, $"{p}.attn_k_norm.weight", headDim);
             var sinks = new float[Heads];
-            for (int h = 0; h < Heads; h++) sinks[h] = options.Sinks ? (float)(Gauss(rng) * 1.5) : -30f;
+            for (int h = 0; h < Heads; h++)
+            {
+                // Draw whenever Sinks is on so FullLayerSinks = false changes only the full layers' sinks, not the rest of the rng stream.
+                float g = options.Sinks ? (float)(Gauss(rng) * 1.5) : -30f;
+                sinks[h] = Sliding[i] || options.FullLayerSinks ? g : -30f;
+            }
             w.AddTensor($"{p}.attn_sinks.weight", [Heads], (uint)QuantizationType.F32, Bytes(sinks));
-            Norm(w, rng, $"{p}.ffn_norm.weight", Hidden);
+            Norm(w, rng, $"{p}.ffn_norm.weight", hidden);
 
             if (i < LeadingDense)
             {
-                Matrix(w, rng, $"{p}.ffn_gate.weight", Hidden, DenseFf, 1.4f / MathF.Sqrt(Hidden), dq);
-                Matrix(w, rng, $"{p}.ffn_up.weight", Hidden, DenseFf, 1.4f / MathF.Sqrt(Hidden), dq);
-                Matrix(w, rng, $"{p}.ffn_down.weight", DenseFf, Hidden, 1.4f / MathF.Sqrt(DenseFf), dq);
+                Matrix(w, rng, $"{p}.ffn_gate.weight", hidden, denseFf, 1.4f / MathF.Sqrt(hidden), dq);
+                Matrix(w, rng, $"{p}.ffn_up.weight", hidden, denseFf, 1.4f / MathF.Sqrt(hidden), dq);
+                Matrix(w, rng, $"{p}.ffn_down.weight", denseFf, hidden, 1.4f / MathF.Sqrt(denseFf), dq);
                 continue;
             }
 
-            Matrix(w, rng, $"{p}.ffn_gate_inp.weight", Hidden, Experts, 0.6f, QuantizationType.F32);
-            Bank(w, rng, $"{p}.ffn_gate_exps.weight", Hidden, MoeFf, 1.4f / MathF.Sqrt(Hidden), options.RoutedQuant);
-            Bank(w, rng, $"{p}.ffn_up_exps.weight", Hidden, MoeFf, 1.4f / MathF.Sqrt(Hidden), options.RoutedQuant);
-            Bank(w, rng, $"{p}.ffn_down_exps.weight", MoeFf, Hidden, 1.4f / MathF.Sqrt(MoeFf), options.RoutedQuant);
-            Matrix(w, rng, $"{p}.ffn_gate_shexp.weight", Hidden, SharedFf, 1.4f / MathF.Sqrt(Hidden), options.SharedQuant);
-            Matrix(w, rng, $"{p}.ffn_up_shexp.weight", Hidden, SharedFf, 1.4f / MathF.Sqrt(Hidden), options.SharedQuant);
-            Matrix(w, rng, $"{p}.ffn_down_shexp.weight", SharedFf, Hidden, 1.4f / MathF.Sqrt(SharedFf), options.SharedQuant);
+            Matrix(w, rng, $"{p}.ffn_gate_inp.weight", hidden, Experts, options.RouterStd, QuantizationType.F32);
+            Bank(w, rng, $"{p}.ffn_gate_exps.weight", hidden, moeFf, options.ExpertGateUpScale * 1.4f / MathF.Sqrt(hidden), options.RoutedQuant);
+            Bank(w, rng, $"{p}.ffn_up_exps.weight", hidden, moeFf, options.ExpertGateUpScale * 1.4f / MathF.Sqrt(hidden), options.RoutedQuant);
+            Bank(w, rng, $"{p}.ffn_down_exps.weight", moeFf, hidden, 1.4f / MathF.Sqrt(moeFf), options.RoutedQuant);
+            Matrix(w, rng, $"{p}.ffn_gate_shexp.weight", hidden, sharedFf, 1.4f / MathF.Sqrt(hidden), options.SharedQuant);
+            Matrix(w, rng, $"{p}.ffn_up_shexp.weight", hidden, sharedFf, 1.4f / MathF.Sqrt(hidden), options.SharedQuant);
+            Matrix(w, rng, $"{p}.ffn_down_shexp.weight", sharedFf, hidden, 1.4f / MathF.Sqrt(sharedFf), options.SharedQuant);
         }
         return w.Build();
     }
