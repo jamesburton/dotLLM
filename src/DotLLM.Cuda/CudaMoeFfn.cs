@@ -278,15 +278,36 @@ public static unsafe class CudaMoeFfn
             expertLocalIdx[e] = kActive++;
         }
 
+        // Fully grouped Q4_1 decode body (#1172): one SwiGLU, one grouped down GEMV and one weighted combine over all
+        // K_active experts instead of the per-expert upload / SwiGLU / down / axpy loop (~4 launches + a sync copy per
+        // expert). Same math; the combine runs in the loop's expert order.
+        bool groupedDown = useGrouped && weights.DownProjQuantType == QuantizationType.Q4_1
+            && kernels.HasQ4_1Gemm && kernels.HasMoeGroupedDownQ4_1 && (I & 31) == 0
+            && weights.DownExpsBiasF32 == 0 && !weights.UseSwiGluOai && packedQ4Projection is null;
+
         if (useGrouped && kActive > 0)
         {
             DispatchGroupedGateUp(
                 hiddenF32, weights, scratch, kernels, stream,
                 expertLocalIdx: expertLocalIdx, kActive: kActive,
-                hidden: hidden, I: I);
+                hidden: hidden, I: I,
+                downSlots: groupedDown ? bucketSlots.AsSpan(0, totalAssign) : default,
+                downOffsets: groupedDown ? offsets : default);
         }
 
-        for (int e = 0; e < E; e++)
+        if (groupedDown && kActive > 0)
+        {
+            long perArrayBytes = (long)kActive * sizeof(long);
+            kernels.LaunchSwiGLUF32(scratch.GateBatch, scratch.UpBatch, scratch.SiluBatch, I, kActive, stream);
+            kernels.LaunchMoeGroupedGemvQ4_1F32PerExpertInput(
+                scratch.SiluBatch, scratch.GroupedPtrArrays + (nint)(4 * perArrayBytes), scratch.DownBatch,
+                hidden, I, kActive, stream);
+            kernels.LaunchMoeWeightedRowsSum(
+                outputF32, scratch.DownBatch, scratch.TopkWeight, scratch.GroupedPtrArrays + (nint)(5 * perArrayBytes),
+                kActive, hidden, stream);
+        }
+
+        for (int e = 0; e < E && !groupedDown; e++)
         {
             int batch = counts[e];
             if (batch == 0) continue;
@@ -877,9 +898,11 @@ public static unsafe class CudaMoeFfn
     private static void DispatchGroupedGateUp(
         nint hiddenF32, CudaMoeLayerWeights weights,
         CudaMoeScratch scratch, CudaKernels kernels, nint stream,
-        Span<int> expertLocalIdx, int kActive, int hidden, int I)
+        Span<int> expertLocalIdx, int kActive, int hidden, int I,
+        ReadOnlySpan<int> downSlots = default, ReadOnlySpan<int> downOffsets = default)
     {
         int E = weights.NumExperts;
+        bool withDown = !downOffsets.IsEmpty;
 
         // Build host-side ptr arrays (4 × kActive nints, all packed into one
         // contiguous block matching the device-side layout).
@@ -887,7 +910,10 @@ public static unsafe class CudaMoeFfn
         //   slice 1: gate outputs[0..kActive)
         //   slice 2: up weights  [0..kActive)
         //   slice 3: up outputs  [0..kActive)
-        long* hostPtrs = stackalloc long[4 * kActive];
+        //   slice 4: down weights[0..kActive)  (withDown only: the fully grouped Q4_1 body)
+        //   slice 5: routing slot of each expert (withDown only; decode has one token, so offsets[e] is its entry)
+        int slices = withDown ? 6 : 4;
+        long* hostPtrs = stackalloc long[slices * kActive];
 
         // Walk experts in increasing global id (matches the per-expert loop
         // ordering), skipping inactive ones. eLocal = position in the compacted
@@ -902,13 +928,18 @@ public static unsafe class CudaMoeFfn
             hostPtrs[1 * kActive + eLocal] = (long)(scratch.GroupedGateF16 + (nint)((long)eLocal * iBytesF16));
             hostPtrs[2 * kActive + eLocal] = (long)weights.UpProj[e];
             hostPtrs[3 * kActive + eLocal] = (long)(scratch.GroupedUpF16 + (nint)((long)eLocal * iBytesF16));
+            if (withDown)
+            {
+                hostPtrs[4 * kActive + eLocal] = (long)weights.DownProj[e];
+                hostPtrs[5 * kActive + eLocal] = downSlots[downOffsets[e]];
+            }
             eLocal++;
         }
 
         // One synchronous HtoD copy of all 4 ptr arrays at once. Source is
         // stack-local — must complete before this method returns. Sync HtoD
         // (cuMemcpyHtoD_v2) on pageable memory is immediate.
-        long ptrBytes = 4L * kActive * sizeof(long);
+        long ptrBytes = (long)slices * kActive * sizeof(long);
         CudaDriverApi.cuMemcpyHtoD_v2(
             scratch.GroupedPtrArrays, (nint)hostPtrs, (nuint)ptrBytes).ThrowOnError();
 
@@ -1146,8 +1177,9 @@ public sealed unsafe class CudaMoeScratch : IDisposable
                 AllocatedBytes += needGroupedF16;
                 CudaDriverApi.cuMemAlloc_v2(out _groupedUpF16, (nuint)needGroupedF16).ThrowOnError();
                 AllocatedBytes += needGroupedF16;
-                // 4 ptr arrays × K_active_max × sizeof(nint).
-                long ptrBytes = 4L * activeMax * sizeof(long);
+                // 6 ptr arrays × K_active_max × sizeof(nint): gate W/out, up W/out, and for the fully grouped
+                // Q4_1 decode body the down weights and each expert's routing slot (#1172).
+                long ptrBytes = 6L * activeMax * sizeof(long);
                 CudaDriverApi.cuMemAlloc_v2(out _groupedPtrArrays, (nuint)ptrBytes).ThrowOnError();
                 AllocatedBytes += ptrBytes;
                 _groupedActiveMax = activeMax;

@@ -153,3 +153,18 @@ extern "C" __global__ void __launch_bounds__(256) moe_grouped_gemv_q4_1_f16(
     if (e >= K_active || row >= M) return;
     q4_1_row<1>(weights[e], x, outputs[e], row, K, 0, 1, M);
 }
+
+// MoE grouped decode GEMV with one F32 input row PER expert (the routed down projection): y[e * M + m] =
+// W_e[m, K] @ x[e * K + :]. x and y are the contiguous [K_active, K] / [K_active, M] F32 expert batches.
+// Grid: (ceil(M / 8), K_active). Block: 256.
+extern "C" __global__ void __launch_bounds__(256) moe_grouped_gemv_q4_1_f32_xe(
+    const float* __restrict__ x,
+    const uint8_t* const* __restrict__ weights,
+    float* __restrict__ y,
+    const int M, const int K, const int K_active)
+{
+    const int e = blockIdx.y;
+    const int row = blockIdx.x * Q4_1_ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (e >= K_active || row >= M) return;
+    q4_1_row<1>(weights[e], x + (size_t)e * K, y + (size_t)e * M, row, K, 0, 1, M);
+}

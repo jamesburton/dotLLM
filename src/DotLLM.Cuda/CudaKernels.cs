@@ -447,6 +447,8 @@ public sealed unsafe partial class CudaKernels : IDisposable
     private readonly nint _quantizedGemvQ4_1F32Func;
     private readonly nint _quantizedGemmQ4_1F32Func;
     private readonly nint _moeGroupedGemvQ4_1Func;
+    private readonly nint _moeGroupedGemvQ4_1F32XeFunc;
+    private readonly nint _moeWeightedRowsSumF32Func;
     private readonly nint _moeSigmoidTopkF32Func;
     private readonly nint _moePow2RescaleRowsF32Func;
     private readonly nint _moeScaleRowsF32Func;
@@ -1207,6 +1209,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
             _moeFfnModule = CudaModule.LoadFromFile(moeFfnPath);
             _moeSoftmaxTopkF32Func = _moeFfnModule.TryGetFunction("moe_softmax_topk_f32");
             _moeSigmoidTopkF32Func = _moeFfnModule.TryGetFunction("moe_sigmoid_topk_f32");
+            _moeWeightedRowsSumF32Func = _moeFfnModule.TryGetFunction("moe_weighted_rows_sum_f32");
             _moePow2RescaleRowsF32Func = _moeFfnModule.TryGetFunction("moe_pow2_rescale_rows_f32");
             _moeScaleRowsF32Func = _moeFfnModule.TryGetFunction("moe_scale_rows_f32");
             _moeRenormTopkF32Func = _moeFfnModule.TryGetFunction("moe_renorm_topk_f32");
@@ -1247,6 +1250,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
             _quantizedGemvQ4_1F32Func = _q4_1Module.TryGetFunction("quantized_gemv_q4_1_f32");
             _quantizedGemmQ4_1F32Func = _q4_1Module.TryGetFunction("quantized_gemm_q4_1_f32");
             _moeGroupedGemvQ4_1Func = _q4_1Module.TryGetFunction("moe_grouped_gemv_q4_1_f16");
+            _moeGroupedGemvQ4_1F32XeFunc = _q4_1Module.TryGetFunction("moe_grouped_gemv_q4_1_f32_xe");
         }
 
         // Qwen3MoeHybrid recurrence-path kernels (optional — present only when
@@ -5523,6 +5527,55 @@ public sealed unsafe partial class CudaKernels : IDisposable
         else
             LaunchQ4_1(_quantizedGemmQ4_1F32Func, "quantized_gemm_q4_1_f32", quantWeight, x, y, n, k, m,
                 (uint)((m + Q4_1TokTile - 1) / Q4_1TokTile), stream);
+    }
+
+    /// <summary>
+    /// True when the fully grouped Q4_1 decode expert body is loaded: <see cref="LaunchMoeGroupedGemvQ4_1F32PerExpertInput"/>
+    /// (routed down projection) and <see cref="LaunchMoeWeightedRowsSum"/> (combine), #1172.
+    /// </summary>
+    public bool HasMoeGroupedDownQ4_1 => !DisableQuantizedGemv && _moeGroupedGemvQ4_1F32XeFunc != 0
+        && _moeWeightedRowsSumF32Func != 0;
+
+    /// <summary>
+    /// MoE grouped decode GEMV with one F32 input row per expert: <c>y[e, m] = W_e[m, K] @ x[e, :]</c> for the
+    /// <paramref name="kActive"/> experts in one launch (the routed down projection, each expert reading its own SwiGLU row).
+    /// </summary>
+    /// <param name="xF32">Contiguous F32 inputs <c>[kActive, K]</c>.</param>
+    /// <param name="weightPtrsDevice">Device array of <paramref name="kActive"/> Q4_1 weight pointers (<c>[M, K]</c> each).</param>
+    /// <param name="yF32">Contiguous F32 outputs <c>[kActive, M]</c>.</param>
+    /// <param name="M">Output rows per expert.</param>
+    /// <param name="K">Input width, a multiple of 32.</param>
+    /// <param name="kActive">Active experts.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchMoeGroupedGemvQ4_1F32PerExpertInput(nint xF32, nint weightPtrsDevice, nint yF32,
+        int M, int K, int kActive, nint stream)
+    {
+        if (kActive <= 0) return;
+        LaunchQ4_1(_moeGroupedGemvQ4_1F32XeFunc, "moe_grouped_gemv_q4_1_f32_xe", xF32, weightPtrsDevice, yF32,
+            M, K, kActive, (uint)kActive, stream);
+    }
+
+    /// <summary>
+    /// Grouped-decode combine: <c>out[h] += sum_e topkWeight[slot[e]] * rows[e, h]</c> over the <paramref name="kActive"/>
+    /// expert rows of one token, replacing one weighted axpy launch per expert.
+    /// </summary>
+    /// <param name="outF32">F32 output row <c>[hidden]</c>, accumulated into.</param>
+    /// <param name="rowsF32">F32 expert rows <c>[kActive, hidden]</c>.</param>
+    /// <param name="topkWeight">F32 routing weights of the token (indexed by slot).</param>
+    /// <param name="slotIdxDevice">Device int64 array: the routing slot of each expert row.</param>
+    /// <param name="kActive">Expert rows.</param>
+    /// <param name="hidden">Row width.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchMoeWeightedRowsSum(nint outF32, nint rowsF32, nint topkWeight, nint slotIdxDevice,
+        int kActive, int hidden, nint stream)
+    {
+        if (_moeWeightedRowsSumF32Func == 0)
+            throw new InvalidOperationException("moe_weighted_rows_sum_f32 not available. Recompile native/kernels/moe_ffn.cu to PTX.");
+        nint o = outF32, r = rowsF32, w = topkWeight, sl = slotIdxDevice;
+        int ka = kActive, h = hidden;
+        void** args = stackalloc void*[] { &o, &r, &w, &sl, &ka, &h };
+        CudaDriverApi.cuLaunchKernel(_moeWeightedRowsSumF32Func, (uint)((hidden + BlockSize - 1) / BlockSize), 1, 1,
+            BlockSize, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
     }
 
     // q4_1_gemv.cu: 8 rows (warps) per 256-thread block, 8 tokens per GEMM tile.

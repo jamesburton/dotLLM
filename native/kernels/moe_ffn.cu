@@ -318,6 +318,22 @@ extern "C" __global__ void __launch_bounds__(256) moe_scale_rows_f32(
     for (int i = threadIdx.x; i < n; i += blockDim.x) row[i] *= f;
 }
 
+// ── moe_weighted_rows_sum_f32 ───────────────────────────────────────────────
+//
+// Grouped-decode combine (#1172): out[h] += sum_e topk_weight[slot[e]] * rows[e * hidden + h] for the K_active expert
+// rows of the single decode token, in e order (= increasing expert id, the per-expert loop's order). slot holds int64.
+extern "C" __global__ void __launch_bounds__(256) moe_weighted_rows_sum_f32(
+    float* __restrict__ out, const float* __restrict__ rows, const float* __restrict__ topk_weight,
+    const long long* __restrict__ slot, const int k_active, const int hidden)
+{
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= hidden) return;
+    float acc = out[h];
+    for (int e = 0; e < k_active; e++)
+        acc += topk_weight[slot[e]] * rows[(size_t)e * hidden + h];
+    out[h] = acc;
+}
+
 // ── moe_renorm_topk_f32 ──────────────────────────────────────────────────
 //
 // In-place per-token renormalisation of the top-k weights so they sum to 1.0
