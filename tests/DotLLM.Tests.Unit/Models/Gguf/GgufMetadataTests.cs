@@ -75,7 +75,7 @@ public class GgufMetadataTests
     {
         var metadata = BuildMetadata(_ => { });
         var ex = Assert.Throws<KeyNotFoundException>(() => metadata.GetString("nonexistent"));
-        Assert.Contains("nonexistent", ex.Message);
+        Assert.Contains("nonexistent", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -83,8 +83,8 @@ public class GgufMetadataTests
     {
         var metadata = BuildMetadata(d => d.AddUInt32("number", 42));
         var ex = Assert.Throws<InvalidOperationException>(() => metadata.GetString("number"));
-        Assert.Contains("UInt32", ex.Message);
-        Assert.Contains("String", ex.Message);
+        Assert.Contains("UInt32", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("String", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]

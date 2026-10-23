@@ -1,0 +1,102 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Q8_0 decode GEMV with an FP32 activation, COALESCED lane=K-position layout (issue #471).
+//
+//   y[m] = sum_k W_q8[m,k] * x[k]
+//
+// Same contract and bindings as matmul_q8_0.comp (FP32 x, no activation quantization, so the
+// result stays within float rounding of that kernel), but with the memory layout of
+// matmul_q8_0_mmvq.comp (#338). matmul_q8_0.comp maps lane -> whole 34-byte block, so at one
+// load the lanes of a wave read words ~34 bytes apart and each memory transaction serves about
+// two lanes. Here lane L owns 8 contiguous int8 of a WINDOW of WG_SIZE/4 blocks: four lanes
+// cover one block, consecutive lanes read consecutive words, and a wave hits one contiguous
+// region per iteration. The fp16 scale is read uniformly by a block's four lanes.
+//
+// Weight layout: each 32 weights = one Q8_0 block of 34 bytes = 17 uint16:
+//   uint16 [0]     = fp16 scale d
+//   uint16 [1..16] = 32 signed int8 qs
+// Row stride = (K/32) * 17 uint16. 34 is even, so every uint16 index is 2-byte aligned.
+//
+// Dispatch: one workgroup of WG_SIZE threads per output row. Reduction: subgroupAdd, then a
+// shared-memory pass over the subgroups when the workgroup spans more than one.
+
+#define WG_SIZE 64u
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint weight[]; };  // Q8_0 blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { vec4 x4[]; };      // [K/4]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };      // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint blocksPerRow;
+    uint rowUints;     // unused here; kept for binding/push-constant parity with matmul_q8_0
+} pc;
+
+const uint UINT16_PER_BLOCK = 17u;
+const uint WINDOW_BLOCKS    = WG_SIZE / 4u;
+
+uint readU16(uint idx16) {
+    uint w = weight[idx16 >> 1u];
+    return ((idx16 & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
+}
+
+// Sign-extended int8 lanes of a packed uint, as a vec4 (byte 0 first).
+vec4 unpackS8(uint u) {
+    ivec4 v = ivec4(int(u << 24), int(u << 16), int(u << 8), int(u)) >> 24;
+    return vec4(v);
+}
+
+shared float partials[WG_SIZE];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint lane = gl_LocalInvocationID.x;
+    uint blockInWindow = lane >> 2u;
+    uint subInBlock    = lane & 3u;
+    uint qOff16        = 1u + 4u * subInBlock;
+
+    uint rowBase16 = m * pc.blocksPerRow * UINT16_PER_BLOCK;
+
+    float acc = 0.0;
+    for (uint w0 = 0u; w0 < pc.blocksPerRow; w0 += WINDOW_BLOCKS) {
+        uint blk = w0 + blockInWindow;
+        if (blk >= pc.blocksPerRow)
+            continue;
+
+        uint blkBase16 = rowBase16 + blk * UINT16_PER_BLOCK;
+        float d = unpackHalf2x16(readU16(blkBase16)).x;
+
+        uint qb = blkBase16 + qOff16;
+        uint wa = readU16(qb)      | (readU16(qb + 1u) << 16u);
+        uint wb = readU16(qb + 2u) | (readU16(qb + 3u) << 16u);
+
+        uint xi = blk * 8u + 2u * subInBlock;
+        vec4 xa = x4[xi];
+        vec4 xb = x4[xi + 1u];
+
+        acc += d * (dot(unpackS8(wa), xa) + dot(unpackS8(wb), xb));
+    }
+
+    float s = subgroupAdd(acc);
+    if (gl_NumSubgroups == 1u) {
+        if (subgroupElect())
+            y[m] = s;
+        return;
+    }
+
+    if (subgroupElect())
+        partials[gl_SubgroupID] = s;
+    barrier();
+    if (lane == 0u) {
+        float total = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; i++)
+            total += partials[i];
+        y[m] = total;
+    }
+}
