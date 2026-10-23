@@ -492,82 +492,25 @@ public static unsafe partial class MatMul
         }
     }
 
-    private struct GemmR4TiledQ8Ctx
-    {
-        public byte* RepackedWeights;
-        public byte* InputQ8;
-        public float* C;
-        public int FullGroups;
-        public int TailRows;
-        public int BlockCount;
-        public int M;
-        public int N;
-        public int TileGroups;
-    }
-
     /// <summary>
-    /// Parallel <c>GemmR4TiledQ8_0</c>. Partitions row-group tiles across threads; each
-    /// thread owns a disjoint row range of C, so no synchronisation is needed.
+    /// Parallel <c>GemmR4TiledQ8_0</c> over pre-quantized input. Runs the generic R4 GEMM, which partitions
+    /// row groups across threads and adds the multi-token kernel (#1119); the per-element arithmetic is
+    /// unchanged, so results equal the serial overload's.
     /// </summary>
+    /// <param name="repackedWeights">R4-interleaved weight data.</param>
+    /// <param name="inputQ8">Pre-quantized Q8_0 input, [N x q8RowBytes].</param>
+    /// <param name="c">Output [N x M], row-major.</param>
+    /// <param name="fullGroups">Complete 4-row groups (M / 4).</param>
+    /// <param name="tailRows">Leftover rows (M % 4), stored row-major after the interleaved data.</param>
+    /// <param name="blockCount">Blocks per row (K / 32).</param>
+    /// <param name="m">Total output rows.</param>
+    /// <param name="n">Token count.</param>
+    /// <param name="pool">Thread pool, or null for single-threaded.</param>
     [SkipLocalsInit]
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     internal static void GemmR4TiledQ8_0(byte* repackedWeights, byte* inputQ8, float* c,
         int fullGroups, int tailRows, int blockCount, int m, int n, ComputeThreadPool? pool)
-    {
-        if (pool is null || m < ParallelMinRows)
-        {
-            GemmR4TiledQ8_0(repackedWeights, inputQ8, c, fullGroups, tailRows, blockCount, m, n);
-            return;
-        }
-
-        var ctx = new GemmR4TiledQ8Ctx
-        {
-            RepackedWeights = repackedWeights, InputQ8 = inputQ8, C = c,
-            FullGroups = fullGroups, TailRows = tailRows, BlockCount = blockCount,
-            M = m, N = n, TileGroups = Math.Max(1, ComputeTileM(blockCount * Q8_0BlockBytes) / 4),
-        };
-        pool.Dispatch((nint)(&ctx), &GemmR4TiledQ8Worker);
-    }
-
-    private static void GemmR4TiledQ8Worker(nint ctxPtr, int threadIdx, int threadCount)
-    {
-        ref var ctx = ref Unsafe.AsRef<GemmR4TiledQ8Ctx>((void*)ctxPtr);
-
-        int q8RowBytes = ctx.BlockCount * Q8_0BlockBytes;
-        int groupBytes = 4 * q8RowBytes;
-
-        // Partition groups across threads, then tile within each thread's share.
-        ComputeThreadPool.PartitionRange(ctx.FullGroups, threadIdx, threadCount, out int startGroup, out int endGroup);
-
-        for (int gStart = startGroup; gStart < endGroup; gStart += ctx.TileGroups)
-        {
-            int gCount = Math.Min(ctx.TileGroups, endGroup - gStart);
-            byte* tileWeights = ctx.RepackedWeights + (long)gStart * groupBytes;
-
-            for (int t = 0; t < ctx.N; t++)
-            {
-                ComputeRowsQ8_0Interleaved(
-                    tileWeights,
-                    ctx.InputQ8 + (long)t * q8RowBytes,
-                    ctx.C + (long)t * ctx.M + gStart * 4,
-                    gCount, tailRows: 0, ctx.BlockCount);
-            }
-        }
-
-        // Thread 0 handles the row-major tail rows.
-        if (threadIdx == 0 && ctx.TailRows > 0)
-        {
-            byte* tailBase = ctx.RepackedWeights + (long)ctx.FullGroups * groupBytes;
-            for (int t = 0; t < ctx.N; t++)
-            {
-                ComputeRows(
-                    tailBase,
-                    ctx.InputQ8 + (long)t * q8RowBytes,
-                    ctx.C + (long)t * ctx.M + ctx.FullGroups * 4,
-                    ctx.TailRows, ctx.BlockCount);
-            }
-        }
-    }
+        => GemmR4TiledQ8_0(repackedWeights, null, inputQ8, c, fullGroups, tailRows, blockCount, m,
+            blockCount * Q8_0GroupSize, n, pool);
 
     /// <summary>
     /// Parallel R4-interleaved Q8_0 ComputeRows. Partitions groups across threads.
