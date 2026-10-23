@@ -57,6 +57,9 @@ internal static class SyntheticFlintGguf
 
         /// <summary>Std of the router logits weights (smaller = fewer near-tie expert flips between engines).</summary>
         public float RouterStd { get; init; } = 0.6f;
+
+        /// <summary>Multiplier on the routed gate / up bank std: large values push the SwiGLU output (the down input) past the F16 range (#1171).</summary>
+        public float ExpertGateUpScale { get; init; } = 1f;
     }
 
     public static byte[] Build(Options? options = null)
@@ -137,8 +140,8 @@ internal static class SyntheticFlintGguf
             }
 
             Matrix(w, rng, $"{p}.ffn_gate_inp.weight", hidden, Experts, options.RouterStd, QuantizationType.F32);
-            Bank(w, rng, $"{p}.ffn_gate_exps.weight", hidden, moeFf, 1.4f / MathF.Sqrt(hidden), options.RoutedQuant);
-            Bank(w, rng, $"{p}.ffn_up_exps.weight", hidden, moeFf, 1.4f / MathF.Sqrt(hidden), options.RoutedQuant);
+            Bank(w, rng, $"{p}.ffn_gate_exps.weight", hidden, moeFf, options.ExpertGateUpScale * 1.4f / MathF.Sqrt(hidden), options.RoutedQuant);
+            Bank(w, rng, $"{p}.ffn_up_exps.weight", hidden, moeFf, options.ExpertGateUpScale * 1.4f / MathF.Sqrt(hidden), options.RoutedQuant);
             Bank(w, rng, $"{p}.ffn_down_exps.weight", moeFf, hidden, 1.4f / MathF.Sqrt(moeFf), options.RoutedQuant);
             Matrix(w, rng, $"{p}.ffn_gate_shexp.weight", hidden, sharedFf, 1.4f / MathF.Sqrt(hidden), options.SharedQuant);
             Matrix(w, rng, $"{p}.ffn_up_shexp.weight", hidden, sharedFf, 1.4f / MathF.Sqrt(hidden), options.SharedQuant);

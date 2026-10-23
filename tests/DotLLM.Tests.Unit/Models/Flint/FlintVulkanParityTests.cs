@@ -25,9 +25,9 @@ public sealed class FlintVulkanParityTests
     public FlintVulkanParityTests(ITestOutputHelper output) => _output = output;
 
     /// <summary>All-Q4_1 Flint at Vulkan-friendly widths (packed Q4_1 banks need K % 256 == 0).</summary>
-    private static SyntheticFlintGguf.Options Q41(int window, bool fullSinks = true) => new()
+    private static SyntheticFlintGguf.Options Q41(int window, bool fullSinks = true, int headDim = 64) => new()
     {
-        Hidden = 256, MoeFf = 256, DenseFf = 256, HeadDim = 64, Window = window, RouterStd = 0.15f,
+        Hidden = 256, MoeFf = 256, DenseFf = 256, HeadDim = headDim, Window = window, RouterStd = 0.15f,
         DenseQuant = QuantizationType.Q4_1, RoutedQuant = QuantizationType.Q4_1, SharedQuant = QuantizationType.Q4_1,
         FullLayerSinks = fullSinks,
     };
@@ -136,11 +136,13 @@ public sealed class FlintVulkanParityTests
     }
 
     /// <summary>16-token prefill into the F16 cache, window 4 &lt; 16: the F16-KV sink prefill kernel on every layer.</summary>
-    [SkippableFact]
-    public void Prefill_F16Kv_MatchesCpu()
+    [SkippableTheory]
+    [InlineData(64)]
+    [InlineData(128)]   // real Flint head_dim
+    public void Prefill_F16Kv_MatchesCpu(int headDim)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
-        using var fx = new Fixture(Q41(window: 4));
+        using var fx = new Fixture(Q41(window: 4, headDim: headDim));
         int[] ids = Ids(16);
         float[] cpu = fx.CpuPrefill(ids);
         using var vk = VulkanTransformerModel.LoadFromGguf(fx.Gguf, fx.Config, spvDir);
@@ -196,6 +198,36 @@ public sealed class FlintVulkanParityTests
         var kl = RowKl(batched, cpu.AsSpan(ctx * vocab, rows * vocab).ToArray(), vocab);
         var (median, _) = Summarise($"smallrow rows={rows}", kl, 0.05);
         Assert.True(median < 0.01, $"small-row rows off the CPU: median KL {median}");
+    }
+
+    /// <summary>
+    /// Routed SwiGLU outputs past the F16 maximum (real Flint has tokens above 65504): the grouped coopmat MoE kernels fold the down input into
+    /// an F16 operand, which turned such a token into inf / NaN on Strix until the per-row power-of-two rescale (#1171). 16 rows take the
+    /// grouped path on a wave64 coopmat device; elsewhere the MMVQ arm (F32 scales) runs and the test still checks parity.
+    /// </summary>
+    [SkippableFact]
+    public void Prefill_DownInputBeyondF16Range_StaysFiniteAndMatchesCpu()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var fx = new Fixture(Q41(window: 4) with { ExpertGateUpScale = 60f });
+        int[] ids = Ids(16);
+        float[] cpu = fx.CpuPrefill(ids);
+        Assert.All(cpu, v => Assert.True(float.IsFinite(v)));
+        using var vk = VulkanTransformerModel.LoadFromGguf(fx.Gguf, fx.Config, spvDir);
+        float[] rows = VulkanRows(vk, ids, prefill: ids.Length, out var cache);
+        using (cache) { }
+        Assert.True(rows.All(float.IsFinite), "non-finite Vulkan logits: the F16 down operand overflowed");
+        AssertRowsAgree("prefill f16-range down input", rows, cpu, fx.Config.VocabSize);
+
+        // Control: where the grouped kernels ran, the same forward without the rescale must overflow, or this test cannot see the bug.
+        if (vk.GroupedMoeDispatchCount > 0)
+        {
+            using var vkOff = VulkanTransformerModel.LoadFromGguf(fx.Gguf, fx.Config, spvDir);
+            vkOff.MoeDownRescaleEnabled = false;
+            float[] off = VulkanRows(vkOff, ids, prefill: ids.Length, out var cacheOff);
+            using (cacheOff) { }
+            Assert.False(off.All(float.IsFinite), "without the rescale the grouped path stayed finite: the synthetic down input does not reach the F16 limit");
+        }
     }
 
     /// <summary>

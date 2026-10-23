@@ -168,6 +168,9 @@ Differences between architectures are captured entirely in ModelConfig.
   top-6 on `moe_topk_sigmoid_bias_f32` with a zero bias, and Q4_1 read in place everywhere (dense MMVQ / GEMV / GEMM / coopmat, MoE indexed
   MMVQ + grouped coopmat). KV is **F16** (`VulkanKvCache.Storage`, `DOTLLM_VK_KV=f32` for A/B) at full length for every layer: the compact
   sliding-window ring is not on Vulkan yet (follow-up), so 98 KiB/token (28 KiB of it the 14 full layers).
+  The grouped coopmat MoE kernels fold the down input into an F16 operand; real Flint tokens exceed 65504 there (inf, then a NaN token that
+  an F16 KV cache spreads to every later row). `row_pow2_downscale_f32` / `row_scale_mul_f32` apply the CPU's power-of-two rescale around
+  the grouped down projection (all architectures; `DOTLLM_VK_MOE_DOWN_RESCALE=0` disables it for A/B).
 - **CUDA** refuses `flint` (`ModelConfig.FlintUnsupportedMessage`); bring-up is #1157 F6.
 - Verification: `FlintSyntheticGoldenTests` writes a random-weight `flint` GGUF (GQA 8:2, Q wider than hidden, window 4 over 16 tokens,
   NoPE on a MoE layer, sinks everywhere, shared expert) and compares against llama.cpp CPU logits on the same bytes: F32 max |dlogit|

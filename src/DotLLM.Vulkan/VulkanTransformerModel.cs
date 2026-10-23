@@ -928,6 +928,13 @@ public sealed partial class VulkanTransformerModel : IModel
     // Flint (#1171): F16 KV storage. The writer converts the projected F32 rows into the cache; the split-KV decode and small-row kernels have
     // F16-KV twins that read the rows in place (the sink prefill kernel's twin lives in VulkanGptOssKernels). Null unless the model selects F16 KV.
     private VulkanKvF16WriteKernel? _kvF16Writer;
+    // F16-operand guard for the grouped coopmat MoE down projection (#1171): per-row power-of-two downscale of the input and the matching
+    // multiply on the output (llama.cpp build_amax_src1_f16; the CPU MoeSwiGluMlp rescale). Null when the SPIR-V is absent.
+    private SimpleComputeKernel? _rowPow2Downscale;
+
+    /// <summary>A/B and test switch for the grouped MoE down-input rescale (#1171); <c>DOTLLM_VK_MOE_DOWN_RESCALE=0</c> disables it.</summary>
+    internal bool MoeDownRescaleEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_DOWN_RESCALE") != "0";
+    private SimpleComputeKernel? _rowScaleMul;
     private VulkanSplitKvAttentionKernel? _splitKvAttentionKvF16;
     private VulkanSplitKvRowsAttentionKernel? _smallRowAttnKvF16;
     // KV storage of the cache the current forward reads (set at the top of Forward; F32 for cacheless forwards).
@@ -2429,6 +2436,11 @@ public sealed partial class VulkanTransformerModel : IModel
         model._headless = headless;
         model._noTokenEmbed = skipTokenEmbed;
         model.CreateSmallRowKernels(device, spvDir);
+        if (File.Exists(Path.Combine(spvDir, "row_pow2_downscale_f32.spv")) && File.Exists(Path.Combine(spvDir, "row_scale_mul_f32.spv")))
+        {
+            model._rowPow2Downscale = SimpleComputeKernel.Create(device, spvDir, "row_pow2_downscale_f32", buffers: 2, pushWords: 2);
+            model._rowScaleMul = SimpleComputeKernel.Create(device, spvDir, "row_scale_mul_f32", buffers: 2, pushWords: 2);
+        }
         if (config.Architecture == DotLLM.Core.Configuration.Architecture.GptOss)
             model.InitGptOss(spvDir);
         if (config.Architecture is DotLLM.Core.Configuration.Architecture.MiMoV2 or DotLLM.Core.Configuration.Architecture.Flint)
@@ -5012,6 +5024,8 @@ public sealed partial class VulkanTransformerModel : IModel
         _smallRowAttnKvF16?.InvalidateDescriptorCache();
         _splitKvAttentionKvF16?.InvalidateDescriptorCache();
         _kvF16Writer?.InvalidateDescriptorCache();
+        _rowPow2Downscale?.InvalidateDescriptorCache();
+        _rowScaleMul?.InvalidateDescriptorCache();
         _matmulQ5KMmq?.InvalidateDescriptorCache();
         _matmulIq4XsMmq?.InvalidateDescriptorCache();
         _matmulIq4NlMmq?.InvalidateDescriptorCache();
@@ -6881,12 +6895,42 @@ public sealed partial class VulkanTransformerModel : IModel
         BarrierComputeToCompute(cmdBuf);
         ProfSample("moe_act");
 
+        // The down kernels fold the activation into an F16 operand; Flint's SwiGLU output can exceed 65504 (inf -> NaN token, #1171).
+        // The rescale is exact; a per-expert down bias (gpt-oss) would be scaled with the row, so it is skipped there (MXFP4 activations
+        // stay far below the F16 range).
+        bool downScaled = !(bias && g!.DownBias is not null) && RecordRowPow2Downscale(cmdBuf, _state.MoeSiluInter!, expandedRows, interm);
         RecordGroupedQuantProjection(cmdBuf, moeW.W2DeviceQuantType, moeW.W2Bank, _state.MoeSiluInter!, _state.MoeGroupedHidden!,
             MoeBuildTileListKernel.ArgsStrideBytes, hidden, interm, expandedRows, numE, bias ? g!.DownBias : null);
         BarrierComputeToCompute(cmdBuf);
+        if (downScaled) RecordRowScaleMul(cmdBuf, _state.MoeGroupedHidden!, expandedRows, hidden);
         ProfSample("moe_down_grouped");
 
         _moeUngroupScatter!.Record(cmdBuf, _state.MoeGroupedHidden!, _state.MoePermutation!, _state.MoeDownRows!, rows: expandedRows, hidden: hidden);
+        BarrierComputeToCompute(cmdBuf);
+    }
+
+    /// <summary>
+    /// Divides each of <paramref name="rows"/> rows of <paramref name="x"/> (width <paramref name="n"/>) by a power of two that brings
+    /// max|row| to at most 1024, recording the factor per row in <c>MoeRowScale</c>. Returns false (nothing recorded) when the kernels or the
+    /// scale buffer are absent. Pair with <see cref="RecordRowScaleMul"/> on the projected rows.
+    /// </summary>
+    private bool RecordRowPow2Downscale(nint cmdBuf, VulkanDevice.Buffer x, int rows, int n)
+    {
+        if (!MoeDownRescaleEnabled || _rowPow2Downscale is null || _rowScaleMul is null || _state.MoeRowScale is null) return false;
+        Span<nint> bufs = stackalloc nint[2] { x.Handle, _state.MoeRowScale.Handle };
+        Span<uint> pc = stackalloc uint[2] { (uint)rows, (uint)n };
+        _rowPow2Downscale.Record(cmdBuf, bufs, pc, (uint)rows);
+        BarrierComputeToCompute(cmdBuf);
+        return true;
+    }
+
+    /// <summary>Multiplies each row of <paramref name="y"/> by its <c>MoeRowScale</c> factor (undoes <see cref="RecordRowPow2Downscale"/>).</summary>
+    private void RecordRowScaleMul(nint cmdBuf, VulkanDevice.Buffer y, int rows, int n)
+    {
+        uint total = (uint)(rows * n);
+        Span<nint> bufs = stackalloc nint[2] { y.Handle, _state.MoeRowScale!.Handle };
+        Span<uint> pc = stackalloc uint[2] { total, (uint)n };
+        _rowScaleMul!.Record(cmdBuf, bufs, pc, (total + 255) / 256);
         BarrierComputeToCompute(cmdBuf);
     }
 
@@ -6963,10 +7007,12 @@ public sealed partial class VulkanTransformerModel : IModel
             rows: expandedRows, hidden: interm, numExperts: numExperts);
         BarrierComputeToCompute(cmdBuf);
 
+        bool downScaled = RecordRowPow2Downscale(cmdBuf, _state.MoeGroupedGateInter!, expandedRows, interm);   // F16 operand guard (#1171)
         _moeGroupedMatmulF16Coopmat.Record(cmdBuf,
             moeW.W2Bank, _state.MoeGroupedGateInter!, _state.MoeExpertOffsets!, _state.MoeGroupedHidden!,
             m: hidden, k: interm, rows: expandedRows, numExperts: numExperts);
         BarrierComputeToCompute(cmdBuf);
+        if (downScaled) RecordRowScaleMul(cmdBuf, _state.MoeGroupedHidden!, expandedRows, hidden);
 
         _moeUngroupScatter.Record(cmdBuf,
             _state.MoeGroupedHidden!, _state.MoePermutation!, _state.MoeDownRows!,
@@ -8846,6 +8892,8 @@ public sealed partial class VulkanTransformerModel : IModel
         _smallRowAttnKvF16?.Dispose();
         _splitKvAttentionKvF16?.Dispose();
         _kvF16Writer?.Dispose();
+        _rowPow2Downscale?.Dispose();
+        _rowScaleMul?.Dispose();
         _matmulQ5KMmq?.Dispose();
         _matmulIq4XsMmq?.Dispose();
         _matmulIq4NlMmq?.Dispose();

@@ -223,6 +223,8 @@ internal static class Program
                     int[] sid = streams[si];
                     int n = sid.Length, promptLen = promptLens[si] == 0 ? n : promptLens[si];
                     ms.ResetSequenceState();
+                    bool allRows = Environment.GetEnvironmentVariable("STEPS_ALLROWS") == "1";
+                    if (allRows) ms.TrySetAllRowLogitsLimit(chunk + 1);
                     using var kv = makeKv(ctxLen);
                     using var fs = File.Create(outsS[si]);
                     void Take(DotLLM.Core.Tensors.ITensor lg)
@@ -235,7 +237,16 @@ internal static class Program
                     {
                         int len = Math.Min(chunk, promptLen - p);
                         using var lg = ms.Forward(sid.AsSpan(p, len), Enumerable.Range(p, len).ToArray(), did, kv);
-                        if (p + len >= promptLen) Take(lg);
+                        if (allRows)
+                        {
+                            // STEPS_ALLROWS=1: every prefill row (needs all-row logits), for locating where two runs diverge.
+                            for (int r = 0; r < len; r++)
+                            {
+                                unsafe { System.Buffer.BlockCopy(new ReadOnlySpan<float>((float*)lg.DataPointer + (long)r * v, v).ToArray(), 0, rowBuf, 0, rowBuf.Length); }
+                                fs.Write(rowBuf, 0, rowBuf.Length);
+                            }
+                        }
+                        else if (p + len >= promptLen) Take(lg);
                     }
                     double prefillS = sw.Elapsed.TotalSeconds;
                     sw.Restart();
