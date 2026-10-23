@@ -25,10 +25,10 @@ public class GrammarConstraintTests
         public string DecodeToken(int tokenId) =>
             tokenId >= 0 && tokenId < Tokens.Length ? Tokens[tokenId] : "";
 
-        public int[] Encode(string text) => throw new NotImplementedException();
-        public string Decode(ReadOnlySpan<int> tokenIds) => throw new NotImplementedException();
-        public string Decode(ReadOnlySpan<int> tokenIds, bool stripBosSpace) => throw new NotImplementedException();
-        public int CountTokens(string text) => throw new NotImplementedException();
+        public int[] Encode(string text) => throw new NotSupportedException();
+        public string Decode(ReadOnlySpan<int> tokenIds) => throw new NotSupportedException();
+        public string Decode(ReadOnlySpan<int> tokenIds, bool stripBosSpace) => throw new NotSupportedException();
+        public int CountTokens(string text) => throw new NotSupportedException();
     }
 
     [Fact]

@@ -1,0 +1,83 @@
+#version 450
+// TurboQuant (MSE stage) KV dequantization to FP32 — the GPU port of
+// DotLLM.Engine.KvCache.Codecs.TurboQuantCodec.Decode (useQjl = false).
+//
+// Per cached head-vector (dimension headDim, a power of two <= 256) the compressed store holds:
+//   - codes:  headDim packed indices of `mseBits` bits each (LSB-first within a vector,
+//             coord i at bit offset i*mseBits), tightly packed across head-vectors at
+//             byte offset hv*codeBytes (codeBytes = (headDim*mseBits + 7)/8).
+//   - norm:   one fp32 L2 norm per head-vector.
+// Decode reproduces the codec exactly:
+//   x[i] = centroids[code_i]                 // centroids already scaled by 1/sqrt(d)
+//   x    = WalshHadamard(x)                   // unnormalized H (H*H = d*I)
+//   x[i] = x[i] * invSqrtD * signs[i] * norm  // inverse rotation + rescale
+// where centroids[], signs[] (+/-1) and invSqrtD are codec constants (seed-derived signs).
+//
+// Dispatch: one workgroup per head-vector (gl_WorkGroupID.x = hv), local_size_x = 256,
+// one thread per coordinate (threads with t >= headDim stay live but idle so every
+// invocation reaches each barrier()). Output is the contiguous fp32 attention scratch laid
+// out [position, numKvHeads*headDim]; head-vector hv = pos*numKvHeads + h writes at
+// pos*stride + h*headDim.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufCodes { uint  codes[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufNorm  { float norms[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufCent  { float centroids[]; };
+layout(set = 0, binding = 3, std430) readonly  buffer BufSign  { float signs[]; };
+layout(set = 0, binding = 4, std430) writeonly buffer BufDst   { float dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint headDim;         // power of two, <= 256
+    uint numKvHeads;
+    uint mseBits;         // 1..8
+    uint codeUintsPerVec; // ceil(codeBytes/4) — stride (in uints) between head-vectors' codes
+    float invSqrtD;       // 1/sqrt(headDim), the codec's exact constant
+} pc;
+
+shared float s[256];
+
+void main() {
+    uint hv  = gl_WorkGroupID.x;       // head-vector index
+    uint t   = gl_LocalInvocationID.x; // coordinate within the head-vector
+    uint d   = pc.headDim;
+    bool live = t < d;
+
+    // --- 1. centroid lookup: read mseBits bits at bit offset t*mseBits within this vector ---
+    if (live) {
+        uint baseBit = hv * pc.codeUintsPerVec * 32u; // start of this vector's codes, in bits
+        uint p       = baseBit + t * pc.mseBits;
+        uint widx    = p >> 5u;
+        uint boff    = p & 31u;
+        uint mask    = (pc.mseBits >= 32u) ? 0xFFFFFFFFu : ((1u << pc.mseBits) - 1u);
+        uint val     = codes[widx] >> boff;
+        if (boff + pc.mseBits > 32u)
+            val |= codes[widx + 1u] << (32u - boff);
+        val &= mask;
+        s[t] = centroids[val];
+    }
+    barrier();
+
+    // --- 2. in-place unnormalized Walsh-Hadamard transform (cooperative butterfly) ---
+    // For a length-d transform with d a power of two and len < d, both partners of an active
+    // thread (t, t+len) lie in [0, d), so idle threads (t >= d) never touch live data. Every
+    // invocation still executes the barrier so control flow stays workgroup-uniform.
+    for (uint len = 1u; len < d; len <<= 1u) {
+        if (live && (t & len) == 0u) {
+            float u = s[t];
+            float v = s[t + len];
+            s[t]       = u + v;
+            s[t + len] = u - v;
+        }
+        barrier();
+    }
+
+    // --- 3. inverse rotation + rescale by the stored norm ---
+    if (live) {
+        float outv  = s[t] * pc.invSqrtD * signs[t] * norms[hv];
+        uint pos    = hv / pc.numKvHeads;
+        uint h      = hv - pos * pc.numKvHeads;
+        uint stride = pc.numKvHeads * d;
+        dst[pos * stride + h * d + t] = outv;
+    }
+}

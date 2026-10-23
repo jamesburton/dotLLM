@@ -4,6 +4,16 @@ using System.Text;
 namespace DotLLM.Tokenizers.ChatTemplates;
 
 /// <summary>
+/// Runtime value produced by evaluating a <see cref="MacroNode"/> and stored as a regular
+/// scope variable under the macro's name — so a later <c>{{ name(args) }}</c> resolves through
+/// the same identifier lookup as any other variable, and macros defined inside a loop or
+/// conditional are only callable once that branch actually executes (matches Jinja2).
+/// </summary>
+internal sealed record JinjaMacroValue(
+    IReadOnlyList<(string Name, IExpression? Default)> Parameters,
+    IReadOnlyList<ITemplateNode> Body);
+
+/// <summary>
 /// Tree-walking evaluator: executes a JinjaTemplate AST against a variable context
 /// and produces the rendered output string.
 /// </summary>
@@ -33,6 +43,7 @@ internal sealed class JinjaEvaluator
         ["string"] = (input, _) => Stringify(input),
         ["list"] = (input, _) => input is IList list ? list : input is IEnumerable e ? ToList(e) : new List<object?> { input },
         ["items"] = (input, _) => GetDictItems(input),
+        ["dictsort"] = (input, _) => DictSort(input),
         ["join"] = (input, args) => JoinFilter(input, args),
         ["replace"] = (input, args) => ReplaceFilter(input, args),
         ["selectattr"] = (input, args) => SelectAttrFilter(input, args),
@@ -80,17 +91,64 @@ internal sealed class JinjaEvaluator
                 SetVariable(setNode.Name, EvalExpr(setNode.Value));
                 break;
 
+            case SetBlockNode setBlock:
+                SetVariable(setBlock.Name, RenderNodes(setBlock.Body));
+                break;
+
             case SetAttributeNode setAttr:
                 EvaluateSetAttribute(setAttr);
                 break;
+
+            case MacroNode macroNode:
+                // Registered as a plain scope variable (see JinjaMacroValue) so calls resolve
+                // through the same LookupVariable path as any other identifier.
+                SetVariable(macroNode.Name, new JinjaMacroValue(macroNode.Parameters, macroNode.Body));
+                break;
+        }
+    }
+
+    /// <summary>Binds the loop variable(s) for one item, unpacking dict entries / 2-element lists when the loop has two variables.</summary>
+    private void BindLoopVariables(ForNode node, object? item)
+    {
+        if (node.SecondVariableName != null && item is KeyValuePair<string, object?> kvp)
+        {
+            SetVariable(node.VariableName, kvp.Key);
+            SetVariable(node.SecondVariableName, kvp.Value);
+        }
+        else if (node.SecondVariableName != null && item is IList tupleList && tupleList.Count >= 2)
+        {
+            SetVariable(node.VariableName, tupleList[0]);
+            SetVariable(node.SecondVariableName, tupleList[1]);
+        }
+        else
+        {
+            SetVariable(node.VariableName, item);
         }
     }
 
     private void EvaluateFor(ForNode node)
     {
         var iterableValue = EvalExpr(node.Iterable);
-        var items = ToEnumerable(iterableValue);
+        // Jinja iterates a dict's KEYS when the loop has a single variable (two variables unpack items()).
+        var items = iterableValue is Dictionary<string, object?> keyedDict && node.SecondVariableName is null
+            ? keyedDict.Keys.Cast<object?>()
+            : ToEnumerable(iterableValue);
         var itemList = items.ToList();
+
+        if (node.Filter is not null)
+        {
+            // Evaluate the per-item filter in a scope that binds the loop variable(s) exactly as the body will see them.
+            var kept = new List<object?>(itemList.Count);
+            foreach (var candidate in itemList)
+            {
+                PushScope();
+                BindLoopVariables(node, candidate);
+                bool keep = IsTruthy(EvalExpr(node.Filter));
+                PopScope();
+                if (keep) kept.Add(candidate);
+            }
+            itemList = kept;
+        }
 
         if (itemList.Count == 0)
         {
@@ -107,23 +165,13 @@ internal sealed class JinjaEvaluator
 
             var item = itemList[i];
 
-            // Handle tuple unpacking for dict iteration
-            if (node.SecondVariableName != null && item is KeyValuePair<string, object?> kvp)
-            {
-                SetVariable(node.VariableName, kvp.Key);
-                SetVariable(node.SecondVariableName, kvp.Value);
-            }
-            else if (node.SecondVariableName != null && item is IList tupleList && tupleList.Count >= 2)
-            {
-                SetVariable(node.VariableName, tupleList[0]);
-                SetVariable(node.SecondVariableName, tupleList[1]);
-            }
-            else
-            {
-                SetVariable(node.VariableName, item);
-            }
+            BindLoopVariables(node, item);
 
-            // Set loop variable
+            // Set loop variable. previtem/nextitem are intentionally omitted rather than set to
+            // Undefined at the first/last iteration respectively — member access on a
+            // Dictionary<string, object?> already yields Undefined for an absent key (see
+            // EvalMemberAccess), so this reuses the evaluator's existing undefined convention
+            // instead of inventing a new one, and never throws at the boundary (Jinja2 semantics).
             var loopVar = new Dictionary<string, object?>
             {
                 ["index"] = i + 1,
@@ -134,6 +182,10 @@ internal sealed class JinjaEvaluator
                 ["revindex"] = length - i,
                 ["revindex0"] = length - i - 1,
             };
+            if (i > 0)
+                loopVar["previtem"] = itemList[i - 1];
+            if (i < length - 1)
+                loopVar["nextitem"] = itemList[i + 1];
             SetVariable("loop", loopVar);
 
             foreach (var bodyNode in node.Body)
@@ -327,7 +379,15 @@ internal sealed class JinjaEvaluator
         return expr.Op switch
         {
             UnaryOp.Not => !IsTruthy(operand),
-            UnaryOp.Negate => operand is int i ? -i : operand is double d ? -d : throw new JinjaException("Cannot negate non-number"),
+            // Box each arm separately: `cond ? -i : cond2 ? -d : throw` is typed double, which turned -1 into -1.0 and broke
+            // negative list/string indexing (`x[-1]`).
+            UnaryOp.Negate => operand switch
+            {
+                int i => (object)(-i),
+                long l => -l,
+                double d => -d,
+                _ => throw new JinjaException("Cannot negate non-number"),
+            },
             _ => throw new JinjaException($"Unknown unary operator: {expr.Op}")
         };
     }
@@ -403,6 +463,8 @@ internal sealed class JinjaEvaluator
             {
                 // Check if it's a variable that's callable (e.g., user-provided function)
                 var func = LookupVariable(expr.Name);
+                if (func is JinjaMacroValue macro)
+                    return CallMacro(macro, expr.Args);
                 if (func is Func<object?[], object?> callable)
                 {
                     var args = expr.Args.Select(a => EvalExpr(a.Value)).ToArray();
@@ -411,6 +473,70 @@ internal sealed class JinjaEvaluator
                 throw new JinjaException($"Unknown function: {expr.Name}");
             }
         }
+    }
+
+    /// <summary>
+    /// Invokes a macro call site: binds positional/keyword arguments to the macro's declared
+    /// parameters (falling back to each parameter's default expression, then
+    /// <see cref="Undefined"/>), then renders the macro body in its own pushed scope. Named args
+    /// take priority over positional position — mirrors Jinja2/Python keyword-argument binding.
+    /// </summary>
+    private object? CallMacro(JinjaMacroValue macro, IReadOnlyList<(string? Name, IExpression Value)> callArgs)
+    {
+        PushScope();
+        try
+        {
+            var positional = new List<object?>();
+            var named = new Dictionary<string, object?>();
+            foreach (var (name, valueExpr) in callArgs)
+            {
+                var value = EvalExpr(valueExpr);
+                if (name is not null)
+                    named[name] = value;
+                else
+                    positional.Add(value);
+            }
+
+            for (int i = 0; i < macro.Parameters.Count; i++)
+            {
+                var (paramName, defaultExpr) = macro.Parameters[i];
+                object? value;
+                if (named.TryGetValue(paramName, out var namedVal))
+                    value = namedVal;
+                else if (i < positional.Count)
+                    value = positional[i];
+                else if (defaultExpr is not null)
+                    value = EvalExpr(defaultExpr);
+                else
+                    value = Undefined;
+                SetVariable(paramName, value);
+            }
+
+            return RenderNodes(macro.Body);
+        }
+        finally
+        {
+            PopScope();
+        }
+    }
+
+    /// <summary>
+    /// Renders a node list into its own returned string by temporarily redirecting
+    /// <see cref="_output"/> — used for macro bodies, whose rendered text is captured as the
+    /// expression's return value at the call site rather than appended straight to the
+    /// top-level template output. Restores the caller's in-progress output afterward, so nested
+    /// macro calls (a macro invoking another macro) compose correctly via normal recursion.
+    /// </summary>
+    private string RenderNodes(IReadOnlyList<ITemplateNode> nodes)
+    {
+        var saved = _output.ToString();
+        _output.Clear();
+        foreach (var node in nodes)
+            EvaluateNode(node);
+        var rendered = _output.ToString();
+        _output.Clear();
+        _output.Append(saved);
+        return rendered;
     }
 
     private object? EvalMethodCall(MethodCallExpr expr)
@@ -501,11 +627,18 @@ internal sealed class JinjaEvaluator
         bool result = expr.TestName switch
         {
             "none" => value is null,
+            // "is defined" is parsed separately as IsDefinedExpr (see JinjaParser), but "is
+            // undefined" falls through to the generic identifier-test path here — mirror the
+            // same Undefined-sentinel check so both spellings agree.
+            "undefined" => ReferenceEquals(value, Undefined),
             "mapping" => value is Dictionary<string, object?>,
             "string" => value is string,
             "sequence" => value is IList,
             "number" or "integer" => value is int or double or long,
-            "iterable" => value is IEnumerable and not string,
+            // Jinja2 `iterable` is `iter(value)` succeeding: strings ARE iterable. Llama-3.1's template relies on it
+            // (`message.content is mapping or message.content is iterable` -> tojson), and both reference
+            // Jinja2 and llama.cpp render a string tool result as a quoted/escaped JSON string.
+            "iterable" => value is IEnumerable,
             "true" => value is true,
             "false" => value is false,
             "callable" => false, // we don't support callable test
@@ -519,33 +652,61 @@ internal sealed class JinjaEvaluator
         var obj = EvalExpr(expr.Object);
         int? startVal = expr.Start != null ? ToInt(EvalExpr(expr.Start)) : null;
         int? stopVal = expr.Stop != null ? ToInt(EvalExpr(expr.Stop)) : null;
+        int? stepVal = expr.Step != null ? ToInt(EvalExpr(expr.Step)) : null;
 
         if (obj is string s)
         {
-            int from = startVal ?? 0;
-            int to = stopVal ?? s.Length;
-            if (from < 0) from = Math.Max(0, s.Length + from);
-            if (to < 0) to = Math.Max(0, s.Length + to);
-            to = Math.Min(to, s.Length);
-            from = Math.Min(from, to);
-            return s[from..to];
+            var sliced = SliceSequence(s.Length, startVal, stopVal, stepVal, i => s[i]);
+            var sb = new StringBuilder(sliced.Count);
+            foreach (var c in sliced) sb.Append((char)c!);
+            return sb.ToString();
         }
 
         if (obj is IList list)
-        {
-            int from = startVal ?? 0;
-            int to = stopVal ?? list.Count;
-            if (from < 0) from = Math.Max(0, list.Count + from);
-            if (to < 0) to = Math.Max(0, list.Count + to);
-            to = Math.Min(to, list.Count);
-            from = Math.Min(from, to);
-            var sliced = new List<object?>();
-            for (int i = from; i < to; i++)
-                sliced.Add(list[i]);
-            return sliced;
-        }
+            return SliceSequence(list.Count, startVal, stopVal, stepVal, i => list[i]);
 
         return Undefined;
+    }
+
+    /// <summary>
+    /// Applies Python slice semantics (including negative <paramref name="stepVal"/> for reversal,
+    /// e.g. <c>[::-1]</c>) over a sequence of <paramref name="length"/> items. Index normalization
+    /// follows CPython's <c>PySlice_AdjustIndices</c>.
+    /// </summary>
+    private static List<object?> SliceSequence(int length, int? startVal, int? stopVal, int? stepVal, Func<int, object?> get)
+    {
+        int step = stepVal ?? 1;
+        var result = new List<object?>();
+        if (step == 0) return result; // Python raises; we yield empty rather than throw mid-template.
+
+        int lower, upper;
+        if (step < 0) { lower = -1; upper = length - 1; }
+        else { lower = 0; upper = length; }
+
+        int start;
+        if (startVal is null) start = step < 0 ? upper : lower;
+        else
+        {
+            start = startVal.Value;
+            if (start < 0) start = Math.Max(start + length, lower);
+            else start = Math.Min(start, upper);
+        }
+
+        int stop;
+        if (stopVal is null) stop = step < 0 ? lower : upper;
+        else
+        {
+            stop = stopVal.Value;
+            if (stop < 0) stop = Math.Max(stop + length, lower);
+            else stop = Math.Min(stop, upper);
+        }
+
+        if (step > 0)
+            for (int i = start; i < stop; i += step) result.Add(get(i));
+        else
+            for (int i = start; i > stop; i += step) result.Add(get(i));
+
+        return result;
     }
 
     // ── Scope management ──
@@ -902,6 +1063,15 @@ internal sealed class JinjaEvaluator
     {
         if (input is Dictionary<string, object?> dict)
             return dict.Select(kvp => (object?)new List<object?> { kvp.Key, kvp.Value }).ToList();
+        return new List<object?>();
+    }
+
+    /// <summary>Jinja2 <c>dictsort</c>: (key, value) pairs ordered by key, case-insensitive (default).</summary>
+    private static object? DictSort(object? input)
+    {
+        if (input is Dictionary<string, object?> dict)
+            return dict.OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase)
+                       .Select(kvp => (object?)new List<object?> { kvp.Key, kvp.Value }).ToList();
         return new List<object?>();
     }
 

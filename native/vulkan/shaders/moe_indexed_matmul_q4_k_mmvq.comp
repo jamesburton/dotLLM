@@ -1,0 +1,141 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// MoE INDEXED Q4_K MMVQ decode GEMV (issue #137): integer-dot (dp4a)
+// matrix-vector multiply over a packed Q4_K expert bank.
+//
+//   y[n, m] = sum_k dequant_q4k(bank[indices[n], m, k]) * x[n, k]
+//
+// The gathered/indexed variant of matmul_q4_k_mmvq.comp: the weight row is
+// looked up through the per-row expert index (bank layout [numExperts, M, K],
+// row-major, 144-byte super-blocks) and the activation rows come from the
+// row-major Q8_1-quantized expanded MoE input produced by
+// quantize_q8_1_rows.comp (row n at xq uint offset n*(K/4), xds vec2 offset
+// n*(K/32)). Everything else — the COALESCED lane=K-position layout, the
+// per-sub-block  d·scale·(d_x·dot) − dmin·min·s  math, the single subgroupAdd
+// reduction — is byte-identical to the proven dense decode shader (#338).
+//
+// NOT bit-exact vs the F32-in indexed kernel (x is int8-quantized); validated
+// argmax + tolerance vs the CPU MoeSwiGluMlp / Gemma4Moe oracle.
+//
+// Replaces the one-thread-per-output-cell scalar moe_indexed_matmul_q4_k_f32
+// on the DECODE path (small N): that kernel streams each expert row with
+// per-thread byte reads (adjacent threads read rows ~1.5 KB apart =>
+// uncoalesced), which capped the Gemma-4 26B expert GEMVs far below the
+// coalesced bandwidth the dense mmvq kernels reach.
+//
+// Dispatch: 2D grid — gl_WorkGroupID.x = m (output row), gl_WorkGroupID.y = n
+// (expanded token row). One wave32 subgroup per (n, m) output cell row.
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufBank { uint  bank[]; };   // Q4_K blob [numExperts, M, K]
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq   { uint  xq[]; };     // [N * K/4] packed int8 activations
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds  { vec2  xds[]; };    // [N * K/32] (d_x, s)
+layout(set = 0, binding = 3, std430) readonly  buffer BufIdx  { int   indices[]; };// [N]
+layout(set = 0, binding = 4, std430) writeonly buffer BufY    { float y[]; };      // [N * M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // output dim   (per-expert weight row count)
+    uint K;             // input dim    (multiple of 256)
+    uint N;             // total rows   (typically seqLen * topK)
+    uint numExperts;    // bank's first axis size — bounds-check only
+    uint blocksPerRow;  // = K / 256
+} pc;
+
+const uint Q4K_BLOCK_BYTES = 144u;
+
+uint readByte(uint absByteOff) {
+    uint u = bank[absByteOff >> 2u];
+    return (u >> ((absByteOff & 3u) * 8u)) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = bank[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = bank[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+// j-th (0..7) (scale, min) pair from the 12-byte scales[] — get_scale_min_k4.
+uvec2 unpackScaleMin(uint scalesByteBase, uint j) {
+    uint sc, mn;
+    if (j < 4u) {
+        sc = readByte(scalesByteBase + j) & 63u;
+        mn = readByte(scalesByteBase + j + 4u) & 63u;
+    } else {
+        uint scLow  = readByte(scalesByteBase + j + 4u) & 0xFu;
+        uint scHigh = (readByte(scalesByteBase + j - 4u) >> 6u) & 0x3u;
+        sc = scLow | (scHigh << 4u);
+        uint mnLow  = (readByte(scalesByteBase + j + 4u) >> 4u) & 0xFu;
+        uint mnHigh = (readByte(scalesByteBase + j) >> 6u) & 0x3u;
+        mn = mnLow | (mnHigh << 4u);
+    }
+    return uvec2(sc, mn);
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    uint n = gl_WorkGroupID.y;
+    if (m >= pc.M || n >= pc.N) return;
+
+    uint expert = uint(indices[n]);
+    if (expert >= pc.numExperts) return; // defensive: bad index leaves y untouched
+
+    uint lane = gl_LocalInvocationID.x;   // 0..31 (one subgroup per workgroup)
+    uint p = lane >> 3u;                  // pairIdx 0..3
+    uint g = lane & 7u;                   // group 0..7 (which 4-element quartet)
+    uint j0 = p * 2u;                     // low-nibble sub-block
+    uint j1 = j0 + 1u;                    // high-nibble sub-block
+
+    uint rowByteBase = (expert * pc.M + m) * pc.blocksPerRow * Q4K_BLOCK_BYTES;
+    uint xqRowBase   = n * (pc.K >> 2u);  // uint index of row n's packed activations
+    uint xdsRowBase  = n * (pc.K >> 5u);  // vec2 index of row n's (d_x, s)
+
+    float acc = 0.0;
+
+    for (uint b = 0u; b < pc.blocksPerRow; b++) {
+        uint blockByteBase = rowByteBase + b * Q4K_BLOCK_BYTES;
+        float d    = readHalf(blockByteBase);
+        float dmin = readHalf(blockByteBase + 2u);
+        uint scalesBase = blockByteBase + 4u;
+        uvec2 sm0 = unpackScaleMin(scalesBase, j0);
+        uvec2 sm1 = unpackScaleMin(scalesBase, j1);
+
+        // Lane L owns qs uint L => the 32 lanes read 32 consecutive uints.
+        uint cur = bank[((blockByteBase + 16u) >> 2u) + lane];
+        uint lo = ( cur        & 0x0Fu)
+                | ((cur >>  8u) & 0x0Fu) << 8u
+                | ((cur >> 16u) & 0x0Fu) << 16u
+                | ((cur >> 24u) & 0x0Fu) << 24u;
+        uint hi = ((cur >>  4u) & 0x0Fu)
+                | ((cur >> 12u) & 0x0Fu) << 8u
+                | ((cur >> 20u) & 0x0Fu) << 16u
+                | ((cur >> 28u) & 0x0Fu) << 24u;
+
+        uint xqBlockBase = xqRowBase + b * 64u;  // first activation uint of this super-block
+        uint xdsBase     = xdsRowBase + b * 8u;  // first Q8_1 block of this super-block
+        vec2 ds0 = xds[xdsBase + j0];            // (d_x, s) for sub-block j0
+        vec2 ds1 = xds[xdsBase + j1];
+
+        int dot0 = dotPacked4x8AccSatEXT(int(lo), int(xq[xqBlockBase + j0 * 8u + g]), 0);
+        int dot1 = dotPacked4x8AccSatEXT(int(hi), int(xq[xqBlockBase + j1 * 8u + g]), 0);
+
+        // d·sc·(d_x·dot)  minus  1/8 of the per-sub-block min term (8 lanes share it).
+        acc += (d * float(sm0.x)) * (ds0.x * float(dot0)) - (dmin * float(sm0.y)) * ds0.y * 0.125;
+        acc += (d * float(sm1.x)) * (ds1.x * float(dot1)) - (dmin * float(sm1.y)) * ds1.y * 0.125;
+    }
+
+    // The subgroup IS the (n, m) cell: one reduction yields y[n*M + m].
+    float total = subgroupAdd(acc);
+    if (subgroupElect())
+        y[n * pc.M + m] = total;
+}
