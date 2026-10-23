@@ -30,7 +30,7 @@ namespace DotLLM.Models.Architectures;
 /// MoE routing — and the corresponding per-model quant dispatch gaining a <c>PQ2_0</c> arm
 /// (Bonsai's ternary quant type; see <c>MatMul.PQ2S.cs</c>).
 /// </summary>
-public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
+public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
 {
     private readonly GgufFile? _gguf; // kept alive; null when built from prebuilt weights
     private readonly Qwen3HybridDenseLayerWeights[] _layers;
@@ -74,7 +74,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     // Multi-Token Prediction (MTP / "NextN") head — issue #253. Null for every GGUF without a
     // nextn.* tensor group, which is the overwhelming majority: every other field and code path
     // in this class is completely unaffected by MTP being absent.
-    private readonly MtpHeadWeights? _mtpHead;
+    private MtpHeadWeights? _mtpHead; // set at load (embedded head) or by AttachMtpHead (separate mtp-*.gguf, #1185)
 
     /// <inheritdoc/>
     public ModelConfig Config { get; }
@@ -2405,6 +2405,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         _gdnCache.Dispose();
         Interlocked.Exchange(ref _spareGdnCheckpoint, null)?.Dispose();
         FreeRowSnapshots();
+        _ownedMtpHeadFile?.Dispose();
         GC.SuppressFinalize(this);
     }
 
