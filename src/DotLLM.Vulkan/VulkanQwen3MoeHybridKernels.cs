@@ -181,6 +181,52 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     // ── Shared norms / attention / SwiGLU / Add ─────────────────────────────
     public RmsNormF32Kernel RmsNorm { get; }
     public RopeF32Kernel Rope { get; }
+
+    /// <summary>
+    /// Dense-YaRN rotation (issue #1101), or null when the model's RoPE has no active YaRN. Owned by this set once
+    /// attached: <see cref="InvalidateAll"/> and <see cref="Dispose"/> cover it.
+    /// </summary>
+    public VulkanDenseYarnRope? YarnRope { get; private set; }
+
+    /// <summary>Attaches (and takes ownership of) the model's YaRN rotation; null keeps the theta-derived <see cref="Rope"/>.</summary>
+    /// <param name="yarnRope">The rotation, or null.</param>
+    internal void AttachYarnRope(VulkanDenseYarnRope? yarnRope)
+    {
+        if (!ReferenceEquals(YarnRope, yarnRope))
+            YarnRope?.Dispose();
+        YarnRope = yarnRope;
+    }
+
+    /// <summary>
+    /// Records the NeoX RoPE on Q and K: YaRN-ramped when <see cref="YarnRope"/> is attached, the theta-derived
+    /// <see cref="Rope"/> otherwise. Every RoPE call site of a host that may carry YaRN goes through here, so none can
+    /// silently keep the unscaled rotation (issue #1101).
+    /// </summary>
+    /// <param name="cmdBuf">Command buffer being recorded.</param>
+    /// <param name="q">Q rows, <c>[seqLen, numHeads, headDim]</c>.</param>
+    /// <param name="k">K rows, <c>[seqLen, numKvHeads, headDim]</c>.</param>
+    /// <param name="positions">Per-row positions.</param>
+    /// <param name="seqLen">Rows.</param>
+    /// <param name="numHeads">Q heads to rotate.</param>
+    /// <param name="numKvHeads">K heads to rotate.</param>
+    /// <param name="headDim">Head width.</param>
+    /// <param name="ropeDim">Rotated dims per head.</param>
+    /// <param name="theta">RoPE base (used only without YaRN).</param>
+    public void RecordRopeNeoX(nint cmdBuf, VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer positions,
+        int seqLen, int numHeads, int numKvHeads, int headDim, int ropeDim, float theta)
+    {
+        if (YarnRope is { } yarn)
+        {
+            yarn.Record(cmdBuf, q, k, positions, seqLen, numHeads, numKvHeads, headDim);
+            return;
+        }
+
+        Rope.Record(cmdBuf, q, k, positions,
+            seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
+            headDim: headDim, ropeDim: ropeDim, theta: theta,
+            variant: RopeF32Kernel.Variant.NeoX);
+    }
+
     public AttentionF32Kernel Attention { get; }
     /// <summary>
     /// Optional Flash-Attention prefill kernel. Null when the SPV is missing,
@@ -205,6 +251,97 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     /// threshold derivation and the ON-by-default evidence.
     /// </summary>
     public VulkanSplitKvAttentionKernel? SplitKvAttention { get; }
+
+    /// <summary>
+    /// The attention kernels for a narrow (F16) KV cache (issue #1102), or null until a host selects one with
+    /// <see cref="EnsureNarrowKv"/>. Owned here so <see cref="InvalidateAll"/> and <see cref="Dispose"/> cover them.
+    /// </summary>
+    public VulkanNarrowKvAttentionKernels? NarrowKv { get; private set; }
+
+    private VulkanDevice? _device;
+    private string? _spvDir;
+
+    /// <summary>
+    /// Returns the narrow-KV kernels for <paramref name="storage"/>, building them on first use (issue #1102).
+    /// </summary>
+    /// <param name="storage">The narrow storage the host's caches use.</param>
+    /// <param name="headDim">The model's per-head dimension (gates which prefill kernels are worth building).</param>
+    /// <returns>The kernel set.</returns>
+    /// <exception cref="NotSupportedException">The storage has no narrow kernels, or this build lacks their SPIR-V.</exception>
+    internal VulkanNarrowKvAttentionKernels EnsureNarrowKv(VulkanKvStorage storage, int headDim)
+    {
+        if (NarrowKv is { } existing && existing.Storage == storage) return existing;
+        var made = VulkanNarrowKvAttentionKernels.Create(_device!, _spvDir!, headDim, storage);
+        if (_gqaDecode) made.SplitKvAttention?.EnableGqaByDefault();
+        NarrowKv?.Dispose();
+        NarrowKv = made;
+        return made;
+    }
+
+    /// <summary>Gets or sets a value indicating whether <see cref="EnsureGqaFlash"/> returns null (an A/B and test switch).</summary>
+    internal bool GqaFlashDisabled { get; set; }
+
+    /// <summary>Gets the GQA-grouped prefill dispatches recorded so far, both KV formats.</summary>
+    internal long GqaFlashDispatches => (_gqaFlashF32?.Dispatches ?? 0) + (_gqaFlashF16?.Dispatches ?? 0);
+
+    private VulkanFlashAttentionGqaKernel? _gqaFlashF32;
+    private VulkanFlashAttentionGqaKernel? _gqaFlashF16;
+    private bool _gqaFlashF32Tried;
+    private bool _gqaFlashF16Tried;
+
+    /// <summary>
+    /// Returns the GQA-grouped tiled prefill attention for <paramref name="storage"/> (issue #441), building it on first use, or null
+    /// when it is disabled (<see cref="VulkanFlashAttentionGqaKernel.DisableEnvVar"/>, the flash opt-out), unavailable on this device,
+    /// or not worth it for this head width: heads of 128 or less keep the per-head flash kernels, which serve them well.
+    /// </summary>
+    /// <param name="storage">The KV storage the host's cache uses.</param>
+    /// <param name="headDim">The model's per-head dimension.</param>
+    /// <returns>The kernel, or null.</returns>
+    internal VulkanFlashAttentionGqaKernel? EnsureGqaFlash(VulkanKvStorage storage, int headDim)
+    {
+        if (GqaFlashDisabled) return null;
+        if (headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim || headDim > VulkanFlashAttentionGqaKernel.MaxHeadDim) return null;
+        bool f16 = storage == VulkanKvStorage.F16;
+        if (f16 ? _gqaFlashF16Tried : _gqaFlashF32Tried) return f16 ? _gqaFlashF16 : _gqaFlashF32;
+        VulkanFlashAttentionGqaKernel? made = VulkanTransformerModel.IsFlashAttentionDisabled()
+            ? null
+            : VulkanFlashAttentionGqaKernel.TryCreate(_device!, _spvDir!, storage,
+                allowCoopmat: !VulkanTransformerModel.IsCoopmatAttentionDisabled());
+        if (f16)
+        {
+            _gqaFlashF16 = made;
+            _gqaFlashF16Tried = true;
+        }
+        else
+        {
+            _gqaFlashF32 = made;
+            _gqaFlashF32Tried = true;
+        }
+
+        return made;
+    }
+
+    private bool _gqaDecode;
+
+    /// <summary>
+    /// Opts this host's split-KV decode kernels (the F32 set and any narrow set) into the GQA-grouped pass (issue #1102), which
+    /// reads each cached K / V element once per KV head instead of once per query head. <c>DOTLLM_VULKAN_SPLITKV_GQA</c> still wins.
+    /// </summary>
+    internal void EnableGqaDecode()
+    {
+        _gqaDecode = true;
+        SplitKvAttention?.EnableGqaByDefault();
+        NarrowKv?.SplitKvAttention?.EnableGqaByDefault();
+    }
+
+    /// <summary>Test hook: forces the grouped decode pass on or off for every split-KV kernel of this set.</summary>
+    /// <param name="on">Whether the grouped pass may run.</param>
+    internal void SetGqaDecodeForTest(bool on)
+    {
+        _gqaDecode = on;
+        if (SplitKvAttention is { } f32) f32.PreferGqa = on;
+        if (NarrowKv?.SplitKvAttention is { } narrow) narrow.PreferGqa = on;
+    }
 
     /// <summary>Split-KV attention with per-row query offsets for 2..8-row verify forwards (null when its SPIR-V is missing or split decode is disabled).</summary>
     public VulkanSplitKvRowsAttentionKernel? SplitKvRowsAttention { get; private set; }
@@ -517,6 +654,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             moeTopk, moeBroadcast, moeIndexed, moeIndexedQ6K, moeIndexedQ4K, moeIndexedQ5K,
             moeIndexedQ4KMmq, quantizeQ8_1Rows, moeIndexedQ5KMmq, moeScatter, moeSigmoidGatedAdd);
         kernels.SplitKvRowsAttention = splitKvAttention is null ? null : VulkanSplitKvRowsAttentionKernel.TryCreate(device, spvDir);
+        kernels._device = device;
+        kernels._spvDir = spvDir;
         kernels.Iq1CodebooksOwned = Iq1Codebooks.Create(device);   // #823: grid for the IQ1_M expert kernels
         kernels.MoeSharedGateAdd = moeSharedGateAdd;
         kernels.MatMulBf16Multi = matmulBf16Multi;
@@ -669,6 +808,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     /// <summary>Invalidates every kernel's cached descriptor sets. Call after scratch buffers re-allocate.</summary>
     public void InvalidateAll()
     {
+        YarnRope?.InvalidateDescriptorCache();
         MatMul.InvalidateDescriptorCache();
         MatMulQ8.InvalidateDescriptorCache();
         MatMulQ8Gemm.InvalidateDescriptorCache();
@@ -720,6 +860,9 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         FlashAttentionCoopmat?.InvalidateDescriptorCache();
         SplitKvAttention?.InvalidateDescriptorCache();
         SplitKvRowsAttention?.InvalidateDescriptorCache();
+        NarrowKv?.InvalidateAll();
+        _gqaFlashF32?.InvalidateDescriptorCache();
+        _gqaFlashF16?.InvalidateDescriptorCache();
         SwiGlu.InvalidateDescriptorCache();
         Add.InvalidateDescriptorCache();
         SiluInplace.InvalidateDescriptorCache();
@@ -797,6 +940,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
 
     public void Dispose()
     {
+        YarnRope?.Dispose();
         MatMulQ4_0Gemm?.Dispose();
         foreach (var gk in _iqGrouped.Values) gk.Dispose();
         foreach (var mk in _iqMmvq.Values) mk.Dispose();
@@ -834,6 +978,9 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         SwiGlu.Dispose();
         SplitKvAttention?.Dispose();
         SplitKvRowsAttention?.Dispose();
+        NarrowKv?.Dispose();
+        _gqaFlashF32?.Dispose();
+        _gqaFlashF16?.Dispose();
         FlashAttention?.Dispose();
         FlashAttentionCoopmat?.Dispose();
         Attention.Dispose();

@@ -66,6 +66,11 @@ public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
     // Prefill dequant-to-F16 + cuBLAS-HGEMM scratch, shared by every projection whose weight
     // has no native F32 CUDA kernel — see Task 8's Gemm dispatcher.
     private nint _dequantScratchF16Weight;
+    // #1099: elements the scratch holds — the widest LAYER projection, no longer the LM head, which a
+    // multi-row forward now dequantizes in tiles of at most this size (GemmLmHead).
+    private long _dequantScratchElems;
+    private int _lmHeadDequantTiles;    // #1099 (LmHeadDequantTiles)
+    private bool _warnedLmHeadTiled;
     private nint _activF16InScratch;
     private long _activF16InScratchElems;
     private nint _activF16OutScratch;
@@ -502,7 +507,8 @@ public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
             // optimization; NemotronH's CPU loader already resolves the tied case at the host-pointer
             // level, so outputWeight here is already the correct source regardless).
             nint outputDevice = UploadRawTensorFromHost(outputWeight, outputQt, outputOutputDim, outputInputDim, allocs);
-            UpdateMaxTile(ref maxTileFloats, (long)outputOutputDim * outputInputDim);
+            // #1099: the LM head no longer sizes the dequant scratch (it was ~1 GiB of F16 for a 131k x 4096
+            // head, held for the model's lifetime); GemmLmHead tiles it through the layer-sized scratch.
 
             long tokenEmbedRowBytes = Dequantize.RowByteSize(hiddenSize, tokenEmbedQt);
 
@@ -587,6 +593,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
                 outputDevice, outputQt, outputOutputDim, outputInputDim, ownsOutputDevice: true,
                 kvSlotForLayer, attentionLayerCount,
                 state, ssmCache, stream, cublas, context, kernels, deviceId, dequantScratchDevice);
+            model._dequantScratchElems = maxTileFloats;
             model._moeSpec = ComputeMoeSpec(layers, hiddenSize);
             if (hasMoe)
             {
@@ -802,6 +809,51 @@ public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
             _activF16OutScratch, seqLen, k, m, streamH);
         _kernels.LaunchConvertF16ToF32(_activF16OutScratch, y, activOutElems, streamH);
     }
+
+    /// <summary>
+    /// The LM head over <paramref name="seqLen"/> rows (issue #1099). This host has no packed multi-row
+    /// kernel, and every prefill computes all rows' logits, so a multi-row head goes through dequant +
+    /// cuBLAS in output-row tiles that fit the layer-sized scratch (<see cref="CudaWideProjection"/>)
+    /// instead of a whole <c>[vocab, hidden]</c> F16 copy.
+    /// </summary>
+    private void GemmLmHead(nint weight, QuantizationType qt, nint x, nint y, int m, int k, int seqLen)
+    {
+        if (seqLen == 1 || (long)m * k <= _dequantScratchElems || !CudaWideProjection.SupportsRowTiles(qt))
+        {
+            Gemm(weight, qt, x, y, m, k, seqLen);
+            return;
+        }
+
+        int tileRows = CudaWideProjection.TileRows(m, k, _dequantScratchElems);
+        if (!_warnedLmHeadTiled)
+        {
+            _warnedLmHeadTiled = true;
+            Console.Error.WriteLine(
+                $"[dotLLM.Cuda] LM head ({qt}) has no packed multi-row kernel: {seqLen}-row logits dequantize it in " +
+                $"{(m + tileRows - 1) / tileRows} tiles of {(long)tileRows * k * sizeof(ushort) >> 20} MiB F16 " +
+                $"instead of one {(long)m * k * sizeof(ushort) >> 20} MiB copy (issue #1099).");
+        }
+        nint streamH = _stream.Handle;
+        int activInElems = checked(seqLen * k);
+        int activOutElems = checked(seqLen * m);
+        EnsureActivF16InScratch(activInElems);
+        _kernels.LaunchConvertF32ToF16(x, _activF16InScratch, activInElems, streamH);
+        if (qt == QuantizationType.NVFP4)
+        {
+            // #1038: NVFP4's pre-scale product overflows FP16, so accumulate and write FP32 (as Gemm does).
+            _lmHeadDequantTiles += CudaWideProjection.RunTiled(_kernels, _cublas.Handle, weight, qt,
+                _activF16InScratch, y, f32Out: true, m, k, seqLen, _dequantScratchF16Weight, tileRows, streamH);
+            return;
+        }
+        EnsureActivF16OutScratch(activOutElems);
+        _lmHeadDequantTiles += CudaWideProjection.RunTiled(_kernels, _cublas.Handle, weight, qt,
+            _activF16InScratch, _activF16OutScratch, f32Out: false, m, k, seqLen,
+            _dequantScratchF16Weight, tileRows, streamH);
+        _kernels.LaunchConvertF16ToF32(_activF16OutScratch, y, activOutElems, streamH);
+    }
+
+    /// <summary>Test hook (issue #1099): LM-head dequant tiles launched since the model was created.</summary>
+    internal int LmHeadDequantTiles => _lmHeadDequantTiles;
 
     private void EnsureActivF16InScratch(long halfs)
     {
@@ -1160,7 +1212,7 @@ public sealed unsafe partial class CudaNemotronHTransformerModel : IModel
         _kernels.LaunchRmsNormF32(_state.HiddenState, _outputNormDevice, _state.HiddenState,
             hiddenSize, eps, seqLen, streamH);
 
-        Gemm(_outputDevice, _outputQt, _state.HiddenState, _state.Logits,
+        GemmLmHead(_outputDevice, _outputQt, _state.HiddenState, _state.Logits,
              _outputOutputDim, _outputInputDim, seqLen);
 
         // cuMemcpyDtoH_v2 does not implicitly wait for this model's non-default _stream —

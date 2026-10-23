@@ -248,8 +248,9 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
         VulkanModule? hd64Module, ComputePipeline? hd64Pipeline, nint hd64Pool,
         VulkanModule? hd256Module, ComputePipeline? hd256Pipeline, nint hd256Pool,
-        uint requireInvariantPv)
+        uint requireInvariantPv, VulkanKvStorage kvStorage)
     {
+        KvStorage = kvStorage;
         _hd256Module = hd256Module;
         _hd256Pipeline = hd256Pipeline;
         _hd256DescriptorPool = hd256Pool;
@@ -294,7 +295,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
     /// pipeline using <see cref="FlashAttentionCoopmatVariant.SelectFor"/>
     /// (currently the unpinned <see cref="FlashAttentionCoopmatVariant.Default"/>).
     /// Throws when the device lacks the required coopmat tile or the SPV is
-    /// missing �?" use <see cref="TryCreate"/> for graceful fallback.
+    /// missing �?" use <see cref="TryCreate(VulkanDevice, string)"/> for graceful fallback.
     /// </summary>
     public static VulkanFlashAttentionCoopmatKernel Create(VulkanDevice device, string spvDir)
         => Create(device, spvDir, FlashAttentionCoopmatVariant.SelectFor(device));
@@ -326,7 +327,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
     /// </summary>
     internal static VulkanFlashAttentionCoopmatKernel Create(
         VulkanDevice device, string spvDir, FlashAttentionCoopmatVariant variant, string shaderBaseName,
-        uint? requireInvariantPv = null)
+        uint? requireInvariantPv = null, VulkanKvStorage kvStorage = VulkanKvStorage.F32)
     {
         if (!SupportsDevice(device))
             throw new InvalidOperationException(
@@ -442,14 +443,48 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
         return new VulkanFlashAttentionCoopmatKernel(
             device, module, pipeline, pool, hd64Module, hd64Pipeline, hd64Pool,
-            hd256Module, hd256Pipeline, hd256Pool, gate);
+            hd256Module, hd256Pipeline, hd256Pool, gate, kvStorage);
     }
 
     /// <summary>
     /// Returns <c>null</c> when the device lacks coopmat support, the SPV is
     /// missing, or pipeline creation fails �?" callers fall back to the scalar
-    /// FA kernel.
+    /// FA kernel. Issue #1102: for <see cref="VulkanKvStorage.F16"/> it loads the <c>_kvf16</c> twins (base and hd256; no hd64 twin),
+    /// which read the packed halves in place.
     /// </summary>
+    /// <param name="device">The device.</param>
+    /// <param name="spvDir">Directory holding the SPIR-V blobs.</param>
+    /// <param name="kvStorage">Element format of the K / V buffers.</param>
+    /// <returns>The kernel, or <see langword="null"/>.</returns>
+    public static VulkanFlashAttentionCoopmatKernel? TryCreate(VulkanDevice device, string spvDir, VulkanKvStorage kvStorage)
+    {
+        if (kvStorage == VulkanKvStorage.F32) return TryCreate(device, spvDir);
+        if (!SupportsDevice(device)) return null;
+        try
+        {
+            return Create(device, spvDir, FlashAttentionCoopmatVariant.SelectFor(device),
+                kvStorage.ShaderName(DefaultShaderBaseName), kvStorage: kvStorage);
+        }
+        catch (FileNotFoundException)
+        {
+            return null;
+        }
+        catch (VulkanException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Element format of the K / V buffers this instance reads (issue #1102); fixed at creation.</summary>
+    public VulkanKvStorage KvStorage { get; }
+
+    /// <summary>
+    /// <see cref="Create(VulkanDevice, string)"/>, or <see langword="null"/> when the device lacks the coopmat tile, an SPV is missing
+    /// or a pipeline fails.
+    /// </summary>
+    /// <param name="device">The device.</param>
+    /// <param name="spvDir">Directory holding the SPIR-V blobs.</param>
+    /// <returns>The kernel, or <see langword="null"/>.</returns>
     public static VulkanFlashAttentionCoopmatKernel? TryCreate(VulkanDevice device, string spvDir)
     {
         if (!SupportsDevice(device)) return null;
@@ -528,7 +563,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         if (prefixLen < 0) throw new ArgumentOutOfRangeException(nameof(prefixLen));
 
         long qBytes   = (long)seqQ  * numHeads   * headDim * sizeof(float);
-        long kvBytes  = (long)seqKv * numKvHeads * headDim * sizeof(float);
+        long kvBytes  = (long)seqKv * numKvHeads * headDim * KvStorage.ElementBytes();
         long outBytes = qBytes;
         if (q.Size      < qBytes)   throw new ArgumentException("Q buffer too small.",      nameof(q));
         if (k.Size      < kvBytes)  throw new ArgumentException("K buffer too small.",      nameof(k));

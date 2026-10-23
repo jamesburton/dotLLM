@@ -180,7 +180,12 @@ public sealed class CudaQwen3HybridDenseMtpLongContextTests : IDisposable
         using (ITensor _ = model.Forward(prompt, Enumerable.Range(0, len).ToArray(), deviceId: -1, kvCache, adapter: null, mtp)) { }
         Assert.Equal(len, mtp.CurrentLength);
         Assert.Equal(5120, mtp.Capacity);
-        Assert.True(mtp.AllocatedBytes > before);
+        // Issue #1095: grown in place, memory is whole mapped granules, and this tiny head's 5120 rows fit the first ones; a
+        // copying growth allocates the new rows outright.
+        if (mtp.GrowsInPlace)
+            Assert.Equal(before, mtp.AllocatedBytes);
+        else
+            Assert.True(mtp.AllocatedBytes > before);
     }
 
     private static bool IsCudaDriverPresent()

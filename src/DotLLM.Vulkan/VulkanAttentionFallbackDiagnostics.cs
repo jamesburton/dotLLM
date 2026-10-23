@@ -34,11 +34,18 @@ public static class VulkanAttentionFallbackDiagnostics
 
     private static readonly ConcurrentDictionary<string, byte> Seen = new(StringComparer.Ordinal);
 
+    // Issue #441: the naive-prefill report is once per host and head width, while its message names the shape that tripped it.
+    private static readonly ConcurrentDictionary<string, byte> NaivePrefillSeen = new(StringComparer.Ordinal);
+
     /// <summary>Every distinct warning raised in this process, in no particular order.</summary>
     public static IReadOnlyCollection<string> Reported => (IReadOnlyCollection<string>)Seen.Keys;
 
     /// <summary>Clears the de-duplication set. Test hook; not for production use.</summary>
-    public static void Reset() => Seen.Clear();
+    public static void Reset()
+    {
+        Seen.Clear();
+        NaivePrefillSeen.Clear();
+    }
 
     /// <summary>
     /// Reports that the prefill flash-attention kernel will not be used for this model because
@@ -55,6 +62,27 @@ public static class VulkanAttentionFallbackDiagnostics
             $"{VulkanFlashAttentionF32Kernel.QueryTileRows}-row tile. Fix: add/compile a wider " +
             $"attention_flash_f32_hd*.comp variant (issue #441), or set {VulkanFlashAttentionF32Kernel.WideVariantEnvVar} " +
             $"if a suitable one exists but was switched off.");
+
+    /// <summary>KV length from which a prefill on the per-token kernel is reported (issue #441).</summary>
+    public const int NaivePrefillReportSeqKv = 1024;
+
+    /// <summary>
+    /// Reports, once per model kind and head width, a prefill that took the per-token attention kernel at a KV length of at least
+    /// <see cref="NaivePrefillReportSeqKv"/> (issue #441: the original defect was that this fallback was silent).
+    /// </summary>
+    /// <param name="modelKind">Host label for the message.</param>
+    /// <param name="seqQ">Query rows of the forward.</param>
+    /// <param name="seqKv">KV length the forward attends over.</param>
+    /// <param name="headDim">Per-head dimension.</param>
+    public static void ReportNaivePrefill(string modelKind, int seqQ, int seqKv, int headDim)
+    {
+        if (seqKv < NaivePrefillReportSeqKv) return;
+        if (!NaivePrefillSeen.TryAdd($":{modelKind}:{headDim}", 0)) return;   // once per host and head width, not per shape
+        Report(
+            $"[vulkan-attn] {modelKind}: a {seqQ}-row prefill at KV length {seqKv} (headDim {headDim}) ran the per-token attention " +
+            "kernel: no tiled prefill kernel was available for this shape/device. Long prompts will be slow. Check the " +
+            $"{VulkanFlashAttentionGqaKernel.DisableEnvVar} / flash-attention opt-outs and that the attention SPIR-V is present (issue #441).");
+    }
 
     /// <summary>
     /// Reports that the flash-attention SPV could not be loaded at all, so prefill runs on the

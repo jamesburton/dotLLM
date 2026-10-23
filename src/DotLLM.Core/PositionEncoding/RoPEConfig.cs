@@ -36,12 +36,27 @@ public readonly record struct RoPEConfig(
         => ScalingType == RoPEScalingType.YaRN && ScalingFactor > 1.0f && OrigMaxSeqLen > 0;
 
     /// <summary>
+    /// The context window YaRN extends the model to: <c>factor × original</c>
+    /// (<see cref="ScalingFactor"/> × <see cref="OrigMaxSeqLen"/>), or 0 when
+    /// <see cref="IsDenseYarnActive"/> is false. Qwen3.8's opt-in YaRN (factor 4 over
+    /// 262,144) gives 1,048,576 (issue #1101).
+    /// </summary>
+    public int YarnExtendedContextLength
+        => IsDenseYarnActive
+            ? (int)Math.Min(int.MaxValue, Math.Round((double)ScalingFactor * OrigMaxSeqLen))
+            : 0;
+
+    /// <summary>
     /// The scalar YaRN "attention magnitude concentration" multiplier applied to
     /// <em>both</em> the cosine and sine tables — i.e. to every rotated element at
     /// <em>every</em> position, position 0 included. gpt-oss follows llama.cpp's
     /// <c>ggml_rope_ext</c> YaRN convention (<c>ext_factor = 1</c>), which folds
-    /// <c>attn_factor * (1 + 0.1 * ln(factor))</c> into cos/sin; the other dense-YaRN
-    /// architectures (SmolLM3, Llama 3.1+) keep the plain <see cref="AttnFactor"/>
+    /// <c>attn_factor * (1 + 0.1 * ln(factor))</c> into cos/sin. The Qwen3.5/3.8 hybrids
+    /// (<see cref="Architecture.Qwen3HybridDense"/>, <see cref="Architecture.Qwen3MoeHybrid"/>) and
+    /// Qwen3.8-Flash-Next (<see cref="Architecture.Qwen4Exp"/>) use the same value: HF
+    /// <c>_compute_yarn_parameters</c> defaults <c>attention_factor</c> to
+    /// <c>0.1·ln(factor) + 1</c> and multiplies cos and sin by it (issue #1101). The other
+    /// dense-YaRN architectures (SmolLM3, Llama 3.1+) keep the plain <see cref="AttnFactor"/>
     /// convention established when they were wired.
     /// </summary>
     /// <param name="architecture">Model architecture selecting the mscale convention.</param>
@@ -53,7 +68,17 @@ public readonly record struct RoPEConfig(
     /// not merely beyond <see cref="OrigMaxSeqLen"/>.
     /// </remarks>
     public float ComputeYarnMscaleMultiplier(Architecture architecture)
-        => architecture == Architecture.GptOss
+        => UsesLogFactorYarnMscale(architecture)
             ? AttnFactor * (1.0f + 0.1f * MathF.Log(ScalingFactor))
             : AttnFactor;
+
+    /// <summary>
+    /// Whether <paramref name="architecture"/> folds <c>1 + 0.1·ln(factor)</c> into cos/sin
+    /// (llama.cpp <c>ggml_rope_ext</c> / HF default <c>attention_factor</c>).
+    /// </summary>
+    /// <param name="architecture">Model architecture.</param>
+    /// <returns><see langword="true"/> for gpt-oss and the Qwen3.5/3.8 family.</returns>
+    private static bool UsesLogFactorYarnMscale(Architecture architecture)
+        => architecture is Architecture.GptOss
+            or Architecture.Qwen3HybridDense or Architecture.Qwen3MoeHybrid or Architecture.Qwen4Exp;
 }

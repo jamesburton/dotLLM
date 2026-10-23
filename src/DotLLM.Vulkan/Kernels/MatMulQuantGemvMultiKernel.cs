@@ -46,7 +46,8 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
     /// <summary>The format this instance serves.</summary>
     public QuantGemvMultiFormat Format { get; }
 
-    private MatMulQuantGemvMultiKernel(QuantGemvMultiFormat format, VulkanDevice device, VulkanModule module, nint pool, int buffersPerSet, int blockBytes)
+    private MatMulQuantGemvMultiKernel(QuantGemvMultiFormat format, VulkanDevice device, VulkanModule module, nint pool, int buffersPerSet, int blockBytes,
+                                       uint requiredSubgroupSize)
     {
         Format = format;
         _device = device; _module = module; _descriptorPool = pool; _buffersPerSet = buffersPerSet; _blockBytes = blockBytes;
@@ -54,33 +55,63 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
         for (int i = 0; i < buffersPerSet; i++) bindings[i] = new VkDescriptorBinding((uint)i);
         for (int n = 2; n <= MaxColumns; n++)
             _pipelines[n] = module.CreateComputePipeline(
-                entryPoint: "main", bindings: bindings, pushConstantBytes: PushConstantBytes, specConstants: [(uint)n]);
+                entryPoint: "main", bindings: bindings, pushConstantBytes: PushConstantBytes, requiredSubgroupSize: requiredSubgroupSize, specConstants: [(uint)n]);
         _descriptorCache = new DescriptorSetCache(device, pool, _pipelines[2]!, buffersPerSet: buffersPerSet);
     }
 
-    private static (string Spv, int BlockBytes, int Buffers, bool NeedsSubgroup) Describe(QuantGemvMultiFormat f) => f switch
+    /// <summary>
+    /// Shader facts per format. <c>NeedsWave32</c>: the shader is ONE 32-lane workgroup whose whole reduction is a single <c>subgroupAdd</c> followed by a
+    /// <c>subgroupElect</c> store, so it is only correct when the workgroup is exactly one subgroup. A driver free to pick a narrower subgroup (Intel Arc
+    /// picks 8/16) splits the row over several subgroups that each store a partial sum: the IQ4_XS kernel returned about a quarter of the dot product
+    /// there and every 2..8-row qwen4exp forward (MTP verify) produced garbage (#1104). Such a pipeline is pinned to wave32, or not created.
+    /// </summary>
+    private static (string Spv, int BlockBytes, int Buffers, bool NeedsSubgroup, bool NeedsWave32) Describe(QuantGemvMultiFormat f) => f switch
     {
-        QuantGemvMultiFormat.Q4_K => ("matmul_q4_k_gemv_f32_multi.spv", 144, 3, true),
-        QuantGemvMultiFormat.Q5_K => ("matmul_q5_k_gemv_f32_multi.spv", 176, 3, true),
-        QuantGemvMultiFormat.Q6_K => ("matmul_q6_k_gemv_f32_multi.spv", 210, 3, true),
-        QuantGemvMultiFormat.Q6_K_R2 => ("matmul_q6_k_gemv_f32_multi_r2.spv", 210, 3, true),
-        QuantGemvMultiFormat.IQ4_XS => ("matmul_iq4_xs_f32_gemv_multi.spv", 136, 3, false),
-        QuantGemvMultiFormat.IQ3_S => ("matmul_iq3_s_f32_gemv_multi.spv", 110, 4, false),
+        QuantGemvMultiFormat.Q4_K => ("matmul_q4_k_gemv_f32_multi.spv", 144, 3, true, false),
+        QuantGemvMultiFormat.Q5_K => ("matmul_q5_k_gemv_f32_multi.spv", 176, 3, true, false),
+        QuantGemvMultiFormat.Q6_K => ("matmul_q6_k_gemv_f32_multi.spv", 210, 3, true, false),
+        QuantGemvMultiFormat.Q6_K_R2 => ("matmul_q6_k_gemv_f32_multi_r2.spv", 210, 3, true, false),
+        QuantGemvMultiFormat.IQ4_XS => ("matmul_iq4_xs_f32_gemv_multi.spv", 136, 3, true, true),
+        QuantGemvMultiFormat.IQ3_S => ("matmul_iq3_s_f32_gemv_multi.spv", 110, 4, false, false),
         _ => throw new ArgumentOutOfRangeException(nameof(f)),
     };
 
-    /// <summary>Loads the format's multi-column shader; null when it is missing or the device lacks the subgroup arithmetic the K-quant variants reduce with.</summary>
+    /// <summary>True when <paramref name="format"/>'s shader reduces with a single subgroup per 32-lane workgroup and must run pinned to wave32.</summary>
+    /// <param name="format">The block format.</param>
+    /// <returns>Whether the pipeline needs a required subgroup size of 32.</returns>
+    internal static bool RequiresWave32(QuantGemvMultiFormat format) => Describe(format).NeedsWave32;
+
+    /// <summary>
+    /// The required subgroup size to create <paramref name="format"/>'s pipelines with: 0 (driver default) for shaders that reduce across subgroups,
+    /// 32 for single-subgroup shaders when the device can pin it, or null when the shader cannot run correctly on this device (no pin available, or the
+    /// <c>DOTLLM_VULKAN_DISABLE_WAVE32</c> opt-out is set), in which case the caller falls back to the GEMM path.
+    /// </summary>
+    /// <param name="format">The block format.</param>
+    /// <param name="wave32Pin">What <see cref="Wave32SubgroupControl.RequiredSubgroupSizeFor"/> returned for the device (32 or 0).</param>
+    /// <returns>The pipeline's required subgroup size, or null to refuse the kernel.</returns>
+    internal static uint? PipelineSubgroupSize(QuantGemvMultiFormat format, uint wave32Pin)
+        => !RequiresWave32(format) ? 0u : wave32Pin == Wave32SubgroupControl.Wave32 ? wave32Pin : null;
+
+    /// <summary>
+    /// Loads the format's multi-column shader; null when it is missing, the device lacks the subgroup arithmetic the shader reduces with, or the shader
+    /// needs a wave32 pin the device cannot provide.
+    /// </summary>
+    /// <param name="device">The device.</param>
+    /// <param name="spvDir">Directory holding the compiled SPIR-V.</param>
+    /// <param name="format">The block format.</param>
+    /// <returns>The kernel, or null when it cannot run correctly here.</returns>
     public static MatMulQuantGemvMultiKernel? TryCreate(VulkanDevice device, string spvDir, QuantGemvMultiFormat format)
     {
-        var (spv, blockBytes, buffers, needsSubgroup) = Describe(format);
+        var (spv, blockBytes, buffers, needsSubgroup, _) = Describe(format);
         if (needsSubgroup && !device.HasSubgroupArithmetic) return null;
+        if (PipelineSubgroupSize(format, Wave32SubgroupControl.RequiredSubgroupSizeFor(device)) is not { } subgroupSize) return null;
         string path = Path.Combine(spvDir, spv);
         if (!File.Exists(path)) return null;
         var module = VulkanModule.LoadFromFile(device, path);
         try
         {
             nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)buffers);
-            return new MatMulQuantGemvMultiKernel(format, device, module, pool, buffers, blockBytes);
+            return new MatMulQuantGemvMultiKernel(format, device, module, pool, buffers, blockBytes, subgroupSize);
         }
         catch { module.Dispose(); throw; }
     }

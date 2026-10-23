@@ -67,11 +67,88 @@ split Qwen3-hybrid model, the KV handoff paths and the CLI memory estimate now a
 ### Vulkan hybrid KV: element format and lazy growth (issue #898)
 
 `VulkanNemotronHKvCache` (shared by the Vulkan Nemotron-H, Qwen3.5/3.6/3.8 hybrids and Qwen4-Exp) takes two opt-in constructor arguments, both OFF by default so existing models are
-untouched: `storage: VulkanKvStorage.F16` (K/V rows written by a convert kernel, 2 bytes per element; only the Qwen4-Exp QSA gather kernel reads them, so it is created only through the
-Qwen4-Exp model) and `lazy: true` (buffers start empty and `EnsureCapacity(positions)` reallocates layer by layer, 25 % / >= 1024 positions at a time, copying the live prefix).
+untouched: `storage: VulkanKvStorage.F16` (K/V rows written by a convert kernel, 2 bytes per element; read by the Qwen4-Exp QSA gather kernel and,
+since #1102, by the `_kvf16` attention twins the dense hybrid selects; see the next section) and `lazy: true` (buffers start empty and `EnsureCapacity(positions)` reallocates layer by layer, 25 % / >= 1024 positions at a time, copying the live prefix).
 `MaxLength` is the logical limit, `AllocatedLength` the physical one. After `EnsureCapacity` returns true the CALLER must drop every descriptor cache that may name the freed buffers
 (handles are recycled; a stale cached set reads zeros without any error). Qwen4-Exp does this in `ForwardCore` before recording (`EnsureContext`), for the sequence's K/V and its indexer
 state. Switches and measurements: [ATTENTION.md](ATTENTION.md), "Lazy growth and F16 K/V".
+
+#### Growable caches for a continuing session (issue #1100)
+
+The engine grows a sequence's KV with `IKvCache.TryGrowTo` when a recurrent-prefix hit needs more positions than the cache
+was made with (a growing chat session needs that on almost every turn). The Vulkan cache used to keep the interface default
+(never grows), so on Vulkan every turn after the first missed its prefix, and after #1093 a long one was refused.
+
+- **`TryGrowTo(n)`** raises `MaxLength` up to the `growthLimit` the cache was created with (the model's window; 0, the
+  default, means never). A lazy cache only raises the limit, and its buffers grow in the forward. An eager cache re-creates its
+  buffers at once, copying the live rows layer by layer, so the transient cost is one layer's K and V. Out of device memory
+  returns `false` and leaves the cache as it was.
+- **Hosts.** The Bonsai / Qwen3.5 dense hybrid (`VulkanQwen3HybridDenseTransformerModel`) and LFM2
+  (`VulkanLfm2MoeTransformerModel`) create **lazy** caches capped at the window. Before recording, each forward calls
+  `VulkanNemotronHKvCache.PrepareForForward(kv, positionsEnd, ref seenEpoch)`. It grows the buffers to cover the forward and maps
+  out-of-device-memory to `DeviceMemoryAdmissionException` (HTTP 400, not a crash). It returns true when the caller must drop
+  its descriptor caches.
+- **Descriptor epoch.** Kernels cache descriptor sets by buffer handle, and Vulkan recycles a freed handle into the next
+  allocation. Any cache of this type that frees buffers (a growth, per layer, or a dispose) bumps the process-wide
+  `BufferEpoch`. A model drops every descriptor cache when the epoch it last saw has moved. The check covers another sequence's
+  growth and a snapshot's dispose, not only this cache's. The Arc driver does not recycle a handle soon enough for a stale set
+  to change the logits. The tests therefore pin the invalidation itself (`KvBufferInvalidationsForTest`), as well as
+  bit-identical logits against a cache allocated in one step.
+- **Snapshots.** `SnapshotPrefix` copies into an exactly-sized eager cache. `RestorePrefixFrom` grows a lazy destination first.
+  A snapshot taken before a growth restores exactly after it (`VulkanQwen3HybridDenseKvGrowthTests`).
+- **Cost.** Growth, admission and snapshot copies size everything from the cache's `ElementBytes` / `BytesPerPosition`, never an
+  assumed F32. Since #1102 the storage is F16 by default: 64 KiB per token for Bonsai-2 (16 attention layers x 4 KV heads x 256 x
+  K and V x 2 B), so 8 GiB at 128k (F32, the A/B baseline: 128 KiB, 16 GiB). A growth step is 25 % of what is held (at least
+  1,024 positions), plus one layer's K and V in transit.
+
+### Vulkan dense-hybrid (Bonsai 2) KV: F16 storage read in place (issue #1102)
+
+`VulkanQwen3HybridDenseTransformerModel` (Bonsai 2, Qwen3.5 / 3.6 dense hybrids) keeps its KV in a lazy, growable
+`VulkanNemotronHKvCache` (#1100) whose element format is selectable:
+
+```bash
+dotllm serve <bonsai> --device vulkan            # F16 KV by default
+dotllm bench <bonsai> --device vulkan --kv-quant-k f32 --kv-quant-v f32   # explicit F32 A/B baseline
+```
+
+| storage | bytes / element | Bonsai 2 per token (16 attn layers × 4 KV heads × 256 × K+V) | 128k | 262,144 | 1M (YaRN, #1101) |
+|---|---|---|---|---|---|
+| f32 (A/B baseline only) | 4 | 128 KiB | 16 GiB | 32 GiB | 128 GiB |
+| **f16 (default)** | 2 | 64 KiB | 8 GiB | 16 GiB | 64 GiB |
+
+- **Read in place, no widening.** Every attention kernel the model dispatches has an F16 twin (`*_kvf16.comp`) that
+  loads its K / V elements from the packed halves (`kv_load.glsl`, `unpackHalf2x16` in the load). No kernel converts the
+  history to an F32 scratch, so the device holds exactly the per-token cost above plus the existing per-forward
+  scratch. Decode reads 64 KiB per cached token instead of 128 KiB. Details and the kernel list:
+  [ATTENTION.md](ATTENTION.md), "Narrow (F16) KV on Vulkan".
+- **Writes.** The F32 K / V rows the projections produce are converted on the device by `convert_f32_to_f16_range.comp`
+  (round-to-nearest-even in the integer domain, saturating at ±65504), from contiguous positions only. That is every
+  forward the engine issues: prefill tiles, decode, MTP verify and each `ForwardBatch` sequence.
+- **Snapshots, restore, rollback, growth** copy whole rows byte for byte, so they keep the format and round-trip exactly
+  (`ValidateSnapshotLayout` no longer requires F32).
+- **Selection.** `ConfigureKvStorage(VulkanKvStorage)` sets the format of caches created afterwards; the forward picks
+  kernels per cache. The CLI and server accept `f16` / `fp16` and `f32`. q8_0, q4_0, TurboQuant and mixed K / V are
+  refused at startup with a message, never stored as something else. **F16 is the default** (#1107: no F32 KV on hot
+  paths). F32 is the explicit A/B and parity baseline only: `--cache-type-k/-v f32` on `run` / `bench`, or `DOTLLM_VK_KV=f32`
+  (the server cannot tell an explicit `f32` from its option default).
+- **Measured on Strix** (`serve --device vulkan --no-mtp`, one session grown by ~8k-token turns with `scripts/session-growth.py`,
+  64 generated tokens per turn; prefix reuse on every turn after the first; no device loss to 128k with #1100's submit budget):
+
+  | context | decode tok/s, F32 KV | decode tok/s, F16 KV | prefill tok/s (new turn), F16 |
+  |---|---|---|---|
+  | 7.8k | 19.6 | 21.2 | 179 |
+  | 32.9k | 12.6 | 15.9 | 66 |
+  | 64.3k | 8.7 | 12.0 | 38 |
+  | 128.3k | 5.4 | **8.1** | 21 |
+
+  Process private bytes grew 134 KiB/token with F32 and 70 KiB/token with F16: the cache is 128 vs 64 KiB/token, plus the lazy
+  growth headroom. Both arms ran the GQA-grouped decode pass. In the per-layer kernel bench (ATTENTION.md) the per-query-head
+  pass is within 5 % of it for F32, so the F32 column is close to the old default.
+
+  The F16 arm ran the paired-load variant of that pass (#1113). The shipped per-element pass measures 6.13 instead of 5.37 ms
+  per layer at 128k, about 12 ms more per token (16 layers), so expect ~7.4 tok/s at 128k with the shipped kernels.
+- **Accuracy.** F16 rounds each K / V element once (relative error ≤ 2⁻¹¹). On the synthetic fixture the logits stay
+  within the tolerance the Vulkan forward is held to against the CPU reference (abs 5e-3 + rel 1e-3).
 
 ### CUDA hybrid-dense KV: staging, quantized storage, fused decode (issue #956)
 
@@ -113,6 +190,17 @@ length-only `CudaHybridKvCacheHandle`. Per full-attention slot (16 of 64 layers 
   MTP is 18 KiB/token (KV rows only). `CudaQwen3HybridDenseTransformerModel.FlashPrefillHd256KvqForTest` turns the tier off
   for A/B tests. Remaining `ResolveKvF16` callers (decode with `DOTLLM_HYBRID_KV_FUSED=0`, decode below the mma split
   minimum, the F32 fallback tiers) still allocate the scratch on demand, admitted against free VRAM.
+- **The MTP head's KV follows the trunk's type (#1095).** `CudaMtpState` used to keep the head's one attention layer in F32
+  (8 KiB/token on Bonsai-2) and grow it by copying, so the fit counted 16 KiB/token, more than the q4_0 trunk's 16 layers
+  together (18 KiB). The head now stores K/V in the trunk's type per side: Q8_0 / Q4_0 (and the mixed pairs) when the fused
+  quantized-KV decode kernel takes the head's shape, otherwise F16, never wider (#1107). Rows are written exactly like the
+  trunk's (F32 -> F16 staging -> `quant_f16_to_q{8,4}_0`), byte for byte. A draft step reads the history in place with
+  `attention_flash_mma_decode_gqa_split_kvq_*` (quantized) or the F16 tensor-core decode kernel; below their 256-key minimum
+  the short history goes through the dequant scratch and the F32 kernel, which that minimum bounds. The head's attention reads
+  are all single-row draft steps (the absorb writes K/V only), so the prefill and per-row verify tiers never see its cache.
+  K, V and the position iota grow **in place** with `CudaGrowableDeviceBuffer` (address range reserved for the ceiling, pages
+  mapped on growth); without the VMM API the copying growth remains. Per token on Bonsai-2: q4_0 **1,156 B** (2 x 576 + 4 iota),
+  q8_0 2,180 B, f16 4,100 B, against 16,392 B counted before. `DOTLLM_CUDA_MTP_KV=f32` restores F32 storage for A/B runs only.
 - **KV Q4_0 is not the GGUF Q4_0 layout.** KV blocks pack ADJACENT PAIRS (low nibble = even element), matching CPU
   `KvQuantize` and `quant_kv.cu`; the weight dequant (`dequant_q4_0_f16`) unpacks low/high HALVES. Always use
   `CudaKernels.LaunchKvDequantToF16` for KV data. (The eager `CudaQuantizedKvCache` path used the weight dequant until

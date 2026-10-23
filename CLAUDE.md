@@ -165,6 +165,19 @@ the issue/PR. Reference/baseline comparisons (tests, oracles, A/B measurements) 
 - Known expansions being removed: the full-history KV dequant scratch (fixed for Bonsai-2 prefill in #1094), the LM head
   over more than 8 rows (#1099), and the per-projection F16 weight dequant on prefill GEMMs (#495, audit in #1107).
 
+### 3. Disk ↔ device transfers go direct
+
+- Moving data between disk and a GPU must go **direct**, never via a system-RAM copy. That covers model weight loading,
+  prefix-snapshot disk spill and restore, and any other large disk ↔ device transfer.
+- The direct routes:
+  - **Discrete GPUs:**
+    - Windows: DirectStorage into a D3D12 resource imported into CUDA or Vulkan via external memory.
+    - Linux: cuFile/GPUDirect Storage.
+  - **UMA devices (Strix, Arc):** import the mmap'd or host pages zero-copy.
+- A host bounce buffer (a pinned staging ring, or read-then-copy) is a **double allocation and an extra copy**. It
+  needs measured justification and the user's sign-off, recorded in the issue or PR. Where a direct route doesn't exist
+  yet for a platform or device, treat it as a gap to fill, and state the bounce path's cost (bytes, time) in the PR.
+
 ## Model & Fixture Storage Rules
 
 **Model weights NEVER live in the repository, and are never committed.** They belong in the
