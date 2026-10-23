@@ -233,17 +233,9 @@ internal sealed class VulkanGptOssKernels : IDisposable
         VulkanDevice.Buffer positions, VulkanDevice.Buffer invFreq,
         int seqLen, int numHeads, int numKvHeads, int headDim, int ropeDim, bool neox, float mscale)
     {
-        if (ropeDim <= 0 || (ropeDim & 1) != 0 || ropeDim > headDim)
-            throw new ArgumentException($"ropeDim {ropeDim} invalid for headDim {headDim}.", nameof(ropeDim));
-        ReadOnlySpan<nint> bufs = [q.Handle, k.Handle, positions.Handle, invFreq.Handle];
-        ReadOnlySpan<uint> pc =
-        [
-            (uint)seqLen, (uint)numHeads, (uint)numKvHeads, (uint)headDim, (uint)ropeDim,
-            neox ? 1u : 0u, BitConverter.SingleToUInt32Bits(mscale), (uint)(ropeDim / 2),
-        ];
-        long maxPairs = (long)seqLen * Math.Max(numHeads, numKvHeads) * (ropeDim / 2);
+        VulkanDenseYarnRope.Record(_ropeYarn, cmdBuf, q, k, positions, invFreq,
+            seqLen, numHeads, numKvHeads, headDim, ropeDim, neox, mscale);
         RopeYarnDispatches++;
-        _ropeYarn.Record(cmdBuf, bufs, pc, (uint)((maxPairs + Wg256 - 1) / Wg256));
     }
 
     /// <summary>Counted wrapper over the MXFP4 indexed matmul.</summary>

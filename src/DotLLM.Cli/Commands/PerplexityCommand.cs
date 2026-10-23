@@ -111,6 +111,22 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         [DefaultValue(0)]
         public int Threads { get; set; }
 
+        [CommandOption("--rope-scaling")]
+        [Description("RoPE scaling override: 'none', 'linear', 'yarn', 'ntk', 'dynamic' (as on run/serve; issue #1101 measures YaRN's short-context cost).")]
+        public string? RopeScaling { get; set; }
+
+        [CommandOption("--rope-scale")]
+        [Description("RoPE scaling factor override (linear/YaRN/NTK).")]
+        public float? RopeScale { get; set; }
+
+        [CommandOption("--yarn-orig-ctx")]
+        [Description("YaRN original context length override.")]
+        public int? YarnOrigCtx { get; set; }
+
+        [CommandOption("--yarn-attn-factor")]
+        [Description("YaRN attention factor override.")]
+        public float? YarnAttnFactor { get; set; }
+
         [CommandOption("--kv-cache")]
         [Description("KV-cache storage format for perplexity scoring: 'none' (cacheless, exact K/V baseline — the default), 'f32' (FP32 cache), 'q8_0', 'q4_0'. When set, the forward pass reads K/V from the cache, so perplexity reflects the quantization quality of KV storage.")]
         [DefaultValue("none")]
@@ -212,6 +228,9 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         else
         {
         config = GgufModelConfigExtractor.Extract(gguf!.Metadata);
+        config = GgufModelConfigExtractor.ApplyRoPEOverride(config, DotLLM.Server.ServerOptions.BuildRopeOverride(
+            settings.RopeScaling, freqBase: null, settings.RopeScale, settings.YarnOrigCtx, settings.YarnAttnFactor,
+            betaFast: null, betaSlow: null));
 
         // Issue #515/#516: llama.cpp prepends BOS to the whole stream when the vocab asks for it,
         // and dotLLM did not -- so every chunk boundary sat one token off llama.cpp's and the two

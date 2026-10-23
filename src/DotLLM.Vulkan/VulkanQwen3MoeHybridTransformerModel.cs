@@ -200,9 +200,14 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                Config.NumKvHeads, Config.HeadDim, maxSeqLen);
 
     /// <summary>Creates a sparse KV cache with an explicit element format and (optionally) lazy growth (Qwen4-Exp, issue #437).</summary>
-    internal VulkanNemotronHKvCache CreateKvCache(int maxSeqLen, VulkanKvStorage storage, bool lazy)
+    /// <param name="maxSeqLen">Initial logical capacity in positions.</param>
+    /// <param name="storage">Element format of the K/V rows.</param>
+    /// <param name="lazy">Allocate on demand (the forward must call <see cref="VulkanNemotronHKvCache.PrepareForForward"/>).</param>
+    /// <param name="growthLimit">Largest capacity <see cref="IKvCache.TryGrowTo"/> may reach (issue #1100); 0 = never grows.</param>
+    /// <returns>The new cache.</returns>
+    internal VulkanNemotronHKvCache CreateKvCache(int maxSeqLen, VulkanKvStorage storage, bool lazy, int growthLimit = 0)
         => new(_device, _kvSlotForLayer, _attentionLayerCount,
-               Config.NumKvHeads, Config.HeadDim, maxSeqLen, storage, lazy);
+               Config.NumKvHeads, Config.HeadDim, maxSeqLen, storage, lazy, growthLimit);
 
     /// <summary>
     /// Creates a fresh per-sequence <see cref="VulkanGdnStateCache"/> sized for this

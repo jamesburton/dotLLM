@@ -132,9 +132,11 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
         VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
         VulkanModule? wideModule, ComputePipeline? widePipeline, nint widePool,
         FlashAttentionWideVariant wideVariant,
-        VulkanModule? hd512Module = null, ComputePipeline? hd512Pipeline = null, nint hd512Pool = 0)
+        VulkanModule? hd512Module = null, ComputePipeline? hd512Pipeline = null, nint hd512Pool = 0,
+        VulkanKvStorage kvStorage = VulkanKvStorage.F32)
     {
         _device = device;
+        KvStorage = kvStorage;
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
@@ -157,6 +159,9 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
         if (hd512Pipeline is not null)
             _hd512DescriptorCache = new DescriptorSetCache(device, hd512Pool, hd512Pipeline, buffersPerSet: 4);
     }
+
+    /// <summary>Element format of the K / V buffers this instance reads (issue #1102); fixed at creation.</summary>
+    public VulkanKvStorage KvStorage { get; }
 
     /// <summary>The wide-head variant this instance actually loaded, or <see cref="FlashAttentionWideVariant.None"/>.</summary>
     public FlashAttentionWideVariant WideVariant { get; }
@@ -233,12 +238,17 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
     /// <param name="device">Device to create the pipelines on.</param>
     /// <param name="spvDir">Directory holding the compiled SPIR-V blobs.</param>
     /// <param name="wideVariant">Wide-head variant to attempt to load.</param>
-    /// <param name="includeHd512">Also load the optional 512-dim variant (Gemma-4 global layers, #914).</param>
+    /// <param name="includeHd512">Also load the optional 512-dim variant (Gemma-4 global layers, #914; F32 KV only).</param>
+    /// <param name="kvStorage">
+    /// Element format of the K / V buffers (issue #1102). <see cref="VulkanKvStorage.F16"/> loads the <c>_kvf16</c> twins of the base and
+    /// wide shaders, which read the packed halves in place.
+    /// </param>
     /// <returns>The created kernel.</returns>
     public static VulkanFlashAttentionF32Kernel Create(
-        VulkanDevice device, string spvDir, FlashAttentionWideVariant wideVariant, bool includeHd512 = false)
+        VulkanDevice device, string spvDir, FlashAttentionWideVariant wideVariant, bool includeHd512 = false,
+        VulkanKvStorage kvStorage = VulkanKvStorage.F32)
     {
-        string path = Path.Combine(spvDir, "attention_flash_f32.spv");
+        string path = Path.Combine(spvDir, kvStorage.ShaderName("attention_flash_f32") + ".spv");
         if (!File.Exists(path))
             throw new FileNotFoundException(
                 $"Vulkan SPIR-V not found: {path}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");
@@ -270,7 +280,7 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
         nint widePool = 0;
         if (wideVariant != FlashAttentionWideVariant.None)
         {
-            string widePath = Path.Combine(spvDir, WideSpvName(wideVariant));
+            string widePath = Path.Combine(spvDir, kvStorage.ShaderName(Path.GetFileNameWithoutExtension(WideSpvName(wideVariant))) + ".spv");
             if (File.Exists(widePath))
             {
                 // The LOAD is inside the try as well as the pipeline build: a corrupt or
@@ -309,7 +319,7 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
         VulkanModule? hd512Module = null;
         ComputePipeline? hd512Pipeline = null;
         nint hd512Pool = 0;
-        if (includeHd512 && widePipeline is not null
+        if (includeHd512 && kvStorage == VulkanKvStorage.F32 && widePipeline is not null
             && File.Exists(Path.Combine(spvDir, "attention_flash_f32_hd512_br4.spv"))
             && Environment.GetEnvironmentVariable("DOTLLM_VK_FLASH_HD512") != "0")
         {
@@ -333,7 +343,7 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
 
         return new VulkanFlashAttentionF32Kernel(
             device, module, pipeline, pool, wideModule, widePipeline, widePool, wideVariant,
-            hd512Module, hd512Pipeline, hd512Pool);
+            hd512Module, hd512Pipeline, hd512Pool, kvStorage);
     }
 
     /// <summary>
@@ -346,20 +356,22 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
         => TryCreate(device, spvDir, WideVariantFromEnvironment());
 
     /// <summary>
-    /// <see cref="Create(VulkanDevice, string, FlashAttentionWideVariant, bool)"/> companion that
+    /// <see cref="Create(VulkanDevice, string, FlashAttentionWideVariant, bool, VulkanKvStorage)"/> companion that
     /// returns <c>null</c> instead of throwing when the base SPV is missing.
     /// </summary>
     /// <param name="device">Device to create the pipelines on.</param>
     /// <param name="spvDir">Directory holding the compiled SPIR-V blobs.</param>
     /// <param name="wideVariant">Wide-head variant to attempt to load.</param>
     /// <param name="includeHd512">Also load the optional 512-dim variant (Gemma-4 global layers, #914).</param>
+    /// <param name="kvStorage">Element format of the K / V buffers (issue #1102).</param>
     /// <returns>The created kernel, or <c>null</c>.</returns>
     public static VulkanFlashAttentionF32Kernel? TryCreate(
-        VulkanDevice device, string spvDir, FlashAttentionWideVariant wideVariant, bool includeHd512 = false)
+        VulkanDevice device, string spvDir, FlashAttentionWideVariant wideVariant, bool includeHd512 = false,
+        VulkanKvStorage kvStorage = VulkanKvStorage.F32)
     {
         try
         {
-            return Create(device, spvDir, wideVariant, includeHd512);
+            return Create(device, spvDir, wideVariant, includeHd512, kvStorage);
         }
         catch (FileNotFoundException)
         {
@@ -436,7 +448,7 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
         if (prefixLen < 0) throw new ArgumentOutOfRangeException(nameof(prefixLen));
 
         long qBytes   = (long)seqQ  * numHeads   * headDim * sizeof(float);
-        long kvBytes  = (long)seqKv * numKvHeads * headDim * sizeof(float);
+        long kvBytes  = (long)seqKv * numKvHeads * headDim * KvStorage.ElementBytes();
         long outBytes = qBytes;
         if (q.Size      < qBytes)   throw new ArgumentException("Q buffer too small.",      nameof(q));
         if (k.Size      < kvBytes)  throw new ArgumentException("K buffer too small.",      nameof(k));

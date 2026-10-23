@@ -79,6 +79,14 @@ public class VulkanSplitKvAttentionKernelTests
     }
 
     [SkippableFact]
+    public void Decode_Gqa_SplitWiderThanGroupedTile()
+    {
+        // Issue #1102: the GQA-grouped pass splits per KV head (8 here -> S=32), so seqKv=9000 gives 282 positions per split,
+        // three of its 128-row tiles: the cross-tile online-softmax rescale runs (a pass without it fails here).
+        RunOne(seqKv: 9000, numHeads: 32, numKvHeads: 8, headDim: 64, positionOffset: 8999);
+    }
+
+    [SkippableFact]
     public void Decode_Causal_MaskedTail_AcrossSplits()
     {
         // Causal with the query NOT at the last position: posQ=300, seqKv=600.
@@ -161,15 +169,22 @@ public class VulkanSplitKvAttentionKernelTests
         device.Upload(kh.AsSpan(), bufK);
         device.Upload(vh.AsSpan(), bufV);
 
-        kernel.Launch(bufQ, bufK, bufV, bufOut,
-            seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset,
-            slidingWindow: slidingWindow, useAlibi: useAlibi,
-            softCap: softCap, maskMode: maskMode, prefixLen: prefixLen);
+        // Issue #1102: both split passes, the per-query-head one and (where the shape allows) the GQA-grouped one, against the
+        // same CPU reference at the same tolerance.
+        foreach (bool gqa in new[] { false, true })
+        {
+            kernel.PreferGqa = gqa;
+            if (gqa && !kernel.UsesGqa(numHeads, numKvHeads, headDim)) continue;
+            kernel.Launch(bufQ, bufK, bufV, bufOut,
+                seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset,
+                slidingWindow: slidingWindow, useAlibi: useAlibi,
+                softCap: softCap, maskMode: maskMode, prefixLen: prefixLen);
 
-        float[] actual = new float[expected.Length];
-        device.Download(bufOut, actual);
+            float[] actual = new float[expected.Length];
+            device.Download(bufOut, actual);
 
-        AssertClose(expected, actual, seqQ, seqKv, numHeads, numKvHeads, headDim);
+            AssertClose(expected, actual, seqQ, seqKv, numHeads, numKvHeads, headDim);
+        }
     }
 
     private static float[] RandomFloats(Random rng, int count)
