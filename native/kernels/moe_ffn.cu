@@ -223,6 +223,62 @@ extern "C" __global__ void __launch_bounds__(128) moe_softmax_topk_f32(
     }
 }
 
+// ── moe_sigmoid_topk_f32 ─────────────────────────────────────────────────
+//
+// Sigmoid routing (Flint, #1172; llama.cpp build_moe_ffn LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID): probs =
+// sigmoid(logits), top-k on probs (no selection bias here), gating weights = the chosen probs, optionally
+// renormalised with the sum clamped at 6.103515625e-5 exactly as MoeSwiGluMlp.Route does. Same launch shape and
+// index-stable tie rule as moe_softmax_topk_f32 (one block per token, 128 threads, dynamic shared num_experts floats).
+extern "C" __global__ void __launch_bounds__(128) moe_sigmoid_topk_f32(
+    const float* __restrict__ logits,      // [seq_len, num_experts]
+    int*   __restrict__ topk_idx,          // [seq_len, top_k]
+    float* __restrict__ topk_weight,       // [seq_len, top_k]
+    const int seq_len, const int num_experts, const int top_k, const int normalize)
+{
+    int t = blockIdx.x;
+    if (t >= seq_len) return;
+
+    extern __shared__ float s_sig[];
+    const float* row = logits + (size_t)t * num_experts;
+    for (int i = threadIdx.x; i < num_experts; i += blockDim.x)
+        s_sig[i] = 1.0f / (1.0f + expf(-row[i]));
+    __syncthreads();
+
+    if (threadIdx.x == 0)
+    {
+        int   sel_idx[64];
+        float sel_prob[64];
+        float sum = 0.0f;
+        for (int slot = 0; slot < top_k; slot++)
+        {
+            int   best_idx = -1;
+            float best_val = -INFINITY;
+            for (int i = 0; i < num_experts; i++)
+            {
+                bool claimed = false;
+                for (int p = 0; p < slot; p++) { if (sel_idx[p] == i) { claimed = true; break; } }
+                if (claimed) continue;
+                float v = s_sig[i];
+                if (v > best_val) { best_val = v; best_idx = i; }
+            }
+            sel_idx[slot] = best_idx;
+            sel_prob[slot] = best_val;
+            sum += best_val;
+        }
+        float inv = 1.0f;
+        if (normalize)
+        {
+            sum = fmaxf(sum, 6.103515625e-5f);
+            inv = 1.0f / sum;
+        }
+        for (int slot = 0; slot < top_k; slot++)
+        {
+            topk_idx[(size_t)t * top_k + slot] = sel_idx[slot];
+            topk_weight[(size_t)t * top_k + slot] = sel_prob[slot] * inv;
+        }
+    }
+}
+
 // ── moe_renorm_topk_f32 ──────────────────────────────────────────────────
 //
 // In-place per-token renormalisation of the top-k weights so they sum to 1.0

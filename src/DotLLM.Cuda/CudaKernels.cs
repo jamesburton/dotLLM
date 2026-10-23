@@ -438,6 +438,16 @@ public sealed unsafe partial class CudaKernels : IDisposable
     // projection. Optional — PTX may be missing on stale builds; HasMoeGroupedGemv
     // reports false and CudaMoeFfn falls back to the per-expert path.
     private readonly CudaModule? _moeGroupedGemvModule;
+
+    // Q4_1 in-place kernels (q4_1_gemv.cu, #1172): dense GEMV / multi-token GEMM (F16 and F32 activations) and the MoE
+    // grouped GEMV. Optional module; every entry is 0 on a stale PTX tree and the callers keep their old paths.
+    private readonly CudaModule? _q4_1Module;
+    private readonly nint _quantizedGemvQ4_1Func;
+    private readonly nint _quantizedGemmQ4_1F16Func;
+    private readonly nint _quantizedGemvQ4_1F32Func;
+    private readonly nint _quantizedGemmQ4_1F32Func;
+    private readonly nint _moeGroupedGemvQ4_1Func;
+    private readonly nint _moeSigmoidTopkF32Func;
     private readonly nint _moeGroupedGemvQ2_KFunc;
     private readonly nint _moeGroupedGemvQ4_KFunc;
     private readonly nint _moeGroupedGemvQ5_KFunc;
@@ -1194,6 +1204,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
         {
             _moeFfnModule = CudaModule.LoadFromFile(moeFfnPath);
             _moeSoftmaxTopkF32Func = _moeFfnModule.TryGetFunction("moe_softmax_topk_f32");
+            _moeSigmoidTopkF32Func = _moeFfnModule.TryGetFunction("moe_sigmoid_topk_f32");
             _moeRenormTopkF32Func = _moeFfnModule.TryGetFunction("moe_renorm_topk_f32");
             _moeZeroF32Func = _moeFfnModule.TryGetFunction("moe_zero_f32");
             _moeAxpyScaledRowF32Func = _moeFfnModule.TryGetFunction("moe_axpy_scaled_row_f32");
@@ -1221,6 +1232,17 @@ public sealed unsafe partial class CudaKernels : IDisposable
             _moeGroupedGemvQ8_0Func = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_q8_0_f16");
             _moeGroupedGemvIQ4_NLFunc = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_iq4_nl_f16");
             _moeGroupedGemvIQ4_XSFunc = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_iq4_xs_f16");
+        }
+
+        string q4_1Path = Path.Combine(ptxDir, "q4_1_gemv.ptx");
+        if (File.Exists(q4_1Path))
+        {
+            _q4_1Module = CudaModule.LoadFromFile(q4_1Path);
+            _quantizedGemvQ4_1Func = _q4_1Module.TryGetFunction("quantized_gemv_q4_1");
+            _quantizedGemmQ4_1F16Func = _q4_1Module.TryGetFunction("quantized_gemm_q4_1_f16");
+            _quantizedGemvQ4_1F32Func = _q4_1Module.TryGetFunction("quantized_gemv_q4_1_f32");
+            _quantizedGemmQ4_1F32Func = _q4_1Module.TryGetFunction("quantized_gemm_q4_1_f32");
+            _moeGroupedGemvQ4_1Func = _q4_1Module.TryGetFunction("moe_grouped_gemv_q4_1_f16");
         }
 
         // Qwen3MoeHybrid recurrence-path kernels (optional — present only when
@@ -1916,8 +1938,17 @@ public sealed unsafe partial class CudaKernels : IDisposable
         QuantizationType.Q8_0 => HasMoeGroupedGemvQ8_0,
         QuantizationType.IQ4_NL => HasMoeGroupedGemvIQ4_NL,
         QuantizationType.IQ4_XS => HasMoeGroupedGemvIQ4_XS,
+        QuantizationType.Q4_1 => !DisableQuantizedGemv && _moeGroupedGemvQ4_1Func != 0,
         _ => false,
     };
+
+    /// <summary>
+    /// K alignment <see cref="LaunchMoeGroupedGemv"/> requires for <paramref name="qt"/>: 32 for Q4_1 (whose kernel
+    /// walks 32-element blocks), 256 for every other grouped type (the shared K-quant gate).
+    /// </summary>
+    /// <param name="qt">Expert weight quantization type.</param>
+    /// <returns>The required divisor of K.</returns>
+    public static int MoeGroupedGemvKAlignment(QuantizationType qt) => qt == QuantizationType.Q4_1 ? 32 : 256;
 
     /// <summary>
     /// Opt a kernel into >48 KB dynamic shared memory (up to the device's optin cap).
@@ -5378,6 +5409,11 @@ public sealed unsafe partial class CudaKernels : IDisposable
     public void LaunchQuantizedGemv(nint quantWeight, QuantizationType qt,
                                       nint x, nint y, int n, int k, nint stream)
     {
+        if (qt == QuantizationType.Q4_1)
+        {
+            LaunchQ4_1(_quantizedGemvQ4_1Func, "quantized_gemv_q4_1", quantWeight, x, y, n, k, null, 1, stream);
+            return;
+        }
         nint wArg = quantWeight, xArg = x, yArg = y;
         int nArg = n, kArg = k;
 
@@ -5411,7 +5447,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
     public static bool HasQuantizedGemv(QuantizationType qt) =>
         qt is QuantizationType.Q8_0 or QuantizationType.Q4_K or QuantizationType.Q5_0
             or QuantizationType.Q5_K or QuantizationType.Q6_K
-            or QuantizationType.Q2_K
+            or QuantizationType.Q2_K or QuantizationType.Q4_1
             or QuantizationType.IQ4_NL or QuantizationType.IQ4_XS
             or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS or QuantizationType.IQ2_S;
 
@@ -5433,8 +5469,78 @@ public sealed unsafe partial class CudaKernels : IDisposable
         QuantizationType.IQ2_XXS => !DisableQuantizedGemv && _quantizedGemvIQ2_XXSFunc != 0,
         QuantizationType.IQ2_XS => !DisableQuantizedGemv && _quantizedGemvIQ2_XSFunc != 0,
         QuantizationType.IQ2_S => !DisableQuantizedGemv && _quantizedGemvIQ2_SFunc != 0,
+        QuantizationType.Q4_1 => !DisableQuantizedGemv && _quantizedGemvQ4_1Func != 0,
         _ => false,
     };
+
+    /// <summary>
+    /// True when the in-place Q4_1 multi-token GEMMs are loaded (<see cref="LaunchQuantizedGemmQ4_1F16"/>,
+    /// <see cref="LaunchQuantizedGemmQ4_1F32"/>): prefill and MoE expert batches read the Q4_1 blocks directly instead of
+    /// dequantizing the weight into scratch (#1172, CLAUDE.md rule 2).
+    /// </summary>
+    public bool HasQ4_1Gemm => !DisableQuantizedGemv && _quantizedGemmQ4_1F16Func != 0 && _quantizedGemmQ4_1F32Func != 0
+        && _quantizedGemvQ4_1F32Func != 0 && _quantizedGemvQ4_1Func != 0;
+
+    /// <summary>
+    /// Q4_1 multi-token GEMM with FP16 activations: <c>Y[m, n] = X[m, k] * W[n, k]^T</c>, reading the Q4_1 blocks in
+    /// place (8 tokens share each weight load). <paramref name="k"/> must be a multiple of 32.
+    /// </summary>
+    /// <param name="quantWeight">Device Q4_1 weight <c>[n, k]</c>.</param>
+    /// <param name="x">Device FP16 input <c>[m, k]</c>.</param>
+    /// <param name="y">Device FP16 output <c>[m, n]</c>.</param>
+    /// <param name="n">Output rows.</param>
+    /// <param name="k">Input width.</param>
+    /// <param name="m">Activation rows (tokens).</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchQuantizedGemmQ4_1F16(nint quantWeight, nint x, nint y, int n, int k, int m, nint stream)
+    {
+        if (m == 1)
+            LaunchQ4_1(_quantizedGemvQ4_1Func, "quantized_gemv_q4_1", quantWeight, x, y, n, k, null, 1, stream);
+        else
+            LaunchQ4_1(_quantizedGemmQ4_1F16Func, "quantized_gemm_q4_1_f16", quantWeight, x, y, n, k, m,
+                (uint)((m + Q4_1TokTile - 1) / Q4_1TokTile), stream);
+    }
+
+    /// <summary>
+    /// Q4_1 GEMV / multi-token GEMM with FP32 activations (the MoE expert path): <c>Y[m, n] = X[m, k] * W[n, k]^T</c>,
+    /// reading the Q4_1 blocks in place. F32 inputs also mean a large routed SwiGLU output never passes through F16.
+    /// </summary>
+    /// <param name="quantWeight">Device Q4_1 weight <c>[n, k]</c>.</param>
+    /// <param name="x">Device FP32 input <c>[m, k]</c>.</param>
+    /// <param name="y">Device FP32 output <c>[m, n]</c>.</param>
+    /// <param name="n">Output rows.</param>
+    /// <param name="k">Input width, a multiple of 32.</param>
+    /// <param name="m">Activation rows (tokens).</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchQuantizedGemmQ4_1F32(nint quantWeight, nint x, nint y, int n, int k, int m, nint stream)
+    {
+        if (m == 1)
+            LaunchQ4_1(_quantizedGemvQ4_1F32Func, "quantized_gemv_q4_1_f32", quantWeight, x, y, n, k, null, 1, stream);
+        else
+            LaunchQ4_1(_quantizedGemmQ4_1F32Func, "quantized_gemm_q4_1_f32", quantWeight, x, y, n, k, m,
+                (uint)((m + Q4_1TokTile - 1) / Q4_1TokTile), stream);
+    }
+
+    // q4_1_gemv.cu: 8 rows (warps) per 256-thread block, 8 tokens per GEMM tile.
+    private const int Q4_1RowsPerBlock = 8;
+    private const int Q4_1TokTile = 8;
+
+    // Shared launcher for the q4_1_gemv.cu entries: (a0, a1, a2, rows, k[, m]) args, grid (ceil(rows / 8), gridY).
+    // The GEMV entries take five arguments; the trailing m is ignored by them.
+    private void LaunchQ4_1(nint func, string name, nint a0, nint a1, nint a2, int rows, int k, int? m, uint gridY,
+        nint stream)
+    {
+        if (func == 0)
+            throw new NotSupportedException($"{name} not available. Compile native/kernels/q4_1_gemv.cu to PTX.");
+        if ((k & 31) != 0)
+            throw new ArgumentException($"Q4_1 kernels need k % 32 == 0 (got {k}).", nameof(k));
+        nint p0 = a0, p1 = a1, p2 = a2;
+        int rowsArg = rows, kArg = k, mArg = m ?? 0;
+        void** args = stackalloc void*[] { &p0, &p1, &p2, &rowsArg, &kArg, &mArg };
+        CudaDriverApi.cuLaunchKernel(func,
+                (uint)((rows + Q4_1RowsPerBlock - 1) / Q4_1RowsPerBlock), gridY, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
 
     /// <summary>
     /// True when any loaded decode-time quantized GEMV implementation can execute
@@ -5495,8 +5601,15 @@ public sealed unsafe partial class CudaKernels : IDisposable
                                        int M, int K, int kActive, nint stream)
     {
         if (kActive <= 0 || M <= 0 || K <= 0) return;
-        if ((K & 255) != 0)
-            throw new ArgumentException($"K must be a multiple of 256 (got {K}).", nameof(K));
+        int kAlign = MoeGroupedGemvKAlignment(qt);
+        if (K % kAlign != 0)
+            throw new ArgumentException($"K must be a multiple of {kAlign} for {qt} (got {K}).", nameof(K));
+        if (qt == QuantizationType.Q4_1)
+        {
+            LaunchQ4_1(_moeGroupedGemvQ4_1Func, "moe_grouped_gemv_q4_1_f16",
+                x, weightPtrsDevice, outputPtrsDevice, M, K, kActive, (uint)kActive, stream);
+            return;
+        }
 
         nint func = qt switch
         {
@@ -7246,6 +7359,38 @@ public sealed unsafe partial class CudaKernels : IDisposable
                 sharedBytes, stream, (nint)args, 0).ThrowOnError();
     }
 
+    /// <summary>True when the sigmoid top-k router kernel is loaded (moe_ffn.cu, #1172).</summary>
+    public bool HasMoeSigmoidTopk => _moeSigmoidTopkF32Func != 0;
+
+    /// <summary>
+    /// Per-token sigmoid + top-k selection for MoE routing (Flint; llama.cpp SIGMOID gating, no selection bias):
+    /// <paramref name="topkWeight"/> holds the chosen sigmoid probabilities, renormalised (sum clamped at 6.1035e-5,
+    /// as the CPU <c>MoeSwiGluMlp.Route</c>) when <paramref name="normalize"/> is set.
+    /// </summary>
+    /// <param name="logits">Router logits <c>[seqLen, numExperts]</c> (F32).</param>
+    /// <param name="topkIdx">Output expert ids <c>[seqLen, topK]</c> (int32).</param>
+    /// <param name="topkWeight">Output gating weights <c>[seqLen, topK]</c> (F32).</param>
+    /// <param name="seqLen">Tokens.</param>
+    /// <param name="numExperts">Routed experts.</param>
+    /// <param name="topK">Experts per token (at most 64).</param>
+    /// <param name="normalize">Renormalise the chosen weights to sum to 1.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchMoeSigmoidTopk(nint logits, nint topkIdx, nint topkWeight,
+        int seqLen, int numExperts, int topK, bool normalize, nint stream)
+    {
+        if (_moeSigmoidTopkF32Func == 0)
+            throw new InvalidOperationException(
+                "moe_sigmoid_topk_f32 not available. Recompile native/kernels/moe_ffn.cu to PTX.");
+        if (topK > 64)
+            throw new ArgumentOutOfRangeException(nameof(topK), "topK > 64 is not supported by the GPU MoE kernel.");
+        nint logitsArg = logits, idxArg = topkIdx, wArg = topkWeight;
+        int slArg = seqLen, neArg = numExperts, kArg = topK, normArg = normalize ? 1 : 0;
+        void** args = stackalloc void*[] { &logitsArg, &idxArg, &wArg, &slArg, &neArg, &kArg, &normArg };
+        CudaDriverApi.cuLaunchKernel(_moeSigmoidTopkF32Func,
+                (uint)seqLen, 1, 1, 128, 1, 1,
+                (uint)(numExperts * sizeof(float)), stream, (nint)args, 0).ThrowOnError();
+    }
+
     /// <summary>
     /// Per-token in-place renormalisation of top-k weights to sum to 1.0
     /// (Mixtral / Qwen3-MoE convention; skip for Qwen1.5-MoE).
@@ -7703,6 +7848,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
         _mlaHelpersModule?.Dispose();
         _moeFfnModule?.Dispose();
         _moeGroupedGemvModule?.Dispose();
+        _q4_1Module?.Dispose();
         _attentionMlaLatentModule?.Dispose();
         // GDN/conv1d modules: _l2NormHeadsF32Module aliases _gdnScanF32Module
         // (same .ptx file), so dispose only the scan module — disposing both

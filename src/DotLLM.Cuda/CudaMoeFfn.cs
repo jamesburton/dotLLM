@@ -153,14 +153,21 @@ public static unsafe class CudaMoeFfn
                 kernels.LaunchMoeGateBiasAddF32(scratch.Logits, effectiveRouterBias, seqLen, E, stream);
             }
 
-            // ── Step 3: per-token softmax + top-k selection → device buffers ──
-            kernels.LaunchMoeSoftmaxTopk(
-                scratch.Logits, scratch.TopkIdx, scratch.TopkWeight,
-                seqLen, E, K, stream);
-
-            // ── Step 4: optional renorm of top-k weights ──
-            if (weights.NormTopKProb)
-                kernels.LaunchMoeRenormTopk(scratch.TopkWeight, seqLen, K, stream);
+            // ── Steps 3-4: per-token sigmoid (Flint, renorm folded in) or softmax + top-k, then optional renorm ──
+            if (weights.SigmoidGating)
+            {
+                kernels.LaunchMoeSigmoidTopk(
+                    scratch.Logits, scratch.TopkIdx, scratch.TopkWeight,
+                    seqLen, E, K, weights.NormTopKProb, stream);
+            }
+            else
+            {
+                kernels.LaunchMoeSoftmaxTopk(
+                    scratch.Logits, scratch.TopkIdx, scratch.TopkWeight,
+                    seqLen, E, K, stream);
+                if (weights.NormTopKProb)
+                    kernels.LaunchMoeRenormTopk(scratch.TopkWeight, seqLen, K, stream);
+            }
 
         }
 
@@ -252,7 +259,7 @@ public static unsafe class CudaMoeFfn
         // just slices into the already-populated buffers.
         bool useGrouped = weights.Precision == MoePrecision.Quantized
             && seqLen == 1
-            && (hidden % 256) == 0
+            && (hidden % CudaKernels.MoeGroupedGemvKAlignment(weights.GateProjQuantType)) == 0
             && kernels.HasMoeGroupedGemv(weights.GateProjQuantType)
             && kernels.HasMoeGroupedGemv(weights.UpProjQuantType)
             && weights.GateProjQuantType == weights.UpProjQuantType
@@ -805,6 +812,14 @@ public static unsafe class CudaMoeFfn
     {
         if (precision == MoePrecision.Quantized && weightQt == QuantizationType.Q4_0 && packedQ4Projection is not null)
         { packedQ4Projection(weightQuant, inputF32, outputF32, M, K, batch, stream); return; }
+        if (precision == MoePrecision.Quantized && weightQt == QuantizationType.Q4_1 && kernels.HasQ4_1Gemm
+            && (K & 31) == 0)
+        {
+            // Q4_1 (Flint, #1172): decode GEMV and multi-token GEMM both read the blocks in place on F32 activations, so
+            // there is no dequant scratch (rule 2) and no F16 round trip of a large routed SwiGLU output.
+            kernels.LaunchQuantizedGemmQ4_1F32(weightQuant, inputF32, outputF32, M, K, batch, stream);
+            return;
+        }
         if (precision == MoePrecision.Quantized)
         {
             // Fast path: direct quantized GEMV when batch=1, K satisfies the
