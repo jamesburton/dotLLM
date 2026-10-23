@@ -324,6 +324,12 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                      "Ignored for models whose GGUF embeds the head.")]
         public string? MtpHead { get; set; }
 
+        /// <summary>DFlash / DFlash2 block-diffusion drafter GGUF (issue #1175).</summary>
+        [CommandOption("--dflash")]
+        [Description("Path of a DFlash / DFlash2 drafter GGUF (arch 'dflash', e.g. z-lab/Qwen3.8-27B-DFlash2-GGUF). It takes the MTP slot: drafts are verified by the " +
+                     "MTP speculative decoder, greedy output is identical to plain decode. CPU qwen35 targets only for now. Overrides an embedded MTP head.")]
+        public string? DFlash { get; set; }
+
         /// <summary>Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog).</summary>
         [CommandOption("--prefill-chunk-size|--ubatch-size")]
         [Description("Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog). 0 = whole prompt in one pass (default).")]
@@ -437,7 +443,13 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 resolvedPath, MoeOffloadCli.Build(settings.MoeValues));
             model = loaded.Model;
             vulkanKv = loaded.IsVulkan ? loaded.KvCacheFactory : null;   // CUDA/hybrid models build their caches from the model type below
-            if (!settings.NoMtp)
+            if (settings.DFlash is not null)
+            {
+                if (model is not DotLLM.Core.Models.IDFlashDraftAttachable dflashTarget)
+                    throw new NotSupportedException($"--dflash: {model.GetType().Name} cannot drive a DFlash drafter (CPU qwen35 targets only for now).");
+                dflashTarget.AttachDFlashDrafter(settings.DFlash);
+            }
+            else if (!settings.NoMtp)
             {
                 // qwen4exp ships its MTP draft head as a separate GGUF (#820): attach the explicit or auto-detected sibling.
                 try
