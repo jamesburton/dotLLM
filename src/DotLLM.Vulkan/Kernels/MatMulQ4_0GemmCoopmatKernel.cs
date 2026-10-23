@@ -61,7 +61,13 @@ public sealed class MatMulQ4_0GemmCoopmatKernel : IDisposable
     /// <summary>Loads the SPIR-V and creates the pipeline. Check <see cref="IsSupportedOn"/> first.</summary>
     public static MatMulQ4_0GemmCoopmatKernel Create(VulkanDevice device, string spvDir)
     {
-        string path = Path.Combine(spvDir, SpvFileName);
+        // Issue #1109 (experiment only): VulkanPrecisionExperiment.Gemm at creation loads the F16-accumulate twin.
+        string path = Path.Combine(spvDir, VulkanPrecisionExperiment.Gemm switch
+        {
+            GemmAccVariant.F16 => SpvFileName.Replace(".spv", "_xf16.spv", StringComparison.Ordinal),
+            GemmAccVariant.F16Promote256 => SpvFileName.Replace(".spv", "_xf16p256.spv", StringComparison.Ordinal),
+            _ => SpvFileName,
+        });
         if (!File.Exists(path))
             throw new FileNotFoundException(
                 $"Vulkan SPIR-V not found: {path}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");

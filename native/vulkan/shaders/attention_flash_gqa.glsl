@@ -19,11 +19,21 @@
 // KV storage (the .comp wrapper): KV_F16 reads F16 rows as packed words, the default F32 rows; either is converted to F32 in the
 // LDS tile load (2 x 16 KiB tiles, BC = 16), a per-tile transient, never a widened history. No 16-bit device feature is used. Requires subgroups of at least 8 lanes (host-checked).
 //
+// Precision-study variants (issue #1109; experiment only, selected by DOTLLM_VK_EXP_FA_ACC; the shipped pipelines define none of
+// these and compile to the same SPIR-V as before):
+//   QK_ACC_F16      Q and the K tile are F16 (Q pre-scaled by the softmax scale, exact for 1/16) and each lane's 32-dim partial
+//                   dot accumulates in F16; the 8-lane butterfly and the softmax stay F32.
+//   PV_ACC_F16_TILE the V tile is F16 and one tile's P.V accumulates in F16 registers, added to the F32 O per tile.
+//   PV_ACC_F16      the V tile and O are F16 over the whole KV range.
+//
 // Dispatch: local_size_x = 128, workgroups = (ceil(seqQ * G / 16), numKvHeads).
 
 #extension GL_KHR_shader_subgroup_basic   : require
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_EXT_control_flow_attributes : require
+#if defined(QK_ACC_F16) || defined(PV_ACC_F16_TILE) || defined(PV_ACC_F16)
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
 
 #define ROWS            16
 #define TPR             8                        // lanes per row
@@ -51,8 +61,16 @@ layout(set = 0, binding = 2, std430) readonly  buffer BufV   { vec4 v4[]; };
 vec4 loadK(uint i) { return k4[i]; }
 vec4 loadV(uint i) { return v4[i]; }
 #endif
+#if defined(QK_ACC_F16)
+shared f16vec4 kT[BC * ROW_WORDS];
+#else
 shared vec4 kT[BC * ROW_WORDS];
+#endif
+#if defined(PV_ACC_F16_TILE) || defined(PV_ACC_F16)
+shared f16vec4 vT[BC * ROW_WORDS];
+#else
 shared vec4 vT[BC * ROW_WORDS];
+#endif
 layout(set = 0, binding = 3, std430) writeonly buffer BufOut { vec4 out4[]; };    // [seq_q, num_heads * head_dim] F32
 
 layout(push_constant) uniform PushConstants {
@@ -103,12 +121,32 @@ void main() {
     uint dSteps    = pc.headDim / uint(4 * TPR);
     float scale = (pc.scaleOverride > 0.0) ? pc.scaleOverride : inversesqrt(float(pc.headDim));
 
+#if defined(QK_ACC_F16)
+    f16vec4 qr[DSTEPS];
+#else
     vec4 qr[DSTEPS];
+#endif
+#if defined(PV_ACC_F16)
+    f16vec4 o[DSTEPS];
+#else
     vec4 o[DSTEPS];
+#endif
     [[unroll]] for (uint i = 0u; i < uint(DSTEPS); i++) {
+#if defined(QK_ACC_F16)
+        qr[i] = f16vec4(0.0);
+#else
         qr[i] = vec4(0.0);
+#endif
+#if defined(PV_ACC_F16)
+        o[i] = f16vec4(0.0);
+#else
         o[i] = vec4(0.0);
+#endif
+#if defined(QK_ACC_F16)
+        if (rowLive && i < dSteps) qr[i] = f16vec4(q4[t * qStride4 + hq * hd4 + j + uint(TPR) * i] * scale);
+#else
         if (rowLive && i < dSteps) qr[i] = q4[t * qStride4 + hq * hd4 + j + uint(TPR) * i];
+#endif
     }
     float runMax = NEG_INF;
     float runSum = 0.0;
@@ -127,8 +165,16 @@ void main() {
             uint d4 = idx - c * uint(ROW_WORDS);
             if (c < tileLen && d4 < hd4) {
                 uint src = (tStart + c) * kvStride4 + hkv * hd4 + d4;
+#if defined(QK_ACC_F16)
+                kT[idx] = f16vec4(loadK(src));
+#else
                 kT[idx] = loadK(src);
+#endif
+#if defined(PV_ACC_F16_TILE) || defined(PV_ACC_F16)
+                vT[idx] = f16vec4(loadV(src));
+#else
                 vT[idx] = loadV(src);
+#endif
             }
         }
         barrier();
@@ -137,12 +183,22 @@ void main() {
         float s[BC];
         float tileMax = NEG_INF;
         [[unroll]] for (uint c = 0u; c < uint(BC); c++) {
+#if defined(QK_ACC_F16)
+            float16_t part16 = float16_t(0.0);
+            if (c < tileLen) {
+                [[unroll]] for (uint i = 0u; i < uint(DSTEPS); i++) {
+                    if (i < dSteps) part16 += dot(qr[i], kT[c * uint(ROW_WORDS) + j + uint(TPR) * i]);
+                }
+            }
+            float part = float(part16);
+#else
             float part = 0.0;
             if (c < tileLen) {
                 [[unroll]] for (uint i = 0u; i < uint(DSTEPS); i++) {
                     if (i < dSteps) part += dot(qr[i], kT[c * uint(ROW_WORDS) + j + uint(TPR) * i]);
                 }
             }
+#endif
             part += subgroupShuffleXor(part, 1u);
             part += subgroupShuffleXor(part, 2u);
             part += subgroupShuffleXor(part, 4u);
@@ -152,7 +208,11 @@ void main() {
                 bool masked = isMasked(tkv, posQ)
                     || (pc.slidingWindow > 0u && posQ >= tkv && (posQ - tkv) >= pc.slidingWindow);
                 if (!masked) {
+#if defined(QK_ACC_F16)
+                    sc = part;
+#else
                     sc = part * scale;
+#endif
                     if (pc.softCap > 0.0) sc = pc.softCap * tanh(sc / pc.softCap);
                 }
             }
@@ -162,17 +222,34 @@ void main() {
 
         float newMax = max(runMax, tileMax);
         float corr = (runMax > NEG_INF * 0.5) ? exp(runMax - newMax) : 0.0;
+#if defined(PV_ACC_F16)
+        [[unroll]] for (uint i = 0u; i < uint(DSTEPS); i++) o[i] *= float16_t(corr);
+#else
         [[unroll]] for (uint i = 0u; i < uint(DSTEPS); i++) o[i] *= corr;
+#endif
+#if defined(PV_ACC_F16_TILE)
+        f16vec4 t16[DSTEPS];
+        [[unroll]] for (uint i = 0u; i < uint(DSTEPS); i++) t16[i] = f16vec4(0.0);
+#endif
         float tileSum = 0.0;
         [[unroll]] for (uint c = 0u; c < uint(BC); c++) {
             float w = (s[c] > NEG_INF * 0.5) ? exp(s[c] - newMax) : 0.0;
             tileSum += w;
             if (w != 0.0) {
                 [[unroll]] for (uint i = 0u; i < uint(DSTEPS); i++) {
+#if defined(PV_ACC_F16_TILE)
+                    if (i < dSteps) t16[i] += float16_t(w) * vT[c * uint(ROW_WORDS) + j + uint(TPR) * i];
+#elif defined(PV_ACC_F16)
+                    if (i < dSteps) o[i] += float16_t(w) * vT[c * uint(ROW_WORDS) + j + uint(TPR) * i];
+#else
                     if (i < dSteps) o[i] += w * vT[c * uint(ROW_WORDS) + j + uint(TPR) * i];
+#endif
                 }
             }
         }
+#if defined(PV_ACC_F16_TILE)
+        [[unroll]] for (uint i = 0u; i < uint(DSTEPS); i++) o[i] += vec4(t16[i]);
+#endif
         runSum = runSum * corr + tileSum;
         runMax = newMax;
         barrier();   // the next tile overwrites kT / vT
@@ -181,7 +258,11 @@ void main() {
     if (rowLive) {
         float inv = (runSum > 1e-10) ? (1.0 / runSum) : 0.0;
         [[unroll]] for (uint i = 0u; i < uint(DSTEPS); i++) {
+#if defined(PV_ACC_F16)
+            if (i < dSteps) out4[t * qStride4 + hq * hd4 + j + uint(TPR) * i] = vec4(o[i]) * inv;
+#else
             if (i < dSteps) out4[t * qStride4 + hq * hd4 + j + uint(TPR) * i] = o[i] * inv;
+#endif
         }
     }
 }

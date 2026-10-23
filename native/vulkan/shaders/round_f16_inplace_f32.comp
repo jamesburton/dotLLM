@@ -1,0 +1,30 @@
+#version 450
+// Rounds an F32 range to F16-representable values in place (issue #1109, precision-study experiment only).
+//
+// x[elemOffset + i] = float(half(x[elemOffset + i])) for i < count, with the same integer-domain round-to-nearest-even and the same
+// finite-range clamp as convert_f32_to_f16_range.comp, so a rounded F32 KV row holds exactly the values an F16 cache row would.
+// Selected by DOTLLM_VK_EXP_KV_F16_ROUND=1 on the F32 KV stores #1107 still tracks: the attention kernels then compute on F16 values
+// and the KL against the F32 run is the accuracy cost of narrowing that store.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer BufX { float x[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint elemOffset;
+    uint count;
+} pc;
+
+float roundToHalfRne(float v) {
+    uint b = floatBitsToUint(v);
+    b += 0xFFFu + ((b >> 13u) & 1u);
+    return uintBitsToFloat(b & 0xFFFFE000u);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    float v = clamp(x[pc.elemOffset + i], -65504.0, 65504.0);
+    // Exact: the rounded mantissa has 10 bits, so the half round trip reproduces it (subnormal halves aside, which K / V never reach).
+    x[pc.elemOffset + i] = unpackHalf2x16(packHalf2x16(vec2(roundToHalfRne(v), 0.0))).x;
+}

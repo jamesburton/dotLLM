@@ -185,6 +185,14 @@ void main() {
     coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> sums[CMS_PER_ROW * CMS_PER_COL];
     [[unroll]] for (uint i = 0u; i < CMS_PER_ROW * CMS_PER_COL; i++)
         sums[i] = coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
+#if defined(GEMM_ACC_F16) || defined(GEMM_ACC_F16_P256)
+    // Issue #1109 precision-study variant (experiment only; the shipped pipelines define neither): the MMAs accumulate in F16.
+    // GEMM_ACC_F16 keeps the F16 accumulator over the whole K range; GEMM_ACC_F16_P256 adds it into the F32 `sums` every
+    // 256 K elements (8 BK=32 chunks) and restarts it.
+    coopmat<float16_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> sums16[CMS_PER_ROW * CMS_PER_COL];
+    [[unroll]] for (uint i = 0u; i < CMS_PER_ROW * CMS_PER_COL; i++)
+        sums16[i] = coopmat<float16_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
+#endif
 
 #ifdef FAST_UNPACK
     // Hoisted across the chunk loop: the group scale changes only every 4th chunk.
@@ -293,14 +301,31 @@ void main() {
                                 (warp_c * WN + cm_col * TN) * STRIDE + i, STRIDE,
                                 gl_CooperativeMatrixLayoutColumnMajor);
 
+#if defined(GEMM_ACC_F16) || defined(GEMM_ACC_F16_P256)
+                    sums16[cm_col * CMS_PER_ROW + cm_row] =
+                        coopMatMulAdd(cache_a, cache_b, sums16[cm_col * CMS_PER_ROW + cm_row]);
+#else
                     sums[cm_col * CMS_PER_ROW + cm_row] =
                         coopMatMulAdd(cache_a, cache_b, sums[cm_col * CMS_PER_ROW + cm_row]);
+#endif
                 }
             }
         }
 
+#if defined(GEMM_ACC_F16_P256)
+        if ((ch & 7u) == 7u) {
+            [[unroll]] for (uint i = 0u; i < CMS_PER_ROW * CMS_PER_COL; i++) {
+                sums[i] = sums[i] + coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(sums16[i]);
+                sums16[i] = coopmat<float16_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
+            }
+        }
+#endif
         barrier();
     }
+#if defined(GEMM_ACC_F16) || defined(GEMM_ACC_F16_P256)
+    [[unroll]] for (uint i = 0u; i < CMS_PER_ROW * CMS_PER_COL; i++)
+        sums[i] = sums[i] + coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(sums16[i]);
+#endif
 
     // ---- 4. Store. C layout: [N, M] row-major; ColumnMajor + stride M places sums[m,t] at
     // base + t*M + m, which is exactly that. No trailing scale: PQ2_0's per-group scales were

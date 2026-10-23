@@ -33,6 +33,14 @@
 // LDS (KV_F16): K/V tile 32 x 264 f16 (16.5 KiB) + scores 4 x 16 x 36 f32 (9 KiB) + P 4 x 16 x 40 f16 (5 KiB) = 30.5 KiB, under
 // the 32 KiB Strix limit.
 //
+// Precision-study variants (issue #1109; experiment only, selected by DOTLLM_VK_EXP_FA_ACC; the shipped pipelines define none of
+// these and compile to the same SPIR-V as before):
+//   QK_ACC_F16      S = Q K^T accumulates in an F16 cooperative matrix; Q is pre-scaled by the softmax scale (exact for a
+//                   power-of-two scale such as 1/16 at head_dim 256) so the F16 accumulator holds scaled scores.
+//   PV_ACC_F16_TILE P.V of one KV tile accumulates in F16, then is added to the F32 O accumulator (F32 across tiles).
+//   PV_ACC_F16      O itself is an F16 accumulator over the whole KV range.
+//   SCORE_STATS     binding 4 receives score statistics (see BufStats); the arithmetic is the default's.
+//
 // Dispatch: local_size_x = 4 * subgroupSize (specialization constant 1, the subgroup size pinned at pipeline creation),
 //           workgroups = (ceil(seqQ * G / 64), numKvHeads).
 
@@ -79,6 +87,22 @@ layout(set = 0, binding = 1, std430) readonly  buffer BufK   { vec4 k4[]; };    
 layout(set = 0, binding = 2, std430) readonly  buffer BufV   { vec4 v4[]; };
 #endif
 layout(set = 0, binding = 3, std430) writeonly buffer BufOut { float outp[]; };   // [seq_q, num_heads * head_dim] F32
+#if defined(SCORE_STATS)
+// [0] max |s| over every unmasked scaled score (float bits; non-negative floats order as uints), [1] max |Q_lo . K| * scale,
+// [2 + b] rows whose max |s| falls in [b, b + 1) (b < 256, clamped), [258 + b] rows whose max |Q_lo . K| * scale falls in
+// [2^(b-40), 2^(b-39)) (b < 64, clamped), [322] rows counted.
+layout(set = 0, binding = 4, std430) buffer BufStats { uint stats[]; };
+#endif
+#if defined(PV_ACC_F16)
+#define OACC float16_t
+#else
+#define OACC float
+#endif
+#if defined(QK_ACC_F16)
+#define SACC float16_t
+#else
+#define SACC float
+#endif
 
 layout(push_constant) uniform PushConstants {
     uint  seqQ;
@@ -180,6 +204,14 @@ void main() {
     uint kvStride4 = (pc.numKvHeads * pc.headDim) >> 2u;
     uint hdChunks  = pc.headDim >> 4u;
     float scale = (pc.scaleOverride > 0.0) ? pc.scaleOverride : inversesqrt(float(pc.headDim));
+#if defined(QK_ACC_F16)
+    // F16 S: fold the scale into Q (exact for a power-of-two scale) so the F16 accumulator holds scaled scores.
+#define Q_SCALED(x) ((x) * scale)
+#define S_SCALED(x) (x)
+#else
+#define Q_SCALED(x) (x)
+#define S_SCALED(x) ((x) * scale)
+#endif
 
     uint sBase = strip * uint(S_STRIP);
     uint pBase = strip * uint(P_STRIP);
@@ -205,7 +237,7 @@ void main() {
                     if (m < totalRows) {
                         uint t = m / G;
                         uint hq = hkv * G + (m - t * G);
-                        x = q[t * qStride + hq * pc.headDim + d];
+                        x = Q_SCALED(q[t * qStride + hq * pc.headDim + d]);
                     }
                     float16_t hi = float16_t(x);
                     sP[pBase + e] = (half_ == 0u) ? hi : float16_t(x - float(hi));
@@ -219,12 +251,16 @@ void main() {
         }
     }
 
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> o[HD_CHUNKS];
+    coopmat<OACC, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> o[HD_CHUNKS];
     [[unroll]] for (uint j = 0u; j < uint(HD_CHUNKS); j++) {
-        o[j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        o[j] = coopmat<OACC, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
     }
     float runMax = NEG_INF;
     float runSum = 0.0;
+#if defined(SCORE_STATS)
+    float statAbsMax = 0.0;   // this lane's max |s| over its row
+    float statLoMax = 0.0;    // this lane's max |Q_lo . K| * scale
+#endif
 
     // 2. KV walk. Causal early exit at the workgroup's last position; per strip, tiles past its own last position are skipped.
     uint kvEnd = pc.seqKv;
@@ -251,8 +287,8 @@ void main() {
         if (stripOn) {
             // 2b. S = Q K^T (F32 accumulate), stored to this strip's score rows.
             [[unroll]] for (uint cf = 0u; cf < uint(CF); cf++) {
-                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
-                    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+                coopmat<SACC, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+                    coopmat<SACC, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
                 [[unroll]] for (uint dc = 0u; dc < uint(HD_CHUNKS); dc++) {
                     if (dc < hdChunks) {
                         coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> kt;
@@ -266,7 +302,12 @@ void main() {
 #endif
                     }
                 }
+#if defined(QK_ACC_F16)
+                coopMatStore(coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(acc), sS, sBase + cf * 16u,
+                             uint(S_STRIDE), gl_CooperativeMatrixLayoutRowMajor);
+#else
                 coopMatStore(acc, sS, sBase + cf * 16u, uint(S_STRIDE), gl_CooperativeMatrixLayoutRowMajor);
+#endif
             }
             subgroupMemoryBarrierShared();
             subgroupBarrier();
@@ -283,13 +324,38 @@ void main() {
                     bool masked = isMasked(tkv, posQ)
                         || (pc.slidingWindow > 0u && posQ >= tkv && (posQ - tkv) >= pc.slidingWindow);
                     if (!masked) {
-                        s = sS[sBase + myRow * uint(S_STRIDE) + c] * scale;
+                        s = S_SCALED(sS[sBase + myRow * uint(S_STRIDE) + c]);
+#if defined(SCORE_STATS)
+                        statAbsMax = max(statAbsMax, abs(s));
+#endif
                         if (pc.softCap > 0.0) s = pc.softCap * tanh(s / pc.softCap);
                     }
                 }
                 sv[i] = s;
                 tileMax = max(tileMax, s);
             }
+#if defined(SCORE_STATS)
+            // The Q lo-half's share of each score, recomputed here (the score rows are already in registers).
+            subgroupBarrier();
+            [[unroll]] for (uint cf = 0u; cf < uint(CF); cf++) {
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accLo =
+                    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+                [[unroll]] for (uint dc = 0u; dc < uint(HD_CHUNKS); dc++) {
+                    if (dc < hdChunks) {
+                        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> kt;
+                        coopMatLoad(kt, kvT, cf * 16u * uint(T_STRIDE4) + dc * 4u, uint(T_STRIDE4), gl_CooperativeMatrixLayoutColumnMajor);
+                        accLo = coopMatMulAdd(ql[dc], kt, accLo);
+                    }
+                }
+                coopMatStore(accLo, sS, sBase + cf * 16u, uint(S_STRIDE), gl_CooperativeMatrixLayoutRowMajor);
+            }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            for (uint i = 0u; i < cols; i++) {
+                uint c = myJ + i * lpr;
+                if (sv[i] > NEG_INF * 0.5) statLoMax = max(statLoMax, abs(S_SCALED(sS[sBase + myRow * uint(S_STRIDE) + c])));
+            }
+#endif
             for (uint off = 1u; off < lpr; off <<= 1u) {
                 tileMax = max(tileMax, subgroupShuffleXor(tileMax, off));
             }
@@ -320,9 +386,17 @@ void main() {
                 subgroupBarrier();
                 coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> cm;
                 coopMatLoad(cm, sS, sBase, 16u, gl_CooperativeMatrixLayoutRowMajor);
+#if defined(PV_ACC_F16)
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> cmh =
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(cm);
+                [[unroll]] for (uint j = 0u; j < uint(HD_CHUNKS); j++) {
+                    o[j] = o[j] * cmh;
+                }
+#else
                 [[unroll]] for (uint j = 0u; j < uint(HD_CHUNKS); j++) {
                     o[j] = o[j] * cm;
                 }
+#endif
             }
             subgroupMemoryBarrierShared();
             subgroupBarrier();
@@ -345,16 +419,27 @@ void main() {
                 // 2f. O += P V on the matrix cores.
                 [[unroll]] for (uint j = 0u; j < uint(HD_CHUNKS); j++) {
                     if (j < hdChunks) {
+#if defined(PV_ACC_F16_TILE)
+                        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> t16 =
+                            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+#endif
                         [[unroll]] for (uint cf = 0u; cf < uint(CF); cf++) {
                             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> vm;
                             coopMatLoad(vm, kvT, cf * 16u * uint(T_STRIDE4) + j * 4u, uint(T_STRIDE4), gl_CooperativeMatrixLayoutRowMajor);
+#if defined(PV_ACC_F16_TILE)
+                            t16 = coopMatMulAdd(pm[cf], vm, t16);
+#else
                             o[j] = coopMatMulAdd(pm[cf], vm, o[j]);
+#endif
 #if !defined(KV_F16)
                             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> vl;
                             coopMatLoad(vl, kLoT, cf * 16u * uint(T_STRIDE4) + j * 4u, uint(T_STRIDE4), gl_CooperativeMatrixLayoutRowMajor);
                             o[j] = coopMatMulAdd(pm[cf], vl, o[j]);
 #endif
                         }
+#if defined(PV_ACC_F16_TILE)
+                        o[j] = o[j] + coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(t16);
+#endif
                     }
                 }
             } else {
@@ -379,7 +464,11 @@ void main() {
                         subgroupBarrier();
                         coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> t;
                         coopMatLoad(t, sS, sBase, 16u, gl_CooperativeMatrixLayoutRowMajor);
+#if defined(PV_ACC_F16)
+                        o[j] = o[j] + coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(t);
+#else
                         o[j] = o[j] + t;
+#endif
                         subgroupBarrier();
                     }
                 }
@@ -387,6 +476,21 @@ void main() {
         }
         barrier();   // every strip is done with the V tile before the next K tile overwrites it
     }
+
+#if defined(SCORE_STATS)
+    for (uint off = 1u; off < lpr; off <<= 1u) {
+        statAbsMax = max(statAbsMax, subgroupShuffleXor(statAbsMax, off));
+        statLoMax = max(statLoMax, subgroupShuffleXor(statLoMax, off));
+    }
+    if (rowLive && stripLive && myJ == 0u) {
+        atomicMax(stats[0], floatBitsToUint(statAbsMax));
+        atomicMax(stats[1], floatBitsToUint(statLoMax));
+        atomicAdd(stats[2u + min(uint(statAbsMax), 255u)], 1u);
+        int lb = (statLoMax > 0.0) ? clamp(int(floor(log2(statLoMax))) + 40, 0, 63) : 0;
+        atomicAdd(stats[258u + uint(lb)], 1u);
+        atomicAdd(stats[322], 1u);
+    }
+#endif
 
     // 3. Normalise (row-wise 1/sum through the same matrix trick) and write the strip's rows.
     if (stripLive) {
@@ -401,7 +505,12 @@ void main() {
         subgroupBarrier();
         [[unroll]] for (uint j = 0u; j < uint(HD_CHUNKS); j++) {
             if (j < hdChunks) {
+#if defined(PV_ACC_F16)
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> r =
+                    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(o[j]) * im;
+#else
                 coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> r = o[j] * im;
+#endif
                 coopMatStore(r, sS, sBase, 16u, gl_CooperativeMatrixLayoutRowMajor);
                 subgroupMemoryBarrierShared();
                 subgroupBarrier();

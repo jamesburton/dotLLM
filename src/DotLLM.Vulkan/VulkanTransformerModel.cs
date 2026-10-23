@@ -4155,6 +4155,12 @@ public sealed partial class VulkanTransformerModel : IModel
                 ProfSample("rope");
                 DpStamp(cmdBuf, DpCatRope);
                 BarrierComputeToCompute(cmdBuf);
+                // Issue #1109 experiment (default off): round the fused-written rows to F16 values.
+                Kernels.VulkanKvRoundF16Kernel.RecordIfEnabled(_device, cmdBuf, vkCache.GetKeysBuffer(layer),
+                    (long)positions[0] * kvStride, (long)seqLen * kvStride);
+                Kernels.VulkanKvRoundF16Kernel.RecordIfEnabled(_device, cmdBuf, vkCache.GetValuesBuffer(layer),
+                    (long)positions[0] * kvStride, (long)seqLen * kvStride);
+
                 // RecordUpdate would normally advance CurrentLength as a side effect of the
                 // vkCmdCopyBuffer path; the fused kernel writes cache rows directly without
                 // going through it, so mirror the length-tracking here.

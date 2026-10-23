@@ -150,6 +150,10 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
     private long _partOutFloats;
     private long _partMSFloats;
 
+    // Issue #1109 precision-study variants of the GQA-grouped pass, built on first use (null = SPIR-V missing).
+    private readonly Dictionary<DecodeAccVariant, (VulkanModule Module, ComputePipeline Pipeline, nint Pool, DescriptorSetCache Cache)?> _gqaVariants = [];
+    private string? _spvDir;
+
     private bool _disposed;
 
     private VulkanSplitKvAttentionKernel(
@@ -255,7 +259,7 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
 
         return new VulkanSplitKvAttentionKernel(
             device, splitModule, splitPipeline, splitPool, mergeModule!, mergePipeline, mergePool, kvStorage,
-            gqaModule, gqaPipeline, gqaPool);
+            gqaModule, gqaPipeline, gqaPool) { _spvDir = spvDir };
     }
 
     /// <summary>
@@ -363,6 +367,7 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         _splitCache.Reset();
         _mergeCache.Reset();
         _gqaCache?.Reset();
+        foreach (var v in _gqaVariants.Values) v?.Cache.Reset();
     }
 
     /// <summary>
@@ -446,7 +451,15 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         Span<nint> splitBuffers = stackalloc nint[5]
             { q.Handle, k.Handle, v.Handle, _partOut!.Handle, _partMS!.Handle };
         ComputePipeline splitPipeline = gqa ? _gqaPipeline! : _splitPipeline;
-        nint splitSet = (gqa ? _gqaCache! : _splitCache).GetOrCreate(splitBuffers);
+        DescriptorSetCache splitCache = gqa ? _gqaCache! : _splitCache;
+        if (gqa && VulkanPrecisionExperiment.Decode != DecodeAccVariant.Default)
+        {
+            var variant = GqaVariant(VulkanPrecisionExperiment.Decode);
+            splitPipeline = variant.Pipeline;
+            splitCache = variant.Cache;
+        }
+
+        nint splitSet = splitCache.GetOrCreate(splitBuffers);
 
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, splitPipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(
@@ -548,11 +561,41 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         InvalidateDescriptorCache();
     }
 
+    /// <summary>The #1109 precision-study variant of the GQA-grouped pass, built on first use.</summary>
+    /// <param name="mode">The variant.</param>
+    /// <returns>Its pipeline and descriptor cache.</returns>
+    /// <exception cref="NotSupportedException">The variant's SPIR-V is missing for this KV format.</exception>
+    private (VulkanModule Module, ComputePipeline Pipeline, nint Pool, DescriptorSetCache Cache) GqaVariant(DecodeAccVariant mode)
+    {
+        if (!_gqaVariants.TryGetValue(mode, out var built))
+        {
+            string path = Path.Combine(_spvDir ?? "", KvStorage.ShaderName("attention_f32_splitkv_gqa") + VulkanPrecisionExperiment.DecodeSuffix(mode) + ".spv");
+            if (File.Exists(path))
+            {
+                var module = VulkanModule.LoadFromFile(_device, path);
+                var pipeline = CreatePipeline(module, bindingCount: 5, SplitPushConstantBytes);
+                nint pool = KernelSupport.CreateDescriptorPool(_device, buffersPerSet: 5);
+                built = (module, pipeline, pool, new DescriptorSetCache(_device, pool, pipeline, buffersPerSet: 5));
+            }
+
+            _gqaVariants[mode] = built;
+        }
+
+        return built ?? throw new NotSupportedException($"Decode precision variant {mode} has no SPIR-V for {KvStorage} KV.");
+    }
+
     /// <inheritdoc/>
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
+        foreach (var variant in _gqaVariants.Values)
+        {
+            if (variant is not { } v) continue;
+            VulkanApi.vkDestroyDescriptorPool(_device.Handle, v.Pool, 0);
+            v.Pipeline.Dispose();
+            v.Module.Dispose();
+        }
 
         if (_splitPool != 0) VulkanApi.vkDestroyDescriptorPool(_device.Handle, _splitPool, 0);
         if (_mergePool != 0) VulkanApi.vkDestroyDescriptorPool(_device.Handle, _mergePool, 0);

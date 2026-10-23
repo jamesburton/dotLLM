@@ -55,16 +55,29 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
     private readonly ComputePipeline _pipeline;
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
+    private readonly int _bindingCount;
+    private readonly string _spvDir;
+    private readonly uint _requiredSubgroupSize;
+    private readonly uint[] _spec;
+
+    // Issue #1109 precision-study variants, built on first use (null = this variant cannot run here).
+    private readonly Dictionary<FlashAccVariant, VulkanFlashAttentionGqaKernel?> _variants = [];
+    private bool _isVariant;
     private bool _disposed;
 
     private VulkanFlashAttentionGqaKernel(
-        VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, bool isCoopmat, VulkanKvStorage kvStorage)
+        VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, bool isCoopmat, VulkanKvStorage kvStorage,
+        int bindingCount, string spvDir, uint requiredSubgroupSize, uint[] spec)
     {
         _device = device;
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 4);
+        _bindingCount = bindingCount;
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: bindingCount);
+        _spvDir = spvDir;
+        _requiredSubgroupSize = requiredSubgroupSize;
+        _spec = spec;
         IsCoopmat = isCoopmat;
         KvStorage = kvStorage;
     }
@@ -141,7 +154,7 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
         uint gate = VulkanFlashAttentionCoopmatKernel.RequiresInvariantPv(device.VendorId);
         uint splitQ = Environment.GetEnvironmentVariable(SplitQEnvVar) == "0" ? 0u : 1u;
         ReadOnlySpan<uint> spec = [gate, 4 * sg, splitQ];
-        return TryBuild(device, spvDir, kvStorage.ShaderName(CoopmatShader), pin, spec, isCoopmat: true, kvStorage);
+        return TryBuild(device, spvDir, kvStorage.ShaderName(CoopmatShader), pin, spec, isCoopmat: true, kvStorage, bindingCount: 4);
     }
 
     /// <summary>Creates the scalar implementation, or null when the build or device cannot run it.</summary>
@@ -161,12 +174,12 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
             pin = want;
         }
 
-        return TryBuild(device, spvDir, kvStorage.ShaderName(ScalarShader), pin, default, isCoopmat: false, kvStorage);
+        return TryBuild(device, spvDir, kvStorage.ShaderName(ScalarShader), pin, default, isCoopmat: false, kvStorage, bindingCount: 4);
     }
 
     private static VulkanFlashAttentionGqaKernel? TryBuild(
         VulkanDevice device, string spvDir, string shaderName, uint requiredSubgroupSize, ReadOnlySpan<uint> spec,
-        bool isCoopmat, VulkanKvStorage kvStorage)
+        bool isCoopmat, VulkanKvStorage kvStorage, int bindingCount)
     {
         string path = Path.Combine(spvDir, shaderName + ".spv");
         if (!File.Exists(path)) return null;
@@ -175,16 +188,17 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
         try
         {
             module = VulkanModule.LoadFromFile(device, path);
-            Span<VkDescriptorBinding> bindings = stackalloc VkDescriptorBinding[4];
-            for (int i = 0; i < 4; i++) bindings[i] = new VkDescriptorBinding((uint)i);
+            Span<VkDescriptorBinding> bindings = stackalloc VkDescriptorBinding[bindingCount];
+            for (int i = 0; i < bindingCount; i++) bindings[i] = new VkDescriptorBinding((uint)i);
             pipeline = module.CreateComputePipeline(
                 entryPoint: "main",
                 bindings: bindings,
                 pushConstantBytes: PushConstantBytes,
                 requiredSubgroupSize: requiredSubgroupSize,
                 specConstants: spec);
-            nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
-            return new VulkanFlashAttentionGqaKernel(device, module, pipeline, pool, isCoopmat, kvStorage);
+            nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)bindingCount);
+            return new VulkanFlashAttentionGqaKernel(
+                device, module, pipeline, pool, isCoopmat, kvStorage, bindingCount, spvDir, requiredSubgroupSize, spec.ToArray());
         }
         catch (VulkanException)
         {
@@ -195,7 +209,49 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
     }
 
     /// <summary>Drops cached descriptor sets (a buffer they name was freed or re-created).</summary>
-    internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
+    internal void InvalidateDescriptorCache()
+    {
+        _descriptorCache.Reset();
+        foreach (var v in _variants.Values) v?.InvalidateDescriptorCache();
+    }
+
+    /// <summary>
+    /// The #1109 precision-study variant of this kernel selected by <see cref="VulkanPrecisionExperiment.Flash"/>, built on first use;
+    /// null for the shipped variant (and on a variant instance itself).
+    /// </summary>
+    /// <returns>The variant kernel, or null.</returns>
+    /// <exception cref="NotSupportedException">The selected variant has no pipeline for this implementation or KV format.</exception>
+    private VulkanFlashAttentionGqaKernel? ExperimentVariant()
+    {
+        var mode = VulkanPrecisionExperiment.Flash;
+        if (mode == FlashAccVariant.Default || _isVariant) return null;
+        if (!_variants.TryGetValue(mode, out var kernel))
+        {
+            kernel = BuildVariant(mode);
+            if (kernel is not null) kernel._isVariant = true;
+            _variants[mode] = kernel;
+        }
+
+        return kernel ?? throw new NotSupportedException(
+            $"Precision variant {mode} is not available for the {(IsCoopmat ? "coopmat" : "scalar")} GQA flash kernel with {KvStorage} KV.");
+    }
+
+    private VulkanFlashAttentionGqaKernel? BuildVariant(FlashAccVariant mode)
+    {
+        string baseName = KvStorage.ShaderName(IsCoopmat ? CoopmatShader : ScalarShader);
+        if (IsCoopmat)
+        {
+            // spec: [REQUIRE_INVARIANT_PV, workgroup size, QK_SPLIT_Q]; F16 S keeps Q hi only (a lo term is below its rounding).
+            uint[] spec = [_spec[0], _spec[1], mode is FlashAccVariant.NoQlo or FlashAccVariant.Qk16 ? 0u : 1u];
+            string name = mode == FlashAccVariant.NoQlo ? baseName : baseName + VulkanPrecisionExperiment.FlashSuffix(mode);
+            return TryBuild(_device, _spvDir, name, _requiredSubgroupSize, spec, isCoopmat: true, KvStorage,
+                bindingCount: mode == FlashAccVariant.Stats ? 5 : 4);
+        }
+
+        if (mode is FlashAccVariant.NoQlo or FlashAccVariant.Stats) return null;
+        return TryBuild(_device, _spvDir, baseName + VulkanPrecisionExperiment.FlashSuffix(mode), _requiredSubgroupSize, default,
+            isCoopmat: false, KvStorage, bindingCount: 4);
+    }
 
     /// <summary>Records, submits and waits for one dispatch (tests and benches).</summary>
     /// <param name="q">Queries, F32 <c>[seqQ, numHeads * headDim]</c>.</param>
@@ -256,6 +312,14 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
         ArgumentOutOfRangeException.ThrowIfNegative(positionOffset);
         ArgumentOutOfRangeException.ThrowIfNegative(slidingWindow);
         ArgumentOutOfRangeException.ThrowIfNegative(prefixLen);
+        if (ExperimentVariant() is { } variant)
+        {
+            variant.Record(cmdBuf, q, k, v, output, seqQ, seqKv, numHeads, numKvHeads, headDim,
+                positionOffset, slidingWindow, softCap, scaleOverride, maskMode, prefixLen);
+            Dispatches++;
+            return;
+        }
+
         if (!CanDispatch(headDim, numHeads, numKvHeads))
             throw new ArgumentException(
                 $"Shape headDim={headDim} heads={numHeads}/{numKvHeads} is outside this kernel ({(IsCoopmat ? "coopmat" : "scalar")}).",
@@ -268,7 +332,14 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
         if (v.Size < kvBytes) throw new ArgumentException("V buffer too small.", nameof(v));
         if (output.Size < qBytes) throw new ArgumentException("Output buffer too small.", nameof(output));
 
-        Span<nint> buffers = stackalloc nint[4] { q.Handle, k.Handle, v.Handle, output.Handle };
+        Span<nint> buffers = stackalloc nint[5] { q.Handle, k.Handle, v.Handle, output.Handle, 0 };
+        if (_bindingCount == 5)
+        {
+            buffers[4] = (VulkanPrecisionExperiment.StatsBuffer
+                ?? throw new InvalidOperationException("The score-statistics flash variant needs VulkanPrecisionExperiment.StatsBuffer.")).Handle;
+        }
+
+        buffers = buffers[.._bindingCount];
         nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout, 0, 1, descriptorSet, 0, 0);
@@ -303,6 +374,7 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        foreach (var variant in _variants.Values) variant?.Dispose();
         if (_descriptorPool != 0) VulkanApi.vkDestroyDescriptorPool(_device.Handle, _descriptorPool, 0);
         _pipeline.Dispose();
         _module.Dispose();

@@ -1,5 +1,8 @@
 #extension GL_KHR_shader_subgroup_basic      : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#if defined(STATS16) || defined(PV16)
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
 
 // GQA-grouped split-KV (flash-decoding) PARTIAL pass, decode only (seqQ == 1). Issue #1102.
 //
@@ -16,6 +19,12 @@
 // (attention_f32_splitkv_merge.comp) finishes the row. Masking (causal / bidirectional / hybrid), sliding window, ALiBi,
 // soft-cap, scale override and kvStart follow attention_f32_splitkv.glsl. Push constants are identical; the dispatch is
 // numKvHeads * numSplits workgroups.
+//
+// Precision-study variants (issue #1109; experiment only, selected by DOTLLM_VK_EXP_DECODE_ACC; the shipped pipelines define
+// none of these and compile to the same SPIR-V as before):
+//   STATS16  the running max, the correction and the running sum are rounded to F16 at every update, and each lane's share of
+//            a tile's sum accumulates in F16 (the cross-lane reduction and the exp stay F32).
+//   PV16     the P.V accumulators are F16 (P rounded to F16, V exact), rescaled by an F16 correction.
 //
 // Bounds: G <= MAX_GROUP, head_dim <= MAX_HEAD_DIM (= WG_SIZE). LDS: 8 KiB Q + 4 KiB scores.
 
@@ -109,11 +118,19 @@ void main() {
     }
 
     float slopes[MAX_GROUP];
+#if defined(PV16)
+    float16_t acc[MAX_GROUP];
+    for (uint g = 0u; g < MAX_GROUP; g++) {
+        slopes[g] = (pc.useAlibi != 0u && g < G) ? alibiSlope(hq0 + g, pc.numHeads) : 0.0;
+        acc[g] = float16_t(0.0);
+    }
+#else
     float acc[MAX_GROUP];
     for (uint g = 0u; g < MAX_GROUP; g++) {
         slopes[g] = (pc.useAlibi != 0u && g < G) ? alibiSlope(hq0 + g, pc.numHeads) : 0.0;
         acc[g] = 0.0;
     }
+#endif
     barrier();
 
     uint nSub   = gl_NumSubgroups;
@@ -164,6 +181,23 @@ void main() {
             float tileMax = subgroupMax(m);
             float oldMax = runMax[g];
             float newMax = max(oldMax, tileMax);
+#if defined(STATS16)
+            if (newMax > NEG_INF * 0.5) newMax = float(float16_t(newMax));
+            float c = (oldMax > NEG_INF * 0.5) ? float(float16_t(exp(oldMax - newMax))) : 0.0;
+            float16_t s16 = float16_t(0.0);
+            for (uint t = lane; t < tileLen; t += sgSize) {
+                float sc = scoreTile[g * TILE_KV + t];
+                float w = (sc > NEG_INF * 0.5) ? exp(sc - newMax) : 0.0;
+                scoreTile[g * TILE_KV + t] = w;
+                s16 += float16_t(w);
+            }
+            float tileSum = subgroupAdd(float(s16));
+            if (subgroupElect()) {
+                runSum[g] = float(float16_t(runSum[g] * c + tileSum));
+                runMax[g] = newMax;
+                corr[g] = c;
+            }
+#else
             float c = (oldMax > NEG_INF * 0.5) ? exp(oldMax - newMax) : 0.0;
             float s = 0.0;
             for (uint t = lane; t < tileLen; t += sgSize) {
@@ -178,13 +212,18 @@ void main() {
                 runMax[g] = newMax;
                 corr[g] = c;
             }
+#endif
         }
         barrier();
 
         // 3. P.V: thread d owns column d; one V load feeds all G accumulators. A position every head masked is not read.
         if (tid < pc.headDim) {
             for (uint g = 0u; g < MAX_GROUP; g++) {
+#if defined(PV16)
+                if (g < G) acc[g] *= float16_t(corr[g]);
+#else
                 if (g < G) acc[g] *= corr[g];
+#endif
             }
             for (uint t = 0u; t < tileLen; t++) {
                 float wAny = 0.0;
@@ -194,7 +233,11 @@ void main() {
                 if (wAny > 0.0) {
                     float vd = KV_V((tStart + t) * kvStride + kvHeadBase + tid);
                     for (uint g = 0u; g < MAX_GROUP; g++) {
+#if defined(PV16)
+                        if (g < G) acc[g] += float16_t(scoreTile[g * TILE_KV + t]) * float16_t(vd);
+#else
                         if (g < G) acc[g] += scoreTile[g * TILE_KV + t] * vd;
+#endif
                     }
                 }
             }
@@ -205,7 +248,11 @@ void main() {
     // 4. Partials in the layout of attention_f32_splitkv.glsl: row (hq * numSplits + split).
     if (tid < pc.headDim) {
         for (uint g = 0u; g < MAX_GROUP; g++) {
+#if defined(PV16)
+            if (g < G) partOut[((hq0 + g) * pc.numSplits + splitId) * pc.headDim + tid] = float(acc[g]);
+#else
             if (g < G) partOut[((hq0 + g) * pc.numSplits + splitId) * pc.headDim + tid] = acc[g];
+#endif
         }
     }
     if (tid < G) {

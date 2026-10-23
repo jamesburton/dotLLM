@@ -425,6 +425,17 @@ public sealed class VulkanNemotronHKvCache : IKvCache
             }
         }
 
+        // Issue #1109 experiment (default off): round the rows just written to F16 values, as an F16 store would hold them.
+        if (VulkanPrecisionExperiment.KvRoundF16)
+        {
+            for (int i = 0; i < seqLen; i++)
+            {
+                long off = (long)positions[i] * _kvStride;
+                Kernels.VulkanKvRoundF16Kernel.RecordIfEnabled(_device, cmdBuf, _keys[slot], off, _kvStride);
+                Kernels.VulkanKvRoundF16Kernel.RecordIfEnabled(_device, cmdBuf, _values[slot], off, _kvStride);
+            }
+        }
+
         int newLength = maxPos + 1;
         if (newLength > _currentLength)
             _currentLength = newLength;

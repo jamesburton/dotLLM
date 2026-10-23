@@ -1008,6 +1008,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         ulong slabOff = (ulong)((long)firstPosition * kvRowBytes);
         RecordCopyBufferRange(cmdBuf, _state.K, state.KeyCache, 0, slabOff, slab);
         RecordCopyBufferRange(cmdBuf, _state.V, state.ValueCache, 0, slabOff, slab);
+        // Issue #1109 experiment (default off): the MTP head's F32 KV rows rounded to F16 values.
+        Kernels.VulkanKvRoundF16Kernel.RecordIfEnabled(_device, cmdBuf, state.KeyCache, (long)firstPosition * kvStride, (long)s * kvStride);
+        Kernels.VulkanKvRoundF16Kernel.RecordIfEnabled(_device, cmdBuf, state.ValueCache, (long)firstPosition * kvStride, (long)s * kvStride);
         TransferToAllBarrier(cmdBuf);
         _submit.SubmitAndWait();
 
@@ -2523,6 +2526,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         ulong kvSlot = (ulong)((long)step * kvRowBytes);
         RecordCopyBufferRange(cmdBuf, _state.K, state.KeyCache, 0, kvSlot, (ulong)kvRowBytes);
         RecordCopyBufferRange(cmdBuf, _state.V, state.ValueCache, 0, kvSlot, (ulong)kvRowBytes);
+        // Issue #1109 experiment (default off): the MTP head's F32 KV row rounded to F16 values.
+        Kernels.VulkanKvRoundF16Kernel.RecordIfEnabled(_device, cmdBuf, state.KeyCache, (long)step * kvStride, kvStride);
+        Kernels.VulkanKvRoundF16Kernel.RecordIfEnabled(_device, cmdBuf, state.ValueCache, (long)step * kvStride, kvStride);
         KernelSupport.TransferToComputeBarrier(cmdBuf);
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.AttnKvUpdate);
 

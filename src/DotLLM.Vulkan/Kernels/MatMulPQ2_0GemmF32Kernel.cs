@@ -323,6 +323,12 @@ public sealed class MatMulPQ2_0GemmF32Kernel : IDisposable
     private readonly DescriptorSetCache _descriptorCache;
     private readonly int _tileM;
     private readonly int _tileN;
+
+    // Issue #1109 precision-study accumulator variants of the blocked ladder kernel, built on first use.
+    private readonly Dictionary<GemmAccVariant, MatMulPQ2_0GemmF32Kernel> _accVariants = [];
+    private string _spvDir = string.Empty;
+    private PQ2_0GemmVariant _variant;
+    private bool _isAccVariant;
     private bool _disposed;
 
     /// <summary>
@@ -412,11 +418,38 @@ public sealed class MatMulPQ2_0GemmF32Kernel : IDisposable
         return new MatMulPQ2_0GemmF32Kernel(device, module, pipeline, pool, variant.TileM, variant.TileN)
         {
             VariantName = variant.SpvFileName,
+            _spvDir = spvDir,
+            _variant = variant,
         };
     }
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
-    internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
+    internal void InvalidateDescriptorCache()
+    {
+        _descriptorCache.Reset();
+        foreach (var v in _accVariants.Values) v.InvalidateDescriptorCache();
+    }
+
+    /// <summary>
+    /// The #1109 accumulator variant selected by <see cref="VulkanPrecisionExperiment.Gemm"/> (F16 accumulation, optionally promoted
+    /// to F32 every 256 K elements), built on first use; null for the shipped F32-accumulate kernel.
+    /// </summary>
+    /// <returns>The variant kernel, or null.</returns>
+    /// <exception cref="NotSupportedException">This kernel is not the blocked 128x128 ladder, the only one with variants.</exception>
+    private MatMulPQ2_0GemmF32Kernel? AccVariant()
+    {
+        var mode = VulkanPrecisionExperiment.Gemm;
+        if (mode == GemmAccVariant.Default || _isAccVariant) return null;
+        if (_accVariants.TryGetValue(mode, out var built)) return built;
+        if (!VariantName.StartsWith("matmul_pq2_0_f32_gemm_ladder_128x128x4", StringComparison.Ordinal)
+            || VariantName.Contains("fastunpack", StringComparison.Ordinal))
+            throw new NotSupportedException($"GEMM accumulator variant {mode} exists only for the 128x128 ladder, not {VariantName}.");
+        string suffix = mode == GemmAccVariant.F16 ? "_xf16.spv" : "_xf16p256.spv";
+        built = Create(_device, _spvDir, _variant with { SpvFileName = "matmul_pq2_0_f32_gemm_ladder_128x128x4" + suffix });
+        built._isAccVariant = true;
+        _accVariants[mode] = built;
+        return built;
+    }
 
     /// <summary>Dispatches the GEMM synchronously.</summary>
     public void Launch(
@@ -440,6 +473,11 @@ public sealed class MatMulPQ2_0GemmF32Kernel : IDisposable
         if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n));
         if ((k % PQ2_0GroupSize) != 0)
             throw new ArgumentException($"k must be a multiple of {PQ2_0GroupSize}, got {k}", nameof(k));
+        if (AccVariant() is { } accVariant)
+        {
+            accVariant.Record(cmdBuf, weightsPQ2_0, inputB, outputC, m, k, n);
+            return;
+        }
 
         int blocksPerRow = k / PQ2_0GroupSize;
         long rowBytes = (long)blocksPerRow * PQ2_0GroupBytes;
@@ -491,6 +529,7 @@ public sealed class MatMulPQ2_0GemmF32Kernel : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        foreach (var v in _accVariants.Values) v.Dispose();
 
         if (_descriptorPool != 0)
             VulkanApi.vkDestroyDescriptorPool(_device.Handle, _descriptorPool, 0);

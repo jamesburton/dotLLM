@@ -1,0 +1,6 @@
+#version 450
+// Precision-study variant (issue #1109, experiment only): attention_flash_gqa_cm_kvf16 with QK_ACC_F16. Body: attention_flash_gqa_cm.glsl.
+#define KV_F16 1
+#define QK_ACC_F16 1
+#extension GL_GOOGLE_include_directive : require
+#include "attention_flash_gqa_cm.glsl"

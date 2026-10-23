@@ -240,7 +240,13 @@ public sealed class MatMulQ8_0GemmCoopmatKernel : IDisposable
                 "Check VulkanDevice.HasCooperativeMatrix before calling Create() and fall " +
                 "back to MatMulQ8_0GemmKernel when it is false.");
 
-        string path = Path.Combine(spvDir, variant.SpvFileName);
+        // Issue #1109 (experiment only): VulkanPrecisionExperiment.Gemm at creation swaps the blocked tile for its F16-accumulate
+        // twin and leaves out the split-K and F16-activation siblings (both F32-accumulate), so every shape takes the variant.
+        bool accVariant = VulkanPrecisionExperiment.Gemm != GemmAccVariant.Default
+            && variant.SpvFileName == Q8_0GemmCoopmatVariant.Blocked128x128x4.SpvFileName;
+        string path = Path.Combine(spvDir, accVariant
+            ? variant.SpvFileName.Replace(".spv", VulkanPrecisionExperiment.Gemm == GemmAccVariant.F16 ? "_xf16.spv" : "_xf16p256.spv", StringComparison.Ordinal)
+            : variant.SpvFileName);
         if (!File.Exists(path))
             throw new FileNotFoundException(
                 $"Vulkan SPIR-V not found: {path}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");
@@ -267,7 +273,7 @@ public sealed class MatMulQ8_0GemmCoopmatKernel : IDisposable
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
         var kernel = new MatMulQ8_0GemmCoopmatKernel(device, module, pipeline, pool, variant.TileM, variant.TileN);
-        if (variant.SpvFileName == Q8_0GemmCoopmatVariant.Blocked128x128x4.SpvFileName)
+        if (variant.SpvFileName == Q8_0GemmCoopmatVariant.Blocked128x128x4.SpvFileName && !accVariant)
         {
             kernel._splitK = CoopmatSplitK.TryCreate(device, spvDir, "matmul_q8_0_gemm_coopmat_128x128x4_splitk.spv",
                 QuantFormat.Q8_0BlockBytes, QuantFormat.LegacyGroupSize);
