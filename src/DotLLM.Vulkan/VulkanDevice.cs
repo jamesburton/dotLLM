@@ -1655,8 +1655,14 @@ public sealed class VulkanDevice : IDisposable
         private readonly uint _heapIndex;
         private readonly long _allocatedBytes;
 
+        // Sub-allocation (#1174): a buffer bound into another buffer's memory (a VulkanWeightArena slab)
+        // releases its slab reference instead of freeing memory; a slab frees its memory when the last
+        // reference (the arena's own, plus one per sub-buffer) goes.
+        private readonly Buffer? _slab;
+        private int _slabRefs;
+
         internal Buffer(VulkanDevice device, nint buffer, nint memory, long size, bool hostVisible,
-            uint heapIndex = 0, long allocatedBytes = 0)
+            uint heapIndex = 0, long allocatedBytes = 0, uint typeIndex = uint.MaxValue)
         {
             _device = device;
             _buffer = buffer;
@@ -1666,6 +1672,40 @@ public sealed class VulkanDevice : IDisposable
             IsHostVisible = hostVisible;
             _heapIndex = heapIndex;
             _allocatedBytes = allocatedBytes;
+            TypeIndex = typeIndex;
+        }
+
+        /// <summary>A sub-buffer: <paramref name="buffer"/> is bound to <paramref name="slab"/>'s memory at <paramref name="memoryOffset"/>.</summary>
+        internal Buffer(VulkanDevice device, nint buffer, Buffer slab, long memoryOffset, long size)
+        {
+            _device = device;
+            _buffer = buffer;
+            _memory = slab._memory;
+            Size = size;
+            MemoryOffset = memoryOffset;
+            TypeIndex = slab.TypeIndex;
+            _slab = slab;
+
+            // Never mapped directly: two sub-buffers of one slab share a VkDeviceMemory, which can only be
+            // mapped once, and a map at offset 0 would address the slab, not this buffer. Upload/Download stage instead.
+            IsHostVisible = false;
+            slab.AddSlabRef();
+        }
+
+        /// <summary>Memory type of the backing allocation; <see cref="uint.MaxValue"/> when unknown (imports).</summary>
+        internal uint TypeIndex { get; }
+
+        /// <summary>Byte offset of this buffer inside <see cref="Memory"/>; non-zero only for a sub-allocated buffer.</summary>
+        public long MemoryOffset { get; }
+
+        /// <summary>True when this buffer is bound into a shared slab (<see cref="VulkanWeightArena"/>).</summary>
+        internal bool IsSubAllocated => _slab is not null;
+
+        internal void AddSlabRef() => Interlocked.Increment(ref _slabRefs);
+
+        internal void ReleaseSlabRef()
+        {
+            if (Interlocked.Decrement(ref _slabRefs) == 0) Dispose();
         }
 
         internal Buffer(VulkanDevice device, HostVisibleBuffer hostImport)
@@ -1684,6 +1724,25 @@ public sealed class VulkanDevice : IDisposable
         /// <inheritdoc/>
         public void Dispose()
         {
+            if (_slab is not null)
+            {
+                if (_buffer == 0) return;
+                s_lifecycleLock.EnterReadLock();
+                try
+                {
+                    _device.RecordBufferDestroyed(_buffer);
+                    VulkanApi.vkDestroyBuffer(_device._device, _buffer, 0);
+                    _buffer = 0;
+                    _memory = 0;
+                }
+                finally
+                {
+                    s_lifecycleLock.ExitReadLock();
+                }
+                _slab.ReleaseSlabRef();
+                return;
+            }
+
             if (_hostImport is not null)
             {
                 // The import wrapper owns lifetime — destroying the buffer +
@@ -2039,6 +2098,25 @@ public sealed class VulkanDevice : IDisposable
         return sb.ToString();
     }
 
+    /// <summary>
+    /// <see cref="MemorySnapshot"/> plus this process's Windows <c>GPU Process Memory</c> counters on this adapter and the part of
+    /// them no allocation of ours explains (driver-internal memory: pipelines, descriptor pools, command buffers, shader scratch;
+    /// #1174). The counter read takes seconds on a busy box, so this is for the opt-in <c>DOTLLM_MEM_PROBE</c> lines only.
+    /// </summary>
+    public string MemoryProbeSnapshot()
+    {
+        string snap = MemorySnapshot();
+        if (DeviceLuid() is not { } luid || VulkanGpuMemoryCounters.ReadProcessUsage(luid) is not { } all) return snap;
+        int pid = Environment.ProcessId;
+        foreach (var p in all)
+        {
+            if (p.Pid != pid) continue;
+            return snap + $"; wddm(own) shared={p.SharedBytes / (1024 * 1024)} MiB dedicated={p.DedicatedBytes / (1024 * 1024)} MiB"
+                 + $" untracked={(p.TotalBytes - TotalLiveBytes()) / (1024 * 1024)} MiB";
+        }
+        return snap;
+    }
+
     /// <summary>Extra text for an out-of-device-memory failure: who else is holding GPU memory (#880). Empty for other results or when unknown.</summary>
     private string OtherProcessOomHint(int result)
     {
@@ -2095,6 +2173,12 @@ public sealed class VulkanDevice : IDisposable
     /// <summary>Process-wide wall time inside <c>vkAllocateMemory</c> on the primary path (#874 load-time diagnostic).</summary>
     internal static double AllocateMemoryMilliseconds => Interlocked.Read(ref s_allocateMemoryTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
 
+    /// <summary>Usage of every storage buffer this device creates (the arena's sub-buffers too).</summary>
+    internal const VkBufferUsageFlags BufferUsage = VkBufferUsageFlags.StorageBuffer
+        | VkBufferUsageFlags.TransferSrc
+        | VkBufferUsageFlags.TransferDst
+        | VkBufferUsageFlags.IndirectBuffer; // GPU-written dispatch arguments (grouped-MoE tile lists)
+
     private Buffer AllocateInternal(long bytes, bool deviceLocal, bool preferHostCached = false)
     {
         if (bytes <= 0) throw new ArgumentOutOfRangeException(nameof(bytes));
@@ -2113,10 +2197,7 @@ public sealed class VulkanDevice : IDisposable
         {
             sType = VkStructureType.BufferCreateInfo,
             size = (ulong)bytes,
-            usage = VkBufferUsageFlags.StorageBuffer
-                  | VkBufferUsageFlags.TransferSrc
-                  | VkBufferUsageFlags.TransferDst
-                  | VkBufferUsageFlags.IndirectBuffer,   // GPU-written dispatch arguments (grouped-MoE tile lists)
+            usage = BufferUsage,
             sharingMode = VkSharingMode.Exclusive,
         };
         VulkanApi.vkCreateBuffer(_device, bci, 0, out nint buffer)
@@ -2279,7 +2360,7 @@ public sealed class VulkanDevice : IDisposable
                 $"[vulkan-mem] alloc {req.size} B type={typeIndex} heap={heapIndex} at {TraceSite()} -> {MemorySnapshot()}");
         }
 
-        return new Buffer(this, buffer, memory, bytes, hostVisible, heapIndex, (long)req.size);
+        return new Buffer(this, buffer, memory, bytes, hostVisible, heapIndex, (long)req.size, typeIndex);
         }
         finally
         {

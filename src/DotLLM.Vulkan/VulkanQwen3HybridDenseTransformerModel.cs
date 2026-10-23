@@ -66,7 +66,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
 
     // Compute-dispatch gather for a token-embedding table kept packed on the device; null when the
     // table was widened to F32 and the vkCmdCopyBuffer row copy applies.
-    private readonly Pq2_0EmbedGatherF32Kernel? _embedGather;
+    private readonly EmbedGatherF32Kernel? _embedGather;
     private readonly VulkanGdnStateCache _gdnCache;
     private readonly VulkanQwen3MoeHybridKernels _kernels;
 
@@ -235,7 +235,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         int[] gdnLayerOrdinal,
         int ropeDim, float ropeTheta,
         VulkanHadamardRotation? hadamard,
-        Pq2_0EmbedGatherF32Kernel? embedGather,
+        EmbedGatherF32Kernel? embedGather,
         VulkanQwen3HybridDenseMtpWeights? mtpHead)
     {
         _mtpHead = mtpHead;
@@ -381,7 +381,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         }
 
         var weights = VulkanQwen3HybridDenseWeights.Upload(device, config, cpuLayers, outputNormWeight,
-            tokenEmbedPtr, tokenEmbedQt, outputPtr, outputQt, outputM, outputK);
+            tokenEmbedPtr, tokenEmbedQt, outputPtr, outputQt, outputM, outputK,
+            keepEmbedPacked: EmbedGatherF32Kernel.IsSupported(tokenEmbedQt, config.HiddenSize, spvDir));
 
         var state = new VulkanQwen3HybridDenseForwardState(device, config, gdn, initialSeqLen: 1);
         var gdnCache = new VulkanGdnStateCache(device, gdn, gdnOrdinal);
@@ -394,8 +395,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             ? VulkanHadamardRotation.Create(device, spvDir, fold, gdn)
             : null;
 
-        var embedGather = weights.TokenEmbeddingQuantType == QuantizationType.PQ2_0
-            ? Pq2_0EmbedGatherF32Kernel.Create(device, spvDir)
+        var embedGather = weights.TokenEmbeddingQuantType != QuantizationType.F32
+            ? EmbedGatherF32Kernel.Create(device, spvDir, weights.TokenEmbeddingQuantType)
             : null;
 
         // MTP head (issue #435). Only the GGUF path can carry one: the prebuilt-weights entry

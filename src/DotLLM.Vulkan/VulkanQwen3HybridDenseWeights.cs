@@ -95,7 +95,7 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
     private readonly LayerBuffers[] _layers;
     public LayerBuffers[] Layers => _layers;
 
-    /// <summary>The packed (PQ2_0) token-embedding buffer; <c>null</c> when the table is the widened F32 one.</summary>
+    /// <summary>The packed token-embedding buffer (PQ2_0, Q8_0, Q4_K or Q6_K; #1174); <c>null</c> when the table is the widened F32 one.</summary>
     public VulkanDevice.Buffer? TokenEmbedding { get; }
 
     /// <summary>
@@ -107,7 +107,7 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
 
     /// <summary>
     /// On-device layout of the token embedding: <c>F32</c> (<see cref="TokenEmbeddingRows"/>) for the
-    /// ordinary widened table, or <c>PQ2_0</c> (<see cref="TokenEmbedding"/>) when it is kept packed
+    /// ordinary widened table, or the packed source type (<see cref="TokenEmbedding"/>) when it is kept packed
     /// and gathered by a compute dispatch.
     /// </summary>
     public QuantizationType TokenEmbeddingQuantType { get; }
@@ -152,7 +152,8 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
         Qwen3HybridDenseLayerWeights[] cpuLayers,
         float[] outputNormWeight,
         nint tokenEmbedWeight, QuantizationType tokenEmbedQt,
-        nint outputWeight, QuantizationType outputQt, int outputOutputDim, int outputInputDim)
+        nint outputWeight, QuantizationType outputQt, int outputOutputDim, int outputInputDim,
+        bool keepEmbedPacked = false)
     {
         ArgumentNullException.ThrowIfNull(device);
         ArgumentNullException.ThrowIfNull(config);
@@ -171,8 +172,10 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
         // F32 layout. PQ2_0 is the exception, and not for tidiness: Bonsai 2's
         // token_embd [5120, 248320] widens to 5,085,593,600 bytes, which EXCEEDS Vulkan's 4 GiB
         // maxStorageBufferRange — the model simply cannot load widened. Kept packed it is ~339 MB
-        // and the gather runs as a compute dispatch (pq2_0_embed_gather_f32.comp) instead.
-        bool packedEmbed = tokenEmbedQt == QuantizationType.PQ2_0;
+        // and the gather runs as a compute dispatch (pq2_0_embed_gather_f32.comp) instead. Q8_0 / Q4_K / Q6_K tables stay
+        // packed too when the caller has their gather (keepEmbedPacked, #1174): Qwen3.8-27B's Q4_K table is 682 MiB packed
+        // and 4.85 GiB widened (#919).
+        bool packedEmbed = tokenEmbedQt == QuantizationType.PQ2_0 || keepEmbedPacked;
         VulkanDevice.Buffer? tokenEmbed = null;
         VulkanChunkedRowTable? tokenEmbedRows = null;
         QuantizationType tokenEmbedDeviceQt;
@@ -181,8 +184,8 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
         if (packedEmbed)
         {
             // Uploaded directly rather than through UploadProjectionMatrix: that helper's KeepNative
-            // table has no PQ2_0 arm, and widening here is not an option at this vocabulary size.
-            tokenEmbedBytes = DotLLM.Cpu.Kernels.Dequantize.RowByteSize(config.HiddenSize, QuantizationType.PQ2_0)
+            // table has no PQ2_0 arm, and the gather needs the source bytes unconverted.
+            tokenEmbedBytes = DotLLM.Cpu.Kernels.Dequantize.RowByteSize(config.HiddenSize, tokenEmbedQt)
                             * (long)config.VocabSize;
             // #508: kept packed means the device image IS the mmap'd bytes — on Bonsai 2
             // this single tensor is ~339 MB, so aliasing it rather than copying is worth
@@ -197,7 +200,7 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
                 staging.UploadBytes(tokenEmbedWeight, tokenEmbedBytes, tokenEmbed);
                 VulkanWeightImportPolicy.NoteStaged(tokenEmbedWeight, tokenEmbedBytes);
             }
-            tokenEmbedDeviceQt = QuantizationType.PQ2_0;
+            tokenEmbedDeviceQt = tokenEmbedQt;
         }
         else
         {
