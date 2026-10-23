@@ -1,0 +1,106 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_EXT_control_flow_attributes    : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// MoE INDEXED IQ2_XXS MMVQ decode GEMV, V2 (issue #991). Same math as moe_indexed_matmul_iq2_xxs_mmvq.comp (integer dp4a against the Q8_1 activation),
+// restructured for the decode memory system: a lane owns one 32-element sub-block (all four 8-element pairs) of one of FOUR blocks per step, so the
+// wave issues ~5x fewer load instructions per weight byte (v1: ~9 per block per lane, latency/issue bound at ~70-90 GB/s); sign application is a
+// multiply-and-mask over packed bytes instead of per-byte loops. 2-D dispatch: x = m, y = n; one wave32 per output cell. Bindings: 0 bank, 1 xq,
+// 2 xds, 3 indices, 4 y, 5 iq2xxs grid (256 x 8 magnitudes), 6 ksigns (unused).
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW    { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq   { uint  xq[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds  { vec2  xds[]; };
+layout(set = 0, binding = 3, std430) readonly  buffer BufIdx  { int   indices[]; };
+layout(set = 0, binding = 4, std430) writeonly buffer BufY    { float y[]; };
+layout(set = 0, binding = 5, std430) readonly  buffer BufGrid { uint  grid[]; };
+// binding 6 (ksigns) is part of the pipeline layout but unused here: the sign byte is index | (parity(index) << 7) by construction.
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+    uint numExperts;
+    uint blocksPerRow; // K / 256
+    uint xDiv;         // activation row = n / xDiv
+} pc;
+
+const uint BLOCK_BYTES = 66u;
+
+// 8 sub-block bytes (a0, a1) at an absolute byte offset p that is 0 or 2 mod 4. The third word is only read when it is needed (p % 4 == 2).
+// Like V1's read4Bytes, that word can extend 2 bytes past the end of a block (for the last sub-block it is the next block's first bytes, or, in
+// the very last block of a bank, bytes past the bank: bank allocations are word-granular and the extra bytes are discarded by the shifts).
+void load8(uint p, out uint a0, out uint a1) {
+    uint pw = p >> 2u;
+    uint w0 = weight[pw];
+    uint w1 = weight[pw + 1u];
+    if ((p & 2u) != 0u) {
+        uint w2 = weight[pw + 2u];
+        a0 = (w0 >> 16u) | (w1 << 16u);
+        a1 = (w1 >> 16u) | (w2 << 16u);
+    } else {
+        a0 = w0;
+        a1 = w1;
+    }
+}
+
+uint load16(uint byteOff) {   // 2-byte aligned
+    return (weight[byteOff >> 2u] >> ((byteOff & 2u) << 3u)) & 0xFFFFu;
+}
+
+// +/- grid bytes: sign bit j of `signs` (bits 0..3 -> lo word, 4..7 -> hi word) negates grid byte j (magnitudes are <= 43: no inter-byte carry).
+uvec2 signedGrid(uint gridIdx, uint signs) {
+    uint gLo = grid[2u * gridIdx], gHi = grid[2u * gridIdx + 1u];
+    uint mLo = ((signs & 0xFu) * 0x00204081u) & 0x01010101u;
+    uint mHi = ((signs >> 4u) * 0x00204081u) & 0x01010101u;
+    return uvec2((gLo ^ (mLo * 0xFFu)) + mLo, (gHi ^ (mHi * 0xFFu)) + mHi);
+}
+
+uint signByte(uint idx7) { return idx7 | ((bitCount(idx7) & 1u) << 7u); }
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    uint n = gl_WorkGroupID.y;
+    if (m >= pc.M || n >= pc.N) return;
+    uint expert = uint(indices[n]);
+    if (expert >= pc.numExperts) return;
+
+    uint lane = gl_LocalInvocationID.x;
+    uint bq = lane >> 3u;                 // block within a 4-block step
+    uint ib = lane & 7u;                  // sub-block 0..7 (32 elements = 4 pairs of 8)
+    uint rowByteBase = (expert * pc.M + m) * pc.blocksPerRow * BLOCK_BYTES;
+    uint xRow       = n / pc.xDiv;
+    uint xqRowBase  = xRow * (pc.K >> 2u);
+    uint xdsRowBase = xRow * (pc.K >> 5u);
+    float acc = 0.0;
+
+    for (uint chunk = 0u; chunk < pc.blocksPerRow; chunk += 16u) {
+        [[unroll]] for (uint s = 0u; s < 4u; s++) {
+            uint blkRaw = chunk + s * 4u + bq;
+            if (blkRaw >= pc.blocksPerRow) continue;
+            uint base = rowByteBase + blkRaw * BLOCK_BYTES;
+            uint xqi = xqRowBase + blkRaw * 64u + ib * 8u;
+            float dX = xds[xdsRowBase + blkRaw * 8u + ib].x;
+            float d = unpackHalf2x16(load16(base)).x;
+            uint a0, a1;
+            load8(base + 2u + 8u * ib, a0, a1);
+            int dotI = 0;
+            [[unroll]] for (uint l = 0u; l < 4u; l++) {
+                uint gridIdx = (a0 >> (8u * l)) & 0xFFu;
+                uint signs = signByte((a1 >> (7u * l)) & 0x7Fu);
+                uvec2 w = signedGrid(gridIdx, signs);
+                dotI = dotPacked4x8AccSatEXT(int(w.x), int(xq[xqi + 2u * l]), dotI);
+                dotI = dotPacked4x8AccSatEXT(int(w.y), int(xq[xqi + 2u * l + 1u]), dotI);
+            }
+            float db = d * (0.5 + float(a1 >> 28u)) * 0.25;
+            acc += db * (dX * float(dotI));
+        }
+    }
+
+    float total = subgroupAdd(acc);
+    if (subgroupElect())
+        y[n * pc.M + m] = total;
+}

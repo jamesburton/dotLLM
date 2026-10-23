@@ -1,0 +1,118 @@
+#version 450
+// PrismML blockwise normalized Walsh-Hadamard activation transform (prism.hadamard.*).
+//
+// Bonsai 2 stores its ternary weights in a rotated basis, so every folded weight's input
+// activation must be rotated to match before the matmul. This shader is that rotation, and it is
+// the GPU twin of DotLLM.Cpu.Kernels.Hadamard — the CPU kernel is the parity oracle.
+//
+// Operator: a Sylvester-ordered Walsh-Hadamard transform scaled by 1/sqrt(blockSize), applied
+// independently to each contiguous blockSize-wide block of a row. Equivalently a dense multiply by
+// H where H[r,c] = +/-1/sqrt(n) with the sign given by the parity of popcount(r & c) — but computed
+// as an in-place butterfly, so the rotation matrix is never materialized and no weight bytes move.
+// Cost is O(n log n) over the activation alone.
+//
+// Three composable steps, in an order that DIFFERS between the two directions:
+//
+//   forward (a folded weight's input):   [optional GDN permute] -> signs -> FWHT
+//   inverse (a rotated lookup row):      FWHT -> signs
+//
+// The inverse order is not a mistake: the rotation is its own inverse, so (H.S)^-1 = S.H. Applying
+// the signs on the wrong side is silent corruption, not a crash.
+//
+// The GDN permute (prism.hadamard.gdn_v_grouped, *.ssm_out.weight only) reorders value heads from
+// the recurrence's tiled order vh = k + nKHead*r into the grouped order vh' = r + rep*k that the
+// fold was computed in. It is folded into the LOAD as an index remap rather than run as a separate
+// pass, and it reaches across block boundaries within the row (a head is 128 wide, a block 1024).
+//
+// Dispatch:
+//   gl_WorkGroupID.x = block index within the row (0 .. blocksPerRow-1)
+//   gl_WorkGroupID.y = row index (0 .. rows-1)
+// One workgroup owns one blockSize-wide block; blockSize must be a power of two and <= MAX_BLOCK.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufSrc   { float src[];   };
+layout(set = 0, binding = 1, std430) writeonly buffer BufDst   { float dst[];   };
+layout(set = 0, binding = 2, std430) readonly  buffer BufSigns { float signs[]; }; // [width], +/-1
+
+layout(push_constant) uniform PushConstants {
+    uint rows;          // token rows
+    uint width;         // full row width (multiple of blockSize)
+    uint blockSize;     // Hadamard block width, power of two
+    uint blocksPerRow;  // width / blockSize
+    uint applySigns;    // 0 = identity sign step
+    uint inverse;       // 0 = signs before FWHT (forward), 1 = signs after (inverse)
+    uint permute;       // 1 = GDN tiled -> grouped value-head remap on load
+    uint permDState;    // head width for the permute (128)
+    uint permNKHead;    // key heads (16)
+    uint permRep;       // value heads per key head (3)
+} pc;
+
+const uint MAX_BLOCK = 1024u;
+shared float s[MAX_BLOCK];
+
+void main() {
+    uint row = gl_WorkGroupID.y;
+    uint blk = gl_WorkGroupID.x;
+    if (row >= pc.rows || blk >= pc.blocksPerRow) return;
+
+    uint n        = pc.blockSize;
+    uint rowBase  = row * pc.width;
+    uint blockOff = blk * n;
+    uint tid      = gl_LocalInvocationID.x;
+    uint threads  = gl_WorkGroupSize.x;
+
+    // 1/sqrt(n) is folded into the load so it costs no extra pass; combined with the sign flip it
+    // is a single multiply per element on the way into shared memory.
+    float scale = inversesqrt(float(n));
+
+    for (uint i = tid; i < n; i += threads) {
+        uint col = blockOff + i;              // column within the row, post-permute
+
+        uint srcCol = col;
+        if (pc.permute != 0u) {
+            // dest head dh reads source head (dh / rep) + nKHead * (dh % rep)
+            uint dh   = col / pc.permDState;
+            uint lane = col - dh * pc.permDState;
+            uint srcHead = (dh / pc.permRep) + pc.permNKHead * (dh % pc.permRep);
+            srcCol = srcHead * pc.permDState + lane;
+        }
+
+        float v = src[rowBase + srcCol];
+
+        // Forward applies signs before the butterflies; inverse applies them after, below.
+        if (pc.applySigns != 0u && pc.inverse == 0u) {
+            v *= signs[col];
+        }
+
+        s[i] = v * scale;
+    }
+    barrier();
+
+    // Sylvester-ordered butterfly passes. Every pass is a full shared-memory sweep, so each needs a
+    // barrier on both sides: the reads of pass k+1 must not race the writes of pass k.
+    for (uint len = 1u; len < n; len <<= 1u) {
+        // n/2 butterflies per pass, spread over the workgroup.
+        for (uint b = tid; b < (n >> 1u); b += threads) {
+            uint blockIdx = b / len;          // which 2*len-wide span
+            uint j        = b - blockIdx * len;
+            uint i0       = blockIdx * (len << 1u) + j;
+            uint i1       = i0 + len;
+
+            float u = s[i0];
+            float v = s[i1];
+            s[i0] = u + v;
+            s[i1] = u - v;
+        }
+        barrier();
+    }
+
+    for (uint i = tid; i < n; i += threads) {
+        uint col = blockOff + i;
+        float v = s[i];
+        if (pc.applySigns != 0u && pc.inverse != 0u) {
+            v *= signs[col];
+        }
+        dst[rowBase + col] = v;
+    }
+}

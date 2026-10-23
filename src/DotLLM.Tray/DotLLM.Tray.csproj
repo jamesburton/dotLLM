@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <OutputType>WinExe</OutputType>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AssemblyName>dotllm-tray</AssemblyName>
+    <RootNamespace>DotLLM.Tray</RootNamespace>
+    <IsPackable>false</IsPackable>
+
+    <!-- WinForms is not trim-safe or AOT-safe (designer serialization and control activation are
+         reflection-driven), so the trim analyzer inherited from src/Directory.Build.props would
+         report findings that cannot be fixed. The tray publishes self-contained single-file
+         WITHOUT trimming — see docs/TRAY.md for why that is the right packaging here. -->
+    <IsTrimmable>false</IsTrimmable>
+    <EnableTrimAnalyzer>false</EnableTrimAnalyzer>
+    <PublishTrimmed>false</PublishTrimmed>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DotLLM.Tray.Core\DotLLM.Tray.Core.csproj" />
+  </ItemGroup>
+
+</Project>

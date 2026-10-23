@@ -1,0 +1,156 @@
+#version 450
+// Per-head batched Q8_0 GEMM for absorbed MLA (issue #913).
+//
+//   out[t, h, m] = sum_k  W[h*M + m, k] * x[t, h, k]          (W: Q8_0 rows, K contiguous per row)
+//
+// Used twice per layer:
+//   * query absorption:  W = attn_k_b  (per head [kvLoraRank rows x qkNope]),  x = q_nope[t,h,:],   out = q_abs[t,h,0..kvLoraRank)
+//   * value up-project:  W = attn_v_b  (per head [vHead rows x kvLoraRank]),   x = latent_out[t,h,:], out = attn_out[t,h,:]
+//
+// When ropeDim > 0 the workgroups of row-tile 0 additionally rotate q_pe (interleaved-pair RoPE, same angle math as
+// rope_mla_f32.comp) from x-row offset ropeSrcOff to out-row offset ropeDstOff, so the absorbed query row
+// [q_abs | rope(q_pe)] is complete after ONE dispatch.
+//
+// Tiling: one thread per weight row (128 rows / workgroup), TT = 8 tokens per workgroup so every dequantised weight is
+// reused 8x. The x tile is staged token-minor in LDS (xs[k*2 + {0,1}] = vec4 of 4 tokens), so the inner loop is
+// 8 FMA + 2 broadcast LDS reads per weight element. Decode (1 token) wastes 7/8 of the FMAs but is bandwidth-bound on
+// the (small) per-head weights anyway.
+//
+// Dispatch: groups.x = numHeads * ceil(M/128), groups.y = ceil(seqLen / TT)
+
+#define TT     8
+#define WG     128
+#define MAX_K  512
+
+layout(local_size_x = WG, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW   { uint  weight[]; };    // Q8_0 blocks (34 B each)
+layout(set = 0, binding = 1, std430) readonly  buffer BufX   { float x[]; };
+layout(set = 0, binding = 2, std430)           buffer BufOut { float outp[]; };
+layout(set = 0, binding = 3, std430) readonly  buffer BufPos { int   positions[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint  M;
+    uint  K;
+    uint  numHeads;
+    uint  seqLen;
+    uint  xTokStride;
+    uint  xHeadStride;
+    uint  outTokStride;
+    uint  outHeadStride;
+    uint  ropeDim;        // 0 = no rope pack
+    uint  ropeSrcOff;     // offset (floats) inside the x head row of q_pe
+    uint  ropeDstOff;     // offset (floats) inside the out head row for rotated q_pe
+    float theta;
+} pc;
+
+shared vec4 xs[MAX_K * 2];
+
+void sincosRed(float a, out float c, out float s) {
+    float k = floor(a * 0.15915494309189535 + 0.5);
+    float r = fma(-k, 6.28318548202514648, a);
+    r = fma(k, 1.7484556e-7, r);
+    c = cos(r);
+    s = sin(r);
+}
+
+float halfToFloat(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint bi = absByteOff & 3u;
+    uint h16;
+    if (bi <= 2u) {
+        h16 = (u >> (bi * 8u)) & 0xFFFFu;
+    } else {
+        h16 = ((u >> 24) & 0xFFu) | ((weight[(absByteOff >> 2u) + 1u] & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(h16).x;
+}
+
+void main() {
+    uint rowTiles = (pc.M + uint(WG) - 1u) / uint(WG);
+    uint h  = gl_WorkGroupID.x / rowTiles;
+    uint rt = gl_WorkGroupID.x - h * rowTiles;
+    uint t0 = gl_WorkGroupID.y * uint(TT);
+    uint tid = gl_LocalInvocationID.x;
+
+    // Stage the x tile. xs[k*2 + 0] = tokens 0..3, xs[k*2 + 1] = tokens 4..7 at contraction index k.
+    for (uint idx = tid; idx < uint(TT) * pc.K; idx += uint(WG)) {
+        uint tt = idx / pc.K;
+        uint k  = idx - tt * pc.K;
+        uint t  = t0 + tt;
+        float v = (t < pc.seqLen) ? x[t * pc.xTokStride + h * pc.xHeadStride + k] : 0.0;
+        xs[k * 2u + (tt >> 2u)][tt & 3u] = v;
+    }
+
+    // Rope-pack q_pe for this (head, token tile); only row-tile 0 does it.
+    if (pc.ropeDim != 0u && rt == 0u) {
+        uint halfRope = pc.ropeDim >> 1u;
+        for (uint idx = tid; idx < uint(TT) * halfRope; idx += uint(WG)) {
+            uint tt = idx / halfRope;
+            uint p  = idx - tt * halfRope;
+            uint t  = t0 + tt;
+            if (t < pc.seqLen) {
+                float expn  = float(2u * p) / float(pc.ropeDim);
+                float freq  = 1.0 / pow(pc.theta, expn);
+                float angle = float(positions[t]) * freq;
+                float c, s;
+                sincosRed(angle, c, s);
+                uint src = t * pc.xTokStride + h * pc.xHeadStride + pc.ropeSrcOff + 2u * p;
+                float v0 = x[src];
+                float v1 = x[src + 1u];
+                uint dst = t * pc.outTokStride + h * pc.outHeadStride + pc.ropeDstOff + 2u * p;
+                outp[dst]      = v0 * c - v1 * s;
+                outp[dst + 1u] = v0 * s + v1 * c;
+            }
+        }
+    }
+    barrier();
+
+    uint m = rt * uint(WG) + tid;
+    if (m >= pc.M) return;
+
+    uint blocksPerRow = pc.K >> 5u;
+    uint rowByteBase = (h * pc.M + m) * (blocksPerRow * 34u);
+
+    vec4 accA = vec4(0.0);
+    vec4 accB = vec4(0.0);
+
+    for (uint b = 0u; b < blocksPerRow; b++) {
+        uint blockByteBase = rowByteBase + b * 34u;
+        float d = halfToFloat(blockByteBase);
+        uint q = blockByteBase + 2u;
+        uint ubase = q >> 2u;
+        uint ph = q & 3u;
+        uint prev = (ph == 0u) ? 0u : weight[ubase];
+        vec4 bA = vec4(0.0);
+        vec4 bB = vec4(0.0);
+        uint kb = b << 5u;
+        for (uint g = 0u; g < 8u; g++) {
+            uint cur;
+            if (ph == 0u) {
+                cur = weight[ubase + g];
+            } else {
+                uint nxt = weight[ubase + g + 1u];
+                cur = (prev >> 16u) | (nxt << 16u);
+                prev = nxt;
+            }
+            int p = int(cur);
+            uint kk = (kb + (g << 2u)) * 2u;
+            float w0 = float(bitfieldExtract(p,  0, 8));
+            float w1 = float(bitfieldExtract(p,  8, 8));
+            float w2 = float(bitfieldExtract(p, 16, 8));
+            float w3 = float(bitfieldExtract(p, 24, 8));
+            bA += w0 * xs[kk]      + w1 * xs[kk + 2u] + w2 * xs[kk + 4u] + w3 * xs[kk + 6u];
+            bB += w0 * xs[kk + 1u] + w1 * xs[kk + 3u] + w2 * xs[kk + 5u] + w3 * xs[kk + 7u];
+        }
+        accA += d * bA;
+        accB += d * bB;
+    }
+
+    uint outBase = h * pc.outHeadStride + m;
+    for (uint tt = 0u; tt < uint(TT); tt++) {
+        uint t = t0 + tt;
+        if (t < pc.seqLen)
+            outp[t * pc.outTokStride + outBase] = (tt < 4u) ? accA[tt] : accB[tt - 4u];
+    }
+}
