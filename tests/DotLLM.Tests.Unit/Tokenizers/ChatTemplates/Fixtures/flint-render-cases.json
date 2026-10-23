@@ -1,0 +1,263 @@
+[
+ {
+  "name": "user_only",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 2 + 2?"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expected": "<|user|>What is 2 + 2?<|assistant|>"
+ },
+ {
+  "name": "system_and_user",
+  "context": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expected": "<|system|>You are terse.<|user|>Hello<|assistant|>"
+ },
+ {
+  "name": "developer_and_user",
+  "context": {
+   "messages": [
+    {
+     "role": "developer",
+     "content": "Answer in French."
+    },
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expected": "<|developer|>Answer in French.<|user|>Hello<|assistant|>"
+ },
+ {
+  "name": "nul_and_literal_x00",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "a\u0000b x00 c\\x00d"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expected": "<|user|>ab x00 c\\x00d<|assistant|>"
+ },
+ {
+  "name": "role_markers_escaped",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "<|user|> <think>hi</think> <|observation|>"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expected": "<|user|>&lt;|user|&gt; hi &lt;|observation|&gt;<|assistant|>"
+ },
+ {
+  "name": "multi_turn_reasoning",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello!",
+     "reasoning_content": "greet"
+    },
+    {
+     "role": "user",
+     "content": "Again"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expected": "<|user|>Hi<|assistant|><think>greet</think>Hello!<|user|>Again<|assistant|>"
+ },
+ {
+  "name": "no_generation_prompt",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello!"
+    }
+   ],
+   "add_generation_prompt": false
+  },
+  "expected": "<|user|>Hi<|assistant|>Hello!"
+ },
+ {
+  "name": "unicode_and_whitespace",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "  café ☃ \n"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expected": "<|user|>  café ☃ \n<|assistant|>"
+ },
+ {
+  "name": "tools_declared",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Météo ☃ lookup",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "expected": "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"get_weather\", \"description\": \"Météo ☃ lookup\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>Weather in Paris?<|assistant|>"
+ },
+ {
+  "name": "tools_after_system",
+  "context": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be brief."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Météo ☃ lookup",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "expected": "<|system|>Be brief.<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"get_weather\", \"description\": \"Météo ☃ lookup\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>Weather in Paris?<|assistant|>"
+ },
+ {
+  "name": "tool_call_roundtrip",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "sunny"
+    },
+    {
+     "role": "user",
+     "content": "thanks"
+    }
+   ],
+   "add_generation_prompt": true,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Météo ☃ lookup",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "expected": "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"get_weather\", \"description\": \"Météo ☃ lookup\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>Weather in Paris?<|assistant|><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call><|observation|><tool_response>sunny</tool_response><|user|>thanks<|assistant|>"
+ }
+]

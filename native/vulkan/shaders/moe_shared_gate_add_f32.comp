@@ -1,0 +1,46 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Fused shared-expert gate + sigmoid-gated add for the MoE prefill (issue #693):
+//
+//   logit[t]  = dot(x[t, :], wg[:])                       (the 1 x hidden shared_expert_gate matmul)
+//   out[t, h] += sigmoid(logit[t]) * b[t, h]
+//
+// Replaces a [seqLen x 1] F32 GEMM (a 64-workgroup grid at M = 1: ~0.5 ms per layer at 2048 tokens) plus a scalar-per-element gated add
+// (~1 ms per layer) with one pass: one workgroup per token, 256 threads, vec4 traffic. The dot is reduced in a different order than the
+// GEMM's, so the scale differs by an F32 ulp or so; equivalent, not bit-identical.
+//
+// Dispatch: groupCount.x = seqLen. hiddenSize % 4 == 0.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430)          buffer BufOut { vec4 o4[]; };
+layout(set = 0, binding = 1, std430) readonly buffer BufB   { vec4 b4[]; };
+layout(set = 0, binding = 2, std430) readonly buffer BufX   { vec4 x4[]; };
+layout(set = 0, binding = 3, std430) readonly buffer BufWg  { vec4 w4[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seqLen;
+    uint hiddenSize;
+} pc;
+
+shared float red[64];
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    if (t >= pc.seqLen) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint h4 = pc.hiddenSize >> 2u;
+    uint base = t * h4;
+
+    float part = 0.0;
+    for (uint i = tid; i < h4; i += 256u) part += dot(x4[base + i], w4[i]);
+    float sg = subgroupAdd(part);
+    if (subgroupElect()) red[gl_SubgroupID] = sg;
+    barrier();
+    float total = 0.0;
+    for (uint s = 0u; s < gl_NumSubgroups; s++) total += red[s];
+    float scale = 1.0 / (1.0 + exp(-total));
+
+    for (uint i = tid; i < h4; i += 256u) o4[base + i] += scale * b4[base + i];
+}

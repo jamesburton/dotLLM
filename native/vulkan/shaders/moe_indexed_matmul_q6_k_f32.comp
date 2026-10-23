@@ -1,0 +1,150 @@
+#version 450
+// MoE indexed expert matmul over a packed Q6_K expert bank.
+//
+//   y[n, m] = sum_k dequant_q6k(bank[indices[n], m, k]) * x[n, k]
+//
+// Layout of `bank` is [numExperts, M, K] row-major. Each row holds (K / 256)
+// Q6_K super-blocks of 210 bytes:
+//     bytes [0..127]   = ql[128]   (low 4 bits, two per byte)
+//     bytes [128..191] = qh[64]    (high 2 bits per element, four per byte)
+//     bytes [192..207] = scales[16] (int8, signed, one per 16-element sub-block)
+//     bytes [208,209]  = fp16 d    (global super-block delta)
+// Row stride = (K / 256) * 210 bytes. Note: 210 is NOT a multiple of 4, so the
+// per-byte / per-fp16 readers must handle straddled uint words.
+//
+// Sibling of moe_indexed_matmul_q8_0_f32.comp — same dispatch shape (one
+// thread per output cell, 16x16 workgroup tile, per-row expert lookup) and
+// same interface (BufBank / BufX / BufIdx / BufY) — only the per-row dequant
+// kernel differs. Reused for all three expert projections in a Qwen3MoeHybrid
+// SwiGLU MLP (gate W1, up W3, down W2).
+//
+// Per-row dequant follows DotLLM.Cpu.Kernels.DequantizeKQuants.DequantizeQ6_KScalar
+// byte-for-byte and matches the dense matmul_q6_k_gemv_f32.comp inner loop:
+//   For every super-block we walk 8 chunks (2 halves x 4 groups) of 32
+//   elements each, reconstructing q6 = (nibble | (high2 << 4)) - 32 and
+//   multiplying by the per-16-element scale and the per-block fp16 delta.
+//
+// Dispatch: 2D grid, one thread per output cell (n, m). Workgroup (16, 16).
+//   groupCount = (ceil(M/16), ceil(N/16)).
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufBank { uint  bank[]; };  // Q6_K blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufX    { float x[]; };     // [N * K]
+layout(set = 0, binding = 2, std430) readonly  buffer BufIdx  { int   indices[]; };// [N]
+layout(set = 0, binding = 3, std430) writeonly buffer BufY    { float y[]; };     // [N * M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // output dim   (per-expert weight row count)
+    uint K;             // input dim    (per-expert weight col count, multiple of 256)
+    uint N;             // total rows   (typically seqLen * topK)
+    uint numExperts;    // bank's first axis size — bounds-check only
+    uint blocksPerRow;  // = K / 256
+} pc;
+
+const uint Q6K_BLOCK_BYTES = 210u;
+const uint Q6K_GROUP_SIZE  = 256u;
+const uint NUM_SUBBLOCKS   = 8u;        // chunks per super-block (2 halves x 4 groups)
+const uint SUBBLOCK        = 32u;       // K-chunk size
+
+uint readByte(uint absByteOff) {
+    uint u = bank[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+// Sign-extended int8.
+int readSByte(uint absByteOff) {
+    uint b = readByte(absByteOff);
+    return int(b) - int((b & 0x80u) << 1);
+}
+
+// fp16 read with 4-byte straddle handling — Q6_K's 210-byte block stride means
+// `d` at offset (blockBase + 208) is generally NOT 4-byte aligned.
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = bank[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = bank[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+void main() {
+    uint m = gl_GlobalInvocationID.x; // 0..M
+    uint n = gl_GlobalInvocationID.y; // 0..N
+    if (m >= pc.M || n >= pc.N) return;
+
+    // Per-row expert selection. A negative or out-of-range index would be
+    // a routing bug; clamp to 0 to avoid a UB read but the math will be
+    // wrong if it ever fires.
+    int rawIdx = indices[n];
+    uint expertIdx = uint(clamp(rawIdx, 0, int(pc.numExperts) - 1));
+
+    uint rowByteStride    = pc.blocksPerRow * Q6K_BLOCK_BYTES;
+    uint matrixByteStride = pc.M * rowByteStride;
+    uint rowByteBase      = expertIdx * matrixByteStride + m * rowByteStride;
+    uint xRowBase         = n * pc.K;
+
+    float acc = 0.0;
+
+    // For each super-block: 8 chunks of 32 elements; each chunk has its own
+    // (half, group)-derived ql / qh / scale lookups. Within a chunk the first
+    // 16 elements share scale `sc0`, the next 16 share `sc1`. Mirrors the
+    // chunked fold in matmul_q6_k_gemv_f32.comp.
+    for (uint b = 0u; b < pc.blocksPerRow; b++) {
+        uint blockByteBase = rowByteBase + b * Q6K_BLOCK_BYTES;
+        uint qlBase     = blockByteBase;            //   0
+        uint qhBase     = blockByteBase + 128u;     // 128
+        uint scalesBase = blockByteBase + 192u;     // 192
+        float d         = readHalf(blockByteBase + 208u);
+
+        uint xBase = xRowBase + b * Q6K_GROUP_SIZE;
+
+        for (uint chunk = 0u; chunk < NUM_SUBBLOCKS; chunk++) {
+            uint hf      = chunk >> 2u;             // 0..1 — super-block half
+            uint group   = chunk & 3u;              // 0..3
+            uint qlOff   = hf * 64u;
+            uint qhOff   = hf * 32u;
+            uint scOff   = hf * 8u;
+            uint shift   = group * 2u;
+            bool useHigh = (group >= 2u);           // groups 2,3 take ql high nibble
+            uint qlLane  = (group & 1u) * 32u;      // groups 0,2 -> +0; groups 1,3 -> +32
+
+            uint outBase = xBase + chunk * SUBBLOCK;
+
+            int sc0 = readSByte(scalesBase + scOff + 0u + 2u * group);
+            int sc1 = readSByte(scalesBase + scOff + 1u + 2u * group);
+            float scF0 = d * float(sc0);
+            float scF1 = d * float(sc1);
+
+            float subSum = 0.0;
+            // First 16 elements (isc=0)
+            for (uint i = 0u; i < 16u; i++) {
+                uint qlByte = readByte(qlBase + qlOff + qlLane + i);
+                uint qhByte = readByte(qhBase + qhOff + i);
+                uint nibble = useHigh ? (qlByte >> 4u) : (qlByte & 0xFu);
+                uint high2  = (qhByte >> shift) & 3u;
+                int q6 = int(nibble | (high2 << 4u)) - 32;
+                subSum += x[outBase + i] * (scF0 * float(q6));
+            }
+            // Next 16 elements (isc=1)
+            for (uint i = 16u; i < 32u; i++) {
+                uint qlByte = readByte(qlBase + qlOff + qlLane + i);
+                uint qhByte = readByte(qhBase + qhOff + i);
+                uint nibble = useHigh ? (qlByte >> 4u) : (qlByte & 0xFu);
+                uint high2  = (qhByte >> shift) & 3u;
+                int q6 = int(nibble | (high2 << 4u)) - 32;
+                subSum += x[outBase + i] * (scF1 * float(q6));
+            }
+            acc += subSum;
+        }
+    }
+
+    y[n * pc.M + m] = acc;
+}

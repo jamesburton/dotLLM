@@ -56,6 +56,30 @@ body {
 
 /* Message content typography */
 .msg-content p { margin: 0.25rem 0; }
+
+/* Collapsible reasoning ("thinking") block above an assistant answer (#767). */
+.reasoning-block {
+    margin: 0.25rem 0 0.5rem;
+    border-left: 2px solid #3f3f46;
+    padding-left: 0.6rem;
+}
+.reasoning-summary {
+    cursor: pointer;
+    font-size: 0.7rem;
+    color: #a1a1aa;
+    user-select: none;
+}
+.reasoning-body {
+    margin-top: 0.25rem;
+    font-size: 0.75rem;
+    line-height: 1.4;
+    color: #a1a1aa;
+    white-space: pre-wrap;
+    max-height: 18rem;
+    overflow-y: auto;
+}
+html.light .reasoning-block { border-left-color: #d4d4d8; }
+html.light .reasoning-summary, html.light .reasoning-body { color: #52525b; }
 .msg-content strong { color: #e4e4e7; font-weight: 600; }
 .msg-content ul, .msg-content ol { padding-left: 1.5rem; margin: 0.25rem 0; }
 .msg-content li { margin: 0.125rem 0; }

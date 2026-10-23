@@ -32,6 +32,12 @@
     <MinVerDefaultPreReleaseIdentifiers>preview.0</MinVerDefaultPreReleaseIdentifiers>
   </PropertyGroup>
 
+  <!-- Builds from a fork's Actions point the package/SourceLink repository at that fork, not at upstream. -->
+  <PropertyGroup Condition="'$(GITHUB_ACTIONS)' == 'true' and '$(GITHUB_REPOSITORY)' != ''">
+    <RepositoryUrl>https://github.com/$(GITHUB_REPOSITORY)</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/$(GITHUB_REPOSITORY)</PackageProjectUrl>
+  </PropertyGroup>
+
   <!-- Deterministic, reproducible builds when running on GitHub Actions.
        Normalizes source paths in embedded PDBs / SourceLink mappings. -->
   <PropertyGroup Condition="'$(GITHUB_ACTIONS)' == 'true'">

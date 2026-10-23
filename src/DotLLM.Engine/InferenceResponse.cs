@@ -30,4 +30,16 @@ public record InferenceResponse
 
     /// <summary>Parsed tool calls from the generated text. Null if no tool calls were detected.</summary>
     public ToolCall[]? ToolCalls { get; init; }
+
+    /// <summary>
+    /// The stop string that ended generation, or <see langword="null"/> when generation ended for
+    /// any other reason (EOS, max-tokens, cancellation).
+    /// </summary>
+    /// <remarks>
+    /// Reported explicitly because <see cref="Text"/> has already had the match trimmed off, so a
+    /// caller cannot recover it by testing the text — which is precisely what the Anthropic
+    /// <c>stop_sequence</c> mapping used to do, silently and correctly, back when stop strings
+    /// never fired at all (#459).
+    /// </remarks>
+    public string? MatchedStopSequence { get; init; }
 }

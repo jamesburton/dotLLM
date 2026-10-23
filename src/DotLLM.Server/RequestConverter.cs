@@ -37,6 +37,7 @@ public static class RequestConverter
                 Content = d.Content ?? "",
                 ToolCalls = toolCalls,
                 ToolCallId = d.ToolCallId,
+                ReasoningContent = d.ReasoningContent ?? d.Reasoning,
             };
         }
         return result;
@@ -68,14 +69,19 @@ public static class RequestConverter
     {
         var allStops = new List<string>(stopSequences);
         AddRequestStopSequences(allStops, request.Stop);
+        if (defaults.StopSequences is { Count: > 0 } profileStops) allStops.AddRange(profileStops.Where(x => !allStops.Contains(x)));
 
-        return new InferenceOptions
+        var options = new InferenceOptions
         {
             Temperature = request.Temperature ?? defaults.Temperature,
             TopK = request.TopK ?? defaults.TopK,
             TopP = request.TopP ?? defaults.TopP,
             MinP = request.MinP ?? defaults.MinP,
             RepetitionPenalty = request.RepetitionPenalty ?? defaults.RepetitionPenalty,
+            FrequencyPenalty = request.FrequencyPenalty ?? 0f,
+            PresencePenalty = request.PresencePenalty ?? 0f,
+            LogitBias = ParseLogitBias(request.LogitBias),
+            TopNSigma = request.TopNSigma ?? -1f,
             MaxTokens = request.MaxTokens ?? defaults.MaxTokens,
             Seed = request.Seed ?? defaults.Seed,
             StopSequences = allStops,
@@ -84,6 +90,8 @@ public static class RequestConverter
             TopLogprobs = Math.Clamp(request.TopLogprobs ?? 0, 0, 20),
             Threading = threading,
         };
+        return ApplyDryOverrides(options, request.DryMultiplier, request.DryBase,
+            request.DryAllowedLength, request.DryPenaltyLastN, request.DrySequenceBreakers);
     }
 
     /// <summary>
@@ -94,14 +102,19 @@ public static class RequestConverter
     {
         var stops = new List<string>();
         AddRequestStopSequences(stops, request.Stop);
+        if (defaults.StopSequences is { Count: > 0 } profileStops) stops.AddRange(profileStops.Where(x => !stops.Contains(x)));
 
-        return new InferenceOptions
+        var options = new InferenceOptions
         {
             Temperature = request.Temperature ?? defaults.Temperature,
             TopK = request.TopK ?? defaults.TopK,
             TopP = request.TopP ?? defaults.TopP,
             MinP = request.MinP ?? defaults.MinP,
             RepetitionPenalty = request.RepetitionPenalty ?? defaults.RepetitionPenalty,
+            FrequencyPenalty = request.FrequencyPenalty ?? 0f,
+            PresencePenalty = request.PresencePenalty ?? 0f,
+            LogitBias = ParseLogitBias(request.LogitBias),
+            TopNSigma = request.TopNSigma ?? -1f,
             MaxTokens = request.MaxTokens ?? defaults.MaxTokens,
             Seed = request.Seed ?? defaults.Seed,
             StopSequences = stops,
@@ -110,6 +123,49 @@ public static class RequestConverter
             TopLogprobs = Math.Clamp(request.TopLogprobs ?? 0, 0, 20),
             Threading = threading,
         };
+        return ApplyDryOverrides(options, request.DryMultiplier, request.DryBase,
+            request.DryAllowedLength, request.DryPenaltyLastN, request.DrySequenceBreakers);
+    }
+
+    /// <summary>
+    /// Applies request-level DRY overrides on top of the <see cref="InferenceOptions"/> defaults
+    /// (<see cref="InferenceOptions.DryBase"/>=1.75, <see cref="InferenceOptions.DryAllowedLength"/>=2,
+    /// etc.) — every field is optional per request, absent fields keep the default.
+    /// </summary>
+    private static InferenceOptions ApplyDryOverrides(InferenceOptions options,
+        float? dryMultiplier, float? dryBase, int? dryAllowedLength, int? dryPenaltyLastN,
+        string[]? drySequenceBreakers)
+    {
+        if (dryMultiplier is null && dryBase is null && dryAllowedLength is null
+            && dryPenaltyLastN is null && drySequenceBreakers is null)
+            return options;
+
+        return options with
+        {
+            DryMultiplier = dryMultiplier ?? options.DryMultiplier,
+            DryBase = dryBase ?? options.DryBase,
+            DryAllowedLength = dryAllowedLength ?? options.DryAllowedLength,
+            DryPenaltyLastN = dryPenaltyLastN ?? options.DryPenaltyLastN,
+            DrySequenceBreakers = drySequenceBreakers ?? options.DrySequenceBreakers,
+        };
+    }
+
+    /// <summary>
+    /// Parses the OpenAI-compatible <c>logit_bias</c> map (string token-id keys) into a
+    /// token-id-keyed dictionary. Non-numeric keys are skipped. Returns null when empty/absent.
+    /// </summary>
+    public static IReadOnlyDictionary<int, float>? ParseLogitBias(Dictionary<string, float>? logitBias)
+    {
+        if (logitBias is null || logitBias.Count == 0)
+            return null;
+
+        var result = new Dictionary<int, float>(logitBias.Count);
+        foreach (var (key, value) in logitBias)
+        {
+            if (int.TryParse(key, out int tokenId))
+                result[tokenId] = value;
+        }
+        return result.Count > 0 ? result : null;
     }
 
     /// <summary>
@@ -162,8 +218,44 @@ public static class RequestConverter
                         : schemaProp.GetRawText(),
                     Name = schemaProp.TryGetProperty("name", out var n) ? n.GetString() : null,
                 },
+            // Extensions for classifier-style callers (vLLM guided_regex / guided_choice analogues). The output is
+            // exactly the matched text (no JSON quoting), and generation stops as soon as it is complete.
+            "regex" when element.Value.TryGetProperty("pattern", out var patternProp)
+                         && patternProp.ValueKind == JsonValueKind.String =>
+                new ResponseFormat.Regex { Pattern = patternProp.GetString()! },
+            "choice" when element.Value.TryGetProperty("choices", out var choicesProp)
+                          && choicesProp.ValueKind == JsonValueKind.Array && choicesProp.GetArrayLength() > 0 =>
+                new ResponseFormat.Regex { Pattern = BuildChoicePattern(choicesProp) },
             _ => null,
         };
+    }
+
+    /// <summary>Compiles <c>["A","B"]</c> to the alternation <c>(A|B)</c>, escaping regex metacharacters in each choice.</summary>
+    internal static string BuildChoicePattern(JsonElement choices)
+    {
+        var alternatives = new List<string>();
+        foreach (JsonElement c in choices.EnumerateArray())
+        {
+            string? text = c.ValueKind == JsonValueKind.String ? c.GetString() : c.GetRawText();
+            if (string.IsNullOrEmpty(text))
+                continue;
+            alternatives.Add(EscapeRegexLiteral(text));
+        }
+        return "(" + string.Join("|", alternatives) + ")";
+    }
+
+    private const string RegexMetaCharacters = @"\.^$|?*+()[]{}";
+
+    private static string EscapeRegexLiteral(string text)
+    {
+        var sb = new System.Text.StringBuilder(text.Length + 4);
+        foreach (char ch in text)
+        {
+            if (RegexMetaCharacters.IndexOf(ch) >= 0)
+                sb.Append('\\');
+            sb.Append(ch);
+        }
+        return sb.ToString();
     }
 
     /// <summary>
@@ -194,6 +286,25 @@ public static class RequestConverter
                     Name = tc.FunctionName,
                     Arguments = tc.Arguments,
                 }
+            };
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Converts engine tool calls to streaming deltas with distinct, zero-based indexes.
+    /// </summary>
+    public static StreamingToolCallDto[] ToStreamingToolCallDtos(ToolCall[] toolCalls)
+    {
+        var calls = ToToolCallDtos(toolCalls);
+        var result = new StreamingToolCallDto[calls.Length];
+        for (int i = 0; i < calls.Length; i++)
+        {
+            result[i] = new StreamingToolCallDto
+            {
+                Index = i,
+                Id = calls[i].Id,
+                Function = calls[i].Function,
             };
         }
         return result;
