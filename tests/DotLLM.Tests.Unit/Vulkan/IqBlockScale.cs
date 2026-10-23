@@ -25,6 +25,13 @@ internal static class IqBlockScale
         {
             bytes[blockOffset] = (byte)bits;
             bytes[blockOffset + 1] = (byte)(bits >> 8);
+            if (blockBytes == 20)
+            {
+                // Q4_1 (#1171): the fp16 min follows d; keep it in the QAT range (about -8 d) so random nibbles stay realistic.
+                ushort mBits = BitConverter.HalfToUInt16Bits((Half)(-7.5f * (float)d));
+                bytes[blockOffset + 2] = (byte)mBits;
+                bytes[blockOffset + 3] = (byte)(mBits >> 8);
+            }
         }
     }
 }

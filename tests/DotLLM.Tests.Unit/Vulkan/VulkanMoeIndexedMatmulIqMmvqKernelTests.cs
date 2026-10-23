@@ -54,6 +54,10 @@ public sealed class VulkanMoeIndexedMatmulIqMmvqKernelTests
     [InlineData(QuantizationType.Q4_0, 9, 16, 20, 288, 11)]    // 9 blocks/row - window + 1-block tail
     [InlineData(QuantizationType.Q4_0, 10, 64, 48, 2048, 10)]  // LFM2.5 gate/up: 64 experts, K = hidden 2048
     [InlineData(QuantizationType.Q4_0, 12, 64, 40, 1536, 10)]  // LFM2.5 down: K = expert_feed_forward_length 1536 (48 blocks/row)
+    [InlineData(QuantizationType.Q4_1, 5, 7, 12, 32, 4)]       // #1171: 1 block/row
+    [InlineData(QuantizationType.Q4_1, 9, 16, 20, 288, 11)]    // 9 blocks/row
+    [InlineData(QuantizationType.Q4_1, 12, 256, 40, 2048, 6)]  // Flint gate/up: 256 experts, top-6, K = hidden 2048
+    [InlineData(QuantizationType.Q4_1, 12, 256, 48, 512, 6)]   // Flint down: K = expert_feed_forward_length 512 (16 blocks/row)
     public void Launch_MatchesSameTierCpuOracle(QuantizationType qt, int n, int numExperts, int m, int k, int activeExperts)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
@@ -93,6 +97,7 @@ public sealed class VulkanMoeIndexedMatmulIqMmvqKernelTests
     [InlineData(QuantizationType.Q2_0, 6, 8, 12, 192)]
     [InlineData(QuantizationType.IQ1_M, 6, 8, 12, 768)]
     [InlineData(QuantizationType.Q4_0, 9, 16, 20, 288)]
+    [InlineData(QuantizationType.Q4_1, 9, 16, 20, 288)]
     public void PerRowExpertIndex_MatchesSingleRowLaunches(QuantizationType qt, int n, int numExperts, int m, int k)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
@@ -156,6 +161,10 @@ public sealed class VulkanMoeIndexedMatmulIqMmvqKernelTests
     [InlineData(QuantizationType.Q4_0, 1536, false)]
     [InlineData(QuantizationType.Q4_0, 2048, false)]
     [InlineData(QuantizationType.Q4_0, 4608, false)]
+    [InlineData(QuantizationType.Q4_1, 32, true)]       // #1171 (V2 only): one block, 31 masked lanes
+    [InlineData(QuantizationType.Q4_1, 512, true)]      // Flint down: 16 blocks
+    [InlineData(QuantizationType.Q4_1, 2048, true)]     // Flint gate/up: exactly one U=2 chunk
+    [InlineData(QuantizationType.Q4_1, 2080, true)]     // chunk + 1-block tail
     public void BroadcastActivation_V1AndV2_MatchSameTierCpuOracle(QuantizationType qt, int k, bool v2)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);

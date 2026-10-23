@@ -110,6 +110,8 @@ internal sealed class VulkanGptOssKernels : IDisposable
     private const int Wg256 = 256;
 
     private readonly SimpleComputeKernel _attnSinks;
+    // F16-KV twin (issue #1171, Flint): attention_sinks_f32_kvf16 reads K / V stored as F16 in place. Null when the SPIR-V is absent.
+    private readonly SimpleComputeKernel? _attnSinksKvF16;
     private readonly SimpleComputeKernel _swigluOai;
     private readonly SimpleComputeKernel _expertBias;
     private readonly SimpleComputeKernel _topkRaw;
@@ -122,10 +124,11 @@ internal sealed class VulkanGptOssKernels : IDisposable
 
     private VulkanGptOssKernels(SimpleComputeKernel attnSinks, SimpleComputeKernel swigluOai,
         SimpleComputeKernel expertBias, SimpleComputeKernel topkRaw, MoeIndexedMatmulMxfp4F32Kernel mxfp4,
-        SimpleComputeKernel ropeYarn)
+        SimpleComputeKernel ropeYarn, SimpleComputeKernel? attnSinksKvF16)
     {
         _ropeYarn = ropeYarn;
         _attnSinks = attnSinks;
+        _attnSinksKvF16 = attnSinksKvF16;
         _swigluOai = swigluOai;
         _expertBias = expertBias;
         _topkRaw = topkRaw;
@@ -143,12 +146,16 @@ internal sealed class VulkanGptOssKernels : IDisposable
         var topk = SimpleComputeKernel.Create(device, spvDir, "moe_topk_rawsoftmax_f32", buffers: 3, pushWords: 3);
         var mx = MoeIndexedMatmulMxfp4F32Kernel.Create(device, spvDir);
         var yarn = SimpleComputeKernel.Create(device, spvDir, "rope_yarn_f32", buffers: 4, pushWords: 8);
-        return new VulkanGptOssKernels(attn, swi, bias, topk, mx, yarn);
+        var attnF16 = File.Exists(Path.Combine(spvDir, "attention_sinks_f32_kvf16.spv"))
+            ? SimpleComputeKernel.Create(device, spvDir, "attention_sinks_f32_kvf16", buffers: 5, pushWords: 12)
+            : null;
+        return new VulkanGptOssKernels(attn, swi, bias, topk, mx, yarn, attnF16);
     }
 
     internal void InvalidateDescriptorCaches()
     {
         _attnSinks.InvalidateDescriptorCache();
+        _attnSinksKvF16?.InvalidateDescriptorCache();
         _swigluOai.InvalidateDescriptorCache();
         _expertBias.InvalidateDescriptorCache();
         _topkRaw.InvalidateDescriptorCache();
@@ -160,13 +167,17 @@ internal sealed class VulkanGptOssKernels : IDisposable
     /// Causal GQA attention with per-head attention sinks (and optional sliding window). Same
     /// buffer/push layout as <see cref="AttentionF32Kernel"/> plus <paramref name="sinks"/>
     /// <c>[numHeads]</c>. Always the shared-memory reference path: sinks are only wired here.
+    /// <paramref name="kvStorage"/> = <see cref="VulkanKvStorage.F16"/> reads K / V stored as F16 in place (issue #1171).
     /// </summary>
     public void RecordAttentionSinks(nint cmdBuf,
         VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer v, VulkanDevice.Buffer output,
         VulkanDevice.Buffer sinks,
         int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
-        int positionOffset, int slidingWindow, float scaleOverride = 0.0f)
+        int positionOffset, int slidingWindow, float scaleOverride = 0.0f, VulkanKvStorage kvStorage = VulkanKvStorage.F32)
     {
+        var kernel = kvStorage == VulkanKvStorage.F16
+            ? _attnSinksKvF16 ?? throw new NotSupportedException("F16 KV sink attention needs attention_sinks_f32_kvf16.spv, which this build lacks.")
+            : _attnSinks;
         if (seqQ <= 0) throw new ArgumentOutOfRangeException(nameof(seqQ));
         if (seqKv <= 0) throw new ArgumentOutOfRangeException(nameof(seqKv));
         if (numHeads % numKvHeads != 0) throw new ArgumentException("numHeads must be divisible by numKvHeads.");
@@ -184,7 +195,7 @@ internal sealed class VulkanGptOssKernels : IDisposable
             0u /*causal*/, 0u,
         ];
         SinkAttentionDispatches++;
-        _attnSinks.Record(cmdBuf, bufs, pc, (uint)seqQ * (uint)numHeads);
+        kernel.Record(cmdBuf, bufs, pc, (uint)seqQ * (uint)numHeads);
     }
 
     /// <summary>gpt-oss clamped SwiGLU: <c>result[i] = swiglu_oai(gate[i], up[i])</c> over <paramref name="n"/> elements.</summary>
@@ -249,6 +260,7 @@ internal sealed class VulkanGptOssKernels : IDisposable
     public void Dispose()
     {
         _attnSinks.Dispose();
+        _attnSinksKvF16?.Dispose();
         _swigluOai.Dispose();
         _expertBias.Dispose();
         _topkRaw.Dispose();
