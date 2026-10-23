@@ -160,7 +160,7 @@ public sealed class PrefixCacheTests
     [Fact]
     public void Dispose_ClearsAllEntries()
     {
-        var cache = new PrefixCache(4);
+        using var cache = new PrefixCache(4);
         cache.Store([1, 2], CreateCache());
         cache.Store([3, 4], CreateCache());
 
@@ -172,6 +172,6 @@ public sealed class PrefixCacheTests
     [Fact]
     public void Constructor_ThrowsOnZeroMaxEntries()
     {
-        Assert.Throws<ArgumentOutOfRangeException>(() => new PrefixCache(0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => { new PrefixCache(0); });
     }
 }

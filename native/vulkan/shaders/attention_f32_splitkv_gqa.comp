@@ -1,0 +1,4 @@
+#version 450
+// GQA-grouped split-KV decode partial pass over an F32 KV cache (issue #1102). Body: attention_f32_splitkv_gqa.glsl.
+#extension GL_GOOGLE_include_directive : require
+#include "attention_f32_splitkv_gqa.glsl"

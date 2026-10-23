@@ -1,0 +1,5 @@
+#version 450
+// GQA-grouped cooperative-matrix flash-attention prefill, head_dim <= 256, F32 K / V (issue #441).
+// Body: attention_flash_gqa_cm.glsl.
+#extension GL_GOOGLE_include_directive : require
+#include "attention_flash_gqa_cm.glsl"
