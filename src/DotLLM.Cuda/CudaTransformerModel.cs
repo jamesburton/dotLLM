@@ -979,6 +979,8 @@ public sealed unsafe class CudaTransformerModel : IModel
             && _kernels.HasKvWriteKernel
             && !ProfilingEnabled            // event injection between launches breaks capture
             && !isMla && !isMoe
+            // The captured bodies always rotate; NoPE layers are honoured by the eager body only (#1172).
+            && Config.NoRopeLayers is not { Count: > 0 }
             // BitNet IS graph-capable (issue #212): CaptureDecodeGraph/CaptureDecodeGraphQuantized
             // now carry the same fp32Res-gated FP32 residual accumulation, Sub-LN, and ReLU² FFN
             // activation as this eager body, ported 1:1 from the branches below.
@@ -1268,6 +1270,11 @@ public sealed unsafe class CudaTransformerModel : IModel
                 && kvCache is CudaKvCache
                 && _kernels.HasFusedRopeKvWriteKernel;
 
+            // NoPE layers (Flint's full-attention layers, #1172): rotate nothing. The fused kernel with rope_dim 0
+            // copies all of K as its "tail", so the KV write is unchanged.
+            bool noRope = Config.IsNoRopeLayer(layer);
+            int layerRopeDim = noRope ? 0 : _ropeDim;
+
             if (useFusedRopeKv)
             {
                 var cudaKvCache = (CudaKvCache)kvCache!;
@@ -1276,7 +1283,7 @@ public sealed unsafe class CudaTransformerModel : IModel
                     _state.PositionsDevice, positions[0],
                     layer,
                     numHeads, numKvHeads, headDim,
-                    _ropeDim, _ropeTheta, effectiveRopeType,
+                    layerRopeDim, _ropeTheta, effectiveRopeType,
                     s, _kernels, _ropeYarnInvFreq, _ropeYarnMscale);
                 MarkProfile(ProfileCategory.RopeAndExtras);
                 int seqKv = cudaKvCache.CurrentLength;
@@ -1290,10 +1297,11 @@ public sealed unsafe class CudaTransformerModel : IModel
             else
             {
                 // Eager fallback path (prefill seqLen>1, quantized KV, or no fused kernel).
-                _kernels.LaunchRoPE(qPtr, kPtr, _state.PositionsDevice,
-                    seqLen, numHeads, numKvHeads, headDim,
-                    _ropeDim, _ropeTheta, effectiveRopeType, s,
-                    _ropeYarnInvFreq, _ropeYarnMscale);
+                if (!noRope)
+                    _kernels.LaunchRoPE(qPtr, kPtr, _state.PositionsDevice,
+                        seqLen, numHeads, numKvHeads, headDim,
+                        _ropeDim, _ropeTheta, effectiveRopeType, s,
+                        _ropeYarnInvFreq, _ropeYarnMscale);
                 MarkProfile(ProfileCategory.RopeAndExtras);
 
                 // gpt-oss per-head attention sinks (#365). Hoisted out of `lw` because `lw` is a
@@ -3437,8 +3445,6 @@ public sealed unsafe class CudaTransformerModel : IModel
             throw new NotSupportedException(Qwen4ExpConfig.UnsupportedMessage("CUDA"));
         if (config.Architecture == Architecture.MiMoV2)
             throw new NotSupportedException(ModelConfig.MiMoV2UnsupportedMessage("CUDA"));
-        if (config.Architecture == Architecture.Flint)
-            throw new NotSupportedException(ModelConfig.FlintUnsupportedMessage("CUDA"));
         if (config.Architecture == Architecture.GraniteMoe)
             throw new NotSupportedException(
                 "Architecture GraniteMoe (Granite-3.x MoE, GGUF granitemoe) is not supported on the CUDA backend: the "
@@ -3885,6 +3891,12 @@ public sealed unsafe class CudaTransformerModel : IModel
                 _kernels.LaunchQuantizeXToQ8_1Batched(input, _state.PreQ8_1BatchedScratch, inputDim, seqLen, s);
                 _kernels.LaunchQuantizedGemvMmqBatchedQ4K(quantWeight, _state.PreQ8_1BatchedScratch,
                     output, outputDim, inputDim, seqLen, s);
+            }
+            else if (quantWeight != 0 && qt == QuantizationType.Q4_1 && fp16Weight == 0 && _kernels.HasQ4_1Gemm
+                     && (inputDim & 31) == 0)
+            {
+                // Q4_1 prefill (Flint, #1172): in-place GEMM over the blocks, no dequant scratch (rule 2).
+                _kernels.LaunchQuantizedGemmQ4_1F16(quantWeight, input, output, outputDim, inputDim, seqLen, s);
             }
             else // Fallback: dequant into scratch, then cuBLAS HGEMM
             {

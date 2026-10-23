@@ -183,6 +183,12 @@ public sealed class CudaMoeLayerWeights
     /// <summary>Total expert vector elements per token: <c>numExpertsPerTok</c>.</summary>
     public int TopK => NumExpertsPerTok;
 
+    /// <summary>
+    /// Router scores are <c>sigmoid(logit)</c> instead of softmax (Flint, #1172); <see cref="NormTopKProb"/> then
+    /// renormalises the chosen probabilities. No selection bias: the loader refuses one.
+    /// </summary>
+    public bool SigmoidGating { get; init; }
+
     /// <summary>Precision of the per-expert projections. F32 = direct cuBLAS GEMM; Quantized = dequant-per-call into F16 scratch.</summary>
     public MoePrecision Precision { get; }
 

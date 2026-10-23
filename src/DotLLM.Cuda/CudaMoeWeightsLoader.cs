@@ -144,6 +144,13 @@ internal static unsafe class CudaMoeWeightsLoader
                 "when the top-k weights are renormalized to sum to 1). A model with " +
                 "SoftmaxAfterTopK=true and NormTopKProb=false is not supported on CUDA.");
 
+        // Sigmoid routing is honoured (Flint, #1172) but only in its plain form: a selection bias (DeepSeek-V3 /
+        // GLM-4.7-Flash, #742) or an expert weight scale would be silently dropped by the GPU router.
+        if (moe.SigmoidGating && (moe.SelectionBias is not null || moe.WeightsScale != 1.0f))
+            throw new NotSupportedException(
+                "CudaMoeWeightsLoader.LoadLayerQuant: sigmoid MoE routing with a selection bias or an expert weight "
+                + "scale is not implemented on CUDA (issue #742); only bias-free, unscaled sigmoid routing is.");
+
         int numExperts = moe.NumExperts;
         int hidden = moe.HiddenSize;
         int moeIntermediate = moe.IntermediateSize;
@@ -227,7 +234,10 @@ internal static unsafe class CudaMoeWeightsLoader
             gateExpsBiasF32: gateExpsBiasF32,
             upExpsBiasF32: upExpsBiasF32,
             downExpsBiasF32: downExpsBiasF32,
-            useSwiGluOai: moe.UseSwiGluOai);
+            useSwiGluOai: moe.UseSwiGluOai)
+        {
+            SigmoidGating = moe.SigmoidGating,
+        };
     }
 
     /// <summary>
