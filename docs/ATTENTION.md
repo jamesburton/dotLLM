@@ -188,6 +188,7 @@ Vulkan attention has two F32 paths sharing one descriptor surface:
 | `AttentionF32Kernel` | `attention_f32.comp` (+ `_sg`, `_coopmat`) | one (query token, head) | Decode (seq_q = 1); fallback for FA-ineligible shapes |
 | `VulkanFlashAttentionF32Kernel` | `attention_flash_f32.comp` | one (head, query-tile of BR=16 rows) | Prefill (seq_q > 1), head_dim ≤ 128 |
 | `VulkanFlashAttentionF32Kernel` (wide) | `attention_flash_f32_hd256_br{4,8,16}.comp` | one (head, query-tile of BR rows) | Prefill (seq_q > 1), 128 < head_dim ≤ 256 |
+| `VulkanFlashAttentionGqaKernel` | `attention_flash_gqa_cm.comp` (coopmat) / `attention_flash_gqa.comp` (scalar), `_kvf16` twins | one (KV head, 64 / 16 rows across its query heads) | Dense-hybrid (Bonsai 2) prefill, 128 < head_dim ≤ 256 — see "GQA-grouped tiled prefill" below (#441) |
 
 The FA shader is Flash-Attention-v2 style: each workgroup holds BR=16 Q-rows in shared memory and walks the KV stream in BC=64 column tiles. Each KV row is read **once per Q-tile** (= BR× amortisation vs the per-token shader). Online softmax is maintained per Q-row (per-row running max + sum_exp), with one workgroup-wide tree reduce per (Q-row, KV-tile) pair using subgroupMax / subgroupAdd + cross-subgroup shared-memory combine — portable across subgroup widths.
 
@@ -285,6 +286,125 @@ Per-shape kernel microbench (dev-laptop iGPU, GQA-4, 32/8 heads, head_dim 64): *
 MLA-attention (DeepSeek-V2/V3) keeps `AttentionMlaF32Kernel`; the FA path is GQA-only by design — an MLA FA variant is a separate workstream.
 
 Strix Halo (Ryzen AI Max+ 395 / Radeon 8060S iGPU) measurement at pp512/pp2048/pp4096 with 32/8 heads, head_dim 64: FA speedup is 1.35× / 2.06× / 2.72× — scales with sequence length per the BR=BC K-amortisation prediction. See `docs/PERFORMANCE.md` §6.4.
+
+### GQA-grouped tiled prefill for head_dim 256 — issue #441 (2026-10)
+
+**Why the wide variants above were not enough.** At long context the prefill bottleneck on Strix was attention, not the
+projections: the #1100 growth run logged `[vk-prefill] … dense=11–15 TF/s attn=~1.0 TF/s`, and 128k-deep 8k-token turns took
+395 s. On a coopmat device Bonsai 2 does reach a flash kernel (`attention_flash_f32_coopmat_hd256`, not the naive one: the
+issue's original "silent naive fallback" only applies to non-coopmat devices without the wide variants). But that kernel is
+slow by construction:
+
+- one workgroup = **one query head** × 16 rows, so each K/V row is fetched once per query head (24× for Bonsai's 24 / 4 heads)
+  and amortised over only 16 query rows;
+- ~19 workgroup barriers per 32-column KV tile (K and V staged in four 64-wide d-chunks each);
+- the online softmax is 16 threads scanning rows serially while 240 wait, and only 2 of 4 subgroups run QK^T.
+
+Measured (`VulkanFlashAttentionGqaDepthBench`, one layer, Bonsai shape 24 / 4 / 256, F16 KV, rows appended at KV depth d):
+**1.10–1.29 TFLOP/s at every depth** for the old coopmat kernel, 0.45–0.66 for the old scalar br4. It is a kernel-design
+limit, not occupancy at 32 KiB LDS or the dispatch shape.
+
+**`VulkanFlashAttentionGqaKernel`** (`attention_flash_gqa_cm{,_kvf16}.comp`, coopmat; `attention_flash_gqa{,_kvf16}.comp`,
+scalar; bodies in the matching `.glsl`):
+
+- **Row space per KV head.** The query side of KV head `hkv` is the matrix of its `G = numHeads / numKvHeads` query heads'
+  rows: row `m` ↔ (token `m / G`, head `hkv·G + m % G`). One K/V tile load serves every head of the group. Grid =
+  `(ceil(seqQ·G / rowsPerWG), numKvHeads)`, launched last-rows-first (they have the longest causal range).
+- **Coopmat (Strix, NVIDIA):** 64 rows per workgroup, one 16-row strip per subgroup (subgroup size pinned; workgroup size =
+  4 × subgroup via specialization constant 1). Flash-Attention-2 ownership: Q (hi and lo F16 halves) and O live in registers as
+  cooperative matrices; the strip's lanes run its online softmax with shuffle reductions; the per-row O rescale is a
+  component-wise multiply by a 16×16 matrix whose row r is `corr[r]`, skipped when every correction is exactly 1. Four
+  workgroup barriers per 32-column tile, all around the shared K/V stage; the next tile's global fetch is held in registers
+  while the current one is multiplied. LDS 30.5 KiB (F16 KV), under Strix's 32 KiB.
+- **Scalar (Arc):** 16 rows per workgroup, 8 lanes per row each holding 32 of the row's Q and O dims in registers; QK^T
+  partials are summed with a 3-step shuffle-xor butterfly (every lane of the row ends with the bit-identical score); K/V tiles
+  are staged as F32 in LDS (converted once per element, not per reading lane). Two barriers per tile, 32 KiB LDS.
+- **Numerics.** F32 accumulation for QK^T and P·V, F32 running max / sum / correction (the precision rules). Coopmat P is
+  F16 and the denominator sums the same F16-rounded P. QK^T keeps the hd256 kernel's Q hi/lo split (specialization constant 2,
+  `DOTLLM_VULKAN_FA_GQA_QLO=0` drops it — see the A/B below). The #533 rule carries over: a tile that is partial or holds a
+  masked cell for any row of the workgroup takes a `precise` scalar P·V on AMD.
+- **KV read in place.** F16 rows are read as packed words (`uvec2`, no 16-bit storage-buffer feature) and converted in the tile
+  load; F32 rows split K and V into hi/lo halves so the F32 baseline is not rounded to F16. A q8_0 cache is one more tile-load
+  body. Nothing widens the history.
+- **Routing.** `VulkanQwen3MoeHybridKernels.EnsureGqaFlash(storage, headDim)` builds it per KV storage for 128 < head_dim ≤ 256;
+  the dense-hybrid host dispatches it ahead of the per-head flash kernels (profiler notes `attn_flash_gqa_cm` /
+  `attn_flash_gqa`; the per-head coopmat branch now notes `attn_flash_cm`). `DOTLLM_VULKAN_FA_GQA=0` restores the previous
+  path, `DOTLLM_VULKAN_FA_GQA_SCALAR=1` forces the scalar implementation. A prefill at KV ≥ 1024 that still reaches the
+  per-token kernel reports once per host and head width (`VulkanAttentionFallbackDiagnostics.ReportNaivePrefill`).
+- **TDR.** A dispatch is one layer's attention for the forward's rows; #1100's submit budget (fitted per device, ~1 s) sizes the
+  rows at depth, and the faster kernel simply lets it pack more rows per submission. No KV-axis split was needed.
+
+**Kernel A/B** (min of 3 interleaved order-reversed rounds, attention TFLOP/s = causal QK^T + P·V work; rows halve at depth
+where an arm would exceed ~0.8 s):
+
+| device | arm | 8k | 32k | 64k | 128k |
+|---|---|---:|---:|---:|---:|
+| Strix (8060S) | old coopmat hd256 | 1.24 | 1.14 | 1.10 | 1.11 |
+| Strix | **GQA coopmat** | **3.99** | **3.92** | **3.90** | **3.92** |
+| Strix | GQA coopmat, Q-lo off (A/B only) | 6.32 | – | – | 6.06 |
+| Strix | old scalar br4 | 0.60 | 0.51 | 0.50 | 0.68 |
+| Strix | GQA scalar | 1.89 | 1.80 | 1.72 | 1.77 |
+| Arc (Meteor Lake) | old scalar br4 | 0.06 | 0.06 | 0.06 | 0.06 |
+| Arc | **GQA scalar** | **0.22** | 0.20 | 0.19 | **0.19** |
+
+**Q hi/lo split A/B.** Perplexity on Strix, wikitext-2 (`dotllm perplexity --device vulkan`, cacheless F32 K/V):
+
+| model | windows | GQA, split (default) | GQA, no split | old kernel |
+|---|---|---:|---:|---:|
+| Bonsai 2 27B PQ2_0 | 10 × 4096 | 8.3260 (NLL 2.119382) | 8.3259 (2.119376) | 8.3260 (2.119378) |
+| Tev1-4B IQ4_NL | 20 × 1024 | 9.4546 (2.246506) | 9.4546 (2.246500) | 9.4546 (2.246498) |
+
+Perplexity cannot see the split on either hd256 model (the Tev1 NLL 2.272 → 3.509 that motivated it does not reproduce on this
+kernel). But without it the kernel misses the coopmat tolerance on large scores (`Prefill_LargeScores_MatchesCpuReference`:
+max abs 1.3e-2 against 1e-3), so it **stays on by default**; `DOTLLM_VULKAN_FA_GQA_QLO=0` (1.6× attention) is an opt-in pending
+the user's call. (Tev1 at 4096-token windows lost the device on every arm, the old kernel included: a cacheless 4096-row
+forward is not row-sliced by the submit budget.)
+
+TFLOP/s is still a third of the dense projections; the remaining limit is the QK^T MMA count (the split doubles it) and the
+B-fragment reload per MMA pair. Next levers: retire the split where measured safe, and a 128-row workgroup once LDS allows.
+
+**End-to-end** (Strix, Bonsai 2 PQ2_0, F16 KV, `--no-mtp`, GDN scan default variant):
+
+Session growth (`scripts/session-growth.py`, 16 turns of ~8k tokens to 128k, 63 generated tokens per turn). The old-kernel arm
+is the same build with `DOTLLM_VULKAN_FA_GQA=0`, so the KV storage (F16) and everything else are identical; the #1100 column is
+that issue's published baseline (F32 KV), for reference:
+
+| turn | context | #1100 baseline TTFT (F32 KV) | old kernel, F16 KV | **GQA kernel, F16 KV** | speed-up (same build) | prefill tok/s old → new | decode tok/s old → new |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 7,823 | 45.7 s | 44.1 s | **38.2 s** | 1.15× | 178 → 206 | 20.4 → 20.8 |
+| 2 | 17,037 | 83.7 s | 82.1 s | **52.2 s** | 1.57× | 112 → 177 | 18.1 → 18.3 |
+| 3 | 25,060 | 98.8 s | 97.9 s | **52.8 s** | 1.85× | 82 → 152 | 16.4 → 16.5 |
+| 4 | 32,934 | 119.5 s | 118.7 s | **58.0 s** | 2.05× | 66 → 136 | 15.0 → 14.9 |
+| 5 | 41,026 | 146.4 s | 145.6 s | **66.9 s** | 2.18× | 56 → 121 | 13.7 → 13.5 |
+| 6 | 48,783 | 163.4 s | 160.7 s | **70.9 s** | 2.27× | 48 → 110 | 12.7 → 12.5 |
+| 7 | 56,411 | 181.3 s | 178.1 s | **76.7 s** | 2.32× | 43 → 100 | 11.9 → 11.6 |
+| 8 | 64,320 | 212.0 s | 208.1 s | **86.4 s** | 2.41× | 38 → 92 | 11.1 → 10.8 |
+| 9 | 72,287 | 235.8 s | 230.9 s | **94.7 s** | 2.44× | 35 → 84 | 10.4 → 10.2 |
+| 10 | 80,915 | 281.6 s | 274.8 s | **110.0 s** | 2.50× | 31 → 79 | 9.8 → 9.6 |
+| 11 | 89,112 | 309.4 s | 301.4 s | **112.7 s** | 2.67× | 27 → 73 | 9.2 → 9.1 |
+| 12 | 96,656 | 307.4 s | 298.6 s | **110.0 s** | 2.71× | 25 → 69 | 8.8 → 8.6 |
+| 13 | 104,149 | 327.1 s | 317.2 s | **116.4 s** | 2.73× | 24 → 65 | 8.4 → 8.1 |
+| 14 | 112,017 | 352.1 s | 346.3 s | **129.1 s** | 2.68× | 23 → 61 | 8.0 → 7.8 |
+| 15 | 120,386 | 392.6 s | 378.5 s | **145.0 s** | 2.61× | 22 → 58 | 7.6 → 7.5 |
+| 16 | 128,254 | 394.6 s | 381.7 s | **143.9 s** | 2.65× | 21 → 55 | 7.3 → 7.2 |
+| all 16 | | 60.9 min | 59.4 min | **24.4 min** | 2.44× | | |
+
+Fresh single prompts (server restarted for each; #1100's baseline, F32 KV, vs this branch, F16 KV):
+
+| prompt | #1100 TTFT | GQA kernel TTFT | prefill tok/s |
+|---:|---:|---:|---:|
+| 17,003 | 127.6 s | **90.1 s** | 133 → 189 |
+| 32,831 | 344.6 s | **206.1 s** | 95 → 159 |
+| 64,077 | 1,039.9 s | **500.5 s** | 62 → 128 |
+
+The fitted `[vk-prefill]` attention rate at 128k is 3.6 TFLOP/s (was ~1.0); dense stays 10–12. Decode is not this change
+(split-KV); it tracks the old arm within noise. The Arc is dense-bound for Bonsai 2 (projections 0.10–0.14 TFLOP/s against
+attention 0.25), so its end-to-end prefill barely moves; its kernel numbers are above.
+
+Tests: `VulkanFlashAttentionGqaKernelTests` (both implementations × F32 / F16 KV vs `Attention.ExecuteScalar` at the family
+tolerances: GQA 6 and 8 with several KV heads, MHA, position offsets, ragged tiles, head_dim 256 and 128, large scores),
+`VulkanQwen3HybridDenseGqaFlashTests` (whole model, 12 / 2 heads at hd256, both storages, vs the pre-#441 path). Mutants (wrong
+head mapping, missing rescale, causal off by one; each on both implementations) fail every case of their implementation.
 
 ### Tuning headroom (deferred — workable WG=64 + BR=16 baseline shipped)
 

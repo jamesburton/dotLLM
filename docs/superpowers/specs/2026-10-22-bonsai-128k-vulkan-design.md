@@ -152,6 +152,16 @@ depth. V2 (narrow KV) and V3 (tiled hd256) address these.
   Arc's is larger), tiled so one dispatch stays well inside the TDR window.
 - One-time warning when a prefill with seqKv above a threshold takes the naive kernel.
 
+**Outcome (#441, 2026-10-23).** Strix did engage a flash kernel (`attention_flash_f32_coopmat_hd256`), not the naive one; the
+~1 TFLOP/s at depth was that kernel's design (one query head x 16 rows per workgroup, so each K/V row was fetched once per query
+head; ~19 barriers per 32-column tile; a serial 16-thread softmax). Measured 1.10-1.24 TFLOP/s at every depth 8k-128k.
+`VulkanFlashAttentionGqaKernel` replaces it for 128 < head_dim <= 256 on the dense-hybrid host: rows of all G query heads of a KV
+head share one K/V tile load; coopmat (Strix) with Q/O in registers and per-subgroup online softmax, scalar (Arc) with 8 lanes per
+row. F32 accumulation and softmax state; F16 or F32 KV read in place (q8_0 is one more tile-load body). Kernel A/B at depth:
+Strix 3.90-3.99 TFLOP/s (3.2-3.5x), Arc 0.19-0.22 (3.3x over br4). Fresh 64k prompt on Strix: 1,040 s -> 500 s. No KV-axis split
+was needed: #1100's submit budget keeps each submission near 1 s. Details and the end-to-end growth table: `docs/ATTENTION.md`,
+"GQA-grouped tiled prefill for head_dim 256".
+
 ### V5. YaRN beyond the native 262,144 window (user request, 2026-10-22)
 
 The user wants to know how far context can be pushed, especially on Strix. Qwen3.8 supports 262,144 tokens natively and
