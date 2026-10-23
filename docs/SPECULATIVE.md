@@ -787,3 +787,43 @@ which then fell back to plain mid-request (103 of 199 tokens on MTP: the round m
 MTP, after each draft step with the verify chunk's known prefix `[last token, d1 .. di]`. Cold 1K-token prefill of fresh ids, A/B/B/A in one process:
 **7.7-7.9 s with the prefetch vs 14.4-14.6 s without** (-6.7 s, 1.85x), matching the CPU measurement of 6.8 s of demand faults per 1K chunk.
 `DOTLLM_VK_Q4E_PREFETCH=0` turns it off (diagnostic).
+
+## DFlash / DFlash2 block-diffusion drafting (issue #1175)
+
+DFlash (z-lab, arXiv 2602.06036) and DFlash2 (Inco AI) drafters are small (5-layer, ~1.9B) models that condition on the
+target's intermediate residual streams and draft a whole block of tokens in **one** forward pass. dotLLM loads llama.cpp's
+`dflash` GGUF (PR #22105 / #27342 format, e.g. `z-lab/Qwen3.8-27B-DFlash2-GGUF`, the Bonsai-2 refit
+`naklitechie/Qwen3.8-27B-DFlash2-ternary-bonsai2`) and attaches it to a `qwen35` target with `--dflash <gguf>` (run, chat, serve).
+
+**How it plugs in.** The drafter takes the target's MTP slot (`IDFlashDraftAttachable`), so the unmodified
+`MtpSpeculativeDecoder` verifies its drafts — KV rollback, recurrent per-row snapshots, the adaptive gate and streaming all
+come for free:
+
+| MTP protocol call | DFlash meaning |
+|---|---|
+| `Forward(..., mtpState)` | captures the target's layer inputs at `dflash.target_layers` (F16) and injects them into the drafter's context K/V (`fc` → `enc.output_norm` → per-layer `attn_k`/`attn_v`, k-norm, RoPE) |
+| `ForwardMtpArgMax(state, last, pos)` | at the context end: runs the block `[last, mask × (B-1)]` once and returns draft 1; later calls serve drafts 2..B-1 |
+| `IMtpState.Rollback(len)` | crops the drafter context like the MTP head's KV |
+
+`dflash.target_layers` are **layer inputs** (HF `target_layer_ids + 1`; Qwen3.8: 6/20/34/48/62 = outputs of layers
+5/19/33/47/61). The drafter attends non-causally over its context (sliding window 2048) plus the block; DFlash2 adds the
+grouped dynamic causal convolutions (kernel 2, group 16) and the rank-256 / top-16 candidate selector, walked greedily from
+the anchor. The block embedding and the lm-head are the **target's** (no copy).
+
+**Backends.** CPU (`Qwen3HybridDenseTransformerModel`); CUDA and Vulkan (`Cuda/VulkanQwen3HybridDenseTransformerModel`)
+verify on the GPU and run the drafter on the CPU: the verify forward copies the tapped rows to the host (pinned D2H on CUDA,
+a host-readback buffer on Vulkan), the drafter's lm-head runs on the device with the target's head.
+
+**Exactness.** Greedy output is token-identical to plain decode (`DFlashDrafterTests`, `CudaDFlashTests`,
+`VulkanDFlashTests`; real Bonsai-2 27B on the RTX 3060). The selector's greedy draft is a point mass, so sampled decoding
+uses the MTP decoder's exact accept/residual rule unchanged.
+
+**Memory.** Drafter weights stay in their stored quant (mmap). Context ring: `layers × (2048 + 2·B) × kvDim × 2 × 2 B`
+(42 MB for Qwen3.8-27B-DFlash2). Taps: `rows × 5 × 5120 × 2 B` F16 per verify (400 KB at B = 8), capped at the ring for a
+long prefill and released after it.
+
+**Knobs.** `DOTLLM_DFLASH_DRAFT=n` caps drafts per round (default B-1 = 7); `DOTLLM_DFLASH_THREADS` sizes the GPU hosts'
+CPU drafter pool (default half the logical processors); `DOTLLM_DFLASH_TRACE=1` prints draft / inject wall time per request.
+
+**Not yet.** A GPU-resident drafter; tree (DDTree) verification; reduced-vocab (`d2t`), DSpark and LiliCorr drafters;
+sampled-selector proposals (llama.cpp's DFlash2 sampled mode).
