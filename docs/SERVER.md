@@ -601,7 +601,7 @@ Measured on an RTX 3060 12 GB (desktop on the same card) with Bonsai-2 27B PQ2_0
 
 | Flags | Fitted window | Cost per token |
 |---|---|---|
-| `--kv-quant-k q8_0 --kv-quant-v q8_0` (MTP on) | 26,624 | 54 KiB (KV 34, dequant scratch 4, MTP head 2 x 8) |
+| `--kv-quant-k q8_0 --kv-quant-v q8_0` (MTP on) | 26,624 | 54 KiB (KV 34, dequant scratch 4, MTP head 2 x 8; before #1094/#1095) |
 | same, plus `DOTLLM_CUDA_PREFILL_CHUNK=512` | 35,840 | 54 KiB, but ~480 MiB less fixed prefill scratch |
 | `--kv-quant-k q8_0 --kv-quant-v q8_0 --no-mtp` | 53,248 | 38 KiB |
 | f16 KV (MTP on) | 14,336 | 80 KiB |
@@ -614,6 +614,18 @@ card with nothing else on it (2,782 MiB free after load at the 512 tile), q4_0 /
 ```
 [dotllm] Context window: 97280 of 262144 tokens, fitted to free VRAM (2130 MiB free after load, 256 MiB reserve, 149 MiB fixed, 18.0 KiB/token, q4_0 KV). Set --ctx-size to override.
 ```
+
+Since #1095 the MTP head keeps its KV in the trunk's type and grows it in place, so it costs 1,156 B/token at q4_0 (was
+16 KiB counted: F32 rows, doubled for the copying growth). q4_0 with MTP is **19.1 KiB/token** (was 34). Measured on the
+same card with nothing else on it, 512 tile:
+
+| Flags | Free after load | Fitted window | Cost per token |
+|---|---|---|---|
+| `--kv-quant-k q4_0 --kv-quant-v q4_0` (MTP on) | 2,316 MiB | **101,376** (~57k at the old 34 KiB) | 19.1 KiB (KV 18, MTP head 1.1) |
+| same, `--no-mtp` | 2,782 MiB | 135,168 | 18.0 KiB |
+
+The remaining gap to `--no-mtp` is the ~466 MiB MTP holds regardless of context (the head's weights and draft scratch),
+not a per-token cost.
 
 The 512-token prefill tile costs about 15% of prefill speed. `--no-mtp` doubles the window at the cost of MTP's decode
 speed-up. An agent client that sends a large `max_tokens` (CodeSharp sends 16,384) spends that much of the window on

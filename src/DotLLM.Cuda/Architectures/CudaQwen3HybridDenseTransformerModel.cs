@@ -436,8 +436,9 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     /// Peak device bytes one context token costs while serving (issue #1068): its K/V rows in every attention slot under the
     /// effective storage, the F16 dequant scratch a quantized-KV prefill tile fills over the whole history (none when the
     /// quantized-KV flash prefill kernel serves it, issue #1094), the F32 staging
-    /// when the flash-prefill kernel cannot run, and, with MTP, the head's F32 K/V counted twice because a lazy growth
-    /// copies into a new buffer while the old one is still allocated.
+    /// when the flash-prefill kernel cannot run, and, with MTP, the head's own K/V rows in the format it stores them in
+    /// (issue #1095: the trunk's KV type where the fused kernels read it): counted once when the head grows in place, twice
+    /// when a growth copies into a new buffer while the old one is still allocated.
     /// </summary>
     /// <param name="mtp">Whether MTP self-speculation will run.</param>
     /// <returns>Bytes per token.</returns>
@@ -456,7 +457,11 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         if (!flashPrefill)
             bytes += 2L * kvElems * sizeof(float);
         if (mtp && _mtpHead is { } head)
-            bytes += 2 * (2L * head.Layer.FullAttn!.Value.NumKvHeads * Config.HeadDim * sizeof(float) + sizeof(int));
+        {
+            var (keyFormat, valueFormat) = ResolveMtpKvFormats();
+            bytes += CudaMtpState.BytesPerPosition(keyFormat, valueFormat,
+                head.Layer.FullAttn!.Value.NumKvHeads * Config.HeadDim, growsInPlace: _kvVirtualMemory is not null);
+        }
         return bytes;
     }
 
@@ -846,12 +851,77 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
             return null;
 
         _context.MakeCurrent();
+        var (keyFormat, valueFormat) = ResolveMtpKvFormats();
         return new CudaMtpState(
             hiddenSize: Config.HiddenSize,
             numKvHeads: _mtpHead.Value.Layer.FullAttn!.Value.NumKvHeads,
             headDim: Config.HeadDim,
             maxSteps: maxSequenceLength,
-            admitGrowth: AdmitDeviceGrowth);   // issue #1068: the head's F32 KV grows with the context too
+            keyFormat, valueFormat,
+            virtualMemory: _kvVirtualMemory,   // issue #1095: grow in place where the trunk does
+            admitGrowth: AdmitDeviceGrowth);   // issue #1068: the head's KV grows with the context too
+    }
+
+    /// <summary>
+    /// Environment switch for the MTP head's KV format (issue #1095): <c>f32</c> stores it in F32, the pre-#1095 layout. It
+    /// exists only as the reference arm of the acceptance-rate A/B; FP32 storage is not a serving fallback (#1107).
+    /// </summary>
+    internal const string MtpKvEnvVar = "DOTLLM_CUDA_MTP_KV";
+
+    private static readonly bool s_mtpKvF32Env =
+        string.Equals(Environment.GetEnvironmentVariable(MtpKvEnvVar), "f32", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Reference arm only (issue #1095): true makes <see cref="CreateMtpState(int)"/> store the head's KV in F32, as it was
+    /// before the head followed the trunk's KV type. Tests and the acceptance-rate A/B compare against it; nothing serves with
+    /// it by default. Defaults to <c>DOTLLM_CUDA_MTP_KV=f32</c>.
+    /// </summary>
+    internal bool MtpKvF32ForTest { get; set; } = s_mtpKvF32Env;
+
+    /// <summary>
+    /// Test seam (issue #1095): false makes a quantized head's draft step dequantize its history into the F16 scratch and run
+    /// the F16 tensor-core kernel — the reference the fused read is compared against bit for bit.
+    /// </summary>
+    internal bool MtpFusedKvReadForTest { get; set; } = true;
+
+    /// <summary>Test-only: MTP draft-step attention calls served by the fused quantized-KV kernel over the head's own cache.</summary>
+    internal int DebugMtpFusedKvqCallsForTest { get; private set; }
+
+    /// <summary>Test-only: MTP draft-step dequantizations of the head's history into the F16 scratch (one per K or V side).</summary>
+    internal int DebugMtpKvDequantCallsForTest { get; private set; }
+
+    /// <summary>
+    /// The MTP head's K/V element formats (issue #1095). The head is one full-attention layer of the trunk's shape, so it takes
+    /// the trunk's KV type: both sides quantized when the fused quantized-KV decode kernel for that pair is loaded and takes the
+    /// head's shape (real GQA, head_dim 256, the trunk's row), otherwise F16 — never wider than F16 (#1107). The F16 rows are
+    /// read in place by the tensor-core decode kernel where it takes the shape; on other shapes (head_dim other than 256, no
+    /// real GQA) they are staged to F32 per draft step for the plain kernel, as the trunk's own attention is on those shapes.
+    /// <see cref="MtpKvF32ForTest"/> selects F32 storage for reference arms only.
+    /// </summary>
+    /// <returns>Key and value formats; F32 on both sides (reference arm only), or neither.</returns>
+    internal (CudaMtpKvFormat Key, CudaMtpKvFormat Value) ResolveMtpKvFormats()
+    {
+        const CudaMtpKvFormat F16 = CudaMtpKvFormat.F16;
+        if (MtpKvF32ForTest)
+            return (CudaMtpKvFormat.F32, CudaMtpKvFormat.F32);
+        if (_mtpHead is not { } head)
+            return (F16, F16);
+        int numHeads = Config.NumAttentionHeads;
+        int numKvHeads = head.Layer.FullAttn!.Value.NumKvHeads;
+        int headDim = Config.HeadDim;
+        bool kq = IsQuantKv(_kvKeyDType), vq = IsQuantKv(_kvValueDType);
+
+        // The head's short-history tier borrows the trunk's dequant scratch, which is sized by the trunk's row.
+        bool fusedShape = numKvHeads == Config.NumKvHeads
+            && numKvHeads < numHeads
+            && headDim == DotLLM.Cuda.CudaAttentionMmaDecodeGqaSplit.SupportedHeadDim
+            && CudaKernels.IsGqaGroupShapeSupported(numHeads, numKvHeads)
+            && DotLLM.Cuda.CudaAttentionMmaDecodeGqaSplit.Enabled;
+        if (kq && vq && fusedShape && _kernels.HasAttentionMmaDecodeKvq(_kvKeyDType, _kvValueDType))
+            return (ToMtpFormat(_kvKeyDType), ToMtpFormat(_kvValueDType));
+        return (F16, F16);   // an F16 trunk, a mixed F16/quantized pair, or a shape/device the fused kernel does not cover
+
+        static CudaMtpKvFormat ToMtpFormat(KvCacheDType d) => d == KvCacheDType.Q8_0 ? CudaMtpKvFormat.Q8_0 : CudaMtpKvFormat.Q4_0;
     }
 
     /// <summary>
@@ -2222,6 +2292,9 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         public nint Concat;     // [rows, 2 * hidden]
         public nint Cur;        // [rows, hidden]
         public nint Normed;     // [rows, hidden]
+        public nint KRows;      // [rows, kvStride] — K before it is stored in the head's format (issue #1095)
+        public nint VRows;      // [rows, kvStride] — V, likewise
+        public int KvStride;
 
         /// <summary>
         /// Pinned host staging rows ([rows, hidden] f32 each) for the embedding and pairing uploads
@@ -2232,9 +2305,10 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         public nint EmbedHost;
         public nint PairHost;
 
-        public static CudaMtpAbsorbScratch Allocate(int rows, int hiddenSize)
+        public static CudaMtpAbsorbScratch Allocate(int rows, int hiddenSize, int kvStride)
         {
             long h = (long)rows * hiddenSize * sizeof(float);
+            long kv = (long)rows * kvStride * sizeof(float);
             CudaDriverApi.cuMemHostAlloc(out nint embedHost, (nuint)h, 0).ThrowOnError();
             CudaDriverApi.cuMemHostAlloc(out nint pairHost, (nuint)h, 0).ThrowOnError();
             return new CudaMtpAbsorbScratch
@@ -2249,6 +2323,9 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
                 Concat = AllocDevice(2 * h),
                 Cur = AllocDevice(h),
                 Normed = AllocDevice(h),
+                KRows = AllocDevice(kv),
+                VRows = AllocDevice(kv),
+                KvStride = kvStride,
             };
         }
 
@@ -2261,6 +2338,8 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
             FreeIfNonZero(ref Concat);
             FreeIfNonZero(ref Cur);
             FreeIfNonZero(ref Normed);
+            FreeIfNonZero(ref KRows);
+            FreeIfNonZero(ref VRows);
             if (EmbedHost != 0) { CudaDriverApi.cuMemFreeHost(EmbedHost); EmbedHost = 0; }
             if (PairHost != 0) { CudaDriverApi.cuMemFreeHost(PairHost); PairHost = 0; }
         }
@@ -2277,12 +2356,12 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     private int _mtpEmbedPrefetchRows;
 
     /// <summary>Allocates (or grows) the batched-absorb scratch for <paramref name="chunkRows"/> rows.</summary>
-    private CudaMtpAbsorbScratch EnsureMtpAbsorbScratch(int chunkRows, int hiddenSize)
+    private CudaMtpAbsorbScratch EnsureMtpAbsorbScratch(int chunkRows, int hiddenSize, int kvStride)
     {
-        if (_mtpAbsorbScratch is null || _mtpAbsorbScratch.Rows < chunkRows)
+        if (_mtpAbsorbScratch is null || _mtpAbsorbScratch.Rows < chunkRows || _mtpAbsorbScratch.KvStride < kvStride)
         {
             _mtpAbsorbScratch?.Dispose();
-            _mtpAbsorbScratch = CudaMtpAbsorbScratch.Allocate(chunkRows, hiddenSize);
+            _mtpAbsorbScratch = CudaMtpAbsorbScratch.Allocate(chunkRows, hiddenSize, kvStride);
         }
         return _mtpAbsorbScratch;
     }
@@ -2335,7 +2414,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
             return;
         int hiddenSize = Config.HiddenSize;
         int chunkRows = Math.Max(1, Math.Min(tokenIds.Length, MtpAbsorbChunkRows));
-        var sc = EnsureMtpAbsorbScratch(chunkRows, hiddenSize);
+        var sc = EnsureMtpAbsorbScratch(chunkRows, hiddenSize, state.KvStride);
         int s = Math.Min(chunkRows, tokenIds.Length);
         FillMtpAbsorbEmbedRows(mtpHead, tokenIds, 0, s, (float*)sc.EmbedHost, hiddenSize);
         _mtpEmbedPrefetchRows = s;
@@ -2446,7 +2525,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         ProfMark("mtp-absorb-0a-begin");
 
         int chunkRows = Math.Max(1, Math.Min(total, MtpAbsorbChunkRows));
-        var sc = EnsureMtpAbsorbScratch(chunkRows, hiddenSize);
+        var sc = EnsureMtpAbsorbScratch(chunkRows, hiddenSize, state.KvStride);
         ProfMark("mtp-absorb-0b-scratch");
 
         float* embedHost = (float*)sc.EmbedHost;
@@ -2498,21 +2577,26 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
             _kernels.LaunchRmsNormF32(sc.Cur, mtpHead.Layer.AttnNormWeightDevice, sc.Normed, hiddenSize, eps, s, streamH);
             ProfMark("mtp-absorb-4-eh-proj");
 
-            // K/V straight into the head's cache slab [p, p + s): one contiguous [maxSteps, kvStride] buffer.
+            // K/V for the head's cache slab [p, p + s). An F32 cache takes them straight into its rows (one contiguous
+            // [capacity, kvStride] buffer); any other format computes them in F32 scratch and stores them below (issue #1095).
             int p = firstPosition + start;
             int kvStride = state.KvStride;
-            MtpGemmRows(attn.KDevice, attn.KQt, sc.Normed, hiddenSize, state.GetKeyRowDevicePtr(p), kvStride,
+            bool f32Cache = state.KeyFormat == CudaMtpKvFormat.F32;
+            nint kSlab = f32Cache ? state.GetKeyRowDevicePtr(p) : sc.KRows;
+            nint vSlab = f32Cache ? state.GetValueRowDevicePtr(p) : sc.VRows;
+            MtpGemmRows(attn.KDevice, attn.KQt, sc.Normed, hiddenSize, kSlab, kvStride,
                         attn.KOutputDim, attn.KInputDim, s);
-            MtpGemmRows(attn.VDevice, attn.VQt, sc.Normed, hiddenSize, state.GetValueRowDevicePtr(p), kvStride,
+            MtpGemmRows(attn.VDevice, attn.VQt, sc.Normed, hiddenSize, vSlab, kvStride,
                         attn.VOutputDim, attn.VInputDim, s);
             ProfMark("mtp-absorb-5-kv-proj");
 
-            nint kSlab = state.GetKeyRowDevicePtr(p);
             _kernels.LaunchRmsNormF32(kSlab, attn.KNormDevice, kSlab, headDim, eps, s * numKvHeads, streamH);
             // numHeads = 0: the kernel rotates no Q pairs, so its Q operand is never touched.
             // Positions [p, p + s) are a slice of the state's device iota (issue #482) — no upload.
             _kernels.LaunchRoPEF32(kSlab, kSlab, state.GetPositionDevicePtr(p, s), s, 0, numKvHeads, headDim,
                 _ropeDim, _ropeTheta, 1, streamH, ropeInvFreq: _ropeYarnInvFreq, ropeMscale: _ropeYarnMscale);
+            if (!f32Cache)
+                StoreMtpKvRows(state, kSlab, vSlab, p, s, streamH);
 
             // The next chunk overwrites the device scratch and the pinned host rows.
             _stream.Synchronize();
@@ -2552,6 +2636,8 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         public nint NormedHead;  // [hiddenSize]
         public nint HeadRot;     // [hiddenSize] — Hadamard-rotated NormedHead (folded trunk lm_head fallback only)
         public nint LogitsDevice; // [vocabSize]
+        public nint KRow;        // [kvStride] f32 — this step's K before it is stored in the head's format (issue #1095)
+        public nint VRow;        // [kvStride] f32 — this step's V, likewise
 
         /// <summary>
         /// Pinned host staging row ([hiddenSize] f32) for the draft token's embedding (issue #482).
@@ -2562,7 +2648,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         /// </summary>
         public nint EmbedHostPinned;
 
-        public static CudaMtpScratch Allocate(int hiddenSize, int qElems, int intermediateSize, int vocabSize)
+        public static CudaMtpScratch Allocate(int hiddenSize, int qElems, int intermediateSize, int vocabSize, int kvStride)
         {
             CudaDriverApi.cuMemHostAlloc(out nint embedHostPinned, (nuint)((long)hiddenSize * sizeof(float)), 0)
                 .ThrowOnError();
@@ -2584,6 +2670,8 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
                 NormedHead = AllocDevice((long)hiddenSize * sizeof(float)),
                 HeadRot = AllocDevice((long)hiddenSize * sizeof(float)),
                 LogitsDevice = AllocDevice((long)vocabSize * sizeof(float)),
+                KRow = AllocDevice((long)kvStride * sizeof(float)),
+                VRow = AllocDevice((long)kvStride * sizeof(float)),
             };
             return s;
         }
@@ -2605,6 +2693,8 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
             FreeIfNonZero(ref NormedHead);
             FreeIfNonZero(ref HeadRot);
             FreeIfNonZero(ref LogitsDevice);
+            FreeIfNonZero(ref KRow);
+            FreeIfNonZero(ref VRow);
             if (EmbedHostPinned != 0)
             {
                 CudaDriverApi.cuMemFreeHost(EmbedHostPinned);
@@ -2811,6 +2901,151 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         }
     }
 
+    /// <summary>
+    /// Stores <paramref name="rows"/> F32 K and V rows (after K-norm and RoPE) into the head's cache at
+    /// <paramref name="firstPosition"/> in its own format (issue #1095): F32 -> F16 through the trunk's write staging, then
+    /// either the F16 rows themselves or the trunk's quantize-on-write kernel. Exactly the conversion the trunk's own KV
+    /// write applies, so a head row holds the bits a trunk row would.
+    /// </summary>
+    private void StoreMtpKvRows(CudaMtpState state, nint kF32, nint vF32, int firstPosition, int rows, nint streamH)
+    {
+        int elems = rows * state.KvStride;
+        EnsureF16KvWriteStaging(rows, state.KvStride);
+        nint staging = _f16KvWriteStaging;
+        _kernels.LaunchConvertF32ToF16(kF32, staging, elems, streamH);
+        StoreMtpSide(staging, state.GetKeyRowDevicePtr(firstPosition), state.KeyFormat, elems, streamH);
+        _kernels.LaunchConvertF32ToF16(vF32, staging, elems, streamH);   // stream-ordered after the K store read it
+        StoreMtpSide(staging, state.GetValueRowDevicePtr(firstPosition), state.ValueFormat, elems, streamH);
+
+        void StoreMtpSide(nint srcF16, nint dst, CudaMtpKvFormat format, int count, nint stream)
+        {
+            if (CudaMtpState.IsQuantized(format))
+                _kernels.LaunchQuantKv(srcF16, dst, count, CudaMtpState.ToKvCacheDType(format), stream);
+            else
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(dst, srcF16, (nuint)((long)count * sizeof(ushort)), stream).ThrowOnError();
+        }
+    }
+
+    /// <summary>
+    /// Test-only (issue #1095): stores <paramref name="rowsF32"/> the way the trunk's KV write does — F32 -> F16 through the
+    /// write staging, then the F16 bytes or the quantize-on-write kernel — and returns the stored bytes. The oracle for the
+    /// head's own rows, which must be exactly these.
+    /// </summary>
+    /// <param name="rowsF32">Rows to store; a multiple of 32 elements for a quantized format.</param>
+    /// <param name="format">F16, Q8_0 or Q4_0.</param>
+    /// <returns>The stored bytes.</returns>
+    internal unsafe byte[] StoreKvRowsForTest(ReadOnlySpan<float> rowsF32, CudaMtpKvFormat format)
+    {
+        _context.MakeCurrent();
+        int n = rowsF32.Length;
+        long bytes = CudaMtpState.RowBytes(format, n);
+        nint src = AllocDevice((long)n * sizeof(float));
+        nint dst = AllocDevice(bytes);
+        try
+        {
+            fixed (float* p = rowsF32)
+                CudaDriverApi.cuMemcpyHtoD_v2(src, (nint)p, (nuint)((long)n * sizeof(float))).ThrowOnError();
+            nint streamH = _stream.Handle;
+            EnsureF16KvWriteStaging(1, n);
+            _kernels.LaunchConvertF32ToF16(src, _f16KvWriteStaging, n, streamH);
+            if (CudaMtpState.IsQuantized(format))
+                _kernels.LaunchQuantKv(_f16KvWriteStaging, dst, n, CudaMtpState.ToKvCacheDType(format), streamH);
+            else
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(dst, _f16KvWriteStaging, (nuint)((long)n * sizeof(ushort)), streamH).ThrowOnError();
+            _stream.Synchronize();
+            var host = new byte[bytes];
+            fixed (byte* h = host)
+                CudaDriverApi.cuMemcpyDtoH_v2((nint)h, dst, (nuint)bytes).ThrowOnError();
+            return host;
+        }
+        finally
+        {
+            FreeIfNonZero(ref src);
+            FreeIfNonZero(ref dst);
+        }
+    }
+
+    /// <summary>
+    /// One draft step's attention over the head's own F16 or quantized history <c>[0, seqKv)</c> (issue #1095), read in place
+    /// by the trunk's decode kernels: the fused quantized-KV kernel for quantized rows, the tensor-core F16 kernel for F16 rows.
+    /// Below those kernels' minimum depth (<see cref="CudaKernels.AttentionGqaSplitMinSeqKv"/>) the short history goes through
+    /// the F32 kernel via the trunk's staging, which that depth bounds; no tier widens a long history.
+    /// </summary>
+    /// <param name="state">The head's state; its formats are F16 or quantized.</param>
+    /// <param name="qF32">This step's Q, <c>[numHeads, headDim]</c> F32, after QK-norm and RoPE.</param>
+    /// <param name="outF32">Attention output, <c>[numHeads, headDim]</c> F32.</param>
+    /// <param name="seqKv">Keys attended: positions <c>[0, seqKv)</c>, this step's included.</param>
+    /// <param name="numHeads">Query heads.</param>
+    /// <param name="numKvHeads">KV heads.</param>
+    /// <param name="headDim">Head dimension.</param>
+    /// <param name="streamH">The model's stream.</param>
+    private void MtpHeadAttention(CudaMtpState state, nint qF32, nint outF32, int seqKv,
+                                  int numHeads, int numKvHeads, int headDim, nint streamH)
+    {
+        KvCacheDType kd = CudaMtpState.ToKvCacheDType(state.KeyFormat);
+        KvCacheDType vd = CudaMtpState.ToKvCacheDType(state.ValueFormat);
+        bool quant = CudaMtpState.IsQuantized(state.KeyFormat);   // both sides or neither (ResolveMtpKvFormats)
+        bool mmaShape = numKvHeads < numHeads
+            && seqKv >= CudaKernels.AttentionGqaSplitMinSeqKv
+            && _mmaDecodeGqaSplit.CanUse(1, seqKv, slidingWindow: 0, numHeads, numKvHeads, headDim);
+
+        if (quant && mmaShape && MtpFusedKvReadForTest
+            && _mmaDecodeGqaSplit.CanUseKvq(kd, vd, 1, seqKv, 0, numHeads, numKvHeads, headDim))
+        {
+            int split = _mmaDecodeGqaSplit.ComputeSafeKvSplitKvq(kd, vd, numKvHeads, seqKv);
+            if (split >= 1)
+            {
+                EnsureAttentionMmaDecodeQF16Scratch(numHeads, headDim);
+                EnsureAttentionGqaSplitScratch(numHeads, headDim, split);
+                _kernels.LaunchConvertF32ToF16(qF32, _attnMmaDecodeQF16, numHeads * headDim, streamH);
+                _mmaDecodeGqaSplit.RunKvq(_attnMmaDecodeQF16, state.KeyCacheDevicePtr, state.ValueCacheDevicePtr, kd, vd,
+                    outF32, seqKv, numHeads, numKvHeads, split,
+                    _attnGqaSplitPartialMax, _attnGqaSplitPartialSum, _attnGqaSplitPartialOut, streamH);
+                DebugMtpFusedKvqCallsForTest++;
+                return;
+            }
+        }
+
+        // An F16 view of the history: the head's own F16 rows, or its quantized rows dequantized into the trunk's scratch
+        // (the short-history tier, and the reference arm the fused read is tested against).
+        int kvElems = state.KvStride;
+        nint kF16 = state.KeyCacheDevicePtr, vF16 = state.ValueCacheDevicePtr;
+        if (quant)
+        {
+            if (kd != _kvKeyDType || vd != _kvValueDType || kvElems != Config.NumKvHeads * Config.HeadDim)
+                throw new InvalidOperationException(
+                    $"The MTP state stores {state.KeyFormat}/{state.ValueFormat} but the model's KV storage is now " +
+                    $"{KvStorageLabel}: create the MTP state after choosing the KV storage.");
+            EnsureKvF16Scratch(seqKv, kvElems);
+            _kernels.LaunchKvDequantToF16(kF16, kd, _kvF16ScratchK, seqKv * kvElems, streamH);
+            _kernels.LaunchKvDequantToF16(vF16, vd, _kvF16ScratchV, seqKv * kvElems, streamH);
+            kF16 = _kvF16ScratchK;
+            vF16 = _kvF16ScratchV;
+            DebugMtpKvDequantCallsForTest += 2;
+        }
+
+        if (mmaShape)
+        {
+            int split = _mmaDecodeGqaSplit.ComputeSafeKvSplit(numKvHeads, numHeads / numKvHeads, seqKv);
+            if (split >= 1)
+            {
+                EnsureAttentionMmaDecodeQF16Scratch(numHeads, headDim);
+                EnsureAttentionGqaSplitScratch(numHeads, headDim, split);
+                _kernels.LaunchConvertF32ToF16(qF32, _attnMmaDecodeQF16, numHeads * headDim, streamH);
+                _mmaDecodeGqaSplit.Run(_attnMmaDecodeQF16, kF16, vF16, outF32, seqKv, numHeads, numKvHeads, split,
+                    _attnGqaSplitPartialMax, _attnGqaSplitPartialSum, _attnGqaSplitPartialOut, streamH);
+                return;
+            }
+        }
+
+        EnsureF32KvStaging(seqKv, kvElems);
+        _kernels.LaunchConvertF16ToF32(kF16, _f32KvStageK, seqKv * kvElems, streamH);
+        _kernels.LaunchConvertF16ToF32(vF16, _f32KvStageV, seqKv * kvElems, streamH);
+        _kernels.LaunchAttentionF32(qF32, _f32KvStageK, _f32KvStageV, outF32,
+            /* seqQ */ 1, seqKv, numHeads, numKvHeads, headDim,
+            positionOffset: seqKv - 1, slidingWindow: 0, streamH);
+    }
+
     private ITensor? ForwardMtpCoreBody(in CudaMtpHeadWeights mtpHead, CudaMtpState state, int tokenId, int position,
                                         MtpStepOutput output, out int argmax)
     {
@@ -2843,7 +3078,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         // Issue #966: the head KV grows lazily; make slot `step` addressable before any pointer into it.
         state.EnsureCapacity(step + 1, _stream.Handle);
 
-        _mtpScratch ??= CudaMtpScratch.Allocate(hiddenSize, qElems, intermediateSize, vocabSize);
+        _mtpScratch ??= CudaMtpScratch.Allocate(hiddenSize, qElems, intermediateSize, vocabSize, numKvHeads * headDim);
         var s = _mtpScratch;
         ProfMark("mtp-0-setup");
 
@@ -2911,11 +3146,12 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         }
         ProfMark("mtp-4a-attn-norm-q-proj");
 
-        // K/V projections write directly into this step's KV-cache row — appends this step's K/V
-        // into the MTP head's own tiny cache (no extra copy), matching the CPU host's
-        // `k.CopyTo(state.GetKeyRow(step))` / `v.CopyTo(state.GetValueRow(step))`.
-        nint kRowDst = state.GetKeyRowDevicePtr(step);
-        nint vRowDst = state.GetValueRowDevicePtr(step);
+        // K/V projections. An F32 cache takes them directly into this step's row (no extra copy), matching the CPU host's
+        // `k.CopyTo(state.GetKeyRow(step))` / `v.CopyTo(state.GetValueRow(step))`. Any other format computes them in F32
+        // scratch and stores them after K-norm and RoPE, the same F32 -> F16 (-> quantize) write the trunk does (issue #1095).
+        bool f32Cache = state.KeyFormat == CudaMtpKvFormat.F32;
+        nint kRowDst = f32Cache ? state.GetKeyRowDevicePtr(step) : s.KRow;
+        nint vRowDst = f32Cache ? state.GetValueRowDevicePtr(step) : s.VRow;
         MtpGemm(attn.KDevice, attn.KQt, s.Normed, kRowDst, attn.KOutputDim, attn.KInputDim);
         MtpGemm(attn.VDevice, attn.VQt, s.Normed, vRowDst, attn.VOutputDim, attn.VInputDim);
         ProfMark("mtp-4b-kv-proj");
@@ -2930,6 +3166,8 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         // docs allow to synchronize with the stream).
         _kernels.LaunchRoPEF32(s.Q, kRowDst, state.GetPositionDevicePtr(position), 1, numHeads, numKvHeads, headDim,
             _ropeDim, _ropeTheta, 1, streamH, ropeInvFreq: _ropeYarnInvFreq, ropeMscale: _ropeYarnMscale);
+        if (!f32Cache)
+            StoreMtpKvRows(state, kRowDst, vRowDst, step, 1, streamH);
         ProfMark("mtp-4c-qknorm-rope");
 
         // Append this step's K/V (already written above) and attend causally over everything
@@ -2937,9 +3175,16 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         // key j in [0, step] satisfies the causal check (step >= j), i.e. no masking within the
         // round, matching the CPU host's Attention.Execute(..., positionOffset: step, ...) call.
         int seqKv = step + 1;
-        _kernels.LaunchAttentionF32(s.Q, state.KeyCacheDevicePtr, state.ValueCacheDevicePtr, s.AttnOut,
-            /* seqQ */ 1, /* seqKv */ seqKv, numHeads, numKvHeads, headDim,
-            /* positionOffset */ step, /* slidingWindow */ 0, streamH);
+        if (f32Cache)
+        {
+            _kernels.LaunchAttentionF32(s.Q, state.KeyCacheDevicePtr, state.ValueCacheDevicePtr, s.AttnOut,
+                /* seqQ */ 1, /* seqKv */ seqKv, numHeads, numKvHeads, headDim,
+                /* positionOffset */ step, /* slidingWindow */ 0, streamH);
+        }
+        else
+        {
+            MtpHeadAttention(state, s.Q, s.AttnOut, seqKv, numHeads, numKvHeads, headDim, streamH);
+        }
         ProfMark("mtp-5-attn-core");
 
         // attnOut *= sigmoid(gate) — Qwen3.5/3.6 gated attention, applied before the O-proj.

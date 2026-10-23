@@ -372,6 +372,24 @@ head's K/V bits on quantized weights, so the CUDA batched absorb stays bit-ident
 per-token loop (one stream sync per 64-row chunk instead of one per token). Bonsai 2 27B, Vulkan: S=3 (a K=2 verify) 12.9 → 1.7 ms; S=256
 prefill 1171 → 5 ms. CPU: S=3 178 → 15 ms.
 
+### The head's KV in the trunk's type (CUDA, #1095)
+
+`CudaMtpState` stores the head's K/V in the trunk's KV type per side (Q8_0 / Q4_0 where the fused quantized-KV decode kernel
+takes the head's shape, F16 otherwise; never F32, #1107) and grows it in place with CUDA virtual memory. The absorb and the
+draft step compute K/V in a bounded F32 scratch (one row, or a 64-row absorb chunk, as the trunk does), apply K-norm and RoPE, then store them through the trunk's own
+write (F32 -> F16 -> `quant_f16_to_q{8,4}_0`). A draft step reads the history in place with the fused kvq decode kernel (or
+the F16 tensor-core kernel). Verified on Bonsai-2 27B (`CudaQwen3HybridDenseMtpKvFormatTests`, 600-token prefix, 3 chained
+draft steps):
+
+- the fused read's draft logits equal dequant-to-F16-scratch + the F16 kernel **bit for bit** (q4_0, q8_0, k8v4);
+- the stored rows equal the F32 head's rows stored through the trunk's write, **byte for byte** (and, for F16, the CPU's own
+  half conversion);
+- drift against the F32 head (reported, not asserted): max |dlogit| 0.009-0.010 (f16), 0.04-0.06 (q8_0), 0.33-0.60 (q4_0) on
+  logits up to ~9.8; the draft argmax matched the F32 head on every step.
+
+The trunk verifies every draft, so greedy output cannot change; only acceptance can (measured below / in the PR).
+`DOTLLM_CUDA_MTP_KV=f32` restores F32 storage as the A/B reference arm.
+
 ### Correctness (demonstrated, not asserted)
 
 `MtpSpeculativeDecoderTests` proves token-for-token equivalence between MTP self-speculative
