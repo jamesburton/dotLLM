@@ -1,0 +1,45 @@
+#version 450
+// Merge pass of the QSA sparse attention (issue #819): combines the numSplits partial online-softmax states of every
+// (query, head) into the normalised output row, written at row (qBase + lq) of the [T, numHeads*headDim] attention output.
+
+#define WG_SIZE 256
+#define NEG_INF (-3.4e38)
+
+layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufPartOut { float partOut[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufPartMS  { float partMS[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufOut     { float outp[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint qBase;
+    uint numHeads;
+    uint headDim;
+    uint numSplits;
+} pc;
+
+void main() {
+    uint hq = gl_WorkGroupID.x;
+    uint lq = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint row = lq * pc.numHeads + hq;
+    uint base = row * pc.numSplits;
+
+    float M = NEG_INF;
+    for (uint s = 0u; s < pc.numSplits; s++) M = max(M, partMS[(base + s) * 2u]);
+    float L = 0.0;
+    for (uint s = 0u; s < pc.numSplits; s++) {
+        float ms = partMS[(base + s) * 2u];
+        if (ms > NEG_INF * 0.5) L += exp(ms - M) * partMS[(base + s) * 2u + 1u];
+    }
+    float invL = (L > 1e-20) ? (1.0 / L) : 0.0;
+    uint outBase = (pc.qBase + lq) * pc.numHeads * pc.headDim + hq * pc.headDim;
+    for (uint d = tid; d < pc.headDim; d += WG_SIZE) {
+        float acc = 0.0;
+        for (uint s = 0u; s < pc.numSplits; s++) {
+            float ms = partMS[(base + s) * 2u];
+            if (ms > NEG_INF * 0.5) acc += exp(ms - M) * partOut[(base + s) * pc.headDim + d];
+        }
+        outp[outBase + d] = acc * invL;
+    }
+}

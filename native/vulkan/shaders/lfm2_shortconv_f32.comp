@@ -1,0 +1,73 @@
+#version 450
+// LFM2 / LFM2.5 gated short convolution (llama.cpp build_shortconv_block, HF Lfm2ShortConv; issue #1015).
+//
+//   proj[t] = in_proj(norm(x_t)) = [B | C | X]  (3 * channels floats per token)
+//   bx[t]   = B[t] * X[t]
+//   conv[t, c] = sum_{k=0..L-1} weight[c*L + k] * xs[t + k],  xs = [state (L-1 rows, oldest first) | bx]   (tap 0 = oldest)
+//   y[t, c] = C[t, c] * conv[t, c]       (no bias, no activation)
+//   new_state = last L-1 rows of xs
+//
+// mode 0: conv   - one thread per (channel, TT-timestep tile); a register window slides along time so each bx is computed once.
+//                  Reads the OLD state only; a window start inside the tile is rebuilt from proj, so tiles are independent.
+// mode 1: state  - one thread per channel; AFTER mode 0 (barrier), in place. new_state[s] = xs[T + s]; the source index
+//                  T + s is always > s, so reading ahead of the write position within one thread is hazard-free.
+// L <= 8. Dispatch: mode 0 groups = (ceil(channels/256), ceil(seqLen/TT)); mode 1 groups = (ceil(channels/256), 1).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer BufState { float state[]; };                 // [(L-1) * channels], slot 0 = oldest
+layout(set = 0, binding = 1, std430) readonly  buffer BufProj   { float proj[];   };     // [seqLen * 3 * channels]
+layout(set = 0, binding = 2, std430) readonly  buffer BufWeight { float weight[]; };     // [channels * L], channel-major (GGUF layout)
+layout(set = 0, binding = 3, std430) writeonly buffer BufOut    { float outp[];   };     // [seqLen * channels]
+
+layout(push_constant) uniform PushConstants {
+    uint dConv;
+    uint channels;
+    uint seqLen;
+    uint mode;
+} pc;
+
+const uint TT = 16u;
+
+float bx(uint t, uint c) {
+    uint row = t * 3u * pc.channels;
+    return proj[row + c] * proj[row + 2u * pc.channels + c];
+}
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.channels) return;
+    uint taps = pc.dConv;
+
+    if (pc.mode == 1u) {
+        for (uint s = 0u; s + 1u < taps; s++) {
+            uint idx = pc.seqLen + s;
+            float v = idx + 1u < taps ? state[idx * pc.channels + c] : bx(idx - (taps - 1u), c);
+            state[s * pc.channels + c] = v;
+        }
+        return;
+    }
+
+    uint t0 = gl_WorkGroupID.y * TT;
+    if (t0 >= pc.seqLen) return;
+    uint tEnd = min(t0 + TT, pc.seqLen);
+
+    float w[8];
+    for (uint k = 0u; k < taps; k++) w[k] = weight[c * taps + k];
+
+    float win[7];
+    for (uint k = 0u; k + 1u < taps; k++) {
+        int j = int(t0) + int(k) - int(taps - 1u);
+        win[k] = j < 0 ? state[uint(j + int(taps - 1u)) * pc.channels + c] : bx(uint(j), c);
+    }
+
+    for (uint t = t0; t < tEnd; t++) {
+        float cur = bx(t, c);
+        float acc = 0.0;
+        for (uint k = 0u; k + 1u < taps; k++) acc += win[k] * w[k];
+        acc += cur * w[taps - 1u];
+        outp[t * pc.channels + c] = acc * proj[t * 3u * pc.channels + pc.channels + c];
+        for (uint k = 0u; k + 2u < taps; k++) win[k] = win[k + 1u];
+        win[taps - 2u] = cur;
+    }
+}

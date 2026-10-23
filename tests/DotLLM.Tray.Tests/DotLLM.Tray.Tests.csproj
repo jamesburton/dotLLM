@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Matches DotLLM.Tray.Core. A separate project from DotLLM.Tests.Unit because that one is
+         `net10.0` and pulls in every backend; the tray suite needs neither and must not slow it
+         down. CI runs `dotnet test tests/DotLLM.Tests.Unit/` only, so this suite is build-verified
+         on the ubuntu runner (via EnableWindowsTargeting) and executed on Windows. -->
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\DotLLM.Tray.Core\DotLLM.Tray.Core.csproj" />
+    <!-- The contract suite round-trips the real server DTOs against the tray's mirrors, so it
+         references the server. The tray itself deliberately does not. -->
+    <ProjectReference Include="..\..\src\DotLLM.Server\DotLLM.Server.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="Xunit.SkippableFact" />
+  </ItemGroup>
+
+</Project>

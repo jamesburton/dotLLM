@@ -1,0 +1,896 @@
+using DotLLM.Core.Configuration;
+using DotLLM.Core.PositionEncoding;
+using DotLLM.Models.SafeTensors;
+using Xunit;
+
+namespace DotLLM.Tests.Unit.Models.SafeTensors;
+
+/// <summary>
+/// Unit tests for <see cref="HfConfigExtractor"/> — the HuggingFace
+/// <c>config.json</c> → <see cref="Core.Models.ModelConfig"/> parser.
+/// </summary>
+public sealed class HfConfigExtractorTests
+{
+    [Fact]
+    public void Llama_MinimalConfig_PopulatesCoreFields()
+    {
+        const string json = """
+        {
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": 128,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "intermediate_size": 256,
+            "vocab_size": 1000,
+            "max_position_embeddings": 512,
+            "rope_theta": 500000.0,
+            "rms_norm_eps": 1e-5
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+
+        Assert.Equal(Architecture.Llama, cfg.Architecture);
+        Assert.Equal(128, cfg.HiddenSize);
+        Assert.Equal(2, cfg.NumLayers);
+        Assert.Equal(4, cfg.NumAttentionHeads);
+        Assert.Equal(2, cfg.NumKvHeads);
+        Assert.Equal(256, cfg.IntermediateSize);
+        Assert.Equal(1000, cfg.VocabSize);
+        Assert.Equal(512, cfg.MaxSequenceLength);
+        Assert.Equal(32, cfg.HeadDim); // 128 / 4
+        Assert.Equal(1e-5f, cfg.NormEpsilon);
+        Assert.Equal(PositionEncodingType.RoPE, cfg.PositionEncodingType);
+        Assert.NotNull(cfg.RoPEConfig);
+        Assert.Equal(500000.0f, cfg.RoPEConfig!.Value.Theta);
+        // HF Llama uses rotate_half (halves convention), which dotLLM calls NeoX.
+        // Only the GGUF path's permuted weights use Norm.
+        Assert.Equal(RoPEType.NeoX, cfg.RoPEConfig.Value.Type);
+        Assert.False(cfg.TiedEmbeddings);
+    }
+
+    [Fact]
+    public void Mistral_UsesNeoXRoPE()
+    {
+        const string json = """
+        {
+            "architectures": ["MistralForCausalLM"],
+            "hidden_size": 64, "num_hidden_layers": 2, "num_attention_heads": 4,
+            "intermediate_size": 128, "vocab_size": 500, "max_position_embeddings": 256,
+            "sliding_window": 64
+        }
+        """;
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.Equal(Architecture.Mistral, cfg.Architecture);
+        Assert.Equal(4, cfg.NumKvHeads); // defaults to num_attention_heads
+        Assert.Equal(64, cfg.SlidingWindowSize);
+        // HF Mistral copies Llama's apply_rotary_pos_emb (rotate_half = halves = NeoX).
+        Assert.Equal(RoPEType.NeoX, cfg.RoPEConfig!.Value.Type);
+    }
+
+    [Fact]
+    public void Phi_UsesNeoXRoPE_AndTiesByDefault()
+    {
+        const string json = """
+        {
+            "architectures": ["Phi3ForCausalLM"],
+            "model_type": "phi3",
+            "hidden_size": 96, "num_hidden_layers": 2, "num_attention_heads": 4,
+            "intermediate_size": 192, "vocab_size": 500, "max_position_embeddings": 256
+        }
+        """;
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.Equal(Architecture.Phi, cfg.Architecture);
+        Assert.Equal(RoPEType.NeoX, cfg.RoPEConfig!.Value.Type);
+        Assert.True(cfg.TiedEmbeddings);
+    }
+
+    [Fact]
+    public void Qwen_UsesNeoXRoPE_AndExplicitHeadDim()
+    {
+        const string json = """
+        {
+            "architectures": ["Qwen3ForCausalLM"],
+            "model_type": "qwen3",
+            "hidden_size": 128, "num_hidden_layers": 2, "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "intermediate_size": 256, "vocab_size": 500, "max_position_embeddings": 256,
+            "head_dim": 48,
+            "tie_word_embeddings": false
+        }
+        """;
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.Equal(Architecture.Qwen, cfg.Architecture);
+        Assert.Equal(RoPEType.NeoX, cfg.RoPEConfig!.Value.Type);
+        Assert.Equal(48, cfg.HeadDim);
+        Assert.False(cfg.TiedEmbeddings);
+    }
+
+    [Fact]
+    public void NullNumKvHeads_FallsBackToAttentionHeads()
+    {
+        // HF checkpoints sometimes emit `"num_key_value_heads": null` to mean
+        // "use num_attention_heads". JSON null must not crash the parser.
+        const string json = """
+        {
+            "architectures": ["LlamaForCausalLM"],
+            "hidden_size": 64, "num_hidden_layers": 1, "num_attention_heads": 4,
+            "num_key_value_heads": null,
+            "intermediate_size": 128, "vocab_size": 100, "max_position_embeddings": 128
+        }
+        """;
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.Equal(4, cfg.NumKvHeads);
+    }
+
+    [Fact]
+    public void UnsupportedArchitecture_Throws()
+    {
+        const string json = """
+        {"architectures": ["BertForMaskedLM"], "model_type": "bert",
+         "hidden_size": 64, "num_hidden_layers": 1, "num_attention_heads": 4,
+         "intermediate_size": 128, "vocab_size": 100, "max_position_embeddings": 128}
+        """;
+        var ex = Assert.Throws<InvalidDataException>(() => HfConfigExtractor.Extract(json));
+        Assert.Contains("Unsupported HF architecture", ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Mixtral config is detected from <c>architectures[0] = "MixtralForCausalLM"</c>
+    /// AND populates <see cref="Core.Models.MoeConfig"/> from
+    /// <c>num_local_experts</c> / <c>num_experts_per_tok</c>. Copy of the
+    /// <c>yujiepan/mixtral-tiny-random</c> config (2026-04).
+    /// </summary>
+    [Fact]
+    public void Mixtral_TinyRandom_PopulatesMoeConfig()
+    {
+        const string json = """
+        {
+            "architectures": ["MixtralForCausalLM"],
+            "model_type": "mixtral",
+            "hidden_size": 4,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "intermediate_size": 8,
+            "vocab_size": 32000,
+            "max_position_embeddings": 32768,
+            "rope_theta": 1000000.0,
+            "rms_norm_eps": 1e-5,
+            "num_local_experts": 8,
+            "num_experts_per_tok": 2,
+            "tie_word_embeddings": false,
+            "sliding_window": null
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.Equal(Architecture.Mixtral, cfg.Architecture);
+        Assert.NotNull(cfg.Moe);
+        Assert.Equal(8, cfg.Moe!.NumExperts);
+        Assert.Equal(2, cfg.Moe.NumExpertsPerTok);
+        Assert.Equal(8, cfg.Moe.MoeIntermediateSize); // defaults to intermediate_size
+        // Attention path stays GQA/RoPE — nothing Mixtral-specific there.
+        Assert.Equal(4, cfg.NumAttentionHeads);
+        Assert.Equal(2, cfg.NumKvHeads);
+        Assert.Equal(1, cfg.HeadDim); // 4 / 4
+        // HF Mixtral copies Llama's apply_rotary_pos_emb (rotate_half = halves = NeoX).
+        Assert.Equal(RoPEType.NeoX, cfg.RoPEConfig!.Value.Type);
+    }
+
+    /// <summary>
+    /// When <c>moe_intermediate_size</c> is declared explicitly (Phi-3.5-MoE
+    /// convention), <see cref="Core.Models.MoeConfig.MoeIntermediateSize"/>
+    /// should reflect that value, not the top-level <c>intermediate_size</c>.
+    /// </summary>
+    [Fact]
+    public void Mixtral_OverrideMoeIntermediateSize_UsedOverTopLevel()
+    {
+        const string json = """
+        {
+            "architectures": ["MixtralForCausalLM"],
+            "model_type": "mixtral",
+            "hidden_size": 16, "num_hidden_layers": 1, "num_attention_heads": 4,
+            "num_key_value_heads": 4, "intermediate_size": 64, "moe_intermediate_size": 32,
+            "vocab_size": 100, "max_position_embeddings": 128,
+            "num_local_experts": 4, "num_experts_per_tok": 2
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.NotNull(cfg.Moe);
+        Assert.Equal(32, cfg.Moe!.MoeIntermediateSize);
+        Assert.Equal(64, cfg.IntermediateSize);
+    }
+
+    /// <summary>
+    /// Non-MoE configs must leave <c>ModelConfig.Moe</c> null — the dense
+    /// FFN path keys off that.
+    /// </summary>
+    [Fact]
+    public void DenseLlama_NoMoeConfig()
+    {
+        const string json = """
+        {"architectures": ["LlamaForCausalLM"], "model_type": "llama",
+         "hidden_size": 64, "num_hidden_layers": 1, "num_attention_heads": 4,
+         "intermediate_size": 128, "vocab_size": 100, "max_position_embeddings": 128}
+        """;
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.Null(cfg.Moe);
+    }
+
+    /// <summary>
+    /// Declaring experts without a top-k should throw — misconfigured MoE is
+    /// never silently ignored.
+    /// </summary>
+    [Fact]
+    public void Mixtral_MissingNumExpertsPerTok_Throws()
+    {
+        const string json = """
+        {"architectures": ["MixtralForCausalLM"], "model_type": "mixtral",
+         "hidden_size": 4, "num_hidden_layers": 1, "num_attention_heads": 4,
+         "intermediate_size": 8, "vocab_size": 100, "max_position_embeddings": 128,
+         "num_local_experts": 8}
+        """;
+        var ex = Assert.Throws<InvalidDataException>(() => HfConfigExtractor.Extract(json));
+        Assert.Contains("num_experts_per_tok", ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Qwen3-MoE detection path — copy of the real
+    /// <c>yujiepan/qwen3-moe-tiny-random</c> config (2026-04). Must resolve
+    /// to <see cref="Architecture.QwenMoe"/>, populate MoE fields, use NeoX
+    /// RoPE (Qwen family), leave shared-expert fields null, and carry the
+    /// <c>decoder_sparse_step=2</c> layer-level sparsity across.
+    /// </summary>
+    [Fact]
+    public void Qwen3Moe_TinyRandom_PopulatesMoeConfig_NoSharedExpert()
+    {
+        const string json = """
+        {
+            "architectures": ["Qwen3MoeForCausalLM"],
+            "model_type": "qwen3_moe",
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 32,
+            "intermediate_size": 128,
+            "moe_intermediate_size": 128,
+            "vocab_size": 151936,
+            "max_position_embeddings": 40960,
+            "rope_theta": 1000000.0,
+            "rms_norm_eps": 1e-6,
+            "num_experts": 8,
+            "num_experts_per_tok": 2,
+            "norm_topk_prob": true,
+            "decoder_sparse_step": 2,
+            "mlp_only_layers": [],
+            "tie_word_embeddings": true
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.Equal(Architecture.QwenMoe, cfg.Architecture);
+        Assert.Equal(RoPEType.NeoX, cfg.RoPEConfig!.Value.Type);
+        Assert.NotNull(cfg.Moe);
+        Assert.Equal(8, cfg.Moe!.NumExperts);
+        Assert.Equal(2, cfg.Moe.NumExpertsPerTok);
+        Assert.Equal(128, cfg.Moe.MoeIntermediateSize);
+        Assert.True(cfg.Moe.NormTopKProb);
+        Assert.Null(cfg.Moe.SharedExpertIntermediateSize);
+        Assert.False(cfg.Moe.HasSharedExpertGate);
+        Assert.Equal(2, cfg.Moe.DecoderSparseStep);
+        // decoder_sparse_step=2 ⇒ layer 0 is dense, layer 1 is MoE.
+        Assert.False(cfg.Moe.IsMoeLayer(0));
+        Assert.True(cfg.Moe.IsMoeLayer(1));
+    }
+
+    /// <summary>
+    /// Qwen1.5-MoE-A2.7B config (2026-04) — has a shared expert with sigmoid
+    /// gate and <c>norm_topk_prob=false</c>. Must surface all three via the
+    /// extracted <see cref="Core.Models.MoeConfig"/>.
+    /// </summary>
+    [Fact]
+    public void Qwen15Moe_A27B_PopulatesSharedExpertAndRawTopKProb()
+    {
+        const string json = """
+        {
+            "architectures": ["Qwen2MoeForCausalLM"],
+            "model_type": "qwen2_moe",
+            "hidden_size": 2048,
+            "num_hidden_layers": 24,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "intermediate_size": 5632,
+            "moe_intermediate_size": 1408,
+            "shared_expert_intermediate_size": 5632,
+            "vocab_size": 151936,
+            "max_position_embeddings": 8192,
+            "rope_theta": 1000000.0,
+            "rms_norm_eps": 1e-6,
+            "num_experts": 60,
+            "num_experts_per_tok": 4,
+            "norm_topk_prob": false,
+            "decoder_sparse_step": 1,
+            "tie_word_embeddings": false
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.Equal(Architecture.QwenMoe, cfg.Architecture);
+        Assert.NotNull(cfg.Moe);
+        Assert.Equal(60, cfg.Moe!.NumExperts);
+        Assert.Equal(4, cfg.Moe.NumExpertsPerTok);
+        Assert.Equal(1408, cfg.Moe.MoeIntermediateSize);
+        Assert.False(cfg.Moe.NormTopKProb);
+        Assert.Equal(5632, cfg.Moe.SharedExpertIntermediateSize);
+        Assert.True(cfg.Moe.HasSharedExpertGate);
+        Assert.Equal(1, cfg.Moe.DecoderSparseStep);
+        // decoder_sparse_step=1 ⇒ every layer is MoE.
+        Assert.True(cfg.Moe.IsMoeLayer(0));
+        Assert.True(cfg.Moe.IsMoeLayer(23));
+    }
+
+    /// <summary>
+    /// Qwen-MoE <c>mlp_only_layers</c> override: forces listed layer indices
+    /// to be dense MLPs even if the sparsity stride would otherwise mark
+    /// them MoE.
+    /// </summary>
+    [Fact]
+    public void QwenMoe_MlpOnlyLayersOverride_RespectedByIsMoeLayer()
+    {
+        const string json = """
+        {
+            "architectures": ["Qwen3MoeForCausalLM"],
+            "model_type": "qwen3_moe",
+            "hidden_size": 64, "num_hidden_layers": 4, "num_attention_heads": 2,
+            "num_key_value_heads": 1, "head_dim": 32,
+            "intermediate_size": 128, "vocab_size": 100,
+            "max_position_embeddings": 128,
+            "num_experts": 4, "num_experts_per_tok": 2,
+            "decoder_sparse_step": 1,
+            "mlp_only_layers": [2]
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.NotNull(cfg.Moe);
+        Assert.True(cfg.Moe!.IsMoeLayer(0));
+        Assert.True(cfg.Moe.IsMoeLayer(1));
+        Assert.False(cfg.Moe.IsMoeLayer(2));  // forced dense
+        Assert.True(cfg.Moe.IsMoeLayer(3));
+    }
+
+    /// <summary>
+    /// AllenAI OLMoE-1B-7B-0924 config (verbatim from the HF checkpoint,
+    /// 2026-07). <c>model_type=olmoe</c> / <c>OlmoeForCausalLM</c> must resolve
+    /// to <see cref="Architecture.QwenMoe"/> (it reuses the Qwen-MoE tensor
+    /// layout + GQA attention). MoE fields: 64 experts, top-8,
+    /// <c>norm_topk_prob=false</c>, NO shared expert. OLMoE carries no
+    /// <c>moe_intermediate_size</c> — the per-expert width is the top-level
+    /// <c>intermediate_size</c> (1024). NeoX RoPE (Llama-descended). Every
+    /// layer is MoE (no decoder_sparse_step).
+    /// </summary>
+    [Fact]
+    public void Olmoe_1B7B_0924_ResolvesToQwenMoe_RoutedOnly()
+    {
+        const string json = """
+        {
+            "architectures": ["OlmoeForCausalLM"],
+            "model_type": "olmoe",
+            "hidden_size": 2048,
+            "num_hidden_layers": 16,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "intermediate_size": 1024,
+            "vocab_size": 50304,
+            "max_position_embeddings": 4096,
+            "rope_theta": 10000.0,
+            "rms_norm_eps": 1e-5,
+            "clip_qkv": null,
+            "num_experts": 64,
+            "num_experts_per_tok": 8,
+            "norm_topk_prob": false,
+            "tie_word_embeddings": false
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.Equal(Architecture.QwenMoe, cfg.Architecture);
+        Assert.Equal(RoPEType.NeoX, cfg.RoPEConfig!.Value.Type);
+        Assert.Equal(2048, cfg.HiddenSize);
+        Assert.Equal(16, cfg.NumLayers);
+        Assert.Equal(16, cfg.NumAttentionHeads);
+        Assert.Equal(16, cfg.NumKvHeads);
+        Assert.Equal(128, cfg.HeadDim); // 2048 / 16 (no explicit head_dim)
+
+        Assert.NotNull(cfg.Moe);
+        Assert.Equal(64, cfg.Moe!.NumExperts);
+        Assert.Equal(8, cfg.Moe.NumExpertsPerTok);
+        // OLMoE has no moe_intermediate_size → per-expert width == intermediate_size.
+        Assert.Equal(1024, cfg.Moe.MoeIntermediateSize);
+        Assert.False(cfg.Moe.NormTopKProb);
+        // No shared expert (routed-only path).
+        Assert.Null(cfg.Moe.SharedExpertIntermediateSize);
+        Assert.False(cfg.Moe.HasSharedExpertGate);
+        // Every layer is MoE.
+        Assert.Equal(1, cfg.Moe.DecoderSparseStep);
+        Assert.True(cfg.Moe.IsMoeLayer(0));
+        Assert.True(cfg.Moe.IsMoeLayer(15));
+    }
+
+    [Fact]
+    public void DeepSeekV2Lite_PopulatesMlaAndMoe()
+    {
+        // Schema from deepseek-ai/DeepSeek-V2-Lite config.json. Truncated for the
+        // fields the extractor consumes — verifies MLA detection, MlaConfig
+        // population, MoE plumbing (n_routed_experts + moe_intermediate_size
+        // + n_shared_experts), and first_k_dense_replace folded into
+        // MlpOnlyLayers so IsMoeLayer reflects the dense-prefix convention.
+        const string json = """
+        {
+            "architectures": ["DeepseekV2ForCausalLM"],
+            "model_type": "deepseek_v2",
+            "hidden_size": 2048,
+            "num_hidden_layers": 27,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "intermediate_size": 10944,
+            "vocab_size": 102400,
+            "max_position_embeddings": 163840,
+            "rope_theta": 10000.0,
+            "rms_norm_eps": 1e-6,
+            "kv_lora_rank": 512,
+            "q_lora_rank": 0,
+            "qk_nope_head_dim": 128,
+            "qk_rope_head_dim": 64,
+            "v_head_dim": 128,
+            "n_routed_experts": 64,
+            "num_experts_per_tok": 6,
+            "moe_intermediate_size": 1408,
+            "n_shared_experts": 2,
+            "first_k_dense_replace": 1,
+            "norm_topk_prob": false
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+
+        Assert.Equal(Architecture.DeepSeekV2, cfg.Architecture);
+        Assert.Equal(AttentionType.MLA, cfg.AttentionType);
+
+        Assert.NotNull(cfg.MlaConfig);
+        Assert.Equal(512, cfg.MlaConfig!.KvLoraRank);
+        Assert.Equal(0, cfg.MlaConfig.QLoraRank);
+        Assert.Equal(128, cfg.MlaConfig.QkNopeHeadDim);
+        Assert.Equal(64, cfg.MlaConfig.QkRopeHeadDim);
+        Assert.Equal(128, cfg.MlaConfig.VHeadDim);
+        Assert.Equal(192, cfg.MlaConfig.QkHeadDim);  // 128 + 64
+        Assert.Equal(192, cfg.HeadDim);              // HeadDim reuses qk_head_dim
+
+        Assert.NotNull(cfg.Moe);
+        Assert.Equal(64, cfg.Moe!.NumExperts);
+        Assert.Equal(6, cfg.Moe.NumExpertsPerTok);
+        Assert.Equal(1408, cfg.Moe.MoeIntermediateSize);
+        Assert.False(cfg.Moe.NormTopKProb);
+        // DeepSeek-V2 fuses n_shared_experts shared experts into a SINGLE
+        // DeepseekV2MLP(intermediate_size = moe_intermediate_size *
+        // n_shared_experts) per modeling_deepseek.py. The checkpoint reflects
+        // that — tensors are mlp.shared_experts.{gate,up,down}_proj with no
+        // numeric expert index. We represent this as NumSharedExperts=1 with
+        // fused SharedExpertIntermediateSize=1408*2=2816.
+        Assert.Equal(1408 * 2, cfg.Moe.SharedExpertIntermediateSize);
+        Assert.Equal(1, cfg.Moe.NumSharedExperts);
+        Assert.False(cfg.Moe.HasSharedExpertGate); // DeepSeek does NOT gate
+
+        // first_k_dense_replace=1 → layer 0 is dense, 1..26 are MoE
+        Assert.False(cfg.Moe.IsMoeLayer(0));
+        Assert.True(cfg.Moe.IsMoeLayer(1));
+        Assert.True(cfg.Moe.IsMoeLayer(26));
+    }
+
+    [Fact]
+    public void DeepSeekV2_WithQLoraRank_PopulatesQFactorisationRank()
+    {
+        // DeepSeek-V2 full (non-Lite) uses q_lora_rank = 1536.
+        const string json = """
+        {
+            "architectures": ["DeepseekV2ForCausalLM"],
+            "model_type": "deepseek_v2",
+            "hidden_size": 5120,
+            "num_hidden_layers": 60,
+            "num_attention_heads": 128,
+            "num_key_value_heads": 128,
+            "intermediate_size": 12288,
+            "vocab_size": 102400,
+            "max_position_embeddings": 163840,
+            "rope_theta": 10000.0,
+            "rms_norm_eps": 1e-6,
+            "kv_lora_rank": 512,
+            "q_lora_rank": 1536,
+            "qk_nope_head_dim": 128,
+            "qk_rope_head_dim": 64,
+            "v_head_dim": 128,
+            "n_routed_experts": 160,
+            "num_experts_per_tok": 6,
+            "moe_intermediate_size": 1536,
+            "first_k_dense_replace": 1
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.Equal(Architecture.DeepSeekV2, cfg.Architecture);
+        Assert.NotNull(cfg.MlaConfig);
+        Assert.Equal(1536, cfg.MlaConfig!.QLoraRank);
+        Assert.Equal(192, cfg.MlaConfig.QkHeadDim);
+    }
+
+    [Fact]
+    public void DeepSeekV3_DetectedByArchitectureName()
+    {
+        const string json = """
+        {
+            "architectures": ["DeepseekV3ForCausalLM"],
+            "model_type": "deepseek_v3",
+            "hidden_size": 128, "num_hidden_layers": 2,
+            "num_attention_heads": 4, "num_key_value_heads": 4,
+            "intermediate_size": 256, "vocab_size": 100,
+            "max_position_embeddings": 128,
+            "kv_lora_rank": 32, "q_lora_rank": 24,
+            "qk_nope_head_dim": 16, "qk_rope_head_dim": 8, "v_head_dim": 16,
+            "n_routed_experts": 4, "num_experts_per_tok": 2,
+            "moe_intermediate_size": 64, "n_shared_experts": 1,
+            "first_k_dense_replace": 0
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.Equal(Architecture.DeepSeekV3, cfg.Architecture);
+        Assert.Equal(AttentionType.MLA, cfg.AttentionType);
+        Assert.NotNull(cfg.MlaConfig);
+        Assert.Equal(32, cfg.MlaConfig!.KvLoraRank);
+        Assert.Equal(24, cfg.MlaConfig.QLoraRank);
+
+        // first_k_dense_replace = 0 means every layer is MoE.
+        Assert.NotNull(cfg.Moe);
+        Assert.True(cfg.Moe!.IsMoeLayer(0));
+        Assert.True(cfg.Moe.IsMoeLayer(1));
+    }
+
+    /// <summary>
+    /// SmolLM3-3B detection on the real-world HF config (2026-05 snapshot).
+    /// <c>architectures[0]=SmolLM3ForCausalLM</c>, <c>model_type=smollm3</c>,
+    /// GQA-4, NeoX RoPE, NoPE on every 4th layer (indices 3, 7, 11, ... in
+    /// the 36-layer SKU).
+    /// </summary>
+    [Fact]
+    public void SmolLM3_3B_DetectsArchAndParsesNoPeLayers()
+    {
+        // Authoritative copy of HuggingFaceTB/SmolLM3-3B/config.json's
+        // shape (vocab/hidden/heads), with the canonical 36-element
+        // no_rope_layers pattern (1,1,1,0) × 9. The roadmap step 56
+        // acceptance test specifies the resulting NoPE index set
+        // {3, 7, 11, 15, 19, 23, 27, 31, 35}.
+        const string json = """
+        {
+            "architectures": ["SmolLM3ForCausalLM"],
+            "model_type": "smollm3",
+            "hidden_size": 2048,
+            "num_hidden_layers": 36,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 128,
+            "intermediate_size": 11008,
+            "vocab_size": 128256,
+            "max_position_embeddings": 65536,
+            "rope_theta": 5000000.0,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": true,
+            "no_rope_layer_interval": 4,
+            "no_rope_layers": [1,1,1,0,1,1,1,0,1,1,1,0,1,1,1,0,1,1,1,0,1,1,1,0,1,1,1,0,1,1,1,0,1,1,1,0]
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+
+        Assert.Equal(Architecture.SmolLM3, cfg.Architecture);
+        Assert.Equal(36, cfg.NumLayers);
+        Assert.Equal(16, cfg.NumAttentionHeads);
+        Assert.Equal(4, cfg.NumKvHeads);
+        Assert.Equal(128, cfg.HeadDim);
+        Assert.Equal(2048, cfg.HiddenSize);
+        Assert.Equal(11008, cfg.IntermediateSize);
+        Assert.Equal(128256, cfg.VocabSize);
+        Assert.Equal(65536, cfg.MaxSequenceLength);
+        Assert.Equal(5_000_000.0f, cfg.RoPEConfig!.Value.Theta);
+        // HF transformers' SmolLM3 inherits rotate_half from Llama.
+        Assert.Equal(RoPEType.NeoX, cfg.RoPEConfig.Value.Type);
+        Assert.True(cfg.TiedEmbeddings);
+
+        // NoPE mask: HF stores 1 = apply RoPE, 0 = skip RoPE. Extractor
+        // inverts to the indices that SKIP RoPE.
+        Assert.NotNull(cfg.NoRopeLayers);
+        Assert.Equal(
+            new[] { 3, 7, 11, 15, 19, 23, 27, 31, 35 },
+            cfg.NoRopeLayers!.ToArray());
+        Assert.True(cfg.IsNoRopeLayer(3));
+        Assert.True(cfg.IsNoRopeLayer(35));
+        Assert.False(cfg.IsNoRopeLayer(0));
+        Assert.False(cfg.IsNoRopeLayer(1));
+        Assert.False(cfg.IsNoRopeLayer(2));
+    }
+
+    /// <summary>
+    /// SmolLM3 without <c>no_rope_layers</c> (e.g. a hypothetical "every
+    /// layer keeps RoPE" SKU) must leave <see cref="Core.Models.ModelConfig.NoRopeLayers"/>
+    /// null so the forward path skips the gating altogether (zero cost
+    /// when feature is absent).
+    /// </summary>
+    [Fact]
+    public void SmolLM3_NoNoRopeLayers_FieldIsNull()
+    {
+        const string json = """
+        {
+            "architectures": ["SmolLM3ForCausalLM"],
+            "model_type": "smollm3",
+            "hidden_size": 64, "num_hidden_layers": 4, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "intermediate_size": 128,
+            "vocab_size": 100, "max_position_embeddings": 256
+        }
+        """;
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.Equal(Architecture.SmolLM3, cfg.Architecture);
+        Assert.Null(cfg.NoRopeLayers);
+        Assert.False(cfg.IsNoRopeLayer(0));
+        Assert.False(cfg.IsNoRopeLayer(3));
+    }
+
+    /// <summary>
+    /// SmolLM3 with a <c>rope_scaling</c> YaRN block (the 128k long-context
+    /// SKU) populates <see cref="Core.PositionEncoding.RoPEConfig.ScalingType"/>,
+    /// the factor, <c>original_max_position_embeddings</c>, and the YaRN
+    /// beta_fast/beta_slow defaults. The roadmap step 56 acceptance test
+    /// specifies this pathway: with <c>original_max_position_embeddings=4096</c>
+    /// and a position beyond it the RoPE frequency must be YaRN-scaled.
+    /// </summary>
+    [Fact]
+    public void SmolLM3_YarnRopeScaling_PopulatesRopeConfig()
+    {
+        const string json = """
+        {
+            "architectures": ["SmolLM3ForCausalLM"],
+            "model_type": "smollm3",
+            "hidden_size": 64, "num_hidden_layers": 2, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "intermediate_size": 128,
+            "vocab_size": 100, "max_position_embeddings": 131072,
+            "rope_theta": 5000000.0,
+            "rope_scaling": {
+                "rope_type": "yarn",
+                "factor": 32.0,
+                "original_max_position_embeddings": 4096
+            },
+            "no_rope_layers": [1,0]
+        }
+        """;
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.Equal(Architecture.SmolLM3, cfg.Architecture);
+        Assert.Equal(RoPEScalingType.YaRN, cfg.RoPEConfig!.Value.ScalingType);
+        Assert.Equal(32.0f, cfg.RoPEConfig.Value.ScalingFactor);
+        Assert.Equal(4096, cfg.RoPEConfig.Value.OrigMaxSeqLen);
+        Assert.Equal(32.0f, cfg.RoPEConfig.Value.BetaFast); // default
+        Assert.Equal(1.0f, cfg.RoPEConfig.Value.BetaSlow); // default
+        // no_rope_layers=[1,0] -> only layer index 1 skips RoPE.
+        Assert.Equal(new[] { 1 }, cfg.NoRopeLayers!.ToArray());
+    }
+
+    // ───────────────────── Gemma 3 ─────────────────────
+
+    /// <summary>
+    /// Text-only Gemma 3 checkpoint: <c>model_type=gemma3_text</c>,
+    /// <c>architectures[0]=Gemma3TextForCausalLM</c>. Verifies the activation flips to
+    /// <see cref="ActivationFunction.GELUTanh"/>, the four-norm Gemma layout knobs land,
+    /// soft-cap fields propagate, and the per-layer attention-type list follows the
+    /// <c>sliding_window_pattern</c> formula <c>(i + 1) % pattern == 0 ⇒ full</c>.
+    /// </summary>
+    [Fact]
+    public void Gemma3_TextOnly_PopulatesGemmaFields()
+    {
+        const string json = """
+        {
+            "architectures": ["Gemma3TextForCausalLM"],
+            "model_type": "gemma3_text",
+            "hidden_size": 64,
+            "num_hidden_layers": 6,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "intermediate_size": 128,
+            "vocab_size": 256,
+            "max_position_embeddings": 1024,
+            "head_dim": 32,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000.0,
+            "hidden_activation": "gelu_pytorch_tanh",
+            "sliding_window": 512,
+            "sliding_window_pattern": 3,
+            "query_pre_attn_scalar": 256,
+            "attn_logit_softcapping": 50.0,
+            "final_logit_softcapping": 30.0
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+
+        Assert.Equal(Architecture.Gemma3, cfg.Architecture);
+        Assert.Equal(ActivationFunction.GELUTanh, cfg.ActivationFunction);
+        Assert.Equal(NormType.RMSNorm, cfg.NormType);
+        Assert.Equal(512, cfg.SlidingWindowSize);
+        Assert.Equal(50f, cfg.AttnLogitSoftcap);
+        Assert.Equal(30f, cfg.FinalLogitSoftcap);
+        Assert.Equal(256f, cfg.QueryPreAttnScalar);
+        Assert.True(cfg.TiedEmbeddings, "Gemma 3 default ties word embeddings.");
+
+        // Gemma scales input embeddings by sqrt(hidden_size).
+        Assert.NotNull(cfg.EmbeddingScale);
+        Assert.Equal(MathF.Sqrt(64), cfg.EmbeddingScale!.Value, precision: 5);
+
+        // Per-layer attention pattern with sliding_window_pattern=3 on 6 layers:
+        // (i+1) % 3 == 0 ⇒ full, else sliding.
+        Assert.NotNull(cfg.PerLayerSlidingWindow);
+        var perLayer = cfg.PerLayerSlidingWindow!;
+        Assert.Equal(6, perLayer.Count);
+        Assert.Equal(512, perLayer[0]);
+        Assert.Equal(512, perLayer[1]);
+        Assert.Null(perLayer[2]);   // full attention every 3rd layer
+        Assert.Equal(512, perLayer[3]);
+        Assert.Equal(512, perLayer[4]);
+        Assert.Null(perLayer[5]);
+    }
+
+    /// <summary>
+    /// Multimodal Gemma 3 checkpoint (<c>model_type=gemma3</c>,
+    /// <c>architectures[0]=Gemma3ForConditionalGeneration</c>) embeds the text-tower
+    /// config under a <c>text_config</c> sub-object. The extractor must hoist that
+    /// sub-object so subsequent field lookups see the text-tower shape, and the
+    /// architecture still resolves to <see cref="Architecture.Gemma3"/>.
+    /// </summary>
+    [Fact]
+    public void Gemma3_Multimodal_HoistsTextConfig()
+    {
+        const string json = """
+        {
+            "architectures": ["Gemma3ForConditionalGeneration"],
+            "model_type": "gemma3",
+            "text_config": {
+                "model_type": "gemma3_text",
+                "hidden_size": 32,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "intermediate_size": 128,
+                "vocab_size": 1000,
+                "max_position_embeddings": 1024,
+                "head_dim": 32,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 1000000.0,
+                "hidden_activation": "gelu_pytorch_tanh",
+                "sliding_window": 1024,
+                "sliding_window_pattern": 2,
+                "query_pre_attn_scalar": 168,
+                "attn_logit_softcapping": null,
+                "final_logit_softcapping": null
+            },
+            "vision_config": { "model_type": "siglip_vision_model" }
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+
+        Assert.Equal(Architecture.Gemma3, cfg.Architecture);
+        Assert.Equal(32, cfg.HiddenSize);
+        Assert.Equal(2, cfg.NumLayers);
+        Assert.Equal(1000, cfg.VocabSize);
+        Assert.Equal(ActivationFunction.GELUTanh, cfg.ActivationFunction);
+        Assert.Equal(1024, cfg.SlidingWindowSize);
+        Assert.Null(cfg.AttnLogitSoftcap);     // null in JSON ⇒ null in config
+        Assert.Null(cfg.FinalLogitSoftcap);
+        Assert.Equal(168f, cfg.QueryPreAttnScalar);
+
+        // sliding_window_pattern=2 on 2 layers → [sliding, full]
+        Assert.NotNull(cfg.PerLayerSlidingWindow);
+        Assert.Equal(2, cfg.PerLayerSlidingWindow!.Count);
+        Assert.Equal(1024, cfg.PerLayerSlidingWindow[0]);
+        Assert.Null(cfg.PerLayerSlidingWindow[1]);
+    }
+
+    /// <summary>
+    /// Explicit <c>layer_types</c> array overrides the
+    /// <c>sliding_window_pattern</c> formula. Supports HF's newer convention where the
+    /// per-layer pattern is shipped verbatim.
+    /// </summary>
+    [Fact]
+    public void Gemma3_LayerTypesArray_OverridesSlidingWindowPattern()
+    {
+        const string json = """
+        {
+            "architectures": ["Gemma3TextForCausalLM"],
+            "model_type": "gemma3_text",
+            "hidden_size": 32, "num_hidden_layers": 4,
+            "num_attention_heads": 2, "num_key_value_heads": 1,
+            "intermediate_size": 64, "vocab_size": 100,
+            "max_position_embeddings": 512,
+            "sliding_window": 128,
+            "sliding_window_pattern": 6,
+            "layer_types": ["full_attention", "sliding_attention", "full_attention", "sliding_attention"]
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.NotNull(cfg.PerLayerSlidingWindow);
+        Assert.Equal(4, cfg.PerLayerSlidingWindow!.Count);
+        Assert.Null(cfg.PerLayerSlidingWindow[0]);    // full
+        Assert.Equal(128, cfg.PerLayerSlidingWindow[1]); // sliding
+        Assert.Null(cfg.PerLayerSlidingWindow[2]);
+        Assert.Equal(128, cfg.PerLayerSlidingWindow[3]);
+    }
+
+    /// <summary>
+    /// Gemma-4 E2B (<c>Gemma4ForConditionalGeneration</c>, text tower under
+    /// <c>text_config</c> with <c>model_type=gemma4_text</c>): the dense + PLE shape.
+    /// The extractor must hoist text_config, resolve <see cref="Architecture.Gemma4"/>,
+    /// populate <see cref="Core.Models.ModelConfig.PerLayerEmbedding"/>, set GeGLU-tanh
+    /// activation + the sqrt(hidden) embedding scale, and leave Moe null (dense tower).
+    /// </summary>
+    [Fact]
+    public void Gemma4_E2B_TextTower_DetectsPerLayerEmbeddingsAndDenseGemma()
+    {
+        const string json = """
+        {
+            "architectures": ["Gemma4ForConditionalGeneration"],
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 1536,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 1,
+                "head_dim": 256,
+                "intermediate_size": 6144,
+                "vocab_size": 262144,
+                "max_position_embeddings": 131072,
+                "sliding_window": 512,
+                "rms_norm_eps": 1e-6,
+                "hidden_activation": "gelu_pytorch_tanh",
+                "final_logit_softcapping": 30.0,
+                "tie_word_embeddings": true,
+                "enable_moe_block": false,
+                "hidden_size_per_layer_input": 256,
+                "vocab_size_per_layer_input": 262144,
+                "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention", "full_attention"]
+            }
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+
+        Assert.Equal(Architecture.Gemma4, cfg.Architecture);
+        Assert.True(cfg.IsGemmaArchitecture);
+        Assert.Equal(1536, cfg.HiddenSize);
+        Assert.Equal(1, cfg.NumKvHeads);                 // MQA
+        Assert.Equal(256, cfg.HeadDim);
+        Assert.Equal(ActivationFunction.GELUTanh, cfg.ActivationFunction);
+        Assert.Equal(30.0f, cfg.FinalLogitSoftcap);
+        Assert.NotNull(cfg.EmbeddingScale);
+        Assert.Null(cfg.Moe);                            // dense tower
+
+        Assert.NotNull(cfg.PerLayerEmbedding);
+        Assert.Equal(256, cfg.PerLayerEmbedding!.PerLayerDim);
+        Assert.Equal(262144, cfg.PerLayerEmbedding.VocabSize);
+
+        Assert.NotNull(cfg.PerLayerSlidingWindow);
+        Assert.Equal(512, cfg.PerLayerSlidingWindow![0]);
+        Assert.Null(cfg.PerLayerSlidingWindow[3]);
+    }
+}

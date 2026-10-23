@@ -5,23 +5,26 @@ using DotLLM.Core.Configuration;
 namespace DotLLM.Cpu.Kernels;
 
 /// <summary>
-/// Repacks quantized weight matrices from row-major to R4 interleaved layout.
-/// Groups of 4 consecutive rows have their blocks interleaved column-by-column,
-/// so that 4-row SIMD kernels read sequentially instead of striding across rows.
-/// This improves cache utilization, TLB locality, and hardware prefetch effectiveness.
+/// The "R4" view the 4-row kernels consume: a quantized [M, K] weight seen as full groups of 4 consecutive rows
+/// plus M % 4 tail rows, over the original row-major (memory-mapped) weights.
 /// </summary>
+/// <remarks>
+/// This used to build an interleaved copy (each group's blocks column by column). That copy was a second committed
+/// copy of the projections, about the size of the GGUF, and measured no faster: the same kernels over the original
+/// rows ran within noise and bit-identical (#1156). Nothing is allocated now.
+/// </remarks>
 public static unsafe class WeightRepacking
 {
     /// <summary>Number of rows interleaved per group. Matches existing 4-row kernel batching.</summary>
     public const int InterleaveFactor = 4;
 
     /// <summary>
-    /// Holds a repacked weight matrix with R4 interleaved layout.
-    /// Full groups of 4 rows have their blocks interleaved. Tail rows (M % 4) are appended in original order.
+    /// A 4-row-group view over row-major quantized weights: group <c>g</c> starts at <c>Ptr + g·4·RowBytes</c>, its rows
+    /// are <see cref="RowBytes"/> apart, and the M % 4 tail rows follow the last group.
     /// </summary>
     internal readonly struct RepackedWeight : IDisposable
     {
-        /// <summary>64-byte aligned pointer to repacked data.</summary>
+        /// <summary>The original row-major weights (not owned).</summary>
         public readonly nint Ptr;
 
         /// <summary>Number of complete 4-row groups (M / 4).</summary>
@@ -36,7 +39,7 @@ public static unsafe class WeightRepacking
         /// <summary>Byte size of one quant block.</summary>
         public readonly int BlockBytes;
 
-        /// <summary>Total allocated bytes.</summary>
+        /// <summary>Bytes allocated for the view: always 0 (#1156).</summary>
         public readonly long AllocatedBytes;
 
         public RepackedWeight(nint ptr, int fullGroupCount, int tailRows,
@@ -57,17 +60,16 @@ public static unsafe class WeightRepacking
             get => BlocksPerRow * BlockBytes;
         }
 
-        /// <summary>Pointer to the start of tail rows (after all interleaved groups).</summary>
+        /// <summary>Pointer to the start of the tail rows (after all full groups).</summary>
         public byte* TailPtr
         {
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
             get => (byte*)Ptr + (long)FullGroupCount * InterleaveFactor * RowBytes;
         }
 
+        /// <summary>Nothing to free: the view does not own <see cref="Ptr"/> (#1156).</summary>
         public void Dispose()
         {
-            if (Ptr != 0)
-                NativeMemory.AlignedFree((void*)Ptr);
         }
     }
 
@@ -96,16 +98,13 @@ public static unsafe class WeightRepacking
             or QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K;
 
     /// <summary>
-    /// Repacks a [M, K] quantized weight matrix from row-major to R4 interleaved layout.
-    /// For each group of 4 rows, blocks are stored column-by-column:
-    /// [row0_blk0][row1_blk0][row2_blk0][row3_blk0][row0_blk1][row1_blk1]...
-    /// Tail rows (M % 4) are appended in original row-major order after the interleaved data.
+    /// Returns the 4-row-group view of a [M, K] row-major quantized weight matrix. Allocates and copies nothing (#1156).
     /// </summary>
     /// <param name="sourcePtr">Pointer to original row-major quantized weights.</param>
     /// <param name="qt">Quantization type of the weights.</param>
     /// <param name="m">Number of rows (output dimension).</param>
     /// <param name="k">Number of columns / elements per row (input dimension).</param>
-    /// <returns>A <see cref="RepackedWeight"/> with the interleaved layout. Caller owns disposal.</returns>
+    /// <returns>A <see cref="RepackedWeight"/> view over <paramref name="sourcePtr"/>, which must outlive it.</returns>
     internal static RepackedWeight RepackR4(nint sourcePtr, QuantizationType qt, int m, int k)
     {
         var (blockBytes, groupSize) = GetBlockInfo(qt);
@@ -117,49 +116,14 @@ public static unsafe class WeightRepacking
                 $"k ({k}) must be a multiple of group size ({groupSize}) for {qt}.", nameof(k));
 
         int blocksPerRow = k / groupSize;
-        int rowBytes = blocksPerRow * blockBytes;
         int fullGroups = m / InterleaveFactor;
         int tailRows = m % InterleaveFactor;
 
         if (m == 0)
             return default;
 
-        // Total size = same as original (we're just rearranging blocks)
-        long totalBytes = (long)m * rowBytes;
-        nint destPtr = (nint)NativeMemory.AlignedAlloc((nuint)totalBytes, 64);
-
-        byte* src = (byte*)sourcePtr;
-        byte* dst = (byte*)destPtr;
-
-        // Interleave full groups: for each group of 4 rows, write blocks column-by-column
-        for (int g = 0; g < fullGroups; g++)
-        {
-            int baseRow = g * InterleaveFactor;
-            byte* groupDst = dst + (long)g * InterleaveFactor * rowBytes;
-
-            for (int b = 0; b < blocksPerRow; b++)
-            {
-                byte* colDst = groupDst + (long)b * InterleaveFactor * blockBytes;
-
-                for (int r = 0; r < InterleaveFactor; r++)
-                {
-                    byte* srcBlock = src + (long)(baseRow + r) * rowBytes + (long)b * blockBytes;
-                    byte* dstBlock = colDst + (long)r * blockBytes;
-                    Buffer.MemoryCopy(srcBlock, dstBlock, blockBytes, blockBytes);
-                }
-            }
-        }
-
-        // Copy tail rows as-is (row-major)
-        if (tailRows > 0)
-        {
-            int tailStartRow = fullGroups * InterleaveFactor;
-            byte* tailSrc = src + (long)tailStartRow * rowBytes;
-            byte* tailDst = dst + (long)fullGroups * InterleaveFactor * rowBytes;
-            long tailBytes = (long)tailRows * rowBytes;
-            Buffer.MemoryCopy(tailSrc, tailDst, tailBytes, tailBytes);
-        }
-
-        return new RepackedWeight(destPtr, fullGroups, tailRows, blocksPerRow, blockBytes, totalBytes);
+        // A view, not a copy (#1156): the 4-row kernels read the original rows in place (rows rowBytes apart,
+        // blocks blockBytes apart). Same group offsets and tail position the interleaved copy had, same arithmetic.
+        return new RepackedWeight(sourcePtr, fullGroups, tailRows, blocksPerRow, blockBytes, allocatedBytes: 0);
     }
 }
