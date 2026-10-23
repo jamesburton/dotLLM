@@ -17,6 +17,14 @@ internal sealed class CompiledSchema
     public PropertyNameTrie[] PropertyTries { get; }
 
     /// <summary>
+    /// Whether any node in the schema is an <c>anyOf</c> union. A schema with no <c>anyOf</c>
+    /// node anywhere can never fork during tracking, so its <see cref="SchemaTracker"/> always
+    /// holds exactly one live branch. Computed once at construction and used by the tracker to
+    /// gate the single-branch fast path that avoids cloning the full (wide) branch array.
+    /// </summary>
+    public bool HasAnyOf { get; }
+
+    /// <summary>
     /// Creates a compiled schema from pre-built node and trie arrays.
     /// </summary>
     /// <param name="nodes">Flat array of schema nodes (index 0 = root).</param>
@@ -25,5 +33,6 @@ internal sealed class CompiledSchema
     {
         Nodes = nodes;
         PropertyTries = tries;
+        HasAnyOf = Array.Exists(nodes, n => n.AnyOfNodeIndices != null);
     }
 }

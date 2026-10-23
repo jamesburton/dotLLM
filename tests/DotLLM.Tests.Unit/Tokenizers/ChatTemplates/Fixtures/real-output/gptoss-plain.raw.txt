@@ -1,0 +1,1 @@
+<|channel|>analysis<|message|>The user asks: "What is the capital of France? Answer in one word." The answer is "Paris". Just output that.<|end|><|start|>assistant<|channel|>final<|message|>Paris

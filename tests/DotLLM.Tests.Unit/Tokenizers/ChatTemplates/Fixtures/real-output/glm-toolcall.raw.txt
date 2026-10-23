@@ -1,0 +1,1 @@
+I'll get the current weather in Paris for you.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>

@@ -17,6 +17,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// Generates 15 tokens and compares logits at each step.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaDecodeDebugTest
 {
     private readonly ITestOutputHelper _out;
@@ -109,6 +110,20 @@ public class CudaDecodeDebugTest
         RunLayerBisect(modelPath, "The capital of France is");
     }
 
+    [SkippableFact]
+    public unsafe void DebugDecode_IQ4XS_SidecarLayerBisect()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+
+        string modelPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".dotllm", "models", "bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF",
+            "Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf");
+        Skip.If(!File.Exists(modelPath), "Meta-Llama-3.1-8B-Instruct IQ4_XS GGUF not found");
+
+        RunLayerBisectWithTokens(modelPath, [128000, 791, 6864, 315, 9822, 374]);
+    }
+
     /// <summary>
     /// Isolates whether the error comes from NeoX RoPE, Q/K biases, or both.
     /// Runs GPU with each feature disabled independently and compares error vs baseline.
@@ -123,7 +138,7 @@ public class CudaDecodeDebugTest
             ".dotllm", "models", "Qwen", "Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf");
         Skip.If(!File.Exists(modelPath), "Qwen2.5-0.5B-Instruct Q8_0 GGUF not found");
 
-        var gguf = GgufFile.Open(modelPath);
+        using var gguf = GgufFile.Open(modelPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
 
         int[] promptTokens = GgufBpeTokenizerFactory.Load(gguf.Metadata).Encode("The capital of France is");
@@ -171,7 +186,7 @@ public class CudaDecodeDebugTest
 
     private unsafe void RunLayerBisect(string modelPath, string prompt)
     {
-        var gguf = GgufFile.Open(modelPath);
+        using var gguf = GgufFile.Open(modelPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
 
@@ -213,9 +228,57 @@ public class CudaDecodeDebugTest
         }
     }
 
+    private unsafe void RunLayerBisectWithTokens(string modelPath, int[] promptTokens)
+    {
+        using var gguf = GgufFile.Open(modelPath);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+
+        _out.WriteLine($"Model: {Path.GetFileName(modelPath)}");
+        _out.WriteLine($"Config: {config.Architecture} {config.NumLayers}L/{config.HiddenSize}H " +
+                       $"heads={config.NumAttentionHeads} kvHeads={config.NumKvHeads} headDim={config.HeadDim}");
+        _out.WriteLine($"Prompt tokens ({promptTokens.Length}): [{string.Join(", ", promptTokens)}]");
+
+        int[] positions = new int[promptTokens.Length];
+        for (int i = 0; i < positions.Length; i++) positions[i] = i;
+
+        string ptxDir = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "native", "ptx"));
+
+        int[] checkpoints = [-1, 1, 2];
+        var cpuModel = TransformerModel.LoadFromGguf(gguf, config);
+        var gpuModel = CudaTransformerModel.LoadFromGguf(gguf, config, 0, ptxDir);
+        try
+        {
+            foreach (int maxLayers in checkpoints)
+            {
+                if (maxLayers > config.NumLayers) break;
+
+            cpuModel.DebugMaxLayers = maxLayers;
+            gpuModel.DebugMaxLayers = maxLayers;
+
+            using var cpuLogits = cpuModel.Forward(promptTokens, positions, -1);
+            using var gpuLogits = gpuModel.Forward(promptTokens, positions, 0);
+
+                float* cpuLast = LastLogitRow(cpuLogits, config.VocabSize);
+                float* gpuLast = LastLogitRow(gpuLogits, config.VocabSize);
+                int cpuToken = ArgMax(cpuLast, config.VocabSize);
+                int gpuToken = ArgMax(gpuLast, config.VocabSize);
+                var (maxDiff, meanDiff) = CompareLogitArrays(cpuLast, gpuLast, config.VocabSize);
+
+                string marker = cpuToken != gpuToken ? " *** DIVERGED ***" : "";
+                _out.WriteLine($"Layers={maxLayers:D2} -> CPU:{cpuToken} GPU:{gpuToken}  " +
+                                $"maxDiff={maxDiff:F4} meanDiff={meanDiff:F4}{marker}");
+            }
+        }
+        finally
+        {
+            cpuModel.Dispose();
+            gpuModel.Dispose();
+        }
+    }
+
     private unsafe void RunDecodeComparison(string modelPath, string prompt, int decodeSteps)
     {
-        var gguf = GgufFile.Open(modelPath);
+        using var gguf = GgufFile.Open(modelPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
 
@@ -226,12 +289,12 @@ public class CudaDecodeDebugTest
 
         // CPU model
         var cpuModel = TransformerModel.LoadFromGguf(gguf, config);
-        var cpuKv = new SimpleKvCache(config.NumLayers, config.NumKvHeads, config.HeadDim, 64);
+        using var cpuKv = new SimpleKvCache(config.NumLayers, config.NumKvHeads, config.HeadDim, 64);
 
         // GPU model
         string ptxDir = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "native", "ptx"));
         var gpuModel = CudaTransformerModel.LoadFromGguf(gguf, config, 0, ptxDir);
-        var gpuKv = gpuModel.CreateKvCache(64);
+        using var gpuKv = gpuModel.CreateKvCache(64);
 
         int[] promptTokens = tokenizer.Encode(prompt);
         _out.WriteLine($"Prompt tokens ({promptTokens.Length}): [{string.Join(", ", promptTokens)}]");
@@ -288,8 +351,6 @@ public class CudaDecodeDebugTest
 
         cpuModel.Dispose();
         gpuModel.Dispose();
-        cpuKv.Dispose();
-        gpuKv.Dispose();
     }
 
     private static unsafe (float maxDiff, float meanDiff) CompareLogitArrays(float* a, float* b, int n)
@@ -302,6 +363,12 @@ public class CudaDecodeDebugTest
             if (diff > maxDiff) maxDiff = diff;
         }
         return (maxDiff, sumDiff / n);
+    }
+
+    private static unsafe float* LastLogitRow(ITensor logits, int vocabSize)
+    {
+        int rows = logits.Shape.Rank >= 2 ? logits.Shape[0] : 1;
+        return (float*)logits.DataPointer + (rows - 1) * vocabSize;
     }
 
     private static unsafe (int idx, float val)[] TopK(float* data, int n, int k)

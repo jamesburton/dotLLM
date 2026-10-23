@@ -1,0 +1,45 @@
+#version 450
+// F32 matrix-vector product for the single-row (decode) case: y[m] = dot(A[m, :], x).
+//
+// matmul_f32.comp assigns one thread per output cell, so at N = 1 each thread walks its own K-long row serially with a K-element
+// stride between neighbouring threads (uncoalesced), and a one-output matmul (the MoE shared-expert gate logit) runs on a single
+// thread. On Qwen3.6-35B-A3B decode those F32 matmuls (router, shared-expert gate/up/down, gate logit) were ~17 of 47 ms/token.
+//
+// One workgroup per output row; 128 threads stride across the row in vec4 units, then a shared-memory tree reduction.
+// Requires K % 4 == 0 (caller falls back to matmul_f32.comp otherwise). Same push-constant layout as matmul_f32.comp.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufA { vec4  a4[]; }; // [M*K/4]
+layout(set = 0, binding = 1, std430) readonly  buffer BufB { vec4  x4[]; }; // [K/4]
+layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[];  }; // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N; // always 1
+} pc;
+
+shared float partials[128];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint k4 = pc.K >> 2u;
+    uint rowBase = m * k4;
+
+    float acc = 0.0;
+    for (uint i = tid; i < k4; i += 128u) {
+        acc += dot(a4[rowBase + i], x4[i]);
+    }
+
+    partials[tid] = acc;
+    barrier();
+    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] += partials[tid + stride];
+        barrier();
+    }
+    if (tid == 0u) c[m] = partials[0];
+}

@@ -1,0 +1,5599 @@
+using System.Runtime.CompilerServices;
+using DotLLM.Core.Attention;
+using DotLLM.Core.Configuration;
+using DotLLM.Core.Lora;
+using DotLLM.Core.Models;
+using DotLLM.Core.Tensors;
+using DotLLM.Cpu.Kernels;
+using DotLLM.Cuda.Interop;
+using DotLLM.Models.Gguf;
+
+namespace DotLLM.Cuda.Architectures;
+
+/// <summary>
+/// CUDA implementation of the Qwen3HybridDense (<c>qwen35</c>) model — e.g. PrismML's
+/// Bonsai-27B. F32 activations throughout — mirrors
+/// <c>DotLLM.Models.Architectures.Qwen3HybridDenseTransformerModel</c> (CPU) on the GPU.
+/// Adapted from <see cref="CudaQwen3MoeHybridTransformerModel"/>: the GDN and
+/// full-attention token-mixing sub-layers are byte-for-byte identical (shared
+/// <see cref="HybridLayerLayout"/>/<see cref="GatedDeltaNetConfig"/> infrastructure); the
+/// only structural difference is the FFN sub-layer — dense SwiGLU (this class) instead
+/// of sparse MoE routing.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Each of the <c>numLayers</c> layers has a token-mixing sub-layer (GDN recurrence or
+/// full GQA attention) followed by a dense SwiGLU FFN. Layer kind for every index comes
+/// from <see cref="ModelConfig.HybridLayout"/>; full-attention layers are placed every
+/// <see cref="GatedDeltaNetConfig.FullAttnInterval"/> steps (Bonsai-27B: interval = 4 over
+/// 64 layers → 16 full-attention layers, 48 GDN layers).
+/// </para>
+/// <para>
+/// Unlike <see cref="CudaQwen3MoeHybridTransformerModel"/>'s <c>Gemm</c> dispatcher, this
+/// class's <see cref="Gemm"/> has explicit I2_S / PQ2_0 branches — Bonsai-27B ships PQ2_0
+/// ternary weights, so the ternary GEMV kernels (<see cref="CudaKernels.LaunchPQ2_0GemvF32Native"/>
+/// / <see cref="CudaKernels.LaunchDequantPQ2_0ToF16"/>) must be reachable from every
+/// projection site (GDN, attention, and dense FFN). The decode-time GEMV/fused-GEMV2 path is
+/// F32-native (issue #161) — no F32↔F16 activation-conversion launches around it; only the
+/// prefill dequant-then-cuBLAS-HGEMM path (seqLen &gt; 1) still stages through F16.
+/// </para>
+/// </remarks>
+public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel, IContextLimitable, IRecurrentPrefixSnapshotProvider
+{
+    private readonly CudaQwen3HybridDenseForwardState _state;
+    private readonly CudaGdnStateCache _gdnCache;
+    private readonly CudaStream _stream;
+    private readonly CudaCublasHandle _cublas;
+    private readonly CudaContext _context;
+    private readonly CudaKernels _kernels;
+    private readonly GgufFile? _gguf;
+    private readonly int _deviceId;
+
+    // Per-layer device-side weight pointers — loaded once, alive for model lifetime.
+    private readonly DeviceLayer[] _layers;
+
+    // Output stage: token embedding (shared with lm_head when output.weight is missing) and
+    // the final RMSNorm gain + lm_head projection.
+    private readonly nint _tokenEmbedDevice;
+    private readonly QuantizationType _tokenEmbedQt;
+    private readonly nint _outputNormDevice; // F32 [hiddenSize]
+    private readonly nint _outputDevice;     // lm_head raw quant bytes (may alias _tokenEmbedDevice)
+    private readonly QuantizationType _outputQt;
+    private readonly int _outputOutputDim;   // vocab size
+    private readonly int _outputInputDim;    // hidden size
+    private readonly bool _ownsOutputDevice; // false when aliased to embed
+
+    private readonly HybridLayerLayout _layout;
+    private readonly GatedDeltaNetConfig _gdn;
+    private readonly int _intermediateSize;
+    private readonly int[] _kvSlotForLayer;
+    private readonly int _attentionLayerCount;
+    private readonly int[] _gdnLayerOrdinal;
+
+    private readonly float _ropeTheta;
+
+    // Issue #1101: dense-YaRN rotation (--rope-scaling yarn). Device copy of RoPE.ResolveDenseYarn's ramped inverse
+    // frequencies ([ropeDim / 2] F32) and the cos/sin multiplier; 0 / 1 when YaRN is off, which every RoPE launch below
+    // treats as the plain theta rotation.
+    private nint _ropeYarnInvFreq;
+    private readonly float _ropeYarnMscale = 1.0f;
+    private readonly int _ropeDim;
+
+    // Model-owned device F16 scratch for on-the-fly weight dequant in the prefill path
+    // (seqLen > 1). See CudaQwen3MoeHybridTransformerModel's field doc for the full
+    // rationale — identical convention here.
+    //
+    // #495: LAZY and demand-sized. This used to be allocated at model load sized to the widest
+    // weight tile in the whole model, which on Bonsai 2 27B is the lm_head (248320 x 5120) =
+    // 2.54 GB (2425 MiB) of device F16 — allocated before a single token was seen, on a card that is
+    // already holding ~7.6 GB of weights. Every PQ2_0 projection the model actually runs is now
+    // covered by a packed path (#482 multi-column GEMV at 2..8 rows, #485 dp4a W2A8 GEMV,
+    // #490 tiled MMQ prefill), so on a folded PQ2_0 checkpoint that buffer was dead weight.
+    // It is now allocated on first actual use at exactly the m*k that use needs and grown (never
+    // shrunk) from there, exactly like _activF16InScratch/_activF16OutScratch below — so a weight
+    // type or shape that still needs dequant + cuBLAS gets it on demand, and a model whose every
+    // projection stays on a packed path never pays for it at all.
+    private nint _dequantScratchF16Weight;
+    private long _dequantScratchF16WeightElems;
+
+    // Lazily allocated F16 activation staging buffers for the decode/prefill F16 GEMV/GEMM
+    // path. Activations live in F32; the quantised GEMV kernels and cuBLAS HGEMM consume F16.
+    private nint _activF16InScratch;
+    private long _activF16InScratchElems;
+    private nint _activF16OutScratch;
+    private long _activF16OutScratchElems;
+
+    // #482: set once the "multi-column PQ2_0 GEMV unavailable" warning has been printed, so a
+    // missing/stale pq2_0_gemv_multi.ptx is reported once per model, not once per projection.
+    private bool _warnedNoPQ2_0GemvMulti;
+
+    // #485: int8 activation scratch for the dp4a PQ2_0 GEMV — the permuted int8 rows [seqLen, k] and
+    // one 8-byte { scale, sum } pair per 32 elements. Lazily grown (never shrunk) like the F16
+    // staging buffers above, so steady-state decode/verify allocates nothing.
+    private nint _activQ8InScratch;
+    private long _activQ8InScratchElems;
+    private nint _activQ8MetaScratch;
+    private bool _warnedNoPQ2_0GemvDp4a;
+    private bool _warnedNoPQ2_0Mmq;     // #490
+    private int _dp4aGemvLaunches;      // test-visible launch counters (Dp4aLaunchCounts)
+    private int _dp4aQuantizeLaunches;
+    private int _pq2_0MmqLaunches;      // #490 (Pq2_0MmqLaunchCount)
+    private int _lmHeadRowChunks;       // #1099 (LmHeadLaunchCounts)
+    private int _lmHeadDequantTiles;    // #1099 (LmHeadLaunchCounts)
+    private bool _warnedLmHeadTiled;    // #1099: one notice per model that the head dequantizes in tiles
+#if DEBUG
+    // What _activQ8InScratch currently holds — checked when a caller claims it pre-quantized x.
+    private (nint X, int K, int SeqLen) _dp4aQuantizedFor;
+#endif
+
+    // Host-side per-row embedding lookup (NOT a full-table GPU pre-dequant — see the
+    // LoadFromGguf remarks for why). Points at the mmap'd GGUF data region backing
+    // token_embd.weight; each Forward call dequantizes only its `seqLen` rows on the CPU
+    // and H2D-copies the tiny result.
+    private readonly nint _embedDataBase;
+    private readonly ulong _embedDataOffset;
+    private readonly long _embedRowBytes;
+
+    // Per-attention-layer F16 KV cache. Sized lazily on first kvCache-enabled Forward call.
+    // See CudaQwen3MoeHybridTransformerModel's field doc for the full rationale.
+    private nint[]? _f16KCache;
+    private nint[]? _f16VCache;
+    private int _f16CacheMaxSeqLen;
+    private int _f16CacheCurrentLength;
+
+    // Issue #1080: in-place KV growth. When the device supports CUDA virtual memory, each attention slot's K and V storage
+    // (quantized or F16, whichever that side keeps) is a growable buffer: its address range is reserved for the context window
+    // and physical memory is mapped in as the handle grows. A growth then keeps its rows where they are and costs only the
+    // added bytes, where the copying growth needed old + new at once and so was refused near the fitted window (every agent
+    // turn re-prefilled). Null when the API is unavailable or DOTLLM_CUDA_KV_VMM=0: the copying growth below stays as the
+    // fallback. _kvGrowK/_kvGrowV are null until the first allocation; _f16KCache/_kQuant (and V) then hold their pointers.
+    private ICudaVirtualMemory? _kvVirtualMemory;
+    private CudaGrowableDeviceBuffer[]? _kvGrowK;
+    private CudaGrowableDeviceBuffer[]? _kvGrowV;
+
+    /// <summary>Environment switch for in-place KV growth (issue #1080): <c>0</c> keeps the copying growth.</summary>
+    internal const string KvVirtualMemoryEnvVar = "DOTLLM_CUDA_KV_VMM";
+
+    // Identity of the IKvCache instance last seen by ForwardFullAttnBody (issue #185). A fresh
+    // Forward call whose kvCache is a DIFFERENT instance than last time means "new/unrelated
+    // sequence" even when its MaxLength happens to match the previous cache's -- EnsureF16KvCache's
+    // "maxSeqLen <= _f16CacheMaxSeqLen" guard only resets _f16CacheCurrentLength
+    // on a capacity-driven reallocation, so a same-size reused-instance-free sequence (e.g. every
+    // rep after the first in `dotllm bench -r N>1`, or a scheduler session rebuild that lands on an
+    // identical cacheSize) would otherwise leave the previous sequence's final depth "stuck" for the
+    // new sequence's entire duration. Reference identity is a reliable signal here because every
+    // caller (BenchRunner, ContinuousBatchScheduler, TextGenerator) allocates a brand-new IKvCache
+    // instance per logical sequence and only reuses the SAME instance across calls that belong to
+    // that one sequence (including legitimate mid-sequence speculative-decoding rollback, which must
+    // NOT reset this state).
+    private IKvCache? _lastForwardKvCache;
+
+    private nint _f16KvWriteStaging;
+    private long _f16KvWriteStagingElems;
+
+    // Shared F32 K/V read-staging pair (issue #956, superseding #182's per-slot persistent
+    // mirrors). Only the F32-consuming attention tiers (prefill via attention_f32, and the
+    // opt-in / fallback decode tiers) read it; the default mma decode kernel reads the F16
+    // cache directly and never touches it. ONE pair is shared by every full-attention layer and
+    // fully reconverted from the layer's F16 cache on each use, so its cost is
+    // seqKv * numKvHeads * headDim * 8 bytes TOTAL (512 MiB at 64k) instead of 128 KiB/token per
+    // layer slot persistently (8 GiB at 64k, 16 GiB past 65,536 via power-of-two growth).
+    private nint _f32KvStageK;
+    private nint _f32KvStageV;
+    private long _f32KvStageElems;
+
+    // DOTLLM_HYBRID_VRAM_LEDGER=1: log the model-owned KV/staging bytes once (issue #956 Phase 0).
+    private static readonly bool s_vramLedger =
+        Environment.GetEnvironmentVariable("DOTLLM_HYBRID_VRAM_LEDGER") == "1";
+    private bool _vramLedgerLogged;
+
+    // KV storage format (issue #956 Phase 2). Default F32 == "unquantized F16 on GPU" (the
+    // KvCacheDType convention). DOTLLM_HYBRID_KV = f16 | q8_0 | q4_0 | k8v4 | k4v8 selects
+    // quantized storage per side. Quantized rows live in _kQuant/_vQuant (per attention slot,
+    // standard block_q8_0 / block_q4_0 layout) and are dequantized into ONE shared F16 scratch
+    // pair per attention call, so the F16 persistent cache (64 KiB/token) disappears.
+    private KvCacheDType _kvKeyDType = ParseKvStorageEnv().key;
+    private KvCacheDType _kvValueDType = ParseKvStorageEnv().value;
+    private nint[]? _kQuant;
+    private nint[]? _vQuant;
+
+    // Fused dequant-in-load decode attention for quantized KV (issue #956 / #988).
+    // History: #956 shipped it default OFF because the v1 load path (one element + one scale load per
+    // thread, uncoalesced) measured SLOWER than dequant-into-scratch + the F16 kernel at ctx 16k
+    // (Q4_0: 12.4 vs 13.3 tok/s). #988's v2 kernel loads whole 32-element blocks per quad with
+    // vectorised byte loads and reads 2-4x fewer bytes than F16; at the kernel level it is ~5-6x
+    // faster than scratch+F16 (16k keys: 0.11-0.14 ms vs 0.67 ms) and bit-identical (tested).
+    // So the default is: ON when the v2 fused kernels are loaded and selected, OFF otherwise (v1
+    // fused stays slower than scratch). DOTLLM_HYBRID_KV_FUSED=1 forces ON, =0 forces OFF.
+    private bool? _fuseQuantKvDecodeOverride;
+    internal bool FuseQuantKvDecodeForTest
+    {
+        get => _fuseQuantKvDecodeOverride ?? DefaultFuseQuantKvDecode();
+        set => _fuseQuantKvDecodeOverride = value;
+    }
+
+    private bool DefaultFuseQuantKvDecode()
+    {
+        string? env = Environment.GetEnvironmentVariable("DOTLLM_HYBRID_KV_FUSED");
+        if (env == "1") return true;
+        if (env == "0") return false;
+        return _kernels.HasAttentionMmaDecodeKvqV2(_kvKeyDType, _kvValueDType);
+    }
+
+    /// <summary>Test-only: decode attention calls served by the fused quantized-KV kernel.</summary>
+    internal int DebugFusedKvqAttentionCallsForTest { get; private set; }
+
+    /// <summary>
+    /// Most rows a forward may have and still take the per-row fused quantized-KV attention (issue #1068): an MTP or
+    /// speculative verify is K+1 rows (4 at the default K=3). Each row re-reads the quantized history once, so the cost is
+    /// <c>rows x 2.1</c> bytes per element-token against ~10 for dequant-to-scratch + the F16 kernel.
+    /// </summary>
+    internal const int PerRowKvqMaxRows = 8;
+
+    // Issue #1068: per-row fused quantized-KV attention for short multi-row forwards. Default ON wherever the fused decode
+    // tier is on; DOTLLM_HYBRID_KVQ_PER_ROW=0 restores dequant-to-scratch for A/B measurement.
+    private static readonly bool s_perRowKvqEnv = Environment.GetEnvironmentVariable("DOTLLM_HYBRID_KVQ_PER_ROW") != "0";
+    private bool? _perRowKvqOverride;
+
+    /// <summary>Test seam for the per-row quantized-KV verify tier (issue #1068).</summary>
+    internal bool PerRowKvqForTest
+    {
+        get => _perRowKvqOverride ?? s_perRowKvqEnv;
+        set => _perRowKvqOverride = value;
+    }
+
+    /// <summary>Test-only: attention calls (one per row) served by the per-row fused quantized-KV tier.</summary>
+    internal int DebugPerRowKvqAttentionCallsForTest { get; private set; }
+
+    /// <summary>Test-only: quantized-KV history dequantizations into the F16 scratch (one per K or V side per layer call).</summary>
+    internal int DebugKvDequantCallsForTest { get; private set; }
+    private nint _kvF16ScratchK;
+    private nint _kvF16ScratchV;
+    private long _kvF16ScratchElems;
+
+    private static (KvCacheDType key, KvCacheDType value) ParseKvStorageEnv() =>
+        HybridKvStorage.Resolve(null, null, Environment.GetEnvironmentVariable(HybridKvStorage.EnvVar));
+
+    private static bool IsQuantKv(KvCacheDType d) => d is KvCacheDType.Q8_0 or KvCacheDType.Q4_0;
+
+    private static long QuantRowBytes(KvCacheDType d, int kvElems) => HybridKvStorage.RowBytes(d, kvElems);
+
+    /// <summary>Effective key storage format (<see cref="KvCacheDType.F32"/> means an unquantized F16 cache).</summary>
+    public KvCacheDType KvKeyStorage => _kvKeyDType;
+
+    /// <summary>Effective value storage format (<see cref="KvCacheDType.F32"/> means an unquantized F16 cache).</summary>
+    public KvCacheDType KvValueStorage => _kvValueDType;
+
+    /// <summary>Short label of the effective KV storage: <c>f16</c>, <c>q8_0</c>, <c>q4_0</c>, <c>k8v4</c>, <c>k4v8</c>.</summary>
+    public string KvStorageLabel => HybridKvStorage.Label(_kvKeyDType, _kvValueDType);
+
+    /// <summary>
+    /// Persistent K/V device bytes for <paramref name="maxSeqLen"/> tokens across all full-attention
+    /// slots under the effective storage format. The VRAM ledger and the CLI summary share this.
+    /// </summary>
+    public long ComputeKvBytes(long maxSeqLen) => HybridKvStorage.TotalBytes(
+        _attentionLayerCount, maxSeqLen, Config.NumKvHeads * Config.HeadDim, _kvKeyDType, _kvValueDType);
+
+    /// <summary>Persistent K/V device bytes actually allocated so far (0 before the first attention forward).</summary>
+    public long KvAllocatedBytes => _f16KCache is null ? 0 : ComputeKvBytes(_f16CacheMaxSeqLen);
+
+    /// <summary>
+    /// Selects the KV storage format (issue #967). A non-null argument is an explicit request and
+    /// overrides <c>DOTLLM_HYBRID_KV</c> for that side; a null argument keeps the current value
+    /// (environment variable or default). Must be called before the first attention-enabled forward.
+    /// </summary>
+    /// <exception cref="NotSupportedException">The format is unsupported or the KV row width is not a multiple of 32.</exception>
+    /// <exception cref="InvalidOperationException">The KV cache has already been allocated.</exception>
+    public void ConfigureKvStorage(KvCacheDType? key, KvCacheDType? value)
+    {
+        if (_f16KCache is not null || _kQuant is not null)
+            throw new InvalidOperationException("KV storage must be chosen before the first Forward.");
+        var k = key ?? _kvKeyDType;
+        var v = value ?? _kvValueDType;
+        string? error = HybridKvStorage.Validate(k, v, Config.NumKvHeads * Config.HeadDim);
+        if (error is not null) throw new NotSupportedException(error);
+        _kvKeyDType = k;
+        _kvValueDType = v;
+    }
+
+    /// <summary>
+    /// Test-only (issue #956): selects the KV storage format. Must be called before the first
+    /// attention-enabled Forward (the cache is sized lazily from it).
+    /// </summary>
+    internal void SetKvStorageForTest(KvCacheDType key, KvCacheDType value)
+    {
+        if (_f16KCache is not null || _kQuant is not null)
+            throw new InvalidOperationException("KV storage must be chosen before the first Forward.");
+        _kvKeyDType = key;
+        _kvValueDType = value;
+    }
+
+    /// <summary>
+    /// Test-only accessor for issue #185's regression test — exposes the F16 KV cache's current
+    /// -length cursor directly, since correctness (attention logits) is unaffected by the bug this
+    /// cursor's reset fixes (causal masking hides any stale over-length KV range regardless), so a
+    /// black-box logits comparison cannot discriminate broken vs. fixed here.
+    /// </summary>
+    internal int DebugF16CacheCurrentLengthForTest => _f16CacheCurrentLength;
+
+    /// <summary>
+    /// Test-only counter (issue #956): attention calls that took an F32-consuming tier and so
+    /// converted the layer's F16 KV into the shared F32 staging pair. Stays flat while the
+    /// default mma decode kernel (F16 cache read directly) is serving decode.
+    /// </summary>
+    internal int DebugF32StagedAttentionCallsForTest { get; private set; }
+
+    /// <summary>
+    /// Issue #962: serve prefill (seqLen &gt; 1) full-attention through the head_dim-256 tensor-core
+    /// flash kernel reading the F16 KV cache directly (no F32 staging). Default ON; env opt-out
+    /// <c>DOTLLM_ATTN_FLASH_PREFILL_HD256=0</c>. Settable so tests can A/B against attention_f32.
+    /// </summary>
+    internal bool FlashPrefillHd256ForTest { get; set; } = CudaKernels.EnableAttentionFlashPrefillHd256;
+
+    /// <summary>Test-only: prefill attention calls served by the head_dim-256 flash kernel.</summary>
+    internal int DebugFlashPrefillHd256CallsForTest { get; private set; }
+
+    /// <summary>
+    /// Issue #1094: with both K and V quantized, serve the flash prefill through the kernel that reads the Q8_0 / Q4_0
+    /// blocks directly (dequantized per 16-row tile in shared memory), so no full-history F16 scratch is built. Default
+    /// ON; settable so tests can A/B it against dequant-to-scratch + the F16 kernel, which it matches bit for bit.
+    /// </summary>
+    internal bool FlashPrefillHd256KvqForTest { get; set; } = true;
+
+    /// <summary>Test-only: prefill attention calls served by the quantized-KV head_dim-256 flash kernel.</summary>
+    internal int DebugFlashPrefillHd256KvqCallsForTest { get; private set; }
+
+    /// <summary>Test-only: whether the quantized-KV flash prefill kernel is loaded for the effective K/V storage pair.</summary>
+    internal bool HasFlashPrefillHd256KvqKernelForTest => _kernels.HasAttentionFlashPrefillHd256Kvq(_kvKeyDType, _kvValueDType);
+
+    /// <summary>The head_dim-256 flash prefill kernel is enabled, loaded and fits the given head shape.</summary>
+    /// <param name="numHeads">Query heads of the attention layer.</param>
+    /// <param name="numKvHeads">KV heads of the attention layer.</param>
+    /// <param name="headDim">Head dimension.</param>
+    /// <returns><see langword="true"/> when a multi-row forward over this shape can use the flash prefill kernel.</returns>
+    private bool FlashPrefillHd256Eligible(int numHeads, int numKvHeads, int headDim) => FlashPrefillHd256ForTest
+        && _kernels.HasAttentionFlashPrefillHd256
+        && CudaKernels.IsAttentionFlashPrefillHd256Shape(numHeads, numKvHeads, headDim);
+
+    /// <summary>
+    /// Both K and V are quantized and the flash prefill kernel that reads those blocks directly is enabled and loaded
+    /// (issue #1094). Applies only where <see cref="FlashPrefillHd256Eligible"/> does.
+    /// </summary>
+    private bool FlashPrefillHd256KvqEligible => FlashPrefillHd256KvqForTest
+        && IsQuantKv(_kvKeyDType) && IsQuantKv(_kvValueDType)
+        && _kernels.HasAttentionFlashPrefillHd256Kvq(_kvKeyDType, _kvValueDType);
+
+    private nint _attnFlashPrefillQF16;
+    private long _attnFlashPrefillQF16ElemsAllocated;
+
+    // Opt-in split-KV attention (issue #183) scratch: partial (max, sum, out) per (head, split).
+    // Sized once for the model's fixed (numHeads, headDim) shape and reused every decode step.
+    private nint _attnSplitKvPartialMax;
+    private nint _attnSplitKvPartialSum;
+    private nint _attnSplitKvPartialOut;
+    private long _attnSplitKvPartialHeadsAllocated;
+    // Combined GQA-group + split-KV scratch (issues #197 + #198) -- separate buffers from the
+    // #183 split-KV scratch above so this new, still-experimental tier cannot disturb the
+    // already-tested #183 path's allocation lifecycle.
+    private nint _attnGqaSplitPartialMax;
+    private nint _attnGqaSplitPartialSum;
+    private nint _attnGqaSplitPartialOut;
+    private long _attnGqaSplitPartialHeadsAllocated;
+    private int _attnGqaSplitMaxSplitAllocated;
+    // Composed tensor-core decode kernel (issue #199 v2) -- FP16 Q scratch. Reuses the
+    // #197/#198 GQA-split partial-max/sum/out scratch above (identical [numHeads, kvSplit(,
+    // headDim)] layout, per CudaAttentionMmaDecodeGqaSplit's own doc) rather than duplicating
+    // it; EnsureAttentionGqaSplitScratch already grows-if-needed for whichever kernel asks.
+    private nint _attnMmaDecodeQF16;
+    private long _attnMmaDecodeQF16ElemsAllocated;
+    private readonly DotLLM.Cuda.CudaAttentionMmaDecodeGqaSplit _mmaDecodeGqaSplit;
+
+    // Multi-Token Prediction (MTP / "NextN") head — issue #253. Null for every GGUF without a
+    // nextn.* tensor group, which is the overwhelming majority: every other field and code path
+    // in this class is completely unaffected by MTP being absent. Mirrors the CPU host's
+    // Qwen3HybridDenseTransformerModel._mtpHead (DotLLM.Models.Architectures.MtpHeadWeights).
+    private readonly CudaMtpHeadWeights? _mtpHead;
+
+    // PrismML Hadamard fold (prism.hadamard.*, issue #479) — null for every checkpoint outside the
+    // Bonsai 2 family, and every rotation site below is a single null check on it, so an unfolded
+    // model pays nothing. Mirrors the CPU host's Qwen3HybridDenseTransformerModel._hadamard.
+    private readonly CudaHadamardRotation? _hadamard;
+
+    private bool _disposed;
+
+    // Issue #291: true for an instance built via LoadHeadFromGguf (the GPU half of a CPU/GPU
+    // partial-offload split) — such an instance only owns a layer PREFIX and has no lm_head/
+    // output-norm/embedding-table device weights loaded (_outputDevice/_outputNormDevice/
+    // _tokenEmbedDevice are all 0 sentinels; the CPU tail owns the final norm + lm_head). Guards
+    // the normal Forward()/ForwardCore() entry points, which assume a full model, so a
+    // misuse (calling the full Forward on a head-only instance) fails fast instead of silently
+    // reading garbage/null device pointers.
+    private readonly bool _isHeadOnly;
+
+    /// <inheritdoc/>
+    public ModelConfig Config { get; private set; }
+
+    /// <summary>
+    /// The window the model was loaded with, before any <see cref="LimitContextLength"/> (issue #1068): the checkpoint's own, or
+    /// factor × original with <c>--rope-scaling yarn</c> (issue #1101).
+    /// </summary>
+    public int NativeMaxSequenceLength { get; }
+
+    /// <summary>
+    /// Lowers the served context window to <paramref name="maxSequenceLength"/> tokens (issue #1068): <see cref="Config"/>'s
+    /// <c>MaxSequenceLength</c> then bounds every position, KV handle and MTP ceiling, and the server reports it in
+    /// <c>/props</c> so clients compact before they reach it.
+    /// </summary>
+    /// <param name="maxSequenceLength">The new window, 1..<see cref="NativeMaxSequenceLength"/>.</param>
+    public void LimitContextLength(int maxSequenceLength)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxSequenceLength);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(maxSequenceLength, NativeMaxSequenceLength);
+        Config = Config with { MaxSequenceLength = maxSequenceLength };
+    }
+
+    /// <summary>
+    /// Peak device bytes one context token costs while serving (issue #1068): its K/V rows in every attention slot under the
+    /// effective storage, the F16 dequant scratch a quantized-KV prefill tile fills over the whole history (none when the
+    /// quantized-KV flash prefill kernel serves it, issue #1094), the F32 staging
+    /// when the flash-prefill kernel cannot run, and, with MTP, the head's own K/V rows in the format it stores them in
+    /// (issue #1095: the trunk's KV type where the fused kernels read it): counted once when the head grows in place, twice
+    /// when a growth copies into a new buffer while the old one is still allocated.
+    /// </summary>
+    /// <param name="mtp">Whether MTP self-speculation will run.</param>
+    /// <returns>Bytes per token.</returns>
+    public long ContextBytesPerToken(bool mtp)
+    {
+        int kvElems = Config.NumKvHeads * Config.HeadDim;
+        long bytes = ComputeKvBytes(1);
+        bool flashPrefill = FlashPrefillHd256Eligible(Config.NumAttentionHeads, Config.NumKvHeads, Config.HeadDim);
+        // Issue #1094: the quantized-KV flash prefill builds no full-history F16 scratch. The decode tiers that still
+        // dequantize (short histories below the mma split minimum) need only a bounded scratch, not a per-token one.
+        if (!(flashPrefill && FlashPrefillHd256KvqEligible))
+        {
+            int quantSides = (IsQuantKv(_kvKeyDType) ? 1 : 0) + (IsQuantKv(_kvValueDType) ? 1 : 0);
+            bytes += (long)quantSides * kvElems * sizeof(ushort);
+        }
+        if (!flashPrefill)
+            bytes += 2L * kvElems * sizeof(float);
+        if (mtp && _mtpHead is { } head)
+        {
+            var (keyFormat, valueFormat) = ResolveMtpKvFormats();
+            bytes += CudaMtpState.BytesPerPosition(keyFormat, valueFormat,
+                head.Layer.FullAttn!.Value.NumKvHeads * Config.HeadDim, growsInPlace: _kvVirtualMemory is not null);
+        }
+        return bytes;
+    }
+
+    /// <summary>
+    /// Measures the longest context that fits in free VRAM for serving (issue #1068). First it runs one prefill tile and,
+    /// with MTP, one verify-shaped forward, so every context-independent buffer (forward scratch at the tile size, weight
+    /// dequant scratch, row snapshots, a spare checkpoint) is allocated at its serving size and already out of the free
+    /// figure. Then it releases the context-sized buffers that forward grew, reads free VRAM, and divides what is left after
+    /// <see cref="VramReserveBytes"/> and one more checkpoint (the recurrent-prefix entry keeps one while the decoder takes
+    /// another per round) by <see cref="ContextBytesPerToken"/>. Resets the sequence state.
+    /// </summary>
+    /// <param name="mtp">Whether MTP self-speculation will run.</param>
+    /// <param name="verifyRows">Rows of one speculative verify (K + 1); ignored without MTP.</param>
+    /// <returns>The fit and the numbers behind it.</returns>
+    public HybridContextFit MeasureServingContextFit(bool mtp, int verifyRows)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _context.MakeCurrent();
+        string? sizingError = null;
+        int tile = Math.Min(PrefillChunkTokens > 0 ? PrefillChunkTokens : DefaultPrefillChunkTokens,
+                            Math.Max(1, NativeMaxSequenceLength - Math.Max(verifyRows, 1)));
+        try
+        {
+            using var kv = CreateKvCache(tile + Math.Max(verifyRows, 1));
+            int[] tokens = new int[tile];
+            int[] positions = new int[tile];
+            for (int i = 0; i < tile; i++) { tokens[i] = i % Config.VocabSize; positions[i] = i; }
+            Forward(tokens, positions, deviceId: -1, kv, lastTokenLogitsOnly: true)?.Dispose();
+            if (mtp && verifyRows > 1 && SupportsRecurrentRowSnapshots)
+            {
+                int[] rowPositions = Enumerable.Range(tile, verifyRows).ToArray();
+                ForwardWithRecurrentSnapshots(tokens.AsSpan(0, verifyRows), rowPositions, deviceId: -1, kv, mtpState: null).Dispose();
+            }
+            using (CheckpointRecurrentState() as IDisposable) { }   // allocates the pooled spare
+        }
+        catch (DeviceMemoryAdmissionException ex)
+        {
+            sizingError = ex.Message;
+        }
+        finally
+        {
+            ResetSequenceState();
+            _stream.Synchronize();
+            FreeKvStorage();
+            _f16CacheMaxSeqLen = 0;
+            _f16CacheCurrentLength = 0;
+            _lastForwardKvCache = null;
+            FreeIfNonZero(ref _kvF16ScratchK);
+            FreeIfNonZero(ref _kvF16ScratchV);
+            _kvF16ScratchElems = 0;
+            FreeIfNonZero(ref _f32KvStageK);
+            FreeIfNonZero(ref _f32KvStageV);
+            _f32KvStageElems = 0;
+        }
+
+        long free = FreeVramOverride ?? QueryFreeDeviceBytes();
+        long fixedBytes = _gdnCache.AllocatedBytes;
+        long perToken = ContextBytesPerToken(mtp);
+        int fit = DeviceMemoryBudget.MaxFittingContext(free, VramReserveBytes, fixedBytes, perToken, NativeMaxSequenceLength);
+        return new HybridContextFit(fit, free, VramReserveBytes, fixedBytes, perToken, sizingError);
+    }
+
+    /// <inheritdoc/>
+    public bool SupportsMtp => _mtpHead is not null;
+
+    /// <inheritdoc/>
+    public long ComputeMemoryBytes => _state.AllocatedBytes + _gdnCache.AllocatedBytes;
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Re-zeroes the model-owned Gated-DeltaNet cache used by every forward that does not carry a
+    /// caller-supplied <see cref="IGdnState"/>. The GDN cache persists across uncached forwards, so
+    /// callers that treat each forward as an independent sequence (perplexity windows, and
+    /// <c>TextGenerator</c> requests) must reset it — see issues #261 and #615.
+    /// </remarks>
+    public void ResetSequenceState()
+    {
+        _context.MakeCurrent();
+        _gdnCache.Reset();
+        _rowSnapshotValidRows = 0;   // issue #473: snapshots no longer describe the state
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// True: the model-owned <see cref="_gdnCache"/> is per-sequence state with no position addressing.
+    /// This used to be left undeclared, which made <c>TextGenerator</c> skip
+    /// <see cref="ResetSequenceState"/> and let each request inherit the previous one's state (measured on
+    /// Tev1-4B, T5500: a repeated greedy prompt flipped its answer from A to B) — issue #615.
+    /// </remarks>
+    public bool RequiresPerSequenceState => true;
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Issue #287 CUDA parity with the CPU host (<c>Qwen3HybridDenseTransformerModel</c>):
+    /// speculative decoding's batched verify forward mutates <see cref="_gdnCache"/> for every
+    /// drafted token before accept/reject is known, and <see cref="CudaGdnStateCache"/> has no
+    /// position addressing to undo a rejected token's contribution the way the KV-cache rollback
+    /// does. Alongside <see cref="IModel.RequiresPerSequenceState"/>: <see cref="_gdnCache"/> is
+    /// the model-owned default state every explicit-state-less <c>Forward</c> call threads,
+    /// and that is exactly the state <c>MtpSpeculativeDecoder</c> / <c>SpeculativeDecoder</c>
+    /// operate against today.
+    /// </remarks>
+    public bool SupportsRecurrentStateCheckpoint => true;
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Snapshots are pooled (one spare), mirroring the CPU and Vulkan hosts (issue #469, ported in
+    /// #478): a speculative decoder takes one per round, and a fresh <see cref="CudaGdnStateCache"/>
+    /// each time cost two <c>cuMemAlloc</c> + two <c>cuMemset</c> + two <c>cuMemFree</c> on top of
+    /// the copy. Disposing the returned checkpoint hands its buffers back for the next round. The
+    /// contents are the same D2D copy <see cref="CudaGdnStateCache.Clone"/> made, so restores are
+    /// bit-identical to before.
+    /// </remarks>
+    public object? CheckpointRecurrentState()
+    {
+        _context.MakeCurrent();
+        CudaGdnStateCache? snapshot = Interlocked.Exchange(ref _spareGdnCheckpoint, null);
+        if (snapshot is null)
+        {
+            AdmitDeviceGrowth(_gdnCache.AllocatedBytes, "recurrent-state checkpoint");
+            snapshot = new CudaGdnStateCache(_gdn, _gdnCache.NumGdnLayers);
+        }
+        _gdnCache.CopyTo(snapshot);
+        return new PooledGdnCheckpoint(this, snapshot);
+    }
+
+    /// <inheritdoc/>
+    public void RestoreRecurrentState(object? checkpoint)
+    {
+        CudaGdnStateCache? snapshot = checkpoint switch
+        {
+            null => null,
+            PooledGdnCheckpoint pooled => pooled.Snapshot,
+            CudaGdnStateCache raw => raw,
+            _ => throw new ArgumentException(
+                $"{GetType().Name}.RestoreRecurrentState expects a checkpoint from CheckpointRecurrentState; " +
+                $"got {checkpoint.GetType().Name}.",
+                nameof(checkpoint)),
+        };
+        if (snapshot is null) return;
+        _context.MakeCurrent();
+        snapshot.CopyTo(_gdnCache);
+        _rowSnapshotValidRows = 0;   // issue #473
+    }
+
+    private CudaGdnStateCache? _spareGdnCheckpoint;
+
+    /// <summary>A pooled GDN snapshot; disposing returns its buffers to the owning model (issue #469).</summary>
+    private sealed class PooledGdnCheckpoint(CudaQwen3HybridDenseTransformerModel owner, CudaGdnStateCache snapshot)
+        : IDisposable
+    {
+        private CudaGdnStateCache? _snapshot = snapshot;
+
+        public CudaGdnStateCache Snapshot
+            => _snapshot ?? throw new ObjectDisposedException(nameof(PooledGdnCheckpoint));
+
+        public void Dispose()
+        {
+            var s = Interlocked.Exchange(ref _snapshot, null);
+            if (s is null) return;
+            if (owner._disposed || Interlocked.CompareExchange(ref owner._spareGdnCheckpoint, s, null) is not null)
+                s.Dispose();
+        }
+    }
+
+    // ── Per-row recurrent snapshots (issue #473, ported in #478) ─────────────
+
+    // Model-owned device scratch, laid out [row][gdnLayer][elements] so that one row's snapshot has
+    // exactly the layout of the live CudaGdnStateCache ([gdnLayer][elements], contiguous) and a
+    // restore is ONE D2D copy per buffer rather than one per layer. Grown to the largest verify
+    // seen and kept for the model's lifetime.
+    private nint _rowSnapGdn;
+    private nint _rowSnapConv;
+    private int _rowSnapCapacity;
+    private int _rowSnapshotRequestRows;   // > 0 only while ForwardWithRecurrentSnapshots runs
+    private int _rowSnapshotValidRows;     // rows the last such forward recorded; 0 = none
+
+    /// <summary>Device bytes currently held by the per-row recurrent snapshot scratch (issue #473).</summary>
+    public long RecurrentRowSnapshotBytes =>
+        (long)_rowSnapCapacity * _gdnCache.NumGdnLayers
+        * (_gdnCache.GdnStateElements + _gdnCache.ConvStateElements) * sizeof(float);
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// The verify forward copies the GDN matrix state after each scan step (the CUDA scan is already
+    /// one launch per token) and each row's conv window, so every snapshot is bit-identical to the
+    /// live state at that row. Scratch is <c>K × gdnLayers × (NVHead·DState² + conv)</c> floats of
+    /// device memory, grown to the largest K seen — about 144 MiB per row on Bonsai 27B, so ~430 MiB
+    /// at K=3, which has to fit next to the weights on a 12 GB card. It replaces the per-round
+    /// checkpoint copy and the replay forward after a rejection. <c>DOTLLM_MTP_GDN_SNAPSHOTS=0</c>
+    /// makes the decoder keep checkpoint + replay instead.
+    /// </remarks>
+    public bool SupportsRecurrentRowSnapshots => _gdnCache.NumGdnLayers > 0;
+
+    /// <inheritdoc/>
+    public ITensor ForwardWithRecurrentSnapshots(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                                                 int deviceId, IKvCache? kvCache, IMtpState? mtpState)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        int rows = Math.Max(tokenIds.Length - 1, 0);
+        _context.MakeCurrent();
+        EnsureRowSnapshotCapacity(rows);
+        _rowSnapshotRequestRows = rows;
+        ITensor logits;
+        try
+        {
+            logits = ForwardCore(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly: false,
+                                 mtpCapture: mtpState as CudaMtpState);
+        }
+        finally
+        {
+            _rowSnapshotRequestRows = 0;
+        }
+        _rowSnapshotValidRows = rows;
+        return logits;
+    }
+
+    /// <inheritdoc/>
+    public void RestoreRecurrentStateToRow(int row)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (row == _rowSnapshotValidRows && row > 0)
+            return; // the live state IS the state after the last row
+        if ((uint)row >= (uint)_rowSnapshotValidRows)
+            throw new InvalidOperationException(
+                $"No recurrent snapshot for row {row}: the last ForwardWithRecurrentSnapshots recorded " +
+                $"{_rowSnapshotValidRows} row(s), or a later forward invalidated them.");
+
+        _context.MakeCurrent();
+        nint streamH = _stream.Handle;
+        int layers = _gdnCache.NumGdnLayers;
+        long gdnRowBytes = (long)layers * _gdnCache.GdnStateElements * sizeof(float);
+        long convRowBytes = (long)layers * _gdnCache.ConvStateElements * sizeof(float);
+        if (gdnRowBytes > 0)
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(_gdnCache.GetGdnStatePtr(0), RowSnapshotGdnPtr(row, 0),
+                (nuint)gdnRowBytes, streamH).ThrowOnError();
+        if (convRowBytes > 0)
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(_gdnCache.GetConvStatePtr(0), RowSnapshotConvPtr(row, 0),
+                (nuint)convRowBytes, streamH).ThrowOnError();
+        _stream.Synchronize();
+        _rowSnapshotValidRows = 0;
+    }
+
+    private void EnsureRowSnapshotCapacity(int rows)
+    {
+        if (rows <= _rowSnapCapacity) return;
+        FreeRowSnapshots();
+        int layers = _gdnCache.NumGdnLayers;
+        AdmitDeviceGrowth((long)rows * layers * (_gdnCache.GdnStateElements + _gdnCache.ConvStateElements) * sizeof(float),
+            $"recurrent row snapshots for a {rows + 1}-token verify");
+        _rowSnapGdn = AllocDevice(Math.Max((long)rows * layers * _gdnCache.GdnStateElements * sizeof(float), 4));
+        _rowSnapConv = AllocDevice(Math.Max((long)rows * layers * _gdnCache.ConvStateElements * sizeof(float), 4));
+        _rowSnapCapacity = rows;
+    }
+
+    private void FreeRowSnapshots()
+    {
+        FreeIfNonZero(ref _rowSnapGdn);
+        FreeIfNonZero(ref _rowSnapConv);
+        _rowSnapCapacity = 0;
+        _rowSnapshotValidRows = 0;
+    }
+
+    /// <summary>Device pointer to GDN layer <paramref name="gdnOrdinal"/>'s matrix-state snapshot after row <paramref name="row"/>.</summary>
+    private nint RowSnapshotGdnPtr(int row, int gdnOrdinal)
+        => _rowSnapGdn + (nint)(((long)row * _gdnCache.NumGdnLayers + gdnOrdinal) * _gdnCache.GdnStateElements * sizeof(float));
+
+    /// <summary>Device pointer to GDN layer <paramref name="gdnOrdinal"/>'s conv-window snapshot after row <paramref name="row"/>.</summary>
+    private nint RowSnapshotConvPtr(int row, int gdnOrdinal)
+        => _rowSnapConv + (nint)(((long)row * _gdnCache.NumGdnLayers + gdnOrdinal) * _gdnCache.ConvStateElements * sizeof(float));
+
+    /// <summary>Number of full-attention layers — matches the sparse KV-cache slot count.</summary>
+    public int AttentionLayerCount => _attentionLayerCount;
+
+    /// <summary>
+    /// Creates a length-only <see cref="IKvCache"/> handle sized to <paramref name="maxSeqLen"/>.
+    /// K/V storage is owned internally by this model (a per-attention-layer F16 device
+    /// cache) — the returned handle only communicates the capacity to
+    /// <see cref="Forward(System.ReadOnlySpan{int}, System.ReadOnlySpan{int}, int, IKvCache?)"/>.
+    /// </summary>
+    public CudaHybridKvCacheHandle CreateKvCache(int maxSeqLen) => new(maxSeqLen, CanGrowKvStorageTo);   // EnsureF16KvCache keeps rows on growth (#1025)
+
+    /// <summary>
+    /// Free device memory every context-sized growth must leave (issue #1068; PR #1026 introduced it for the KV copy alone):
+    /// forward scratch, cuBLAS workspace, the display, other processes. <c>DOTLLM_CUDA_VRAM_RESERVE_MB</c> overrides it.
+    /// </summary>
+    internal static readonly long VramReserveBytes =
+        DeviceMemoryBudget.ResolveReserveBytes(Environment.GetEnvironmentVariable(DeviceMemoryBudget.ReserveEnvVar));
+
+    // Issue #1068: warns when this process's device memory spills into shared system memory anyway (another process took
+    // the headroom, or an allocation outside the admitted paths). Polled on a background timer, checked after each KV growth.
+    private readonly GpuSpillMonitor _spillMonitor;
+
+    /// <summary>
+    /// Admission for <see cref="CudaHybridKvCacheHandle.TryGrowTo"/>. When <see cref="KvStorageGrowthBytes"/> plus
+    /// <see cref="VramReserveBytes"/> does not fit in free device memory, refuse, and the engine falls back to the miss path
+    /// (free, then allocate) instead of pushing the card into the shared-memory spill #1025 was about. The miss path's own
+    /// allocation is admitted by <see cref="AdmitDeviceGrowth"/> (issue #1068).
+    /// </summary>
+    /// <param name="maxLength">The handle's requested length.</param>
+    /// <returns><see langword="true"/> when the growth may proceed.</returns>
+    internal bool CanGrowKvStorageTo(int maxLength)
+    {
+        if (maxLength <= _f16CacheMaxSeqLen) return true;
+        long free = FreeVramOverride ?? QueryFreeDeviceBytes();
+        return DeviceMemoryBudget.Fits(free, KvStorageGrowthBytes(maxLength), VramReserveBytes);
+    }
+
+    /// <summary>True when the KV storage grows in place, through CUDA virtual memory (issue #1080).</summary>
+    internal bool KvGrowsInPlace => _kvVirtualMemory is not null;
+
+    /// <summary>
+    /// Device bytes a growth of the KV storage to <paramref name="maxLength"/> tokens must newly allocate while keeping its rows.
+    /// In place (issue #1080) that is only the added pages: the physical memory mapped behind each slot's K and V range, rounded
+    /// up to the allocation granularity. A copying growth allocates the whole new storage while the old is still held, which near
+    /// the fitted window does not fit.
+    /// </summary>
+    /// <param name="maxLength">Tokens the storage must hold.</param>
+    /// <returns>Bytes to allocate; zero when the storage already holds them.</returns>
+    internal long KvStorageGrowthBytes(int maxLength)
+    {
+        if (_kvVirtualMemory is not { } vm) return maxLength <= _f16CacheMaxSeqLen ? 0 : ComputeKvBytes(maxLength);
+        int kvElems = Config.NumKvHeads * Config.HeadDim;
+        long kBytes = (long)maxLength * QuantRowBytes(_kvKeyDType, kvElems);
+        long vBytes = (long)maxLength * QuantRowBytes(_kvValueDType, kvElems);
+        if (_kvGrowK is null || _kvGrowV is null)
+            return _attentionLayerCount * (CudaGrowableDeviceBuffer.RoundUp(kBytes, vm.Granularity)
+                                           + CudaGrowableDeviceBuffer.RoundUp(vBytes, vm.Granularity));
+        long total = 0;
+        for (int i = 0; i < _attentionLayerCount; i++)
+            total += _kvGrowK[i].GrowthBytes(kBytes) + _kvGrowV[i].GrowthBytes(vBytes);
+        return total;
+    }
+
+    /// <summary>Test-only (issue #1080): device address of attention slot <paramref name="slot"/>'s K storage, or 0 before allocation.</summary>
+    internal nint DebugKeyStoragePointerForTest(int slot)
+        => _f16KCache is null ? 0 : IsQuantKv(_kvKeyDType) ? _kQuant![slot] : _f16KCache[slot];
+
+    /// <summary>Test hook (issue #1080): keep the copying KV growth on this model. Call before the first attention forward.</summary>
+    internal void UseCopyingKvGrowthForTest()
+    {
+        if (_f16KCache is not null) throw new InvalidOperationException("KV storage is already allocated.");
+        _kvVirtualMemory = null;
+    }
+
+    /// <summary>
+    /// Admits a device allocation of <paramref name="bytes"/> that grows with the context, or refuses it loudly (issue #1068).
+    /// Without this, WDDM backs an allocation past dedicated VRAM with shared system memory instead of failing it, and every
+    /// kernel touching it then runs at PCIe speed: requests went from minutes to hours on a 12 GB card. Call it after any
+    /// free-first release, so the free figure includes the released bytes.
+    /// </summary>
+    /// <param name="bytes">Bytes about to be allocated.</param>
+    /// <param name="what">What they are for, for the error message.</param>
+    /// <exception cref="DeviceMemoryAdmissionException">The allocation would not leave <see cref="VramReserveBytes"/> free.</exception>
+    internal void AdmitDeviceGrowth(long bytes, string what)
+    {
+        long free = FreeVramOverride ?? QueryFreeDeviceBytes();
+        if (DeviceMemoryBudget.Fits(free, bytes, VramReserveBytes)) return;
+        string message = DeviceMemoryBudget.DescribeRefusal(what, bytes, free, VramReserveBytes);
+        Console.Error.WriteLine($"[dotllm] ERROR: {message}");
+        throw new DeviceMemoryAdmissionException(message);
+    }
+
+    private long QueryFreeDeviceBytes()
+    {
+        _context.MakeCurrent();
+        CudaDriverApi.cuMemGetInfo_v2(out nuint free, out _).ThrowOnError();
+        return (long)free;
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Sized for the MTP head's own attention (<see cref="Config"/>'s standard head count/dim —
+    /// the MTP block is a normal full-attention layer, see <see cref="CudaMtpHeadWeights"/>), with a
+    /// device-resident, position-indexed KV-cache. The cache allocates lazily (issue #966), so this
+    /// parameterless overload costs only the first 1024 positions up front and uses the model's whole
+    /// context window as its ceiling. Engine callers pass the trunk KV-cache's <c>MaxLength</c>.
+    /// Mirrors the CPU host's <c>Qwen3HybridDenseTransformerModel.CreateMtpState</c>.
+    /// </remarks>
+    public IMtpState? CreateMtpState()
+        => CreateMtpState(Math.Max(MtpDefaultMaxSequenceLength, Config.MaxSequenceLength));
+
+    /// <inheritdoc/>
+    public IMtpState? CreateMtpState(int maxSequenceLength)
+    {
+        if (_mtpHead is null)
+            return null;
+
+        _context.MakeCurrent();
+        var (keyFormat, valueFormat) = ResolveMtpKvFormats();
+        return new CudaMtpState(
+            hiddenSize: Config.HiddenSize,
+            numKvHeads: _mtpHead.Value.Layer.FullAttn!.Value.NumKvHeads,
+            headDim: Config.HeadDim,
+            maxSteps: maxSequenceLength,
+            keyFormat, valueFormat,
+            virtualMemory: _kvVirtualMemory,   // issue #1095: grow in place where the trunk does
+            admitGrowth: AdmitDeviceGrowth);   // issue #1068: the head's KV grows with the context too
+    }
+
+    /// <summary>
+    /// Environment switch for the MTP head's KV format (issue #1095): <c>f32</c> stores it in F32, the pre-#1095 layout. It
+    /// exists only as the reference arm of the acceptance-rate A/B; FP32 storage is not a serving fallback (#1107).
+    /// </summary>
+    internal const string MtpKvEnvVar = "DOTLLM_CUDA_MTP_KV";
+
+    private static readonly bool s_mtpKvF32Env =
+        string.Equals(Environment.GetEnvironmentVariable(MtpKvEnvVar), "f32", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Reference arm only (issue #1095): true makes <see cref="CreateMtpState(int)"/> store the head's KV in F32, as it was
+    /// before the head followed the trunk's KV type. Tests and the acceptance-rate A/B compare against it; nothing serves with
+    /// it by default. Defaults to <c>DOTLLM_CUDA_MTP_KV=f32</c>.
+    /// </summary>
+    internal bool MtpKvF32ForTest { get; set; } = s_mtpKvF32Env;
+
+    /// <summary>
+    /// Test seam (issue #1095): false makes a quantized head's draft step dequantize its history into the F16 scratch and run
+    /// the F16 tensor-core kernel — the reference the fused read is compared against bit for bit.
+    /// </summary>
+    internal bool MtpFusedKvReadForTest { get; set; } = true;
+
+    /// <summary>Test-only: MTP draft-step attention calls served by the fused quantized-KV kernel over the head's own cache.</summary>
+    internal int DebugMtpFusedKvqCallsForTest { get; private set; }
+
+    /// <summary>Test-only: MTP draft-step dequantizations of the head's history into the F16 scratch (one per K or V side).</summary>
+    internal int DebugMtpKvDequantCallsForTest { get; private set; }
+
+    /// <summary>
+    /// The MTP head's K/V element formats (issue #1095). The head is one full-attention layer of the trunk's shape, so it takes
+    /// the trunk's KV type: both sides quantized when the fused quantized-KV decode kernel for that pair is loaded and takes the
+    /// head's shape (real GQA, head_dim 256, the trunk's row), otherwise F16 — never wider than F16 (#1107). The F16 rows are
+    /// read in place by the tensor-core decode kernel where it takes the shape; on other shapes (head_dim other than 256, no
+    /// real GQA) they are staged to F32 per draft step for the plain kernel, as the trunk's own attention is on those shapes.
+    /// <see cref="MtpKvF32ForTest"/> selects F32 storage for reference arms only.
+    /// </summary>
+    /// <returns>Key and value formats; F32 on both sides (reference arm only), or neither.</returns>
+    internal (CudaMtpKvFormat Key, CudaMtpKvFormat Value) ResolveMtpKvFormats()
+    {
+        const CudaMtpKvFormat F16 = CudaMtpKvFormat.F16;
+        if (MtpKvF32ForTest)
+            return (CudaMtpKvFormat.F32, CudaMtpKvFormat.F32);
+        if (_mtpHead is not { } head)
+            return (F16, F16);
+        int numHeads = Config.NumAttentionHeads;
+        int numKvHeads = head.Layer.FullAttn!.Value.NumKvHeads;
+        int headDim = Config.HeadDim;
+        bool kq = IsQuantKv(_kvKeyDType), vq = IsQuantKv(_kvValueDType);
+
+        // The head's short-history tier borrows the trunk's dequant scratch, which is sized by the trunk's row.
+        bool fusedShape = numKvHeads == Config.NumKvHeads
+            && numKvHeads < numHeads
+            && headDim == DotLLM.Cuda.CudaAttentionMmaDecodeGqaSplit.SupportedHeadDim
+            && CudaKernels.IsGqaGroupShapeSupported(numHeads, numKvHeads)
+            && DotLLM.Cuda.CudaAttentionMmaDecodeGqaSplit.Enabled;
+        if (kq && vq && fusedShape && _kernels.HasAttentionMmaDecodeKvq(_kvKeyDType, _kvValueDType))
+            return (ToMtpFormat(_kvKeyDType), ToMtpFormat(_kvValueDType));
+        return (F16, F16);   // an F16 trunk, a mixed F16/quantized pair, or a shape/device the fused kernel does not cover
+
+        static CudaMtpKvFormat ToMtpFormat(KvCacheDType d) => d == KvCacheDType.Q8_0 ? CudaMtpKvFormat.Q8_0 : CudaMtpKvFormat.Q4_0;
+    }
+
+    /// <summary>
+    /// Floor of the ceiling <see cref="CreateMtpState()"/> uses (the head's cache is indexed by position
+    /// and absorbs the whole sequence, issue #469). The ceiling is <c>max(this, Config.MaxSequenceLength)</c>;
+    /// memory follows the positions actually reached, not this value (issue #966).
+    /// </summary>
+    public const int MtpDefaultMaxSequenceLength = 4096;
+
+    private CudaQwen3HybridDenseTransformerModel(
+        ModelConfig config,
+        GgufFile? gguf,
+        DeviceLayer[] layers,
+        nint tokenEmbedDevice, QuantizationType tokenEmbedQt,
+        nint embedDataBase, ulong embedDataOffset, long embedRowBytes,
+        nint outputNormDevice,
+        nint outputDevice, QuantizationType outputQt, int outputOutputDim, int outputInputDim,
+        bool ownsOutputDevice,
+        int[] kvSlotForLayer, int attentionLayerCount,
+        float ropeTheta, int ropeDim,
+        CudaQwen3HybridDenseForwardState state, CudaGdnStateCache gdnCache,
+        CudaStream stream, CudaCublasHandle cublas, CudaContext context, CudaKernels kernels,
+        int deviceId,
+        CudaMtpHeadWeights? mtpHead = null,
+        bool isHeadOnly = false,
+        CudaHadamardRotation? hadamard = null)
+    {
+        // A Hadamard-folded checkpoint (Bonsai 2) stores its weights in a rotated basis and needs
+        // the matching activation transform, and the failure mode of skipping it is not a crash:
+        // the weights are well-formed values in the wrong basis, so the model emits fluent
+        // nonsense. The loaders build the transform (CudaHadamardRotation.Create validates the
+        // declared fold set and refuses anything the rotation sites below do not cover); any path
+        // that reaches here with a fold but without the transform must refuse rather than guess.
+        if (config.HadamardFold is not null && hadamard is null)
+            throw new NotSupportedException(
+                "This checkpoint declares a PrismML Hadamard weight fold (prism.hadamard.*) but no " +
+                "CUDA Hadamard transform was built for it. Loading it without one would generate " +
+                "plausible-looking but wrong output rather than fail.");
+        if (hadamard is not null && !ReferenceEquals(hadamard.Fold, config.HadamardFold))
+            throw new ArgumentException("The Hadamard transform does not belong to this model's config.", nameof(hadamard));
+
+        Config = config;
+        _spillMonitor = new GpuSpillMonitor(() => $"KV allocated for {_f16CacheMaxSeqLen} tokens");
+        NativeMaxSequenceLength = config.MaxSequenceLength;
+        _isHeadOnly = isHeadOnly;
+        _gguf = gguf;
+        _layers = layers;
+        _mtpHead = mtpHead;
+        _hadamard = hadamard;
+        _tokenEmbedDevice = tokenEmbedDevice;
+        _tokenEmbedQt = tokenEmbedQt;
+        _embedDataBase = embedDataBase;
+        _embedDataOffset = embedDataOffset;
+        _embedRowBytes = embedRowBytes;
+        _outputNormDevice = outputNormDevice;
+        _outputDevice = outputDevice;
+        _outputQt = outputQt;
+        _outputOutputDim = outputOutputDim;
+        _outputInputDim = outputInputDim;
+        _ownsOutputDevice = ownsOutputDevice;
+        _layout = config.HybridLayout!;
+        _gdn = config.GdnConfig!.Value;
+        _intermediateSize = config.IntermediateSize;
+        _kvSlotForLayer = kvSlotForLayer;
+        _attentionLayerCount = attentionLayerCount;
+        _ropeTheta = ropeTheta;
+        _ropeDim = ropeDim;
+        var (yarnInvFreq, yarnMscale) = RoPE.ResolveDenseYarn(config.RoPEConfig, config.Architecture, ropeDim);
+        if (yarnInvFreq is not null)
+        {
+            long yarnBytes = (long)yarnInvFreq.Length * sizeof(float);
+            _ropeYarnInvFreq = AllocDevice(yarnBytes);
+            fixed (float* pYarn = yarnInvFreq)
+                CopyHtoD(_ropeYarnInvFreq, (nint)pYarn, yarnBytes);
+            _ropeYarnMscale = yarnMscale;
+        }
+
+        _state = state;
+        _gdnCache = gdnCache;
+        _stream = stream;
+        _cublas = cublas;
+        _context = context;
+        _kernels = kernels;
+        _deviceId = deviceId;
+        _kvVirtualMemory = Environment.GetEnvironmentVariable(KvVirtualMemoryEnvVar) == "0"
+            ? null
+            : CudaDriverVirtualMemory.TryCreate(deviceId);
+        _mmaDecodeGqaSplit = new DotLLM.Cuda.CudaAttentionMmaDecodeGqaSplit(kernels);
+
+        _gdnLayerOrdinal = new int[config.NumLayers];
+        int gdnOrdinal = 0;
+        for (int i = 0; i < config.NumLayers; i++)
+        {
+            _gdnLayerOrdinal[i] = _layout.LayerKind[i] == HybridLayerKind.GatedDeltaNet
+                ? gdnOrdinal++
+                : -1;
+        }
+    }
+
+    /// <summary>
+    /// Loads a Qwen3HybridDense model from an opened GGUF file onto the given CUDA device.
+    /// </summary>
+    /// <param name="gguf">Opened GGUF file (must remain alive for the model's lifetime).</param>
+    /// <param name="config">Model configuration extracted from GGUF metadata.</param>
+    /// <param name="deviceId">GPU device ordinal (0-based).</param>
+    /// <param name="ptxDir">Directory containing compiled PTX. Null auto-detects.</param>
+    public static CudaQwen3HybridDenseTransformerModel LoadFromGguf(
+        GgufFile gguf, ModelConfig config, int deviceId = 0, string? ptxDir = null)
+    {
+        ArgumentNullException.ThrowIfNull(gguf);
+        ArgumentNullException.ThrowIfNull(config);
+        if (config.Architecture != Architecture.Qwen3HybridDense)
+            throw new ArgumentException(
+                $"CudaQwen3HybridDenseTransformerModel requires Architecture.Qwen3HybridDense, got {config.Architecture}.",
+                nameof(config));
+        if (config.HybridLayout is null)
+            throw new ArgumentException("Qwen3HybridDense config must have HybridLayout populated.", nameof(config));
+        if (config.GdnConfig is null)
+            throw new ArgumentException("Qwen3HybridDense config must have GdnConfig populated.", nameof(config));
+
+        // #484: validate the PTX deployment BEFORE any CUDA resource exists. A bad or
+        // incomplete ptxDir is by far the most common way this factory throws, and doing the
+        // check up front means it can no longer orphan a context/stream/cuBLAS handle,
+        // whatever the unwind path does (see CudaKernels.ResolveAndValidatePtxDirectory).
+        ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(ptxDir);
+
+        // #383: context creation cannot leak on its own throw (nothing allocated yet), so it
+        // stays outside the try/catch — everything created from here on (stream/cublas/kernels/
+        // state/gdnCache/every device buffer, tracked via `allocs`) is disposed on any failure
+        // before rethrowing.
+        var context = CudaContext.Create(deviceId);
+        CudaStream? stream = null;
+        CudaCublasHandle? cublas = null;
+        CudaKernels? kernels = null;
+        CudaQwen3HybridDenseForwardState? state = null;
+        CudaGdnStateCache? gdnCache = null;
+        CudaHadamardRotation? hadamard = null;
+        var allocs = new List<nint>();
+        try
+        {
+        stream = CudaStream.Create();
+        cublas = CudaCublasHandle.Create();
+        cublas.SetStream(stream);
+
+        // Force a fresh load of UploadRawTensor's process-wide cached PQ2_0 repack module/
+        // function for THIS model load. Comparing a raw CUDA context handle across calls (see
+        // EnsurePq2_0RepackFunc) is not fully reliable on its own: cuCtxDestroy_v2 (from a
+        // previous model's Dispose) can free a context whose handle value the driver later
+        // reissues to a brand-new cuCtxCreate_v2 call (a classic ABA hazard) — observed in
+        // practice when many CUDA tests load/dispose Qwen3HybridDense models across one process
+        // (issue #162 follow-up: "CUDA error 400: invalid resource handle" resurfaced in the
+        // full suite despite EnsurePq2_0RepackFunc's context check passing). Resetting
+        // unconditionally here guarantees every LoadFromGguf call gets a module freshly loaded
+        // into ITS OWN just-created context, regardless of any handle-value coincidence.
+        s_pq2_0RepackModule = null;
+        s_pq2_0RepackFunc = 0;
+        s_pq2_0RepackContext = 0;
+
+        kernels = new CudaKernels(ptxDir);
+
+        // PrismML Hadamard fold (issue #479): validate + upload signs before any weight upload, so
+        // an unsupported declaration fails fast instead of after gigabytes of H2D traffic.
+        if (config.HadamardFold is { } fold)
+            hadamard = CudaHadamardRotation.Create(kernels, fold, config.GdnConfig!.Value, config.NumLayers);
+
+        var dataBase = new GgufDataBase(gguf);
+        var tensors = gguf.TensorsByName;
+        var layout = config.HybridLayout!;
+        int hiddenSize = config.HiddenSize;
+
+        // ── Token embedding ──
+        // Raw quant bytes are uploaded (small — e.g. ~340 MB at Bonsai's PQ2_0 packing for a
+        // 248320-vocab table) for the lm_head-tied case. Unlike
+        // CudaQwen3MoeHybridTransformerModel (built for A6000/H100-class VRAM budgets), this
+        // model targets a 12 GB consumer card, and Bonsai's huge vocab makes a full-table F32
+        // pre-dequant (~5 GB) plus the prefill dequant scratch (~2.5 GB, sized to the largest
+        // single tile — the lm_head) push total VRAM demand past 12 GB. That silently trips
+        // WDDM's host-RAM paging fallback (confirmed via
+        // `Get-Counter '\GPU Process Memory(*)\Shared Usage'` showing multi-GB "shared usage"
+        // for the process) — a hang-that-isn't-a-hang, not a deadlock: every GPU memory access
+        // becomes a PCIe round-trip once oversubscribed. So the embedding LOOKUP (as opposed to
+        // the lm_head projection) is done as a per-call host-side row dequant in Forward()
+        // instead — only `seqLen` rows are ever needed, never all 248320.
+        var embDesc = tensors["token_embd.weight"];
+        long embRowBytes = Dequantize.RowByteSize(hiddenSize, embDesc.QuantizationType);
+        // Uploaded via UploadRawTensor (not a hand-rolled alloc+copy) so PQ2_0 tensors get the
+        // same load-time interleaved->split repack every other PQ2_0 weight in the model gets
+        // (see UploadRawTensor's own doc comment) — see issue #162: this tensor previously
+        // bypassed the repack, leaving it in the on-disk interleaved layout while every PQ2_0
+        // GEMV/dequant kernel that might read it (via the tied-embedding lm_head fallback below)
+        // unconditionally assumes split layout. `embRowBytes` (computed above, from
+        // `hiddenSize`/`config.VocabSize`) is used only for the HOST-side per-token embedding
+        // dequant in Forward() — reads directly from the mmap'd GGUF bytes via `dataBase`, not
+        // from this GPU buffer — so it is unaffected by the on-device byte layout either way.
+        nint tokenEmbedDevice = UploadRawTensor(dataBase, embDesc, allocs);
+
+        // ── Output norm (always F32 [hiddenSize], dequant on host then H2D) ──
+        var outNormDesc = tensors["output_norm.weight"];
+        float[] outputNormHost = new float[hiddenSize];
+        Dequantize.ToFloat32(dataBase.Of(outNormDesc), hiddenSize,
+            outNormDesc.QuantizationType, outputNormHost);
+        nint outputNormDevice = AllocDevice((long)hiddenSize * sizeof(float), allocs);
+        fixed (float* p = outputNormHost)
+        {
+            CopyHtoD(outputNormDevice, (nint)p, (long)hiddenSize * sizeof(float));
+        }
+
+        // ── lm_head (tied to token embedding when output.weight is absent) ──
+        nint outputDevice;
+        QuantizationType outputQt;
+        int outputOutputDim;
+        int outputInputDim;
+        bool ownsOutputDevice;
+        if (tensors.TryGetValue("output.weight", out var outDesc))
+        {
+            // Uploaded via UploadRawTensor (issue #162 fix) — see tokenEmbedDevice's identical
+            // fix above for the full rationale. This tensor drives the LM head projection
+            // directly (Gemm() -> LaunchDequantPQ2_0ToF16/LaunchPQ2_0GemvF16In/
+            // LaunchPQ2_0GemvF32Native, all split-layout readers), so the missing repack here
+            // was the actual root cause of #162's -Inf prefill logits: the LM head decoded raw
+            // interleaved on-disk bytes as if they were split-layout, producing effectively
+            // random (garbage-magnitude, sign-uncorrelated vs. the CPU F32 reference) logit
+            // values — most conspicuously ones landing outside FP16's finite range once the
+            // prefill HGEMM path's F16 output store rounds them.
+            outputDevice = UploadRawTensor(dataBase, outDesc, allocs);
+            outputQt = outDesc.QuantizationType;
+            outputInputDim = outDesc.Shape[0];
+            outputOutputDim = outDesc.Shape[1];
+            ownsOutputDevice = true;
+        }
+        else
+        {
+            outputDevice = tokenEmbedDevice;
+            outputQt = embDesc.QuantizationType;
+            outputInputDim = embDesc.Shape[0];
+            outputOutputDim = embDesc.Shape[1];
+            ownsOutputDevice = false;
+        }
+
+        // ── RoPE config ──
+        int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
+        if ((ropeDim & 1) != 0)
+            throw new InvalidDataException(
+                $"Qwen3HybridDense rope_dim={ropeDim} must be even for pair-wise rotation.");
+        if (ropeDim > config.HeadDim)
+            throw new InvalidDataException(
+                $"Qwen3HybridDense rope_dim={ropeDim} exceeds head_dim={config.HeadDim}.");
+        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
+
+        // ── Per-layer load ──
+        var layers = new DeviceLayer[config.NumLayers];
+        var kvSlotForLayer = new int[config.NumLayers];
+        int attentionLayerCount = 0;
+
+        for (int i = 0; i < config.NumLayers; i++)
+        {
+            layers[i] = LoadLayerDevice(i, dataBase, tensors, config, allocs);
+            kvSlotForLayer[i] = layout.LayerKind[i] == HybridLayerKind.Attention
+                ? attentionLayerCount++
+                : -1;
+        }
+
+        // MTP (issue #253): load the trailing NextN head when the GGUF carries one. Zero behavior
+        // change for every other checkpoint — LoadMtpHeadIfPresent returns null unless
+        // config.NextnPredictLayers > 0 AND the nextn.* tensors are actually present. Mirrors the
+        // CPU host's Qwen3HybridDenseTransformerModel.LoadMtpHeadIfPresent tensor layout exactly.
+        CudaMtpHeadWeights? mtpHead = LoadMtpHeadIfPresent(dataBase, tensors, config, allocs);
+
+        var gdn = config.GdnConfig!.Value;
+        state = new CudaQwen3HybridDenseForwardState(
+            hiddenSize: hiddenSize,
+            vocabSize: config.VocabSize,
+            qElems: config.NumAttentionHeads * config.HeadDim,
+            kvElems: config.NumKvHeads * config.HeadDim,
+            convDim: (2 * gdn.NKHead + gdn.NVHead) * gdn.DState,
+            dConv: gdn.DConv,
+            nVHead: gdn.NVHead,
+            nKHead: gdn.NKHead,
+            dState: gdn.DState,
+            intermediateSize: config.IntermediateSize,
+            hasHadamardFold: hadamard is not null);
+
+        int gdnLayerCount = 0;
+        for (int i = 0; i < config.NumLayers; i++)
+            if (layout.LayerKind[i] == HybridLayerKind.GatedDeltaNet) gdnLayerCount++;
+        gdnCache = new CudaGdnStateCache(gdn, gdnLayerCount);
+
+        return new CudaQwen3HybridDenseTransformerModel(
+            config, gguf, layers,
+            tokenEmbedDevice, embDesc.QuantizationType,
+            dataBase.Of(embDesc), 0UL, embRowBytes,
+            outputNormDevice,
+            outputDevice, outputQt, outputOutputDim, outputInputDim, ownsOutputDevice,
+            kvSlotForLayer, attentionLayerCount,
+            ropeTheta, ropeDim,
+            state, gdnCache, stream, cublas, context, kernels, deviceId,
+            mtpHead, hadamard: hadamard);
+        }
+        catch
+        {
+            hadamard?.Dispose();
+            gdnCache?.Dispose();
+            state?.Dispose();
+            for (int i = allocs.Count - 1; i >= 0; i--)
+                FreeIfNonZeroValue(allocs[i]);
+            kernels?.Dispose();
+            cublas?.Dispose();
+            stream?.Dispose();
+            // CudaContext.Create (above) makes the context current on THIS thread, and this
+            // catch runs synchronously on the same thread — no MakeCurrent() call is needed
+            // here (matches #368's convention).
+            context.Dispose();
+            throw;
+        }
+    }
+
+    private static void FreeIfNonZeroValue(nint ptr)
+    {
+        if (ptr != 0) CudaDriverApi.cuMemFree_v2(ptr);
+    }
+
+    /// <summary>
+    /// Loads ONLY the GPU-resident layer prefix <c>[0, numGpuLayers)</c> of a Qwen3HybridDense
+    /// model — the GPU half of a CPU/GPU partial-offload split (issue #291). Pairs with a
+    /// CPU-side tail instance (<c>DotLLM.Models.Architectures.Qwen3HybridDenseTransformerModel.LoadTailFromGguf</c>)
+    /// covering the remaining layers; the composition model D2H-transfers this instance's boundary
+    /// hidden state (via <see cref="ForwardHead"/>) into the tail.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Deliberately skips uploading the full embedding table, lm_head, output-norm and MTP head to
+    /// device — the CPU tail owns the final norm + lm_head, so none of those are needed by a
+    /// head-only instance. Skipping them is the actual VRAM saving partial offload exists to
+    /// deliver for a large-vocabulary model like Bonsai-27B (a 248,320-token vocab lm_head can be
+    /// hundreds of MB even quantized) — loading them here anyway would silently defeat the whole
+    /// point of a smaller <c>--gpu-layers</c> count.
+    /// </para>
+    /// <para>
+    /// Reuses <see cref="LoadLayerDevice"/> unchanged — the SAME per-layer tensor-name resolution
+    /// the full <see cref="LoadFromGguf"/> path already gets right for this architecture's
+    /// GDN-vs-full-attention naming split (issue #291's root cause: the generic, architecture-
+    /// unaware <c>DotLLM.Cuda.HybridTransformerModel</c> partial-offload splitter never consulted
+    /// per-layer-kind naming at all).
+    /// </para>
+    /// </remarks>
+    /// <param name="gguf">Opened GGUF file (must remain alive for the model's lifetime).</param>
+    /// <param name="fullConfig">
+    /// The FULL model's configuration (<c>NumLayers</c> = the whole trunk). Since the GPU head
+    /// always owns the layer PREFIX <c>[0, numGpuLayers)</c>, global and local layer indices
+    /// coincide here — unlike the CPU tail, no index offset is needed when calling
+    /// <see cref="LoadLayerDevice"/>.
+    /// </param>
+    /// <param name="numGpuLayers">Number of layers this head owns. Must be in <c>(0, fullConfig.NumLayers)</c>.</param>
+    /// <param name="deviceId">GPU device ordinal (0-based).</param>
+    /// <param name="ptxDir">Directory containing compiled PTX. Null auto-detects.</param>
+    internal static CudaQwen3HybridDenseTransformerModel LoadHeadFromGguf(
+        GgufFile gguf, ModelConfig fullConfig, int numGpuLayers, int deviceId = 0, string? ptxDir = null)
+    {
+        ArgumentNullException.ThrowIfNull(gguf);
+        ArgumentNullException.ThrowIfNull(fullConfig);
+        if (fullConfig.Architecture != Architecture.Qwen3HybridDense)
+            throw new ArgumentException(
+                $"CudaQwen3HybridDenseTransformerModel requires Architecture.Qwen3HybridDense, got {fullConfig.Architecture}.",
+                nameof(fullConfig));
+        if (fullConfig.HybridLayout is null)
+            throw new ArgumentException("Qwen3HybridDense config must have HybridLayout populated.", nameof(fullConfig));
+        if (fullConfig.GdnConfig is null)
+            throw new ArgumentException("Qwen3HybridDense config must have GdnConfig populated.", nameof(fullConfig));
+        if (numGpuLayers <= 0 || numGpuLayers >= fullConfig.NumLayers)
+            throw new ArgumentOutOfRangeException(nameof(numGpuLayers),
+                $"numGpuLayers must be between 1 and {fullConfig.NumLayers - 1} for a GPU/CPU split.");
+
+        // #484: validate the PTX deployment BEFORE any CUDA resource exists. A bad or
+        // incomplete ptxDir is by far the most common way this factory throws, and doing the
+        // check up front means it can no longer orphan a context/stream/cuBLAS handle,
+        // whatever the unwind path does (see CudaKernels.ResolveAndValidatePtxDirectory).
+        ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(ptxDir);
+
+        // #383: context creation cannot leak on its own throw (nothing allocated yet), so it
+        // stays outside the try/catch — everything created from here on is disposed on any
+        // failure before rethrowing.
+        var context = CudaContext.Create(deviceId);
+        CudaStream? stream = null;
+        CudaCublasHandle? cublas = null;
+        CudaKernels? kernels = null;
+        CudaQwen3HybridDenseForwardState? state = null;
+        CudaGdnStateCache? gdnCache = null;
+        CudaHadamardRotation? hadamard = null;
+        var allocs = new List<nint>();
+        try
+        {
+        stream = CudaStream.Create();
+        cublas = CudaCublasHandle.Create();
+        cublas.SetStream(stream);
+
+        // See LoadFromGguf's identical reset — guards against the same ABA context-handle hazard
+        // (issue #162 follow-up) when many CUDA tests load/dispose Qwen3HybridDense models
+        // (head-only or full) across one process.
+        s_pq2_0RepackModule = null;
+        s_pq2_0RepackFunc = 0;
+        s_pq2_0RepackContext = 0;
+
+        kernels = new CudaKernels(ptxDir);
+
+        // PrismML Hadamard fold (issues #479, #481). The declaration names every block of the FULL
+        // trunk, so validation takes the full layer count, but this head only rotates its prefix
+        // [0, numGpuLayers) and never runs the lm_head: it requires just those names to be declared
+        // (plus refusing any declared name no block of the whole model rotates). The CPU tail it is
+        // paired with validates its own blocks + output.weight the same way (LoadTailFromGguf), so
+        // together the two halves cover exactly the whole-model check. The token_embd inverse is
+        // this head's: ForwardHead does the embedding lookup.
+        if (fullConfig.HadamardFold is { } fold)
+            hadamard = CudaHadamardRotation.Create(kernels, fold, fullConfig.GdnConfig!.Value, fullConfig.NumLayers,
+                ownedFirstLayer: 0, ownedLayerCount: numGpuLayers, ownsLmHead: false);
+
+        var dataBase = new GgufDataBase(gguf);
+        var tensors = gguf.TensorsByName;
+        var fullLayout = fullConfig.HybridLayout!;
+        int hiddenSize = fullConfig.HiddenSize;
+
+        // Embedding: host-side lookup metadata only — deliberately NOT uploaded to device (see
+        // remarks above). tokenEmbedDevice stays 0; ForwardHead's per-token dequant reads
+        // straight from the mmap'd GGUF via dataBase/embDesc.DataOffset, exactly like the full
+        // model's own host-side embedding lookup already does.
+        var embDesc = tensors["token_embd.weight"];
+        long embRowBytes = Dequantize.RowByteSize(hiddenSize, embDesc.QuantizationType);
+
+        int ropeDim = fullConfig.RoPEConfig?.DimensionCount ?? fullConfig.HeadDim;
+        if ((ropeDim & 1) != 0)
+            throw new InvalidDataException(
+                $"Qwen3HybridDense rope_dim={ropeDim} must be even for pair-wise rotation.");
+        if (ropeDim > fullConfig.HeadDim)
+            throw new InvalidDataException(
+                $"Qwen3HybridDense rope_dim={ropeDim} exceeds head_dim={fullConfig.HeadDim}.");
+        float ropeTheta = fullConfig.RoPEConfig?.Theta ?? 10000.0f;
+
+        var layers = new DeviceLayer[numGpuLayers];
+        var kvSlotForLayer = new int[numGpuLayers];
+        int attentionLayerCount = 0;
+
+        for (int i = 0; i < numGpuLayers; i++)
+        {
+            // i IS the global raw GGUF block index here — the GPU head always owns the layer
+            // PREFIX [0, numGpuLayers), so local and global indices coincide (unlike the CPU
+            // tail's LoadTailFromGguf, which must offset by startLayer).
+            layers[i] = LoadLayerDevice(i, dataBase, tensors, fullConfig, allocs);
+            kvSlotForLayer[i] = fullLayout.LayerKind[i] == HybridLayerKind.Attention
+                ? attentionLayerCount++
+                : -1;
+        }
+
+        var gdn = fullConfig.GdnConfig!.Value;
+        state = new CudaQwen3HybridDenseForwardState(
+            hiddenSize: hiddenSize,
+            vocabSize: fullConfig.VocabSize,
+            qElems: fullConfig.NumAttentionHeads * fullConfig.HeadDim,
+            kvElems: fullConfig.NumKvHeads * fullConfig.HeadDim,
+            convDim: (2 * gdn.NKHead + gdn.NVHead) * gdn.DState,
+            dConv: gdn.DConv,
+            nVHead: gdn.NVHead,
+            nKHead: gdn.NKHead,
+            dState: gdn.DState,
+            intermediateSize: fullConfig.IntermediateSize,
+            hasHadamardFold: hadamard is not null);
+
+        int gdnLayerCount = 0;
+        for (int i = 0; i < numGpuLayers; i++)
+            if (fullLayout.LayerKind[i] == HybridLayerKind.GatedDeltaNet) gdnLayerCount++;
+        gdnCache = new CudaGdnStateCache(gdn, gdnLayerCount);
+
+        // Sliced config: NumLayers=numGpuLayers so this instance's own Config correctly reports
+        // its (partial) layer count / hybrid layout. Since the head owns the PREFIX, slicing
+        // [0, numGpuLayers) is an identity slice for every layer this instance actually touches.
+        var headLayout = new HybridLayerLayout
+        {
+            LayerKind = fullLayout.LayerKind[..numGpuLayers],
+            HeadCountKv = fullLayout.HeadCountKv[..numGpuLayers],
+            FeedForwardLength = fullLayout.FeedForwardLength[..numGpuLayers],
+        };
+        var headConfig = fullConfig with { NumLayers = numGpuLayers, HybridLayout = headLayout, NextnPredictLayers = 0 };
+
+        return new CudaQwen3HybridDenseTransformerModel(
+            headConfig, gguf, layers,
+            tokenEmbedDevice: 0, embDesc.QuantizationType,
+            dataBase.Of(embDesc), 0UL, embRowBytes,
+            outputNormDevice: 0,
+            outputDevice: 0, outputQt: default, outputOutputDim: 0, outputInputDim: 0,
+            ownsOutputDevice: false,
+            kvSlotForLayer, attentionLayerCount,
+            ropeTheta, ropeDim,
+            state, gdnCache, stream, cublas, context, kernels, deviceId,
+            mtpHead: null, isHeadOnly: true, hadamard: hadamard);
+        }
+        catch
+        {
+            hadamard?.Dispose();
+            gdnCache?.Dispose();
+            state?.Dispose();
+            for (int i = allocs.Count - 1; i >= 0; i--)
+                FreeIfNonZeroValue(allocs[i]);
+            kernels?.Dispose();
+            cublas?.Dispose();
+            stream?.Dispose();
+            // CudaContext.Create (above) makes the context current on THIS thread, and this
+            // catch runs synchronously on the same thread — no MakeCurrent() call is needed
+            // here (matches #368's convention).
+            context.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Runs embedding + the GPU-resident layer prefix ONLY (no final RMSNorm / lm_head / MTP),
+    /// returning the raw pre-final-norm hidden state as a <c>[seqLen, hiddenSize]</c> F32 HOST
+    /// tensor. Only valid on an instance built via <see cref="LoadHeadFromGguf"/> — the GPU half
+    /// of a CPU/GPU partial-offload split (issue #291).
+    /// </summary>
+    /// <remarks>
+    /// SYNC WARNING: mirrors <see cref="ForwardCore"/>'s setup block (H2D token/position upload,
+    /// host-side per-token embedding dequant + H2D copy, per-layer dispatch via
+    /// <see cref="RunSingleLayerBody"/>) — any future fix to that setup or to the GDN/attention
+    /// per-layer dispatch must be mirrored here. Unlike <see cref="ForwardCore"/> this method never
+    /// runs the final RMSNorm/lm_head/MTP-capture tail — a head-only instance has none of those
+    /// weights loaded (see <see cref="LoadHeadFromGguf"/>'s remarks).
+    /// </remarks>
+    internal ITensor ForwardHead(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, IKvCache? kvCache)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!_isHeadOnly)
+            throw new InvalidOperationException(
+                $"{nameof(ForwardHead)} is only valid on a head-only instance built via {nameof(LoadHeadFromGguf)}.");
+
+        int seqLen = tokenIds.Length;
+        if (seqLen == 0 || seqLen != positions.Length)
+            throw new ArgumentException("tokenIds and positions must have equal, non-zero length.");
+
+        int hiddenSize = Config.HiddenSize;
+        int numHeads = Config.NumAttentionHeads;
+        int numKvHeads = Config.NumKvHeads;
+        int headDim = Config.HeadDim;
+        float eps = Config.NormEpsilon;
+        int maxSeq = Config.MaxSequenceLength;
+
+        for (int i = 0; i < positions.Length; i++)
+        {
+            if ((uint)positions[i] >= (uint)maxSeq)
+                throw new ArgumentOutOfRangeException(nameof(positions),
+                    $"Position {positions[i]} at index {i} exceeds max sequence length {maxSeq}.");
+        }
+
+        AdvanceKvHandleAndSyncLengths(kvCache, positions);
+        // Any forward moves the model-owned GDN state on, so earlier row snapshots no longer
+        // describe it (issue #473). ForwardWithRecurrentSnapshots re-validates after it returns.
+        _rowSnapshotValidRows = 0;
+
+        _context.MakeCurrent();
+        _state.EnsureCapacity(seqLen);
+
+        nint streamH = _stream.Handle;
+
+        fixed (int* tokenPtr = tokenIds)
+        {
+            CudaDriverApi.cuMemcpyHtoDAsync_v2(_state.TokenIdsDevice, (nint)tokenPtr,
+                (nuint)(seqLen * sizeof(int)), streamH).ThrowOnError();
+        }
+        fixed (int* posPtr = positions)
+        {
+            CudaDriverApi.cuMemcpyHtoDAsync_v2(_state.PositionsDevice, (nint)posPtr,
+                (nuint)(seqLen * sizeof(int)), streamH).ThrowOnError();
+        }
+
+        float[] embedHost = new float[(long)seqLen * hiddenSize];
+        for (int t = 0; t < seqLen; t++)
+        {
+            nint rowSrc = _embedDataBase + (nint)(_embedDataOffset + (ulong)tokenIds[t] * (ulong)_embedRowBytes);
+            Dequantize.ToFloat32(rowSrc, hiddenSize, _tokenEmbedQt,
+                embedHost.AsSpan(t * hiddenSize, hiddenSize));
+        }
+        fixed (float* pEmbedHost = embedHost)
+        {
+            // A Hadamard-latent token_embd (prism.hadamard.inverse_weight_names) stores rotated
+            // rows: restore the primal basis before the upload (rotation, then signs) — the CPU
+            // host's EmbedTokens code path, run on the same host rows (issue #479).
+            if (_hadamard is { } embRot)
+                embRot.RotateInverseInPlaceHost(pEmbedHost, seqLen, hiddenSize);
+            CudaDriverApi.cuMemcpyHtoDAsync_v2(_state.HiddenState, (nint)pEmbedHost,
+                (nuint)((long)seqLen * hiddenSize * sizeof(float)), streamH).ThrowOnError();
+        }
+
+        for (int layer = 0; layer < _layers.Length; layer++)
+        {
+            RunSingleLayerBody(layer, seqLen, positions, hiddenSize,
+                numHeads, numKvHeads, headDim, eps, kvCache);
+        }
+
+        _stream.Synchronize();
+        var shape = new TensorShape(seqLen, hiddenSize);
+        var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
+        CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, _state.HiddenState,
+            (nuint)((long)seqLen * hiddenSize * sizeof(float))).ThrowOnError();
+        return result;
+    }
+
+    /// <summary>
+    /// Advances the length-only KV handle to cover <paramref name="positions"/> and, first, syncs the
+    /// model-owned KV lengths to the handle's committed length (issues #476, #478).
+    /// </summary>
+    /// <remarks>
+    /// The handle is length-only, but callers rely on its <c>CurrentLength</c>: speculative decoding
+    /// rolls it back to a committed position after a rejected round. Nothing used to advance it, so
+    /// <c>Rollback(n &gt; 0)</c> always threw (#476). Its length BEFORE this call is the committed
+    /// prefix; <see cref="_f16CacheCurrentLength"/> shrinks to it. Runs once per forward,
+    /// before any attention layer reads it. (The F32 staging is reconverted in full per use, #956,
+    /// so it carries no length of its own to sync.)
+    /// </remarks>
+    private void AdvanceKvHandleAndSyncLengths(IKvCache? kvCache, ReadOnlySpan<int> positions)
+    {
+        if (kvCache is not CudaHybridKvCacheHandle handle)
+            return;
+
+        _f16CacheCurrentLength = HybridKvLengthBookkeeping.SyncToCommitted(
+            _f16CacheCurrentLength, Span<int>.Empty, handle.CurrentLength);
+
+        int maxPos = 0;
+        for (int i = 0; i < positions.Length; i++)
+            if (positions[i] > maxPos) maxPos = positions[i];
+        handle.Advance(maxPos + 1);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    //  Per-layer loaders (host → device upload of raw quant bytes)
+    // ──────────────────────────────────────────────────────────────────────
+
+    private static DeviceLayer LoadLayerDevice(
+        int layerIdx, GgufDataBase dataBase,
+        IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
+        ModelConfig config, List<nint> allocs)
+    {
+        string prefix = $"blk.{layerIdx}";
+        int hiddenSize = config.HiddenSize;
+        var layout = config.HybridLayout!;
+
+        // Norms — F32 [hiddenSize].
+        var attnNormDesc = tensors[$"{prefix}.attn_norm.weight"];
+        nint attnNormDevice = UploadF32Tensor(dataBase, attnNormDesc, hiddenSize, allocs);
+        var postNormDesc = tensors[$"{prefix}.post_attention_norm.weight"];
+        nint postAttnNormDevice = UploadF32Tensor(dataBase, postNormDesc, hiddenSize, allocs);
+
+        DeviceGdn? gdnDev = null;
+        DeviceFullAttn? attnDev = null;
+        switch (layout.LayerKind[layerIdx])
+        {
+            case HybridLayerKind.GatedDeltaNet:
+                gdnDev = LoadGdnLayerDevice(prefix, dataBase, tensors, config, allocs);
+                break;
+            case HybridLayerKind.Attention:
+                attnDev = LoadFullAttnLayerDevice(prefix, dataBase, tensors, config,
+                    layout.HeadCountKv[layerIdx], allocs);
+                break;
+            default:
+                throw new InvalidOperationException(
+                    $"Unexpected HybridLayerKind {layout.LayerKind[layerIdx]} at layer {layerIdx} in Qwen3HybridDense.");
+        }
+
+        // Dense SwiGLU FFN — ffn_gate.weight, ffn_up.weight, ffn_down.weight (no MoE
+        // routing; no "_exps" suffix, confirmed against the real Ternary-Bonsai-27B-Q2_0.gguf).
+        var gateDesc = tensors[$"{prefix}.ffn_gate.weight"];
+        var upDesc = tensors[$"{prefix}.ffn_up.weight"];
+        var downDesc = tensors[$"{prefix}.ffn_down.weight"];
+        nint gateDevice = UploadRawTensor(dataBase, gateDesc, allocs);
+        nint upDevice = UploadRawTensor(dataBase, upDesc, allocs);
+        nint downDevice = UploadRawTensor(dataBase, downDesc, allocs);
+
+        return new DeviceLayer
+        {
+            AttnNormWeightDevice = attnNormDevice,
+            PostAttnNormWeightDevice = postAttnNormDevice,
+            Gdn = gdnDev,
+            FullAttn = attnDev,
+
+            GateWeight = gateDevice, GateQt = gateDesc.QuantizationType,
+            GateInputDim = gateDesc.Shape[0], GateOutputDim = gateDesc.Shape[1],
+
+            UpWeight = upDevice, UpQt = upDesc.QuantizationType,
+            UpInputDim = upDesc.Shape[0], UpOutputDim = upDesc.Shape[1],
+
+            DownWeight = downDevice, DownQt = downDesc.QuantizationType,
+            DownInputDim = downDesc.Shape[0], DownOutputDim = downDesc.Shape[1],
+        };
+    }
+
+    private static DeviceGdn LoadGdnLayerDevice(
+        string prefix, GgufDataBase dataBase,
+        IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
+        ModelConfig config, List<nint> allocs)
+    {
+        var gdn = config.GdnConfig!.Value;
+        int convDim = (2 * gdn.NKHead + gdn.NVHead) * gdn.DState;
+
+        var qkvDesc = tensors[$"{prefix}.attn_qkv.weight"];
+        var gateDesc = tensors[$"{prefix}.attn_gate.weight"];
+        var alphaDesc = tensors[$"{prefix}.ssm_alpha.weight"];
+        var betaDesc = tensors[$"{prefix}.ssm_beta.weight"];
+        var conv1dWDesc = tensors[$"{prefix}.ssm_conv1d.weight"];
+        var aDesc = tensors[$"{prefix}.ssm_a"];
+        var dtBDesc = tensors[$"{prefix}.ssm_dt.bias"];
+        var ssmNormDesc = tensors[$"{prefix}.ssm_norm.weight"];
+        var outDesc = tensors[$"{prefix}.ssm_out.weight"];
+
+        nint qkvDevice = UploadRawTensor(dataBase, qkvDesc, allocs);
+        nint gateDevice = UploadRawTensor(dataBase, gateDesc, allocs);
+        nint alphaDevice = UploadRawTensor(dataBase, alphaDesc, allocs);
+        nint betaDevice = UploadRawTensor(dataBase, betaDesc, allocs);
+        nint outDevice = UploadRawTensor(dataBase, outDesc, allocs);
+
+        nint conv1dWeightDevice = UploadF32Tensor(dataBase, conv1dWDesc, gdn.DConv * convDim, allocs);
+        nint conv1dBiasDevice = AllocDevice((long)convDim * sizeof(float), allocs);
+        CudaDriverApi.cuMemsetD8_v2(conv1dBiasDevice, 0, (nuint)((long)convDim * sizeof(float)))
+            .ThrowOnError();
+
+        nint aDevice = UploadF32Tensor(dataBase, aDesc, gdn.NVHead, allocs);
+        nint dtBiasDevice = UploadF32Tensor(dataBase, dtBDesc, gdn.NVHead, allocs);
+        nint ssmNormDevice = UploadF32Tensor(dataBase, ssmNormDesc, gdn.DState, allocs);
+
+
+        return new DeviceGdn
+        {
+            QkvDevice = qkvDevice, QkvQt = qkvDesc.QuantizationType,
+            QkvInputDim = qkvDesc.Shape[0], QkvOutputDim = qkvDesc.Shape[1],
+
+            GateDevice = gateDevice, GateQt = gateDesc.QuantizationType,
+            GateInputDim = gateDesc.Shape[0], GateOutputDim = gateDesc.Shape[1],
+
+            AlphaDevice = alphaDevice, AlphaQt = alphaDesc.QuantizationType,
+            AlphaInputDim = alphaDesc.Shape[0], AlphaOutputDim = alphaDesc.Shape[1],
+
+            BetaDevice = betaDevice, BetaQt = betaDesc.QuantizationType,
+            BetaInputDim = betaDesc.Shape[0], BetaOutputDim = betaDesc.Shape[1],
+
+            Conv1dWeightDevice = conv1dWeightDevice,
+            Conv1dBiasDevice = conv1dBiasDevice,
+            ADevice = aDevice,
+            DtBiasDevice = dtBiasDevice,
+            SsmNormDevice = ssmNormDevice,
+
+            OutDevice = outDevice, OutQt = outDesc.QuantizationType,
+            OutInputDim = outDesc.Shape[0], OutOutputDim = outDesc.Shape[1],
+        };
+    }
+
+    private static DeviceFullAttn LoadFullAttnLayerDevice(
+        string prefix, GgufDataBase dataBase,
+        IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
+        ModelConfig config, int numKvHeads, List<nint> allocs)
+    {
+        var q = tensors[$"{prefix}.attn_q.weight"];
+        var k = tensors[$"{prefix}.attn_k.weight"];
+        var v = tensors[$"{prefix}.attn_v.weight"];
+        var o = tensors[$"{prefix}.attn_output.weight"];
+
+        int expectedQGateOut = 2 * config.NumAttentionHeads * config.HeadDim;
+        if (q.Shape[1] != expectedQGateOut)
+        {
+            throw new InvalidDataException(
+                $"{prefix}.attn_q.weight has output dim {q.Shape[1]} but qwen35 expects " +
+                $"{expectedQGateOut} = 2 * {config.NumAttentionHeads} * {config.HeadDim} (Q+Gate fused).");
+        }
+
+        nint qDevice = UploadRawTensor(dataBase, q, allocs);
+        nint kDevice = UploadRawTensor(dataBase, k, allocs);
+        nint vDevice = UploadRawTensor(dataBase, v, allocs);
+        nint oDevice = UploadRawTensor(dataBase, o, allocs);
+
+        nint qNormDevice = UploadF32Tensor(dataBase, tensors[$"{prefix}.attn_q_norm.weight"], config.HeadDim, allocs);
+        nint kNormDevice = UploadF32Tensor(dataBase, tensors[$"{prefix}.attn_k_norm.weight"], config.HeadDim, allocs);
+
+
+        return new DeviceFullAttn
+        {
+            QDevice = qDevice, QQt = q.QuantizationType,
+            QInputDim = q.Shape[0], QOutputDim = q.Shape[1],
+
+            KDevice = kDevice, KQt = k.QuantizationType,
+            KInputDim = k.Shape[0], KOutputDim = k.Shape[1],
+
+            VDevice = vDevice, VQt = v.QuantizationType,
+            VInputDim = v.Shape[0], VOutputDim = v.Shape[1],
+
+            ODevice = oDevice, OQt = o.QuantizationType,
+            OInputDim = o.Shape[0], OOutputDim = o.Shape[1],
+
+            NumKvHeads = numKvHeads,
+            QNormDevice = qNormDevice,
+            KNormDevice = kNormDevice,
+        };
+    }
+
+    /// <summary>
+    /// Loads the trailing Multi-Token Prediction (MTP / "NextN") head when the GGUF has one
+    /// (issue #253), or returns <see langword="null"/> for a checkpoint without MTP — the
+    /// overwhelming majority of GGUFs, completely unaffected by this method. Mirrors
+    /// <c>DotLLM.Models.Architectures.Qwen3HybridDenseTransformerModel.LoadMtpHeadIfPresent</c>
+    /// (CPU) exactly: same tensor names, same "hparam without tensors ⇒ no MTP head" tolerance,
+    /// same <c>nextn_predict_layers == 1</c>-only restriction. The MTP block's own attn+ffn
+    /// tensors reuse <see cref="LoadFullAttnLayerDevice"/> / the same dense-FFN upload pattern
+    /// <see cref="LoadLayerDevice"/> uses — it is structurally a normal full-attention decoder
+    /// layer, just appended at raw GGUF block index <c>config.NumLayers</c> (trunk layers occupy
+    /// <c>[0, NumLayers)</c>, since <c>GgufModelConfigExtractor</c> already subtracted
+    /// <c>nextn_predict_layers</c> back out of the raw <c>block_count</c>).
+    /// </summary>
+    private static CudaMtpHeadWeights? LoadMtpHeadIfPresent(
+        GgufDataBase dataBase,
+        IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
+        ModelConfig config,
+        List<nint> allocs)
+    {
+        if (config.NextnPredictLayers <= 0)
+            return null;
+
+        if (config.NextnPredictLayers != 1)
+            throw new NotSupportedException(
+                $"Qwen3HybridDense MTP only supports a single trailing MTP block " +
+                $"(nextn_predict_layers=1); got {config.NextnPredictLayers}. Matches llama.cpp's own " +
+                "current QWEN35 MTP assertion (issue #253 scope: Qwen3.6, not a future multi-head variant).");
+
+        int mtpBlk = config.NumLayers; // trunk occupies [0, NumLayers); MTP is appended right after
+        string prefix = $"blk.{mtpBlk}";
+
+        // The hparam can be set without the tensors actually being present (e.g. a trunk-only
+        // GGUF someone hand-edited the metadata on) — treat that as "no MTP head", not an error,
+        // to keep the zero-behavior-change guarantee unconditional.
+        if (!tensors.ContainsKey($"{prefix}.nextn.eh_proj.weight"))
+            return null;
+
+        int hiddenSize = config.HiddenSize;
+
+        // The MTP block's own attn+ffn tensors use the exact same naming/shapes as any other
+        // full-attention Qwen3HybridDense layer — reuse the trunk loaders directly.
+        var attnNormDesc = tensors[$"{prefix}.attn_norm.weight"];
+        nint attnNormDevice = UploadF32Tensor(dataBase, attnNormDesc, hiddenSize, allocs);
+        var postNormDesc = tensors[$"{prefix}.post_attention_norm.weight"];
+        nint postAttnNormDevice = UploadF32Tensor(dataBase, postNormDesc, hiddenSize, allocs);
+
+        DeviceFullAttn attnDev = LoadFullAttnLayerDevice(prefix, dataBase, tensors, config,
+            config.NumKvHeads, allocs);
+
+        var gateDesc = tensors[$"{prefix}.ffn_gate.weight"];
+        var upDesc = tensors[$"{prefix}.ffn_up.weight"];
+        var downDesc = tensors[$"{prefix}.ffn_down.weight"];
+        nint gateDevice = UploadRawTensor(dataBase, gateDesc, allocs);
+        nint upDevice = UploadRawTensor(dataBase, upDesc, allocs);
+        nint downDevice = UploadRawTensor(dataBase, downDesc, allocs);
+
+        var layer = new DeviceLayer
+        {
+            AttnNormWeightDevice = attnNormDevice,
+            PostAttnNormWeightDevice = postAttnNormDevice,
+            Gdn = null,
+            FullAttn = attnDev,
+
+            GateWeight = gateDevice, GateQt = gateDesc.QuantizationType,
+            GateInputDim = gateDesc.Shape[0], GateOutputDim = gateDesc.Shape[1],
+
+            UpWeight = upDevice, UpQt = upDesc.QuantizationType,
+            UpInputDim = upDesc.Shape[0], UpOutputDim = upDesc.Shape[1],
+
+            DownWeight = downDevice, DownQt = downDesc.QuantizationType,
+            DownInputDim = downDesc.Shape[0], DownOutputDim = downDesc.Shape[1],
+        };
+
+        var ehProjDesc = tensors[$"{prefix}.nextn.eh_proj.weight"];
+        nint ehProjDevice = UploadRawTensor(dataBase, ehProjDesc, allocs);
+
+        nint enormDevice = UploadF32Tensor(dataBase, tensors[$"{prefix}.nextn.enorm.weight"], hiddenSize, allocs);
+        nint hnormDevice = UploadF32Tensor(dataBase, tensors[$"{prefix}.nextn.hnorm.weight"], hiddenSize, allocs);
+
+        // Optional nextn.embed_tokens: host-mmap pointer (NOT uploaded to device), mirroring the
+        // trunk's own _embedDataBase convention — MTP embeds one token per ForwardMtp call via a
+        // host-side dequant + tiny H2D copy, exactly like the trunk's per-token embedding lookup
+        // in Forward(). Falls back to the trunk's own token_embd.weight (via _embedDataBase/
+        // _embedDataOffset/_embedRowBytes) when absent.
+        nint? embedTokensHostBase = null;
+        ulong embedTokensDataOffset = 0;
+        long embedTokensRowBytes = 0;
+        QuantizationType embedTokensQt = default;
+        if (tensors.TryGetValue($"{prefix}.nextn.embed_tokens.weight", out var embedDesc))
+        {
+            embedTokensHostBase = dataBase.Of(embedDesc);
+            embedTokensDataOffset = 0; // host base is already tensor-resolved (split-GGUF safe, #756)
+            embedTokensRowBytes = Dequantize.RowByteSize(hiddenSize, embedDesc.QuantizationType);
+            embedTokensQt = embedDesc.QuantizationType;
+        }
+
+        // Optional nextn.shared_head_head / nextn.shared_head_norm: device-resident (feed a GEMM /
+        // RMSNorm kernel respectively), mirroring _outputDevice/_outputNormDevice. Fall back to the
+        // trunk's own lm_head/output_norm when absent.
+        nint? sharedHeadHeadDevice = null;
+        QuantizationType sharedHeadHeadQt = default;
+        int sharedHeadHeadInputDim = 0, sharedHeadHeadOutputDim = 0;
+        if (tensors.TryGetValue($"{prefix}.nextn.shared_head_head.weight", out var sharedHeadDesc))
+        {
+            sharedHeadHeadDevice = UploadRawTensor(dataBase, sharedHeadDesc, allocs);
+            sharedHeadHeadQt = sharedHeadDesc.QuantizationType;
+            sharedHeadHeadInputDim = sharedHeadDesc.Shape[0];
+            sharedHeadHeadOutputDim = sharedHeadDesc.Shape[1];
+        }
+
+        nint? sharedHeadNormDevice = tensors.TryGetValue($"{prefix}.nextn.shared_head_norm.weight", out var shnDesc)
+            ? UploadF32Tensor(dataBase, shnDesc, hiddenSize, allocs)
+            : null;
+
+        return new CudaMtpHeadWeights
+        {
+            Layer = layer,
+
+            EhProjDevice = ehProjDevice, EhProjQt = ehProjDesc.QuantizationType,
+            EhProjInputDim = ehProjDesc.Shape[0], EhProjOutputDim = ehProjDesc.Shape[1],
+
+            EnormDevice = enormDevice,
+            HnormDevice = hnormDevice,
+
+            EmbedTokensHostBase = embedTokensHostBase,
+            EmbedTokensDataOffset = embedTokensDataOffset,
+            EmbedTokensRowBytes = embedTokensRowBytes,
+            EmbedTokensQt = embedTokensQt,
+
+            SharedHeadHeadDevice = sharedHeadHeadDevice,
+            SharedHeadHeadQt = sharedHeadHeadQt,
+            SharedHeadHeadInputDim = sharedHeadHeadInputDim,
+            SharedHeadHeadOutputDim = sharedHeadHeadOutputDim,
+
+            SharedHeadNormDevice = sharedHeadNormDevice,
+        };
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    //  Forward dispatch
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// <inheritdoc/>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
+        => Forward(tokenIds, positions, deviceId, kvCache: null);
+
+    /// <inheritdoc/>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache)
+        => Forward(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly: false);
+
+    /// <inheritdoc/>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly)
+        => ForwardCore(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly, mtpCapture: null);
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// MTP (issue #253): when <paramref name="mtpState"/> is a <see cref="CudaMtpState"/> on a
+    /// model with <see cref="SupportsMtp"/> true, this call additionally D2H-copies the trunk's
+    /// pre-final-norm hidden state for every position in <paramref name="tokenIds"/> into it — see
+    /// the capture point inside <see cref="ForwardCore"/>. The returned logits are byte-identical
+    /// to calling without <paramref name="mtpState"/>. <paramref name="adapter"/> is accepted (per
+    /// the <see cref="IModel"/> contract) but has no effect — this model has no LoRA support, same
+    /// as every other overload here.
+    /// </remarks>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, ILoraAdapter? adapter, IMtpState? mtpState)
+        => ForwardCore(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly: false,
+                        mtpCapture: mtpState as CudaMtpState);
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Issue #493: honours <paramref name="lastTokenLogitsOnly"/> <b>together with</b>
+    /// <paramref name="mtpState"/>. The MTP capture needs every position's post-<c>output_norm</c>
+    /// row, but the LM head does not — <see cref="ForwardCore"/> normalises all rows and still
+    /// projects only the last one, so an MTP prefill gets the same VRAM saving as a plain one.
+    /// </remarks>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, ILoraAdapter? adapter,
+                           IMtpState? mtpState, bool lastTokenLogitsOnly)
+        => ForwardCore(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly,
+                        mtpCapture: mtpState as CudaMtpState);
+
+    /// <summary>
+    /// Default prefill tile, in tokens (issue #494). A prefill forward's working set — the F32
+    /// activation buffers, the per-projection F16 dequant scratch and the cuBLAS workspace — all
+    /// scale with the submitted token count, so a single 4096-token call pinned a 12 GB RTX 3060 at
+    /// 12,035 / 12,288 MiB on Bonsai 2 27B and thrashed, while p=1024 was comfortable. Tiling the
+    /// forward bounds that working set by the tile instead of by the prompt.
+    /// </summary>
+    /// <remarks>
+    /// Chosen as the largest size the issue records as healthy on a 12 GB card rather than derived
+    /// from free VRAM: <see cref="CudaQwen3HybridDenseForwardState.AllocatedBytes"/> covers neither
+    /// the cuBLAS workspace nor the KV staging, so any "fit it to <c>cuMemGetInfo</c>" formula
+    /// would be a guess that silently mis-sizes on an unfamiliar card. Override with
+    /// <c>DOTLLM_CUDA_PREFILL_CHUNK</c> (0 disables tiling entirely and restores the single call).
+    /// </remarks>
+    private const int DefaultPrefillChunkTokens = 1024;
+
+    /// <summary>
+    /// Resolved tile size: <c>DOTLLM_CUDA_PREFILL_CHUNK</c> when it parses to a non-negative int,
+    /// otherwise <see cref="DefaultPrefillChunkTokens"/>. 0 disables tiling.
+    /// </summary>
+    private static readonly int PrefillChunkFromEnv =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_CUDA_PREFILL_CHUNK"), out int envChunk) && envChunk >= 0
+            ? envChunk
+            : DefaultPrefillChunkTokens;
+
+    /// <summary>
+    /// When set, overrides the environment on the CURRENT thread. Thread-static, so parallel test
+    /// classes and in-process A/B sweeps cannot flip each other's tile size — the forward runs
+    /// synchronously on the thread that called it. Mirrors <c>MtpAbsorbDispatch.PerTokenOverride</c>.
+    /// </summary>
+    [ThreadStatic]
+    internal static int? PrefillChunkOverride;
+
+    /// <summary>
+    /// Test hook (PR #1026 review): when set, the KV storage allocation after this many successful buffer allocations
+    /// throws, as a real OOM partway through <c>EnsureF16KvCache</c> would. Thread-static, like <see cref="PrefillChunkOverride"/>.
+    /// </summary>
+    [ThreadStatic]
+    internal static int? KvAllocFailureAfter;
+
+    /// <summary>Test hook (PR #1026 review): when set, the free device memory the KV growth admission sees, in bytes.</summary>
+    [ThreadStatic]
+    internal static long? FreeVramOverride;
+
+    /// <summary>Rows the per-token forward buffers are sized for: bounded by the prefill tile when tiling applies (issue #1025).</summary>
+    internal int ForwardStateSequenceCapacity => _state.SequenceCapacity;
+
+    /// <summary>Tile size in force for this thread: the override, else the environment/default.</summary>
+    internal static int PrefillChunkTokens => PrefillChunkOverride ?? PrefillChunkFromEnv;
+
+    /// <inheritdoc/>
+    /// <remarks>The <see cref="ForwardCore"/> tile, so an engine that chunks at it splits exactly where this model would (issue #1025).</remarks>
+    public int PreferredPrefillChunkTokens => PrefillChunkTokens;
+
+    /// <summary>
+    /// Core forward pass. Tiles a long prefill over tokens (issue #494) so peak VRAM is bounded by
+    /// <see cref="PrefillChunkTokens"/> rather than by the prompt length, then delegates each tile
+    /// to <see cref="ForwardTile"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>Tiling is exactly what <c>TextGenerator</c>'s <c>--prefill-chunk-size</c> already does
+    /// one level up, and is correct for the same reason: with a KV-cache present, tile <c>t</c>
+    /// attends to the keys/values tiles <c>0..t-1</c> already committed, and the GDN state advances
+    /// sequentially across tiles just as it does across calls. It lives HERE as well because the
+    /// engine knob is off by default and does not cover the callers that hit the ceiling —
+    /// <c>bench -p 4096</c> submits the whole prompt in one <c>Forward</c> (only its untimed
+    /// <c>--depth</c> walk chunks, via <c>BenchRunner</c>'s own <c>DepthExtensionChunkSize</c>), and
+    /// so does any direct <c>IModel</c> caller. The engine knob remains the user-facing <c>-ub</c>
+    /// analog; this is the backend defending its own VRAM ceiling.</para>
+    /// <para>Three gates keep it off where it would change behaviour rather than just memory:</para>
+    /// <list type="bullet">
+    /// <item><c>kvCache is null</c> — later tiles would have nothing to attend to. A cacheless
+    /// caller (<c>PerplexityEvaluator</c>, <c>debug forward-pass</c>) also wants every row, so it
+    /// pays the full-S working set inherently.</item>
+    /// <item><c>!lastTokenLogitsOnly</c> — the caller wants a row per position, which a tile loop
+    /// would have to reassemble. Every long-prompt caller opts into the hint (issue #493); the
+    /// all-rows callers submit short batches (a speculative verify is K+1 tokens).</item>
+    /// <item><c>_rowSnapshotRequestRows &gt; 0</c> — <c>ForwardWithRecurrentSnapshots</c> (#473)
+    /// records a GDN snapshot per input row; a tile loop would leave only the last tile's rows
+    /// valid.</item>
+    /// </list>
+    /// <para><b>An MTP prefill is tiled too</b> (issue #1025). It used to be exempt, so an MTP request
+    /// sized every per-token buffer for the whole prompt. On Bonsai 2 27B that is ~600 KB/token: a
+    /// 5.8k-token agent prompt oversubscribed a 12 GB card, spilled to shared memory and prefilled
+    /// for tens of minutes, which is the #494 thrash again. Each MTP tile runs the full tail
+    /// (final norm over its rows, capture, absorb, carry seeded from its last row). That is the same
+    /// sequence of calls a decode/verify loop already makes, and
+    /// <c>CudaQwen3HybridDenseMtpPrefillTilingTests</c> pins it against the single call. Its
+    /// non-final tiles still project their last row through the LM head: one row per tile.</para>
+    /// <para><b>Not bit-identical</b> to the single call: each layer's GEMMs run with a different
+    /// M per tile and cuBLAS selects per-M algorithms, so the last row's logits agree only to the
+    /// usual accumulation-order tolerance — the same caveat
+    /// <c>CudaQwen3HybridDenseLastTokenLogitsOnlyTest</c> already documents for the row-count hint.
+    /// The KV-cache contents are unaffected in kind: each tile writes the same positions it would
+    /// have written in the single call.</para>
+    /// </remarks>
+    private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly,
+                           CudaMtpState? mtpCapture)
+    {
+        int chunk = PrefillChunkTokens;
+        int total = tokenIds.Length;
+        if (chunk <= 0 || total <= chunk || kvCache is null || !lastTokenLogitsOnly
+            || _rowSnapshotRequestRows > 0)
+        {
+            return ForwardTile(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly,
+                               mtpCapture, produceLogits: true)!;
+        }
+
+        ITensor? logits = null;
+        try
+        {
+            for (int offset = 0; offset < total; offset += chunk)
+            {
+                int len = Math.Min(chunk, total - offset);
+                bool isFinal = offset + len >= total;
+                // Non-final tiles skip the final norm, the LM-head GEMM and the D2H copy entirely:
+                // the caller asked for the last row only, so their logits would be discarded. That
+                // is a prefill-time win on top of the VRAM one. An MTP tile cannot skip the tail,
+                // because the capture and absorb live there (issue #1025), so it keeps it and its
+                // one-row logits are dropped when the next tile starts.
+                logits?.Dispose();
+                logits = ForwardTile(tokenIds.Slice(offset, len), positions.Slice(offset, len),
+                                     deviceId, kvCache, lastTokenLogitsOnly: true,
+                                     mtpCapture, produceLogits: isFinal || mtpCapture is not null);
+            }
+            return logits!;
+        }
+        catch
+        {
+            logits?.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// One forward pass over a tile of tokens — the whole layer stack for those tokens, against the
+    /// shared KV-cache and recurrent state. This is the body every public <c>Forward</c> overload
+    /// ultimately runs; <see cref="ForwardCore"/> above calls it once, or once per tile.
+    /// <paramref name="mtpCapture"/> is non-null only from the MTP-aware overloads — see their
+    /// remarks and the capture point below, right before the final RMSNorm overwrites
+    /// <see cref="CudaQwen3HybridDenseForwardState.HiddenState"/> in place.
+    /// <paramref name="produceLogits"/> is false only for a non-final tile, which runs purely to
+    /// advance the KV-cache and the GDN state; it returns <see langword="null"/>.
+    /// </summary>
+    [SkipLocalsInit]
+    private ITensor? ForwardTile(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly,
+                           CudaMtpState? mtpCapture, bool produceLogits)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_isHeadOnly)
+            throw new InvalidOperationException(
+                $"This instance was built via {nameof(LoadHeadFromGguf)} (issue #291 partial-offload " +
+                $"GPU head) and has no lm_head/output-norm loaded. Use {nameof(ForwardHead)} instead.");
+
+        int seqLen = tokenIds.Length;
+        if (seqLen == 0 || seqLen != positions.Length)
+            throw new ArgumentException("tokenIds and positions must have equal, non-zero length.");
+
+        _profileActiveForThisCall = seqLen == 1;
+        _mtpEmbedPrefetchRows = 0;   // #492: no claim survives a call boundary
+
+        int hiddenSize = Config.HiddenSize;
+        int vocabSize = Config.VocabSize;
+        int numHeads = Config.NumAttentionHeads;
+        int numKvHeads = Config.NumKvHeads;
+        int headDim = Config.HeadDim;
+        float eps = Config.NormEpsilon;
+        int maxSeq = Config.MaxSequenceLength;
+
+        for (int i = 0; i < positions.Length; i++)
+        {
+            if ((uint)positions[i] >= (uint)maxSeq)
+                throw new ArgumentOutOfRangeException(nameof(positions),
+                    $"Position {positions[i]} at index {i} exceeds max sequence length {maxSeq}.");
+        }
+
+        AdvanceKvHandleAndSyncLengths(kvCache, positions);
+        // Any forward moves the model-owned GDN state on, so earlier row snapshots no longer
+        // describe it (issue #473). ForwardWithRecurrentSnapshots re-validates after it returns.
+        _rowSnapshotValidRows = 0;
+
+        // Category profiler bracket (issue #168): MakeCurrent + EnsureCapacity + H2D
+        // token/position copy + host embed-lookup dequant + H2D embed copy. Confirmed via a
+        // fresh dedicated bracket that this region is a genuinely small share of decode time
+        // (~0.2% profiled) — not the dark matter some earlier hypotheses suspected.
+        ProfStart();
+        _context.MakeCurrent();
+        if (DebugTrace) LogVram($"before EnsureCapacity(seqLen={seqLen})");
+        _state.EnsureCapacity(seqLen);
+        if (DebugTrace) LogVram($"after EnsureCapacity (state.AllocatedBytes={_state.AllocatedBytes:N0})");
+
+        nint streamH = _stream.Handle;
+
+        fixed (int* tokenPtr = tokenIds)
+        {
+            CudaDriverApi.cuMemcpyHtoDAsync_v2(_state.TokenIdsDevice, (nint)tokenPtr,
+                (nuint)(seqLen * sizeof(int)), streamH).ThrowOnError();
+        }
+        fixed (int* posPtr = positions)
+        {
+            CudaDriverApi.cuMemcpyHtoDAsync_v2(_state.PositionsDevice, (nint)posPtr,
+                (nuint)(seqLen * sizeof(int)), streamH).ThrowOnError();
+        }
+
+        // Host-side per-row embedding lookup — see LoadFromGguf's remarks on why this isn't
+        // a GPU-resident full-table dequant. Dequantize each token's row (any quant type)
+        // into a small host buffer, then a single bulk H2D copy into HiddenState.
+        float[] embedHost = new float[(long)seqLen * hiddenSize];
+        for (int t = 0; t < seqLen; t++)
+        {
+            nint rowSrc = _embedDataBase + (nint)(_embedDataOffset + (ulong)tokenIds[t] * (ulong)_embedRowBytes);
+            Dequantize.ToFloat32(rowSrc, hiddenSize, _tokenEmbedQt,
+                embedHost.AsSpan(t * hiddenSize, hiddenSize));
+        }
+        fixed (float* pEmbedHost = embedHost)
+        {
+            // A Hadamard-latent token_embd (prism.hadamard.inverse_weight_names) stores rotated
+            // rows: restore the primal basis before the upload (rotation, then signs) — the CPU
+            // host's EmbedTokens code path, run on the same host rows (issue #479).
+            if (_hadamard is { } embRot)
+                embRot.RotateInverseInPlaceHost(pEmbedHost, seqLen, hiddenSize);
+            CudaDriverApi.cuMemcpyHtoDAsync_v2(_state.HiddenState, (nint)pEmbedHost,
+                (nuint)((long)seqLen * hiddenSize * sizeof(float)), streamH).ThrowOnError();
+        }
+        if (ProfileTrace) _stream.Synchronize();
+        ProfMark("setup-embed");
+
+        for (int layer = 0; layer < _layers.Length; layer++)
+        {
+            RunSingleLayerBody(layer, seqLen, positions, hiddenSize,
+                numHeads, numKvHeads, headDim, eps, kvCache);
+        }
+
+        // Issue #492: every layer is now queued on the stream and the host has nothing to wait for
+        // until the MTP capture's synchronize below, so this is the one window in the call where
+        // host work is free. Run the batched absorb's embedding gather here instead of after the
+        // trunk, where it sat on the critical path (mtp-absorb-1-host-embed-pair). Pure hoisting:
+        // the rows are byte-identical and the absorb refills them if the claim does not apply.
+        if (mtpCapture is not null && _mtpHead is not null)
+        {
+            bool profPrevPre = _profileActiveForThisCall;
+            if (ProfileTrace) { _profileActiveForThisCall = true; ProfStart(); }
+            PrefetchMtpAbsorbEmbedRows(mtpCapture, tokenIds, positions);
+            if (ProfileTrace) { ProfMark("mtp-absorb-1a-embed-hoisted"); _profileActiveForThisCall = profPrevPre; }
+        }
+
+        if (DebugTrace) { _stream.Synchronize(); Console.Error.WriteLine("[hybrid-debug] all layers done, starting lm_head"); Console.Error.Flush(); LogVram("before lm-head"); }
+
+        if (!produceLogits)
+        {
+            // Non-final prefill tile (issue #494): advancing the KV-cache and the GDN state is all
+            // this tile exists to do. Still synchronize before returning — the embedding H2D above
+            // reads a managed float[] under `fixed`, which must not move or be reused while the
+            // copy is in flight, and the single-call path relies on the same guarantee.
+            _stream.Synchronize();
+            return null;
+        }
+
+        ProfStart();
+
+        // MTP (issue #253): capture the pre-final-norm hidden state for every position, one row
+        // per input token, BEFORE the final RMSNorm below overwrites _state.HiddenState in place.
+        // This is the exact quantity llama.cpp's MTP head consumes (`h_pre_norm` /
+        // `llama_get_embeddings_pre_norm`) — a pure side effect that never changes the logits this
+        // call returns. Every layer writes all `seqLen` rows, so _state.HiddenState always holds
+        // all of them here regardless of the logits row count chosen below (the final norm's
+        // row count is decided separately — see `normRows`). cuMemcpyDtoH_v2 does not implicitly wait for this model's non-default _stream, so
+        // synchronize first — the LM-head projection below queues fresh work after this point, so
+        // this sync does not skip/reorder anything, only adds one extra host-blocking wait on the
+        // (low-frequency, K+1-token-per-round) MTP verify/catchup path.
+
+        // Issue #185: only compute/copy the LAST token's logits when the caller has explicitly
+        // opted in via lastTokenLogitsOnly (e.g. BenchRunner's untimed prefill / --depth context
+        // extension, which only ever reads the last row via argmax). This must NOT be inferred
+        // from kvCache alone -- speculative-decoding verification also submits multiple tokens
+        // through a kvCache-bearing Forward call but genuinely needs EVERY position's logits to
+        // accept/reject each draft token, so it correctly leaves the hint false (see IModel's XML
+        // doc on this overload). Restricting the final RmsNorm/LM-head-GEMM/D2H-copy to one row
+        // eliminates the single largest VRAM consumer in this Forward call when honored: the old
+        // code always sized and computed a full [seqLen, vocabSize] Logits tensor (e.g. ~970 MiB
+        // of scratch alone at seqLen=1024 for this model's 248,320-token vocabulary), which was
+        // the dominant term in the VRAM-ceiling hang `dotllm bench --depth` hit beyond ~650-768 on
+        // a 12GB card (confirmed via cuMemGetInfo instrumentation: EnsureCapacity's cap=1024
+        // allocation landed on EXACTLY 0 MiB free). Every caller that hasn't opted in (including
+        // ordinary seqLen==1 decode, where this is a no-op either way) keeps returning full
+        // per-position logits, unchanged from before this fix.
+        int logitsRows = lastTokenLogitsOnly ? 1 : seqLen;
+        _state.EnsureLogitsCapacity(logitsRows);
+        // Issue #493: the LM head and the MTP capture want different row counts. The head only
+        // needs the last row when the caller opted in; the MTP head consumes llama.cpp's `h_nextn`
+        // for EVERY position, so the final norm must still cover all `seqLen` rows whenever a
+        // capture is active. Normalise `normRows` rows, then project the last `logitsRows` of them
+        // — the two are independent, so an MTP prefill can also skip the [seqLen, vocab] LM head.
+        int normRows = mtpCapture is not null ? seqLen : logitsRows;
+        nint lastRowPtr = _state.HiddenState + (nint)((long)(seqLen - 1) * hiddenSize * sizeof(float));
+        nint normInput = normRows == seqLen ? _state.HiddenState : lastRowPtr;
+        _kernels.LaunchRmsNormF32(normInput, _outputNormDevice, normInput,
+            hiddenSize, eps, normRows, streamH);
+        nint lmHeadInput = logitsRows == seqLen ? _state.HiddenState : lastRowPtr;
+
+        // MTP (issues #253, #469): the head consumes llama.cpp's `h_nextn` — the hidden state AFTER
+        // output_norm. `normRows == seqLen` whenever a capture is active (issue #493), so every row
+        // has just been normalised in place, whatever the LM head's row count is.
+        // cuMemcpyDtoH does not wait for this model's stream: sync first.
+        if (mtpCapture is not null)
+        {
+            _stream.Synchronize();
+            mtpCapture.SetCapturedRowsFromDevice(_state.HiddenState, seqLen);
+        }
+        // output.weight is folded too — rotate the final-norm output before the lm_head. After the
+        // MTP capture above, which wants the post-norm, PRE-rotation rows (same order as the CPU).
+        nint headIn = lmHeadInput;
+        if (_hadamard is { } headRot)
+        {
+            headIn = _state.HadamardScratch;
+            headRot.RotateForward(lmHeadInput, headIn, logitsRows, _outputInputDim,
+                permuteGdnValueHeads: false, streamH);
+        }
+        GemmLmHead(_outputDevice, _outputQt, headIn, _state.Logits,
+             _outputOutputDim, _outputInputDim, logitsRows);
+        ProfMark("lm-head");
+        if (DebugTrace) { _stream.Synchronize(); Console.Error.WriteLine("[hybrid-debug] lm_head done"); Console.Error.Flush(); LogVram("after lm-head"); }
+
+        _stream.Synchronize();
+        ProfStart(); // measures result alloc + D2H logits copy
+
+        var shape = new TensorShape(logitsRows, vocabSize);
+        var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
+        CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, _state.Logits,
+            (nuint)((long)logitsRows * vocabSize * sizeof(float))).ThrowOnError();
+        ProfMark("output-copy");
+        if (DebugTrace) LogVram("after D2H logits copy");
+
+        if (mtpCapture is not null && _mtpHead is { } absorbHead)
+            AbsorbMtp(absorbHead, mtpCapture, tokenIds, positions);
+
+        return result;
+    }
+
+    /// <summary>
+    /// Runs the MTP head over every token of a trunk batch, without logits, so its KV-cache holds
+    /// the whole sequence — llama.cpp's <c>draft-mtp</c> <c>process()</c> (issue #469). Token
+    /// <c>i</c> pairs with the trunk hidden state of the previous position: the carried row for
+    /// <c>i == 0</c>, captured row <c>i - 1</c> otherwise. Mirrors the CPU reference.
+    /// </summary>
+    private void AbsorbMtp(in CudaMtpHeadWeights mtpHead, CudaMtpState state,
+                           ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions)
+    {
+        if (!DotLLM.Models.Architectures.MtpAbsorbDispatch.UsePerToken
+            && DotLLM.Models.Architectures.MtpAbsorbDispatch.IsContiguous(positions))
+        {
+            // Profiler (issue #482): the batched absorb is armed regardless of the trunk's seqLen (a
+            // verify is S = K+1 > 1, which leaves the trunk profiler off). Its categories are the
+            // "mtp-absorb-*" stages (issue #486); their sum is the whole absorb.
+            bool profPrev = _profileActiveForThisCall;
+            if (ProfileTrace) { _profileActiveForThisCall = true; ProfStart(); }
+            AbsorbMtpBatched(mtpHead, state, tokenIds, positions[0]);
+            state.SeedFromCapturedRow(tokenIds.Length - 1);
+            if (ProfileTrace) { ProfMark("mtp-absorb-7-seed"); _profileActiveForThisCall = profPrev; }
+            return;
+        }
+        for (int i = 0; i < tokenIds.Length; i++)
+        {
+            if (i == 0) state.SetPendingFromCarry();
+            else state.SetPendingFromCapturedRow(i - 1);
+            ForwardMtpCore(mtpHead, state, tokenIds[i], positions[i], MtpStepOutput.None, out _);
+        }
+        state.SeedFromCapturedRow(tokenIds.Length - 1);
+    }
+
+    /// <summary>Rows per chunk of <see cref="AbsorbMtpBatched"/>: bounds its scratch on a long prefill.</summary>
+    private const int MtpAbsorbChunkRows = 64;
+
+    /// <summary>
+    /// Device scratch for <see cref="AbsorbMtpBatched"/>, sized for up to
+    /// <see cref="MtpAbsorbChunkRows"/> rows and allocated on first use.
+    /// </summary>
+    private sealed class CudaMtpAbsorbScratch : IDisposable
+    {
+        public int Rows;
+        public nint Embed;      // [rows, hidden]
+        public nint Pair;       // [rows, hidden]
+        public nint ENorm;      // [rows, hidden]
+        public nint HNorm;      // [rows, hidden]
+        public nint Concat;     // [rows, 2 * hidden]
+        public nint Cur;        // [rows, hidden]
+        public nint Normed;     // [rows, hidden]
+        public nint KRows;      // [rows, kvStride] — K before it is stored in the head's format (issue #1095)
+        public nint VRows;      // [rows, kvStride] — V, likewise
+        public int KvStride;
+
+        /// <summary>
+        /// Pinned host staging rows ([rows, hidden] f32 each) for the embedding and pairing uploads
+        /// (issue #486). Replaces pooled managed arrays, whose pageable H2D goes through a driver
+        /// staging copy; page-locked rows let the copies run async on the stream. Reuse is safe
+        /// because every chunk ends in a stream synchronize.
+        /// </summary>
+        public nint EmbedHost;
+        public nint PairHost;
+
+        public static CudaMtpAbsorbScratch Allocate(int rows, int hiddenSize, int kvStride)
+        {
+            long h = (long)rows * hiddenSize * sizeof(float);
+            long kv = (long)rows * kvStride * sizeof(float);
+            CudaDriverApi.cuMemHostAlloc(out nint embedHost, (nuint)h, 0).ThrowOnError();
+            CudaDriverApi.cuMemHostAlloc(out nint pairHost, (nuint)h, 0).ThrowOnError();
+            return new CudaMtpAbsorbScratch
+            {
+                Rows = rows,
+                EmbedHost = embedHost,
+                PairHost = pairHost,
+                Embed = AllocDevice(h),
+                Pair = AllocDevice(h),
+                ENorm = AllocDevice(h),
+                HNorm = AllocDevice(h),
+                Concat = AllocDevice(2 * h),
+                Cur = AllocDevice(h),
+                Normed = AllocDevice(h),
+                KRows = AllocDevice(kv),
+                VRows = AllocDevice(kv),
+                KvStride = kvStride,
+            };
+        }
+
+        public void Dispose()
+        {
+            FreeIfNonZero(ref Embed);
+            FreeIfNonZero(ref Pair);
+            FreeIfNonZero(ref ENorm);
+            FreeIfNonZero(ref HNorm);
+            FreeIfNonZero(ref Concat);
+            FreeIfNonZero(ref Cur);
+            FreeIfNonZero(ref Normed);
+            FreeIfNonZero(ref KRows);
+            FreeIfNonZero(ref VRows);
+            if (EmbedHost != 0) { CudaDriverApi.cuMemFreeHost(EmbedHost); EmbedHost = 0; }
+            if (PairHost != 0) { CudaDriverApi.cuMemFreeHost(PairHost); PairHost = 0; }
+        }
+    }
+
+    private CudaMtpAbsorbScratch? _mtpAbsorbScratch;
+
+    /// <summary>
+    /// Rows of <see cref="CudaMtpAbsorbScratch.EmbedHost"/> that <see cref="PrefetchMtpAbsorbEmbedRows"/>
+    /// has already filled for the batched absorb at the end of the current <c>Forward</c> (issue #492),
+    /// or 0. Claimed exactly once by <see cref="AbsorbMtpBatched"/> and cleared on every
+    /// <c>Forward</c> entry, so a throwing or short-circuiting call can never leave a stale claim.
+    /// </summary>
+    private int _mtpEmbedPrefetchRows;
+
+    /// <summary>Allocates (or grows) the batched-absorb scratch for <paramref name="chunkRows"/> rows.</summary>
+    private CudaMtpAbsorbScratch EnsureMtpAbsorbScratch(int chunkRows, int hiddenSize, int kvStride)
+    {
+        if (_mtpAbsorbScratch is null || _mtpAbsorbScratch.Rows < chunkRows || _mtpAbsorbScratch.KvStride < kvStride)
+        {
+            _mtpAbsorbScratch?.Dispose();
+            _mtpAbsorbScratch = CudaMtpAbsorbScratch.Allocate(chunkRows, hiddenSize, kvStride);
+        }
+        return _mtpAbsorbScratch;
+    }
+
+    /// <summary>
+    /// Dequantises <paramref name="count"/> embedding rows for <c>tokenIds[start ..]</c> into the
+    /// pinned staging buffer and, for a folded checkpoint's trunk table, restores the primal basis —
+    /// the batched absorb's whole host-side embedding gather, factored out so the trunk forward can
+    /// run it early (<see cref="PrefetchMtpAbsorbEmbedRows"/>).
+    /// </summary>
+    private void FillMtpAbsorbEmbedRows(in CudaMtpHeadWeights mtpHead, ReadOnlySpan<int> tokenIds,
+                                        int start, int count, float* embedHost, int hiddenSize)
+    {
+        // Same embedding-table selection as ForwardMtpCore: head-local nextn.embed_tokens when the
+        // GGUF ships one, the trunk table otherwise.
+        nint embedHostBase = mtpHead.EmbedTokensHostBase ?? _embedDataBase;
+        ulong embedDataOffset = mtpHead.EmbedTokensHostBase is not null ? mtpHead.EmbedTokensDataOffset : _embedDataOffset;
+        long embedRowBytes = mtpHead.EmbedTokensHostBase is not null ? mtpHead.EmbedTokensRowBytes : _embedRowBytes;
+        QuantizationType embedQt = mtpHead.EmbedTokensHostBase is not null ? mtpHead.EmbedTokensQt : _tokenEmbedQt;
+
+        for (int i = 0; i < count; i++)
+        {
+            nint rowSrc = embedHostBase + (nint)(embedDataOffset + (ulong)tokenIds[start + i] * (ulong)embedRowBytes);
+            Dequantize.ToFloat32(rowSrc, hiddenSize, embedQt, new Span<float>(embedHost + (long)i * hiddenSize, hiddenSize));
+        }
+        // A folded checkpoint's trunk embedding is stored in the rotated basis (#479); the
+        // head-local table, when shipped, is not. Same rule as ForwardMtpCore's gather.
+        if (mtpHead.EmbedTokensHostBase is null && _hadamard is { } embRot)
+            embRot.RotateInverseInPlaceHost(embedHost, count, hiddenSize);
+    }
+
+    /// <summary>
+    /// Issue #492: runs the batched absorb's host-side embedding gather for the first chunk while the
+    /// trunk's layers are still executing on the stream, so its cost (a mmap-resident dequant per
+    /// token plus the inverse Hadamard) overlaps GPU work instead of sitting on the critical path
+    /// after it. Pure hoisting — <see cref="AbsorbMtpBatched"/> produces byte-identical rows either
+    /// way, and falls back to filling them itself if the claim is not there (a different chunk shape,
+    /// the per-token absorb path, or a caller that never reaches the absorb).
+    /// </summary>
+    /// <remarks>
+    /// Safe to overwrite the pinned rows here: every previous absorb chunk ended in a stream
+    /// synchronize, so no H2D is still reading them.
+    /// </remarks>
+    private void PrefetchMtpAbsorbEmbedRows(CudaMtpState state, ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions)
+    {
+        if (_mtpHead is not { } mtpHead)
+            return;
+        if (DotLLM.Models.Architectures.MtpAbsorbDispatch.UsePerToken
+            || !DotLLM.Models.Architectures.MtpAbsorbDispatch.IsContiguous(positions))
+            return;
+        int hiddenSize = Config.HiddenSize;
+        int chunkRows = Math.Max(1, Math.Min(tokenIds.Length, MtpAbsorbChunkRows));
+        var sc = EnsureMtpAbsorbScratch(chunkRows, hiddenSize, state.KvStride);
+        int s = Math.Min(chunkRows, tokenIds.Length);
+        FillMtpAbsorbEmbedRows(mtpHead, tokenIds, 0, s, (float*)sc.EmbedHost, hiddenSize);
+        _mtpEmbedPrefetchRows = s;
+        _ = state;   // the claim is per-Forward, not per-state; kept for call-site clarity
+    }
+
+    /// <summary>
+    /// Copies <paramref name="rows"/> contiguous rows of <paramref name="rowBytes"/> into a
+    /// destination whose row pitch is <c>2 * rowBytes</c> — the absorb's <c>[e_i, h_i]</c> interleave,
+    /// in one strided launch rather than one per row (issue #492).
+    /// </summary>
+    /// <remarks>
+    /// The driver documents that an intra-device <c>cuMemcpy2D</c> "may fail for pitches not computed
+    /// by cuMemAllocPitch", and there is no async unaligned variant — so a refusal here is a
+    /// documented outcome for a small hidden size, not a bug. It falls back to the per-row loop this
+    /// replaced and latches, because the answer is a property of the model's row pitch and will not
+    /// change between chunks.
+    /// </remarks>
+    private void CopyRowsStrided(nint src, nint dst, long rowBytes, int rows, nint stream)
+    {
+        if (_mtpConcatStridedUnsupported)
+        {
+            CopyRowsPerRow(src, dst, rowBytes, rows, stream);
+            return;
+        }
+        var copy = new CudaDriverApi.CudaMemcpy2D
+        {
+            SrcMemoryType = CudaDriverApi.CU_MEMORYTYPE_DEVICE,
+            SrcDevice = src,
+            SrcPitch = (nuint)rowBytes,
+            DstMemoryType = CudaDriverApi.CU_MEMORYTYPE_DEVICE,
+            DstDevice = dst,
+            DstPitch = (nuint)(2 * rowBytes),
+            WidthInBytes = (nuint)rowBytes,
+            Height = (nuint)rows,
+        };
+        if (CudaDriverApi.cuMemcpy2DAsync_v2(ref copy, stream) == 0)
+            return;
+        _mtpConcatStridedUnsupported = true;
+        CopyRowsPerRow(src, dst, rowBytes, rows, stream);
+    }
+
+    /// <summary>The pre-#492 interleave: one <c>cuMemcpyDtoDAsync</c> per row.</summary>
+    private static void CopyRowsPerRow(nint src, nint dst, long rowBytes, int rows, nint stream)
+    {
+        for (int i = 0; i < rows; i++)
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(dst + (nint)(2 * i * rowBytes), src + (nint)(i * rowBytes),
+                (nuint)rowBytes, stream).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Latched when this model's row pitch is one the driver's 2-D device-to-device copy refuses
+    /// (issue #492) — see <see cref="CopyRowsStrided"/>.
+    /// </summary>
+    private bool _mtpConcatStridedUnsupported;
+
+    /// <summary>
+    /// Test hook (issue #492): <see langword="false"/> once the driver has refused the 2-D
+    /// device-to-device interleave for this model's row pitch and the per-row fallback has latched.
+    /// </summary>
+    internal bool MtpConcatUsesStridedCopy => !_mtpConcatStridedUnsupported;
+
+    /// <summary>
+    /// Batched, KV-only absorb of S contiguous positions (issue #472, ported in #478) — see
+    /// <c>MtpAbsorbDispatch</c>. Computes exactly the K/V rows <see cref="ForwardMtpCore"/> writes
+    /// per token and nothing past them: an absorbed step's output hidden is discarded (the next
+    /// draft seeds from a trunk row), so its attention, O-projection, FFN and the per-token stream
+    /// sync are dead work.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Bit-identical to the per-token absorb, deliberately.</b> The embed dequant, the pairing
+    /// rows, every RMSNorm (enorm, hnorm, attn_norm, K-norm) and RoPE are batched over S rows — all
+    /// of them are per-row kernels (one block per row / one thread per pair), so a row's result does
+    /// not depend on the batch. The three projections (eh_proj, K, V) do NOT use <see cref="Gemm"/>'s
+    /// S-row route: it takes a different path for <c>seqLen &gt; 1</c> (dequant to F16 + cuBLAS
+    /// HGEMM on F16-staged activations) than for one row (the F32-native GEMV the per-token path
+    /// uses), so an S-row GEMM would change the head's K/V bits on quantized weights. They go through
+    /// <see cref="MtpGemmRows"/> instead: for Q8_0 (Bonsai 2's whole head) one multi-column GEMV that
+    /// reads the weights once and is bit-identical per row to the single-row kernel (issue #486);
+    /// otherwise S single-row GEMVs.
+    /// </para>
+    /// <para>
+    /// Processed in chunks of <see cref="MtpAbsorbChunkRows"/> rows so a long prefill does not size
+    /// the scratch to the prompt. Chunking cannot change a row's result for the same reason.
+    /// </para>
+    /// <para>
+    /// Issue #492 moved work around without changing any of it: the first chunk's embedding rows are
+    /// normally gathered by <see cref="PrefetchMtpAbsorbEmbedRows"/> while the trunk's layers are
+    /// still on the stream, and the <c>[e_i, h_i]</c> interleave is two strided copies rather than
+    /// two per row. The stage marks are finer too (<c>0a</c>/<c>0b</c> for the setup,
+    /// <c>1a</c>/<c>1b</c> for the gather and the pairing).
+    /// </para>
+    /// </remarks>
+    private void AbsorbMtpBatched(in CudaMtpHeadWeights mtpHead, CudaMtpState state,
+                                  ReadOnlySpan<int> tokenIds, int firstPosition)
+    {
+        int total = tokenIds.Length;
+        int hiddenSize = Config.HiddenSize;
+        var attn = mtpHead.Layer.FullAttn!.Value;
+        int numKvHeads = attn.NumKvHeads;
+        int headDim = Config.HeadDim;
+        float eps = Config.NormEpsilon;
+        nint streamH = _stream.Handle;
+        long hiddenRowBytes = (long)hiddenSize * sizeof(float);
+
+        state.BeginAbsorb(firstPosition, total, streamH);
+        ProfMark("mtp-absorb-0a-begin");
+
+        int chunkRows = Math.Max(1, Math.Min(total, MtpAbsorbChunkRows));
+        var sc = EnsureMtpAbsorbScratch(chunkRows, hiddenSize, state.KvStride);
+        ProfMark("mtp-absorb-0b-scratch");
+
+        float* embedHost = (float*)sc.EmbedHost;
+        float* pairHost = (float*)sc.PairHost;
+        // Issue #492: the first chunk's embedding rows may already have been dequantised (and
+        // un-rotated) into the pinned buffer while the trunk's layers were still running on the
+        // GPU — see PrefetchMtpAbsorbEmbedRows. Consume the claim exactly once.
+        int prefetched = _mtpEmbedPrefetchRows;
+        _mtpEmbedPrefetchRows = 0;
+        ProfMark("mtp-absorb-0-setup");
+        for (int start = 0; start < total; start += chunkRows)
+        {
+            int s = Math.Min(chunkRows, total - start);
+            int elems = s * hiddenSize;
+
+            if (start == 0 && prefetched == s)
+                ProfMark("mtp-absorb-1a-embed-prefetched");
+            else
+            {
+                FillMtpAbsorbEmbedRows(mtpHead, tokenIds, start, s, embedHost, hiddenSize);
+                ProfMark("mtp-absorb-1a-embed");
+            }
+            // Pairing (#469): row r goes with h_{p-1} — the carry for r == 0, captured row r-1 otherwise.
+            state.CopyAbsorbPairingRows(start, s, new Span<float>(pairHost, elems));
+            ProfMark("mtp-absorb-1b-pair");
+
+            // Pinned rows (issue #486): async on the stream; the chunk-end synchronize below is what
+            // makes rewriting them for the next chunk safe.
+            CudaDriverApi.cuMemcpyHtoDAsync_v2(sc.Embed, (nint)embedHost, (nuint)((long)elems * sizeof(float)), streamH).ThrowOnError();
+            CudaDriverApi.cuMemcpyHtoDAsync_v2(sc.Pair, (nint)pairHost, (nuint)((long)elems * sizeof(float)), streamH).ThrowOnError();
+            ProfMark("mtp-absorb-2-h2d");
+
+            // enorm / hnorm over s rows, then interleave into concat rows [e_i, h_i]. The interleave
+            // is two strided copies (issue #492: it was 2 * s separate cuMemcpyDtoDAsync launches,
+            // ~10 us of driver overhead each against ~20 KB of payload) — dst pitch 2 * hiddenRowBytes,
+            // src pitch hiddenRowBytes, s rows. Identical bytes, 2 launches instead of 2 * s.
+            _kernels.LaunchRmsNormF32(sc.Embed, mtpHead.EnormDevice, sc.ENorm, hiddenSize, eps, s, streamH);
+            _kernels.LaunchRmsNormF32(sc.Pair, mtpHead.HnormDevice, sc.HNorm, hiddenSize, eps, s, streamH);
+            CopyRowsStrided(sc.ENorm, sc.Concat, hiddenRowBytes, s, streamH);
+            CopyRowsStrided(sc.HNorm, sc.Concat + (nint)hiddenRowBytes, hiddenRowBytes, s, streamH);
+            ProfMark("mtp-absorb-3-norms-concat");
+
+            // cur = eh_proj @ concat over s rows — one multi-column GEMV reading the weights once
+            // when the Q8_0 register-blocked kernel is present (issue #486), else one GEMV per row
+            // (see remarks); both leave each row bit-identical to the per-token path. Then attn_norm.
+            MtpGemmRows(mtpHead.EhProjDevice, mtpHead.EhProjQt,
+                        sc.Concat, 2 * hiddenSize, sc.Cur, hiddenSize,
+                        mtpHead.EhProjOutputDim, mtpHead.EhProjInputDim, s);
+            _kernels.LaunchRmsNormF32(sc.Cur, mtpHead.Layer.AttnNormWeightDevice, sc.Normed, hiddenSize, eps, s, streamH);
+            ProfMark("mtp-absorb-4-eh-proj");
+
+            // K/V for the head's cache slab [p, p + s). An F32 cache takes them straight into its rows (one contiguous
+            // [capacity, kvStride] buffer); any other format computes them in F32 scratch and stores them below (issue #1095).
+            int p = firstPosition + start;
+            int kvStride = state.KvStride;
+            bool f32Cache = state.KeyFormat == CudaMtpKvFormat.F32;
+            nint kSlab = f32Cache ? state.GetKeyRowDevicePtr(p) : sc.KRows;
+            nint vSlab = f32Cache ? state.GetValueRowDevicePtr(p) : sc.VRows;
+            MtpGemmRows(attn.KDevice, attn.KQt, sc.Normed, hiddenSize, kSlab, kvStride,
+                        attn.KOutputDim, attn.KInputDim, s);
+            MtpGemmRows(attn.VDevice, attn.VQt, sc.Normed, hiddenSize, vSlab, kvStride,
+                        attn.VOutputDim, attn.VInputDim, s);
+            ProfMark("mtp-absorb-5-kv-proj");
+
+            _kernels.LaunchRmsNormF32(kSlab, attn.KNormDevice, kSlab, headDim, eps, s * numKvHeads, streamH);
+            // numHeads = 0: the kernel rotates no Q pairs, so its Q operand is never touched.
+            // Positions [p, p + s) are a slice of the state's device iota (issue #482) — no upload.
+            _kernels.LaunchRoPEF32(kSlab, kSlab, state.GetPositionDevicePtr(p, s), s, 0, numKvHeads, headDim,
+                _ropeDim, _ropeTheta, 1, streamH, ropeInvFreq: _ropeYarnInvFreq, ropeMscale: _ropeYarnMscale);
+            if (!f32Cache)
+                StoreMtpKvRows(state, kSlab, vSlab, p, s, streamH);
+
+            // The next chunk overwrites the device scratch and the pinned host rows.
+            _stream.Synchronize();
+            ProfMark("mtp-absorb-6-knorm-rope-sync");
+        }
+
+        state.EndAbsorb(firstPosition + total);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    //  MTP (issue #253) — self-speculative decoding draft head
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Lazily-allocated, model-owned device scratch for <see cref="ForwardMtpCore"/> — one row
+    /// (seqLen=1) worth of every intermediate buffer the MTP block's own decoder-layer forward
+    /// needs. Sized once from <see cref="Config"/> (fixed per model instance) and reused across
+    /// every <see cref="ForwardMtp"/> call, mirroring the model's other lazily-allocated instance
+    /// scratch (e.g. <c>_activF16InScratch</c>) rather than allocating/freeing per call — MTP draft
+    /// steps run K times per speculation round, frequently enough that repeated cuMemAlloc/cuMemFree
+    /// overhead would be wasteful, even though the call is off the trunk's hot decode path.
+    /// </summary>
+    private sealed class CudaMtpScratch : IDisposable
+    {
+        public nint Embed;       // [hiddenSize]
+        public nint Concat;      // [2*hiddenSize] — eNorm at [0,hiddenSize), hNorm at [hiddenSize,2*hiddenSize)
+        public nint Cur;         // [hiddenSize]
+        public nint Residual;    // [hiddenSize]
+        public nint Normed;      // [hiddenSize]
+        public nint Qg;          // [2*qElems]
+        public nint Q;           // [qElems]
+        public nint Gate;        // [qElems]
+        public nint AttnOut;     // [qElems]
+        public nint FfnGate;     // [intermediateSize]
+        public nint FfnUp;       // [intermediateSize]
+        public nint Silu;        // [intermediateSize]
+        public nint NormedHead;  // [hiddenSize]
+        public nint HeadRot;     // [hiddenSize] — Hadamard-rotated NormedHead (folded trunk lm_head fallback only)
+        public nint LogitsDevice; // [vocabSize]
+        public nint KRow;        // [kvStride] f32 — this step's K before it is stored in the head's format (issue #1095)
+        public nint VRow;        // [kvStride] f32 — this step's V, likewise
+
+        /// <summary>
+        /// Pinned host staging row ([hiddenSize] f32) for the draft token's embedding (issue #482).
+        /// Replaces a per-step <c>new float[hiddenSize]</c>, and — being page-locked — lets the H2D
+        /// run truly async instead of the driver's pageable-copy path (staging + implicit stream
+        /// sync). Reuse is safe because every <c>ForwardMtpCore</c> call ends in a stream
+        /// synchronize, so the previous step's H2D has always drained before the row is rewritten.
+        /// </summary>
+        public nint EmbedHostPinned;
+
+        public static CudaMtpScratch Allocate(int hiddenSize, int qElems, int intermediateSize, int vocabSize, int kvStride)
+        {
+            CudaDriverApi.cuMemHostAlloc(out nint embedHostPinned, (nuint)((long)hiddenSize * sizeof(float)), 0)
+                .ThrowOnError();
+            var s = new CudaMtpScratch
+            {
+                EmbedHostPinned = embedHostPinned,
+                Embed = AllocDevice((long)hiddenSize * sizeof(float)),
+                Concat = AllocDevice(2L * hiddenSize * sizeof(float)),
+                Cur = AllocDevice((long)hiddenSize * sizeof(float)),
+                Residual = AllocDevice((long)hiddenSize * sizeof(float)),
+                Normed = AllocDevice((long)hiddenSize * sizeof(float)),
+                Qg = AllocDevice(2L * qElems * sizeof(float)),
+                Q = AllocDevice((long)qElems * sizeof(float)),
+                Gate = AllocDevice((long)qElems * sizeof(float)),
+                AttnOut = AllocDevice((long)qElems * sizeof(float)),
+                FfnGate = AllocDevice((long)intermediateSize * sizeof(float)),
+                FfnUp = AllocDevice((long)intermediateSize * sizeof(float)),
+                Silu = AllocDevice((long)intermediateSize * sizeof(float)),
+                NormedHead = AllocDevice((long)hiddenSize * sizeof(float)),
+                HeadRot = AllocDevice((long)hiddenSize * sizeof(float)),
+                LogitsDevice = AllocDevice((long)vocabSize * sizeof(float)),
+                KRow = AllocDevice((long)kvStride * sizeof(float)),
+                VRow = AllocDevice((long)kvStride * sizeof(float)),
+            };
+            return s;
+        }
+
+        public void Dispose()
+        {
+            FreeIfNonZero(ref Embed);
+            FreeIfNonZero(ref Concat);
+            FreeIfNonZero(ref Cur);
+            FreeIfNonZero(ref Residual);
+            FreeIfNonZero(ref Normed);
+            FreeIfNonZero(ref Qg);
+            FreeIfNonZero(ref Q);
+            FreeIfNonZero(ref Gate);
+            FreeIfNonZero(ref AttnOut);
+            FreeIfNonZero(ref FfnGate);
+            FreeIfNonZero(ref FfnUp);
+            FreeIfNonZero(ref Silu);
+            FreeIfNonZero(ref NormedHead);
+            FreeIfNonZero(ref HeadRot);
+            FreeIfNonZero(ref LogitsDevice);
+            FreeIfNonZero(ref KRow);
+            FreeIfNonZero(ref VRow);
+            if (EmbedHostPinned != 0)
+            {
+                CudaDriverApi.cuMemFreeHost(EmbedHostPinned);
+                EmbedHostPinned = 0;
+            }
+        }
+    }
+
+    private CudaMtpScratch? _mtpScratch;
+
+    // Issue #482: optional staged Q8_0 GEMV for the MTP head, probed on first MTP use.
+    private CudaQ8_0StagedGemv? _mtpQ8Staged;
+    private CudaQ8_0RbGemv? _mtpQ8Rb;           // issue #486, probed together with the staged kernel
+    private bool _mtpQ8StagedProbed;
+
+    /// <summary>
+    /// Single-row projection for the MTP head (draft and absorb). A Q8_0 weight — every projection of
+    /// Bonsai 2's MTP block — goes to <see cref="CudaQ8_0StagedGemv"/> when its PTX is present: a
+    /// coalesced, bit-identical twin of the <c>LaunchQuantizedGemvF32In</c> kernel <see cref="Gemm"/>
+    /// uses for Q8_0 at one row, whose uncoalesced loads dominate the draft step (issue #482).
+    /// Everything else, and Q8_0 without the PTX, goes through <see cref="Gemm"/> unchanged.
+    /// </summary>
+    private void MtpGemm(nint weight, QuantizationType qt, nint x, nint y, int m, int k)
+    {
+        if (qt == QuantizationType.Q8_0)
+        {
+            EnsureMtpQ8Probed();
+            // Issue #486: the register-blocked kernel first — same bits as the staged one.
+            if (_mtpQ8Rb is { } rb && CudaQ8_0RbGemv.Accepts(x, k, k))
+            {
+                rb.Launch(weight, x, y, m, k, _stream.Handle);
+                return;
+            }
+            if (_mtpQ8Staged is { } staged)
+            {
+                staged.Launch(weight, x, y, m, k, _stream.Handle);
+                return;
+            }
+        }
+        Gemm(weight, qt, x, y, m, k, 1);
+    }
+
+    /// <summary>
+    /// <paramref name="cols"/>-row projection for the batched absorb (issue #486): input row
+    /// <c>c</c> at <c>x + c * ldx</c> floats, output row <c>c</c> at <c>y + c * ldy</c> floats. A Q8_0
+    /// weight goes to the multi-column register-blocked kernel, which reads the weights once and
+    /// leaves every output row bit-identical to <see cref="MtpGemm"/> on that row. Anything else
+    /// loops <see cref="MtpGemm"/> row by row, exactly as before.
+    /// </summary>
+    private void MtpGemmRows(nint weight, QuantizationType qt, nint x, int ldx, nint y, int ldy,
+                             int m, int k, int cols)
+    {
+        if (qt == QuantizationType.Q8_0)
+        {
+            EnsureMtpQ8Probed();
+            if (_mtpQ8Rb is { HasMulti: true } rb && CudaQ8_0RbGemv.Accepts(x, k, ldx))
+            {
+                rb.LaunchMulti(weight, x, ldx, y, ldy, m, k, cols, _stream.Handle);
+                return;
+            }
+        }
+        long xStride = (long)ldx * sizeof(float), yStride = (long)ldy * sizeof(float);
+        for (int c = 0; c < cols; c++)
+            MtpGemm(weight, qt, x + (nint)(c * xStride), y + (nint)(c * yStride), m, k);
+    }
+
+    private void EnsureMtpQ8Probed()
+    {
+        if (_mtpQ8StagedProbed)
+            return;
+        _mtpQ8Staged = CudaQ8_0StagedGemv.TryLoad(_kernels.PtxDirectory);
+        _mtpQ8Rb = CudaQ8_0RbGemv.TryLoad(_kernels.PtxDirectory);
+        _mtpQ8StagedProbed = true;
+    }
+
+    /// <summary>Test hook (issue #482): whether the MTP path is dispatching Q8_0 to the staged kernel.</summary>
+    internal bool MtpUsesStagedQ8Gemv => _mtpQ8Staged is not null;
+
+    /// <summary>Test hook (issue #486): whether the MTP path is dispatching Q8_0 to the register-blocked kernel.</summary>
+    internal bool MtpUsesRbQ8Gemv => _mtpQ8Rb is not null;
+
+    /// <summary>
+    /// Test hook (issue #492): whether a batched absorb of <paramref name="cols"/> rows will run the
+    /// NCOLS-specialised multi-column kernel rather than the generic 8-column one — so a parity test
+    /// can prove it is not silently measuring the fallback.
+    /// </summary>
+    internal bool MtpUsesSpecializedRbQ8Gemv(int cols) => _mtpQ8Rb?.HasSpecialized(cols) == true;
+
+    /// <summary>
+    /// Test hook (issue #485): whether the dp4a PQ2_0 GEMV module is loaded, so a test that switches
+    /// the path on can prove it is not silently measuring the fallback.
+    /// </summary>
+    internal bool PQ2_0Dp4aAvailable => _kernels.HasPQ2_0GemvDp4a;
+
+    /// <summary>
+    /// Test hook (issue #490): whether the packed PQ2_0 prefill GEMM is loaded (with the quantizer it
+    /// reuses), so a test that switches the path on can prove it is not measuring the fallback.
+    /// </summary>
+    internal bool PQ2_0MmqAvailable => _kernels.HasPQ2_0MmqDp4a && _kernels.HasPQ2_0GemvDp4a;
+
+    /// <inheritdoc/>
+    public ITensor ForwardMtp(IMtpState state, int tokenId, int position)
+    {
+        var (mtpHead, mtp) = ValidateMtpCall(state);
+        _context.MakeCurrent();
+        return ForwardMtpCore(mtpHead, mtp, tokenId, position, MtpStepOutput.Logits, out _)!;
+    }
+
+    /// <summary>What a <see cref="ForwardMtpCore"/> step hands back.</summary>
+    private enum MtpStepOutput
+    {
+        /// <summary>Absorb: only the KV row matters; stops before the LM head.</summary>
+        None,
+        /// <summary>Draft: the full logits row, copied to a host tensor.</summary>
+        Logits,
+        /// <summary>Greedy draft (issue #486): the argmax, reduced on the device — one int copied back.</summary>
+        ArgMax,
+    }
+
+    // Issue #486: optional device argmax for the unconstrained greedy draft, probed on first use.
+    private CudaArgMaxF32? _mtpArgMax;
+    private bool _mtpArgMaxProbed;
+
+    private CudaArgMaxF32? EnsureMtpArgMax()
+    {
+        if (!_mtpArgMaxProbed)
+        {
+            _context.MakeCurrent();
+            _mtpArgMax = CudaArgMaxF32.TryLoad(_kernels.PtxDirectory);
+            _mtpArgMaxProbed = true;
+        }
+        return _mtpArgMax;
+    }
+
+    /// <summary>
+    /// True when the model has an MTP head and the device argmax kernel loaded (issue #486): the
+    /// decoder then takes an unconstrained greedy draft token from <see cref="ForwardMtpArgMax"/>
+    /// instead of copying the 248k-float logits row to the host every draft step.
+    /// </summary>
+    public bool SupportsMtpArgMax => !_disposed && _mtpHead is not null && EnsureMtpArgMax() is not null;
+
+    /// <inheritdoc/>
+    public int ForwardMtpArgMax(IMtpState state, int tokenId, int position)
+    {
+        var (mtpHead, mtp) = ValidateMtpCall(state);
+        if (EnsureMtpArgMax() is null)
+            throw new NotSupportedException(
+                $"{CudaArgMaxF32.PtxFileName} is not available (SupportsMtpArgMax=false); use ForwardMtp.");
+        _context.MakeCurrent();
+        ForwardMtpCore(mtpHead, mtp, tokenId, position, MtpStepOutput.ArgMax, out int token);
+        return token;
+    }
+
+    private (CudaMtpHeadWeights Head, CudaMtpState State) ValidateMtpCall(IMtpState state)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_mtpHead is not { } mtpHead)
+            throw new NotSupportedException(
+                $"{nameof(CudaQwen3HybridDenseTransformerModel)} has no MTP head loaded (SupportsMtp=false).");
+        if (state is not CudaMtpState mtp)
+            throw new ArgumentException(
+                $"CudaQwen3HybridDenseTransformerModel requires a CUDA CudaMtpState; got {state.GetType().Name}.",
+                nameof(state));
+        return (mtpHead, mtp);
+    }
+
+    /// <summary>
+    /// Runs one MTP head autoregressive draft step (issue #253) — see <see cref="ForwardMtp"/>.
+    /// Off the trunk's hot forward path (single token, called K≤~16 times per speculation round).
+    /// Operation order mirrors the CPU host's <c>Qwen3HybridDenseTransformerModel.ForwardMtpCore</c>
+    /// exactly (confirmed against llama.cpp PR ggml-org/llama.cpp#22673's <c>graph_mtp</c>):
+    /// <list type="number">
+    ///   <item><c>h_norm = RMSNorm(pendingHidden, nextn.hnorm)</c>; <c>e_norm = RMSNorm(embed(tokenId), nextn.enorm)</c>.</item>
+    ///   <item><c>cur = eh_proj @ concat(e_norm, h_norm)</c> — this becomes the attention sub-block's residual (<c>inpSA</c>).</item>
+    ///   <item>Gated full attention over the MTP head's own device-resident KV-cache (identical math to
+    ///         <see cref="ForwardFullAttnBody"/>, but seqQ=1 against the head's private cache rather
+    ///         than the trunk's), residual-added back onto <c>inpSA</c>.</item>
+    ///   <item>Dense SwiGLU FFN, residual-added — the result is the MTP block's own output hidden
+    ///         state ("h_pre_norm"), which seeds <em>this state's next</em> <see cref="ForwardMtp"/> call
+    ///         (D2D-copied directly into <see cref="CudaMtpState.PendingHiddenDevicePtr"/> — no host round-trip).</item>
+    ///   <item><c>shared_head_norm</c> (or the trunk's <c>output_norm</c> fallback) then
+    ///         <c>shared_head_head</c> (or the trunk's own LM head fallback) → logits.</item>
+    /// </list>
+    /// </summary>
+    private ITensor? ForwardMtpCore(in CudaMtpHeadWeights mtpHead, CudaMtpState state, int tokenId, int position,
+                                    MtpStepOutput output, out int argmax)
+    {
+        // Category profiler (issue #482): the trunk arms it only for seqLen == 1, and a draft step
+        // runs right after an S = K+1 verify, so it would otherwise always be disarmed here. Arm it
+        // for DRAFT steps only — per-token absorb steps would pollute the same keys — and restore
+        // the caller's state on exit. Every category is prefixed "mtp-".
+        if (!ProfileTrace)
+            return ForwardMtpCoreBody(mtpHead, state, tokenId, position, output, out argmax);
+
+        bool profPrev = _profileActiveForThisCall;
+        _profileActiveForThisCall = output != MtpStepOutput.None;
+        try
+        {
+            return ForwardMtpCoreBody(mtpHead, state, tokenId, position, output, out argmax);
+        }
+        finally
+        {
+            _profileActiveForThisCall = profPrev;
+        }
+    }
+
+    /// <summary>
+    /// Stores <paramref name="rows"/> F32 K and V rows (after K-norm and RoPE) into the head's cache at
+    /// <paramref name="firstPosition"/> in its own format (issue #1095): F32 -> F16 through the trunk's write staging, then
+    /// either the F16 rows themselves or the trunk's quantize-on-write kernel. Exactly the conversion the trunk's own KV
+    /// write applies, so a head row holds the bits a trunk row would.
+    /// </summary>
+    private void StoreMtpKvRows(CudaMtpState state, nint kF32, nint vF32, int firstPosition, int rows, nint streamH)
+    {
+        int elems = rows * state.KvStride;
+        EnsureF16KvWriteStaging(rows, state.KvStride);
+        nint staging = _f16KvWriteStaging;
+        _kernels.LaunchConvertF32ToF16(kF32, staging, elems, streamH);
+        StoreMtpSide(staging, state.GetKeyRowDevicePtr(firstPosition), state.KeyFormat, elems, streamH);
+        _kernels.LaunchConvertF32ToF16(vF32, staging, elems, streamH);   // stream-ordered after the K store read it
+        StoreMtpSide(staging, state.GetValueRowDevicePtr(firstPosition), state.ValueFormat, elems, streamH);
+
+        void StoreMtpSide(nint srcF16, nint dst, CudaMtpKvFormat format, int count, nint stream)
+        {
+            if (CudaMtpState.IsQuantized(format))
+                _kernels.LaunchQuantKv(srcF16, dst, count, CudaMtpState.ToKvCacheDType(format), stream);
+            else
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(dst, srcF16, (nuint)((long)count * sizeof(ushort)), stream).ThrowOnError();
+        }
+    }
+
+    /// <summary>
+    /// Test-only (issue #1095): stores <paramref name="rowsF32"/> the way the trunk's KV write does — F32 -> F16 through the
+    /// write staging, then the F16 bytes or the quantize-on-write kernel — and returns the stored bytes. The oracle for the
+    /// head's own rows, which must be exactly these.
+    /// </summary>
+    /// <param name="rowsF32">Rows to store; a multiple of 32 elements for a quantized format.</param>
+    /// <param name="format">F16, Q8_0 or Q4_0.</param>
+    /// <returns>The stored bytes.</returns>
+    internal unsafe byte[] StoreKvRowsForTest(ReadOnlySpan<float> rowsF32, CudaMtpKvFormat format)
+    {
+        _context.MakeCurrent();
+        int n = rowsF32.Length;
+        long bytes = CudaMtpState.RowBytes(format, n);
+        nint src = AllocDevice((long)n * sizeof(float));
+        nint dst = AllocDevice(bytes);
+        try
+        {
+            fixed (float* p = rowsF32)
+                CudaDriverApi.cuMemcpyHtoD_v2(src, (nint)p, (nuint)((long)n * sizeof(float))).ThrowOnError();
+            nint streamH = _stream.Handle;
+            EnsureF16KvWriteStaging(1, n);
+            _kernels.LaunchConvertF32ToF16(src, _f16KvWriteStaging, n, streamH);
+            if (CudaMtpState.IsQuantized(format))
+                _kernels.LaunchQuantKv(_f16KvWriteStaging, dst, n, CudaMtpState.ToKvCacheDType(format), streamH);
+            else
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(dst, _f16KvWriteStaging, (nuint)((long)n * sizeof(ushort)), streamH).ThrowOnError();
+            _stream.Synchronize();
+            var host = new byte[bytes];
+            fixed (byte* h = host)
+                CudaDriverApi.cuMemcpyDtoH_v2((nint)h, dst, (nuint)bytes).ThrowOnError();
+            return host;
+        }
+        finally
+        {
+            FreeIfNonZero(ref src);
+            FreeIfNonZero(ref dst);
+        }
+    }
+
+    /// <summary>
+    /// One draft step's attention over the head's own F16 or quantized history <c>[0, seqKv)</c> (issue #1095), read in place
+    /// by the trunk's decode kernels: the fused quantized-KV kernel for quantized rows, the tensor-core F16 kernel for F16 rows.
+    /// Below those kernels' minimum depth (<see cref="CudaKernels.AttentionGqaSplitMinSeqKv"/>) the short history goes through
+    /// the F32 kernel via the trunk's staging, which that depth bounds; no tier widens a long history.
+    /// </summary>
+    /// <param name="state">The head's state; its formats are F16 or quantized.</param>
+    /// <param name="qF32">This step's Q, <c>[numHeads, headDim]</c> F32, after QK-norm and RoPE.</param>
+    /// <param name="outF32">Attention output, <c>[numHeads, headDim]</c> F32.</param>
+    /// <param name="seqKv">Keys attended: positions <c>[0, seqKv)</c>, this step's included.</param>
+    /// <param name="numHeads">Query heads.</param>
+    /// <param name="numKvHeads">KV heads.</param>
+    /// <param name="headDim">Head dimension.</param>
+    /// <param name="streamH">The model's stream.</param>
+    private void MtpHeadAttention(CudaMtpState state, nint qF32, nint outF32, int seqKv,
+                                  int numHeads, int numKvHeads, int headDim, nint streamH)
+    {
+        KvCacheDType kd = CudaMtpState.ToKvCacheDType(state.KeyFormat);
+        KvCacheDType vd = CudaMtpState.ToKvCacheDType(state.ValueFormat);
+        bool quant = CudaMtpState.IsQuantized(state.KeyFormat);   // both sides or neither (ResolveMtpKvFormats)
+        bool mmaShape = numKvHeads < numHeads
+            && seqKv >= CudaKernels.AttentionGqaSplitMinSeqKv
+            && _mmaDecodeGqaSplit.CanUse(1, seqKv, slidingWindow: 0, numHeads, numKvHeads, headDim);
+
+        if (quant && mmaShape && MtpFusedKvReadForTest
+            && _mmaDecodeGqaSplit.CanUseKvq(kd, vd, 1, seqKv, 0, numHeads, numKvHeads, headDim))
+        {
+            int split = _mmaDecodeGqaSplit.ComputeSafeKvSplitKvq(kd, vd, numKvHeads, seqKv);
+            if (split >= 1)
+            {
+                EnsureAttentionMmaDecodeQF16Scratch(numHeads, headDim);
+                EnsureAttentionGqaSplitScratch(numHeads, headDim, split);
+                _kernels.LaunchConvertF32ToF16(qF32, _attnMmaDecodeQF16, numHeads * headDim, streamH);
+                _mmaDecodeGqaSplit.RunKvq(_attnMmaDecodeQF16, state.KeyCacheDevicePtr, state.ValueCacheDevicePtr, kd, vd,
+                    outF32, seqKv, numHeads, numKvHeads, split,
+                    _attnGqaSplitPartialMax, _attnGqaSplitPartialSum, _attnGqaSplitPartialOut, streamH);
+                DebugMtpFusedKvqCallsForTest++;
+                return;
+            }
+        }
+
+        // An F16 view of the history: the head's own F16 rows, or its quantized rows dequantized into the trunk's scratch
+        // (the short-history tier, and the reference arm the fused read is tested against).
+        int kvElems = state.KvStride;
+        nint kF16 = state.KeyCacheDevicePtr, vF16 = state.ValueCacheDevicePtr;
+        if (quant)
+        {
+            if (kd != _kvKeyDType || vd != _kvValueDType || kvElems != Config.NumKvHeads * Config.HeadDim)
+                throw new InvalidOperationException(
+                    $"The MTP state stores {state.KeyFormat}/{state.ValueFormat} but the model's KV storage is now " +
+                    $"{KvStorageLabel}: create the MTP state after choosing the KV storage.");
+            EnsureKvF16Scratch(seqKv, kvElems);
+            _kernels.LaunchKvDequantToF16(kF16, kd, _kvF16ScratchK, seqKv * kvElems, streamH);
+            _kernels.LaunchKvDequantToF16(vF16, vd, _kvF16ScratchV, seqKv * kvElems, streamH);
+            kF16 = _kvF16ScratchK;
+            vF16 = _kvF16ScratchV;
+            DebugMtpKvDequantCallsForTest += 2;
+        }
+
+        if (mmaShape)
+        {
+            int split = _mmaDecodeGqaSplit.ComputeSafeKvSplit(numKvHeads, numHeads / numKvHeads, seqKv);
+            if (split >= 1)
+            {
+                EnsureAttentionMmaDecodeQF16Scratch(numHeads, headDim);
+                EnsureAttentionGqaSplitScratch(numHeads, headDim, split);
+                _kernels.LaunchConvertF32ToF16(qF32, _attnMmaDecodeQF16, numHeads * headDim, streamH);
+                _mmaDecodeGqaSplit.Run(_attnMmaDecodeQF16, kF16, vF16, outF32, seqKv, numHeads, numKvHeads, split,
+                    _attnGqaSplitPartialMax, _attnGqaSplitPartialSum, _attnGqaSplitPartialOut, streamH);
+                return;
+            }
+        }
+
+        EnsureF32KvStaging(seqKv, kvElems);
+        _kernels.LaunchConvertF16ToF32(kF16, _f32KvStageK, seqKv * kvElems, streamH);
+        _kernels.LaunchConvertF16ToF32(vF16, _f32KvStageV, seqKv * kvElems, streamH);
+        _kernels.LaunchAttentionF32(qF32, _f32KvStageK, _f32KvStageV, outF32,
+            /* seqQ */ 1, seqKv, numHeads, numKvHeads, headDim,
+            positionOffset: seqKv - 1, slidingWindow: 0, streamH);
+    }
+
+    private ITensor? ForwardMtpCoreBody(in CudaMtpHeadWeights mtpHead, CudaMtpState state, int tokenId, int position,
+                                        MtpStepOutput output, out int argmax)
+    {
+        argmax = -1;
+        ProfStart();
+        int hiddenSize = Config.HiddenSize;
+        int vocabSize = Config.VocabSize;
+        var attn = mtpHead.Layer.FullAttn!.Value;
+        int numHeads = Config.NumAttentionHeads;
+        int numKvHeads = attn.NumKvHeads;
+        int headDim = Config.HeadDim;
+        int qElems = numHeads * headDim;
+        int intermediateSize = mtpHead.Layer.GateOutputDim;
+        float eps = Config.NormEpsilon;
+        nint streamH = _stream.Handle;
+
+        // Position-indexed head KV-cache (issue #469): slot p holds the pair (h_{p-1}, x_p).
+        if (state.CurrentLength > position)
+            state.Rollback(position);
+        else if (state.CurrentLength < position)
+            throw new InvalidOperationException(
+                $"MTP step at position {position} but the MTP KV-cache only covers {state.CurrentLength} " +
+                "positions. Every trunk Forward of the sequence must pass the MTP state so the head " +
+                "absorbs it (prefill included).");
+        int step = position;
+        if (step >= state.MaxSteps)
+            throw new InvalidOperationException(
+                $"CudaMtpState KV-cache exhausted at position {position} (MaxSteps={state.MaxSteps}). " +
+                "Create the state with CreateMtpState(maxSequenceLength) covering the whole sequence.");
+        // Issue #966: the head KV grows lazily; make slot `step` addressable before any pointer into it.
+        state.EnsureCapacity(step + 1, _stream.Handle);
+
+        _mtpScratch ??= CudaMtpScratch.Allocate(hiddenSize, qElems, intermediateSize, vocabSize, numKvHeads * headDim);
+        var s = _mtpScratch;
+        ProfMark("mtp-0-setup");
+
+        // ── Embed predicted-from token (host dequant of one row + tiny H2D — same pattern as the
+        //    trunk's own per-token embedding lookup in ForwardCore) ──
+        nint embedHostBase = mtpHead.EmbedTokensHostBase ?? _embedDataBase;
+        ulong embedDataOffset = mtpHead.EmbedTokensHostBase is not null ? mtpHead.EmbedTokensDataOffset : _embedDataOffset;
+        long embedRowBytes = mtpHead.EmbedTokensHostBase is not null ? mtpHead.EmbedTokensRowBytes : _embedRowBytes;
+        QuantizationType embedQt = mtpHead.EmbedTokensHostBase is not null ? mtpHead.EmbedTokensQt : _tokenEmbedQt;
+
+        // Pinned, model-owned staging row (issue #482) — no per-step GC allocation, and a genuinely
+        // async H2D (no driver staging copy). Safe to overwrite: the previous step ended in a
+        // stream synchronize.
+        float* pEmbedHost = (float*)s.EmbedHostPinned;
+        nint rowSrc = embedHostBase + (nint)(embedDataOffset + (ulong)tokenId * (ulong)embedRowBytes);
+        Dequantize.ToFloat32(rowSrc, hiddenSize, embedQt, new Span<float>(pEmbedHost, hiddenSize));
+        // PrismML Hadamard fold (#435/#479): falling back to the trunk's token_embd.weight means
+        // reading ROTATED rows, so restore the primal basis exactly as the trunk lookup does. A
+        // head-local nextn.embed_tokens is not folded and stays untouched. Mirrors the CPU host.
+        if (mtpHead.EmbedTokensHostBase is null && _hadamard is { } embRot)
+            embRot.RotateInverseInPlaceHost(pEmbedHost, 1, hiddenSize);
+        ProfMark("mtp-1-embed-host");
+        CudaDriverApi.cuMemcpyHtoDAsync_v2(s.Embed, (nint)pEmbedHost,
+            (nuint)((long)hiddenSize * sizeof(float)), streamH).ThrowOnError();
+        ProfMark("mtp-2-embed-h2d");
+
+        // ── h_norm / e_norm — written directly into the two halves of the eh_proj concat buffer
+        //    (avoids an extra D2D copy vs. normalizing into standalone buffers first) ──
+        nint eNormDst = s.Concat;
+        nint hNormDst = s.Concat + (nint)((long)hiddenSize * sizeof(float));
+        _kernels.LaunchRmsNormF32(s.Embed, mtpHead.EnormDevice, eNormDst, hiddenSize, eps, 1, streamH);
+        _kernels.LaunchRmsNormF32(state.PendingHiddenDevicePtr, mtpHead.HnormDevice, hNormDst, hiddenSize, eps, 1, streamH);
+        ProfMark("mtp-3a-enorm-hnorm");
+
+        // cur = eh_proj @ concat(e_norm, h_norm)
+        MtpGemm(mtpHead.EhProjDevice, mtpHead.EhProjQt, s.Concat, s.Cur,
+             mtpHead.EhProjOutputDim, mtpHead.EhProjInputDim);
+
+        // inpSA: the attention sub-block's residual is the eh_proj output, not the raw input.
+        CudaDriverApi.cuMemcpyDtoDAsync_v2(s.Residual, s.Cur, (nuint)((long)hiddenSize * sizeof(float)), streamH)
+            .ThrowOnError();
+        ProfMark("mtp-3b-eh-proj");
+
+        // ── Attention sub-block — same gated-QKV math as ForwardFullAttnBody, seqQ=1 ──
+        _kernels.LaunchRmsNormF32(s.Cur, mtpHead.Layer.AttnNormWeightDevice, s.Normed, hiddenSize, eps, 1, streamH);
+
+        MtpGemm(attn.QDevice, attn.QQt, s.Normed, s.Qg, attn.QOutputDim, attn.QInputDim);
+
+        if (_kernels.HasDeinterleaveF32)
+        {
+            _kernels.LaunchDeinterleaveQGateF32(s.Qg, s.Q, s.Gate, numHeads, headDim, 1, streamH);
+        }
+        else
+        {
+            long perHeadBytes = (long)headDim * sizeof(float);
+            for (int h = 0; h < numHeads; h++)
+            {
+                nint qgHead = s.Qg + (nint)(h * 2 * perHeadBytes);
+                nint qHead = s.Q + (nint)(h * perHeadBytes);
+                nint gHead = s.Gate + (nint)(h * perHeadBytes);
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(qHead, qgHead, (nuint)perHeadBytes, streamH).ThrowOnError();
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(gHead, qgHead + (nint)perHeadBytes,
+                    (nuint)perHeadBytes, streamH).ThrowOnError();
+            }
+        }
+        ProfMark("mtp-4a-attn-norm-q-proj");
+
+        // K/V projections. An F32 cache takes them directly into this step's row (no extra copy), matching the CPU host's
+        // `k.CopyTo(state.GetKeyRow(step))` / `v.CopyTo(state.GetValueRow(step))`. Any other format computes them in F32
+        // scratch and stores them after K-norm and RoPE, the same F32 -> F16 (-> quantize) write the trunk does (issue #1095).
+        bool f32Cache = state.KeyFormat == CudaMtpKvFormat.F32;
+        nint kRowDst = f32Cache ? state.GetKeyRowDevicePtr(step) : s.KRow;
+        nint vRowDst = f32Cache ? state.GetValueRowDevicePtr(step) : s.VRow;
+        MtpGemm(attn.KDevice, attn.KQt, s.Normed, kRowDst, attn.KOutputDim, attn.KInputDim);
+        MtpGemm(attn.VDevice, attn.VQt, s.Normed, vRowDst, attn.VOutputDim, attn.VInputDim);
+        ProfMark("mtp-4b-kv-proj");
+
+        // Per-head QK-norm (RMSNorm over headDim, one "row" per head — seqLen=1 * numHeads/numKvHeads rows).
+        _kernels.LaunchRmsNormF32(s.Q, attn.QNormDevice, s.Q, headDim, eps, numHeads, streamH);
+        _kernels.LaunchRmsNormF32(kRowDst, attn.KNormDevice, kRowDst, headDim, eps, numKvHeads, streamH);
+
+        // RoPE — partial-rotary NeoX, at this step's absolute round-relative position.
+        // The position comes from the state's device-resident iota table (issue #482), replacing a
+        // per-step GC-allocated int[1] plus a pageable H2D (driver staging copy, which the CUDA
+        // docs allow to synchronize with the stream).
+        _kernels.LaunchRoPEF32(s.Q, kRowDst, state.GetPositionDevicePtr(position), 1, numHeads, numKvHeads, headDim,
+            _ropeDim, _ropeTheta, 1, streamH, ropeInvFreq: _ropeYarnInvFreq, ropeMscale: _ropeYarnMscale);
+        if (!f32Cache)
+            StoreMtpKvRows(state, kRowDst, vRowDst, step, 1, streamH);
+        ProfMark("mtp-4c-qknorm-rope");
+
+        // Append this step's K/V (already written above) and attend causally over everything
+        // drafted so far in this round (NOT the trunk's KV-cache) — positionOffset=step means every
+        // key j in [0, step] satisfies the causal check (step >= j), i.e. no masking within the
+        // round, matching the CPU host's Attention.Execute(..., positionOffset: step, ...) call.
+        int seqKv = step + 1;
+        if (f32Cache)
+        {
+            _kernels.LaunchAttentionF32(s.Q, state.KeyCacheDevicePtr, state.ValueCacheDevicePtr, s.AttnOut,
+                /* seqQ */ 1, /* seqKv */ seqKv, numHeads, numKvHeads, headDim,
+                /* positionOffset */ step, /* slidingWindow */ 0, streamH);
+        }
+        else
+        {
+            MtpHeadAttention(state, s.Q, s.AttnOut, seqKv, numHeads, numKvHeads, headDim, streamH);
+        }
+        ProfMark("mtp-5-attn-core");
+
+        // attnOut *= sigmoid(gate) — Qwen3.5/3.6 gated attention, applied before the O-proj.
+        if (_kernels.HasElementwiseF32)
+            _kernels.LaunchSigmoidMulF32(s.AttnOut, s.Gate, qElems, streamH);
+        else
+            LaunchSigmoidMulHostFallback(s.AttnOut, s.Gate, qElems);
+
+        MtpGemm(attn.ODevice, attn.OQt, s.AttnOut, s.Cur, attn.OOutputDim, attn.OInputDim);
+
+        _kernels.LaunchAddF32(s.Residual, s.Cur, s.Cur, hiddenSize, streamH); // cur = inpSA + attn_out_projected
+        ProfMark("mtp-6-attn-gate-o-proj");
+
+        // ── Dense SwiGLU FFN sub-layer ──
+        CudaDriverApi.cuMemcpyDtoDAsync_v2(s.Residual, s.Cur, (nuint)((long)hiddenSize * sizeof(float)), streamH)
+            .ThrowOnError(); // ffn_residual
+        _kernels.LaunchRmsNormF32(s.Cur, mtpHead.Layer.PostAttnNormWeightDevice, s.Normed, hiddenSize, eps, 1, streamH);
+
+        MtpGemm(mtpHead.Layer.GateWeight, mtpHead.Layer.GateQt, s.Normed, s.FfnGate,
+             mtpHead.Layer.GateOutputDim, mtpHead.Layer.GateInputDim);
+        MtpGemm(mtpHead.Layer.UpWeight, mtpHead.Layer.UpQt, s.Normed, s.FfnUp,
+             mtpHead.Layer.UpOutputDim, mtpHead.Layer.UpInputDim);
+        ProfMark("mtp-7a-ffn-norm-gate-up");
+        _kernels.LaunchSwiGLUF32(s.FfnGate, s.FfnUp, s.Silu, intermediateSize, 1, streamH);
+        MtpGemm(mtpHead.Layer.DownWeight, mtpHead.Layer.DownQt, s.Silu, s.Cur,
+             mtpHead.Layer.DownOutputDim, mtpHead.Layer.DownInputDim);
+
+        _kernels.LaunchAddF32(s.Residual, s.Cur, s.Cur, hiddenSize, streamH); // cur = ffn_residual + ffn_out
+        ProfMark("mtp-7b-ffn-swiglu-down");
+
+        state.Advance();
+        if (output == MtpStepOutput.None)
+        {
+            // Absorb: only the KV row mattered; the caller seeds the next step from a trunk row.
+            _stream.Synchronize();
+            return null;
+        }
+
+        // ── Shared LM head (falls back to the trunk's output_norm/output.weight when the GGUF
+        //    didn't ship head-local nextn.shared_head_* tensors) ──
+        nint headNormWeight = mtpHead.SharedHeadNormDevice ?? _outputNormDevice;
+        _kernels.LaunchRmsNormF32(s.Cur, headNormWeight, s.NormedHead, hiddenSize, eps, 1, streamH);
+
+        // The next chained draft step pairs this step's hidden state with the token it predicts.
+        // llama.cpp chains the head's `h_nextn` — AFTER shared_head_norm (issue #469).
+        CudaDriverApi.cuMemcpyDtoDAsync_v2(state.PendingHiddenDevicePtr, s.NormedHead,
+            (nuint)((long)hiddenSize * sizeof(float)), streamH).ThrowOnError();
+
+        nint headWeight = mtpHead.SharedHeadHeadDevice ?? _outputDevice;
+        QuantizationType headQt = mtpHead.SharedHeadHeadDevice is not null ? mtpHead.SharedHeadHeadQt : _outputQt;
+        int headOutputDim = mtpHead.SharedHeadHeadDevice is not null ? mtpHead.SharedHeadHeadOutputDim : _outputOutputDim;
+        int headInputDim = mtpHead.SharedHeadHeadDevice is not null ? mtpHead.SharedHeadHeadInputDim : _outputInputDim;
+
+        // PrismML Hadamard fold (#435/#479), the mirror of the embedding case above: the trunk's
+        // output.weight fallback is a FOLDED matrix, so its input needs the forward rotation exactly
+        // as the trunk's own lm_head does. A head-local nextn.shared_head_head is not folded. The
+        // pending-hidden copy above stays unrotated (it feeds the next step's hnorm).
+        nint headIn = s.NormedHead;
+        if (mtpHead.SharedHeadHeadDevice is null && _hadamard is { } headRot)
+        {
+            headIn = s.HeadRot;
+            headRot.RotateForward(s.NormedHead, headIn, 1, headInputDim,
+                permuteGdnValueHeads: false, streamH);
+        }
+        ProfMark("mtp-8-head-norm-rot");
+        MtpGemm(headWeight, headQt, headIn, s.LogitsDevice, headOutputDim, headInputDim);
+        ProfMark("mtp-9-lm-head");
+
+        if (output == MtpStepOutput.ArgMax)
+        {
+            // Issue #486: reduce on the device over the same vocabSize floats the Logits path copies,
+            // and read back one int (pinned slot, async copy on the stream) — no host tensor.
+            _mtpArgMax!.Launch(s.LogitsDevice, vocabSize, streamH);
+            _stream.Synchronize();
+            argmax = _mtpArgMax.Result;
+            ProfMark("mtp-10-argmax-d2h");
+            return null;
+        }
+
+        _stream.Synchronize();
+        var shape = new TensorShape(1, vocabSize);
+        var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
+        CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, s.LogitsDevice,
+            (nuint)((long)vocabSize * sizeof(float))).ThrowOnError();
+        ProfMark("mtp-10-logits-d2h");
+        return result;
+    }
+
+    // Issue #178 (2026-07-25 profiling round): re-verified that HasCopyRmsNormF32 is actually
+    // true at runtime for both "layer-pre-norm1" and "layer-resid1-norm2" below (a real xUnit
+    // pass on CudaCopyRmsNormF32Test, not just the property returning true — confirms PTX isn't
+    // stale) — the fused single-launch path IS the one executing in production, not the 2-launch
+    // fallback. cuobjdump --dump-sass on copy_rmsnorm_f32 (sm_86) shows 24 registers/thread, 0
+    // spills — a lean kernel with nothing left to trim internally. The remaining cost is
+    // structural, not launch-count: decode always has seqLen==1, so blockIdx.x (=row) only ever
+    // takes value 0 — each call launches exactly ONE block, occupying 1 of 28 SMs. This is the
+    // same "grid too small to fill the device" shape the parallel gdn_scan_step_f32 ncu
+    // investigation found (see .docs/handoff.md), but here it's structural rather than tunable:
+    // there is only one row to normalize per decode step, so there is no more per-row parallelism
+    // to spread across blocks. Splitting the 5120-wide reduction itself across multiple blocks
+    // to raise occupancy would need either (a) a second kernel launch for the cross-block
+    // reduction — which gives back exactly the launch this fusion exists to remove — or (b) a
+    // cooperative-groups grid-wide sync (cuLaunchCooperativeKernel), which is not used anywhere
+    // else in this codebase and adds real portability/occupancy-oversubscription risk for a
+    // single-digit-percent theoretical upside. Concluded: no further action here without a
+    // materially different (riskier, cooperative-launch) redesign; not attempted this session.
+    private void RunSingleLayerBody(int layerIdx, int seqLen, ReadOnlySpan<int> positions,
+        int hiddenSize, int numHeads, int numKvHeads, int headDim, float eps, IKvCache? kvCache)
+    {
+        nint streamH = _stream.Handle;
+        long hiddenBytes = (long)seqLen * hiddenSize * sizeof(float);
+        var kinds = _layout.LayerKind;
+        ref readonly DeviceLayer lw = ref _layers[layerIdx];
+
+        bool debug = DebugTrace;
+        if (debug) { _stream.Synchronize(); Console.Error.WriteLine($"[hybrid-debug] layer {layerIdx} start ({kinds[layerIdx]})"); Console.Error.Flush(); }
+
+        ProfStart();
+        // 1. Token mixing — residual = hidden; normOut = RmsNorm(hidden, attn_norm).
+        if (_kernels.HasCopyRmsNormF32)
+        {
+            _kernels.LaunchCopyRmsNormF32(_state.HiddenState, _state.Residual, lw.AttnNormWeightDevice,
+                _state.NormOutput, hiddenSize, eps, seqLen, streamH);
+        }
+        else
+        {
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.Residual, _state.HiddenState,
+                (nuint)hiddenBytes, streamH).ThrowOnError();
+            _kernels.LaunchRmsNormF32(_state.HiddenState, lw.AttnNormWeightDevice, _state.NormOutput,
+                hiddenSize, eps, seqLen, streamH);
+        }
+        ProfMark("layer-pre-norm1");
+
+        if (kinds[layerIdx] == HybridLayerKind.GatedDeltaNet)
+        {
+            ForwardGdnBody(lw.Gdn!.Value, layerIdx, seqLen, hiddenSize, eps);
+        }
+        else
+        {
+            ForwardFullAttnBody(lw.FullAttn!.Value, layerIdx, seqLen, positions,
+                numHeads, numKvHeads, headDim, eps, kvCache);
+        }
+        if (debug) { _stream.Synchronize(); Console.Error.WriteLine($"[hybrid-debug] layer {layerIdx} token-mixing done"); Console.Error.Flush(); }
+
+        ProfStart();
+        // 2. First residual add: hidden = residual + normOut.
+        _kernels.LaunchAddF32(_state.Residual, _state.NormOutput, _state.HiddenState,
+            seqLen * hiddenSize, streamH);
+
+        // 3. Dense FFN — residual = hidden; normOut = RmsNorm(hidden, post_attn_norm).
+        if (_kernels.HasCopyRmsNormF32)
+        {
+            _kernels.LaunchCopyRmsNormF32(_state.HiddenState, _state.Residual, lw.PostAttnNormWeightDevice,
+                _state.NormOutput, hiddenSize, eps, seqLen, streamH);
+        }
+        else
+        {
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.Residual, _state.HiddenState,
+                (nuint)hiddenBytes, streamH).ThrowOnError();
+            _kernels.LaunchRmsNormF32(_state.HiddenState, lw.PostAttnNormWeightDevice, _state.NormOutput,
+                hiddenSize, eps, seqLen, streamH);
+        }
+        ProfMark("layer-resid1-norm2");
+
+        ForwardDenseFfnBody(lw, seqLen, hiddenSize);
+        if (debug) { _stream.Synchronize(); Console.Error.WriteLine($"[hybrid-debug] layer {layerIdx} ffn done"); Console.Error.Flush(); }
+
+        ProfStart();
+        // 4. Second residual add: hidden = residual + normOut.
+        _kernels.LaunchAddF32(_state.Residual, _state.NormOutput, _state.HiddenState,
+            seqLen * hiddenSize, streamH);
+        ProfMark("layer-resid2");
+    }
+
+    private static readonly bool DebugTrace =
+        Environment.GetEnvironmentVariable("DOTLLM_HYBRID_DEBUG") == "1";
+
+    /// <summary>
+    /// Issue #185 diagnostic: logs free/total device VRAM (via <c>cuMemGetInfo</c>) under the same
+    /// <see cref="DebugTrace"/> gate used by the existing hybrid-debug traces above — zero cost when
+    /// unset. Added to find the real allocation source of the VRAM-ceiling hang that
+    /// <c>dotllm bench --depth</c> hits beyond ~650-768 on a 12GB card (see the issue for the
+    /// original symptom description).
+    /// </summary>
+    private static void LogVram(string label)
+    {
+        CudaDriverApi.cuMemGetInfo_v2(out nuint free, out nuint total).ThrowOnError();
+        long usedMiB = (long)(total - free) / (1024 * 1024);
+        long freeMiB = (long)free / (1024 * 1024);
+        long totalMiB = (long)total / (1024 * 1024);
+        Console.Error.WriteLine($"[hybrid-debug][vram] {label}: used={usedMiB}MiB free={freeMiB}MiB total={totalMiB}MiB");
+        Console.Error.Flush();
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    //  One-off category profiler (DOTLLM_HYBRID_PROFILE=1). Coarse (Stopwatch +
+    //  per-mark Synchronize — the sync itself perturbs true pipelined timing, so
+    //  this is for RELATIVE category comparison only, not absolute steady-state
+    //  throughput). Not used by production code paths; zero cost when unset.
+    // ──────────────────────────────────────────────────────────────────────
+    internal static readonly bool ProfileTrace =
+        Environment.GetEnvironmentVariable("DOTLLM_HYBRID_PROFILE") == "1";
+    internal static readonly System.Collections.Generic.Dictionary<string, double> ProfileTotalsMs = new();
+    internal static readonly System.Collections.Generic.Dictionary<string, int> ProfileCounts = new();
+    private readonly System.Diagnostics.Stopwatch _profSw = new();
+
+    // Only accumulate for seqLen==1 (decode) calls — prefill (seqLen>1) routes every
+    // projection through the much heavier dequant-then-cuBLAS path, which would dominate
+    // and mask the decode-path (GEMV) picture this profiler exists to show.
+    private bool _profileActiveForThisCall;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ProfStart()
+    {
+        if (!ProfileTrace || !_profileActiveForThisCall) return;
+        _stream.Synchronize();
+        _profSw.Restart();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ProfMark(string category)
+    {
+        if (!ProfileTrace || !_profileActiveForThisCall) return;
+        _stream.Synchronize();
+        double ms = _profSw.Elapsed.TotalMilliseconds;
+        ProfileTotalsMs[category] = ProfileTotalsMs.GetValueOrDefault(category) + ms;
+        ProfileCounts[category] = ProfileCounts.GetValueOrDefault(category) + 1;
+        _profSw.Restart();
+    }
+
+    /// <summary>Prints accumulated category totals (ms, and ms/call) to stderr and clears them.</summary>
+    internal static void ProfileReportAndReset()
+    {
+        if (!ProfileTrace) return;
+        Console.Error.WriteLine("[hybrid-profile] category totals:");
+        foreach (var kv in ProfileTotalsMs)
+        {
+            int n = ProfileCounts.GetValueOrDefault(kv.Key, 1);
+            Console.Error.WriteLine($"  {kv.Key,-20} total={kv.Value,9:F2}ms  calls={n,6}  avg={kv.Value / n,7:F4}ms");
+        }
+        Console.Error.Flush();
+        ProfileTotalsMs.Clear();
+        ProfileCounts.Clear();
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    //  GDN token-mixing body — verbatim from CudaQwen3MoeHybridTransformerModel
+    //  (architecture-agnostic to the FFN kind).
+    // ──────────────────────────────────────────────────────────────────────
+
+    private void ForwardGdnBody(
+        in DeviceGdn gdnW, int absoluteLayerIdx, int seqLen, int hiddenSize, float eps)
+    {
+        nint streamH = _stream.Handle;
+        int nVHead = _gdn.NVHead;
+        int nKHead = _gdn.NKHead;
+        int dState = _gdn.DState;
+        int dConv = _gdn.DConv;
+        int convDim = (2 * nKHead + nVHead) * dState;
+        int vDim = nVHead * dState;
+        int kDim = nKHead * dState;
+        int gdnOrdinal = _gdnLayerOrdinal[absoluteLayerIdx];
+
+        // Issue #473: rows whose post-row state this forward records (verify forwards only). A
+        // request implies seqLen >= 2, so the general (convInput) conv path below always runs.
+        int snapRows = _rowSnapshotRequestRows > 0 ? Math.Min(_rowSnapshotRequestRows, seqLen - 1) : 0;
+
+        nint normOut = _state.NormOutput;
+        nint qkvBuf = _state.GdnQkvBuf;
+        nint zBuf = _state.GdnZBuf;
+        nint alphaBuf = _state.GdnAlphaBuf;
+        nint betaBuf = _state.GdnBetaBuf;
+        nint qBuf = _state.GdnQBuf;
+        nint kBuf = _state.GdnKBuf;
+        nint vBuf = _state.GdnVBuf;
+        nint gdnOut = _state.GdnOut;
+        nint convInput = _state.GdnConvInput;
+
+        ProfStart();
+        // ── 1. Projections from the normed input ──
+        // PrismML Hadamard fold: only qkv and gate are folded. alpha and beta are NOT, so they must
+        // keep reading the unrotated normOut — hence the rotation goes to scratch, never in place.
+        nint foldedIn = normOut;
+        if (_hadamard is { } rot)
+        {
+            foldedIn = _state.HadamardScratch;
+            rot.RotateForward(normOut, foldedIn, seqLen, gdnW.QkvInputDim,
+                permuteGdnValueHeads: false, streamH);
+        }
+        // #485: qkv and gate read the same input — with the dp4a GEMV on, quantize it once.
+        bool gdnDp4aShared = SharesDp4aInput(gdnW.QkvQt, gdnW.GateQt, gdnW.QkvInputDim, gdnW.GateInputDim, seqLen);
+        if (gdnDp4aShared) QuantizeDp4aInput(foldedIn, gdnW.QkvInputDim, seqLen);
+        Gemm(gdnW.QkvDevice, gdnW.QkvQt, foldedIn, qkvBuf,
+             gdnW.QkvOutputDim, gdnW.QkvInputDim, seqLen, xQuantized: gdnDp4aShared);
+        Gemm(gdnW.GateDevice, gdnW.GateQt, foldedIn, zBuf,
+             gdnW.GateOutputDim, gdnW.GateInputDim, seqLen, xQuantized: gdnDp4aShared);
+        // Without a Hadamard fold alpha/beta read that same (unrotated) input, so the scratch still
+        // holds it; with one they read normOut, not foldedIn, and quantize their own.
+        bool abDp4aShared = gdnDp4aShared && foldedIn == normOut
+            && gdnW.AlphaInputDim == gdnW.QkvInputDim && gdnW.BetaInputDim == gdnW.QkvInputDim;
+        // Alpha/Beta project to tiny output dims (NVHead each) — their decode-time GEMV cost is
+        // dominated by the fixed shared-x staging overhead, not compute, so fusing them (unlike
+        // gate+up/K+V above, which showed no measurable win — compute already dominates there)
+        // avoids paying that staging cost twice.
+        if (!TryFusedPQ2_0Gemm2(gdnW.AlphaDevice, gdnW.AlphaQt, gdnW.BetaDevice, gdnW.BetaQt,
+                normOut, alphaBuf, betaBuf, gdnW.AlphaOutputDim, gdnW.BetaOutputDim,
+                gdnW.AlphaInputDim, gdnW.BetaInputDim, seqLen, xQuantized: abDp4aShared))
+        {
+            Gemm(gdnW.AlphaDevice, gdnW.AlphaQt, normOut, alphaBuf,
+                 gdnW.AlphaOutputDim, gdnW.AlphaInputDim, seqLen, xQuantized: abDp4aShared);
+            Gemm(gdnW.BetaDevice, gdnW.BetaQt, normOut, betaBuf,
+                 gdnW.BetaOutputDim, gdnW.BetaInputDim, seqLen, xQuantized: abDp4aShared);
+        }
+        ProfMark("gdn-1-proj");
+
+        // ── 2. Decay g and write-gate beta ──
+        if (_kernels.HasGdnDecaySigmoidF32)
+        {
+            _kernels.LaunchGdnDecaySigmoidF32(alphaBuf, betaBuf, gdnW.DtBiasDevice, gdnW.ADevice,
+                seqLen, nVHead, streamH);
+        }
+        else
+        {
+            if (_kernels.HasGdnDecayF32)
+            {
+                _kernels.LaunchGdnDecayF32(alphaBuf, gdnW.DtBiasDevice, gdnW.ADevice,
+                    seqLen, nVHead, streamH);
+            }
+            else
+            {
+                LaunchGdnDecayHostFallback(alphaBuf, gdnW.DtBiasDevice, gdnW.ADevice, seqLen, nVHead);
+            }
+            if (_kernels.HasElementwiseF32)
+            {
+                _kernels.LaunchSigmoidF32(betaBuf, (long)seqLen * nVHead, streamH);
+            }
+            else
+            {
+                LaunchSigmoidHostFallback(betaBuf, seqLen * nVHead);
+            }
+        }
+        ProfMark("gdn-2-decaygate");
+
+        // ── 3. Conv1d on QKV concat ──
+        nint convStateDev = _gdnCache.GetConvStatePtr(gdnOrdinal);
+        long convStateBytes = (long)(dConv - 1) * convDim * sizeof(float);
+
+        // Issue #168: decode (seqLen==1) is the overwhelming majority of real GDN-body calls
+        // and needs no physical [state; qkv] concat — the fused kernel reads conv_state and
+        // the new qkv row directly and writes the shifted trailing state back in place,
+        // folding what was 3 memcpy launches + conv1d + silu (5 launches) into 1. Prefill
+        // (seqLen>1) keeps the general path unchanged (concat buffer, arbitrary window count).
+        if (seqLen == 1 && _kernels.HasGdnConv1dCausalDecodeF32)
+        {
+            _kernels.LaunchGdnConv1dCausalDecodeF32(convStateDev, qkvBuf,
+                gdnW.Conv1dWeightDevice, gdnW.Conv1dBiasDevice, qkvBuf, dConv, convDim, streamH);
+        }
+        else
+        {
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(convInput, convStateDev,
+                (nuint)convStateBytes, streamH).ThrowOnError();
+            long qkvRowsBytes = (long)seqLen * convDim * sizeof(float);
+            nint convInputQkvOff = convInput + (nint)convStateBytes;
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(convInputQkvOff, qkvBuf,
+                (nuint)qkvRowsBytes, streamH).ThrowOnError();
+
+            _kernels.LaunchConv1dCausalF32(convInput, gdnW.Conv1dWeightDevice, gdnW.Conv1dBiasDevice,
+                qkvBuf, dConv, convDim, seqLen, streamH);
+            if (_kernels.HasElementwiseF32)
+            {
+                _kernels.LaunchSiluF32(qkvBuf, (long)seqLen * convDim, streamH);
+            }
+            else
+            {
+                LaunchSiluHostFallback(qkvBuf, (long)seqLen * convDim);
+            }
+
+            nint trailRowsSrc = convInput + (nint)((long)seqLen * convDim * sizeof(float));
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(convStateDev, trailRowsSrc,
+                (nuint)convStateBytes, streamH).ThrowOnError();
+
+            // Issue #473: the conv window after row t is convInput rows t+1 .. t+dConv-1 — the
+            // slice the save above takes for t = seqLen-1. Same stream, so ordered before the next
+            // layer reuses convInput.
+            for (int t = 0; t < snapRows; t++)
+            {
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(RowSnapshotConvPtr(t, gdnOrdinal),
+                    convInput + (nint)((long)(t + 1) * convDim * sizeof(float)),
+                    (nuint)convStateBytes, streamH).ThrowOnError();
+            }
+        }
+        ProfMark("gdn-3-conv1d");
+
+        // ── 4. De-interleave Q/K/V from conv output, L2-normalise Q and K per head ──
+        // Issue #170: decode (seqLen==1) fuses the deinterleave gather and both Q/K
+        // L2-normalize launches into one — also drops the runtime integer division
+        // deinterleave_gdn_qkv_f32 pays per element in the general path (SASS-confirmed
+        // via cuobjdump; unnecessary here since seqLen==1 always makes the token index 0).
+        if (seqLen == 1 && _kernels.HasGdnDeinterleaveL2NormDecodeF32)
+        {
+            _kernels.LaunchGdnDeinterleaveL2NormDecodeF32(
+                qkvBuf, qBuf, kBuf, vBuf, nKHead, nVHead, dState, 1e-6f, streamH);
+        }
+        else
+        {
+            if (_kernels.HasDeinterleaveF32)
+            {
+                _kernels.LaunchDeinterleaveGdnQkvF32(qkvBuf, qBuf, kBuf, vBuf, kDim, vDim, seqLen, streamH);
+            }
+            else
+            {
+                long rowBytes = (long)convDim * sizeof(float);
+                long kDimBytes = (long)kDim * sizeof(float);
+                long vDimBytes = (long)vDim * sizeof(float);
+                for (int t = 0; t < seqLen; t++)
+                {
+                    nint srcRow = qkvBuf + (nint)(t * rowBytes);
+                    nint qDst = qBuf + (nint)(t * kDimBytes);
+                    nint kDst = kBuf + (nint)(t * kDimBytes);
+                    nint vDst = vBuf + (nint)(t * vDimBytes);
+                    CudaDriverApi.cuMemcpyDtoDAsync_v2(qDst, srcRow, (nuint)kDimBytes, streamH).ThrowOnError();
+                    CudaDriverApi.cuMemcpyDtoDAsync_v2(kDst, srcRow + (nint)kDimBytes, (nuint)kDimBytes, streamH).ThrowOnError();
+                    CudaDriverApi.cuMemcpyDtoDAsync_v2(vDst, srcRow + (nint)(2 * kDimBytes), (nuint)vDimBytes, streamH).ThrowOnError();
+                }
+            }
+
+            _kernels.LaunchL2NormalizeHeadsF32(qBuf, seqLen * nKHead, dState, 1e-6f, streamH);
+            _kernels.LaunchL2NormalizeHeadsF32(kBuf, seqLen * nKHead, dState, 1e-6f, streamH);
+        }
+        ProfMark("gdn-4-deinterleave");
+
+        // ── 5. GDN scan — single-token kernel driven by host loop ──
+        nint gdnStateDev = _gdnCache.GetGdnStatePtr(gdnOrdinal);
+        long qStepBytes = (long)kDim * sizeof(float);
+        long kStepBytes = qStepBytes;
+        long vStepBytes = (long)vDim * sizeof(float);
+        long gStepBytes = (long)nVHead * sizeof(float);
+        long betaStepBytes = gStepBytes;
+        long outStepBytes = vStepBytes;
+        // Opt-in, default-OFF row-split cooperative-groups scan (issue #180,
+        // DOTLLM_GDN_SCAN_APPROX_SPLIT4=1) — ~26-27% faster kernel time, ~1.5-2% end-to-end decode,
+        // but NOT bit-exact vs the CPU oracle (see gated_delta_net_scan.cu's header for the full
+        // measured-speedup-vs-bit-parity tradeoff writeup — this is why it defaults OFF). Checked
+        // once per shape via IsGdnScanCoopSplit4Safe (cooperative-launch co-residency is a hard
+        // per-GPU/per-shape ceiling, not a soft limit) with a safe fallback to the exact kernel.
+        bool useCoopSplit4 = CudaKernels.EnableGdnScanApproxSplit4 &&
+            _kernels.IsGdnScanCoopSplit4Safe(nVHead, dState);
+        for (int t = 0; t < seqLen; t++)
+        {
+            nint qT = qBuf + (nint)(t * qStepBytes);
+            nint kT = kBuf + (nint)(t * kStepBytes);
+            nint vT = vBuf + (nint)(t * vStepBytes);
+            nint gT = alphaBuf + (nint)(t * gStepBytes);
+            nint betaT = betaBuf + (nint)(t * betaStepBytes);
+            nint outT = gdnOut + (nint)(t * outStepBytes);
+            if (useCoopSplit4)
+            {
+                _kernels.LaunchGdnScanStepF32CoopSplit4(gdnStateDev, qT, kT, vT, gT, betaT, outT,
+                    _state.GdnScanPartialTmp, _state.GdnScanPartialOut, nVHead, nKHead, dState, streamH);
+            }
+            else
+            {
+                _kernels.LaunchGdnScanStepF32(gdnStateDev, qT, kT, vT, gT, betaT, outT,
+                    nVHead, nKHead, dState, streamH);
+            }
+
+            // Issue #473: the scan is already one launch per token, so the state after row t is a
+            // plain D2D copy of the live state here — bit-identical by construction, no new kernel.
+            if (t < snapRows)
+            {
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(RowSnapshotGdnPtr(t, gdnOrdinal), gdnStateDev,
+                    (nuint)((long)_gdnCache.GdnStateElements * sizeof(float)), streamH).ThrowOnError();
+            }
+        }
+        ProfMark("gdn-5-scan");
+
+        // ── 6. Per-head RMSNorm(out, ssm_norm) * silu(z) gating ──
+        // Investigated fusing these two launches (issue #172): implemented, SASS-verified,
+        // correctness-tested, but showed no reproducible real-bench decode win (within this
+        // machine's thermal-drift noise floor) — see rmsnorm_f32.cu's header for the full
+        // writeup. Left as two separate calls.
+        _kernels.LaunchRmsNormF32(gdnOut, gdnW.SsmNormDevice, gdnOut,
+            dState, eps, seqLen * nVHead, streamH);
+        _kernels.LaunchSwiGLUF32(zBuf, gdnOut, gdnOut, vDim, seqLen, streamH);
+        ProfMark("gdn-6-normgate");
+
+        // ── 7. ssm_out projection into NormOutput ──
+        // Folded in GROUPED value-head order (prism.hadamard.gdn_v_grouped) while the recurrence
+        // emits tiled order: the rotation permutes tiled -> grouped on load, then signs, then FWHT.
+        nint outIn = gdnOut;
+        if (_hadamard is { } outRot)
+        {
+            outIn = _state.HadamardScratch;
+            outRot.RotateForward(gdnOut, outIn, seqLen, gdnW.OutInputDim,
+                permuteGdnValueHeads: true, streamH);
+        }
+        Gemm(gdnW.OutDevice, gdnW.OutQt, outIn, normOut,
+             gdnW.OutOutputDim, gdnW.OutInputDim, seqLen);
+        ProfMark("gdn-7-outproj");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    //  Full GQA attention body — verbatim from CudaQwen3MoeHybridTransformerModel.
+    // ──────────────────────────────────────────────────────────────────────
+
+    private void ForwardFullAttnBody(
+        in DeviceFullAttn attn, int layer, int seqLen, ReadOnlySpan<int> positions,
+        int numHeads, int numKvHeads, int headDim, float eps, IKvCache? kvCache)
+    {
+        nint streamH = _stream.Handle;
+        int qElems = numHeads * headDim;
+        int qgElems = 2 * qElems;
+        int kvElems = numKvHeads * headDim;
+
+        nint normOut = _state.NormOutput;
+        nint qgBuf = _state.QGateScratch;
+        nint q = _state.QScratch;
+        nint k = _state.KScratch;
+        nint v = _state.VScratch;
+        nint gate = _state.GateScratch;
+        nint attnOut = _state.AttnOutput;
+
+        ProfStart();
+        // ── 1. Fused Q+Gate projection ──
+        // PrismML Hadamard fold: attn_q, attn_k and attn_v are all folded and read the same
+        // normOut, so one rotation feeds all three. HadamardScratch is untouched between here and
+        // the K/V projections below.
+        nint projIn = normOut;
+        if (_hadamard is { } qkvRot)
+        {
+            projIn = _state.HadamardScratch;
+            qkvRot.RotateForward(normOut, projIn, seqLen, attn.QInputDim,
+                permuteGdnValueHeads: false, streamH);
+        }
+        // #485: Q, K and V read the same projIn — with the dp4a GEMV on, quantize it once here and
+        // reuse it for K/V below (nothing in between runs a projection).
+        bool attnDp4aShared = SharesDp4aInput(attn.QQt, attn.KQt, attn.QInputDim, attn.KInputDim, seqLen)
+            && SharesDp4aInput(attn.KQt, attn.VQt, attn.KInputDim, attn.VInputDim, seqLen);
+        if (attnDp4aShared) QuantizeDp4aInput(projIn, attn.QInputDim, seqLen);
+        Gemm(attn.QDevice, attn.QQt, projIn, qgBuf, attn.QOutputDim, attn.QInputDim, seqLen, xQuantized: attnDp4aShared);
+        DumpDevice2D($"blk.{layer}.fa_qg", qgBuf, seqLen, qgElems);
+        ProfMark("attn-1-qgproj");
+
+        // ── 2. De-interleave QG → Q and Gate ──
+        // Single gather-kernel launch (see elementwise_f32.cu's deinterleave_qgate_f32) —
+        // replaces a numHeads-iteration host loop of paired cuMemcpyDtoDAsync calls, which
+        // profiled as ~12% of total decode time (bigger than the attention kernel itself).
+        if (_kernels.HasDeinterleaveF32)
+        {
+            _kernels.LaunchDeinterleaveQGateF32(qgBuf, q, gate, numHeads, headDim, seqLen, streamH);
+        }
+        else
+        {
+            long perTokenQgBytes = (long)qgElems * sizeof(float);
+            long perTokenQBytes = (long)qElems * sizeof(float);
+            long perHeadBytes = (long)headDim * sizeof(float);
+            for (int t = 0; t < seqLen; t++)
+            {
+                nint qgRow = qgBuf + (nint)(t * perTokenQgBytes);
+                nint qRow = q + (nint)(t * perTokenQBytes);
+                nint gRow = gate + (nint)(t * perTokenQBytes);
+                for (int h = 0; h < numHeads; h++)
+                {
+                    nint qgHead = qgRow + (nint)(h * 2 * perHeadBytes);
+                    nint qHead = qRow + (nint)(h * perHeadBytes);
+                    nint gHead = gRow + (nint)(h * perHeadBytes);
+                    CudaDriverApi.cuMemcpyDtoDAsync_v2(qHead, qgHead, (nuint)perHeadBytes, streamH).ThrowOnError();
+                    CudaDriverApi.cuMemcpyDtoDAsync_v2(gHead, qgHead + (nint)perHeadBytes,
+                        (nuint)perHeadBytes, streamH).ThrowOnError();
+                }
+            }
+        }
+        DumpDevice2D($"blk.{layer}.fa_q_split", q, seqLen, numHeads * headDim);
+        DumpDevice2D($"blk.{layer}.fa_gate_split", gate, seqLen, numHeads * headDim);
+        ProfMark("attn-2-deinterleave");
+
+        // ── 3. K and V projections ──
+        if (!TryFusedPQ2_0Gemm2(attn.KDevice, attn.KQt, attn.VDevice, attn.VQt,
+                projIn, k, v, attn.KOutputDim, attn.VOutputDim,
+                attn.KInputDim, attn.VInputDim, seqLen, xQuantized: attnDp4aShared))
+        {
+            Gemm(attn.KDevice, attn.KQt, projIn, k, attn.KOutputDim, attn.KInputDim, seqLen, xQuantized: attnDp4aShared);
+            Gemm(attn.VDevice, attn.VQt, projIn, v, attn.VOutputDim, attn.VInputDim, seqLen, xQuantized: attnDp4aShared);
+        }
+        DumpDevice2D($"blk.{layer}.fa_k", k, seqLen, numKvHeads * headDim);
+        DumpDevice2D($"blk.{layer}.fa_v", v, seqLen, numKvHeads * headDim);
+        ProfMark("attn-3-kvproj");
+
+        // ── 4. Per-head QK-norm ──
+        _kernels.LaunchRmsNormF32(q, attn.QNormDevice, q,
+            headDim, eps, seqLen * numHeads, streamH);
+        _kernels.LaunchRmsNormF32(k, attn.KNormDevice, k,
+            headDim, eps, seqLen * numKvHeads, streamH);
+        DumpDevice2D($"blk.{layer}.fa_q_postnorm", q, seqLen, qElems);
+        DumpDevice2D($"blk.{layer}.fa_k_postnorm", k, seqLen, numKvHeads * headDim);
+        ProfMark("attn-4-qknorm");
+
+        // ── 5. RoPE — partial-rotary NeoX ──
+        _kernels.LaunchRoPEF32(q, k, _state.PositionsDevice,
+            seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, 1, streamH,
+            ropeInvFreq: _ropeYarnInvFreq, ropeMscale: _ropeYarnMscale);
+        DumpDevice2D($"blk.{layer}.fa_q_postrope", q, seqLen, qElems);
+        DumpDevice2D($"blk.{layer}.fa_k_postrope", k, seqLen, numKvHeads * headDim);
+        ProfMark("attn-5-rope");
+
+        // ── 6. Attention (GQA with causal mask) ──
+        if (kvCache is not null)
+        {
+            if (!ReferenceEquals(kvCache, _lastForwardKvCache))
+            {
+                _lastForwardKvCache = kvCache;
+                _f16CacheCurrentLength = 0;
+            }
+
+            EnsureF16KvCache(kvCache.MaxLength, numKvHeads, headDim);
+            int slot = _kvSlotForLayer[layer];
+            if (slot < 0)
+                throw new InvalidOperationException(
+                    $"Layer {layer} is not a full-attention layer but ForwardFullAttnBody was invoked.");
+            WriteF16KvRows(slot, k, v, positions, numKvHeads, headDim);
+            ProfMark("attn-6a-kvwrite");
+
+            int positionOffset = positions[0];
+            int seqKv = _f16CacheCurrentLength;
+            int kvLiveElems = seqKv * kvElems;
+
+
+            // Opt-in split-KV ("Flash-Decoding") attention (issue #183): attention_f32's grid is
+            // seqQ*numHeads, so decode's seqQ==1 underfills the GPU (numHeads=24 < 28 SMs for
+            // Bonsai-27B) and the KV-tile loop runs fully sequentially within one block per head —
+            // a cost that grows with context depth (`.docs/handoff.md`'s "Depth-dependent
+            // attention finding": +151% 0.043->0.108ms/call, depth 0->256). Decode-only (seqLen==1)
+            // scope; gated by a minimum seqKv (splitting a shallow KV range isn't worth the
+            // grid.sync + combine overhead) and a per-shape cooperative-launch co-residency safety
+            // check. Off by default (DOTLLM_ATTN_SPLIT_KV=1 to enable) — see CudaKernels.cs's
+            // EnableAttentionSplitKv doc and attention_f32.cu's header for the full tradeoff
+            // (reassociated, not bit-exact, float reduction across the cross-block combine).
+            // kStage/vStage are this SLOT's per-layer F32 KV staging buffers (issue #182 made
+            // these per-slot arrays, not one shared buffer) — the split-KV kernel reads the same
+            // staged data the exact kernel would, just via more blocks.
+            // Opt-in combined GQA-group + split-KV attention (issues #197 + #198): register-blocks
+            // the QK/PV loops across the numHeads/numKvHeads query-head group sharing each KV
+            // head (grid = numKvHeads instead of numHeads), composed with a runtime-tuned KV
+            // split so the grid doesn't collapse below the #183 baseline for small numKvHeads
+            // (Bonsai-27B: numKvHeads=4 alone would be 6x worse than today's grid=24 -- see
+            // attention_f32.cu's combined-kernel header). Preferred over the plain #183 split-KV
+            // tier below whenever the shape has real GQA (numKvHeads < numHeads) and the shape
+            // fits this GPU's cooperative-launch co-residency ceiling; falls back to the #183
+            // tier, then to the exact LaunchAttentionF32, on any ineligibility. Off by default
+            // (DOTLLM_ATTN_GQA_SPLIT=1 to enable) -- see CudaKernels.cs's EnableAttentionGqaSplit
+            // doc for the full tradeoff.
+            bool gqaGroupEligible = CudaKernels.IsGqaGroupShapeSupported(numHeads, numKvHeads)
+                && numKvHeads < numHeads;
+            int gqaMaxSafeSplit = gqaGroupEligible
+                ? _kernels.MaxSafeAttentionGqaSplit(numKvHeads, headDim, numHeads / numKvHeads)
+                : 0;
+            bool useGqaSplitAttn = seqLen == 1
+                && CudaKernels.EnableAttentionGqaSplit
+                && seqKv >= CudaKernels.AttentionGqaSplitMinSeqKv
+                && gqaGroupEligible
+                && _kernels.HasAttentionF32GqaSplitKv
+                && gqaMaxSafeSplit >= 1;
+
+            bool useSplitKvAttn = !useGqaSplitAttn
+                && seqLen == 1
+                && CudaKernels.EnableAttentionSplitKv
+                && seqKv >= CudaKernels.AttentionSplitKvMinSeqKv
+                && _kernels.IsAttentionSplitKvSafe(numHeads, headDim);
+
+            // Opt-in composed tensor-core decode attention (issue #199 v2): same grid design as
+            // the GQA-split kernel above (numKvHeads x runtime-tuned kvSplit), but packs the
+            // GQA group into the mma.sync tile's M dimension for real tensor-core throughput
+            // instead of one query row per warp. Measured 2-2.6x faster than the plain F32
+            // kernel and 2-2.5x faster than the GQA-split kernel itself at depth >=512 (see
+            // docs/CUDA.md's "2026-07-30 re-profile"/issue #199 v2 entries) -- but ONLY when
+            // there's a real group to pack (numKvHeads < numHeads); at group=1 this kernel
+            // degenerates to v1's exact failure mode (one row wasted in a 16-row mma tile,
+            // ~4% occupancy), so it deliberately requires the same "real GQA" gate the sibling
+            // F32 kernel uses, not just IsGqaGroupShapeSupported alone. Requires FP16 Q
+            // (converted just below) and reads K/V straight from the FP16 KV cache -- no F32
+            // staging needed for this path, though kStage/vStage above are still populated
+            // unconditionally for the fallback tiers. Default ON as of 2026-07-30, real
+            // generation-parity validated (opt-out via DOTLLM_ATTN_MMA_DECODE_GQA_SPLIT=0) --
+            // see CudaAttentionMmaDecodeGqaSplit's doc for the full precision/scope story and
+            // validation results. Takes priority over every tier below when
+            // eligible (strictly faster whenever it applies, per the real A/B); the #226
+            // fp64-combine research toggle above still wins over this when ITS flag is
+            // explicitly set (deliberately mutually exclusive, not meant to compose).
+            // "Real GQA" (numKvHeads < numHeads) and the shared min-seqKv gate are checked here
+            // rather than inside CudaAttentionMmaDecodeGqaSplit.CanUse (which stays a pure
+            // per-launch shape/precondition check, mirroring CudaKernels.IsAttentionSplitKvSafe's
+            // split of concerns) -- at group=1 there is no query-head group to pack into the mma
+            // tile's M dimension, so this kernel would degenerate to v1's exact failure mode (one
+            // row wasted in a 16-row tile, ~4% occupancy) rather than its real ~2-2.5x win.
+            bool mmaEligible = seqLen == 1
+                && numKvHeads < numHeads
+                && seqKv >= CudaKernels.AttentionGqaSplitMinSeqKv
+                && _mmaDecodeGqaSplit.CanUse(seqLen, seqKv, slidingWindow: 0, numHeads, numKvHeads, headDim);
+            // Fused quantized-KV tier (issue #956): both sides quantized, kernel loaded, mma-eligible.
+            bool fusedKvqDecode = mmaEligible
+                && FuseQuantKvDecodeForTest
+                && IsQuantKv(_kvKeyDType) && IsQuantKv(_kvValueDType)
+                && _mmaDecodeGqaSplit.CanUseKvq(_kvKeyDType, _kvValueDType, seqLen, seqKv, 0,
+                                                numHeads, numKvHeads, headDim)
+                && _mmaDecodeGqaSplit.ComputeSafeKvSplitKvq(_kvKeyDType, _kvValueDType, numKvHeads, seqKv) >= 1;
+            int mmaKvSplit = !mmaEligible ? 0
+                : fusedKvqDecode
+                    ? _mmaDecodeGqaSplit.ComputeSafeKvSplitKvq(_kvKeyDType, _kvValueDType, numKvHeads, seqKv)
+                    : _mmaDecodeGqaSplit.ComputeSafeKvSplit(numKvHeads, numHeads / numKvHeads, seqKv);
+            bool useMmaDecodeGqaSplitAttn = mmaEligible && mmaKvSplit >= 1;
+
+            // Issue #226 spike: fp64-combine variant, mutually exclusive with (checked before, so
+            // it wins over) the plain split-KV and GQA-split tiers when its own flag is set --
+            // this is a research A/B toggle, not meant to compose with the other opt-in kernels.
+            // Same scratch-buffer layout as plain split-KV, so it reuses that allocation.
+            bool useSplitKvHpAttn = seqLen == 1
+                && CudaKernels.EnableAttentionSplitKvHp
+                && seqKv >= CudaKernels.AttentionSplitKvMinSeqKv
+                && _kernels.IsAttentionSplitKvHpSafe(numHeads, headDim);
+            // The fp64-combine research toggle wins over mma and consumes F32 staging built from
+            // kF16/vF16, so the fused quantized-KV path (which never resolves them) must stand down.
+            if (useSplitKvHpAttn) fusedKvqDecode = false;
+
+            // Issue #1068: a short multi-row forward over quantized KV (an MTP or speculative verify, K+1 rows every round)
+            // used to dequantize the WHOLE history [0, seqKv) of K and V into F16 scratch in every attention layer, then run
+            // the prefill kernel over it: O(context) extra writes and reads per round, plus a scratch that grows with the
+            // context (and, once VRAM ran out, spilled into shared memory and ran at PCIe speed). Instead run the fused
+            // dequant-in-load decode kernel once per row, each row attending to its own causal prefix [0, position + 1).
+            // That is exact causal attention (the rows' K/V were written above) and needs no scratch at all.
+            int perRowFirstSeqKv = positionOffset + 1;
+            bool perRowKvq = !useMmaDecodeGqaSplitAttn
+                && seqLen > 1 && seqLen <= PerRowKvqMaxRows
+                && PerRowKvqForTest && FuseQuantKvDecodeForTest
+                && IsQuantKv(_kvKeyDType) && IsQuantKv(_kvValueDType)
+                && numKvHeads < numHeads
+                && perRowFirstSeqKv >= CudaKernels.AttentionGqaSplitMinSeqKv
+                && IsContiguous(positions)
+                && _mmaDecodeGqaSplit.CanUseKvq(_kvKeyDType, _kvValueDType, 1, perRowFirstSeqKv, 0,
+                                                numHeads, numKvHeads, headDim)
+                && _mmaDecodeGqaSplit.ComputeSafeKvSplitKvq(_kvKeyDType, _kvValueDType, numKvHeads, perRowFirstSeqKv) >= 1;
+
+            // F32 K/V read-staging (issue #956): needed only by the F32-consuming tiers. The mma
+            // decode kernel below reads the F16 cache directly, so on the default decode path no
+            // F32 copy is allocated or converted at all. Tier precedence mirrors the dispatch
+            // chain: the #226 fp64-combine toggle wins over mma, then mma, then the F32 tiers.
+            // Issue #962: tensor-core flash prefill (head_dim 256) reads the F16 view directly too.
+            bool useFlashPrefillHd256 = seqLen > 1 && !perRowKvq && FlashPrefillHd256Eligible(numHeads, numKvHeads, headDim);
+            // Issue #1094: over quantized K and V the flash prefill reads the blocks directly (one 16-row tile at a time,
+            // dequantized in shared memory), so neither a prefill tile nor a verify wider than the per-row tier builds the
+            // full-history F16 scratch.
+            bool useFlashPrefillHd256Kvq = useFlashPrefillHd256 && FlashPrefillHd256KvqEligible;
+            bool needF32Stage = !useFlashPrefillHd256 && !perRowKvq && (useSplitKvHpAttn || !useMmaDecodeGqaSplitAttn);
+            nint kStage = 0, vStage = 0;
+            // F16 view of K/V history: the persistent cache, or a fresh dequant into the shared
+            // scratch when KV storage is quantized (Phase 2).
+            nint kF16 = 0, vF16 = 0;
+            if (!fusedKvqDecode && !perRowKvq && !useFlashPrefillHd256Kvq)
+            {
+                kF16 = ResolveKvF16(slot, isKey: true, seqKv, kvElems, streamH);
+                vF16 = ResolveKvF16(slot, isKey: false, seqKv, kvElems, streamH);
+            }
+            if (needF32Stage)
+            {
+                EnsureF32KvStaging(seqKv, kvElems);
+                kStage = _f32KvStageK;
+                vStage = _f32KvStageV;
+                _kernels.LaunchConvertF16ToF32(kF16, kStage, kvLiveElems, streamH);
+                _kernels.LaunchConvertF16ToF32(vF16, vStage, kvLiveElems, streamH);
+                DebugF32StagedAttentionCallsForTest++;
+            }
+            ProfMark("attn-6b-kvdequant");
+
+            if (s_vramLedger && !_vramLedgerLogged)
+            {
+                _vramLedgerLogged = true;
+                long kvBytes = ComputeKvBytes(_f16CacheMaxSeqLen);
+                long f32Stage = 2L * _f32KvStageElems * sizeof(float);
+                long f16Scratch = (IsQuantKv(_kvKeyDType) ? 1L : 0L) + (IsQuantKv(_kvValueDType) ? 1L : 0L);
+                f16Scratch *= _kvF16ScratchElems * sizeof(ushort);
+                Console.Error.WriteLine(
+                    $"[vram-ledger] KV {_kvKeyDType}/{_kvValueDType} {kvBytes / 1048576.0:F0} MiB (maxSeq {_f16CacheMaxSeqLen}, " +
+                    $"{_attentionLayerCount} slots), shared F32 staging {f32Stage / 1048576.0:F0} MiB, " +
+                    $"F16 dequant scratch {f16Scratch / 1048576.0:F0} MiB, " +
+                    $"state+gdn {ComputeMemoryBytes / 1048576.0:F0} MiB");
+            }
+
+            if (perRowKvq)
+            {
+                int maxSplit = 1;   // the partial scratch must hold the widest split any row uses
+                for (int r = 0; r < seqLen; r++)
+                    maxSplit = Math.Max(maxSplit, _mmaDecodeGqaSplit.ComputeSafeKvSplitKvq(_kvKeyDType, _kvValueDType,
+                                                                                           numKvHeads, positionOffset + r + 1));
+                EnsureAttentionMmaDecodeQF16Scratch(numHeads, headDim, rows: seqLen);
+                EnsureAttentionGqaSplitScratch(numHeads, headDim, maxSplit);
+                _kernels.LaunchConvertF32ToF16(q, _attnMmaDecodeQF16, seqLen * qElems, streamH);
+                for (int r = 0; r < seqLen; r++)
+                {
+                    int rowSeqKv = positionOffset + r + 1;   // causal: row r sees positions [0, positionOffset + r]
+                    int split = _mmaDecodeGqaSplit.ComputeSafeKvSplitKvq(_kvKeyDType, _kvValueDType, numKvHeads, rowSeqKv);
+                    _mmaDecodeGqaSplit.RunKvq(_attnMmaDecodeQF16 + (nint)((long)r * qElems * sizeof(ushort)),
+                        _kQuant![slot], _vQuant![slot], _kvKeyDType, _kvValueDType,
+                        attnOut + (nint)((long)r * qElems * sizeof(float)),
+                        rowSeqKv, numHeads, numKvHeads, split,
+                        _attnGqaSplitPartialMax, _attnGqaSplitPartialSum, _attnGqaSplitPartialOut, streamH);
+                    DebugPerRowKvqAttentionCallsForTest++;
+                }
+            }
+            else if (useFlashPrefillHd256)
+            {
+                long qElemsAll = (long)seqLen * numHeads * headDim;
+                if (qElemsAll > _attnFlashPrefillQF16ElemsAllocated)
+                {
+                    FreeIfNonZero(ref _attnFlashPrefillQF16);
+                    _attnFlashPrefillQF16 = AllocDevice(qElemsAll * sizeof(ushort));
+                    _attnFlashPrefillQF16ElemsAllocated = qElemsAll;
+                }
+                _kernels.LaunchConvertF32ToF16(q, _attnFlashPrefillQF16, (int)qElemsAll, streamH);
+                if (useFlashPrefillHd256Kvq)
+                {
+                    _kernels.LaunchAttentionFlashPrefillHd256Kvq(_attnFlashPrefillQF16, _kQuant![slot], _vQuant![slot],
+                        _kvKeyDType, _kvValueDType, attnOut, seqLen, seqKv, numHeads, numKvHeads, positionOffset, streamH);
+                    DebugFlashPrefillHd256KvqCallsForTest++;
+                }
+                else
+                {
+                    _kernels.LaunchAttentionFlashPrefillHd256(_attnFlashPrefillQF16, kF16, vF16, attnOut,
+                        seqLen, seqKv, numHeads, numKvHeads, positionOffset, streamH);
+                }
+                DebugFlashPrefillHd256CallsForTest++;
+            }
+            else if (useSplitKvHpAttn)
+            {
+                EnsureAttentionSplitKvScratch(numHeads, headDim);
+                _kernels.LaunchAttentionF32SplitKvHp(q, kStage, vStage, attnOut,
+                    seqKv, numHeads, numKvHeads, headDim,
+                    positionOffset: positionOffset, slidingWindow: 0,
+                    _attnSplitKvPartialMax, _attnSplitKvPartialSum, _attnSplitKvPartialOut, streamH);
+            }
+            else if (useMmaDecodeGqaSplitAttn)
+            {
+                EnsureAttentionMmaDecodeQF16Scratch(numHeads, headDim);
+                EnsureAttentionGqaSplitScratch(numHeads, headDim, mmaKvSplit);
+                _kernels.LaunchConvertF32ToF16(q, _attnMmaDecodeQF16, numHeads * headDim, streamH);
+                if (fusedKvqDecode)
+                {
+                    _mmaDecodeGqaSplit.RunKvq(_attnMmaDecodeQF16, _kQuant![slot], _vQuant![slot],
+                        _kvKeyDType, _kvValueDType, attnOut,
+                        seqKv, numHeads, numKvHeads, mmaKvSplit,
+                        _attnGqaSplitPartialMax, _attnGqaSplitPartialSum, _attnGqaSplitPartialOut, streamH);
+                    DebugFusedKvqAttentionCallsForTest++;
+                }
+                else
+                {
+                    _mmaDecodeGqaSplit.Run(_attnMmaDecodeQF16, kF16, vF16, attnOut,
+                        seqKv, numHeads, numKvHeads, mmaKvSplit,
+                        _attnGqaSplitPartialMax, _attnGqaSplitPartialSum, _attnGqaSplitPartialOut, streamH);
+                }
+            }
+            else if (useGqaSplitAttn)
+            {
+                int kvSplit = CudaKernels.ComputeAttentionKvSplit(seqKv, numKvHeads, gqaMaxSafeSplit);
+                EnsureAttentionGqaSplitScratch(numHeads, headDim, gqaMaxSafeSplit);
+                _kernels.LaunchAttentionF32GqaSplit(q, kStage, vStage, attnOut,
+                    seqKv, numHeads, numKvHeads, headDim,
+                    positionOffset: positionOffset, slidingWindow: 0, kvSplit,
+                    _attnGqaSplitPartialMax, _attnGqaSplitPartialSum, _attnGqaSplitPartialOut, streamH);
+            }
+            else if (useSplitKvAttn)
+            {
+                EnsureAttentionSplitKvScratch(numHeads, headDim);
+                _kernels.LaunchAttentionF32SplitKv(q, kStage, vStage, attnOut,
+                    seqKv, numHeads, numKvHeads, headDim,
+                    positionOffset: positionOffset, slidingWindow: 0,
+                    _attnSplitKvPartialMax, _attnSplitKvPartialSum, _attnSplitKvPartialOut, streamH);
+            }
+            else
+            {
+                _kernels.LaunchAttentionF32(q, kStage, vStage, attnOut,
+                    seqLen, seqKv, numHeads, numKvHeads, headDim,
+                    positionOffset: positionOffset, slidingWindow: 0, streamH);
+            }
+        }
+        else
+        {
+            _kernels.LaunchAttentionF32(q, k, v, attnOut,
+                seqLen, seqLen, numHeads, numKvHeads, headDim,
+                positionOffset: 0, slidingWindow: 0, streamH);
+        }
+        DumpDevice2D($"blk.{layer}.fa_attnout_pregate", attnOut, seqLen, qElems);
+        ProfMark("attn-6c-core");
+
+        // ── 7. attnOut *= sigmoid(gate). ──
+        if (_kernels.HasElementwiseF32)
+        {
+            _kernels.LaunchSigmoidMulF32(attnOut, gate, (long)seqLen * qElems, streamH);
+        }
+        else
+        {
+            LaunchSigmoidMulHostFallback(attnOut, gate, (long)seqLen * qElems);
+        }
+        DumpDevice2D($"blk.{layer}.fa_attnout_postgate", attnOut, seqLen, qElems);
+        ProfMark("attn-7-gate");
+
+        // ── 8. Output projection (attn_output is folded) ──
+        nint oIn = attnOut;
+        if (_hadamard is { } oRot)
+        {
+            oIn = _state.HadamardScratch;
+            oRot.RotateForward(attnOut, oIn, seqLen, attn.OInputDim,
+                permuteGdnValueHeads: false, streamH);
+        }
+        Gemm(attn.ODevice, attn.OQt, oIn, _state.NormOutput,
+             attn.OOutputDim, attn.OInputDim, seqLen);
+        ProfMark("attn-8-outproj");
+    }
+
+    /// <summary>
+    /// Debug helper: D2H-copy a contiguous F32 device buffer and forward it to TensorDump.
+    /// Compiled away to a single env-var check when DOTLLM_TENSOR_DUMP is unset.
+    /// </summary>
+    private void DumpDevice2D(string name, nint devPtr, int d0, int d1)
+    {
+        if (!DotLLM.Models.Architectures.TensorDump.Enabled) return;
+        long n = (long)d0 * d1;
+        if (n <= 0) return;
+        _stream.Synchronize();
+        float[] host = new float[n];
+        fixed (float* pHost = host)
+        {
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)pHost, devPtr, (nuint)(n * sizeof(float))).ThrowOnError();
+            DotLLM.Models.Architectures.TensorDump.Dump2D(name, pHost, d0, d1);
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    //  Per-attention-layer F16 KV cache (model-private) — verbatim.
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// <remarks>
+    /// Growth keeps the live rows <c>[0, _f16CacheCurrentLength)</c> (issue #1025): a recurrent-prefix hit grows its
+    /// handle (<see cref="CudaHybridKvCacheHandle.TryGrowTo"/>) rather than re-prefilling, and the prefix it reuses
+    /// lives in this storage. A new handle has already reset the live length to 0 (see <c>_lastForwardKvCache</c>),
+    /// so nothing is copied for an unrelated sequence, and the old storage is freed before the new one is allocated, as
+    /// before. Only a copy makes old and new storage coexist briefly.
+    /// </remarks>
+    private void EnsureF16KvCache(int maxSeqLen, int numKvHeads, int headDim)
+    {
+        if (_f16KCache is not null && maxSeqLen <= _f16CacheMaxSeqLen) return;
+
+        int kvElems = numKvHeads * headDim;
+        if ((IsQuantKv(_kvKeyDType) || IsQuantKv(_kvValueDType)) && kvElems % 32 != 0)
+            throw new NotSupportedException(
+                $"Quantized KV storage needs numKvHeads*headDim ({kvElems}) to be a multiple of 32.");
+
+        if (_kvVirtualMemory is not null)
+        {
+            GrowKvStorageInPlace(maxSeqLen, kvElems);
+            return;
+        }
+
+        int keepRows = _f16KCache is null ? 0 : Math.Min(_f16CacheCurrentLength, _f16CacheMaxSeqLen);
+        if (keepRows == 0)
+        {
+            // Nothing to keep: free first, so peak VRAM is the new size alone. A failure below then leaves no storage
+            // at all (_f16KCache null), which the next call simply allocates.
+            FreeKvStorage();
+            _f16CacheMaxSeqLen = 0;
+            _f16CacheCurrentLength = 0;
+        }
+
+        // Allocate into locals and publish only once every buffer exists (PR #1026 review). An OOM partway through used to
+        // leave half-zero arrays in the fields and leak the old storage, and the retry then "kept" rows copied out of
+        // buffers that were never filled. Now a failure frees what it allocated, and the old storage stays valid.
+        // Issue #1068: a fresh (miss-path) allocation had no admission at all, so a long agent prompt plus its max_tokens
+        // grew the KV straight into shared memory. After the free-first release above, free includes the old storage.
+        AdmitDeviceGrowth(ComputeKvBytes(maxSeqLen), $"KV cache ({KvStorageLabel}) for {maxSeqLen} tokens");
+
+        var newK = new nint[_attentionLayerCount];
+        var newV = new nint[_attentionLayerCount];
+        var newKQ = new nint[_attentionLayerCount];
+        var newVQ = new nint[_attentionLayerCount];
+        long f16Bytes = (long)maxSeqLen * kvElems * sizeof(ushort);
+        long kBytes = (long)maxSeqLen * QuantRowBytes(_kvKeyDType, kvElems);
+        long vBytes = (long)maxSeqLen * QuantRowBytes(_kvValueDType, kvElems);
+        try
+        {
+            for (int i = 0; i < _attentionLayerCount; i++)
+            {
+                if (IsQuantKv(_kvKeyDType)) newKQ[i] = AllocKvDevice(kBytes);
+                else newK[i] = AllocKvDevice(f16Bytes);
+                if (IsQuantKv(_kvValueDType)) newVQ[i] = AllocKvDevice(vBytes);
+                else newV[i] = AllocKvDevice(f16Bytes);
+            }
+            if (keepRows > 0)
+            {
+                long f16Row = (long)kvElems * sizeof(ushort);
+                long kRow = QuantRowBytes(_kvKeyDType, kvElems);
+                long vRow = QuantRowBytes(_kvValueDType, kvElems);
+                nint streamH = _stream.Handle;
+                for (int i = 0; i < _attentionLayerCount; i++)
+                {
+                    CopyRows(_f16KCache![i], newK[i], keepRows * f16Row, streamH);
+                    CopyRows(_f16VCache![i], newV[i], keepRows * f16Row, streamH);
+                    CopyRows(_kQuant![i], newKQ[i], keepRows * kRow, streamH);
+                    CopyRows(_vQuant![i], newVQ[i], keepRows * vRow, streamH);
+                }
+                _stream.Synchronize();   // the old buffers are freed below
+            }
+        }
+        catch
+        {
+            if (keepRows > 0)
+            {
+                try { _stream.Synchronize(); }   // no copy may still be reading or writing what is freed next
+                catch { /* a faulted stream: free regardless */ }
+            }
+            FreeKvStorage(newK, newV, newKQ, newVQ);
+            throw;
+        }
+
+        FreeKvStorage();   // the old storage (already null when nothing was kept)
+        _f16KCache = newK;
+        _f16VCache = newV;
+        _kQuant = newKQ;
+        _vQuant = newVQ;
+        _f16CacheMaxSeqLen = maxSeqLen;
+        _f16CacheCurrentLength = keepRows;
+        _spillMonitor.Check($"KV cache ({KvStorageLabel}) grown to {maxSeqLen} tokens");
+
+        static void CopyRows(nint src, nint dst, long bytes, nint stream)
+        {
+            if (src != 0 && dst != 0 && bytes > 0)
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(dst, src, (nuint)bytes, stream).ThrowOnError();
+        }
+    }
+
+    /// <summary>
+    /// Grows the KV storage to <paramref name="maxSeqLen"/> tokens in place (issue #1080): every slot's K and V buffer maps the
+    /// added pages behind its existing rows, so the live rows <c>[0, _f16CacheCurrentLength)</c> stay put and peak VRAM is the
+    /// new size alone. The address ranges are reserved for the context window on first use; a request past it moves the same
+    /// physical pages to a larger range, still without copying. A failure (an admission refusal or an allocation error) leaves
+    /// the storage valid at its old length: buffers that did grow keep their extra pages for the next attempt.
+    /// </summary>
+    private void GrowKvStorageInPlace(int maxSeqLen, int kvElems)
+    {
+        ICudaVirtualMemory vm = _kvVirtualMemory!;
+        AdmitDeviceGrowth(KvStorageGrowthBytes(maxSeqLen), $"KV cache ({KvStorageLabel}) for {maxSeqLen} tokens");
+
+        long kRow = QuantRowBytes(_kvKeyDType, kvElems);
+        long vRow = QuantRowBytes(_kvValueDType, kvElems);
+        if (_kvGrowK is null || _kvGrowV is null)
+        {
+            // Reserving address space costs no memory, so cover the whole window: later growths then never move the pointers.
+            long reserveTokens = Math.Max(maxSeqLen, Config.MaxSequenceLength);
+            var newK = new CudaGrowableDeviceBuffer[_attentionLayerCount];
+            var newV = new CudaGrowableDeviceBuffer[_attentionLayerCount];
+            try
+            {
+                for (int i = 0; i < _attentionLayerCount; i++)
+                {
+                    newK[i] = new CudaGrowableDeviceBuffer(vm, reserveTokens * kRow);
+                    newV[i] = new CudaGrowableDeviceBuffer(vm, reserveTokens * vRow);
+                }
+            }
+            catch
+            {
+                DisposeAll(newK);
+                DisposeAll(newV);
+                throw;
+            }
+            _kvGrowK = newK;
+            _kvGrowV = newV;
+            _f16KCache = new nint[_attentionLayerCount];
+            _f16VCache = new nint[_attentionLayerCount];
+            _kQuant = new nint[_attentionLayerCount];
+            _vQuant = new nint[_attentionLayerCount];
+            _f16CacheMaxSeqLen = 0;
+            _f16CacheCurrentLength = 0;
+        }
+
+        // Kernels in flight may still address the old ranges if a growth past the reservation moves them.
+        _stream.Synchronize();
+        try
+        {
+            for (int i = 0; i < _attentionLayerCount; i++)
+            {
+                CountKvAllocation();
+                _kvGrowK[i].EnsureCapacity(maxSeqLen * kRow);
+                CountKvAllocation();
+                _kvGrowV[i].EnsureCapacity(maxSeqLen * vRow);
+            }
+        }
+        finally
+        {
+            PublishKvPointers();
+        }
+
+        _f16CacheMaxSeqLen = maxSeqLen;
+        _spillMonitor.Check($"KV cache ({KvStorageLabel}) grown in place to {maxSeqLen} tokens");
+
+        static void DisposeAll(CudaGrowableDeviceBuffer?[] buffers)
+        {
+            foreach (var b in buffers) b?.Dispose();
+        }
+    }
+
+    /// <summary>Points the per-slot K/V arrays at the growable buffers: each side is quantized or F16, and the other array holds 0.</summary>
+    private void PublishKvPointers()
+    {
+        bool kq = IsQuantKv(_kvKeyDType), vq = IsQuantKv(_kvValueDType);
+        for (int i = 0; i < _attentionLayerCount; i++)
+        {
+            nint k = _kvGrowK![i].Pointer, v = _kvGrowV![i].Pointer;
+            _kQuant![i] = kq ? k : 0;
+            _f16KCache![i] = kq ? 0 : k;
+            _vQuant![i] = vq ? v : 0;
+            _f16VCache![i] = vq ? 0 : v;
+        }
+    }
+
+    /// <summary>Frees the per-slot KV storage (F16 and quantized) and the shared dequant scratch.</summary>
+    private void FreeKvStorage()
+    {
+        if (_kvGrowK is not null || _kvGrowV is not null)
+        {
+            // Unmapping is not ordered on the stream: nothing may still be reading or writing these ranges.
+            _stream.Synchronize();
+            foreach (var b in _kvGrowK ?? []) b?.Dispose();
+            foreach (var b in _kvGrowV ?? []) b?.Dispose();
+            _kvGrowK = null;
+            _kvGrowV = null;
+            _f16KCache = null;
+            _f16VCache = null;
+            _kQuant = null;
+            _vQuant = null;
+            return;
+        }
+        FreeKvStorage(_f16KCache, _f16VCache, _kQuant, _vQuant);
+        _f16KCache = null;
+        _f16VCache = null;
+        _kQuant = null;
+        _vQuant = null;
+    }
+
+    private static void FreeKvStorage(nint[]? k, nint[]? v, nint[]? kq, nint[]? vq)
+    {
+        FreeAll(k);
+        FreeAll(v);
+        FreeAll(kq);
+        FreeAll(vq);
+
+        static void FreeAll(nint[]? buffers)
+        {
+            if (buffers is null) return;
+            foreach (nint p in buffers)
+                if (p != 0) CudaDriverApi.cuMemFree_v2(p);
+        }
+    }
+
+    /// <summary>
+    /// Ensures the shared F16 dequant scratch pair holds <c>seqKv * kvElems</c> halves each
+    /// (1024-token growth steps; content is never preserved -- every use re-dequantizes).
+    /// </summary>
+    private void EnsureKvF16Scratch(int seqKv, int kvElems)
+    {
+        long needed = (long)seqKv * kvElems;
+        if (needed <= _kvF16ScratchElems) return;
+
+        const int GrowTokens = 1024;
+        long grown = ((long)seqKv + GrowTokens - 1) / GrowTokens * GrowTokens * kvElems;
+        FreeIfNonZero(ref _kvF16ScratchK);
+        FreeIfNonZero(ref _kvF16ScratchV);
+        _kvF16ScratchElems = 0;
+        int sides = (IsQuantKv(_kvKeyDType) ? 1 : 0) + (IsQuantKv(_kvValueDType) ? 1 : 0);
+        AdmitDeviceGrowth(sides * grown * sizeof(ushort), $"F16 dequant scratch for {seqKv} tokens of quantized KV history");
+        if (IsQuantKv(_kvKeyDType)) _kvF16ScratchK = AllocDevice(grown * sizeof(ushort));
+        if (IsQuantKv(_kvValueDType)) _kvF16ScratchV = AllocDevice(grown * sizeof(ushort));
+        _kvF16ScratchElems = grown;
+    }
+
+    /// <summary>
+    /// Device pointer to a contiguous F16 <c>[seqKv, numKvHeads, headDim]</c> view of the K (or V)
+    /// history for <paramref name="slot"/>: the persistent F16 cache when unquantized, otherwise the
+    /// shared scratch just filled by a dequantize of rows <c>[0, seqKv)</c>.
+    /// </summary>
+    private nint ResolveKvF16(int slot, bool isKey, int seqKv, int kvElems, nint stream)
+    {
+        KvCacheDType dt = isKey ? _kvKeyDType : _kvValueDType;
+        if (!IsQuantKv(dt))
+            return isKey ? _f16KCache![slot] : _f16VCache![slot];
+
+        EnsureKvF16Scratch(seqKv, kvElems);
+        nint scratch = isKey ? _kvF16ScratchK : _kvF16ScratchV;
+        nint quant = isKey ? _kQuant![slot] : _vQuant![slot];
+        _kernels.LaunchKvDequantToF16(quant, dt, scratch, seqKv * kvElems, stream);
+        DebugKvDequantCallsForTest++;
+        return scratch;
+    }
+
+    /// <summary>True when <paramref name="positions"/> are consecutive (each one more than the last).</summary>
+    private static bool IsContiguous(ReadOnlySpan<int> positions)
+    {
+        for (int i = 1; i < positions.Length; i++)
+            if (positions[i] != positions[i - 1] + 1) return false;
+        return true;
+    }
+
+    private void EnsureF16KvWriteStaging(int seqLen, int kvElems)
+    {
+        long needed = (long)seqLen * kvElems;
+        if (needed <= _f16KvWriteStagingElems) return;
+
+        long grown = _f16KvWriteStagingElems == 0 ? 256L : _f16KvWriteStagingElems;
+        while (grown < needed) grown *= 2;
+
+        FreeIfNonZero(ref _f16KvWriteStaging);
+        _f16KvWriteStaging = AllocDevice(grown * sizeof(ushort));
+        _f16KvWriteStagingElems = grown;
+    }
+
+    /// <summary>
+    /// Ensures the shared F32 K/V staging pair can hold <c>seqKv * kvElems</c> floats each,
+    /// growing in 1024-token steps (not power-of-two: at 64k a doubling overshoot would cost
+    /// gigabytes). Content is never preserved across a grow -- every use fully reconverts.
+    /// </summary>
+    private void EnsureF32KvStaging(int seqKv, int kvElems)
+    {
+        long needed = (long)seqKv * kvElems;
+        if (needed <= _f32KvStageElems) return;
+
+        const int GrowTokens = 1024;
+        long grownTokens = ((long)seqKv + GrowTokens - 1) / GrowTokens * GrowTokens;
+        long grown = grownTokens * kvElems;
+
+        FreeIfNonZero(ref _f32KvStageK);
+        FreeIfNonZero(ref _f32KvStageV);
+        _f32KvStageElems = 0;
+        AdmitDeviceGrowth(2 * grown * sizeof(float), $"F32 attention staging for {seqKv} tokens of KV history");
+        _f32KvStageK = AllocDevice(grown * sizeof(float));
+        _f32KvStageV = AllocDevice(grown * sizeof(float));
+        _f32KvStageElems = grown;
+    }
+
+
+    /// <summary>
+    /// Ensures the opt-in split-KV attention (issue #183) partial scratch buffers can hold
+    /// <c>numHeads * AttentionKvSplit</c> (max, sum) scalars and
+    /// <c>numHeads * AttentionKvSplit * headDim</c> output floats. Sized once for the model's
+    /// fixed (numHeads, headDim) shape (both are load-time constants for a given GGUF) — the
+    /// "grown" check is a defensive no-op in practice, not a hot-path realloc.
+    /// </summary>
+    private void EnsureAttentionSplitKvScratch(int numHeads, int headDim)
+    {
+        long neededHeads = numHeads;
+        if (neededHeads <= _attnSplitKvPartialHeadsAllocated) return;
+
+        FreeIfNonZero(ref _attnSplitKvPartialMax);
+        FreeIfNonZero(ref _attnSplitKvPartialSum);
+        FreeIfNonZero(ref _attnSplitKvPartialOut);
+
+        long scalarCount = neededHeads * CudaKernels.AttentionKvSplit;
+        long outCount = scalarCount * headDim;
+        _attnSplitKvPartialMax = AllocDevice(scalarCount * sizeof(float));
+        _attnSplitKvPartialSum = AllocDevice(scalarCount * sizeof(float));
+        _attnSplitKvPartialOut = AllocDevice(outCount * sizeof(float));
+        _attnSplitKvPartialHeadsAllocated = neededHeads;
+    }
+
+    /// <summary>
+    /// Ensures the opt-in combined GQA-group + split-KV attention (issues #197 + #198) partial
+    /// scratch buffers can hold <c>numHeads * maxSplit</c> (max, sum) scalars and
+    /// <c>numHeads * maxSplit * headDim</c> output floats. Sized against <paramref name="maxSplit"/>
+    /// (the real co-residency CEILING from <see cref="CudaKernels.MaxSafeAttentionGqaSplit"/>),
+    /// not the per-call <c>kvSplit</c> value the heuristic picks each step -- (numHeads, headDim,
+    /// maxSplit) are all load-time constants for a given GGUF+GPU pair, so this is sized once and
+    /// reused for every decode step even though the per-call split varies with seqKv. Mirrors
+    /// <see cref="EnsureAttentionSplitKvScratch"/> exactly, generalized for a variable ceiling.
+    /// </summary>
+    private void EnsureAttentionGqaSplitScratch(int numHeads, int headDim, int maxSplit)
+    {
+        long neededHeads = numHeads;
+        if (neededHeads <= _attnGqaSplitPartialHeadsAllocated && maxSplit <= _attnGqaSplitMaxSplitAllocated) return;
+
+        FreeIfNonZero(ref _attnGqaSplitPartialMax);
+        FreeIfNonZero(ref _attnGqaSplitPartialSum);
+        FreeIfNonZero(ref _attnGqaSplitPartialOut);
+
+        long scalarCount = neededHeads * maxSplit;
+        long outCount = scalarCount * headDim;
+        _attnGqaSplitPartialMax = AllocDevice(scalarCount * sizeof(float));
+        _attnGqaSplitPartialSum = AllocDevice(scalarCount * sizeof(float));
+        _attnGqaSplitPartialOut = AllocDevice(outCount * sizeof(float));
+        _attnGqaSplitPartialHeadsAllocated = neededHeads;
+        _attnGqaSplitMaxSplitAllocated = maxSplit;
+    }
+
+    /// <summary>FP16 Q scratch for the composed tensor-core decode kernel (issue #199 v2) --
+    /// <see cref="CudaKernels.LaunchAttentionMmaDecodeGqaSplit"/> requires FP16 Q, but this
+    /// model's projected Q (<c>_state.QScratch</c>) is F32 like every other attention tier
+    /// here, so it needs its own one-shot conversion immediately before that launch.</summary>
+    private void EnsureAttentionMmaDecodeQF16Scratch(int numHeads, int headDim, int rows = 1)
+    {
+        long needed = (long)rows * numHeads * headDim;
+        if (needed <= _attnMmaDecodeQF16ElemsAllocated) return;
+
+        FreeIfNonZero(ref _attnMmaDecodeQF16);
+        _attnMmaDecodeQF16 = AllocDevice(needed * sizeof(ushort));
+        _attnMmaDecodeQF16ElemsAllocated = needed;
+    }
+
+    private void WriteF16KvRows(int layerSlot, nint kSrcF32, nint vSrcF32,
+                                 ReadOnlySpan<int> positions, int numKvHeads, int headDim)
+    {
+        nint streamH = _stream.Handle;
+        int seqLen = positions.Length;
+        int kvElems = numKvHeads * headDim;
+        long rowBytes = (long)kvElems * sizeof(ushort);
+        int totalElems = seqLen * kvElems;
+
+        bool contiguous = seqLen > 0;
+        for (int i = 0; i < seqLen; i++)
+        {
+            int p = positions[i];
+            if ((uint)p >= (uint)_f16CacheMaxSeqLen)
+                throw new ArgumentOutOfRangeException(nameof(positions),
+                    $"Position {p} at index {i} exceeds F16 KV cache capacity {_f16CacheMaxSeqLen}.");
+            if (i > 0 && positions[i] != positions[i - 1] + 1) contiguous = false;
+        }
+
+        EnsureF16KvWriteStaging(seqLen, kvElems);
+        nint stagingF16 = _f16KvWriteStaging;
+
+        _kernels.LaunchConvertF32ToF16(kSrcF32, stagingF16, totalElems, streamH);
+        StoreKvRows(stagingF16, _f16KCache![layerSlot], _kQuant![layerSlot], _kvKeyDType,
+                    positions, contiguous, kvElems, rowBytes, streamH);
+
+        _kernels.LaunchConvertF32ToF16(vSrcF32, stagingF16, totalElems, streamH);
+        StoreKvRows(stagingF16, _f16VCache![layerSlot], _vQuant![layerSlot], _kvValueDType,
+                    positions, contiguous, kvElems, rowBytes, streamH);
+
+        _f16CacheCurrentLength = HybridKvLengthBookkeeping.LengthAfterWrite(_f16CacheCurrentLength, positions);
+    }
+
+    /// <summary>
+    /// Stores <paramref name="positions"/>.Length F16 rows from <paramref name="stagingF16"/> into
+    /// either the persistent F16 cache or the quantized buffer (issue #956 Phase 2).
+    /// </summary>
+    private void StoreKvRows(nint stagingF16, nint f16Base, nint quantBase, KvCacheDType dtype,
+                             ReadOnlySpan<int> positions, bool contiguous, int kvElems, long f16RowBytes,
+                             nint streamH)
+    {
+        int seqLen = positions.Length;
+        if (IsQuantKv(dtype))
+        {
+            long qRow = QuantRowBytes(dtype, kvElems);
+            if (contiguous)
+            {
+                _kernels.LaunchQuantKv(stagingF16, quantBase + (nint)((long)positions[0] * qRow),
+                    seqLen * kvElems, dtype, streamH);
+            }
+            else
+            {
+                for (int i = 0; i < seqLen; i++)
+                    _kernels.LaunchQuantKv(stagingF16 + (nint)((long)i * f16RowBytes),
+                        quantBase + (nint)((long)positions[i] * qRow), kvElems, dtype, streamH);
+            }
+            return;
+        }
+
+        if (contiguous && seqLen > 1)
+        {
+            nint dst = f16Base + (nint)((long)positions[0] * f16RowBytes);
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(dst, stagingF16, (nuint)((long)seqLen * f16RowBytes), streamH).ThrowOnError();
+        }
+        else
+        {
+            for (int i = 0; i < seqLen; i++)
+            {
+                nint dst = f16Base + (nint)((long)positions[i] * f16RowBytes);
+                nint src = stagingF16 + (nint)((long)i * f16RowBytes);
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(dst, src, (nuint)f16RowBytes, streamH).ThrowOnError();
+            }
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    //  Dense SwiGLU FFN body (replaces CudaQwen3MoeHybridTransformerModel's
+    //  ForwardMoeBody).
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Dense SwiGLU FFN forward. Reads pre-normed activations from
+    /// <see cref="CudaQwen3HybridDenseForwardState.NormOutput"/> and writes the FFN output
+    /// back to the same buffer. Entirely on-device — no host round-trip.
+    /// </summary>
+    private void ForwardDenseFfnBody(in DeviceLayer lw, int seqLen, int hiddenSize)
+    {
+        nint streamH = _stream.Handle;
+        nint normOut = _state.NormOutput;
+        nint ffnGate = _state.FfnGate;
+        nint ffnUp = _state.FfnUp;
+        nint siluOut = _state.SiluOutput;
+
+        ProfStart();
+        // PrismML Hadamard fold: ffn_gate and ffn_up are folded and share one rotated input.
+        nint ffnIn = normOut;
+        if (_hadamard is { } ffnRot)
+        {
+            ffnIn = _state.HadamardScratch;
+            ffnRot.RotateForward(normOut, ffnIn, seqLen, lw.GateInputDim,
+                permuteGdnValueHeads: false, streamH);
+        }
+        if (!TryFusedPQ2_0Gemm2(lw.GateWeight, lw.GateQt, lw.UpWeight, lw.UpQt,
+                ffnIn, ffnGate, ffnUp, lw.GateOutputDim, lw.UpOutputDim,
+                lw.GateInputDim, lw.UpInputDim, seqLen))
+        {
+            Gemm(lw.GateWeight, lw.GateQt, ffnIn, ffnGate, lw.GateOutputDim, lw.GateInputDim, seqLen);
+            Gemm(lw.UpWeight, lw.UpQt, ffnIn, ffnUp, lw.UpOutputDim, lw.UpInputDim, seqLen);
+        }
+        ProfMark("ffn-1-gateup");
+        _kernels.LaunchSwiGLUF32(ffnGate, ffnUp, siluOut, _intermediateSize, seqLen, streamH);
+        ProfMark("ffn-2-swiglu");
+        // ffn_down is folded: rotate the SwiGLU output before the down projection.
+        nint downIn = siluOut;
+        if (_hadamard is { } downRot)
+        {
+            downIn = _state.HadamardScratch;
+            downRot.RotateForward(siluOut, downIn, seqLen, lw.DownInputDim,
+                permuteGdnValueHeads: false, streamH);
+        }
+        Gemm(lw.DownWeight, lw.DownQt, downIn, normOut, lw.DownOutputDim, lw.DownInputDim, seqLen);
+        ProfMark("ffn-3-down");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    //  Gemm dispatcher — quantised-direct GEMV (decode) / HGEMM-after-F16-dequant (prefill)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Per-layer F32-in / F32-out projection dispatcher. Adapted from
+    /// <see cref="CudaQwen3MoeHybridTransformerModel.Gemm"/> with explicit I2_S / PQ2_0
+    /// branches added — Bonsai-27B ships PQ2_0 ternary weights end-to-end (GDN projections,
+    /// attention projections, and the dense FFN), so the ternary GEMV/dequant kernels must
+    /// be reachable from every call site. The MoE hybrid's Gemm lacks these branches; that
+    /// is a pre-existing, separate gap (tracked, not fixed here — out of scope for this
+    /// dense-architecture addition).
+    /// </summary>
+    /// <remarks>
+    /// #485: <c>xQuantized</c> means the caller has already run <see cref="QuantizeDp4aInput"/> on
+    /// exactly this <c>x</c>/<c>k</c>/<c>seqLen</c> (one activation feeding several projections), so
+    /// the dp4a path skips its own quantize launch. Only meaningful when <see cref="Dp4aActive"/> is
+    /// true for <c>qt</c>; ignored otherwise.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void Gemm(nint weight, QuantizationType qt, nint x, nint y, int m, int k, int seqLen,
+        bool xQuantized = false)
+    {
+        nint streamH = _stream.Handle;
+
+        if (qt == QuantizationType.F32)
+        {
+            CudaGemm.LinearF32(_cublas.Handle, x, weight, y, seqLen, k, m, streamH);
+            return;
+        }
+
+        // #485 (default on): int8 activations + dp4a for 1..8 token rows.
+        // #490 (opt-in, DOTLLM_CUDA_PQ2_0_MMQ=1): the same W2A8 numerics, tiled, for every wider
+        // projection — prefill and perplexity's whole-window forward — instead of dequantizing the
+        // matrix to F16 for cuBLAS below.
+        if (Dp4aActive(qt, seqLen) || Pq2_0MmqActive(qt, seqLen))
+        {
+            if (xQuantized) AssertDp4aQuantizedFor(x, k, seqLen);
+            else QuantizeDp4aInput(x, k, seqLen);
+            LaunchPq2_0Quantized(weight, y, m, k, seqLen, streamH);
+            return;
+        }
+
+        // #482: 2..8 token rows (an MTP / speculative verify, a short prefill) read the packed PQ2_0
+        // weights once for all rows instead of dequantizing the whole matrix to F16 for cuBLAS below.
+        if (qt == QuantizationType.PQ2_0 && CudaSmallSGemvDispatch.Covers(seqLen)
+            && TryPQ2_0GemvMulti(weight, x, y, m, k, seqLen, streamH))
+            return;
+
+        if (seqLen == 1)
+        {
+            if (qt == QuantizationType.Q8_0)
+            {
+                _kernels.LaunchQuantizedGemvF32In(weight, x, y, m, k, streamH);
+                return;
+            }
+
+            if (qt == QuantizationType.I2_S)
+            {
+                EnsureActivF16InScratch(k);
+                EnsureActivF16OutScratch(m);
+                _kernels.LaunchConvertF32ToF16(x, _activF16InScratch, k, streamH);
+                _kernels.LaunchI2_SGemvF16In(weight, _activF16InScratch, _activF16OutScratch, m, k, streamH);
+                _kernels.LaunchConvertF16ToF32(_activF16OutScratch, y, m, streamH);
+                return;
+            }
+
+            if (qt == QuantizationType.PQ2_0)
+            {
+                // F32-native GEMV (#161) — converts F32<->F16 inline in the kernel's own
+                // vectorized stage/store steps, so no surrounding LaunchConvertF32ToF16/
+                // LaunchConvertF16ToF32 launches or _activF16InScratch/_activF16OutScratch
+                // round-trip are needed here (unlike the I2_S branch above, still on the old
+                // convert-launch-bracketed path — see native/kernels/pq2_0_gemv.cu's
+                // "F32-native activations" file-header section for the full rationale and the
+                // note on why I2_S wasn't also converted in this pass).
+                _kernels.LaunchPQ2_0GemvF32Native(weight, x, y, m, k, streamH);
+                return;
+            }
+
+            if (qt == QuantizationType.F16
+                || _kernels.HasMmq(qt)
+                || _kernels.HasQuantizedGemvKernel(qt))
+            {
+                EnsureActivF16InScratch(k);
+                EnsureActivF16OutScratch(m);
+                _kernels.LaunchConvertF32ToF16(x, _activF16InScratch, k, streamH);
+
+                if (qt == QuantizationType.F16)
+                {
+                    CudaGemm.GemvF16(_cublas.Handle, weight, _activF16InScratch,
+                        _activF16OutScratch, m, k, streamH);
+                }
+                else if (_kernels.HasMmq(qt) && !CudaKernels.ForceDirectGemv)
+                {
+                    _kernels.LaunchQuantizedGemvMmq(weight, qt,
+                        _activF16InScratch, _activF16OutScratch, m, k, preqScratch: 0, streamH);
+                }
+                else
+                {
+                    _kernels.LaunchQuantizedGemv(weight, qt,
+                        _activF16InScratch, _activF16OutScratch, m, k, streamH);
+                }
+
+                _kernels.LaunchConvertF16ToF32(_activF16OutScratch, y, m, streamH);
+                return;
+            }
+        }
+
+        // ── Prefill (seqLen > 1) and decode fallback ──
+        long totalElems = (long)m * k;
+        int totalElemsI = checked((int)totalElems);
+        int activInElems = checked((int)((long)seqLen * k));
+        int activOutElems = checked((int)((long)seqLen * m));
+        EnsureActivF16InScratch(activInElems);
+        EnsureActivF16OutScratch(activOutElems);
+        EnsureDequantScratchF16Weight(totalElems);   // #495: demand-sized, grow-only
+
+        if (qt == QuantizationType.I2_S)
+            _kernels.LaunchDequantI2_SToF16(weight, _dequantScratchF16Weight, m, k, streamH);
+        else if (qt == QuantizationType.PQ2_0)
+            _kernels.LaunchDequantPQ2_0ToF16(weight, _dequantScratchF16Weight, m, k, streamH);
+        else
+            _kernels.LaunchDequantToF16(weight, qt, _dequantScratchF16Weight, totalElemsI, streamH);
+
+        _kernels.LaunchConvertF32ToF16(x, _activF16InScratch, activInElems, streamH);
+        CudaGemm.LinearF16(_cublas.Handle, _activF16InScratch, _dequantScratchF16Weight,
+            _activF16OutScratch, seqLen, k, m, streamH);
+        _kernels.LaunchConvertF16ToF32(_activF16OutScratch, y, activOutElems, streamH);
+    }
+
+    /// <summary>
+    /// The LM head over <paramref name="seqLen"/> rows (issue #1099). Wider than the small-row tiers,
+    /// <see cref="Gemm"/> would dequantize the whole <c>[vocab, hidden]</c> head to F16 — 2.5 GiB on
+    /// Bonsai 2 27B, more than every layer projection together needs — so instead:
+    /// <list type="bullet">
+    ///   <item>PQ2_0 / I2_S: the rows run in chunks through the packed kernels <see cref="Gemm"/>
+    ///   already uses at that width (<see cref="LmHeadRowChunk"/>), reading the packed head once per
+    ///   chunk. Bit-identical per row to an un-chunked launch of the same kernel (the dp4a and
+    ///   multi-column GEMVs compute each column independently).</item>
+    ///   <item>Other quant types, which have no packed multi-row kernel here: dequant + cuBLAS in
+    ///   output-row tiles bounded by the scratch the layers already use
+    ///   (<see cref="CudaWideProjection"/>), with any growth admitted.</item>
+    /// </list>
+    /// </summary>
+    private void GemmLmHead(nint weight, QuantizationType qt, nint x, nint y, int m, int k, int seqLen)
+    {
+        if (seqLen == 1 || qt == QuantizationType.F32 || CudaWideProjection.BoundedLmHeadOverride == false)
+        {
+            Gemm(weight, qt, x, y, m, k, seqLen);
+            return;
+        }
+
+        if (qt is QuantizationType.PQ2_0 or QuantizationType.I2_S)
+        {
+            int chunk = LmHeadRowChunk(qt, seqLen);
+            if (seqLen <= chunk)
+            {
+                Gemm(weight, qt, x, y, m, k, seqLen);
+                return;
+            }
+            long xRowBytes = (long)k * sizeof(float), yRowBytes = (long)m * sizeof(float);
+            for (int r0 = 0; r0 < seqLen; r0 += chunk)
+            {
+                Gemm(weight, qt, x + (nint)(r0 * xRowBytes), y + (nint)(r0 * yRowBytes), m, k,
+                    Math.Min(chunk, seqLen - r0));
+                _lmHeadRowChunks++;
+            }
+            return;
+        }
+
+        long bound = Math.Max(_dequantScratchF16WeightElems, CudaWideProjection.TileFloorElems);
+        if ((long)m * k <= bound || !CudaWideProjection.SupportsRowTiles(qt))
+        {
+            Gemm(weight, qt, x, y, m, k, seqLen);   // fits the bound, or not tileable: admitted growth
+            return;
+        }
+
+        int tileRows = CudaWideProjection.TileRows(m, k, bound);
+        if (!_warnedLmHeadTiled)
+        {
+            _warnedLmHeadTiled = true;
+            Console.Error.WriteLine(
+                $"[dotLLM.Cuda] LM head ({qt}) has no packed multi-row kernel: {seqLen}-row logits dequantize it in " +
+                $"{(m + tileRows - 1) / tileRows} tiles of {(long)tileRows * k * sizeof(ushort) >> 20} MiB F16 " +
+                $"instead of one {(long)m * k * sizeof(ushort) >> 20} MiB copy (issue #1099).");
+        }
+        nint streamH = _stream.Handle;
+        int activInElems = checked(seqLen * k);
+        int activOutElems = checked(seqLen * m);
+        EnsureActivF16InScratch(activInElems);
+        EnsureActivF16OutScratch(activOutElems);
+        EnsureDequantScratchF16Weight((long)tileRows * k);
+        _kernels.LaunchConvertF32ToF16(x, _activF16InScratch, activInElems, streamH);
+        _lmHeadDequantTiles += CudaWideProjection.RunTiled(_kernels, _cublas.Handle, weight, qt,
+            _activF16InScratch, _activF16OutScratch, f32Out: false, m, k, seqLen,
+            _dequantScratchF16Weight, tileRows, streamH);
+        _kernels.LaunchConvertF16ToF32(_activF16OutScratch, y, activOutElems, streamH);
+    }
+
+    /// <summary>
+    /// Rows per LM-head chunk for a packed weight (issue #1099): the multi-row width when
+    /// <paramref name="seqLen"/> rows would take a packed multi-row kernel at that width (the dp4a
+    /// GEMV, or #482's F16-activation one), otherwise one row, which always has a packed path for
+    /// PQ2_0 / I2_S. Returns <paramref name="seqLen"/> when the opt-in #490 packed GEMM covers the
+    /// whole width, so the head is not chunked at all.
+    /// </summary>
+    private int LmHeadRowChunk(QuantizationType qt, int seqLen)
+    {
+        if (Pq2_0MmqActive(qt, seqLen)) return seqLen;
+        int cols = CudaSmallSGemvDispatch.MaxColumns;
+        if (qt == QuantizationType.PQ2_0 && cols >= 2
+            && (Dp4aActive(qt, cols) || (CudaSmallSGemvDispatch.Covers(cols) && _kernels.HasPQ2_0GemvMulti)))
+            return cols;
+        return 1;
+    }
+
+    /// <summary>
+    /// Test hook (issue #1099): LM-head row chunks and dequant tiles launched since the model was
+    /// created, so a test can prove an all-logits forward took the bounded route.
+    /// </summary>
+    internal (int RowChunks, int DequantTiles) LmHeadLaunchCounts => (_lmHeadRowChunks, _lmHeadDequantTiles);
+
+    /// <summary>
+    /// Multi-column PQ2_0 projection (issue #482): converts the <c>[seqLen, k]</c> F32 activations
+    /// to F16 in the shared staging scratch (the same rounding the single-column kernel applies when
+    /// it stages x) and runs one exact-width multi-column GEMV into <c>y[seqLen, m]</c>. Returns
+    /// <see langword="false"/> — after a one-time warning — when <c>pq2_0_gemv_multi.ptx</c> is not
+    /// loaded, so the caller keeps the old path.
+    /// </summary>
+    private bool TryPQ2_0GemvMulti(nint weight, nint x, nint y, int m, int k, int seqLen, nint streamH)
+    {
+        if (!_kernels.HasPQ2_0GemvMulti)
+        {
+            if (!_warnedNoPQ2_0GemvMulti)
+            {
+                _warnedNoPQ2_0GemvMulti = true;
+                Console.Error.WriteLine(
+                    "[dotLLM.Cuda] Multi-column PQ2_0 GEMV unavailable (" + _kernels.PQ2_0GemvMultiUnavailableReason +
+                    ") — 2..8-token PQ2_0 projections fall back to dequant+cuBLAS (MTP verify will be slow).");
+            }
+            return false;
+        }
+
+        int activInElems = checked(seqLen * k);
+        EnsureActivF16InScratch(activInElems);
+        _kernels.LaunchConvertF32ToF16(x, _activF16InScratch, activInElems, streamH);
+        _kernels.LaunchPQ2_0GemvMulti(weight, _activF16InScratch, y, m, k, seqLen, streamH);
+        return true;
+    }
+
+    /// <summary>
+    /// Whether a <paramref name="qt"/> projection over <paramref name="seqLen"/> rows takes the
+    /// int8-activation dp4a GEMV (issue #485): PQ2_0, the env/override on
+    /// (<see cref="CudaSmallSGemvDispatch.CoversDp4a"/>), and <c>pq2_0_gemv_dp4a.ptx</c> loaded. When
+    /// the switch is on but the PTX is missing or stale it warns once and returns
+    /// <see langword="false"/>, so the #482 / single-column kernels keep running.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool Dp4aActive(QuantizationType qt, int seqLen)
+    {
+        if (qt != QuantizationType.PQ2_0 || !CudaSmallSGemvDispatch.CoversDp4a(seqLen)) return false;
+        if (_kernels.HasPQ2_0GemvDp4a) return true;
+        if (!_warnedNoPQ2_0GemvDp4a)
+        {
+            _warnedNoPQ2_0GemvDp4a = true;
+            Console.Error.WriteLine(
+                "[dotLLM.Cuda] " + CudaSmallSGemvDispatch.Dp4aEnvVar + "=1 but the dp4a PQ2_0 GEMV is unavailable (" +
+                _kernels.PQ2_0GemvDp4aUnavailableReason + ") — keeping the F16-activation PQ2_0 kernels.");
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Whether a <paramref name="qt"/> projection over <paramref name="seqLen"/> rows takes the packed
+    /// dp4a prefill GEMM (issue #490): PQ2_0, a width the GEMV does not cover
+    /// (<see cref="CudaSmallSGemvDispatch.CoversMmq"/>), the env/override on, and BOTH
+    /// <c>pq2_0_mmq_dp4a.ptx</c> and <c>pq2_0_gemv_dp4a.ptx</c> (whose quantizer it reuses) loaded.
+    /// When the switch is on but either PTX is missing or stale it warns once and returns
+    /// <see langword="false"/>, so the dequant+cuBLAS prefill keeps running.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool Pq2_0MmqActive(QuantizationType qt, int seqLen)
+    {
+        if (qt != QuantizationType.PQ2_0 || !CudaSmallSGemvDispatch.CoversMmq(seqLen)) return false;
+        if (_kernels.HasPQ2_0MmqDp4a && _kernels.HasPQ2_0GemvDp4a) return true;
+        if (!_warnedNoPQ2_0Mmq)
+        {
+            _warnedNoPQ2_0Mmq = true;
+            Console.Error.WriteLine(
+                "[dotLLM.Cuda] " + CudaSmallSGemvDispatch.MmqEnvVar + "=1 but the packed PQ2_0 prefill GEMM is unavailable (" +
+                (_kernels.PQ2_0MmqDp4aUnavailableReason ?? _kernels.PQ2_0GemvDp4aUnavailableReason) +
+                ") — keeping dequant-to-F16 + cuBLAS for wide PQ2_0 projections.");
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Runs the PQ2_0 projection that matches <paramref name="seqLen"/> over the already-quantized
+    /// activation scratch: #485's exact-width GEMV at 1..8 rows, #490's tiled GEMM above.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void LaunchPq2_0Quantized(nint weight, nint y, int m, int k, int seqLen, nint streamH)
+    {
+        if (CudaSmallSGemvDispatch.CoversDp4a(seqLen) && seqLen <= CudaKernels.Pq2_0GemvMultiMaxColumns)
+        {
+            _kernels.LaunchPQ2_0GemvDp4a(weight, _activQ8InScratch, _activQ8MetaScratch, y, m, k, seqLen, streamH);
+            _dp4aGemvLaunches++;
+            return;
+        }
+        _kernels.LaunchPQ2_0MmqDp4a(weight, _activQ8InScratch, _activQ8MetaScratch, y, m, k, seqLen,
+            CudaSmallSGemvDispatch.MmqTileColumns(seqLen), streamH);
+        _pq2_0MmqLaunches++;
+    }
+
+    /// <summary>
+    /// Whether two projections reading the same input can share one dp4a activation quantization:
+    /// both take an int8-activation path (#485's GEMV or #490's GEMM) and have the same input width.
+    /// </summary>
+    private bool SharesDp4aInput(QuantizationType qtA, QuantizationType qtB, int kA, int kB, int seqLen)
+        => CudaSmallSGemvDispatch.ShareDp4aInputs && BothDp4a(qtA, qtB, kA, kB, seqLen);
+
+    /// <summary>
+    /// Whether both projections of a pair take an int8-activation path with the same input width.
+    /// Both sides see the same <paramref name="seqLen"/>, so they always pick the same kernel.
+    /// </summary>
+    private bool BothDp4a(QuantizationType qtA, QuantizationType qtB, int kA, int kB, int seqLen)
+        => kA == kB
+           && (Dp4aActive(qtA, seqLen) || Pq2_0MmqActive(qtA, seqLen))
+           && (Dp4aActive(qtB, seqLen) || Pq2_0MmqActive(qtB, seqLen));
+
+    /// <summary>
+    /// Test hook (issue #485): dp4a GEMV and quantizer launches since the last
+    /// <see cref="ResetDp4aLaunchCounts"/>, so a test can prove the same projections take the dp4a path
+    /// at every seqLen (coverage) and that input sharing removes quantize launches.
+    /// </summary>
+    internal (int Gemv, int Quantize) Dp4aLaunchCounts => (_dp4aGemvLaunches, _dp4aQuantizeLaunches);
+
+    /// <summary>
+    /// Test hook (issue #490): packed prefill GEMM launches since the last
+    /// <see cref="ResetDp4aLaunchCounts"/> — the control proving a wide forward actually took the new
+    /// kernel rather than dequant+cuBLAS.
+    /// </summary>
+    internal int Pq2_0MmqLaunchCount => _pq2_0MmqLaunches;
+
+    /// <summary>Resets <see cref="Dp4aLaunchCounts"/> and <see cref="Pq2_0MmqLaunchCount"/>.</summary>
+    internal void ResetDp4aLaunchCounts()
+        => (_dp4aGemvLaunches, _dp4aQuantizeLaunches, _pq2_0MmqLaunches) = (0, 0, 0);
+
+    /// <summary>
+    /// Quantizes <paramref name="x"/> (<c>[seqLen, k]</c> F32) into the dp4a int8 scratch (issue #485).
+    /// Every dp4a projection reads the scratch, so a caller sharing it across projections must not
+    /// run another dp4a projection on a different input in between.
+    /// </summary>
+    private void QuantizeDp4aInput(nint x, int k, int seqLen)
+    {
+        int elems = checked(seqLen * k);
+        EnsureActivQ8InScratch(elems);
+        _kernels.LaunchPQ2_0Dp4aQuantizeX(x, _activQ8InScratch, _activQ8MetaScratch, elems, _stream.Handle);
+        _dp4aQuantizeLaunches++;
+#if DEBUG
+        _dp4aQuantizedFor = (x, k, seqLen);
+#endif
+    }
+
+    [System.Diagnostics.Conditional("DEBUG")]
+    private void AssertDp4aQuantizedFor(nint x, int k, int seqLen)
+    {
+#if DEBUG
+        System.Diagnostics.Debug.Assert(_dp4aQuantizedFor == (x, k, seqLen),
+            $"dp4a scratch holds {_dp4aQuantizedFor}, but a projection claimed it pre-quantized ({x}, {k}, {seqLen}).");
+#endif
+    }
+
+    private void EnsureActivQ8InScratch(long elems)
+    {
+        if (elems <= _activQ8InScratchElems) return;
+        FreeIfNonZero(ref _activQ8InScratch);
+        FreeIfNonZero(ref _activQ8MetaScratch);
+        _activQ8InScratch = AllocDevice(elems);
+        _activQ8MetaScratch = AllocDevice(elems / CudaKernels.Pq2_0Dp4aQuantBlock * CudaKernels.Pq2_0Dp4aMetaBytesPerBlock);
+        _activQ8InScratchElems = elems;
+    }
+
+    private void EnsureActivF16InScratch(long halfs)
+    {
+        if (halfs <= _activF16InScratchElems) return;
+        FreeIfNonZero(ref _activF16InScratch);
+        _activF16InScratch = AllocDevice(halfs * sizeof(ushort));
+        _activF16InScratchElems = halfs;
+    }
+
+    private void EnsureActivF16OutScratch(long halfs)
+    {
+        if (halfs <= _activF16OutScratchElems) return;
+        FreeIfNonZero(ref _activF16OutScratch);
+        _activF16OutScratch = AllocDevice(halfs * sizeof(ushort));
+        _activF16OutScratchElems = halfs;
+    }
+
+    /// <summary>
+    /// Issue #495: grows the F16 weight-dequant scratch to <paramref name="halfs"/> elements, the
+    /// <c>m*k</c> of the projection about to run. Grow-only (never shrunk), so a steady-state
+    /// prefill allocates once and every later projection of the same or smaller tile is free — the
+    /// same convention as the activation staging buffers above. Allocates nothing at all for a
+    /// model whose every projection stays on a packed path.
+    /// </summary>
+    private void EnsureDequantScratchF16Weight(long halfs)
+    {
+        if (halfs <= _dequantScratchF16WeightElems) return;
+        // Round up to a whole K-quant super-block: dequant_q{2,3,4,5,6}_k_f16 are driven by a
+        // super-block count and each block unconditionally writes all 256 of its elements, with no
+        // per-element tail guard. Every block-quantised GGUF tensor has a row length that is a
+        // multiple of its block size, so m*k already is — but the old buffer was sized to the
+        // largest tile and so carried slack for every smaller one, and an exactly-sized buffer does
+        // not. 510 bytes of insurance against a shape that is not.
+        halfs = (halfs + 255) & ~255L;
+        FreeIfNonZero(ref _dequantScratchF16Weight);
+        _dequantScratchF16WeightElems = 0;
+        // #1099: admitted like every other growth (#1068), so a dequant that cannot fit is a clean
+        // refusal rather than a WDDM spill. Freed first, so the free figure includes the old buffer.
+        AdmitDeviceGrowth(halfs * sizeof(ushort), $"F16 weight-dequant scratch ({halfs:N0} elements)");
+        _dequantScratchF16Weight = AllocDevice(halfs * sizeof(ushort));
+        _dequantScratchF16WeightElems = halfs;
+    }
+
+    /// <summary>
+    /// Device bytes currently held by the F16 weight-dequant scratch (issue #495). Zero until the
+    /// first projection that actually falls back to dequant + cuBLAS; it used to be
+    /// <c>maxTileFloats * 2</c> — 2.54 GB (2425 MiB) on Bonsai 2 27B — from the moment the model loaded.
+    /// Test-visible so the reduction can be asserted against the model's own accounting rather
+    /// than a process- or driver-level memory reading.
+    /// </summary>
+    public long DequantScratchF16WeightBytes => _dequantScratchF16WeightElems * sizeof(ushort);
+
+    // ──────────────────────────────────────────────────────────────────────
+    //  Fused 2-way PQ2_0 decode dispatch — dense FFN gate+up, full-attention K+V.
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Dispatches a fused decode-time PQ2_0 GEMV for a projection pair sharing one input
+    /// (e.g. dense FFN gate+up, full-attention K+V) via
+    /// <see cref="CudaKernels.LaunchPQ2_0Gemv2F32Native"/> — F32-native in/out (#161), so unlike
+    /// the pre-#161 version this needs no F32→F16 activation staging launch, no F16→F32 output
+    /// conversion launches, and no <c>_activF16InScratch</c>/<c>_activF16OutScratch</c>/
+    /// (former) <c>_fusedOut1F16Scratch</c> round-trip at all — <paramref name="x"/>/
+    /// <paramref name="y0"/>/<paramref name="y1"/> are passed straight through to the kernel. Falls
+    /// back to <see langword="false"/> (caller issues two separate <see cref="Gemm"/> calls) for
+    /// prefill, mixed/non-PQ2_0 quant types, or unequal input dims.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool TryFusedPQ2_0Gemm2(
+        nint weight0, QuantizationType qt0, nint weight1, QuantizationType qt1,
+        nint x, nint y0, nint y1, int m0, int m1, int k0, int k1, int seqLen, bool xQuantized = false)
+    {
+        // #485: with the dp4a GEMV on, a pair sharing one input quantizes it once and launches twice —
+        // for S = 1 and for the 2..8-row verify widths alike.
+        if (BothDp4a(qt0, qt1, k0, k1, seqLen))
+        {
+            // Sharing off (a test-only A/B, CudaSmallSGemvDispatch.ShareDp4aInputOverride) re-quantizes
+            // before each launch — the results must be bit-identical either way.
+            bool share = CudaSmallSGemvDispatch.ShareDp4aInputs;
+            if (xQuantized && share) AssertDp4aQuantizedFor(x, k0, seqLen);
+            else QuantizeDp4aInput(x, k0, seqLen);
+            nint s = _stream.Handle;
+            LaunchPq2_0Quantized(weight0, y0, m0, k0, seqLen, s);
+            if (!share) QuantizeDp4aInput(x, k0, seqLen);
+            LaunchPq2_0Quantized(weight1, y1, m1, k0, seqLen, s);
+            return true;
+        }
+
+        if (seqLen != 1 || k0 != k1
+            || qt0 != QuantizationType.PQ2_0 || qt1 != QuantizationType.PQ2_0)
+            return false;
+        // #482: by default (DOTLLM_CUDA_PQ2_0_S1_MULTI != 0) every S=1 PQ2_0 projection, the fused
+        // pairs included, goes through Gemm's multi-column S=1 variant. It measured faster for the
+        // whole decode step than the fused single-column pairs.
+        if (CudaSmallSGemvDispatch.UseMultiForSingleColumn && _kernels.HasPQ2_0GemvMulti)
+            return false;
+
+        nint streamH = _stream.Handle;
+        int k = k0;
+        _kernels.LaunchPQ2_0Gemv2F32Native(weight0, weight1, x, y0, y1, m0, m1, k, streamH);
+        return true;
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    //  Host fallbacks — temporary CPU paths used while waiting on CUDA kernels.
+    //  Verbatim from CudaQwen3MoeHybridTransformerModel.
+    // ──────────────────────────────────────────────────────────────────────
+
+    private void LaunchGdnDecayHostFallback(nint alphaBufDev, nint dtBiasDev, nint aDev,
+        int seqLen, int nVHead)
+    {
+        _stream.Synchronize();
+        float[] alpha = new float[seqLen * nVHead];
+        float[] dtBias = new float[nVHead];
+        float[] a = new float[nVHead];
+        fixed (float* pAlpha = alpha)
+        fixed (float* pDtBias = dtBias)
+        fixed (float* pA = a)
+        {
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)pAlpha, alphaBufDev, (nuint)(alpha.Length * sizeof(float))).ThrowOnError();
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)pDtBias, dtBiasDev, (nuint)(dtBias.Length * sizeof(float))).ThrowOnError();
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)pA, aDev, (nuint)(a.Length * sizeof(float))).ThrowOnError();
+
+            for (int t = 0; t < seqLen; t++)
+            {
+                for (int h = 0; h < nVHead; h++)
+                {
+                    int idx = t * nVHead + h;
+                    float x = alpha[idx] + dtBias[h];
+                    float softplus = x > 20f ? x : MathF.Log(1f + MathF.Exp(x));
+                    alpha[idx] = MathF.Exp(softplus * a[h]);
+                }
+            }
+
+            CudaDriverApi.cuMemcpyHtoD_v2(alphaBufDev, (nint)pAlpha, (nuint)(alpha.Length * sizeof(float))).ThrowOnError();
+        }
+    }
+
+    private void LaunchSigmoidHostFallback(nint bufDev, long elems)
+    {
+        _stream.Synchronize();
+        float[] buf = new float[elems];
+        fixed (float* pBuf = buf)
+        {
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)pBuf, bufDev, (nuint)(elems * sizeof(float))).ThrowOnError();
+            for (long i = 0; i < elems; i++)
+                buf[i] = 1f / (1f + MathF.Exp(-buf[i]));
+            CudaDriverApi.cuMemcpyHtoD_v2(bufDev, (nint)pBuf, (nuint)(elems * sizeof(float))).ThrowOnError();
+        }
+    }
+
+    private void LaunchSiluHostFallback(nint bufDev, long elems)
+    {
+        _stream.Synchronize();
+        float[] buf = new float[elems];
+        fixed (float* pBuf = buf)
+        {
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)pBuf, bufDev, (nuint)(elems * sizeof(float))).ThrowOnError();
+            for (long i = 0; i < elems; i++)
+                buf[i] = buf[i] / (1f + MathF.Exp(-buf[i]));
+            CudaDriverApi.cuMemcpyHtoD_v2(bufDev, (nint)pBuf, (nuint)(elems * sizeof(float))).ThrowOnError();
+        }
+    }
+
+    private void LaunchSigmoidMulHostFallback(nint aDev, nint bDev, long elems)
+    {
+        _stream.Synchronize();
+        float[] a = new float[elems];
+        float[] b = new float[elems];
+        fixed (float* pA = a)
+        fixed (float* pB = b)
+        {
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)pA, aDev, (nuint)(elems * sizeof(float))).ThrowOnError();
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)pB, bDev, (nuint)(elems * sizeof(float))).ThrowOnError();
+            for (long i = 0; i < elems; i++)
+                a[i] *= 1f / (1f + MathF.Exp(-b[i]));
+            CudaDriverApi.cuMemcpyHtoD_v2(aDev, (nint)pA, (nuint)(elems * sizeof(float))).ThrowOnError();
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    //  Disposal
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// <inheritdoc/>
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        _context.MakeCurrent();
+
+        for (int i = 0; i < _layers.Length; i++)
+        {
+            FreeLayer(ref _layers[i]);
+        }
+
+        FreeIfNonZero(ref _dequantScratchF16Weight);
+        _dequantScratchF16WeightElems = 0;
+        FreeIfNonZero(ref _activF16InScratch);
+        FreeIfNonZero(ref _activF16OutScratch);
+        FreeIfNonZero(ref _activQ8InScratch);
+        FreeIfNonZero(ref _activQ8MetaScratch);
+
+        nint outNormPtr = _outputNormDevice;
+        if (outNormPtr != 0) CudaDriverApi.cuMemFree_v2(outNormPtr);
+        if (_ownsOutputDevice)
+        {
+            nint outPtr = _outputDevice;
+            if (outPtr != 0) CudaDriverApi.cuMemFree_v2(outPtr);
+        }
+        nint embPtr = _tokenEmbedDevice;
+        if (embPtr != 0) CudaDriverApi.cuMemFree_v2(embPtr);
+
+        FreeKvStorage();
+        _spillMonitor.Dispose();
+        FreeIfNonZero(ref _kvF16ScratchK);
+        FreeIfNonZero(ref _kvF16ScratchV);
+        _kvF16ScratchElems = 0;
+        FreeIfNonZero(ref _f16KvWriteStaging);
+        FreeIfNonZero(ref _f32KvStageK);
+        FreeIfNonZero(ref _f32KvStageV);
+        _f32KvStageElems = 0;
+        FreeIfNonZero(ref _attnSplitKvPartialMax);
+        FreeIfNonZero(ref _attnSplitKvPartialSum);
+        FreeIfNonZero(ref _attnSplitKvPartialOut);
+        FreeIfNonZero(ref _attnGqaSplitPartialMax);
+        FreeIfNonZero(ref _attnGqaSplitPartialSum);
+        FreeIfNonZero(ref _attnGqaSplitPartialOut);
+        FreeIfNonZero(ref _attnMmaDecodeQF16);
+        FreeIfNonZero(ref _attnFlashPrefillQF16);
+        FreeIfNonZero(ref _ropeYarnInvFreq);
+
+        // MTP (issue #253): free the trailing NextN head's device weights (a no-op when absent).
+        if (_mtpHead is { } mtpHead)
+        {
+            var layerCopy = mtpHead.Layer;
+            FreeLayer(ref layerCopy);
+            nint ehProj = mtpHead.EhProjDevice; if (ehProj != 0) CudaDriverApi.cuMemFree_v2(ehProj);
+            nint enorm = mtpHead.EnormDevice; if (enorm != 0) CudaDriverApi.cuMemFree_v2(enorm);
+            nint hnorm = mtpHead.HnormDevice; if (hnorm != 0) CudaDriverApi.cuMemFree_v2(hnorm);
+            if (mtpHead.SharedHeadHeadDevice is { } shh && shh != 0) CudaDriverApi.cuMemFree_v2(shh);
+            if (mtpHead.SharedHeadNormDevice is { } shn && shn != 0) CudaDriverApi.cuMemFree_v2(shn);
+        }
+        _mtpScratch?.Dispose();
+        _mtpScratch = null;
+        _mtpAbsorbScratch?.Dispose();
+        _mtpAbsorbScratch = null;
+        _mtpQ8Staged?.Dispose();
+        _mtpQ8Staged = null;
+        _mtpQ8Rb?.Dispose();
+        _mtpQ8Rb = null;
+        _mtpArgMax?.Dispose();
+        _mtpArgMax = null;
+        _hadamard?.Dispose();
+
+        _state.Dispose();
+        _gdnCache.Dispose();
+        Interlocked.Exchange(ref _spareGdnCheckpoint, null)?.Dispose();
+        FreeRowSnapshots();
+        _kernels.Dispose();
+        _cublas.Dispose();
+        _stream.Dispose();
+        _context.Dispose();
+
+        GC.SuppressFinalize(this);
+    }
+
+    private static void FreeLayer(ref DeviceLayer layer)
+    {
+        FreeIfNonZero(ref layer.AttnNormWeightDevice);
+        FreeIfNonZero(ref layer.PostAttnNormWeightDevice);
+
+        if (layer.Gdn is { } gdn)
+        {
+            FreeIfNonZero(ref gdn.QkvDevice);
+            FreeIfNonZero(ref gdn.GateDevice);
+            FreeIfNonZero(ref gdn.AlphaDevice);
+            FreeIfNonZero(ref gdn.BetaDevice);
+            FreeIfNonZero(ref gdn.Conv1dWeightDevice);
+            FreeIfNonZero(ref gdn.Conv1dBiasDevice);
+            FreeIfNonZero(ref gdn.ADevice);
+            FreeIfNonZero(ref gdn.DtBiasDevice);
+            FreeIfNonZero(ref gdn.SsmNormDevice);
+            FreeIfNonZero(ref gdn.OutDevice);
+            layer.Gdn = gdn;
+        }
+        if (layer.FullAttn is { } attn)
+        {
+            FreeIfNonZero(ref attn.QDevice);
+            FreeIfNonZero(ref attn.KDevice);
+            FreeIfNonZero(ref attn.VDevice);
+            FreeIfNonZero(ref attn.ODevice);
+            FreeIfNonZero(ref attn.QNormDevice);
+            FreeIfNonZero(ref attn.KNormDevice);
+            layer.FullAttn = attn;
+        }
+        FreeIfNonZero(ref layer.GateWeight);
+        FreeIfNonZero(ref layer.UpWeight);
+        FreeIfNonZero(ref layer.DownWeight);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    //  Static helpers
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Allocates a device buffer. <paramref name="allocs"/> (#383), when supplied, is the
+    /// caller's allocation ledger — every pointer is appended the instant <c>cuMemAlloc</c>
+    /// succeeds, so a throw anywhere later in the same load sequence can free everything
+    /// allocated so far. Null (the default) preserves every pre-existing runtime call site's
+    /// behavior unchanged (per-instance scratch buffers own their own field-based cleanup via
+    /// <c>Dispose</c>, not this ledger).
+    /// </summary>
+    private static nint AllocDevice(long bytes, List<nint>? allocs = null)
+    {
+        CudaDriverApi.cuMemAlloc_v2(out nint ptr, (nuint)bytes).ThrowOnError();
+        allocs?.Add(ptr);
+        return ptr;
+    }
+
+    /// <summary><see cref="AllocDevice"/> for KV storage, honouring <see cref="KvAllocFailureAfter"/>.</summary>
+    private static nint AllocKvDevice(long bytes)
+    {
+        CountKvAllocation();
+        return AllocDevice(bytes);
+    }
+
+    /// <summary>Counts one KV buffer allocation or growth against <see cref="KvAllocFailureAfter"/>, throwing when it is exhausted.</summary>
+    private static void CountKvAllocation()
+    {
+        if (KvAllocFailureAfter is int left)
+        {
+            if (left <= 0)
+                throw new InvalidOperationException("Injected KV allocation failure (test hook KvAllocFailureAfter).");
+            KvAllocFailureAfter = left - 1;
+        }
+    }
+
+    private static void CopyHtoD(nint dst, nint src, long bytes)
+    {
+        CudaDriverApi.cuMemcpyHtoD_v2(dst, src, (nuint)bytes).ThrowOnError();
+    }
+
+    private static void FreeIfNonZero(ref nint ptr)
+    {
+        if (ptr != 0)
+        {
+            CudaDriverApi.cuMemFree_v2(ptr);
+            ptr = 0;
+        }
+    }
+
+    private static nint UploadF32Tensor(GgufDataBase dataBase, GgufTensorDescriptor desc, int expectedElems, List<nint>? allocs = null)
+    {
+        float[] host = new float[expectedElems];
+        Dequantize.ToFloat32(dataBase.Of(desc), expectedElems,
+            desc.QuantizationType, host);
+        nint device = AllocDevice((long)expectedElems * sizeof(float), allocs);
+        fixed (float* p = host)
+        {
+            CopyHtoD(device, (nint)p, (long)expectedElems * sizeof(float));
+        }
+        return device;
+    }
+
+    // Lazily-loaded, process-wide singleton for the PQ2_0 weight-repack kernel. Kept independent
+    // of the per-model CudaKernels instance (`kernels` in LoadFromGguf) rather than threaded
+    // through as a parameter: UploadRawTensor and its dozens of call sites (LoadLayerDevice,
+    // LoadGdnLayerDevice, LoadFullAttnLayerDevice — all `private static`, running before this
+    // model instance or its CudaKernels even exist) stay completely unchanged, which is the
+    // entire point of doing the repack at this one choke point instead of threading split-layout
+    // awareness through every layer's weight struct and every Gemm/TryFusedPQ2_0Gemm2 call site.
+    // Mirrors CudaKernels.LaunchPQ2_0RepackSplitF16's launch shape exactly (same PTX, same grid
+    // formula) — that instance-based wrapper is what tests use; this static path exists solely
+    // because this call site structurally cannot hold a CudaKernels instance without a much
+    // larger, invasive restructuring of the (static, pre-construction) loading pipeline.
+    private static CudaModule? s_pq2_0RepackModule;
+    private static nint s_pq2_0RepackFunc;
+    // The CUDA context s_pq2_0RepackModule was loaded into (cuModuleLoad binds a module to
+    // whichever context is current at load time). A CudaModule/function handle from a since-
+    // destroyed context is invalid in any other context ("CUDA error 400: invalid resource
+    // handle") — loading a second Qwen3HybridDense model (a fresh CudaContext.Create per
+    // LoadFromGguf call, see that method) after the first model's Dispose() reuses this
+    // process-wide cache across two different (one now-dead) contexts otherwise. Track the
+    // context the cached module belongs to and reload whenever the CURRENT context differs.
+    private static nint s_pq2_0RepackContext;
+
+    private static nint EnsurePq2_0RepackFunc()
+    {
+        CudaDriverApi.cuCtxGetCurrent(out nint currentCtx).ThrowOnError();
+        if (s_pq2_0RepackModule is null || currentCtx != s_pq2_0RepackContext)
+        {
+            string ptxDir = Path.Combine(AppContext.BaseDirectory, "ptx");
+            s_pq2_0RepackModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "pq2_0_repack.ptx"));
+            s_pq2_0RepackFunc = s_pq2_0RepackModule.GetFunction("pq2_0_repack_split_f16");
+            s_pq2_0RepackContext = currentCtx;
+        }
+        return s_pq2_0RepackFunc;
+    }
+
+    private static nint UploadRawTensor(GgufDataBase dataBase, GgufTensorDescriptor desc, List<nint>? allocs = null)
+    {
+        int innerDim = desc.Shape[0];
+        long outerDim = desc.Shape.ElementCount / innerDim;
+        long bytes = Dequantize.RowByteSize(innerDim, desc.QuantizationType) * outerDim;
+        nint device = AllocDevice(bytes, allocs);
+        CopyHtoD(device, dataBase.Of(desc), bytes);
+
+        if (desc.QuantizationType != QuantizationType.PQ2_0)
+            return device;
+
+        // One-time load-time repack: reorder from dotLLM's interleaved on-disk PQ2_0 layout
+        // (per-group scale immediately followed by that group's 32 code bytes — never
+        // 32-byte-aligned, PQ2_0_GROUP_BYTES=34) into the split layout pq2_0_gemv.cu /
+        // dequant_pq2_0.cu now read (all scales, then all codes — see those files'
+        // "Split-layout addressing" notes and pq2_0_repack.cu's file header). This makes every
+        // group's hot-path code read unconditionally 32-byte-aligned with zero added
+        // synchronization in the decode kernel — see native/kernels/pq2_0_gemv.cu's file header
+        // for why this is preferred over an in-kernel batched-staging fix (measured regression
+        // from added __syncwarp() barriers on a parallel investigation branch). Synchronous:
+        // this runs once per tensor at load time, never on the inference hot path. The temporary
+        // interleaved buffer is freed immediately after, so this is not a steady-state VRAM
+        // increase — only a transient extra allocation (same size as the split buffer) during
+        // the repack itself.
+        int n = (int)outerDim;
+        int k = innerDim;
+        long splitBytes = CudaKernels.PQ2_0SplitLayoutBytes(n, k);
+        nint splitDevice = AllocDevice(splitBytes, allocs);
+
+        nint repackFunc = EnsurePq2_0RepackFunc();
+        long totalGroups = (long)n * (k / 128);
+        const int blockSize = 256;       // must match pq2_0_repack.cu's __launch_bounds__(256)
+        const int warpsPerBlock = blockSize / 32;
+        const int maxGridSize = 256;      // mirrors CudaKernels.MaxDequantGridSize
+        uint gridDim = (uint)Math.Min((totalGroups + warpsPerBlock - 1) / warpsPerBlock, maxGridSize);
+        if (gridDim == 0) gridDim = 1;
+
+        nint srcArg = device, dstArg = splitDevice;
+        int nArg = n, kArg = k;
+        void** args = stackalloc void*[] { &srcArg, &dstArg, &nArg, &kArg };
+        CudaDriverApi.cuLaunchKernel(repackFunc,
+                gridDim, 1, 1, blockSize, 1, 1,
+                0, 0, (nint)args, 0).ThrowOnError();
+        CudaDriverApi.cuStreamSynchronize(0).ThrowOnError();   // synchronous — one-time load-time cost, not hot path
+
+        // #383: `device` (the transient interleaved-layout buffer) is freed here, before this
+        // successful return — remove it from the ledger too (mirrors CudaWeights.cs's identical
+        // allocs.Remove(...) idiom for its own transient buffers), so a LATER factory-level
+        // failure elsewhere in the same load doesn't try to free this already-freed pointer again.
+        nint tempDevice = device;
+        FreeIfNonZero(ref device);
+        allocs?.Remove(tempDevice);
+        return splitDevice;
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    //  Per-layer device-side bundles
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// <summary>Per-layer device pointers (norms + token-mixing + dense FFN).</summary>
+    internal struct DeviceLayer
+    {
+        public nint AttnNormWeightDevice;
+        public nint PostAttnNormWeightDevice;
+        public DeviceGdn? Gdn;
+        public DeviceFullAttn? FullAttn;
+
+        public nint GateWeight;
+        public QuantizationType GateQt;
+        public int GateInputDim;
+        public int GateOutputDim;
+
+        public nint UpWeight;
+        public QuantizationType UpQt;
+        public int UpInputDim;
+        public int UpOutputDim;
+
+        public nint DownWeight;
+        public QuantizationType DownQt;
+        public int DownInputDim;
+        public int DownOutputDim;
+    }
+
+    /// <summary>Device-side GDN token-mixing weights.</summary>
+    internal struct DeviceGdn
+    {
+        public nint QkvDevice;
+        public QuantizationType QkvQt;
+        public int QkvInputDim;
+        public int QkvOutputDim;
+
+        public nint GateDevice;
+        public QuantizationType GateQt;
+        public int GateInputDim;
+        public int GateOutputDim;
+
+        public nint AlphaDevice;
+        public QuantizationType AlphaQt;
+        public int AlphaInputDim;
+        public int AlphaOutputDim;
+
+        public nint BetaDevice;
+        public QuantizationType BetaQt;
+        public int BetaInputDim;
+        public int BetaOutputDim;
+
+        public nint Conv1dWeightDevice;
+        public nint Conv1dBiasDevice;
+        public nint ADevice;
+        public nint DtBiasDevice;
+        public nint SsmNormDevice;
+
+        public nint OutDevice;
+        public QuantizationType OutQt;
+        public int OutInputDim;
+        public int OutOutputDim;
+    }
+
+    /// <summary>Device-side full-attention weights.</summary>
+    internal struct DeviceFullAttn
+    {
+        public nint QDevice;
+        public QuantizationType QQt;
+        public int QInputDim;
+        public int QOutputDim;
+
+        public nint KDevice;
+        public QuantizationType KQt;
+        public int KInputDim;
+        public int KOutputDim;
+
+        public nint VDevice;
+        public QuantizationType VQt;
+        public int VInputDim;
+        public int VOutputDim;
+
+        public nint ODevice;
+        public QuantizationType OQt;
+        public int OInputDim;
+        public int OOutputDim;
+
+        public int NumKvHeads;
+        public nint QNormDevice;
+        public nint KNormDevice;
+    }
+
+    /// <summary>
+    /// Device-side weights for a Multi-Token Prediction (MTP / "NextN") head — the trailing extra
+    /// decoder block used for self-speculative decoding (issue #253). Mirrors
+    /// <c>DotLLM.Models.Architectures.MtpHeadWeights</c> (CPU): the MTP block for Qwen3.5/3.6 is
+    /// structurally a full-attention Qwen3HybridDense decoder layer (<see cref="Layer"/>) with four
+    /// extra "nextn" tensors wrapped around it. <see cref="EmbedTokensHostBase"/> is a host-mmap
+    /// pointer (not device-resident) — MTP embeds one token per <c>ForwardMtp</c> call via a
+    /// host-side dequant + tiny H2D copy, exactly like the trunk's own per-token embedding lookup.
+    /// <see cref="SharedHeadHeadDevice"/> / <see cref="SharedHeadNormDevice"/> are device-resident
+    /// (they feed a GEMM / RMSNorm kernel respectively) and null when the GGUF didn't ship
+    /// head-local <c>nextn.shared_head_*</c> tensors — the trunk's own lm_head/output_norm are used
+    /// instead in that case (see <see cref="ForwardMtpCore"/>).
+    /// </summary>
+    internal struct CudaMtpHeadWeights
+    {
+        /// <summary>
+        /// The MTP block's own decoder-layer weights (attn norms, gated full attention, dense FFN) —
+        /// structurally identical to any other full-attention <see cref="DeviceLayer"/>.
+        /// </summary>
+        public DeviceLayer Layer;
+
+        /// <summary><c>nextn.eh_proj.weight</c> [2·hiddenSize, hiddenSize]. Quantized, device-resident.</summary>
+        public nint EhProjDevice;
+        public QuantizationType EhProjQt;
+        public int EhProjInputDim;
+        public int EhProjOutputDim;
+
+        /// <summary><c>nextn.enorm.weight</c> [hiddenSize] — F32 device RMSNorm weight applied to the predicted token's embedding.</summary>
+        public nint EnormDevice;
+
+        /// <summary><c>nextn.hnorm.weight</c> [hiddenSize] — F32 device RMSNorm weight applied to the incoming trunk hidden state.</summary>
+        public nint HnormDevice;
+
+        /// <summary>Optional <c>nextn.embed_tokens.weight</c> host-mmap base pointer. Null ⇒ reuse the trunk's <c>token_embd.weight</c> (<c>_embedDataBase</c>).</summary>
+        public nint? EmbedTokensHostBase;
+        public ulong EmbedTokensDataOffset;
+        public long EmbedTokensRowBytes;
+        public QuantizationType EmbedTokensQt;
+
+        /// <summary>Optional <c>nextn.shared_head_head.weight</c> [hiddenSize, vocabSize], device-resident. Null ⇒ reuse the trunk's lm_head.</summary>
+        public nint? SharedHeadHeadDevice;
+        public QuantizationType SharedHeadHeadQt;
+        public int SharedHeadHeadInputDim;
+        public int SharedHeadHeadOutputDim;
+
+        /// <summary>Optional <c>nextn.shared_head_norm.weight</c> [hiddenSize], F32 device-resident. Null ⇒ reuse the trunk's <c>output_norm.weight</c>.</summary>
+        public nint? SharedHeadNormDevice;
+    }
+}
