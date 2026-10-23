@@ -44,8 +44,8 @@ public sealed class SpeculativeDecoderTests
     {
         // Both models always produce token 3 as argmax
         float[] logits = MakeLogits(argmaxToken: 3);
-        var target = new MockModel(logits, VocabSize);
-        var draft = new MockModel(logits, VocabSize);
+        using var target = new MockModel(logits, VocabSize);
+        using var draft = new MockModel(logits, VocabSize);
 
         int k = 3;
         var decoder = new SpeculativeDecoder(greedy: true, seed: 42);
@@ -83,8 +83,8 @@ public sealed class SpeculativeDecoderTests
         // Draft always picks token 2, target always picks token 5
         float[] draftLogits = MakeLogits(argmaxToken: 2);
         float[] targetLogits = MakeLogits(argmaxToken: 5);
-        var target = new MockModel(targetLogits, VocabSize);
-        var draft = new MockModel(draftLogits, VocabSize);
+        using var target = new MockModel(targetLogits, VocabSize);
+        using var draft = new MockModel(draftLogits, VocabSize);
 
         int k = 3;
         var decoder = new SpeculativeDecoder(greedy: true, seed: 42);
@@ -117,8 +117,8 @@ public sealed class SpeculativeDecoderTests
     {
         float[] draftLogits = MakeLogits(argmaxToken: 2);
         float[] targetLogits = MakeLogits(argmaxToken: 5);
-        var target = new MockModel(targetLogits, VocabSize);
-        var draft = new MockModel(draftLogits, VocabSize);
+        using var target = new MockModel(targetLogits, VocabSize);
+        using var draft = new MockModel(draftLogits, VocabSize);
 
         int k = 3;
         var decoder = new SpeculativeDecoder(greedy: true, seed: 42);
@@ -150,8 +150,8 @@ public sealed class SpeculativeDecoderTests
     public void TimingTicks_AreRecorded()
     {
         float[] logits = MakeLogits(argmaxToken: 3);
-        var target = new MockModel(logits, VocabSize);
-        var draft = new MockModel(logits, VocabSize);
+        using var target = new MockModel(logits, VocabSize);
+        using var draft = new MockModel(logits, VocabSize);
 
         var decoder = new SpeculativeDecoder(greedy: true, seed: 42);
         var pipeline = new SamplerPipeline(new InferenceOptions { Temperature = 0f });
@@ -180,8 +180,8 @@ public sealed class SpeculativeDecoderTests
     public void ZeroCandidates_ReturnsEmptyResult()
     {
         float[] logits = MakeLogits(argmaxToken: 3);
-        var target = new MockModel(logits, VocabSize);
-        var draft = new MockModel(logits, VocabSize);
+        using var target = new MockModel(logits, VocabSize);
+        using var draft = new MockModel(logits, VocabSize);
 
         var decoder = new SpeculativeDecoder(greedy: true, seed: 42);
         var pipeline = new SamplerPipeline(new InferenceOptions { Temperature = 0f });

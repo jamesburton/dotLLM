@@ -46,7 +46,7 @@ internal sealed class ModelInfoCommand : AsyncCommand<ModelInfoCommand.Settings>
         AnsiConsole.Write(infoTable);
 
         // Check for locally downloaded files
-        var localModels = HuggingFaceDownloader.ListLocalModels()
+        var localModels = ModelResolver.EnumerateLocal()
             .Where(m => m.RepoId.Equals(settings.RepoId, StringComparison.OrdinalIgnoreCase))
             .ToDictionary(m => m.Filename, StringComparer.OrdinalIgnoreCase);
 
