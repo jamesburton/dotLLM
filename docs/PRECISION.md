@@ -1,9 +1,8 @@
 # Numeric Precision per Operation and Device
 
-> **Status (#1109, 2026-10-23).** CPU and CUDA arms are measured; their evidence is condensed in §5 (tables E1–E8).
-> The **Vulkan arm is pending** (§5.9); Strix 8060S and Arc cells below rest on earlier repo measurements until it lands.
-> Raw results: `.docs/precision/cpu/RESULTS.md`, `.docs/precision/cuda/RESULTS.md`, `.docs/precision/SURVEY.md`
-> (git-ignored, local). Follow-up issues are listed in §7.
+> **Status (#1109, 2026-10-23).** CPU, CUDA and Vulkan arms are measured; their evidence is condensed in §5 (tables
+> E1–E12). Raw results: `.docs/precision/{cpu,cuda,vulkan}/RESULTS.md`, `.docs/precision/SURVEY.md` and
+> `.docs/precision/raw/` (git-ignored, local). Follow-up issues are listed in §7.
 
 ## 1. Rules and how to read this document
 
@@ -23,7 +22,7 @@ Terms:
 - **Accuracy bar:** KL(ref ‖ test) over the full vocabulary, gated on the **median** (or trimmed mean) plus the outlier
   rate (rows with KL > 1e-3 / 1e-2) and top-1 agreement. Mean KL is reported but not gated: massive-activation rows
   dominate it.
-- Evidence is cited as **E1–E8** (§5). `[lit]` marks a literature-only claim; `not measured (#n)` names the issue that
+- Evidence is cited as **E1–E12** (§5). `[lit]` marks a literature-only claim; `not measured (#n)` names the issue that
   will measure it.
 
 ---
@@ -31,7 +30,7 @@ Terms:
 ## 2. Device capability matrix
 
 Peak rates are per clock relative to the device's own FP32 FMA, from vendor whitepapers, ISA guides, uops.info and
-local `vulkaninfo`/CPUID probes (2026-10-22). **Measured** rows come from E1–E8 and override the peak where they
+local `vulkaninfo`/CPUID probes (2026-10-22). **Measured** rows come from E1–E12 and override the peak where they
 disagree.
 
 | | RTX 3060 (GA106, CC 8.6) | Radeon 8060S (gfx1151) | Arc iGPU (Xe-LPG, MTL) | Core Ultra 7 155H | Ryzen AI Max+ 395 (Zen 5) | Xeon X5670 (Westmere) |
@@ -43,7 +42,7 @@ disagree.
 | INT8 peak | mma **8×**; dp4a | WMMA iu8 = f16 rate (bytes only) | DP4a 4× | `VPDPBUSD ymm` 4× | `VPDPBUSD zmm` 4× | SSSE3 `pmaddubsw` ≈1× |
 | INT4 | mma 16× | WMMA iu4 2× iu8 | none | none | none | none |
 | Bandwidth (spec) | 360 GB/s, 12 GB | ≈256 GB/s LPDDR5X, shared | ≈90 GB/s DDR5-5600, shared | ≈90 GB/s | ≈256 GB/s shared | ≈32 GB/s per socket, NUMA |
-| **Measured (E1, E2)** | plain F16-acc GEMM only **1.11–1.20×** end to end on Bonsai prefill; dp4a W2A8 MMQ 0.82–0.93× of the dequant + COMPUTE_32F path | pending (§5.9) | pending (§5.9) | **VNNI = AVX2 maddubs** (1.00×); F32 GEMV reaches 23–26 GB/s on 6 P-cores (issue-bound, not DRAM-bound) | **VNNI 0.91×, AVX-512BW 0.82× of AVX2** per core; 8 cores reach ≈59 GB/s (F32 GEMV); multithreaded AVX-512BW +5–10% | F32 GEMV 9.9 GB/s (1 socket) / 21.4 GB/s (2); `GemvF16` 0.58×, BF16 shift-widen 1.41× of F32 (1 thread) |
+| **Measured (E1, E2, E9–E12)** | plain F16-acc GEMM only **1.11–1.20×** end to end on Bonsai prefill; dp4a W2A8 MMQ 0.82–0.93× of the dequant + COMPUTE_32F path | **F16-accumulate coopmat no faster than F32-accumulate** (1.00–1.01×); Q8_0 prefill: F32-acc coopmat 1.10–1.25× faster than dp4a MMQ; int8 MMVQ decode 1.6× (Q4_0) / parity (Q8_0) vs F32-in | **every F16 arithmetic variant slower** (0.60–0.68×; compiler emits no packed FMA); DP4a MMQ prefill **34×** the scalar F32 GEMM; int8 MMVQ decode 1.3–1.7× | **VNNI = AVX2 maddubs** (1.00×); F32 GEMV reaches 23–26 GB/s on 6 P-cores (issue-bound, not DRAM-bound) | **VNNI 0.91×, AVX-512BW 0.82× of AVX2** per core; 8 cores reach ≈59 GB/s (F32 GEMV); multithreaded AVX-512BW +5–10% | F32 GEMV 9.9 GB/s (1 socket) / 21.4 GB/s (2); `GemvF16` 0.58×, BF16 shift-widen 1.41× of F32 (1 thread) |
 
 Corrections against the draft:
 
@@ -57,6 +56,9 @@ Corrections against the draft:
 - **Vulkan features:** the device now enables `shaderFloat16`, 16-bit storage and `shaderInt8` (#374, fixed on `dev`
   in 972d5c53), so F16 storage on Vulkan is unblocked.
 - **Westmere:** BF16 is the cheaper 16-bit format (shift vs software F16), now measured (E1).
+- **Strix (RDNA 3.5):** F16- and F32-accumulate WMMA run at one rate, so F16 accumulation buys nothing and costs 13× the
+  3060's F16-acc error (median KL 1.6e-3 on Bonsai). The draft's "F16-acc rate gain UNVERIFIED" is now **no** (E11).
+- **Arc:** packed F16 (2× peak) does not materialise; the scalar F32 kernels are the right ones (E9, E10).
 
 ### 2.1 Engine practice (survey; links in `.docs/precision/SURVEY.md` §5)
 
@@ -82,9 +84,11 @@ Only what the data proved. Everything here is **in registers or within a tile**,
 
 | # | what | where | evidence |
 |---|---|---|---|
-| K1 | **P·V accumulator across KV tiles** (flash attention O) | CUDA, every depth | Whole-range F16 O drifts with depth: median KL 1.7e-5 at 4k → 4.4e-4 at 32k → **8.8e-4 at 100k**, 47% of rows > 1e-3 at 100k, top-1 96.9% at 32k. F16 *within* a 16-key tile, promoted to F32 every tile (pv16t), stays at 1.5–1.7e-4 even at 100k. Speed gain of the F16 variants ≤ 1.6%. (E7) |
+| K1 | **P·V accumulator across KV tiles** (flash prefill O) | CUDA and Vulkan, every device, every depth | CUDA: whole-range F16 O drifts with depth, median KL 1.7e-5 at 4k → 4.4e-4 at 32k → **8.8e-4 at 100k**, 47% of rows > 1e-3 at 100k (E7). Strix: 7.8e-6 at 2k → **2.8e-3 at 128k, 73.6% of rows > 1e-3, 10% > 1e-2, top-1 94.7%**; Tev1-4B PPL **+18%** at 128k (E9). F16 *within* a tile, F32 across (pv16t), is at the noise floor on both, but buys nothing (CUDA ≤ 0.3%, Strix 0.94–0.96×, Arc 0.61×). |
 | K2 | **F32 promotion every ≤ 256 K-terms** in FP GEMM | CUDA prefill (any FP-accumulate GEMM with long K) | Plain F16 accumulation error grows with K: 2.0e-3 at K = 5,120 → **7.6e-3 at K = 17,408** (ffn_down, 3.7×). End to end: median KL 1.16e-4, 1.1% of rows > 1e-3, 0.6% top-1 flips. Promotion every 256 → median KL **6.3e-6** (18× lower), no row > 1e-3, 99.8% top-1. Promotion every 1,024 → 2.4e-5. (E2) |
-| K3 | **Softmax running max / sum and the online rescale** | CPU (registers only); GPU kernels keep them F32 in every variant tested | No CPU here has FP16 arithmetic, so F32 accumulation is free; GPU variants that changed S or O never narrowed *m*/*ℓ* (E7, E8). |
+| K2v | **F32 accumulation throughout** the coopmat GEMMs | Vulkan Strix (PQ2_0 ladder, Q8_0, Q4_0) | F16 accumulation: Bonsai median KL **1.6e-3**, 65.8% of rows > 1e-3, top-1 96.7%; Q4_0 KL max 0.106; **speed 1.00–1.01×** (one WMMA rate on RDNA 3.5). The promote-every-256 variant could not be measured (driver compiler crash) and has nothing to gain here. (E11, E12) |
+| K6 | **Decode P·V accumulators** | Vulkan (Strix, Arc) | F16: median KL 7e-9 at 2k → **7.5e-5 at 128k** (Bonsai), 1.75e-4 with 2.1% of rows > 1e-2 and PPL +1.0% (Tev1-4B); no speed (the pass is bandwidth-bound). (E10) |
+| K3 | **Softmax running max / sum and the online rescale** | CPU (registers only); every GPU kernel | No CPU here has FP16 arithmetic, so F32 accumulation is free. Vulkan decode with F16 statistics is accuracy-free at today's split sizes (KL ≤ 1.2e-8) but gives **no speed** (±1%), and would stagnate with fewer, longer splits; keep F32 (E10). GPU prefill variants never narrowed *m*/*ℓ* (E7, E9). |
 | K4 | **RMSNorm sum of squares** | CPU (registers only), all backends by policy | Same as K3: F32 accumulate is free on AVX2/SSE; FP16 x² overflows above |x| ≈ 256 `[lit]`. |
 | K5 | **Per-block scale promotion** `d_w·d_x·Σint32` | CPU int8 dots (per 32 for Q8_0/Q8_1, per 32-sub-block within 256 for Q8_K); CUDA MMQ | int32 cannot overflow inside a 32-element block (32·127·127 < 2³¹); this *is* the chunked promotion of K2 for integer paths (E4). |
 
@@ -101,6 +105,11 @@ Only what the data proved. Everything here is **in registers or within a tile**,
 **Not justified anywhere:** F32 weights, F32 KV, F32 MTP/draft KV, F32 inter-kernel activations (pending #1138), F32
 embedding tables.
 
+**Not required either:** the Vulkan GQA prefill's **Q hi/lo split** (an extra F16 term carrying Q's F32 residual into
+QKᵀ). Dropping it gives KL at the noise floor (median ≤ 1.5e-7, max ≤ 4.7e-6 at 2k–128k on Bonsai; no Tev1 row
+> 1e-3) and 1.67× attention, 1.46× a 1k prefill tile at 128k (E9). The unit test that needs it uses scores 2–3× and a
+dropped term 4–8× larger than 50 M real Bonsai rows produce. Turning it off is the user's call: **#1148**.
+
 ---
 
 ## 4. Per-operation recommendations by device
@@ -112,15 +121,15 @@ LM head. Its GPU side follows the RTX 3060 column.
 
 | operation | 155H | Zen 5 | Xeon SSE4.2 | Xeon+3060 (CPU side) | RTX 3060 | Strix 8060S | Arc | evidence |
 |---|---|---|---|---|---|---|---|---|
-| **Weight GEMV (decode)** | int8 activations (Q8_0/Q8_1/Q8_K), AVX2 maddubs; VNNI optional | int8 activations, AVX2 maddubs; AVX-512BW only multithreaded (+5–10%) | int8 activations, SSSE3 (**only** viable tier) | keep the GGUF's quant format, W4A8/W8A8; prefer Q4_K/Q4_0 over Q8_0 | quantized weights × Q8_1 activations, dp4a (done) | Q8_1 + integer dot (done) | Q8_1 + DP4a (done) | E1, E4 |
-| **Weight GEMM (prefill)** | Q4_K int8 tile; **Q8_0/Q4_0 need the Q4_K-style int8 microkernel (#1119)** | same; Q8_0 int8 today 0.6× of F32 | Q8_0 int8 R4 (1.4–1.6× F32); Q4_0 no gain | prefill on the 3060 where possible; else Q8_0 int8 | **int8-mma MMQ, Q8_1 activations, no weight expansion** (#1132 hybrid, #1135 dense) | f16 coopmat with in-tile dequant (done); iu8 bytes-only (pending) | DP4a MMQ (no coopmat) | E2, E3 |
-| **FP GEMM accumulator** | F32 (no F16 ALU) | F32 / int32 | F32 / int32 | F32 / int32 | F16 within ≤ 256 K, **F32 across** (fused, K2); plain `COMPUTE_16F` rejected for Bonsai | F32 today; F16-acc pending | int32 | E2 |
-| **Attention QKᵀ** | int8 QKᵀ over q8_0 K (+10–25%) | int8 QKᵀ (+20–35%) | **int8 QKᵀ (~1.9×)** | int8 QKᵀ over q8_0 (after #970, #1120) | F32 S default; F16 S with exact pre-scale is safe (1.2e-4 at 100k) for ≤ 5% | F32 acc (coopmat F16 operands) | F32 (scalar GQA kernel) | E7, E8 |
-| **Attention P·V** | F32 acc | F32 acc | F32 acc | F32 acc | **F32 across tiles (K1)**; F16 within a tile allowed, no gain | F32 acc | F32 acc | E7 |
-| **Softmax / norm reductions** | F32 registers | F32 registers | F32 registers | F32 registers | F32 registers | F32 registers | F32 registers | K3, K4 |
-| **KV storage** | **q8_0** (0.53× F16 bytes); F16/BF16 safe; never q4_0 K | q8_0 (1.43× decode vs F32 at 16k) | q8_0 + int8 QKᵀ; **never F16** (software widen) | q8_0 + int8 QKᵀ | **q8_0 default; K8V4 when memory forces it; q4_0 last** (#1133) | F16 default (#1102); q8_0 in-tile (#1112) | F16 / q8_0 | E5, E6 |
+| **Weight GEMV (decode)** | int8 activations (Q8_0/Q8_1/Q8_K), AVX2 maddubs; VNNI optional | int8 activations, AVX2 maddubs; AVX-512BW only multithreaded (+5–10%) | int8 activations, SSSE3 (**only** viable tier) | keep the GGUF's quant format, W4A8/W8A8; prefer Q4_K/Q4_0 over Q8_0 | quantized weights × Q8_1 activations, dp4a (done) | **int8 MMVQ** (Q4_0 1.6×, Q8_0 parity vs F32-in; KL 1–3e-4) | **int8 MMVQ** (1.3–1.7× vs F32-in) | E1, E4, E12 |
+| **Weight GEMM (prefill)** | Q4_K int8 tile; **Q8_0/Q4_0 need the Q4_K-style int8 microkernel (#1119)** | same; Q8_0 int8 today 0.6× of F32 | Q8_0 int8 R4 (1.4–1.6× F32); Q4_0 no gain | prefill on the 3060 where possible; else Q8_0 int8 | **int8-mma MMQ, Q8_1 activations, no weight expansion** (#1132 hybrid, #1135 dense) | f16 coopmat with in-tile dequant, **F32 acc**; Q8_0: coopmat 1.10–1.25× over dp4a MMQ (#1150); hybrid IQ4_NL/K-quants still scalar F32 (#1149) | **DP4a MMQ (34× the scalar F32 GEMM)**; hybrid host gap #1149 | E2, E3, E11, E12 |
+| **FP GEMM accumulator** | F32 (no F16 ALU) | F32 / int32 | F32 / int32 | F32 / int32 | F16 within ≤ 256 K, **F32 across** (fused, K2); plain `COMPUTE_16F` rejected for Bonsai | **F32** (F16-acc no faster, KL 1.6e-3; K2v) | int32 | E2, E11 |
+| **Attention QKᵀ** | int8 QKᵀ over q8_0 K (+10–25%) | int8 QKᵀ (+20–35%) | **int8 QKᵀ (~1.9×)** | int8 QKᵀ over q8_0 (after #970, #1120) | F32 S default; F16 S with exact pre-scale is safe (1.2e-4 at 100k) for ≤ 5% | F32 S; **Q as plain F16, no hi/lo split** (1.67×, #1148, needs sign-off); F16 S rejected (Tev1 tail KL 1.47) | F32 (F16 variants 0.66×) | E7, E8, E9 |
+| **Attention P·V** | F32 acc | F32 acc | F32 acc | F32 acc | **F32 across tiles (K1)**; F16 within a tile allowed, no gain | **F32 across tiles (K1)**; within-tile F16 0.94× → F32; decode P·V F32 (K6) | F32 (F16 0.61×) | E7, E9, E10 |
+| **Softmax / norm reductions** | F32 registers | F32 registers | F32 registers | F32 registers | F32 registers | F32 registers (F16 stats accurate but no gain) | F32 registers | K3, K4, E10 |
+| **KV storage** | **q8_0** (0.53× F16 bytes); F16/BF16 safe; never q4_0 K | q8_0 (1.43× decode vs F32 at 16k) | q8_0 + int8 QKᵀ; **never F16** (software widen) | q8_0 + int8 QKᵀ | **q8_0 default; K8V4 when memory forces it; q4_0 last** (#1133) | hybrid F16 default (#1102), q8_0 in-tile (#1112); **dense host F32 → F16** (Llama-1B KL ~5e-4, 3B ~1e-6–2e-4; #1151) | same as Strix | E5, E6, E10b |
 | **Recurrent state** | F32 (pending #1144) | same | same | same | same | same | same | — |
-| **MTP / draft KV** | trunk KV type (#1141) | same | same | same | **trunk KV type, done** (#1095: 16,392 → 1,156 B/token at q4_0, acceptance 2.267 → 2.262) | trunk type (#1141) | trunk type (#1141) | PR #1126 |
+| **MTP / draft KV** | trunk KV type (#1141) | same | same | same | **trunk KV type, done** (#1095: 16,392 → 1,156 B/token at q4_0, acceptance 2.267 → 2.262) | trunk type (#1141); F16 measured invisible (8 → 4 KiB/token, KL 3.4e-8) | trunk type (#1141) | PR #1126, E10b |
 | **LM head weights** | quantized, int8 GEMV | same | same | quantized on whichever side holds it | **packed ≤ 8-row chunks, no F16 copy** (done, #1099: 2,425 → 170 MiB, PPL +0.03%) | packed | packed | PR #1125 |
 | **Logits** | F32 for sampled/scored rows only (#1137) | same | same | same | same (+486 MiB per 512-row window today) | same | same | — |
 | **Embeddings** | GGUF quant type, one row dequantized per token | same | same | same, CPU-side lookup | same; no load-time F16 table (#1135) | packed, not F32 (#919) | packed | — |
@@ -147,6 +156,10 @@ LM head. Its GPU side follows the RTX 3060 column.
   once per query head in a GQA group (#970).
 - CUDA: F16 QKᵀ holds only because Bonsai's scale is a power of two and q/k are RMS-normed; recheck for unnormalized
   models. Verdict for the 3060: keep F32 accumulators; qk16 only if ≥ 100k prefill attention becomes the bottleneck.
+- Vulkan agrees on every accumulator (E9, E10). The one real Vulkan win is dropping the Q hi/lo split (1.67× attention,
+  KL at the noise floor; #1148). Real Bonsai scores stay at |s| ≤ 32.6 from 2k to 128k (q/k are RMS-normed); re-check
+  with `DOTLLM_VK_EXP_FA_ACC=stats` for any model whose q/k are not normed. F16 S (qk16) has a heavy tail on Tev1-4B
+  (one row at KL 1.47) and is rejected.
 
 **KV storage (E5, E6).**
 
@@ -154,6 +167,9 @@ LM head. Its GPU side follows the RTX 3060 column.
 - At 4k, decode tok/s is format-independent on CPU (weights dominate); at 16k, q8_0 is 1.43× F32 on Zen 5. On the Xeon,
   today's production q8_0 path is 0.67× of F32 (0.86× with the int8-QKᵀ prototype) because of the per-head re-dequant.
 - On the 3060, q8_0 costs nothing measurable (KL ≤ 9e-5 median, 100% top-1) at 53% of F16's bytes.
+- Vulkan's remaining F32 KV stores narrow to F16 cleanly: the MTP head is invisible (KL 3.4e-8), and the dense host costs
+  Llama-1B ~5e-4 median (the CPU F16 figure on the same model) and Llama-3B Q4_0 ≤ 2e-4 (E10b; #1151, #1141). Vulkan
+  q8_0/K8V4/q4_0 KV on the hybrid host is not measured yet (#1112).
 
 **Recurrent / MTP state.** The carried state is rewritten every token, so storage rounding compounds; it is O(1) in
 sequence length, so narrowing saves little. Keep F32 pending #1144. MTP/draft KV follows the trunk: the verify step
@@ -299,28 +315,104 @@ gives KL ≤ 1e-7. 32k with F16 KV did not fit next to the speed tile, so 32k/10
 | production q8_0 (dequant tile) | 1.51 | 0.77 | 0.77 | 1.10 | 1.10 |
 | production q8_0 + int8 QKᵀ (prototype) | **1.65** | 0.88 | 1.22 | 1.22 | **1.89** |
 
-### 5.9 Vulkan (Strix 8060S, Arc) — **pending**
+### Vulkan arm (Strix 8060S, Arc) — E9 to E12
 
-> **Vulkan: pending.** The Vulkan arm is running and will write `.docs/precision/vulkan/RESULTS.md`; its rows are added
-> here before this PR merges. Until then the Strix and Arc cells in §4.1 rest on earlier measurements: I2_S F16 weight
-> tile 1.22–1.50× on the Arc with an int8 tile giving no gain (#229); ffn-down F16 activation 13.5 → 23.5 TFLOPS at
-> k = 9,216 with NLL Δ 1e-5; Vulkan GQA flash prefill keeps F32 accumulators (#441); F16 KV default on Bonsai-2 (#1102).
+Strix: gfx1151, coopmat 16×16×16 f16→f32 and f16→f16, s8→s32. Arc: no coopmat, DP4a. Models: Bonsai-2 (F16 KV, the
+#1102 default), Tev1-4B (Qwen3.5 hybrid, 8 attention layers, 16/4 × 256; IQ4_NL on Strix, Q4_K_M on the Arc),
+Llama-3.2-1B Q8_0, Llama-3.2-3B Q4_0 (requantized). The reference is the shipped kernel in the same process; an F32
+repeat gives KL ≤ 1e-7 everywhere. Depth runs grow one wikitext prefix 2k → 128k; each cell scores 512 rows through the
+flash prefill kernel or 48 teacher-forced decode rows. Arc timings were taken on a loaded box: use only interleaved
+kernel ratios.
 
-Planned tables:
+#### E9 — Vulkan GQA flash prefill accumulators (#441 kernel)
 
-| experiment | device | ref | variant | KL median | KL p99 | rows KL > 1e-3 | top-1 | PPL Δ | speed × ref | verdict |
-|---|---|---|---|---|---|---|---|---|---|---|
-| coopmat GEMM accumulate | Strix | F32 acc | F16 acc | | | | | | | |
-| prefill GEMM operand type | Strix | f16 WMMA | iu8 WMMA (bytes only) | | | | | | | |
-| packed-half shader paths | Strix, Arc | F32 | `f16vec2` FMA | | | | | | | |
-| hybrid KV format | Strix, Arc | F16 | q8_0 / K8V4 / q4_0 | | | | | | | |
-| flash attention accumulators | Strix | F32 S, O | F16 S / F16 O within tile | | | | | | | |
-| integer-dot MMQ prefill | Arc | F16 tile | DP4a over Q8_1 | | | | | | | |
+Bonsai-2, Strix, shared prefix (variant only on the scored forwards):
 
-| device | KV | bytes/token | decode tok/s @ 8k / 32k / 128k | prefill tok/s @ 8k | notes |
-|---|---|---:|---|---|---|
-| Strix | f16 / q8_0 / k8v4 / q4_0 | | | | |
-| Arc | f16 / q8_0 | | | | |
+| ctx | variant | KL median | KL max | rows > 1e-3 | rows > 1e-2 | top-1 | PPL Δ | 1k tile at depth × F32 |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| 2k | **Q lo off** (no hi/lo split) | 1.3e-7 | 2.7e-6 | 0% | 0% | 100% | +0.003% | 1.022 |
+| 2k | pv16 (whole-range F16 O) | 7.8e-6 | 1.5e-4 | 0% | 0% | 99.8% | −0.001% | 1.000 |
+| 32k | **Q lo off** | 1.5e-7 | 1.2e-6 | 0% | 0% | 100% | +0.002% | **1.208** |
+| 32k | qk16 (F16 S) | 7.1e-6 | 2.5e-4 | 0% | 0% | 99.8% | −0.031% | 1.231 |
+| 32k | pv16t (F16 within a 32-key tile) | 1.5e-7 | 2.4e-6 | 0% | 0% | 100% | −0.001% | 0.971 |
+| 32k | pv16 | 5.7e-4 | 9.9e-3 | 27.0% | 0% | 99.2% | −0.228% | 1.001 |
+| 64k | **Q lo off** | 7.9e-8 | 4.7e-6 | 0% | 0% | 100% | −0.005% | **1.333** |
+| 64k | qk16 | 6.6e-6 | **5.8e-2** | 1.6% | 0.2% | 100% | +0.042% | 1.371 |
+| 64k | pv16 | 7.5e-4 | 5.1e-2 | 42.4% | 2.7% | 97.7% | +0.386% | 1.002 |
+| 128k | **Q lo off** | 1.2e-7 | 3.0e-6 | 0% | 0% | 100% | +0.002% | **1.464** |
+| 128k | qk16 | 4.7e-6 | 1.0e-4 | 0% | 0% | 99.8% | +0.012% | 1.593 |
+| 128k | pv16t | 1.2e-7 | 3.2e-6 | 0% | 0% | 100% | −0.001% | 1.013 |
+| 128k | **pv16** | **2.8e-3** | 8.0e-2 | **73.6%** | **10.0%** | **94.7%** | +0.679% | 1.001 |
+
+Tev1-4B IQ4_NL (Strix): Q lo off median 3–7e-8, worst row 8.4e-4, none > 1e-3; qk16 one row at **KL 1.47** (8k);
+pv16 at 128k median 1.0e-2, 51% of rows > 1e-2, **PPL +18.1%**.
+
+Kernel level (synthetic 24/4/256, F16 KV, TFLOP/s and × default):
+
+| depth | default (Q hi/lo split) | Q lo off | qk16 | pv16t | pv16 |
+|---:|---:|---:|---:|---:|---:|
+| 8k | 4.01 | 6.67 (1.67×) | 7.03 (1.76×) | 3.77 (0.94×) | 4.02 (1.00×) |
+| 128k | 3.93 | 6.58 (1.67×) | 7.08 (1.80×) | 3.71 (0.94×) | 3.95 (1.01×) |
+
+Score statistics over 50 M real Bonsai rows (2k–128k): max |s| 29.3–32.6, per-row p99.9 < 24, dropped Q_lo·K term ≤ 6.8e-3
+(bulk 0.5–2e-3). The unit test that fails without the split has scores ~37–56 and a dropped term up to 1.3e-2.
+
+Arc (scalar GQA kernel, Tev1-4B Q4_K_M at 2k): qk16 KL 1.6e-7, **0.66×**; pv16t 2.3e-8, **0.61×**; pv16 1.0e-4 with 4.3% of
+rows > 1e-3, 0.60–0.68×.
+
+#### E10 — Vulkan decode attention (#1102 grouped split-KV pass, F16 KV), Bonsai-2, Strix
+
+| ctx | variant | KL median | KL max | top-1 | PPL Δ | Δ ms per attention layer |
+|---:|---|---:|---:|---:|---:|---:|
+| 2k | st16 (F16 max/sum) | 6.7e-11 | 6.7e-8 | 100% | +0.001% | +0.004 |
+| 2k | pv16 (F16 P·V acc) | 7.4e-9 | 1.6e-7 | 100% | +0.003% | +0.004 |
+| 32k | st16 | 6.4e-9 | 9.3e-8 | 100% | +0.003% | −0.001 |
+| 32k | pv16 | 3.9e-6 | 2.7e-5 | 100% | −0.008% | +0.020 |
+| 128k | st16 | 1.2e-8 | 1.0e-7 | 100% | −0.003% | +0.013 |
+| 128k | **pv16** | **7.5e-5** | 4.3e-4 | 100% | +0.192% | +0.037 |
+
+Baseline decode 43.5 / 67.7 / 140.1 ms/token at 2k / 32k / 128k. Tev1-4B: pv16 median 1.75e-4, 2.1% of rows > 1e-2, PPL
++1.0% at 128k. Kernel level (ms per layer, Strix / Arc) at 32k: default 1.494 / 12.09, st16 1.497 / 12.17, pv16 1.503 /
+12.48. No variant is faster on either device.
+
+#### E10b — Vulkan F32 KV stores narrowed to F16 (stored rows rounded to F16 values; reference = same host, F32 rows)
+
+| store | model / device | rows | KL median | KL p99 / max | rows > 1e-3 | top-1 | PPL Δ | bytes/token F32 → F16 |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| Bonsai-2 MTP head KV (`VulkanMtpState`) | Bonsai-2, Strix | 128 drafts | **3.4e-8** | 4.0e-7 / 5.2e-7 | 0% | 100% (54/128 draft hits both arms) | +0.005% | 8 → 4 KiB |
+| dense `VulkanKvCache` | Llama-3.2-1B Q8_0, Strix, prefill / decode | 1,024 / 64 | 4.7e-4 / 5.4e-4 | 3.3e-3 / 3.0e-3 | 15.1% / 21.9% | 98.6% / 98.4% | −0.16% / +0.82% | 64 → 32 KiB (K+V) |
+| same | Llama-3.2-1B Q8_0, Arc, prefill / decode | 1,024 / 64 | 4.7e-4 / 4.2e-4 | 3.3e-3 / 3.3e-3 | 16.3% / 10.9% | 99.0% / 100% | −0.08% / −0.36% | |
+| same | Llama-3.2-3B Q4_0, Strix, prefill / decode | 1,024 / 64 | 7.6e-7 / 1.7e-4 | 6.1e-6 / 2.0e-3 | 0% / 3.1% | 100% / 100% | −0.006% / +0.24% | 224 → 112 KiB (K+V) |
+| same | Llama-3.2-3B Q4_0, Arc, prefill / decode | 512 / 48 | 3.7e-6 / 1.8e-4 | 1.7e-5 / 1.2e-3 | 0% / 4.2% | 99.8% / 97.9% | 0.00% / −0.10% | |
+
+The Llama-1B dense-KV cost (~5e-4) matches the CPU arm's F16 KV result on the same model (E5), so it is the format on a
+small GQA-8 model, not a kernel defect. (`.docs/precision/vulkan/RESULTS.md` §3 quotes the dense bytes per K or V side;
+the figures here are K+V.)
+
+#### E11 — Vulkan coopmat GEMM accumulation, Bonsai-2 PQ2_0 prefill (Strix, 128×128 ladder)
+
+| variant | rows | KL median | KL p99 | KL max | rows > 1e-3 | rows > 1e-2 | top-1 | PPL Δ (all / wikitext) | prefill × F32 @512 / 2k / 8k |
+|---|---:|---:|---:|---:|---:|---:|---:|---|---|
+| **F16-acc** | 1,136 | **1.6e-3** | 1.4e-2 | 2.6e-2 | **65.8%** | 2.2% | **96.7%** | +0.54% / +0.27% | **1.00 / 1.01 / 1.01** |
+| F16-acc, F32 every 256 | not measured: the AMD Windows driver crashes in `vkCreateComputePipelines` for every format | | | | | | | | |
+
+F32-acc reference: 230.3 / 222.4 / 207.4 tok/s. Same 1,136-row protocol as E2: Strix F16-acc error is 13× the 3060's.
+
+#### E12 — Vulkan dense Q8_0 / Q4_0 paths (reference = shipped path: Strix Q8_0 prefill dp4a MMQ, Q4_0 prefill F16 coopmat F32-acc, decode dp4a MMVQ)
+
+| model / device | arm | prefill KL median / max | decode KL median / max | prefill × default (512 / 2k / 8k) | decode × default |
+|---|---|---|---|---|---|
+| 1B Q8_0, Strix | coopmat F32-acc (no MMQ) | 3.2e-4 / 4.0e-2 | 5.6e-4 / 6.2e-3 | **1.25 / 1.20 / 1.10** | 1.00 |
+| 1B Q8_0, Strix | coopmat F16-acc | 1.8e-3 / 1.9e-2 | 6.2e-4 / 1.9e-2 | 1.21 / 1.20 / 1.11 | 1.00 |
+| 1B Q8_0, Strix | F32-in GEMV decode (no MMVQ) | 0 | 3.0e-4 / 2.8e-3 | 1.00 | 1.01 |
+| 3B Q4_0, Strix | coopmat F16-acc | 3.6e-4 / **0.106** | 2.9e-4 / 2.3e-3 | 1.01 / 0.98 / — | 1.00 |
+| 3B Q4_0, Strix | F32-in GEMV decode | 0 | 1.1e-4 / 1.4e-3 | 1.00 / 0.98 / — | **0.62** |
+| 1B Q8_0, Arc | scalar F32 GEMM (no MMQ) | 3.2e-4 / 5.3e-3 | 5.4e-4 / 1.3e-2 | **0.029** (10.9 vs 370 tok/s) | 0.92 |
+| 1B Q8_0, Arc | F32-in GEMV decode | 0 | 2.6e-4 / 1.8e-3 | 1.01 | **0.76** |
+| 3B Q4_0, Arc | F32-in GEMV decode | 0 | 1.5e-4 / 1.3e-3 | 1.01 | 0.60 (1 rep) |
+
+No F32-weight reference exists on Vulkan, so the MMQ vs coopmat comparison is path against path (KL 3.2e-4 apart);
+which is closer to F32 truth is #1150.
 
 ---
 
@@ -328,14 +420,15 @@ Planned tables:
 
 | CLAUDE.md rule (Precision & Expansion) | evidence | verdict |
 |---|---|---|
-| 1. FP32 gives no meaningful accuracy gain over FP16/BF16 | F16/BF16 KV vs F32: median KL 2.4–7.2e-4, ΔNLL ≈ 0, 0% rows > 1e-2 (E5) | **confirmed** for KV; activations not measured (#1138) |
+| 1. FP32 gives no meaningful accuracy gain over FP16/BF16 | F16/BF16 KV vs F32: median KL 2.4–7.2e-4, ΔNLL ≈ 0, 0% rows > 1e-2 (E5); Vulkan F32 → F16 KV: MTP head 3.4e-8, dense Llama-1B ~5e-4, Llama-3B ≤ 2e-4 (E10b) | **confirmed** for KV on all three backends; activations not measured (#1138) |
 | 1. FP16/BF16 is the widest stored default | KV (E5, E6); MTP head q4_0 vs F32: acceptance 2.262 vs 2.267, greedy output identical (#1095) | confirmed |
 | 1. Always evaluate formats below FP16 | q8_0 KV ≈ F16 on both backends (E5, E6); int8 activations ≤ 2.4e-4 KL (E4); **q4_0 K fails** (E5, E6); FP8: no device has it | confirmed; q4_0 K excluded |
-| 1. Accumulate F32 by default for norms, softmax/attention sums, long-KV attention | **PV across tiles proven** (K1, E7); softmax/norm: no F16 ALU on CPU, GPU variants never narrowed them (K3, K4) | confirmed for PV; others by policy |
+| 1. Accumulate F32 by default for norms, softmax/attention sums, long-KV attention | **PV across tiles proven on CUDA and Vulkan** (K1: 8.8e-4 at 100k CUDA, 2.8e-3 and 73.6% of rows > 1e-3 at 128k Strix); **decode P·V proven** (K6, E10); softmax stats in F16 accurate at today's split sizes but no faster (E10); norms: no F16 ALU on CPU (K3, K4) | **confirmed** for long-range sums; softmax/norm kept F32 because narrowing buys nothing |
 | 1. … recurrent-state updates, split-reduction combines | not measured | open → #1144 |
-| 1. Compute-bound GEMM: F16 accumulation where faster and KL-parity passes; promote every 64–256 for long K | plain F16-acc 1.11–1.20× faster but fails on Bonsai (median 1.16e-4, 0.6% top-1 flips, grows 3.7× with K); **promote every 256: 6.3e-6** (E2) | **confirmed**: promotion is required at K = 17,408; implement fused (#1132) |
-| 1. Integer dot products accumulate int32 | CPU W8A8/W4A8 KL 1–2e-4 at per-32 scales (E4); CUDA W2A8 5.1e-5, better than F16-acc (E2) | confirmed; per-32 activation scales preferred over per-256 |
+| 1. Compute-bound GEMM: F16 accumulation where faster and KL-parity passes; promote every 64–256 for long K | RTX 3060: plain F16-acc 1.11–1.20× faster but fails on Bonsai (median 1.16e-4, 0.6% top-1 flips, grows 3.7× with K); **promote every 256: 6.3e-6** (E2). **Strix: F16-acc is not faster (1.00–1.01×)** and fails (1.6e-3, 65.8% of rows > 1e-3; Q4_0 max 0.106) (E11, E12). Arc: no F16 path is faster (0.60–0.68×) | **3060: yes, with promotion** (fused, #1132). **Strix, Arc: no** — F32 accumulation |
+| 1. Integer dot products accumulate int32 | CPU W8A8/W4A8 KL 1–2e-4 at per-32 scales (E4); CUDA W2A8 5.1e-5, better than F16-acc (E2); Vulkan MMVQ 1–3e-4 vs F32-in, 1.3–1.7× (Arc), 1.6× (Strix Q4_0); Arc MMQ prefill 34× (E12) | confirmed; per-32 activation scales preferred over per-256; Strix Q8_0 prefill prefers the F32-acc coopmat (#1150) |
 | 1. Stored F32 partials (split-K, split-KV) need sign-off | not measured | open → #1144 |
+| (not a rule; a kernel extra) Q hi/lo split in Vulkan GQA prefill | dropping it: KL ≤ 1.5e-7 median, 1.67× attention, 1.46× a 128k tile (E9) | turn off by default → #1148 (user sign-off) |
 | 1. Model-declared FP32 state is evidence, not exemption | engines unanimous `[lit]`; no dotLLM measurement | open → #1144 |
 | 2. Kernels read quantized blocks directly | int8 tiers beat dequant tiers on every CPU (E1); W2A8 MMQ more accurate than dequant + F16 GEMM (E2); LM head packed: 2,425 → 170 MiB, PPL +0.03% (#1099); kvq prefill without the F16 scratch (#1094) | confirmed; remaining expansions in §7 |
 | 2. Expansion fallbacks bounded, admitted, logged, with byte cost | LM-head tiles bounded and admitted (#1099); MTP short-history tier bounded at 256 rows (#1095) | in place for those paths; others open (§7) |
@@ -385,10 +478,10 @@ PRs #1103, #1122, #1125, #1126.
 | GX5 | CUDA | load-time F16 copies (no GEMV kernel), embedding, dense LM head | Qwen3-8B embedding 1.16 GiB | open (gated) | #1135 |
 | GX6 | CUDA | Gemma `ProjectF32` quant → F16 → F32 | `4·maxProj` | open | #1135 |
 | M1–M3 | CUDA | MTP short-history (< 256 keys) dequant + F32 staging; non-mma F16 → F32 staging; F32 K/V projection scratch | bounded (256 rows; 4 KiB/row) | open (bounded) | #1136 |
-| V1 | Vulkan | dense KV F32 default | L1B 64 KiB/token | open | #918 |
+| V1 | Vulkan | dense `VulkanKvCache` F32 default | L1B 64 → 32 KiB/token (K+V) at F16, KL ~5e-4; L3B 224 → 112 KiB, KL ≤ 2e-4 (E10b) | open; F16 measured | #1151, #918 |
 | V2 | Vulkan | hybrid KV F32 default | B2 128 KiB/token | **fixed on dev for B2** (#1102, PR #1122: F16 default, 64 KiB/token); q8_0 open | #1112 |
 | V3 | Vulkan | inter-kernel activations F32 | `4·seqLen·(3H+2q+2kv+3I)` | open | #1138, #677 |
-| V4 | Vulkan | MTP KV and hidden F32 | B2 8 KiB/position | open | #1141 |
+| V4 | Vulkan | MTP KV and hidden F32 | B2 8 → 4 KiB/token at F16, KL 3.4e-8 (E10b) | open; F16 measured invisible | #1141 |
 | V5 | Vulkan | split-KV partials, split-K slabs F32 | 5.24 MB per split-K | sign-off pending | #1144 |
 | V6 | Vulkan | logits `rows·V·4`; recurrent state; MLA KV; Q8_1 `(d,s)` and KV scales F32 | various | open | #1137, #1144, #1140, #1146 |
 | VX1 | Vulkan | token embedding → F32 for every type but Q8_0 | Qwen3.8-27B 5.09 GB vs ≈339 MB | open | #919 |
@@ -404,8 +497,18 @@ PRs #1103, #1122, #1125, #1126.
 | Q5 | Vulkan qwen4exp | QSA KV F32 default; indexer keys F32 | 48 vs 24 KiB/token (12 → 6 GiB @262k) | open | #1145 |
 | Q6 | Vulkan qwen4exp | activation scratch F32 @1024 planned rows | 3,753 MiB | open | #1138 |
 | Q7 | Vulkan qwen4exp | MTP head routed bank re-quantised Q8_0 → Q4_K/Q5_1 | smaller than file (lossy, not an expansion) | noted only | — |
+| H1 | Vulkan hybrid | IQ4_NL / K-quant prefill on scalar F32 GEMMs (not an expansion; the missing MMQ/coopmat path) | Tev1 63 tok/s Strix, 3.7 tok/s Arc | open | #1149 |
+| L2 | Vulkan LFM2 MoE | F32 KV (`VulkanNemotronHKvCache` F32 path) | per token | open; not measured | #1151 |
 
-New issues filed by this study: #1134–#1146. Earlier study follow-ups: #1117–#1120 (CPU), #1132, #1133 (CUDA).
+New issues filed by this study: #1134–#1146 (inventory), #1148–#1151 (Vulkan arm). Earlier study follow-ups: #1117–#1120
+(CPU), #1132, #1133 (CUDA).
+
+| issue | Vulkan-arm follow-up |
+|---|---|
+| #1148 | Drop the Q hi/lo split in the GQA coopmat prefill by default (KL at the noise floor, 1.46× a 128k tile; needs user sign-off) |
+| #1149 | Hybrid host: IQ4_NL / K-quant prefill on scalar F32 GEMMs; use MMQ / coopmat |
+| #1150 | Strix Q8_0 dense prefill: dp4a MMQ default is 1.10–1.25× slower than the F32-acc coopmat; needs an F32 reference arm |
+| #1151 | F16 KV for the dense Vulkan host (F32 today) |
 
 ---
 
@@ -417,7 +520,11 @@ New issues filed by this study: #1134–#1146. Earlier study follow-ups: #1117�
 | Recurrent state at 16 bits over ≥ 8k-token decodes; 16-bit snapshots | the one store that feeds back into itself | #1144 |
 | Split-KV O partials / split-K slabs in F16 | small bytes, needs sign-off either way | #1144 |
 | F16 RoPE tables at ≥ 32k | CPU table bytes | #1142 |
-| Any Vulkan accumulator, KV or MMQ experiment | Strix and Arc cells in §4.1 | §5.9 (Vulkan arm of #1109) |
+| Vulkan F16 accumulation promoted every 256 K | the AMD Windows driver crashes compiling it; moot on Strix (F16-acc no faster) | — |
+| Vulkan hybrid KV in q8_0 / K8V4 / q4_0 | Strix/Arc long-context KV choice | #1112 |
+| Vulkan iu8 WMMA prefill vs f16 WMMA (bytes only on RDNA 3.5) | Strix Q8_0 prefill choice | #1150 |
+| Vulkan path accuracy against an F32-weight reference | MMQ vs coopmat differ by 3.2e-4; which is closer is unknown | #1150 |
+| LFM2 MoE Vulkan F32 KV narrowed to F16 | not on Strix | #1151 |
 | Fused int8-mma / promoted-F16 PQ2_0 GEMM speed (and the dp4a vs mma rate) | E2 shows the accuracy; speed needs the kernel | #1132 |
 | CUDA KV formats on a Llama-class model (CPU covered Llama) | KV policy beyond Bonsai | #1133 |
 | q4_0 K failure cross-checked against llama.cpp `-ctk q4_0` | rules out a dotLLM nibble-order bug | #1120 |
