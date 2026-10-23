@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='utf-8' />
+<title>DotLLM.Benchmarks.ThreadPoolDispatchBenchmarks-20260424-170416</title>
+
+<style type="text/css">
+	table { border-collapse: collapse; display: block; width: 100%; overflow: auto; }
+	td, th { padding: 6px 13px; border: 1px solid #ddd; text-align: right; }
+	tr { background-color: #fff; border-top: 1px solid #ccc; }
+	tr:nth-child(even) { background: #f8f8f8; }
+</style>
+</head>
+<body>
+<pre><code>
+BenchmarkDotNet v0.14.0, Windows 11 (10.0.26200.7019)
+Unknown processor
+.NET SDK 10.0.103
+  [Host]     : .NET 10.0.3 (10.0.326.7603), X64 RyuJIT AVX-512F+CD+BW+DQ+VL+VBMI
+  Job-TVTRHL : .NET 10.0.3 (10.0.326.7603), X64 RyuJIT AVX-512F+CD+BW+DQ+VL+VBMI
+</code></pre>
+<pre><code>IterationCount=10  WarmupCount=3  
+</code></pre>
+
+<table>
+<thead><tr><th>Method              </th><th>Threads</th><th>Mode</th><th>Mean     </th><th>Error  </th><th>StdDev </th><th>Median   </th><th>Prefill tok/s</th><th>Decode tok/s</th><th>Allocated</th>
+</tr>
+</thead><tbody><tr><td>Dispatch(no-op)</td><td>2</td><td>EventBased</td><td>289.0 ns</td><td>56.73 ns</td><td>33.76 ns</td><td>298.4 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;Dispatch(~1µs work)&#39;</td><td>2</td><td>EventBased</td><td>441.8 ns</td><td>68.58 ns</td><td>40.81 ns</td><td>442.5 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;Single-thread same work&#39;</td><td>2</td><td>EventBased</td><td>257.4 ns</td><td>4.05 ns</td><td>2.12 ns</td><td>258.0 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;30× Dispatch(small work)&#39;</td><td>2</td><td>EventBased</td><td>14,849.3 ns</td><td>2,304.60 ns</td><td>1,524.35 ns</td><td>14,879.3 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>Dispatch(no-op)</td><td>2</td><td>SpinWait</td><td>216.1 ns</td><td>52.38 ns</td><td>34.65 ns</td><td>203.1 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;Dispatch(~1µs work)&#39;</td><td>2</td><td>SpinWait</td><td>365.0 ns</td><td>99.82 ns</td><td>66.02 ns</td><td>354.5 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;Single-thread same work&#39;</td><td>2</td><td>SpinWait</td><td>264.4 ns</td><td>11.12 ns</td><td>7.35 ns</td><td>261.9 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;30× Dispatch(small work)&#39;</td><td>2</td><td>SpinWait</td><td>11,552.7 ns</td><td>2,391.65 ns</td><td>1,581.93 ns</td><td>11,360.9 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>Dispatch(no-op)</td><td>4</td><td>EventBased</td><td>723.2 ns</td><td>188.44 ns</td><td>124.64 ns</td><td>757.3 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;Dispatch(~1µs work)&#39;</td><td>4</td><td>EventBased</td><td>772.7 ns</td><td>151.86 ns</td><td>100.44 ns</td><td>798.4 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;Single-thread same work&#39;</td><td>4</td><td>EventBased</td><td>261.5 ns</td><td>7.82 ns</td><td>5.17 ns</td><td>260.9 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;30× Dispatch(small work)&#39;</td><td>4</td><td>EventBased</td><td>27,550.4 ns</td><td>7,449.08 ns</td><td>4,927.11 ns</td><td>29,776.3 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>Dispatch(no-op)</td><td>4</td><td>SpinWait</td><td>547.7 ns</td><td>222.80 ns</td><td>147.37 ns</td><td>569.7 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;Dispatch(~1µs work)&#39;</td><td>4</td><td>SpinWait</td><td>497.3 ns</td><td>101.35 ns</td><td>67.03 ns</td><td>488.1 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;Single-thread same work&#39;</td><td>4</td><td>SpinWait</td><td>259.9 ns</td><td>5.45 ns</td><td>3.25 ns</td><td>260.4 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;30× Dispatch(small work)&#39;</td><td>4</td><td>SpinWait</td><td>17,680.9 ns</td><td>5,708.21 ns</td><td>3,775.63 ns</td><td>16,896.5 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>Dispatch(no-op)</td><td>8</td><td>EventBased</td><td>1,521.5 ns</td><td>120.69 ns</td><td>79.83 ns</td><td>1,514.8 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;Dispatch(~1µs work)&#39;</td><td>8</td><td>EventBased</td><td>1,425.1 ns</td><td>405.89 ns</td><td>268.47 ns</td><td>1,502.1 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;Single-thread same work&#39;</td><td>8</td><td>EventBased</td><td>259.5 ns</td><td>12.38 ns</td><td>8.19 ns</td><td>262.1 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;30× Dispatch(small work)&#39;</td><td>8</td><td>EventBased</td><td>43,443.1 ns</td><td>5,813.42 ns</td><td>3,845.22 ns</td><td>42,797.7 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>Dispatch(no-op)</td><td>8</td><td>SpinWait</td><td>1,042.4 ns</td><td>139.69 ns</td><td>92.40 ns</td><td>1,050.8 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;Dispatch(~1µs work)&#39;</td><td>8</td><td>SpinWait</td><td>1,167.6 ns</td><td>223.73 ns</td><td>147.98 ns</td><td>1,172.8 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;Single-thread same work&#39;</td><td>8</td><td>SpinWait</td><td>264.6 ns</td><td>7.66 ns</td><td>5.07 ns</td><td>264.3 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;30× Dispatch(small work)&#39;</td><td>8</td><td>SpinWait</td><td>32,705.2 ns</td><td>7,094.87 ns</td><td>4,692.82 ns</td><td>30,661.7 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>Dispatch(no-op)</td><td>16</td><td>EventBased</td><td>9,126.3 ns</td><td>6,714.01 ns</td><td>4,440.90 ns</td><td>9,515.5 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;Dispatch(~1µs work)&#39;</td><td>16</td><td>EventBased</td><td>19,700.9 ns</td><td>22,325.29 ns</td><td>13,285.42 ns</td><td>16,894.2 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;Single-thread same work&#39;</td><td>16</td><td>EventBased</td><td>253.6 ns</td><td>24.48 ns</td><td>16.19 ns</td><td>260.5 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;30× Dispatch(small work)&#39;</td><td>16</td><td>EventBased</td><td>589,037.0 ns</td><td>241,238.42 ns</td><td>159,564.28 ns</td><td>610,580.0 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>Dispatch(no-op)</td><td>16</td><td>SpinWait</td><td>2,113.4 ns</td><td>369.97 ns</td><td>220.16 ns</td><td>2,085.0 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;Dispatch(~1µs work)&#39;</td><td>16</td><td>SpinWait</td><td>1,609.3 ns</td><td>165.01 ns</td><td>109.14 ns</td><td>1,663.0 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;Single-thread same work&#39;</td><td>16</td><td>SpinWait</td><td>267.9 ns</td><td>9.72 ns</td><td>6.43 ns</td><td>266.9 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;30× Dispatch(small work)&#39;</td><td>16</td><td>SpinWait</td><td>52,266.0 ns</td><td>6,036.53 ns</td><td>3,592.24 ns</td><td>53,018.5 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>Dispatch(no-op)</td><td>32</td><td>EventBased</td><td>23,947.1 ns</td><td>22,323.45 ns</td><td>14,765.58 ns</td><td>16,776.2 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;Dispatch(~1µs work)&#39;</td><td>32</td><td>EventBased</td><td>14,127.9 ns</td><td>5,505.95 ns</td><td>2,879.72 ns</td><td>14,263.2 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;Single-thread same work&#39;</td><td>32</td><td>EventBased</td><td>263.9 ns</td><td>4.64 ns</td><td>2.42 ns</td><td>264.1 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;30× Dispatch(small work)&#39;</td><td>32</td><td>EventBased</td><td>1,415,062.3 ns</td><td>681,610.27 ns</td><td>450,842.99 ns</td><td>1,420,001.7 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>Dispatch(no-op)</td><td>32</td><td>SpinWait</td><td>333,405.4 ns</td><td>79,674.13 ns</td><td>52,699.50 ns</td><td>352,126.5 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;Dispatch(~1µs work)&#39;</td><td>32</td><td>SpinWait</td><td>338,844.3 ns</td><td>89,757.23 ns</td><td>59,368.85 ns</td><td>368,067.4 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;Single-thread same work&#39;</td><td>32</td><td>SpinWait</td><td>259.9 ns</td><td>9.51 ns</td><td>6.29 ns</td><td>262.0 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr><tr><td>&#39;30× Dispatch(small work)&#39;</td><td>32</td><td>SpinWait</td><td>10,627,798.6 ns</td><td>507,786.53 ns</td><td>335,869.35 ns</td><td>10,693,921.1 ns</td><td>N/A</td><td>N/A</td><td>-</td>
+</tr></tbody></table>
+</body>
+</html>

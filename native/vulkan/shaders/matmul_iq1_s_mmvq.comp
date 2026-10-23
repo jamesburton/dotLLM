@@ -1,0 +1,116 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// IQ1_S MMVQ decode GEMV: integer-dot (dp4a) matrix-vector multiply.
+//
+//   y[m] = sum_k W_iq1s[m,k] * x[k]
+//
+// The activation x[] is pre-quantized to Q8_1. IQ1_S reconstructs each weight as
+//   w_j = dl · (g_j + delta)
+// where g_j ∈ {-1,0,+1} is the ggml iq1s_grid ternary lane (already a signed int8:
+// 0xff/0x00/0x01), dl is the 3-bit per-sub-block scale, and delta = ±0.125 (per
+// sub-block sign bit). So per group of 8:
+//   sum_j w_j·x_j = dl · [ Σ g_j·x_j + delta·Σ x_j ]
+//                 ≈ dl · d_x · ( dp4a(grid, xq) + delta · dp4a(0x01010101, xq) )
+// The grid lanes feed dp4a verbatim; the delta term is delta·d_x·Σxq.
+//
+// NOT bit-exact (x is int8-quantized); validated argmax + tolerance vs CPU F32.
+//
+// ── COALESCED lane=K-position layout (issue #339) ─────────────────────────────
+// One wave32 subgroup per row; 4 lanes share a 32-element sub-block (32 lanes →
+// 8 sub-blocks/iteration). Lane L → sub-block ib=L/4, group l=L%4, owning the
+// group's 8 elements (= 2 dp4a + 2 sum-dp4a). Reduction: a single subgroupAdd.
+//
+// IQ1_S super-block layout (50 bytes / 256 elements; matches matmul_iq1_s_f32_gemv.comp):
+//   [0,1]    = fp16 d
+//   [2..33]  = qs[32] — low 8 bits of grid index per group of 8
+//   [34..49] = qh[8] uint16 LE per 32-element sub-block: bits 3*l..3*l+2 = grid-index
+//              high 3 bits for group l; bits 12..14 = 3-bit scale; bit 15 = delta sign.
+//   Row stride = (K/256) * 50 bytes.
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW    { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq   { uint  xq[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds  { vec2  xds[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer BufY    { float y[]; };
+layout(set = 0, binding = 4, std430) readonly  buffer BufGrid { uint  iq1sGrid[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint blocksPerRow; // = K / 256
+    uint pad;
+} pc;
+
+const uint IQ1_S_BLOCK_BYTES = 50u;
+const float IQ1S_DELTA = 0.125;
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    return (u >> ((absByteOff & 3u) * 8u)) & 0xFFu;
+}
+
+uint readU16(uint absByteOff) {
+    return readByte(absByteOff) | (readByte(absByteOff + 1u) << 8u);
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint lane = gl_LocalInvocationID.x;   // 0..31
+    uint ib = lane >> 2u;                 // sub-block 0..7
+    uint l  = lane & 3u;                  // group 0..3 (8 elements)
+
+    uint rowByteBase = m * pc.blocksPerRow * IQ1_S_BLOCK_BYTES;
+    float acc = 0.0;
+
+    for (uint blk = 0u; blk < pc.blocksPerRow; blk++) {
+        uint blockByteBase = rowByteBase + blk * IQ1_S_BLOCK_BYTES;
+        float d = readHalf(blockByteBase);
+
+        uint qhVal = readU16(blockByteBase + 34u + ib * 2u);
+        float dl    = d * float(2 * int((qhVal >> 12u) & 7u) + 1);
+        float delta = ((qhVal & 0x8000u) != 0u) ? -IQ1S_DELTA : IQ1S_DELTA;
+
+        uint qsByte = readByte(blockByteBase + 2u + ib * 4u + l);
+        uint idx    = qsByte | (((qhVal >> (3u * l)) & 7u) << 8u);
+        uint gridLo = iq1sGrid[2u * idx];        // 4 ternary int8 lanes (elems 0..3)
+        uint gridHi = iq1sGrid[2u * idx + 1u];   // 4 ternary int8 lanes (elems 4..7)
+
+        // Group l's 8 elements: blk*256 + ib*32 + l*8 → xq uint blk*64 + ib*8 + l*2.
+        uint xqi = blk * 64u + ib * 8u + l * 2u;
+        uint xqLo = xq[xqi];
+        uint xqHi = xq[xqi + 1u];
+
+        int dotGrid = dotPacked4x8AccSatEXT(int(gridLo), int(xqLo), 0);
+        dotGrid = dotPacked4x8AccSatEXT(int(gridHi), int(xqHi), dotGrid);
+
+        int sumXq = dotPacked4x8AccSatEXT(0x01010101, int(xqLo), 0);
+        sumXq = dotPacked4x8AccSatEXT(0x01010101, int(xqHi), sumXq);
+
+        // Sub-block ib = one Q8_1 block.
+        float dX = xds[blk * 8u + ib].x;
+        acc += dl * (dX * (float(dotGrid) + delta * float(sumXq)));
+    }
+
+    float total = subgroupAdd(acc);
+    if (subgroupElect())
+        y[m] = total;
+}
