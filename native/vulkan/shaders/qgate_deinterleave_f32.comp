@@ -1,0 +1,30 @@
+#version 450
+// De-interleave the fused attention Q+gate projection: per token [Q_h0(headDim), Gate_h0(headDim), Q_h1, Gate_h1, ...] ->
+// q[t, h*headDim + d], gate[t, h*headDim + d]. Replaces 2 x numHeads x seqLen vkCmdCopyBuffer commands per full-attention layer.
+// Pure F32 moves: bit-exact with the copy loop.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufQg   { float qg[]; };   // [seqLen, numHeads * 2 * headDim]
+layout(set = 0, binding = 1, std430) writeonly buffer BufQ    { float q[]; };    // [seqLen, numHeads * headDim]
+layout(set = 0, binding = 2, std430) writeonly buffer BufGate { float gate[]; }; // [seqLen, numHeads * headDim]
+
+layout(push_constant) uniform PushConstants {
+    uint seqLen;
+    uint numHeads;
+    uint headDim;
+} pc;
+
+void main() {
+    uint per = pc.numHeads * pc.headDim;
+    uint idx = (gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x) * 256u + gl_LocalInvocationID.x;
+    if (idx >= pc.seqLen * per) return;
+
+    uint t = idx / per;
+    uint r = idx - t * per;
+    uint h = r / pc.headDim;
+    uint d = r - h * pc.headDim;
+    uint src = t * 2u * per + h * 2u * pc.headDim + d;
+    q[idx]    = qg[src];
+    gate[idx] = qg[src + pc.headDim];
+}

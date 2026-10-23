@@ -1,0 +1,96 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Q8_0 MMVQ decode GEMV, RESIDUAL-FUSED variant (issue #379).
+//
+// Identical to matmul_q8_0_mmvq.comp except the final store adds a 5th
+// "residual" buffer:
+//
+//   y[m] = (sum_k W_q8[m,k] * x[k]) + residual[m]
+//
+// This eliminates the separate AddKernel dispatch + barrier that otherwise
+// follows every Q8_0 decode GEMV feeding a residual connection (o_proj,
+// down_proj). The reduction itself (subgroup dp4a + subgroupAdd) is BYTE-
+// IDENTICAL to matmul_q8_0_mmvq.comp — only the final scalar addition at the
+// elected lane changes, so this is bit-exact vs running matmul_q8_0_mmvq.comp
+// then a separate float add (same operand values, same operation, same
+// order: matmul-result + residual).
+//
+// See matmul_q8_0_mmvq.comp for the full layout/coalescing commentary.
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW    { uint  weight[]; };   // Q8_0 blob, 4-byte indexable
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq   { uint  xq[]; };       // [K/4] packed int8 activations
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds  { vec2  xds[]; };      // [K/32] (d_x, s_x)
+layout(set = 0, binding = 3, std430) readonly  buffer BufResid{ float residual[]; }; // [M]
+layout(set = 0, binding = 4, std430) writeonly buffer BufY    { float y[]; };        // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;            // number of output rows
+    uint K;            // columns (multiple of 32)
+    uint blocksPerRow; // = K / 32
+    uint rowUints;     // per-row uint stride bound (rounded up; unused here)
+} pc;
+
+const uint UINT16_PER_BLOCK = 17u;  // 34 bytes = 1 scale + 16 qs (uint16)
+const uint WINDOW_BLOCKS    = 8u;   // 32 lanes * 8 int8/lane = 256 weights = 8 blocks
+
+// Read one uint16 (little-endian) from the 4-byte-indexed weight buffer at the
+// given uint16 index. The 34-byte block stride is even, so every uint16 index
+// is a valid 2-byte-aligned element — no straddle, no funnel.
+uint readU16(uint idx16) {
+    uint w = weight[idx16 >> 1u];
+    return ((idx16 & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint lane = gl_LocalInvocationID.x;        // 0..31 (one subgroup per workgroup)
+    uint blockInWindow = lane >> 2u;           // 0..7 : which block of the 8-block window
+    uint subInBlock    = lane & 3u;            // 0..3 : which 8-int8 quarter of that block
+    uint qOff16        = 1u + 4u * subInBlock; // uint16 offset into the block's qs for this lane
+
+    uint rowBase16 = m * pc.blocksPerRow * UINT16_PER_BLOCK;
+
+    float acc = 0.0;
+    for (uint w0 = 0u; w0 < pc.blocksPerRow; w0 += WINDOW_BLOCKS) {
+        uint blk = w0 + blockInWindow;
+        if (blk >= pc.blocksPerRow)
+            continue;
+
+        uint blkBase16 = rowBase16 + blk * UINT16_PER_BLOCK;
+
+        // fp16 weight scale (uint16 at the block base), shared by this block's 4 lanes.
+        float dW = unpackHalf2x16(readU16(blkBase16)).x;
+        float dX = xds[blk].x;
+
+        // This lane's 8 int8 weights, read as four contiguous uint16 -> two uint32.
+        uint qb = blkBase16 + qOff16;
+        uint w32a = readU16(qb)      | (readU16(qb + 1u) << 16u);
+        uint w32b = readU16(qb + 2u) | (readU16(qb + 3u) << 16u);
+
+        // Matching 8 activations: block blk's 32 activations are xq[blk*8 .. +8];
+        // this lane owns the 8 at int8 index 8*subInBlock => uint index +2*subInBlock.
+        uint xbase = blk * 8u + 2u * subInBlock;
+        uint xa = xq[xbase];
+        uint xb = xq[xbase + 1u];
+
+        int dotI = 0;
+        dotI = dotPacked4x8AccSatEXT(int(w32a), int(xa), dotI);
+        dotI = dotPacked4x8AccSatEXT(int(w32b), int(xb), dotI);
+
+        acc += (dW * dX) * float(dotI);
+    }
+
+    // The subgroup IS the row: one reduction yields the matmul result (no
+    // shared mem, no barrier). The residual add happens at the elected lane,
+    // AFTER the reduction — same float value and same operation order as the
+    // unfused matmul-then-AddKernel path.
+    float total = subgroupAdd(acc);
+    if (subgroupElect())
+        y[m] = total + residual[m];
+}
