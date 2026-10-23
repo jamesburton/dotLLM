@@ -163,7 +163,12 @@ Differences between architectures are captured entirely in ModelConfig.
   each input row by `e = 2^ceil(log2(max|row| / 1024))` and multiplies the projected row back (llama.cpp `build_amax_src1_f16`). A
   power of two is exact, so rows at or below 1024 are untouched; it applies to every architecture.
 - **KV**: sliding layers keep only their recent rows on CPU (compact sliding-window KV, #1169, `docs/KV_CACHE.md`): at 262K the 14 full layers dominate (~14 GiB F32, ~3.7 GiB with `--cache-type-k q8_0 --cache-type-v q8_0 --cache-window 0`).
-- **GPU**: CUDA and Vulkan refuse `flint` (`ModelConfig.FlintUnsupportedMessage`); bring-up is #1157 F4 (Vulkan) / F6 (CUDA).
+- **Vulkan** (#1171, single-device `VulkanTransformerModel` only; pipeline / hybrid refuse): sinks required on every layer (the gpt-oss
+  sink kernels), NoPE through the generic `IsNoRopeLayer` path, the ungated shared expert through the existing shared-expert branch, sigmoid
+  top-6 on `moe_topk_sigmoid_bias_f32` with a zero bias, and Q4_1 read in place everywhere (dense MMVQ / GEMV / GEMM / coopmat, MoE indexed
+  MMVQ + grouped coopmat). KV is **F16** (`VulkanKvCache.Storage`, `DOTLLM_VK_KV=f32` for A/B) at full length for every layer: the compact
+  sliding-window ring is not on Vulkan yet (follow-up), so 98 KiB/token (28 KiB of it the 14 full layers).
+- **CUDA** refuses `flint` (`ModelConfig.FlintUnsupportedMessage`); bring-up is #1157 F6.
 - Verification: `FlintSyntheticGoldenTests` writes a random-weight `flint` GGUF (GQA 8:2, Q wider than hidden, window 4 over 16 tokens,
   NoPE on a MoE layer, sinks everywhere, shared expert) and compares against llama.cpp CPU logits on the same bytes: F32 max |dlogit|
   2.1e-6, Q4_1 routed + Q8_0 shared 8.0e-6; NoPE, window, shared expert, renormalisation and sinks each move the logits by > 4.
