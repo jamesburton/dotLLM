@@ -59,6 +59,23 @@ public static unsafe partial class MatMul
         return Sse.Or(f, Sse2.Or(Sse2.And(infNan, Vector128.Create(0x7F800000)), sign).AsSingle());
     }
 
+    /// <summary>
+    /// Converts the Half at <paramref name="p"/> to Single, bit-identical to <c>(float)Half</c> but inlined:
+    /// on .NET 10 the cast is a managed call (#1119), which costs more than a Q8_0 block dot.
+    /// </summary>
+    /// <param name="p">Pointer to the Half's two bytes.</param>
+    /// <returns>The value as Single.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static float HalfToSingle(byte* p) => HalfToSingle(Unsafe.ReadUnaligned<ushort>(p));
+
+    /// <summary>Converts Half bits to Single, bit-identical to <c>HalfToSingle(bits)</c> but inlined (#1119).</summary>
+    /// <param name="bits">The Half's bit pattern.</param>
+    /// <returns>The value as Single.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static float HalfToSingle(ushort bits) => Sse2.IsSupported
+        ? HalfToSingleSse2(Vector128.CreateScalarUnsafe((int)bits)).ToScalar()
+        : (float)BitConverter.UInt16BitsToHalf(bits);
+
     /// <summary>Loads four Half scales at byte offsets <c>0, stride, 2·stride, 3·stride</c> as int32 lanes.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static Vector128<int> LoadHalf4(byte* p, nint stride) => Vector128.Create(
@@ -149,8 +166,8 @@ public static unsafe partial class MatMul
             Vector128<int> v = BlockDotSsse3((sbyte*)(aBlock + 2), bBlock + 2, ones);
             v = Ssse3.HorizontalAdd(v, v);
             v = Ssse3.HorizontalAdd(v, v);
-            float da = (float)Unsafe.ReadUnaligned<Half>(aBlock);
-            float db = (float)Unsafe.ReadUnaligned<Half>(bBlock);
+            float da = HalfToSingle(aBlock);
+            float db = HalfToSingle(bBlock);
             sumf += da * db * v.ToScalar();
         }
 

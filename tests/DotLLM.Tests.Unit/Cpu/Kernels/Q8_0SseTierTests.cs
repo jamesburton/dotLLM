@@ -54,6 +54,24 @@ public sealed unsafe class Q8_0SseTierTests
         }
     }
 
+    /// <summary>#1119: the scalar <c>HalfToSingle</c> the AVX2 Q8_0 kernels now use, against the software cast.</summary>
+    [Fact]
+    public unsafe void HalfToSingle_MatchesSoftwareHalf_AllBitPatterns()
+    {
+        ushort* h = stackalloc ushort[1];
+        for (int i = 0; i < 65536; i++)
+        {
+            *h = (ushort)i;
+            float expected = (float)BitConverter.UInt16BitsToHalf((ushort)i);
+            float actual = MatMul.HalfToSingle((byte*)h);
+            if (float.IsNaN(expected))
+                Assert.True(float.IsNaN(actual), $"half 0x{i:X4}: expected NaN, got {actual}");
+            else
+                Assert.True(BitConverter.SingleToInt32Bits(expected) == BitConverter.SingleToInt32Bits(actual),
+                    $"half 0x{i:X4}: expected 0x{BitConverter.SingleToInt32Bits(expected):X8}, got 0x{BitConverter.SingleToInt32Bits(actual):X8}");
+        }
+    }
+
     // ──────────────────── Kernels (bit-exact) ────────────────────
 
     [SkippableTheory]

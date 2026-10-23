@@ -200,7 +200,7 @@ public static unsafe partial class MatMul
             byte* ql = qk;
             byte* qh = qk + 128;
             sbyte* scales = (sbyte*)(qk + 192);
-            float d6 = (float)Unsafe.ReadUnaligned<Half>(qk + 208); // one scale per super-block: SSE conversion measured neutral
+            float d6 = HalfToSingle(qk + 208); // one scale per super-block: SSE conversion measured neutral
 
             float d8 = Unsafe.ReadUnaligned<float>(q8k);
             sbyte* q8qs = (sbyte*)(q8k + 4);
@@ -329,7 +329,7 @@ public static unsafe partial class MatMul
             byte* hm = qk;
             byte* q3 = qk + 32;
             Dequantize.UnpackQ3KScales(qk + 96, scales);
-            float d3 = (float)Unsafe.ReadUnaligned<Half>(qk + 108); // one scale per super-block
+            float d3 = HalfToSingle(qk + 108); // one scale per super-block
 
             float d8 = Unsafe.ReadUnaligned<float>(q8k);
             sbyte* q8qs = (sbyte*)(q8k + 4);

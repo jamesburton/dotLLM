@@ -73,8 +73,8 @@ public static unsafe partial class MatMul
             byte* aBlock = a + block * Q8_0BlockBytes;
             byte* bBlock = b + block * Q8_0BlockBytes;
 
-            float dw = (float)Unsafe.ReadUnaligned<Half>(aBlock);
-            float dx = (float)Unsafe.ReadUnaligned<Half>(bBlock);
+            float dw = HalfToSingle(aBlock);
+            float dx = HalfToSingle(bBlock);
 
             Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(aBlock + 2);
             Vector256<byte> vx = Unsafe.ReadUnaligned<Vector256<byte>>(bBlock + 2);
@@ -128,7 +128,7 @@ public static unsafe partial class MatMul
         for (int block = 0; block < blockCount; block++)
         {
             byte* xBlock = x + block * Q8_0BlockBytes;
-            float dx = (float)Unsafe.ReadUnaligned<Half>(xBlock);
+            float dx = HalfToSingle(xBlock);
             Vector256<byte> vx = Unsafe.ReadUnaligned<Vector256<byte>>(xBlock + 2);
             Vector256<byte> xu = vx ^ bias;
 
@@ -150,7 +150,7 @@ public static unsafe partial class MatMul
         ref Vector256<float> acc)
     {
         byte* wBlock = w + block * Q8_0BlockBytes;
-        float dw = (float)Unsafe.ReadUnaligned<Half>(wBlock);
+        float dw = HalfToSingle(wBlock);
         Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock + 2);
 
         Vector256<int> pos = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, xu, vw);

@@ -69,7 +69,7 @@ public static unsafe partial class KvQuantize
             byte* blockSrc = src + block * Q8_0BlockBytes;
             float* blockDst = dest + block * BlockSize;
 
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockSrc);
+            float d = MatMul.HalfToSingle(blockSrc);
             sbyte* qs = (sbyte*)(blockSrc + 2);
 
             for (int i = 0; i < BlockSize; i++)
@@ -87,7 +87,7 @@ public static unsafe partial class KvQuantize
             byte* blockSrc = src + block * Q8_0BlockBytes;
             float* blockDst = dest + block * BlockSize;
 
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockSrc);
+            float d = MatMul.HalfToSingle(blockSrc);
             Vector256<float> vScale = Vector256.Create(d);
             sbyte* qs = (sbyte*)(blockSrc + 2);
 
@@ -268,7 +268,7 @@ public static unsafe partial class KvQuantize
             byte* blockSrc = src + block * Q4_0BlockBytes;
             float* blockDst = dest + block * BlockSize;
 
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockSrc);
+            float d = MatMul.HalfToSingle(blockSrc);
             byte* qs = blockSrc + 2;
 
             for (int j = 0; j < 16; j++)
@@ -298,7 +298,7 @@ public static unsafe partial class KvQuantize
             byte* blockSrc = src + block * Q4_0BlockBytes;
             float* blockDst = dest + block * BlockSize;
 
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockSrc);
+            float d = MatMul.HalfToSingle(blockSrc);
             Vector256<float> vScale = Vector256.Create(d);
             byte* qs = blockSrc + 2;
 

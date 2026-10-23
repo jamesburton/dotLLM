@@ -1,4 +1,6 @@
 using System.Buffers;
+using System.Numerics.Tensors;
+using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Tensors;
 using DotLLM.Cuda.Interop;
@@ -352,9 +354,9 @@ public sealed class CudaKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache
             fixed (ushort* hp = host)
             {
                 CudaDriverApi.cuMemcpyDtoH_v2((nint)hp, _keys[layerIndex], (nuint)bytes).ThrowOnError();
-                for (int i = 0; i < count; i++) keys[i] = (float)BitConverter.UInt16BitsToHalf(host[i]);
+                TensorPrimitives.ConvertToSingle(MemoryMarshal.Cast<ushort, Half>(host.AsSpan(0, count)), keys); // vectorized; the scalar cast is a managed call (#1119)
                 CudaDriverApi.cuMemcpyDtoH_v2((nint)hp, _values[layerIndex], (nuint)bytes).ThrowOnError();
-                for (int i = 0; i < count; i++) values[i] = (float)BitConverter.UInt16BitsToHalf(host[i]);
+                TensorPrimitives.ConvertToSingle(MemoryMarshal.Cast<ushort, Half>(host.AsSpan(0, count)), values); // vectorized; the scalar cast is a managed call (#1119)
             }
         }
         finally

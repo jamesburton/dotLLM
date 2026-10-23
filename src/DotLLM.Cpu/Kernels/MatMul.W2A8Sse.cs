@@ -76,7 +76,7 @@ public static unsafe partial class MatMul
         for (int g = 0; g < groups; g++)
         {
             byte* groupBase = rowPtr + g * PQ2_0GroupBytes;
-            groupScales[g] = (float)Unsafe.ReadUnaligned<Half>(groupBase);
+            groupScales[g] = HalfToSingle(groupBase);
             byte* bp = groupBase + 2;
             sbyte* outp = dest + g * PQ2_0GroupSize;
 
@@ -217,7 +217,7 @@ public static unsafe partial class MatMul
     internal static void ConvertQ8_0Scales(byte* q8, float* dest, int blockCount)
     {
         for (int b = 0; b < blockCount; b++)
-            dest[b] = (float)Unsafe.ReadUnaligned<Half>(q8 + (long)b * Q8_0BlockBytes);
+            dest[b] = HalfToSingle(q8 + (long)b * Q8_0BlockBytes);
     }
 
     /// <summary>

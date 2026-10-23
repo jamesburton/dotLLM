@@ -55,7 +55,7 @@ public static unsafe partial class MatMul
                 int q8Block = sIdx / 2;
                 int q8Off = (sIdx % 2) * Dequantize.Nvfp4SubBlockSize;
                 byte* y = q8 + (2 * ib + q8Block) * Q8_0BlockBytes;
-                float dy = (float)*(Half*)y;
+                float dy = HalfToSingle((byte*)y);
                 sbyte* yqs = (sbyte*)(y + 2);
 
                 int sumiLo = 0, sumiHi = 0;
@@ -109,8 +109,8 @@ public static unsafe partial class MatMul
             Vector256<int> p23 = Avx2.MultiplyAddAdjacent(
                 Avx2.MultiplyAddAdjacent(Avx2.Abs(w23), Avx2.Sign(q23, w23)), ones);
 
-            float dy0 = (float)*(Half*)y0;
-            float dy1 = (float)*(Half*)y1;
+            float dy0 = HalfToSingle((byte*)y0);
+            float dy1 = HalfToSingle((byte*)y1);
             Vector256<float> s01 = Vector256.Create(
                 Vector128.Create(Dequantize.Ue4m3ToFloatHalf(x[0]) * dy0),
                 Vector128.Create(Dequantize.Ue4m3ToFloatHalf(x[1]) * dy0));

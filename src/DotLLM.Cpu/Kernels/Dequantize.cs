@@ -274,7 +274,7 @@ public static unsafe partial class Dequantize
 
         for (long b = 0; b < blockCount; b++)
         {
-            float scale = (float)Unsafe.ReadUnaligned<Half>(blockBase);
+            float scale = MatMul.HalfToSingle(blockBase);
             sbyte* qs = (sbyte*)(blockBase + 2);
 
             for (int i = 0; i < Q8_0GroupSize; i++)
@@ -362,7 +362,7 @@ public static unsafe partial class Dequantize
         int outIdx = 0;
         for (long b = 0; b < blockCount; b++)
         {
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockBase);
+            float d = MatMul.HalfToSingle(blockBase);
             byte* qs = blockBase + 2;
             for (int j = 0; j < 16; j++)
             {
@@ -393,8 +393,8 @@ public static unsafe partial class Dequantize
         int outIdx = 0;
         for (long b = 0; b < blockCount; b++)
         {
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockBase);
-            float m = (float)Unsafe.ReadUnaligned<Half>(blockBase + 2);
+            float d = MatMul.HalfToSingle(blockBase);
+            float m = MatMul.HalfToSingle(blockBase + 2);
             byte* qs = blockBase + 4;
             for (int j = 0; j < 16; j++)
             {
@@ -426,8 +426,8 @@ public static unsafe partial class Dequantize
         int outIdx = 0;
         for (long b = 0; b < blockCount; b++)
         {
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockBase);
-            float m = (float)Unsafe.ReadUnaligned<Half>(blockBase + 2);
+            float d = MatMul.HalfToSingle(blockBase);
+            float m = MatMul.HalfToSingle(blockBase + 2);
             uint qh = Unsafe.ReadUnaligned<uint>(blockBase + 4);
             byte* qs = blockBase + 8;
             for (int j = 0; j < 16; j++)
@@ -478,7 +478,7 @@ public static unsafe partial class Dequantize
 
         for (long b = 0; b < blockCount; b++)
         {
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockBase);
+            float d = MatMul.HalfToSingle(blockBase);
             uint qh = Unsafe.ReadUnaligned<uint>(blockBase + 2);
             byte* qs = blockBase + 6;
 
@@ -552,7 +552,7 @@ public static unsafe partial class Dequantize
         long blocks = elementCount / QuantFormat.Q2_0GroupSize;
         for (long b = 0; b < blocks; b++)
         {
-            float d = (float)BitConverter.UInt16BitsToHalf((ushort)(p[0] | (p[1] << 8)));
+            float d = MatMul.HalfToSingle((ushort)(p[0] | (p[1] << 8)));
             long o = b * QuantFormat.Q2_0GroupSize;
             for (int j = 0; j < QuantFormat.Q2_0GroupSize; j++)
                 dest[(int)(o + j)] = (((p[2 + (j >> 2)] >> ((j & 3) * 2)) & 3) - 1) * d;
@@ -595,7 +595,7 @@ public static unsafe partial class Dequantize
         for (long g = 0; g < groupCount; g++)
         {
             byte* groupBase = data + g * PQ2_0GroupBytes;
-            float scale = (float)Unsafe.ReadUnaligned<Half>(groupBase);
+            float scale = MatMul.HalfToSingle(groupBase);
             byte* codes = groupBase + 2;
             int outBase = (int)(g * PQ2_0GroupSize);
 
@@ -635,7 +635,7 @@ public static unsafe partial class Dequantize
             for (long b = 0; b < blockCount; b++)
             {
                 // Broadcast the Half scale to all 8 lanes.
-                float scale = (float)Unsafe.ReadUnaligned<Half>(blockBase);
+                float scale = MatMul.HalfToSingle(blockBase);
                 Vector256<float> vScale = Vector256.Create(scale);
 
                 // Load the 4-byte high-bit field and the 16-byte packed-nibble payload.
@@ -698,7 +698,7 @@ public static unsafe partial class Dequantize
             for (long b = 0; b < blockCount; b++)
             {
                 // Read the Half scale and broadcast to all 8 lanes.
-                float scale = (float)Unsafe.ReadUnaligned<Half>(blockBase);
+                float scale = MatMul.HalfToSingle(blockBase);
                 Vector256<float> vScale = Vector256.Create(scale);
 
                 // Load 32 sbytes (quantized values).

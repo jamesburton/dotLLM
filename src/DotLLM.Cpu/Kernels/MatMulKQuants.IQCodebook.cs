@@ -31,7 +31,7 @@ internal unsafe interface IIqFormat
     static abstract float Factor { get; }
     static abstract IqSubBlock Decode(byte* qk, int ib);
     /// <summary>The block's fp32 super-scale <c>d</c>; every format but IQ1_M stores it as the leading fp16.</summary>
-    static virtual float Scale(byte* qk) => (float)Unsafe.ReadUnaligned<Half>(qk);
+    static virtual float Scale(byte* qk) => MatMul.HalfToSingle(qk);
 }
 
 /// <summary>
@@ -268,7 +268,7 @@ public static unsafe partial class MatMul
         {
             ushort* sc = (ushort*)(qk + 48);
             ushort bits = (ushort)((sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
-            return (float)BitConverter.UInt16BitsToHalf(bits);
+            return MatMul.HalfToSingle(bits);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

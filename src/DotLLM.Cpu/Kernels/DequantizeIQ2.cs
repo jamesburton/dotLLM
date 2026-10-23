@@ -1879,7 +1879,7 @@ public static unsafe partial class Dequantize
 
         for (long b = 0; b < blockCount; b++)
         {
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockBase);
+            float d = MatMul.HalfToSingle(blockBase);
             byte* qsBytes = blockBase + 2;
 
             // 8 sub-blocks of 32 elements each. Each sub-block reads 4 uint32s = 16 bytes from qs.
@@ -1933,7 +1933,7 @@ public static unsafe partial class Dequantize
 
         for (long b = 0; b < blockCount; b++)
         {
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockBase);
+            float d = MatMul.HalfToSingle(blockBase);
             byte* qsBytes = blockBase + 2;
             byte* scales = blockBase + 2 + 64;
 
@@ -1987,7 +1987,7 @@ public static unsafe partial class Dequantize
 
         for (long b = 0; b < blockCount; b++)
         {
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockBase);
+            float d = MatMul.HalfToSingle(blockBase);
             byte* qsLow = blockBase + 2;             // 32 bytes - low 8 bits of index per pair
             byte* qsSigns = blockBase + 2 + 32;      // 32 bytes - sign byte per pair (offset 34)
             byte* qh = blockBase + 2 + 64;           // 8 bytes - high 2 bits per pair (offset 66)

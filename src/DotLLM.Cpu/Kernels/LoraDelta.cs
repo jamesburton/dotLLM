@@ -591,7 +591,7 @@ public static unsafe class LoraDelta
         for (int block = 0; block < blockCount; block++)
         {
             byte* blockSrc = srcQ8 + block * 34;
-            float scale = (float)Unsafe.ReadUnaligned<Half>(blockSrc);
+            float scale = MatMul.HalfToSingle(blockSrc);
             sbyte* qs = (sbyte*)(blockSrc + 2);
             float* dstBlock = dstF32 + block * 32;
             for (int i = 0; i < 32; i++)

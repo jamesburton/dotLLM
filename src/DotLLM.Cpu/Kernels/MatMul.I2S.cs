@@ -936,10 +936,10 @@ public static unsafe partial class MatMul
             byte* xb3 = x3 + xoff;
 
             // Row-invariant per-block activation scales: fetched + broadcast once for all 4 rows.
-            Vector256<float> s0 = Vector256.Create((float)Unsafe.ReadUnaligned<Half>(xb0));
-            Vector256<float> s1 = Vector256.Create((float)Unsafe.ReadUnaligned<Half>(xb1));
-            Vector256<float> s2 = Vector256.Create((float)Unsafe.ReadUnaligned<Half>(xb2));
-            Vector256<float> s3 = Vector256.Create((float)Unsafe.ReadUnaligned<Half>(xb3));
+            Vector256<float> s0 = Vector256.Create(HalfToSingle(xb0));
+            Vector256<float> s1 = Vector256.Create(HalfToSingle(xb1));
+            Vector256<float> s2 = Vector256.Create(HalfToSingle(xb2));
+            Vector256<float> s3 = Vector256.Create(HalfToSingle(xb3));
 
             Vector256<sbyte> q0 = Unsafe.ReadUnaligned<Vector256<sbyte>>(xb0 + 2);
             Vector256<sbyte> q1 = Unsafe.ReadUnaligned<Vector256<sbyte>>(xb1 + 2);

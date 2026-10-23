@@ -48,7 +48,7 @@ public static unsafe partial class MatMul
 
         for (int sb = 0; sb < superBlockCount; sb++)
         {
-            float d = (float)Unsafe.ReadUnaligned<Half>(qk) * Unsafe.ReadUnaligned<float>(q8k);
+            float d = HalfToSingle(qk) * Unsafe.ReadUnaligned<float>(q8k);
             byte* qs = qk + 8;
             sbyte* q8 = (sbyte*)(q8k + 4);
 
@@ -92,7 +92,7 @@ public static unsafe partial class MatMul
 
         for (int sb = 0; sb < superBlockCount; sb++)
         {
-            float dd = (float)Unsafe.ReadUnaligned<Half>(qk) * Unsafe.ReadUnaligned<float>(q8k);
+            float dd = HalfToSingle(qk) * Unsafe.ReadUnaligned<float>(q8k);
             byte* qs = qk + 8;
             sbyte* q8 = (sbyte*)(q8k + 4);
 
@@ -133,7 +133,7 @@ public static unsafe partial class MatMul
 
         for (int sb = 0; sb < superBlockCount; sb++)
         {
-            float dd = (float)Unsafe.ReadUnaligned<Half>(qk) * Unsafe.ReadUnaligned<float>(q8k);
+            float dd = HalfToSingle(qk) * Unsafe.ReadUnaligned<float>(q8k);
             byte* qs = qk + 8;
             sbyte* q8 = (sbyte*)(q8k + 4);
 
@@ -229,7 +229,7 @@ public static unsafe partial class MatMul
 
         for (int sb = 0; sb < superBlockCount; sb++)
         {
-            float d = (float)Unsafe.ReadUnaligned<Half>(qk);
+            float d = HalfToSingle(qk);
             byte* qs = qk + 8;
             Vector256<int> s0 = Vector256<int>.Zero, s1 = s0, s2 = s0, s3 = s0;
 

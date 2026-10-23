@@ -141,11 +141,11 @@ public static unsafe partial class MatMul
                 Unsafe.ReadUnaligned<Vector128<sbyte>>(xb + 4),
                 Unsafe.ReadUnaligned<Vector128<sbyte>>(xb + 20), ones));
 
-            float d = (float)Unsafe.ReadUnaligned<Half>(wb);
-            sumf += d * (float)Unsafe.ReadUnaligned<Half>(xb) * sumi;
+            float d = HalfToSingle(wb);
+            sumf += d * HalfToSingle(xb) * sumi;
             if (isIq4) continue;
-            float offd = hasMin ? (float)Unsafe.ReadUnaligned<Half>(wb + 2) : d;
-            offsetSum += offd * (float)Unsafe.ReadUnaligned<Half>(xb + 2);
+            float offd = hasMin ? HalfToSingle(wb + 2) : d;
+            offsetSum += offd * HalfToSingle(xb + 2);
         }
 
         if (isIq4) return sumf;
@@ -284,8 +284,8 @@ public static unsafe partial class MatMul
                 {
                     byte* wb = wRow + block * blockBytes;
                     UnpackLegacySse(qt, wb, out var lo, out var hi, out var signLo, out var signHi);
-                    float d = (float)Unsafe.ReadUnaligned<Half>(wb);
-                    float offd = hasMin ? (float)Unsafe.ReadUnaligned<Half>(wb + 2) : d;
+                    float d = HalfToSingle(wb);
+                    float offd = hasMin ? HalfToSingle(wb + 2) : d;
 
                     for (int j = 0; j < nt; j++)
                     {
@@ -298,8 +298,8 @@ public static unsafe partial class MatMul
                             q8Hi = Ssse3.Sign(q8Hi, signHi);
                         }
                         int sumi = HorizontalSumInt(UnsignedPairsSse(lo, hi, q8Lo, q8Hi, ones));
-                        acc[j] += d * (float)Unsafe.ReadUnaligned<Half>(xb) * sumi;
-                        if (!isIq4) off[j] += offd * (float)Unsafe.ReadUnaligned<Half>(xb + 2);
+                        acc[j] += d * HalfToSingle(xb) * sumi;
+                        if (!isIq4) off[j] += offd * HalfToSingle(xb + 2);
                     }
                 }
 

@@ -83,8 +83,8 @@ public static unsafe partial class MatMul
         for (int sb = 0; sb < superBlockCount; sb++)
         {
             float d8 = Unsafe.ReadUnaligned<float>(q8k);
-            float d5 = (float)Unsafe.ReadUnaligned<Half>(w);
-            float dm = (float)Unsafe.ReadUnaligned<Half>(w + 2);
+            float d5 = HalfToSingle(w);
+            float dm = HalfToSingle(w + 2);
             UnpackQ4KScalesFast(w + 4, out Vector128<short> sc16, out Vector256<short> mnDup);
             Sse2.Store(sc, sc16);
 
@@ -122,8 +122,8 @@ public static unsafe partial class MatMul
 
         for (int sb = 0; sb < superBlockCount; sb++)
         {
-            float d5 = (float)Unsafe.ReadUnaligned<Half>(w);
-            float dm = (float)Unsafe.ReadUnaligned<Half>(w + 2);
+            float d5 = HalfToSingle(w);
+            float dm = HalfToSingle(w + 2);
             UnpackQ4KScalesFast(w + 4, out Vector128<short> sc16, out Vector256<short> mnDup);
             Sse2.Store(sc, sc16);
 
