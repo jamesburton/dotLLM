@@ -1713,9 +1713,10 @@ internal sealed class TransformerWeights : IDisposable
         // Optional FFN sub-norm (BitNet Sub-LN): RMSNorm over the gated intermediate [intermediateSize] before ffn_down.
         float[]? ffnSubNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.ffn_sub_norm.weight", config.IntermediateSize);
 
-        // MiMo-V2 routed-MoE layer: sigmoid + selection-bias top-k, no shared expert, raw GGUF quant banks kept in place
-        // (the F32 host dequant would be ~1.2 TB at 310B scale). Layer 0 is dense and falls through to the dense path below.
-        if (config.Architecture == DotLLM.Core.Configuration.Architecture.MiMoV2
+        // MiMo-V2 / Flint routed-MoE layer: sigmoid (+ optional selection-bias) top-k, raw GGUF quant banks kept in place
+        // (the F32 host dequant would be ~1.2 TB at MiMo's 310B scale, ~150 GB for Flint). Flint's ungated shared expert also
+        // stays raw (ForwardMoeGrouped runs it quantised). Leading dense layers fall through to the dense path below.
+        if (config.Architecture is DotLLM.Core.Configuration.Architecture.MiMoV2 or DotLLM.Core.Configuration.Architecture.Flint
             && config.Moe is not null && config.Moe.IsMoeLayer(layerIdx)
             && tensors.ContainsKey($"{prefix}.ffn_gate_exps.weight"))
         {

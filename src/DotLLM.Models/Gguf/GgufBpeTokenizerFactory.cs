@@ -37,16 +37,33 @@ public static class GgufBpeTokenizerFactory
 
         // llama.cpp stops on eot / eom as well as eos (#797): GLM-4.x ends a turn with <|user|> (eot) and a
         // tool call with <|observation|> (eom), neither of which is the declared eos (<|endoftext|>).
-        var extra = new List<int>(2);
+        var extra = new List<int>(4);
+        void AddEog(int id)
+        {
+            if (id >= 0 && id < tokens.Length && id != eosId && !extra.Contains(id))
+                extra.Add(id);
+        }
+
         foreach (string key in new[] { "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id" })
         {
             if (metadata.ContainsKey(key))
+                AddEog((int)metadata.GetUInt32OrDefault(key, uint.MaxValue));
+        }
+
+        // Explicit EOG list (Flint ships four: <|endoftext|>, <|user|>, <|observation|>, ...).
+        foreach (int id in GgufModelConfigExtractor.GetIntArrayOrEmpty(metadata, "tokenizer.ggml.eog_token_ids"))
+            AddEog(id);
+
+        // llama.cpp (llama-vocab.cpp) also forces <|user|> / <|observation|> as EOG for pre-type "flint".
+        if (metadata.GetStringOrDefault("tokenizer.ggml.pre", "") == "flint")
+        {
+            for (int i = 0; i < tokens.Length; i++)
             {
-                int id = (int)metadata.GetUInt32OrDefault(key, uint.MaxValue);
-                if (id >= 0 && id < tokens.Length && id != eosId && !extra.Contains(id))
-                    extra.Add(id);
+                if (tokens[i] is "<|user|>" or "<|observation|>")
+                    AddEog(i);
             }
         }
+
         tokenizer.ExtraEndOfGenerationTokenIds = extra.ToArray();
 
         // Gemma 1 / CodeGemma / Gemma 2 are untrained-without-BOS: every consumer that calls

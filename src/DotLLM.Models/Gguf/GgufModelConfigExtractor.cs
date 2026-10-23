@@ -34,9 +34,9 @@ public static partial class GgufModelConfigExtractor
             return BuildGemma4Config(metadata, arch, architecture);
 
         // MiMo-V2 likewise stores head_count_kv / sliding_window_pattern as per-layer arrays (global vs SWA layers differ),
-        // and has K head_dim != V head_dim; dedicated builder.
-        if (architecture == Architecture.MiMoV2)
-            return BuildMiMoV2Config(metadata, arch);
+        // and has K head_dim != V head_dim; dedicated builder. Flint shares the same sinks + SWA-mix + sigmoid-MoE layout.
+        if (architecture is Architecture.MiMoV2 or Architecture.Flint)
+            return BuildMiMoV2Config(metadata, arch, architecture);
 
         int hiddenSize = (int)metadata.GetUInt32($"{arch}.embedding_length");
         int numLayers = (int)metadata.GetUInt32($"{arch}.block_count");
@@ -1118,6 +1118,8 @@ public static partial class GgufModelConfigExtractor
             "gpt-oss" => Architecture.GptOss,
             // Xiaomi MiMo-V2 (llama.cpp LLM_ARCH_MIMO2): GQA + sinks/SWA mix + K!=V head dim + sigmoid-bias MoE.
             "mimo2" => Architecture.MiMoV2,
+            // Recursive Flint (llama.cpp LLM_ARCH_FLINT): sinks on every layer, SWA/full mix with NoPE full layers, sigmoid MoE + shared expert.
+            "flint" => Architecture.Flint,
             // Gemma 1 / CodeGemma (llama.cpp LLM_ARCH_GEMMA) and Gemma 2 (LLM_ARCH_GEMMA2).
             "gemma" => Architecture.Gemma,
             "gemma2" => Architecture.Gemma2,
@@ -1163,8 +1165,17 @@ public static partial class GgufModelConfigExtractor
     ///   <c>ffn_gate_exps</c> tensor and <see cref="MoeConfig.MlpOnlyLayers"/> carries the same default for consumers that
     ///   only see the config).</item>
     /// </list>
+    /// <para><b>Flint</b> (llama.cpp <c>flint</c>, src/models/flint.cpp) reuses this layout with: sinks on every layer (loaded by
+    /// tensor presence), <c>attention.rope_pattern</c> (per-layer bool, false = NoPE) mapped onto
+    /// <see cref="ModelConfig.NoRopeLayers"/>, two leading dense layers, and one ungated shared expert of width
+    /// <c>expert_shared_feed_forward_length</c> (<c>expert_shared_count</c> is that width over the expert width, not a count of
+    /// separate experts).</para>
     /// </remarks>
-    private static ModelConfig BuildMiMoV2Config(GgufMetadata metadata, string arch)
+    /// <param name="metadata">GGUF metadata.</param>
+    /// <param name="arch">Lower-case architecture key prefix.</param>
+    /// <param name="architecture">Either <see cref="Architecture.MiMoV2"/> or <see cref="Architecture.Flint"/>.</param>
+    /// <returns>The model configuration.</returns>
+    private static ModelConfig BuildMiMoV2Config(GgufMetadata metadata, string arch, Architecture architecture)
     {
         int hiddenSize = (int)metadata.GetUInt32($"{arch}.embedding_length");
         int blockCount = (int)metadata.GetUInt32($"{arch}.block_count");
@@ -1233,12 +1244,33 @@ public static partial class GgufModelConfigExtractor
         int moeIntermediate = (int)metadata.GetUInt32($"{arch}.expert_feed_forward_length");
         uint gating = metadata.GetUInt32OrDefault($"{arch}.expert_gating_func", 2);
         if (gating != 2)
-            throw new InvalidDataException($"{arch}.expert_gating_func = {gating} is not supported (mimo2 routes with sigmoid = 2).");
+            throw new InvalidDataException($"{arch}.expert_gating_func = {gating} is not supported ({arch} routes with sigmoid = 2).");
         float weightsScale = metadata.GetFloat32OrDefault($"{arch}.expert_weights_scale", 1.0f);
         if (weightsScale == 0.0f) weightsScale = 1.0f;
         int leadingDense = (int)metadata.GetUInt32OrDefault($"{arch}.leading_dense_block_count", 1);
         var mlpOnly = new int[Math.Max(0, Math.Min(leadingDense, numLayers))];
         for (int i = 0; i < mlpOnly.Length; i++) mlpOnly[i] = i;
+
+        // Shared expert (Flint): one fused, ungated SwiGLU MLP; mimo2 has none.
+        int sharedCount = (int)metadata.GetUInt32OrDefault($"{arch}.expert_shared_count", 0);
+        int sharedWidth = sharedCount > 0
+            ? (int)metadata.GetUInt32OrDefault($"{arch}.expert_shared_feed_forward_length", (uint)(moeIntermediate * sharedCount))
+            : 0;
+
+        // attention.rope_pattern (Flint): true = apply RoPE, false = NoPE.
+        int[] ropePattern = GetIntArrayOrEmpty(metadata, $"{arch}.attention.rope_pattern");
+        List<int>? noRope = null;
+        for (int i = 0; i < Math.Min(ropePattern.Length, numLayers); i++)
+        {
+            if (ropePattern[i] == 0)
+                (noRope ??= new List<int>()).Add(i);
+        }
+
+        // A global RoPE table only matters when some full-attention layer still rotates.
+        bool anyRopedGlobal = false;
+        for (int i = 0; i < numLayers && !anyRopedGlobal; i++)
+            anyRopedGlobal = perLayerSliding[i] is null && (noRope is null || !noRope.Contains(i));
+
         var moe = new MoeConfig
         {
             NumExperts = expertCount,
@@ -1246,11 +1278,14 @@ public static partial class GgufModelConfigExtractor
             MoeIntermediateSize = moeIntermediate,
             NormTopKProb = false,
             SigmoidGating = true,
-            HasSelectionBias = true,
+            HasSelectionBias = true,   // exp_probs_b; a missing tensor loads as "no bias" (Flint ships none)
             NormalizeExpertWeights = metadata.GetBoolOrDefault($"{arch}.expert_weights_norm", true),
             ExpertWeightsScale = weightsScale,
             DecoderSparseStep = 1,
             MlpOnlyLayers = mlpOnly.Length > 0 ? mlpOnly : null,
+            SharedExpertIntermediateSize = sharedWidth > 0 ? sharedWidth : null,
+            NumSharedExperts = sharedWidth > 0 ? 1 : 0,
+            HasSharedExpertGate = false,
         };
 
         string? chatTemplate = metadata.GetStringOrDefault("tokenizer.chat_template", null!);
@@ -1260,7 +1295,7 @@ public static partial class GgufModelConfigExtractor
 
         return new ModelConfig
         {
-            Architecture = Architecture.MiMoV2,
+            Architecture = architecture,
             VocabSize = vocabSize,
             HiddenSize = hiddenSize,
             IntermediateSize = denseIntermediate,
@@ -1276,7 +1311,8 @@ public static partial class GgufModelConfigExtractor
             AttentionType = AttentionType.GQA,
             PositionEncodingType = PositionEncodingType.RoPE,
             RoPEConfig = slidingRope,
-            GlobalRoPEConfig = globalRope,
+            GlobalRoPEConfig = anyRopedGlobal ? globalRope : null,
+            NoRopeLayers = noRope,
             NormEpsilon = normEps,
             SlidingWindowSize = window,
             PerLayerSlidingWindow = perLayerSliding,

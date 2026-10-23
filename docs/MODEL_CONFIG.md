@@ -135,6 +135,50 @@ Differences between architectures are captured entirely in ModelConfig.
   compares HF torch / llama.cpp CPU / dotLLM CPU (max |dlogit| 1.9e-5, KL 8.6e-12, top-1 100%; decode through the per-layer-strided KV cache
   matches too). `MiMoV2SyntheticGoldenTests` is the hermetic variant (C#-written GGUF vs llama.cpp golden logits, plus mutants).
 
+### Recursive Flint (`flint`) - CPU (#1158), tracker #1157
+- GGUF arch string: `flint` (llama.cpp `LLM_ARCH_FLINT`, `src/models/flint.cpp`, ggml-org/llama.cpp#30928); HF `FlintForCausalLM`
+  (no transformers modeling code; references are llama.cpp, SGLang, vLLM, MLX `rec`). 39.8B total / ~2.5B active, 49 layers, hidden 2048.
+- **Attention**: 32 Q heads / 4 KV heads, head_dim 128 (Q projection 4096 wide, wider than hidden), separate `attn_q/k/v`, per-head
+  QK-RMSNorm (`attn_q_norm` / `attn_k_norm` [128]) before RoPE, learned per-head **attention sinks on every layer**
+  (`attn_sinks.weight` [32]), score scale `1/sqrt(128)`.
+- **SWA / full mix**: `attention.sliding_window` = 513 (current + 512 previous, llama.cpp `LLAMA_SWA_TYPE_STANDARD`) on the layers
+  flagged by `attention.sliding_window_pattern` (bool array, true = sliding; 35 of 49), full attention on the other 14.
+- **RoPE**: NEOX, theta 1e4, full head dim, on the layers flagged by `attention.rope_pattern` (bool array, true = RoPE). The full layers are
+  **NoPE**; the extractor maps them onto `ModelConfig.NoRopeLayers` and leaves `GlobalRoPEConfig` null when every full layer is NoPE.
+- **FFN**: layers 0-1 dense SwiGLU 6144 (`leading_dense_block_count` = 2); layers 2-48 MoE: 256 experts, top-6, expert ff 512, **sigmoid**
+  scores, renormalised (`expert_weights_norm`), scale 1.0, no selection bias in any shipped file (`exp_probs_b` is optional and loads as
+  "no bias"), plus **one ungated shared expert** of width `expert_shared_feed_forward_length` = 1024 added to the routed output.
+  `expert_shared_count` = 2 is that width over the expert width, not two experts (`NumSharedExperts` = 1).
+- **Built by** `BuildMiMoV2Config` (shared with `mimo2`); the CPU loader reuses the MiMo-V2 MoE branch, which keeps the routed AND the
+  shared expert banks in the raw GGUF quant view (no F32 copy, rule 2). `ForwardMoeGrouped` runs the shared expert from the raw view
+  through the same `DispatchGemm` as the routed experts, and uses the packed x Q8_1 dot for Q4_0/Q4_1/Q5_1/IQ4_NL banks (the official file is
+  Q4_1 throughout; batch-invariant).
+- Tokenizer: GPT-2 BPE, `tokenizer.ggml.pre = flint` (3-stage pipeline: `\p{N}{1,3}`, CJK/kana runs, GPT-4o-style main regex with
+  ` ?[\p{P}\p{S}]+[\r\n]*`), vocab 150144, no BOS for chat. EOG: `tokenizer.ggml.eog_token_ids` plus `<|user|>` / `<|observation|>`
+  (llama.cpp forces both for this pre-type). Chat template: `<|system|>` / `<|developer|>` / `<|user|>` / `<|assistant|>` /
+  `<|observation|>`, `<think>` reasoning, GLM-4.5-style tool calls (`GlmToolCallParser`); it strips `"\x00"`, which needs the Jinja lexer's
+  hex escapes.
+- **F16-safe down input**: Flint's routed SwiGLU output reaches ~13000; the Q8_1 block sum `s = d * sum(q)` is stored as F16 and
+  overflowed to inf (then NaN, then an out-of-range expert index in the next layer's routing). The routed down projection now divides
+  each input row by `e = 2^ceil(log2(max|row| / 1024))` and multiplies the projected row back (llama.cpp `build_amax_src1_f16`). A
+  power of two is exact, so rows at or below 1024 are untouched; it applies to every architecture.
+- **KV**: the CPU caches allocate full context on every layer (no 513-token ring yet, #1157 F2), so use a short `--ctx-size`.
+- **GPU**: CUDA and Vulkan refuse `flint` (`ModelConfig.FlintUnsupportedMessage`); bring-up is #1157 F4 (Vulkan) / F6 (CUDA).
+- Verification: `FlintSyntheticGoldenTests` writes a random-weight `flint` GGUF (GQA 8:2, Q wider than hidden, window 4 over 16 tokens,
+  NoPE on a MoE layer, sinks everywhere, shared expert) and compares against llama.cpp CPU logits on the same bytes: F32 max |dlogit|
+  2.1e-6, Q4_1 routed + Q8_0 shared 8.0e-6; NoPE, window, shared expert, renormalisation and sinks each move the logits by > 4.
+  `JinjaFlintReferenceRenderTests` renders the real template byte-identically to transformers.
+- **Real weights** (`RecursiveSI/flint-int4-gguf`, Q4_1, vs llama.cpp ggml-org/llama.cpp#30928 CPU, 155H):
+  - token ids identical to `llama-tokenize` on prose, C# source and a mixed CJK/emoji/digits/code text;
+  - teacher-forced top-1 on llama.cpp's greedy 128-token answers (5 chat prompts): 98.2-100 %, every miss a near-tie (gap 0.06-0.46);
+  - peak private memory 423 MiB for the 24.8 GB file (no expert expansion, no copy).
+- **KL against llama.cpp is not a parity metric for Flint.** Its Q4_1 path quantises activations to Q8_1, and Flint's large
+  activations make that coarse: llama.cpp's own Q4_1 file vs the same weights dequantised to F32 is KL 6e-3 (synthetic, head_dim
+  128, 512 tokens), while dotLLM's batched prefill (exact dequantised weights x F32 activations) matches the dequantised reference
+  to 2e-5. On the real model, dotLLM vs llama.cpp (both F32 KV) is mean KL 0.016 / 0.018 / 0.073 (prose / code / mixed), and dotLLM's
+  own prefill vs its Q8_1-activation decode is 0.011; llama.cpp vs itself at a different thread count is 0.000. dotLLM's prefill PPL
+  is 1-6 % above llama.cpp's on those corpora (exact activations vs Q8_1; which is closer to the BF16 reference is open).
+
 ### Qwen4-Exp / Qwen3.8-Flash-Next (`qwen4exp`) — config (#815) + CPU reference forward (#816), epic #814
 - GGUF arch string: `qwen4exp` (llama.cpp `LLM_ARCH_QWEN4EXP`) -> `Architecture.Qwen4Exp`. The **CPU** loader builds `Qwen4ExpTransformerModel` (the
   numerical oracle, validated against HF `qwen4_exp` on a tiny random-weight model); **Vulkan** builds `VulkanQwen4ExpTransformerModel` (#818, below);

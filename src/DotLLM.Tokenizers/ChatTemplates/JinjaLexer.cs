@@ -271,6 +271,17 @@ internal sealed class JinjaLexer
             {
                 Advance(); // skip backslash
                 char escaped = _source[_pos];
+
+                // Python string-literal hex escapes: \xNN, \uNNNN, \UNNNNNNNN (Flint's template strips "\x00").
+                int hexDigits = escaped switch { 'x' => 2, 'u' => 4, 'U' => 8, _ => 0 };
+                if (hexDigits > 0 && TryReadHex(_pos + 1, hexDigits, out int codePoint))
+                {
+                    sb.Append(char.ConvertFromUtf32(codePoint));
+                    for (int i = 0; i <= hexDigits; i++)
+                        Advance();
+                    continue;
+                }
+
                 sb.Append(escaped switch
                 {
                     'n' => '\n',
@@ -296,6 +307,34 @@ internal sealed class JinjaLexer
         Advance(); // skip closing quote
         return new JinjaToken(JinjaTokenType.StringLiteral, sb.ToString(), startLine, startCol);
     }
+
+    /// <summary>Parses exactly <paramref name="count"/> hex digits starting at <paramref name="start"/> as a Unicode scalar value.</summary>
+    /// <param name="start">Index of the first hex digit.</param>
+    /// <param name="count">Number of hex digits to read.</param>
+    /// <param name="codePoint">The parsed code point when successful.</param>
+    /// <returns><see langword="true"/> when all digits are hex and the value is a valid scalar (not a surrogate).</returns>
+    private bool TryReadHex(int start, int count, out int codePoint)
+    {
+        codePoint = 0;
+        if (start + count > _source.Length)
+            return false;
+        for (int i = 0; i < count; i++)
+        {
+            int d = HexValue(_source[start + i]);
+            if (d < 0)
+                return false;
+            codePoint = (codePoint << 4) | d;
+        }
+        return codePoint is >= 0 and <= 0x10FFFF and not (>= 0xD800 and <= 0xDFFF);
+    }
+
+    private static int HexValue(char c) => c switch
+    {
+        >= '0' and <= '9' => c - '0',
+        >= 'a' and <= 'f' => c - 'a' + 10,
+        >= 'A' and <= 'F' => c - 'A' + 10,
+        _ => -1,
+    };
 
     private JinjaToken ReadNumber()
     {

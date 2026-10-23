@@ -891,7 +891,12 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 sharedExpertGate: moe.SharedExpertGate is not null
                     ? moe.SharedExpertGate.AsSpan() : ReadOnlySpan<float>.Empty,
                 loraAdapter: _currentAdapter, loraLayer: layer,
-                threadPool: _threadPool);
+                threadPool: _threadPool,
+                // Flint's official file is Q4_1 throughout: the packed x Q8_1 dot is batch-invariant and ~10x the dequant fallback.
+                packedLegacyExperts: Config.Architecture == DotLLM.Core.Configuration.Architecture.Flint,
+                sharedGateRaw: moe.SharedGateRaw, sharedGateRawQt: moe.SharedGateRawQt,
+                sharedUpRaw: moe.SharedUpRaw, sharedUpRawQt: moe.SharedUpRawQt,
+                sharedDownRaw: moe.SharedDownRaw, sharedDownRawQt: moe.SharedDownRawQt);
         }
         finally
         {

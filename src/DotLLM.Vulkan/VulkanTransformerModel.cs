@@ -2981,6 +2981,10 @@ public sealed partial class VulkanTransformerModel : IModel
         if (config.Architecture == DotLLM.Core.Configuration.Architecture.MiMoV2 && !allowGptOss)
             throw new NotSupportedException(ModelConfig.MiMoV2UnsupportedMessage("Vulkan"));
 
+        // Flint (#1157 F4): NoPE in the MoE route, the ungated quantised shared expert and Q4_1 MoE shaders are not wired yet.
+        if (config.Architecture == DotLLM.Core.Configuration.Architecture.Flint)
+            throw new NotSupportedException(ModelConfig.FlintUnsupportedMessage("Vulkan"));
+
         // gpt-oss (#480): the dense VulkanTransformerModel would load it and produce wrong output
         // with no error — see GptOssUnsupportedMessage. Checked here (not only in
         // VulkanModelLoader.CreateFromGguf) because every factory on this class calls this first,

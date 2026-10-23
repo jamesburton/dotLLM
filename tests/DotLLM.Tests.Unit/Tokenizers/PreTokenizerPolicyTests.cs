@@ -161,6 +161,22 @@ public class PreTokenizerPolicyTests
         Assert.Equal(3, Build("gpt2", merged, merge).Encode(input).Length);
     }
 
+    /// <summary>
+    /// Flint (#1158): llama.cpp's symbol run <c> ?[\p{P}\p{S}]+</c> keeps the leading space with an emoji (So). .NET regex
+    /// sees the emoji as two surrogates (Cs), so without <c>\p{Cs}</c> in the class the space split off on its own and the
+    /// real model's " 😀" token never formed (found by the real-vocab parity sweep). The merge "Ġ ð" (space + the emoji's first
+    /// UTF-8 byte 0xF0) can only fire inside one segment: 4 tokens under flint, 5 if the space is split off.
+    /// </summary>
+    [Fact]
+    public void Flint_Keeps_Leading_Space_With_Astral_Symbol()
+    {
+        string input = " " + char.ConvertFromUtf32(0x1F600);   // UTF-8: 20 F0 9F 98 80
+        string merged = "Ġð";
+        string merge = "Ġ ð";
+
+        Assert.Equal(4, Build("flint", merged, merge).Encode(input).Length);
+    }
+
     [Fact]
     public void UnknownPreType_Throws_NamingTheValue()
     {
