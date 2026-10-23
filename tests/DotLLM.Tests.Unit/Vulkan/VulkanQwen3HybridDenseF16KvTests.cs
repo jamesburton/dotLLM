@@ -72,7 +72,12 @@ public sealed class VulkanQwen3HybridDenseF16KvTests : IDisposable
     public void F16Cache_PrefillAndDecode_TrackTheF32Cache(bool pq2)
     {
         using var f = Open(pq2);
+
+        // The reference arm takes the long-standing per-query-head decode pass, the F16 arm the GQA-grouped one, so a grouped-pass
+        // bug cannot cancel out of the comparison.
+        f.Model.SetGqaDecodeForTest(false);
         var want = RunSchedule(f, VulkanKvStorage.F32);
+        f.Model.SetGqaDecodeForTest(true);
         var got = RunSchedule(f, VulkanKvStorage.F16);
 
         Assert.Equal(want.Count, got.Count);

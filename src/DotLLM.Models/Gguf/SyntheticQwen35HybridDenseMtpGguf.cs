@@ -106,6 +106,12 @@ public static class SyntheticQwen35HybridDenseMtpGguf
     /// Q8_0 MTP GEMV paths (single-row draft/absorb and the multi-column batched absorb). The head-local
     /// embedding / lm_head stay F32. Default <see langword="false"/> leaves the fixture unchanged.
     /// </param>
+    /// <param name="headDim">
+    /// Issue #1101: overrides the attention head width (null keeps the dims' default). With
+    /// <paramref name="ropeDim"/> 64 and 256 here the fixture has Bonsai 2's partial-rotary shape (64 of 256).
+    /// </param>
+    /// <param name="ropeDim">Overrides <c>rope.dimension_count</c> (null keeps <see cref="RopeDim"/>).</param>
+    /// <param name="ropeFreqBase">Overrides <c>rope.freq_base</c> (null keeps 10000).</param>
     /// <param name="attentionHeads">
     /// Overrides <see cref="NumAttentionHeads"/> (2). Issue #1102 needs a GQA shape that is not degenerate: with one KV head every
     /// query head reads the same KV row, so a wrong head broadcast cannot show. Must be a multiple of <paramref name="kvHeads"/>.
@@ -115,6 +121,7 @@ public static class SyntheticQwen35HybridDenseMtpGguf
         int fullAttnInterval = FullAttnInterval, int blockCount = BlockCount,
         int contextLength = ContextLength, int gdnKeyHeads = NKHead, int gdnValueHeads = NVHead,
         bool pq2_0Projections = false, bool q8_0MtpHead = false,
+        int? headDim = null, int? ropeDim = null, float? ropeFreqBase = null,
         int attentionHeads = NumAttentionHeads, int kvHeads = NumKvHeads)
     {
         if (gdnKeyHeads <= 0 || gdnValueHeads <= 0 || gdnValueHeads % gdnKeyHeads != 0)
@@ -128,6 +135,11 @@ public static class SyntheticQwen35HybridDenseMtpGguf
         var rng = new SyntheticGemma4Gguf.Xorshift(seed);
         const string arch = "qwen35";
         Dims d = (pq2_0Projections || q8_0MtpHead ? Dims.Pq2_0 : Dims.Default) with { Heads = attentionHeads, KvHeads = kvHeads };
+        if (headDim is int hd)
+            d = d with { HeadDim = hd };
+        int rotary = ropeDim ?? RopeDim;
+        if (rotary <= 0 || (rotary & 1) != 0 || rotary > d.HeadDim)
+            throw new ArgumentException($"ropeDim {rotary} must be even and at most the head width {d.HeadDim}.");
 
         // ── Metadata ──────────────────────────────────────────────────────
         w.AddString("general.architecture", arch);
@@ -144,8 +156,8 @@ public static class SyntheticQwen35HybridDenseMtpGguf
         w.AddUInt32($"{arch}.feed_forward_length", (uint)d.Ffn);
         w.AddFloat32($"{arch}.attention.layer_norm_rms_epsilon", 1e-5f);
         w.AddUInt32($"{arch}.vocab_size", VocabSize);
-        w.AddFloat32($"{arch}.rope.freq_base", 10000.0f);
-        w.AddUInt32($"{arch}.rope.dimension_count", RopeDim);
+        w.AddFloat32($"{arch}.rope.freq_base", ropeFreqBase ?? 10000.0f);
+        w.AddUInt32($"{arch}.rope.dimension_count", (uint)rotary);
 
         // Hybrid layout: trunk layer i is full attention when (i+1) % full_attention_interval == 0.
         // fullAttnInterval defaults to the standard fixture shape (mixed GDN+attention); callers that
@@ -221,10 +233,11 @@ public static class SyntheticQwen35HybridDenseMtpGguf
         int fullAttnInterval = FullAttnInterval, int blockCount = BlockCount,
         int contextLength = ContextLength, int gdnKeyHeads = NKHead, int gdnValueHeads = NVHead,
         bool pq2_0Projections = false, bool q8_0MtpHead = false,
+        int? headDim = null, int? ropeDim = null, float? ropeFreqBase = null,
         int attentionHeads = NumAttentionHeads, int kvHeads = NumKvHeads)
     {
         File.WriteAllBytes(path, Build(seed, withMtp, mtpHasOwnHeadTensors, fullAttnInterval, blockCount, contextLength,
-            gdnKeyHeads, gdnValueHeads, pq2_0Projections, q8_0MtpHead, attentionHeads, kvHeads));
+            gdnKeyHeads, gdnValueHeads, pq2_0Projections, q8_0MtpHead, headDim, ropeDim, ropeFreqBase, attentionHeads, kvHeads));
         return path;
     }
 

@@ -4,6 +4,8 @@ using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.PositionEncoding;
+using Architecture = DotLLM.Core.Configuration.Architecture;
 
 namespace DotLLM.Cpu.Kernels;
 
@@ -286,6 +288,26 @@ public static class RoPE
             //   inv_freq = freq_inter * linear_ramp + freq_extra * (1 - linear_ramp)
             invFreq[i] = freqInter * mask + freqExtra * (1.0f - mask);
         }
+    }
+
+    /// <summary>
+    /// Resolves the dense-YaRN rotation for a model whose RoPE rotates <paramref name="ropeDim"/> dims
+    /// (issue #1101): the ramped inverse frequencies and the cos/sin multiplier, or <c>(null, 1)</c> when
+    /// <see cref="RoPEConfig.IsDenseYarnActive"/> is false. The ramp runs over the ROTARY dim, as HF does
+    /// (<c>dim = head_dim * partial_rotary_factor</c>): for Bonsai-2 / Qwen3.8 that is 64, not the 256-wide head.
+    /// One helper for the CPU table, the CUDA upload and the Vulkan upload, so the hosts cannot drift.
+    /// </summary>
+    /// <param name="rope">The model's RoPE configuration, or null.</param>
+    /// <param name="architecture">Selects the mscale convention (<see cref="RoPEConfig.ComputeYarnMscaleMultiplier"/>).</param>
+    /// <param name="ropeDim">Rotated dims per head (even).</param>
+    /// <returns>The <c>ropeDim / 2</c> inverse frequencies (null when YaRN is off) and the cos/sin multiplier.</returns>
+    public static (float[]? InvFreq, float Mscale) ResolveDenseYarn(RoPEConfig? rope, Architecture architecture, int ropeDim)
+    {
+        if (rope is not { IsDenseYarnActive: true } r)
+            return (null, 1.0f);
+        float[] invFreq = new float[ropeDim / 2];
+        ComputeYarnInverseFrequencies(ropeDim, r.Theta, r.ScalingFactor, r.OrigMaxSeqLen, r.BetaFast, r.BetaSlow, invFreq);
+        return (invFreq, r.ComputeYarnMscaleMultiplier(architecture));
     }
 
     /// <summary>

@@ -46,7 +46,7 @@ namespace DotLLM.Vulkan;
 /// so <c>MtpSpeculativeDecoder</c> drives this model with no backend-specific branch of its own.
 /// </para>
 /// </remarks>
-public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
+public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, IContextLimitable
 {
     private readonly VulkanDevice _device;
     private readonly bool _ownsDevice;
@@ -98,7 +98,23 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     private readonly VulkanDevice.SubmitContext _submit;
 
     /// <inheritdoc/>
-    public ModelConfig Config { get; }
+    public ModelConfig Config { get; private set; }
+
+    /// <inheritdoc/>
+    public int NativeMaxSequenceLength { get; }
+
+    /// <summary>
+    /// Lowers the served context window (<c>--ctx-size</c>, issue #1101): <see cref="Config"/>'s <c>MaxSequenceLength</c> then
+    /// bounds every position and the growth limit of each KV cache created afterwards. With YaRN the native window is
+    /// factor × original (about 1M for Bonsai-2), far more F32 KV than a device holds, so the server applies the user's cap.
+    /// </summary>
+    /// <param name="maxSequenceLength">The new window, 1..<see cref="NativeMaxSequenceLength"/>.</param>
+    public void LimitContextLength(int maxSequenceLength)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxSequenceLength);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(maxSequenceLength, NativeMaxSequenceLength);
+        Config = Config with { MaxSequenceLength = maxSequenceLength };
+    }
 
     /// <inheritdoc/>
     public long ComputeMemoryBytes =>
@@ -170,6 +186,10 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     /// </summary>
     internal int KvBufferInvalidationsForTest { get; private set; }
 
+    /// <summary>Test hook (issue #1102): forces the GQA-grouped split-KV decode pass on or off.</summary>
+    /// <param name="on">Whether the grouped pass may run.</param>
+    internal void SetGqaDecodeForTest(bool on) => _kernels.SetGqaDecodeForTest(on);
+
     /// <summary>Test hook (issue #1102): F32-to-F16 convert dispatches recorded for F16 KV rows.</summary>
     internal long F16KvRowWritesForTest => _kernels.NarrowKv?.Writer.Dispatches ?? 0;
 
@@ -222,6 +242,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         _device = device;
         _ownsDevice = ownsDevice;
         Config = config;
+        NativeMaxSequenceLength = config.MaxSequenceLength;
         _gguf = gguf;
         _cpuModel = cpuModel;
         _weights = weights;
@@ -365,6 +386,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         var state = new VulkanQwen3HybridDenseForwardState(device, config, gdn, initialSeqLen: 1);
         var gdnCache = new VulkanGdnStateCache(device, gdn, gdnOrdinal);
         var kernels = VulkanQwen3MoeHybridKernels.Create(device, spvDir, config.HeadDim);
+        // Issue #1101: --rope-scaling yarn. Every RoPE call site goes through kernels.RecordRopeNeoX, which uses this when attached.
+        if (attentionLayerCount > 0)
+            kernels.AttachYarnRope(VulkanDenseYarnRope.TryCreate(device, spvDir, config, ropeDim));
 
         var hadamard = config.HadamardFold is { } fold
             ? VulkanHadamardRotation.Create(device, spvDir, fold, gdn)
@@ -974,10 +998,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // The RoPE kernel always rotates a Q operand too; give it one head of the (dead) Q scratch.
-        _kernels.Rope.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
-            seqLen: s, numHeads: 1, numKvHeads: numKvHeads,
-            headDim: headDim, ropeDim: _ropeDim, theta: _ropeTheta,
-            variant: RopeF32Kernel.Variant.NeoX);
+        _kernels.RecordRopeNeoX(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
+            s, 1, numKvHeads, headDim, _ropeDim, _ropeTheta);
         KernelSupport.ComputeToTransferBarrier(cmdBuf);
 
         // ── 5. One slab copy into cache slots [firstPosition, firstPosition + S) ──
@@ -1937,10 +1959,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
 
         // 5. RoPE — NeoX pair pattern over the first ropeDim of each head, mirroring
         //    the CPU reference's choice so device output matches CPU output.
-        _kernels.Rope.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
-            seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
-            headDim: headDim, ropeDim: _ropeDim, theta: _ropeTheta,
-            variant: RopeF32Kernel.Variant.NeoX);
+        _kernels.RecordRopeNeoX(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
+            seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta);
 
         // 6. Attention.
         VulkanDevice.Buffer kSrc, vSrc;
@@ -2492,10 +2512,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.Norm);
 
-        _kernels.Rope.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
-            seqLen: 1, numHeads: numHeads, numKvHeads: numKvHeads,
-            headDim: headDim, ropeDim: _ropeDim, theta: _ropeTheta,
-            variant: RopeF32Kernel.Variant.NeoX);
+        _kernels.RecordRopeNeoX(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
+            1, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta);
         KernelSupport.ComputeToTransferBarrier(cmdBuf);
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.AttnRope);
 

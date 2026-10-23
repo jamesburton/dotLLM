@@ -430,6 +430,13 @@ public static partial class GgufModelConfigExtractor
             result = result with { RoPEConfig = ApplyOverride(rope, overrides) };
         if (config.GlobalRoPEConfig is { } globalRope)
             result = result with { GlobalRoPEConfig = ApplyOverride(globalRope, overrides) };
+
+        // Issue #1101: YaRN exists to run past the trained window, so a YaRN override raises the window to
+        // factor × original (Qwen3.8: 4 × 262,144 ≈ 1M). Every cap downstream (the CUDA VRAM fit, --ctx-size, the
+        // KV caches' growth limits, the prompt-length checks) reads MaxSequenceLength, so they all follow. Never lowers it.
+        if (result.RoPEConfig is { YarnExtendedContextLength: > 0 } yarn
+            && yarn.YarnExtendedContextLength > result.MaxSequenceLength)
+            result = result with { MaxSequenceLength = yarn.YarnExtendedContextLength };
         return result;
     }
 

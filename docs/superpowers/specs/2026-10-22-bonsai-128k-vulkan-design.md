@@ -133,6 +133,17 @@ depth. V2 (narrow KV) and V3 (tiled hd256) address these.
   it) and q8_0 (new storage; dequant in the kernels' tile loads, as CUDA #956/#1094 do). Recommended order: F16 first
   (smallest kernel change, halves bandwidth), q8_0 second if Strix decode at 128k is still KV-bound. Measure each.
 - No kernel may convert the whole history to F32 scratch.
+- **Status (#1102):**
+  - **F16 shipped, and it is the default** (#1107): 64 KiB/token instead of 128 KiB. Every attention path the Bonsai shape
+    reaches has an `_kvf16` twin that reads the halves in place (split-KV decode, coopmat flash hd128/hd256, scalar flash
+    hd128/hd256 br4/8/16, naive). Each twin is bit-identical to its F32 twin on F16-rounded rows. Snapshots and growth copy
+    F16 rows byte for byte.
+  - **F16 alone did not speed decode up.** The split-KV pass ran one workgroup per query head and re-read each KV head's rows
+    six times (G = 24/4), so it was bound by issue rather than DRAM. A **GQA-grouped split-KV pass** reads each row once for
+    all six heads. With F16 it is 1.57x faster than F32 at 128k per layer (Strix: 6.13 vs 9.62 ms), and decode attention is
+    now bandwidth-bound.
+  - **q8_0 is the follow-up (#1112).** A faster paired-load variant of the grouped pass is wrong on Intel and was withdrawn
+    (#1113).
 
 ### V3. hd256 tiled prefill attention on every Vulkan device (#441)
 
