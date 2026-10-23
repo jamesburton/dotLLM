@@ -1251,3 +1251,68 @@ hybrid checkpoints and representative kernel shapes; no full-checkpoint CUDA spe
 or quality result is implied. The committed PTX uses ISA 8.7 / `compute_75`, compiled with CUDA 12.8.93
 and `-fmad=false`, preserving the existing driver compatibility baseline. Local
 validation uses NVIDIA driver 610.88.
+
+## Recursive Flint on CUDA and in-place Q4_1 kernels (#1172, Flint F6)
+
+`flint` loads through the default `CudaTransformerModel` arm (generic FP16 eager loop; MoE models are never
+graph-captured). What it needed, and where it lives:
+
+- **Per-layer NoPE** in the FP16 loop: `Config.IsNoRopeLayer(layer)` passes `rope_dim 0` to the fused RoPE + KV write
+  (the kernel then copies all of K as its "tail") and skips `LaunchRoPE` on the eager path. Graph capture is refused
+  when `NoRopeLayers` is set (the captured bodies always rotate). Composite hosts still refuse NoPE models.
+- **Sinks on every layer**: already wired through `AttnSinksDevice` (#365); nothing Flint-specific.
+- **Sigmoid routing** (`moe_sigmoid_topk_f32`): top-k on `sigmoid(logits)`, renormalised with the CPU's 6.1035e-5 sum
+  clamp, lower index on ties. A selection bias or expert weight scale (DeepSeek-V3 / GLM-4.7-Flash, #742) is still
+  refused at load.
+- **Ungated shared expert, leading dense layers**: the existing `CudaMoeFfn` shared path and dense FFN path.
+
+`native/kernels/q4_1_gemv.cu` reads `block_q4_1` in place (no dequant scratch, no wider weight copy; rule 2). One warp
+per output row, four lanes per 20-byte block (lane & 3 picks the 4-byte nibble chunk: elements 4c..4c+3 and
+16+4c..16+4c+3), so one warp pass reads 160 contiguous bytes. `sum (d q + m) x = d sum(q x) + m sum(x)`, F32 accumulate.
+
+| entry | use |
+|---|---|
+| `quantized_gemv_q4_1` | decode GEMV, F16 in/out (`LaunchQuantizedGemv`) |
+| `quantized_gemm_q4_1_f16` | dense prefill, 8 tokens share each weight load (`Project` prefill branch) |
+| `quantized_gemv_q4_1_f32` / `quantized_gemm_q4_1_f32` | MoE expert projections on F32 activations |
+| `moe_grouped_gemv_q4_1_f16` | grouped gate / up (shared input row) |
+| `moe_grouped_gemv_q4_1_f32_xe` + `moe_weighted_rows_sum_f32` | grouped down (one input row per expert) + combine |
+
+Because Q4_1 now counts as a loaded quantized-GEMV type, `CudaWeights` no longer keeps a persistent F16 copy of Q4_1
+projections or the Q4_1 LM head.
+
+**F16-safe MoE down input.** The Q4_1 expert path never quantizes activations (F32 in), so Flint's ~1.3e4 routed
+SwiGLU output cannot overflow there. dotLLM's own Q8_1 MMQ layout stores integer block sums and an F16 `amax/127`, which
+cannot overflow either. The one CUDA path that stores `d * sum(q)` in F16 is the LFM2 packed Q4_0 x Q8_1 projection; its
+routed down projection now runs `moe_pow2_rescale_rows_f32` / `moe_scale_rows_f32`, the CUDA mirror of the CPU
+`MoeSwiGluMlp.RescaleDownInputForF16Sums` (#1158).
+
+**Microbench** (RTX 3060 12 GB eGPU over Thunderbolt, WDDM, `CudaQ4_1KernelBench`, weight GB/s; back-to-back launches
+so the ~20 us WDDM launch floor dominates the small shapes):
+
+| shape | Q4_1 (new) | Q4_0 `lfm2_gemv_q4_0_f32` | Q8_0 | Q4_K mmq |
+|---|---|---|---|---|
+| 2048x2048 | 85 | 63 | 69 | 27 |
+| 6144x2048 | 239 | 115 | 76 | 29 |
+| 150144x2048 (LM head) | 268 (F16 in) / 335 (F32 in) | 151 | 88 | 33 |
+| grouped 6 x 512x2048 | 142 | - | 79 | 17 |
+
+Prefill (2048x2048, 512 tokens): the in-place Q4_1 GEMM reaches 1.7 TFLOP/s with zero scratch; dequant + cuBLAS HGEMM
+reaches 17 TFLOP/s but needs an F16 copy of the projection (8 MiB here, 25 MiB for the 6144-wide dense FFN), which rule
+2 forbids. A tensor-core MMQ-style Q4_1 prefill is the follow-up (#1181).
+
+**Validation.** `CudaFlintParitySyntheticTests` (synthetic GGUF, all-Q4_1 and routed Q4_1 + shared Q8_0, prefill and
+10 + 6 KV-cache decode) against the CPU on the same weights dequantised to F32: worst max |dlogit| 2.7e-2 (bound 5e-2);
+every Flint feature moves the CPU logits by 3.0-9.1. `CudaFlintRealWeightsProbe` runs the first 8 layers of the official
+Q4_1 file (2 dense, 6 MoE incl. NoPE full layer 5): CPU vs CUDA cosine >= 0.99998, KL <= 1.4e-3 (the CPU runs Q8_1
+activations on its experts), top-1 identical on all 9 compared rows. VRAM 4.80 GiB for those 8 layers (of which the F32
+`token_embd` table is 1.15 GiB, uploaded as-is), +64 MiB KV at 4096 tokens, +16 MiB run scratch. On WDDM, device
+allocations count 1:1 in process private bytes (measured), so private bytes minus VRAM is ~0.5 GiB of host state.
+
+The full file (26 GB) does not fit a 12 GB GPU; that is F7 (generic CPU-expert offload).
+
+**Known gaps** (follow-ups on #1157): the CUDA KV cache is full-length on every layer (no sliding-window ring, #1184); the F32
+`token_embd` is uploaded as F32 instead of gathered from the mmap (#1183); decode MoE routing syncs to the host once per layer
+(no device-side routing, so no graph capture, #1182); the FP16 residual stream is verified on 8 real layers only; the
+per-projection `DequantScratch` (F16 + F32, 72 MiB at Flint's 6144x2048) is still allocated though no Q4_1 path uses it (#1183);
+NVFP4 grouped experts with the per-expert `_exps.scale` are not implemented (#1179).
