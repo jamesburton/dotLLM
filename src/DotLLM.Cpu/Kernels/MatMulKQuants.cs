@@ -1237,6 +1237,7 @@ public static unsafe partial class MatMul
     internal static void ComputeRowsQ4_KInterleaved(byte* repackedWeights, byte* xQ8K, float* result,
         int fullGroups, int tailRows, int superBlockCount)
     {
+        nint rowStride = (nint)superBlockCount * Q4_K_BlockBytes;
         int groupBytes = 4 * superBlockCount * Q4_K_BlockBytes;
 
         for (int g = 0; g < fullGroups; g++)
@@ -1245,9 +1246,9 @@ public static unsafe partial class MatMul
             // One strided call over the whole K, exactly as the row-major ComputeRowsQ4_K
             // path does - same accumulators, same order, so the R4 and row-major layouts
             // produce bit-identical results (#530).
-            VecDotQ4_K_Q8_K_4Rows(groupBase, groupBase + Q4_K_BlockBytes,
-                groupBase + 2 * Q4_K_BlockBytes, groupBase + 3 * Q4_K_BlockBytes,
-                xQ8K, superBlockCount, 4 * Q4_K_BlockBytes, result + g * 4);
+            VecDotQ4_K_Q8_K_4Rows(groupBase, groupBase + rowStride,
+                groupBase + 2 * rowStride, groupBase + 3 * rowStride,
+                xQ8K, superBlockCount, Q4_K_BlockBytes, result + g * 4);
         }
 
         if (tailRows > 0)
@@ -1269,6 +1270,7 @@ public static unsafe partial class MatMul
     internal static void ComputeRowsQ5_KInterleaved(byte* repackedWeights, byte* xQ8K, float* result,
         int fullGroups, int tailRows, int superBlockCount)
     {
+        nint rowStride = (nint)superBlockCount * Q5_K_BlockBytes;
         int groupBytes = 4 * superBlockCount * Q5_K_BlockBytes;
 
         for (int g = 0; g < fullGroups; g++)
@@ -1277,9 +1279,9 @@ public static unsafe partial class MatMul
             // One strided call over the whole K, exactly as the row-major ComputeRowsQ5_K
             // path does - same accumulators, same order, so the R4 and row-major layouts
             // produce bit-identical results (#530).
-            VecDotQ5_K_Q8_K_4Rows(groupBase, groupBase + Q5_K_BlockBytes,
-                groupBase + 2 * Q5_K_BlockBytes, groupBase + 3 * Q5_K_BlockBytes,
-                xQ8K, superBlockCount, 4 * Q5_K_BlockBytes, result + g * 4);
+            VecDotQ5_K_Q8_K_4Rows(groupBase, groupBase + rowStride,
+                groupBase + 2 * rowStride, groupBase + 3 * rowStride,
+                xQ8K, superBlockCount, Q5_K_BlockBytes, result + g * 4);
         }
 
         if (tailRows > 0)
@@ -1301,6 +1303,7 @@ public static unsafe partial class MatMul
     internal static void ComputeRowsQ6_KInterleaved(byte* repackedWeights, byte* xQ8K, float* result,
         int fullGroups, int tailRows, int superBlockCount)
     {
+        nint rowStride = (nint)superBlockCount * Q6_K_BlockBytes;
         int groupBytes = 4 * superBlockCount * Q6_K_BlockBytes;
 
         for (int g = 0; g < fullGroups; g++)
@@ -1309,9 +1312,9 @@ public static unsafe partial class MatMul
             // One strided call over the whole K, exactly as the row-major ComputeRowsQ6_K
             // path does - same accumulators, same order, so the R4 and row-major layouts
             // produce bit-identical results (#530).
-            VecDotQ6_K_Q8_K_4Rows(groupBase, groupBase + Q6_K_BlockBytes,
-                groupBase + 2 * Q6_K_BlockBytes, groupBase + 3 * Q6_K_BlockBytes,
-                xQ8K, superBlockCount, 4 * Q6_K_BlockBytes, result + g * 4);
+            VecDotQ6_K_Q8_K_4Rows(groupBase, groupBase + rowStride,
+                groupBase + 2 * rowStride, groupBase + 3 * rowStride,
+                xQ8K, superBlockCount, Q6_K_BlockBytes, result + g * 4);
         }
 
         if (tailRows > 0)
@@ -1888,9 +1891,9 @@ public static unsafe partial class MatMul
         {
             byte* groupBase = ctx.RepackedWeights + (long)g * groupBytes;
             // Single strided call over the whole K — see ComputeRowsQ4_KInterleaved (#530).
-            vecDot4Rows(groupBase, groupBase + kBlockBytes,
-                groupBase + 2 * kBlockBytes, groupBase + 3 * kBlockBytes,
-                ctx.XQ, ctx.BlockCount, 4 * kBlockBytes, ctx.Result + g * 4);
+            vecDot4Rows(groupBase, groupBase + rowBytes,
+                groupBase + 2 * rowBytes, groupBase + 3 * rowBytes,
+                ctx.XQ, ctx.BlockCount, kBlockBytes, ctx.Result + g * 4); // #1156: original row-major rows
         }
 
         if (ctx.TailRows > 0 && end > ctx.FullGroups * 4)

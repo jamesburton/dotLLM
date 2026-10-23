@@ -29,17 +29,18 @@ public static unsafe partial class MatMul
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     internal static void Q8_0Rows4Tokens4(byte* groupBase, int blockCount, byte* xq, int xRowBytes, float* results, int ldc)
     {
+        nint rowStride = (nint)blockCount * Q8_0BlockBytes;
         Vector256<float>* acc = stackalloc Vector256<float>[16];
         for (int i = 0; i < 16; i++) acc[i] = Vector256<float>.Zero;
         Vector256<short> ones = Vector256.Create((short)1);
-        const int wStride = 4 * Q8_0BlockBytes;
+        const int wStride = Q8_0BlockBytes; // #1156: original row-major rows, rowStride apart
         float* sc = stackalloc float[16];
 
         for (int block = 0; block < blockCount; block++)
         {
             byte* bb = groupBase + block * wStride;
             byte* xb = xq + block * Q8_0BlockBytes;
-            Vector128<float> dw4 = HalfToSingleSse2(LoadHalf4(bb, Q8_0BlockBytes));
+            Vector128<float> dw4 = HalfToSingleSse2(LoadHalf4(bb, rowStride));
             Vector128<float> dx4 = HalfToSingleSse2(LoadHalf4(xb, xRowBytes));
             Sse.Store(sc, Sse.Multiply(Sse.Shuffle(dx4, dx4, 0x00), dw4));
             Sse.Store(sc + 4, Sse.Multiply(Sse.Shuffle(dx4, dx4, 0x55), dw4));
@@ -52,9 +53,9 @@ public static unsafe partial class MatMul
                 Vector256<sbyte> v = Unsafe.ReadUnaligned<Vector256<sbyte>>(xbt + 2);
                 Vector256<sbyte> ab = Avx2.Sign(v, v);
                 acc[t * 4] = Q8_0BlockFma(acc[t * 4], bb, v, ab, sc[t * 4], ones);
-                acc[t * 4 + 1] = Q8_0BlockFma(acc[t * 4 + 1], bb + Q8_0BlockBytes, v, ab, sc[t * 4 + 1], ones);
-                acc[t * 4 + 2] = Q8_0BlockFma(acc[t * 4 + 2], bb + 2 * Q8_0BlockBytes, v, ab, sc[t * 4 + 2], ones);
-                acc[t * 4 + 3] = Q8_0BlockFma(acc[t * 4 + 3], bb + 3 * Q8_0BlockBytes, v, ab, sc[t * 4 + 3], ones);
+                acc[t * 4 + 1] = Q8_0BlockFma(acc[t * 4 + 1], bb + rowStride, v, ab, sc[t * 4 + 1], ones);
+                acc[t * 4 + 2] = Q8_0BlockFma(acc[t * 4 + 2], bb + 2 * rowStride, v, ab, sc[t * 4 + 2], ones);
+                acc[t * 4 + 3] = Q8_0BlockFma(acc[t * 4 + 3], bb + 3 * rowStride, v, ab, sc[t * 4 + 3], ones);
             }
         }
 

@@ -456,7 +456,7 @@ PRs #1103, #1122, #1125, #1126.
 | X1 | CPU | safetensors BF16 → F32 | L8B +16 GB; L1B +2.5 GB | open | #1143 (needs #1118) |
 | X2 | CPU | MLA-MoE routed experts → F32 | ≈57 GB on V2-Lite | open | #1140 |
 | X3 | CPU | MLA projections, shared / Granite-MoE experts → F32 | `Σ out·in·4` | open | #1140 |
-| X4 | CPU | R4 repack: second same-width copy | L8B Q4_K_M +4.9 GB | open | #1143 |
+| X4 | CPU | R4 repack: second same-width copy | L8B Q4_K_M +4.9 GB | **fixed**: R4 is a zero-copy view; same kernels on the mmap rows, bit-identical, same speed | #1156 (from #1143) |
 | X5 | CPU | TurboQuant full-history F32 scratch | L8B @128k 1 GiB | open | #1139 |
 | X6 | CPU | dequant-rows prefill (Q4_0/Q4_1/Q5_1/IQ4_NL, BF16, F16, MXFP4, PQ2_0) | bounded `k·4` per worker | open (missing kernels) | #1119, #1118, #489 |
 | X7 | CPU | quantized-KV tile dequant per head, allocated per call | `tile·hd·8` per head call | open | #970, #1120 |

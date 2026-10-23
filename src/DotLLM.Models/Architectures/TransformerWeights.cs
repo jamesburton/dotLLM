@@ -1120,16 +1120,11 @@ internal sealed class TransformerWeights : IDisposable
     /// </summary>
     private readonly HashSet<nint>? _liveOwnedAllocations;
 
-    /// <summary>
-    /// Total unmanaged bytes held by R4-interleaved buffers. Zero until <see cref="RepackWeights()"/> runs,
-    /// and zero for models whose weights are not repackable (F32/F16).
-    /// </summary>
+    /// <summary>Unmanaged bytes held for the R4 kernels.</summary>
     /// <remarks>
-    /// These buffers are a second copy of the weights, held in committed memory alongside the
-    /// memory-mapped originals — reporting that counts only the mapped file understates the
-    /// process footprint by roughly 2x.
+    /// Always 0 since #1156: the R4 views read the memory-mapped originals. It used to be a second copy of the weights.
     /// </remarks>
-    public long RepackedBytes { get; private set; }
+    public long RepackedBytes => 0;
 
     private TransformerWeights(
         nint tokenEmbedWeight, QuantizationType tokenEmbedQuantType, int vocabSize, int hiddenSize,
@@ -1492,84 +1487,19 @@ internal sealed class TransformerWeights : IDisposable
     }
 
     /// <summary>
-    /// Repacks all linear projection weights into R4 interleaved layout for improved
-    /// cache locality in 4-row SIMD kernels. Skips token embeddings (random row access)
-    /// and non-block-structured types (F32, F16).
+    /// Builds the 4-row-group views the R4 kernels consume over every linear projection and the LM head. Skips token
+    /// embeddings (random row access) and non-block-structured types (F32, F16). Allocates and copies nothing (#1156):
+    /// the views read the memory-mapped originals.
     /// </summary>
-    public void RepackWeights() => RepackWeights(long.MaxValue);
-
-    /// <summary>Layers whose projections were R4-repacked by the last <see cref="RepackWeights(long)"/>.</summary>
-    public int RepackedLayerCount { get; private set; }
-
-    /// <summary>
-    /// Bytes a full <see cref="RepackWeights()"/> would allocate (what the budget in #792 is measured against).
-    /// </summary>
-    public long RepackCandidateBytes()
+    public void RepackWeights()
     {
-        long total = 0;
-        for (int i = 0; i < Layers.Length; i++)
-            total += LayerRepackBytes(in Layers[i]);
-        total += WeightRepacking.RepackedSize(OutputQuantType, OutputOutputDim, OutputInputDim);
-        return total;
-    }
-
-    private static long LayerRepackBytes(in TransformerLayerWeights lw)
-    {
-        bool isMoe = lw.Moe is not null;
-        bool isMla = lw.Mla is not null;
-        long b = 0;
-        if (!isMla)
-        {
-            b += WeightRepacking.RepackedSize(lw.QQuantType, lw.QOutputDim, lw.QInputDim);
-            b += WeightRepacking.RepackedSize(lw.KQuantType, lw.KOutputDim, lw.KInputDim);
-            b += WeightRepacking.RepackedSize(lw.VQuantType, lw.VOutputDim, lw.VInputDim);
-            b += WeightRepacking.RepackedSize(lw.OQuantType, lw.OOutputDim, lw.OInputDim);
-        }
-        if (!isMoe)
-        {
-            b += WeightRepacking.RepackedSize(lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim);
-            b += WeightRepacking.RepackedSize(lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim);
-            b += WeightRepacking.RepackedSize(lw.DownQuantType, lw.DownOutputDim, lw.DownInputDim);
-        }
-        return b;
-    }
-
-    /// <summary>
-    /// Budgeted repack (#792): layers are repacked in order while the cumulative repacked bytes stay within
-    /// <paramref name="budgetBytes"/>; the LM head last. A layer that does not fit keeps its mmap weights
-    /// (every consumer falls back to the original pointer when the repacked entry is default), so the result is
-    /// always correct and only the speed varies. <c>0</c> repacks nothing (<see cref="RepackedLayers"/> stays null).
-    /// </summary>
-    public void RepackWeights(long budgetBytes)
-    {
-        RepackedLayerCount = 0;
-        if (budgetBytes <= 0)
-        {
-            RepackedBytes = 0;
-            return;
-        }
-
         var repacked = new RepackedLayerWeights[Layers.Length];
-        long used = 0;
-        bool exhausted = false;
         for (int i = 0; i < Layers.Length; i++)
         {
             ref readonly var lw = ref Layers[i];
-            long layerBytes = LayerRepackBytes(in lw);
-            if (exhausted || used + layerBytes > budgetBytes)
-            {
-                exhausted = true;
-                repacked[i] = new RepackedLayerWeights();
-                continue;
-            }
-            // MoE layers don't populate the dense gate/up/down slots —
-            // repack only the attention projections. The MoE FFN path runs
-            // without R4 interleaving (the per-expert GEMMs are tiny and
-            // the win would be microscopic).
+            // MoE layers don't populate the dense gate/up/down slots; MLA layers don't populate Q/K/V/O
+            // (their forwards take weights from lw.Moe / lw.Mla).
             bool isMoe = lw.Moe is not null;
-            // MLA layers don't populate the legacy Q/K/V slots either — the
-            // MLA forward takes its weights from lw.Mla and calls the scalar
-            // MlaAttention kernel which does not consume R4 repacks.
             bool isMla = lw.Mla is not null;
             repacked[i] = new RepackedLayerWeights
             {
@@ -1581,20 +1511,9 @@ internal sealed class TransformerWeights : IDisposable
                 Up = isMoe ? default : TryRepack(lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim),
                 Down = isMoe ? default : TryRepack(lw.DownWeight, lw.DownQuantType, lw.DownOutputDim, lw.DownInputDim),
             };
-            used += layerBytes;
-            if (layerBytes > 0) RepackedLayerCount++;
         }
         RepackedLayers = repacked;
-
-        long outBytes = WeightRepacking.RepackedSize(OutputQuantType, OutputOutputDim, OutputInputDim);
-        if (outBytes > 0 && !exhausted && used + outBytes <= budgetBytes)
-            RepackedOutput = WeightRepacking.RepackR4(OutputWeight, OutputQuantType, OutputOutputDim, OutputInputDim);
-
-        long total = 0;
-        foreach (var rl in repacked)
-            total += rl.AllocatedBytes;
-        total += RepackedOutput?.AllocatedBytes ?? 0;
-        RepackedBytes = total;
+        RepackedOutput = TryRepack(OutputWeight, OutputQuantType, OutputOutputDim, OutputInputDim);
     }
 
     private static WeightRepacking.RepackedWeight TryRepack(nint ptr, QuantizationType qt, int m, int k)
@@ -1604,7 +1523,7 @@ internal sealed class TransformerWeights : IDisposable
         return WeightRepacking.RepackR4(ptr, qt, m, k);
     }
 
-    /// <summary>Frees all R4-interleaved weight buffers and any owned aligned allocations.</summary>
+    /// <summary>Drops the R4 views and frees any owned aligned allocations.</summary>
     public unsafe void Dispose()
     {
         if (RepackedLayers is not null)

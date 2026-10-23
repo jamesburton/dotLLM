@@ -64,14 +64,15 @@ public static unsafe partial class MatMul
     internal static void Rows4Tokens4(byte* groupBase, int superBlockCount, byte* q8k, int q8RowBytes,
         float* results, int ldc)
     {
-        int wStride = 4 * Q4_K_BlockBytes;
+        int wStride = Q4_K_BlockBytes; // #1156: original row-major rows, rowStride apart
+        nint rowStride = (nint)superBlockCount * Q4_K_BlockBytes;
         if (!FastKQuantIsa)
         {
             float* tmp = stackalloc float[4];
             for (int t = 0; t < 4; t++)
             {
-                VecDotQ4_K_Q8_K_4RowsReference(groupBase, groupBase + Q4_K_BlockBytes, groupBase + 2 * Q4_K_BlockBytes,
-                    groupBase + 3 * Q4_K_BlockBytes, q8k + (long)t * q8RowBytes, superBlockCount, wStride, tmp);
+                VecDotQ4_K_Q8_K_4RowsReference(groupBase, groupBase + rowStride, groupBase + 2 * rowStride,
+                    groupBase + 3 * rowStride, q8k + (long)t * q8RowBytes, superBlockCount, wStride, tmp);
                 for (int r = 0; r < 4; r++) results[(long)t * ldc + r] = tmp[r];
             }
             return;
@@ -79,7 +80,7 @@ public static unsafe partial class MatMul
 
         for (int r = 0; r < 4; r++)
         {
-            Q4KRowTok4(groupBase + r * Q4_K_BlockBytes, q8k, q8RowBytes, superBlockCount, wStride,
+            Q4KRowTok4(groupBase + r * rowStride, q8k, q8RowBytes, superBlockCount, wStride,
                 results + r, ldc);
         }
     }

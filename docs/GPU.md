@@ -47,7 +47,7 @@ See [CUDA.md](CUDA.md) for the low-level architecture: PTX loading, P/Invoke dec
 Both `TransformerModel` (CPU) and `CudaTransformerModel` (GPU) implement `IModel`. The `TextGenerator` is backend-agnostic — it calls `model.Forward()` regardless of which backend produced the logits.
 
 The CPU and GPU forward passes are **separate implementations** because:
-- CPU uses fused ops, R4-interleaved weight repacking, pre-quantized input reuse, `ComputeThreadPool` dispatch
+- CPU uses fused ops, 4-row-group (R4) kernels over the memory-mapped weights (no repacked copy, #1156), pre-quantized input reuse, `ComputeThreadPool` dispatch
 - GPU uses cuBLAS FP16 GEMM, PTX kernel launches, device memory, CUDA streams
 - A shared kernel abstraction would lose CPU-specific optimizations
 
