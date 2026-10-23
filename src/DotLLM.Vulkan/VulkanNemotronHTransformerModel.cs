@@ -206,6 +206,12 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     /// </summary>
     private NemotronHTransformerModel? _cpuModel;
 
+    /// <summary>Gather for a resident Q8_0 token-embedding table (#1174); null when the table was widened to F32.</summary>
+    private Q8_0EmbedGatherF32Kernel? _embedGatherQ8;
+
+    /// <summary>True when the token embedding is held as resident Q8_0 blocks rather than a widened F32 table (#1174; test hook).</summary>
+    internal bool TokenEmbeddingResidentQ8 => _embedGatherQ8 is not null;
+
     /// <inheritdoc/>
     public ModelConfig Config { get; }
 
@@ -485,9 +491,11 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         // Any RoPEConfig is ignored — nemotron_h applies no position encoding on
         // attention (issue #372); mirrors the CPU model.
 
-        // Upload weights and allocate scratch.
+        // Upload weights and allocate scratch. A Q8_0 embedding stays packed when its gather shader exists (#1174).
+        bool q8EmbedResident = VulkanWeights.KeepEmbedQ8_0OnDevice(tokenEmbedQt, config.HiddenSize, spvDir);
         var weights = VulkanNemotronHWeights.Upload(device, config, cpuLayers, outputNormWeight,
-            tokenEmbedWeight, tokenEmbedQt, outputWeight, outputQt, outputM, outputK);
+            tokenEmbedWeight, tokenEmbedQt, outputWeight, outputQt, outputM, outputK,
+            keepQ8EmbedResident: q8EmbedResident);
 
         var state = new VulkanNemotronHForwardState(device,
             hiddenSize: config.HiddenSize,
@@ -630,6 +638,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         created._moe = moeKernels;
         try
         {
+            if (weights.TokenEmbeddingQuantType == QuantizationType.Q8_0)
+                created._embedGatherQ8 = Q8_0EmbedGatherF32Kernel.Create(device, spvDir);
             created._matmulNvfp4 = MatMulNvfp4F32Kernel.Create(device, spvDir);
             created._matmulNvfp4Coopmat = MatMulNvfp4GemmCoopmatKernel.TryCreate(device, spvDir);
             created._matmulIq2XxsCoopmat = MatMulIq2XxsGemmCoopmatKernel.TryCreate(device, spvDir, iq2Codebooks);
@@ -821,7 +831,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
         _state.ResetHiddenSlot();
         RecordEmbeddingGather(cmdBuf, tokenIds);
-        KernelSupport.TransferToComputeBarrier(cmdBuf);
+        if (_embedGatherQ8 is not null) KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        else KernelSupport.TransferToComputeBarrier(cmdBuf);
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.Embed);
 
         var kinds = _layout.LayerKind;
@@ -2062,6 +2073,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     private void InvalidateKernelCaches()
     {
         _matmul.InvalidateDescriptorCache();
+        _embedGatherQ8?.InvalidateDescriptorCache();
         _matmulQ8.InvalidateDescriptorCache();
         _matmulQ8Gemm.InvalidateDescriptorCache();
         _matmulQ8GemmCoopmat?.InvalidateDescriptorCache();
@@ -2474,6 +2486,15 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     private void RecordEmbeddingGather(nint cmdBuf, ReadOnlySpan<int> tokenIds)
     {
         int hiddenSize = Config.HiddenSize;
+        if (_embedGatherQ8 is not null)
+        {
+            // Resident Q8_0 table: a dequantizing compute gather, bit-identical to the F32 row copies (#352, #1174).
+            _device.Upload(MemoryMarshal.AsBytes(tokenIds), _state.TokenIdsBuffer);
+            _embedGatherQ8.Record(cmdBuf, _weights.TokenEmbedding, _state.TokenIdsBuffer, _state.HiddenState,
+                tokenIds.Length, hiddenSize, Config.VocabSize);
+            return;
+        }
+
         long rowBytes = (long)hiddenSize * sizeof(float);
         var srcBuf = _weights.TokenEmbedding.Handle;
         var dstBuf = _state.HiddenState.Handle;
@@ -2511,6 +2532,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _cpuModel?.Dispose();
 
         _moe?.Dispose();
+        _embedGatherQ8?.Dispose();
         _profiler?.Dispose();
         _ssmSplitXbc.Dispose();
         _reluSquared.Dispose();

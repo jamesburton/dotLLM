@@ -1795,6 +1795,8 @@ public sealed class VulkanDevice : IDisposable
         // still bound with VK_WHOLE_SIZE, so it must fit maxStorageBufferRange.
         ThrowIfExceedsStorageBufferRange(size, MaxStorageBufferRange);
         var import = HostVisibleBuffer.TryCreate(this, hostPointer, size);
+        if (s_memTrace)
+            Console.Error.WriteLine($"[vulkan-mem] import {size} B {(import is null ? "refused" : "ok")} at {TraceSite()}");
         return import is null ? null : new Buffer(this, import);
     }
 
@@ -1955,6 +1957,28 @@ public sealed class VulkanDevice : IDisposable
     /// </summary>
     private static readonly bool s_memTrace =
         Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_TRACE") == "1";
+
+    /// <summary>
+    /// The first few DotLLM callers outside this file, for attributing a traced allocation to its
+    /// site (#1174). Only evaluated when <c>DOTLLM_VULKAN_MEM_TRACE=1</c>.
+    /// </summary>
+    private static string TraceSite()
+    {
+        var frames = new System.Diagnostics.StackTrace(2, false).GetFrames();
+        var sb = new StringBuilder();
+        int n = 0;
+        foreach (var f in frames)
+        {
+            var m = System.Diagnostics.DiagnosticMethodInfo.Create(f);
+            string? t = m?.DeclaringTypeName;
+            if (t is null || !t.StartsWith("DotLLM", StringComparison.Ordinal)
+                || t.StartsWith("DotLLM.Vulkan.VulkanDevice", StringComparison.Ordinal)) continue;
+            if (n++ > 0) sb.Append(" < ");
+            sb.Append(t, t.LastIndexOf('.') + 1, t.Length - t.LastIndexOf('.') - 1).Append('.').Append(m!.Name);
+            if (n == 4) break;
+        }
+        return sb.ToString();
+    }
 
     /// <summary>
     /// Memory type index to heap index. Built once — the mapping is immutable for the life of
@@ -2252,7 +2276,7 @@ public sealed class VulkanDevice : IDisposable
         if (s_memTrace)
         {
             Console.Error.WriteLine(
-                $"[vulkan-mem] alloc {req.size} B type={typeIndex} heap={heapIndex} -> {MemorySnapshot()}");
+                $"[vulkan-mem] alloc {req.size} B type={typeIndex} heap={heapIndex} at {TraceSite()} -> {MemorySnapshot()}");
         }
 
         return new Buffer(this, buffer, memory, bytes, hostVisible, heapIndex, (long)req.size);

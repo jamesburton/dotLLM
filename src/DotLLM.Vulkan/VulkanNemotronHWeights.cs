@@ -30,10 +30,11 @@ namespace DotLLM.Vulkan;
 /// the CPU side at GGUF load time.
 /// </para>
 /// <para>
-/// <b>Token embedding.</b> Dequantised to F32 at upload regardless of source quant type
-/// — the embedding gather uses <c>vkCmdCopyBuffer</c> with row-major byte offsets, which
-/// only works with a contiguous F32 layout. This matches the
-/// <see cref="VulkanWeights"/> convention.
+/// <b>Token embedding.</b> A Q8_0 table stays resident as its raw blocks (zero-copy imported
+/// when the driver allows) and is gathered by <c>q8_0_embed_gather_f32</c> (#352, #1174): on
+/// Nemotron 3.5 Bolt the F32 widening cost 2 GiB of device memory for a 544 MiB table. Every
+/// other source type is still dequantised to F32 at upload and gathered with
+/// <c>vkCmdCopyBuffer</c> row copies (#919 tracks the remaining types).
 /// </para>
 /// </remarks>
 internal sealed class VulkanNemotronHWeights : IDisposable
@@ -251,6 +252,9 @@ internal sealed class VulkanNemotronHWeights : IDisposable
 
     public LayerBuffers[] Layers => _layers;
     public VulkanDevice.Buffer TokenEmbedding { get; }
+
+    /// <summary>Device layout of <see cref="TokenEmbedding"/>: <see cref="QuantizationType.Q8_0"/> (resident blocks) or <see cref="QuantizationType.F32"/>.</summary>
+    public QuantizationType TokenEmbeddingQuantType { get; }
     public int VocabSize { get; }
     public int HiddenSize { get; }
 
@@ -264,7 +268,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
 
     private VulkanNemotronHWeights(
         LayerBuffers[] layers,
-        VulkanDevice.Buffer tokenEmbedding, int vocabSize, int hiddenSize,
+        VulkanDevice.Buffer tokenEmbedding, QuantizationType tokenEmbeddingQt, int vocabSize, int hiddenSize,
         VulkanDevice.Buffer outputNormWeight,
         VulkanDevice.Buffer outputWeight, QuantizationType outputDeviceQt,
         int outputOutputDim, int outputInputDim,
@@ -272,6 +276,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     {
         _layers = layers;
         TokenEmbedding = tokenEmbedding;
+        TokenEmbeddingQuantType = tokenEmbeddingQt;
         VocabSize = vocabSize;
         HiddenSize = hiddenSize;
         OutputNormWeight = outputNormWeight;
@@ -294,7 +299,8 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         float[] outputNormWeight,
         nint tokenEmbedWeight, QuantizationType tokenEmbedQuantType,
         nint outputWeight, QuantizationType outputQuantType,
-        int outputOutputDim, int outputInputDim)
+        int outputOutputDim, int outputInputDim,
+        bool keepQ8EmbedResident = false)
     {
         ArgumentNullException.ThrowIfNull(device);
         ArgumentNullException.ThrowIfNull(config);
@@ -311,12 +317,12 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         VulkanWeightImportPolicy.Reset();
         using var staging = VulkanStagingBuffer.Create(device, stagingBytes);
 
-        // Token embedding [vocab, hidden] — always dequantised on upload (the embedding
-        // gather uses byte-offset vkCmdCopyBuffer and needs a contiguous F32 layout).
+        // Token embedding [vocab, hidden]: raw Q8_0 blocks when the caller has the Q8_0 gather
+        // kernel (#1174), else dequantised to F32 for the vkCmdCopyBuffer row gather.
         var tokenEmbed = UploadProjectionMatrix(device, staging,
             tokenEmbedWeight, tokenEmbedQuantType, config.VocabSize, config.HiddenSize,
-            forceF32: true,
-            out _, out long tokenEmbedBytes);
+            forceF32: !(keepQ8EmbedResident && KeepQ8OnDevice(tokenEmbedQuantType, config.HiddenSize)),
+            out var tokenEmbedDeviceQt, out long tokenEmbedBytes);
         totalBytes += tokenEmbedBytes;
 
         var layers = new LayerBuffers[config.NumLayers];
@@ -375,7 +381,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         totalBytes += outputBytes;
 
         return new VulkanNemotronHWeights(layers,
-            tokenEmbed, config.VocabSize, config.HiddenSize,
+            tokenEmbed, tokenEmbedDeviceQt, config.VocabSize, config.HiddenSize,
             outputNorm, outputW, outputDeviceQt, outputOutputDim, outputInputDim,
             totalBytes);
     }
