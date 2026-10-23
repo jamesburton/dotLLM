@@ -24,14 +24,31 @@ public readonly struct KvGeometry
 {
     private readonly int[] _kvStridePerLayer;
     private readonly int[]? _slotForLayer;
+    private readonly int[]? _slidingWindowPerSlot;
 
-    private KvGeometry(int[] kvStridePerLayer, bool isUniform, int uniformStride, int[]? slotForLayer = null)
+    private KvGeometry(int[] kvStridePerLayer, bool isUniform, int uniformStride, int[]? slotForLayer = null,
+        int[]? slidingWindowPerSlot = null)
     {
         _kvStridePerLayer = kvStridePerLayer;
         IsUniform = isUniform;
         UniformStride = uniformStride;
         _slotForLayer = slotForLayer;
+        _slidingWindowPerSlot = slidingWindowPerSlot;
     }
+
+    /// <summary>
+    /// True when at least one slot is a compact sliding-window slot (see <see cref="SlidingWindowOf"/>). Only geometries
+    /// built with <c>FromConfig(config, compactSlidingWindows: true)</c> carry windows.
+    /// </summary>
+    public bool HasSlidingWindows => _slidingWindowPerSlot is not null;
+
+    /// <summary>
+    /// The sliding window of <paramref name="slot"/> when the cache may keep only that slot's recent rows, else 0 (the slot
+    /// holds every position).
+    /// </summary>
+    /// <param name="slot">Cache slot index.</param>
+    /// <returns>The window in positions, or 0 for a full slot.</returns>
+    public int SlidingWindowOf(int slot) => _slidingWindowPerSlot is null ? 0 : _slidingWindowPerSlot[slot];
 
     /// <summary>
     /// Number of KV <b>slots</b> (buffers) this geometry describes. Equals the model's layer count for every dense / GQA / MoE
@@ -143,6 +160,33 @@ public readonly struct KvGeometry
     /// cache factory should call instead of re-deriving per-layer strides.
     /// </summary>
     public static KvGeometry FromConfig(ModelConfig config)
+        => FromConfig(config, compactSlidingWindows: false);
+
+    /// <summary>
+    /// <see cref="FromConfig(ModelConfig)"/>, optionally marking each sliding-window layer's slot with its window
+    /// (<see cref="ModelConfig.SlidingWindowOf"/>) so caches keep only the recent rows of those slots. Pass
+    /// <see langword="true"/> only for a model whose <see cref="IModel.SupportsCompactSlidingKv"/> is true: other readers
+    /// address cached rows by absolute position.
+    /// </summary>
+    /// <param name="config">Model configuration.</param>
+    /// <param name="compactSlidingWindows">Mark sliding-window slots as compact.</param>
+    /// <returns>The geometry for <paramref name="config"/>.</returns>
+    public static KvGeometry FromConfig(ModelConfig config, bool compactSlidingWindows)
+    {
+        var g = FromConfigCore(config);
+        if (!compactSlidingWindows) return g;
+        int[]? windows = null;
+        for (int l = 0; l < g.ModelLayerCount; l++)
+        {
+            int slot = g.SlotOfLayer(l);
+            if (slot < 0 || config.SlidingWindowOf(l) is not int w || w <= 0) continue;
+            windows ??= new int[g.LayerCount];
+            windows[slot] = w;
+        }
+        return windows is null ? g : new KvGeometry(g._kvStridePerLayer, g.IsUniform, g.UniformStride, g._slotForLayer, windows);
+    }
+
+    private static KvGeometry FromConfigCore(ModelConfig config)
     {
         System.ArgumentNullException.ThrowIfNull(config);
         int n = config.NumLayers;

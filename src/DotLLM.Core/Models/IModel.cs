@@ -239,6 +239,14 @@ public interface IModel : IDisposable
     bool RequiresPerSequenceState => false;
 
     /// <summary>
+    /// <see langword="true"/> when every cached-attention read in this model honours <see cref="IWindowedKvCache"/>,
+    /// so its caches may keep only the recent rows of sliding-window layers (see
+    /// <see cref="KvGeometry.FromConfig(ModelConfig, bool)"/>). Default <see langword="false"/>: the model reads
+    /// cached rows by absolute position.
+    /// </summary>
+    bool SupportsCompactSlidingKv => false;
+
+    /// <summary>
     /// Re-zeroes any <em>model-owned</em> recurrent state, so the next <c>Forward</c> that does not
     /// carry a caller-threaded state container starts a genuinely fresh sequence.
     /// </summary>

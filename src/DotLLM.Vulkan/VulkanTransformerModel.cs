@@ -1213,7 +1213,7 @@ public sealed partial class VulkanTransformerModel : IModel
     /// <summary>Creates a <see cref="VulkanKvCache"/> sized for this model.</summary>
     /// <remarks>
     /// Per-layer geometry comes from the single Core helper
-    /// <see cref="KvGeometry.FromConfig"/>: uniform <c>NumKvHeads × HeadDim</c> for every
+    /// <see cref="KvGeometry.FromConfig(DotLLM.Core.Models.ModelConfig)"/>: uniform <c>NumKvHeads × HeadDim</c> for every
     /// dense/GQA/MoE model, and distinct per-layer strides for Gemma-4 (whose sliding and
     /// global layers carry different KV-head counts AND head dims).
     /// </remarks>

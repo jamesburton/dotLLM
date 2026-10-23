@@ -445,7 +445,7 @@ public record ModelConfig
     /// to a uniform <see cref="NumKvHeads"/> when <see cref="NumGlobalKvHeads"/> is
     /// null, so non-Gemma-4 models are unaffected. This is the single source of
     /// truth for per-layer KV-head resolution (backends delegate here rather than
-    /// re-deriving it) and feeds <see cref="DotLLM.Core.Attention.KvGeometry.FromConfig"/>.
+    /// re-deriving it) and feeds <see cref="DotLLM.Core.Attention.KvGeometry.FromConfig(ModelConfig)"/>.
     /// </summary>
     [System.Runtime.CompilerServices.MethodImpl(
         System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
@@ -472,6 +472,25 @@ public record ModelConfig
         if (perLayer is null || (uint)layerIdx >= (uint)perLayer.Count)
             return true;
         return perLayer[layerIdx] is null;
+    }
+
+    /// <summary>
+    /// The sliding-window size of <paramref name="layer"/>, or <see langword="null"/> for a full-attention layer.
+    /// <see cref="PerLayerSlidingWindow"/> wins when set; otherwise <see cref="SlidingWindowSize"/> applies, modulated by
+    /// <see cref="SlidingWindowPattern"/>: pattern N &gt; 0 windows only the layers where <c>layer % N &lt; N - 1</c>
+    /// (llama.cpp <c>set_swa_pattern(N, dense_first=false)</c>; gpt-oss N=2: even layers windowed, odd dense).
+    /// </summary>
+    /// <param name="layer">Model layer index.</param>
+    /// <returns>The window in positions, or <see langword="null"/> when the layer attends the whole context.</returns>
+    public int? SlidingWindowOf(int layer)
+    {
+        var perLayer = PerLayerSlidingWindow;
+        if (perLayer is not null && (uint)layer < (uint)perLayer.Count)
+            return perLayer[layer];
+        if (SlidingWindowSize is null) return null;
+        int pattern = SlidingWindowPattern;
+        if (pattern <= 0) return SlidingWindowSize;
+        return (layer % pattern) < pattern - 1 ? SlidingWindowSize : null;
     }
 
     /// <summary>

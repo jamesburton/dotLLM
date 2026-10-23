@@ -83,7 +83,6 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     // Per-attention-type RoPE element-pairing convention for the FULL-attention
     // layers (Gemma 4). Equal to _ropeType when no global RoPE table is present.
     private readonly RoPEType _globalRopeType;
-    private readonly int? _slidingWindowSize;
     private readonly ComputeThreadPool? _threadPool;
     private readonly bool _ownsThreadPool;
     // Gemma-family embedding scale: input embeddings are multiplied by
@@ -140,7 +139,6 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         _ropeDim = ropeDim;
         _ropeType = ropeType;
         _globalRopeType = globalRopeType;
-        _slidingWindowSize = config.SlidingWindowSize;
         _threadPool = threadPool;
         _ownsThreadPool = ownsPool;
         _embeddingScale = config.EmbeddingScale ?? 1.0f;
@@ -443,7 +441,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     /// GlobalHeadDim</c>; sliding layers <c>NumKvHeads * HeadDim</c>). As of KV Phase 0
     /// the contiguous F32 <c>SimpleKvCache</c> supports this via per-layer
     /// strides, so the cache is accepted when its geometry MATCHES
-    /// <see cref="KvGeometry.FromConfig"/>; a mismatched cache (e.g. a uniform cache
+    /// <see cref="KvGeometry.FromConfig(ModelConfig)"/>; a mismatched cache (e.g. a uniform cache
     /// built for a different model) fails fast. Quantized / paged caches do not yet
     /// carry per-layer strides for distinct-head-dim models and are still rejected.
     /// Non-distinct (uniform) models skip this entirely — every cache type is valid.
@@ -748,28 +746,28 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     /// <inheritdoc/>
     public PoolingType? DeclaredPoolingType => Config.PoolingType;
 
-    /// <summary>
-    /// Returns the effective sliding-window size for <paramref name="layer"/>.
-    /// Honours <see cref="ModelConfig.PerLayerSlidingWindow"/> when set (each entry
-    /// may be null for full attention or a positive int for sliding); otherwise
-    /// falls back to the model-wide <see cref="ModelConfig.SlidingWindowSize"/>,
-    /// optionally modulated by <see cref="ModelConfig.SlidingWindowPattern"/> —
-    /// pattern N &gt; 0 applies the window only to layers where
-    /// <c>layer % N &lt; N - 1</c> (llama.cpp <c>set_swa_pattern(N,
-    /// dense_first=false)</c>; gpt-oss N=2: even layers windowed, odd dense).
-    /// Used for Gemma 3's interleaved local/global pattern and gpt-oss's
-    /// alternating sliding/dense attention.
-    /// </summary>
+    /// <summary>The effective sliding-window size for <paramref name="layer"/> (see <see cref="ModelConfig.SlidingWindowOf"/>).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private int? GetLayerSlidingWindow(int layer)
+    private int? GetLayerSlidingWindow(int layer) => Config.SlidingWindowOf(layer);
+
+    /// <inheritdoc/>
+    /// <remarks>Every cached read goes through <see cref="AttendCachedF32"/> or the quantized kernel, which both apply the row base.</remarks>
+    public bool SupportsCompactSlidingKv => true;
+
+    /// <summary>
+    /// Causal attention of <paramref name="seqQ"/> queries over the F32 rows cached for <paramref name="cacheLayer"/>.
+    /// Applies a compact sliding-window cache's row base (<see cref="IWindowedKvCache"/>, #1169): the kernel sees rows
+    /// <c>[base, CurrentLength)</c> and a query offset shifted by the same base.
+    /// </summary>
+    private void AttendCachedF32(float* q, IKvCache kvCache, int cacheLayer, float* output, int seqQ, int positionOffset,
+        int numHeads, int numKvHeads, int headDim, float scale, int? slidingWindow, float softCap, float[]? sinks = null)
     {
-        var perLayer = Config.PerLayerSlidingWindow;
-        if (perLayer is not null && (uint)layer < (uint)perLayer.Count)
-            return perLayer[layer];
-        if (_slidingWindowSize is null) return null;
-        int pattern = Config.SlidingWindowPattern;
-        if (pattern <= 0) return _slidingWindowSize;
-        return (layer % pattern) < pattern - 1 ? _slidingWindowSize : null;
+        int rowBase = (kvCache as IWindowedKvCache)?.RowBaseOf(cacheLayer) ?? 0;
+        var cachedK = kvCache.GetKeysRef(cacheLayer);
+        var cachedV = kvCache.GetValuesRef(cacheLayer);
+        Attention.Execute(q, (float*)cachedK.DataPointer, (float*)cachedV.DataPointer, output,
+            seqQ, kvCache.CurrentLength - rowBase, numHeads, numKvHeads, headDim, positionOffset - rowBase, scale,
+            _threadPool, slidingWindow, softCap, AttentionMaskMode.Causal, 0, sinks);
     }
 
     /// <summary>
@@ -1565,13 +1563,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 }
                 else
                 {
-                    var cachedK = kvCache.GetKeysRef(layer);
-                    var cachedV = kvCache.GetValuesRef(layer);
-
-                    Attention.Execute(q, (float*)cachedK.DataPointer, (float*)cachedV.DataPointer, attnOut,
-                        seqLen, seqKv, numHeads, numKvHeadsLayer, headDimLayer, positions[0], attnScale,
-                        _threadPool, layerSlidingWindow, attnSoftCap,
-                        AttentionMaskMode.Causal, 0, lw.AttnSinks);
+                    AttendCachedF32(q, kvCache, layer, attnOut, seqLen, positions[0],
+                        numHeads, numKvHeadsLayer, headDimLayer, attnScale, layerSlidingWindow, attnSoftCap, lw.AttnSinks);
                 }
             }
             else
@@ -2212,11 +2205,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 }
                 else
                 {
-                    var donorK = kvCache.GetKeysRef(donorLayer);
-                    var donorV = kvCache.GetValuesRef(donorLayer);
-                    Attention.Execute(q, (float*)donorK.DataPointer, (float*)donorV.DataPointer, attnOut,
-                        seqLen, seqKv, numHeads, numKvHeadsLayer, headDimLayer, positions[0], attnScale,
-                        _threadPool, layerSlidingWindow, softCap: 0f);
+                    AttendCachedF32(q, kvCache, donorLayer, attnOut, seqLen, positions[0],
+                        numHeads, numKvHeadsLayer, headDimLayer, attnScale, layerSlidingWindow, softCap: 0f);
                 }
             }
             else
@@ -2310,11 +2300,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             }
             else
             {
-                var cachedK = kvCache.GetKeysRef(layer);
-                var cachedV = kvCache.GetValuesRef(layer);
-                Attention.Execute(q, (float*)cachedK.DataPointer, (float*)cachedV.DataPointer, attnOut,
-                    seqLen, seqKv, numHeads, numKvHeadsLayer, headDimLayer, positions[0], attnScale,
-                    _threadPool, layerSlidingWindow, softCap: 0f);
+                AttendCachedF32(q, kvCache, layer, attnOut, seqLen, positions[0],
+                    numHeads, numKvHeadsLayer, headDimLayer, attnScale, layerSlidingWindow, softCap: 0f);
             }
         }
         else
@@ -2605,12 +2592,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                     int donorLayer = Config.SharedKvDonorLayer(layer);
                     if (kvCache is not null)
                     {
-                        var donorK = kvCache.GetKeysRef(donorLayer);
-                        var donorV = kvCache.GetValuesRef(donorLayer);
-                        int seqKv = kvCache.CurrentLength;
-                        Attention.Execute(q, (float*)donorK.DataPointer, (float*)donorV.DataPointer, attnOut,
-                            seqLen, seqKv, numHeads, numKvHeadsLayer, headDimLayer, positions[0], attnScale,
-                            _threadPool, layerSlidingWindow, softCap: attnSoftcap);
+                        AttendCachedF32(q, kvCache, donorLayer, attnOut, seqLen, positions[0],
+                            numHeads, numKvHeadsLayer, headDimLayer, attnScale, layerSlidingWindow, softCap: attnSoftcap);
                     }
                     else
                     {
@@ -2630,12 +2613,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                     var kRef = new TensorRef(seqLen, kvStrideLayer, DType.Float32, -1, (nint)k);
                     var vRef = new TensorRef(seqLen, kvStrideLayer, DType.Float32, -1, (nint)v);
                     kvCache.Update(kRef, vRef, positions, layer);
-                    int seqKv = kvCache.CurrentLength;
-                    var cachedK = kvCache.GetKeysRef(layer);
-                    var cachedV = kvCache.GetValuesRef(layer);
-                    Attention.Execute(q, (float*)cachedK.DataPointer, (float*)cachedV.DataPointer, attnOut,
-                        seqLen, seqKv, numHeads, numKvHeadsLayer, headDimLayer, positions[0], attnScale,
-                        _threadPool, layerSlidingWindow, softCap: attnSoftcap);
+                    AttendCachedF32(q, kvCache, layer, attnOut, seqLen, positions[0],
+                        numHeads, numKvHeadsLayer, headDimLayer, attnScale, layerSlidingWindow, softCap: attnSoftcap);
                 }
                 else
                 {
@@ -3523,11 +3502,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 }
                 else
                 {
-                    var cachedK = kvCache.GetKeysRef(layer);
-                    var cachedV = kvCache.GetValuesRef(layer);
-                    Attention.Execute(qSlice, (float*)cachedK.DataPointer, (float*)cachedV.DataPointer, aSlice,
-                        n, seqKv, numHeads, numKvHeadsLayer, headDim, positions[0], attnScale,
-                        _threadPool, layerSlidingWindow, attnSoftCap);
+                    AttendCachedF32(qSlice, kvCache, layer, aSlice, n, positions[0],
+                        numHeads, numKvHeadsLayer, headDim, attnScale, layerSlidingWindow, attnSoftCap);
                 }
             }
 

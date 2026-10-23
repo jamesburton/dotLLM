@@ -895,6 +895,10 @@ public static class Attention
 
         int quantLen = kvCache.QuantizedLength;
         int windowLen = kvCache.WindowLength;
+        // Compact sliding-window layer (#1169): row 0 holds position rowBase. Masks are relative, so shift both.
+        int rowBase = (kvCache as IWindowedKvCache)?.RowBaseOf(layerIndex) ?? 0;
+        quantLen -= rowBase;
+        positionOffset -= rowBase;
         byte* kQuant = (byte*)kvCache.GetQuantizedKeysPtr(layerIndex);
         byte* vQuant = (byte*)kvCache.GetQuantizedValuesPtr(layerIndex);
         float* kWindow = (float*)kvCache.GetWindowKeysPtr(layerIndex);
