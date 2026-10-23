@@ -82,7 +82,14 @@ void main() {
     const uint cSlab = 0u;
 #endif
 
+#if defined(GEMM_ACC_F16_P256)
+    for (uint chG = chBegin; chG < chunks; chG += 8u) {
+    [[unroll]] for (uint i = 0u; i < CMS_PER_ROW * CMS_PER_COL; i++)
+        sums16[i] = coopmat<float16_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
+    for (uint ch = chG; ch < min(chG + 8u, chunks); ch++) {
+#else
     for (uint ch = chBegin; ch < chunks; ch++) {
+#endif
         uint kBase = ch * BK;
 
         // ---- 1. Stage sharedB[BN, BK] as F16. ----
@@ -151,19 +158,15 @@ void main() {
             }
         }
 
-#if defined(GEMM_ACC_F16_P256)
-        if ((ch & 7u) == 7u) {
-            [[unroll]] for (uint i = 0u; i < CMS_PER_ROW * CMS_PER_COL; i++) {
-                sums[i] = sums[i] + coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(sums16[i]);
-                sums16[i] = coopmat<float16_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
-            }
-        }
-#endif
         barrier();
     }
 #if defined(GEMM_ACC_F16) || defined(GEMM_ACC_F16_P256)
+    // GEMM_ACC_F16: the one promotion at the end. GEMM_ACC_F16_P256: the promotion closing each 8-chunk group (see the loop head).
     [[unroll]] for (uint i = 0u; i < CMS_PER_ROW * CMS_PER_COL; i++)
         sums[i] = sums[i] + coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(sums16[i]);
+#endif
+#if defined(GEMM_ACC_F16_P256)
+    }
 #endif
 
 #ifdef GEMM_EPILOGUE_SCALE

@@ -202,7 +202,14 @@ void main() {
 
     uint chunks = pc.blocksPerRow * 4u;   // K / BK
 
+#if defined(GEMM_ACC_F16_P256)
+    for (uint chG = 0u; chG < chunks; chG += 8u) {
+    [[unroll]] for (uint i = 0u; i < CMS_PER_ROW * CMS_PER_COL; i++)
+        sums16[i] = coopmat<float16_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
+    for (uint ch = chG; ch < min(chG + 8u, chunks); ch++) {
+#else
     for (uint ch = 0u; ch < chunks; ch++) {
+#endif
         uint kBase      = ch * BK;
         uint grp        = ch >> 2u;       // PQ2_0 group index
         uint sliceInGrp = ch & 3u;        // 8-byte code slice within that group
@@ -312,19 +319,15 @@ void main() {
             }
         }
 
-#if defined(GEMM_ACC_F16_P256)
-        if ((ch & 7u) == 7u) {
-            [[unroll]] for (uint i = 0u; i < CMS_PER_ROW * CMS_PER_COL; i++) {
-                sums[i] = sums[i] + coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(sums16[i]);
-                sums16[i] = coopmat<float16_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
-            }
-        }
-#endif
         barrier();
     }
 #if defined(GEMM_ACC_F16) || defined(GEMM_ACC_F16_P256)
+    // GEMM_ACC_F16: the one promotion at the end. GEMM_ACC_F16_P256: the promotion closing each 8-chunk group (see the loop head).
     [[unroll]] for (uint i = 0u; i < CMS_PER_ROW * CMS_PER_COL; i++)
         sums[i] = sums[i] + coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(sums16[i]);
+#endif
+#if defined(GEMM_ACC_F16_P256)
+    }
 #endif
 
     // ---- 4. Store. C layout: [N, M] row-major; ColumnMajor + stride M places sums[m,t] at
