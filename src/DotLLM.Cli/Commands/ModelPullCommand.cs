@@ -27,17 +27,47 @@ internal sealed class ModelPullCommand : AsyncCommand<ModelPullCommand.Settings>
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
     {
+        // "ollama:llama3.2:3b" pulls from the ollama registry instead of the Hugging Face Hub.
+        if (OllamaRef.TryParse(settings.RepoId) is { Explicit: true } ollamaRef)
+        {
+            try
+            {
+                string pulled = GgufFileResolver.PullOllamaWithProgress(ollamaRef);
+                AnsiConsole.MarkupLine($"[green]Saved to:[/] {pulled.EscapeMarkup()}  [grey](model '{ollamaRef.ToString().EscapeMarkup()}' - run it with: dotllm run {ollamaRef.ToString().EscapeMarkup()})[/]");
+                return 0;
+            }
+            catch (Exception ex) when (ex is HttpRequestException or InvalidOperationException or IOException)
+            {
+                AnsiConsole.MarkupLine($"[red]Could not pull {settings.RepoId.EscapeMarkup()}:[/] {ex.Message.EscapeMarkup()}");
+                return 1;
+            }
+        }
+
         using var client = new HuggingFaceClient();
         using var downloader = new HuggingFaceDownloader();
 
         var filename = settings.Filename;
+        var reference = ModelResolver.Parse(settings.RepoId);
+        string repoId = reference.RepoId ?? settings.RepoId;
+        if (filename is null && reference.Filename is not null) filename = reference.Filename;
+        // "owner/repo:Q4_K_M" picks the matching file without a prompt.
+        if (string.IsNullOrEmpty(filename) && reference.Tag is not null)
+        {
+            var listing = await client.ListGgufFilesAsync(repoId);
+            filename = ModelResolver.ChooseRemoteFile(listing.Select(f => (f.Path, f.Size)), reference.Tag);
+            if (filename is null)
+            {
+                AnsiConsole.MarkupLine($"[red]No GGUF matching '{reference.Tag.EscapeMarkup()}' in {repoId.EscapeMarkup()}.[/]");
+                return 1;
+            }
+        }
 
         // If no filename specified, list GGUF files and let user pick
         if (string.IsNullOrEmpty(filename))
         {
             var ggufFiles = await AnsiConsole.Status()
                 .StartAsync("Fetching file list...", async _ =>
-                    await client.ListGgufFilesAsync(settings.RepoId));
+                    await client.ListGgufFilesAsync(repoId));
 
             if (ggufFiles.Count == 0)
             {
@@ -51,7 +81,7 @@ internal sealed class ModelPullCommand : AsyncCommand<ModelPullCommand.Settings>
                     .AddChoices(ggufFiles.Select(f => f.Path)));
         }
 
-        AnsiConsole.MarkupLine($"Downloading [bold]{filename.EscapeMarkup()}[/] from [bold]{settings.RepoId.EscapeMarkup()}[/]...");
+        AnsiConsole.MarkupLine($"Downloading [bold]{filename.EscapeMarkup()}[/] from [bold]{repoId.EscapeMarkup()}[/]...");
 
         var path = await AnsiConsole.Progress()
             .AutoClear(false)
@@ -66,6 +96,9 @@ internal sealed class ModelPullCommand : AsyncCommand<ModelPullCommand.Settings>
                 var task = ctx.AddTask($"[green]{filename.EscapeMarkup()}[/]", maxValue: 100);
                 long? lastTotal = null;
 
+                // Ticks are posted to the thread pool, so a stale one can land after the download
+                // returns and leave the bar short — cosmetic only here, unlike the server job state
+                // this same pattern corrupted (#521); the bar is torn down on return either way.
                 var progress = new Progress<(long bytesDownloaded, long? totalBytes)>(p =>
                 {
                     if (p.totalBytes.HasValue)
@@ -79,8 +112,11 @@ internal sealed class ModelPullCommand : AsyncCommand<ModelPullCommand.Settings>
                     }
                 });
 
-                return await downloader.DownloadFileAsync(
-                    settings.RepoId, filename, settings.Directory, progress);
+                // Hub cache (shared with huggingface_hub / hf download) + a mirror link; --dir keeps the old flat-directory behaviour.
+                if (settings.Directory is not null)
+                    return await downloader.DownloadFileAsync(repoId, filename, settings.Directory, progress);
+                var r = await downloader.DownloadToHubCacheAsync(repoId, filename, progress: progress);
+                return r.ModelPath;
             });
 
         AnsiConsole.MarkupLine($"[green]Saved to:[/] {path.EscapeMarkup()}");

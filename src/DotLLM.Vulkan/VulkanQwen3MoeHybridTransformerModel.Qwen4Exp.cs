@@ -1,0 +1,146 @@
+using DotLLM.Core.Configuration;
+using DotLLM.Vulkan.Kernels;
+
+namespace DotLLM.Vulkan;
+
+/// <summary>
+/// Narrow internal surface through which <see cref="VulkanQwen4ExpTransformerModel"/> drives this class's already-validated
+/// building blocks (Gated-DeltaNet layer, full-GQA attention layer, routed+shared MoE layer, quant-aware matmul dispatcher) on its
+/// own residual plumbing. Qwen4-Exp is a Qwen3.5-style GDN/attention + MoE hybrid whose only structural differences are the
+/// 4-stream gated residual around each block (which replaces the pre-norms and residual adds) and the sigmoid GDN output gate,
+/// so it composes this model instead of forking ~1500 lines of kernels.
+/// </summary>
+public sealed partial class VulkanQwen3MoeHybridTransformerModel
+{
+    internal VulkanDevice Q4Device => _device;
+    internal VulkanQwen3MoeHybridForwardState Q4State => _state;
+    internal VulkanQwen3MoeHybridWeights Q4Weights => _weights;
+    internal VulkanQwen3MoeHybridKernels Q4Kernels => _kernels;
+    internal VulkanDevice.SubmitContext Q4Submit => _submit;
+
+    /// <summary>Grows the per-forward scratch to <paramref name="seqLen"/> rows; true when buffers were re-created (descriptor caches were dropped).</summary>
+    internal bool Q4EnsureCapacity(int seqLen)
+    {
+        bool resized;
+        try { resized = _state.EnsureCapacity(seqLen); }
+        catch (Interop.VulkanException e) when (e.ErrorCode is -2 or -1)   // out of device / host memory (#880)
+        {
+            throw new InvalidOperationException(Qwen4ExpResidencyPlan.ScratchGrowthMessage(seqLen, e.Message), e);
+        }
+        if (resized) { _kernels.InvalidateAll(); _iqF16Prefill?.InvalidateDescriptorCache(); }
+        return resized;
+    }
+
+    /// <summary>Drops every cached descriptor set (call after re-creating buffers the caller feeds into this model's kernels).</summary>
+    internal void Q4InvalidateCaches() { _kernels.InvalidateAll(); _iqF16Prefill?.InvalidateDescriptorCache(); }
+
+    internal void Q4UploadPositions(ReadOnlySpan<int> positions) => UploadPositions(positions);
+
+    internal void Q4RecordEmbedding(nint cmdBuf, ReadOnlySpan<int> tokenIds) => RecordEmbeddingGather(cmdBuf, tokenIds);
+
+    internal void Q4RecordGdn(nint cmdBuf, int layer, int seqLen, float eps, VulkanGdnStateCache gdnCache, GdnPostScanGateF32Kernel sigmoidGate,
+                              Q4GdnRowSnapshots? snap = null)
+        => RecordGdnLayer(cmdBuf, layer, _weights.Layers[layer].Gdn!.Value, seqLen, eps, gdnCache, sigmoidGate, snap);
+
+    /// <summary>GDN ordinal of absolute layer <paramref name="layer"/> (-1 for attention layers).</summary>
+    internal int Q4GdnOrdinal(int layer) => _gdnLayerOrdinal[layer];
+
+    /// <summary>Optional QSA hook (#819): consulted by the full-attention layer after the K/V cache update; true = it produced <c>AttnOutput</c>.</summary>
+    internal IQ4AttentionHook? Q4AttentionHook { get; set; }
+
+    /// <summary>
+    /// qwen4exp 2..8-row verify forwards attend with the per-row split-KV kernel (the 1-row decode kernel's arithmetic at each row's own length) instead of the
+    /// f16 coopmat flash attention. <c>DOTLLM_VK_Q4E_SPLITKV_ROWS=0</c> (or setting this) restores the flash path.
+    /// </summary>
+    internal static bool Q4SplitKvRows { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_Q4E_SPLITKV_ROWS") != "0";
+
+    /// <summary>Test hook: dispatches recorded through the per-row split-KV kernel.</summary>
+    internal long Q4SplitKvRowsDispatches => _kernels.SplitKvRowsAttention?.RecordCount ?? 0;
+
+    private static bool IsConsecutive(ReadOnlySpan<int> positions)
+    {
+        for (int i = 1; i < positions.Length; i++) if (positions[i] != positions[0] + i) return false;
+        return true;
+    }
+
+    internal void Q4RecordAttention(nint cmdBuf, int layer, int seqLen, ReadOnlySpan<int> positions, VulkanNemotronHKvCache kvCache)
+        => RecordFullAttnLayer(cmdBuf, layer, _weights.Layers[layer].Attention!.Value, seqLen, positions,
+            Config.NumAttentionHeads, _weights.Layers[layer].Attention!.Value.NumKvHeads, Config.HeadDim, kvCache);
+
+    /// <summary>MoE on the block input already in <c>NormOutput</c>; the caller staged a copy of it in <c>MoeSharedInput</c> (no post-attention norm exists). Result lands in <c>NormOutput</c>.</summary>
+    internal void Q4RecordMoe(nint cmdBuf, VulkanQwen3MoeMoeUpload.LayerBundle bundle, int seqLen)
+        => RecordMoeLayer(cmdBuf, bundle, postAttnNormWeight: null, seqLen, Config.HiddenSize, Config.NormEpsilon);
+
+    internal void Q4RecordMatmul(nint cmdBuf, VulkanDevice.Buffer weights, QuantizationType qt, VulkanDevice.Buffer input,
+        VulkanDevice.Buffer output, int outputDim, int inputDim, int seqLen, bool xqReady = false)
+        => RecordMatmul(cmdBuf, weights, qt, input, output, outputDim, inputDim, seqLen, xqReady);
+
+    /// <summary>
+    /// Records a Q8_0 GEMV through the wide MMVQ twin (#885) against the row the last <see cref="Q4PrepareQ8Row"/> quantized: <paramref name="kSplit"/> picks the
+    /// 4-subgroups-per-row kernel (large K, few rows), otherwise the 4-rows-per-workgroup kernel (small K, many rows). False when the twin is unavailable or switched off.
+    /// </summary>
+    internal bool Q4RecordQ8Wide(nint cmdBuf, bool kSplit, VulkanDevice.Buffer weights, VulkanDevice.Buffer output, int m, int k)
+    {
+        var kern = kSplit ? _kernels.MatMulQ8MmvqWideKSplit : _kernels.MatMulQ8MmvqWideRows;
+        if (kern is null || !Q4WideEnabled) return false;
+        kern.Record(cmdBuf, weights, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, output, m: m, k: k);
+        Q4WideDispatches++;
+        return true;
+    }
+
+    /// <summary>Test hook (#885): GEMVs recorded through the wide Q8_0 MMVQ twins.</summary>
+    internal long Q4WideDispatches { get; private set; }
+
+    /// <summary>Wide Q8_0 MMVQ twins for the gated-residual down / up projections. On by default; <c>DOTLLM_VK_Q4E_Q8_WIDE=0</c> (or setting this) restores the one-wave-per-row kernel.</summary>
+    internal static bool Q4WideEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_Q4E_Q8_WIDE") != "0";
+
+    /// <summary>
+    /// Quantizes the single decode row <paramref name="input"/> to Q8_1 into the shared activation scratch (and records the barrier that makes it
+    /// readable) so several Q8_0 / independent GEMVs can then be recorded back to back without a barrier between them (pass <c>xqReady: true</c>).
+    /// False when the Q8 MMVQ kernels are unavailable or the row does not fit.
+    /// </summary>
+    internal bool Q4PrepareQ8Row(nint cmdBuf, VulkanDevice.Buffer input, int k) => TryPrepareQ8Activations(cmdBuf, input, k);
+
+    internal static void Q4Copy(nint cmdBuf, VulkanDevice.Buffer src, VulkanDevice.Buffer dst, ulong srcOffset, ulong dstOffset, ulong size)
+        => RecordCopyBufferRange(cmdBuf, src, dst, srcOffset, dstOffset, size);
+
+    /// <summary>Per-sequence GDN state sized for this model's GDN layers.</summary>
+    internal VulkanGdnStateCache Q4CreateGdnState() => CreateGdnStateCache();
+
+    /// <summary>Sparse per-attention-layer KV cache sized for <paramref name="maxSeqLen"/> positions.</summary>
+    internal VulkanNemotronHKvCache Q4CreateKvCache(int maxSeqLen, VulkanKvStorage storage = VulkanKvStorage.F32, bool lazy = false)
+        => CreateKvCache(maxSeqLen, storage, lazy);
+}
+
+/// <summary>
+/// Replaces the dense attention dispatch of a full-attention layer (issue #819). Called after Q/K were normed + rotated and the chunk's K/V were
+/// written to the cache; the block input is still in <c>NormOutput</c>. Return true after writing <c>AttnOutput</c>; false = run the dense kernels.
+/// </summary>
+internal interface IQ4AttentionHook
+{
+    /// <remarks><paramref name="kvStorage"/> is the element format of <paramref name="kSrc"/> / <paramref name="vSrc"/>; an F16 cache MUST be handled (true), the dense kernels cannot read it.</remarks>
+    bool RecordAttention(nint cmd, int layer, int seqLen, ReadOnlySpan<int> positions, VulkanDevice.Buffer kSrc, VulkanDevice.Buffer vSrc,
+        VulkanKvStorage kvStorage = VulkanKvStorage.F32);
+
+    /// <summary>Kernels that convert the F32 K/V rows into an F16 cache (null when F16 caches are unsupported).</summary>
+    Kernels.Qwen4ExpQsaKernels? F16Writer { get; }
+}
+
+/// <summary>
+/// Per-row recurrent-state snapshots a speculative verify forward asks the Gated-DeltaNet layers to record (#820): the state after each
+/// of the first <see cref="Rows"/> rows (scan twin kernel, owned by the model, bit-identical to the shipping scan) and the conv window after each of them.
+/// Buffers are indexed by GDN ordinal: <c>Gdn[l]</c> holds <c>Rows x stateElements</c> floats, <c>Conv[l]</c> <c>Rows x convStateElements</c>.
+/// </summary>
+internal sealed class Q4GdnRowSnapshots : IDisposable
+{
+    public required GdnScanMultiTokenSnapshotF32Kernel Kernel { get; init; }
+    public required VulkanDevice.Buffer[] Gdn { get; init; }
+    public required VulkanDevice.Buffer[] Conv { get; init; }
+    public int Rows { get; set; }
+
+    public void Dispose()
+    {
+        foreach (var b in Gdn) b?.Dispose();
+        foreach (var b in Conv) b?.Dispose();
+    }
+}

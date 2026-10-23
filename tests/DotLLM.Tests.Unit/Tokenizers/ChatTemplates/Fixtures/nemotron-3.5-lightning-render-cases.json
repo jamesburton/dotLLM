@@ -1,0 +1,143 @@
+[
+ {
+  "name": "single_user",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello there"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nHello there<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "system_and_multiturn",
+  "context": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a concise assistant."
+    },
+    {
+     "role": "user",
+     "content": "Hi! I'm Marta."
+    },
+    {
+     "role": "assistant",
+     "content": "Hello Marta!"
+    },
+    {
+     "role": "user",
+     "content": "What was my name?"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expected": "<|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nHi! I'm Marta.<|im_end|>\n<|im_start|>assistant\n<think></think>Hello Marta!<|im_end|>\n<|im_start|>user\nWhat was my name?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tools",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "What's the weather like in Paris right now?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_weather</name>\n<description>Get the current weather for a city.</description>\n<parameters>\n<parameter>\n<name>city</name>\n<type>string</type>\n<description>City name</description>\n</parameter>\n<parameter>\n<name>unit</name>\n<type>string</type>\n<enum>[\"c\", \"f\"]</enum>\n</parameter>\n<required>[\"city\"]</required>\n</parameters>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat's the weather like in Paris right now?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tool_roundtrip",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c1",
+     "content": "18C and sunny"
+    }
+   ],
+   "add_generation_prompt": true,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_weather</name>\n<description>Get the current weather for a city.</description>\n<parameters>\n<parameter>\n<name>city</name>\n<type>string</type>\n<description>City name</description>\n</parameter>\n<parameter>\n<name>unit</name>\n<type>string</type>\n<enum>[\"c\", \"f\"]</enum>\n</parameter>\n<required>[\"city\"]</required>\n</parameters>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\n<|im_end|>\n<|im_start|>user\n<tool_response>\n18C and sunny\n</tool_response>\n<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ }
+]

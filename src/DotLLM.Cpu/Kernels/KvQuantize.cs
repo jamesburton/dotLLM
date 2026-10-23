@@ -13,10 +13,10 @@ namespace DotLLM.Cpu.Kernels;
 public static unsafe partial class KvQuantize
 {
     /// <summary>Q8_0 block: 2 bytes (Half scale) + 32 bytes (int8 values) = 34 bytes.</summary>
-    public const int Q8_0BlockBytes = 34;
+    public const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
 
     /// <summary>Q4_0 block: 2 bytes (Half scale) + 16 bytes (packed nibbles) = 18 bytes.</summary>
-    public const int Q4_0BlockBytes = 18;
+    public const int Q4_0BlockBytes = QuantFormat.Q4_0BlockBytes;
 
     /// <summary>Elements per quantization block (both Q8_0 and Q4_0).</summary>
     public const int BlockSize = 32;
@@ -69,7 +69,7 @@ public static unsafe partial class KvQuantize
             byte* blockSrc = src + block * Q8_0BlockBytes;
             float* blockDst = dest + block * BlockSize;
 
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockSrc);
+            float d = MatMul.HalfToSingle(blockSrc);
             sbyte* qs = (sbyte*)(blockSrc + 2);
 
             for (int i = 0; i < BlockSize; i++)
@@ -87,7 +87,7 @@ public static unsafe partial class KvQuantize
             byte* blockSrc = src + block * Q8_0BlockBytes;
             float* blockDst = dest + block * BlockSize;
 
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockSrc);
+            float d = MatMul.HalfToSingle(blockSrc);
             Vector256<float> vScale = Vector256.Create(d);
             sbyte* qs = (sbyte*)(blockSrc + 2);
 
@@ -268,7 +268,7 @@ public static unsafe partial class KvQuantize
             byte* blockSrc = src + block * Q4_0BlockBytes;
             float* blockDst = dest + block * BlockSize;
 
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockSrc);
+            float d = MatMul.HalfToSingle(blockSrc);
             byte* qs = blockSrc + 2;
 
             for (int j = 0; j < 16; j++)
@@ -298,7 +298,7 @@ public static unsafe partial class KvQuantize
             byte* blockSrc = src + block * Q4_0BlockBytes;
             float* blockDst = dest + block * BlockSize;
 
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockSrc);
+            float d = MatMul.HalfToSingle(blockSrc);
             Vector256<float> vScale = Vector256.Create(d);
             byte* qs = blockSrc + 2;
 
