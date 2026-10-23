@@ -3,6 +3,7 @@ using DotLLM.Core.Configuration;
 using DotLLM.Core.Tensors;
 using DotLLM.Cuda;
 using DotLLM.Cuda.Architectures;
+using DotLLM.Cuda.Interop;
 using DotLLM.Models.Gguf;
 using Xunit;
 
@@ -91,10 +92,13 @@ public sealed class CudaQwen3HybridDenseVramAdmissionTests : IDisposable
     [SkippableFact]
     public void MtpHeadKvGrowth_IsAdmittedByTheModel()
     {
-        // The head's F32 KV grows 1024 positions at a time with the context (8 KiB/position on Bonsai 2).
+        // The head's KV grows 1024 positions at a time with the context. The copying growth (no CUDA virtual memory) admits
+        // the whole new storage, since the old buffers are still held during the copy.
         using var l = Load(withMtp: true, contextLength: 4096);
         var model = l.Model;
+        model.UseCopyingKvGrowthForTest();
         using var mtp = (CudaMtpState)model.CreateMtpState(4096)!;
+        Assert.False(mtp.GrowsInPlace);
         Assert.Equal(1024, mtp.Capacity);
 
         CudaQwen3HybridDenseTransformerModel.FreeVramOverride = Reserve;
@@ -105,6 +109,59 @@ public sealed class CudaQwen3HybridDenseVramAdmissionTests : IDisposable
         CudaQwen3HybridDenseTransformerModel.FreeVramOverride = null;
         mtp.EnsureCapacity(2000, stream: 0);
         Assert.Equal(2048, mtp.Capacity);
+    }
+
+    [SkippableFact]
+    public unsafe void MtpHeadKvGrowth_InPlace_KeepsRowsAndPointer_AndIsChargedOnlyTheAddedPages()
+    {
+        // Issue #1095: the head's K, V and iota map pages behind their rows. A growth that stays inside the mapped granules
+        // needs nothing; one that crosses a granule is charged exactly the pages it maps, and no row or pointer moves.
+        using var l = Load(withMtp: true, contextLength: 4096);
+        var model = l.Model;
+        Skip.IfNot(model.KvGrowsInPlace, "CUDA virtual memory unavailable on this device");
+        const int Ceiling = 1 << 18;
+        using var mtp = (CudaMtpState)model.CreateMtpState(Ceiling)!;
+        Assert.True(mtp.GrowsInPlace);
+        Assert.Equal(CudaMtpKvFormat.F16, mtp.KeyFormat);   // the synthetic trunk is F16; never wider (#1107)
+        long granule = CudaDriverVirtualMemory.TryCreate(0)!.Granularity;
+
+        // A recognisable pattern in a committed row, read back after the growths.
+        const int Row = 5;
+        byte[] pattern = new byte[mtp.KeyRowBytes];
+        for (int i = 0; i < pattern.Length; i++) pattern[i] = (byte)(i * 37 + 11);
+        fixed (byte* p = pattern)
+            CudaDriverApi.cuMemcpyHtoD_v2(mtp.GetKeyRowDevicePtr(Row), (nint)p, (nuint)pattern.Length).ThrowOnError();
+        nint keyPtr = mtp.KeyCacheDevicePtr, valuePtr = mtp.ValueCacheDevicePtr;
+
+        // Inside the first granule: free VRAM at exactly the reserve still admits it.
+        CudaQwen3HybridDenseTransformerModel.FreeVramOverride = Reserve;
+        mtp.EnsureCapacity(2000, stream: 0);
+        Assert.Equal(2048, mtp.Capacity);
+
+        // Past it: K and V each map whole granules for the rows they add; the iota (4 B/row) still fits its first granule.
+        int target = (int)(granule / mtp.KeyRowBytes) + 1;
+        int targetRounded = (target + 1023) / 1024 * 1024;
+        Assert.True((long)targetRounded * sizeof(int) <= granule, "the iota must stay in its first granule for this count");
+        long added = RoundUp(targetRounded * mtp.KeyRowBytes, granule) - granule
+                   + RoundUp(targetRounded * mtp.ValueRowBytes, granule) - granule;
+        long before = mtp.AllocatedBytes;
+        CudaQwen3HybridDenseTransformerModel.FreeVramOverride = Reserve + added - 1;
+        var ex = Assert.Throws<DeviceMemoryAdmissionException>(() => mtp.EnsureCapacity(target, stream: 0));
+        Assert.Contains($"MTP head KV cache for {targetRounded} positions", ex.Message);
+        Assert.Equal(2048, mtp.Capacity);
+        CudaQwen3HybridDenseTransformerModel.FreeVramOverride = Reserve + added;
+        mtp.EnsureCapacity(target, stream: 0);
+        Assert.Equal(targetRounded, mtp.Capacity);
+        Assert.Equal(added, mtp.AllocatedBytes - before);
+
+        Assert.Equal(keyPtr, mtp.KeyCacheDevicePtr);
+        Assert.Equal(valuePtr, mtp.ValueCacheDevicePtr);
+        byte[] back = new byte[pattern.Length];
+        fixed (byte* p = back)
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)p, mtp.GetKeyRowDevicePtr(Row), (nuint)back.Length).ThrowOnError();
+        Assert.Equal(pattern, back);
+
+        static long RoundUp(long bytes, long g) => (bytes + g - 1) / g * g;
     }
 
     [SkippableFact]
