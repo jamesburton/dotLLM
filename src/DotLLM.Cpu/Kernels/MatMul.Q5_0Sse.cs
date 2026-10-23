@@ -183,10 +183,10 @@ public static unsafe partial class MatMul
             result[row] = VecDotQ5_0Q8_1Sse(weights + row * rowBytes, xQ8, blockCount);
     }
 
-    /// <summary>R4-interleaved 4-row group for the SSSE3 tier (blocks of the 4 rows are adjacent).</summary>
+    /// <summary>4-row group for the SSSE3 tier over the original row-major rows (#1156).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void VecDotQ5_0Q8_1Sse_4RowsR4(byte* groupBase, byte* xQ8, int blockCount, float* results)
-        => VecDotQ5_0Q8_1Sse_4Rows(groupBase, Q5_0BlockBytes, 4 * Q5_0BlockBytes, xQ8, blockCount, results);
+        => VecDotQ5_0Q8_1Sse_4Rows(groupBase, (nint)blockCount * Q5_0BlockBytes, Q5_0BlockBytes, xQ8, blockCount, results);
 
     /// <summary>Best available single-row Q5_0 dot (AVX2, then SSSE3, then scalar) for tail rows.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

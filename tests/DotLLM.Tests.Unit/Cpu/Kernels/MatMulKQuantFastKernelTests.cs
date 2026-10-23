@@ -35,7 +35,7 @@ public sealed unsafe class MatMulKQuantFastKernelTests
         const int tokens = 4;
         var rng = new Random(933 + sbCount + fmt * 100);
 
-        // One R4 group (4 rows): super-block s of row r lives at (s * 4 + r) * blockBytes.
+        // One 4-row group over row-major rows (#1156): super-block s of row r lives at (r * sbCount + s) * blockBytes.
         byte* w = (byte*)NativeMemory.AlignedAlloc((nuint)(4L * sbCount * blockBytes), 64);
         byte* x = (byte*)NativeMemory.AlignedAlloc((nuint)((long)tokens * sbCount * Q8KBytes), 64);
         float* src = (float*)NativeMemory.AlignedAlloc((nuint)(k * 4), 64);
@@ -68,19 +68,20 @@ public sealed unsafe class MatMulKQuantFastKernelTests
                 MatMul.QuantizeF32ToQ8_K(src, x + (long)t * sbCount * Q8KBytes, k);
             }
 
-            int wStride = 4 * blockBytes;
+            int wStride = blockBytes;
+            long rs = (long)sbCount * blockBytes;
             int q8Row = sbCount * Q8KBytes;
             for (int t = 0; t < tokens; t++)
             {
                 byte* g = w;
                 if (q6)
-                    MatMul.VecDotQ6_K_Q8_K_4RowsReference(g, g + 210, g + 420, g + 630,
+                    MatMul.VecDotQ6_K_Q8_K_4RowsReference(g, g + rs, g + 2 * rs, g + 3 * rs,
                         x + (long)t * q8Row, sbCount, wStride, expected + t * 4);
                 else if (q5)
-                    MatMul.VecDotQ5_K_Q8_K_4RowsReference(g, g + 176, g + 352, g + 528,
+                    MatMul.VecDotQ5_K_Q8_K_4RowsReference(g, g + rs, g + 2 * rs, g + 3 * rs,
                         x + (long)t * q8Row, sbCount, wStride, expected + t * 4);
                 else
-                    MatMul.VecDotQ4_K_Q8_K_4RowsReference(g, g + 144, g + 288, g + 432,
+                    MatMul.VecDotQ4_K_Q8_K_4RowsReference(g, g + rs, g + 2 * rs, g + 3 * rs,
                         x + (long)t * q8Row, sbCount, wStride, expected + t * 4);
             }
 
@@ -89,11 +90,11 @@ public sealed unsafe class MatMulKQuantFastKernelTests
             {
                 byte* g = w;
                 if (q6)
-                    MatMul.Q6KRows4Tokens1(g, g + 210, g + 420, g + 630, x + (long)t * q8Row, sbCount, wStride, actual + t * 4);
+                    MatMul.Q6KRows4Tokens1(g, g + rs, g + 2 * rs, g + 3 * rs, x + (long)t * q8Row, sbCount, wStride, actual + t * 4);
                 else if (q5)
-                    MatMul.Q5KRows4Tokens1(g, g + 176, g + 352, g + 528, x + (long)t * q8Row, sbCount, wStride, actual + t * 4);
+                    MatMul.Q5KRows4Tokens1(g, g + rs, g + 2 * rs, g + 3 * rs, x + (long)t * q8Row, sbCount, wStride, actual + t * 4);
                 else
-                    MatMul.Q4KRows4Tokens1(g, g + 144, g + 288, g + 432, x + (long)t * q8Row, sbCount, wStride, actual + t * 4);
+                    MatMul.Q4KRows4Tokens1(g, g + rs, g + 2 * rs, g + 3 * rs, x + (long)t * q8Row, sbCount, wStride, actual + t * 4);
             }
             AssertBits(expected, actual, tokens * 4, $"Q{fmt}_K sb={sbCount} 1-token kernel");
 
@@ -214,13 +215,14 @@ public sealed unsafe class MatMulKQuantFastKernelTests
                 MatMul.QuantizeF32ToQ8_K(src, x + (long)t * q8Row, k);
             }
 
-            int stride = 4 * bb;
+            int stride = bb;
+            long rs = (long)sb * bb;
             for (int t = 0; t < tokens; t++)
             {
                 byte* q = x + (long)t * q8Row;
-                if (q6) MatMul.VecDotQ6_K_Q8_K_4RowsReference(w, w + bb, w + 2 * bb, w + 3 * bb, q, sb, stride, exp + t * 4);
-                else if (q5) MatMul.VecDotQ5_K_Q8_K_4RowsReference(w, w + bb, w + 2 * bb, w + 3 * bb, q, sb, stride, exp + t * 4);
-                else MatMul.VecDotQ4_K_Q8_K_4RowsReference(w, w + bb, w + 2 * bb, w + 3 * bb, q, sb, stride, exp + t * 4);
+                if (q6) MatMul.VecDotQ6_K_Q8_K_4RowsReference(w, w + rs, w + 2 * rs, w + 3 * rs, q, sb, stride, exp + t * 4);
+                else if (q5) MatMul.VecDotQ5_K_Q8_K_4RowsReference(w, w + rs, w + 2 * rs, w + 3 * rs, q, sb, stride, exp + t * 4);
+                else MatMul.VecDotQ4_K_Q8_K_4RowsReference(w, w + rs, w + 2 * rs, w + 3 * rs, q, sb, stride, exp + t * 4);
             }
 
             MatMul.ForceDisableFastKQuant = true;
@@ -242,15 +244,15 @@ public sealed unsafe class MatMulKQuantFastKernelTests
                     byte* q = x + (long)t * q8Row;
                     if (pass == 0)
                     {
-                        if (q6) MatMul.Q6KRows4Tokens1(w, w + bb, w + 2 * bb, w + 3 * bb, q, sb, stride, act + t * 4);
-                        else if (q5) MatMul.Q5KRows4Tokens1(w, w + bb, w + 2 * bb, w + 3 * bb, q, sb, stride, act + t * 4);
-                        else MatMul.Q4KRows4Tokens1(w, w + bb, w + 2 * bb, w + 3 * bb, q, sb, stride, act + t * 4);
+                        if (q6) MatMul.Q6KRows4Tokens1(w, w + rs, w + 2 * rs, w + 3 * rs, q, sb, stride, act + t * 4);
+                        else if (q5) MatMul.Q5KRows4Tokens1(w, w + rs, w + 2 * rs, w + 3 * rs, q, sb, stride, act + t * 4);
+                        else MatMul.Q4KRows4Tokens1(w, w + rs, w + 2 * rs, w + 3 * rs, q, sb, stride, act + t * 4);
                     }
                     else
                     {
-                        if (q6) MatMul.VecDotQ6_K_Q8_K_4Rows(w, w + bb, w + 2 * bb, w + 3 * bb, q, sb, stride, act + t * 4);
-                        else if (q5) MatMul.VecDotQ5_K_Q8_K_4Rows(w, w + bb, w + 2 * bb, w + 3 * bb, q, sb, stride, act + t * 4);
-                        else MatMul.VecDotQ4_K_Q8_K_4Rows(w, w + bb, w + 2 * bb, w + 3 * bb, q, sb, stride, act + t * 4);
+                        if (q6) MatMul.VecDotQ6_K_Q8_K_4Rows(w, w + rs, w + 2 * rs, w + 3 * rs, q, sb, stride, act + t * 4);
+                        else if (q5) MatMul.VecDotQ5_K_Q8_K_4Rows(w, w + rs, w + 2 * rs, w + 3 * rs, q, sb, stride, act + t * 4);
+                        else MatMul.VecDotQ4_K_Q8_K_4Rows(w, w + rs, w + 2 * rs, w + 3 * rs, q, sb, stride, act + t * 4);
                     }
                 }
                 AssertBits(exp, act, tokens * 4, $"Q{fmt}_K forced-off {(pass == 0 ? "1-token entry point" : "dispatcher")}");

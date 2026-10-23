@@ -180,10 +180,8 @@ public sealed unsafe class Q8_0SseTierTests
         try
         {
             for (int r = 0; r < 4; r++) FillQ8Row(rng, w + r * rowBytes, blockCount, allowMinus128: true);
-            // R4 interleave by hand: [r0_b0][r1_b0][r2_b0][r3_b0][r0_b1]...
-            for (int b = 0; b < blockCount; b++)
-            for (int r = 0; r < 4; r++)
-                Buffer.MemoryCopy(w + r * rowBytes + b * BlockBytes, r4 + (b * 4 + r) * BlockBytes, BlockBytes, BlockBytes);
+            // The R4 entry points read the original row-major rows (#1156); a copy proves they take no other layout.
+            Buffer.MemoryCopy(w, r4, 4L * rowBytes, 4L * rowBytes);
 
             MatMul.VecDotQ8_0Sse_4Rows(w, rowBytes, BlockBytes, x, blockCount, res);
             for (int r = 0; r < 4; r++)

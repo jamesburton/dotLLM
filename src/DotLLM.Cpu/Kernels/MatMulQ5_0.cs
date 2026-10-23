@@ -462,13 +462,14 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     internal static float VecDotQ5_0Q8_1ScalarR4(byte* groupBase, int rowInGroup, byte* q8, int blockCount)
     {
+        nint rowStride = (nint)blockCount * Q5_0BlockBytes;
         float sumf = 0;
         float offsetSum = 0;
-        const int wStride = 4 * Q5_0BlockBytes;
+        const int wStride = Q5_0BlockBytes; // #1156: original row-major rows, rowStride apart
 
         for (int block = 0; block < blockCount; block++)
         {
-            byte* q5Block = groupBase + block * wStride + rowInGroup * Q5_0BlockBytes;
+            byte* q5Block = groupBase + block * wStride + rowInGroup * rowStride;
             byte* q8Block = q8 + block * Q8_1BlockBytes;
 
             float d5 = HalfToSingle(q5Block);
@@ -502,13 +503,14 @@ public static unsafe partial class MatMul
     internal static void VecDotQ5_0Q8_1Avx2_4RowsR4(
         byte* groupBase, byte* q8, int blockCount, float* results)
     {
+        nint rowStride = (nint)blockCount * Q5_0BlockBytes;
         Vector256<float> acc0 = Vector256<float>.Zero;
         Vector256<float> acc1 = Vector256<float>.Zero;
         Vector256<float> acc2 = Vector256<float>.Zero;
         Vector256<float> acc3 = Vector256<float>.Zero;
         Vector256<short> ones = Vector256.Create((short)1);
         float off0 = 0, off1 = 0, off2 = 0, off3 = 0;
-        const int wStride = 4 * Q5_0BlockBytes;
+        const int wStride = Q5_0BlockBytes; // #1156: original row-major rows, rowStride apart
 
         for (int block = 0; block < blockCount; block++)
         {
@@ -534,7 +536,7 @@ public static unsafe partial class MatMul
 
             // Row 1
             {
-                byte* w = blockBase + Q5_0BlockBytes;
+                byte* w = blockBase + rowStride;
                 float d5 = HalfToSingle(w);
                 Vector256<int> dot = Q5_0BlockDotQ8_1(w, q8Vals, ones);
                 if (Fma.IsSupported)
@@ -546,7 +548,7 @@ public static unsafe partial class MatMul
 
             // Row 2
             {
-                byte* w = blockBase + 2 * Q5_0BlockBytes;
+                byte* w = blockBase + 2 * rowStride;
                 float d5 = HalfToSingle(w);
                 Vector256<int> dot = Q5_0BlockDotQ8_1(w, q8Vals, ones);
                 if (Fma.IsSupported)
@@ -558,7 +560,7 @@ public static unsafe partial class MatMul
 
             // Row 3
             {
-                byte* w = blockBase + 3 * Q5_0BlockBytes;
+                byte* w = blockBase + 3 * rowStride;
                 float d5 = HalfToSingle(w);
                 Vector256<int> dot = Q5_0BlockDotQ8_1(w, q8Vals, ones);
                 if (Fma.IsSupported)
@@ -946,7 +948,8 @@ public static unsafe partial class MatMul
         byte* groupBase, byte* x0, byte* x1, byte* x2,
         float* c, int blockCount, int cStride)
     {
-        const int wStride = 4 * Q5_0BlockBytes;
+        nint rowStride = (nint)blockCount * Q5_0BlockBytes;
+        const int wStride = Q5_0BlockBytes; // #1156: original row-major rows, rowStride apart
 
         Vector256<float> acc00 = Vector256<float>.Zero, acc01 = Vector256<float>.Zero, acc02 = Vector256<float>.Zero;
         Vector256<float> acc10 = Vector256<float>.Zero, acc11 = Vector256<float>.Zero, acc12 = Vector256<float>.Zero;
@@ -1006,7 +1009,7 @@ public static unsafe partial class MatMul
 
             // Row 1
             {
-                byte* w = blockBase + Q5_0BlockBytes;
+                byte* w = blockBase + rowStride;
                 float d5 = HalfToSingle(w);
 
                 Vector256<int> dot0 = Q5_0BlockDotQ8_1(w, q8v0, ones);
@@ -1027,7 +1030,7 @@ public static unsafe partial class MatMul
 
             // Row 2
             {
-                byte* w = blockBase + 2 * Q5_0BlockBytes;
+                byte* w = blockBase + 2 * rowStride;
                 float d5 = HalfToSingle(w);
 
                 Vector256<int> dot0 = Q5_0BlockDotQ8_1(w, q8v0, ones);
@@ -1048,7 +1051,7 @@ public static unsafe partial class MatMul
 
             // Row 3
             {
-                byte* w = blockBase + 3 * Q5_0BlockBytes;
+                byte* w = blockBase + 3 * rowStride;
                 float d5 = HalfToSingle(w);
 
                 Vector256<int> dot0 = Q5_0BlockDotQ8_1(w, q8v0, ones);

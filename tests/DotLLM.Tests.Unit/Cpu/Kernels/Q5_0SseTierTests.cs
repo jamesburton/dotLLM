@@ -161,9 +161,8 @@ public sealed unsafe class Q5_0SseTierTests
         {
             for (int r = 0; r < 4; r++) FillQ5Row(rng, w + r * rowBytes, blockCount);
             FillRawQ8_1Row(rng, x, blockCount);
-            for (int b = 0; b < blockCount; b++)
-            for (int r = 0; r < 4; r++)
-                Buffer.MemoryCopy(w + r * rowBytes + b * Q5Bytes, r4 + (b * 4 + r) * Q5Bytes, Q5Bytes, Q5Bytes);
+            // The R4 entry points read the original row-major rows (#1156).
+            Buffer.MemoryCopy(w, r4, 4L * rowBytes, 4L * rowBytes);
 
             MatMul.VecDotQ5_0Q8_1Sse_4Rows(w, rowBytes, Q5Bytes, x, blockCount, res);
             for (int r = 0; r < 4; r++)

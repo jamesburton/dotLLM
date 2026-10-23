@@ -198,11 +198,12 @@ public static unsafe partial class MatMul
     internal static float VecDotQ8_0ScalarR4(byte* groupBase, int rowInGroup, byte* xQ8, int blockCount)
     {
         float sumf = 0;
-        const int wStride = 4 * Q8_0BlockBytes;
+        const int wStride = Q8_0BlockBytes; // #1156: original row-major rows, rowStride apart
+        nint rowStride = (nint)blockCount * Q8_0BlockBytes;
 
         for (int block = 0; block < blockCount; block++)
         {
-            byte* wBlock = groupBase + block * wStride + rowInGroup * Q8_0BlockBytes;
+            byte* wBlock = groupBase + block * wStride + rowInGroup * rowStride;
             byte* xBlock = xQ8 + block * Q8_0BlockBytes;
 
             float dw = HalfToSingle(wBlock);
@@ -228,13 +229,27 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     internal static void VecDotQ8_0Avx2_4RowsR4(
         byte* groupBase, byte* x, int blockCount, float* results)
+        => VecDotQ8_0Avx2_4RowsStrided(groupBase, (nint)blockCount * Q8_0BlockBytes, Q8_0BlockBytes, x, blockCount, results);
+
+    /// <summary>
+    /// The 4-row Q8_0 AVX2 dot over any layout: row <c>r</c>'s block <c>b</c> is at <c>w + r·rowStride + b·blockStride</c>.
+    /// R4 is <c>(34, 136)</c>; the original row-major weights are <c>(rowBytes, 34)</c>. Same arithmetic either way.
+    /// </summary>
+    /// <param name="w">Row 0's first block.</param>
+    /// <param name="rowStride">Bytes between rows' blocks at the same K position.</param>
+    /// <param name="blockStride">Bytes between consecutive blocks of one row.</param>
+    /// <param name="x">Q8_0 activation row.</param>
+    /// <param name="blockCount">Blocks per row.</param>
+    /// <param name="results">Four outputs.</param>
+    [SkipLocalsInit]
+    internal static void VecDotQ8_0Avx2_4RowsStrided(
+        byte* w, nint rowStride, nint blockStride, byte* x, int blockCount, float* results)
     {
         Vector256<float> acc0 = Vector256<float>.Zero;
         Vector256<float> acc1 = Vector256<float>.Zero;
         Vector256<float> acc2 = Vector256<float>.Zero;
         Vector256<float> acc3 = Vector256<float>.Zero;
         Vector256<short> ones = Vector256.Create((short)1);
-        const int wStride = 4 * Q8_0BlockBytes;
         float* scale = stackalloc float[4];
 
         for (int block = 0; block < blockCount; block++)
@@ -243,17 +258,17 @@ public static unsafe partial class MatMul
             Vector256<sbyte> vx = Unsafe.ReadUnaligned<Vector256<sbyte>>(xBlock + 2);
             Vector256<sbyte> absX = Avx2.Sign(vx, vx);
 
-            byte* blockBase = groupBase + block * wStride;
+            byte* blockBase = w + block * blockStride;
 
             // The four rows' dx*dw at once: (float)Half is a managed call on .NET 10, costlier than the block dot (#1119).
             // HalfToSingleSse2 is exact and IEEE multiplication commutes, so each lane equals the scalar dx * dw.
-            Vector128<float> dw4 = HalfToSingleSse2(LoadHalf4(blockBase, Q8_0BlockBytes));
+            Vector128<float> dw4 = HalfToSingleSse2(LoadHalf4(blockBase, rowStride));
             Sse.Store(scale, Sse.Multiply(Vector128.Create(HalfToSingle(xBlock)), dw4));
 
             acc0 = Q8_0BlockFma(acc0, blockBase, vx, absX, scale[0], ones);
-            acc1 = Q8_0BlockFma(acc1, blockBase + Q8_0BlockBytes, vx, absX, scale[1], ones);
-            acc2 = Q8_0BlockFma(acc2, blockBase + 2 * Q8_0BlockBytes, vx, absX, scale[2], ones);
-            acc3 = Q8_0BlockFma(acc3, blockBase + 3 * Q8_0BlockBytes, vx, absX, scale[3], ones);
+            acc1 = Q8_0BlockFma(acc1, blockBase + rowStride, vx, absX, scale[1], ones);
+            acc2 = Q8_0BlockFma(acc2, blockBase + 2 * rowStride, vx, absX, scale[2], ones);
+            acc3 = Q8_0BlockFma(acc3, blockBase + 3 * rowStride, vx, absX, scale[3], ones);
         }
 
         results[0] = HorizontalSumAvx2Float(acc0);
@@ -333,7 +348,8 @@ public static unsafe partial class MatMul
         Vector512<float> acc1 = Vector512<float>.Zero;
         Vector512<float> acc2 = Vector512<float>.Zero;
         Vector512<float> acc3 = Vector512<float>.Zero;
-        const int wStride = 4 * Q8_0BlockBytes;
+        const int wStride = Q8_0BlockBytes; // #1156: original row-major rows, rowStride apart
+        nint rowStride = (nint)blockCount * Q8_0BlockBytes;
 
         int block = 0;
 
@@ -350,15 +366,14 @@ public static unsafe partial class MatMul
             Vector256<sbyte> absX0 = Avx2.Sign(vx0, vx0);
             Vector256<sbyte> absX1 = Avx2.Sign(vx1, vx1);
 
-            // Row r's block b lives at groupBase + b * wStride + r * Q8_0BlockBytes, so each row
-            // is a fixed offset from the group base with the interleave stride between its blocks.
+            // Row r's block b lives at groupBase + r * rowStride + b * wStride (#1156: original row-major weights).
             ProcessVnniDualBlock(groupBase, block, wStride,
                 vx0, vx1, absX0, absX1, dx0, dx1, ref acc0);
-            ProcessVnniDualBlock(groupBase + Q8_0BlockBytes, block, wStride,
+            ProcessVnniDualBlock(groupBase + rowStride, block, wStride,
                 vx0, vx1, absX0, absX1, dx0, dx1, ref acc1);
-            ProcessVnniDualBlock(groupBase + 2 * Q8_0BlockBytes, block, wStride,
+            ProcessVnniDualBlock(groupBase + 2 * rowStride, block, wStride,
                 vx0, vx1, absX0, absX1, dx0, dx1, ref acc2);
-            ProcessVnniDualBlock(groupBase + 3 * Q8_0BlockBytes, block, wStride,
+            ProcessVnniDualBlock(groupBase + 3 * rowStride, block, wStride,
                 vx0, vx1, absX0, absX1, dx0, dx1, ref acc3);
         }
 
@@ -377,9 +392,9 @@ public static unsafe partial class MatMul
             Vector256<short> ones = Vector256.Create((short)1);
 
             results[0] += ProcessAvx2SingleBlock(groupBase, block, wStride, vx, absX, dx, ones);
-            results[1] += ProcessAvx2SingleBlock(groupBase + Q8_0BlockBytes, block, wStride, vx, absX, dx, ones);
-            results[2] += ProcessAvx2SingleBlock(groupBase + 2 * Q8_0BlockBytes, block, wStride, vx, absX, dx, ones);
-            results[3] += ProcessAvx2SingleBlock(groupBase + 3 * Q8_0BlockBytes, block, wStride, vx, absX, dx, ones);
+            results[1] += ProcessAvx2SingleBlock(groupBase + rowStride, block, wStride, vx, absX, dx, ones);
+            results[2] += ProcessAvx2SingleBlock(groupBase + 2 * rowStride, block, wStride, vx, absX, dx, ones);
+            results[3] += ProcessAvx2SingleBlock(groupBase + 3 * rowStride, block, wStride, vx, absX, dx, ones);
         }
     }
 
@@ -1609,7 +1624,8 @@ public static unsafe partial class MatMul
         byte* groupBase, byte* x0, byte* x1, byte* x2,
         float* c, int blockCount, int cStride)
     {
-        const int wStride = 4 * Q8_0BlockBytes;
+        const int wStride = Q8_0BlockBytes; // #1156: original row-major rows, rowStride apart
+        nint rowStride = (nint)blockCount * Q8_0BlockBytes;
 
         // 12 accumulators: [row][token]
         float acc00 = 0, acc01 = 0, acc02 = 0;
@@ -1630,7 +1646,7 @@ public static unsafe partial class MatMul
 
             for (int r = 0; r < 4; r++)
             {
-                byte* wBlock = blockBase + r * Q8_0BlockBytes;
+                byte* wBlock = blockBase + r * rowStride;
                 float dw = HalfToSingle(wBlock);
                 sbyte* qw = (sbyte*)(wBlock + 2);
 
@@ -1684,7 +1700,8 @@ public static unsafe partial class MatMul
         byte* groupBase, byte* x0, byte* x1, byte* x2,
         float* c, int blockCount, int cStride)
     {
-        const int wStride = 4 * Q8_0BlockBytes;
+        const int wStride = Q8_0BlockBytes; // #1156: original row-major rows, rowStride apart
+        nint rowStride = (nint)blockCount * Q8_0BlockBytes;
         Vector256<short> ones = Vector256.Create((short)1);
 
         // Process one weight row at a time with only 3 accumulators (one per token).
@@ -1698,7 +1715,7 @@ public static unsafe partial class MatMul
 
             for (int b = 0; b < blockCount; b++)
             {
-                byte* wBlock = groupBase + b * wStride + r * Q8_0BlockBytes;
+                byte* wBlock = groupBase + b * wStride + r * rowStride;
                 float dw = HalfBitsToFloat(wBlock);
                 Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock + 2);
 
@@ -1756,7 +1773,8 @@ public static unsafe partial class MatMul
         byte* groupBase, byte* x0, byte* x1, byte* x2, byte* x3, byte* x4, byte* x5,
         float* c, int blockCount, int cStride)
     {
-        const int wStride = 4 * Q8_0BlockBytes;
+        const int wStride = Q8_0BlockBytes; // #1156: original row-major rows, rowStride apart
+        nint rowStride = (nint)blockCount * Q8_0BlockBytes;
 
         // 24 accumulators: acc_r{row}t{token}
         Vector512<float> a0t0 = Vector512<float>.Zero, a0t1 = Vector512<float>.Zero, a0t2 = Vector512<float>.Zero;
@@ -1804,8 +1822,8 @@ public static unsafe partial class MatMul
 
             // Row 1
             {
-                byte* wb0 = blockBase0 + Q8_0BlockBytes;
-                byte* wb1 = blockBase1 + Q8_0BlockBytes;
+                byte* wb0 = blockBase0 + rowStride;
+                byte* wb1 = blockBase1 + rowStride;
                 float dw0 = HalfBitsToFloat(wb0);
                 float dw1 = HalfBitsToFloat(wb1);
                 Vector256<sbyte> vwLo = Unsafe.ReadUnaligned<Vector256<sbyte>>(wb0 + 2);
@@ -1821,8 +1839,8 @@ public static unsafe partial class MatMul
 
             // Row 2
             {
-                byte* wb0 = blockBase0 + 2 * Q8_0BlockBytes;
-                byte* wb1 = blockBase1 + 2 * Q8_0BlockBytes;
+                byte* wb0 = blockBase0 + 2 * rowStride;
+                byte* wb1 = blockBase1 + 2 * rowStride;
                 float dw0 = HalfBitsToFloat(wb0);
                 float dw1 = HalfBitsToFloat(wb1);
                 Vector256<sbyte> vwLo = Unsafe.ReadUnaligned<Vector256<sbyte>>(wb0 + 2);
@@ -1838,8 +1856,8 @@ public static unsafe partial class MatMul
 
             // Row 3
             {
-                byte* wb0 = blockBase0 + 3 * Q8_0BlockBytes;
-                byte* wb1 = blockBase1 + 3 * Q8_0BlockBytes;
+                byte* wb0 = blockBase0 + 3 * rowStride;
+                byte* wb1 = blockBase1 + 3 * rowStride;
                 float dw0 = HalfBitsToFloat(wb0);
                 float dw1 = HalfBitsToFloat(wb1);
                 Vector256<sbyte> vwLo = Unsafe.ReadUnaligned<Vector256<sbyte>>(wb0 + 2);
