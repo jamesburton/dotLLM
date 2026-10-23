@@ -558,7 +558,7 @@ public static unsafe partial class Dequantize
             byte* qh = blockBase + 32;
             ushort* sc = (ushort*)(blockBase + 48);
             ushort scaleBits = (ushort)((sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
-            float d = (float)BitConverter.UInt16BitsToHalf(scaleBits);
+            float d = MatMul.HalfToSingle(scaleBits);
 
             for (int ib = 0; ib < KQuantGroupSize / 32; ib++)
             {
@@ -613,7 +613,7 @@ public static unsafe partial class Dequantize
 
         for (long b = 0; b < blockCount; b++)
         {
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockBase);
+            float d = MatMul.HalfToSingle(blockBase);
             byte* qs = blockBase + 2;
             ushort* qh = (ushort*)(blockBase + 2 + 32);
 

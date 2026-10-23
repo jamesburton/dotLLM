@@ -63,7 +63,7 @@ public static unsafe partial class MatMul
         }
         float sum = HorizontalSumSse(Sse.Add(a, b));
         for (; i < k; i++)
-            sum += (float)BitConverter.UInt16BitsToHalf(w[i]) * x[i];
+            sum += HalfToSingle(w[i]) * x[i];
         return sum;
     }
 

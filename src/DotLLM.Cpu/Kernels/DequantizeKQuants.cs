@@ -129,7 +129,7 @@ public static unsafe partial class Dequantize
             byte* ql = blockBase;
             byte* qh = blockBase + 128;
             sbyte* scales = (sbyte*)(blockBase + 192);
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockBase + 208);
+            float d = MatMul.HalfToSingle(blockBase + 208);
 
             // Process two 128-element halves, matching llama.cpp dequantize_row_q6_K.
             // Within each half: ql lower nibbles → first 64 elements,
@@ -182,7 +182,7 @@ public static unsafe partial class Dequantize
                 byte* ql = blockBase;
                 byte* qh = blockBase + 128;
                 sbyte* scales = (sbyte*)(blockBase + 192);
-                float d = (float)Unsafe.ReadUnaligned<Half>(blockBase + 208);
+                float d = MatMul.HalfToSingle(blockBase + 208);
 
                 // Process 32 values per iteration (2 sub-blocks of 16), 8 iterations for 256 values.
                 // Matches llama.cpp: within each half (128 elements), ql lower nibbles produce
@@ -285,8 +285,8 @@ public static unsafe partial class Dequantize
             byte* block = basePtr + sb * Q2_K_BlockBytes;
             byte* scales = block;          // 16 bytes
             byte* qs = block + 16;         // 64 bytes
-            float d = (float)Unsafe.ReadUnaligned<Half>(block + 80);
-            float dmin = (float)Unsafe.ReadUnaligned<Half>(block + 82);
+            float d = MatMul.HalfToSingle(block + 80);
+            float dmin = MatMul.HalfToSingle(block + 82);
 
             int outOffset = (int)(sb * KQuantGroupSize);
             for (int t = 0; t < KQuantGroupSize; t++)
@@ -342,7 +342,7 @@ public static unsafe partial class Dequantize
             byte* qs = blockBase + 32;               // [64 bytes]
             byte* scales12 = blockBase + 32 + 64;    // [12 bytes]
             ushort dHalf = *(ushort*)(blockBase + 32 + 64 + 12);
-            float d = (float)BitConverter.UInt16BitsToHalf(dHalf);
+            float d = MatMul.HalfToSingle(dHalf);
 
             UnpackQ3KScales(scales12, scales);
 
@@ -414,8 +414,8 @@ public static unsafe partial class Dequantize
 
         for (long b = 0; b < blockCount; b++)
         {
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockBase);
-            float dmin = (float)Unsafe.ReadUnaligned<Half>(blockBase + 2);
+            float d = MatMul.HalfToSingle(blockBase);
+            float dmin = MatMul.HalfToSingle(blockBase + 2);
             UnpackQ4Q5Scales(blockBase + 4, scBuf, mnBuf);
             byte* qs = blockBase + 16;
 
@@ -458,8 +458,8 @@ public static unsafe partial class Dequantize
 
             for (long b = 0; b < blockCount; b++)
             {
-                float d = (float)Unsafe.ReadUnaligned<Half>(blockBase);
-                float dmin = (float)Unsafe.ReadUnaligned<Half>(blockBase + 2);
+                float d = MatMul.HalfToSingle(blockBase);
+                float dmin = MatMul.HalfToSingle(blockBase + 2);
                 UnpackQ4Q5Scales(blockBase + 4, scBuf, mnBuf);
                 byte* qs = blockBase + 16;
 
@@ -542,8 +542,8 @@ public static unsafe partial class Dequantize
 
         for (long b = 0; b < blockCount; b++)
         {
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockBase);
-            float dmin = (float)Unsafe.ReadUnaligned<Half>(blockBase + 2);
+            float d = MatMul.HalfToSingle(blockBase);
+            float dmin = MatMul.HalfToSingle(blockBase + 2);
             UnpackQ4Q5Scales(blockBase + 4, scBuf, mnBuf);
             byte* qh = blockBase + 16;
             byte* qs = blockBase + 48;
@@ -590,8 +590,8 @@ public static unsafe partial class Dequantize
 
             for (long b = 0; b < blockCount; b++)
             {
-                float d = (float)Unsafe.ReadUnaligned<Half>(blockBase);
-                float dmin = (float)Unsafe.ReadUnaligned<Half>(blockBase + 2);
+                float d = MatMul.HalfToSingle(blockBase);
+                float dmin = MatMul.HalfToSingle(blockBase + 2);
                 UnpackQ4Q5Scales(blockBase + 4, scBuf, mnBuf);
                 byte* qh = blockBase + 16;
                 byte* qs = blockBase + 48;

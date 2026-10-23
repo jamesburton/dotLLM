@@ -71,8 +71,8 @@ public static unsafe partial class MatMul
         {
             byte* sc = qk;
             byte* q2 = qk + 16;
-            float d2 = (float)Unsafe.ReadUnaligned<Half>(qk + 80);
-            float dmin2 = (float)Unsafe.ReadUnaligned<Half>(qk + 82);
+            float d2 = HalfToSingle(qk + 80);
+            float dmin2 = HalfToSingle(qk + 82);
 
             float d8 = Unsafe.ReadUnaligned<float>(q8k);
             sbyte* q8 = (sbyte*)(q8k + 4);
@@ -139,7 +139,7 @@ public static unsafe partial class MatMul
             byte* hm = qk;
             byte* q3 = qk + 32;
             Dequantize.UnpackQ3KScales(qk + 96, scales);
-            float d3 = (float)Unsafe.ReadUnaligned<Half>(qk + 108);
+            float d3 = HalfToSingle(qk + 108);
 
             float d8 = Unsafe.ReadUnaligned<float>(q8k);
             sbyte* q8 = (sbyte*)(q8k + 4);
@@ -203,8 +203,8 @@ public static unsafe partial class MatMul
         {
             byte* sc = qk;
             byte* q2 = qk + 16;
-            float d2 = (float)Unsafe.ReadUnaligned<Half>(qk + 80);
-            float dmin2 = (float)Unsafe.ReadUnaligned<Half>(qk + 82);
+            float d2 = HalfToSingle(qk + 80);
+            float dmin2 = HalfToSingle(qk + 82);
 
             float d8 = Unsafe.ReadUnaligned<float>(q8k);
             sbyte* q8qs = (sbyte*)(q8k + 4);
@@ -276,7 +276,7 @@ public static unsafe partial class MatMul
             byte* hm = qk;
             byte* q3 = qk + 32;
             Dequantize.UnpackQ3KScales(qk + 96, scales);
-            float d3 = (float)Unsafe.ReadUnaligned<Half>(qk + 108);
+            float d3 = HalfToSingle(qk + 108);
 
             float d8 = Unsafe.ReadUnaligned<float>(q8k);
             sbyte* q8qs = (sbyte*)(q8k + 4);

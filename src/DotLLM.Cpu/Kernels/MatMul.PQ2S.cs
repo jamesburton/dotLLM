@@ -298,7 +298,7 @@ public static unsafe partial class MatMul
         for (int g = 0; g < groups; g++)
         {
             byte* groupBase = rowPtr + g * PQ2_0GroupBytes;
-            float scale = (float)Unsafe.ReadUnaligned<Half>(groupBase);
+            float scale = HalfToSingle(groupBase);
             byte* codes = groupBase + 2;
             int outBase = g * PQ2_0GroupSize;
 
@@ -627,7 +627,7 @@ public static unsafe partial class MatMul
             for (int g = 0; g < groups; g++)
             {
                 byte* groupBase = rowPtr + g * PQ2_0GroupBytes;
-                groupScales[g] = (float)Unsafe.ReadUnaligned<Half>(groupBase);
+                groupScales[g] = HalfToSingle(groupBase);
                 byte* bp = groupBase + 2;
                 sbyte* outp = dest + g * PQ2_0GroupSize;
 
@@ -663,7 +663,7 @@ public static unsafe partial class MatMul
         for (int g = 0; g < groups; g++)
         {
             byte* groupBase = rowPtr + g * PQ2_0GroupBytes;
-            groupScales[g] = (float)Unsafe.ReadUnaligned<Half>(groupBase);
+            groupScales[g] = HalfToSingle(groupBase);
             byte* bp = groupBase + 2;
             int outBase = g * PQ2_0GroupSize;
             for (int b = 0; b < 32; b++)

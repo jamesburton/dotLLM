@@ -124,7 +124,7 @@ public static unsafe partial class MatMul
         for (int sb = 0; sb < superBlockCount; sb++)
         {
             float d8 = Unsafe.ReadUnaligned<float>(q8k);
-            float d6 = (float)Unsafe.ReadUnaligned<Half>(w + 208);
+            float d6 = HalfToSingle(w + 208);
             sbyte* s = (sbyte*)(w + 192);
 
             Vector256<short> s16 = Avx2.ConvertToVector256Int16(Unsafe.ReadUnaligned<Vector128<sbyte>>(s));
@@ -164,7 +164,7 @@ public static unsafe partial class MatMul
 
         for (int sb = 0; sb < superBlockCount; sb++)
         {
-            float d6 = (float)Unsafe.ReadUnaligned<Half>(w + 208);
+            float d6 = HalfToSingle(w + 208);
             sbyte* s = (sbyte*)(w + 192);
             float d80 = Unsafe.ReadUnaligned<float>(qa0), d81 = Unsafe.ReadUnaligned<float>(qa1);
             float d82 = Unsafe.ReadUnaligned<float>(qa2), d83 = Unsafe.ReadUnaligned<float>(qa3);

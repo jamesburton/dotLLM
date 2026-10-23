@@ -161,9 +161,9 @@ public static unsafe partial class MatMul
                 Unsafe.ReadUnaligned<Vector128<sbyte>>(xb + 4), Unsafe.ReadUnaligned<Vector128<sbyte>>(xb + 20), ones);
             v = Ssse3.HorizontalAdd(v, v);
             v = Ssse3.HorizontalAdd(v, v);
-            float d5 = (float)Unsafe.ReadUnaligned<Half>(wb);
-            float d8 = (float)Unsafe.ReadUnaligned<Half>(xb);
-            float s8 = (float)Unsafe.ReadUnaligned<Half>(xb + 2);
+            float d5 = HalfToSingle(wb);
+            float d8 = HalfToSingle(xb);
+            float s8 = HalfToSingle(xb + 2);
             sumf += d5 * d8 * v.ToScalar();
             offsetSum += d5 * s8;
         }

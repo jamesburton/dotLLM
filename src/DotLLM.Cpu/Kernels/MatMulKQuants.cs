@@ -199,7 +199,7 @@ public static unsafe partial class MatMul
             byte* ql = qk;
             byte* qh = qk + 128;
             sbyte* scales = (sbyte*)(qk + 192);
-            float d6 = (float)Unsafe.ReadUnaligned<Half>(qk + 208);
+            float d6 = HalfToSingle(qk + 208);
 
             float d8 = Unsafe.ReadUnaligned<float>(q8k); // float32 scale — no precision loss
             sbyte* q8qs = (sbyte*)(q8k + 4);             // 256 contiguous values
@@ -269,8 +269,8 @@ public static unsafe partial class MatMul
 
         for (int sb = 0; sb < superBlockCount; sb++)
         {
-            float d4 = (float)Unsafe.ReadUnaligned<Half>(qk);
-            float dmin = (float)Unsafe.ReadUnaligned<Half>(qk + 2);
+            float d4 = HalfToSingle(qk);
+            float dmin = HalfToSingle(qk + 2);
             Dequantize.UnpackQ4Q5Scales(qk + 4, scBuf, mnBuf);
             byte* qs = qk + 16;
 
@@ -335,8 +335,8 @@ public static unsafe partial class MatMul
 
         for (int sb = 0; sb < superBlockCount; sb++)
         {
-            float d5 = (float)Unsafe.ReadUnaligned<Half>(qk);
-            float dmin = (float)Unsafe.ReadUnaligned<Half>(qk + 2);
+            float d5 = HalfToSingle(qk);
+            float dmin = HalfToSingle(qk + 2);
             Dequantize.UnpackQ4Q5Scales(qk + 4, scBuf, mnBuf);
             byte* qh = qk + 16;
             byte* qs = qk + 48;
@@ -394,8 +394,8 @@ public static unsafe partial class MatMul
 
         for (int sb = 0; sb < superBlockCount; sb++)
         {
-            float d4 = (float)Unsafe.ReadUnaligned<Half>(qk);
-            float dmin = (float)Unsafe.ReadUnaligned<Half>(qk + 2);
+            float d4 = HalfToSingle(qk);
+            float dmin = HalfToSingle(qk + 2);
             Dequantize.UnpackQ4Q5Scales(qk + 4, scBuf, mnBuf);
             byte* qs = qk + 16;
 
@@ -458,7 +458,7 @@ public static unsafe partial class MatMul
             byte* ql = qk;
             byte* qh = qk + 128;
             sbyte* scales = (sbyte*)(qk + 192);
-            float d6 = (float)Unsafe.ReadUnaligned<Half>(qk + 208);
+            float d6 = HalfToSingle(qk + 208);
 
             float d8 = Unsafe.ReadUnaligned<float>(q8k);
             sbyte* q8qs = (sbyte*)(q8k + 4);
@@ -542,8 +542,8 @@ public static unsafe partial class MatMul
 
         for (int sb = 0; sb < superBlockCount; sb++)
         {
-            float d5 = (float)Unsafe.ReadUnaligned<Half>(qk);
-            float dmin = (float)Unsafe.ReadUnaligned<Half>(qk + 2);
+            float d5 = HalfToSingle(qk);
+            float dmin = HalfToSingle(qk + 2);
             Dequantize.UnpackQ4Q5Scales(qk + 4, scBuf, mnBuf);
             byte* qh = qk + 16;
             byte* qs = qk + 48;
@@ -671,17 +671,17 @@ public static unsafe partial class MatMul
             sbyte* q8qs = (sbyte*)(q8k + 4);
             short* bsums = (short*)(q8k + 260);
 
-            float d4_0 = (float)Unsafe.ReadUnaligned<Half>(w0);
-            float dm0 = (float)Unsafe.ReadUnaligned<Half>(w0 + 2);
+            float d4_0 = HalfToSingle(w0);
+            float dm0 = HalfToSingle(w0 + 2);
             Dequantize.UnpackQ4Q5Scales(w0 + 4, sc0, mn0);
-            float d4_1 = (float)Unsafe.ReadUnaligned<Half>(w1);
-            float dm1 = (float)Unsafe.ReadUnaligned<Half>(w1 + 2);
+            float d4_1 = HalfToSingle(w1);
+            float dm1 = HalfToSingle(w1 + 2);
             Dequantize.UnpackQ4Q5Scales(w1 + 4, sc1, mn1);
-            float d4_2 = (float)Unsafe.ReadUnaligned<Half>(w2);
-            float dm2 = (float)Unsafe.ReadUnaligned<Half>(w2 + 2);
+            float d4_2 = HalfToSingle(w2);
+            float dm2 = HalfToSingle(w2 + 2);
             Dequantize.UnpackQ4Q5Scales(w2 + 4, sc2, mn2);
-            float d4_3 = (float)Unsafe.ReadUnaligned<Half>(w3);
-            float dm3 = (float)Unsafe.ReadUnaligned<Half>(w3 + 2);
+            float d4_3 = HalfToSingle(w3);
+            float dm3 = HalfToSingle(w3 + 2);
             Dequantize.UnpackQ4Q5Scales(w3 + 4, sc3, mn3);
 
             // Min corrections via shared bsums
@@ -837,17 +837,17 @@ public static unsafe partial class MatMul
             sbyte* q8qs = (sbyte*)(q8k + 4);
             short* bsums = (short*)(q8k + 260);
 
-            float d5_0 = (float)Unsafe.ReadUnaligned<Half>(w0);
-            float dm0 = (float)Unsafe.ReadUnaligned<Half>(w0 + 2);
+            float d5_0 = HalfToSingle(w0);
+            float dm0 = HalfToSingle(w0 + 2);
             Dequantize.UnpackQ4Q5Scales(w0 + 4, sc0, mn0);
-            float d5_1 = (float)Unsafe.ReadUnaligned<Half>(w1);
-            float dm1 = (float)Unsafe.ReadUnaligned<Half>(w1 + 2);
+            float d5_1 = HalfToSingle(w1);
+            float dm1 = HalfToSingle(w1 + 2);
             Dequantize.UnpackQ4Q5Scales(w1 + 4, sc1, mn1);
-            float d5_2 = (float)Unsafe.ReadUnaligned<Half>(w2);
-            float dm2 = (float)Unsafe.ReadUnaligned<Half>(w2 + 2);
+            float d5_2 = HalfToSingle(w2);
+            float dm2 = HalfToSingle(w2 + 2);
             Dequantize.UnpackQ4Q5Scales(w2 + 4, sc2, mn2);
-            float d5_3 = (float)Unsafe.ReadUnaligned<Half>(w3);
-            float dm3 = (float)Unsafe.ReadUnaligned<Half>(w3 + 2);
+            float d5_3 = HalfToSingle(w3);
+            float dm3 = HalfToSingle(w3 + 2);
             Dequantize.UnpackQ4Q5Scales(w3 + 4, sc3, mn3);
 
             // Min corrections via shared bsums
@@ -1024,13 +1024,13 @@ public static unsafe partial class MatMul
             short* bsums = (short*)(q8k + 260);
 
             byte* ql0 = w0; byte* qh0 = w0 + 128; sbyte* s0 = (sbyte*)(w0 + 192);
-            float d6_0 = (float)Unsafe.ReadUnaligned<Half>(w0 + 208);
+            float d6_0 = HalfToSingle(w0 + 208);
             byte* ql1 = w1; byte* qh1 = w1 + 128; sbyte* s1 = (sbyte*)(w1 + 192);
-            float d6_1 = (float)Unsafe.ReadUnaligned<Half>(w1 + 208);
+            float d6_1 = HalfToSingle(w1 + 208);
             byte* ql2 = w2; byte* qh2 = w2 + 128; sbyte* s2 = (sbyte*)(w2 + 192);
-            float d6_2 = (float)Unsafe.ReadUnaligned<Half>(w2 + 208);
+            float d6_2 = HalfToSingle(w2 + 208);
             byte* ql3 = w3; byte* qh3 = w3 + 128; sbyte* s3 = (sbyte*)(w3 + 192);
-            float d6_3 = (float)Unsafe.ReadUnaligned<Half>(w3 + 208);
+            float d6_3 = HalfToSingle(w3 + 208);
 
             // Bias corrections using shared bsums
             int bc0 = 0, bc1 = 0, bc2 = 0, bc3 = 0;

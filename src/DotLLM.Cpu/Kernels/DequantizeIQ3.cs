@@ -201,7 +201,7 @@ public static unsafe partial class Dequantize
 
         for (long b = 0; b < blockCount; b++)
         {
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockBase);
+            float d = MatMul.HalfToSingle(blockBase);
             byte* qs = blockBase + 2;
             byte* scalesAndSigns = qs + KQuantGroupSize / 4;     // offset 66
 
@@ -260,7 +260,7 @@ public static unsafe partial class Dequantize
 
         for (long b = 0; b < blockCount; b++)
         {
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockBase);
+            float d = MatMul.HalfToSingle(blockBase);
             byte* qs = blockBase + 2;                             // 64 bytes
             byte* qh = qs + KQuantGroupSize / 4;                  // offset 66, 8 bytes
             byte* signs = qh + KQuantGroupSize / 32;              // offset 74, 32 bytes
