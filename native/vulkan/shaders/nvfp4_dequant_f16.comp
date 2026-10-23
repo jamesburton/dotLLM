@@ -1,0 +1,46 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// NVFP4 (GGUF type 40) -> FP16 dequantization (#1060), the NVFP4 member of the IQ F16 prefill path (#621): dequantise a weight
+// matrix once into F16 scratch, then run the F16 cooperative-matrix GEMM.
+//
+// EXACT in F16: an element is KVALUES_FP4[nibble] (at most 2 significant bits, |v| <= 12) times ue4m3_half(d) (4 significant bits,
+// 2^-10 .. 240; 0xFF decodes to 240 because bit 7 is ignored), so the product needs at most 6 mantissa bits and lies in [2^-10, 2880],
+// inside F16's normal range. The per-tensor
+// X.scale (~1e-4 in Bolt) is NOT applied here: scaled, the smallest weights would fall below F16's subnormal range. The caller
+// multiplies the F32 GEMM output by it.
+//
+// Element e of the row-major [M, K] matrix (K a multiple of 64, so blocks never straddle rows) lives in block e / 64; within the
+// block, element i = 16s + w belongs to sub-block s and is byte (w & 7) of that sub-block's qs, low nibble for w < 8, high otherwise.
+//
+// Dispatch: one thread per element, 256 per workgroup (4 blocks).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint weight[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer BufY { float16_t dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint totalBlocks;
+} pc;
+
+#include "nvfp4_decode.glsl"
+
+void main() {
+    uint e = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+    uint blk = e >> 6u;
+    if (blk >= pc.totalBlocks) return;
+
+    uint i = e & 63u;
+    uint s = i >> 4u;            // sub-block 0..3
+    uint w = i & 15u;            // position in the sub-block
+    uint base = blk * NVFP4_BLOCK_UINTS;
+
+    uint dByte = (weight[base] >> (8u * s)) & 0xFFu;
+    uint q = 8u * s + (w & 7u);  // byte index within qs[32]
+    uint qb = (weight[base + 1u + (q >> 2u)] >> (8u * (q & 3u))) & 0xFFu;
+    uint nib = (w < 8u) ? (qb & 0xFu) : (qb >> 4u);
+
+    dst[e] = float16_t(KVALUES_FP4[nib] * ue4m3_half(dByte));
+}

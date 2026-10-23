@@ -13,7 +13,8 @@ internal sealed record ForNode(
     string? SecondVariableName, // for "key, value in dict" unpacking
     IExpression Iterable,
     IReadOnlyList<ITemplateNode> Body,
-    IReadOnlyList<ITemplateNode>? ElseBody) : ITemplateNode;
+    IReadOnlyList<ITemplateNode>? ElseBody,
+    IExpression? Filter = null) : ITemplateNode; // "for x in seq if cond": cond is evaluated per item BEFORE iteration (loop.* counts the survivors)
 
 internal sealed record IfNode(
     IReadOnlyList<(IExpression Condition, IReadOnlyList<ITemplateNode> Body)> Branches,
@@ -21,8 +22,21 @@ internal sealed record IfNode(
 
 internal sealed record SetNode(string Name, IExpression Value) : ITemplateNode;
 
+/// <summary>Block set: <c>{% set x %}...{% endset %}</c> captures the rendered body as a string (#770).</summary>
+internal sealed record SetBlockNode(string Name, IReadOnlyList<ITemplateNode> Body) : ITemplateNode;
+
 internal sealed record SetAttributeNode(
     string ObjectName, string AttributeName, IExpression Value) : ITemplateNode;
+
+/// <summary>
+/// <c>{% macro name(params) %}...{% endmacro %}</c>. Parameters may declare a default
+/// expression (<c>param=expr</c>); parameters without one carry a <see langword="null"/> default
+/// and are <see cref="JinjaEvaluator.Undefined"/> when the call site omits them.
+/// </summary>
+internal sealed record MacroNode(
+    string Name,
+    IReadOnlyList<(string Name, IExpression? Default)> Parameters,
+    IReadOnlyList<ITemplateNode> Body) : ITemplateNode;
 
 // ── Root ──
 
@@ -60,7 +74,7 @@ internal sealed record ListExpr(IReadOnlyList<IExpression> Items) : IExpression;
 
 internal sealed record DictExpr(IReadOnlyList<(IExpression Key, IExpression Value)> Pairs) : IExpression;
 
-internal sealed record SliceExpr(IExpression Object, IExpression? Start, IExpression? Stop) : IExpression;
+internal sealed record SliceExpr(IExpression Object, IExpression? Start, IExpression? Stop, IExpression? Step = null) : IExpression;
 
 // ── Operators ──
 

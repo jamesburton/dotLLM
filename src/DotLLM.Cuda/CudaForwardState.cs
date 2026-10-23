@@ -34,6 +34,29 @@ internal sealed class CudaForwardState : IDisposable
     public nint FfnUp;          // [seqLen, intermediateSize]
     public nint SiluOutput;     // [seqLen, intermediateSize]
 
+    // Optional high-precision activation buffers. Used by correctness paths
+    // where cumulative FP16 activation truncation dominates real-model parity.
+    public nint HiddenStateF32;  // [seqLen, hiddenSize]
+    /// <summary>FP32 residual stream [seqLen, hiddenSize]. Used by high-precision F32 paths
+    /// (e.g. Gemma) and by BitNet, whose residual magnitude can exceed FP16's ~65504 ceiling.</summary>
+    public nint ResidualF32;     // [seqLen, hiddenSize]
+    public nint NormOutputF32;   // [seqLen, hiddenSize]
+    public nint QF32;            // [seqLen, numHeads * headDim]
+    public nint KF32;            // [seqLen, numKvHeads * headDim]
+    public nint VF32;            // [seqLen, numKvHeads * headDim]
+    public nint AttnOutputF32;   // [seqLen, numHeads * headDim]
+    public nint FfnGateF32;      // [seqLen, intermediateSize]
+    public nint FfnUpF32;        // [seqLen, intermediateSize]
+    public nint SiluOutputF32;   // [seqLen, intermediateSize]
+
+    // Fused-projection scratches — written by a single packed quantized GEMV
+    // when the layer has CudaLayerWeights.QkvPacked / GateUpPacked set.
+    // Decode-only: only safe when seqLen==1 because consumers downstream
+    // (RoPE, KV update, attention, SwiGLU) read each slice with the per-tensor
+    // stride, not the packed (n_q+2*n_kv) / (2*intermediate) stride.
+    public nint QkvPacked;      // [n_q + 2 * n_kv] (seqLen=1 decode only)
+    public nint GateUpPacked;   // [2 * intermediateSize] (seqLen=1 decode only)
+
     // Logits — FP16 on device, then converted to FP32
     public nint LogitsF16;      // [vocabSize] FP16
     public nint LogitsF32;      // [vocabSize] FP32
@@ -41,18 +64,49 @@ internal sealed class CudaForwardState : IDisposable
     // General-purpose FP16 scratch buffer
     public nint GemmOutputF16;
 
+    // I2_S W2A8 decode scratch. Activations are quantized per token on GPU.
+    public nint A8Input;        // int8 [max input dim]
+    public nint A8InvScale;     // float [1]
+    public nint A8OutputF32;    // float [max non-LM-head projection output dim]
+
     // On-the-fly dequantization scratch: holds one projection's FP16 weights
     // for cuBLAS GEMM. Sized for the largest projection (max of Gate/Up/Down/Q/O).
     // Reused across all cuBLAS calls — safe because all ops are on the same stream.
     public nint DequantScratch;
+    public nint DequantScratchF32;
+
+    // Pre-Q8_1 input quantization scratch (single buffer per forward state, sized
+    // for the largest GEMV input vector across all call sites in the model).
+    // Layout: int8_t xq[K] | half dx[K/32] | half sx2[K/16]. Consumed by the MMQ
+    // `_preq` GEMV kernel variants which skip Stage 1. Populated once per fused
+    // projection group via LaunchQuantizeXToQ8_1, then reused across all rows
+    // (eliminates the redundant Stage 1 work the on-the-fly kernels run per block).
+    public nint PreQ8_1Scratch;
+    public int  PreQ8_1ScratchK;        // capacity in elements (must be a multiple of 32)
+
+    // Batched pre-Q8_1 input-quantization scratch for prefill (issue #349): holds ALL
+    // seqLen activation rows quantized in one shot, feeding the batched-MMQ prefill
+    // kernel. Grows with EnsureCapacity like the other per-token buffers below (unlike
+    // PreQ8_1Scratch, which is a fixed one-row buffer sized once in the constructor).
+    // Per-row byte count uses the same PreQ8_1ScratchBytes(k) formula as the decode
+    // scratch, with k = PreQ8_1ScratchK (the largest GEMV input dim across call sites).
+    public nint PreQ8_1BatchedScratch;
 
     // Small device buffers for H2D copy of token IDs and positions
     public nint TokenIdsDevice; // [maxSeqLen] int32
     public nint PositionsDevice;// [maxSeqLen] int32
 
+    // LoRA intermediate scratch: tmp[seqLen, rank] for the two-GEMV delta path.
+    // Sized at maxCapacity × MaxLoraRank (rank cap) in FP16.
+    internal const int MaxLoraRank = 256;
+    public nint LoraTmp;        // [seqLen, MaxLoraRank] FP16
+
+    private readonly bool _useFp32Residual;
+
     public CudaForwardState(int hiddenSize, int numHeads, int numKvHeads, int headDim,
-                              int intermediateSize, int vocabSize)
+                              int intermediateSize, int vocabSize, bool useFp32Residual = false)
     {
+        _useFp32Residual = useFp32Residual;
         _hiddenSize = hiddenSize;
         _numHeads = numHeads;
         _numKvHeads = numKvHeads;
@@ -71,6 +125,27 @@ internal sealed class CudaForwardState : IDisposable
             (long)Math.Max(numHeads * headDim, numKvHeads * headDim) * hiddenSize,
             (long)intermediateSize * hiddenSize);
         DequantScratch = AllocDevice(maxProjectionElements * sizeof(ushort));
+        DequantScratchF32 = AllocDevice(maxProjectionElements * sizeof(float));
+
+        // Fused decode scratches (seqLen=1 only). Sized once — tiny.
+        long qkvPackedFp16Bytes = (long)(numHeads * headDim + 2 * numKvHeads * headDim) * sizeof(ushort);
+        long gateUpPackedFp16Bytes = (long)(2 * intermediateSize) * sizeof(ushort);
+        QkvPacked = AllocDevice(qkvPackedFp16Bytes);
+        GateUpPacked = AllocDevice(gateUpPackedFp16Bytes);
+
+        // Pre-Q8_1 scratch: sized for the largest GEMV input vector.
+        // Inputs are: hidden (Q/K/V/Gate/Up/LmHead read NormOutput), intermediate (Down reads SiluOutput),
+        // num_q*head_dim (O reads AttnOutput). Take the max and round up to a 32-element multiple.
+        int preQ8K = Math.Max(hiddenSize, Math.Max(intermediateSize, numHeads * headDim));
+        preQ8K = ((preQ8K + 31) / 32) * 32;
+        PreQ8_1ScratchK = preQ8K;
+        PreQ8_1Scratch = AllocDevice(PreQ8_1ScratchBytes(preQ8K));
+
+        int maxA8Input = Math.Max(hiddenSize, intermediateSize);
+        int maxA8Output = Math.Max(hiddenSize, intermediateSize);
+        A8Input = AllocDevice(maxA8Input);
+        A8InvScale = AllocDevice(sizeof(float));
+        A8OutputF32 = AllocDevice((long)maxA8Output * sizeof(float));
 
         // Initial allocation for decode (seqLen=1)
         EnsureCapacity(1);
@@ -102,12 +177,35 @@ internal sealed class CudaForwardState : IDisposable
         FfnGate = AllocDevice((long)newCapacity * _intermediateSize * half);
         FfnUp = AllocDevice((long)newCapacity * _intermediateSize * half);
         SiluOutput = AllocDevice((long)newCapacity * _intermediateSize * half);
+        HiddenStateF32 = AllocDevice((long)newCapacity * _hiddenSize * sizeof(float));
+        ResidualF32 = AllocDevice((long)newCapacity * _hiddenSize * sizeof(float));
+        NormOutputF32 = AllocDevice((long)newCapacity * _hiddenSize * sizeof(float));
+        QF32 = AllocDevice((long)newCapacity * _numHeads * _headDim * sizeof(float));
+        KF32 = AllocDevice((long)newCapacity * _numKvHeads * _headDim * sizeof(float));
+        VF32 = AllocDevice((long)newCapacity * _numKvHeads * _headDim * sizeof(float));
+        AttnOutputF32 = AllocDevice((long)newCapacity * _numHeads * _headDim * sizeof(float));
+        FfnGateF32 = AllocDevice((long)newCapacity * _intermediateSize * sizeof(float));
+        FfnUpF32 = AllocDevice((long)newCapacity * _intermediateSize * sizeof(float));
+        SiluOutputF32 = AllocDevice((long)newCapacity * _intermediateSize * sizeof(float));
         // General scratch: must fit largest projection output or LM head logits
         long maxPerLayer = (long)newCapacity * Math.Max(Math.Max(_numHeads * _headDim, _intermediateSize), _hiddenSize);
         long maxLmHead = _vocabSize;
         GemmOutputF16 = AllocDevice(Math.Max(maxPerLayer, maxLmHead) * half);
         TokenIdsDevice = AllocDevice((long)newCapacity * sizeof(int));
         PositionsDevice = AllocDevice((long)newCapacity * sizeof(int));
+        LoraTmp = AllocDevice((long)newCapacity * MaxLoraRank * half);
+        // Only allocate the batched-MMQ prefill scratch when the dispatcher gate can actually
+        // fire (issue #349/#367): at the shipped default (MmqBatchedMinSeqLen=int.MaxValue) the
+        // buffer would otherwise sit allocated-but-unreadable for every model, CPU or GPU-bound,
+        // costing real VRAM (~30-478 MB depending on context/model size) for zero benefit — the
+        // exact unconditional-EnsureCapacity failure mode documented in issue #188. newCapacity is
+        // always >= seqLen (power-of-2 rounded), so this guard can only under-allocate relative to
+        // MmqBatchedMinSeqLen, never leave a live dispatch path pointing at a smaller-than-needed
+        // buffer; see CudaTransformerModel.Project's PreQ8_1BatchedScratch != 0 check for the
+        // complementary guard covering the case where MmqBatchedMinSeqLen is lowered after this
+        // allocation decision was made.
+        if (newCapacity >= CudaKernels.MmqBatchedMinSeqLen)
+            PreQ8_1BatchedScratch = AllocDevice((long)newCapacity * PreQ8_1ScratchBytes(PreQ8_1ScratchK));
 
         _currentSeqLen = newCapacity;
     }
@@ -140,9 +238,21 @@ internal sealed class CudaForwardState : IDisposable
         FreeIfNonZero(ref FfnGate);
         FreeIfNonZero(ref FfnUp);
         FreeIfNonZero(ref SiluOutput);
+        FreeIfNonZero(ref HiddenStateF32);
+        FreeIfNonZero(ref ResidualF32);
+        FreeIfNonZero(ref NormOutputF32);
+        FreeIfNonZero(ref QF32);
+        FreeIfNonZero(ref KF32);
+        FreeIfNonZero(ref VF32);
+        FreeIfNonZero(ref AttnOutputF32);
+        FreeIfNonZero(ref FfnGateF32);
+        FreeIfNonZero(ref FfnUpF32);
+        FreeIfNonZero(ref SiluOutputF32);
         FreeIfNonZero(ref GemmOutputF16);
         FreeIfNonZero(ref TokenIdsDevice);
         FreeIfNonZero(ref PositionsDevice);
+        FreeIfNonZero(ref LoraTmp);
+        FreeIfNonZero(ref PreQ8_1BatchedScratch);
     }
 
     public void Dispose()
@@ -151,6 +261,26 @@ internal sealed class CudaForwardState : IDisposable
         FreeIfNonZero(ref LogitsF16);
         FreeIfNonZero(ref LogitsF32);
         FreeIfNonZero(ref DequantScratch);
+        FreeIfNonZero(ref DequantScratchF32);
+        FreeIfNonZero(ref QkvPacked);
+        FreeIfNonZero(ref GateUpPacked);
+        FreeIfNonZero(ref PreQ8_1Scratch);
+        PreQ8_1ScratchK = 0;
+        FreeIfNonZero(ref A8Input);
+        FreeIfNonZero(ref A8InvScale);
+        FreeIfNonZero(ref A8OutputF32);
         _currentSeqLen = 0;
+    }
+
+    /// <summary>
+    /// Total bytes required for the pre-Q8_1 scratch buffer holding a vector of <paramref name="k"/> elements.
+    /// Layout: int8_t xq[k] | half dx[k/32] | half sx2[k/16].
+    /// </summary>
+    /// <remarks>k must be a multiple of 32 (pre-quant kernel chunks 32 elements at a time).</remarks>
+    public static long PreQ8_1ScratchBytes(int k)
+    {
+        // xq: k bytes, dx: (k/32) halves = k/16 bytes, sx2: (k/16) halves = k/8 bytes.
+        // Total: k + k/16 + k/8 = k * (1 + 0.0625 + 0.125) = k * 1.1875.
+        return (long)k + ((long)k / 16) + ((long)k / 8);
     }
 }

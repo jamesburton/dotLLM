@@ -1,0 +1,104 @@
+using DotLLM.Core.Models;
+using DotLLM.Vulkan.Interop;
+using DotLLM.Vulkan.Kernels;
+
+namespace DotLLM.Vulkan;
+
+/// <summary>
+/// Device-resident per-sequence recurrent state of the LFM2 gated short-convolution layers: for each conv layer the last
+/// <c>L_cache - 1</c> projected inputs (<c>B*X</c>) per channel, time-major (<c>[slot 0 = oldest .. L-2][channel]</c>), matching
+/// <see cref="DotLLM.Models.Architectures.Lfm2ConvStateCache"/> and llama.cpp's <c>conv_state</c> (#1015).
+/// </summary>
+public sealed class VulkanLfm2ConvStateCache : ISsmState
+{
+    private readonly VulkanDevice _device;
+    private readonly VulkanDevice.Buffer[] _buffers;
+    private readonly long _bytesPerLayer;
+    private bool _disposed;
+
+    /// <summary>Creates a zero-initialised state.</summary>
+    public VulkanLfm2ConvStateCache(VulkanDevice device, int numConvLayers, int stateSlots, int hiddenSize)
+    {
+        ArgumentNullException.ThrowIfNull(device);
+        _device = device;
+        NumSsmLayers = numConvLayers;
+        StateSlots = stateSlots;
+        HiddenSize = hiddenSize;
+        _bytesPerLayer = (long)stateSlots * hiddenSize * sizeof(float);
+        _buffers = new VulkanDevice.Buffer[numConvLayers];
+        for (int i = 0; i < numConvLayers; i++)
+            _buffers[i] = device.AllocateDeviceLocal(_bytesPerLayer);
+        Reset();
+    }
+
+    /// <inheritdoc/>
+    public int NumSsmLayers { get; }
+
+    /// <summary>Rows per layer (<c>L_cache - 1</c>).</summary>
+    public int StateSlots { get; }
+
+    /// <summary>Channels per row.</summary>
+    public int HiddenSize { get; }
+
+    /// <summary>Total device bytes.</summary>
+    public long AllocatedBytes => _bytesPerLayer * NumSsmLayers;
+
+    internal VulkanDevice Device => _device;
+
+    internal void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);
+
+    /// <summary>Creates an independent device copy with the same geometry.</summary>
+    public VulkanLfm2ConvStateCache Clone()
+    {
+        ThrowIfDisposed();
+        var copy = new VulkanLfm2ConvStateCache(_device, NumSsmLayers, StateSlots, HiddenSize);
+        try { copy.CopyFrom(this); return copy; }
+        catch { copy.Dispose(); throw; }
+    }
+
+    /// <summary>Copies state from a live cache with identical geometry on the same device.</summary>
+    public void CopyFrom(VulkanLfm2ConvStateCache source)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ThrowIfDisposed(); source.ThrowIfDisposed();
+        if (!ReferenceEquals(_device, source._device) || NumSsmLayers != source.NumSsmLayers ||
+            StateSlots != source.StateSlots || HiddenSize != source.HiddenSize)
+            throw new ArgumentException("State device or geometry mismatch.", nameof(source));
+        if (ReferenceEquals(source, this) || AllocatedBytes == 0) return;
+        using var submit = _device.CreateSubmitContext();
+        submit.Begin();
+        nint cmd = submit.CommandBuffer;
+        KernelSupport.ComputeToTransferBarrier(cmd);
+        var region = new VkBufferCopy { size = (ulong)_bytesPerLayer };
+        for (int i = 0; i < NumSsmLayers; i++)
+            VulkanApi.vkCmdCopyBuffer(cmd, source._buffers[i].Handle, _buffers[i].Handle, 1, region);
+        KernelSupport.TransferToComputeBarrier(cmd);
+        submit.SubmitAndWait();
+    }
+
+    internal VulkanDevice.Buffer GetBuffer(int convOrdinal)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        return _buffers[convOrdinal];
+    }
+
+    /// <inheritdoc/>
+    public void Reset()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (NumSsmLayers == 0 || _bytesPerLayer == 0) return;
+        byte[] zeros = new byte[_bytesPerLayer];
+        using var staging = _device.Allocate(_bytesPerLayer);
+        _device.Upload(zeros.AsSpan(), staging);
+        foreach (var b in _buffers)
+            _device.CopyBufferSynchronous(staging, b, (ulong)_bytesPerLayer);
+    }
+
+    /// <inheritdoc/>
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        foreach (var b in _buffers) b.Dispose();
+    }
+}

@@ -1,0 +1,123 @@
+#version 450
+// MoE indexed expert matmul over a packed Q5_1 expert bank, with a per-expert
+// output scale folded in (Gemma-4 ffn_down_exps.scale[e]).
+//
+//   y[n, m] = downScale[indices[n]] * sum_k dequant_q5_1(bank[indices[n], m, k]) * x[n, k]
+//
+// Layout of `bank` is [numExperts, M, K] row-major. Each row holds (K / 32)
+// Q5_1 blocks of 24 bytes (32 elements each):
+//     bytes [0,1]   = fp16 d   (delta)
+//     bytes [2,3]   = fp16 m   (min)
+//     bytes [4..7]  = qh[4]    (one 5th bit per element, 32 bits little-endian)
+//     bytes [8..23] = qs[16]   (two 4-bit values per byte)
+// Row stride = (K / 32) * 24 bytes. 24 is a multiple of 4 so blocks are
+// word-aligned; fp16 d/m still use the straddle-safe reader for symmetry.
+//
+// Element reconstruction (mirrors DotLLM.Cpu.Kernels.Dequantize
+// .DequantizeQ5_1Scalar byte-for-byte): for j in [0,16):
+//     lo  = qs[j] & 0xF ;  hi  = qs[j] >> 4
+//     b5lo = (qh >> j) & 1 ;  b5hi = (qh >> (j+16)) & 1
+//     out[j]      = d * (lo | (b5lo << 4)) + m
+//     out[j + 16] = d * (hi | (b5hi << 4)) + m
+// So output element index e in [0,32): if e < 16 -> low nibble of qs[e], qh bit e;
+// else -> high nibble of qs[e-16], qh bit (e-16+16)=e.
+//
+// The per-expert down scale is applied to the final accumulator (NOT per-element),
+// which is algebraically identical to scaling every dequantised weight and exactly
+// matches the CPU fold (down_output * DownExpertScale[e]) before the routing weight.
+//
+// Sibling of moe_indexed_matmul_q6_k_f32.comp; one extra binding (BufScale) and
+// one extra inner step (the post-scale). Used for the Gemma-4 down experts
+// (W2 bank; K = expert_ff).
+//
+// Dispatch: 2D grid, one thread per output cell (n, m). Workgroup (16, 16).
+//   groupCount = (ceil(M/16), ceil(N/16)).
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufBank  { uint  bank[]; };  // Q5_1 blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufX     { float x[]; };     // [N * K]
+layout(set = 0, binding = 2, std430) readonly  buffer BufIdx   { int   indices[]; };// [N]
+layout(set = 0, binding = 3, std430) writeonly buffer BufY     { float y[]; };     // [N * M]
+layout(set = 0, binding = 4, std430) readonly  buffer BufScale { float downScale[]; };// [numExperts]
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // output dim   (per-expert weight row count)
+    uint K;             // input dim    (per-expert weight col count, multiple of 32)
+    uint N;             // total rows   (typically seqLen * topK)
+    uint numExperts;    // bank's first axis size — bounds-check + scale lookup
+    uint blocksPerRow;  // = K / 32
+} pc;
+
+const uint Q5_1_BLOCK_BYTES = 24u;
+const uint Q5_1_GROUP_SIZE  = 32u;
+
+uint readByte(uint absByteOff) {
+    uint u = bank[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = bank[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = bank[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+uint readWord(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    if (byteInWord == 0u) return bank[alignedIdx];
+    uint lo = bank[alignedIdx];
+    uint hi = bank[alignedIdx + 1u];
+    uint sh = byteInWord * 8u;
+    return (lo >> sh) | (hi << (32u - sh));
+}
+
+void main() {
+    uint m = gl_GlobalInvocationID.x; // 0..M
+    uint n = gl_GlobalInvocationID.y; // 0..N
+    if (m >= pc.M || n >= pc.N) return;
+
+    int rawIdx = indices[n];
+    uint expertIdx = uint(clamp(rawIdx, 0, int(pc.numExperts) - 1));
+
+    uint rowByteStride    = pc.blocksPerRow * Q5_1_BLOCK_BYTES;
+    uint matrixByteStride = pc.M * rowByteStride;
+    uint rowByteBase      = expertIdx * matrixByteStride + m * rowByteStride;
+    uint xRowBase         = n * pc.K;
+
+    float acc = 0.0;
+
+    for (uint b = 0u; b < pc.blocksPerRow; b++) {
+        uint blockByteBase = rowByteBase + b * Q5_1_BLOCK_BYTES;
+        float d = readHalf(blockByteBase);
+        float mn = readHalf(blockByteBase + 2u);
+        uint qh = readWord(blockByteBase + 4u);
+        uint qsBase = blockByteBase + 8u;
+
+        uint xBase = xRowBase + b * Q5_1_GROUP_SIZE;
+
+        for (uint j = 0u; j < 16u; j++) {
+            uint byteVal = readByte(qsBase + j);
+            uint lo = byteVal & 0xFu;
+            uint hi = (byteVal >> 4u) & 0xFu;
+            uint b5lo = (qh >> j) & 1u;
+            uint b5hi = (qh >> (j + 16u)) & 1u;
+            float wLo = d * float(lo | (b5lo << 4u)) + mn;
+            float wHi = d * float(hi | (b5hi << 4u)) + mn;
+            acc += x[xBase + j] * wLo;
+            acc += x[xBase + j + 16u] * wHi;
+        }
+    }
+
+    y[n * pc.M + m] = acc * downScale[expertIdx];
+}

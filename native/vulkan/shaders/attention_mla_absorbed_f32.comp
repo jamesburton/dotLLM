@@ -1,0 +1,183 @@
+#version 450
+// Absorbed Multi-head Latent Attention (issue #913): attention directly over the compressed latent cache.
+//
+// The cache holds ONE row per token, C[s] = concat(c_kv[s] (kvLoraRank = 512), k_pe[s] (qkRope = 64)) = 576 floats, shared
+// by every head (MQA). The query was pre-multiplied by W_UK ("absorbed"): Q'[t,h] = concat(q_nope[t,h]·W_UK_h, rope(q_pe[t,h])).
+//
+//   score[t,h,s] = scale * Q'[t,h] · C[s]                      (576-wide dot)
+//   lat[t,h]     = sum_s softmax_s(score)[s] * C[s][0 .. 512)    (V = the latent part of the same row)
+//
+// The caller applies W_UV afterwards (mla_head_gemm_q8) to get the per-head v_head_dim output. Compared with the expanded
+// layout this reads 576 floats per cached token ONCE for all heads instead of 20 heads x (192+256) floats, and the cache is
+// ~16x smaller; the arithmetic per (query row, key) is 1088 MACs instead of 512, which the tiling below amortises.
+//
+// Tiling. A "row" is one (token, head) pair, rows are flattened token-major (g = t*numHeads + h). A workgroup owns BR = 8
+// consecutive rows and walks the KV range in tiles of BC = 64 keys:
+//   1. QK^T: thread (j = tid & 63, rg = tid >> 6) computes the scores of rows {2rg, 2rg+1} against key j (vec4 loads of the
+//      key row, Q from LDS) and writes them, transposed, to sc[j*8 + r].
+//   2. softmax: BR row-owner threads fold the tile into the running (max, sum) and turn sc into probabilities in place.
+//   3. P·V: thread tid owns latent dims {2tid, 2tid+1} for all 8 rows (16 register accumulators); per key it does one
+//      coalesced float2 global load and two LDS vec4 reads for 16 FMAs.
+// No subgroup operations are used, so wave32 and wave64 are both correct.
+//
+// Split-KV (numSplits > 1, decode and tiny verify chunks): workgroup.x = rowTile * numSplits + split; each split covers
+// [split*kvPerSplit, +kvPerSplit) and stores its UNNORMALISED partial (acc, m, l) to the scratch buffers; mla_attn_merge
+// combines them. numSplits == 1 normalises and writes the result directly.
+//
+// Dispatch: groups.x = ceil(seqQ * numHeads / BR) * numSplits
+
+#define BR       8
+#define BC       64
+#define WG       256
+#define LAT      512
+#define C_DIM    576
+#define NEG_INF  (-3.4e38)
+
+layout(local_size_x = WG, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufQ    { vec4  q4[];      };   // [seqQ * numHeads, 576]
+layout(set = 0, binding = 1, std430) readonly  buffer BufC4   { vec4  c4[];      };   // latent cache rows (vec4 view)
+layout(set = 0, binding = 2, std430) readonly  buffer BufC2   { vec2  c2[];      };   // same buffer, vec2 view
+layout(set = 0, binding = 3, std430) writeonly buffer BufOut  { float outp[];    };   // [seqQ * numHeads, 512]
+layout(set = 0, binding = 4, std430) writeonly buffer BufPO   { float partO[];   };   // [numSplits, splitRows, 512]
+layout(set = 0, binding = 5, std430) writeonly buffer BufPML  { float partML[];  };   // [numSplits, splitRows, 2]
+
+layout(push_constant) uniform PushConstants {
+    uint  seqQ;
+    uint  seqKv;
+    uint  numHeads;
+    uint  positionOffset;
+    float scale;
+    uint  numSplits;
+    uint  kvPerSplit;
+    uint  splitRows;      // row capacity per split in partO / partML (>= seqQ * numHeads when numSplits > 1)
+} pc;
+
+shared vec4  qTile[BR * (C_DIM / 4)];
+shared float sc[BC * BR];          // transposed: sc[j * BR + r]
+shared float rowM[BR];
+shared float rowL[BR];
+shared float rowCorr[BR];
+
+void main() {
+    uint totalRows = pc.seqQ * pc.numHeads;
+    uint rowTiles = (totalRows + uint(BR) - 1u) / uint(BR);
+    uint tile  = gl_WorkGroupID.x / pc.numSplits;
+    uint split = gl_WorkGroupID.x - tile * pc.numSplits;
+    if (tile >= rowTiles) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint row0 = tile * uint(BR);
+
+    // Stage Q rows (zero for rows past the end).
+    for (uint idx = tid; idx < uint(BR * (C_DIM / 4)); idx += uint(WG)) {
+        uint r = idx / uint(C_DIM / 4);
+        uint c = idx - r * uint(C_DIM / 4);
+        uint g = row0 + r;
+        qTile[idx] = (g < totalRows) ? q4[g * uint(C_DIM / 4) + c] : vec4(0.0);
+    }
+    if (tid < uint(BR)) { rowM[tid] = NEG_INF; rowL[tid] = 0.0; }
+
+    uint lastRow = min(row0 + uint(BR), totalRows) - 1u;
+    uint maxPos = pc.positionOffset + lastRow / pc.numHeads;     // causal cap for the whole tile
+    uint kvBegin = (pc.numSplits > 1u) ? split * pc.kvPerSplit : 0u;
+    uint kvEnd = (pc.numSplits > 1u) ? min(pc.seqKv, kvBegin + pc.kvPerSplit) : pc.seqKv;
+    kvEnd = min(kvEnd, maxPos + 1u);
+    barrier();
+
+    uint j  = tid & uint(BC - 1);
+    uint rg = tid >> 6u;
+    uint myRow0 = row0 + 2u * rg;
+    uint myRow1 = myRow0 + 1u;
+    uint pos0 = pc.positionOffset + myRow0 / pc.numHeads;
+    uint pos1 = pc.positionOffset + myRow1 / pc.numHeads;
+    bool v0 = myRow0 < totalRows;
+    bool v1 = myRow1 < totalRows;
+
+    vec2 acc[BR];
+    for (uint r = 0u; r < uint(BR); r++) acc[r] = vec2(0.0);
+    uint d0 = 2u * tid;
+
+    for (uint tStart = kvBegin; tStart < kvEnd; tStart += uint(BC)) {
+        uint tileLen = min(uint(BC), kvEnd - tStart);
+
+        // 1. scores
+        uint key = tStart + j;
+        float s0 = NEG_INF;
+        float s1 = NEG_INF;
+        if (j < tileLen) {
+            float a0 = 0.0;
+            float a1 = 0.0;
+            uint kb4 = key * uint(C_DIM / 4);
+            uint qb0 = (2u * rg) * uint(C_DIM / 4);
+            uint qb1 = qb0 + uint(C_DIM / 4);
+            for (uint c = 0u; c < uint(C_DIM / 4); c++) {
+                vec4 kv = c4[kb4 + c];
+                a0 += dot(qTile[qb0 + c], kv);
+                a1 += dot(qTile[qb1 + c], kv);
+            }
+            if (v0 && key <= pos0) s0 = a0 * pc.scale;
+            if (v1 && key <= pos1) s1 = a1 * pc.scale;
+        }
+        sc[j * uint(BR) + 2u * rg]      = s0;
+        sc[j * uint(BR) + 2u * rg + 1u] = s1;
+        barrier();
+
+        // 2. softmax fold (row owners)
+        if (tid < uint(BR)) {
+            uint r = tid;
+            float tmax = NEG_INF;
+            for (uint jj = 0u; jj < tileLen; jj++) tmax = max(tmax, sc[jj * uint(BR) + r]);
+            float mOld = rowM[r];
+            float mNew = max(mOld, tmax);
+            float corr = (mOld > NEG_INF * 0.5) ? exp(mOld - mNew) : 0.0;
+            float lsum = 0.0;
+            for (uint jj = 0u; jj < tileLen; jj++) {
+                float s = sc[jj * uint(BR) + r];
+                float w = (s > NEG_INF * 0.5) ? exp(s - mNew) : 0.0;
+                sc[jj * uint(BR) + r] = w;
+                lsum += w;
+            }
+            rowL[r] = rowL[r] * corr + lsum;
+            rowM[r] = mNew;
+            rowCorr[r] = corr;
+        }
+        barrier();
+
+        // 3. P.V over the latent half of the key rows
+        for (uint r = 0u; r < uint(BR); r++) acc[r] *= rowCorr[r];
+        for (uint jj = 0u; jj < tileLen; jj++) {
+            vec2 cv = c2[(tStart + jj) * uint(C_DIM / 2) + tid];
+            vec4 wa = vec4(sc[jj * uint(BR) + 0u], sc[jj * uint(BR) + 1u], sc[jj * uint(BR) + 2u], sc[jj * uint(BR) + 3u]);
+            vec4 wb = vec4(sc[jj * uint(BR) + 4u], sc[jj * uint(BR) + 5u], sc[jj * uint(BR) + 6u], sc[jj * uint(BR) + 7u]);
+            acc[0] += wa.x * cv; acc[1] += wa.y * cv; acc[2] += wa.z * cv; acc[3] += wa.w * cv;
+            acc[4] += wb.x * cv; acc[5] += wb.y * cv; acc[6] += wb.z * cv; acc[7] += wb.w * cv;
+        }
+        barrier();
+    }
+
+    if (pc.numSplits == 1u) {
+        for (uint r = 0u; r < uint(BR); r++) {
+            uint g = row0 + r;
+            if (g < totalRows) {
+                float l = rowL[r];
+                float inv = (l > 1e-30) ? (1.0 / l) : 0.0;
+                outp[g * uint(LAT) + d0]      = acc[r].x * inv;
+                outp[g * uint(LAT) + d0 + 1u] = acc[r].y * inv;
+            }
+        }
+    } else {
+        for (uint r = 0u; r < uint(BR); r++) {
+            uint g = row0 + r;
+            if (g < totalRows) {
+                uint base = (split * pc.splitRows + g) * uint(LAT);
+                partO[base + d0]      = acc[r].x;
+                partO[base + d0 + 1u] = acc[r].y;
+            }
+        }
+        if (tid < uint(BR) && row0 + tid < totalRows) {
+            uint base = (split * pc.splitRows + row0 + tid) * 2u;
+            partML[base]      = rowM[tid];
+            partML[base + 1u] = rowL[tid];
+        }
+    }
+}
