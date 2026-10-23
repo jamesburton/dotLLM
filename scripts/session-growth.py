@@ -11,6 +11,7 @@ ap.add_argument("--turn-chars", type=int, default=34000, help="characters append
 ap.add_argument("--turns", type=int, default=18, help="maximum number of turns")
 ap.add_argument("--max-tokens", type=int, default=64)
 ap.add_argument("--out", default="growth.tsv")
+ap.add_argument("--pid", type=int, default=0, help="server process id: also record its working set and private bytes per turn")
 args = ap.parse_args()
 URL, TURN_CHARS, MAX_TURNS, OUT = args.url, args.turn_chars, args.turns, args.out
 
@@ -27,9 +28,27 @@ def vram():
         return 0
 
 
+def process_mib(pid):
+    """(working set, private bytes) of a process in MiB, or (0, 0) when unavailable. Windows: PowerShell; Linux: /proc."""
+    if pid <= 0:
+        return 0, 0
+    try:
+        if sys.platform == "win32":
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command", f"$p = Get-Process -Id {pid}; \"$($p.WorkingSet64) $($p.PrivateMemorySize64)\""],
+                text=True, stderr=subprocess.DEVNULL)
+            ws, priv = (int(x) for x in out.split())
+            return ws >> 20, priv >> 20
+        status = pathlib.Path(f"/proc/{pid}/status").read_text()
+        kib = {k: int(v.split()[0]) for k, v in (ln.split(":", 1) for ln in status.splitlines()) if k in ("VmRSS", "VmData")}
+        return kib.get("VmRSS", 0) >> 10, kib.get("VmData", 0) >> 10
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return 0, 0
+
+
 msgs = [{"role": "system", "content": "You are reading a long document in parts. Answer briefly."}]
 with open(OUT, "w") as f:
-    f.write("turn\tprompt_tok\tcached_tok\tnew_tok\tttft_s\tprefill_ms\tprefill_tps\tdecode_tps\tgen_tok\tvram_mib\terror\n")
+    f.write("turn\tprompt_tok\tcached_tok\tnew_tok\tttft_s\tprefill_ms\tprefill_tps\tdecode_tps\tgen_tok\tvram_mib\tws_mib\tprivate_mib\terror\n")
     for turn in range(1, MAX_TURNS + 1):
         chunk = text[(turn - 1) * TURN_CHARS: turn * TURN_CHARS]
         if not chunk:
@@ -65,7 +84,7 @@ with open(OUT, "w") as f:
         prompt = timings.get("prompt_tokens", usage.get("prompt_tokens", 0))
         row = [turn, prompt, cached, prompt - cached, f"{ttft or 0:.1f}", f"{timings.get('prefill_time_ms', 0):.0f}",
                f"{timings.get('prefill_tokens_per_sec', 0):.0f}", f"{timings.get('decode_tokens_per_sec', 0):.1f}",
-               timings.get("generated_tokens", 0), vram(), err.replace("\t", " ")]
+               timings.get("generated_tokens", 0), vram(), *process_mib(args.pid), err.replace("\t", " ")]
         f.write("\t".join(map(str, row)) + "\n"); f.flush()
         print("\t".join(map(str, row)), flush=True)
         if err:

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using DotLLM.Core.Lora;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
@@ -45,7 +46,7 @@ namespace DotLLM.Vulkan;
 /// so <c>MtpSpeculativeDecoder</c> drives this model with no backend-specific branch of its own.
 /// </para>
 /// </remarks>
-public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
+public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, IContextLimitable
 {
     private readonly VulkanDevice _device;
     private readonly bool _ownsDevice;
@@ -97,7 +98,23 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     private readonly VulkanDevice.SubmitContext _submit;
 
     /// <inheritdoc/>
-    public ModelConfig Config { get; }
+    public ModelConfig Config { get; private set; }
+
+    /// <inheritdoc/>
+    public int NativeMaxSequenceLength { get; }
+
+    /// <summary>
+    /// Lowers the served context window (<c>--ctx-size</c>, issue #1101): <see cref="Config"/>'s <c>MaxSequenceLength</c> then
+    /// bounds every position and the growth limit of each KV cache created afterwards. With YaRN the native window is
+    /// factor × original (about 1M for Bonsai-2), far more F32 KV than a device holds, so the server applies the user's cap.
+    /// </summary>
+    /// <param name="maxSequenceLength">The new window, 1..<see cref="NativeMaxSequenceLength"/>.</param>
+    public void LimitContextLength(int maxSequenceLength)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxSequenceLength);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(maxSequenceLength, NativeMaxSequenceLength);
+        Config = Config with { MaxSequenceLength = maxSequenceLength };
+    }
 
     /// <inheritdoc/>
     public long ComputeMemoryBytes =>
@@ -106,10 +123,85 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     /// <summary>Number of full-attention layers — the matching sparse KV-cache slot count.</summary>
     public int AttentionLayerCount => _attentionLayerCount;
 
-    /// <summary>Creates a sparse <see cref="VulkanNemotronHKvCache"/> sized for this model.</summary>
+    /// <summary>
+    /// Creates a sparse, lazily allocated <see cref="VulkanNemotronHKvCache"/> for this model. It may grow up to the context window
+    /// (<see cref="IKvCache.TryGrowTo"/>, issue #1100), so a growing session keeps its recurrent-prefix hit; the forward allocates the
+    /// rows it writes (<see cref="VulkanNemotronHKvCache.PrepareForForward"/>).
+    /// </summary>
+    /// <param name="maxSeqLen">Initial logical capacity in positions (capped at the context window).</param>
+    /// <returns>The new cache.</returns>
     public VulkanNemotronHKvCache CreateKvCache(int maxSeqLen)
         => new(_device, _kvSlotForLayer, _attentionLayerCount,
-               Config.NumKvHeads, Config.HeadDim, maxSeqLen);
+               Config.NumKvHeads, Config.HeadDim, Math.Min(maxSeqLen, Config.MaxSequenceLength), _kvStorage, lazy: true,
+               growthLimit: Config.MaxSequenceLength);
+
+    // F16 by default (#1102, #1107: no F32 KV on hot paths). The F16 kernels are built on first use.
+    private VulkanKvStorage _kvStorage = VulkanKvStorage.F16;
+
+    /// <summary>
+    /// Element format of the caches <see cref="CreateKvCache"/> makes: F16 unless configured (issue #1102). F32 exists as the explicit
+    /// A/B and parity baseline only.
+    /// </summary>
+    public VulkanKvStorage KvStorage => _kvStorage;
+
+    /// <summary>Device bytes one cached position costs across every attention layer, K and V, in <see cref="KvStorage"/>.</summary>
+    public long KvBytesPerPosition => 2L * _attentionLayerCount * Config.NumKvHeads * Config.HeadDim * _kvStorage.ElementBytes();
+
+    /// <summary>
+    /// Selects the element format of the caches <see cref="CreateKvCache"/> makes from now on (issue #1102). F16 halves the KV
+    /// (Bonsai 2: 64 instead of 128 KiB per token) and the bytes every decoded token reads; its attention kernels read the halves in
+    /// place, with no F32 copy of the history. Caches created earlier keep their format; the forward picks kernels per cache.
+    /// </summary>
+    /// <param name="storage">The storage format.</param>
+    /// <exception cref="NotSupportedException">This build lacks the F16 attention SPIR-V.</exception>
+    public void ConfigureKvStorage(VulkanKvStorage storage)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (storage != VulkanKvStorage.F32)
+            _kernels.EnsureNarrowKv(storage, Config.HeadDim);
+        _kvStorage = storage;
+    }
+
+    /// <summary><see cref="VulkanNemotronHKvCache.BufferEpoch"/> when this model last dropped its descriptor caches.</summary>
+    private long _seenKvBufferEpoch = -1;
+
+    /// <summary>
+    /// Before recording a forward: see <see cref="VulkanNemotronHKvCache.PrepareForForward"/>. True when the descriptor caches must be
+    /// dropped because a KV buffer was freed.
+    /// </summary>
+    /// <param name="kvCache">The forward's cache, or null.</param>
+    /// <param name="positions">The forward's positions.</param>
+    /// <returns><see langword="true"/> when descriptor caches must be dropped.</returns>
+    private bool PrepareKvCache(IKvCache? kvCache, ReadOnlySpan<int> positions)
+    {
+        if (!VulkanNemotronHKvCache.PrepareForForward(kvCache, VulkanNemotronHKvCache.PositionsEnd(positions), ref _seenKvBufferEpoch))
+            return false;
+        KvBufferInvalidationsForTest++;
+        return true;
+    }
+
+    /// <summary>
+    /// Test hook (issue #1100): forwards that dropped the descriptor caches because a KV buffer was freed. Not every driver recycles a
+    /// freed handle fast enough for a stale set to show in the logits, so the tests pin the invalidation itself.
+    /// </summary>
+    internal int KvBufferInvalidationsForTest { get; private set; }
+
+    /// <summary>Test hook (issue #1102): forces the GQA-grouped split-KV decode pass on or off.</summary>
+    /// <param name="on">Whether the grouped pass may run.</param>
+    internal void SetGqaDecodeForTest(bool on) => _kernels.SetGqaDecodeForTest(on);
+
+    /// <summary>Test hook (issue #1102): F32-to-F16 convert dispatches recorded for F16 KV rows.</summary>
+    internal long F16KvRowWritesForTest => _kernels.NarrowKv?.Writer.Dispatches ?? 0;
+
+    /// <summary>Drops every kernel's handle-keyed descriptor cache (after any buffer they may name was re-created or freed).</summary>
+    private void InvalidateDescriptorCaches()
+    {
+        _kernels.InvalidateAll();
+        _hadamard?.InvalidateDescriptorCache();
+        _embedGather?.InvalidateDescriptorCache();
+        _gdnSnapScan?.InvalidateDescriptorCache();
+        _iqF16Prefill?.InvalidateDescriptorCache();
+    }
 
     /// <summary>
     /// Creates a fresh per-sequence <see cref="VulkanGdnStateCache"/> sized for this
@@ -140,12 +232,16 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         _device = device;
         _ownsDevice = ownsDevice;
         Config = config;
+        NativeMaxSequenceLength = config.MaxSequenceLength;
         _gguf = gguf;
         _cpuModel = cpuModel;
         _weights = weights;
         _state = state;
         _gdnCache = gdnCache;
         _kernels = kernels;
+
+        // Issue #1102: Bonsai 2's 24 query heads share 4 KV heads; the grouped decode pass reads each cached row once, not 6 times.
+        _kernels.EnableGqaDecode();
         _layout = config.HybridLayout!;
         _gdn = config.GdnConfig!.Value;
         _kvSlotForLayer = kvSlotForLayer;
@@ -280,6 +376,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         var state = new VulkanQwen3HybridDenseForwardState(device, config, gdn, initialSeqLen: 1);
         var gdnCache = new VulkanGdnStateCache(device, gdn, gdnOrdinal);
         var kernels = VulkanQwen3MoeHybridKernels.Create(device, spvDir, config.HeadDim);
+        // Issue #1101: --rope-scaling yarn. Every RoPE call site goes through kernels.RecordRopeNeoX, which uses this when attached.
+        if (attentionLayerCount > 0)
+            kernels.AttachYarnRope(VulkanDenseYarnRope.TryCreate(device, spvDir, config, ropeDim));
 
         var hadamard = config.HadamardFold is { } fold
             ? VulkanHadamardRotation.Create(device, spvDir, fold, gdn)
@@ -466,16 +565,17 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         // exactly this hazard), so it must never run against an open command buffer.
         int headRows = seqLen <= _allRowLogitsLimit ? seqLen : 1;
 
+        // A tile too deep for one attention layer to fit the submission budget runs as row slices (issue #1100).
+        if (ForwardInRowSlices(tokenIds, positions, deviceId, kvCache, gdnState, mtpState) is { } sliced)
+            return sliced;
+
         bool resized = _state.EnsureCapacity(seqLen);
+        resized |= PrepareKvCache(kvCache, positions);
         if (resized)
         {
-            _kernels.InvalidateAll();
-            // The FWHT kernel keeps its own handle-keyed descriptor cache, and a freed buffer handle
-            // can be recycled into the new scratch allocation — which would bind the stale set.
-            _hadamard?.InvalidateDescriptorCache();
-            _embedGather?.InvalidateDescriptorCache();
-            _gdnSnapScan?.InvalidateDescriptorCache();
-            _iqF16Prefill?.InvalidateDescriptorCache();
+            // Every kernel (the FWHT one included) keeps a handle-keyed descriptor cache, and a freed buffer handle can be
+            // recycled into the new scratch or KV allocation — which would bind the stale set.
+            InvalidateDescriptorCaches();
         }
 
         var logitsBuf = headRows == 1 ? SingleRowLogits : EnsureMultiRowLogits(headRows, vocabSize);
@@ -495,11 +595,11 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         // (fence wait + re-record + submit) with the GPU idle in between, ~3 of ~18 ms per Tev1-4B decode token. Long prefills keep one
         // submission per layer (the round trip is noise there, and one multi-hundred-ms buffer would risk the GPU watchdog). The profiler
         // needs per-layer submissions for its per-submit stamps, so it also takes the old path.
-        // Longer prefills submit every `layersPerSubmit` layers (still bounded GPU time per submission, fewer idle gaps).
-        int layersPerSubmit = !FuseForwardEnabled || _prof is not null ? 1
-            : seqLen <= FuseMaxSeqLen ? int.MaxValue
-            : PrefillLayersPerSubmit(seqLen);
-        bool fuse = layersPerSubmit > 1;
+        // Longer prefills pack layers into submissions up to a GPU-time budget (issue #1100; see SubmitSchedule).
+        int kvEnd = kvCache is VulkanNemotronHKvCache ? VulkanNemotronHKvCache.PositionsEnd(positions) : seqLen;
+        var schedule = BeginSubmitSchedule(seqLen,
+            VulkanPrefillSubmitBudget.AttentionGflops(VulkanPrefillSubmitBudget.EffectiveRows(seqLen), kvEnd, numHeads, headDim));
+        bool fuse = schedule.Fuse;
         bool open = false;   // a command buffer is currently being recorded (not yet submitted)
         VulkanMtpState? mtpCapture = _mtpHead is not null ? mtpState as VulkanMtpState : null;
 
@@ -526,6 +626,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         for (int layer = 0; layer < kinds.Length; layer++)
         {
             ref readonly var layerBuf = ref _weights.Layers[layer];
+            schedule.LayerStarted(layer);
 
             if (open)
             {
@@ -603,14 +704,18 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
                 0, 0, (ulong)((long)seqLen * hiddenRowBytes));
             KernelSupport.ComputeToHostBarrier(cmdBuf);
             ProfMark(cmdBuf, VulkanOpProfiler.Cat.Resid);
-            if (!fuse || (layersPerSubmit != int.MaxValue && (layer + 1) % layersPerSubmit == 0))
+            if (schedule.SubmitAfter(layer))
             {
                 ProfBeforeSubmit(cmdBuf);
+                long submitStart = Stopwatch.GetTimestamp();
                 _submit.SubmitAndWait();
+                schedule.Submitted(Stopwatch.GetElapsedTime(submitStart).TotalSeconds);
                 ProfAfterSubmit();
                 open = false;
             }
         }
+
+        schedule.Finish(kvEnd);
 
         // The MTP capture below reads HiddenState on the host, so an open buffer must complete first.
         if (open && mtpCapture is not null)
@@ -883,10 +988,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // The RoPE kernel always rotates a Q operand too; give it one head of the (dead) Q scratch.
-        _kernels.Rope.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
-            seqLen: s, numHeads: 1, numKvHeads: numKvHeads,
-            headDim: headDim, ropeDim: _ropeDim, theta: _ropeTheta,
-            variant: RopeF32Kernel.Variant.NeoX);
+        _kernels.RecordRopeNeoX(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
+            s, 1, numKvHeads, headDim, _ropeDim, _ropeTheta);
         KernelSupport.ComputeToTransferBarrier(cmdBuf);
 
         // ── 5. One slab copy into cache slots [firstPosition, firstPosition + S) ──
@@ -1205,6 +1308,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         // Every (re)allocation happens BEFORE recording: a grow invalidates the handle-keyed descriptor caches (resets pools an open
         // command buffer may still reference).
         bool resized = _state.EnsureCapacity(sumN);
+        for (int i = 0; i < n; i++)
+            resized |= PrepareKvCache(requests[i].KvCache, requests[i].Positions.Span);
         if (_batchNorm is null || _batchNormRows < sumN)
         {
             _batchNorm?.Dispose();
@@ -1234,13 +1339,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             resized = true;
         }
         if (resized)
-        {
-            _kernels.InvalidateAll();
-            _hadamard?.InvalidateDescriptorCache();
-            _embedGather?.InvalidateDescriptorCache();
-            _gdnSnapScan?.InvalidateDescriptorCache();
-            _iqF16Prefill?.InvalidateDescriptorCache();
-        }
+            InvalidateDescriptorCaches();
         var logitsBuf = headTotal == 1 ? SingleRowLogits : EnsureMultiRowLogits(headTotal, vocabSize);
         var batchNorm = _batchNorm!;
 
@@ -1255,10 +1354,18 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         _device.Upload(MemoryMarshal.AsBytes(positionsAll.AsSpan()), _batchPositions!);
 
         var kinds = _layout.LayerKind;
-        int layersPerSubmit = !FuseForwardEnabled ? 1
-            : sumN <= FuseMaxSeqLen ? int.MaxValue
-            : PrefillLayersPerSubmit(sumN);
-        bool fuse = layersPerSubmit > 1;
+        double batchAttentionGflops = 0;
+        int batchKvEnd = 0;
+        for (int i = 0; i < n; i++)
+        {
+            int len = offsets[i + 1] - offsets[i];
+            int end = VulkanNemotronHKvCache.PositionsEnd(positionsAll.AsSpan(offsets[i], len));
+            // Per sequence at its own length: a batch of short sequences still fills the GPU as a whole.
+            batchAttentionGflops += VulkanPrefillSubmitBudget.AttentionGflops(len, end, numHeads, headDim);
+            batchKvEnd = Math.Max(batchKvEnd, end);
+        }
+        var schedule = BeginSubmitSchedule(sumN, batchAttentionGflops);
+        bool fuse = schedule.Fuse;
         bool open;
         long hiddenRowBytes = (long)hiddenSize * sizeof(float);
 
@@ -1275,6 +1382,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         for (int layer = 0; layer < kinds.Length; layer++)
         {
             ref readonly var layerBuf = ref _weights.Layers[layer];
+            schedule.LayerStarted(layer);
             if (open)
             {
                 KernelSupport.ComputeTransferFullBarrier(cmdBuf);
@@ -1391,12 +1499,16 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             KernelSupport.ComputeToTransferBarrier(cmdBuf);
             RecordCopyBufferRange(cmdBuf, _state.AddScratch, _state.HiddenState, 0, 0, (ulong)((long)sumN * hiddenRowBytes));
             KernelSupport.ComputeToHostBarrier(cmdBuf);
-            if (!fuse || (layersPerSubmit != int.MaxValue && (layer + 1) % layersPerSubmit == 0))
+            if (schedule.SubmitAfter(layer))
             {
+                long submitStart = Stopwatch.GetTimestamp();
                 _submit.SubmitAndWait();
+                schedule.Submitted(Stopwatch.GetElapsedTime(submitStart).TotalSeconds);
                 open = false;
             }
         }
+
+        schedule.Finish(batchKvEnd);
 
         // ── 3. Final norm + LM head over each sequence's head rows ────────────
         if (open)
@@ -1837,20 +1949,21 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
 
         // 5. RoPE — NeoX pair pattern over the first ropeDim of each head, mirroring
         //    the CPU reference's choice so device output matches CPU output.
-        _kernels.Rope.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
-            seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
-            headDim: headDim, ropeDim: _ropeDim, theta: _ropeTheta,
-            variant: RopeF32Kernel.Variant.NeoX);
+        _kernels.RecordRopeNeoX(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
+            seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta);
 
         // 6. Attention.
         VulkanDevice.Buffer kSrc, vSrc;
         int seqKv, positionOffset;
+        VulkanNarrowKvAttentionKernels? narrow = null;   // issue #1102: a narrow cache is read by its own kernel twins
         if (kvCache is VulkanNemotronHKvCache vkCache)
         {
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
             ProfMark(cmdBuf, VulkanOpProfiler.Cat.AttnRope);      // #445 sub-bucket
-            vkCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, absoluteLayerIdx);
-            KernelSupport.TransferToComputeBarrier(cmdBuf);
+            narrow = vkCache.Storage == VulkanKvStorage.F32 ? null : _kernels.EnsureNarrowKv(vkCache.Storage, headDim);
+            vkCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, absoluteLayerIdx, narrow?.Writer);
+            if (narrow is null) KernelSupport.TransferToComputeBarrier(cmdBuf);
+            else KernelSupport.ComputeToComputeBarrier(cmdBuf);   // the F16 rows are written by a compute kernel
             ProfMark(cmdBuf, VulkanOpProfiler.Cat.AttnKvUpdate);  // #445 sub-bucket
             kSrc = vkCache.GetKeysBuffer(absoluteLayerIdx);
             vSrc = vkCache.GetValuesBuffer(absoluteLayerIdx);
@@ -1867,7 +1980,11 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             positionOffset = 0;
         }
 
-        if (_kernels.SplitKvAttention is not null && seqLen == 1
+        var splitKvAttention = narrow is null ? _kernels.SplitKvAttention : narrow.SplitKvAttention;
+        var flashAttentionCoopmat = narrow is null ? _kernels.FlashAttentionCoopmat : narrow.FlashAttentionCoopmat;
+        var flashAttention = narrow is null ? _kernels.FlashAttention : narrow.FlashAttention;
+        var attention = narrow is null ? _kernels.Attention : narrow.Attention;
+        if (splitKvAttention is not null && seqLen == 1
             && headDim <= VulkanSplitKvAttentionKernel.MaxHeadDim
             && VulkanSplitKvAttentionKernel.WouldSplit(seqKv, numHeads))
         {
@@ -1875,22 +1992,22 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             // Engages from seqKv >= 17 with the shipping heuristic (issue #331);
             // only seqKv <= 16 falls through to the per-token kernel.
             ProfNote("attn_splitkv", m: numHeads, k: headDim, n: seqKv);
-            _kernels.SplitKvAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
+            splitKvAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: 0);
         }
-        else if (_kernels.FlashAttentionCoopmat is not null && seqLen > 1 && headDim <= _kernels.FlashAttentionCoopmat.SupportedMaxHeadDim)
+        else if (flashAttentionCoopmat is not null && seqLen > 1 && headDim <= flashAttentionCoopmat.SupportedMaxHeadDim)
         {
-            _kernels.FlashAttentionCoopmat.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
+            flashAttentionCoopmat.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: 0);
         }
-        else if (_kernels.FlashAttention is not null && seqLen > 1 && headDim <= _kernels.FlashAttention.SupportedMaxHeadDim)
+        else if (flashAttention is not null && seqLen > 1 && headDim <= flashAttention.SupportedMaxHeadDim)
         {
             ProfNote("attn_flash", m: numHeads, k: headDim, n: seqKv);
-            _kernels.FlashAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
+            flashAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: 0);
@@ -1898,7 +2015,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         else
         {
             ProfNote("attn_naive", m: numHeads, k: headDim, n: seqKv);
-            _kernels.Attention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
+            attention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: 0);
@@ -2372,10 +2489,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.Norm);
 
-        _kernels.Rope.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
-            seqLen: 1, numHeads: numHeads, numKvHeads: numKvHeads,
-            headDim: headDim, ropeDim: _ropeDim, theta: _ropeTheta,
-            variant: RopeF32Kernel.Variant.NeoX);
+        _kernels.RecordRopeNeoX(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
+            1, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta);
         KernelSupport.ComputeToTransferBarrier(cmdBuf);
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.AttnRope);
 

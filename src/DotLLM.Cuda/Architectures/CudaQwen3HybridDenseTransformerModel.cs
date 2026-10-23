@@ -38,7 +38,7 @@ namespace DotLLM.Cuda.Architectures;
 /// prefill dequant-then-cuBLAS-HGEMM path (seqLen &gt; 1) still stages through F16.
 /// </para>
 /// </remarks>
-public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel, IRecurrentPrefixSnapshotProvider
+public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel, IContextLimitable, IRecurrentPrefixSnapshotProvider
 {
     private readonly CudaQwen3HybridDenseForwardState _state;
     private readonly CudaGdnStateCache _gdnCache;
@@ -71,6 +71,12 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     private readonly int[] _gdnLayerOrdinal;
 
     private readonly float _ropeTheta;
+
+    // Issue #1101: dense-YaRN rotation (--rope-scaling yarn). Device copy of RoPE.ResolveDenseYarn's ramped inverse
+    // frequencies ([ropeDim / 2] F32) and the cos/sin multiplier; 0 / 1 when YaRN is off, which every RoPE launch below
+    // treats as the plain theta rotation.
+    private nint _ropeYarnInvFreq;
+    private readonly float _ropeYarnMscale = 1.0f;
     private readonly int _ropeDim;
 
     // Model-owned device F16 scratch for on-the-fly weight dequant in the prefill path
@@ -404,7 +410,10 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     /// <inheritdoc/>
     public ModelConfig Config { get; private set; }
 
-    /// <summary>The checkpoint's own context window, before any <see cref="LimitContextLength"/> (issue #1068).</summary>
+    /// <summary>
+    /// The window the model was loaded with, before any <see cref="LimitContextLength"/> (issue #1068): the checkpoint's own, or
+    /// factor × original with <c>--rope-scaling yarn</c> (issue #1101).
+    /// </summary>
     public int NativeMaxSequenceLength { get; }
 
     /// <summary>
@@ -977,6 +986,16 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         _attentionLayerCount = attentionLayerCount;
         _ropeTheta = ropeTheta;
         _ropeDim = ropeDim;
+        var (yarnInvFreq, yarnMscale) = RoPE.ResolveDenseYarn(config.RoPEConfig, config.Architecture, ropeDim);
+        if (yarnInvFreq is not null)
+        {
+            long yarnBytes = (long)yarnInvFreq.Length * sizeof(float);
+            _ropeYarnInvFreq = AllocDevice(yarnBytes);
+            fixed (float* pYarn = yarnInvFreq)
+                CopyHtoD(_ropeYarnInvFreq, (nint)pYarn, yarnBytes);
+            _ropeYarnMscale = yarnMscale;
+        }
+
         _state = state;
         _gdnCache = gdnCache;
         _stream = stream;
@@ -2572,7 +2591,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
             // numHeads = 0: the kernel rotates no Q pairs, so its Q operand is never touched.
             // Positions [p, p + s) are a slice of the state's device iota (issue #482) — no upload.
             _kernels.LaunchRoPEF32(kSlab, kSlab, state.GetPositionDevicePtr(p, s), s, 0, numKvHeads, headDim,
-                _ropeDim, _ropeTheta, 1, streamH);
+                _ropeDim, _ropeTheta, 1, streamH, ropeInvFreq: _ropeYarnInvFreq, ropeMscale: _ropeYarnMscale);
             if (!f32Cache)
                 StoreMtpKvRows(state, kSlab, vSlab, p, s, streamH);
 
@@ -3143,7 +3162,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         // per-step GC-allocated int[1] plus a pageable H2D (driver staging copy, which the CUDA
         // docs allow to synchronize with the stream).
         _kernels.LaunchRoPEF32(s.Q, kRowDst, state.GetPositionDevicePtr(position), 1, numHeads, numKvHeads, headDim,
-            _ropeDim, _ropeTheta, 1, streamH);
+            _ropeDim, _ropeTheta, 1, streamH, ropeInvFreq: _ropeYarnInvFreq, ropeMscale: _ropeYarnMscale);
         if (!f32Cache)
             StoreMtpKvRows(state, kRowDst, vRowDst, step, 1, streamH);
         ProfMark("mtp-4c-qknorm-rope");
@@ -3762,7 +3781,8 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
 
         // ── 5. RoPE — partial-rotary NeoX ──
         _kernels.LaunchRoPEF32(q, k, _state.PositionsDevice,
-            seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, 1, streamH);
+            seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, 1, streamH,
+            ropeInvFreq: _ropeYarnInvFreq, ropeMscale: _ropeYarnMscale);
         DumpDevice2D($"blk.{layer}.fa_q_postrope", q, seqLen, qElems);
         DumpDevice2D($"blk.{layer}.fa_k_postrope", k, seqLen, numKvHeads * headDim);
         ProfMark("attn-5-rope");
@@ -5113,6 +5133,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         FreeIfNonZero(ref _attnGqaSplitPartialOut);
         FreeIfNonZero(ref _attnMmaDecodeQF16);
         FreeIfNonZero(ref _attnFlashPrefillQF16);
+        FreeIfNonZero(ref _ropeYarnInvFreq);
 
         // MTP (issue #253): free the trailing NextN head's device weights (a no-op when absent).
         if (_mtpHead is { } mtpHead)

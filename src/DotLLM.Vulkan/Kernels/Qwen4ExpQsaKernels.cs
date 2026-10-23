@@ -11,7 +11,7 @@ namespace DotLLM.Vulkan.Kernels;
 /// <c>budget</c> blocks (ties to the lower index) and attends their tokens plus the tail of the incomplete block. Queries with at most
 /// <c>budget</c> complete blocks attend densely and skip scoring.
 /// </summary>
-public sealed class Qwen4ExpQsaKernels : IDisposable
+public sealed class Qwen4ExpQsaKernels : IDisposable, IVulkanKvF16Writer
 {
     private const int PoolPcBytes = 7 * 4;
     private const int ScorePcBytes = 9 * 4;

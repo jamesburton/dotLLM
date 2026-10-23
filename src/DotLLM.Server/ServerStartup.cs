@@ -275,6 +275,26 @@ public static class ServerStartup
     }
 
     /// <summary>
+    /// Issue #1101: applies <c>--ctx-size</c> to a model that can lower its window but has no VRAM fit (the Vulkan hybrid). With
+    /// YaRN its window is factor × original (about 1M for Bonsai-2); without this the flag was ignored on Vulkan and the server
+    /// advertised the whole window.
+    /// </summary>
+    /// <param name="model">The loaded model.</param>
+    /// <param name="limitable">The same model, as <see cref="IContextLimitable"/>.</param>
+    /// <param name="options">Server options (<see cref="ServerOptions.ContextSize"/>).</param>
+    /// <returns>The model's config after the limit.</returns>
+    internal static ModelConfig ApplyRequestedContextSize(IModel model, IContextLimitable limitable, ServerOptions options)
+    {
+        int native = limitable.NativeMaxSequenceLength;
+        if (options.ContextSize is > 0 and int requested && requested < native)
+            limitable.LimitContextLength(requested);
+        Console.WriteLine(options.ContextSize is > 0
+            ? $"[dotllm] Context window: {model.Config.MaxSequenceLength} of {native} tokens (--ctx-size)."
+            : $"[dotllm] Context window: {native} tokens. Set --ctx-size to lower it.");
+        return model.Config;
+    }
+
+    /// <summary>
     /// The served context: an explicit request (capped at the model's window) or the fit; never below one 1024-token granule.
     /// </summary>
     /// <param name="requested">The <c>--ctx-size</c> value, or null.</param>
@@ -399,6 +419,19 @@ public static class ServerStartup
             }
             else
             {
+                if (model is DotLLM.Vulkan.VulkanQwen3HybridDenseTransformerModel vkDense)
+                {
+                    // #1102: the dense hybrid (Bonsai 2) stores its KV as f16 (the default) and reads it in place. "f32" is the
+                    // option default, so it means "not given" here; DOTLLM_VK_KV=f32 selects the F32 A/B baseline. q8_0 / q4_0 /
+                    // mixed K and V fail startup.
+                    static string? Given(string? v) => string.Equals(v?.Trim(), "f32", StringComparison.OrdinalIgnoreCase) ? null : v;
+                    vkDense.ConfigureKvStorage(DotLLM.Vulkan.VulkanKvStorageExtensions.ParseOptions(
+                        Given(options.CacheTypeK), Given(options.CacheTypeV)));
+                    Console.WriteLine(
+                        $"[dotllm] KV storage: {vkDense.KvStorage.ToString().ToLowerInvariant()} ({vkDense.KvBytesPerPosition / 1024.0:F0} KiB/token), " +
+                        $"~{vkDense.KvBytesPerPosition * (long)config.MaxSequenceLength / 1048576.0:F0} MiB at {config.MaxSequenceLength} tokens.");
+                }
+
                 var vkFactory = vulkanKvFactory;
                 kvFactory = (cfg, size) => vkFactory(size);
             }
@@ -629,6 +662,8 @@ public static class ServerStartup
         // Issue #1068: size the CUDA hybrid's served context to free VRAM (after warm-up, so its buffers are counted).
         if (model is DotLLM.Cuda.Architectures.CudaQwen3HybridDenseTransformerModel hybridDense)
             config = ApplyHybridContextFit(hybridDense, options, mtpActive, mtpK);
+        else if (model is IContextLimitable limitable)
+            config = ApplyRequestedContextSize(model, limitable, options);
 
         // Continuous-batch scheduler. Enabled when a paged factory is available and speculative
         // decoding is off — the scheduler doesn't support draft models (or MTP self-speculative

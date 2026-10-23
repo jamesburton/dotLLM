@@ -168,6 +168,13 @@ public sealed class VulkanDevice : IDisposable
     public bool HasIntegerDotProduct { get; }
 
     /// <summary>
+    /// The 16-bit / 8-bit storage and float16 / int8 arithmetic features this device supports, all of which were ENABLED at device
+    /// creation (issue #374). Shaders that declare <c>StorageBuffer16BitAccess</c>, <c>Float16</c>, <c>Int8</c> or
+    /// <c>StorageBuffer8BitAccess</c> are only valid on a device whose matching flag is set here.
+    /// </summary>
+    public VulkanNumericFeatures NumericFeatures { get; private set; }
+
+    /// <summary>
     /// True when the physical device advertises <c>VK_EXT_subgroup_size_control</c>
     /// (or Vulkan 1.3 core), reports a valid <c>minSubgroupSize</c>..<c>maxSubgroupSize</c>
     /// range with the compute stage in <c>requiredSubgroupSizeStages</c>, AND the
@@ -569,10 +576,14 @@ public sealed class VulkanDevice : IDisposable
                 bool hasPipelineExecutableProperties =
                     HasDeviceExtension(physical, "VK_KHR_pipeline_executable_properties"u8);
 
+                // Issue #374: 16-bit / 8-bit storage and float16 / int8 arithmetic. ~60 shaders declare these capabilities;
+                // every supported one is enabled (binding such a module on a device without the feature is spec-invalid).
+                VulkanNumericFeatures numeric = ProbeNumericFeatures(physical, apiVersion);
+
                 nint device = CreateLogicalDevice(
                     physical, queueFamily, hasCoopmat, hasExternalMemoryHost, hasIntegerDotProduct,
                     hasSubgroupSizeControl, hasExternalSemaphoreWin32, hasShaderInfoAmd,
-                    hasPipelineExecutableProperties);
+                    hasPipelineExecutableProperties, numeric);
 
                 VulkanApi.vkGetDeviceQueue(device, queueFamily, 0, out nint queue);
 
@@ -595,6 +606,7 @@ public sealed class VulkanDevice : IDisposable
                     requiredSubgroupSizeStages, hasExternalSemaphoreWin32, hasShaderInfoAmd,
                     hasPipelineExecutableProperties);
                 result.PhysicalDeviceIndex = IndexOfPhysicalDevice(instance, physical);
+                result.NumericFeatures = numeric;
                 instance = 0;
                 return result;
             }
@@ -1023,6 +1035,54 @@ public sealed class VulkanDevice : IDisposable
     /// required for correctness — the shader works on any driver exposing the
     /// feature; acceleration only affects throughput.
     /// </summary>
+    /// <summary>
+    /// Issue #374: queries the 16-bit storage (1.1 core), float16 / int8 and 8-bit storage (1.2 core) feature bits. A device below
+    /// the version a struct became core reports none of its bits (the extensions are not probed: every target is 1.2+).
+    /// </summary>
+    /// <param name="physical">The physical device.</param>
+    /// <param name="apiVersion">Its API version.</param>
+    /// <returns>The supported bits.</returns>
+    private static unsafe VulkanNumericFeatures ProbeNumericFeatures(nint physical, uint apiVersion)
+    {
+        bool v11 = VkApiMajor(apiVersion) > 1u || (VkApiMajor(apiVersion) == 1u && VkApiMinor(apiVersion) >= 1u);
+        bool v12 = VkApiMajor(apiVersion) > 1u || (VkApiMajor(apiVersion) == 1u && VkApiMinor(apiVersion) >= 2u);
+        if (!v11) return default;
+        try
+        {
+            VkPhysicalDevice16BitStorageFeatures s16 = default;
+            s16.sType = VkStructureType.PhysicalDevice16BitStorageFeatures;
+            VkPhysicalDeviceShaderFloat16Int8Features f16i8 = default;
+            f16i8.sType = VkStructureType.PhysicalDeviceShaderFloat16Int8Features;
+            VkPhysicalDevice8BitStorageFeatures s8 = default;
+            s8.sType = VkStructureType.PhysicalDevice8BitStorageFeatures;
+            if (v12)
+            {
+                s16.pNext = (nint)(&f16i8);
+                f16i8.pNext = (nint)(&s8);
+            }
+
+            VkPhysicalDeviceFeatures2 features2 = default;
+            features2.sType = VkStructureType.PhysicalDeviceFeatures2;
+            features2.pNext = (nint)(&s16);
+            VulkanApi.vkGetPhysicalDeviceFeatures2(physical, ref features2);
+
+            return new VulkanNumericFeatures(
+                StorageBuffer16BitAccess: s16.storageBuffer16BitAccess != 0,
+                UniformAndStorageBuffer16BitAccess: s16.uniformAndStorageBuffer16BitAccess != 0,
+                StoragePushConstant16: s16.storagePushConstant16 != 0,
+                ShaderFloat16: v12 && f16i8.shaderFloat16 != 0,
+                ShaderInt8: v12 && f16i8.shaderInt8 != 0,
+                StorageBuffer8BitAccess: v12 && s8.storageBuffer8BitAccess != 0,
+                UniformAndStorageBuffer8BitAccess: v12 && s8.uniformAndStorageBuffer8BitAccess != 0,
+                StoragePushConstant8: v12 && s8.storagePushConstant8 != 0);
+        }
+        catch
+        {
+            // Same defensive posture as the other probes: an unusable answer enables nothing.
+            return default;
+        }
+    }
+
     private static unsafe void ProbeIntegerDotProduct(
         nint physical, uint apiVersion, out bool hasIntegerDotProduct)
     {
@@ -1297,7 +1357,7 @@ public sealed class VulkanDevice : IDisposable
         nint physical, uint queueFamily,
         bool enableCoopmat, bool enableExternalMemoryHost, bool enableIntegerDotProduct,
         bool enableSubgroupSizeControl, bool enableExternalSemaphoreWin32, bool enableShaderInfoAmd,
-        bool enablePipelineExecutableProperties)
+        bool enablePipelineExecutableProperties, VulkanNumericFeatures numeric)
     {
         float priority = 1.0f;
 
@@ -1481,6 +1541,39 @@ public sealed class VulkanDevice : IDisposable
             pipeExecFeatures.pipelineExecutableInfo = 1; // VK_TRUE
             pipeExecFeatures.pNext = featureChain;
             featureChain = (nint)(&pipeExecFeatures);
+        }
+
+        // Issue #374: enable every supported 16-bit / 8-bit storage and float16 / int8 bit (core structs, no extension names).
+        VkPhysicalDevice16BitStorageFeatures s16 = default;
+        if (numeric.Any16BitStorage)
+        {
+            s16.sType = VkStructureType.PhysicalDevice16BitStorageFeatures;
+            s16.storageBuffer16BitAccess = numeric.StorageBuffer16BitAccess ? 1u : 0u;
+            s16.uniformAndStorageBuffer16BitAccess = numeric.UniformAndStorageBuffer16BitAccess ? 1u : 0u;
+            s16.storagePushConstant16 = numeric.StoragePushConstant16 ? 1u : 0u;
+            s16.pNext = featureChain;
+            featureChain = (nint)(&s16);
+        }
+
+        VkPhysicalDeviceShaderFloat16Int8Features f16i8 = default;
+        if (numeric.ShaderFloat16 || numeric.ShaderInt8)
+        {
+            f16i8.sType = VkStructureType.PhysicalDeviceShaderFloat16Int8Features;
+            f16i8.shaderFloat16 = numeric.ShaderFloat16 ? 1u : 0u;
+            f16i8.shaderInt8 = numeric.ShaderInt8 ? 1u : 0u;
+            f16i8.pNext = featureChain;
+            featureChain = (nint)(&f16i8);
+        }
+
+        VkPhysicalDevice8BitStorageFeatures s8 = default;
+        if (numeric.Any8BitStorage)
+        {
+            s8.sType = VkStructureType.PhysicalDevice8BitStorageFeatures;
+            s8.storageBuffer8BitAccess = numeric.StorageBuffer8BitAccess ? 1u : 0u;
+            s8.uniformAndStorageBuffer8BitAccess = numeric.UniformAndStorageBuffer8BitAccess ? 1u : 0u;
+            s8.storagePushConstant8 = numeric.StoragePushConstant8 ? 1u : 0u;
+            s8.pNext = featureChain;
+            featureChain = (nint)(&s8);
         }
 
         ci.pNext = featureChain;

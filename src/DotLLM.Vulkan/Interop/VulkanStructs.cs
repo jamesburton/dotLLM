@@ -55,6 +55,11 @@ internal static class VkStructureType
     // and the device-create enable. Drives the dp4a MMVQ decode path
     // (dotPacked4x8AccSatEXT / GL_EXT_integer_dot_product).
     internal const int PhysicalDeviceShaderIntegerDotProductFeatures = 1000280000;
+    // Issue #374: the numeric-type / narrow-storage feature structs (16-bit storage: 1.1 core; float16/int8 and 8-bit
+    // storage: 1.2 core). Probed and enabled at device creation because shaders declare the matching SPIR-V capabilities.
+    internal const int PhysicalDevice16BitStorageFeatures = 1000083000;
+    internal const int PhysicalDeviceShaderFloat16Int8Features = 1000082000;
+    internal const int PhysicalDevice8BitStorageFeatures = 1000177000;
     // VK_EXT_subgroup_size_control (promoted to Vulkan 1.3 core). The Properties
     // struct (chained off VkPhysicalDeviceProperties2) reports min/max subgroup
     // size and which shader stages accept a required size; the Features struct
@@ -756,6 +761,39 @@ internal struct VkPhysicalDeviceShaderIntegerDotProductFeatures
     internal int sType;
     internal nint pNext;
     internal uint shaderIntegerDotProduct; // VkBool32
+}
+
+// VkPhysicalDevice16BitStorageFeatures (Vulkan 1.1 core) - issue #374.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDevice16BitStorageFeatures
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint storageBuffer16BitAccess;           // VkBool32
+    internal uint uniformAndStorageBuffer16BitAccess; // VkBool32
+    internal uint storagePushConstant16;              // VkBool32
+    internal uint storageInputOutput16;               // VkBool32
+}
+
+// VkPhysicalDeviceShaderFloat16Int8Features (Vulkan 1.2 core) - issue #374.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDeviceShaderFloat16Int8Features
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint shaderFloat16; // VkBool32
+    internal uint shaderInt8;    // VkBool32
+}
+
+// VkPhysicalDevice8BitStorageFeatures (Vulkan 1.2 core) - issue #374.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDevice8BitStorageFeatures
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint storageBuffer8BitAccess;           // VkBool32
+    internal uint uniformAndStorageBuffer8BitAccess; // VkBool32
+    internal uint storagePushConstant8;              // VkBool32
 }
 
 // VkPhysicalDeviceSubgroupSizeControlProperties — VK_EXT_subgroup_size_control
