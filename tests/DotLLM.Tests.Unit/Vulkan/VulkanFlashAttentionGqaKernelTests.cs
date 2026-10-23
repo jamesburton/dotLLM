@@ -64,18 +64,27 @@ public sealed class VulkanFlashAttentionGqaKernelTests
         => RunParity(impl, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, qScale: 1f);
 
     /// <summary>
-    /// Large scores, as the QK-normed hd256 hybrids produce: a plain F16 Q.K^T fails here, the hi/lo Q split must hold the
-    /// cooperative-matrix tolerance.
+    /// The default configuration (#1148: Q lo-half term off) at Bonsai-like magnitudes, Q ±1 and K ±3, where the #1109 study measured
+    /// the split's term at 0.5–7e-3 and KL at the noise floor. The case fails with Q ±12 (see the split-on case below): that range is
+    /// 2–3x beyond any measured hd256 hybrid.
+    /// </summary>
+    [SkippableFact]
+    public void Prefill_DefaultNoSplit_MatchesCpuReference()
+        => RunParity(Impl.Coopmat, 61, 333, 24, 4, 256, 272, qScale: 1f, splitQ: null);
+
+    /// <summary>
+    /// Large scores beyond the measured range (Q ±12): a plain F16 Q.K^T misses the cooperative-matrix tolerance (max abs 1.3e-2),
+    /// the hi/lo Q split (<c>DOTLLM_VULKAN_FA_GQA_QLO=1</c>) must hold it. Guards the opt-in path.
     /// </summary>
     /// <param name="impl">The implementation.</param>
     [SkippableTheory]
     [InlineData(Impl.Scalar)]
     [InlineData(Impl.Coopmat)]
     public void Prefill_LargeScores_MatchesCpuReference(Impl impl)
-        => RunParity(impl, 61, 333, 24, 4, 256, 272, qScale: 12f);
+        => RunParity(impl, 61, 333, 24, 4, 256, 272, qScale: 12f, splitQ: true);
 
     private static void RunParity(
-        Impl impl, int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim, int positionOffset, float qScale)
+        Impl impl, int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim, int positionOffset, float qScale, bool? splitQ = null)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         var rng = new Random(441 + seqQ * 31 + seqKv * 17 + numHeads * 7 + headDim);
@@ -121,7 +130,7 @@ public sealed class VulkanFlashAttentionGqaKernelTests
         foreach (VulkanKvStorage storage in new[] { VulkanKvStorage.F32, VulkanKvStorage.F16 })
         {
             using var kernel = impl == Impl.Coopmat
-                ? VulkanFlashAttentionGqaKernel.TryCreateCoopmat(device, spvDir, storage)
+                ? VulkanFlashAttentionGqaKernel.TryCreateCoopmat(device, spvDir, storage, splitQ)
                 : VulkanFlashAttentionGqaKernel.TryCreateScalar(device, spvDir, storage);
             Skip.If(kernel is null, $"the {impl} GQA flash kernel is unavailable on {device.DeviceName}");
             Assert.Equal(impl == Impl.Coopmat, kernel!.IsCoopmat);

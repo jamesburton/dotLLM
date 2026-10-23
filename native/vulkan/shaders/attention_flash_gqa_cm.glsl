@@ -14,8 +14,10 @@
 //   - Flash-Attention-2 ownership: each subgroup owns its strip end to end. Q (hi and lo halves, see below) and the O accumulator
 //     live in registers as cooperative matrices; the online softmax runs on the strip's own lanes (shuffle reductions), so the only
 //     workgroup barriers are the four around the shared K and V tile stages.
-//   - QK^T keeps the hd256 kernel's HI/LO Q split (S = Qh.K + Ql.K, + Qh.Klo for F32 K), because a plain f16 QK^T measured
-//     NLL 2.272 -> 3.509 on the hd256 Qwen3.5 hybrids. With F16 K the K_lo term is exactly zero and is not computed.
+//   - QK^T can add the hd256 kernel's HI/LO Q split (S = Qh.K + Ql.K, + Qh.Klo for F32 K; QK_SPLIT_Q = 1), which that kernel
+//     kept after a plain f16 QK^T measured NLL 2.272 -> 3.509 on the hd256 Qwen3.5 hybrids. On this kernel the #1109 study
+//     could not reproduce that (KL at the F32 noise floor to 128k), so the split is off by default (#1148). With F16 K the
+//     K_lo term is exactly zero and is not computed.
 //   - The O rescale by the per-row correction is a component-wise multiply by a 16x16 matrix whose row r holds corr[r] (all
 //     accumulator fragments share one element layout), skipped when every row's correction is exactly 1.
 //
@@ -64,9 +66,9 @@
 #define NEG_INF         (-3.4e38)
 
 layout(constant_id = 0) const uint REQUIRE_INVARIANT_PV = 1u;
-// 1 (default): QK^T adds the Q lo-half term (see the header). 0 drops it: 1.6x faster at depth on Strix (6.1-6.3 vs 3.8 TFLOP/s),
-// but Q is then rounded to F16. Off only for a measured A/B (DOTLLM_VULKAN_FA_GQA_QLO=0) until perplexity parity is shown.
-layout(constant_id = 2) const uint QK_SPLIT_Q = 1u;
+// 0 (default, #1148): Q is rounded to F16 for QK^T; 1.67x faster at depth on Strix (6.6 vs 4.0 TFLOP/s) and KL at the F32 noise
+// floor to 128k on the RMS-normed hd256 hybrids. 1 adds the Q lo-half term (see the header): DOTLLM_VULKAN_FA_GQA_QLO=1.
+layout(constant_id = 2) const uint QK_SPLIT_Q = 0u;
 layout(local_size_x_id = 1, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std430) readonly  buffer BufQ   { float q[]; };      // [seq_q, num_heads * head_dim] F32
