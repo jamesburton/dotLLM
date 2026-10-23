@@ -510,6 +510,15 @@ public record ModelConfig
          + "(Q2_K / IQ1_M / IQ2_*) are not kept packed by the generic MoE path. Use --device cpu. "
          + "Tracked in https://github.com/jamesburton/dotLLM/issues/935 (CPU reference: #936).";
 
+    /// <summary>Actionable message for backends that cannot run <see cref="Architecture.Flint"/> yet.</summary>
+    /// <param name="backend">Backend name shown to the user.</param>
+    /// <returns>The refusal message.</returns>
+    public static string FlintUnsupportedMessage(string backend)
+        => $"The Flint architecture (GGUF 'flint', Recursive Flint) is not supported on the {backend} backend yet - only the CPU backend runs it: "
+         + "the GPU paths lack NoPE on the full-attention layers inside the MoE loop, a sliding-window KV ring, a quantised shared-expert "
+         + "path and, for the official file, Q4_1 MoE kernels. Use --device cpu. "
+         + "Tracked in https://github.com/jamesburton/dotLLM/issues/1157 (Vulkan F4, CUDA F6).";
+
     /// <summary>Actionable message for backends that cannot run <see cref="IsGemma4DensePle"/> models.</summary>
     public static string Gemma4DensePleUnsupportedMessage(string backend)
         => $"The Gemma-4 dense variant (E2B/E4B: per-layer embeddings, shared-KV layers, no MoE block) "

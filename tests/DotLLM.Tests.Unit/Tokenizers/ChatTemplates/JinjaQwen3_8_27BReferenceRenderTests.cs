@@ -1,5 +1,3 @@
-using System.Text.Json;
-using DotLLM.Tokenizers.ChatTemplates;
 using Xunit;
 
 namespace DotLLM.Tests.Unit.Tokenizers.ChatTemplates;
@@ -13,46 +11,12 @@ namespace DotLLM.Tests.Unit.Tokenizers.ChatTemplates;
 /// </summary>
 public class JinjaQwen3_8_27BReferenceRenderTests
 {
-    private static string Fixture(string name) =>
-        File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "Tokenizers", "ChatTemplates", "Fixtures", name));
+    private const string Template = "qwen3.8-27b-chat-template.jinja";
+    private const string Cases = "qwen3.8-27b-render-cases.json";
 
-    public static IEnumerable<object[]> CaseNames()
-    {
-        using var doc = JsonDocument.Parse(Fixture("qwen3.8-27b-render-cases.json"));
-        foreach (var c in doc.RootElement.EnumerateArray())
-            yield return [c.GetProperty("name").GetString()!];
-    }
+    public static IEnumerable<object[]> CaseNames() => ReferenceRenderCases.Names(Cases);
 
     [Theory]
     [MemberData(nameof(CaseNames))]
-    public void Render_MatchesReferenceJinja2(string caseName)
-    {
-        using var doc = JsonDocument.Parse(Fixture("qwen3.8-27b-render-cases.json"));
-        var c = doc.RootElement.EnumerateArray().Single(e => e.GetProperty("name").GetString() == caseName);
-
-        var ctx = (Dictionary<string, object?>)Convert(c.GetProperty("context"))!;
-        var ast = new JinjaParser(new JinjaLexer(Fixture("qwen3.8-27b-chat-template.jinja")).Tokenize()).Parse();
-        var evaluator = new JinjaEvaluator(ctx);
-
-        if (c.TryGetProperty("expectedError", out var err))
-        {
-            var ex = Assert.ThrowsAny<Exception>(() => evaluator.Evaluate(ast));
-            Assert.Contains(err.GetString()!, ex.Message, StringComparison.Ordinal);
-        }
-        else
-        {
-            Assert.Equal(c.GetProperty("expected").GetString(), evaluator.Evaluate(ast));
-        }
-    }
-
-    private static object? Convert(JsonElement e) => e.ValueKind switch
-    {
-        JsonValueKind.Object => e.EnumerateObject().ToDictionary(p => p.Name, p => Convert(p.Value)),
-        JsonValueKind.Array => e.EnumerateArray().Select(Convert).ToList(),
-        JsonValueKind.String => e.GetString(),
-        JsonValueKind.True => true,
-        JsonValueKind.False => false,
-        JsonValueKind.Number => e.TryGetInt64(out var l) ? l : e.GetDouble(),
-        _ => null,
-    };
+    public void Render_MatchesReferenceJinja2(string caseName) => ReferenceRenderCases.AssertMatches(Template, Cases, caseName);
 }

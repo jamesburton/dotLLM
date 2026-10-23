@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Configuration;
@@ -92,6 +93,7 @@ public static unsafe partial class MoeSwiGluMlp
         int u = uniqueCount;
         // Per-expert slot (token 0 -> top-k slot) and a batch==1 guard.
         Span<int> slots = stackalloc int[u];
+        Span<float> downScale = stackalloc float[u];
         for (int i = 0; i < u; i++)
         {
             int e = uniqueExperts[i];
@@ -145,6 +147,7 @@ public static unsafe partial class MoeSwiGluMlp
                     var up = new ReadOnlySpan<float>(upOut + i * inter, inter);
                     var o = new Span<float>(siluOut + i * inter, inter);
                     if (useGeGLU) FusedOps.GeGLUTanh(g, up, o); else FusedOps.SwiGLU(g, up, o);
+                    downScale[i] = RescaleDownInputForF16Sums(siluOut + i * inter, inter);
                     QuantizeBatchForWeightQt(downQt, siluOut + i * inter, siluQ + (long)i * downPre, inter, 1);
                 }
                 CpuStageProf.E(11, t0); t0 = CpuStageProf.T();
@@ -164,6 +167,14 @@ public static unsafe partial class MoeSwiGluMlp
                     SegWeights = segW, SegResults = segR, SegInput = segI, SegKind = kind,
                 };
                 pool.Dispatch((nint)(&ctxB), &DecodeN1Worker);
+                for (int i = 0; i < u; i++)
+                {
+                    if (downScale[i] != 1f)
+                    {
+                        var row = new Span<float>(scatterDownPtr + (long)slots[i] * hiddenSize, hiddenSize);
+                        TensorPrimitives.Multiply(row, downScale[i], row);
+                    }
+                }
                 CpuStageProf.E(12, t0);
             }
             Interlocked.Increment(ref _decodeN1Calls);

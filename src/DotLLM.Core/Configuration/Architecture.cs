@@ -465,6 +465,14 @@ public enum Architecture
     MiMoV2,
 
     /// <summary>
+    /// Recursive Flint (llama.cpp <c>flint</c>, HF <c>FlintForCausalLM</c>): a Qwen3-MoE-shaped trunk with learned per-head
+    /// attention sinks on every layer, a 3:1 sliding-window (513) / full-attention mix with NoPE on the full layers
+    /// (<see cref="DotLLM.Core.Models.ModelConfig.NoRopeLayers"/>), per-head QK-RMSNorm, two leading dense layers, then
+    /// sigmoid top-6-of-256 routing (renormalised, no selection bias) plus one ungated shared expert. See issues #1157 / #1158.
+    /// </summary>
+    Flint,
+
+    /// <summary>
     /// Gemma 4 MTP drafter model (llama.cpp GGUF arch <c>gemma4-assistant</c>). A
     /// standalone 4-layer mini-transformer (78M params for E4B, ~407M for larger
     /// variants) that drafts speculative tokens for the <see cref="Gemma4"/> trunk

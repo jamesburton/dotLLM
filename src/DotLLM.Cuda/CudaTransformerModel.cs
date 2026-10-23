@@ -3437,6 +3437,8 @@ public sealed unsafe class CudaTransformerModel : IModel
             throw new NotSupportedException(Qwen4ExpConfig.UnsupportedMessage("CUDA"));
         if (config.Architecture == Architecture.MiMoV2)
             throw new NotSupportedException(ModelConfig.MiMoV2UnsupportedMessage("CUDA"));
+        if (config.Architecture == Architecture.Flint)
+            throw new NotSupportedException(ModelConfig.FlintUnsupportedMessage("CUDA"));
         if (config.Architecture == Architecture.GraniteMoe)
             throw new NotSupportedException(
                 "Architecture GraniteMoe (Granite-3.x MoE, GGUF granitemoe) is not supported on the CUDA backend: the "

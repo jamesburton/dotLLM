@@ -129,6 +129,9 @@ public static class CudaModelLoader
             case Architecture.MiMoV2:
                 throw new NotSupportedException(ModelConfig.MiMoV2UnsupportedMessage("CUDA"));
 
+            case Architecture.Flint:
+                throw new NotSupportedException(ModelConfig.FlintUnsupportedMessage("CUDA"));
+
             // nemotron_h_moe (Nemotron 3.5 Bolt / Lightning, #403) runs on the same host: its MoE FFN layers keep every
             // expert resident in VRAM when the model fits, else stream them from a host store through a VRAM cache (#1070).
             case Architecture.NemotronH or Architecture.NemotronHMoe:

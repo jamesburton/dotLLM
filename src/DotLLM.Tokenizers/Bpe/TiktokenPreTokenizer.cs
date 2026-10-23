@@ -83,6 +83,24 @@ internal static class TiktokenPreTokenizer
         RegexOptions.Compiled),
     ];
 
+    // ── Recursive Flint (llama.cpp LLAMA_VOCAB_PRE_TYPE_FLINT) ──────
+    // Three stages, copied from llama-vocab.cpp (ggml-org/llama.cpp#30928): split digit runs into
+    // groups of up to three, then isolate CJK ideograph / kana runs, then a GPT-4o-style main
+    // expression (case-split letter runs with per-character contractions; the punctuation
+    // alternative is ` ?[\p{P}\p{S}]+[\r\n]*`, not GPT-4o's `[^\s\p{L}\p{N}]`).
+    // clean_spaces = false for this type, which is this pipeline's default.
+    // .NET regex matches UTF-16 code units, so an emoji (So) arrives as two surrogates (Cs) and fails \p{S};
+    // the symbol class therefore also takes \p{Cs}. shortcut: astral LETTERS (CJK Ext-B etc.) also land in the
+    // symbol run instead of a letter run; match per code point if a parity sweep shows one.
+    private static readonly Regex[] FlintPipeline =
+    [
+        new(@"\p{N}{1,3}", RegexOptions.Compiled),
+        new(@"[一-龥぀-ゟ゠-ヿ]+", RegexOptions.Compiled),
+        new(
+        @"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?| ?[\p{P}\p{S}\p{Cs}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+        RegexOptions.Compiled),
+    ];
+
     // ── Qwen 2 / Qwen 3 (llama.cpp LLAMA_VOCAB_PRE_TYPE_QWEN2) ──────
     // Byte-identical to the expression llama.cpp EXECUTES for the
     // STABLELM2 / QWEN2 / HUNYUAN / SOLAR_OPEN case block (llama-vocab.cpp,
@@ -168,6 +186,7 @@ internal static class TiktokenPreTokenizer
         "gpt-4o" or "llama4" => Gpt4oPipeline,
         "tekken" => TekkenPipeline,
         "glm4" or "glm5" or "chatglm-bpe" => ChatGlm4Pipeline,
+        "flint" => FlintPipeline,
         _ => Environment.GetEnvironmentVariable("DOTLLM_ALLOW_UNKNOWN_PRETOKENIZER") == "1"
             ? Gpt2Pipeline
             : throw new InvalidDataException(
