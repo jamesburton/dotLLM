@@ -209,7 +209,7 @@ public sealed class FlintVulkanParityTests
     public void Prefill_DownInputBeyondF16Range_StaysFiniteAndMatchesCpu()
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
-        using var fx = new Fixture(Q41(window: 4) with { ExpertGateUpScale = 60f });
+        using var fx = new Fixture(Q41(window: 4) with { ExpertGateUpScale = 200f });
         int[] ids = Ids(16);
         float[] cpu = fx.CpuPrefill(ids);
         Assert.All(cpu, v => Assert.True(float.IsFinite(v)));
