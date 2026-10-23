@@ -1,0 +1,125 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// MoE INDEXED MXFP4 MMVQ decode GEMV (gpt-oss): integer-dot (dp4a) matrix-vector multiply over a packed MXFP4 expert bank.
+//
+//   y[n, m] = sum_k dequant_mxfp4(bank[indices[n], m, k]) * x[n / xDiv, k]  (+ bias[indices[n], m])
+//
+// The decode-sized sibling of moe_indexed_matmul_mxfp4_f32.comp (one thread per cell, 16x16 workgroups, F32 activations: ~60 GB/s on
+// gpt-oss decode). Same weight layout - [numExperts, M, K] row-major, 17-byte blocks of 32 elements: 1 byte E8M0 scale, then 16 bytes
+// of packed nibbles (low nibble -> element j, high nibble -> element j + 16), value = kvalues[nibble] * e8m0_to_fp32_half(e) with
+// kvalues = {0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12} - but one wave32 subgroup per output cell and the activation row pre-quantized
+// to Q8_1 (quantize_q8_1_rows.comp): lane L owns blocks L, L+32, ... of the row, so a subgroup reads one contiguous run of
+// 32 * 17 bytes per iteration, and every weight block is a handful of dp4a. The activation scale xds.x multiplies the block sum; the
+// Q8_1 min term xds.y is unused (MXFP4 has no zero point).
+//
+// Lookup without a table: each nibble byte b (0..15) is split into sign (bit 3) and 3-bit magnitude index k; |kvalue| = k for k < 4 and
+// 4 + 2j + 2*(j == 3) for k >= 4 (j = k & 3), computed on four bytes at once (SWAR). The sign is applied by routing the magnitudes into
+// a positive and a negative dp4a against the same activations (all magnitudes fit int8: <= 12).
+//
+// xDiv lets decode broadcast one quantized activation row to its topK expert slots (activation row = n / xDiv). The optional per-expert
+// bias (gpt-oss ffn_{gate,up,down}_exps.bias, [numExperts, M]) is added in the epilogue (hasBias != 0), replacing a separate dispatch.
+//
+// NOT bit-exact vs moe_indexed_matmul_mxfp4_f32.comp (the activation is int8-quantized).
+//
+// Dispatch: gl_WorkGroupID.x = m, gl_WorkGroupID.y = n; one wave32 subgroup per output cell.
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufBank { uint  bank[]; };    // MXFP4 blob [numExperts, M, K/32 * 17 bytes]
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq   { uint  xq[]; };      // [(N/xDiv) * K/4] packed int8 activations
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds  { vec2  xds[]; };     // [(N/xDiv) * K/32] (d_x, s)
+layout(set = 0, binding = 3, std430) readonly  buffer BufIdx  { int   indices[]; }; // [N]
+layout(set = 0, binding = 4, std430) writeonly buffer BufY    { float y[]; };       // [N * M]
+layout(set = 0, binding = 5, std430) readonly  buffer BufBias { float bias[]; };    // [numExperts * M] (bound but unread when hasBias == 0)
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // output dim   (per-expert weight row count)
+    uint K;             // input dim    (multiple of 32)
+    uint N;             // total rows   (typically seqLen * topK)
+    uint numExperts;    // bank's first axis size - bounds-check only
+    uint blocksPerRow;  // = K / 32
+    uint xDiv;          // activation row = n / xDiv
+    uint hasBias;       // 1 = add bias[expert * M + m]
+} pc;
+
+float e8m0Half(uint e) {
+    uint bits = (e < 2u) ? (0x00200000u << e) : ((e - 1u) << 23);
+    return uintBitsToFloat(bits);
+}
+
+// Dot of four packed nibbles (one per byte, 0..15) against four packed int8 activations, through the kvalues table.
+int nibbleDot(uint nib, uint xv) {
+    uint j  = nib & 0x03030303u;                    // k & 3
+    uint hi = (nib >> 2u) & 0x01010101u;            // k >= 4
+    uint j3 = (j & (j >> 1u)) & 0x01010101u;        // j == 3
+    uint t  = 0x04040404u + j + (j3 << 1u);         // 4 + j + 2*(j == 3): bytes <= 9, no carry
+    uint mag = j + (t & (hi * 0xFFu));              // |kvalue|, 0..12 per byte
+    uint sm  = ((nib >> 3u) & 0x01010101u) * 0xFFu; // 0xFF on bytes whose nibble has the sign bit
+    int pos = dotPacked4x8AccSatEXT(int(mag & ~sm), int(xv), 0);
+    int neg = dotPacked4x8AccSatEXT(int(mag & sm),  int(xv), 0);
+    return pos - neg;
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    uint n = gl_WorkGroupID.y;
+    if (m >= pc.M || n >= pc.N) return;
+
+    uint expert = uint(indices[n]);
+    if (expert >= pc.numExperts) return; // defensive: bad index leaves y untouched
+
+    uint xRow = n / pc.xDiv;
+    uint xqRowBase  = xRow * (pc.K >> 2u);
+    uint xdsRowBase = xRow * (pc.K >> 5u);
+
+    uint lane = gl_LocalInvocationID.x;
+    uint rowByteBase = (expert * pc.M + m) * pc.blocksPerRow * 17u;
+
+    float acc = 0.0;
+    for (uint b = lane; b < pc.blocksPerRow; b += 32u) {
+        // A 17-byte block starts at an arbitrary byte offset: load the 5 dwords that cover it (bytes 0..16 end in dword wi+4 for every
+        // alignment) and realign with a funnel shift.
+        uint off = rowByteBase + b * 17u;
+        uint wi = off >> 2u;
+        uint sh = (off & 3u) * 8u;
+        uint w0 = bank[wi], w1 = bank[wi + 1u], w2 = bank[wi + 2u], w3 = bank[wi + 3u], w4 = bank[wi + 4u];
+        uint c0, c1, c2, c3, c4;
+        if (sh == 0u) {
+            c0 = w0; c1 = w1; c2 = w2; c3 = w3; c4 = w4;
+        } else {
+            uint rs = 32u - sh;
+            c0 = (w0 >> sh) | (w1 << rs);
+            c1 = (w1 >> sh) | (w2 << rs);
+            c2 = (w2 >> sh) | (w3 << rs);
+            c3 = (w3 >> sh) | (w4 << rs);
+            c4 = w4 >> sh;   // only block byte 16 is used; it lives in w4
+        }
+        float dW = e8m0Half(c0 & 0xFFu);
+        // Nibble bytes are block bytes 1..16 (byte 0 is the scale).
+        uint q0 = (c0 >> 8u) | (c1 << 24u);   // bytes 1..4   -> elements 0..3  (low), 16..19 (high)
+        uint q1 = (c1 >> 8u) | (c2 << 24u);   // bytes 5..8   -> elements 4..7  (low), 20..23 (high)
+        uint q2 = (c2 >> 8u) | (c3 << 24u);   // bytes 9..12  -> elements 8..11 (low), 24..27 (high)
+        uint q3 = (c3 >> 8u) | (c4 << 24u);   // bytes 13..16 -> elements 12..15 (low), 28..31 (high)
+
+        uint xb = xqRowBase + b * 8u;
+        int sumi = nibbleDot(q0 & 0x0F0F0F0Fu, xq[xb])
+                 + nibbleDot(q1 & 0x0F0F0F0Fu, xq[xb + 1u])
+                 + nibbleDot(q2 & 0x0F0F0F0Fu, xq[xb + 2u])
+                 + nibbleDot(q3 & 0x0F0F0F0Fu, xq[xb + 3u])
+                 + nibbleDot((q0 >> 4u) & 0x0F0F0F0Fu, xq[xb + 4u])
+                 + nibbleDot((q1 >> 4u) & 0x0F0F0F0Fu, xq[xb + 5u])
+                 + nibbleDot((q2 >> 4u) & 0x0F0F0F0Fu, xq[xb + 6u])
+                 + nibbleDot((q3 >> 4u) & 0x0F0F0F0Fu, xq[xb + 7u]);
+
+        acc += (dW * xds[xdsRowBase + b].x) * float(sumi);
+    }
+
+    // The subgroup IS the row: one reduction yields y[n, m] (no shared mem, no barrier).
+    float total = subgroupAdd(acc);
+    if (subgroupElect()) {
+        if (pc.hasBias != 0u) total += bias[expert * pc.M + m];
+        y[n * pc.M + m] = total;
+    }
+}

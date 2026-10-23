@@ -1,0 +1,63 @@
+#version 450
+// Fused causal depthwise conv + SiLU for the Gated-DeltaNet prefill (issue #695).
+//
+// The GDN token-mixing path used to (1) copy [conv_state | qkv] into one contiguous ConvInput buffer (a full read+write of the
+// [seqLen, convDim] activations), (2) run a one-thread-per-cell conv that re-reads each input row d_conv times, and (3) run a separate
+// in-place SiLU pass: three memory passes over a 67 MB tensor at 2048 tokens (~59 ms of a 1.6 s Qwen3.6-35B-A3B prefill, all at the
+// bandwidth roofline). This kernel reads the cached conv state and the qkv rows directly (no concatenation), slides a register window along
+// time so each input element is loaded once, applies SiLU, and writes the result - one pass. Per-cell math is identical to
+// conv1d_causal_f32.comp followed by silu_inplace_f32.comp (same tap order, same SiLU expression), so the result is bit-identical.
+//
+//   y[t, c] = silu(bias[c] + sum_{k=0..d_conv-1} x[t + k - (d_conv-1), c] * weight[c*d_conv + k]),
+//   x[j, c] = state[(j + d_conv-1) * channels + c] for j < 0, qkv[j * channels + c] otherwise.
+//
+// The caller updates the conv state afterwards (last d_conv-1 rows of [state | qkv]) AFTER this kernel (it reads the old state).
+// Dispatch: groupCount = (ceil(channels / 256), ceil(seqLen / TT)). d_conv <= 8.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufState  { float state[];  }; // [(d_conv-1) * channels]
+layout(set = 0, binding = 1, std430) readonly  buffer BufQkv    { float qkv[];    }; // [seqLen * channels]
+layout(set = 0, binding = 2, std430) readonly  buffer BufWeight { float weight[]; }; // [d_conv * channels] channel-major
+layout(set = 0, binding = 3, std430) readonly  buffer BufBias   { float bias[];   }; // [channels]
+layout(set = 0, binding = 4, std430) writeonly buffer BufOut    { float outp[];   }; // [seqLen * channels]
+
+layout(push_constant) uniform PushConstants {
+    uint dConv;
+    uint channels;
+    uint seqLen;
+} pc;
+
+const uint TT = 16u;   // output timesteps per thread
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.channels) return;
+    uint t0 = gl_WorkGroupID.y * TT;
+    if (t0 >= pc.seqLen) return;
+    uint tEnd = min(t0 + TT, pc.seqLen);
+    uint taps = pc.dConv;
+
+    float w[8];
+    for (uint k = 0u; k < taps; k++) w[k] = weight[c * taps + k];
+    float b = bias[c];
+
+    // Sliding window of the d_conv - 1 inputs preceding t0.
+    float win[7];
+    for (uint k = 0u; k + 1u < taps; k++) {
+        // input row t0 + k - (d_conv - 1)
+        int j = int(t0) + int(k) - int(taps - 1u);
+        win[k] = j < 0 ? state[uint(j + int(taps - 1u)) * pc.channels + c] : qkv[uint(j) * pc.channels + c];
+    }
+
+    for (uint t = t0; t < tEnd; t++) {
+        float cur = qkv[t * pc.channels + c];
+        float acc = b;
+        for (uint k = 0u; k + 1u < taps; k++) acc += win[k] * w[k];
+        acc += cur * w[taps - 1u];
+        float sig = 1.0 / (1.0 + exp(-acc));
+        outp[t * pc.channels + c] = acc * sig;
+        for (uint k = 0u; k + 2u < taps; k++) win[k] = win[k + 1u];
+        win[taps - 2u] = cur;
+    }
+}

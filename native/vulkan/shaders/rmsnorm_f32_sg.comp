@@ -1,0 +1,96 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Subgroup-arithmetic variant of rmsnorm_f32.comp.
+//
+// Algorithm is byte-for-byte the same as the shared-memory reference
+// (sum-of-squares -> mean -> rsqrt(mean + eps) -> scale-and-write), but the
+// per-workgroup reduction is replaced by:
+//   1. subgroupAdd  across each subgroup (no barrier)
+//   2. subgroup-0 writes its per-subgroup partial to a tiny shared slot
+//   3. ONE barrier
+//   4. subgroup 0 does a second subgroupAdd across the partials
+//   5. broadcast result via shared slot (one more barrier)
+//
+// Barrier count: 2 total vs. log2(256)+1 = 9 in the shared-memory path.
+// This is the ~4x barrier saving flagged in the wave-2 handoff.
+//
+// Dispatch / bindings / push constants / output semantics match rmsnorm_f32.
+//
+// Subgroup size is driver-defined (32 on NVIDIA/Intel, 64 on AMD RDNA).
+// The code is agnostic: gl_NumSubgroups tells us how many partials we have
+// and only subgroup 0 reads them.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufIn     { float input_[]; };   // [rowCount * n]
+layout(set = 0, binding = 1, std430) readonly  buffer BufWeight { float weight[]; };   // [n]
+layout(set = 0, binding = 2, std430) writeonly buffer BufOut    { float output_[]; };  // [rowCount * n]
+
+layout(push_constant) uniform PushConstants {
+    uint  n;    // row length
+    float eps;  // epsilon added under the sqrt
+} pc;
+
+// Max subgroups per workgroup at WG=256:
+//   subgroupSize=4   -> 64 partials
+//   subgroupSize=32  -> 8  partials
+//   subgroupSize=64  -> 4  partials
+// 64 slots covers every sane configuration and costs 256 bytes of shared mem.
+shared float partials[64];
+
+// Single slot used to broadcast the final rinv from subgroup 0 lane 0 to every
+// invocation. Sized to one float = 4 bytes.
+shared float rinvBroadcast;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+    uint rowBase = row * pc.n;
+
+    // 1. Per-thread partial sum of squares.
+    float sumSq = 0.0;
+    for (uint i = tid; i < pc.n; i += threads) {
+        float v = input_[rowBase + i];
+        sumSq += v * v;
+    }
+
+    // 2. Subgroup-scoped reduction: every lane in a subgroup ends up holding
+    //    the subgroup's total. No barrier required — subgroups execute in
+    //    lockstep on every modern GPU.
+    float subgroupSum = subgroupAdd(sumSq);
+
+    // 3. Lane 0 of each subgroup publishes the partial.
+    if (subgroupElect()) {
+        partials[gl_SubgroupID] = subgroupSum;
+    }
+    barrier();
+
+    // 4. Subgroup 0 loads the partials and reduces them. Any thread outside
+    //    the partial range contributes 0 so the cross-subgroup subgroupAdd
+    //    still produces the correct total.
+    //
+    //    We intentionally use subgroupAdd again (not a scalar loop on lane 0):
+    //    on RDNA3 the 4 partials reduce in a single SALU instruction sequence,
+    //    and on NVIDIA's 8-lane case it's a single shuffle-tree.
+    float totalSumSq = 0.0;
+    if (gl_SubgroupID == 0u) {
+        float x = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                ? partials[gl_SubgroupInvocationID]
+                : 0.0;
+        float reduced = subgroupAdd(x);
+        if (subgroupElect()) {
+            float meanSq = reduced / float(pc.n);
+            rinvBroadcast = inversesqrt(meanSq + pc.eps);
+        }
+    }
+    barrier();
+    float rinv = rinvBroadcast;
+
+    // 5. Scale and write out — same as the reference shader.
+    for (uint i = tid; i < pc.n; i += threads) {
+        output_[rowBase + i] = input_[rowBase + i] * rinv * weight[i];
+    }
+}
