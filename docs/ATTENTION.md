@@ -320,8 +320,8 @@ scalar; bodies in the matching `.glsl`):
   partials are summed with a 3-step shuffle-xor butterfly (every lane of the row ends with the bit-identical score); K/V tiles
   are staged as F32 in LDS (converted once per element, not per reading lane). Two barriers per tile, 32 KiB LDS.
 - **Numerics.** F32 accumulation for QK^T and P·V, F32 running max / sum / correction (the precision rules). Coopmat P is
-  F16 and the denominator sums the same F16-rounded P. QK^T keeps the hd256 kernel's Q hi/lo split (specialization constant 2,
-  `DOTLLM_VULKAN_FA_GQA_QLO=0` drops it — see the A/B below). The #533 rule carries over: a tile that is partial or holds a
+  F16 and the denominator sums the same F16-rounded P. QK^T rounds Q to F16 by default (#1148); the hd256 kernel's Q hi/lo
+  split is specialization constant 2, `DOTLLM_VULKAN_FA_GQA_QLO=1` restores it — see the A/B below. The #533 rule carries over: a tile that is partial or holds a
   masked cell for any row of the workgroup takes a `precise` scalar P·V on AMD.
 - **KV read in place.** F16 rows are read as packed words (`uvec2`, no 16-bit storage-buffer feature) and converted in the tile
   load; F32 rows split K and V into hi/lo halves so the F32 baseline is not rounded to F16. A q8_0 cache is one more tile-load
@@ -341,7 +341,7 @@ where an arm would exceed ~0.8 s):
 |---|---|---:|---:|---:|---:|
 | Strix (8060S) | old coopmat hd256 | 1.24 | 1.14 | 1.10 | 1.11 |
 | Strix | **GQA coopmat** | **3.99** | **3.92** | **3.90** | **3.92** |
-| Strix | GQA coopmat, Q-lo off (A/B only) | 6.32 | – | – | 6.06 |
+| Strix | **GQA coopmat, Q-lo off (default since #1148)** | **6.32** | – | – | **6.06** |
 | Strix | old scalar br4 | 0.60 | 0.51 | 0.50 | 0.68 |
 | Strix | GQA scalar | 1.89 | 1.80 | 1.72 | 1.77 |
 | Arc (Meteor Lake) | old scalar br4 | 0.06 | 0.06 | 0.06 | 0.06 |
@@ -355,13 +355,22 @@ where an arm would exceed ~0.8 s):
 | Tev1-4B IQ4_NL | 20 × 1024 | 9.4546 (2.246506) | 9.4546 (2.246500) | 9.4546 (2.246498) |
 
 Perplexity cannot see the split on either hd256 model (the Tev1 NLL 2.272 → 3.509 that motivated it does not reproduce on this
-kernel). But without it the kernel misses the coopmat tolerance on large scores (`Prefill_LargeScores_MatchesCpuReference`:
-max abs 1.3e-2 against 1e-3), so it **stays on by default**; `DOTLLM_VULKAN_FA_GQA_QLO=0` (1.6× attention) is an opt-in pending
-the user's call. (Tev1 at 4096-token windows lost the device on every arm, the old kernel included: a cacheless 4096-row
-forward is not row-sliced by the submit budget.)
+kernel). (Tev1 at 4096-token windows lost the device on every arm, the old kernel included: a cacheless 4096-row forward is not
+row-sliced by the submit budget.)
 
-TFLOP/s is still a third of the dense projections; the remaining limit is the QK^T MMA count (the split doubles it) and the
-B-fragment reload per MMA pair. Next levers: retire the split where measured safe, and a 128-row workgroup once LDS allows.
+**The split is off by default since #1148.** The #1109 precision study (`.docs/precision/vulkan/RESULTS.md` §1, Bonsai-2 27B
+PQ2_0, F16 KV, 2k–128k) scored all 512 rows of 32 shared-prefix forwards against the split-on kernel: KL median ≤ 1.5e-7, max
+≤ 4.7e-6 (the F32 repeat's own noise floor is 1.0e-7), no row above 1e-3, top-1 100%, PPL within ±0.005%, and the 1k prefill
+tile at 128k depth 1.46× faster (kernel level 1.67×, 4.0 → 6.6 TFLOP/s). Score statistics over the whole 128k prefill (50 M
+rows, `DOTLLM_VK_EXP_FA_ACC=stats`) put max |s| at 30.9–32.6 and the term the split adds at 0.5–2e-3 (6.8e-3 worst); Tev1-4B
+matches (max |s| ≤ 28). The unit case where a plain F16 Q·Kᵀ misses the coopmat tolerance (`Prefill_LargeScores_MatchesCpuReference`,
+Q ±12: per-row max |s| ≈ 37, split term 7.8e-3 median) is 2–3× beyond either model and now guards the opt-in split
+(`DOTLLM_VULKAN_FA_GQA_QLO=1`); `Prefill_DefaultNoSplit_MatchesCpuReference` pins the default at Bonsai magnitudes. The decision
+rests on RMS-normed q/k: re-run the stats variant before relying on it for a model without q/k norm. F16 S accumulation was
+rejected (5–9% over split-off, with a KL tail of 5.8e-2 at 64k).
+
+TFLOP/s is still a third of the dense projections; the remaining limit is the QK^T MMA count and the B-fragment reload per MMA
+pair. Next lever: a 128-row workgroup once LDS allows.
 
 **End-to-end** (Strix, Bonsai 2 PQ2_0, F16 KV, `--no-mtp`, GDN scan default variant):
 

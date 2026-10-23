@@ -39,8 +39,10 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
     public const string ForceScalarEnvVar = "DOTLLM_VULKAN_FA_GQA_SCALAR";
 
     /// <summary>
-    /// Environment variable: <c>0</c> drops the cooperative-matrix QK^T's Q lo-half term (Q rounded to F16). Measured 1.6x faster at
-    /// depth on Strix; an accuracy A/B knob until Bonsai perplexity parity is shown, so the default keeps the split.
+    /// Environment variable: <c>1</c> restores the cooperative-matrix QK^T's Q lo-half term (#1148). Off by default: Q is rounded to
+    /// F16, attention is 1.67x faster at depth on Strix, and the #1109 study measured KL at the F32 noise floor to 128k on Bonsai-2.
+    /// That rests on RMS-normed q/k (max |s| ≈ 33 over a 128k prefill); re-run <c>DOTLLM_VK_EXP_FA_ACC=stats</c> before relying on
+    /// it for a model without q/k norm.
     /// </summary>
     public const string SplitQEnvVar = "DOTLLM_VULKAN_FA_GQA_QLO";
 
@@ -122,8 +124,10 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
     /// <param name="device">The device.</param>
     /// <param name="spvDir">Directory holding the SPIR-V blobs.</param>
     /// <param name="kvStorage">The KV element format to read.</param>
+    /// <param name="splitQ">Whether QK^T adds the Q lo-half term; null reads <see cref="SplitQEnvVar"/> (off unless <c>1</c>).</param>
     /// <returns>The kernel, or null.</returns>
-    internal static VulkanFlashAttentionGqaKernel? TryCreateCoopmat(VulkanDevice device, string spvDir, VulkanKvStorage kvStorage)
+    internal static VulkanFlashAttentionGqaKernel? TryCreateCoopmat(
+        VulkanDevice device, string spvDir, VulkanKvStorage kvStorage, bool? splitQ = null)
     {
         if (!VulkanFlashAttentionCoopmatKernel.SupportsDevice(device)) return null;
 
@@ -139,8 +143,8 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
         }
 
         uint gate = VulkanFlashAttentionCoopmatKernel.RequiresInvariantPv(device.VendorId);
-        uint splitQ = Environment.GetEnvironmentVariable(SplitQEnvVar) == "0" ? 0u : 1u;
-        ReadOnlySpan<uint> spec = [gate, 4 * sg, splitQ];
+        bool split = splitQ ?? Environment.GetEnvironmentVariable(SplitQEnvVar) == "1";
+        ReadOnlySpan<uint> spec = [gate, 4 * sg, split ? 1u : 0u];
         return TryBuild(device, spvDir, kvStorage.ShaderName(CoopmatShader), pin, spec, isCoopmat: true, kvStorage);
     }
 
