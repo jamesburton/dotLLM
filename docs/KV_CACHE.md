@@ -262,19 +262,24 @@ only plans (`TryPlan` / `Commit`); each backend carries out the move.
   `STEPS_FULLKV=1` for `steps`). Gemma-2/3/4, gpt-oss and Mistral-SWA stay on full rows: they also reach the fused RoPE+KV write,
   the batched forward or Gemma-4 shared-KV donors, which address rows by absolute position. A pipeline stage keeps full rows.
 - **Compaction on the device.** `RecordUpdate` records the move into the forward's command buffer before the F16 write. When the
-  kept rows do not overlap their destination (every decode compaction: shift = keep) it is one `vkCmdCopyBuffer` per K / V;
-  otherwise (a prefill chunk crossing the end of the ring) the rows stage through a cache-owned scratch of `W - 1 + 64` rows for
+  kept rows do not overlap their destination (every decode compaction on the default ring) it is one `vkCmdCopyBuffer` per K / V;
+  otherwise (a prefill chunk crossing the end of the ring) the rows stage through a cache-owned scratch sized for the largest compaction, for
   K and V, since `vkCmdCopyBuffer` forbids overlapping regions. Barriers come from the hazard tracker, or a blanket
   compute/transfer barrier on the untracked path. No host round trip.
 - **Oversized chunks grow the ring before recording.** A chunk longer than the ring's free half needs a bigger buffer. Growing
   swaps buffer handles, so `Forward` calls `EnsureWindowCapacity(positions)` before it records and drops the kernels' cached
   descriptor sets when anything grew (as on a scratch resize); the kept rows move with a one-off device copy. The ring is
   grow-only on Vulkan (shrinking would invalidate descriptors again), so it settles at `W - 1 + 64 + chunk` rows.
+- **Bit-identical by alignment.** The sink prefill kernel tiles the KV range in 256-row tiles from row 0, so an arbitrary base
+  changes where a window crosses a tile boundary and the online-softmax rounding with it (measured ~1e-2 on synthetic logits).
+  Vulkan therefore keeps every base a multiple of 256 (`SlidingWindowRows(..., baseAlignment: 256)`): a compaction keeps
+  `W - 1 + 64` to `W - 1 + 64 + 255` rows and the default ring is `2 * (W - 1 + 64) + 255` rows (1,407 for Flint). The decode
+  and small-row kernels split relative to the window start and are shift-invariant anyway.
 - **Attention.** The forward passes `positions[0] - base` / `CurrentLength - base`; the sink, split-KV and small-row kernels are
   unchanged. The fused RoPE+KV write and the host-staged paths (`IngestFromHost`, `DownloadLayer`) refuse a compact cache.
 - **Rollback / truncation** behave as on the CPU (`CanTruncateTo`, `Rollback`, `SetCurrentLength`, `Reset`).
-- **Bytes** (Flint, F16, 2 KiB per token per layer): 4K 392 → 191 MiB, 32K 3.06 → 0.95 GiB, 262K 24.5 → 7.08 GiB (14 full
-  layers + 35 rings of 1,152 rows).
+- **Bytes** (Flint, F16, 2 KiB per token per layer; 14 full layers + 35 rings of 1,407 rows): 4K 392 → 208 MiB,
+  32K 3.06 → 0.97 GiB, 262K 24.5 → 7.09 GiB.
 - Tests: `FlintVulkanCompactKvTests` (synthetic Flint, window 20: an overlapping in-ring compaction, a grown ring and direct decode
   compactions against the full-length F16 cache and the CPU compact cache; rollback within / past the margin; reset and reuse).
 
