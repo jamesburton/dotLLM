@@ -48,7 +48,7 @@ vec4 unpackS8(uint u) {
 shared float partials[NR * NC][WG_SIZE];
 
 void main() {
-    uint m0 = gl_WorkGroupID.x * NR;
+    uint m0 = (gl_WorkGroupID.y * 32768u + gl_WorkGroupID.x) * NR;   // y folds dispatches wider than 32768 groups (GemvColumns)
     if (m0 >= pc.M) return;
 
     uint lane = gl_LocalInvocationID.x;

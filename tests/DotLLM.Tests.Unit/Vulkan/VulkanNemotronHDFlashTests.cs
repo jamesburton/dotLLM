@@ -5,6 +5,7 @@ using DotLLM.Core.Tensors;
 using DotLLM.Models.Gguf;
 using DotLLM.Tests.Unit.Models;
 using DotLLM.Vulkan;
+using DotLLM.Vulkan.Kernels;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -78,12 +79,17 @@ public sealed class VulkanNemotronHDFlashTests : IDisposable
         using (model.Forward(prompt, P(0, prompt.Length), -1, kv)) { }
         float[] batched;
         VulkanNemotronHTransformerModel.RowExactEnabled = rowExact;
+        long exactBefore = Interlocked.Read(ref MatMulExactGemvMultiKernel.Dispatches);
         try
         {
             using var l = model.Forward(rows, P(prompt.Length, rows.Length), -1, kv);
             batched = Rows(l, rows.Length, vocab);
         }
         finally { VulkanNemotronHTransformerModel.RowExactEnabled = true; }
+        long exactDispatches = Interlocked.Read(ref MatMulExactGemvMultiKernel.Dispatches) - exactBefore;
+
+        // #1244: the verify's NVFP4 / IQ2_XXS / Q8_0 projections take the multi-column GEMVs (not the #1237 per-column ones).
+        Assert.True(rowExact == exactDispatches > 0, $"multi-column GEMV dispatches in the 8-row forward: {exactDispatches}");
 
         model.ResetSequenceState();
         kv.Rollback(0);
@@ -185,4 +191,14 @@ internal sealed class RowExactOffScope : IDisposable
     public RowExactOffScope() => VulkanNemotronHTransformerModel.RowExactEnabled = false;
 
     public void Dispose() => VulkanNemotronHTransformerModel.RowExactEnabled = true;
+}
+
+/// <summary>Turns the #1244 multi-column GEMVs on or off for the models a test builds (read at model creation).</summary>
+internal sealed class ExactGemvScope : IDisposable
+{
+    private readonly bool _was = VulkanNemotronHTransformerModel.ExactGemvEnabled;
+
+    public ExactGemvScope(bool enabled) => VulkanNemotronHTransformerModel.ExactGemvEnabled = enabled;
+
+    public void Dispose() => VulkanNemotronHTransformerModel.ExactGemvEnabled = _was;
 }

@@ -646,6 +646,7 @@ public sealed partial class VulkanNemotronHTransformerModel : IModel
                 created._embedGather = EmbedGatherF32Kernel.Create(device, spvDir, weights.TokenEmbeddingQuantType);
             created._matmulNvfp4 = MatMulNvfp4F32Kernel.Create(device, spvDir);
             created._matmulNvfp4Coopmat = MatMulNvfp4GemmCoopmatKernel.TryCreate(device, spvDir);
+            created.CreateExactGemvKernels(device, spvDir);
             if (!VulkanTransformerModel.IsFlashAttentionDisabled() && !VulkanTransformerModel.IsCoopmatAttentionDisabled()
                 && config.HeadDim <= VulkanFlashAttentionCoopmatKernel.WideMaxHeadDim
                 && VulkanFlashAttentionCoopmatKernel.TryCreate(device, spvDir) is { } fac)
@@ -2272,6 +2273,9 @@ public sealed partial class VulkanNemotronHTransformerModel : IModel
         _matmulIq4Nl.InvalidateDescriptorCache();
         _matmulIq4NlGemm.InvalidateDescriptorCache();
         _matmulNvfp4?.InvalidateDescriptorCache();
+        _exactQ8?.InvalidateDescriptorCache();
+        _exactNvfp4?.InvalidateDescriptorCache();
+        _exactIq2Xxs?.InvalidateDescriptorCache();
         _matmulNvfp4Coopmat?.InvalidateDescriptorCache();
         _flashAttentionCoopmat?.InvalidateDescriptorCache();
         _matmulIq2XxsCoopmat?.InvalidateDescriptorCache();
@@ -2376,6 +2380,11 @@ public sealed partial class VulkanNemotronHTransformerModel : IModel
         VulkanDevice.Buffer input, VulkanDevice.Buffer output,
         int outputDim, int inputDim, int seqLen, float scale = 1.0f)
     {
+        // #1244: decode and every small batch of an NVFP4 / IQ2_XXS / Q8_0 projection share one deterministic multi-column GEMV that
+        // decodes each weight block once for all rows; each row is bit-identical to a decode step.
+        if (seqLen <= RowExactMaxTokens && (seqLen == 1 || RowExactEnabled)
+            && TryRecordExactGemv(cmdBuf, weights, weightQt, input, output, outputDim, inputDim, seqLen, scale))
+            return;
         // #1237: a small batch (a speculative verify, its replay, a short prompt) runs the decode GEMV over its rows, so each row is
         // bit-identical to a decode step while every weight row is still read once.
         if (seqLen > 1 && seqLen <= RowExactMaxTokens && RowExactEnabled
@@ -2745,6 +2754,9 @@ public sealed partial class VulkanNemotronHTransformerModel : IModel
         _matmulIq4NlGemm.Dispose();
         _matmulIq4Nl.Dispose();
         _matmulNvfp4?.Dispose();
+        _exactQ8?.Dispose();
+        _exactNvfp4?.Dispose();
+        _exactIq2Xxs?.Dispose();
         _matmulNvfp4Coopmat?.Dispose();
         _flashAttentionCoopmat?.Dispose();
         _matmulIq2XxsCoopmat?.Dispose();

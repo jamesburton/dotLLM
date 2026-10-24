@@ -208,6 +208,51 @@ public sealed partial class VulkanNemotronHTransformerModel : IDFlashDraftAttach
 
     // ── Small-batch exact path ──────────────────────────────────────────
 
+    // #1244: deterministic multi-column GEMVs (decode = 1 column) that decode each weight block once for every row; null when the shader
+    // is missing, and NVFP4's when the opt-in MMVQ owns decode.
+    private MatMulExactGemvMultiKernel? _exactQ8, _exactNvfp4, _exactIq2Xxs;
+
+    /// <summary>Environment override of the exact GEMVs' rows per workgroup, <c>decode,verify</c> (tuning A/B; e.g. <c>2,4</c>).</summary>
+    internal const string ExactGemvRowsEnvVar = "DOTLLM_VK_NEMOTRON_GEMV_ROWS";
+
+    /// <summary>Test hook: false keeps the #1237 per-column GEMVs (A/B and the negative control of the multi-column tests).</summary>
+    internal static bool ExactGemvEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_NEMOTRON_EXACT_GEMV") != "0";
+
+    private void CreateExactGemvKernels(VulkanDevice device, string spvDir)
+    {
+        if (!ExactGemvEnabled) return;
+        int decodeRows = 1, multiRows = 1;   // Strix: NR 1, 2 and 4 time the same at Bolt's shapes
+        if (Environment.GetEnvironmentVariable(ExactGemvRowsEnvVar)?.Split(',') is [var d, var mr]
+            && int.TryParse(d, out int dv) && int.TryParse(mr, out int mv))
+        {
+            decodeRows = dv;
+            multiRows = mv;
+        }
+
+        _exactQ8 = MatMulExactGemvMultiKernel.TryCreate(device, spvDir, ExactGemvFormat.Q8_0, decodeRows, multiRows);
+        if (_matmulNvfp4 is not { HasMmvq: true })
+            _exactNvfp4 = MatMulExactGemvMultiKernel.TryCreate(device, spvDir, ExactGemvFormat.Nvfp4, decodeRows, multiRows);
+        _exactIq2Xxs = MatMulExactGemvMultiKernel.TryCreate(device, spvDir, ExactGemvFormat.Iq2Xxs, decodeRows, multiRows);
+    }
+
+    /// <summary>Records <paramref name="cols"/> rows (1 = decode) through the exact multi-column GEMV of <paramref name="qt"/>, or returns false.</summary>
+    private bool TryRecordExactGemv(nint cmdBuf, VulkanDevice.Buffer weights, QuantizationType qt,
+        VulkanDevice.Buffer input, VulkanDevice.Buffer output, int outputDim, int inputDim, int cols, float scale)
+    {
+        var kernel = qt switch
+        {
+            QuantizationType.Q8_0 => _exactQ8,
+            QuantizationType.NVFP4 => _exactNvfp4,
+            QuantizationType.IQ2_XXS => _exactIq2Xxs,
+            _ => null,
+        };
+        if (kernel is null || !kernel.Accepts(cols, inputDim)) return false;
+        if (qt != QuantizationType.NVFP4) VulkanNemotronHWeights.ThrowIfScaleUnsupported("projection", scale, qt);
+        kernel.Record(cmdBuf, weights, input, output, outputDim, inputDim, cols, scale,
+            _iq2Codebooks.Iq2XxsGrid, _iq2Codebooks.Ksigns);
+        return true;
+    }
+
     /// <summary>Records <paramref name="cols"/> rows through the decode GEMV of <paramref name="qt"/>, or returns false when it has none.</summary>
     private bool TryRecordGemvColumns(nint cmdBuf, VulkanDevice.Buffer weights, QuantizationType qt,
         VulkanDevice.Buffer input, VulkanDevice.Buffer output, int outputDim, int inputDim, int cols, float scale)
