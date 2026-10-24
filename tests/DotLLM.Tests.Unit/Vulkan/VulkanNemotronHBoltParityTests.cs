@@ -257,6 +257,34 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         Assert.True(report.ByCategory.GetValueOrDefault("lm_head") > 0, "LM head not attributed");
     }
 
+    /// <summary>
+    /// #1174: a Q8_0 / Q4_K token embedding stays resident as its raw blocks and is gathered by <see cref="EmbedGatherF32Kernel"/> instead
+    /// of being widened to a vocab x hidden F32 table (2 GiB on Bolt). The dequant is exact, so the logits must be bit-identical to the F32
+    /// table holding the same dequantized rows, on a batched prefill (ids 0 and vocab-1 included) and on a single-token decode.
+    /// </summary>
+    /// <param name="format">Embedding table format.</param>
+    [SkippableTheory]
+    [InlineData(QuantizationType.Q8_0)]
+    [InlineData(QuantizationType.Q4_K)]
+    public void Forward_PackedEmbedding_BitIdenticalToF32Table(QuantizationType format)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        Skip.IfNot(EmbedGatherF32Kernel.IsSupported(format, Hidden, spvDir), $"{format} gather shader missing");
+        using var device = VulkanDevice.Create();
+        using var fx = new Fixture(zeroBias: false, Layers, KQuantSeed);
+        foreach (var (tokens, positions) in new[] { (Tokens, Positions), (new[] { 7 }, new[] { 0 }) })
+        {
+            float[] widened = fx.VulkanEmbed(device, spvDir, tokens, positions, format, packed: false, out var f32Qt);
+            float[] resident = fx.VulkanEmbed(device, spvDir, tokens, positions, format, packed: true, out var packedQt);
+            Assert.Equal(QuantizationType.F32, f32Qt);
+            Assert.Equal(format, packedQt);
+            Assert.Equal(widened.Length, resident.Length);
+            for (int i = 0; i < widened.Length; i++)
+                Assert.True(BitConverter.SingleToInt32Bits(widened[i]) == BitConverter.SingleToInt32Bits(resident[i]),
+                    $"seq {tokens.Length} logit {i}: {widened[i]:G9} F32 table vs {resident[i]:G9} packed {format}");
+        }
+    }
+
     private static float MaxDiff(float[] a, float[] b)
     {
         Assert.Equal(a.Length, b.Length);
@@ -345,6 +373,25 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
             model.TrySetAllRowLogitsLimit(tokens.Length + 1);
             using var logits = model.Forward(tokens, positions, deviceId: 0);
             report = model.LastProfile;
+            return Copy((float*)logits.DataPointer, logits.ElementCount);
+        }
+
+        /// <summary>
+        /// Vulkan forward with the embedding quantized to <paramref name="format"/>: either the raw blocks (<paramref name="packed"/>) or
+        /// their exact F32 dequantization, so both arms see identical embedding values (#1174).
+        /// </summary>
+        public float[] VulkanEmbed(VulkanDevice device, string spvDir, int[] tokens, int[] positions, QuantizationType format, bool packed,
+            out QuantizationType deviceQt)
+        {
+            byte[] q = format == QuantizationType.Q4_K ? Q4KFixture.QuantizeRows(_embed, Vocab, Hidden) : QuantRows(_embed, Vocab, Hidden, format);
+            nint qPtr = PinBytes(q, out _);
+            nint embedPtr = packed ? qPtr : Pin(Dequant(qPtr, format, Vocab, Hidden));
+            using var model = VulkanNemotronHTransformerModel.BuildFromPrebuiltWeights(
+                device, _config, _layers, _outNorm, Pin(_wOut), QuantizationType.F32, Vocab, Hidden,
+                embedPtr, packed ? format : QuantizationType.F32, spvDir);
+            deviceQt = model.TokenEmbeddingDeviceQuantType;
+            model.TrySetAllRowLogitsLimit(tokens.Length + 1);
+            using var logits = model.Forward(tokens, positions, deviceId: 0);
             return Copy((float*)logits.DataPointer, logits.ElementCount);
         }
 

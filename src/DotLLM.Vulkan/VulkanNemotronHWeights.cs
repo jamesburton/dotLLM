@@ -30,10 +30,11 @@ namespace DotLLM.Vulkan;
 /// the CPU side at GGUF load time.
 /// </para>
 /// <para>
-/// <b>Token embedding.</b> Dequantised to F32 at upload regardless of source quant type
-/// — the embedding gather uses <c>vkCmdCopyBuffer</c> with row-major byte offsets, which
-/// only works with a contiguous F32 layout. This matches the
-/// <see cref="VulkanWeights"/> convention.
+/// <b>Token embedding.</b> A Q8_0 / Q4_K / Q6_K table stays resident as its raw blocks (zero-copy
+/// imported when the driver allows) and is gathered by <see cref="Kernels.EmbedGatherF32Kernel"/>
+/// (#352, #1174): on Nemotron 3.5 Bolt the F32 widening cost 2 GiB of device memory for a 544 MiB
+/// table. Any other source type is still dequantised to F32 at upload and gathered with
+/// <c>vkCmdCopyBuffer</c> row copies.
 /// </para>
 /// </remarks>
 internal sealed class VulkanNemotronHWeights : IDisposable
@@ -251,6 +252,9 @@ internal sealed class VulkanNemotronHWeights : IDisposable
 
     public LayerBuffers[] Layers => _layers;
     public VulkanDevice.Buffer TokenEmbedding { get; }
+
+    /// <summary>Device layout of <see cref="TokenEmbedding"/>: the packed source type (gathered by <see cref="Kernels.EmbedGatherF32Kernel"/>) or <see cref="QuantizationType.F32"/>.</summary>
+    public QuantizationType TokenEmbeddingQuantType { get; }
     public int VocabSize { get; }
     public int HiddenSize { get; }
 
@@ -264,7 +268,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
 
     private VulkanNemotronHWeights(
         LayerBuffers[] layers,
-        VulkanDevice.Buffer tokenEmbedding, int vocabSize, int hiddenSize,
+        VulkanDevice.Buffer tokenEmbedding, QuantizationType tokenEmbeddingQt, int vocabSize, int hiddenSize,
         VulkanDevice.Buffer outputNormWeight,
         VulkanDevice.Buffer outputWeight, QuantizationType outputDeviceQt,
         int outputOutputDim, int outputInputDim,
@@ -272,6 +276,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     {
         _layers = layers;
         TokenEmbedding = tokenEmbedding;
+        TokenEmbeddingQuantType = tokenEmbeddingQt;
         VocabSize = vocabSize;
         HiddenSize = hiddenSize;
         OutputNormWeight = outputNormWeight;
@@ -294,7 +299,8 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         float[] outputNormWeight,
         nint tokenEmbedWeight, QuantizationType tokenEmbedQuantType,
         nint outputWeight, QuantizationType outputQuantType,
-        int outputOutputDim, int outputInputDim)
+        int outputOutputDim, int outputInputDim,
+        bool keepEmbedPacked = false)
     {
         ArgumentNullException.ThrowIfNull(device);
         ArgumentNullException.ThrowIfNull(config);
@@ -310,20 +316,25 @@ internal sealed class VulkanNemotronHWeights : IDisposable
             outputOutputDim, outputInputDim, outputQuantType);
         VulkanWeightImportPolicy.Reset();
         using var staging = VulkanStagingBuffer.Create(device, stagingBytes);
+        // Small/medium tensors share 64 MiB slabs instead of one driver allocation each (#1174).
+        using var arena = new VulkanWeightArena(device);
 
-        // Token embedding [vocab, hidden] — always dequantised on upload (the embedding
-        // gather uses byte-offset vkCmdCopyBuffer and needs a contiguous F32 layout).
-        var tokenEmbed = UploadProjectionMatrix(device, staging,
+        // Token embedding [vocab, hidden]: the raw blocks when the caller has a gather kernel for the type and they reach the
+        // device unconverted (#1174), else dequantised to F32 for the vkCmdCopyBuffer row gather.
+        bool embedPacked = keepEmbedPacked
+            && KeepQuantOnDevice(tokenEmbedQuantType, config.HiddenSize)
+            && DeviceQuantTypeFor(tokenEmbedQuantType, config.HiddenSize) == tokenEmbedQuantType;
+        var tokenEmbed = UploadProjectionMatrix(device, staging, arena,
             tokenEmbedWeight, tokenEmbedQuantType, config.VocabSize, config.HiddenSize,
-            forceF32: true,
-            out _, out long tokenEmbedBytes);
+            forceF32: !embedPacked,
+            out var tokenEmbedDeviceQt, out long tokenEmbedBytes);
         totalBytes += tokenEmbedBytes;
 
         var layers = new LayerBuffers[config.NumLayers];
         for (int i = 0; i < config.NumLayers; i++)
         {
             var lw = cpuLayers[i];
-            var attnNorm = UploadFloatArray(device, staging, lw.AttnNormWeight);
+            var attnNorm = UploadFloatArray(device, staging, arena, lw.AttnNormWeight);
             totalBytes += (long)lw.AttnNormWeight.Length * sizeof(float);
 
             switch (layout.LayerKind[i])
@@ -331,7 +342,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
                 case HybridLayerKind.Ssm:
                     {
                         var ssmW = lw.Ssm!;
-                        var ssm = UploadSsmLayer(device, staging, ssmW, out long ssmBytes);
+                        var ssm = UploadSsmLayer(device, staging, arena, ssmW, out long ssmBytes);
                         totalBytes += ssmBytes;
                         layers[i] = new LayerBuffers(attnNorm, HybridLayerKind.Ssm, ssm, null, null);
                         break;
@@ -339,14 +350,14 @@ internal sealed class VulkanNemotronHWeights : IDisposable
                 case HybridLayerKind.Attention:
                     {
                         var attnW = lw.Attention!;
-                        var attn = UploadAttentionLayer(device, staging, attnW, out long attnBytes);
+                        var attn = UploadAttentionLayer(device, staging, arena, attnW, out long attnBytes);
                         totalBytes += attnBytes;
                         layers[i] = new LayerBuffers(attnNorm, HybridLayerKind.Attention, null, attn, null);
                         break;
                     }
                 case HybridLayerKind.Ffn when lw.Moe is { } moeW:
                     {
-                        var moe = UploadMoeLayer(device, staging, moeW, config.HiddenSize, out long moeBytes);
+                        var moe = UploadMoeLayer(device, staging, arena, moeW, config.HiddenSize, out long moeBytes);
                         totalBytes += moeBytes;
                         layers[i] = new LayerBuffers(attnNorm, HybridLayerKind.Ffn, null, null, null, moe);
                         break;
@@ -354,7 +365,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
                 case HybridLayerKind.Ffn:
                     {
                         var ffnW = lw.Ffn!;
-                        var ffn = UploadFfnLayer(device, staging, ffnW, out long ffnBytes);
+                        var ffn = UploadFfnLayer(device, staging, arena, ffnW, out long ffnBytes);
                         totalBytes += ffnBytes;
                         layers[i] = new LayerBuffers(attnNorm, HybridLayerKind.Ffn, null, null, ffn);
                         break;
@@ -365,17 +376,17 @@ internal sealed class VulkanNemotronHWeights : IDisposable
             }
         }
 
-        var outputNorm = UploadFloatArray(device, staging, outputNormWeight);
+        var outputNorm = UploadFloatArray(device, staging, arena, outputNormWeight);
         totalBytes += (long)outputNormWeight.Length * sizeof(float);
 
-        var outputW = UploadProjectionMatrix(device, staging,
+        var outputW = UploadProjectionMatrix(device, staging, arena,
             outputWeight, outputQuantType, outputOutputDim, outputInputDim,
             forceF32: false,
             out var outputDeviceQt, out long outputBytes);
         totalBytes += outputBytes;
 
         return new VulkanNemotronHWeights(layers,
-            tokenEmbed, config.VocabSize, config.HiddenSize,
+            tokenEmbed, tokenEmbedDeviceQt, config.VocabSize, config.HiddenSize,
             outputNorm, outputW, outputDeviceQt, outputOutputDim, outputInputDim,
             totalBytes);
     }
@@ -641,7 +652,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     }
 
     private static SsmLayerBuffers UploadSsmLayer(
-        VulkanDevice device, VulkanStagingBuffer staging,
+        VulkanDevice device, VulkanStagingBuffer staging, VulkanWeightArena arena,
         NemotronHSsmWeights ssmW, out long uploadedBytes)
     {
         // #1038: only the NVFP4 kernel multiplies by a per-tensor X.scale; a scale on any other device
@@ -649,26 +660,26 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         ThrowIfScaleUnsupported("ssm_in", ssmW.InScale, DeviceQuantTypeFor(ssmW.InQuantType, ssmW.InInputDim));
         ThrowIfScaleUnsupported("ssm_out", ssmW.OutScale, DeviceQuantTypeFor(ssmW.OutQuantType, ssmW.OutInputDim));
         uploadedBytes = 0;
-        var inBuf = UploadProjectionMatrix(device, staging,
+        var inBuf = UploadProjectionMatrix(device, staging, arena,
             ssmW.InWeight, ssmW.InQuantType, ssmW.InOutputDim, ssmW.InInputDim,
             forceF32: false,
             out var inDeviceQt, out long inBytes);
         uploadedBytes += inBytes;
 
-        var conv1dWeight = UploadFloatArray(device, staging, ssmW.Conv1dWeight);
+        var conv1dWeight = UploadFloatArray(device, staging, arena, ssmW.Conv1dWeight);
         uploadedBytes += (long)ssmW.Conv1dWeight.Length * sizeof(float);
-        var conv1dBias = UploadFloatArray(device, staging, ssmW.Conv1dBias);
+        var conv1dBias = UploadFloatArray(device, staging, arena, ssmW.Conv1dBias);
         uploadedBytes += (long)ssmW.Conv1dBias.Length * sizeof(float);
-        var a = UploadFloatArray(device, staging, ssmW.A);
+        var a = UploadFloatArray(device, staging, arena, ssmW.A);
         uploadedBytes += (long)ssmW.A.Length * sizeof(float);
-        var d = UploadFloatArray(device, staging, ssmW.D);
+        var d = UploadFloatArray(device, staging, arena, ssmW.D);
         uploadedBytes += (long)ssmW.D.Length * sizeof(float);
-        var dtBias = UploadFloatArray(device, staging, ssmW.DtBias);
+        var dtBias = UploadFloatArray(device, staging, arena, ssmW.DtBias);
         uploadedBytes += (long)ssmW.DtBias.Length * sizeof(float);
-        var norm = UploadFloatArray(device, staging, ssmW.NormWeight);
+        var norm = UploadFloatArray(device, staging, arena, ssmW.NormWeight);
         uploadedBytes += (long)ssmW.NormWeight.Length * sizeof(float);
 
-        var outBuf = UploadProjectionMatrix(device, staging,
+        var outBuf = UploadProjectionMatrix(device, staging, arena,
             ssmW.OutWeight, ssmW.OutQuantType, ssmW.OutOutputDim, ssmW.OutInputDim,
             forceF32: false,
             out var outDeviceQt, out long outBytes);
@@ -684,20 +695,20 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     }
 
     private static AttentionLayerBuffers UploadAttentionLayer(
-        VulkanDevice device, VulkanStagingBuffer staging,
+        VulkanDevice device, VulkanStagingBuffer staging, VulkanWeightArena arena,
         NemotronHAttentionWeights attnW, out long uploadedBytes)
     {
         uploadedBytes = 0;
-        var q = UploadProjectionMatrix(device, staging,
+        var q = UploadProjectionMatrix(device, staging, arena,
             attnW.QWeight, attnW.QQuantType, attnW.QOutputDim, attnW.QInputDim,
             forceF32: false, out var qQt, out long qBytes);
-        var k = UploadProjectionMatrix(device, staging,
+        var k = UploadProjectionMatrix(device, staging, arena,
             attnW.KWeight, attnW.KQuantType, attnW.KOutputDim, attnW.KInputDim,
             forceF32: false, out var kQt, out long kBytes);
-        var v = UploadProjectionMatrix(device, staging,
+        var v = UploadProjectionMatrix(device, staging, arena,
             attnW.VWeight, attnW.VQuantType, attnW.VOutputDim, attnW.VInputDim,
             forceF32: false, out var vQt, out long vBytes);
-        var o = UploadProjectionMatrix(device, staging,
+        var o = UploadProjectionMatrix(device, staging, arena,
             attnW.OWeight, attnW.OQuantType, attnW.OOutputDim, attnW.OInputDim,
             forceF32: false, out var oQt, out long oBytes);
         uploadedBytes += qBytes + kBytes + vBytes + oBytes;
@@ -717,7 +728,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     /// product), Q5_0 exactly repacked to Q5_1. Any other expert quantization throws instead of silently widening (MXFP4 / NVFP4 banks).
     /// </summary>
     private static VulkanDevice.Buffer UploadExpertBank(
-        VulkanDevice device, VulkanStagingBuffer staging,
+        VulkanDevice device, VulkanStagingBuffer staging, VulkanWeightArena arena,
         nint srcPtr, QuantizationType srcQt, int numExperts, int mDim, int kDim, string what,
         out QuantizationType deviceQt, out long bytes)
     {
@@ -738,7 +749,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
             case QuantizationType.Q8_0:
             case QuantizationType.Q5_1:
                 deviceQt = srcQt;
-                return UploadAsStored(device, staging, srcPtr, srcRowBytes * rows, out bytes);
+                return UploadAsStored(device, staging, arena, srcPtr, srcRowBytes * rows, out bytes);
             case var _ when MoeIqFormats.FromQuantizationType(srcQt) is { } iq:
             {
                 // #1057: IQ-family banks (NVIDIA's official Bolt GGUF is IQ2_XXS) stay packed for the IQ MMVQ / grouped coopmat kernels (#823).
@@ -752,14 +763,14 @@ internal sealed class VulkanNemotronHWeights : IDisposable
                         $"nemotron_h_moe {what} is {srcQt}: the Vulkan IQ expert kernels need integer dot product (dp4a), which this device lacks. " +
                         "Widening the banks to F32 is not an option at this size; use --device cpu.");
                 deviceQt = srcQt;
-                return UploadAsStored(device, staging, srcPtr, srcRowBytes * rows, out bytes);
+                return UploadAsStored(device, staging, arena, srcPtr, srcRowBytes * rows, out bytes);
             }
             case QuantizationType.Q5_0:
             {
                 deviceQt = QuantizationType.Q5_1;
                 long dstRowBytes = Dequantize.RowByteSize(kDim, QuantizationType.Q5_1);
                 bytes = dstRowBytes * rows;
-                var buf = device.AllocateDeviceLocal(bytes);
+                var buf = arena.AllocateDeviceLocal(bytes);
                 int blocksPerRow = kDim / 32;
                 staging.UploadRows(rows, dstRowBytes, buf, 0, (chunkPtr, firstRow, rowCount) =>
                 {
@@ -781,24 +792,25 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     /// <summary>Uploads (or imports zero-copy) <paramref name="byteCount"/> bytes of an expert bank exactly as stored.</summary>
     /// <param name="device">Target device.</param>
     /// <param name="staging">Staging buffer for the copy path.</param>
+    /// <param name="arena">Slab allocator for tensors below 64 MiB (#1174).</param>
     /// <param name="srcPtr">Host pointer to the bank (mmapped GGUF data).</param>
     /// <param name="byteCount">Bank size in bytes.</param>
     /// <param name="bytes">Receives <paramref name="byteCount"/>, the bytes the bank occupies on the device.</param>
     /// <returns>The device buffer holding the bank.</returns>
     private static VulkanDevice.Buffer UploadAsStored(
-        VulkanDevice device, VulkanStagingBuffer staging, nint srcPtr, long byteCount, out long bytes)
+        VulkanDevice device, VulkanStagingBuffer staging, VulkanWeightArena arena, nint srcPtr, long byteCount, out long bytes)
     {
         bytes = byteCount;
         if (VulkanWeightImportPolicy.TryImport(device, srcPtr, byteCount, out var imported))
             return imported!;
-        var buf = device.AllocateDeviceLocal(byteCount);
+        var buf = arena.AllocateDeviceLocal(byteCount);
         staging.UploadBytes(srcPtr, byteCount, buf);
         VulkanWeightImportPolicy.NoteStaged(srcPtr, byteCount);
         return buf;
     }
 
     private static MoeLayerBuffers UploadMoeLayer(
-        VulkanDevice device, VulkanStagingBuffer staging, NemotronHMoeWeights moe, int hidden, out long uploadedBytes)
+        VulkanDevice device, VulkanStagingBuffer staging, VulkanWeightArena arena, NemotronHMoeWeights moe, int hidden, out long uploadedBytes)
     {
         int numE = moe.NumExperts;
         int inter = moe.MoeIntermediateSize;
@@ -806,16 +818,16 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         // LatentMoE (#1045): the routed banks are [latent -> inter] / [inter -> latent]; the router and shared expert keep the hidden.
         int expertDim = moe.HasLatent ? moe.LatentSize : hidden;
 
-        var router = UploadProjectionMatrix(device, staging, moe.GateInpWeight, moe.GateInpQuantType, numE, hidden,
+        var router = UploadProjectionMatrix(device, staging, arena, moe.GateInpWeight, moe.GateInpQuantType, numE, hidden,
             forceF32: false, out var routerQt, out long routerBytes);
-        var bias = UploadFloatArray(device, staging, moe.SelectionBias);
-        var up = UploadExpertBank(device, staging, moe.UpExpsWeight, moe.UpExpsQuantType, numE, inter, expertDim,
+        var bias = UploadFloatArray(device, staging, arena, moe.SelectionBias);
+        var up = UploadExpertBank(device, staging, arena, moe.UpExpsWeight, moe.UpExpsQuantType, numE, inter, expertDim,
             "ffn_up_exps", out var upQt, out long upBytes);
-        var down = UploadExpertBank(device, staging, moe.DownExpsWeight, moe.DownExpsQuantType, numE, expertDim, inter,
+        var down = UploadExpertBank(device, staging, arena, moe.DownExpsWeight, moe.DownExpsQuantType, numE, expertDim, inter,
             "ffn_down_exps", out var downQt, out long downBytes);
-        var sharedUp = UploadProjectionMatrix(device, staging, moe.UpShexpWeight, moe.UpShexpQuantType, sharedInter, hidden,
+        var sharedUp = UploadProjectionMatrix(device, staging, arena, moe.UpShexpWeight, moe.UpShexpQuantType, sharedInter, hidden,
             forceF32: false, out var sharedUpQt, out long sharedUpBytes);
-        var sharedDown = UploadProjectionMatrix(device, staging, moe.DownShexpWeight, moe.DownShexpQuantType, hidden, sharedInter,
+        var sharedDown = UploadProjectionMatrix(device, staging, arena, moe.DownShexpWeight, moe.DownShexpQuantType, hidden, sharedInter,
             forceF32: false, out var sharedDownQt, out long sharedDownBytes);
 
         VulkanDevice.Buffer? latentDown = null, latentUp = null;
@@ -823,9 +835,9 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         long latentBytes = 0;
         if (moe.HasLatent)
         {
-            latentDown = UploadProjectionMatrix(device, staging, moe.LatentDownWeight, moe.LatentDownQuantType, moe.LatentSize, hidden,
+            latentDown = UploadProjectionMatrix(device, staging, arena, moe.LatentDownWeight, moe.LatentDownQuantType, moe.LatentSize, hidden,
                 forceF32: false, out latentDownQt, out long latentDownBytes);
-            latentUp = UploadProjectionMatrix(device, staging, moe.LatentUpWeight, moe.LatentUpQuantType, hidden, moe.LatentSize,
+            latentUp = UploadProjectionMatrix(device, staging, arena, moe.LatentUpWeight, moe.LatentUpQuantType, hidden, moe.LatentSize,
                 forceF32: false, out latentUpQt, out long latentUpBytes);
             latentBytes = latentDownBytes + latentUpBytes;
         }
@@ -839,13 +851,13 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     }
 
     private static FfnLayerBuffers UploadFfnLayer(
-        VulkanDevice device, VulkanStagingBuffer staging,
+        VulkanDevice device, VulkanStagingBuffer staging, VulkanWeightArena arena,
         NemotronHFfnWeights ffnW, out long uploadedBytes)
     {
-        var up = UploadProjectionMatrix(device, staging,
+        var up = UploadProjectionMatrix(device, staging, arena,
             ffnW.UpWeight, ffnW.UpQuantType, ffnW.UpOutputDim, ffnW.UpInputDim,
             forceF32: false, out var upQt, out long upBytes);
-        var down = UploadProjectionMatrix(device, staging,
+        var down = UploadProjectionMatrix(device, staging, arena,
             ffnW.DownWeight, ffnW.DownQuantType, ffnW.DownOutputDim, ffnW.DownInputDim,
             forceF32: false, out var downQt, out long downBytes);
         uploadedBytes = upBytes + downBytes;
@@ -864,7 +876,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     /// <see cref="QuantizationType.F32"/>.
     /// </summary>
     private static unsafe VulkanDevice.Buffer UploadProjectionMatrix(
-        VulkanDevice device, VulkanStagingBuffer staging,
+        VulkanDevice device, VulkanStagingBuffer staging, VulkanWeightArena arena,
         nint srcPtr, QuantizationType qt, int outputDim, int inputDim,
         bool forceF32,
         out QuantizationType deviceQuantType,
@@ -889,7 +901,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
             if (VulkanWeightImportPolicy.TryImport(device, srcPtr, bytes, out var imported))
                 return imported!;
 
-            var buf = device.AllocateDeviceLocal(bytes);
+            var buf = arena.AllocateDeviceLocal(bytes);
             staging.UploadBytes(srcPtr, bytes, buf);
             VulkanWeightImportPolicy.NoteStaged(srcPtr, bytes);
             return buf;
@@ -912,7 +924,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         // Q5_0 (no Vulkan kernel for those yet), and the forceF32-token-embedding
         // path that always lands here.
         long fpBytes = elems * sizeof(float);
-        var fpBuf = device.AllocateDeviceLocal(fpBytes);
+        var fpBuf = arena.AllocateDeviceLocal(fpBytes);
 
         if (qt == QuantizationType.F32)
         {
@@ -952,10 +964,10 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     }
 
     private static unsafe VulkanDevice.Buffer UploadFloatArray(
-        VulkanDevice device, VulkanStagingBuffer staging, float[] data)
+        VulkanDevice device, VulkanStagingBuffer staging, VulkanWeightArena arena, float[] data)
     {
         long bytes = (long)data.Length * sizeof(float);
-        var buf = device.AllocateDeviceLocal(bytes);
+        var buf = arena.AllocateDeviceLocal(bytes);
         staging.UploadFloats(data, buf);
         return buf;
     }

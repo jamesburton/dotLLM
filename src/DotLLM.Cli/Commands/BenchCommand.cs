@@ -291,6 +291,8 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
                 case "vulkan":
                 {
                     vulkanDevice = DotLLM.Vulkan.VulkanDevice.Create();
+                    if (HostResidencyProbe.Enabled)
+                        HostResidencyProbe.Report("after-device", 0, 0, vulkanDevice.MemoryProbeSnapshot());
                     // THE shared per-architecture Vulkan dispatch (#259).
                     (model, kvFactory) = DotLLM.Vulkan.VulkanModelLoader.CreateFromGguf(
                         vulkanDevice, gguf, config, ResolveSpvDir(),
@@ -370,7 +372,7 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         }
 
         if (HostResidencyProbe.Enabled)
-            HostResidencyProbe.Report("after-load", mapBase, mapLength, vulkanDevice?.MemorySnapshot());
+            HostResidencyProbe.Report("after-load", mapBase, mapLength, vulkanDevice?.MemoryProbeSnapshot());
 
         // Issue #438 experiment arm — DOTLLM_BENCH_RELEASE_GGUF=1 unmaps the GGUF right
         // after upload. Every device-resident weight was copied into a device buffer by
@@ -385,7 +387,7 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
             {
                 // mapBase is dangling now — pass 0 so the page census is skipped rather
                 // than querying an unmapped range.
-                HostResidencyProbe.Report("after-gguf-dispose", 0, 0, vulkanDevice?.MemorySnapshot());
+                HostResidencyProbe.Report("after-gguf-dispose", 0, 0, vulkanDevice?.MemoryProbeSnapshot());
             }
             mapBase = 0;
             mapLength = 0;
@@ -419,7 +421,7 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
                 warmupReps: warmupReps);
 
             if (HostResidencyProbe.Enabled)
-                HostResidencyProbe.Report("after-decode", mapBase, mapLength, vulkanDevice?.MemorySnapshot());
+                HostResidencyProbe.Report("after-decode", mapBase, mapLength, vulkanDevice?.MemoryProbeSnapshot());
 
             string settingsSummary = BuildSettingsSummary(settings, result, backend);
             string notes = $"pp{result.PromptTokens}/tg{result.DecodeTokens} r{settings.Reps} " +
@@ -494,7 +496,7 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         }
 
         if (HostResidencyProbe.Enabled)
-            HostResidencyProbe.Report("after-decode", mapBase, mapLength, vulkanDevice?.MemorySnapshot());
+            HostResidencyProbe.Report("after-decode", mapBase, mapLength, vulkanDevice?.MemoryProbeSnapshot());
 
         if (settings.Json)
         {

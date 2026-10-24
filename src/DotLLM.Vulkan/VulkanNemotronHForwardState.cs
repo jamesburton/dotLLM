@@ -89,6 +89,9 @@ internal sealed class VulkanNemotronHForwardState : IDisposable
     public VulkanDevice.Buffer Logits { get; private set; }
     public VulkanDevice.Buffer PositionsBuffer { get; private set; }
 
+    /// <summary>Token ids for the resident Q8_0 embedding gather (#1174); same shape as <see cref="PositionsBuffer"/>.</summary>
+    public VulkanDevice.Buffer TokenIdsBuffer { get; private set; }
+
     private bool _disposed;
 
     public long AllocatedBytes { get; private set; }
@@ -118,6 +121,7 @@ internal sealed class VulkanNemotronHForwardState : IDisposable
         // Read back by the host every decoded token: HOST_CACHED, not write-combined (#143, #471).
         Logits = device.AllocateHostReadback((long)vocabSize * sizeof(float));
         PositionsBuffer = device.Allocate(Math.Max(1, initialSeqLen) * sizeof(int));
+        TokenIdsBuffer = device.Allocate(Math.Max(1, initialSeqLen) * sizeof(int));
 
         AllocateForCapacity(Math.Max(1, initialSeqLen));
     }
@@ -207,6 +211,8 @@ internal sealed class VulkanNemotronHForwardState : IDisposable
         // Resize positions buffer (host writes positions per forward).
         PositionsBuffer.Dispose();
         PositionsBuffer = _device.Allocate((long)seqLen * sizeof(int));
+        TokenIdsBuffer.Dispose();
+        TokenIdsBuffer = _device.Allocate((long)seqLen * sizeof(int));
 
         _capacitySeqLen = seqLen;
         AllocatedBytes = hiddenBytes * 3 + qBytes * 2 + kvBytes * 2 + ffnBytes
@@ -254,6 +260,7 @@ internal sealed class VulkanNemotronHForwardState : IDisposable
         ReleaseLayerScratch();
         Logits?.Dispose();
         PositionsBuffer?.Dispose();
+        TokenIdsBuffer?.Dispose();
     }
 }
 

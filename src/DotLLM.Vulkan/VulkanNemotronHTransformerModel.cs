@@ -206,6 +206,12 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     /// </summary>
     private NemotronHTransformerModel? _cpuModel;
 
+    /// <summary>Gather for a packed token-embedding table (#1174); null when the table was widened to F32.</summary>
+    private EmbedGatherF32Kernel? _embedGather;
+
+    /// <summary>The token embedding's device format: its packed source type, or F32 when widened (#1174; test hook).</summary>
+    internal QuantizationType TokenEmbeddingDeviceQuantType => _embedGather?.Format ?? QuantizationType.F32;
+
     /// <inheritdoc/>
     public ModelConfig Config { get; }
 
@@ -485,9 +491,10 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         // Any RoPEConfig is ignored — nemotron_h applies no position encoding on
         // attention (issue #372); mirrors the CPU model.
 
-        // Upload weights and allocate scratch.
+        // Upload weights and allocate scratch. The embedding stays packed when its type has a gather shader (#1174).
         var weights = VulkanNemotronHWeights.Upload(device, config, cpuLayers, outputNormWeight,
-            tokenEmbedWeight, tokenEmbedQt, outputWeight, outputQt, outputM, outputK);
+            tokenEmbedWeight, tokenEmbedQt, outputWeight, outputQt, outputM, outputK,
+            keepEmbedPacked: EmbedGatherF32Kernel.IsSupported(tokenEmbedQt, config.HiddenSize, spvDir));
 
         var state = new VulkanNemotronHForwardState(device,
             hiddenSize: config.HiddenSize,
@@ -630,6 +637,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         created._moe = moeKernels;
         try
         {
+            if (weights.TokenEmbeddingQuantType != QuantizationType.F32)
+                created._embedGather = EmbedGatherF32Kernel.Create(device, spvDir, weights.TokenEmbeddingQuantType);
             created._matmulNvfp4 = MatMulNvfp4F32Kernel.Create(device, spvDir);
             created._matmulNvfp4Coopmat = MatMulNvfp4GemmCoopmatKernel.TryCreate(device, spvDir);
             created._matmulIq2XxsCoopmat = MatMulIq2XxsGemmCoopmatKernel.TryCreate(device, spvDir, iq2Codebooks);
@@ -821,7 +830,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
         _state.ResetHiddenSlot();
         RecordEmbeddingGather(cmdBuf, tokenIds);
-        KernelSupport.TransferToComputeBarrier(cmdBuf);
+        if (_embedGather is not null) KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        else KernelSupport.TransferToComputeBarrier(cmdBuf);
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.Embed);
 
         var kinds = _layout.LayerKind;
@@ -2062,6 +2072,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     private void InvalidateKernelCaches()
     {
         _matmul.InvalidateDescriptorCache();
+        _embedGather?.InvalidateDescriptorCache();
         _matmulQ8.InvalidateDescriptorCache();
         _matmulQ8Gemm.InvalidateDescriptorCache();
         _matmulQ8GemmCoopmat?.InvalidateDescriptorCache();
@@ -2474,6 +2485,15 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     private void RecordEmbeddingGather(nint cmdBuf, ReadOnlySpan<int> tokenIds)
     {
         int hiddenSize = Config.HiddenSize;
+        if (_embedGather is not null)
+        {
+            // Packed table: a dequantizing compute gather, bit-identical to the F32 row copies (#352, #1174).
+            _device.Upload(MemoryMarshal.AsBytes(tokenIds), _state.TokenIdsBuffer);
+            _embedGather.Record(cmdBuf, _weights.TokenEmbedding, _state.TokenIdsBuffer, _state.HiddenState,
+                tokenIds.Length, hiddenSize, Config.VocabSize);
+            return;
+        }
+
         long rowBytes = (long)hiddenSize * sizeof(float);
         var srcBuf = _weights.TokenEmbedding.Handle;
         var dstBuf = _state.HiddenState.Handle;
@@ -2511,6 +2531,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _cpuModel?.Dispose();
 
         _moe?.Dispose();
+        _embedGather?.Dispose();
         _profiler?.Dispose();
         _ssmSplitXbc.Dispose();
         _reluSquared.Dispose();
