@@ -1,0 +1,24 @@
+#version 450
+// MiMo-V2 (V head_dim 128 < K head_dim 192): the attention kernels run on K-shaped V (zero-padded rows), so each attention output row is
+// [numHeads, kDim] with exact-zero pad columns. Compacts it to [numHeads, vDim] (the o_proj input) and applies attention_value_scale,
+// which is linear in V. One thread per output element; `total` = rows * vDim where rows = seqLen * numHeads.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufIn  { float x[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer BufOut { float y[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint  total;
+    uint  kDim;
+    uint  vDim;
+    float scale;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.total) return;
+    uint row = i / pc.vDim;
+    uint d = i - row * pc.vDim;
+    y[i] = x[row * pc.kDim + d] * pc.scale;
+}

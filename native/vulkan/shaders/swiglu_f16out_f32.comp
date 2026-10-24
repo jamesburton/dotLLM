@@ -1,0 +1,25 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+// SwiGLU with an F16 result: y[i] = float16_t(gate[i] * sigmoid(gate[i]) * up[i]). Feeds the F16-activation GEMM variants
+// (ffn-down: the widest-K GEMM in a dense model). The conversion is the SAME float16_t(float) cast the GEMM's own LDS staging
+// applies to F32 activations (tested bit-identical for ordinary values; packHalf2x16 rounds differently on this driver --
+// measured one F16 ULP off -- hence the explicit 16-bit store).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufGate   { float gate[];   };
+layout(set = 0, binding = 1, std430) readonly  buffer BufUp     { float up[];     };
+layout(set = 0, binding = 2, std430) writeonly buffer BufResult { float16_t result[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    float g = gate[i];
+    float sig = 1.0 / (1.0 + exp(-g));
+    result[i] = float16_t(g * sig * up[i]);
+}

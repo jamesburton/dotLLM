@@ -1,0 +1,6 @@
+#version 450
+// headDim<=256 flash attention (issue #441), 16 query rows per workgroup.
+// Body: attention_flash_f32_hd256.glsl (issue #1102 split it out so the F32 and F16-KV pipelines share one source).
+#define BR              16
+#extension GL_GOOGLE_include_directive : require
+#include "attention_flash_f32_hd256.glsl"
