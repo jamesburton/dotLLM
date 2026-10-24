@@ -1176,6 +1176,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             throw new ArgumentException("Snapshot / KV cache / state are not this model's types.");
         kv.RestorePrefixFrom(snap.Kv, snap.Length);
         snap.Gdn.CopyTo(gdn);
+        if (ReferenceEquals(gdn, _gdnCache))
+            _rowSnapshotValidRows = _pendingCommitRows = 0;   // #1194: a pending verify commit belongs to the overwritten state
     }
 
     /// <summary>
