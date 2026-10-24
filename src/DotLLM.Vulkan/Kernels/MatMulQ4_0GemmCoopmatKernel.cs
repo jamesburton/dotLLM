@@ -37,8 +37,9 @@ public sealed class MatMulQ4_0GemmCoopmatKernel : IDisposable
     /// <summary><c>DOTLLM_VK_Q4_GEMM_SMALL=0</c> keeps every shape on the 128x128 tile (A/B).</summary>
     public const string SmallEnvVar = "DOTLLM_VK_Q4_GEMM_SMALL";
 
-    // Below this many 128x128 tiles (~1.6 per CU on a 40-CU part) the 64x64 twin runs: 4x the workgroups, no stored partials.
-    private const int SmallGridMaxTiles = 64;
+    // Below this many 128x128 tiles (0.8 per CU on a 40-CU part) the 64x64 twin runs: 4x the workgroups, no stored partials. Measured on
+    // Strix at n = 512: m = 512 (16 tiles) 20.2 -> 11.0 ms per forward; m = 1024 (32 tiles) 24.4 -> 28.7 ms, so it stays on 128x128.
+    private const int SmallGridMaxTiles = 32;
     private const int SmallTile = 64;
     private const int PushConstantBytes = 5 * sizeof(uint); // M, K, N, blocksPerRow, rowUints
 
