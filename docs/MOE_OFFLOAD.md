@@ -159,6 +159,9 @@ experts are either all resident or all on the CPU for decode; multi-token calls 
   expert pointers), so it neither waits for the routing nor reads it back: three link round trips fewer per resident
   layer, bit-identical logits. CPU-expert layers still read the ids back (one round trip). `DOTLLM_CUDA_MOE_DEVICE_ROUTING=0`
   restores host routing.
+- **Token embeddings on the host** (#1183): an F32 `token_embd` (Flint: vocab 150,144 x 2048, 1.15 GiB) stays in the
+  mmap; the forward gathers the call's rows, converts them to F16 and uploads `hidden x 2` bytes per token. llama.cpp
+  keeps the table on the host too. Auto placement uses the freed VRAM for three more resident MoE layers on Flint.
 - **Routing top-k** (#1202): `moe_sigmoid_topk_f32` / `moe_softmax_topk_f32` picked the top-k on one thread with a
   "claimed" inner loop, 210 us per token for 256 experts / top-6 on the 3060 (10 ms per decoded Flint token across 47
   layers). They now run k rounds of a block-wide arg-max with the same tie rule (lower index wins), a few microseconds.
@@ -168,22 +171,31 @@ experts are either all resident or all on the CPU for decode; multi-token calls 
 
 ### Measured: Recursive Flint Q4_1 (26 GB) on an RTX 3060 12 GB (eGPU, Core Ultra 7 155H, 96 GB RAM)
 
-`CudaFlintCpuMoeRealProbe` (opt-in, `DOTLLM_FLINT_GGUF`), all 49 layers, KV for 4096 tokens:
+`dotllm bench -p 512 -n 64 -r 2 --warmup 1` vs `llama-bench -p 512 -n 64 -r 2` (llama.cpp master CUDA, default 16
+threads), three interleaved rounds, median (min-max). Peak VRAM is device-wide `nvidia-smi` minus idle; host is the
+process's peak private bytes minus its VRAM for dotLLM (WDDM counts its device allocations in private bytes), private
+bytes for llama.cpp (it does not). "before" is `dev` at 132eaf4c (#1187 + #1191).
 
-| placement | device weights | VRAM after load / peak | host private bytes minus VRAM | pp512 tok/s | tg64 @ 512 tok/s |
-|---|---|---|---|---|---|
-| auto (= `--n-cpu-moe 34`, 32 MoE layers on CPU) | 9.2 GiB | 10.0 / 10.6 GiB | ~0.9 GiB | 15-20 | 4.0-9.1 |
-| `--cpu-moe` (47 MoE layers on CPU) | 2.2 GiB | 2.6 / 3.2 GiB | ~0.7 GiB (baseline 0.28) | 19-21 | 4.9-9.3 |
-| llama.cpp master CUDA `-ncmoe 34` (llama-bench) | | 8.8 GiB peak | 0.6 GiB | 79 | 17.2 |
-| llama.cpp master CUDA `-ncmoe 99` (llama-bench) | | 1.7 GiB peak | 1.6 GiB | 56 | 12.7 |
+| engine, placement | pp512 tok/s | tg64 tok/s | peak VRAM | host |
+|---|---|---|---|---|
+| dotLLM before (#1187), `--n-cpu-moe 34` | 24.8 (24.5-24.9) | 13.6 (13.6-13.9) | 10.25 GiB | 1.1 GiB |
+| **dotLLM now, `--n-cpu-moe 34`** | **83.7** (83.5-84.2) | 19.1 (18.0-22.2) | 9.23 GiB | 0.9-1.2 GiB |
+| llama.cpp `-ncmoe 34` | 79.5 (78.9-79.8) | 21.3 (19.2-22.0) | 8.57 GiB | 0.8 GiB |
+| **dotLLM now, `--n-cpu-moe 36`** (less VRAM than llama.cpp `-ncmoe 34`) | **80.0** (79.9-80.1) | 19.7 (19.7-20.9) | 8.23 GiB | 0.9-1.2 GiB |
+| **dotLLM now, auto** (= `--n-cpu-moe 31`) | **88.3** (88.0-88.4) | **21.0** (19.7-22.0) | 10.73 GiB | 1.0-1.2 GiB |
+| llama.cpp `-ncmoe 31` | 87.5 (87.3-87.7) | 19.5 (18.8-22.5) | 9.97 GiB | 0.8 GiB |
 
-- On WDDM, dotLLM's device allocations count 1:1 in its private bytes, so the host column subtracts VRAM. It does not
-  grow with the 15-22 GiB of experts on the CPU: those are file-backed mmap pages, not private memory.
-- Decode varies run to run on this hybrid P/E-core CPU (the CPU leg is 1.2-3 ms per layer); `--moe-cpu-threads 12` was
-  the best of 4 / 7 / 12. The CPU leg was the whole prefill cost (22 of 25 s at pp512) until the GPU leg (#1202).
-- Quality vs the dotLLM CPU model (teacher-forced on the CUDA greedy ids, 5 F1 chat prompts x 32 tokens): top-1 157/160
-  in both placements, KL(cpu || cuda) mean 1.5e-3 (auto) / 2.0e-3 (`--cpu-moe`), max 2.9e-2 / 1.05e-1. The CPU-expert
-  share does not move it: the gap is the FP16 residual loop of the non-expert layers (#1172 measured 1.4e-3 on 8 layers).
+- Prefill is link-bound: the GPU leg sends ~190-225 of 256 experts per CPU layer over the 2.25 GB/s eGPU link while the
+  CPU computes the rest. It now beats llama.cpp at every placement, also at lower VRAM.
+- Decode is at parity within this machine's noise (the 155H is shared with other work and runs ThrottleStop; single
+  runs vary 15-23 tok/s for both engines). Per token: CPU leg ~17-30 ms, kernel launches ~1,000 at 15-31 us each on WDDM
+  (#1210). Runtime scratch keeps dotLLM ~0.65 GiB of VRAM above llama.cpp at the same placement (#1211).
+- The first prefill after load runs at ~40 tok/s: page-locking the mapped experts is lazy on this driver, so the first
+  DMA of each page pays for it.
+- Quality vs the dotLLM CPU model (`CudaFlintCpuMoeRealProbe`, 5 chat prompts x 32 teacher-forced tokens, auto
+  placement): top-1 157-158/160, KL mean 2.0-2.4e-3 (GPU leg off: 157/160, 1.5e-3). Against the CPU model with exact F32
+  expert activations (`DOTLLM_Q4E_DIAG_F32ACT=moe`): 160/160 and KL 5.6e-4 with the GPU leg vs 7.7e-4 without: the
+  streamed experts take F32 activations, so they move prefill away from the CPU leg's Q8_1 noise, towards the exact result.
 
 ## Telemetry
 
