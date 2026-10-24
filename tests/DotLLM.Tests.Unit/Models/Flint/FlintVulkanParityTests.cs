@@ -49,19 +49,14 @@ public sealed class FlintVulkanParityTests
         }
 
         /// <summary>
-        /// CPU reference logits. The dense Q4_1 projections run on F32 activations here (the pre-#1159 CPU prefill), which is
-        /// what the Vulkan dense prefill implements; since #1159 the CPU default is llama.cpp's Q8_1-activation dot.
+        /// CPU reference logits on the default CPU path: the Q4_1 projections run llama.cpp's Q8_1-activation dot at every token count
+        /// (#1159), as the Vulkan dense prefill does since #1235.
         /// </summary>
         public float[] CpuPrefill(int[] ids)
         {
             using var cpu = TransformerModel.LoadFromGguf(Gguf, Config, ThreadingConfig.SingleThreaded);
-            DotLLM.Cpu.Kernels.MatMul.Q4PackedAllColumnsOverride = false;
-            try
-            {
-                using ITensor t = cpu.Forward(ids, Enumerable.Range(0, ids.Length).ToArray(), deviceId: -1);
-                return Copy(t);
-            }
-            finally { DotLLM.Cpu.Kernels.MatMul.Q4PackedAllColumnsOverride = null; }
+            using ITensor t = cpu.Forward(ids, Enumerable.Range(0, ids.Length).ToArray(), deviceId: -1);
+            return Copy(t);
         }
 
         public void Dispose()
@@ -116,16 +111,21 @@ public sealed class FlintVulkanParityTests
         return (median, good);
     }
 
+    /// <summary>Median per-row KL a parity row may reach (see <see cref="AssertRowsAgree"/>).</summary>
+    private const double MedianKlLimit = 0.03;
+
     /// <summary>
-    /// Random-weight MoEs flip a top-k expert choice on near-ties between engines (Q8_1 activation rounding differs), which wrecks that ONE row only.
-    /// A systematic defect moves every row: median per-row KL tiny and at most ~15 % of the rows off.
+    /// Random-weight MoEs flip a top-k expert choice on near-ties between engines, which wrecks that ONE row only. With Q8_1 activations on
+    /// both sides (#1159 CPU, #1235 Vulkan dense prefill) any upstream difference (F16 KV, accumulation order) also flips single int8 codes,
+    /// which a random-weight model amplifies: measured medians 3e-3..1.4e-2 with 75-94 % of rows under 0.05 (RTX 3060 and 8060S), against
+    /// 1.2-1.6 with 0-19 % for the mutants below. A systematic defect moves every row.
     /// </summary>
     private void AssertRowsAgree(string tag, float[] vk, float[] cpu, int vocab)
     {
         Assert.Equal(cpu.Length, vk.Length);
         var (median, good) = Summarise(tag, RowKl(vk, cpu, vocab), 0.05);
-        Assert.True(median < 0.01, $"{tag}: median per-row KL {median}");
-        Assert.True(good >= 0.84, $"{tag}: only {good:P0} of rows agree");
+        Assert.True(median < MedianKlLimit, $"{tag}: median per-row KL {median}");
+        Assert.True(good >= 0.7, $"{tag}: only {good:P0} of rows agree");
     }
 
     /// <summary>Every projection stays Q4_1 on the device (no widened copy), and the KV cache is F16 (CLAUDE.md rules 1 and 2).</summary>
@@ -144,21 +144,33 @@ public sealed class FlintVulkanParityTests
         Assert.Equal(expected, cache.AllocatedBytes);
     }
 
-    /// <summary>16-token prefill into the F16 cache, window 4 &lt; 16: the F16-KV GQA flash sink kernel on every layer (#1200).</summary>
+    /// <summary>
+    /// 16-token prefill into the F16 cache, window 4 &lt; 16: the F16-KV GQA flash sink kernel on every layer (#1200). Dense Q4_1 projections on
+    /// the device default, then forced onto Q8_1 activations (#1235), which must reach the Q4_1 MMQ on every dense projection.
+    /// </summary>
     [SkippableTheory]
-    [InlineData(64)]
-    [InlineData(128)]   // real Flint head_dim
-    public void Prefill_F16Kv_MatchesCpu(int headDim)
+    [InlineData(64, false)]
+    [InlineData(128, false)]   // real Flint head_dim
+    [InlineData(64, true)]
+    [InlineData(128, true)]
+    public void Prefill_F16Kv_MatchesCpu(int headDim, bool q8_1Prefill)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var fx = new Fixture(Q41(window: 4, headDim: headDim));
         int[] ids = Ids(16);
         float[] cpu = fx.CpuPrefill(ids);
         using var vk = VulkanTransformerModel.LoadFromGguf(fx.Gguf, fx.Config, spvDir);
+        if (q8_1Prefill) vk.Q4_1PrefillQ8_1 = true;
         float[] rows = VulkanRows(vk, ids, prefill: ids.Length, out var cache);
         using (cache) { }
-        AssertRowsAgree("prefill f16kv", rows, cpu, fx.Config.VocabSize);
+        AssertRowsAgree($"prefill f16kv q8_1={vk.Q4_1PrefillQ8_1}", rows, cpu, fx.Config.VocabSize);
         Assert.True(vk.SinkFlashDispatchCount > 0, "prefill did not reach the GQA flash sink kernel (#1200)");
+        if (q8_1Prefill)
+        {
+            Skip.If(vk.Q4_1MmqDispatchCount == 0, "no Q4_1 MMQ on this device (needs integer dot products).");
+            // Per layer: q, k, v, o and the dense FFN's gate, up, down or the shared expert's gate, up, down.
+            Assert.Equal(SyntheticFlintGguf.Layers * 7, vk.Q4_1MmqDispatchCount);
+        }
     }
 
     /// <summary>
@@ -181,8 +193,8 @@ public sealed class FlintVulkanParityTests
     }
 
     /// <summary>
-    /// A 2..4-row forward from an F16 cache takes the F16 small-row split-KV kernel on every layer and matches the CPU rows. (Not compared with
-    /// the 1-row decode: there the Q4_1 projections run the dp4a MMVQ on Q8_1 activations, while 2..4 rows take the F32-activation GEMM.)
+    /// A 2..4-row forward from an F16 cache takes the F16 small-row split-KV kernel on every layer and matches the CPU rows. (Its Q4_1
+    /// projections run the Q8_1 MMQ (#1235), the 1-row decode the dp4a MMVQ on the same Q8_1 activations.)
     /// </summary>
     [SkippableTheory]
     [InlineData(2)]
@@ -207,7 +219,7 @@ public sealed class FlintVulkanParityTests
         Assert.Equal(SyntheticFlintGguf.Layers, vk.SmallRowAttnCount - a0);
         var kl = RowKl(batched, cpu.AsSpan(ctx * vocab, rows * vocab).ToArray(), vocab);
         var (median, _) = Summarise($"smallrow rows={rows}", kl, 0.05);
-        Assert.True(median < 0.01, $"small-row rows off the CPU: median KL {median}");
+        Assert.True(median < MedianKlLimit, $"small-row rows off the CPU: median KL {median}");
     }
 
     /// <summary>
