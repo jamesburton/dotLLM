@@ -393,6 +393,21 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
     /// <returns>The split count (at least 1).</returns>
     public static int ComputeGqaSplits(int seqKv, int numKvHeads) => ComputeSplits(seqKv, numKvHeads);
 
+    /// <summary>
+    /// Splits per KV head for the v2 grouped pass: the same occupancy target, but at least <see cref="Gqa2MinKvPerSplit"/> positions per
+    /// split. Its 128-row tile makes a 16-position split mostly launch and merge overhead (Flint on Strix: decode at 0.5K 70-72 -> 77 tok/s,
+    /// at 8K 63 -> 66, 32K unchanged since the occupancy cap binds there).
+    /// </summary>
+    /// <param name="seqKv">KV positions the splits cover.</param>
+    /// <param name="numKvHeads">KV heads.</param>
+    /// <returns>The split count (at least 1).</returns>
+    public static int ComputeGqa2Splits(int seqKv, int numKvHeads)
+        => seqKv <= 0 || numKvHeads <= 0 ? 1
+            : Math.Max(1, Math.Min(Math.Max(1, TargetWorkgroups / numKvHeads), (seqKv + Gqa2MinKvPerSplit - 1) / Gqa2MinKvPerSplit));
+
+    /// <summary>Position floor per split of the v2 grouped pass (measured: 64 beat 16, 128 and 256 on Flint / Strix).</summary>
+    public const int Gqa2MinKvPerSplit = 64;
+
     internal static int MaxSplitsFor(int numHeads)
         => numHeads <= 0 ? 1 : Math.Max(1, TargetWorkgroups / numHeads);
 
@@ -475,7 +490,9 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         if (kvStart < 0 || kvStart >= seqKv) throw new ArgumentOutOfRangeException(nameof(kvStart));
         if (sinks is not null && sinks.Size < (long)numHeads * sizeof(float)) throw new ArgumentException("Sinks buffer too small.", nameof(sinks));
         bool gqa = UsesGqa(numHeads, numKvHeads, headDim);
-        int numSplits = gqa ? ComputeGqaSplits(seqKv - kvStart, numKvHeads) : ComputeSplits(seqKv - kvStart, numHeads);
+        bool gqa2 = gqa && UsesGqa2(numHeads, numKvHeads, headDim);
+        int numSplits = gqa2 ? ComputeGqa2Splits(seqKv - kvStart, numKvHeads)
+            : gqa ? ComputeGqaSplits(seqKv - kvStart, numKvHeads) : ComputeSplits(seqKv - kvStart, numHeads);
 
         EnsureScratch(numHeads);
 
@@ -492,7 +509,6 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         // ── Pass 1: split ────────────────────────────────────────────────
         Span<nint> splitBuffers = stackalloc nint[5]
             { q.Handle, k.Handle, v.Handle, _partOut!.Handle, _partMS!.Handle };
-        bool gqa2 = gqa && UsesGqa2(numHeads, numKvHeads, headDim);
         ComputePipeline splitPipeline = gqa2 ? _gqa2Pipeline! : gqa ? _gqaPipeline! : _splitPipeline;
         nint splitSet = (gqa2 ? _gqa2Cache! : gqa ? _gqaCache! : _splitCache).GetOrCreate(splitBuffers);
 
