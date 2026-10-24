@@ -859,12 +859,15 @@ come for free:
 grouped dynamic causal convolutions (kernel 2, group 16) and the rank-256 / top-16 candidate selector, walked greedily from
 the anchor. The block embedding and the lm-head are the **target's** (no copy).
 
-**Backends.** The drafter's forward runs on an `IDFlashBackend`. CPU (`Qwen3HybridDenseTransformerModel`) and Vulkan
-(`VulkanQwen3HybridDenseTransformerModel`, GPU verify) use the CPU backend; the Vulkan verify forward copies the tapped rows to
-a host-readback buffer and the drafter's lm-head runs on the device with the target's head. CUDA
-(`CudaQwen3HybridDenseTransformerModel`) runs the whole drafter on the GPU: weights uploaded as stored (1.1 GB for the Q4_K_M
-drafters), the context ring in device F16, and `dflash_f32.ptx` for the DFlash2 convolution, the ring attention and
-multi-column Q4_K / Q6_K GEMVs that read each weight block once per 8 rows (no F16 expansion).
+**Backends.** The drafter's forward runs on an `IDFlashBackend`. CPU (`Qwen3HybridDenseTransformerModel`) uses the CPU backend.
+CUDA (`CudaQwen3HybridDenseTransformerModel`) and Vulkan (`VulkanQwen3HybridDenseTransformerModel`, #1193) run the whole drafter on
+the GPU: weights uploaded as stored (1.1 GB for the Q4_K_M drafters; on a UMA Vulkan device imported zero-copy from the mmap), the
+context ring in device F16, the trunk's projection / norm / SwiGLU / add kernels and the target's own embedding and lm-head. Their own
+kernels are the DFlash2 convolution, the ring write, a fused per-head RMSNorm + NeoX RoPE (cos/sin from a host table in double, as the
+CPU) and the block attention over the ring (`dflash_f32.ptx`; `dflash_*.comp` on Vulkan, where the attention is a tiled online softmax
+so the 2048-position window fits Strix Halo's 32 KB of shared memory). On Vulkan the verify's tap injection and the next draft record
+into one command buffer: a draft is one submit for the layers (read back for the selector) and one for the head. The verify forward
+copies the tapped rows to host memory (F16 in the state) on both GPU hosts.
 
 **Measured** (Bonsai-2 27B PQ2_0 abliterated + the `naklitechie` r3 drafter, RTX 3060, 128 tokens greedy, code prompt; the
 host CPU was shared with other jobs, hence ranges). Every run was token-identical to plain decode.
@@ -888,10 +891,11 @@ uses the MTP decoder's exact accept/residual rule unchanged.
 (42 MB for Qwen3.8-27B-DFlash2). Taps: `rows × 5 × 5120 × 2 B` F16 per verify (400 KB at B = 8), capped at the ring for a
 long prefill and released after it.
 
-**Knobs.** `DOTLLM_DFLASH_DRAFT=n` caps drafts per round (default B-1 = 7); `DOTLLM_DFLASH_THREADS` sizes the GPU hosts'
-CPU drafter pool (default half the logical processors); `DOTLLM_DFLASH_TRACE=1` prints draft / inject wall time per request.
+**Knobs.** `DOTLLM_DFLASH_DRAFT=n` caps drafts per round (default B-1 = 7); `DOTLLM_DFLASH_TRACE=1` prints draft / inject wall
+time per request (and, on Vulkan, the drafter's submit count and wait). Vulkan small-row GEMVs: `DOTLLM_VK_Q4K_MULTI_ROWS` (1/2/4/8 output
+rows per workgroup, default 4; `DOTLLM_VK_Q4K_MULTI_R4=0` = the old one-row kernel) and `DOTLLM_VK_SMALLROW_Q6K_R2_MIN_ROWS` (default 3).
 
-**Not yet.** A GPU-resident drafter; tree (DDTree) verification; reduced-vocab (`d2t`), DSpark and LiliCorr drafters;
+**Not yet.** Tree (DDTree) verification; reduced-vocab (`d2t`), DSpark and LiliCorr drafters;
 sampled-selector proposals (llama.cpp's DFlash2 sampled mode).
 
 ### `qwen35moe` MTP head (issue #1188)
