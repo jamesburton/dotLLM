@@ -1157,7 +1157,7 @@ public sealed partial class VulkanTransformerModel : IModel
     }
 
     /// <summary>
-    /// KV storage <see cref="CreateKvCache"/> allocates: F16 for Flint (#1171; CLAUDE.md rule 1, <c>DOTLLM_VK_KV=f32</c> is the A/B
+    /// KV storage <see cref="CreateKvCache(int)"/> allocates: F16 for Flint (#1171; CLAUDE.md rule 1, <c>DOTLLM_VK_KV=f32</c> is the A/B
     /// baseline), F32 for every other architecture until their attention dispatch reads F16 in place (#1151).
     /// </summary>
     public VulkanKvStorage DefaultKvStorage =>
@@ -1293,7 +1293,32 @@ public sealed partial class VulkanTransformerModel : IModel
     /// global layers carry different KV-head counts AND head dims).
     /// </remarks>
     public VulkanKvCache CreateKvCache(int maxSeqLen)
-        => new(_device, KvGeometry.FromConfig(Config), maxSeqLen, DefaultKvStorage);
+        => CreateKvCache(maxSeqLen, SupportsCompactSlidingKv);
+
+    /// <summary>
+    /// As <see cref="CreateKvCache(int)"/>, choosing whether sliding-window layers keep only their recent rows (issue #1176). Passing
+    /// <see langword="false"/> gives the full-length baseline for A/B runs; <see langword="true"/> requires
+    /// <see cref="SupportsCompactSlidingKv"/>.
+    /// </summary>
+    /// <param name="maxSeqLen">Positions the cache holds.</param>
+    /// <param name="compactSlidingWindows">Keep only the recent rows of sliding-window layers.</param>
+    /// <returns>The cache.</returns>
+    public VulkanKvCache CreateKvCache(int maxSeqLen, bool compactSlidingWindows)
+    {
+        if (compactSlidingWindows && !SupportsCompactSlidingKv)
+            throw new NotSupportedException($"{Config.Architecture} on this Vulkan model reads cached rows by absolute position; it cannot take a compact sliding-window cache.");
+        return new(_device, KvGeometry.FromConfig(Config, compactSlidingWindows), maxSeqLen, DefaultKvStorage);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Flint only (issue #1176): its every attention read goes through the per-sequence <c>Forward</c>'s
+    /// <see cref="VulkanKvCache.RecordUpdate"/> arm, which applies the row base. Other sliding-window architectures here
+    /// (Gemma-2/3/4, gpt-oss, Mistral) also reach the fused RoPE+KV write, the batched forward or Gemma-4 shared-KV donors,
+    /// which address rows by absolute position. A pipeline stage keeps full rows (its cache slots are stage-local).
+    /// </remarks>
+    public bool SupportsCompactSlidingKv =>
+        Config.Architecture == DotLLM.Core.Configuration.Architecture.Flint && _firstLayer == 0 && !_headless && !_noTokenEmbed;
 
     /// <summary>
     /// Creates a GPU-resident Q8_0/Q4_0 quantized KV-cache on this model's device. Pure-quantized
@@ -3941,7 +3966,10 @@ public sealed partial class VulkanTransformerModel : IModel
         // next dispatch binds a dangling VkBuffer. In steady-state decode
         // (seqLen = 1 after the initial prefill) scratch never grows, so the
         // cache stays warm across forwards.
-        if (scratchResized)
+        // A compact sliding-window cache (#1176) grows a ring that a long prefill chunk would overflow, here, before recording:
+        // the grown buffers are new handles, so cached descriptor sets go stale exactly as on a scratch resize.
+        bool kvRingGrown = kvCache is VulkanKvCache { HasCompactWindows: true } ringCache && ringCache.EnsureWindowCapacity(positions);
+        if (scratchResized || kvRingGrown)
             InvalidateKernelCaches();
 
         // All-row logits (#564), opt-in: reuse the diffusion all-position head. Its logits buffer is
@@ -4245,7 +4273,7 @@ public sealed partial class VulkanTransformerModel : IModel
                 && _gptOss is null   // gpt-oss: YaRN table + mscale live in RecordRopeQk, not the fused shader
                 && _ropeInvFreq is null
                 && !noRopeLayer
-                && kvCache is VulkanKvCache { Storage: VulkanKvStorage.F32 }
+                && kvCache is VulkanKvCache { Storage: VulkanKvStorage.F32, HasCompactWindows: false }
                 && IsContiguousAscending(positions);
 
             if (useFusedRopeKv)
@@ -4290,8 +4318,12 @@ public sealed partial class VulkanTransformerModel : IModel
                     else BarrierTransferToCompute(cmdBuf);
                     kSrc = vkCache.GetKeysBuffer(layer);
                     vSrc = vkCache.GetValuesBuffer(layer);
-                    seqKv = vkCache.CurrentLength;
-                    positionOffset = positions[0];
+
+                    // Compact sliding-window slot (#1176): row 0 holds position rowBase; masks are relative and K is stored after
+                    // RoPE, so shifting the query offset and the KV length by the same base is exact.
+                    int rowBase = vkCache.RowBaseOf(layer);
+                    seqKv = vkCache.CurrentLength - rowBase;
+                    positionOffset = positions[0] - rowBase;
                 }
                 else if (kvCache is VulkanTurboQuantKvCache tqCache)
                 {

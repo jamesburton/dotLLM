@@ -25,16 +25,16 @@ public sealed class FlintVulkanParityTests
     public FlintVulkanParityTests(ITestOutputHelper output) => _output = output;
 
     /// <summary>All-Q4_1 Flint at Vulkan-friendly widths (packed Q4_1 banks need K % 256 == 0).</summary>
-    private static SyntheticFlintGguf.Options Q41(int window, bool fullSinks = true, int headDim = 64) => new()
+    internal static SyntheticFlintGguf.Options Q41(int window, bool fullSinks = true, int headDim = 64) => new()
     {
         Hidden = 256, MoeFf = 256, DenseFf = 256, HeadDim = headDim, Window = window, RouterStd = 0.15f,
         DenseQuant = QuantizationType.Q4_1, RoutedQuant = QuantizationType.Q4_1, SharedQuant = QuantizationType.Q4_1,
         FullLayerSinks = fullSinks,
     };
 
-    private static int[] Ids(int n) => Enumerable.Range(0, n).Select(i => (i * 7 + 3) % SyntheticFlintGguf.Vocab).ToArray();
+    internal static int[] Ids(int n) => Enumerable.Range(0, n).Select(i => (i * 7 + 3) % SyntheticFlintGguf.Vocab).ToArray();
 
-    private sealed class Fixture : IDisposable
+    internal sealed class Fixture : IDisposable
     {
         private readonly string _path;
         public GgufFile Gguf { get; }
@@ -62,7 +62,7 @@ public sealed class FlintVulkanParityTests
         }
     }
 
-    private static unsafe float[] Copy(ITensor t)
+    internal static unsafe float[] Copy(ITensor t)
     {
         var f = new float[checked((int)t.Shape.ElementCount)];
         new ReadOnlySpan<float>((void*)t.DataPointer, f.Length).CopyTo(f);
@@ -87,7 +87,7 @@ public sealed class FlintVulkanParityTests
         return all.ToArray();
     }
 
-    private static double[] RowKl(float[] vk, float[] cpu, int vocab)
+    internal static double[] RowKl(float[] vk, float[] cpu, int vocab)
     {
         int rows = cpu.Length / vocab;
         var kl = new double[rows];

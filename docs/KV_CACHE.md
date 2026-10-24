@@ -252,6 +252,32 @@ A sliding-window layer with window `W` only ever reads the last `W` positions, s
 - Tests: `SlidingWindowKvCacheTests` (bit-identical attention through compactions, an oversized chunk, rollback in and past the
   margin, F32 / Q8_0 / Q4_0). Real weights: `NemotronProbe swa` runs one stream through a full and a compact cache.
 
+### Compact sliding-window KV on Vulkan (issue #1176)
+
+The same ring on `VulkanKvCache` (F16 for Flint, F32 also works). `SlidingWindowRows` now lives in `DotLLM.Core.Attention` and
+only plans (`TryPlan` / `Commit`); each backend carries out the move.
+
+- **Opt-in.** `VulkanTransformerModel.SupportsCompactSlidingKv` is true for Flint on a single device only, and `CreateKvCache(n)`
+  follows it; `CreateKvCache(n, compactSlidingWindows: false)` is the full-length A/B baseline (`NemotronProbe swa ... vulkan`,
+  `STEPS_FULLKV=1` for `steps`). Gemma-2/3/4, gpt-oss and Mistral-SWA stay on full rows: they also reach the fused RoPE+KV write,
+  the batched forward or Gemma-4 shared-KV donors, which address rows by absolute position. A pipeline stage keeps full rows.
+- **Compaction on the device.** `RecordUpdate` records the move into the forward's command buffer before the F16 write. When the
+  kept rows do not overlap their destination (every decode compaction: shift = keep) it is one `vkCmdCopyBuffer` per K / V;
+  otherwise (a prefill chunk crossing the end of the ring) the rows stage through a cache-owned scratch of `W - 1 + 64` rows for
+  K and V, since `vkCmdCopyBuffer` forbids overlapping regions. Barriers come from the hazard tracker, or a blanket
+  compute/transfer barrier on the untracked path. No host round trip.
+- **Oversized chunks grow the ring before recording.** A chunk longer than the ring's free half needs a bigger buffer. Growing
+  swaps buffer handles, so `Forward` calls `EnsureWindowCapacity(positions)` before it records and drops the kernels' cached
+  descriptor sets when anything grew (as on a scratch resize); the kept rows move with a one-off device copy. The ring is
+  grow-only on Vulkan (shrinking would invalidate descriptors again), so it settles at `W - 1 + 64 + chunk` rows.
+- **Attention.** The forward passes `positions[0] - base` / `CurrentLength - base`; the sink, split-KV and small-row kernels are
+  unchanged. The fused RoPE+KV write and the host-staged paths (`IngestFromHost`, `DownloadLayer`) refuse a compact cache.
+- **Rollback / truncation** behave as on the CPU (`CanTruncateTo`, `Rollback`, `SetCurrentLength`, `Reset`).
+- **Bytes** (Flint, F16, 2 KiB per token per layer): 4K 392 → 191 MiB, 32K 3.06 → 0.95 GiB, 262K 24.5 → 7.08 GiB (14 full
+  layers + 35 rings of 1,152 rows).
+- Tests: `FlintVulkanCompactKvTests` (synthetic Flint, window 20: an overlapping in-ring compaction, a grown ring and direct decode
+  compactions against the full-length F16 cache and the CPU compact cache; rollback within / past the margin; reset and reuse).
+
 ## Paged KV-Cache
 
 Inspired by OS virtual memory paging. This is the **memory management** half of PagedAttention (vLLM): block-based allocation, ref counting, CoW. The **kernel** half (attention reading non-contiguous blocks directly) is opt-in on CUDA as of issue #200 (`DOTLLM_ATTN_PAGED_NATIVE=1`, decode only — see the CUDA section below); it remains a future step for CPU and any future Vulkan paged cache, where current kernels still see contiguous buffers via staging-buffer gather.
