@@ -183,6 +183,20 @@ public sealed class VulkanNemotronHDFlashTests : IDisposable
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out _spvDir);
         LiLiCorrDrafterTests.AssertTokenIdentical(_dir, Vk, _out);
     }
+
+    /// <summary>
+    /// The pre-verify state copy (<c>DOTLLM_NEMOTRON_VERIFY_COPY=1</c>, #1244): allocating the checkpoint after the per-row snapshot buffers
+    /// used to dispose the snapshots, and the verify then hit a null snapshot buffer.
+    /// </summary>
+    [SkippableFact]
+    public void SpeculativeDecode_WithVerifyCopy_IsTokenIdenticalToGreedy()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out _spvDir);
+        bool was = VulkanNemotronHTransformerModel.ReadOnlyVerifyEnabled;
+        VulkanNemotronHTransformerModel.ReadOnlyVerifyEnabled = false;
+        try { LiLiCorrDrafterTests.AssertTokenIdentical(_dir, Vk, _out); }
+        finally { VulkanNemotronHTransformerModel.ReadOnlyVerifyEnabled = was; }
+    }
 }
 
 /// <summary>Sends short Nemotron-H batches down the prefill kernels for the duration of a test that checks those kernels (#1237).</summary>

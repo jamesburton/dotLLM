@@ -442,7 +442,6 @@ public sealed partial class VulkanNemotronHTransformerModel : IDFlashDraftAttach
         if (_ckptConv is not null) foreach (var b in _ckptConv) b.Dispose();
         if (_ckptSsm is not null) foreach (var b in _ckptSsm) b.Dispose();
         _ckptConv = _ckptSsm = null;
-        DisposeRowSnapshotBuffers();
     }
 
     private void DisposeRowSnapshotBuffers()
@@ -658,5 +657,6 @@ public sealed partial class VulkanNemotronHTransformerModel : IDFlashDraftAttach
         _dflashTapBuffer?.Dispose();
         _dflashTapBuffer = null;
         DisposeCheckpointBuffers();
+        DisposeRowSnapshotBuffers();
     }
 }
