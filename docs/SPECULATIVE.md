@@ -136,20 +136,43 @@ state copy before every verify. A model that reports `SupportsRecurrentRowSnapsh
 row `0..S-2`; the state after the last row is the live state) and `RestoreRecurrentStateToRow(n)`.
 This is llama.cpp's `n_rs_seq` snapshot ring. `MtpSpeculativeDecoder` uses it when available: it
 verifies `[lastToken, d1..dK]` through the snapshot forward, skips the checkpoint, and on a
-rejection at `accepted` restores row `accepted`. There is no replay. Both the GDN matrix state and
-the conv1d window are captured, the latter as `ConvInput` rows `t+1 .. t+dConv-1`.
+rejection at `accepted` restores row `accepted`. There is no trunk replay. Both the GDN matrix state and
+the conv1d window are restored, the latter from `ConvInput` rows `t+1 .. t+dConv-1`.
 
-- **Implemented:** CPU `Qwen3HybridDenseTransformerModel` (`GatedDeltaNetScan.Execute` copies
-  the state out after each row) and `VulkanQwen3HybridDenseTransformerModel` (the
-  `gdn_scan_multi_token_lds_fused_snap_f32` twin of the shipping scan writes each row's state from
-  LDS), and since #478 `CudaQwen3HybridDenseTransformerModel` (no new kernel: the CUDA scan is
-  already one launch per token, so each row's state is a D2D copy right after its launch; the
-  scratch is laid out `[row][layer]` so a restore is two copies). The CUDA checkpoint is pooled
-  (one spare) like the CPU and Vulkan ones (#469).
+**What is stored (#1194).** Not a full GDN state per row: that was `K × layers × NVHead·DState²` F32,
+1047 MiB on Bonsai-2 27B at DFlash K=7, and FP32 storage that scaled with K (#1107 rule 1). The verify
+keeps the state *before* the verify once, plus each row's scan inputs, plus the `ConvInput` rows
+`1 .. K+dConv-2` that every row's conv window lies in. A restore to row `r` replays `r+1` scan steps
+of the recurrence alone (no trunk forward) from the pre-verify state: the same operations on the same
+inputs, so the state is **bit-identical** to the one the verify passed through after row `r`.
+
+- **Implemented:** dense `qwen35` on all three backends.
+  - CPU `Qwen3HybridDenseTransformerModel`: `GatedDeltaNetScan.Execute` records each row's delta
+    `β(v − Sᵀk)`, and `GatedDeltaNetScan.Replay` rebuilds `S = S·g + k⊗d` (#842, as Qwen4Exp does).
+  - CUDA `CudaQwen3HybridDenseTransformerModel`: `gdn_scan_replay_f32_d128` keeps each state column in
+    registers across the replayed rows, reading the pre-verify state and writing the live one (no restore
+    copy). It is bit-exact against the scan (`GdnScanReplayF32_IsBitIdenticalToTheScan`). The opt-in
+    split4 scan (`DOTLLM_GDN_SCAN_APPROX_SPLIT4`) re-associates, so with it the restore re-runs it.
+  - Vulkan `VulkanQwen3HybridDenseTransformerModel`: the shipping multi-token scan (the same pipeline the
+    verify used) replays the recorded rows. The `_snap` twin kernel is no longer used by this model.
+  - Still a full state per row: the Vulkan `qwen35moe` and Qwen4Exp hosts (`Q4GdnRowSnapshots`, #1188; #1221 ports this).
+    The CPU Qwen4Exp host already replays (#842).
+  - The CUDA checkpoint is pooled (one spare) like the CPU and Vulkan ones (#469).
 - **Opt-out:** `DOTLLM_MTP_GDN_SNAPSHOTS=0`, or `MtpSpeculativeDecoder.UseRecurrentRowSnapshots`
   in-process. `Replays` and `ReplaysAvoided` count each path.
-- **Memory:** `K x GDN layers x (NVHead*DState^2 + conv)` floats, grown to the largest K seen and
-  kept. That is about 150 MiB per row on Bonsai 2 27B (449 MiB at K=3).
+- **Memory:** one GDN state (`layers × NVHead·DState²` F32) plus, per row and layer, the scan inputs
+  (CUDA/Vulkan: q, k, v, g, β; CPU: k, g, delta), plus `(K + dConv − 2) × convDim` per layer of conv rows.
+  Grown to the largest K seen and kept. Bonsai-2 27B at K=7: **174 MiB** (was 1047 MiB): 144 MiB of state,
+  13 MiB of inputs, 17 MiB of conv rows.
+- **Cost (Bonsai-2 27B, RTX 3060, K=7, host shared with other jobs):** a restore went from ~1 ms (one
+  copy) to ~3 ms (the replay). The verify no longer writes 7 states, so its snapshot overhead fell from
+  ~17 ms to ~6–9 ms. DFlash decode tok/s is unchanged (medians 20.26 before and 20.36 after over 5
+  interleaved pairs), and every run was token-identical.
+  On Strix Vulkan (8060S), DFlash K=7 medians went 20.61 → 21.09 tok/s and MTP K=3 went 33.99 → 35.71 (3 alternated rounds each), all token-identical.
+- **Why not 16-bit snapshots (#1107):** a BF16/F16 snapshot restores a rounded state, so a rejected
+  round would leave a different recurrence than plain decode. That breaks greedy token identity, the
+  hard gate. Storing inputs instead is exact and smaller than 16-bit states for any K ≥ 1. The live
+  state's own precision is #1144.
 - **Numerics:** a snapshot comes from inside the K+1-row batch, and a replay is a shorter batch, so
   the two differ at ULP scale (CPU GEMM tiles by n, Vulkan picks its matmul pipeline by width).
   Greedy output is identical. `MtpSpeculativeDecoderGdnStateTests`' byte-exact serial comparison
@@ -880,7 +903,9 @@ host CPU was shared with other jobs, hence ranges). Every run was token-identica
 | llama.cpp PrismML fork plain / MTP K=3 | 15.6 / 22.2 | – / 3.6 | 7.6 / 8.3 GB |
 | llama.cpp PrismML fork DFlash K=7 | did not fit: card full, 0.38 tok/s | 6.9 | – |
 
-The extra DFlash VRAM is the drafter (1.1 GB) plus the per-row GDN snapshots of a 7-row verify (#473, ~0.9 GB, F32). On the
+The extra DFlash VRAM was the drafter (1.1 GB) plus the per-row GDN snapshots of a 7-row verify (#473, ~0.9 GB, F32). Since
+#1194 a verify keeps one pre-verify state and the rows' scan inputs instead (1047 → 174 MiB at K=7), so the DFlash rows above
+overstate today's VRAM by ~0.87 GB. On the
 CPU (Strix Halo, Bonsai-2) DFlash breaks even (3.3 vs 3.4 tok/s): an 8-row CPU verify costs ~7× a decode step there.
 
 **Strix Halo (8060S, Vulkan, #1193).** 128 tokens greedy, `DOTLLM_MTP_ADAPTIVE=0`, `DOTLLM_DFLASH_DRAFT=K`, four prompts (code,
