@@ -155,7 +155,7 @@ inputs, so the state is **bit-identical** to the one the verify passed through a
     split4 scan (`DOTLLM_GDN_SCAN_APPROX_SPLIT4`) re-associates, so with it the restore re-runs it.
   - Vulkan `VulkanQwen3HybridDenseTransformerModel`: the shipping multi-token scan (the same pipeline the
     verify used) replays the recorded rows. The `_snap` twin kernel is no longer used by this model.
-  - Still a full state per row: the Vulkan `qwen35moe` and Qwen4Exp hosts (`Q4GdnRowSnapshots`, #1188).
+  - Still a full state per row: the Vulkan `qwen35moe` and Qwen4Exp hosts (`Q4GdnRowSnapshots`, #1188; #1221 ports this).
     The CPU Qwen4Exp host already replays (#842).
   - The CUDA checkpoint is pooled (one spare) like the CPU and Vulkan ones (#469).
 - **Opt-out:** `DOTLLM_MTP_GDN_SNAPSHOTS=0`, or `MtpSpeculativeDecoder.UseRecurrentRowSnapshots`
