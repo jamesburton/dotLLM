@@ -118,6 +118,43 @@ public sealed class CudaFlintParitySyntheticTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// The FP16 loop's residual stream past the F16 range (#1191): real Flint's residual reaches ~3.5e4 after the layer-46 MoE, so
+    /// CUDA carries it scaled by <see cref="CudaTransformerModel.ResidualStreamScale"/> (1/8). Here routed gate/up are scaled until
+    /// the MoE output, and with it the residual, exceeds 65504: the scaled stream must stay finite and match the exact CPU, and the
+    /// unscaled stream (scale 1) must overflow, or the test cannot see the bug.
+    /// </summary>
+    [SkippableFact]
+    public void ResidualBeyondF16Range_ScaledStreamStaysFiniteAndMatchesCpu()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
+        var o = AllQ4_1 with { ExpertGateUpScale = HugeResidualGateUpScale };
+        using var gguf = GgufFile.Open(Write(o, "huge-resid"));
+        using var exact = GgufFile.Open(Write(o with { F32Roundtrip = true }, "huge-resid-f32"));
+        ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        int vocab = SyntheticFlintGguf.Vocab;
+        float[] cpu = CpuRows(exact, cfg);
+        Assert.All(cpu, v => Assert.True(float.IsFinite(v)));
+        float[] cpuLast = cpu.AsSpan((Ids.Length - 1) * vocab, vocab).ToArray();
+
+        float[] Run(float scale)
+        {
+            var (model, _) = CudaModelLoader.CreateFromGguf(gguf, cfg, deviceId: 0);
+            using (model)
+            {
+                ((CudaTransformerModel)model).ResidualStreamScale = scale;
+                using ITensor t = model.Forward(Ids, Enumerable.Range(0, Ids.Length).ToArray(), deviceId: -1);
+                return Copy(t);
+            }
+        }
+
+        AssertMatch("huge residual, scaled stream", cpuLast, Run(0.125f));
+        Assert.False(Run(1f).All(float.IsFinite), "the unscaled F16 residual stayed finite: the synthetic MoE output does not reach the F16 limit");
+    }
+
+    /// <summary>Routed gate/up std multiplier that pushes the synthetic MoE output past 65504 but keeps it below 8 x 65504.</summary>
+    private const float HugeResidualGateUpScale = 120f;
+
     /// <summary>CPU-only: NoPE, the sliding window, the shared expert, renormalisation and the sinks each move the logits far above <see cref="AbsTol"/>.</summary>
     [Fact]
     public void EveryFlintFeatureMovesLogitsFarAboveParityTolerance()

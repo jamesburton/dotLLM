@@ -3,7 +3,8 @@
 // (the original benefit of fusing) AND now also avoids the FP16 round-trip in
 // the second pass — the FP32 sum is cached in shared memory.
 //
-//   1. sum = FP32(residual) + FP32(x)         — keep in FP32
+//   1. sum = FP32(residual) * r_scale + FP32(x) * x_scale — keep in FP32
+//      (r_scale / x_scale are 1 except on a power-of-two scaled residual stream, #1191)
 //   2. residual[i] = FP16(sum)                 — update residual buffer (FP16 store)
 //   3. shmem[i] = sum                          — cache FP32 sum for pass 2
 //   4. output[i] = FP16(sum * rsqrt(rms) * w)  — normalize from cached FP32 sum
@@ -26,7 +27,9 @@ extern "C" __global__ void __launch_bounds__(256) fused_add_rmsnorm_f16(
     const half* __restrict__ weight,   // [n] norm weights
     half* __restrict__ output,         // [n] normalized output (may alias `x`)
     const int n,
-    const float eps)
+    const float eps,
+    const float r_scale,
+    const float x_scale)
 {
     extern __shared__ float smem[];
     // smem[0 .. n-1]            : FP32 sum cache
@@ -54,8 +57,8 @@ extern "C" __global__ void __launch_bounds__(256) fused_add_rmsnorm_f16(
         half2 xi = x2[i];
         float r0 = __low2float(r),  r1 = __high2float(r);
         float x0 = __low2float(xi), x1 = __high2float(xi);
-        float s0 = r0 + x0;
-        float s1 = r1 + x1;
+        float s0 = fmaf(r0, r_scale, x0 * x_scale);
+        float s1 = fmaf(r1, r_scale, x1 * x_scale);
         res2_out[i] = __floats2half2_rn(s0, s1);
         smem[2 * i]     = s0;
         smem[2 * i + 1] = s1;
@@ -69,7 +72,7 @@ extern "C" __global__ void __launch_bounds__(256) fused_add_rmsnorm_f16(
         int last = n - 1;
         float r = __half2float(res_row[last]);
         float xi = __half2float(x_row[last]);
-        float s = r + xi;
+        float s = fmaf(r, r_scale, xi * x_scale);
         res_row[last] = __float2half(s);
         smem[last] = s;
         sum_sq = fmaf(s, s, sum_sq);

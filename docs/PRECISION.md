@@ -100,7 +100,7 @@ Only what the data proved. Everything here is **in registers or within a tile**,
 | Split-KV *m*/*ℓ* (LSE) partials, split-K combine | not measured → **#1144** (an F16 LSE at magnitude 20 gives ≈1.6% weight error `[lit, derived]`) |
 | Sampled-row logits and the V-wide LSE | policy (4·V B per sampled row) → bounded to sampled rows by **#1137** |
 | RoPE angle `pos·θ` (F64 for the YaRN ramp) | compute only; F16 cos/sin tables not measured → **#1142** |
-| Residual stream of models that overflow F16 (BitNet) | per-model exception; measurement → **#1138** |
+| Residual stream of models that overflow F16 (BitNet) | per-model exception; measurement → **#1138**. Flint (3.5e4) instead carries an F16 stream scaled by 1/8 on CUDA (E13) |
 
 **Not justified anywhere:** F32 weights, F32 KV, F32 MTP/draft KV, F32 inter-kernel activations (pending #1138), F32
 embedding tables.
@@ -413,6 +413,49 @@ F32-acc reference: 230.3 / 222.4 / 207.4 tok/s. Same 1,136-row protocol as E2: S
 
 No F32-weight reference exists on Vulkan, so the MMQ vs coopmat comparison is path against path (KL 3.2e-4 apart);
 which is closer to F32 truth is #1150.
+
+### E13 — Activation range at GPU F16 / Q8_1 storage sites (#1191)
+
+Measured on the CPU forward with `DOTLLM_AMAX_PROBE=<tsv>` (`ActivationRangeProbe`: per layer and site, max |x| and the
+largest 32-element block sum, which is what a Q8_1 block's F16 `s` holds). Prefill in 512-token chunks through the KV
+cache. Corpora: an 8K-token Flint-format coding-agent trace (system + tools + tool calls over repo sources and git logs)
+and 8K tokens of wikitext-2 test.
+
+**Recursive Flint Q4_1** (16,512 tokens). Max over all layers; the large values all sit in layers 46-48.
+
+| site | max \|x\| | max \|block sum\| | layer | GPU storage | headroom vs 65504 |
+|---|---|---|---|---|---|
+| routed down input (SwiGLU out) | **239,269** | 245,325 | 48 | Vulkan grouped coopmat F16, CPU Q8_1 `s` | **overflows**: guarded (#1158 CPU, #1171 Vulkan) |
+| residual stream | **34,605** | 39,922 | 48 | CUDA F16 (`Residual`) | **1.9x**: scaled by 1/8 on CUDA (#1191) |
+| MoE output | 32,610 | 34,953 | 46 | CUDA F16 (MoE staging out) | 2.0x: scaled in F32 before the store (#1191) |
+| shared-expert down input | 6,308 | 8,561 | 48 | Vulkan coopmat F16 (prefill), CPU Q8_1 `s` | 10x / 7.7x: unguarded |
+| FFN input (RMSNorm out) | 3,359 | 3,296 | 46 | coopmat F16 gate/up | 20x |
+| attention in | 218 | 204 | 48 | | 300x |
+| o_proj input | 126 | 226 | 48 | coopmat F16, CUDA F16 | 290x |
+| q / k / v | 38 / 45 / 127 | 65 / 68 / 226 | | F16 KV | > 500x |
+| dense down input (layers 0-1) | 9.3 | 9.0 | 0 | coopmat F16, CUDA `swiglu_f16` | 7000x |
+
+The residual grew with the corpus (17.4K after 3K agent tokens, 24.2K after 6.6K, 34.6K once wikitext followed), so it
+is the site to watch at longer contexts.
+
+On Strix Vulkan (8K agent trace and 8K wikitext, 512-token chunks through the F16 KV cache, 64 teacher-forced decode steps
+each) every logit row is finite. With the grouped-down guard off (`DOTLLM_VK_MOE_DOWN_RESCALE=0`) the rows also stay finite,
+because the F16 KV write clamps to ±65504, but they are wrong: KL(guard on ‖ off) 52-54 nats, top-1 agreement 0%. A
+finiteness check alone cannot see this overflow. Short prompts vs the CPU are unchanged (KL mean 1.44e-3, top-1 99.0%, the
+same as #1171). 16K / 32K prefill loses the device on Strix before reaching the end (#1200), so those lengths were not
+checked on Vulkan.
+
+**Qwen3.6-35B-A3B Q8_0** (5.6K tokens, same corpora): every site below 200 (routed down input 98, shared down input
+164, residual 39), so its unguarded Vulkan grouped down (`VulkanQwen3MoeHybridTransformerModel`) has > 300x headroom.
+
+Storage map (where an activation becomes F16, or Q8_1 with F16 `d`/`s`):
+- **Vulkan**: every Q8_1 producer writes `d` and `s` as F32, so the only F16 activation stores are the coopmat
+  `float16_t` operand casts (dense GEMM, grouped MoE B operand) and F16 KV (clamped to ±65504). Residual and MoE
+  outputs are F32.
+- **CUDA**: `quantize_x_to_q8_1` stores `d` as half and `s` as an integer sum (exact). The generic FP16 loop holds the
+  residual, norm outputs, SwiGLU output and MoE staging in half; Flint's Q4_1 experts take F32 input. LFM2's
+  `lfm2_quant_q8_1_f32` stores `s = d·Σq` as half (routed down guarded; shared / dense down not, LFM2 values small).
+- **CPU**: Q8_1 `s` is F16 (routed down guarded; shared down at 7.7x).
 
 ---
 

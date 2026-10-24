@@ -1993,15 +1993,17 @@ public sealed unsafe partial class CudaKernels : IDisposable
     /// Allocates dynamic shared memory: <c>(hiddenSize + 32) * sizeof(float)</c> per block.
     /// hiddenSize rounded up to even is the FP32 sum cache; the trailing 32 floats are warp-reduce scratch (also stores rms_inv).
     /// For hidden=576 (SmolLM-135M), this is 2432 bytes — well within the SM86 default 48 KB budget.
+    /// The sum is <c>residual * residualScale + x * xScale</c>: both are 1 except on a power-of-two scaled residual stream (#1191).
     /// </remarks>
     public void LaunchFusedAddRmsNorm(nint residual, nint x, nint weight, nint output,
-                                        int hiddenSize, float eps, int rows, nint stream)
+                                        int hiddenSize, float eps, int rows, nint stream,
+                                        float residualScale = 1f, float xScale = 1f)
     {
         nint resArg = residual, xArg = x, wArg = weight, outArg = output;
         int nArg = hiddenSize;
-        float epsArg = eps;
+        float epsArg = eps, rScaleArg = residualScale, xScaleArg = xScale;
 
-        void** args = stackalloc void*[] {&resArg, &xArg, &wArg, &outArg, &nArg, &epsArg};
+        void** args = stackalloc void*[] {&resArg, &xArg, &wArg, &outArg, &nArg, &epsArg, &rScaleArg, &xScaleArg};
         // Shared memory: n floats (sum cache, padded to even) + 32 floats (warp scratch)
         uint sharedBytes = (uint)((((hiddenSize + 1) & ~1) + 32) * sizeof(float));
         CudaDriverApi.cuLaunchKernel(_fusedAddRmsNormFunc,
