@@ -333,6 +333,7 @@ public sealed class CudaQwen3HybridDenseSmallSGemvTests : IDisposable
             // #482 arms: pin the dp4a path off so a process-wide DOTLLM_CUDA_PQ2_0_DP4A=1 cannot route
             // the S = 1 reference (or either S = 3 arm) through it.
             CudaSmallSGemvDispatch.Dp4aOverride = false;
+            CudaSmallSGemvDispatch.MmqOverride = false;   // #1222: the "old" arm is dequant + cuBLAS, not the W2A8 GEMM
             CudaSmallSGemvDispatch.MaxColumnsOverride = null;
             multi = RunBatched(model, vocab, prompt, continuation, out _);
             CudaSmallSGemvDispatch.MaxColumnsOverride = 0;
@@ -344,6 +345,7 @@ public sealed class CudaQwen3HybridDenseSmallSGemvTests : IDisposable
         {
             CudaSmallSGemvDispatch.MaxColumnsOverride = null;
             CudaSmallSGemvDispatch.Dp4aOverride = null;
+            CudaSmallSGemvDispatch.MmqOverride = null;
         }
         return new Arms(multi, old, singles);
     }

@@ -155,6 +155,30 @@ public sealed class CudaPQ2_0MmqDp4aTests
         _out.WriteLine($"S={columns} n={n} k={k} BN={tile}: {emulated.Length} outputs bit-identical to the CPU emulation");
     }
 
+    /// <summary>
+    /// Issue #1222: the int8 tensor-core tile (<c>pq2_0_mmq_mma_f32y</c>) feeds the same exact block
+    /// dots into the same per-output FMA chain as the dp4a tiles, so it must be BIT-identical to the
+    /// wide dp4a tile on every shape — ragged rows and columns included. Oracle A then covers it too.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(Shapes))]
+    public void MmqMma_IsBitIdenticalToTheDp4aTile(int columns, int n, int k)
+    {
+        string ptxDir = SkipUnlessMmqKernel();
+        Skip.IfNot(File.Exists(Path.Combine(ptxDir, "pq2_0_mmq_mma.ptx")), "pq2_0_mmq_mma.ptx not generated");
+        var rng = new Random(12220 + 31 * columns + n + k);
+        byte[] packed = CudaPQ2_0GemvDp4aTests.RandomPackedPQ2_0WithCode3(rng, n, k);
+        float[] x = CudaPQ2_0GemvDp4aTests.RealisticActivations(rng, columns * k);
+
+        MmqRun run = RunMmq(ptxDir, packed, x, n, k, columns, withF16Oracle: false,
+            tile: CudaKernels.Pq2_0MmqTileColumnsMma, other: CudaKernels.Pq2_0MmqTileColumnsWide, requireMma: true);
+
+        for (long i = 0; i < run.Y.LongLength; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(run.Y[i]) == BitConverter.SingleToInt32Bits(run.YOtherTile![i]),
+                $"S={columns} n={n} k={k}: column {i / n} row {i % n}: mma {run.Y[i]:R} vs dp4a {run.YOtherTile[i]:R}");
+        _out.WriteLine($"S={columns} n={n} k={k}: {run.Y.Length} outputs, mma tile bit-identical to the dp4a tile");
+    }
+
     private void AssertMatchesReference(string label, byte[] packed, sbyte[] q, float[] d, float[] y,
         int n, int k, int columns)
     {
@@ -233,20 +257,22 @@ public sealed class CudaPQ2_0MmqDp4aTests
     /// </summary>
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private static unsafe MmqRun RunMmq(string ptxDir, byte[] packed, float[] x, int n, int k, int columns,
-        bool withF16Oracle, bool keepRaw = false)
+        bool withF16Oracle, bool keepRaw = false, int tile = 0, int other = 0, bool requireMma = false)
     {
         using var ctx = CudaContext.Create(0);
         using var stream = CudaStream.Create();
         using var kernels = new CudaKernels(ptxDir);
         Assert.True(kernels.HasPQ2_0MmqDp4a, kernels.PQ2_0MmqDp4aUnavailableReason);
         Assert.True(kernels.HasPQ2_0GemvDp4a, kernels.PQ2_0GemvDp4aUnavailableReason);
+        Skip.If(requireMma && !kernels.HasPQ2_0MmqMma, "int8 tensor-core MMQ not loaded (needs sm_80+)");
         nint s = stream.Handle;
 
         int elems = x.Length, blocks = elems / 32;
-        int tile = CudaSmallSGemvDispatch.MmqTileColumns(columns);
-        int other = tile == CudaKernels.Pq2_0MmqTileColumnsWide
-            ? CudaKernels.Pq2_0MmqTileColumnsNarrow
-            : CudaKernels.Pq2_0MmqTileColumnsWide;
+        if (tile == 0) tile = CudaSmallSGemvDispatch.MmqTileColumns(columns);
+        if (other == 0)
+            other = tile == CudaKernels.Pq2_0MmqTileColumnsWide
+                ? CudaKernels.Pq2_0MmqTileColumnsNarrow
+                : CudaKernels.Pq2_0MmqTileColumnsWide;
 
         nint devW = Alloc(packed.LongLength), devWSplit = Alloc(CudaKernels.PQ2_0SplitLayoutBytes(n, k));
         nint devX = Alloc((long)elems * sizeof(float));

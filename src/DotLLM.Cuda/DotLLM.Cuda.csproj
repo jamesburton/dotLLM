@@ -66,7 +66,7 @@
          These kernels are dispatch-gated to GeForce-Ampere-or-newer devices in C# (see
          CudaFlashAttention.ConfigureDefault / CudaAttentionMmaDecodeGqaSplit), so raising their
          arch does not reduce portability for the rest of the PTX tree. -->
-    <CudaKernel Update="$(CudaKernelDir)\attention_flash_mma.cu;$(CudaKernelDir)\attention_flash_mma_decode_gqa_split.cu;$(CudaKernelDir)\attention_flash_mma_decode_gqa_split_kvq.cu;$(CudaKernelDir)\attention_flash_mma_prefill_hd256.cu;$(CudaKernelDir)\attention_flash_mma_prefill_hd256_kvq.cu">
+    <CudaKernel Update="$(CudaKernelDir)\pq2_0_mmq_mma.cu;$(CudaKernelDir)\attention_flash_mma.cu;$(CudaKernelDir)\attention_flash_mma_decode_gqa_split.cu;$(CudaKernelDir)\attention_flash_mma_decode_gqa_split_kvq.cu;$(CudaKernelDir)\attention_flash_mma_prefill_hd256.cu;$(CudaKernelDir)\attention_flash_mma_prefill_hd256_kvq.cu">
       <Arch>compute_86</Arch>
     </CudaKernel>
     <!-- Element-wise kernels: safe for fast_math (no expf/rsqrtf/sinf/cosf accumulation) -->

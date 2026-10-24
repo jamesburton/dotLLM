@@ -79,7 +79,7 @@ REM Kernels that emit Ampere-only PTX (mma.sync / cp.async) and so MUST be built
 REM at compute_86 instead of the global default. These are dispatch-gated to
 REM Ampere+ GPUs in C# (the PTX never loads on Turing), so overriding their arch
 REM does not affect portability of the rest of the tree. See ARCH POLICY above.
-set "ARCH_86=attention_flash_mma attention_flash_mma_decode_gqa_split attention_flash_mma_decode_gqa_split_kvq attention_flash_mma_prefill_hd256 attention_flash_mma_prefill_hd256_kvq"
+set "ARCH_86=pq2_0_mmq_mma attention_flash_mma attention_flash_mma_decode_gqa_split attention_flash_mma_decode_gqa_split_kvq attention_flash_mma_prefill_hd256 attention_flash_mma_prefill_hd256_kvq"
 
 REM Kernels that #include <cooperative_groups.h> (needed for grid.sync() — see
 REM gated_delta_net_scan.cu's gdn_scan_step_f32_coop_split4, issue #180, and

@@ -123,7 +123,9 @@ public class CudaQwen3HybridDensePrefillChunkingTest
         // small S, dequant+cuBLAS F16 above). Comparing across that boundary measures the dp4a
         // numeric trade, not the tiling invariance this test is about, so pin one path for both arms.
         bool? dp4aWas = CudaSmallSGemvDispatch.Dp4aOverride;
+        bool? mmqWas = CudaSmallSGemvDispatch.MmqOverride;
         CudaSmallSGemvDispatch.Dp4aOverride = false;
+        CudaSmallSGemvDispatch.MmqOverride = false;   // #1222: the W2A8 prefill GEMM is the default above 8 rows
         try
         {
             using var gguf = GgufFile.Open(path);
@@ -138,6 +140,7 @@ public class CudaQwen3HybridDensePrefillChunkingTest
         {
             CudaQwen3HybridDenseTransformerModel.PrefillChunkOverride = null;
             CudaSmallSGemvDispatch.Dp4aOverride = dp4aWas;
+            CudaSmallSGemvDispatch.MmqOverride = mmqWas;
         }
     }
 

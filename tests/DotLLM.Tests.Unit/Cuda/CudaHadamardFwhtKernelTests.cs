@@ -138,6 +138,35 @@ public sealed class CudaHadamardFwhtKernelTests
             "permuted and unpermuted results must differ, or the test cannot detect an ignored permute");
     }
 
+    /// <summary>
+    /// Issue #1222: 1024-wide blocks take a register/shuffle kernel. It performs the generic kernel's butterflies on the
+    /// same pairs in the same pass order, so it must match it bit for bit — forward with signs, the GDN permute, and the
+    /// in-place inverse.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(3, 5120, false, false)]
+    [InlineData(2, 17408, false, false)]
+    [InlineData(2, 6144, true, false)]
+    [InlineData(2, 5120, false, true)]
+    public void Fast1024Kernel_IsBitIdenticalToTheGenericKernel(int rows, int width, bool permute, bool inverse)
+    {
+        using var env = CudaEnv.Create();
+        var rng = new Random(1222 + rows + width);
+        var src = RandomFloats(rng, rows * width);
+        var signs = new sbyte[width];
+        for (int i = 0; i < width; i++) signs[i] = rng.Next(2) == 0 ? (sbyte)-1 : (sbyte)1;
+        (int, int, int)? perm = permute ? (128, 16, 3) : null;
+
+        env.Kernels.ForceGenericHadamardForTest = true;
+        var generic = env.Run(src, signs, rows, width, 1024, inverse, perm, inPlace: inverse);
+        env.Kernels.ForceGenericHadamardForTest = false;
+        var fast = env.Run(src, signs, rows, width, 1024, inverse, perm, inPlace: inverse);
+
+        for (int i = 0; i < generic.Length; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(generic[i]) == BitConverter.SingleToInt32Bits(fast[i]),
+                $"element {i}: generic {generic[i]:R} vs fast {fast[i]:R}");
+    }
+
     [SkippableFact]
     public void Launch_RejectsBadArguments()
     {

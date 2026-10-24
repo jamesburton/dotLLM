@@ -448,6 +448,18 @@ internal static partial class CudaDriverApi
     [LibraryImport(LibName)]
     internal static partial int cuGraphExecDestroy(nint graphExec);
 
+    /// <summary>
+    /// Updates an instantiated graph in place from a freshly captured graph of the same topology (kernel
+    /// arguments and launch dimensions may differ). <paramref name="resultInfo"/> points at a
+    /// <c>CUgraphExecUpdateResultInfo</c> (24 bytes). Non-zero means the topology changed: re-instantiate.
+    /// </summary>
+    /// <param name="graphExec">The executable graph to update.</param>
+    /// <param name="graph">The newly captured graph.</param>
+    /// <param name="resultInfo">Receives the update result details.</param>
+    /// <returns>The CUresult.</returns>
+    [LibraryImport(LibName, EntryPoint = "cuGraphExecUpdate_v2")]
+    internal static partial int cuGraphExecUpdate(nint graphExec, nint graph, nint resultInfo);
+
     // ── Events (used for GPU-side profiling) ────────────────────────
 
     /// <summary>Default flags. Use for profiling: blocking-sync isn't needed when we cuEventSynchronize host-side.</summary>

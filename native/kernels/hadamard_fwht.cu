@@ -121,3 +121,118 @@ extern "C" __global__ void hadamard_fwht_f32(
         dst[rowBase + col] = v;
     }
 }
+
+// ─── blockSize == 1024 fast path (issue #1222) ──────────────────────────────────────────────────
+// Same transform, same butterflies, fewer barriers. The generic kernel above runs all 10 passes
+// through shared memory with a barrier (and a runtime integer divide) per pass. Here each of the 256
+// threads owns 4 consecutive elements: passes len = 1, 2 stay in registers, len = 4..64 pair threads
+// 1..16 lanes apart inside one warp (__shfl_xor), and only len = 128, 256, 512 cross warps — 128
+// threads then each take the 8 elements t + 128*j and finish those passes in registers.
+//
+// Every butterfly is still s[i0] + s[i1] / s[i0] - s[i1] on the same pair in the same pass order,
+// so the output is bit-identical to hadamard_fwht_f32 (and the CPU oracle): only where each operand
+// sits changes. The lower element of a pair is the one whose index has the pass bit clear.
+#define HADAMARD1024_N 1024
+
+extern "C" __global__ void __launch_bounds__(HADAMARD_THREADS) hadamard_fwht1024_f32(
+    const float* src,
+    float* dst,
+    const float* __restrict__ signs,
+    int rows,
+    int width,
+    int blockSize,      // == 1024 (host-checked)
+    int applySigns,
+    int inverse,
+    int permute,
+    int permDState,
+    int permNKHead,
+    int permRep,
+    float scale)
+{
+    __shared__ float s[HADAMARD1024_N];
+
+    const int blk = blockIdx.x;
+    const int row = blockIdx.y;
+    if (row >= rows || blk >= width / HADAMARD1024_N) return;
+
+    const long long rowBase = (long long)row * width;
+    const int blockOff = blk * HADAMARD1024_N;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+
+    float v[4];
+    #pragma unroll
+    for (int k = 0; k < 4; k++)
+    {
+        const int col = blockOff + 4 * tid + k;
+        int srcCol = col;
+        if (permute != 0)
+        {
+            const int dh = col / permDState;
+            const int ln = col - dh * permDState;
+            srcCol = ((dh / permRep) + permNKHead * (dh % permRep)) * permDState + ln;
+        }
+        float x = src[rowBase + srcCol];
+        if (applySigns != 0 && inverse == 0 && signs[col] < 0.0f)
+            x = -x;
+        v[k] = x * scale;
+    }
+
+    // len = 1, 2: within the thread's 4 elements.
+    {
+        float a = v[0], b = v[1], c = v[2], d = v[3];
+        v[0] = a + b; v[1] = a - b; v[2] = c + d; v[3] = c - d;
+        a = v[0]; b = v[1]; c = v[2]; d = v[3];
+        v[0] = a + c; v[1] = b + d; v[2] = a - c; v[3] = b - d;
+    }
+
+    // len = 4 .. 64: the partner is lane ^ m, m = len / 4.
+    #pragma unroll
+    for (int m = 1; m <= 16; m <<= 1)
+    {
+        const bool upper = (lane & m) != 0;
+        #pragma unroll
+        for (int k = 0; k < 4; k++)
+        {
+            const float p = __shfl_xor_sync(0xFFFFFFFFu, v[k], m);
+            v[k] = upper ? p - v[k] : v[k] + p;
+        }
+    }
+
+    #pragma unroll
+    for (int k = 0; k < 4; k++)
+        s[4 * tid + k] = v[k];
+    __syncthreads();
+
+    if (tid < 128)
+    {
+        // len = 128, 256, 512: elements tid + 128*j, j = 0..7; the pass bit is j's bit.
+        float u[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j++)
+            u[j] = s[tid + 128 * j];
+        #pragma unroll
+        for (int bit = 1; bit < 8; bit <<= 1)
+        {
+            #pragma unroll
+            for (int j = 0; j < 8; j++)
+            {
+                if ((j & bit) == 0)
+                {
+                    const float a = u[j], b = u[j | bit];
+                    u[j] = a + b;
+                    u[j | bit] = a - b;
+                }
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < 8; j++)
+        {
+            const int col = blockOff + tid + 128 * j;
+            float x = u[j];
+            if (applySigns != 0 && inverse != 0 && signs[col] < 0.0f)
+                x = -x;
+            dst[rowBase + col] = x;
+        }
+    }
+}
