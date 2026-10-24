@@ -38,15 +38,33 @@ public static unsafe partial class MoeSwiGluMlp
         public float** SegResults;    // [Segments]
         public byte** SegInput;       // [Segments] pre-quantised input per segment
         public byte* SegKind;         // [Segments] 0 -> Rows0, 1 -> Rows1
+        public long Next;             // next unclaimed row group (dynamic scheduling)
     }
+
+    // Row groups per claim: small enough that a preempted or slower (E-core) thread holds back little work, large enough
+    // that the shared counter is touched only a few hundred times per dispatch.
+    private const int DecodeN1GroupsPerClaim = 8;
 
     private static void DecodeN1Worker(nint ctxPtr, int threadIdx, int threadCount)
     {
         ref var c = ref Unsafe.AsRef<DecodeN1Ctx>((void*)ctxPtr);
         int groupsPerSegment = (c.RowsPerSegment + c.RowAlignment - 1) / c.RowAlignment;
         long total = (long)c.Segments * groupsPerSegment;
-        long start = total * threadIdx / threadCount;
-        long end = total * (threadIdx + 1) / threadCount;
+
+        // Dynamic claims instead of a static 1/threadCount slice: on a hybrid P/E-core CPU, or with another process on a
+        // core, the static slice made every dispatch wait for the slowest thread. Rows are independent, so the result is
+        // the same whichever thread computes them.
+        while (true)
+        {
+            long start = Interlocked.Add(ref c.Next, DecodeN1GroupsPerClaim) - DecodeN1GroupsPerClaim;
+            if (start >= total) break;
+            long end = Math.Min(total, start + DecodeN1GroupsPerClaim);
+            DecodeN1Range(ref c, groupsPerSegment, start, end);
+        }
+    }
+
+    private static void DecodeN1Range(ref DecodeN1Ctx c, int groupsPerSegment, long start, long end)
+    {
         while (start < end)
         {
             int seg = (int)(start / groupsPerSegment);

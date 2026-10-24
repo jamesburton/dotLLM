@@ -317,6 +317,20 @@ internal static partial class CudaDriverApi
     [LibraryImport(LibName)]
     internal static partial int cuMemFreeHost(nint p);
 
+    /// <summary>
+    /// Page-locks an existing host range (here: the mmap'd GGUF pages of CPU-resident experts, #1202) so the device can
+    /// DMA from it directly: no staging copy, and <see cref="cuMemcpyHtoDAsync_v2"/> from it is truly asynchronous.
+    /// </summary>
+    [LibraryImport(LibName)]
+    internal static partial int cuMemHostRegister_v2(nint p, nuint bytesize, uint flags);
+
+    /// <summary>Undoes <see cref="cuMemHostRegister_v2"/>; must run before the range is unmapped.</summary>
+    [LibraryImport(LibName)]
+    internal static partial int cuMemHostUnregister(nint p);
+
+    /// <summary>CU_MEMHOSTREGISTER_READ_ONLY: the device only reads the registered range (required for a read-only file mapping).</summary>
+    internal const uint CU_MEMHOSTREGISTER_READ_ONLY = 0x08;
+
     // ── Streams ─────────────────────────────────────────────────────
 
     [LibraryImport(LibName)]

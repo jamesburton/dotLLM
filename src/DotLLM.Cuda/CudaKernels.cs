@@ -449,6 +449,8 @@ public sealed unsafe partial class CudaKernels : IDisposable
     private readonly nint _moeGroupedGemvQ4_1Func;
     private readonly nint _moeGroupedGemvQ4_1F32XeFunc;
     private readonly nint _moeWeightedRowsSumF32Func;
+    private readonly nint _moeCombineBucketedF32Func;
+    private readonly nint _moeAddF16F32Func;
     private readonly nint _moeSigmoidTopkF32Func;
     private readonly nint _moePow2RescaleRowsF32Func;
     private readonly nint _moeScaleRowsF32Func;
@@ -1210,6 +1212,8 @@ public sealed unsafe partial class CudaKernels : IDisposable
             _moeSoftmaxTopkF32Func = _moeFfnModule.TryGetFunction("moe_softmax_topk_f32");
             _moeSigmoidTopkF32Func = _moeFfnModule.TryGetFunction("moe_sigmoid_topk_f32");
             _moeWeightedRowsSumF32Func = _moeFfnModule.TryGetFunction("moe_weighted_rows_sum_f32");
+            _moeCombineBucketedF32Func = _moeFfnModule.TryGetFunction("moe_combine_bucketed_f32");
+            _moeAddF16F32Func = _moeFfnModule.TryGetFunction("moe_add_f16_f32");
             _moePow2RescaleRowsF32Func = _moeFfnModule.TryGetFunction("moe_pow2_rescale_rows_f32");
             _moeScaleRowsF32Func = _moeFfnModule.TryGetFunction("moe_scale_rows_f32");
             _moeRenormTopkF32Func = _moeFfnModule.TryGetFunction("moe_renorm_topk_f32");
@@ -5577,6 +5581,62 @@ public sealed unsafe partial class CudaKernels : IDisposable
         int ka = kActive, h = hidden;
         void** args = stackalloc void*[] { &o, &r, &w, &sl, &ka, &h };
         CudaDriverApi.cuLaunchKernel(_moeWeightedRowsSumF32Func, (uint)((hidden + BlockSize - 1) / BlockSize), 1, 1,
+            BlockSize, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>True when <see cref="LaunchMoeCombineBucketedF32"/> is loaded (the multi-token bucketed expert body, #1202).</summary>
+    public bool HasMoeCombineBucketed => _moeCombineBucketedF32Func != 0 && _moeGatherTokenRowsF32Func != 0;
+
+    /// <summary>Most top-k slots per token <see cref="LaunchMoeCombineBucketedF32"/> supports.</summary>
+    public const int MoeCombineMaxTopK = 32;
+
+    /// <summary>
+    /// Multi-token MoE combine: <c>out[t, :] += sum_slot topkWeight[t, slot] * rows[pos[t, slot], :]</c>, summed in ascending
+    /// row position (= ascending expert id of the bucketed layout), replacing one weighted axpy per expert and slot.
+    /// </summary>
+    /// <param name="outF32">F32 output <c>[seqLen, hidden]</c>, accumulated into.</param>
+    /// <param name="rowsF32">F32 expert output rows <c>[seqLen * topK, hidden]</c>, bucketed by expert.</param>
+    /// <param name="topkWeight">F32 routing weights <c>[seqLen, topK]</c>.</param>
+    /// <param name="posDevice">Int32 row of each assignment <c>[seqLen, topK]</c>; negative = no row.</param>
+    /// <param name="seqLen">Tokens.</param>
+    /// <param name="hidden">Row width.</param>
+    /// <param name="topK">Slots per token, at most <see cref="MoeCombineMaxTopK"/>.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchMoeCombineBucketedF32(nint outF32, nint rowsF32, nint topkWeight, nint posDevice,
+        int seqLen, int hidden, int topK, nint stream)
+    {
+        if (_moeCombineBucketedF32Func == 0)
+            throw new InvalidOperationException("moe_combine_bucketed_f32 not available. Recompile native/kernels/moe_ffn.cu to PTX.");
+        if ((uint)topK > MoeCombineMaxTopK)
+            throw new ArgumentOutOfRangeException(nameof(topK), topK, $"At most {MoeCombineMaxTopK} slots per token.");
+        nint o = outF32, r = rowsF32, w = topkWeight, p = posDevice;
+        int sl = seqLen, h = hidden, k = topK;
+        void** args = stackalloc void*[] { &o, &r, &w, &p, &sl, &h, &k };
+        CudaDriverApi.cuLaunchKernel(_moeCombineBucketedF32Func, (uint)seqLen, 1, 1,
+            BlockSize, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>True when <see cref="LaunchMoeAddF16F32"/> is loaded.</summary>
+    public bool HasMoeAddF16F32 => _moeAddF16F32Func != 0;
+
+    /// <summary>
+    /// <c>out[i] += (float)in[i] * factor</c>: adds an F16 partial (the CPU part of a split expert layer, #1202), stored
+    /// divided by the power of two <paramref name="factor"/>, to an F32 output.
+    /// </summary>
+    /// <param name="outF32">F32 output, accumulated into.</param>
+    /// <param name="inF16">F16 addend.</param>
+    /// <param name="n">Elements.</param>
+    /// <param name="factor">Power-of-two scale the addend was divided by.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchMoeAddF16F32(nint outF32, nint inF16, int n, float factor, nint stream)
+    {
+        if (_moeAddF16F32Func == 0)
+            throw new InvalidOperationException("moe_add_f16_f32 not available. Recompile native/kernels/moe_ffn.cu to PTX.");
+        nint o = outF32, i = inF16;
+        int count = n;
+        float f = factor;
+        void** args = stackalloc void*[] { &o, &i, &count, &f };
+        CudaDriverApi.cuLaunchKernel(_moeAddF16F32Func, (uint)((n + BlockSize - 1) / BlockSize), 1, 1,
             BlockSize, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
     }
 

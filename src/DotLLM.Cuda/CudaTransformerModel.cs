@@ -380,6 +380,9 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// <summary>Routed experts the CPU leg has computed (one per expert per layer call), for telemetry and tests.</summary>
     public long CpuMoeExpertsComputed => _moeHost?.ExpertsComputed ?? 0;
 
+    /// <summary>Experts of CPU-expert layers streamed to the GPU for multi-token calls so far (#1202).</summary>
+    public long CpuMoeExpertsStreamed => _moeHost?.Stream?.ExpertsStreamed ?? 0;
+
     /// <summary>Host wall time spent in the CPU leg, microseconds.</summary>
     public long CpuMoeMicroseconds => _moeHost?.ComputeMicroseconds ?? 0;
 
@@ -576,6 +579,29 @@ public sealed unsafe class CudaTransformerModel : IModel
         return LoadFromCpuWeights(cpuWeights, config, gguf, deviceId, ptxDir, estimatedWeightBytes, placement);
     }
 
+    // GPU leg for multi-token calls of CPU-expert layers (#1202); DOTLLM_CUDA_MOE_STREAM=0 keeps them on the CPU.
+    internal static bool StreamCpuExperts { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_CUDA_MOE_STREAM") != "0";
+
+    /// <summary>
+    /// CPU leg threads when <c>--moe-cpu-threads</c> is not given: physical cores - 1 from the detected topology (the forward
+    /// thread joins the workers). <see cref="MoeOffloadOptions.DefaultCpuThreads"/> halves the logical count, which assumes
+    /// SMT on every core and gave 7 threads on a 16-core Core Ultra 7 155H (no SMT); 12-15 decode 20-40 % faster there (#1202).
+    /// </summary>
+    private static int DefaultCpuLegThreads()
+    {
+        try
+        {
+            var cores = new HashSet<int>();
+            foreach (var p in DotLLM.Cpu.Threading.NumaTopology.Detect().Processors) cores.Add(p.PhysicalCoreId);
+            if (cores.Count > 1) return cores.Count - 1;
+        }
+        catch (Exception)
+        {
+            // Unknown topology: keep the logical-count heuristic.
+        }
+        return MoeOffloadOptions.DefaultCpuThreads();
+    }
+
     /// <summary>What the loader needs to place routed experts on the CPU (#1187).</summary>
     /// <param name="Options">Resolved offload options.</param>
     /// <param name="RoutedBytesPerLayer">Device bytes of each layer's routed expert banks (0 for a dense layer).</param>
@@ -746,6 +772,15 @@ public sealed unsafe class CudaTransformerModel : IModel
             long reserve = (placement.Options.ReserveMib ?? 1024) * 1048576L + kvBytes;
             cpuMoeLayers = PlanCpuMoeLayers(placement.Options, placement.RoutedBytesPerLayer, placement.AutoEligible,
                 estimatedWeightBytes, (long)freeNow, reserve);
+
+            // Once some experts live on the CPU, also leave room for the GPU leg's expert ring (#1202), which the first
+            // multi-token call allocates. A model that fits whole is not pushed onto the CPU for it.
+            if (cpuMoeLayers > 0 && StreamCpuExperts && config.Moe is { NumExperts: > 0 } moeCfg)
+            {
+                long ring = CudaMoeExpertStream.RingBytes(placement.RoutedBytesPerLayer.Max() / moeCfg.NumExperts);
+                cpuMoeLayers = PlanCpuMoeLayers(placement.Options, placement.RoutedBytesPerLayer, placement.AutoEligible,
+                    estimatedWeightBytes, (long)freeNow, reserve + ring + CudaMoeExpertStream.RingMarginBytes);
+            }
             if (cpuMoeLayers > 0)
             {
                 long kept = 0;
@@ -759,7 +794,7 @@ public sealed unsafe class CudaTransformerModel : IModel
                     }
                 }
                 estimatedWeightBytes -= kept;
-                int threads = placement.Options.EffectiveCpuThreads;
+                int threads = placement.Options.CpuThreads ?? DefaultCpuLegThreads();
                 string nArg = cpuMoeLayers == MoeOffloadOptions.AllLayers ? "all" : cpuMoeLayers.ToString();
                 (placement.Options.Log ?? Console.Error.WriteLine)(
                     $"MoE experts on CPU: {n} layer(s) (--n-cpu-moe {nArg}), {kept / 1048576} MiB read from the mmap'd GGUF, "
@@ -807,6 +842,14 @@ public sealed unsafe class CudaTransformerModel : IModel
         weights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle,
             onHostTensorUploaded: onHostTensorUploaded,
             hostMoeLayer: cpuMoeLayers > 0 ? layer => layer < cpuMoeLayers : null);
+        if (moeHost is not null && StreamCpuExperts)
+        {
+            // GPU leg for multi-token calls (#1202): page-lock the mapped experts of the CPU layers in place.
+            var hostLayers = new List<DotLLM.Models.Architectures.MoeLayerWeights>();
+            foreach (var ml in weights.MoeLayers ?? [])
+                if (ml?.HostExperts is { } h) hostLayers.Add(h);
+            moeHost.Stream = CudaMoeExpertStream.TryCreate(hostLayers, placement!.Options.Log ?? Console.Error.WriteLine);
+        }
         LastLoadStreamedHostFreeCount = streamedFreeCount;
 
         // Gemma-4 full-attention (global) layers may use a distinct head dim and
@@ -1625,7 +1668,8 @@ public sealed unsafe class CudaTransformerModel : IModel
                     cublasHandle: cublasH,
                     kernels: _kernels,
                     stream: s,
-                    hostExperts: _moeHost);
+                    hostExperts: _moeHost,
+                    nextHostLayer: layer + 1 < _weights.MoeLayers!.Length ? _weights.MoeLayers[layer + 1]?.HostExperts : null);
                 if (resScale != 1f)
                     _kernels.LaunchScaleInplaceF32(_moeStagingOutF32, hiddenElems, resScale, s);
                 _kernels.LaunchConvertF32ToF16(_moeStagingOutF32, _state.NormOutput, hiddenElems, s);

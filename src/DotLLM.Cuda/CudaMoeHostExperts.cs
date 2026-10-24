@@ -1,6 +1,4 @@
 using System.Diagnostics;
-using System.Runtime.InteropServices;
-using DotLLM.Core.Configuration;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Cpu.Threading;
 using DotLLM.Cuda.Interop;
@@ -15,6 +13,7 @@ namespace DotLLM.Cuda;
 /// <remarks>
 /// Only activations cross the link: the F32 expert input and the top-k weights down (<c>seqLen × (hidden + topK)</c>
 /// floats), the routed sum up (<c>seqLen × hidden</c>). The device keeps the router, the shared expert and everything else.
+/// On multi-token calls <see cref="Stream"/> (when present) moves part of the experts to the GPU (#1202).
 /// </remarks>
 internal sealed unsafe class CudaMoeHostExperts : IDisposable
 {
@@ -38,29 +37,58 @@ internal sealed unsafe class CudaMoeHostExperts : IDisposable
     /// <summary>Host wall time of the CPU legs (download, compute, upload), in microseconds.</summary>
     public long ComputeMicroseconds { get; private set; }
 
+    /// <summary>GPU leg for multi-token calls (#1202), or null when the experts cannot be streamed.</summary>
+    public CudaMoeExpertStream? Stream { get; set; }
+
     /// <summary>
-    /// Runs the routed experts of one layer call on the CPU and writes their weighted sum to <paramref name="routedOutF32"/>.
-    /// The caller has synchronised the stream after routing, so the device inputs are final.
+    /// Runs the routed experts of one layer call on the CPU (inputs from <see cref="EnqueueDownload"/>, already complete) and
+    /// queues the upload of their weighted sum to <paramref name="routedOutF32"/> on <paramref name="stream"/>.
     /// </summary>
     /// <param name="moe">The layer's CPU bundle (raw quant views into the mmap).</param>
-    /// <param name="hiddenF32">Device F32 expert input <c>[seqLen, hidden]</c>.</param>
-    /// <param name="topkWeightF32">Device F32 top-k weights <c>[seqLen, topK]</c>.</param>
     /// <param name="topkIdx">Host top-k expert ids <c>[seqLen, topK]</c>.</param>
     /// <param name="seqLen">Tokens in this call.</param>
     /// <param name="routedOutF32">Device F32 output <c>[seqLen, hidden]</c>; fully overwritten.</param>
-    public void Run(DotLLM.Models.Architectures.MoeLayerWeights moe, nint hiddenF32, nint topkWeightF32,
-        ReadOnlySpan<int> topkIdx, int seqLen, nint routedOutF32)
+    /// <param name="stream">Stream the upload is queued on.</param>
+    public void Run(DotLLM.Models.Architectures.MoeLayerWeights moe, ReadOnlySpan<int> topkIdx, int seqLen, nint routedOutF32,
+        nint stream)
+    {
+        var rows = Compute(moe, topkIdx, seqLen, firstExpert: 0, out _);
+        fixed (float* p = rows)
+            CudaDriverApi.cuMemcpyHtoDAsync_v2(routedOutF32, (nint)p, (nuint)((long)rows.Length * sizeof(float)), stream).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Queues the copies of the call's expert input and top-k weights into pinned host memory on <paramref name="stream"/>;
+    /// the caller synchronises once for these and the top-k ids. The previous call's upload from the same memory is ordered
+    /// before them on the stream.
+    /// </summary>
+    public void EnqueueDownload(DotLLM.Models.Architectures.MoeLayerWeights moe, nint hiddenF32, nint topkWeightF32, int seqLen,
+        nint stream)
+    {
+        long rowFloats = (long)seqLen * moe.HiddenSize;
+        int total = seqLen * moe.NumExpertsPerTok;
+        EnsureHost(2 * rowFloats + total, stream);
+        CudaDriverApi.cuMemcpyDtoHAsync_v2((nint)_host, hiddenF32, (nuint)(rowFloats * sizeof(float)), stream).ThrowOnError();
+        CudaDriverApi.cuMemcpyDtoHAsync_v2((nint)(_host + 2 * rowFloats), topkWeightF32, (nuint)((long)total * sizeof(float)),
+            stream).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Computes the weighted routed sum of the experts with id <c>&gt;= <paramref name="firstExpert"/></c> on the CPU from
+    /// the inputs <see cref="EnqueueDownload"/> fetched. Assignments to lower experts contribute nothing (they run on the GPU).
+    /// </summary>
+    /// <returns>The host F32 rows <c>[seqLen, hidden]</c>, valid until the next call.</returns>
+    public ReadOnlySpan<float> Compute(DotLLM.Models.Architectures.MoeLayerWeights moe, ReadOnlySpan<int> topkIdx, int seqLen,
+        int firstExpert, out int assignments)
     {
         long t0 = Stopwatch.GetTimestamp();
         int hidden = moe.HiddenSize, k = moe.NumExpertsPerTok, numExperts = moe.NumExperts, inter = moe.IntermediateSize;
         int total = seqLen * k;
         long rowFloats = (long)seqLen * hidden;
-        EnsureHost(2 * rowFloats + total);
         float* hIn = _host, hOut = _host + rowFloats, hW = _host + 2 * rowFloats;
-        CudaDriverApi.cuMemcpyDtoH_v2((nint)hIn, hiddenF32, (nuint)(rowFloats * sizeof(float))).ThrowOnError();
-        CudaDriverApi.cuMemcpyDtoH_v2((nint)hW, topkWeightF32, (nuint)((long)total * sizeof(float))).ThrowOnError();
 
-        // Bucket the assignments per expert (ascending id), the layout ExecuteRoutedFromAssignments expects.
+        // Bucket the assignments per expert (ascending id), the layout ExecuteRoutedFromAssignments expects. The routine
+        // skips zero weights in its final sum, so the GPU's assignments are zeroed rather than removed.
         Span<int> cursors = stackalloc int[numExperts + 1];
         Span<int> unique = stackalloc int[numExperts];
         int[] bucketBuf = System.Buffers.ArrayPool<int>.Shared.Rent(2 * total);
@@ -68,7 +96,20 @@ internal sealed unsafe class CudaMoeHostExperts : IDisposable
         {
             Span<int> bucketTokens = bucketBuf.AsSpan(0, total), bucketSlots = bucketBuf.AsSpan(total, total);
             cursors.Clear();
-            foreach (int e in topkIdx[..total]) cursors[e + 1]++;
+            assignments = 0;
+            for (int i = 0; i < total; i++)
+            {
+                int e = topkIdx[i];
+                if (e >= firstExpert)
+                {
+                    cursors[e + 1]++;
+                    assignments++;
+                }
+                else
+                {
+                    hW[i] = 0f;
+                }
+            }
             int uniqueCount = 0;
             for (int e = 0; e < numExperts; e++)
             {
@@ -79,7 +120,9 @@ internal sealed unsafe class CudaMoeHostExperts : IDisposable
             cursors[..numExperts].CopyTo(fill);
             for (int i = 0; i < total; i++)
             {
-                int pos = fill[topkIdx[i]]++;
+                int e = topkIdx[i];
+                if (e < firstExpert) continue;
+                int pos = fill[e]++;
                 bucketTokens[pos] = i / k;
                 bucketSlots[pos] = i % k;
             }
@@ -109,24 +152,32 @@ internal sealed unsafe class CudaMoeHostExperts : IDisposable
             System.Buffers.ArrayPool<int>.Shared.Return(bucketBuf);
         }
 
-        CudaDriverApi.cuMemcpyHtoD_v2(routedOutF32, (nint)hOut, (nuint)(rowFloats * sizeof(float))).ThrowOnError();
         ComputeMicroseconds += (long)Stopwatch.GetElapsedTime(t0).TotalMicroseconds;
+        return new ReadOnlySpan<float>(hOut, (int)rowFloats);
     }
 
-    private void EnsureHost(long floats)
+    // Pinned, so the copies in and out are asynchronous. Activations only ([hidden rows | routed rows | top-k weights]).
+    private void EnsureHost(long floats, nint stream)
     {
         if (_hostFloats >= floats) return;
-        if (_host != null) NativeMemory.AlignedFree(_host);
+        if (_host != null)
+        {
+            CudaDriverApi.cuStreamSynchronize(stream).ThrowOnError();   // the last upload may still read the old buffer
+            CudaDriverApi.cuMemFreeHost((nint)_host);
+        }
         long cap = Math.Max(floats, 2 * _hostFloats);
-        _host = (float*)NativeMemory.AlignedAlloc((nuint)(cap * sizeof(float)), 64);
+        CudaDriverApi.cuMemHostAlloc(out nint p, (nuint)(cap * sizeof(float)), 0).ThrowOnError();
+        _host = (float*)p;
         _hostFloats = cap;
     }
 
     /// <inheritdoc/>
     public void Dispose()
     {
+        Stream?.Dispose();
+        Stream = null;
         _pool?.Dispose();
-        if (_host != null) NativeMemory.AlignedFree(_host);
+        if (_host != null) CudaDriverApi.cuMemFreeHost((nint)_host);
         _host = null;
         _hostFloats = 0;
     }
