@@ -214,6 +214,17 @@ public static unsafe partial class MatMul
 
     // ──────────────────── AVX2 block dots ────────────────────
 
+    /// <summary>
+    /// Exact int32 sums of each group of four <c>u8 x s8</c> products: one <c>vpdpbusd</c> with AVX-VNNI, else
+    /// <c>vpmaddubsw</c> + <c>vpmaddwd</c>. Identical results: the legacy operands cannot saturate the int16 pair sums (see the
+    /// header), and both forms sum the same four bytes into each lane (#1159).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<int> DotU8S8Avx2(Vector256<byte> q, Vector256<sbyte> q8v, Vector256<short> ones)
+        => AvxVnni.IsSupported
+            ? AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, q, q8v)
+            : Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(q, q8v), ones);
+
     /// <summary>Low nibbles in the low 128-bit lane, high nibbles in the high lane — the ggml element order.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static Vector256<byte> UnpackNibblesAvx2(byte* qs)
@@ -264,7 +275,7 @@ public static unsafe partial class MatMul
             Vector256<byte> q = UnpackLegacyAvx2(qt, wb, lut, out Vector256<sbyte> signSrc);
             Vector256<sbyte> q8v = Unsafe.ReadUnaligned<Vector256<sbyte>>(xb + 4);
             if (isIq4) q8v = Avx2.Sign(q8v, signSrc);
-            Vector256<int> p = Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(q, q8v), ones);
+            Vector256<int> p = DotU8S8Avx2(q, q8v, ones);
 
             float d = HalfToSingle(wb);
             Vector256<float> scale = Vector256.Create(d * HalfToSingle(xb));
@@ -370,7 +381,7 @@ public static unsafe partial class MatMul
     {
         Vector256<byte> q = UnpackLegacyAvx2(qt, wb, lut, out Vector256<sbyte> signSrc);
         if (isIq4) q8v = Avx2.Sign(q8v, signSrc);
-        return Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(q, q8v), ones);
+        return DotU8S8Avx2(q, q8v, ones);
     }
 
     // ──────────────────── Tier selection ────────────────────
@@ -425,6 +436,13 @@ public static unsafe partial class MatMul
         if (Avx2.IsSupported)
         {
             int row = 0;
+            if (qt is QuantizationType.Q4_0 or QuantizationType.Q4_1 && rowBytes <= int.MaxValue / 8)
+            {
+                for (; row + 7 < m; row += 8)
+                    VecDotQ4Avx2_8Rows(qt, weights + row * rowBytes, (int)rowBytes, xQ8, blockCount, result + row);
+                ComputeRowsQ4ExactTail(qt, weights + row * rowBytes, rowBytes, xQ8, result + row, m - row, blockCount);
+                return;
+            }
             for (; row + 3 < m; row += 4)
                 VecDotLegacyQuantAvx2_4Rows(qt, weights + row * rowBytes, rowBytes, xQ8, blockCount, result + row);
             for (; row < m; row++)
@@ -439,6 +457,20 @@ public static unsafe partial class MatMul
         }
 
         for (int row = 0; row < m; row++)
+            result[row] = VecDotLegacyQuantScalar(qt, weights + row * rowBytes, xQ8, blockCount);
+    }
+
+    /// <summary>
+    /// Up to seven Q4_0/Q4_1 rows (the remainder of an eight-row pass): the exact four-row kernel, then the scalar dot, so the
+    /// whole Q4 path is bit-exact with <see cref="VecDotLegacyQuantScalar"/> (#1159).
+    /// </summary>
+    private static void ComputeRowsQ4ExactTail(QuantizationType qt, byte* weights, nint rowBytes, byte* xQ8, float* result,
+        int rows, int blockCount)
+    {
+        int row = 0;
+        for (; row + 3 < rows; row += 4)
+            VecDotLegacyQuantAvx2_4Rows(qt, weights + row * rowBytes, rowBytes, xQ8, blockCount, result + row);
+        for (; row < rows; row++)
             result[row] = VecDotLegacyQuantScalar(qt, weights + row * rowBytes, xQ8, blockCount);
     }
 
@@ -470,6 +502,36 @@ public static unsafe partial class MatMul
 
         if (Avx2.IsSupported)
         {
+            nint q4RowBytes = (nint)blockCount * LegacyBlockBytes(qt);
+            if (qt is QuantizationType.Q4_0 or QuantizationType.Q4_1 && q4RowBytes <= int.MaxValue / 8)
+            {
+                // #1159: eight rows per pass, exact per column (so equal to the n = 1 kernel); the tail rows stay exact too.
+                int done = 0;
+                if (m >= 8)
+                {
+                    // The activation scales, converted once for every eight-row group.
+                    float[] scaleBuf = ArrayPool<float>.Shared.Rent(n * blockCount * 2);
+                    fixed (float* scales = scaleBuf)
+                    {
+                        for (int t = 0; t < n; t++)
+                            for (int blk = 0; blk < blockCount; blk++)
+                            {
+                                byte* xb = xQ8 + (long)t * q8RowBytes + blk * Q8_1BlockBytes;
+                                scales[(t * blockCount + blk) * 2] = HalfToSingle(xb);
+                                scales[(t * blockCount + blk) * 2 + 1] = HalfToSingle(xb + 2);
+                            }
+                        for (; done + 7 < m; done += 8)
+                            ComputeRowsQ4MultiAvx2_8Rows(qt, weights + done * q4RowBytes, (int)q4RowBytes, xQ8, q8RowBytes,
+                                scales, c + done, mTotal, n, blockCount);
+                    }
+                    ArrayPool<float>.Shared.Return(scaleBuf);
+                }
+                if (done < m)
+                    for (int t = 0; t < n; t++)
+                        ComputeRowsQ4ExactTail(qt, weights + done * q4RowBytes, q4RowBytes, xQ8 + (long)t * q8RowBytes,
+                            c + (long)t * mTotal + done, m - done, blockCount);
+                return;
+            }
             ComputeRowsLegacyMultiAvx2(qt, weights, xQ8, q8RowBytes, c, mTotal, m, n, blockCount);
             return;
         }
@@ -544,7 +606,7 @@ public static unsafe partial class MatMul
                         byte* xb = xQ8 + (long)(t0 + j) * q8RowBytes + block * Q8_1BlockBytes;
                         Vector256<sbyte> q8v = Unsafe.ReadUnaligned<Vector256<sbyte>>(xb + 4);
                         if (isIq4) q8v = Avx2.Sign(q8v, signSrc);
-                        Vector256<int> p = Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(q, q8v), ones);
+                        Vector256<int> p = DotU8S8Avx2(q, q8v, ones);
                         Vector256<float> scale = Vector256.Create(d * HalfToSingle(xb));
                         acc[j] = Avx.Add(acc[j], Avx.Multiply(scale, Avx.ConvertToVector256Single(p)));
                         if (!isIq4) off[j] += offd * HalfToSingle(xb + 2);
@@ -591,6 +653,22 @@ public static unsafe partial class MatMul
     private const int PackedLegacyMaxColumns = 1;
 
     /// <summary>
+    /// Q4_0 / Q4_1 on AVX2 take the packed path at every column count (#1159). Their eight-row multi-column kernel
+    /// (<see cref="ComputeRowsQ4MultiAvx2_8Rows"/>) unpacks and transposes each block once for all columns and is bit-exact per
+    /// column with the n = 1 kernel, which removes both objections above: measured 4.4x the dequantize path at Flint's
+    /// attn_q (m = 4096, k = 2048, n = 64) and 5-11x at its expert shapes, and a token's result no longer depends on the batch
+    /// (prefill and decode now agree bit for bit). The activations are Q8_1 at prefill as at decode, as in llama.cpp.
+    /// <c>DOTLLM_CPU_Q4_PACKED_PREFILL=0</c> restores dequantize-then-GEMM for n &gt; 1 (A/B baseline).
+    /// </summary>
+    public static bool Q4PackedAllColumns { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_CPU_Q4_PACKED_PREFILL") != "0";
+
+    /// <summary>True when <paramref name="qt"/> takes the packed path for any column count (see <see cref="Q4PackedAllColumns"/>).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool PackedAtAnyN(QuantizationType qt)
+        => Q4PackedAllColumns && Avx2.IsSupported && qt is QuantizationType.Q4_0 or QuantizationType.Q4_1;
+
+    /// <summary>
     /// True when a GEMM of <paramref name="n"/> columns in <paramref name="qt"/> will take the
     /// packed path. Input pre-quantization is only worth doing when it will — quantizing to Q8_1
     /// for a prefill that then runs <c>GemmDequantRows</c> off the F32 input is pure waste, and
@@ -598,7 +676,7 @@ public static unsafe partial class MatMul
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool UsesPackedLegacyDot(QuantizationType qt, int n)
-        => HasPackedLegacyDot(qt) && n <= PackedLegacyMaxColumns;
+        => HasPackedLegacyDot(qt) && (n <= PackedLegacyMaxColumns || PackedAtAnyN(qt));
 
     /// <summary>
     /// Dispatches a packed legacy quant to whichever kernel measurement favours at this
@@ -609,7 +687,7 @@ public static unsafe partial class MatMul
     public static void GemmLegacyQuantOrDequant(byte* weights, QuantizationType qt, float* b, float* c,
         int m, int k, int n, ComputeThreadPool? pool, byte* preQuantizedInput = null)
     {
-        if (n <= PackedLegacyMaxColumns)
+        if (n <= PackedLegacyMaxColumns || PackedAtAnyN(qt))
             GemmLegacyQuant(weights, qt, b, c, m, k, n, pool, preQuantizedInput);
         else
             GemmDequantRows(weights, qt, b, c, m, k, n, pool);
