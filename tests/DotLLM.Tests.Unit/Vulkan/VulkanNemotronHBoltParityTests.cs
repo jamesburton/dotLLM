@@ -51,7 +51,7 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
 
     /// <summary>
     /// #1057: the same per-layer geometry with IQ2_XXS banks, the routed-expert type of NVIDIA's official Bolt GGUF. Layer 2 pairs an IQ2_XXS
-    /// up bank with a Q8_0 down bank, so the kernel is chosen per bank and that layer stays indexed under the grouped prefill.
+    /// up bank with a Q8_0 down bank, so the kernel is chosen per bank (that layer is grouped only where the legacy Q8_0 grouped kernel exists, #1225).
     /// </summary>
     private static readonly LayerSpec[] IqLayers =
     [
@@ -154,6 +154,7 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         using var device = VulkanDevice.Create();
         Skip.If(!device.HasIntegerDotProduct, "IQ expert banks need integer dot product (the host refuses them otherwise)");
         bool iqGrouped = MoeGroupedMatmulIqCoopmatKernel.IsSupportedOn(device, spvDir, MoeIqQuant.IQ2_XXS);
+        bool legacyQ8Grouped = MoeGroupedMatmulLegacyQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedLegacyQuant.Q8_0);
 
         RunParity(device, spvDir, IqLayers, IqSeed, mmvq, grouped, xdiv, () =>
         {
@@ -165,9 +166,10 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
             Assert.Equal(0, viaMmq);
             if (grouped && iqGrouped)
             {
-                // Layers 0, 1 and 3 (IQ2_XXS up and down) take the grouped IQ coopmat; layer 2 (Q8_0 down) stays indexed: one IQ MMVQ up.
-                Assert.Equal(3, viaGroupedIq);
-                Assert.Equal(1, viaIq);
+                // Layers 0, 1 and 3 (IQ2_XXS up and down) take the grouped IQ coopmat. Layer 2 (IQ2_XXS up, Q8_0 down) joins them when the
+                // legacy-quant grouped Q8_0 kernel exists (#1225, wave64 coopmat); otherwise it stays indexed: one IQ MMVQ up.
+                Assert.Equal(legacyQ8Grouped ? 4 : 3, viaGroupedIq);
+                Assert.Equal(legacyQ8Grouped ? 0 : 1, viaIq);
             }
             else
             {
@@ -304,6 +306,7 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
     [SkippableTheory]
     [InlineData(QuantizationType.Q8_0)]
     [InlineData(QuantizationType.Q4_K)]
+    [InlineData(QuantizationType.Q5_0)]
     public void Forward_PackedEmbedding_BitIdenticalToF32Table(QuantizationType format)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);

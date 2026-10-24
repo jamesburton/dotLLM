@@ -1,0 +1,79 @@
+#version 450
+// Q5_0 token-embedding gather + dequantize (issue #1225: Nemotron-3.5 Lightning's token_embd is Q5_0, which was widened to F32 at
+// upload, +1.1 GiB). Same contract as q8_0_embed_gather_f32.comp; the table stays in its 22-byte Q5_0 blocks:
+//
+//   bytes [0..1]  fp16 d, [2..5] qh (bit j = 5th bit of element j), [6..21] qs (element j < 16: low nibble of qs[j];
+//   element j >= 16: high nibble of qs[j - 16])
+//   value = (q - 16) * d, ordered as DotLLM.Cpu.Kernels.Dequantize's scalar Q5_0 path (bit-identical to the F32 upload).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW   { uint  src[]; };  // Q5_0 table
+layout(set = 0, binding = 1, std430) readonly  buffer BufIds { int   ids[]; };  // [nTokens]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY   { float dst[]; };  // [nTokens*hidden]
+
+layout(push_constant) uniform PushConstants {
+    uint nTokens;      // number of tokens to gather
+    uint hidden;       // row length in elements (multiple of 32)
+    uint blocksPerRow; // = hidden / 32
+    uint vocabSize;    // row-count bound (defensive clamp)
+} pc;
+
+const uint Q5_0_BLOCK_BYTES = 22u;
+const uint Q5_0_GROUP_SIZE  = 32u;
+
+uint readByte(uint absByteOff) {
+    uint u = src[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+// fp16 read at an arbitrary (possibly 2-mod-4) byte offset.
+float readHalf(uint absByteOff) {
+    uint alignedIdx  = absByteOff >> 2u;
+    uint byteInWord  = absByteOff & 3u;
+    uint u = src[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = src[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+// 32-bit read at an arbitrary byte offset.
+uint readWord(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    if (byteInWord == 0u) return src[alignedIdx];
+    uint sh = byteInWord * 8u;
+    return (src[alignedIdx] >> sh) | (src[alignedIdx + 1u] << (32u - sh));
+}
+
+void main() {
+    uint t = gl_WorkGroupID.y;
+    if (t >= pc.nTokens) return;
+
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.hidden) return;
+
+    // Token ids are host-validated before recording; the clamp is a defensive
+    // second gate so a bad id can never read outside the table.
+    uint row = uint(ids[t]);
+    if (row >= pc.vocabSize) row = 0u;
+
+    uint rowBase   = row * pc.blocksPerRow * Q5_0_BLOCK_BYTES;
+    uint block     = c / Q5_0_GROUP_SIZE;
+    uint lane      = c - block * Q5_0_GROUP_SIZE;
+    uint blockBase = rowBase + block * Q5_0_BLOCK_BYTES;
+
+    float d  = readHalf(blockBase);
+    uint  qh = readWord(blockBase + 2u);
+    uint  qb = readByte(blockBase + 6u + (lane & 15u));
+    uint  q  = (lane < 16u ? (qb & 0xFu) : (qb >> 4u)) | (((qh >> lane) & 1u) << 4u);
+
+    precise float v = float(int(q) - 16) * d;
+    dst[t * pc.hidden + c] = v;
+}
