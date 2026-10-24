@@ -1194,7 +1194,13 @@ public sealed partial class VulkanTransformerModel : IModel
     {
         _kvF16Writer = VulkanKvF16WriteKernel.Create(_device, spvDir);
         if (!IsSplitDecodeDisabled())
+        {
             _splitKvAttentionKvF16 = VulkanSplitKvAttentionKernel.TryCreate(_device, spvDir, VulkanKvStorage.F16);
+
+            // #1200: the GQA-grouped split pass reads each K / V row once for the 8 query heads of a group (the per-head pass reads it
+            // 8 times); at 32K the full layers' decode attention dominated the step. DOTLLM_VULKAN_SPLITKV_GQA=0 restores the per-head pass.
+            _splitKvAttentionKvF16?.EnableGqaByDefault();
+        }
         if (_smallRowAttn is not null)
             _smallRowAttnKvF16 = VulkanSplitKvRowsAttentionKernel.TryCreate(_device, spvDir, VulkanKvStorage.F16);
     }

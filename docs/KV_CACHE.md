@@ -274,7 +274,8 @@ only plans (`TryPlan` / `Commit`); each backend carries out the move.
   changes where a window crosses a tile boundary and the online-softmax rounding with it (measured ~1e-2 on synthetic logits).
   Vulkan therefore keeps every base a multiple of 256 (`SlidingWindowRows(..., baseAlignment: 256)`): a compaction keeps
   `W - 1 + 64` to `W - 1 + 64 + 255` rows and the default ring is `2 * (W - 1 + 64) + 255` rows (1,407 for Flint). The decode
-  and small-row kernels split relative to the window start and are shift-invariant anyway.
+  and small-row kernels split relative to the window start and are shift-invariant anyway. Prefill now runs the GQA flash sink
+  twins (#1200), whose 16 / 32-row tiles divide 256 and whose window-start tile skip is exact, so the ring stays bit-identical.
 - **Attention.** The forward passes `positions[0] - base` / `CurrentLength - base`; the sink, split-KV and small-row kernels are
   unchanged. The fused RoPE+KV write and the host-staged paths (`IngestFromHost`, `DownloadLayer`) refuse a compact cache.
 - **Rollback / truncation** behave as on the CPU (`CanTruncateTo`, `Rollback`, `SetCurrentLength`, `Reset`).

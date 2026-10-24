@@ -21,12 +21,19 @@ public sealed class VulkanSinkSplitKvAttentionTests
     [InlineData(1025, 128, 64, 8, 64, 4.0f)]     // sink dominates the denominator (e^4 x the typical key weight)
     [InlineData(300, 0, 12, 4, 128, 1.0f)]       // other geometry (GQA 3, headDim 128)
     [InlineData(40, 0, 64, 8, 64, 0.0f)]         // short context, small split count
-    public void SplitKvWithSinks_MatchesSinkKernel(int seqKv, int window, int numHeads, int numKvHeads, int headDim, float sinkBias)
+    [InlineData(700, 128, 64, 8, 64, 0.5f, true)]    // the GQA-grouped split pass (#1200): gpt-oss geometry, windowed
+    [InlineData(4000, 0, 32, 4, 128, 2.0f, true)]    // Flint full (NoPE) layer at depth, group of 8
+    [InlineData(2600, 513, 32, 4, 128, 1.0f, true)]  // Flint sliding layer, clipped to the window
+    public void SplitKvWithSinks_MatchesSinkKernel(
+        int seqKv, int window, int numHeads, int numKvHeads, int headDim, float sinkBias, bool gqa = false)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
         using var gpt = VulkanGptOssKernels.Create(device, spvDir);
         using var split = VulkanSplitKvAttentionKernel.Create(device, spvDir);
+        split.PreferGqa = gqa;
+        Skip.If(gqa && !split.UsesGqa(numHeads, numKvHeads, headDim), "GQA-grouped split pass unavailable");
+        Assert.Equal(gqa, split.UsesGqa(numHeads, numKvHeads, headDim));
 
         var rng = new Random(0x915 + seqKv + window);
         float[] q = Rand(rng, numHeads * headDim, 1f);
