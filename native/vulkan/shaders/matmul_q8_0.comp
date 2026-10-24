@@ -37,7 +37,11 @@ layout(push_constant) uniform PushConstants {
     uint K;                // columns (must be a multiple of 32)
     uint blocksPerRow;     // = K / 32
     uint rowUints;         // = (blocksPerRow * 34) / 4  (exact, because row stride is 4-byte-aligned only when blocksPerRow*34 is divisible by 4; we keep it as an absolute uint-count per row for safety)
+    uint cols;
 } pc;
+
+// #1237: `cols` activation columns. Workgroup w (x + 32768 y) computes row w / cols of column w % cols with the
+// one-column arithmetic, so a speculative verify of cols rows is bit-identical to cols decode steps.
 
 // Fetch the i-th byte (0..31) of the qs[] portion of block `b` in row `mRowUint` (uint index of row start).
 // The block's qs region starts at absolute byte offset `mRowBytes + b*34 + 2`.
@@ -72,8 +76,11 @@ float readHalf(uint absByteOff) {
 shared float partials[128];
 
 void main() {
-    uint m = gl_WorkGroupID.x;
+    uint wg = gl_WorkGroupID.y * 32768u + gl_WorkGroupID.x;
+    uint col = wg % pc.cols;
+    uint m = wg / pc.cols;
     if (m >= pc.M) return;
+    uint xCol = col * pc.K, yCol = col * pc.M;
 
     uint tid = gl_LocalInvocationID.x;
     uint threads = gl_WorkGroupSize.x;
@@ -127,7 +134,7 @@ void main() {
             vec4 qv = vec4(bitfieldExtract(p,  0, 8), bitfieldExtract(p,  8, 8),
                            bitfieldExtract(p, 16, 8), bitfieldExtract(p, 24, 8));
             uint xb = xBase + g * 4u;
-            vec4 xv = vec4(x[xb], x[xb + 1u], x[xb + 2u], x[xb + 3u]);
+            vec4 xv = vec4(x[xCol + xb], x[xCol + xb + 1u], x[xCol + xb + 2u], x[xCol + xb + 3u]);
             blockSum += dot(qv, xv);
         }
         acc += d * blockSum;
@@ -142,5 +149,5 @@ void main() {
         barrier();
     }
 
-    if (tid == 0u) y[m] = partials[0];
+    if (tid == 0u) y[yCol + m] = partials[0];
 }

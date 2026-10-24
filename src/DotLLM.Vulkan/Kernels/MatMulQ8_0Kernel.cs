@@ -41,7 +41,7 @@ public sealed class MatMulQ8_0Kernel : IDisposable
     /// <summary>Elements per Q8_0 block.</summary>
     public const int Q8_0GroupSize = QuantFormat.LegacyGroupSize;
 
-    private const int PushConstantBytes = 4 * sizeof(uint); // M, K, blocksPerRow, rowUints
+    private const int PushConstantBytes = 5 * sizeof(uint); // M, K, blocksPerRow, rowUints, cols (#1237)
 
     private static readonly bool CoalescedDisabledFromEnv =
         Environment.GetEnvironmentVariable("DOTLLM_VK_Q8_0_GEMV_COALESCED") == "0";
@@ -157,11 +157,16 @@ public sealed class MatMulQ8_0Kernel : IDisposable
     /// <param name="y">FP32 output buffer of length <paramref name="m"/>.</param>
     /// <param name="m">Output dimension.</param>
     /// <param name="k">Input dimension (must be a multiple of 32).</param>
+    /// <param name="cols">
+    /// Activation columns (#1237): <paramref name="x"/> holds <c>cols</c> rows of <paramref name="k"/> and <paramref name="y"/>
+    /// receives <c>cols</c> rows of <paramref name="m"/>, each bit-identical to a one-column call (see <see cref="GemvColumns"/>).
+    /// </param>
     public unsafe void Record(
         nint cmdBuf,
         VulkanDevice.Buffer weightsQ8, VulkanDevice.Buffer x, VulkanDevice.Buffer y,
-        int m, int k)
+        int m, int k, int cols = 1)
     {
+        if (cols <= 0) throw new ArgumentOutOfRangeException(nameof(cols));
         if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m));
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
         if ((k % Q8_0GroupSize) != 0)
@@ -176,9 +181,9 @@ public sealed class MatMulQ8_0Kernel : IDisposable
             throw new ArgumentException(
                 $"Weights buffer too small: need >= {weightsMin} bytes, got {weightsQ8.Size}.",
                 nameof(weightsQ8));
-        if (x.Size < (long)k * sizeof(float))
+        if (x.Size < (long)cols * k * sizeof(float))
             throw new ArgumentException("Input buffer too small.", nameof(x));
-        if (y.Size < (long)m * sizeof(float))
+        if (y.Size < (long)cols * m * sizeof(float))
             throw new ArgumentException("Output buffer too small.", nameof(y));
 
         bool coalesced = _coalesced is not null && (CoalescedOverride ?? _useCoalesced);
@@ -192,12 +197,13 @@ public sealed class MatMulQ8_0Kernel : IDisposable
             cmdBuf, VkPipelineBindPoint.Compute, v.Pipeline.Layout,
             0, 1, descriptorSet, 0, 0);
 
-        Span<uint> pc = stackalloc uint[4]
+        Span<uint> pc = stackalloc uint[5]
         {
             (uint)m,
             (uint)k,
             (uint)blocksPerRow,
             (uint)rowUints,
+            (uint)cols,
         };
         fixed (uint* pcPtr = pc)
         {
@@ -206,7 +212,7 @@ public sealed class MatMulQ8_0Kernel : IDisposable
                 0, PushConstantBytes, (nint)pcPtr);
         }
 
-        VulkanApi.vkCmdDispatch(cmdBuf, (uint)m, 1, 1);
+        GemvColumns.Dispatch(cmdBuf, (long)m * cols);
     }
 
     /// <inheritdoc/>

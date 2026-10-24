@@ -20,7 +20,7 @@ namespace DotLLM.Models.Architectures;
 ///   - squared-ReLU MLP (no gate).
 /// with a single RMSNorm before and one residual add after.
 /// </summary>
-public sealed unsafe class NemotronHTransformerModel : IModel
+public sealed unsafe partial class NemotronHTransformerModel : IModel
 {
     private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
     private const int Q8_0GroupSize = QuantFormat.LegacyGroupSize;
@@ -598,14 +598,53 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
         => Forward(tokenIds, positions, deviceId, kvCache: null);
 
+    /// <summary>
+    /// Forwards of at most this many tokens run one token at a time through the decode path (#1237), so a speculative verify or
+    /// replay of K+1 rows computes every row exactly as K+1 decode steps would: greedy speculation is token-identical to plain
+    /// decoding by construction. Longer batches (prefill) keep the batched GEMMs.
+    /// </summary>
+    internal const int RowByRowMaxTokens = 16;
+
     /// <inheritdoc/>
-    [SkipLocalsInit]
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache)
+        => ForwardWithTaps(tokenIds, positions, deviceId, kvCache, taps: null);
+
+    private ITensor ForwardWithTaps(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                                    int deviceId, IKvCache? kvCache, DFlash.DFlashMtpState? taps)
     {
         int seqLen = tokenIds.Length;
         if (seqLen == 0 || seqLen != positions.Length)
             throw new ArgumentException("tokenIds and positions must have equal, non-zero length.");
+        int vocabSize = Config.VocabSize;
+        var result = UnmanagedTensor.Allocate(new TensorShape(seqLen, vocabSize), DType.Float32, deviceId);
+        try
+        {
+            float* dst = (float*)result.DataPointer;
+            if (seqLen > 1 && seqLen <= RowByRowMaxTokens && kvCache is not null)   // without a cache the rows must see each other
+            {
+                for (int t = 0; t < seqLen; t++)
+                    ForwardCore(tokenIds.Slice(t, 1), positions.Slice(t, 1), kvCache, taps, t, dst + (long)t * vocabSize);
+            }
+            else
+            {
+                ForwardCore(tokenIds, positions, kvCache, taps, 0, dst);
+            }
+        }
+        catch
+        {
+            result.Dispose();
+            throw;
+        }
+        return result;
+    }
+
+    /// <summary>The forward body: logits of every row into <paramref name="logitsDest"/>; tapped layer inputs into <paramref name="taps"/> rows from <paramref name="tapRow0"/>.</summary>
+    [SkipLocalsInit]
+    private void ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, IKvCache? kvCache,
+                             DFlash.DFlashMtpState? taps, int tapRow0, float* logitsDest)
+    {
+        int seqLen = tokenIds.Length;
 
         int hiddenSize = Config.HiddenSize;
         int vocabSize = Config.VocabSize;
@@ -644,6 +683,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         for (int layer = 0; layer < _layers.Length; layer++)
         {
             var lw = _layers[layer];
+            if (taps is not null) CaptureDFlashTaps(taps, layer, hidden, seqLen, tapRow0);
 
             // Save residual snapshot and pre-norm into normOut (shared by all three sub-layers).
             new Span<float>(hidden, seqLen * hiddenSize).CopyTo(new Span<float>(residual, seqLen * hiddenSize));
@@ -696,6 +736,8 @@ public sealed unsafe class NemotronHTransformerModel : IModel
                 NemotronHDiagnostics.DumpStats($"L{layer:D2}{kindTag}[last]", hidden + (seqLen - 1) * hiddenSize, hiddenSize);
         }
 
+        if (taps is not null) CaptureDFlashTaps(taps, _layers.Length, hidden, seqLen, tapRow0);
+
         for (int t = 0; t < seqLen; t++)
         {
             RmsNorm.Execute(
@@ -707,12 +749,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         Gemm(_outputWeight, _outputQuantType, hidden, logits,
              _outputOutputDim, _outputInputDim, seqLen, preQuantizedInput: null);
 
-        var shape = new TensorShape(seqLen, vocabSize);
-        var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
-        new Span<float>(logits, seqLen * vocabSize).CopyTo(
-            new Span<float>((void*)result.DataPointer, seqLen * vocabSize));
-
-        return result;
+        new Span<float>(logits, seqLen * vocabSize).CopyTo(new Span<float>(logitsDest, seqLen * vocabSize));
     }
 
     /// <summary>
@@ -1517,6 +1554,8 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     {
         if (_ownsThreadPool)
             _threadPool?.Dispose();
+        _dflash?.Dispose();
+        _dflash = null;
         _state.Dispose();
         _ssmCache.Dispose();
         GC.SuppressFinalize(this);

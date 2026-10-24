@@ -49,7 +49,7 @@ public sealed class Mamba2SelectiveScanRegsF32Kernel : IDisposable
         => dState == 128 && headDim > 0 && headDim % RowsPerWorkgroup == 0
            && Environment.GetEnvironmentVariable(LegacyEnvVar) != "1";
     // nHead, headDim, dState, nGroup, seqLen (all u32)
-    private const int PushConstantBytes = 5 * sizeof(uint);
+    private const int PushConstantBytes = 6 * sizeof(uint);   // + writeState (#1237)
     private const int BufferCount = 7;
 
     private readonly VulkanDevice _device;
@@ -121,6 +121,7 @@ public sealed class Mamba2SelectiveScanRegsF32Kernel : IDisposable
     /// </summary>
     /// <param name="cmdBuf">Open Vulkan command buffer.</param>
     /// <param name="state">SSM hidden state [<paramref name="nHead"/>, <paramref name="headDim"/>, <paramref name="dState"/>] — read-modify-write.</param>
+    /// <param name="writeState">False: emit y but leave the state untouched (a read-only speculative verify, #1237).</param>
     /// <param name="x">Post-conv activations [<paramref name="seqLen"/>, <paramref name="nHead"/>*<paramref name="headDim"/>].</param>
     /// <param name="dt">Time-step parameter [<paramref name="seqLen"/>, <paramref name="nHead"/>] — already bias-added.</param>
     /// <param name="a">A parameter [<paramref name="nHead"/>] — scalar per head (Mamba-2).</param>
@@ -137,7 +138,7 @@ public sealed class Mamba2SelectiveScanRegsF32Kernel : IDisposable
         VulkanDevice.Buffer state, VulkanDevice.Buffer x, VulkanDevice.Buffer dt,
         VulkanDevice.Buffer a, VulkanDevice.Buffer b, VulkanDevice.Buffer c,
         VulkanDevice.Buffer y,
-        int nHead, int headDim, int dState, int nGroup, int seqLen)
+        int nHead, int headDim, int dState, int nGroup, int seqLen, bool writeState = true)
     {
         if (nHead <= 0) throw new ArgumentOutOfRangeException(nameof(nHead));
         if (headDim <= 0) throw new ArgumentOutOfRangeException(nameof(headDim));
@@ -183,6 +184,7 @@ public sealed class Mamba2SelectiveScanRegsF32Kernel : IDisposable
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[8..],   (uint)dState);
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[12..],  (uint)nGroup);
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[16..],  (uint)seqLen);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[20..],  writeState ? 1u : 0u);
         fixed (byte* pcPtr = pcBytes)
         {
             VulkanApi.vkCmdPushConstants(

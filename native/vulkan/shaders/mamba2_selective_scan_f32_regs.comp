@@ -43,6 +43,7 @@ layout(push_constant) uniform PushConstants {
     uint dState;
     uint nGroup;
     uint seqLen;
+    uint writeState;   // 0: read the state, emit y, leave the state untouched (#1237 speculative verify)
 } pc;
 
 float softplusF(float v) {
@@ -93,5 +94,6 @@ void main() {
             y[t * dInner + h * pc.headDim + i] = part;
     }
 
-    for (uint j = 0u; j < KPL4; j++) st[stateBase4 + j] = s[j];
+    if (pc.writeState != 0u)
+        for (uint j = 0u; j < KPL4; j++) st[stateBase4 + j] = s[j];
 }

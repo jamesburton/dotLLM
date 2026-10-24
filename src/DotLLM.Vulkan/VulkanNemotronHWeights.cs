@@ -875,8 +875,42 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     /// dequantised to F32 before upload and <paramref name="deviceQuantType"/> is
     /// <see cref="QuantizationType.F32"/>.
     /// </summary>
-    private static unsafe VulkanDevice.Buffer UploadProjectionMatrix(
+    private static VulkanDevice.Buffer UploadProjectionMatrix(
         VulkanDevice device, VulkanStagingBuffer staging, VulkanWeightArena arena,
+        nint srcPtr, QuantizationType qt, int outputDim, int inputDim,
+        bool forceF32,
+        out QuantizationType deviceQuantType,
+        out long uploadedBytes)
+        => UploadProjectionMatrix(device, staging, arena.AllocateDeviceLocal, srcPtr, qt, outputDim, inputDim, forceF32,
+            out deviceQuantType, out uploadedBytes);
+
+    /// <summary>Device bytes <see cref="UploadDFlashMatrix"/> stages for a drafter matrix (#1237).</summary>
+    /// <param name="outputDim">Rows.</param>
+    /// <param name="inputDim">Row length.</param>
+    /// <param name="qt">Stored type.</param>
+    /// <returns>Bytes.</returns>
+    internal static long DFlashUploadBytes(int outputDim, int inputDim, QuantizationType qt) => ProjectionUploadBytes(outputDim, inputDim, qt);
+
+    /// <summary>
+    /// Uploads a DFlash drafter matrix (#1237) exactly as a trunk projection: kept in its stored type where a kernel reads it (imported
+    /// zero-copy from the mmap where the device allows), each in its own allocation.
+    /// </summary>
+    /// <param name="device">Device.</param>
+    /// <param name="staging">Staging buffer.</param>
+    /// <param name="srcPtr">Host (mmap) pointer.</param>
+    /// <param name="qt">Stored type.</param>
+    /// <param name="outputDim">Rows.</param>
+    /// <param name="inputDim">Row length.</param>
+    /// <param name="deviceQuantType">The type on the device.</param>
+    /// <param name="uploadedBytes">Device bytes.</param>
+    /// <returns>The device buffer.</returns>
+    internal static VulkanDevice.Buffer UploadDFlashMatrix(VulkanDevice device, VulkanStagingBuffer staging,
+        nint srcPtr, QuantizationType qt, int outputDim, int inputDim, out QuantizationType deviceQuantType, out long uploadedBytes)
+        => UploadProjectionMatrix(device, staging, device.AllocateDeviceLocal, srcPtr, qt, outputDim, inputDim, forceF32: false,
+            out deviceQuantType, out uploadedBytes);
+
+    private static unsafe VulkanDevice.Buffer UploadProjectionMatrix(
+        VulkanDevice device, VulkanStagingBuffer staging, Func<long, VulkanDevice.Buffer> allocate,
         nint srcPtr, QuantizationType qt, int outputDim, int inputDim,
         bool forceF32,
         out QuantizationType deviceQuantType,
@@ -901,7 +935,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
             if (VulkanWeightImportPolicy.TryImport(device, srcPtr, bytes, out var imported))
                 return imported!;
 
-            var buf = arena.AllocateDeviceLocal(bytes);
+            var buf = allocate(bytes);
             staging.UploadBytes(srcPtr, bytes, buf);
             VulkanWeightImportPolicy.NoteStaged(srcPtr, bytes);
             return buf;
@@ -924,7 +958,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         // Q5_0 (no Vulkan kernel for those yet), and the forceF32-token-embedding
         // path that always lands here.
         long fpBytes = elems * sizeof(float);
-        var fpBuf = arena.AllocateDeviceLocal(fpBytes);
+        var fpBuf = allocate(fpBytes);
 
         if (qt == QuantizationType.F32)
         {

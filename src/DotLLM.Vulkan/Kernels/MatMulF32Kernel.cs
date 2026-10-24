@@ -221,7 +221,7 @@ public sealed class MatMulF32Kernel : IDisposable
 
         if (gemv)
         {
-            VulkanApi.vkCmdDispatch(cmdBuf, (uint)m, 1, 1);
+            GemvColumns.Dispatch(cmdBuf, m);
             return;
         }
 
@@ -229,6 +229,39 @@ public sealed class MatMulF32Kernel : IDisposable
         uint groupsX = (uint)((m + tileX - 1) / tileX);
         uint groupsY = (uint)((n + tileY - 1) / tileY);
         VulkanApi.vkCmdDispatch(cmdBuf, groupsX, groupsY, 1);
+    }
+
+    /// <summary>True when <see cref="RecordGemvColumns"/> can serve a contraction of <paramref name="k"/>.</summary>
+    /// <param name="k">Contraction length.</param>
+    /// <returns>Whether the vec4 GEMV is loaded and <paramref name="k"/> is a multiple of 4.</returns>
+    internal bool CanGemvColumns(int k) => _gemvPipeline is not null && (k & 3) == 0;
+
+    /// <summary>
+    /// The decode GEMV over <paramref name="cols"/> activation rows (#1237): row <c>c</c> of <paramref name="outputC"/> is
+    /// bit-identical to a one-row <see cref="Record"/> of row <c>c</c> of <paramref name="inputB"/>.
+    /// </summary>
+    /// <param name="cmdBuf">Command buffer.</param>
+    /// <param name="weightsA">F32 weights <c>[m, k]</c>.</param>
+    /// <param name="inputB">Input rows <c>[cols, k]</c>.</param>
+    /// <param name="outputC">Output rows <c>[cols, m]</c>.</param>
+    /// <param name="m">Output width.</param>
+    /// <param name="k">Contraction length, a multiple of 4.</param>
+    /// <param name="cols">Rows.</param>
+    internal unsafe void RecordGemvColumns(nint cmdBuf, VulkanDevice.Buffer weightsA, VulkanDevice.Buffer inputB, VulkanDevice.Buffer outputC,
+        int m, int k, int cols)
+    {
+        if (!CanGemvColumns(k)) throw new InvalidOperationException("The F32 GEMV is unavailable or k is not a multiple of 4.");
+        if (inputB.Size < (long)cols * k * sizeof(float)) throw new ArgumentException("Input buffer too small.", nameof(inputB));
+        if (outputC.Size < (long)cols * m * sizeof(float)) throw new ArgumentException("Output buffer too small.", nameof(outputC));
+        Span<nint> buffers = stackalloc nint[3] { weightsA.Handle, inputB.Handle, outputC.Handle };
+        nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
+        var pipe = _gemvPipeline!;
+        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, pipe.Pipeline);
+        VulkanApi.vkCmdBindDescriptorSets(cmdBuf, VkPipelineBindPoint.Compute, pipe.Layout, 0, 1, descriptorSet, 0, 0);
+        Span<uint> pc = stackalloc uint[3] { (uint)m, (uint)k, (uint)cols };
+        fixed (uint* pcPtr = pc)
+            VulkanApi.vkCmdPushConstants(cmdBuf, pipe.Layout, VkShaderStageFlags.Compute, 0, PushConstantBytes, (nint)pcPtr);
+        GemvColumns.Dispatch(cmdBuf, (long)m * cols);
     }
 
     /// <inheritdoc/>

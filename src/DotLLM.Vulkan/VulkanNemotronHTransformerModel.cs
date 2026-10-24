@@ -35,7 +35,7 @@ namespace DotLLM.Vulkan;
 /// scratch shapes; the SSM-bearing hybrid path has its own (Zxbcdt, ConvInput, …).
 /// </para>
 /// </remarks>
-public sealed class VulkanNemotronHTransformerModel : IModel
+public sealed partial class VulkanNemotronHTransformerModel : IModel
 {
     private readonly VulkanDevice _device;
     private readonly VulkanNemotronHWeights _weights;
@@ -635,6 +635,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             ssmSplitXbc,
             submit);
         created._moe = moeKernels;
+        created._spvDir = spvDir;
+        created._hostTokenEmbed = tokenEmbedWeight;
+        created._hostTokenEmbedQt = tokenEmbedQt;
         try
         {
             if (weights.TokenEmbeddingQuantType != QuantizationType.F32)
@@ -828,6 +831,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _prof?.BeginSubmit(cmdBuf);
         KernelSupport.HostToComputeBarrier(cmdBuf);
 
+        RecordPendingRecurrentOps(cmdBuf);   // #1237: a deferred rollback, then the verify's checkpoint
+
         _state.ResetHiddenSlot();
         RecordEmbeddingGather(cmdBuf, tokenIds);
         if (_embedGather is not null) KernelSupport.ComputeToComputeBarrier(cmdBuf);
@@ -838,6 +843,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         for (int layer = 0; layer < Config.NumLayers; layer++)
         {
             ref readonly var lw = ref _weights.Layers[layer];
+            RecordDFlashTap(cmdBuf, layer);
 
             // Pre-sublayer RMSNorm: HiddenState → NormOutput. Shared across all three kinds.
             _rmsnorm.Record(cmdBuf, _state.HiddenState, lw.AttnNormWeight, _state.NormOutput,
@@ -891,6 +897,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             }
         }
 
+        RecordDFlashTap(cmdBuf, Config.NumLayers);
+
         // Final RMSNorm on the last headRows tokens (1 unless all-row logits were requested).
         long rowBytes = (long)hiddenSize * sizeof(float);
         long headSrcOffset = (long)(seqLen - headRows) * rowBytes;
@@ -929,7 +937,11 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     /// per-sequence state container. Callers that treat each forward as an independent sequence
     /// (perplexity windows) must call this between sequences — see issue #261.
     /// </remarks>
-    public void ResetSequenceState() => _ssmCache.Reset();
+    public void ResetSequenceState()
+    {
+        DropPendingRecurrentOps();   // #1237: a deferred checkpoint save/restore is moot once the state is zeroed
+        _ssmCache.Reset();
+    }
 
     /// <inheritdoc/>
     public bool RequiresPerSequenceState => true;
@@ -1156,6 +1168,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         }
         KernelSupport.TransferToComputeBarrier(cmdBuf);
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.CopyFanout);
+        RecordSsmRowSnapshot(cmdBuf, ssmOrdinal, seqLen, convOnly: true);
 
         // 3. Conv1d causal → XBC.
         _conv1dCausal.Record(cmdBuf, _state.ConvInput, ssmW.Conv1dWeight, ssmW.Conv1dBias, _state.XBC,
@@ -1170,7 +1183,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         //    conv_state. The CPU oracle reads from indices [seqLen, seqLen+1, …, seqLen+dConv-2]
         //    of ConvInput, i.e. the rows numbered seqLen..(seqLen+dConv-2). Copy
         //    contiguous (d_conv-1)*convDim bytes starting at byte-offset seqLen*convDimBytes.
-        if (convStateBytes > 0)
+        // A read-only speculative verify (#1237) leaves the conv state alone: the commit writes the accepted row's window.
+        if (convStateBytes > 0 && !_roVerify)
         {
             KernelSupport.ComputeToTransferBarrier(cmdBuf);
             ulong saveSrcOffset = (ulong)((long)seqLen * convDimBytes);
@@ -1210,22 +1224,11 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             seqLen: seqLen, dInner: dInner, bcDim: bcDim);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.GdnPre);
+        RecordSsmRowSnapshot(cmdBuf, ssmOrdinal, seqLen, convOnly: false);
 
         // 8. Mamba2 selective scan: state, SsmX, DtBuf, A, SsmB, SsmC -> SsmY.
-        if (_mamba2ScanRegs is not null && Mamba2SelectiveScanRegsF32Kernel.IsEligible(headDim, dState))
-        {
-            // Register-resident state, 4 lanes per row (#572): 3-4x on prefill, and it removes the
-            // per-token global state round trip that dominated Nemotron-H prefill AND decode.
-            _mamba2ScanRegs.Record(cmdBuf, ssmStateBuf, _state.SsmX, _state.DtBuf, ssmW.A,
-                _state.SsmB, _state.SsmC, _state.SsmY,
-                nHead: nHead, headDim: headDim, dState: dState, nGroup: nGroup, seqLen: seqLen);
-        }
-        else
-        {
-            _mamba2Scan.Record(cmdBuf, ssmStateBuf, _state.SsmX, _state.DtBuf, ssmW.A,
-                _state.SsmB, _state.SsmC, _state.SsmY,
-                nHead: nHead, headDim: headDim, dState: dState, nGroup: nGroup, seqLen: seqLen);
-        }
+        RecordMamba2Scan(cmdBuf, ssmStateBuf, _state.SsmX, _state.DtBuf, ssmW.A, _state.SsmB, _state.SsmC, _state.SsmY, seqLen,
+            writeState: !_roVerify);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.GdnScanCore);
 
@@ -1270,6 +1273,29 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         RecordMatmul(cmdBuf, ssmW.OutWeight, ssmW.OutDeviceQuantType, _state.SsmY, _state.NormOutput,
             outputDim: ssmW.OutOutputDim, inputDim: ssmW.OutInputDim, seqLen: seqLen, scale: ssmW.OutScale);
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.ProjGdn);
+    }
+
+    /// <summary>
+    /// The Mamba-2 selective scan of <paramref name="seqLen"/> rows into <paramref name="state"/> (in place). One dispatch serves the
+    /// forward and the #1237 rollback replay, so a replay of rows 0..r leaves exactly the state the forward passed through after row r.
+    /// </summary>
+    private void RecordMamba2Scan(nint cmdBuf, VulkanDevice.Buffer state, VulkanDevice.Buffer x, VulkanDevice.Buffer dt, VulkanDevice.Buffer a,
+        VulkanDevice.Buffer b, VulkanDevice.Buffer c, VulkanDevice.Buffer y, int seqLen, bool writeState = true)
+    {
+        int nHead = _ssm.NHead, headDim = _ssm.HeadDim, dState = _ssm.DState, nGroup = _ssm.NGroup;
+        if (ScanKeepsStateInRegisters)
+        {
+            // Register-resident state, 4 lanes per row (#572): 3-4x on prefill, and it removes the
+            // per-token global state round trip that dominated Nemotron-H prefill AND decode.
+            _mamba2ScanRegs!.Record(cmdBuf, state, x, dt, a, b, c, y,
+                nHead: nHead, headDim: headDim, dState: dState, nGroup: nGroup, seqLen: seqLen, writeState: writeState);
+        }
+        else
+        {
+            if (!writeState) throw new InvalidOperationException("Only the register scan can run read-only.");
+            _mamba2Scan.Record(cmdBuf, state, x, dt, a, b, c, y,
+                nHead: nHead, headDim: headDim, dState: dState, nGroup: nGroup, seqLen: seqLen);
+        }
     }
 
     /// <summary>
@@ -1319,7 +1345,24 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             positionOffset = 0;
         }
 
-        if (_splitKvAttention is not null && seqLen == 1
+        if (seqLen > 1 && seqLen <= RowExactMaxTokens && RowExactEnabled && kvCache is VulkanNemotronHKvCache)
+        {
+            // #1237: each row through the decode attention over the cache prefix it would see as a decode step (the batch's K/V
+            // are already written): a small batch is bit-identical to seqLen decode steps.
+            long rowBytes = (long)numHeads * headDim * sizeof(float);
+            for (int r = 0; r < seqLen; r++)
+            {
+                KernelSupport.ComputeToTransferBarrier(cmdBuf);
+                RecordCopyBufferRange(cmdBuf, _state.Q, _state.RowQ, (ulong)(r * rowBytes), 0, (ulong)rowBytes);
+                KernelSupport.TransferToComputeBarrier(cmdBuf);
+                RecordDecodeAttention(cmdBuf, _state.RowQ, kSrc, vSrc, _state.RowAttn, positions[r] + 1, positions[r],
+                    numHeads, numKvHeads, headDim);
+                KernelSupport.ComputeToTransferBarrier(cmdBuf);
+                RecordCopyBufferRange(cmdBuf, _state.RowAttn, _state.AttnOutput, 0, (ulong)(r * rowBytes), (ulong)rowBytes);
+                KernelSupport.TransferToComputeBarrier(cmdBuf);
+            }
+        }
+        else if (_splitKvAttention is not null && seqLen == 1
             && headDim <= VulkanSplitKvAttentionKernel.MaxHeadDim
             && VulkanSplitKvAttentionKernel.WouldSplit(seqKv, numHeads))
         {
@@ -1735,7 +1778,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _reluSquared.Record(cmdBuf, _state.FfnIntermediate, n: seqLen * sharedInter);
         k.Router.Record(cmdBuf, _state.MoeRouterLogits!, m.SelectionBias, _state.MoeTopkIndices!, _state.MoeTopkWeights!,
             seqLen: seqLen, numExperts: numE, k: topK, normTopKProb: m.NormalizeWeights, weightsScale: m.WeightsScale);
-        var grouped = seqLen >= MoeGroupedMinTokens ? SelectGroupedPath(k, m, expertDim) : GroupedPath.None;
+        // A small batch keeps the per-(token, slot) indexed kernels, so each row matches its decode step bit for bit (#1237).
+        var grouped = seqLen >= MoeGroupedMinTokens && (seqLen > RowExactMaxTokens || !RowExactEnabled) ? SelectGroupedPath(k, m, expertDim) : GroupedPath.None;
         // #1049: a K-quant up bank on the MMVQ arm reads the per-token rows directly (xDiv = topK), so neither the topK-fold broadcast
         // nor the topK-fold quantize is needed.
         // #1057: so does an IQ-family up bank (its MMVQ kernel takes the same xDiv).
@@ -2197,6 +2241,11 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         VulkanDevice.Buffer input, VulkanDevice.Buffer output,
         int outputDim, int inputDim, int seqLen, float scale = 1.0f)
     {
+        // #1237: a small batch (a speculative verify, its replay, a short prompt) runs the decode GEMV over its rows, so each row is
+        // bit-identical to a decode step while every weight row is still read once.
+        if (seqLen > 1 && seqLen <= RowExactMaxTokens && RowExactEnabled
+            && TryRecordGemvColumns(cmdBuf, weights, weightQt, input, output, outputDim, inputDim, seqLen, scale))
+            return;
         // #1064: NVFP4 prefill decodes the blocks into shared memory inside the coopmat GEMM and applies X.scale once to the F32
         // accumulator: no F16 copy of the weight.
         if (seqLen > 1 && weightQt == QuantizationType.NVFP4 && _matmulNvfp4Coopmat is not null)
@@ -2519,6 +2568,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     /// <inheritdoc/>
     public void Dispose()
     {
+        DisposeDFlash();
         // Phase 5f mirror — ForwardBatch lm_head scratch (null when never invoked).
         _batchScratch?.Dispose();
         _multiRowLogits?.Dispose();

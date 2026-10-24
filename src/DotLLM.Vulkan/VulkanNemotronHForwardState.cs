@@ -43,6 +43,12 @@ internal sealed class VulkanNemotronHForwardState : IDisposable
     public VulkanDevice.Buffer V { get; private set; } = null!;
     public VulkanDevice.Buffer AttnOutput { get; private set; } = null!;
 
+    /// <summary>One query row, for the row-at-a-time attention of a small batch (#1237); fixed size, never reallocated.</summary>
+    public VulkanDevice.Buffer RowQ { get; private set; } = null!;
+
+    /// <summary>One attention output row (see <see cref="RowQ"/>).</summary>
+    public VulkanDevice.Buffer RowAttn { get; private set; } = null!;
+
     // ── SSM scratch ───────────────────────────────────────────────────────
     public VulkanDevice.Buffer Zxbcdt { get; private set; } = null!;
     public VulkanDevice.Buffer ConvInput { get; private set; } = null!;   // [(d_conv-1+seqLen) * conv_dim]
@@ -124,6 +130,8 @@ internal sealed class VulkanNemotronHForwardState : IDisposable
         TokenIdsBuffer = device.Allocate(Math.Max(1, initialSeqLen) * sizeof(int));
 
         AllocateForCapacity(Math.Max(1, initialSeqLen));
+        RowQ = device.AllocateDeviceLocal(Math.Max(1L, _qElems) * sizeof(float));
+        RowAttn = device.AllocateDeviceLocal(Math.Max(1L, _qElems) * sizeof(float));
     }
 
     public bool EnsureCapacity(int seqLen)
@@ -258,6 +266,8 @@ internal sealed class VulkanNemotronHForwardState : IDisposable
         _disposed = true;
 
         ReleaseLayerScratch();
+        RowQ?.Dispose();
+        RowAttn?.Dispose();
         Logits?.Dispose();
         PositionsBuffer?.Dispose();
         TokenIdsBuffer?.Dispose();

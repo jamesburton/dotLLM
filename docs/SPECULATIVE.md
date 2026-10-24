@@ -994,8 +994,82 @@ long prefill and released after it.
 time per request (and, on Vulkan, the drafter's submit count and wait). Vulkan small-row GEMVs: `DOTLLM_VK_Q4K_ROWS` / `DOTLLM_VK_Q4K_ROWS_MULTI` (1..4 output
 rows per workgroup for decode / verify, default 2 / 4, #1220; this replaced #1193's `DOTLLM_VK_Q4K_MULTI_ROWS` / `_R4` kernel) and `DOTLLM_VK_SMALLROW_Q6K_R2_MIN_ROWS` (default 3).
 
-**Not yet.** Tree (DDTree) verification; reduced-vocab (`d2t`), DSpark and LiliCorr drafters;
+**Not yet.** Tree (DDTree) verification; reduced-vocab (`d2t`) and DSpark drafters (LiLiCorr: #1237 below);
 sampled-selector proposals (llama.cpp's DFlash2 sampled mode).
+
+### LiLiCorr drafter for Nemotron-3.5 Bolt (issue #1237)
+
+NVIDIA's `*-LiLiCorr` GGUFs (e.g. `nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr-GGUF`, arXiv 2608.20530) are llama.cpp
+`dflash` drafters: the **same drafter contract** as DFlash2 (target layer-input taps, here `[2,19,36,52,69,86]` of Bolt's 88 layers;
+`fc` → `enc.output_norm` → KV injection; a non-causal block of B = 8 `[anchor, mask(990) × 7]`; sliding window 1024; DFlash2
+convolutions) **without the low-rank selector**, plus a **lattice head** (`lilicorr.*`). Run it with
+`dotllm run|serve <bolt.gguf> --dflash <lilicorr.gguf>` on CPU or Vulkan (`nemotron_h` / `nemotron_h_moe` targets).
+
+**The head** (llama.cpp `build_lilicorr_scores` + the walk in `common/speculative.cpp`): for each of the 7 drafted slots it takes the
+top-8 candidates of the drafter's logits (sorted by logit) and builds one node per (slot, candidate) from
+`token_proj(target embedding)` + `pass_hidden_proj(slot's normed drafter hidden)` + an MLP over five features
+`[log p, p, log p − log p₀, rank/7, rank==0]` (LayerNorm first) + slot and rank embeddings. Two pre-RMSNorm transformer layers run over
+all 56 nodes (8 heads, an additive per-head slot-distance bias, SiLU MLP, biases everywhere). Factors `SiLU(W[x, a, x·a])` (a =
+`context_proj` of the fused context feature of the position before the anchor) give unit `out`/`in` vectors; the transition score is
+`8·⟨inₛ,ⱼ, outₛ₋₁,ₚ⟩` (slot 0 against the anchor), and the draft is the greedy walk. The drafter always runs the full trained block;
+`DOTLLM_DFLASH_DRAFT=n` only shortens the walk. The head runs on the host (56 nodes, ~70 MB of F32 / NVFP4 weights read in place
+from the mmap) for both backends; the trunk drafter runs on the target's backend (Vulkan: on the GPU, weights imported zero-copy).
+
+Backbone additions this needed: NVFP4 weights with a per-tensor `X.scale` (`DFlashDrafter.Matrix.Scale`), BF16 projections, and
+**attention sinks** (`blk.*.attn_sinks`: one more logit in the softmax denominator; CPU and `dflash_attention_f32.comp`, which
+starts its online softmax at `m = sink, l = 1`). A per-sequence ring of `B + 1` fused context features (F32, 144 KiB on Bolt) feeds
+the anchor.
+
+**Exactness (Vulkan).** A batch of ≤ 16 rows (a verify, its replay, a short prompt) runs:
+
+- every projection through the **decode GEMV over its rows**: `matmul_q8_0[_coalesced]`, `matmul_nvfp4_*gemv*`,
+  `matmul_iq2_xxs_f32_gemv` and `matmul_f32_gemv` take a `cols` push constant. Workgroup `w` computes row `w / cols` of column
+  `w % cols` with the one-column arithmetic, and decode dispatches `cols = 1` through the same pipeline. The `cols` workgroups of a
+  row are adjacent, so each weight row is read from memory once per verify;
+- the attention one row at a time through the decode kernels (split-KV or per-token) over the cache prefix that row sees;
+- the routed experts through the per-(token, slot) indexed MMVQ (never the grouped prefill).
+
+Every row is then **bit-identical** to a decode step (`VulkanNemotronHDFlashTests`: 256/256 logits equal; with the path switched
+off, 256/256 differ), so greedy speculation reproduces plain decoding token for token. The CPU host runs batches of ≤ 16 rows one
+row at a time (an oracle, not a fast path).
+
+**Rollback (Vulkan): no copy of the state.** The verify's selective scan (the register-resident scan, which serves Bolt's
+d_state 128) **reads** the live Mamba-2 state and never writes it back. It also skips the conv-state save. Each SSM layer's scan
+inputs (x, dt, B, C) and conv-input rows are kept, in F32, which is what decode itself produces and consumes. After the decoder
+decides, the accepted rows are replayed into the live state at the head of the next forward's command buffer: the conv window first,
+then the same scan dispatch, in place, over rows 0..a. This holds for a full accept too, and it needs no extra submit and no replay
+forward. Per round the state is read by the verify and read + written by the replay; nothing else touches it, so the double-buffer
+fallback was not needed. Exactness comes from the scan walking rows in order inside one dispatch: a replay over rows 0..a leaves
+bit-for-bit the state the verify passed through after row a.
+
+The pre-verify copy is kept as a fallback for scans that keep their state in memory (the non-register scan) and for A/B
+(`DOTLLM_NEMOTRON_VERIFY_COPY=1`; F32, `layers × (d_inner·d_state + 3·conv_dim) × 4 B`, ≈ 4.1 MiB per SSM layer on Bolt). The CPU
+oracle uses a checkpoint copy plus the decoder's replay forward. `DOTLLM_MTP_GDN_SNAPSHOTS=0` selects checkpoint + replay on Vulkan
+too. With a drafter attached the adaptive gate tries speculation first (`MtpGatePriorBytes`, #1223).
+
+**Memory (Bolt).** The drafter weights are stored as-is (~1.0 GB, imported zero-copy on UMA). The extra scratch:
+
+| Scratch | Size on Bolt |
+|---|---|
+| Per-row scan inputs and conv rows (F32, decode's own dtype; kept for 16 rows) | `16 × (d_inner + n_head + 2·n_group·d_state + conv_dim) × 4 B` ≈ 1.3 MiB per SSM layer |
+| Anchor ring (F32) | 144 KiB |
+| Tap capture (F16) | `rows × 6 × 4096 × 2 B` |
+
+A follow-up applies the same read-only verify + replay to #1194's GDN path (`qwen35`), which still keeps a pre-verify state copy
+(174 MiB at DFlash K=7) on CPU, CUDA and Vulkan.
+
+**Measured.** Real Bolt 24GB on CPU (Core Ultra 7 155H), 24 tokens greedy, `DOTLLM_MTP_ADAPTIVE=0`: speculative output identical to
+plain, about 5.75 tokens per round (4 drafts for 23 tokens). Strix Vulkan numbers against llama.cpp `draft-dflash` are still to come.
+llama.cpp's output is not greedy-exact (#1237 table). That is expected from its batched verify kernels (GEMM, flash attention,
+grouped MoE), whose reduction order differs from decode; the drafter itself cannot change the output.
+
+**Qwen3.8-27B / Bonsai-2 27B.** No LiLiCorr head is published for `qwen35` targets. The head is a cheap re-scorer (~70 MB) trained
+on a frozen DFlash backbone with the target's hidden states, so one could be trained for the z-lab / incoai DFlash2 drafters.
+Converting is not possible: DFlash2's selector (rank-256 `prev ⊙ gate · next` scores) is a different parametrisation. The expected
+gain over DFlash2 is modest. Both re-rank the drafter's own top-k with pairwise transitions; LiLiCorr adds attention across slots and
+rank/probability features, which mostly helps the long tail of the block. On Qwen3.8 the measured gap to llama.cpp is the target's
+multi-row verify, not draft quality (see the Strix table above), so a better head would not close it. Not worth building until a
+checkpoint exists.
 
 ### `qwen35moe` MTP head (issue #1188)
 

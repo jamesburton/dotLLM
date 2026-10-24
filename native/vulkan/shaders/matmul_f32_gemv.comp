@@ -17,14 +17,20 @@ layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[];  }; // [
 layout(push_constant) uniform PushConstants {
     uint M;
     uint K;
-    uint N; // always 1
+    uint cols; // activation columns; 1 for decode (#1237)
 } pc;
+
+// #1237: `cols` activation columns. Workgroup w (x + 32768 y) computes row w / cols of column w % cols with the
+// one-column arithmetic, so a speculative verify of cols rows is bit-identical to cols decode steps.
 
 shared float partials[128];
 
 void main() {
-    uint m = gl_WorkGroupID.x;
+    uint wg = gl_WorkGroupID.y * 32768u + gl_WorkGroupID.x;
+    uint col = wg % pc.cols;
+    uint m = wg / pc.cols;
     if (m >= pc.M) return;
+    uint x4Col = col * (pc.K >> 2u), yCol = col * pc.M;
 
     uint tid = gl_LocalInvocationID.x;
     uint k4 = pc.K >> 2u;
@@ -32,7 +38,7 @@ void main() {
 
     float acc = 0.0;
     for (uint i = tid; i < k4; i += 128u) {
-        acc += dot(a4[rowBase + i], x4[i]);
+        acc += dot(a4[rowBase + i], x4[x4Col + i]);
     }
 
     partials[tid] = acc;
@@ -41,5 +47,5 @@ void main() {
         if (tid < stride) partials[tid] += partials[tid + stride];
         barrier();
     }
-    if (tid == 0u) c[m] = partials[0];
+    if (tid == 0u) c[yCol + m] = partials[0];
 }

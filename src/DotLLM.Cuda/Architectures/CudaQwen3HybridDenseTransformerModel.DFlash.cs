@@ -233,6 +233,8 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IDFlas
 
         public void Gemm(in DFlashDrafter.Matrix w, nint x, nint y, int rows)
         {
+            if (w.Scale != 1f)
+                throw new NotSupportedException("The CUDA DFlash drafter does not apply per-tensor weight scales (X.scale) yet.");
             nint dev = _weights[w.Ptr];
             long xRow = (long)w.In * sizeof(float), yRow = (long)w.Out * sizeof(float);
             if (CudaDFlashKernels.HasGemvMulti(w.Qt))
@@ -300,9 +302,15 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IDFlas
             }
         }
 
-        public void Attend(nint ringK, nint ringV, int capacity, int lo, int start, int b, nint q, nint kb, nint vb, nint output)
-            => k.LaunchAttention(q, kb, vb, ringK, ringV, output, b, _d.NumHeads, _d.NumKvHeads, _d.HeadDim,
+        public void Copy(nint src, nint dst, int floats)
+            => CudaDriverApi.cuMemcpyDtoDAsync_v2(dst, src, (nuint)((long)floats * sizeof(float)), m._stream.Handle).ThrowOnError();
+
+        public void Attend(nint ringK, nint ringV, int capacity, int lo, int start, int b, nint q, nint kb, nint vb, nint output, float[]? sinks)
+        {
+            if (sinks is not null) throw new NotSupportedException("The CUDA DFlash drafter has no attention sinks yet.");
+            k.LaunchAttention(q, kb, vb, ringK, ringV, output, b, _d.NumHeads, _d.NumKvHeads, _d.HeadDim,
                 capacity, lo, start, _d.Window, 1f / MathF.Sqrt(_d.HeadDim), m._stream.Handle);
+        }
 
         public void Dispose()
         {
