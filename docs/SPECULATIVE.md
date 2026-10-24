@@ -1095,12 +1095,43 @@ p0 is prose ("The history of the printing press began in"); p1 is code (Python q
 - **Draft:** 93 ms per round. About 32 ms is the host-side LiLiCorr head, 17 ms the 7-row LM head plus its 3.6 MB logits readback,
   and the rest the drafter trunk.
 
+**Multi-column exact GEMVs (#1244).** Decode and every batch of 1..16 rows of an NVFP4, IQ2_XXS or Q8_0 projection now run
+`matmul_nvfp4_gemv_multi`, `matmul_iq2_xxs_gemv_multi` or `matmul_q8_0_gemv_multi` (`MatMulExactGemvMultiKernel`). Each lane decodes
+its weights once per row and FMAs them against every column. A column's arithmetic (explicit fma chains under `precise`, a fixed
+shared-memory reduction tree, never `subgroupAdd`) does not depend on the column count or on the rows per workgroup, so a verify row
+is bit-identical to the one-column decode dispatch. Rows per workgroup for verify: NVFP4 4, IQ2_XXS 2, Q8_0 4; decode 1
+(`DOTLLM_VK_NEMOTRON_GEMV_ROWS=decode,verify` overrides; `DOTLLM_VK_NEMOTRON_EXACT_GEMV=0` restores #1237's per-column GEMVs). The
+opt-in NVFP4 MMVQ keeps NVFP4 decode, as before. No new buffers.
+
+Strix 8060S, Bolt 24GB + LiLiCorr, K = 7, 128 greedy tokens, medians of 3 interleaved reps (p0 prose, p1 code):
+
+| `DOTLLM_VK_NEMOTRON_PROFILE`, ms over all layers | 8-row verify before | after | 3-row verify before | after | decode before | after |
+|---|---|---|---|---|---|---|
+| wall | 172.4 | 83.7 | 81.1 | 58.2 | 38.7 | 39.0 |
+| `proj_gdn` (NVFP4) | 58.4 | 23.2 | 25.7 | 18.8 | 12.7 | 12.8 |
+| `moe_dense` (IQ2_XXS shexp, Q8_0 latent, F32 router) | 50.7 | 13.8 | 19.0 | 8.5 | 7.4 | 7.3 |
+| `moe_routed` (indexed experts, unchanged) | 23.1 | 24.4 | 10.8 | 10.9 | 4.4 | 4.3 |
+| `lm_head` (Q8_0) | 17.0 | 3.6 | 8.3 | 3.9 | 2.6 | 2.6 |
+
+| Strix, Bolt 24GB | p0 tok/s | p1 tok/s | round (draft + verify) | peak private / GPU-shared MiB |
+|---|---|---|---|---|
+| dotLLM plain, before / after | 30.75 / 30.66 | 30.50 / 30.36 | | 21,843 / 21,179 before, 21,853 / 21,180 after |
+| dotLLM + LiLiCorr, before | 27.44 | 13.78 | 260 ms (95 + 160) | 22,889 / 22,178 |
+| dotLLM + LiLiCorr, after | **44.27** | **23.00** | 164 ms (82 + 81) | 22,894 / 22,178 |
+| dotLLM + LiLiCorr, after, `DOTLLM_NEMOTRON_VERIFY_COPY=1` | 43.57 | 22.15 | 167 ms (82 + 83) | 23,078 / 22,347 |
+| llama.cpp plain | 29.59 | 29.66 | | 21,865 / 21,359 |
+| llama.cpp `draft-dflash` + LiLiCorr | 60.22 | 29.38 | | 24,970 / 24,068 |
+
+Every dotLLM run (plain and speculative, before and after, both verify modes) produced the same text. Speculation now beats plain
+on prose (1.44x) but not on code (3.3-3.75 tokens/round). The round is now half draft: about 45 ms of each draft is the host-side
+LiLiCorr head (`select` in `DOTLLM_DFLASH_TRACE`). The verify (81 ms) is 2.5x a 32.6 ms decode step; the rest of it is the indexed
+routed experts, which barely share expert reads across 8 tokens (top-k routing over 240 experts). The read-only verify beats the
+pre-verify copy by ~2 ms per round and 180 MiB.
+
 **Next (follow-ups):**
 
-1. Multi-column NVFP4 / IQ2_XXS / Q8_0 GEMVs that decode each weight block once and apply it to every column, keeping each
-   column's accumulation order identical to the one-column kernel (so decode stays bit-identical).
-2. The LiLiCorr head and the top-k/softmax on the GPU (no 3.6 MB logits readback).
-3. Read-only verify + replay for the Vulkan `qwen35moe` / Qwen4Exp GDN hosts (#1221; #1194 did the dense `qwen35` path).
+1. The LiLiCorr head and the top-k/softmax on the GPU (no 3.6 MB logits readback); now the largest cost per round.
+2. Read-only verify + replay for the Vulkan `qwen35moe` / Qwen4Exp GDN hosts (#1221; #1194 did the dense `qwen35` path).
 
 **Qwen3.8-27B / Bonsai-2 27B.** No LiLiCorr head is published for `qwen35` targets. The head is a cheap re-scorer (~70 MB) trained
 on a frozen DFlash backbone with the target's hidden states, so one could be trained for the z-lab / incoai DFlash2 drafters.
