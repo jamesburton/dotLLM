@@ -1,0 +1,176 @@
+#version 450
+// MoE indexed expert matmul — TILED variant.
+//
+// Computes the same per-row expert-selected matmul as
+// moe_indexed_matmul_f32.comp:
+//
+//   y[n, m] = sum_k bank[indices[n], m, k] * x[n, k]
+//
+// but uses workgroup shared memory to amortise the K-dimension load
+// across an output tile of TILE_M consecutive m-values for a fixed
+// row n.
+//
+// Why "one workgroup per output row"?
+//   The expert index varies per output row (idx = indices[n]) — that
+//   means the "weight A tile" cannot be shared across rows of x. The
+//   standard GEMM tile pattern (TILE_M × TILE_N output cells per WG,
+//   shared A and B tiles) breaks because each row of B would need a
+//   different slab of A. To keep one expert lookup per WG, we pin
+//   gl_WorkGroupID.y = n, and let TILE_M threads in the WG cover
+//   TILE_M consecutive m-values of the output for that single n.
+//
+// Dispatch (one WG per output cell tile):
+//   workgroup_size = (TILE_M, 1, 1)   = 16 threads per WG
+//   groupCount     = (ceil(M / TILE_M), N, 1)
+//
+// Per K-chunk (TILE_K = 16):
+//   - All TILE_M threads cooperatively load x[n, kBase..kBase+TILE_K]
+//     into sharedX (one float per thread).
+//   - All TILE_M threads cooperatively load
+//     bank[idx, mBase..mBase+TILE_M, kBase..kBase+TILE_K]
+//     into sharedW (TILE_M × TILE_K = 256 floats; 16 floats per
+//     thread).
+//   - Each thread accumulates a partial dot for its own m-row from
+//     sharedW × sharedX.
+//   - barrier() between iterations to recycle shared memory.
+//
+// Shared memory budget:
+//   sharedX:  TILE_K   floats =   16 * 4 =   64 B
+//   sharedW:  TILE_M * TILE_K floats = 256 * 4 = 1024 B
+//   total                                       ~1.1 KB / WG
+//
+// Bounds:
+//   M and K may not be multiples of TILE_M / TILE_K — the shader
+//   bounds-checks both dimensions on the cooperative load and the
+//   final store so odd shapes (M=8, K=24, ...) produce identical
+//   numerics to the scalar variant.
+
+layout(local_size_x = 16, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufBank { float bank[]; };  // [numExperts * M * K]
+layout(set = 0, binding = 1, std430) readonly  buffer BufX    { float x[]; };     // [N * K]
+layout(set = 0, binding = 2, std430) readonly  buffer BufIdx  { int indices[]; }; // [N]
+layout(set = 0, binding = 3, std430) writeonly buffer BufY    { float y[]; };     // [N * M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;          // output dim   (per-expert weight row count)
+    uint K;          // input  dim   (per-expert weight col count, contraction)
+    uint N;          // total rows   (seqLen * topK)
+    uint numExperts; // bank's first axis size — bounds-check only
+} pc;
+
+const uint TILE_M = 16u;
+const uint TILE_K = 16u;
+
+// One row of x for this WG, sliced by K-chunk.
+shared float sharedX[TILE_K];
+
+// TILE_M weight rows for this WG, each TILE_K floats wide. Row-major flat.
+shared float sharedW[TILE_M * TILE_K];
+
+void main() {
+    // gl_WorkGroupID.x indexes m-tiles (0..ceil(M/TILE_M));
+    // gl_WorkGroupID.y indexes the output row (0..N).
+    uint mBase = gl_WorkGroupID.x * TILE_M;
+    uint n     = gl_WorkGroupID.y;
+    uint tid   = gl_LocalInvocationID.x; // 0..TILE_M-1
+
+    if (n >= pc.N) return;
+
+    // Per-row expert lookup. All TILE_M threads in this WG share the
+    // same n, so they all read the same expert index — that's exactly
+    // why we partition the grid this way.
+    int rawIdx = indices[n];
+    uint expertIdx = uint(clamp(rawIdx, 0, int(pc.numExperts) - 1));
+
+    uint bankRowSize   = pc.M * pc.K;
+    uint expertBase    = expertIdx * bankRowSize;
+    uint xRowBase      = n * pc.K;
+
+    // m-row that this thread is responsible for.
+    uint m = mBase + tid;
+    bool mValid = m < pc.M;
+
+    float acc = 0.0;
+
+    // March K in chunks of TILE_K. The last chunk may be partial when
+    // K is not a multiple of TILE_K — we zero shared mem for OOB lanes
+    // before the inner loop runs so the inner FMA loop stays branch-free.
+    uint kFull = (pc.K / TILE_K) * TILE_K; // largest multiple of TILE_K <= K
+    uint kBase = 0u;
+
+    for (; kBase < kFull; kBase += TILE_K) {
+        // ---- 1. Cooperatively stage sharedX[TILE_K]. ----
+        // 16 threads, 16 elements: thread tid writes element tid.
+        sharedX[tid] = x[xRowBase + kBase + tid];
+
+        // ---- 2. Cooperatively stage sharedW[TILE_M * TILE_K]. ----
+        // 16 threads, 256 elements: each thread loads 16 contiguous
+        // elements of one weight row. Distribute by mLocal == tid so
+        // each thread owns its own (mLocal, *) slice — that lines up
+        // with the per-thread accumulator below (no cross-thread W
+        // reads in the inner loop, only sharedX is shared).
+        //
+        // Out-of-range weight rows write zeros so the inner FMA loop
+        // can stay branch-free. The final store is bounds-guarded.
+        uint sBase = tid * TILE_K;
+        if (mValid) {
+            uint wRowBase = expertBase + m * pc.K + kBase;
+            for (uint j = 0u; j < TILE_K; j++) {
+                sharedW[sBase + j] = bank[wRowBase + j];
+            }
+        } else {
+            for (uint j = 0u; j < TILE_K; j++) {
+                sharedW[sBase + j] = 0.0;
+            }
+        }
+
+        barrier();
+
+        // ---- 3. Per-thread partial dot for this K-chunk. ----
+        // Thread tid reads its own sharedW row and the shared sharedX.
+        float chunk = 0.0;
+        for (uint j = 0u; j < TILE_K; j++) {
+            chunk += sharedW[sBase + j] * sharedX[j];
+        }
+        acc += chunk;
+
+        barrier();
+    }
+
+    // ---- 4. K tail: K not a multiple of TILE_K. ----
+    // Loads only the valid prefix of the chunk; pads sharedX/sharedW
+    // with zeros so the inner FMA loop still runs over TILE_K lanes.
+    if (kBase < pc.K) {
+        uint kRem = pc.K - kBase;
+
+        sharedX[tid] = (tid < kRem) ? x[xRowBase + kBase + tid] : 0.0;
+
+        uint sBase = tid * TILE_K;
+        if (mValid) {
+            uint wRowBase = expertBase + m * pc.K + kBase;
+            for (uint j = 0u; j < TILE_K; j++) {
+                sharedW[sBase + j] = (j < kRem) ? bank[wRowBase + j] : 0.0;
+            }
+        } else {
+            for (uint j = 0u; j < TILE_K; j++) {
+                sharedW[sBase + j] = 0.0;
+            }
+        }
+
+        barrier();
+
+        float chunk = 0.0;
+        for (uint j = 0u; j < TILE_K; j++) {
+            chunk += sharedW[sBase + j] * sharedX[j];
+        }
+        acc += chunk;
+
+        barrier();
+    }
+
+    // ---- 5. Store output if within [N, M] bounds. ----
+    if (mValid) {
+        y[n * pc.M + m] = acc;
+    }
+}

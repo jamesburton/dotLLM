@@ -1,0 +1,1 @@
+<|tool_call|>[{"arguments": {"hour": 7, "label": "gym", "repeat": true, "days": ["Monday", "Friday"]}}]

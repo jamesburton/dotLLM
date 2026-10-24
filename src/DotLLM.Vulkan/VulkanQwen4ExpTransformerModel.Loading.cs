@@ -1,0 +1,639 @@
+using System.Runtime.InteropServices;
+using DotLLM.Core.Configuration;
+using DotLLM.Core.Models;
+using DotLLM.Cpu.Kernels;
+using DotLLM.Models.Architectures;
+using DotLLM.Models.Gguf;
+using DotLLM.Vulkan.Kernels;
+using Architecture = DotLLM.Core.Configuration.Architecture;
+
+namespace DotLLM.Vulkan;
+
+public sealed unsafe partial class VulkanQwen4ExpTransformerModel
+{
+    /// <summary>Default context capacity (tokens) of the K/V + indexer caches; <c>DOTLLM_VK_QWEN4EXP_CONTEXT</c> overrides.</summary>
+    internal const int DefaultContextCapacity = 8192;
+
+    /// <summary>
+    /// Gather token-embedding rows on the host from the mmap'd (quantised) table instead of keeping an F32 copy of the whole table on the device
+    /// (2.4 GiB at the released vocabulary). On by default; <c>DOTLLM_VK_QWEN4EXP_HOST_EMBED=0</c> restores the device table (A/B diagnostic).
+    /// </summary>
+    public static bool HostEmbedding { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_QWEN4EXP_HOST_EMBED") != "0";
+
+    /// <summary>
+    /// Element format of the QSA layers' K/V rows (issue #437), read when a cache is created. <c>DOTLLM_VK_QWEN4EXP_KV=f16</c> halves the K/V footprint
+    /// (24 instead of 48 KiB per token at the released geometry); F32 is the default until the accuracy delta is accepted. F16 caches are read only by the
+    /// QSA gather kernel (exact dense attention below the budget runs through it too), so they need the QSA indexer on.
+    /// </summary>
+    public static VulkanKvStorage KvStorage { get; set; } =
+        string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_QWEN4EXP_KV"), "f16", StringComparison.OrdinalIgnoreCase) ? VulkanKvStorage.F16 : VulkanKvStorage.F32;
+
+    /// <summary>
+    /// Store the indexer's raw (pre-pooling) keys as F16 (<c>DOTLLM_VK_QWEN4EXP_IDX_F16=1</c>): 2 of the ~6 KiB per token the indexer holds. The pooled
+    /// block keys, which the scorer reads, stay F32. Off by default.
+    /// </summary>
+    public static bool IndexerRawF16 { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_QWEN4EXP_IDX_F16") == "1";
+
+    /// <summary>
+    /// Grow the K/V and indexer caches on demand instead of allocating the whole capacity per sequence (issue #437). On by default;
+    /// <c>DOTLLM_VK_QWEN4EXP_KV_LAZY=0</c> restores eager allocation (A/B diagnostic). Output is bit-identical either way.
+    /// </summary>
+    public static bool LazyKv { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_QWEN4EXP_KV_LAZY") != "0";
+
+    /// <summary>
+    /// Expert tiering (#939): routed experts per layer kept in device slots; the rest stay on the SSD and are read on demand (stall on miss, output identical to a fully
+    /// resident run). 0 = off (every routed expert resident, the default). <c>DOTLLM_VK_EXPERT_SLOTS=N</c> sets it at startup; must be at least the model's top-k.
+    /// </summary>
+    public static int ExpertSlots { get; set; } =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_EXPERT_SLOTS"), out int es) && es > 0 ? es : 0;
+
+    /// <summary>Resident-capacity refusal override: <c>DOTLLM_VK_ALLOW_OVERCOMMIT=1</c> turns the pre-load refusal into a warning.</summary>
+    private static bool AllowOvercommit
+        => string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_ALLOW_OVERCOMMIT"), "1", StringComparison.Ordinal);
+
+    /// <summary>
+    /// Loads a Qwen4Exp model from an opened (possibly multi-shard) GGUF onto <paramref name="device"/>. The file must outlive the model.
+    /// </summary>
+    /// <param name="device">An initialized Vulkan device. Not owned.</param>
+    /// <param name="gguf">The opened GGUF; must outlive the model.</param>
+    /// <param name="config">Configuration extracted from <paramref name="gguf"/>.</param>
+    /// <param name="spvDir">Directory containing compiled SPIR-V blobs.</param>
+    /// <exception cref="NotSupportedException">The weights do not fit the device's resident capacity (and no overcommit override is set).</exception>
+    public static VulkanQwen4ExpTransformerModel BuildFromGguf(VulkanDevice device, GgufFile gguf, ModelConfig config, string spvDir)
+        => BuildFromGguf(device, gguf, config, spvDir, residentCapacityOverrideBytes: null);
+
+    /// <summary>
+    /// Test seam: <paramref name="residentCapacityOverrideBytes"/> replaces the device's resident capacity in the pre-load gate;
+    /// <paramref name="otherPressureProbe"/> replaces the OS read of other processes' GPU memory (called once before and once after the upload).
+    /// </summary>
+    internal static VulkanQwen4ExpTransformerModel BuildFromGguf(VulkanDevice device, GgufFile gguf, ModelConfig config, string spvDir,
+        long? residentCapacityOverrideBytes, Func<VulkanGpuMemoryPressure?>? otherPressureProbe = null, int? expertSlots = null)
+    {
+        int slots = expertSlots ?? ExpertSlots;
+        if (slots > 0)
+        {
+            if (config.Moe is not { } moeCfg0) throw new ArgumentException("Expert tiering needs a MoE configuration.", nameof(config));
+            if (slots < moeCfg0.NumExpertsPerTok)
+                throw new ArgumentOutOfRangeException(nameof(expertSlots), $"{slots} expert slots per layer cannot hold the {moeCfg0.NumExpertsPerTok} experts one token selects.");
+            if (slots > moeCfg0.NumExperts) slots = moeCfg0.NumExperts;
+            if (string.Equals(Environment.GetEnvironmentVariable("DOTLLM_GGUF_MAP_COW"), "1", StringComparison.Ordinal))
+                throw new NotSupportedException("Expert tiering reads the GGUF with a second handle, which a copy-on-write mapping (DOTLLM_GGUF_MAP_COW=1) forbids.");
+        }
+        ArgumentNullException.ThrowIfNull(device);
+        ArgumentNullException.ThrowIfNull(gguf);
+        ArgumentNullException.ThrowIfNull(config);
+        ArgumentNullException.ThrowIfNull(spvDir);
+        if (config.Architecture != Architecture.Qwen4Exp || config.Qwen4Exp is not { } q4
+            || config.GdnConfig is null || config.Moe is null || config.HybridLayout is null)
+            throw new ArgumentException("VulkanQwen4ExpTransformerModel requires a fully populated Architecture.Qwen4Exp configuration.", nameof(config));
+        var tensors = gguf.TensorsByName;
+        var problems = Qwen4ExpTensors.FindProblems(tensors, config, includeTrunk: true, includeMtp: false);
+        if (problems.Count > 0)
+            throw new InvalidDataException("qwen4exp tensor table does not match the model contract: " +
+                                           string.Join("; ", problems.Take(8)) + (problems.Count > 8 ? $"; (+{problems.Count - 8} more)" : ""));
+        if (q4.Ple is { } ple0 && ple0.Layers.Count > 1)
+            throw new NotSupportedException("qwen4exp files carry one set of PLE hash constants; several PLE layers cannot be represented.");
+
+        // Context capacity (#819): QSA attention is exact dense attention up to budget + block - 1 tokens (2051); beyond it the indexer
+        // selects blocks, so the K/V + indexer caches can be sized for far more than the dense limit. Default 8192 (env override), clamped
+        // to the model's context and then halved until the plan fits the device - never below the dense limit.
+        int denseLimit = q4.IndexerBlockSize > 0 ? q4.IndexerTopK + q4.IndexerBlockSize - 1 : config.MaxSequenceLength;
+        int floorCapacity = Math.Min(config.MaxSequenceLength, denseLimit);
+        int requested = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_QWEN4EXP_CONTEXT"), out int envCtx) && envCtx > 0 ? envCtx : DefaultContextCapacity;
+        int kvCapacity = Math.Max(floorCapacity, Math.Min(config.MaxSequenceLength, requested));
+
+        // Residency gate BEFORE touching the device (the 122B WDDM-thrash class: refuse with numbers, do not page).
+        // #880: other processes' GPU memory (second dotllm, llama.cpp, ...) is invisible to VK_EXT_memory_budget, so read the OS counters.
+        var pressure = otherPressureProbe is not null ? otherPressureProbe() : device.ReadOtherProcessPressure();
+        long residentCapacity = residentCapacityOverrideBytes ?? device.ResidentCapacityBytes();
+        Qwen4ExpResidencyPlan MakePlan(int capacity)
+        {
+            var p = Qwen4ExpResidencyPlan.Create(tensors, config, residentCapacity, capacity, GC.GetGCMemoryInfo().TotalAvailableMemoryBytes,
+                integerDot: device.HasIntegerDotProduct, kvElementBytes: KvStorage == VulkanKvStorage.F16 ? 2 : 4, rawKeysF16: IndexerRawF16, expertSlots: slots);
+            return pressure is not null ? p with { OtherProcessBytes = pressure.OtherBytes, OtherProcessDetail = pressure.DescribeCulprits() } : p;
+        }
+        var plan = MakePlan(kvCapacity);
+        if (!plan.Fits && kvCapacity > floorCapacity)
+        {
+            int requestedCapacity = kvCapacity;
+            while (!plan.Fits && kvCapacity > floorCapacity)
+            {
+                kvCapacity = Math.Max(floorCapacity, kvCapacity / 2);
+                plan = MakePlan(kvCapacity);
+            }
+            Console.Error.WriteLine($"[dotLLM] qwen4exp context capacity reduced from {requestedCapacity} to {kvCapacity} tokens to fit the device " +
+                                    $"(K/V + indexer caches cost {Qwen4ExpResidencyPlan.ContextBytes(config, 1, KvStorage == VulkanKvStorage.F16 ? 2 : 4, IndexerRawF16) / 1024.0:F0} KiB per token)." +
+                                    (KvStorage == VulkanKvStorage.F32 ? " DOTLLM_VK_QWEN4EXP_KV=f16 halves the K/V part." : ""));
+        }
+        if (!plan.Fits)
+        {
+            string msg = "qwen4exp weights do not fit the Vulkan device's resident capacity: " + plan.Describe() + ". " + plan.DescribeShortfall() + " " +
+                         "Quant types without a resident indexed-MoE kernel (everything but Q4_K/Q5_K/Q6_K/Q5_1/Q8_0/IQ3_S/IQ4_XS/IQ4_NL experts) are widened to F32 on upload.";
+            if (!AllowOvercommit)
+                throw new NotSupportedException(msg + " Set DOTLLM_VK_ALLOW_OVERCOMMIT=1 to load anyway (expect paging).");
+            Console.Error.WriteLine("[dotLLM] WARNING: " + msg + " DOTLLM_VK_ALLOW_OVERCOMMIT=1: loading anyway.");
+        }
+        else if (plan.HostPressure)
+            Console.Error.WriteLine("[dotLLM] WARNING: qwen4exp device weights plus the host-only n-gram table exceed physical RAM less headroom: " + plan.Describe());
+
+        // The n-gram table: registered host-only BEFORE any upload so no staging/import path can ever take it.
+        (nint, long)? hostOnly = null;
+        if (tensors.TryGetValue(Qwen4ExpTensors.PerLayerTokenEmbd, out var tdesc))
+        {
+            nint tptr = gguf.TensorDataPointer(tdesc);
+            long tbytes = Dequantize.RowByteSize(tdesc.Shape[0], tdesc.QuantizationType) * tdesc.Shape[1];
+            VulkanWeightImportPolicy.RegisterHostOnly(tptr, tbytes);
+            hostOnly = (tptr, tbytes);
+        }
+
+        bool hostEmbedding = HostEmbedding;
+        var owned = new List<nint>();
+        VulkanQwen3MoeHybridTransformerModel? core = null;
+        var attnGr = new List<VulkanQwen4ExpGrWeights>();
+        var ffnGr = new List<VulkanQwen4ExpGrWeights>();
+        VulkanQwen4ExpGrWeights? head = null;
+        var moeBundles = new List<VulkanQwen3MoeMoeUpload.LayerBundle>();
+        Qwen4ExpGatedResidualKernel? gr = null;
+        GroupRmsNormF32Kernel? groupRms = null;
+        GdnPostScanGateF32Kernel? sigmoidGate = null;
+        VulkanQwen4ExpTransformerModel? model = null;
+        var qsaWeights = new List<VulkanQwen4ExpQsa.LayerWeights>();
+        var qsaOrdinal = new int[config.NumLayers];
+        for (int il = 0, qo = 0; il < qsaOrdinal.Length; il++)
+            qsaOrdinal[il] = config.HybridLayout.LayerKind[il] == HybridLayerKind.GatedDeltaNet ? -1 : qo++;
+        Qwen4ExpQsaKernels? qsaKernels = null;
+        VulkanQwen4ExpQsa? qsa = null;
+        bool disposed = false;
+        try
+        {
+            var phase = System.Diagnostics.Stopwatch.StartNew();
+            var phases = new List<string>();
+            void Mark(string what) { phases.Add($"{what}={phase.Elapsed.TotalSeconds:F1}s"); phase.Restart(); }
+            var layers = BuildHybridLayers(gguf, tensors, config, owned);
+            Mark("hybridLayers");
+            var embDesc = tensors[Qwen4ExpTensors.TokenEmbd];
+            nint embPtr = gguf.TensorDataPointer(embDesc);
+            nint outPtr = embPtr; var outQt = embDesc.QuantizationType; int outM = embDesc.Shape[1], outK = embDesc.Shape[0];
+            if (tensors.TryGetValue(Qwen4ExpTensors.Output, out var od))
+            { outPtr = gguf.TensorDataPointer(od); outQt = od.QuantizationType; outM = od.Shape[1]; outK = od.Shape[0]; }
+
+            // The hybrid's pre/post norms and output norm do not exist in qwen4exp (the gated residual replaces them): 1-element dummies.
+            core = VulkanQwen3MoeHybridTransformerModel.BuildFromPrebuiltWeights(
+                device, config, layers, outputNormWeight: [1f], outPtr, outQt, outM, outK, embPtr, embDesc.QuantizationType,
+                spvDir, nCpuMoeLayers: 0, hostTokenEmbedding: hostEmbedding);
+
+            Mark("coreWeights");
+            long weightBytes = 0;
+            using (var staging = VulkanStagingBuffer.Create(device, 64L << 20))
+            {
+                for (int il = 0; il < config.NumLayers; il++)
+                {
+                    string b = $"blk.{il}.";
+                    attnGr.Add(VulkanQwen4ExpGrWeights.Upload(device, staging, gguf, b + "hc_attn_norm.weight", b + "hc_attn_down.weight",
+                        b + "hc_attn_up.weight", b + "hc_attn_inject.weight"));
+                    ffnGr.Add(VulkanQwen4ExpGrWeights.Upload(device, staging, gguf, b + "hc_ffn_norm.weight", b + "hc_ffn_down.weight",
+                        b + "hc_ffn_up.weight", b + "hc_ffn_inject.weight"));
+                    weightBytes += attnGr[^1].Bytes + ffnGr[^1].Bytes;
+                }
+                head = VulkanQwen4ExpGrWeights.Upload(device, staging, gguf, Qwen4ExpTensors.OutputHcNorm, Qwen4ExpTensors.OutputHcDown,
+                    Qwen4ExpTensors.OutputHcUp, inject: null);
+                weightBytes += head.Bytes;
+
+                // QSA indexer projections + folded norm gammas, one set per QSA layer (#819).
+                for (int il = 0; il < config.NumLayers; il++)
+                {
+                    if (qsaOrdinal[il] < 0) continue;
+                    var lw = UploadQsaIndexer(device, staging, gguf, tensors, $"blk.{il}.", q4);
+                    qsaWeights.Add(lw);
+                    weightBytes += lw.Bytes;
+                }
+            }
+
+            Mark("grWeights");
+            // Routed experts are uploaded eagerly (resident): a model that cannot be resident was refused above, and the transient
+            // per-forward upload path would be the 0.01 tok/s thrash class.
+            // #874: one multi-threaded staging buffer for the whole load (parallel page-in + memcpy), and the next layers' banks
+            // allocated on background threads while the current layer copies (vkAllocateMemory is ~0.45 s/GiB here). A/B switch:
+            // DOTLLM_VULKAN_PARALLEL_UPLOAD=0 restores the serial per-layer staging and inline allocation.
+            bool parallelUpload = !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_PARALLEL_UPLOAD"), "0", StringComparison.Ordinal);
+            using (var upStaging = parallelUpload
+                       ? VulkanStagingBuffer.CreateParallel(device, VulkanStagingBuffer.ParallelSlotBytes, VulkanStagingBuffer.ParallelSlotCount) : null)
+            using (var prealloc = parallelUpload && slots == 0 && !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_BANK_PREALLOC"), "0", StringComparison.Ordinal) ? new VulkanBankPrealloc(device) : null)
+            {
+                const int AllocAhead = 2;
+                long heapBytes = device.DeviceLocalHeapBytes();
+                const long AheadMargin = 3L << 30;
+                void ScheduleLayer(int il)
+                {
+                    if (prealloc is null || il >= config.NumLayers) return;
+                    long[] sizes = VulkanQwen3MoeMoeUpload.BankAllocationSizes(layers[il].Moe, config.HiddenSize, residentQuant: true, integerDot: device.HasIntegerDotProduct);
+                    // Near the device-local heap boundary allocation ORDER decides what falls back to the slower heap: allocate those inline.
+                    if (VulkanBankPrealloc.MayAllocateAhead(heapBytes, LiveDeviceBytes(device), prealloc.PendingBytes, sizes.Sum(), AheadMargin))
+                        prealloc.Schedule(sizes);
+                }
+                for (int il = 0; il < AllocAhead; il++) ScheduleLayer(il);
+                bool layerTrace = string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_TRACE"), "1", StringComparison.Ordinal);
+                for (int il = 0; il < config.NumLayers; il++)
+                {
+                    long tl = System.Diagnostics.Stopwatch.GetTimestamp();
+                    double cw0 = VulkanStagingBuffer.CopyWaitMilliseconds, aw0 = VulkanBankPrealloc.WaitMilliseconds, am0 = VulkanDevice.AllocateMemoryMilliseconds;
+                    moeBundles.Add(VulkanQwen3MoeMoeUpload.UploadLayer(device, layers[il].Moe, config.HiddenSize, residentQuant: true, upStaging, prealloc, expertSlots: slots, sharedPackedDefault: false));
+                    ScheduleLayer(il + AllocAhead);
+                    if (layerTrace)
+                        Console.Error.WriteLine($"[vulkan-load] layer {il}: {System.Diagnostics.Stopwatch.GetElapsedTime(tl).TotalMilliseconds:F0} ms " +
+                            $"(memcpy wait {VulkanStagingBuffer.CopyWaitMilliseconds - cw0:F0}, alloc wait {VulkanBankPrealloc.WaitMilliseconds - aw0:F0}, " +
+                            $"vkAllocateMemory thread-ms {VulkanDevice.AllocateMemoryMilliseconds - am0:F0}, live {LiveDeviceBytes(device) >> 20} MiB)");
+                }
+                upStaging?.WaitAll();   // the banks are consumed by compute right after the load: drain every queued copy first
+            }
+
+            // #890: the shared-expert gate/up/down F32 host copies (LoadMoe.SharedF32) existed only to be uploaded as F16; every copy is drained
+            // above. They are ~3.3 GiB of private memory on the real UD-Q4_K_XL file, and the OS caps a process's total residency (~82 GiB on
+            // a 127 GiB box) - with a 79.7 GiB trunk that is the whole margin. This model never routes an MoE layer through the host
+            // (nCpuMoeLayers: 0), so nothing reads them again. A/B: DOTLLM_VK_KEEP_HOST_SHARED=1 keeps them.
+            if (!string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_KEEP_HOST_SHARED"), "1", StringComparison.Ordinal))
+            {
+                long freed = 0;
+                for (int il = 0; il < layers.Length; il++)
+                    freed += ReleaseHostSharedExperts(layers[il].Moe, owned, config.HiddenSize);
+                if (string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_TRACE"), "1", StringComparison.Ordinal))
+                    Console.Error.WriteLine($"[vulkan-load] released {freed >> 20} MiB of host F32 shared-expert copies");
+            }
+
+            Mark("moeBanks");
+            Qwen4ExpPleBranch? ple = null;
+            VulkanQwen4ExpPleGpu? pleGpu = null;
+            int pleLayer = -1;
+            if (q4.Ple is { } pc)
+            {
+                pleLayer = pc.Layers[0];
+                ple = BuildPleBranch(gguf, tensors, config, q4, pc, pleLayer, owned);
+                using var pleStaging = VulkanStagingBuffer.Create(device, 64L << 20);
+                pleGpu = VulkanQwen4ExpPleGpu.Upload(device, pleStaging, gguf, $"blk.{pleLayer}.ple_key.weight", $"blk.{pleLayer}.ple_value.weight",
+                    q4.HyperConnectionCount * config.HiddenSize, Qwen4ExpResidencyPlan.PlannedRows(kvCapacity));
+            }
+
+            gr = Qwen4ExpGatedResidualKernel.Create(device, spvDir);
+            groupRms = GroupRmsNormF32Kernel.Create(device, spvDir);
+            sigmoidGate = GdnPostScanGateF32Kernel.Create(device, spvDir, sigmoidGate: true);
+            qsaKernels = Qwen4ExpQsaKernels.Create(device, spvDir);
+            qsa = new VulkanQwen4ExpQsa(device, core, qsaKernels, qsaWeights.ToArray(), qsaOrdinal, config, q4, kvCapacity);
+
+            // #880: allocate the per-forward scratch for the planned row count NOW, so (a) the post-upload check below counts it and (b) no
+            // forward up to that size has to grow it after the weights fill the heap (a small-then-larger call order lost the device).
+            int plannedRows = Qwen4ExpResidencyPlan.PlannedRows(kvCapacity);
+            try { core.Q4EnsureCapacity(plannedRows); }
+            catch (InvalidOperationException e) when (e.InnerException is Interop.VulkanException)
+            {
+                throw new NotSupportedException(e.Message + (AllowOvercommit ? "" : " Set DOTLLM_VK_PLANNED_ROWS to a smaller value to load with less scratch."), e);
+            }
+
+            Mark("ple+kernels");
+            if (string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_TRACE"), "1", StringComparison.Ordinal))
+                Console.Error.WriteLine($"[vulkan-load] phases: {string.Join(", ", phases)}; vkAllocateMemory={VulkanDevice.AllocateMemoryMilliseconds / 1000:F1}s, " +
+                                        $"staging memcpy={VulkanStagingBuffer.MemcpyMilliseconds / 1000:F1}s/{VulkanStagingBuffer.MemcpyBytes / (1024 * 1024)} MiB (thread-sum), " +
+                                        $"bank uploads={VulkanQwen3MoeMoeUpload.BanksMilliseconds / 1000:F1}s, submitter waited {VulkanStagingBuffer.CopyWaitMilliseconds / 1000:F1}s on memcpy and {VulkanBankPrealloc.WaitMilliseconds / 1000:F1}s on bank allocation; {device.MemorySnapshot()}");
+            model = new VulkanQwen4ExpTransformerModel(device, gguf, config, core, attnGr.ToArray(), ffnGr.ToArray(), head, moeBundles.ToArray(),
+                ple, pleLayer, owned, hostOnly, gr, groupRms, sigmoidGate, kvCapacity, weightBytes, qsa, hostEmbedding, pleGpu);
+            model._spvDir = spvDir;
+            if (slots > 0)
+            {
+                model._tier = BuildExpertTier(device, gguf, config, moeBundles, slots);
+                Console.Error.WriteLine($"[dotLLM] qwen4exp expert tiering: {slots} of {config.Moe!.NumExperts} routed experts per layer resident on the device, " +
+                                        $"the rest read from the GGUF on demand ({(model._tier.Unbuffered ? "unbuffered overlapped reads" : "buffered reads")}); greedy output is identical to the resident run. MTP is off.");
+            }
+            model._groupRmsOop = GroupRmsNormOopF32Kernel.Create(device, spvDir);
+            try
+            {
+                model.EnsureScratch(plannedRows);   // the model's own (small) scratch too, so no forward up to plannedRows allocates anything
+            // #880: re-check after the upload. Another process may have grown while we were loading; surface it here with numbers
+                // instead of letting the first forward end in VK_ERROR_DEVICE_LOST.
+                var after = otherPressureProbe is not null ? otherPressureProbe() : device.ReadOtherProcessPressure();
+                if (after is not null)
+                {
+                    long ours = device.LiveBytesTotal();
+                    long short_ = Qwen4ExpResidencyPlan.PostUploadShortfall(ours, after.OtherBytes, plan.CapacityBytes, plan.HeadroomBytes);
+                    if (short_ > 0)
+                    {
+                        string msg = $"after the qwen4exp upload this process holds {ours / (double)(1L << 30):F1} GiB and other processes hold " +
+                                     $"{after.OtherBytes / (double)(1L << 30):F1} GiB ({after.DescribeCulprits()}), " +
+                                     $"{short_ / (double)(1L << 30):F1} GiB over the {plan.BudgetBytes / (double)(1L << 30):F1} GiB budget. " +
+                                     "Close the other GPU consumers (a second dotllm, llama.cpp, Lemonade, Docker, ollama, a browser); " +
+                                     "oversubscribing GPU memory can end in VK_ERROR_DEVICE_LOST.";
+                        if (!AllowOvercommit)
+                            throw new NotSupportedException(msg + " Set DOTLLM_VK_ALLOW_OVERCOMMIT=1 to continue anyway.");
+                        Console.Error.WriteLine("[dotLLM] WARNING: " + msg + " DOTLLM_VK_ALLOW_OVERCOMMIT=1: continuing.");
+                    }
+                }
+            }
+            catch
+            {
+                model.Dispose();   // owns every resource built above now
+                disposed = true;
+                throw;
+            }
+            return model;
+        }
+        catch
+        {
+            if (disposed) throw;
+            foreach (var m in moeBundles) m.Dispose();
+            foreach (var g in attnGr) g.Dispose();
+            foreach (var g in ffnGr) g.Dispose();
+            head?.Dispose();
+            gr?.Dispose(); groupRms?.Dispose(); sigmoidGate?.Dispose();
+            if (qsa is not null) qsa.Dispose();
+            else { foreach (var w in qsaWeights) w.Dispose(); qsaKernels?.Dispose(); }
+            core?.Dispose();
+            foreach (nint p in owned) NativeMemory.AlignedFree((void*)p);
+            if (hostOnly is { } h) VulkanWeightImportPolicy.UnregisterHostOnly(h.Item1);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Frees the host F32 shared-expert projections of one layer (allocated by <c>LoadMoe</c>, tracked in <paramref name="owned"/>) once they
+    /// have been uploaded, and zeroes the pointers. Returns the bytes released.
+    /// </summary>
+    internal static long ReleaseHostSharedExperts(MoeLayerWeights moe, List<nint> owned, int hiddenSize)
+    {
+        long bytes = 0;
+        long elems = (long)moe.SharedIntermediateSize * hiddenSize;
+        foreach (nint[] arr in new[] { moe.SharedGateProj, moe.SharedUpProj, moe.SharedDownProj })
+        {
+            for (int s = 0; s < arr.Length; s++)
+            {
+                nint p = arr[s];
+                if (p == 0 || !owned.Remove(p)) continue;   // only pointers this loader allocated
+                NativeMemory.AlignedFree((void*)p);
+                arr[s] = 0;
+                bytes += elems * sizeof(float);
+            }
+        }
+        return bytes;
+    }
+
+    /// <summary>Bytes this device object has allocated across all heaps (the sum is conservative once allocations fall back to the host heap).</summary>
+    private static long LiveDeviceBytes(VulkanDevice device)
+    {
+        long sum = 0;
+        for (int h = 0; h < 16; h++) sum += device.LiveBytesOnHeap(h);
+        return sum;
+    }
+
+    /// <summary>Uploads one QSA layer's indexer projections (<c>indexer.q_proj</c>, <c>indexer.k_proj</c>) and folded norm gammas.</summary>
+    private static VulkanQwen4ExpQsa.LayerWeights UploadQsaIndexer(VulkanDevice device, VulkanStagingBuffer staging, GgufFile gguf,
+        IReadOnlyDictionary<string, GgufTensorDescriptor> t, string b, Qwen4ExpConfig q4)
+    {
+        if (!VulkanQwen4ExpQsa.Enabled)   // diagnostic baseline footprint (DOTLLM_VK_QWEN4EXP_QSA=0): the indexer is never run, so upload nothing
+        {
+            return new VulkanQwen4ExpQsa.LayerWeights
+            {
+                QProj = device.AllocateDeviceLocal(16), KProj = device.AllocateDeviceLocal(16), QGamma = device.AllocateDeviceLocal(16),
+                KGamma = device.AllocateDeviceLocal(16), QQt = QuantizationType.F32, KQt = QuantizationType.F32, Bytes = 64,
+            };
+        }
+        var qd = t[b + "indexer.q_proj.weight"]; var kd = t[b + "indexer.k_proj.weight"];
+        var qBuf = VulkanQwen3MoeHybridWeights.UploadProjectionMatrix(device, staging, gguf.TensorDataPointer(qd), qd.QuantizationType,
+            outputDim: qd.Shape[1], inputDim: qd.Shape[0], forceF32: false, out var qQt, out long qBytes);
+        var kBuf = VulkanQwen3MoeHybridWeights.UploadProjectionMatrix(device, staging, gguf.TensorDataPointer(kd), kd.QuantizationType,
+            outputDim: kd.Shape[1], inputDim: kd.Shape[0], forceF32: false, out var kQt, out long kBytes);
+        var qg = VulkanQwen3MoeHybridWeights.UploadFloatArray(device, staging, F32(gguf, t, b + "indexer.q_norm.weight", q4.IndexerKeyLength));
+        var kg = VulkanQwen3MoeHybridWeights.UploadFloatArray(device, staging, F32(gguf, t, b + "indexer.k_norm.weight", q4.IndexerKeyLength));
+        return new VulkanQwen4ExpQsa.LayerWeights
+        {
+            QProj = qBuf, KProj = kBuf, QGamma = qg, KGamma = kg, QQt = qQt, KQt = kQt,
+            Bytes = qBytes + kBytes + 2L * q4.IndexerKeyLength * 4,
+        };
+    }
+
+    private static Qwen3MoeLayerWeights[] BuildHybridLayers(GgufFile gguf, IReadOnlyDictionary<string, GgufTensorDescriptor> t,
+        ModelConfig config, List<nint> owned)
+    {
+        var layout = config.HybridLayout!;
+        var gdn = config.GdnConfig!.Value;
+        var layers = new Qwen3MoeLayerWeights[config.NumLayers];
+        float[] dummyNorm = [1f];
+        for (int il = 0; il < layers.Length; il++)
+        {
+            string b = $"blk.{il}.";
+            bool isGdn = layout.LayerKind[il] == HybridLayerKind.GatedDeltaNet;
+            layers[il] = new Qwen3MoeLayerWeights
+            {
+                AttnNormWeight = dummyNorm,
+                PostAttnNormWeight = dummyNorm,
+                Gdn = isGdn ? LoadGdn(b, gguf, t, gdn) : null,
+                FullAttn = isGdn ? null : LoadAttention(b, gguf, t, layout.HeadCountKv[il], config.HeadDim),
+                Moe = LoadMoe(il, gguf, t, config, owned),
+            };
+        }
+        return layers;
+    }
+
+    private static float[] F32(GgufFile gguf, IReadOnlyDictionary<string, GgufTensorDescriptor> t, string name, long count)
+    {
+        var d = t[name];
+        var r = new float[count];
+        Dequantize.ToFloat32(gguf.TensorDataPointer(d), count, d.QuantizationType, r);
+        return r;
+    }
+
+    private static GdnTokenMixingWeights LoadGdn(string b, GgufFile gguf, IReadOnlyDictionary<string, GgufTensorDescriptor> t, GatedDeltaNetConfig g)
+    {
+        int convDim = (2 * g.NKHead + g.NVHead) * g.DState;
+        var qkv = t[b + "attn_qkv.weight"]; var gate = t[b + "attn_gate.weight"]; var alpha = t[b + "ssm_alpha.weight"];
+        var beta = t[b + "ssm_beta.weight"]; var outp = t[b + "ssm_out.weight"];
+        return new GdnTokenMixingWeights
+        {
+            QkvWeight = gguf.TensorDataPointer(qkv), QkvQuantType = qkv.QuantizationType, QkvInputDim = qkv.Shape[0], QkvOutputDim = qkv.Shape[1],
+            GateWeight = gguf.TensorDataPointer(gate), GateQuantType = gate.QuantizationType, GateInputDim = gate.Shape[0], GateOutputDim = gate.Shape[1],
+            A = F32(gguf, t, b + "ssm_a", g.NVHead),
+            AlphaWeight = gguf.TensorDataPointer(alpha), AlphaQuantType = alpha.QuantizationType, AlphaInputDim = alpha.Shape[0], AlphaOutputDim = alpha.Shape[1],
+            BetaWeight = gguf.TensorDataPointer(beta), BetaQuantType = beta.QuantizationType, BetaInputDim = beta.Shape[0], BetaOutputDim = beta.Shape[1],
+            Conv1dWeight = F32(gguf, t, b + "ssm_conv1d.weight", (long)g.DConv * convDim),
+            Conv1dBias = new float[convDim],
+            DtBias = F32(gguf, t, b + "ssm_dt.bias", g.NVHead),
+            SsmNormWeight = F32(gguf, t, b + "ssm_norm.weight", g.DState),
+            OutWeight = gguf.TensorDataPointer(outp), OutQuantType = outp.QuantizationType, OutInputDim = outp.Shape[0], OutOutputDim = outp.Shape[1],
+        };
+    }
+
+    private static Qwen3FullAttnWeights LoadAttention(string b, GgufFile gguf, IReadOnlyDictionary<string, GgufTensorDescriptor> t, int nKv, int headDim)
+    {
+        var q = t[b + "attn_q.weight"]; var k = t[b + "attn_k.weight"]; var v = t[b + "attn_v.weight"]; var o = t[b + "attn_output.weight"];
+        return new Qwen3FullAttnWeights
+        {
+            QWeight = gguf.TensorDataPointer(q), QQuantType = q.QuantizationType, QInputDim = q.Shape[0], QOutputDim = q.Shape[1],
+            KWeight = gguf.TensorDataPointer(k), KQuantType = k.QuantizationType, KInputDim = k.Shape[0], KOutputDim = k.Shape[1],
+            VWeight = gguf.TensorDataPointer(v), VQuantType = v.QuantizationType, VInputDim = v.Shape[0], VOutputDim = v.Shape[1],
+            OWeight = gguf.TensorDataPointer(o), OQuantType = o.QuantizationType, OInputDim = o.Shape[0], OOutputDim = o.Shape[1],
+            NumKvHeads = nKv,
+            QNormWeight = F32(gguf, t, b + "attn_q_norm.weight", headDim),
+            KNormWeight = F32(gguf, t, b + "attn_k_norm.weight", headDim),
+        };
+    }
+
+    private static MoeLayerWeights LoadMoe(int il, GgufFile gguf, IReadOnlyDictionary<string, GgufTensorDescriptor> t, ModelConfig config, List<nint> owned,
+        bool requantRoutedBanks = false)
+    {
+        var moe = config.Moe!;
+        string p = $"blk.{il}.";
+        int hidden = config.HiddenSize, ne = moe.NumExperts, inter = moe.MoeIntermediateSize;
+        int shared = moe.SharedExpertIntermediateSize ?? inter;
+
+        // #987: when the shared gate/up/down upload packed Q8_0 the host F32 dequant (3.3 GiB on the real file) is never read - skip it.
+        bool sharedPacked = VulkanQwen3MoeMoeUpload.SharedPackedPlan(t[p + "ffn_gate_shexp.weight"].QuantizationType,
+            t[p + "ffn_up_shexp.weight"].QuantizationType, t[p + "ffn_down_shexp.weight"].QuantizationType, hidden, shared, defaultOn: false);
+        nint SharedF32(string name, long count)
+        {
+            if (sharedPacked) return 0;
+            var d = t[name];
+            nint dst = (nint)NativeMemory.AlignedAlloc((nuint)(count * sizeof(float)), 64);
+            owned.Add(dst);
+            Dequantize.ToFloat32(gguf.TensorDataPointer(d), count, d.QuantizationType, new Span<float>((void*)dst, (int)count));
+            return dst;
+        }
+
+        var gateD = t[p + "ffn_gate_exps.weight"]; var upD = t[p + "ffn_up_exps.weight"]; var downD = t[p + "ffn_down_exps.weight"];
+        var sg = t[p + "ffn_gate_shexp.weight"]; var su = t[p + "ffn_up_shexp.weight"]; var sd = t[p + "ffn_down_shexp.weight"];
+        // #900: a smaller routed bank for the MTP head. Gate/up -> Q4_K (the fused decode chain and the multi-row MMVQ twin read it), down -> Q5_1
+        // (K = the 640-wide intermediate is not a multiple of 256, so no K-quant fits; Q5_1 has a decode MMVQ). Draft quality only: the verify
+        // forward decides every emitted token.
+        nint gateP = gguf.TensorDataPointer(gateD), upP = gguf.TensorDataPointer(upD), downP = gguf.TensorDataPointer(downD);
+        QuantizationType gateQt = gateD.QuantizationType, upQt = upD.QuantizationType, downQt = downD.QuantizationType;
+        if (requantRoutedBanks)
+        {
+            (gateP, gateQt) = RequantBank(gateP, gateQt, ne, inter, hidden, QuantizationType.Q4_K, owned);
+            (upP, upQt) = RequantBank(upP, upQt, ne, inter, hidden, QuantizationType.Q4_K, owned);
+            (downP, downQt) = RequantBank(downP, downQt, ne, hidden, inter, QuantizationType.Q5_1, owned);
+        }
+        return new MoeLayerWeights(
+            gate: F32(gguf, t, p + "ffn_gate_inp.weight", (long)ne * hidden),
+            w1: new nint[ne], w2: new nint[ne], w3: new nint[ne],
+            numExperts: ne, numExpertsPerTok: moe.NumExpertsPerTok, hiddenSize: hidden, intermediateSize: inter,
+            normTopKProb: moe.NormTopKProb,
+            sharedGateProj: [SharedF32(p + "ffn_gate_shexp.weight", (long)shared * hidden)],
+            sharedUpProj: [SharedF32(p + "ffn_up_shexp.weight", (long)shared * hidden)],
+            sharedDownProj: [SharedF32(p + "ffn_down_shexp.weight", (long)hidden * shared)],
+            sharedIntermediateSize: shared,
+            sharedExpertGate: F32(gguf, t, p + "ffn_gate_inp_shexp.weight", hidden),
+            gateExpsRaw: gateP, gateExpsRawQt: gateQt, gateExpsMDim: inter, gateExpsKDim: hidden,
+            upExpsRaw: upP, upExpsRawQt: upQt, upExpsMDim: inter, upExpsKDim: hidden,
+            downExpsRaw: downP, downExpsRawQt: downQt, downExpsMDim: hidden, downExpsKDim: inter,
+            sharedGateRaw: [gguf.TensorDataPointer(sg)], sharedGateRawQt: sg.QuantizationType,
+            sharedUpRaw: [gguf.TensorDataPointer(su)], sharedUpRawQt: su.QuantizationType,
+            sharedDownRaw: [gguf.TensorDataPointer(sd)], sharedDownRawQt: sd.QuantizationType);
+    }
+
+    /// <summary>
+    /// Re-quantises a packed routed-expert bank <c>[experts, m, k]</c> row by row (dequantise to F32, quantise to <paramref name="dst"/>) into a new
+    /// host allocation owned by <paramref name="owned"/>. A bank already in <paramref name="dst"/>, or one whose <paramref name="k"/> does not fit the target
+    /// block size, is returned unchanged. Parallel over experts (the 512-expert MTP head takes about a second).
+    /// </summary>
+    internal static (nint Ptr, QuantizationType Qt) RequantBank(nint src, QuantizationType srcQt, int experts, int m, int k, QuantizationType dst, List<nint> owned)
+    {
+        if (srcQt == dst) return (src, srcQt);
+        int block = dst == QuantizationType.Q4_K ? 256 : 32;
+        if (k % block != 0 || (srcQt != QuantizationType.Q8_0 && srcQt != QuantizationType.Q5_1 && srcQt != QuantizationType.Q4_K && srcQt != QuantizationType.Q5_K && srcQt != QuantizationType.Q6_K))
+            return (src, srcQt);
+        long srcRow = Dequantize.RowByteSize(k, srcQt), dstRow = Dequantize.RowByteSize(k, dst);
+        long total = dstRow * m * experts;
+        nint mem = (nint)NativeMemory.AlignedAlloc((nuint)total, 64);
+        owned.Add(mem);
+        Parallel.For(0, experts, () => new float[k], (e, _, buf) =>
+        {
+            for (int r = 0; r < m; r++)
+            {
+                long row = (long)e * m + r;
+                Dequantize.ToFloat32(src + (nint)(row * srcRow), k, srcQt, buf);
+                Quantize.FromFloat32(buf, k, dst, new Span<byte>((void*)(mem + (nint)(row * dstRow)), (int)dstRow));
+            }
+            return buf;
+        }, _ => { });
+        return (mem, dst);
+    }
+
+    /// <summary>
+    /// The n-gram branch exactly as the CPU oracle builds it (its own <see cref="Qwen4ExpPleBranch"/>); the key / value projections are
+    /// dequantised to F32 once into host memory and run through the CPU GEMM. The table pointer is borrowed from the mmap and never copied.
+    /// </summary>
+    private static Qwen4ExpPleBranch BuildPleBranch(GgufFile gguf, IReadOnlyDictionary<string, GgufTensorDescriptor> t, ModelConfig config,
+        Qwen4ExpConfig q4, Qwen4ExpPleConfig ple, int layer, List<nint> owned)
+    {
+        string b = $"blk.{layer}.";
+        int hidden = config.HiddenSize, hc = q4.HyperConnectionCount, hcDim = hc * hidden;
+        var tdesc = t[Qwen4ExpTensors.PerLayerTokenEmbd];
+
+        Qwen4ExpProjection HostProj(string name)
+        {
+            var d = t[name];
+            int inDim = d.Shape[0], outDim = d.Shape[1];
+            long count = (long)inDim * outDim;
+            nint w = (nint)NativeMemory.AlignedAlloc((nuint)(count * sizeof(float)), 64);
+            owned.Add(w);
+            Dequantize.ToFloat32(gguf.TensorDataPointer(d), count, d.QuantizationType, new Span<float>((void*)w, checked((int)count)));
+            return (input, output, tokens) =>
+            {
+                fixed (float* x = input) fixed (float* y = output)
+                    MatMul.GemmF32((float*)w, x, y, outDim, inDim, tokens);
+            };
+        }
+
+        var convRaw = F32(gguf, t, b + "ple_conv1d.weight", (long)ple.ConvKernel * hcDim);   // [C][K] (K fastest)
+        return new Qwen4ExpPleBranch(
+            gguf.TensorDataPointer(tdesc), tdesc.QuantizationType, tdesc.Shape[1], ple.RowDim,
+            ple.NgramSize, ple.HeadsPerNgram, ple.EosTokenId, ple.ConvKernel,
+            ple.LayerMultipliers.Select(v => unchecked((long)v)).ToArray(),
+            ple.HeadOffsets.Select(v => checked((long)v)).ToArray(),
+            ple.HeadVocabSizes.Select(v => checked((long)v)).ToArray(),
+            hc, hidden, config.NormEpsilon,
+            F32(gguf, t, b + "ple_norm_key.weight", hcDim), F32(gguf, t, b + "ple_norm_query.weight", hcDim), F32(gguf, t, b + "ple_norm_conv.weight", hcDim),
+            Qwen4ExpPle.TransposeConvWeight(convRaw, hcDim, ple.ConvKernel),
+            HostProj(b + "ple_key.weight"), HostProj(b + "ple_value.weight"));
+    }
+
+    /// <summary>
+    /// Creates the expert tier (#939) over the slot-sized bundles: resolves where each layer's gate / up / down expert tensors sit on disk and attaches the tier to
+    /// every bundle. Reads nothing from the file.
+    /// </summary>
+    internal static Tiering.VulkanExpertTier BuildExpertTier(
+        VulkanDevice device, GgufFile gguf, ModelConfig config, IReadOnlyList<VulkanQwen3MoeMoeUpload.LayerBundle> bundles, int slots)
+    {
+        var moe = config.Moe!;
+        int hidden = config.HiddenSize, interm = moe.MoeIntermediateSize;
+        var layers = new Tiering.VulkanExpertTier.Layer[bundles.Count];
+        for (int il = 0; il < layers.Length; il++)
+        {
+            var b = bundles[il];
+            string[] names =
+            {
+                Qwen4ExpTensors.Block(il, Qwen4ExpTensors.Suffix.FfnGateExps),
+                Qwen4ExpTensors.Block(il, Qwen4ExpTensors.Suffix.FfnUpExps),
+                Qwen4ExpTensors.Block(il, Qwen4ExpTensors.Suffix.FfnDownExps),
+            };
+            // Piece order: gate (W1), up (W3), down (W2) - the slot banks are the bundle's own buffers.
+            var banks = new[] { b.W1Bank, b.W3Bank, b.W2Bank };
+            var qts = new[] { b.W1QuantType, b.W3QuantType, b.W2QuantType };
+            var mk = new[] { (interm, hidden), (interm, hidden), (hidden, interm) };
+            var pieceBytes = new long[3]; var file = new int[3]; var offset = new long[3];
+            for (int p = 0; p < 3; p++)
+            {
+                pieceBytes[p] = Dequantize.RowByteSize(mk[p].Item2, qts[p]) * mk[p].Item1;
+                var desc = gguf.TensorsByName[names[p]];
+                long total = Dequantize.RowByteSize(desc.Shape[0], desc.QuantizationType) * desc.Shape[1] * desc.Shape[2];
+                if (desc.QuantizationType != qts[p] || total != pieceBytes[p] * moe.NumExperts)
+                    throw new InvalidDataException($"{names[p]}: tensor is {total} bytes of {desc.QuantizationType} but the tiered bank expects {moe.NumExperts} x {pieceBytes[p]} bytes of {qts[p]}.");
+                file[p] = gguf.GetTensorShardIndex(names[p]);
+                offset[p] = gguf.GetTensorFileLocation(names[p]).FileOffset;
+            }
+            layers[il] = new Tiering.VulkanExpertTier.Layer
+            {
+                Cache = new Tiering.ExpertSlotCache(moe.NumExperts, slots),
+                SlotBanks = banks, PieceBytes = pieceBytes, File = file, FileOffset = offset,
+            };
+        }
+        var tier = new Tiering.VulkanExpertTier(device, gguf.ShardPaths, layers, moe.NumExperts, moe.NumExpertsPerTok, slots);
+        for (int il = 0; il < layers.Length; il++) bundles[il].AttachTier(tier, il);
+        return tier;
+    }
+}
