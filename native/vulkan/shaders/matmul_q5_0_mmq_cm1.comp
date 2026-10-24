@@ -1,0 +1,5 @@
+#version 450
+// Q5_0 weights x Q8_1 activations on int8 cooperative matrices (issue #1226); see mmq_cm1_main.glsl.
+#extension GL_GOOGLE_include_directive : require
+#define MMQ_Q5_0 1
+#include "mmq_cm1_main.glsl"

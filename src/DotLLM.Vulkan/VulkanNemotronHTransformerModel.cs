@@ -93,6 +93,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     // Native NVFP4 coopmat GEMM (#1064): decodes NVFP4 into shared memory inside the GEMM; null off wave64/coopmat devices, where
     // NVFP4 prefill falls back to _iqF16Prefill and then the packed scalar GEMM.
     private MatMulNvfp4GemmCoopmatKernel? _matmulNvfp4Coopmat;
+    // Coopmat flash prefill (#1226): Lightning's six attention layers took 27 ms of a 512-token prefill on the F32 flash kernel.
+    private VulkanFlashAttentionCoopmatKernel? _flashAttentionCoopmat;
     // Native IQ2_XXS coopmat GEMM (#1069) for dense IQ2_XXS prefill (Bolt's shared expert); null off wave64/coopmat devices.
     private MatMulIq2XxsGemmCoopmatKernel? _matmulIq2XxsCoopmat;
 
@@ -641,6 +643,13 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                 created._embedGather = EmbedGatherF32Kernel.Create(device, spvDir, weights.TokenEmbeddingQuantType);
             created._matmulNvfp4 = MatMulNvfp4F32Kernel.Create(device, spvDir);
             created._matmulNvfp4Coopmat = MatMulNvfp4GemmCoopmatKernel.TryCreate(device, spvDir);
+            if (!VulkanTransformerModel.IsFlashAttentionDisabled() && !VulkanTransformerModel.IsCoopmatAttentionDisabled()
+                && config.HeadDim <= VulkanFlashAttentionCoopmatKernel.WideMaxHeadDim
+                && VulkanFlashAttentionCoopmatKernel.TryCreate(device, spvDir) is { } fac)
+            {
+                if (config.HeadDim <= fac.SupportedMaxHeadDim) created._flashAttentionCoopmat = fac;
+                else fac.Dispose();
+            }
             created._matmulIq2XxsCoopmat = MatMulIq2XxsGemmCoopmatKernel.TryCreate(device, spvDir, iq2Codebooks);
             // #1064 / #1069: formats with a native coopmat GEMM need no F16 scratch; it is sized only for what it still serves.
             created._iqF16Prefill = IqF16PrefillMatmul.TryCreate(device, spvDir, matmulF16GemmCoopmat,
@@ -1331,6 +1340,13 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: 0);
         }
+        else if (_flashAttentionCoopmat is not null && seqLen > 1)
+        {
+            _flashAttentionCoopmat.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
+                seqQ: seqLen, seqKv: seqKv,
+                numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
+                positionOffset: positionOffset, slidingWindow: 0);
+        }
         else if (_flashAttention is not null && seqLen > 1 && headDim <= _flashAttention.SupportedMaxHeadDim)
         {
             _flashAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
@@ -1420,6 +1436,20 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         /// <summary>Grouped coopmat for Q5_1, Q5_0 and Q8_0 banks (#1225), 16-row tiles; null when unsupported.</summary>
         public IMoeGroupedF32Kernel? GroupedCoopmatQ5_1 { get; init; }
         public IMoeGroupedF32Kernel? GroupedCoopmatQ5_0 { get; init; }
+
+        /// <summary>Int8-coopmat grouped GEMMs (#1226, RDNA3/3.5): Q8_1 expert-sorted activations, 64-row tiles; null elsewhere.</summary>
+        public MatMulMmqCm1Kernel? GroupedCm1Q8_0 { get; init; }
+        public MatMulMmqCm1Kernel? GroupedCm1Q5_0 { get; init; }
+        public MatMulMmqCm1Kernel? GroupedCm1Q4_K { get; init; }
+
+        /// <summary>The int8-coopmat grouped kernel for a bank of type <paramref name="qt"/>, or null.</summary>
+        public MatMulMmqCm1Kernel? GroupedCm1(QuantizationType qt) => qt switch
+        {
+            QuantizationType.Q8_0 => GroupedCm1Q8_0,
+            QuantizationType.Q5_0 => GroupedCm1Q5_0,
+            QuantizationType.Q4_K => GroupedCm1Q4_K,
+            _ => null,
+        };
         public IMoeGroupedF32Kernel? GroupedCoopmatQ8_0 { get; init; }
 
         // IQ-family banks (#1057, NVIDIA's official IQ2_XXS Bolt file): one indexed dp4a MMVQ kernel per bank format present in the model
@@ -1482,6 +1512,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             GroupedCoopmatQ4_K?.InvalidateDescriptorCache(); GroupedCoopmatQ5_K?.InvalidateDescriptorCache(); GroupedCoopmatQ6_K?.InvalidateDescriptorCache();
             (GroupedCoopmatQ5_1 as LegacyGroupedKernel)?.Kernel.InvalidateDescriptorCache(); (GroupedCoopmatQ8_0 as LegacyGroupedKernel)?.Kernel.InvalidateDescriptorCache();
             (GroupedCoopmatQ5_0 as LegacyGroupedKernel)?.Kernel.InvalidateDescriptorCache();
+            GroupedCm1Q8_0?.InvalidateDescriptorCache(); GroupedCm1Q5_0?.InvalidateDescriptorCache(); GroupedCm1Q4_K?.InvalidateDescriptorCache();
             foreach (var kernel in MmvqIq.Values) kernel.InvalidateDescriptorCache();
             foreach (var kernel in GroupedCoopmatIq.Values) kernel.InvalidateDescriptorCache();
         }
@@ -1497,6 +1528,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             GroupedCoopmatQ4_K?.Dispose(); GroupedCoopmatQ5_K?.Dispose(); GroupedCoopmatQ6_K?.Dispose();
             (GroupedCoopmatQ5_1 as LegacyGroupedKernel)?.Kernel.Dispose(); (GroupedCoopmatQ8_0 as LegacyGroupedKernel)?.Kernel.Dispose();
             (GroupedCoopmatQ5_0 as LegacyGroupedKernel)?.Kernel.Dispose();
+            GroupedCm1Q8_0?.Dispose(); GroupedCm1Q5_0?.Dispose(); GroupedCm1Q4_K?.Dispose();
             foreach (var kernel in MmvqIq.Values) kernel.Dispose();
             foreach (var kernel in GroupedCoopmatIq.Values) kernel.Dispose();
             Iq1?.Dispose();
@@ -1589,6 +1621,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             GroupedCoopmatQ4_K = g.Cm4, GroupedCoopmatQ5_K = g.Cm5, GroupedCoopmatQ6_K = g.Cm6,
             GroupedCoopmatQ5_1 = g.Offsets is not null ? LegacyGroupedKernel.TryCreate(device, spvDir, MoeGroupedLegacyQuant.Q5_1, ones) : null,
             GroupedCoopmatQ5_0 = g.Offsets is not null ? LegacyGroupedKernel.TryCreate(device, spvDir, MoeGroupedLegacyQuant.Q5_0, ones) : null,
+            GroupedCm1Q8_0 = g.GatherQ8 is not null && g.Tiles is not null ? MatMulMmqCm1Kernel.TryCreate(device, spvDir, QuantizationType.Q8_0, grouped: true) : null,
+            GroupedCm1Q5_0 = g.GatherQ8 is not null && g.Tiles is not null ? MatMulMmqCm1Kernel.TryCreate(device, spvDir, QuantizationType.Q5_0, grouped: true) : null,
+            GroupedCm1Q4_K = g.GatherQ8 is not null && g.Tiles is not null ? MatMulMmqCm1Kernel.TryCreate(device, spvDir, QuantizationType.Q4_K, grouped: true) : null,
             GroupedCoopmatQ8_0 = g.Offsets is not null ? LegacyGroupedKernel.TryCreate(device, spvDir, MoeGroupedLegacyQuant.Q8_0, ones) : null,
             Router = MoeTopKSigmoidBiasF32Kernel.Create(device, spvDir),
             Broadcast = MoeBroadcastF32Kernel.Create(device, spvDir),
@@ -1625,6 +1660,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         public static long GroupedMmq;
         /// <summary>Routed layers run on the expert-grouped coopmat prefill (#1046).</summary>
         public static long GroupedCoopmat;
+        /// <summary>Routed layers run on the int8-coopmat grouped prefill (#1226).</summary>
+        public static long GroupedCm1;
         /// <summary>Up projections run on the xDiv broadcast MMVQ (#1049), one-row and multi-row kernels.</summary>
         public static long XDivUp;
         /// <summary>Up projections run on the multi-row Q4_K MMVQ (#1049).</summary>
@@ -1640,7 +1677,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             Interlocked.Exchange(ref IqMmvq, 0); Interlocked.Exchange(ref GroupedIqCoopmat, 0);
             Interlocked.Exchange(ref XDivUp, 0); Interlocked.Exchange(ref MultiRowUp, 0); Interlocked.Exchange(ref MultiRowDown, 0);
             Interlocked.Exchange(ref Mmvq, 0); Interlocked.Exchange(ref F32Indexed, 0);
-            Interlocked.Exchange(ref GroupedMmq, 0); Interlocked.Exchange(ref GroupedCoopmat, 0);
+            Interlocked.Exchange(ref GroupedMmq, 0); Interlocked.Exchange(ref GroupedCoopmat, 0); Interlocked.Exchange(ref GroupedCm1, 0);
         }
     }
 
@@ -1851,7 +1888,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     }
 
     /// <summary>Which expert-grouped prefill a routed layer takes (#1046).</summary>
-    private enum GroupedPath { None, Mmq, Coopmat }
+    private enum GroupedPath { None, Mmq, Coopmat, Cm1 }
 
     /// <summary>
     /// Picks the grouped prefill for a layer: dp4a MMQ when both banks have an MMQ kernel (Q4_K / Q5_K), else coopmat when both have a coopmat
@@ -1861,6 +1898,12 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     {
         if (!k.HasGroupedGlue)
             return GroupedPath.None;
+        // #1226: int8 coopmat (iu8 WMMA) on Q8_1 expert-sorted rows, the llama.cpp mul_mat_id path on RDNA3/3.5. Needs the Q8_1 gather,
+        // the quantizer and the tile list (64-row tiles).
+        if (k.GatherGroupQ8_1 is not null && k.Quantize is not null && k.BuildTileList is not null
+            && k.GroupedCm1(m.UpBankQuantType) is { } cmUp && cmUp.SupportsK(expertDim)
+            && k.GroupedCm1(m.DownBankQuantType) is { } cmDown && cmDown.SupportsK(m.MoeIntermediateSize))
+            return GroupedPath.Cm1;
         // #1225: the legacy-quant (Q5_1 / Q8_0, 32-element block) kernels only need K in whole 64-element staging rounds; Nemotron-3.5
         // Lightning's 2688 / 1856 widths are not 256-multiples.
         if (IsLegacyGroupedBank(m.UpBankQuantType) && IsLegacyGroupedBank(m.DownBankQuantType))
@@ -1931,7 +1974,31 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             rows: rows, numExperts: numE);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-        if (path == GroupedPath.Mmq)
+        if (path == GroupedPath.Cm1)
+        {
+            Interlocked.Increment(ref MoePathCounters.GroupedCm1);
+            var upK = k.GroupedCm1(m.UpBankQuantType)!;
+            var downK = k.GroupedCm1(m.DownBankQuantType)!;
+            // Quantize the [seqLen, expertDim] token rows once, gather them (as Q8_1) into expert order.
+            k.Quantize!.Record(cmdBuf, expertIn, _state.MoeTokenXq!, _state.MoeTokenXds!, n: seqLen, k: expertDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            k.GatherGroupQ8_1!.Record(cmdBuf, _state.MoeTokenXq!, _state.MoeTokenXds!, indices, _state.MoeGroupOffsets!, _state.MoeGroupCounters!,
+                _state.MoeExpandedInputXq!, _state.MoeExpandedInputXds!, _state.MoeGroupPerm!, _state.MoeGroupInvPerm!,
+                rows: rows, k: expertDim, numExperts: numE, topK: topK);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            BuildTiles(cmdBuf, k, numE, upK.MTiles(inter), downK.MTiles(expertDim), MatMulMmqCm1Kernel.RowTile);
+            upK.RecordGroupedIndirect(cmdBuf, m.UpBank, _state.MoeExpandedInputXq!, _state.MoeExpandedInputXds!, _state.MoeGroupOffsets!,
+                _state.MoeUpInter!, _state.MoeGroupDispatchArgs!, 0, m: inter, k: expertDim, rows: rows, numExperts: numE);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            _reluSquared.Record(cmdBuf, _state.MoeUpInter!, n: rows * inter);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            k.Quantize!.Record(cmdBuf, _state.MoeUpInter!, _state.MoeUpInterXq!, _state.MoeUpInterXds!, n: rows, k: inter);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            downK.RecordGroupedIndirect(cmdBuf, m.DownBank, _state.MoeUpInterXq!, _state.MoeUpInterXds!, _state.MoeGroupOffsets!,
+                _state.MoeDownRows!, _state.MoeGroupDispatchArgs!, MoeBuildTileListKernel.ArgsStrideBytes,
+                m: expertDim, k: inter, rows: rows, numExperts: numE);
+        }
+        else if (path == GroupedPath.Mmq)
         {
             Interlocked.Increment(ref MoePathCounters.GroupedMmq);
             var upK = k.GroupedMmq(m.UpBankQuantType)!;
@@ -2162,6 +2229,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulIq4NlGemm.InvalidateDescriptorCache();
         _matmulNvfp4?.InvalidateDescriptorCache();
         _matmulNvfp4Coopmat?.InvalidateDescriptorCache();
+        _flashAttentionCoopmat?.InvalidateDescriptorCache();
         _matmulIq2XxsCoopmat?.InvalidateDescriptorCache();
         _iqF16Prefill?.InvalidateDescriptorCache();
         _matmulIq4Xs.InvalidateDescriptorCache();
@@ -2628,6 +2696,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulIq4Nl.Dispose();
         _matmulNvfp4?.Dispose();
         _matmulNvfp4Coopmat?.Dispose();
+        _flashAttentionCoopmat?.Dispose();
         _matmulIq2XxsCoopmat?.Dispose();
         _iqF16Prefill?.Dispose();
         _matmulIq3SGemm.Dispose();

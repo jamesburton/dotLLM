@@ -72,6 +72,26 @@ internal sealed class VulkanQwen3HybridDenseForwardState : IDisposable
     public VulkanDevice.Buffer FfnUp { get; private set; } = null!;          // [seqLen, intermediate]
     public VulkanDevice.Buffer FfnSilu { get; private set; } = null!;        // [seqLen, intermediate]
 
+    /// <summary>Q8_1 int8 activations for the int8-coopmat GEMM (#1226), <c>[seqLen, widest GEMM input]</c>; null unless enabled.</summary>
+    public VulkanDevice.Buffer? Cm1Xq { get; private set; }
+    /// <summary>Q8_1 per-32-block (d, d*sum) for <see cref="Cm1Xq"/>.</summary>
+    public VulkanDevice.Buffer? Cm1Xds { get; private set; }
+
+    /// <summary>Whether <see cref="Cm1Xq"/> / <see cref="Cm1Xds"/> are allocated (set once by the model when an int8-coopmat GEMM exists).</summary>
+    public bool Cm1ScratchEnabled
+    {
+        get => _cm1;
+        set
+        {
+            if (value == _cm1) return;
+            _cm1 = value;
+            ReleaseLayerScratch();
+            AllocateForCapacity(_capacitySeqLen);
+        }
+    }
+
+    private bool _cm1;
+
     // ── Logits + positions ───────────────────────────────────────────────────
     public VulkanDevice.Buffer Logits { get; }
     public VulkanDevice.Buffer PositionsBuffer { get; private set; }
@@ -154,6 +174,16 @@ internal sealed class VulkanQwen3HybridDenseForwardState : IDisposable
         FfnUp = _device.AllocateDeviceLocal(ffnBytes);
         FfnSilu = _device.AllocateDeviceLocal(ffnBytes);
 
+        long cm1Bytes = 0;
+        if (_cm1)
+        {
+            // Every GEMM input: hidden (most projections), intermediate (ffn_down), GDN value dim (ssm_out), q width (attn_o).
+            int maxK = Math.Max(Math.Max(_hiddenSize, _qElems), Math.Max(_gdnVDim, _intermediateSize));
+            Cm1Xq = _device.AllocateDeviceLocal(Kernels.QuantizeQ8_1RowsKernel.PackedBytes(seqLen, maxK));
+            Cm1Xds = _device.AllocateDeviceLocal(Kernels.QuantizeQ8_1RowsKernel.ScaleBytes(seqLen, maxK));
+            cm1Bytes = Cm1Xq.Size + Cm1Xds.Size;
+        }
+
         long hadamardBytes = 0;
         if (_hasHadamardFold)
         {
@@ -178,7 +208,7 @@ internal sealed class VulkanQwen3HybridDenseForwardState : IDisposable
             + convInputBytes + convBytes + vDimBytes * 3 + kDimBytes * 2 + alphaBytes * 2
             + ffnBytes * 3
             + (long)_vocabSize * sizeof(float) + (long)seqLen * sizeof(int)
-            + hadamardBytes;
+            + hadamardBytes + cm1Bytes;
     }
 
     private void ReleaseLayerScratch()
@@ -192,6 +222,7 @@ internal sealed class VulkanQwen3HybridDenseForwardState : IDisposable
         GdnAlphaBuf?.Dispose(); GdnBetaBuf?.Dispose();
         GdnQBuf?.Dispose(); GdnKBuf?.Dispose(); GdnVBuf?.Dispose(); GdnOut?.Dispose();
         FfnGate?.Dispose(); FfnUp?.Dispose(); FfnSilu?.Dispose();
+        Cm1Xq?.Dispose(); Cm1Xq = null; Cm1Xds?.Dispose(); Cm1Xds = null;
     }
 
     public void Dispose()
