@@ -112,6 +112,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
     // the PTX is absent/stale; Hadamard-folded checkpoints then refuse to load on CUDA.
     private readonly CudaModule? _hadamardFwhtModule;
     private readonly nint _hadamardFwhtF32Func;
+    private readonly nint _hadamardFwht1024F32Func;   // #1222: blockSize == 1024 fast path
 
     // Small-S multi-column PQ2_0 GEMV (pq2_0_gemv_multi.ptx) — optional module (issue #482). One
     // exact-width entry point per S = 1..8; index 0 unused. All zero when the PTX is absent, stale or
@@ -859,6 +860,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
         {
             _hadamardFwhtModule = CudaModule.LoadFromFile(hadamardFwhtPath);
             _hadamardFwhtF32Func = _hadamardFwhtModule.TryGetFunction("hadamard_fwht_f32");
+            _hadamardFwht1024F32Func = _hadamardFwhtModule.TryGetFunction("hadamard_fwht1024_f32");
         }
 
         string pq2_0GemvMultiPath = Path.Combine(ptxDir, "pq2_0_gemv_multi.ptx");
@@ -3900,12 +3902,20 @@ public sealed unsafe partial class CudaKernels : IDisposable
     /// <param name="nKHead">Number of key heads (tiled broadcast, <c>kh = vh % nKHead</c>).</param>
     /// <param name="seqLen">Number of tokens.</param>
     /// <param name="stream">CUDA stream handle.</param>
+    /// <param name="snapshot">
+    /// Optional (#473): for <c>t &lt; snapshotRows</c> the state after token <c>t</c> is also written to
+    /// <c>snapshot + t * snapshotRowStride</c> floats, in <paramref name="state"/>'s layout. Zero for none.
+    /// </param>
+    /// <param name="snapshotRowStride">Floats between consecutive rows' snapshots.</param>
+    /// <param name="snapshotRows">Rows to snapshot (0 = none).</param>
     public void LaunchGdnScanMultiF32(nint state, nint q, nint k, nint v, nint g, nint beta, nint output,
-                                      int nVHead, int nKHead, int seqLen, nint stream)
+                                      int nVHead, int nKHead, int seqLen, nint stream,
+                                      nint snapshot = 0, long snapshotRowStride = 0, int snapshotRows = 0)
     {
-        nint sArg = state, qArg = q, kArg = k, vArg = v, gArg = g, bArg = beta, oArg = output;
-        int nvArg = nVHead, nkArg = nKHead, slArg = seqLen;
-        void** args = stackalloc void*[] { &sArg, &qArg, &kArg, &vArg, &gArg, &bArg, &oArg, &nvArg, &nkArg, &slArg };
+        nint sArg = state, qArg = q, kArg = k, vArg = v, gArg = g, bArg = beta, oArg = output, snArg = snapshot;
+        int nvArg = nVHead, nkArg = nKHead, slArg = seqLen, srArg = snapshotRows;
+        long ssArg = snapshotRowStride;
+        void** args = stackalloc void*[] { &sArg, &qArg, &kArg, &vArg, &gArg, &bArg, &oArg, &nvArg, &nkArg, &slArg, &snArg, &ssArg, &srArg };
         CudaDriverApi.cuLaunchKernel(_gdnScanMultiF32Func,
                 (uint)nVHead, 1, 1, 128, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
@@ -6415,6 +6425,9 @@ public sealed unsafe partial class CudaKernels : IDisposable
     /// <summary>Whether the PrismML Hadamard FWHT kernel is loaded (hadamard_fwht.ptx present and current).</summary>
     public bool HasHadamardFwht => _hadamardFwhtF32Func != 0;
 
+    /// <summary>Test hook (#1222): route 1024-wide blocks through the generic kernel, the fast path's oracle.</summary>
+    internal bool ForceGenericHadamardForTest { get; set; }
+
     /// <summary>
     /// Blockwise normalized Sylvester Walsh-Hadamard transform over a <c>[rows, width]</c> F32
     /// activation (PrismML <c>prism.hadamard.*</c> fold, issue #479). One CUDA block per
@@ -6466,7 +6479,10 @@ public sealed unsafe partial class CudaKernels : IDisposable
         int pds = permDState, pnk = permNKHead, prp = permRep;
         float sc = scale;
         void** args = stackalloc void*[] { &s, &d, &sg, &r, &w, &bs, &aps, &inv, &perm, &pds, &pnk, &prp, &sc };
-        CudaDriverApi.cuLaunchKernel(_hadamardFwhtF32Func,
+        // #1222: 1024-wide blocks (Bonsai 2) take the register/shuffle kernel — same butterflies, bit-identical.
+        nint func = blockSize == 1024 && _hadamardFwht1024F32Func != 0 && !ForceGenericHadamardForTest
+            ? _hadamardFwht1024F32Func : _hadamardFwhtF32Func;
+        CudaDriverApi.cuLaunchKernel(func,
                 (uint)(width / blockSize), (uint)rows, 1, HadamardFwhtThreads, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }

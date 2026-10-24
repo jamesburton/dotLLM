@@ -12,12 +12,14 @@
 // (word j: chunk j/4, bit plane j%4). Weight word j is (codeword_{j/4} >> 2*(j%4)) & 0x03030303 and
 // activation word j is the j-th permuted int8 word — #485's pairing. Feeding word j as logical
 // K bytes 4j..4j+3 of mma.m16n8k32's A (row-major) and B (col-major) fragments therefore gives the
-// exact int32 sum of code*q for the block. As in the dp4a kernels, codes stay 0..3 and the "-1"
-// becomes "- sum q" per (column, block).
+// exact int32 sum of code*q for the block. Unlike the dp4a kernels, the "-1" is applied to the
+// weights here, per byte with __vsub4 (no borrow between bytes: code 0 becomes 0xFF = -1 as s8), once
+// per A fragment and shared by every column tile, instead of subtracting "sum q" per output — the
+// mma then yields sum (code-1)*q directly, the same exact integer.
 //
 // Per output element the float work is then IDENTICAL to pq2_0_mmq_dp4a's, in the same order:
 // for each group g ascending, each 32-block b ascending,
-//     acc = fmaf(i2f(isum - sum_q), d * ws, acc)
+//     acc = fmaf(i2f(sum (code-1)*q), d * ws, acc)
 // with the same magic-number i2f. So this kernel is bit-identical to the dp4a MMQ (the existing
 // #490 tests are its oracle), only faster: 32 MACs per mma lane-op instead of 4 per dp4a.
 //
@@ -86,7 +88,6 @@ extern "C" __global__ void __launch_bounds__(PQ2T_THREADS, 2) pq2_0_mmq_mma_f32y
     __shared__ __align__(16) unsigned xsm[PQ2T_BN * PQ2T_XSTRIDE];
     __shared__ float wscale[PQ2T_BM];
     __shared__ float xd[PQ2T_BN][PQ2T_BPG];
-    __shared__ int   xs[PQ2T_BN][PQ2T_BPG];
 
     const int tid  = threadIdx.x;
     const int warp = tid >> 5;
@@ -158,7 +159,6 @@ extern "C" __global__ void __launch_bounds__(PQ2T_THREADS, 2) pq2_0_mmq_mma_f32y
         for (int j = 0; j < 2; j++)
             *reinterpret_cast<uint4*>(&xsm[xCol[j] * PQ2T_XSTRIDE + 4 * xWord[j]]) = nx[j];
         xd[mCol][mBlk] = __int_as_float(nm.x);
-        xs[mCol][mBlk] = nm.y;
         __syncthreads();
 
         if (g + 1 < gpr) fetch(g + 1);   // in flight while this group computes
@@ -181,10 +181,11 @@ extern "C" __global__ void __launch_bounds__(PQ2T_THREADS, 2) pq2_0_mmq_mma_f32y
                 const int r0 = wm * 32 + mi * 16 + gid;
                 const uint2 c0 = *reinterpret_cast<const uint2*>(&wsm[r0 * PQ2T_WSTRIDE + 2 * b]);
                 const uint2 c1 = *reinterpret_cast<const uint2*>(&wsm[(r0 + 8) * PQ2T_WSTRIDE + 2 * b]);
-                af[mi][0] = (c0.x >> (2 * tig)) & 0x03030303u;   // row gid,   word tig
-                af[mi][1] = (c1.x >> (2 * tig)) & 0x03030303u;   // row gid+8, word tig
-                af[mi][2] = (c0.y >> (2 * tig)) & 0x03030303u;   // row gid,   word 4+tig
-                af[mi][3] = (c1.y >> (2 * tig)) & 0x03030303u;   // row gid+8, word 4+tig
+                // code - 1 per byte (values -1..2 as s8)
+                af[mi][0] = __vsub4((c0.x >> (2 * tig)) & 0x03030303u, 0x01010101u);   // row gid,   word tig
+                af[mi][1] = __vsub4((c1.x >> (2 * tig)) & 0x03030303u, 0x01010101u);   // row gid+8, word tig
+                af[mi][2] = __vsub4((c0.y >> (2 * tig)) & 0x03030303u, 0x01010101u);   // row gid,   word 4+tig
+                af[mi][3] = __vsub4((c1.y >> (2 * tig)) & 0x03030303u, 0x01010101u);   // row gid+8, word 4+tig
             }
 
             #pragma unroll
@@ -195,17 +196,16 @@ extern "C" __global__ void __launch_bounds__(PQ2T_THREADS, 2) pq2_0_mmq_mma_f32y
                 const unsigned b1 = xsm[(cl + gid) * PQ2T_XSTRIDE + 8 * b + 4 + tig];
                 const int   cA = cl + 2 * tig, cB = cA + 1;
                 const float dA = xd[cA][b], dB = xd[cB][b];
-                const int   sA = xs[cA][b], sB = xs[cB][b];
 
                 #pragma unroll
                 for (int mi = 0; mi < 2; mi++)
                 {
                     int c[4] = {0, 0, 0, 0};
                     pq2t_mma(c, af[mi][0], af[mi][1], af[mi][2], af[mi][3], b0, b1);
-                    acc[mi][ni][0] = fmaf(pq2t_i2f(c[0] - sA), dA * ws[mi][0], acc[mi][ni][0]);
-                    acc[mi][ni][1] = fmaf(pq2t_i2f(c[1] - sB), dB * ws[mi][0], acc[mi][ni][1]);
-                    acc[mi][ni][2] = fmaf(pq2t_i2f(c[2] - sA), dA * ws[mi][1], acc[mi][ni][2]);
-                    acc[mi][ni][3] = fmaf(pq2t_i2f(c[3] - sB), dB * ws[mi][1], acc[mi][ni][3]);
+                    acc[mi][ni][0] = fmaf(pq2t_i2f(c[0]), dA * ws[mi][0], acc[mi][ni][0]);
+                    acc[mi][ni][1] = fmaf(pq2t_i2f(c[1]), dB * ws[mi][0], acc[mi][ni][1]);
+                    acc[mi][ni][2] = fmaf(pq2t_i2f(c[2]), dA * ws[mi][1], acc[mi][ni][2]);
+                    acc[mi][ni][3] = fmaf(pq2t_i2f(c[3]), dB * ws[mi][1], acc[mi][ni][3]);
                 }
             }
         }

@@ -411,6 +411,9 @@ extern "C" __global__ void __launch_bounds__(128) gdn_scan_step_f32(
 // Layout per token t (row-major, contiguous tokens):
 //   q, k : [seq_len, n_k_head, 128]    v, out : [seq_len, n_v_head, 128]
 //   g, beta : [seq_len, n_v_head]
+// Optional per-row snapshots (#473, verify forwards): for t < snap_rows the state after token t is
+// also stored at snap + t * snap_row_stride (floats), laid out like `state` — the bytes the host's
+// per-token D2D snapshot copy would take.
 #define GDN_MT_DSTATE 128
 extern "C" __global__ void __launch_bounds__(GDN_MT_DSTATE) gdn_scan_multi_f32(
     float* __restrict__ state,
@@ -420,7 +423,8 @@ extern "C" __global__ void __launch_bounds__(GDN_MT_DSTATE) gdn_scan_multi_f32(
     const float* __restrict__ g,
     const float* __restrict__ beta,
     float* __restrict__ output,
-    const int n_v_head, const int n_k_head, const int seq_len)
+    const int n_v_head, const int n_k_head, const int seq_len,
+    float* __restrict__ snap, const long long snap_row_stride, const int snap_rows)
 {
     const int vh = blockIdx.x;
     if (vh >= n_v_head) return;
@@ -469,6 +473,14 @@ extern "C" __global__ void __launch_bounds__(GDN_MT_DSTATE) gdn_scan_multi_f32(
             out_col += s[row] * q_shared[row];
         }
         output[t * vDim + (size_t)vh * GDN_MT_DSTATE + col] = out_col * scale;
+
+        if (t < snap_rows)
+        {
+            float* Sn = snap + t * snap_row_stride + (size_t)vh * GDN_MT_DSTATE * GDN_MT_DSTATE;
+            #pragma unroll
+            for (int row = 0; row < GDN_MT_DSTATE; row++)
+                Sn[row * GDN_MT_DSTATE + col] = s[row];
+        }
     }
 
     #pragma unroll

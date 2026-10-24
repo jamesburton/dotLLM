@@ -31,6 +31,9 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
 
     public long AllocatedBytes { get; private set; }
 
+    // One allocation behind the GDN, attention and FFN scratch pointers (#1222); see EnsureCapacity.
+    private nint _subLayerArena;
+
     /// <summary>Rows every per-token buffer currently holds (0 before the first forward). Tests use it to observe the prefill tile bound (issue #1025).</summary>
     internal int SequenceCapacity => _currentSeqLen;
 
@@ -86,16 +89,18 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
     public nint SiluOutput;     // [seqLen * intermediateSize] — silu(FfnGate) * FfnUp
 
     // ── PrismML Hadamard fold (issue #479) ────────────────────────────────────
-    /// <summary>
-    /// Destination for the forward Hadamard activation transform (<c>prism.hadamard.*</c>):
-    /// <c>[seqLen, maxFoldedWidth]</c>, where the width covers every folded input — hidden
-    /// (attn/GDN/FFN inputs, lm_head), <c>NVHead·DState</c> (<c>ssm_out</c>), <c>qElems</c>
-    /// (<c>attn_output</c>) and <c>intermediateSize</c> (<c>ffn_down</c>). A separate buffer rather
-    /// than in-place because unfolded consumers (<c>ssm_alpha</c>/<c>ssm_beta</c>) read the very same
-    /// <see cref="NormOutput"/> the folded GDN projections rotate. 0 (never allocated) when the
-    /// checkpoint declares no fold.
-    /// </summary>
-    public nint HadamardScratch;
+    // Destinations for the forward Hadamard activation transform (prism.hadamard.*). Not in place, because unfolded
+    // consumers (ssm_alpha / ssm_beta) read the very NormOutput the folded GDN projections rotate. #1222: each lives in
+    // its sub-layer's arena slice instead of one [seqLen, widest fold] buffer: the GDN and attention ones are carved
+    // there ([seqLen, max(hidden, NVHead*DState)] and [seqLen, max(hidden, qElems)]); the FFN rotates its input into
+    // SiluOutput (not yet written) and its down input into FfnGate (dead once SwiGLU has run), and the post-trunk heads
+    // use FfnGate too. Both 0 without a fold.
+
+    /// <summary>Hadamard destination for the GDN sub-layer's folded inputs (qkv / gate, ssm_out).</summary>
+    public nint GdnRotScratch;
+
+    /// <summary>Hadamard destination for the attention sub-layer's folded inputs (q / k / v, attn_output).</summary>
+    public nint AttnRotScratch;
 
     // ── Token-id / position H2D staging ───────────────────────────────────────
     public nint TokenIdsDevice;
@@ -200,29 +205,41 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
         Residual = AllocDevice((long)cap * _hiddenSize * sizeof(float));
         NormOutput = AllocDevice((long)cap * _hiddenSize * sizeof(float));
 
-        GdnConvInput = AllocDevice((long)(_dConv - 1 + cap) * _convDim * sizeof(float));
-        GdnQkvBuf = AllocDevice((long)cap * _convDim * sizeof(float));
-        GdnZBuf = AllocDevice((long)cap * _gdnVDim * sizeof(float));
-        GdnAlphaBuf = AllocDevice((long)cap * _gdnHeads * sizeof(float));
-        GdnBetaBuf = AllocDevice((long)cap * _gdnHeads * sizeof(float));
-        GdnQBuf = AllocDevice((long)cap * _gdnKDim * sizeof(float));
-        GdnKBuf = AllocDevice((long)cap * _gdnKDim * sizeof(float));
-        GdnVBuf = AllocDevice((long)cap * _gdnVDim * sizeof(float));
-        GdnOut = AllocDevice((long)cap * _gdnVDim * sizeof(float));
+        // #1222: a layer runs its token mixer (GDN or attention) to completion before its FFN, and nothing outlives the
+        // sub-layer that wrote it (results land in NormOutput), so the three sub-layers' scratch share ONE arena sized to
+        // the largest set instead of their sum (~150 MiB less at a 512-token tile on Bonsai 2 27B).
+        long gdnFloats = 0, attnFloats = 0, ffnFloats = 0;
+        long[] gdn =
+        [
+            Carve(ref gdnFloats, (long)(_dConv - 1 + cap) * _convDim), Carve(ref gdnFloats, (long)cap * _convDim),
+            Carve(ref gdnFloats, (long)cap * _gdnVDim), Carve(ref gdnFloats, (long)cap * _gdnHeads),
+            Carve(ref gdnFloats, (long)cap * _gdnHeads), Carve(ref gdnFloats, (long)cap * _gdnKDim),
+            Carve(ref gdnFloats, (long)cap * _gdnKDim), Carve(ref gdnFloats, (long)cap * _gdnVDim),
+            Carve(ref gdnFloats, (long)cap * _gdnVDim),
+        ];
+        long[] attn =
+        [
+            Carve(ref attnFloats, (long)cap * 2 * _qElems), Carve(ref attnFloats, (long)cap * _qElems),
+            Carve(ref attnFloats, (long)cap * _qElems), Carve(ref attnFloats, (long)cap * _kvElems),
+            Carve(ref attnFloats, (long)cap * _kvElems), Carve(ref attnFloats, (long)cap * _qElems),
+        ];
+        bool folded = _hadamardWidth > 0;
+        long gdnRot = folded ? Carve(ref gdnFloats, (long)cap * Math.Max(_hiddenSize, _gdnVDim)) : -1;
+        long attnRot = folded ? Carve(ref attnFloats, (long)cap * Math.Max(_hiddenSize, _qElems)) : -1;
+        long[] ffn =
+        [
+            Carve(ref ffnFloats, (long)cap * _intermediateSize), Carve(ref ffnFloats, (long)cap * _intermediateSize),
+            Carve(ref ffnFloats, (long)cap * _intermediateSize),
+        ];
+        _subLayerArena = AllocDevice(Math.Max(gdnFloats, Math.Max(attnFloats, ffnFloats)) * sizeof(float));
+        nint At(long floatOffset) => _subLayerArena + (nint)(floatOffset * sizeof(float));
 
-        QGateScratch = AllocDevice((long)cap * 2 * _qElems * sizeof(float));
-        QScratch = AllocDevice((long)cap * _qElems * sizeof(float));
-        GateScratch = AllocDevice((long)cap * _qElems * sizeof(float));
-        KScratch = AllocDevice((long)cap * _kvElems * sizeof(float));
-        VScratch = AllocDevice((long)cap * _kvElems * sizeof(float));
-        AttnOutput = AllocDevice((long)cap * _qElems * sizeof(float));
-
-        FfnGate = AllocDevice((long)cap * _intermediateSize * sizeof(float));
-        FfnUp = AllocDevice((long)cap * _intermediateSize * sizeof(float));
-        SiluOutput = AllocDevice((long)cap * _intermediateSize * sizeof(float));
-
-        if (_hadamardWidth > 0)
-            HadamardScratch = AllocDevice((long)cap * _hadamardWidth * sizeof(float));
+        (GdnConvInput, GdnQkvBuf, GdnZBuf, GdnAlphaBuf, GdnBetaBuf) = (At(gdn[0]), At(gdn[1]), At(gdn[2]), At(gdn[3]), At(gdn[4]));
+        (GdnQBuf, GdnKBuf, GdnVBuf, GdnOut) = (At(gdn[5]), At(gdn[6]), At(gdn[7]), At(gdn[8]));
+        (QGateScratch, QScratch, GateScratch) = (At(attn[0]), At(attn[1]), At(attn[2]));
+        (KScratch, VScratch, AttnOutput) = (At(attn[3]), At(attn[4]), At(attn[5]));
+        (FfnGate, FfnUp, SiluOutput) = (At(ffn[0]), At(ffn[1]), At(ffn[2]));
+        (GdnRotScratch, AttnRotScratch) = folded ? (At(gdnRot), At(attnRot)) : (0, 0);
 
         TokenIdsDevice = AllocDevice((long)cap * sizeof(int));
         PositionsDevice = AllocDevice((long)cap * sizeof(int));
@@ -246,8 +263,20 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
         _logitsCurrentRows = rows;
     }
 
+    /// <summary>Reserves <paramref name="floats"/> (rounded to 256 bytes) at the end of a sub-layer's arena slice.</summary>
+    /// <param name="end">The slice's running size in floats; advanced past the reservation.</param>
+    /// <param name="floats">Floats to reserve.</param>
+    /// <returns>The reservation's offset in floats.</returns>
+    private static long Carve(ref long end, long floats)
+    {
+        long at = end;
+        end += (floats + 63) & ~63L;
+        return at;
+    }
+
     private nint AllocDevice(long bytes)
     {
+        CudaQwen3HybridDenseTransformerModel.DeviceAllocEpoch++;   // #1222: a decode graph captured ahead may hold the old pointer
         CudaDriverApi.cuMemAlloc_v2(out nint ptr, (nuint)bytes).ThrowOnError();
         AllocatedBytes += bytes;
         return ptr;
@@ -257,6 +286,7 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
     {
         if (ptr != 0)
         {
+            CudaQwen3HybridDenseTransformerModel.DeviceAllocEpoch++;
             CudaDriverApi.cuMemFree_v2(ptr);
             ptr = 0;
         }
@@ -267,25 +297,10 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
         FreeIfNonZero(ref HiddenState);
         FreeIfNonZero(ref Residual);
         FreeIfNonZero(ref NormOutput);
-        FreeIfNonZero(ref GdnConvInput);
-        FreeIfNonZero(ref GdnQkvBuf);
-        FreeIfNonZero(ref GdnZBuf);
-        FreeIfNonZero(ref GdnAlphaBuf);
-        FreeIfNonZero(ref GdnBetaBuf);
-        FreeIfNonZero(ref GdnQBuf);
-        FreeIfNonZero(ref GdnKBuf);
-        FreeIfNonZero(ref GdnVBuf);
-        FreeIfNonZero(ref GdnOut);
-        FreeIfNonZero(ref QGateScratch);
-        FreeIfNonZero(ref QScratch);
-        FreeIfNonZero(ref GateScratch);
-        FreeIfNonZero(ref KScratch);
-        FreeIfNonZero(ref VScratch);
-        FreeIfNonZero(ref AttnOutput);
-        FreeIfNonZero(ref FfnGate);
-        FreeIfNonZero(ref FfnUp);
-        FreeIfNonZero(ref SiluOutput);
-        FreeIfNonZero(ref HadamardScratch);
+        FreeIfNonZero(ref _subLayerArena);   // the GDN / attention / FFN scratch below all point into it
+        GdnConvInput = GdnQkvBuf = GdnZBuf = GdnAlphaBuf = GdnBetaBuf = GdnQBuf = GdnKBuf = GdnVBuf = GdnOut = 0;
+        QGateScratch = QScratch = GateScratch = KScratch = VScratch = AttnOutput = 0;
+        FfnGate = FfnUp = SiluOutput = GdnRotScratch = AttnRotScratch = 0;
         FreeIfNonZero(ref TokenIdsDevice);
         FreeIfNonZero(ref PositionsDevice);
     }

@@ -136,7 +136,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IDFlas
         nint headIn = hidden;
         if (_hadamard is { } headRot)
         {
-            headIn = _state.HadamardScratch;
+            headIn = _state.FfnGate;   // #1222: FFN scratch is dead after the trunk
             headRot.RotateForward(hidden, headIn, rows, _outputInputDim, permuteGdnValueHeads: false, streamH);
         }
         GemmLmHead(_outputDevice, _outputQt, headIn, _state.Logits, _outputOutputDim, _outputInputDim, rows);

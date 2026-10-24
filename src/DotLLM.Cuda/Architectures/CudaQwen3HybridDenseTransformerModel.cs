@@ -393,7 +393,11 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     // nextn.* tensor group, which is the overwhelming majority: every other field and code path
     // in this class is completely unaffected by MTP being absent. Mirrors the CPU host's
     // Qwen3HybridDenseTransformerModel._mtpHead (DotLLM.Models.Architectures.MtpHeadWeights).
-    private readonly CudaMtpHeadWeights? _mtpHead;
+    private CudaMtpHeadWeights? _mtpHead;
+
+    // #1222: the GGUF carries an MTP head that is uploaded on first use (EnsureMtpHead), so plain
+    // decode does not hold the ~430 MiB NextN block in VRAM.
+    private bool _mtpHeadDeferred;
 
     // PrismML Hadamard fold (prism.hadamard.*, issue #479) — null for every checkpoint outside the
     // Bonsai 2 family, and every rotation site below is a single null check on it, so an unfolded
@@ -457,6 +461,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         }
         if (!flashPrefill)
             bytes += 2L * kvElems * sizeof(float);
+        if (mtp) EnsureMtpHead();
         if (mtp && _mtpHead is { } head)
         {
             var (keyFormat, valueFormat) = ResolveMtpKvFormats();
@@ -481,6 +486,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         _context.MakeCurrent();
+        if (mtp) EnsureMtpHead();   // #1222: the head's weights count against the free VRAM measured below
         string? sizingError = null;
         int tile = Math.Min(PrefillChunkTokens > 0 ? PrefillChunkTokens : DefaultPrefillChunkTokens,
                             Math.Max(1, NativeMaxSequenceLength - Math.Max(verifyRows, 1)));
@@ -526,7 +532,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     }
 
     /// <inheritdoc/>
-    public bool SupportsMtp => _mtpHead is not null || _dflash is not null;
+    public bool SupportsMtp => _mtpHead is not null || _mtpHeadDeferred || _dflash is not null;
 
     /// <inheritdoc/>
     public long ComputeMemoryBytes => _state.AllocatedBytes + _gdnCache.AllocatedBytes;
@@ -850,6 +856,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     {
         if (_dflash is not null)
             return new DFlashMtpState(_dflash);   // an attached DFlash drafter takes the MTP slot (#1175)
+        EnsureMtpHead();
         if (_mtpHead is null)
             return null;
 
@@ -950,7 +957,8 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         int deviceId,
         CudaMtpHeadWeights? mtpHead = null,
         bool isHeadOnly = false,
-        CudaHadamardRotation? hadamard = null)
+        CudaHadamardRotation? hadamard = null,
+        bool mtpHeadDeferred = false)
     {
         // A Hadamard-folded checkpoint (Bonsai 2) stores its weights in a rotated basis and needs
         // the matching activation transform, and the failure mode of skipping it is not a crash:
@@ -973,6 +981,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         _gguf = gguf;
         _layers = layers;
         _mtpHead = mtpHead;
+        _mtpHeadDeferred = mtpHeadDeferred && gguf is not null;
         _hadamard = hadamard;
         _tokenEmbedDevice = tokenEmbedDevice;
         _tokenEmbedQt = tokenEmbedQt;
@@ -1119,7 +1128,10 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         // `hiddenSize`/`config.VocabSize`) is used only for the HOST-side per-token embedding
         // dequant in Forward() — reads directly from the mmap'd GGUF bytes via `dataBase`, not
         // from this GPU buffer — so it is unaffected by the on-device byte layout either way.
-        nint tokenEmbedDevice = UploadRawTensor(dataBase, embDesc, allocs);
+        // #1222: the device copy only ever serves as a TIED lm_head; with its own output.weight (Bonsai 2) it was
+        // 322 MiB of VRAM nothing read, so upload it only when the head is tied.
+        bool tiedHead = !tensors.ContainsKey("output.weight");
+        nint tokenEmbedDevice = tiedHead ? UploadRawTensor(dataBase, embDesc, allocs) : 0;
 
         // ── Output norm (always F32 [hiddenSize], dequant on host then H2D) ──
         var outNormDesc = tensors["output_norm.weight"];
@@ -1191,7 +1203,11 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         // change for every other checkpoint — LoadMtpHeadIfPresent returns null unless
         // config.NextnPredictLayers > 0 AND the nextn.* tensors are actually present. Mirrors the
         // CPU host's Qwen3HybridDenseTransformerModel.LoadMtpHeadIfPresent tensor layout exactly.
-        CudaMtpHeadWeights? mtpHead = LoadMtpHeadIfPresent(dataBase, tensors, config, allocs);
+        // #1222: a single-block head (every shipped Bonsai 2 / Qwen3.6 GGUF) is uploaded on first use, so a run that never
+        // drafts does not hold it in VRAM. Anything else still loads (or is rejected) here, as before.
+        bool mtpDeferred = config.NextnPredictLayers == 1
+            && tensors.ContainsKey($"blk.{config.NumLayers}.nextn.eh_proj.weight");
+        CudaMtpHeadWeights? mtpHead = mtpDeferred ? null : LoadMtpHeadIfPresent(dataBase, tensors, config, allocs);
 
         var gdn = config.GdnConfig!.Value;
         state = new CudaQwen3HybridDenseForwardState(
@@ -1221,7 +1237,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
             kvSlotForLayer, attentionLayerCount,
             ropeTheta, ropeDim,
             state, gdnCache, stream, cublas, context, kernels, deviceId,
-            mtpHead, hadamard: hadamard);
+            mtpHead, hadamard: hadamard, mtpHeadDeferred: mtpDeferred);
         }
         catch
         {
@@ -1735,6 +1751,25 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     /// <c>[0, NumLayers)</c>, since <c>GgufModelConfigExtractor</c> already subtracted
     /// <c>nextn_predict_layers</c> back out of the raw <c>block_count</c>).
     /// </summary>
+    /// <summary>Uploads a deferred MTP head (issue #1222) the first time anything needs it.</summary>
+    private void EnsureMtpHead()
+    {
+        if (!_mtpHeadDeferred) return;
+        _context.MakeCurrent();
+        var allocs = new List<nint>();
+        try
+        {
+            _mtpHead = LoadMtpHeadIfPresent(new GgufDataBase(_gguf!), _gguf!.TensorsByName, Config, allocs);
+        }
+        catch
+        {
+            for (int i = allocs.Count - 1; i >= 0; i--)
+                FreeIfNonZeroValue(allocs[i]);
+            throw;
+        }
+        _mtpHeadDeferred = false;
+    }
+
     private static CudaMtpHeadWeights? LoadMtpHeadIfPresent(
         GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
@@ -2145,8 +2180,8 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         if (ProfileTrace) _stream.Synchronize();
         ProfMark("setup-embed");
 
-        // #1222: a plain one-token step runs the whole layer loop as one graph launch.
-        bool graphed = seqLen == 1 && produceLogits && mtpCapture is null && _dflashCall is null
+        // #1222: a decode step or a short verify runs the whole layer loop as one graph launch.
+        bool graphed = seqLen <= MaxGraphRows && _dflashCall is null
             && TryForwardDecodeGraph(positions, hiddenSize, numHeads, numKvHeads, headDim, eps, kvCache);
         if (!graphed)
         {
@@ -2241,13 +2276,16 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         nint headIn = lmHeadInput;
         if (_hadamard is { } headRot)
         {
-            headIn = _state.HadamardScratch;
+            headIn = _state.FfnGate;   // #1222: FFN scratch is dead after the trunk; >= [rows, hidden]
             headRot.RotateForward(lmHeadInput, headIn, logitsRows, _outputInputDim,
                 permuteGdnValueHeads: false, streamH);
         }
         GemmLmHead(_outputDevice, _outputQt, headIn, _state.Logits,
              _outputOutputDim, _outputInputDim, logitsRows);
         ProfMark("lm-head");
+        // #1222: capture the next step while the GPU works through this one.
+        if (graphed && seqLen == 1)
+            CaptureNextDecodeStepAhead(positions[0], hiddenSize, numHeads, numKvHeads, headDim, eps, kvCache);
         if (DebugTrace) { _stream.Synchronize(); Console.Error.WriteLine("[hybrid-debug] lm_head done"); Console.Error.Flush(); LogVram("after lm-head"); }
 
         _stream.Synchronize();
@@ -2860,7 +2898,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     /// decoder then takes an unconstrained greedy draft token from <see cref="ForwardMtpArgMax"/>
     /// instead of copying the 248k-float logits row to the host every draft step.
     /// </summary>
-    public bool SupportsMtpArgMax => !_disposed && (_dflash is not null || (_mtpHead is not null && EnsureMtpArgMax() is not null));
+    public bool SupportsMtpArgMax => !_disposed && (_dflash is not null || ((_mtpHead is not null || _mtpHeadDeferred) && EnsureMtpArgMax() is not null));
 
     /// <inheritdoc/>
     public int ForwardMtpArgMax(IMtpState state, int tokenId, int position)
@@ -3498,7 +3536,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         nint foldedIn = normOut;
         if (_hadamard is { } rot)
         {
-            foldedIn = _state.HadamardScratch;
+            foldedIn = _state.GdnRotScratch;
             rot.RotateForward(normOut, foldedIn, seqLen, gdnW.QkvInputDim,
                 permuteGdnValueHeads: false, streamH);
         }
@@ -3660,12 +3698,14 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         // per-GPU/per-shape ceiling, not a soft limit) with a safe fallback to the exact kernel.
         bool useCoopSplit4 = CudaKernels.EnableGdnScanApproxSplit4 &&
             _kernels.IsGdnScanCoopSplit4Safe(nVHead, dState);
-        // #1222: without per-row snapshots (#473) every token runs in ONE launch with the state in
-        // registers — bit-identical to the per-token loop below, which verify forwards keep.
-        if (snapRows == 0 && !useCoopSplit4 && _kernels.CanGdnScanMultiF32(dState))
+        // #1222: every token runs in ONE launch with the state in registers, writing any per-row
+        // snapshots (#473) itself — bit-identical to the per-token loop below.
+        if (!useCoopSplit4 && _kernels.CanGdnScanMultiF32(dState))
         {
             _kernels.LaunchGdnScanMultiF32(gdnStateDev, qBuf, kBuf, vBuf, alphaBuf, betaBuf, gdnOut,
-                nVHead, nKHead, seqLen, streamH);
+                nVHead, nKHead, seqLen, streamH,
+                snapRows > 0 ? RowSnapshotGdnPtr(0, gdnOrdinal) : 0,
+                (long)_gdnCache.NumGdnLayers * _gdnCache.GdnStateElements, snapRows);
         }
         else for (int t = 0; t < seqLen; t++)
         {
@@ -3712,7 +3752,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         nint outIn = gdnOut;
         if (_hadamard is { } outRot)
         {
-            outIn = _state.HadamardScratch;
+            outIn = _state.GdnRotScratch;
             outRot.RotateForward(gdnOut, outIn, seqLen, gdnW.OutInputDim,
                 permuteGdnValueHeads: true, streamH);
         }
@@ -3745,12 +3785,12 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         ProfStart();
         // ── 1. Fused Q+Gate projection ──
         // PrismML Hadamard fold: attn_q, attn_k and attn_v are all folded and read the same
-        // normOut, so one rotation feeds all three. HadamardScratch is untouched between here and
+        // normOut, so one rotation feeds all three. AttnRotScratch is untouched between here and
         // the K/V projections below.
         nint projIn = normOut;
         if (_hadamard is { } qkvRot)
         {
-            projIn = _state.HadamardScratch;
+            projIn = _state.AttnRotScratch;
             qkvRot.RotateForward(normOut, projIn, seqLen, attn.QInputDim,
                 permuteGdnValueHeads: false, streamH);
         }
@@ -4127,7 +4167,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         nint oIn = attnOut;
         if (_hadamard is { } oRot)
         {
-            oIn = _state.HadamardScratch;
+            oIn = _state.AttnRotScratch;
             oRot.RotateForward(attnOut, oIn, seqLen, attn.OInputDim,
                 permuteGdnValueHeads: false, streamH);
         }
@@ -4374,6 +4414,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         static void FreeAll(nint[]? buffers)
         {
             if (buffers is null) return;
+            DeviceAllocEpoch++;   // #1222: invalidates a decode graph captured ahead
             foreach (nint p in buffers)
                 if (p != 0) CudaDriverApi.cuMemFree_v2(p);
         }
@@ -4628,7 +4669,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         nint ffnIn = normOut;
         if (_hadamard is { } ffnRot)
         {
-            ffnIn = _state.HadamardScratch;
+            ffnIn = _state.SiluOutput;   // #1222: not written until SwiGLU, after gate/up have read it
             ffnRot.RotateForward(normOut, ffnIn, seqLen, lw.GateInputDim,
                 permuteGdnValueHeads: false, streamH);
         }
@@ -4646,7 +4687,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         nint downIn = siluOut;
         if (_hadamard is { } downRot)
         {
-            downIn = _state.HadamardScratch;
+            downIn = _state.FfnGate;     // #1222: dead once SwiGLU has produced SiluOutput
             downRot.RotateForward(siluOut, downIn, seqLen, lw.DownInputDim,
                 permuteGdnValueHeads: false, streamH);
         }
@@ -5370,6 +5411,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     /// <summary>Counts one KV buffer allocation or growth against <see cref="KvAllocFailureAfter"/>, throwing when it is exhausted.</summary>
     private static void CountKvAllocation()
     {
+        DeviceAllocEpoch++;   // #1222
         if (KvAllocFailureAfter is int left)
         {
             if (left <= 0)
