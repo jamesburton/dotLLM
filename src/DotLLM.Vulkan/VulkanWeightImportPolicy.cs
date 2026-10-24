@@ -61,6 +61,13 @@ internal static class VulkanWeightImportPolicy
             Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_HOST_IMPORT"),
             "1", StringComparison.Ordinal);
 
+    /// <summary><c>DOTLLM_VULKAN_HOST_IMPORT_WRITABLE=1</c>: import read-only GGUF ranges through a shared writable
+    /// alias view (#1190). Read per call.</summary>
+    public static bool WritableAliasEnabled =>
+        string.Equals(
+            Environment.GetEnvironmentVariable("DOTLLM_VULKAN_HOST_IMPORT_WRITABLE"),
+            "1", StringComparison.Ordinal);
+
     private static readonly List<(nint Pointer, long Bytes)> s_stagedRanges = [];
 
     // Host-only ranges (#818): source tensors that must NEVER reach the device. The Qwen4-Exp n-gram table is one 28.8 GB tensor in
@@ -192,6 +199,18 @@ internal static class VulkanWeightImportPolicy
         }
 
         var wrapped = device.TryWrapHostVisible(srcPtr, bytes);
+
+        // #1190: amdvlk and the Arc driver both refuse read-only pages, which is how every GGUF is mapped. Retry from a
+        // shared writable view of the same file range (no private pages). A copy-on-write view is also accepted but the
+        // driver's write-lock privatises every page, so it costs what staging costs and is not tried.
+        if (wrapped is null && WritableAliasEnabled
+            && Models.Gguf.GgufFile.TryMapImportAlias(srcPtr, bytes, writable: true, out nint alias))
+        {
+            wrapped = device.TryWrapHostVisible(alias, bytes);
+            if (wrapped is null)
+                Models.Gguf.GgufFile.ReleaseImportAlias(alias);
+        }
+
         if (wrapped is null)
         {
             // "rejected" on its own is not a cause. Carry the driver's own verdict —

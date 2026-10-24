@@ -635,6 +635,50 @@ a host with a small or disabled pagefile where the read-only map succeeded. `Rea
 offered: CoW gets the same acceptance while making it physically impossible for a stray write to
 reach the checkpoint on disk.
 
+### Copy-on-write does not save memory; a shared writable alias does (#1190)
+
+The #508 measurement above read *commit charge*, which cannot see a copy-on-write break: a CoW
+view's commit is charged when it is mapped. Measuring the **private working set** instead
+(`VulkanHostImportMmapAccessModeTests.Import_PrivateWorkingSetCost_ByMapping`, 256 MiB, already read):
+
+| host mapping | Arc iGPU (Intel) | Strix 8060S (amdvlk) |
+|---|---|---|
+| read-only (what `GgufFile` maps) | refused, `VK_ERROR_OUT_OF_DEVICE_MEMORY` | refused, `VK_ERROR_INVALID_EXTERNAL_HANDLE` |
+| copy-on-write view | accepted, **+256 MiB private** | accepted, **+256 MiB private** |
+| read-write mapping, read-only view | refused | refused |
+| read-write mapping, read-write view | accepted, **+0 MiB** | accepted, **+0 MiB** |
+
+Both drivers lock imported pages for write. On a read-only page that fails; on a copy-on-write page
+it privatises the page (a full copy, same cost as staging); only a shared writable page is used in
+place. So `DOTLLM_GGUF_MAP_COW=1` imports but saves nothing physical, and it charges commit for the
+whole file.
+
+**`DOTLLM_VULKAN_HOST_IMPORT_WRITABLE=1`** (opt-in): when an import from the read-only mapping is
+refused, `VulkanWeightImportPolicy.TryImport` retries through `GgufFile.TryMapImportAlias`, a shared
+writable view of the same file range (same page-cache pages as the read-only mapping). Real Flint
+Q4_1 (26 GB), 485/485 tensors imported, logits bit-identical to staging:
+
+| Strix 8060S, Flint | private WS | prefill pp512 | decode (prose / pp512 tail) |
+|---|---|---|---|
+| staging (default) | 25.5-26.0 GiB | 558-560 tok/s | 82.8-83.0 / 74.2-74.3 tok/s |
+| writable alias | **1.9-2.5 GiB** | 512-517 (-8 %) | 69.4-70.2 / 63.9-64.2 (**-15 %**) |
+| `DOTLLM_GGUF_MAP_COW=1` | 25.4-26.0 GiB | 544-547 | 74.3-75.1 / 66.7-67.5 |
+
+(interleaved stg, wr, cow, cow, wr, stg.) On the Arc iGPU the alias also drops the private working set
+from 25.7 to 2.2 GiB; its decode A/B is inside the iGPU's run-to-run noise (19-26 tok/s for identical
+staged runs). Imported pages live in the GTT heap 0 (memory type 1: host-visible, coherent, not
+cached), not the device-local carve-out, which is where the decode cost comes from.
+
+Why it is opt-in:
+
+- It opens the checkpoint **for write** (shared). A stray device write would reach the file on disk.
+  Weight buffers are bound read-only in every shader, but nothing enforces that in Vulkan.
+- A process that holds the file with `FileShare.Read` (llama.cpp, an older dotLLM, a test host) blocks
+  the write-open, and the load quietly falls back to staging. While the alias is live, such a process
+  cannot open the file. `GgufFile` itself now opens with `FileShare.ReadWrite`, so dotLLM processes
+  coexist.
+- The decode cost above. It is the memory-for-throughput trade #508 described, now measured.
+
 ### What the import actually buys, and costs
 
 On Bonsai 2 27B PQ2_0, a 32 GiB UMA box previously held **13.9 GiB** for the weights: 6.86 GiB of

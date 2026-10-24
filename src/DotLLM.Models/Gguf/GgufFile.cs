@@ -36,10 +36,13 @@ public sealed class GgufFile : IDisposable
     /// <para>
     /// <b>What copy-on-write costs</b>, measured on the same box over a 256 MiB mapping:
     /// creating the view reserves commit charge equal to the mapped size <i>up front</i>
-    /// (+256 MiB), reading every page adds <b>no</b> private commit (the pages stay shared with
-    /// the page cache, working set grows as normal), and the Vulkan import adds <b>no</b>
-    /// private commit either — the driver pins without breaking copy-on-write. So it does not
-    /// duplicate the weights, which was the thing that would have made it pointless.
+    /// (+256 MiB) and reading every page adds no private pages. <b>The Vulkan import, however,
+    /// privatises every page</b> (#1190): amdvlk and the Arc driver lock imported pages for write,
+    /// which breaks copy-on-write, so the private working set grows by the full imported size —
+    /// the same physical cost as staging (measured on the real Flint load: 25.4 GiB private
+    /// working set either way). The earlier "adds no private commit" reading was true but
+    /// blind: a CoW view's commit is charged at map time, so commit cannot show the break. Only a
+    /// shared writable view imports without a private copy — see <see cref="TryMapImportAlias"/>.
     /// </para>
     /// <para>
     /// <b>What it risks.</b> (1) The up-front commit reservation is the whole file: a 30 GB
@@ -295,6 +298,59 @@ public sealed class GgufFile : IDisposable
             shard.Dispose();
     }
 
+    /// <summary>
+    /// Maps a second view of the source file over the bytes at <paramref name="pointer"/> (an address inside any open
+    /// <see cref="GgufFile"/>'s read-only mapping) and returns its address. For the Vulkan zero-copy weight import (#1190).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// amdvlk (Strix) and the Intel Arc driver both refuse <c>VK_EXT_external_memory_host</c> on read-only pages (#508):
+    /// they lock the pages for write. What they accept, measured on Arc (<c>VulkanHostImportMmapAccessModeTests</c>):
+    /// </para>
+    /// <list type="bullet">
+    ///   <item><b>copy-on-write view</b> (<paramref name="writable"/> false): accepted, but the write-lock breaks
+    ///   copy-on-write, so every imported page becomes a private copy — the same physical cost as staging.</item>
+    ///   <item><b>shared writable view</b> (<paramref name="writable"/> true): accepted with no private pages — the device
+    ///   reads the page-cache pages themselves. Opens the file for write (shared, so other readers are unaffected); a
+    ///   stray device write would reach the checkpoint on disk.</item>
+    /// </list>
+    /// <para>
+    /// Both views alias the same file, so they share physical pages with the read-only mapping. The view lives until
+    /// <see cref="ReleaseImportAlias"/> or until its file is disposed — the lifetime contract imported weights already
+    /// have with the read-only mapping.
+    /// </para>
+    /// </remarks>
+    /// <param name="pointer">Start of the range inside a mapped GGUF's data.</param>
+    /// <param name="bytes">Length of the range.</param>
+    /// <param name="writable">Map a shared writable view instead of a copy-on-write one.</param>
+    /// <param name="alias">The same bytes in the new view, or zero.</param>
+    /// <returns>False when the range is not inside one open read-only mapping, or the file cannot be opened for write.</returns>
+    public static bool TryMapImportAlias(nint pointer, long bytes, bool writable, out nint alias)
+    {
+        alias = 0;
+        if (pointer == 0 || bytes <= 0 || MappingAccess != MemoryMappedFileAccess.Read)
+            return false;
+        lock (Shard.LiveLock)
+        {
+            foreach (var shard in Shard.Live)
+                if (shard.TryMapAlias(pointer, bytes, writable, out alias))
+                    return alias != 0;
+        }
+        return false;
+    }
+
+    /// <summary>Unmaps a view returned by <see cref="TryMapImportAlias"/> (e.g. when the import still failed).</summary>
+    /// <param name="alias">The alias address.</param>
+    public static void ReleaseImportAlias(nint alias)
+    {
+        lock (Shard.LiveLock)
+        {
+            foreach (var shard in Shard.Live)
+                if (shard.ReleaseAlias(alias))
+                    return;
+        }
+    }
+
     // ───────────────────────────── shard parsing ─────────────────────────────
 
     private sealed record ParsedShard(
@@ -314,7 +370,7 @@ public sealed class GgufFile : IDisposable
         long streamPositionAfterInfos;
 
         long fileLength;
-        using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+        using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) // coexists with a writable import alias (#1190)
         using (var reader = new BinaryReader(fs))
         {
             header = GgufReader.ReadHeader(reader);
@@ -455,6 +511,69 @@ public sealed class GgufFile : IDisposable
         private MemoryMappedFile? _mmf;
         private MemoryMappedViewAccessor? _accessor;
         private byte* _basePointer;
+        private long _mappedLength;
+        private readonly Dictionary<nint, MemoryMappedViewAccessor> _aliases = [];
+        private MemoryMappedFile? _writableMmf;
+
+        /// <summary>Shards with a live mapping, for <see cref="TryMapImportAlias"/>.</summary>
+        internal static readonly List<Shard> Live = [];
+
+        /// <summary>Guards <see cref="Live"/> and every shard's alias table.</summary>
+        internal static readonly object LiveLock = new();
+
+        /// <summary>
+        /// Maps an alias view over <c>[pointer, pointer + bytes)</c>. True when the range lies in this shard's mapping
+        /// (then <paramref name="alias"/> is zero if the writable mapping could not be opened).
+        /// </summary>
+        public bool TryMapAlias(nint pointer, long bytes, bool writable, out nint alias)
+        {
+            alias = 0;
+            if (_accessor is null || _mmf is null)
+                return false;
+            long offset = (long)((byte*)pointer - _basePointer) - _accessor.PointerOffset;
+            if (offset < 0 || offset + bytes > _mappedLength)
+                return false;
+
+            MemoryMappedFile mmf = _mmf;
+            var access = MemoryMappedFileAccess.CopyOnWrite;
+            if (writable)
+            {
+                if (_writableMmf is null)
+                {
+                    try
+                    {
+                        // FileShare.ReadWrite: the read-only handle (and other processes' readers) stay valid alongside.
+                        var fs = new FileStream(Path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+                        _writableMmf = MemoryMappedFile.CreateFromFile(
+                            fs, null, 0, MemoryMappedFileAccess.ReadWrite, HandleInheritability.None, leaveOpen: false);
+                    }
+                    catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                    {
+                        return true; // read-only file or a reader that denies writers: no alias, caller stages
+                    }
+                }
+                mmf = _writableMmf;
+                access = MemoryMappedFileAccess.ReadWrite;
+            }
+
+            // CreateViewAccessor rounds the view start down to the allocation granularity; PointerOffset is the slack.
+            var view = mmf.CreateViewAccessor(offset, bytes, access);
+            byte* viewPointer = null;
+            view.SafeMemoryMappedViewHandle.AcquirePointer(ref viewPointer);
+            alias = (nint)(viewPointer + view.PointerOffset);
+            _aliases.Add(alias, view);
+            return true;
+        }
+
+        /// <summary>Unmaps one alias view; false when it is not this shard's.</summary>
+        public bool ReleaseAlias(nint alias)
+        {
+            if (!_aliases.Remove(alias, out var view))
+                return false;
+            view.SafeMemoryMappedViewHandle.ReleasePointer();
+            view.Dispose();
+            return true;
+        }
 
         public string Path { get; }
         public long DataSectionOffset { get; }
@@ -477,12 +596,32 @@ public sealed class GgufFile : IDisposable
             try
             {
                 MemoryMappedFileAccess access = MappingAccess;
-                shard._mmf = MemoryMappedFile.CreateFromFile(parsed.Path, FileMode.Open, null, 0, access);
+                if (access == MemoryMappedFileAccess.Read)
+                {
+                    // FileShare.ReadWrite (not CreateFromFile(path)'s FileShare.Read) so TryMapImportAlias can open the
+                    // writable alias mapping of the same file next to this one (#1190).
+                    var fs = new FileStream(parsed.Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                    try
+                    {
+                        shard._mmf = MemoryMappedFile.CreateFromFile(fs, null, 0, access, HandleInheritability.None, leaveOpen: false);
+                    }
+                    catch
+                    {
+                        fs.Dispose();
+                        throw;
+                    }
+                }
+                else
+                {
+                    shard._mmf = MemoryMappedFile.CreateFromFile(parsed.Path, FileMode.Open, null, 0, access);
+                }
                 shard._accessor = shard._mmf.CreateViewAccessor(0, 0, access);
                 byte* basePointer = null;
                 shard._accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref basePointer);
                 shard._basePointer = basePointer;
                 shard.DataBase = (nint)(basePointer + shard._accessor.PointerOffset + parsed.DataSectionOffset);
+                shard._mappedLength = parsed.DataSectionOffset + parsed.DataSectionLength;
+                lock (LiveLock) Live.Add(shard);
                 return shard;
             }
             catch
@@ -494,6 +633,19 @@ public sealed class GgufFile : IDisposable
 
         public void Dispose()
         {
+            lock (LiveLock)
+            {
+                Live.Remove(this);
+                foreach (var view in _aliases.Values)
+                {
+                    view.SafeMemoryMappedViewHandle.ReleasePointer();
+                    view.Dispose();
+                }
+                _aliases.Clear();
+                _writableMmf?.Dispose();
+                _writableMmf = null;
+            }
+
             if (_basePointer != null)
             {
                 _accessor?.SafeMemoryMappedViewHandle.ReleasePointer();

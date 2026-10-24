@@ -235,8 +235,9 @@ public class VulkanHostImportMmapAccessModeTests(ITestOutputHelper output)
                 _output.WriteLine(brokenPages > bytes / 2
                     ? $"  => IMPORT BREAKS COPY-ON-WRITE: +{Mib(brokenPages)} MiB private for a "
                       + $"{Mib(bytes)} MiB mapping. CoW duplicates the weights and is NOT a fix."
-                    : $"  => import added {Mib(brokenPages)} MiB private for a {Mib(bytes)} MiB "
-                      + "mapping — copy-on-write held, so CoW is a viable fix on this driver.");
+                    : $"  => import added {Mib(brokenPages)} MiB commit for a {Mib(bytes)} MiB mapping. Commit cannot "
+                      + "see a copy-on-write break (the view's commit is charged at map time): see "
+                      + "Import_PrivateWorkingSetCost_ByMapping for the physical cost (#1190).");
             }
             finally { acc.SafeMemoryMappedViewHandle.ReleasePointer(); }
         }
@@ -244,6 +245,106 @@ public class VulkanHostImportMmapAccessModeTests(ITestOutputHelper output)
         {
             try { File.Delete(path); } catch (IOException) { /* best effort */ }
         }
+    }
+
+    /// <summary>
+    /// The physical cost of an import, per host mapping (#1190): private working set (pages only this process holds)
+    /// before and after the import of the same 256 MiB, already read. Commit charge cannot see a copy-on-write break —
+    /// the view's commit is charged at map time — so <see cref="CopyOnWriteImport_PrivateCommitCost"/> reports "0 MiB"
+    /// whether or not the driver privatised every page.
+    /// </summary>
+    [SkippableFact]
+    public unsafe void Import_PrivateWorkingSetCost_ByMapping()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out _);
+        Skip.IfNot(OperatingSystem.IsWindows(), "Private working set probe is Windows-only.");
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(device.HasExternalMemoryHost, "Driver does not expose VK_EXT_external_memory_host on this host.");
+
+        const long bytes = 256L * 1024 * 1024;
+        string path = WritePayload(bytes);
+        try
+        {
+            void Probe(string label, MemoryMappedFileAccess mmfAccess, MemoryMappedFileAccess viewAccess, FileAccess fileAccess)
+            {
+                File.SetLastWriteTimeUtc(path, new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+                long modified0 = ModifiedFileBytes();
+                ProbeOnce(label, mmfAccess, viewAccess, fileAccess);
+                _output.WriteLine($"{"",-34}  modified (file-backed) page list after unmap: {(ModifiedFileBytes() - modified0) / (1024 * 1024):+#;-#;0} MiB");
+                // A driver that locks the pages for write marks them dirty on release; on a shared writable mapping
+                // that is a write-back of the whole range to the checkpoint (same bytes, but real disk writes).
+                _output.WriteLine($"{"",-34}  file mtime after unmap: {(File.GetLastWriteTimeUtc(path).Year == 2020 ? "unchanged" : "CHANGED")}");
+            }
+
+            void ProbeOnce(string label, MemoryMappedFileAccess mmfAccess, MemoryMappedFileAccess viewAccess, FileAccess fileAccess)
+            {
+                using var fs = new FileStream(path, FileMode.Open, fileAccess, FileShare.ReadWrite);
+                using var mmf = MemoryMappedFile.CreateFromFile(fs, null, 0, mmfAccess, HandleInheritability.None, leaveOpen: false);
+                using var acc = mmf.CreateViewAccessor(0, bytes, viewAccess);
+                byte* basePtr = null;
+                acc.SafeMemoryMappedViewHandle.AcquirePointer(ref basePtr);
+                try
+                {
+                    byte* p = basePtr + acc.PointerOffset;
+                    long sink = 0;
+                    for (long off = 0; off < bytes; off += 4096) sink += p[off];
+                    Assert.True(sink >= 0);
+                    long pws0 = PrivateWorkingSet();
+                    using var buf = HostVisibleBuffer.TryCreate(device, (nint)p, bytes);
+                    long pws1 = PrivateWorkingSet();
+                    _output.WriteLine($"{label,-34}: {Verdict(buf),-50} private WS +{(pws1 - pws0) / (1024 * 1024)} MiB of {bytes / (1024 * 1024)}");
+                }
+                finally { acc.SafeMemoryMappedViewHandle.ReleasePointer(); }
+            }
+
+            Probe("CoW mapping, CoW view", MemoryMappedFileAccess.CopyOnWrite, MemoryMappedFileAccess.CopyOnWrite, FileAccess.Read);
+            Probe("read-only mapping, CoW view", MemoryMappedFileAccess.Read, MemoryMappedFileAccess.CopyOnWrite, FileAccess.Read);
+            Probe("read-write mapping, read view", MemoryMappedFileAccess.ReadWrite, MemoryMappedFileAccess.Read, FileAccess.ReadWrite);
+            Probe("read-write mapping, read-write view", MemoryMappedFileAccess.ReadWrite, MemoryMappedFileAccess.ReadWrite, FileAccess.ReadWrite);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch (IOException) { /* best effort */ }
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MemCountersEx2
+    {
+        public uint Cb, PageFaultCount;
+        public nuint PeakWorkingSetSize, WorkingSetSize, QuotaPeakPagedPoolUsage, QuotaPagedPoolUsage, QuotaPeakNonPagedPoolUsage,
+            QuotaNonPagedPoolUsage, PagefileUsage, PeakPagefileUsage, PrivateUsage, PrivateWorkingSetSize;
+        public ulong SharedCommitUsage;
+    }
+
+    [DllImport("psapi.dll")]
+    private static extern bool GetProcessMemoryInfo(nint process, ref MemCountersEx2 counters, uint cb);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private unsafe struct MemoryListInfo
+    {
+        public nuint ZeroPageCount, FreePageCount, ModifiedPageCount, ModifiedNoWritePageCount, BadPageCount;
+        public fixed ulong PageCountByPriority[8];
+        public fixed ulong RepurposedPagesByPriority[8];
+        public nuint ModifiedPageCountPageFile;
+    }
+
+    [DllImport("ntdll.dll")]
+    private static extern int NtQuerySystemInformation(int infoClass, ref MemoryListInfo info, int length, out int returnLength);
+
+    /// <summary>System-wide modified pages bound for a mapped file (not the pagefile), in bytes; -1 when unavailable.</summary>
+    private static unsafe long ModifiedFileBytes()
+    {
+        var info = default(MemoryListInfo);
+        return NtQuerySystemInformation(80 /* SystemMemoryListInformation */, ref info, sizeof(MemoryListInfo), out _) == 0
+            ? (long)(info.ModifiedPageCount - info.ModifiedPageCountPageFile) * 4096
+            : -1;
+    }
+
+    private static long PrivateWorkingSet()
+    {
+        var c = new MemCountersEx2 { Cb = (uint)Marshal.SizeOf<MemCountersEx2>() };
+        return GetProcessMemoryInfo(System.Diagnostics.Process.GetCurrentProcess().Handle, ref c, c.Cb) ? (long)c.PrivateWorkingSetSize : -1;
     }
 
     /// <summary>

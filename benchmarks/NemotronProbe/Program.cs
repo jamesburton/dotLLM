@@ -14,8 +14,30 @@ using DotLLM.Tokenizers;
 using DotLLM.Tokenizers.ChatTemplates;
 using DotLLM.Core.Configuration;
 
-internal static class Program
+internal static partial class Program
 {
+    // #1190: commit charge (PrivateMemorySize64) counts copy-on-write views of the GGUF that never get a private page;
+    // the private working set is the physical cost.
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct MemCountersEx2
+    {
+        public uint Cb, PageFaultCount;
+        public nuint PeakWorkingSetSize, WorkingSetSize, QuotaPeakPagedPoolUsage, QuotaPagedPoolUsage, QuotaPeakNonPagedPoolUsage,
+            QuotaNonPagedPoolUsage, PagefileUsage, PeakPagefileUsage, PrivateUsage, PrivateWorkingSetSize;
+        public ulong SharedCommitUsage;
+    }
+
+    [System.Runtime.InteropServices.LibraryImport("psapi.dll", EntryPoint = "GetProcessMemoryInfo")]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static partial bool GetProcessMemoryInfo(nint process, ref MemCountersEx2 counters, uint cb);
+
+    private static long PrivateWorkingSet()
+    {
+        if (!OperatingSystem.IsWindows()) return -1;
+        var c = new MemCountersEx2 { Cb = (uint)System.Runtime.InteropServices.Marshal.SizeOf<MemCountersEx2>() };
+        return GetProcessMemoryInfo(Process.GetCurrentProcess().Handle, ref c, c.Cb) ? (long)c.PrivateWorkingSetSize : -1;
+    }
+
     private static int Main(string[] args)
     {
         Console.OutputEncoding = new System.Text.UTF8Encoding(false);
@@ -269,7 +291,7 @@ internal static class Program
                     string devMem = ms is DotLLM.Vulkan.VulkanTransformerModel vm ? $" deviceWeights+scratch={vm.ComputeMemoryBytes / 1048576.0:F0} MiB" : "";
                     Console.WriteLine($"steps {dev} [{Path.GetFileName(idFilesS[si])}]: prompt={promptLen} chunk={chunk} prefill={promptLen / prefillS:F1} tok/s "
                         + $"decode={decodeSteps}@{(decodeSteps > 0 ? decodeSteps / decodeS : 0):F2} tok/s kv={kvKind} {kvBytes / 1048576.0:F1} MiB (ctx {ctxLen}) "
-                        + $"private={proc.PrivateMemorySize64 / 1048576.0:F0} MiB peakWS={proc.PeakWorkingSet64 / 1048576.0:F0} MiB{devMem}");
+                        + $"private={proc.PrivateMemorySize64 / 1048576.0:F0} MiB privateWS={PrivateWorkingSet() / 1048576.0:F0} MiB peakWS={proc.PeakWorkingSet64 / 1048576.0:F0} MiB{devMem}");
                 }
             }
             return 0;
