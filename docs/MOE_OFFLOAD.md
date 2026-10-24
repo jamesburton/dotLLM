@@ -154,6 +154,11 @@ experts are either all resident or all on the CPU for decode; multi-token calls 
   runs gate / up / down per expert on its row range, one SwiGLU per range and one combine kernel that sums each token's
   rows in ascending expert order. The per-expert loop it replaces made one synchronous host copy per expert and one per
   row of mixed-slot buckets (365 ms per Flint layer at 512 tokens, now 27 ms); the results are bit-identical.
+- **Device-routed decode** (#1182): a resident layer on the fully grouped Q4_1 decode body builds its six pointer arrays
+  on the device from the top-k ids (`moe_build_grouped_ptrs`, experts in ascending id order, a per-layer device table of
+  expert pointers), so it neither waits for the routing nor reads it back: three link round trips fewer per resident
+  layer, bit-identical logits. CPU-expert layers still read the ids back (one round trip). `DOTLLM_CUDA_MOE_DEVICE_ROUTING=0`
+  restores host routing.
 - **Routing top-k** (#1202): `moe_sigmoid_topk_f32` / `moe_softmax_topk_f32` picked the top-k on one thread with a
   "claimed" inner loop, 210 us per token for 256 experts / top-6 on the 3060 (10 ms per decoded Flint token across 47
   layers). They now run k rounds of a block-wide arg-max with the same tie rule (lower index wins), a few microseconds.

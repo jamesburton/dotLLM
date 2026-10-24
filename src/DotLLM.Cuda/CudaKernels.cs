@@ -451,6 +451,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
     private readonly nint _moeWeightedRowsSumF32Func;
     private readonly nint _moeCombineBucketedF32Func;
     private readonly nint _moeAddF16F32Func;
+    private readonly nint _moeBuildGroupedPtrsFunc;
     private readonly nint _moeSigmoidTopkF32Func;
     private readonly nint _moePow2RescaleRowsF32Func;
     private readonly nint _moeScaleRowsF32Func;
@@ -1214,6 +1215,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
             _moeWeightedRowsSumF32Func = _moeFfnModule.TryGetFunction("moe_weighted_rows_sum_f32");
             _moeCombineBucketedF32Func = _moeFfnModule.TryGetFunction("moe_combine_bucketed_f32");
             _moeAddF16F32Func = _moeFfnModule.TryGetFunction("moe_add_f16_f32");
+            _moeBuildGroupedPtrsFunc = _moeFfnModule.TryGetFunction("moe_build_grouped_ptrs");
             _moePow2RescaleRowsF32Func = _moeFfnModule.TryGetFunction("moe_pow2_rescale_rows_f32");
             _moeScaleRowsF32Func = _moeFfnModule.TryGetFunction("moe_scale_rows_f32");
             _moeRenormTopkF32Func = _moeFfnModule.TryGetFunction("moe_renorm_topk_f32");
@@ -5638,6 +5640,36 @@ public sealed unsafe partial class CudaKernels : IDisposable
         void** args = stackalloc void*[] { &o, &i, &count, &f };
         CudaDriverApi.cuLaunchKernel(_moeAddF16F32Func, (uint)((n + BlockSize - 1) / BlockSize), 1, 1,
             BlockSize, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>True when <see cref="LaunchMoeBuildGroupedPtrs"/> is loaded (device-routed decode, #1182).</summary>
+    public bool HasMoeBuildGroupedPtrs => _moeBuildGroupedPtrsFunc != 0;
+
+    /// <summary>
+    /// Builds the grouped decode body's six pointer arrays (<c>[6, topK]</c> int64: gate W / out, up W / out, down W, slot)
+    /// on the device from the top-k ids of one token, experts in ascending id order, so no host read-back is needed.
+    /// </summary>
+    /// <param name="topkIdx">Device int32 top-k ids <c>[topK]</c>.</param>
+    /// <param name="expertTable">Device int64 expert pointers <c>[gate E | up E | down E]</c>.</param>
+    /// <param name="outPtrs">Device int64 output <c>[6 * topK]</c>.</param>
+    /// <param name="numExperts">Experts per bank.</param>
+    /// <param name="topK">Selected experts (at most <see cref="MoeCombineMaxTopK"/>).</param>
+    /// <param name="gateOut">Device base of the F16 gate outputs <c>[topK, I]</c>.</param>
+    /// <param name="upOut">Device base of the F16 up outputs <c>[topK, I]</c>.</param>
+    /// <param name="outRowBytes">Bytes of one output row.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchMoeBuildGroupedPtrs(nint topkIdx, nint expertTable, nint outPtrs, int numExperts, int topK,
+        nint gateOut, nint upOut, long outRowBytes, nint stream)
+    {
+        if (_moeBuildGroupedPtrsFunc == 0)
+            throw new InvalidOperationException("moe_build_grouped_ptrs not available. Recompile native/kernels/moe_ffn.cu to PTX.");
+        if ((uint)topK > MoeCombineMaxTopK)
+            throw new ArgumentOutOfRangeException(nameof(topK), topK, $"At most {MoeCombineMaxTopK} slots per token.");
+        nint ids = topkIdx, table = expertTable, o = outPtrs;
+        int e = numExperts, k = topK;
+        long g = gateOut, u = upOut, rb = outRowBytes;
+        void** args = stackalloc void*[] { &ids, &table, &o, &e, &k, &g, &u, &rb };
+        CudaDriverApi.cuLaunchKernel(_moeBuildGroupedPtrsFunc, 1, 1, 1, 32, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
     }
 
     // q4_1_gemv.cu: 8 rows (warps) per 256-thread block, 8 tokens per GEMM tile.

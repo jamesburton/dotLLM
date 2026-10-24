@@ -188,6 +188,37 @@ public sealed class CudaFlintCpuMoeTests : IDisposable
         Assert.Equal(0, CudaTransformerModel.PlanCpuMoeLayers(auto, routed, false, 500, 50, 50));
     }
 
+    /// <summary>
+    /// Device-routed decode (#1182): the resident grouped Q4_1 decode body with pointer arrays built on the device from the
+    /// top-k ids must give logits bit-identical to the host-routed body (same kernels, same expert order).
+    /// </summary>
+    [SkippableFact]
+    public void ResidentDecode_DeviceRouting_BitIdenticalToHostRouting()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
+        using var gguf = GgufFile.Open(_path);
+        ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var off = new MoeOffloadOptions { Mode = MoeOffloadMode.Off };
+        long before = CudaMoeFfn.DeviceRoutedCalls;
+        List<float[]> device = RunCuda(gguf, cfg, off, null);
+        Assert.True(CudaMoeFfn.DeviceRoutedCalls > before, "the device-routed body did not run");
+        List<float[]> host;
+        CudaMoeFfn.DeviceRoutingEnabled = false;
+        try
+        {
+            host = RunCuda(gguf, cfg, off, null);
+        }
+        finally
+        {
+            CudaMoeFfn.DeviceRoutingEnabled = true;
+        }
+        Assert.Equal(host.Count, device.Count);
+        for (int r = 0; r < host.Count; r++)
+            for (int i = 0; i < host[r].Length; i++)
+                Assert.True(BitConverter.SingleToInt32Bits(host[r][i]) == BitConverter.SingleToInt32Bits(device[r][i]),
+                    $"row {r} logit {i}: device-routed {device[r][i]} vs host-routed {host[r][i]}");
+    }
+
     [Fact]
     public void PlanSplit_BalancesLinkAgainstCpu()
     {

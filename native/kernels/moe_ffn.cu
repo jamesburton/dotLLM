@@ -405,6 +405,42 @@ extern "C" __global__ void __launch_bounds__(256) moe_add_f16_f32(
     if (i < n) out[i] = out[i] + __half2float(in[i]) * factor;
 }
 
+// ── moe_build_grouped_ptrs ──────────────────────────────────────────────────
+//
+// Device-side routing for the grouped decode body (#1182): writes the pointer arrays the host used to build from the
+// read-back top-k ids, straight from the device ids, so a resident MoE layer needs no host round trip. One thread:
+//   out[0*k + j] = gate weights of the j-th selected expert in ascending id order (the host loop's order)
+//   out[1*k + j] = gate_out + j * out_row_bytes        out[2*k + j] = up weights
+//   out[3*k + j] = up_out + j * out_row_bytes          out[4*k + j] = down weights
+//   out[5*k + j] = routing slot of that expert
+// table holds the layer's expert pointers as int64: [gate E | up E | down E]. Decode only: one token, k distinct ids.
+extern "C" __global__ void __launch_bounds__(32) moe_build_grouped_ptrs(
+    const int* __restrict__ topk_idx, const long long* __restrict__ table, long long* __restrict__ out,
+    const int num_experts, const int top_k, const long long gate_out, const long long up_out, const long long out_row_bytes)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    int ids[MOE_COMBINE_MAX_K], slots[MOE_COMBINE_MAX_K];
+    int n = 0;
+    for (int j = 0; j < top_k; j++)
+    {
+        const int e = topk_idx[j];
+        int i = n++;
+        while (i > 0 && ids[i - 1] > e) { ids[i] = ids[i - 1]; slots[i] = slots[i - 1]; i--; }
+        ids[i] = e;
+        slots[i] = j;
+    }
+    for (int j = 0; j < n; j++)
+    {
+        const int e = ids[j];
+        out[0 * top_k + j] = table[e];
+        out[1 * top_k + j] = gate_out + j * out_row_bytes;
+        out[2 * top_k + j] = table[num_experts + e];
+        out[3 * top_k + j] = up_out + j * out_row_bytes;
+        out[4 * top_k + j] = table[2 * num_experts + e];
+        out[5 * top_k + j] = slots[j];
+    }
+}
+
 // ── moe_renorm_topk_f32 ──────────────────────────────────────────────────
 //
 // In-place per-token renormalisation of the top-k weights so they sum to 1.0
