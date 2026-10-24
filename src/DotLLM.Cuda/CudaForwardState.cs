@@ -19,6 +19,9 @@ internal sealed class CudaForwardState : IDisposable
 
     private int _currentSeqLen;
 
+    /// <summary>Bumped whenever the sequence buffers are reallocated: a captured graph that uses them is then stale.</summary>
+    public int Generation { get; private set; }
+
     /// <summary>Total bytes currently allocated on GPU.</summary>
     public long AllocatedBytes { get; private set; }
 
@@ -162,6 +165,7 @@ internal sealed class CudaForwardState : IDisposable
 
         int newCapacity = (int)BitOperations.RoundUpToPowerOf2((uint)seqLen);
         FreeSequenceBuffers();
+        Generation++;
 
         int half = sizeof(ushort); // FP16 = 2 bytes
 

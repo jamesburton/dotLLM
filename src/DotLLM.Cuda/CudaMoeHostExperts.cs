@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Cpu.Threading;
 using DotLLM.Cuda.Interop;
@@ -21,6 +22,11 @@ internal sealed unsafe class CudaMoeHostExperts : IDisposable
     private readonly bool _packedLegacyExperts;
     private float* _host;          // [hidden rows | routed rows | top-k weights], F32
     private long _hostFloats;
+    private readonly List<GCHandle> _hostJobs = [];
+    private Exception? _hostJobError;
+
+    /// <summary>Bumped whenever the pinned activation buffer moves: a captured graph that copies through it is then stale.</summary>
+    public int Generation { get; private set; }
 
     /// <summary>Creates the CPU leg.</summary>
     /// <param name="threads">Total CPU threads of the leg, including the forward's own thread (1 = no pool).</param>
@@ -56,6 +62,63 @@ internal sealed unsafe class CudaMoeHostExperts : IDisposable
         fixed (float* p = rows)
             CudaDriverApi.cuMemcpyHtoDAsync_v2(routedOutF32, (nint)p, (nuint)((long)rows.Length * sizeof(float)), stream).ThrowOnError();
     }
+
+    /// <summary>
+    /// Graph-capturable <see cref="Run"/> (#1210): queues the CPU computation as a host function on <paramref name="stream"/>
+    /// (it reads the top-k ids and inputs that <see cref="EnqueueDownload"/> and the caller's id copy queued before it) and
+    /// the upload of its result after it, so the host never waits. The job stays registered until <see cref="ReleaseHostJobs"/>,
+    /// because a captured graph keeps calling it; an exception in it is kept for <see cref="ThrowHostJobError"/>.
+    /// </summary>
+    /// <param name="moe">The layer's CPU bundle.</param>
+    /// <param name="hostTopkIdx">Pinned host top-k ids <c>[seqLen, topK]</c>, filled by a copy queued before this call.</param>
+    /// <param name="seqLen">Tokens in the call.</param>
+    /// <param name="routedOutF32">Device F32 output <c>[seqLen, hidden]</c>; fully overwritten.</param>
+    /// <param name="stream">The stream.</param>
+    public void EnqueueRun(DotLLM.Models.Architectures.MoeLayerWeights moe, nint hostTopkIdx, int seqLen, nint routedOutF32,
+        nint stream)
+    {
+        var handle = GCHandle.Alloc(new HostJob(this, moe, hostTopkIdx, seqLen));
+        _hostJobs.Add(handle);
+        CudaDriverApi.cuLaunchHostFunc(stream, (nint)(delegate* unmanaged<nint, void>)&RunHostJob, GCHandle.ToIntPtr(handle))
+            .ThrowOnError();
+        long rowFloats = (long)seqLen * moe.HiddenSize;
+        CudaDriverApi.cuMemcpyHtoDAsync_v2(routedOutF32, (nint)(_host + rowFloats), (nuint)(rowFloats * sizeof(float)), stream)
+            .ThrowOnError();
+    }
+
+    /// <summary>Frees the jobs <see cref="EnqueueRun"/> registered. No graph that calls them may be launched afterwards.</summary>
+    public void ReleaseHostJobs()
+    {
+        foreach (var h in _hostJobs) h.Free();
+        _hostJobs.Clear();
+    }
+
+    /// <summary>Rethrows (once) an exception a host job raised on the driver thread.</summary>
+    public void ThrowHostJobError()
+    {
+        var e = Interlocked.Exchange(ref _hostJobError, null);
+        if (e is not null)
+            throw new InvalidOperationException("The CPU leg of a captured MoE decode failed.", e);
+    }
+
+    [UnmanagedCallersOnly]
+    private static void RunHostJob(nint userData)
+    {
+        var job = (HostJob)GCHandle.FromIntPtr(userData).Target!;
+        try
+        {
+            int total = job.SeqLen * job.Moe.NumExpertsPerTok;
+            job.Owner.Compute(job.Moe, new ReadOnlySpan<int>((void*)job.HostTopkIdx, total), job.SeqLen, firstExpert: 0, out _);
+        }
+        catch (Exception e)
+        {
+            // Nothing may unwind into the driver; the caller rethrows after the stream synchronises.
+            Interlocked.CompareExchange(ref job.Owner._hostJobError, e, null);
+        }
+    }
+
+    private sealed record HostJob(CudaMoeHostExperts Owner, DotLLM.Models.Architectures.MoeLayerWeights Moe, nint HostTopkIdx,
+        int SeqLen);
 
     /// <summary>
     /// Queues the copies of the call's expert input and top-k weights into pinned host memory on <paramref name="stream"/>;
@@ -169,11 +232,13 @@ internal sealed unsafe class CudaMoeHostExperts : IDisposable
         CudaDriverApi.cuMemHostAlloc(out nint p, (nuint)(cap * sizeof(float)), 0).ThrowOnError();
         _host = (float*)p;
         _hostFloats = cap;
+        Generation++;
     }
 
     /// <inheritdoc/>
     public void Dispose()
     {
+        ReleaseHostJobs();
         Stream?.Dispose();
         Stream = null;
         _pool?.Dispose();
