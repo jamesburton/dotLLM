@@ -144,21 +144,33 @@ public sealed class FlintVulkanParityTests
         Assert.Equal(expected, cache.AllocatedBytes);
     }
 
-    /// <summary>16-token prefill into the F16 cache, window 4 &lt; 16: the F16-KV GQA flash sink kernel on every layer (#1200).</summary>
+    /// <summary>
+    /// 16-token prefill into the F16 cache, window 4 &lt; 16: the F16-KV GQA flash sink kernel on every layer (#1200). Dense Q4_1 projections on
+    /// the device default, then forced onto Q8_1 activations (#1235), which must reach the Q4_1 MMQ on every dense projection.
+    /// </summary>
     [SkippableTheory]
-    [InlineData(64)]
-    [InlineData(128)]   // real Flint head_dim
-    public void Prefill_F16Kv_MatchesCpu(int headDim)
+    [InlineData(64, false)]
+    [InlineData(128, false)]   // real Flint head_dim
+    [InlineData(64, true)]
+    [InlineData(128, true)]
+    public void Prefill_F16Kv_MatchesCpu(int headDim, bool q8_1Prefill)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var fx = new Fixture(Q41(window: 4, headDim: headDim));
         int[] ids = Ids(16);
         float[] cpu = fx.CpuPrefill(ids);
         using var vk = VulkanTransformerModel.LoadFromGguf(fx.Gguf, fx.Config, spvDir);
+        if (q8_1Prefill) vk.Q4_1PrefillQ8_1 = true;
         float[] rows = VulkanRows(vk, ids, prefill: ids.Length, out var cache);
         using (cache) { }
-        AssertRowsAgree("prefill f16kv", rows, cpu, fx.Config.VocabSize);
+        AssertRowsAgree($"prefill f16kv q8_1={vk.Q4_1PrefillQ8_1}", rows, cpu, fx.Config.VocabSize);
         Assert.True(vk.SinkFlashDispatchCount > 0, "prefill did not reach the GQA flash sink kernel (#1200)");
+        if (q8_1Prefill)
+        {
+            Skip.If(vk.Q4_1MmqDispatchCount == 0, "no Q4_1 MMQ on this device (needs integer dot products).");
+            // Per layer: q, k, v, o and the dense FFN's gate, up, down or the shared expert's gate, up, down.
+            Assert.Equal(SyntheticFlintGguf.Layers * 7, vk.Q4_1MmqDispatchCount);
+        }
     }
 
     /// <summary>

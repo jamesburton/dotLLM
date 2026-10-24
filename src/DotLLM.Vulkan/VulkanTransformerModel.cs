@@ -2496,11 +2496,13 @@ public sealed partial class VulkanTransformerModel : IModel
             model._matmulQ4_1Mmvq = MatMulQ4_0MmvqKernel.TryCreate(device, spvDir, quant: QuantType.Q4_1);
             if (MatMulQ4_0GemmCoopmatKernel.IsSupportedOn(device, spvDir, QuantType.Q4_1))
                 model._matmulQ4_1GemmCoopmat = MatMulQ4_0GemmCoopmatKernel.Create(device, spvDir, QuantType.Q4_1);
-            if (Q4_1PrefillQ8_1Enabled && model._quantizeQ8_1Rows is not null)
+            string? q8_1Prefill = Environment.GetEnvironmentVariable(Q4_1PrefillQ8_1EnvVar);
+            if (q8_1Prefill != "0" && model._quantizeQ8_1Rows is not null)
             {
                 model._matmulQ4_1MmqCm1 = MatMulMmqCm1Kernel.TryCreate(device, spvDir, QuantType.Q4_1);
                 if (model._matmulQ4_1MmqCm1 is null) model._matmulQ4_1Mmq = MatMulQ4_1MmqKernel.TryCreate(device, spvDir);
             }
+            model.Q4_1PrefillQ8_1 = q8_1Prefill == "1" || (q8_1Prefill != "0" && model._matmulQ4_1GemmCoopmat is null);
         }
         if (Environment.GetEnvironmentVariable(DisableQ3KCoopmatEnvVar) != "1"
             && MatMulQ3KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
@@ -8011,8 +8013,8 @@ public sealed partial class VulkanTransformerModel : IModel
         QuantType.Q6_K => _matmulQ6KMmq is not null && (inputDim % MatMulQ6KMmqKernel.Q6KGroupSize) == 0,
         QuantType.IQ4_XS => _matmulIq4XsMmq is not null && (inputDim % MatMulIq4XsMmqKernel.Iq4XsGroupSize) == 0,
         QuantType.IQ4_NL => _matmulIq4NlMmq is not null && (inputDim % MatMulIq4NlMmqKernel.Iq4NlGroupSize) == 0,
-        QuantType.Q4_1 => _matmulQ4_1MmqCm1 is { } cm1 ? cm1.SupportsK(inputDim)
-            : _matmulQ4_1Mmq is not null && (inputDim % MatMulQ4_1MmqKernel.Q4_1GroupSize) == 0,
+        QuantType.Q4_1 => Q4_1PrefillQ8_1 && (_matmulQ4_1MmqCm1 is { } cm1 ? cm1.SupportsK(inputDim)
+            : _matmulQ4_1Mmq is not null && (inputDim % MatMulQ4_1MmqKernel.Q4_1GroupSize) == 0),
         _ => false,
     };
 
@@ -8181,11 +8183,17 @@ public sealed partial class VulkanTransformerModel : IModel
         return true;
     }
 
+    /// <summary>Load-time default of <see cref="Q4_1PrefillQ8_1"/>: <c>1</c> = on, <c>0</c> = off (kernels not even created), unset = auto.</summary>
+    public const string Q4_1PrefillQ8_1EnvVar = "DOTLLM_VK_Q4_1_PREFILL_Q8_1";
+
     /// <summary>
-    /// <c>DOTLLM_VK_Q4_1_PREFILL_Q8_1=0</c> keeps the Q4_1 prefill on the F16 coopmat / F32 GEMMs (F32 activations) instead of quantising the
-    /// activations to Q8_1 (#1235; A/B baseline). Read when the model is loaded.
+    /// Whether the Q4_1 prefill quantises its activations to Q8_1 and runs the MMQ (#1235: llama.cpp's and the CPU's #1159 contract) instead
+    /// of the F16 coopmat / F32 GEMMs on F32 activations. Effective only where the int8-coopmat or dp4a MMQ was created.
+    /// Auto default: on where the device has no Q4_1 F16 coopmat GEMM (RTX 3060: the dp4a MMQ is 8-12x the F32 GEMM at Flint's shapes);
+    /// off where it has one (8060S: that GEMM, tuned in #1161, ran Flint's dense pp512 projections in 2.12 ms against 2.40 ms for the
+    /// int8-coopmat MMQ, at equal wikitext PPL), so the default never slows prefill.
     /// </summary>
-    public static bool Q4_1PrefillQ8_1Enabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_Q4_1_PREFILL_Q8_1") != "0";
+    public bool Q4_1PrefillQ8_1 { get; set; }
 
     /// <summary>Q4_1 prefill projections that ran on Q8_1 activations (#1235; test hook).</summary>
     internal long Q4_1MmqDispatchCount { get; private set; }
