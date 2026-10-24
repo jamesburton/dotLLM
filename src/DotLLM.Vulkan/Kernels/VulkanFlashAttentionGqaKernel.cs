@@ -26,6 +26,10 @@ namespace DotLLM.Vulkan.Kernels;
 /// Scope: head_dim a multiple of 16 (cooperative-matrix) or 32 (scalar) up to 256, no ALiBi; every mask mode, sliding window,
 /// soft-cap and scale override is supported. <see cref="CanDispatch"/> says whether a shape qualifies.
 /// </para>
+/// <para>
+/// An instance created with <c>sinks: true</c> runs the <c>_sinks</c> twins (issue #1200): a fifth binding carries one learned logit per
+/// query head (gpt-oss, Flint) that joins the softmax denominator only, as in <see cref="VulkanGptOssKernels.RecordAttentionSinks"/>.
+/// </para>
 /// </remarks>
 public sealed class VulkanFlashAttentionGqaKernel : IDisposable
 {
@@ -60,15 +64,17 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
     private bool _disposed;
 
     private VulkanFlashAttentionGqaKernel(
-        VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, bool isCoopmat, VulkanKvStorage kvStorage)
+        VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, bool isCoopmat, VulkanKvStorage kvStorage,
+        bool hasSinks)
     {
         _device = device;
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 4);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: BindingCount(hasSinks));
         IsCoopmat = isCoopmat;
         KvStorage = kvStorage;
+        HasSinks = hasSinks;
     }
 
     /// <summary>Gets a value indicating whether this instance runs the cooperative-matrix implementation.</summary>
@@ -76,6 +82,9 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
 
     /// <summary>Gets the KV element format this instance reads.</summary>
     public VulkanKvStorage KvStorage { get; }
+
+    /// <summary>Gets a value indicating whether this instance runs the attention-sink twins (a sinks buffer is required).</summary>
+    public bool HasSinks { get; }
 
     /// <summary>Gets the number of dispatches recorded (test and profiling hook).</summary>
     public long Dispatches { get; private set; }
@@ -104,20 +113,23 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
     /// <param name="spvDir">Directory holding the SPIR-V blobs.</param>
     /// <param name="kvStorage">The KV element format to read.</param>
     /// <param name="allowCoopmat">False forces the scalar implementation.</param>
+    /// <param name="sinks">True builds the attention-sink twins.</param>
+    /// <param name="splitQ">Cooperative-matrix only: whether QK^T adds the Q lo-half term; null reads <see cref="SplitQEnvVar"/>.</param>
     /// <returns>The kernel, or null.</returns>
     public static VulkanFlashAttentionGqaKernel? TryCreate(
-        VulkanDevice device, string spvDir, VulkanKvStorage kvStorage = VulkanKvStorage.F32, bool allowCoopmat = true)
+        VulkanDevice device, string spvDir, VulkanKvStorage kvStorage = VulkanKvStorage.F32, bool allowCoopmat = true,
+        bool sinks = false, bool? splitQ = null)
     {
         if (IsDisabled()) return null;
         bool forceScalar = string.Equals(Environment.GetEnvironmentVariable(ForceScalarEnvVar), "1", StringComparison.Ordinal)
             || string.Equals(Environment.GetEnvironmentVariable(ForceScalarEnvVar), "scalar", StringComparison.OrdinalIgnoreCase);
         if (allowCoopmat && !forceScalar)
         {
-            var cm = TryCreateCoopmat(device, spvDir, kvStorage);
+            var cm = TryCreateCoopmat(device, spvDir, kvStorage, splitQ, sinks);
             if (cm is not null) return cm;
         }
 
-        return TryCreateScalar(device, spvDir, kvStorage);
+        return TryCreateScalar(device, spvDir, kvStorage, sinks);
     }
 
     /// <summary>Creates the cooperative-matrix implementation, or null when the device or build cannot run it.</summary>
@@ -125,9 +137,10 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
     /// <param name="spvDir">Directory holding the SPIR-V blobs.</param>
     /// <param name="kvStorage">The KV element format to read.</param>
     /// <param name="splitQ">Whether QK^T adds the Q lo-half term; null reads <see cref="SplitQEnvVar"/> (off unless <c>1</c>).</param>
+    /// <param name="sinks">True builds the attention-sink twin.</param>
     /// <returns>The kernel, or null.</returns>
     internal static VulkanFlashAttentionGqaKernel? TryCreateCoopmat(
-        VulkanDevice device, string spvDir, VulkanKvStorage kvStorage, bool? splitQ = null)
+        VulkanDevice device, string spvDir, VulkanKvStorage kvStorage, bool? splitQ = null, bool sinks = false)
     {
         if (!VulkanFlashAttentionCoopmatKernel.SupportsDevice(device)) return null;
 
@@ -145,15 +158,17 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
         uint gate = VulkanFlashAttentionCoopmatKernel.RequiresInvariantPv(device.VendorId);
         bool split = splitQ ?? Environment.GetEnvironmentVariable(SplitQEnvVar) == "1";
         ReadOnlySpan<uint> spec = [gate, 4 * sg, split ? 1u : 0u];
-        return TryBuild(device, spvDir, kvStorage.ShaderName(CoopmatShader), pin, spec, isCoopmat: true, kvStorage);
+        return TryBuild(device, spvDir, CoopmatShader, pin, spec, isCoopmat: true, kvStorage, sinks);
     }
 
     /// <summary>Creates the scalar implementation, or null when the build or device cannot run it.</summary>
     /// <param name="device">The device.</param>
     /// <param name="spvDir">Directory holding the SPIR-V blobs.</param>
     /// <param name="kvStorage">The KV element format to read.</param>
+    /// <param name="sinks">True builds the attention-sink twin.</param>
     /// <returns>The kernel, or null.</returns>
-    internal static VulkanFlashAttentionGqaKernel? TryCreateScalar(VulkanDevice device, string spvDir, VulkanKvStorage kvStorage)
+    internal static VulkanFlashAttentionGqaKernel? TryCreateScalar(
+        VulkanDevice device, string spvDir, VulkanKvStorage kvStorage, bool sinks = false)
     {
         // A row's 8 lanes must share a subgroup: every subgroup the driver may pick must have at least 8 lanes.
         uint minWidth = device.MinSubgroupSize != 0 ? device.MinSubgroupSize : device.SubgroupSize;
@@ -165,13 +180,18 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
             pin = want;
         }
 
-        return TryBuild(device, spvDir, kvStorage.ShaderName(ScalarShader), pin, default, isCoopmat: false, kvStorage);
+        return TryBuild(device, spvDir, ScalarShader, pin, default, isCoopmat: false, kvStorage, sinks);
     }
 
+    // The sink twins add binding 4 (the per-head sink logits).
+    private static int BindingCount(bool sinks) => sinks ? 5 : 4;
+
     private static VulkanFlashAttentionGqaKernel? TryBuild(
-        VulkanDevice device, string spvDir, string shaderName, uint requiredSubgroupSize, ReadOnlySpan<uint> spec,
-        bool isCoopmat, VulkanKvStorage kvStorage)
+        VulkanDevice device, string spvDir, string baseShader, uint requiredSubgroupSize, ReadOnlySpan<uint> spec,
+        bool isCoopmat, VulkanKvStorage kvStorage, bool sinks)
     {
+        string shaderName = kvStorage.ShaderName(sinks ? baseShader + "_sinks" : baseShader);
+        int bindingCount = BindingCount(sinks);
         string path = Path.Combine(spvDir, shaderName + ".spv");
         if (!File.Exists(path)) return null;
         VulkanModule? module = null;
@@ -179,16 +199,16 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
         try
         {
             module = VulkanModule.LoadFromFile(device, path);
-            Span<VkDescriptorBinding> bindings = stackalloc VkDescriptorBinding[4];
-            for (int i = 0; i < 4; i++) bindings[i] = new VkDescriptorBinding((uint)i);
+            Span<VkDescriptorBinding> bindings = stackalloc VkDescriptorBinding[bindingCount];
+            for (int i = 0; i < bindingCount; i++) bindings[i] = new VkDescriptorBinding((uint)i);
             pipeline = module.CreateComputePipeline(
                 entryPoint: "main",
                 bindings: bindings,
                 pushConstantBytes: PushConstantBytes,
                 requiredSubgroupSize: requiredSubgroupSize,
                 specConstants: spec);
-            nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
-            return new VulkanFlashAttentionGqaKernel(device, module, pipeline, pool, isCoopmat, kvStorage);
+            nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)bindingCount);
+            return new VulkanFlashAttentionGqaKernel(device, module, pipeline, pool, isCoopmat, kvStorage, sinks);
         }
         catch (VulkanException)
         {
@@ -217,16 +237,17 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
     /// <param name="scaleOverride">Score scale (0 = 1/sqrt(headDim)).</param>
     /// <param name="maskMode">Mask mode.</param>
     /// <param name="prefixLen">Hybrid-mask causal prefix length.</param>
+    /// <param name="sinks">Per-head sink logits, F32 <c>[numHeads]</c>; required exactly when <see cref="HasSinks"/>.</param>
     public void Launch(
         VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer v, VulkanDevice.Buffer output,
         int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
         int positionOffset = 0, int slidingWindow = 0, float softCap = 0.0f, float scaleOverride = 0.0f,
-        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
+        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0, VulkanDevice.Buffer? sinks = null)
     {
         using var ctx = _device.CreateSubmitContext();
         ctx.Begin();
         Record(ctx.CommandBuffer, q, k, v, output, seqQ, seqKv, numHeads, numKvHeads, headDim,
-            positionOffset, slidingWindow, softCap, scaleOverride, maskMode, prefixLen);
+            positionOffset, slidingWindow, softCap, scaleOverride, maskMode, prefixLen, sinks);
         ctx.SubmitAndWait();
     }
 
@@ -247,14 +268,20 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
     /// <param name="scaleOverride">Score scale (0 = 1/sqrt(headDim)).</param>
     /// <param name="maskMode">Mask mode.</param>
     /// <param name="prefixLen">Hybrid-mask causal prefix length.</param>
-    /// <exception cref="ArgumentException">The shape is outside <see cref="CanDispatch"/> or a buffer is too small.</exception>
+    /// <param name="sinks">Per-head sink logits, F32 <c>[numHeads]</c>; required exactly when <see cref="HasSinks"/>.</param>
+    /// <exception cref="ArgumentException">The shape is outside <see cref="CanDispatch"/>, a buffer is too small, or
+    /// <paramref name="sinks"/> does not match <see cref="HasSinks"/>.</exception>
     public unsafe void Record(
         nint cmdBuf,
         VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer v, VulkanDevice.Buffer output,
         int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
         int positionOffset = 0, int slidingWindow = 0, float softCap = 0.0f, float scaleOverride = 0.0f,
-        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
+        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0, VulkanDevice.Buffer? sinks = null)
     {
+        if (HasSinks != sinks is not null)
+            throw new ArgumentException(HasSinks ? "This sink kernel needs a sinks buffer." : "This kernel has no sink binding.", nameof(sinks));
+        if (sinks is not null && sinks.Size < (long)numHeads * sizeof(float))
+            throw new ArgumentException("Sinks buffer too small.", nameof(sinks));
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(seqQ);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(seqKv);
         ArgumentOutOfRangeException.ThrowIfNegative(positionOffset);
@@ -272,8 +299,8 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
         if (v.Size < kvBytes) throw new ArgumentException("V buffer too small.", nameof(v));
         if (output.Size < qBytes) throw new ArgumentException("Output buffer too small.", nameof(output));
 
-        Span<nint> buffers = stackalloc nint[4] { q.Handle, k.Handle, v.Handle, output.Handle };
-        nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
+        Span<nint> buffers = stackalloc nint[5] { q.Handle, k.Handle, v.Handle, output.Handle, sinks?.Handle ?? 0 };
+        nint descriptorSet = _descriptorCache.GetOrCreate(buffers[..BindingCount(HasSinks)]);
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout, 0, 1, descriptorSet, 0, 0);
 

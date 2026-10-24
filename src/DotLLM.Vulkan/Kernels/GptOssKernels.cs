@@ -166,7 +166,7 @@ internal sealed class VulkanGptOssKernels : IDisposable
     /// <summary>
     /// Causal GQA attention with per-head attention sinks (and optional sliding window). Same
     /// buffer/push layout as <see cref="AttentionF32Kernel"/> plus <paramref name="sinks"/>
-    /// <c>[numHeads]</c>. Always the shared-memory reference path: sinks are only wired here.
+    /// <c>[numHeads]</c>. The shared-memory reference path; prefill hosts prefer the GQA flash sink twin (#1200).
     /// <paramref name="kvStorage"/> = <see cref="VulkanKvStorage.F16"/> reads K / V stored as F16 in place (issue #1171).
     /// </summary>
     public void RecordAttentionSinks(nint cmdBuf,

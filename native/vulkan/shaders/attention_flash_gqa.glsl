@@ -19,6 +19,13 @@
 // KV storage (the .comp wrapper): KV_F16 reads F16 rows as packed words, the default F32 rows; either is converted to F32 in the
 // LDS tile load (2 x 16 KiB tiles, BC = 16), a per-tile transient, never a widened history. No 16-bit device feature is used. Requires subgroups of at least 8 lanes (host-checked).
 //
+// Attention sinks (SINKS, the _sinks wrappers; gpt-oss / Flint, issue #1200): binding 4 holds one learned logit per query head that
+// joins the softmax denominator but contributes no value. Seeding the online state with (max = sink, sum = 1, O = 0) is exact, and
+// the sink is not scaled (attention_sinks_f32.glsl, llama.cpp ggml_soft_max_ext).
+//
+// Sliding window: tiles wholly before the workgroup's first window start are skipped. A skipped tile is fully masked, so it would
+// leave the running state unchanged (corr = 1 or O = 0, tile sum 0): the skip is exact, and starts stay multiples of BC.
+//
 // Dispatch: local_size_x = 128, workgroups = (ceil(seqQ * G / 16), numKvHeads).
 
 #extension GL_KHR_shader_subgroup_basic   : require
@@ -54,6 +61,9 @@ vec4 loadV(uint i) { return v4[i]; }
 shared vec4 kT[BC * ROW_WORDS];
 shared vec4 vT[BC * ROW_WORDS];
 layout(set = 0, binding = 3, std430) writeonly buffer BufOut { vec4 out4[]; };    // [seq_q, num_heads * head_dim] F32
+#if defined(SINKS)
+layout(set = 0, binding = 4, std430) readonly  buffer BufSink { float sinks[]; };  // [num_heads] F32 sink logits
+#endif
 
 layout(push_constant) uniform PushConstants {
     uint  seqQ;
@@ -110,16 +120,26 @@ void main() {
         o[i] = vec4(0.0);
         if (rowLive && i < dSteps) qr[i] = q4[t * qStride4 + hq * hd4 + j + uint(TPR) * i];
     }
+#if defined(SINKS)
+    float runMax = rowLive ? sinks[hq] : NEG_INF;
+    float runSum = rowLive ? 1.0 : 0.0;
+#else
     float runMax = NEG_INF;
     float runSum = 0.0;
+#endif
 
     uint kvEnd = pc.seqKv;
     if (pc.maskMode == 0u) {
         uint lastPos = pc.positionOffset + (wgRowEnd - 1u) / G;
         kvEnd = min(pc.seqKv, lastPos + 1u);
     }
+    uint kvStart = 0u;
+    uint wgFirstPos = pc.positionOffset + wgRow0 / G;
+    if (pc.slidingWindow > 0u && wgFirstPos >= pc.slidingWindow) {
+        kvStart = min(((wgFirstPos - pc.slidingWindow + 1u) / uint(BC)) * uint(BC), kvEnd);
+    }
 
-    for (uint tStart = 0u; tStart < kvEnd; tStart += uint(BC)) {
+    for (uint tStart = kvStart; tStart < kvEnd; tStart += uint(BC)) {
         uint tileLen = min(uint(BC), kvEnd - tStart);
         // Stage K and V rows [tStart, tStart + tileLen); rows past tileLen and dims past headDim are never read.
         for (uint idx = gl_LocalInvocationIndex; idx < uint(BC * ROW_WORDS); idx += uint(WG_SIZE)) {

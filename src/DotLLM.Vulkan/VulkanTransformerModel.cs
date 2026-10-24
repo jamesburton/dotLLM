@@ -937,6 +937,9 @@ public sealed partial class VulkanTransformerModel : IModel
     private SimpleComputeKernel? _rowScaleMul;
     private VulkanSplitKvAttentionKernel? _splitKvAttentionKvF16;
     private VulkanSplitKvRowsAttentionKernel? _smallRowAttnKvF16;
+    // Sink prefill (#1200): the GQA flash kernel's attention-sink twins, per KV format. Null when unavailable or turned off.
+    private VulkanFlashAttentionGqaKernel? _sinkFlash;
+    private VulkanFlashAttentionGqaKernel? _sinkFlashKvF16;
     // KV storage of the cache the current forward reads (set at the top of Forward; F32 for cacheless forwards).
     private VulkanKvStorage _fwdKvStorage = VulkanKvStorage.F32;
     // MiMo-V2: pre-o_proj compaction of the K-shaped (zero-padded V) attention output to the V head dim, with attention_value_scale folded in.
@@ -1118,6 +1121,8 @@ public sealed partial class VulkanTransformerModel : IModel
                     + "(this would silently produce wrong logits).");
         }
         _gptOss = VulkanGptOssKernels.Create(_device, spvDir);
+        // gpt-oss has no q/k norm, so its scores are not bounded the way the #1148 F16-Q default assumes: keep the Q lo-half term.
+        InitSinkFlash(spvDir, splitQ: true);
 
         if (Config.RoPEConfig is { IsDenseYarnActive: true } rcfg)
         {
@@ -1154,6 +1159,27 @@ public sealed partial class VulkanTransformerModel : IModel
         _attnCompact = SimpleComputeKernel.Create(_device, spvDir, "attn_compact_scale_f32", buffers: 2, pushWords: 4);
         if (DefaultKvStorage == VulkanKvStorage.F16)
             InitKvF16Kernels(spvDir);
+
+        // Flint has per-head q/k RMSNorm (the #1148 F16-Q default holds). MiMo-V2 stays on the reference sink kernel: no parity fixture yet.
+        if (flint) InitSinkFlash(spvDir, splitQ: null);
+    }
+
+    /// <summary>Environment variable: <c>0</c> keeps sink prefill on the reference sink kernel (#1200 A/B).</summary>
+    internal const string SinkFlashEnvVar = "DOTLLM_VK_SINK_FLASH";
+
+    /// <summary>Gets the number of sink-attention dispatches served by the GQA flash sink twins (#1200).</summary>
+    public long SinkFlashDispatchCount { get; private set; }
+
+    /// <summary>
+    /// Creates the GQA flash kernel's attention-sink twins (#1200) for the KV formats this model can hold, so sink prefill stops running
+    /// the reference kernel (one workgroup per query and head over the whole KV range; a 512-row chunk at 32K tripped the TDR on Strix).
+    /// </summary>
+    private void InitSinkFlash(string spvDir, bool? splitQ)
+    {
+        if (Environment.GetEnvironmentVariable(SinkFlashEnvVar) == "0" || IsFlashAttentionDisabled()) return;
+        _sinkFlash = VulkanFlashAttentionGqaKernel.TryCreate(_device, spvDir, VulkanKvStorage.F32, sinks: true, splitQ: splitQ);
+        if (DefaultKvStorage == VulkanKvStorage.F16)
+            _sinkFlashKvF16 = VulkanFlashAttentionGqaKernel.TryCreate(_device, spvDir, VulkanKvStorage.F16, sinks: true, splitQ: splitQ);
     }
 
     /// <summary>
@@ -1168,7 +1194,13 @@ public sealed partial class VulkanTransformerModel : IModel
     {
         _kvF16Writer = VulkanKvF16WriteKernel.Create(_device, spvDir);
         if (!IsSplitDecodeDisabled())
+        {
             _splitKvAttentionKvF16 = VulkanSplitKvAttentionKernel.TryCreate(_device, spvDir, VulkanKvStorage.F16);
+
+            // #1200: the GQA-grouped split pass reads each K / V row once for the 8 query heads of a group (the per-head pass reads it
+            // 8 times); at 32K the full layers' decode attention dominated the step. DOTLLM_VULKAN_SPLITKV_GQA=0 restores the per-head pass.
+            _splitKvAttentionKvF16?.EnableGqaByDefault();
+        }
         if (_smallRowAttn is not null)
             _smallRowAttnKvF16 = VulkanSplitKvRowsAttentionKernel.TryCreate(_device, spvDir, VulkanKvStorage.F16);
     }
@@ -2789,8 +2821,8 @@ public sealed partial class VulkanTransformerModel : IModel
             return;
         }
 
-        // gpt-oss attention sinks (#737): ALWAYS the sink kernel (prefill + decode), never the
-        // split-KV / coopmat / flash variants - none of them carry the sink term.
+        // Attention sinks (#737): only the sink-aware kernels below (split-KV decode, the GQA flash sink twin for prefill (#1200), the
+        // reference sink kernel otherwise); the sink-free split-KV / coopmat / flash variants further down would drop the sink term.
         if (sinks is not null && _gptOss is not null && !_gptOssDbg.NoSinks)
         {
             if (softCap != 0.0f || maskMode != AttentionMaskMode.Causal)
@@ -2811,6 +2843,17 @@ public sealed partial class VulkanTransformerModel : IModel
                     return;
                 }
             }
+            // Prefill (#1200): the GQA flash kernel's sink twin (K / V tiles shared by the query heads of a group, window-clipped start).
+            var sinkFlash = kvF16 ? _sinkFlashKvF16 : _sinkFlash;
+            if (seqQ > 1 && sinkFlash is not null && sinkFlash.CanDispatch(headDim, numHeads, numKvHeads))
+            {
+                SinkFlashDispatchCount++;
+                ProfNote("attn_flash_sink", seqQ, seqKv, numHeads);
+                sinkFlash.Record(cmdBuf, q, k, v, output, seqQ, seqKv, numHeads, numKvHeads, headDim,
+                    positionOffset: positionOffset, slidingWindow: slidingWindow, scaleOverride: scaleOverride, sinks: sinks);
+                return;
+            }
+
             _gptOss.RecordAttentionSinks(cmdBuf, q, k, v, output, sinks,
                 seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, slidingWindow, scaleOverride,
                 kvF16 ? VulkanKvStorage.F16 : VulkanKvStorage.F32);
@@ -5055,6 +5098,8 @@ public sealed partial class VulkanTransformerModel : IModel
         _smallRowAttn?.InvalidateDescriptorCache();
         _smallRowAttnKvF16?.InvalidateDescriptorCache();
         _splitKvAttentionKvF16?.InvalidateDescriptorCache();
+        _sinkFlash?.InvalidateDescriptorCache();
+        _sinkFlashKvF16?.InvalidateDescriptorCache();
         _kvF16Writer?.InvalidateDescriptorCache();
         _rowPow2Downscale?.InvalidateDescriptorCache();
         _rowScaleMul?.InvalidateDescriptorCache();
@@ -8923,6 +8968,8 @@ public sealed partial class VulkanTransformerModel : IModel
         _smallRowAttn?.Dispose();
         _smallRowAttnKvF16?.Dispose();
         _splitKvAttentionKvF16?.Dispose();
+        _sinkFlash?.Dispose();
+        _sinkFlashKvF16?.Dispose();
         _kvF16Writer?.Dispose();
         _rowPow2Downscale?.Dispose();
         _rowScaleMul?.Dispose();

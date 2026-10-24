@@ -35,6 +35,13 @@
 // LDS (KV_F16): K/V tile 32 x 264 f16 (16.5 KiB) + scores 4 x 16 x 36 f32 (9 KiB) + P 4 x 16 x 40 f16 (5 KiB) = 30.5 KiB, under
 // the 32 KiB Strix limit.
 //
+// Attention sinks (SINKS, the _sinks wrappers; gpt-oss / Flint, issue #1200): binding 4 holds one learned logit per query head that
+// joins the softmax denominator but contributes no value. Seeding each row's online state with (max = sink, sum = 1, O = 0) is
+// exact; the sink is not scaled and enters the F32 sum unrounded (attention_sinks_f32.glsl, llama.cpp ggml_soft_max_ext).
+//
+// Sliding window: tiles wholly before the workgroup's first window start are skipped. A skipped tile is fully masked, so it would
+// leave the running state unchanged (corr = 1 or O = 0, tile sum 0): the skip is exact, and starts stay multiples of BC.
+//
 // Dispatch: local_size_x = 4 * subgroupSize (specialization constant 1, the subgroup size pinned at pipeline creation),
 //           workgroups = (ceil(seqQ * G / 64), numKvHeads).
 
@@ -81,6 +88,9 @@ layout(set = 0, binding = 1, std430) readonly  buffer BufK   { vec4 k4[]; };    
 layout(set = 0, binding = 2, std430) readonly  buffer BufV   { vec4 v4[]; };
 #endif
 layout(set = 0, binding = 3, std430) writeonly buffer BufOut { float outp[]; };   // [seq_q, num_heads * head_dim] F32
+#if defined(SINKS)
+layout(set = 0, binding = 4, std430) readonly  buffer BufSink { float sinks[]; };  // [num_heads] F32 sink logits
+#endif
 
 layout(push_constant) uniform PushConstants {
     uint  seqQ;
@@ -225,8 +235,18 @@ void main() {
     [[unroll]] for (uint j = 0u; j < uint(HD_CHUNKS); j++) {
         o[j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
     }
+#if defined(SINKS)
     float runMax = NEG_INF;
     float runSum = 0.0;
+    if (rowLive) {
+        uint tRow = mRow / G;
+        runMax = sinks[hkv * G + (mRow - tRow * G)];
+        runSum = 1.0;
+    }
+#else
+    float runMax = NEG_INF;
+    float runSum = 0.0;
+#endif
 
     // 2. KV walk. Causal early exit at the workgroup's last position; per strip, tiles past its own last position are skipped.
     uint kvEnd = pc.seqKv;
@@ -236,9 +256,13 @@ void main() {
     }
     uint wgFirstPos   = pc.positionOffset + wgRow0 / G;
     uint stripLastPos = pc.positionOffset + (stripLive ? (stripRowEnd - 1u) / G : 0u);
+    uint kvStart = 0u;
+    if (pc.slidingWindow > 0u && wgFirstPos >= pc.slidingWindow) {
+        kvStart = min(((wgFirstPos - pc.slidingWindow + 1u) / uint(BC)) * uint(BC), kvEnd);
+    }
 
-    fetchTile(0u, 0u, min(uint(BC), kvEnd), hkv, hd4, kvStride4);
-    for (uint tStart = 0u; tStart < kvEnd; tStart += uint(BC)) {
+    if (kvStart < kvEnd) fetchTile(0u, kvStart, min(uint(BC), kvEnd - kvStart), hkv, hd4, kvStride4);
+    for (uint tStart = kvStart; tStart < kvEnd; tStart += uint(BC)) {
         uint tileLen = min(uint(BC), kvEnd - tStart);
         bool tileSafe = (REQUIRE_INVARIANT_PV == 0u)
             || (tileLen == uint(BC) && (pc.maskMode == 1u || (tStart + uint(BC)) <= wgFirstPos + 1u));

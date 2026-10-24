@@ -51,9 +51,9 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     // buffer handles and invalidates descriptor sets) happens only in EnsureWindowCapacity, before recording.
     private readonly SlidingWindowRows? _rows;
 
-    // TILE_KV of the sink prefill kernel (attention_sinks_f32.glsl), which tiles the KV range from row 0. Ring bases stay multiples of it,
+    // TILE_KV of the reference sink kernel (attention_sinks_f32.glsl), which tiles the KV range from row 0. Ring bases stay multiples of it,
     // so the kernel sees the same tiles as on a full-length cache and the ring is bit-identical to it (the decode / small-row kernels
-    // split relative to the window start and do not care).
+    // split relative to the window start and do not care). The GQA flash sink twins (#1200) tile in 16 / 32 rows, which divide it.
     private const int KvTileRows = 256;
     private readonly VulkanDevice.Buffer? _moveScratch; // overlapping compaction moves stage through here (K then V half)
     private int _currentLength;
