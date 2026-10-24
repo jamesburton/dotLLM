@@ -46,8 +46,11 @@ public sealed class CudaQwen3HybridDenseGdnRowSnapshotTests : IDisposable
         try { Directory.Delete(_scratch, recursive: true); } catch { /* best-effort */ }
     }
 
+    // #1194: the read-only verify needs the register scan (dState 128), so the fixture takes the Bonsai 2 widths (Dims.Pq2_0) with
+    // 4 value heads over 2 key heads (a tiled head broadcast that a wrong kh mapping would miss).
     private string Fixture(string name) =>
-        SyntheticQwen35HybridDenseMtpGguf.Write(Path.Combine(_scratch, name), withMtp: true);
+        SyntheticQwen35HybridDenseMtpGguf.Write(Path.Combine(_scratch, name), withMtp: true, pq2_0Projections: true,
+            gdnKeyHeads: 2, gdnValueHeads: 4);
 
     /// <summary>
     /// Row selection on CUDA: restoring the snapshot of verify row <c>n</c> and probing the next
