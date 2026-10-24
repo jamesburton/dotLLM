@@ -95,9 +95,9 @@ public static unsafe class CudaMoeFfn
     internal static void ForwardWithHostExperts(
         nint hiddenF32, nint outputF32, int seqLen, CudaMoeLayerWeights weights,
         CudaMoeScratch scratch, nint cublasHandle, CudaKernels kernels, nint stream, CudaMoeHostExperts? hostExperts,
-        DotLLM.Models.Architectures.MoeLayerWeights? nextHostLayer = null)
+        DotLLM.Models.Architectures.MoeLayerWeights? nextHostLayer = null, bool graphSafe = false)
         => ForwardCore(hiddenF32, outputF32, seqLen, weights, scratch, cublasHandle, kernels, stream, null, false, null, hostExperts,
-            nextHostLayer);
+            nextHostLayer, graphSafe);
 
     /// <summary>Runs the expert body after architecture-specific routing populated scratch TopkIdx/TopkWeight.</summary>
     internal static void ForwardWithPrecomputedRouting(
@@ -111,7 +111,7 @@ public static unsafe class CudaMoeFfn
         CudaMoeScratch scratch, nint cublasHandle, CudaKernels kernels, nint stream,
         bool? forceUseI2SBatchedGemm, bool routingAlreadyComputed,
         Action<nint, nint, nint, int, int, int, nint>? packedQ4Projection, CudaMoeHostExperts? hostExperts,
-        DotLLM.Models.Architectures.MoeLayerWeights? nextHostLayer = null)
+        DotLLM.Models.Architectures.MoeLayerWeights? nextHostLayer = null, bool graphSafe = false)
     {
         if (!kernels.HasMoeKernels)
             throw new InvalidOperationException(
@@ -193,6 +193,21 @@ public static unsafe class CudaMoeFfn
             LaunchGroupedDownQ4_1(outputF32, scratch, kernels, stream, K, hidden, I);
             RunSharedExperts(hiddenF32, outputF32, seqLen, weights, scratch, cublasHandle, kernels, stream, packedQ4Projection);
             Interlocked.Increment(ref s_deviceRoutedCalls);
+            return;
+        }
+
+        // Graph-captured decode of a CPU-expert layer (#1210): the same copies, but the CPU leg runs as a host function on the
+        // stream instead of after a host sync. The shared expert is queued first, as on the eager path, so the sum is the same.
+        if (graphSafe)
+        {
+            if (seqLen != 1 || weights.HostExperts is not { } graphHost || hostExperts is null)
+                throw new InvalidOperationException("Only single-token calls of CPU-expert layers take the graph-safe MoE path.");
+            hostExperts.EnqueueDownload(graphHost, hiddenF32, scratch.TopkWeight, seqLen, stream);
+            CudaDriverApi.cuMemcpyDtoHAsync_v2(scratch.HostTopkIdx, scratch.TopkIdx,
+                (nuint)((long)totalAssign * sizeof(int)), stream).ThrowOnError();
+            RunSharedExperts(hiddenF32, outputF32, seqLen, weights, scratch, cublasHandle, kernels, stream, packedQ4Projection);
+            hostExperts.EnqueueRun(graphHost, scratch.HostTopkIdx, seqLen, scratch.DownBatch, stream);
+            kernels.LaunchMoeAxpyUnweightedF32(outputF32, scratch.DownBatch, seqLen, hidden, stream);
             return;
         }
 
@@ -590,6 +605,14 @@ public static unsafe class CudaMoeFfn
             && weights.DownProjQuantType == QuantizationType.Q4_1 && kernels.HasQ4_1Gemm && kernels.HasMoeGroupedDownQ4_1
             && (weights.MoeIntermediateSize & 31) == 0 && weights.DownExpsBiasF32 == 0 && !weights.UseSwiGluOai
             && packedQ4Projection is null;
+
+    /// <summary>
+    /// Whether a single-token call of this layer can be captured into a CUDA graph (#1210): a resident layer must take the
+    /// device-routed body (no host read-back), a CPU-expert layer the host-function CPU leg.
+    /// </summary>
+    internal static bool CanCaptureDecode(CudaMoeLayerWeights weights, CudaKernels kernels, bool hasHostLeg)
+        => weights.Precision == MoePrecision.Quantized
+            && (weights.HostExperts is not null ? hasHostLeg : CanRouteOnDevice(weights, kernels, null));
 
     /// <summary>Test hook: false runs multi-token calls through the per-expert loop (the bucketed body's reference).</summary>
     internal static bool BucketedEnabled { get; set; } = true;
@@ -1343,6 +1366,9 @@ public sealed unsafe class CudaMoeScratch : IDisposable
     /// <summary>Total allocated bytes across all scratch buffers.</summary>
     public long AllocatedBytes { get; private set; }
 
+    /// <summary>Bumped whenever the buffers are reallocated: a captured graph that uses them is then stale.</summary>
+    internal int Generation { get; private set; }
+
     internal nint Logits => _logits;
     internal nint TopkIdx => _topkIdx;
     internal nint TopkWeight => _topkWeight;
@@ -1412,6 +1438,7 @@ public sealed unsafe class CudaMoeScratch : IDisposable
             newCap = (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)newCap);
 
         Free();
+        Generation++;
 
         _capSeqLen = newCap;
         _capE = weights.NumExperts;

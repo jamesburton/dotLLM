@@ -344,6 +344,17 @@ internal static partial class CudaDriverApi
     internal static partial int cuMemcpyDtoHAsync_v2(
         nint dstHost, nint srcDevice, nuint byteCount, nint stream);
 
+    /// <summary>
+    /// Queues a host function on <paramref name="stream"/>: it runs on a driver thread once the work before it completes, and
+    /// the work after it waits for it. Captured into a graph as a host node. The function must not call the CUDA API.
+    /// </summary>
+    /// <param name="stream">The stream.</param>
+    /// <param name="fn">A <c>void(void*)</c> unmanaged function pointer.</param>
+    /// <param name="userData">Passed to <paramref name="fn"/>.</param>
+    /// <returns>The CUresult.</returns>
+    [LibraryImport(LibName)]
+    internal static partial int cuLaunchHostFunc(nint stream, nint fn, nint userData);
+
     [LibraryImport(LibName)]
     internal static partial int cuMemcpyDtoDAsync_v2(
         nint dstDevice, nint srcDevice, nuint byteCount, nint stream);

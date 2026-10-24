@@ -377,6 +377,24 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// <summary>The device weights (tests).</summary>
     internal CudaWeights DeviceWeights => _weights;
 
+    // MoE decode graph (#1210): the eager decode body captured whole, CPU-expert layers as host-function nodes.
+    private nint _moeGraph;
+    private nint _moeGraphExec;
+    private object? _moeGraphKey;
+    private object? _moeGraphWarmKv;       // the cache whose first decode step ran eagerly (allocates the lazy scratch)
+    private bool _moeGraphCapturing;
+    private bool _moeGraphFailed;
+    private bool? _moeGraphCapable;
+    private int _scratchGeneration;        // bumped when the MoE staging or the host-embedding staging moves
+    private nint _moeGraphScalarsHost;     // pinned int[4]: token, position, KV length
+
+    /// <summary>
+    /// Captures single-token decode of MoE models into a CUDA graph (#1210). On by default with <see cref="UseGraphCapture"/>;
+    /// <c>DOTLLM_CUDA_MOE_GRAPH=0</c> keeps the eager body (A/B).
+    /// </summary>
+    internal static bool MoeDecodeGraphEnabled { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_CUDA_MOE_GRAPH") != "0";
+
     /// <summary>
     /// Layers below this index keep their routed experts on the CPU (<c>--n-cpu-moe</c> semantics, #1187); 0 when every
     /// expert is device-resident. <see cref="MoeOffloadOptions.AllLayers"/> means every MoE layer.
@@ -1063,6 +1081,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         CudaDriverApi.cuMemAlloc_v2(out _moeStagingInF32, (nuint)bytes).ThrowOnError();
         CudaDriverApi.cuMemAlloc_v2(out _moeStagingOutF32, (nuint)bytes).ThrowOnError();
         _moeStagingCapacityElems = needed;
+        _scratchGeneration++;
     }
 
     /// <summary>
@@ -1208,10 +1227,22 @@ public sealed unsafe class CudaTransformerModel : IModel
                 return ForwardDecodeGraphQuantized(tokenIds, positions, deviceId, qKv);
         }
 
+        // MoE decode graph (#1210): the eager body below, captured whole. Resident layers route on the device (#1182) and
+        // CPU-expert layers run their CPU leg as a host-function node, so nothing in it waits for the host. Position-dependent
+        // arguments come from device scalars; NoPE, sinks and sliding windows are the eager body's own.
+        if (!_moeGraphCapturing && !_moeGraphFailed && UseGraphCapture && MoeDecodeGraphEnabled
+            && !suppressGraphCapture && deferredHostDest == 0 && tokenIds.Length == 1
+            && isMoe && !isMla && !ProfilingEnabled && _currentAdapter is null && DebugCaptureAttnLayer < 0
+            && kvCache is CudaKvCache moeKv && positions[0] == moeKv.CurrentLength
+            && _kernels.HasFusedRopeKvWriteKernel && CanCaptureMoeDecode()
+            && ForwardMoeDecodeGraph(tokenIds, positions, deviceId, moeKv) is { } graphLogits)
+            return graphLogits;
+        bool capturing = _moeGraphCapturing;
+
         // #338: a single-token decode reaching here did NOT use graph replay, whatever
         // UseGraphCapture says. Counted so a test can tell "capture engaged" from "capture
         // was requested and silently declined".
-        if (tokenIds.Length == 1) EagerDecodeCount++;
+        if (tokenIds.Length == 1 && !capturing) EagerDecodeCount++;
 
         _context.MakeCurrent();
         int seqLen = tokenIds.Length;
@@ -1243,13 +1274,16 @@ public sealed unsafe class CudaTransformerModel : IModel
             CudaDriverApi.cuEventRecord(_evtStart, s).ThrowOnError();
         }
 
-        // 1. Upload tokenIds + positions to device
-        fixed (int* tokenPtr = tokenIds)
-            CudaDriverApi.cuMemcpyHtoD_v2(_state.TokenIdsDevice, (nint)tokenPtr,
-                (nuint)(seqLen * sizeof(int))).ThrowOnError();
-        fixed (int* posPtr = positions)
-            CudaDriverApi.cuMemcpyHtoD_v2(_state.PositionsDevice, (nint)posPtr,
-                (nuint)(seqLen * sizeof(int))).ThrowOnError();
+        // 1. Upload tokenIds + positions to device (a captured MoE decode has them uploaded before each replay)
+        if (!capturing)
+        {
+            fixed (int* tokenPtr = tokenIds)
+                CudaDriverApi.cuMemcpyHtoD_v2(_state.TokenIdsDevice, (nint)tokenPtr,
+                    (nuint)(seqLen * sizeof(int))).ThrowOnError();
+            fixed (int* posPtr = positions)
+                CudaDriverApi.cuMemcpyHtoD_v2(_state.PositionsDevice, (nint)posPtr,
+                    (nuint)(seqLen * sizeof(int))).ThrowOnError();
+        }
 
         // Decode CUDA-graph capture/replay is handled by dev's dedicated
         // ForwardDecodeGraph / ForwardDecodeGraphQuantized early-return path
@@ -1259,7 +1293,7 @@ public sealed unsafe class CudaTransformerModel : IModel
 
         // 2. Embedding lookup → FP16 HiddenState
         if (_weights.TokenEmbedHost != 0)
-            GatherHostEmbeddings(tokenIds, hiddenSize, s);
+            GatherHostEmbeddings(tokenIds, hiddenSize, s, gather: !capturing);
         else
             _kernels.LaunchEmbeddingLookup(
                 _weights.TokenEmbedDevice, _weights.TokenEmbedQuantType,
@@ -1480,7 +1514,23 @@ public sealed unsafe class CudaTransformerModel : IModel
             bool noRope = Config.IsNoRopeLayer(layer);
             int layerRopeDim = noRope ? 0 : _ropeDim;
 
-            if (useFusedRopeKv)
+            if (useFusedRopeKv && capturing)
+            {
+                // Captured MoE decode (#1210): the KV row and the attention length come from device scalars, uploaded per replay.
+                var cudaKvCache = (CudaKvCache)kvCache!;
+                _kernels.LaunchFusedRopeKvWriteF16Dyn(
+                    qPtr, kPtr, vPtr,
+                    cudaKvCache.GetKeysPtr(layer), cudaKvCache.GetValuesPtr(layer),
+                    _state.PositionsDevice, _decodePosDevice,
+                    numHeads, numKvHeads, headDim,
+                    layerRopeDim, cudaKvCache.KvStrideOf(layer), _ropeTheta, effectiveRopeType, s,
+                    _ropeYarnInvFreq, _ropeYarnMscale);
+                _kernels.LaunchAttentionDyn(qPtr, cudaKvCache.GetKeysPtr(layer),
+                    cudaKvCache.GetValuesPtr(layer), _state.AttnOutput,
+                    seqLen, _decodeSeqKvDevice, numHeads, numKvHeads, headDim,
+                    _decodePosDevice, slidingWindow, s, lw.AttnSinksDevice);
+            }
+            else if (useFusedRopeKv)
             {
                 var cudaKvCache = (CudaKvCache)kvCache!;
                 cudaKvCache.FusedRopeAndUpdateDevice(
@@ -1699,7 +1749,8 @@ public sealed unsafe class CudaTransformerModel : IModel
                     kernels: _kernels,
                     stream: s,
                     hostExperts: _moeHost,
-                    nextHostLayer: layer + 1 < _weights.MoeLayers!.Length ? _weights.MoeLayers[layer + 1]?.HostExperts : null);
+                    nextHostLayer: layer + 1 < _weights.MoeLayers!.Length ? _weights.MoeLayers[layer + 1]?.HostExperts : null,
+                    graphSafe: capturing && moeLayer.HostExperts is not null);
                 if (resScale != 1f)
                     _kernels.LaunchScaleInplaceF32(_moeStagingOutF32, hiddenElems, resScale, s);
                 _kernels.LaunchConvertF32ToF16(_moeStagingOutF32, _state.NormOutput, hiddenElems, s);
@@ -1881,6 +1932,10 @@ public sealed unsafe class CudaTransformerModel : IModel
 
         // Capture dispatch-only time (all launches queued, before GPU wait).
         long dispatchEndTs = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
+        // A captured MoE decode ends at the F32 logits; the replay copies them out.
+        if (capturing)
+            return null;
 
         // #251 batched-decode path: enqueue a genuinely async D2H copy into caller-owned
         // PINNED host memory and return without synchronizing. Async D2H into pageable
@@ -2957,11 +3012,18 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// Gathers the call's F32 embedding rows from the host table (<see cref="CudaWeights.TokenEmbedHost"/>), converts them
     /// to F16 (round to nearest even, as the device lookup kernel does) and queues their upload into the hidden state.
     /// </summary>
-    private void GatherHostEmbeddings(ReadOnlySpan<int> tokenIds, int hiddenSize, nint stream)
+    private void GatherHostEmbeddings(ReadOnlySpan<int> tokenIds, int hiddenSize, nint stream, bool gather = true)
     {
         long elems = (long)tokenIds.Length * hiddenSize;
+        if (!gather)
+        {
+            // Captured decode (#1210): the rows were gathered into the staging before the replay; only the copy is a node.
+            CudaDriverApi.cuMemcpyHtoDAsync_v2(_state.HiddenState, _embedStaging, (nuint)(elems * sizeof(ushort)), stream).ThrowOnError();
+            return;
+        }
         if (elems > _embedStagingElems)
         {
+            _scratchGeneration++;
             if (_embedStaging != 0) CudaDriverApi.cuMemFreeHost(_embedStaging);
             _embedStaging = 0;
             long cap = (long)System.Numerics.BitOperations.RoundUpToPowerOf2((ulong)elems);
@@ -2979,7 +3041,133 @@ public sealed unsafe class CudaTransformerModel : IModel
             System.Numerics.Tensors.TensorPrimitives.ConvertToHalf(
                 new ReadOnlySpan<float>(table + (long)id * hiddenSize, hiddenSize), new Span<Half>(dst + (long)t * hiddenSize, hiddenSize));
         }
-        CudaDriverApi.cuMemcpyHtoDAsync_v2(_state.HiddenState, _embedStaging, (nuint)(elems * sizeof(ushort)), stream).ThrowOnError();
+        if (stream != 0)
+            CudaDriverApi.cuMemcpyHtoDAsync_v2(_state.HiddenState, _embedStaging, (nuint)(elems * sizeof(ushort)), stream).ThrowOnError();
+    }
+
+    /// <summary>Whether every MoE layer's single-token call is capturable (#1210); fixed for the model's lifetime.</summary>
+    private bool CanCaptureMoeDecode()
+    {
+        if (_moeGraphCapable is { } known)
+            return known;
+        bool ok = _weights.MoeLayers is not null;
+        if (ok)
+        {
+            foreach (var ml in _weights.MoeLayers!)
+            {
+                if (ml is not null && !CudaMoeFfn.CanCaptureDecode(ml, _kernels, _moeHost is not null))
+                {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        _moeGraphCapable = ok;
+        return ok;
+    }
+
+    /// <summary>
+    /// Replays (capturing first when needed) the MoE decode graph (#1210). The first decode step on a cache runs eagerly, so
+    /// every lazily allocated buffer exists before the capture; the graph is recaptured when the cache, the layer count or
+    /// any buffer it bakes in changes.
+    /// </summary>
+    /// <returns>The logits, or null to run the eager body this time.</returns>
+    private ITensor? ForwardMoeDecodeGraph(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+        CudaKvCache kvCache)
+    {
+        if (!ReferenceEquals(_moeGraphWarmKv, kvCache))
+        {
+            _moeGraphWarmKv = kvCache;
+            return null;
+        }
+
+        _context.MakeCurrent();
+        _state.EnsureCapacity(1);
+        EnsureGraphScalarBuffers();
+        nint s = _stream.Handle;
+        int pos = positions[0];
+        int seqKv = pos + 1;
+        // Pinned, so the four scalar uploads are queued without a link round trip each (the stream is idle here).
+        if (_moeGraphScalarsHost == 0)
+            CudaDriverApi.cuMemHostAlloc(out _moeGraphScalarsHost, 4 * sizeof(int), 0).ThrowOnError();
+        int* scalars = (int*)_moeGraphScalarsHost;
+        scalars[0] = tokenIds[0];
+        scalars[1] = pos;
+        scalars[2] = seqKv;
+        CudaDriverApi.cuMemcpyHtoDAsync_v2(_state.TokenIdsDevice, (nint)scalars, sizeof(int), s).ThrowOnError();
+        CudaDriverApi.cuMemcpyHtoDAsync_v2(_state.PositionsDevice, (nint)(scalars + 1), sizeof(int), s).ThrowOnError();
+        CudaDriverApi.cuMemcpyHtoDAsync_v2(_decodePosDevice, (nint)(scalars + 1), sizeof(int), s).ThrowOnError();
+        CudaDriverApi.cuMemcpyHtoDAsync_v2(_decodeSeqKvDevice, (nint)(scalars + 2), sizeof(int), s).ThrowOnError();
+        if (_weights.TokenEmbedHost != 0)
+            GatherHostEmbeddings(tokenIds, Config.HiddenSize, stream: 0);
+
+        int effectiveLayers = DebugMaxLayers switch
+        {
+            < 0 => 0,
+            0 => Config.NumLayers,
+            _ => Math.Min(DebugMaxLayers, Config.NumLayers),
+        };
+        var key = (kvCache, effectiveLayers, _state.Generation, _moeScratch?.Generation ?? -1, _moeHost?.Generation ?? -1,
+            _scratchGeneration);
+        if (_moeGraphExec == 0 || !key.Equals(_moeGraphKey))
+        {
+            DisposeMoeGraph();
+            if (!CaptureMoeDecodeGraph(tokenIds, positions, deviceId, kvCache))
+                return null;
+            GraphCaptureCount++;
+            _moeGraphKey = key;
+        }
+
+        CudaDriverApi.cuGraphLaunch(_moeGraphExec, s).ThrowOnError();
+        GraphReplayCount++;
+        _stream.Synchronize();
+        _moeHost?.ThrowHostJobError();
+        kvCache.AdvanceLengthForGraphDecode(seqKv);
+
+        var result = UnmanagedTensor.Allocate(new TensorShape(1, Config.VocabSize), DType.Float32, deviceId: -1);
+        CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, _state.LogitsF32, (nuint)(Config.VocabSize * sizeof(float))).ThrowOnError();
+        return result;
+    }
+
+    /// <summary>Captures the eager decode body; on failure logs once and leaves MoE decode eager for this model.</summary>
+    private bool CaptureMoeDecodeGraph(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, CudaKvCache kvCache)
+    {
+        nint s = _stream.Handle;
+        CudaDriverApi.cuStreamBeginCapture_v2(s, CudaDriverApi.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL).ThrowOnError();
+        _moeGraphCapturing = true;
+        Exception? error = null;
+        try
+        {
+            ForwardInternal(tokenIds, positions, deviceId, kvCache, suppressGraphCapture: false, deferredHostDest: 0);
+        }
+        catch (Exception e)
+        {
+            error = e;
+        }
+        finally
+        {
+            _moeGraphCapturing = false;
+        }
+
+        int rc = CudaDriverApi.cuStreamEndCapture(s, out _moeGraph);
+        if (error is null && rc == 0)
+            rc = CudaDriverApi.cuGraphInstantiateWithFlags(out _moeGraphExec, _moeGraph, 0);
+        if (error is null && rc == 0)
+            return true;
+
+        DisposeMoeGraph();
+        _moeGraphFailed = true;
+        Console.Error.WriteLine($"[dotLLM.Cuda] MoE decode graph capture failed ({error?.Message ?? $"CUresult {rc}"}); "
+            + "decode stays eager.");
+        return false;
+    }
+
+    private void DisposeMoeGraph()
+    {
+        if (_moeGraphExec != 0) { CudaDriverApi.cuGraphExecDestroy(_moeGraphExec); _moeGraphExec = 0; }
+        if (_moeGraph != 0) { CudaDriverApi.cuGraphDestroy(_moeGraph); _moeGraph = 0; }
+        _moeHost?.ReleaseHostJobs();
+        _moeGraphKey = null;
     }
 
     private static bool WillRetainHostWeights(TransformerWeights cpuWeights, ModelConfig config)
@@ -4422,6 +4610,8 @@ public sealed unsafe class CudaTransformerModel : IModel
         ReportLaunchProfile();
         _cudaLora?.Dispose();
         DisposeDecodeGraph();
+        DisposeMoeGraph();
+        if (_moeGraphScalarsHost != 0) { CudaDriverApi.cuMemFreeHost(_moeGraphScalarsHost); _moeGraphScalarsHost = 0; }
         if (_decodePosDevice != 0) { CudaDriverApi.cuMemFree_v2(_decodePosDevice); _decodePosDevice = 0; }
         if (_decodeSeqKvDevice != 0) { CudaDriverApi.cuMemFree_v2(_decodeSeqKvDevice); _decodeSeqKvDevice = 0; }
         if (_evtStart != 0) CudaDriverApi.cuEventDestroy_v2(_evtStart);

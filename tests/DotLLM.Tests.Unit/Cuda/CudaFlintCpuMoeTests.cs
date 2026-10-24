@@ -286,6 +286,51 @@ public sealed class CudaFlintCpuMoeTests : IDisposable
                     $"row {r} logit {i}: arena {packed[r][i]} vs one allocation per tensor {separate[r][i]}");
     }
 
+    /// <summary>
+    /// The captured MoE decode (#1210) replays the eager body: resident layers device-routed, CPU-expert layers as host-function
+    /// nodes, the NoPE full layer, sinks and the 4-token window read from the same kernels with device-side position and
+    /// length. Decode steps 2-6 run from the graph (step 1 is the eager warm-up that captures nothing) and must give logits
+    /// bit-identical to the eager body's, for every placement.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData("resident")]
+    [InlineData("n-cpu-moe-4")]
+    [InlineData("cpu-moe")]
+    public void MoeDecodeGraph_BitIdenticalToEager(string placement)
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
+        using var gguf = GgufFile.Open(_path);
+        ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var (options, cpuLayers) = placement switch
+        {
+            "resident" => (new MoeOffloadOptions { Mode = MoeOffloadMode.Off }, (int?)null),
+            "n-cpu-moe-4" => (new MoeOffloadOptions { CpuMoeLayers = 4, CpuThreads = 2 }, 2),
+            _ => (new MoeOffloadOptions { CpuMoeLayers = MoeOffloadOptions.AllLayers, CpuThreads = 1 }, 4),
+        };
+        int decodeSteps = Ids.Length - PrefillTokens;
+        List<float[]> graph = RunCuda(gguf, cfg, options, cpuLayers, stream: "stream-auto", check: m =>
+        {
+            Assert.Equal(1, m.GraphCaptureCount);
+            Assert.Equal(decodeSteps - 1, m.GraphReplayCount);
+            Assert.Equal(1, m.EagerDecodeCount);
+        });
+        List<float[]> eager;
+        CudaTransformerModel.MoeDecodeGraphEnabled = false;
+        try
+        {
+            eager = RunCuda(gguf, cfg, options, cpuLayers, stream: "stream-auto", check: m => Assert.Equal(0, m.GraphReplayCount));
+        }
+        finally
+        {
+            CudaTransformerModel.MoeDecodeGraphEnabled = true;
+        }
+        Assert.Equal(eager.Count, graph.Count);
+        for (int r = 0; r < eager.Count; r++)
+            for (int i = 0; i < eager[r].Length; i++)
+                Assert.True(BitConverter.SingleToInt32Bits(eager[r][i]) == BitConverter.SingleToInt32Bits(graph[r][i]),
+                    $"{placement} row {r} logit {i}: graph {graph[r][i]} vs eager {eager[r][i]}");
+    }
+
     [Fact]
     public void PlanSplit_BalancesLinkAgainstCpu()
     {
