@@ -7,6 +7,9 @@ public enum QuantGemvMultiFormat
 {
     /// <summary>Q4_K, 144-byte super-blocks.</summary>
     Q4_K,
+    /// <summary>Q4_K, four output rows per workgroup sharing the activation loads (#1193; the 1-row-per-workgroup kernel re-reads all NC activation
+    /// rows once per output row, which bounds it well below memory bandwidth at 4..8 columns on Strix Halo).</summary>
+    Q4_K_R4,
     /// <summary>Q5_K, 176-byte super-blocks.</summary>
     Q5_K,
     /// <summary>Q6_K, 210-byte super-blocks.</summary>
@@ -41,6 +44,7 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
     private readonly DescriptorSetCache _descriptorCache;
     private readonly int _buffersPerSet;
     private readonly int _blockBytes;
+    private readonly int _rowsPerGroup;
     private bool _disposed;
 
     /// <summary>The format this instance serves.</summary>
@@ -51,11 +55,13 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
     {
         Format = format;
         _device = device; _module = module; _descriptorPool = pool; _buffersPerSet = buffersPerSet; _blockBytes = blockBytes;
+        _rowsPerGroup = RowsPerGroup(format);
         var bindings = new VkDescriptorBinding[buffersPerSet];
         for (int i = 0; i < buffersPerSet; i++) bindings[i] = new VkDescriptorBinding((uint)i);
         for (int n = 2; n <= MaxColumns; n++)
             _pipelines[n] = module.CreateComputePipeline(
-                entryPoint: "main", bindings: bindings, pushConstantBytes: PushConstantBytes, requiredSubgroupSize: requiredSubgroupSize, specConstants: [(uint)n]);
+                entryPoint: "main", bindings: bindings, pushConstantBytes: PushConstantBytes, requiredSubgroupSize: requiredSubgroupSize,
+                specConstants: format == QuantGemvMultiFormat.Q4_K_R4 ? [(uint)n, (uint)_rowsPerGroup] : [(uint)n]);
         _descriptorCache = new DescriptorSetCache(device, pool, _pipelines[2]!, buffersPerSet: buffersPerSet);
     }
 
@@ -68,6 +74,7 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
     private static (string Spv, int BlockBytes, int Buffers, bool NeedsSubgroup, bool NeedsWave32) Describe(QuantGemvMultiFormat f) => f switch
     {
         QuantGemvMultiFormat.Q4_K => ("matmul_q4_k_gemv_f32_multi.spv", 144, 3, true, false),
+        QuantGemvMultiFormat.Q4_K_R4 => ("matmul_q4_k_gemv_f32_multi_r4.spv", 144, 3, true, false),
         QuantGemvMultiFormat.Q5_K => ("matmul_q5_k_gemv_f32_multi.spv", 176, 3, true, false),
         QuantGemvMultiFormat.Q6_K => ("matmul_q6_k_gemv_f32_multi.spv", 210, 3, true, false),
         QuantGemvMultiFormat.Q6_K_R2 => ("matmul_q6_k_gemv_f32_multi_r2.spv", 210, 3, true, false),
@@ -116,6 +123,14 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
         catch { module.Dispose(); throw; }
     }
 
+    /// <summary>Output rows per workgroup: 2 for Q6_K_R2; for Q4_K_R4 <c>DOTLLM_VK_Q4K_MULTI_ROWS</c> (1, 2, 4 or 8; default 2: 2, 4 and 8 measured within noise of each other and ~15-20 % over 1 on Strix Halo, #1193).</summary>
+    private static int RowsPerGroup(QuantGemvMultiFormat format) => format switch
+    {
+        QuantGemvMultiFormat.Q6_K_R2 => 2,
+        QuantGemvMultiFormat.Q4_K_R4 => int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_Q4K_MULTI_ROWS"), out int r) && r is 1 or 2 or 4 or 8 ? r : 2,
+        _ => 1,
+    };
+
     /// <summary>True when this kernel serves a matmul with <paramref name="n"/> rows and contraction <paramref name="k"/>.</summary>
     public static bool Accepts(int n, int k) => n >= 2 && n <= MaxColumns && k > 0 && (k % GroupSize) == 0;
 
@@ -144,7 +159,7 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
         Span<uint> pc = stackalloc uint[4] { (uint)m, (uint)k, (uint)blocksPerRow, (uint)((rowBytes + 3) / 4) };
         fixed (uint* p = pc)
             VulkanApi.vkCmdPushConstants(cmdBuf, pipe.Layout, VkShaderStageFlags.Compute, 0, PushConstantBytes, (nint)p);
-        VulkanApi.vkCmdDispatch(cmdBuf, Format == QuantGemvMultiFormat.Q6_K_R2 ? (uint)((m + 1) / 2) : (uint)m, 1, 1);
+        VulkanApi.vkCmdDispatch(cmdBuf, (uint)((m + _rowsPerGroup - 1) / _rowsPerGroup), 1, 1);
     }
 
     /// <inheritdoc/>

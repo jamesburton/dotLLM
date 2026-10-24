@@ -207,6 +207,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
     /// <summary>Drops every kernel's handle-keyed descriptor cache (after any buffer they may name was re-created or freed).</summary>
     private void InvalidateDescriptorCaches()
     {
+        // A pool reset would free descriptor sets the drafter's recorded-but-unsubmitted commands still use (#1193).
+        _dflashGpu?.Flush();
         _kernels.InvalidateAll();
         _hadamard?.InvalidateDescriptorCache();
         _embedGather?.InvalidateDescriptorCache();
@@ -423,6 +425,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             long maxLayerElements = Math.Max((long)config.IntermediateSize * hidden, 4L * hidden * hidden);
             model._iqF16Prefill = IqF16PrefillMatmul.TryCreate(device, spvDir, kernels.MatMulF16GemmCoopmat, maxLayerElements);
         }
+        model._spvDir = spvDir;
         return model;
     }
 
@@ -920,9 +923,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         }
         if (resized)
         {
-            _kernels.InvalidateAll();
-            _hadamard?.InvalidateDescriptorCache();
-            _embedGather?.InvalidateDescriptorCache();
+            InvalidateDescriptorCaches();
         }
         var sc = _mtpAbsorbScratch;
 
@@ -1044,10 +1045,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
     {
         if (ReferenceEquals(_lastMtpState, mtp))
             return;
-        _kernels.InvalidateAll();
-        _hadamard?.InvalidateDescriptorCache();
-        _embedGather?.InvalidateDescriptorCache();
-        _gdnSnapScan?.InvalidateDescriptorCache();
+        InvalidateDescriptorCaches();
         _lastMtpState = mtp;
     }
 
@@ -1100,9 +1098,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             {
                 _wcLogits = _device.Allocate((long)Config.VocabSize * sizeof(float));
                 // Same reasoning as EnsureMultiRowLogits: a recycled handle must not hit a stale set.
-                _kernels.InvalidateAll();
-                _hadamard?.InvalidateDescriptorCache();
-                _embedGather?.InvalidateDescriptorCache();
+                InvalidateDescriptorCaches();
             }
             return _wcLogits;
         }
@@ -1122,10 +1118,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         // into a dispatch that now means a different buffer. The FWHT and embed-gather kernels are
         // included even though neither binds this buffer: the handle we just freed could equally be
         // recycled into one of THEIR buffers on a later allocation.
-        _kernels.InvalidateAll();
-        _hadamard?.InvalidateDescriptorCache();
-        _embedGather?.InvalidateDescriptorCache();
-        _gdnSnapScan?.InvalidateDescriptorCache();
+        InvalidateDescriptorCaches();
         return _multiRowLogits;
     }
 
@@ -2245,10 +2238,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         // Freed handles can be recycled into the new buffers (or into any kernel's later
         // allocations) — invalidate every cache, as EnsureMultiRowLogits does. No command buffer
         // is open here.
-        _kernels.InvalidateAll();
-        _hadamard?.InvalidateDescriptorCache();
-        _embedGather?.InvalidateDescriptorCache();
-        _gdnSnapScan?.InvalidateDescriptorCache();
+        InvalidateDescriptorCaches();
     }
 
     private void FreeRowSnapshots()
@@ -2885,6 +2875,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
     {
         if (_disposed) return;
         _disposed = true;
+        // First: the drafter records with the trunk's kernels and buffers.
+        DisposeDFlash();
         Interlocked.Exchange(ref _spareGdnCheckpoint, null)?.Dispose();
         FreeRowSnapshots();
         _gdnSnapScan?.Dispose();
@@ -2899,7 +2891,6 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         _hadamard?.Dispose();
         _embedGather?.Dispose();
         _mtpHead?.Dispose();
-        DisposeDFlash();
         _mtpScratch?.Dispose();
         _mtpAbsorbScratch?.Dispose();
         _multiRowLogits?.Dispose();

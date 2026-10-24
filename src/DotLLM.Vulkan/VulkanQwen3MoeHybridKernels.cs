@@ -80,6 +80,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MatMulQuantGemvMultiKernel? MatMulQ5KMulti { get; private set; }
     /// <inheritdoc cref="MatMulQ4KMulti"/>
     public MatMulQuantGemvMultiKernel? MatMulQ6KMulti { get; private set; }
+    /// <summary>Q6_K multi-column GEMV with two output rows per workgroup (#996), used from 3 columns (#1193: the lm-head over a verify or a DFlash block).</summary>
+    public MatMulQuantGemvMultiKernel? MatMulQ6KMultiR2 { get; private set; }
     /// <inheritdoc cref="MatMulQ4KMulti"/>
     public MatMulQuantGemvMultiKernel? MatMulIq4XsMulti { get; private set; }
     /// <inheritdoc cref="MatMulQ4KMulti"/>
@@ -665,9 +667,13 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         kernels.MatMulF32Multi = MatMulF32GemvMultiKernel.TryCreate(device, spvDir);
         kernels.MatMulF16Multi = MatMulF16GemvMultiKernel.TryCreate(device, spvDir);
         kernels.MatMulQ8Multi = MatMulQ8_0GemvMultiKernel.TryCreate(device, spvDir);
-        kernels.MatMulQ4KMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q4_K);
+        // #1193: the 4-rows-per-workgroup variant unless DOTLLM_VK_Q4K_MULTI_R4=0 (A/B); same per-row arithmetic.
+        kernels.MatMulQ4KMulti = (Environment.GetEnvironmentVariable("DOTLLM_VK_Q4K_MULTI_R4") != "0"
+                ? MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q4_K_R4) : null)
+            ?? MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q4_K);
         kernels.MatMulQ5KMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q5_K);
         kernels.MatMulQ6KMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K);
+        kernels.MatMulQ6KMultiR2 = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K_R2);
         kernels.MatMulIq4XsMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.IQ4_XS);
         kernels.MatMulIq3SMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.IQ3_S);
         kernels.MatMulQ8MmvqMulti = MatMulQ8_0MmvqMultiKernel.TryCreate(device, spvDir);
@@ -920,6 +926,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulQ4KMulti?.InvalidateDescriptorCache();
         MatMulQ5KMulti?.InvalidateDescriptorCache();
         MatMulQ6KMulti?.InvalidateDescriptorCache();
+        MatMulQ6KMultiR2?.InvalidateDescriptorCache();
         MatMulIq4XsMulti?.InvalidateDescriptorCache();
         MatMulIq3SMulti?.InvalidateDescriptorCache();
         GdnQkvSplit?.InvalidateDescriptorCache();
@@ -1000,6 +1007,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulQ4KMulti?.Dispose();
         MatMulQ5KMulti?.Dispose();
         MatMulQ6KMulti?.Dispose();
+        MatMulQ6KMultiR2?.Dispose();
         MatMulIq4XsMulti?.Dispose();
         MatMulIq3SMulti?.Dispose();
         MatMulBf16.Dispose();

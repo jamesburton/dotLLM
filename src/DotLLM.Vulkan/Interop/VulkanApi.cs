@@ -318,6 +318,11 @@ internal static partial class VulkanApi
         vkCmdCopyBufferNative(commandBuffer, srcBuffer, dstBuffer, regionCount, in pRegions);
     }
 
+    /// <summary><c>vkCmdUpdateBuffer</c>: inline host data (at most 65536 bytes, 4-byte aligned) written by the transfer stage.</summary>
+    [LibraryImport(LibName)]
+    internal static partial void vkCmdUpdateBuffer(
+        nint commandBuffer, nint dstBuffer, ulong dstOffset, ulong dataSize, nint pData);
+
     // Inserts an execution / memory dependency between commands. Used on the
     // hot forward path to chain kernel dispatches without a host wait: a
     // SHADER_WRITE -> SHADER_READ memory barrier between kernels is enough to
