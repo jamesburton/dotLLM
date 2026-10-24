@@ -51,6 +51,7 @@ public sealed class EmbedGatherF32Kernel : IDisposable
     private static (string Spv, int GroupSize)? ShaderFor(QuantizationType format) => format switch
     {
         QuantizationType.Q8_0 => ("q8_0_embed_gather_f32.spv", 32),
+        QuantizationType.Q5_0 => ("q5_0_embed_gather_f32.spv", 32),   // #1225: Nemotron-3.5 Lightning
         QuantizationType.PQ2_0 => ("pq2_0_embed_gather_f32.spv", 128),
         QuantizationType.Q4_K => ("q4_k_embed_gather_f32.spv", 256),
         QuantizationType.Q6_K => ("q6_k_embed_gather_f32.spv", 256),

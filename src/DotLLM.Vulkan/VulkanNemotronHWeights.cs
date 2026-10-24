@@ -157,7 +157,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     /// <summary>
     /// nemotron_h_moe routed-MoE FFN layer (#375/#402): sigmoid router + selection bias, ungated relu-squared routed expert banks
     /// (up, down), and one ungated relu-squared shared expert. Expert banks are resident in a quantized form that has an
-    /// indexed matmul kernel: Q8_0 and Q5_1 as stored, Q5_0 repacked to Q5_1 at upload (bit-exact, <see cref="VulkanWeights.ConvertQ5_0BlocksToQ5_1"/>).
+    /// indexed matmul kernel: Q8_0, Q5_1 and Q5_0 (#1225) as stored.
     /// </summary>
     internal readonly struct MoeLayerBuffers
     {
@@ -725,7 +725,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     /// Uploads one nemotron_h_moe MoE layer. The routed banks stay quantized (the F32 expansion of the published files is
     /// ~100 GB), in a form an indexed matmul kernel reads: Q8_0, Q5_1 and the K-quants Q4_K / Q5_K / Q6_K as stored (#1045, the
     /// Nemotron 3.5 Bolt AD-Q4_K_M / AD-Q6_K banks), the IQ family as stored (#1057, NVIDIA's official IQ2_XXS Bolt file; needs integer dot
-    /// product), Q5_0 exactly repacked to Q5_1. Any other expert quantization throws instead of silently widening (MXFP4 / NVFP4 banks).
+    /// product), Q5_0 as stored (#1225). Any other expert quantization throws instead of silently widening (MXFP4 / NVFP4 banks).
     /// </summary>
     private static VulkanDevice.Buffer UploadExpertBank(
         VulkanDevice device, VulkanStagingBuffer staging, VulkanWeightArena arena,
@@ -748,6 +748,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
                 goto case QuantizationType.Q8_0;
             case QuantizationType.Q8_0:
             case QuantizationType.Q5_1:
+            case QuantizationType.Q5_0:   // #1225: kept packed (22-byte blocks); was repacked to 24-byte Q5_1
                 deviceQt = srcQt;
                 return UploadAsStored(device, staging, arena, srcPtr, srcRowBytes * rows, out bytes);
             case var _ when MoeIqFormats.FromQuantizationType(srcQt) is { } iq:
@@ -765,25 +766,9 @@ internal sealed class VulkanNemotronHWeights : IDisposable
                 deviceQt = srcQt;
                 return UploadAsStored(device, staging, arena, srcPtr, srcRowBytes * rows, out bytes);
             }
-            case QuantizationType.Q5_0:
-            {
-                deviceQt = QuantizationType.Q5_1;
-                long dstRowBytes = Dequantize.RowByteSize(kDim, QuantizationType.Q5_1);
-                bytes = dstRowBytes * rows;
-                var buf = arena.AllocateDeviceLocal(bytes);
-                int blocksPerRow = kDim / 32;
-                staging.UploadRows(rows, dstRowBytes, buf, 0, (chunkPtr, firstRow, rowCount) =>
-                {
-                    nint srcFirst = srcPtr + (nint)(firstRow * srcRowBytes);
-                    System.Threading.Tasks.Parallel.For(0, rowCount, r =>
-                        VulkanWeights.ConvertQ5_0BlocksToQ5_1(srcFirst + (nint)(r * srcRowBytes), chunkPtr + (nint)(r * dstRowBytes), blocksPerRow));
-                });
-                VulkanWeightImportPolicy.NoteStaged(srcPtr, rows * srcRowBytes, "repacked_q5_0_to_q5_1");
-                return buf;
-            }
             default:
                 throw new NotSupportedException(
-                    $"nemotron_h_moe {what} is {srcQt}: the Vulkan expert-indexed kernels cover Q8_0, Q5_1, Q5_0 (repacked to Q5_1), Q4_K / Q5_K / Q6_K " +
+                    $"nemotron_h_moe {what} is {srcQt}: the Vulkan expert-indexed kernels cover Q8_0, Q5_1, Q5_0, Q4_K / Q5_K / Q6_K " +
                     "and the IQ family (IQ1_M, IQ2_XXS / IQ2_XS / IQ2_S, IQ3_XXS / IQ3_S, IQ4_NL / IQ4_XS, Q2_0, Q4_0) only. " +
                     "Widening the banks to F32 would need ~100 GB. MXFP4 / NVFP4 expert banks are not implemented (#402, #1038); use --device cpu.");
         }

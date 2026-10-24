@@ -1386,12 +1386,16 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         public required MoeBroadcastF32Kernel Broadcast { get; init; }
         public required MoeWeightedScatterF32Kernel Scatter { get; init; }
         public required MoeIndexedMatmulQ5_1F32Kernel IndexedQ5_1 { get; init; }
+        /// <summary>F32-activation indexed kernel over PACKED Q5_0 banks (#1225).</summary>
+        public required MoeIndexedMatmulQ5_1F32Kernel IndexedQ5_0 { get; init; }
         public required MoeIndexedMatmulQ8_0F32Kernel IndexedQ8_0 { get; init; }
         public required MoeIndexedMatmulQ4_KF32Kernel IndexedQ4_K { get; init; }
         public required MoeIndexedMatmulQ5_KF32Kernel IndexedQ5_K { get; init; }
         public required MoeIndexedMatmulQ6_KF32Kernel IndexedQ6_K { get; init; }
         public QuantizeQ8_1RowsKernel? Quantize { get; init; }
         public MoeIndexedMatmulQ5_1MmvqKernel? MmvqQ5_1 { get; init; }
+        /// <summary>dp4a MMVQ over PACKED Q5_0 banks (#1225).</summary>
+        public MoeIndexedMatmulQ5_1MmvqKernel? MmvqQ5_0 { get; init; }
         public MoeIndexedMatmulQ8_0MmvqKernel? MmvqQ8_0 { get; init; }
         public MoeIndexedMatmulKQuantMmvqKernel? MmvqQ4_K { get; init; }
         public MoeIndexedMatmulKQuantMmvqKernel? MmvqQ5_K { get; init; }
@@ -1413,6 +1417,10 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         public MoeGroupedMatmulKQuantCoopmatKernel? GroupedCoopmatQ4_K { get; init; }
         public MoeGroupedMatmulKQuantCoopmatKernel? GroupedCoopmatQ5_K { get; init; }
         public MoeGroupedMatmulKQuantCoopmatKernel? GroupedCoopmatQ6_K { get; init; }
+        /// <summary>Grouped coopmat for Q5_1, Q5_0 and Q8_0 banks (#1225), 16-row tiles; null when unsupported.</summary>
+        public IMoeGroupedF32Kernel? GroupedCoopmatQ5_1 { get; init; }
+        public IMoeGroupedF32Kernel? GroupedCoopmatQ5_0 { get; init; }
+        public IMoeGroupedF32Kernel? GroupedCoopmatQ8_0 { get; init; }
 
         // IQ-family banks (#1057, NVIDIA's official IQ2_XXS Bolt file): one indexed dp4a MMVQ kernel per bank format present in the model
         // (mandatory: there is no F32-activation IQ arm) and, where the device has them, the grouped coopmat prefill kernels.
@@ -1442,6 +1450,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             QuantizationType.Q4_K => GroupedCoopmatQ4_K,
             QuantizationType.Q5_K => GroupedCoopmatQ5_K,
             QuantizationType.Q6_K => GroupedCoopmatQ6_K,
+            QuantizationType.Q5_1 => GroupedCoopmatQ5_1,
+            QuantizationType.Q5_0 => GroupedCoopmatQ5_0,
+            QuantizationType.Q8_0 => GroupedCoopmatQ8_0,
             _ => MoeIqFormats.FromQuantizationType(qt) is { } f && GroupedCoopmatIq.TryGetValue(f, out var iq) ? iq : null,
         };
 
@@ -1449,6 +1460,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         public bool CanMmvq(QuantizationType bankQt) => Quantize is not null && bankQt switch
         {
             QuantizationType.Q5_1 => MmvqQ5_1 is not null,
+            QuantizationType.Q5_0 => MmvqQ5_0 is not null,
             QuantizationType.Q8_0 => MmvqQ8_0 is not null,
             QuantizationType.Q4_K => MmvqQ4_K is not null,
             QuantizationType.Q5_K => MmvqQ5_K is not null,
@@ -1459,28 +1471,32 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         public void Invalidate()
         {
             Router.InvalidateDescriptorCache(); Broadcast.InvalidateDescriptorCache(); Scatter.InvalidateDescriptorCache();
-            IndexedQ5_1.InvalidateDescriptorCache(); IndexedQ8_0.InvalidateDescriptorCache();
+            IndexedQ5_1.InvalidateDescriptorCache(); IndexedQ5_0.InvalidateDescriptorCache(); IndexedQ8_0.InvalidateDescriptorCache();
             IndexedQ4_K.InvalidateDescriptorCache(); IndexedQ5_K.InvalidateDescriptorCache(); IndexedQ6_K.InvalidateDescriptorCache();
-            Quantize?.InvalidateDescriptorCache(); MmvqQ5_1?.InvalidateDescriptorCache(); MmvqQ8_0?.InvalidateDescriptorCache();
+            Quantize?.InvalidateDescriptorCache(); MmvqQ5_1?.InvalidateDescriptorCache(); MmvqQ5_0?.InvalidateDescriptorCache(); MmvqQ8_0?.InvalidateDescriptorCache();
             MmvqQ4_K?.InvalidateDescriptorCache(); MmvqQ5_K?.InvalidateDescriptorCache(); MmvqQ6_K?.InvalidateDescriptorCache();
             MmvqQ4_KMr?.InvalidateDescriptorCache(); MmvqQ5_KMr?.InvalidateDescriptorCache();
             ExpertOffsets?.InvalidateDescriptorCache(); BuildTileList?.InvalidateDescriptorCache();
             GatherGroupF32?.InvalidateDescriptorCache(); GatherGroupQ8_1?.InvalidateDescriptorCache(); ScatterGrouped?.InvalidateDescriptorCache();
             GroupedMmqQ4_K?.InvalidateDescriptorCache(); GroupedMmqQ5_K?.InvalidateDescriptorCache();
             GroupedCoopmatQ4_K?.InvalidateDescriptorCache(); GroupedCoopmatQ5_K?.InvalidateDescriptorCache(); GroupedCoopmatQ6_K?.InvalidateDescriptorCache();
+            (GroupedCoopmatQ5_1 as LegacyGroupedKernel)?.Kernel.InvalidateDescriptorCache(); (GroupedCoopmatQ8_0 as LegacyGroupedKernel)?.Kernel.InvalidateDescriptorCache();
+            (GroupedCoopmatQ5_0 as LegacyGroupedKernel)?.Kernel.InvalidateDescriptorCache();
             foreach (var kernel in MmvqIq.Values) kernel.InvalidateDescriptorCache();
             foreach (var kernel in GroupedCoopmatIq.Values) kernel.InvalidateDescriptorCache();
         }
 
         public void Dispose()
         {
-            Router.Dispose(); Broadcast.Dispose(); Scatter.Dispose(); IndexedQ5_1.Dispose(); IndexedQ8_0.Dispose();
+            Router.Dispose(); Broadcast.Dispose(); Scatter.Dispose(); IndexedQ5_1.Dispose(); IndexedQ5_0.Dispose(); IndexedQ8_0.Dispose();
             IndexedQ4_K.Dispose(); IndexedQ5_K.Dispose(); IndexedQ6_K.Dispose();
-            Quantize?.Dispose(); MmvqQ5_1?.Dispose(); MmvqQ8_0?.Dispose();
+            Quantize?.Dispose(); MmvqQ5_1?.Dispose(); MmvqQ5_0?.Dispose(); MmvqQ8_0?.Dispose();
             MmvqQ4_K?.Dispose(); MmvqQ5_K?.Dispose(); MmvqQ6_K?.Dispose(); MmvqQ4_KMr?.Dispose(); MmvqQ5_KMr?.Dispose();
             ExpertOffsets?.Dispose(); BuildTileList?.Dispose(); GatherGroupF32?.Dispose(); GatherGroupQ8_1?.Dispose(); ScatterGrouped?.Dispose();
             GroupedMmqQ4_K?.Dispose(); GroupedMmqQ5_K?.Dispose();
             GroupedCoopmatQ4_K?.Dispose(); GroupedCoopmatQ5_K?.Dispose(); GroupedCoopmatQ6_K?.Dispose();
+            (GroupedCoopmatQ5_1 as LegacyGroupedKernel)?.Kernel.Dispose(); (GroupedCoopmatQ8_0 as LegacyGroupedKernel)?.Kernel.Dispose();
+            (GroupedCoopmatQ5_0 as LegacyGroupedKernel)?.Kernel.Dispose();
             foreach (var kernel in MmvqIq.Values) kernel.Dispose();
             foreach (var kernel in GroupedCoopmatIq.Values) kernel.Dispose();
             Iq1?.Dispose();
@@ -1571,10 +1587,14 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             ExpertOffsets = g.Offsets, BuildTileList = g.Tiles, GatherGroupF32 = g.GatherF32, GatherGroupQ8_1 = g.GatherQ8,
             ScatterGrouped = g.Scatter, GroupedMmqQ4_K = g.Mmq4, GroupedMmqQ5_K = g.Mmq5,
             GroupedCoopmatQ4_K = g.Cm4, GroupedCoopmatQ5_K = g.Cm5, GroupedCoopmatQ6_K = g.Cm6,
+            GroupedCoopmatQ5_1 = g.Offsets is not null ? LegacyGroupedKernel.TryCreate(device, spvDir, MoeGroupedLegacyQuant.Q5_1, ones) : null,
+            GroupedCoopmatQ5_0 = g.Offsets is not null ? LegacyGroupedKernel.TryCreate(device, spvDir, MoeGroupedLegacyQuant.Q5_0, ones) : null,
+            GroupedCoopmatQ8_0 = g.Offsets is not null ? LegacyGroupedKernel.TryCreate(device, spvDir, MoeGroupedLegacyQuant.Q8_0, ones) : null,
             Router = MoeTopKSigmoidBiasF32Kernel.Create(device, spvDir),
             Broadcast = MoeBroadcastF32Kernel.Create(device, spvDir),
             Scatter = MoeWeightedScatterF32Kernel.Create(device, spvDir),
             IndexedQ5_1 = MoeIndexedMatmulQ5_1F32Kernel.Create(device, spvDir),
+            IndexedQ5_0 = MoeIndexedMatmulQ5_1F32Kernel.Create(device, spvDir, q5_0: true),
             IndexedQ8_0 = MoeIndexedMatmulQ8_0F32Kernel.Create(device, spvDir),
             IndexedQ4_K = MoeIndexedMatmulQ4_KF32Kernel.Create(device, spvDir),
             IndexedQ5_K = MoeIndexedMatmulQ5_KF32Kernel.Create(device, spvDir),
@@ -1585,6 +1605,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                     ?? (iqBanks ? throw new NotSupportedException("nemotron_h_moe IQ expert banks need the Q8_1 row quantizer (quantize_q8_1_rows.spv missing).") : null)
                 : null,
             MmvqQ5_1 = mmvq ? MoeIndexedMatmulQ5_1MmvqKernel.TryCreate(device, spvDir) : null,
+            MmvqQ5_0 = mmvq ? MoeIndexedMatmulQ5_1MmvqKernel.TryCreate(device, spvDir, q5_0: true) : null,
             MmvqQ8_0 = mmvq ? MoeIndexedMatmulQ8_0MmvqKernel.TryCreate(device, spvDir) : null,
             MmvqQ4_K = mmvq ? MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q4_K) : null,
             MmvqQ5_K = mmvq ? MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q5_K) : null,
@@ -1838,7 +1859,18 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     /// </summary>
     private static GroupedPath SelectGroupedPath(MoeKernelSet k, VulkanNemotronHWeights.MoeLayerBuffers m, int expertDim)
     {
-        if (!k.HasGroupedGlue || expertDim % 256 != 0 || m.MoeIntermediateSize % 256 != 0)
+        if (!k.HasGroupedGlue)
+            return GroupedPath.None;
+        // #1225: the legacy-quant (Q5_1 / Q8_0, 32-element block) kernels only need K in whole 64-element staging rounds; Nemotron-3.5
+        // Lightning's 2688 / 1856 widths are not 256-multiples.
+        if (IsLegacyGroupedBank(m.UpBankQuantType) && IsLegacyGroupedBank(m.DownBankQuantType))
+        {
+            return expertDim % MoeGroupedMatmulLegacyQuantCoopmatKernel.KGroup == 0
+                && m.MoeIntermediateSize % MoeGroupedMatmulLegacyQuantCoopmatKernel.KGroup == 0
+                && k.GatherGroupF32 is not null && k.GroupedCoopmat(m.UpBankQuantType) is not null && k.GroupedCoopmat(m.DownBankQuantType) is not null
+                ? GroupedPath.Coopmat : GroupedPath.None;
+        }
+        if (expertDim % 256 != 0 || m.MoeIntermediateSize % 256 != 0)
             return GroupedPath.None;
         if (k.GatherGroupQ8_1 is not null && k.Quantize is not null
             && k.GroupedMmq(m.UpBankQuantType) is not null && k.GroupedMmq(m.DownBankQuantType) is not null)
@@ -1848,6 +1880,35 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             && up.RowTile == down.RowTile)
             return GroupedPath.Coopmat;
         return GroupedPath.None;
+    }
+
+    private static bool IsLegacyGroupedBank(QuantizationType qt) => qt is QuantizationType.Q5_0 or QuantizationType.Q5_1 or QuantizationType.Q8_0;
+
+    /// <summary>
+    /// <see cref="IMoeGroupedF32Kernel"/> view of a <see cref="MoeGroupedMatmulLegacyQuantCoopmatKernel"/> (#1225): binds the all-ones
+    /// per-expert scale with the scale epilogue off, since nemotron_h_moe banks carry no output scale.
+    /// </summary>
+    private sealed class LegacyGroupedKernel(MoeGroupedMatmulLegacyQuantCoopmatKernel kernel, VulkanDevice.Buffer unitScale) : IMoeGroupedF32Kernel
+    {
+        public MoeGroupedMatmulLegacyQuantCoopmatKernel Kernel { get; } = kernel;
+
+        public static LegacyGroupedKernel? TryCreate(VulkanDevice device, string spvDir, MoeGroupedLegacyQuant quant, VulkanDevice.Buffer unitScale)
+            => MoeGroupedMatmulLegacyQuantCoopmatKernel.IsSupportedOn(device, spvDir, quant)
+                ? new LegacyGroupedKernel(MoeGroupedMatmulLegacyQuantCoopmatKernel.Create(device, spvDir, quant), unitScale)
+                : null;
+
+        public int RowTile => Kernel.RowTile;
+
+        public int MTiles(int m) => Kernel.MTiles(m);
+
+        public void Record(nint cmdBuf, VulkanDevice.Buffer bank, VulkanDevice.Buffer packedInput, VulkanDevice.Buffer offsets,
+            VulkanDevice.Buffer output, int m, int k, int rows, int numExperts, int maxRowsPerExpert = 0)
+            => Kernel.Record(cmdBuf, bank, packedInput, offsets, output, unitScale, applyScale: false, m, k, rows, numExperts, maxRowsPerExpert);
+
+        public void RecordIndirect(nint cmdBuf, VulkanDevice.Buffer bank, VulkanDevice.Buffer packedInput, VulkanDevice.Buffer offsetsAndTiles,
+            VulkanDevice.Buffer output, VulkanDevice.Buffer dispatchArgs, int dispatchArgsOffset, int m, int k, int rows, int numExperts)
+            => Kernel.RecordIndirect(cmdBuf, bank, packedInput, offsetsAndTiles, output, unitScale, applyScale: false, dispatchArgs, dispatchArgsOffset,
+                m, k, rows, numExperts);
     }
 
     /// <summary>
@@ -1980,6 +2041,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                 case QuantizationType.Q5_1:
                     k.MmvqQ5_1!.Record(cmdBuf, bank, xq, xds, indices, y, k.UnitScale, m: mDim, k: kDim, n: rows, numExperts: numExperts);
                     break;
+                case QuantizationType.Q5_0:
+                    k.MmvqQ5_0!.Record(cmdBuf, bank, xq, xds, indices, y, k.UnitScale, m: mDim, k: kDim, n: rows, numExperts: numExperts);
+                    break;
                 case QuantizationType.Q8_0:
                     k.MmvqQ8_0!.Record(cmdBuf, bank, xq, xds, indices, y, m: mDim, k: kDim, n: rows, numExperts: numExperts);
                     break;
@@ -2008,6 +2072,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         {
             case QuantizationType.Q5_1:
                 k.IndexedQ5_1.Record(cmdBuf, bank, x, indices, y, k.UnitScale, m: mDim, k: kDim, n: rows, numExperts: numExperts);
+                break;
+            case QuantizationType.Q5_0:
+                k.IndexedQ5_0.Record(cmdBuf, bank, x, indices, y, k.UnitScale, m: mDim, k: kDim, n: rows, numExperts: numExperts);
                 break;
             case QuantizationType.Q8_0:
                 k.IndexedQ8_0.Record(cmdBuf, bank, x, indices, y, m: mDim, k: kDim, n: rows, numExperts: numExperts);

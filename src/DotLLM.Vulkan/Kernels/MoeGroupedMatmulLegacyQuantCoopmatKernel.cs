@@ -9,6 +9,8 @@ public enum MoeGroupedLegacyQuant
     Q5_1,
     /// <summary>Q8_0, 34-byte blocks (fp16 d, 32 x int8).</summary>
     Q8_0,
+    /// <summary>Q5_0, 22-byte blocks (fp16 d, 5th bits, nibbles) kept packed - Nemotron-3.5 Lightning expert banks (#1225).</summary>
+    Q5_0,
     /// <summary>MXFP4, 17-byte blocks (u8 E8M0 scale, 16 bytes of packed nibbles) - gpt-oss expert banks (#789). Supports a per-expert bias epilogue.</summary>
     Mxfp4,
 }
@@ -50,6 +52,7 @@ public sealed class MoeGroupedMatmulLegacyQuantCoopmatKernel : IDisposable
     {
         MoeGroupedLegacyQuant.Q5_1 => "moe_grouped_matmul_q5_1_coopmat_m64.spv",
         MoeGroupedLegacyQuant.Mxfp4 => "moe_grouped_matmul_mxfp4_coopmat_m64.spv",
+        MoeGroupedLegacyQuant.Q5_0 => "moe_grouped_matmul_q5_0_coopmat_m64.spv",
         _ => "moe_grouped_matmul_q8_0_coopmat_m64.spv",
     };
 
@@ -57,6 +60,7 @@ public sealed class MoeGroupedMatmulLegacyQuantCoopmatKernel : IDisposable
     {
         MoeGroupedLegacyQuant.Q5_1 => 24,
         MoeGroupedLegacyQuant.Mxfp4 => 17,
+        MoeGroupedLegacyQuant.Q5_0 => 22,
         _ => 34,
     };
 
@@ -155,7 +159,12 @@ public sealed class MoeGroupedMatmulLegacyQuantCoopmatKernel : IDisposable
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout, 0, 1, descriptorSet, 0, 0);
         // The Q5_1 shader strides rows in uints, the Q8_0 shader (34-byte blocks, not word aligned) in bytes.
-        uint rowStride = _quant == MoeGroupedLegacyQuant.Q5_1 ? (uint)(rowBytes / 4) : (uint)rowBytes;   // Q8_0 / MXFP4 blocks are not word aligned: byte stride
+        uint rowStride = _quant switch
+        {
+            MoeGroupedLegacyQuant.Q5_1 => (uint)(rowBytes / 4),
+            MoeGroupedLegacyQuant.Q5_0 => (uint)(rowBytes / 2),   // 22-byte blocks read as uint16
+            _ => (uint)rowBytes,
+        };   // Q8_0 / MXFP4 blocks are not word aligned: byte stride
         Span<uint> pc = stackalloc uint[8] { (uint)m, (uint)k, (uint)rows, (uint)numExperts, (uint)(k / 32), rowStride, tileList, applyBias ? 2u : applyScale ? 1u : 0u };
         fixed (uint* pcPtr = pc)
             VulkanApi.vkCmdPushConstants(cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute, 0, PushConstantBytes, (nint)pcPtr);
