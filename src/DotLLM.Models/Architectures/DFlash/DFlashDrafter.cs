@@ -29,14 +29,18 @@ internal sealed unsafe class DFlashDrafter : IDisposable
     private readonly GgufFile? _ownedFile;
     private readonly IDFlashBackend _backend;
 
-    /// <summary>A matrix in its stored type: rows of <see cref="In"/> elements, <see cref="Out"/> rows.</summary>
-    internal readonly record struct Matrix(nint Ptr, QuantizationType Qt, int In, int Out);
+    /// <summary>
+    /// A matrix in its stored type: rows of <see cref="In"/> elements, <see cref="Out"/> rows, and the per-tensor output scale of
+    /// its <c>X.scale</c> sibling (NVFP4, #1237; 1 when absent) that every product is multiplied by, as llama.cpp's <c>build_lora_mm</c>.
+    /// </summary>
+    internal readonly record struct Matrix(nint Ptr, QuantizationType Qt, int In, int Out, float Scale = 1f);
 
     internal sealed class Layer
     {
         public required float[] AttnNorm, FfnNorm, QNorm, KNorm;
         public required Matrix Q, K, V, O, Gate, Up, Down;
         public Matrix? AttnConvProj, FfnConvProj;
+        public float[]? Sinks;   // per query head (#1237: Nemotron drafters)
         public float[]? AttnConvBase, FfnConvBase; // [side][tap][hidden]
     }
 
@@ -96,6 +100,12 @@ internal sealed unsafe class DFlashDrafter : IDisposable
     /// <summary>True for a DFlash2 drafter (convolutions + selector).</summary>
     public bool IsDFlash2 => _selHidden is not null;
 
+    /// <summary>True for a LiLiCorr drafter (#1237): DFlash2 convolutions and the lattice head instead of the selector.</summary>
+    public bool IsLiLiCorr => _lilicorr is not null;
+
+    /// <summary>Rows of the per-sequence anchor-feature ring a LiLiCorr drafter keeps (<c>BlockSize + 1</c>, as llama.cpp).</summary>
+    public int AnchorRows => BlockSize + 1;
+
     /// <summary>The weights the backend runs (the selector codebooks stay on the host).</summary>
     public IEnumerable<Matrix> DeviceMatrices
     {
@@ -123,6 +133,7 @@ internal sealed unsafe class DFlashDrafter : IDisposable
             foreach (var l in _layers)
             {
                 yield return l.AttnNorm; yield return l.FfnNorm; yield return l.QNorm; yield return l.KNorm;
+                if (l.Sinks is { } s) yield return s;
                 if (l.AttnConvBase is { } a) yield return a;
                 if (l.FfnConvBase is { } f) yield return f;
             }
@@ -130,6 +141,9 @@ internal sealed unsafe class DFlashDrafter : IDisposable
     }
 
     private readonly int _ffn, _selRank, _selTopK, _vocab;
+    private readonly LiLiCorrHead? _lilicorr;
+    private float* _hiddenHost;   // LiLiCorr: the drafted rows' normed hidden states, read back for the head
+    private readonly float[] _anchorHost = [];
 
     // Backend scratch, sized for max(BlockSize, InjectChunkRows) rows, and host buffers for the selector.
     private readonly nint[] _buffers;
@@ -142,11 +156,13 @@ internal sealed unsafe class DFlashDrafter : IDisposable
     /// <param name="targetLayers">Target layer count.</param>
     /// <param name="targetVocab">Target vocabulary size.</param>
     /// <param name="backend">The kernels to run on; disposed with the drafter.</param>
+    /// <param name="hostPool">Host thread pool for a LiLiCorr head (null = the head's own pool); not owned.</param>
     /// <returns>The drafter, owning the file.</returns>
-    public static DFlashDrafter Open(string path, int targetHidden, int targetLayers, int targetVocab, IDFlashBackend backend)
+    public static DFlashDrafter Open(string path, int targetHidden, int targetLayers, int targetVocab, IDFlashBackend backend,
+        ComputeThreadPool? hostPool = null)
     {
         var file = GgufFile.Open(path);
-        try { return new DFlashDrafter(file, ownsFile: true, targetHidden, targetLayers, targetVocab, backend); }
+        try { return new DFlashDrafter(file, ownsFile: true, targetHidden, targetLayers, targetVocab, backend, hostPool); }
         catch { file.Dispose(); backend.Dispose(); throw; }
     }
 
@@ -157,7 +173,9 @@ internal sealed unsafe class DFlashDrafter : IDisposable
     /// <param name="targetLayers">Target layer count.</param>
     /// <param name="targetVocab">Target vocabulary size.</param>
     /// <param name="backend">The kernels to run on; disposed with the drafter.</param>
-    public DFlashDrafter(GgufFile file, bool ownsFile, int targetHidden, int targetLayers, int targetVocab, IDFlashBackend backend)
+    /// <param name="hostPool">Host thread pool for a LiLiCorr head (null = the head's own pool); not owned.</param>
+    public DFlashDrafter(GgufFile file, bool ownsFile, int targetHidden, int targetLayers, int targetVocab, IDFlashBackend backend,
+        ComputeThreadPool? hostPool = null)
     {
         _backend = backend;
         var md = file.Metadata;
@@ -165,8 +183,8 @@ internal sealed unsafe class DFlashDrafter : IDisposable
         if (arch != "dflash")
             throw new NotSupportedException($"Not a DFlash drafter GGUF (general.architecture = '{arch}').");
         if (file.TensorsByName.ContainsKey("d2t") || file.TensorsByName.ContainsKey("markov_w1.weight")
-            || md.ContainsKey("dflash.lilicorr_hidden_size") || md.ContainsKey("dflash.hyper_connection_count"))
-            throw new NotSupportedException("Reduced-vocabulary (d2t), DSpark, LiliCorr and DSV4 DFlash variants are not supported yet.");
+            || md.ContainsKey("dflash.hyper_connection_count"))
+            throw new NotSupportedException("Reduced-vocabulary (d2t), DSpark and DSV4 DFlash variants are not supported yet.");
         if (file.TensorsByName.ContainsKey("token_embd.weight") || file.TensorsByName.ContainsKey("output.weight"))
             throw new NotSupportedException("DFlash drafters with their own embeddings/output head are not supported yet; only target-shared heads.");
 
@@ -204,25 +222,8 @@ internal sealed unsafe class DFlashDrafter : IDisposable
         int ropeDim = (int)md.GetUInt32OrDefault("dflash.rope.dimension_count", (uint)HeadDim);
         if (ropeDim != HeadDim) throw new NotSupportedException("Partial-rotary DFlash drafters are not supported yet.");
 
-        Matrix M(string name, int expectIn, int expectOut)
-        {
-            if (!file.TensorsByName.TryGetValue(name, out var d))
-                throw new InvalidOperationException($"DFlash drafter is missing tensor '{name}'.");
-            int inDim = d.Shape[0], outDim = d.Shape.Rank > 1 ? d.Shape[1] : 1;
-            if (inDim != expectIn || outDim != expectOut)
-                throw new InvalidOperationException($"DFlash tensor '{name}' is [{inDim}, {outDim}], expected [{expectIn}, {expectOut}].");
-            return new Matrix(file.TensorDataPointer(d), d.QuantizationType, inDim, outDim);
-        }
-        float[] F(string name, int count)
-        {
-            if (!file.TensorsByName.TryGetValue(name, out var d))
-                throw new InvalidOperationException($"DFlash drafter is missing tensor '{name}'.");
-            if (d.Shape.ElementCount != count)
-                throw new InvalidOperationException($"DFlash tensor '{name}' has {d.Shape.ElementCount} elements, expected {count}.");
-            var dst = new float[count];
-            Dequantize.ToFloat32(file.TensorDataPointer(d), count, d.QuantizationType, dst);
-            return dst;
-        }
+        Matrix M(string name, int expectIn, int expectOut) => ReadMatrix(file, name, expectIn, expectOut);
+        float[] F(string name, int count) => ReadVector(file, name, count);
 
         int qDim = NumHeads * HeadDim, kvDim = NumKvHeads * HeadDim;
         _fc = M("fc.weight", TargetLayers.Length * HiddenSize, HiddenSize);
@@ -239,8 +240,9 @@ internal sealed unsafe class DFlashDrafter : IDisposable
         _layers = new Layer[nLayer];
         for (int i = 0; i < nLayer; i++)
         {
-            if (file.TensorsByName.ContainsKey($"blk.{i}.attn_sinks.weight") || file.TensorsByName.ContainsKey($"blk.{i}.attn_post_norm.weight"))
-                throw new NotSupportedException("DFlash drafters with attention sinks or post-norms are not supported yet.");
+            if (file.TensorsByName.ContainsKey($"blk.{i}.attn_post_norm.weight") || file.TensorsByName.ContainsKey($"blk.{i}.ffn_post_norm.weight")
+                || file.TensorsByName.ContainsKey($"blk.{i}.layer_output_scale.weight") || file.TensorsByName.ContainsKey($"blk.{i}.rope_freqs.weight"))
+                throw new NotSupportedException("DFlash drafters with post-norms, output scales or rope factors are not supported yet.");
             var l = new Layer
             {
                 AttnNorm = F($"blk.{i}.attn_norm.weight", HiddenSize),
@@ -254,6 +256,7 @@ internal sealed unsafe class DFlashDrafter : IDisposable
                 Gate = M($"blk.{i}.ffn_gate.weight", HiddenSize, _ffn),
                 Up = M($"blk.{i}.ffn_up.weight", HiddenSize, _ffn),
                 Down = M($"blk.{i}.ffn_down.weight", _ffn, HiddenSize),
+                Sinks = file.TensorsByName.ContainsKey($"blk.{i}.attn_sinks.weight") ? F($"blk.{i}.attn_sinks.weight", NumHeads) : null,
             };
             if (hasConv)
             {
@@ -273,6 +276,14 @@ internal sealed unsafe class DFlashDrafter : IDisposable
             _selHidden = M("selector_hidden.weight", HiddenSize, _selRank);
             _selPrev = M("selector_predecessor.weight", _selRank, targetVocab);
             _selNext = M("selector_successor.weight", _selRank, targetVocab);
+        }
+
+        if (LiLiCorrHead.IsPresent(file))
+        {
+            if (_selHidden is not null) throw new InvalidOperationException("A DFlash drafter cannot carry both a DFlash2 selector and a LiLiCorr head.");
+            _lilicorr = new LiLiCorrHead(file, HiddenSize, BlockSize, nLayer, Eps, targetVocab, hostPool);
+            _hiddenHost = (float*)NativeMemory.AlignedAlloc((nuint)((long)(BlockSize - 1) * HiddenSize * sizeof(float)), 64);
+            _anchorHost = new float[HiddenSize];
         }
 
         _ownedFile = ownsFile ? file : null;
@@ -300,6 +311,42 @@ internal sealed unsafe class DFlashDrafter : IDisposable
         _logits = (float*)NativeMemory.AlignedAlloc((nuint)((long)(bs - 1) * targetVocab * sizeof(float)), 64);
         _selGate = (float*)NativeMemory.AlignedAlloc((nuint)((long)bs * Math.Max(_selRank, 1) * sizeof(float)), 64);
         backend.Bind(this);
+    }
+
+    /// <summary>A matrix of <paramref name="file"/> in its stored type, shape-checked, with its optional <c>X.scale</c>.</summary>
+    /// <param name="file">The GGUF.</param>
+    /// <param name="name">Tensor name (<c>*.weight</c>).</param>
+    /// <param name="expectIn">Expected row length (GGUF ne0).</param>
+    /// <param name="expectOut">Expected row count (GGUF ne1).</param>
+    /// <returns>The matrix view (no copy).</returns>
+    internal static Matrix ReadMatrix(GgufFile file, string name, int expectIn, int expectOut)
+    {
+        if (!file.TensorsByName.TryGetValue(name, out var d))
+            throw new InvalidOperationException($"DFlash drafter is missing tensor '{name}'.");
+        int inDim = d.Shape[0], outDim = d.Shape.Rank > 1 ? d.Shape[1] : 1;
+        if (inDim != expectIn || outDim != expectOut)
+            throw new InvalidOperationException($"DFlash tensor '{name}' is [{inDim}, {outDim}], expected [{expectIn}, {expectOut}].");
+        string stem = name.EndsWith(".weight", StringComparison.Ordinal) ? name[..^".weight".Length] : name;
+        if (file.TensorsByName.ContainsKey(stem + ".input_scale"))
+            throw new NotSupportedException($"DFlash tensor '{name}' has an input scale; only output scales (X.scale) are supported.");
+        float scale = file.TensorsByName.ContainsKey(stem + ".scale") ? ReadVector(file, stem + ".scale", 1)[0] : 1f;
+        return new Matrix(file.TensorDataPointer(d), d.QuantizationType, inDim, outDim, scale);
+    }
+
+    /// <summary>A small tensor of <paramref name="file"/> as F32 (norms, biases, conv bases).</summary>
+    /// <param name="file">The GGUF.</param>
+    /// <param name="name">Tensor name.</param>
+    /// <param name="count">Expected element count.</param>
+    /// <returns>A host copy.</returns>
+    internal static float[] ReadVector(GgufFile file, string name, int count)
+    {
+        if (!file.TensorsByName.TryGetValue(name, out var d))
+            throw new InvalidOperationException($"DFlash drafter is missing tensor '{name}'.");
+        if (d.Shape.ElementCount != count)
+            throw new InvalidOperationException($"DFlash tensor '{name}' has {d.Shape.ElementCount} elements, expected {count}.");
+        var dst = new float[count];
+        Dequantize.ToFloat32(file.TensorDataPointer(d), count, d.QuantizationType, dst);
+        return dst;
     }
 
     private static int[] ReadIntArray(GgufMetadata md, string key)
@@ -357,6 +404,12 @@ internal sealed unsafe class DFlashDrafter : IDisposable
             _backend.LoadTaps(taps + (long)start * width, n * width, _taps32);
             Gemm(_fc, _taps32, _feat, n);
             _backend.RmsNorm(_feat, _feat, n, _encNorm);
+            if (_lilicorr is not null)
+            {
+                // The head's anchor is the fused context feature of the position before the block: keep the newest ones.
+                for (int r = Math.Max(0, positions.Length - AnchorRows - start); r < n; r++)
+                    state.StoreAnchor(_feat + (nint)((long)r * HiddenSize * sizeof(float)), pos[r]);
+            }
             for (int li = 0; li < _layers.Length; li++)
             {
                 var l = _layers[li];
@@ -384,8 +437,10 @@ internal sealed unsafe class DFlashDrafter : IDisposable
     /// <param name="tokens">Receives the drafts, <c>1 &lt;= Length &lt; BlockSize</c>.</param>
     public void Draft(DFlashMtpState state, IDFlashTargetOps target, int anchor, int start, Span<int> tokens)
     {
-        int nDraft = tokens.Length, b = nDraft + 1;
-        if (nDraft < 1 || b > BlockSize) throw new ArgumentOutOfRangeException(nameof(tokens));
+        int nWalk = tokens.Length;
+        if (nWalk < 1 || nWalk + 1 > BlockSize) throw new ArgumentOutOfRangeException(nameof(tokens));
+        // LiLiCorr scores the whole trained block (its slot embeddings and bias table are per slot); the walk takes the first nWalk.
+        int nDraft = _lilicorr is null ? nWalk : BlockSize - 1, b = nDraft + 1;
         int h = HiddenSize;
 
         Span<int> block = stackalloc int[b];
@@ -413,7 +468,7 @@ internal sealed unsafe class DFlashDrafter : IDisposable
             _backend.NormRopeHeads(_q, NumHeads, l.QNorm, positions);
             _backend.NormRopeHeads(_k, NumKvHeads, l.KNorm, positions);
             long ta = System.Diagnostics.Stopwatch.GetTimestamp();
-            _backend.Attend(state.RingKeys(li), state.RingValues(li), state.RingCapacity, lo, start, b, _q, _k, _v, _attn);
+            _backend.Attend(state.RingKeys(li), state.RingValues(li), state.RingCapacity, lo, start, b, _q, _k, _v, _attn, l.Sinks);
             _attnTicks += System.Diagnostics.Stopwatch.GetTimestamp() - ta;
             Gemm(l.O, _attn, _o, b);
             nint attnOut = _o;
@@ -453,11 +508,20 @@ internal sealed unsafe class DFlashDrafter : IDisposable
             Gemm(sh, hid, _gateSel, nDraft);   // before the head: ProjectForDraft may overwrite hid
             _backend.Download(_gateSel, _selGate, nDraft * _selRank);
         }
+        if (_lilicorr is not null)
+            _backend.Download(hid, _hiddenHost, nDraft * h);   // before the head, for the same reason
         long th = System.Diagnostics.Stopwatch.GetTimestamp();
         target.ProjectForDraft(hid, nDraft, _logits);
         long ts = System.Diagnostics.Stopwatch.GetTimestamp();
         _headTicks += ts - th;
 
+        if (_lilicorr is { } head)
+        {
+            state.LoadAnchor(start - 1, _anchorHost);
+            head.Walk(_logits, _hiddenHost, _anchorHost, target, tokens);
+            _selectTicks += System.Diagnostics.Stopwatch.GetTimestamp() - ts;
+            return;
+        }
         if (_selHidden is null)
         {
             for (int i = 0; i < nDraft; i++)
@@ -541,6 +605,8 @@ internal sealed unsafe class DFlashDrafter : IDisposable
         foreach (nint buf in _buffers) _backend.Free(buf);
         if (_logits != null) { NativeMemory.AlignedFree(_logits); _logits = null; }
         if (_selGate != null) { NativeMemory.AlignedFree(_selGate); _selGate = null; }
+        if (_hiddenHost != null) { NativeMemory.AlignedFree(_hiddenHost); _hiddenHost = null; }
+        _lilicorr?.Dispose();
         _backend.Dispose();
         _ownedFile?.Dispose();
     }

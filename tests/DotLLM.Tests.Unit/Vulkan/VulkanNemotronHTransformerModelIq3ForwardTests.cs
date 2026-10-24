@@ -148,6 +148,7 @@ public sealed class VulkanNemotronHTransformerModelIq3ForwardTests
             if (native) Skip.IfNot(MatMulIq2XxsGemmCoopmatKernel.IsSupportedOn(probe, spvDir), "no wave64 cooperative-matrix device");
         }
         var kinds = new[] { HybridLayerKind.Attention, HybridLayerKind.Ssm, HybridLayerKind.Ffn };
+        using var prefillKernels = new RowExactOffScope();   // a short batch would otherwise take the decode GEMVs (#1237)
         using var nativeOff = native ? null : new EnvVarScope(MatMulIq2XxsGemmCoopmatKernel.LegacyEnvVar, "1");
         using var f16 = native ? null : new F16PrefillTestScope();
         IqF16PrefillMatmul.Counters.Reset();

@@ -26,7 +26,7 @@ public sealed class MatMulNvfp4F32Kernel : IDisposable
 {
     private const int TileM = 16;
     private const int TileN = 16;
-    private const int GemvPushBytes = 4 * sizeof(uint); // M, K, blocksPerRow, scale
+    private const int GemvPushBytes = 5 * sizeof(uint); // M, K, blocksPerRow, scale, cols (#1237)
     private const int GemmPushBytes = 5 * sizeof(uint); // M, K, N, blocksPerRow, scale
 
     /// <summary>SPIR-V of the coalesced multi-row GEMV (#1066).</summary>
@@ -224,7 +224,7 @@ public sealed class MatMulNvfp4F32Kernel : IDisposable
 
         uint scaleBits = BitConverter.SingleToUInt32Bits(scale);
         Span<uint> pc = gemv
-            ? stackalloc uint[4] { (uint)m, (uint)k, (uint)blocksPerRow, scaleBits }
+            ? stackalloc uint[5] { (uint)m, (uint)k, (uint)blocksPerRow, scaleBits, 1u }
             : stackalloc uint[5] { (uint)m, (uint)k, (uint)n, (uint)blocksPerRow, scaleBits };
         fixed (uint* pcPtr = pc)
         {
@@ -234,13 +234,47 @@ public sealed class MatMulNvfp4F32Kernel : IDisposable
 
         if (gemv && _gemvCoalesced is not null)
         {
-            VulkanApi.vkCmdDispatch(cmdBuf, (uint)((m + _gemvCoalescedRows - 1) / _gemvCoalescedRows), 1, 1);
+            GemvColumns.Dispatch(cmdBuf, (m + _gemvCoalescedRows - 1) / _gemvCoalescedRows);
             Interlocked.Increment(ref CoalescedGemvDispatches);
         }
         else if (gemv)
-            VulkanApi.vkCmdDispatch(cmdBuf, (uint)m, 1, 1);
+            GemvColumns.Dispatch(cmdBuf, m);
         else
             VulkanApi.vkCmdDispatch(cmdBuf, (uint)((m + TileM - 1) / TileM), (uint)((n + TileN - 1) / TileN), 1);
+    }
+
+    /// <summary>
+    /// The FP32 decode GEMV over <paramref name="cols"/> activation rows (#1237): row <c>c</c> of <paramref name="output"/> is
+    /// bit-identical to a one-row <see cref="Record"/> of row <c>c</c> of <paramref name="input"/> (unless the opt-in MMVQ serves
+    /// that one-row call: <see cref="EnableMmvqEnvVar"/> moves decode off the FP32 GEMV, so it breaks speculative exactness).
+    /// </summary>
+    /// <param name="cmdBuf">Command buffer.</param>
+    /// <param name="weights">Packed NVFP4 weights.</param>
+    /// <param name="input">Input rows <c>[cols, k]</c>.</param>
+    /// <param name="output">Output rows <c>[cols, m]</c>.</param>
+    /// <param name="m">Output rows of the weight.</param>
+    /// <param name="k">Contraction length, a multiple of 64.</param>
+    /// <param name="cols">Activation rows.</param>
+    /// <param name="scale">Per-tensor output scale.</param>
+    internal unsafe void RecordGemvColumns(nint cmdBuf, VulkanDevice.Buffer weights, VulkanDevice.Buffer input, VulkanDevice.Buffer output,
+        int m, int k, int cols, float scale)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(cols);
+        if (k % QuantFormat.Nvfp4GroupSize != 0)
+            throw new ArgumentException($"k must be a multiple of {QuantFormat.Nvfp4GroupSize}, got {k}", nameof(k));
+        int blocksPerRow = k / QuantFormat.Nvfp4GroupSize;
+        if (input.Size < (long)cols * k * sizeof(float)) throw new ArgumentException("Input buffer too small.", nameof(input));
+        if (output.Size < (long)cols * m * sizeof(float)) throw new ArgumentException("Output buffer too small.", nameof(output));
+        Stage stage = _gemvCoalesced ?? _gemv;
+        Span<nint> buffers = stackalloc nint[3] { weights.Handle, input.Handle, output.Handle };
+        nint descriptorSet = stage.Cache.GetOrCreate(buffers);
+        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, stage.Pipeline.Pipeline);
+        VulkanApi.vkCmdBindDescriptorSets(cmdBuf, VkPipelineBindPoint.Compute, stage.Pipeline.Layout, 0, 1, descriptorSet, 0, 0);
+        Span<uint> pc = stackalloc uint[5] { (uint)m, (uint)k, (uint)blocksPerRow, BitConverter.SingleToUInt32Bits(scale), (uint)cols };
+        fixed (uint* pcPtr = pc)
+            VulkanApi.vkCmdPushConstants(cmdBuf, stage.Pipeline.Layout, VkShaderStageFlags.Compute, 0, GemvPushBytes, (nint)pcPtr);
+        int rowGroups = _gemvCoalesced is not null ? (m + _gemvCoalescedRows - 1) / _gemvCoalescedRows : m;
+        GemvColumns.Dispatch(cmdBuf, (long)rowGroups * cols);
     }
 
     /// <inheritdoc/>
@@ -313,7 +347,7 @@ public sealed class MatMulNvfp4F32Kernel : IDisposable
             nint descriptorSet = _stage.Cache.GetOrCreate(buffers);
             VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _stage.Pipeline.Pipeline);
             VulkanApi.vkCmdBindDescriptorSets(cmdBuf, VkPipelineBindPoint.Compute, _stage.Pipeline.Layout, 0, 1, descriptorSet, 0, 0);
-            Span<uint> pc = stackalloc uint[4] { (uint)m, (uint)k, (uint)blocksPerRow, BitConverter.SingleToUInt32Bits(scale) };
+            Span<uint> pc = stackalloc uint[5] { (uint)m, (uint)k, (uint)blocksPerRow, BitConverter.SingleToUInt32Bits(scale), 1u };
             fixed (uint* pcPtr = pc)
             {
                 VulkanApi.vkCmdPushConstants(cmdBuf, _stage.Pipeline.Layout, VkShaderStageFlags.Compute, 0, GemvPushBytes, (nint)pcPtr);

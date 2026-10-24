@@ -19,7 +19,7 @@ internal sealed class VulkanDFlashKernels : IDisposable
         _conv = new Op(device, spvDir, "dflash_conv_f32.spv", 4, 5);
         _ringWrite = new Op(device, spvDir, "dflash_ring_write_f32.spv", 4, 7);
         _normRope = new Op(device, spvDir, "dflash_norm_rope_f32.spv", 3, 3);
-        _attention = new Op(device, spvDir, "dflash_attention_f32.spv", 6, 11);
+        _attention = new Op(device, spvDir, "dflash_attention_f32.spv", 7, 12);
     }
 
     /// <summary>Loads the four pipelines from <paramref name="spvDir"/>.</summary>
@@ -47,14 +47,17 @@ internal sealed class VulkanDFlashKernels : IDisposable
         => _normRope.Record(cmd, [x.Handle, norm.Handle, cosSin.Handle],
             [(uint)heads, (uint)headDim, BitConverter.SingleToUInt32Bits(eps)], (uint)heads, (uint)rows);
 
-    /// <summary>Block attention of <paramref name="b"/> queries over ring positions <c>[lo, start)</c> and the block's own K/V.</summary>
+    /// <summary>
+    /// Block attention of <paramref name="b"/> queries over ring positions <c>[lo, start)</c> and the block's own K/V; with
+    /// <paramref name="sinks"/> (one F32 logit per query head, #1237) the softmax denominator also holds <c>exp(sink)</c>.
+    /// </summary>
     public void RecordAttention(nint cmd, VulkanDevice.Buffer q, VulkanDevice.Buffer kb, VulkanDevice.Buffer vb,
         VulkanDevice.Buffer ringK, VulkanDevice.Buffer ringV, VulkanDevice.Buffer output,
         int b, int heads, int kvHeads, int headDim, int cap, int lo, int start, int window, float scale,
-        long ringKByteOffset, long ringVByteOffset)
-        => _attention.Record(cmd, [q.Handle, kb.Handle, vb.Handle, ringK.Handle, ringV.Handle, output.Handle],
+        long ringKByteOffset, long ringVByteOffset, VulkanDevice.Buffer? sinks = null)
+        => _attention.Record(cmd, [q.Handle, kb.Handle, vb.Handle, ringK.Handle, ringV.Handle, output.Handle, (sinks ?? q).Handle],
             [(uint)b, (uint)heads, (uint)kvHeads, (uint)headDim, (uint)cap, (uint)lo, (uint)start, (uint)window,
-             BitConverter.SingleToUInt32Bits(scale), Words(ringKByteOffset), Words(ringVByteOffset)],
+             BitConverter.SingleToUInt32Bits(scale), Words(ringKByteOffset), Words(ringVByteOffset), sinks is null ? 0u : 1u],
             (uint)(b * heads), 1);
 
     private static uint Groups(long items, int size) => (uint)((items + size - 1) / size);

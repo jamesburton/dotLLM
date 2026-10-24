@@ -484,6 +484,7 @@ public sealed class VulkanNvfp4Tests : IDisposable
     public void NemotronH_Nvfp4Ssm_ForwardMatchesCpuF32Twin(Nvfp4PrefillPath path)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var prefillKernels = new RowExactOffScope();   // a short batch would otherwise take the decode GEMVs (#1237)
         if (path != Nvfp4PrefillPath.Scalar)
         {
             using var probe = VulkanDevice.Create();

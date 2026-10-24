@@ -27,7 +27,7 @@ public sealed class VulkanDFlashTests : IDisposable
         try { Directory.Delete(_dir, recursive: true); } catch { /* best-effort */ }
     }
 
-    private sealed unsafe class DeviceMemory(VulkanQwen3HybridDenseTransformerModel.VulkanDFlashBackend backend) : DFlashDrafterTests.ITargetMemory
+    private sealed unsafe class DeviceMemory(VulkanDFlashBackend backend) : DFlashDrafterTests.ITargetMemory
     {
         public void Up(float* src, nint dst, int count) => backend.UploadForTest(src, dst, count);
 
@@ -50,10 +50,10 @@ public sealed class VulkanDFlashTests : IDisposable
         var device = VulkanDevice.Create();
         _devices.Add(device);
         using var model = VulkanQwen3HybridDenseTransformerModel.BuildFromGguf(device, gguf, config, spvDir);
-        VulkanQwen3HybridDenseTransformerModel.VulkanDFlashBackend? backend = null;
+        VulkanDFlashBackend? backend = null;
         // F32 fixture weights; the tolerance covers the GPU reduction order.
         DFlashDrafterTests.AssertMatchesReference(_dir, dflash2,
-            () => backend = (VulkanQwen3HybridDenseTransformerModel.VulkanDFlashBackend)model.CreateDFlashBackend(),
+            () => backend = (VulkanDFlashBackend)model.CreateDFlashBackend(),
             t => new DFlashDrafterTests.StagedTarget(t, new DeviceMemory(backend!)), 1e-3f, _out);
     }
 

@@ -24,6 +24,15 @@ internal unsafe interface IDFlashTargetOps
     /// <param name="rows">Row count.</param>
     /// <param name="logits">Host destination <c>[rows, vocab]</c>.</param>
     void ProjectForDraft(nint hidden, int rows, float* logits);
+
+    /// <summary>
+    /// Embeds <paramref name="tokens"/> into HOST rows <c>[tokens, hidden]</c> F32 with the target's <c>token_embd</c>, read in place
+    /// from its stored type. The LiLiCorr head (#1237) embeds its candidate tokens on the host.
+    /// </summary>
+    /// <param name="tokens">Token ids.</param>
+    /// <param name="dst">Host destination rows.</param>
+    void EmbedHost(ReadOnlySpan<int> tokens, float* dst)
+        => throw new NotSupportedException($"{GetType().Name} cannot embed on the host; LiLiCorr drafters need it.");
 }
 
 /// <summary>
@@ -75,9 +84,13 @@ internal unsafe interface IDFlashBackend : IDisposable
 
     /// <summary>
     /// Non-causal attention of <paramref name="b"/> block queries over the ring positions <c>[lo, start)</c> within the sliding
-    /// window of each query, then the block's own K/V. Writes <paramref name="output"/>.
+    /// window of each query, then the block's own K/V. Writes <paramref name="output"/>. With <paramref name="sinks"/> (one logit
+    /// per query head, #1237) the softmax denominator also holds <c>exp(sink)</c>, as llama.cpp's <c>soft_max_ext</c> with sinks.
     /// </summary>
-    void Attend(nint ringK, nint ringV, int capacity, int lo, int start, int b, nint q, nint k, nint v, nint output);
+    void Attend(nint ringK, nint ringV, int capacity, int lo, int start, int b, nint q, nint k, nint v, nint output, float[]? sinks);
+
+    /// <summary>Copies <paramref name="floats"/> F32 values between backend buffers (any offsets).</summary>
+    void Copy(nint src, nint dst, int floats);
 }
 
 /// <summary>The CPU drafter backend: host buffers, the CPU GEMM dispatch, head-parallel attention on the pool.</summary>
@@ -115,7 +128,18 @@ internal sealed unsafe class DFlashCpuBackend(ComputeThreadPool? pool, bool owns
 
     /// <inheritdoc/>
     public void Gemm(in DFlashDrafter.Matrix w, nint x, nint y, int rows)
-        => NemotronHTransformerModel.GemmDispatch(w.Ptr, w.Qt, (float*)x, (float*)y, w.Out, w.In, rows, pool, null);
+    {
+        NemotronHTransformerModel.GemmDispatch(w.Ptr, w.Qt, (float*)x, (float*)y, w.Out, w.In, rows, pool, null);
+        if (w.Scale != 1f)
+        {
+            var o = new Span<float>((void*)y, checked(rows * w.Out));
+            TensorPrimitives.Multiply(o, w.Scale, o);
+        }
+    }
+
+    /// <inheritdoc/>
+    public void Copy(nint src, nint dst, int floats)
+        => new ReadOnlySpan<float>((void*)src, floats).CopyTo(new Span<float>((void*)dst, floats));
 
     /// <inheritdoc/>
     public void RmsNorm(nint src, nint dst, int rows, float[] weight)
@@ -192,10 +216,19 @@ internal sealed unsafe class DFlashCpuBackend(ComputeThreadPool? pool, bool owns
     }
 
     /// <inheritdoc/>
-    public void Attend(nint ringK, nint ringV, int capacity, int lo, int start, int b, nint q, nint k, nint v, nint output)
+    public void Attend(nint ringK, nint ringV, int capacity, int lo, int start, int b, nint q, nint k, nint v, nint output, float[]? sinks)
+    {
+        if (sinks is not null && sinks.Length != _d.NumHeads)
+            throw new ArgumentException($"Expected {_d.NumHeads} sink logits, got {sinks.Length}.", nameof(sinks));
+        fixed (float* sp = sinks)
+            AttendCore(ringK, ringV, capacity, lo, start, b, q, k, v, output, sp);
+    }
+
+    private void AttendCore(nint ringK, nint ringV, int capacity, int lo, int start, int b, nint q, nint k, nint v, nint output, float* sinks)
     {
         var ctx = new AttendCtx
         {
+            Sinks = sinks,
             Q = (float*)q, K = (float*)k, V = (float*)v, Out = (float*)output,
             RingK = (Half*)ringK, RingV = (Half*)ringV, RingCap = capacity,
             Lo = lo, Start = start, B = b, Window = _d.Window,
@@ -212,7 +245,7 @@ internal sealed unsafe class DFlashCpuBackend(ComputeThreadPool? pool, bool owns
 
     private struct AttendCtx
     {
-        public float* Q, K, V, Out;
+        public float* Q, K, V, Out, Sinks;
         public Half* RingK, RingV;
         public int RingCap, Lo, Start, B, Window, Heads, KvHeads, HeadDim;
         public float Scale;
@@ -258,9 +291,13 @@ internal sealed unsafe class DFlashCpuBackend(ComputeThreadPool? pool, bool owns
             {
                 var row = new Span<float>(scores + (long)i * nKeys, nKeys);
                 float m = TensorPrimitives.Max((ReadOnlySpan<float>)row);
+                // A sink is one more logit in the softmax with no value row: it only enlarges the denominator.
+                if (c->Sinks != null) m = MathF.Max(m, c->Sinks[head]);
                 TensorPrimitives.Add((ReadOnlySpan<float>)row, -m, row);
                 TensorPrimitives.Exp((ReadOnlySpan<float>)row, row);
-                TensorPrimitives.Multiply((ReadOnlySpan<float>)row, 1f / TensorPrimitives.Sum((ReadOnlySpan<float>)row), row);
+                float denom = TensorPrimitives.Sum((ReadOnlySpan<float>)row);
+                if (c->Sinks != null) denom += MathF.Exp(c->Sinks[head] - m);
+                TensorPrimitives.Multiply((ReadOnlySpan<float>)row, 1f / denom, row);
                 new Span<float>(c->Out + (long)i * qStride + head * d, d).Clear();
             }
             float* vfp = stackalloc float[d];

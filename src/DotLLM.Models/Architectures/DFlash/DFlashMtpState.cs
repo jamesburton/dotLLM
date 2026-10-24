@@ -26,6 +26,8 @@ internal sealed unsafe class DFlashMtpState : IMtpState
     private int _length;
     private int _maxInjected = -1; // highest position ever written: ring slots below maxInjected - capacity are stale
     private readonly int[] _draft;
+    private nint _anchors;           // LiLiCorr (#1237): [AnchorRows][hidden] F32 fused context features, backend memory
+    private readonly int[] _anchorPos = [];
     private int _draftStart = -1;  // position of the anchor of the cached block, -1 = none
     private int _draftCount;
     private bool _disposed;
@@ -46,6 +48,40 @@ internal sealed unsafe class DFlashMtpState : IMtpState
         _ring = drafter.Backend.AllocHalf(halves);   // host or device, the drafter's backend decides
         RingBytes = halves * sizeof(ushort);
         _draft = new int[drafter.BlockSize - 1];
+        if (drafter.IsLiLiCorr)
+        {
+            _anchors = drafter.Backend.Alloc((long)drafter.AnchorRows * drafter.HiddenSize);
+            _anchorPos = new int[drafter.AnchorRows];
+            Array.Fill(_anchorPos, -1);
+        }
+    }
+
+    /// <summary>Bytes of the LiLiCorr anchor-feature ring (0 for other drafters).</summary>
+    public long AnchorBytes => _anchors == 0 ? 0 : (long)_anchorPos.Length * _drafter.HiddenSize * sizeof(float);
+
+    /// <summary>Keeps the fused context feature row at <paramref name="feature"/> (backend memory) as the anchor of <paramref name="pos"/>.</summary>
+    /// <param name="feature">The row.</param>
+    /// <param name="pos">Its position.</param>
+    internal void StoreAnchor(nint feature, int pos)
+    {
+        int slot = pos % _anchorPos.Length;
+        _drafter.Backend.Copy(feature, _anchors + (nint)((long)slot * _drafter.HiddenSize * sizeof(float)), _drafter.HiddenSize);
+        _anchorPos[slot] = pos;
+    }
+
+    /// <summary>The anchor feature of <paramref name="pos"/> into <paramref name="dst"/>; zeros when that position was never injected.</summary>
+    /// <param name="pos">Position (the one before a block's anchor token).</param>
+    /// <param name="dst">Host destination, hidden wide.</param>
+    internal void LoadAnchor(int pos, float[] dst)
+    {
+        int slot = pos < 0 ? -1 : pos % _anchorPos.Length;
+        if (slot < 0 || _anchorPos[slot] != pos)
+        {
+            Array.Clear(dst);
+            return;
+        }
+        fixed (float* p = dst)
+            _drafter.Backend.Download(_anchors + (nint)((long)slot * _drafter.HiddenSize * sizeof(float)), p, _drafter.HiddenSize);
     }
 
     /// <summary>Rows per layer of the context ring.</summary>
@@ -186,6 +222,7 @@ internal sealed unsafe class DFlashMtpState : IMtpState
                 $"split_ms gemm={p.Gemm:F0} attn={p.Attn:F0} head={p.Head:F0} select={p.Select:F0}");
         }
         if (_ring != 0) { _drafter.Backend.Free(_ring); _ring = 0; }
+        if (_anchors != 0) { _drafter.Backend.Free(_anchors); _anchors = 0; }
         if (_taps != null) { NativeMemory.AlignedFree(_taps); _taps = null; }
     }
 }

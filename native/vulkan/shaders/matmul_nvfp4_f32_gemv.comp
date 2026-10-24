@@ -20,15 +20,22 @@ layout(push_constant) uniform PushConstants {
     uint  K;             // multiple of 64
     uint  blocksPerRow;  // K / 64
     float scale;         // per-tensor X.scale
+    uint  cols;
 } pc;
+
+// #1237: `cols` activation columns. Workgroup w (x + 32768 y) computes row w / cols of column w % cols with the
+// one-column arithmetic, so a speculative verify of cols rows is bit-identical to cols decode steps.
 
 #include "nvfp4_decode.glsl"
 
 shared float partials[128];
 
 void main() {
-    uint m = gl_WorkGroupID.x;
+    uint wg = gl_WorkGroupID.y * 32768u + gl_WorkGroupID.x;
+    uint col = wg % pc.cols;
+    uint m = wg / pc.cols;
     if (m >= pc.M) return;
+    uint xCol = col * pc.K, yCol = col * pc.M;
     uint tid = gl_LocalInvocationID.x;
 
     float acc = 0.0;
@@ -44,8 +51,8 @@ void main() {
                 uint e = xb + 16u * s + 4u * h;     // element of byte (4h + i) low nibble
                 for (uint i = 0u; i < 4u; i++) {
                     uint byteVal = (q >> (8u * i)) & 0xFFu;
-                    sub += x[e + i]      * KVALUES_FP4[byteVal & 0xFu]
-                         + x[e + i + 8u] * KVALUES_FP4[byteVal >> 4u];
+                    sub += x[xCol + e + i]      * KVALUES_FP4[byteVal & 0xFu]
+                         + x[xCol + e + i + 8u] * KVALUES_FP4[byteVal >> 4u];
                 }
             }
             acc += d * sub;
@@ -58,5 +65,5 @@ void main() {
         if (tid < stride) partials[tid] += partials[tid + stride];
         barrier();
     }
-    if (tid == 0u) y[m] = partials[0] * pc.scale;
+    if (tid == 0u) y[yCol + m] = partials[0] * pc.scale;
 }
