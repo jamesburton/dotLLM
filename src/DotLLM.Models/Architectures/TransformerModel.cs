@@ -1441,6 +1441,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                         new Span<float>(normOut + t * hiddenSize, hiddenSize));
                 }
 
+                if (DotLLM.Cpu.ActivationRangeProbe.On) DotLLM.Cpu.ActivationRangeProbe.Record(layer, "attn_in", normOut, (long)seqLen * hiddenSize);
                 byte* preQuantNorm = QuantizeInput(normOut, inputQ8Scratch, hiddenSize, seqLen, lw.QQuantType);
 
                 var rwQ = rl?.Q ?? default;
@@ -1547,6 +1548,13 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 var kRef = new TensorRef(seqLen, kvStrideLayer, DType.Float32, -1, (nint)k);
                 var vRef = new TensorRef(seqLen, kvStrideLayer, DType.Float32, -1, (nint)v);
 
+                if (DotLLM.Cpu.ActivationRangeProbe.On)
+                {
+                    DotLLM.Cpu.ActivationRangeProbe.Record(layer, "q", q, (long)seqLen * qStrideLayer);
+                    DotLLM.Cpu.ActivationRangeProbe.Record(layer, "k", k, (long)seqLen * kvStrideLayer);
+                    DotLLM.Cpu.ActivationRangeProbe.Record(layer, "v", v, (long)seqLen * kvStrideLayer);
+                }
+
                 kvCache.Update(kRef, vRef, positions, layer);
 
                 int seqKv = kvCache.CurrentLength;
@@ -1602,6 +1610,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             DotLLM.Cpu.CpuStageProf.E(1, _pt); _pt = DotLLM.Cpu.CpuStageProf.T();
             // f. Batched O projection. The O projection input width is the
             // attention output stride (numHeads * vHeadDimLayer == lw.OInputDim).
+            if (DotLLM.Cpu.ActivationRangeProbe.On) DotLLM.Cpu.ActivationRangeProbe.Record(layer, "attn_out", attnOut, (long)seqLen * oInStride);
             byte* preQuantAttn = QuantizeInput(attnOut, inputQ8Scratch, oInStride, seqLen, lw.OQuantType);
             var rwO = rl?.O ?? default;
             GemmInterleaved(lw.OWeight, lw.OQuantType, attnOut, normOut, lw.OOutputDim, lw.OInputDim, seqLen,
@@ -1638,6 +1647,11 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                     new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
                     new Span<float>(hidden + t * hiddenSize, hiddenSize));
             }
+            if (DotLLM.Cpu.ActivationRangeProbe.On)
+            {
+                DotLLM.Cpu.ActivationRangeProbe.Record(layer, "attn_proj", normOut, (long)seqLen * hiddenSize);
+                DotLLM.Cpu.ActivationRangeProbe.Record(layer, "resid_mid", hidden, (long)seqLen * hiddenSize);
+            }
 
             // h. Copy hiddenState → residual
             new Span<float>(hidden, seqLen * hiddenSize).CopyTo(new Span<float>(residual, seqLen * hiddenSize));
@@ -1662,6 +1676,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 }
 
                 DotLLM.Cpu.CpuStageProf.E(3, _pt); _pt = DotLLM.Cpu.CpuStageProf.T();
+                if (DotLLM.Cpu.ActivationRangeProbe.On) DotLLM.Cpu.ActivationRangeProbe.Record(layer, "ffn_in", normOut, (long)seqLen * hiddenSize);
                 MoeLayerWeights moe = lw.Moe!;
                 // BitNet-ternary MoE (identity-MoTE): experts are I2_S with a relu² +
                 // per-expert ffn_sub_norm body, dispatched through the indexed I2_S kernel.
@@ -1785,6 +1800,11 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                         new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
                         new Span<float>(hidden + t * hiddenSize, hiddenSize));
                 }
+                if (DotLLM.Cpu.ActivationRangeProbe.On)
+                {
+                    DotLLM.Cpu.ActivationRangeProbe.Record(layer, "ffn_out", normOut, (long)seqLen * hiddenSize);
+                    DotLLM.Cpu.ActivationRangeProbe.Record(layer, "resid_out", hidden, (long)seqLen * hiddenSize);
+                }
                 DotLLM.Cpu.CpuStageProf.E(6, _pt);
                 continue;
             }
@@ -1836,6 +1856,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                         new Span<float>(normOut + t * hiddenSize, hiddenSize));
                 }
 
+                if (DotLLM.Cpu.ActivationRangeProbe.On) DotLLM.Cpu.ActivationRangeProbe.Record(layer, "ffn_in", normOut, (long)seqLen * hiddenSize);
                 byte* preQuantFfn = QuantizeInput(normOut, inputQ8Scratch, hiddenSize, seqLen, lw.GateQuantType);
 
                 var rwGate = rl?.Gate ?? default;
@@ -1894,6 +1915,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 }
             }
 
+            if (DotLLM.Cpu.ActivationRangeProbe.On) DotLLM.Cpu.ActivationRangeProbe.Record(layer, "ffn_down_in", siluOut, (long)seqLen * intermediateSize);
             // Pre-quantize siluOutput for Down projection (different input dim = intermediateSize)
             byte* preQuantSilu = QuantizeInput(siluOut, inputQ8Scratch, intermediateSize, seqLen, lw.DownQuantType);
 
@@ -1935,6 +1957,11 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                     new ReadOnlySpan<float>(residual + t * hiddenSize, hiddenSize),
                     new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
                     new Span<float>(hidden + t * hiddenSize, hiddenSize));
+            }
+            if (DotLLM.Cpu.ActivationRangeProbe.On)
+            {
+                DotLLM.Cpu.ActivationRangeProbe.Record(layer, "ffn_out", normOut, (long)seqLen * hiddenSize);
+                DotLLM.Cpu.ActivationRangeProbe.Record(layer, "resid_out", hidden, (long)seqLen * hiddenSize);
             }
 
             // l. Per-Layer Embeddings (PLE) injection — Gemma-4 dense text tower.

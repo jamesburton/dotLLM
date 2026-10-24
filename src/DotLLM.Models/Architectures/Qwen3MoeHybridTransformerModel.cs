@@ -1074,6 +1074,7 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
             }
             if (TensorDump.Enabled)
                 TensorDump.Dump2D($"blk.{layer}.attn_norm", normOut, seqLen, hiddenSize);
+            if (DotLLM.Cpu.ActivationRangeProbe.On) DotLLM.Cpu.ActivationRangeProbe.Record(layer, "attn_in", normOut, (long)seqLen * hiddenSize);
 
             if (kinds[layer] == HybridLayerKind.GatedDeltaNet)
                 ForwardGdnBody(lw.Gdn!, layer, seqLen, hiddenSize, normOut, eps, gdnCache);
@@ -1103,6 +1104,11 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
 
             if (TensorDump.Enabled)
                 TensorDump.Dump2D($"blk.{layer}.attn_post_norm", normOut, seqLen, hiddenSize);
+            if (DotLLM.Cpu.ActivationRangeProbe.On)
+            {
+                DotLLM.Cpu.ActivationRangeProbe.Record(layer, "resid_mid", hidden, (long)seqLen * hiddenSize);
+                DotLLM.Cpu.ActivationRangeProbe.Record(layer, "ffn_in", normOut, (long)seqLen * hiddenSize);
+            }
 
             ForwardMoeBody(lw.Moe, layer, seqLen, hiddenSize, normOut);
             if (TensorDump.Enabled)
@@ -1118,6 +1124,11 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
             }
             if (TensorDump.Enabled)
                 TensorDump.Dump2D($"blk.{layer}.l_out", hidden, seqLen, hiddenSize);
+            if (DotLLM.Cpu.ActivationRangeProbe.On)
+            {
+                DotLLM.Cpu.ActivationRangeProbe.Record(layer, "ffn_out", normOut, (long)seqLen * hiddenSize);
+                DotLLM.Cpu.ActivationRangeProbe.Record(layer, "resid_out", hidden, (long)seqLen * hiddenSize);
+            }
         }
 
         // Final output norm + logit projection.

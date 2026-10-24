@@ -652,6 +652,7 @@ public static unsafe partial class MoeSwiGluMlp
                                 FusedOps.SwiGLU(gSlice, uSlice, oSlice);
                         }
 
+                        if (ActivationRangeProbe.On) ActivationRangeProbe.Record(loraLayer, "shexp_down_in", ssBatch, (long)seqLen * sharedIntermediateSize);
                         if (k == 0)
                         {
                             SharedProjection(sharedDownProj[k], sharedDownRaw, sharedDownRawQt, k, ssBatch, sdBatch,
@@ -888,6 +889,7 @@ public static unsafe partial class MoeSwiGluMlp
                         FusedOps.SwiGLU(gSlice, uSlice, oSlice);
                 }
 
+                if (ActivationRangeProbe.On) ActivationRangeProbe.Record(loraLayer, "moe_down_in", siluBatchPtr, (long)batch * intermediateSize);
                 // F16-safe down input (llama.cpp build_amax_src1_f16); undone per row in the scatter below.
                 for (int b = 0; b < batch; b++)
                     downScaleBuf[b] = RescaleDownInputForF16Sums(siluBatchPtr + (long)b * intermediateSize, intermediateSize);
