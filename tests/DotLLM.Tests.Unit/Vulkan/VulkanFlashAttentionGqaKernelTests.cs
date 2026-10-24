@@ -83,12 +83,104 @@ public sealed class VulkanFlashAttentionGqaKernelTests
     public void Prefill_LargeScores_MatchesCpuReference(Impl impl)
         => RunParity(impl, 61, 333, 24, 4, 256, 272, qScale: 12f, splitQ: true);
 
+    /// <summary>
+    /// Issue #1200: the attention-sink twins against the scalar CPU reference with sinks, on Flint's shape (32 query / 4 KV heads,
+    /// head_dim 128) for a sliding layer (window 513 &lt; the KV span) and a full (NoPE) layer at depth, gpt-oss's (64 / 8, head_dim 64,
+    /// window 128), and a fresh windowed prefill. Sinks are drawn in [-8, 8] so they move the output even against 1.5K keys (checked).
+    /// </summary>
+    /// <param name="impl">The implementation.</param>
+    /// <param name="seqQ">Query rows.</param>
+    /// <param name="seqKv">KV positions.</param>
+    /// <param name="numHeads">Query heads.</param>
+    /// <param name="numKvHeads">KV heads.</param>
+    /// <param name="headDim">Per-head dimension.</param>
+    /// <param name="positionOffset">Absolute position of the first query row.</param>
+    /// <param name="window">Sliding window (0 = full layer).</param>
+    [SkippableTheory]
+    [InlineData(Impl.Scalar, 100, 1124, 32, 4, 128, 1024, 513)]   // Flint sliding layer, chunk at depth (window-skipped tiles)
+    [InlineData(Impl.Scalar, 77, 1500, 32, 4, 128, 1423, 0)]      // Flint full (NoPE) layer
+    [InlineData(Impl.Scalar, 45, 300, 64, 8, 64, 255, 128)]       // gpt-oss shape
+    [InlineData(Impl.Scalar, 70, 70, 32, 4, 128, 0, 33)]          // fresh prefill, window < seq
+    [InlineData(Impl.Coopmat, 100, 1124, 32, 4, 128, 1024, 513)]
+    [InlineData(Impl.Coopmat, 77, 1500, 32, 4, 128, 1423, 0)]
+    [InlineData(Impl.Coopmat, 45, 300, 64, 8, 64, 255, 128)]
+    [InlineData(Impl.Coopmat, 70, 70, 32, 4, 128, 0, 33)]
+    public void PrefillSinks_MatchesCpuReference(
+        Impl impl, int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim, int positionOffset, int window)
+        => RunParity(impl, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, qScale: 1f, window: window, sinks: true);
+
+    /// <summary>
+    /// Issue #1200 / #1176: the compact sliding-window ring hands the kernel a KV view whose first row is a multiple of 256 positions into
+    /// the sequence, with the position offset rebased by the same amount. The sink twins must give bit-identical rows on that view and on
+    /// the full-length cache (tile starts stay aligned; skipped tiles are exact no-ops).
+    /// </summary>
+    /// <param name="impl">The implementation.</param>
+    /// <param name="storage">The KV format.</param>
+    [SkippableTheory]
+    [InlineData(Impl.Scalar, VulkanKvStorage.F16)]
+    [InlineData(Impl.Coopmat, VulkanKvStorage.F16)]
+    [InlineData(Impl.Coopmat, VulkanKvStorage.F32)]
+    public void PrefillSinks_RingView_BitIdenticalToFullCache(Impl impl, VulkanKvStorage storage)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        const int seqQ = 96, seqKv = 1600, numHeads = 32, numKvHeads = 4, headDim = 128, window = 513, ringBase = 768;
+        int offset = seqKv - seqQ;
+        var rng = new Random(1200);
+        float[] q = RandomFloats(rng, seqQ * numHeads * headDim, 1f);
+        float[] k = RandomFloats(rng, seqKv * numKvHeads * headDim, 3f);
+        float[] v = RandomFloats(rng, seqKv * numKvHeads * headDim, 3f);
+        float[] sinkLogits = RandomFloats(rng, numHeads, 3f);
+        int rowFloats = numKvHeads * headDim;
+
+        using var device = VulkanDevice.Create();
+        using var kernel = impl == Impl.Coopmat
+            ? VulkanFlashAttentionGqaKernel.TryCreateCoopmat(device, spvDir, storage, sinks: true)
+            : VulkanFlashAttentionGqaKernel.TryCreateScalar(device, spvDir, storage, sinks: true);
+        Skip.If(kernel is null, $"the {impl} GQA flash sink kernel is unavailable on {device.DeviceName}");
+        using var bufQ = Upload(device, q);
+        using var bufS = Upload(device, sinkLogits);
+        using var kFull = UploadKv(device, k, storage);
+        using var vFull = UploadKv(device, v, storage);
+        using var kRing = UploadKv(device, k[(ringBase * rowFloats)..], storage);
+        using var vRing = UploadKv(device, v[(ringBase * rowFloats)..], storage);
+        using var bufOut = device.Allocate((long)q.Length * sizeof(float));
+
+        float[] full = new float[q.Length], ring = new float[q.Length];
+        kernel!.Launch(bufQ, kFull, vFull, bufOut, seqQ, seqKv, numHeads, numKvHeads, headDim, offset, window, sinks: bufS);
+        device.Download(bufOut, full);
+        kernel.Launch(bufQ, kRing, vRing, bufOut, seqQ, seqKv - ringBase, numHeads, numKvHeads, headDim, offset - ringBase, window,
+            sinks: bufS);
+        device.Download(bufOut, ring);
+        for (int i = 0; i < full.Length; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(full[i]) == BitConverter.SingleToInt32Bits(ring[i]), $"[{i}] {full[i]:R} vs {ring[i]:R}");
+    }
+
+    private static VulkanDevice.Buffer Upload(VulkanDevice device, float[] data)
+    {
+        var buf = device.Allocate((long)data.Length * sizeof(float));
+        device.Upload(data.AsSpan(), buf);
+        return buf;
+    }
+
+    private static VulkanDevice.Buffer UploadKv(VulkanDevice device, float[] data, VulkanKvStorage storage)
+    {
+        if (storage == VulkanKvStorage.F32) return Upload(device, data);
+        ushort[] halves = new ushort[data.Length];
+        for (int i = 0; i < data.Length; i++) halves[i] = BitConverter.HalfToUInt16Bits((Half)data[i]);
+        var buf = device.Allocate((long)halves.Length * sizeof(ushort));
+        device.Upload(System.Runtime.InteropServices.MemoryMarshal.AsBytes(halves.AsSpan()), buf);
+        return buf;
+    }
+
     private static void RunParity(
-        Impl impl, int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim, int positionOffset, float qScale, bool? splitQ = null)
+        Impl impl, int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim, int positionOffset, float qScale, bool? splitQ = null,
+        int window = 0, bool sinks = false)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         var rng = new Random(441 + seqQ * 31 + seqKv * 17 + numHeads * 7 + headDim);
         float[] q = RandomFloats(rng, seqQ * numHeads * headDim, qScale);
+        float[] sinkLogits = sinks ? RandomFloats(rng, numHeads, 8f) : [];
+        int? windowOrNull = window > 0 ? window : null;
         int kvElems = seqKv * numKvHeads * headDim;
         float[] k = RandomFloats(rng, kvElems, 3f);
         float[] v = RandomFloats(rng, kvElems, 3f);
@@ -106,10 +198,20 @@ public sealed class VulkanFlashAttentionGqaKernelTests
         float scale = 1.0f / MathF.Sqrt(headDim);
         float[] expected32 = new float[seqQ * numHeads * headDim];
         Attention.ExecuteScalar(q, k, v, expected32, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset,
-            scale, default, null, 0f, AttentionMaskMode.Causal, 0);
+            scale, default, windowOrNull, 0f, AttentionMaskMode.Causal, 0, sinkLogits);
         float[] expected16 = new float[expected32.Length];
         Attention.ExecuteScalar(q, k16, v16, expected16, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset,
-            scale, default, null, 0f, AttentionMaskMode.Causal, 0);
+            scale, default, windowOrNull, 0f, AttentionMaskMode.Causal, 0, sinkLogits);
+        if (sinks)
+        {
+            // Discrimination: a sink-ignoring kernel must fail this fixture.
+            float[] noSink = new float[expected32.Length];
+            Attention.ExecuteScalar(q, k, v, noSink, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset,
+                scale, default, windowOrNull, 0f, AttentionMaskMode.Causal, 0);
+            float gap = 0;
+            for (int i = 0; i < noSink.Length; i++) gap = MathF.Max(gap, MathF.Abs(noSink[i] - expected32[i]));
+            Assert.True(gap > 1e-2f, $"fixture too weak: the sinks move the output by only {gap}");
+        }
 
         using var device = VulkanDevice.Create();
         using var bufQ = device.Allocate((long)q.Length * sizeof(float));
@@ -118,6 +220,8 @@ public sealed class VulkanFlashAttentionGqaKernelTests
         using var bufK16 = device.Allocate((long)kvElems * sizeof(ushort));
         using var bufV16 = device.Allocate((long)kvElems * sizeof(ushort));
         using var bufOut = device.Allocate((long)expected32.Length * sizeof(float));
+        using var bufSinks = device.Allocate(Math.Max(1, sinkLogits.Length) * (long)sizeof(float));
+        if (sinks) device.Upload(sinkLogits.AsSpan(), bufSinks);
         device.Upload(q.AsSpan(), bufQ);
         device.Upload(k.AsSpan(), bufK32);
         device.Upload(v.AsSpan(), bufV32);
@@ -130,8 +234,8 @@ public sealed class VulkanFlashAttentionGqaKernelTests
         foreach (VulkanKvStorage storage in new[] { VulkanKvStorage.F32, VulkanKvStorage.F16 })
         {
             using var kernel = impl == Impl.Coopmat
-                ? VulkanFlashAttentionGqaKernel.TryCreateCoopmat(device, spvDir, storage, splitQ)
-                : VulkanFlashAttentionGqaKernel.TryCreateScalar(device, spvDir, storage);
+                ? VulkanFlashAttentionGqaKernel.TryCreateCoopmat(device, spvDir, storage, splitQ, sinks)
+                : VulkanFlashAttentionGqaKernel.TryCreateScalar(device, spvDir, storage, sinks);
             Skip.If(kernel is null, $"the {impl} GQA flash kernel is unavailable on {device.DeviceName}");
             Assert.Equal(impl == Impl.Coopmat, kernel!.IsCoopmat);
             Assert.True(kernel.CanDispatch(headDim, numHeads, numKvHeads));
@@ -139,7 +243,8 @@ public sealed class VulkanFlashAttentionGqaKernelTests
             float[] actual = new float[expected32.Length];
             device.Upload(new float[actual.Length].AsSpan(), bufOut);
             var (bk, bv) = storage == VulkanKvStorage.F16 ? (bufK16, bufV16) : (bufK32, bufV32);
-            kernel.Launch(bufQ, bk, bv, bufOut, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset);
+            kernel.Launch(bufQ, bk, bv, bufOut, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, window,
+                sinks: sinks ? bufSinks : null);
             device.Download(bufOut, actual);
             string? failure = Compare(storage == VulkanKvStorage.F16 ? expected16 : expected32, actual, absTol, relTol,
                 $"{impl} {storage} on {device.DeviceName}");
