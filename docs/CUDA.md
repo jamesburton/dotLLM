@@ -1254,12 +1254,13 @@ validation uses NVIDIA driver 610.88.
 
 ## Recursive Flint on CUDA and in-place Q4_1 kernels (#1172, Flint F6)
 
-`flint` loads through the default `CudaTransformerModel` arm (generic FP16 eager loop; MoE models are never
-graph-captured). What it needed, and where it lives:
+`flint` loads through the default `CudaTransformerModel` arm (generic FP16 eager loop; MoE decode is captured whole since
+#1210, see below). What it needed, and where it lives:
 
 - **Per-layer NoPE** in the FP16 loop: `Config.IsNoRopeLayer(layer)` passes `rope_dim 0` to the fused RoPE + KV write
-  (the kernel then copies all of K as its "tail") and skips `LaunchRoPE` on the eager path. Graph capture is refused
-  when `NoRopeLayers` is set (the captured bodies always rotate). Composite hosts still refuse NoPE models.
+  (the kernel then copies all of K as its "tail") and skips `LaunchRoPE` on the eager path. The dense captured bodies
+  (`CaptureDecodeGraph*`) still refuse `NoRopeLayers` (they always rotate); the MoE decode graph (#1210) captures the eager
+  body itself, so NoPE is honoured there. Composite hosts still refuse NoPE models.
 - **Sinks on every layer**: already wired through `AttnSinksDevice` (#365); nothing Flint-specific.
 - **Sigmoid routing** (`moe_sigmoid_topk_f32`): top-k on `sigmoid(logits)`, renormalised with the CPU's 6.1035e-5 sum
   clamp, lower index on ties. A selection bias or expert weight scale (DeepSeek-V3 / GLM-4.7-Flash, #742) is still
@@ -1318,3 +1319,32 @@ from the mmap'd file (`--cpu-moe` / `--n-cpu-moe`, or automatically; see `docs/M
 since #1202 (see `docs/MOE_OFFLOAD.md`); the FP16 residual stream is verified on 8 real layers only; the
 per-projection `DequantScratch` (F16 + F32, 72 MiB at Flint's 6144x2048) is still allocated though no Q4_1 path uses it (#1183);
 NVFP4 grouped experts with the per-expert `_exps.scale` are not implemented (#1179).
+
+### MoE decode graph (#1210)
+
+On WDDM a Flint decode token was ~1,000 `cuLaunchKernel` calls at 15-31 us each, with the GPU idle between them. Since
+#1182 resident MoE layers route on the device, so the only host interaction left in a decode step is the CPU leg of the
+CPU-expert layers. `CudaTransformerModel.ForwardMoeDecodeGraph` therefore captures the **eager decode body itself** (not a
+separate captured copy like the dense `CaptureDecodeGraph`), with three switches while `_moeGraphCapturing` is set:
+
+- token id, position and KV length are uploaded before each replay (one pinned buffer, four async copies); the body skips
+  its own uploads and the host-embedding gather (#1183) fills the pinned staging before the launch, leaving only its copy
+  in the graph;
+- RoPE + KV write and attention use the `_dyn` kernels (`fused_rope_kv_write_f16_dyn`, `attention_f16_dyn`: the same
+  bodies, position and length read from device scalars), with the layer's own `rope_dim` (0 on NoPE layers), window and
+  sinks;
+- a CPU-expert layer queues its input / top-k copies into pinned memory, the shared expert, then the CPU leg as a
+  **host-function node** (`cuLaunchHostFunc`, `CudaMoeHostExperts.EnqueueRun`) and the upload of its result, so nothing
+  waits for the host. A host job's exception is kept and rethrown after the replay's sync.
+
+The first decode step on a KV cache runs eagerly (it allocates the lazy scratch: expert pointer tables, pinned buffers);
+the second captures; later steps replay. The graph is recaptured when the cache, the layer count or any buffer it bakes in
+moves (generation counters on `CudaForwardState`, `CudaMoeScratch`, `CudaMoeHostExperts` and the model's staging). A
+capture failure is logged once and leaves decode eager. Eligible: every MoE layer device-routable (#1182) or a CPU-expert
+layer, a `CudaKvCache`, no adapter / profiling, decode appending at the cache's length. `DOTLLM_CUDA_MOE_GRAPH=0` keeps
+the eager body. No depth ceiling: unlike the dense path (#218), the launches saved dwarf the `_dyn` attention's cost.
+
+Flint Q4_1, RTX 3060, `--n-cpu-moe 34`, tg64 at depth 512: 20-22 -> 26-27 tok/s interleaved with llama.cpp (20.7-22.2),
+same peak VRAM; logits bit-identical to eager (`CudaFlintCpuMoeTests.MoeDecodeGraph_BitIdenticalToEager`: resident,
+mixed and all-CPU placements on the synthetic Flint with a NoPE layer, sinks and a 4-token window); real-file parity
+(`CudaFlintCpuMoeRealProbe`) 158/160 top-1, KL mean 2.1e-3, unchanged.
