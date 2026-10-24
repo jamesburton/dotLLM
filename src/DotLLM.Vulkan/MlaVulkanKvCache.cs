@@ -230,6 +230,9 @@ public sealed class MlaVulkanKvCache : IKvCache, IDisposable
             hazards.OnTransfer(kPeDev.Handle, _kPeBuffers[layerIndex].Handle);
         }
 
+        // The copies below read what RoPE (a compute shader) just wrote; a COMPUTE->COMPUTE barrier does not order a TRANSFER read (races on Intel Arc, #1249).
+        if (_device.ActiveHazards is null) Kernels.KernelSupport.ComputeToTransferBarrier(cmdBuf);
+
         // K_nope copy
         var kRegion = new VkBufferCopy
         {

@@ -397,6 +397,9 @@ public sealed class VulkanNemotronHKvCache : IKvCache
             return;
         }
 
+        // The copies below read what RoPE (a compute shader) just wrote; a COMPUTE->COMPUTE barrier does not order a TRANSFER read (races on Intel Arc, #1249).
+        Kernels.KernelSupport.ComputeToTransferBarrier(cmdBuf);
+
         if (contiguous)
         {
             int startPos = positions[0];
