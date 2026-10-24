@@ -6821,6 +6821,9 @@ public sealed partial class VulkanTransformerModel : IModel
     {
         int hidden = moeW.HiddenSize, interm = moeW.IntermediateSize, numE = moeW.NumExperts, topK = moeW.NumExpertsPerTok;
         int sharedI = moeW.SharedIntermediateSize;
+        // shortcut: Flint only - DeepSeek-style models (GLM-4.7-Flash, DeepSeek-V2) meet the same shape but have no real-model check here yet;
+        // drop the architecture test once one passes.
+        if (Config.Architecture != DotLLM.Core.Configuration.Architecture.Flint) return false;
         if (!MoeDecodeFusedEnabled || seqLen != 1 || moeW.GptOss is not null || moeW.NumSharedExperts != 1 || moeW.SharedExpertGate is not null
             || _currentLora is not null || _residualScale != 1.0f || lw.PostFfnNormWeight is not null || lw.Gemma4 is not null
             || moeW.GateDeviceQuantType != QuantType.F32)
