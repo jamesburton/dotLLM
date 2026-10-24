@@ -17,7 +17,7 @@ public class GenericToolCallParserTests
         Assert.NotNull(calls);
         Assert.Single(calls);
         Assert.Equal("get_weather", calls![0].FunctionName);
-        Assert.Contains("London", calls[0].Arguments);
+        Assert.Contains("London", calls[0].Arguments, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -30,7 +30,7 @@ public class GenericToolCallParserTests
         Assert.NotNull(calls);
         Assert.Single(calls);
         Assert.Equal("get_weather", calls![0].FunctionName);
-        Assert.Contains("Tokyo", calls[0].Arguments);
+        Assert.Contains("Tokyo", calls[0].Arguments, StringComparison.Ordinal);
     }
 
     [Fact]
