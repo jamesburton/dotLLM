@@ -10,7 +10,8 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// Tests cuBLAS GEMM correctness against CPU reference for various matrix sizes.
 /// </summary>
 [Trait("Category", "GPU")]
-public class CudaGemmTest : IDisposable
+[Collection(CudaCollection.Name)]
+public sealed class CudaGemmTest : IDisposable
 {
     private readonly ITestOutputHelper _out;
     private readonly CudaContext? _ctx;

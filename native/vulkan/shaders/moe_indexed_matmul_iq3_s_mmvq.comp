@@ -1,0 +1,128 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// MoE INDEXED IQ3_S MMVQ decode GEMV (issue #823): the dense matmul_iq3_s_mmvq.comp lane layout over a packed IQ3_S expert bank.
+//
+//   y[n, m] = sum_k dequant_iq3_s(bank[indices[n], m, k]) * x[n, k]
+//
+// x is pre-quantized to Q8_1 (QuantizeQ8_1RowsKernel). IQ3_S rebuilds each pair's 8 weights from TWO 4-byte iq3s grid entries
+// (9-bit index = qs_low | qh_high<<8) plus an explicit 8-bit sign mask per pair; sign*grid is int8 -> dp4a:
+//   sum_i w_i*x_i = db * d_x * dp4a(sign*grid, xq)
+// Lane layout (one wave32 subgroup per output cell (n, m); 4 lanes per 32-element sub-block, 8 sub-blocks per iteration):
+// lane L -> sub-block ib32 = L/4, pair l = L%4 (8 elements = 2 grid lookups = 2 dp4a). Reduction: one subgroupAdd.
+//
+// IQ3_S super-block (110 bytes / 256 elements; matches matmul_iq3_s_f32_gemv.comp):
+//   [0,1] fp16 d | [2..65] qs[64] | [66..73] qh[8] | [74..105] signs[32] | [106..109] scales[4] (db = d*(1+2*sub))
+//
+// NOT bit-exact vs the CPU (x is int8-quantized); validated against Dequantize.ToFloat32 with a Q8_1-quantized x.
+// Dispatch: 2D grid - gl_WorkGroupID.x = m, gl_WorkGroupID.y = n.
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufBank { uint  bank[]; };      // IQ3_S blob [numExperts, M, K/256 x 110 B]
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq   { uint  xq[]; };        // [N * K/4] packed int8 activations
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds  { vec2  xds[]; };       // [N * K/32] (d_x, s)
+layout(set = 0, binding = 3, std430) readonly  buffer BufIdx  { int   indices[]; };   // [N]
+layout(set = 0, binding = 4, std430) writeonly buffer BufY    { float y[]; };         // [N * M]
+layout(set = 0, binding = 5, std430) readonly  buffer BufGrid { uint  iq3sGrid[]; };  // 512 x uint32 (4 grid bytes each)
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+    uint numExperts;
+    uint blocksPerRow;  // K / 256
+    uint xDiv;          // activation row = n / xDiv (1 = per-row input; topK = one row broadcast to its topK expert slots)
+} pc;
+
+const uint IQ3_S_BLOCK_BYTES = 110u;
+
+uint readByte(uint absByteOff) {
+    uint u = bank[absByteOff >> 2u];
+    return (u >> ((absByteOff & 3u) * 8u)) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = bank[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = bank[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+uint gridByte(uint absIdx) {
+    uint u = iq3sGrid[absIdx >> 2u];
+    return (u >> ((absIdx & 3u) * 8u)) & 0xFFu;
+}
+
+// Pack 4 sign*grid int8 values: grid bytes gOff..gOff+3, sign bits sgnBase..sgnBase+3.
+uint packSG(uint gOff, uint signs, uint sgnBase) {
+    uint res = 0u;
+    for (uint e = 0u; e < 4u; e++) {
+        int g = int(gridByte(gOff + e));
+        int sg = ((signs & (1u << (sgnBase + e))) != 0u) ? -g : g;
+        res |= (uint(sg) & 0xFFu) << (e * 8u);
+    }
+    return res;
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    uint n = gl_WorkGroupID.y;
+    if (m >= pc.M || n >= pc.N) return;
+
+    uint expert = uint(indices[n]);
+    if (expert >= pc.numExperts) return; // defensive: bad index leaves y untouched
+
+    uint lane = gl_LocalInvocationID.x;   // 0..31
+    uint ib32 = lane >> 2u;               // sub-block 0..7
+    uint l    = lane & 3u;                // pair 0..3 (8 elements)
+
+    uint rowByteBase = (expert * pc.M + m) * pc.blocksPerRow * IQ3_S_BLOCK_BYTES;
+    uint xRow        = n / pc.xDiv;
+    uint xqRowBase   = xRow * (pc.K >> 2u);
+    uint xdsRowBase  = xRow * (pc.K >> 5u);
+    float acc = 0.0;
+
+    for (uint blk = 0u; blk < pc.blocksPerRow; blk++) {
+        uint blockByteBase = rowByteBase + blk * IQ3_S_BLOCK_BYTES;
+        float d = readHalf(blockByteBase);
+
+        uint qsSubBase = blockByteBase + 2u + ib32 * 8u;
+        uint lo1 = readByte(qsSubBase + 2u * l + 0u);
+        uint lo2 = readByte(qsSubBase + 2u * l + 1u);
+        uint qhByte = readByte(blockByteBase + 66u + ib32);
+        uint hi1 = (qhByte << (8u - 2u * l)) & 0x100u;
+        uint hi2 = (qhByte << (7u - 2u * l)) & 0x100u;
+        uint g1 = lo1 | hi1;
+        uint g2 = lo2 | hi2;
+
+        uint signs = readByte(blockByteBase + 74u + ib32 * 4u + l);
+
+        uint scaleByte = readByte(blockByteBase + 106u + (ib32 >> 1u));
+        uint subScale  = ((ib32 & 1u) == 0u) ? (scaleByte & 0xFu) : (scaleByte >> 4u);
+        float db = d * float(1u + 2u * subScale);
+
+        uint wLo = packSG(g1 * 4u, signs, 0u);   // elems 0..3, sign bits 0..3
+        uint wHi = packSG(g2 * 4u, signs, 4u);   // elems 4..7, sign bits 4..7
+
+        // Pair l's 8 elements: blk*256 + ib32*32 + l*8 -> xq uint blk*64 + ib32*8 + l*2.
+        uint xqi = xqRowBase + blk * 64u + ib32 * 8u + l * 2u;
+        int dotI = dotPacked4x8AccSatEXT(int(wLo), int(xq[xqi]), 0);
+        dotI = dotPacked4x8AccSatEXT(int(wHi), int(xq[xqi + 1u]), dotI);
+
+        float dX = xds[xdsRowBase + blk * 8u + ib32].x;
+        acc += db * (dX * float(dotI));
+    }
+
+    float total = subgroupAdd(acc);
+    if (subgroupElect())
+        y[n * pc.M + m] = total;
+}
