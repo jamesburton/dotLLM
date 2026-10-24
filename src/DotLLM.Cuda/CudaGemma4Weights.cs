@@ -217,7 +217,7 @@ internal static unsafe class CudaGemma4WeightsLoader
         return extras;
     }
 
-    private static nint UploadF32Array(float[] data, List<nint> allocs)
+    private static nint UploadF32Array(ReadOnlySpan<float> data, List<nint> allocs)
         => UploadF32Span(data, allocs);
 
     private static nint UploadF32Span(ReadOnlySpan<float> data, List<nint> allocs)

@@ -106,7 +106,7 @@ public sealed unsafe class CudaLfm2MoeTransformerModel : IModel
         _weights.Add(ptr); _weightBytes += bytes;
         CudaDriverApi.cuMemcpyHtoD_v2(ptr, source, (nuint)bytes).ThrowOnError(); return ptr;
     }
-    private nint UploadFloats(float[] values)
+    private nint UploadFloats(ReadOnlySpan<float> values)
     {
         fixed (float* p = values) return UploadBytes((nint)p, (long)values.Length * 4);
     }

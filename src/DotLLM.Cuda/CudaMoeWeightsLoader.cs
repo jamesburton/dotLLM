@@ -401,7 +401,7 @@ internal static unsafe class CudaMoeWeightsLoader
         return devPtr;
     }
 
-    private static nint UploadF32Array(float[] data, List<nint> allocs)
+    private static nint UploadF32Array(ReadOnlySpan<float> data, List<nint> allocs)
     {
         long bytes = (long)data.Length * sizeof(float);
         CudaDriverApi.cuMemAlloc_v2(out nint devPtr, (nuint)bytes).ThrowOnError();
