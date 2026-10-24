@@ -227,6 +227,7 @@ public static unsafe partial class MoeSwiGluMlp
     /// <param name="sigmoidGating">When true, router scores are <c>sigmoid(logit)</c> instead of softmax (DeepSeek-V3 / GLM-4.7-Flash).</param>
     /// <param name="selectionBias">Optional per-expert bias added to the sigmoid scores for top-k SELECTION only (<c>exp_probs_b</c>); gating weights stay unbiased.</param>
     /// <param name="weightsScale">Multiplier applied to the final (optionally renormalised) top-k weights (<c>expert_weights_scale</c>).</param>
+    /// <param name="pool">Optional pool for the router logits (split over experts, same per-row dot, so bit-identical to serial).</param>
     /// <returns>Number of unique experts actually used (the valid prefix length of <paramref name="uniqueExperts"/>).</returns>
     public static int Route(
         ReadOnlySpan<float> hidden,
@@ -243,7 +244,8 @@ public static unsafe partial class MoeSwiGluMlp
         ReadOnlySpan<float> gateBias = default,
         bool sigmoidGating = false,
         ReadOnlySpan<float> selectionBias = default,
-        float weightsScale = 1.0f)
+        float weightsScale = 1.0f,
+        ComputeThreadPool? pool = null)
     {
         if (numExperts <= 0) throw new ArgumentOutOfRangeException(nameof(numExperts));
         if (numExpertsPerTok <= 0 || numExpertsPerTok > numExperts)
@@ -276,11 +278,25 @@ public static unsafe partial class MoeSwiGluMlp
             fixed (float* gateWPtr = gateWeights)
             fixed (float* logitsAllPtr = gateLogitsBuf)
             {
-                for (int t = 0; t < seqLen; t++)
+                if (pool is not null && numExperts >= 64)
                 {
-                    float* x = hiddenPtr + t * hiddenSize;
-                    float* logits = logitsAllPtr + t * numExperts;
-                    MatMul.GemvF32(gateWPtr, x, logits, numExperts, hiddenSize);
+                    // #1159: the same per-(row, token) dot, split over expert rows; each worker reuses its rows across every
+                    // token from cache instead of streaming the whole router once per token on one thread.
+                    var ctx = new RouterLogitsCtx
+                    {
+                        Gate = gateWPtr, Hidden = hiddenPtr, Logits = logitsAllPtr,
+                        NumExperts = numExperts, HiddenSize = hiddenSize, SeqLen = seqLen,
+                    };
+                    pool.Dispatch((nint)(&ctx), &RouterLogitsWorker);
+                }
+                else
+                {
+                    for (int t = 0; t < seqLen; t++)
+                    {
+                        float* x = hiddenPtr + t * hiddenSize;
+                        float* logits = logitsAllPtr + t * numExperts;
+                        MatMul.GemvF32(gateWPtr, x, logits, numExperts, hiddenSize);
+                    }
                 }
             }
 
@@ -539,8 +555,10 @@ public static unsafe partial class MoeSwiGluMlp
             // (gather/gate/up/silu/down scratch + optional Q8 input scratch) is owned by
             // the worker — when parallelised each thread rents its own. Per-expert writes
             // hit disjoint (token, slot) rows in scatterDown by construction.
+            bool sharedDone = false;
             fixed (float* hiddenPtr = hidden)
             fixed (float* scatterDownPtr = scatterDownBuf)
+            fixed (float* sharedDownOut = sharedDownBatchBuf)
             {
                 // Snapshot pointers + sizes the worker captures.
                 var workerCtx = new RoutedExpertWorkerCtx
@@ -566,6 +584,18 @@ public static unsafe partial class MoeSwiGluMlp
                     PackedLegacy = packedLegacyExperts,
                 };
 
+                // An ungated raw-quant single shared expert can ride in the decode path's two dispatches (#1159).
+                bool sharedFusable = hasSharedExpert && numSharedExperts == 1 && !hasSharedGate
+                    && sharedGateProj[0] == 0 && sharedUpProj[0] == 0 && sharedDownProj[0] == 0
+                    && sharedGateRaw.Length > 0 && sharedUpRaw.Length > 0 && sharedDownRaw.Length > 0;
+                var sharedN1 = sharedFusable
+                    ? new DecodeN1Shared
+                    {
+                        Gate = sharedGateRaw[0], Up = sharedUpRaw[0], Down = sharedDownRaw[0],
+                        GateQt = sharedGateRawQt, UpQt = sharedUpRawQt, DownQt = sharedDownRawQt,
+                        Intermediate = sharedIntermediateSize, Out = sharedDownOut, Layer = loraLayer,
+                    }
+                    : default;
                 if (seqLen == 1 && threadPool is not null && loraAdapter is null
                     && gateExpsF32Ptrs.IsEmpty && upExpsF32Ptrs.IsEmpty && downExpsF32Ptrs.IsEmpty
                     && TryExecuteRoutedDecodeN1(
@@ -574,7 +604,8 @@ public static unsafe partial class MoeSwiGluMlp
                         upExpsRawBase, upExpsQt, upExpsRowBytes,
                         downExpsRawBase, downExpsQt, downExpsRowBytes,
                         bucketCursors, bucketSlots, uniqueExperts, uniqueExpertCount,
-                        numExpertsPerTok, hiddenSize, intermediateSize, useGeGLU, threadPool, packedLegacyExperts))
+                        numExpertsPerTok, hiddenSize, intermediateSize, useGeGLU, threadPool, packedLegacyExperts,
+                        sharedN1, out sharedDone))
                 {
                     // Decode fast path ran: two pool dispatches for the whole layer (see TryExecuteRoutedDecodeN1).
                 }
@@ -621,7 +652,12 @@ public static unsafe partial class MoeSwiGluMlp
             }
 
             // ────────────── Shared-expert batched compute (F32, or the raw quant view when the F32 slot is 0) ──────────────
-            if (hasSharedExpert)
+            long _ps = CpuStageProf.T();
+            if (sharedDone)
+            {
+                sharedScaleBuf![0] = 1.0f;   // ungated: the fused decode path already wrote the shared down row
+            }
+            else if (hasSharedExpert)
             {
                 fixed (float* hiddenPtr = hidden)
                 fixed (float* sgBatch = sharedGateBatchBuf)
@@ -696,6 +732,8 @@ public static unsafe partial class MoeSwiGluMlp
                 }
             }
 
+            CpuStageProf.E(14, _ps);
+
             // ────────────── Final in-order accumulation ──────────────
             var acc = accBuf.AsSpan(0, hiddenSize);
             fixed (float* outPtr = output)
@@ -729,6 +767,37 @@ public static unsafe partial class MoeSwiGluMlp
             if (sharedDownBatchBuf is not null) ArrayPool<float>.Shared.Return(sharedDownBatchBuf);
             if (sharedScaleBuf is not null) ArrayPool<float>.Shared.Return(sharedScaleBuf);
             ArrayPool<float>.Shared.Return(accBuf);
+        }
+    }
+
+    private struct RouterLogitsCtx
+    {
+        public float* Gate;
+        public float* Hidden;
+        public float* Logits;
+        public int NumExperts;
+        public int HiddenSize;
+        public int SeqLen;
+    }
+
+    /// <summary>Router rows to keep hot while every token is dotted against them (8 KiB per row at Flint's 2048).</summary>
+    private const int RouterRowTile = 8;
+
+    private static void RouterLogitsWorker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        ref var c = ref Unsafe.AsRef<RouterLogitsCtx>((void*)ctxPtr);
+        ComputeThreadPool.PartitionRange(c.NumExperts, threadIdx, threadCount, out int start, out int end);
+        int k = c.HiddenSize;
+        for (int r0 = start; r0 < end; r0 += RouterRowTile)
+        {
+            int r1 = Math.Min(end, r0 + RouterRowTile);
+            for (int t = 0; t < c.SeqLen; t++)
+            {
+                var x = new ReadOnlySpan<float>(c.Hidden + (long)t * k, k);
+                float* logits = c.Logits + (long)t * c.NumExperts;
+                for (int r = r0; r < r1; r++)
+                    logits[r] = TensorPrimitives.Dot(new ReadOnlySpan<float>(c.Gate + (long)r * k, k), x);
+            }
         }
     }
 

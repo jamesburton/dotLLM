@@ -182,6 +182,7 @@ public static unsafe partial class MatMul
         public byte* PreQuantInput;
         public int BlockCount;
         public int TotalRows;
+        public long Next;             // next unclaimed row (dynamic scheduling, #1159)
     }
 
     /// <summary>Fused context for 2 projections (Gate/Up) in one dispatch.</summary>
@@ -192,96 +193,55 @@ public static unsafe partial class MatMul
         public byte* PreQuantInput;
         public int BlockCount;
         public int TotalRows;
+        public long Next;             // next unclaimed row (dynamic scheduling, #1159)
     }
 
     // ──────────────────── Workers ────────────────────
 
+    /// <summary>
+    /// Rows per dynamic claim. A multiple of 8 so claims keep the 4- and 8-row kernel groupings of a projection that starts on a
+    /// claim boundary; rows are independent, so which thread computes a row never changes its value.
+    /// </summary>
+    private const int FusedClaimRows = 32;
+
+    // Dynamic claims instead of a static 1/threadCount slice (#1159): on a hybrid P/E-core CPU, or with another process on a
+    // core, the static slice made every decode dispatch wait for the slowest thread (the MoE decode path already claims).
     private static void FusedDecode3Worker(nint ctxPtr, int threadIdx, int threadCount)
     {
         ref var ctx = ref Unsafe.AsRef<FusedDecode3Ctx>((void*)ctxPtr);
-        PartitionRows(ctx.TotalRows, threadIdx, threadCount, out int start, out int count);
-        if (count == 0) return;
-
-        int end = start + count;
-        int offset = 0;
-
-        // Proj0
-        if (ctx.Proj0.M > 0)
+        while (true)
         {
-            int projStart = Math.Max(0, start - offset);
-            int projEnd = Math.Min(ctx.Proj0.M, end - offset);
-            if (projEnd > projStart)
-                ctx.Proj0.ComputeRows(
-                    ctx.Proj0.Weights + (long)projStart * ctx.Proj0.WeightRowBytes,
-                    ctx.PreQuantInput,
-                    ctx.Proj0.Result + projStart,
-                    projEnd - projStart, ctx.BlockCount);
-            offset += ctx.Proj0.M;
-        }
-
-        // Proj1
-        if (ctx.Proj1.M > 0)
-        {
-            int projStart = Math.Max(0, start - offset);
-            int projEnd = Math.Min(ctx.Proj1.M, end - offset);
-            if (projEnd > projStart)
-                ctx.Proj1.ComputeRows(
-                    ctx.Proj1.Weights + (long)projStart * ctx.Proj1.WeightRowBytes,
-                    ctx.PreQuantInput,
-                    ctx.Proj1.Result + projStart,
-                    projEnd - projStart, ctx.BlockCount);
-            offset += ctx.Proj1.M;
-        }
-
-        // Proj2
-        if (ctx.Proj2.M > 0)
-        {
-            int projStart = Math.Max(0, start - offset);
-            int projEnd = Math.Min(ctx.Proj2.M, end - offset);
-            if (projEnd > projStart)
-                ctx.Proj2.ComputeRows(
-                    ctx.Proj2.Weights + (long)projStart * ctx.Proj2.WeightRowBytes,
-                    ctx.PreQuantInput,
-                    ctx.Proj2.Result + projStart,
-                    projEnd - projStart, ctx.BlockCount);
+            long s = Interlocked.Add(ref ctx.Next, FusedClaimRows) - FusedClaimRows;
+            if (s >= ctx.TotalRows) break;
+            int start = (int)s, end = Math.Min(ctx.TotalRows, start + FusedClaimRows);
+            FusedRange(ref ctx.Proj0, 0, start, end, ctx.PreQuantInput, ctx.BlockCount);
+            FusedRange(ref ctx.Proj1, ctx.Proj0.M, start, end, ctx.PreQuantInput, ctx.BlockCount);
+            FusedRange(ref ctx.Proj2, ctx.Proj0.M + ctx.Proj1.M, start, end, ctx.PreQuantInput, ctx.BlockCount);
         }
     }
 
     private static void FusedDecode2Worker(nint ctxPtr, int threadIdx, int threadCount)
     {
         ref var ctx = ref Unsafe.AsRef<FusedDecode2Ctx>((void*)ctxPtr);
-        PartitionRows(ctx.TotalRows, threadIdx, threadCount, out int start, out int count);
-        if (count == 0) return;
-
-        int end = start + count;
-        int offset = 0;
-
-        // Proj0
-        if (ctx.Proj0.M > 0)
+        while (true)
         {
-            int projStart = Math.Max(0, start - offset);
-            int projEnd = Math.Min(ctx.Proj0.M, end - offset);
-            if (projEnd > projStart)
-                ctx.Proj0.ComputeRows(
-                    ctx.Proj0.Weights + (long)projStart * ctx.Proj0.WeightRowBytes,
-                    ctx.PreQuantInput,
-                    ctx.Proj0.Result + projStart,
-                    projEnd - projStart, ctx.BlockCount);
-            offset += ctx.Proj0.M;
+            long s = Interlocked.Add(ref ctx.Next, FusedClaimRows) - FusedClaimRows;
+            if (s >= ctx.TotalRows) break;
+            int start = (int)s, end = Math.Min(ctx.TotalRows, start + FusedClaimRows);
+            FusedRange(ref ctx.Proj0, 0, start, end, ctx.PreQuantInput, ctx.BlockCount);
+            FusedRange(ref ctx.Proj1, ctx.Proj0.M, start, end, ctx.PreQuantInput, ctx.BlockCount);
         }
+    }
 
-        // Proj1
-        if (ctx.Proj1.M > 0)
-        {
-            int projStart = Math.Max(0, start - offset);
-            int projEnd = Math.Min(ctx.Proj1.M, end - offset);
-            if (projEnd > projStart)
-                ctx.Proj1.ComputeRows(
-                    ctx.Proj1.Weights + (long)projStart * ctx.Proj1.WeightRowBytes,
-                    ctx.PreQuantInput,
-                    ctx.Proj1.Result + projStart,
-                    projEnd - projStart, ctx.BlockCount);
-        }
+    /// <summary>Computes the part of the fused row range <c>[start, end)</c> that falls in <paramref name="p"/> (rows <c>offset..offset+M</c>).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void FusedRange(ref FusedProjection p, int offset, int start, int end, byte* xQ, int blockCount)
+    {
+        if (p.M <= 0) return;
+        int projStart = Math.Max(0, start - offset);
+        int projEnd = Math.Min(p.M, end - offset);
+        if (projEnd > projStart)
+            p.ComputeRows(p.Weights + (long)projStart * p.WeightRowBytes, xQ, p.Result + projStart, projEnd - projStart, blockCount);
     }
 
     // ──────────────────── Build FusedProjection helper ────────────────────

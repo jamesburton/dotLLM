@@ -20,10 +20,32 @@ public static unsafe partial class MoeSwiGluMlp
     /// </summary>
     public static bool DecodeN1Enabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_CPU_MOE_DECODE_N1") != "0";
 
+    // Per calling thread (the forward runs the decision on its own thread), so parallel tests cannot see each other's calls.
+    [ThreadStatic]
     private static long _decodeN1Calls;
 
-    /// <summary>Number of layers served by the n=1 decode fast path (diagnostic / test oracle that the path really ran).</summary>
-    public static long DecodeN1Calls => Interlocked.Read(ref _decodeN1Calls);
+    /// <summary>Number of layers served by the n=1 decode fast path on the calling thread (test oracle that the path ran).</summary>
+    public static long DecodeN1Calls => _decodeN1Calls;
+
+    [ThreadStatic]
+    private static long _decodeN1SharedFused;
+
+    /// <summary>Number of those layers whose shared expert was folded into the two dispatches (calling thread, #1159).</summary>
+    public static long DecodeN1SharedFusedCalls => _decodeN1SharedFused;
+
+    /// <summary>The single ungated shared expert the n=1 decode path may fold into its two dispatches (#1159).</summary>
+    private readonly struct DecodeN1Shared
+    {
+        public nint Gate { get; init; }
+        public nint Up { get; init; }
+        public nint Down { get; init; }
+        public QuantizationType GateQt { get; init; }
+        public QuantizationType UpQt { get; init; }
+        public QuantizationType DownQt { get; init; }
+        public int Intermediate { get; init; }
+        public float* Out { get; init; }
+        public int Layer { get; init; }
+    }
 
     private struct DecodeN1Ctx
     {
@@ -31,6 +53,7 @@ public static unsafe partial class MoeSwiGluMlp
         public int RowsPerSegment;    // M of every segment in this dispatch
         public int RowAlignment;      // legacy four-row kernels must retain their grouped-path row boundaries
         public int BlockCount;
+        public int BlockCount1;       // kind-1 reduction width when it differs (the fused shared-expert down, #1159)
         public long WeightRowBytes0, WeightRowBytes1; // per projection kind (gate/up share a quant family but may differ in qt)
         public delegate*<byte*, byte*, float*, int, int, void> Rows0;
         public delegate*<byte*, byte*, float*, int, int, void> Rows1;
@@ -75,7 +98,7 @@ public static unsafe partial class MoeSwiGluMlp
             bool k1 = c.SegKind[seg] != 0;
             long rb = k1 ? c.WeightRowBytes1 : c.WeightRowBytes0;
             var fn = k1 ? c.Rows1 : c.Rows0;
-            fn(c.SegWeights[seg] + row * rb, c.SegInput[seg], c.SegResults[seg] + row, n, c.BlockCount);
+            fn(c.SegWeights[seg] + row * rb, c.SegInput[seg], c.SegResults[seg] + row, n, k1 ? c.BlockCount1 : c.BlockCount);
             start += groups;
         }
     }
@@ -92,8 +115,10 @@ public static unsafe partial class MoeSwiGluMlp
         nint downBase, QuantizationType downQt, long downExpBytes,
         ReadOnlySpan<int> bucketCursors, ReadOnlySpan<int> bucketSlots,
         ReadOnlySpan<int> uniqueExperts, int uniqueCount,
-        int numExpertsPerTok, int hiddenSize, int intermediateSize, bool useGeGLU, ComputeThreadPool pool, bool packedLegacy)
+        int numExpertsPerTok, int hiddenSize, int intermediateSize, bool useGeGLU, ComputeThreadPool pool, bool packedLegacy,
+        in DecodeN1Shared shared, out bool sharedDone)
     {
+        sharedDone = false;
         if (!DecodeN1Enabled || DiagF32Activations || uniqueCount < 1) return false;
         // Legacy rows quantize activations. Preserve the explicitly selected F32-activation fallback.
         if (!packedLegacy && (IsPackedLegacyQuant(gateQt) || IsPackedLegacyQuant(upQt) || IsPackedLegacyQuant(downQt))) return false;
@@ -108,6 +133,23 @@ public static unsafe partial class MoeSwiGluMlp
         if (gatePre <= 0 || downPre <= 0) return false;
         if (upQt != gateQt && ComputePrequantBytes(upQt, hiddenSize, 1) != gatePre) return false;
 
+        // #1159: one shared expert of the same gate/up quant rides in dispatch A (as extra 'inter'-row segments) and its down
+        // projection in dispatch B (kind 1, own reduction width): three fewer pool barriers per layer. Same row kernels, same
+        // activation and same Q8_1 input as SharedProjection's GEMV, so the result is unchanged.
+        int sInter = shared.Intermediate;
+        bool fuseShared = shared.Gate != 0 && shared.Up != 0 && shared.Down != 0 && shared.Out != null
+            && shared.GateQt == gateQt && shared.UpQt == upQt && sInter > 0 && sInter % intermediateSize == 0;
+        delegate*<byte*, byte*, float*, int, int, void> sDownRows = null;
+        long sDownRowBytes = 0;
+        int sBlocks = 0, sDownPre = 0;
+        if (fuseShared)
+        {
+            fuseShared = MatMul.TryGetDecodeRowKernel(shared.DownQt, sInter, out sDownRows, out sDownRowBytes, out sBlocks, out _)
+                && (IsPackedLegacyQuant(shared.DownQt) == IsPackedLegacyQuant(downQt))
+                && (sDownPre = ComputePrequantBytes(shared.DownQt, sInter, 1)) > 0;
+        }
+        int sSegs = fuseShared ? sInter / intermediateSize : 0;
+
         int u = uniqueCount;
         // Per-expert slot (token 0 -> top-k slot) and a batch==1 guard.
         Span<int> slots = stackalloc int[u];
@@ -121,9 +163,9 @@ public static unsafe partial class MoeSwiGluMlp
 
         long t0 = CpuStageProf.T();
         int inter = intermediateSize;
-        float[] actBuf = ArrayPool<float>.Shared.Rent(u * inter * 3);
-        byte[] qBuf = ArrayPool<byte>.Shared.Rent(gatePre + u * downPre + 64);
-        nint* ptrs = (nint*)NativeMemory.Alloc((nuint)(sizeof(nint) * (u * 6 + 8)));
+        float[] actBuf = ArrayPool<float>.Shared.Rent(u * inter * 3 + 3 * sInter);
+        byte[] qBuf = ArrayPool<byte>.Shared.Rent(gatePre + u * downPre + sDownPre + 64);
+        nint* ptrs = (nint*)NativeMemory.Alloc((nuint)(sizeof(nint) * ((u + sSegs) * 6 + 8)));
         try
         {
             fixed (float* act = actBuf)
@@ -134,12 +176,16 @@ public static unsafe partial class MoeSwiGluMlp
                 float* siluOut = act + 2 * u * inter;
                 byte* xQ = q;
                 byte* siluQ = q + gatePre;
+                float* sGateOut = act + 3 * u * inter;   // [sInter] each, used only when the shared expert is fused
+                float* sUpOut = sGateOut + sInter;
+                float* sSiluOut = sUpOut + sInter;
+                byte* sSiluQ = siluQ + (long)u * downPre;
 
                 QuantizeBatchForWeightQt(gateQt, hiddenPtr, xQ, hiddenSize, 1);
                 CpuStageProf.E(9, t0); t0 = CpuStageProf.T();
 
                 // ── Dispatch A: gate + up rows of every expert ──
-                int segs = 2 * u;
+                int segs = 2 * (u + sSegs);
                 byte** segW = (byte**)ptrs; float** segR = (float**)(ptrs + segs); byte** segI = (byte**)(ptrs + 2 * segs);
                 byte* kind = (byte*)(ptrs + 3 * segs);
                 for (int i = 0; i < u; i++)
@@ -148,9 +194,16 @@ public static unsafe partial class MoeSwiGluMlp
                     segW[2 * i] = (byte*)(gateBase + (nint)(e * gateExpBytes)); segR[2 * i] = gateOut + i * inter; segI[2 * i] = xQ; kind[2 * i] = 0;
                     segW[2 * i + 1] = (byte*)(upBase + (nint)(e * upExpBytes)); segR[2 * i + 1] = upOut + i * inter; segI[2 * i + 1] = xQ; kind[2 * i + 1] = 1;
                 }
+                for (int j = 0; j < sSegs; j++)
+                {
+                    int sg = 2 * (u + j);
+                    long rowOff = (long)j * inter;
+                    segW[sg] = (byte*)shared.Gate + rowOff * gateRowBytes; segR[sg] = sGateOut + rowOff; segI[sg] = xQ; kind[sg] = 0;
+                    segW[sg + 1] = (byte*)shared.Up + rowOff * upRowBytes; segR[sg + 1] = sUpOut + rowOff; segI[sg + 1] = xQ; kind[sg + 1] = 1;
+                }
                 var ctx = new DecodeN1Ctx
                 {
-                    Segments = segs, RowsPerSegment = inter, BlockCount = hBlocks,
+                    Segments = segs, RowsPerSegment = inter, BlockCount = hBlocks, BlockCount1 = hBlocks,
                     RowAlignment = IsPackedLegacyQuant(gateQt) || IsPackedLegacyQuant(upQt) ? 4 : 1,
                     WeightRowBytes0 = gateRowBytes, WeightRowBytes1 = upRowBytes, Rows0 = gateRows, Rows1 = upRows,
                     SegWeights = segW, SegResults = segR, SegInput = segI, SegKind = kind,
@@ -168,6 +221,15 @@ public static unsafe partial class MoeSwiGluMlp
                     downScale[i] = RescaleDownInputForF16Sums(siluOut + i * inter, inter);
                     QuantizeBatchForWeightQt(downQt, siluOut + i * inter, siluQ + (long)i * downPre, inter, 1);
                 }
+                if (fuseShared)
+                {
+                    var g = new ReadOnlySpan<float>(sGateOut, sInter);
+                    var up = new ReadOnlySpan<float>(sUpOut, sInter);
+                    var o = new Span<float>(sSiluOut, sInter);
+                    if (useGeGLU) FusedOps.GeGLUTanh(g, up, o); else FusedOps.SwiGLU(g, up, o);
+                    if (ActivationRangeProbe.On) ActivationRangeProbe.Record(shared.Layer, "shexp_down_in", sSiluOut, sInter);
+                    QuantizeBatchForWeightQt(shared.DownQt, sSiluOut, sSiluQ, sInter, 1);
+                }
                 CpuStageProf.E(11, t0); t0 = CpuStageProf.T();
 
                 // ── Dispatch B: down rows of every expert, written straight into the scatter table ──
@@ -177,11 +239,17 @@ public static unsafe partial class MoeSwiGluMlp
                     segW[i] = (byte*)(downBase + (nint)(e * downExpBytes)); segR[i] = scatterDownPtr + (long)slots[i] * hiddenSize;
                     segI[i] = siluQ + (long)i * downPre; kind[i] = 0;
                 }
+                if (fuseShared)
+                {
+                    segW[u] = (byte*)shared.Down; segR[u] = shared.Out; segI[u] = sSiluQ; kind[u] = 1;
+                }
                 var ctxB = new DecodeN1Ctx
                 {
-                    Segments = u, RowsPerSegment = hiddenSize, BlockCount = iBlocks,
+                    Segments = u + (fuseShared ? 1 : 0), RowsPerSegment = hiddenSize, BlockCount = iBlocks,
+                    BlockCount1 = fuseShared ? sBlocks : iBlocks,
                     RowAlignment = IsPackedLegacyQuant(downQt) ? 4 : 1,
-                    WeightRowBytes0 = downRowBytes, WeightRowBytes1 = downRowBytes, Rows0 = downRows, Rows1 = downRows,
+                    WeightRowBytes0 = downRowBytes, WeightRowBytes1 = fuseShared ? sDownRowBytes : downRowBytes,
+                    Rows0 = downRows, Rows1 = fuseShared ? sDownRows : downRows,
                     SegWeights = segW, SegResults = segR, SegInput = segI, SegKind = kind,
                 };
                 pool.Dispatch((nint)(&ctxB), &DecodeN1Worker);
@@ -195,7 +263,9 @@ public static unsafe partial class MoeSwiGluMlp
                 }
                 CpuStageProf.E(12, t0);
             }
-            Interlocked.Increment(ref _decodeN1Calls);
+            _decodeN1Calls++;
+            sharedDone = fuseShared;
+            if (fuseShared) _decodeN1SharedFused++;
             return true;
         }
         finally

@@ -135,21 +135,33 @@ public sealed class FlintSyntheticGoldenTests : IDisposable
     }
 
     /// <summary>
-    /// Attention and dense FFN in Q4_1 (the official file's layout). Prefill must equal llama.cpp run on the SAME weights dequantised
-    /// to F32 (<c>llama-quantize --allow-requantize ... F32</c>): dotLLM's batched Q4_1 GEMM multiplies the exact dequantised weights
-    /// by F32 activations. llama.cpp's own Q4_1 path quantises the activations to Q8_1 and lands far from both (KL 6e-3 at 512
-    /// tokens, head_dim 128), which is why the real-model KL against llama.cpp is not a parity metric for Flint (#1158). The routed
-    /// and shared experts run on Q8_1 activations in both engines (the packed dot), so they are covered by the quantised golden.
+    /// Attention and dense FFN in Q4_1 (the official file's layout). Since #1159 dotLLM's batched Q4_1 GEMM is the packed x Q8_1 dot
+    /// at every token count (bit-identical to its decode kernel), so prefill now runs llama.cpp's own arithmetic: it must match
+    /// llama.cpp on the SAME Q4_1 bytes. Before #1159 prefill multiplied the dequantised weights by F32 activations, which matched
+    /// llama.cpp only on the weights requantised to F32 and disagreed with dotLLM's own decode.
     /// </summary>
     [Fact]
-    public void DenseQ4_1_Prefill_Matches_Exact_Dequantised_Reference()
+    public void DenseQ4_1_Prefill_Matches_LlamaCpp_Q4_1_Golden()
     {
         using var gguf = GgufFile.Open(Write(DenseQ4_1, "denseq"));
         ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
         float[] ours = Run(gguf, cfg);
-        Assert.Equal(GoldenDenseQ4_1Exact.Length, ours.Length);
-        float diff = MaxAbs(ours, GoldenDenseQ4_1Exact);
-        Assert.True(diff < 1e-4f, $"max |dotLLM - exact| = {diff}");
+        Assert.Equal(GoldenDenseQ4_1LlamaCpp.Length, ours.Length);
+        float diff = MaxAbs(ours, GoldenDenseQ4_1LlamaCpp);
+        Assert.True(diff < QuantizedTolerance, $"max |dotLLM - llama.cpp Q4_1| = {diff}");
+    }
+
+    /// <summary>
+    /// Decode runs the dense Q4_1 projections on the same packed kernel as prefill (#1159), so the two paths agree to the
+    /// attention-path tolerance. Before #1159 prefill used F32 activations and decode Q8_1, and they differed by ~0.8 in the logits.
+    /// </summary>
+    [Fact]
+    public void DenseQ4_1_Decode_Equals_Prefill()
+    {
+        using var gguf = GgufFile.Open(Write(DenseQ4_1, "denseq"));
+        ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        float diff = MaxAbs(Run(gguf, cfg, decode: true), Run(gguf, cfg));
+        Assert.True(diff < 1e-4f, $"decode vs batched {diff}");
     }
 
     [Fact]
@@ -170,6 +182,27 @@ public sealed class FlintSyntheticGoldenTests : IDisposable
         }
         float diff = MaxAbs(Run(gguf, cfg, threading: new ThreadingConfig(4)), Run(gguf, cfg));
         Assert.True(diff < 1e-4f, $"threaded vs serial {diff}");
+    }
+
+    /// <summary>
+    /// All-Q4_1 (the official layout): threaded decode folds the ungated shared expert into the MoE decode path's two dispatches
+    /// (#1159). It must equal the serial decode, which runs the shared expert through its own GEMVs.
+    /// </summary>
+    [Fact]
+    public void AllQ4_1_ThreadedDecode_FusedSharedExpert_Matches_Serial()
+    {
+        var allQ4_1 = new SyntheticFlintGguf.Options
+        {
+            DenseQuant = QuantizationType.Q4_1, RoutedQuant = QuantizationType.Q4_1, SharedQuant = QuantizationType.Q4_1,
+        };
+        using var gguf = GgufFile.Open(Write(allQ4_1, "allq"));
+        ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        float[] serial = Run(gguf, cfg, decode: true);
+        long fused0 = DotLLM.Cpu.Kernels.MoeSwiGluMlp.DecodeN1SharedFusedCalls;
+        float[] threaded = Run(gguf, cfg, decode: true, threading: new ThreadingConfig(4));
+        Assert.True(DotLLM.Cpu.Kernels.MoeSwiGluMlp.DecodeN1SharedFusedCalls > fused0, "the fused shared-expert decode path did not run");
+        float diff = MaxAbs(threaded, serial);
+        Assert.True(diff < 1e-4f, $"threaded fused decode vs serial {diff}");
     }
 
     [Fact]
@@ -331,37 +364,37 @@ public sealed class FlintSyntheticGoldenTests : IDisposable
         "MkBWBDNAAHK6PzLqQ0AUavO+AOgePMX2JL8O+xfApjUuv53joL4A6Hg6zqZ/v37rHD8+lyJA6MWSviAvJT9rWUu/fNrHvuGphL9BYPm/zlMDP3/FTkAaE1rA" +
         "rcFjwE7tK0DsbAa/SeRRwP+EBsC6DP8/y6mVv6TmHUAuAYDAPBnzvg==");
 
-    /// <summary>llama.cpp CPU logits (16 x 40) for <see cref="Ids"/> on <c>Build(DenseQ4_1)</c> requantised to F32 (exact dequantised weights).</summary>
-    private static readonly float[] GoldenDenseQ4_1Exact = DecodeGolden(
-        "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");
+    /// <summary>llama.cpp CPU logits (16 x 40) for <see cref="Ids"/> on <c>Build(DenseQ4_1)</c> itself: its Q4_1 path, Q8_1 activations (#1159).</summary>
+    private static readonly float[] GoldenDenseQ4_1LlamaCpp = DecodeGolden(
+        "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");
 
     private static float[] DecodeGolden(string b64)
     {

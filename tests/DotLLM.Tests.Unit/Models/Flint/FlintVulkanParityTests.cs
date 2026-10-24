@@ -48,11 +48,20 @@ public sealed class FlintVulkanParityTests
             Config = GgufModelConfigExtractor.Extract(Gguf.Metadata);
         }
 
+        /// <summary>
+        /// CPU reference logits. The dense Q4_1 projections run on F32 activations here (the pre-#1159 CPU prefill), which is
+        /// what the Vulkan dense prefill implements; since #1159 the CPU default is llama.cpp's Q8_1-activation dot.
+        /// </summary>
         public float[] CpuPrefill(int[] ids)
         {
             using var cpu = TransformerModel.LoadFromGguf(Gguf, Config, ThreadingConfig.SingleThreaded);
-            using ITensor t = cpu.Forward(ids, Enumerable.Range(0, ids.Length).ToArray(), deviceId: -1);
-            return Copy(t);
+            DotLLM.Cpu.Kernels.MatMul.Q4PackedAllColumnsOverride = false;
+            try
+            {
+                using ITensor t = cpu.Forward(ids, Enumerable.Range(0, ids.Length).ToArray(), deviceId: -1);
+                return Copy(t);
+            }
+            finally { DotLLM.Cpu.Kernels.MatMul.Q4PackedAllColumnsOverride = null; }
         }
 
         public void Dispose()

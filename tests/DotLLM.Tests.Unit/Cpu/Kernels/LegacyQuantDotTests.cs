@@ -231,6 +231,65 @@ public sealed unsafe class LegacyQuantDotTests
     }
 
     /// <summary>
+    /// The eight-row Q4_0/Q4_1 kernel (#1159; gathered scales, VNNI where present) against the scalar dot per row, bit for bit.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(FormatsAndBlockCounts))]
+    public void Avx2Tier_8Rows_BitExactWithScalarPerRow(QuantizationType qt, int blockCount)
+    {
+        Skip.IfNot(Avx2.IsSupported, "needs AVX2");
+        Skip.IfNot(qt is QuantizationType.Q4_0 or QuantizationType.Q4_1, "8-row kernel covers Q4_0/Q4_1");
+        var rng = new Random(81159 + (int)qt * 31 + blockCount);
+        int rowBytes = blockCount * BlockBytes(qt);
+        byte* w = (byte*)NativeMemory.Alloc((nuint)(8 * rowBytes));
+        byte* x = (byte*)NativeMemory.Alloc((nuint)(blockCount * Q81Bytes));
+        float* res = stackalloc float[8];
+        try
+        {
+            for (int r = 0; r < 8; r++) FillWeightRow(rng, qt, w + r * rowBytes, blockCount, unitScales: false);
+            QuantizedQ8_1Row(rng, x, blockCount);
+
+            MatMul.VecDotQ4Avx2_8Rows(qt, w, rowBytes, x, blockCount, res);
+            for (int r = 0; r < 8; r++)
+                AssertBitEqual(MatMul.VecDotLegacyQuantScalar(qt, w + r * rowBytes, x, blockCount), res[r],
+                    $"{qt} AVX2 8-rows r={r} bc={blockCount}");
+        }
+        finally { NativeMemory.Free(w); NativeMemory.Free(x); }
+    }
+
+    /// <summary>
+    /// The multi-column Q4_0/Q4_1 driver is bit-exact per column with the scalar dot (#1159), across eight-row groups, a
+    /// four-row tail, a token tail past the four-column tile and the single-column path — so a token's expert output does not
+    /// depend on how many tokens routed to the same expert.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(QuantizationType.Q4_0, 20, 5, 7)]
+    [InlineData(QuantizationType.Q4_1, 20, 18, 7)]
+    [InlineData(QuantizationType.Q4_1, 16, 64, 1)]
+    [InlineData(QuantizationType.Q4_1, 24, 16, 9)]
+    public void Q4Multi_BitExactWithScalarPerColumn(QuantizationType qt, int m, int blockCount, int n)
+    {
+        Skip.IfNot(Avx2.IsSupported, "needs AVX2");
+        var rng = new Random(91159 + (int)qt * 7 + m + n);
+        int rowBytes = blockCount * BlockBytes(qt), xRowBytes = blockCount * Q81Bytes;
+        byte* w = (byte*)NativeMemory.Alloc((nuint)(m * rowBytes));
+        byte* x = (byte*)NativeMemory.Alloc((nuint)(n * xRowBytes));
+        float* c = (float*)NativeMemory.Alloc((nuint)(n * m * sizeof(float)));
+        try
+        {
+            for (int r = 0; r < m; r++) FillWeightRow(rng, qt, w + r * rowBytes, blockCount, unitScales: false);
+            for (int t = 0; t < n; t++) QuantizedQ8_1Row(rng, x + t * xRowBytes, blockCount);
+
+            MatMul.ComputeRowsLegacyQuantMulti(qt, w, x, xRowBytes, c, m, m, n, blockCount);
+            for (int t = 0; t < n; t++)
+                for (int r = 0; r < m; r++)
+                    AssertBitEqual(MatMul.VecDotLegacyQuantScalar(qt, w + r * rowBytes, x + t * xRowBytes, blockCount), c[t * m + r],
+                        $"{qt} multi r={r} t={t} bc={blockCount}");
+        }
+        finally { NativeMemory.Free(w); NativeMemory.Free(x); NativeMemory.Free(c); }
+    }
+
+    /// <summary>
     /// The IQ4_NL sign trick needs PSIGN's operand never to be −128. That is a property of
     /// <see cref="MatMul.QuantizeF32ToQ8_1"/>, not of the kernel, so it is pinned here — including
     /// the inputs most likely to round to −128 (an exact negative maximum).
@@ -394,11 +453,16 @@ public sealed unsafe class LegacyQuantDotTests
                         $"{qt} [t={t},r={r}]: packed {packed[t * m + r]} vs dequant {dequant[t * m + r]} (mag {mag})");
                 }
 
-            // And the policy helper: n == 1 must take the packed path, n > 1 the dequant one.
+            // And the policy helper: n == 1 must take the packed path; n > 1 the dequant one, except Q4_0/Q4_1 on AVX2, whose
+            // exact multi-column kernel is packed at every n (#1159).
+            bool packedAtAnyN = MatMul.Q4PackedAllColumns && Avx2.IsSupported
+                && qt is QuantizationType.Q4_0 or QuantizationType.Q4_1;
             Assert.True(MatMul.UsesPackedLegacyDot(qt, 1));
-            Assert.False(MatMul.UsesPackedLegacyDot(qt, 2));
+            Assert.Equal(packedAtAnyN, MatMul.UsesPackedLegacyDot(qt, 2));
             Assert.False(MatMul.UsesPackedLegacyDot(QuantizationType.Q8_0, 1));
 
+            if (packedAtAnyN)
+                MatMul.GemmLegacyQuant(w, qt, xf, dequant, m, k, n);   // the expected output is then the packed GEMM's
             new Span<float>(packed, n * m).Clear();
             MatMul.GemmLegacyQuantOrDequant(w, qt, xf, packed, m, k, n, pool: null);
             for (int i = 0; i < n * m; i++) AssertBitEqual(dequant[i], packed[i], $"{qt} OrDequant n={n} [{i}]");

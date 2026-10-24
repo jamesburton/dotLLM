@@ -858,7 +858,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 normTopKProb: moe.NormTopKProb,
                 sigmoidGating: moe.SigmoidGating,
                 selectionBias: moe.SelectionBias is null ? default : moe.SelectionBias.AsSpan(),
-                weightsScale: moe.WeightsScale);
+                weightsScale: moe.WeightsScale,
+                pool: _threadPool);
             DotLLM.Cpu.CpuStageProf.E(4, _tr);
 
             bool raw = moe.HasRawQuantView;
