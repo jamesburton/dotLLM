@@ -1315,6 +1315,25 @@ from the mmap'd file (`--cpu-moe` / `--n-cpu-moe`, or automatically; see `docs/M
 **Known gaps** (follow-ups on #1157): the CUDA KV cache is full-length on every layer (no sliding-window ring, #1184); the F32
 `token_embd` is gathered on the host from the mmap for MoE models (#1183, 1.15 GiB of VRAM on Flint); resident MoE layers route on the device at decode
 (#1182) but the MoE decode body is not graph-captured (#1210); the CPU-expert layers' prefill runs partly on the GPU
-since #1202 (see `docs/MOE_OFFLOAD.md`); the FP16 residual stream is verified on 8 real layers only; the
-per-projection `DequantScratch` (F16 + F32, 72 MiB at Flint's 6144x2048) is still allocated though no Q4_1 path uses it (#1183);
+since #1202 (see `docs/MOE_OFFLOAD.md`); the FP16 residual stream is verified on 8 real layers only;
 NVFP4 grouped experts with the per-expert `_exps.scale` are not implemented (#1179).
+
+### Device memory: itemisation and runtime scratch (#1211)
+
+`DOTLLM_CUDA_MEM_TRACE=1` attributes every `cuMemAlloc_v2` / `cuMemCreate` to its first caller outside the interop layer
+(`CudaMemTrace`), logs allocations of 1 MiB or more as they happen, prints the driver's used VRAM at the load phases
+(context, cuBLAS, kernels, weights, forward state, first multi-token / decode forward) and dumps the live bytes per site
+when the model is disposed. Driver-used minus tracked is the context, modules and cuBLAS (on WDDM `cuMemGetInfo` also
+counts ~1 GiB the OS reserves, which `nvidia-smi` does not).
+
+What it found on Flint (`--n-cpu-moe 34`, pp512), and what changed:
+
+| item | before | after |
+|---|---|---|
+| allocation rounding: one `cuMemAlloc` per routed expert (0.625 MiB Q4_1, three per 2 MiB page) | ~480 MiB | one allocation per `[E, ...]` bank |
+| allocation rounding: one 2 MiB-rounded `cuMemAlloc` per dense tensor (6.25 MiB QKV takes 8) | ~150 MiB | `CudaWeightArena`: bump allocator in one VMM range (`DOTLLM_CUDA_WEIGHT_ARENA=0` off) |
+| F32 shadow of every activation (`HiddenStateF32` ... `SiluOutputF32`), read only by Gemma / high-precision I-quant | 66 MiB | allocated only for those forwards (rule 1, #1107) |
+| `DequantScratch` + `DequantScratchF32` for the largest projection, never read by in-place Q4_1 | 72 MiB | allocated on first use |
+
+Remaining runtime scratch at pp512 (~330 MiB): the prefill GPU leg's expert ring 120 MiB (#1202), MoE scratch 89 MiB
+(F32 `[seqLen*topK, hidden]` gather / down rows, #1107 inventory), FP16 activations 39 MiB, staging 10 MiB, cuBLAS 12 MiB.

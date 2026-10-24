@@ -190,6 +190,10 @@ internal sealed class CudaWeights : IDisposable
     public QuantizationType OutputQuantType { get; }
 
     private readonly List<nint> _allAllocations = new();
+    private CudaWeightArena? _arena;
+
+    /// <summary>Bytes of weights packed into the arena (#1211); 0 when it is off or unsupported.</summary>
+    internal long ArenaUsedBytes => _arena?.UsedBytes ?? 0;
 
     private CudaWeights(CudaLayerWeights[] layers, nint tokenEmbed, QuantizationType tokenEmbedQt,
                           nint outputNorm, nint outputWeight, int outputOutDim, int outputInDim,
@@ -295,6 +299,8 @@ internal sealed class CudaWeights : IDisposable
         using var uploadStaging = CudaWeightUploadStaging.BeginScope();
 
         var allocs = new List<nint>();
+        // #1211: model-lifetime tensors are packed into one arena instead of one cuMemAlloc each (2 MiB rounding).
+        var arena = CudaWeightArena.Begin();
         // #383: `allocs` already tracked every device buffer this method (and the MLA/MoE/
         // Gemma4 per-layer loaders below, which share this same list by reference) allocates —
         // it just was never used to clean up on a mid-load throw (device OOM, a corrupt tensor).
@@ -634,6 +640,7 @@ internal sealed class CudaWeights : IDisposable
         // carry their own YaRN cos/sin tables through CudaTransformerModel's MLA state).
         var (ropeYarnInvFreq, ropeYarnMscale) = UploadDenseYarnInvFreq(config, cpuWeights.RopeFreqFactors, allocs);
 
+        CudaWeightArena.End();
         return new CudaWeights(layers, tokenEmbed, tokenEmbedQt,
             outputNorm, outputWeight, cpuWeights.OutputOutputDim, cpuWeights.OutputInputDim,
             outputWeightQuant, cpuWeights.OutputQuantType, allocs,
@@ -641,16 +648,19 @@ internal sealed class CudaWeights : IDisposable
             ropeYarnInvFreq, ropeYarnMscale)
         {
             TokenEmbedHost = tokenEmbedHost,
+            _arena = arena,
         };
         }
         catch
         {
+            CudaWeightArena.End();
             // Best-effort drain of any pending async H2D copies (several upload helpers above
             // use cuMemcpyHtoDAsync_v2 on `stream`) before freeing the buffers they target.
             try { CudaDriverApi.cuStreamSynchronize(stream); } catch { /* already failing */ }
 
             for (int i = allocs.Count - 1; i >= 0; i--)
                 FreeDeviceIfNonZero(allocs[i]);
+            arena?.Dispose();
             throw;
         }
     }
@@ -763,7 +773,23 @@ internal sealed class CudaWeights : IDisposable
             quantBytes += 4; // include the trailing per-tensor float32 scale (RowByteSize excludes it).
                              // The I2_S GEMV/dequant kernels read the scale from the tensor tail at
                              // byte offset n·k/4, so the device copy must include these +4 bytes.
-        return AllocAndUpload(hostPtr, quantBytes, allocs);
+        nint devPtr = AllocWeight(quantBytes, "weight upload", allocs);
+        MemcpyHtoDOrThrowWithContext(devPtr, hostPtr, quantBytes, "weight upload");
+        return devPtr;
+    }
+
+    /// <summary>
+    /// Allocates a model-lifetime weight buffer from the open <see cref="CudaWeightArena"/>, else with its own
+    /// <c>cuMemAlloc</c> recorded in <paramref name="allocs"/>. Never for a buffer that is freed on its own.
+    /// </summary>
+    internal static nint AllocWeight(long bytes, string label, List<nint> allocs)
+    {
+        nint devPtr = CudaWeightArena.Current?.TryAlloc(bytes) ?? 0;
+        if (devPtr != 0)
+            return devPtr;
+        AllocOrThrowWithContext(bytes, label, out devPtr);
+        allocs.Add(devPtr);
+        return devPtr;
     }
 
     /// <summary>
@@ -812,8 +838,7 @@ internal sealed class CudaWeights : IDisposable
         long vBytes = rowBytes * vOut;
         long totalBytes = qBytes + kBytes + vBytes;
 
-        AllocOrThrowWithContext(totalBytes, "QkvPacked", out nint packed);
-        allocs.Add(packed);
+        nint packed = AllocWeight(totalBytes, "QkvPacked", allocs);
         // Upload each tensor's bytes directly into its slice — no intermediate alloc,
         // no D2D copy. Slices are NOT in `allocs` (they alias `packed`).
         nint qSlice = packed;
@@ -846,8 +871,7 @@ internal sealed class CudaWeights : IDisposable
         long bBytes = rowBytes * bOut;
         long totalBytes = aBytes + bBytes;
 
-        AllocOrThrowWithContext(totalBytes, "GateUpPacked", out nint packed);
-        allocs.Add(packed);
+        nint packed = AllocWeight(totalBytes, "GateUpPacked", allocs);
         nint aSlice = packed;
         nint bSlice = packed + (nint)aBytes;
         MemcpyHtoDOrThrowWithContext(aSlice, aHost, aBytes, "GateUpPacked.Gate");
@@ -1067,5 +1091,7 @@ internal sealed class CudaWeights : IDisposable
                 CudaDriverApi.cuMemFree_v2(ptr);
         }
         _allAllocations.Clear();
+        _arena?.Dispose();
+        _arena = null;
     }
 }

@@ -185,11 +185,11 @@ internal static unsafe class CudaMoeWeightsLoader
         long w1ExpertBytes = moe.GateExpsMDim * w1RowBytes;
         long w3ExpertBytes = moe.UpExpsMDim * w3RowBytes;
         long w2ExpertBytes = moe.DownExpsMDim * w2RowBytes;
-        for (int e = 0; e < numExperts && !hostExperts; e++)
+        if (!hostExperts)
         {
-            gateProj[e] = UploadRawBytes(moe.GateExpsRaw + (nint)(e * w1ExpertBytes), w1ExpertBytes, allocs);
-            upProj[e] = UploadRawBytes(moe.UpExpsRaw + (nint)(e * w3ExpertBytes), w3ExpertBytes, allocs);
-            downProj[e] = UploadRawBytes(moe.DownExpsRaw + (nint)(e * w2ExpertBytes), w2ExpertBytes, allocs);
+            UploadExpertBank(moe.GateExpsRaw, w1ExpertBytes, gateProj, allocs);
+            UploadExpertBank(moe.UpExpsRaw, w3ExpertBytes, upProj, allocs);
+            UploadExpertBank(moe.DownExpsRaw, w2ExpertBytes, downProj, allocs);
         }
 
         // Shared expert (DeepSeek-V2/V3 fuses N shared into a single wider MLP).
@@ -211,9 +211,24 @@ internal static unsafe class CudaMoeWeightsLoader
             long suBytes = sharedIntermediate * suRowBytes;
             long sdBytes = hidden * sdRowBytes;
 
-            sharedGate = [UploadRawBytes(moe.SharedGateRaw[0], sgBytes, allocs)];
-            sharedUp = [UploadRawBytes(moe.SharedUpRaw[0], suBytes, allocs)];
-            sharedDown = [UploadRawBytes(moe.SharedDownRaw[0], sdBytes, allocs)];
+            if (sgBytes % 256 == 0 && suBytes % 256 == 0)
+            {
+                // One allocation for the three projections (#1211): Flint's 1.25 MiB each would take a 2 MiB page apiece.
+                nint dShared = CudaWeights.AllocWeight(sgBytes + suBytes + sdBytes, "shared expert", allocs);
+                CudaDriverApi.cuMemcpyHtoD_v2(dShared, moe.SharedGateRaw[0], (nuint)sgBytes).ThrowOnError();
+                CudaDriverApi.cuMemcpyHtoD_v2(dShared + (nint)sgBytes, moe.SharedUpRaw[0], (nuint)suBytes).ThrowOnError();
+                CudaDriverApi.cuMemcpyHtoD_v2(dShared + (nint)(sgBytes + suBytes), moe.SharedDownRaw[0], (nuint)sdBytes)
+                    .ThrowOnError();
+                sharedGate = [dShared];
+                sharedUp = [dShared + (nint)sgBytes];
+                sharedDown = [dShared + (nint)(sgBytes + suBytes)];
+            }
+            else
+            {
+                sharedGate = [UploadRawBytes(moe.SharedGateRaw[0], sgBytes, allocs)];
+                sharedUp = [UploadRawBytes(moe.SharedUpRaw[0], suBytes, allocs)];
+                sharedDown = [UploadRawBytes(moe.SharedDownRaw[0], sdBytes, allocs)];
+            }
             sgQt = moe.SharedGateRawQt;
             suQt = moe.SharedUpRawQt;
             sdQt = moe.SharedDownRawQt;
@@ -378,6 +393,26 @@ internal static unsafe class CudaMoeWeightsLoader
         CudaDriverApi.cuMemcpyHtoD_v2(
             devPtr + (nint)payloadBytes, (nint)(&scale), (nuint)sizeof(float)).ThrowOnError();
         return devPtr;
+    }
+
+    /// <summary>
+    /// Uploads a fused <c>[E, ...]</c> expert bank as ONE allocation and points each expert at its slice (#1211).
+    /// One allocation per expert cost Flint ~630 MiB: the driver packs sub-2 MiB allocations into 2 MiB pages, and three
+    /// 0.625 MiB Q4_1 experts leave 0.125 MiB of every page unused. Slices that would not stay 256-byte aligned (an odd
+    /// expert size) keep one allocation per expert.
+    /// </summary>
+    private static void UploadExpertBank(nint hostBase, long expertBytes, nint[] dst, List<nint> allocs)
+    {
+        if (expertBytes % 256 != 0)
+        {
+            for (int e = 0; e < dst.Length; e++)
+                dst[e] = UploadRawBytes(hostBase + (nint)(e * expertBytes), expertBytes, allocs);
+            return;
+        }
+
+        nint dBase = UploadRawBytes(hostBase, expertBytes * dst.Length, allocs);
+        for (int e = 0; e < dst.Length; e++)
+            dst[e] = dBase + (nint)(e * expertBytes);
     }
 
     private static unsafe nint UploadRawBytes(nint hostPtr, long bytes, List<nint> allocs)

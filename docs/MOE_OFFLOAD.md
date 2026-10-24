@@ -113,7 +113,7 @@ experts are either all resident or all on the CPU for decode; multi-token calls 
 - **Placement.** Layers whose index is below N keep their routed experts on the CPU (`--cpu-moe` = every MoE layer,
   `--moe-offload on` = the same). Their router, shared expert and biases are still uploaded; the routed banks are not.
 - **Auto.** With `--moe-offload auto` (the default) and no explicit N, a model whose weights do not fit picks the smallest
-  N that leaves free VRAM for `ReserveMib` (default 1024 MiB on this host) plus an F16 KV cache of `--ctx-size` tokens
+  N that leaves free VRAM for `ReserveMib` (default 512 MiB on this host since #1211) plus an F16 KV cache of `--ctx-size` tokens
   (default 4096), plus the GPU leg's expert ring and its margin (376 MiB for Flint) once some experts go to the CPU
   anyway. The load log says what it chose, for example
   `MoE experts on CPU: 32 layer(s) (--n-cpu-moe 34), 15360 MiB read from the mmap'd GGUF, 15 CPU thread(s); 9423 MiB device weights.`.

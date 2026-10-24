@@ -158,12 +158,34 @@ internal static partial class CudaDriverApi
 
     // ── Memory ──────────────────────────────────────────────────────
 
-    [LibraryImport(LibName)]
-    internal static partial int cuMemAlloc_v2(out nint devicePtr, nuint bytesize);
+    [LibraryImport(LibName, EntryPoint = "cuMemAlloc_v2")]
+    private static partial int cuMemAllocNative(out nint devicePtr, nuint bytesize);
 
-    [LibraryImport(LibName)]
+    [LibraryImport(LibName, EntryPoint = "cuMemFree_v2")]
     [SuppressGCTransition]
-    internal static partial int cuMemFree_v2(nint devicePtr);
+    private static partial int cuMemFreeNative(nint devicePtr);
+
+    /// <summary>Allocates device memory; recorded by <see cref="CudaMemTrace"/> when <c>DOTLLM_CUDA_MEM_TRACE=1</c> (#1211).</summary>
+    /// <param name="devicePtr">The allocated device pointer.</param>
+    /// <param name="bytesize">Bytes to allocate.</param>
+    /// <returns>The CUresult.</returns>
+    internal static int cuMemAlloc_v2(out nint devicePtr, nuint bytesize)
+    {
+        int r = cuMemAllocNative(out devicePtr, bytesize);
+        if (r == 0 && CudaMemTrace.Enabled)
+            CudaMemTrace.OnAlloc(devicePtr, (long)bytesize);
+        return r;
+    }
+
+    /// <summary>Frees device memory allocated by <see cref="cuMemAlloc_v2"/>.</summary>
+    /// <param name="devicePtr">The device pointer.</param>
+    /// <returns>The CUresult.</returns>
+    internal static int cuMemFree_v2(nint devicePtr)
+    {
+        if (CudaMemTrace.Enabled)
+            CudaMemTrace.OnFree(devicePtr);
+        return cuMemFreeNative(devicePtr);
+    }
 
     // ── Virtual memory management (issue #1080) ─────────────────────
     // Reserve a device address range once, then back it with physical allocations as it grows. Growth maps more pages
@@ -228,11 +250,35 @@ internal static partial class CudaDriverApi
     [LibraryImport(LibName)]
     internal static partial int cuMemAddressFree(nint ptr, nuint size);
 
-    [LibraryImport(LibName)]
-    internal static partial int cuMemCreate(out ulong handle, nuint size, in CudaMemAllocationProp prop, ulong flags);
+    [LibraryImport(LibName, EntryPoint = "cuMemCreate")]
+    private static partial int cuMemCreateNative(out ulong handle, nuint size, in CudaMemAllocationProp prop, ulong flags);
 
-    [LibraryImport(LibName)]
-    internal static partial int cuMemRelease(ulong handle);
+    [LibraryImport(LibName, EntryPoint = "cuMemRelease")]
+    private static partial int cuMemReleaseNative(ulong handle);
+
+    /// <summary>Creates a physical allocation; recorded by <see cref="CudaMemTrace"/> when tracing (#1211).</summary>
+    /// <param name="handle">The allocation handle.</param>
+    /// <param name="size">Bytes.</param>
+    /// <param name="prop">Allocation properties.</param>
+    /// <param name="flags">Reserved, 0.</param>
+    /// <returns>The CUresult.</returns>
+    internal static int cuMemCreate(out ulong handle, nuint size, in CudaMemAllocationProp prop, ulong flags)
+    {
+        int r = cuMemCreateNative(out handle, size, prop, flags);
+        if (r == 0 && CudaMemTrace.Enabled)
+            CudaMemTrace.OnAlloc((nint)handle, (long)size);
+        return r;
+    }
+
+    /// <summary>Releases a physical allocation made by <see cref="cuMemCreate"/>.</summary>
+    /// <param name="handle">The allocation handle.</param>
+    /// <returns>The CUresult.</returns>
+    internal static int cuMemRelease(ulong handle)
+    {
+        if (CudaMemTrace.Enabled)
+            CudaMemTrace.OnFree((nint)handle);
+        return cuMemReleaseNative(handle);
+    }
 
     [LibraryImport(LibName)]
     internal static partial int cuMemMap(nint ptr, nuint size, nuint offset, ulong handle, ulong flags);
@@ -364,8 +410,17 @@ internal static partial class CudaDriverApi
     /// Safer than relaxed/global mode when other threads might touch the stream.</summary>
     internal const uint CU_STREAM_CAPTURE_MODE_THREAD_LOCAL = 2;
 
+    /// <summary>Relaxed capture mode: the thread may make "unsafe" calls such as <c>cuMemAlloc</c> while a capture is open.</summary>
+    internal const uint CU_STREAM_CAPTURE_MODE_RELAXED = 2;
+
     [LibraryImport(LibName)]
     internal static partial int cuStreamBeginCapture_v2(nint stream, uint mode);
+
+    /// <summary>Swaps this thread's stream-capture interaction mode; <paramref name="mode"/> receives the previous one.</summary>
+    /// <param name="mode">In: the new mode. Out: the previous mode.</param>
+    /// <returns>The CUresult.</returns>
+    [LibraryImport(LibName)]
+    internal static partial int cuThreadExchangeStreamCaptureMode(ref uint mode);
 
     [LibraryImport(LibName)]
     internal static partial int cuStreamEndCapture(nint stream, out nint graph);
