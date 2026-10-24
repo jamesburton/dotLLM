@@ -115,7 +115,7 @@ experts are either all resident or all on the CPU.
 - **Auto.** With `--moe-offload auto` (the default) and no explicit N, a model whose weights do not fit picks the smallest
   N that leaves free VRAM for `ReserveMib` (default 1024 MiB on this host) plus an F16 KV cache of `--ctx-size` tokens
   (default 4096). The load log says what it chose, for example
-  `MoE experts on CPU: 30 layer(s) (--n-cpu-moe 32), ... MiB read from the mmap'd GGUF, 15 CPU thread(s)`.
+  `MoE experts on CPU: 32 layer(s) (--n-cpu-moe 34), 15360 MiB read from the mmap'd GGUF, 7 CPU thread(s); 9423 MiB device weights.`.
   `auto` never moves the experts of a model with per-expert biases or `swiglu_oai` (gpt-oss): the CPU leg cannot run them,
   and an explicit `--cpu-moe` on such a model is refused.
 - **The CPU leg** (`CudaMoeHostExperts`). Routing and top-k stay on the device. After the existing top-k read-back, the
@@ -127,6 +127,26 @@ experts are either all resident or all on the CPU.
 - **No second copy of the weights** (#1156). Unlike the Nemotron-H host store above, nothing is pinned or copied: the
   CPU reads the OS page cache's pages of the file, which every process mapping the file shares. Only activations cross
   the link.
+
+### Measured: Recursive Flint Q4_1 (26 GB) on an RTX 3060 12 GB (eGPU, Core Ultra 7 155H, 96 GB RAM)
+
+`CudaFlintCpuMoeRealProbe` (opt-in, `DOTLLM_FLINT_GGUF`), all 49 layers, KV for 4096 tokens:
+
+| placement | device weights | VRAM after load / peak | host private bytes minus VRAM | pp512 tok/s | tg64 @ 512 tok/s |
+|---|---|---|---|---|---|
+| auto (= `--n-cpu-moe 34`, 32 MoE layers on CPU) | 9.2 GiB | 10.0 / 10.6 GiB | ~0.9 GiB | 15-20 | 4.0-9.1 |
+| `--cpu-moe` (47 MoE layers on CPU) | 2.2 GiB | 2.6 / 3.2 GiB | ~0.7 GiB (baseline 0.28) | 19-21 | 4.9-9.3 |
+| llama.cpp master CUDA `-ncmoe 34` (llama-bench) | | 8.8 GiB peak | 0.6 GiB | 79 | 17.2 |
+| llama.cpp master CUDA `-ncmoe 99` (llama-bench) | | 1.7 GiB peak | 1.6 GiB | 56 | 12.7 |
+
+- On WDDM, dotLLM's device allocations count 1:1 in its private bytes, so the host column subtracts VRAM. It does not
+  grow with the 15-22 GiB of experts on the CPU: those are file-backed mmap pages, not private memory.
+- Decode varies run to run on this hybrid P/E-core CPU (the CPU leg is 1.2-3 ms per layer); `--moe-cpu-threads 12` was
+  the best of 4 / 7 / 12. The CPU leg is the whole prefill cost (22 of 25 s at pp512): llama.cpp copies the experts to the
+  GPU for large batches instead, which is the follow-up (a prefill streaming path / VRAM expert cache on this host).
+- Quality vs the dotLLM CPU model (teacher-forced on the CUDA greedy ids, 5 F1 chat prompts x 32 tokens): top-1 157/160
+  in both placements, KL(cpu || cuda) mean 1.5e-3 (auto) / 2.0e-3 (`--cpu-moe`), max 2.9e-2 / 1.05e-1. The CPU-expert
+  share does not move it: the gap is the FP16 residual loop of the non-expert layers (#1172 measured 1.4e-3 on 8 layers).
 
 ## Telemetry
 
@@ -170,7 +190,11 @@ Hits and misses count one lookup per expert per layer call: a prefill block that
 
 ## Tests
 
-The GPU tests run on T5500.
+`CudaFlintCpuMoeTests` (#1187, local RTX 3060) runs the synthetic Flint GGUF with `--cpu-moe`, `--n-cpu-moe 4` (a split
+across MoE layers 2-3 / 4-5) and `--moe-offload on` against the CPU model, prefill plus 6 KV-cache decode steps, checks
+that each decode token computes exactly `topK` experts per CPU layer, and unit-tests the auto placement.
+
+The Nemotron-H GPU tests run on T5500.
 
 - `CudaNemotronHMoeOffloadTests` (synthetic Bolt / Lightning fixture) runs a 1 MiB cache against a resident run and requires bit-identical logits.
   - It covers prefill and decode, waves of one expert, both store kinds and all three policies.

@@ -21,7 +21,8 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// </summary>
 /// <remarks>
 /// Env: <c>DOTLLM_FLINT_GGUF</c> (required), <c>DOTLLM_FLINT_N_CPU_MOE</c> (<c>all</c> = <c>--cpu-moe</c>, a number =
-/// <c>--n-cpu-moe</c>, <c>auto</c> (default) = the loader's fit), <c>DOTLLM_FLINT_GEN</c> (greedy tokens per prompt, default 32).
+/// <c>--n-cpu-moe</c>, <c>auto</c> (default) = the loader's fit), <c>DOTLLM_FLINT_GEN</c> (greedy tokens per prompt, default 32;
+/// 0 = throughput only), <c>DOTLLM_PROBE_LOG</c> (also append the output to this file).
 /// </remarks>
 [Trait("Category", "GPU")]
 [Collection(CudaCollection.Name)]
@@ -39,7 +40,21 @@ public sealed unsafe class CudaFlintCpuMoeRealProbe
 
     private readonly ITestOutputHelper _out;
 
-    public CudaFlintCpuMoeRealProbe(ITestOutputHelper output) => _out = output;
+    public CudaFlintCpuMoeRealProbe(ITestOutputHelper output) => _out = new TeeOutput(output);
+
+    /// <summary>Also appends every line to <c>DOTLLM_PROBE_LOG</c> when set, so a long run can be watched.</summary>
+    private sealed class TeeOutput(ITestOutputHelper inner) : ITestOutputHelper
+    {
+        private readonly string? _log = Environment.GetEnvironmentVariable("DOTLLM_PROBE_LOG");
+
+        public void WriteLine(string message)
+        {
+            inner.WriteLine(message);
+            if (_log is not null) File.AppendAllText(_log, $"{DateTime.UtcNow:HH:mm:ss} {message}{Environment.NewLine}");
+        }
+
+        public void WriteLine(string format, params object[] args) => WriteLine(string.Format(format, args));
+    }
 
     [SkippableFact]
     public void FullModel_CpuExperts_VsCpuModel_AndThroughput()
@@ -78,7 +93,7 @@ public sealed unsafe class CudaFlintCpuMoeRealProbe
                 + $"private bytes {priv0 / 1048576} -> {privLoaded / 1048576} MiB");
 
             var decodeMs = new List<double>();
-            foreach (var (name, msgs) in Prompts)
+            foreach (var (name, msgs) in gen > 0 ? Prompts : [])
             {
                 string prompt = tmpl.Apply(msgs.Select(m => new ChatMessage { Role = m.Role, Content = m.Content }).ToList(),
                     new ChatTemplateOptions { AddGenerationPrompt = true });
@@ -130,7 +145,8 @@ public sealed unsafe class CudaFlintCpuMoeRealProbe
                 _out.WriteLine($"prefill {pre.Length} tok: {pre.Length / prefillS:F1} tok/s (CPU leg {cpuUsPre / 1000.0:F0} ms of {prefillS * 1000:F0} ms); "
                     + $"decode 64 @ {pre.Length}: {64 / decS:F2} tok/s ({decS * 1000 / 64:F1} ms/token, CPU leg {(cuda.CpuMoeMicroseconds - cpuUs0) / 64000.0:F1} ms/token)");
             }
-            _out.WriteLine($"decode over prompts: {decodeMs.Skip(1).Average():F1} ms/token median {decodeMs.Order().ElementAt(decodeMs.Count / 2):F1}");
+            if (decodeMs.Count > 1)
+                _out.WriteLine($"decode over prompts: {decodeMs.Skip(1).Average():F1} ms/token median {decodeMs.Order().ElementAt(decodeMs.Count / 2):F1}");
             _out.WriteLine($"peak VRAM used (device-wide) {(free0 - minFree) / 1048576} MiB; private bytes after runs {Process.GetCurrentProcess().PrivateMemorySize64 / 1048576} MiB "
                 + $"(WDDM counts device allocations in private bytes 1:1, see CudaFlintRealWeightsProbe); peak working set {Process.GetCurrentProcess().PeakWorkingSet64 / 1048576} MiB");
         }

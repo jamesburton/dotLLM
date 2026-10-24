@@ -1309,7 +1309,8 @@ activations on its experts), top-1 identical on all 9 compared rows. VRAM 4.80 G
 `token_embd` table is 1.15 GiB, uploaded as-is), +64 MiB KV at 4096 tokens, +16 MiB run scratch. On WDDM, device
 allocations count 1:1 in process private bytes (measured), so private bytes minus VRAM is ~0.5 GiB of host state.
 
-The full file (26 GB) does not fit a 12 GB GPU; that is F7 (generic CPU-expert offload).
+The full file (26 GB) does not fit a 12 GB GPU: F7 (#1187) keeps the routed experts of the first layers on the CPU, read
+from the mmap'd file (`--cpu-moe` / `--n-cpu-moe`, or automatically; see `docs/MOE_OFFLOAD.md`).
 
 **Known gaps** (follow-ups on #1157): the CUDA KV cache is full-length on every layer (no sliding-window ring, #1184); the F32
 `token_embd` is uploaded as F32 instead of gathered from the mmap (#1183); decode MoE routing syncs to the host once per layer
