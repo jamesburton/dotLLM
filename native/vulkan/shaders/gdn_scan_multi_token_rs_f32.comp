@@ -33,6 +33,7 @@ layout(push_constant) uniform PushConstants {
     int d_state;
     int v_heads_per_k_head;
     int seq_len;
+    int write_state;   // 0: emit the outputs, leave the state untouched (#1194 read-only speculative verify)
 } pc;
 
 shared float k_shared[128];
@@ -140,6 +141,6 @@ void main() {
         }
     }
 
-    for (uint i = 0u; i < uint(ROWS_PER); i++)
+    if (pc.write_state != 0) for (uint i = 0u; i < uint(ROWS_PER); i++)
         st[stateBase + (row0 + i) * dState + col] = s[i];
 }

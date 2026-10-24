@@ -69,6 +69,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel
     public IRecurrentPrefixSnapshot CapturePrefixSnapshot(IKvCache kvCache, int prefixLength, RecurrentPrefixSnapshotStorage storage)
     {
         ValidatePrefixCapture(kvCache, prefixLength);
+        CommitPendingRows(synchronize: false);   // #1194: a read-only verify's accepted rows belong to the captured state
         _context.MakeCurrent(); _stream.Synchronize();
         var segments = PrefixSegments(prefixLength);
         var snapshot = AllocatePrefixSnapshot(prefixLength, segments.Sum(s => s.Bytes), storage);

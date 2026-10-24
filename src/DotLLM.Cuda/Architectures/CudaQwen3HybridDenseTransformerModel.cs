@@ -593,6 +593,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     /// </remarks>
     public object? CheckpointRecurrentState()
     {
+        CommitPendingRows(synchronize: true);
         _context.MakeCurrent();
         CudaGdnStateCache? snapshot = Interlocked.Exchange(ref _spareGdnCheckpoint, null);
         if (snapshot is null)
@@ -645,44 +646,42 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
 
     // ── Per-row recurrent snapshots (issue #473, ported in #478) ─────────────
 
-    // Issue #1194: NOT a full F32 GDN state per row (~150 MiB each on Bonsai-2 27B, ~0.9 GB at DFlash K=7). The state before the
-    // verify is kept once (_rowBase, the live cache's [gdnLayer][elements] layout, so capture and restore are one D2D copy each), and
-    // per GDN layer the scan's inputs for the recorded rows (_rowRec: [layer][q | k | v | g | beta][row], ~41 KB per row and layer on
-    // Bonsai-2) plus the ConvInput rows every row's conv window lies in. A restore re-runs the same scan launches on the same inputs,
-    // so the state it rebuilds is bit-identical to the one the verify passed through. Grown to the largest verify seen and kept.
-    private nint _rowBase;
+    // Issue #1194: no copy of the GDN state at all. The verify's register scan reads the live state and never writes it (nor the
+    // conv state); per GDN layer the forward records the scan inputs the replay needs for each row (_rowRec: [layer][k | v | g | beta]
+    // [row], ~33 KB per row and layer on Bonsai-2) plus the ConvInput rows every row's conv window lies in. The accepted rows are then
+    // replayed into the live state in place (gdn_scan_replay_f32_d128, bit-identical to the scan). Grown to the largest verify seen.
     private nint _rowRec;
     private nint _rowSnapConv;
     private int _rowSnapCapacity;
     private int _rowSnapshotRequestRows;   // > 0 only while ForwardWithRecurrentSnapshots runs
-    private int _rowSnapshotValidRows;     // rows the last such forward recorded; 0 = none
+    private int _rowSnapshotValidRows;     // rows the last such forward recorded and not yet committed; 0 = none
 
     /// <summary>Device bytes currently held by the per-row recurrent snapshot scratch (issues #473, #1194).</summary>
     public long RecurrentRowSnapshotBytes => _rowSnapCapacity == 0 ? 0 : RowSnapshotBytes(_rowSnapCapacity);
 
     /// <inheritdoc/>
     /// <remarks>
-    /// The verify forward keeps the GDN state as it stood before the verify (one copy) and, per layer, the scan's inputs for each
-    /// recorded row and the conv windows (#1194). A restore to row r copies the pre-verify state back and re-runs the scan launches
-    /// of rows 0..r on the stored inputs: the same kernel on the same data, so the state is bit-identical to the one the verify
-    /// passed through after row r. Scratch is one GDN state (~144 MiB on Bonsai 27B) plus ~2 MiB per row, instead of a full state
-    /// per row (~1 GiB at DFlash K=7 before). <c>DOTLLM_MTP_GDN_SNAPSHOTS=0</c> makes the decoder keep checkpoint + replay instead.
+    /// Read-only verify (#1194): the verify forward leaves the GDN and conv state untouched and records each row's scan inputs and the
+    /// conv windows. A restore to row r replays rows 0..r into the live state in place; with no rollback, the next forward (or
+    /// checkpoint, or prefix capture) replays every row. Scratch is ~2 MiB per row on Bonsai-2 27B; no state copy. Needs the register
+    /// scan and the replay kernel (dState 128, not the opt-in split4 scan); otherwise <c>false</c> and the decoder uses checkpoint +
+    /// replay. <c>DOTLLM_MTP_GDN_SNAPSHOTS=0</c> forces that too.
     /// </remarks>
-    public bool SupportsRecurrentRowSnapshots => _gdnCache.NumGdnLayers > 0;
+    public bool SupportsRecurrentRowSnapshots
+        => _gdnCache.NumGdnLayers > 0 && _kernels.CanGdnScanMultiF32(_gdn.DState) && _kernels.HasGdnScanReplayF32
+           && !(CudaKernels.EnableGdnScanApproxSplit4 && _kernels.IsGdnScanCoopSplit4Safe(_gdn.NVHead, _gdn.DState));
 
     /// <inheritdoc/>
     public ITensor ForwardWithRecurrentSnapshots(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                                                  int deviceId, IKvCache? kvCache, IMtpState? mtpState)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        int rows = Math.Max(tokenIds.Length - 1, 0);
+        if (!SupportsRecurrentRowSnapshots)
+            throw new NotSupportedException($"{GetType().Name}: no read-only GDN verify on this device/kernel set (SupportsRecurrentRowSnapshots=false).");
+        CommitPendingRows(synchronize: false);   // before the records are reused or regrown
+        int rows = tokenIds.Length;
         _context.MakeCurrent();
         EnsureRowSnapshotCapacity(rows);
-        if (rows > 0)
-        {
-            CudaDriverApi.cuMemcpyDtoDAsync_v2(_rowBase, _gdnCache.GetGdnStatePtr(0),
-                (nuint)((long)_gdnCache.NumGdnLayers * _gdnCache.GdnStateElements * sizeof(float)), _stream.Handle).ThrowOnError();
-        }
         _rowSnapshotRequestRows = rows;
         ITensor logits;
         try
@@ -702,63 +701,47 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     public void RestoreRecurrentStateToRow(int row)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (row == _rowSnapshotValidRows && row > 0)
-            return; // the live state IS the state after the last row
         if ((uint)row >= (uint)_rowSnapshotValidRows)
             throw new InvalidOperationException(
                 $"No recurrent snapshot for row {row}: the last ForwardWithRecurrentSnapshots recorded " +
                 $"{_rowSnapshotValidRows} row(s), or a later forward invalidated them.");
+        CommitRows(row + 1, synchronize: true);
+    }
 
+    /// <summary>Replays every row of a not-yet-committed read-only verify into the live state (#1194).</summary>
+    private void CommitPendingRows(bool synchronize)
+    {
+        if (_rowSnapshotValidRows > 0) CommitRows(_rowSnapshotValidRows, synchronize);
+    }
+
+    /// <summary>
+    /// Advances the untouched live GDN and conv state through the first <paramref name="rows"/> verify rows, in place, on the model's
+    /// stream. <paramref name="synchronize"/> waits for it, for callers that touch the state off that stream.
+    /// </summary>
+    private void CommitRows(int rows, bool synchronize)
+    {
+        _rowSnapshotValidRows = 0;
         _context.MakeCurrent();
         nint streamH = _stream.Handle;
-        int layers = _gdnCache.NumGdnLayers;
-        int nVHead = _gdn.NVHead, nKHead = _gdn.NKHead, dState = _gdn.DState;
         long convStateBytes = (long)_gdnCache.ConvStateElements * sizeof(float);
-        bool useCoopSplit4 = CudaKernels.EnableGdnScanApproxSplit4 && _kernels.IsGdnScanCoopSplit4Safe(nVHead, dState);
-        // The register-resident replay is bit-identical to the exact step kernel only; the opt-in split4 scan re-associates, so
-        // replaying it means re-running it.
-        bool fusedReplay = !useCoopSplit4 && dState == 128 && _kernels.HasGdnScanReplayF32;
-        if (!fusedReplay)
-        {
-            CudaDriverApi.cuMemcpyDtoDAsync_v2(_gdnCache.GetGdnStatePtr(0), _rowBase,
-                (nuint)((long)layers * _gdnCache.GdnStateElements * sizeof(float)), streamH).ThrowOnError();
-        }
-        for (int l = 0; l < layers; l++)
+        for (int l = 0; l < _gdnCache.NumGdnLayers; l++)
         {
             if (convStateBytes > 0)
-                CudaDriverApi.cuMemcpyDtoDAsync_v2(_gdnCache.GetConvStatePtr(l), RowSnapshotConvPtr(row, l),
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(_gdnCache.GetConvStatePtr(l), RowSnapshotConvPtr(rows - 1, l),
                     (nuint)convStateBytes, streamH).ThrowOnError();
             nint stateDev = _gdnCache.GetGdnStatePtr(l);
-            if (fusedReplay)
-            {
-                // Reads the pre-verify state from the base and writes the live state: no separate restore copy.
-                _kernels.LaunchGdnScanReplayF32(stateDev, RowBasePtr(l), RowRecPtr(l, RowRecK, 0), RowRecPtr(l, RowRecV, 0),
-                    RowRecPtr(l, RowRecG, 0), RowRecPtr(l, RowRecBeta, 0), row + 1, nVHead, nKHead, dState, streamH);
-                continue;
-            }
-            for (int t = 0; t <= row; t++)
-            {
-                // The forward's own launch for row t, on the inputs it recorded; the output is scratch.
-                nint q = RowRecPtr(l, RowRecQ, t), k = RowRecPtr(l, RowRecK, t), v = RowRecPtr(l, RowRecV, t);
-                nint g = RowRecPtr(l, RowRecG, t), beta = RowRecPtr(l, RowRecBeta, t);
-                if (useCoopSplit4)
-                    _kernels.LaunchGdnScanStepF32CoopSplit4(stateDev, q, k, v, g, beta, _state.GdnOut,
-                        _state.GdnScanPartialTmp, _state.GdnScanPartialOut, nVHead, nKHead, dState, streamH);
-                else
-                    _kernels.LaunchGdnScanStepF32(stateDev, q, k, v, g, beta, _state.GdnOut, nVHead, nKHead, dState, streamH);
-            }
+            _kernels.LaunchGdnScanReplayF32(stateDev, stateDev, RowRecPtr(l, RowRecK, 0), RowRecPtr(l, RowRecV, 0),
+                RowRecPtr(l, RowRecG, 0), RowRecPtr(l, RowRecBeta, 0), rows, _gdn.NVHead, _gdn.NKHead, _gdn.DState, streamH);
         }
-        _stream.Synchronize();
-        _rowSnapshotValidRows = 0;
+        if (synchronize) _stream.Synchronize();
     }
 
     private void EnsureRowSnapshotCapacity(int rows)
     {
         if (rows <= _rowSnapCapacity) return;
         FreeRowSnapshots();
-        AdmitDeviceGrowth(RowSnapshotBytes(rows), $"recurrent row snapshots for a {rows + 1}-token verify");
+        AdmitDeviceGrowth(RowSnapshotBytes(rows), $"recurrent row snapshots for a {rows}-token verify");
         int layers = _gdnCache.NumGdnLayers;
-        _rowBase = AllocDevice(Math.Max((long)layers * _gdnCache.GdnStateElements * sizeof(float), 4));
         _rowRec = AllocDevice(Math.Max((long)layers * rows * RowRecFloatsPerRow * sizeof(float), 4));
         _rowSnapConv = AllocDevice(Math.Max((long)layers * RowSnapConvRows(rows) * RowConvDim * sizeof(float), 4));
         _rowSnapCapacity = rows;
@@ -766,35 +749,31 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
 
     private void FreeRowSnapshots()
     {
-        FreeIfNonZero(ref _rowBase);
         FreeIfNonZero(ref _rowRec);
         FreeIfNonZero(ref _rowSnapConv);
         _rowSnapCapacity = 0;
         _rowSnapshotValidRows = 0;
     }
 
-    /// <summary>Device pointer to GDN layer <paramref name="gdnOrdinal"/>'s state as it stood before the last recorded verify.</summary>
-    private nint RowBasePtr(int gdnOrdinal) => _rowBase + (nint)((long)gdnOrdinal * _gdnCache.GdnStateElements * sizeof(float));
-
     /// <summary>Device bytes of the snapshot scratch for <paramref name="rows"/> recorded rows.</summary>
     private long RowSnapshotBytes(int rows)
         => (long)_gdnCache.NumGdnLayers
-           * (_gdnCache.GdnStateElements + (long)rows * RowRecFloatsPerRow + (long)RowSnapConvRows(rows) * RowConvDim) * sizeof(float);
+           * ((long)rows * RowRecFloatsPerRow + (long)RowSnapConvRows(rows) * RowConvDim) * sizeof(float);
 
     private int RowConvDim => (2 * _gdn.NKHead + _gdn.NVHead) * _gdn.DState;
 
     /// <summary>ConvInput rows the conv windows of <paramref name="rows"/> snapshot rows span: rows 1 .. rows + dConv - 2.</summary>
     private int RowSnapConvRows(int rows) => _gdn.DConv > 1 ? rows + _gdn.DConv - 2 : 0;
 
-    // Per-row scan inputs, in the order RowRecPtr lays them out: q and k (NKHead·DState), v (NVHead·DState), g and beta (NVHead).
-    private const int RowRecQ = 0, RowRecK = 1, RowRecV = 2, RowRecG = 3, RowRecBeta = 4;
+    // Per-row scan inputs the replay reads, in the order RowRecPtr lays them out: k (NKHead·DState), v (NVHead·DState), g and beta (NVHead).
+    private const int RowRecK = 0, RowRecV = 1, RowRecG = 2, RowRecBeta = 3;
 
-    private int RowRecFloatsPerRow => 2 * _gdn.NKHead * _gdn.DState + _gdn.NVHead * _gdn.DState + 2 * _gdn.NVHead;
+    private int RowRecFloatsPerRow => _gdn.NKHead * _gdn.DState + _gdn.NVHead * _gdn.DState + 2 * _gdn.NVHead;
 
     /// <summary>Floats per row of scan input <paramref name="kind"/>.</summary>
     private int RowRecWidth(int kind) => kind switch
     {
-        RowRecQ or RowRecK => _gdn.NKHead * _gdn.DState,
+        RowRecK => _gdn.NKHead * _gdn.DState,
         RowRecV => _gdn.NVHead * _gdn.DState,
         _ => _gdn.NVHead,
     };
@@ -2206,9 +2185,9 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         }
 
         AdvanceKvHandleAndSyncLengths(kvCache, positions);
-        // Any forward moves the model-owned GDN state on, so earlier row snapshots no longer
-        // describe it (issue #473). ForwardWithRecurrentSnapshots re-validates after it returns.
-        _rowSnapshotValidRows = 0;
+        // #1194: the last read-only verify left the model-owned GDN state untouched; its accepted rows (all, unless a rollback said
+        // otherwise) are replayed on this stream before the forward reads it. ForwardWithRecurrentSnapshots re-validates after it returns.
+        CommitPendingRows(synchronize: false);
 
         // Category profiler bracket (issue #168): MakeCurrent + EnsureCapacity + H2D
         // token/position copy + host embed-lookup dequant + H2D embed copy. Confirmed via a
@@ -3590,9 +3569,9 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         int kDim = nKHead * dState;
         int gdnOrdinal = _gdnLayerOrdinal[absoluteLayerIdx];
 
-        // Issue #473: rows whose post-row state this forward records (verify forwards only). A
-        // request implies seqLen >= 2, so the general (convInput) conv path below always runs.
-        int snapRows = _rowSnapshotRequestRows > 0 ? Math.Min(_rowSnapshotRequestRows, seqLen - 1) : 0;
+        // Issue #473/#1194: a read-only verify (every row recorded, state and conv state left untouched). A single-row verify still
+        // takes the general (convInput) conv path below, which is where the conv windows are stashed.
+        int snapRows = _rowSnapshotRequestRows > 0 ? Math.Min(_rowSnapshotRequestRows, seqLen) : 0;
 
         nint normOut = _state.NormOutput;
         nint qkvBuf = _state.GdnQkvBuf;
@@ -3679,7 +3658,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         // the new qkv row directly and writes the shifted trailing state back in place,
         // folding what was 3 memcpy launches + conv1d + silu (5 launches) into 1. Prefill
         // (seqLen>1) keeps the general path unchanged (concat buffer, arbitrary window count).
-        if (seqLen == 1 && _kernels.HasGdnConv1dCausalDecodeF32)
+        if (seqLen == 1 && snapRows == 0 && _kernels.HasGdnConv1dCausalDecodeF32)
         {
             _kernels.LaunchGdnConv1dCausalDecodeF32(convStateDev, qkvBuf,
                 gdnW.Conv1dWeightDevice, gdnW.Conv1dBiasDevice, qkvBuf, dConv, convDim, streamH);
@@ -3705,8 +3684,11 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
             }
 
             nint trailRowsSrc = convInput + (nint)((long)seqLen * convDim * sizeof(float));
-            CudaDriverApi.cuMemcpyDtoDAsync_v2(convStateDev, trailRowsSrc,
-                (nuint)convStateBytes, streamH).ThrowOnError();
+            if (snapRows == 0)   // a read-only verify leaves the conv state to the commit
+            {
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(convStateDev, trailRowsSrc,
+                    (nuint)convStateBytes, streamH).ThrowOnError();
+            }
 
             // Issue #473/#1194: the conv window after row t is convInput rows t+1 .. t+dConv-1, so all of them lie in rows
             // 1 .. snapRows+dConv-2: one copy. Same stream, so ordered before the next layer reuses convInput.
@@ -3775,8 +3757,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
             _kernels.IsGdnScanCoopSplit4Safe(nVHead, dState);
         if (snapRows > 0)
         {
-            // Issue #1194: record the scan inputs of the rows a restore may replay (the pre-verify state was captured before the forward).
-            RecordRowRec(gdnOrdinal, RowRecQ, qBuf, snapRows, streamH);
+            // Issue #1194: record the scan inputs the commit replays into the untouched live state.
             RecordRowRec(gdnOrdinal, RowRecK, kBuf, snapRows, streamH);
             RecordRowRec(gdnOrdinal, RowRecV, vBuf, snapRows, streamH);
             RecordRowRec(gdnOrdinal, RowRecG, alphaBuf, snapRows, streamH);
@@ -3786,7 +3767,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         if (!useCoopSplit4 && _kernels.CanGdnScanMultiF32(dState))
         {
             _kernels.LaunchGdnScanMultiF32(gdnStateDev, qBuf, kBuf, vBuf, alphaBuf, betaBuf, gdnOut,
-                nVHead, nKHead, seqLen, streamH);
+                nVHead, nKHead, seqLen, streamH, writeState: snapRows == 0);
         }
         else for (int t = 0; t < seqLen; t++)
         {

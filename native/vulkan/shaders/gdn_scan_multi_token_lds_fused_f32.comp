@@ -36,6 +36,7 @@ layout(push_constant) uniform PushConstants {
     int d_state;
     int v_heads_per_k_head;
     int seq_len;
+    int write_state;   // 0: emit the outputs, leave the state untouched (#1194 read-only speculative verify)
 } pc;
 
 shared float k_shared[128];
@@ -121,7 +122,7 @@ void main() {
     }
 
     // Stage out: one global write of the slab.
-    if (laneActive) {
+    if (laneActive && pc.write_state != 0) {
         for (uint row = 0u; row < dState; row++)
             st[stateBase + row * dState + col] = sLds[row * uint(COLS) + lane];
     }

@@ -3926,7 +3926,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
     /// pays one launch per token. Bit-identical to <paramref name="seqLen"/> calls of
     /// <see cref="LaunchGdnScanStepF32"/> on the same buffers.
     /// </summary>
-    /// <param name="state">Device pointer to <c>[nVHead, 128, 128]</c> FP32 state, updated in place.</param>
+    /// <param name="state">Device pointer to <c>[nVHead, 128, 128]</c> FP32 state, updated in place (read only when <paramref name="writeState"/> is false).</param>
     /// <param name="q">Device pointer to <c>[seqLen, nKHead, 128]</c> L2-normalised queries.</param>
     /// <param name="k">Device pointer to <c>[seqLen, nKHead, 128]</c> L2-normalised keys.</param>
     /// <param name="v">Device pointer to <c>[seqLen, nVHead, 128]</c> values.</param>
@@ -3937,20 +3937,16 @@ public sealed unsafe partial class CudaKernels : IDisposable
     /// <param name="nKHead">Number of key heads (tiled broadcast, <c>kh = vh % nKHead</c>).</param>
     /// <param name="seqLen">Number of tokens.</param>
     /// <param name="stream">CUDA stream handle.</param>
-    /// <param name="snapshot">
-    /// Optional (#473): for <c>t &lt; snapshotRows</c> the state after token <c>t</c> is also written to
-    /// <c>snapshot + t * snapshotRowStride</c> floats, in <paramref name="state"/>'s layout. Zero for none.
+    /// <param name="writeState">
+    /// False (#1194 read-only speculative verify): emit the outputs but leave <paramref name="state"/> untouched; the accepted rows are
+    /// replayed into it afterwards with <see cref="LaunchGdnScanReplayF32"/>.
     /// </param>
-    /// <param name="snapshotRowStride">Floats between consecutive rows' snapshots.</param>
-    /// <param name="snapshotRows">Rows to snapshot (0 = none).</param>
     public void LaunchGdnScanMultiF32(nint state, nint q, nint k, nint v, nint g, nint beta, nint output,
-                                      int nVHead, int nKHead, int seqLen, nint stream,
-                                      nint snapshot = 0, long snapshotRowStride = 0, int snapshotRows = 0)
+                                      int nVHead, int nKHead, int seqLen, nint stream, bool writeState = true)
     {
-        nint sArg = state, qArg = q, kArg = k, vArg = v, gArg = g, bArg = beta, oArg = output, snArg = snapshot;
-        int nvArg = nVHead, nkArg = nKHead, slArg = seqLen, srArg = snapshotRows;
-        long ssArg = snapshotRowStride;
-        void** args = stackalloc void*[] { &sArg, &qArg, &kArg, &vArg, &gArg, &bArg, &oArg, &nvArg, &nkArg, &slArg, &snArg, &ssArg, &srArg };
+        nint sArg = state, qArg = q, kArg = k, vArg = v, gArg = g, bArg = beta, oArg = output;
+        int nvArg = nVHead, nkArg = nKHead, slArg = seqLen, wsArg = writeState ? 1 : 0;
+        void** args = stackalloc void*[] { &sArg, &qArg, &kArg, &vArg, &gArg, &bArg, &oArg, &nvArg, &nkArg, &slArg, &wsArg };
         CudaDriverApi.cuLaunchKernel(_gdnScanMultiF32Func,
                 (uint)nVHead, 1, 1, 128, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
