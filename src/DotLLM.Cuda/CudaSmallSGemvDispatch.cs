@@ -114,16 +114,30 @@ public static class CudaSmallSGemvDispatch
     /// <summary>
     /// Environment variable that, when set to <c>1</c>, routes PQ2_0 projections WIDER than
     /// <see cref="MaxColumns"/> (prefill, and perplexity's whole-window forward) to the packed dp4a
-    /// GEMM (issue #490) instead of dequantizing the matrix to F16 for cuBLAS. OPT-IN until measured:
-    /// like #485 this is a numerics change (int8 activations, the CPU W2A8 tier), and unlike #485 it
-    /// is on the path perplexity scores.
+    /// GEMM (issue #490) instead of dequantizing the matrix to F16 for cuBLAS. Like #485 this is a
+    /// numerics change (int8 activations, the CPU W2A8 tier) on the path perplexity scores. Unset, it
+    /// is ON wherever the int8 tensor-core kernel loads (issue #1222, sm_80+) and off otherwise (the
+    /// dp4a-only tile is slower than cuBLAS); <c>1</c> / <c>0</c> force it either way.
     /// </summary>
     public const string MmqEnvVar = "DOTLLM_CUDA_PQ2_0_MMQ";
 
-    private static readonly bool MmqFromEnv = Environment.GetEnvironmentVariable(MmqEnvVar) == "1";
+    private static readonly bool? MmqFromEnv = Environment.GetEnvironmentVariable(MmqEnvVar) switch
+    {
+        "1" => true,
+        "0" => false,
+        _ => null,
+    };
 
-    /// <summary>Whether the packed PQ2_0 prefill GEMM is enabled (<see cref="MmqEnvVar"/>, default off).</summary>
-    public static bool UseMmq => MmqOverride ?? MmqFromEnv;
+    /// <summary>Whether the packed PQ2_0 prefill GEMM is forced on (<see cref="MmqEnvVar"/> = 1 or the override).</summary>
+    public static bool UseMmq => MmqOverride ?? MmqFromEnv ?? false;
+
+    /// <summary>
+    /// Whether the packed PQ2_0 prefill GEMM is enabled given whether the int8 tensor-core tile is
+    /// loaded: the env/override when set, otherwise <paramref name="mmaAvailable"/> (issue #1222).
+    /// </summary>
+    /// <param name="mmaAvailable">Whether <c>pq2_0_mmq_mma.ptx</c> loaded on this device.</param>
+    /// <returns><see langword="true"/> when wide PQ2_0 projections should take the packed GEMM.</returns>
+    public static bool UseMmqWith(bool mmaAvailable) => MmqOverride ?? MmqFromEnv ?? mmaAvailable;
 
     /// <summary>In-process override of <see cref="UseMmq"/> (tests/benches only; read per projection).</summary>
     internal static bool? MmqOverride { get; set; }
@@ -142,8 +156,18 @@ public static class CudaSmallSGemvDispatch
         => UseMmq && seqLen > Math.Max(1, MaxColumns);
 
     /// <summary>
-    /// Environment variable forcing the PQ2_0 MMQ column tile (<c>16</c> or <c>32</c>); unset picks
-    /// <see cref="MmqTileColumns"/>'s width for the token count.
+    /// <see cref="CoversMmq(int)"/>, with the default resolved by <see cref="UseMmqWith"/> (issue #1222).
+    /// </summary>
+    /// <param name="seqLen">Token rows in the projection.</param>
+    /// <param name="mmaAvailable">Whether the int8 tensor-core tile is loaded.</param>
+    /// <returns><see langword="true"/> when the packed GEMM should run this width.</returns>
+    public static bool CoversMmq(int seqLen, bool mmaAvailable)
+        => UseMmqWith(mmaAvailable) && seqLen > Math.Max(1, MaxColumns);
+
+    /// <summary>
+    /// Environment variable forcing the PQ2_0 MMQ column tile (<c>16</c>, <c>32</c>, or <c>64</c> for the
+    /// int8 tensor-core tile); unset picks
+    /// <see cref="MmqTileColumns(int, bool)"/>'s width for the token count.
     /// </summary>
     public const string MmqTileEnvVar = "DOTLLM_CUDA_PQ2_0_MMQ_BN";
 
@@ -158,10 +182,20 @@ public static class CudaSmallSGemvDispatch
     /// wide (32-column, 128-row) one above. <see cref="MmqTileEnvVar"/> pins either.
     /// </summary>
     /// <param name="seqLen">Token rows in the projection.</param>
-    public static int MmqTileColumns(int seqLen)
+    public static int MmqTileColumns(int seqLen) => MmqTileColumns(seqLen, mmaAvailable: false);
+
+    /// <summary>
+    /// <see cref="MmqTileColumns(int)"/>, preferring the 64-column int8 tensor-core tile above 16 tokens
+    /// when it is loaded (issue #1222).
+    /// </summary>
+    /// <param name="seqLen">Token rows in the projection.</param>
+    /// <param name="mmaAvailable">Whether <c>pq2_0_mmq_mma.ptx</c> loaded.</param>
+    /// <returns>The column tile to launch.</returns>
+    public static int MmqTileColumns(int seqLen, bool mmaAvailable)
     {
         int forced = MmqTileOverride ?? MmqTileFromEnv;
         if (forced != 0) return forced;
+        if (mmaAvailable && seqLen > CudaKernels.Pq2_0MmqTileColumnsNarrow) return CudaKernels.Pq2_0MmqTileColumnsMma;
         return seqLen <= CudaKernels.Pq2_0MmqTileColumnsNarrow
             ? CudaKernels.Pq2_0MmqTileColumnsNarrow
             : CudaKernels.Pq2_0MmqTileColumnsWide;
@@ -170,7 +204,8 @@ public static class CudaSmallSGemvDispatch
     private static int ReadMmqTile()
         => int.TryParse(Environment.GetEnvironmentVariable(MmqTileEnvVar),
                NumberStyles.Integer, CultureInfo.InvariantCulture, out int v)
-           && (v == CudaKernels.Pq2_0MmqTileColumnsNarrow || v == CudaKernels.Pq2_0MmqTileColumnsWide)
+           && (v == CudaKernels.Pq2_0MmqTileColumnsNarrow || v == CudaKernels.Pq2_0MmqTileColumnsWide
+               || v == CudaKernels.Pq2_0MmqTileColumnsMma)
            ? v
            : 0;
 

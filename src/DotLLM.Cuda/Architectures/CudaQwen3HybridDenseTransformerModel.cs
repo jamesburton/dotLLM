@@ -2145,14 +2145,20 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         if (ProfileTrace) _stream.Synchronize();
         ProfMark("setup-embed");
 
-        if (_dflashCall is not null) EnsureDFlashTapPinned(seqLen - DFlashTapFirst(seqLen));
-        for (int layer = 0; layer < _layers.Length; layer++)
+        // #1222: a plain one-token step runs the whole layer loop as one graph launch.
+        bool graphed = seqLen == 1 && produceLogits && mtpCapture is null && _dflashCall is null
+            && TryForwardDecodeGraph(positions, hiddenSize, numHeads, numKvHeads, headDim, eps, kvCache);
+        if (!graphed)
         {
-            if (_dflashCall is not null) QueueDFlashTap(layer, seqLen);
-            RunSingleLayerBody(layer, seqLen, positions, hiddenSize,
-                numHeads, numKvHeads, headDim, eps, kvCache);
+            if (_dflashCall is not null) EnsureDFlashTapPinned(seqLen - DFlashTapFirst(seqLen));
+            for (int layer = 0; layer < _layers.Length; layer++)
+            {
+                if (_dflashCall is not null) QueueDFlashTap(layer, seqLen);
+                RunSingleLayerBody(layer, seqLen, positions, hiddenSize,
+                    numHeads, numKvHeads, headDim, eps, kvCache);
+            }
+            if (_dflashCall is not null) QueueDFlashTap(_layers.Length, seqLen);
         }
-        if (_dflashCall is not null) QueueDFlashTap(_layers.Length, seqLen);
 
         // Issue #492: every layer is now queued on the stream and the host has nothing to wait for
         // until the MTP capture's synchronize below, so this is the one window in the call where
@@ -3654,7 +3660,14 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         // per-GPU/per-shape ceiling, not a soft limit) with a safe fallback to the exact kernel.
         bool useCoopSplit4 = CudaKernels.EnableGdnScanApproxSplit4 &&
             _kernels.IsGdnScanCoopSplit4Safe(nVHead, dState);
-        for (int t = 0; t < seqLen; t++)
+        // #1222: without per-row snapshots (#473) every token runs in ONE launch with the state in
+        // registers — bit-identical to the per-token loop below, which verify forwards keep.
+        if (snapRows == 0 && !useCoopSplit4 && _kernels.CanGdnScanMultiF32(dState))
+        {
+            _kernels.LaunchGdnScanMultiF32(gdnStateDev, qBuf, kBuf, vBuf, alphaBuf, betaBuf, gdnOut,
+                nVHead, nKHead, seqLen, streamH);
+        }
+        else for (int t = 0; t < seqLen; t++)
         {
             nint qT = qBuf + (nint)(t * qStepBytes);
             nint kT = kBuf + (nint)(t * kStepBytes);
@@ -4917,7 +4930,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     /// <summary>
     /// Whether a <paramref name="qt"/> projection over <paramref name="seqLen"/> rows takes the packed
     /// dp4a prefill GEMM (issue #490): PQ2_0, a width the GEMV does not cover
-    /// (<see cref="CudaSmallSGemvDispatch.CoversMmq"/>), the env/override on, and BOTH
+    /// (<see cref="CudaSmallSGemvDispatch.CoversMmq(int, bool)"/>), the env/override on, and BOTH
     /// <c>pq2_0_mmq_dp4a.ptx</c> and <c>pq2_0_gemv_dp4a.ptx</c> (whose quantizer it reuses) loaded.
     /// When the switch is on but either PTX is missing or stale it warns once and returns
     /// <see langword="false"/>, so the dequant+cuBLAS prefill keeps running.
@@ -4925,7 +4938,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private bool Pq2_0MmqActive(QuantizationType qt, int seqLen)
     {
-        if (qt != QuantizationType.PQ2_0 || !CudaSmallSGemvDispatch.CoversMmq(seqLen)) return false;
+        if (qt != QuantizationType.PQ2_0 || !CudaSmallSGemvDispatch.CoversMmq(seqLen, _kernels.HasPQ2_0MmqMma)) return false;
         if (_kernels.HasPQ2_0MmqDp4a && _kernels.HasPQ2_0GemvDp4a) return true;
         if (!_warnedNoPQ2_0Mmq)
         {
@@ -4952,7 +4965,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
             return;
         }
         _kernels.LaunchPQ2_0MmqDp4a(weight, _activQ8InScratch, _activQ8MetaScratch, y, m, k, seqLen,
-            CudaSmallSGemvDispatch.MmqTileColumns(seqLen), streamH);
+            CudaSmallSGemvDispatch.MmqTileColumns(seqLen, _kernels.HasPQ2_0MmqMma), streamH);
         _pq2_0MmqLaunches++;
     }
 
@@ -5214,6 +5227,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         if (_disposed) return;
         _disposed = true;
         _context.MakeCurrent();
+        DisposeDecodeGraph();
         DisposeDFlash();
 
         for (int i = 0; i < _layers.Length; i++)
@@ -5340,6 +5354,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     /// </summary>
     private static nint AllocDevice(long bytes, List<nint>? allocs = null)
     {
+        ThrowIfCapturing();
         CudaDriverApi.cuMemAlloc_v2(out nint ptr, (nuint)bytes).ThrowOnError();
         allocs?.Add(ptr);
         return ptr;
@@ -5372,6 +5387,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
     {
         if (ptr != 0)
         {
+            ThrowIfCapturing();
             CudaDriverApi.cuMemFree_v2(ptr);
             ptr = 0;
         }

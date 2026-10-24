@@ -165,4 +165,79 @@ public class CudaGdnScanStepF32Tests
             if (dOut != 0) CudaDriverApi.cuMemFree_v2(dOut);
         }
     }
+    /// <summary>
+    /// Issue #1222: <see cref="CudaKernels.LaunchGdnScanMultiF32"/> runs a whole sequence in one launch
+    /// with the state in registers. It must equal the CPU reference over the same sequence exactly —
+    /// output for every token and the final state — since it is meant to be a drop-in for the
+    /// per-token loop. nVHead = 3 × nKHead makes the tiled head broadcast (vh % nKHead) matter.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(48, 16, 1)]   // decode: one token
+    [InlineData(48, 16, 37)]  // Bonsai-2 27B GDN shape, a prefill-sized run
+    public void GdnScanMultiF32_MatchesCpuReference_OverSequence(int nVHead, int nKHead, int seqLen)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+        const int dState = 128;
+
+        using var ctx = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        using var kernels = new CudaKernels(ptxDir!);
+        Skip.IfNot(kernels.CanGdnScanMultiF32(dState), "gdn_scan_multi_f32 not in the loaded PTX");
+
+        var rng = new Random(1222 ^ seqLen);
+        float[] Rand(int n, double lo, double hi)
+        {
+            var a = new float[n];
+            for (int i = 0; i < n; i++) a[i] = (float)(lo + rng.NextDouble() * (hi - lo));
+            return a;
+        }
+
+        float[] state = Rand(nVHead * dState * dState, -1, 1);
+        float[] q = Rand(seqLen * nKHead * dState, -1, 1);
+        float[] k = Rand(seqLen * nKHead * dState, -1, 1);
+        float[] v = Rand(seqLen * nVHead * dState, -1, 1);
+        float[] g = Rand(seqLen * nVHead, 0.5, 1);
+        float[] beta = Rand(seqLen * nVHead, 0, 1);
+
+        nint[] bufs = new nint[7];
+        try
+        {
+            float[][] host = [state, q, k, v, g, beta, new float[seqLen * nVHead * dState]];
+            for (int i = 0; i < host.Length; i++)
+            {
+                CudaDriverApi.cuMemAlloc_v2(out bufs[i], (nuint)(host[i].Length * sizeof(float))).ThrowOnError();
+                unsafe
+                {
+                    fixed (float* p = host[i])
+                        CudaDriverApi.cuMemcpyHtoD_v2(bufs[i], (nint)p, (nuint)(host[i].Length * sizeof(float))).ThrowOnError();
+                }
+            }
+
+            kernels.LaunchGdnScanMultiF32(bufs[0], bufs[1], bufs[2], bufs[3], bufs[4], bufs[5], bufs[6],
+                nVHead, nKHead, seqLen, stream.Handle);
+            stream.Synchronize();
+
+            float[] cpuOut = new float[seqLen * nVHead * dState];
+            float[] cpuState = (float[])state.Clone();
+            GatedDeltaNetScan.Execute(cpuState, q, k, v, g, beta, cpuOut, nVHead, nKHead, dState, seqLen);
+
+            float[] gpuOut = new float[cpuOut.Length];
+            float[] gpuState = new float[cpuState.Length];
+            unsafe
+            {
+                fixed (float* p = gpuOut) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, bufs[6], (nuint)(gpuOut.Length * sizeof(float))).ThrowOnError();
+                fixed (float* p = gpuState) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, bufs[0], (nuint)(gpuState.Length * sizeof(float))).ThrowOnError();
+            }
+
+            Assert.True(cpuOut.AsSpan().SequenceEqual(gpuOut), "output mismatch");
+            Assert.True(cpuState.AsSpan().SequenceEqual(gpuState), "final state mismatch");
+        }
+        finally
+        {
+            foreach (nint b in bufs)
+                if (b != 0) CudaDriverApi.cuMemFree_v2(b);
+        }
+    }
 }

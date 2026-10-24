@@ -141,6 +141,10 @@ public sealed unsafe partial class CudaKernels : IDisposable
     private readonly nint _pq2_0MmqDp4aBn16Func;
     private readonly string? _pq2_0MmqDp4aUnavailableReason;
     private readonly bool _hasPQ2_0MmqDp4a;   // cached: read on every prefill-width PQ2_0 projection
+    // int8 tensor-core tile of the same GEMM (pq2_0_mmq_mma.ptx, issue #1222): compute_86 PTX, so it
+    // only loads on sm_80+; absent, the 64-column tile falls back to the dp4a 32-column one.
+    private readonly CudaModule? _pq2_0MmqMmaModule;
+    private readonly nint _pq2_0MmqMmaFunc;
     private readonly nint _quantizedGemvQ2_KMmqPreqFunc;
     private readonly nint _quantizedGemvQ4_KMmqPreqFunc;
     private readonly nint _quantizedGemvQ5_KMmqPreqFunc;
@@ -491,6 +495,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
     private readonly CudaModule? _gdnScanF32Module;
     private readonly nint _gdnScanStepF32Func;
     private readonly nint _gdnScanStepF32CoopSplit4Func;
+    private readonly nint _gdnScanMultiF32Func;   // #1222
     private int _gdnScanCoopSplit4MaxCoResidentGrid = -1; // -1 = not yet queried
     private readonly CudaModule? _l2NormHeadsF32Module;
     private readonly nint _l2NormHeadsF32Func;
@@ -934,6 +939,20 @@ public sealed unsafe partial class CudaKernels : IDisposable
             _pq2_0MmqDp4aUnavailableReason = $"pq2_0_mmq_dp4a.ptx not found in {ptxDir}";
         }
 
+        string pq2_0MmqMmaPath = Path.Combine(ptxDir, "pq2_0_mmq_mma.ptx");
+        if (File.Exists(pq2_0MmqMmaPath))
+        {
+            try
+            {
+                _pq2_0MmqMmaModule = CudaModule.LoadFromFile(pq2_0MmqMmaPath);
+                _pq2_0MmqMmaFunc = _pq2_0MmqMmaModule.TryGetFunction("pq2_0_mmq_mma_f32y");
+            }
+            catch (CudaException)
+            {
+                _pq2_0MmqMmaFunc = 0;   // pre-Ampere device: the compute_86 PTX does not JIT
+            }
+        }
+
         _rmsnormFunc = _rmsnormModule.GetFunction("rmsnorm_f16");
         _rmsnormF32Func = _rmsnormF32Module.GetFunction("rmsnorm_f32");
         _quantizedGemvQ8_0F32InFunc = _quantizedGemvF32InModule.GetFunction("quantized_gemv_q8_0_f32in");
@@ -1280,6 +1299,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
             // gated_delta_net_scan.cu's header for the full measured-speedup-vs-bit-parity-
             // tradeoff writeup. TryGetFunction so a stale PTX (pre-#180) still loads gracefully.
             _gdnScanStepF32CoopSplit4Func = _gdnScanF32Module.TryGetFunction("gdn_scan_step_f32_coop_split4");
+            _gdnScanMultiF32Func = _gdnScanF32Module.TryGetFunction("gdn_scan_multi_f32");
             // The L2-norm and decay helpers live in the same .cu translation unit,
             // so they are in the same .ptx module — query each function pointer here.
             _l2NormHeadsF32Module = _gdnScanF32Module;
@@ -3851,6 +3871,43 @@ public sealed unsafe partial class CudaKernels : IDisposable
 
         CudaDriverApi.cuLaunchKernel(_gdnConv1dCausalDecodeF32Func,
                 gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Whether <see cref="LaunchGdnScanMultiF32"/> can run a <paramref name="dState"/>-wide scan:
+    /// the kernel is loaded (a stale pre-#1222 PTX lacks it) and <paramref name="dState"/> is 128.
+    /// </summary>
+    /// <param name="dState">Per-head state dimension.</param>
+    /// <returns><see langword="true"/> when the multi-token kernel covers this shape.</returns>
+    public bool CanGdnScanMultiF32(int dState) => _gdnScanMultiF32Func != 0 && dState == 128;
+
+    /// <summary>
+    /// Gated DeltaNet recurrence over <paramref name="seqLen"/> contiguous tokens in ONE launch
+    /// (issue #1222). Each thread keeps its state column in registers for the whole sequence, so
+    /// the state is read and written once instead of four passes per token, and a prefill no longer
+    /// pays one launch per token. Bit-identical to <paramref name="seqLen"/> calls of
+    /// <see cref="LaunchGdnScanStepF32"/> on the same buffers.
+    /// </summary>
+    /// <param name="state">Device pointer to <c>[nVHead, 128, 128]</c> FP32 state, updated in place.</param>
+    /// <param name="q">Device pointer to <c>[seqLen, nKHead, 128]</c> L2-normalised queries.</param>
+    /// <param name="k">Device pointer to <c>[seqLen, nKHead, 128]</c> L2-normalised keys.</param>
+    /// <param name="v">Device pointer to <c>[seqLen, nVHead, 128]</c> values.</param>
+    /// <param name="g">Device pointer to <c>[seqLen, nVHead]</c> decay scalars.</param>
+    /// <param name="beta">Device pointer to <c>[seqLen, nVHead]</c> write gates.</param>
+    /// <param name="output">Device pointer to <c>[seqLen, nVHead, 128]</c> output, overwritten.</param>
+    /// <param name="nVHead">Number of value heads.</param>
+    /// <param name="nKHead">Number of key heads (tiled broadcast, <c>kh = vh % nKHead</c>).</param>
+    /// <param name="seqLen">Number of tokens.</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchGdnScanMultiF32(nint state, nint q, nint k, nint v, nint g, nint beta, nint output,
+                                      int nVHead, int nKHead, int seqLen, nint stream)
+    {
+        nint sArg = state, qArg = q, kArg = k, vArg = v, gArg = g, bArg = beta, oArg = output;
+        int nvArg = nVHead, nkArg = nKHead, slArg = seqLen;
+        void** args = stackalloc void*[] { &sArg, &qArg, &kArg, &vArg, &gArg, &bArg, &oArg, &nvArg, &nkArg, &slArg };
+        CudaDriverApi.cuLaunchKernel(_gdnScanMultiF32Func,
+                (uint)nVHead, 1, 1, 128, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
@@ -6579,6 +6636,19 @@ public sealed unsafe partial class CudaKernels : IDisposable
     /// <summary>Output rows per block tile of the narrow PQ2_0 MMQ instantiation.</summary>
     public const int Pq2_0MmqTileRowsNarrow = 256;
 
+    /// <summary>Token columns per block tile of the int8 tensor-core PQ2_0 MMQ (<c>pq2_0_mmq_mma_f32y</c>, issue #1222).</summary>
+    public const int Pq2_0MmqTileColumnsMma = 64;
+
+    /// <summary>Output rows per block tile of the int8 tensor-core PQ2_0 MMQ.</summary>
+    public const int Pq2_0MmqTileRowsMma = 128;
+
+    /// <summary>
+    /// Whether the int8 tensor-core PQ2_0 prefill GEMM (<c>pq2_0_mmq_mma.ptx</c>, issue #1222) loaded
+    /// (sm_80+ only). It shares <see cref="LaunchPQ2_0MmqDp4a"/>'s inputs and is bit-identical to its
+    /// dp4a tiles; select it with <see cref="Pq2_0MmqTileColumnsMma"/>.
+    /// </summary>
+    public bool HasPQ2_0MmqMma => _pq2_0MmqMmaFunc != 0;
+
     /// <summary>
     /// Whether the packed PQ2_0 prefill GEMM (<c>pq2_0_mmq_dp4a.ptx</c>, issue #490) is loaded. It
     /// consumes <see cref="LaunchPQ2_0Dp4aQuantizeX"/>'s output, so
@@ -6609,7 +6679,9 @@ public sealed unsafe partial class CudaKernels : IDisposable
     /// <param name="k">Input width, a multiple of 128.</param>
     /// <param name="columns">Token columns (any positive count; tails are masked).</param>
     /// <param name="tileColumns">
-    /// Column tile: <see cref="Pq2_0MmqTileColumnsWide"/> or <see cref="Pq2_0MmqTileColumnsNarrow"/>.
+    /// Column tile: <see cref="Pq2_0MmqTileColumnsWide"/>, <see cref="Pq2_0MmqTileColumnsNarrow"/>, or
+    /// <see cref="Pq2_0MmqTileColumnsMma"/> (the int8 tensor-core tile; falls back to the wide dp4a
+    /// tile when <see cref="HasPQ2_0MmqMma"/> is false).
     /// </param>
     /// <param name="stream">CUDA stream.</param>
     public void LaunchPQ2_0MmqDp4a(nint quantWeight, nint xQ8, nint xMeta, nint yF32,
@@ -6619,6 +6691,24 @@ public sealed unsafe partial class CudaKernels : IDisposable
             throw new ArgumentOutOfRangeException(nameof(columns), columns, "columns must be positive.");
         if (k <= 0 || k % 128 != 0)
             throw new ArgumentException($"PQ2_0 k must be a positive multiple of 128, got {k}.", nameof(k));
+
+        if (tileColumns == Pq2_0MmqTileColumnsMma)
+        {
+            if (_pq2_0MmqMmaFunc != 0)
+            {
+                if (n <= 0) return;
+                nint wA = quantWeight, qA = xQ8, mA = xMeta, yA = yF32;
+                int nA = n, kA = k, cA = columns;
+                void** a = stackalloc void*[] { &wA, &qA, &mA, &yA, &nA, &kA, &cA };
+                CudaDriverApi.cuLaunchKernel(_pq2_0MmqMmaFunc,
+                        (uint)((columns + Pq2_0MmqTileColumnsMma - 1) / Pq2_0MmqTileColumnsMma),   // x = column tile
+                        (uint)((n + Pq2_0MmqTileRowsMma - 1) / Pq2_0MmqTileRowsMma), 1,
+                        BlockSize, 1, 1,
+                        0, stream, (nint)a, 0).ThrowOnError();
+                return;
+            }
+            tileColumns = Pq2_0MmqTileColumnsWide;
+        }
 
         bool narrow = tileColumns == Pq2_0MmqTileColumnsNarrow;
         if (!narrow && tileColumns != Pq2_0MmqTileColumnsWide)
@@ -8027,6 +8117,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
         _pq2_0GemvMultiModule?.Dispose();
         _pq2_0GemvDp4aModule?.Dispose();
         _pq2_0MmqDp4aModule?.Dispose();
+        _pq2_0MmqMmaModule?.Dispose();
         _kvWriteModule?.Dispose();
         _fusedRopeKvWriteModule?.Dispose();
         _attentionMlaModule?.Dispose();

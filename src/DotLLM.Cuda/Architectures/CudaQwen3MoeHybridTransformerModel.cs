@@ -2059,7 +2059,13 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         long gStepBytes = (long)nVHead * sizeof(float);
         long betaStepBytes = gStepBytes;
         long outStepBytes = vStepBytes;
-        for (int t = 0; t < seqLen; t++)
+        // #1222: one launch for all tokens, state in registers (bit-identical to the loop below).
+        if (_kernels.CanGdnScanMultiF32(dState))
+        {
+            _kernels.LaunchGdnScanMultiF32(gdnStateDev, qBuf, kBuf, vBuf, alphaBuf, betaBuf, gdnOut,
+                nVHead, nKHead, seqLen, streamH);
+        }
+        else for (int t = 0; t < seqLen; t++)
         {
             nint qT = qBuf + (nint)(t * qStepBytes);
             nint kT = kBuf + (nint)(t * kStepBytes);
