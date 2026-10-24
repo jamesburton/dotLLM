@@ -42,9 +42,9 @@ internal sealed unsafe class DFlashMtpState : IMtpState
         _drafter = drafter;
         _kvDim = drafter.NumKvHeads * drafter.HeadDim;
         RingCapacity = (int)Math.Min((long)drafter.Window + 2L * drafter.BlockSize, 1 << 20);
-        nuint bytes = (nuint)((long)drafter.NumLayers * 2 * RingCapacity * _kvDim * sizeof(ushort));
-        _ring = (nint)NativeMemory.AlignedAlloc(bytes, 64);
-        RingBytes = (long)bytes;
+        long halves = (long)drafter.NumLayers * 2 * RingCapacity * _kvDim;
+        _ring = drafter.Backend.AllocHalf(halves);   // host or device, the drafter's backend decides
+        RingBytes = halves * sizeof(ushort);
         _draft = new int[drafter.BlockSize - 1];
     }
 
@@ -116,27 +116,19 @@ internal sealed unsafe class DFlashMtpState : IMtpState
 
     /// <summary>Injects the first <paramref name="positions"/>.Length captured rows (llama.cpp's KV-injection pass).</summary>
     /// <param name="positions">Position of each captured row.</param>
-    /// <param name="pool">Compute pool.</param>
-    public void InjectCaptured(ReadOnlySpan<int> positions, DotLLM.Cpu.Threading.ComputeThreadPool? pool)
+    public void InjectCaptured(ReadOnlySpan<int> positions)
     {
         _draftStart = -1;   // the context changed: any cached block is stale
         long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-        _drafter.Inject(this, _taps, positions, pool);
+        _drafter.Inject(this, _taps, positions);
         _injectTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
         _injects++;
         _injectRows += positions.Length;
     }
 
-    internal Half* RingKeys(int layer) => (Half*)_ring + (long)layer * 2 * RingCapacity * _kvDim;
+    internal nint RingKeys(int layer) => _ring + (nint)((long)layer * 2 * RingCapacity * _kvDim * sizeof(ushort));
 
-    internal Half* RingValues(int layer) => RingKeys(layer) + (long)RingCapacity * _kvDim;
-
-    internal void WriteContextRow(int layer, int pos, ReadOnlySpan<float> k, ReadOnlySpan<float> v)
-    {
-        long off = (long)(pos % RingCapacity) * _kvDim;
-        TensorPrimitives.ConvertToHalf(k, new Span<Half>(RingKeys(layer) + off, _kvDim));
-        TensorPrimitives.ConvertToHalf(v, new Span<Half>(RingValues(layer) + off, _kvDim));
-    }
+    internal nint RingValues(int layer) => RingKeys(layer) + (nint)((long)RingCapacity * _kvDim * sizeof(ushort));
 
     internal void NoteInjected(int pos)
     {
@@ -188,10 +180,12 @@ internal sealed unsafe class DFlashMtpState : IMtpState
         if (Trace && (_drafts > 0 || _injects > 0))
         {
             double f = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            var p = _drafter.TakeProfile();
             Console.Error.WriteLine($"[dflash] drafts={_drafts} draft_ms={_draftTicks * f / Math.Max(1, _drafts):F1}/draft " +
-                $"injects={_injects} rows={_injectRows} inject_ms={_injectTicks * f:F0} total ({_injectTicks * f / Math.Max(1, _injects):F1}/inject)");
+                $"injects={_injects} rows={_injectRows} inject_ms={_injectTicks * f:F0} total ({_injectTicks * f / Math.Max(1, _injects):F1}/inject) " +
+                $"split_ms gemm={p.Gemm:F0} attn={p.Attn:F0} head={p.Head:F0} select={p.Select:F0}");
         }
-        if (_ring != 0) { NativeMemory.AlignedFree((void*)_ring); _ring = 0; }
+        if (_ring != 0) { _drafter.Backend.Free(_ring); _ring = 0; }
         if (_taps != null) { NativeMemory.AlignedFree(_taps); _taps = null; }
     }
 }

@@ -136,14 +136,15 @@ public sealed unsafe class DFlashDrafterTests : IDisposable
             for (int i = 0; i < Head.Length; i++) Head[i] = 0.5f * rng.NextSigned(1f);
         }
 
-        public void EmbedForDraft(ReadOnlySpan<int> tokens, float* dst)
+        public void EmbedForDraft(ReadOnlySpan<int> tokens, nint dst)
         {
             for (int t = 0; t < tokens.Length; t++)
-                Embed.AsSpan(tokens[t] * H, H).CopyTo(new Span<float>(dst + t * H, H));
+                Embed.AsSpan(tokens[t] * H, H).CopyTo(new Span<float>((float*)dst + t * H, H));
         }
 
-        public void ProjectForDraft(float* hidden, int rows, float* logits)
+        public void ProjectForDraft(nint hiddenRows, int rows, float* logits)
         {
+            float* hidden = (float*)hiddenRows;
             for (int r = 0; r < rows; r++)
                 for (int v = 0; v < Vocab; v++)
                 {
@@ -152,8 +153,6 @@ public sealed unsafe class DFlashDrafterTests : IDisposable
                     logits[r * Vocab + v] = s;
                 }
         }
-
-        public ComputeThreadPool? DraftPool => null;
     }
 
     // ── Stateless reference (dflash/model.py) ───────────────────────────
@@ -305,7 +304,7 @@ public sealed unsafe class DFlashDrafterTests : IDisposable
         for (int i = 0; i < nDraft; i++)
         {
             logits[i] = new float[Vocab];
-            fixed (float* hp = hid[i]) fixed (float* lp = logits[i]) target.ProjectForDraft(hp, 1, lp);
+            fixed (float* hp = hid[i]) fixed (float* lp = logits[i]) target.ProjectForDraft((nint)hp, 1, lp);
         }
 
         var tokens = new int[nDraft];
@@ -343,13 +342,44 @@ public sealed unsafe class DFlashDrafterTests : IDisposable
     [InlineData(false)]
     [InlineData(true)]
     public void Draft_MatchesStatelessReference_AcrossInjectRollbackAndWindow(bool dflash2)
+        => AssertMatchesReference(_dir, dflash2, () => new DFlashCpuBackend(null), t => t, 2e-4f, _out);
+
+    /// <summary>Host buffers for the stand-in target, whatever memory the backend uses.</summary>
+    internal interface ITargetMemory
+    {
+        /// <summary>Copies host floats into backend memory.</summary>
+        void Up(float* src, nint dst, int count);
+
+        /// <summary>Copies backend floats to the host.</summary>
+        void Down(nint src, float* dst, int count);
+    }
+
+    /// <summary>The stand-in target over a backend's memory: rows are staged through the host.</summary>
+    internal sealed class StagedTarget(IDFlashTargetOps host, ITargetMemory mem) : IDFlashTargetOps
+    {
+        public void EmbedForDraft(ReadOnlySpan<int> tokens, nint dst)
+        {
+            var tmp = new float[tokens.Length * H];
+            fixed (float* p = tmp) { host.EmbedForDraft(tokens, (nint)p); mem.Up(p, dst, tmp.Length); }
+        }
+
+        public void ProjectForDraft(nint hidden, int rows, float* logits)
+        {
+            var tmp = new float[rows * H];
+            fixed (float* p = tmp) { mem.Down(hidden, p, tmp.Length); host.ProjectForDraft((nint)p, rows, logits); }
+        }
+    }
+
+    internal static void AssertMatchesReference(string dir, bool dflash2, Func<IDFlashBackend> backend,
+        Func<IDFlashTargetOps, IDFlashTargetOps> wrapTarget, float tol, ITestOutputHelper output)
     {
         var (bytes, w) = BuildDrafter(0xD1F1A5u + (dflash2 ? 1u : 0u), dflash2);
-        string path = Path.Combine(_dir, $"drafter-{dflash2}.gguf");
+        string path = Path.Combine(dir, $"drafter-{dflash2}.gguf");
         File.WriteAllBytes(path, bytes);
-        using var drafter = DFlashDrafter.Open(path, H, 2, Vocab);
+        using var drafter = DFlashDrafter.Open(path, H, 2, Vocab, backend());
         Assert.Equal(dflash2, drafter.IsDFlash2);
         var target = new FakeTarget(0x7A5Eu);
+        var ops = wrapTarget(target);
         using var state = new DFlashMtpState(drafter);
         var rng = new SyntheticGemma4Gguf.Xorshift(0x5EEDu);
         int width = drafter.TapRowWidth;
@@ -365,7 +395,7 @@ public sealed unsafe class DFlashDrafterTests : IDisposable
                 for (int s = 0; s < TargetLayers.Length; s++) state.CaptureTap(r, s, rows[r].AsSpan(s * H, H));
                 positions[r] = firstPos + r;
             }
-            state.InjectCaptured(positions, null);
+            state.InjectCaptured(positions);
         }
 
         // Prefill of 3 rows, then rounds: inject a 4-row "verify", roll back to accept 1, re-inject different rows, draft.
@@ -380,14 +410,14 @@ public sealed unsafe class DFlashDrafterTests : IDisposable
             int nDraft = 1 + round % (Block - 1);
             var got = new int[nDraft];
             int anchor = (round * 5 + 2) % Vocab;
-            got[0] = state.NextDraft(target, anchor, start, nDraft);
-            for (int i = 1; i < nDraft; i++) got[i] = state.NextDraft(target, got[i - 1], start + i, nDraft);
+            got[0] = state.NextDraft(ops, anchor, start, nDraft);
+            for (int i = 1; i < nDraft; i++) got[i] = state.NextDraft(ops, got[i - 1], start + i, nDraft);
             var (want, wantLogits) = Reference(w, target, dflash2, committed.ToArray(), anchor, start, nDraft);
             for (int i = 0; i < nDraft; i++)
             {
                 var gl = state.DraftLogits(start + i);
                 for (int v = 0; v < Vocab; v++)
-                    Assert.True(Math.Abs(gl[v] - wantLogits[i][v]) <= 2e-4f + 2e-4f * Math.Abs(wantLogits[i][v]),
+                    Assert.True(Math.Abs(gl[v] - wantLogits[i][v]) <= tol + tol * Math.Abs(wantLogits[i][v]),
                         $"round {round} draft {i} logit {v}: {gl[v]} vs {wantLogits[i][v]}");
             }
             Assert.Equal(want, got);
@@ -404,7 +434,7 @@ public sealed unsafe class DFlashDrafterTests : IDisposable
             committed.AddRange(more);
         }
         Assert.True(committed.Count > drafter.Window + 2 * drafter.BlockSize, "the context must outgrow the ring");
-        _out.WriteLine($"{checks} rounds matched; context {committed.Count} rows, window {drafter.Window}, ring {state.RingCapacity}");
+        output.WriteLine($"{checks} rounds matched; context {committed.Count} rows, window {drafter.Window}, ring {state.RingCapacity}");
     }
 
     /// <summary>A target backend for the end-to-end gate: the model and a KV-cache for it.</summary>

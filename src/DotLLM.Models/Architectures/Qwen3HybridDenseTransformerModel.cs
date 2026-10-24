@@ -1179,7 +1179,7 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
             AbsorbMtp(_mtpHead, mtpCapture, tokenIds, positions);
         if (dflashTaps is not null)
         {
-            dflashTaps.InjectCaptured(positions.Slice(tapFirst), _threadPool);
+            dflashTaps.InjectCaptured(positions.Slice(tapFirst));
             dflashTaps.TrimTapRows();
         }
 

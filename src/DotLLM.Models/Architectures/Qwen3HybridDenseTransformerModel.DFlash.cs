@@ -19,7 +19,7 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IDFlashDra
     public void AttachDFlashDrafter(string path)
     {
         if (_dflash is not null) throw new InvalidOperationException("A DFlash drafter is already attached.");
-        var drafter = DFlashDrafter.Open(path, Config.HiddenSize, Config.NumLayers, Config.VocabSize);
+        var drafter = DFlashDrafter.Open(path, Config.HiddenSize, Config.NumLayers, Config.VocabSize, new DFlashCpuBackend(_threadPool));
         int[] slots;
         try { slots = drafter.SlotForLayerInput(Config.NumLayers); }
         catch { drafter.Dispose(); throw; }
@@ -61,11 +61,12 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IDFlashDra
     }
 
     /// <inheritdoc/>
-    void IDFlashTargetOps.EmbedForDraft(ReadOnlySpan<int> tokens, float* dst) => EmbedTokens(tokens, dst, Config.HiddenSize);
+    void IDFlashTargetOps.EmbedForDraft(ReadOnlySpan<int> tokens, nint dst) => EmbedTokens(tokens, (float*)dst, Config.HiddenSize);
 
     /// <inheritdoc/>
-    void IDFlashTargetOps.ProjectForDraft(float* hidden, int rows, float* logits)
+    void IDFlashTargetOps.ProjectForDraft(nint hiddenRows, int rows, float* logits)
     {
+        float* hidden = (float*)hiddenRows;
         float* headIn = hidden;
         if (_hadamard is { } headRot)
         {
@@ -74,7 +75,4 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IDFlashDra
         }
         Gemm(_outputWeight, _outputQuantType, headIn, logits, _outputOutputDim, _outputInputDim, rows);
     }
-
-    /// <inheritdoc/>
-    ComputeThreadPool? IDFlashTargetOps.DraftPool => _threadPool;
 }
