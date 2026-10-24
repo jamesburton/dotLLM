@@ -28,6 +28,12 @@ public sealed class MatMulQ4_0MmvqKernel : IDisposable
     private readonly ComputePipeline _pipeline;
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
+
+    // #1161: V2 twin with the residual add in the store (y = residual + W x); null when the SPIR-V is absent or for V1.
+    private VulkanModule? _resModule;
+    private ComputePipeline? _resPipeline;
+    private nint _resPool;
+    private DescriptorSetCache? _resCache;
     private bool _disposed;
 
     /// <summary>
@@ -102,16 +108,66 @@ public sealed class MatMulQ4_0MmvqKernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
-        return new MatMulQ4_0MmvqKernel(device, module, pipeline, pool) { IsV2 = wantV2, Quant = quant };
+        var kernel = new MatMulQ4_0MmvqKernel(device, module, pipeline, pool) { IsV2 = wantV2, Quant = quant };
+        string resPath = Path.Combine(spvDir, ShaderFor("matmul_q4_0_mmvq_v2_residual.spv", quant));
+        if (wantV2 && File.Exists(resPath))
+        {
+            var rm = VulkanModule.LoadFromFile(device, resPath);
+            try
+            {
+                Span<VkDescriptorBinding> rb = stackalloc VkDescriptorBinding[5];
+                for (int i = 0; i < 5; i++) rb[i] = new VkDescriptorBinding((uint)i);
+                kernel._resPipeline = rm.CreateComputePipeline("main", rb, PushConstantBytes, requiredSubgroupSize);
+                kernel._resModule = rm;
+                kernel._resPool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 5);
+                kernel._resCache = new DescriptorSetCache(device, kernel._resPool, kernel._resPipeline, buffersPerSet: 5);
+            }
+            catch (VulkanException)
+            {
+                rm.Dispose();
+            }
+        }
+        return kernel;
     }
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
-    internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
+    internal void InvalidateDescriptorCache()
+    {
+        _descriptorCache.Reset();
+        _resCache?.Reset();
+    }
+
+    /// <summary>Whether <see cref="RecordResidual"/> is available.</summary>
+    public bool HasResidual => _resPipeline is not null;
 
     /// <summary>Records the Q4_0 MMVQ GEMV into <paramref name="cmdBuf"/>.</summary>
-    public unsafe void Record(
+    public void Record(
         nint cmdBuf,
         VulkanDevice.Buffer weights, VulkanDevice.Buffer xq, VulkanDevice.Buffer xds,
+        VulkanDevice.Buffer y,
+        int m, int k)
+        => RecordCore(cmdBuf, weights, xq, xds, null, y, m, k);
+
+    /// <summary>Records <c>y = residual + W x</c> (the separate add kernel's F32 add, fused into the store). Requires <see cref="HasResidual"/>.</summary>
+    /// <param name="cmdBuf">Open command buffer.</param>
+    /// <param name="weights">Packed weights.</param>
+    /// <param name="xq">Q8_1 activation.</param>
+    /// <param name="xds">Q8_1 activation scales.</param>
+    /// <param name="residual">Residual row <c>[m]</c>.</param>
+    /// <param name="y">Output <c>[m]</c> (must not alias <paramref name="residual"/>).</param>
+    /// <param name="m">Rows.</param>
+    /// <param name="k">Contraction length.</param>
+    public void RecordResidual(nint cmdBuf, VulkanDevice.Buffer weights, VulkanDevice.Buffer xq, VulkanDevice.Buffer xds,
+        VulkanDevice.Buffer residual, VulkanDevice.Buffer y, int m, int k)
+    {
+        if (_resPipeline is null) throw new InvalidOperationException("The residual-fused twin is not loaded.");
+        if (residual.Size < (long)m * sizeof(float)) throw new ArgumentException("Residual buffer too small.", nameof(residual));
+        RecordCore(cmdBuf, weights, xq, xds, residual, y, m, k);
+    }
+
+    private unsafe void RecordCore(
+        nint cmdBuf,
+        VulkanDevice.Buffer weights, VulkanDevice.Buffer xq, VulkanDevice.Buffer xds, VulkanDevice.Buffer? residual,
         VulkanDevice.Buffer y,
         int m, int k)
     {
@@ -132,19 +188,29 @@ public sealed class MatMulQ4_0MmvqKernel : IDisposable
         if (y.Size < (long)m * sizeof(float))
             throw new ArgumentException("Output buffer too small.", nameof(y));
 
-        Span<nint> buffers = stackalloc nint[4] { weights.Handle, xq.Handle, xds.Handle, y.Handle };
-        nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
+        var pipeline = residual is null ? _pipeline : _resPipeline!;
+        nint descriptorSet;
+        if (residual is null)
+        {
+            Span<nint> buffers = stackalloc nint[4] { weights.Handle, xq.Handle, xds.Handle, y.Handle };
+            descriptorSet = _descriptorCache.GetOrCreate(buffers);
+        }
+        else
+        {
+            Span<nint> buffers = stackalloc nint[5] { weights.Handle, xq.Handle, xds.Handle, residual.Handle, y.Handle };
+            descriptorSet = _resCache!.GetOrCreate(buffers);
+        }
 
-        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
+        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, pipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(
-            cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout,
+            cmdBuf, VkPipelineBindPoint.Compute, pipeline.Layout,
             0, 1, descriptorSet, 0, 0);
 
         Span<uint> pc = stackalloc uint[4] { (uint)m, (uint)k, (uint)blocksPerRow, 0u };
         fixed (uint* pcPtr = pc)
         {
             VulkanApi.vkCmdPushConstants(
-                cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute,
+                cmdBuf, pipeline.Layout, VkShaderStageFlags.Compute,
                 0, PushConstantBytes, (nint)pcPtr);
         }
 
@@ -158,6 +224,10 @@ public sealed class MatMulQ4_0MmvqKernel : IDisposable
         _disposed = true;
         if (_descriptorPool != 0)
             VulkanApi.vkDestroyDescriptorPool(_device.Handle, _descriptorPool, 0);
+        if (_resPool != 0)
+            VulkanApi.vkDestroyDescriptorPool(_device.Handle, _resPool, 0);
+        _resPipeline?.Dispose();
+        _resModule?.Dispose();
         _pipeline.Dispose();
         _module.Dispose();
     }

@@ -994,6 +994,8 @@ public sealed partial class VulkanTransformerModel : IModel
     // F16-operand guard for the grouped coopmat MoE down projection (#1171): per-row power-of-two downscale of the input and the matching
     // multiply on the output (llama.cpp build_amax_src1_f16; the CPU MoeSwiGluMlp rescale). Null when the SPIR-V is absent.
     private SimpleComputeKernel? _rowPow2Downscale;
+    // #1161: routed combine + shared-expert add + FFN residual add in one dispatch (MoE decode).
+    private SimpleComputeKernel? _moeScatterResidual;
 
     /// <summary>A/B and test switch for the grouped MoE down-input rescale (#1171); <c>DOTLLM_VK_MOE_DOWN_RESCALE=0</c> disables it.</summary>
     internal bool MoeDownRescaleEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_DOWN_RESCALE") != "0";
@@ -1860,7 +1862,8 @@ public sealed partial class VulkanTransformerModel : IModel
         // quant types are still dequantised to FP32 at upload.
         var weights = VulkanWeights.Upload(device, cpuWeights, config.NumLayers, firstLayer: firstLayer,
             skipTokenEmbed: skipTokenEmbed, skipOutputHead: headless, spvDir: spvDir,
-            valuePad: config.HasDistinctValueHeadDim ? (config.HeadDim, config.GetValueHeadDim()) : null);
+            valuePad: config.HasDistinctValueHeadDim ? (config.HeadDim, config.GetValueHeadDim()) : null,
+            tokenEmbedOnHost: gguf is not null && EmbedOnHostEligible(cpuWeights));
 
         // MoE detection: any layer with non-null Moe in CPU weights. We
         // don't gate on config.Moe because Mixtral/Qwen-MoE configs may
@@ -2561,6 +2564,8 @@ public sealed partial class VulkanTransformerModel : IModel
         if (File.Exists(Path.Combine(spvDir, "row_pow2_downscale_f32.spv")) && File.Exists(Path.Combine(spvDir, "row_scale_mul_f32.spv")))
         {
             model._rowPow2Downscale = SimpleComputeKernel.Create(device, spvDir, "row_pow2_downscale_f32", buffers: 2, pushWords: 2);
+            if (File.Exists(Path.Combine(spvDir, "moe_weighted_scatter_residual_f32.spv")))
+                model._moeScatterResidual = SimpleComputeKernel.Create(device, spvDir, "moe_weighted_scatter_residual_f32", buffers: 5, pushWords: 3);
             model._rowScaleMul = SimpleComputeKernel.Create(device, spvDir, "row_scale_mul_f32", buffers: 2, pushWords: 2);
         }
         if (config.Architecture == DotLLM.Core.Configuration.Architecture.GptOss)
@@ -4610,7 +4615,10 @@ public sealed partial class VulkanTransformerModel : IModel
                     // top-k expert dispatch. Writes the post-MoE result into
                     // _state.NormOutput so the shared residual-add below
                     // works unchanged.
-                    RecordMoeLayer(cmdBuf, layer, moeW, lw, seqLen, eps);
+                    if (TryRecordMoeLayerDecodeFused(cmdBuf, moeW, lw, seqLen, eps))
+                        downProjFused = true;   // the combine kernel wrote Residual + MoE output into AddScratch
+                    else
+                        RecordMoeLayer(cmdBuf, layer, moeW, lw, seqLen, eps);
                 }
                 ProfSample("ffn_moe");
             }
@@ -5168,6 +5176,7 @@ public sealed partial class VulkanTransformerModel : IModel
         _sinkFlashKvF16?.InvalidateDescriptorCache();
         _kvF16Writer?.InvalidateDescriptorCache();
         _rowPow2Downscale?.InvalidateDescriptorCache();
+        _moeScatterResidual?.InvalidateDescriptorCache();
         _rowScaleMul?.InvalidateDescriptorCache();
         _matmulQ5KMmq?.InvalidateDescriptorCache();
         _matmulIq4XsMmq?.InvalidateDescriptorCache();
@@ -6795,6 +6804,92 @@ public sealed partial class VulkanTransformerModel : IModel
         }
     }
 
+    private static readonly bool MoeDecodeFusedEnabled = Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_DECODE_FUSED") != "0";
+
+    /// <summary>
+    /// One-token MoE layer with an ungated shared expert (Flint, DeepSeek-style) on the indexed MMVQ kernels, scheduled so the shared expert
+    /// rides in the routed path's barrier intervals and its result, the routed combine and the FFN residual add land in one final dispatch
+    /// (#1161). Returns false (nothing recorded) when the layer does not qualify; on true, <c>AddScratch</c> holds
+    /// <c>Residual + routed + shared</c> and the caller skips its residual add.
+    /// </summary>
+    /// <remarks>
+    /// The routed gate / up and the shared gate / up read the same Q8_1 quantisation of the normalised row (one row, so the dense and
+    /// per-row quantize layouts coincide); the per-op math is unchanged. 20 dispatches / ~16 barriers per layer become 13 / 7.
+    /// <c>DOTLLM_VK_MOE_DECODE_FUSED=0</c> disables.
+    /// </remarks>
+    private bool TryRecordMoeLayerDecodeFused(nint cmdBuf, VulkanWeights.MoeLayerBuffers moeW, in VulkanWeights.LayerBuffers lw, int seqLen, float eps)
+    {
+        int hidden = moeW.HiddenSize, interm = moeW.IntermediateSize, numE = moeW.NumExperts, topK = moeW.NumExpertsPerTok;
+        int sharedI = moeW.SharedIntermediateSize;
+        if (!MoeDecodeFusedEnabled || seqLen != 1 || moeW.GptOss is not null || moeW.NumSharedExperts != 1 || moeW.SharedExpertGate is not null
+            || _currentLora is not null || _residualScale != 1.0f || lw.PostFfnNormWeight is not null || lw.Gemma4 is not null
+            || moeW.GateDeviceQuantType != QuantType.F32)
+            return false;
+        if (_moeScatterResidual is null || _rmsnormQuantQ8Fused is null || _swigluQuantQ8Fused is null || _quantizeQ8_1 is null
+            || !GenericMoeFuseEnabled || _gmSwiGluQuant is null || (interm % 32) != 0 || (sharedI % 32) != 0)
+            return false;
+        if (CanUseGroupedF16Moe(moeW, hidden, interm) || CanUseGroupedQuantMoe(moeW, seqLen, hidden, interm)
+            || !CanUseGenericMoeMmvq(moeW, seqLen, hidden, interm, out bool xDiv) || !xDiv)
+            return false;
+        _mmvqGroupScratch[0] = new(moeW.SharedW1![0], moeW.SharedW1DeviceQuantType, _state.MoeSharedGate!, sharedI);
+        _mmvqGroupScratch[1] = new(moeW.SharedW3![0], moeW.SharedW3DeviceQuantType, _state.MoeSharedUp!, sharedI);
+        var sharedGateUp = _mmvqGroupScratch.AsSpan(0, 2);
+        if (!CanShareMmvqQuant(hidden, 1, sharedGateUp) || !HasMmvqDecodeKernel(moeW.SharedW2DeviceQuantType, sharedI)
+            || QuantizeQ8_1Kernel.PackedBytes(sharedI) > _state.Q8_1Xq!.Size || QuantizeQ8_1Kernel.ScaleBytes(sharedI) > _state.Q8_1Xds!.Size)
+            return false;
+        var xq = _state.Q8_1Xq!;
+        var xds = _state.Q8_1Xds!;
+
+        // 1. Normalised row (F32, for the router) and its Q8_1 quantisation (for every expert GEMV that reads it).
+        _rmsnormQuantQ8Fused.Record(cmdBuf, _state.HiddenState, lw.FfnNormWeight, _state.NormOutput, xq, xds, hidden, eps);
+        BarrierComputeToCompute(cmdBuf);
+
+        // 2. Router logits; shared gate / up.
+        RecordMatmul(cmdBuf, moeW.Gate, moeW.GateDeviceQuantType, _state.NormOutput, _state.MoeRouterLogits!, outputDim: numE, inputDim: hidden, seqLen: 1);
+        RecordMmvqGroupGemvs(cmdBuf, hidden, sharedGateUp);
+        BarrierComputeToCompute(cmdBuf);
+
+        // 3. Top-k.
+        if (moeW.SigmoidGating)
+            _moeTopkSigmoid!.Record(cmdBuf, _state.MoeRouterLogits!, moeW.SelectionBias!, _state.MoeTopkIndices!, _state.MoeTopkWeights!,
+                seqLen: 1, numExperts: numE, k: topK, normTopKProb: moeW.NormTopKProb, weightsScale: moeW.WeightsScale);
+        else
+            _moeTopkSoftmax!.Record(cmdBuf, _state.MoeRouterLogits!, _state.MoeTopkIndices!, _state.MoeTopkWeights!,
+                seqLen: 1, numExperts: numE, k: topK, normTopKProb: moeW.NormTopKProb);
+        BarrierComputeToCompute(cmdBuf);
+        ProfSample("moe_router_topk");
+        DpStamp(cmdBuf, DpCatMoeRoute);
+
+        // 4. Routed gate / up: the single row broadcast to its slots, read from the shared quantisation.
+        RecordGenericMoeMmvqProjection(cmdBuf, moeW.W1DeviceQuantType, moeW.W1Bank, _state.MoeGateInter!, null, interm, hidden, topK, numE, topK, xq, xds);
+        RecordGenericMoeMmvqProjection(cmdBuf, moeW.W3DeviceQuantType, moeW.W3Bank, _state.MoeUpInter!, null, interm, hidden, topK, numE, topK, xq, xds);
+        BarrierComputeToCompute(cmdBuf);
+
+        // 5. Routed SwiGLU into the routed Q8_1 scratch; shared SwiGLU into the dense one (all of its readers finished above).
+        _gmSwiGluQuant.Record(cmdBuf, _state.MoeGateInter!, _state.MoeUpInter!, _state.MoeQ8_1Xq!, _state.MoeQ8_1Xds!, topK * interm, false);
+        _swigluQuantQ8Fused.Record(cmdBuf, _state.MoeSharedGate!, _state.MoeSharedUp!, _state.MoeSharedSilu!, xq, xds, sharedI);
+        BarrierComputeToCompute(cmdBuf);
+
+        // 6. Routed down; shared down.
+        RecordGenericMoeMmvqProjection(cmdBuf, moeW.W2DeviceQuantType, moeW.W2Bank, _state.MoeDownRows!, null, hidden, interm, topK, numE, 1);
+        RecordMmvqGemvPreQuantized(cmdBuf, moeW.SharedW2![0], moeW.SharedW2DeviceQuantType, _state.MoeSharedSumA!, hidden, sharedI);
+        BarrierComputeToCompute(cmdBuf);
+
+        // 7. AddScratch = Residual + (routed combine + shared).
+        Span<nint> bufs = stackalloc nint[5]
+        {
+            _state.MoeDownRows!.Handle, _state.MoeTopkWeights!.Handle, _state.Residual.Handle, _state.MoeSharedSumA!.Handle, _state.AddScratch.Handle,
+        };
+        Span<uint> pc = stackalloc uint[3] { (uint)hidden, (uint)hidden, (uint)topK };
+        _moeScatterResidual.Record(cmdBuf, bufs, pc, (uint)((hidden + 255) / 256));
+        GenericMoeDecodeFusedCount++;
+        DpStamp(cmdBuf, DpCatMoeExperts);
+        return true;
+    }
+
+    /// <summary>MoE layers recorded by <see cref="TryRecordMoeLayerDecodeFused"/> (test hook).</summary>
+    internal long GenericMoeDecodeFusedCount { get; private set; }
+
     private static readonly int? GroupedMoeMinTokensEnv =
         int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_GROUPED_MIN_TOKENS"), out int gmt) && gmt > 0 ? gmt : null;
 
@@ -6889,10 +6984,10 @@ public sealed partial class VulkanTransformerModel : IModel
     }
 
     private void RecordGenericMoeMmvqProjection(nint cmdBuf, QuantType qt, VulkanDevice.Buffer bank, VulkanDevice.Buffer y, VulkanDevice.Buffer? bias,
-        int m, int k, int n, int numE, int xDiv)
+        int m, int k, int n, int numE, int xDiv, VulkanDevice.Buffer? xqOverride = null, VulkanDevice.Buffer? xdsOverride = null)
     {
-        var xq = _state.MoeQ8_1Xq!;
-        var xds = _state.MoeQ8_1Xds!;
+        var xq = xqOverride ?? _state.MoeQ8_1Xq!;
+        var xds = xdsOverride ?? _state.MoeQ8_1Xds!;
         var idx = _state.MoeTopkIndices!;
         switch (qt)
         {
@@ -7751,6 +7846,9 @@ public sealed partial class VulkanTransformerModel : IModel
         QuantType.IQ3_XXS => _matmulIq3XxsMmvq is not null && (inputDim % MatMulIq3XxsMmvqKernel.Iq3XxsGroupSize) == 0,
         QuantType.IQ3_S => _matmulIq3SMmvq is not null && (inputDim % MatMulIq3SMmvqKernel.Iq3SGroupSize) == 0,
         QuantType.IQ1_S => _matmulIq1SMmvq is not null && (inputDim % MatMulIq1SMmvqKernel.Iq1SGroupSize) == 0,
+        // #1161: the legacy 4-bit MMVQs read the same Q8_1 scratch (Flint's q / k / v and shared-expert gate / up now share one quantize).
+        QuantType.Q4_0 => _matmulQ4_0Mmvq is not null && (inputDim % MatMulQ4_0MmvqKernel.Q4_0GroupSize) == 0,
+        QuantType.Q4_1 => _matmulQ4_1Mmvq is not null && (inputDim % MatMulQ4_0MmvqKernel.Q4_0GroupSize) == 0,
         _ => false,
     };
 
@@ -7838,6 +7936,12 @@ public sealed partial class VulkanTransformerModel : IModel
                 break;
             case QuantType.IQ3_S:
                 _matmulIq3SMmvq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim);
+                break;
+            case QuantType.Q4_0:
+                _matmulQ4_0Mmvq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim);
+                break;
+            case QuantType.Q4_1:
+                _matmulQ4_1Mmvq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim);
                 break;
             case QuantType.IQ1_S:
                 _matmulIq1SMmvq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim);
@@ -8009,6 +8113,19 @@ public sealed partial class VulkanTransformerModel : IModel
         VulkanDevice.Buffer input, VulkanDevice.Buffer residual, VulkanDevice.Buffer output,
         int outputDim, int inputDim, int seqLen)
     {
+        // #1161: legacy 4-bit decode GEMV with the residual in its store (Flint's o_proj every layer).
+        if (seqLen == 1 && (weightQt == QuantType.Q4_1 ? _matmulQ4_1Mmvq : weightQt == QuantType.Q4_0 ? _matmulQ4_0Mmvq : null) is { HasResidual: true } q4
+            && _quantizeQ8_1 is not null && _state.Q8_1Xq is not null && _state.Q8_1Xds is not null
+            && (inputDim % QuantizeQ8_1Kernel.GroupSize) == 0
+            && QuantizeQ8_1Kernel.PackedBytes(inputDim) <= _state.Q8_1Xq.Size
+            && QuantizeQ8_1Kernel.ScaleBytes(inputDim) <= _state.Q8_1Xds.Size)
+        {
+            _quantizeQ8_1.Record(cmdBuf, input, _state.Q8_1Xq, _state.Q8_1Xds, inputDim);
+            BarrierComputeToCompute(cmdBuf);
+            q4.RecordResidual(cmdBuf, weights, _state.Q8_1Xq, _state.Q8_1Xds, residual, output, m: outputDim, k: inputDim);
+            return true;
+        }
+
         if (weightQt != QuantType.Q8_0)
             return false;
 
@@ -8868,9 +8985,42 @@ public sealed partial class VulkanTransformerModel : IModel
         else BarrierTransferToCompute(cmdBuf);
     }
 
+    /// <summary>
+    /// Whether an F32 token table is large enough to leave in the host mapping (#1161; Flint's is 1.2 GB): the forward gathers its
+    /// rows on the host instead (a few KB per token). <c>DOTLLM_VK_EMBED_HOST=0</c> uploads it as before, <c>1</c> forces it for any F32 table.
+    /// </summary>
+    private static bool EmbedOnHostEligible(TransformerWeights w)
+        => w.TokenEmbedQuantType == QuantizationType.F32 && w.TokenEmbedWeight != 0
+        && Environment.GetEnvironmentVariable("DOTLLM_VK_EMBED_HOST") switch
+        {
+            "0" => false,
+            "1" => true,
+            _ => (long)w.VocabSize * w.HiddenSize * sizeof(float) >= 256L << 20,
+        };
+
+    private VulkanDevice.Buffer? _embedStaging;
+
     private void RecordEmbeddingGather(nint cmdBuf, ReadOnlySpan<int> tokenIds)
     {
         int hiddenSize = Config.HiddenSize;
+
+        if (_weights.TokenEmbeddingOnHost)
+        {
+            // #1161: rows straight from the mmap'd F32 table into host-visible staging, one device copy into HiddenState. The previous
+            // forward has completed (every forward ends in a fence wait), so the staging buffer is free to rewrite or replace here.
+            int rowBytesHost = hiddenSize * sizeof(float);
+            long need = (long)tokenIds.Length * rowBytesHost;
+            if (_embedStaging is null || _embedStaging.Size < need)
+            {
+                _embedStaging?.Dispose();
+                _embedStaging = _device.Allocate(Math.Max(need, 64L * rowBytesHost));
+            }
+            _device.UploadRows(_embedStaging, _cpuWeights.TokenEmbedWeight, rowBytesHost, Config.VocabSize, tokenIds);
+            _device.ActiveHazards?.OnTransfer(_embedStaging.Handle, _state.HiddenState.Handle);
+            VulkanApi.vkCmdCopyBuffer(cmdBuf, _embedStaging.Handle, _state.HiddenState.Handle, 1,
+                new VkBufferCopy { srcOffset = 0, dstOffset = 0, size = (ulong)need });
+            return;
+        }
 
         // Device-resident quantized table (issue #352): the table never got
         // widened to F32, so the gather is a dequantizing compute dispatch that
@@ -9006,6 +9156,7 @@ public sealed partial class VulkanTransformerModel : IModel
         _relu2glu?.Dispose();
         _embedScale?.Dispose();
         _embedGatherQ8?.Dispose();
+        _embedStaging?.Dispose();
         _gemma4OnesVec?.Dispose();
         _pleInputs?.Dispose();
         _g4PleProjW?.Dispose(); _g4PleNormW?.Dispose(); _g4PleIdent?.Dispose(); _g4PleProj?.Dispose();
@@ -9096,6 +9247,7 @@ public sealed partial class VulkanTransformerModel : IModel
         _sinkFlashKvF16?.Dispose();
         _kvF16Writer?.Dispose();
         _rowPow2Downscale?.Dispose();
+        _moeScatterResidual?.Dispose();
         _rowScaleMul?.Dispose();
         _matmulQ5KMmq?.Dispose();
         _matmulIq4XsMmq?.Dispose();
