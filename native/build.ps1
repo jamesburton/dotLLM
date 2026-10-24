@@ -50,7 +50,7 @@ $bitPerfect = @('conv1d_causal', 'gated_delta_net_scan', 'hadamard_fwht')
 # Kernels that emit Ampere-only PTX (mma.sync / cp.async) and so MUST be built at
 # compute_86 instead of the global default (dispatch-gated to Ampere+ in C#).
 # Mirrors build_ptx.bat's ARCH_86 list.
-$arch86 = @('attention_flash_mma', 'attention_flash_mma_decode_gqa_split',
+$arch86 = @('pq2_0_mmq_mma', 'attention_flash_mma', 'attention_flash_mma_decode_gqa_split',
     'attention_flash_mma_decode_gqa_split_kvq', 'attention_flash_mma_prefill_hd256',
     'attention_flash_mma_prefill_hd256_kvq')
 
