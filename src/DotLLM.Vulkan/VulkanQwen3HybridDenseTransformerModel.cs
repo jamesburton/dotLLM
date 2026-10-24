@@ -73,7 +73,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
 
     // MTP ("NextN") head — issue #435. Null for every checkpoint without a nextn.* tensor group,
     // which is the overwhelming majority; SupportsMtp and every MTP member below key off it.
-    private readonly VulkanQwen3HybridDenseMtpWeights? _mtpHead;
+    private VulkanQwen3HybridDenseMtpWeights? _mtpHead; // set at build (embedded head) or by AttachMtpHead (#1185)
     private MtpScratch? _mtpScratch;
     private VulkanMtpState? _lastMtpState;
 
@@ -405,24 +405,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             ? VulkanQwen3HybridDenseMtpWeights.Upload(device, config, cpuMtp)
             : null;
 
-        if (mtpHead is not null && config.HadamardFold is { } mtpFold)
-        {
-            // The MTP block's OWN projections are assumed unfolded — that is what Bonsai 2's MTP
-            // checkpoint ships (blk.{NumLayers}.* is absent from prism.hadamard.weight_names, and
-            // its matmuls are Q8_0 rather than PQ2_0) and it is what the CPU reference computes.
-            // Refuse loudly rather than silently mis-compute if a future checkpoint folds them.
-            string mtpPrefix = $"blk.{config.NumLayers}";
-            foreach (string suffix in new[] { "attn_qkv.weight", "attn_gate.weight", "attn_q.weight",
-                                              "attn_output.weight", "ffn_gate.weight", "ffn_up.weight",
-                                              "ffn_down.weight", "nextn.eh_proj.weight" })
-            {
-                if (mtpFold.IsFolded($"{mtpPrefix}.{suffix}"))
-                    throw new NotSupportedException(
-                        $"Checkpoint folds the MTP block's own weight '{mtpPrefix}.{suffix}' " +
-                        "(prism.hadamard.weight_names). Neither the CPU reference nor this Vulkan host " +
-                        "rotates the MTP block's own projections — see issue #435.");
-            }
-        }
+        if (mtpHead is not null)
+            RejectFoldedMtpHead(config);
 
         var model = new VulkanQwen3HybridDenseTransformerModel(
             device, ownsDevice,
@@ -2684,6 +2668,11 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         int outputDim, int inputDim, int seqLen)
     {
         if (_prof is not null) ProfNoteMatmul(weightQt, outputDim, inputDim, seqLen);
+
+        // 2..8-row verify batches (MTP, #1185): the multi-column GEMVs read each weight once for all rows; the coopmat GEMM tile below
+        // costs ~4.5 single-row forwards even at 2 rows on Strix (Qwen3.8-27B Q4_K_M: 105 ms at 1 row, 480 ms at 2..8).
+        if (seqLen > 1 && TryRecordSmallRowMatmul(cmdBuf, weights, weightQt, input, output, outputDim, inputDim, seqLen))
+            return;
 
         // IQ1/IQ2/IQ3 prefill: dequant to F16 scratch + coopmat GEMM instead of the scalar tiled GEMM (#621).
         if (seqLen > 1 && _iqF16Prefill is not null

@@ -117,13 +117,21 @@ public static class SyntheticQwen35HybridDenseMtpGguf
     /// query head reads the same KV row, so a wrong head broadcast cannot show. Must be a multiple of <paramref name="kvHeads"/>.
     /// </param>
     /// <param name="kvHeads">Overrides <see cref="NumKvHeads"/> (1). See <paramref name="attentionHeads"/>.</param>
+    /// <param name="headOnly">
+    /// Issue #1185: emit only the MTP head, laid out like ggml-org's separate <c>mtp-*.gguf</c> (the full model's metadata, the trunk's
+    /// <c>token_embd</c> / <c>output</c> / <c>output_norm</c> copies and the <c>blk.{BlockCount}.*</c> block, no trunk layers). Weights are drawn in
+    /// the same order as the embedded fixture, so this file plus the <c>withMtp: false</c> trunk (same seed) split the embedded fixture exactly.
+    /// Requires <paramref name="withMtp"/>.
+    /// </param>
     public static byte[] Build(uint seed = 0xC0FFEEu, bool withMtp = true, bool mtpHasOwnHeadTensors = true,
         int fullAttnInterval = FullAttnInterval, int blockCount = BlockCount,
         int contextLength = ContextLength, int gdnKeyHeads = NKHead, int gdnValueHeads = NVHead,
         bool pq2_0Projections = false, bool q8_0MtpHead = false,
         int? headDim = null, int? ropeDim = null, float? ropeFreqBase = null,
-        int attentionHeads = NumAttentionHeads, int kvHeads = NumKvHeads)
+        int attentionHeads = NumAttentionHeads, int kvHeads = NumKvHeads, bool headOnly = false)
     {
+        if (headOnly && !withMtp)
+            throw new ArgumentException("A head-only fixture needs withMtp.", nameof(headOnly));
         if (gdnKeyHeads <= 0 || gdnValueHeads <= 0 || gdnValueHeads % gdnKeyHeads != 0)
             throw new ArgumentException(
                 $"GDN value heads ({gdnValueHeads}) must be a positive multiple of key heads ({gdnKeyHeads}).");
@@ -188,20 +196,22 @@ public static class SyntheticQwen35HybridDenseMtpGguf
         AddProjection(w, rng, "output.weight", inK: d.Hidden, outM: VocabSize, 0.05f, pq2);
         AddNorm(w, rng, "output_norm.weight", d.Hidden);
 
+        // Head-only: the trunk layers are still drawn (so the head's weights match the embedded fixture) but written nowhere.
+        GgufWriter trunkW = headOnly ? new GgufWriter() : w;
         for (int i = 0; i < blockCount; i++)
         {
             bool fullAttn = (i + 1) % fullAttnInterval == 0;
             string p = $"blk.{i}";
 
-            AddNorm(w, rng, $"{p}.attn_norm.weight", d.Hidden);
-            AddNorm(w, rng, $"{p}.post_attention_norm.weight", d.Hidden);
+            AddNorm(trunkW, rng, $"{p}.attn_norm.weight", d.Hidden);
+            AddNorm(trunkW, rng, $"{p}.post_attention_norm.weight", d.Hidden);
 
             if (fullAttn)
-                AddFullAttnLayer(w, rng, p, d, pq2);
+                AddFullAttnLayer(trunkW, rng, p, d, pq2);
             else
-                AddGdnLayer(w, rng, p, gdnKeyHeads, gdnValueHeads, d, pq2);
+                AddGdnLayer(trunkW, rng, p, gdnKeyHeads, gdnValueHeads, d, pq2);
 
-            AddDenseFfnLayer(w, rng, p, d, pq2);
+            AddDenseFfnLayer(trunkW, rng, p, d, pq2);
         }
 
         if (withMtp)
@@ -234,10 +244,10 @@ public static class SyntheticQwen35HybridDenseMtpGguf
         int contextLength = ContextLength, int gdnKeyHeads = NKHead, int gdnValueHeads = NVHead,
         bool pq2_0Projections = false, bool q8_0MtpHead = false,
         int? headDim = null, int? ropeDim = null, float? ropeFreqBase = null,
-        int attentionHeads = NumAttentionHeads, int kvHeads = NumKvHeads)
+        int attentionHeads = NumAttentionHeads, int kvHeads = NumKvHeads, bool headOnly = false)
     {
         File.WriteAllBytes(path, Build(seed, withMtp, mtpHasOwnHeadTensors, fullAttnInterval, blockCount, contextLength,
-            gdnKeyHeads, gdnValueHeads, pq2_0Projections, q8_0MtpHead, headDim, ropeDim, ropeFreqBase, attentionHeads, kvHeads));
+            gdnKeyHeads, gdnValueHeads, pq2_0Projections, q8_0MtpHead, headDim, ropeDim, ropeFreqBase, attentionHeads, kvHeads, headOnly));
         return path;
     }
 

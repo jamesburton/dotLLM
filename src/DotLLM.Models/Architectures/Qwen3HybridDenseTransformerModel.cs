@@ -74,7 +74,7 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
     // Multi-Token Prediction (MTP / "NextN") head — issue #253. Null for every GGUF without a
     // nextn.* tensor group, which is the overwhelming majority: every other field and code path
     // in this class is completely unaffected by MTP being absent.
-    private readonly MtpHeadWeights? _mtpHead;
+    private MtpHeadWeights? _mtpHead; // set at load (embedded head) or by AttachMtpHead (separate mtp-*.gguf, #1185)
 
     /// <inheritdoc/>
     public ModelConfig Config { get; }
@@ -2425,6 +2425,7 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
         FreeRowSnapshots();
         _dflash?.Dispose();
         if (_dflashHeadScratch != 0) { System.Runtime.InteropServices.NativeMemory.AlignedFree((void*)_dflashHeadScratch); _dflashHeadScratch = 0; }
+        _ownedMtpHeadFile?.Dispose();
         GC.SuppressFinalize(this);
     }
 

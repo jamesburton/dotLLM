@@ -96,6 +96,47 @@ public class VulkanSmallRowKernelTests
         }
     }
 
+    /// <summary>
+    /// #1185: the FP32-activation Q8_0 multi-column GEMV must equal the coalesced 1-row decode GEMV BIT FOR BIT per column — that is
+    /// what lets a dense qwen35 MTP verify reproduce plain greedy decode (the Q8_1 MMVQ multi kernel flipped a near-tie on Qwen3.8-27B).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(1024, 5120, 2)]    // qwen35 attn_k: K = 160 blocks
+    [InlineData(5120, 6144, 4)]    // attn_output / ssm_out
+    [InlineData(40, 96, 8)]        // K = 3 blocks: window tail
+    [InlineData(17, 17408, 3)]     // long K, odd M
+    public void Q8F32Multi_EachColumnBitIdenticalToCoalescedGemv(int m, int k, int n)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(device.HasSubgroupArithmetic, "No subgroup arithmetic.");
+        var rng = new Random(0x1185 + m * 7 + k * 11 + n);
+        float[] w = F16Bf16Fixture.RandomFloats(rng, m * k, 0.1f);
+        float[] x = F16Bf16Fixture.RandomFloats(rng, n * k, 1.0f);
+        byte[] wq = Quantize.FromFloat32(w, (long)m * k, QuantizationType.Q8_0);
+
+        using var multi = MatMulQ8_0GemvMultiKernel.TryCreate(device, spvDir) ?? throw new Xunit.Sdk.XunitException("matmul_q8_0_gemv_multi.spv missing");
+        using var single = MatMulQ8_0Kernel.Create(device, spvDir, coalesced: true);
+        using var bw = device.Allocate(((long)wq.Length + 3) & ~3L);
+        using var bx = device.Allocate((long)n * k * 4);
+        using var by = device.Allocate((long)n * m * 4);
+        using var bx1 = device.Allocate((long)k * 4);
+        using var by1 = device.Allocate((long)m * 4);
+        device.Upload(new ReadOnlySpan<byte>(wq), bw);
+        device.Upload(x, bx);
+        using (var ctx = device.CreateSubmitContext()) { ctx.Begin(); multi.Record(ctx.CommandBuffer, bw, bx, by, m, k, n); ctx.SubmitAndWait(); }
+        float[] actual = new float[n * m];
+        device.Download(by, actual);
+        for (int c = 0; c < n; c++)
+        {
+            device.Upload(x.AsSpan(c * k, k).ToArray(), bx1);
+            single.Launch(bw, bx1, by1, m, k);
+            float[] exp = new float[m];
+            device.Download(by1, exp);
+            Assert.Equal(exp, actual.AsSpan(c * m, m).ToArray());
+        }
+    }
+
     [SkippableTheory]
     [InlineData(320, 10240, 2)]    // hc down
     [InlineData(10240, 320, 5)]    // hc up (K = 10 blocks: window tail)
