@@ -5,7 +5,7 @@ namespace DotLLM.Vulkan.Kernels;
 
 /// <summary>
 /// Batched quantized GEMM on int8 cooperative matrices (issue #1226): <c>C[N, M] = B[N, K] @ W[M, K]^T</c> with <c>W</c> read packed in
-/// place (Q8_0, Q5_0 or Q4_K) and <c>B</c> pre-quantized to Q8_1 by <see cref="QuantizeQ8_1RowsKernel"/>. A port of llama.cpp's
+/// place (Q8_0, Q5_0, Q4_K or Q4_1, #1235) and <c>B</c> pre-quantized to Q8_1 by <see cref="QuantizeQ8_1RowsKernel"/>. A port of llama.cpp's
 /// <c>mul_mmq_cm1</c>, the prefill matmul it runs on RDNA3/3.5; see <c>mmq_cm1_main.glsl</c>. The grouped form serves MoE expert
 /// banks over expert-sorted rows (the <c>mul_mat_id</c> twin).
 /// </summary>
@@ -53,12 +53,13 @@ public sealed class MatMulMmqCm1Kernel : IDisposable
 
     /// <summary>The weight formats this kernel reads.</summary>
     /// <param name="qt">Weight format.</param>
-    /// <returns><see langword="true"/> for Q8_0, Q5_0 and Q4_K.</returns>
-    public static bool IsSupportedQuant(QuantizationType qt) => qt is QuantizationType.Q8_0 or QuantizationType.Q5_0 or QuantizationType.Q4_K;
+    /// <returns><see langword="true"/> for Q8_0, Q5_0, Q4_K and Q4_1.</returns>
+    public static bool IsSupportedQuant(QuantizationType qt)
+        => qt is QuantizationType.Q8_0 or QuantizationType.Q5_0 or QuantizationType.Q4_K or QuantizationType.Q4_1;
 
     private static string SpvName(QuantizationType qt, bool grouped)
     {
-        string q = qt switch { QuantizationType.Q8_0 => "q8_0", QuantizationType.Q5_0 => "q5_0", _ => "q4_k" };
+        string q = qt switch { QuantizationType.Q8_0 => "q8_0", QuantizationType.Q5_0 => "q5_0", QuantizationType.Q4_1 => "q4_1", _ => "q4_k" };
         return grouped ? $"moe_grouped_{q}_mmq_cm1.spv" : $"matmul_{q}_mmq_cm1.spv";
     }
 
@@ -85,7 +86,7 @@ public sealed class MatMulMmqCm1Kernel : IDisposable
     /// <summary>Creates the kernel, or returns <see langword="null"/> when <see cref="IsSupportedOn"/> is false.</summary>
     /// <param name="device">The device.</param>
     /// <param name="spvDir">Directory holding the compiled shaders.</param>
-    /// <param name="quant">Weight format (Q8_0, Q5_0 or Q4_K).</param>
+    /// <param name="quant">Weight format (Q8_0, Q5_0, Q4_K or Q4_1).</param>
     /// <param name="grouped">The MoE expert-grouped form.</param>
     /// <returns>The kernel, or <see langword="null"/>.</returns>
     public static MatMulMmqCm1Kernel? TryCreate(VulkanDevice device, string spvDir, QuantizationType quant, bool grouped = false)
@@ -304,9 +305,9 @@ public sealed class MatMulMmqCm1Kernel : IDisposable
         nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout, 0, 1, descriptorSet, 0, 0);
-        // Row stride in the shader's read unit: uint16 for Q8_0 / Q5_0 (34 / 22-byte blocks), uint for Q4_K (144-byte super-blocks).
+        // Row stride in the shader's read unit: uint16 for Q8_0 / Q5_0 (34 / 22-byte blocks), uint for Q4_K / Q4_1 (144 / 20-byte blocks).
         long rowBytes = DotLLM.Cpu.Kernels.Dequantize.RowByteSize(k, _quant);
-        uint rowStride = (uint)(_quant == QuantizationType.Q4_K ? rowBytes / 4 : rowBytes / 2);
+        uint rowStride = (uint)(_quant is QuantizationType.Q4_K or QuantizationType.Q4_1 ? rowBytes / 4 : rowBytes / 2);
         Span<uint> pc = stackalloc uint[6] { (uint)m, (uint)k, (uint)n, rowStride, (uint)numExperts, tileList };
         fixed (uint* pcPtr = pc)
             VulkanApi.vkCmdPushConstants(cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute, 0, PushConstantBytes, (nint)pcPtr);

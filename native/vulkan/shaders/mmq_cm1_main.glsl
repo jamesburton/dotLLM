@@ -10,7 +10,7 @@
 //   * prefetches the next K step into registers while the current one computes,
 //   * walks the M tiles in L2-sized groups.
 //
-// CONTRACT - the wrapper #defines exactly one of MMQ_Q8_0 / MMQ_Q4_K / MMQ_Q5_0, optionally MMQ_GROUPED, and includes this file.
+// CONTRACT - the wrapper #defines exactly one of MMQ_Q8_0 / MMQ_Q4_K / MMQ_Q5_0 / MMQ_Q4_1, optionally MMQ_GROUPED, and includes this file.
 //
 // MMQ_GROUPED (MoE expert-grouped prefill): the weight buffer is a bank [E, M, K]; the activation rows are packed in expert order
 // (offsets[e] .. offsets[e+1], moe_expand_gather_group_q8_1) and the output rows are packed the same way. Workgroup x is the M tile,
@@ -27,7 +27,7 @@
 // multiple of 32 and, for Q4_K, of 256 (the host checks).
 //
 // Buffers:
-//   0  W    packed weight rows (Q8_0: 34-byte blocks, read as uint16; Q4_K: 144-byte super-blocks, read as uint)
+//   0  W    packed weight rows (Q8_0 / Q5_0: 34 / 22-byte blocks, read as uint16; Q4_K / Q4_1: 144 / 20-byte blocks, read as uint)
 //   1  Bq   uvec4[]  Q8_1 int8 activations, row r at uint offset r * K / 4 (QuantizeQ8_1RowsKernel layout)
 //   2  Bds  vec2[]   per-32-block (d, d * sum(q)), row r at r * K / 32
 //   3  C    float[]  [N, M] row-major
@@ -69,12 +69,12 @@ layout(set = 0, binding = 0, std430) readonly buffer BufW { uint16_t w16[]; };
 #else
 #define LOAD_VEC_A 4u
 #endif
-#elif defined(MMQ_Q4_K)
+#elif defined(MMQ_Q4_K) || defined(MMQ_Q4_1)
 layout(set = 0, binding = 0, std430) readonly buffer BufW { uint w32[]; };
 #define HAS_MIN 1
 #define LOAD_VEC_A 8u
 #else
-#error "define MMQ_Q8_0, MMQ_Q5_0 or MMQ_Q4_K"
+#error "define MMQ_Q8_0, MMQ_Q5_0, MMQ_Q4_K or MMQ_Q4_1"
 #endif
 layout(set = 0, binding = 1, std430) readonly  buffer BufBq  { uvec4 bq[]; };
 layout(set = 0, binding = 2, std430) readonly  buffer BufBds { vec2  bds[]; };
@@ -100,6 +100,10 @@ uint g_bRowLimit;
 uint g_kBlocks;   // K / 32: blocks past it (a partial last staging step) are zero-filled
 
 #define LOAD_VEC_B 16u
+
+#if defined(MMQ_Q4_1)
+#include "q8_1_ds_f16.glsl"
+#endif
 
 shared uint buf_a_qs[BM * QPITCH];
 #if HAS_MIN
@@ -156,6 +160,26 @@ void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr) {
     buf_a_qs[buf_ib * QPITCH + ks * (BK / 4u) + loadr + 4u] = hi4;
     if (loadr == 0u) buf_a_d[ks * BM + buf_ib] = blk.d;
 }
+#elif defined(MMQ_Q4_1)
+struct block_a_prefetch { uint qs; vec2 dm; };
+
+// Q4_1 block (20 bytes = 5 uints: fp16 d | fp16 m << 16, qs[16]); lane loadr (0..3) takes qs bytes 4*loadr..4*loadr+3, i.e.
+// elements 4*loadr.. (low nibbles) and 16+4*loadr.. (high nibbles) as raw unsigned codes; the min term m * s_x restores the offset
+// (llama.cpp vec_dot_q4_1_q8_1: d * d_x * sumi + m * s_x).
+block_a_prefetch block_a_load(uint row, uint kb, uint loadr) {
+    block_a_prefetch blk;
+    if (row >= pc.M || kb >= g_kBlocks) { blk.qs = 0u; blk.dm = vec2(0.0); return blk; }
+    uint base = (g_aRowBase + row) * pc.rowStride + kb * 5u;
+    blk.dm = unpackHalf2x16(w32[base]);
+    blk.qs = w32[base + 1u + loadr];
+    return blk;
+}
+
+void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr) {
+    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4u) + loadr]      = blk.qs & 0x0F0F0F0Fu;
+    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4u) + loadr + 4u] = (blk.qs >> 4u) & 0x0F0F0F0Fu;
+    if (loadr == 0u) buf_a_dm[ks * BM + buf_ib] = blk.dm;
+}
 #else
 struct block_a_prefetch { uint qs0; uint qs1; vec2 dm; };
 
@@ -210,6 +234,9 @@ block_b_prefetch block_b_load(uint row, uint kb, uint loadr) {
     uint g = g_bRowBase + row;
     blk.qs = bq[g * (pc.K >> 4u) + kb * 2u + loadr];
     blk.ds = bds[g * (pc.K >> 5u) + kb];
+#if defined(MMQ_Q4_1)
+    blk.ds = roundToF16(blk.ds);   // fp16 (d, s) as block_q8_1 stores them: the CPU (#1159) and llama.cpp products
+#endif
     return blk;
 }
 
@@ -261,6 +288,8 @@ void main() {
     uint blocks_n = (pc.N + BN - 1u) / BN;
 #if defined(MMQ_Q8_0)
     uint a_panel_bytes = BM * pc.K + (BM * pc.K) / 16u;
+#elif defined(MMQ_Q4_1)
+    uint a_panel_bytes = (BM * pc.K) / 2u + (BM * pc.K) / 8u;
 #else
     uint a_panel_bytes = (BM * pc.K) / 2u + (BM * pc.K) / 16u;
 #endif

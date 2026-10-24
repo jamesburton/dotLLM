@@ -49,19 +49,14 @@ public sealed class FlintVulkanParityTests
         }
 
         /// <summary>
-        /// CPU reference logits. The dense Q4_1 projections run on F32 activations here (the pre-#1159 CPU prefill), which is
-        /// what the Vulkan dense prefill implements; since #1159 the CPU default is llama.cpp's Q8_1-activation dot.
+        /// CPU reference logits on the default CPU path: the Q4_1 projections run llama.cpp's Q8_1-activation dot at every token count
+        /// (#1159), as the Vulkan dense prefill does since #1235.
         /// </summary>
         public float[] CpuPrefill(int[] ids)
         {
             using var cpu = TransformerModel.LoadFromGguf(Gguf, Config, ThreadingConfig.SingleThreaded);
-            DotLLM.Cpu.Kernels.MatMul.Q4PackedAllColumnsOverride = false;
-            try
-            {
-                using ITensor t = cpu.Forward(ids, Enumerable.Range(0, ids.Length).ToArray(), deviceId: -1);
-                return Copy(t);
-            }
-            finally { DotLLM.Cpu.Kernels.MatMul.Q4PackedAllColumnsOverride = null; }
+            using ITensor t = cpu.Forward(ids, Enumerable.Range(0, ids.Length).ToArray(), deviceId: -1);
+            return Copy(t);
         }
 
         public void Dispose()
@@ -181,8 +176,8 @@ public sealed class FlintVulkanParityTests
     }
 
     /// <summary>
-    /// A 2..4-row forward from an F16 cache takes the F16 small-row split-KV kernel on every layer and matches the CPU rows. (Not compared with
-    /// the 1-row decode: there the Q4_1 projections run the dp4a MMVQ on Q8_1 activations, while 2..4 rows take the F32-activation GEMM.)
+    /// A 2..4-row forward from an F16 cache takes the F16 small-row split-KV kernel on every layer and matches the CPU rows. (Its Q4_1
+    /// projections run the Q8_1 MMQ (#1235), the 1-row decode the dp4a MMVQ on the same Q8_1 activations.)
     /// </summary>
     [SkippableTheory]
     [InlineData(2)]
