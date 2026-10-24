@@ -20,7 +20,7 @@ layout(push_constant) uniform PushConstants {
     uint blocksPerRow;  // = K / 32
 } pc;
 
-const uint Q5_1_BLOCK_BYTES = 22u;   // Q5_0 block (name kept for the shared body)
+const uint Q5_0_BLOCK_BYTES = 22u;
 const uint Q5_1_GROUP_SIZE  = 32u;
 
 uint readByte(uint absByteOff) {
@@ -61,7 +61,7 @@ void main() {
     int rawIdx = indices[n];
     uint expertIdx = uint(clamp(rawIdx, 0, int(pc.numExperts) - 1));
 
-    uint rowByteStride    = pc.blocksPerRow * Q5_1_BLOCK_BYTES;
+    uint rowByteStride    = pc.blocksPerRow * Q5_0_BLOCK_BYTES;
     uint matrixByteStride = pc.M * rowByteStride;
     uint rowByteBase      = expertIdx * matrixByteStride + m * rowByteStride;
     uint xRowBase         = n * pc.K;
@@ -69,7 +69,7 @@ void main() {
     float acc = 0.0;
 
     for (uint b = 0u; b < pc.blocksPerRow; b++) {
-        uint blockByteBase = rowByteBase + b * Q5_1_BLOCK_BYTES;
+        uint blockByteBase = rowByteBase + b * Q5_0_BLOCK_BYTES;
         float d = readHalf(blockByteBase);
         float mn = -16.0 * d;
         uint qh = readWord(blockByteBase + 2u);
