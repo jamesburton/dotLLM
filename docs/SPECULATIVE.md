@@ -859,12 +859,15 @@ come for free:
 grouped dynamic causal convolutions (kernel 2, group 16) and the rank-256 / top-16 candidate selector, walked greedily from
 the anchor. The block embedding and the lm-head are the **target's** (no copy).
 
-**Backends.** The drafter's forward runs on an `IDFlashBackend`. CPU (`Qwen3HybridDenseTransformerModel`) and Vulkan
-(`VulkanQwen3HybridDenseTransformerModel`, GPU verify) use the CPU backend; the Vulkan verify forward copies the tapped rows to
-a host-readback buffer and the drafter's lm-head runs on the device with the target's head. CUDA
-(`CudaQwen3HybridDenseTransformerModel`) runs the whole drafter on the GPU: weights uploaded as stored (1.1 GB for the Q4_K_M
-drafters), the context ring in device F16, and `dflash_f32.ptx` for the DFlash2 convolution, the ring attention and
-multi-column Q4_K / Q6_K GEMVs that read each weight block once per 8 rows (no F16 expansion).
+**Backends.** The drafter's forward runs on an `IDFlashBackend`. CPU (`Qwen3HybridDenseTransformerModel`) uses the CPU backend.
+CUDA (`CudaQwen3HybridDenseTransformerModel`) and Vulkan (`VulkanQwen3HybridDenseTransformerModel`, #1193) run the whole drafter on
+the GPU: weights uploaded as stored (1.1 GB for the Q4_K_M drafters; on a UMA Vulkan device imported zero-copy from the mmap), the
+context ring in device F16, the trunk's projection / norm / SwiGLU / add kernels and the target's own embedding and lm-head. Their own
+kernels are the DFlash2 convolution, the ring write, a fused per-head RMSNorm + NeoX RoPE (cos/sin from a host table in double, as the
+CPU) and the block attention over the ring (`dflash_f32.ptx`; `dflash_*.comp` on Vulkan, where the attention is a tiled online softmax
+so the 2048-position window fits Strix Halo's 32 KB of shared memory). On Vulkan the verify's tap injection and the next draft record
+into one command buffer: a draft is one submit for the layers (read back for the selector) and one for the head. The verify forward
+copies the tapped rows to host memory (F16 in the state) on both GPU hosts.
 
 **Measured** (Bonsai-2 27B PQ2_0 abliterated + the `naklitechie` r3 drafter, RTX 3060, 128 tokens greedy, code prompt; the
 host CPU was shared with other jobs, hence ranges). Every run was token-identical to plain decode.
@@ -880,6 +883,34 @@ host CPU was shared with other jobs, hence ranges). Every run was token-identica
 The extra DFlash VRAM is the drafter (1.1 GB) plus the per-row GDN snapshots of a 7-row verify (#473, ~0.9 GB, F32). On the
 CPU (Strix Halo, Bonsai-2) DFlash breaks even (3.3 vs 3.4 tok/s): an 8-row CPU verify costs ~7× a decode step there.
 
+**Strix Halo (8060S, Vulkan, #1193).** 128 tokens greedy, `DOTLLM_MTP_ADAPTIVE=0`, `DOTLLM_DFLASH_DRAFT=K`, four prompts (code,
+prose, Q&A, C#); llama.cpp master (0ae0e1976) Vulkan `llama-server` on the same box and files. Every dotLLM run was token-identical to
+its plain decode. tok/s per prompt:
+
+| Qwen3.8-27B Q4_K_M | code | prose | Q&A | C# | peak private / GPU-shared |
+|---|---|---|---|---|---|
+| dotLLM plain | 10.3 | 10.5 | 10.4 | 10.5 | 18.7 / 17.9 GiB |
+| dotLLM MTP K=3 (Q8_0 head) | 20.6 | 16.1 | 15.8 | 19.5 | 19.7 / 18.9 GiB |
+| dotLLM DFlash K=3 (incoai DFlash2) | 22.5 | 17.0 | 14.3 | 20.3 | 20.3 / 19.5 GiB |
+| dotLLM DFlash K=7 | 25.6 | 11.1 | 9.3 | 17.4 | 20.9 / 20.1 GiB |
+| llama.cpp plain | 10.8 | 10.9 | 11.0 | 11.0 | 19.2 / 18.3 GiB |
+| llama.cpp MTP K=3 | 28.1 | 20.9 | 20.5 | 24.6 | 23.4 / 21.9 GiB |
+| llama.cpp DFlash K=3 | 31.5 | 22.2 | 20.3 | 27.3 | 21.8 / 20.6 GiB |
+| llama.cpp DFlash K=7 | 36.7 | 13.9 | 14.2 | 21.7 | 22.4 / 21.2 GiB |
+
+DFlash tokens per round (K=3 / 7): code 3.9 / 7.1, prose 2.8 / 2.8, C# 3.5 / 4.6. The gap to llama.cpp is the target's multi-row
+verify (shared with MTP), not the drafter: a draft costs ~19 ms at K=3 on Qwen3.8 (layers ~12 ms, the 248k-row Q6_K head ~7 ms).
+
+| Bonsai-2 27B PQ2_0 (naklitechie r3) | code | prose | C# | peak private / GPU-shared |
+|---|---|---|---|---|
+| dotLLM plain | 23.6 | 23.6 | 23.5 | 8.4 / 7.6 GiB |
+| dotLLM MTP K=3 (embedded head) | 35.3 | 25.9 | 37.0 | 8.8 / 8.0 GiB |
+| dotLLM DFlash K=3 | 33.2 | 27.2 | 41.3 | 10.0 / 9.1 GiB |
+| dotLLM DFlash K=5 | 44.2 | 26.3 | 45.3 | 10.2 / 9.4 GiB |
+
+llama.cpp master cannot load PQ2_0 (the PrismML fork is CUDA/CPU only), so Bonsai-2 has no comparator on Strix. The Q&A prompt ends at
+once on this abliterated checkpoint (EOS first) and is left out.
+
 **Exactness.** Greedy output is token-identical to plain decode (`DFlashDrafterTests`, `CudaDFlashTests`,
 `VulkanDFlashTests`; real Bonsai-2 27B on the RTX 3060). The selector's greedy draft is a point mass, so sampled decoding
 uses the MTP decoder's exact accept/residual rule unchanged.
@@ -888,10 +919,11 @@ uses the MTP decoder's exact accept/residual rule unchanged.
 (42 MB for Qwen3.8-27B-DFlash2). Taps: `rows × 5 × 5120 × 2 B` F16 per verify (400 KB at B = 8), capped at the ring for a
 long prefill and released after it.
 
-**Knobs.** `DOTLLM_DFLASH_DRAFT=n` caps drafts per round (default B-1 = 7); `DOTLLM_DFLASH_THREADS` sizes the GPU hosts'
-CPU drafter pool (default half the logical processors); `DOTLLM_DFLASH_TRACE=1` prints draft / inject wall time per request.
+**Knobs.** `DOTLLM_DFLASH_DRAFT=n` caps drafts per round (default B-1 = 7); `DOTLLM_DFLASH_TRACE=1` prints draft / inject wall
+time per request (and, on Vulkan, the drafter's submit count and wait). Vulkan small-row GEMVs: `DOTLLM_VK_Q4K_MULTI_ROWS` (1/2/4/8 output
+rows per workgroup, default 2; `DOTLLM_VK_Q4K_MULTI_R4=0` = the old one-row kernel) and `DOTLLM_VK_SMALLROW_Q6K_R2_MIN_ROWS` (default 3).
 
-**Not yet.** A GPU-resident drafter; tree (DDTree) verification; reduced-vocab (`d2t`), DSpark and LiliCorr drafters;
+**Not yet.** Tree (DDTree) verification; reduced-vocab (`d2t`), DSpark and LiliCorr drafters;
 sampled-selector proposals (llama.cpp's DFlash2 sampled mode).
 
 ### `qwen35moe` MTP head (issue #1188)

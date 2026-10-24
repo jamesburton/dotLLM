@@ -18,6 +18,10 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel
     /// <summary><c>DOTLLM_VK_SMALLROW_GEMV=0</c> disables the multi-column GEMVs here as on the MoE host (A/B and diagnostics).</summary>
     internal static bool SmallRowGemvEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_SMALLROW_GEMV") != "0";
 
+    /// <summary>Fewest rows that take the two-rows-per-workgroup Q6_K GEMV (#1193; <c>DOTLLM_VK_SMALLROW_Q6K_R2_MIN_ROWS</c>, as the dense host; 99 = off).</summary>
+    private static readonly int SmallRowQ6KR2MinRows =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_SMALLROW_Q6K_R2_MIN_ROWS"), out int r) && r >= 2 ? r : 3;
+
     /// <summary>Records <paramref name="n"/> (2..8) rows on a multi-column GEMV when one exists for the type and shape; false otherwise.</summary>
     private bool TryRecordSmallRowMatmul(nint cmdBuf, VulkanDevice.Buffer weights, QuantizationType qt,
                                          VulkanDevice.Buffer input, VulkanDevice.Buffer output, int m, int k, int n)
@@ -28,7 +32,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel
         {
             QuantizationType.Q4_K => _kernels.MatMulQ4KMulti,
             QuantizationType.Q5_K => _kernels.MatMulQ5KMulti,
-            QuantizationType.Q6_K => _kernels.MatMulQ6KMulti,
+            QuantizationType.Q6_K => n >= SmallRowQ6KR2MinRows ? _kernels.MatMulQ6KMultiR2 ?? _kernels.MatMulQ6KMulti : _kernels.MatMulQ6KMulti,
             QuantizationType.IQ4_XS => _kernels.MatMulIq4XsMulti,
             _ => null,
         };
