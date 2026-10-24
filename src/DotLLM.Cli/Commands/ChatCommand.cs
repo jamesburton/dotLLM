@@ -9,6 +9,7 @@ using DotLLM.Core.Models;
 using DotLLM.Engine;
 using DotLLM.Engine.Constraints;
 using DotLLM.Engine.PromptCache;
+using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Tokenizers;
@@ -116,15 +117,66 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
 
         /// <summary>Compute device.</summary>
         [CommandOption("--device|-d")]
-        [Description("Compute device: 'cpu' (default), 'gpu', 'gpu:0', 'gpu:1'.")]
-        [DefaultValue("cpu")]
-        public string Device { get; set; } = "cpu";
+        [Description(DeviceCli.OptionHelp)]
+        [DefaultValue(DeviceCli.DefaultDevice)]
+        public string Device { get; set; } = DeviceCli.DefaultDevice;
 
         /// <summary>Number of GPU layers for hybrid offloading.</summary>
         [CommandOption("--gpu-layers")]
-        [Description("Number of transformer layers to offload to GPU. 0 = CPU only. " +
-                     "Omit for default (0 with --device cpu, all with --device gpu).")]
+        [Description("Number of transformer layers to offload to GPU (CUDA). 0 = CPU only. " +
+                     "Omit for default (all layers on a GPU device, 0 with --device cpu). Ignored on vulkan (whole model is device-resident).")]
         public int? GpuLayers { get; set; }
+
+        /// <summary>Routed-expert placement on CUDA (issue #1070).</summary>
+        [CommandOption(MoeOffloadCli.ModeOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.ModeHelp)]
+        public string? MoeOffload { get; set; }
+
+        /// <summary>VRAM expert-cache size in MiB (issue #1070).</summary>
+        [CommandOption(MoeOffloadCli.CacheMibOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CacheMibHelp)]
+        public string? MoeCacheMib { get; set; }
+
+        /// <summary>Expert-cache replacement policy (issue #1070).</summary>
+        [CommandOption(MoeOffloadCli.PolicyOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.PolicyHelp)]
+        public string? MoeCachePolicy { get; set; }
+
+        /// <summary>Where uncached offloaded experts run (issue #1071).</summary>
+        [CommandOption(MoeOffloadCli.ColdOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.ColdHelp)]
+        public string? MoeCold { get; set; }
+
+        /// <summary>CPU cold-expert worker threads (issue #1071).</summary>
+        [CommandOption(MoeOffloadCli.CpuThreadsOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CpuThreadsHelp)]
+        public int? MoeCpuThreads { get; set; }
+
+        /// <summary>llama.cpp <c>--cpu-moe</c>: every MoE layer's experts on the CPU (issue #1071).</summary>
+        [CommandOption(MoeOffloadCli.CpuMoeOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CpuMoeHelp)]
+        [DefaultValue(false)]
+        public bool CpuMoe { get; set; }
+
+        /// <summary>llama.cpp <c>--n-cpu-moe N</c>: the first N layers' experts on the CPU (issue #1071).</summary>
+        [CommandOption(MoeOffloadCli.NCpuMoeOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.NCpuMoeHelp)]
+        public int? NCpuMoe { get; set; }
+
+        /// <summary>Re-run the MoE offload cost calibration (issue #1071).</summary>
+        [CommandOption(MoeOffloadCli.CalibrateOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CalibrateHelp)]
+        [DefaultValue(false)]
+        public bool MoeCalibrate { get; set; }
+
+        /// <summary>Context the MoE offload VRAM budget reserves KV cache for (issue #1071).</summary>
+        [CommandOption(MoeOffloadCli.ContextOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.ContextHelp)]
+        public int? CtxSize { get; set; }
+
+        /// <summary>The raw MoE offload option values (issues #1070, #1071).</summary>
+        public DotLLM.Core.Moe.MoeCliValues MoeValues => new(MoeOffload, MoeCacheMib, MoeCachePolicy, MoeCold, MoeCpuThreads,
+            CpuMoe, NCpuMoe, MoeCalibrate, CtxSize);
 
         /// <summary>Quantization filter.</summary>
         [CommandOption("--quant|-q")]
@@ -200,6 +252,62 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         [DefaultValue(1)]
         public int PromptCacheSize { get; set; } = 1;
 
+        /// <summary>Draft model for speculative decoding.</summary>
+        [CommandOption("--speculative-model|--draft-model")]
+        [Description("Path or HuggingFace repo ID for a draft model. Enables speculative decoding for faster generation. Must share vocabulary with the main model.")]
+        public string? SpeculativeModel { get; set; }
+
+        /// <summary>Number of draft candidates per speculative step.</summary>
+        [CommandOption("--speculative-k|--draft-tokens")]
+        [Description("Number of draft tokens per speculative step (K). Default 3.")]
+        [DefaultValue(DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates)]
+        public int SpeculativeK { get; set; } = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
+
+        /// <summary>Opt-out of MTP self-speculative decoding when the model carries (or is given) an MTP head.</summary>
+        [CommandOption("--no-mtp")]
+        [Description("Disable Multi-Token Prediction (MTP) self-speculative decoding (on by default when the model carries an MTP head; an adaptive gate falls back to plain decode when it loses).")]
+        [DefaultValue(false)]
+        public bool NoMtp { get; set; }
+
+        /// <summary>Explicit MTP head GGUF for architectures that ship it as a separate file (qwen4exp).</summary>
+        [CommandOption("--mtp-head")]
+        [Description("Path of a separate MTP head GGUF (qwen4exp ships it as mtp-*.gguf beside the quantisation folders). Default: auto-detected next to the model; a head that does not fit the device is declined with a warning.")]
+        public string? MtpHead { get; set; }
+
+        /// <summary>Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog).</summary>
+        [CommandOption("--prefill-chunk-size|--ubatch-size")]
+        [Description("Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog). 0 = whole prompt in one pass (default).")]
+        [DefaultValue(0)]
+        public int PrefillChunkSize { get; set; }
+
+        /// <summary>Maximum recurrent prefix snapshots.</summary>
+        [CommandOption("--prefix-snapshots")]
+        [Description("Maximum recurrent prefix snapshots (default 1).")]
+        public int? PrefixSnapshots { get; set; }
+
+        /// <summary>Page-locked host byte budget for recurrent prefix snapshots.</summary>
+        [CommandOption("--prefix-snapshot-host-budget")]
+        [Description("Page-locked host snapshot budget, such as 8GiB. Default 0 disables host retention.")]
+        public string? PrefixSnapshotHostBudget { get; set; }
+
+        /// <summary>Directory for ephemeral recurrent prefix spill files.</summary>
+        [CommandOption("--prefix-snapshot-disk-dir")]
+        [Description("Directory for recurrent prefix spill files; requires a positive disk budget.")]
+        public string? PrefixSnapshotDiskDirectory { get; set; }
+
+        /// <summary>Maximum disk snapshot bytes.</summary>
+        [CommandOption("--prefix-snapshot-disk-budget")]
+        [Description("Snapshot spill budget, such as 32GiB; requires a disk directory. Default 0 disables disk retention.")]
+        public string? PrefixSnapshotDiskBudget { get; set; }
+
+        /// <inheritdoc/>
+        public override ValidationResult Validate()
+        {
+            try { DotLLM.Server.ServerOptions.BuildPrefixSnapshotOptions(PrefixSnapshots, PrefixSnapshotHostBudget, PrefixSnapshotDiskDirectory, PrefixSnapshotDiskBudget); }
+            catch (ArgumentException ex) { return ValidationResult.Error(ex.Message); }
+            return base.Validate();
+        }
+
         /// <summary>Verbose debug output.</summary>
         [CommandOption("--verbose|-v")]
         [Description("Show debug info: finish reason, raw text before stop-sequence stripping, tool call detection details.")]
@@ -210,6 +318,18 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
     /// <inheritdoc/>
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
     {
+        // Reject an unrecognised --device up front: it used to fall through to the CPU silently (#468/#790).
+        if (DeviceCli.Validate(settings.Device) is { } deviceError)
+        {
+            DeviceCli.PrintError(deviceError, json: false);
+            return 1;
+        }
+        if (MoeOffloadCli.Validate(settings.MoeValues) is { } moeError)
+        {
+            DeviceCli.PrintError(moeError, json: false);
+            return 1;
+        }
+
         // Resolve before loading the model so a bad path fails fast.
         if (!TextArgument.TryResolve(settings.SystemPrompt, settings.SystemPromptFile,
                 "--system|-s", "--system-file", required: false,
@@ -219,19 +339,56 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             return 1;
         }
 
-        var resolvedPath = GgufFileResolver.Resolve(settings.Model, settings.Quant);
-        if (resolvedPath is null)
-            return 1;
+        // HuggingFace safetensors directory (config.json + *.safetensors /
+        // index.json)? Auto-detected; loads via the safetensors path. The GGUF
+        // path is unchanged.
+        string? hfDir = RunCommand.TryResolveHfDirectory(settings.Model);
+
+        string resolvedPath;
+        if (hfDir is not null)
+        {
+            resolvedPath = hfDir;
+        }
+        else
+        {
+            var ggufPath = GgufFileResolver.Resolve(settings.Model, settings.Quant, allowPull: true);
+            if (ggufPath is null)
+                return 1;
+            resolvedPath = ggufPath;
+        }
 
         GgufFile? gguf = null;
+        IDisposable? safetensorsSource = null;
         ModelConfig? config = null;
-        Tokenizers.Bpe.BpeTokenizer? tokenizer = null;
+        ITokenizer? tokenizer = null;
         IModel? model = null;
+        Func<int, DotLLM.Core.Attention.IKvCache>? vulkanKv = null;
+        DeviceCli.Outcome deviceOutcome = null!;
 
+        try
+        {
         AnsiConsole.Status()
             .Spinner(Spinner.Known.Dots)
             .Start("Loading model...", ctx =>
             {
+                if (hfDir is not null)
+                {
+                    // Explicit GPU -> error before loading anything; auto -> CPU with a warning (#790).
+                    deviceOutcome = DeviceCli.ResolveCpuOnly(settings.Device, "HuggingFace safetensors checkpoints", Path.GetFileName(hfDir));
+                    ctx.Status("Opening HuggingFace safetensors checkpoint...");
+                    var threadingCfg = new ThreadingConfig(
+                        settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
+                    var (m, src, cfg) = ModelLoader.LoadFromSafetensors(hfDir, threadingCfg);
+                    model = m;
+                    safetensorsSource = src;
+                    config = cfg;
+                    ctx.Status("Loading tokenizer...");
+                    tokenizer = ModelLoader.LoadTokenizerFromHfDirectory(hfDir)
+                        ?? throw new InvalidOperationException(
+                            $"No tokenizer.json (or legacy vocab.json/merges.txt) found in '{hfDir}'.");
+                    return;
+                }
+
                 ctx.Status("Opening GGUF file...");
                 gguf = GgufFile.Open(resolvedPath);
 
@@ -241,31 +398,42 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                 ctx.Status("Loading tokenizer...");
                 tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
 
-                int gpuLayers = ResolveGpuLayers(settings, config);
-                if (gpuLayers <= 0)
+                ctx.Status($"Loading {config.Architecture} model on {settings.Device} ({config.NumLayers} layers)...");
+                // THE shared dispatch (#790) behind serve/run/chat: resolves --device (auto = CUDA, then Vulkan, then CPU with a
+                // warning), loads per architecture (Vulkan #259, CUDA full/partial #729/#291, CPU hybrids), and refuses to turn an
+                // explicit GPU request into a CPU run.
+                DotLLM.Server.DeviceLoadResult loaded;
+                (loaded, deviceOutcome) = DeviceCli.Load(gguf, config, settings.Device, settings.GpuLayers,
+                    new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly),
+                    resolvedPath, MoeOffloadCli.Build(settings.MoeValues));
+                model = loaded.Model;
+                vulkanKv = loaded.IsVulkan ? loaded.KvCacheFactory : null;   // CUDA/hybrid models build their caches from the model type below
+                if (!settings.NoMtp)
                 {
-                    var threading = new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
-                    ctx.Status($"Loading {config.Architecture} model ({config.NumLayers} layers, {threading.EffectiveThreadCount} threads)...");
-                    model = TransformerModel.LoadFromGguf(gguf, config, threading);
-                }
-                else if (gpuLayers >= config.NumLayers)
-                {
-                    int gpuId = settings.Device.IndexOf(':') is int ci and > 0
-                        ? int.Parse(settings.Device.AsSpan(ci + 1))
-                        : 0;
-                    ctx.Status($"Loading {config.Architecture} model on GPU {gpuId}...");
-                    model = DotLLM.Cuda.CudaTransformerModel.LoadFromGguf(gguf, config, gpuId);
-                }
-                else
-                {
-                    int gpuId = settings.Device.IndexOf(':') is int ci2 and > 0
-                        ? int.Parse(settings.Device.AsSpan(ci2 + 1))
-                        : 0;
-                    var threading = new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
-                    ctx.Status($"Loading {config.Architecture} model ({gpuLayers} GPU + {config.NumLayers - gpuLayers} CPU layers)...");
-                    model = DotLLM.Cuda.HybridTransformerModel.LoadFromGguf(gguf, config, gpuLayers, gpuId, threading);
+                    // qwen4exp ships its MTP draft head as a separate GGUF (#820): attach the explicit or auto-detected sibling; plain decode if it cannot be attached.
+                    try
+                    {
+                        DotLLM.Models.Architectures.Qwen4ExpMtpHeadResolver.TryAttach(model, resolvedPath, settings.MtpHead,
+                            trunkBytes: model is DotLLM.Core.Models.IMtpHeadAttachable ? DotLLM.HuggingFace.ModelResolver.FileLength(resolvedPath) : -1);
+                    }
+                    catch (Exception ex) when (ex is not FileNotFoundException && (settings.MtpHead is null || ex is NotSupportedException))
+                    {
+                        Console.Error.WriteLine($"WARNING: MTP head not attached ({ex.GetType().Name}: {ex.Message}); decoding without speculation.");
+                    }
                 }
             });
+        }
+        catch (DotLLM.Server.DeviceUnavailableException ex)
+        {
+            // An explicit device that cannot be honoured: a clean what/why/opt-in message and a failing exit code, never a CPU run.
+            DeviceCli.PrintError(ex.Message, json: false);
+            gguf?.Dispose();
+            safetensorsSource?.Dispose();
+            return 1;
+        }
+
+        // Resolved device line + (for auto on the CPU) the prominent warning, printed after the spinner so it stays visible.
+        DeviceCli.Report(deviceOutcome, json: false);
 
         // Display VRAM warning after spinner completes (so it stays visible)
         string? vramWarning = (model as DotLLM.Cuda.CudaTransformerModel)?.VramWarning
@@ -273,16 +441,29 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         if (vramWarning is not null)
             AnsiConsole.MarkupLine($"[yellow]WARNING: {Markup.Escape(vramWarning)}[/]");
 
-        // Create chat template from GGUF metadata, fallback to ChatML
-        string bosTokenStr = tokenizer!.DecodeToken(tokenizer.BosTokenId);
-        string eosTokenStr = tokenizer.DecodeToken(tokenizer.EosTokenId);
-        IChatTemplate chatTemplate;
-        var jinjaTemplate = GgufChatTemplateFactory.TryCreate(gguf!.Metadata, tokenizer);
-        chatTemplate = jinjaTemplate ?? new JinjaChatTemplate(DefaultChatMlTemplateText, bosTokenStr, eosTokenStr);
+        // GGUF checkpoints carry an embedded Jinja chat template; the HF
+        // safetensors path doesn't surface one here, so it falls back to the
+        // plain completion-style transcript.
+        var jinjaTemplate = gguf is not null
+            ? GgufChatTemplateFactory.TryCreate(gguf.Metadata, tokenizer!, config!.Architecture)
+            : null;
+        IChatTemplate chatTemplate = jinjaTemplate ?? GgufChatTemplateFactory.CreatePlainFallback(tokenizer!);
+        if (jinjaTemplate is null)
+        {
+            AnsiConsole.MarkupLine(
+                "[yellow]WARNING: model has no GGUF chat template; using a plain completion-style transcript. " +
+                "This usually means the model is not instruction/chat tuned.[/]");
+        }
 
-        // Parse tool definitions
+        // Parse tool definitions. Tool calling relies on the GGUF-embedded chat
+        // template, so it is unavailable on the HF safetensors path.
         ToolDefinition[]? tools = ParseToolDefinitions(settings.Tools);
-        IToolCallParser? toolCallParser = tools is { Length: > 0 }
+        if (tools is { Length: > 0 } && gguf is null)
+        {
+            AnsiConsole.MarkupLine("[yellow]WARNING: --tools is not supported for HuggingFace safetensors models; ignoring.[/]");
+            tools = null;
+        }
+        IToolCallParser? toolCallParser = tools is { Length: > 0 } && gguf is not null
             ? GgufChatTemplateFactory.CreateToolCallParser(gguf.Metadata, config!.Architecture)
             : null;
         ToolChoice toolChoice = ParseToolChoice(settings.ToolChoiceStr, tools);
@@ -293,7 +474,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         var stopSequences = new List<string>();
         foreach (var marker in new[] { "<|im_end|>", "<|eot_id|>", "<|eom_id|>", "<|end|>", "</s>", "</tool_call>" })
         {
-            if (marker != eosTokenStr) // avoid duplicate with EOS stop condition
+            if (marker != tokenizer!.DecodeToken(tokenizer.EosTokenId)) // avoid duplicate with EOS stop condition
                 stopSequences.Add(marker);
         }
 
@@ -325,6 +506,13 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                 },
                 _ => null // auto/none — no constraint
             };
+
+            // The constraint emits a BARE JSON object — it cannot produce the model's envelope
+            // (<tool_call>, <|python_tag|>, [TOOL_CALLS]). Parse constrained output with the
+            // markerless parser, or the tool call is silently lost (#325). argumentsKey above is
+            // deliberately computed from the model parser first.
+            if (responseFormat is not null && toolCallParser is not null)
+                toolCallParser = ToolCallParserFactory.ForToolChoice(toolChoice, toolCallParser);
         }
 
         var inferenceOptions = new InferenceOptions
@@ -347,9 +535,10 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         var quantLabel = InferQuantLabel(resolvedPath, settings.Quant);
         var samplingLabel = BuildSamplingLabel(settings);
         var deviceLabel = model is DotLLM.Cuda.CudaTransformerModel
-            ? DotLLM.Cuda.CudaDevice.GetDevice(settings.Device.IndexOf(':') is int ci and > 0
-                ? int.Parse(settings.Device.AsSpan(ci + 1)) : 0).ToString()
-            : $"{threadingInfo.EffectiveThreadCount} threads";
+            ? DotLLM.Cuda.CudaDevice.GetDevice(DeviceCli.CudaOrdinal(deviceOutcome.Resolved)).ToString()
+            : vulkanKv is not null
+                ? $"vulkan {DotLLM.Vulkan.VulkanModelLoader.SharedDevice.DeviceName}"
+                : $"{threadingInfo.EffectiveThreadCount} threads";
         var toolsLabel = tools is { Length: > 0 } ? $" | {tools.Length} tool(s)" : "";
         var segments = $"{config!.Architecture} {config.NumLayers}L/{config.HiddenSize}H | {quantLabel} | {deviceLabel} | {samplingLabel}{toolsLabel}";
         AnsiConsole.Write(new Rule($"[grey]dotllm chat | {Markup.Escape(segments)}[/]").LeftJustified());
@@ -368,19 +557,68 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
 
         Func<ModelConfig, int, DotLLM.Core.Attention.IKvCache>? kvFactory = null;
         DotLLM.Engine.KvCache.PagedKvCacheFactory? pagedFactory = null;
-        if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
+        DotLLM.Cuda.CudaPagedKvCacheFactory? cudaPagedFactory = null;
+        if (vulkanKv is not null)
         {
             if (settings.Paged)
-                AnsiConsole.MarkupLine("[yellow]WARNING: Paged KV-cache not supported with CUDA, using GPU cache.[/]");
-            kvFactory = kvConfig.IsQuantized
-                ? (cfg, size) => cudaModel.CreateKvCache(size, kvConfig)
-                : (cfg, size) => cudaModel.CreateKvCache(size);
+                AnsiConsole.MarkupLine("[yellow]WARNING: Paged KV-cache is not supported on Vulkan; using the model's own device KV-cache.[/]");
+
+            if (kvConfig.IsQuantized && model is DotLLM.Vulkan.VulkanTransformerModel vkModel)
+            {
+                string spvDir = DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir();
+                kvFactory = (cfg, size) => vkModel.CreateQuantizedKvCache(
+                    spvDir, size, kvConfig.KeyDType, kvConfig.ValueDType);
+            }
+            else
+            {
+                var vkFactory = vulkanKv;
+                kvFactory = (cfg, size) => vkFactory(size);
+            }
+        }
+        else if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
+        {
+            if (settings.Paged && kvConfig.IsQuantized)
+            {
+                AnsiConsole.MarkupLine("[yellow]WARNING: Paged KV-cache does not support quantization yet, using quantized GPU cache.[/]");
+                kvFactory = (cfg, size) => cudaModel.CreateKvCache(size, kvConfig);
+            }
+            else if (settings.Paged)
+            {
+                // Issue #252: block-scattered device storage + gather-into-scratch attention
+                // dispatch. Mirrors the CPU `--paged` branch below.
+                cudaPagedFactory = new DotLLM.Cuda.CudaPagedKvCacheFactory(
+                    DotLLM.Core.Attention.KvGeometry.FromConfig(config!));
+                var factory = cudaPagedFactory;
+                kvFactory = (cfg, size) => cudaModel.CreatePagedKvCache(factory.Pool, size);
+            }
+            else
+            {
+                kvFactory = kvConfig.IsQuantized
+                    ? (cfg, size) => cudaModel.CreateKvCache(size, kvConfig)
+                    : (cfg, size) => cudaModel.CreateKvCache(size);
+            }
         }
         else if (model is DotLLM.Cuda.HybridTransformerModel hybridModel)
         {
             if (settings.Paged)
                 AnsiConsole.MarkupLine("[yellow]WARNING: Paged KV-cache not supported with hybrid GPU, using hybrid cache.[/]");
             kvFactory = (cfg, size) => hybridModel.CreateKvCache(size);
+        }
+        else if (model is DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel qwen3Split)
+        {
+            kvFactory = (cfg, size) => qwen3Split.CreateKvCache(size);
+        }
+        else if (model is DotLLM.Cuda.Architectures.CudaLfm2MoeTransformerModel lfmGpu)
+        {
+            DotLLM.Cuda.Architectures.CudaLfm2MoeTransformerModel.ValidateKvStorage(kvConfig.KeyDType, kvConfig.ValueDType, settings.CacheWindow);
+            if (settings.Paged)
+                Console.Error.WriteLine("WARNING: Paged KV-cache not supported for CUDA LFM2; using the model's own sparse cache.");
+            kvFactory = (cfg, size) => lfmGpu.CreateKvCache(size);
+        }
+        else if (model is DotLLM.Cuda.Architectures.CudaNemotronHTransformerModel nemotronHGpu)
+        {
+            // #729: all-GPU fallback for a partial request on Nemotron-H (sparse attention-only KV).
+            kvFactory = (cfg, size) => nemotronHGpu.CreateKvCache(size);
         }
         else if (settings.Paged && !kvConfig.IsQuantized)
         {
@@ -392,20 +630,64 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         {
             AnsiConsole.MarkupLine("[yellow]WARNING: Paged KV-cache does not support quantization yet, using quantized simple cache.[/]");
             kvFactory = (cfg, size) => new DotLLM.Engine.KvCache.QuantizedKvCache(
-                cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, size,
+                DotLLM.Core.Attention.KvGeometry.FromConfig(cfg, model?.SupportsCompactSlidingKv == true), size,
                 kvConfig.KeyDType, kvConfig.ValueDType, kvConfig.MixedPrecisionWindowSize);
         }
         else if (kvConfig.IsQuantized)
         {
             kvFactory = (cfg, size) => new DotLLM.Engine.KvCache.QuantizedKvCache(
-                cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, size,
+                DotLLM.Core.Attention.KvGeometry.FromConfig(cfg, model?.SupportsCompactSlidingKv == true), size,
                 kvConfig.KeyDType, kvConfig.ValueDType, kvConfig.MixedPrecisionWindowSize);
         }
 
-        PrefixCache? prefixCache = !settings.NoPromptCache
+        // Prefix reuse is CPU-KV only: serve does no cross-request prefix reuse on Vulkan, and chat must not either (#790).
+        PrefixCache? prefixCache = !settings.NoPromptCache && vulkanKv is null
             ? new PrefixCache(settings.PromptCacheSize)
             : null;
-        var generator = new TextGenerator(model!, tokenizer!, kvFactory, prefixCache);
+
+        // Load speculative draft model if requested (mirrors `dotllm run` wiring).
+        IModel? draftModel = null;
+        GgufFile? draftGguf = null;
+        if (!string.IsNullOrEmpty(settings.SpeculativeModel))
+        {
+            var draftPath = GgufFileResolver.Resolve(settings.SpeculativeModel, null);
+            if (draftPath is null)
+            {
+                AnsiConsole.MarkupLine("[red]Speculative draft model not found.[/]");
+                model?.Dispose();
+                gguf?.Dispose();
+                safetensorsSource?.Dispose();
+                return 1;
+            }
+
+            draftGguf = GgufFile.Open(draftPath);
+            var draftConfig = GgufModelConfigExtractor.Extract(draftGguf.Metadata);
+            if (!DotLLM.Engine.SpeculativeConstants.AreVocabsCompatible(config!.VocabSize, draftConfig.VocabSize))
+            {
+                AnsiConsole.MarkupLine(
+                    $"[red]Draft model vocab size ({draftConfig.VocabSize}) differs from target ({config.VocabSize}) " +
+                    $"by more than {DotLLM.Engine.SpeculativeConstants.MaxVocabSizeDifference} tokens. " +
+                    "Models must share the same base tokenizer.[/]");
+                draftGguf.Dispose();
+                model?.Dispose();
+                gguf?.Dispose();
+                safetensorsSource?.Dispose();
+                return 1;
+            }
+
+            draftModel = TransformerModel.LoadFromGguf(draftGguf, draftConfig,
+                new ThreadingConfig(settings.Threads, settings.DecodeThreads));
+            AnsiConsole.MarkupLine($"[dim]Speculative decoding: K={settings.SpeculativeK}, draft={Path.GetFileName(draftPath)}[/]");
+        }
+
+        var generator = new TextGenerator(model!, tokenizer!, kvFactory, prefixCache,
+            draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,
+            mtpEnabled: !settings.NoMtp, mtpAdaptive: true, recurrentPrefixCache: !settings.NoPromptCache,
+            prefillChunkSize: settings.PrefillChunkSize,
+            recurrentPrefixCacheOptions: DotLLM.Server.ServerOptions.BuildPrefixSnapshotOptions(settings.PrefixSnapshots, settings.PrefixSnapshotHostBudget, settings.PrefixSnapshotDiskDirectory, settings.PrefixSnapshotDiskBudget));
+
+        if (settings.PrefixSnapshotDiskDirectory is not null)
+            Console.WriteLine($"[dotllm] Prefix snapshot disk transport: {generator.RecurrentPrefixStatistics.DiskTransport ?? "unavailable (provider or directory)"} (restart persistence disabled)");
 
         try
         {
@@ -413,9 +695,14 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         }
         finally
         {
+            generator.ClearRecurrentPrefixCache();
             pagedFactory?.Dispose();
+            cudaPagedFactory?.Dispose();
+            draftModel?.Dispose();
+            draftGguf?.Dispose();
             model?.Dispose();
             gguf?.Dispose();
+            safetensorsSource?.Dispose();
         }
 
         return 0;
@@ -593,7 +880,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         }
 
         // Check for tool calls
-        ToolCall[]? detectedCalls = toolCallParser?.TryParse(assistantText);
+        ToolCall[]? detectedCalls = toolCallParser?.TryParse(assistantText, tools);
 
         if (detectedCalls is { Length: > 0 })
         {
@@ -684,14 +971,6 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             $"[dim][[{promptTokenCount} prompt tokens{cacheInfo}, {tokenCount} generated tokens, " +
             $"{ttftMs:F0} ms TTFT, {prefillTokSec:F1} prefill tok/s, {decodeTokSec:F1} decode tok/s]][/]");
         Console.WriteLine();
-    }
-
-    private static int ResolveGpuLayers(Settings settings, ModelConfig config)
-    {
-        if (settings.GpuLayers.HasValue)
-            return Math.Clamp(settings.GpuLayers.Value, 0, config.NumLayers);
-        return settings.Device.StartsWith("gpu", StringComparison.OrdinalIgnoreCase)
-            ? config.NumLayers : 0;
     }
 
     private static string InferQuantLabel(string resolvedPath, string? quantFlag)
@@ -795,7 +1074,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         }
     }
 
-    private static ToolChoice ParseToolChoice(string choice, ToolDefinition[]? tools)
+    internal static ToolChoice ParseToolChoice(string choice, ToolDefinition[]? tools)
     {
         return choice.ToLowerInvariant() switch
         {
@@ -809,10 +1088,5 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         };
     }
 
-    // Default ChatML template used as fallback when GGUF has no chat_template
-    internal const string DefaultChatMlTemplateText =
-        "{% for message in messages %}" +
-        "{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}" +
-        "{% endfor %}" +
-        "{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}";
+    internal const string DefaultChatMlTemplateText = GgufChatTemplateFactory.PlainCompletionTemplateText;
 }

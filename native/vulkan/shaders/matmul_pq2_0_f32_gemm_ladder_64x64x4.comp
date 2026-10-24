@@ -1,0 +1,23 @@
+#version 450
+// Issue #439 ladder point (b) — the midpoint.
+//
+// 64x64 output tile from FOUR subgroups (256 threads at wave64) arranged 2x2, each owning a 32x32 warp
+// tile = 2x2 coopmat fragments. Close to llama.cpp's m_warptile_mmq.
+//
+//   MACs per staged K-chunk : 64 * 64 * 32       = 131,072
+//   bytes staged            : (64 + 64) * 32 * 2 =   8,192
+//   arithmetic intensity    :                       16.0 MAC/byte   (4x the shipping kernel)
+//   LDS                     : 2 * 64 * 40 * 2 + 4 * 256 * 4 = 10,240 + 4,096 = 14,336 B
+//   accumulators            : 4 fragments * 256 f32 / 64 lanes = 16 VGPRs
+//
+// WAVE=64: the driver's native compute wave. Pinning to 32 was tried and is what forced the
+// whole ladder off the pin — see the wave-width note in matmul_pq2_0_f32_gemm_ladder.glsl.
+#define BM 64
+#define BN 64
+#define WM 32
+#define WN 32
+#define NSG 4
+#define WAVE 64
+
+#extension GL_GOOGLE_include_directive : require
+#include "matmul_pq2_0_f32_gemm_ladder.glsl"
