@@ -1,0 +1,111 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Q4_0 MMVQ decode GEMV: integer-dot (dp4a) matrix-vector multiply.
+//
+//   y[m] = sum_k W_q4_0[m,k] * x[k]
+//
+// The activation x[] is pre-quantized to Q8_1 (int8 qs + fp32 scale d_x, one
+// block per 32 elements, aligned 1:1 with a Q4_0 block). Q4_0's reconstructed
+// weight is w = d * (nibble - 8) with (nibble - 8) in [-8, 7], already int8:
+//   sum_i w_i*x_i = d * d_x * dp4a(nibble - 8, xq)
+// No min term (centred by the fixed -8 offset, folded into the int8 operand).
+//
+// NOT bit-exact (x is int8-quantized); validated argmax + tolerance vs CPU F32.
+//
+// ── COALESCED lane=K-position layout (issue #339, mirrors #338) ───────────────
+// One wave32 subgroup per row; 4 lanes share a 32-element block (32 lanes → 8
+// blocks/iteration). Lane L → block bi=L/4, word w=L%4: reads qs uint w (4 bytes
+// = 4 low-nibble elements [4w..4w+3] + 4 high-nibble elements [16+4w..]) → 2 dp4a.
+// Consecutive lanes within a block read consecutive qs words → coalesced.
+// Reduction: a single subgroupAdd.
+//
+// Q4_0 block layout (18 bytes / 32 elements; matches matmul_q4_0 (same 18-byte block as IQ4_NL)):
+//   [0,1]   = fp16 d
+//   [2..17] = qs[16] (32 x 4-bit values; low nibble → elem [0..15],
+//                     high nibble → elem [16..31])
+//   Row stride = (K/32) * 18 bytes (qs base 2-mod-4 ⇒ funnelled 4-byte reads).
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW   { uint  weight[]; }; // Q4_0 blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq  { uint  xq[]; };      // [K/4] packed int8 activations
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds { vec2  xds[]; };     // [K/32] (d_x, s)
+layout(set = 0, binding = 3, std430) writeonly buffer BufY   { float y[]; };       // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint blocksPerRow; // = K / 32
+    uint pad;
+} pc;
+
+const uint Q4_0_BLOCK_BYTES = 18u;
+const uint WINDOW_BLOCKS = 8u;   // 32 lanes / 4 lanes-per-block
+
+uint read4Bytes(uint absByteOff) {
+    uint idx = absByteOff >> 2u;
+    uint ph  = absByteOff & 3u;
+    uint lo  = weight[idx];
+    if (ph == 0u) return lo;
+    uint hi = weight[idx + 1u];
+    return (lo >> (ph * 8u)) | (hi << ((4u - ph) * 8u));
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+// Q4_0 value = d * (nibble - 8). Four nibbles (one per byte, 0..15) -> four packed int8 (nibble - 8) without cross-byte borrow:
+// (v + 0x78) stays in 0x78..0x87 per byte (no carry), and flipping bit 7 turns that into the two's-complement byte of (nibble - 8).
+uint nibblesMinus8(uint v) {
+    return (v + 0x78787878u) ^ 0x80808080u;
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint lane = gl_LocalInvocationID.x;   // 0..31
+    uint bi = lane >> 2u;                 // block within the 8-block window
+    uint w  = lane & 3u;                  // qs word 0..3
+
+    uint rowByteBase = m * pc.blocksPerRow * Q4_0_BLOCK_BYTES;
+    float acc = 0.0;
+
+    for (uint w0 = 0u; w0 < pc.blocksPerRow; w0 += WINDOW_BLOCKS) {
+        uint blk = w0 + bi;
+        if (blk >= pc.blocksPerRow)
+            continue;
+
+        uint blockByteBase = rowByteBase + blk * Q4_0_BLOCK_BYTES;
+        float d = readHalf(blockByteBase);
+        uint cur = read4Bytes(blockByteBase + 2u + w * 4u);
+
+        // Low nibbles → elements [4w..4w+3]; high nibbles → [16+4w..16+4w+3].
+        uint wLo = nibblesMinus8(cur & 0x0F0F0F0Fu);
+        uint wHi = nibblesMinus8((cur >> 4u) & 0x0F0F0F0Fu);
+
+        uint xBase = blk * 8u;            // 32 elements / 4 = 8 xq uints per block
+        int dotI = dotPacked4x8AccSatEXT(int(wLo), int(xq[xBase + w]), 0);
+        dotI = dotPacked4x8AccSatEXT(int(wHi), int(xq[xBase + 4u + w]), dotI);
+
+        float dX = xds[blk].x;
+        acc += d * (dX * float(dotI));
+    }
+
+    float total = subgroupAdd(acc);
+    if (subgroupElect())
+        y[m] = total;
+}

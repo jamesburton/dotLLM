@@ -1,0 +1,5 @@
+#version 450
+// Split-KV (flash-decoding) PARTIAL pass. Decode-only (seqQ == 1).
+// Body: attention_f32_splitkv.glsl (issue #1102 split it out so the F32 and F16-KV pipelines share one source).
+#extension GL_GOOGLE_include_directive : require
+#include "attention_f32_splitkv.glsl"
