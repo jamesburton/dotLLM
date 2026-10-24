@@ -183,6 +183,19 @@ public static unsafe class CudaMoeFfn
 
         }
 
+        // Device-routed decode (#1182): a resident layer on the fully grouped Q4_1 body builds its pointer arrays from the
+        // device top-k ids, so the host neither waits for the routing nor reads it back.
+        if (seqLen == 1 && weights.HostExperts is null && CanRouteOnDevice(weights, kernels, packedQ4Projection))
+        {
+            kernels.LaunchMoeBuildGroupedPtrs(scratch.TopkIdx, scratch.ExpertTable(weights), scratch.GroupedPtrArrays,
+                E, K, scratch.GroupedGateF16, scratch.GroupedUpF16, (long)I * sizeof(ushort), stream);
+            LaunchGroupedGateUp(hiddenF32, weights, scratch, kernels, stream, K, hidden, I);
+            LaunchGroupedDownQ4_1(outputF32, scratch, kernels, stream, K, hidden, I);
+            RunSharedExperts(hiddenF32, outputF32, seqLen, weights, scratch, cublasHandle, kernels, stream, packedQ4Projection);
+            Interlocked.Increment(ref s_deviceRoutedCalls);
+            return;
+        }
+
         // ── Step 5: download top-k indices to host so we can dispatch
         // per-expert grouped batches. Per-token weights stay device-resident —
         // the per-expert axpy reads them from device memory by (token, slot)
@@ -333,16 +346,7 @@ public static unsafe class CudaMoeFfn
         }
 
         if (groupedDown && kActive > 0)
-        {
-            long perArrayBytes = (long)kActive * sizeof(long);
-            kernels.LaunchSwiGLUF32(scratch.GateBatch, scratch.UpBatch, scratch.SiluBatch, I, kActive, stream);
-            kernels.LaunchMoeGroupedGemvQ4_1F32PerExpertInput(
-                scratch.SiluBatch, scratch.GroupedPtrArrays + (nint)(4 * perArrayBytes), scratch.DownBatch,
-                hidden, I, kActive, stream);
-            kernels.LaunchMoeWeightedRowsSum(
-                outputF32, scratch.DownBatch, scratch.TopkWeight, scratch.GroupedPtrArrays + (nint)(5 * perArrayBytes),
-                kActive, hidden, stream);
-        }
+            LaunchGroupedDownQ4_1(outputF32, scratch, kernels, stream, kActive, hidden, I);
 
         for (int e = 0; e < E && !groupedDown; e++)
         {
@@ -544,6 +548,48 @@ public static unsafe class CudaMoeFfn
             gpu.Prefetch(nextHostLayer, split);
         return true;
     }
+
+    /// <summary>
+    /// The fully grouped Q4_1 decode tail (#1172): one SwiGLU over the <paramref name="kActive"/> expert rows, one grouped
+    /// down GEMV (pointer slice 4) and one weighted combine (slot slice 5) into <paramref name="outputF32"/>.
+    /// </summary>
+    private static void LaunchGroupedDownQ4_1(nint outputF32, CudaMoeScratch scratch, CudaKernels kernels, nint stream,
+        int kActive, int hidden, int I)
+    {
+        long perArrayBytes = (long)kActive * sizeof(long);
+        kernels.LaunchSwiGLUF32(scratch.GateBatch, scratch.UpBatch, scratch.SiluBatch, I, kActive, stream);
+        kernels.LaunchMoeGroupedGemvQ4_1F32PerExpertInput(
+            scratch.SiluBatch, scratch.GroupedPtrArrays + (nint)(4 * perArrayBytes), scratch.DownBatch,
+            hidden, I, kActive, stream);
+        kernels.LaunchMoeWeightedRowsSum(
+            outputF32, scratch.DownBatch, scratch.TopkWeight, scratch.GroupedPtrArrays + (nint)(5 * perArrayBytes),
+            kActive, hidden, stream);
+    }
+
+    private static long s_deviceRoutedCalls;
+
+    /// <summary>Layer calls served by the device-routed decode body (#1182), for tests.</summary>
+    internal static long DeviceRoutedCalls => Interlocked.Read(ref s_deviceRoutedCalls);
+
+    /// <summary>False keeps decode routing on the host (the device-routed body's reference, #1182; <c>DOTLLM_CUDA_MOE_DEVICE_ROUTING=0</c>).</summary>
+    internal static bool DeviceRoutingEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_CUDA_MOE_DEVICE_ROUTING") != "0";
+
+    /// <summary>
+    /// True when a decode call can run the fully grouped Q4_1 body with device-built pointer arrays (#1182): the same
+    /// conditions as the host-routed grouped body, plus the pointer-build kernel.
+    /// </summary>
+    private static bool CanRouteOnDevice(CudaMoeLayerWeights weights, CudaKernels kernels,
+        Action<nint, nint, nint, int, int, int, nint>? packedQ4Projection)
+        => DeviceRoutingEnabled && kernels.HasMoeBuildGroupedPtrs
+            && weights.Precision == MoePrecision.Quantized
+            && weights.NumExpertsPerTok <= CudaKernels.MoeCombineMaxTopK
+            && (weights.HiddenSize % CudaKernels.MoeGroupedGemvKAlignment(weights.GateProjQuantType)) == 0
+            && kernels.HasMoeGroupedGemv(weights.GateProjQuantType) && kernels.HasMoeGroupedGemv(weights.UpProjQuantType)
+            && weights.GateProjQuantType == weights.UpProjQuantType
+            && weights.GateExpsBiasF32 == 0 && weights.UpExpsBiasF32 == 0
+            && weights.DownProjQuantType == QuantizationType.Q4_1 && kernels.HasQ4_1Gemm && kernels.HasMoeGroupedDownQ4_1
+            && (weights.MoeIntermediateSize & 31) == 0 && weights.DownExpsBiasF32 == 0 && !weights.UseSwiGluOai
+            && packedQ4Projection is null;
 
     /// <summary>Test hook: false runs multi-token calls through the per-expert loop (the bucketed body's reference).</summary>
     internal static bool BucketedEnabled { get; set; } = true;
@@ -1190,7 +1236,18 @@ public static unsafe class CudaMoeFfn
         long ptrBytes = (long)slices * kActive * sizeof(long);
         CudaDriverApi.cuMemcpyHtoD_v2(
             scratch.GroupedPtrArrays, (nint)hostPtrs, (nuint)ptrBytes).ThrowOnError();
+        LaunchGroupedGateUp(hiddenF32, weights, scratch, kernels, stream, kActive, hidden, I);
+    }
 
+    /// <summary>
+    /// The launches of the grouped decode gate / up projections over the pointer arrays in
+    /// <see cref="CudaMoeScratch.GroupedPtrArrays"/> (built on the host by <see cref="DispatchGroupedGateUp"/>, or on the
+    /// device by <c>moe_build_grouped_ptrs</c>, #1182): F16 input, grouped GEMVs, F32 outputs in <c>GateBatch</c> /
+    /// <c>UpBatch</c> as <c>[kActive, I]</c>.
+    /// </summary>
+    private static void LaunchGroupedGateUp(nint hiddenF32, CudaMoeLayerWeights weights, CudaMoeScratch scratch,
+        CudaKernels kernels, nint stream, int kActive, int hidden, int I)
+    {
         // Convert the shared input hidden vector F32→F16 once.
         kernels.LaunchConvertF32ToF16(hiddenF32, scratch.GemvInputF16, hidden, stream);
 
@@ -1276,6 +1333,7 @@ public sealed unsafe class CudaMoeScratch : IDisposable
     private nint _groupedUpF16;       // [K_active_max, I_max] halfs
     private nint _groupedPtrArrays;   // 4 × K_active_max nints (8 bytes each)
     private nint _hostTopkIdx;        // pinned host [maxBatch] int32
+    private readonly Dictionary<CudaMoeLayerWeights, nint> _expertTables = new(ReferenceEqualityComparer.Instance);
     private long _groupedActiveMax;   // K_active_max actually allocated for
     private long _groupedIMax;        // I_max actually allocated for
 
@@ -1308,6 +1366,29 @@ public sealed unsafe class CudaMoeScratch : IDisposable
     internal nint GroupedGateF16 => _groupedGateF16;
     internal nint GroupedUpF16 => _groupedUpF16;
     internal nint GroupedPtrArrays => _groupedPtrArrays;
+
+    /// <summary>
+    /// The layer's routed expert pointers on the device as int64 <c>[gate E | up E | down E]</c>, uploaded on first use and
+    /// kept for the scratch's lifetime (device-routed decode, #1182; 6 KiB per 256-expert layer).
+    /// </summary>
+    internal unsafe nint ExpertTable(CudaMoeLayerWeights weights)
+    {
+        if (_expertTables.TryGetValue(weights, out nint table)) return table;
+        int e = weights.NumExperts;
+        var host = new long[3 * e];
+        for (int i = 0; i < e; i++)
+        {
+            host[i] = weights.GateProj[i];
+            host[e + i] = weights.UpProj[i];
+            host[2 * e + i] = weights.DownProj[i];
+        }
+        long bytes = host.Length * sizeof(long);
+        CudaDriverApi.cuMemAlloc_v2(out table, (nuint)bytes).ThrowOnError();
+        fixed (long* p = host)
+            CudaDriverApi.cuMemcpyHtoD_v2(table, (nint)p, (nuint)bytes).ThrowOnError();
+        _expertTables[weights] = table;
+        return table;
+    }
 
     /// <summary>Pinned host copy of the top-k ids <c>[seqLen * topK]</c> (async read-back, #1202).</summary>
     internal nint HostTopkIdx => _hostTopkIdx;
@@ -1487,6 +1568,8 @@ public sealed unsafe class CudaMoeScratch : IDisposable
     public void Dispose()
     {
         Free();
+        foreach (nint t in _expertTables.Values) CudaDriverApi.cuMemFree_v2(t);
+        _expertTables.Clear();
         _capSeqLen = 0;
     }
 }
