@@ -669,6 +669,14 @@ from 25.7 to 2.2 GiB; its decode A/B is inside the iGPU's run-to-run noise (19-2
 staged runs). Imported pages live in the GTT heap 0 (memory type 1: host-visible, coherent, not
 cached), not the device-local carve-out, which is where the decode cost comes from.
 
+For comparison, llama.cpp master (`0ae0e1976`, Vulkan, `llama-bench -ngl 99`) on the same Strix and file
+copies the weights too (`buffer_from_host_ptr` is off in ggml-vulkan): peak private working set
+24.1 GiB with `-lm mmap`, 25.2 GiB with `-lm none`; pp512 1633-1670 tok/s, tg64 73.2-73.4 tok/s.
+
+Loaders that never call `TryImport` are not changed by the flag: on Qwen3.6-35B-A3B the attention /
+shared tensors import (191 tensors, 1.7 GiB; private WS 23.8 -> 21.9 GiB) but the routed-expert banks
+(`VulkanQwen3MoeMoeUpload`) always stage.
+
 Why it is opt-in:
 
 - It opens the checkpoint **for write** (shared). A stray device write would reach the file on disk.
