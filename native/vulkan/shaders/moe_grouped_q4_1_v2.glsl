@@ -73,6 +73,23 @@ shared float stage[4u * TM * TN];
 
 struct Stage { uint aw[5]; vec4 b[BV4]; };   // aw[0]: d | m << 16, aw[1..4]: qs bytes 0..15
 
+// Raw words of staging round r for this thread (its block of the weight tile, its activation vec4s).
+void loadStage(uint r, bool aValid, uint aWord, bool bOk[BV4], uint xb[BV4], out Stage st) {
+    uint wa = aWord + r * NB * 5u;
+    for (uint i = 0u; i < 5u; i++) st.aw[i] = 0u;
+    if (aValid) {
+#ifdef GATEUP
+        // Rows 64..127 of the staged tile are the up bank (waves 2-3: uniform per wave).
+        if ((gl_LocalInvocationID.x / TPB) / NB >= 64u) { for (uint i = 0u; i < 5u; i++) st.aw[i] = w1[wa + i]; }
+        else                                              { for (uint i = 0u; i < 5u; i++) st.aw[i] = w0[wa + i]; }
+#else
+        for (uint i = 0u; i < 5u; i++) st.aw[i] = w0[wa + i];
+#endif
+    }
+    uint xo = r * (BK / 4u);
+    [[unroll]] for (uint i = 0u; i < BV4; i++) st.b[i] = bOk[i] ? x4[xb[i] + xo] : vec4(0.0);
+}
+
 void main() {
     uint listIdx = pc.tileList + 2u * gl_WorkGroupID.y;
     uint expert = offsets[listIdx];
@@ -95,7 +112,6 @@ void main() {
     uint aRow = aBlockIdx / NB;
     uint aBlk = aBlockIdx % NB;
 #ifdef GATEUP
-    bool upRow = aRow >= 64u;
     uint m = mBase + (aRow & 63u);
 #else
     uint m = mBase + aRow;
@@ -129,18 +145,10 @@ void main() {
     }
 
     uint rounds = pc.blocksPerRow / NB;
+    // Round r's raw words are loaded one round ahead into registers and converted to LDS after round r-1's MMAs (a two-round
+    // prefetch measured the same on Strix).
     Stage st;
-    // Round r's raw words are loaded one round ahead (register prefetch) and converted after round r-1's MMAs.
-    for (uint i = 0u; i < 5u; i++) st.aw[i] = 0u;
-    if (aValid) {
-#ifdef GATEUP
-        if (upRow) { for (uint i = 0u; i < 5u; i++) st.aw[i] = w1[aWord + i]; }
-        else       { for (uint i = 0u; i < 5u; i++) st.aw[i] = w0[aWord + i]; }
-#else
-        for (uint i = 0u; i < 5u; i++) st.aw[i] = w0[aWord + i];
-#endif
-    }
-    [[unroll]] for (uint i = 0u; i < BV4; i++) st.b[i] = bOk[i] ? x4[xb[i]] : vec4(0.0);
+    loadStage(0u, aValid, aWord, bOk, xb, st);
 
 #ifdef GATEUP
     uint aOff0 = (wave * TM) * STRIDE4;            // gate rows of this wave's 16 columns
@@ -171,19 +179,7 @@ void main() {
         }
         barrier();
 
-        if (r + 1u < rounds) {
-            uint wa = aWord + (r + 1u) * NB * 5u;
-            if (aValid) {
-#ifdef GATEUP
-                if (upRow) { for (uint i = 0u; i < 5u; i++) st.aw[i] = w1[wa + i]; }
-                else       { for (uint i = 0u; i < 5u; i++) st.aw[i] = w0[wa + i]; }
-#else
-                for (uint i = 0u; i < 5u; i++) st.aw[i] = w0[wa + i];
-#endif
-            }
-            uint xo = (r + 1u) * (BK / 4u);
-            [[unroll]] for (uint i = 0u; i < BV4; i++) st.b[i] = bOk[i] ? x4[xb[i] + xo] : vec4(0.0);
-        }
+        if (r + 1u < rounds) loadStage(r + 1u, aValid, aWord, bOk, xb, st);
 
         [[unroll]] for (uint ks = 0u; ks < BK / TK; ks++) {
             coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> a0;
