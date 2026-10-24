@@ -810,9 +810,26 @@ come for free:
 grouped dynamic causal convolutions (kernel 2, group 16) and the rank-256 / top-16 candidate selector, walked greedily from
 the anchor. The block embedding and the lm-head are the **target's** (no copy).
 
-**Backends.** CPU (`Qwen3HybridDenseTransformerModel`); CUDA and Vulkan (`Cuda/VulkanQwen3HybridDenseTransformerModel`)
-verify on the GPU and run the drafter on the CPU: the verify forward copies the tapped rows to the host (pinned D2H on CUDA,
-a host-readback buffer on Vulkan), the drafter's lm-head runs on the device with the target's head.
+**Backends.** The drafter's forward runs on an `IDFlashBackend`. CPU (`Qwen3HybridDenseTransformerModel`) and Vulkan
+(`VulkanQwen3HybridDenseTransformerModel`, GPU verify) use the CPU backend; the Vulkan verify forward copies the tapped rows to
+a host-readback buffer and the drafter's lm-head runs on the device with the target's head. CUDA
+(`CudaQwen3HybridDenseTransformerModel`) runs the whole drafter on the GPU: weights uploaded as stored (1.1 GB for the Q4_K_M
+drafters), the context ring in device F16, and `dflash_f32.ptx` for the DFlash2 convolution, the ring attention and
+multi-column Q4_K / Q6_K GEMVs that read each weight block once per 8 rows (no F16 expansion).
+
+**Measured** (Bonsai-2 27B PQ2_0 abliterated + the `naklitechie` r3 drafter, RTX 3060, 128 tokens greedy, code prompt; the
+host CPU was shared with other jobs, hence ranges). Every run was token-identical to plain decode.
+
+| | tok/s | tokens / round | peak VRAM over idle |
+|---|---|---|---|
+| dotLLM plain | 11.7–14.3 | 1 | 8.15 GB |
+| dotLLM MTP K=3 | 19.3–21.9 | 3.63 | 8.6 GB |
+| dotLLM DFlash K=7 (GPU drafter) | 31.7–33.5 (15–18 under heavy host load) | 6.68 | 10.3 GB (9.4 GB with `DOTLLM_MTP_GDN_SNAPSHOTS=0`) |
+| llama.cpp PrismML fork plain / MTP K=3 | 15.6 / 22.2 | – / 3.6 | 7.6 / 8.3 GB |
+| llama.cpp PrismML fork DFlash K=7 | did not fit: card full, 0.38 tok/s | 6.9 | – |
+
+The extra DFlash VRAM is the drafter (1.1 GB) plus the per-row GDN snapshots of a 7-row verify (#473, ~0.9 GB, F32). On the
+CPU (Strix Halo, Bonsai-2) DFlash breaks even (3.3 vs 3.4 tok/s): an 8-row CPU verify costs ~7× a decode step there.
 
 **Exactness.** Greedy output is token-identical to plain decode (`DFlashDrafterTests`, `CudaDFlashTests`,
 `VulkanDFlashTests`; real Bonsai-2 27B on the RTX 3060). The selector's greedy draft is a point mass, so sampled decoding
