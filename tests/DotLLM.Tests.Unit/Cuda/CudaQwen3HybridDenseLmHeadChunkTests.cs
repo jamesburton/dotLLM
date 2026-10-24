@@ -42,6 +42,9 @@ public sealed class CudaQwen3HybridDenseLmHeadChunkTests : IDisposable
     public CudaQwen3HybridDenseLmHeadChunkTests(ITestOutputHelper output)
     {
         _out = output;
+        // #1222: with the W2A8 prefill GEMM on (the sm_80+ default) a wide head is one packed GEMM, not chunks; this
+        // class covers the chunked route the GEMM-less path still takes.
+        CudaSmallSGemvDispatch.MmqOverride = false;
         _scratch = Path.Combine(Path.GetTempPath(), $"dotllm-cuda-lmhead-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_scratch);
     }
@@ -50,6 +53,7 @@ public sealed class CudaQwen3HybridDenseLmHeadChunkTests : IDisposable
     {
         CudaWideProjection.BoundedLmHeadOverride = null;
         CudaSmallSGemvDispatch.Dp4aOverride = null;
+        CudaSmallSGemvDispatch.MmqOverride = null;
         try { Directory.Delete(_scratch, recursive: true); } catch { /* best-effort */ }
     }
 

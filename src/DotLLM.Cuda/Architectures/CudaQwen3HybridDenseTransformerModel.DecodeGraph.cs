@@ -59,6 +59,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel
     private bool _aheadValid;
     private int _aheadPosition, _aheadLenBefore, _aheadLenAfter, _aheadEpoch;
     private IKvCache? _aheadKvCache;
+    private int[]? _aheadCounters;   // the test counters the ahead capture bumped, credited only if it is launched
 
     private int _decodeGraphLaunches, _decodeGraphAheadHits, _decodeGraphInstantiations, _decodeGraphFallbacks;
 
@@ -120,6 +121,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel
         {
             slot = 1 - _decodeGraphSlot;
             _f16CacheCurrentLength = _aheadLenAfter;   // the trunk's one host-side effect, replayed
+            AddCounters(_aheadCounters!, 1);
             _decodeGraphAheadHits++;
         }
         else
@@ -153,10 +155,14 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel
 
         int lenBefore = _f16CacheCurrentLength;
         int epoch = DeviceAllocEpoch;
+        int[] countersBefore = ReadCounters();
         Span<int> next = [position + 1];
         bool ok = CaptureTrunkInto(1 - _decodeGraphSlot, next, hiddenSize, numHeads, numKvHeads, headDim, eps, kvCache);
         int lenAfter = _f16CacheCurrentLength;
         _f16CacheCurrentLength = lenBefore;
+        int[] delta = ReadCounters();
+        for (int i = 0; i < delta.Length; i++) delta[i] -= countersBefore[i];
+        AddCounters(delta, -1);   // nothing ran yet; credited by TryForwardDecodeGraph if this graph is launched
         if (!ok || epoch != DeviceAllocEpoch)
             return;
 
@@ -166,6 +172,28 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel
         _aheadLenAfter = lenAfter;
         _aheadEpoch = epoch;
         _aheadKvCache = kvCache;
+        _aheadCounters = delta;
+    }
+
+    // The per-call test counters the layer loop bumps (kernel-tier and launch counts).
+    private int[] ReadCounters() =>
+    [
+        DebugF32StagedAttentionCallsForTest, DebugFusedKvqAttentionCallsForTest, DebugPerRowKvqAttentionCallsForTest,
+        DebugFlashPrefillHd256CallsForTest, DebugFlashPrefillHd256KvqCallsForTest, DebugKvDequantCallsForTest,
+        _dp4aGemvLaunches, _dp4aQuantizeLaunches, _pq2_0MmqLaunches,
+    ];
+
+    private void AddCounters(int[] d, int sign)
+    {
+        DebugF32StagedAttentionCallsForTest += sign * d[0];
+        DebugFusedKvqAttentionCallsForTest += sign * d[1];
+        DebugPerRowKvqAttentionCallsForTest += sign * d[2];
+        DebugFlashPrefillHd256CallsForTest += sign * d[3];
+        DebugFlashPrefillHd256KvqCallsForTest += sign * d[4];
+        DebugKvDequantCallsForTest += sign * d[5];
+        _dp4aGemvLaunches += sign * d[6];
+        _dp4aQuantizeLaunches += sign * d[7];
+        _pq2_0MmqLaunches += sign * d[8];
     }
 
     /// <summary>Captures the 64-layer trunk for <c>positions.Length</c> tokens and commits it to executable graph <paramref name="slot"/>.</summary>

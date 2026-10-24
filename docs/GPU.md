@@ -418,6 +418,38 @@ See [CUDA.md](CUDA.md) for detailed prerequisites and build instructions.
 - **Decode**: 3–10× over CPU (bandwidth-bound, HBM advantage)
 - **Target**: >50 tok/s decode on consumer GPU (RTX 3090/4090) with 7B model
 
+### Ternary Bonsai-2 27B PQ2_0 on the RTX 3060 (CUDA, #1222)
+
+Abliterated-v2 PQ2_0-MTP file, interleaved with the PrismML llama.cpp fork (`b87ca7225`, CUDA, `llama-bench -ngl 99 -fa 1`,
+pp512 / tg128, 3 reps, two rounds each):
+
+| | dotLLM (#1222) | PrismML fork | dotLLM before (`c8d4569a`) |
+|---|---:|---:|---:|
+| prefill pp512 (tok/s) | 597-601 | 587-591 | 157 |
+| plain decode tg128 (tok/s) | 37.1-37.2 | 35.0-35.3 | 20.5 |
+| MTP K=3, gate forced, `run` (tok/s) | 54-56 | 48.8 (`llama-server --spec-type draft-mtp`) | 35.0 |
+| VRAM, plain bench (nvidia-smi delta, MiB) | 7,370 | 7,388 | 8,475 |
+
+What closed the gap, largest first:
+
+- **Decode was launch-bound, not bandwidth-bound.** The 64-layer trunk is ~2,000 launches per token; eager WDDM launches left
+  the GPU idle ~45% of each token (kernels ~27 ms of ~49 ms; the PQ2_0 dp4a GEMV itself already ran at ~315 GB/s). A one-token
+  forward now runs the layer loop as one CUDA graph launch (`CudaQwen3HybridDenseTransformerModel.DecodeGraph.cs`). The loop is
+  re-captured every step (so no kernel needs a device-side position) and pushed into the executable with `cuGraphExecUpdate`;
+  the capture of step `t+1` runs on the host while the GPU executes step `t`. 2..8-row verify forwards (MTP) are graphed too.
+  `DOTLLM_CUDA_HYBRID_GRAPH=0` restores eager launches. Output is bit-identical (same launch sequence).
+- **Prefill expanded every PQ2_0 matrix to F16 for cuBLAS** (rule 2). `pq2_0_mmq_mma.cu` is an int8 tensor-core GEMM
+  (`mma.m16n8k32.s8`) that decodes the packed weights straight into A fragments; it is bit-identical to the #490 dp4a MMQ
+  (CPU W2A8 numerics) and is the default wherever it loads (sm_80+; `DOTLLM_CUDA_PQ2_0_MMQ=0` restores dequant + cuBLAS).
+  wikitext-2, 16 x 512, no BOS: PPL 10.6182 (W2A8 MMA) vs 10.6179 (dequant + cuBLAS) vs 10.6166 (fork), per-window |dNLL| <= 0.25%.
+- **The GDN recurrence was one launch per token** at prefill, each streaming the whole state 4 times. `gdn_scan_multi_f32`
+  runs the sequence in one launch with the state column in registers, and writes the per-row snapshots MTP verifies need
+  (bit-identical to the per-token kernel; also used by the MoE `qwen35moe` host).
+- 1024-wide Hadamard blocks use a register/shuffle FWHT (`hadamard_fwht1024_f32`, bit-identical).
+- VRAM: `token_embd` is uploaded only for a tied head (Bonsai 2 has `output.weight`; 322 MiB nothing read), the MTP head is
+  uploaded on first MTP use (~430 MiB; the fork also skips it without `--spec-type draft-mtp`), and the GDN / attention / FFN
+  scratch share one arena sized to the largest sub-layer, with the Hadamard destinations folded into it.
+
 ### Recursive Flint on the Strix 8060S (Vulkan, #1161)
 
 Official Q4_1 file (39.8B MoE, 2.5B active), chunk / ubatch 512, F16 KV with the #1176 sliding-window ring. Measured interleaved

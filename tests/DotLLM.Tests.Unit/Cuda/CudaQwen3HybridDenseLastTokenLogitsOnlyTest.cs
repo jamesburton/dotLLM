@@ -94,7 +94,9 @@ public class CudaQwen3HybridDenseLastTokenLogitsOnlyTest
         // above). That is #485's deliberate numeric trade, an order of magnitude larger than the
         // GEMV-vs-general-path drift this test bounds, so pin one path across both arms.
         bool? dp4aWas = CudaSmallSGemvDispatch.Dp4aOverride;
+        bool? mmqWas = CudaSmallSGemvDispatch.MmqOverride;
         CudaSmallSGemvDispatch.Dp4aOverride = false;
+        CudaSmallSGemvDispatch.MmqOverride = false;   // #1222: the W2A8 prefill GEMM is the default above 8 rows
         try
         {
         _out.WriteLine("Running full (lastTokenLogitsOnly: false) on a fresh model instance...");
@@ -139,6 +141,7 @@ public class CudaQwen3HybridDenseLastTokenLogitsOnlyTest
         }
         finally
         {
+            CudaSmallSGemvDispatch.MmqOverride = mmqWas;
             CudaSmallSGemvDispatch.Dp4aOverride = dp4aWas;
         }
 

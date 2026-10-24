@@ -562,7 +562,7 @@ PRs #1103, #1122, #1125, #1126.
 | G8 | CUDA | Gemma F32 KV round-trip + activation scratch | `2·kvLen·kvStride·4` | open | #1134 |
 | G9 | CUDA | split-KV partials F32 | ≈0.8 MB | sign-off pending | #1144 |
 | G10 | CUDA | recurrent state F32 | O(1) per sequence | sign-off pending | #1144 |
-| GX1 | CUDA | prefill dequant → F16 scratch → cuBLAS | L1B 33.5 MB, 70B 470 MB + 2 B/weight traffic | open | #1132 (hybrid PQ2_0), #1135 (dense) |
+| GX1 | CUDA | prefill dequant → F16 scratch → cuBLAS | L1B 33.5 MB, 70B 470 MB + 2 B/weight traffic | hybrid PQ2_0 **fixed** (#1222: int8-mma W2A8 MMQ default on sm_80+); dense open | #1132 (hybrid PQ2_0), #1135 (dense) |
 | GX2 | CUDA | LM head > 8 rows → whole-head F16 | B2 2.54 GB | **fixed on dev** (#1099, PR #1125): 2,425 → 170 MiB | — |
 | GX2b | CUDA | multi-row LM head for non-PQ2_0 heads: tiled F16 dequant | ≤ max(layer scratch, 64 MiB) per tile | open (bounded, admitted) | #1136 |
 | GX3 | CUDA | quantized-KV full-history F16 scratch | stride 1024 @32k: 128 MB | hybrid **fixed on dev** (#1094, PR #1103); dense `CudaQuantizedKvCache`/TurboQuant open | #1139 |
@@ -617,7 +617,7 @@ New issues filed by this study: #1134–#1146 (inventory), #1148–#1151 (Vulkan
 | Vulkan iu8 WMMA prefill vs f16 WMMA (bytes only on RDNA 3.5) | Strix Q8_0 prefill choice | #1150 |
 | Vulkan path accuracy against an F32-weight reference | MMQ vs coopmat differ by 3.2e-4; which is closer is unknown | #1150 |
 | LFM2 MoE Vulkan F32 KV narrowed to F16 | not on Strix | #1151 |
-| Fused int8-mma / promoted-F16 PQ2_0 GEMM speed (and the dp4a vs mma rate) | E2 shows the accuracy; speed needs the kernel | #1132 |
+| ~~Fused int8-mma / promoted-F16 PQ2_0 GEMM speed (and the dp4a vs mma rate)~~ measured (#1222): Bonsai-2 pp512 157 → ~600 tok/s on the 3060 (fork 590); PPL 10.6182 vs 10.6179 (dequant + cuBLAS) | — | #1132 |
 | CUDA KV formats on a Llama-class model (CPU covered Llama) | KV policy beyond Bonsai | #1133 |
 | q4_0 K failure cross-checked against llama.cpp `-ctk q4_0` | rules out a dotLLM nibble-order bug | #1120 |
 | Q8_K activations on massive-activation models (Qwen, Gemma) | per-256 scale outliers (E4) | #1138 |
