@@ -175,6 +175,13 @@ internal sealed class CudaWeights : IDisposable
 
     public nint TokenEmbedDevice { get; }
     public QuantizationType TokenEmbedQuantType { get; }
+
+    /// <summary>
+    /// Host address of an F32 token-embedding table left in the mmap'd GGUF instead of uploaded (#1183), or 0. The forward
+    /// gathers the call's rows on the host and uploads them as F16 (<c>hidden x 2</c> bytes per token); the table itself
+    /// never occupies VRAM. Not owned: it lives as long as the GGUF mapping.
+    /// </summary>
+    public nint TokenEmbedHost { get; private init; }
     public nint OutputNormWeight { get; }
     public nint OutputWeight { get; }
     public int OutputOutputDim { get; }
@@ -249,6 +256,10 @@ internal sealed class CudaWeights : IDisposable
     /// disposes <paramref name="cpuWeights"/>. The caller MUST pass null whenever it retains
     /// <paramref name="cpuWeights"/> for a CPU-side forward.
     /// </param>
+    /// <param name="hostTokenEmbed">
+    /// Leave an F32 token-embedding table in the mmap and expose it as <see cref="TokenEmbedHost"/> (#1183). Only for a
+    /// caller whose forward gathers host embeddings; ignored for any other table type.
+    /// </param>
     /// <param name="hostMoeLayer">
     /// Optional predicate over the GLOBAL layer index: true keeps that MoE layer's routed experts in the mmap'd GGUF
     /// for the CPU leg (<c>--cpu-moe</c> / <c>--n-cpu-moe</c>, #1187) instead of uploading them. Null uploads every expert.
@@ -258,7 +269,8 @@ internal sealed class CudaWeights : IDisposable
                                               int numGpuLayers = -1, int firstLayer = 0,
                                               bool skipTokenEmbed = false,
                                               Action<nint>? onHostTensorUploaded = null,
-                                              Func<int, bool>? hostMoeLayer = null)
+                                              Func<int, bool>? hostMoeLayer = null,
+                                              bool hostTokenEmbed = false)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(firstLayer);
         // Dense Gemma-4 (E2B/E4B, #734) runs only on the whole-model CudaTransformerModel Gemma-4 forward; a layer
@@ -306,9 +318,15 @@ internal sealed class CudaWeights : IDisposable
         // for A/B perf comparison and as a fallback if a per-row kernel ever
         // misbehaves on a new model.
         bool disablePerRowEmbed = Environment.GetEnvironmentVariable("DOTLLM_DISABLE_EMBED_ROWLOOKUP") == "1";
+        nint tokenEmbedHost = 0;
         if (skipTokenEmbed)
         {
             // Nothing to upload.
+        }
+        else if (hostTokenEmbed && tokenEmbedQt == QuantizationType.F32)
+        {
+            // #1183: 1.15 GiB of VRAM for Flint's F32 table, of which a token reads 8 KiB. llama.cpp keeps it on the host too.
+            tokenEmbedHost = cpuWeights.TokenEmbedWeight;
         }
         else if (!disablePerRowEmbed && kernels.HasEmbeddingLookup(tokenEmbedQt, config.HiddenSize))
         {
@@ -620,7 +638,10 @@ internal sealed class CudaWeights : IDisposable
             outputNorm, outputWeight, cpuWeights.OutputOutputDim, cpuWeights.OutputInputDim,
             outputWeightQuant, cpuWeights.OutputQuantType, allocs,
             mlaLayers, moeLayers, gemma4Layers,
-            ropeYarnInvFreq, ropeYarnMscale);
+            ropeYarnInvFreq, ropeYarnMscale)
+        {
+            TokenEmbedHost = tokenEmbedHost,
+        };
         }
         catch
         {
