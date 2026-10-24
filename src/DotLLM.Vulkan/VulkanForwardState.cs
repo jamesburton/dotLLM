@@ -290,7 +290,8 @@ internal sealed class VulkanForwardState : IDisposable
         // the model's natural K which is already a 32-multiple for Q8_0).
         if (_mmvqEnabled)
         {
-            int maxK = Math.Max(hiddenSize, intermediateSize);
+            // numHeads * headDim: the o_proj input, wider than hidden and the FFN on some models (#1235: synthetic Flint at head_dim 128).
+            int maxK = Math.Max(Math.Max(hiddenSize, intermediateSize), numHeads * headDim);
             if (moeIntermediateSize > 0) maxK = Math.Max(maxK, moeIntermediateSize);
             if (moeSharedIntermediateSize > 0) maxK = Math.Max(maxK, moeSharedIntermediateSize);
             _q8_1MaxK = (maxK + 31) / 32 * 32;

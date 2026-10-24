@@ -586,10 +586,11 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         int tapRows = seqLen - tapFirst;
         if (dflashTaps is not null) EnsureDFlashTapBuffer(tapRows);
 
-        // Any forward moves the model-owned GDN state on, so earlier row snapshots no longer
-        // describe it (issue #473). ForwardWithRecurrentSnapshots re-validates after it returns.
-        if (ReferenceEquals(gdnCache, _gdnCache))
-            _rowSnapshotValidRows = 0;
+        // #1194: the last read-only verify left the model-owned GDN state untouched; its accepted rows (all, unless a rollback said
+        // otherwise) are replayed at the head of this forward's first command buffer. ForwardWithRecurrentSnapshots re-validates after.
+        int commitRows = _pendingCommitRows;
+        _pendingCommitRows = 0;
+        _rowSnapshotValidRows = 0;
 
         UploadPositions(positions);
 
@@ -615,6 +616,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         nint cmdBuf = _submit.CommandBuffer;
         KernelSupport.HostToComputeBarrier(cmdBuf);
         ProfBeginSubmit(cmdBuf);
+        if (commitRows > 0) RecordCommitRows(cmdBuf, commitRows);
         RecordEmbeddingGather(cmdBuf, tokenIds);
         KernelSupport.TransferToComputeBarrier(cmdBuf);
         if (!fuse)
@@ -1134,6 +1136,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
     {
         _gdnCache.Reset();
         _rowSnapshotValidRows = 0;   // issue #473: snapshots no longer describe the state
+        _pendingCommitRows = 0;      // #1194: nor is a read-only verify's commit owed to a state that is gone
     }
 
     /// <inheritdoc/>
@@ -1161,6 +1164,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
     public IDisposable? SnapshotSequencePrefix(IKvCache kvCache, IRecurrentSequenceState? state, int prefixLen)
     {
         if (kvCache is not VulkanNemotronHKvCache kv || state is not VulkanGdnStateCache gdn) return null;
+        if (ReferenceEquals(gdn, _gdnCache)) FlushPendingCommit();
         var kvCopy = kv.SnapshotPrefix(prefixLen);
         return new SequencePrefixSnapshot(kvCopy, gdn.Clone(), prefixLen);
     }
@@ -1172,6 +1176,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             throw new ArgumentException("Snapshot / KV cache / state are not this model's types.");
         kv.RestorePrefixFrom(snap.Kv, snap.Length);
         snap.Gdn.CopyTo(gdn);
+        if (ReferenceEquals(gdn, _gdnCache))
+            _rowSnapshotValidRows = _pendingCommitRows = 0;   // #1194: a pending verify commit belongs to the overwritten state
     }
 
     /// <summary>
@@ -1681,9 +1687,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         var convStateBuf = gdnCache.GetConvStateBuffer(gdnOrdinal);
         var gdnStateBuf = gdnCache.GetGdnStateBuffer(gdnOrdinal);
 
-        // Issue #473: rows whose post-row state this forward records (verify forwards only).
+        // Issue #473/#1194: a read-only verify (every row recorded; the GDN and conv state are left to the commit).
         int snapRows = _rowSnapshotRequestRows > 0 && ReferenceEquals(gdnCache, _gdnCache)
-            ? Math.Min(_rowSnapshotRequestRows, seqLen - 1)
+            ? Math.Min(_rowSnapshotRequestRows, seqLen)
             : 0;
 
         if (!projectionsDone)
@@ -1729,15 +1735,6 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         // Issue #695: for real prefills (>= 8 rows) one fused pass reads the conv state and the qkv rows directly (no [state | qkv]
         // concatenation copy), applies SiLU, and writes GdnConvInput; the new conv state is the last (dConv-1) qkv rows. Bit-identical to the
         // copy + conv + SiLU chain below, which short forwards (decode, verify) and DOTLLM_VK_GDN_CONV_FUSED=0 keep.
-        if (snapRows > 0)
-        {
-            // Issue #1194: the state before this verify, kept once (no compute has touched this layer's GDN state in this forward yet).
-            KernelSupport.ComputeToTransferBarrier(cmdBuf);
-            long stateBytes = (long)_gdnCache.GdnStateElements * sizeof(float);
-            RecordCopyBufferRange(cmdBuf, gdnStateBuf, _rowBase!, srcOffset: 0, dstOffset: (ulong)(gdnOrdinal * stateBytes), size: (ulong)stateBytes);
-            KernelSupport.TransferToComputeBarrier(cmdBuf);
-        }
-
         var convOut = _state.GdnQkvBuf;
         if (_kernels.GdnConvSilu is { } fusedConv && seqLen >= 8 && dConv >= 2 && dConv <= GdnConvSiluF32Kernel.MaxConvWidth && snapRows == 0)
         {
@@ -1779,8 +1776,11 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             {
                 KernelSupport.ComputeToTransferBarrier(cmdBuf);
                 ulong saveSrc = (ulong)((long)seqLen * convDimBytes);
-                RecordCopyBufferRange(cmdBuf, _state.GdnConvInput, convStateBuf,
-                    srcOffset: saveSrc, dstOffset: 0, size: (ulong)convStateBytes);
+                if (snapRows == 0)   // a read-only verify leaves the conv state to the commit
+                {
+                    RecordCopyBufferRange(cmdBuf, _state.GdnConvInput, convStateBuf,
+                        srcOffset: saveSrc, dstOffset: 0, size: (ulong)convStateBytes);
+                }
                 // Issue #473/#1194: the conv window after row t is ConvInput rows t+1 .. t+dConv-1, so all of them lie in rows
                 // 1 .. snapRows+dConv-2: one copy.
                 if (snapRows > 0)
@@ -1829,7 +1829,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         // ── 5. GDN scan — single multi-token dispatch ────────────────────────
         if (snapRows > 0)
         {
-            // Issue #1194: record the scan inputs of the rows a restore may replay.
+            // Issue #1194: record the scan inputs the commit replays into the untouched live state.
             KernelSupport.ComputeToTransferBarrier(cmdBuf);
             RecordRowRecs(cmdBuf, gdnOrdinal, snapRows, toRecord: true);
             KernelSupport.TransferToComputeBarrier(cmdBuf);
@@ -1839,7 +1839,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             q: _state.GdnQBuf, k: _state.GdnKBuf, v: _state.GdnVBuf,
             g: _state.GdnAlphaBuf, beta: _state.GdnBetaBuf,
             output: _state.GdnOut,
-            seqLen: seqLen, nVHead: nVHead, nKHead: nKHead, dState: dState);
+            seqLen: seqLen, nVHead: nVHead, nKHead: nKHead, dState: dState, writeState: snapRows == 0);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.GdnScanCore);   // #445 sub-bucket
         ProfNote("gdn_scan_multitoken", m: nVHead, k: dState, n: seqLen);
@@ -2088,6 +2088,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
     /// </remarks>
     public object? CheckpointRecurrentState()
     {
+        FlushPendingCommit();
         VulkanGdnStateCache snapshot = Interlocked.Exchange(ref _spareGdnCheckpoint, null)
             ?? _gdnCache.CloneGeometry();
         _gdnCache.CopyTo(snapshot);
@@ -2103,11 +2104,11 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
                 return;
             case PooledGdnCheckpoint pooled:
                 pooled.Snapshot.CopyTo(_gdnCache);
-                _rowSnapshotValidRows = 0;   // issue #473
+                _rowSnapshotValidRows = _pendingCommitRows = 0;   // issue #473 / #1194
                 return;
             case VulkanGdnStateCache snapshot:
                 snapshot.CopyTo(_gdnCache);
-                _rowSnapshotValidRows = 0;   // issue #473
+                _rowSnapshotValidRows = _pendingCommitRows = 0;   // issue #473 / #1194
                 return;
             default:
                 throw new ArgumentException(
@@ -2143,35 +2144,38 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
 
     /// <summary>IQ1/IQ2/IQ3 prefill: dequantise to F16 scratch + F16 coopmat GEMM (#621). Null when disabled or unsupported.</summary>
     private IqF16PrefillMatmul? _iqF16Prefill;
-    // Issue #1194: NOT a full F32 GDN state per row (~144 MiB each on Bonsai 2 27B). _rowBase holds every layer's state as it stood
-    // before the verify ([layer][NVHead*DState^2]); _rowRec the scan inputs of the recorded rows ([layer][q | k | v | g | beta][row]);
-    // _rowSnapConv the ConvInput rows every row's conv window lies in ([layer][rows + dConv - 2][convDim]). One buffer each.
-    private VulkanDevice.Buffer? _rowBase;
+    // Issue #1194: no copy of the GDN state at all. The verify's scan reads the live state and never writes it (nor the conv state);
+    // _rowRec keeps the scan inputs of every verify row ([layer][q | k | v | g | beta][row]) and _rowSnapConv the ConvInput rows every
+    // row's conv window lies in ([layer][rows + dConv - 2][convDim]). The accepted rows are replayed into the live state in place, at
+    // the head of the next forward's command buffer (no extra submit).
     private VulkanDevice.Buffer? _rowRec;
     private VulkanDevice.Buffer? _rowSnapConv;
     private int _rowSnapCapacity;
     private int _rowSnapshotRequestRows;   // > 0 only while ForwardWithRecurrentSnapshots runs
-    private int _rowSnapshotValidRows;     // rows the last such forward recorded; 0 = none
+    private int _rowSnapshotValidRows;     // rows the last such forward recorded that a rollback may still pick; 0 = none
+    private int _pendingCommitRows;        // rows of the last read-only verify still to replay into the live state; 0 = none
 
     /// <summary>Device bytes currently held by the per-row snapshot scratch (issues #473, #1194).</summary>
     public long RecurrentRowSnapshotBytes => _rowSnapCapacity == 0 ? 0 : RowSnapshotBytes(_rowSnapCapacity).Total;
 
     /// <inheritdoc/>
     /// <remarks>
-    /// The verify forward keeps each layer's GDN state as it stood before the verify (one copy) plus the scan's inputs for each
-    /// recorded row and the conv windows (#1194). A restore to row r copies the pre-verify state back and re-runs the same scan
-    /// dispatch over rows 0..r of the recorded inputs: the scan walks rows in order inside the shader, so the state it leaves is
-    /// bit-identical to the one the verify passed through after row r. Scratch is one GDN state (~144 MiB on Bonsai 2 27B) plus
-    /// ~2 MiB per row, instead of a full state per row.
+    /// Read-only verify (#1194): the verify forward leaves the GDN and conv state untouched and records each row's scan inputs and the
+    /// conv windows. A rollback to row r (or, without one, every row) is replayed into the live state in place by the shipping
+    /// multi-token scan at the head of the next forward, so the state is bit-identical to the one the scan itself would have left. No
+    /// state copy; ~2 MiB per row on Bonsai 2 27B. Needs a scan arm that holds the state in registers or LDS (the default).
     /// </remarks>
-    public bool SupportsRecurrentRowSnapshots => _gdnCache.NumGdnLayers > 0;
+    public bool SupportsRecurrentRowSnapshots => _gdnCache.NumGdnLayers > 0 && _kernels.GdnScanMultiToken.SupportsReadOnly;
 
     /// <inheritdoc/>
     public ITensor ForwardWithRecurrentSnapshots(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                                                  int deviceId, IKvCache? kvCache, IMtpState? mtpState)
     {
-        int rows = Math.Max(tokenIds.Length - 1, 0);
-        // Before Forward opens any command buffer: growing the scratch invalidates descriptor sets.
+        if (!SupportsRecurrentRowSnapshots)
+            throw new NotSupportedException($"{GetType().Name}: the GDN scan arm cannot run read-only (SupportsRecurrentRowSnapshots=false).");
+        int rows = tokenIds.Length;
+        // Before Forward opens any command buffer: growing the scratch invalidates descriptor sets (and frees the pending records).
+        if (rows > _rowSnapCapacity) FlushPendingCommit();
         EnsureRowSnapshotCapacity(rows);
         _rowSnapshotRequestRows = rows;
         ITensor logits;
@@ -2184,52 +2188,62 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             _rowSnapshotRequestRows = 0;
         }
         _rowSnapshotValidRows = rows;
+        _pendingCommitRows = rows;   // every row accepted unless a rollback says otherwise
         return logits;
     }
 
     /// <inheritdoc/>
     public void RestoreRecurrentStateToRow(int row)
     {
-        if (row == _rowSnapshotValidRows && row > 0)
-            return; // the live state IS the state after the last row
         if ((uint)row >= (uint)_rowSnapshotValidRows)
             throw new InvalidOperationException(
                 $"No recurrent snapshot for row {row}: the last ForwardWithRecurrentSnapshots recorded " +
                 $"{_rowSnapshotValidRows} row(s), or a later forward invalidated them.");
+        _pendingCommitRows = row + 1;   // replayed at the next forward's head
+        _rowSnapshotValidRows = 0;
+    }
 
-        long stateBytes = (long)_gdnCache.GdnStateElements * sizeof(float);
+    /// <summary>
+    /// Records the replay of the first <paramref name="rows"/> recorded verify rows into the untouched live state: each GDN layer's conv
+    /// window after row <c>rows - 1</c>, then the shipping multi-token scan over the staged inputs (its output is scratch).
+    /// </summary>
+    private void RecordCommitRows(nint cmdBuf, int rows)
+    {
         long convBytes = (long)_gdnCache.ConvStateElements * sizeof(float);
         int nVHead = _gdn.NVHead, nKHead = _gdn.NKHead, dState = _gdn.DState;
-
-        // One submission for every layer: put the pre-verify state and the row's conv window back, then re-run the verify's scan
-        // dispatch over rows 0..row of the recorded inputs (staged through the forward's own scan buffers; the output is scratch).
-        using var ctx = _device.CreateSubmitContext();
-        ctx.Begin();
-        nint cmdBuf = ctx.CommandBuffer;
-        KernelSupport.ComputeToTransferBarrier(cmdBuf);
-        for (int l = 0; l < _gdnCache.NumGdnLayers; l++)
+        KernelSupport.ComputeTransferFullBarrier(cmdBuf);
+        if (convBytes > 0)
         {
-            RecordCopyBufferRange(cmdBuf, _rowBase!, _gdnCache.GetGdnStateBuffer(l),
-                srcOffset: (ulong)(l * stateBytes), dstOffset: 0, size: (ulong)stateBytes);
-            if (convBytes > 0)
+            for (int l = 0; l < _gdnCache.NumGdnLayers; l++)
                 RecordCopyBufferRange(cmdBuf, _rowSnapConv!, _gdnCache.GetConvStateBuffer(l),
-                    srcOffset: (ulong)RowSnapConvOffset(l, row), dstOffset: 0, size: (ulong)convBytes);
+                    srcOffset: (ulong)RowSnapConvOffset(l, rows - 1), dstOffset: 0, size: (ulong)convBytes);
         }
         for (int l = 0; l < _gdnCache.NumGdnLayers; l++)
         {
             if (l > 0) KernelSupport.ComputeToTransferBarrier(cmdBuf);   // the previous layer's scan has read the staging buffers
-            RecordRowRecs(cmdBuf, l, row + 1, toRecord: false);
+            RecordRowRecs(cmdBuf, l, rows, toRecord: false);
             KernelSupport.TransferToComputeBarrier(cmdBuf);
             _kernels.GdnScanMultiToken.Record(cmdBuf,
                 state: _gdnCache.GetGdnStateBuffer(l),
                 q: _state.GdnQBuf, k: _state.GdnKBuf, v: _state.GdnVBuf,
                 g: _state.GdnAlphaBuf, beta: _state.GdnBetaBuf,
                 output: _state.GdnOut,
-                seqLen: row + 1, nVHead: nVHead, nKHead: nKHead, dState: dState);
+                seqLen: rows, nVHead: nVHead, nKHead: nKHead, dState: dState);
         }
-        KernelSupport.ComputeToComputeBarrier(cmdBuf);
-        ctx.SubmitAndWait();
+        KernelSupport.ComputeTransferFullBarrier(cmdBuf);
+    }
+
+    /// <summary>Runs a pending read-only verify commit in its own submit (for callers that read the state outside a forward).</summary>
+    private void FlushPendingCommit()
+    {
+        if (_pendingCommitRows == 0) return;
+        int rows = _pendingCommitRows;
+        _pendingCommitRows = 0;
         _rowSnapshotValidRows = 0;
+        using var ctx = _device.CreateSubmitContext();
+        ctx.Begin();
+        RecordCommitRows(ctx.CommandBuffer, rows);
+        ctx.SubmitAndWait();
     }
 
     private void EnsureRowSnapshotCapacity(int rows)
@@ -2237,7 +2251,6 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         if (rows <= _rowSnapCapacity) return;
         FreeRowSnapshots();
         var bytes = RowSnapshotBytes(rows);
-        _rowBase = _device.AllocateDeviceLocal(Math.Max(bytes.Base, 4));
         _rowRec = _device.AllocateDeviceLocal(Math.Max(bytes.Rec, 4));
         _rowSnapConv = _device.AllocateDeviceLocal(Math.Max(bytes.Conv, 4));
         _rowSnapCapacity = rows;
@@ -2249,22 +2262,21 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
 
     private void FreeRowSnapshots()
     {
-        _rowBase?.Dispose();
         _rowRec?.Dispose();
         _rowSnapConv?.Dispose();
-        _rowBase = _rowRec = _rowSnapConv = null;
+        _rowRec = _rowSnapConv = null;
         _rowSnapCapacity = 0;
         _rowSnapshotValidRows = 0;
+        _pendingCommitRows = 0;
     }
 
     /// <summary>Device bytes of each snapshot buffer for <paramref name="rows"/> recorded rows.</summary>
-    private (long Base, long Rec, long Conv, long Total) RowSnapshotBytes(int rows)
+    private (long Rec, long Conv, long Total) RowSnapshotBytes(int rows)
     {
         int layers = _gdnCache.NumGdnLayers;
-        long b = (long)layers * _gdnCache.GdnStateElements * sizeof(float);
         long r = (long)layers * rows * RowRecFloatsPerRow * sizeof(float);
         long c = (long)layers * RowSnapConvRows(rows) * RowConvDim * sizeof(float);
-        return (b, r, c, b + r + c);
+        return (r, c, r + c);
     }
 
     private int RowConvDim => (2 * _gdn.NKHead + _gdn.NVHead) * _gdn.DState;

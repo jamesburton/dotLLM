@@ -663,17 +663,10 @@ public static unsafe partial class MatMul
     public static bool Q4PackedAllColumns { get; set; } =
         Environment.GetEnvironmentVariable("DOTLLM_CPU_Q4_PACKED_PREFILL") != "0";
 
-    /// <summary>
-    /// Per-thread override of <see cref="Q4PackedAllColumns"/> (the policy is read on the thread that runs the forward). Lets a
-    /// test build a pre-#1159 F32-activation reference without racing other tests through the process-wide switch.
-    /// </summary>
-    [ThreadStatic]
-    internal static bool? Q4PackedAllColumnsOverride;
-
     /// <summary>True when <paramref name="qt"/> takes the packed path for any column count (see <see cref="Q4PackedAllColumns"/>).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static bool PackedAtAnyN(QuantizationType qt)
-        => (Q4PackedAllColumnsOverride ?? Q4PackedAllColumns) && Avx2.IsSupported && qt is QuantizationType.Q4_0 or QuantizationType.Q4_1;
+        => Q4PackedAllColumns && Avx2.IsSupported && qt is QuantizationType.Q4_0 or QuantizationType.Q4_1;
 
     /// <summary>
     /// True when a GEMM of <paramref name="n"/> columns in <paramref name="qt"/> will take the

@@ -139,35 +139,40 @@ verifies `[lastToken, d1..dK]` through the snapshot forward, skips the checkpoin
 rejection at `accepted` restores row `accepted`. There is no trunk replay. Both the GDN matrix state and
 the conv1d window are restored, the latter from `ConvInput` rows `t+1 .. t+dConv-1`.
 
-**What is stored (#1194).** Not a full GDN state per row: that was `K × layers × NVHead·DState²` F32,
-1047 MiB on Bonsai-2 27B at DFlash K=7, and FP32 storage that scaled with K (#1107 rule 1). The verify
-keeps the state *before* the verify once, plus each row's scan inputs, plus the `ConvInput` rows
-`1 .. K+dConv-2` that every row's conv window lies in. A restore to row `r` replays `r+1` scan steps
-of the recurrence alone (no trunk forward) from the pre-verify state: the same operations on the same
-inputs, so the state is **bit-identical** to the one the verify passed through after row `r`.
+**What is stored (#1194): no state at all.** The verify is **read-only** on the recurrent state, the design #1237 used for
+Nemotron-H. The verify's scan reads the live GDN state and never writes it, and the conv-state save is skipped. Each row's scan
+inputs are recorded, plus the `ConvInput` rows `1 .. S+dConv-2` that every row's conv window lies in. After the decoder decides,
+the accepted rows `0..a` are replayed **into the live state in place**: the conv window after row `a`, then the same recurrence
+over the recorded rows. A full accept replays every row. Without a `RestoreRecurrentStateToRow` call, the next forward, checkpoint or
+prefix capture commits every row. The replay runs the scan's own operations on the same inputs, so the state is **bit-identical**
+to what the writing scan (and so plain decoding) leaves. There is no per-row state copy and no pre-verify copy.
+
+History: per-row F32 states (#473; 1047 MiB on Bonsai-2 27B at DFlash K=7), then one pre-verify copy plus row inputs (174 MiB, PR
+#1231), now row inputs only.
 
 - **Implemented:** dense `qwen35` on all three backends.
-  - CPU `Qwen3HybridDenseTransformerModel`: `GatedDeltaNetScan.Execute` records each row's delta
-    `β(v − Sᵀk)`, and `GatedDeltaNetScan.Replay` rebuilds `S = S·g + k⊗d` (#842, as Qwen4Exp does).
-  - CUDA `CudaQwen3HybridDenseTransformerModel`: `gdn_scan_replay_f32_d128` keeps each state column in
-    registers across the replayed rows, reading the pre-verify state and writing the live one (no restore
-    copy). It is bit-exact against the scan (`GdnScanReplayF32_IsBitIdenticalToTheScan`). The opt-in
-    split4 scan (`DOTLLM_GDN_SCAN_APPROX_SPLIT4`) re-associates, so with it the restore re-runs it.
-  - Vulkan `VulkanQwen3HybridDenseTransformerModel`: the shipping multi-token scan (the same pipeline the
-    verify used) replays the recorded rows. The `_snap` twin kernel is no longer used by this model.
-  - Still a full state per row: the Vulkan `qwen35moe` and Qwen4Exp hosts (`Q4GdnRowSnapshots`, #1188; #1221 ports this).
-    The CPU Qwen4Exp host already replays (#842).
-  - The CUDA checkpoint is pooled (one spare) like the CPU and Vulkan ones (#469).
+  - CPU `Qwen3HybridDenseTransformerModel`: `GatedDeltaNetScan.Execute(readOnlyState: true)` walks the tokens per head in a
+    one-head scratch (`DState²` floats, 64 KiB, pooled) and records each row's delta `β(v − Sᵀk)`.
+    `GatedDeltaNetScan.Replay` commits `S = S·g + k⊗d` in place (#842).
+  - CUDA `CudaQwen3HybridDenseTransformerModel`: `gdn_scan_multi_f32` takes `write_state` (it replaces the unused snapshot output).
+    The commit is `gdn_scan_replay_f32_d128` with the live state as its own source. Each thread owns one column, so in-place is
+    safe. It needs the register scan (`DState` 128). Under the opt-in split4 scan, or another head size,
+    `SupportsRecurrentRowSnapshots` is false and the decoder uses checkpoint + replay.
+  - Vulkan `VulkanQwen3HybridDenseTransformerModel`: the register/LDS scan arms (`rs`, the default, and its `lds_fused` fallback)
+    take a `write_state` push constant. The commit is recorded at the head of the next forward's first command buffer (no extra
+    submit), as the same multi-token dispatch over the staged rows. The global-state A/B arms (`base`, `fused`, `lds*`) cannot run
+    read-only, so they fall back to checkpoint + replay.
+  - Still a full state per row: the Vulkan `qwen35moe` and Qwen4Exp hosts (`Q4GdnRowSnapshots`, #1188; #1221 ports this). Their
+    `rs` / `lds_fused` arms now accept `write_state`. The CPU Qwen4Exp host replays (#842).
 - **Opt-out:** `DOTLLM_MTP_GDN_SNAPSHOTS=0`, or `MtpSpeculativeDecoder.UseRecurrentRowSnapshots`
   in-process. `Replays` and `ReplaysAvoided` count each path.
-- **Memory:** one GDN state (`layers × NVHead·DState²` F32) plus, per row and layer, the scan inputs
-  (CUDA/Vulkan: q, k, v, g, β; CPU: k, g, delta), plus `(K + dConv − 2) × convDim` per layer of conv rows.
-  Grown to the largest K seen and kept. Bonsai-2 27B at K=7: **174 MiB** (was 1047 MiB): 144 MiB of state,
-  13 MiB of inputs, 17 MiB of conv rows.
-- **Cost (Bonsai-2 27B, RTX 3060, K=7, host shared with other jobs):** a restore went from ~1 ms (one
-  copy) to ~3 ms (the replay). The verify no longer writes 7 states, so its snapshot overhead fell from
-  ~17 ms to ~6–9 ms. DFlash decode tok/s is unchanged (medians 20.26 before and 20.36 after over 5
-  interleaved pairs), and every run was token-identical.
+- **Memory:** per row and GDN layer, the replay inputs in decode's own dtype (F32). CUDA: k, v, g, β. Vulkan: q, k, v, g, β (the
+  replay is the shipping scan, which reads q). CPU: k, g, delta. Plus `(S + dConv − 2) × convDim` per layer of conv rows. Grown to
+  the largest verify seen and kept. Bonsai-2 27B at DFlash K=7 (8 rows): **~31 MiB** on CUDA (was 174 MiB): 12 MiB of inputs and
+  19 MiB of conv rows. Vulkan is ~34 MiB, CPU ~31 MiB. Measured on the 3060: peak dedicated VRAM fell by 140–142 MiB at MTP K=3 and
+  DFlash K=5/7.
+- **Cost:** a full accept now replays every row (before, the live state was already right). The replay is one register-resident
+  pass per layer, so it reads and writes the state once. In exchange the verify never writes the state.
   On Strix Vulkan (8060S), DFlash K=7 medians went 20.61 → 21.09 tok/s and MTP K=3 went 33.99 → 35.71 (3 alternated rounds each), all token-identical.
 - **Why not 16-bit snapshots (#1107):** a BF16/F16 snapshot restores a rounded state, so a rejected
   round would leave a different recurrence than plain decode. That breaks greedy token identity, the
@@ -950,8 +955,8 @@ host CPU was shared with other jobs, hence ranges). Every run was token-identica
 | llama.cpp PrismML fork DFlash K=7 | did not fit: card full, 0.38 tok/s | 6.9 | – |
 
 The extra DFlash VRAM was the drafter (1.1 GB) plus the per-row GDN snapshots of a 7-row verify (#473, ~0.9 GB, F32). Since
-#1194 a verify keeps one pre-verify state and the rows' scan inputs instead (1047 → 174 MiB at K=7), so the DFlash rows above
-overstate today's VRAM by ~0.87 GB. On the
+#1194 a verify keeps only the rows' scan inputs (1047 → 174 → ~31 MiB at K=7), so the DFlash rows above
+overstate today's VRAM by ~1.0 GB. On the
 CPU (Strix Halo, Bonsai-2) DFlash breaks even (3.3 vs 3.4 tok/s): an 8-row CPU verify costs ~7× a decode step there.
 
 **Strix Halo (8060S, Vulkan, #1193).** 128 tokens greedy, `DOTLLM_MTP_ADAPTIVE=0`, `DOTLLM_DFLASH_DRAFT=K`, four prompts (code,
@@ -1055,8 +1060,7 @@ too. With a drafter attached the adaptive gate tries speculation first (`MtpGate
 | Anchor ring (F32) | 144 KiB |
 | Tap capture (F16) | `rows × 6 × 4096 × 2 B` |
 
-A follow-up applies the same read-only verify + replay to #1194's GDN path (`qwen35`), which still keeps a pre-verify state copy
-(174 MiB at DFlash K=7) on CPU, CUDA and Vulkan.
+#1194 applies the same read-only verify + replay to the dense `qwen35` GDN path on CPU, CUDA and Vulkan (174 → ~31 MiB at DFlash K=7).
 
 **Measured.** Real Bolt 24GB on CPU (Core Ultra 7 155H), 24 tokens greedy: speculative output identical to plain, ~5.75 tokens/round.
 Strix (Vulkan):
@@ -1096,7 +1100,7 @@ p0 is prose ("The history of the printing press began in"); p1 is code (Python q
 1. Multi-column NVFP4 / IQ2_XXS / Q8_0 GEMVs that decode each weight block once and apply it to every column, keeping each
    column's accumulation order identical to the one-column kernel (so decode stays bit-identical).
 2. The LiLiCorr head and the top-k/softmax on the GPU (no 3.6 MB logits readback).
-3. Read-only verify + replay for #1194's GDN path.
+3. Read-only verify + replay for the Vulkan `qwen35moe` / Qwen4Exp GDN hosts (#1221; #1194 did the dense `qwen35` path).
 
 **Qwen3.8-27B / Bonsai-2 27B.** No LiLiCorr head is published for `qwen35` targets. The head is a cheap re-scorer (~70 MB) trained
 on a frozen DFlash backbone with the target's hidden states, so one could be trained for the z-lab / incoai DFlash2 drafters.

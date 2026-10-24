@@ -170,8 +170,7 @@ public class CudaGdnScanStepF32Tests
     /// Issue #1222: <see cref="CudaKernels.LaunchGdnScanMultiF32"/> runs a whole sequence in one launch
     /// with the state in registers. It must equal the CPU reference over the same sequence exactly —
     /// output for every token and the final state — since it is meant to be a drop-in for the
-    /// per-token loop. nVHead = 3 × nKHead makes the tiled head broadcast (vh % nKHead) matter. The
-    /// per-row snapshots a verify forward asks for (#473) must equal the CPU state after each row.
+    /// per-token loop. nVHead = 3 × nKHead makes the tiled head broadcast (vh % nKHead) matter.
     /// </summary>
     [SkippableTheory]
     [InlineData(48, 16, 1)]   // decode: one token
@@ -203,14 +202,10 @@ public class CudaGdnScanStepF32Tests
         float[] g = Rand(seqLen * nVHead, 0.5, 1);
         float[] beta = Rand(seqLen * nVHead, 0, 1);
 
-        int snapRows = seqLen - 1;
-        long stateElems = (long)nVHead * dState * dState;
-        long snapStride = stateElems + 3 * dState;   // a padded stride, as the real per-layer layout has
-        nint[] bufs = new nint[8];
+        nint[] bufs = new nint[7];
         try
         {
-            float[][] host = [state, q, k, v, g, beta, new float[seqLen * nVHead * dState],
-                new float[Math.Max(1, snapRows) * snapStride]];
+            float[][] host = [state, q, k, v, g, beta, new float[seqLen * nVHead * dState]];
             for (int i = 0; i < host.Length; i++)
             {
                 CudaDriverApi.cuMemAlloc_v2(out bufs[i], (nuint)(host[i].Length * sizeof(float))).ThrowOnError();
@@ -222,25 +217,17 @@ public class CudaGdnScanStepF32Tests
             }
 
             kernels.LaunchGdnScanMultiF32(bufs[0], bufs[1], bufs[2], bufs[3], bufs[4], bufs[5], bufs[6],
-                nVHead, nKHead, seqLen, stream.Handle, bufs[7], snapStride, snapRows);
+                nVHead, nKHead, seqLen, stream.Handle);
             stream.Synchronize();
 
             float[] cpuOut = new float[seqLen * nVHead * dState];
             float[] cpuState = (float[])state.Clone();
-            float[] gpuSnaps = new float[host[7].Length];
-            unsafe
-            {
-                fixed (float* p = gpuSnaps) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, bufs[7], (nuint)(gpuSnaps.Length * sizeof(float))).ThrowOnError();
-            }
             int qkTok = nKHead * dState, vTok = nVHead * dState;
             for (int t = 0; t < seqLen; t++)
             {
                 GatedDeltaNetScan.Execute(cpuState, q.AsSpan(t * qkTok, qkTok), k.AsSpan(t * qkTok, qkTok),
                     v.AsSpan(t * vTok, vTok), g.AsSpan(t * nVHead, nVHead), beta.AsSpan(t * nVHead, nVHead),
                     cpuOut.AsSpan(t * vTok, vTok), nVHead, nKHead, dState, seqLen: 1);
-                if (t < snapRows)
-                    Assert.True(cpuState.AsSpan().SequenceEqual(gpuSnaps.AsSpan((int)(t * snapStride), (int)stateElems)),
-                        $"snapshot after row {t} mismatch");
             }
 
             float[] gpuOut = new float[cpuOut.Length];
@@ -318,6 +305,83 @@ public class CudaGdnScanStepF32Tests
             for (int i = 0; i < actual.Length; i++)
                 if (BitConverter.SingleToInt32Bits(actual[i]) != BitConverter.SingleToInt32Bits(expected[i])) mismatches++;
             Assert.True(mismatches == 0, $"{mismatches} of {actual.Length} state elements differ from the scan");
+            Assert.False(actual.AsSpan().SequenceEqual(oneFewer), "the replay must not equal the state one row earlier");
+        }
+        finally
+        {
+            foreach (nint d in allocs) CudaDriverApi.cuMemFree_v2(d);
+        }
+    }
+
+    /// <summary>
+    /// Issue #1194 read-only verify on CUDA: <see cref="CudaKernels.LaunchGdnScanMultiF32"/> with <c>writeState: false</c> must emit the
+    /// in-place scan's outputs bit for bit and leave the state untouched; <see cref="CudaKernels.LaunchGdnScanReplayF32"/> with the state
+    /// as its own source must then advance it, in place, to exactly the CPU state after rows 0..lastRow (accept nothing, a partial block,
+    /// every row). Bonsai-2's 48/16 heads (tiled broadcast) and a state far from zero. Negative control: one row fewer must differ.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(0)]
+    [InlineData(3)]
+    [InlineData(7)]
+    public void ReadOnlyMultiScan_ThenInPlaceReplay_IsBitIdenticalToTheScan(int lastRow)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+        const int nVHead = 48, nKHead = 16, dState = 128, rows = 8;
+
+        using var ctx = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        using var kernels = new CudaKernels(ptxDir!);
+        Skip.IfNot(kernels.CanGdnScanMultiF32(dState) && kernels.HasGdnScanReplayF32, "PTX predates the #1194 kernels");
+
+        var rng = new Random(1194 + lastRow);
+        float[] Rand(int n, double lo, double hi)
+        {
+            var a = new float[n];
+            for (int i = 0; i < n; i++) a[i] = (float)(lo + rng.NextDouble() * (hi - lo));
+            return a;
+        }
+        float[] state0 = Rand(nVHead * dState * dState, -2, 2);
+        float[] q = Rand(rows * nKHead * dState, -1, 1), k = Rand(rows * nKHead * dState, -1, 1);
+        GatedDeltaNetScan.L2NormalizeHeads(q, dState);
+        GatedDeltaNetScan.L2NormalizeHeads(k, dState);
+        float[] v = Rand(rows * nVHead * dState, -3, 3), g = Rand(rows * nVHead, 0.5, 1), beta = Rand(rows * nVHead, 0.1, 1);
+
+        float[] fullOut = new float[rows * nVHead * dState];
+        GatedDeltaNetScan.Execute((float[])state0.Clone(), q, k, v, g, beta, fullOut, nVHead, nKHead, dState, rows);
+        float[] expected = (float[])state0.Clone();
+        GatedDeltaNetScan.Execute(expected, q, k, v, g, beta, new float[rows * nVHead * dState], nVHead, nKHead, dState, lastRow + 1);
+        float[] oneFewer = (float[])state0.Clone();
+        GatedDeltaNetScan.Execute(oneFewer, q, k, v, g, beta, new float[rows * nVHead * dState], nVHead, nKHead, dState, lastRow);
+
+        var allocs = new List<nint>();
+        nint Upload(float[] a)
+        {
+            CudaDriverApi.cuMemAlloc_v2(out nint d, (nuint)(a.Length * sizeof(float))).ThrowOnError();
+            allocs.Add(d);
+            unsafe { fixed (float* p = a) CudaDriverApi.cuMemcpyHtoD_v2(d, (nint)p, (nuint)(a.Length * sizeof(float))).ThrowOnError(); }
+            return d;
+        }
+        float[] Download(nint d, int n)
+        {
+            float[] a = new float[n];
+            unsafe { fixed (float* p = a) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, d, (nuint)(n * sizeof(float))).ThrowOnError(); }
+            return a;
+        }
+        try
+        {
+            nint dS = Upload(state0), dK = Upload(k), dV = Upload(v), dG = Upload(g), dB = Upload(beta);
+            nint dOut = Upload(new float[fullOut.Length]);
+            kernels.LaunchGdnScanMultiF32(dS, Upload(q), dK, dV, dG, dB, dOut, nVHead, nKHead, rows, stream.Handle, writeState: false);
+            stream.Synchronize();
+            Assert.True(Download(dS, state0.Length).AsSpan().SequenceEqual(state0), "a read-only scan wrote the state");
+            Assert.True(Download(dOut, fullOut.Length).AsSpan().SequenceEqual(fullOut), "read-only outputs differ from the scan");
+
+            kernels.LaunchGdnScanReplayF32(dS, dS, dK, dV, dG, dB, lastRow + 1, nVHead, nKHead, dState, stream.Handle);
+            stream.Synchronize();
+            float[] actual = Download(dS, state0.Length);
+            Assert.True(actual.AsSpan().SequenceEqual(expected), $"in-place replay of {lastRow + 1} row(s) differs from the scan");
             Assert.False(actual.AsSpan().SequenceEqual(oneFewer), "the replay must not equal the state one row earlier");
         }
         finally
