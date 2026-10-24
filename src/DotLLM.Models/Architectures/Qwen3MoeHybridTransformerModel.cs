@@ -22,7 +22,7 @@ namespace DotLLM.Models.Architectures;
 /// Full-attention layers occur every <see cref="GatedDeltaNetConfig.FullAttnInterval"/> steps
 /// (1-indexed), e.g. layers 4, 8, 12, … 40 for interval=4.
 /// </summary>
-public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
+public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel
 {
     private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
     private const int Q8_0GroupSize = QuantFormat.LegacyGroupSize;
@@ -232,6 +232,9 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
         var ropeSin = new float[config.MaxSequenceLength * halfRope];
         RoPE.PrecomputeFrequencyTable(config.MaxSequenceLength, ropeDim, ropeTheta, ropeCos, ropeSin);
 
+        // MTP head (#1188): null unless the file declares nextn_predict_layers and carries blk.{NumLayers}.nextn.*.
+        var mtpHead = LoadMtpHeadIfPresent(dataBase, tensors, config, owned);
+
         ComputeThreadPool? pool = CreatePool(threading);
 
         return new Qwen3MoeHybridTransformerModel(
@@ -240,7 +243,10 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
             outputPtr, outputQt, outputM, outputK,
             kvSlotForLayer, attentionLayerCount,
             ropeCos, ropeSin, ropeDim,
-            pool, ownsPool: pool is not null);
+            pool, ownsPool: pool is not null)
+        {
+            _mtpHead = mtpHead,
+        };
     }
 
     private static ComputeThreadPool? CreatePool(ThreadingConfig threading)
@@ -342,7 +348,7 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
     /// decoders and wires them into the SAME <see cref="Qwen3MoeLayerWeights"/> /
     /// <see cref="GdnTokenMixingWeights"/> / <see cref="Qwen3FullAttnWeights"/> /
     /// <see cref="MoeLayerWeights"/> shapes <see cref="LoadFromGguf(GgufFile, ModelConfig)"/>
-    /// populates — the forward pass (<see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, IGdnState?)"/>)
+    /// populates — the forward pass (<see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, IGdnState?, IMtpState?)"/>)
     /// is completely unmodified; this method is a loader-only addition.
     /// </summary>
     /// <remarks>
@@ -989,9 +995,13 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
     /// Optional per-seq GDN recurrent state container. Must be a
     /// <see cref="GdnStateCache"/> sized for this model's GDN-layer count.
     /// </param>
+    /// <param name="mtpState">
+    /// Optional MTP state (#1188): when a <see cref="CpuMtpState"/> on a model with a head, the post-final-norm rows are captured and the
+    /// batch is absorbed into the head's KV. Logits are unaffected.
+    /// </param>
     [SkipLocalsInit]
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
-                           int deviceId, IKvCache? kvCache, IGdnState? gdnState)
+                           int deviceId, IKvCache? kvCache, IGdnState? gdnState, IMtpState? mtpState = null)
     {
         // Resolve the GDN state: caller-supplied container preferred, model-owned
         // fallback for the single-seq Forward callers that pre-date the per-seq API.
@@ -1142,6 +1152,10 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
         new Span<float>(logits, seqLen * vocabSize).CopyTo(
             new Span<float>((void*)result.DataPointer, seqLen * vocabSize));
 
+        // hidden still holds the post-final-norm rows (llama.cpp's h_nextn) the MTP head pairs with.
+        if (_mtpHead is not null && mtpState is CpuMtpState mtp)
+            CaptureAndAbsorbMtp(mtp, hidden, tokenIds, positions);
+
         return result;
     }
 
@@ -1163,7 +1177,7 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
     public IRecurrentSequenceState? CreateSequenceState() => new GdnStateCache(_gdn, _gdnCache.NumGdnLayers);
 
     /// <summary>
-    /// Per-sequence loop over <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, IGdnState?)"/>
+    /// Per-sequence loop over <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, IGdnState?, IMtpState?)"/>
     /// — threads each request's GDN state through to the GDN scan, so multi-seq batched
     /// dispatch is safe as long as every request supplies a fresh
     /// <see cref="GdnStateCache"/>. The default <see cref="IModel.ForwardBatch"/> would

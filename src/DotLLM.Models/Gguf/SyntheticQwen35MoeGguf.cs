@@ -25,7 +25,7 @@ namespace DotLLM.Models.Gguf;
 public static class SyntheticQwen35MoeGguf
 {
     // Compact but architecturally valid shapes (mirrors the CPU unit-test fixture dims).
-    private const int VocabSize = 8;
+    internal const int VocabSize = 8;
     private const int HiddenSize = 32;
     private const int NumAttentionHeads = 2;
     private const int NumKvHeads = 1;          // GQA repeat factor = 2
@@ -36,7 +36,7 @@ public static class SyntheticQwen35MoeGguf
     private const int SharedIntermediate = 16;
     private const int NumExperts = 4;
     private const int NumExpertsPerTok = 2;
-    private const int BlockCount = 2;          // layer 0 GDN, layer 1 full-attn
+    internal const int BlockCount = 2;          // layer 0 GDN, layer 1 full-attn
     private const int FullAttnInterval = 2;    // (i+1) % 2 == 0 → layer 1 is attention
 
     // GDN config ({arch}.ssm.* keys, qwen35moe semantics).
@@ -47,7 +47,14 @@ public static class SyntheticQwen35MoeGguf
     private const int DInner = NVHead * DState; // ssm.inner_size
 
     /// <summary>Builds the synthetic <c>qwen35moe</c> fixture to a byte array.</summary>
-    public static byte[] Build(uint seed = 0xC0FFEEu)
+    /// <param name="seed">Xorshift PRNG seed.</param>
+    /// <param name="withMtp">
+    /// Issue #1188: append one MTP block at raw index <see cref="BlockCount"/> (gated full attention + the MoE FFN with its gated shared
+    /// expert + <c>nextn.{eh_proj,enorm,hnorm}</c>) and set <c>nextn_predict_layers = 1</c>, as ggml-org's Qwen3.6-35B-A3B-MTP-GGUF does. The
+    /// trunk is drawn first, so the trunk weights equal the <see langword="false"/> fixture's for the same seed.
+    /// </param>
+    /// <param name="contextLength">Overrides the context length (8); speculative-decode tests need room for several rounds.</param>
+    public static byte[] Build(uint seed = 0xC0FFEEu, bool withMtp = false, int contextLength = ContextLength)
     {
         var w = new GgufWriter();
         var rng = new SyntheticGemma4Gguf.Xorshift(seed);
@@ -58,9 +65,11 @@ public static class SyntheticQwen35MoeGguf
         w.AddString("general.name", "synthetic-qwen35moe-tiny");
         w.AddUInt32("general.alignment", 32);
 
-        w.AddUInt32($"{arch}.context_length", ContextLength);
+        w.AddUInt32($"{arch}.context_length", (uint)contextLength);
         w.AddUInt32($"{arch}.embedding_length", HiddenSize);
-        w.AddUInt32($"{arch}.block_count", BlockCount);
+        w.AddUInt32($"{arch}.block_count", (uint)(withMtp ? BlockCount + 1 : BlockCount));
+        if (withMtp)
+            w.AddUInt32($"{arch}.nextn_predict_layers", 1);
         w.AddUInt32($"{arch}.attention.head_count", NumAttentionHeads);
         w.AddUInt32($"{arch}.attention.head_count_kv", NumKvHeads);
         w.AddUInt32($"{arch}.attention.key_length", HeadDim);
@@ -109,13 +118,30 @@ public static class SyntheticQwen35MoeGguf
             AddMoeLayer(w, rng, p);
         }
 
+        if (withMtp)
+        {
+            string mp = $"blk.{BlockCount}";
+            AddNorm(w, rng, $"{mp}.attn_norm.weight", HiddenSize);
+            AddNorm(w, rng, $"{mp}.post_attention_norm.weight", HiddenSize);
+            AddFullAttnLayer(w, rng, mp);
+            AddMoeLayer(w, rng, mp);
+            AddMatrixF32(w, rng, $"{mp}.nextn.eh_proj.weight", inK: 2 * HiddenSize, outM: HiddenSize, 0.05f);
+            AddNorm(w, rng, $"{mp}.nextn.enorm.weight", HiddenSize);
+            AddNorm(w, rng, $"{mp}.nextn.hnorm.weight", HiddenSize);
+            AddNorm(w, rng, $"{mp}.nextn.shared_head_norm.weight", HiddenSize);
+        }
+
         return w.Build();
     }
 
     /// <summary>Writes the synthetic <c>qwen35moe</c> fixture to <paramref name="path"/>.</summary>
-    public static string Write(string path, uint seed = 0xC0FFEEu)
+    /// <param name="path">Destination file.</param>
+    /// <param name="seed">Xorshift PRNG seed.</param>
+    /// <param name="withMtp">See <see cref="Build"/>.</param>
+    /// <param name="contextLength">See <see cref="Build"/>.</param>
+    public static string Write(string path, uint seed = 0xC0FFEEu, bool withMtp = false, int contextLength = ContextLength)
     {
-        File.WriteAllBytes(path, Build(seed));
+        File.WriteAllBytes(path, Build(seed, withMtp, contextLength));
         return path;
     }
 

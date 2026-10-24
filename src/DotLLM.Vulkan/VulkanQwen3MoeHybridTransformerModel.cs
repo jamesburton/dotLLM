@@ -398,6 +398,9 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             kvSlotForLayer, attentionLayerCount, gdnLayerOrdinal,
             ropeDim, ropeTheta, ResolveNCpuMoeLayers(nCpuMoeLayers));
         model._iqF16Prefill = CreateIqF16Prefill(device, spvDir, config, kernels);
+        model.UploadMtpHeadIfPresent();   // #1188: null without a head (or without resident MoE)
+        if (gdnOrdinal > 0 && gdn.DState <= 128 && GdnScanMultiTokenSnapshotF32Kernel.IsAvailable(spvDir))
+            model._rowSnapScan = GdnScanMultiTokenSnapshotF32Kernel.Create(device, spvDir);
         return model;
     }
 
@@ -677,7 +680,24 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     /// </param>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
                            IKvCache? kvCache, IGdnState? gdnState)
+        => Forward(tokenIds, positions, deviceId, kvCache, gdnState, mtpState: null);
+
+    /// <summary>
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, IGdnState?)"/> that also feeds the MTP head (#1188) when
+    /// <paramref name="mtpState"/> is a <see cref="VulkanMtpState"/> on a model with a head: captures the post-final-norm rows and absorbs the
+    /// batch into the head's KV. Logits are unaffected.
+    /// </summary>
+    /// <param name="tokenIds">Input token IDs.</param>
+    /// <param name="positions">Position of each token.</param>
+    /// <param name="deviceId">Ignored (logits are returned on the host).</param>
+    /// <param name="kvCache">Trunk KV cache.</param>
+    /// <param name="gdnState">Per-sequence GDN state, or null for the model-owned one.</param>
+    /// <param name="mtpState">The sequence's MTP state, or null.</param>
+    /// <returns>Logits, one row per input position for a short batch (see <see cref="MaxAllRowLogitsSeqLen"/>), else the last row.</returns>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                           IKvCache? kvCache, IGdnState? gdnState, IMtpState? mtpState)
     {
+        var mtpCapture = _mtpHead is not null ? mtpState as VulkanMtpState : null;
         // Resolve per-seq GDN state container; model-owned _gdnCache is the
         // backwards-compat fallback for single-seq Forward callers.
         VulkanGdnStateCache gdnCache;
@@ -705,6 +725,10 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         int seqLen = tokenIds.Length;
         if (seqLen == 0) throw new ArgumentException("tokenIds must be non-empty.", nameof(tokenIds));
 
+        // Any other forward moves the model-owned GDN state on, so earlier row snapshots no longer describe it (#1188).
+        if (ReferenceEquals(gdnCache, _gdnCache) && _rowSnaps is not { Rows: > 0 })
+            _rowSnapValid = 0;
+
         int hiddenSize = Config.HiddenSize;
         int vocabSize = Config.VocabSize;
         int numHeads = Config.NumAttentionHeads;
@@ -722,6 +746,11 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         bool resized = _state.EnsureCapacity(seqLen);
         if (resized) { _kernels.InvalidateAll(); _iqF16Prefill?.InvalidateDescriptorCache(); }
 
+        // Rows the LM head covers (#1188): every row of a short batch (a speculative verify is K+1 rows and is indexed row by row), the last
+        // row of a long prefill. Resolved before any recording: growing the buffer invalidates the descriptor caches.
+        int headRows = seqLen <= MaxAllRowLogitsSeqLen ? seqLen : 1;
+        var logitsBuf = headRows == 1 ? _state.Logits : EnsureMultiRowLogits(headRows, vocabSize);
+
         UploadPositions(positions);
 
         var kinds = _layout.LayerKind;
@@ -730,7 +759,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         long profT0 = profActive ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
         // Single-token decode with resident fast-path banks in every layer: the whole forward is ONE command buffer (see ForwardDecodeFused).
-        if (seqLen == 1 && FuseDecodeEnabled && CanFuseMoeDecode(hiddenSize))
+        if (seqLen == 1 && mtpCapture is null && FuseDecodeEnabled && CanFuseMoeDecode(hiddenSize))
             return ForwardDecodeFused(tokenIds, positions, gdnCache, kvCache, kinds, hiddenSize, vocabSize, numHeads, numKvHeads, headDim, eps);
 
         // ── 1. Token embedding (single submission) ────────────────────────────
@@ -777,24 +806,27 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             if (profActive) { _profMoeMs += ProfElapsedMs(ref profT0); }
         }
 
-        // ── 3. Final norm + LM head (single submission, last token only) ──────
+        if (mtpCapture is not null)
+            CaptureMtpRows(mtpCapture, seqLen);
+
+        // ── 3. Final norm + LM head (single submission, headRows trailing rows) ─
         _submit.Begin();
         cmdBuf = _submit.CommandBuffer;
         KernelSupport.HostToComputeBarrier(cmdBuf);
 
         long rowBytes = (long)hiddenSize * sizeof(float);
-        long lastRowOffset = (long)(seqLen - 1) * rowBytes;
+        long headSrcOffset = (long)(seqLen - headRows) * rowBytes;
         RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.NormOutput,
-            srcOffset: (ulong)lastRowOffset, dstOffset: 0, size: (ulong)rowBytes);
+            srcOffset: (ulong)headSrcOffset, dstOffset: 0, size: (ulong)(headRows * rowBytes));
         KernelSupport.TransferToComputeBarrier(cmdBuf);
 
         _kernels.RmsNorm.Record(cmdBuf, _state.NormOutput, _weights.OutputNormWeight, _state.NormOutput,
-            rowCount: 1, n: hiddenSize, eps: eps);
+            rowCount: headRows, n: hiddenSize, eps: eps);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType,
-            _state.NormOutput, _state.Logits,
-            outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: 1);
+            _state.NormOutput, logitsBuf,
+            outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: headRows);
         KernelSupport.ComputeToHostBarrier(cmdBuf);
         _submit.SubmitAndWait();
         if (profActive)
@@ -816,13 +848,15 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         }
 
         // ── 4. Download logits ─────────────────────────────────────────────────
-        var shape = new TensorShape(1, vocabSize);
+        var shape = new TensorShape(headRows, vocabSize);
         var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
         unsafe
         {
-            var dest = new Span<float>((void*)result.DataPointer, vocabSize);
-            _device.Download(_state.Logits, dest);
+            var dest = new Span<float>((void*)result.DataPointer, headRows * vocabSize);
+            _device.Download(logitsBuf, dest);
         }
+        if (mtpCapture is not null)
+            AbsorbMtp(mtpCapture, tokenIds, positions);
         return result;
     }
 
@@ -1381,7 +1415,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
 
         if (kinds[layer] == HybridLayerKind.GatedDeltaNet)
         {
-            RecordGdnLayer(cmdBuf, layer, layerBuf.Gdn!.Value, seqLen, eps, gdnCache);
+            RecordGdnLayer(cmdBuf, layer, layerBuf.Gdn!.Value, seqLen, eps, gdnCache,
+                snap: _rowSnaps is { Rows: > 0 } rs && ReferenceEquals(gdnCache, _gdnCache) ? rs : null);   // #1188 verify row snapshots
         }
         else
         {
@@ -2996,6 +3031,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     /// <inheritdoc/>
     public void Dispose()
     {
+        CloseCheckpoints();
+        DisposeMtp();
         _submit.Dispose();
         // Resident MoE bundles outlive single forwards in the default mode;
         // free them here before kernels and the device go away.

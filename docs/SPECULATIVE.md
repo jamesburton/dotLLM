@@ -893,3 +893,30 @@ CPU drafter pool (default half the logical processors); `DOTLLM_DFLASH_TRACE=1` 
 
 **Not yet.** A GPU-resident drafter; tree (DDTree) verification; reduced-vocab (`d2t`), DSpark and LiliCorr drafters;
 sampled-selector proposals (llama.cpp's DFlash2 sampled mode).
+
+### `qwen35moe` MTP head (issue #1188)
+
+Qwen3.6-35B-A3B ships its MTP block embedded (`blk.40`, `nextn_predict_layers = 1`; `ggml-org/Qwen3.6-35B-A3B-MTP-GGUF`,
+`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`). The head is the dense `qwen35` head with the trunk's MoE FFN (llama.cpp `qwen35moe.cpp` `graph_mtp`):
+`eh_proj([enorm(embed) ; hnorm(h)])` -> gated attention over the head's own KV -> `post_attention_norm` -> routed top-k + sigmoid-gated shared
+expert -> `nextn.shared_head_norm` -> the trunk's LM head. Absorb computes K/V only, so the experts run on draft steps only.
+
+- **CPU oracle** (`Qwen3MoeHybridTransformerModel.Mtp.cs`): head loader, capture/absorb, `ForwardMtp`, and the pooled GDN checkpoint pair the
+  MoE hybrid lacked. Synthetic tests: trunk logits unchanged by capture/absorb, absorb K/V == the draft step's, checkpoint/restore
+  discriminates, greedy speculation == plain greedy at K = 1/3/5. Real UD-Q4_K_M on the Strix CPU: identical output (64 tokens); 6.65 vs
+  10.17 tok/s (the CPU MoE verify reads K+1 rows' experts and replays on rejection; the adaptive gate keeps CPU on plain decode by its size prior).
+- **Vulkan** (`VulkanQwen3MoeHybridTransformerModel`): GDN checkpoint pair, per-row recurrent snapshots (the qwen4exp host's snapshot scan;
+  removed a ~30 ms replay from every partial rejection), every-row logits for batches of up to 16 rows, and the head (resident routed banks,
+  one submit per draft step, ~2.5 ms). Drafts match the CPU oracle (argmax exact) and speculation equals plain greedy on the synthetic fixture.
+  **Opt-in (`DOTLLM_VK_QWEN35MOE_MTP=1`)**: measured on Strix (UD-Q4_K_M, 4 prompts x 128 tokens) it is neither exact nor a clear win yet:
+
+| arm | decode tok/s (mean of 4) | x plain | peak private / GPU shared |
+|---|---|---|---|
+| dotLLM plain | 50.7 | 1.00 | 24.6 / 23.2 GB |
+| dotLLM MTP K=2 / 3 / 4 | 49.0 / 52.1 / 55.1 | 0.97 / 1.03 / 1.09 | 24.7-24.8 / 23.3-23.4 GB |
+| llama.cpp `0ae0e1976` plain | 57.5 | 1.00 | 22.6 / 21.2 GB |
+| llama.cpp MTP K=2 / 3 / 4 | 72.2 / 84.2 / 64.6 | 1.26 / 1.46 / 1.12 | 23.8-24.0 / 22.0-22.1 GB |
+
+  Round anatomy (K=3, with snapshots): draft 7.5 ms, verify 38 ms (4 rows; 20 ms for 1), a fully accepted round ~47 ms for 4 tokens. Greedy
+  output equalled plain decode on 2 of 12 runs (llama.cpp: 1 of 4 at K=3): the multi-row routed-MoE / Q8_1 kernels are not bit-identical to the
+  fused single-token decode chain, so near-ties resolve differently. Making the verify exact and cheaper is the follow-up.
