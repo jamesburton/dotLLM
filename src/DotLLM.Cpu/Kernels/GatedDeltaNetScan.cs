@@ -82,6 +82,10 @@ public static class GatedDeltaNetScan
     /// <see cref="Replay"/> needs to rebuild the state after any of those tokens from the state BEFORE the chunk, instead of storing
     /// a full state per row. Independent of <paramref name="rowSnapshots"/>.
     /// </param>
+    /// <param name="readOnlyState">
+    /// Optional (#1194 read-only speculative verify): emit the outputs (and deltas) but leave <paramref name="state"/> untouched; the
+    /// evolving state lives in a one-head scratch. Bit-identical outputs. Not combinable with <paramref name="rowSnapshots"/>.
+    /// </param>
     [SkipLocalsInit]
     public static void Execute(
         Span<float> state,
@@ -98,7 +102,8 @@ public static class GatedDeltaNetScan
         Span<float> rowSnapshots = default,
         int snapshotRows = 0,
         ReadOnlySpan<float> stateSource = default,
-        Span<float> deltaRecord = default)
+        Span<float> deltaRecord = default,
+        bool readOnlyState = false)
     {
         if (nVHead <= 0) throw new ArgumentOutOfRangeException(nameof(nVHead));
         if (nKHead <= 0) throw new ArgumentOutOfRangeException(nameof(nKHead));
@@ -148,88 +153,52 @@ public static class GatedDeltaNetScan
             throw new ArgumentException("stateSource too small.", nameof(stateSource));
         if (seqLen == 0)
         {
-            if (fromSource) stateSource.Slice(0, stateLen).CopyTo(state);
+            if (fromSource && !readOnlyState) stateSource.Slice(0, stateLen).CopyTo(state);
             return;
         }
+
+        if (readOnlyState && recordStates)
+            throw new ArgumentException("A read-only scan cannot record whole-state row snapshots.", nameof(rowSnapshots));
 
         // Temporary [DState] buffer reused across all (t, vh) iterations.
         // First used for "retrieved" (S.T @ k), then overwritten with delta (β*(v-r)).
         float[] tmpBuf = ArrayPool<float>.Shared.Rent(dState);
         try
         {
+            Span<float> tmp = tmpBuf.AsSpan(0, dState);
+            if (readOnlyState)
+            {
+                // #1194: heads are independent, so walking the tokens per head runs the same operations on the same values; the
+                // evolving head state lives in one [DState, DState] scratch (64 KiB at DState 128) and the caller's state is only read.
+                float[] headBuf = ArrayPool<float>.Shared.Rent(statePerHead);
+                try
+                {
+                    Span<float> head = headBuf.AsSpan(0, statePerHead);
+                    ReadOnlySpan<float> initial = fromSource ? stateSource : state;
+                    for (int vh = 0; vh < nVHead; vh++)
+                    {
+                        ReadOnlySpan<float> from = initial.Slice(vh * statePerHead, statePerHead);
+                        for (int t = 0; t < seqLen; t++)
+                        {
+                            StepHead(head, t == 0 ? from : default, q, k, v, g, beta, output, tmp, deltaRecord,
+                                t, vh, nVHead, nKHead, dState, recordDeltas && t < snapshotRows);
+                        }
+                    }
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(headBuf);
+                }
+                return;
+            }
+
             for (int t = 0; t < seqLen; t++)
             {
-                int qkOff = t * qkPerToken;
-                int vOff = t * vPerToken;
-                int gbOff = t * nVHead;
-
                 for (int vh = 0; vh < nVHead; vh++)
                 {
-                    int kh = vh % nKHead;
-
-                    ReadOnlySpan<float> qHead = q.Slice(qkOff + kh * dState, dState);
-                    ReadOnlySpan<float> kHead = k.Slice(qkOff + kh * dState, dState);
-                    ReadOnlySpan<float> vHead = v.Slice(vOff + vh * dState, dState);
-                    float gHead = g[gbOff + vh];
-                    float betaHead = beta[gbOff + vh];
-
-                    Span<float> stateHead = state.Slice(vh * statePerHead, statePerHead);
-                    // stateHead[row * dState + col]: row = key dim, col = value dim.
-
-                    // 1. Decay: S_vh *= g_vh  (element-wise scalar on [DState, DState])
-                    if (fromSource && t == 0)
-                    {
-                        ReadOnlySpan<float> srcHead = stateSource.Slice(vh * statePerHead, statePerHead);
-                        for (int i = 0; i < statePerHead; i++)
-                            stateHead[i] = srcHead[i] * gHead;
-                    }
-                    else
-                    {
-                        for (int i = 0; i < statePerHead; i++)
-                            stateHead[i] *= gHead;
-                    }
-
-                    // 2. Retrieve: tmp[col] = Σ_row S[row,col] × k[row]  (= S.T @ k)
-                    //    Row-outer traversal keeps state accesses sequential (cache-friendly).
-                    Span<float> tmp = tmpBuf.AsSpan(0, dState);
-                    tmp.Clear();
-                    for (int row = 0; row < dState; row++)
-                    {
-                        float ki = kHead[row];
-                        int rowBase = row * dState;
-                        for (int col = 0; col < dState; col++)
-                            tmp[col] += stateHead[rowBase + col] * ki;
-                    }
-
-                    // 3. Delta rule write:
-                    //    tmp[col] = β × (v[col] − tmp[col])   // overwrite tmp with delta
-                    //    S[row,col] += k[row] × tmp[col]       // rank-1 update
-                    for (int col = 0; col < dState; col++)
-                        tmp[col] = betaHead * (vHead[col] - tmp[col]);
-                    if (recordDeltas && t < snapshotRows)
-                        tmp.CopyTo(deltaRecord.Slice((t * nVHead + vh) * dState, dState));
-
-                    for (int row = 0; row < dState; row++)
-                    {
-                        float ki = kHead[row];
-                        int rowBase = row * dState;
-                        for (int col = 0; col < dState; col++)
-                            stateHead[rowBase + col] += ki * tmp[col];
-                    }
-
-                    // 4. Read output: out[col] = Σ_row S[row,col] × q[row] / √DState  (= S.T @ q / √d)
-                    Span<float> outHead = output.Slice(vOff + vh * dState, dState);
-                    outHead.Clear();
-                    for (int row = 0; row < dState; row++)
-                    {
-                        float qi = qHead[row];
-                        int rowBase = row * dState;
-                        for (int col = 0; col < dState; col++)
-                            outHead[col] += stateHead[rowBase + col] * qi;
-                    }
-                    float scale = 1f / MathF.Sqrt(dState);
-                    for (int col = 0; col < dState; col++)
-                        outHead[col] *= scale;
+                    ReadOnlySpan<float> from = fromSource && t == 0 ? stateSource.Slice(vh * statePerHead, statePerHead) : default;
+                    StepHead(state.Slice(vh * statePerHead, statePerHead), from, q, k, v, g, beta, output, tmp, deltaRecord,
+                        t, vh, nVHead, nKHead, dState, recordDeltas && t < snapshotRows);
                 }
 
                 if (recordStates && t < snapshotRows)
@@ -240,6 +209,82 @@ public static class GatedDeltaNetScan
         {
             ArrayPool<float>.Shared.Return(tmpBuf);
         }
+    }
+
+    /// <summary>
+    /// One token of one value head: decay (from <paramref name="decaySource"/> when non-empty, else in place), retrieve, delta-rule
+    /// write and read-out. Every caller runs this exact sequence, so a reordered walk over (token, head) stays bit-identical.
+    /// </summary>
+    private static void StepHead(
+        Span<float> stateHead, ReadOnlySpan<float> decaySource,
+        ReadOnlySpan<float> q, ReadOnlySpan<float> k, ReadOnlySpan<float> v, ReadOnlySpan<float> g, ReadOnlySpan<float> beta,
+        Span<float> output, Span<float> tmp, Span<float> deltaRecord,
+        int t, int vh, int nVHead, int nKHead, int dState, bool recordDelta)
+    {
+        int statePerHead = dState * dState;
+        int qkOff = t * nKHead * dState;
+        int vOff = t * nVHead * dState;
+        int kh = vh % nKHead;
+
+        ReadOnlySpan<float> qHead = q.Slice(qkOff + kh * dState, dState);
+        ReadOnlySpan<float> kHead = k.Slice(qkOff + kh * dState, dState);
+        ReadOnlySpan<float> vHead = v.Slice(vOff + vh * dState, dState);
+        float gHead = g[t * nVHead + vh];
+        float betaHead = beta[t * nVHead + vh];
+        // stateHead[row * dState + col]: row = key dim, col = value dim.
+
+        // 1. Decay: S_vh *= g_vh  (element-wise scalar on [DState, DState])
+        if (!decaySource.IsEmpty)
+        {
+            for (int i = 0; i < statePerHead; i++)
+                stateHead[i] = decaySource[i] * gHead;
+        }
+        else
+        {
+            for (int i = 0; i < statePerHead; i++)
+                stateHead[i] *= gHead;
+        }
+
+        // 2. Retrieve: tmp[col] = Σ_row S[row,col] × k[row]  (= S.T @ k)
+        //    Row-outer traversal keeps state accesses sequential (cache-friendly).
+        tmp.Clear();
+        for (int row = 0; row < dState; row++)
+        {
+            float ki = kHead[row];
+            int rowBase = row * dState;
+            for (int col = 0; col < dState; col++)
+                tmp[col] += stateHead[rowBase + col] * ki;
+        }
+
+        // 3. Delta rule write:
+        //    tmp[col] = β × (v[col] − tmp[col])   // overwrite tmp with delta
+        //    S[row,col] += k[row] × tmp[col]       // rank-1 update
+        for (int col = 0; col < dState; col++)
+            tmp[col] = betaHead * (vHead[col] - tmp[col]);
+        if (recordDelta)
+            tmp.CopyTo(deltaRecord.Slice((t * nVHead + vh) * dState, dState));
+
+        for (int row = 0; row < dState; row++)
+        {
+            float ki = kHead[row];
+            int rowBase = row * dState;
+            for (int col = 0; col < dState; col++)
+                stateHead[rowBase + col] += ki * tmp[col];
+        }
+
+        // 4. Read output: out[col] = Σ_row S[row,col] × q[row] / √DState  (= S.T @ q / √d)
+        Span<float> outHead = output.Slice(vOff + vh * dState, dState);
+        outHead.Clear();
+        for (int row = 0; row < dState; row++)
+        {
+            float qi = qHead[row];
+            int rowBase = row * dState;
+            for (int col = 0; col < dState; col++)
+                outHead[col] += stateHead[rowBase + col] * qi;
+        }
+        float scale = 1f / MathF.Sqrt(dState);
+        for (int col = 0; col < dState; col++)
+            outHead[col] *= scale;
     }
 
     /// <summary>

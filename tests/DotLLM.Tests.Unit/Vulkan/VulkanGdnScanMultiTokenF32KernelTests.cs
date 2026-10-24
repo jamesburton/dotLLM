@@ -197,6 +197,68 @@ public class VulkanGdnScanMultiTokenF32KernelTests
         Assert.False(ro.AsSpan().SequenceEqual(bo), "RowSplit output is bit-identical: expected re-association drift (is the shader actually running?)");
     }
 
+    /// <summary>
+    /// Issue #1194 read-only verify: with <c>writeState: false</c> the scan must emit the same outputs as the writing scan and leave the
+    /// state untouched; re-running the same arm in place over rows 0..lastRow of those inputs (the commit) must then leave exactly the
+    /// state the writing scan leaves after those rows: accept nothing, a partial block, every row. Bonsai-2's 48/16 heads, a state far
+    /// from zero, the shipping RowSplit arm and its LdsFused fallback. Negative control: one row fewer must differ.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(GdnScanMultiTokenF32Kernel.Variant.RowSplit, 0)]
+    [InlineData(GdnScanMultiTokenF32Kernel.Variant.RowSplit, 3)]
+    [InlineData(GdnScanMultiTokenF32Kernel.Variant.RowSplit, 7)]
+    [InlineData(GdnScanMultiTokenF32Kernel.Variant.LdsFused, 3)]
+    public void ReadOnlyScan_ThenInPlaceCommit_MatchesTheWritingScan(GdnScanMultiTokenF32Kernel.Variant variant, int lastRow)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        Skip.IfNot(File.Exists(Path.Combine(spvDir, VariantSpv(variant))), $"{variant} shader not compiled.");
+        const int seqLen = 8, nVHead = 48, nKHead = 16, dState = 128;
+        var rng = new Random(1194 + lastRow);
+        float[] state0 = RandomFloats(rng, nVHead * dState * dState, 2.0f);
+        float[] q = RandomFloats(rng, seqLen * nKHead * dState, 1.0f), k = RandomFloats(rng, seqLen * nKHead * dState, 1.0f);
+        GatedDeltaNetScan.L2NormalizeHeads(q, dState);
+        GatedDeltaNetScan.L2NormalizeHeads(k, dState);
+        float[] v = RandomFloats(rng, seqLen * nVHead * dState, 3.0f);
+        float[] g = new float[seqLen * nVHead], beta = new float[seqLen * nVHead];
+        for (int i = 0; i < g.Length; i++) { g[i] = 0.5f + 0.5f * (float)rng.NextDouble(); beta[i] = 0.1f + 0.9f * (float)rng.NextDouble(); }
+
+        using var device = VulkanDevice.Create();
+        var (_, fullOut) = RunArm(device, spvDir, variant, state0, q, k, v, g, beta, seqLen, nVHead, nKHead, dState);
+        var (expected, _) = RunArm(device, spvDir, variant, state0, q, k, v, g, beta, lastRow + 1, nVHead, nKHead, dState);
+        float[] oneFewer = lastRow == 0
+            ? state0
+            : RunArm(device, spvDir, variant, state0, q, k, v, g, beta, lastRow, nVHead, nKHead, dState).State;
+
+        using var kernel = GdnScanMultiTokenF32Kernel.Create(device, spvDir, variant);
+        Assert.True(kernel.SupportsReadOnly);
+        using var stateBuf = device.Allocate((long)state0.Length * sizeof(float));
+        using var qBuf = device.Allocate((long)q.Length * sizeof(float));
+        using var kBuf = device.Allocate((long)k.Length * sizeof(float));
+        using var vBuf = device.Allocate((long)v.Length * sizeof(float));
+        using var gBuf = device.Allocate((long)g.Length * sizeof(float));
+        using var betaBuf = device.Allocate((long)beta.Length * sizeof(float));
+        using var outBuf = device.Allocate((long)seqLen * nVHead * dState * sizeof(float));
+        device.Upload(state0.AsSpan(), stateBuf);
+        device.Upload(q.AsSpan(), qBuf);
+        device.Upload(k.AsSpan(), kBuf);
+        device.Upload(v.AsSpan(), vBuf);
+        device.Upload(g.AsSpan(), gBuf);
+        device.Upload(beta.AsSpan(), betaBuf);
+
+        kernel.Launch(stateBuf, qBuf, kBuf, vBuf, gBuf, betaBuf, outBuf, seqLen, nVHead, nKHead, dState, writeState: false);
+        float[] roState = new float[state0.Length], roOut = new float[fullOut.Length];
+        device.Download(stateBuf, roState);
+        device.Download(outBuf, roOut);
+        AssertBitIdentical(state0, roState, "read-only scan left the state");
+        AssertBitIdentical(fullOut, roOut, "read-only scan output");
+
+        kernel.Launch(stateBuf, qBuf, kBuf, vBuf, gBuf, betaBuf, outBuf, lastRow + 1, nVHead, nKHead, dState);
+        float[] committed = new float[state0.Length];
+        device.Download(stateBuf, committed);
+        AssertBitIdentical(expected, committed, $"state after committing {lastRow + 1} row(s)");
+        Assert.False(committed.AsSpan().SequenceEqual(oneFewer), "the commit must not equal the state one row earlier");
+    }
+
     /// <summary>The default (RowSplit) kernel only handles d_state == 128; any other size must route to the exact LdsFused arm, bit-identically.</summary>
     [SkippableFact]
     public void DefaultKernel_NonStandardDState_FallsBackToLdsFusedBitIdentical()

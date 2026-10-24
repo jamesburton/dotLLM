@@ -443,7 +443,7 @@ What closed the gap, largest first:
   (CPU W2A8 numerics) and is the default wherever it loads (sm_80+; `DOTLLM_CUDA_PQ2_0_MMQ=0` restores dequant + cuBLAS).
   wikitext-2, 16 x 512, no BOS: PPL 10.6182 (W2A8 MMA) vs 10.6179 (dequant + cuBLAS) vs 10.6166 (fork), per-window |dNLL| <= 0.25%.
 - **The GDN recurrence was one launch per token** at prefill, each streaming the whole state 4 times. `gdn_scan_multi_f32`
-  runs the sequence in one launch with the state column in registers, and writes the per-row snapshots MTP verifies need
+  runs the sequence in one launch with the state column in registers; a speculative verify runs it read-only (`write_state` 0, #1194)
   (bit-identical to the per-token kernel; also used by the MoE `qwen35moe` host).
 - 1024-wide Hadamard blocks use a register/shuffle FWHT (`hadamard_fwht1024_f32`, bit-identical).
 - VRAM: `token_embd` is uploaded only for a tied head (Bonsai 2 has `output.weight`; 322 MiB nothing read), the MTP head is

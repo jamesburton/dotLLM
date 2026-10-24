@@ -470,9 +470,8 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
                 nameof(gdnState));
         }
 
-        // Mirrors Forward: advancing the model-owned state invalidates row snapshots (issue #473).
-        if (ReferenceEquals(gdnCache, _gdnCache))
-            _rowSnapshotValidRows = 0;
+        // Mirrors Forward: a read-only verify's accepted rows land before anything reads the model-owned state (#1194).
+        CommitPendingRows();
 
         int vocabSize = Config.VocabSize;
         int intermediateSize = Config.IntermediateSize;
@@ -1042,10 +1041,9 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
 
         _state.EnsureCapacity(seqLen);
 
-        // Any forward moves the model-owned state on, so earlier row snapshots no longer describe
-        // it (issue #473). ForwardWithRecurrentSnapshots re-validates after this call returns.
-        if (ReferenceEquals(gdnCache, _gdnCache))
-            _rowSnapshotValidRows = 0;
+        // #1194: the last read-only verify left the model-owned state untouched; its accepted rows (all, unless a rollback said
+        // otherwise) land before this forward reads it. ForwardWithRecurrentSnapshots re-validates after this call returns.
+        CommitPendingRows();
 
         // Adaptive dispatch mode: spin-wait for decode (short, frequent dispatches),
         // event-based for prefill (long dispatches where kernel transition cost is negligible).
@@ -1349,6 +1347,7 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
     /// </remarks>
     public object? CheckpointRecurrentState()
     {
+        CommitPendingRows();
         GdnStateCache snapshot = Interlocked.Exchange(ref _spareGdnCheckpoint, null)
             ?? new GdnStateCache(_gdn, _gdnCache.NumGdnLayers);
         _gdnCache.CopyTo(snapshot);
@@ -1395,24 +1394,26 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
 
     // ── Per-row recurrent snapshots (issue #473) ─────────────────────────────
 
-    // Issue #1194: NOT a full F32 GDN state per row (~150 MiB each on Bonsai-2 27B). The state before the verify is kept once
-    // (_rowBase, [layer]), and per row and GDN layer only what GatedDeltaNetScan.Replay needs to rebuild it bit-identically: the
-    // L2-normalised keys, the decays and the scan's deltas (nV * (1 + dS) + nK * dS floats vs nV * dS^2). The conv windows of all
-    // rows share one slice of ConvInput (rows 1 .. rows + dConv - 2). Capacity is the most rows any verify has asked for.
-    private readonly Qwen4ExpNativeBuffer _rowBase = new(), _rowRecK = new(), _rowRecG = new(), _rowRecD = new(), _rowSnapConv = new();
+    // Issue #1194: no copy of the GDN state at all. The verify scan reads the live state and never writes it (nor the conv state);
+    // per row and GDN layer it keeps only what GatedDeltaNetScan.Replay needs: the L2-normalised keys, the decays and the scan's
+    // deltas (nV * (1 + dS) + nK * dS floats vs nV * dS^2). The conv windows of all rows share one slice of ConvInput
+    // (rows 1 .. rows + dConv - 2). The accepted rows are then replayed into the live state in place. Capacity is the most rows any
+    // verify has asked for.
+    private readonly Qwen4ExpNativeBuffer _rowRecK = new(), _rowRecG = new(), _rowRecD = new(), _rowSnapConv = new();
     private int _rowSnapCapacity;
     private int _rowSnapshotRequestRows;   // > 0 only while ForwardWithRecurrentSnapshots runs
-    private int _rowSnapshotValidRows;     // rows the last such forward recorded; 0 = none
+    private int _rowSnapshotValidRows;     // rows the last such forward recorded and not yet committed; 0 = none
 
     /// <summary>Bytes currently held by the per-row recurrent snapshot scratch (issues #473, #1194).</summary>
     public long RecurrentRowSnapshotBytes
-        => _rowBase.Bytes + _rowRecK.Bytes + _rowRecG.Bytes + _rowRecD.Bytes + _rowSnapConv.Bytes;
+        => _rowRecK.Bytes + _rowRecG.Bytes + _rowRecD.Bytes + _rowSnapConv.Bytes;
 
     /// <inheritdoc/>
     /// <remarks>
-    /// Costs one pre-verify GDN state plus, per row and GDN layer, the keys, decays and deltas of the scan (#1194), kept for the
-    /// model's lifetime. A restore to row r replays r + 1 rank-1 updates from the pre-verify state, which is bit-identical to the
-    /// state the scan itself left after that row.
+    /// Read-only verify (#1194): the forward leaves the GDN and conv state untouched and records, per row and GDN layer, the scan's
+    /// keys, decays and deltas. <see cref="RestoreRecurrentStateToRow"/> replays rows 0..r into the live state in place; without a
+    /// rollback, the next forward (or checkpoint) replays every row. The replay is bit-identical to the scan's own update, so the state
+    /// matches what plain decoding of the accepted tokens leaves.
     /// </remarks>
     public bool SupportsRecurrentRowSnapshots => true;
 
@@ -1420,7 +1421,8 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
     public ITensor ForwardWithRecurrentSnapshots(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                                                  int deviceId, IKvCache? kvCache, IMtpState? mtpState)
     {
-        int rows = Math.Max(tokenIds.Length - 1, 0);
+        CommitPendingRows();   // before the records are reused or regrown
+        int rows = tokenIds.Length;
         EnsureRowSnapshotCapacity(rows);
         _rowSnapshotRequestRows = rows;
         ITensor logits;
@@ -1439,21 +1441,30 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
     /// <inheritdoc/>
     public void RestoreRecurrentStateToRow(int row)
     {
-        if (row == _rowSnapshotValidRows && row > 0)
-            return; // the live state IS the state after the last row
         if ((uint)row >= (uint)_rowSnapshotValidRows)
             throw new InvalidOperationException(
                 $"No recurrent snapshot for row {row}: the last ForwardWithRecurrentSnapshots recorded " +
                 $"{_rowSnapshotValidRows} row(s), or a later forward invalidated them.");
+        CommitRows(row + 1);
+    }
 
+    /// <summary>Replays every row of a not-yet-committed read-only verify into the live state (#1194).</summary>
+    private void CommitPendingRows()
+    {
+        if (_rowSnapshotValidRows > 0) CommitRows(_rowSnapshotValidRows);
+    }
+
+    /// <summary>Advances the untouched live GDN and conv state through the first <paramref name="rows"/> verify rows, in place.</summary>
+    private void CommitRows(int rows)
+    {
+        _rowSnapshotValidRows = 0;
         for (int l = 0; l < _gdnCache.NumGdnLayers; l++)
         {
-            GatedDeltaNetScan.Replay(_gdnCache.GetGdnState(l), RowBaseGdn(l), RowRecLayer(_rowRecK, l, _gdn.NKHead * _gdn.DState),
+            GatedDeltaNetScan.Replay(_gdnCache.GetGdnState(l), default, RowRecLayer(_rowRecK, l, _gdn.NKHead * _gdn.DState),
                 RowRecLayer(_rowRecG, l, _gdn.NVHead), RowRecLayer(_rowRecD, l, _gdn.NVHead * _gdn.DState),
-                _gdn.NVHead, _gdn.NKHead, _gdn.DState, row + 1);
-            RowSnapshotConv(l, row).CopyTo(_gdnCache.GetConvState(l));
+                _gdn.NVHead, _gdn.NKHead, _gdn.DState, rows);
+            if (_gdn.DConv > 1) RowSnapshotConv(l, rows - 1).CopyTo(_gdnCache.GetConvState(l));
         }
-        _rowSnapshotValidRows = 0;
     }
 
     private void EnsureRowSnapshotCapacity(int rows)
@@ -1461,7 +1472,6 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
         if (rows <= _rowSnapCapacity) return;
         int layers = _gdnCache.NumGdnLayers;
         int kDim = _gdn.NKHead * _gdn.DState, vDim = _gdn.NVHead * _gdn.DState, convDim = 2 * kDim + vDim;
-        _rowBase.EnsureExact(Math.Max((long)layers * _gdnCache.GdnStateElements, 16));
         _rowRecK.EnsureExact(Math.Max((long)layers * rows * kDim, 16));
         _rowRecG.EnsureExact(Math.Max((long)layers * rows * _gdn.NVHead, 16));
         _rowRecD.EnsureExact(Math.Max((long)layers * rows * vDim, 16));
@@ -1471,7 +1481,6 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
 
     private void FreeRowSnapshots()
     {
-        _rowBase.Dispose();
         _rowRecK.Dispose();
         _rowRecG.Dispose();
         _rowRecD.Dispose();
@@ -1482,10 +1491,6 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
 
     /// <summary>ConvInput rows the conv windows of <paramref name="rows"/> snapshot rows span: rows 1 .. rows + dConv - 2.</summary>
     private int RowSnapConvRows(int rows) => _gdn.DConv > 1 ? rows + _gdn.DConv - 2 : 0;
-
-    /// <summary>GDN layer <paramref name="ordinal"/>'s state as it stood before the last recorded verify.</summary>
-    private Span<float> RowBaseGdn(int ordinal)
-        => _rowBase.Slice((long)ordinal * _gdnCache.GdnStateElements, _gdnCache.GdnStateElements);
 
     /// <summary>GDN layer <paramref name="ordinal"/>'s region of a per-row record (<paramref name="perRow"/> floats per row).</summary>
     private Span<float> RowRecLayer(Qwen4ExpNativeBuffer buffer, int ordinal, int perRow)
@@ -1697,20 +1702,19 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
         if (TensorDump.Enabled)
             TensorDump.Dump2D($"blk.{absoluteLayerIdx}.conv_output_silu", qkvBuf, seqLen, convDim);
 
-        // Save the trailing (dConv-1) rows of convInput back as rolling state.
-        for (int r = 0; r < dConv - 1; r++)
+        // Issue #473/#1194: a read-only verify records every row and leaves the conv and GDN state untouched.
+        int snapRows = _rowSnapshotRequestRows > 0 && ReferenceEquals(gdnCache, _gdnCache)
+            ? Math.Min(_rowSnapshotRequestRows, seqLen)
+            : 0;
+
+        // Save the trailing (dConv-1) rows of convInput back as rolling state (not in a read-only verify: the commit does it).
+        for (int r = 0; snapRows == 0 && r < dConv - 1; r++)
         {
             new ReadOnlySpan<float>(convInput + (seqLen + r) * convDim, convDim)
                 .CopyTo(convState.Slice(r * convDim, convDim));
         }
-
-        // Issue #473: record the conv state as it stands after each of the first snapRows rows.
-        // After row t the rolling window is convInput rows t+1 .. t+dConv-1 — the same slice the
-        // save above takes for t = seqLen-1.
-        int snapRows = _rowSnapshotRequestRows > 0 && ReferenceEquals(gdnCache, _gdnCache)
-            ? Math.Min(_rowSnapshotRequestRows, seqLen - 1)
-            : 0;
-        // #1194: every window lies in convInput rows 1 .. snapRows + dConv - 2, stashed once.
+        // After row t the rolling window is convInput rows t+1 .. t+dConv-1 (the save above takes t = seqLen-1); every window lies in
+        // convInput rows 1 .. snapRows + dConv - 2, stashed once (#1194).
         if (snapRows > 0 && dConv > 1)
         {
             int convRows = RowSnapConvRows(snapRows);
@@ -1745,9 +1749,7 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
         var gdnState = gdnCache.GetGdnState(gdnOrdinal);
         if (snapRows > 0)
         {
-            // #1194: what Replay rebuilds any row from: the pre-verify state and the rows' keys and decays (the scan records the deltas).
-            // shortcut: a plain copy of the state (~3 MiB per layer); Qwen4Exp swaps buffers instead, worth it only if a CPU verify gets fast.
-            gdnState.CopyTo(RowBaseGdn(gdnOrdinal));
+            // #1194: what Replay advances the untouched live state with: the rows' keys and decays (the scan records the deltas).
             new ReadOnlySpan<float>(kBuf, snapRows * kDim).CopyTo(RowRecLayer(_rowRecK, gdnOrdinal, kDim));
             new ReadOnlySpan<float>(alphaBuf, snapRows * nVHead).CopyTo(RowRecLayer(_rowRecG, gdnOrdinal, nVHead));
         }
@@ -1764,7 +1766,8 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
             dState: dState,
             seqLen: seqLen,
             snapshotRows: snapRows,
-            deltaRecord: snapRows > 0 ? RowRecLayer(_rowRecD, gdnOrdinal, vDim) : default);
+            deltaRecord: snapRows > 0 ? RowRecLayer(_rowRecD, gdnOrdinal, vDim) : default,
+            readOnlyState: snapRows > 0);
         if (TensorDump.Enabled)
             TensorDump.Dump3D($"blk.{absoluteLayerIdx}.attn_output", gdnOut, seqLen, nVHead, dState);
 

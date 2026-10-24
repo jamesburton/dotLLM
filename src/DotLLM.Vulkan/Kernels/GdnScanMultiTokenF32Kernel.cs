@@ -24,8 +24,8 @@ namespace DotLLM.Vulkan.Kernels;
 /// </remarks>
 public sealed class GdnScanMultiTokenF32Kernel : IDisposable
 {
-    // n_v_head, n_k_head, d_state, v_heads_per_k_head, seq_len (all u32)
-    private const int PushConstantBytes = 5 * sizeof(uint);
+    // n_v_head, n_k_head, d_state, v_heads_per_k_head, seq_len, write_state (all u32; only the register/LDS arms read write_state)
+    private const int PushConstantBytes = 6 * sizeof(uint);
 
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
@@ -126,6 +126,13 @@ public sealed class GdnScanMultiTokenF32Kernel : IDisposable
     public Variant ActiveVariant => _variant;
 
     /// <summary>
+    /// True when <see cref="Record"/> honours <c>writeState: false</c> (#1194 read-only speculative verify): the arms that hold the
+    /// state in registers or LDS (<see cref="Variant.RowSplit"/>, and <see cref="Variant.LdsFused"/>, its fallback for other head sizes).
+    /// The global-state arms update the state in place and cannot run read-only.
+    /// </summary>
+    public bool SupportsReadOnly => _variant is Variant.RowSplit or Variant.LdsFused;
+
+    /// <summary>
     /// Raw <c>VkPipeline</c> handle — diagnostics only, so
     /// <c>VulkanDevice.GetShaderStatisticsAmd</c> can report this kernel's post-compile
     /// VGPR/SGPR/LDS/scratch allocation. No codepath's correctness or performance depends on it.
@@ -204,11 +211,11 @@ public sealed class GdnScanMultiTokenF32Kernel : IDisposable
     public void Launch(
         VulkanDevice.Buffer state, VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer v,
         VulkanDevice.Buffer g, VulkanDevice.Buffer beta, VulkanDevice.Buffer output,
-        int seqLen, int nVHead, int nKHead, int dState)
+        int seqLen, int nVHead, int nKHead, int dState, bool writeState = true)
     {
         using var ctx = _device.CreateSubmitContext();
         ctx.Begin();
-        Record(ctx.CommandBuffer, state, q, k, v, g, beta, output, seqLen, nVHead, nKHead, dState);
+        Record(ctx.CommandBuffer, state, q, k, v, g, beta, output, seqLen, nVHead, nKHead, dState, writeState);
         ctx.SubmitAndWait();
     }
 
@@ -216,14 +223,17 @@ public sealed class GdnScanMultiTokenF32Kernel : IDisposable
     /// Records the multi-token GDN scan dispatch into <paramref name="cmdBuf"/>.
     /// All buffers are full-sequence views (<c>q/k</c> shape <c>[seqLen, nKHead, dState]</c>,
     /// <c>v/output</c> shape <c>[seqLen, nVHead, dState]</c>, <c>g/beta</c> shape
-    /// <c>[seqLen, nVHead]</c>); the per-token slicing happens inside the shader.
+    /// <c>[seqLen, nVHead]</c>); the per-token slicing happens inside the shader. <paramref name="writeState"/> false emits the
+    /// outputs but leaves the state untouched (#1194); only arms with <see cref="SupportsReadOnly"/> accept it.
     /// </summary>
     public unsafe void Record(
         nint cmdBuf,
         VulkanDevice.Buffer state, VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer v,
         VulkanDevice.Buffer g, VulkanDevice.Buffer beta, VulkanDevice.Buffer output,
-        int seqLen, int nVHead, int nKHead, int dState)
+        int seqLen, int nVHead, int nKHead, int dState, bool writeState = true)
     {
+        if (!writeState && !SupportsReadOnly)
+            throw new NotSupportedException($"GDN scan arm {_variant} updates the state in place and cannot run read-only.");
         if (seqLen <= 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
         if (nVHead <= 0) throw new ArgumentOutOfRangeException(nameof(nVHead));
         if (nKHead <= 0) throw new ArgumentOutOfRangeException(nameof(nKHead));
@@ -235,7 +245,7 @@ public sealed class GdnScanMultiTokenF32Kernel : IDisposable
         if (_variant == Variant.RowSplit && dState != 128)
         {
             (_fallback ??= Create(_device, _spvDir, Variant.LdsFused))
-                .Record(cmdBuf, state, q, k, v, g, beta, output, seqLen, nVHead, nKHead, dState);
+                .Record(cmdBuf, state, q, k, v, g, beta, output, seqLen, nVHead, nKHead, dState, writeState);
             return;
         }
 
@@ -259,6 +269,7 @@ public sealed class GdnScanMultiTokenF32Kernel : IDisposable
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[8..], (uint)dState);
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[12..], (uint)vHeadsPerKHead);
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[16..], (uint)seqLen);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[20..], writeState ? 1u : 0u);
         fixed (byte* pcPtr = pcBytes)
         {
             VulkanApi.vkCmdPushConstants(

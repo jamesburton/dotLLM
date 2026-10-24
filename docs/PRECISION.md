@@ -544,7 +544,7 @@ PRs #1103, #1122, #1125, #1126.
 | C6 | CPU | RoPE cos/sin `float[]`, twice | L8B @128k 64 MiB ×2 | open | #1142 |
 | C7 | CPU | MTP KV and hidden F32 | 32 MiB @4096 positions | open | #1141 |
 | C8 | CPU | MLA KV, TurboQuant norms, MoE scatter F32 | per token | open | #1140 |
-| C9 | CPU | recurrent state + snapshots F32 | O(1) per sequence (speculative-verify row snapshots: one pre-verify state + row inputs, no longer K states, #1194) | sign-off pending | #1144 |
+| C9 | CPU | recurrent state + snapshots F32 | O(1) per sequence (speculative verify: read-only scan + in-place replay of row inputs, no state copy at all, #1194) | sign-off pending | #1144 |
 | X1 | CPU | safetensors BF16 → F32 | L8B +16 GB; L1B +2.5 GB | open | #1143 (needs #1118) |
 | X2 | CPU | MLA-MoE routed experts → F32 | ≈57 GB on V2-Lite | open | #1140 |
 | X3 | CPU | MLA projections, shared / Granite-MoE experts → F32 | `Σ out·in·4` | open | #1140 |
