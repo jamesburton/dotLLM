@@ -24,7 +24,12 @@ namespace DotLLM.Tests.Unit.Vulkan;
 [Collection("VulkanKernels")]
 public sealed class VulkanSplitKvDecodeBench
 {
-    private const int NumHeads = 24, NumKvHeads = 4, HeadDim = 256, Rounds = 9;
+    private const int Rounds = 9;
+
+    // DOTLLM_SPLITKV_DECODE_AB_SHAPE=heads,kvHeads,headDim overrides the Bonsai 2 shape (Flint: 32,4,128, issue #1161).
+    private static readonly int[] Shape = (Environment.GetEnvironmentVariable("DOTLLM_SPLITKV_DECODE_AB_SHAPE") ?? "24,4,256")
+        .Split(',').Select(int.Parse).ToArray();
+    private static readonly int NumHeads = Shape[0], NumKvHeads = Shape[1], HeadDim = Shape[2];
     private readonly ITestOutputHelper _output;
 
     /// <summary>Initializes the bench with the xUnit output sink.</summary>
@@ -64,26 +69,29 @@ public sealed class VulkanSplitKvDecodeBench
             }
 
             using var bq = device.Allocate((long)q.Length * sizeof(float));
-            using var bk32 = device.Allocate((long)kvElems * sizeof(float));
-            using var bv32 = device.Allocate((long)kvElems * sizeof(float));
-            using var bk16 = device.Allocate((long)kvElems * sizeof(ushort));
-            using var bv16 = device.Allocate((long)kvElems * sizeof(ushort));
+            // The cache lives in device-local memory in the model (#1161: host-visible buffers read at a fraction of the bandwidth on
+            // UMA and made every arm look latency-bound).
+            using var bk32 = DeviceLocal(device, MemoryMarshal.AsBytes(kv32.AsSpan()));
+            using var bv32 = DeviceLocal(device, MemoryMarshal.AsBytes(kv32.AsSpan()));
+            using var bk16 = DeviceLocal(device, MemoryMarshal.AsBytes(kv16.AsSpan()));
+            using var bv16 = DeviceLocal(device, MemoryMarshal.AsBytes(kv16.AsSpan()));
             using var bo = device.Allocate((long)q.Length * sizeof(float));
             device.Upload(q.AsSpan(), bq);
-            device.Upload(kv32.AsSpan(), bk32);
-            device.Upload(kv32.AsSpan(), bv32);
-            device.Upload(MemoryMarshal.AsBytes(kv16.AsSpan()), bk16);
-            device.Upload(MemoryMarshal.AsBytes(kv16.AsSpan()), bv16);
             kv32 = null!;
             kv16 = null!;
 
-            var arms = new (string Name, VulkanSplitKvAttentionKernel Kernel, bool Gqa, VulkanDevice.Buffer K, VulkanDevice.Buffer V, int Bytes)[]
+            var arms = new (string Name, VulkanSplitKvAttentionKernel Kernel, bool Gqa, bool V2, VulkanDevice.Buffer K, VulkanDevice.Buffer V, int Bytes)[]
             {
-                ("f32-classic", k32, false, bk32, bv32, 4),
-                ("f32-gqa", k32, true, bk32, bv32, 4),
-                ("f16-classic", k16, false, bk16, bv16, 2),
-                ("f16-gqa", k16, true, bk16, bv16, 2),
+                ("f32-classic", k32, false, false, bk32, bv32, 4),
+                ("f32-gqa", k32, true, false, bk32, bv32, 4),
+                ("f16-classic", k16, false, false, bk16, bv16, 2),
+                ("f16-gqa", k16, true, false, bk16, bv16, 2),
+                ("f32-gqa2", k32, true, true, bk32, bv32, 4),
+                ("f16-gqa2", k16, true, true, bk16, bv16, 2),
             };
+            k16.PreferGqa = true;
+            k16.PreferGqa2 = true;
+            if (!k16.UsesGqa2(NumHeads, NumKvHeads, HeadDim)) arms = arms[..4];
 
             float[]? reference = null;
             var outputs = new float[arms.Length][];
@@ -116,12 +124,22 @@ public sealed class VulkanSplitKvDecodeBench
                 Assert.True(maxDiff <= 1e-3f, $"{arms[a].Name} at seqKv {seqKv} disagrees with f32-classic by {maxDiff}");
             }
 
-            void Run((string Name, VulkanSplitKvAttentionKernel Kernel, bool Gqa, VulkanDevice.Buffer K, VulkanDevice.Buffer V, int Bytes) arm)
+            void Run((string Name, VulkanSplitKvAttentionKernel Kernel, bool Gqa, bool V2, VulkanDevice.Buffer K, VulkanDevice.Buffer V, int Bytes) arm)
             {
                 arm.Kernel.PreferGqa = arm.Gqa;
+                arm.Kernel.PreferGqa2 = arm.V2;
                 Assert.Equal(arm.Gqa, arm.Kernel.UsesGqa(NumHeads, NumKvHeads, HeadDim));
                 arm.Kernel.Launch(bq, arm.K, arm.V, bo, 1, seqKv, NumHeads, NumKvHeads, HeadDim, seqKv - 1);
             }
         }
+    }
+
+    private static VulkanDevice.Buffer DeviceLocal(VulkanDevice device, ReadOnlySpan<byte> data)
+    {
+        using var staging = device.Allocate(data.Length);
+        device.Upload(data, staging);
+        var dst = device.AllocateDeviceLocal(data.Length);
+        device.CopyBufferSynchronous(staging, dst, (ulong)data.Length);
+        return dst;
     }
 }
