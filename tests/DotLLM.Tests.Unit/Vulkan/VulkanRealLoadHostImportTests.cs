@@ -62,7 +62,7 @@ public class VulkanRealLoadHostImportTests(ITestOutputHelper output)
     /// <summary>
     /// Load a real Q8_0 checkpoint through the production Vulkan weight path and assert the
     /// import outcome that the current <see cref="GgufFile.MappingAccess"/> mode entails:
-    /// copy-on-write MUST alias at least one tensor, read-only MUST alias none and say why.
+    /// copy-on-write or the writable alias (#1190) MUST alias at least one tensor, plain read-only MUST alias none and say why.
     /// Neither branch can be silently green while the import is broken.
     /// </summary>
     [SkippableFact]
@@ -95,9 +95,11 @@ public class VulkanRealLoadHostImportTests(ITestOutputHelper output)
             _output.WriteLine($"GgufFile.MappingAccess = {GgufFile.MappingAccess}");
             _output.WriteLine(ledger);
 
-            if (GgufFile.MappingAccess == MemoryMappedFileAccess.CopyOnWrite)
+            if (GgufFile.MappingAccess == MemoryMappedFileAccess.CopyOnWrite
+                || VulkanWeightImportPolicy.WritableAliasEnabled)
             {
-                // The mode in which the import is SUPPOSED to work. This is the guard: if the
+                // The modes in which the import is SUPPOSED to work (a read-only mapping imports through a
+                // shared writable alias view under DOTLLM_VULKAN_HOST_IMPORT_WRITABLE=1, #1190). This is the guard: if the
                 // import ever stops engaging on a real load again, this goes red.
                 Assert.True(
                     VulkanWeightImportPolicy.ImportedTensorCount > 0,
@@ -125,7 +127,7 @@ public class VulkanRealLoadHostImportTests(ITestOutputHelper output)
                     "Nothing imported, so #438 may release the whole mapping.");
                 _output.WriteLine(
                     "Read-only mapping: the import is known-dead here by driver refusal. " +
-                    "Set DOTLLM_GGUF_MAP_COW=1 to exercise the working path.");
+                    "Set DOTLLM_VULKAN_HOST_IMPORT_WRITABLE=1 (or DOTLLM_GGUF_MAP_COW=1) to exercise the working path.");
             }
         }
         finally
