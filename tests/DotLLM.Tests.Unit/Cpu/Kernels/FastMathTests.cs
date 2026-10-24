@@ -84,7 +84,10 @@ public sealed class FastMathTests
             refSum += refOutput[i];
         }
 
-        // Allow ~2% relative error from fast exp approximation
+        // Allow ~2% relative error: the Schraudolph approximation's own error budget, which is
+        // what this bound has to cover under DOTLLM_FAST_EXP=1. By default (#501) the exp is
+        // precise and the observed error is ~0 — see FastMathAccuracyTests for the 1e-5 bounds
+        // that actually discriminate between the two.
         float sumRelError = MathF.Abs(fusedSum - refSum) / refSum;
         Assert.True(sumRelError < 0.02f,
             $"Sum mismatch: fused={fusedSum}, reference={refSum}, relative error={sumRelError:P2}");
