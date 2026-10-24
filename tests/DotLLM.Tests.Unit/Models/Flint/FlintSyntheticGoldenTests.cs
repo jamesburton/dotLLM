@@ -184,6 +184,27 @@ public sealed class FlintSyntheticGoldenTests : IDisposable
         Assert.True(diff < 1e-4f, $"threaded vs serial {diff}");
     }
 
+    /// <summary>
+    /// All-Q4_1 (the official layout): threaded decode folds the ungated shared expert into the MoE decode path's two dispatches
+    /// (#1159). It must equal the serial decode, which runs the shared expert through its own GEMVs.
+    /// </summary>
+    [Fact]
+    public void AllQ4_1_ThreadedDecode_FusedSharedExpert_Matches_Serial()
+    {
+        var allQ4_1 = new SyntheticFlintGguf.Options
+        {
+            DenseQuant = QuantizationType.Q4_1, RoutedQuant = QuantizationType.Q4_1, SharedQuant = QuantizationType.Q4_1,
+        };
+        using var gguf = GgufFile.Open(Write(allQ4_1, "allq"));
+        ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        float[] serial = Run(gguf, cfg, decode: true);
+        long fused0 = DotLLM.Cpu.Kernels.MoeSwiGluMlp.DecodeN1SharedFusedCalls;
+        float[] threaded = Run(gguf, cfg, decode: true, threading: new ThreadingConfig(4));
+        Assert.True(DotLLM.Cpu.Kernels.MoeSwiGluMlp.DecodeN1SharedFusedCalls > fused0, "the fused shared-expert decode path did not run");
+        float diff = MaxAbs(threaded, serial);
+        Assert.True(diff < 1e-4f, $"threaded fused decode vs serial {diff}");
+    }
+
     [Fact]
     public void KvCacheDecode_Equals_BatchedForward()
     {

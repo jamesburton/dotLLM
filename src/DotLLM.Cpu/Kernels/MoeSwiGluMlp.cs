@@ -555,8 +555,10 @@ public static unsafe partial class MoeSwiGluMlp
             // (gather/gate/up/silu/down scratch + optional Q8 input scratch) is owned by
             // the worker — when parallelised each thread rents its own. Per-expert writes
             // hit disjoint (token, slot) rows in scatterDown by construction.
+            bool sharedDone = false;
             fixed (float* hiddenPtr = hidden)
             fixed (float* scatterDownPtr = scatterDownBuf)
+            fixed (float* sharedDownOut = sharedDownBatchBuf)
             {
                 // Snapshot pointers + sizes the worker captures.
                 var workerCtx = new RoutedExpertWorkerCtx
@@ -582,6 +584,18 @@ public static unsafe partial class MoeSwiGluMlp
                     PackedLegacy = packedLegacyExperts,
                 };
 
+                // An ungated raw-quant single shared expert can ride in the decode path's two dispatches (#1159).
+                bool sharedFusable = hasSharedExpert && numSharedExperts == 1 && !hasSharedGate
+                    && sharedGateProj[0] == 0 && sharedUpProj[0] == 0 && sharedDownProj[0] == 0
+                    && sharedGateRaw.Length > 0 && sharedUpRaw.Length > 0 && sharedDownRaw.Length > 0;
+                var sharedN1 = sharedFusable
+                    ? new DecodeN1Shared
+                    {
+                        Gate = sharedGateRaw[0], Up = sharedUpRaw[0], Down = sharedDownRaw[0],
+                        GateQt = sharedGateRawQt, UpQt = sharedUpRawQt, DownQt = sharedDownRawQt,
+                        Intermediate = sharedIntermediateSize, Out = sharedDownOut, Layer = loraLayer,
+                    }
+                    : default;
                 if (seqLen == 1 && threadPool is not null && loraAdapter is null
                     && gateExpsF32Ptrs.IsEmpty && upExpsF32Ptrs.IsEmpty && downExpsF32Ptrs.IsEmpty
                     && TryExecuteRoutedDecodeN1(
@@ -590,7 +604,8 @@ public static unsafe partial class MoeSwiGluMlp
                         upExpsRawBase, upExpsQt, upExpsRowBytes,
                         downExpsRawBase, downExpsQt, downExpsRowBytes,
                         bucketCursors, bucketSlots, uniqueExperts, uniqueExpertCount,
-                        numExpertsPerTok, hiddenSize, intermediateSize, useGeGLU, threadPool, packedLegacyExperts))
+                        numExpertsPerTok, hiddenSize, intermediateSize, useGeGLU, threadPool, packedLegacyExperts,
+                        sharedN1, out sharedDone))
                 {
                     // Decode fast path ran: two pool dispatches for the whole layer (see TryExecuteRoutedDecodeN1).
                 }
@@ -637,7 +652,12 @@ public static unsafe partial class MoeSwiGluMlp
             }
 
             // ────────────── Shared-expert batched compute (F32, or the raw quant view when the F32 slot is 0) ──────────────
-            if (hasSharedExpert)
+            long _ps = CpuStageProf.T();
+            if (sharedDone)
+            {
+                sharedScaleBuf![0] = 1.0f;   // ungated: the fused decode path already wrote the shared down row
+            }
+            else if (hasSharedExpert)
             {
                 fixed (float* hiddenPtr = hidden)
                 fixed (float* sgBatch = sharedGateBatchBuf)
@@ -711,6 +731,8 @@ public static unsafe partial class MoeSwiGluMlp
                     }
                 }
             }
+
+            CpuStageProf.E(14, _ps);
 
             // ────────────── Final in-order accumulation ──────────────
             var acc = accBuf.AsSpan(0, hiddenSize);
