@@ -663,10 +663,17 @@ public static unsafe partial class MatMul
     public static bool Q4PackedAllColumns { get; set; } =
         Environment.GetEnvironmentVariable("DOTLLM_CPU_Q4_PACKED_PREFILL") != "0";
 
+    /// <summary>
+    /// Per-thread override of <see cref="Q4PackedAllColumns"/> (the policy is read on the thread that runs the forward). Lets a
+    /// test build a pre-#1159 F32-activation reference without racing other tests through the process-wide switch.
+    /// </summary>
+    [ThreadStatic]
+    internal static bool? Q4PackedAllColumnsOverride;
+
     /// <summary>True when <paramref name="qt"/> takes the packed path for any column count (see <see cref="Q4PackedAllColumns"/>).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static bool PackedAtAnyN(QuantizationType qt)
-        => Q4PackedAllColumns && Avx2.IsSupported && qt is QuantizationType.Q4_0 or QuantizationType.Q4_1;
+        => (Q4PackedAllColumnsOverride ?? Q4PackedAllColumns) && Avx2.IsSupported && qt is QuantizationType.Q4_0 or QuantizationType.Q4_1;
 
     /// <summary>
     /// True when a GEMM of <paramref name="n"/> columns in <paramref name="qt"/> will take the
@@ -912,6 +919,7 @@ public static unsafe partial class MatMul
         public int M;
         public int BlockCount;
         public QuantizationType Qt;
+        public long Next;             // next unclaimed row (dynamic scheduling, #1159)
     }
 
     private struct LegacyQuantGemmCtx
@@ -926,17 +934,25 @@ public static unsafe partial class MatMul
         public int WRowBytes;
         public int Q8RowBytes;
         public QuantizationType Qt;
+        public long Next;             // next unclaimed row (dynamic scheduling, #1159)
     }
 
     private static void ComputeRowsLegacyQuantWorker(nint ctxPtr, int threadIdx, int threadCount)
     {
         ref var ctx = ref Unsafe.AsRef<LegacyQuantRowsCtx>((void*)ctxPtr);
-        PartitionRows(ctx.M, threadIdx, threadCount, out int start, out int count);
-        if (count == 0) return;
         nint rowBytes = (nint)ctx.BlockCount * LegacyBlockBytes(ctx.Qt);
-        ComputeRowsLegacyQuant(ctx.Qt, ctx.Weights + start * rowBytes, ctx.XQ8,
-            ctx.Result + start, count, ctx.BlockCount);
+        // Dynamic 32-row claims (#1159, see FusedDecode3Worker): 4-row aligned, so every row runs the same kernel as before.
+        while (true)
+        {
+            long s = Interlocked.Add(ref ctx.Next, FusedClaimRows) - FusedClaimRows;
+            if (s >= ctx.M) break;
+            int start = (int)s, count = Math.Min(ctx.M - start, FusedClaimRows);
+            ComputeRowsLegacyQuant(ctx.Qt, ctx.Weights + start * rowBytes, ctx.XQ8, ctx.Result + start, count, ctx.BlockCount);
+        }
     }
+
+    /// <summary>Rows per prefill GEMM claim: 8-aligned, and large enough to amortise the per-call activation-scale conversion.</summary>
+    private const int GemmClaimRows = 64;
 
     /// <summary>
     /// Partitions the GEMM over <em>rows</em>, not over M-tiles. Tiling alone does not parallelize:
@@ -947,9 +963,14 @@ public static unsafe partial class MatMul
     private static void GemmLegacyQuantWorker(nint ctxPtr, int threadIdx, int threadCount)
     {
         ref var ctx = ref Unsafe.AsRef<LegacyQuantGemmCtx>((void*)ctxPtr);
-        PartitionRows(ctx.M, threadIdx, threadCount, out int start, out int count);
-        if (count == 0) return;
-        GemmLegacyQuantTiles(ctx.Qt, ctx.Weights, ctx.InputQ8, ctx.C, start, count,
-            ctx.M, ctx.N, ctx.BlockCount, ctx.TileM, ctx.WRowBytes, ctx.Q8RowBytes);
+        // Dynamic claims (#1159): prefill runs on every core, E-cores included, and a static slice waits for the slowest one.
+        while (true)
+        {
+            long s = Interlocked.Add(ref ctx.Next, GemmClaimRows) - GemmClaimRows;
+            if (s >= ctx.M) break;
+            int start = (int)s, count = Math.Min(ctx.M - start, GemmClaimRows);
+            GemmLegacyQuantTiles(ctx.Qt, ctx.Weights, ctx.InputQ8, ctx.C, start, count,
+                ctx.M, ctx.N, ctx.BlockCount, ctx.TileM, ctx.WRowBytes, ctx.Q8RowBytes);
+        }
     }
 }
