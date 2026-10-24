@@ -163,6 +163,11 @@ Differences between architectures are captured entirely in ModelConfig.
   each input row by `e = 2^ceil(log2(max|row| / 1024))` and multiplies the projected row back (llama.cpp `build_amax_src1_f16`). A
   power of two is exact, so rows at or below 1024 are untouched; it applies to every architecture.
 - **KV**: sliding layers keep only their recent rows on CPU (compact sliding-window KV, #1169, `docs/KV_CACHE.md`): at 262K the 14 full layers dominate (~14 GiB F32, ~3.7 GiB with `--cache-type-k q8_0 --cache-type-v q8_0 --cache-window 0`).
+- **Activation range** (#1191, `docs/PRECISION.md` E13, `DOTLLM_AMAX_PROBE`): on 16K tokens of agent trace + wikitext the routed
+  down input reaches 2.4e5 (guarded on every backend), the residual stream 3.5e4 and the MoE output 3.3e4 (layers 46-48),
+  the shared-expert down input 6.3e3, everything else < 3.4e3. CUDA keeps the residual in F16, so the Flint FP16 loop carries it
+  scaled by 1/8 (exact: every residual read is an RMSNorm with eps scaled to match; `DOTLLM_CUDA_RESIDUAL_SCALE=1` disables it).
+  Vulkan keeps the residual and MoE outputs in F32 and its Q8_1 scales in F32, so no further guard is needed there.
 - **GPU**: CUDA runs `flint` on the generic FP16 MoE loop (#1172, F6: per-layer NoPE, sigmoid routing, in-place Q4_1 GEMV /
   GEMM / grouped MoE kernels; see `docs/CUDA.md`). The 26 GB Q4_1 file needs a >= 32 GB GPU until F7 (CPU-expert offload).
 - **Vulkan** (#1171, single-device `VulkanTransformerModel` only; pipeline / hybrid refuse): sinks required on every layer (the gpt-oss
