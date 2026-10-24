@@ -76,6 +76,40 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
 
     /// <summary>Multi-column (2..8 rows) F32-in GEMVs for the K-quant / IQ dense-projection formats (#902); null when the shader is missing.</summary>
     public MatMulQuantGemvMultiKernel? MatMulQ4KMulti { get; private set; }
+
+    /// <summary>
+    /// Output rows per workgroup of <see cref="MatMulQ4KMulti"/> (#1220) for one column: <c>DOTLLM_VK_Q4K_ROWS</c> (1..8), default 2; <c>DOTLLM_VK_Q4K_ROWS_MULTI</c> (default 4) for 2..8 columns. The kernel also serves
+    /// Q4_K decode (one column) so that a verify batch's columns are bit-identical to plain decode.
+    /// </summary>
+    internal static int Q4KRowsPerWorkgroup { get; } = RowsFromEnv("DOTLLM_VK_Q4K_ROWS", 2);
+
+    /// <summary>
+    /// Rows-per-workgroup knob (1..8) from <paramref name="name"/>, else <paramref name="fallback"/>. #1220 on Strix: NR = 2 is best for one column
+    /// (decode), NR = 4 for the 3..4-column MTP verify; the <c>*_MULTI</c> variables set the latter.
+    /// </summary>
+    private static int RowsFromEnv(string name, int fallback) =>
+        int.TryParse(Environment.GetEnvironmentVariable(name), out int v) && v is >= 1 and <= 8 ? v : fallback;
+
+    /// <summary>Q6_K GEMV for the dense qwen35 decode and verify (#1220; NR from <c>DOTLLM_VK_Q6K_ROWS</c> / <c>_MULTI</c>, default 2 / 4); null without the shader or with <c>DOTLLM_VK_Q6K_ROWS_DECODE=0</c>.</summary>
+    public MatMulQuantGemvMultiKernel? MatMulQ6KRows { get; private set; }
+
+    /// <summary>
+    /// Q8_0 decode GEMV on <see cref="MatMulQ8Multi"/> at one column for the dense qwen35 model (#1220) unless <c>DOTLLM_VK_Q8_ROWS_DECODE=0</c>
+    /// (A/B: the coalesced 1-row kernel, ULP-close to the verify columns).
+    /// </summary>
+    internal MatMulQ8_0GemvMultiKernel? Q8DecodeOnRows =>
+        Environment.GetEnvironmentVariable("DOTLLM_VK_Q8_ROWS_DECODE") != "0" ? MatMulQ8Multi : null;
+
+    /// <summary>Output rows per workgroup of <see cref="MatMulQ8Multi"/> (#1220) for one column: <c>DOTLLM_VK_Q8_ROWS</c> (1..8), default 2; <c>DOTLLM_VK_Q8_ROWS_MULTI</c> (default 4) for 2..8 columns.</summary>
+    internal static int Q8RowsPerWorkgroup { get; } = RowsFromEnv("DOTLLM_VK_Q8_ROWS", 2);
+
+    /// <summary>
+    /// Q4_K decode GEMV on <see cref="MatMulQ4KMulti"/> at one column (#1220) unless <c>DOTLLM_VK_Q4K_ROWS_DECODE=0</c>, which restores the
+    /// coalesced 1-row kernel (A/B; MTP verify columns are then only ULP-close to decode).
+    /// </summary>
+    internal MatMulQuantGemvMultiKernel? Q4KDecodeOnRows =>
+        Environment.GetEnvironmentVariable("DOTLLM_VK_Q4K_ROWS_DECODE") != "0" && MatMulQ4KMulti is { SupportsSingleColumn: true } k ? k : null;
+
     /// <inheritdoc cref="MatMulQ4KMulti"/>
     public MatMulQuantGemvMultiKernel? MatMulQ5KMulti { get; private set; }
     /// <inheritdoc cref="MatMulQ4KMulti"/>
@@ -666,13 +700,16 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         kernels.MatMulBf16Multi = matmulBf16Multi;
         kernels.MatMulF32Multi = MatMulF32GemvMultiKernel.TryCreate(device, spvDir);
         kernels.MatMulF16Multi = MatMulF16GemvMultiKernel.TryCreate(device, spvDir);
-        kernels.MatMulQ8Multi = MatMulQ8_0GemvMultiKernel.TryCreate(device, spvDir);
-        // #1193: the 4-rows-per-workgroup variant unless DOTLLM_VK_Q4K_MULTI_R4=0 (A/B); same per-row arithmetic.
-        kernels.MatMulQ4KMulti = (Environment.GetEnvironmentVariable("DOTLLM_VK_Q4K_MULTI_R4") != "0"
-                ? MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q4_K_R4) : null)
-            ?? MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q4_K);
+        kernels.MatMulQ8Multi = MatMulQ8_0GemvMultiKernel.TryCreate(device, spvDir, Q8RowsPerWorkgroup,
+            RowsFromEnv("DOTLLM_VK_Q8_ROWS_MULTI", 4));
+        // #1220 (supersedes #1193's Q4_K_R4): NR rows per workgroup share the activation loads; deterministic, and also the qwen35 decode GEMV.
+        kernels.MatMulQ4KMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q4_K, Q4KRowsPerWorkgroup,
+            RowsFromEnv("DOTLLM_VK_Q4K_ROWS_MULTI", 4));
         kernels.MatMulQ5KMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q5_K);
         kernels.MatMulQ6KMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K);
+        if (Environment.GetEnvironmentVariable("DOTLLM_VK_Q6K_ROWS_DECODE") != "0")
+            kernels.MatMulQ6KRows = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K_Rows,
+                RowsFromEnv("DOTLLM_VK_Q6K_ROWS", 2), RowsFromEnv("DOTLLM_VK_Q6K_ROWS_MULTI", 4));
         kernels.MatMulQ6KMultiR2 = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K_R2);
         kernels.MatMulIq4XsMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.IQ4_XS);
         kernels.MatMulIq3SMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.IQ3_S);
@@ -924,6 +961,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulF16Multi?.InvalidateDescriptorCache();
         MatMulQ8Multi?.InvalidateDescriptorCache();
         MatMulQ4KMulti?.InvalidateDescriptorCache();
+        MatMulQ6KRows?.InvalidateDescriptorCache();
         MatMulQ5KMulti?.InvalidateDescriptorCache();
         MatMulQ6KMulti?.InvalidateDescriptorCache();
         MatMulQ6KMultiR2?.InvalidateDescriptorCache();
@@ -1005,6 +1043,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulF16Multi?.Dispose();
         MatMulQ8Multi?.Dispose();
         MatMulQ4KMulti?.Dispose();
+        MatMulQ6KRows?.Dispose();
         MatMulQ5KMulti?.Dispose();
         MatMulQ6KMulti?.Dispose();
         MatMulQ6KMultiR2?.Dispose();

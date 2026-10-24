@@ -74,6 +74,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     private readonly VulkanQwen3MoeHybridForwardState _state;
     private readonly VulkanGdnStateCache _gdnCache;
     private readonly VulkanQwen3MoeHybridKernels _kernels;
+    private readonly MatMulQuantGemvMultiKernel? _q4kDecode;   // #1220: Q4_K decode on the verify kernel (see Q4KDecodeOnRows)
 
     // Hybrid layout: kind per layer + sparse KV-slot mapping for attention layers only.
     private readonly HybridLayerLayout _layout;
@@ -252,6 +253,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         _state = state;
         _gdnCache = gdnCache;
         _kernels = kernels;
+        _q4kDecode = kernels.Q4KDecodeOnRows;
         _layout = config.HybridLayout!;
         _gdn = config.GdnConfig ?? default;   // null for the LFM2-MoE headless host (#1015)
         _kvSlotForLayer = kvSlotForLayer;
@@ -403,7 +405,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         }
         model.UploadMtpHeadIfPresent();   // #1188: null without a head (or without resident MoE)
         if (gdnOrdinal > 0 && gdn.DState <= 128 && GdnScanMultiTokenSnapshotF32Kernel.IsAvailable(spvDir))
-            model._rowSnapScan = GdnScanMultiTokenSnapshotF32Kernel.Create(device, spvDir);
+            model._rowSnapScan = GdnScanMultiTokenSnapshotF32Kernel.Create(device, spvDir, kernels.GdnScanMultiToken.ActiveVariant, gdn.DState);   // #1220: mirror decode
         return model;
     }
 
@@ -2864,7 +2866,9 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                     _kernels.MatMulQ3KGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
             case QuantizationType.Q4_K:
-                if (seqLen == 1)
+                if (seqLen == 1 && _q4kDecode is { } q4kRows)
+                    q4kRows.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: 1);   // #1220: same kernel as the verify rows
+                else if (seqLen == 1)
                     _kernels.MatMulQ4K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
                 else if (SmallRowGemvEnabled && _kernels.MatMulQ4KMulti is { } multiQ4K && MatMulQuantGemvMultiKernel.Accepts(seqLen, inputDim))
                 { CountSmallRow(SmallRowPath.QuantMulti); multiQ4K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen); }   // #902

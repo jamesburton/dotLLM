@@ -38,7 +38,7 @@ public class VulkanQuantGemvMultiKernelTests
         var rng = new Random(0x902 + m * 7 + k * 11 + n + (int)format);
         (int blockBytes, int[] halves) = format switch
         {
-            QuantGemvMultiFormat.Q4_K or QuantGemvMultiFormat.Q4_K_R4 => (144, new[] { 0, 2 }),
+            QuantGemvMultiFormat.Q4_K => (144, new[] { 0, 2 }),
             QuantGemvMultiFormat.Q5_K => (176, new[] { 0, 2 }),
             QuantGemvMultiFormat.Q6_K or QuantGemvMultiFormat.Q6_K_R2 => (210, new[] { 208 }),
             QuantGemvMultiFormat.IQ4_XS => (136, new[] { 0 }),
@@ -64,7 +64,7 @@ public class VulkanQuantGemvMultiKernelTests
         IDisposable? refKernel;
         switch (format)
         {
-            case QuantGemvMultiFormat.Q4_K or QuantGemvMultiFormat.Q4_K_R4: { var r = MatMulQ4KGemvF32Kernel.Create(device, spvDir); refKernel = r; single = (w, xx, yy) => r.Launch(w, xx, yy, m, k); break; }
+            case QuantGemvMultiFormat.Q4_K: { var r = MatMulQ4KGemvF32Kernel.Create(device, spvDir); refKernel = r; single = (w, xx, yy) => r.Launch(w, xx, yy, m, k); break; }
             case QuantGemvMultiFormat.Q5_K: { var r = MatMulQ5KGemvF32Kernel.Create(device, spvDir); refKernel = r; single = (w, xx, yy) => r.Launch(w, xx, yy, m, k); break; }
             case QuantGemvMultiFormat.Q6_K or QuantGemvMultiFormat.Q6_K_R2: { var r = MatMulQ6KGemvF32Kernel.Create(device, spvDir); refKernel = r; single = (w, xx, yy) => r.Launch(w, xx, yy, m, k); break; }
             case QuantGemvMultiFormat.IQ4_XS: { var r = MatMulIq4XsGemvF32Kernel.Create(device, spvDir); refKernel = r; single = (w, xx, yy) => r.Launch(w, xx, yy, m, k); break; }
@@ -96,14 +96,6 @@ public class VulkanQuantGemvMultiKernelTests
     [InlineData(QuantGemvMultiFormat.Q4_K, 64, 1024, 2)]
     [InlineData(QuantGemvMultiFormat.Q4_K, 40, 2560, 5)]     // K = 10 super-blocks: window tail (two blocks per 64-lane step)
     [InlineData(QuantGemvMultiFormat.Q4_K, 17, 256, 8)]
-    // Four output rows per workgroup (#1193): M not a multiple of 4, M below 4, partial windows, every column count.
-    [InlineData(QuantGemvMultiFormat.Q4_K_R4, 64, 1024, 2)]
-    [InlineData(QuantGemvMultiFormat.Q4_K_R4, 33, 2560, 5)]
-    [InlineData(QuantGemvMultiFormat.Q4_K_R4, 18, 256, 8)]
-    [InlineData(QuantGemvMultiFormat.Q4_K_R4, 3, 4096, 7)]
-    [InlineData(QuantGemvMultiFormat.Q4_K_R4, 1, 512, 3)]
-    [InlineData(QuantGemvMultiFormat.Q4_K_R4, 41, 1280, 4)]
-    [InlineData(QuantGemvMultiFormat.Q4_K_R4, 40, 768, 6)]
     [InlineData(QuantGemvMultiFormat.Q5_K, 64, 1024, 3)]
     [InlineData(QuantGemvMultiFormat.Q5_K, 40, 2560, 8)]
     [InlineData(QuantGemvMultiFormat.Q6_K, 64, 1024, 2)]

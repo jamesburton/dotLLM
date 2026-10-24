@@ -93,6 +93,19 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
     /// <summary>Replay forwards issued after a rejection (checkpoint path).</summary>
     internal int Replays { get; private set; }
 
+    private int _traceRounds, _traceTokens;
+    private long _traceDraft, _traceVerify, _traceRound;
+
+    /// <summary><c>DOTLLM_MTP_TRACE=1</c> (#1220): every 16 rounds, the mean draft / verify / whole-round wall time and tokens per round.</summary>
+    private void TraceRound(long draftTicks, long verifyTicks, long roundTicks, int tokens)
+    {
+        _traceRounds++; _traceTokens += tokens; _traceDraft += draftTicks; _traceVerify += verifyTicks; _traceRound += roundTicks;
+        if (_traceRounds % 16 != 0) return;
+        double f = 1000.0 / Stopwatch.Frequency / _traceRounds;
+        Console.Error.WriteLine($"[mtp] rounds={_traceRounds} tokens/round={(double)_traceTokens / _traceRounds:F2} draft_ms={_traceDraft * f:F1} " +
+                                $"verify_ms={_traceVerify * f:F1} round_ms={_traceRound * f:F1}");
+    }
+
     /// <summary>
     /// Creates a new MTP self-speculative decoder.
     /// </summary>
@@ -332,7 +345,10 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
                     deviceId: -1, kvCacheTarget, adapter: null, mtpState: null);
             }
 
-            return new SpeculativeResult(acceptedCount, draftTicks, verifyTicks, k, Stopwatch.GetTimestamp() - roundStart);
+            long roundTicks = Stopwatch.GetTimestamp() - roundStart;
+            if (MtpAdaptiveGate.TraceEnabled)
+                TraceRound(draftTicks, verifyTicks, roundTicks, acceptedCount);
+            return new SpeculativeResult(acceptedCount, draftTicks, verifyTicks, k, roundTicks);
         }
         finally
         {
