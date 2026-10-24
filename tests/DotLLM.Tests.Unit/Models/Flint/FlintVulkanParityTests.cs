@@ -135,7 +135,7 @@ public sealed class FlintVulkanParityTests
         Assert.Equal(expected, cache.AllocatedBytes);
     }
 
-    /// <summary>16-token prefill into the F16 cache, window 4 &lt; 16: the F16-KV sink prefill kernel on every layer.</summary>
+    /// <summary>16-token prefill into the F16 cache, window 4 &lt; 16: the F16-KV GQA flash sink kernel on every layer (#1200).</summary>
     [SkippableTheory]
     [InlineData(64)]
     [InlineData(128)]   // real Flint head_dim
@@ -149,6 +149,7 @@ public sealed class FlintVulkanParityTests
         float[] rows = VulkanRows(vk, ids, prefill: ids.Length, out var cache);
         using (cache) { }
         AssertRowsAgree("prefill f16kv", rows, cpu, fx.Config.VocabSize);
+        Assert.True(vk.SinkFlashDispatchCount > 0, "prefill did not reach the GQA flash sink kernel (#1200)");
     }
 
     /// <summary>
