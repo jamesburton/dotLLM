@@ -1,0 +1,4 @@
+#version 450
+// GQA-grouped scalar flash-attention prefill, head_dim <= 256, F32 K / V (issue #441). Body: attention_flash_gqa.glsl.
+#extension GL_GOOGLE_include_directive : require
+#include "attention_flash_gqa.glsl"

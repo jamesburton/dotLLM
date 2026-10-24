@@ -1,0 +1,124 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Q5_K decode GEMV with an FP32 activation, COALESCED lane=K-position layout.
+//
+//   y[m] = sum_k W_q5k[m,k] * x[k]
+//
+// Same contract and bindings as matmul_q5_k_gemv_f32.comp, with the memory layout of
+// matmul_q4_k_gemv_f32_coalesced.comp (#574): consecutive lanes read consecutive words instead of
+// one lane walking a whole 176-byte super-block. The old kernel gave each THREAD one super-block, so
+// a K = 2560 row (10 super-blocks) kept 10 of its 128 threads busy: the 248k-row Q5_K lm_head of
+// Qwen3.5-4B ran at ~90 GB/s (4.9 ms) on a part that streams ~200 GB/s.
+//
+// Super-block (176 bytes = 44 uint, every field word-aligned):
+//   word 0        = fp16 d | fp16 dmin << 16
+//   words 1..3    = scales[12] (8 x 6-bit scale + 8 x 6-bit min, get_scale_min_k4 packing)
+//   words 4..11   = qh[32]  : bit `sb` of qh[i] is the 5th bit of element i of sub-block sb
+//   words 12..43  = qs[128] : nibble (sb & 1) of qs[(sb >> 1) * 32 + i]
+// value = d*scale[sb]*q5 - dmin*min[sb],  q5 = nibble | (qhbit << 4).
+//
+// Lane l (0..31) of a super-block owns sub-block sb = l / 4 and 8 consecutive i = 8q .. 8q+7
+// (q = l % 4): two words of qs, two words of qh and two vec4 of activations. A 64-lane workgroup
+// covers two super-blocks per window step.
+//
+// Dispatch: one workgroup of 64 threads per output row; subgroupAdd then a shared-memory pass.
+
+#define WG_SIZE 64u
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint weight[]; };  // Q5_K blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { vec4 x4[]; };      // [K/4]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };      // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint blocksPerRow;   // = K / 256 (super-blocks)
+    uint rowUints;       // unused; kept for parity with matmul_q5_k_gemv_f32
+} pc;
+
+const uint UINTS_PER_BLOCK = 44u;
+const uint WINDOW_BLOCKS   = WG_SIZE / 32u;
+
+// Byte i (0..11) of the 12-byte scales region held in words s0..s2.
+uint scaleByte(uint s0, uint s1, uint s2, uint i) {
+    uint w = (i < 4u) ? s0 : ((i < 8u) ? s1 : s2);
+    return (w >> ((i & 3u) * 8u)) & 0xFFu;
+}
+
+// (scale, min) pair j (0..7); mirrors llama.cpp get_scale_min_k4.
+uvec2 scaleMin(uint s0, uint s1, uint s2, uint j) {
+    if (j < 4u)
+        return uvec2(scaleByte(s0, s1, s2, j) & 63u, scaleByte(s0, s1, s2, j + 4u) & 63u);
+    uint hiByte = scaleByte(s0, s1, s2, j + 4u);
+    uint sc = (hiByte & 0xFu)        | (((scaleByte(s0, s1, s2, j - 4u) >> 6u) & 0x3u) << 4u);
+    uint mn = ((hiByte >> 4u) & 0xFu) | (((scaleByte(s0, s1, s2, j)      >> 6u) & 0x3u) << 4u);
+    return uvec2(sc, mn);
+}
+
+// Four 5-bit codes: nibble `shift` of each byte of `u`, plus bit `sb` of each byte of `qh` as the 5th bit.
+vec4 codes5(uint u, uint shift, uint qh, uint sb) {
+    return vec4(float(((u >> shift) & 0xFu)         | (((qh >> sb) & 1u) << 4u)),
+                float(((u >> (shift + 8u)) & 0xFu)  | (((qh >> (8u + sb)) & 1u) << 4u)),
+                float(((u >> (shift + 16u)) & 0xFu) | (((qh >> (16u + sb)) & 1u) << 4u)),
+                float(((u >> (shift + 24u)) & 0xFu) | (((qh >> (24u + sb)) & 1u) << 4u)));
+}
+
+shared float partials[WG_SIZE];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint lane = gl_LocalInvocationID.x;
+    uint blockInWindow = lane >> 5u;
+    uint l32 = lane & 31u;
+    uint sb  = l32 >> 2u;
+    uint q   = l32 & 3u;
+    uint shift = (sb & 1u) * 4u;
+
+    uint rowBase = m * pc.blocksPerRow * UINTS_PER_BLOCK;
+
+    float acc = 0.0;
+    for (uint w0 = 0u; w0 < pc.blocksPerRow; w0 += WINDOW_BLOCKS) {
+        uint blk = w0 + blockInWindow;
+        if (blk >= pc.blocksPerRow)
+            continue;
+
+        uint b = rowBase + blk * UINTS_PER_BLOCK;
+        vec2 dd = unpackHalf2x16(weight[b]);
+        uvec2 sm = scaleMin(weight[b + 1u], weight[b + 2u], weight[b + 3u], sb);
+        float sc = dd.x * float(sm.x);
+        float mn = dd.y * float(sm.y);
+
+        uint qw = b + 12u + (sb >> 1u) * 8u + 2u * q;
+        uint qhw = b + 4u + 2u * q;
+        vec4 cA = codes5(weight[qw],      shift, weight[qhw],      sb);
+        vec4 cB = codes5(weight[qw + 1u], shift, weight[qhw + 1u], sb);
+
+        uint xi = blk * 64u + sb * 8u + 2u * q;
+        vec4 xa = x4[xi];
+        vec4 xb = x4[xi + 1u];
+
+        acc += sc * (dot(cA, xa) + dot(cB, xb))
+             - mn * (xa.x + xa.y + xa.z + xa.w + xb.x + xb.y + xb.z + xb.w);
+    }
+
+    float sum = subgroupAdd(acc);
+    if (gl_NumSubgroups == 1u) {
+        if (subgroupElect())
+            y[m] = sum;
+        return;
+    }
+    if (subgroupElect())
+        partials[gl_SubgroupID] = sum;
+    barrier();
+    if (lane == 0u) {
+        float total = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; i++)
+            total += partials[i];
+        y[m] = total;
+    }
+}

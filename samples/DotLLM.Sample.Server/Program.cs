@@ -28,6 +28,7 @@ Console.WriteLine($"Loading model: {modelPath}");
 var resolvedPath = ServerStartup.ResolveModelPath(options.Model, options.Quant)
     ?? modelPath;
 
+ServerLog.InstallTimestamps();
 var state = ServerStartup.LoadModel(resolvedPath, options);
 var app = ServerStartup.BuildApp(state, args, serveUi: true);
 

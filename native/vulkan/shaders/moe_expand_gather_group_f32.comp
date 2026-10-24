@@ -1,0 +1,56 @@
+#version 450
+// Fused "broadcast + expand-group-by-expert" for the grouped MoE path.
+//
+//   packed[offsets[e] + slot, :] = x[row / topK, :]      for every routed row = t * topK + k with indices[row] == e
+//   permutation[packedRow]   = row                       (packed -> original routed row)
+//   invPermutation[row]      = packedRow                 (original routed row -> packed; consumed by the weighted scatter)
+//
+// The previous path broadcast the [seqLen, hidden] activations to [seqLen * topK, hidden] (moe_broadcast_f32) and then copied every
+// row again into expert-grouped order (moe_expand_group_by_expert_f32): two full passes over a 32 MB matrix. This reads the source
+// token row directly, copies it with 16-byte accesses, and records the inverse permutation so the ungroup pass can be dropped too
+// (moe_weighted_scatter_grouped_f32).
+//
+// One workgroup per routed row. Slot order inside an expert group is the atomic arrival order, exactly as in the unfused kernel, so
+// any per-row consumer (the grouped GEMMs) is order independent.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufX       { vec4 x4[]; };          // [seqLen, hidden] F32
+layout(set = 0, binding = 1, std430) readonly  buffer BufIdx     { int indices[]; };      // [rows] expert of each routed row
+layout(set = 0, binding = 2, std430) readonly  buffer BufOffsets { uint offsets[]; };     // [numExperts + 1]
+layout(set = 0, binding = 3, std430) coherent  buffer BufCount   { uint counters[]; };    // [numExperts], zeroed by moe_expert_offsets
+layout(set = 0, binding = 4, std430) writeonly buffer BufPacked  { vec4 packed4[]; };     // [rows, hidden] expert-grouped
+layout(set = 0, binding = 5, std430) writeonly buffer BufPerm    { uint permutation[]; };    // [rows]
+layout(set = 0, binding = 6, std430) writeonly buffer BufInvPerm { uint invPermutation[]; }; // [rows]
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint hidden;      // multiple of 4
+    uint numExperts;
+    uint topK;
+} pc;
+
+shared uint dstRow;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.rows) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    if (tid == 0u) {
+        uint expert = uint(clamp(indices[row], 0, int(pc.numExperts) - 1));
+        uint slot = atomicAdd(counters[expert], 1u);
+        uint dst = offsets[expert] + slot;
+        permutation[dst] = row;
+        invPermutation[row] = dst;
+        dstRow = dst;
+    }
+    barrier();
+
+    uint hidden4 = pc.hidden >> 2u;
+    uint srcBase = (row / pc.topK) * hidden4;
+    uint dstBase = dstRow * hidden4;
+    for (uint c = tid; c < hidden4; c += gl_WorkGroupSize.x) {
+        packed4[dstBase + c] = x4[srcBase + c];
+    }
+}

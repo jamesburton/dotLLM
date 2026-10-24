@@ -22,6 +22,7 @@ internal sealed class PropertyNameTrie
         string? CompleteName);
 
     private readonly TrieNode[] _nodes;
+    private readonly ulong[] _reachable;
 
     /// <summary>Total number of nodes in the trie.</summary>
     public int NodeCount => _nodes.Length;
@@ -32,13 +33,16 @@ internal sealed class PropertyNameTrie
     /// <param name="values">The strings to insert (property names or enum values).</param>
     public PropertyNameTrie(IEnumerable<string> values)
     {
+        // Capture into a list so we can iterate twice (build + reachable computation).
+        var valuesList = values.ToList();
+
         // Build phase uses Dictionary for convenience, then freezes to sorted arrays.
         var builders = new List<(Dictionary<char, int> Children, bool IsTerminal, string? CompleteName)>
         {
             (new Dictionary<char, int>(), false, null) // root
         };
 
-        foreach (string value in values)
+        foreach (string value in valuesList)
         {
             int current = 0;
             foreach (char c in value)
@@ -66,7 +70,42 @@ internal sealed class PropertyNameTrie
             Array.Sort(children, (a, b) => a.Key.CompareTo(b.Key));
             _nodes[i] = new TrieNode(children, b.IsTerminal, b.CompleteName);
         }
+
+        // Compute _reachable: OR of bit indices (insertion order) for all terminals reachable from each node.
+        _reachable = new ulong[_nodes.Length];
+        {
+            // Map terminal node index → bit position (insertion order of values).
+            int bit = 0;
+            var terminalBit = new Dictionary<int, int>();
+            foreach (string value in valuesList)
+            {
+                int current = 0;
+                foreach (char c in value) { TryGetChild(current, c, out current); }
+                terminalBit[current] = bit++;
+            }
+
+            // Post-order propagation: propagate reachable bits bottom-up from leaves.
+            ulong Compute(int node)
+            {
+                ulong bits = 0;
+                if (terminalBit.TryGetValue(node, out int b) && b < 64)
+                    bits |= 1UL << b;
+                foreach (var (_, child) in _nodes[node].Children)
+                    bits |= Compute(child);
+                _reachable[node] = bits;
+                return bits;
+            }
+            Compute(0);
+        }
     }
+
+    /// <summary>
+    /// Returns the OR of the bit indices (value insertion order) of all terminals
+    /// reachable from the given node. Bit position corresponds to insertion order of
+    /// the value in the constructor's <c>values</c> enumerable.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public ulong ReachableTerminalBits(int nodeIndex) => _reachable[nodeIndex];
 
     /// <summary>
     /// Attempts to advance from <paramref name="nodeIndex"/> by character <paramref name="c"/>.

@@ -436,19 +436,8 @@ public sealed unsafe class OuterProductGemmTests
             for (int t = 0; t < n; t++)
                 FillRandomQ8_0Blocks(input + t * rowBytes, blockCount, rng);
 
-            // Repack: full groups interleaved, tail rows appended row-major.
-            for (int g = 0; g < fullGroups; g++)
-                for (int b = 0; b < blockCount; b++)
-                    for (int r = 0; r < 4; r++)
-                        Buffer.MemoryCopy(
-                            rowMajor + (g * 4 + r) * rowBytes + b * Q8_0BlockBytes,
-                            r4 + g * 4 * rowBytes + (b * 4 + r) * Q8_0BlockBytes,
-                            Q8_0BlockBytes, Q8_0BlockBytes);
-            if (tailRows > 0)
-                Buffer.MemoryCopy(
-                    rowMajor + fullGroups * 4 * rowBytes,
-                    r4 + fullGroups * 4 * rowBytes,
-                    (long)tailRows * rowBytes, (long)tailRows * rowBytes);
+            // The R4 GEMM reads the original row-major rows (#1156).
+            Buffer.MemoryCopy(rowMajor, r4, (long)m * rowBytes, (long)m * rowBytes);
 
             // Reference: per-token row-major ComputeRows, which is what the tiled GEMM dispatches to.
             for (int t = 0; t < n; t++)

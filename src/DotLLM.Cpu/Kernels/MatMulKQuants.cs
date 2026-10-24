@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using DotLLM.Cpu.Threading;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Cpu.Kernels;
 
@@ -14,16 +15,16 @@ namespace DotLLM.Cpu.Kernels;
 /// </summary>
 public static unsafe partial class MatMul
 {
-    private const int Q4_K_BlockBytes = 144;
-    private const int Q5_K_BlockBytes = 176;
-    private const int Q6_K_BlockBytes = 210;
-    private const int KQuantGroupSize = 256;
+    private const int Q4_K_BlockBytes = QuantFormat.Q4_KBlockBytes;
+    private const int Q5_K_BlockBytes = QuantFormat.Q5_KBlockBytes;
+    private const int Q6_K_BlockBytes = QuantFormat.Q6_KBlockBytes;
+    private const int KQuantGroupSize = QuantFormat.KQuantGroupSize;
 
     /// <summary>Q8_K block: float d(4) + sbyte qs[256](256) + short bsums[16](32) = 292 bytes.</summary>
-    public const int Q8_K_BlockBytes = 292;
+    public const int Q8_K_BlockBytes = QuantFormat.Q8_KBlockBytes;
 
     /// <summary>Elements per Q8_K block.</summary>
-    private const int Q8_K_GroupSize = 256;
+    private const int Q8_K_GroupSize = QuantFormat.KQuantGroupSize;
 
     // ──────────────────── Q8_K quantization ────────────────────
 
@@ -180,6 +181,16 @@ public static unsafe partial class MatMul
     /// </summary>
     [SkipLocalsInit]
     internal static float VecDotQ6_K_Q8_KScalar(byte* qk, byte* q8k, int superBlockCount)
+        => VecDotQ6_K_Q8_KScalar(qk, q8k, superBlockCount, Q6_K_BlockBytes);
+
+    /// <summary>
+    /// Stride-aware Q6_K x Q8_K dot product. <paramref name="wStride"/> is the byte distance
+    /// between consecutive super-blocks of the SAME row: Q6_K_BlockBytes for row-major
+    /// weights, 4 * Q6_K_BlockBytes for R4-interleaved weights. Accumulation order is
+    /// therefore identical for both layouts (#530).
+    /// </summary>
+    [SkipLocalsInit]
+    internal static float VecDotQ6_K_Q8_KScalar(byte* qk, byte* q8k, int superBlockCount, int wStride)
     {
         float sumf = 0;
 
@@ -188,7 +199,7 @@ public static unsafe partial class MatMul
             byte* ql = qk;
             byte* qh = qk + 128;
             sbyte* scales = (sbyte*)(qk + 192);
-            float d6 = (float)Unsafe.ReadUnaligned<Half>(qk + 208);
+            float d6 = HalfToSingle(qk + 208);
 
             float d8 = Unsafe.ReadUnaligned<float>(q8k); // float32 scale — no precision loss
             sbyte* q8qs = (sbyte*)(q8k + 4);             // 256 contiguous values
@@ -223,7 +234,7 @@ public static unsafe partial class MatMul
                 sumf += sc * sumi;
             }
 
-            qk += Q6_K_BlockBytes;
+            qk += wStride;
             q8k += Q8_K_BlockBytes;
         }
 
@@ -240,6 +251,16 @@ public static unsafe partial class MatMul
     /// </summary>
     [SkipLocalsInit]
     internal static float VecDotQ4_K_Q8_KScalar(byte* qk, byte* q8k, int superBlockCount)
+        => VecDotQ4_K_Q8_KScalar(qk, q8k, superBlockCount, Q4_K_BlockBytes);
+
+    /// <summary>
+    /// Stride-aware Q4_K x Q8_K dot product. <paramref name="wStride"/> is the byte distance
+    /// between consecutive super-blocks of the SAME row: Q4_K_BlockBytes for row-major
+    /// weights, 4 * Q4_K_BlockBytes for R4-interleaved weights. Accumulation order is
+    /// therefore identical for both layouts (#530).
+    /// </summary>
+    [SkipLocalsInit]
+    internal static float VecDotQ4_K_Q8_KScalar(byte* qk, byte* q8k, int superBlockCount, int wStride)
     {
         float sumf = 0;
 
@@ -248,8 +269,8 @@ public static unsafe partial class MatMul
 
         for (int sb = 0; sb < superBlockCount; sb++)
         {
-            float d4 = (float)Unsafe.ReadUnaligned<Half>(qk);
-            float dmin = (float)Unsafe.ReadUnaligned<Half>(qk + 2);
+            float d4 = HalfToSingle(qk);
+            float dmin = HalfToSingle(qk + 2);
             Dequantize.UnpackQ4Q5Scales(qk + 4, scBuf, mnBuf);
             byte* qs = qk + 16;
 
@@ -280,7 +301,7 @@ public static unsafe partial class MatMul
                 sumf += d8 * (sc * prodSum - mn * q8Sum);
             }
 
-            qk += Q4_K_BlockBytes;
+            qk += wStride;
             q8k += Q8_K_BlockBytes;
         }
 
@@ -296,6 +317,16 @@ public static unsafe partial class MatMul
     /// </summary>
     [SkipLocalsInit]
     internal static float VecDotQ5_K_Q8_KScalar(byte* qk, byte* q8k, int superBlockCount)
+        => VecDotQ5_K_Q8_KScalar(qk, q8k, superBlockCount, Q5_K_BlockBytes);
+
+    /// <summary>
+    /// Stride-aware Q5_K x Q8_K dot product. <paramref name="wStride"/> is the byte distance
+    /// between consecutive super-blocks of the SAME row: Q5_K_BlockBytes for row-major
+    /// weights, 4 * Q5_K_BlockBytes for R4-interleaved weights. Accumulation order is
+    /// therefore identical for both layouts (#530).
+    /// </summary>
+    [SkipLocalsInit]
+    internal static float VecDotQ5_K_Q8_KScalar(byte* qk, byte* q8k, int superBlockCount, int wStride)
     {
         float sumf = 0;
 
@@ -304,8 +335,8 @@ public static unsafe partial class MatMul
 
         for (int sb = 0; sb < superBlockCount; sb++)
         {
-            float d5 = (float)Unsafe.ReadUnaligned<Half>(qk);
-            float dmin = (float)Unsafe.ReadUnaligned<Half>(qk + 2);
+            float d5 = HalfToSingle(qk);
+            float dmin = HalfToSingle(qk + 2);
             Dequantize.UnpackQ4Q5Scales(qk + 4, scBuf, mnBuf);
             byte* qh = qk + 16;
             byte* qs = qk + 48;
@@ -338,7 +369,7 @@ public static unsafe partial class MatMul
                 sumf += d8 * (sc * prodSum - mn * q8Sum);
             }
 
-            qk += Q5_K_BlockBytes;
+            qk += wStride;
             q8k += Q8_K_BlockBytes;
         }
 
@@ -363,8 +394,8 @@ public static unsafe partial class MatMul
 
         for (int sb = 0; sb < superBlockCount; sb++)
         {
-            float d4 = (float)Unsafe.ReadUnaligned<Half>(qk);
-            float dmin = (float)Unsafe.ReadUnaligned<Half>(qk + 2);
+            float d4 = HalfToSingle(qk);
+            float dmin = HalfToSingle(qk + 2);
             Dequantize.UnpackQ4Q5Scales(qk + 4, scBuf, mnBuf);
             byte* qs = qk + 16;
 
@@ -427,7 +458,7 @@ public static unsafe partial class MatMul
             byte* ql = qk;
             byte* qh = qk + 128;
             sbyte* scales = (sbyte*)(qk + 192);
-            float d6 = (float)Unsafe.ReadUnaligned<Half>(qk + 208);
+            float d6 = HalfToSingle(qk + 208);
 
             float d8 = Unsafe.ReadUnaligned<float>(q8k);
             sbyte* q8qs = (sbyte*)(q8k + 4);
@@ -511,8 +542,8 @@ public static unsafe partial class MatMul
 
         for (int sb = 0; sb < superBlockCount; sb++)
         {
-            float d5 = (float)Unsafe.ReadUnaligned<Half>(qk);
-            float dmin = (float)Unsafe.ReadUnaligned<Half>(qk + 2);
+            float d5 = HalfToSingle(qk);
+            float dmin = HalfToSingle(qk + 2);
             Dequantize.UnpackQ4Q5Scales(qk + 4, scBuf, mnBuf);
             byte* qh = qk + 16;
             byte* qs = qk + 48;
@@ -586,13 +617,41 @@ public static unsafe partial class MatMul
     internal static void VecDotQ4_K_Q8_K_4Rows(
         byte* w0, byte* w1, byte* w2, byte* w3,
         byte* q8k, int superBlockCount, float* results)
+        => VecDotQ4_K_Q8_K_4Rows(w0, w1, w2, w3, q8k, superBlockCount, Q4_K_BlockBytes, results);
+
+    /// <summary>
+    /// Stride-aware 4-row Q4_K x Q8_K. <paramref name="wStride"/> is the byte distance between
+    /// consecutive super-blocks of the same row — Q4_K_BlockBytes row-major, 4 * Q4_K_BlockBytes
+    /// for R4-interleaved weights. One call covers the whole K, so the R4 layout accumulates
+    /// in the same vector accumulators, in the same order, as the row-major layout (#530).
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void VecDotQ4_K_Q8_K_4Rows(
+        byte* w0, byte* w1, byte* w2, byte* w3,
+        byte* q8k, int superBlockCount, int wStride, float* results)
+    {
+        if (FastKQuantIsa)
+        {
+            // Bit-identical rewrite with hoisted/vectorised scale + min handling (#933).
+            Q4KRows4Tokens1(w0, w1, w2, w3, q8k, superBlockCount, wStride, results);
+            return;
+        }
+
+        VecDotQ4_K_Q8_K_4RowsReference(w0, w1, w2, w3, q8k, superBlockCount, wStride, results);
+    }
+
+    /// <summary>Original (pre-#933) 4-row Q4_K x Q8_K kernel; the bit-exactness oracle for the fast kernels.</summary>
+    [SkipLocalsInit]
+    internal static void VecDotQ4_K_Q8_K_4RowsReference(
+        byte* w0, byte* w1, byte* w2, byte* w3,
+        byte* q8k, int superBlockCount, int wStride, float* results)
     {
         if (!Avx2.IsSupported)
         {
-            results[0] = VecDotQ4_K_Q8_KScalar(w0, q8k, superBlockCount);
-            results[1] = VecDotQ4_K_Q8_KScalar(w1, q8k, superBlockCount);
-            results[2] = VecDotQ4_K_Q8_KScalar(w2, q8k, superBlockCount);
-            results[3] = VecDotQ4_K_Q8_KScalar(w3, q8k, superBlockCount);
+            results[0] = VecDotQ4_K_Q8_KPortable(w0, q8k, superBlockCount, wStride);
+            results[1] = VecDotQ4_K_Q8_KPortable(w1, q8k, superBlockCount, wStride);
+            results[2] = VecDotQ4_K_Q8_KPortable(w2, q8k, superBlockCount, wStride);
+            results[3] = VecDotQ4_K_Q8_KPortable(w3, q8k, superBlockCount, wStride);
             return;
         }
 
@@ -612,17 +671,17 @@ public static unsafe partial class MatMul
             sbyte* q8qs = (sbyte*)(q8k + 4);
             short* bsums = (short*)(q8k + 260);
 
-            float d4_0 = (float)Unsafe.ReadUnaligned<Half>(w0);
-            float dm0 = (float)Unsafe.ReadUnaligned<Half>(w0 + 2);
+            float d4_0 = HalfToSingle(w0);
+            float dm0 = HalfToSingle(w0 + 2);
             Dequantize.UnpackQ4Q5Scales(w0 + 4, sc0, mn0);
-            float d4_1 = (float)Unsafe.ReadUnaligned<Half>(w1);
-            float dm1 = (float)Unsafe.ReadUnaligned<Half>(w1 + 2);
+            float d4_1 = HalfToSingle(w1);
+            float dm1 = HalfToSingle(w1 + 2);
             Dequantize.UnpackQ4Q5Scales(w1 + 4, sc1, mn1);
-            float d4_2 = (float)Unsafe.ReadUnaligned<Half>(w2);
-            float dm2 = (float)Unsafe.ReadUnaligned<Half>(w2 + 2);
+            float d4_2 = HalfToSingle(w2);
+            float dm2 = HalfToSingle(w2 + 2);
             Dequantize.UnpackQ4Q5Scales(w2 + 4, sc2, mn2);
-            float d4_3 = (float)Unsafe.ReadUnaligned<Half>(w3);
-            float dm3 = (float)Unsafe.ReadUnaligned<Half>(w3 + 2);
+            float d4_3 = HalfToSingle(w3);
+            float dm3 = HalfToSingle(w3 + 2);
             Dequantize.UnpackQ4Q5Scales(w3 + 4, sc3, mn3);
 
             // Min corrections via shared bsums
@@ -706,8 +765,8 @@ public static unsafe partial class MatMul
                 acc3 = Avx.Add(acc3, Avx.Multiply(Vector256.Create(d4_3 * d8), Avx.ConvertToVector256Single(sumi3)));
             }
 
-            w0 += Q4_K_BlockBytes; w1 += Q4_K_BlockBytes;
-            w2 += Q4_K_BlockBytes; w3 += Q4_K_BlockBytes;
+            w0 += wStride; w1 += wStride;
+            w2 += wStride; w3 += wStride;
             q8k += Q8_K_BlockBytes;
         }
 
@@ -724,13 +783,41 @@ public static unsafe partial class MatMul
     internal static void VecDotQ5_K_Q8_K_4Rows(
         byte* w0, byte* w1, byte* w2, byte* w3,
         byte* q8k, int superBlockCount, float* results)
+        => VecDotQ5_K_Q8_K_4Rows(w0, w1, w2, w3, q8k, superBlockCount, Q5_K_BlockBytes, results);
+
+    /// <summary>
+    /// Stride-aware 4-row Q5_K x Q8_K. <paramref name="wStride"/> is the byte distance between
+    /// consecutive super-blocks of the same row — Q5_K_BlockBytes row-major, 4 * Q5_K_BlockBytes
+    /// for R4-interleaved weights. One call covers the whole K, so the R4 layout accumulates
+    /// in the same vector accumulators, in the same order, as the row-major layout (#530).
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void VecDotQ5_K_Q8_K_4Rows(
+        byte* w0, byte* w1, byte* w2, byte* w3,
+        byte* q8k, int superBlockCount, int wStride, float* results)
+    {
+        if (FastKQuantIsa)
+        {
+            // Bit-identical rewrite (#933).
+            Q5KRows4Tokens1(w0, w1, w2, w3, q8k, superBlockCount, wStride, results);
+            return;
+        }
+
+        VecDotQ5_K_Q8_K_4RowsReference(w0, w1, w2, w3, q8k, superBlockCount, wStride, results);
+    }
+
+    /// <summary>Original (pre-#933) 4-row Q5_K x Q8_K kernel; the bit-exactness oracle for the fast kernels.</summary>
+    [SkipLocalsInit]
+    internal static void VecDotQ5_K_Q8_K_4RowsReference(
+        byte* w0, byte* w1, byte* w2, byte* w3,
+        byte* q8k, int superBlockCount, int wStride, float* results)
     {
         if (!Avx2.IsSupported)
         {
-            results[0] = VecDotQ5_K_Q8_KScalar(w0, q8k, superBlockCount);
-            results[1] = VecDotQ5_K_Q8_KScalar(w1, q8k, superBlockCount);
-            results[2] = VecDotQ5_K_Q8_KScalar(w2, q8k, superBlockCount);
-            results[3] = VecDotQ5_K_Q8_KScalar(w3, q8k, superBlockCount);
+            results[0] = VecDotQ5_K_Q8_KPortable(w0, q8k, superBlockCount, wStride);
+            results[1] = VecDotQ5_K_Q8_KPortable(w1, q8k, superBlockCount, wStride);
+            results[2] = VecDotQ5_K_Q8_KPortable(w2, q8k, superBlockCount, wStride);
+            results[3] = VecDotQ5_K_Q8_KPortable(w3, q8k, superBlockCount, wStride);
             return;
         }
 
@@ -750,17 +837,17 @@ public static unsafe partial class MatMul
             sbyte* q8qs = (sbyte*)(q8k + 4);
             short* bsums = (short*)(q8k + 260);
 
-            float d5_0 = (float)Unsafe.ReadUnaligned<Half>(w0);
-            float dm0 = (float)Unsafe.ReadUnaligned<Half>(w0 + 2);
+            float d5_0 = HalfToSingle(w0);
+            float dm0 = HalfToSingle(w0 + 2);
             Dequantize.UnpackQ4Q5Scales(w0 + 4, sc0, mn0);
-            float d5_1 = (float)Unsafe.ReadUnaligned<Half>(w1);
-            float dm1 = (float)Unsafe.ReadUnaligned<Half>(w1 + 2);
+            float d5_1 = HalfToSingle(w1);
+            float dm1 = HalfToSingle(w1 + 2);
             Dequantize.UnpackQ4Q5Scales(w1 + 4, sc1, mn1);
-            float d5_2 = (float)Unsafe.ReadUnaligned<Half>(w2);
-            float dm2 = (float)Unsafe.ReadUnaligned<Half>(w2 + 2);
+            float d5_2 = HalfToSingle(w2);
+            float dm2 = HalfToSingle(w2 + 2);
             Dequantize.UnpackQ4Q5Scales(w2 + 4, sc2, mn2);
-            float d5_3 = (float)Unsafe.ReadUnaligned<Half>(w3);
-            float dm3 = (float)Unsafe.ReadUnaligned<Half>(w3 + 2);
+            float d5_3 = HalfToSingle(w3);
+            float dm3 = HalfToSingle(w3 + 2);
             Dequantize.UnpackQ4Q5Scales(w3 + 4, sc3, mn3);
 
             // Min corrections via shared bsums
@@ -868,8 +955,8 @@ public static unsafe partial class MatMul
                 acc3 = Avx.Add(acc3, Avx.Multiply(Vector256.Create(d5_3 * d8), Avx.ConvertToVector256Single(sumi3)));
             }
 
-            w0 += Q5_K_BlockBytes; w1 += Q5_K_BlockBytes;
-            w2 += Q5_K_BlockBytes; w3 += Q5_K_BlockBytes;
+            w0 += wStride; w1 += wStride;
+            w2 += wStride; w3 += wStride;
             q8k += Q8_K_BlockBytes;
         }
 
@@ -886,13 +973,41 @@ public static unsafe partial class MatMul
     internal static void VecDotQ6_K_Q8_K_4Rows(
         byte* w0, byte* w1, byte* w2, byte* w3,
         byte* q8k, int superBlockCount, float* results)
+        => VecDotQ6_K_Q8_K_4Rows(w0, w1, w2, w3, q8k, superBlockCount, Q6_K_BlockBytes, results);
+
+    /// <summary>
+    /// Stride-aware 4-row Q6_K x Q8_K. <paramref name="wStride"/> is the byte distance between
+    /// consecutive super-blocks of the same row — Q6_K_BlockBytes row-major, 4 * Q6_K_BlockBytes
+    /// for R4-interleaved weights. One call covers the whole K, so the R4 layout accumulates
+    /// in the same vector accumulators, in the same order, as the row-major layout (#530).
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void VecDotQ6_K_Q8_K_4Rows(
+        byte* w0, byte* w1, byte* w2, byte* w3,
+        byte* q8k, int superBlockCount, int wStride, float* results)
+    {
+        if (FastKQuantIsa)
+        {
+            // Bit-identical rewrite (#933).
+            Q6KRows4Tokens1(w0, w1, w2, w3, q8k, superBlockCount, wStride, results);
+            return;
+        }
+
+        VecDotQ6_K_Q8_K_4RowsReference(w0, w1, w2, w3, q8k, superBlockCount, wStride, results);
+    }
+
+    /// <summary>Original (pre-#933) 4-row Q6_K x Q8_K kernel; the bit-exactness oracle for the fast kernels.</summary>
+    [SkipLocalsInit]
+    internal static void VecDotQ6_K_Q8_K_4RowsReference(
+        byte* w0, byte* w1, byte* w2, byte* w3,
+        byte* q8k, int superBlockCount, int wStride, float* results)
     {
         if (!Avx2.IsSupported)
         {
-            results[0] = VecDotQ6_K_Q8_KScalar(w0, q8k, superBlockCount);
-            results[1] = VecDotQ6_K_Q8_KScalar(w1, q8k, superBlockCount);
-            results[2] = VecDotQ6_K_Q8_KScalar(w2, q8k, superBlockCount);
-            results[3] = VecDotQ6_K_Q8_KScalar(w3, q8k, superBlockCount);
+            results[0] = VecDotQ6_K_Q8_KPortable(w0, q8k, superBlockCount, wStride);
+            results[1] = VecDotQ6_K_Q8_KPortable(w1, q8k, superBlockCount, wStride);
+            results[2] = VecDotQ6_K_Q8_KPortable(w2, q8k, superBlockCount, wStride);
+            results[3] = VecDotQ6_K_Q8_KPortable(w3, q8k, superBlockCount, wStride);
             return;
         }
 
@@ -909,13 +1024,13 @@ public static unsafe partial class MatMul
             short* bsums = (short*)(q8k + 260);
 
             byte* ql0 = w0; byte* qh0 = w0 + 128; sbyte* s0 = (sbyte*)(w0 + 192);
-            float d6_0 = (float)Unsafe.ReadUnaligned<Half>(w0 + 208);
+            float d6_0 = HalfToSingle(w0 + 208);
             byte* ql1 = w1; byte* qh1 = w1 + 128; sbyte* s1 = (sbyte*)(w1 + 192);
-            float d6_1 = (float)Unsafe.ReadUnaligned<Half>(w1 + 208);
+            float d6_1 = HalfToSingle(w1 + 208);
             byte* ql2 = w2; byte* qh2 = w2 + 128; sbyte* s2 = (sbyte*)(w2 + 192);
-            float d6_2 = (float)Unsafe.ReadUnaligned<Half>(w2 + 208);
+            float d6_2 = HalfToSingle(w2 + 208);
             byte* ql3 = w3; byte* qh3 = w3 + 128; sbyte* s3 = (sbyte*)(w3 + 192);
-            float d6_3 = (float)Unsafe.ReadUnaligned<Half>(w3 + 208);
+            float d6_3 = HalfToSingle(w3 + 208);
 
             // Bias corrections using shared bsums
             int bc0 = 0, bc1 = 0, bc2 = 0, bc3 = 0;
@@ -1012,8 +1127,8 @@ public static unsafe partial class MatMul
                 acc3 = Avx.Add(acc3, Avx.Multiply(Vector256.Create(d6_3 * d8), Avx.ConvertToVector256Single(sumi3)));
             }
 
-            w0 += Q6_K_BlockBytes; w1 += Q6_K_BlockBytes;
-            w2 += Q6_K_BlockBytes; w3 += Q6_K_BlockBytes;
+            w0 += wStride; w1 += wStride;
+            w2 += wStride; w3 += wStride;
             q8k += Q8_K_BlockBytes;
         }
 
@@ -1049,7 +1164,7 @@ public static unsafe partial class MatMul
         else
         {
             for (; row < m; row++)
-                result[row] = VecDotQ4_K_Q8_KScalar(weights + (long)row * rowBytes, xQ8K, superBlockCount);
+                result[row] = VecDotQ4_K_Q8_KPortable(weights + (long)row * rowBytes, xQ8K, superBlockCount);
         }
     }
 
@@ -1077,7 +1192,7 @@ public static unsafe partial class MatMul
         else
         {
             for (; row < m; row++)
-                result[row] = VecDotQ5_K_Q8_KScalar(weights + (long)row * rowBytes, xQ8K, superBlockCount);
+                result[row] = VecDotQ5_K_Q8_KPortable(weights + (long)row * rowBytes, xQ8K, superBlockCount);
         }
     }
 
@@ -1105,35 +1220,11 @@ public static unsafe partial class MatMul
         else
         {
             for (; row < m; row++)
-                result[row] = VecDotQ6_K_Q8_KScalar(weights + (long)row * rowBytes, xQ8K, superBlockCount);
+                result[row] = VecDotQ6_K_Q8_KPortable(weights + (long)row * rowBytes, xQ8K, superBlockCount);
         }
     }
 
     // ──────────────────── R4 Interleaved ComputeRows for K-quants ────────────────────
-
-    /// <summary>
-    /// Scalar K-quant dot product for a single row within an R4-interleaved group.
-    /// Super-blocks from 4 rows are interleaved; block stride is 4 * blockBytes.
-    /// Extracts per-super-block pointers with R4 addressing and delegates to the scalar kernel.
-    /// </summary>
-    [SkipLocalsInit]
-    private static float VecDotKQuantScalarR4(
-        byte* groupBase, int rowInGroup, byte* q8k, int superBlockCount,
-        int blockBytes,
-        delegate*<byte*, byte*, int, float> scalarFn)
-    {
-        // Cannot call scalar VecDot directly since it expects contiguous super-blocks.
-        // Instead, accumulate per-super-block results with R4 addressing.
-        float sumf = 0;
-        int wStride = 4 * blockBytes;
-        for (int sb = 0; sb < superBlockCount; sb++)
-        {
-            byte* wSb = groupBase + sb * wStride + rowInGroup * blockBytes;
-            byte* q8Sb = q8k + sb * Q8_K_BlockBytes;
-            sumf += scalarFn(wSb, q8Sb, 1);
-        }
-        return sumf;
-    }
 
     /// <summary>
     /// Processes R4-interleaved Q4_K weights. For full groups, extracts 4 row pointers
@@ -1146,33 +1237,18 @@ public static unsafe partial class MatMul
     internal static void ComputeRowsQ4_KInterleaved(byte* repackedWeights, byte* xQ8K, float* result,
         int fullGroups, int tailRows, int superBlockCount)
     {
+        nint rowStride = (nint)superBlockCount * Q4_K_BlockBytes;
         int groupBytes = 4 * superBlockCount * Q4_K_BlockBytes;
 
         for (int g = 0; g < fullGroups; g++)
         {
             byte* groupBase = repackedWeights + (long)g * groupBytes;
-            if (Avx2.IsSupported)
-            {
-                float r0 = 0, r1 = 0, r2 = 0, r3 = 0;
-                int wStride = 4 * Q4_K_BlockBytes;
-                float* tmp = result + g * 4; // reuse output as scratch
-                for (int sb = 0; sb < superBlockCount; sb++)
-                {
-                    byte* sbBase = groupBase + sb * wStride;
-                    VecDotQ4_K_Q8_K_4Rows(sbBase, sbBase + Q4_K_BlockBytes,
-                        sbBase + 2 * Q4_K_BlockBytes, sbBase + 3 * Q4_K_BlockBytes,
-                        xQ8K + sb * Q8_K_BlockBytes, 1, tmp);
-                    r0 += tmp[0]; r1 += tmp[1]; r2 += tmp[2]; r3 += tmp[3];
-                }
-                result[g * 4] = r0; result[g * 4 + 1] = r1;
-                result[g * 4 + 2] = r2; result[g * 4 + 3] = r3;
-            }
-            else
-            {
-                for (int r = 0; r < 4; r++)
-                    result[g * 4 + r] = VecDotKQuantScalarR4(groupBase, r, xQ8K,
-                        superBlockCount, Q4_K_BlockBytes, &VecDotQ4_K_Q8_KScalar);
-            }
+            // One strided call over the whole K, exactly as the row-major ComputeRowsQ4_K
+            // path does - same accumulators, same order, so the R4 and row-major layouts
+            // produce bit-identical results (#530).
+            VecDotQ4_K_Q8_K_4Rows(groupBase, groupBase + rowStride,
+                groupBase + 2 * rowStride, groupBase + 3 * rowStride,
+                xQ8K, superBlockCount, Q4_K_BlockBytes, result + g * 4);
         }
 
         if (tailRows > 0)
@@ -1182,7 +1258,7 @@ public static unsafe partial class MatMul
             for (int r = 0; r < tailRows; r++)
                 result[fullGroups * 4 + r] = Avx2.IsSupported
                     ? VecDotQ4_K_Q8_KAvx2(tailBase + (long)r * rowBytes, xQ8K, superBlockCount)
-                    : VecDotQ4_K_Q8_KScalar(tailBase + (long)r * rowBytes, xQ8K, superBlockCount);
+                    : VecDotQ4_K_Q8_KPortable(tailBase + (long)r * rowBytes, xQ8K, superBlockCount);
         }
     }
 
@@ -1194,33 +1270,18 @@ public static unsafe partial class MatMul
     internal static void ComputeRowsQ5_KInterleaved(byte* repackedWeights, byte* xQ8K, float* result,
         int fullGroups, int tailRows, int superBlockCount)
     {
+        nint rowStride = (nint)superBlockCount * Q5_K_BlockBytes;
         int groupBytes = 4 * superBlockCount * Q5_K_BlockBytes;
 
         for (int g = 0; g < fullGroups; g++)
         {
             byte* groupBase = repackedWeights + (long)g * groupBytes;
-            if (Avx2.IsSupported)
-            {
-                float r0 = 0, r1 = 0, r2 = 0, r3 = 0;
-                int wStride = 4 * Q5_K_BlockBytes;
-                float* tmp = result + g * 4;
-                for (int sb = 0; sb < superBlockCount; sb++)
-                {
-                    byte* sbBase = groupBase + sb * wStride;
-                    VecDotQ5_K_Q8_K_4Rows(sbBase, sbBase + Q5_K_BlockBytes,
-                        sbBase + 2 * Q5_K_BlockBytes, sbBase + 3 * Q5_K_BlockBytes,
-                        xQ8K + sb * Q8_K_BlockBytes, 1, tmp);
-                    r0 += tmp[0]; r1 += tmp[1]; r2 += tmp[2]; r3 += tmp[3];
-                }
-                result[g * 4] = r0; result[g * 4 + 1] = r1;
-                result[g * 4 + 2] = r2; result[g * 4 + 3] = r3;
-            }
-            else
-            {
-                for (int r = 0; r < 4; r++)
-                    result[g * 4 + r] = VecDotKQuantScalarR4(groupBase, r, xQ8K,
-                        superBlockCount, Q5_K_BlockBytes, &VecDotQ5_K_Q8_KScalar);
-            }
+            // One strided call over the whole K, exactly as the row-major ComputeRowsQ5_K
+            // path does - same accumulators, same order, so the R4 and row-major layouts
+            // produce bit-identical results (#530).
+            VecDotQ5_K_Q8_K_4Rows(groupBase, groupBase + rowStride,
+                groupBase + 2 * rowStride, groupBase + 3 * rowStride,
+                xQ8K, superBlockCount, Q5_K_BlockBytes, result + g * 4);
         }
 
         if (tailRows > 0)
@@ -1230,7 +1291,7 @@ public static unsafe partial class MatMul
             for (int r = 0; r < tailRows; r++)
                 result[fullGroups * 4 + r] = Avx2.IsSupported
                     ? VecDotQ5_K_Q8_KAvx2(tailBase + (long)r * rowBytes, xQ8K, superBlockCount)
-                    : VecDotQ5_K_Q8_KScalar(tailBase + (long)r * rowBytes, xQ8K, superBlockCount);
+                    : VecDotQ5_K_Q8_KPortable(tailBase + (long)r * rowBytes, xQ8K, superBlockCount);
         }
     }
 
@@ -1242,33 +1303,18 @@ public static unsafe partial class MatMul
     internal static void ComputeRowsQ6_KInterleaved(byte* repackedWeights, byte* xQ8K, float* result,
         int fullGroups, int tailRows, int superBlockCount)
     {
+        nint rowStride = (nint)superBlockCount * Q6_K_BlockBytes;
         int groupBytes = 4 * superBlockCount * Q6_K_BlockBytes;
 
         for (int g = 0; g < fullGroups; g++)
         {
             byte* groupBase = repackedWeights + (long)g * groupBytes;
-            if (Avx2.IsSupported)
-            {
-                float r0 = 0, r1 = 0, r2 = 0, r3 = 0;
-                int wStride = 4 * Q6_K_BlockBytes;
-                float* tmp = result + g * 4;
-                for (int sb = 0; sb < superBlockCount; sb++)
-                {
-                    byte* sbBase = groupBase + sb * wStride;
-                    VecDotQ6_K_Q8_K_4Rows(sbBase, sbBase + Q6_K_BlockBytes,
-                        sbBase + 2 * Q6_K_BlockBytes, sbBase + 3 * Q6_K_BlockBytes,
-                        xQ8K + sb * Q8_K_BlockBytes, 1, tmp);
-                    r0 += tmp[0]; r1 += tmp[1]; r2 += tmp[2]; r3 += tmp[3];
-                }
-                result[g * 4] = r0; result[g * 4 + 1] = r1;
-                result[g * 4 + 2] = r2; result[g * 4 + 3] = r3;
-            }
-            else
-            {
-                for (int r = 0; r < 4; r++)
-                    result[g * 4 + r] = VecDotKQuantScalarR4(groupBase, r, xQ8K,
-                        superBlockCount, Q6_K_BlockBytes, &VecDotQ6_K_Q8_KScalar);
-            }
+            // One strided call over the whole K, exactly as the row-major ComputeRowsQ6_K
+            // path does - same accumulators, same order, so the R4 and row-major layouts
+            // produce bit-identical results (#530).
+            VecDotQ6_K_Q8_K_4Rows(groupBase, groupBase + rowStride,
+                groupBase + 2 * rowStride, groupBase + 3 * rowStride,
+                xQ8K, superBlockCount, Q6_K_BlockBytes, result + g * 4);
         }
 
         if (tailRows > 0)
@@ -1278,7 +1324,7 @@ public static unsafe partial class MatMul
             for (int r = 0; r < tailRows; r++)
                 result[fullGroups * 4 + r] = Avx2.IsSupported
                     ? VecDotQ6_K_Q8_KAvx2(tailBase + (long)r * rowBytes, xQ8K, superBlockCount)
-                    : VecDotQ6_K_Q8_KScalar(tailBase + (long)r * rowBytes, xQ8K, superBlockCount);
+                    : VecDotQ6_K_Q8_KPortable(tailBase + (long)r * rowBytes, xQ8K, superBlockCount);
         }
     }
 
@@ -1754,7 +1800,7 @@ public static unsafe partial class MatMul
                 Weights = weights, InputQ8 = preQuantizedInput, C = c,
                 M = m, N = n, SuperBlockCount = superBlockCount2,
                 TileM = tileM, KRowBytes = kRowBytes, Q8RowBytes = q8RowBytes,
-                ComputeRows = computeRows
+                ComputeRows = computeRows, KBlockBytes = kBlockBytes
             };
             pool.Dispatch((nint)(&ctx), &GemmTiledKQuantWorker);
             return;
@@ -1786,7 +1832,7 @@ public static unsafe partial class MatMul
                     Weights = weights, InputQ8 = inputQ8, C = c,
                     M = m, N = n, SuperBlockCount = superBlockCount2,
                     TileM = tileM, KRowBytes = kRowBytes, Q8RowBytes = q8RowBytes,
-                    ComputeRows = computeRows
+                    ComputeRows = computeRows, KBlockBytes = kBlockBytes
                 };
                 pool.Dispatch((nint)(&ctx), &GemmTiledKQuantWorker);
             }
@@ -1802,7 +1848,7 @@ public static unsafe partial class MatMul
         PartitionRows(ctx.M, threadIdx, threadCount, out int start, out int count);
         if (count == 0) return;
         ComputeKQuantR4Range(ref ctx, start, count, Q4_K_BlockBytes,
-            &VecDotQ4_K_Q8_K_4Rows, &VecDotQ4_K_Q8_KAvx2, &VecDotQ4_K_Q8_KScalar);
+            &VecDotQ4_K_Q8_K_4Rows, &VecDotQ4_K_Q8_KAvx2, &VecDotQ4_K_Q8_KPortable);
     }
 
     private static void ComputeRowsQ5_KR4Worker(nint ctxPtr, int threadIdx, int threadCount)
@@ -1811,7 +1857,7 @@ public static unsafe partial class MatMul
         PartitionRows(ctx.M, threadIdx, threadCount, out int start, out int count);
         if (count == 0) return;
         ComputeKQuantR4Range(ref ctx, start, count, Q5_K_BlockBytes,
-            &VecDotQ5_K_Q8_K_4Rows, &VecDotQ5_K_Q8_KAvx2, &VecDotQ5_K_Q8_KScalar);
+            &VecDotQ5_K_Q8_K_4Rows, &VecDotQ5_K_Q8_KAvx2, &VecDotQ5_K_Q8_KPortable);
     }
 
     private static void ComputeRowsQ6_KR4Worker(nint ctxPtr, int threadIdx, int threadCount)
@@ -1820,7 +1866,7 @@ public static unsafe partial class MatMul
         PartitionRows(ctx.M, threadIdx, threadCount, out int start, out int count);
         if (count == 0) return;
         ComputeKQuantR4Range(ref ctx, start, count, Q6_K_BlockBytes,
-            &VecDotQ6_K_Q8_K_4Rows, &VecDotQ6_K_Q8_KAvx2, &VecDotQ6_K_Q8_KScalar);
+            &VecDotQ6_K_Q8_K_4Rows, &VecDotQ6_K_Q8_KAvx2, &VecDotQ6_K_Q8_KPortable);
     }
 
     /// <summary>
@@ -1830,7 +1876,7 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     private static void ComputeKQuantR4Range(ref ComputeRowsR4Ctx ctx, int start, int count,
         int kBlockBytes,
-        delegate*<byte*, byte*, byte*, byte*, byte*, int, float*, void> vecDot4Rows,
+        delegate*<byte*, byte*, byte*, byte*, byte*, int, int, float*, void> vecDot4Rows,
         delegate*<byte*, byte*, int, float> vecDotAvx2,
         delegate*<byte*, byte*, int, float> vecDotScalar)
     {
@@ -1844,28 +1890,10 @@ public static unsafe partial class MatMul
         for (int g = startGroup; g < endGroup; g++)
         {
             byte* groupBase = ctx.RepackedWeights + (long)g * groupBytes;
-            if (Avx2.IsSupported)
-            {
-                float r0 = 0, r1 = 0, r2 = 0, r3 = 0;
-                int wStride = 4 * kBlockBytes;
-                float* tmp = ctx.Result + g * 4;
-                for (int sb = 0; sb < ctx.BlockCount; sb++)
-                {
-                    byte* sbBase = groupBase + sb * wStride;
-                    vecDot4Rows(sbBase, sbBase + kBlockBytes,
-                        sbBase + 2 * kBlockBytes, sbBase + 3 * kBlockBytes,
-                        ctx.XQ + sb * Q8_K_BlockBytes, 1, tmp);
-                    r0 += tmp[0]; r1 += tmp[1]; r2 += tmp[2]; r3 += tmp[3];
-                }
-                ctx.Result[g * 4] = r0; ctx.Result[g * 4 + 1] = r1;
-                ctx.Result[g * 4 + 2] = r2; ctx.Result[g * 4 + 3] = r3;
-            }
-            else
-            {
-                for (int r = 0; r < 4; r++)
-                    ctx.Result[g * 4 + r] = VecDotKQuantScalarR4(groupBase, r, ctx.XQ,
-                        ctx.BlockCount, kBlockBytes, vecDotScalar);
-            }
+            // Single strided call over the whole K — see ComputeRowsQ4_KInterleaved (#530).
+            vecDot4Rows(groupBase, groupBase + rowBytes,
+                groupBase + 2 * rowBytes, groupBase + 3 * rowBytes,
+                ctx.XQ, ctx.BlockCount, kBlockBytes, ctx.Result + g * 4); // #1156: original row-major rows
         }
 
         if (ctx.TailRows > 0 && end > ctx.FullGroups * 4)
@@ -1912,6 +1940,7 @@ public static unsafe partial class MatMul
         public int TileM;
         public int KRowBytes;
         public int Q8RowBytes;
+        public int KBlockBytes;
         public delegate*<byte*, byte*, float*, int, int, void> ComputeRows;
     }
 
@@ -1919,16 +1948,55 @@ public static unsafe partial class MatMul
     {
         ref var ctx = ref Unsafe.AsRef<GemmTiledKQuantCtx>((void*)ctxPtr);
         int totalTiles = (ctx.M + ctx.TileM - 1) / ctx.TileM;
-        int tilesPerThread = (totalTiles + threadCount - 1) / threadCount;
-        int startTile = threadIdx * tilesPerThread;
-        int endTile = Math.Min(startTile + tilesPerThread, totalTiles);
+        ComputeThreadPool.PartitionRange(totalTiles, threadIdx, threadCount, out int startTile, out int endTile);
+
+        // Q4_K / Q6_K on AVX2: weights of a 4-row group are decoded once per 4 tokens (#933), bit-identical
+        // to the per-token ComputeRows path. Everything else (and the <4-token / <4-row remainders) is unchanged.
+        bool tok4 = FastKQuantIsa
+            && (ctx.KBlockBytes == Q4_K_BlockBytes || ctx.KBlockBytes == Q5_K_BlockBytes || ctx.KBlockBytes == Q6_K_BlockBytes);
+        bool q6 = ctx.KBlockBytes == Q6_K_BlockBytes;
+        bool q5 = ctx.KBlockBytes == Q5_K_BlockBytes;
 
         for (int tile = startTile; tile < endTile; tile++)
         {
             int mStart = tile * ctx.TileM;
             int tileRows = Math.Min(ctx.TileM, ctx.M - mStart);
             byte* tileWeights = ctx.Weights + (long)mStart * ctx.KRowBytes;
-            for (int t = 0; t < ctx.N; t++)
+            int t = 0;
+            int groupRows = tileRows & ~3;
+            if (tok4 && groupRows > 0)
+            {
+                for (; t + 4 <= ctx.N; t += 4)
+                {
+                    byte* xq = ctx.InputQ8 + (long)t * ctx.Q8RowBytes;
+                    for (int r = 0; r < groupRows; r += 4)
+                    {
+                        byte* gw = tileWeights + (long)r * ctx.KRowBytes;
+                        float* cc = ctx.C + (long)t * ctx.M + mStart + r;
+                        for (int rr = 0; rr < 4; rr++)
+                        {
+                            if (q6)
+                                Q6KRowTok4(gw + (long)rr * ctx.KRowBytes, xq, ctx.Q8RowBytes, ctx.SuperBlockCount,
+                                    Q6_K_BlockBytes, cc + rr, ctx.M);
+                            else if (q5)
+                                Q5KRowTok4(gw + (long)rr * ctx.KRowBytes, xq, ctx.Q8RowBytes, ctx.SuperBlockCount,
+                                    Q5_K_BlockBytes, cc + rr, ctx.M);
+                            else
+                                Q4KRowTok4(gw + (long)rr * ctx.KRowBytes, xq, ctx.Q8RowBytes, ctx.SuperBlockCount,
+                                    Q4_K_BlockBytes, cc + rr, ctx.M);
+                        }
+                    }
+
+                    if (tileRows > groupRows)
+                    {
+                        for (int tt = t; tt < t + 4; tt++)
+                            ctx.ComputeRows(tileWeights + (long)groupRows * ctx.KRowBytes, ctx.InputQ8 + (long)tt * ctx.Q8RowBytes,
+                                ctx.C + (long)tt * ctx.M + mStart + groupRows, tileRows - groupRows, ctx.SuperBlockCount);
+                    }
+                }
+            }
+
+            for (; t < ctx.N; t++)
                 ctx.ComputeRows(tileWeights, ctx.InputQ8 + t * ctx.Q8RowBytes,
                     ctx.C + t * ctx.M + mStart, tileRows, ctx.SuperBlockCount);
         }
@@ -2013,9 +2081,7 @@ public static unsafe partial class MatMul
         ref var ctx = ref Unsafe.AsRef<OuterProductGemmKQuantCtx>((void*)ctxPtr);
 
         // Partition tokens across threads
-        int tokensPerThread = (ctx.N + threadCount - 1) / threadCount;
-        int startToken = threadIdx * tokensPerThread;
-        int endToken = Math.Min(startToken + tokensPerThread, ctx.N);
+        ComputeThreadPool.PartitionRange(ctx.N, threadIdx, threadCount, out int startToken, out int endToken);
 
         if (startToken >= ctx.N) return;
 

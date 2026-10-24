@@ -1,0 +1,66 @@
+#version 450
+// KV-cache quantization: FP32 → Q4_0 (split layout: float scale + packed nibbles).
+//
+// Reads contiguous FP32 elements and writes per-32-element block:
+//   scales[blockIdx] = float (max_abs / 7)
+//   quants[blockIdx*4 + 0..3] = uint (8 nibbles per uint, lo=even elem, hi=odd)
+//
+// Nibble convention (matches GGUF Q4_0 / CPU KvQuantize):
+//   q = clamp(round(val / scale) + 8, 0, 15)
+//   byte[j] = (elem[2j+1] << 4) | elem[2j]
+//   dequant: val = scale * (nibble - 8)
+//
+// Dispatch: ceil(totalBlocks / 256) workgroups × 1 × 1.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Src    { float src[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Scales { float scales[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer Quants { uint  quants[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint totalBlocks;
+    uint srcOffset;
+    uint dstOffset;
+} pc;
+
+const uint QK = 32u;
+
+void main() {
+    uint b = gl_GlobalInvocationID.x;
+    if (b >= pc.totalBlocks) return;
+
+    uint srcBase  = pc.srcOffset + b * QK;
+    uint dstBlock = pc.dstOffset + b;
+
+    // Pass 1: max absolute value.
+    float amax = 0.0;
+    for (uint i = 0u; i < QK; i++) {
+        amax = max(amax, abs(src[srcBase + i]));
+    }
+
+    float scale = amax / 7.0;
+    float invScale = (scale != 0.0) ? (1.0 / scale) : 0.0;
+    scales[dstBlock] = scale;
+
+    // Pass 2: quantize to 4-bit unsigned [0,15], pack 8 elements per uint.
+    // Each uint holds 4 bytes; each byte packs two nibbles (lo=even, hi=odd element).
+    uint qBase = dstBlock * 4u;
+    for (uint g = 0u; g < 4u; g++) {
+        uint e = srcBase + g * 8u;
+        uint b0lo = uint(clamp(int(round(src[e + 0u] * invScale)) + 8, 0, 15));
+        uint b0hi = uint(clamp(int(round(src[e + 1u] * invScale)) + 8, 0, 15));
+        uint b1lo = uint(clamp(int(round(src[e + 2u] * invScale)) + 8, 0, 15));
+        uint b1hi = uint(clamp(int(round(src[e + 3u] * invScale)) + 8, 0, 15));
+        uint b2lo = uint(clamp(int(round(src[e + 4u] * invScale)) + 8, 0, 15));
+        uint b2hi = uint(clamp(int(round(src[e + 5u] * invScale)) + 8, 0, 15));
+        uint b3lo = uint(clamp(int(round(src[e + 6u] * invScale)) + 8, 0, 15));
+        uint b3hi = uint(clamp(int(round(src[e + 7u] * invScale)) + 8, 0, 15));
+
+        uint packed = (b0lo | (b0hi << 4u))
+                    | ((b1lo | (b1hi << 4u)) << 8u)
+                    | ((b2lo | (b2hi << 4u)) << 16u)
+                    | ((b3lo | (b3hi << 4u)) << 24u);
+        quants[qBase + g] = packed;
+    }
+}
