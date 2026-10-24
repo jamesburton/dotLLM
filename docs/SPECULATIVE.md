@@ -1058,10 +1058,45 @@ too. With a drafter attached the adaptive gate tries speculation first (`MtpGate
 A follow-up applies the same read-only verify + replay to #1194's GDN path (`qwen35`), which still keeps a pre-verify state copy
 (174 MiB at DFlash K=7) on CPU, CUDA and Vulkan.
 
-**Measured.** Real Bolt 24GB on CPU (Core Ultra 7 155H), 24 tokens greedy, `DOTLLM_MTP_ADAPTIVE=0`: speculative output identical to
-plain, about 5.75 tokens per round (4 drafts for 23 tokens). Strix Vulkan numbers against llama.cpp `draft-dflash` are still to come.
-llama.cpp's output is not greedy-exact (#1237 table). That is expected from its batched verify kernels (GEMM, flash attention,
-grouped MoE), whose reduction order differs from decode; the drafter itself cannot change the output.
+**Measured.** Real Bolt 24GB on CPU (Core Ultra 7 155H), 24 tokens greedy: speculative output identical to plain, ~5.75 tokens/round.
+Strix (Vulkan):
+
+These runs used Bolt 24GB with the real LiLiCorr drafter on Strix Halo 8060S. Each figure is the median of 3 interleaved reps:
+128 greedy tokens, `DOTLLM_MTP_ADAPTIVE=0`, K = 7 drafts (`--spec-draft-n-max 7` for llama.cpp master 0ae0e1976 Vulkan).
+p0 is prose ("The history of the printing press began in"); p1 is code (Python quicksort).
+
+| Strix 8060S, Bolt 24GB | p0 tok/s | p1 tok/s | tokens/round | peak private / GPU-shared MiB |
+|---|---|---|---|---|
+| dotLLM plain | 30.05 | 29.72 | 1 | 21,841 / 21,359 |
+| dotLLM + LiLiCorr | 25.86 | 12.86 | p0 7.44, p1 3.3–3.75 | 22,883 / 22,353 |
+| llama.cpp plain | 28.88 | 28.89 | 1 | 21,872 / 21,424 |
+| llama.cpp `draft-dflash` + LiLiCorr | 58.14 | 28.04 | acceptance p0 0.89, p1 0.33 | 24,972 / 24,143 |
+
+- **Exactness:** dotLLM LiLiCorr output == dotLLM plain on **6/6** runs. On these two prompts llama.cpp `draft-dflash` also matched
+  its own plain output.
+- **Memory:** speculative dotLLM uses **2.1 GiB less private / 1.8 GiB less GPU memory** than llama.cpp.
+- **Speed:** dotLLM speculation is **slower than plain**. The drafts are as good as llama.cpp's (p0: 7.44 tokens/round), but a
+  round costs ~285 ms: verify 187 ms plus draft 93 ms.
+- **The verify is the gap.** `DOTLLM_VK_NEMOTRON_PROFILE` on an 8-row verify gave 174 ms wall:
+
+| Bucket | Time | What it is |
+|---|---|---|
+| `proj_gdn` | 63 ms | NVFP4 SSM projections |
+| `moe_dense` | 54 ms | IQ2_XXS shared expert, Q8_0 latent, F32 router |
+| `moe_routed` | 23 ms | routed experts |
+| `lm_head` | 8.5 ms | LM head |
+
+  At 3 rows the same buckets are 25.5 / 19 / 10.6 ms. So the column GEMVs scale linearly with rows: each workgroup decodes the
+  weights again for its own column. The weight bytes are shared through the cache, but the NVFP4/IQ2_XXS dequant ALU work is not.
+- **Draft:** 93 ms per round. About 32 ms is the host-side LiLiCorr head, 17 ms the 7-row LM head plus its 3.6 MB logits readback,
+  and the rest the drafter trunk.
+
+**Next (follow-ups):**
+
+1. Multi-column NVFP4 / IQ2_XXS / Q8_0 GEMVs that decode each weight block once and apply it to every column, keeping each
+   column's accumulation order identical to the one-column kernel (so decode stays bit-identical).
+2. The LiLiCorr head and the top-k/softmax on the GPU (no 3.6 MB logits readback).
+3. Read-only verify + replay for #1194's GDN path.
 
 **Qwen3.8-27B / Bonsai-2 27B.** No LiLiCorr head is published for `qwen35` targets. The head is a cheap re-scorer (~70 MB) trained
 on a frozen DFlash backbone with the target's hidden states, so one could be trained for the z-lab / incoai DFlash2 drafters.
