@@ -883,6 +883,34 @@ host CPU was shared with other jobs, hence ranges). Every run was token-identica
 The extra DFlash VRAM is the drafter (1.1 GB) plus the per-row GDN snapshots of a 7-row verify (#473, ~0.9 GB, F32). On the
 CPU (Strix Halo, Bonsai-2) DFlash breaks even (3.3 vs 3.4 tok/s): an 8-row CPU verify costs ~7× a decode step there.
 
+**Strix Halo (8060S, Vulkan, #1193).** 128 tokens greedy, `DOTLLM_MTP_ADAPTIVE=0`, `DOTLLM_DFLASH_DRAFT=K`, four prompts (code,
+prose, Q&A, C#); llama.cpp master (0ae0e1976) Vulkan `llama-server` on the same box and files. Every dotLLM run was token-identical to
+its plain decode. tok/s per prompt:
+
+| Qwen3.8-27B Q4_K_M | code | prose | Q&A | C# | peak private / GPU-shared |
+|---|---|---|---|---|---|
+| dotLLM plain | 10.3 | 10.5 | 10.4 | 10.5 | 18.7 / 17.9 GiB |
+| dotLLM MTP K=3 (Q8_0 head) | 20.6 | 16.1 | 15.8 | 19.5 | 19.7 / 18.9 GiB |
+| dotLLM DFlash K=3 (incoai DFlash2) | 22.5 | 17.0 | 14.3 | 20.3 | 20.3 / 19.5 GiB |
+| dotLLM DFlash K=7 | 25.6 | 11.1 | 9.3 | 17.4 | 20.9 / 20.1 GiB |
+| llama.cpp plain | 10.8 | 10.9 | 11.0 | 11.0 | 19.2 / 18.3 GiB |
+| llama.cpp MTP K=3 | 28.1 | 20.9 | 20.5 | 24.6 | 23.4 / 21.9 GiB |
+| llama.cpp DFlash K=3 | 31.5 | 22.2 | 20.3 | 27.3 | 21.8 / 20.6 GiB |
+| llama.cpp DFlash K=7 | 36.7 | 13.9 | 14.2 | 21.7 | 22.4 / 21.2 GiB |
+
+DFlash tokens per round (K=3 / 7): code 3.9 / 7.1, prose 2.8 / 2.8, C# 3.5 / 4.6. The gap to llama.cpp is the target's multi-row
+verify (shared with MTP), not the drafter: a draft costs ~19 ms at K=3 on Qwen3.8 (layers ~12 ms, the 248k-row Q6_K head ~7 ms).
+
+| Bonsai-2 27B PQ2_0 (naklitechie r3) | code | prose | C# | peak private / GPU-shared |
+|---|---|---|---|---|
+| dotLLM plain | 23.6 | 23.6 | 23.5 | 8.4 / 7.6 GiB |
+| dotLLM MTP K=3 (embedded head) | 35.3 | 25.9 | 37.0 | 8.8 / 8.0 GiB |
+| dotLLM DFlash K=3 | 33.2 | 27.2 | 41.3 | 10.0 / 9.1 GiB |
+| dotLLM DFlash K=5 | 44.2 | 26.3 | 45.3 | 10.2 / 9.4 GiB |
+
+llama.cpp master cannot load PQ2_0 (the PrismML fork is CUDA/CPU only), so Bonsai-2 has no comparator on Strix. The Q&A prompt ends at
+once on this abliterated checkpoint (EOS first) and is left out.
+
 **Exactness.** Greedy output is token-identical to plain decode (`DFlashDrafterTests`, `CudaDFlashTests`,
 `VulkanDFlashTests`; real Bonsai-2 27B on the RTX 3060). The selector's greedy draft is a point mass, so sampled decoding
 uses the MTP decoder's exact accept/residual rule unchanged.
