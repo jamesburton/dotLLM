@@ -1,0 +1,5 @@
+#version 450
+// F16-KV twin of attention_flash_gqa_cm.comp (issue #441): reads the F16 cache rows in place. Body: attention_flash_gqa_cm.glsl.
+#define KV_F16 1
+#extension GL_GOOGLE_include_directive : require
+#include "attention_flash_gqa_cm.glsl"

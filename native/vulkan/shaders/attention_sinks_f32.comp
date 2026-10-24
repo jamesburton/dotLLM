@@ -1,0 +1,5 @@
+#version 450
+// Attention with learned per-head sinks (gpt-oss #737, MiMo-V2, Flint).
+// Body: attention_sinks_f32.glsl (issue #1171 split it out so the F32 and F16-KV pipelines share one source).
+#extension GL_GOOGLE_include_directive : require
+#include "attention_sinks_f32.glsl"

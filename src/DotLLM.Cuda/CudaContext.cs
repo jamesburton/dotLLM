@@ -47,6 +47,6 @@ public sealed class CudaContext : IDisposable
     {
         nint ctx = Interlocked.Exchange(ref _ctx, 0);
         if (ctx != 0)
-            CudaDriverApi.cuCtxDestroy_v2(ctx);
+            CudaTeardownDiagnostics.RecordDestroy("CUcontext", CudaDriverApi.cuCtxDestroy_v2(ctx));
     }
 }

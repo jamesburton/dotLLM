@@ -38,7 +38,7 @@ public sealed class StreamingToolCallAccumulator
     /// Attempts to parse completed tool calls from the accumulated buffer.
     /// </summary>
     /// <returns>Parsed tool calls, or null if parsing fails or is incomplete.</returns>
-    public ToolCall[]? TryParseCompleted() => _parser.TryParse(_buffer.ToString());
+    public ToolCall[]? TryParseCompleted(IReadOnlyList<ToolDefinition>? tools = null) => _parser.TryParse(_buffer.ToString(), tools);
 
     /// <summary>Gets the full accumulated text.</summary>
     public string GetAccumulatedText() => _buffer.ToString();
