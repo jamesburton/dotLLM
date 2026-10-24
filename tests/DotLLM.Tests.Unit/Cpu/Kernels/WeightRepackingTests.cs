@@ -20,60 +20,27 @@ public sealed unsafe class WeightRepackingTests
 
     // ──────────────────── Roundtrip tests ────────────────────
 
+    /// <summary>#1156: the view is the source itself. No allocation, no copy, nothing freed on dispose.</summary>
     [Theory]
-    [InlineData(QuantizationType.Q8_0, 8, 128)]   // 2 full groups, 0 tail
-    [InlineData(QuantizationType.Q8_0, 12, 64)]    // 3 full groups, 0 tail
-    [InlineData(QuantizationType.Q5_0, 8, 64)]     // 2 full groups, 0 tail
-    [InlineData(QuantizationType.Q5_0, 4, 96)]     // 1 full group, 0 tail
-    public void RepackR4_Roundtrip_BlocksAtExpectedPositions(QuantizationType qt, int m, int k)
+    [InlineData(QuantizationType.Q8_0, 10, 128)]
+    [InlineData(QuantizationType.Q5_0, 4, 96)]
+    [InlineData(QuantizationType.Q4_K, 9, 512)]
+    [InlineData(QuantizationType.Q6_K, 8, 256)]
+    public void RepackR4_IsZeroCopyViewOverSource(QuantizationType qt, int m, int k)
     {
         var (blockBytes, groupSize) = WeightRepacking.GetBlockInfo(qt);
-        int blocksPerRow = k / groupSize;
-        int rowBytes = blocksPerRow * blockBytes;
-        long totalBytes = (long)m * rowBytes;
-
-        // Allocate source with known pattern: each block's first byte = row*blocksPerRow + blockCol
+        long totalBytes = (long)m * (k / groupSize) * blockBytes;
         byte* src = (byte*)NativeMemory.AlignedAlloc((nuint)totalBytes, 64);
         try
         {
-            for (int row = 0; row < m; row++)
-            {
-                for (int b = 0; b < blocksPerRow; b++)
-                {
-                    byte* block = src + (long)row * rowBytes + (long)b * blockBytes;
-                    // Fill block with identifiable pattern
-                    byte tag = (byte)(row * blocksPerRow + b);
-                    for (int i = 0; i < blockBytes; i++)
-                        block[i] = (byte)(tag ^ i); // unique per block+offset
-                }
-            }
+            new Span<byte>(src, (int)totalBytes).Fill(0x5A);
+            var rw = WeightRepacking.RepackR4((nint)src, qt, m, k);
+            Assert.Equal((nint)src, rw.Ptr);
+            Assert.Equal(0, rw.AllocatedBytes);
+            rw.Dispose();
 
-            using var repacked = WeightRepacking.RepackR4((nint)src, qt, m, k);
-            byte* dst = (byte*)repacked.Ptr;
-
-            int fullGroups = m / 4;
-
-            // Verify interleaved layout: for group g, block b, row r:
-            // dst[g * 4 * rowBytes + b * 4 * blockBytes + r * blockBytes + i]
-            // should equal src[row * rowBytes + b * blockBytes + i]
-            for (int g = 0; g < fullGroups; g++)
-            {
-                for (int b = 0; b < blocksPerRow; b++)
-                {
-                    for (int r = 0; r < 4; r++)
-                    {
-                        int srcRow = g * 4 + r;
-                        byte* srcBlock = src + (long)srcRow * rowBytes + (long)b * blockBytes;
-                        byte* dstBlock = dst + (long)g * 4 * rowBytes
-                                         + (long)b * 4 * blockBytes + (long)r * blockBytes;
-
-                        for (int i = 0; i < blockBytes; i++)
-                        {
-                            Assert.Equal(srcBlock[i], dstBlock[i]);
-                        }
-                    }
-                }
-            }
+            // Still readable: the view never owned the source.
+            Assert.Equal(0x5A, src[totalBytes - 1]);
         }
         finally
         {
@@ -357,7 +324,7 @@ public sealed unsafe class WeightRepackingTests
             Assert.Equal(2, rw.TailRows);            // 10 % 4
             Assert.Equal(4, rw.BlocksPerRow);         // 128 / 32
             Assert.Equal(Q8_0BlockBytes, rw.BlockBytes);
-            Assert.Equal(totalBytes, rw.AllocatedBytes);
+            Assert.Equal(0, rw.AllocatedBytes); // a view (#1156)
             Assert.Equal(blockCount * Q8_0BlockBytes, rw.RowBytes);
         }
         finally
@@ -378,11 +345,8 @@ public sealed unsafe class WeightRepackingTests
         byte* src = (byte*)NativeMemory.AlignedAlloc((nuint)totalBytes, 64);
         new Span<byte>(src, (int)totalBytes).Clear();
 
-        var rw = WeightRepacking.RepackR4((nint)src, QuantizationType.Q8_0, m, k);
+        using var rw = WeightRepacking.RepackR4((nint)src, QuantizationType.Q8_0, m, k);
         NativeMemory.AlignedFree(src);
-
-        // Dispose should not throw
-        rw.Dispose();
     }
 
     [Fact]
@@ -471,9 +435,16 @@ public sealed unsafe class WeightRepackingTests
                 // Half scale (2 bytes)
                 Half scale = (Half)(rng.NextSingle() * 0.5f);
                 Unsafe.WriteUnaligned(block, scale);
-                // 32 quantized sbytes
+                // 32 quantized sbytes in the VALID Q8_0 range [-127, 127].
+                // Q8_0 quantization sets d = amax/127 and clamps q to [-127, 127]
+                // (see MatMul.QuantizeF32ToQ8_0), so -128 never occurs in real data.
+                // Generating -128 here would exercise an out-of-distribution value the
+                // abs/sign int8-dot emulation (AVX2 / AVX-512BW and the interleaved
+                // kernel, abs(-128) overflows int8) cannot represent — diverging from
+                // the exact VNNI vpdpbusd path on inputs Q8_0 never produces. Match the
+                // valid range so every SIMD path agrees (and the test stays meaningful).
                 for (int i = 0; i < 32; i++)
-                    block[2 + i] = (byte)(rng.Next(256) - 128);
+                    block[2 + i] = (byte)rng.Next(-127, 128);
             }
         }
     }

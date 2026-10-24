@@ -1,0 +1,83 @@
+#version 450
+// NVFP4 (GGUF type 40) batched GEMM on the shared 128x128 blocked coopmat template (issue #1064; template:
+// matmul_q4_0_f32_gemm_coopmat_128x128x4.comp). Replaces #1060's two-pass prefill (whole-matrix NVFP4 -> F16 scratch, F16 GEMM,
+// in-place scale) with a decode into shared memory, so no F16 copy of the weights ever exists in device memory.
+//
+//   C[N, M] = scale * (B[N, K] @ W_nvfp4[M, K]^T),  W decoded on the fly.
+//
+// Weight layout (nvfp4_decode.glsl): 36-byte blocks of 64 = 9 uints, always 4-byte aligned. Word 0 holds the four UE4M3 sub-block
+// scales d[0..3]; words 1..8 hold qs[32]. Sub-block s owns qs[8s .. 8s+7] = words 1+2s and 2+2s; byte j of it gives element 16s+j
+// (low nibble) and element 16s+8+j (high nibble).
+// A BK=32 K-chunk is half a block (sub-blocks 2h and 2h+1, h = ch & 1). With two lanes per weight row, lane L stages sub-block
+// s = 2h + L into columns 16L .. 16L+15 of the staged row.
+//
+// NUMERICS (the #1059 overflow class, and llama.cpp b11739 mul_mm_funcs.glsl DATA_A_NVFP4 as the reference):
+//   * The staged F16 operand is KVALUES_FP4[nibble] * ue4m3_half(d): at most 6 significant bits, |v| in [2^-10, 2880] (0xFF decodes to 240: bit 7 is ignored), so it is EXACT
+//     in F16 (#1060's argument; DequantF16_IsBitExactVsCpu pins it). llama.cpp stages the same unscaled product as FLOAT_TYPE.
+//   * Activations round to F16 when staged, exactly as every other coopmat GEMM here (and llama.cpp's mul_mm) does.
+//   * Products accumulate in F32 coopmat accumulators across the whole K loop.
+//   * The per-tensor X.scale (~1e-4 in Bolt) multiplies the F32 ACCUMULATOR once, in the epilogue, and the result is written as F32.
+//     No F16 value ever holds an accumulated or scaled quantity, so an unscaled dot product of ~1e8 is fine.
+
+#define BM  128
+#define BN  128
+#define WM  64
+#define WN  64
+#define NSG 4
+#define WAVE 64
+
+#extension GL_GOOGLE_include_directive : require
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; }; // NVFP4 blob, [M, K/64 blocks]
+layout(set = 0, binding = 1, std430) readonly  buffer BufB { vec4 b4[]; };      // [N*K] F32
+layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[]; };      // [N*M] F32
+
+layout(push_constant) uniform PushConstants {
+    uint  M;             // output dim (weight rows)
+    uint  K;             // contraction dim (a multiple of 64)
+    uint  N;             // batch size (token rows)
+    uint  blocksPerRow;  // K / 64
+    float scale;         // per-tensor X.scale (1 when the GGUF has none)
+} pc;
+
+#include "gemm_coopmat_blocked_decl.glsl"
+#include "nvfp4_decode.glsl"
+
+const uint A_LANES_PER_ROW = BLOCK_SIZE / BM;        // 2 threads cooperate on one weight row
+const uint A_COLS_PER_THR  = BK / A_LANES_PER_ROW;   // 16 = one NVFP4 sub-block
+
+void gemmStageA(uint ch) {
+    uint rowLocal  = g_tid / A_LANES_PER_ROW;
+    uint laneOfRow = g_tid % A_LANES_PER_ROW;
+    uint mGlobal   = g_mBase + rowLocal;
+    uint sBase     = rowLocal * STRIDE + laneOfRow * A_COLS_PER_THR;
+
+    if (mGlobal >= pc.M) {
+        [[unroll]] for (uint j = 0u; j < A_COLS_PER_THR; j++) sharedA[sBase + j] = float16_t(0.0);
+        return;
+    }
+
+    uint s    = (ch & 1u) * 2u + laneOfRow;                                    // sub-block 0..3
+    uint base = (mGlobal * pc.blocksPerRow + (ch >> 1u)) * NVFP4_BLOCK_UINTS;  // first word of the block
+    float d   = ue4m3_half((weight[base] >> (8u * s)) & 0xFFu);
+    uint q0   = weight[base + 1u + 2u * s];                                    // qs bytes 8s   .. 8s+3
+    uint q1   = weight[base + 2u + 2u * s];                                    // qs bytes 8s+4 .. 8s+7
+
+    [[unroll]] for (uint j = 0u; j < 8u; j++) {
+        uint qb = ((j < 4u ? q0 : q1) >> ((j & 3u) * 8u)) & 0xFFu;
+        sharedA[sBase + j]      = float16_t(e2m1Doubled(qb & 0xFu) * d);   // element 16s + j
+        sharedA[sBase + 8u + j] = float16_t(e2m1Doubled(qb >> 4u) * d);    // element 16s + 8 + j
+    }
+}
+
+#define GEMM_M              pc.M
+#define GEMM_K              pc.K
+#define GEMM_CHUNKS         (pc.blocksPerRow * 2u)
+#define GEMM_ROW_BASE       0u
+#define GEMM_ROW_LIMIT      pc.N
+#define GEMM_B_BUF          b4
+#define GEMM_B_VEC4
+#define GEMM_C_BUF          c
+#define GEMM_EPILOGUE_SCALE pc.scale
+
+#include "gemm_coopmat_blocked_main.glsl"

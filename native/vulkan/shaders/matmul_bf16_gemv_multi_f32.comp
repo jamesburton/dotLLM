@@ -1,0 +1,72 @@
+#version 450
+// BF16 native multi-column GEMV (issue #706): y[n, m] = sum_k W_bf16[m, k] * x[n, k] for n in [1, MAX_N].
+//
+// The decode-path GEMV (matmul_bf16_gemv_f32.comp) handles one activation vector; the prefill GEMM (matmul_bf16_gemm_f32.comp) uses a 16x16
+// tile whose 16-wide M tiling wastes most of its lanes on the thin ssm_alpha / ssm_beta projections (48 output rows) and costs ~20 ms of a
+// 94 ms Bonsai-2-27B MTP verify forward at n = 4. This reads each weight row ONCE for all n columns (8 accumulators per lane), so a 2..8-token
+// verify batch costs about one GEMV.
+//
+// x is [N, K] row-major, y is [N, M] row-major -- the same layout the GEMM produces. Accumulation order per column matches the single-column GEMV
+// (per-lane partials, then a power-of-two tree reduce); results agree to a few ULP (mul+add contraction differs).
+//
+// Dispatch: groupCount = (M, 1, 1), local_size_x = 128.
+
+#define MAX_N 8
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { float x[]; };       // [N, K]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };       // [N, M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint pairsPerRow;   // K / 2
+    uint rowUints;
+    uint N;             // 1..MAX_N
+} pc;
+
+shared float partials[MAX_N * 128];
+
+float bf16_to_f32(uint bits) {
+    return uintBitsToFloat(bits << 16);
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+    uint rowUintBase = m * pc.rowUints;
+    uint n = pc.N;
+
+    float acc[MAX_N];
+    for (uint c = 0u; c < MAX_N; c++) acc[c] = 0.0;
+
+    for (uint p = tid; p < pc.pairsPerRow; p += threads) {
+        uint packed = weight[rowUintBase + p];
+        float w0 = bf16_to_f32(packed & 0xFFFFu);
+        float w1 = bf16_to_f32((packed >> 16) & 0xFFFFu);
+        uint kBase = p * 2u;
+        for (uint c = 0u; c < MAX_N; c++) {
+            if (c < n) {
+                acc[c] += w0 * x[c * pc.K + kBase];
+                acc[c] += w1 * x[c * pc.K + kBase + 1u];
+            }
+        }
+    }
+
+    for (uint c = 0u; c < MAX_N; c++) partials[c * 128u + tid] = acc[c];
+    barrier();
+    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            for (uint c = 0u; c < MAX_N; c++)
+                partials[c * 128u + tid] = partials[c * 128u + tid] + partials[c * 128u + tid + stride];
+        }
+        barrier();
+    }
+
+    if (tid < n) y[tid * pc.M + m] = partials[tid * 128u];
+}

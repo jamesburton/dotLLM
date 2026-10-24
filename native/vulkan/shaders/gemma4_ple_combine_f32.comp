@@ -1,0 +1,63 @@
+#version 450
+// Gemma-4 dense-PLE (E2B/E4B) per-layer-input combine, device side of
+// DotLLM.Cpu.Kernels.PerLayerEmbeddings.ComputeInputs (#916):
+//
+//   p      = proj[t, l*P .. +P] * projScale            // proj = per_layer_model_proj . scaled_embed (GEMM, earlier dispatch)
+//   p      = rmsnorm(p) * projNorm                      // over the P-wide block, eps
+//   out    = (p + identity[t, l*P .. +P]) * combineScale
+//
+// and writes the result LAYER-MAJOR out[l, t, :] so each layer's injection can copy one contiguous [seq, P] slice.
+//
+// Dispatch: one workgroup per (t, l) row: groupCount = (seq * layers, 1, 1), local_size_x = 256.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufProj     { float proj[]; };      // [seq, layers * P]
+layout(set = 0, binding = 1, std430) readonly  buffer BufIdentity { float identity[]; };  // [seq, layers * P]
+layout(set = 0, binding = 2, std430) readonly  buffer BufWeight   { float weight[]; };    // [P]
+layout(set = 0, binding = 3, std430) writeonly buffer BufOut      { float output_[]; };   // [layers, seq, P]
+
+layout(push_constant) uniform PushConstants {
+    uint  pleDim;
+    uint  layers;
+    uint  seq;
+    float projScale;
+    float eps;
+    float combineScale;
+} pc;
+
+shared float partials[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;           // t * layers + l
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+    uint t = row / pc.layers;
+    uint l = row - t * pc.layers;
+    uint lp = pc.layers * pc.pleDim;
+    uint inBase = t * lp + l * pc.pleDim;
+    uint outBase = (l * pc.seq + t) * pc.pleDim;
+
+    float sumSq = 0.0;
+    for (uint i = tid; i < pc.pleDim; i += threads) {
+        float v = proj[inBase + i] * pc.projScale;
+        sumSq += v * v;
+    }
+    partials[tid] = sumSq;
+    barrier();
+    for (uint stride = threads / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+    if (tid == 0) {
+        float meanSq = partials[0] / float(pc.pleDim);
+        partials[0] = inversesqrt(meanSq + pc.eps);
+    }
+    barrier();
+    float rinv = partials[0];
+
+    for (uint i = tid; i < pc.pleDim; i += threads) {
+        float p = proj[inBase + i] * pc.projScale * rinv * weight[i];
+        output_[outBase + i] = (p + identity[inBase + i]) * pc.combineScale;
+    }
+}

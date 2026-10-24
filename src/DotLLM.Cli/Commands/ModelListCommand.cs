@@ -14,9 +14,10 @@ internal sealed class ModelListCommand : Command<ModelListCommand.Settings>
 
     public override int Execute(CommandContext context, Settings settings)
     {
-        var models = HuggingFaceDownloader.ListLocalModels();
+        var models = ModelResolver.EnumerateLocal(includeOllama: true);
+        var profiles = ModelProfileStore.List();
 
-        if (models.Count == 0)
+        if (models.Count == 0 && profiles.Count == 0)
         {
             AnsiConsole.MarkupLine("[yellow]No locally downloaded models found.[/]");
             AnsiConsole.MarkupLine($"[dim]Models directory: {HuggingFaceDownloader.DefaultModelsDirectory.EscapeMarkup()}[/]");
@@ -39,7 +40,24 @@ internal sealed class ModelListCommand : Command<ModelListCommand.Settings>
                 model.DownloadedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm"));
         }
 
-        AnsiConsole.Write(table);
+        if (models.Count > 0) AnsiConsole.Write(table);
+
+        if (profiles.Count > 0)
+        {
+            var pt = new Table().Border(TableBorder.Rounded).Title("Profiles (dotllm model create)");
+            pt.AddColumn("Name"); pt.AddColumn("From"); pt.AddColumn("Settings");
+            foreach (var (name, p) in profiles)
+            {
+                var bits = new List<string>();
+                if (p.System is not null) bits.Add("system");
+                if (p.Temperature is { } t) bits.Add($"temp {t}");
+                if (p.Device is not null) bits.Add(p.Device);
+                if (p.MaxTokens is { } mt) bits.Add($"max {mt}");
+                if (p.KeepAlive is { } ka) bits.Add($"keep-alive {ka}s");
+                pt.AddRow($"[bold]{name.EscapeMarkup()}[/]", (p.From ?? "").EscapeMarkup(), string.Join(", ", bits).EscapeMarkup());
+            }
+            AnsiConsole.Write(pt);
+        }
         return 0;
     }
 

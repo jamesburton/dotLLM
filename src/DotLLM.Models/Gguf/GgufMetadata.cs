@@ -92,6 +92,12 @@ public sealed class GgufMetadata
     /// <summary>Gets a uint32 array value.</summary>
     public uint[] GetUInt32Array(string key) => GetTyped<uint[]>(key, GgufValueType.Array);
 
+    /// <summary>Gets a uint64 array value (exact 64-bit values; no float round-trip).</summary>
+    public ulong[] GetUInt64Array(string key) => GetTyped<ulong[]>(key, GgufValueType.Array);
+
+    /// <summary>Gets an int64 array value.</summary>
+    public long[] GetInt64Array(string key) => GetTyped<long[]>(key, GgufValueType.Array);
+
     private T GetTyped<T>(string key, GgufValueType expectedType)
     {
         if (!_entries.TryGetValue(key, out var entry))

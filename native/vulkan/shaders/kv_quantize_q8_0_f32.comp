@@ -1,0 +1,56 @@
+#version 450
+// KV-cache quantization: FP32 → Q8_0 (split layout: float scale + packed int8).
+//
+// Reads contiguous FP32 elements and writes per-32-element block:
+//   scales[blockIdx] = float (max_abs / 127)
+//   quants[blockIdx*8 + 0..7] = uint (4 packed int8 per uint, little-endian)
+//
+// Dispatch: ceil(totalBlocks / 256) workgroups × 1 × 1.
+// Each thread processes one block; early-exits for out-of-range blocks.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Src    { float src[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Scales { float scales[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer Quants { uint  quants[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint totalBlocks;   // number of 32-element blocks to quantize
+    uint srcOffset;     // element offset in src buffer
+    uint dstOffset;     // block offset in scales/quants buffers
+} pc;
+
+const uint QK = 32u;
+
+void main() {
+    uint b = gl_GlobalInvocationID.x;
+    if (b >= pc.totalBlocks) return;
+
+    uint srcBase  = pc.srcOffset + b * QK;
+    uint dstBlock = pc.dstOffset + b;
+
+    // Pass 1: max absolute value over the 32 elements.
+    float amax = 0.0;
+    for (uint i = 0u; i < QK; i++) {
+        amax = max(amax, abs(src[srcBase + i]));
+    }
+
+    float scale = amax / 127.0;
+    float invScale = (scale != 0.0) ? (1.0 / scale) : 0.0;
+    scales[dstBlock] = scale;
+
+    // Pass 2: quantize to int8, pack 4 per uint.
+    uint qBase = dstBlock * 8u;
+    for (uint g = 0u; g < QK / 4u; g++) {
+        uint e = srcBase + g * 4u;
+        int q0 = clamp(int(round(src[e + 0u] * invScale)), -128, 127);
+        int q1 = clamp(int(round(src[e + 1u] * invScale)), -128, 127);
+        int q2 = clamp(int(round(src[e + 2u] * invScale)), -128, 127);
+        int q3 = clamp(int(round(src[e + 3u] * invScale)), -128, 127);
+        uint packed = (uint(q0) & 0xFFu)
+                    | ((uint(q1) & 0xFFu) << 8u)
+                    | ((uint(q2) & 0xFFu) << 16u)
+                    | ((uint(q3) & 0xFFu) << 24u);
+        quants[qBase + g] = packed;
+    }
+}

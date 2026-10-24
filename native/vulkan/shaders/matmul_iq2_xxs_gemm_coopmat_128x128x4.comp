@@ -1,0 +1,104 @@
+#version 450
+// IQ2_XXS batched GEMM on the shared 128x128 blocked coopmat template (issue #1069; template:
+// matmul_iq4_xs_gemm_coopmat_128x128x4.comp). Replaces #1060's dense IQ prefill (whole-matrix IQ2_XXS -> F16 scratch, then the F16
+// GEMM) for Nemotron-H's shared expert: the decode lands in shared memory, so no F16 copy of the weight exists in device memory.
+//
+//   C[N, M] = B[N, K] @ W_iq2xxs[M, K]^T,  W decoded on the fly.
+//
+// Weight layout (iq2_xxs_dequant_f16.comp): rows of K/256 super-blocks of 66 bytes: fp16 d, then per 32-element sub-block ib 8 bytes,
+// a0 (4 grid indices) and a1 (4 x 7-bit ksigns indices | 4-bit scale << 28). Pair l (elements 8l..8l+7) = iq2xxs grid entry
+// (a0 >> 8l) & 255 with the sign byte ksigns[(a1 >> 7l) & 127]; value = d * (0.5 + (a1 >> 28)) * 0.25 * sign * grid byte.
+// A BK=32 chunk is one sub-block (super-block ch / 8, ib = ch % 8); with two lanes per row, lane L stages pairs 2L and 2L+1 (columns
+// 16L .. 16L+15). 66-byte super-blocks are only 2-byte aligned, so the 4-byte fields are funnel-shifted.
+//
+// PRECISION: the staged F16 operand is float16_t(db * g * sign) with db = d * (0.5 + scale) * 0.25, the same expression in the same
+// order as iq2_xxs_dequant_f16.comp, so this kernel stages bit-identical operands to #1060's F16 path; only the accumulation order of
+// the F32 coopmat accumulators differs.
+
+#define BM  128
+#define BN  128
+#define WM  64
+#define WN  64
+#define NSG 4
+#define WAVE 64
+
+#extension GL_GOOGLE_include_directive : require
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW      { uint  weight[]; };      // IQ2_XXS blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufB      { vec4 b4[]; };           // [N*K]
+layout(set = 0, binding = 2, std430) writeonly buffer BufC      { float c[]; };           // [N*M]
+layout(set = 0, binding = 3, std430) readonly  buffer BufGrid   { uint  iq2xxsGrid[]; };  // 256 entries x 8 magnitude bytes
+layout(set = 0, binding = 4, std430) readonly  buffer BufKsigns { uint  ksigns[]; };      // 128 sign bytes
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // output dim (weight rows)
+    uint K;             // contraction dim (a multiple of 256)
+    uint N;             // batch size (token rows)
+    uint blocksPerRow;  // K / 256 (super-blocks)
+} pc;
+
+#include "gemm_coopmat_blocked_decl.glsl"
+
+const uint IQ2_XXS_BLOCK_BYTES = 66u;
+
+const uint A_LANES_PER_ROW = BLOCK_SIZE / BM;        // 2 threads cooperate on one weight row
+const uint A_COLS_PER_THR  = BK / A_LANES_PER_ROW;   // 16 = two grid pairs
+
+uint read4Bytes(uint absByteOff) {
+    uint idx = absByteOff >> 2u;
+    uint ph  = absByteOff & 3u;
+    uint lo  = weight[idx];
+    if (ph == 0u) return lo;
+    return (lo >> (ph * 8u)) | (weight[idx + 1u] << ((4u - ph) * 8u));
+}
+
+float readHalf(uint absByteOff) {
+    uint idx = absByteOff >> 2u;
+    uint ph  = absByteOff & 3u;
+    uint u = weight[idx];
+    uint h = ph <= 2u ? (u >> (ph * 8u)) & 0xFFFFu : ((u >> 24u) & 0xFFu) | ((weight[idx + 1u] & 0xFFu) << 8u);
+    return unpackHalf2x16(h).x;
+}
+
+void gemmStageA(uint ch) {
+    uint rowLocal  = g_tid / A_LANES_PER_ROW;
+    uint laneOfRow = g_tid % A_LANES_PER_ROW;
+    uint mGlobal   = g_mBase + rowLocal;
+    uint sBase     = rowLocal * STRIDE + laneOfRow * A_COLS_PER_THR;
+
+    if (mGlobal >= pc.M) {
+        [[unroll]] for (uint j = 0u; j < A_COLS_PER_THR; j++) sharedA[sBase + j] = float16_t(0.0);
+        return;
+    }
+
+    uint base = (mGlobal * pc.blocksPerRow + (ch >> 3u)) * IQ2_XXS_BLOCK_BYTES;
+    uint ib   = ch & 7u;
+    float d   = readHalf(base);
+    uint a0   = read4Bytes(base + 2u + 8u * ib);
+    uint a1   = read4Bytes(base + 6u + 8u * ib);
+    float db  = d * (0.5 + float(a1 >> 28)) * 0.25;
+
+    [[unroll]] for (uint p = 0u; p < 2u; p++) {
+        uint l = laneOfRow * 2u + p;
+        uint gridIdx  = (a0 >> (8u * l)) & 0xFFu;
+        uint signsIdx = (a1 >> (7u * l)) & 0x7Fu;
+        uint signs = (ksigns[signsIdx >> 2u] >> ((signsIdx & 3u) * 8u)) & 0xFFu;
+        uint g0 = iq2xxsGrid[gridIdx * 2u], g1 = iq2xxsGrid[gridIdx * 2u + 1u];
+        [[unroll]] for (uint j = 0u; j < 8u; j++) {
+            float g    = float(((j < 4u ? g0 : g1) >> ((j & 3u) * 8u)) & 0xFFu);
+            float sign = ((signs & (1u << j)) != 0u) ? -1.0 : 1.0;
+            sharedA[sBase + p * 8u + j] = float16_t(db * g * sign);
+        }
+    }
+}
+
+#define GEMM_M          pc.M
+#define GEMM_K          pc.K
+#define GEMM_CHUNKS     (pc.blocksPerRow * 8u)
+#define GEMM_ROW_BASE   0u
+#define GEMM_ROW_LIMIT  pc.N
+#define GEMM_B_BUF      b4
+#define GEMM_B_VEC4
+#define GEMM_C_BUF      c
+
+#include "gemm_coopmat_blocked_main.glsl"
