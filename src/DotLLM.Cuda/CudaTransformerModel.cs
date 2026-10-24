@@ -380,6 +380,9 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// <summary>Routed experts the CPU leg has computed (one per expert per layer call), for telemetry and tests.</summary>
     public long CpuMoeExpertsComputed => _moeHost?.ExpertsComputed ?? 0;
 
+    /// <summary>True when the token-embedding table stayed in the mmap and the forward gathers its rows on the host (#1183).</summary>
+    public bool TokenEmbeddingsOnHost => _weights.TokenEmbedHost != 0;
+
     /// <summary>Experts of CPU-expert layers streamed to the GPU for multi-token calls so far (#1202).</summary>
     public long CpuMoeExpertsStreamed => _moeHost?.Stream?.ExpertsStreamed ?? 0;
 
@@ -572,6 +575,10 @@ public sealed unsafe class CudaTransformerModel : IModel
             long outerDim = (long)t.Shape.ElementCount / innerDim;
             estimatedWeightBytes += Cpu.Kernels.Dequantize.RowByteSize(innerDim, t.QuantizationType) * outerDim;
         }
+
+        // A table the forward gathers on the host takes no VRAM (#1183).
+        if (UsesHostTokenEmbed(config, cpuWeights) && gguf.TensorsByName.TryGetValue("token_embd.weight", out var embd))
+            estimatedWeightBytes -= embd.Shape.ElementCount * sizeof(float);
 
         CpuMoePlacementInput? placement = config.Moe is null || config.Gemma4DualFfn ? null
             : new CpuMoePlacementInput(MoeOffloadOptions.WithEnvironmentFallback(moeOffload),
@@ -841,7 +848,8 @@ public sealed unsafe class CudaTransformerModel : IModel
 
         weights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle,
             onHostTensorUploaded: onHostTensorUploaded,
-            hostMoeLayer: cpuMoeLayers > 0 ? layer => layer < cpuMoeLayers : null);
+            hostMoeLayer: cpuMoeLayers > 0 ? layer => layer < cpuMoeLayers : null,
+            hostTokenEmbed: UsesHostTokenEmbed(config, cpuWeights));
         if (moeHost is not null && StreamCpuExperts)
         {
             // GPU leg for multi-token calls (#1202): page-lock the mapped experts of the CPU layers in place.
@@ -1231,10 +1239,13 @@ public sealed unsafe class CudaTransformerModel : IModel
         // BitNet I2_S decode, and adapter-active decode (all graph-ineligible).
 
         // 2. Embedding lookup → FP16 HiddenState
-        _kernels.LaunchEmbeddingLookup(
-            _weights.TokenEmbedDevice, _weights.TokenEmbedQuantType,
-            _state.TokenIdsDevice, _state.HiddenState,
-            seqLen, hiddenSize, s);
+        if (_weights.TokenEmbedHost != 0)
+            GatherHostEmbeddings(tokenIds, hiddenSize, s);
+        else
+            _kernels.LaunchEmbeddingLookup(
+                _weights.TokenEmbedDevice, _weights.TokenEmbedQuantType,
+                _state.TokenIdsDevice, _state.HiddenState,
+                seqLen, hiddenSize, s);
         MarkProfile(ProfileCategory.Embed);
 
         // FP32 residual stream for BitNet (its residual magnitude exceeds FP16's ~65504 ceiling).
@@ -2908,6 +2919,50 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// Erring toward "retain" only forfeits the RAM optimization in rare cases; it can never
     /// free a buffer the forward later reads.
     /// </summary>
+    /// <summary>
+    /// True when the F32 token-embedding table stays in the mmap and the eager forward gathers its rows on the host (#1183):
+    /// MoE models on the generic eager body only (they never take the graph-captured decode, which reads a device table;
+    /// MLA and the Gemma forwards have their own lookups). <c>DOTLLM_CUDA_HOST_EMBED=0</c> uploads the table.
+    /// </summary>
+    private static bool UsesHostTokenEmbed(ModelConfig config, TransformerWeights cpuWeights)
+        => cpuWeights.TokenEmbedQuantType == QuantizationType.F32 && config.Moe is not null && config.MlaConfig is null
+            && !config.Gemma4DualFfn && !UsesF32DenseForward(config) && !WillRetainHostWeights(cpuWeights, config)
+            && Environment.GetEnvironmentVariable("DOTLLM_CUDA_HOST_EMBED") != "0";
+
+    // Pinned F16 staging of the gathered embedding rows; the forward's final sync completes each upload before the next
+    // forward rewrites it.
+    private nint _embedStaging;
+    private long _embedStagingElems;
+
+    /// <summary>
+    /// Gathers the call's F32 embedding rows from the host table (<see cref="CudaWeights.TokenEmbedHost"/>), converts them
+    /// to F16 (round to nearest even, as the device lookup kernel does) and queues their upload into the hidden state.
+    /// </summary>
+    private void GatherHostEmbeddings(ReadOnlySpan<int> tokenIds, int hiddenSize, nint stream)
+    {
+        long elems = (long)tokenIds.Length * hiddenSize;
+        if (elems > _embedStagingElems)
+        {
+            if (_embedStaging != 0) CudaDriverApi.cuMemFreeHost(_embedStaging);
+            _embedStaging = 0;
+            long cap = (long)System.Numerics.BitOperations.RoundUpToPowerOf2((ulong)elems);
+            CudaDriverApi.cuMemHostAlloc(out _embedStaging, (nuint)(cap * sizeof(ushort)), 0).ThrowOnError();
+            _embedStagingElems = cap;
+        }
+        float* table = (float*)_weights.TokenEmbedHost;
+        Half* dst = (Half*)_embedStaging;
+        int vocab = Config.VocabSize;
+        for (int t = 0; t < tokenIds.Length; t++)
+        {
+            int id = tokenIds[t];
+            if ((uint)id >= (uint)vocab)
+                throw new ArgumentOutOfRangeException(nameof(tokenIds), id, $"Token id outside the vocabulary ({vocab}).");
+            System.Numerics.Tensors.TensorPrimitives.ConvertToHalf(
+                new ReadOnlySpan<float>(table + (long)id * hiddenSize, hiddenSize), new Span<Half>(dst + (long)t * hiddenSize, hiddenSize));
+        }
+        CudaDriverApi.cuMemcpyHtoDAsync_v2(_state.HiddenState, _embedStaging, (nuint)(elems * sizeof(ushort)), stream).ThrowOnError();
+    }
+
     private static bool WillRetainHostWeights(TransformerWeights cpuWeights, ModelConfig config)
     {
         // Gemma-4 dual-FFN keeps the host weights for the CPU LM head (mirrors _isGemma4,
@@ -4359,6 +4414,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         if (_mlaRopeCosF32 != 0) { CudaDriverApi.cuMemFree_v2(_mlaRopeCosF32); _mlaRopeCosF32 = 0; }
         if (_mlaRopeSinF32 != 0) { CudaDriverApi.cuMemFree_v2(_mlaRopeSinF32); _mlaRopeSinF32 = 0; }
         if (_moeStagingInF32 != 0) { CudaDriverApi.cuMemFree_v2(_moeStagingInF32); _moeStagingInF32 = 0; }
+        if (_embedStaging != 0) { CudaDriverApi.cuMemFreeHost(_embedStaging); _embedStaging = 0; }
         if (_moeStagingOutF32 != 0) { CudaDriverApi.cuMemFree_v2(_moeStagingOutF32); _moeStagingOutF32 = 0; }
         if (_gemma4DenseF32 != 0) { CudaDriverApi.cuMemFree_v2(_gemma4DenseF32); _gemma4DenseF32 = 0; }
         if (_gemma4MoeF32 != 0) { CudaDriverApi.cuMemFree_v2(_gemma4MoeF32); _gemma4MoeF32 = 0; }

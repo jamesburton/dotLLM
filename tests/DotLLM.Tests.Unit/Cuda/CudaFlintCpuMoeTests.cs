@@ -128,7 +128,7 @@ public sealed class CudaFlintCpuMoeTests : IDisposable
 
     /// <summary>Prefill of <see cref="PrefillTokens"/> then one-token decodes; returns the last row of each call.</summary>
     private static List<float[]> RunCuda(GgufFile gguf, ModelConfig cfg, MoeOffloadOptions options, int? expectedCpuLayers,
-        string stream = "stream-off")
+        string stream = "stream-off", string? embed = null)
     {
         var rows = new List<float[]>();
         var (model, kvFactory) = CudaModelLoader.CreateFromGguf(gguf, cfg, deviceId: 0, moeOffload: options);
@@ -136,6 +136,8 @@ public sealed class CudaFlintCpuMoeTests : IDisposable
         {
             var cuda = Assert.IsType<CudaTransformerModel>(model);
             Assert.Equal(expectedCpuLayers is null, cuda.CpuMoeLayers == 0);
+            if (embed is not null)
+                Assert.Equal(embed == "host", cuda.TokenEmbeddingsOnHost);
             using var kv = kvFactory(64);
             int[] pos = Enumerable.Range(0, Ids.Length).ToArray();
             using (ITensor p = cuda.Forward(Ids.AsSpan(0, PrefillTokens), pos.AsSpan(0, PrefillTokens), deviceId: -1, kv))
@@ -217,6 +219,34 @@ public sealed class CudaFlintCpuMoeTests : IDisposable
             for (int i = 0; i < host[r].Length; i++)
                 Assert.True(BitConverter.SingleToInt32Bits(host[r][i]) == BitConverter.SingleToInt32Bits(device[r][i]),
                     $"row {r} logit {i}: device-routed {device[r][i]} vs host-routed {host[r][i]}");
+    }
+
+    /// <summary>
+    /// Host-gathered F32 token embeddings (#1183): the table stays in the mmap and the forward uploads the rows as F16. The
+    /// logits must be bit-identical to the device lookup's (same F32 to F16 rounding), and the table must not be on the device.
+    /// </summary>
+    [SkippableFact]
+    public void HostTokenEmbeddings_BitIdenticalToDeviceTable()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
+        using var gguf = GgufFile.Open(_path);
+        ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var options = new MoeOffloadOptions { CpuMoeLayers = 4, CpuThreads = 1 };
+        List<float[]> host = RunCuda(gguf, cfg, options, 2, stream: "stream-auto", embed: "host");
+        List<float[]> device;
+        Environment.SetEnvironmentVariable("DOTLLM_CUDA_HOST_EMBED", "0");
+        try
+        {
+            device = RunCuda(gguf, cfg, options, 2, stream: "stream-auto", embed: "device");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("DOTLLM_CUDA_HOST_EMBED", null);
+        }
+        for (int r = 0; r < host.Count; r++)
+            for (int i = 0; i < host[r].Length; i++)
+                Assert.True(BitConverter.SingleToInt32Bits(host[r][i]) == BitConverter.SingleToInt32Bits(device[r][i]),
+                    $"row {r} logit {i}: host-gathered {host[r][i]} vs device table {device[r][i]}");
     }
 
     [Fact]
