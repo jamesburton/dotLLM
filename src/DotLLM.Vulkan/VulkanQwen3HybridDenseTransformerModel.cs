@@ -207,6 +207,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
     /// <summary>Drops every kernel's handle-keyed descriptor cache (after any buffer they may name was re-created or freed).</summary>
     private void InvalidateDescriptorCaches()
     {
+        // A pool reset would free descriptor sets the drafter's recorded-but-unsubmitted commands still use (#1193).
+        _dflashGpu?.Flush();
         _kernels.InvalidateAll();
         _hadamard?.InvalidateDescriptorCache();
         _embedGather?.InvalidateDescriptorCache();
@@ -423,6 +425,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             long maxLayerElements = Math.Max((long)config.IntermediateSize * hidden, 4L * hidden * hidden);
             model._iqF16Prefill = IqF16PrefillMatmul.TryCreate(device, spvDir, kernels.MatMulF16GemmCoopmat, maxLayerElements);
         }
+        model._spvDir = spvDir;
         return model;
     }
 

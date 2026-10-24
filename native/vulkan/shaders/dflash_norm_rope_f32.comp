@@ -1,0 +1,42 @@
+#version 450
+// DFlash per-head RMSNorm then NeoX RoPE over the full head, in place (issue #1193; CPU twin DFlashCpuBackend.NormRopeHeads).
+// One workgroup per (row, head); thread i owns the pair (i, i + hd/2). The host computes cos/sin per (row, pair) in double, as the
+// CPU does: GPU sin/cos lose precision on the large angles of late positions.
+//   n = x * inversesqrt(mean(x^2) + eps) * w;   x[i] = n[i] cos - n[i+h] sin;   x[i+h] = n[i] sin + n[i+h] cos
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer BufX { float x[]; };                   // [rows, heads, hd]
+layout(set = 0, binding = 1, std430) readonly buffer BufW { float w[]; };          // [hd]
+layout(set = 0, binding = 2, std430) readonly buffer BufCs { float cs[]; };       // [rows, hd / 2, 2] (cos, sin)
+
+layout(push_constant) uniform PushConstants {
+    uint heads;
+    uint hd;          // <= 256, even
+    float eps;
+} pc;
+
+shared float red[128];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint head = gl_WorkGroupID.x, row = gl_WorkGroupID.y;
+    uint h = pc.hd / 2u;
+    uint base_ = (row * pc.heads + head) * pc.hd;
+    float a = 0.0, b = 0.0;
+    if (tid < h) { a = x[base_ + tid]; b = x[base_ + tid + h]; }
+    red[tid] = a * a + b * b;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    float inv = inversesqrt(red[0] / float(pc.hd) + pc.eps);
+    if (tid < h) {
+        float n0 = a * inv * w[tid], n1 = b * inv * w[tid + h];
+        uint t = (row * h + tid) * 2u;
+        float c = cs[t], sn = cs[t + 1u];
+        x[base_ + tid] = n0 * c - n1 * sn;
+        x[base_ + tid + h] = n0 * sn + n1 * c;
+    }
+}
