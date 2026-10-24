@@ -164,7 +164,8 @@ Differences between architectures are captured entirely in ModelConfig.
   power of two is exact, so rows at or below 1024 are untouched; it applies to every architecture.
 - **KV**: sliding layers keep only their recent rows on CPU (compact sliding-window KV, #1169, `docs/KV_CACHE.md`): at 262K the 14 full layers dominate (~14 GiB F32, ~3.7 GiB with `--cache-type-k q8_0 --cache-type-v q8_0 --cache-window 0`).
 - **GPU**: CUDA runs `flint` on the generic FP16 MoE loop (#1172, F6: per-layer NoPE, sigmoid routing, in-place Q4_1 GEMV /
-  GEMM / grouped MoE kernels; see `docs/CUDA.md`). The 26 GB Q4_1 file needs a >= 32 GB GPU until F7 (CPU-expert offload).
+  GEMM / grouped MoE kernels; see `docs/CUDA.md`). On a smaller GPU the routed experts of the first layers stay on the CPU, read from the mmap
+  (#1187, F7: `--cpu-moe` / `--n-cpu-moe` or automatic; `docs/MOE_OFFLOAD.md`): all 49 layers run on a 12 GB RTX 3060.
 - **Vulkan** (#1171, single-device `VulkanTransformerModel` only; pipeline / hybrid refuse): sinks required on every layer (the gpt-oss
   sink kernels), NoPE through the generic `IsNoRopeLayer` path, the ungated shared expert through the existing shared-expert branch, sigmoid
   top-6 on `moe_topk_sigmoid_bias_f32` with a zero bias, and Q4_1 read in place everywhere (dense MMVQ / GEMV / GEMM / coopmat, MoE indexed

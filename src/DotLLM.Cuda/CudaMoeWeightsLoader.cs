@@ -125,8 +125,15 @@ internal static unsafe class CudaMoeWeightsLoader
     /// via numGpuLayers / NumLayers patching.
     /// </para>
     /// </remarks>
+    /// <param name="cpuLayer">Per-layer weight bundle from the GGUF loader (raw quant views populated).</param>
+    /// <param name="allocs">Allocation list to extend (caller owns + frees on dispose).</param>
+    /// <param name="hostExperts">
+    /// True keeps the routed banks in the mmap'd GGUF for the CPU leg (<c>--cpu-moe</c>, #1187): nothing of them is
+    /// uploaded or copied, and <see cref="CudaMoeLayerWeights.HostExperts"/> carries the CPU bundle.
+    /// </param>
+    /// <returns>Populated <see cref="CudaMoeLayerWeights"/> with device pointers.</returns>
     public static CudaMoeLayerWeights LoadLayerQuant(
-        in TransformerLayerWeights cpuLayer, List<nint> allocs)
+        in TransformerLayerWeights cpuLayer, List<nint> allocs, bool hostExperts = false)
     {
         var moe = cpuLayer.Moe
             ?? throw new InvalidOperationException(
@@ -151,6 +158,13 @@ internal static unsafe class CudaMoeWeightsLoader
                 "CudaMoeWeightsLoader.LoadLayerQuant: sigmoid MoE routing with a selection bias or an expert weight "
                 + "scale is not implemented on CUDA (issue #742); only bias-free, unscaled sigmoid routing is.");
 
+        // The CPU leg runs MoeSwiGluMlp.ExecuteRoutedFromAssignments, which has plain SwiGLU and no per-expert biases.
+        if (hostExperts && (moe.UseSwiGluOai || moe.GateExpsBias is not null || moe.UpExpsBias is not null
+                            || moe.DownExpsBias is not null))
+            throw new NotSupportedException(
+                "--cpu-moe / --n-cpu-moe on the generic CUDA host does not support per-expert biases or the clamped "
+                + "swiglu_oai activation (gpt-oss): its CPU leg runs plain SwiGLU experts.");
+
         int numExperts = moe.NumExperts;
         int hidden = moe.HiddenSize;
         int moeIntermediate = moe.IntermediateSize;
@@ -171,7 +185,7 @@ internal static unsafe class CudaMoeWeightsLoader
         long w1ExpertBytes = moe.GateExpsMDim * w1RowBytes;
         long w3ExpertBytes = moe.UpExpsMDim * w3RowBytes;
         long w2ExpertBytes = moe.DownExpsMDim * w2RowBytes;
-        for (int e = 0; e < numExperts; e++)
+        for (int e = 0; e < numExperts && !hostExperts; e++)
         {
             gateProj[e] = UploadRawBytes(moe.GateExpsRaw + (nint)(e * w1ExpertBytes), w1ExpertBytes, allocs);
             upProj[e] = UploadRawBytes(moe.UpExpsRaw + (nint)(e * w3ExpertBytes), w3ExpertBytes, allocs);
@@ -237,6 +251,7 @@ internal static unsafe class CudaMoeWeightsLoader
             useSwiGluOai: moe.UseSwiGluOai)
         {
             SigmoidGating = moe.SigmoidGating,
+            HostExperts = hostExperts ? moe : null,
         };
     }
 

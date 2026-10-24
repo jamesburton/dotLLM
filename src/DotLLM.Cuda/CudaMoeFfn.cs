@@ -86,20 +86,29 @@ public static unsafe class CudaMoeFfn
         nint hiddenF32, nint outputF32, int seqLen, CudaMoeLayerWeights weights,
         CudaMoeScratch scratch, nint cublasHandle, CudaKernels kernels, nint stream,
         bool? forceUseI2SBatchedGemm = null)
-        => ForwardCore(hiddenF32, outputF32, seqLen, weights, scratch, cublasHandle, kernels, stream, forceUseI2SBatchedGemm, false, null);
+        => ForwardCore(hiddenF32, outputF32, seqLen, weights, scratch, cublasHandle, kernels, stream, forceUseI2SBatchedGemm, false, null, null);
+
+    /// <summary>
+    /// <see cref="Forward(nint, nint, int, CudaMoeLayerWeights, CudaMoeScratch, nint, CudaKernels, nint, bool?)"/> for a model whose MoE layers may keep their routed experts on the CPU (<c>--cpu-moe</c>,
+    /// #1187): a layer with <see cref="CudaMoeLayerWeights.HostExperts"/> runs them through <paramref name="hostExperts"/>.
+    /// </summary>
+    internal static void ForwardWithHostExperts(
+        nint hiddenF32, nint outputF32, int seqLen, CudaMoeLayerWeights weights,
+        CudaMoeScratch scratch, nint cublasHandle, CudaKernels kernels, nint stream, CudaMoeHostExperts? hostExperts)
+        => ForwardCore(hiddenF32, outputF32, seqLen, weights, scratch, cublasHandle, kernels, stream, null, false, null, hostExperts);
 
     /// <summary>Runs the expert body after architecture-specific routing populated scratch TopkIdx/TopkWeight.</summary>
     internal static void ForwardWithPrecomputedRouting(
         nint hiddenF32, nint outputF32, int seqLen, CudaMoeLayerWeights weights,
         CudaMoeScratch scratch, nint cublasHandle, CudaKernels kernels, nint stream,
         Action<nint, nint, nint, int, int, int, nint>? packedQ4Projection = null)
-        => ForwardCore(hiddenF32, outputF32, seqLen, weights, scratch, cublasHandle, kernels, stream, null, true, packedQ4Projection);
+        => ForwardCore(hiddenF32, outputF32, seqLen, weights, scratch, cublasHandle, kernels, stream, null, true, packedQ4Projection, null);
 
     private static void ForwardCore(
         nint hiddenF32, nint outputF32, int seqLen, CudaMoeLayerWeights weights,
         CudaMoeScratch scratch, nint cublasHandle, CudaKernels kernels, nint stream,
         bool? forceUseI2SBatchedGemm, bool routingAlreadyComputed,
-        Action<nint, nint, nint, int, int, int, nint>? packedQ4Projection)
+        Action<nint, nint, nint, int, int, int, nint>? packedQ4Projection, CudaMoeHostExperts? hostExperts)
     {
         if (!kernels.HasMoeKernels)
             throw new InvalidOperationException(
@@ -184,6 +193,18 @@ public static unsafe class CudaMoeFfn
             CudaDriverApi.cuMemcpyDtoH_v2(
                 (nint)p, scratch.TopkIdx,
                 (nuint)((long)totalAssign * sizeof(int))).ThrowOnError();
+
+        // CPU-expert layer (#1187): queue the shared expert on the device first so it overlaps the CPU leg, then add the
+        // routed sum. shared + routed is one addition per element, so the order matches the resident path's routed + shared.
+        if (weights.HostExperts is { } hostMoe)
+        {
+            if (hostExperts is null)
+                throw new InvalidOperationException("This MoE layer keeps its routed experts on the CPU, but no CPU leg was supplied.");
+            RunSharedExperts(hiddenF32, outputF32, seqLen, weights, scratch, cublasHandle, kernels, stream, packedQ4Projection);
+            hostExperts.Run(hostMoe, hiddenF32, scratch.TopkWeight, topkIdxHost, seqLen, scratch.DownBatch);
+            kernels.LaunchMoeAxpyUnweightedF32(outputF32, scratch.DownBatch, seqLen, hidden, stream);
+            return;
+        }
 
         // ── Step 6: bucket assignments per expert (host-side) ──
         // counts[e] = number of (token, slot) assignments routed to expert e.
@@ -450,6 +471,16 @@ public static unsafe class CudaMoeFfn
         }
 
         // ── Step 8: shared-expert path (DeepSeek / Qwen1.5-MoE) ──
+        RunSharedExperts(hiddenF32, outputF32, seqLen, weights, scratch, cublasHandle, kernels, stream, packedQ4Projection);
+    }
+
+    /// <summary>Adds the layer's shared expert(s) (DeepSeek / Qwen1.5-MoE / Flint) to <paramref name="outputF32"/>.</summary>
+    private static void RunSharedExperts(
+        nint hiddenF32, nint outputF32, int seqLen, CudaMoeLayerWeights weights,
+        CudaMoeScratch scratch, nint cublasHandle, CudaKernels kernels, nint stream,
+        Action<nint, nint, nint, int, int, int, nint>? packedQ4Projection)
+    {
+        int hidden = weights.HiddenSize;
         if (weights.NumSharedExperts > 0 && weights.SharedIntermediateSize > 0)
         {
             int sI = weights.SharedIntermediateSize;

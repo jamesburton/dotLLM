@@ -249,11 +249,16 @@ internal sealed class CudaWeights : IDisposable
     /// disposes <paramref name="cpuWeights"/>. The caller MUST pass null whenever it retains
     /// <paramref name="cpuWeights"/> for a CPU-side forward.
     /// </param>
+    /// <param name="hostMoeLayer">
+    /// Optional predicate over the GLOBAL layer index: true keeps that MoE layer's routed experts in the mmap'd GGUF
+    /// for the CPU leg (<c>--cpu-moe</c> / <c>--n-cpu-moe</c>, #1187) instead of uploading them. Null uploads every expert.
+    /// </param>
     public static CudaWeights LoadFromGguf(TransformerWeights cpuWeights, ModelConfig config,
                                               CudaKernels kernels, nint stream,
                                               int numGpuLayers = -1, int firstLayer = 0,
                                               bool skipTokenEmbed = false,
-                                              Action<nint>? onHostTensorUploaded = null)
+                                              Action<nint>? onHostTensorUploaded = null,
+                                              Func<int, bool>? hostMoeLayer = null)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(firstLayer);
         // Dense Gemma-4 (E2B/E4B, #734) runs only on the whole-model CudaTransformerModel Gemma-4 forward; a layer
@@ -582,8 +587,12 @@ internal sealed class CudaWeights : IDisposable
                     // GGUF source with raw quant view → upload Q4_K bytes per expert
                     // (~26 GB at full V2-Lite Q4_K_M scale; the next perf milestone
                     // is grouped-GEMM compaction). Safetensors source → F32 path.
+                    bool host = hostMoeLayer?.Invoke(globalLayer) == true;
+                    if (host && !lw.Moe!.HasRawQuantView)
+                        throw new NotSupportedException(
+                            $"--cpu-moe needs the routed experts as a raw GGUF quant view (layer {globalLayer} has none).");
                     moeLayers![i] = lw.Moe!.HasRawQuantView
-                        ? CudaMoeWeightsLoader.LoadLayerQuant(lw, allocs)
+                        ? CudaMoeWeightsLoader.LoadLayerQuant(lw, allocs, host)
                         : CudaMoeWeightsLoader.LoadLayer(lw, allocs);
                 }
             }

@@ -431,12 +431,14 @@ public sealed record MoeOffloadOptions
     /// <summary>Help text of <c>--cpu-moe</c>.</summary>
     public const string CpuMoeHelp =
         "Keep every MoE layer's routed experts on the CPU (llama.cpp --cpu-moe). CUDA nemotron_h_moe: never cached, always computed " +
-        "on the CPU; Vulkan Qwen3MoeHybrid (bench): as --n-cpu-moe with every layer. Env fallback: " + CpuMoeEnvVar + "=1.";
+        "on the CPU; other CUDA MoE models (e.g. Flint): computed on the CPU from the mmap'd file; Vulkan Qwen3MoeHybrid (bench): as " +
+        "--n-cpu-moe with every layer. Env fallback: " + CpuMoeEnvVar + "=1.";
 
     /// <summary>Help text of <c>--n-cpu-moe</c>.</summary>
     public const string NCpuMoeHelp =
         "Keep the routed experts of the first N layers (by layer index, llama.cpp --n-cpu-moe) on the CPU. CUDA nemotron_h_moe: " +
-        "never cached, always computed on the CPU; Vulkan Qwen3MoeHybrid: CPU expert compute for those layers (#370). " +
+        "never cached, always computed on the CPU; other CUDA MoE models: computed on the CPU from the mmap'd file (#1187); " +
+        "Vulkan Qwen3MoeHybrid: CPU expert compute for those layers (#370). " +
         "Env fallback: " + NCpuMoeEnvVar + ".";
 
     /// <summary>Help text of <c>--moe-calibrate</c>.</summary>

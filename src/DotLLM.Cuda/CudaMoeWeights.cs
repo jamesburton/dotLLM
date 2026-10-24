@@ -189,6 +189,13 @@ public sealed class CudaMoeLayerWeights
     /// </summary>
     public bool SigmoidGating { get; init; }
 
+    /// <summary>
+    /// Non-null when this layer's routed experts stay on the CPU (<c>--cpu-moe</c> / <c>--n-cpu-moe</c>, #1187): the
+    /// CPU-side bundle whose raw views point into the mmap'd GGUF. <see cref="GateProj"/> / <see cref="UpProj"/> /
+    /// <see cref="DownProj"/> are then all zero and the router, shared expert and biases are the only device weights.
+    /// </summary>
+    internal DotLLM.Models.Architectures.MoeLayerWeights? HostExperts { get; init; }
+
     /// <summary>Precision of the per-expert projections. F32 = direct cuBLAS GEMM; Quantized = dequant-per-call into F16 scratch.</summary>
     public MoePrecision Precision { get; }
 
