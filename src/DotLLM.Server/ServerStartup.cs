@@ -624,7 +624,7 @@ public static class ServerStartup
         bool concurrencyOverMtp = options.MtpEnabled && options.ExpectedConcurrency >= 5 && schedulerAvailable;
         // qwen4exp ships its draft head as a separate mtp-*.gguf (#820): attach it when MTP can engage (same rules as DecideMtp) so the default-on
         // serve path actually speculates; a head that does not fit the device is declined with a message, never fatal.
-        if (options.MtpEnabled && !concurrencyOverMtp && draftModel is null && !model.SupportsMtp)
+        if (options.MtpEnabled && !concurrencyOverMtp && draftModel is null && (!model.SupportsMtp || options.DFlashPath is not null))
             TryAttachSeparateMtpHead(model, resolvedPath, options);
         int mtpK = options.SpeculativeCandidates == TextGenerator.DefaultSpeculativeCandidates && model.MtpPreferredDraftTokens > 0
             ? model.MtpPreferredDraftTokens : options.SpeculativeCandidates;
@@ -749,6 +749,15 @@ public static class ServerStartup
     /// </summary>
     internal static void TryAttachSeparateMtpHead(IModel model, string resolvedPath, ServerOptions options)
     {
+        if (options.DFlashPath is { } dflashPath)
+        {
+            // An explicit drafter is the user's choice: failing to attach it fails startup rather than silently decoding plain.
+            if (model is not IDFlashDraftAttachable dflash)
+                throw new NotSupportedException($"--dflash: {model.GetType().Name} cannot drive a DFlash drafter (qwen35 targets on CPU, CUDA or Vulkan only).");
+            dflash.AttachDFlashDrafter(dflashPath);
+            Console.WriteLine($"[dotllm] DFlash: attached drafter {Path.GetFileName(dflashPath)}.");
+            return;
+        }
         if (model is not IMtpHeadAttachable) return;
         try
         {

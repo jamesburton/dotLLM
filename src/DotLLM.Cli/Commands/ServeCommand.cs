@@ -195,6 +195,11 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
                      "directory and the one above it (a head that does not fit the device is declined with a startup message and serving continues without it).")]
         public string? MtpHead { get; set; }
 
+        /// <summary>DFlash / DFlash2 drafter GGUF (issue #1175).</summary>
+        [CommandOption("--dflash")]
+        [Description("Path of a DFlash / DFlash2 drafter GGUF (arch 'dflash'). It takes the MTP slot; qwen35 targets on CPU, CUDA or Vulkan (drafter on the CPU).")]
+        public string? DFlash { get; set; }
+
         /// <summary>How reasoning output is split from the answer (#767).</summary>
         [CommandOption("--reasoning-format")]
         [Description("How thinking output is separated from the answer: auto (default; split into reasoning_content + content when the chat " +
@@ -453,6 +458,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             MtpEnabled = !settings.NoMtp,
             MtpExplicit = settings.Mtp && !settings.NoMtp,
             MtpHeadPath = settings.MtpHead,
+            DFlashPath = settings.DFlash,
             ReasoningFormat = DotLLM.Tokenizers.Reasoning.ReasoningFormats.Parse(settings.ReasoningFormat),
             PrefillChunkSize = settings.PrefillChunkSize,
             PrefixSnapshots = settings.PrefixSnapshots,

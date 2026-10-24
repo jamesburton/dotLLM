@@ -30,7 +30,7 @@ namespace DotLLM.Models.Architectures;
 /// MoE routing — and the corresponding per-model quant dispatch gaining a <c>PQ2_0</c> arm
 /// (Bonsai's ternary quant type; see <c>MatMul.PQ2S.cs</c>).
 /// </summary>
-public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
+public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
 {
     private readonly GgufFile? _gguf; // kept alive; null when built from prebuilt weights
     private readonly Qwen3HybridDenseLayerWeights[] _layers;
@@ -86,7 +86,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     public int AttentionLayerCount => _attentionLayerCount;
 
     /// <inheritdoc/>
-    public bool SupportsMtp => _mtpHead is not null;
+    public bool SupportsMtp => _mtpHead is not null || _dflash is not null;
 
     private Qwen3HybridDenseTransformerModel(
         ModelConfig config,
@@ -1066,9 +1066,15 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             TensorDump.Dump2D("token_embd", hidden, seqLen, hiddenSize);
 
         var kinds = _layout.LayerKind;
+        // DFlash (#1175): the drafter conditions on these layers' inputs; only the rows its context ring can hold are kept.
+        DFlash.DFlashMtpState? dflashTaps = _dflash is not null ? mtpState as DFlash.DFlashMtpState : null;
+        int tapFirst = dflashTaps is null ? 0 : Math.Max(0, seqLen - dflashTaps.RingCapacity);
+        dflashTaps?.EnsureTapRows(seqLen - tapFirst);
         for (int layer = 0; layer < _layers.Length; layer++)
         {
             var lw = _layers[layer];
+            if (dflashTaps is not null)
+                CaptureDFlashTaps(dflashTaps, layer, hidden, tapFirst, seqLen, hiddenSize);
             // ── Token-mixing sub-layer ─────────────────────────────────────────
             // Snapshot hidden as residual, then attn_norm.
             new Span<float>(hidden, seqLen * hiddenSize)
@@ -1128,6 +1134,9 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
                 TensorDump.Dump2D($"blk.{layer}.l_out", hidden, seqLen, hiddenSize);
         }
 
+        if (dflashTaps is not null)
+            CaptureDFlashTaps(dflashTaps, _layers.Length, hidden, tapFirst, seqLen, hiddenSize);
+
         // Final output norm + logit projection.
         for (int t = 0; t < seqLen; t++)
         {
@@ -1168,6 +1177,11 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
 
         if (mtpCapture is not null && _mtpHead is not null)
             AbsorbMtp(_mtpHead, mtpCapture, tokenIds, positions);
+        if (dflashTaps is not null)
+        {
+            dflashTaps.InjectCaptured(positions.Slice(tapFirst));
+            dflashTaps.TrimTapRows();
+        }
 
         return result;
     }
@@ -1490,6 +1504,8 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     /// <inheritdoc/>
     public IMtpState? CreateMtpState(int maxSequenceLength)
     {
+        if (_dflash is not null)
+            return new DFlash.DFlashMtpState(_dflash);   // an attached DFlash drafter takes the MTP slot (#1175)
         if (_mtpHead is null)
             return null;
 
@@ -1509,6 +1525,8 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     /// <inheritdoc/>
     public ITensor ForwardMtp(IMtpState state, int tokenId, int position)
     {
+        if (state is DFlash.DFlashMtpState dflash)
+            return ForwardDFlashDraft(dflash, tokenId, position);
         if (_mtpHead is null)
             throw new NotSupportedException(
                 $"{nameof(Qwen3HybridDenseTransformerModel)} has no MTP head loaded (SupportsMtp=false).");
@@ -2405,6 +2423,8 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         _gdnCache.Dispose();
         Interlocked.Exchange(ref _spareGdnCheckpoint, null)?.Dispose();
         FreeRowSnapshots();
+        _dflash?.Dispose();
+        if (_dflashHeadScratch != 0) { System.Runtime.InteropServices.NativeMemory.AlignedFree((void*)_dflashHeadScratch); _dflashHeadScratch = 0; }
         GC.SuppressFinalize(this);
     }
 
