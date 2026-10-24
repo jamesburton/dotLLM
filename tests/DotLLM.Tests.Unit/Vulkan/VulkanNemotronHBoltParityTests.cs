@@ -35,9 +35,9 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
 
     /// <summary>
     /// Weight seeds of the two fixtures, chosen so every routing decision past layer 0 clears <see cref="RequiredRoutingMargin"/>
-    /// (min 0.052 and 0.028); <see cref="RunParity"/> re-checks. Of 40 consecutive seeds, about one in six qualifies.
+    /// (min 0.052, 0.028 and, for the #1225 legacy-bank fixture, 0.049); <see cref="RunParity"/> re-checks. Of 40 consecutive seeds, about one in six qualifies.
     /// </summary>
-    private const int KQuantSeed = 1077, IqSeed = 1052;
+    private const int KQuantSeed = 1077, IqSeed = 1052, LegacySeed = 1125;
 
     private static readonly LayerSpec[] Layers =
     [
@@ -59,6 +59,18 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         new(Experts: 6, TopK: 3, Inter: 256, Latent: Latent, UpQt: QuantizationType.IQ2_XXS, DownQt: QuantizationType.IQ2_XXS),
         new(Experts: 5, TopK: 1, Inter: 256, Latent: 0, UpQt: QuantizationType.IQ2_XXS, DownQt: QuantizationType.Q8_0),
         new(Experts: 4, TopK: 2, Inter: 256, Latent: 0, UpQt: QuantizationType.IQ2_XXS, DownQt: QuantizationType.IQ2_XXS),
+    ];
+
+    /// <summary>
+    /// #1225: Nemotron-3.5 Lightning's routed banks are Q5_0 (repacked to Q5_1 at upload) and Q8_0, at widths that are 64- but not
+    /// 256-multiples (2688 / 1856 there; 320 / 192 here), so only the legacy-quant grouped coopmat kernels can take them.
+    /// </summary>
+    private static readonly LayerSpec[] LegacyLayers =
+    [
+        new(Experts: 4, TopK: 2, Inter: 320, Latent: Latent, UpQt: QuantizationType.Q5_0, DownQt: QuantizationType.Q5_0),
+        new(Experts: 6, TopK: 3, Inter: 192, Latent: 0, UpQt: QuantizationType.Q5_0, DownQt: QuantizationType.Q8_0),
+        new(Experts: 5, TopK: 1, Inter: 256, Latent: 0, UpQt: QuantizationType.Q8_0, DownQt: QuantizationType.Q8_0),
+        new(Experts: 4, TopK: 2, Inter: 320, Latent: 0, UpQt: QuantizationType.Q5_0, DownQt: QuantizationType.Q5_0),
     ];
 
     // 20 rows: at the grouped-prefill threshold (16) and enough that experts receive zero, one and many routed rows.
@@ -166,6 +178,32 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
                 // Only layer 2's Q8_0 down bank follows the switch to the F32-activation arm.
                 Assert.Equal(mmvq ? 0 : 1, viaF32);
             }
+        });
+    }
+
+    /// <summary>
+    /// #1225: Q5_0 / Q8_0 routed banks at non-256 widths. With the grouped prefill on a device with the wave64 legacy-quant coopmat
+    /// kernels every layer takes them; otherwise (and with grouping off) every bank stays on the indexed arm.
+    /// </summary>
+    /// <param name="mmvq">dp4a MMVQ indexed arm vs the F32-activation indexed arm.</param>
+    /// <param name="grouped">Expert-grouped prefill for the batched forward.</param>
+    [SkippableTheory]
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    public void Forward_LightningLegacyBanks_MatchesCpuAndReference(bool mmvq, bool grouped)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        Skip.If(mmvq && !device.HasIntegerDotProduct, "device lacks integer dot product");
+        bool legacyGrouped = MoeGroupedMatmulLegacyQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedLegacyQuant.Q5_1)
+            && MoeGroupedMatmulLegacyQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedLegacyQuant.Q8_0);
+
+        RunParity(device, spvDir, LegacyLayers, LegacySeed, mmvq, grouped, xdiv: true, () =>
+        {
+            long viaCoopmat = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.GroupedCoopmat);
+            Assert.Equal(0, Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.GroupedMmq));
+            Assert.Equal(grouped && legacyGrouped ? LegacyLayers.Length : 0, viaCoopmat);
         });
     }
 

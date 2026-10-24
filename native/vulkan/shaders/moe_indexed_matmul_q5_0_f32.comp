@@ -1,0 +1,94 @@
+#version 450
+// MoE indexed expert matmul over a PACKED Q5_0 expert bank (issue #1225: Nemotron-3.5 Lightning's routed banks), the Q5_0 twin of
+// moe_indexed_matmul_q5_1_f32.comp: same dispatch, bindings and per-expert post-scale. Q5_0 block = 22 bytes (fp16 d, qh[4], qs[16]),
+// not word aligned, so every field goes through the straddle-safe readers; w = d * (q - 16), i.e. the Q5_1 form with m = -16 d.
+// Kept packed (no repack to Q5_1): 22 instead of 24 bytes per 32 weights.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufBank  { uint  bank[]; };  // Q5_0 blob (22-byte blocks)
+layout(set = 0, binding = 1, std430) readonly  buffer BufX     { float x[]; };     // [N * K]
+layout(set = 0, binding = 2, std430) readonly  buffer BufIdx   { int   indices[]; };// [N]
+layout(set = 0, binding = 3, std430) writeonly buffer BufY     { float y[]; };     // [N * M]
+layout(set = 0, binding = 4, std430) readonly  buffer BufScale { float downScale[]; };// [numExperts]
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // output dim   (per-expert weight row count)
+    uint K;             // input dim    (per-expert weight col count, multiple of 32)
+    uint N;             // total rows   (typically seqLen * topK)
+    uint numExperts;    // bank's first axis size — bounds-check + scale lookup
+    uint blocksPerRow;  // = K / 32
+} pc;
+
+const uint Q5_1_BLOCK_BYTES = 22u;   // Q5_0 block (name kept for the shared body)
+const uint Q5_1_GROUP_SIZE  = 32u;
+
+uint readByte(uint absByteOff) {
+    uint u = bank[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = bank[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = bank[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+uint readWord(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    if (byteInWord == 0u) return bank[alignedIdx];
+    uint lo = bank[alignedIdx];
+    uint hi = bank[alignedIdx + 1u];
+    uint sh = byteInWord * 8u;
+    return (lo >> sh) | (hi << (32u - sh));
+}
+
+void main() {
+    uint m = gl_GlobalInvocationID.x; // 0..M
+    uint n = gl_GlobalInvocationID.y; // 0..N
+    if (m >= pc.M || n >= pc.N) return;
+
+    int rawIdx = indices[n];
+    uint expertIdx = uint(clamp(rawIdx, 0, int(pc.numExperts) - 1));
+
+    uint rowByteStride    = pc.blocksPerRow * Q5_1_BLOCK_BYTES;
+    uint matrixByteStride = pc.M * rowByteStride;
+    uint rowByteBase      = expertIdx * matrixByteStride + m * rowByteStride;
+    uint xRowBase         = n * pc.K;
+
+    float acc = 0.0;
+
+    for (uint b = 0u; b < pc.blocksPerRow; b++) {
+        uint blockByteBase = rowByteBase + b * Q5_1_BLOCK_BYTES;
+        float d = readHalf(blockByteBase);
+        float mn = -16.0 * d;
+        uint qh = readWord(blockByteBase + 2u);
+        uint qsBase = blockByteBase + 6u;
+
+        uint xBase = xRowBase + b * Q5_1_GROUP_SIZE;
+
+        for (uint j = 0u; j < 16u; j++) {
+            uint byteVal = readByte(qsBase + j);
+            uint lo = byteVal & 0xFu;
+            uint hi = (byteVal >> 4u) & 0xFu;
+            uint b5lo = (qh >> j) & 1u;
+            uint b5hi = (qh >> (j + 16u)) & 1u;
+            float wLo = d * float(lo | (b5lo << 4u)) + mn;
+            float wHi = d * float(hi | (b5hi << 4u)) + mn;
+            acc += x[xBase + j] * wLo;
+            acc += x[xBase + j + 16u] * wHi;
+        }
+    }
+
+    y[n * pc.M + m] = acc * downScale[expertIdx];
+}
