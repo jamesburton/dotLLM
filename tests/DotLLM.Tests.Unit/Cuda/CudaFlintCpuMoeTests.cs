@@ -128,7 +128,7 @@ public sealed class CudaFlintCpuMoeTests : IDisposable
 
     /// <summary>Prefill of <see cref="PrefillTokens"/> then one-token decodes; returns the last row of each call.</summary>
     private static List<float[]> RunCuda(GgufFile gguf, ModelConfig cfg, MoeOffloadOptions options, int? expectedCpuLayers,
-        string stream = "stream-off", string? embed = null)
+        string stream = "stream-off", string? embed = null, Action<CudaTransformerModel>? check = null)
     {
         var rows = new List<float[]>();
         var (model, kvFactory) = CudaModelLoader.CreateFromGguf(gguf, cfg, deviceId: 0, moeOffload: options);
@@ -159,6 +159,7 @@ public sealed class CudaFlintCpuMoeTests : IDisposable
                 Assert.Equal((expectedCpuLayers ?? 0) * SyntheticFlintGguf.TopK, cuda.CpuMoeExpertsComputed - before);
                 Assert.Equal(streamedAfterPrefill, cuda.CpuMoeExpertsStreamed);
             }
+            check?.Invoke(cuda);
         }
         return rows;
     }
@@ -247,6 +248,42 @@ public sealed class CudaFlintCpuMoeTests : IDisposable
             for (int i = 0; i < host[r].Length; i++)
                 Assert.True(BitConverter.SingleToInt32Bits(host[r][i]) == BitConverter.SingleToInt32Bits(device[r][i]),
                     $"row {r} logit {i}: host-gathered {host[r][i]} vs device table {device[r][i]}");
+    }
+
+    /// <summary>
+    /// Runtime VRAM (#1211): the FP16 forward allocates no F32 activation shadows and never the dequant scratch (every Flint
+    /// projection runs in place), and the dense / shared-expert weights are packed into the arena. Packing changes only where
+    /// the tensors live, so the logits must be bit-identical to one allocation per tensor.
+    /// </summary>
+    [SkippableFact]
+    public void Fp16Forward_NoF32ShadowsNoDequantScratch_ArenaBitIdentical()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
+        using var gguf = GgufFile.Open(_path);
+        ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var options = new MoeOffloadOptions { CpuMoeLayers = 4, CpuThreads = 1 };
+        List<float[]> packed = RunCuda(gguf, cfg, options, 2, stream: "stream-auto", check: m =>
+        {
+            Assert.Equal(0, m.ForwardState.HiddenStateF32);
+            Assert.Equal(0, m.ForwardState.ResidualF32);
+            Assert.Equal(0, m.ForwardState.SiluOutputF32);
+            Assert.False(m.ForwardState.DequantScratchAllocated, "no Flint projection dequantises");
+            Assert.True(m.DeviceWeights.ArenaUsedBytes > 0, "the weights were not packed");
+        });
+        List<float[]> separate;
+        Environment.SetEnvironmentVariable("DOTLLM_CUDA_WEIGHT_ARENA", "0");
+        try
+        {
+            separate = RunCuda(gguf, cfg, options, 2, stream: "stream-auto", check: m => Assert.Equal(0, m.DeviceWeights.ArenaUsedBytes));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("DOTLLM_CUDA_WEIGHT_ARENA", null);
+        }
+        for (int r = 0; r < packed.Count; r++)
+            for (int i = 0; i < packed[r].Length; i++)
+                Assert.True(BitConverter.SingleToInt32Bits(packed[r][i]) == BitConverter.SingleToInt32Bits(separate[r][i]),
+                    $"row {r} logit {i}: arena {packed[r][i]} vs one allocation per tensor {separate[r][i]}");
     }
 
     [Fact]

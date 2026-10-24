@@ -371,6 +371,12 @@ public sealed unsafe class CudaTransformerModel : IModel
     // every expert is device-resident.
     private CudaMoeHostExperts? _moeHost;
 
+    /// <summary>The forward's scratch (tests).</summary>
+    internal CudaForwardState ForwardState => _state;
+
+    /// <summary>The device weights (tests).</summary>
+    internal CudaWeights DeviceWeights => _weights;
+
     /// <summary>
     /// Layers below this index keep their routed experts on the CPU (<c>--n-cpu-moe</c> semantics, #1187); 0 when every
     /// expert is device-resident. <see cref="MoeOffloadOptions.AllLayers"/> means every MoE layer.
@@ -754,6 +760,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         // stays outside the try/catch — everything created from here on (stream/cublas/kernels/
         // weights/state) is disposed on any failure before rethrowing.
         var context = CudaContext.Create(deviceId);
+        CudaMemTrace.Mark("context");
         CudaStream? stream = null;
         CudaCublasHandle? cublas = null;
         CudaKernels? kernels = null;
@@ -765,8 +772,10 @@ public sealed unsafe class CudaTransformerModel : IModel
         stream = CudaStream.Create();
         cublas = CudaCublasHandle.Create();
         cublas.SetStream(stream);
+        CudaMemTrace.Mark("stream + cuBLAS");
 
         kernels = new CudaKernels(ptxDir);
+        CudaMemTrace.Mark("kernels");
 
         // Routed experts on the CPU (#1187): explicit --cpu-moe / --n-cpu-moe, or auto when the experts do not fit.
         int cpuMoeLayers = 0;
@@ -776,7 +785,7 @@ public sealed unsafe class CudaTransformerModel : IModel
             // Leave the reserve plus an F16 KV cache for the served context (default 4096 tokens) to the forward.
             int ctx = Math.Min(placement.Options.ContextTokens ?? 4096, config.MaxSequenceLength);
             long kvBytes = (long)ctx * config.NumLayers * 2 * config.NumKvHeads * config.HeadDim * sizeof(ushort);
-            long reserve = (placement.Options.ReserveMib ?? 1024) * 1048576L + kvBytes;
+            long reserve = (placement.Options.ReserveMib ?? 512) * 1048576L + kvBytes;
             cpuMoeLayers = PlanCpuMoeLayers(placement.Options, placement.RoutedBytesPerLayer, placement.AutoEligible,
                 estimatedWeightBytes, (long)freeNow, reserve);
 
@@ -859,6 +868,7 @@ public sealed unsafe class CudaTransformerModel : IModel
             moeHost.Stream = CudaMoeExpertStream.TryCreate(hostLayers, placement!.Options.Log ?? Console.Error.WriteLine);
         }
         LastLoadStreamedHostFreeCount = streamedFreeCount;
+        CudaMemTrace.Mark("weights");
 
         // Gemma-4 full-attention (global) layers may use a distinct head dim and
         // KV-head count (GlobalHeadDim / NumGlobalKvHeads). Size the Q/K/V scratch
@@ -906,9 +916,14 @@ public sealed unsafe class CudaTransformerModel : IModel
         // DOTLLM_CUDA_FLASH_ATTN_MINSEQ. Per-call gating in CudaFlashAttention.CanUse.
         CudaFlashAttention.ConfigureDefault(geForceAmpere);
 
+        // The F32 activation shadows are read only by the Gemma and high-precision I-quant forwards (#1211); the
+        // conditions mirror the constructor's choice of forward.
+        bool f32Activations = ShouldUseHighPrecisionForward(weights) || weights.Gemma4Layers is not null
+            || UsesF32DenseForward(config);
         state = new CudaForwardState(
             config.HiddenSize, config.NumAttentionHeads, stateKvHeads,
-            stateHeadDim, config.IntermediateSize, config.VocabSize, useFp32Residual);
+            stateHeadDim, config.IntermediateSize, config.VocabSize, useFp32Residual, f32Activations);
+        CudaMemTrace.Mark("forward state");
 
         int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
         if (ropeDim == 0) ropeDim = config.HeadDim;
@@ -1075,8 +1090,12 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache)
-        => ForwardInternal(tokenIds, positions, deviceId, kvCache,
+    {
+        var r = ForwardInternal(tokenIds, positions, deviceId, kvCache,
             suppressGraphCapture: false, deferredHostDest: 0)!;
+        CudaMemTrace.Mark(tokenIds.Length > 1 ? "multi-token forward" : "decode forward");
+        return r;
+    }
 
     /// <summary>
     /// Core forward body shared by the single-sequence <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>
@@ -4399,6 +4418,7 @@ public sealed unsafe class CudaTransformerModel : IModel
     public void Dispose()
     {
         _context.MakeCurrent();
+        CudaMemTrace.Dump("CudaTransformerModel.Dispose");
         ReportLaunchProfile();
         _cudaLora?.Dispose();
         DisposeDecodeGraph();
