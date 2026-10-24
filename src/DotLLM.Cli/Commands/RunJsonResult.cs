@@ -17,6 +17,25 @@ internal sealed record RunJsonResult
     public required RunUsageDto Usage { get; init; }
     public required RunTimingsDto Timings { get; init; }
     public required RunMemoryDto Memory { get; init; }
+    public RunBackendDto? Backend { get; init; }
+}
+
+/// <summary>Backend/decode-path diagnostics: which sampler path ran and CUDA decode-graph status.</summary>
+internal sealed record RunBackendDto
+{
+    public required string SamplerPath { get; init; }
+
+    /// <summary>CUDA decode-graph state (GPU models only); null on CPU/hybrid.</summary>
+    public string? DecodeGraph { get; init; }
+
+    /// <summary>The <c>--device</c> value as given (default <c>auto</c>).</summary>
+    public string? RequestedDevice { get; init; }
+
+    /// <summary>Device the model actually ran on (<c>cpu</c>, <c>vulkan</c>, <c>gpu:N</c>) - never inferred from the request.</summary>
+    public string? ResolvedDevice { get; init; }
+
+    /// <summary>Non-null when <c>auto</c> ended on the CPU (why, and the cost).</summary>
+    public string? DeviceWarning { get; init; }
 }
 
 /// <summary>Detected tool call in generated output.</summary>

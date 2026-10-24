@@ -61,6 +61,15 @@ public sealed record TimingsDto
     [JsonPropertyName("cached_tokens")]
     public int CachedTokens { get; init; }
 
+    /// <summary>Storage tier used to restore the cached prefix.</summary>
+    [JsonPropertyName("cache_tier")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? CacheTier { get; init; }
+
+    /// <summary>Time spent restoring the cached prefix, in milliseconds.</summary>
+    [JsonPropertyName("cache_restore_ms")]
+    public double CacheRestoreMilliseconds { get; init; }
+
     [JsonPropertyName("speculative_draft_tokens")]
     public int SpeculativeDraftTokens { get; init; }
 
@@ -69,6 +78,24 @@ public sealed record TimingsDto
 
     [JsonPropertyName("speculative_acceptance_rate")]
     public float SpeculativeAcceptanceRate { get; init; }
+
+    /// <summary>Maps engine measurements to the streaming timing extension.</summary>
+    public static TimingsDto From(DotLLM.Engine.InferenceTimings timings) => new()
+    {
+        PrefillTimeMs = timings.PrefillTimeMs,
+        DecodeTimeMs = timings.DecodeTimeMs,
+        SamplingTimeMs = timings.SamplingTimeMs,
+        PrefillTokensPerSec = timings.PrefillTokensPerSec,
+        DecodeTokensPerSec = timings.DecodeTokensPerSec,
+        PromptTokens = timings.PrefillTokenCount,
+        GeneratedTokens = timings.DecodeTokenCount,
+        CachedTokens = timings.CachedTokenCount,
+        CacheTier = timings.CacheTier,
+        CacheRestoreMilliseconds = timings.CacheRestoreMilliseconds,
+        SpeculativeDraftTokens = timings.SpeculativeDraftTokens,
+        SpeculativeAcceptedTokens = timings.SpeculativeAcceptedTokens,
+        SpeculativeAcceptanceRate = timings.SpeculativeAcceptanceRate,
+    };
 }
 
 /// <summary>
@@ -104,7 +131,31 @@ public sealed record ChatDeltaDto
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Content { get; init; }
 
+    /// <summary>Incremental reasoning text (#767), streamed separately from <see cref="Content"/>.</summary>
+    [JsonPropertyName("reasoning_content")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReasoningContent { get; init; }
+
     [JsonPropertyName("tool_calls")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public ToolCallDto[]? ToolCalls { get; init; }
+    public StreamingToolCallDto[]? ToolCalls { get; init; }
+}
+
+/// <summary>
+/// A streamed tool call, identified by its position in the assistant's tool-call list.
+/// Unlike a non-streaming tool call, OpenAI clients require this index to assemble deltas.
+/// </summary>
+public sealed record StreamingToolCallDto
+{
+    [JsonPropertyName("index")]
+    public required int Index { get; init; }
+
+    [JsonPropertyName("id")]
+    public required string Id { get; init; }
+
+    [JsonPropertyName("type")]
+    public string Type => "function";
+
+    [JsonPropertyName("function")]
+    public required ToolCallFunctionDto Function { get; init; }
 }

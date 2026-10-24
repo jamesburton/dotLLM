@@ -10,7 +10,8 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// Tests for GPU tensor allocation and host↔device memory copies.
 /// </summary>
 [Trait("Category", "GPU")]
-public class CudaTensorTests : IDisposable
+[Collection(CudaCollection.Name)]
+public sealed class CudaTensorTests : IDisposable
 {
     private readonly CudaContext? _ctx;
 

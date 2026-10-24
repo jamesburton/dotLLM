@@ -1,0 +1,77 @@
+#version 450
+// Q4_1 (issue #1171, Recursive Flint): the Q4_1 GEMV (#1018) with the 20-byte block.
+// Q4_1 matrix-vector multiplication (decode-path GEMV, F32 activation; fallback when the dp4a MMVQ kernel is unavailable).
+//
+//   y[m] = sum_k  W_q4_1[m, k] * x[k]      with W_q4_1 dequantized on the fly.
+//
+// Weight layout mirrors llama.cpp's block_q4_1 / DotLLM.Cpu.Kernels.Dequantize: each 32 contiguous elements of a row form one
+// 20-byte block (every block word aligned):
+//     bytes [0,1]   = fp16 d
+//     bytes [2,3]   = fp16 m
+//     bytes [4..19] = qs[16] -- low nibble = element j, high nibble = element j + 16; value = d * nibble + m.
+//   Row stride = (K / 32) * 20 bytes.
+//
+// Per block: sum_i (d * q_i + m) * x_i = d * dot(q, x) + m * sum(x).
+// Dispatch: one workgroup per output row, 128 threads striding across blocks, shared-memory reduce.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; };  // Q4_1 blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { float x[]; };       // [K]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };       // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // number of output rows
+    uint K;             // columns (must be a multiple of 32)
+    uint blocksPerRow;  // = K / 32
+    uint rowUints;      // per-row uint stride bound (rounded up)
+} pc;
+
+const uint Q4_1_BLOCK_BYTES = 20u;
+const uint Q4_1_GROUP_SIZE  = 32u;
+
+shared float partials[128];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    uint rowByteStride = pc.blocksPerRow * Q4_1_BLOCK_BYTES;
+    uint rowByteBase = m * rowByteStride;
+
+    float acc = 0.0;
+
+    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+        uint blockByteBase = rowByteBase + b * Q4_1_BLOCK_BYTES;
+        uint w0 = blockByteBase >> 2u;
+        vec2 dm = unpackHalf2x16(weight[w0]);
+
+        uint xBase = b * Q4_1_GROUP_SIZE;
+
+        // qs word w holds bytes [4w..4w+3]: low nibbles = elements 4w..4w+3, high nibbles = elements 4w+16..4w+19.
+        float qd = 0.0;
+        float xs = 0.0;
+        for (uint w = 0u; w < 4u; w++) {
+            uint cur = weight[w0 + 1u + w];
+            uint e = xBase + w * 4u;
+            vec4 xlo = vec4(x[e], x[e + 1u], x[e + 2u], x[e + 3u]);
+            vec4 xhi = vec4(x[e + 16u], x[e + 17u], x[e + 18u], x[e + 19u]);
+            qd += dot(xlo, vec4(float(cur & 0xFu), float((cur >> 8u) & 0xFu), float((cur >> 16u) & 0xFu), float((cur >> 24u) & 0xFu)))
+                 + dot(xhi, vec4(float((cur >> 4u) & 0xFu), float((cur >> 12u) & 0xFu), float((cur >> 20u) & 0xFu), float(cur >> 28u)));
+            xs += (xlo.x + xlo.y + xlo.z + xlo.w) + (xhi.x + xhi.y + xhi.z + xhi.w);
+        }
+        acc += dm.x * qd + dm.y * xs;
+    }
+
+    partials[tid] = acc;
+    barrier();
+    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0u) y[m] = partials[0];
+}

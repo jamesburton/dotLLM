@@ -1,0 +1,174 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Qwen4-Exp sparse (QSA) attention, partial pass (issue #819). Structure of attention_f32_splitkv.comp (one workgroup per
+// (query head, KV split) with a coalesced subgroup-per-key Q.K and an online softmax), but the key set of query tq is a
+// VIRTUAL list: the tokens of its selected blocks (ascending block order) followed by the tail tokens of the incomplete
+// last block. Queries whose complete-block count fits the budget attend every block (the list is simply 0..p), so dense
+// and sparse queries share this kernel. No mask is needed: every listed key is causally visible.
+//
+// Grid: x = numHeads * numSplits, y = qCount. Partial (m, l, acc) rows are laid out [(lq*numHeads + head)*numSplits + split]
+// for qsa_merge_f32.comp.
+
+#define TILE_KV      256
+#define MAX_HEAD_DIM 512
+#define WG_SIZE      256
+#define NEG_INF      (-3.4e38)
+
+layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufQ       { float q[]; };       // [T, numHeads * head_dim]
+layout(set = 0, binding = 1, std430) readonly  buffer BufK       { float k[]; };       // [seq_kv, num_kv_heads * head_dim]
+layout(set = 0, binding = 2, std430) readonly  buffer BufV       { float v[]; };
+layout(set = 0, binding = 3, std430) readonly  buffer BufSel     { int   sel[]; };     // [qCount, selStride] ascending block ids
+layout(set = 0, binding = 4, std430) writeonly buffer BufPartOut { float partOut[]; }; // [qCount*numHeads*numSplits, head_dim]
+layout(set = 0, binding = 5, std430) writeonly buffer BufPartMS  { float partMS[]; };  // [qCount*numHeads*numSplits, 2]
+
+layout(push_constant) uniform PushConstants {
+    uint  qBase;
+    uint  qCount;
+    uint  firstPos;
+    uint  numHeads;
+    uint  numKvHeads;
+    uint  headDim;
+    uint  blockSize;
+    uint  budgetBlocks;
+    uint  numSplits;
+    uint  selStride;
+    float scale;
+} pc;
+
+shared float qShared[MAX_HEAD_DIM];
+shared float scoreTile[TILE_KV];
+shared uint  posTile[TILE_KV];
+shared float outAccum[MAX_HEAD_DIM];
+shared float partialMax[64];
+shared float partialSum[64];
+shared float broadcastSlot;
+
+float workgroupMaxSg(float val) {
+    float sgMax = subgroupMax(val);
+    if (subgroupElect()) partialMax[gl_SubgroupID] = sgMax;
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        float x = (gl_SubgroupInvocationID < gl_NumSubgroups) ? partialMax[gl_SubgroupInvocationID] : NEG_INF;
+        float reduced = subgroupMax(x);
+        if (subgroupElect()) broadcastSlot = reduced;
+    }
+    barrier();
+    float m = broadcastSlot;
+    barrier();
+    return m;
+}
+
+float workgroupSumSg(float val) {
+    float sgSum = subgroupAdd(val);
+    if (subgroupElect()) partialSum[gl_SubgroupID] = sgSum;
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        float x = (gl_SubgroupInvocationID < gl_NumSubgroups) ? partialSum[gl_SubgroupInvocationID] : 0.0;
+        float reduced = subgroupAdd(x);
+        if (subgroupElect()) broadcastSlot = reduced;
+    }
+    barrier();
+    float s = broadcastSlot;
+    barrier();
+    return s;
+}
+
+void main() {
+    uint lq      = gl_WorkGroupID.y;
+    uint hq      = gl_WorkGroupID.x / pc.numSplits;
+    uint splitId = gl_WorkGroupID.x - hq * pc.numSplits;
+    uint tq      = pc.qBase + lq;
+    uint tid     = gl_LocalInvocationID.x;
+
+    uint groupSize = pc.numHeads / pc.numKvHeads;
+    uint hkv = hq / groupSize;
+    uint kvStride = pc.numKvHeads * pc.headDim;
+
+    uint p       = pc.firstPos + tq;
+    uint nb      = (p + 1u) / pc.blockSize;
+    bool dense   = nb <= pc.budgetBlocks;
+    uint nSel    = dense ? nb : pc.budgetBlocks;
+    uint selKeys = nSel * pc.blockSize;
+    uint nKeys   = selKeys + (p + 1u - nb * pc.blockSize);
+
+    uint splitLen   = (nKeys + pc.numSplits - 1u) / pc.numSplits;
+    uint chunkStart = min(splitId * splitLen, nKeys);
+    uint chunkEnd   = min(chunkStart + splitLen, nKeys);
+
+    uint qBase = tq * pc.numHeads * pc.headDim + hq * pc.headDim;
+    for (uint d = tid; d < pc.headDim; d += WG_SIZE) {
+        qShared[d]  = q[qBase + d];
+        outAccum[d] = 0.0;
+    }
+    barrier();
+
+    float runningMax = NEG_INF;
+    float runningSum = 0.0;
+
+    uint nSub = gl_NumSubgroups, sgId = gl_SubgroupID, lane = gl_SubgroupInvocationID, sgSize = gl_SubgroupSize;
+
+    for (uint tStart = chunkStart; tStart < chunkEnd; tStart += uint(TILE_KV)) {
+        uint tEnd = min(tStart + uint(TILE_KV), chunkEnd);
+        uint tileLen = tEnd - tStart;
+
+        for (uint t = sgId; t < tileLen; t += nSub) {
+            uint i = tStart + t;
+            uint pos;
+            if (i < selKeys) {
+                uint blk = i / pc.blockSize;
+                uint b = dense ? blk : uint(sel[lq * pc.selStride + blk]);
+                pos = b * pc.blockSize + (i - blk * pc.blockSize);
+            } else {
+                pos = nb * pc.blockSize + (i - selKeys);
+            }
+            uint kBase = pos * kvStride + hkv * pc.headDim;
+            float partial = 0.0;
+            for (uint d = lane; d < pc.headDim; d += sgSize) partial += qShared[d] * k[kBase + d];
+            float dotqk = subgroupAdd(partial);
+            if (subgroupElect()) { scoreTile[t] = dotqk * pc.scale; posTile[t] = pos; }
+        }
+        barrier();
+
+        float localMax = NEG_INF;
+        for (uint t = tid; t < tileLen; t += WG_SIZE) localMax = max(localMax, scoreTile[t]);
+        float tileMax = workgroupMaxSg(localMax);
+
+        float newMax = max(runningMax, tileMax);
+        float correction = (runningMax > NEG_INF * 0.5) ? exp(runningMax - newMax) : 0.0;
+        runningSum *= correction;
+        for (uint d = tid; d < pc.headDim; d += WG_SIZE) outAccum[d] *= correction;
+        runningMax = newMax;
+        barrier();
+
+        float localSum = 0.0;
+        for (uint t = tid; t < tileLen; t += WG_SIZE) {
+            float w = exp(scoreTile[t] - runningMax);
+            scoreTile[t] = w;
+            localSum += w;
+        }
+        float tileSum = workgroupSumSg(localSum);
+        runningSum += tileSum;
+        barrier();
+
+        for (uint d = tid; d < pc.headDim; d += WG_SIZE) {
+            float vAcc = 0.0;
+            for (uint t = 0u; t < tileLen; t++) {
+                vAcc += scoreTile[t] * v[posTile[t] * kvStride + hkv * pc.headDim + d];
+            }
+            outAccum[d] += vAcc;
+        }
+        barrier();
+    }
+
+    uint blockId = (lq * pc.numHeads + hq) * pc.numSplits + splitId;
+    uint partBase = blockId * pc.headDim;
+    for (uint d = tid; d < pc.headDim; d += WG_SIZE) partOut[partBase + d] = outAccum[d];
+    if (tid == 0u) {
+        partMS[blockId * 2u + 0u] = runningMax;
+        partMS[blockId * 2u + 1u] = runningSum;
+    }
+}

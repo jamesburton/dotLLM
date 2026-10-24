@@ -1,0 +1,116 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// IQ4_XS MMVQ decode GEMV: integer-dot (dp4a) matrix-vector multiply.
+//
+//   y[m] = sum_k W_iq4xs[m,k] * x[k]
+//
+// The activation x[] is pre-quantized to Q8_1. IQ4_XS uses the SAME 16-entry
+// signed-int8 codebook as IQ4_NL (kvalues_iq4nl) plus a per-32-element sub-block
+// signed 6-bit scale dl = d·(ls−32). Per 32-element sub-block (= one Q8_1 block):
+//   sum_i w_i·x_i = dl · d_x · dp4a(kvalues_iq4nl[q], xq)
+// No min term.
+//
+// NOT bit-exact (x is int8-quantized); validated argmax + tolerance vs CPU F32.
+//
+// ── COALESCED lane=K-position layout (issue #339, mirrors #338) ───────────────
+// One wave32 subgroup per row; the 32 lanes consume one super-block per iteration.
+// The super-block qs is 128 bytes = 32 uints, so lane L reads qs uint L (=
+// sub-block ib=L/4, word w=L%4) → consecutive lanes read consecutive words = a
+// fully coalesced 128-byte region. Each uint = 4 low-nibble elements [4w..4w+3] +
+// 4 high-nibble [16+4w..] → 2 dp4a. Reduction: a single subgroupAdd.
+//
+// IQ4_XS super-block layout (136 bytes / 256 elements; matches matmul_iq4_xs_f32_gemv.comp):
+//   [0,1]    = fp16 d
+//   [2,3]    = scales_h (uint16 LE: top 2 bits of each of 8 sub-block 6-bit scales)
+//   [4..7]   = scales_l[4] (low 4 bits of each scale)
+//   [8..135] = qs[128] (8 sub-blocks × 16 bytes; low nibble → elem j, high → j+16)
+//   Row stride = (K/256) * 136 bytes (qs base 4-aligned ⇒ no funnel).
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW   { uint  weight[]; }; // IQ4_XS blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq  { uint  xq[]; };      // [K/4] packed int8 activations
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds { vec2  xds[]; };     // [K/32] (d_x, s)
+layout(set = 0, binding = 3, std430) writeonly buffer BufY   { float y[]; };       // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint blocksPerRow; // = K / 256
+    uint pad;
+} pc;
+
+const uint IQ4_XS_BLOCK_BYTES = 136u;
+
+const int KV[16] = int[16](
+    -127, -104, -83, -65, -49, -35, -22, -10,
+       1,   13,  25,  38,  53,  69,  89, 113
+);
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    return (u >> ((absByteOff & 3u) * 8u)) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+uint packCB(uint cur, uint s0, uint s1, uint s2, uint s3) {
+    return (uint(KV[(cur >> s0) & 0xFu]) & 0xFFu)
+         | ((uint(KV[(cur >> s1) & 0xFu]) & 0xFFu) << 8u)
+         | ((uint(KV[(cur >> s2) & 0xFu]) & 0xFFu) << 16u)
+         | ((uint(KV[(cur >> s3) & 0xFu]) & 0xFFu) << 24u);
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint lane = gl_LocalInvocationID.x;   // 0..31
+    uint ib = lane >> 2u;                 // sub-block 0..7
+    uint w  = lane & 3u;                  // qs word 0..3
+
+    uint rowByteBase = m * pc.blocksPerRow * IQ4_XS_BLOCK_BYTES;
+    float acc = 0.0;
+
+    for (uint blk = 0u; blk < pc.blocksPerRow; blk++) {
+        uint blockByteBase = rowByteBase + blk * IQ4_XS_BLOCK_BYTES;
+        float d = readHalf(blockByteBase);
+
+        // This lane's sub-block signed 6-bit scale.
+        uint scalesH = readByte(blockByteBase + 2u) | (readByte(blockByteBase + 3u) << 8u);
+        uint scalesLByte = readByte(blockByteBase + 4u + (ib >> 1u));
+        uint low  = (scalesLByte >> (4u * (ib & 1u))) & 0xFu;
+        uint high = (scalesH >> (2u * ib)) & 0x3u;
+        float dl = d * float(int(low | (high << 4u)) - 32);
+
+        // This lane's qs uint (lane = ib*4 + w over the 32-uint qs region).
+        uint cur = weight[((blockByteBase + 8u) >> 2u) + lane];
+        uint wLo = packCB(cur, 0u, 8u, 16u, 24u);
+        uint wHi = packCB(cur, 4u, 12u, 20u, 28u);
+
+        uint xBase = blk * 64u + ib * 8u;  // sub-block ib's first xq uint
+        int dotI = dotPacked4x8AccSatEXT(int(wLo), int(xq[xBase + w]), 0);
+        dotI = dotPacked4x8AccSatEXT(int(wHi), int(xq[xBase + 4u + w]), dotI);
+
+        float dX = xds[blk * 8u + ib].x;
+        acc += dl * (dX * float(dotI));
+    }
+
+    float total = subgroupAdd(acc);
+    if (subgroupElect())
+        y[m] = total;
+}
