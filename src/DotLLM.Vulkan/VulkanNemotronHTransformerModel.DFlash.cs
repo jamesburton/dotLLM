@@ -221,18 +221,20 @@ public sealed partial class VulkanNemotronHTransformerModel : IDFlashDraftAttach
     private void CreateExactGemvKernels(VulkanDevice device, string spvDir)
     {
         if (!ExactGemvEnabled) return;
-        int decodeRows = 1, multiRows = 1;   // Strix: NR 1, 2 and 4 time the same at Bolt's shapes
+        // Verify rows per workgroup measured on Strix at Bolt's shapes (8-row verify, ms over all layers): NVFP4 NR 1/2/4 = 34/23.5/23.2,
+        // IQ2_XXS 21.5/14.9/17.2, Q8_0 (LM head + attention) best at 4. Decode is flat in NR, so it stays 1.
+        int decodeRows = 1, nvfp4Rows = 4, iq2Rows = 2, q8Rows = 4;
         if (Environment.GetEnvironmentVariable(ExactGemvRowsEnvVar)?.Split(',') is [var d, var mr]
             && int.TryParse(d, out int dv) && int.TryParse(mr, out int mv))
         {
             decodeRows = dv;
-            multiRows = mv;
+            nvfp4Rows = iq2Rows = q8Rows = mv;
         }
 
-        _exactQ8 = MatMulExactGemvMultiKernel.TryCreate(device, spvDir, ExactGemvFormat.Q8_0, decodeRows, multiRows);
+        _exactQ8 = MatMulExactGemvMultiKernel.TryCreate(device, spvDir, ExactGemvFormat.Q8_0, decodeRows, q8Rows);
         if (_matmulNvfp4 is not { HasMmvq: true })
-            _exactNvfp4 = MatMulExactGemvMultiKernel.TryCreate(device, spvDir, ExactGemvFormat.Nvfp4, decodeRows, multiRows);
-        _exactIq2Xxs = MatMulExactGemvMultiKernel.TryCreate(device, spvDir, ExactGemvFormat.Iq2Xxs, decodeRows, multiRows);
+            _exactNvfp4 = MatMulExactGemvMultiKernel.TryCreate(device, spvDir, ExactGemvFormat.Nvfp4, decodeRows, nvfp4Rows);
+        _exactIq2Xxs = MatMulExactGemvMultiKernel.TryCreate(device, spvDir, ExactGemvFormat.Iq2Xxs, decodeRows, iq2Rows);
     }
 
     /// <summary>Records <paramref name="cols"/> rows (1 = decode) through the exact multi-column GEMV of <paramref name="qt"/>, or returns false.</summary>
