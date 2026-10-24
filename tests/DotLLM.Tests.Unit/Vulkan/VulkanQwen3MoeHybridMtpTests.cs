@@ -40,6 +40,19 @@ public sealed class VulkanQwen3MoeHybridMtpTests : IDisposable
 
     private string Fixture() => SyntheticQwen35MoeGguf.Write(Path.Combine(_scratch, "moe-mtp.gguf"), withMtp: true, contextLength: Context);
 
+    /// <summary>
+    /// #1224: the resident banks are uploaded by the loader, not by the first forward. The lazy upload made a real model's first prefill pay
+    /// a ~19 GiB page-in (11 tok/s against 1,443 warm). <see cref="Drafts_MatchCpuOracle"/> covers the forward on the eagerly uploaded banks.
+    /// </summary>
+    [SkippableFact]
+    public void BuildFromGguf_UploadsEveryResidentBankAtLoad()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        var (resident, layers) = WithVulkan(Fixture(), spvDir, m => (m.ResidentMoeLayerCount, m.Config.NumLayers));
+        Assert.True(layers > 1);
+        Assert.Equal(layers, resident);
+    }
+
     [SkippableFact]
     public void Drafts_MatchCpuOracle()
     {

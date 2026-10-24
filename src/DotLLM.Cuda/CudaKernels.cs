@@ -495,6 +495,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
     private readonly nint _gdnConv1dCausalDecodeF32Func;
     private readonly CudaModule? _gdnScanF32Module;
     private readonly nint _gdnScanStepF32Func;
+    private readonly nint _gdnScanReplayF32D128Func;   // issue #1194
     private readonly nint _gdnScanStepF32CoopSplit4Func;
     private readonly nint _gdnScanMultiF32Func;   // #1222
     private int _gdnScanCoopSplit4MaxCoResidentGrid = -1; // -1 = not yet queried
@@ -1297,6 +1298,7 @@ public sealed unsafe partial class CudaKernels : IDisposable
         {
             _gdnScanF32Module = CudaModule.LoadFromFile(gdnScanF32Path);
             _gdnScanStepF32Func = _gdnScanF32Module.TryGetFunction("gdn_scan_step_f32");
+            _gdnScanReplayF32D128Func = _gdnScanF32Module.TryGetFunction("gdn_scan_replay_f32_d128");
             // Opt-in, default-off row-split cooperative-groups variant (issue #180) — see
             // gated_delta_net_scan.cu's header for the full measured-speedup-vs-bit-parity-
             // tradeoff writeup. TryGetFunction so a stale PTX (pre-#180) still loads gracefully.
@@ -3874,6 +3876,39 @@ public sealed unsafe partial class CudaKernels : IDisposable
         CudaDriverApi.cuLaunchKernel(_gdnConv1dCausalDecodeF32Func,
                 gridDim, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>True when <see cref="LaunchGdnScanReplayF32"/> is available (issue #1194; needs a PTX that has it).</summary>
+    public bool HasGdnScanReplayF32 => _gdnScanReplayF32D128Func != 0;
+
+    /// <summary>
+    /// Rebuilds the GDN state after <paramref name="rows"/> tokens from the state before them (issue #1194): bit-identical to
+    /// <paramref name="rows"/> launches of <see cref="LaunchGdnScanStepF32"/> on the same k / v / g / beta, minus the read-out, with
+    /// each column held in registers across the rows. <c>dState</c> must be 128.
+    /// </summary>
+    /// <param name="state">Device pointer, <c>[nVHead, 128, 128]</c> F32: receives the state after the rows.</param>
+    /// <param name="source">Device pointer to the state before the rows (same shape); may equal <paramref name="state"/>.</param>
+    /// <param name="k">Device pointer, <c>[rows, nKHead, 128]</c> L2-normalised keys.</param>
+    /// <param name="v">Device pointer, <c>[rows, nVHead, 128]</c> values.</param>
+    /// <param name="g">Device pointer, <c>[rows, nVHead]</c> decays.</param>
+    /// <param name="beta">Device pointer, <c>[rows, nVHead]</c> write gates.</param>
+    /// <param name="rows">Tokens to replay (&gt;= 1).</param>
+    /// <param name="nVHead">Value heads.</param>
+    /// <param name="nKHead">Key heads (value head <c>vh</c> uses key head <c>vh % nKHead</c>).</param>
+    /// <param name="dState">Per-head state dimension; only 128 is compiled.</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="dState"/> is not 128 or <paramref name="rows"/> is below 1.</exception>
+    public void LaunchGdnScanReplayF32(nint state, nint source, nint k, nint v, nint g, nint beta,
+                                       int rows, int nVHead, int nKHead, int dState, nint stream)
+    {
+        if (dState != 128) throw new ArgumentOutOfRangeException(nameof(dState), $"dState={dState}; only gdn_scan_replay_f32_d128 is compiled.");
+        if (rows < 1) throw new ArgumentOutOfRangeException(nameof(rows));
+        nint sArg = state, srcArg = source, kArg = k, vArg = v, gArg = g, bArg = beta;
+        int rowsArg = rows, nvArg = nVHead, nkArg = nKHead;
+        void** args = stackalloc void*[] { &sArg, &srcArg, &kArg, &vArg, &gArg, &bArg, &rowsArg, &nvArg, &nkArg };
+        CudaDriverApi.cuLaunchKernel(_gdnScanReplayF32D128Func,
+                (uint)nVHead, 1, 1, 128, 1, 1,
+                128 * sizeof(float), stream, (nint)args, 0).ThrowOnError();
     }
 
     /// <summary>

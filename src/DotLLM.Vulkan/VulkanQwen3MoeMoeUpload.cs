@@ -236,6 +236,66 @@ internal static class VulkanQwen3MoeMoeUpload
     public static double BanksMilliseconds => Interlocked.Read(ref s_banksTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
 
     /// <summary>
+    /// Uploads the routed banks of every non-null entry of <paramref name="layers"/> resident (raw quant), eagerly and in layer order, through one
+    /// multi-threaded staging buffer, with the next layers' banks allocated ahead on background threads (#874). Shared by the Flint loader and the
+    /// qwen35moe loader (#1224): a lazy upload inside the first forward made that forward pay a ~19 GiB serial page-in as "prefill".
+    /// <c>DOTLLM_VULKAN_PARALLEL_UPLOAD=0</c> restores the serial per-layer staging and <c>DOTLLM_VULKAN_BANK_PREALLOC=0</c> the inline allocation.
+    /// </summary>
+    /// <param name="device">Target device.</param>
+    /// <param name="layers">Per-layer MoE weights; null skips the layer (e.g. a CPU-placed MoE layer).</param>
+    /// <param name="hiddenSize">Model hidden size.</param>
+    /// <param name="onUploaded">Receives each bundle as soon as it exists, so the caller's cleanup owns it even if a later layer fails.</param>
+    /// <param name="expertSlots">#939 tiered slot count; 0 uploads every expert.</param>
+    /// <param name="sharedPackedDefault">Forwarded to <see cref="UploadLayer"/>.</param>
+    internal static void UploadResidentLayers(
+        VulkanDevice device, IReadOnlyList<MoeLayerWeights?> layers, int hiddenSize, Action<int, LayerBundle> onUploaded,
+        int expertSlots = 0, bool sharedPackedDefault = true)
+    {
+        bool parallelUpload = !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_PARALLEL_UPLOAD"), "0", StringComparison.Ordinal);
+        using var upStaging = parallelUpload
+            ? VulkanStagingBuffer.CreateParallel(device, VulkanStagingBuffer.ParallelSlotBytes, VulkanStagingBuffer.ParallelSlotCount) : null;
+        using var prealloc = parallelUpload && expertSlots == 0
+            && !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_BANK_PREALLOC"), "0", StringComparison.Ordinal) ? new VulkanBankPrealloc(device) : null;
+
+        const int AllocAhead = 2;
+        long heapBytes = device.DeviceLocalHeapBytes();
+        const long AheadMargin = 3L << 30;
+        void ScheduleLayer(int il)
+        {
+            if (prealloc is null || il >= layers.Count || layers[il] is not { } moe) return;
+            long[] sizes = BankAllocationSizes(moe, hiddenSize, residentQuant: true, integerDot: device.HasIntegerDotProduct);
+            // Near the device-local heap boundary allocation ORDER decides what falls back to the slower heap: allocate those inline.
+            if (VulkanBankPrealloc.MayAllocateAhead(heapBytes, LiveDeviceBytes(device), prealloc.PendingBytes, sizes.Sum(), AheadMargin))
+                prealloc.Schedule(sizes);
+        }
+        for (int il = 0; il < AllocAhead; il++) ScheduleLayer(il);
+        bool layerTrace = string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_TRACE"), "1", StringComparison.Ordinal);
+        for (int il = 0; il < layers.Count; il++)
+        {
+            if (layers[il] is { } moe)
+            {
+                long tl = System.Diagnostics.Stopwatch.GetTimestamp();
+                double cw0 = VulkanStagingBuffer.CopyWaitMilliseconds, aw0 = VulkanBankPrealloc.WaitMilliseconds, am0 = VulkanDevice.AllocateMemoryMilliseconds;
+                onUploaded(il, UploadLayer(device, moe, hiddenSize, residentQuant: true, upStaging, prealloc, expertSlots, sharedPackedDefault));
+                if (layerTrace)
+                    Console.Error.WriteLine($"[vulkan-load] layer {il}: {System.Diagnostics.Stopwatch.GetElapsedTime(tl).TotalMilliseconds:F0} ms " +
+                        $"(memcpy wait {VulkanStagingBuffer.CopyWaitMilliseconds - cw0:F0}, alloc wait {VulkanBankPrealloc.WaitMilliseconds - aw0:F0}, " +
+                        $"vkAllocateMemory thread-ms {VulkanDevice.AllocateMemoryMilliseconds - am0:F0}, live {LiveDeviceBytes(device) >> 20} MiB)");
+            }
+            ScheduleLayer(il + AllocAhead);
+        }
+        upStaging?.WaitAll();   // the banks are consumed by compute right after the load: drain every queued copy first
+    }
+
+    /// <summary>Bytes this device object has allocated across all heaps (the sum is conservative once allocations fall back to the host heap).</summary>
+    internal static long LiveDeviceBytes(VulkanDevice device)
+    {
+        long sum = 0;
+        for (int h = 0; h < 16; h++) sum += device.LiveBytesOnHeap(h);
+        return sum;
+    }
+
+    /// <summary>
     /// Byte sizes of the three routed-expert banks (gate, down, up) <see cref="UploadLayer"/> will allocate for <paramref name="moe"/>,
     /// in allocation order. Mirrors <c>UploadRoutedBankAnyQuant</c> so a <see cref="VulkanBankPrealloc"/> can allocate them ahead (#874).
     /// </summary>

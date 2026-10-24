@@ -544,7 +544,7 @@ PRs #1103, #1122, #1125, #1126.
 | C6 | CPU | RoPE cos/sin `float[]`, twice | L8B @128k 64 MiB ×2 | open | #1142 |
 | C7 | CPU | MTP KV and hidden F32 | 32 MiB @4096 positions | open | #1141 |
 | C8 | CPU | MLA KV, TurboQuant norms, MoE scatter F32 | per token | open | #1140 |
-| C9 | CPU | recurrent state + snapshots F32 | O(1) per sequence | sign-off pending | #1144 |
+| C9 | CPU | recurrent state + snapshots F32 | O(1) per sequence (speculative-verify row snapshots: one pre-verify state + row inputs, no longer K states, #1194) | sign-off pending | #1144 |
 | X1 | CPU | safetensors BF16 → F32 | L8B +16 GB; L1B +2.5 GB | open | #1143 (needs #1118) |
 | X2 | CPU | MLA-MoE routed experts → F32 | ≈57 GB on V2-Lite | open | #1140 |
 | X3 | CPU | MLA projections, shared / Granite-MoE experts → F32 | `Σ out·in·4` | open | #1140 |
@@ -609,7 +609,7 @@ New issues filed by this study: #1134–#1146 (inventory), #1148–#1151 (Vulkan
 | item | why it matters | issue |
 |---|---|---|
 | F16/BF16 stored activations (all backends); residual-stream max |x| per model | rule 1 for the largest per-token store after KV | #1138 |
-| Recurrent state at 16 bits over ≥ 8k-token decodes; 16-bit snapshots | the one store that feeds back into itself | #1144 |
+| Recurrent state at 16 bits over ≥ 8k-token decodes; 16-bit snapshots | the one store that feeds back into itself (dense `qwen35` verify rows no longer store states at all, #1194: a 16-bit snapshot would break greedy identity, row inputs + replay do not) | #1144 |
 | Split-KV O partials / split-K slabs in F16 | small bytes, needs sign-off either way | #1144 |
 | F16 RoPE tables at ≥ 32k | CPU table bytes | #1142 |
 | Vulkan F16 accumulation promoted every 256 K | the AMD Windows driver crashes compiling it; moot on Strix (F16-acc no faster) | — |
