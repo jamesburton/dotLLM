@@ -200,6 +200,8 @@ Differences between architectures are captured entirely in ModelConfig.
   to 2e-5. On the real model, dotLLM vs llama.cpp (both F32 KV) is mean KL 0.016 / 0.018 / 0.073 (prose / code / mixed), and dotLLM's
   own prefill vs its Q8_1-activation decode is 0.011; llama.cpp vs itself at a different thread count is 0.000. dotLLM's prefill PPL
   is 1-6 % above llama.cpp's on those corpora (exact activations vs Q8_1; which is closer to the BF16 reference is open).
+  Per-row KL between any two Flint backends (or one backend and a 1e-6-perturbed copy of itself) has a heavy tail from
+  Q8_1 expert-activation rounding and router near-ties, at every depth: gate on NLL / PPL, not mean KL (`docs/PRECISION.md` E14, #1218).
 
 ### Qwen4-Exp / Qwen3.8-Flash-Next (`qwen4exp`) — config (#815) + CPU reference forward (#816), epic #814
 - GGUF arch string: `qwen4exp` (llama.cpp `LLM_ARCH_QWEN4EXP`) -> `Architecture.Qwen4Exp`. The **CPU** loader builds `Qwen4ExpTransformerModel` (the
