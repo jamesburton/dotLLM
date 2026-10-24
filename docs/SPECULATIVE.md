@@ -168,6 +168,7 @@ inputs, so the state is **bit-identical** to the one the verify passed through a
   copy) to ~3 ms (the replay). The verify no longer writes 7 states, so its snapshot overhead fell from
   ~17 ms to ~6–9 ms. DFlash decode tok/s is unchanged (medians 20.26 before and 20.36 after over 5
   interleaved pairs), and every run was token-identical.
+  On Strix Vulkan (8060S), DFlash K=7 medians went 20.61 → 21.09 tok/s and MTP K=3 went 33.99 → 35.71 (3 alternated rounds each), all token-identical.
 - **Why not 16-bit snapshots (#1107):** a BF16/F16 snapshot restores a rounded state, so a rejected
   round would leave a different recurrence than plain decode. That breaks greedy token identity, the
   hard gate. Storing inputs instead is exact and smaller than 16-bit states for any K ≥ 1. The live
