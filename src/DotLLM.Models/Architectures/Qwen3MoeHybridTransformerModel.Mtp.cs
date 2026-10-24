@@ -28,7 +28,7 @@ namespace DotLLM.Models.Architectures;
 public sealed unsafe partial class Qwen3MoeHybridTransformerModel
 {
     /// <summary>The MTP block's weights; the embedding and LM head default to the trunk's.</summary>
-    private sealed class MoeMtpHead
+    internal sealed class MoeMtpHead
     {
         public required float[] AttnNorm { get; init; }
         public required float[] PostAttnNorm { get; init; }
@@ -44,6 +44,9 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel
     }
 
     private MoeMtpHead? _mtpHead;
+
+    /// <summary>The loaded MTP head, for the GPU hosts that upload it; null without one.</summary>
+    internal MoeMtpHead? MtpHead => _mtpHead;
 
     /// <inheritdoc/>
     public bool SupportsMtp => _mtpHead is not null;
