@@ -175,6 +175,9 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     public int AttentionLayerCount => _attentionLayerCount;
 
     /// <summary>Resident MoE layers whose shared-expert gate/up/down stay packed Q8_0 on the device (#987); 0 with <c>DOTLLM_VK_MOE_SHARED_PACKED=0</c>.</summary>
+    /// <summary>Layers whose resident routed banks exist (test hook, #1224: <c>BuildFromGguf</c> fills them at load, before any forward).</summary>
+    internal int ResidentMoeLayerCount => _residentMoeBundles.Count(b => b is not null);
+
     internal int SharedExpertPackedLayerCount => _residentMoeBundles.Count(b => b is { HasSharedExpert: true, SharedQuantType: QuantizationType.Q8_0 });
 
     /// <summary>Device bytes held by the resident layers' shared-expert gate/up/down buffers (each distinct buffer once).</summary>
@@ -382,8 +385,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         }
 
         // Upload all token-mixing weights (norm, GDN per-layer, full-attn per-layer,
-        // token embedding, output norm, LM head). Routed MoE banks are NOT uploaded
-        // here — they live on host and stream per layer in the forward pass.
+        // token embedding, output norm, LM head). Routed MoE banks follow after the
+        // model is built: resident at load when they fit (#1224), else streamed per layer.
         var weights = VulkanQwen3MoeHybridWeights.Upload(device, config, cpuLayers, outputNormWeight,
             tokenEmbedPtr, tokenEmbedQt, outputPtr, outputQt, outputM, outputK);
 
@@ -398,6 +401,15 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             kvSlotForLayer, attentionLayerCount, gdnLayerOrdinal,
             ropeDim, ropeTheta, ResolveNCpuMoeLayers(nCpuMoeLayers));
         model._iqF16Prefill = CreateIqF16Prefill(device, spvDir, config, kernels);
+        try
+        {
+            model.UploadResidentMoeBanks();   // #1224: at load, not inside the first forward
+        }
+        catch
+        {
+            model.Dispose();
+            throw;
+        }
         model.UploadMtpHeadIfPresent();   // #1188: null without a head (or without resident MoE)
         if (gdnOrdinal > 0 && gdn.DState <= 128 && GdnScanMultiTokenSnapshotF32Kernel.IsAvailable(spvDir))
             model._rowSnapScan = GdnScanMultiTokenSnapshotF32Kernel.Create(device, spvDir);
@@ -1330,8 +1342,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     private static readonly bool FuseDecodeEnabled =
         !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_FUSE_FORWARD"), "0", StringComparison.Ordinal);
 
-    // Latched once every layer's resident bundle exists and takes RecordMoeDecodeFast (the bundles are uploaded lazily by the first
-    // forwards, which therefore take the per-layer-submission path); false/unset re-checks until all bundles are present.
+    // Latched once every layer's resident bundle exists and takes RecordMoeDecodeFast (BuildFromGguf uploads them at load; prebuilt fixtures
+    // fill them lazily in the first forwards, which take the per-layer-submission path); false/unset re-checks until all bundles are present.
     private bool _fuseDecodeOk;
 
     private bool CanFuseMoeDecode(int hiddenSize)
@@ -1453,25 +1465,13 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         bool disposeAfterLayer;
         if (_residentMoeEnabled)
         {
-            // Lazily upload on first use; retained for the life of the
-            // model after that. See _residentMoeBundles field docstring
-            // for the device-memory caveat — DOTLLM_VK_MOE_RESIDENT=1
-            // is opt-in for models that fit.
+            // BuildFromGguf uploads every bank at load (#1224); prebuilt-weight fixtures still fill them lazily here. Retained for the life
+            // of the model.
             bool firstUpload = _residentMoeBundles[layer] is null;
             moeBuf = _residentMoeBundles[layer]
                 ?? (_residentMoeBundles[layer] = VulkanQwen3MoeMoeUpload.UploadLayer(
                     _device, lw.Moe, hiddenSize, residentQuant: true));
-            if (firstUpload && layer == 0)
-            {
-                // One-line diagnostic so DOTLLM_VK_MOE_RESIDENT=1 runs make
-                // the chosen bank storage type observable (#371) — this is
-                // the only place that knows whether the resident-quant
-                // overlay engaged or silently fell back to F32.
-                Console.Error.WriteLine(
-                    $"[dotLLM] Vulkan resident-MoE bank quant types: gate={moeBuf.W1QuantType} " +
-                    $"up={moeBuf.W3QuantType} down={moeBuf.W2QuantType} " +
-                    $"(source: gate={lw.Moe.GateExpsRawQt}, up={lw.Moe.UpExpsRawQt}, down={lw.Moe.DownExpsRawQt})");
-            }
+            if (firstUpload && layer == 0) ReportResidentBankTypes(moeBuf, lw.Moe);
             disposeAfterLayer = false;
         }
         else
@@ -1516,6 +1516,29 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         // alive on _residentMoeBundles and only disposed at model Dispose.
         if (disposeAfterLayer) moeBuf.Dispose();
     }
+
+    /// <summary>
+    /// Uploads every GPU-placed layer's routed banks resident, at load (#1224). The lazy upload in <see cref="RunGpuPlacedMoeLayer"/> made
+    /// the first forward of a process pay a ~19 GiB serial page-in (Qwen3.6-35B-A3B on Strix: a 313-token prompt "prefilled" at 11 tok/s
+    /// against 1,443 tok/s warm). No-op when resident MoE is off.
+    /// </summary>
+    private void UploadResidentMoeBanks()
+    {
+        if (!_residentMoeEnabled) return;
+        var layers = new MoeLayerWeights?[_cpuLayers.Length];
+        for (int l = 0; l < layers.Length; l++)
+            if (!_cpuMoeLayer[l]) layers[l] = _cpuLayers[l].Moe;
+        VulkanQwen3MoeMoeUpload.UploadResidentLayers(_device, layers, Config.HiddenSize, (l, b) => _residentMoeBundles[l] = b);
+        int first = Array.FindIndex(layers, m => m is not null);
+        if (first >= 0) ReportResidentBankTypes(_residentMoeBundles[first]!, layers[first]!);
+    }
+
+    // One-line diagnostic that makes the chosen bank storage type observable (#371): the only place that knows whether the resident-quant
+    // overlay engaged or silently fell back to F32.
+    private static void ReportResidentBankTypes(VulkanQwen3MoeMoeUpload.LayerBundle b, MoeLayerWeights moe)
+        => Console.Error.WriteLine(
+            $"[dotLLM] Vulkan resident-MoE bank quant types: gate={b.W1QuantType} up={b.W3QuantType} down={b.W2QuantType} " +
+            $"(source: gate={moe.GateExpsRawQt}, up={moe.UpExpsRawQt}, down={moe.DownExpsRawQt})");
 
     private static readonly bool MoeDecodeFastEnabled =
         !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_DECODE_FUSED"), "0", StringComparison.Ordinal);

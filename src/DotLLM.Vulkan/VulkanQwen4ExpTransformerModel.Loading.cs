@@ -212,40 +212,9 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             Mark("grWeights");
             // Routed experts are uploaded eagerly (resident): a model that cannot be resident was refused above, and the transient
             // per-forward upload path would be the 0.01 tok/s thrash class.
-            // #874: one multi-threaded staging buffer for the whole load (parallel page-in + memcpy), and the next layers' banks
-            // allocated on background threads while the current layer copies (vkAllocateMemory is ~0.45 s/GiB here). A/B switch:
-            // DOTLLM_VULKAN_PARALLEL_UPLOAD=0 restores the serial per-layer staging and inline allocation.
-            bool parallelUpload = !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_PARALLEL_UPLOAD"), "0", StringComparison.Ordinal);
-            using (var upStaging = parallelUpload
-                       ? VulkanStagingBuffer.CreateParallel(device, VulkanStagingBuffer.ParallelSlotBytes, VulkanStagingBuffer.ParallelSlotCount) : null)
-            using (var prealloc = parallelUpload && slots == 0 && !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_BANK_PREALLOC"), "0", StringComparison.Ordinal) ? new VulkanBankPrealloc(device) : null)
-            {
-                const int AllocAhead = 2;
-                long heapBytes = device.DeviceLocalHeapBytes();
-                const long AheadMargin = 3L << 30;
-                void ScheduleLayer(int il)
-                {
-                    if (prealloc is null || il >= config.NumLayers) return;
-                    long[] sizes = VulkanQwen3MoeMoeUpload.BankAllocationSizes(layers[il].Moe, config.HiddenSize, residentQuant: true, integerDot: device.HasIntegerDotProduct);
-                    // Near the device-local heap boundary allocation ORDER decides what falls back to the slower heap: allocate those inline.
-                    if (VulkanBankPrealloc.MayAllocateAhead(heapBytes, LiveDeviceBytes(device), prealloc.PendingBytes, sizes.Sum(), AheadMargin))
-                        prealloc.Schedule(sizes);
-                }
-                for (int il = 0; il < AllocAhead; il++) ScheduleLayer(il);
-                bool layerTrace = string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_TRACE"), "1", StringComparison.Ordinal);
-                for (int il = 0; il < config.NumLayers; il++)
-                {
-                    long tl = System.Diagnostics.Stopwatch.GetTimestamp();
-                    double cw0 = VulkanStagingBuffer.CopyWaitMilliseconds, aw0 = VulkanBankPrealloc.WaitMilliseconds, am0 = VulkanDevice.AllocateMemoryMilliseconds;
-                    moeBundles.Add(VulkanQwen3MoeMoeUpload.UploadLayer(device, layers[il].Moe, config.HiddenSize, residentQuant: true, upStaging, prealloc, expertSlots: slots, sharedPackedDefault: false));
-                    ScheduleLayer(il + AllocAhead);
-                    if (layerTrace)
-                        Console.Error.WriteLine($"[vulkan-load] layer {il}: {System.Diagnostics.Stopwatch.GetElapsedTime(tl).TotalMilliseconds:F0} ms " +
-                            $"(memcpy wait {VulkanStagingBuffer.CopyWaitMilliseconds - cw0:F0}, alloc wait {VulkanBankPrealloc.WaitMilliseconds - aw0:F0}, " +
-                            $"vkAllocateMemory thread-ms {VulkanDevice.AllocateMemoryMilliseconds - am0:F0}, live {LiveDeviceBytes(device) >> 20} MiB)");
-                }
-                upStaging?.WaitAll();   // the banks are consumed by compute right after the load: drain every queued copy first
-            }
+            // #874 parallel staging + banks allocated ahead; shared with the qwen35moe loader (#1224).
+            VulkanQwen3MoeMoeUpload.UploadResidentLayers(device, layers.Select(l => (MoeLayerWeights?)l.Moe).ToArray(), config.HiddenSize,
+                (_, b) => moeBundles.Add(b), expertSlots: slots, sharedPackedDefault: false);
 
             // #890: the shared-expert gate/up/down F32 host copies (LoadMoe.SharedF32) existed only to be uploaded as F16; every copy is drained
             // above. They are ~3.3 GiB of private memory on the real UD-Q4_K_XL file, and the OS caps a process's total residency (~82 GiB on
@@ -371,14 +340,6 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             }
         }
         return bytes;
-    }
-
-    /// <summary>Bytes this device object has allocated across all heaps (the sum is conservative once allocations fall back to the host heap).</summary>
-    private static long LiveDeviceBytes(VulkanDevice device)
-    {
-        long sum = 0;
-        for (int h = 0; h < 16; h++) sum += device.LiveBytesOnHeap(h);
-        return sum;
     }
 
     /// <summary>Uploads one QSA layer's indexer projections (<c>indexer.q_proj</c>, <c>indexer.k_proj</c>) and folded norm gammas.</summary>
