@@ -1,0 +1,4 @@
+#version 450
+// Grouped Q4_1 MoE down projection scattering to the (token, slot) rows, v2 (issue #1161). Body: moe_grouped_q4_1_v2.glsl.
+#extension GL_GOOGLE_include_directive : require
+#include "moe_grouped_q4_1_v2.glsl"

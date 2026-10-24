@@ -312,7 +312,15 @@ public sealed partial class VulkanTransformerModel : IModel
     // stderr; set DOTLLM_VULKAN_PREFILL_PROFILE_OUT=<path> to also append to a
     // file (useful under test runners that swallow console output).
     private static readonly bool PrefillProfileEnabled =
-        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_PREFILL_PROFILE") == "1";
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_PREFILL_PROFILE") is "1" or "gpu";
+
+    // DOTLLM_VULKAN_PREFILL_PROFILE=gpu (#1161): GPU timestamps instead of submit splits, so buckets carry no host round trip and each
+    // noted matmul dispatch gets its own time (the interval since the previous stamp is charged to the stamp's label).
+    private static readonly bool PrefillProfileGpu =
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_PREFILL_PROFILE") == "gpu";
+    private const int ProfGpuMaxQueries = 8192;
+    private nint _profQueryPool;
+    private List<string>? _profGpuLabels;
     private Dictionary<string, double>? _profMs;
     private Dictionary<string, int>? _profCounts;
     private Dictionary<string, int>? _profDispatches;
@@ -328,6 +336,52 @@ public sealed partial class VulkanTransformerModel : IModel
         (_profCounts ??= new()).Clear();
         (_profDispatches ??= new()).Clear();
         _profStartTicks = _profLastTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (PrefillProfileGpu) ProfGpuBegin();
+    }
+
+    private void ProfGpuBegin()
+    {
+        if (_profQueryPool == 0)
+        {
+            var qci = new VkQueryPoolCreateInfo { sType = 11, queryType = 2, queryCount = ProfGpuMaxQueries };
+            if (VulkanApi.vkCreateQueryPool(_device.Handle, qci, 0, out _profQueryPool) < 0) _profQueryPool = 0;
+        }
+        (_profGpuLabels ??= new()).Clear();
+        if (_profQueryPool == 0) return;
+        VulkanApi.vkCmdResetQueryPool(_submit.CommandBuffer, _profQueryPool, 0, ProfGpuMaxQueries);
+        ProfGpuStamp("start");
+    }
+
+    private void ProfGpuStamp(string label)
+    {
+        if (_profQueryPool == 0 || _profGpuLabels!.Count >= ProfGpuMaxQueries) return;
+        VulkanApi.vkCmdWriteTimestamp(_submit.CommandBuffer, VkPipelineStageFlags.BottomOfPipe, _profQueryPool, (uint)_profGpuLabels.Count);
+        _profGpuLabels.Add(label);
+    }
+
+    /// <summary>Reads the forward's timestamps (the fence has been waited) and charges each interval to the later stamp's label.</summary>
+    private unsafe void ProfGpuCollect()
+    {
+        int n = _profGpuLabels?.Count ?? 0;
+        if (_profQueryPool == 0 || n < 2) return;
+        var ts = new ulong[n];
+        fixed (ulong* p = ts)
+        {
+            if (VulkanApi.vkGetQueryPoolResults(_device.Handle, _profQueryPool, 0, (uint)n, (nuint)(n * sizeof(ulong)), (nint)p, sizeof(ulong),
+                    flags: 0x1 | 0x2) < 0)
+                return;
+        }
+        double toMs = _device.TimestampPeriodNs / 1_000_000.0;
+        _profMs!.Clear();
+        _profCounts!.Clear();
+        for (int i = 1; i < n; i++)
+        {
+            string key = _profGpuLabels![i];
+            _profMs.TryGetValue(key, out double acc);
+            _profMs[key] = acc + (ts[i] - ts[i - 1]) * toMs;
+            _profCounts.TryGetValue(key, out int c);
+            _profCounts[key] = c + 1;
+        }
     }
 
     /// <summary>
@@ -338,6 +392,11 @@ public sealed partial class VulkanTransformerModel : IModel
     private void ProfSample(string category)
     {
         if (!_profActive) return;
+        if (PrefillProfileGpu)
+        {
+            ProfGpuStamp(category);
+            return;
+        }
         _submit.SubmitAndWait();
         long now = System.Diagnostics.Stopwatch.GetTimestamp();
         double ms = (now - _profLastTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
@@ -355,6 +414,7 @@ public sealed partial class VulkanTransformerModel : IModel
     {
         if (!_profActive) return;
         string key = $"{kernel} m={m} k={k} n={n}";
+        if (PrefillProfileGpu) ProfGpuStamp("  " + key);
         _profDispatches!.TryGetValue(key, out int c);
         _profDispatches[key] = c + 1;
     }
@@ -363,7 +423,8 @@ public sealed partial class VulkanTransformerModel : IModel
     {
         if (!_profActive) return;
         _profActive = false;
-        double total = (System.Diagnostics.Stopwatch.GetTimestamp() - _profStartTicks)
+        if (PrefillProfileGpu) ProfGpuCollect();
+        double total = PrefillProfileGpu ? _profMs!.Values.Sum() : (System.Diagnostics.Stopwatch.GetTimestamp() - _profStartTicks)
             * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
         var sb = new System.Text.StringBuilder();
         sb.AppendLine($"[prefill-profile] seqLen={seqLen} layers={Config.NumLayers} total_ms={total:F1}");
@@ -908,6 +969,8 @@ public sealed partial class VulkanTransformerModel : IModel
     private MoeGroupedMatmulKQuantCoopmatKernel? _grpQ4K, _grpQ5K, _grpQ6K;
     private MoeGroupedMatmulLegacyQuantCoopmatKernel? _grpQ8_0, _grpMxfp4;
     private MoeBuildTileListKernel? _grpTileList;
+    // Grouped Q4_1 v2 (#1161): fused gate/up + SwiGLU gathering token rows, down scattering to (token, slot) rows.
+    private MoeGroupedQ4_1V2Kernel? _grpQ4_1V2;
     /// <summary>Count of generic MoE layers that took the expert-grouped coopmat prefill path (test/diagnostic).</summary>
     public int GroupedMoeDispatchCount { get; private set; }
     /// <summary>Of <see cref="GroupedMoeDispatchCount"/>, layers whose gate/up banks were MXFP4 (gpt-oss).</summary>
@@ -2464,6 +2527,8 @@ public sealed partial class VulkanTransformerModel : IModel
             if (MoeGroupedMatmulLegacyQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedLegacyQuant.Mxfp4))
                 model._grpMxfp4 = MoeGroupedMatmulLegacyQuantCoopmatKernel.Create(device, spvDir, MoeGroupedLegacyQuant.Mxfp4);
             model._grpTileList = MoeBuildTileListKernel.Create(device, spvDir);
+            if (MoeGroupedQ4_1V2Kernel.IsSupportedOn(device, spvDir))
+                model._grpQ4_1V2 = MoeGroupedQ4_1V2Kernel.Create(device, spvDir);
             model.CreateIqMoeGroupedKernels(device, spvDir, cpuWeights, firstLayer, config.NumLayers, iq2Codebooks, iq3Codebooks);
         }
         if (hasMoe && !config.Gemma4DualFfn && quantizeQ8_1Rows is not null && !IsMmvqDisabled() && !IsMoeMmvqDisabled()
@@ -4800,6 +4865,7 @@ public sealed partial class VulkanTransformerModel : IModel
 
         // 4. COMPUTE→HOST barrier for the vocab-row download that follows, submit, wait.
         DpStamp(cmdBuf, DpCatLmHead);
+        if (_profActive && PrefillProfileGpu) ProfGpuStamp("lm_head");
         KernelSupport.ComputeToHostBarrier(cmdBuf);
         DpPreSubmit();
         _submit.SubmitAndWait();
@@ -5167,6 +5233,7 @@ public sealed partial class VulkanTransformerModel : IModel
         _gemma4GroupedQ8_0?.InvalidateDescriptorCache();
         _gemma4MoeBuildTileList?.InvalidateDescriptorCache();
         _grpTileList?.InvalidateDescriptorCache();   // generic grouped-MoE tile builder (#789): the one kernel field this method missed
+        _grpQ4_1V2?.InvalidateDescriptorCache();
         _moeWeightedScatter?.InvalidateDescriptorCache();
         _moeBroadcast?.InvalidateDescriptorCache();
         _moeIndexedLoraDelta?.InvalidateDescriptorCache();
@@ -6616,7 +6683,8 @@ public sealed partial class VulkanTransformerModel : IModel
         //    vkCmdCopyBuffer regions the previous implementation issued —
         //    same math, no transfer↔compute stage transition, dispatch
         //    count drops from O(seqLen·topK) to 1 per MoE layer.
-        if (!(mmvqArm && mmvqXDiv))
+        bool q41v2 = !mmvqArm && CanUseGroupedQ4_1V2(moeW, seqLen, hidden, interm);
+        if (!(mmvqArm && mmvqXDiv) && !q41v2)
         {
             _moeBroadcast!.Record(cmdBuf,
                 _state.NormOutput, _state.MoeExpandedInput!,
@@ -6633,6 +6701,12 @@ public sealed partial class VulkanTransformerModel : IModel
         {
             GenericMoeMmvqLayerCount++;
             RecordGenericMoeMmvqExperts(cmdBuf, moeW, hidden, interm, numE, topK, expandedRows, mmvqXDiv);
+        }
+        else if (q41v2)
+        {
+            GroupedMoeDispatchCount++;
+            GroupedMoeQ4_1V2DispatchCount++;
+            RecordGroupedQ4_1V2Experts(cmdBuf, moeW, hidden, interm, numE, topK, expandedRows);
         }
         else if (CanUseGroupedQuantMoe(moeW, seqLen, hidden, interm))
         {
@@ -6904,6 +6978,54 @@ public sealed partial class VulkanTransformerModel : IModel
             _gptOss!.RecordExpertBiasAdd(cmdBuf, _state.MoeDownRows!, db, _state.MoeTopkIndices!, expandedRows, hidden, numE);
             BarrierComputeToCompute(cmdBuf);
         }
+    }
+
+    /// <summary>Layers that took the grouped Q4_1 v2 path (#1161; test hook).</summary>
+    internal long GroupedMoeQ4_1V2DispatchCount { get; private set; }
+
+    /// <summary>
+    /// Whether this MoE layer takes the grouped Q4_1 v2 kernels (#1161): the v1 grouped path applies, all three banks are Q4_1, and no
+    /// per-expert bias (gpt-oss) is in play.
+    /// </summary>
+    private bool CanUseGroupedQ4_1V2(in VulkanWeights.MoeLayerBuffers moeW, int seqLen, int hidden, int interm)
+        => _grpQ4_1V2 is not null && moeW.GptOss is null
+        && moeW.W1DeviceQuantType == QuantType.Q4_1 && moeW.W3DeviceQuantType == QuantType.Q4_1 && moeW.W2DeviceQuantType == QuantType.Q4_1
+        && (hidden % MoeGroupedQ4_1V2Kernel.KGroup) == 0 && (interm % MoeGroupedQ4_1V2Kernel.KGroup) == 0
+        && CanUseGroupedQuantMoe(moeW, seqLen, hidden, interm);
+
+    /// <summary>
+    /// Routed experts on the grouped Q4_1 v2 kernels (#1161). On entry <c>NormOutput</c> holds the normalised token rows and the top-k
+    /// indices are set; on exit <c>MoeDownRows</c> holds the per-(token, slot) down outputs, as the v1 path leaves them. Rows are grouped by
+    /// expert as a permutation only (no copy of the activations); gate/up gather their token rows through it and write the SwiGLU activation
+    /// in packed order; the down pass writes each row back to its (token, slot) position.
+    /// </summary>
+    private void RecordGroupedQ4_1V2Experts(nint cmdBuf, in VulkanWeights.MoeLayerBuffers moeW, int hidden, int interm, int numE, int topK, int expandedRows)
+    {
+        _moeExpertOffsets!.Record(cmdBuf, _state.MoeTopkIndices!, _state.MoeExpertCounts!, _state.MoeExpertOffsets!, _state.MoeExpertCounters!,
+            rows: expandedRows, numExperts: numE);
+        BarrierComputeToCompute(cmdBuf);
+        // hidden: 0 = permutation only.
+        _moeExpandGroupByExpert!.Record(cmdBuf, _state.NormOutput, _state.MoeTopkIndices!, _state.MoeExpertOffsets!,
+            _state.MoeExpertCounters!, _state.MoeGroupedHidden!, _state.MoePermutation!, rows: expandedRows, hidden: 0, numExperts: numE);
+        BarrierComputeToCompute(cmdBuf);
+        _grpTileList!.Record(cmdBuf, _state.MoeExpertOffsets!, _state.MoeGroupDispatchArgs!, numE,
+            MoeGroupedQ4_1V2Kernel.GateUpMTiles(interm), MoeGroupedQ4_1V2Kernel.DownMTiles(hidden), tileRows: MoeGroupedQ4_1V2Kernel.RowTile);
+        KernelSupport.ComputeToIndirectAndComputeBarrier(cmdBuf);
+        ProfSample("moe_group");
+
+        _grpQ4_1V2!.RecordGateUpIndirect(cmdBuf, moeW.W1Bank, moeW.W3Bank, _state.NormOutput, _state.MoeExpertOffsets!, _state.MoePermutation!,
+            _state.MoeSiluInter!, _state.MoeGroupDispatchArgs!, 0, interm, hidden, expandedRows, numE, topK);
+        BarrierComputeToCompute(cmdBuf);
+        ProfSample("moe_gateup_grouped");
+
+        // The down kernel folds the activation into an F16 operand; Flint's SwiGLU output can exceed 65504 (#1171), so rows are brought
+        // under 1024 by an exact power of two first and the kernel multiplies the factor back.
+        bool downScaled = RecordRowPow2Downscale(cmdBuf, _state.MoeSiluInter!, expandedRows, interm);
+        _grpQ4_1V2.RecordDownIndirect(cmdBuf, moeW.W2Bank, _state.MoeSiluInter!, _state.MoeExpertOffsets!, _state.MoePermutation!,
+            _state.MoeDownRows!, downScaled ? _state.MoeRowScale : null, _state.MoeGroupDispatchArgs!, MoeBuildTileListKernel.ArgsStrideBytes,
+            hidden, interm, expandedRows, numE);
+        BarrierComputeToCompute(cmdBuf);
+        ProfSample("moe_down_grouped");
     }
 
     private void RecordGroupedQuantProjection(nint cmdBuf, QuantType qt, VulkanDevice.Buffer bank, VulkanDevice.Buffer packedIn,
@@ -7238,6 +7360,7 @@ public sealed partial class VulkanTransformerModel : IModel
             VulkanApi.vkCmdCopyBuffer(cmdBuf, foldDst.Handle, _state.NormOutput.Handle, 1, foldRegion);
             BarrierTransferToCompute(cmdBuf);
         }
+        ProfSample("moe_shared");
     }
 
     /// <summary>
@@ -8849,6 +8972,7 @@ public sealed partial class VulkanTransformerModel : IModel
         _attnCompact?.Dispose();
         _gmSwiGluQuant?.Dispose();
         _grpTileList?.Dispose();
+        _grpQ4_1V2?.Dispose();
         _gemma4GroupedQ4K?.Dispose();
         _gemma4GroupedQ5_1?.Dispose();
         _gemma4GroupedQ8_0?.Dispose();
