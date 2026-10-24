@@ -1,0 +1,105 @@
+#version 450
+// Q6_K token-embedding gather + dequantize (#1174): the Q6_K twin of q8_0_embed_gather_f32.comp
+// (#352). Without it a Q6_K token_embd is widened to a vocab x hidden F32 device table at upload
+// (Qwen3.8-27B: 682 MiB packed -> 4.85 GiB F32, #919) just to gather one row per token.
+//
+// The per-element decode is q6_k_dequant_f32.comp's, line for line (same `precise` math, same op
+// order), so a gathered row is bit-identical to the CPU dequant and to the widened table.
+//
+// Dispatch:
+//   gl_WorkGroupID.y = token index (0..nTokens-1)
+//   gl_WorkGroupID.x = super-block within the row (0..blocksPerRow-1); one element per thread
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW   { uint  src[]; };  // packed table
+layout(set = 0, binding = 1, std430) readonly  buffer BufIds { int   ids[]; };  // [nTokens]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY   { float dst[]; };  // [nTokens*hidden]
+
+layout(push_constant) uniform PushConstants {
+    uint nTokens;      // number of tokens to gather
+    uint hidden;       // row length in elements (multiple of 256)
+    uint blocksPerRow; // = hidden / 256
+    uint vocabSize;    // row-count bound (defensive clamp)
+} pc;
+
+const uint Q6K_BLOCK_BYTES = 210u;
+const uint Q6K_GROUP_SIZE  = 256u;
+
+uint readByte(uint absByteOff) {
+    uint u = src[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = src[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = src[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+// int8 read (two's complement).
+int readSByte(uint absByteOff) {
+    int b = int(readByte(absByteOff));
+    return b >= 128 ? b - 256 : b;
+}
+
+void main() {
+    uint tok = gl_WorkGroupID.y;
+    if (tok >= pc.nTokens || gl_WorkGroupID.x >= pc.blocksPerRow) return;
+
+    // Token ids are host-validated before recording; the clamp is a defensive second gate so a bad
+    // id can never read outside the table.
+    uint row = uint(ids[tok]);
+    if (row >= pc.vocabSize) row = 0u;
+    uint block = row * pc.blocksPerRow + gl_WorkGroupID.x;
+
+    uint t = gl_LocalInvocationID.x;        // 0..255
+    uint blockBase  = block * Q6K_BLOCK_BYTES;
+    uint qlBase     = blockBase;
+    uint qhBase     = blockBase + 128u;
+    uint scalesBase = blockBase + 192u;
+    float d         = readHalf(blockBase + 208u);
+
+    uint half_ = t >> 7u;                    // 0..1
+    uint n     = t & 127u;
+    uint g     = n >> 5u;                    // 0..3
+    uint l     = n & 31u;
+    uint isc   = l >> 4u;                    // 0..1
+    uint qlOff = half_ * 64u;
+    uint qhOff = half_ * 32u;
+    uint scOff = half_ * 8u;
+
+    uint qhByte = readByte(qhBase + qhOff + l);
+    uint qlLo   = readByte(qlBase + qlOff + l);
+    uint qlHi   = readByte(qlBase + qlOff + l + 32u);
+
+    int q;
+    uint si;
+    if (g == 0u) {
+        q = int((qlLo & 0xFu) | (((qhByte >> 0u) & 3u) << 4u)) - 32;
+        si = scOff + isc;
+    } else if (g == 1u) {
+        q = int((qlHi & 0xFu) | (((qhByte >> 2u) & 3u) << 4u)) - 32;
+        si = scOff + isc + 2u;
+    } else if (g == 2u) {
+        q = int((qlLo >> 4u) | (((qhByte >> 4u) & 3u) << 4u)) - 32;
+        si = scOff + isc + 4u;
+    } else {
+        q = int((qlHi >> 4u) | (((qhByte >> 6u) & 3u) << 4u)) - 32;
+        si = scOff + isc + 6u;
+    }
+
+    int scale = readSByte(scalesBase + si);
+    precise float ds = d * float(scale);
+    precise float v = ds * float(q);
+    dst[tok * pc.hidden + gl_WorkGroupID.x * Q6K_GROUP_SIZE + t] = v;
+}

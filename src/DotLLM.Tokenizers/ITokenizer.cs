@@ -10,6 +10,14 @@ public interface ITokenizer
     /// <returns>Array of token IDs.</returns>
     int[] Encode(string text);
 
+    /// <summary>
+    /// Encodes text WITHOUT any automatic BOS prepending. Identical to <see cref="Encode"/> for
+    /// tokenizers that never add BOS on their own (the default). Used where the caller owns
+    /// stream framing — corpus streaming for perplexity, which prepends BOS once itself, and
+    /// sampler token-set construction.
+    /// </summary>
+    int[] EncodeRaw(string text) => Encode(text);
+
     /// <summary>Decodes a sequence of token IDs back to text.</summary>
     /// <param name="tokenIds">Token IDs to decode.</param>
     /// <returns>Decoded text.</returns>
@@ -39,6 +47,14 @@ public interface ITokenizer
 
     /// <summary>End-of-sequence token ID.</summary>
     int EosTokenId { get; }
+
+    /// <summary>
+    /// Additional end-of-generation token ids declared by the model file beyond <see cref="EosTokenId"/>
+    /// (GGUF <c>tokenizer.ggml.eot_token_id</c> / <c>eom_token_id</c>: GLM-4.x declares <c>&lt;|endoftext|&gt;</c> as
+    /// EOS but ends its turns with <c>&lt;|user|&gt;</c> (eot) or <c>&lt;|observation|&gt;</c> after a tool call (eom), #797).
+    /// Empty when the model declares none.
+    /// </summary>
+    IReadOnlyList<int> ExtraEndOfGenerationTokenIds => [];
 
     /// <summary>
     /// Counts the number of tokens without performing a full encode.

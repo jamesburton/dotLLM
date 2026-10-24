@@ -1,0 +1,74 @@
+#version 450
+// Fused "broadcast + expand-group-by-expert" for Q8_1-quantized activations (#986).
+//
+//   xqOut[dst, :]  = xqIn[row / topK, :]      packed int8 gather
+//   xdsOut[dst, :] = xdsIn[row / topK, :]     (d, s) scale gather
+//   permutation[dst]     = row
+//   invPermutation[row]  = dst
+//
+// Q8_1 variant of moe_expand_gather_group_f32.comp: instead of gathering F32
+// activations (4 bytes/element), gathers the pre-quantized Q8_1 representation
+// (1 byte/element + 8-byte scale per 32-block). This eliminates the separate
+// quantize pass after the F32 gather by quantizing ONCE on the compact [seqLen]
+// rows and gathering the Q8_1 data directly.
+//
+// Q8_1 layout per row (K elements):
+//   xq:  K/4 uints   (4 packed int8 per uint)
+//   xds: K/32 vec2    (d=scale, s=sum per 32-element block)
+//
+// One workgroup per routed row, 128 threads.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufXqIn      { uint  xqIn[]; };       // [seqLen, K/4]
+layout(set = 0, binding = 1, std430) readonly  buffer BufXdsIn     { vec2  xdsIn[]; };      // [seqLen, K/32]
+layout(set = 0, binding = 2, std430) readonly  buffer BufIdx       { int   indices[]; };    // [rows]
+layout(set = 0, binding = 3, std430) readonly  buffer BufOffsets   { uint  offsets[]; };    // [numExperts + 1]
+layout(set = 0, binding = 4, std430) coherent  buffer BufCount     { uint  counters[]; };   // [numExperts]
+layout(set = 0, binding = 5, std430) writeonly buffer BufXqOut     { uint  xqOut[]; };      // [rows, K/4]
+layout(set = 0, binding = 6, std430) writeonly buffer BufXdsOut    { vec2  xdsOut[]; };     // [rows, K/32]
+layout(set = 0, binding = 7, std430) writeonly buffer BufPerm      { uint  permutation[]; };    // [rows]
+layout(set = 0, binding = 8, std430) writeonly buffer BufInvPerm   { uint  invPermutation[]; }; // [rows]
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint K;           // hidden dim, multiple of 32
+    uint numExperts;
+    uint topK;
+} pc;
+
+shared uint dstRow;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.rows) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    if (tid == 0u) {
+        uint expert = uint(clamp(indices[row], 0, int(pc.numExperts) - 1));
+        uint slot = atomicAdd(counters[expert], 1u);
+        uint dst = offsets[expert] + slot;
+        permutation[dst] = row;
+        invPermutation[row] = dst;
+        dstRow = dst;
+    }
+    barrier();
+
+    uint srcToken = row / pc.topK;
+
+    // Copy packed int8 data: K/4 uints per row.
+    uint xqPerRow = pc.K >> 2u;
+    uint srcXqBase = srcToken * xqPerRow;
+    uint dstXqBase = dstRow * xqPerRow;
+    for (uint c = tid; c < xqPerRow; c += gl_WorkGroupSize.x) {
+        xqOut[dstXqBase + c] = xqIn[srcXqBase + c];
+    }
+
+    // Copy (d, s) scales: K/32 vec2s per row.
+    uint xdsPerRow = pc.K >> 5u;
+    uint srcXdsBase = srcToken * xdsPerRow;
+    uint dstXdsBase = dstRow * xdsPerRow;
+    for (uint c = tid; c < xdsPerRow; c += gl_WorkGroupSize.x) {
+        xdsOut[dstXdsBase + c] = xdsIn[srcXdsBase + c];
+    }
+}

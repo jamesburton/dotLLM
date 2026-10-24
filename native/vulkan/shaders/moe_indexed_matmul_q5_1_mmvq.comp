@@ -1,0 +1,125 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// MoE INDEXED Q5_1 MMVQ decode GEMV (issue #137): integer-dot (dp4a)
+// matrix-vector multiply over a packed Q5_1 expert bank, with the per-expert
+// output scale folded in (Gemma-4 ffn_down_exps.scale[e], op #14).
+//
+//   y[n, m] = downScale[indices[n]] * sum_k dequant_q5_1(bank[indices[n], m, k]) * x[n, k]
+//
+// Q5_1 block (24 bytes = 6 uints, word-aligned; 32 elements):
+//     u0 = fp16 d | fp16 m           (delta, min)
+//     u1 = qh                        (one 5th bit per element, LE bit e = elem e)
+//     u2..u5 = qs[16]                (two 4-bit values per byte; byte j holds
+//                                     elem j in the low nibble, elem j+16 high)
+// Element e (0..31):  q_e = nibble | (qh bit e << 4)  in [0, 31];  w_e = d·q_e + m.
+//
+// Per 32-element block against a Q8_1 activation block (int8 xq, scale d_x,
+// block-sum s = d_x·Σxq):
+//     Σ w_e·x_e = d·d_x·Σ(q_e·xq_e) + m·s
+// The integer Σ(q·xq) runs on dotPacked4x8AccSatEXT (q_e ≤ 31 fits int8).
+//
+// COALESCED lane layout: one wave32 subgroup per output cell (n, m); the 32
+// lanes sweep a window of 8 consecutive Q5_1 blocks per iteration (8 blocks ×
+// 24 B = 192 B contiguous). Lane L: block = window + L/4, quarter s = L%4 owns
+// elements [8s, 8s+8) of that block — i.e. two nibble-planes of one qs uint:
+//     s=0: low  nibbles of u2,u3 (elems 0..7,  qh bits 0..7)
+//     s=1: low  nibbles of u4,u5 (elems 8..15, qh bits 8..15)
+//     s=2: high nibbles of u2,u3 (elems 16..23, qh bits 16..23)
+//     s=3: high nibbles of u4,u5 (elems 24..31, qh bits 24..31)
+// The m·s block term is shared by a block's 4 lanes — each adds a quarter.
+// Reduction: a single subgroupAdd (no shared memory, no barriers).
+//
+// NOT bit-exact vs moe_indexed_matmul_q5_1_f32.comp (x is int8-quantized);
+// validated argmax + tolerance vs the CPU Gemma4Moe oracle. The per-expert
+// downScale is applied to the final reduced sum — identical fold order to the
+// F32 indexed kernel and the CPU reference.
+//
+// Dispatch: 2D grid — gl_WorkGroupID.x = m, gl_WorkGroupID.y = n.
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufBank  { uint  bank[]; };   // Q5_1 blob [numExperts, M, K]
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq    { uint  xq[]; };     // [N * K/4] packed int8 activations
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds   { vec2  xds[]; };    // [N * K/32] (d_x, s)
+layout(set = 0, binding = 3, std430) readonly  buffer BufIdx   { int   indices[]; };// [N]
+layout(set = 0, binding = 4, std430) writeonly buffer BufY     { float y[]; };      // [N * M]
+layout(set = 0, binding = 5, std430) readonly  buffer BufScale { float downScale[]; };// [numExperts]
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // output dim   (per-expert weight row count)
+    uint K;             // input dim    (multiple of 32)
+    uint N;             // total rows   (typically seqLen * topK)
+    uint numExperts;    // bank's first axis size — bounds-check + scale lookup
+    uint blocksPerRow;  // = K / 32
+} pc;
+
+const uint Q5_1_BLOCK_UINTS = 6u;   // 24 bytes
+const uint WINDOW_BLOCKS    = 8u;   // 32 lanes / 4 lanes-per-block
+
+// Insert 4 qh bits (bits t..t+3, one per element) as bit 4 of each packed byte.
+uint qhNibblePlane(uint qh, uint t) {
+    return (((qh >> t)        & 1u) <<  4u)
+         | (((qh >> (t + 1u)) & 1u) << 12u)
+         | (((qh >> (t + 2u)) & 1u) << 20u)
+         | (((qh >> (t + 3u)) & 1u) << 28u);
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    uint n = gl_WorkGroupID.y;
+    if (m >= pc.M || n >= pc.N) return;
+
+    uint expert = uint(indices[n]);
+    if (expert >= pc.numExperts) return; // defensive: bad index leaves y untouched
+
+    uint lane = gl_LocalInvocationID.x;   // 0..31
+    uint blockInWindow = lane >> 2u;      // 0..7
+    uint s = lane & 3u;                   // quarter 0..3 (see lane layout above)
+
+    uint rowUintBase = (expert * pc.M + m) * pc.blocksPerRow * Q5_1_BLOCK_UINTS;
+    uint xqRowBase   = n * (pc.K >> 2u);
+    uint xdsRowBase  = n * (pc.K >> 5u);
+
+    // Quarter s reads qs uints u2+2*(s&1), high nibbles when s>=2; qh bits start at 8*s.
+    uint qsOff   = 2u + 2u * (s & 1u);
+    bool highNib = s >= 2u;
+    uint qhBase  = 8u * s;
+
+    float acc = 0.0;
+
+    for (uint w0 = 0u; w0 < pc.blocksPerRow; w0 += WINDOW_BLOCKS) {
+        uint blk = w0 + blockInWindow;
+        if (blk >= pc.blocksPerRow)
+            continue;
+
+        uint blkBase = rowUintBase + blk * Q5_1_BLOCK_UINTS;
+
+        vec2 dm = unpackHalf2x16(bank[blkBase]);   // (d, m) — uniform per block's 4 lanes
+        uint qh = bank[blkBase + 1u];
+
+        uint qsA = bank[blkBase + qsOff];
+        uint qsB = bank[blkBase + qsOff + 1u];
+        uint nibA = highNib ? ((qsA >> 4u) & 0x0F0F0F0Fu) : (qsA & 0x0F0F0F0Fu);
+        uint nibB = highNib ? ((qsB >> 4u) & 0x0F0F0F0Fu) : (qsB & 0x0F0F0F0Fu);
+        uint qA = nibA | qhNibblePlane(qh, qhBase);
+        uint qB = nibB | qhNibblePlane(qh, qhBase + 4u);
+
+        // Matching 8 activations: block blk's 32 int8 are xq[8*blk ..]; quarter s
+        // owns elements [8s, 8s+8) => uint index 8*blk + 2*s.
+        uint xbase = xqRowBase + blk * 8u + 2u * s;
+        int dotI = 0;
+        dotI = dotPacked4x8AccSatEXT(int(qA), int(xq[xbase]), dotI);
+        dotI = dotPacked4x8AccSatEXT(int(qB), int(xq[xbase + 1u]), dotI);
+
+        vec2 ds = xds[xdsRowBase + blk];           // (d_x, s = d_x·Σxq)
+        // d·(d_x·dot) plus 1/4 of the per-block min term (4 lanes share it).
+        acc += dm.x * (ds.x * float(dotI)) + dm.y * ds.y * 0.25;
+    }
+
+    // The subgroup IS the (n, m) cell; fold the per-expert down scale once.
+    float total = subgroupAdd(acc);
+    if (subgroupElect())
+        y[n * pc.M + m] = downScale[expert] * total;
+}
