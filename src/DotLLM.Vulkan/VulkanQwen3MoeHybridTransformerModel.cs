@@ -89,18 +89,9 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
 
     private readonly VulkanDevice.SubmitContext _submit;
 
-    // Per-layer resident MoE bundles. When `_residentMoeEnabled` is true
-    // (opt-in via DOTLLM_VK_MOE_RESIDENT=1), each layer's routed experts are
-    // uploaded once on first use and retained for the lifetime of the model
-    // — eliminating the dequant + host→device upload cost from subsequent
-    // forwards. The default is streaming-mode (re-upload every forward),
-    // which is the correctness-first path: the routed banks currently
-    // dequantise to F32 (see VulkanQwen3MoeMoeUpload remarks), so a fully
-    // resident layout for Qwen3.6-A3B at qwen35moe scale (256 experts × 40
-    // layers × 3 matrices, ~120 GB F32) cannot fit in unified memory on any
-    // current single-device host. Resident mode is only safe for smaller
-    // models or once a quantized MoE matmul shader lands (follow-up
-    // Priority 3) — hence the explicit opt-in.
+    // Per-layer resident MoE bundles. When `_residentMoeEnabled` is true (the raw-quant banks fit the device, see ResolveResidentMoe;
+    // DOTLLM_VK_MOE_RESIDENT=1/0 forces it), BuildFromGguf uploads every GPU-placed layer's routed experts at load (#1224) and keeps them
+    // for the life of the model; prebuilt-weight fixtures fill them on first use. Otherwise each forward streams (re-uploads) the layer.
     private readonly VulkanQwen3MoeMoeUpload.LayerBundle?[] _residentMoeBundles;
     private readonly bool _residentMoeEnabled;
     /// <summary>#849: [numExperts] of 1.0f - the Q5_1 indexed kernels take a per-expert output scale (Gemma-4 ffn_down_exps.scale); routed
