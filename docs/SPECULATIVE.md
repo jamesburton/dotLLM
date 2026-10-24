@@ -893,7 +893,7 @@ long prefill and released after it.
 
 **Knobs.** `DOTLLM_DFLASH_DRAFT=n` caps drafts per round (default B-1 = 7); `DOTLLM_DFLASH_TRACE=1` prints draft / inject wall
 time per request (and, on Vulkan, the drafter's submit count and wait). Vulkan small-row GEMVs: `DOTLLM_VK_Q4K_MULTI_ROWS` (1/2/4/8 output
-rows per workgroup, default 4; `DOTLLM_VK_Q4K_MULTI_R4=0` = the old one-row kernel) and `DOTLLM_VK_SMALLROW_Q6K_R2_MIN_ROWS` (default 3).
+rows per workgroup, default 2; `DOTLLM_VK_Q4K_MULTI_R4=0` = the old one-row kernel) and `DOTLLM_VK_SMALLROW_Q6K_R2_MIN_ROWS` (default 3).
 
 **Not yet.** Tree (DDTree) verification; reduced-vocab (`d2t`), DSpark and LiliCorr drafters;
 sampled-selector proposals (llama.cpp's DFlash2 sampled mode).

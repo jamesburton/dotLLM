@@ -3,7 +3,7 @@
 #extension GL_KHR_shader_subgroup_basic      : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
-// Q4_K multi-column GEMV, NR (default four) OUTPUT ROWS per workgroup (#1193). Same decode and lane layout as matmul_q4_k_gemv_f32_multi.comp, but the NC FP32
+// Q4_K multi-column GEMV, NR OUTPUT ROWS per workgroup (#1193; the host picks NR, default 2). Same decode and lane layout as matmul_q4_k_gemv_f32_multi.comp, but the NC FP32
 // activation loads (2 vec4 per column per window step) are shared by the NR rows. With one row per workgroup an 8-column call re-reads the whole
 // [NC, K] activation once per output row (~57x the weight bytes for a 17408 x 5120 projection), which made an 8-row Qwen3.8-27B verify cost ~3.8
 // single-row forwards on Strix Halo. Per-row, per-column accumulation order is unchanged (the compiler may still contract differently: ULP-level, as the 1-row-per-WG kernel vs the decode GEMV).

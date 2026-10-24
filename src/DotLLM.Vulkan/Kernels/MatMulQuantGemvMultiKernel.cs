@@ -123,11 +123,11 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
         catch { module.Dispose(); throw; }
     }
 
-    /// <summary>Output rows per workgroup: 2 for Q6_K_R2; for Q4_K_R4 <c>DOTLLM_VK_Q4K_MULTI_ROWS</c> (1, 2, 4 or 8; default 4, A/B on new hardware).</summary>
+    /// <summary>Output rows per workgroup: 2 for Q6_K_R2; for Q4_K_R4 <c>DOTLLM_VK_Q4K_MULTI_ROWS</c> (1, 2, 4 or 8; default 2: 2, 4 and 8 measured within noise of each other and ~15-20 % over 1 on Strix Halo, #1193).</summary>
     private static int RowsPerGroup(QuantGemvMultiFormat format) => format switch
     {
         QuantGemvMultiFormat.Q6_K_R2 => 2,
-        QuantGemvMultiFormat.Q4_K_R4 => int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_Q4K_MULTI_ROWS"), out int r) && r is 1 or 2 or 4 or 8 ? r : 4,
+        QuantGemvMultiFormat.Q4_K_R4 => int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_Q4K_MULTI_ROWS"), out int r) && r is 1 or 2 or 4 or 8 ? r : 2,
         _ => 1,
     };
 
