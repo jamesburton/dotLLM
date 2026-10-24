@@ -61,6 +61,13 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
     private readonly ComputePipeline _pipeline;
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
+
+    // head_dim <= 128 twin of the coopmat shader (#1161): same contract, fragment arrays and K/V tile sized for 128.
+    // DOTLLM_VULKAN_FA_GQA_HD128=0 keeps the 256-wide build for every head size.
+    private VulkanModule? _hd128Module;
+    private ComputePipeline? _hd128Pipeline;
+    private nint _hd128Pool;
+    private DescriptorSetCache? _hd128Cache;
     private bool _disposed;
 
     private VulkanFlashAttentionGqaKernel(
@@ -208,7 +215,24 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
                 requiredSubgroupSize: requiredSubgroupSize,
                 specConstants: spec);
             nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)bindingCount);
-            return new VulkanFlashAttentionGqaKernel(device, module, pipeline, pool, isCoopmat, kvStorage, sinks);
+            var kernel = new VulkanFlashAttentionGqaKernel(device, module, pipeline, pool, isCoopmat, kvStorage, sinks);
+            string twin = Path.Combine(spvDir, shaderName + "_hd128.spv");
+            if (isCoopmat && Environment.GetEnvironmentVariable("DOTLLM_VULKAN_FA_GQA_HD128") != "0" && File.Exists(twin))
+            {
+                var tm = VulkanModule.LoadFromFile(device, twin);
+                try
+                {
+                    kernel._hd128Pipeline = tm.CreateComputePipeline("main", bindings, PushConstantBytes, requiredSubgroupSize, specConstants: spec);
+                    kernel._hd128Module = tm;
+                    kernel._hd128Pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)bindingCount);
+                    kernel._hd128Cache = new DescriptorSetCache(device, kernel._hd128Pool, kernel._hd128Pipeline, buffersPerSet: bindingCount);
+                }
+                catch (VulkanException)
+                {
+                    tm.Dispose();
+                }
+            }
+            return kernel;
         }
         catch (VulkanException)
         {
@@ -219,7 +243,11 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
     }
 
     /// <summary>Drops cached descriptor sets (a buffer they name was freed or re-created).</summary>
-    internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
+    internal void InvalidateDescriptorCache()
+    {
+        _descriptorCache.Reset();
+        _hd128Cache?.Reset();
+    }
 
     /// <summary>Records, submits and waits for one dispatch (tests and benches).</summary>
     /// <param name="q">Queries, F32 <c>[seqQ, numHeads * headDim]</c>.</param>
@@ -300,9 +328,11 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
         if (output.Size < qBytes) throw new ArgumentException("Output buffer too small.", nameof(output));
 
         Span<nint> buffers = stackalloc nint[5] { q.Handle, k.Handle, v.Handle, output.Handle, sinks?.Handle ?? 0 };
-        nint descriptorSet = _descriptorCache.GetOrCreate(buffers[..BindingCount(HasSinks)]);
-        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
-        VulkanApi.vkCmdBindDescriptorSets(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout, 0, 1, descriptorSet, 0, 0);
+        bool hd128 = _hd128Pipeline is not null && headDim <= 128;
+        var pipeline = hd128 ? _hd128Pipeline! : _pipeline;
+        nint descriptorSet = (hd128 ? _hd128Cache! : _descriptorCache).GetOrCreate(buffers[..BindingCount(HasSinks)]);
+        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, pipeline.Pipeline);
+        VulkanApi.vkCmdBindDescriptorSets(cmdBuf, VkPipelineBindPoint.Compute, pipeline.Layout, 0, 1, descriptorSet, 0, 0);
 
         Span<uint> pc = stackalloc uint[12];
         pc[0] = (uint)seqQ;
@@ -319,7 +349,7 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
         pc[11] = (uint)prefixLen;
         fixed (uint* pcPtr = pc)
         {
-            VulkanApi.vkCmdPushConstants(cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute, 0, PushConstantBytes, (nint)pcPtr);
+            VulkanApi.vkCmdPushConstants(cmdBuf, pipeline.Layout, VkShaderStageFlags.Compute, 0, PushConstantBytes, (nint)pcPtr);
         }
 
         long rows = (long)seqQ * (numHeads / numKvHeads);
@@ -335,6 +365,9 @@ public sealed class VulkanFlashAttentionGqaKernel : IDisposable
         if (_disposed) return;
         _disposed = true;
         if (_descriptorPool != 0) VulkanApi.vkDestroyDescriptorPool(_device.Handle, _descriptorPool, 0);
+        if (_hd128Pool != 0) VulkanApi.vkDestroyDescriptorPool(_device.Handle, _hd128Pool, 0);
+        _hd128Pipeline?.Dispose();
+        _hd128Module?.Dispose();
         _pipeline.Dispose();
         _module.Dispose();
     }
