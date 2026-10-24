@@ -7,6 +7,9 @@ public enum QuantGemvMultiFormat
 {
     /// <summary>Q4_K, 144-byte super-blocks.</summary>
     Q4_K,
+    /// <summary>Q4_K, four output rows per workgroup sharing the activation loads (#1193; the 1-row-per-workgroup kernel re-reads all NC activation
+    /// rows once per output row, which bounds it well below memory bandwidth at 4..8 columns on Strix Halo).</summary>
+    Q4_K_R4,
     /// <summary>Q5_K, 176-byte super-blocks.</summary>
     Q5_K,
     /// <summary>Q6_K, 210-byte super-blocks.</summary>
@@ -68,6 +71,7 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
     private static (string Spv, int BlockBytes, int Buffers, bool NeedsSubgroup, bool NeedsWave32) Describe(QuantGemvMultiFormat f) => f switch
     {
         QuantGemvMultiFormat.Q4_K => ("matmul_q4_k_gemv_f32_multi.spv", 144, 3, true, false),
+        QuantGemvMultiFormat.Q4_K_R4 => ("matmul_q4_k_gemv_f32_multi_r4.spv", 144, 3, true, false),
         QuantGemvMultiFormat.Q5_K => ("matmul_q5_k_gemv_f32_multi.spv", 176, 3, true, false),
         QuantGemvMultiFormat.Q6_K => ("matmul_q6_k_gemv_f32_multi.spv", 210, 3, true, false),
         QuantGemvMultiFormat.Q6_K_R2 => ("matmul_q6_k_gemv_f32_multi_r2.spv", 210, 3, true, false),
@@ -144,7 +148,8 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
         Span<uint> pc = stackalloc uint[4] { (uint)m, (uint)k, (uint)blocksPerRow, (uint)((rowBytes + 3) / 4) };
         fixed (uint* p = pc)
             VulkanApi.vkCmdPushConstants(cmdBuf, pipe.Layout, VkShaderStageFlags.Compute, 0, PushConstantBytes, (nint)p);
-        VulkanApi.vkCmdDispatch(cmdBuf, Format == QuantGemvMultiFormat.Q6_K_R2 ? (uint)((m + 1) / 2) : (uint)m, 1, 1);
+        int rowsPerGroup = Format switch { QuantGemvMultiFormat.Q6_K_R2 => 2, QuantGemvMultiFormat.Q4_K_R4 => 4, _ => 1 };
+        VulkanApi.vkCmdDispatch(cmdBuf, (uint)((m + rowsPerGroup - 1) / rowsPerGroup), 1, 1);
     }
 
     /// <inheritdoc/>

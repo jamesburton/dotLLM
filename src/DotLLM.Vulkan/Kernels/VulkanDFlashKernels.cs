@@ -64,15 +64,6 @@ internal sealed class VulkanDFlashKernels : IDisposable
             ? (uint)(byteOffset / 4)
             : throw new ArgumentOutOfRangeException(nameof(byteOffset), "Ring offsets must be whole 32-bit words.");
 
-    /// <summary>Drops every cached descriptor set (a drafter buffer was freed; its handle may be recycled).</summary>
-    public void InvalidateDescriptorCaches()
-    {
-        _conv.InvalidateDescriptorCache();
-        _ringWrite.InvalidateDescriptorCache();
-        _normRope.InvalidateDescriptorCache();
-        _attention.InvalidateDescriptorCache();
-    }
-
     /// <inheritdoc/>
     public void Dispose()
     {

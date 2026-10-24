@@ -26,6 +26,7 @@ public class MatMulQuantGemvMultiSubgroupPolicyTests
     private static string ShaderSource(QuantGemvMultiFormat format) => File.ReadAllText(Path.Combine(ShaderDir(), format switch
     {
         QuantGemvMultiFormat.Q4_K => "matmul_q4_k_gemv_f32_multi.comp",
+        QuantGemvMultiFormat.Q4_K_R4 => "matmul_q4_k_gemv_f32_multi_r4.comp",
         QuantGemvMultiFormat.Q5_K => "matmul_q5_k_gemv_f32_multi.comp",
         QuantGemvMultiFormat.Q6_K => "matmul_q6_k_gemv_f32_multi.comp",
         QuantGemvMultiFormat.Q6_K_R2 => "matmul_q6_k_gemv_f32_multi_r2.comp",
@@ -43,6 +44,7 @@ public class MatMulQuantGemvMultiSubgroupPolicyTests
 
     [Theory]
     [InlineData(QuantGemvMultiFormat.Q4_K)]
+    [InlineData(QuantGemvMultiFormat.Q4_K_R4)]
     [InlineData(QuantGemvMultiFormat.Q5_K)]
     [InlineData(QuantGemvMultiFormat.Q6_K)]
     [InlineData(QuantGemvMultiFormat.Q6_K_R2)]

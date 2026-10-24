@@ -42,6 +42,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IDFlashDraf
         _dflashSlotForLayerInput = slots;
         _dflashGpu = (VulkanDFlashBackend)drafter.Backend;
         _dflash = drafter;
+        // Sized now so a draft never grows them mid-recording (a grow flushes the recorded draft early).
+        if (_state.EnsureCapacity(drafter.BlockSize)) InvalidateDescriptorCaches();
+        EnsureMultiRowLogits(drafter.BlockSize, Config.VocabSize);
     }
 
     /// <summary>A drafter backend on this model's device (also the tests' handle on the Vulkan drafter kernels).</summary>
@@ -182,6 +185,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IDFlashDraf
         private float[] _cosSinHost = [];
         private int[] _cosSinPositions = [];   // the positions the table holds for the open command buffer
         private float[] _tapHost = [];
+        private VulkanDevice.Buffer? _upload, _readback;   // host-visible staging for taps in and selector rows out
+        private long _flushTicks;
+        private int _flushes;
         private double[] _invFreq = [];
         private DFlashDrafter _d = null!;
         private long _nextId = 1;
@@ -250,32 +256,39 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IDFlashDraf
             if (buffer == 0 || _disposed) return;
             Flush();
             if (!_buffers.Remove((long)buffer >> 32, out var b)) return;
-            b.Dispose();
-            InvalidateDescriptorCaches();
-        }
-
-        private void InvalidateDescriptorCaches()
-        {
-            k.InvalidateDescriptorCaches();
-            m.InvalidateDescriptorCaches();
+            b.Dispose();   // descriptor sets naming it are evicted through the device's destroy log (#467)
         }
 
         public void Download(nint src, float* dst, int count)
         {
-            Flush();
+            // Through a persistent host-readback buffer, copied at the end of the recorded work: one submit, no allocation.
+            long bytes = (long)count * sizeof(float);
+            _readback = Grow(_readback, bytes, readback: true);
             var (b, off) = Resolve(src);
-            if (off != 0) throw new NotSupportedException("DFlash downloads read whole buffers.");
-            m._device.Download(b, new Span<float>(dst, count));
+            RecordCopy(b, off, _readback, 0, bytes);
+            Flush();
+            m._device.Download(_readback, new Span<float>(dst, count));
         }
 
         public void LoadTaps(Half* taps, int count, nint dst)
         {
-            Flush();   // an earlier chunk's recorded projections may still read dst
-            var (b, off) = Resolve(dst);
-            if (off != 0) throw new NotSupportedException("DFlash taps load whole buffers.");
+            Flush();   // an earlier chunk's recorded projections may still read dst, or its copy the staging
+            long bytes = (long)count * sizeof(float);
+            _upload = Grow(_upload, bytes, readback: false);
             if (_tapHost.Length < count) _tapHost = new float[count];
             TensorPrimitives.ConvertToSingle(new ReadOnlySpan<Half>(taps, count), _tapHost.AsSpan(0, count));
-            m._device.Upload(_tapHost.AsSpan(0, count), b);
+            m._device.Upload(_tapHost.AsSpan(0, count), _upload);   // host-visible: a mapped write, no submit
+            var (b, off) = Resolve(dst);
+            RecordCopy(_upload, 0, b, off, bytes);
+        }
+
+        /// <summary>A host-visible buffer of at least <paramref name="bytes"/>, replacing <paramref name="current"/> when smaller.</summary>
+        private VulkanDevice.Buffer Grow(VulkanDevice.Buffer? current, long bytes, bool readback)
+        {
+            if (current is not null && current.Size >= bytes) return current;
+            Flush();
+            current?.Dispose();
+            return readback ? m._device.AllocateHostReadback(bytes) : m._device.Allocate(bytes);
         }
 
         /// <summary>Test hook: copies host floats to <paramref name="dst"/> (any offset), synchronously.</summary>
@@ -321,7 +334,10 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IDFlashDraf
             _open = false;   // first: the submit cannot re-enter
             KernelSupport.ComputeToHostBarrier(_ctx.CommandBuffer);
             KernelSupport.TransferToHostBarrier(_ctx.CommandBuffer);
+            long t = System.Diagnostics.Stopwatch.GetTimestamp();
             _ctx.SubmitAndWait();
+            _flushTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t;
+            _flushes++;
         }
 
         private void Done() => KernelSupport.ComputeTransferFullBarrier(_ctx.CommandBuffer);
@@ -362,7 +378,6 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IDFlashDraf
             Flush();
             _shift[slot]?.Dispose();
             _shift[slot] = m._device.AllocateDeviceLocal(Math.Max(bytes, (long)_d.BlockSize * _d.HiddenSize * sizeof(float)));
-            InvalidateDescriptorCaches();
             return _shift[slot]!;
         }
 
@@ -399,7 +414,6 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IDFlashDraf
                 _cosSin?.Dispose();
                 _cosSin = m._device.AllocateDeviceLocal(Math.Max(tableBytes, 64L * half * 2 * sizeof(float)));
                 _cosSinPositions = [];
-                InvalidateDescriptorCaches();
             }
             nint cmd = Command();
             if (!positions.SequenceEqual(_cosSinPositions))
@@ -495,6 +509,10 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IDFlashDraf
             if (_disposed) return;
             Flush();
             _disposed = true;
+            if (Environment.GetEnvironmentVariable("DOTLLM_DFLASH_TRACE") == "1" && _flushes > 0)
+                Console.Error.WriteLine($"[dflash-vk] submits={_flushes} submit_wait_ms={_flushTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F0} weights_mb={WeightBytes >> 20}");
+            _upload?.Dispose();
+            _readback?.Dispose();
             _ctx.Dispose();
             foreach (var b in _buffers.Values) b.Dispose();
             _buffers.Clear();
@@ -506,7 +524,6 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IDFlashDraf
             _cosSin?.Dispose();
             k.Dispose();
             if (ReferenceEquals(m._dflashGpu, this)) m._dflashGpu = null;
-            m.InvalidateDescriptorCaches();
         }
     }
 }
