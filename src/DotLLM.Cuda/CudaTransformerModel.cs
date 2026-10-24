@@ -235,6 +235,14 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// </summary>
     public bool UseGraphCapture { get; set; }
 
+    /// <summary>
+    /// Power of two the F16 residual stream is carried at on architectures whose residual nears the F16 range (Flint, #1191):
+    /// default 1/8 (<c>DOTLLM_CUDA_RESIDUAL_SCALE</c>; 1 disables it for A/B). Exact: every residual read is an RMSNorm.
+    /// </summary>
+    internal float ResidualStreamScale { get; set; } =
+        float.TryParse(Environment.GetEnvironmentVariable("DOTLLM_CUDA_RESIDUAL_SCALE"), System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture, out float rs) && rs > 0f && MathF.ScaleB(1f, MathF.ILogB(rs)) == rs ? rs : 0.125f;   // powers of two only: exact
+
     /// <summary>Env-var override for the default-on graph-capture path. Set
     /// <c>DOTLLM_DISABLE_GRAPH_CAPTURE=1</c> to force eager decode regardless
     /// of capability. Test/benchmark hook follows the same convention as
@@ -1072,6 +1080,13 @@ public sealed unsafe class CudaTransformerModel : IModel
         // FP32 residual stream for BitNet (its residual magnitude exceeds FP16's ~65504 ceiling).
         bool fp32Res = _state.ResidualF32 != 0 && isBitNet;
 
+        // Power-of-two scaled F16 residual stream (#1191): Flint's residual reaches ~3.5e4 on real text (half the F16 range). Every
+        // residual read is an RMSNorm (scale-invariant once eps is scaled by resScale^2), so carrying residual * resScale is exact.
+        // The embedding enters at layer 0's attention add, each sublayer output is scaled as it is added, and the MoE output is
+        // scaled in F32 before its F16 store. Flint's last layer is MoE, so the unscaled last-layer add below never sees a dense output.
+        float resScale = !fp32Res && !isMla && Config.Architecture == Architecture.Flint ? ResidualStreamScale : 1f;
+        float resEps = eps * resScale * resScale;
+
         // 3. Layer 0 setup: copy hidden→residual; on the GQA path also
         //    pre-RmsNorm into NormOutput. The MLA path skips the pre-norm —
         //    CudaMlaAttention.ForwardF16 applies its own input RMSNorm internally,
@@ -1469,7 +1484,7 @@ public sealed unsafe class CudaTransformerModel : IModel
                     hiddenSize, eps, seqLen, s);
             else
                 _kernels.LaunchFusedAddRmsNorm(_state.Residual, _state.NormOutput, lw.FfnNormWeight, _state.NormOutput,
-                    hiddenSize, eps, seqLen, s);
+                    hiddenSize, resEps, seqLen, s, residualScale: layer == 0 ? resScale : 1f, xScale: resScale);
             MarkProfile(ProfileCategory.Norm);
 
         FfnBlock:
@@ -1493,6 +1508,8 @@ public sealed unsafe class CudaTransformerModel : IModel
                     cublasHandle: cublasH,
                     kernels: _kernels,
                     stream: s);
+                if (resScale != 1f)
+                    _kernels.LaunchScaleInplaceF32(_moeStagingOutF32, hiddenElems, resScale, s);
                 _kernels.LaunchConvertF32ToF16(_moeStagingOutF32, _state.NormOutput, hiddenElems, s);
                 MarkProfile(ProfileCategory.MlpUp);
                 MarkProfile(ProfileCategory.Swiglu);
@@ -1619,7 +1636,7 @@ public sealed unsafe class CudaTransformerModel : IModel
                             hiddenSize, eps, seqLen, s);
                     else
                         _kernels.LaunchFusedAddRmsNorm(_state.Residual, _state.NormOutput, nextLw.AttnNormWeight, _state.NormOutput,
-                            hiddenSize, eps, seqLen, s);
+                            hiddenSize, resEps, seqLen, s, xScale: moeLayer is null ? resScale : 1f);
                 }
             }
             else
@@ -1649,7 +1666,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         {
             nint lastHidden = _state.HiddenState + (nint)((long)(seqLen - 1) * hiddenSize * h);
             _kernels.LaunchRmsNorm(lastHidden, _weights.OutputNormWeight, _state.NormOutput,
-                hiddenSize, eps, 1, s);
+                hiddenSize, numLayers > 0 ? resEps : eps, 1, s);
         }
         MarkProfile(ProfileCategory.Norm);
 
