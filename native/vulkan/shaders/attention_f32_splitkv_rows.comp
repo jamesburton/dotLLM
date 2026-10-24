@@ -1,0 +1,5 @@
+#version 450
+// Split-KV (flash-decoding) PARTIAL pass for a small batch of rows (seqQ = 2..8).
+// Body: attention_f32_splitkv_rows.glsl (issue #1171 split it out so the F32 and F16-KV pipelines share one source).
+#extension GL_GOOGLE_include_directive : require
+#include "attention_f32_splitkv_rows.glsl"

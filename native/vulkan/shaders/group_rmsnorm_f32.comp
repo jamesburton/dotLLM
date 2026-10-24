@@ -1,0 +1,82 @@
+#version 450
+// Group RMS Normalization: per-token, per-group RMSNorm with a per-group
+// slice of the norm weight. Used by NemotronH / Mamba-2 SSM "ssm_norm" —
+// step 11 in NemotronHTransformerModel.ForwardSsmBody.
+//
+// Each token's [dInner = nGroup * groupDim] row is split into nGroup groups
+// of groupDim, each normalised independently against its own slice of the
+// per-group weight:
+//
+//   for g in 0..nGroup:
+//     base = t * dInner + g * groupDim
+//     sumSq = sum_i (data[base+i]^2)        // over i in [0, groupDim)
+//     rinv  = 1 / sqrt(sumSq / groupDim + eps)
+//     for i in 0..groupDim:
+//         data[base+i] = data[base+i] * rinv * weight[g*groupDim + i]
+//
+// Mirrors the workgroup-tree reduction pattern of rmsnorm_f32.comp — one
+// workgroup per (token, group), threads stride over groupDim, shared-memory
+// tree reduce for the sum-of-squares (no subgroup intrinsics, broadest
+// driver portability).
+//
+// Dispatch:
+//   groupCount   = (nGroup, seqLen, 1)     // (g, t)
+//   local_size_x = 256
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// data is read-write — the kernel updates in place.
+layout(set = 0, binding = 0, std430)          buffer BufData   { float data[]; };    // [seqLen * nGroup * groupDim]
+layout(set = 0, binding = 1, std430) readonly buffer BufWeight { float weight[]; };  // [nGroup * groupDim]
+
+layout(push_constant) uniform PushConstants {
+    uint  seqLen;
+    uint  nGroup;
+    uint  groupDim;
+    float eps;
+} pc;
+
+shared float partials[256];
+
+void main() {
+    uint g       = gl_WorkGroupID.x;        // group index in [0, nGroup)
+    uint t       = gl_WorkGroupID.y;        // token index in [0, seqLen)
+    uint tid     = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    uint dInner    = pc.nGroup * pc.groupDim;
+    uint groupBase = t * dInner + g * pc.groupDim;
+    uint weightBase = g * pc.groupDim;
+
+    // 1. Per-thread partial sum of squares over this (t, g) slice.
+    //    Threads stride by `threads` over [0, groupDim) — the i < groupDim
+    //    bound handles groupDim < threads as well as non-multiples.
+    float sumSq = 0.0;
+    for (uint i = tid; i < pc.groupDim; i += threads) {
+        float v = data[groupBase + i];
+        sumSq += v * v;
+    }
+
+    // 2. Workgroup tree reduction in shared memory.
+    partials[tid] = sumSq;
+    barrier();
+    for (uint stride = threads / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    // 3. Thread 0 computes inverse-RMS into the shared slot, broadcasts.
+    if (tid == 0) {
+        float meanSq = partials[0] / float(pc.groupDim);
+        partials[0] = inversesqrt(meanSq + pc.eps);
+    }
+    barrier();
+    float rinv = partials[0];
+
+    // 4. Scale and write back in place. Weight is offset by g*groupDim so
+    //    each group sees its own slice. Bound check protects when groupDim
+    //    is not a multiple of `threads`.
+    for (uint i = tid; i < pc.groupDim; i += threads) {
+        data[groupBase + i] = data[groupBase + i] * rinv * weight[weightBase + i];
+    }
+}

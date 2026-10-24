@@ -1,0 +1,102 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Q8_0 multi-column GEMV with FP32 activations (2..8 rows, #1185): Y[col, m] = sum_k W[m, k] * X[col, k].
+//
+// matmul_q8_0_coalesced.comp for NC columns at once: every lane decodes its weights ONCE and FMAs them against all NC activation rows.
+// Per-column accumulation order, the subgroup reduction and the cross-subgroup pass equal the single-column kernel's, so each output
+// column is bit-identical to a 1-row decode GEMV: an MTP verify then reproduces plain greedy decode exactly. (The Q8_1 MMVQ multi
+// kernel quantises the activations and flipped near-tie argmaxes against the FP32 decode.) NC is a specialization constant;
+// X is [NC, K], Y is [NC, M].
+//
+// Weight layout: each 32 weights = one Q8_0 block of 34 bytes = 17 uint16: [0] fp16 scale d, [1..16] 32 signed int8 qs.
+// Lane L owns 8 contiguous int8 of a window of WG_SIZE/4 blocks: four lanes per block, consecutive lanes on consecutive words.
+// Dispatch: one workgroup of WG_SIZE threads per output row.
+
+#define WG_SIZE 64u
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint NC = 2u;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint weight[]; };  // Q8_0 blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { vec4 x4[]; };      // [NC, K/4]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };      // [NC, M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint blocksPerRow;
+    uint rowUints;     // unused; kept for push-constant parity with matmul_q8_0
+} pc;
+
+const uint UINT16_PER_BLOCK = 17u;
+const uint WINDOW_BLOCKS    = WG_SIZE / 4u;
+
+uint readU16(uint idx16) {
+    uint w = weight[idx16 >> 1u];
+    return ((idx16 & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
+}
+
+vec4 unpackS8(uint u) {
+    ivec4 v = ivec4(int(u << 24), int(u << 16), int(u << 8), int(u)) >> 24;
+    return vec4(v);
+}
+
+shared float partials[NC][WG_SIZE];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint lane = gl_LocalInvocationID.x;
+    uint blockInWindow = lane >> 2u;
+    uint subInBlock    = lane & 3u;
+    uint qOff16        = 1u + 4u * subInBlock;
+
+    uint rowBase16 = m * pc.blocksPerRow * UINT16_PER_BLOCK;
+    uint xRow4 = pc.K >> 2u;
+
+    float acc[NC];
+    [[unroll]] for (uint cc = 0u; cc < NC; ++cc) acc[cc] = 0.0;
+    for (uint w0 = 0u; w0 < pc.blocksPerRow; w0 += WINDOW_BLOCKS) {
+        uint blk = w0 + blockInWindow;
+        if (blk >= pc.blocksPerRow)
+            continue;
+
+        uint blkBase16 = rowBase16 + blk * UINT16_PER_BLOCK;
+        float d = unpackHalf2x16(readU16(blkBase16)).x;
+
+        uint qb = blkBase16 + qOff16;
+        vec4 wa = unpackS8(readU16(qb)      | (readU16(qb + 1u) << 16u));
+        vec4 wb = unpackS8(readU16(qb + 2u) | (readU16(qb + 3u) << 16u));
+
+        uint xi = blk * 8u + 2u * subInBlock;
+        [[unroll]] for (uint cc = 0u; cc < NC; ++cc) {
+            vec4 xa = x4[cc * xRow4 + xi];
+            vec4 xb = x4[cc * xRow4 + xi + 1u];
+            acc[cc] += d * (dot(wa, xa) + dot(wb, xb));
+        }
+    }
+
+    float sums[NC];
+    [[unroll]] for (uint cc = 0u; cc < NC; ++cc) sums[cc] = subgroupAdd(acc[cc]);
+    if (gl_NumSubgroups == 1u) {
+        if (subgroupElect())
+            [[unroll]] for (uint cc = 0u; cc < NC; ++cc) y[cc * pc.M + m] = sums[cc];
+        return;
+    }
+    if (subgroupElect())
+        [[unroll]] for (uint cc = 0u; cc < NC; ++cc) partials[cc][gl_SubgroupID] = sums[cc];
+    barrier();
+    if (lane == 0u) {
+        [[unroll]] for (uint cc = 0u; cc < NC; ++cc) {
+            float total = 0.0;
+            for (uint i = 0u; i < gl_NumSubgroups; i++)
+                total += partials[cc][i];
+            y[cc * pc.M + m] = total;
+        }
+    }
+}

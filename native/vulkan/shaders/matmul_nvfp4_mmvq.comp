@@ -1,0 +1,119 @@
+#version 450
+#extension GL_GOOGLE_include_directive       : require
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes    : require
+// NVFP4 MMVQ decode GEMV: integer dot products against Q8_1 activations (issue #1066; the Vulkan counterpart of CUDA's #1061).
+//
+//   y[m] = scale * sum_s ue4m3_half(d[s]) * d_x(s) * sum_i code_i * xq_i
+//
+// E2M1 values doubled (kvalues_mxfp4) are integers in [-12, 12], so a 16-element sub-block is four dotPacked4x8 of int8 codes
+// against the Q8_1-quantised activations (quantize_q8_1.comp: int8 + fp32 d per 32 elements, natural element order). This is
+// llama.cpp b11739's CPU precision (ggml_vec_dot_nvfp4_q8_0: activations rounded to 8 bits per 32-block), not its Vulkan one
+// (float mul_mat_vec), so it is validated against the CPU reference to a tolerance, not to rounding.
+//
+// Layout (after matmul_nvfp4_gemv_coalesced.comp): lane L owns sub-block s = L & 3 of block L >> 2 of a 16-block window; per sub-block
+// it reads the two qs words (bytes 8s..8s+7) and the four xq words of elements 16s..16s+15 of that block. Q8_1 block 2b + s/2 holds
+// those elements (offset (s & 1) * 16), so d_x is xds[2b + (s >> 1)]. ROWS weight rows share each lane's activation loads.
+// Element order (nvfp4_decode.glsl): the low nibbles of qs word 1+2s are elements 0..3, of word 2+2s elements 4..7, and their high
+// nibbles elements 8..11 and 12..15: xq words 0..3 of the sub-block, in order. X.scale multiplies the F32 sum once.
+//
+// Dispatch: ceil(M / ROWS) workgroups of 64 threads.
+
+#ifndef ROWS
+#define ROWS 1u
+#endif
+#define WG_SIZE 64u
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW   { uint weight[]; };  // NVFP4 blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq  { uint xq[]; };      // [K/4] packed int8 activations
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds { vec2 xds[]; };     // [K/32] (d_x, s)
+layout(set = 0, binding = 3, std430) writeonly buffer BufY   { float y[]; };      // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint  M;
+    uint  K;             // multiple of 64
+    uint  blocksPerRow;  // K / 64
+    float scale;         // per-tensor X.scale
+} pc;
+
+#include "nvfp4_decode.glsl"
+
+const uint WINDOW_BLOCKS = WG_SIZE / 4u;
+
+// kvalues_mxfp4 as int8 bytes: code c -> byte c of the table word (c & 3) of {0..3, 4..7, 8..11, 12..15}.
+const uint KV8[4] = uint[4](0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu);
+
+// int8 codes of the four nibbles at bits 0..3 of each byte of `u`, packed byte 0 first.
+uint codes4(uint u) {
+    uint r = 0u;
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        uint n = (u >> (8u * i)) & 0xFu;
+        r |= ((KV8[n >> 2u] >> ((n & 3u) * 8u)) & 0xFFu) << (8u * i);
+    }
+    return r;
+}
+
+shared float partials[ROWS * (WG_SIZE / 8u)];   // room for subgroups as narrow as 8
+
+void main() {
+    uint row0 = gl_WorkGroupID.x * ROWS;
+    uint lane = gl_LocalInvocationID.x;
+    uint blockInWindow = lane >> 2u;
+    uint s = lane & 3u;
+
+    float acc[ROWS];
+    [[unroll]] for (uint r = 0u; r < ROWS; r++) acc[r] = 0.0;
+
+    for (uint w0 = 0u; w0 < pc.blocksPerRow; w0 += WINDOW_BLOCKS) {
+        uint blk = w0 + blockInWindow;
+        if (blk >= pc.blocksPerRow)
+            continue;
+
+        uint xi = blk * 16u + 4u * s;           // xq word of element 16s of the block
+        int x0 = int(xq[xi]), x1 = int(xq[xi + 1u]), x2 = int(xq[xi + 2u]), x3 = int(xq[xi + 3u]);
+        float dX = xds[blk * 2u + (s >> 1u)].x;
+
+        [[unroll]] for (uint r = 0u; r < ROWS; r++) {
+            uint m = row0 + r;
+            if (m >= pc.M)
+                break;
+            uint base = (m * pc.blocksPerRow + blk) * NVFP4_BLOCK_UINTS;
+            float d = ue4m3_half((weight[base] >> (8u * s)) & 0xFFu);
+            uint q0 = weight[base + 1u + 2u * s];
+            uint q1 = weight[base + 2u + 2u * s];
+            int dotI = dotPacked4x8AccSatEXT(int(codes4(q0)), x0, 0);
+            dotI = dotPacked4x8AccSatEXT(int(codes4(q1)), x1, dotI);
+            dotI = dotPacked4x8AccSatEXT(int(codes4(q0 >> 4u)), x2, dotI);
+            dotI = dotPacked4x8AccSatEXT(int(codes4(q1 >> 4u)), x3, dotI);
+            acc[r] += d * dX * float(dotI);
+        }
+    }
+
+    float sums[ROWS];
+    [[unroll]] for (uint r = 0u; r < ROWS; r++) sums[r] = subgroupAdd(acc[r]);
+
+    if (gl_NumSubgroups == 1u) {
+        if (subgroupElect()) {
+            [[unroll]] for (uint r = 0u; r < ROWS; r++)
+                if (row0 + r < pc.M) y[row0 + r] = sums[r] * pc.scale;
+        }
+        return;
+    }
+
+    if (subgroupElect()) {
+        [[unroll]] for (uint r = 0u; r < ROWS; r++) partials[r * gl_NumSubgroups + gl_SubgroupID] = sums[r];
+    }
+    barrier();
+    if (lane == 0u) {
+        [[unroll]] for (uint r = 0u; r < ROWS; r++) {
+            if (row0 + r >= pc.M) break;
+            float total = 0.0;
+            for (uint i = 0u; i < gl_NumSubgroups; i++) total += partials[r * gl_NumSubgroups + i];
+            y[row0 + r] = total * pc.scale;
+        }
+    }
+}

@@ -1,0 +1,5 @@
+#version 450
+// Subgroup-arithmetic variant of attention_f32.comp. Algorithm is identical
+// Body: attention_f32_sg.glsl (issue #1102 split it out so the F32 and F16-KV pipelines share one source).
+#extension GL_GOOGLE_include_directive : require
+#include "attention_f32_sg.glsl"

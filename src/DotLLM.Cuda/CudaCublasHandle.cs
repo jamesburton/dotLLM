@@ -23,7 +23,19 @@ public sealed class CudaCublasHandle : IDisposable
     public static CudaCublasHandle Create()
     {
         CublasApi.cublasCreate_v2(out nint handle).ThrowOnCublasError();
-        CublasApi.cublasSetMathMode(handle, CublasApi.CUBLAS_TENSOR_OP_MATH).ThrowOnCublasError();
+        try
+        {
+            // #484: the handle is live (and holds a device-side cuBLAS workspace) the instant
+            // cublasCreate succeeds, but nothing owns it until the wrapper below is constructed.
+            // A throw from cublasSetMathMode in between orphaned it — the same "allocated but not
+            // yet owned" shape as the factory failure paths this issue is about.
+            CublasApi.cublasSetMathMode(handle, CublasApi.CUBLAS_TENSOR_OP_MATH).ThrowOnCublasError();
+        }
+        catch
+        {
+            CublasApi.cublasDestroy_v2(handle);
+            throw;
+        }
         return new CudaCublasHandle(handle);
     }
 
@@ -44,6 +56,6 @@ public sealed class CudaCublasHandle : IDisposable
     {
         nint handle = Interlocked.Exchange(ref _handle, 0);
         if (handle != 0)
-            CublasApi.cublasDestroy_v2(handle);
+            CudaTeardownDiagnostics.RecordDestroy("cublasHandle_t", CublasApi.cublasDestroy_v2(handle));
     }
 }
