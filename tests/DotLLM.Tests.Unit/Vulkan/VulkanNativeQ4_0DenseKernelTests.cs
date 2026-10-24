@@ -72,6 +72,53 @@ public sealed class VulkanNativeQ4_0DenseKernelTests
     [InlineData(QuantizationType.Q4_0, 2048, 2048, false)]
     [InlineData(QuantizationType.Q4_0, 2048, 11776, false)]
     public void Mmvq_MatchesSameTierCpuOracle(QuantizationType qt, int m, int k, bool v2)
+        => MmvqCase(qt, m, k, v2);
+
+    /// <summary>#1161: the residual-fused V2 twin stores exactly <c>residual + W x</c> (the add kernel's F32 add), bit for bit.</summary>
+    [SkippableTheory]
+    [InlineData(QuantizationType.Q4_1, 2048, 4096)]   // Flint o_proj
+    [InlineData(QuantizationType.Q4_0, 33, 288)]
+    public void MmvqResidual_EqualsMmvqPlusResidual(QuantizationType qt, int m, int k)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(device.HasIntegerDotProduct, "No integer-dot-product support.");
+        using var quant = QuantizeQ8_1RowsKernel.TryCreate(device, spvDir) ?? throw new Xunit.Sdk.XunitException("quantize_q8_1_rows.spv missing.");
+        using var mmvq = MatMulQ4_0MmvqKernel.TryCreate(device, spvDir, true, qt) ?? throw new Xunit.Sdk.XunitException($"{qt} mmvq spv missing.");
+        Assert.True(mmvq.HasResidual, "residual twin not loaded");
+
+        var rng = new Random(0x1161 + m + k);
+        byte[] w = RandomWeights(rng, m, k, qt);
+        float[] x = new float[k], res = new float[m];
+        for (int i = 0; i < k; i++) x[i] = rng.NextSingle() * 2f - 1f;
+        for (int i = 0; i < m; i++) res[i] = rng.NextSingle() * 200f - 100f;
+        using var bufW = device.Allocate(((long)w.Length + 3) & ~3L);
+        using var bufX = device.Allocate((long)k * sizeof(float));
+        using var bufRes = device.Allocate((long)m * sizeof(float));
+        using var bufXq = device.Allocate(QuantizeQ8_1RowsKernel.PackedBytes(1, k));
+        using var bufXds = device.Allocate(QuantizeQ8_1RowsKernel.ScaleBytes(1, k));
+        using var bufY = device.Allocate((long)m * sizeof(float));
+        using var bufYr = device.Allocate((long)m * sizeof(float));
+        device.Upload(new ReadOnlySpan<byte>(w), bufW);
+        device.Upload(x, bufX);
+        device.Upload(res, bufRes);
+        using (var ctx = device.CreateSubmitContext())
+        {
+            ctx.Begin();
+            quant.Record(ctx.CommandBuffer, bufX, bufXq, bufXds, 1, k);
+            KernelSupport.ComputeToComputeBarrier(ctx.CommandBuffer);
+            mmvq.Record(ctx.CommandBuffer, bufW, bufXq, bufXds, bufY, m, k);
+            mmvq.RecordResidual(ctx.CommandBuffer, bufW, bufXq, bufXds, bufRes, bufYr, m, k);
+            ctx.SubmitAndWait();
+        }
+        float[] y = new float[m], yr = new float[m];
+        device.Download(bufY, y);
+        device.Download(bufYr, yr);
+        for (int i = 0; i < m; i++)
+            Assert.True(yr[i] == res[i] + y[i], $"row {i}: fused {yr[i]:G9} vs {res[i]:G9} + {y[i]:G9}");
+    }
+
+    private static void MmvqCase(QuantizationType qt, int m, int k, bool v2)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
@@ -129,6 +176,9 @@ public sealed class VulkanNativeQ4_0DenseKernelTests
     [InlineData(QuantizationType.Q4_1, 5, 1000, 2048)]
     [InlineData(QuantizationType.Q4_0, 64, 6144, 2048)]    // LFM2.5 conv in_proj width
     [InlineData(QuantizationType.Q4_1, 64, 6144, 2048)]
+    [InlineData(QuantizationType.Q4_1, 512, 512, 2048)]    // #1161: Flint k / v at n = 512 (64x64 twin)
+    [InlineData(QuantizationType.Q4_1, 300, 1000, 1024)]   // 64x64 twin with ragged m and n
+    [InlineData(QuantizationType.Q4_1, 512, 2048, 1024)]   // Flint shared-expert down: 64 tiles, stays on 128x128
     public void Gemm_MatchesCpuReference(QuantizationType qt, int n, int m, int k)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
@@ -158,6 +208,8 @@ public sealed class VulkanNativeQ4_0DenseKernelTests
         device.Upload(new ReadOnlySpan<byte>(w), bufW);
         device.Upload(b32, bufB);
         kernel.Launch(bufW, bufB, bufC, m, k, n);
+        if (qt == QuantizationType.Q4_1 && n >= 300)
+            Assert.Equal(m < 2048, kernel.UsesSmallTile(m, n));   // the Flint cases must exercise the tile they name
         float[] actual = new float[(long)n * m];
         device.Download(bufC, actual);
 

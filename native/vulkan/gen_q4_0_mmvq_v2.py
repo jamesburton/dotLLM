@@ -110,6 +110,15 @@ layout(push_constant) uniform PushConstants {
     uint xdsRowBase = 0u;''',
     store='y[m] = total;')
 
+# #1161: dense GEMV with the residual add fused into the store (o_proj / dense down at decode): y = matmul + residual, the same F32 add
+# the separate add kernel performs.
+DENSE_RESIDUAL = dict(DENSE, name='matmul_q4_0_mmvq_v2_residual', title='Dense residual-fused',
+    bindings=DENSE['bindings'].replace(
+        'layout(set = 0, binding = 3, std430) writeonly buffer BufY   { float y[]; };       // [M]',
+        'layout(set = 0, binding = 3, std430) readonly  buffer BufRes { float residual[]; }; // [M]' + chr(10) +
+        'layout(set = 0, binding = 4, std430) writeonly buffer BufY   { float y[]; };       // [M]'),
+    store='y[m] = residual[m] + total;')
+
 MOE = dict(
     name='moe_indexed_matmul_q4_0_mmvq_v2', title='MoE INDEXED',
     bindings='''layout(set = 0, binding = 0, std430) readonly  buffer BufBank { uint  weight[]; };    // Q4_0 blob [numExperts, M, K/32 x 18 B]
@@ -189,7 +198,7 @@ def render(spec, u):
 
 def main():
     u = int(os.environ.get('Q4_0_V2_U', '2'))
-    for spec in (DENSE, MOE):
+    for spec in (DENSE, DENSE_RESIDUAL, MOE):
         for name, text in ((spec['name'], render(spec, u)), (spec['name'].replace('q4_0', 'q4_1'), render_q4_1(spec, u))):
             path = os.path.join(SHADERS, name + '.comp')
             with open(path, 'w', encoding='utf-8', newline='\n') as f:

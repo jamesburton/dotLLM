@@ -542,6 +542,12 @@ internal sealed class VulkanWeights : IDisposable
     public VulkanChunkedRowTable? TokenEmbeddingRows { get; private set; }
 
     /// <summary>
+    /// True when the F32 table was left in the host mapping (#1161): <see cref="TokenEmbedding"/> is a stub and the forward copies the
+    /// token rows from the CPU weights into a host-visible staging buffer.
+    /// </summary>
+    public bool TokenEmbeddingOnHost { get; private set; }
+
+    /// <summary>
     /// Byte layout the token-embedding table actually holds on the device:
     /// <see cref="QuantizationType.F32"/> for the widened gather table (the
     /// historic behaviour — <c>vkCmdCopyBuffer</c> row gather), or
@@ -626,6 +632,10 @@ internal sealed class VulkanWeights : IDisposable
     /// <param name="valuePad">
     /// MiMo-V2: (K head dim, V head dim) when V is narrower than K; every layer's V projection is zero-row padded to the K head dim.
     /// </param>
+    /// <param name="tokenEmbedOnHost">
+    /// #1161: leave an F32 token table in the host mapping (a stub on device, <see cref="TokenEmbeddingOnHost"/> set); the caller
+    /// guarantees <c>weights.TokenEmbedWeight</c> outlives the returned weights.
+    /// </param>
     /// <remarks>
     /// <para>
     /// Staging is a single bounded, persistently-mapped buffer
@@ -640,7 +650,8 @@ internal sealed class VulkanWeights : IDisposable
         bool dequantToFp32 = false, int firstLayer = 0,
         bool skipTokenEmbed = false, bool skipOutputHead = false,
         string? spvDir = null,
-        (int KHeadDim, int VHeadDim)? valuePad = null)
+        (int KHeadDim, int VHeadDim)? valuePad = null,
+        bool tokenEmbedOnHost = false)
     {
         if (firstLayer < 0 || firstLayer + numLayers > weights.Layers.Length)
             throw new ArgumentOutOfRangeException(nameof(firstLayer),
@@ -676,10 +687,19 @@ internal sealed class VulkanWeights : IDisposable
         VulkanDevice.Buffer tokenEmbed;
         VulkanChunkedRowTable? tokenEmbedRows = null;
         QuantizationType tokenEmbedDeviceQt = QuantizationType.F32;
+        bool hostEmbed = false;
         if (skipTokenEmbed)
         {
             LastTokenEmbedDequantPath = "skipped";
             tokenEmbed = device.AllocateDeviceLocal(64);
+        }
+        else if (tokenEmbedOnHost && weights.TokenEmbedQuantType == QuantizationType.F32)
+        {
+            // #1161: an F32 table (Flint: 1.2 GB) stays in the mmap; the forward gathers its rows on the host (TokenEmbeddingOnHost).
+            LastTokenEmbedDequantPath = "host-gather";
+            tokenEmbed = device.AllocateDeviceLocal(64);
+            hostEmbed = true;
+            _residencyReport.Add("token_embd.weight", weights.TokenEmbedQuantType, QuantizationType.F32, 0, 0);
         }
         else
         {
@@ -1000,6 +1020,7 @@ internal sealed class VulkanWeights : IDisposable
             weights.OutputOutputDim, weights.OutputInputDim,
             totalBytes);
         built.TokenEmbeddingRows = tokenEmbedRows;
+        built.TokenEmbeddingOnHost = hostEmbed;
         return built;
     }
 

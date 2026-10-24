@@ -30,6 +30,17 @@ public sealed class MatMulQ4_0GemmCoopmatKernel : IDisposable
     public const string LegacyEnvVar = "DOTLLM_VK_Q4_0_GEMM_LEGACY";
 
     private const int Tile = 128;
+
+    /// <summary>SPIR-V of the 64x64 small-grid twin (issue #1161; only the Q4_1 instantiation ships).</summary>
+    public const string SmallSpvFileName = "matmul_q4_0_f32_gemm_coopmat_64x64x4.spv";
+
+    /// <summary><c>DOTLLM_VK_Q4_GEMM_SMALL=0</c> keeps every shape on the 128x128 tile (A/B).</summary>
+    public const string SmallEnvVar = "DOTLLM_VK_Q4_GEMM_SMALL";
+
+    // Below this many 128x128 tiles (0.8 per CU on a 40-CU part) the 64x64 twin runs: 4x the workgroups, no stored partials. Measured on
+    // Strix at n = 512: m = 512 (16 tiles) 20.2 -> 11.0 ms per forward; m = 1024 (32 tiles) 24.4 -> 28.7 ms, so it stays on 128x128.
+    private const int SmallGridMaxTiles = 32;
+    private const int SmallTile = 64;
     private const int PushConstantBytes = 5 * sizeof(uint); // M, K, N, blocksPerRow, rowUints
 
     private readonly VulkanDevice _device;
@@ -37,6 +48,10 @@ public sealed class MatMulQ4_0GemmCoopmatKernel : IDisposable
     private readonly ComputePipeline _pipeline;
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
+    private VulkanModule? _smallModule;
+    private ComputePipeline? _smallPipeline;
+    private nint _smallPool;
+    private DescriptorSetCache? _smallCache;
     private bool _disposed;
 
     /// <summary>The legacy 4-bit format this instance reads: <see cref="QuantizationType.Q4_0"/> (18 B blocks) or
@@ -106,11 +121,41 @@ public sealed class MatMulQ4_0GemmCoopmatKernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
-        return new MatMulQ4_0GemmCoopmatKernel(device, module, pipeline, pool) { Quant = quant };
+        var kernel = new MatMulQ4_0GemmCoopmatKernel(device, module, pipeline, pool) { Quant = quant };
+        string smallPath = Path.Combine(spvDir, ShaderFor(SmallSpvFileName, quant));
+        if (Environment.GetEnvironmentVariable(SmallEnvVar) != "0" && File.Exists(smallPath))
+        {
+            var sm = VulkanModule.LoadFromFile(device, smallPath);
+            try
+            {
+                Span<VkDescriptorBinding> b = stackalloc VkDescriptorBinding[3];
+                for (int i = 0; i < 3; i++) b[i] = new VkDescriptorBinding((uint)i);
+                kernel._smallPipeline = sm.CreateComputePipeline("main", b, PushConstantBytes, requiredSubgroupSize: 0);
+                kernel._smallModule = sm;
+                kernel._smallPool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
+                kernel._smallCache = new DescriptorSetCache(device, kernel._smallPool, kernel._smallPipeline, buffersPerSet: 3);
+            }
+            catch (VulkanException)
+            {
+                sm.Dispose();
+            }
+        }
+        return kernel;
     }
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
-    internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
+    internal void InvalidateDescriptorCache()
+    {
+        _descriptorCache.Reset();
+        _smallCache?.Reset();
+    }
+
+    /// <summary>Whether <see cref="Record"/> takes the 64x64 twin for this shape.</summary>
+    /// <param name="m">Output dimension.</param>
+    /// <param name="n">Batch size.</param>
+    /// <returns>True for small grids when the twin loaded.</returns>
+    public bool UsesSmallTile(int m, int n)
+        => _smallPipeline is not null && (long)((m + Tile - 1) / Tile) * ((n + Tile - 1) / Tile) < SmallGridMaxTiles;
 
     /// <summary>Dispatches synchronously (one-shot submit + fence wait); production uses <see cref="Record"/>.</summary>
     public void Launch(
@@ -151,21 +196,24 @@ public sealed class MatMulQ4_0GemmCoopmatKernel : IDisposable
         if (inputB.Size < (long)n * k * sizeof(float)) throw new ArgumentException("Input buffer too small.", nameof(inputB));
         if (outputC.Size < (long)n * m * sizeof(float)) throw new ArgumentException("Output buffer too small.", nameof(outputC));
 
+        bool small = UsesSmallTile(m, n);
+        var pipeline = small ? _smallPipeline! : _pipeline;
+        int tile = small ? SmallTile : Tile;
         Span<nint> buffers = stackalloc nint[3] { weightsQ4_0.Handle, inputB.Handle, outputC.Handle };
-        nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
+        nint descriptorSet = (small ? _smallCache! : _descriptorCache).GetOrCreate(buffers);
 
-        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
+        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, pipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(
-            cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout, 0, 1, descriptorSet, 0, 0);
+            cmdBuf, VkPipelineBindPoint.Compute, pipeline.Layout, 0, 1, descriptorSet, 0, 0);
 
         Span<uint> pc = stackalloc uint[5] { (uint)m, (uint)k, (uint)n, (uint)blocksPerRow, (uint)rowUints };
         fixed (uint* pcPtr = pc)
         {
             VulkanApi.vkCmdPushConstants(
-                cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute, 0, PushConstantBytes, (nint)pcPtr);
+                cmdBuf, pipeline.Layout, VkShaderStageFlags.Compute, 0, PushConstantBytes, (nint)pcPtr);
         }
 
-        VulkanApi.vkCmdDispatch(cmdBuf, (uint)((m + Tile - 1) / Tile), (uint)((n + Tile - 1) / Tile), 1);
+        VulkanApi.vkCmdDispatch(cmdBuf, (uint)((m + tile - 1) / tile), (uint)((n + tile - 1) / tile), 1);
     }
 
     /// <inheritdoc/>
@@ -175,6 +223,10 @@ public sealed class MatMulQ4_0GemmCoopmatKernel : IDisposable
         _disposed = true;
         if (_descriptorPool != 0)
             VulkanApi.vkDestroyDescriptorPool(_device.Handle, _descriptorPool, 0);
+        if (_smallPool != 0)
+            VulkanApi.vkDestroyDescriptorPool(_device.Handle, _smallPool, 0);
+        _smallPipeline?.Dispose();
+        _smallModule?.Dispose();
         _pipeline.Dispose();
         _module.Dispose();
     }

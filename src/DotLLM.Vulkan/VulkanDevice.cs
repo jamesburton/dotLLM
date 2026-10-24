@@ -2927,6 +2927,34 @@ public sealed class VulkanDevice : IDisposable
         }
     }
 
+    /// <summary>
+    /// Copies rows <paramref name="rowIds"/> of a host table (<paramref name="tableBase"/>, <paramref name="rowCount"/> rows of
+    /// <paramref name="rowBytes"/>) into the host-visible <paramref name="dst"/>, packed in order, under one mapping (#1161).
+    /// </summary>
+    /// <param name="dst">Host-visible destination of at least <c>rowIds.Length * rowBytes</c> bytes.</param>
+    /// <param name="tableBase">Host address of row 0.</param>
+    /// <param name="rowBytes">Bytes per row.</param>
+    /// <param name="rowCount">Rows in the table (ids are range-checked).</param>
+    /// <param name="rowIds">Rows to copy.</param>
+    public unsafe void UploadRows(Buffer dst, nint tableBase, int rowBytes, int rowCount, ReadOnlySpan<int> rowIds)
+    {
+        long bytes = (long)rowIds.Length * rowBytes;
+        if (!dst.IsHostVisible) throw new ArgumentException("Destination must be host-visible.", nameof(dst));
+        if (bytes > dst.Size) throw new ArgumentException("Destination too small.", nameof(dst));
+        foreach (int id in rowIds)
+            if ((uint)id >= (uint)rowCount) throw new ArgumentOutOfRangeException(nameof(rowIds), $"Row {id} is out of range");
+        nint mapped = MapMemoryWithRetry(dst.Memory, 0, (ulong)bytes, "vkMapMemory");
+        try
+        {
+            for (int t = 0; t < rowIds.Length; t++)
+                System.Buffer.MemoryCopy((void*)(tableBase + (nint)((long)rowIds[t] * rowBytes)), (void*)(mapped + (nint)((long)t * rowBytes)), rowBytes, rowBytes);
+        }
+        finally
+        {
+            VulkanApi.vkUnmapMemory(_device, dst.Memory);
+        }
+    }
+
     /// <summary>Copies from the start of <paramref name="src"/> into <paramref name="destination"/> host memory.</summary>
     /// <remarks>
     /// When <paramref name="src"/> is device-local-only (a discrete GPU's VRAM — see

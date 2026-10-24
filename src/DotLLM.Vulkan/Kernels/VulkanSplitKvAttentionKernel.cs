@@ -111,6 +111,25 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
     private readonly nint _gqaPool;
     private readonly DescriptorSetCache? _gqaCache;
 
+    // v2 of the grouped pass (issue #1161): 16 lanes per KV position, 16-byte KV loads batched per tile. Serves
+    // headDim <= 128 (multiple of 8) on wave64 devices; other shapes keep the v1 pass. DOTLLM_VULKAN_SPLITKV_GQA2=0 keeps v1 for A/B.
+    private readonly VulkanModule? _gqa2Module;
+    private readonly ComputePipeline? _gqa2Pipeline;
+    private readonly nint _gqa2Pool;
+    private readonly DescriptorSetCache? _gqa2Cache;
+
+    /// <summary>Largest head_dim the v2 grouped pass serves.</summary>
+    public const int Gqa2MaxHeadDim = 128;
+
+    internal const string Gqa2EnvVar = "DOTLLM_VULKAN_SPLITKV_GQA2";
+
+    /// <summary>Whether the grouped pass may use v2 where it applies (tests and the A/B bench pin either).</summary>
+    internal bool PreferGqa2 { get; set; } = true;
+
+    /// <summary>True when <see cref="Record"/> takes the v2 grouped pass for this shape.</summary>
+    internal bool UsesGqa2(int numHeads, int numKvHeads, int headDim)
+        => PreferGqa2 && _gqa2Pipeline is not null && UsesGqa(numHeads, numKvHeads, headDim) && headDim <= Gqa2MaxHeadDim && (headDim & 7) == 0;
+
     /// <summary>Largest query-head group (numHeads / numKvHeads) the GQA-grouped pass serves.</summary>
     public const int GqaMaxGroup = 8;
 
@@ -156,9 +175,15 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         VulkanDevice device,
         VulkanModule splitModule, ComputePipeline splitPipeline, nint splitPool,
         VulkanModule mergeModule, ComputePipeline mergePipeline, nint mergePool, VulkanKvStorage kvStorage,
-        VulkanModule? gqaModule, ComputePipeline? gqaPipeline, nint gqaPool)
+        VulkanModule? gqaModule, ComputePipeline? gqaPipeline, nint gqaPool,
+        VulkanModule? gqa2Module, ComputePipeline? gqa2Pipeline, nint gqa2Pool)
     {
         _device = device;
+        _gqa2Module = gqa2Module;
+        _gqa2Pipeline = gqa2Pipeline;
+        _gqa2Pool = gqa2Pool;
+        if (gqa2Pipeline is not null)
+            _gqa2Cache = new DescriptorSetCache(device, gqa2Pool, gqa2Pipeline, buffersPerSet: 5);
         KvStorage = kvStorage;
         _gqaModule = gqaModule;
         _gqaPipeline = gqaPipeline;
@@ -253,9 +278,30 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
             }
         }
 
+        var (gqa2Module, gqa2Pipeline, gqa2Pool) = device.SubgroupSize == 64 && Environment.GetEnvironmentVariable(Gqa2EnvVar) != "0"
+            ? TryLoadOptional(device, Path.Combine(spvDir, kvStorage.ShaderName("attention_f32_splitkv_gqa_v2") + ".spv"))
+            : (null, null, 0);
+
         return new VulkanSplitKvAttentionKernel(
             device, splitModule, splitPipeline, splitPool, mergeModule!, mergePipeline, mergePool, kvStorage,
-            gqaModule, gqaPipeline, gqaPool);
+            gqaModule, gqaPipeline, gqaPool, gqa2Module, gqa2Pipeline, gqa2Pool);
+    }
+
+    private static (VulkanModule?, ComputePipeline?, nint) TryLoadOptional(VulkanDevice device, string path)
+    {
+        if (!File.Exists(path)) return (null, null, 0);
+        VulkanModule? module = null;
+        try
+        {
+            module = VulkanModule.LoadFromFile(device, path);
+            var pipeline = CreatePipeline(module, bindingCount: 5, SplitPushConstantBytes);
+            return (module, pipeline, KernelSupport.CreateDescriptorPool(device, buffersPerSet: 5));
+        }
+        catch (VulkanException)
+        {
+            module?.Dispose();
+            return (null, null, 0);
+        }
     }
 
     /// <summary>
@@ -347,6 +393,21 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
     /// <returns>The split count (at least 1).</returns>
     public static int ComputeGqaSplits(int seqKv, int numKvHeads) => ComputeSplits(seqKv, numKvHeads);
 
+    /// <summary>
+    /// Splits per KV head for the v2 grouped pass: the same occupancy target, but at least <see cref="Gqa2MinKvPerSplit"/> positions per
+    /// split. Its 128-row tile makes a 16-position split mostly launch and merge overhead (Flint on Strix: decode at 0.5K 70-72 -> 77 tok/s,
+    /// at 8K 63 -> 66, 32K unchanged since the occupancy cap binds there).
+    /// </summary>
+    /// <param name="seqKv">KV positions the splits cover.</param>
+    /// <param name="numKvHeads">KV heads.</param>
+    /// <returns>The split count (at least 1).</returns>
+    public static int ComputeGqa2Splits(int seqKv, int numKvHeads)
+        => seqKv <= 0 || numKvHeads <= 0 ? 1
+            : Math.Max(1, Math.Min(Math.Max(1, TargetWorkgroups / numKvHeads), (seqKv + Gqa2MinKvPerSplit - 1) / Gqa2MinKvPerSplit));
+
+    /// <summary>Position floor per split of the v2 grouped pass (measured: 64 beat 16, 128 and 256 on Flint / Strix).</summary>
+    public const int Gqa2MinKvPerSplit = 64;
+
     internal static int MaxSplitsFor(int numHeads)
         => numHeads <= 0 ? 1 : Math.Max(1, TargetWorkgroups / numHeads);
 
@@ -363,6 +424,7 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         _splitCache.Reset();
         _mergeCache.Reset();
         _gqaCache?.Reset();
+        _gqa2Cache?.Reset();
     }
 
     /// <summary>
@@ -428,7 +490,9 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         if (kvStart < 0 || kvStart >= seqKv) throw new ArgumentOutOfRangeException(nameof(kvStart));
         if (sinks is not null && sinks.Size < (long)numHeads * sizeof(float)) throw new ArgumentException("Sinks buffer too small.", nameof(sinks));
         bool gqa = UsesGqa(numHeads, numKvHeads, headDim);
-        int numSplits = gqa ? ComputeGqaSplits(seqKv - kvStart, numKvHeads) : ComputeSplits(seqKv - kvStart, numHeads);
+        bool gqa2 = gqa && UsesGqa2(numHeads, numKvHeads, headDim);
+        int numSplits = gqa2 ? ComputeGqa2Splits(seqKv - kvStart, numKvHeads)
+            : gqa ? ComputeGqaSplits(seqKv - kvStart, numKvHeads) : ComputeSplits(seqKv - kvStart, numHeads);
 
         EnsureScratch(numHeads);
 
@@ -445,8 +509,8 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         // ── Pass 1: split ────────────────────────────────────────────────
         Span<nint> splitBuffers = stackalloc nint[5]
             { q.Handle, k.Handle, v.Handle, _partOut!.Handle, _partMS!.Handle };
-        ComputePipeline splitPipeline = gqa ? _gqaPipeline! : _splitPipeline;
-        nint splitSet = (gqa ? _gqaCache! : _splitCache).GetOrCreate(splitBuffers);
+        ComputePipeline splitPipeline = gqa2 ? _gqa2Pipeline! : gqa ? _gqaPipeline! : _splitPipeline;
+        nint splitSet = (gqa2 ? _gqa2Cache! : gqa ? _gqaCache! : _splitCache).GetOrCreate(splitBuffers);
 
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, splitPipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(
@@ -559,6 +623,9 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         if (_gqaPool != 0) VulkanApi.vkDestroyDescriptorPool(_device.Handle, _gqaPool, 0);
         _gqaPipeline?.Dispose();
         _gqaModule?.Dispose();
+        if (_gqa2Pool != 0) VulkanApi.vkDestroyDescriptorPool(_device.Handle, _gqa2Pool, 0);
+        _gqa2Pipeline?.Dispose();
+        _gqa2Module?.Dispose();
         _partOut?.Dispose();
         _partMS?.Dispose();
         _mergePipeline.Dispose();

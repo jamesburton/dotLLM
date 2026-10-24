@@ -259,7 +259,10 @@ internal static partial class Program
                     int[] sid = streams[si];
                     int n = sid.Length, promptLen = promptLens[si] == 0 ? n : promptLens[si];
                     ms.ResetSequenceState();
-                    bool allRows = Environment.GetEnvironmentVariable("STEPS_ALLROWS") == "1";
+                    // STEPS_ALLROWS=last: the last 128 rows of the final prefill chunk only (#1161: an accuracy sample at depth without
+                    // writing every chunk's rows).
+                    string? allRowsMode = Environment.GetEnvironmentVariable("STEPS_ALLROWS");
+                    bool allRows = allRowsMode is "1" or "last";
                     if (allRows) ms.TrySetAllRowLogitsLimit(chunk + 1);
                     using var kv = makeKv(ctxLen);
                     using var fs = File.Create(outsS[si]);
@@ -273,10 +276,10 @@ internal static partial class Program
                     {
                         int len = Math.Min(chunk, promptLen - p);
                         using var lg = ms.Forward(sid.AsSpan(p, len), Enumerable.Range(p, len).ToArray(), did, kv);
-                        if (allRows)
+                        if (allRows && (allRowsMode == "1" || p + len >= promptLen))
                         {
                             // STEPS_ALLROWS=1: every prefill row (needs all-row logits), for locating where two runs diverge.
-                            for (int r = 0; r < len; r++)
+                            for (int r = allRowsMode == "last" ? Math.Max(0, len - 128) : 0; r < len; r++)
                             {
                                 unsafe { System.Buffer.BlockCopy(new ReadOnlySpan<float>((float*)lg.DataPointer + (long)r * v, v).ToArray(), 0, rowBuf, 0, rowBuf.Length); }
                                 fs.Write(rowBuf, 0, rowBuf.Length);

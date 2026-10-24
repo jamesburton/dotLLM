@@ -87,6 +87,21 @@ public class VulkanSplitKvAttentionKernelTests
     }
 
     [SkippableFact]
+    public void Decode_FlintShape_Gqa8_HeadDim128()
+    {
+        // Issue #1161: Recursive Flint's full layers (32 query heads over 4 KV heads, head_dim 128). S=64 per KV head, 79 or 78
+        // positions per split: the v2 pass's 64-row tile loop runs twice with a ragged second tile.
+        RunOne(seqKv: 5003, numHeads: 32, numKvHeads: 4, headDim: 128, positionOffset: 5002);
+    }
+
+    [SkippableFact]
+    public void Decode_FlintShape_SlidingWindow_HeadDim96()
+    {
+        // Sliding window with a head_dim below 128 (v2: lanes 12..15 of each position idle).
+        RunOne(seqKv: 1500, numHeads: 16, numKvHeads: 2, headDim: 96, positionOffset: 1499, slidingWindow: 513);
+    }
+
+    [SkippableFact]
     public void Decode_Causal_MaskedTail_AcrossSplits()
     {
         // Causal with the query NOT at the last position: posQ=300, seqKv=600.
@@ -171,10 +186,13 @@ public class VulkanSplitKvAttentionKernelTests
 
         // Issue #1102: both split passes, the per-query-head one and (where the shape allows) the GQA-grouped one, against the
         // same CPU reference at the same tolerance.
-        foreach (bool gqa in new[] { false, true })
+        // Issue #1161: the grouped pass twice, v1 and (where the shape and device allow) v2.
+        foreach (var (gqa, v2) in new[] { (false, false), (true, false), (true, true) })
         {
             kernel.PreferGqa = gqa;
+            kernel.PreferGqa2 = v2;
             if (gqa && !kernel.UsesGqa(numHeads, numKvHeads, headDim)) continue;
+            if (v2 && !kernel.UsesGqa2(numHeads, numKvHeads, headDim)) continue;
             kernel.Launch(bufQ, bufK, bufV, bufOut,
                 seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset,
                 slidingWindow: slidingWindow, useAlibi: useAlibi,

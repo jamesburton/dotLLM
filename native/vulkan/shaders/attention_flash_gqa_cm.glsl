@@ -56,7 +56,9 @@
 #define STRIP           16                       // query rows per subgroup
 #define NSTRIP          4                        // subgroups (strips) per workgroup
 #define WG_ROWS         (STRIP * NSTRIP)         // 64 query rows per workgroup
-#define MAX_HEAD_DIM    256
+#ifndef MAX_HEAD_DIM
+#define MAX_HEAD_DIM    256                      // the _hd128 wrappers define 128 (#1161: half the registers and LDS)
+#endif
 #define HD_CHUNKS       (MAX_HEAD_DIM / 16)      // 16 coopmat d-chunks
 #if defined(KV_F16)
 #define BC              32
