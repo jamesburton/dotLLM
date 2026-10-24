@@ -393,6 +393,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         var state = new VulkanQwen3HybridDenseForwardState(device, config, gdn, initialSeqLen: 1);
         var gdnCache = new VulkanGdnStateCache(device, gdn, gdnOrdinal);
         var kernels = VulkanQwen3MoeHybridKernels.Create(device, spvDir, config.HeadDim);
+        // #1226: Q8_1 activation scratch for the int8-coopmat prefill GEMMs (RDNA3/3.5 only).
+        state.Cm1ScratchEnabled = kernels.QuantizeQ8_1RowsCm1 is not null;
         // Issue #1101: --rope-scaling yarn. Every RoPE call site goes through kernels.RecordRopeNeoX, which uses this when attached.
         if (attentionLayerCount > 0)
             kernels.AttachYarnRope(VulkanDenseYarnRope.TryCreate(device, spvDir, config, ropeDim));
@@ -1575,7 +1577,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
 
     /// <summary>The F16-activation GEMM for a down-projection quant, or null when that quant has none (or it needs a non-coopmat path).</summary>
     private CoopmatF16Gemm? F16ActivationGemmFor(QuantizationType qt, int inputDim)
-        => qt switch
+        => Cm1For(qt, inputDim) is not null ? null : qt switch
         {
             QuantizationType.Q4_K when (inputDim % 256) == 0 => _kernels.MatMulQ4KGemmCoopmat?.F16Activation,
             QuantizationType.Q5_K when (inputDim % 256) == 0 => _kernels.MatMulQ5KGemmCoopmat?.F16Activation,
@@ -2694,6 +2696,23 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
     // ── Matmul dispatch ──────────────────────────────────────────────────────
 
     /// <summary>
+    /// The int8-coopmat GEMM (#1226) for a <paramref name="qt"/> weight of input width <paramref name="inputDim"/> over
+    /// <paramref name="seqLen"/> rows (0 = skip the scratch-size check), or null.
+    /// </summary>
+    private MatMulMmqCm1Kernel? Cm1For(QuantizationType qt, int inputDim, int seqLen = 0)
+    {
+        var k = qt switch
+        {
+            QuantizationType.Q8_0 => _kernels.MatMulQ8MmqCm1,
+            QuantizationType.Q4_K => _kernels.MatMulQ4KMmqCm1,
+            _ => null,
+        };
+        // A fused batch forward can stack more rows than the state's capacity; those GEMMs keep the F16 coopmat path.
+        return k is not null && _state.Cm1Xq is { } xq && k.SupportsK(inputDim)
+            && xq.Size >= QuantizeQ8_1RowsKernel.PackedBytes(seqLen, inputDim) ? k : null;
+    }
+
+    /// <summary>
     /// Dispatches the GEMV (<paramref name="seqLen"/> == 1) or GEMM variant for the
     /// weight's on-device quantization. Same policy table as
     /// <see cref="VulkanQwen3MoeHybridTransformerModel"/>.
@@ -2710,6 +2729,18 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         // costs ~4.5 single-row forwards even at 2 rows on Strix (Qwen3.8-27B Q4_K_M: 105 ms at 1 row, 480 ms at 2..8).
         if (seqLen > 1 && TryRecordSmallRowMatmul(cmdBuf, weights, weightQt, input, output, outputDim, inputDim, seqLen))
             return;
+
+        // #1226: int8-coopmat MMQ (RDNA3/3.5) for Q8_0 / Q4_K: quantize the activations to Q8_1, then int8 WMMA on the packed weights.
+        // The barrier in front orders the quantize after any earlier GEMM still reading the shared scratch (gate and up are recorded
+        // back to back without one).
+        if (seqLen > 1 && Cm1For(weightQt, inputDim, seqLen) is { } cm1)
+        {
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            _kernels.QuantizeQ8_1RowsCm1!.Record(cmdBuf, input, _state.Cm1Xq!, _state.Cm1Xds!, seqLen, inputDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            cm1.Record(cmdBuf, weights, _state.Cm1Xq!, _state.Cm1Xds!, output, m: outputDim, k: inputDim, n: seqLen);
+            return;
+        }
 
         // IQ1/IQ2/IQ3 prefill: dequant to F16 scratch + coopmat GEMM instead of the scalar tiled GEMM (#621).
         if (seqLen > 1 && _iqF16Prefill is not null

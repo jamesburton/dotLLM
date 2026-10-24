@@ -198,14 +198,20 @@ public sealed class VulkanNemotronHBoltParityTests(Xunit.Abstractions.ITestOutpu
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
         Skip.If(mmvq && !device.HasIntegerDotProduct, "device lacks integer dot product");
-        bool legacyGrouped = MoeGroupedMatmulLegacyQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedLegacyQuant.Q5_1)
+        bool legacyGrouped = MoeGroupedMatmulLegacyQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedLegacyQuant.Q5_0)
             && MoeGroupedMatmulLegacyQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedLegacyQuant.Q8_0);
+        // #1226: where the int8-coopmat grouped kernels exist (RDNA3/3.5, needs dp4a for the Q8_1 gather) they take these banks instead.
+        bool cm1Grouped = mmvq && device.HasIntegerDotProduct
+            && MatMulMmqCm1Kernel.IsSupportedOn(device, spvDir, QuantizationType.Q5_0, grouped: true)
+            && MatMulMmqCm1Kernel.IsSupportedOn(device, spvDir, QuantizationType.Q8_0, grouped: true);
 
         RunParity(device, spvDir, LegacyLayers, LegacySeed, mmvq, grouped, xdiv: true, () =>
         {
             long viaCoopmat = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.GroupedCoopmat);
+            long viaCm1 = Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.GroupedCm1);
             Assert.Equal(0, Interlocked.Read(ref VulkanNemotronHTransformerModel.MoePathCounters.GroupedMmq));
-            Assert.Equal(grouped && legacyGrouped ? LegacyLayers.Length : 0, viaCoopmat);
+            Assert.Equal(grouped && cm1Grouped ? LegacyLayers.Length : 0, viaCm1);
+            Assert.Equal(grouped && !cm1Grouped && legacyGrouped ? LegacyLayers.Length : 0, viaCoopmat);
         });
     }
 

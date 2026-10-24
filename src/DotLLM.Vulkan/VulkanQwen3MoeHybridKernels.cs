@@ -22,6 +22,12 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MatMulQ2KGemmCoopmatKernel? MatMulQ2KGemmCoopmat { get; private set; }
     public MatMulQ3KGemmCoopmatKernel? MatMulQ3KGemmCoopmat { get; private set; }
     public MatMulQ4KGemmCoopmatKernel? MatMulQ4KGemmCoopmat { get; private set; }
+    /// <summary>Int8-coopmat MMQ prefill GEMM for Q8_0 weights (#1226, RDNA3/3.5 only); null elsewhere or with <c>DOTLLM_VK_MMQ_CM1=0</c>.</summary>
+    public MatMulMmqCm1Kernel? MatMulQ8MmqCm1 { get; private set; }
+    /// <summary>Int8-coopmat MMQ prefill GEMM for Q4_K weights (#1226).</summary>
+    public MatMulMmqCm1Kernel? MatMulQ4KMmqCm1 { get; private set; }
+    /// <summary>Row-wise Q8_1 activation quantizer feeding the int8-coopmat GEMMs; non-null exactly when one of them is.</summary>
+    public QuantizeQ8_1RowsKernel? QuantizeQ8_1RowsCm1 { get; private set; }
     public MatMulQ5KGemmCoopmatKernel? MatMulQ5KGemmCoopmat { get; private set; }
     public MatMulQ6KGemmCoopmatKernel? MatMulQ6KGemmCoopmat { get; private set; }
     public MatMulIq4XsGemmCoopmatKernel? MatMulIq4XsGemmCoopmat { get; private set; }
@@ -729,6 +735,22 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             kernels.MatMulQ4KGemmCoopmat = MatMulQ4KGemmCoopmatKernel.Create(device, spvDir);
         if (Environment.GetEnvironmentVariable(VulkanTransformerModel.DisableQ5KCoopmatEnvVar) != "1" && MatMulQ5KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
             kernels.MatMulQ5KGemmCoopmat = MatMulQ5KGemmCoopmatKernel.Create(device, spvDir);
+        // #1226: opt-in (DOTLLM_VK_MMQ_CM1_DENSE=1). Measured on the 8060S (Qwen3.8-27B pp512): 300 tok/s against 335-348 for the F16
+        // coopmat GEMM, whose 128x128 tile already runs these shapes at 17-20 TFLOP/s; the MoE grouped form is where the int8 path wins.
+        if (Environment.GetEnvironmentVariable("DOTLLM_VK_MMQ_CM1_DENSE") == "1")
+        {
+            kernels.MatMulQ8MmqCm1 = MatMulMmqCm1Kernel.TryCreate(device, spvDir, DotLLM.Core.Configuration.QuantizationType.Q8_0);
+            kernels.MatMulQ4KMmqCm1 = MatMulMmqCm1Kernel.TryCreate(device, spvDir, DotLLM.Core.Configuration.QuantizationType.Q4_K);
+        }
+        if (kernels.MatMulQ8MmqCm1 is not null || kernels.MatMulQ4KMmqCm1 is not null)
+        {
+            kernels.QuantizeQ8_1RowsCm1 = QuantizeQ8_1RowsKernel.TryCreate(device, spvDir);
+            if (kernels.QuantizeQ8_1RowsCm1 is null)
+            {
+                kernels.MatMulQ8MmqCm1?.Dispose(); kernels.MatMulQ8MmqCm1 = null;
+                kernels.MatMulQ4KMmqCm1?.Dispose(); kernels.MatMulQ4KMmqCm1 = null;
+            }
+        }
         if (Environment.GetEnvironmentVariable(VulkanTransformerModel.DisableQ6KCoopmatEnvVar) != "1" && MatMulQ6KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
             kernels.MatMulQ6KGemmCoopmat = MatMulQ6KGemmCoopmatKernel.Create(device, spvDir);
         if (Environment.GetEnvironmentVariable(VulkanTransformerModel.DisableIq4XsCoopmatEnvVar) != "1" && MatMulIq4XsGemmCoopmatKernel.IsSupportedOn(device, spvDir))
@@ -863,6 +885,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulQ2KGemmCoopmat?.InvalidateDescriptorCache();
         MatMulQ3KGemmCoopmat?.InvalidateDescriptorCache();
         MatMulQ4KGemmCoopmat?.InvalidateDescriptorCache();
+        MatMulQ8MmqCm1?.InvalidateDescriptorCache(); MatMulQ4KMmqCm1?.InvalidateDescriptorCache(); QuantizeQ8_1RowsCm1?.InvalidateDescriptorCache();
         MatMulQ5KGemmCoopmat?.InvalidateDescriptorCache();
         MatMulQ6KGemmCoopmat?.InvalidateDescriptorCache();
         MatMulIq4XsGemmCoopmat?.InvalidateDescriptorCache();
@@ -1088,6 +1111,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulQ2KGemmCoopmat?.Dispose();
         MatMulQ3KGemmCoopmat?.Dispose();
         MatMulQ4KGemmCoopmat?.Dispose();
+        MatMulQ8MmqCm1?.Dispose(); MatMulQ4KMmqCm1?.Dispose(); QuantizeQ8_1RowsCm1?.Dispose();
         MatMulQ5KGemmCoopmat?.Dispose();
         MatMulQ6KGemmCoopmat?.Dispose();
         MatMulIq4XsGemmCoopmat?.Dispose();
