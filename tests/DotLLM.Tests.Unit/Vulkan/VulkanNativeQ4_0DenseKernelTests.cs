@@ -129,6 +129,9 @@ public sealed class VulkanNativeQ4_0DenseKernelTests
     [InlineData(QuantizationType.Q4_1, 5, 1000, 2048)]
     [InlineData(QuantizationType.Q4_0, 64, 6144, 2048)]    // LFM2.5 conv in_proj width
     [InlineData(QuantizationType.Q4_1, 64, 6144, 2048)]
+    [InlineData(QuantizationType.Q4_1, 512, 512, 2048)]    // #1161: Flint k / v at n = 512 (64x64 twin)
+    [InlineData(QuantizationType.Q4_1, 300, 1000, 1024)]   // 64x64 twin with ragged m and n
+    [InlineData(QuantizationType.Q4_1, 512, 2048, 1024)]   // Flint shared-expert down: 64 tiles, stays on 128x128
     public void Gemm_MatchesCpuReference(QuantizationType qt, int n, int m, int k)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
@@ -158,6 +161,8 @@ public sealed class VulkanNativeQ4_0DenseKernelTests
         device.Upload(new ReadOnlySpan<byte>(w), bufW);
         device.Upload(b32, bufB);
         kernel.Launch(bufW, bufB, bufC, m, k, n);
+        if (qt == QuantizationType.Q4_1 && n >= 300)
+            Assert.Equal(m < 2048, kernel.UsesSmallTile(m, n));   // the Flint cases must exercise the tile they name
         float[] actual = new float[(long)n * m];
         device.Download(bufC, actual);
 
