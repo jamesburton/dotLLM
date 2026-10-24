@@ -141,4 +141,57 @@ public sealed class MtpAdaptiveGateTests
         }
         Assert.Equal(silent.Describe(), asked.Describe());
     }
+
+    /// <summary>
+    /// #1223: the CUDA hybrid-dense model's <c>ComputeMemoryBytes</c> leaves out its device weights, so a 7+ GiB Bonsai-2 fell on the plain-first
+    /// side of the size prior and a one-shot run never drafted. The prior must put it MTP-first, like the Vulkan MTP models.
+    /// </summary>
+    [Fact]
+    public void CudaHybridDensePrior_TriesMtpFirst()
+    {
+        // The property is a constant, so an uninitialised instance (no GPU needed) is enough to read it.
+        var model = (DotLLM.Core.Models.IModel)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(
+            typeof(DotLLM.Cuda.Architectures.CudaQwen3HybridDenseTransformerModel));
+        Assert.True(model.MtpGatePriorBytes >= MtpAdaptiveGate.MtpPriorMinModelBytes);
+        Assert.True(new MtpAdaptiveGate(model.MtpGatePriorBytes).ShouldUseMtp(128));
+    }
+
+    /// <summary>
+    /// One fresh 128-token request driven through the gate and the round controller with injected timings (#1223). MTP-first is only safe
+    /// because the request measures itself: where drafting wins (GPU verify ~1.3x a decode step) it must keep drafting, and where it loses
+    /// (CPU, an 8-row verify ~7x a step) it must drop to plain inside that same request.
+    /// </summary>
+    [Theory]
+    [InlineData(1.3, true)]    // bandwidth-bound GPU trunk: a 4-row verify costs ~1.3 decode steps
+    [InlineData(7.0, false)]   // compute-bound CPU trunk: the verify costs ~7 decode steps
+    public void FreshRequest_KeepsDraftingOnlyWhereItMeasuresFaster(double roundCostInSteps, bool expectDrafting)
+    {
+        const double StepMs = 50;   // plain decode step
+        const int K = 3;
+        var gate = new MtpAdaptiveGate(long.MaxValue);
+        Assert.True(gate.ShouldUseMtp(128));
+
+        var ctl = new MtpRoundController(gate.CostModel, K, calibratePlain: gate.NeedsPlainReference(127), gate: gate);
+        int generated = 1, drafted = 0;
+        bool fellBack = false;
+        while (generated < 128)
+        {
+            int k = ctl.NextK(128 - generated);
+            if (k == 0)
+            {
+                ctl.Record(0, 1, StepMs);   // zero-draft calibration round
+                generated++;
+                continue;
+            }
+            drafted += k;
+            int emitted = k + 1;   // every draft accepted: the most favourable case for MTP
+            ctl.Record(k, emitted, StepMs * roundCostInSteps * (k + 1) / (K + 1));
+            generated += emitted;
+            if (ctl.ShouldFallBack(gate.PlainMsPerToken)) { fellBack = true; break; }
+        }
+
+        Assert.True(drafted > 0, "an MTP-first request must try drafting");
+        Assert.Equal(expectDrafting, !fellBack);
+        Assert.Equal(StepMs, gate.PlainMsPerToken, 3);   // the calibration became the gate's plain reference
+    }
 }

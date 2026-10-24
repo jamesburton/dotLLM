@@ -533,6 +533,15 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
 
     /// <inheritdoc/>
     /// <remarks>
+    /// <see cref="ComputeMemoryBytes"/> is scratch plus the GDN cache only, so the device weights are missing from it and a 7+ GiB Bonsai-2
+    /// looks tiny. That put every CUDA MTP/DFlash run on the plain-first side of the gate's size prior: a one-shot run never drafted, at
+    /// 20.8 tok/s against 35.0 with drafting forced (#1223). A GPU trunk is bandwidth-bound in verify, so MTP goes first. The request's
+    /// zero-draft calibration and the mid-request fall-back still drop to plain where drafting measures slower.
+    /// </remarks>
+    public long MtpGatePriorBytes => long.MaxValue;
+
+    /// <inheritdoc/>
+    /// <remarks>
     /// Re-zeroes the model-owned Gated-DeltaNet cache used by every forward that does not carry a
     /// caller-supplied <see cref="IGdnState"/>. The GDN cache persists across uncached forwards, so
     /// callers that treat each forward as an independent sequence (perplexity windows, and
