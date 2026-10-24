@@ -2649,6 +2649,11 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
     {
         if (_prof is not null) ProfNoteMatmul(weightQt, outputDim, inputDim, seqLen);
 
+        // 2..8-row verify batches (MTP, #1185): the multi-column GEMVs read each weight once for all rows; the coopmat GEMM tile below
+        // costs ~4.5 single-row forwards even at 2 rows on Strix (Qwen3.8-27B Q4_K_M: 105 ms at 1 row, 480 ms at 2..8).
+        if (seqLen > 1 && TryRecordSmallRowMatmul(cmdBuf, weights, weightQt, input, output, outputDim, inputDim, seqLen))
+            return;
+
         // IQ1/IQ2/IQ3 prefill: dequant to F16 scratch + coopmat GEMM instead of the scalar tiled GEMM (#621).
         if (seqLen > 1 && _iqF16Prefill is not null
             && _iqF16Prefill.TryRecord(cmdBuf, weightQt, weights, input, output, outputDim, inputDim, seqLen))

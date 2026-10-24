@@ -470,6 +470,55 @@ wire-format fields needed.
   `MtpBenchProfile`-only.
 - **Only `nextn_predict_layers == 1`** is supported, matching llama.cpp's own current QWEN35
   assertion — multi-block MTP is out of scope until a real checkpoint needs it.
+### Separate `mtp-*.gguf` head for `qwen35` (issue #1185)
+
+`ggml-org/Qwen3.8-27B-GGUF` converts the trunk with `--no-mtp` and ships the head beside it as `mtp-Qwen3.8-27B-{Q4_0,Q8_0,BF16}.gguf`:
+18 tensors, `blk.64.*` (full attention + dense FFN, the same block an embedded head has) plus `blk.64.nextn.{eh_proj,enorm,hnorm,shared_head_norm}`,
+and its own copies of `token_embd` / `output`.
+
+- `Qwen3HybridDenseTransformerModel` (CPU) and `VulkanQwen3HybridDenseTransformerModel` implement `IMtpHeadAttachable`, so the existing
+  `mtp-*.gguf` auto-detect (`Qwen4ExpMtpHeadResolver`), `--mtp-head` and the server attach it. The head file is validated against the trunk
+  (`ValidateMtpHeadFile`: arch, `nextn_predict_layers == 1`, `block_count == trunk + 1`, hidden / heads / KV heads / head dim / FFN width) and
+  loaded through the same `LoadMtpHeadIfPresent` as an embedded head, so draft, absorb and verify are unchanged.
+- **No weight duplication:** the file's `token_embd` / `output` copies are never read or uploaded (the trunk's are used); the head's own
+  projections stay in their stored quant (CPU: read from the head file's mapping; Vulkan: uploaded as-is, ~0.4 GiB for the Q8_0 block).
+- Synthetic coverage: `SyntheticQwen35HybridDenseMtpGguf.Build(headOnly: true)` splits one seeded checkpoint into trunk + head files; the
+  split model drafts bit-identically to the embedded one and speculates to plain greedy (`Qwen3HybridDenseMtpHeadAttachTests`,
+  `VulkanQwen3HybridDenseMtpHeadAttachTests`).
+
+**Verify cost: 2..8-row GEMVs on the dense Vulkan model.** The first Strix run accepted 91 % of drafts and still decoded at 0.4x plain:
+every projection of a 2..8-row verify fell to the 128x128 coopmat GEMM tile, so a 2-row forward cost 4.5 single-row forwards
+(Qwen3.8-27B Q4_K_M: 105 ms at 1 row, 477 ms at 2, 512 ms at 4, 480 ms at 8). The dense model now takes the multi-column GEMVs the MoE
+host has used since #876 / #902 (Q4_K / Q5_K / Q6_K / IQ4_XS / IQ3_S / F16 / F32 on float activations; Q8_0 via the Q8_1 MMVQ multi
+kernel), `DOTLLM_VK_SMALLROW_GEMV=0` to disable: 113 ms at 2 rows, 150 ms at 4.
+
+**Exactness needs FP32-activation verify GEMVs.** The MoE host's Q8_0 small-row path (Q8_1 MMVQ multi) quantises the activations, which
+the 1-row FP32 decode GEMV does not: on Qwen3.8-27B it flipped a near-tie (`InvalidOperationException` -> `ArgumentException` in a C# prompt).
+The dense model therefore uses a new `matmul_q8_0_gemv_multi` (the coalesced 1-row Q8_0 GEMV with NC accumulators, same per-column
+reduction order; `VulkanSmallRowKernelTests.Q8F32Multi_EachColumnBitIdenticalToCoalescedGemv` asserts bit equality), and only when the decode
+GEMV is the coalesced variant. Every kernel the verify uses is then the 1-row kernel's arithmetic per column.
+
+**Measured (Strix Halo 8060S, Vulkan, `ggml-org` Qwen3.8-27B Q4_K_M + `mtp-Qwen3.8-27B-Q8_0.gguf`, 4 prompts x 128 greedy tokens, CLI `run`,
+llama.cpp master `0ae0e1976` `llama-server --spec-type draft-mtp -md <head>`, same prompts, temperature 0):**
+
+| arm | decode tok/s (mean of 4) | per prompt | x plain | peak private / GPU shared |
+|---|---|---|---|---|
+| dotLLM plain | 10.57 | 10.6 / 10.6 / 10.4 / 10.6 | 1.00 | 23.3 / 22.6 GB |
+| dotLLM MTP K=2 | 16.82 | 16.5 / 18.0 / 14.3 / 18.5 | 1.59 | 24.2 / 23.3 GB |
+| dotLLM MTP K=3 | 17.14 | 15.9 / 19.9 / 14.0 / 18.8 | 1.62 | 24.3 / 23.5 GB |
+| dotLLM MTP K=4 | 16.99 | 15.9 / 19.8 / 14.3 / 18.0 | 1.61 | 24.4 / 23.6 GB |
+| llama.cpp plain | 11.00 | 10.9 / 11.0 / 11.0 / 11.0 | 1.00 | 20.6 / 18.6 GB |
+| llama.cpp MTP K=2 | 22.21 | 19.4 / 25.3 / 21.5 / 22.7 | 2.02 | 24.7 / 22.1 GB |
+| llama.cpp MTP K=3 | 24.27 | 21.4 / 28.5 / 21.8 / 25.5 | 2.21 | 24.8 / 22.2 GB |
+| llama.cpp MTP K=4 | 20.56 | 15.8 / 26.7 / 17.5 / 22.2 | 1.87 | 25.0 / 22.4 GB |
+
+- **Greedy output: dotLLM MTP equals dotLLM plain on 12 / 12 runs** (4 prompts x K 2..4, 128 tokens); llama.cpp's MTP equals its plain decode
+  on 7 / 12. CPU (Strix, 48 tokens): identical, 4.41 vs 3.73 tok/s.
+- The head costs ~0.95 GB (Q8_0 block uploaded as-is, 4 KiB/position F32 head KV, scratch); llama.cpp's head costs ~3.6 GB because it also
+  loads the head file's own `token_embd` / `output` copies. dotLLM's plain baseline is ~4 GB above llama.cpp's (a trunk-side gap, not MTP).
+- llama.cpp drafts 74 % accepted at K=3. dotLLM's verify (150 ms for 4 rows vs 105 ms decode) and per-step head cost (LM head over 248k rows
+  per draft step) are the remaining gap to llama.cpp's 2.2x.
+
 ### qwen4exp MTP head (issue #820, CPU oracle)
 
 Qwen3.8-Flash-Next (`qwen4exp`) ships its MTP head as a **separate 49-block GGUF** (`mtp-Qwen3.8-Flash-Next-Q8_0.gguf`, 4.1 GB: `blk.48.*`
