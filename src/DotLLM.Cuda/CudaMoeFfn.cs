@@ -94,8 +94,10 @@ public static unsafe class CudaMoeFfn
     /// </summary>
     internal static void ForwardWithHostExperts(
         nint hiddenF32, nint outputF32, int seqLen, CudaMoeLayerWeights weights,
-        CudaMoeScratch scratch, nint cublasHandle, CudaKernels kernels, nint stream, CudaMoeHostExperts? hostExperts)
-        => ForwardCore(hiddenF32, outputF32, seqLen, weights, scratch, cublasHandle, kernels, stream, null, false, null, hostExperts);
+        CudaMoeScratch scratch, nint cublasHandle, CudaKernels kernels, nint stream, CudaMoeHostExperts? hostExperts,
+        DotLLM.Models.Architectures.MoeLayerWeights? nextHostLayer = null)
+        => ForwardCore(hiddenF32, outputF32, seqLen, weights, scratch, cublasHandle, kernels, stream, null, false, null, hostExperts,
+            nextHostLayer);
 
     /// <summary>Runs the expert body after architecture-specific routing populated scratch TopkIdx/TopkWeight.</summary>
     internal static void ForwardWithPrecomputedRouting(
@@ -108,7 +110,8 @@ public static unsafe class CudaMoeFfn
         nint hiddenF32, nint outputF32, int seqLen, CudaMoeLayerWeights weights,
         CudaMoeScratch scratch, nint cublasHandle, CudaKernels kernels, nint stream,
         bool? forceUseI2SBatchedGemm, bool routingAlreadyComputed,
-        Action<nint, nint, nint, int, int, int, nint>? packedQ4Projection, CudaMoeHostExperts? hostExperts)
+        Action<nint, nint, nint, int, int, int, nint>? packedQ4Projection, CudaMoeHostExperts? hostExperts,
+        DotLLM.Models.Architectures.MoeLayerWeights? nextHostLayer = null)
     {
         if (!kernels.HasMoeKernels)
             throw new InvalidOperationException(
@@ -184,15 +187,14 @@ public static unsafe class CudaMoeFfn
         // per-expert grouped batches. Per-token weights stay device-resident —
         // the per-expert axpy reads them from device memory by (token, slot)
         // index. ──
-        // Sync once here — necessary so the host can read topkIdx. Cheap for
-        // decode (seqLen=1, K=2..8).
+        // One round trip: the ids (and, for a CPU-expert layer, the CPU leg's inputs) are queued as async copies into pinned
+        // memory and the stream is synchronised once (#1202; a sync copy each cost a link round trip on an eGPU).
+        if (weights.HostExperts is { } hostInputs && hostExperts is not null)
+            hostExperts.EnqueueDownload(hostInputs, hiddenF32, scratch.TopkWeight, seqLen, stream);
+        CudaDriverApi.cuMemcpyDtoHAsync_v2(scratch.HostTopkIdx, scratch.TopkIdx,
+            (nuint)((long)totalAssign * sizeof(int)), stream).ThrowOnError();
         CudaDriverApi.cuStreamSynchronize(stream).ThrowOnError();
-
-        int[] topkIdxHost = new int[totalAssign];
-        fixed (int* p = topkIdxHost)
-            CudaDriverApi.cuMemcpyDtoH_v2(
-                (nint)p, scratch.TopkIdx,
-                (nuint)((long)totalAssign * sizeof(int))).ThrowOnError();
+        var topkIdxHost = new ReadOnlySpan<int>((void*)scratch.HostTopkIdx, totalAssign);
 
         // CPU-expert layer (#1187): queue the shared expert on the device first so it overlaps the CPU leg, then add the
         // routed sum. shared + routed is one addition per element, so the order matches the resident path's routed + shared.
@@ -200,9 +202,23 @@ public static unsafe class CudaMoeFfn
         {
             if (hostExperts is null)
                 throw new InvalidOperationException("This MoE layer keeps its routed experts on the CPU, but no CPU leg was supplied.");
+            if (TryRunHostLayerSplit(hiddenF32, outputF32, seqLen, weights, hostMoe, nextHostLayer, scratch, cublasHandle,
+                    kernels, stream, hostExperts, topkIdxHost, packedQ4Projection))
+                return;
             RunSharedExperts(hiddenF32, outputF32, seqLen, weights, scratch, cublasHandle, kernels, stream, packedQ4Projection);
-            hostExperts.Run(hostMoe, hiddenF32, scratch.TopkWeight, topkIdxHost, seqLen, scratch.DownBatch);
+            hostExperts.Run(hostMoe, topkIdxHost, seqLen, scratch.DownBatch, stream);
             kernels.LaunchMoeAxpyUnweightedF32(outputF32, scratch.DownBatch, seqLen, hidden, stream);
+            return;
+        }
+
+        if (CanRunBucketed(seqLen, weights, kernels))
+        {
+            int[] rowOffsets = PrepareBuckets(hiddenF32, seqLen, weights, scratch, kernels, stream, topkIdxHost);
+            RunBucketedExperts(0, E, weights.GateProj, weights.UpProj, weights.DownProj, rowOffsets,
+                weights, scratch, cublasHandle, kernels, stream, packedQ4Projection);
+            kernels.LaunchMoeCombineBucketedF32(outputF32, scratch.DownBatch, scratch.TopkWeight,
+                scratch.TokenIndices + (nint)((long)totalAssign * sizeof(int)), seqLen, hidden, K, stream);
+            RunSharedExperts(hiddenF32, outputF32, seqLen, weights, scratch, cublasHandle, kernels, stream, packedQ4Projection);
             return;
         }
 
@@ -472,6 +488,207 @@ public static unsafe class CudaMoeFfn
 
         // ── Step 8: shared-expert path (DeepSeek / Qwen1.5-MoE) ──
         RunSharedExperts(hiddenF32, outputF32, seqLen, weights, scratch, cublasHandle, kernels, stream, packedQ4Projection);
+    }
+
+    /// <summary>
+    /// Multi-token call of a CPU-expert layer with a GPU leg (#1202): experts <c>[0, split)</c> are streamed to the device
+    /// and run there in waves while the CPU leg computes <c>[split, E)</c>; then the CPU part is added and the next CPU
+    /// layer's first waves are prefetched. False when the layer should stay entirely on the CPU leg.
+    /// </summary>
+    private static bool TryRunHostLayerSplit(
+        nint hiddenF32, nint outputF32, int seqLen, CudaMoeLayerWeights weights,
+        DotLLM.Models.Architectures.MoeLayerWeights hostMoe, DotLLM.Models.Architectures.MoeLayerWeights? nextHostLayer,
+        CudaMoeScratch scratch, nint cublasHandle, CudaKernels kernels, nint stream, CudaMoeHostExperts hostExperts,
+        ReadOnlySpan<int> topkIdxHost, Action<nint, nint, nint, int, int, int, nint>? packedQ4Projection)
+    {
+        if (hostExperts.Stream is not { } gpu || !CanRunBucketed(seqLen, weights, kernels) || !kernels.HasMoeAddF16F32
+            || weights.Precision != MoePrecision.Quantized || !gpu.EnsureRing())
+            return false;
+
+        int E = weights.NumExperts, K = weights.NumExpertsPerTok, total = seqLen * K, hidden = weights.HiddenSize;
+        Span<int> all = stackalloc int[E + 1];
+        all.Clear();
+        foreach (int e in topkIdxHost[..total]) all[e + 1]++;
+        for (int e = 0; e < E; e++) all[e + 1] += all[e];
+        int split = gpu.PlanSplit(all, gpu.PrefetchedEnd(hostMoe));
+        if (split == 0)
+            return false;
+
+        // The CPU leg's inputs came down with the top-k ids.
+        bool cpuPart = all[E] > all[split];
+
+        int[] offsets = PrepareBuckets(hiddenF32, seqLen, weights, scratch, kernels, stream, topkIdxHost, split);
+        for (int begin = 0; begin < split; begin += gpu.WaveExperts)
+        {
+            int end = Math.Min(begin + gpu.WaveExperts, split);
+            int slot = gpu.BeginWave(hostMoe, begin, end, offsets, stream);
+            RunBucketedExperts(begin, end, gpu.Gate, gpu.Up, gpu.Down, offsets, weights, scratch, cublasHandle, kernels,
+                stream, packedQ4Projection);
+            gpu.EndWave(slot, stream);
+        }
+        kernels.LaunchMoeCombineBucketedF32(outputF32, scratch.DownBatch, scratch.TopkWeight,
+            scratch.TokenIndices + (nint)((long)total * sizeof(int)), seqLen, hidden, K, stream);
+        RunSharedExperts(hiddenF32, outputF32, seqLen, weights, scratch, cublasHandle, kernels, stream, packedQ4Projection);
+
+        if (cpuPart)
+        {
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            var rows = hostExperts.Compute(hostMoe, topkIdxHost, seqLen, split, out int assignments);
+            gpu.ObserveCpu(System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds, assignments);
+            gpu.AddCpuPart(rows, outputF32, kernels, stream);
+        }
+
+        // Keep the link busy through the next layer's attention: its first waves go now (at most the ring, at most
+        // this layer's GPU share).
+        if (nextHostLayer is not null)
+            gpu.Prefetch(nextHostLayer, split);
+        return true;
+    }
+
+    /// <summary>Test hook: false runs multi-token calls through the per-expert loop (the bucketed body's reference).</summary>
+    internal static bool BucketedEnabled { get; set; } = true;
+
+    /// <summary>
+    /// True when a multi-token call can run the bucketed expert body (<see cref="PrepareBuckets"/> +
+    /// <see cref="RunBucketedExperts"/> + one combine) instead of the per-expert loop with its per-expert host copies.
+    /// </summary>
+    private static bool CanRunBucketed(int seqLen, CudaMoeLayerWeights weights, CudaKernels kernels)
+        => seqLen > 1 && BucketedEnabled && kernels.HasMoeCombineBucketed && weights.NumExpertsPerTok <= CudaKernels.MoeCombineMaxTopK
+            && weights.Precision is MoePrecision.Quantized or MoePrecision.F32;
+
+    /// <summary>
+    /// Buckets the call's (token, slot) assignments by expert (ascending id, tokens in order), uploads the row-to-token
+    /// map and the assignment-to-row map in one copy, and gathers every assignment's input row into
+    /// <see cref="CudaMoeScratch.GatheredInput"/>. The stream must be idle on the scratch (the caller synchronised it
+    /// to read the top-k ids). Only experts below <c>expertLimit</c> get rows (the rest run on the CPU leg).
+    /// </summary>
+    /// <returns>Row offsets per expert, <c>[numExperts + 1]</c>: expert <c>e</c> owns rows <c>[offsets[e], offsets[e + 1])</c>.</returns>
+    private static unsafe int[] PrepareBuckets(nint hiddenF32, int seqLen, CudaMoeLayerWeights weights,
+        CudaMoeScratch scratch, CudaKernels kernels, nint stream, ReadOnlySpan<int> topkIdx, int expertLimit = int.MaxValue)
+    {
+        int E = weights.NumExperts, K = weights.NumExpertsPerTok, total = seqLen * K;
+        int limit = Math.Min(E, expertLimit);
+        var offsets = new int[E + 1];
+        foreach (int e in topkIdx[..total])
+            if ((uint)e < (uint)limit) offsets[e + 1]++;
+        for (int e = 0; e < E; e++) offsets[e + 1] += offsets[e];
+
+        // [rowToken (total) | assignmentRow (total)] in one upload; rows past offsets[E] stay unused.
+        int[] map = System.Buffers.ArrayPool<int>.Shared.Rent(2 * total);
+        try
+        {
+            Span<int> cursor = stackalloc int[E];
+            offsets.AsSpan(0, E).CopyTo(cursor);
+            for (int i = 0; i < total; i++)
+            {
+                int e = topkIdx[i];
+                if ((uint)e >= (uint)limit) { map[total + i] = -1; continue; }
+                int row = cursor[e]++;
+                map[row] = i / K;
+                map[total + i] = row;
+            }
+            fixed (int* mp = map)
+                CudaDriverApi.cuMemcpyHtoD_v2(scratch.TokenIndices, (nint)mp, (nuint)(2L * total * sizeof(int))).ThrowOnError();
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<int>.Shared.Return(map);
+        }
+
+        kernels.LaunchMoeGatherTokenRowsF32(hiddenF32, scratch.GatheredInput, scratch.TokenIndices, offsets[E],
+            weights.HiddenSize, stream);
+        return offsets;
+    }
+
+    /// <summary>
+    /// Runs experts <c>[eBegin, eEnd)</c> of the bucketed body: gate / up per expert on its rows of
+    /// <see cref="CudaMoeScratch.GatheredInput"/>, one SwiGLU over the range's rows, down per expert into
+    /// <see cref="CudaMoeScratch.DownBatch"/>. The per-expert math is the per-expert loop's, so the rows are identical.
+    /// </summary>
+    /// <param name="eBegin">First expert id.</param>
+    /// <param name="eEnd">One past the last expert id.</param>
+    /// <param name="gate">Gate weights indexed by expert id (device pointers; only the range is read).</param>
+    /// <param name="up">Up weights indexed by expert id.</param>
+    /// <param name="down">Down weights indexed by expert id.</param>
+    /// <param name="offsets">Row offsets from <see cref="PrepareBuckets"/>.</param>
+    /// <param name="weights">Layer weights (dims, quant types, biases).</param>
+    /// <param name="scratch">Scratch.</param>
+    /// <param name="cublasHandle">cuBLAS handle.</param>
+    /// <param name="kernels">Kernels.</param>
+    /// <param name="stream">Stream.</param>
+    /// <param name="packedQ4Projection">Packed Q4_0 projection (LFM2), or null.</param>
+    private static void RunBucketedExperts(int eBegin, int eEnd, ReadOnlySpan<nint> gate, ReadOnlySpan<nint> up,
+        ReadOnlySpan<nint> down, int[] offsets, CudaMoeLayerWeights weights, CudaMoeScratch scratch, nint cublasHandle,
+        CudaKernels kernels, nint stream, Action<nint, nint, nint, int, int, int, nint>? packedQ4Projection)
+    {
+        int hidden = weights.HiddenSize, I = weights.MoeIntermediateSize;
+        int rowBegin = offsets[eBegin], rows = offsets[eEnd] - rowBegin;
+        if (rows == 0) return;
+        long iBytes = (long)I * sizeof(float), hBytes = (long)hidden * sizeof(float);
+
+        for (int e = eBegin; e < eEnd; e++)
+        {
+            int start = offsets[e], batch = offsets[e + 1] - start;
+            if (batch == 0) continue;
+            nint x = scratch.GatheredInput + (nint)(start * hBytes);
+            ProjectF32OrQuant(weights.Precision, cublasHandle, kernels, stream, x, batch, K: hidden, M: I,
+                weightF32: gate[e], weightQuant: gate[e], weightQt: weights.GateProjQuantType,
+                dequantF16: scratch.DequantF16, dequantF32: scratch.DequantF32,
+                gemvInputF16: scratch.GemvInputF16, gemvOutputF16: scratch.GemvOutputF16,
+                outputF32: scratch.GateBatch + (nint)(start * iBytes), packedQ4Projection: packedQ4Projection);
+            if (weights.GateExpsBiasF32 != 0)
+                kernels.LaunchMoeGateBiasAddF32(scratch.GateBatch + (nint)(start * iBytes),
+                    weights.GateExpsBiasF32 + (nint)(e * iBytes), seqLen: batch, numExperts: I, stream);
+            ProjectF32OrQuant(weights.Precision, cublasHandle, kernels, stream, x, batch, K: hidden, M: I,
+                weightF32: up[e], weightQuant: up[e], weightQt: weights.UpProjQuantType,
+                dequantF16: scratch.DequantF16, dequantF32: scratch.DequantF32,
+                gemvInputF16: scratch.GemvInputF16, gemvOutputF16: scratch.GemvOutputF16,
+                outputF32: scratch.UpBatch + (nint)(start * iBytes), packedQ4Projection: packedQ4Projection);
+            if (weights.UpExpsBiasF32 != 0)
+                kernels.LaunchMoeGateBiasAddF32(scratch.UpBatch + (nint)(start * iBytes),
+                    weights.UpExpsBiasF32 + (nint)(e * iBytes), seqLen: batch, numExperts: I, stream);
+        }
+
+        nint g = scratch.GateBatch + (nint)(rowBegin * iBytes), u = scratch.UpBatch + (nint)(rowBegin * iBytes);
+        nint silu = scratch.SiluBatch + (nint)(rowBegin * iBytes);
+        if (weights.UseSwiGluOai)
+        {
+            if (!kernels.HasSwiGluOai)
+                throw new InvalidOperationException(
+                    "MoE layer requires the gpt-oss clamped SwiGLU activation but swiglu_oai_f32 is not available. " +
+                    "Recompile native/kernels/moe_ffn.cu to PTX.");
+            kernels.LaunchSwiGLUOaiF32(g, u, silu, I, rows,
+                DotLLM.Cpu.Kernels.MoeQuantSwiGluMlp.SwiGluOaiAlpha, DotLLM.Cpu.Kernels.MoeQuantSwiGluMlp.SwiGluOaiLimit, stream);
+        }
+        else
+        {
+            kernels.LaunchSwiGLUF32(g, u, silu, I, rows, stream);
+        }
+
+        // Same F16 block-sum guard as the per-expert loop (packed Q4_0 x Q8_1 down projection); it is per row, so one
+        // launch covers the range.
+        bool downRescale = packedQ4Projection is not null && weights.Precision == MoePrecision.Quantized
+            && weights.DownProjQuantType == QuantizationType.Q4_0;
+        nint rowScale = scratch.DownRowScale + (nint)((long)rowBegin * sizeof(float));
+        if (downRescale)
+            kernels.LaunchMoePow2RescaleRows(silu, rowScale, rows, I, stream);
+        for (int e = eBegin; e < eEnd; e++)
+        {
+            int start = offsets[e], batch = offsets[e + 1] - start;
+            if (batch == 0) continue;
+            nint y = scratch.DownBatch + (nint)(start * hBytes);
+            ProjectF32OrQuant(weights.Precision, cublasHandle, kernels, stream,
+                scratch.SiluBatch + (nint)(start * iBytes), batch, K: I, M: hidden,
+                weightF32: down[e], weightQuant: down[e], weightQt: weights.DownProjQuantType,
+                dequantF16: scratch.DequantF16, dequantF32: scratch.DequantF32,
+                gemvInputF16: scratch.GemvInputF16, gemvOutputF16: scratch.GemvOutputF16,
+                outputF32: y, packedQ4Projection: packedQ4Projection);
+            if (weights.DownExpsBiasF32 != 0)
+                kernels.LaunchMoeGateBiasAddF32(y, weights.DownExpsBiasF32 + (nint)(e * hBytes),
+                    seqLen: batch, numExperts: hidden, stream);
+        }
+        if (downRescale)
+            kernels.LaunchMoeScaleRows(scratch.DownBatch + (nint)(rowBegin * hBytes), rowScale, rows, hidden, stream);
     }
 
     /// <summary>Adds the layer's shared expert(s) (DeepSeek / Qwen1.5-MoE / Flint) to <paramref name="outputF32"/>.</summary>
@@ -1058,6 +1275,7 @@ public sealed unsafe class CudaMoeScratch : IDisposable
     private nint _groupedGateF16;     // [K_active_max, I_max] halfs
     private nint _groupedUpF16;       // [K_active_max, I_max] halfs
     private nint _groupedPtrArrays;   // 4 × K_active_max nints (8 bytes each)
+    private nint _hostTopkIdx;        // pinned host [maxBatch] int32
     private long _groupedActiveMax;   // K_active_max actually allocated for
     private long _groupedIMax;        // I_max actually allocated for
 
@@ -1090,6 +1308,9 @@ public sealed unsafe class CudaMoeScratch : IDisposable
     internal nint GroupedGateF16 => _groupedGateF16;
     internal nint GroupedUpF16 => _groupedUpF16;
     internal nint GroupedPtrArrays => _groupedPtrArrays;
+
+    /// <summary>Pinned host copy of the top-k ids <c>[seqLen * topK]</c> (async read-back, #1202).</summary>
+    internal nint HostTopkIdx => _hostTopkIdx;
     internal long GroupedActiveMax => _groupedActiveMax;
     internal long GroupedIMax => _groupedIMax;
 
@@ -1124,7 +1345,8 @@ public sealed unsafe class CudaMoeScratch : IDisposable
         _logits = AllocF32((long)newCap * _capE);
         _topkIdx = AllocInt32(maxBatch);
         _topkWeight = AllocF32(maxBatch);
-        _tokenIndices = AllocInt32(maxBatch);
+        _tokenIndices = AllocInt32(2 * maxBatch);
+        CudaDriverApi.cuMemHostAlloc(out _hostTopkIdx, (nuint)(maxBatch * sizeof(int)), 0).ThrowOnError();   // [row token | assignment row] for the bucketed body
         _singleTokenScratch = AllocInt32(1);
         _gatheredInput = AllocF32(maxBatch * _capHidden);
         _gateBatch = AllocF32(maxBatch * _capI);
@@ -1249,6 +1471,7 @@ public sealed unsafe class CudaMoeScratch : IDisposable
         FreeIf(ref _gemvInputF16); FreeIf(ref _gemvOutputF16);
         FreeIf(ref _groupedGateF16); FreeIf(ref _groupedUpF16);
         FreeIf(ref _groupedPtrArrays);
+        if (_hostTopkIdx != 0) { CudaDriverApi.cuMemFreeHost(_hostTopkIdx); _hostTopkIdx = 0; }
         _dequantElems = 0;
         _gemvKMax = 0; _gemvMMax = 0;
         _groupedActiveMax = 0; _groupedIMax = 0;

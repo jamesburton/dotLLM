@@ -108,22 +108,55 @@ Expected outcomes, still to be measured: T5500 (PCIe 2.0 x16, pre-AVX Xeons) is 
 
 MoE models that load through the plain `CudaTransformerModel` (Recursive Flint, DeepSeek-V2, Qwen-MoE, ...) honour
 `--cpu-moe`, `--n-cpu-moe N` and `--moe-offload` too. There is no VRAM expert cache on this host yet: a layer's routed
-experts are either all resident or all on the CPU.
+experts are either all resident or all on the CPU for decode; multi-token calls stream part of them to the GPU (#1202, below).
 
 - **Placement.** Layers whose index is below N keep their routed experts on the CPU (`--cpu-moe` = every MoE layer,
   `--moe-offload on` = the same). Their router, shared expert and biases are still uploaded; the routed banks are not.
 - **Auto.** With `--moe-offload auto` (the default) and no explicit N, a model whose weights do not fit picks the smallest
   N that leaves free VRAM for `ReserveMib` (default 1024 MiB on this host) plus an F16 KV cache of `--ctx-size` tokens
-  (default 4096). The load log says what it chose, for example
-  `MoE experts on CPU: 32 layer(s) (--n-cpu-moe 34), 15360 MiB read from the mmap'd GGUF, 7 CPU thread(s); 9423 MiB device weights.`.
+  (default 4096), plus the GPU leg's expert ring and its margin (376 MiB for Flint) once some experts go to the CPU
+  anyway. The load log says what it chose, for example
+  `MoE experts on CPU: 32 layer(s) (--n-cpu-moe 34), 15360 MiB read from the mmap'd GGUF, 15 CPU thread(s); 9423 MiB device weights.`.
   `auto` never moves the experts of a model with per-expert biases or `swiglu_oai` (gpt-oss): the CPU leg cannot run them,
   and an explicit `--cpu-moe` on such a model is refused.
-- **The CPU leg** (`CudaMoeHostExperts`). Routing and top-k stay on the device. After the existing top-k read-back, the
-  F32 expert input and the top-k weights (`seqLen x (hidden + topK)` floats) are read back; the CPU model's own kernels
-  (`MoeSwiGluMlp.ExecuteRoutedFromAssignments`, Q8_1 activations, `--moe-cpu-threads` threads) compute the routed sum
-  **straight from the memory-mapped GGUF**; the sum (`seqLen x hidden` floats) is copied up and added. The device shared
+- **The CPU leg** (`CudaMoeHostExperts`). Routing and top-k stay on the device. The top-k ids, the top-k weights and the
+  F32 expert input (`seqLen x (hidden + 2 topK)` values) come back in one round trip: async copies into pinned memory and
+  one stream sync (#1202; each synchronous copy cost a link round trip on the eGPU). The CPU model's own kernels
+  (`MoeSwiGluMlp.ExecuteRoutedFromAssignments`, Q8_1 activations) compute the routed sum **straight from the
+  memory-mapped GGUF**, and the sum (`seqLen x hidden` floats) is queued back asynchronously and added. The device shared
   expert is queued before the CPU leg starts, so the two overlap; `shared + routed` is one addition per element, so the
   order matches the resident path.
+- **CPU leg threads.** `--moe-cpu-threads`, else physical cores - 1 from the detected topology (#1202: the old default
+  halved the logical count, assuming SMT, which gave 7 threads on a 16-core Core Ultra 7 155H; 12-15 decode 20-40 % faster
+  there). The n=1 decode dispatch hands out rows in small claims instead of a fixed 1/N slice, so a slower E-core or a
+  preempted thread no longer holds up every dispatch.
+- **The GPU leg for multi-token calls** (`CudaMoeExpertStream`, #1202). A prefill chunk routes to nearly every expert, and
+  the CPU computing all of them was 22 of 25 s at pp512. Like llama.cpp's op offload for large batches, the experts of a
+  CPU layer are copied to the GPU and run there, but split with the CPU so that both legs finish together:
+  - experts `[0, split)` are copied into a VRAM ring of 8 slots x 8 experts (120 MiB for Flint) and run in waves by the
+    same bucketed expert body as resident layers (below); experts `[split, E)` run on the CPU leg at the same time. The
+    split minimises `max(link time of the GPU experts with rows, CPU time of the CPU assignments)` with the link rate
+    measured once (2.25 GB/s on the 3060 eGPU) and an EMA of the CPU leg's ms per assignment;
+  - the next CPU layer's first waves are copied ahead of its routing, so the link keeps working through its attention;
+  - **no second copy of the weights**: the expert banks' mmap'd pages are page-locked in place (`cuMemHostRegister`,
+    read-only) and DMA'd straight from the OS page cache, so the copies are asynchronous with no pinned or staged host
+    copy (rule 3: the page cache is the source; a cold file is read once by the page-in, then every prefill chunk sends
+    1.875 MiB per Flint expert over the link, ~0.83 ms at 2.25 GB/s; the first DMA of each page also pays for locking it,
+    so the first prefill after load is slower);
+  - the ring is admitted against free VRAM (with 256 MiB to spare, WDDM spills silently instead of failing) on the first
+    multi-token call, and auto placement reserves it. Without room, or when page-locking fails, prefill keeps the CPU
+    leg (logged). `DOTLLM_CUDA_MOE_STREAM=0` turns the GPU leg off;
+  - the CPU part's routed sum is uploaded as F16, divided by a power of two when its max |x| exceeds 16384 (Flint's MoE
+    output reaches 3.3e4, #1191) and multiplied back on the device;
+  - decode (one token, 6 experts) stays on the CPU leg: 11 MiB of experts per layer would take 5 ms on the link.
+- **Bucketed multi-token expert body** (#1202, every MoE model on this host, resident or streamed). A multi-token call
+  buckets its assignments by expert once on the host, uploads the row maps in one copy, gathers all rows in one launch,
+  runs gate / up / down per expert on its row range, one SwiGLU per range and one combine kernel that sums each token's
+  rows in ascending expert order. The per-expert loop it replaces made one synchronous host copy per expert and one per
+  row of mixed-slot buckets (365 ms per Flint layer at 512 tokens, now 27 ms); the results are bit-identical.
+- **Routing top-k** (#1202): `moe_sigmoid_topk_f32` / `moe_softmax_topk_f32` picked the top-k on one thread with a
+  "claimed" inner loop, 210 us per token for 256 experts / top-6 on the 3060 (10 ms per decoded Flint token across 47
+  layers). They now run k rounds of a block-wide arg-max with the same tie rule (lower index wins), a few microseconds.
 - **No second copy of the weights** (#1156). Unlike the Nemotron-H host store above, nothing is pinned or copied: the
   CPU reads the OS page cache's pages of the file, which every process mapping the file shares. Only activations cross
   the link.
@@ -142,8 +175,7 @@ experts are either all resident or all on the CPU.
 - On WDDM, dotLLM's device allocations count 1:1 in its private bytes, so the host column subtracts VRAM. It does not
   grow with the 15-22 GiB of experts on the CPU: those are file-backed mmap pages, not private memory.
 - Decode varies run to run on this hybrid P/E-core CPU (the CPU leg is 1.2-3 ms per layer); `--moe-cpu-threads 12` was
-  the best of 4 / 7 / 12. The CPU leg is the whole prefill cost (22 of 25 s at pp512): llama.cpp copies the experts to the
-  GPU for large batches instead, which is the follow-up (a prefill streaming path / VRAM expert cache on this host).
+  the best of 4 / 7 / 12. The CPU leg was the whole prefill cost (22 of 25 s at pp512) until the GPU leg (#1202).
 - Quality vs the dotLLM CPU model (teacher-forced on the CUDA greedy ids, 5 F1 chat prompts x 32 tokens): top-1 157/160
   in both placements, KL(cpu || cuda) mean 1.5e-3 (auto) / 2.0e-3 (`--cpu-moe`), max 2.9e-2 / 1.05e-1. The CPU-expert
   share does not move it: the gap is the FP16 residual loop of the non-expert layers (#1172 measured 1.4e-3 on 8 layers).
@@ -192,7 +224,13 @@ Hits and misses count one lookup per expert per layer call: a prefill block that
 
 `CudaFlintCpuMoeTests` (#1187, local RTX 3060) runs the synthetic Flint GGUF with `--cpu-moe`, `--n-cpu-moe 4` (a split
 across MoE layers 2-3 / 4-5) and `--moe-offload on` against the CPU model, prefill plus 6 KV-cache decode steps, checks
-that each decode token computes exactly `topK` experts per CPU layer, and unit-tests the auto placement.
+that each decode token computes exactly `topK` experts per CPU layer, and unit-tests the auto placement. Each placement
+runs with the prefill GPU leg (#1202) off, on with its cost model, and forced to split every CPU layer half / half in waves
+of two experts (several waves per layer, ring slots reused across layers, the next layer prefetched, a CPU part; once
+more with the CPU part's power-of-two F16 scale forced on). `PlanSplit_BalancesLinkAgainstCpu` unit-tests the split.
+`CudaMoeFfnTests.MoeFfn_MultiToken_MixedSlots_BucketedMatchesLoopAndCpuOracle` checks the bucketed body bit-for-bit
+against the per-expert loop (24 tokens, top-3 of 8, gated shared expert) and `CudaQ4_1KernelTests.SigmoidTopk_*` the
+parallel top-k's tie rule within and across warps.
 
 The Nemotron-H GPU tests run on T5500.
 

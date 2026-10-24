@@ -1314,6 +1314,7 @@ from the mmap'd file (`--cpu-moe` / `--n-cpu-moe`, or automatically; see `docs/M
 
 **Known gaps** (follow-ups on #1157): the CUDA KV cache is full-length on every layer (no sliding-window ring, #1184); the F32
 `token_embd` is uploaded as F32 instead of gathered from the mmap (#1183); decode MoE routing syncs to the host once per layer
-(no device-side routing, so no graph capture, #1182); the FP16 residual stream is verified on 8 real layers only; the
+(no device-side routing, so no graph capture, #1182; the CPU-expert layers' prefill runs partly on the GPU since #1202,
+see `docs/MOE_OFFLOAD.md`); the FP16 residual stream is verified on 8 real layers only; the
 per-projection `DequantScratch` (F16 + F32, 72 MiB at Flint's 6144x2048) is still allocated though no Q4_1 path uses it (#1183);
 NVFP4 grouped experts with the per-expert `_exps.scale` are not implemented (#1179).

@@ -53,12 +53,29 @@ public sealed class CudaFlintCpuMoeTests : IDisposable
         try { File.Delete(_path); } catch { /* best effort */ }
     }
 
-    /// <summary>Placements: every MoE layer on the CPU, a split (layers 2-3 CPU, 4-5 device), and <c>--moe-offload on</c>.</summary>
-    public static TheoryData<string> Placements => new() { "cpu-moe", "n-cpu-moe-4", "offload-on" };
+    /// <summary>
+    /// Placements: every MoE layer on the CPU, a split (layers 2-3 CPU, 4-5 device), and <c>--moe-offload on</c>; each with
+    /// the prefill GPU leg (#1202) off, on with its cost model, and forced to split every CPU layer half / half in waves of
+    /// two experts (several waves per layer, ring slots reused across layers, the next layer prefetched, a CPU part).
+    /// </summary>
+    public static TheoryData<string, string> Placements
+    {
+        get
+        {
+            var data = new TheoryData<string, string>();
+            foreach (string p in new[] { "cpu-moe", "n-cpu-moe-4", "offload-on" })
+                foreach (string stream in new[] { "stream-off", "stream-auto", "stream-split" })
+                    data.Add(p, stream);
+
+            // The CPU part's F16 upload with its power-of-two scale (forced: these logits never reach the real limit).
+            data.Add("cpu-moe", "stream-split-scaled");
+            return data;
+        }
+    }
 
     [SkippableTheory]
     [MemberData(nameof(Placements))]
-    public void CpuExpertLayers_MatchCpuModel_PrefillAndDecode(string placement)
+    public void CpuExpertLayers_MatchCpuModel_PrefillAndDecode(string placement, string stream)
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
         using var gguf = GgufFile.Open(_path);
@@ -78,11 +95,31 @@ public sealed class CudaFlintCpuMoeTests : IDisposable
         };
         int expectedCpuLayers = placement == "n-cpu-moe-4" ? 2 : 4;
 
-        List<float[]> offloaded = RunCuda(gguf, cfg, options, expectedCpuLayers);
+        List<float[]> offloaded;
+        bool streamWas = CudaTransformerModel.StreamCpuExperts;
+        try
+        {
+            CudaTransformerModel.StreamCpuExperts = stream != "stream-off";
+            if (stream.StartsWith("stream-split", StringComparison.Ordinal))
+            {
+                CudaMoeExpertStream.TestWaveExperts = 2;
+                CudaMoeExpertStream.TestSplit = experts => experts / 2;
+            }
+            if (stream == "stream-split-scaled")
+                CudaMoeExpertStream.CpuPartF16Limit = 1e-3f;
+            offloaded = RunCuda(gguf, cfg, options, expectedCpuLayers, stream);
+        }
+        finally
+        {
+            CudaTransformerModel.StreamCpuExperts = streamWas;
+            CudaMoeExpertStream.TestWaveExperts = null;
+            CudaMoeExpertStream.TestSplit = null;
+            CudaMoeExpertStream.CpuPartF16Limit = 16384f;
+        }
         for (int r = 0; r < offloaded.Count; r++)
         {
             int at = PrefillTokens - 1 + r;
-            string what = $"{placement} {(r == 0 ? "prefill" : "decode")}@{at}";
+            string what = $"{placement} {stream} {(r == 0 ? "prefill" : "decode")}@{at}";
             _out.WriteLine($"{what,-28} resident vs CPU model {MaxAbs(cpu.AsSpan(at * vocab, vocab), resident[r]):E3}, "
                 + $"vs CPU experts {MaxAbs(resident[r], offloaded[r]):E3}");
             AssertMatch(what, cpu.AsSpan(at * vocab, vocab).ToArray(), offloaded[r]);
@@ -90,7 +127,8 @@ public sealed class CudaFlintCpuMoeTests : IDisposable
     }
 
     /// <summary>Prefill of <see cref="PrefillTokens"/> then one-token decodes; returns the last row of each call.</summary>
-    private static List<float[]> RunCuda(GgufFile gguf, ModelConfig cfg, MoeOffloadOptions options, int? expectedCpuLayers)
+    private static List<float[]> RunCuda(GgufFile gguf, ModelConfig cfg, MoeOffloadOptions options, int? expectedCpuLayers,
+        string stream = "stream-off")
     {
         var rows = new List<float[]>();
         var (model, kvFactory) = CudaModelLoader.CreateFromGguf(gguf, cfg, deviceId: 0, moeOffload: options);
@@ -102,15 +140,22 @@ public sealed class CudaFlintCpuMoeTests : IDisposable
             int[] pos = Enumerable.Range(0, Ids.Length).ToArray();
             using (ITensor p = cuda.Forward(Ids.AsSpan(0, PrefillTokens), pos.AsSpan(0, PrefillTokens), deviceId: -1, kv))
                 rows.Add(Copy(p));
-            Assert.Equal(expectedCpuLayers is not null, cuda.CpuMoeExpertsComputed > 0);
+            // Prefill: the CPU layers' experts ran on the CPU leg, the GPU leg, or (forced split) both.
+            Assert.Equal(expectedCpuLayers is not null, cuda.CpuMoeExpertsComputed + cuda.CpuMoeExpertsStreamed > 0);
+            if (expectedCpuLayers is not null && stream == "stream-off")
+                Assert.Equal(0, cuda.CpuMoeExpertsStreamed);
+            if (expectedCpuLayers is not null && stream.StartsWith("stream-split", StringComparison.Ordinal))
+                Assert.True(cuda.CpuMoeExpertsComputed > 0 && cuda.CpuMoeExpertsStreamed > 0, "both legs must run");
+            long streamedAfterPrefill = cuda.CpuMoeExpertsStreamed;
             for (int i = PrefillTokens; i < Ids.Length; i++)
             {
                 long before = cuda.CpuMoeExpertsComputed;
                 using ITensor d = cuda.Forward(Ids.AsSpan(i, 1), pos.AsSpan(i, 1), deviceId: -1, kv);
                 rows.Add(Copy(d));
 
-                // One decode token routes TopK distinct experts in each CPU layer.
+                // One decode token routes TopK distinct experts in each CPU layer, all on the CPU leg.
                 Assert.Equal((expectedCpuLayers ?? 0) * SyntheticFlintGguf.TopK, cuda.CpuMoeExpertsComputed - before);
+                Assert.Equal(streamedAfterPrefill, cuda.CpuMoeExpertsStreamed);
             }
         }
         return rows;
@@ -141,6 +186,26 @@ public sealed class CudaFlintCpuMoeTests : IDisposable
         // Even every expert on the CPU does not fit; auto still moves all of them. Not eligible: auto never moves any.
         Assert.Equal(MoeOffloadOptions.AllLayers, CudaTransformerModel.PlanCpuMoeLayers(auto, routed, true, 500, 50, 50));
         Assert.Equal(0, CudaTransformerModel.PlanCpuMoeLayers(auto, routed, false, 500, 50, 50));
+    }
+
+    [Fact]
+    public void PlanSplit_BalancesLinkAgainstCpu()
+    {
+        // 4 experts with 1, 1, 10, 10 assignments.
+        int[] offsets = [0, 1, 2, 12, 22];
+
+        // Free link: everything on the GPU. Free CPU: nothing on the GPU.
+        Assert.Equal(4, CudaMoeExpertStream.PlanSplit(offsets, 4, 0, expertMs: 0.001, cpuMsPerAssignment: 1));
+        Assert.Equal(0, CudaMoeExpertStream.PlanSplit(offsets, 4, 0, expertMs: 1, cpuMsPerAssignment: 0.001));
+
+        // 1 ms per expert vs 0.1 ms per assignment: split 3 costs max(3, 1.0) = 3, split 2 max(2, 2.0) = 2, split 1
+        // max(1, 2.1) = 2.1. Prefetched experts stay on the GPU even when that costs more.
+        Assert.Equal(2, CudaMoeExpertStream.PlanSplit(offsets, 4, 0, expertMs: 1, cpuMsPerAssignment: 0.1));
+        Assert.Equal(3, CudaMoeExpertStream.PlanSplit(offsets, 4, 3, expertMs: 1, cpuMsPerAssignment: 0.1));
+
+        // Experts without rows cost no link time.
+        int[] sparse = [0, 0, 0, 10, 10];
+        Assert.Equal(3, CudaMoeExpertStream.PlanSplit(sparse, 4, 0, expertMs: 1, cpuMsPerAssignment: 1));
     }
 
     private void AssertMatch(string what, float[] cpu, float[] offloaded)

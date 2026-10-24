@@ -127,6 +127,7 @@ public sealed unsafe class CudaQ4_1KernelTests
         const int tokens = 3, experts = 256, topK = 6;
         var logits = RandomActivations(tokens, experts, seed: 4242, scale: 2f);
         logits[experts + 17] = logits[experts + 18] = 9f;   // exact tie: index 17 must win the first slot of token 1
+        logits[2 * experts + 230] = logits[2 * experts + 30] = 9f;   // tie across warps (the parallel arg-max): 30 then 230
         nint dL = g.UploadFloat(logits), dIdx = g.Alloc(tokens * topK * 4), dW = g.Alloc(tokens * topK * 4);
         g.K.LaunchMoeSigmoidTopk(dL, dIdx, dW, tokens, experts, topK, normalize: true, g.S.Handle);
         g.S.Synchronize();
@@ -155,6 +156,8 @@ public sealed unsafe class CudaQ4_1KernelTests
         }
         Assert.Equal(17, idx[topK]);
         Assert.Equal(18, idx[topK + 1]);
+        Assert.Equal(30, idx[2 * topK]);
+        Assert.Equal(230, idx[2 * topK + 1]);
     }
 
     /// <summary>
