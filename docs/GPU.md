@@ -418,6 +418,54 @@ See [CUDA.md](CUDA.md) for detailed prerequisites and build instructions.
 - **Decode**: 3–10× over CPU (bandwidth-bound, HBM advantage)
 - **Target**: >50 tok/s decode on consumer GPU (RTX 3090/4090) with 7B model
 
+### Recursive Flint on the Strix 8060S (Vulkan, #1161)
+
+Official Q4_1 file (39.8B MoE, 2.5B active), chunk / ubatch 512, F16 KV with the #1176 sliding-window ring. Measured interleaved
+with llama.cpp master Vulkan (`0ae0e1976`, `llama-bench -ngl 99 -fa 1`) in one session; two rounds, warm (the first round of each
+engine runs slower).
+
+| | dotLLM before (#1200) | dotLLM after | llama.cpp |
+|---|---|---|---|
+| pp512 | 1,004-1,239 | **1,588-1,994** | 1,560-1,623 |
+| pp8K | 981 | **1,455-1,768** | 1,304-1,385 |
+| pp32K | 620 | **1,138-1,206** | 936-938 |
+| decode @ 0.5K | 70-72 | **81-90** | 71.6-73.7 |
+| decode @ 8K | 54 | **72-77** | 63.5-65.4 |
+| decode @ 32K | 28.2 | **55.8-60.0** | 52.0-52.8 |
+| device weights + scratch | 25,001 MiB | **23,828 MiB** | 23,611 model + 343 compute (+ 1,173 host) |
+| private working set | 25.5-26.7 GiB | 24.4-25.1 GiB | 24.1 GiB (`-lm mmap`) / 25.2 GiB (`-lm none`) |
+
+What moved the numbers (each step bit-identical or gated against the CPU model on the five F4 streams):
+
+- **Split-KV decode v2** (`attention_f32_splitkv_gqa_v2`, head_dim <= 128): 16 lanes per KV position with 16-byte F16 loads,
+  all of a tile's loads in flight, and the KV heads interleaved across consecutive workgroups. A cache row holds every KV head's
+  columns; ordering workgroups one head's slice of many rows at a time ran at ~90 GB/s, neighbouring slices of the same rows at
+  ~190-200 GB/s. The same interleave measured nothing on the flash prefill (its tiles are reused by 64 query rows). At least 64
+  positions per split (`ComputeGqa2Splits`).
+- **Grouped Q4_1 MoE v2** (`moe_grouped_q4_1_{gateup,down}_v2`): a permutation instead of the topK broadcast + grouped copy, gate
+  and up in one pass with SwiGLU on the accumulators, 64-row work items so an expert's weights are read once per 64 rows, two Q4_1
+  blocks per staging round, and the down pass writing straight to the (token, slot) rows with the power-of-two row scale in its
+  epilogue. Kernel bench at Flint's routed shapes: gate+up 163 -> 189 GB/s, down 167 -> 174 GB/s.
+- **head_dim <= 128 twin of the GQA coopmat flash prefill**: the shared body sized its Q / O fragment arrays and K/V tile for 256.
+  Attention at the 8K chunk 236 -> 72 ms.
+- **64x64 Q4_1 GEMM twin** below 32 128x128 tiles (k / v at n = 512).
+- **Decode fusions**: Q4_0 / Q4_1 join the shared-quantize MMVQ groups, a residual-fused Q4 MMVQ for o_proj / dense down, and
+  (Flint only for now) the shared expert scheduled inside the routed expert's barrier intervals with one combine + residual kernel:
+  1,733 -> 1,202 dispatches and 1,701 -> 835 barriers per token.
+- **Token table on the host**: an F32 `token_embd` of 256 MiB or more stays in the mapping; the forward copies the token rows
+  (`DOTLLM_VK_EMBED_HOST=0/1`). Flint saves 1,173 MiB of device memory.
+
+A/B switches: `DOTLLM_VULKAN_SPLITKV_GQA2=0`, `DOTLLM_VK_MOE_Q4_1_V2=0`, `DOTLLM_VULKAN_FA_GQA_HD128=0`, `DOTLLM_VK_Q4_GEMM_SMALL=0`,
+`DOTLLM_VK_MOE_DECODE_FUSED=0`, `DOTLLM_VK_EMBED_HOST=0`. `DOTLLM_VULKAN_PREFILL_PROFILE=gpu` times prefill buckets (and every noted
+matmul) with GPU timestamps instead of submit splits; it serialises dispatches that would otherwise overlap, so read it per kernel.
+
+Accuracy at depth: against the dotLLM CPU model on the 8K `agent32k` prefix, every Vulkan variant (default, Q hi/lo split, F32 KV,
+the reference sink kernel, the build before these changes) disagrees per row at KL ~0.4-1 (top-1 ~70 %), and two Vulkan runs that
+differ only in KV precision disagree with each other by KL 0.42. The negative log-likelihood of the true next tokens is the same
+for all of them (CPU 5.31, Vulkan 5.13-5.23 over the last 128 prompt rows). The model is that sensitive at depth on this text, so a
+per-row KL bound is not a usable gate past a few thousand tokens; use NLL / perplexity there. At short context the F4 gate holds
+(KL mean 1.69e-3, top-1 99.4 % over 507 steps).
+
 ## Hybrid CPU/GPU Inference
 
 When a model doesn't fully fit in VRAM, hybrid mode runs part of the model on GPU and the rest on CPU. The `--gpu-layers N` option specifies how many transformer layers execute on GPU (bottom layers), with the remainder on CPU (top layers). The embedding lookup runs on GPU, while the final RMSNorm and LM head run on CPU. This matches llama.cpp's `--n-gpu-layers` convention.
