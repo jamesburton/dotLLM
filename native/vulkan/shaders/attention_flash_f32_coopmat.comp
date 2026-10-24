@@ -1,0 +1,5 @@
+#version 450
+// KHR_cooperative_matrix variant of attention_flash_f32.comp (issue #149).
+// Body: attention_flash_f32_coopmat.glsl (issue #1102 split it out so the F32 and F16-KV pipelines share one source).
+#extension GL_GOOGLE_include_directive : require
+#include "attention_flash_f32_coopmat.glsl"

@@ -11,6 +11,10 @@ public sealed class JinjaChatTemplate : IChatTemplate
     private readonly JinjaTemplate _ast;
     private readonly string _bosToken;
     private readonly string _eosToken;
+    private readonly bool _aliasXmlTools;
+
+    private static readonly System.Text.RegularExpressions.Regex GenerationTag = new(
+        @"\{%(-?)\s*(?:end)?generation\s*(-?)%\}", System.Text.RegularExpressions.RegexOptions.Compiled);
 
     /// <summary>
     /// Creates a new Jinja2 chat template.
@@ -23,11 +27,41 @@ public sealed class JinjaChatTemplate : IChatTemplate
         _bosToken = bosToken;
         _eosToken = eosToken;
 
+        // Jinja2's default is keep_trailing_newline=False: ONE trailing newline of the template source is
+        // dropped (HF transformers and llama.cpp's minja both do this). Llama-3.x's template ends
+        // "{%- endif %}\n", so without this every prompt ended "<|start_header_id|>assistant<|end_header_id|>\n\n\n"
+        // — an extra blank line the model never saw in training (found while diagnosing #771).
+        if (templateSource.EndsWith("\r\n", StringComparison.Ordinal))
+            templateSource = templateSource[..^2];
+        else if (templateSource.EndsWith('\n'))
+            templateSource = templateSource[..^1];
+
+        // HF's `{% generation %}` / `{% endgeneration %}` mark the span an assistant-token mask covers (training
+        // only); at render time they emit nothing. SmolLM3's template wraps every assistant turn in them, the
+        // parser rejected the unknown statement keyword, and the server then fell back to the plain transcript
+        // template: no tools, no /think switch, the wrong chat format (#797). Rewritten as comments, which keep
+        // the `-` whitespace-control markers and emit nothing, exactly like minja's no-op treatment.
+        templateSource = GenerationTag.Replace(templateSource, m => "{#" + m.Groups[1].Value + " generation " + m.Groups[2].Value + "#}");
+
+        // SmolLM3 reads its tool list from `xml_tools` / `python_tools` and never from `tools`.
+        _aliasXmlTools = templateSource.Contains("xml_tools", StringComparison.Ordinal)
+            && !templateSource.Contains("tools is defined", StringComparison.Ordinal)
+            && !templateSource.Contains("if tools", StringComparison.Ordinal);
+
+        TemplateSource = templateSource;
+        ReasoningMarkup = Reasoning.ReasoningMarkups.Detect(templateSource);
+
         var lexer = new JinjaLexer(templateSource);
         var tokens = lexer.Tokenize();
         var parser = new JinjaParser(tokens);
         _ast = parser.Parse();
     }
+
+    /// <summary>The Jinja source this template was built from (trailing newline normalised, <c>{% generation %}</c> markers rewritten).</summary>
+    public string TemplateSource { get; }
+
+    /// <summary>The reasoning markup this template's model uses, detected from the source (#798).</summary>
+    public Reasoning.ReasoningMarkup ReasoningMarkup { get; }
 
     /// <inheritdoc/>
     public string Apply(IReadOnlyList<ChatMessage> messages, ChatTemplateOptions options)
@@ -74,16 +108,36 @@ public sealed class JinjaChatTemplate : IChatTemplate
             if (msg.ToolCallId is not null)
                 dict["tool_call_id"] = msg.ToolCallId;
 
+            // Only when present: templates test `message.reasoning_content is string`.
+            if (msg.ReasoningContent is not null)
+                dict["reasoning_content"] = msg.ReasoningContent;
+
             messageList.Add(dict);
         }
 
-        var context = new Dictionary<string, object?>
+        var context = new Dictionary<string, object?>();
+
+        // chat_template_kwargs first so every explicit field below, and the structural variables,
+        // take precedence over a same-named kwarg.
+        if (options.TemplateKwargs is { Count: > 0 })
         {
-            ["messages"] = messageList,
-            ["add_generation_prompt"] = options.AddGenerationPrompt,
-            ["bos_token"] = _bosToken,
-            ["eos_token"] = _eosToken,
-        };
+            foreach (var (key, value) in options.TemplateKwargs)
+                context[key] = ConvertJsonElement(value);
+        }
+
+        // Reasoning switches: inserted only when the client set them, so an unset value stays
+        // *undefined* in the template (a null-valued key is not undefined).
+        if (options.EnableThinking is { } enableThinking)
+            context["enable_thinking"] = enableThinking;
+        if (options.ReasoningEffort is { Length: > 0 } effort)
+            context["reasoning_effort"] = effort;
+        if (options.PreserveThinking is { } preserve)
+            context["preserve_thinking"] = preserve;
+
+        context["messages"] = messageList;
+        context["add_generation_prompt"] = options.AddGenerationPrompt;
+        context["bos_token"] = _bosToken;
+        context["eos_token"] = _eosToken;
 
         // Add tool definitions if present
         if (options.Tools is { Length: > 0 })
@@ -104,6 +158,12 @@ public sealed class JinjaChatTemplate : IChatTemplate
                 tools.Add(toolDict);
             }
             context["tools"] = tools;
+
+            // SmolLM3 (#797): the template's tool section is gated on `xml_tools or python_tools` (HF callers
+            // pass xml_tools=...), so an OpenAI-style `tools` request rendered NO tool declarations and the model
+            // answered that it had no tools. Alias `tools` to `xml_tools` unless the client chose a branch itself.
+            if (_aliasXmlTools && !context.ContainsKey("xml_tools") && !context.ContainsKey("python_tools"))
+                context["xml_tools"] = tools;
         }
 
         return context;

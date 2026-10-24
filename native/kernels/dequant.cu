@@ -62,10 +62,14 @@ extern "C" __global__ void __launch_bounds__(256) dequant_q4_0_f16(
         float d = __half2float(*reinterpret_cast<const half*>(block));
         const uint8_t* qs = block + 2;
 
-        // Elements interleave: out[2j]=lo(qs[j]), out[2j+1]=hi(qs[j])
-        int byte_idx = lane / 2;
-        uint8_t packed = qs[byte_idx];
-        int val = (lane & 1) ? ((int)(packed >> 4) - 8) : ((int)(packed & 0x0F) - 8);
+        // GGUF Q4_0 packs the block as two halves, NOT interleaved pairs:
+        //   element j       = low  nibble of qs[j]   (j = 0..15)
+        //   element j + 16  = high nibble of qs[j]
+        // (Matches ggml's dequantize_row_q4_0 and the Q5_0/Q5_1 kernels below.)
+        int j = lane < 16 ? lane : lane - 16;
+        uint8_t packed = qs[j];
+        int nibble = (lane < 16) ? (packed & 0x0F) : (packed >> 4);
+        int val = nibble - 8;
 
         dst[(size_t)block_idx * Q4_0_BLOCK_SIZE + lane] = __float2half(d * (float)val);
     }
@@ -104,6 +108,174 @@ extern "C" __global__ void __launch_bounds__(256) dequant_q5_0_f16(
         int val = (nibble | (high_bit << 4)) - 16;
 
         dst[(size_t)block_idx * Q5_0_BLOCK_SIZE + lane] = __float2half(d * (float)val);
+    }
+}
+
+// ── Q4_1: 20 bytes per 32 values ────────────────────────────────────
+// struct block_q4_1 { half d; half m; uint8_t qs[16]; };
+// value = d * nibble + m  (unsigned + min, vs Q4_0's signed-after-bias-of-8)
+#define Q4_1_BLOCK_SIZE 32
+#define Q4_1_BLOCK_BYTES 20
+
+extern "C" __global__ void __launch_bounds__(256) dequant_q4_1_f16(
+    const uint8_t* __restrict__ src,
+    half* __restrict__ dst,
+    const int total_blocks)
+{
+    int lane = threadIdx.x % Q4_1_BLOCK_SIZE;
+    int warp_in_block = threadIdx.x / Q4_1_BLOCK_SIZE;
+    int warps_per_grid = (gridDim.x * blockDim.x) / Q4_1_BLOCK_SIZE;
+    int start_block = blockIdx.x * (blockDim.x / Q4_1_BLOCK_SIZE) + warp_in_block;
+
+    for (int block_idx = start_block; block_idx < total_blocks; block_idx += warps_per_grid)
+    {
+        const uint8_t* block = src + (size_t)block_idx * Q4_1_BLOCK_BYTES;
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        float m = __half2float(*reinterpret_cast<const half*>(block + 2));
+        const uint8_t* qs = block + 4;
+
+        // Same two-halves nibble order as Q4_0: element j = low nibble of qs[j],
+        // element j + 16 = high nibble of qs[j].
+        int j = lane < 16 ? lane : lane - 16;
+        uint8_t packed = qs[j];
+        int val = (lane < 16) ? (int)(packed & 0x0F) : (int)(packed >> 4);
+
+        dst[(size_t)block_idx * Q4_1_BLOCK_SIZE + lane] = __float2half(d * (float)val + m);
+    }
+}
+
+// ── Q5_1: 24 bytes per 32 values ────────────────────────────────────
+// struct block_q5_1 { half d; half m; uint32_t qh; uint8_t qs[16]; };
+// value = d * ((qh_bit << 4) | nibble) + m  (5-bit unsigned + min)
+#define Q5_1_BLOCK_SIZE 32
+#define Q5_1_BLOCK_BYTES 24
+
+extern "C" __global__ void __launch_bounds__(256) dequant_q5_1_f16(
+    const uint8_t* __restrict__ src,
+    half* __restrict__ dst,
+    const int total_blocks)
+{
+    int lane = threadIdx.x % Q5_1_BLOCK_SIZE;
+    int warp_in_block = threadIdx.x / Q5_1_BLOCK_SIZE;
+    int warps_per_grid = (gridDim.x * blockDim.x) / Q5_1_BLOCK_SIZE;
+    int start_block = blockIdx.x * (blockDim.x / Q5_1_BLOCK_SIZE) + warp_in_block;
+
+    for (int block_idx = start_block; block_idx < total_blocks; block_idx += warps_per_grid)
+    {
+        const uint8_t* block = src + (size_t)block_idx * Q5_1_BLOCK_BYTES;
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        float m = __half2float(*reinterpret_cast<const half*>(block + 2));
+        // Read qh (4 bytes, may be unaligned).
+        unsigned int qh = (unsigned int)block[4] | ((unsigned int)block[5] << 8) |
+                          ((unsigned int)block[6] << 16) | ((unsigned int)block[7] << 24);
+        const uint8_t* qs = block + 8;
+
+        int j = lane < 16 ? lane : lane - 16;
+        uint8_t packed = qs[j];
+        int nibble = (lane < 16) ? (packed & 0x0F) : (packed >> 4);
+        int high_bit = (qh >> lane) & 1;
+        int val = nibble | (high_bit << 4);
+
+        dst[(size_t)block_idx * Q5_1_BLOCK_SIZE + lane] = __float2half(d * (float)val + m);
+    }
+}
+
+// ── Q2_K: 84 bytes per 256 values ──────────────────────────────────
+// struct block_q2_K { uint8_t scales[16]; uint8_t qs[64]; half d; half dmin; };
+//   - scales[i]: low nibble = sub-block i scale, high nibble = sub-block i dmin coef
+//   - qs[i]: 2-bit elements packed 4 per byte, TRANSPOSED (issue #498). Each
+//     128-element half of the super-block consumes 32 qs bytes and each byte
+//     supplies four elements 32 apart — NOT four consecutive elements:
+//         element t -> byte 32*(t>>7) + (t & 31), shift 2*((t>>5) & 3)
+//     Authority: ggml/src/ggml-quants.c dequantize_row_q2_K. Sub-block (scale)
+//     indexing t>>4 is NOT transposed and is unchanged.
+//
+// 256 threads/block, one element per thread, FP16 store.
+
+#define Q2_K_SUPER_BLOCK_SIZE 256
+#define Q2_K_BLOCK_BYTES 84
+
+extern "C" __global__ void __launch_bounds__(256) dequant_q2_k_f16(
+    const uint8_t* __restrict__ src,
+    half* __restrict__ dst,
+    const int total_superblocks)
+{
+    int t = threadIdx.x; // 0..255
+
+    for (int sb_idx = blockIdx.x; sb_idx < total_superblocks; sb_idx += gridDim.x)
+    {
+        const uint8_t* block = src + (size_t)sb_idx * Q2_K_BLOCK_BYTES;
+        const uint8_t* scales = block;        // 16 bytes
+        const uint8_t* qs = block + 16;       // 64 bytes
+        float d = __half2float(*reinterpret_cast<const half*>(block + 80));
+        float dmin = __half2float(*reinterpret_cast<const half*>(block + 82));
+
+        int sub = t >> 4;                        // t / 16 (scale sub-block, not transposed)
+        int byte_idx = 32 * (t >> 7) + (t & 31); // transposed 2-bit layout (#498)
+        int bit_off = ((t >> 5) & 0x3) << 1;
+        int q2 = (qs[byte_idx] >> bit_off) & 0x3;
+        int scale = scales[sub] & 0xF;
+        int dm_coef = (scales[sub] >> 4) & 0xF;
+
+        float result = d * (float)scale * (float)q2 - dmin * (float)dm_coef;
+        dst[(size_t)sb_idx * Q2_K_SUPER_BLOCK_SIZE + t] = __float2half(result);
+    }
+}
+
+// ── Q3_K: 110 bytes per 256 values (super-block with 16 sub-blocks of 16) ──
+// struct block_q3_K { uint8_t hmask[32]; uint8_t qs[64]; uint8_t scales[12]; half d; };
+//   hmask: 1 high bit per element (32 × 8 = 256 bits)
+//   qs:    2 low bits per element (64 × 4 = 256)
+//   scales: 16 × 6-bit signed-after-bias-of-32 packed into 12 bytes
+//   d: FP16 super-block delta
+// Per-element value: d × (signed_scale[sub]) × (((hmask_bit << 2) | qs_bits) - 4)
+#define Q3_K_SUPER_BLOCK_SIZE 256
+#define Q3_K_BLOCK_BYTES 110
+
+extern "C" __global__ void __launch_bounds__(256) dequant_q3_k_f16(
+    const uint8_t* __restrict__ src,
+    half* __restrict__ dst,
+    const int total_superblocks)
+{
+    int t = threadIdx.x; // 0..255
+
+    for (int sb_idx = blockIdx.x; sb_idx < total_superblocks; sb_idx += gridDim.x)
+    {
+        const uint8_t* block = src + (size_t)sb_idx * Q3_K_BLOCK_BYTES;
+        const uint8_t* hmask = block;                // 32 bytes
+        const uint8_t* qs = block + 32;              // 64 bytes
+        const uint8_t* scales12 = block + 32 + 64;   // 12 bytes
+        float d = __half2float(*reinterpret_cast<const half*>(block + 32 + 64 + 12));
+
+        // Sub-block index (0..15) for this thread; 16 threads share a sub-block
+        // (= 16 elements per sub-block).
+        int sub = t / 16;
+
+        // Unpack 6-bit scale for this sub-block from the 12 packed bytes.
+        // Per llama.cpp ggml-quants.c dequantize_row_q3_K:
+        //   sub 0..7  low nibble = scales12[sub] low nibble
+        //   sub 8..15 low nibble = scales12[sub-8] high nibble (NOT sub-4 — that
+        //   collides with the high-2-bits packing in scales12[8..11]).
+        //   high 2 bits = scales12[8 + (sub % 4)] >> ((sub / 4) * 2)
+        // The byte/shift pair is TRANSPOSED relative to the obvious-looking
+        // 8 + sub/4 @ (sub%4)*2 — the wrong way round scrambles 12 of 16 scales.
+        int lowSrcByte = sub < 8 ? sub : sub - 8;
+        int lowNibble = sub < 8
+            ? (scales12[lowSrcByte] & 0x0F)
+            : ((scales12[lowSrcByte] >> 4) & 0x0F);
+        int hiBits = (scales12[8 + (sub & 3)] >> ((sub >> 2) * 2)) & 0x03;
+        int signedScale = (lowNibble | (hiBits << 4)) - 32;  // [-32, 31]
+
+        // Per-element 3-bit unpacking. The 2-bit quants are NOT stored four
+        // consecutive elements per byte: element t reads bit-pair (t/32)%4 of
+        // qs byte (t%32) + 32*(t/128), and hmask bit t/32 of byte t%32
+        // (llama.cpp's shift/m loop over 128-element halves).
+        int qBits = (qs[(t & 31) + 32 * (t >> 7)] >> (((t >> 5) & 3) * 2)) & 0x03;
+        int hBit = (hmask[t & 31] >> (t >> 5)) & 0x01;
+        int signed3 = ((hBit << 2) | qBits) - 4;  // [-4, 3]
+
+        dst[(size_t)sb_idx * Q3_K_SUPER_BLOCK_SIZE + t] =
+            __float2half(d * (float)signedScale * (float)signed3);
     }
 }
 
@@ -202,20 +374,62 @@ extern "C" __global__ void __launch_bounds__(256) dequant_q5_k_f16(
         float scale = d * (float)sc;
         float min_val = dmin * (float)m;
 
-        const uint8_t* sub_qs = qs + sub * 16;
-        const uint8_t* sub_qh = qh + sub * 4;
+        int pair_idx = sub >> 1;
+        int nibble_half = sub & 1;
+        uint8_t packed = qs[pair_idx * 32 + pos];
+        int nibble = nibble_half ? (packed >> 4) : (packed & 0x0F);
 
-        // pos 0..31: interleaved low/high nibbles
-        // sub_out[2*j+0]=lo, sub_out[2*j+1]=hi for j=0..15
-        int j = pos / 2;
-        uint8_t packed = sub_qs[j];
-        int nibble = (pos & 1) ? (packed >> 4) : (packed & 0x0F);
-
-        // Extract 5th bit from qh
-        int bit = (sub_qh[j / 4] >> ((j % 4) * 2 + (pos & 1))) & 1;
+        // qh is indexed by element position; bit `sub` supplies the fifth bit.
+        int bit = (qh[pos] >> sub) & 1;
         int val = nibble | (bit << 4);
 
         dst[(size_t)sb_idx * Q5_K_SUPER_BLOCK_SIZE + t] = __float2half(scale * (float)val - min_val);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) dequant_q5_k_f32(
+    const uint8_t* __restrict__ src,
+    float* __restrict__ dst,
+    const int total_superblocks)
+{
+    int t = threadIdx.x; // 0..255
+
+    for (int sb_idx = blockIdx.x; sb_idx < total_superblocks; sb_idx += gridDim.x)
+    {
+        const uint8_t* block = src + (size_t)sb_idx * Q5_K_BLOCK_BYTES;
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        float dmin = __half2float(*reinterpret_cast<const half*>(block + 2));
+        const uint8_t* scales_raw = block + 4;
+        const uint8_t* qh = block + 16;
+        const uint8_t* qs = block + 48;
+
+        int sub = t / 32;
+        int pos = t % 32;
+
+        int sc, m;
+        if (sub < 4)
+        {
+            sc = scales_raw[sub] & 0x3F;
+            m = scales_raw[sub + 4] & 0x3F;
+        }
+        else
+        {
+            sc = (scales_raw[sub + 4] & 0x0F) | ((scales_raw[sub - 4] >> 6) << 4);
+            m = (scales_raw[sub + 4] >> 4) | ((scales_raw[sub] >> 6) << 4);
+        }
+
+        float scale = d * (float)sc;
+        float min_val = dmin * (float)m;
+
+        int pair_idx = sub >> 1;
+        int nibble_half = sub & 1;
+        uint8_t packed = qs[pair_idx * 32 + pos];
+        int nibble = nibble_half ? (packed >> 4) : (packed & 0x0F);
+
+        int bit = (qh[pos] >> sub) & 1;
+        int val = nibble | (bit << 4);
+
+        dst[(size_t)sb_idx * Q5_K_SUPER_BLOCK_SIZE + t] = scale * (float)val - min_val;
     }
 }
 
@@ -271,5 +485,70 @@ extern "C" __global__ void __launch_bounds__(256) dequant_q6_k_f16(
 
         float sc = d * (float)sc_half[isc + group * 2];
         dst[(size_t)sb_idx * Q6_K_SUPER_BLOCK_SIZE + t] = __float2half(sc * (float)q_val);
+    }
+}
+
+// Q6_K → F32 dequant. Bit-perfect port of DequantizeQ6_KScalar in
+// src/DotLLM.Cpu/Kernels/DequantizeKQuants.cs:81-122. Per-element formula:
+//
+//     val = d * scales[isc + group * 2] * q   where q = unpacked_q6 − 32
+//
+// Operation order matches the CPU scalar reference exactly:
+// `(d * scales[isc + group * 2]) * (float)q` left-to-right, since all three
+// operands are multiplied, FP32 multiplication is exactly associative on
+// non-overflow inputs — so any pairwise ordering yields the same single-
+// rounding result. We use the same parenthesisation as the F16 kernel above
+// (sc computed first, then * q) and emit the result directly to F32 without
+// the F16 cast. dequant.cu is in the FAST_MATH list in build_ptx.bat —
+// fast_math affects only div/sqrt/transcendentals (none here), not exact
+// multiplication, so the F32 output is bit-identical to the CPU reference.
+
+extern "C" __global__ void __launch_bounds__(256) dequant_q6_k_f32(
+    const uint8_t* __restrict__ src,
+    float* __restrict__ dst,
+    const int total_superblocks)
+{
+    int t = threadIdx.x; // 0..255
+
+    for (int sb_idx = blockIdx.x; sb_idx < total_superblocks; sb_idx += gridDim.x)
+    {
+        const uint8_t* block = src + (size_t)sb_idx * Q6_K_BLOCK_BYTES;
+        const uint8_t* ql = block;                                          // 128 bytes
+        const uint8_t* qh_base = block + 128;                               // 64 bytes
+        const int8_t* scales = reinterpret_cast<const int8_t*>(block + 192); // 16 bytes
+        float d = __half2float(*reinterpret_cast<const half*>(block + 208));
+
+        // Two 128-element halves (t<128 → first half, t>=128 → second half)
+        int half_idx = t / 128;
+        int pos_in_half = t % 128;
+
+        const uint8_t* ql_half = ql + half_idx * 64;
+        const uint8_t* qh_half = qh_base + half_idx * 32;
+        const int8_t* sc_half = scales + half_idx * 8;
+
+        // Within each half (128 elements): 4 groups of 32
+        int group = pos_in_half / 32;
+        int l = pos_in_half % 32;
+        int isc = l / 16;
+
+        int q_val;
+        switch (group)
+        {
+            case 0:
+                q_val = ((ql_half[l] & 0x0F) | (((qh_half[l] >> 0) & 3) << 4)) - 32;
+                break;
+            case 1:
+                q_val = ((ql_half[l + 32] & 0x0F) | (((qh_half[l] >> 2) & 3) << 4)) - 32;
+                break;
+            case 2:
+                q_val = ((ql_half[l] >> 4) | (((qh_half[l] >> 4) & 3) << 4)) - 32;
+                break;
+            default: // case 3
+                q_val = ((ql_half[l + 32] >> 4) | (((qh_half[l] >> 6) & 3) << 4)) - 32;
+                break;
+        }
+
+        float sc = d * (float)sc_half[isc + group * 2];
+        dst[(size_t)sb_idx * Q6_K_SUPER_BLOCK_SIZE + t] = sc * (float)q_val;
     }
 }

@@ -1,0 +1,148 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// MoE INDEXED Q5_K MMVQ decode GEMV: integer-dot (dp4a) matrix-vector multiply over a packed expert bank.
+//
+//   y[n, m] = sum_k dequant(bank[indices[n], m, k]) * x[n, k]
+//
+// The gathered/indexed variant of matmul_q5_k_mmvq.comp, generated from it by gen_idx_mmvq.py (same recipe as the existing
+// moe_indexed_matmul_q4_k_mmvq.comp): the weight row is looked up through the per-row expert index and the activation row n comes
+// from the Q8_1-quantized expanded MoE input (quantize_q8_1_rows.comp). The lane layout, per-sub-block math and subgroupAdd are
+// unchanged. The scalar one-thread-per-cell moe_indexed_matmul_*_q8_1/_f32 kernels read adjacent rows a whole row apart
+// (uncoalesced) and were ~1.5 ms/layer for Q6_K on Qwen3.6-35B-A3B decode. xDiv lets decode broadcast one quantized activation row to its topK slots.
+//
+// MULTI-ROW variant (#1049, the #876 recipe applied to Q5_K): each workgroup produces NR consecutive output rows (m0 .. m0+NR-1) of one
+// expanded row n, so the activation loads (xq, xds) are shared and NR independent weight-load chains are in flight per lane. The per-row
+// arithmetic and accumulation order are IDENTICAL to the one-row kernel (a few ULP at most from FMA contraction). Requires M % NR == 0.
+// Dispatch: gl_WorkGroupID.x = m0 / NR, gl_WorkGroupID.y = n; one wave32 subgroup per NR output cells.
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint NR = 2u;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufBank { uint  bank[]; }; // Q5_K blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq  { uint  xq[]; };      // [N * K/4] packed int8 activations
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds { vec2  xds[]; };     // [N * K/32] (d_x, s)
+layout(set = 0, binding = 3, std430) readonly  buffer BufIdx  { int   indices[]; };// [N]
+layout(set = 0, binding = 4, std430) writeonly buffer BufY    { float y[]; };      // [N * M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // output dim   (per-expert weight row count)
+    uint K;             // input dim    (multiple of 256)
+    uint N;             // total rows   (typically seqLen * topK)
+    uint numExperts;    // bank's first axis size - bounds-check only
+    uint blocksPerRow;  // = K / 256
+    uint xDiv;          // activation row = n / xDiv (1 = per-row input; topK = one row broadcast to its topK expert slots)
+} pc;
+
+const uint Q5K_BLOCK_BYTES = 176u;
+
+uint readByte(uint absByteOff) {
+    uint u = bank[absByteOff >> 2u];
+    return (u >> ((absByteOff & 3u) * 8u)) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = bank[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = bank[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+// j-th (0..7) (scale, min) pair from the 12-byte scales[] — get_scale_min_k4 (same as Q4_K).
+uvec2 unpackScaleMin(uint scalesByteBase, uint j) {
+    uint sc, mn;
+    if (j < 4u) {
+        sc = readByte(scalesByteBase + j) & 63u;
+        mn = readByte(scalesByteBase + j + 4u) & 63u;
+    } else {
+        uint scLow  = readByte(scalesByteBase + j + 4u) & 0xFu;
+        uint scHigh = (readByte(scalesByteBase + j - 4u) >> 6u) & 0x3u;
+        sc = scLow | (scHigh << 4u);
+        uint mnLow  = (readByte(scalesByteBase + j + 4u) >> 4u) & 0xFu;
+        uint mnHigh = (readByte(scalesByteBase + j) >> 6u) & 0x3u;
+        mn = mnLow | (mnHigh << 4u);
+    }
+    return uvec2(sc, mn);
+}
+
+// Build 4 packed 5-bit weights (q5 = nibble | (qh_bit << 4), 0..31) ready for dp4a.
+// useHigh selects the high nibble of each qs byte; j is the sub-block index whose
+// bit in each qh byte is the 5th bit.
+uint packQ5(uint qs4, uint qh4, bool useHigh, uint j) {
+    uint res = 0u;
+    for (uint e = 0u; e < 4u; e++) {
+        uint qsb = (qs4 >> (e * 8u)) & 0xFFu;
+        uint nib = useHigh ? ((qsb >> 4u) & 0xFu) : (qsb & 0xFu);
+        uint hb  = (qh4 >> (e * 8u + j)) & 1u;
+        uint q5  = nib | (hb << 4u);          // 0..31
+        res |= (q5 & 0xFFu) << (e * 8u);
+    }
+    return res;
+}
+
+void main() {
+    uint m0 = gl_WorkGroupID.x * NR;
+    uint n = gl_WorkGroupID.y;
+    if (m0 >= pc.M || n >= pc.N) return;
+
+    uint expert = uint(indices[n]);
+    if (expert >= pc.numExperts) return; // defensive: bad index leaves y untouched
+    uint xRow = n / pc.xDiv;
+    uint xqRowBase  = xRow * (pc.K >> 2u);
+    uint xdsRowBase = xRow * (pc.K >> 5u);
+
+    uint lane = gl_LocalInvocationID.x;
+    uint p = lane >> 3u;
+    uint g = lane & 7u;
+    uint j0 = p * 2u;
+    uint j1 = j0 + 1u;
+
+    uint rowBytes = pc.blocksPerRow * Q5K_BLOCK_BYTES;
+    uint rowByteBase0 = (expert * pc.M + m0) * rowBytes;
+    float acc[NR];
+    for (uint r = 0u; r < NR; ++r) acc[r] = 0.0;
+
+    for (uint b = 0u; b < pc.blocksPerRow; b++) {
+        uint xqBlockBase = xqRowBase + b * 64u;
+        uint xdsBase     = xdsRowBase + b * 8u;
+        vec2 ds0 = xds[xdsBase + j0];
+        vec2 ds1 = xds[xdsBase + j1];
+        int x0 = int(xq[xqBlockBase + j0 * 8u + g]);
+        int x1 = int(xq[xqBlockBase + j1 * 8u + g]);
+
+        for (uint r = 0u; r < NR; ++r) {
+            uint blockByteBase = rowByteBase0 + r * rowBytes + b * Q5K_BLOCK_BYTES;
+            float d    = readHalf(blockByteBase);
+            float dmin = readHalf(blockByteBase + 2u);
+            uint scalesBase = blockByteBase + 4u;
+            uvec2 sm0 = unpackScaleMin(scalesBase, j0);
+            uvec2 sm1 = unpackScaleMin(scalesBase, j1);
+
+            uint qs4 = bank[((blockByteBase + 48u) >> 2u) + lane];
+            uint qh4 = bank[((blockByteBase + 16u) >> 2u) + g];
+            uint w0 = packQ5(qs4, qh4, false, j0);
+            uint w1 = packQ5(qs4, qh4, true,  j1);
+
+            int dot0 = dotPacked4x8AccSatEXT(int(w0), x0, 0);
+            int dot1 = dotPacked4x8AccSatEXT(int(w1), x1, 0);
+
+            acc[r] += (d * float(sm0.x)) * (ds0.x * float(dot0)) - (dmin * float(sm0.y)) * ds0.y * 0.125;
+            acc[r] += (d * float(sm1.x)) * (ds1.x * float(dot1)) - (dmin * float(sm1.y)) * ds1.y * 0.125;
+        }
+    }
+
+    for (uint r = 0u; r < NR; ++r) {
+        float total = subgroupAdd(acc[r]);
+        if (subgroupElect())
+            y[n * pc.M + m0 + r] = total;
+    }
+}

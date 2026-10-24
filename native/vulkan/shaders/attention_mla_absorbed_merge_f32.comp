@@ -1,0 +1,44 @@
+#version 450
+// Split-KV merge for attention_mla_absorbed_f32.comp (issue #913).
+//
+// One workgroup per (token, head) row. Combines the numSplits unnormalised partials (acc_s[512], m_s, l_s):
+//   m = max_s m_s ;  L = sum_s l_s * exp(m_s - m) ;  out = (sum_s acc_s * exp(m_s - m)) / L
+// Empty splits (m_s = -3.4e38, l_s = 0) contribute exactly zero.
+
+#define LAT 512
+#define NEG_INF (-3.4e38)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufPO  { float partO[];  };
+layout(set = 0, binding = 1, std430) readonly  buffer BufPML { float partML[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufOut { float outp[];   };
+
+layout(push_constant) uniform PushConstants {
+    uint totalRows;
+    uint numSplits;
+    uint splitRows;
+} pc;
+
+void main() {
+    uint g = gl_WorkGroupID.x;
+    if (g >= pc.totalRows) return;
+    uint tid = gl_LocalInvocationID.x;
+
+    float m = NEG_INF;
+    for (uint s = 0u; s < pc.numSplits; s++) m = max(m, partML[(s * pc.splitRows + g) * 2u]);
+
+    float L = 0.0;
+    vec2 acc = vec2(0.0);
+    uint d0 = 2u * tid;
+    for (uint s = 0u; s < pc.numSplits; s++) {
+        uint idx = s * pc.splitRows + g;
+        float ms = partML[idx * 2u];
+        float w = (ms > NEG_INF * 0.5) ? exp(ms - m) : 0.0;
+        L += partML[idx * 2u + 1u] * w;
+        acc += w * vec2(partO[idx * uint(LAT) + d0], partO[idx * uint(LAT) + d0 + 1u]);
+    }
+    float inv = (L > 1e-30) ? (1.0 / L) : 0.0;
+    outp[g * uint(LAT) + d0]      = acc.x * inv;
+    outp[g * uint(LAT) + d0 + 1u] = acc.y * inv;
+}
