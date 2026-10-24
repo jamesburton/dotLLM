@@ -43,15 +43,27 @@
 #extension GL_KHR_memory_scope_semantics : require
 
 #define WARP 64u
-#define BM 64u
-#define BN 64u
-#define WM 32u
-#define WN 64u
+// The wrapper may override the tile (MMQ_BM / MMQ_BN / MMQ_WM / MMQ_WN / MMQ_BK_STEP, and MMQ_THREADS = (BM / WM) * (BN / WN) * 64).
+#ifndef MMQ_BM
+#define MMQ_BM 64u
+#define MMQ_BN 64u
+#define MMQ_WM 32u
+#define MMQ_WN 64u
+#define MMQ_THREADS 128
+#endif
+#define BM MMQ_BM
+#define BN MMQ_BN
+#define WM MMQ_WM
+#define WN MMQ_WN
 #define TM 16u
 #define TN 16u
 #define TK 16u
 #define BK 32u
+#ifdef MMQ_BK_STEP
+#define BK_STEP MMQ_BK_STEP
+#else
 #define BK_STEP 4u
+#endif
 // LDS rows: BK_STEP blocks of 8 uints (32 int8) + 4 uints of padding against bank conflicts.
 #define QPITCH (BK_STEP * (BK / 4u) + 4u)
 #define CM_ELEMS ((TM * TN) / WARP)
@@ -59,7 +71,7 @@
 #define GROUP_A_BUDGET (16u * 1024u * 1024u)
 
 #define BLOCK_SIZE ((BM / WM) * (BN / WN) * WARP)
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;   // BLOCK_SIZE: two wave64 subgroups
+layout(local_size_x = MMQ_THREADS, local_size_y = 1, local_size_z = 1) in;   // BLOCK_SIZE (default: two wave64 subgroups)
 
 #if defined(MMQ_Q8_0) || defined(MMQ_Q5_0)
 layout(set = 0, binding = 0, std430) readonly buffer BufW { uint16_t w16[]; };

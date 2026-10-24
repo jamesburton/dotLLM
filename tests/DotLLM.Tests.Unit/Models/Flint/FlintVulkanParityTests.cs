@@ -111,16 +111,21 @@ public sealed class FlintVulkanParityTests
         return (median, good);
     }
 
+    /// <summary>Median per-row KL a parity row may reach (see <see cref="AssertRowsAgree"/>).</summary>
+    private const double MedianKlLimit = 0.03;
+
     /// <summary>
-    /// Random-weight MoEs flip a top-k expert choice on near-ties between engines (Q8_1 activation rounding differs), which wrecks that ONE row only.
-    /// A systematic defect moves every row: median per-row KL tiny and at most ~15 % of the rows off.
+    /// Random-weight MoEs flip a top-k expert choice on near-ties between engines, which wrecks that ONE row only. With Q8_1 activations on
+    /// both sides (#1159 CPU, #1235 Vulkan dense prefill) any upstream difference (F16 KV, accumulation order) also flips single int8 codes,
+    /// which a random-weight model amplifies: measured medians 3e-3..1.4e-2 with 75-94 % of rows under 0.05 (RTX 3060 and 8060S), against
+    /// 1.2-1.6 with 0-19 % for the mutants below. A systematic defect moves every row.
     /// </summary>
     private void AssertRowsAgree(string tag, float[] vk, float[] cpu, int vocab)
     {
         Assert.Equal(cpu.Length, vk.Length);
         var (median, good) = Summarise(tag, RowKl(vk, cpu, vocab), 0.05);
-        Assert.True(median < 0.01, $"{tag}: median per-row KL {median}");
-        Assert.True(good >= 0.84, $"{tag}: only {good:P0} of rows agree");
+        Assert.True(median < MedianKlLimit, $"{tag}: median per-row KL {median}");
+        Assert.True(good >= 0.7, $"{tag}: only {good:P0} of rows agree");
     }
 
     /// <summary>Every projection stays Q4_1 on the device (no widened copy), and the KV cache is F16 (CLAUDE.md rules 1 and 2).</summary>
@@ -202,7 +207,7 @@ public sealed class FlintVulkanParityTests
         Assert.Equal(SyntheticFlintGguf.Layers, vk.SmallRowAttnCount - a0);
         var kl = RowKl(batched, cpu.AsSpan(ctx * vocab, rows * vocab).ToArray(), vocab);
         var (median, _) = Summarise($"smallrow rows={rows}", kl, 0.05);
-        Assert.True(median < 0.01, $"small-row rows off the CPU: median KL {median}");
+        Assert.True(median < MedianKlLimit, $"small-row rows off the CPU: median KL {median}");
     }
 
     /// <summary>

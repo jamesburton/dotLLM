@@ -8011,6 +8011,8 @@ public sealed partial class VulkanTransformerModel : IModel
         QuantType.Q6_K => _matmulQ6KMmq is not null && (inputDim % MatMulQ6KMmqKernel.Q6KGroupSize) == 0,
         QuantType.IQ4_XS => _matmulIq4XsMmq is not null && (inputDim % MatMulIq4XsMmqKernel.Iq4XsGroupSize) == 0,
         QuantType.IQ4_NL => _matmulIq4NlMmq is not null && (inputDim % MatMulIq4NlMmqKernel.Iq4NlGroupSize) == 0,
+        QuantType.Q4_1 => _matmulQ4_1MmqCm1 is { } cm1 ? cm1.SupportsK(inputDim)
+            : _matmulQ4_1Mmq is not null && (inputDim % MatMulQ4_1MmqKernel.Q4_1GroupSize) == 0,
         _ => false,
     };
 
@@ -8055,6 +8057,9 @@ public sealed partial class VulkanTransformerModel : IModel
                 break;
             case QuantType.IQ4_NL:
                 _matmulIq4NlMmq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim, n: seqLen);
+                break;
+            case QuantType.Q4_1:
+                RecordQ4_1MmqPreQuantized(cmdBuf, weights, output, outputDim, inputDim, seqLen);
                 break;
             default:
                 throw new InvalidOperationException($"No prefill MMQ kernel for {qt}.");
@@ -8192,12 +8197,22 @@ public sealed partial class VulkanTransformerModel : IModel
     private bool TryRecordQ4_1Mmq(nint cmdBuf, VulkanDevice.Buffer weights, VulkanDevice.Buffer input, VulkanDevice.Buffer output,
         int outputDim, int inputDim, int seqLen)
     {
-        if ((_matmulQ4_1MmqCm1 is null && _matmulQ4_1Mmq is null) || _quantizeQ8_1Rows is null
-            || _state.Q8_1XqRows is not { } xq || _state.Q8_1XdsRows is not { } xds
-            || (inputDim % QuantizeQ8_1RowsKernel.GroupSize) != 0 || !_state.Q8_1RowsFit(seqLen, inputDim))
+        if (!HasMmqPrefillKernel(QuantType.Q4_1, inputDim) || _quantizeQ8_1Rows is null
+            || _state.Q8_1XqRows is not { } xq || _state.Q8_1XdsRows is not { } xds || !_state.Q8_1RowsFit(seqLen, inputDim))
             return false;
+        // The rows scratch is shared: order this quantize after any GEMM still reading it (callers may record projections back to back).
+        BarrierComputeToCompute(cmdBuf);
         _quantizeQ8_1Rows.Record(cmdBuf, input, xq, xds, n: seqLen, k: inputDim);
         BarrierComputeToCompute(cmdBuf);
+        RecordQ4_1MmqPreQuantized(cmdBuf, weights, output, outputDim, inputDim, seqLen);
+        return true;
+    }
+
+    /// <summary>The Q4_1 MMQ (#1235) on the already quantised rows scratch.</summary>
+    private void RecordQ4_1MmqPreQuantized(nint cmdBuf, VulkanDevice.Buffer weights, VulkanDevice.Buffer output, int outputDim, int inputDim, int seqLen)
+    {
+        var xq = _state.Q8_1XqRows!;
+        var xds = _state.Q8_1XdsRows!;
         if (_matmulQ4_1MmqCm1 is { } cm1)
         {
             cm1.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim, n: seqLen);
@@ -8209,7 +8224,6 @@ public sealed partial class VulkanTransformerModel : IModel
             ProfNote("q4_1_mmq", outputDim, inputDim, seqLen);
         }
         Q4_1MmqDispatchCount++;
-        return true;
     }
 
     /// <summary>

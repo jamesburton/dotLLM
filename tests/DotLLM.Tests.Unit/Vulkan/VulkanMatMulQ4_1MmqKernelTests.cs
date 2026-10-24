@@ -13,8 +13,8 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// <summary>
 /// The Q4_1 prefill GEMMs on Q8_1 activations (#1235): the int8-coopmat <see cref="MatMulMmqCm1Kernel"/> (AMD) and the dp4a
 /// <see cref="MatMulQ4_1MmqKernel"/>. Two oracles: a double-precision reference over the SAME Q8_1 activations the kernel read (only
-/// accumulation order may differ), and the CPU's packed Q4_1 x Q8_1 GEMM (#1159, llama.cpp-golden to &lt; 1e-4) on the same F32 input,
-/// which pins the activation quantisation contract too. Weights and activations both carry an offset, so the min term
+/// accumulation order may differ), and the CPU's packed Q4_1 x Q8_1 GEMM (#1159, llama.cpp-golden to &lt; 1e-4) on the same Q8_1
+/// blocks, which pins the GEMM contract, fp16 (d, s) included; the device's codes are also counted against the CPU quantizer's. Weights and activations both carry an offset, so the min term
 /// <c>m * s_x</c> is a large share of every output and a kernel that dropped or mis-scaled it fails by O(1) (asserted as a control).
 /// </summary>
 [Trait("Category", "GPU")]
@@ -51,7 +51,8 @@ public sealed class VulkanMatMulQ4_1MmqKernelTests(ITestOutputHelper output)
     [SkippableTheory]
     [InlineData("cm1", 77, 200, 352)]     // partial M / N tiles, 11 blocks (a partial last K step)
     [InlineData("cm1", 5, 2112, 1024)]    // L2 group boundary
-    [InlineData("cm1", 130, 512, 2048)]   // Flint k/v projection shape
+    [InlineData("cm1", 130, 512, 2048)]   // Flint k/v projection shape; > one 128-row token tile
+    [InlineData("cm1", 300, 72, 160)]     // three token tiles, the last partial; one partial weight tile
     [InlineData("dp4a", 77, 200, 352)]
     [InlineData("dp4a", 5, 2112, 1024)]
     [InlineData("dp4a", 130, 512, 2048)]  // several FLUSH_BLOCKS windows
@@ -70,17 +71,6 @@ public sealed class VulkanMatMulQ4_1MmqKernelTests(ITestOutputHelper output)
         for (int i = 0; i < b.Length; i++) b[i] = 0.3f + (float)(rng.NextDouble() * 2 - 1);            // offset activations: s_x != 0
         byte[] wq = SyntheticFlintGguf.EncodeQ4_1(w);
         long rowBytes = Dequantize.RowByteSize(k, QuantizationType.Q4_1);
-        float[] cpu = new float[n * m];
-        unsafe
-        {
-            fixed (byte* p = wq)
-            fixed (float* pb = b)
-            fixed (float* pc = cpu)
-            {
-                MatMul.GemmLegacyQuant(p, QuantizationType.Q4_1, pb, pc, m, k, n);
-            }
-        }
-
         using var bufW = device.Allocate(wq.Length);
         using var bufB = device.Allocate((long)n * k * sizeof(float));
         using var bufXq = device.Allocate(QuantizeQ8_1RowsKernel.PackedBytes(n, k));
@@ -104,6 +94,35 @@ public sealed class VulkanMatMulQ4_1MmqKernelTests(ITestOutputHelper output)
         device.Download(bufXds, xds);
         float[] c = new float[n * m];
         device.Download(bufC, c);
+
+        // CPU oracle: the CPU packed Q4_1 GEMM run on the DEVICE's Q8_1 activations (block_q8_1 bytes: fp16 d, fp16 s, qs[32]).
+        // Fed its own quantisation instead, a few codes differ by one where x / d sits within an ulp of .5 (AMD computes 1 / d with
+        // a 1-ulp reciprocal): that is the quantizer's business, counted below, not the GEMM's.
+        int blocks = n * (k / 32), qMismatch = 0;
+        byte[] devQ8 = new byte[blocks * 36];
+        byte[] cpuQ8 = new byte[blocks * 36];
+        float[] cpu = new float[n * m];
+        for (int bi = 0; bi < blocks; bi++)
+        {
+            BitConverter.TryWriteBytes(devQ8.AsSpan(bi * 36, 2), (Half)xds[bi * 2]);
+            BitConverter.TryWriteBytes(devQ8.AsSpan(bi * 36 + 2, 2), (Half)xds[bi * 2 + 1]);
+            for (int j = 0; j < 32; j++) devQ8[bi * 36 + 4 + j] = (byte)xq[bi * 32 + j];
+        }
+        unsafe
+        {
+            fixed (byte* p = wq)
+            fixed (byte* pq = devQ8)
+            fixed (byte* pcq = cpuQ8)
+            fixed (float* pb = b)
+            fixed (float* pc = cpu)
+            {
+                MatMul.QuantizeF32ToQ8_1(pb, pcq, n * k);
+                MatMul.GemmLegacyQuant(p, QuantizationType.Q4_1, pb, pc, m, k, n, preQuantizedInput: pq);
+            }
+        }
+        for (int bi = 0; bi < blocks; bi++)
+            for (int j = 0; j < 32; j++)
+                if (cpuQ8[bi * 36 + 4 + j] != devQ8[bi * 36 + 4 + j]) qMismatch++;
 
         double worst = 0, worstCpu = 0, worstNoMin = 0, scale = 0;
         for (int t = 0; t < n; t++)
@@ -135,9 +154,10 @@ public sealed class VulkanMatMulQ4_1MmqKernelTests(ITestOutputHelper output)
             }
         }
         output.WriteLine($"q4_1 {kind} n={n} m={m} k={k}: max|ref-gpu|={worst:E3} max|cpu-gpu|={worstCpu:E3} (rel {worstCpu / scale:E2}) "
-            + $"max|ref|={scale:E3} no-min control={worstNoMin:E3}");
+            + $"max|ref|={scale:E3} no-min control={worstNoMin:E3} q8 codes != cpu quantizer: {qMismatch}/{n * k}");
         Assert.True(worst <= 2e-5 * scale + 1e-5, $"max |ref - gpu| = {worst:E3} against max |ref| {scale:E3}");
         Assert.True(worstCpu <= 1e-5 * scale, $"max |cpu - gpu| = {worstCpu:E3} against max |ref| {scale:E3}");
+        Assert.True(qMismatch <= n * k / 1000, $"{qMismatch} of {n * k} Q8_1 codes differ from the CPU quantizer");
         Assert.True(worstNoMin > 0.05 * scale, $"the min term is too small to be checked here ({worstNoMin:E3})");
     }
 
@@ -156,6 +176,7 @@ public sealed class VulkanMatMulQ4_1MmqKernelTests(ITestOutputHelper output)
         using var dp4a = Create(device, spvDir, "dp4a");
         using var f16 = MatMulQ4_0GemmCoopmatKernel.IsSupportedOn(device, spvDir, QuantizationType.Q4_1)
             ? MatMulQ4_0GemmCoopmatKernel.Create(device, spvDir, QuantizationType.Q4_1) : null;
+        using var f32 = MatMulQ4_0GemmF32Kernel.Create(device, spvDir, QuantizationType.Q4_1);
         (int M, int K)[] shapes = [(4096, 2048), (512, 2048), (2048, 4096), (6144, 2048), (2048, 6144), (1024, 2048), (2048, 1024)];
         int nRows = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_GEMM_SHAPE_PROBE_N"), out int nn) ? nn : 512;
         const int Reps = 10;
@@ -187,7 +208,9 @@ public sealed class VulkanMatMulQ4_1MmqKernelTests(ITestOutputHelper output)
             string T(IGemm? g) => g is null ? "   n/a" : $"{Time(cb => g.Record(cb, w, xq, xds, c, m, k, nRows)),6:F3}";
             double tQ = Time(cb => quant.Record(cb, b, xq, xds, nRows, k));
             string tF16 = f16 is null ? "   n/a" : $"{Time(cb => f16.Record(cb, w, b, c, m, k, nRows)),6:F3}";
-            output.WriteLine($"q4_1 n={nRows} m={m,5} k={k,5}: cm1 {T(cm1)} ms | dp4a {T(dp4a)} ms | + quant {tQ,6:F3} ms | f16 coopmat {tF16} ms");
+            double tF32 = Time(cb => f32.Record(cb, w, b, c, m, k, nRows));
+            output.WriteLine($"q4_1 n={nRows} m={m,5} k={k,5}: cm1 {T(cm1)} ms | dp4a {T(dp4a)} ms | + quant {tQ,6:F3} ms | f16 coopmat {tF16} ms "
+                + $"| f32 gemm {tF32,6:F3} ms");
         }
     }
 }

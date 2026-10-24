@@ -24,7 +24,7 @@ public sealed class MatMulMmqCm1Kernel : IDisposable
     /// <summary>Token rows per workgroup tile (the tile-list row count for the grouped form).</summary>
     public const int RowTile = 64;
 
-    private const int Tile = 64;   // token rows per tile (and weight rows for the 64-row form)
+    private const int Tile = 64;   // weight rows per tile; token rows too, except the dense Q4_1 form (128)
     private const int PushConstantBytes = 6 * sizeof(uint); // M, K, N, rowStride, numExperts, tileList
     private const uint AmdVendorId = 0x1002;
 
@@ -35,10 +35,13 @@ public sealed class MatMulMmqCm1Kernel : IDisposable
     private readonly DescriptorSetCache _descriptorCache;
     private readonly QuantizationType _quant;
     private readonly bool _grouped;
+    private readonly int _tileN;
     private bool _disposed;
 
-    private MatMulMmqCm1Kernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, QuantizationType quant, bool grouped)
+    private MatMulMmqCm1Kernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, QuantizationType quant, bool grouped,
+        int tileN)
     {
+        _tileN = tileN;
         _device = device;
         _module = module;
         _pipeline = pipeline;
@@ -112,7 +115,9 @@ public sealed class MatMulMmqCm1Kernel : IDisposable
             throw;
         }
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)bufferCount);
-        return new MatMulMmqCm1Kernel(device, module, pipeline, pool, quant, grouped);
+        // matmul_q4_1_mmq_cm1 is compiled with a 64 x 128 tile (#1235); every other form uses 64 x 64.
+        int tileN = quant == QuantizationType.Q4_1 && !grouped ? 2 * Tile : Tile;
+        return new MatMulMmqCm1Kernel(device, module, pipeline, pool, quant, grouped, tileN);
     }
 
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<VulkanDevice, object> LayoutChecks = new();
@@ -230,7 +235,7 @@ public sealed class MatMulMmqCm1Kernel : IDisposable
         if (_grouped) throw new InvalidOperationException("This is the grouped kernel; use RecordGrouped.");
         Validate(weights, xq, xds, output, m, k, n, numExperts: 1);
         Bind(cmdBuf, [weights.Handle, xq.Handle, xds.Handle, output.Handle], m, k, n, numExperts: 0, tileList: 0);
-        VulkanApi.vkCmdDispatch(cmdBuf, (uint)MTiles(m), (uint)((n + Tile - 1) / Tile), 1);
+        VulkanApi.vkCmdDispatch(cmdBuf, (uint)MTiles(m), (uint)((n + _tileN - 1) / _tileN), 1);
     }
 
     /// <summary>
