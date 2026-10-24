@@ -12,7 +12,7 @@ namespace DotLLM.Cli.Commands;
 /// </summary>
 internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 {
-    public sealed class Settings : CommandSettings
+    public sealed class Settings : DotLLM.Cli.Helpers.KvQuantSettings
     {
         /// <summary>Path to a GGUF file or HuggingFace repo ID.</summary>
         [CommandArgument(0, "[model]")]
@@ -33,14 +33,63 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 
         /// <summary>Compute device.</summary>
         [CommandOption("--device|-d")]
-        [Description("Compute device: 'cpu' (default), 'gpu', 'gpu:0', 'gpu:1'.")]
-        [DefaultValue("cpu")]
-        public string Device { get; set; } = "cpu";
+        [Description("Compute device: 'auto' (default: CUDA if the model fits, else Vulkan, else CPU - a failed GPU load falls back), 'cpu', 'gpu', 'gpu:0', 'gpu:1' (CUDA), or 'vulkan'.")]
+        [DefaultValue("auto")]
+        public string Device { get; set; } = "auto";
 
         /// <summary>Number of GPU layers for hybrid offloading.</summary>
         [CommandOption("--gpu-layers")]
         [Description("Number of transformer layers to offload to GPU.")]
         public int? GpuLayers { get; set; }
+
+        /// <summary>Routed-expert placement on CUDA (issue #1070).</summary>
+        [CommandOption(DotLLM.Cli.Helpers.MoeOffloadCli.ModeOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.ModeHelp)]
+        public string? MoeOffload { get; set; }
+
+        /// <summary>VRAM expert-cache size in MiB (issue #1070).</summary>
+        [CommandOption(DotLLM.Cli.Helpers.MoeOffloadCli.CacheMibOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CacheMibHelp)]
+        public string? MoeCacheMib { get; set; }
+
+        /// <summary>Expert-cache replacement policy (issue #1070).</summary>
+        [CommandOption(DotLLM.Cli.Helpers.MoeOffloadCli.PolicyOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.PolicyHelp)]
+        public string? MoeCachePolicy { get; set; }
+
+        /// <summary>Where uncached offloaded experts run (issue #1071).</summary>
+        [CommandOption(DotLLM.Cli.Helpers.MoeOffloadCli.ColdOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.ColdHelp)]
+        public string? MoeCold { get; set; }
+
+        /// <summary>CPU cold-expert worker threads (issue #1071).</summary>
+        [CommandOption(DotLLM.Cli.Helpers.MoeOffloadCli.CpuThreadsOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CpuThreadsHelp)]
+        public int? MoeCpuThreads { get; set; }
+
+        /// <summary>llama.cpp <c>--cpu-moe</c>: every MoE layer's experts on the CPU (issue #1071).</summary>
+        [CommandOption(DotLLM.Cli.Helpers.MoeOffloadCli.CpuMoeOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CpuMoeHelp)]
+        [DefaultValue(false)]
+        public bool CpuMoe { get; set; }
+
+        /// <summary>llama.cpp <c>--n-cpu-moe N</c>: the first N layers' experts on the CPU (issue #1071).</summary>
+        [CommandOption(DotLLM.Cli.Helpers.MoeOffloadCli.NCpuMoeOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.NCpuMoeHelp)]
+        public int? NCpuMoe { get; set; }
+
+        /// <summary>Re-run the MoE offload cost calibration (issue #1071).</summary>
+        [CommandOption(DotLLM.Cli.Helpers.MoeOffloadCli.CalibrateOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CalibrateHelp)]
+        [DefaultValue(false)]
+        public bool MoeCalibrate { get; set; }
+
+        /// <summary>
+        /// The raw MoE offload option values (issues #1070, #1071). The served context (<see cref="CtxSize"/>, <c>--ctx-size</c>,
+        /// #1068) is also the context the offload budget reserves KV cache for; 0 or unset keeps the default.
+        /// </summary>
+        public DotLLM.Core.Moe.MoeCliValues MoeValues => new(MoeOffload, MoeCacheMib, MoeCachePolicy, MoeCold, MoeCpuThreads,
+            CpuMoe, NCpuMoe, MoeCalibrate, CtxSize is > 0 ? CtxSize : null);
 
         /// <summary>CPU thread count.</summary>
         [CommandOption("--threads")]
@@ -61,15 +110,14 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 
         /// <summary>KV-cache key quantization type.</summary>
         [CommandOption("--cache-type-k")]
-        [Description("KV-cache key quantization: f32 (default), q8_0, q4_0.")]
-        [DefaultValue("f32")]
-        public string CacheTypeK { get; set; } = "f32";
+        [Description("KV-cache key quantization: f32 (default), f16, q8_0, q4_0. Synonym of --kv-quant-k. " +
+                     "For the CUDA hybrid-dense model f32 means 'not given' (DOTLLM_HYBRID_KV applies); use f16 to force unquantized.")]
+        public string? CacheTypeK { get; set; }
 
         /// <summary>KV-cache value quantization type.</summary>
         [CommandOption("--cache-type-v")]
-        [Description("KV-cache value quantization: f32 (default), q8_0, q4_0.")]
-        [DefaultValue("f32")]
-        public string CacheTypeV { get; set; } = "f32";
+        [Description("KV-cache value quantization: f32 (default), f16, q8_0, q4_0. Synonym of --kv-quant-v.")]
+        public string? CacheTypeV { get; set; }
 
         /// <summary>Disable prompt caching (enabled by default).</summary>
         [CommandOption("--no-prompt-cache")]
@@ -114,32 +162,289 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         public bool NoPaged { get; set; }
 
         /// <summary>Draft model for speculative decoding.</summary>
-        [CommandOption("--speculative-model")]
+        [CommandOption("--speculative-model|--draft-model")]
         [Description("Path or HuggingFace repo ID for a draft model. Enables speculative decoding for faster generation. Must share vocabulary with the main model.")]
         public string? SpeculativeModel { get; set; }
 
         /// <summary>Number of draft candidates per speculative step.</summary>
-        [CommandOption("--speculative-k")]
-        [Description("Number of draft tokens per speculative step (K). Default 5.")]
-        [DefaultValue(5)]
-        public int SpeculativeK { get; set; } = 5;
+        [CommandOption("--speculative-k|--draft-tokens")]
+        [Description("Number of draft tokens per speculative step (K). Default 3. Also used as K for MTP.")]
+        [DefaultValue(DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates)]
+        public int SpeculativeK { get; set; } = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
+
+        /// <summary>Accepted for back-compat: MTP is already on by default for models with an embedded head.</summary>
+        [CommandOption("--mtp")]
+        [Description("Multi-Token Prediction (MTP) self-speculative decoding is ON by default for serve when the loaded GGUF carries an " +
+                     "embedded MTP head (nextn.* tensors) and no --speculative-model is given and --expected-concurrency is below 5 " +
+                     "(adaptive: it backs off when drafts stop paying). --mtp is accepted for back-compat and only changes the startup log; " +
+                     "it does not override those rules. Use --no-mtp to opt out. Tradeoff: while MTP is active the continuous-batch " +
+                     "scheduler is off for this model.")]
+        [DefaultValue(false)]
+        public bool Mtp { get; set; }
+
+        /// <summary>Opt out of the default-on MTP self-speculative decoding.</summary>
+        [CommandOption("--no-mtp")]
+        [Description("Disable the default-on MTP self-speculative decoding for models with an embedded MTP head (keeps the continuous-batch " +
+                     "scheduler available for concurrent clients).")]
+        [DefaultValue(false)]
+        public bool NoMtp { get; set; }
+
+        /// <summary>Explicit MTP head GGUF for architectures that ship it as a separate file (qwen4exp).</summary>
+        [CommandOption("--mtp-head")]
+        [Description("Path of a separate MTP head GGUF (qwen4exp ships it as mtp-*.gguf beside the quantisation folders). Default: auto-detected in the model's " +
+                     "directory and the one above it (a head that does not fit the device is declined with a startup message and serving continues without it).")]
+        public string? MtpHead { get; set; }
+
+        /// <summary>DFlash / DFlash2 drafter GGUF (issue #1175).</summary>
+        [CommandOption("--dflash")]
+        [Description("Path of a DFlash / DFlash2 drafter GGUF (arch 'dflash'). It takes the MTP slot; qwen35 targets on CPU, CUDA or Vulkan (drafter on the CPU).")]
+        public string? DFlash { get; set; }
+
+        /// <summary>How reasoning output is split from the answer (#767).</summary>
+        [CommandOption("--reasoning-format")]
+        [Description("How thinking output is separated from the answer: auto (default; split into reasoning_content + content when the chat " +
+                     "template opens a <think> block or the model emits one), deepseek (as auto, and <think> blocks are recognised anywhere in the " +
+                     "output), none (raw output in content, </think> included). Requests may override with reasoning_format.")]
+        [DefaultValue("auto")]
+        public string ReasoningFormat { get; set; } = "auto";
+
+        /// <summary>Expected number of concurrent decode streams; 5 or more enables the Vulkan continuous-batch scheduler.</summary>
+        [CommandOption("--expected-concurrency")]
+        [Description("Expected number of concurrently decoding requests. At 5 or more, Vulkan hybrid models serve through the continuous-batch " +
+                     "scheduler (measured +73% aggregate decode throughput at 8 concurrent on Tev1-4B; parity at 4 or fewer). At 5 or more, default-on MTP is dropped for the model. " +
+                     "0 (default) keeps the serial per-request path. DOTLLM_VK_SCHEDULER=0|1 overrides.")]
+        [DefaultValue(0)]
+        public int ExpectedConcurrency { get; set; }
+
+        /// <summary>Per-request message-count cap (#835).</summary>
+        [CommandOption("--max-messages")]
+        [Description("Maximum messages accepted per chat request on /v1/chat/completions and /v1/messages. Default 8192; 0 = unlimited. " +
+                     "Falls back to the DOTLLM_MAX_MESSAGES environment variable; the flag wins. The prompt-length-vs-context check still applies.")]
+        public int? MaxMessages { get; set; }
+
+        /// <summary>Download a missing Hugging Face model when a request or load names one.</summary>
+        [CommandOption("--auto-pull")]
+        [Description("Download a missing Hugging Face model when a request names one (e.g. model \"owner/repo:Q4_K_M\"), like 'ollama run' does. " +
+                     "Off by default: remote clients should not be able to start multi-gigabyte downloads.")]
+        [DefaultValue(false)]
+        public bool AutoPull { get; set; }
+
+        /// <summary>Logit temperature for POST /v1/systemone probabilities.</summary>
+        [CommandOption("--decision-temperature")]
+        [Description("Logit temperature for POST /v1/systemone probabilities (softmax(logits / T)). 0 or 1 (default) = the model's raw restricted softmax. " +
+                     "Tev1-4B is slightly under-confident: T=0.58 cut held-out NLL 0.0546 -> 0.0428 on a 480-item labelled set (scripts/decision-calibration.py); " +
+                     "fit your own on your task before relying on it.")]
+        [DefaultValue(0.0)]
+        public double DecisionTemperature { get; set; }
+
+        /// <summary>Option orderings averaged per noul/choice question on POST /v1/systemone.</summary>
+        [CommandOption("--decision-orderings")]
+        [Description("Option orderings averaged per noul/choice question on POST /v1/systemone: 1 (default) or 2 (forward + reversed, logits averaged; " +
+                     "reversal flipped 2.2% of Tev1-4B choice answers and averaging lifted choice accuracy 98.2 -> 98.9%, at twice the forward passes).")]
+        [DefaultValue(1)]
+        public int DecisionOrderings { get; set; }
+
+        /// <summary>Served context window in tokens (llama.cpp -c); null fits it to free VRAM where the model supports that (issue #1068).</summary>
+        [CommandOption("--ctx-size|-c")]
+        [Description("Served context window in tokens (llama.cpp -c). Default: the CUDA hybrid model (Bonsai, Qwen3.5/3.6 dense) fits it to free VRAM " +
+                     "at load and reports it in /props as max_sequence_length; other models keep the checkpoint's window. A value overrides the fit " +
+                     "(capped at the checkpoint's window); past the fit, requests are refused with an out-of-memory error instead of spilling into system RAM.")]
+        public int? CtxSize { get; set; }
+
+        /// <summary>Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog).</summary>
+        [CommandOption("--prefill-chunk-size|--ubatch-size")]
+        [Description("Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog). 0 = whole prompt in one pass (default). With the continuous-batch scheduler this caps prefill tokens admitted per step instead.")]
+        [DefaultValue(0)]
+        public int PrefillChunkSize { get; set; }
+
+        /// <summary>Maximum recurrent prefix snapshots.</summary>
+        [CommandOption("--prefix-snapshots")]
+        [Description("Maximum recurrent prefix snapshots (default 1). Use with --prefix-snapshot-host-budget for alternating sessions.")]
+        public int? PrefixSnapshots { get; set; }
+
+        /// <summary>Page-locked host byte budget for recurrent prefix snapshots.</summary>
+        [CommandOption("--prefix-snapshot-host-budget")]
+        [Description("Page-locked host snapshot budget, such as 8GiB. Default 0 disables host retention.")]
+        public string? PrefixSnapshotHostBudget { get; set; }
+
+        /// <summary>Directory for ephemeral recurrent prefix spill files.</summary>
+        [CommandOption("--prefix-snapshot-disk-dir")]
+        [Description("Directory for recurrent prefix spill files; requires a positive disk budget.")]
+        public string? PrefixSnapshotDiskDirectory { get; set; }
+
+        /// <summary>Maximum disk snapshot bytes.</summary>
+        [CommandOption("--prefix-snapshot-disk-budget")]
+        [Description("Snapshot spill budget, such as 32GiB; requires a disk directory. Default 0 disables disk retention.")]
+        public string? PrefixSnapshotDiskBudget { get; set; }
+
+        /// <inheritdoc/>
+        public override ValidationResult Validate()
+        {
+            try { ServerOptions.BuildPrefixSnapshotOptions(PrefixSnapshots, PrefixSnapshotHostBudget, PrefixSnapshotDiskDirectory, PrefixSnapshotDiskBudget); }
+            catch (ArgumentException ex) { return ValidationResult.Error(ex.Message); }
+            return base.Validate();
+        }
+
+        [CommandOption("--rope-scaling")]
+        [Description("RoPE scaling override: 'none', 'linear', 'yarn', 'ntk', 'dynamic'. Overrides the GGUF-derived value.")]
+        public string? RopeScaling { get; set; }
+
+        [CommandOption("--rope-freq-base")]
+        [Description("RoPE base frequency (theta) override. Overrides the GGUF-derived value.")]
+        public float? RopeFreqBase { get; set; }
+
+        [CommandOption("--rope-scale")]
+        [Description("RoPE scaling factor override (linear/YaRN/NTK). Overrides the GGUF-derived value.")]
+        public float? RopeScale { get; set; }
+
+        [CommandOption("--yarn-orig-ctx")]
+        [Description("YaRN original context length override.")]
+        public int? YarnOrigCtx { get; set; }
+
+        [CommandOption("--yarn-attn-factor")]
+        [Description("YaRN attention factor override.")]
+        public float? YarnAttnFactor { get; set; }
+
+        [CommandOption("--yarn-beta-fast")]
+        [Description("YaRN beta-fast parameter override.")]
+        public float? YarnBetaFast { get; set; }
+
+        [CommandOption("--yarn-beta-slow")]
+        [Description("YaRN beta-slow parameter override.")]
+        public float? YarnBetaSlow { get; set; }
+
+        /// <summary>Idle-unload duration in seconds (#369, ollama parity).</summary>
+        [CommandOption("--keep-alive")]
+        [Description("Idle-unload duration in seconds (ollama parity; default 300 = 5 min). 0 = unload after each request. Negative = never unload.")]
+        [DefaultValue(300.0)]
+        public double KeepAlive { get; set; } = 300;
+
+        /// <summary>Maximum number of models resident at once (#369).</summary>
+        [CommandOption("--max-resident-models")]
+        [Description("Maximum number of models resident at once, counting the active one (default 1 = classic single-model hot-swap). Set > 1 to hold multiple models concurrently.")]
+        [DefaultValue(1)]
+        public int MaxResidentModels { get; set; } = 1;
+
+        /// <summary>Total byte budget across all resident models (#369).</summary>
+        [CommandOption("--resident-memory-budget")]
+        [Description("Total byte budget across all resident models. 0 (default) = unlimited, only --max-resident-models bounds residency.")]
+        [DefaultValue(0L)]
+        public long ResidentMemoryBudgetBytes { get; set; }
+
+        /// <summary>Enables the #454 model-administration write endpoints (off by default).</summary>
+        [CommandOption("--allow-model-admin")]
+        [Description("Enable the model-administration API (#454): POST /v1/models/unload, /pull, /enable, /disable and PUT /v1/settings. Off by default.")]
+        public bool AllowModelAdmin { get; set; }
+
+        /// <summary>Enables the LoRA admin write endpoints (off by default).</summary>
+        [CommandOption("--allow-lora-admin")]
+        [Description("Enable the LoRA admin API: POST /v1/lora/load and DELETE /v1/lora/{name}. Off by default.")]
+        public bool AllowLoraAdmin { get; set; }
+
+        /// <summary>
+        /// Per-API-key request cap (#457). 0 = no per-request cap. Any of the three rate-limit
+        /// options being set turns the limiter on; it is off by default.
+        /// </summary>
+        [CommandOption("--rate-limit-rpm")]
+        [Description("Rate limit: max requests per minute per API key. 0 = unlimited. Setting any --rate-limit-* option enables rate limiting (off by default).")]
+        public int RateLimitRequestsPerMinute { get; set; }
+
+        /// <summary>Per-API-key token cap (#457). 0 = no per-token cap.</summary>
+        [CommandOption("--rate-limit-tpm")]
+        [Description("Rate limit: max tokens per minute per API key (prompt + completion). 0 = unlimited.")]
+        public int RateLimitTokensPerMinute { get; set; }
+
+        /// <summary>Per-API-key concurrency cap (#457). 0 = no concurrency cap.</summary>
+        [CommandOption("--rate-limit-concurrency")]
+        [Description("Rate limit: max concurrent in-flight requests per API key. 0 = unlimited.")]
+        public int RateLimitConcurrency { get; set; }
+    }
+
+    /// <summary>
+    /// Builds the rate-limit config from the CLI options (#457), or <see langword="null"/> when
+    /// no cap was requested.
+    /// </summary>
+    /// <remarks>
+    /// Returning null (rather than a disabled config) keeps <c>RateLimitMiddleware</c> on its
+    /// pass-through path, so an unconfigured server pays nothing.
+    /// </remarks>
+    private static DotLLM.Server.RateLimiting.RateLimitConfig? BuildRateLimit(Settings settings)
+    {
+        if (settings.RateLimitRequestsPerMinute <= 0
+            && settings.RateLimitTokensPerMinute <= 0
+            && settings.RateLimitConcurrency <= 0)
+        {
+            return null;
+        }
+
+        return new DotLLM.Server.RateLimiting.RateLimitConfig
+        {
+            Enabled = true,
+            DefaultPolicy = new DotLLM.Server.RateLimiting.RateLimitPolicy
+            {
+                RequestsPerMinute = settings.RateLimitRequestsPerMinute,
+                TokensPerMinute = settings.RateLimitTokensPerMinute,
+                MaxConcurrent = settings.RateLimitConcurrency,
+            },
+        };
     }
 
     /// <inheritdoc/>
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
     {
+        // Timestamp every "[dotllm] ..." line from here on, startup load included (#1021).
+        DotLLM.Server.ServerLog.InstallTimestamps();
+
+        // Reject an unrecognised --device up front instead of serving on the CPU (#468/#790).
+        if (DeviceSpec.TryParse(settings.Device, out _, out string? deviceError) is false)
+        {
+            AnsiConsole.MarkupLine($"[red]{Markup.Escape(deviceError!)}[/]");
+            return 1;
+        }
+        if (DotLLM.Cli.Helpers.MoeOffloadCli.Validate(settings.MoeValues) is { } moeError)
+        {
+            AnsiConsole.MarkupLine($"[red]{Markup.Escape(moeError)}[/]");
+            return 1;
+        }
+
+        // #967: --kv-quant-k/-v are synonyms of --cache-type-k/-v; reject conflicts and bad values up front.
+        if (!DotLLM.Cli.Helpers.KvStorageCli.TryBuild(settings.CacheTypeK, settings.CacheTypeV,
+                settings.KvQuantK, settings.KvQuantV, 0, out _, out string? kvFlagError))
+        {
+            AnsiConsole.MarkupLine($"[red]{Markup.Escape(kvFlagError!)}[/]");
+            return 1;
+        }
+
+        int? maxMessages;
+        try
+        {
+            maxMessages = ServerOptions.ResolveMaxMessages(
+                settings.MaxMessages, Environment.GetEnvironmentVariable(ServerOptions.MaxMessagesEnvVar));
+        }
+        catch (ArgumentException ex)
+        {
+            AnsiConsole.MarkupLine($"[red]{Markup.Escape(ex.Message)}[/]");
+            return 1;
+        }
+
         var serverOptions = new ServerOptions
         {
+            MaxMessages = maxMessages,
             Model = settings.Model ?? "",
+            ExpectedConcurrency = settings.ExpectedConcurrency,
+            AutoPull = settings.AutoPull,
+            DecisionTemperature = settings.DecisionTemperature,
+            DecisionOrderings = Math.Clamp(settings.DecisionOrderings, 1, 2),
             Quant = settings.Quant,
             Device = settings.Device,
             GpuLayers = settings.GpuLayers,
+            MoeOffload = DotLLM.Cli.Helpers.MoeOffloadCli.Build(settings.MoeValues),
             Threads = settings.Threads,
             DecodeThreads = settings.DecodeThreads,
             Host = settings.Host,
             Port = settings.Port,
-            CacheTypeK = settings.CacheTypeK,
-            CacheTypeV = settings.CacheTypeV,
+            CacheTypeK = settings.KvQuantK ?? settings.CacheTypeK ?? "f32",
+            CacheTypeV = settings.KvQuantV ?? settings.CacheTypeV ?? "f32",
             PromptCacheEnabled = !settings.NoPromptCache,
             PromptCacheSize = settings.PromptCacheSize,
             Warmup = new WarmupOptions
@@ -150,7 +455,31 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             UsePaged = !settings.NoPaged,
             SpeculativeModel = settings.SpeculativeModel,
             SpeculativeCandidates = settings.SpeculativeK,
+            MtpEnabled = !settings.NoMtp,
+            MtpExplicit = settings.Mtp && !settings.NoMtp,
+            MtpHeadPath = settings.MtpHead,
+            DFlashPath = settings.DFlash,
+            ReasoningFormat = DotLLM.Tokenizers.Reasoning.ReasoningFormats.Parse(settings.ReasoningFormat),
+            PrefillChunkSize = settings.PrefillChunkSize,
+            PrefixSnapshots = settings.PrefixSnapshots,
+            PrefixSnapshotHostBudgetBytes = ServerOptions.ParsePrefixSnapshotHostBudget(settings.PrefixSnapshotHostBudget),
+            PrefixSnapshotDiskDirectory = settings.PrefixSnapshotDiskDirectory,
+            PrefixSnapshotDiskBudgetBytes = ServerOptions.ParsePrefixSnapshotDiskBudget(settings.PrefixSnapshotDiskBudget),
+            ContextSize = settings.CtxSize is > 0 ? settings.CtxSize : null,
+            KeepAliveSeconds = settings.KeepAlive,
+            MaxResidentModels = settings.MaxResidentModels,
+            ResidentMemoryBudgetBytes = settings.ResidentMemoryBudgetBytes,
+            AllowModelAdminApi = settings.AllowModelAdmin,
+            AllowLoraAdminApi = settings.AllowLoraAdmin,
+            // #457: nothing in src/ ever assigned RateLimit, so the entire RateLimiting
+            // subsystem was unreachable — no invocation of `dotllm serve` could produce a 429,
+            // and the limiter was exercised only by unit tests constructing the config directly.
+            // Off unless a cap is given, so the default behaviour is unchanged.
+            RateLimit = BuildRateLimit(settings),
             ModelId = "none",
+            RopeOverride = ServerOptions.BuildRopeOverride(settings.RopeScaling, settings.RopeFreqBase,
+                settings.RopeScale, settings.YarnOrigCtx, settings.YarnAttnFactor,
+                settings.YarnBetaFast, settings.YarnBetaSlow),
         };
 
         ServerState? state = null;
@@ -158,21 +487,29 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         if (!string.IsNullOrEmpty(settings.Model))
         {
             // Resolve and load model
-            var resolvedPath = GgufFileResolver.Resolve(settings.Model, settings.Quant);
+            var resolvedPath = GgufFileResolver.Resolve(settings.Model, settings.Quant, allowPull: true);
             if (resolvedPath is null)
                 return 1;
 
-            string modelId = Path.GetFileNameWithoutExtension(resolvedPath);
-            if (settings.Model.Contains('/'))
-                modelId = settings.Model.Split('/')[^1];
-            serverOptions = serverOptions with { ModelId = modelId };
+            // The stable id of this file (#1021): owner/repo/rel for a store file, the full path for a file outside the stores - the same
+            // key a later load/request of it produces, and never a bare stem a client could persist and later see resolve elsewhere.
+            serverOptions = serverOptions with { ModelId = ServerStartup.ModelIdFor(settings.Model, resolvedPath) };
 
-            AnsiConsole.Status()
-                .Spinner(Spinner.Known.Dots)
-                .Start("Loading and warming up model...", _ =>
-                {
-                    state = ServerStartup.LoadModel(resolvedPath, serverOptions);
-                });
+            try
+            {
+                AnsiConsole.Status()
+                    .Spinner(Spinner.Known.Dots)
+                    .Start("Loading and warming up model...", _ =>
+                    {
+                        state = ServerStartup.LoadModel(resolvedPath, serverOptions);
+                    });
+            }
+            catch (DeviceUnavailableException ex)
+            {
+                // An explicit GPU that cannot be honoured: clean what/why/opt-in message, failing exit code, never a CPU server (#790).
+                AnsiConsole.MarkupLine($"[red]{Markup.Escape(ex.Message)}[/]");
+                return 1;
+            }
         }
         else
         {
@@ -192,6 +529,11 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             AnsiConsole.MarkupLine(
                 $"  [bold]{state.Config!.Architecture}[/] {state.Config.NumLayers}L/{state.Config.HiddenSize}H | " +
                 $"{Markup.Escape(Path.GetFileName(state.LoadedModelPath))}");
+            // Same device report as run/chat and /props (#790).
+            string reqDev = state.Options.Device, resDev = state.Options.ResolvedDevice ?? state.Options.Device;
+            AnsiConsole.MarkupLine($"  device: {Markup.Escape(string.Equals(reqDev, resDev, StringComparison.OrdinalIgnoreCase) ? resDev : reqDev + " -> " + resDev)}");
+            if (state.DeviceFallbackWarning is { } devWarn)
+                AnsiConsole.MarkupLine($"  [bold yellow]WARNING: {Markup.Escape(devWarn)}[/]");
         }
         else
         {

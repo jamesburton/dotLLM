@@ -1,0 +1,77 @@
+#version 450
+// Shared-memory tiled F32 GEMM for N > 1: C[N,M] = B[N,K] @ A[M,K]^T  (same layout / push constants as matmul_f32.comp).
+//
+// matmul_f32.comp assigns one thread per output cell with no reuse: every A row is re-read from global memory by each of the N
+// token rows and the K-strided A reads are uncoalesced. On Qwen3.6-35B-A3B prefill the F32 router matmul (K=2048, M=256) cost
+// ~30 ms/forward. Here a 16x16 workgroup computes a 32x32 output tile (2x2 cells per thread), staging BK=16 slices of A and B in
+// shared memory with K-contiguous (coalesced) loads.
+//
+// Dispatch: groupCount = (ceil(M/32), ceil(N/32), 1).
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufA { float a[]; }; // [M*K]
+layout(set = 0, binding = 1, std430) readonly  buffer BufB { float b[]; }; // [N*K]
+layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[]; }; // [N*M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+} pc;
+
+const uint TILE = 32u;
+const uint BK = 16u;
+
+// [k][row] layout, +1 pad against bank conflicts on the transposed read.
+shared float As[BK][TILE + 1u];
+shared float Bs[BK][TILE + 1u];
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+    uint tid = ty * 16u + tx;
+    uint mBase = gl_WorkGroupID.x * TILE;
+    uint nBase = gl_WorkGroupID.y * TILE;
+
+    // Load mapping: 256 threads, tile is 32 rows x 16 k = 512 floats => 2 per thread; consecutive tids walk k (coalesced).
+    uint lk = tid & 15u;
+    uint lr = tid >> 4u; // 0..15; second element is lr + 16
+
+    float acc00 = 0.0, acc01 = 0.0, acc10 = 0.0, acc11 = 0.0;
+
+    for (uint k0 = 0u; k0 < pc.K; k0 += BK) {
+        uint kk = k0 + lk;
+        bool kOk = kk < pc.K;
+        for (uint h = 0u; h < 2u; h++) {
+            uint r = lr + h * 16u;
+            uint am = mBase + r;
+            uint bn = nBase + r;
+            As[lk][r] = (kOk && am < pc.M) ? a[am * pc.K + kk] : 0.0;
+            Bs[lk][r] = (kOk && bn < pc.N) ? b[bn * pc.K + kk] : 0.0;
+        }
+        barrier();
+        for (uint j = 0u; j < BK; j++) {
+            float a0 = As[j][tx];
+            float a1 = As[j][tx + 16u];
+            float b0 = Bs[j][ty];
+            float b1 = Bs[j][ty + 16u];
+            acc00 += a0 * b0;
+            acc01 += a1 * b0;
+            acc10 += a0 * b1;
+            acc11 += a1 * b1;
+        }
+        barrier();
+    }
+
+    uint m0 = mBase + tx, m1 = m0 + 16u;
+    uint n0 = nBase + ty, n1 = n0 + 16u;
+    if (n0 < pc.N) {
+        if (m0 < pc.M) c[n0 * pc.M + m0] = acc00;
+        if (m1 < pc.M) c[n0 * pc.M + m1] = acc01;
+    }
+    if (n1 < pc.N) {
+        if (m0 < pc.M) c[n1 * pc.M + m0] = acc10;
+        if (m1 < pc.M) c[n1 * pc.M + m1] = acc11;
+    }
+}
