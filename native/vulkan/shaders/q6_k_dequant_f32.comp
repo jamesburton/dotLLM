@@ -1,0 +1,118 @@
+#version 450
+// Q6_K dequantization to FP32.
+//
+// Reads a tightly-packed Q6_K blob (one 210-byte super-block per 256 elements)
+// and produces a contiguous FP32 buffer of the dequantized values. Layout
+// matches DotLLM.Cpu.Kernels.DequantizeKQuants.DequantizeQ6_K and llama.cpp's
+// block_q6_K byte-for-byte:
+//
+//   bytes [  0..127] = ql[128]     — low 4 bits, 2 elements per byte
+//   bytes [128..191] = qh[64]      — high 2 bits, 4 elements per byte
+//   bytes [192..207] = scales[16]  — int8 per-sub-block scales (16 elements each)
+//   bytes [208, 209] = fp16 d      — global delta
+//
+// Per-element decode (t in [0, 256)), matching dequantize_row_q6_K's two
+// 128-element halves — half = t/128, n = t%128, g = n/32, l = n%32,
+// isc = l/16, qlOff = half*64, qhOff = half*32, scOff = half*8:
+//
+//   g == 0: q = ((ql[qlOff+l]    & 0xF) | (((qh[qhOff+l] >> 0) & 3) << 4)) - 32; si = scOff+isc
+//   g == 1: q = ((ql[qlOff+l+32] & 0xF) | (((qh[qhOff+l] >> 2) & 3) << 4)) - 32; si = scOff+isc+2
+//   g == 2: q = ((ql[qlOff+l]    >> 4) | (((qh[qhOff+l] >> 4) & 3) << 4)) - 32; si = scOff+isc+4
+//   g == 3: q = ((ql[qlOff+l+32] >> 4) | (((qh[qhOff+l] >> 6) & 3) << 4)) - 32; si = scOff+isc+6
+//   value = (d * scales[si]) * q        (scales are SIGNED int8)
+//
+// The multiply sequence mirrors the CPU scalar oracle exactly and is marked
+// `precise` so the compiler cannot contract it into an FMA — the
+// GPU-dequantised token-embed table must be bit-identical to the CPU path
+// (issue #147 load-parity gate).
+//
+// Dispatch:
+//   One workgroup per 210-byte super-block, 256 threads, one element per
+//   thread. Large tensors are dispatched in chunks: gl_WorkGroupID.x is
+//   offset by pc.firstBlock.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  src[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer BufY { float dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint totalBlocks;
+    uint srcUints;
+    uint firstBlock;
+} pc;
+
+const uint Q6K_BLOCK_BYTES = 210u;
+const uint Q6K_GROUP_SIZE  = 256u;
+
+uint readByte(uint absByteOff) {
+    uint u = src[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = src[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = src[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+// int8 read (two's complement).
+int readSByte(uint absByteOff) {
+    int b = int(readByte(absByteOff));
+    return b >= 128 ? b - 256 : b;
+}
+
+void main() {
+    uint block = gl_WorkGroupID.x + pc.firstBlock;
+    if (block >= pc.totalBlocks) return;
+
+    uint t = gl_LocalInvocationID.x;        // 0..255
+    uint blockBase  = block * Q6K_BLOCK_BYTES;
+    uint qlBase     = blockBase;
+    uint qhBase     = blockBase + 128u;
+    uint scalesBase = blockBase + 192u;
+    float d         = readHalf(blockBase + 208u);
+
+    uint half_ = t >> 7u;                    // 0..1
+    uint n     = t & 127u;
+    uint g     = n >> 5u;                    // 0..3
+    uint l     = n & 31u;
+    uint isc   = l >> 4u;                    // 0..1
+    uint qlOff = half_ * 64u;
+    uint qhOff = half_ * 32u;
+    uint scOff = half_ * 8u;
+
+    uint qhByte = readByte(qhBase + qhOff + l);
+    uint qlLo   = readByte(qlBase + qlOff + l);
+    uint qlHi   = readByte(qlBase + qlOff + l + 32u);
+
+    int q;
+    uint si;
+    if (g == 0u) {
+        q = int((qlLo & 0xFu) | (((qhByte >> 0u) & 3u) << 4u)) - 32;
+        si = scOff + isc;
+    } else if (g == 1u) {
+        q = int((qlHi & 0xFu) | (((qhByte >> 2u) & 3u) << 4u)) - 32;
+        si = scOff + isc + 2u;
+    } else if (g == 2u) {
+        q = int((qlLo >> 4u) | (((qhByte >> 4u) & 3u) << 4u)) - 32;
+        si = scOff + isc + 4u;
+    } else {
+        q = int((qlHi >> 4u) | (((qhByte >> 6u) & 3u) << 4u)) - 32;
+        si = scOff + isc + 6u;
+    }
+
+    int scale = readSByte(scalesBase + si);
+    precise float ds = d * float(scale);
+    precise float v = ds * float(q);
+    dst[block * Q6K_GROUP_SIZE + t] = v;
+}

@@ -1,0 +1,126 @@
+#version 450
+// Mamba-3 canonical SSD scan (SISO variant) — recurrent attention-style kernel.
+//
+// Mirrors DotLLM.Cpu.Kernels.Mamba3CanonicalSsd.ExecuteSiso. Per token t the
+// inner state update is:
+//   decay = exp(adt[t, h])
+//   scl   = scale[t, h]
+//   skip  = d[h] + gamma[t, h] * qkPreDot[t, h]
+//   for p in [0, headDim):
+//     yScan = 0
+//     for n in [0, dState):
+//       state[h, p, n] = decay * state[h, p, n] + V[t, h, p] * (K[t, h, n] * scl)
+//       yScan         += Q[t, h, n] * state[h, p, n]
+//     y[t, h, p] = yScan + skip * V[t, h, p]
+//     if hasZ: y[t, h, p] *= silu(z[t, h, p])
+//
+// Dispatch:
+//   local_size_x = 256
+//   groupCount.x = nHead              (one workgroup per head — heads are independent)
+// Each thread tid covers p = tid + n*256 for n covering [0, headDim). For
+// Mamba-3 typical headDim is 64-128 so threads loop 1 iteration; large
+// headDim values stride safely.
+//
+// Sequential over t inside the shader: the recurrence carries through the
+// state buffer and a chunked prefix-scan port is out of scope.
+//
+// Per token, thread 0 broadcasts decay, scl, gm, qkp and the resulting skip
+// into shared memory. All threads then read these values and run the inner
+// per-(p, n) update over global memory. A barrier closes each token so
+// thread 0 can safely overwrite the shared values for the next t.
+//
+// State persistence: state is the only RW buffer. Calling the shader N
+// times with the same state buffer is bit-equivalent to one call with the
+// concatenated input.
+
+#define WG_SIZE 256
+
+layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding =  0, std430)          buffer BufState    { float st[];    }; // [nHead, headDim, dState] (RW)
+layout(set = 0, binding =  1, std430) readonly buffer BufV        { float v[];     }; // [seqLen, nHead, headDim]
+layout(set = 0, binding =  2, std430) readonly buffer BufQRoped   { float qR[];    }; // [seqLen, nHead, dState]
+layout(set = 0, binding =  3, std430) readonly buffer BufKRoped   { float kR[];    }; // [seqLen, nHead, dState]
+layout(set = 0, binding =  4, std430) readonly buffer BufQkPreDot { float qkp[];   }; // [seqLen, nHead]
+layout(set = 0, binding =  5, std430) readonly buffer BufScale    { float scl[];   }; // [seqLen, nHead]
+layout(set = 0, binding =  6, std430) readonly buffer BufGamma    { float gm[];    }; // [seqLen, nHead]
+layout(set = 0, binding =  7, std430) readonly buffer BufAdt      { float adt[];   }; // [seqLen, nHead]
+layout(set = 0, binding =  8, std430) readonly buffer BufD        { float d[];     }; // [nHead]
+layout(set = 0, binding =  9, std430) readonly buffer BufZ        { float z[];     }; // [seqLen, nHead, headDim] (only read if hasZ != 0)
+layout(set = 0, binding = 10, std430) writeonly buffer BufY       { float y[];     }; // [seqLen, nHead, headDim]
+
+layout(push_constant) uniform PushConstants {
+    uint seqLen;
+    uint nHead;
+    uint headDim;
+    uint dState;
+    uint hasZ;
+} pc;
+
+shared float decayShared;
+shared float sclShared;
+shared float skipShared;
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    if (h >= pc.nHead) return;
+
+    uint tid           = gl_LocalInvocationID.x;
+    uint stateHeadBase = h * pc.headDim * pc.dState;
+    float dh           = d[h];
+
+    for (uint t = 0u; t < pc.seqLen; t++) {
+        // 1. Per-(t, h) broadcast: thread 0 produces decay, scl, skip.
+        if (tid == 0u) {
+            uint hdrIdx = t * pc.nHead + h;
+            float decay = exp(adt[hdrIdx]);
+            float scl_  = scl[hdrIdx];
+            float gm_   = gm[hdrIdx];
+            float qkp_  = qkp[hdrIdx];
+            float skip_ = dh + gm_ * qkp_;
+            decayShared = decay;
+            sclShared   = scl_;
+            skipShared  = skip_;
+        }
+        barrier();
+
+        float decay = decayShared;
+        float scaleT = sclShared;
+        float skipT = skipShared;
+
+        uint vRowBase  = t * pc.nHead * pc.headDim + h * pc.headDim;
+        uint bcRowBase = t * pc.nHead * pc.dState  + h * pc.dState;
+        uint yRowBase  = vRowBase;          // y has the same [T, H, P] layout as v
+        uint zRowBase  = vRowBase;          // z has the same [T, H, P] layout as v
+
+        // 2. Each thread strides over p. For typical Mamba-3 headDim ∈ {64, 128}
+        //    this is 1 iteration; larger headDim values stride safely.
+        for (uint p = tid; p < pc.headDim; p += WG_SIZE) {
+            float vp = v[vRowBase + p];
+            uint stateRowBase = stateHeadBase + p * pc.dState;
+
+            float yScan = 0.0;
+            for (uint n = 0u; n < pc.dState; n++) {
+                // h_new[p, n] = decay * h_old[p, n] + V[p] * (K[n] * scale)
+                float kScaled = kR[bcRowBase + n] * scaleT;
+                float s = decay * st[stateRowBase + n] + vp * kScaled;
+                st[stateRowBase + n] = s;
+                yScan += qR[bcRowBase + n] * s;
+            }
+
+            float yOut = yScan + skipT * vp;
+            if (pc.hasZ != 0u) {
+                float zv = z[zRowBase + p];
+                // silu(z) = z * sigmoid(z) = z / (1 + exp(-z))
+                float siluZ = zv / (1.0 + exp(-zv));
+                yOut *= siluZ;
+            }
+            y[yRowBase + p] = yOut;
+        }
+
+        // 3. Barrier before thread 0 overwrites the shared decay / scl / skip
+        //    on the next iteration. (No data hazard on state / y across t —
+        //    each thread keeps the same p set and writes its own y/state lane.)
+        barrier();
+    }
+}
