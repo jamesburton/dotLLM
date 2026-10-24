@@ -86,8 +86,37 @@ internal sealed class MoeLayerWeights
         }
     }
 
-    /// <summary>Router gate.weight as F32 [numExperts, hiddenSize] row-major.</summary>
-    public readonly float[] Gate;
+    private readonly float[] _gate;
+    private nint _gateView;
+    private int _gateViewLength;
+
+    /// <summary>
+    /// Router gate.weight as F32 [numExperts, hiddenSize] row-major. Either a managed array (converted / test /
+    /// safetensors routers) or, for F32-on-disk GGUF routers, a zero-copy view of the mmap (#1168).
+    /// </summary>
+    public ReadOnlySpan<float> Gate
+    {
+        get
+        {
+            unsafe { return _gateView != 0 ? new ReadOnlySpan<float>((void*)_gateView, _gateViewLength) : _gate; }
+        }
+    }
+
+    /// <summary>Points <see cref="Gate"/> at F32 mmap memory instead of the managed array (which should then be empty).</summary>
+    internal void SetGateView(nint ptr, int length) { _gateView = ptr; _gateViewLength = length; }
+
+    /// <summary>
+    /// Loads a GGUF router: F32 tensors are returned as a mmap view in <paramref name="view"/> (empty array result);
+    /// other types are dequantized into a managed array (no in-place conversion GEMV yet).
+    /// </summary>
+    internal static float[] LoadRouter(nint src, int count, QuantizationType qt, out nint view)
+    {
+        if (qt == QuantizationType.F32) { view = src; return Array.Empty<float>(); }
+        view = 0;
+        var r = new float[count];
+        Dequantize.ToFloat32(src, count, qt, r);
+        return r;
+    }
 
     /// <summary>Per-expert <c>w1</c> (gate_proj) F32 pointers [intermediateSize, hiddenSize] row-major.</summary>
     public readonly nint[] W1;
@@ -266,7 +295,7 @@ internal sealed class MoeLayerWeights
                                           nint downRaw, QuantizationType downQt)
     {
         var m = new MoeLayerWeights(
-            Gate, W1, W2, W3, NumExperts, NumExpertsPerTok, HiddenSize, IntermediateSize, NormTopKProb,
+            _gate, W1, W2, W3, NumExperts, NumExpertsPerTok, HiddenSize, IntermediateSize, NormTopKProb,
             SharedGateProj, SharedUpProj, SharedDownProj, SharedIntermediateSize, SharedExpertGate,
             gateRaw, gateQt, GateExpsMDim, GateExpsKDim,
             upRaw, upQt, UpExpsMDim, UpExpsKDim,
@@ -275,6 +304,7 @@ internal sealed class MoeLayerWeights
         m.SigmoidGating = SigmoidGating;
         m.SelectionBias = SelectionBias;
         m.WeightsScale = WeightsScale;
+        m._gateView = _gateView; m._gateViewLength = _gateViewLength;
         return m;
     }
 
@@ -445,7 +475,7 @@ internal sealed class MoeLayerWeights
             throw new ArgumentException(
                 "Shared-expert pointer arrays must all have the same length (number of shared experts).");
 
-        Gate = gate;
+        _gate = gate;
         W1 = w1; W2 = w2; W3 = w3;
         NumExperts = numExperts;
         NumExpertsPerTok = numExpertsPerTok;
@@ -1938,9 +1968,7 @@ internal sealed class TransformerWeights : IDisposable
         // row-major (M outer) == [numExperts, hidden] — exactly the kernel's gate
         // layout. Small → dequant inline to F32.
         var routerDesc = tensors[$"{prefix}.ffn_gate_inp.weight"];
-        float[] router = new float[(long)numExperts * hiddenSize];
-        Dequantize.ToFloat32(dataBase.Of(routerDesc),
-            (long)numExperts * hiddenSize, routerDesc.QuantizationType, router);
+        float[] router = MoeLayerWeights.LoadRouter(dataBase.Of(routerDesc), numExperts * hiddenSize, routerDesc.QuantizationType, out nint routerView);
 
         // Fused gate_up experts ffn_gate_up_exps [K=hidden, 2*Ie, E]: per expert a
         // [2*Ie, hidden] slab, gate = rows [0, Ie), up = rows [Ie, 2*Ie). Expose as
@@ -1999,6 +2027,7 @@ internal sealed class TransformerWeights : IDisposable
             sharedGateRaw: Array.Empty<nint>(), sharedGateRawQt: QuantizationType.F32,
             sharedUpRaw: Array.Empty<nint>(), sharedUpRawQt: QuantizationType.F32,
             sharedDownRaw: Array.Empty<nint>(), sharedDownRawQt: QuantizationType.F32);
+        if (routerView != 0) moe.SetGateView(routerView, numExperts * hiddenSize);
 
         // ── MoE-only extras (dual-FFN split norms + router/expert scales) ──
         preFfwNorm2 = DequantizeNorm(dataBase, tensors[$"{prefix}.pre_ffw_norm_2.weight"], hiddenSize);
@@ -2109,12 +2138,7 @@ internal sealed class TransformerWeights : IDisposable
 
         // Router (2D, F32 — small, dequant inline) + optional bias.
         var routerDesc = tensors[$"{prefix}.ffn_gate_inp.weight"];
-        float[] router = new float[numExperts * hiddenSize];
-        Dequantize.ToFloat32(
-            dataBase.Of(routerDesc),
-            (long)numExperts * hiddenSize,
-            routerDesc.QuantizationType,
-            router);
+        float[] router = MoeLayerWeights.LoadRouter(dataBase.Of(routerDesc), numExperts * hiddenSize, routerDesc.QuantizationType, out nint routerView);
         float[]? routerBias = LoadOptionalBias(dataBase, tensors, $"{prefix}.ffn_gate_inp.bias");
 
         var gateDesc = tensors[$"{prefix}.ffn_gate_exps.weight"];
@@ -2168,6 +2192,7 @@ internal sealed class TransformerWeights : IDisposable
             UseSwiGluOai = moe.UseSwiGluOai,
             SoftmaxAfterTopK = moe.SoftmaxAfterTopK,
         };
+        if (routerView != 0) bundle.SetGateView(routerView, numExperts * hiddenSize);
         return bundle;
     }
 
@@ -2512,12 +2537,7 @@ internal sealed class TransformerWeights : IDisposable
 
         // Router (2D, F32 — small, dequant inline).
         var routerDesc = tensors[$"{prefix}.ffn_gate_inp.weight"];
-        float[] router = new float[numExperts * hiddenSize];
-        Dequantize.ToFloat32(
-            dataBase.Of(routerDesc),
-            (long)numExperts * hiddenSize,
-            routerDesc.QuantizationType,
-            router);
+        float[] router = MoeLayerWeights.LoadRouter(dataBase.Of(routerDesc), numExperts * hiddenSize, routerDesc.QuantizationType, out nint routerView);
 
         // Per-expert routed projections. Populate BOTH the F32 dequant (for
         // the CPU MoeSwiGluMlp oracle path) AND the raw GGUF mmap pointer +
@@ -2666,6 +2686,7 @@ internal sealed class TransformerWeights : IDisposable
             sharedGateRaw: sharedGateRaw, sharedGateRawQt: sharedGateRawQt,
             sharedUpRaw: sharedUpRaw, sharedUpRawQt: sharedUpRawQt,
             sharedDownRaw: sharedDownRaw, sharedDownRawQt: sharedDownRawQt);
+        if (routerView != 0) moeLayer.SetGateView(routerView, numExperts * hiddenSize);
         moeLayer.SigmoidGating = moe.SigmoidGating;
         moeLayer.SelectionBias = selectionBias;
         moeLayer.WeightsScale = moe.ExpertWeightsScale;

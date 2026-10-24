@@ -1438,7 +1438,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     }
 
     /// <summary>Allocates a device F32 buffer and copies a managed <c>float[]</c> into it.</summary>
-    private static nint UploadF32Array(float[] hostArray, List<nint>? allocs = null)
+    private static nint UploadF32Array(ReadOnlySpan<float> hostArray, List<nint>? allocs = null)
     {
         long bytes = (long)hostArray.Length * sizeof(float);
         nint device = AllocDevice(bytes, allocs);
