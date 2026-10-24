@@ -1,0 +1,6 @@
+#version 450
+// F16-KV twin of attention_f32_splitkv_rows.comp (issue #1171): the same kernel reading K / V stored as F16 (two halves per 32-bit word,
+// see kv_load.glsl). Body: attention_f32_splitkv_rows.glsl.
+#define KV_F16 1
+#extension GL_GOOGLE_include_directive : require
+#include "attention_f32_splitkv_rows.glsl"

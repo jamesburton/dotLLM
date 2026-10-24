@@ -1,0 +1,306 @@
+using System.Runtime.InteropServices;
+using DotLLM.Core.Models;
+
+namespace DotLLM.Models.Architectures;
+
+/// <summary>
+/// CPU <see cref="IMtpState"/> implementation: the MTP head's own tiny KV-cache (sized for just
+/// the trailing MTP block's attention, not the trunk) plus the pending-hidden-state handoff row
+/// and the captured-rows buffer a verify-phase <c>Forward</c> call populates. See issue #253 and
+/// <see cref="IMtpState"/> for the overall design; mirrors llama.cpp's
+/// <c>common_speculative_state_draft_mtp</c> (<c>common/speculative.cpp</c>), translated from a
+/// second <c>llama_context</c> into a plain per-sequence state object.
+/// </summary>
+public sealed unsafe class CpuMtpState : IMtpState, IDisposable
+{
+    private readonly int _hiddenSize;
+    private readonly int _numKvHeads;
+    private readonly int _headDim;
+    private int _maxSteps;            // hard ceiling on positions (the trunk KV-cache's MaxLength); raised by a resume (issue #1088)
+    private int _capacity;            // rows currently allocated, <= _maxSteps; grows on demand (issue #966)
+    private readonly int _kvStride; // numKvHeads * headDim
+
+    private nint _keyCache;   // [capacity, kvStride]
+    private nint _valueCache; // [capacity, kvStride]
+    private readonly float[] _pendingHidden; // [hiddenSize] — seed for the next ForwardMtp call
+
+    // The trunk's hidden state at the last position absorbed into the MTP KV-cache (issue #469):
+    // the h_{p-1} that pairs with the next token x_p. Drafting rewrites _pendingHidden with the
+    // head's own output; this survives it, so the next absorb starts from a verified row.
+    private readonly float[] _carryHidden;
+
+    private float[] _capturedRows = []; // [rowCount, hiddenSize], grown on demand
+    private int _capturedRowCount;
+
+    private int _currentLength;
+    private bool _disposed;
+
+    /// <summary>
+    /// Hard ceiling on the positions this state can hold (the <c>maxSteps</c> it was created with).
+    /// Exceeding it throws <see cref="InvalidOperationException"/> before any write.
+    /// </summary>
+    public int MaxSteps => _maxSteps;
+
+    /// <summary>Positions currently allocated; grows in <see cref="MtpKvCapacity.GrowthStep"/> steps up to <see cref="MaxSteps"/>.</summary>
+    public int Capacity => _capacity;
+
+    /// <inheritdoc/>
+    public int CurrentLength => _currentLength;
+
+    /// <inheritdoc/>
+    public ReadOnlySpan<float> CapturedHiddenRows => _capturedRows.AsSpan(0, _capturedRowCount * _hiddenSize);
+
+    /// <inheritdoc/>
+    public int CapturedRowCount => _capturedRowCount;
+
+    /// <inheritdoc/>
+    public int HiddenSize => _hiddenSize;
+
+    /// <summary>
+    /// Creates a fresh MTP state. All buffers are zero-initialised (an empty MTP KV-cache and a
+    /// zero pending-hidden vector — the latter is always overwritten by
+    /// <see cref="SeedFromCapturedRow"/> before the first <c>ForwardMtp</c> call in normal use).
+    /// </summary>
+    /// <param name="hiddenSize">Model hidden size (matches <see cref="ModelConfig.HiddenSize"/>).</param>
+    /// <param name="numKvHeads">KV head count for the MTP block's own attention.</param>
+    /// <param name="headDim">Per-head dimension for the MTP block's own attention.</param>
+    /// <param name="maxSteps">Maximum autoregressive MTP draft steps to size the KV-cache for (typically the max candidate count K).</param>
+    public CpuMtpState(int hiddenSize, int numKvHeads, int headDim, int maxSteps)
+    {
+        if (hiddenSize <= 0) throw new ArgumentOutOfRangeException(nameof(hiddenSize));
+        if (numKvHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numKvHeads));
+        if (headDim <= 0) throw new ArgumentOutOfRangeException(nameof(headDim));
+        if (maxSteps <= 0) throw new ArgumentOutOfRangeException(nameof(maxSteps));
+
+        _hiddenSize = hiddenSize;
+        _numKvHeads = numKvHeads;
+        _headDim = headDim;
+        _maxSteps = maxSteps;
+        _kvStride = numKvHeads * headDim;
+
+        // Lazy KV (issue #966): min(ceiling, 1024) positions now, grown as positions are reached.
+        _capacity = MtpKvCapacity.Initial(maxSteps);
+        long kvBytes = (long)_capacity * _kvStride * sizeof(float);
+        _keyCache = (nint)NativeMemory.AlignedAlloc((nuint)kvBytes, 64);
+        _valueCache = (nint)NativeMemory.AlignedAlloc((nuint)kvBytes, 64);
+        NativeMemory.Clear((void*)_keyCache, (nuint)kvBytes);
+        NativeMemory.Clear((void*)_valueCache, (nuint)kvBytes);
+
+        _pendingHidden = new float[hiddenSize];
+        _carryHidden = new float[hiddenSize];
+    }
+
+    /// <summary>Read-only view of the pending hidden-state vector that seeds the next <c>ForwardMtp</c> call.</summary>
+    public ReadOnlySpan<float> PendingHidden => _pendingHidden;
+
+    /// <summary>Mutable view — the MTP forward implementation writes its own output hidden state here after each step.</summary>
+    internal Span<float> PendingHiddenMutable => _pendingHidden;
+
+    /// <summary>
+    /// Makes the buffers cover at least <paramref name="positions"/> rows (issue #966), preserving the
+    /// committed rows <c>[0, CurrentLength)</c>. Pointers from <see cref="KeyCachePtr"/> /
+    /// <see cref="ValueCachePtr"/> / the row getters are invalidated by a grow: re-fetch after calling.
+    /// Throws <see cref="InvalidOperationException"/> above <see cref="MaxSteps"/>.
+    /// </summary>
+    internal void EnsureCapacity(int positions)
+    {
+        ThrowIfDisposed();
+        int target = MtpKvCapacity.Next(_capacity, positions, _maxSteps);
+        if (target == _capacity)
+            return;
+
+        long newBytes = (long)target * _kvStride * sizeof(float);
+        long keepBytes = (long)Math.Min(_currentLength, _capacity) * _kvStride * sizeof(float);
+        nint newKey = (nint)NativeMemory.AlignedAlloc((nuint)newBytes, 64);
+        nint newValue;
+        try { newValue = (nint)NativeMemory.AlignedAlloc((nuint)newBytes, 64); }
+        catch { NativeMemory.AlignedFree((void*)newKey); throw; }
+        NativeMemory.Clear((void*)newKey, (nuint)newBytes);
+        NativeMemory.Clear((void*)newValue, (nuint)newBytes);
+        if (keepBytes > 0)
+        {
+            Buffer.MemoryCopy((void*)_keyCache, (void*)newKey, newBytes, keepBytes);
+            Buffer.MemoryCopy((void*)_valueCache, (void*)newValue, newBytes, keepBytes);
+        }
+        NativeMemory.AlignedFree((void*)_keyCache);
+        NativeMemory.AlignedFree((void*)_valueCache);
+        _keyCache = newKey;
+        _valueCache = newValue;
+        _capacity = target;
+    }
+
+    /// <summary>Seeds the pending hidden from the carried (last absorbed) trunk row.</summary>
+    internal void SetPendingFromCarry() => _carryHidden.CopyTo(_pendingHidden);
+
+    /// <summary>Seeds the pending hidden from captured row <paramref name="row"/> without moving the carry.</summary>
+    internal void SetPendingFromCapturedRow(int row)
+        => _capturedRows.AsSpan(row * _hiddenSize, _hiddenSize).CopyTo(_pendingHidden);
+
+    /// <summary>Key-cache row for MTP step <paramref name="step"/> (0-based), shape <c>[kvStride]</c>.</summary>
+    internal Span<float> GetKeyRow(int step)
+    {
+        ThrowIfDisposed();
+        if ((uint)step >= (uint)_capacity) throw new ArgumentOutOfRangeException(nameof(step));
+        return new Span<float>((float*)_keyCache + (long)step * _kvStride, _kvStride);
+    }
+
+    /// <summary>Value-cache row for MTP step <paramref name="step"/> (0-based), shape <c>[kvStride]</c>.</summary>
+    internal Span<float> GetValueRow(int step)
+    {
+        ThrowIfDisposed();
+        if ((uint)step >= (uint)_capacity) throw new ArgumentOutOfRangeException(nameof(step));
+        return new Span<float>((float*)_valueCache + (long)step * _kvStride, _kvStride);
+    }
+
+    /// <summary>
+    /// Base pointer to the full key-cache buffer, shape <c>[maxSteps, kvStride]</c> row-major.
+    /// Used to build a multi-row <c>ReadOnlySpan&lt;float&gt;</c> covering <c>[0, seqKv)</c> steps
+    /// for the attention kernel (a single MTP decode step attends over every step drafted so far
+    /// in the current round, not just the newest one).
+    /// </summary>
+    internal float* KeyCachePtr => (float*)_keyCache;
+
+    /// <summary>Base pointer to the full value-cache buffer — see <see cref="KeyCachePtr"/>.</summary>
+    internal float* ValueCachePtr => (float*)_valueCache;
+
+    /// <summary>Advances the MTP KV-cache length by one step after a successful <c>ForwardMtp</c> call.</summary>
+    internal void Advance()
+    {
+        ThrowIfDisposed();
+        if (_currentLength >= _maxSteps)
+            throw new InvalidOperationException(
+                $"CpuMtpState KV-cache exhausted: {_currentLength} steps already advanced against a " +
+                $"MaxSteps={_maxSteps} cache. Size the state for the whole sequence (prompt + generated + draft steps).");
+        _currentLength++;
+    }
+
+    /// <summary>
+    /// Prepares a batched absorb of <paramref name="count"/> contiguous positions starting at
+    /// <paramref name="firstPosition"/> (issue #472): rolls speculative slots back to it, rejects a
+    /// gap, and bounds-checks the whole slab before anything is written.
+    /// </summary>
+    internal void BeginAbsorb(int firstPosition, int count)
+    {
+        ThrowIfDisposed();
+        if (_currentLength > firstPosition)
+            _currentLength = firstPosition;
+        else if (_currentLength < firstPosition)
+            throw new InvalidOperationException(
+                $"MTP absorb at position {firstPosition} but the MTP KV-cache only covers {_currentLength} " +
+                "positions. Every trunk Forward of the sequence must pass the MTP state so the head " +
+                "absorbs it (prefill included).");
+        if ((long)firstPosition + count > _maxSteps)
+            throw new InvalidOperationException(
+                $"CpuMtpState KV-cache exhausted absorbing positions [{firstPosition}, {firstPosition + count}) " +
+                $"(MaxSteps={_maxSteps}). Create the state with CreateMtpState(maxSequenceLength) covering the whole sequence.");
+        EnsureCapacity(firstPosition + count);   // issue #966: lazy growth, after the ceiling check
+    }
+
+    /// <summary>Completes a batched absorb begun by <see cref="BeginAbsorb"/>: the cache now covers <paramref name="length"/> positions.</summary>
+    internal void EndAbsorb(int length)
+    {
+        ThrowIfDisposed();
+        if (length < _currentLength || length > _maxSteps)
+            throw new ArgumentOutOfRangeException(nameof(length));
+        _currentLength = length;
+    }
+
+    /// <summary>
+    /// Writes the hidden-state rows a batch of <paramref name="count"/> tokens pairs with (issue
+    /// #469): row 0 is the carried row (the trunk hidden of the position before the batch), row
+    /// <c>i</c> is captured row <c>i - 1</c>. <paramref name="dest"/> is <c>[count, hiddenSize]</c>.
+    /// </summary>
+    internal void CopyAbsorbPairingRows(int count, Span<float> dest)
+    {
+        ThrowIfDisposed();
+        if (count > _capturedRowCount)
+            throw new ArgumentOutOfRangeException(nameof(count));
+        _carryHidden.CopyTo(dest);
+        if (count > 1)
+            _capturedRows.AsSpan(0, (count - 1) * _hiddenSize).CopyTo(dest.Slice(_hiddenSize));
+    }
+
+    /// <inheritdoc/>
+    public void Rollback(int length)
+    {
+        ThrowIfDisposed();
+        if (length < 0 || length > _currentLength)
+            throw new ArgumentOutOfRangeException(nameof(length));
+        _currentLength = length;
+    }
+
+    /// <summary>
+    /// Called by an MTP-supporting model's verify-phase <c>Forward</c> overload to stash the
+    /// captured pre-final-norm hidden rows for this state's next round.
+    /// </summary>
+    /// <param name="rows">Row-major <c>[rowCount, hiddenSize]</c> hidden state rows.</param>
+    /// <param name="rowCount">Number of rows in <paramref name="rows"/>.</param>
+    internal void SetCapturedRows(ReadOnlySpan<float> rows, int rowCount)
+    {
+        ThrowIfDisposed();
+        int needed = rowCount * _hiddenSize;
+        if (_capturedRows.Length < needed)
+            _capturedRows = new float[needed];
+        rows.Slice(0, needed).CopyTo(_capturedRows);
+        _capturedRowCount = rowCount;
+    }
+
+    /// <inheritdoc/>
+    public void SeedFromCapturedRow(int rowIndex)
+    {
+        ThrowIfDisposed();
+        if ((uint)rowIndex >= (uint)_capturedRowCount)
+            throw new ArgumentOutOfRangeException(nameof(rowIndex),
+                $"rowIndex {rowIndex} out of range [0, {_capturedRowCount}) — CapturedHiddenRows was not populated " +
+                "by a verify-phase Forward call, or has fewer rows than expected.");
+        var row = _capturedRows.AsSpan(rowIndex * _hiddenSize, _hiddenSize);
+        row.CopyTo(_pendingHidden);
+        row.CopyTo(_carryHidden);
+    }
+
+    /// <inheritdoc/>
+    public object? MarkPrefix()
+    {
+        ThrowIfDisposed();
+        return new MtpPrefixMark(this, _currentLength, (float[])_carryHidden.Clone());
+    }
+
+    /// <inheritdoc/>
+    public bool TryResumeAt(object mark, int maxSequenceLength)
+    {
+        ThrowIfDisposed();
+        if (MtpPrefixMark.For(mark, this, _hiddenSize) is not { } m || maxSequenceLength < m.Length)
+            return false;
+        _maxSteps = Math.Max(_maxSteps, maxSequenceLength);
+        _currentLength = m.Length;
+        m.CarryHidden.CopyTo(_carryHidden);
+        m.CarryHidden.CopyTo(_pendingHidden);
+        return true;
+    }
+
+    /// <summary>Total bytes allocated for this state's own KV-cache (excludes the small managed captured-rows buffer).</summary>
+    public long AllocatedBytes => 2L * _capacity * _kvStride * sizeof(float);
+
+    private void ThrowIfDisposed()
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CpuMtpState));
+    }
+
+    /// <inheritdoc/>
+    public void Dispose()
+    {
+        if (_disposed) return;
+        if (_keyCache != 0) { NativeMemory.AlignedFree((void*)_keyCache); _keyCache = 0; }
+        if (_valueCache != 0) { NativeMemory.AlignedFree((void*)_valueCache); _valueCache = 0; }
+        _disposed = true;
+        GC.SuppressFinalize(this);
+    }
+
+    /// <summary>Finalizer — last-ditch free if the state was not disposed.</summary>
+    ~CpuMtpState()
+    {
+        if (_disposed) return;
+        if (_keyCache != 0) NativeMemory.AlignedFree((void*)_keyCache);
+        if (_valueCache != 0) NativeMemory.AlignedFree((void*)_valueCache);
+    }
+}

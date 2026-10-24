@@ -23,13 +23,13 @@ public class RequestValidatorTests
     [Fact]
     public void ValidateChatRequest_TooManyMessages_ReturnsError()
     {
-        var messages = new ChatMessageDto[RequestValidator.MaxMessages + 1];
+        var messages = new ChatMessageDto[RequestValidator.DefaultMaxMessages + 1];
         for (int i = 0; i < messages.Length; i++)
             messages[i] = new ChatMessageDto { Role = "user", Content = "hi" };
 
         var request = new ChatCompletionRequest { Messages = messages };
         var error = RequestValidator.ValidateChatRequest(request);
-        Assert.Contains("exceeds maximum", error);
+        Assert.Contains("exceeds maximum", error, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -113,7 +113,7 @@ public class RequestValidatorTests
             requestedMaxTokens: 100, out _, out int promptTokenCount);
 
         Assert.NotNull(error);
-        Assert.Contains("exceeds model context length", error);
+        Assert.Contains("exceeds model context length", error, StringComparison.Ordinal);
         Assert.Equal(520, promptTokenCount);
     }
 
