@@ -99,6 +99,8 @@ public readonly record struct Q8_0GemmCoopmatVariant(
     /// </remarks>
     public bool IsSupportedOn(VulkanDevice device, string spvDir)
     {
+        // Every variant here is a cooperative-matrix kernel: without the extension Create() throws, so report unsupported (Intel Arc, #1249).
+        if (!device.HasCooperativeMatrix) return false;
         if (RequiredSubgroupSize != 0
             && !device.SupportsRequiredSubgroupSize((uint)RequiredSubgroupSize, VkShaderStageFlags.Compute))
             return false;

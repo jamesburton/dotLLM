@@ -161,6 +161,10 @@ public class QuantFormatTests
                     foreach (var (frag, bytes) in byFile)
                         if (name.Contains(frag, StringComparison.OrdinalIgnoreCase)) { expected = bytes; break; }
                 }
+                // moe_indexed_matmul_q5_0_f32.comp is the Q5_0 twin of the Q5_1 shader and deliberately keeps the Q5_1_ constant names
+                // for the shared body (header comment), so its Q5_1_BLOCK_BYTES holds the 22-byte Q5_0 block.
+                if (name == "moe_indexed_matmul_q5_0_f32.comp" && constName == "Q5_1")
+                    expected = QuantFormat.Q5_0BlockBytes;
                 if (expected is null)
                 {
                     mismatches.Add($"{name}: unmapped constant '{constName}_BLOCK_BYTES = {val}'");

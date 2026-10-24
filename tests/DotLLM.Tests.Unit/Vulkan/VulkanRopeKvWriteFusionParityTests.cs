@@ -255,7 +255,7 @@ public sealed class VulkanRopeKvWriteFusionParityTests
                 seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
                 headDim: headDim, ropeDim: ropeDim, theta: theta,
                 variant: RopeF32Kernel.Variant.Norm);
-            KernelSupport.ComputeToComputeBarrier(ctx.CommandBuffer);
+            KernelSupport.ComputeToTransferBarrier(ctx.CommandBuffer); // RoPE (compute write) -> vkCmdCopyBuffer (transfer read)
             kvCacheBaseline.RecordUpdate(ctx.CommandBuffer, bufKBaseline, bufVBaseline, positions, seqLen, layerIndex: 0);
             KernelSupport.TransferToComputeBarrier(ctx.CommandBuffer);
             ctx.SubmitAndWait();

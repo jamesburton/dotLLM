@@ -4423,8 +4423,10 @@ public sealed partial class VulkanTransformerModel : IModel
                 if (kvCache is VulkanKvCache vkCache)
                 {
                     // RoPE writes K; attention (via the cache buffers) reads K.
-                    // Barrier the RoPE → KV copy, then the KV copy → attention.
-                    BarrierComputeToCompute(cmdBuf);
+                    // Barrier the RoPE → KV copy, then the KV copy → attention. F32 rows are written by vkCmdCopyBuffer (TRANSFER stage), so the
+                    // RoPE write needs a COMPUTE→TRANSFER dependency; a COMPUTE→COMPUTE one leaves the copy racing the rotation (Intel Arc, #1249).
+                    if (vkCache.Storage == VulkanKvStorage.F16) BarrierComputeToCompute(cmdBuf);
+                    else BarrierComputeToTransfer(cmdBuf);
                     vkCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, layer, _kvF16Writer);
                     // F32 rows are copied (transfer); F16 rows are converted by a compute dispatch.
                     if (vkCache.Storage == VulkanKvStorage.F16) BarrierComputeToCompute(cmdBuf);
