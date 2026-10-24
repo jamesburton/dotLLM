@@ -70,6 +70,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
     private readonly EmbedGatherF32Kernel? _embedGather;
     private readonly VulkanGdnStateCache _gdnCache;
     private readonly VulkanQwen3MoeHybridKernels _kernels;
+    private readonly MatMulQuantGemvMultiKernel? _q4kDecode;   // #1220: Q4_K decode on the verify kernel (see Q4KDecodeOnRows)
+    private readonly MatMulQ8_0GemvMultiKernel? _q8Decode;     // #1220: Q8_0 decode on the verify kernel (see Q8DecodeOnRows)
 
     // MTP ("NextN") head — issue #435. Null for every checkpoint without a nextn.* tensor group,
     // which is the overwhelming majority; SupportsMtp and every MTP member below key off it.
@@ -251,6 +253,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         _state = state;
         _gdnCache = gdnCache;
         _kernels = kernels;
+        _q4kDecode = kernels.Q4KDecodeOnRows;
+        _q8Decode = kernels.Q8DecodeOnRows;
 
         // Issue #1102: Bonsai 2's 24 query heads share 4 KV heads; the grouped decode pass reads each cached row once, not 6 times.
         _kernels.EnableGqaDecode();
@@ -2715,7 +2719,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         switch (weightQt)
         {
             case QuantizationType.Q8_0:
-                if (seqLen == 1)
+                if (seqLen == 1 && _q8Decode is { } q8Rows)
+                    q8Rows.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: 1);   // #1220: same kernel as the verify rows
+                else if (seqLen == 1)
                     _kernels.MatMulQ8.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
                 else if (_kernels.MatMulQ8GemmCoopmat is not null)
                     _kernels.MatMulQ8GemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
@@ -2739,7 +2745,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
                     _kernels.MatMulQ3KGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
             case QuantizationType.Q4_K:
-                if (seqLen == 1)
+                if (seqLen == 1 && _q4kDecode is { } q4kRows)
+                    q4kRows.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: 1);   // #1220: same kernel as the verify rows
+                else if (seqLen == 1)
                     _kernels.MatMulQ4K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
                 else if (_kernels.MatMulQ4KGemmCoopmat is not null && (inputDim % 256) == 0)
                     _kernels.MatMulQ4KGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
@@ -2755,7 +2763,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
                     _kernels.MatMulQ5KGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
             case QuantizationType.Q6_K:
-                if (seqLen == 1)
+                if (seqLen == 1 && _kernels.MatMulQ6KRows is { } q6Rows)
+                    q6Rows.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: 1);   // #1220: same kernel as the verify rows
+                else if (seqLen == 1)
                     _kernels.MatMulQ6K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
                 else if (_kernels.MatMulQ6KGemmCoopmat is not null && (inputDim % 256) == 0)
                     _kernels.MatMulQ6KGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);

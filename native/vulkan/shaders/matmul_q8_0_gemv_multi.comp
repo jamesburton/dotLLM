@@ -1,15 +1,14 @@
 #version 450
 #extension GL_EXT_control_flow_attributes : require
-#extension GL_KHR_shader_subgroup_basic      : require
-#extension GL_KHR_shader_subgroup_arithmetic : require
 
-// Q8_0 multi-column GEMV with FP32 activations (2..8 rows, #1185): Y[col, m] = sum_k W[m, k] * X[col, k].
+// Q8_0 GEMV with FP32 activations for 1..8 activation columns (#1185) and NR output rows per workgroup (#1220):
+// Y[col, m] = sum_k W[m, k] * X[col, k].
 //
-// matmul_q8_0_coalesced.comp for NC columns at once: every lane decodes its weights ONCE and FMAs them against all NC activation rows.
-// Per-column accumulation order, the subgroup reduction and the cross-subgroup pass equal the single-column kernel's, so each output
-// column is bit-identical to a 1-row decode GEMV: an MTP verify then reproduces plain greedy decode exactly. (The Q8_1 MMVQ multi
-// kernel quantises the activations and flipped near-tie argmaxes against the FP32 decode.) NC is a specialization constant;
-// X is [NC, K], Y is [NC, M].
+// Every lane decodes its weights ONCE and FMAs them against all NC activation rows; NR rows share the activation loads. A row's arithmetic
+// (lane -> block map, explicit fma chain under `precise`, fixed shared-memory reduction tree) does not depend on NC or NR, so each column of
+// a 2..8-row MTP verify is bit-identical to the NC = 1 decode dispatch, which the dense qwen35 model uses for decode. (The Q8_1 MMVQ multi
+// kernel quantises the activations and flipped near-tie argmaxes against the FP32 decode.) NC (constant_id 0) and NR (constant_id 1) are
+// specialization constants; X is [NC, K], Y is [NC, M].
 //
 // Weight layout: each 32 weights = one Q8_0 block of 34 bytes = 17 uint16: [0] fp16 scale d, [1..16] 32 signed int8 qs.
 // Lane L owns 8 contiguous int8 of a window of WG_SIZE/4 blocks: four lanes per block, consecutive lanes on consecutive words.
@@ -20,6 +19,7 @@
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(constant_id = 0) const uint NC = 2u;
+layout(constant_id = 1) const uint NR = 1u;
 
 layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint weight[]; };  // Q8_0 blob
 layout(set = 0, binding = 1, std430) readonly  buffer BufX { vec4 x4[]; };      // [NC, K/4]
@@ -45,58 +45,66 @@ vec4 unpackS8(uint u) {
     return vec4(v);
 }
 
-shared float partials[NC][WG_SIZE];
+shared float partials[NR * NC][WG_SIZE];
 
 void main() {
-    uint m = gl_WorkGroupID.x;
-    if (m >= pc.M) return;
+    uint m0 = gl_WorkGroupID.x * NR;
+    if (m0 >= pc.M) return;
 
     uint lane = gl_LocalInvocationID.x;
     uint blockInWindow = lane >> 2u;
     uint subInBlock    = lane & 3u;
     uint qOff16        = 1u + 4u * subInBlock;
 
-    uint rowBase16 = m * pc.blocksPerRow * UINT16_PER_BLOCK;
+    // Rows past M (last workgroup) duplicate row M-1 and are not stored.
+    uint rowBase16[NR];
+    [[unroll]] for (uint r = 0u; r < NR; ++r) rowBase16[r] = min(m0 + r, pc.M - 1u) * pc.blocksPerRow * UINT16_PER_BLOCK;
     uint xRow4 = pc.K >> 2u;
 
-    float acc[NC];
-    [[unroll]] for (uint cc = 0u; cc < NC; ++cc) acc[cc] = 0.0;
+    precise float acc[NR * NC];
+    [[unroll]] for (uint i = 0u; i < NR * NC; ++i) acc[i] = 0.0;
     for (uint w0 = 0u; w0 < pc.blocksPerRow; w0 += WINDOW_BLOCKS) {
         uint blk = w0 + blockInWindow;
         if (blk >= pc.blocksPerRow)
             continue;
 
-        uint blkBase16 = rowBase16 + blk * UINT16_PER_BLOCK;
-        float d = unpackHalf2x16(readU16(blkBase16)).x;
+        float d[NR];
+        vec4 wa[NR];
+        vec4 wb[NR];
+        [[unroll]] for (uint r = 0u; r < NR; ++r) {
+            uint blkBase16 = rowBase16[r] + blk * UINT16_PER_BLOCK;
+            d[r] = unpackHalf2x16(readU16(blkBase16)).x;
+            uint qb = blkBase16 + qOff16;
+            wa[r] = unpackS8(readU16(qb)      | (readU16(qb + 1u) << 16u));
+            wb[r] = unpackS8(readU16(qb + 2u) | (readU16(qb + 3u) << 16u));
+        }
 
-        uint qb = blkBase16 + qOff16;
-        vec4 wa = unpackS8(readU16(qb)      | (readU16(qb + 1u) << 16u));
-        vec4 wb = unpackS8(readU16(qb + 2u) | (readU16(qb + 3u) << 16u));
-
+        // Explicit fma chain under `precise` (no driver contraction / reordering): a row's bits do not depend on NR / NC.
         uint xi = blk * 8u + 2u * subInBlock;
         [[unroll]] for (uint cc = 0u; cc < NC; ++cc) {
             vec4 xa = x4[cc * xRow4 + xi];
             vec4 xb = x4[cc * xRow4 + xi + 1u];
-            acc[cc] += d * (dot(wa, xa) + dot(wb, xb));
+            [[unroll]] for (uint r = 0u; r < NR; ++r) {
+                precise float dq = wa[r].x * xa.x;
+                dq = fma(wa[r].y, xa.y, dq); dq = fma(wa[r].z, xa.z, dq); dq = fma(wa[r].w, xa.w, dq);
+                dq = fma(wb[r].x, xb.x, dq); dq = fma(wb[r].y, xb.y, dq); dq = fma(wb[r].z, xb.z, dq); dq = fma(wb[r].w, xb.w, dq);
+                acc[r * NC + cc] = fma(d[r], dq, acc[r * NC + cc]);
+            }
         }
     }
 
-    float sums[NC];
-    [[unroll]] for (uint cc = 0u; cc < NC; ++cc) sums[cc] = subgroupAdd(acc[cc]);
-    if (gl_NumSubgroups == 1u) {
-        if (subgroupElect())
-            [[unroll]] for (uint cc = 0u; cc < NC; ++cc) y[cc * pc.M + m] = sums[cc];
-        return;
-    }
-    if (subgroupElect())
-        [[unroll]] for (uint cc = 0u; cc < NC; ++cc) partials[cc][gl_SubgroupID] = sums[cc];
+    // Fixed shared-memory tree over the 64 lanes, NOT subgroupAdd: a driver may compile each NR / NC pipeline at a different subgroup width,
+    // which changes a subgroup reduction's order and so the bits.
+    [[unroll]] for (uint i = 0u; i < NR * NC; ++i) partials[i][lane] = acc[i];
     barrier();
-    if (lane == 0u) {
-        [[unroll]] for (uint cc = 0u; cc < NC; ++cc) {
-            float total = 0.0;
-            for (uint i = 0u; i < gl_NumSubgroups; i++)
-                total += partials[cc][i];
-            y[cc * pc.M + m] = total;
-        }
+    [[unroll]] for (uint stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
+        if (lane < stride)
+            [[unroll]] for (uint i = 0u; i < NR * NC; ++i) partials[i][lane] = partials[i][lane] + partials[i][lane + stride];
+        barrier();
+    }
+    if (lane < NR * NC) {
+        uint r = lane / NC, cc = lane - r * NC;
+        if (m0 + r < pc.M)
+            y[cc * pc.M + m0 + r] = partials[lane][0];
     }
 }

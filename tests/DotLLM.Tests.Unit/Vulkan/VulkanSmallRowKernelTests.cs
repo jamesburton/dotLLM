@@ -97,15 +97,16 @@ public class VulkanSmallRowKernelTests
     }
 
     /// <summary>
-    /// #1185: the FP32-activation Q8_0 multi-column GEMV must equal the coalesced 1-row decode GEMV BIT FOR BIT per column — that is
-    /// what lets a dense qwen35 MTP verify reproduce plain greedy decode (the Q8_1 MMVQ multi kernel flipped a near-tie on Qwen3.8-27B).
+    /// #1185 / #1220: the FP32-activation Q8_0 multi-column GEMV against the coalesced 1-row decode GEMV. Same lane map, so they agree to
+    /// rounding; the bit-for-bit guarantee MTP exactness relies on is against the kernel's own one-column dispatch, which the dense qwen35
+    /// model decodes on (<c>VulkanDenseGemvRowsTests</c>).
     /// </summary>
     [SkippableTheory]
     [InlineData(1024, 5120, 2)]    // qwen35 attn_k: K = 160 blocks
     [InlineData(5120, 6144, 4)]    // attn_output / ssm_out
     [InlineData(40, 96, 8)]        // K = 3 blocks: window tail
     [InlineData(17, 17408, 3)]     // long K, odd M
-    public void Q8F32Multi_EachColumnBitIdenticalToCoalescedGemv(int m, int k, int n)
+    public void Q8F32Multi_EachColumnMatchesCoalescedGemv(int m, int k, int n)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
@@ -133,7 +134,7 @@ public class VulkanSmallRowKernelTests
             single.Launch(bw, bx1, by1, m, k);
             float[] exp = new float[m];
             device.Download(by1, exp);
-            Assert.Equal(exp, actual.AsSpan(c * m, m).ToArray());
+            AssertClose(exp, actual.AsSpan(c * m, m).ToArray(), $"q8 multi col {c}");
         }
     }
 

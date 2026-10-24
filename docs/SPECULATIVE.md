@@ -542,6 +542,52 @@ llama.cpp master `0ae0e1976` `llama-server --spec-type draft-mtp -md <head>`, sa
 - llama.cpp drafts 74 % accepted at K=3. dotLLM's verify (150 ms for 4 rows vs 105 ms decode) and per-step head cost (LM head over 248k rows
   per draft step) are the remaining gap to llama.cpp's 2.2x.
 
+**Verify and decode on the same kernels (issue #1220).** The 4-row verify cost 150 ms against a 105 ms decode, and every verify column only
+matched decode by luck: the multi-column GEMVs reduced with `subgroupAdd`, whose order changes with the subgroup width a driver picks for
+each pipeline. Intel picks SIMD8/16/32 by register pressure, so the multi kernels differed from decode at NR = 4 on Arc. The row-split GDN
+decode scan and the LDS snapshot scan used for verify re-associate the 128-row sums differently. The dense `qwen35` model now decodes and
+verifies on the same deterministic kernels:
+
+- **Q4_K / Q8_0 / Q6_K rows-per-workgroup GEMVs** (`matmul_q4_k_gemv_f32_multi`, `matmul_q8_0_gemv_multi`, `matmul_q6_k_gemv_f32_rows`):
+  NR output rows per workgroup share the activation loads, there is an explicit fma chain under `precise`, and a fixed shared-memory
+  reduction tree (no `subgroupAdd`). A row's bits do not depend on NR or on the column count, so decode (NC = 1, NR = 2) and a verify column
+  (NC = 2..8, NR = 4) are bit-identical (`VulkanDenseGemvRowsTests`, also across NR). Q4_K dequantises each weight once per row
+  (`w = sc * q - min`), leaving 8 FMAs per column instead of a dot product, a sum of x and two scale FMAs: at 4 columns the kernel went from
+  1.5-1.75x a single-row GEMV to 1.2-1.4x. #1193's `Q4_K_R4` (the same row sharing, `subgroupAdd`) is replaced. The knobs
+  `DOTLLM_VK_{Q4K,Q8,Q6K}_ROWS` / `_ROWS_MULTI` (1..8, default 2 / 4) and `DOTLLM_VK_{Q4K,Q8,Q6K}_ROWS_DECODE=0` (the old 1-row decode
+  kernel) are kept for A/B.
+- **Row-split GDN snapshot scan** (`gdn_scan_multi_token_rs_snap_f32`): the snapshot kernel mirrors the decode arm, so every snapshot and
+  the final state are bit-identical to token-by-token decode (`VulkanGdnScanSnapshotRowSplitTests`); the scan in a 4-row verify went from
+  9.8 to 3.8 ms. The dense model has since replayed instead of snapshotting (#1194, on the decode scan itself, so exact too); the
+  `qwen35moe` host still snapshots and now uses this kernel. The numbers below were measured on the snapshot path, before #1194 merged.
+- Strix kernel bench (`DOTLLM_GEMV_ROWS_BENCH=1`, `Bench_RowsPerWorkgroup`): at one column every rows kernel streams at ~220-227 GB/s, the
+  same as the coalesced decode GEMV it replaces. Q4_K at 4 columns: 278-324 µs vs 225 µs at one column (was 409 µs).
+
+Measured and rejected (Strix): staging the activations in LDS for 4 row groups (slower than the global-load kernel once Q4_K dequantised
+once), a fused residual add + RMSNorm (neutral: the per-layer barriers are not the cost), writing the LM head to device memory before
+copying it to the host-cached logits buffer (neutral), and NR = 8 (no better than 4).
+
+**Measured (Strix Halo 8060S, Qwen3.8-27B Q4_K_M + `mtp-Qwen3.8-27B-Q8_0.gguf`, same 4 prompts x 128 greedy tokens as above, K = 3,
+`DOTLLM_MTP_ADAPTIVE=0`, dotLLM and llama.cpp `0ae0e1976` interleaved A-B-A-B, 2 reps; the host had unrelated background load):**
+
+| arm | tok/s (mean of 8) | per prompt (rep a / rep b) | x plain | peak private / GPU shared |
+|---|---|---|---|---|
+| dotLLM plain | 10.57 | 10.4/10.2, 10.8/10.8, 10.6/10.5, 10.6/10.5 | 1.00 | 19.2 / 18.4 GB |
+| **dotLLM MTP K=3** | **20.82** | 18.3/18.2, 25.3/25.9, 17.2/17.4, 21.7/22.6 | **1.97** | 20.2 / 19.3 GB |
+| llama.cpp plain | 10.73 | 10.3/10.9, 10.9/10.5, 10.8/10.7, 10.9/10.8 | 1.00 | 19.6-20.6 / 18.7 GB |
+| llama.cpp MTP K=3 | 23.42 | 20.2/21.0, 27.6/26.6, 21.2/21.4, 24.6/24.8 | 2.18 | 23.8-24.8 / 22.4 GB |
+
+- After merging #1194 (dense verify replays instead of snapshotting), interleaved against `dev` at that point (8 runs each): MTP K=3
+  **21.65** vs 19.79 tok/s, plain **10.82** vs 10.57, MTP memory 19.8 / 19.0 GB; 8 / 8 token-identical. Against the llama.cpp rows
+  above that is 0.92x for MTP and 1.01x for plain decode.
+- Before (#1195 build, same session): plain ~10.4, MTP K=3 ~17.1 (1.62x). MTP is now 0.89x llama.cpp and plain decode 0.985x, with less
+  memory than llama.cpp in both modes (plain 18.4 vs 18.7 GB GPU shared; MTP 19.3 vs 22.4 GB).
+- **Greedy output: dotLLM MTP equals dotLLM plain on 20 / 20 runs** (K 2..4 x 4 prompts, and the 8 K = 3 runs above).
+- Round split (`DOTLLM_MTP_TRACE=1`, prompt 0): draft 7.2 ms per step, verify 113 / 121.5 / 156 ms for 3 / 4 / 5 rows against a ~92 ms
+  decode, ~2 ms restore and absorb per round. K = 3 stays best (K = 2: 19.0, K = 4: 16.0 tok/s on prompt 0).
+- What is left: the 4-row verify is still ~1.3x a decode (Q4_K FFN at 4 columns is the largest share, then the Q8_0 GDN projections), and
+  the 5-row verify jumps to 156 ms, which caps K at 3.
+
 ### qwen4exp MTP head (issue #820, CPU oracle)
 
 Qwen3.8-Flash-Next (`qwen4exp`) ships its MTP head as a **separate 49-block GGUF** (`mtp-Qwen3.8-Flash-Next-Q8_0.gguf`, 4.1 GB: `blk.48.*`
@@ -945,8 +991,8 @@ uses the MTP decoder's exact accept/residual rule unchanged.
 long prefill and released after it.
 
 **Knobs.** `DOTLLM_DFLASH_DRAFT=n` caps drafts per round (default B-1 = 7); `DOTLLM_DFLASH_TRACE=1` prints draft / inject wall
-time per request (and, on Vulkan, the drafter's submit count and wait). Vulkan small-row GEMVs: `DOTLLM_VK_Q4K_MULTI_ROWS` (1/2/4/8 output
-rows per workgroup, default 2; `DOTLLM_VK_Q4K_MULTI_R4=0` = the old one-row kernel) and `DOTLLM_VK_SMALLROW_Q6K_R2_MIN_ROWS` (default 3).
+time per request (and, on Vulkan, the drafter's submit count and wait). Vulkan small-row GEMVs: `DOTLLM_VK_Q4K_ROWS` / `DOTLLM_VK_Q4K_ROWS_MULTI` (1..4 output
+rows per workgroup for decode / verify, default 2 / 4, #1220; this replaced #1193's `DOTLLM_VK_Q4K_MULTI_ROWS` / `_R4` kernel) and `DOTLLM_VK_SMALLROW_Q6K_R2_MIN_ROWS` (default 3).
 
 **Not yet.** Tree (DDTree) verification; reduced-vocab (`d2t`), DSpark and LiliCorr drafters;
 sampled-selector proposals (llama.cpp's DFlash2 sampled mode).

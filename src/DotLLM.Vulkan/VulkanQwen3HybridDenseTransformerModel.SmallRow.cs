@@ -32,7 +32,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel
         {
             QuantizationType.Q4_K => _kernels.MatMulQ4KMulti,
             QuantizationType.Q5_K => _kernels.MatMulQ5KMulti,
-            QuantizationType.Q6_K => n >= SmallRowQ6KR2MinRows ? _kernels.MatMulQ6KMultiR2 ?? _kernels.MatMulQ6KMulti : _kernels.MatMulQ6KMulti,
+            QuantizationType.Q6_K => _kernels.MatMulQ6KRows   // #1220: the decode kernel when present
+                                     ?? (n >= SmallRowQ6KR2MinRows ? _kernels.MatMulQ6KMultiR2 ?? _kernels.MatMulQ6KMulti : _kernels.MatMulQ6KMulti),
             QuantizationType.IQ4_XS => _kernels.MatMulIq4XsMulti,
             _ => null,
         };
@@ -46,8 +47,10 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel
             iq3s.Record(cmdBuf, weights, input, output, m: m, k: k, n: n, codebook: _kernels.MatMulIq3S.GridBuffer);
             return true;
         }
-        // Mirrors the coalesced 1-row Q8_0 GEMV only; a device decoding on the block-per-lane variant keeps the GEMM.
-        if (qt == QuantizationType.Q8_0 && _kernels.MatMulQ8.VariantName == "coalesced" && _kernels.MatMulQ8Multi is { } q8 && MatMulQ8_0GemvMultiKernel.Accepts(n, k))
+        // Decode runs on this kernel (n = 1, #1220), so every verify column is bit-identical to it. With DOTLLM_VK_Q8_ROWS_DECODE=0 the decode
+        // is the coalesced 1-row GEMV (same lane map, ULP-close); a device decoding on the block-per-lane variant then keeps the GEMM.
+        if (qt == QuantizationType.Q8_0 && (_q8Decode is not null || _kernels.MatMulQ8.VariantName == "coalesced")
+            && _kernels.MatMulQ8Multi is { } q8 && MatMulQ8_0GemvMultiKernel.Accepts(n, k))
         {
             q8.Record(cmdBuf, weights, input, output, m: m, k: k, n: n);
             return true;
