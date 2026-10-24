@@ -105,17 +105,21 @@ internal static class Program
         }
         if (args[0] == "swa")
         {
-            // swa <gguf> <ids-file> <promptLen> <chunk> [q8_0]: compact sliding-window KV (#1169) vs full-history KV on the
-            // same stream: prefill ids[0..promptLen) in chunks, then teacher-force the rest one token at a time. Logits of
-            // every chunk's last row and every decode step must be identical; prints KV bytes of both caches.
+            // swa <gguf> <ids-file> <promptLen> <chunk> [q8_0|vulkan]: compact sliding-window KV (#1169; Vulkan F16 ring #1176) vs
+            // full-history KV on the same stream: prefill ids[0..promptLen) in chunks, then teacher-force the rest one token at a
+            // time. Logits of every chunk's last row and every decode step must be identical; prints KV bytes of both caches.
             int[] sid = File.ReadAllText(args[2]).Split(new[] { ' ', '\n', '\r', ',', '[', ']' }, StringSplitOptions.RemoveEmptyEntries)
                 .Select(int.Parse).ToArray();
             int promptLen = int.Parse(args[3]), chunk = int.Parse(args[4]);
             bool q8 = args.Length > 5 && args[5] == "q8_0";
-            using var ms = ModelLoader.CreateCpuModelFromGguf(gguf, config, new ThreadingConfig(0));
-            int v = config.VocabSize, n = sid.Length;
+            bool vulkan = args.Length > 5 && args[5] == "vulkan";
+            using var ms = vulkan
+                ? DotLLM.Vulkan.VulkanModelLoader.CreateSharedFromGguf(gguf, config).Model
+                : ModelLoader.CreateCpuModelFromGguf(gguf, config, new ThreadingConfig(0));
+            int v = config.VocabSize, n = sid.Length, did = vulkan ? 0 : -1;
             DotLLM.Core.Attention.IKvCache Make(bool compact)
             {
+                if (ms is DotLLM.Vulkan.VulkanTransformerModel vm) return vm.CreateKvCache(n + 8, compact);
                 var g = DotLLM.Core.Attention.KvGeometry.FromConfig(config, compact);
                 return q8
                     ? new DotLLM.Engine.KvCache.QuantizedKvCache(g, n + 8, KvCacheDType.Q8_0, KvCacheDType.Q8_0, 0)
@@ -125,8 +129,10 @@ internal static class Program
             {
                 DotLLM.Engine.KvCache.SimpleKvCache s => s.AllocatedBytes,
                 DotLLM.Engine.KvCache.QuantizedKvCache q => q.AllocatedBytes,
+                DotLLM.Vulkan.VulkanKvCache vk => vk.AllocatedBytes,
                 _ => -1,
             };
+            double decodeTps = 0;
             float[] Run(DotLLM.Core.Attention.IKvCache kv, out double seconds)
             {
                 var sw = Stopwatch.StartNew();
@@ -135,21 +141,25 @@ internal static class Program
                 for (int p = 0; p < promptLen; p += chunk)
                 {
                     int len = Math.Min(chunk, promptLen - p);
-                    using var lg = ms.Forward(sid.AsSpan(p, len), Enumerable.Range(p, len).ToArray(), -1, kv, lastTokenLogitsOnly: true);
+                    using var lg = ms.Forward(sid.AsSpan(p, len), Enumerable.Range(p, len).ToArray(), did, kv, lastTokenLogitsOnly: true);
                     Take(lg);
                 }
+                var swDecode = Stopwatch.StartNew();
                 for (int i = promptLen; i < n; i++)
                 {
-                    using var lg = ms.Forward(sid.AsSpan(i, 1), new[] { i }, -1, kv);
+                    using var lg = ms.Forward(sid.AsSpan(i, 1), new[] { i }, did, kv);
                     Take(lg);
                 }
+                decodeTps = (n - promptLen) / swDecode.Elapsed.TotalSeconds;
                 seconds = sw.Elapsed.TotalSeconds;
                 return rows.ToArray();
             }
             using var kvFull = Make(false);
             using var kvCompact = Make(true);
             var a = Run(kvFull, out double ta);
+            double tpsFull = decodeTps;
             var b = Run(kvCompact, out double tb);
+            double tpsCompact = decodeTps;
             int steps = a.Length / v, flips = 0, firstDiff = -1;
             double maxAbs = 0;
             for (int s = 0; s < steps; s++)
@@ -165,10 +175,10 @@ internal static class Program
             }
             var wk = (DotLLM.Core.Attention.IWindowedKvCache)kvCompact;
             int baseL = Enumerable.Range(0, config.NumLayers).Max(wk.RowBaseOf);
-            Console.WriteLine($"swa: n={n} prompt={promptLen} chunk={chunk} kv={(q8 ? "q8_0" : "f32")} steps={steps} identical={maxAbs == 0} "
+            Console.WriteLine($"swa: n={n} prompt={promptLen} chunk={chunk} kv={(vulkan ? "vulkan f16" : q8 ? "q8_0" : "f32")} steps={steps} identical={maxAbs == 0} "
                 + $"maxAbsLogitDiff={maxAbs:E3} firstDiffStep={firstDiff} top1Flips={flips}");
             Console.WriteLine($"swa: KV bytes full={Bytes(kvFull) / 1048576.0:F1} MiB compact={Bytes(kvCompact) / 1048576.0:F1} MiB; "
-                + $"max row base={baseL}; time full={ta:F0}s compact={tb:F0}s");
+                + $"max row base={baseL}; time full={ta:F0}s compact={tb:F0}s; decode full={tpsFull:F2} compact={tpsCompact:F2} tok/s");
             return maxAbs == 0 ? 0 : 1;
         }
         if (args[0] == "steps")
@@ -194,6 +204,10 @@ internal static class Program
             {
                 (ms, makeKv) = DotLLM.Vulkan.VulkanModelLoader.CreateSharedFromGguf(gguf, config);
                 did = 0;
+
+                // STEPS_FULLKV=1: full-length sliding-window rows (the #1176 A/B baseline) instead of the compact ring.
+                if (Environment.GetEnvironmentVariable("STEPS_FULLKV") == "1" && ms is DotLLM.Vulkan.VulkanTransformerModel vfull)
+                    makeKv = n => vfull.CreateKvCache(n, compactSlidingWindows: false);
             }
             else
             {
