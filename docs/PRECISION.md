@@ -22,7 +22,7 @@ Terms:
 - **Accuracy bar:** KL(ref ‖ test) over the full vocabulary, gated on the **median** (or trimmed mean) plus the outlier
   rate (rows with KL > 1e-3 / 1e-2) and top-1 agreement. Mean KL is reported but not gated: massive-activation rows
   dominate it.
-- Evidence is cited as **E1–E12** (§5). `[lit]` marks a literature-only claim; `not measured (#n)` names the issue that
+- Evidence is cited as **E1–E14** (§5). `[lit]` marks a literature-only claim; `not measured (#n)` names the issue that
   will measure it.
 
 ---
@@ -456,6 +456,55 @@ Storage map (where an activation becomes F16, or Q8_1 with F16 `d`/`s`):
   residual, norm outputs, SwiGLU output and MoE staging in half; Flint's Q4_1 experts take F32 input. LFM2's
   `lfm2_quant_q8_1_f32` stores `s = d·Σq` as half (routed down guarded; shared / dense down not, LFM2 values small).
 - **CPU**: Q8_1 `s` is F16 (routed down guarded; shared down at 7.7x).
+
+### E14 — Flint per-row KL at depth: Q8_1 activation rounding, not a backend defect (#1218)
+
+Real Flint Q4_1. Corpus: the first 8,192 tokens of the wikitext-2 test text E13 used, tokenised by llama.cpp (ids taken
+from its `--kl-divergence-base` file, so every engine sees the same stream). dotLLM rows come from `NemotronProbe steps`
+with `STEPS_ALLROWS=1` (512-token prefill chunks through the KV cache). llama.cpp rows come from `llama-perplexity`, which
+scores the second half of each window, so its shallow bins are separate runs at `-c 64 … 8192` over the same prefix.
+
+**Per-row KL by depth (mean / median, top-1 %).** NLL of the true next token per bin is within 0.03 for every dotLLM pair.
+
+| positions | dotLLM CPU vs Strix VK | dotLLM CPU vs Arc VK | dotLLM CPU vs CPU + 1e-6 noise | llama CPU vs llama Strix VK | llama CPU vs dotLLM CPU |
+|---|---|---|---|---|---|
+| 0-256 | 0.030 / 0.005, 96.1 | 0.031 / 0.005, 95.7 | 0.026 / 0.005, 93.0 | | 0.11-0.15 / 0.09-0.14 (32-255) |
+| 256-512 | 0.024 / 0.003, 94.9 | 0.041 / 0.003, 93.8 | 0.028 / 0.003, 93.4 | | 0.15-0.18 / 0.14, 93 |
+| 512-1024 | 0.108 / 0.003, 94.1 | 0.11-0.14 / 0.003-0.004 | 0.07-0.14 / 0.003-0.004 | | 0.18-0.21 / 0.12-0.13 |
+| 1K-2K | 0.078 / 0.003, 92.7 | 0.060 / 0.004, 92.8 | | | 0.23-0.26 / 0.15 |
+| 2K-4K | 0.077 / 0.004, 93.1 | 0.089 / 0.005, 92.4 | | | 0.20-0.25 / 0.15-0.17 |
+| 4K-6K | 0.084 / 0.003, 93.4 | 0.076 / 0.004, 93.0 | | 0.05-0.11 / 0.005, 92-95 | 0.19-0.29 / 0.14-0.17 |
+| 6K-8K | 0.072 / 0.004, 93.1 | 0.080 / 0.004, 93.5 | | 0.07-0.10 / 0.004-0.007, 91-94 | 0.23-0.27 / 0.16-0.19 |
+
+- Nothing blows up with depth: not at the 513 window, not at 1K, 2K or 8K. Every pair has a small median and a heavy tail
+  (isolated rows at KL 10-20 nats where one engine is confident and the other is not).
+- **The tail is the same between two runs of one engine that differ by a 1e-6 relative embedding perturbation**, and the same
+  between llama.cpp CPU and llama.cpp Vulkan. Strix Vulkan F16 vs F32 KV: KL 0.008 / 0.0006 at 0-511 and 0.059 / 0.0015 at
+  2048-2515, i.e. the same kind of disagreement.
+- llama.cpp vs dotLLM has a larger median (~0.15) at every depth from 32 tokens on: llama.cpp quantises the activations of
+  every Q4_1 matmul to Q8_1, dotLLM's dense prefill does not (see the Flint section of `docs/MODEL_CONFIG.md`).
+- llama.cpp CPU `-ctk f32 -ctv f32` is bit-identical to its F16 KV (same PPL 24.4359, KL 0 at 512 and 8K).
+
+**Mechanism** (dotLLM CPU, diagnostic patch not committed: embedding noise, per-layer residual dump, router top-8 log).
+With the default packed Q4_1 × Q8_1 expert path, a 1e-6 relative embedding perturbation stays at 1-2e-6 through layers 0-1
+(dense), then jumps to >1e-4 at 156 of 512 positions in layer 2 (the first MoE layer) and to 2-3e-3 at every position after
+layer 3 (attention spreads it). Q8_1 rounding is discontinuous: a 1e-6 change flips the rounding of some elements by a full
+quantum, and Flint's per-block outliers make the quantum large. From there router top-6 near-ties flip (16.8 % of
+(layer, token) decisions differ by the end, 6th-7th logit gap median 0.09) and the residual difference reaches O(1) at the
+rows that blow up. With exact F32 expert activations (`packedLegacyExperts` off) the same perturbation stays at 1e-6 through
+layer 20 and gives KL 1e-4 (512 wiki rows) / 0.02 (last 128 rows of the 8K agent trace), top-1 97-100 %.
+
+| 8K agent trace, last 128 prefill rows | KL mean / median | top-1 | NLL |
+|---|---|---|---|
+| dotLLM CPU vs CPU + 1e-6 noise (Q8_1 experts) | 1.03 / 0.26 | 64.8 % | 5.27 |
+| dotLLM CPU (local) vs dotLLM CPU (Strix, #1161) | 1.18 / 0.24 | 64.1 % | |
+| same perturbation, exact F32 experts | 0.020 / 0.0001 | 96.9 % | 5.17 / 5.21 |
+| Q8_1 experts vs exact F32 experts | 0.89 / 0.22 | 68.8 % | 5.27 vs 5.17 |
+
+**Consequence:** per-row KL between any two Flint implementations that both quantise expert activations measures the
+spread of their rounding, not correctness. Gate long context on NLL / perplexity over ≥ 4K scored tokens (here every dotLLM
+pair agrees within 0.03 nats per bin) plus median KL; keep the mean-KL gate for short prompts. Whether Q8_1 expert
+activations cost Flint quality (exact was 0.1 nats better over 128 agent rows, level on wikitext) is open.
 
 ---
 

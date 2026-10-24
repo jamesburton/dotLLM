@@ -461,10 +461,14 @@ matmul) with GPU timestamps instead of submit splits; it serialises dispatches t
 
 Accuracy at depth: against the dotLLM CPU model on the 8K `agent32k` prefix, every Vulkan variant (default, Q hi/lo split, F32 KV,
 the reference sink kernel, the build before these changes) disagrees per row at KL ~0.4-1 (top-1 ~70 %), and two Vulkan runs that
-differ only in KV precision disagree with each other by KL 0.42. The negative log-likelihood of the true next tokens is the same
-for all of them (CPU 5.31, Vulkan 5.13-5.23 over the last 128 prompt rows). The model is that sensitive at depth on this text, so a
-per-row KL bound is not a usable gate past a few thousand tokens; use NLL / perplexity there. At short context the F4 gate holds
-(KL mean 1.69e-3, top-1 99.4 % over 507 steps).
+differ only in KV precision disagree with each other by KL 0.42. This is not a Vulkan or depth defect (#1218, `docs/PRECISION.md` E14):
+the dotLLM CPU model against **itself** with a 1e-6 relative perturbation of the embeddings disagrees by the same amount (KL 1.03,
+top-1 65 % on those rows), and llama.cpp CPU vs llama.cpp Vulkan shows the same heavy-tailed profile as dotLLM CPU vs dotLLM Vulkan.
+The amplifier is the Q8_1 activation quantisation in the routed-expert matmuls: rounding flips turn a 1e-6 difference into 1e-3 at
+the first MoE layer, and router top-6 near-ties and attention carry it on. With exact F32 expert activations the same perturbation
+stays at 1e-6 and gives KL 0.02. On wikitext the per-row KL does not grow with depth (dotLLM CPU vs Strix Vulkan: mean 0.03 at 0-256,
+0.07-0.08 from 1K to 8K, median 0.003-0.005 throughout). Gate long context on NLL / perplexity (and median KL), not on mean per-row KL.
+At short context the F4 gate holds (KL mean 1.69e-3, top-1 99.4 % over 507 steps).
 
 ## Hybrid CPU/GPU Inference
 
