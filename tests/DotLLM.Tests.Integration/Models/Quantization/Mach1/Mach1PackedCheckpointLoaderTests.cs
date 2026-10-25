@@ -17,7 +17,7 @@ namespace DotLLM.Tests.Integration.Models.Quantization.Mach1;
 /// <see cref="Qwen3MoeHybridTransformerModel.LoadFromMach1Packed"/>'s HF-&gt;dotLLM
 /// tensor mapping — all with real fixture data, not synthetic. Resolved via
 /// <c>DOTLLM_MACH1_35B_DIR</c>, falling back to the conventional
-/// <c>~/.dotllm/test-cache/SyzygyResearch/Mach-1-Additive-35B/</c> cache path;
+/// <c>~/.dotllm/models/SyzygyResearch/Mach-1-Additive-35B/</c> cache path;
 /// skips (does not fail) if the fixture is absent.
 /// </summary>
 /// <remarks>
@@ -343,24 +343,9 @@ public sealed class Mach1PackedCheckpointLoaderTests
 
     private const string SkipReason =
         "Mach-1-Additive-35B fixture not found. Set DOTLLM_MACH1_35B_DIR or populate " +
-        "~/.dotllm/test-cache/SyzygyResearch/Mach-1-Additive-35B/ (see docs/QUANTIZATION.md).";
+        "~/.dotllm/models/SyzygyResearch/Mach-1-Additive-35B/ (see docs/QUANTIZATION.md).";
 
     private static string? ResolveFixtureRoot()
-    {
-        string? env = Environment.GetEnvironmentVariable("DOTLLM_MACH1_35B_DIR");
-        if (!string.IsNullOrWhiteSpace(env) && IsValidFixtureRoot(env))
-            return env;
-
-        string conventional = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "test-cache", "SyzygyResearch", "Mach-1-Additive-35B");
-        return IsValidFixtureRoot(conventional) ? conventional : null;
-    }
-
-    private static bool IsValidFixtureRoot(string path)
-    {
-        return Directory.Exists(path)
-            && File.Exists(Path.Combine(path, "config.json"))
-            && File.Exists(Path.Combine(path, "packed", "experts", "codec.json"));
-    }
+        => DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveDirectory(
+            "DOTLLM_MACH1_35B_DIR", "SyzygyResearch", "Mach-1-Additive-35B", "config.json", "packed/experts/codec.json").Path;
 }

@@ -1,12 +1,12 @@
 using BenchmarkDotNet.Attributes;
-using DotLLM.HuggingFace;
+using DotLLM.Tests.Integration.Fixtures;
 using DotLLM.Models.Gguf;
 
 namespace DotLLM.Benchmarks;
 
 /// <summary>
 /// Benchmarks GGUF loading stages against a real model (SmolLM-135M Q8_0, ~145 MB).
-/// Auto-downloads on first run, cached in <c>~/.dotllm/test-cache/</c>.
+/// Auto-downloads on first run, stored in <c>~/.dotllm/models/</c>.
 /// </summary>
 [MemoryDiagnoser]
 [SimpleJob(warmupCount: 3, iterationCount: 10)]
@@ -20,21 +20,7 @@ public class GgufRealModelBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        string cacheDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "test-cache");
-
-        string cachedPath = Path.Combine(cacheDir, RepoId.Replace('/', Path.DirectorySeparatorChar), Filename);
-
-        if (File.Exists(cachedPath))
-        {
-            _modelPath = cachedPath;
-            return;
-        }
-
-        Console.WriteLine($"Downloading {RepoId}/{Filename} (~145 MB)...");
-        using var downloader = new HuggingFaceDownloader();
-        _modelPath = downloader.DownloadFileAsync(RepoId, Filename, cacheDir).GetAwaiter().GetResult();
+        _modelPath = TestModelDownloader.EnsureModelAsync(RepoId, Filename).GetAwaiter().GetResult();
     }
 
     [Benchmark(Description = "Full GgufFile.Open (real model)")]

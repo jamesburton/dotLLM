@@ -126,6 +126,21 @@ public static class HubCache
         File.Copy(source, target, overwrite: true);
         return false;
     }
+
+    /// <summary>
+    /// Creates a hardlink at <paramref name="target"/> pointing at <paramref name="source"/>
+    /// without ever falling back to a copy (#1279) — callers that would rather use the source in
+    /// place than duplicate its bytes.
+    /// </summary>
+    /// <param name="source">Existing file whose bytes the link shares.</param>
+    /// <param name="target">Path of the new link; its directory is created if missing.</param>
+    /// <returns><see langword="true"/> when the link was created; <see langword="false"/> when the
+    /// platform refused (typically a cross-volume link).</returns>
+    public static bool TryCreateHardLink(string source, string target)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+        return NativeLink.TryCreateHardLink(source, target);
+    }
 }
 
 /// <summary>

@@ -5,6 +5,7 @@ using DotLLM.Cuda;
 using DotLLM.Cuda.Interop;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -50,9 +51,7 @@ public class CudaGemvPathComparisonTest
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private unsafe void CompareGemvPaths_RealModelWeights_Layer0_QProjection_Impl()
     {
-        string modelPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q8_0.gguf");
+        string modelPath = TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q8_0.gguf"], null).Path ?? "";
         Skip.If(!File.Exists(modelPath), "SmolLM-135M Q8_0 GGUF not found");
 
         using var gguf = GgufFile.Open(modelPath);
@@ -132,9 +131,7 @@ public class CudaGemvPathComparisonTest
     private unsafe void CompareGemvPaths_AllProjections_Layer0_Impl()
     {
 
-        string modelPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q8_0.gguf");
+        string modelPath = TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q8_0.gguf"], null).Path ?? "";
         Skip.If(!File.Exists(modelPath), "SmolLM-135M Q8_0 GGUF not found");
 
         using var gguf = GgufFile.Open(modelPath);

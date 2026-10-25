@@ -6,7 +6,7 @@ namespace DotLLM.Tests.Integration.Fixtures;
 /// Downloads SmolLM-135M Q4_K_M GGUF (~100 MB) for K-quant integration tests.
 /// Uses Q4_K for FFN layers and Q6_K for attention layers — exercises the full
 /// mixed-quantization dispatch path.
-/// Cached in <c>~/.dotllm/test-cache/</c> across test runs.
+/// Cached in <c>~/.dotllm/models/</c> across test runs.
 /// </summary>
 public sealed class Q4KModelFixture : IAsyncLifetime
 {

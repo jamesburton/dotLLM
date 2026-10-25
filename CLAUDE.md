@@ -180,15 +180,24 @@ the issue/PR. Reference/baseline comparisons (tests, oracles, A/B measurements) 
 
 ## Model & Fixture Storage Rules
 
-**Model weights NEVER live in the repository, and are never committed.** They belong in the
-shared on-disk cache:
+**Model weights NEVER live in the repository, and are never committed.** There is **one model
+store** (#1279) — every model, whether pulled by the CLI or by a test, has one physical copy:
 
 | location | holds |
 |---|---|
-| `~/.dotllm/models/` | models fetched for normal use (`dotllm model pull`) |
-| `~/.dotllm/test-cache/{org}/{repo}/` | fixtures the test suite resolves, incl. `DOTLLM_*_GGUF` overrides |
+| `~/.dotllm/models/{org}/{repo}/` | **the** dotLLM model store: `dotllm model pull` *and* test downloads (`TestModelDownloader`; `$DOTLLM_TEST_CACHE_DIR` is only an override, e.g. for CI) |
+| HF hub cache (`$HF_HUB_CACHE` / `$HF_HOME/hub` / `~/.cache/huggingface/hub`) | models fetched by `hf` / `huggingface_hub`; read in place, never re-downloaded |
 | `~/.dotllm/quant-ladder/` | generated per-quantization coverage fixtures |
+| `~/.dotllm/test-cache/` | **generated, non-model** test artefacts only: `corpora/`, `token-oracles/`, `mimo2-tiny*/`, `nanoquant-oracle/`, `littlebit-*/`. Model files here are legacy — still read, never written |
 
+- **Tests resolve models through `TestFixtureResolver`** (env override → `~/.dotllm/models` →
+  legacy `test-cache` → HF cache), never by a hardcoded store path. A hit outside
+  `~/.dotllm/models` is hardlinked in when on the same volume, else used in place — never copied.
+  Tests must not depend on following HF snapshot symlinks (Windows refuses some with
+  `ERROR_UNTRUSTED_MOUNT_POINT`).
+- `scripts/dedupe-models.ps1` (dry run by default, `-Apply` to act) finds duplicates across the
+  stores by SHA-256, replaces them with hardlinks, and moves legacy `test-cache` models into
+  `~/.dotllm/models`.
 - **If a path inside the tree needs a model, symlink to the cache — never copy it in.**
 - Reference fixtures from tests via the existing `DOTLLM_*_GGUF` environment overrides
   (see `docs/QUANT_FIXTURES.md`), not by relative path into the working tree.

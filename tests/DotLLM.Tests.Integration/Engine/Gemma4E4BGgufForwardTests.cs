@@ -31,19 +31,13 @@ namespace DotLLM.Tests.Integration.Engine;
 public sealed class Gemma4E4BGgufForwardTests
 {
     private const string ModelPathEnvVar = "DOTLLM_GEMMA4E4B_GGUF";
-    private const string DefaultHubPath =
-        "C:/Users/james/.cache/huggingface/hub/models--unsloth--gemma-4-E4B-it-GGUF/" +
-        "snapshots/653803f092503c04a65164346f3208a36e707693/gemma-4-E4B-it-Q4_K_M.gguf";
-
     private readonly ITestOutputHelper _output;
 
     public Gemma4E4BGgufForwardTests(ITestOutputHelper output) => _output = output;
 
     private static string? TryResolveModelPath()
     {
-        string? path = Environment.GetEnvironmentVariable(ModelPathEnvVar);
-        if (!string.IsNullOrWhiteSpace(path) && File.Exists(path)) return path;
-        return File.Exists(DefaultHubPath) ? DefaultHubPath : null;
+        return DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveFile(ModelPathEnvVar, "unsloth", "gemma-4-E4B-it-GGUF", "gemma-4-E4B-it-Q4_K_M.gguf").Path;
     }
 
     [SkippableFact]

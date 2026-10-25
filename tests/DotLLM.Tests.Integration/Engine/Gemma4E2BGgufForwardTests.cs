@@ -32,14 +32,7 @@ public sealed class Gemma4E2BGgufForwardTests
 
     private static string? TryResolveModelPath()
     {
-        string? path = Environment.GetEnvironmentVariable(ModelPathEnvVar);
-        if (!string.IsNullOrWhiteSpace(path) && File.Exists(path)) return path;
-        string hub = Path.Combine(
-            Environment.GetEnvironmentVariable("HF_HOME") ?? Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache", "huggingface"),
-            "hub", "models--unsloth--gemma-4-E2B-it-GGUF", "snapshots");
-        if (!Directory.Exists(hub)) return null;
-        return Directory.EnumerateFiles(hub, FileName, SearchOption.AllDirectories).FirstOrDefault();
+        return DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveFile(ModelPathEnvVar, "unsloth", "gemma-4-E2B-it-GGUF", FileName).Path;
     }
 
     // "The capital of France is" (llama.cpp ids for the gemma4 vocabulary).

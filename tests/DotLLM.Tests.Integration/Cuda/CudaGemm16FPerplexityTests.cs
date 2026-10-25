@@ -362,32 +362,8 @@ public sealed class CudaGemm16FPerplexityTests
     }
 
     private static string? ResolveModelPath()
-    {
-        string? envPath = Environment.GetEnvironmentVariable("DOTLLM_CUDA_GEMM16F_GGUF");
-        if (!string.IsNullOrWhiteSpace(envPath) && File.Exists(envPath))
-            return envPath;
-
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string[] relativeCandidates =
-        [
-            Path.Combine("bartowski", "Llama-3.2-1B-Instruct-GGUF", "Llama-3.2-1B-Instruct-Q8_0.gguf"),
-        ];
-        string[] roots =
-        [
-            Path.Combine(home, ".dotllm", "models"),
-            Path.Combine(home, ".dotllm", "test-cache"),
-        ];
-
-        foreach (string root in roots)
-            foreach (string relative in relativeCandidates)
-            {
-                string candidate = Path.Combine(root, relative);
-                if (File.Exists(candidate))
-                    return candidate;
-            }
-
-        return null;
-    }
+        => DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveFile(
+            "DOTLLM_CUDA_GEMM16F_GGUF", "bartowski", "Llama-3.2-1B-Instruct-GGUF", "Llama-3.2-1B-Instruct-Q8_0.gguf").Path;
 
     private static string ResolvePtxDir()
     {

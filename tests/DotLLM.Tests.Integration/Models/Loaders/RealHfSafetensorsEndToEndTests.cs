@@ -187,9 +187,8 @@ public sealed class RealHfSafetensorsEndToEndTests
     [SkippableFact]
     public void Qwen25_0_5B_LoadsAndForwardsEndToEnd()
     {
-        string? root = ResolveCheckpointRoot(
-            envVar: "DOTLLM_QWEN25_CHECKPOINT_PATH",
-            conventional: "C:/Users/james/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B/snapshots/060db6499f32faf8b98477b0a26969ef7d8b9987");
+        string? root = DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveDirectory(
+            "DOTLLM_QWEN25_CHECKPOINT_PATH", "Qwen", "Qwen2.5-0.5B", "config.json").Path;
         Skip.If(root is null,
             "Qwen2.5-0.5B checkpoint not found. Set DOTLLM_QWEN25_CHECKPOINT_PATH "
             + "or ensure the HF snapshot is present at the conventional path.");
@@ -455,9 +454,8 @@ public sealed class RealHfSafetensorsEndToEndTests
     [SkippableFact]
     public void Qwen25_0_5B_GeneratesText_FromTokenizedPrompt()
     {
-        string? root = ResolveCheckpointRoot(
-            envVar: "DOTLLM_QWEN25_CHECKPOINT_PATH",
-            conventional: "C:/Users/james/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B/snapshots/060db6499f32faf8b98477b0a26969ef7d8b9987");
+        string? root = DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveDirectory(
+            "DOTLLM_QWEN25_CHECKPOINT_PATH", "Qwen", "Qwen2.5-0.5B", "config.json").Path;
         Skip.If(root is null,
             "Qwen2.5-0.5B checkpoint not found. Set DOTLLM_QWEN25_CHECKPOINT_PATH "
             + "or ensure the HF snapshot is present at the conventional path.");
@@ -715,9 +713,8 @@ public sealed class RealHfSafetensorsEndToEndTests
     [SkippableFact]
     public void Qwen25_0_5B_LogitsMatchPyTorchReference()
     {
-        string? root = ResolveCheckpointRoot(
-            envVar: "DOTLLM_QWEN25_CHECKPOINT_PATH",
-            conventional: "C:/Users/james/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B/snapshots/060db6499f32faf8b98477b0a26969ef7d8b9987");
+        string? root = DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveDirectory(
+            "DOTLLM_QWEN25_CHECKPOINT_PATH", "Qwen", "Qwen2.5-0.5B", "config.json").Path;
         Skip.If(root is null,
             "Qwen2.5-0.5B checkpoint not found. Set DOTLLM_QWEN25_CHECKPOINT_PATH "
             + "or ensure the HF snapshot is present at the conventional path.");

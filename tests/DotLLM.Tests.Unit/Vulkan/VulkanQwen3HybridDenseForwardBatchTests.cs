@@ -5,6 +5,7 @@ using DotLLM.Core.Tensors;
 using DotLLM.Models.Gguf;
 using DotLLM.Vulkan;
 using Xunit;
+using DotLLM.Tests.Integration.Fixtures;
 
 namespace DotLLM.Tests.Unit.Vulkan;
 
@@ -29,21 +30,8 @@ public sealed class VulkanQwen3HybridDenseForwardBatchTests
         [..Enumerable.Range(0, 40).Select(i => 1000 + i * 37 % 5000)],
     ];
 
-    private static string? FindGguf()
-    {
-        string? env = Environment.GetEnvironmentVariable("DOTLLM_TEV1_4B_GGUF");
-        if (!string.IsNullOrEmpty(env) && File.Exists(env)) return env;
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string snaps = Path.Combine(home, ".cache", "huggingface", "hub",
-            "models--bartowski--togethercomputer_Tev1-4B-experimental-GGUF", "snapshots");
-        if (!Directory.Exists(snaps)) return null;
-        foreach (string s in Directory.EnumerateDirectories(snaps))
-        {
-            string[] hits = Directory.GetFiles(s, "*Q4_K_M.gguf");
-            if (hits.Length > 0) return hits[0];
-        }
-        return null;
-    }
+    private static string? FindGguf() =>
+        TestFixtureResolver.ResolveFile("DOTLLM_TEV1_4B_GGUF", "bartowski", "togethercomputer_Tev1-4B-experimental-GGUF", "*Q4_K_M.gguf").Path;
 
     private sealed class Fixture : IDisposable
     {

@@ -26,7 +26,7 @@ namespace DotLLM.Tests.Integration.Models.Lora;
 /// <c>RealHfSafetensorsEndToEndTests</c> and <c>TinyLlamaSafetensorsLoadTests</c>.
 /// </para>
 /// <para>
-/// Cache layout: <c>~/.dotllm/test-cache/&lt;org&gt;/&lt;repo&gt;/</c> for both base
+/// Cache layout: <c>~/.dotllm/models/&lt;org&gt;/&lt;repo&gt;/</c> for both base
 /// and adapter, matching <c>HuggingFaceDownloader</c>'s defaults.
 /// </para>
 /// </remarks>
@@ -54,9 +54,7 @@ public sealed class TinyLlamaLoraAdapterTests
         ("llamafactory/tiny-random-Llama-3", "llamafactory/tiny-random-Llama-3-lora"),
     ];
 
-    private static readonly string CacheDir = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-        ".dotllm", "test-cache");
+    private static readonly string CacheDir = DotLLM.Tests.Integration.Fixtures.TestModelDownloader.CacheDirectory;
 
     private readonly ITestOutputHelper _output;
 
@@ -188,7 +186,7 @@ public sealed class TinyLlamaLoraAdapterTests
 
     private string? TryEnsureBase(string repoId)
     {
-        string cachedDir = Path.Combine(CacheDir, repoId.Replace('/', Path.DirectorySeparatorChar));
+        string cachedDir = DotLLM.Tests.Integration.Fixtures.TestRepoDirectory.Resolve(repoId, "model.safetensors", "config.json");
         string cachedModel = Path.Combine(cachedDir, "model.safetensors");
         string cachedConfig = Path.Combine(cachedDir, "config.json");
         if (File.Exists(cachedModel) && File.Exists(cachedConfig))
@@ -221,7 +219,7 @@ public sealed class TinyLlamaLoraAdapterTests
 
     private string? TryEnsureAdapter(string repoId)
     {
-        string cachedDir = Path.Combine(CacheDir, repoId.Replace('/', Path.DirectorySeparatorChar));
+        string cachedDir = DotLLM.Tests.Integration.Fixtures.TestRepoDirectory.Resolve(repoId, "adapter_model.safetensors", "adapter_config.json");
         string cachedAdapter = Path.Combine(cachedDir, "adapter_model.safetensors");
         string cachedConfig = Path.Combine(cachedDir, "adapter_config.json");
         if (File.Exists(cachedAdapter) && File.Exists(cachedConfig))

@@ -54,15 +54,14 @@ public sealed class Qwen3MoeHybridQ6KResidentSmokeTests
     [SkippableFact]
     public unsafe void Qwen36_A3B_Q6_K_XL_ResidentMoE_ProducesFiniteLogits()
     {
-        // Conventional path: ~/.dotllm/test-cache/<org>/<repo>/<file>.
+        // Conventional path: ~/.dotllm/models/<org>/<repo>/<file>.
         // The UD-Q6_K_XL variant is the unsloth dynamic-quant build that
         // ships at ~28 GB on disk (vs 22 GB for vanilla Q6_K).
-        string? path = ResolveGgufPath(
-            envVar: "DOTLLM_QWEN36_A3B_Q6_K_XL_GGUF",
-            conventional: "C:/Users/james/.dotllm/test-cache/unsloth/Qwen3.6-A3B-GGUF/Qwen3.6-A3B-UD-Q6_K_XL.gguf");
+        string? path = DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveFile(
+            "DOTLLM_QWEN36_A3B_Q6_K_XL_GGUF", "unsloth", "Qwen3.6-A3B-GGUF", "Qwen3.6-A3B-UD-Q6_K_XL.gguf").Path;
         Skip.If(path is null,
             "Qwen3.6-A3B-UD-Q6_K_XL GGUF not found. Set DOTLLM_QWEN36_A3B_Q6_K_XL_GGUF or stage "
-            + "the file at ~/.dotllm/test-cache/unsloth/Qwen3.6-A3B-GGUF/. The test does not "
+            + "the file at ~/.dotllm/models/unsloth/Qwen3.6-A3B-GGUF/. The test does not "
             + "trigger downloads — manual staging required (~28 GB).");
 
         SkipIfVulkanUnavailable(out string spvDir);
@@ -132,14 +131,6 @@ public sealed class Qwen3MoeHybridQ6KResidentSmokeTests
         {
             Environment.SetEnvironmentVariable("DOTLLM_VK_MOE_RESIDENT", null);
         }
-    }
-
-    private static string? ResolveGgufPath(string envVar, string conventional)
-    {
-        string? env = Environment.GetEnvironmentVariable(envVar);
-        if (!string.IsNullOrWhiteSpace(env) && File.Exists(env)) return env;
-        if (File.Exists(conventional)) return conventional;
-        return null;
     }
 
     private static void SkipIfVulkanUnavailable(out string spvDir)

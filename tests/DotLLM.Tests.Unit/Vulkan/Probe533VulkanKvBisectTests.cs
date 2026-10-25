@@ -4,6 +4,7 @@ using DotLLM.Models.Gguf;
 using DotLLM.Vulkan;
 using Xunit;
 using Xunit.Abstractions;
+using DotLLM.Tests.Integration.Fixtures;
 
 namespace DotLLM.Tests.Unit.Vulkan;
 
@@ -256,11 +257,6 @@ public sealed class Probe533VulkanKvBisectTests
     {
         string? o = Environment.GetEnvironmentVariable("PROBE533_MODEL_GGUF");
         if (!string.IsNullOrEmpty(o)) return File.Exists(o) ? o : null;
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string[] candidates =
-        [
-            Path.Combine(home, ".dotllm", "test-cache", "bartowski", "Llama-3.2-1B-Instruct-GGUF", "Llama-3.2-1B-Instruct-Q8_0.gguf"),
-        ];
-        return candidates.FirstOrDefault(File.Exists);
+        return TestFixtureResolver.ResolveFile([], "bartowski", "Llama-3.2-1B-Instruct-GGUF", ["Llama-3.2-1B-Instruct-Q8_0.gguf"], null).Path;
     }
 }

@@ -11,7 +11,7 @@ namespace DotLLM.Tests.Integration.Models.Quantization.Mach1;
 /// golden tensor: <c>goldens/L0_e0_fp32.safetensors</c> from
 /// <c>SyzygyResearch/Mach-1-Additive-35B</c>. Resolved via
 /// <c>DOTLLM_MACH1_35B_DIR</c>, falling back to the conventional
-/// <c>~/.dotllm/test-cache/SyzygyResearch/Mach-1-Additive-35B/</c> cache
+/// <c>~/.dotllm/models/SyzygyResearch/Mach-1-Additive-35B/</c> cache
 /// path; skips (does not fail) if the fixture is absent, per this project's
 /// fixture-storage conventions — no weights are ever committed to the repo.
 /// </summary>
@@ -23,7 +23,7 @@ public sealed class Mach1GoldenBitExactTests
         string? root = ResolveFixtureRoot();
         Skip.If(root is null,
             "Mach-1-Additive-35B fixture not found. Set DOTLLM_MACH1_35B_DIR or populate " +
-            "~/.dotllm/test-cache/SyzygyResearch/Mach-1-Additive-35B/ (see docs/QUANTIZATION.md).");
+            "~/.dotllm/models/SyzygyResearch/Mach-1-Additive-35B/ (see docs/QUANTIZATION.md).");
 
         string codecJsonPath = Path.Combine(root!, "packed", "experts", "codec.json");
         using JsonDocument codecDoc = JsonDocument.Parse(File.ReadAllText(codecJsonPath));
@@ -84,23 +84,6 @@ public sealed class Mach1GoldenBitExactTests
     }
 
     private static string? ResolveFixtureRoot()
-    {
-        string? env = Environment.GetEnvironmentVariable("DOTLLM_MACH1_35B_DIR");
-        if (!string.IsNullOrWhiteSpace(env) && IsValidFixtureRoot(env))
-            return env;
-
-        string conventional = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "test-cache", "SyzygyResearch", "Mach-1-Additive-35B");
-        return IsValidFixtureRoot(conventional) ? conventional : null;
-    }
-
-    private static bool IsValidFixtureRoot(string path)
-    {
-        return Directory.Exists(path)
-            && File.Exists(Path.Combine(path, "packed", "experts", "codec.json"))
-            && File.Exists(Path.Combine(path, "packed", "experts", "codebook.safetensors"))
-            && File.Exists(Path.Combine(path, "packed", "experts", "L00.safetensors"))
-            && File.Exists(Path.Combine(path, "goldens", "L0_e0_fp32.safetensors"));
-    }
+        => DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveDirectory(
+            "DOTLLM_MACH1_35B_DIR", "SyzygyResearch", "Mach-1-Additive-35B", "packed/experts/codec.json", "packed/experts/codebook.safetensors", "packed/experts/L00.safetensors", "goldens/L0_e0_fp32.safetensors").Path;
 }

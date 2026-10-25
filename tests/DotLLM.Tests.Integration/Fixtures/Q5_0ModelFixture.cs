@@ -5,7 +5,7 @@ namespace DotLLM.Tests.Integration.Fixtures;
 /// <summary>
 /// Downloads SmolLM-135M Q5_0 GGUF (~100 MB). Q5_0 is a second, structurally different
 /// quantization for tests that must not be single-format (e.g. the #530 chunk-invariance sweep).
-/// Cached in <c>~/.dotllm/test-cache/</c> across test runs.
+/// Cached in <c>~/.dotllm/models/</c> across test runs.
 /// </summary>
 public sealed class Q5_0ModelFixture : IAsyncLifetime
 {

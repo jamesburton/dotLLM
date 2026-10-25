@@ -7,6 +7,7 @@ using DotLLM.Models.Gguf;
 using DotLLM.Models.Quantization;
 using Xunit;
 using Xunit.Abstractions;
+using DotLLM.Tests.Integration.Fixtures;
 
 namespace DotLLM.Tests.Unit.Cpu.Kernels;
 
@@ -25,16 +26,8 @@ public sealed unsafe class NanoQuantTests(ITestOutputHelper output)
     private static int[] I(JsonElement e) => e.EnumerateArray().Select(x => x.GetInt32()).ToArray();
     private static int[] Flat(JsonElement e) => e.EnumerateArray().SelectMany(r => r.EnumerateArray().Select(x => x.GetInt32())).ToArray();
 
-    internal static string? RealGguf()
-    {
-        string? env = Environment.GetEnvironmentVariable("DOTLLM_NANOQUANT_GGUF");
-        if (!string.IsNullOrEmpty(env)) return File.Exists(env) ? env : null;
-        string snaps = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache", "huggingface", "hub",
-            "models--arelath--Qwen3-0.6B-nanoquant-GGUF", "snapshots");
-        return Directory.Exists(snaps)
-            ? Directory.EnumerateFiles(snaps, "qwen3-0-6b-nanoquant.gguf", SearchOption.AllDirectories).FirstOrDefault()
-            : null;
-    }
+    internal static string? RealGguf() =>
+        TestFixtureResolver.ResolveFile("DOTLLM_NANOQUANT_GGUF", "arelath", "Qwen3-0.6B-nanoquant-GGUF", "qwen3-0-6b-nanoquant.gguf").Path;
 
     private sealed record Fx(int DOut, int DIn, int R, int[] U, int[] V, float[] Pre, float[] Mid, float[] Post, int[] Idx, float[] Sal, float[] X, double[] Y);
 

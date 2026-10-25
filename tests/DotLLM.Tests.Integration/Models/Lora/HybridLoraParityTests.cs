@@ -31,8 +31,9 @@ public sealed class HybridLoraParityTests
 
     public HybridLoraParityTests(ITestOutputHelper output) => _output = output;
 
-    private static string ModelPath =>
-        @"C:/Users/james/.dotllm/models/QuantFactory/SmolLM-135M-GGUF/SmolLM-135M.Q8_0.gguf";
+    private static string? ModelPath =>
+        DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveFile(
+            [], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q8_0.gguf"], null).Path;
 
     [SkippableFact]
     public unsafe void HybridAndCpu_LoraLogits_AreNumericallyConsistent()
@@ -46,7 +47,7 @@ public sealed class HybridLoraParityTests
             "No CUDA device available.");
 
         // ── Setup ─────────────────────────────────────────────────────────────────
-        using var gguf = GgufFile.Open(ModelPath);
+        using var gguf = GgufFile.Open(ModelPath!);
         var cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
 
         int[] tok = [1, 2, 3];

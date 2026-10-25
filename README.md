@@ -529,9 +529,9 @@ dotnet run --project src/DotLLM.Cli -c Debug -- debug embed-lookup model.gguf --
 dotnet test
 ```
 
-> Integration tests automatically download several GGUF models (~4.5 GB total) from HuggingFace to `~/.dotllm/test-cache/` on first run. The first `dotnet test` will take a while; subsequent runs use the cache. To run only unit tests (no downloads): `dotnet test tests/DotLLM.Tests.Unit`.
+> Integration tests automatically download several GGUF models (~4.5 GB total) from HuggingFace to `~/.dotllm/models/` (the same store `dotllm model pull` uses) on first run. A model already present in `~/.dotllm/models/`, the HF hub cache, or the legacy `~/.dotllm/test-cache/` is reused — hardlinked into `~/.dotllm/models/` when on the same volume — never re-downloaded. The first `dotnet test` will take a while; subsequent runs use the store. To run only unit tests (no downloads): `dotnet test tests/DotLLM.Tests.Unit`. `scripts/dedupe-models.ps1` collapses existing duplicate copies into hardlinks.
 
-Set `DOTLLM_TEST_CACHE_DIR` to relocate that cache — useful for pointing CI at a mounted cache volume so models aren't re-downloaded every job, or for moving it off a small system drive:
+Set `DOTLLM_TEST_CACHE_DIR` to override where test downloads land — useful for pointing CI at a mounted cache volume so models aren't re-downloaded every job, or for moving it off a small system drive:
 
 ```bash
 # Linux/macOS
@@ -542,13 +542,7 @@ export DOTLLM_TEST_CACHE_DIR=/mnt/ci-cache/dotllm-models
 $env:DOTLLM_TEST_CACHE_DIR = "D:\dotllm-test-cache"
 ```
 
-The cache uses the same `{owner}/{repo}/{file}.gguf` layout as `~/.dotllm/models/`, so you can point it at your CLI model directory to reuse models you already pulled:
-
-```powershell
-$env:DOTLLM_TEST_CACHE_DIR = "$HOME\.dotllm\models"
-```
-
-> Doing so means test models are downloaded into your `dotllm model pull` inventory and will appear in `dotllm model list`. That is intentional but opt-in — leave the variable unset to keep auto-downloaded test models separate from models you pulled explicitly. The value must be an absolute path (or a relative one, resolved against the working directory); `~` is not expanded.
+The override uses the same `{owner}/{repo}/{file}.gguf` layout as `~/.dotllm/models/`. Test models therefore appear in `dotllm model list` — one store, one copy (#1279). The value must be an absolute path (or a relative one, resolved against the working directory); `~` is not expanded.
 
 > **GPU tests** (tagged `Category=GPU`) require an NVIDIA GPU and run full model inference — they can take 20-30 minutes. They are skipped automatically on machines without CUDA. To exclude them explicitly: `dotnet test tests/DotLLM.Tests.Unit/ --filter "Category!=GPU"`
 

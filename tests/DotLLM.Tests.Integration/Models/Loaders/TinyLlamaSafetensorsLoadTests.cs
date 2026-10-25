@@ -25,7 +25,7 @@ namespace DotLLM.Tests.Integration.Models.Loaders;
 /// </para>
 /// <para>
 /// The test fetches <c>model.safetensors</c> + <c>config.json</c> into
-/// <c>~/.dotllm/test-cache/&lt;repo&gt;/</c> on first run and caches them for
+/// <c>~/.dotllm/models/&lt;repo&gt;/</c> on first run and caches them for
 /// subsequent runs. Cap: 50 MB. If the download fails (offline CI, HF
 /// outage, rate limit, repo deleted) the test skips gracefully rather than
 /// failing, per the pattern established by Mamba3 reference tests.
@@ -46,9 +46,7 @@ public sealed class TinyLlamaSafetensorsLoadTests
         ("trl-internal-testing/tiny-random-LlamaForCausalLM", ["model.safetensors", "config.json"]),
     ];
 
-    private static readonly string CacheDir = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-        ".dotllm", "test-cache");
+    private static readonly string CacheDir = DotLLM.Tests.Integration.Fixtures.TestModelDownloader.CacheDirectory;
 
     private readonly ITestOutputHelper _output;
 
@@ -132,8 +130,7 @@ public sealed class TinyLlamaSafetensorsLoadTests
     {
         foreach (var (repoId, files) in Candidates)
         {
-            string cachedDir = Path.Combine(
-                CacheDir, repoId.Replace('/', Path.DirectorySeparatorChar));
+            string cachedDir = DotLLM.Tests.Integration.Fixtures.TestRepoDirectory.Resolve(repoId, "model.safetensors", "config.json");
             string cachedModel = Path.Combine(cachedDir, "model.safetensors");
             string cachedConfig = Path.Combine(cachedDir, "config.json");
 

@@ -49,13 +49,17 @@ internal sealed class FixtureLocation
 /// <list type="number">
 ///   <item><description>the explicit environment override (file path, or a directory
 ///     containing one of the candidate file names);</description></item>
-///   <item><description>the dotLLM test cache — <c>$DOTLLM_TEST_CACHE_DIR</c> or
-///     <c>~/.dotllm/test-cache/</c> — laid out as <c>{org}/{repo}/{file}</c>, plus the
-///     interchangeable CLI store <c>~/.dotllm/models/{org}/{repo}/</c>;</description></item>
+///   <item><description>the dotLLM model store — <see cref="TestModelDownloader.CacheDirectory"/>
+///     (<c>~/.dotllm/models/</c>, or the <c>$DOTLLM_TEST_CACHE_DIR</c> override), then
+///     <c>~/.dotllm/models/</c> itself when overridden, then the legacy
+///     <c>~/.dotllm/test-cache/</c> (read-only; nothing writes models there since #1279) — each
+///     laid out as <c>{org}/{repo}/{file}</c>;</description></item>
 ///   <item><description>the Hugging Face hub cache —
 ///     <c>{hub}/models--{org}--{repo}/snapshots/*/</c>, searched recursively because
 ///     multi-quant GGUF repos nest files under a per-quant subdirectory.</description></item>
 /// </list>
+/// <para>File names may be globs (<c>*</c>, <c>?</c>), matched at the top of each dotLLM store
+/// directory and anywhere under a hub snapshot.</para>
 /// <para>Every probe is recorded so a genuine miss reports <b>skipped</b> with a message
 /// naming each path tried, rather than a bare "fixture not found".</para>
 /// </remarks>
@@ -202,15 +206,21 @@ internal static class TestFixtureResolver
     // ── Probe sources ──
 
     /// <summary>
-    /// <c>{cacheRoot}/{org}/{repo}</c> for the test cache and the interchangeable
-    /// <c>~/.dotllm/models/</c> CLI store.
+    /// The pre-#1279 test download root, <c>~/.dotllm/test-cache/</c>. Still probed so existing
+    /// files are found (and hardlinked into the model store) rather than re-downloaded; never
+    /// written. <c>scripts/dedupe-models.ps1</c> migrates its model files out.
     /// </summary>
-    private static IEnumerable<string> DotLlmCacheDirectories(string org, string repo)
-    {
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        yield return System.IO.Path.Combine(TestModelDownloader.CacheDirectory, org, repo);
-        yield return System.IO.Path.Combine(home, ".dotllm", "models", org, repo);
-    }
+    internal static string LegacyTestCacheDirectory => System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dotllm", "test-cache");
+
+    /// <summary>
+    /// <c>{root}/{org}/{repo}</c> for the download root, the CLI model store (when the download
+    /// root is overridden) and the legacy test cache, de-duplicated.
+    /// </summary>
+    private static IEnumerable<string> DotLlmCacheDirectories(string org, string repo) =>
+        new[] { TestModelDownloader.CacheDirectory, DotLLM.HuggingFace.HuggingFaceDownloader.DefaultModelsDirectory, LegacyTestCacheDirectory }
+            .Select(root => System.IO.Path.Combine(System.IO.Path.GetFullPath(root), org, repo))
+            .Distinct(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
 
     /// <summary>
     /// Hugging Face hub snapshot directories for <c>models--{org}--{repo}</c>, newest first.
@@ -295,11 +305,43 @@ internal static class TestFixtureResolver
         {
             string full = System.IO.Path.Combine(dir, name);
             probed.Add(full);
-            if (File.Exists(full))
+            if (IsGlob(name))
+            {
+                string? match = FirstGlobMatch(dir, name);
+                if (match is not null)
+                    return match;
+            }
+            else if (File.Exists(full))
+            {
                 return System.IO.Path.GetFullPath(full);
+            }
         }
 
         return null;
+    }
+
+    private static bool IsGlob(string name) => name.AsSpan().IndexOfAny('*', '?') >= 0;
+
+    /// <summary>First (ordinal) top-level match of <paramref name="pattern"/> in <paramref name="dir"/>.</summary>
+    private static string? FirstGlobMatch(string dir, string pattern)
+    {
+        if (!Directory.Exists(dir))
+            return null;
+
+        try
+        {
+            string[] hits = Directory.GetFiles(dir, pattern);
+            Array.Sort(hits, StringComparer.Ordinal);
+            return hits.Length > 0 ? System.IO.Path.GetFullPath(hits[0]) : null;
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
     }
 
     /// <summary>

@@ -108,13 +108,7 @@ public sealed class VulkanMoeDecodeKernelSwapParityTests
 
     private static string? ResolveModelPath()
     {
-        string? env = Environment.GetEnvironmentVariable("DOTLLM_SPLIT_PARITY_MOE_GGUF");
-        if (!string.IsNullOrEmpty(env) && File.Exists(env)) return env;
-        string hub = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".cache", "huggingface", "hub", "models--unsloth--Qwen3.6-35B-A3B-GGUF", "snapshots");
-        return Directory.Exists(hub)
-            ? Directory.GetFiles(hub, "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf", SearchOption.AllDirectories).FirstOrDefault()
-            : null;
+        return DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveFile("DOTLLM_SPLIT_PARITY_MOE_GGUF", "unsloth", "Qwen3.6-35B-A3B-GGUF", "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf").Path;
     }
 
     private static string ResolveSpvDir()

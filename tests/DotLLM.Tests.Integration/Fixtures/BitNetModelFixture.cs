@@ -5,7 +5,7 @@ namespace DotLLM.Tests.Integration.Fixtures;
 /// <summary>
 /// Downloads Microsoft BitNet b1.58 2B4T (I2_S ternary GGUF, ~1.2 GB) for BitNet integration tests.
 /// Exercises the ternary-weight (I2_S) path, the squared-ReLU FFN and the attention/FFN Sub-LN
-/// end-to-end. Cached in <c>~/.dotllm/test-cache/</c> across test runs.
+/// end-to-end. Cached in <c>~/.dotllm/models/</c> across test runs.
 /// </summary>
 public sealed class BitNetModelFixture : IAsyncLifetime
 {

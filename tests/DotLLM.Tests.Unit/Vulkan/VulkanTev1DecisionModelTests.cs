@@ -6,6 +6,7 @@ using DotLLM.Tokenizers.Bpe;
 using DotLLM.Vulkan;
 using Xunit;
 using Xunit.Abstractions;
+using DotLLM.Tests.Integration.Fixtures;
 
 namespace DotLLM.Tests.Unit.Vulkan;
 
@@ -33,20 +34,8 @@ public sealed class VulkanTev1DecisionModelTests
 
     public VulkanTev1DecisionModelTests(ITestOutputHelper output) => _out = output;
 
-    private static string? Find(string envVar, string repoDir, string glob)
-    {
-        string? env = Environment.GetEnvironmentVariable(envVar);
-        if (!string.IsNullOrEmpty(env) && File.Exists(env)) return env;
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string snaps = Path.Combine(home, ".cache", "huggingface", "hub", repoDir, "snapshots");
-        if (!Directory.Exists(snaps)) return null;
-        foreach (string s in Directory.EnumerateDirectories(snaps))
-        {
-            string[] hits = Directory.GetFiles(s, glob);
-            if (hits.Length > 0) return hits[0];
-        }
-        return null;
-    }
+    private static string? Find(string envVar, string org, string repo, string glob) =>
+        TestFixtureResolver.ResolveFile(envVar, org, repo, glob).Path;
 
     // Qwen3.5 chat template with enable_thinking=false: the assistant turn is pre-filled with an empty think block.
     private static string Prompt(int daysAgo) =>
@@ -58,7 +47,7 @@ public sealed class VulkanTev1DecisionModelTests
     [SkippableFact]
     public void Tev1_4B_Vulkan_MatchesCpu_AndAnswersDecisionsCorrectly()
     {
-        string? path = Find("DOTLLM_TEV1_4B_GGUF", "models--bartowski--togethercomputer_Tev1-4B-experimental-GGUF", "*Q4_K_M.gguf");
+        string? path = Find("DOTLLM_TEV1_4B_GGUF", "bartowski", "togethercomputer_Tev1-4B-experimental-GGUF", "*Q4_K_M.gguf");
         Skip.If(path is null, "Tev1-4B GGUF not found.");
         Run(path!, expectCorrect: true);
     }
@@ -66,7 +55,7 @@ public sealed class VulkanTev1DecisionModelTests
     [SkippableFact]
     public void Tev1_08B_Vulkan_MatchesCpu()
     {
-        string? path = Find("DOTLLM_TEV1_08B_GGUF", "models--DreamBlooms--Tev1-0.8B-experimental-GGUF", "*Q8_0.gguf");
+        string? path = Find("DOTLLM_TEV1_08B_GGUF", "DreamBlooms", "Tev1-0.8B-experimental-GGUF", "*Q8_0.gguf");
         Skip.If(path is null, "Tev1-0.8B GGUF not found.");
         Run(path!, expectCorrect: false);
     }
@@ -78,7 +67,7 @@ public sealed class VulkanTev1DecisionModelTests
     [SkippableFact]
     public void Tev1_4B_Vulkan_LongContextGreedyDecode_MatchesCpu()
     {
-        string? path = Find("DOTLLM_TEV1_4B_GGUF", "models--bartowski--togethercomputer_Tev1-4B-experimental-GGUF", "*Q4_K_M.gguf");
+        string? path = Find("DOTLLM_TEV1_4B_GGUF", "bartowski", "togethercomputer_Tev1-4B-experimental-GGUF", "*Q4_K_M.gguf");
         Skip.If(path is null, "Tev1-4B GGUF not found.");
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 

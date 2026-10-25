@@ -3,6 +3,7 @@ using DotLLM.Core.Configuration;
 using DotLLM.Cuda;
 using DotLLM.Cuda.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using DotLLM.Tests.Unit.Models.Architectures;
 using Xunit;
 using Xunit.Abstractions;
@@ -456,18 +457,7 @@ public sealed class CudaQwen3HybridDenseSmallSGemvTests : IDisposable
 
     private static string? FindBonsai2Checkpoint()
     {
-        string? env = Environment.GetEnvironmentVariable("DOTLLM_BONSAI2_MTP_GGUF");
-        if (!string.IsNullOrEmpty(env) && File.Exists(env)) return env;
-
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string repo = Path.Combine(home, ".cache", "huggingface", "hub",
-            "models--ProCreations--Ternary-Bonsai-2-27B-MTP", "snapshots");
-        if (!Directory.Exists(repo)) return null;
-        foreach (string snapshot in Directory.EnumerateDirectories(repo))
-        {
-            string[] hits = Directory.GetFiles(snapshot, "*MTP*.gguf");
-            if (hits.Length > 0) return hits[0];
-        }
-        return null;
+        return TestFixtureResolver.ResolveFile(
+            "DOTLLM_BONSAI2_MTP_GGUF", "ProCreations", "Ternary-Bonsai-2-27B-MTP", "*MTP*.gguf").Path;
     }
 }

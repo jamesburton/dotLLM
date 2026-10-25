@@ -43,13 +43,8 @@ public sealed class MlaAbsorbedRealModelTests
         string.Concat(Enumerable.Repeat("Photosynthesis converts light energy into chemical energy stored in glucose. In the light-dependent reactions, chlorophyll absorbs photons and drives an electron transport chain that produces ATP and NADPH; in the Calvin cycle, those carriers fix carbon dioxide into sugars. ", 10)) + "To summarise, plants make food using",
     ];
 
-    private static string? Find(string envVar, string repoDir, string file)
-    {
-        string? p = Environment.GetEnvironmentVariable(envVar);
-        if (!string.IsNullOrWhiteSpace(p) && File.Exists(p)) return p;
-        string hub = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache", "huggingface", "hub", repoDir, "snapshots");
-        return Directory.Exists(hub) ? Directory.EnumerateFiles(hub, file, SearchOption.AllDirectories).FirstOrDefault() : null;
-    }
+    private static string? Find(string envVar, string org, string repo, string file)
+        => DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveFile(envVar, org, repo, file).Path;
 
     private sealed record Mode(string Name, int Chunk);   // Chunk: 1 = decode, 0 = whole prompt, n = n-token chunks
 
@@ -63,7 +58,7 @@ public sealed class MlaAbsorbedRealModelTests
     {
         Skip.If(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1", "DOTLLM_SKIP_VULKAN=1");
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan device.");
-        string? path = Find("DOTLLM_GLM_GGUF", "models--unsloth--GLM-4.7-Flash-GGUF", "GLM-4.7-Flash-Q4_K_M.gguf");
+        string? path = Find("DOTLLM_GLM_GGUF", "unsloth", "GLM-4.7-Flash-GGUF", "GLM-4.7-Flash-Q4_K_M.gguf");
         Skip.If(path is null, "GLM-4.7-Flash Q4_K_M not found (set DOTLLM_GLM_GGUF).");
         string spv = Path.Combine(AppContext.BaseDirectory, "spv");
 

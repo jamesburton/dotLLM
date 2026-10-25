@@ -33,20 +33,15 @@ public sealed class MlaSharedExpertPackedRealModelTests
         string.Concat(Enumerable.Repeat("The history of the Roman Empire spans many centuries, during which the city grew from a small settlement on the banks of the Tiber into the capital of a vast realm. Its legions marched across Europe, and its roads linked provinces from Britain to Syria. ", 4)) + "In summary, the Roman Empire was",
     ];
 
-    private static string? Find(string envVar, string repoDir, string file)
-    {
-        string? p = Environment.GetEnvironmentVariable(envVar);
-        if (!string.IsNullOrWhiteSpace(p) && File.Exists(p)) return p;
-        string hub = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache", "huggingface", "hub", repoDir, "snapshots");
-        return Directory.Exists(hub) ? Directory.EnumerateFiles(hub, file, SearchOption.AllDirectories).FirstOrDefault() : null;
-    }
+    private static string? Find(string envVar, string org, string repo, string file)
+        => DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveFile(envVar, org, repo, file).Path;
 
     [SkippableFact]
     public void SharedExperts_StayPacked_AndKlVsCpuIsNotWorseThanF32Control()
     {
         Skip.If(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1", "DOTLLM_SKIP_VULKAN=1");
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan device.");
-        string? path = Find("DOTLLM_GLM_GGUF", "models--unsloth--GLM-4.7-Flash-GGUF", "GLM-4.7-Flash-Q4_K_M.gguf");
+        string? path = Find("DOTLLM_GLM_GGUF", "unsloth", "GLM-4.7-Flash-GGUF", "GLM-4.7-Flash-Q4_K_M.gguf");
         Skip.If(path is null, "GLM-4.7-Flash Q4_K_M not found (set DOTLLM_GLM_GGUF).");
         string spv = Path.Combine(AppContext.BaseDirectory, "spv");
 

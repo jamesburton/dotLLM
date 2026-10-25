@@ -6,6 +6,7 @@ using DotLLM.Tokenizers.Bpe;
 using DotLLM.Vulkan;
 using Xunit;
 using Xunit.Abstractions;
+using DotLLM.Tests.Integration.Fixtures;
 
 namespace DotLLM.Tests.Unit.Vulkan;
 
@@ -31,20 +32,8 @@ public sealed class VulkanTev1RequestLatencyProbe
         "\"question\":\"Is the return within the window?\",\"options\":[{\"label\":\"A\",\"key\":\"yes\",\"description\":\"Yes.\"}," +
         "{\"label\":\"B\",\"key\":\"no\",\"description\":\"No.\"}]}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
 
-    private static string? FindGguf()
-    {
-        string? env = Environment.GetEnvironmentVariable("DOTLLM_TEV1_4B_GGUF");
-        if (!string.IsNullOrEmpty(env) && File.Exists(env)) return env;
-        string snaps = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".cache", "huggingface", "hub", "models--bartowski--togethercomputer_Tev1-4B-experimental-GGUF", "snapshots");
-        if (!Directory.Exists(snaps)) return null;
-        foreach (string s in Directory.EnumerateDirectories(snaps))
-        {
-            string[] hits = Directory.GetFiles(s, "*Q4_K_M.gguf");
-            if (hits.Length > 0) return hits[0];
-        }
-        return null;
-    }
+    private static string? FindGguf() =>
+        TestFixtureResolver.ResolveFile("DOTLLM_TEV1_4B_GGUF", "bartowski", "togethercomputer_Tev1-4B-experimental-GGUF", "*Q4_K_M.gguf").Path;
 
     [SkippableFact]
     public void Tev1_4B_RequestLatencyBreakdown()

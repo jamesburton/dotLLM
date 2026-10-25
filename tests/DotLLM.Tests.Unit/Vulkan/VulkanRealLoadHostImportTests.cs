@@ -4,6 +4,7 @@ using DotLLM.Vulkan;
 using DotLLM.Vulkan.Interop;
 using Xunit;
 using Xunit.Abstractions;
+using DotLLM.Tests.Integration.Fixtures;
 
 namespace DotLLM.Tests.Unit.Vulkan;
 
@@ -49,14 +50,8 @@ public class VulkanRealLoadHostImportTests(ITestOutputHelper output)
         if (!string.IsNullOrEmpty(overridePath))
             return File.Exists(overridePath) ? overridePath : null;
 
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string[] candidates =
-        [
-            Path.Combine(home, ".dotllm", "test-cache", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q8_0.gguf"),
-            Path.Combine(home, ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q8_0.gguf"),
-            Path.Combine(home, ".dotllm", "test-cache", "bartowski", "SmolLM2-135M-Instruct-GGUF", "SmolLM2-135M-Instruct-Q8_0.gguf"),
-        ];
-        return candidates.FirstOrDefault(File.Exists);
+        return TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q8_0.gguf"], null).Path
+            ?? TestFixtureResolver.ResolveFile([], "bartowski", "SmolLM2-135M-Instruct-GGUF", ["SmolLM2-135M-Instruct-Q8_0.gguf"], null).Path;
     }
 
     /// <summary>

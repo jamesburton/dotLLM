@@ -22,20 +22,13 @@ namespace DotLLM.Tests.Integration.Tokenizers;
 /// </remarks>
 public sealed class Gemma4TokenizerParityTests
 {
-    private const string Path26B =
-        "C:/Users/james/.cache/huggingface/hub/models--unsloth--gemma-4-26B-A4B-it-GGUF/" +
-        "snapshots/3365c68df1a83799b846d05324ebfadbb8cc70b3/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf";
-    private const string PathE4B =
-        "C:/Users/james/.cache/huggingface/hub/models--unsloth--gemma-4-E4B-it-GGUF/" +
-        "snapshots/653803f092503c04a65164346f3208a36e707693/gemma-4-E4B-it-Q4_K_M.gguf";
-
     /// <summary>Tokenizers are expensive to build (262k-entry trie) — cache per model path.</summary>
     private static readonly ConcurrentDictionary<string, BpeTokenizer> Cache = new();
 
     private static string? Resolve(string model) => model switch
     {
-        "26B" => File.Exists(Path26B) ? Path26B : null,
-        "E4B" => File.Exists(PathE4B) ? PathE4B : null,
+        "26B" => DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveFile([], "unsloth", "gemma-4-26B-A4B-it-GGUF", ["gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"], null).Path,
+        "E4B" => DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveFile([], "unsloth", "gemma-4-E4B-it-GGUF", ["gemma-4-E4B-it-Q4_K_M.gguf"], null).Path,
         _ => null,
     };
 

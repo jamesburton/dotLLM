@@ -125,17 +125,9 @@ public sealed class Mach1ChatTemplateTests
 
     private const string SkipReason =
         "Mach-1-Additive-35B fixture not found. Set DOTLLM_MACH1_35B_DIR or populate " +
-        "~/.dotllm/test-cache/SyzygyResearch/Mach-1-Additive-35B/ (see docs/QUANTIZATION.md).";
+        "~/.dotllm/models/SyzygyResearch/Mach-1-Additive-35B/ (see docs/QUANTIZATION.md).";
 
     private static string? ResolveFixtureRoot()
-    {
-        string? env = Environment.GetEnvironmentVariable("DOTLLM_MACH1_35B_DIR");
-        if (!string.IsNullOrWhiteSpace(env) && Directory.Exists(env))
-            return env;
-
-        string conventional = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "test-cache", "SyzygyResearch", "Mach-1-Additive-35B");
-        return Directory.Exists(conventional) ? conventional : null;
-    }
+        => DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveDirectory(
+            "DOTLLM_MACH1_35B_DIR", "SyzygyResearch", "Mach-1-Additive-35B").Path;
 }

@@ -2,6 +2,7 @@ using DotLLM.Core.Configuration;
 using DotLLM.Core.Tensors;
 using DotLLM.Cuda;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -44,7 +45,7 @@ public sealed class CudaRealGgufIQuantSmokeTests
         string? ggufPath = ResolveIq4NlFixturePath();
         Skip.If(ggufPath is null,
             $"IQ4_NL GGUF fixture not found. Set {Iq4NlModelPathEnvVar} or {Iq4NlAliasModelPathEnvVar}, "
-            + "or place an IQ4_NL fixture under ~/.dotllm/models or ~/.dotllm/test-cache.");
+            + "or place an IQ4_NL fixture under ~/.dotllm/models/bartowski/.");
 
         RunRealGgufPrefillAndDecode(ggufPath);
     }
@@ -96,32 +97,8 @@ public sealed class CudaRealGgufIQuantSmokeTests
         if (!string.IsNullOrWhiteSpace(envPath) && File.Exists(envPath))
             return envPath;
 
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string[] relativeCandidates =
-        [
-            Path.Combine("bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF",
-                "Meta-Llama-3.1-8B-Instruct-IQ4_NL.gguf"),
-            Path.Combine("bartowski", "Qwen2.5-7B-Instruct-GGUF",
-                "Qwen2.5-7B-Instruct-IQ4_NL.gguf"),
-        ];
-
-        string[] roots =
-        [
-            Path.Combine(home, ".dotllm", "models"),
-            Path.Combine(home, ".dotllm", "test-cache"),
-        ];
-
-        foreach (string root in roots)
-        {
-            foreach (string relative in relativeCandidates)
-            {
-                string candidate = Path.Combine(root, relative);
-                if (File.Exists(candidate))
-                    return candidate;
-            }
-        }
-
-        return null;
+        return TestFixtureResolver.ResolveFile([], "bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF", ["Meta-Llama-3.1-8B-Instruct-IQ4_NL.gguf"], null).Path
+            ?? TestFixtureResolver.ResolveFile([], "bartowski", "Qwen2.5-7B-Instruct-GGUF", ["Qwen2.5-7B-Instruct-IQ4_NL.gguf"], null).Path;
     }
 
     private static string? ResolveIQuantFixturePath()
@@ -130,34 +107,10 @@ public sealed class CudaRealGgufIQuantSmokeTests
         if (!string.IsNullOrWhiteSpace(envPath) && File.Exists(envPath))
             return envPath;
 
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string modelsRoot = Path.Combine(home, ".dotllm", "models");
-        string testCacheRoot = Path.Combine(home, ".dotllm", "test-cache");
-
-        string[] relativeCandidates =
-        [
-            Path.Combine("bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF",
-                "Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf"),
-            Path.Combine("bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF",
-                "Meta-Llama-3.1-8B-Instruct-IQ4_NL.gguf"),
-            Path.Combine("bartowski", "Qwen2.5-7B-Instruct-GGUF",
-                "Qwen2.5-7B-Instruct-IQ4_XS.gguf"),
-            Path.Combine("bartowski", "Qwen2.5-7B-Instruct-GGUF",
-                "Qwen2.5-7B-Instruct-IQ4_NL.gguf"),
-        ];
-
-        foreach (string relative in relativeCandidates)
-        {
-            string cliPath = Path.Combine(modelsRoot, relative);
-            if (File.Exists(cliPath))
-                return cliPath;
-
-            string testCachePath = Path.Combine(testCacheRoot, relative);
-            if (File.Exists(testCachePath))
-                return testCachePath;
-        }
-
-        return null;
+        return TestFixtureResolver.ResolveFile([], "bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF", ["Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf"], null).Path
+            ?? TestFixtureResolver.ResolveFile([], "bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF", ["Meta-Llama-3.1-8B-Instruct-IQ4_NL.gguf"], null).Path
+            ?? TestFixtureResolver.ResolveFile([], "bartowski", "Qwen2.5-7B-Instruct-GGUF", ["Qwen2.5-7B-Instruct-IQ4_XS.gguf"], null).Path
+            ?? TestFixtureResolver.ResolveFile([], "bartowski", "Qwen2.5-7B-Instruct-GGUF", ["Qwen2.5-7B-Instruct-IQ4_NL.gguf"], null).Path;
     }
 
     private static string ResolvePtxDir()

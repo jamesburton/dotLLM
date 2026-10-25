@@ -4,6 +4,7 @@ using DotLLM.Core.Tensors;
 using DotLLM.Cuda;
 using DotLLM.Cuda.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -152,20 +153,7 @@ public class CudaQwen3HybridDenseQuantKvTest
 
     private static string? ResolveFixturePath()
     {
-        string? envPath = Environment.GetEnvironmentVariable(ModelPathEnvVar);
-        if (!string.IsNullOrWhiteSpace(envPath) && File.Exists(envPath))
-            return envPath;
-
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string[] candidates =
-        [
-            Path.Combine(home, ".dotllm", "models", "prism-ml", "Ternary-Bonsai-2-27B-gguf", FileName),
-            Path.Combine(home, ".dotllm", "test-cache", "prism-ml", "Ternary-Bonsai-2-27B-gguf", FileName),
-        ];
-        foreach (string candidate in candidates)
-            if (File.Exists(candidate))
-                return candidate;
-        return null;
+        return KnownTestFixtures.TernaryBonsai27B_Q2_0.Path;
     }
 
     private static string? FindPtxDir()

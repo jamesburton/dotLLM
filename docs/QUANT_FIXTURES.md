@@ -25,6 +25,27 @@ DOTLLM_QUANT_FIXTURE_<TYPE>=/absolute/path/to/model.gguf
 Fixtures are model weights and therefore **never** live inside the repository — see the
 "Model & Fixture Storage Rules" section of `CLAUDE.md`.
 
+## One model store (#1279)
+
+Real-model fixtures (as opposed to the generated ladder above) live in **one** store,
+`~/.dotllm/models/{org}/{repo}/` — the same directory `dotllm model pull` writes.
+
+- `TestModelDownloader.EnsureModelAsync` downloads there (`$DOTLLM_TEST_CACHE_DIR` overrides the
+  root, e.g. for a CI cache volume). Before downloading it asks `TestFixtureResolver`, which probes
+  the `DOTLLM_*_GGUF` override → `~/.dotllm/models` → legacy `~/.dotllm/test-cache` → HF hub cache
+  (`$HF_HUB_CACHE` / `$HF_HOME/hub` / `~/.cache/huggingface/hub`). A hit elsewhere on the same
+  volume is **hardlinked** into `~/.dotllm/models` (for an HF snapshot symlink, the blob it points
+  at is linked, not the symlink); a cross-volume hit is used in place. Nothing is copied.
+- Tests never hardcode a store path; they call `TestFixtureResolver.ResolveFile` /
+  `ResolveDirectory` (or a `KnownTestFixtures` entry). File names may be globs.
+- `~/.dotllm/test-cache/` is no longer a model store. It keeps only **generated, non-model**
+  artefacts: `corpora/` (LF wikitext, `scripts/make_lf_corpus.py`), `token-oracles/`,
+  `mimo2-tiny/` and `mimo2-tiny-k256/` (below), `nanoquant-oracle/`, `littlebit-qwen3-0.6b-055/`.
+- `scripts/dedupe-models.ps1` migrates an existing machine: it hashes candidate duplicates across
+  the three stores (SHA-256, cached in `~/.dotllm/dedupe-hash-cache.json`), replaces same-volume
+  duplicates with hardlinks, and moves `test-cache` model files into `~/.dotllm/models`. It is a
+  dry run unless `-Apply` is passed; `-SelfTest` checks its own logic on temp files.
+
 > **These fixtures are for coverage and cross-backend gating, not for quality claims.**
 > They are `--pure` requantizations: every tensor forced to one type, including the ones a real
 > quantization scheme deliberately keeps wide. Pure-Q2_K on this 1.2 B base is a *destroyed* model
