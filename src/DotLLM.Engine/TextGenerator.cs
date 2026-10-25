@@ -387,11 +387,22 @@ public sealed partial class TextGenerator
             // trimmed at a character boundary.
             var textEmitter = new StopAwareTextEmitter(onTextGenerated, stopConditions);
 
-            // Emits the freshly decoded text of a token that stays in the output.
+            // Emits the freshly decoded text of a token that stays in the output. A UTF-8 character
+            // still split across tokens is held back until it completes (#1263).
             void EmitText()
             {
                 if (textEmitter.IsActive)
-                    textEmitter.Append(detok.TakeDelta());
+                    textEmitter.Append(detok.TakeDelta(flushIncomplete: false));
+            }
+
+            // Terminal emission for endings that keep every generated token (length limit, KV-cache
+            // exhaustion, a terminal constraint): releases a dangling incomplete character, then
+            // anything withheld as a possible stop-string prefix. Idempotent once both are drained.
+            void FlushText()
+            {
+                if (textEmitter.IsActive)
+                    textEmitter.Append(detok.TakeDelta(flushIncomplete: true));
+                textEmitter.Flush();
             }
 
             // Terminal emission. The three endings differ in what the last token contributes:
@@ -399,7 +410,8 @@ public sealed partial class TextGenerator
             //    output, so append its text and trim the matched suffix off. This is precisely the
             //    case the id-level callback cannot express (issue #424).
             //  • Stop without a stop-string match (EOS and friends) — the token is dropped from the
-            //    id list, so its text is never emitted; only previously withheld text is released.
+            //    id list, so its text is never emitted; only previously withheld text is released
+            //    (including an incomplete character held back before the dropped token, #1263).
             //  • StopInclude — the token is part of the output in full.
             void EmitTextForStop(StopResult result, bool isStopStringMatch)
             {
@@ -408,17 +420,18 @@ public sealed partial class TextGenerator
 
                 if (result == StopResult.Stop && !isStopStringMatch)
                 {
+                    textEmitter.Append(detok.TakeWithheld());
                     textEmitter.Flush();
                     return;
                 }
 
                 if (result == StopResult.Stop)
                 {
-                    textEmitter.FlushTrimmingStopSuffix(detok.TakeDelta());
+                    textEmitter.FlushTrimmingStopSuffix(detok.TakeDelta(flushIncomplete: true));
                 }
                 else
                 {
-                    textEmitter.Append(detok.TakeDelta());
+                    textEmitter.Append(detok.TakeDelta(flushIncomplete: true));
                     textEmitter.Flush();
                 }
             }
@@ -581,7 +594,7 @@ public sealed partial class TextGenerator
             // stop now instead of spending a forward pass to sample the forced EOS (~23 ms on Tev1-4B/Vulkan).
             if (ConstraintIsTerminal(constraint))
             {
-                textEmitter.Flush();
+                FlushText();
                 StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                 telemetry.Complete(promptLen, cachedTokenCount, generatedIds.Count,
                     prefillTicks * 1000.0 / Stopwatch.Frequency,
@@ -849,8 +862,9 @@ public sealed partial class TextGenerator
 
             // Releases text still withheld because it could have begun a stop string, for every
             // ending that did not go through EmitTextForStop (length limit, KV-cache exhaustion,
-            // a speculative round accepting nothing). Idempotent once the buffer is empty.
-            textEmitter.Flush();
+            // a speculative round accepting nothing), plus any incomplete character held back.
+            // Idempotent once the buffers are empty.
+            FlushText();
 
             StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
             telemetry.Complete(promptLen, cachedTokenCount, generatedIds.Count,
@@ -1108,13 +1122,13 @@ public sealed partial class TextGenerator
                     generatedIds.RemoveAt(generatedIds.Count - 1);
                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                     var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount);
-                    yield return new GenerationToken(firstTokenId, string.Empty, fr, timings, firstLogprobInfo);
+                    yield return new GenerationToken(firstTokenId, detok.TakeWithheld(), fr, timings, firstLogprobInfo);
                 }
                 else
                 {
                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                     var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount);
-                    string text = detok.TakeDelta();
+                    string text = detok.TakeDelta(flushIncomplete: true);
                     yield return new GenerationToken(firstTokenId, text, fr, timings, firstLogprobInfo);
                 }
                 yield break;
@@ -1123,7 +1137,7 @@ public sealed partial class TextGenerator
             // Yield first token — check if it's also the last (maxTokens == 1)
             {
                 bool firstIsLast = maxTokens <= 1;
-                string text = detok.TakeDelta();
+                string text = detok.TakeDelta(flushIncomplete: firstIsLast);
                 if (firstIsLast)
                 {
                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
@@ -1191,14 +1205,14 @@ public sealed partial class TextGenerator
                                     generatedIds.RemoveAt(generatedIds.Count - 1);
                                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                                     var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
-                                    yield return new GenerationToken(tokenId, string.Empty, fr, timings);
+                                    yield return new GenerationToken(tokenId, detok.TakeWithheld(), fr, timings);
                                 }
                                 else
                                 {
                                     specAccepted++;
                                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                                     var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
-                                    string text = detok.TakeDelta();
+                                    string text = detok.TakeDelta(flushIncomplete: true);
                                     yield return new GenerationToken(tokenId, text, fr, timings);
                                 }
                                 shouldBreak = true;
@@ -1210,7 +1224,7 @@ public sealed partial class TextGenerator
                             // Yield each accepted token
                             {
                                 bool isLastStep = (step + 1 >= maxTokens) || (promptLen + step >= cacheSize);
-                                string text = detok.TakeDelta();
+                                string text = detok.TakeDelta(flushIncomplete: isLastStep && i == result.AcceptedCount - 1);
                                 if (isLastStep && i == result.AcceptedCount - 1)
                                 {
                                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
@@ -1292,14 +1306,14 @@ public sealed partial class TextGenerator
                                     generatedIds.RemoveAt(generatedIds.Count - 1);
                                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                                     var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
-                                    yield return new GenerationToken(tokenId, string.Empty, fr, timings);
+                                    yield return new GenerationToken(tokenId, detok.TakeWithheld(), fr, timings);
                                 }
                                 else
                                 {
                                     specAccepted++;
                                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                                     var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
-                                    string text = detok.TakeDelta();
+                                    string text = detok.TakeDelta(flushIncomplete: true);
                                     yield return new GenerationToken(tokenId, text, fr, timings);
                                 }
                                 shouldBreak = true;
@@ -1311,7 +1325,7 @@ public sealed partial class TextGenerator
                             // Yield each accepted token
                             {
                                 bool isLastStep = (step + 1 >= maxTokens) || (promptLen + step >= cacheSize);
-                                string text = detok.TakeDelta();
+                                string text = detok.TakeDelta(flushIncomplete: isLastStep && i == result.AcceptedCount - 1);
                                 if (isLastStep && i == result.AcceptedCount - 1)
                                 {
                                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
@@ -1387,13 +1401,13 @@ public sealed partial class TextGenerator
                             generatedIds.RemoveAt(generatedIds.Count - 1);
                             StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                             var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
-                            yield return new GenerationToken(nextTokenId, string.Empty, fr, timings, tokenLogprob);
+                            yield return new GenerationToken(nextTokenId, detok.TakeWithheld(), fr, timings, tokenLogprob);
                         }
                         else
                         {
                             StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                             var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
-                            string text = detok.TakeDelta();
+                            string text = detok.TakeDelta(flushIncomplete: true);
                             yield return new GenerationToken(nextTokenId, text, fr, timings, tokenLogprob);
                         }
                         yield break;
@@ -1402,7 +1416,7 @@ public sealed partial class TextGenerator
                     // Yield token — attach finish reason if this is the last iteration
                     {
                         bool isLastStep = (step + 1 >= maxTokens) || (promptLen + step >= cacheSize);
-                        string text = detok.TakeDelta();
+                        string text = detok.TakeDelta(flushIncomplete: isLastStep);
                         if (isLastStep)
                         {
                             StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);

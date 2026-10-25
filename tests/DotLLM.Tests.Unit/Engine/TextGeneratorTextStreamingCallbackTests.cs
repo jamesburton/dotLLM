@@ -151,6 +151,82 @@ public sealed class TextGeneratorTextStreamingCallbackTests
         Assert.Equal(response.Text, streamed.ToString());
     }
 
+    // ── #1263: UTF-8 characters split across byte-fallback tokens ──
+
+    private const int ByteA = 1; // 'a' in IncrementalDetokenizerTests.BuildByteFallbackVocab
+    private const int ByteVocabEos = 0;
+
+    // Every ending, streamed both ways, must reproduce the non-streaming text exactly:
+    // complete, truncated mid-character by the token limit, and an EOS dropped mid-character.
+    public static TheoryData<string, string> SplitCharEndings()
+    {
+        var data = new TheoryData<string, string>();
+        foreach (string ch in new[] { "é", "€", "😀" })
+        {
+            data.Add(ch, "complete");
+            data.Add(ch, "truncated");
+            data.Add(ch, "eos");
+        }
+
+        return data;
+    }
+
+    private static (int[] Script, int MaxTokens) SplitScript(string ch, string ending)
+    {
+        int[] bytes = IncrementalDetokenizerTests.ByteTokens(ch);
+        return ending switch
+        {
+            "complete" => ([ByteA, .. bytes, ByteA], bytes.Length + 2),
+            "truncated" => ([ByteA, .. bytes[..^1]], bytes.Length),
+            _ => ([ByteA, .. bytes[..^1], ByteVocabEos], 16),
+        };
+    }
+
+    private static InferenceOptions SplitOptions(int maxTokens)
+        => new() { MaxTokens = maxTokens, Temperature = 0f };
+
+    [Theory]
+    [MemberData(nameof(SplitCharEndings))]
+    public async Task SplitUtf8_StreamedTokenTextEqualsReturnedText(string ch, string ending)
+    {
+        var tokenizer = IncrementalDetokenizerTests.BuildByteFallbackVocab();
+        (int[] script, int maxTokens) = SplitScript(ch, ending);
+
+        using var bulkModel = new ScriptedModel(script) { Vocab = tokenizer.VocabSize };
+        string expected = new TextGenerator(bulkModel, tokenizer).Generate("prompt", SplitOptions(maxTokens)).Text;
+
+        using var model = new ScriptedModel(script) { Vocab = tokenizer.VocabSize };
+        var generator = new TextGenerator(model, tokenizer);
+        var streamed = new StringBuilder();
+        await foreach (var token in generator.GenerateStreamingTokensAsync("prompt", SplitOptions(maxTokens)))
+            streamed.Append(token.Text);
+
+        Assert.Equal(expected, streamed.ToString());
+        if (string.Equals(ending, "complete", StringComparison.Ordinal))
+            Assert.Equal("a" + ch + "a", expected);
+        else
+            Assert.Equal(1, expected.Count(c => c == '�')); // dangling bytes flushed exactly once
+    }
+
+    [Theory]
+    [MemberData(nameof(SplitCharEndings))]
+    public void SplitUtf8_TextCallbackEqualsReturnedText(string ch, string ending)
+    {
+        var tokenizer = IncrementalDetokenizerTests.BuildByteFallbackVocab();
+        (int[] script, int maxTokens) = SplitScript(ch, ending);
+        using var model = new ScriptedModel(script) { Vocab = tokenizer.VocabSize };
+        var generator = new TextGenerator(model, tokenizer);
+
+        var streamed = new StringBuilder();
+        var response = generator.Generate("prompt", SplitOptions(maxTokens), onTextGenerated: text => streamed.Append(text));
+
+        Assert.Equal(response.Text, streamed.ToString());
+        if (string.Equals(ending, "complete", StringComparison.Ordinal))
+            Assert.Equal("a" + ch + "a", response.Text);
+        else
+            Assert.Equal(1, response.Text.Count(c => c == '�'));
+    }
+
     // ── Fakes ──
 
     /// <summary>
@@ -206,9 +282,12 @@ public sealed class TextGeneratorTextStreamingCallbackTests
 
         public ScriptedModel(params int[] script) => _script = script;
 
+        /// <summary>Vocabulary size of the logits; must match the tokenizer in use.</summary>
+        public int Vocab { get; init; } = VocabSize;
+
         public ModelConfig Config => new()
         {
-            VocabSize = VocabSize,
+            VocabSize = Vocab,
             NumLayers = 1,
             NumAttentionHeads = 1,
             NumKvHeads = 1,
@@ -231,12 +310,12 @@ public sealed class TextGeneratorTextStreamingCallbackTests
             _index++;
 
             int batchSize = tokenIds.Length;
-            long totalFloats = (long)batchSize * VocabSize;
+            long totalFloats = (long)batchSize * Vocab;
             nint ptr = (nint)NativeMemory.AlignedAlloc((nuint)(totalFloats * sizeof(float)), 64);
             float* dst = (float*)ptr;
             for (int b = 0; b < batchSize; b++)
             {
-                var row = new Span<float>(dst + b * VocabSize, VocabSize);
+                var row = new Span<float>(dst + b * Vocab, Vocab);
                 row.Fill(-10f);
                 row[next] = 10f;
             }
@@ -257,7 +336,7 @@ public sealed class TextGeneratorTextStreamingCallbackTests
                 NativeMemory.AlignedFree((void*)vPtr);
             }
 
-            return new UnmanagedTensor(new TensorShape(batchSize, VocabSize), DType.Float32, deviceId, ptr);
+            return new UnmanagedTensor(new TensorShape(batchSize, Vocab), DType.Float32, deviceId, ptr);
         }
 
         public void Dispose() { }
