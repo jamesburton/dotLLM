@@ -151,8 +151,11 @@ public sealed unsafe class ComputeThreadPool : IDisposable
         // When no NumaTopology is available we therefore fall back to a conservative default of
         // min(8, threadCount) rather than using every thread; 8 matches typical "memory channels × 2"
         // for desktop/workstation x86 hosts and keeps the pool in the regime where SpinWait is a win.
+        //
+        // An explicit DecodeThreadCount of 1 means caller-only decode (no workers); only the automatic
+        // choices keep the floor of 2.
         _decodeThreadCount = config.DecodeThreadCount > 0
-            ? Math.Clamp(config.DecodeThreadCount, 2, threadCount)
+            ? Math.Clamp(config.DecodeThreadCount, 1, threadCount)
             : topology is not null
                 ? Math.Clamp(topology.MemoryChannelEstimate, 2, threadCount)
                 : Math.Clamp(AutoDecodeThreadCount(threadCount, DetectHybrid()), 2, threadCount);
@@ -200,7 +203,7 @@ public sealed unsafe class ComputeThreadPool : IDisposable
     {
         _currentMode = mode;
         _activeWorkerCount = mode == DispatchMode.SpinWait
-            ? Math.Clamp(_decodeThreadCount - 1, 1, _threadCount - 1)
+            ? Math.Clamp(_decodeThreadCount - 1, 0, _threadCount - 1)
             : _threadCount - 1;
     }
 
@@ -230,8 +233,11 @@ public sealed unsafe class ComputeThreadPool : IDisposable
         if (activeWorkers > 0)
             _completion.Reset(activeWorkers);
 
-        // Increment generation counter (wakes spinners)
-        Interlocked.Increment(ref _dispatchGeneration);
+        // Increment generation counter (wakes spinners). A caller-only dispatch leaves the workers
+        // parked and publishes no generation: otherwise a worker still spinning from the previous
+        // dispatch could see the new generation and run this dispatch's work alongside the caller.
+        if (activeWorkers > 0)
+            Interlocked.Increment(ref _dispatchGeneration);
 
         // Also set events (wakes any workers that fell through to kernel wait)
         for (int i = 0; i < activeWorkers; i++)
