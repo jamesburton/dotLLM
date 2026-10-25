@@ -15,8 +15,9 @@ public sealed unsafe class PagedKvCacheTests
     private const int TotalBlocks = 32;
     private const int KvStride = NumKvHeads * HeadDim; // 32
 
+    // F32 rows keep these storage tests bit-exact against SimpleKvCache; F16/Q8_0 blocks are covered by PagedAttentionTests.
     private KvBlockPool CreatePool()
-        => new(NumLayers, NumKvHeads, HeadDim, BlockSize, TotalBlocks);
+        => new(NumLayers, NumKvHeads, HeadDim, BlockSize, TotalBlocks, DType.Float32);
 
     [Fact]
     public void Constructor_InitializesCorrectly()
@@ -26,7 +27,9 @@ public sealed unsafe class PagedKvCacheTests
 
         Assert.Equal(0, cache.CurrentLength);
         Assert.Equal(MaxSeqLen, cache.MaxLength);
-        Assert.Equal(2L * MaxSeqLen * KvStride * sizeof(float), cache.AllocatedBytes);
+        // Staging is lazy and no block is held yet.
+        Assert.Equal(0, cache.AllocatedBytes);
+        Assert.Equal(0, cache.StagingBytes);
     }
 
     [Fact]
@@ -405,7 +408,7 @@ public sealed unsafe class PagedKvCacheTests
     [Fact]
     public void Factory_CreatesWorkingCaches()
     {
-        using var factory = new PagedKvCacheFactory(NumLayers, NumKvHeads, HeadDim, BlockSize);
+        using var factory = new PagedKvCacheFactory(NumLayers, NumKvHeads, HeadDim, BlockSize, elementType: DType.Float32);
         Assert.Equal(factory.Pool.AllocatedBytes, factory.AllocatedBytes);
 
         using var cache1 = factory.Create(MaxSeqLen);

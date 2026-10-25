@@ -1,5 +1,6 @@
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
+using DotLLM.Core.Tensors;
 using DotLLM.Engine;
 using DotLLM.Engine.KvCache;
 using DotLLM.Engine.PromptCache;
@@ -52,8 +53,9 @@ public class PrefixTrieIntegrationTests
         var rBase = baseline.Generate(prompt, options);
 
         // Cached: prefix trie wired up. First request fills the trie, second hits it.
+        // Bit-identity oracle: F32 reference blocks (default F16 blocks are compared by tolerance, #1268).
         using var pagedFactory = new PagedKvCacheFactory(
-            config.NumLayers, config.NumKvHeads, config.HeadDim);
+            config.NumLayers, config.NumKvHeads, config.HeadDim, elementType: DType.Float32);
         using var mgr = new PrefixTrieManager(pagedFactory);
         var cachedGen = new TextGenerator(model, tokenizer,
             kvCacheFactory: (cfg, size) => pagedFactory.Create(size),

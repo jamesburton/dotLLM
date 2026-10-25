@@ -774,13 +774,21 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     public bool SupportsCompactSlidingKv => true;
 
     /// <summary>
-    /// Causal attention of <paramref name="seqQ"/> queries over the F32 rows cached for <paramref name="cacheLayer"/>.
-    /// Applies a compact sliding-window cache's row base (<see cref="IWindowedKvCache"/>, #1169): the kernel sees rows
+    /// Causal attention of <paramref name="seqQ"/> queries over the F32 rows cached for <paramref name="cacheLayer"/>,
+    /// or over an <see cref="IPagedKvCache"/>'s blocks in place (F16/Q8_0, no staging). Applies a compact sliding-window cache's row base (<see cref="IWindowedKvCache"/>, #1169): the kernel sees rows
     /// <c>[base, CurrentLength)</c> and a query offset shifted by the same base.
     /// </summary>
     private void AttendCachedF32(float* q, IKvCache kvCache, int cacheLayer, float* output, int seqQ, int positionOffset,
         int numHeads, int numKvHeads, int headDim, float scale, int? slidingWindow, float softCap, float[]? sinks = null)
     {
+        // Paged cache (#1268): read the F16/Q8_0 blocks in place, no contiguous gather.
+        if (kvCache is IPagedKvCache paged)
+        {
+            Attention.Execute(q, paged, cacheLayer, output, seqQ, numHeads, numKvHeads, headDim, positionOffset, scale,
+                _threadPool, slidingWindow, softCap, sinks);
+            return;
+        }
+
         int rowBase = (kvCache as IWindowedKvCache)?.RowBaseOf(cacheLayer) ?? 0;
         var cachedK = kvCache.GetKeysRef(cacheLayer);
         var cachedV = kvCache.GetValuesRef(cacheLayer);
