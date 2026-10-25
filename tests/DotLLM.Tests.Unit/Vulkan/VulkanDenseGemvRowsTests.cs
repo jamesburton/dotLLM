@@ -85,8 +85,9 @@ public class VulkanDenseGemvRowsTests
             (cmd, bw, bx, by, nn) => rows.Record(cmd, bw, bx, by, m, k, nn));
     }
 
-    private static void AssertColumnsMatchOneColumnDispatch(VulkanDevice device, byte[] wq, float[] x, int m, int k, int n, QuantizationType qt,
-                                                            Action<nint, VulkanDevice.Buffer, VulkanDevice.Buffer, VulkanDevice.Buffer, int> record)
+    internal static void AssertColumnsMatchOneColumnDispatch(VulkanDevice device, byte[] wq, float[] x, int m, int k, int n, QuantizationType qt,
+                                                             Action<nint, VulkanDevice.Buffer, VulkanDevice.Buffer, VulkanDevice.Buffer, int> record,
+                                                             float scale = 1f)
     {
         using var bw = device.Allocate(((long)wq.Length + 3) & ~3L);
         using var bx = device.Allocate((long)n * k * 4);
@@ -116,6 +117,7 @@ public class VulkanDenseGemvRowsTests
             {
                 double dot = 0;
                 for (int i = 0; i < k; i++) dot += (double)wf[(long)r * k + i] * x[c * k + i];
+                dot *= scale;
                 Assert.True(Math.Abs(dot - exp[r]) <= 1e-3 + 1e-4 * Math.Abs(dot), $"row {r} col {c}: {exp[r]} vs {dot}");
             }
         }

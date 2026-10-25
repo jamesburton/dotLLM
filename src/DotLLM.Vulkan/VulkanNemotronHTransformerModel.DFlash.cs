@@ -208,6 +208,53 @@ public sealed partial class VulkanNemotronHTransformerModel : IDFlashDraftAttach
 
     // ── Small-batch exact path ──────────────────────────────────────────
 
+    // #1244: deterministic multi-column GEMVs (decode = 1 column) that decode each weight block once for every row; null when the shader
+    // is missing, and NVFP4's when the opt-in MMVQ owns decode.
+    private MatMulExactGemvMultiKernel? _exactQ8, _exactNvfp4, _exactIq2Xxs;
+
+    /// <summary>Environment override of the exact GEMVs' rows per workgroup, <c>decode,verify</c> (tuning A/B; e.g. <c>2,4</c>).</summary>
+    internal const string ExactGemvRowsEnvVar = "DOTLLM_VK_NEMOTRON_GEMV_ROWS";
+
+    /// <summary>Test hook: false keeps the #1237 per-column GEMVs (A/B and the negative control of the multi-column tests).</summary>
+    internal static bool ExactGemvEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_NEMOTRON_EXACT_GEMV") != "0";
+
+    private void CreateExactGemvKernels(VulkanDevice device, string spvDir)
+    {
+        if (!ExactGemvEnabled) return;
+        // Verify rows per workgroup measured on Strix at Bolt's shapes (8-row verify, ms over all layers): NVFP4 NR 1/2/4 = 34/23.5/23.2,
+        // IQ2_XXS 21.5/14.9/17.2, Q8_0 (LM head + attention) best at 4. Decode is flat in NR, so it stays 1.
+        int decodeRows = 1, nvfp4Rows = 4, iq2Rows = 2, q8Rows = 4;
+        if (Environment.GetEnvironmentVariable(ExactGemvRowsEnvVar)?.Split(',') is [var d, var mr]
+            && int.TryParse(d, out int dv) && int.TryParse(mr, out int mv))
+        {
+            decodeRows = dv;
+            nvfp4Rows = iq2Rows = q8Rows = mv;
+        }
+
+        _exactQ8 = MatMulExactGemvMultiKernel.TryCreate(device, spvDir, ExactGemvFormat.Q8_0, decodeRows, q8Rows);
+        if (_matmulNvfp4 is not { HasMmvq: true })
+            _exactNvfp4 = MatMulExactGemvMultiKernel.TryCreate(device, spvDir, ExactGemvFormat.Nvfp4, decodeRows, nvfp4Rows);
+        _exactIq2Xxs = MatMulExactGemvMultiKernel.TryCreate(device, spvDir, ExactGemvFormat.Iq2Xxs, decodeRows, iq2Rows);
+    }
+
+    /// <summary>Records <paramref name="cols"/> rows (1 = decode) through the exact multi-column GEMV of <paramref name="qt"/>, or returns false.</summary>
+    private bool TryRecordExactGemv(nint cmdBuf, VulkanDevice.Buffer weights, QuantizationType qt,
+        VulkanDevice.Buffer input, VulkanDevice.Buffer output, int outputDim, int inputDim, int cols, float scale)
+    {
+        var kernel = qt switch
+        {
+            QuantizationType.Q8_0 => _exactQ8,
+            QuantizationType.NVFP4 => _exactNvfp4,
+            QuantizationType.IQ2_XXS => _exactIq2Xxs,
+            _ => null,
+        };
+        if (kernel is null || !kernel.Accepts(cols, inputDim)) return false;
+        if (qt != QuantizationType.NVFP4) VulkanNemotronHWeights.ThrowIfScaleUnsupported("projection", scale, qt);
+        kernel.Record(cmdBuf, weights, input, output, outputDim, inputDim, cols, scale,
+            _iq2Codebooks.Iq2XxsGrid, _iq2Codebooks.Ksigns);
+        return true;
+    }
+
     /// <summary>Records <paramref name="cols"/> rows through the decode GEMV of <paramref name="qt"/>, or returns false when it has none.</summary>
     private bool TryRecordGemvColumns(nint cmdBuf, VulkanDevice.Buffer weights, QuantizationType qt,
         VulkanDevice.Buffer input, VulkanDevice.Buffer output, int outputDim, int inputDim, int cols, float scale)
@@ -395,7 +442,6 @@ public sealed partial class VulkanNemotronHTransformerModel : IDFlashDraftAttach
         if (_ckptConv is not null) foreach (var b in _ckptConv) b.Dispose();
         if (_ckptSsm is not null) foreach (var b in _ckptSsm) b.Dispose();
         _ckptConv = _ckptSsm = null;
-        DisposeRowSnapshotBuffers();
     }
 
     private void DisposeRowSnapshotBuffers()
@@ -611,5 +657,6 @@ public sealed partial class VulkanNemotronHTransformerModel : IDFlashDraftAttach
         _dflashTapBuffer?.Dispose();
         _dflashTapBuffer = null;
         DisposeCheckpointBuffers();
+        DisposeRowSnapshotBuffers();
     }
 }

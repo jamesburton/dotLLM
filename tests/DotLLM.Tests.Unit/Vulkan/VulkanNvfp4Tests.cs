@@ -137,6 +137,9 @@ public sealed class VulkanNvfp4Tests : IDisposable
 
         /// <summary>The Q8_1-activation integer-dot MMVQ (#1066).</summary>
         Mmvq,
+
+        /// <summary>The Nemotron-H multi-column GEMV that decode and verify share (#1244); model-level only.</summary>
+        Exact,
     }
 
     /// <summary>
@@ -170,9 +173,11 @@ public sealed class VulkanNvfp4Tests : IDisposable
     /// projections run as GEMVs), against the CPU F32 twin's 5-token prefill. Covers both GEMVs; the decode path's counter proves
     /// which ran.
     /// </summary>
-    /// <param name="variant">The GEMV that must run: the MMVQ (opted in, its size gate lowered to 0 for the small fixture), the
-    /// coalesced FP32 GEMV (the default), or #1038's (forced by its legacy variable).</param>
+    /// <param name="variant">The GEMV that must run: the #1244 multi-column GEMV (the default), the MMVQ (opted in, its size gate lowered
+    /// to 0 for the small fixture), the coalesced FP32 GEMV, or #1038's (forced by its legacy variable); the last two with the #1244 GEMVs
+    /// turned off.</param>
     [SkippableTheory]
+    [InlineData(GemvVariant.Exact)]
     [InlineData(GemvVariant.Mmvq)]
     [InlineData(GemvVariant.Coalesced)]
     [InlineData(GemvVariant.Legacy)]
@@ -187,6 +192,7 @@ public sealed class VulkanNvfp4Tests : IDisposable
         using var legacy = variant == GemvVariant.Legacy ? new EnvVarScope(MatMulNvfp4F32Kernel.LegacyGemvEnvVar, "1") : null;
         using var mmvqOn = variant == GemvVariant.Mmvq ? new EnvVarScope(MatMulNvfp4F32Kernel.EnableMmvqEnvVar, "1") : null;
         using var mmvqGate = variant == GemvVariant.Mmvq ? new EnvVarScope(MatMulNvfp4F32Kernel.MmvqMinBytesEnvVar, "0") : null;
+        using var exactGemv = new ExactGemvScope(variant is GemvVariant.Exact or GemvVariant.Mmvq);
         int[] ids = NemotronHNvfp4SsmTests.Ids, pos = NemotronHNvfp4SsmTests.Pos;
         int last = ids.Length - 1;
 
@@ -202,6 +208,7 @@ public sealed class VulkanNvfp4Tests : IDisposable
         float[] vk;
         long before = Interlocked.Read(ref MatMulNvfp4F32Kernel.CoalescedGemvDispatches);
         long mmvqBefore = Interlocked.Read(ref MatMulNvfp4F32Kernel.MmvqDispatches);
+        long exactBefore = Interlocked.Read(ref MatMulExactGemvMultiKernel.Dispatches);
         using (var gguf = GgufFile.Open(NemotronHNvfp4SsmTests.WriteFixture(_scratch, Variant.Nvfp4Scaled)))
         {
             var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
@@ -219,6 +226,8 @@ public sealed class VulkanNvfp4Tests : IDisposable
         long viaMmvq = Interlocked.Read(ref MatMulNvfp4F32Kernel.MmvqDispatches) - mmvqBefore;
         Assert.True(variant == GemvVariant.Coalesced ? viaCoalesced > 0 : viaCoalesced == 0, $"coalesced GEMV dispatches: {viaCoalesced}");
         Assert.True(variant == GemvVariant.Mmvq ? viaMmvq > 0 : viaMmvq == 0, $"MMVQ dispatches: {viaMmvq}");
+        long viaExact = Interlocked.Read(ref MatMulExactGemvMultiKernel.Dispatches) - exactBefore;
+        Assert.True(variant == GemvVariant.Exact ? viaExact > 0 : viaExact == 0, $"#1244 GEMV dispatches: {viaExact}");   // MMVQ keeps NVFP4 decode
 
         float maxAbs = cpu.Max(MathF.Abs);
         Assert.True(maxAbs > 0.5f, $"degenerate fixture: max |logit| {maxAbs}");
