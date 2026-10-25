@@ -1,7 +1,7 @@
 using DotLLM.Cpu.Threading;
 using Xunit;
 
-namespace DotLLM.Tests.Unit.Threading;
+namespace DotLLM.Tests.Unit.Cpu.Threading;
 
 /// <summary>
 /// Covers <see cref="ComputeThreadPool.PartitionRange"/>, which replaced the ceiling-division
