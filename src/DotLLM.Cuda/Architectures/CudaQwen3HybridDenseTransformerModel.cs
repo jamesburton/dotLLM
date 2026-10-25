@@ -1186,6 +1186,7 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         // #1222: the device copy only ever serves as a TIED lm_head; with its own output.weight (Bonsai 2) it was
         // 322 MiB of VRAM nothing read, so upload it only when the head is tied.
         bool tiedHead = !tensors.ContainsKey("output.weight");
+        config.HadamardFold?.ValidateOutputHead(!tiedHead); // #1276
         nint tokenEmbedDevice = tiedHead ? UploadRawTensor(dataBase, embDesc, allocs) : 0;
 
         // ── Output norm (always F32 [hiddenSize], dequant on host then H2D) ──

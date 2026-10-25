@@ -32,7 +32,7 @@ namespace DotLLM.Core.Models;
 /// </remarks>
 /// <param name="BlockSize">
 /// Hadamard block width (GGUF: <c>prism.hadamard.block_size</c>), always a power of two — 1024 for
-/// Bonsai 2. Activation rows are transformed in independent contiguous blocks of this width, so
+/// Bonsai 2 27B, 512 for the 2B (v2). Activation rows are transformed in independent contiguous blocks of this width, so
 /// every folded weight's input width must be a multiple of it.
 /// </param>
 /// <param name="SignsByWidth">
@@ -43,7 +43,9 @@ namespace DotLLM.Core.Models;
 /// </param>
 /// <param name="FoldedWeights">
 /// Names of the weights whose <b>input activation</b> must be transformed before the matmul
-/// (GGUF: <c>prism.hadamard.weight_names</c>) — 401 entries for Bonsai 2.
+/// (GGUF: <c>prism.hadamard.weight_names</c>) — 401 entries for Bonsai 2 27B. For a
+/// <see cref="TiedOutput"/> file this also holds <c>output.weight</c>, the LM-head site, which the
+/// GGUF list itself omits.
 /// </param>
 /// <param name="InverseWeights">
 /// Names of tables consumed by row lookup rather than matmul, whose <b>fetched row</b> must be
@@ -57,17 +59,28 @@ namespace DotLLM.Core.Models;
 /// before the sign flip and rotation. See <see cref="GatedDeltaNetConfig"/> for the head geometry;
 /// <c>rep = NVHead / NKHead</c>.
 /// </param>
+/// <param name="TiedOutput">
+/// GGUF: <c>prism.hadamard.tied_output</c>, set by (and only by) version 2. The checkpoint ships no
+/// <c>output.weight</c>; the LM head is the rotated <c>token_embd.weight</c> table, used as a
+/// <b>folded</b> weight on the output side while still being an <b>inverse</b> table on the lookup
+/// side (PrismML <c>llama-model.cpp</c> registers <c>token_embd.weight</c> in both sets). The
+/// extractor therefore puts <c>output.weight</c> — the LM-head site — into
+/// <see cref="FoldedWeights"/>, so every backend's existing "rotate the final-norm output before
+/// the head" site applies unchanged and no second rotated copy of the table is materialised.
+/// </param>
 public sealed record HadamardFoldConfig(
     int BlockSize,
     FrozenDictionary<int, sbyte[]> SignsByWidth,
     FrozenSet<string> FoldedWeights,
     FrozenSet<string> InverseWeights,
-    bool GdnVGrouped)
+    bool GdnVGrouped,
+    bool TiedOutput = false)
 {
     /// <summary>
-    /// The only <c>prism.hadamard.version</c> this implementation understands.
+    /// Highest <c>prism.hadamard.version</c> this implementation understands. Version 1 is the
+    /// untied layout (its own folded <c>output.weight</c>); version 2 adds <see cref="TiedOutput"/>.
     /// </summary>
-    public const uint SupportedVersion = 1;
+    public const uint MaxSupportedVersion = 2;
 
     /// <summary>
     /// The only <c>prism.hadamard.transform</c> this implementation understands — a Sylvester-ordered
@@ -122,4 +135,23 @@ public sealed record HadamardFoldConfig(
     /// <param name="tensorName">GGUF tensor name.</param>
     /// <returns>Whether the inverse transform applies.</returns>
     public bool IsInverse(string tensorName) => InverseWeights.Contains(tensorName);
+
+    /// <summary>
+    /// Checks the declaration against whether the file actually ships an <c>output.weight</c>,
+    /// mirroring the PrismML loader: a tied fold must not carry a separate head, and an untied
+    /// (version 1) fold must not fall back to the rotated <c>token_embd</c> as its head.
+    /// </summary>
+    /// <param name="hasOutputWeight">Whether the GGUF contains an <c>output.weight</c> tensor.</param>
+    /// <exception cref="NotSupportedException">The declaration and the tensor set disagree.</exception>
+    public void ValidateOutputHead(bool hasOutputWeight)
+    {
+        if (TiedOutput && hasOutputWeight)
+            throw new NotSupportedException(
+                "prism.hadamard.tied_output is set but the file also ships output.weight. Refusing to load.");
+
+        if (!TiedOutput && !hasOutputWeight && IsInverse("token_embd.weight"))
+            throw new NotSupportedException(
+                "prism.hadamard declares a rotated token_embd.weight with a tied LM head but not " +
+                "tied_output (version 2). Refusing to load.");
+    }
 }

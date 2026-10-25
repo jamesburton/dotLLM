@@ -123,12 +123,17 @@ public static class SyntheticQwen35HybridDenseMtpGguf
     /// the same order as the embedded fixture, so this file plus the <c>withMtp: false</c> trunk (same seed) split the embedded fixture exactly.
     /// Requires <paramref name="withMtp"/>.
     /// </param>
+    /// <param name="tiedOutput">
+    /// Issue #1276: omit <c>output.weight</c> so the lm_head is tied to <c>token_embd</c> (the
+    /// Bonsai 2 small-model / <c>prism.hadamard</c> v2 layout).
+    /// </param>
     public static byte[] Build(uint seed = 0xC0FFEEu, bool withMtp = true, bool mtpHasOwnHeadTensors = true,
         int fullAttnInterval = FullAttnInterval, int blockCount = BlockCount,
         int contextLength = ContextLength, int gdnKeyHeads = NKHead, int gdnValueHeads = NVHead,
         bool pq2_0Projections = false, bool q8_0MtpHead = false,
         int? headDim = null, int? ropeDim = null, float? ropeFreqBase = null,
-        int attentionHeads = NumAttentionHeads, int kvHeads = NumKvHeads, bool headOnly = false)
+        int attentionHeads = NumAttentionHeads, int kvHeads = NumKvHeads, bool headOnly = false,
+        bool tiedOutput = false)
     {
         if (headOnly && !withMtp)
             throw new ArgumentException("A head-only fixture needs withMtp.", nameof(headOnly));
@@ -193,7 +198,8 @@ public static class SyntheticQwen35HybridDenseMtpGguf
         // Bonsai 2); ssm_alpha/ssm_beta and the MTP block stay F32 (BF16 / Q8_0 in Bonsai 2).
         bool pq2 = pq2_0Projections;
         AddProjection(w, rng, "token_embd.weight", inK: d.Hidden, outM: VocabSize, 0.05f, pq2);
-        AddProjection(w, rng, "output.weight", inK: d.Hidden, outM: VocabSize, 0.05f, pq2);
+        if (!tiedOutput)
+            AddProjection(w, rng, "output.weight", inK: d.Hidden, outM: VocabSize, 0.05f, pq2);
         AddNorm(w, rng, "output_norm.weight", d.Hidden);
 
         // Head-only: the trunk layers are still drawn (so the head's weights match the embedded fixture) but written nowhere.
@@ -244,10 +250,12 @@ public static class SyntheticQwen35HybridDenseMtpGguf
         int contextLength = ContextLength, int gdnKeyHeads = NKHead, int gdnValueHeads = NVHead,
         bool pq2_0Projections = false, bool q8_0MtpHead = false,
         int? headDim = null, int? ropeDim = null, float? ropeFreqBase = null,
-        int attentionHeads = NumAttentionHeads, int kvHeads = NumKvHeads, bool headOnly = false)
+        int attentionHeads = NumAttentionHeads, int kvHeads = NumKvHeads, bool headOnly = false,
+        bool tiedOutput = false)
     {
         File.WriteAllBytes(path, Build(seed, withMtp, mtpHasOwnHeadTensors, fullAttnInterval, blockCount, contextLength,
-            gdnKeyHeads, gdnValueHeads, pq2_0Projections, q8_0MtpHead, headDim, ropeDim, ropeFreqBase, attentionHeads, kvHeads, headOnly));
+            gdnKeyHeads, gdnValueHeads, pq2_0Projections, q8_0MtpHead, headDim, ropeDim, ropeFreqBase, attentionHeads, kvHeads, headOnly,
+            tiedOutput));
         return path;
     }
 
