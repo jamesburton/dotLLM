@@ -49,6 +49,7 @@ public sealed class VulkanQwen4ExpGroupedGateUpTests
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var rig = new Q4eRig(Build(), spvDir);
+        Skip.IfNot(rig.Device.HasCooperativeMatrix && rig.Device.SubgroupSize == 64, "the grouped coopmat arm needs VK_KHR_cooperative_matrix and wave64 (absent on Intel Arc)");
         Assert.All(rig.Vk.ExpertBankDeviceTypes, t =>
         {
             Assert.Equal(QuantizationType.Q5_K, t.Gate);
@@ -83,6 +84,7 @@ public sealed class VulkanQwen4ExpGroupedGateUpTests
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var rig = new Q4eRig(Build(budgetAndContext: 1100), spvDir);
+        Skip.IfNot(rig.Device.HasCooperativeMatrix && rig.Device.SubgroupSize == 64, "the grouped coopmat arm needs VK_KHR_cooperative_matrix and wave64 (absent on Intel Arc)");
         var ids = VulkanQwen4ExpParityTests.Ids(rows, 128, seed: 33);
         var pos = Enumerable.Range(0, rows).ToArray();
         var grouped = Q4eRig.Row(rig.Vk.Forward(ids, pos, -1), 0);

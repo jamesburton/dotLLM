@@ -269,6 +269,7 @@ public sealed class VulkanQwen4ExpParityTests
         float[] cpuPrefill, fastPrefill, fastDecode, slowPrefill, slowDecode;
         using (var rig = new Q4eRig(Build(variant), spvDir))
         {
+            Skip.If(groupedExpected && !(rig.Device.HasCooperativeMatrix && rig.Device.SubgroupSize == 64), "the grouped coopmat arm needs VK_KHR_cooperative_matrix and wave64 (absent on Intel Arc)");
             Assert.All(rig.Vk.ExpertBankDeviceTypes, t =>
             {
                 Assert.Equal(QuantizationType.Q4_K, t.Gate);

@@ -304,6 +304,8 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         // per buffer pair covers both the contiguous and per-row forms.
         _device.ActiveHazards?.OnTransfer(kDev.Handle, _keys[layerIndex].Handle);
         _device.ActiveHazards?.OnTransfer(vDev.Handle, _values[layerIndex].Handle);
+        // The copies below read what RoPE (a compute shader) just wrote; a COMPUTE->COMPUTE barrier does not order a TRANSFER read (races on Intel Arc, #1249).
+        if (_device.ActiveHazards is null) Kernels.KernelSupport.ComputeToTransferBarrier(cmdBuf);
 
         if (contiguous)
         {
