@@ -101,7 +101,7 @@ public readonly struct KvGeometry
         if (headDim <= 0)
             throw new System.ArgumentOutOfRangeException(nameof(headDim), headDim, "headDim must be positive.");
 
-        int stride = numKvHeads * headDim;
+        int stride = checked(numKvHeads * headDim);
         var strides = new int[numLayers];
         System.Array.Fill(strides, stride);
         return new KvGeometry(strides, isUniform: true, uniformStride: stride);

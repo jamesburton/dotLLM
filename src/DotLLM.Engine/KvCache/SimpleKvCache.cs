@@ -56,6 +56,8 @@ public sealed unsafe class SimpleKvCache : IKvCache, IPerLayerKvCache, IWindowed
     /// <param name="numKvHeads">Number of KV attention heads per layer.</param>
     /// <param name="headDim">Dimension per attention head.</param>
     /// <param name="maxSeqLen">Maximum number of positions this cache can hold.</param>
+    /// <exception cref="ArgumentOutOfRangeException">A dimension is not positive.</exception>
+    /// <exception cref="OverflowException">The row stride or a layer's byte count overflows.</exception>
     public SimpleKvCache(int numLayers, int numKvHeads, int headDim, int maxSeqLen)
         : this(KvGeometry.Uniform(numLayers, numKvHeads, headDim), maxSeqLen)
     {
@@ -69,8 +71,17 @@ public sealed unsafe class SimpleKvCache : IKvCache, IPerLayerKvCache, IWindowed
     /// </summary>
     /// <param name="geometry">Per-layer KV-cache geometry (see <see cref="KvGeometry.FromConfig(DotLLM.Core.Models.ModelConfig)"/>).</param>
     /// <param name="maxSeqLen">Maximum number of positions this cache can hold.</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxSeqLen"/> is not positive.</exception>
+    /// <exception cref="OverflowException">A layer's buffer byte count does not fit in 64 bits.</exception>
     public SimpleKvCache(KvGeometry geometry, int maxSeqLen)
     {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxSeqLen);
+
+        // Validate before recording a layer count, so a rejected construction leaves the finalizer
+        // nothing to walk. Window rows never exceed maxSeqLen, so this bounds every allocation below.
+        for (int i = 0; i < geometry.LayerCount; i++)
+            _ = checked((long)maxSeqLen * geometry.KvStrideOf(i) * sizeof(float));
+
         _numLayers = geometry.LayerCount;
         _geom = geometry;
         _uniform = geometry.IsUniform;
