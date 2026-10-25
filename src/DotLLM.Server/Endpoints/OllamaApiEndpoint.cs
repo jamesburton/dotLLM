@@ -489,9 +489,9 @@ public static class OllamaApiEndpoint
             if (chunk.Reasoning.Length > 0) await Send("", chunk.Reasoning);
             if (chunk.Content.Length > 0) await Send(chunk.Content, null);
         }
-        await state.ExecuteAsync(modelId, async g =>
+        async Task StreamAsync(IAsyncEnumerable<GenerationToken> tokens)
         {
-            await foreach (var token in g.GenerateStreamingTokensAsync(finalPrompt, options, ct))
+            await foreach (var token in tokens)
             {
                 if (token.Text.Length > 0)
                 {
@@ -500,9 +500,16 @@ public static class OllamaApiEndpoint
                 }
                 if (token.FinishReason.HasValue) finish = token.FinishReason;
                 if (token.Timings.HasValue) timings = token.Timings;
+                if (token.GeneratedTokenCount is int n) generated = n;
             }
             if (splitter is not null) await Emit(splitter.Finish());
-        }, ct);
+        }
+
+        // (#1266) Same routing as the non-streaming path: on the scheduler, with no gate or model lease.
+        if (state.Scheduler is { } streamScheduler)
+            await StreamAsync(ServerState.SchedulerStream(streamScheduler, c, state.Tokenizer.Encode(finalPrompt), options)(ct));
+        else
+            await state.ExecuteAsync(modelId, g => StreamAsync(g.GenerateStreamingTokensAsync(finalPrompt, options, ct)), ct);
 
         RateLimitMiddleware.GetLease(c)?.ReportActualTokens((timings?.PrefillTokenCount ?? 0) + generated);
         using var fin = new MemoryStream();

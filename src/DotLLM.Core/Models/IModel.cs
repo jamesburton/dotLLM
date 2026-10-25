@@ -230,11 +230,11 @@ public interface IModel : IDisposable
     /// Recurrent architectures (Mamba-3, Qwen3-MoE-Hybrid GDN, Nemotron-H) require a per-sequence
     /// <see cref="SequenceForwardRequest.MambaState"/> / <see cref="SequenceForwardRequest.GdnState"/>
     /// on every request when <see cref="ForwardBatch"/> is called with 2+ entries (a null state
-    /// throws or corrupts cross-sequence recurrence). The continuous-batch scheduler does not yet
-    /// allocate/thread that state, so it gates batched decode on this flag: <c>false</c> ⇒ a stateless
-    /// (dense KV-only) model whose decode can be safely fused via <see cref="ForwardBatch"/>;
-    /// <c>true</c> ⇒ keep the per-sequence decode loop. Threading recurrent state to lift this is a
-    /// follow-up.
+    /// throws or corrupts cross-sequence recurrence). The continuous-batch scheduler allocates and
+    /// threads that state per sequence for models reporting <see cref="SupportsThreadedSequenceState"/>,
+    /// and then batches them via <see cref="ForwardBatch"/>. Otherwise it gates batching on this flag:
+    /// <c>false</c> ⇒ a stateless (dense KV-only) model whose forwards can be safely fused;
+    /// <c>true</c> (without threadable state) ⇒ keep the per-sequence loop on the model-owned state.
     /// </remarks>
     bool RequiresPerSequenceState => false;
 

@@ -406,9 +406,9 @@ public static class ServerStartup
         PrefixTrieManager? prefixTrieManager = null;
         if (vulkanKvFactory is not null)
         {
-            // Vulkan models own their device-resident KV storage. Like the CUDA paths, requests run
-            // one at a time through the per-request TextGenerator (no ForwardBatch scheduler, no
-            // paged/quantized KV, no cross-request prefix reuse yet).
+            // Vulkan models own their device-resident KV storage. Requests run one at a time through the
+            // per-request TextGenerator unless the opt-in Vulkan scheduler below engages (hybrid models,
+            // DOTLLM_VK_SCHEDULER); there is no paged KV pool and no cross-request prefix trie yet.
             if (options.UsePaged)
                 Console.WriteLine("[dotllm] Paged KV-cache not supported on Vulkan; using the model's own KV-cache.");
             if (kvConfig.IsQuantized && model is DotLLM.Vulkan.VulkanTransformerModel vkModel)
@@ -446,11 +446,11 @@ public static class ServerStartup
             else if (options.UsePaged)
             {
                 // Issue #252: GPU-resident block pool + gather-into-scratch attention dispatch.
-                // NOT wired into ContinuousBatchScheduler (pagedFactory stays null below) — the
-                // scheduler runs through IModel.ForwardBatch, which CudaTransformerModel doesn't
-                // yet override, so CUDA requests continue to serve one at a time through the
-                // per-request TextGenerator path exactly as before this cache existed. Only the
-                // per-request KV-cache backing changes (block-based instead of one flat buffer).
+                // NOT wired into ContinuousBatchScheduler (pagedFactory stays null below): although
+                // CudaTransformerModel implements IModel.ForwardBatch (#251), the GPU pool is not yet
+                // part of the scheduler's admission, so CUDA requests still serve one at a time through
+                // the per-request TextGenerator path. Only the per-request KV-cache backing changes
+                // (block-based instead of one flat buffer).
                 cudaPagedFactory = new DotLLM.Cuda.CudaPagedKvCacheFactory(
                     DotLLM.Core.Attention.KvGeometry.FromConfig(config));
                 var factory = cudaPagedFactory;
@@ -665,10 +665,11 @@ public static class ServerStartup
         else if (model is IContextLimitable limitable)
             config = ApplyRequestedContextSize(model, limitable, options);
 
-        // Continuous-batch scheduler. Enabled when a paged factory is available and speculative
-        // decoding is off — the scheduler doesn't support draft models (or MTP self-speculative
-        // decoding, same restriction) in this iteration, and GPU/hybrid models keep their existing
-        // single-request path until the IModel.ForwardBatch override lands in those backends.
+        // Continuous-batch scheduler. Enabled when a (CPU) paged factory is available, or on the opt-in
+        // Vulkan hybrid path below, and speculative decoding is off: the scheduler doesn't support draft
+        // models (or MTP self-speculative decoding, same restriction). CUDA keeps the single-request path
+        // until its GPU paged pool is wired into scheduler admission (see above). Streaming requests run
+        // on the scheduler too (#1266).
         ContinuousBatchSchedulerService? scheduler = null;
         // Vulkan hybrid models (per-sequence GDN state + serial ForwardBatch) can run through the scheduler, but the
         // serial TextGenerator path is faster until recurrent prefix restore + fused batching land, so this is opt-in:

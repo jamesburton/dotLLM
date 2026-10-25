@@ -308,6 +308,26 @@ CPU and Vulkan via `ISsmState`): cross-process / cross-device KV transfer + mult
 for the disaggregated driver. (Per-key fairness *weights* are now shipped via
 `FairnessWeightProvider` / `RateLimitPolicy.Weight`.)
 
+## Token Streaming (#1266)
+
+`ContinuousBatchSchedulerService.StreamAsync(request, ct)` yields `GenerationToken`s as the run loop
+samples them; `EnqueueAsync` is the completion-only form. Internally `Submit` takes an optional
+`ChannelWriter<GenerationToken>`:
+
+- **Unbounded channel** (single reader; growth bounded by `max_tokens`). The step loop only calls
+  `TryWrite`, so a slow consumer never blocks the loop or fails its request.
+- **Text** comes from the sequence's `IncrementalDetokenizer` (always created for a streaming request)
+  through `StopAwareTextEmitter`: mid-stream emissions hold back an incomplete UTF-8 character and any
+  suffix that could start a stop string, so the concatenated stream equals `InferenceResponse.Text`.
+- **Emission points**: the first token after prefill, each decode token, and one final token from
+  `CompleteSequence` carrying `FinishReason`, `Timings` and `GeneratedTokenCount` (the authoritative
+  usage count: tokens with held-back text still count). A sequence that has just run out of room
+  (max-tokens or KV full) completes in the same step, so its last sampled token is the final one.
+- **Termination**: every cancel/fail site completes the channel together with the completion source
+  (`SchedulerRequest.Cancel/Fail/Complete`); `StreamAsync` then awaits the completion to surface the
+  outcome. Abandoning the enumeration cancels the request.
+- **Preemption** re-forwards retained tokens without sampling, so a resumed stream emits no duplicates.
+
 ## Sequence State Machine
 
 ```

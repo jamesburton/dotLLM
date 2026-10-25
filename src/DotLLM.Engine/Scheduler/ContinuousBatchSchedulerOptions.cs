@@ -109,7 +109,7 @@ public sealed record ContinuousBatchSchedulerOptions
     /// share of an equal-priority weight-1 key). Default <see langword="null"/>.
     /// </summary>
     /// <remarks>
-    /// The provider is called once per <see cref="ContinuousBatchScheduler.Submit"/> under the scheduler's
+    /// The provider is called once per <see cref="ContinuousBatchScheduler.Submit(InferenceRequest, CancellationToken)"/> under the scheduler's
     /// queue lock, so it must be cheap and side-effect-free (a dictionary lookup over a static policy table
     /// is ideal). A <see langword="null"/> provider, or a returned weight ≤ 0 / non-finite, resolves to
     /// weight <c>1.0</c> — making admission byte-identical to the unweighted SFQ behaviour. The provider is

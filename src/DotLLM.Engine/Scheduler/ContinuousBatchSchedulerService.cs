@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+using System.Threading.Channels;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Models;
 using DotLLM.Engine.KvCache;
@@ -97,6 +99,49 @@ public sealed class ContinuousBatchSchedulerService : IScheduler, IDisposable
         var handle = _inner.Submit(request, cancellationToken);
         _wakeup.Release(); // wake the run loop if it's idle
         return handle.Completion;
+    }
+
+    /// <summary>
+    /// Schedules <paramref name="request"/> and yields its tokens as the run loop samples them, so a
+    /// streaming request batches with every other in-flight request instead of serializing the model
+    /// (#1266). The concatenated <see cref="GenerationToken.Text"/> equals the
+    /// <see cref="InferenceResponse.Text"/> <see cref="EnqueueAsync"/> would return; the final token
+    /// carries the finish reason, timings and <see cref="GenerationToken.GeneratedTokenCount"/>.
+    /// </summary>
+    /// <remarks>
+    /// The request is submitted on the first <c>MoveNextAsync</c>. Tokens are buffered in an unbounded
+    /// channel (at most <c>max_tokens</c> entries), so a slow consumer never stalls the run loop or
+    /// fails the request. Abandoning the enumeration early cancels the request.
+    /// </remarks>
+    /// <param name="request">The request to schedule.</param>
+    /// <param name="cancellationToken">Cancels the request and the enumeration.</param>
+    /// <returns>The generated tokens.</returns>
+    /// <exception cref="OperationCanceledException">The request was cancelled.</exception>
+    public async IAsyncEnumerable<GenerationToken> StreamAsync(
+        InferenceRequest request, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        // Multi-writer: besides the run loop, the caller's cancellation callback completes it.
+        var channel = Channel.CreateUnbounded<GenerationToken>(
+            new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var handle = _inner.Submit(request, cts.Token, channel.Writer);
+        _wakeup.Release();
+        try
+        {
+            await foreach (var token in channel.Reader.ReadAllAsync(cts.Token).ConfigureAwait(false))
+                yield return token;
+
+            // The channel ends on every outcome; the completion says which (and throws on failure).
+            await handle.Completion.ConfigureAwait(false);
+        }
+        finally
+        {
+            // An abandoned enumeration must not leave the sequence generating to max_tokens.
+            if (!handle.Completion.IsCompleted)
+                cts.Cancel();
+        }
     }
 
     /// <inheritdoc/>

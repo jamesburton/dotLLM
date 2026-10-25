@@ -1122,14 +1122,14 @@ public sealed partial class TextGenerator
                     generatedIds.RemoveAt(generatedIds.Count - 1);
                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                     var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount);
-                    yield return new GenerationToken(firstTokenId, detok.TakeWithheld(), fr, timings, firstLogprobInfo);
+                    yield return new GenerationToken(firstTokenId, detok.TakeWithheld(), fr, timings, firstLogprobInfo, GeneratedTokenCount: generatedIds.Count);
                 }
                 else
                 {
                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                     var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount);
                     string text = detok.TakeDelta(flushIncomplete: true);
-                    yield return new GenerationToken(firstTokenId, text, fr, timings, firstLogprobInfo);
+                    yield return new GenerationToken(firstTokenId, text, fr, timings, firstLogprobInfo, GeneratedTokenCount: generatedIds.Count);
                 }
                 yield break;
             }
@@ -1142,7 +1142,7 @@ public sealed partial class TextGenerator
                 {
                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                     var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount);
-                    yield return new GenerationToken(firstTokenId, text, FinishReason.Length, timings, firstLogprobInfo);
+                    yield return new GenerationToken(firstTokenId, text, FinishReason.Length, timings, firstLogprobInfo, GeneratedTokenCount: generatedIds.Count);
                     yield break;
                 }
                 yield return new GenerationToken(firstTokenId, text, null, Logprobs: firstLogprobInfo);
@@ -1205,7 +1205,7 @@ public sealed partial class TextGenerator
                                     generatedIds.RemoveAt(generatedIds.Count - 1);
                                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                                     var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
-                                    yield return new GenerationToken(tokenId, detok.TakeWithheld(), fr, timings);
+                                    yield return new GenerationToken(tokenId, detok.TakeWithheld(), fr, timings, GeneratedTokenCount: generatedIds.Count);
                                 }
                                 else
                                 {
@@ -1213,7 +1213,7 @@ public sealed partial class TextGenerator
                                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                                     var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
                                     string text = detok.TakeDelta(flushIncomplete: true);
-                                    yield return new GenerationToken(tokenId, text, fr, timings);
+                                    yield return new GenerationToken(tokenId, text, fr, timings, GeneratedTokenCount: generatedIds.Count);
                                 }
                                 shouldBreak = true;
                                 yield break;
@@ -1229,7 +1229,7 @@ public sealed partial class TextGenerator
                                 {
                                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                                     var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
-                                    yield return new GenerationToken(tokenId, text, FinishReason.Length, timings);
+                                    yield return new GenerationToken(tokenId, text, FinishReason.Length, timings, GeneratedTokenCount: generatedIds.Count);
                                     shouldBreak = true;
                                     break;
                                 }
@@ -1306,7 +1306,7 @@ public sealed partial class TextGenerator
                                     generatedIds.RemoveAt(generatedIds.Count - 1);
                                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                                     var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
-                                    yield return new GenerationToken(tokenId, detok.TakeWithheld(), fr, timings);
+                                    yield return new GenerationToken(tokenId, detok.TakeWithheld(), fr, timings, GeneratedTokenCount: generatedIds.Count);
                                 }
                                 else
                                 {
@@ -1314,7 +1314,7 @@ public sealed partial class TextGenerator
                                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                                     var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
                                     string text = detok.TakeDelta(flushIncomplete: true);
-                                    yield return new GenerationToken(tokenId, text, fr, timings);
+                                    yield return new GenerationToken(tokenId, text, fr, timings, GeneratedTokenCount: generatedIds.Count);
                                 }
                                 shouldBreak = true;
                                 yield break;
@@ -1330,7 +1330,7 @@ public sealed partial class TextGenerator
                                 {
                                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                                     var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
-                                    yield return new GenerationToken(tokenId, text, FinishReason.Length, timings);
+                                    yield return new GenerationToken(tokenId, text, FinishReason.Length, timings, GeneratedTokenCount: generatedIds.Count);
                                     shouldBreak = true;
                                     break;
                                 }
@@ -1401,14 +1401,14 @@ public sealed partial class TextGenerator
                             generatedIds.RemoveAt(generatedIds.Count - 1);
                             StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                             var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
-                            yield return new GenerationToken(nextTokenId, detok.TakeWithheld(), fr, timings, tokenLogprob);
+                            yield return new GenerationToken(nextTokenId, detok.TakeWithheld(), fr, timings, tokenLogprob, GeneratedTokenCount: generatedIds.Count);
                         }
                         else
                         {
                             StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                             var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
                             string text = detok.TakeDelta(flushIncomplete: true);
-                            yield return new GenerationToken(nextTokenId, text, fr, timings, tokenLogprob);
+                            yield return new GenerationToken(nextTokenId, text, fr, timings, tokenLogprob, GeneratedTokenCount: generatedIds.Count);
                         }
                         yield break;
                     }
@@ -1421,7 +1421,7 @@ public sealed partial class TextGenerator
                         {
                             StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                             var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
-                            yield return new GenerationToken(nextTokenId, text, FinishReason.Length, timings, tokenLogprob);
+                            yield return new GenerationToken(nextTokenId, text, FinishReason.Length, timings, tokenLogprob, GeneratedTokenCount: generatedIds.Count);
                             yield break;
                         }
                         yield return new GenerationToken(nextTokenId, text, null, Logprobs: tokenLogprob);

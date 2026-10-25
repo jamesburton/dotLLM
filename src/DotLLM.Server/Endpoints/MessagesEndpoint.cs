@@ -284,6 +284,19 @@ public static class MessagesEndpoint
         CancellationToken ct,
         ToolDefinition[]? tools = null)
     {
+        // (#1266) Same routing as the non-streaming path: on the scheduler, with no gate or model lease.
+        if (state.Scheduler is { } scheduler)
+        {
+            await WriteMessageStreamAsync(
+                httpContext,
+                ServerState.SchedulerStream(scheduler, httpContext, state.Tokenizer!.Encode(prompt), options),
+                ServerState.WithoutGate,
+                toolCallParser,
+                request.StopSequences,
+                messageId, modelId, promptTokenCount, ct, forcedToolCall, plan, tools, state.KeepAliveInterval);
+            return;
+        }
+
         // (#1023) Keep-alive comments while the gate is contended; the generator is read once it is held, so a request queued
         // behind a model swap never runs on a disposed or different model.
         TextGenerator? current = null;
@@ -470,6 +483,8 @@ public static class MessagesEndpoint
 
                     if (token.FinishReason.HasValue)
                         finishReason = token.FinishReason.Value;
+                    if (token.GeneratedTokenCount is int generated)
+                        completionTokens = generated;
                 }
 
                 // Release whatever the splitter held back (a partial tag that never completed).
