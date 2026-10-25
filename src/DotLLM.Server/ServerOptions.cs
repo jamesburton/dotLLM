@@ -518,9 +518,12 @@ public sealed record ServerOptions
             Environment.Exit(1);
         }
 
-        string modelId = Path.GetFileNameWithoutExtension(model);
-        if (model.Contains('/'))
-            modelId = model.Split('/')[^1]; // last segment of repo
+        // Repo ids keep their final component; local GGUF paths (either separator, relative or absolute) drop the extension,
+        // so one file gets one id however its path was written (#1275).
+        int lastSeparator = Math.Max(model.LastIndexOf('/'), model.LastIndexOf('\\'));
+        string modelId = model[(lastSeparator + 1)..];
+        if (modelId.EndsWith(".gguf", StringComparison.OrdinalIgnoreCase))
+            modelId = modelId[..^5];
 
         var snapshotOptions = BuildPrefixSnapshotOptions(prefixSnapshots, prefixSnapshotHostBudget, prefixSnapshotDiskDirectory, prefixSnapshotDiskBudget);
         return new ServerOptions
