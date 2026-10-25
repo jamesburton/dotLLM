@@ -877,11 +877,6 @@ public static class Attention
                                        int? slidingWindowSize = null, float softCap = 0f,
                                        float[]? sinks = null)
     {
-        // softCap currently unused on the quantized KV-cache path — Gemma checkpoints
-        // ship full-precision KV. When/if Gemma 2/3 quantized KV becomes a target the
-        // online-softmax loops above need an ApplySoftCap call sandwiched between
-        // score computation and the running-max update.
-        _ = softCap;
         if (headDim <= 0)
             throw new ArgumentException($"headDim must be positive, got {headDim}", nameof(headDim));
         if (numHeads % numKvHeads != 0)
@@ -922,7 +917,7 @@ public static class Attention
                     positionOffset, tileSize, slidingWindowSize ?? 0,
                     kvCache.KeyDType, kvCache.ValueDType,
                     h, h / (numHeads / numKvHeads),
-                    kvCache.WindowCapacity,
+                    kvCache.WindowCapacity, softCap,
                     sinks is null ? float.NegativeInfinity : sinks[h]);
             }
         }
@@ -945,6 +940,7 @@ public static class Attention
                     SlidingWindowSize = slidingWindowSize ?? 0,
                     KeyDType = kvCache.KeyDType, ValueDType = kvCache.ValueDType,
                     WindowCapacity = kvCache.WindowCapacity,
+                    SoftCap = softCap,
                     Sinks = sinksPtr
                 };
                 pool.Dispatch((nint)(&ctx), &QuantizedTiledAttentionWorker);
@@ -978,6 +974,8 @@ public static class Attention
         public KvCacheDType KeyDType;
         public KvCacheDType ValueDType;
         public int WindowCapacity;
+        /// <summary>Gemma-2/3 attention-logit soft-cap; 0 = disabled.</summary>
+        public float SoftCap;
         /// <summary>Optional per-head sink logits [NumHeads] (gpt-oss). Null = no sinks.</summary>
         public float* Sinks;
     }
@@ -1001,7 +999,7 @@ public static class Attention
                 ctx.PositionOffset, ctx.TileSize, ctx.SlidingWindowSize,
                 ctx.KeyDType, ctx.ValueDType,
                 h, h / ctx.GroupSize,
-                ctx.WindowCapacity,
+                ctx.WindowCapacity, ctx.SoftCap,
                 ctx.Sinks is null ? float.NegativeInfinity : ctx.Sinks[h]);
         }
     }
@@ -1021,7 +1019,7 @@ public static class Attention
         int positionOffset, int tileSize, int slidingWindowSize,
         KvCacheDType keyDType, KvCacheDType valueDType,
         int headIdx, int kvHeadIdx,
-        int windowCapacity,
+        int windowCapacity, float softCap,
         float sinkLogit = float.NegativeInfinity)
     {
         int seqKv = quantLen + windowLen;
@@ -1089,6 +1087,10 @@ public static class Attention
                         scores[j] = TensorPrimitives.Dot(qRow, kRow) * scale;
                     }
 
+                    // Gemma 2/3 soft-cap on raw scores, before the running max (same placement as TiledRow).
+                    if (softCap > 0f)
+                        ApplySoftCap(scores, softCap);
+
                     // Online softmax update
                     float tileMax = TensorPrimitives.Max(scores);
                     float newMax = MathF.Max(maxSoFar, tileMax);
@@ -1132,6 +1134,9 @@ public static class Attention
                             kWindow + ringIdx * kvStride + kvHeadIdx * headDim, headDim);
                         scores[j] = TensorPrimitives.Dot(qRow, kRow) * scale;
                     }
+
+                    if (softCap > 0f)
+                        ApplySoftCap(scores, softCap);
 
                     float tileMax = TensorPrimitives.Max(scores);
                     float newMax = MathF.Max(maxSoFar, tileMax);

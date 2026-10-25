@@ -2227,6 +2227,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 int seqKv = kvCache.CurrentLength;
                 if (kvCache is IQuantizedKvCache qkvCacheShared)
                 {
+                    // Gemma-4 scale is 1.0; the quantized kernel hard-codes 1/sqrt(headDim).
+                    PrescaleQForKernelDefault(q, seqLen * qStrideLayer, attnScale, headDimLayer);
                     Attention.Execute(q, qkvCacheShared, donorLayer, attnOut,
                         seqLen, seqKv, numHeads, numKvHeadsLayer, headDimLayer, positions[0], _threadPool,
                         layerSlidingWindow, softCap: 0f);
@@ -2322,6 +2324,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 // per-layer-strided quantized cache for distinct-head-dim Gemma-4 is
                 // future work — GuardKvCacheHeadDim only admits per-layer F32 today,
                 // so this branch is reached only for uniform-head-dim Gemma-4.)
+                // Gemma-4 scale is 1.0; the quantized kernel hard-codes 1/sqrt(headDim).
+                PrescaleQForKernelDefault(q, seqLen * qStrideLayer, attnScale, headDimLayer);
                 Attention.Execute(q, qkvCache, layer, attnOut,
                     seqLen, seqKv, numHeads, numKvHeadsLayer, headDimLayer, positions[0], _threadPool,
                     layerSlidingWindow, softCap: 0f);

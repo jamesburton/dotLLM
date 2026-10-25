@@ -3,6 +3,7 @@ using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Tensors;
 using DotLLM.Cpu.Kernels;
+using DotLLM.Cpu.Threading;
 using DotLLM.Engine.KvCache;
 using Xunit;
 
@@ -251,10 +252,33 @@ public sealed unsafe class QuantizedKvAttentionCorrectnessTests
         }
     }
 
+    /// <summary>
+    /// Gemma-2 attention-logit soft-cap on the quantized-KV path (#1265). Q is amplified so raw scores
+    /// (std ≈ 5) sit well inside tanh's compressive range for <c>cap = 5</c>; the helper also asserts the
+    /// uncapped F32 result is far outside tolerance, so a kernel that drops the cap cannot pass.
+    /// Covers the quantized phase, the F32 window phase, prefill rows, and the thread-pool dispatch.
+    /// </summary>
+    [Theory]
+    [InlineData(8, 2, 64, 128, 1, 0, KvCacheDType.Q8_0, KvCacheDType.Q8_0, 0.05f, false)]
+    [InlineData(16, 4, 64, 200, 8, 0, KvCacheDType.Q8_0, KvCacheDType.Q8_0, 0.05f, true)]
+    [InlineData(8, 2, 64, 128, 1, 0, KvCacheDType.Q4_0, KvCacheDType.Q4_0, 0.15f, false)]
+    [InlineData(8, 2, 64, 160, 1, 32, KvCacheDType.Q8_0, KvCacheDType.Q4_0, 0.15f, true)]
+    [InlineData(8, 2, 64, 160, 4, 32, KvCacheDType.Q8_0, KvCacheDType.Q8_0, 0.05f, false)]
+    public void SoftCap_QuantizedMatchesF32(int numHeads, int numKvHeads, int headDim, int seqKv, int seqQ,
+        int windowSize, KvCacheDType keyDType, KvCacheDType valueDType, float tolerance, bool usePool)
+    {
+        using var pool = usePool ? new ComputeThreadPool(4) : null;
+        AssertQuantizedMatchesF32WithWindow(
+            numHeads, numKvHeads, headDim, seqKv, seqQ, windowSize, keyDType, valueDType, tolerance,
+            $"softcap {keyDType}/{valueDType} GQA {numHeads}:{numKvHeads} seqQ={seqQ} window={windowSize} pool={usePool}",
+            softCap: 5f, qAmplify: 4f, pool: pool);
+    }
+
     private static void AssertQuantizedMatchesF32WithWindow(
         int numHeads, int numKvHeads, int headDim, int seqKv, int seqQ, int windowSize,
         KvCacheDType keyDType, KvCacheDType valueDType,
-        float tolerance, string label)
+        float tolerance, string label,
+        float softCap = 0f, float qAmplify = 1f, ComputeThreadPool? pool = null)
     {
         var rng = new Random(42);
         int kvStride = numKvHeads * headDim;
@@ -263,6 +287,8 @@ public sealed unsafe class QuantizedKvAttentionCorrectnessTests
         float[] kData = RandomArray(rng, seqKv * kvStride);
         float[] vData = RandomArray(rng, seqKv * kvStride);
         float[] qData = RandomArray(rng, seqQ * qStride);
+        for (int i = 0; i < qData.Length; i++)
+            qData[i] *= qAmplify;
 
         using var fpCache = new SimpleKvCache(NumLayers, numKvHeads, headDim, seqKv);
         FillCacheF32(fpCache, kData, vData, seqKv, kvStride);
@@ -283,10 +309,10 @@ public sealed unsafe class QuantizedKvAttentionCorrectnessTests
             var vRef = fpCache.GetValuesRef(0);
             int positionOffset = seqKv - seqQ;
             Attention.Execute(qPtr, (float*)kRef.DataPointer, (float*)vRef.DataPointer, outFp,
-                seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, pool: null);
+                seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, pool: null, softCap: softCap);
 
             Attention.Execute(qPtr, quantCache, 0, outQuant,
-                seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, pool: null);
+                seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, pool, softCap: softCap);
 
             float maxErr = 0f;
             int worstIdx = 0;
@@ -299,6 +325,19 @@ public sealed unsafe class QuantizedKvAttentionCorrectnessTests
             Assert.True(maxErr < tolerance,
                 $"[{label}] Max error {maxErr:G6} at index {worstIdx} exceeds tolerance {tolerance}. " +
                 $"FP32={outFp[worstIdx]:G6}, quant={outQuant[worstIdx]:G6}");
+
+            if (softCap > 0f)
+            {
+                // Discrimination guard: the cap must move the reference far more than the tolerance,
+                // otherwise a kernel that ignores it would pass too.
+                Attention.Execute(qPtr, (float*)kRef.DataPointer, (float*)vRef.DataPointer, outQuant,
+                    seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, pool: null);
+                float capEffect = 0f;
+                for (int i = 0; i < outputSize; i++)
+                    capEffect = MathF.Max(capEffect, MathF.Abs(outFp[i] - outQuant[i]));
+                Assert.True(capEffect > 4 * tolerance,
+                    $"[{label}] soft-cap changes the F32 output by only {capEffect:G6}; test is not discriminating.");
+            }
         }
         finally
         {
