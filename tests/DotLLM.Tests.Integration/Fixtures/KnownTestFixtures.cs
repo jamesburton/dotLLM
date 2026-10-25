@@ -62,6 +62,19 @@ internal static class KnownTestFixtures
         "Ternary-Bonsai-2-27B-gguf",
         "Ternary-Bonsai-2-27B-PQ2_0.gguf");
 
+    /// <summary>
+    /// Ternary-Bonsai-2-2B, PQ2_0 (~0.52 GB) — <c>prism-ml/Ternary-Bonsai-2-2B-gguf</c>, the
+    /// re-published (2026-10-14) small model: <c>prism.hadamard.version = 2</c>, tied lm_head (#1276).
+    /// </summary>
+    public static FixtureLocation TernaryBonsai2_2B_PQ2_0 => TestFixtureResolver.ResolveFile(
+        "DOTLLM_BONSAI2_2B_GGUF",
+        "prism-ml",
+        "Ternary-Bonsai-2-2B-gguf",
+        "Ternary-Bonsai-2-2B-PQ2_0.gguf");
+
+    /// <summary>Human-readable name for <see cref="TernaryBonsai2_2B_PQ2_0"/> skip messages.</summary>
+    public const string TernaryBonsai2_2BDescription = "Ternary-Bonsai-2-2B PQ2_0 GGUF (prism.hadamard v2)";
+
     /// <summary>Human-readable name for <see cref="TernaryBonsai27B_Q2_0"/> skip messages.</summary>
     public const string TernaryBonsai27BDescription = "Ternary-Bonsai-2-27B PQ2_0 GGUF (tokenizer.ggml.pre = qwen35)";
 

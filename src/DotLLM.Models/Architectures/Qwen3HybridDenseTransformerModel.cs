@@ -199,6 +199,7 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
         var tensors = gguf.TensorsByName;
         var layout = config.HybridLayout;
         Nvfp4Support.RejectUnappliedScales(tensors, consumedScales: null, "The Qwen3 hybrid-dense loader"); // #1038
+        config.HadamardFold?.ValidateOutputHead(tensors.ContainsKey("output.weight")); // #1276
 
         var embDesc = tensors["token_embd.weight"];
         nint embPtr = dataBase.Of(embDesc);
@@ -348,6 +349,7 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
         // force NextnPredictLayers=0 so this slice never tries (and fails) to resolve an MTP
         // block at the wrong raw index.
         var tailConfig = fullConfig with { NumLayers = tailCount, HybridLayout = tailLayout, NextnPredictLayers = 0 };
+        fullConfig.HadamardFold?.ValidateOutputHead(tensors.ContainsKey("output.weight")); // #1276
 
         var embDesc = tensors["token_embd.weight"];
         nint embPtr = dataBase.Of(embDesc);

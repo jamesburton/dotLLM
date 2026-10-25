@@ -28,6 +28,10 @@ public static class GgufHadamardFoldExtractor
     private const string KeySignValues = "prism.hadamard.sign_values";
     private const string KeyInverseNames = "prism.hadamard.inverse_weight_names";
     private const string KeyGdnVGrouped = "prism.hadamard.gdn_v_grouped";
+    private const string KeyTiedOutput = "prism.hadamard.tied_output";
+
+    /// <summary>Name of the LM-head matmul site in <see cref="HadamardFoldConfig.FoldedWeights"/>.</summary>
+    private const string LmHeadSite = "output.weight";
 
     private const string SignModeExplicit = "explicit";
     private const string SignModeIdentity = "identity";
@@ -51,11 +55,19 @@ public static class GgufHadamardFoldExtractor
             return null;
 
         uint version = metadata.GetUInt32(KeyVersion);
-        if (version != HadamardFoldConfig.SupportedVersion)
+        if (version is < 1 or > HadamardFoldConfig.MaxSupportedVersion)
             throw new NotSupportedException(
-                $"Unsupported {KeyVersion}: {version} (this build implements " +
-                $"{HadamardFoldConfig.SupportedVersion}). Refusing to load — an unapplied or " +
+                $"Unsupported {KeyVersion}: {version} (this build implements 1.." +
+                $"{HadamardFoldConfig.MaxSupportedVersion}). Refusing to load — an unapplied or " +
                 "mismatched Hadamard fold produces plausible-looking garbage, not an error.");
+
+        // v2 differs from v1 only by the tied LM head, and the two are locked together
+        // (PrismML llama-model.cpp: "version 2 requires tied_output=true; version 1 forbids it").
+        bool tiedOutput = metadata.GetBoolOrDefault(KeyTiedOutput, false);
+        if ((version == 2) != tiedOutput)
+            throw new InvalidDataException(
+                $"{KeyVersion} {version} with {KeyTiedOutput}={tiedOutput}: version 2 requires " +
+                "tied_output=true and version 1 forbids it.");
 
         int blockSize = checked((int)metadata.GetUInt32(KeyBlockSize));
         if (blockSize <= 0 || (blockSize & (blockSize - 1)) != 0)
@@ -92,12 +104,27 @@ public static class GgufHadamardFoldExtractor
                     $"'{name}' appears in both {KeyWeightNames} and {KeyInverseNames}.");
         }
 
+        if (tiedOutput)
+        {
+            // The tied head is the rotated token_embd table: forward-rotate into it, exactly like
+            // a folded output.weight. Registering the LM-head site keeps every backend's fixed
+            // head rotation and fold-set validation unchanged.
+            if (inverseNames is not ["token_embd.weight"])
+                throw new InvalidDataException(
+                    $"{KeyTiedOutput} requires {KeyInverseNames} to be exactly [token_embd.weight].");
+            if (folded.Contains(LmHeadSite))
+                throw new InvalidDataException(
+                    $"{KeyTiedOutput} is set but {KeyWeightNames} also names a separate {LmHeadSite}.");
+            folded = folded.Append(LmHeadSite).ToFrozenSet(StringComparer.Ordinal);
+        }
+
         return new HadamardFoldConfig(
             BlockSize: blockSize,
             SignsByWidth: signsByWidth,
             FoldedWeights: folded,
             InverseWeights: inverseNames.ToFrozenSet(StringComparer.Ordinal),
-            GdnVGrouped: metadata.GetBoolOrDefault(KeyGdnVGrouped, false));
+            GdnVGrouped: metadata.GetBoolOrDefault(KeyGdnVGrouped, false),
+            TiedOutput: tiedOutput);
     }
 
     /// <summary>

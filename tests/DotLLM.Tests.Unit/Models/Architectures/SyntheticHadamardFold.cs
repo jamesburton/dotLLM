@@ -54,11 +54,14 @@ internal static class SyntheticHadamardFold
     /// Issue #485: the PQ2_0 variant (projection input widths 128/256/512, all divisible by
     /// <see cref="BlockSize"/>), so the CUDA PQ2_0 GEMVs run under a fold.
     /// </param>
+    /// <param name="tiedOutput">Issue #1276: omit <c>output.weight</c> (lm_head tied to <c>token_embd</c>).</param>
     internal static string WriteFixture(string path, bool withMtp = true,
-        int blockCount = SyntheticQwen35HybridDenseMtpGguf.BlockCount, bool pq2_0Projections = false) =>
+        int blockCount = SyntheticQwen35HybridDenseMtpGguf.BlockCount, bool pq2_0Projections = false,
+        bool tiedOutput = false) =>
         SyntheticQwen35HybridDenseMtpGguf.Write(
             path, withMtp: withMtp, mtpHasOwnHeadTensors: false, blockCount: blockCount,
-            gdnKeyHeads: GdnKeyHeads, gdnValueHeads: GdnValueHeads, pq2_0Projections: pq2_0Projections);
+            gdnKeyHeads: GdnKeyHeads, gdnValueHeads: GdnValueHeads, pq2_0Projections: pq2_0Projections,
+            tiedOutput: tiedOutput);
 
     /// <summary>
     /// Returns a fold declaration covering exactly the weights the <c>qwen35</c> forward pass
@@ -69,8 +72,12 @@ internal static class SyntheticHadamardFold
     /// <param name="gdnVGrouped">Value of <c>prism.hadamard.gdn_v_grouped</c>.</param>
     /// <param name="withSigns">False for <c>sign_mode</c> other than explicit (identity sign step).</param>
     /// <param name="seed">Seed for the deterministic ±1 sign vectors.</param>
+    /// <param name="tiedOutput">
+    /// Issue #1276: a version-2 declaration — <c>output.weight</c> stays in the folded set as the
+    /// LM-head site, exactly as <c>GgufHadamardFoldExtractor</c> produces it for a tied file.
+    /// </param>
     internal static HadamardFoldConfig For(ModelConfig config, bool gdnVGrouped = true, bool withSigns = true,
-        int seed = 0x479)
+        int seed = 0x479, bool tiedOutput = false)
     {
         var gdn = config.GdnConfig ?? throw new ArgumentException("qwen35 config must carry a GDN config.", nameof(config));
         var kinds = config.HybridLayout!.LayerKind;
@@ -121,6 +128,7 @@ internal static class SyntheticHadamardFold
             SignsByWidth: signs.ToFrozenDictionary(),
             FoldedWeights: names.ToFrozenSet(StringComparer.Ordinal),
             InverseWeights: new[] { "token_embd.weight" }.ToFrozenSet(StringComparer.Ordinal),
-            GdnVGrouped: gdnVGrouped);
+            GdnVGrouped: gdnVGrouped,
+            TiedOutput: tiedOutput);
     }
 }
