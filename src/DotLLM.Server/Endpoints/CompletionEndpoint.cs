@@ -88,7 +88,15 @@ public static class CompletionEndpoint
                 state.Options.Threads, state.Options.DecodeThreads));
         options = options with { MaxTokens = effectiveMaxTokens };
 
-        if (request.Stream)
+        if (request.Stream && state.Scheduler is { } scheduler && adapter is null && !options.Logprobs)
+        {
+            // (#1266) Same routing as the non-streaming path: on the scheduler, with no gate or model lease.
+            await WriteCompletionStreamAsync(httpContext,
+                ServerState.SchedulerStream(scheduler, httpContext, state.Tokenizer!.Encode(request.Prompt), options),
+                ServerState.WithoutGate,
+                requestId, modelId, request.WantsUsageChunk, ct, state.KeepAliveInterval);
+        }
+        else if (request.Stream)
         {
             // (#1023) ": waiting for ..." keep-alive comments while the gate is contended; the generator is read once it is held.
             TextGenerator? current = null;
@@ -214,6 +222,7 @@ public static class CompletionEndpoint
                 await foreach (var token in SseKeepAlive.UntilFirstItem(httpContext, tokenSource(ct), keepAliveInterval, ct))
                 {
                     if (token.Text.Length > 0) completionTokens++;
+                    if (token.GeneratedTokenCount is int generated) completionTokens = generated;
                     if (token.Timings.HasValue)
                     {
                         promptTokens = token.Timings.Value.PrefillTokenCount;

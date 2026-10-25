@@ -396,6 +396,17 @@ public static class ChatCompletionEndpoint
         bool forcedToolCall,
         SseKeepAlive? keepAlive)
     {
+        // (#1266) Same routing as the non-streaming path: on the scheduler, with no gate or model lease.
+        if (state.Scheduler is { } scheduler && adapter is null && !options.Logprobs)
+        {
+            return WriteChatStreamAsync(
+                request, httpContext,
+                ServerState.SchedulerStream(scheduler, httpContext, state.Tokenizer!.Encode(prompt), options),
+                ServerState.WithoutGate,
+                requestId, modelId, tools, toolParser, plan, ct, forcedToolCall,
+                keepAlive, state.DescribeWait, state.KeepAliveInterval);
+        }
+
         // (#1023) The generator is resolved under the gate (re-activating the admitted model if a queued swap replaced it), so the
         // token source reads it only once the gate is held.
         TextGenerator? current = null;
@@ -541,6 +552,10 @@ public static class ChatCompletionEndpoint
                     finishReason = token.FinishReason.Value;
                     timings = token.Timings;
                 }
+
+                // Authoritative count: tokens whose text was held back (or empty) were generated too.
+                if (token.GeneratedTokenCount is int generated)
+                    completionTokens = generated;
             }
 
             // Release whatever the splitter held back (a partial tag that never completed).

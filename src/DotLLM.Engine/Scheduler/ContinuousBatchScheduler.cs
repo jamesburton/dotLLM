@@ -2,6 +2,8 @@ using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading.Channels;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Constraints;
@@ -25,15 +27,13 @@ namespace DotLLM.Engine.Scheduler;
 /// <para>This MVP performs <em>iteration-level</em> scheduling: every <see cref="Step"/> processes
 /// admissions and one decode token across all active sequences. The KV-cache pool is shared
 /// across sequences (via a caller-supplied factory such as <see cref="PagedKvCacheFactory"/>),
-/// so sequences can be admitted as soon as blocks become free.</para>
+/// so sequences can be admitted as soon as blocks become free. Prefill and decode forwards fuse
+/// across sequences into one <see cref="IModel.ForwardBatch"/> when the model supports it (Step 59),
+/// and a request can stream its tokens as they are sampled (#1266) via
+/// <see cref="ContinuousBatchSchedulerService.StreamAsync"/>.</para>
 ///
 /// <para><b>What this MVP does NOT do</b> (deferred to follow-on roadmap steps):</para>
 /// <list type="bullet">
-///   <item>Kernel-level batched forward across sequences. We currently call
-///   <see cref="IModel.Forward(System.ReadOnlySpan{int},System.ReadOnlySpan{int},int,IKvCache?)"/>
-///   once per sequence per iteration. The model still benefits from KV-cache pooling and
-///   request-admission overlap, but per-sequence GEMV is not yet batched. Step 59
-///   (advanced scheduling) is the right place for that.</item>
 ///   <item>Chunked prefill. A long prompt is prefilled in a single forward pass during admission.
 ///   See <see cref="ContinuousBatchSchedulerOptions.MaxPrefillTokensPerStep"/> for the partial
 ///   admission cap that mitigates head-of-line blocking at admission time only.</item>
@@ -41,13 +41,9 @@ namespace DotLLM.Engine.Scheduler;
 ///   is set, the scheduler preempts lower-priority active sequences under block pressure and
 ///   <em>recomputes</em> their KV-cache on resume (Step 59). CPU-offload of KV blocks (faster resume,
 ///   uses host RAM) is the remaining swap strategy.</item>
-///   <item>Streaming yield. Generated tokens accumulate inside the scheduler and surface only
-///   when <see cref="ISchedulerRequest.Completion"/> resolves. Streaming through a
-///   <c>ChannelWriter&lt;GenerationToken&gt;</c> per request is straightforward to add but
-///   out of scope for the MVP.</item>
 /// </list>
 ///
-/// <para>Thread-safety: <see cref="Submit"/> may be called from any thread (queue is
+/// <para>Thread-safety: <see cref="Submit(InferenceRequest, CancellationToken)"/> may be called from any thread (queue is
 /// <see cref="ConcurrentQueue{T}"/>). <see cref="Step"/> must be driven by a single thread —
 /// typically the server's run-loop task.</para>
 /// </remarks>
@@ -225,6 +221,19 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
 
     /// <inheritdoc/>
     public ISchedulerRequest Submit(InferenceRequest request, CancellationToken cancellationToken = default)
+        => Submit(request, cancellationToken, stream: null);
+
+    /// <summary>
+    /// <see cref="Submit(InferenceRequest, CancellationToken)"/>, optionally streaming each generated
+    /// token to <paramref name="stream"/> as it is sampled (#1266).
+    /// </summary>
+    /// <param name="request">The request to schedule.</param>
+    /// <param name="cancellationToken">Cancels the request; also ends the stream.</param>
+    /// <param name="stream">Receives the tokens; completed (without an exception) when the request
+    /// ends for any reason, the outcome being on <see cref="ISchedulerRequest.Completion"/>. Must not
+    /// apply backpressure: the step loop only ever calls <c>TryWrite</c>. Null = completion only.</param>
+    /// <returns>The scheduled request.</returns>
+    internal ISchedulerRequest Submit(InferenceRequest request, CancellationToken cancellationToken, ChannelWriter<GenerationToken>? stream)
     {
         ArgumentNullException.ThrowIfNull(request);
         if (_disposed) throw new ObjectDisposedException(nameof(ContinuousBatchScheduler));
@@ -285,12 +294,22 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         // Stop strings match on decoded text, so give this sequence a detokenizer to produce one
         // (#459). Only when a stop string is actually registered — token-level conditions (EOS,
         // max-tokens) need no text, and most requests carry nothing else.
+        // A streaming request always needs one: its text is emitted from the detokenizer's deltas.
         int stopTailSize = StopSuffixTrimmer.TailWindowSize(stops);
         if (stopTailSize > 0)
         {
             seq.StopTailSize = stopTailSize;
             seq.StopScratch = new char[stopTailSize];
+        }
+        if (stopTailSize > 0 || stream is not null)
             seq.Detokenizer = new IncrementalDetokenizer(_tokenizer, initialCapacity: Math.Max(64, maxTokens * 4));
+
+        if (stream is not null)
+        {
+            var streamText = new StringBuilder();
+            seq.StreamWriter = stream;
+            seq.StreamText = streamText;
+            seq.TextEmitter = new StopAwareTextEmitter(text => streamText.Append(text), stops);
         }
 
         if (cancellationToken.CanBeCanceled)
@@ -301,7 +320,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                 // We cannot safely free the KV-cache here — the scheduler thread may be in the
                 // middle of decoding this sequence. Mark for cancellation; Step() will collect it.
                 s.State = SequenceState.Cancelled;
-                s.CompletionSource.TrySetCanceled();
+                s.Cancel();
             }, seq);
         }
 
@@ -526,13 +545,13 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             {
                 seq.State = SequenceState.Cancelled;
                 ReleaseKvCache(seq);
-                seq.CompletionSource.TrySetCanceled();
+                seq.Cancel();
             }
             catch (Exception ex)
             {
                 seq.State = SequenceState.Completed;
                 ReleaseKvCache(seq);
-                seq.CompletionSource.TrySetException(ex);
+                seq.Fail(ex);
             }
         }
 
@@ -699,14 +718,14 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             {
                 seq.State = SequenceState.Cancelled;
                 ReleaseKvCache(seq);
-                seq.CompletionSource.TrySetCanceled();
+                seq.Cancel();
                 _active.Remove(seq);
             }
             catch (Exception ex)
             {
                 seq.State = SequenceState.Completed;
                 ReleaseKvCache(seq);
-                seq.CompletionSource.TrySetException(ex);
+                seq.Fail(ex);
                 _active.Remove(seq);
             }
             finally
@@ -727,12 +746,12 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             if (ex is null)
             {
                 seq.State = SequenceState.Cancelled;
-                seq.CompletionSource.TrySetCanceled();
+                seq.Cancel();
             }
             else
             {
                 seq.State = SequenceState.Completed;
-                seq.CompletionSource.TrySetException(ex);
+                seq.Fail(ex);
             }
             _active.Remove(seq);
         }
@@ -756,14 +775,14 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         {
             seq.State = SequenceState.Cancelled;
             ReleaseKvCache(seq);
-            seq.CompletionSource.TrySetCanceled();
+            seq.Cancel();
             _active.Remove(seq);
         }
         catch (Exception ex)
         {
             seq.State = SequenceState.Completed;
             ReleaseKvCache(seq);
-            seq.CompletionSource.TrySetException(ex);
+            seq.Fail(ex);
             _active.Remove(seq);
         }
     }
@@ -1080,13 +1099,13 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                 {
                     seq.State = SequenceState.Cancelled;
                     ReleaseKvCache(seq);
-                    seq.CompletionSource.TrySetCanceled();
+                    seq.Cancel();
                 }
                 catch (Exception ex)
                 {
                     seq.State = SequenceState.Completed;
                     ReleaseKvCache(seq);
-                    seq.CompletionSource.TrySetException(ex);
+                    seq.Fail(ex);
                 }
                 finally
                 {
@@ -1121,7 +1140,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                 {
                     seq.State = SequenceState.Cancelled;
                     ReleaseKvCache(seq);
-                    seq.CompletionSource.TrySetCanceled();
+                    seq.Cancel();
                     posOff += p.ForwardLen;
                     continue;
                 }
@@ -1129,7 +1148,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                 {
                     seq.State = SequenceState.Completed;
                     ReleaseKvCache(seq);
-                    seq.CompletionSource.TrySetException(ex);
+                    seq.Fail(ex);
                     posOff += p.ForwardLen;
                     continue;
                 }
@@ -1142,13 +1161,13 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                 {
                     seq.State = SequenceState.Cancelled;
                     ReleaseKvCache(seq);
-                    seq.CompletionSource.TrySetCanceled();
+                    seq.Cancel();
                 }
                 catch (Exception ex)
                 {
                     seq.State = SequenceState.Completed;
                     ReleaseKvCache(seq);
-                    seq.CompletionSource.TrySetException(ex);
+                    seq.Fail(ex);
                 }
                 finally { logits.Dispose(); }
                 posOff += p.ForwardLen;
@@ -1194,6 +1213,17 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             return;
         }
 
+        // Out of room already (max_tokens == 1, or a full KV): finish now, so the token just
+        // sampled is streamed as the final one rather than followed by an empty terminal token.
+        if (AtCapacity(seq))
+        {
+            seq.FinishReason = FinishReason.Length;
+            seq.State = SequenceState.Completed;
+            CompleteSequence(seq);
+            return;
+        }
+
+        EmitStreamToken(seq);
         seq.State = SequenceState.Decoding;
         _active.Add(seq);
     }
@@ -1209,12 +1239,12 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             if (ex is null)
             {
                 seq.State = SequenceState.Cancelled;
-                seq.CompletionSource.TrySetCanceled();
+                seq.Cancel();
             }
             else
             {
                 seq.State = SequenceState.Completed;
-                seq.CompletionSource.TrySetException(ex);
+                seq.Fail(ex);
             }
         }
     }
@@ -1425,17 +1455,22 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
     private static bool TryStartDecode(SchedulerRequest seq, out int nextPos)
     {
         Debug.Assert(seq.State == SequenceState.Decoding);
-        int cacheSize = seq.KvCache!.MaxLength;
         // Position is appended at PromptLength + GeneratedCount - 1; the next forward consumes that
         // token at that position. nextPos == seq.Position - 1.
         nextPos = seq.Position - 1;
-        if (nextPos >= cacheSize || seq.GeneratedCount >= seq.MaxTokens)
+        if (AtCapacity(seq))
         {
             seq.FinishReason = FinishReason.Length;
             return false;
         }
         return true;
     }
+
+    /// <summary>True when no further token fits: the KV-cache is full or max-tokens is reached.</summary>
+    /// <param name="seq">An admitted sequence (it holds a KV-cache).</param>
+    /// <returns>Whether the sequence must finish with <see cref="FinishReason.Length"/>.</returns>
+    private static bool AtCapacity(SchedulerRequest seq)
+        => seq.Position - 1 >= seq.KvCache!.MaxLength || seq.GeneratedCount >= seq.MaxTokens;
 
     /// <summary>
     /// Decodes one token for a single sequence (the non-batched path). Runs the capacity gate, one
@@ -1487,7 +1522,51 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             return true;
         }
 
+        // See FinishPrefill: the next decode would only finish on the capacity gate.
+        if (AtCapacity(seq))
+        {
+            seq.FinishReason = FinishReason.Length;
+            return true;
+        }
+
+        EmitStreamToken(seq);
         return false;
+    }
+
+    /// <summary>Streams the token just appended (non-terminal). Text that may still be the start
+    /// of a stop string, or an incomplete UTF-8 character, is held back for a later token.</summary>
+    /// <param name="seq">The streaming (or not: then a no-op) sequence.</param>
+    private static void EmitStreamToken(SchedulerRequest seq)
+    {
+        if (seq.StreamWriter is not { } writer) return;
+        seq.TextEmitter!.Append(seq.Detokenizer!.TakeDelta(flushIncomplete: false));
+        writer.TryWrite(new GenerationToken(seq.LastSampledToken, seq.TakeStreamText(), null));
+    }
+
+    /// <summary>Streams the final token: flushes held-back text (minus a matched stop string, or
+    /// minus the dropped stop token's text) with the finish reason, timings and token count.</summary>
+    /// <param name="seq">The finished sequence; a no-op when it does not stream.</param>
+    /// <param name="response">The response being resolved.</param>
+    private static void EmitFinalStreamToken(SchedulerRequest seq, InferenceResponse response)
+    {
+        if (seq.StreamWriter is not { } writer) return;
+        var detok = seq.Detokenizer!;
+        var emitter = seq.TextEmitter!;
+        if (seq.MatchedStopSequence is not null)
+        {
+            emitter.FlushTrimmingStopSuffix(detok.TakeDelta(flushIncomplete: true));
+        }
+        else
+        {
+            // A token-level stop (EOS) removed the last token from GeneratedTokens after the
+            // detokenizer saw it; its text must not reach the stream.
+            bool lastTokenDropped = seq.FinishReason == FinishReason.Stop;
+            emitter.Append(lastTokenDropped ? detok.TakeWithheld() : detok.TakeDelta(flushIncomplete: true));
+            emitter.Flush();
+        }
+        writer.TryWrite(new GenerationToken(
+            seq.LastSampledToken, seq.TakeStreamText(), response.FinishReason, response.Timings,
+            GeneratedTokenCount: response.GeneratedTokenCount));
     }
 
     // ── Helpers ──
@@ -1500,6 +1579,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
     {
         result = StopResult.Continue;
         int last = seq.GeneratedTokens[^1];
+        seq.LastSampledToken = last;
 
         // Decoded tail for stop-string conditions (#459). Empty when this request registered none,
         // in which case no condition reads it: EOS and max-tokens work on tokenId / count alone.
@@ -1571,9 +1651,10 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
 
         RecordPerKeyTokens(seq.Request.ApiKey, seq.GeneratedTokens.Count);
 
+        EmitFinalStreamToken(seq, response);
         ReleaseKvCache(seq);
         seq.CancellationRegistration.Dispose();
-        seq.CompletionSource.TrySetResult(response);
+        seq.Complete(response);
     }
 
     /// <summary>
@@ -1691,7 +1772,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         foreach (var active in _active)
         {
             ReleaseKvCache(active);
-            active.CompletionSource.TrySetCanceled();
+            active.Cancel();
             active.CancellationRegistration.Dispose();
         }
         _active.Clear();
@@ -1705,7 +1786,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         {
             while (_pendingQueue.TryDequeue(out var pending, out _))
             {
-                pending.CompletionSource.TrySetCanceled();
+                pending.Cancel();
                 pending.CancellationRegistration.Dispose();
             }
         }

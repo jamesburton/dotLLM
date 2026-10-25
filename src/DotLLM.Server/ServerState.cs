@@ -188,6 +188,31 @@ public sealed class ServerState : IDisposable
     public ContinuousBatchSchedulerService? Scheduler { get; set; }
 
     /// <summary>
+    /// A streaming token source on <paramref name="scheduler"/> (#1266). It takes neither the request gate nor the model lease:
+    /// the scheduler's run loop owns the model, so the stream batches with every other scheduled request. Pair it with
+    /// <see cref="WithoutGate"/>.
+    /// </summary>
+    /// <param name="scheduler">The running scheduler.</param>
+    /// <param name="httpContext">The request, for the API key the rate limiter resolved (per-key fairness).</param>
+    /// <param name="promptIds">The encoded prompt.</param>
+    /// <param name="options">The resolved inference options.</param>
+    /// <returns>A token source, started by the endpoint's stream writer.</returns>
+    internal static Func<CancellationToken, IAsyncEnumerable<GenerationToken>> SchedulerStream(
+        ContinuousBatchSchedulerService scheduler, HttpContext httpContext, int[] promptIds, InferenceOptions options)
+    {
+        var request = new InferenceRequest
+        {
+            TokenIds = promptIds,
+            Options = options,
+            ApiKey = httpContext.Items.TryGetValue(RateLimitMiddleware.ApiKeyItemKey, out var k) ? k as string : null,
+        };
+        return ct => scheduler.StreamAsync(request, ct);
+    }
+
+    /// <summary>The <c>execute</c> step for a <see cref="SchedulerStream"/>: runs the work directly, with no gate or lease.</summary>
+    internal static readonly Func<Func<Task>, CancellationToken, Task> WithoutGate = static (work, _) => work();
+
+    /// <summary>
     /// Cancellation source for <see cref="Scheduler"/>'s background run-loop. Cancelled at
     /// shutdown so the loop exits cleanly.
     /// </summary>
@@ -318,12 +343,12 @@ public sealed class ServerState : IDisposable
     /// The scheduler lease is therefore taken here, inside the gate, rather than left to each
     /// caller to remember — which is the follow-up #461 asked for. Every direct forward in the
     /// server already routes through this method, so the protection is now structural instead of
-    /// a convention: <b>streaming chat and completions always take the direct-generator path</b>,
-    /// so before this they raced the loop on every request that overlapped a batched one.
+    /// a convention. (Streaming used to always take the direct-generator path and race the loop;
+    /// since #1266 it runs on the scheduler when one is running, see <see cref="SchedulerStream"/>.)
     /// </para>
     /// <para>
     /// <b>Cost, stated:</b> the lease is held for the whole of <paramref name="work"/>, so a long
-    /// streaming generation stalls in-flight batched requests for its duration. That is the
+    /// direct-generator generation (a LoRA or logprobs request) stalls in-flight batched requests for its duration. That is the
     /// correct trade — the two cannot run at once in any case — but it is a real throughput change
     /// for a mixed workload, not a free fix. Callers that need finer granularity should take the
     /// lease themselves around the forward only.

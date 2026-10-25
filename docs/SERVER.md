@@ -323,8 +323,8 @@ During the activation hand-off (a request that just loaded a model keeps first u
 does not swap it away and force a reload) `/v1/status` reports `busy` with `busy_with: "req#N (activated <id>, preparing to generate)"`,
 and yielding requests count in `waiting_requests`.
 
-`/ready` answers 503 during a load. Requests arriving while a model loads queue behind it. Known gap: non-streaming requests routed
-through the continuous-batch scheduler bypass the lock, so they are not re-validated after a swap.
+`/ready` answers 503 during a load. Requests arriving while a model loads queue behind it. Known gap: requests routed
+through the continuous-batch scheduler (streaming or not) bypass the lock, so they are not re-validated after a swap.
 
 **SSE keep-alive.** A streaming request (`/v1/chat/completions`, `/v1/completions`, `/v1/messages`) that waits - for a load or for the lock,
 in the model-activation phase as well as the generation phase - receives an SSE comment every 10 s:
@@ -1280,8 +1280,8 @@ These are designed for the local Chat UI workflow and must not be internet-expos
 
 The server has two execution paths and picks per-request:
 
-1. **Continuous-batch scheduler path (default for paged-KV serving)**. When `--paged` is on (the default for `serve`) and no speculative-decoding draft model is loaded, `ServerStartup` constructs a `ContinuousBatchSchedulerService` per loaded model and starts its `RunLoopAsync` on a background task tied to `IHostApplicationLifetime.ApplicationStopping`. `/v1/chat/completions` and `/v1/completions` route non-streaming requests through `EnqueueAsync` — multiple concurrent requests pipeline through a single `IModel.ForwardBatch` dispatch per scheduler iteration. The startup log prints `Continuous-batch scheduler active` when this path is engaged.
-2. **Single-request gate path (fallback)**. Streaming requests, LoRA-adapter requests, logprob-capturing requests, and any backend without a paged KV-cache factory (CUDA, Vulkan, hybrid GPU, quantized KV) keep using the original `SemaphoreSlim(1, 1)` gate via `ServerState.ExecuteAsync`. Requests serialize FIFO. The startup log prints `Single-request mode — requests processed sequentially` when this is the only path.
+1. **Continuous-batch scheduler path (default for paged-KV serving)**. When `--paged` is on (the default for `serve`) and no speculative-decoding draft model is loaded, `ServerStartup` constructs a `ContinuousBatchSchedulerService` per loaded model and starts its `RunLoopAsync` on a background task tied to `IHostApplicationLifetime.ApplicationStopping`. `/v1/chat/completions`, `/v1/completions`, `/v1/messages` and the Ollama `/api/generate` / `/api/chat` route requests through it — non-streaming via `EnqueueAsync`, streaming via `StreamAsync` (#1266), which yields each token as the run loop samples it from an unbounded per-request channel, so a slow client never stalls the loop. Multiple concurrent requests, streaming or not, pipeline through a single `IModel.ForwardBatch` dispatch per scheduler iteration; neither path takes the request gate or the model lease. The startup log prints `Continuous-batch scheduler active` when this path is engaged.
+2. **Single-request gate path (fallback)**. LoRA-adapter requests, logprob-capturing requests, and any backend without a paged KV-cache factory (CUDA, Vulkan, hybrid GPU, quantized KV) keep using the original `SemaphoreSlim(1, 1)` gate via `ServerState.ExecuteAsync`. Requests serialize FIFO. The startup log prints `Single-request mode — requests processed sequentially` when this is the only path.
 
 ### Scheduler tuning
 

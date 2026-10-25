@@ -1,9 +1,12 @@
 using System.Diagnostics;
+using System.Text;
+using System.Threading.Channels;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Constraints;
 using DotLLM.Core.Models;
 using DotLLM.Core.Sampling;
 using DotLLM.Engine.Samplers;
+using DotLLM.Engine.Samplers.StopConditions;
 
 namespace DotLLM.Engine.Scheduler;
 
@@ -74,7 +77,8 @@ internal sealed class SchedulerRequest : ISchedulerRequest
 
     /// <summary>
     /// Per-sequence incremental detokenizer, present <b>only</b> when this request registered at
-    /// least one <see cref="DotLLM.Engine.Samplers.StopConditions.StopStringCondition"/> (#459).
+    /// least one <see cref="DotLLM.Engine.Samplers.StopConditions.StopStringCondition"/> (#459)
+    /// or streams its tokens (<see cref="StreamWriter"/>, #1266).
     /// Stop strings match on decoded text, so without it the scheduler had no tail to test and
     /// every stop string — user-supplied or built-in like <c>&lt;|eom_id|&gt;</c> — was silently
     /// inert. <see langword="null"/> when only token-level conditions (EOS, max-tokens) are
@@ -115,10 +119,64 @@ internal sealed class SchedulerRequest : ISchedulerRequest
     /// <summary>Cumulative sampling ticks across all iterations.</summary>
     public long SamplerTicks { get; set; }
 
+    /// <summary>
+    /// Per-request token stream (#1266), or <see langword="null"/> for a completion-only request.
+    /// Unbounded, so the step loop never blocks on (or fails a request for) a slow consumer; growth
+    /// is bounded by <see cref="MaxTokens"/>. Completed at every terminal path alongside
+    /// <see cref="CompletionSource"/>, which carries the outcome (result, cancellation, or error).
+    /// </summary>
+    public ChannelWriter<GenerationToken>? StreamWriter { get; set; }
+
+    /// <summary>Holds back possible stop-string prefixes so the streamed text concatenates to
+    /// <see cref="InferenceResponse.Text"/> (#424). Set together with <see cref="StreamWriter"/>.</summary>
+    public StopAwareTextEmitter? TextEmitter { get; set; }
+
+    /// <summary>Text released by <see cref="TextEmitter"/> since the last emitted token.</summary>
+    public StringBuilder? StreamText { get; set; }
+
+    /// <summary>The most recently sampled token, kept even when a stop condition drops it from
+    /// <see cref="GeneratedTokens"/> so the final streamed token can still report it.</summary>
+    public int LastSampledToken { get; set; }
+
     /// <summary>Completion source resolved when the sequence finishes.</summary>
     public TaskCompletionSource<InferenceResponse> CompletionSource { get; }
 
     public Task<InferenceResponse> Completion => CompletionSource.Task;
+
+    /// <summary>Cancels the completion and ends the token stream, if any. Thread-safe (also called
+    /// from the caller's cancellation callback).</summary>
+    public void Cancel()
+    {
+        CompletionSource.TrySetCanceled();
+        StreamWriter?.TryComplete();
+    }
+
+    /// <summary>Faults the completion with <paramref name="ex"/> and ends the token stream, if any.</summary>
+    /// <param name="ex">The failure, surfaced to the caller through <see cref="Completion"/>.</param>
+    public void Fail(Exception ex)
+    {
+        CompletionSource.TrySetException(ex);
+        StreamWriter?.TryComplete();
+    }
+
+    /// <summary>Resolves the completion with <paramref name="response"/> and ends the token stream, if any.</summary>
+    /// <param name="response">The finished response.</param>
+    public void Complete(InferenceResponse response)
+    {
+        CompletionSource.TrySetResult(response);
+        StreamWriter?.TryComplete();
+    }
+
+    /// <summary>Takes the text released since the last emitted token.</summary>
+    /// <returns>The pending stream text; empty when there is none.</returns>
+    public string TakeStreamText()
+    {
+        var sb = StreamText!;
+        if (sb.Length == 0) return string.Empty;
+        string text = sb.ToString();
+        sb.Clear();
+        return text;
+    }
 
     /// <summary>Cancellation registration on the caller's token; disposed on completion.</summary>
     public CancellationTokenRegistration CancellationRegistration { get; set; }

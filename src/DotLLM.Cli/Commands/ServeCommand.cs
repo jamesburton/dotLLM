@@ -542,7 +542,9 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         AnsiConsole.MarkupLine($"  Listening on [link={url}]{url}[/]");
         if (!settings.NoUi)
             AnsiConsole.MarkupLine($"  Chat UI: [dim]{url}[/]");
-        AnsiConsole.MarkupLine("  [dim]Single-request mode — requests processed sequentially[/]");
+        AnsiConsole.MarkupLine(state.Scheduler is not null
+            ? "  [dim]Continuous batching — concurrent requests (streaming or not) share each forward pass[/]"
+            : "  [dim]Single-request mode — requests processed sequentially[/]");
         AnsiConsole.MarkupLine("[dim]  Press Ctrl+C to stop.[/]");
         AnsiConsole.WriteLine();
 
