@@ -539,7 +539,7 @@ PRs #1103, #1122, #1125, #1126.
 | C1 | CPU | `SimpleKvCache` F32 (default KV, draft KV) | L8B 256 KiB/token (32 GiB @128k) | open; target q8_0 + int8 QKᵀ | #978, #1120, #1133 |
 | C2 | CPU | all activations F32 | L8B 256 KiB/token of capacity | open | #1138 |
 | C3 | CPU | logits for all positions + output copy | L8B 501 KiB/token each (≈2 GiB @2048) | open | #1137 |
-| C4 | CPU | `PagedKvCache` F32 blocks + full-history staging | staging L8B @8k 64 MiB | open | #1142 |
+| C4 | CPU | `PagedKvCache` F32 blocks + full-history staging | was: blocks L8B 256 KiB/token, staging @8k 64 MiB/seq; now F16 blocks 128 KiB/token (Q8_0 68 KiB), no staging on the attention path | fixed (#1268) | #1142 |
 | C5 | CPU | `QuantizedKvCache` F32 recent window | L8B W=128: 32 MiB | open | #1142 |
 | C6 | CPU | RoPE cos/sin `float[]`, twice | L8B @128k 64 MiB ×2 | open | #1142 |
 | C7 | CPU | MTP KV and hidden F32 | 32 MiB @4096 positions | open | #1141 |

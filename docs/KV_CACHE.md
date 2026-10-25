@@ -286,7 +286,7 @@ only plans (`TryPlan` / `Commit`); each backend carries out the move.
 
 ## Paged KV-Cache
 
-Inspired by OS virtual memory paging. This is the **memory management** half of PagedAttention (vLLM): block-based allocation, ref counting, CoW. The **kernel** half (attention reading non-contiguous blocks directly) is opt-in on CUDA as of issue #200 (`DOTLLM_ATTN_PAGED_NATIVE=1`, decode only — see the CUDA section below); it remains a future step for CPU and any future Vulkan paged cache, where current kernels still see contiguous buffers via staging-buffer gather.
+Inspired by OS virtual memory paging. This is the **memory management** half of PagedAttention (vLLM): block-based allocation, ref counting, CoW. The **kernel** half (attention reading non-contiguous blocks directly) is the default on CPU since #1268 (the attention kernel reads F16/Q8_0 blocks in place, prefill and decode) and opt-in on CUDA as of issue #200 (`DOTLLM_ATTN_PAGED_NATIVE=1`, decode only — see the CUDA section below; #1270 tracks the CUDA follow-up). Any future Vulkan paged cache still needs it.
 
 ### Why
 
@@ -297,7 +297,7 @@ Inspired by OS virtual memory paging. This is the **memory management** half of 
 - **Step 43 (speculative decoding)** — benefits from cheap block-level rollback on draft rejection and CoW fork for draft branching, though `SimpleKvCache.SetCurrentLength()` truncation works as a fallback.
 - **Beam search** (future) — beams share prefix blocks via `Fork`, diverge via CoW.
 
-**When it doesn't help**: Single-sequence CLI inference. One sequence uses most of its allocation, and the staging-buffer gather adds overhead. This is why paged is opt-in for `run`/`chat` and default-on only for `serve`.
+**When it doesn't help**: Single-sequence CLI inference. One sequence uses most of its allocation. This is why paged is opt-in for `run`/`chat` and default-on only for `serve`.
 
 ### Design
 - Divide cache into fixed-size **blocks** of B tokens (B = 16).
@@ -311,17 +311,53 @@ Inspired by OS virtual memory paging. This is the **memory management** half of 
 - **Copy-on-write**: For beam search — beams share prefix blocks (ref-counted). On divergence, copy the shared block.
 - **Fork**: For prompt caching — new sequence references existing prefix blocks.
 
-### Attention Integration (v1: Staging Buffer)
+### Attention Integration (CPU: direct block reads, #1268)
 
-Current implementation uses a staging buffer approach: `GetKeysRef()`/`GetValuesRef()` gather block data into a pre-allocated contiguous buffer before each attention call. This avoids modifying attention kernels. The gather cost is O(seqLen × headDim) — negligible compared to attention's O(seqLen² × headDim).
+`PagedKvCache` implements `IPagedKvCache` (Core): block size, uniform `KvStride`, the block table (`BlockIds`) and
+per-layer views of the physical K/V block storage, whose `DType` is the row type. `TransformerModel.AttendCachedF32`
+sends a paged cache to `Attention.Execute(float*, IPagedKvCache, ...)`, which reads the blocks in place: no gather and no
+staging. It is the same kernel as the quantized-cache path (`ExecuteTiledHead`), generalised over row addressing
+(contiguous / ring / paged, a paged block resolved once per run of rows, not per row) and row type (F32 / F16 / Q8_0 /
+Q4_0, one head slice decoded into a `headDim` scratch by the existing per-row helpers). It supports a custom score scale
+(Gemma `query_pre_attn_scalar`, Granite), softcap, sinks and sliding windows, and partitions heads across workers with
+`PartitionRange` like the contiguous path; up to 4 query heads sharing a KV head run together so each cached row is
+decoded once for the group. Rows with ≤ 2048 visible keys take the contiguous path's single-shot softmax,
+longer rows the same tiled online softmax, so **F32 blocks reproduce the contiguous kernel bit for bit** (#530; tested).
 
-Future optimization: specialized paged attention kernels that read blocks directly via block table indirection, eliminating the staging copy.
+**Block row type** (`KvBlockPool` / `PagedKvCacheFactory` `elementType`): **F16 by default**, Q8_0 as an option (the
+server selects it for `--cache-type-k q8_0 --cache-type-v q8_0` on uniform non-hybrid models, no mixed-precision window),
+F32 only as a reference for bit-identity tests. Bytes per token (K+V, all layers), Llama-3.2-1B (16 L × 8 KV heads × 64):
+
+| rows | bytes/token | Llama-3.1-8B (32 L × 8 × 128) |
+|---|---|---|
+| F32 (before) | 64 KiB | 256 KiB |
+| F16 (default) | 32 KiB | 128 KiB |
+| Q8_0 | 17 KiB | 68 KiB |
+
+The old per-sequence F32 staging (`2 × maxSeqLen × kvStride × 4` bytes, allocated eagerly: 64 MiB for Llama-3.1-8B at 8k)
+is gone from the attention path: `GetKeysRef`/`GetValuesRef` still exist for callers without a paged kernel (other
+architectures, KV handoff) and decode into staging that is allocated **lazily**, on first use. `DownloadLayer` decodes
+straight into the caller's buffers. `PagedKvCache.AllocatedBytes` is the bytes of the blocks this sequence holds plus any
+staging (shared prefix blocks are counted by every holder); the pool's reservation is `KvBlockPool.AllocatedBytes`.
+
+Decode attention, one token, 16 q / 4 KV heads, head dim 64, fragmented pages (`PagedAttentionBenchmarks`, 8 threads,
+Zen5): before = F32 blocks gathered into staging + contiguous kernel; after = blocks read in place.
+
+| ctx | before (F32 gather) | after F16 | after Q8_0 | after F32 |
+|---|---|---|---|---|
+| 512 | 256 µs | 172 µs | 125 µs | 93 µs |
+| 4096 | 2.00 ms | 1.12 ms | 0.85 ms | 0.78 ms |
+| 16384 | 10.7 ms | 4.55 ms | 3.18 ms | 4.81 ms |
+
+F16/Q8_0 blocks change greedy output only at near-ties: on SmolLM-135M, teacher-forced logits differ from the F32 simple
+cache by at most 0.94 (F16) / 0.90 (Q8_0), against 0.84 for the existing Q8_0 `QuantizedKvCache`, with top-1 agreement
+14/15 for all three (`PagedKvCache_Blocks_TrackSimpleCacheLogits`).
 
 ### Key Classes
 
 - `KvBlockPool` — Fixed-size pool of KV blocks. Per-layer contiguous storage, 64-byte aligned. Free list with `Interlocked` ref counting for thread safety.
 - `KvBlockTable` — Per-sequence mapping from logical positions to physical block IDs. Supports `Fork` (shared prefix) and `EnsureWritable` (copy-on-write).
-- `PagedKvCache : IKvCache` — Paged cache with staging-buffer gather. Drop-in replacement for `SimpleKvCache`.
+- `PagedKvCache : IPagedKvCache, IHostStagedKvCache` — Paged cache read in place by the CPU attention kernel; legacy contiguous views decode into lazy staging. Drop-in replacement for `SimpleKvCache`.
 - `PagedKvCacheFactory` — Creates `PagedKvCache` instances backed by a shared `KvBlockPool`.
 
 ### CUDA Paged KV-Cache (issue #252)
@@ -390,9 +426,10 @@ dotllm serve model.gguf --no-ui
 - CUDA now has a paged KV-cache (issue #252, see above) via `CudaPagedKvCache`. Hybrid (CPU+GPU
   split-layer) models still fall back to their native KV-cache — `CudaKvBlockPool`'s per-layer
   shape assumes every layer's storage lives on one device, which doesn't fit the hybrid split.
-- Not compatible with quantized KV-cache (`--cache-type-k`/`--cache-type-v`) on either backend.
-  Falls back to `QuantizedKvCache`/`CudaQuantizedKvCache` with a warning.
-- Staging buffer means `GetKeysRef`/`GetValuesRef` (CPU) results are only valid until the next call
+- CPU: q8_0 K+V selects Q8_0 blocks (uniform, non-hybrid models, no mixed-precision window); any other quantized KV
+  request falls back to `QuantizedKvCache` with a warning. CUDA: falls back to `CudaQuantizedKvCache`.
+- CPU paged caches need a uniform per-layer KV stride: Gemma-4 / MiMo-V2 (per-layer KV widths) use the simple cache.
+- The legacy `GetKeysRef`/`GetValuesRef` (CPU) staging results are only valid until the next call
   (shared buffer). CUDA's `CudaPagedKvCache` doesn't implement `GetKeysRef`/`GetValuesRef` at all —
   there's no single contiguous device pointer to hand back without a gather — callers must use
   `PrepareAttentionScratch(layerIndex, stream)` instead.
@@ -401,9 +438,9 @@ dotllm serve model.gguf --no-ui
 - CUDA has an opt-in direct block-table-read decode attention kernel now (issue #200,
   `DOTLLM_ATTN_PAGED_NATIVE=1`, see the CUDA section above and
   `docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md`), but it defaults OFF pending real-hardware
-  measurement, and it only covers CUDA decode — CPU's `PagedKvCache` and any future Vulkan paged
-  cache still only have the staging-buffer-gather shape (see `docs/ROADMAP.md`'s "Paged attention
-  kernels" row for the remaining backends/prefill scope).
+  measurement, and it only covers CUDA decode (#1270). CPU's `PagedKvCache` reads blocks directly
+  since #1268; a future Vulkan paged cache would need its own kernel (see `docs/ROADMAP.md`'s "Paged
+  attention kernels" row).
 
 ## KV-Cache Quantization
 

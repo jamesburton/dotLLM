@@ -1,8 +1,8 @@
 using System.Numerics.Tensors;
-using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Tensors;
 using DotLLM.Cpu.Threading;
 
 namespace DotLLM.Cpu.Kernels;
@@ -863,7 +863,104 @@ public static class Attention
         }
     }
 
-    // ──────────────────── Quantized KV-cache attention ────────────────────
+    // ──────────────────── Tiled attention over cached KV rows (quantized, ring, paged) ────────────────────
+
+    /// <summary>Element format of a cached K or V row, decoded one head slice at a time into F32 scratch.</summary>
+    private enum KvRowFormat : byte
+    {
+        F32,
+        F16,
+        Q8_0,
+        Q4_0,
+    }
+
+    /// <summary>
+    /// Where the cached K (or V) rows of one segment live, and in what format. Logical row <c>r</c> is at
+    /// <c>Base + physical(r) * RowBytes</c> where <c>physical</c> is the identity (contiguous), <c>r % RingCapacity</c>
+    /// (ring window) or <c>Blocks[r / BlockSize] * BlockSize + r % BlockSize</c> (paged).
+    /// </summary>
+    private unsafe struct KvRows
+    {
+        public byte* Base;
+        public int RowBytes;
+        /// <summary>Bytes of one head's slice within a row.</summary>
+        public int HeadBytes;
+        public KvRowFormat Format;
+        /// <summary>&gt; 0: ring buffer of this many rows.</summary>
+        public int RingCapacity;
+        /// <summary>Non-null: logical block → physical block table (paged).</summary>
+        public int* Blocks;
+        public int BlockSize;
+
+        /// <summary>
+        /// Address of logical row <paramref name="row"/>; <paramref name="runLen"/> receives how many rows from it on
+        /// (at most <paramref name="limit"/>) are physically consecutive — so a paged block is resolved once, not per row.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public readonly byte* Run(int row, int limit, out int runLen)
+        {
+            long physical;
+            if (Blocks != null)
+            {
+                int block = row / BlockSize;
+                int offset = row - block * BlockSize;
+                runLen = Math.Min(BlockSize - offset, limit);
+                physical = (long)Blocks[block] * BlockSize + offset;
+            }
+            else if (RingCapacity > 0)
+            {
+                int index = row % RingCapacity;
+                runLen = Math.Min(RingCapacity - index, limit);
+                physical = index;
+            }
+            else
+            {
+                runLen = limit;
+                physical = row;
+            }
+
+            return Base + physical * RowBytes;
+        }
+
+        /// <summary>Builds a descriptor; <see cref="HeadBytes"/> follows from the format.</summary>
+        public static KvRows Create(void* basePtr, int rowBytes, KvRowFormat format, int headDim,
+                                    int ringCapacity = 0, int* blocks = null, int blockSize = 0)
+            => new()
+            {
+                Base = (byte*)basePtr, RowBytes = rowBytes, Format = format,
+                HeadBytes = format switch
+                {
+                    KvRowFormat.F32 => headDim * sizeof(float),
+                    KvRowFormat.F16 => headDim * 2,
+                    KvRowFormat.Q8_0 => headDim / KvQuantize.BlockSize * KvQuantize.Q8_0BlockBytes,
+                    _ => headDim / KvQuantize.BlockSize * KvQuantize.Q4_0BlockBytes,
+                },
+                RingCapacity = ringCapacity, Blocks = blocks, BlockSize = blockSize,
+            };
+    }
+
+    /// <summary>
+    /// Returns one head's slice of a cached row as F32: the row itself for F32, else decoded into <paramref name="scratch"/>
+    /// (<paramref name="headDim"/> floats) by the same per-row helpers the quantized cache always used.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe float* LoadHeadRow(byte* src, KvRowFormat format, int headDim, float* scratch)
+    {
+        switch (format)
+        {
+            case KvRowFormat.F32:
+                return (float*)src;
+            case KvRowFormat.F16:
+                TensorPrimitives.ConvertToSingle(new ReadOnlySpan<Half>(src, headDim), new Span<float>(scratch, headDim));
+                return scratch;
+            case KvRowFormat.Q8_0:
+                KvQuantize.Q8_0ToF32(src, scratch, headDim);
+                return scratch;
+            default:
+                KvQuantize.Q4_0ToF32(src, scratch, headDim);
+                return scratch;
+        }
+    }
 
     /// <summary>
     /// Attention with quantized KV-cache. Dequantizes tiles on-the-fly during attention
@@ -877,16 +974,9 @@ public static class Attention
                                        int? slidingWindowSize = null, float softCap = 0f,
                                        float[]? sinks = null)
     {
-        if (headDim <= 0)
-            throw new ArgumentException($"headDim must be positive, got {headDim}", nameof(headDim));
-        if (numHeads % numKvHeads != 0)
-            throw new ArgumentException(
-                $"numHeads ({numHeads}) must be divisible by numKvHeads ({numKvHeads})", nameof(numKvHeads));
+        ValidateHeads(numHeads, numKvHeads, headDim);
 
-        float scale = 1.0f / MathF.Sqrt(headDim);
         int kvStride = numKvHeads * headDim;
-        int qStride = numHeads * headDim;
-        int tileSize = ComputeTileSize(headDim);
 
         int quantLen = kvCache.QuantizedLength;
         int windowLen = kvCache.WindowLength;
@@ -894,330 +984,381 @@ public static class Attention
         int rowBase = (kvCache as IWindowedKvCache)?.RowBaseOf(layerIndex) ?? 0;
         quantLen -= rowBase;
         positionOffset -= rowBase;
-        byte* kQuant = (byte*)kvCache.GetQuantizedKeysPtr(layerIndex);
-        byte* vQuant = (byte*)kvCache.GetQuantizedValuesPtr(layerIndex);
-        float* kWindow = (float*)kvCache.GetWindowKeysPtr(layerIndex);
-        float* vWindow = (float*)kvCache.GetWindowValuesPtr(layerIndex);
+
         // Per-layer quantized row bytes: equals the scalar property for every uniform
         // model; for Gemma-4 the sliding/global layers carry distinct widths. The
         // kvStride local above is already per-layer (derived from the per-call
         // numKvHeads/headDim the caller passes for this layer).
-        int kQuantRowBytes = kvCache.KeyQuantizedRowBytesOf(layerIndex);
-        int vQuantRowBytes = kvCache.ValueQuantizedRowBytesOf(layerIndex);
+        var ctx = new TiledKvCtx
+        {
+            K0 = KvRows.Create((void*)kvCache.GetQuantizedKeysPtr(layerIndex), kvCache.KeyQuantizedRowBytesOf(layerIndex),
+                               QuantizedRowFormat(kvCache.KeyDType), headDim),
+            V0 = KvRows.Create((void*)kvCache.GetQuantizedValuesPtr(layerIndex), kvCache.ValueQuantizedRowBytesOf(layerIndex),
+                               QuantizedRowFormat(kvCache.ValueDType), headDim),
+            // The full-precision recent window is an F32 ring indexed by logical position.
+            K1 = KvRows.Create((void*)kvCache.GetWindowKeysPtr(layerIndex), kvStride * sizeof(float), KvRowFormat.F32, headDim,
+                               ringCapacity: kvCache.WindowCapacity),
+            V1 = KvRows.Create((void*)kvCache.GetWindowValuesPtr(layerIndex), kvStride * sizeof(float), KvRowFormat.F32, headDim,
+                               ringCapacity: kvCache.WindowCapacity),
+            Split = quantLen,
+            SeqKv = quantLen + windowLen,
+            Scale = 1.0f / MathF.Sqrt(headDim),
+        };
+        RunTiled(ref ctx, q, output, seqQ, numHeads, numKvHeads, headDim, positionOffset, pool,
+                 slidingWindowSize, softCap, sinks);
+    }
 
-        if (pool is null || numHeads < 2)
+    /// <summary>
+    /// Attention that reads a paged KV cache's physical blocks in place (#1268): no gather of the history into a
+    /// contiguous copy. Rows may be F16, Q8_0 or F32; each head slice is decoded into a per-worker row scratch.
+    /// Same tiled online-softmax arithmetic, worker split and tile boundaries as the quantized-cache path.
+    /// </summary>
+    /// <param name="q">Queries <c>[seqQ, numHeads * headDim]</c>.</param>
+    /// <param name="kvCache">Paged cache already holding positions <c>[0, positionOffset + seqQ)</c>.</param>
+    /// <param name="layerIndex">Layer whose blocks to read.</param>
+    /// <param name="output">Output <c>[seqQ, numHeads * headDim]</c>.</param>
+    /// <param name="seqQ">Query rows.</param>
+    /// <param name="numHeads">Query heads.</param>
+    /// <param name="numKvHeads">KV heads; <c>numKvHeads * headDim</c> must equal the cache stride.</param>
+    /// <param name="headDim">Head dimension.</param>
+    /// <param name="positionOffset">Position of the first query row.</param>
+    /// <param name="scale">Score scale (1/sqrt(headDim), or Gemma <c>query_pre_attn_scalar</c> / Granite multiplier).</param>
+    /// <param name="pool">Optional worker pool (heads partitioned as in the contiguous path).</param>
+    /// <param name="slidingWindowSize">Optional sliding window.</param>
+    /// <param name="softCap">Attention-logit soft-cap; 0 = disabled.</param>
+    /// <param name="sinks">Optional per-head sink logits [numHeads].</param>
+    /// <exception cref="ArgumentException">Geometry mismatch, unsupported row type or an incomplete block table.</exception>
+    [SkipLocalsInit]
+    public static unsafe void Execute(float* q, IPagedKvCache kvCache, int layerIndex, float* output,
+                                      int seqQ, int numHeads, int numKvHeads, int headDim, int positionOffset,
+                                      float scale, ComputeThreadPool? pool,
+                                      int? slidingWindowSize = null, float softCap = 0f, float[]? sinks = null)
+    {
+        ValidateHeads(numHeads, numKvHeads, headDim);
+        int kvStride = numKvHeads * headDim;
+        if (kvCache.KvStride != kvStride)
+            throw new ArgumentException($"numKvHeads * headDim ({kvStride}) must equal the paged cache stride ({kvCache.KvStride}).");
+        int seqKv = kvCache.CurrentLength;
+        if (seqQ <= 0 || positionOffset < 0 || (long)positionOffset + seqQ > seqKv)
+            throw new ArgumentException("Query positions must already be present in the cache.");
+
+        var keys = kvCache.GetKeyBlocksRef(layerIndex);
+        var values = kvCache.GetValueBlocksRef(layerIndex);
+        if (keys.DeviceId != -1 || values.DeviceId != -1 || keys.DType != values.DType)
+            throw new ArgumentException("Paged attention needs host K/V blocks of one element type.");
+        KvRowFormat format = keys.DType == DType.Float16 ? KvRowFormat.F16
+            : keys.DType == DType.Q8_0 ? KvRowFormat.Q8_0
+            : keys.DType == DType.Float32 ? KvRowFormat.F32
+            : throw new ArgumentException($"Unsupported paged KV row type {keys.DType}.");
+        if (format == KvRowFormat.Q8_0 && headDim % KvQuantize.BlockSize != 0)
+            throw new ArgumentException($"Q8_0 paged KV needs headDim % {KvQuantize.BlockSize} == 0.");
+
+        int blockSize = kvCache.BlockSize;
+        ReadOnlySpan<int> blocks = kvCache.BlockIds;
+        int usedBlocks = (seqKv + blockSize - 1) / blockSize;
+        if (blockSize <= 0 || blocks.Length < usedBlocks)
+            throw new ArgumentException("Paged block table does not cover the cached length.", nameof(kvCache));
+        uint physicalBlocks = (uint)(keys.Dim0 / blockSize);
+        for (int i = 0; i < usedBlocks; i++)
         {
-            Span<float> tileScores = stackalloc float[MaxTileSize];
-            for (int h = 0; h < numHeads; h++)
-            {
-                ExecuteTiledQuantizedHead(
-                    q, kQuant, vQuant, kWindow, vWindow, output, tileScores,
-                    seqQ, quantLen, windowLen, headDim, scale,
-                    qStride, kvStride, kQuantRowBytes, vQuantRowBytes,
-                    positionOffset, tileSize, slidingWindowSize ?? 0,
-                    kvCache.KeyDType, kvCache.ValueDType,
-                    h, h / (numHeads / numKvHeads),
-                    kvCache.WindowCapacity, softCap,
-                    sinks is null ? float.NegativeInfinity : sinks[h]);
-            }
+            if ((uint)blocks[i] >= physicalBlocks)
+                throw new ArgumentException($"Block id {blocks[i]} lies outside the pool.", nameof(kvCache));
         }
-        else
+
+        int rowBytes = (int)keys.DType.ComputeByteCount(kvStride);
+        fixed (int* table = blocks)
         {
-            fixed (float* sinksPtr = sinks)
+            var ctx = new TiledKvCtx
             {
-                var ctx = new QuantizedTiledCtx
-                {
-                    Q = q, KQuant = kQuant, VQuant = vQuant,
-                    KWindow = kWindow, VWindow = vWindow, Output = output,
-                    SeqQ = seqQ, QuantLen = quantLen, WindowLen = windowLen,
-                    NumHeads = numHeads, NumKvHeads = numKvHeads,
-                    HeadDim = headDim, Scale = scale,
-                    PositionOffset = positionOffset,
-                    GroupSize = numHeads / numKvHeads,
-                    QStride = qStride, KvStride = kvStride,
-                    KQuantRowBytes = kQuantRowBytes, VQuantRowBytes = vQuantRowBytes,
-                    TileSize = tileSize,
-                    SlidingWindowSize = slidingWindowSize ?? 0,
-                    KeyDType = kvCache.KeyDType, ValueDType = kvCache.ValueDType,
-                    WindowCapacity = kvCache.WindowCapacity,
-                    SoftCap = softCap,
-                    Sinks = sinksPtr
-                };
-                pool.Dispatch((nint)(&ctx), &QuantizedTiledAttentionWorker);
-            }
+                K0 = KvRows.Create((void*)keys.DataPointer, rowBytes, format, headDim, blocks: table, blockSize: blockSize),
+                V0 = KvRows.Create((void*)values.DataPointer, rowBytes, format, headDim, blocks: table, blockSize: blockSize),
+                Split = seqKv,
+                SeqKv = seqKv,
+                Scale = scale,
+                OneShot = true,
+            };
+            RunTiled(ref ctx, q, output, seqQ, numHeads, numKvHeads, headDim, positionOffset, pool,
+                     slidingWindowSize, softCap, sinks);
         }
     }
 
-    private unsafe struct QuantizedTiledCtx
+    private static void ValidateHeads(int numHeads, int numKvHeads, int headDim)
+    {
+        if (headDim <= 0)
+            throw new ArgumentException($"headDim must be positive, got {headDim}", nameof(headDim));
+        if (numKvHeads <= 0 || numHeads % numKvHeads != 0)
+            throw new ArgumentException(
+                $"numHeads ({numHeads}) must be divisible by numKvHeads ({numKvHeads})", nameof(numKvHeads));
+    }
+
+    private static KvRowFormat QuantizedRowFormat(KvCacheDType dtype) => dtype switch
+    {
+        KvCacheDType.Q8_0 => KvRowFormat.Q8_0,
+        KvCacheDType.Q4_0 => KvRowFormat.Q4_0,
+        _ => throw new ArgumentOutOfRangeException(nameof(dtype), dtype, "Quantized KV region must be Q8_0 or Q4_0."),
+    };
+
+    /// <summary>Fills the shared fields of <paramref name="ctx"/> and runs every head, on <paramref name="pool"/> when given.</summary>
+    private static unsafe void RunTiled(ref TiledKvCtx ctx, float* q, float* output, int seqQ,
+                                        int numHeads, int numKvHeads, int headDim, int positionOffset,
+                                        ComputeThreadPool? pool, int? slidingWindowSize, float softCap, float[]? sinks)
+    {
+        if (sinks is not null && sinks.Length < numHeads)
+            throw new ArgumentException($"sinks must have at least numHeads ({numHeads}) entries.", nameof(sinks));
+
+        ctx.Q = q;
+        ctx.Output = output;
+        ctx.SeqQ = seqQ;
+        ctx.NumHeads = numHeads;
+        ctx.GroupSize = numHeads / numKvHeads;
+        ctx.HeadDim = headDim;
+        ctx.QStride = numHeads * headDim;
+        ctx.PositionOffset = positionOffset;
+        ctx.TileSize = ComputeTileSize(headDim);
+        ctx.SlidingWindowSize = slidingWindowSize ?? 0;
+        ctx.SoftCap = softCap;
+
+        fixed (float* sinksPtr = sinks)
+        fixed (TiledKvCtx* ctxPtr = &ctx)
+        {
+            ctx.Sinks = sinksPtr;
+            if (pool is null || numHeads < 2)
+                TiledKvWorker((nint)ctxPtr, 0, 1);
+            else
+                pool.Dispatch((nint)ctxPtr, &TiledKvWorker);
+        }
+    }
+
+    /// <summary>
+    /// One attention call over cached rows split into two segments: <c>[0, Split)</c> read through
+    /// <see cref="K0"/>/<see cref="V0"/> and <c>[Split, SeqKv)</c> through <see cref="K1"/>/<see cref="V1"/>
+    /// (quantized history + F32 recent ring, or a single paged segment with <c>Split == SeqKv</c>).
+    /// </summary>
+    private unsafe struct TiledKvCtx
     {
         public float* Q;
-        public byte* KQuant;
-        public byte* VQuant;
-        public float* KWindow;
-        public float* VWindow;
         public float* Output;
+        public KvRows K0;
+        public KvRows V0;
+        public KvRows K1;
+        public KvRows V1;
+        public int Split;
+        public int SeqKv;
         public int SeqQ;
-        public int QuantLen;
-        public int WindowLen;
         public int NumHeads;
-        public int NumKvHeads;
-        public int HeadDim;
-        public float Scale;
-        public int PositionOffset;
         public int GroupSize;
+        public int HeadDim;
         public int QStride;
-        public int KvStride;
-        public int KQuantRowBytes;
-        public int VQuantRowBytes;
+        public int PositionOffset;
         public int TileSize;
         public int SlidingWindowSize;
-        public KvCacheDType KeyDType;
-        public KvCacheDType ValueDType;
-        public int WindowCapacity;
+        public float Scale;
         /// <summary>Gemma-2/3 attention-logit soft-cap; 0 = disabled.</summary>
         public float SoftCap;
         /// <summary>Optional per-head sink logits [NumHeads] (gpt-oss). Null = no sinks.</summary>
         public float* Sinks;
+        /// <summary>
+        /// Rows with at most <see cref="OneShotMaxKeys"/> visible keys take the single-shot softmax, exactly as the contiguous
+        /// path does, so F32 paged rows reproduce it bit for bit (#530). The quantized-cache path keeps tiling every row.
+        /// </summary>
+        public bool OneShot;
     }
 
-    [SkipLocalsInit]
-    private static unsafe void QuantizedTiledAttentionWorker(nint ctxPtr, int threadIdx, int threadCount)
-    {
-        ref var ctx = ref Unsafe.AsRef<QuantizedTiledCtx>((void*)ctxPtr);
+    /// <summary>Query heads sharing one KV head that are processed together, so each cached row is decoded once for all of them.</summary>
+    private const int MaxGroupHeads = 4;
 
+    [SkipLocalsInit]
+    private static unsafe void TiledKvWorker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        ref var ctx = ref Unsafe.AsRef<TiledKvCtx>((void*)ctxPtr);
+
+        // Contiguous head ranges, as in the contiguous path: heads sharing a KV head stay on one worker.
         ComputeThreadPool.PartitionRange(ctx.NumHeads, threadIdx, threadCount, out int startHead, out int endHead);
         if (startHead >= ctx.NumHeads) return;
 
-        Span<float> tileScores = stackalloc float[MaxTileSize];
+        int scoreStride = ctx.OneShot ? OneShotMaxKeys : MaxTileSize;
+        float* scores = stackalloc float[MaxGroupHeads * scoreStride];
+        float* rowScratch = stackalloc float[ctx.HeadDim];
 
-        for (int h = startHead; h < endHead; h++)
+        for (int h = startHead; h < endHead;)
         {
-            ExecuteTiledQuantizedHead(
-                ctx.Q, ctx.KQuant, ctx.VQuant, ctx.KWindow, ctx.VWindow, ctx.Output, tileScores,
-                ctx.SeqQ, ctx.QuantLen, ctx.WindowLen, ctx.HeadDim, ctx.Scale,
-                ctx.QStride, ctx.KvStride, ctx.KQuantRowBytes, ctx.VQuantRowBytes,
-                ctx.PositionOffset, ctx.TileSize, ctx.SlidingWindowSize,
-                ctx.KeyDType, ctx.ValueDType,
-                h, h / ctx.GroupSize,
-                ctx.WindowCapacity, ctx.SoftCap,
-                ctx.Sinks is null ? float.NegativeInfinity : ctx.Sinks[h]);
+            // Run of consecutive heads on the same KV head (capped), never crossing the worker's range.
+            int groupEnd = Math.Min(endHead, (h / ctx.GroupSize + 1) * ctx.GroupSize);
+            int count = Math.Min(MaxGroupHeads, groupEnd - h);
+            ExecuteHeadGroup(ref ctx, h, count, scores, scoreStride, rowScratch);
+            h += count;
         }
     }
 
     /// <summary>
-    /// Processes a single head for quantized KV-cache attention.
-    /// Phase 1: iterate tiles over quantized region with per-tile dequant.
-    /// Phase 2: iterate tiles over full-precision window region.
-    /// Uses online softmax throughout both phases.
+    /// Processes <paramref name="count"/> consecutive query heads that share one KV head. Per query row: softmax over the
+    /// visible keys of segment 0 then segment 1 — single-shot for short rows when <see cref="TiledKvCtx.OneShot"/>, else
+    /// online, tile by tile from the row's own visible start (tile boundaries depend on the query position only, #530).
+    /// Each head's arithmetic is exactly the single-head sequence; only the K/V row decode is shared.
     /// </summary>
     [SkipLocalsInit]
-    private static unsafe void ExecuteTiledQuantizedHead(
-        float* q, byte* kQuant, byte* vQuant, float* kWindow, float* vWindow, float* output,
-        Span<float> tileScores,
-        int seqQ, int quantLen, int windowLen, int headDim, float scale,
-        int qStride, int kvStride, int kQuantRowBytes, int vQuantRowBytes,
-        int positionOffset, int tileSize, int slidingWindowSize,
-        KvCacheDType keyDType, KvCacheDType valueDType,
-        int headIdx, int kvHeadIdx,
-        int windowCapacity, float softCap,
-        float sinkLogit = float.NegativeInfinity)
+    private static unsafe void ExecuteHeadGroup(ref TiledKvCtx ctx, int firstHead, int count, float* scores, int scoreStride,
+                                                float* rowScratch)
     {
-        int seqKv = quantLen + windowLen;
-        int window = slidingWindowSize;
-        bool hasSink = !float.IsNegativeInfinity(sinkLogit);
+        int headDim = ctx.HeadDim;
+        int kvHeadIdx = firstHead / ctx.GroupSize;
+        int window = ctx.SlidingWindowSize;
+        float* maxSoFar = stackalloc float[MaxGroupHeads];
+        float* sumExp = stackalloc float[MaxGroupHeads];
 
-        // Per-tile scratch for dequantized K and V rows
-        // Budget: tileSize * headDim * sizeof(float) per buffer
-        int scratchElems = tileSize * headDim;
-        float* kScratch;
-        float* vScratch;
-        bool scratchAllocated = false;
+        for (int i = 0; i < ctx.SeqQ; i++)
+        {
+            float* q = ctx.Q + (long)i * ctx.QStride + (long)firstHead * headDim;
+            float* outRows = ctx.Output + (long)i * ctx.QStride + (long)firstHead * headDim;
+            new Span<float>(outRows, count * headDim).Clear();
 
-        int scratchBytes = scratchElems * sizeof(float);
-        if (scratchBytes <= StackAllocThreshold)
-        {
-            float* kBuf = stackalloc float[scratchElems];
-            float* vBuf = stackalloc float[scratchElems];
-            kScratch = kBuf;
-            vScratch = vBuf;
-        }
-        else
-        {
-            kScratch = (float*)NativeMemory.AlignedAlloc((nuint)scratchBytes, 64);
-            vScratch = (float*)NativeMemory.AlignedAlloc((nuint)scratchBytes, 64);
-            scratchAllocated = true;
-        }
+            int visibleEnd = Math.Min(ctx.SeqKv, ctx.PositionOffset + i + 1);
+            int visibleStart = window > 0 ? Math.Max(0, ctx.PositionOffset + i - window + 1) : 0;
+            if (visibleStart >= visibleEnd) continue;
 
-        try
-        {
-            for (int i = 0; i < seqQ; i++)
+            int split = Math.Clamp(ctx.Split, visibleStart, visibleEnd);
+            if (ctx.OneShot && visibleEnd - visibleStart <= OneShotMaxKeys)
             {
-                var qRow = new ReadOnlySpan<float>(q + i * qStride + headIdx * headDim, headDim);
-                var outRow = new Span<float>(output + i * qStride + headIdx * headDim, headDim);
-                outRow.Clear();
-
-                int visibleEnd = Math.Min(seqKv, positionOffset + i + 1);
-                int visibleStart = (window > 0)
-                    ? Math.Max(0, positionOffset + i - window + 1)
-                    : 0;
-                if (visibleStart >= visibleEnd) continue;
-
-                // Attention sink (gpt-oss): seed the online softmax as if a virtual key
-                // with logit sinkLogit (and zero value vector) had already been processed.
-                float maxSoFar = hasSink ? sinkLogit : float.NegativeInfinity;
-                float sumExp = hasSink ? 1f : 0f;
-
-                // ── Phase 1: Quantized region [visibleStart..min(quantLen, visibleEnd)) ──
-                int quantEnd = Math.Min(quantLen, visibleEnd);
-                int quantStart = Math.Max(visibleStart, 0);
-
-                for (int tileBase = quantStart; tileBase < quantEnd; tileBase += tileSize)
+                // Mirrors OneShotRow per head: score every visible key, soft-cap, softmax, then accumulate.
+                int n = visibleEnd - visibleStart;
+                int mid = split - visibleStart;
+                ScoreRows(in ctx.K0, visibleStart, split, kvHeadIdx, q, count, scores, scoreStride, rowScratch, ctx.Scale, headDim);
+                ScoreRows(in ctx.K1, split, visibleEnd, kvHeadIdx, q, count, scores + mid, scoreStride, rowScratch, ctx.Scale, headDim);
+                for (int g = 0; g < count; g++)
                 {
-                    int tileLen = Math.Min(tileSize, quantEnd - tileBase);
-                    var scores = tileScores.Slice(0, tileLen);
-
-                    // Dequantize tile of K for this head
-                    DequantTile(kQuant, tileBase, tileLen, kvStride, kQuantRowBytes,
-                                kvHeadIdx, headDim, keyDType, kScratch);
-
-                    // Compute scores: dot(qRow, kScratch[j*headDim .. (j+1)*headDim]) * scale
-                    for (int j = 0; j < tileLen; j++)
-                    {
-                        var kRow = new ReadOnlySpan<float>(kScratch + j * headDim, headDim);
-                        scores[j] = TensorPrimitives.Dot(qRow, kRow) * scale;
-                    }
-
-                    // Gemma 2/3 soft-cap on raw scores, before the running max (same placement as TiledRow).
-                    if (softCap > 0f)
-                        ApplySoftCap(scores, softCap);
-
-                    // Online softmax update
-                    float tileMax = TensorPrimitives.Max(scores);
-                    float newMax = MathF.Max(maxSoFar, tileMax);
-                    float correction = FastMath.FastExp(maxSoFar - newMax);
-
-                    if (correction < 1f)
-                    {
-                        sumExp *= correction;
-                        TensorPrimitives.Multiply(outRow, correction, outRow);
-                    }
-
-                    sumExp += FastMath.ExpSumAndStore(scores, scores, -newMax);
-
-                    // Dequantize tile of V for this head and accumulate
-                    DequantTile(vQuant, tileBase, tileLen, kvStride, vQuantRowBytes,
-                                kvHeadIdx, headDim, valueDType, vScratch);
-
-                    for (int j = 0; j < tileLen; j++)
-                    {
-                        float w = scores[j];
-                        if (w == 0f) continue;
-                        var vRow = new ReadOnlySpan<float>(vScratch + j * headDim, headDim);
-                        TensorPrimitives.MultiplyAdd(vRow, w, outRow, outRow);
-                    }
-
-                    maxSoFar = newMax;
+                    var row = new Span<float>(scores + g * scoreStride, n);
+                    if (ctx.SoftCap > 0f)
+                        ApplySoftCap(row, ctx.SoftCap);
+                    float sink = ctx.Sinks is null ? float.NegativeInfinity : ctx.Sinks[firstHead + g];
+                    if (!float.IsNegativeInfinity(sink))
+                        SoftmaxRowWithSink(row, sink);
+                    else
+                        Softmax.ExecuteFast(row, row);
                 }
 
-                // ── Phase 2: Window region [max(quantLen, visibleStart)..visibleEnd) ──
-                int windowStart = Math.Max(quantLen, visibleStart);
-                for (int tileBase = windowStart; tileBase < visibleEnd; tileBase += tileSize)
+                AccumulateRows(in ctx.V0, visibleStart, split, kvHeadIdx, scores, scoreStride, count, outRows, rowScratch, headDim);
+                AccumulateRows(in ctx.V1, split, visibleEnd, kvHeadIdx, scores + mid, scoreStride, count, outRows, rowScratch, headDim);
+                continue;
+            }
+
+            // Attention sink (gpt-oss): seed the online softmax as if a virtual key
+            // with logit sinkLogit (and zero value vector) had already been processed.
+            for (int g = 0; g < count; g++)
+            {
+                float sink = ctx.Sinks is null ? float.NegativeInfinity : ctx.Sinks[firstHead + g];
+                bool hasSink = !float.IsNegativeInfinity(sink);
+                maxSoFar[g] = hasSink ? sink : float.NegativeInfinity;
+                sumExp[g] = hasSink ? 1f : 0f;
+            }
+
+            AttendSegment(in ctx.K0, in ctx.V0, visibleStart, split, kvHeadIdx, q, outRows, count,
+                          scores, scoreStride, rowScratch, ref ctx, maxSoFar, sumExp);
+            AttendSegment(in ctx.K1, in ctx.V1, split, visibleEnd, kvHeadIdx, q, outRows, count,
+                          scores, scoreStride, rowScratch, ref ctx, maxSoFar, sumExp);
+
+            for (int g = 0; g < count; g++)
+            {
+                if (sumExp[g] > 0f)
                 {
-                    int tileLen = Math.Min(tileSize, visibleEnd - tileBase);
-                    var scores = tileScores.Slice(0, tileLen);
-
-                    for (int j = 0; j < tileLen; j++)
-                    {
-                        // Map logical position to ring buffer index
-                        int ringIdx = (tileBase + j) % windowCapacity;
-                        var kRow = new ReadOnlySpan<float>(
-                            kWindow + ringIdx * kvStride + kvHeadIdx * headDim, headDim);
-                        scores[j] = TensorPrimitives.Dot(qRow, kRow) * scale;
-                    }
-
-                    if (softCap > 0f)
-                        ApplySoftCap(scores, softCap);
-
-                    float tileMax = TensorPrimitives.Max(scores);
-                    float newMax = MathF.Max(maxSoFar, tileMax);
-                    float correction = FastMath.FastExp(maxSoFar - newMax);
-
-                    if (correction < 1f)
-                    {
-                        sumExp *= correction;
-                        TensorPrimitives.Multiply(outRow, correction, outRow);
-                    }
-
-                    sumExp += FastMath.ExpSumAndStore(scores, scores, -newMax);
-
-                    for (int j = 0; j < tileLen; j++)
-                    {
-                        float w = scores[j];
-                        if (w == 0f) continue;
-                        int ringIdx = (tileBase + j) % windowCapacity;
-                        var vRow = new ReadOnlySpan<float>(
-                            vWindow + ringIdx * kvStride + kvHeadIdx * headDim, headDim);
-                        TensorPrimitives.MultiplyAdd(vRow, w, outRow, outRow);
-                    }
-
-                    maxSoFar = newMax;
+                    var outRow = new Span<float>(outRows + g * headDim, headDim);
+                    TensorPrimitives.Multiply(outRow, 1f / sumExp[g], outRow);
                 }
-
-                if (sumExp > 0f)
-                    TensorPrimitives.Multiply(outRow, 1f / sumExp, outRow);
             }
         }
-        finally
+    }
+
+    /// <summary>Online-softmax accumulation of keys <c>[start, end)</c> of one segment, for each head of the group.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void AttendSegment(in KvRows k, in KvRows v, int start, int end, int kvHeadIdx,
+                                             float* q, float* outRows, int count, float* scores, int scoreStride,
+                                             float* rowScratch, ref TiledKvCtx ctx, float* maxSoFar, float* sumExp)
+    {
+        int headDim = ctx.HeadDim;
+        int tileSize = ctx.TileSize;
+        float softCap = ctx.SoftCap;
+
+        for (int tileBase = start; tileBase < end; tileBase += tileSize)
         {
-            if (scratchAllocated)
+            int tileLen = Math.Min(tileSize, end - tileBase);
+
+            ScoreRows(in k, tileBase, tileBase + tileLen, kvHeadIdx, q, count, scores, scoreStride, rowScratch, ctx.Scale, headDim);
+
+            for (int g = 0; g < count; g++)
             {
-                NativeMemory.AlignedFree(kScratch);
-                NativeMemory.AlignedFree(vScratch);
+                var tile = new Span<float>(scores + g * scoreStride, tileLen);
+                var outRow = new Span<float>(outRows + g * headDim, headDim);
+
+                // Gemma 2/3 soft-cap on raw scores, before the running max (same placement as TiledRow).
+                if (softCap > 0f)
+                    ApplySoftCap(tile, softCap);
+
+                // Online softmax update
+                float tileMax = TensorPrimitives.Max(tile);
+                float newMax = MathF.Max(maxSoFar[g], tileMax);
+                float correction = FastMath.FastExp(maxSoFar[g] - newMax);
+
+                if (correction < 1f)
+                {
+                    sumExp[g] *= correction;
+                    TensorPrimitives.Multiply(outRow, correction, outRow);
+                }
+
+                sumExp[g] += FastMath.ExpSumAndStore(tile, tile, -newMax);
+                maxSoFar[g] = newMax;
+            }
+
+            AccumulateRows(in v, tileBase, tileBase + tileLen, kvHeadIdx, scores, scoreStride, count, outRows, rowScratch, headDim);
+        }
+    }
+
+    /// <summary>
+    /// <c>scores[g * scoreStride + j] = dot(q_g, K[start + j]) * scale</c> for keys <c>[start, end)</c> and each of the
+    /// <paramref name="count"/> heads; each K row is decoded once and paged blocks are resolved once per run.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void ScoreRows(in KvRows k, int start, int end, int kvHeadIdx, float* q, int count,
+                                         float* scores, int scoreStride, float* rowScratch, float scale, int headDim)
+    {
+        long headOffset = (long)kvHeadIdx * k.HeadBytes;
+        int rowBytes = k.RowBytes;
+        KvRowFormat format = k.Format;
+        for (int j = 0, n = end - start; j < n;)
+        {
+            byte* row = k.Run(start + j, n - j, out int run) + headOffset;
+            for (int r = 0; r < run; r++, j++, row += rowBytes)
+            {
+                var kRow = new ReadOnlySpan<float>(LoadHeadRow(row, format, headDim, rowScratch), headDim);
+                for (int g = 0; g < count; g++)
+                    scores[g * scoreStride + j] = TensorPrimitives.Dot(new ReadOnlySpan<float>(q + g * headDim, headDim), kRow) * scale;
             }
         }
     }
 
     /// <summary>
-    /// Dequantizes a tile of KV data (Q8_0 or Q4_0) for a specific head into the scratch buffer.
-    /// Output layout: <c>[tileLen, headDim]</c> contiguous floats.
+    /// <c>out_g += weights[g * weightStride + j] * V[start + j]</c> for values <c>[start, end)</c> and each head, skipping
+    /// zero weights; a V row is decoded once, and only when some head weights it.
     /// </summary>
-    [SkipLocalsInit]
-    private static unsafe void DequantTile(byte* quantData, int tileBase, int tileLen,
-                                            int kvStride, int quantRowBytes,
-                                            int kvHeadIdx, int headDim,
-                                            KvCacheDType dtype, float* scratch)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void AccumulateRows(in KvRows v, int start, int end, int kvHeadIdx, float* weights, int weightStride,
+                                              int count, float* outRows, float* rowScratch, int headDim)
     {
-        int headOffset = kvHeadIdx * headDim;
-
-        if (dtype == KvCacheDType.Q8_0)
+        long headOffset = (long)kvHeadIdx * v.HeadBytes;
+        int rowBytes = v.RowBytes;
+        KvRowFormat format = v.Format;
+        for (int j = 0, n = end - start; j < n;)
         {
-            int blockSize = 32;
-            int blockBytes = 34;
-            // Offset within a quantized row to reach the start of this head's data
-            int headBlockStart = headOffset / blockSize;
-            int headBlocks = headDim / blockSize;
-            int headQuantOffset = headBlockStart * blockBytes;
-
-            for (int j = 0; j < tileLen; j++)
+            byte* row = v.Run(start + j, n - j, out int run) + headOffset;
+            for (int r = 0; r < run; r++, j++, row += rowBytes)
             {
-                byte* rowStart = quantData + (long)(tileBase + j) * quantRowBytes + headQuantOffset;
-                float* dst = scratch + j * headDim;
-                KvQuantize.Q8_0ToF32(rowStart, dst, headDim);
-            }
-        }
-        else // Q4_0
-        {
-            int blockSize = 32;
-            int blockBytes = 18;
-            int headBlockStart = headOffset / blockSize;
-            int headBlocks = headDim / blockSize;
-            int headQuantOffset = headBlockStart * blockBytes;
-
-            for (int j = 0; j < tileLen; j++)
-            {
-                byte* rowStart = quantData + (long)(tileBase + j) * quantRowBytes + headQuantOffset;
-                float* dst = scratch + j * headDim;
-                KvQuantize.Q4_0ToF32(rowStart, dst, headDim);
+                float* vRow = null;
+                for (int g = 0; g < count; g++)
+                {
+                    float w = weights[g * weightStride + j];
+                    if (w == 0f) continue;
+                    vRow = vRow != null ? vRow : LoadHeadRow(row, format, headDim, rowScratch);
+                    var outRow = new Span<float>(outRows + g * headDim, headDim);
+                    TensorPrimitives.MultiplyAdd(new ReadOnlySpan<float>(vRow, headDim), w, outRow, outRow);
+                }
             }
         }
     }

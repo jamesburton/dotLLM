@@ -24,6 +24,16 @@ namespace DotLLM.Server;
 public static class ServerStartup
 {
     /// <summary>
+    /// Whether a q8_0 KV request can use Q8_0 paged blocks: both K and V q8_0 (no mixed-precision window), a uniform
+    /// non-hybrid model, and a head dim on whole Q8_0 blocks. Otherwise the quantized simple cache serves it.
+    /// </summary>
+    internal static bool IsPagedQ8Eligible(KvCacheConfig kvConfig, ModelConfig config, IModel? model)
+        => kvConfig.KeyDType == KvCacheDType.Q8_0 && kvConfig.ValueDType == KvCacheDType.Q8_0
+           && kvConfig.MixedPrecisionWindowSize == 0 && config.HeadDim % 32 == 0
+           && !IsHybridOrRecurrentCpuModel(config, model)
+           && DotLLM.Core.Attention.KvGeometry.FromConfig(config).IsUniform;
+
+    /// <summary>
     /// True for CPU hybrid/recurrent models (GDN, SSM or hybrid layer layout, or one of the known hybrid model classes) that must
     /// NOT get the generic paged KV pool: it is sized for <c>NumLayers x MaxSequenceLength</c> although only the attention layers
     /// hold KV, so e.g. Bonsai-2-27B (64 layers, 16 KV layers, 262144 ctx) died at startup with "Insufficient memory" (#760).
@@ -550,18 +560,20 @@ public static class ServerStartup
             // every request.
             Console.WriteLine("[dotllm] Paged KV-cache does not support models with per-layer KV widths (Gemma-4, MiMo-V2); using the simple KV-cache.");
         }
-        else if (options.UsePaged && !kvConfig.IsQuantized)
+        else if (options.UsePaged && (!kvConfig.IsQuantized || IsPagedQ8Eligible(kvConfig, config, model)))
         {
+            // Blocks are F16 by default; q8_0 K and V select Q8_0 blocks (#1268, #1142 C4). Attention reads them in place.
+            var blockType = kvConfig.IsQuantized ? DotLLM.Core.Tensors.DType.Q8_0 : DotLLM.Core.Tensors.DType.Float16;
             pagedFactory = new PagedKvCacheFactory(
-                config.NumLayers, config.NumKvHeads, config.HeadDim);
+                config.NumLayers, config.NumKvHeads, config.HeadDim, elementType: blockType);
             kvFactory = (cfg, size) => pagedFactory.Create(size);
             // Cross-request prefix cache (Step 37). Enabled in tandem with paged.
             prefixTrieManager = new PrefixTrieManager(pagedFactory);
-            Console.WriteLine("[dotllm] Using paged KV-cache (block-based allocation) with cross-request prefix cache");
+            Console.WriteLine($"[dotllm] Using paged KV-cache ({blockType} blocks) with cross-request prefix cache");
         }
         else if (options.UsePaged && kvConfig.IsQuantized)
         {
-            Console.WriteLine("[dotllm] Paged KV-cache does not support quantization yet, using quantized simple cache.");
+            Console.WriteLine("[dotllm] Paged KV-cache supports q8_0 K+V only (uniform, non-hybrid models, no mixed-precision window); using quantized simple cache.");
             kvFactory = (cfg, size) => new QuantizedKvCache(
                 DotLLM.Core.Attention.KvGeometry.FromConfig(cfg, model?.SupportsCompactSlidingKv == true), size,
                 kvConfig.KeyDType, kvConfig.ValueDType, kvConfig.MixedPrecisionWindowSize);
