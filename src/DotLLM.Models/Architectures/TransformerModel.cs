@@ -97,6 +97,9 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     // GELUTanh; every other dense architecture keeps SwiGLU.
     private readonly bool _useGeGLU;
 
+    // True when ForwardBatch may run the matmul-fused packed loop (see CanUsePackedBatch).
+    private readonly bool _canUsePackedBatch;
+
     /// <inheritdoc/>
     public ModelConfig Config { get; }
 
@@ -146,6 +149,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         _residualScale = config.ResidualScale ?? 1.0f;
         _logitScale = config.LogitScale ?? 1.0f;
         _useGeGLU = config.ActivationFunction == ActivationFunction.GELUTanh;
+        _canUsePackedBatch = CanUsePackedBatch(config, weights);
     }
 
     /// <summary>
@@ -3163,12 +3167,12 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         _state.EnsureCapacity(totalTokens);
 
         // Partition into simple (matmul-fused) vs complex (per-seq fallback)
-        // subgroups. The model-level "has complex layer" check is one-shot — if
-        // ANY layer is MLA or MoE, the batched path can't fuse safely (the per-
-        // layer branch executes for every sequence in the batch, so even a
-        // simple-looking sequence would hit the MLA/MoE branch). LoRA adapters
-        // are per-sequence, so each request is judged individually.
-        bool modelHasComplexLayer = ModelHasMlaOrMoeLayer();
+        // subgroups. The model-level capability is fixed at construction: if ANY
+        // layer uses a feature the packed loop lacks (CanUsePackedBatch), every
+        // sequence takes the per-seq core. The diagnostic post-embedding hook is
+        // settable at runtime, so it is checked per call. LoRA adapters are
+        // per-sequence, so each request is judged individually.
+        bool modelHasComplexLayer = !_canUsePackedBatch || Gemma4PostEmbeddingHook is not null;
         Span<int> simpleIdxs = requests.Count <= 256
             ? stackalloc int[requests.Count]
             : new int[requests.Count];
@@ -3298,21 +3302,44 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     }
 
     /// <summary>
-    /// Returns true when any layer of this model uses MLA (DeepSeek-V2/V3) or
-    /// MoE (Mixtral / Qwen-MoE / DeepSeek-V2/V3). Such layers carry per-layer
-    /// kernels that aren't trivially batchable across sequences in the Phase 5b
-    /// matmul-fused path, so the entire batch falls back to per-seq when this
-    /// returns true.
+    /// Capability check for the Phase 5b matmul-fused batch path: false when the model
+    /// uses any feature the packed <see cref="RunLayersAndFinalNormBatched"/> loop does not
+    /// implement, in which case the entire batch falls back to the per-sequence core.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private bool ModelHasMlaOrMoeLayer()
+    /// <param name="config">The model configuration.</param>
+    /// <param name="weights">The loaded model weights.</param>
+    /// <returns>
+    /// <see langword="true"/> when every layer is one the packed loop computes exactly as
+    /// <see cref="RunLayersAndFinalNormCore"/> does; otherwise <see langword="false"/>.
+    /// </returns>
+    /// <remarks>
+    /// The packed loop implements only the shared dense GQA layer: pre/post norms, biases,
+    /// QK-norm, RoPE (incl. NoPE layers and per-layer tables), attention temperature,
+    /// per-layer sliding window, attention soft-cap, Granite residual/logit scales and
+    /// SwiGLU/GeGLU. Any feature the per-sequence core adds on top of that must be rejected
+    /// here, or batched logits silently diverge from per-sequence ones (#1264).
+    /// </remarks>
+    private static bool CanUsePackedBatch(ModelConfig config, TransformerWeights weights)
     {
-        var layers = _weights.Layers;
-        for (int i = 0; i < layers.Length; i++)
+        if (config.HasDistinctValueHeadDim                                 // MiMo-V2 padded V heads
+            || config.AttentionValueScale is not null                      // MiMo-V2 attention_value_scale
+            || config.ActivationFunction == ActivationFunction.ReluSquared // BitNet ReLU²
+            || config.Gemma3n is not null                                  // AltUp stream stack
+            || config.DiffusionConfig is not null                          // diffusion region embedding
+            || config.NumSharedKvLayers > 0                                // Gemma 4 shared-KV layers
+            || weights.PerLayerEmbedding is not null)                      // Gemma 4 per-layer embeddings
+            return false;
+
+        foreach (ref readonly var lw in weights.Layers.AsSpan())
         {
-            if (layers[i].Mla is not null || layers[i].Moe is not null) return true;
+            if (lw.Mla is not null || lw.Moe is not null
+                || lw.Gemma4 is not null || lw.Gemma3n is not null
+                || lw.AttnSubNormWeight is not null || lw.FfnSubNormWeight is not null // BitNet Sub-LN
+                || lw.AttnSinks is not null)                                           // gpt-oss sinks
+                return false;
         }
-        return false;
+
+        return true;
     }
 
     /// <summary>

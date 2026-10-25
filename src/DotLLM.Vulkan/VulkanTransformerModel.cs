@@ -3596,18 +3596,27 @@ public sealed partial class VulkanTransformerModel : IModel
         // attention/final soft-caps, query_pre_attn_scalar) are implemented ONLY in the
         // per-sequence Forward; the fused batched layer loop below is plain SwiGLU/Llama and would
         // silently produce wrong logits for them. Route those models through the per-seq path.
+        // Likewise (#1264): OLMo 2 post-norm-only, gpt-oss YaRN RoPE, MiMo-V2 value-head
+        // compaction / attention_value_scale, attention sinks, Gemma 4 layers and the diffusion
+        // region embedding exist only in the per-sequence Forward.
         bool modelHasMlaOrMoe = _geglu is not null
             || _embedScale is not null
+            || _postNormOnly
+            || _gptOss is not null
             || Config.AttnLogitSoftcap is not null
             || Config.FinalLogitSoftcap is not null
             || Config.QueryPreAttnScalar is not null
             || Config.HasGraniteScalars
-            || Config.IsGemma4DensePle;
+            || Config.IsGemma4DensePle
+            || Config.HasDistinctValueHeadDim
+            || Config.AttentionValueScale is not null
+            || Config.DiffusionConfig is not null;
         for (int layer = 0; layer < Config.NumLayers && !modelHasMlaOrMoe; layer++)
         {
             ref readonly var lw = ref _weights.Layers[layer];
-            if (lw.Mla is not null || lw.Moe is not null
-                || lw.PostAttnNormWeight is not null || lw.PostFfnNormWeight is not null)
+            if (lw.Mla is not null || lw.Moe is not null || lw.Gemma4 is not null
+                || lw.PostAttnNormWeight is not null || lw.PostFfnNormWeight is not null
+                || lw.AttnSinks is not null)
                 modelHasMlaOrMoe = true;
         }
 
@@ -3617,9 +3626,11 @@ public sealed partial class VulkanTransformerModel : IModel
         for (int i = 0; i < requests.Count; i++)
         {
             var r = requests[i];
+            // A compact sliding-window cache (#1176) stores rows relative to a per-layer base and may
+            // need growing first; the batched KV scatter writes absolute rows, so it takes the per-seq path.
             bool simple = !modelHasMlaOrMoe
                        && r.Adapter is null
-                       && r.KvCache is VulkanKvCache { Storage: VulkanKvStorage.F32 };
+                       && r.KvCache is VulkanKvCache { Storage: VulkanKvStorage.F32, HasCompactWindows: false };
             (simple ? simpleIdx : complexIdx).Add(i);
         }
 
