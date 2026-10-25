@@ -1211,4 +1211,178 @@ public sealed class TransformerModelForwardBatchTests : IDisposable
             throw;
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // #1264 — per-sequence-only features must keep ForwardBatch on the per-seq core
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private const int G4Hidden = 32;
+    private const int G4Heads = 4;
+    private const int G4KvHeads = 2;   // GQA group 2: a broadcast mix-up is visible
+    private const int G4HeadDim = 8;
+    private const int G4ValueHeadDim = 4;
+    private const int G4Vocab = 16;
+    private const int G4Inter = 48;
+    private const int G4Layers = 2;
+    private const int G4MaxSeq = 32;
+
+    /// <summary>Feature enabled on the #1264 fixture; each is implemented only by the per-sequence forward.</summary>
+    public enum PerSeqOnlyFeature
+    {
+        /// <summary>No extra feature: the packed loop runs and must already be batch-exact.</summary>
+        Baseline,
+
+        /// <summary>BitNet squared-ReLU gate activation.</summary>
+        Relu2,
+
+        /// <summary>BitNet FFN Sub-LN before down_proj.</summary>
+        FfnSubNorm,
+
+        /// <summary>BitNet attention Sub-LN before o_proj.</summary>
+        AttnSubNorm,
+
+        /// <summary>MiMo-V2 attention_value_scale.</summary>
+        ValueScale,
+
+        /// <summary>MiMo-V2 V head dim smaller than the K head dim.</summary>
+        DistinctValueHeadDim,
+
+        /// <summary>gpt-oss per-head attention sinks.</summary>
+        AttnSinks,
+    }
+
+    /// <summary>
+    /// Each variant enables one feature the per-sequence forward implements but the packed
+    /// matmul-fused loop does not. ForwardBatch must route such a model to the per-seq core,
+    /// so its logits equal per-sequence Forward bit-for-bit. Before #1264 the packed loop ran
+    /// and silently dropped the feature. <see cref="PerSeqOnlyFeature.Baseline"/> proves the fixture itself is batch-exact.
+    /// </summary>
+    /// <param name="variant">The feature to enable on the synthetic F32 GQA fixture.</param>
+    [Theory]
+    [InlineData(PerSeqOnlyFeature.Baseline)]
+    [InlineData(PerSeqOnlyFeature.Relu2)]
+    [InlineData(PerSeqOnlyFeature.FfnSubNorm)]
+    [InlineData(PerSeqOnlyFeature.AttnSubNorm)]
+    [InlineData(PerSeqOnlyFeature.ValueScale)]
+    [InlineData(PerSeqOnlyFeature.DistinctValueHeadDim)]
+    [InlineData(PerSeqOnlyFeature.AttnSinks)]
+    public unsafe void ForwardBatch_PerSeqOnlyFeature_MatchesPerSeqForward(PerSeqOnlyFeature variant)
+    {
+        var allocs = new List<nint>();
+        try
+        {
+            var rng = new Random(1264);
+            nint Alloc(int count, float amplitude)
+            {
+                nint p = (nint)System.Runtime.InteropServices.NativeMemory.AlignedAlloc((nuint)(count * sizeof(float)), 64);
+                allocs.Add(p);
+                for (int i = 0; i < count; i++) ((float*)p)[i] = ((float)rng.NextDouble() * 2f - 1f) * amplitude;
+                return p;
+            }
+            float[] Vec(int count, float center, float jitter)
+            {
+                var a = new float[count];
+                for (int i = 0; i < count; i++) a[i] = center + ((float)rng.NextDouble() * 2f - 1f) * jitter;
+                return a;
+            }
+
+            int vHeadDim = variant == PerSeqOnlyFeature.DistinctValueHeadDim ? G4ValueHeadDim : G4HeadDim;
+            var cfg = new ModelConfig
+            {
+                Architecture = Architecture.Llama,
+                VocabSize = G4Vocab,
+                HiddenSize = G4Hidden,
+                IntermediateSize = G4Inter,
+                NumLayers = G4Layers,
+                NumAttentionHeads = G4Heads,
+                NumKvHeads = G4KvHeads,
+                HeadDim = G4HeadDim,
+                MaxSequenceLength = G4MaxSeq,
+                NormEpsilon = 1e-5f,
+                RoPEConfig = new RoPEConfig(Theta: 10000f, DimensionCount: G4HeadDim, Type: RoPEType.Norm),
+                ActivationFunction = variant == PerSeqOnlyFeature.Relu2 ? ActivationFunction.ReluSquared : ActivationFunction.SiLU,
+                AttentionValueScale = variant == PerSeqOnlyFeature.ValueScale ? 0.5f : null,
+                ValueHeadDim = variant == PerSeqOnlyFeature.DistinctValueHeadDim ? G4ValueHeadDim : null,
+            };
+
+            int qOut = G4Heads * G4HeadDim;
+            int kvOut = G4KvHeads * G4HeadDim;
+            int vOut = G4KvHeads * vHeadDim;
+            int oIn = G4Heads * vHeadDim;
+            var layers = new TransformerLayerWeights[G4Layers];
+            for (int i = 0; i < G4Layers; i++)
+            {
+                layers[i] = new TransformerLayerWeights(
+                    attnNormWeight: Vec(G4Hidden, 1f, 0.05f),
+                    qWeight: Alloc(qOut * G4Hidden, 0.3f), qQuantType: QuantizationType.F32, qOutputDim: qOut, qInputDim: G4Hidden,
+                    kWeight: Alloc(kvOut * G4Hidden, 0.3f), kQuantType: QuantizationType.F32, kOutputDim: kvOut, kInputDim: G4Hidden,
+                    vWeight: Alloc(vOut * G4Hidden, 0.3f), vQuantType: QuantizationType.F32, vOutputDim: vOut, vInputDim: G4Hidden,
+                    oWeight: Alloc(G4Hidden * oIn, 0.3f), oQuantType: QuantizationType.F32, oOutputDim: G4Hidden, oInputDim: oIn,
+                    ffnNormWeight: Vec(G4Hidden, 1f, 0.05f),
+                    gateWeight: Alloc(G4Inter * G4Hidden, 0.3f), gateQuantType: QuantizationType.F32, gateOutputDim: G4Inter, gateInputDim: G4Hidden,
+                    upWeight: Alloc(G4Inter * G4Hidden, 0.3f), upQuantType: QuantizationType.F32, upOutputDim: G4Inter, upInputDim: G4Hidden,
+                    downWeight: Alloc(G4Hidden * G4Inter, 0.3f), downQuantType: QuantizationType.F32, downOutputDim: G4Hidden, downInputDim: G4Inter,
+                    attnSubNormWeight: variant == PerSeqOnlyFeature.AttnSubNorm ? Vec(oIn, 1f, 0.5f) : null,
+                    ffnSubNormWeight: variant == PerSeqOnlyFeature.FfnSubNorm ? Vec(G4Inter, 1f, 0.5f) : null,
+                    attnSinks: variant == PerSeqOnlyFeature.AttnSinks ? Vec(G4Heads, 0f, 2f) : null);
+            }
+
+            using var weights = TransformerWeights.CreateFromSafetensors(
+                tokenEmbedWeight: Alloc(G4Vocab * G4Hidden, 1f), tokenEmbedQt: QuantizationType.F32,
+                vocabSize: G4Vocab, hiddenSize: G4Hidden,
+                layers: layers,
+                outputNormWeight: Vec(G4Hidden, 1f, 0.05f),
+                outputWeight: Alloc(G4Vocab * G4Hidden, 0.3f), outputQt: QuantizationType.F32,
+                outputM: G4Vocab, outputK: G4Hidden,
+                ownedAllocations: new List<nint>());
+            using var model = TransformerModel.BuildFromPrebuiltWeights(weights, cfg);
+
+            // Mixed prefill lengths so attention spans several keys per query.
+            int[][] tokenSets = [[3], [1, 7, 4], [9, 2], [5, 11, 0, 14]];
+            SimpleKvCache NewCache() => new(cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, cfg.MaxSequenceLength);
+
+            var refLogits = new float[tokenSets.Length][];
+            for (int i = 0; i < tokenSets.Length; i++)
+            {
+                using var kv = NewCache();
+                using ITensor logits = model.Forward(tokenSets[i], Enumerable.Range(0, tokenSets[i].Length).ToArray(), deviceId: -1, kv);
+                refLogits[i] = CopyLogits(logits);
+            }
+
+            var caches = new SimpleKvCache[tokenSets.Length];
+            try
+            {
+                var requests = new SequenceForwardRequest[tokenSets.Length];
+                for (int i = 0; i < tokenSets.Length; i++)
+                {
+                    caches[i] = NewCache();
+                    requests[i] = new SequenceForwardRequest
+                    {
+                        TokenIds = tokenSets[i],
+                        Positions = Enumerable.Range(0, tokenSets[i].Length).ToArray(),
+                        KvCache = caches[i],
+                    };
+                }
+
+                var results = model.ForwardBatch(requests, deviceId: -1);
+                try
+                {
+                    for (int i = 0; i < tokenSets.Length; i++)
+                        AssertBitEqual(refLogits[i], CopyLogits(results[i]), $"[#1264/{variant}/seq{i}]");
+                }
+                finally
+                {
+                    foreach (var t in results) t.Dispose();
+                }
+            }
+            finally
+            {
+                foreach (var kv in caches) kv?.Dispose();
+            }
+        }
+        finally
+        {
+            foreach (nint p in allocs) System.Runtime.InteropServices.NativeMemory.AlignedFree((void*)p);
+        }
+    }
 }
