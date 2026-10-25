@@ -456,8 +456,9 @@ public interface IModel : IDisposable
     /// principal continuous-batching throughput win.</para>
     /// <para>The returned tensors follow the same shape contract as <c>Forward</c>: each entry
     /// is <c>[N_i, vocab_size]</c> where <c>N_i</c> matches that request's token count (CPU
-    /// model) or <c>[1, vocab_size]</c> for the last token only (GPU/hybrid). The caller is
-    /// responsible for disposing each returned tensor.</para>
+    /// model) or <c>[1, vocab_size]</c> for the last token only (GPU/hybrid, or any model honouring
+    /// <see cref="SequenceForwardRequest.LastTokenLogitsOnly"/>). The caller is responsible for
+    /// disposing each returned tensor.</para>
     /// </remarks>
     /// <param name="requests">One entry per active sequence. Order is preserved in the result.</param>
     /// <param name="deviceId">Target device for computation.</param>
@@ -471,7 +472,9 @@ public interface IModel : IDisposable
         for (int i = 0; i < requests.Count; i++)
         {
             var r = requests[i];
-            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.Adapter);
+            results[i] = r.LastTokenLogitsOnly
+                ? Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.Adapter, mtpState: null, lastTokenLogitsOnly: true)
+                : Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.Adapter);
         }
         return results;
     }

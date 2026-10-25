@@ -678,6 +678,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                 MambaState = seq.RecurrentState as IMambaState,
                 GdnState = seq.RecurrentState as IGdnState,
                 SsmState = seq.RecurrentState as ISsmState,
+                LastTokenLogitsOnly = true,   // only the last row is read (or none): skip the full-row LM head (#1267)
             });
         }
 
@@ -1002,6 +1003,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             MambaState = seq.RecurrentState as IMambaState,
             GdnState = seq.RecurrentState as IGdnState,
             SsmState = seq.RecurrentState as ISsmState,
+            LastTokenLogitsOnly = true,   // only the last row is read (or none): skip the full-row LM head (#1267)
         };
         var results = _model.ForwardBatch(new[] { request }, deviceId: -1);
         foreach (var r in results) r.Dispose();
@@ -1060,6 +1062,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                 MambaState = p.Seq.RecurrentState as IMambaState,
                 GdnState = p.Seq.RecurrentState as IGdnState,
                 SsmState = p.Seq.RecurrentState as ISsmState,
+                LastTokenLogitsOnly = true,   // only the last row is read (or none): skip the full-row LM head (#1267)
             });
             off += p.ForwardLen;
         }
@@ -1309,6 +1312,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                     MambaState = seq.RecurrentState as IMambaState,
                     GdnState = seq.RecurrentState as IGdnState,
                     SsmState = seq.RecurrentState as ISsmState,
+                    LastTokenLogitsOnly = true,   // only the last row is read (or none): skip the full-row LM head (#1267)
                 };
                 var res = _model.ForwardBatch(new[] { req }, deviceId: -1);
                 res[0].Dispose();
