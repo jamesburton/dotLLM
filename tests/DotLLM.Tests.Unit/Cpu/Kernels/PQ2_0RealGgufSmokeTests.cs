@@ -2,6 +2,7 @@ using DotLLM.Core.Configuration;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Models.Gguf;
 using Xunit;
+using DotLLM.Tests.Integration.Fixtures;
 
 namespace DotLLM.Tests.Unit.Cpu.Kernels;
 
@@ -14,8 +15,7 @@ namespace DotLLM.Tests.Unit.Cpu.Kernels;
 /// <para>Gated on a local fixture: the file is ~7.2GB and lives outside this repo/branch
 /// (currently on a sibling worktree used for unrelated ML-training work, not part of any
 /// git history here). Set <c>DOTLLM_BONSAI_PQ2_0_GGUF</c> to the file path, or place it under
-/// <c>~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/</c> or
-/// <c>~/.dotllm/test-cache/prism-ml/Ternary-Bonsai-2-27B-gguf/</c>, to run this test.</para>
+/// <c>~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/</c>, to run this test.</para>
 /// </summary>
 public sealed class PQ2_0RealGgufSmokeTests
 {
@@ -28,7 +28,7 @@ public sealed class PQ2_0RealGgufSmokeTests
         string? path = ResolveFixturePath();
         Skip.If(path is null,
             $"Bonsai PQ2_0 GGUF fixture not found. Set {ModelPathEnvVar}, or place {FileName} under "
-            + "~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/ or ~/.dotllm/test-cache/prism-ml/Ternary-Bonsai-2-27B-gguf/.");
+            + "~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/.");
 
         using var gguf = GgufFile.Open(path!);
 
@@ -60,22 +60,5 @@ public sealed class PQ2_0RealGgufSmokeTests
         Assert.True(maxAbs < 10f, $"'{tensor.Name}' max abs value {maxAbs} implausible for a ternary*scale tensor.");
     }
 
-    private static string? ResolveFixturePath()
-    {
-        string? envPath = Environment.GetEnvironmentVariable(ModelPathEnvVar);
-        if (!string.IsNullOrWhiteSpace(envPath) && File.Exists(envPath))
-            return envPath;
-
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string[] candidates =
-        [
-            Path.Combine(home, ".dotllm", "models", "prism-ml", "Ternary-Bonsai-2-27B-gguf", FileName),
-            Path.Combine(home, ".dotllm", "test-cache", "prism-ml", "Ternary-Bonsai-2-27B-gguf", FileName),
-        ];
-        foreach (string candidate in candidates)
-            if (File.Exists(candidate))
-                return candidate;
-
-        return null;
-    }
+    private static string? ResolveFixturePath() => KnownTestFixtures.TernaryBonsai27B_Q2_0.Path;
 }

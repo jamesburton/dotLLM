@@ -43,9 +43,7 @@ public sealed class TinyLlamaLoraForwardBenchmarkTests
     private const string ConventionalAdapterPath = "C:/temp/dotllm-tinyllama-lora";
     private const long MaxAdapterBytes = 512L * 1024 * 1024;
 
-    private static readonly string CacheDir = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-        ".dotllm", "test-cache");
+    private static readonly string CacheDir = DotLLM.Tests.Integration.Fixtures.TestModelDownloader.CacheDirectory;
 
     private readonly ITestOutputHelper _output;
 
@@ -161,7 +159,7 @@ public sealed class TinyLlamaLoraForwardBenchmarkTests
 
     private string? TryDownloadAdapter(string repoId)
     {
-        string cachedDir = Path.Combine(CacheDir, repoId.Replace('/', Path.DirectorySeparatorChar));
+        string cachedDir = DotLLM.Tests.Integration.Fixtures.TestRepoDirectory.Resolve(repoId, "adapter_model.safetensors", "adapter_config.json");
         if (HasPeftAdapterFiles(cachedDir))
             return cachedDir;
 

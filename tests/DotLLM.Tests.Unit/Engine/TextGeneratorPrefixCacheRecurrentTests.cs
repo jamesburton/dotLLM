@@ -6,6 +6,7 @@ using DotLLM.Models.Gguf;
 using DotLLM.Tokenizers.Bpe;
 using Xunit;
 using Xunit.Abstractions;
+using DotLLM.Tests.Integration.Fixtures;
 
 namespace DotLLM.Tests.Unit.Engine;
 
@@ -25,20 +26,8 @@ public sealed class TextGeneratorPrefixCacheRecurrentTests
     private readonly ITestOutputHelper _out;
     public TextGeneratorPrefixCacheRecurrentTests(ITestOutputHelper output) => _out = output;
 
-    private static string? Find(string envVar, string repoDir, string glob)
-    {
-        string? env = Environment.GetEnvironmentVariable(envVar);
-        if (!string.IsNullOrEmpty(env) && File.Exists(env)) return env;
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string snaps = Path.Combine(home, ".cache", "huggingface", "hub", repoDir, "snapshots");
-        if (!Directory.Exists(snaps)) return null;
-        foreach (string s in Directory.EnumerateDirectories(snaps))
-        {
-            string[] hits = Directory.GetFiles(s, glob);
-            if (hits.Length > 0) return hits[0];
-        }
-        return null;
-    }
+    private static string? Find(string envVar, string org, string repo, string glob) =>
+        TestFixtureResolver.ResolveFile(envVar, org, repo, glob).Path;
 
     private static string Prompt(int daysAgo) =>
         $"<|im_start|>system\n{SystemPrompt}<|im_end|>\n<|im_start|>user\n" +
@@ -50,7 +39,7 @@ public sealed class TextGeneratorPrefixCacheRecurrentTests
     [SkippableFact]
     public void HybridModel_SequentialRequests_DoNotLeakRecurrentState()
     {
-        string? path = Find("DOTLLM_TEV1_08B_GGUF", "models--DreamBlooms--Tev1-0.8B-experimental-GGUF", "*Q8_0.gguf");
+        string? path = Find("DOTLLM_TEV1_08B_GGUF", "DreamBlooms", "Tev1-0.8B-experimental-GGUF", "*Q8_0.gguf");
         Skip.If(path is null, "Tev1-0.8B GGUF not found.");
 
         using var gguf = GgufFile.Open(path!);
@@ -70,7 +59,7 @@ public sealed class TextGeneratorPrefixCacheRecurrentTests
     [SkippableFact]
     public void HybridModel_WithPrefixCache_MatchesWithout()
     {
-        string? path = Find("DOTLLM_TEV1_08B_GGUF", "models--DreamBlooms--Tev1-0.8B-experimental-GGUF", "*Q8_0.gguf");
+        string? path = Find("DOTLLM_TEV1_08B_GGUF", "DreamBlooms", "Tev1-0.8B-experimental-GGUF", "*Q8_0.gguf");
         Skip.If(path is null, "Tev1-0.8B GGUF not found.");
 
         using var gguf = GgufFile.Open(path!);

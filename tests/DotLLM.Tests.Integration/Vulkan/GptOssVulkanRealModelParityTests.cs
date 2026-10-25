@@ -21,7 +21,6 @@ namespace DotLLM.Tests.Integration.Vulkan;
 [Collection(GpuCollection.Name)]
 public sealed class GptOssVulkanRealModelParityTests
 {
-    private const string DefaultHubGlob = "models--ggml-org--gpt-oss-20b-GGUF";
     private const int MaxNew = 24;
 
     private static readonly string LongProse = string.Concat(Enumerable.Repeat(
@@ -43,12 +42,7 @@ public sealed class GptOssVulkanRealModelParityTests
 
     private static string? ModelPath()
     {
-        string? p = Environment.GetEnvironmentVariable("DOTLLM_GPTOSS_GGUF");
-        if (!string.IsNullOrWhiteSpace(p) && File.Exists(p)) return p;
-        string hub = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".cache", "huggingface", "hub", DefaultHubGlob, "snapshots");
-        if (!Directory.Exists(hub)) return null;
-        return Directory.EnumerateFiles(hub, "gpt-oss-20b-mxfp4.gguf", SearchOption.AllDirectories).FirstOrDefault();
+        return DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveFile("DOTLLM_GPTOSS_GGUF", "ggml-org", "gpt-oss-20b-GGUF", "gpt-oss-20b-mxfp4.gguf").Path;
     }
 
     private static int[] Encode(DotLLM.Tokenizers.ITokenizer tok, string text)

@@ -26,7 +26,7 @@ public sealed class Llama32SpecialTokenDecodeTests
         string? path = ResolveModelPath();
         Skip.If(path is null,
             "Llama-3.2-1B-Instruct-Q8_0.gguf not found. Set DOTLLM_LLAMA32_1B_GGUF or place it in "
-            + "~/.dotllm/models/ or ~/.dotllm/test-cache/bartowski/Llama-3.2-1B-Instruct-GGUF/.");
+            + "~/.dotllm/models/bartowski/Llama-3.2-1B-Instruct-GGUF/.");
 
         using var gguf = GgufFile.Open(path!);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
@@ -44,23 +44,6 @@ public sealed class Llama32SpecialTokenDecodeTests
     }
 
     private static string? ResolveModelPath()
-    {
-        string? envPath = Environment.GetEnvironmentVariable("DOTLLM_LLAMA32_1B_GGUF");
-        if (!string.IsNullOrWhiteSpace(envPath) && File.Exists(envPath))
-            return envPath;
-
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string[] candidates =
-        [
-            Path.Combine(home, ".dotllm", "models", "bartowski", "Llama-3.2-1B-Instruct-GGUF",
-                "Llama-3.2-1B-Instruct-Q8_0.gguf"),
-            Path.Combine(home, ".dotllm", "test-cache", "bartowski", "Llama-3.2-1B-Instruct-GGUF",
-                "Llama-3.2-1B-Instruct-Q8_0.gguf"),
-        ];
-        foreach (string candidate in candidates)
-            if (File.Exists(candidate))
-                return candidate;
-
-        return null;
-    }
+        => DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveFile(
+            "DOTLLM_LLAMA32_1B_GGUF", "bartowski", "Llama-3.2-1B-Instruct-GGUF", "Llama-3.2-1B-Instruct-Q8_0.gguf").Path;
 }

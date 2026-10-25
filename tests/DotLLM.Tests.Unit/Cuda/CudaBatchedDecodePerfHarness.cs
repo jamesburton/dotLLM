@@ -3,6 +3,7 @@ using DotLLM.Core.Attention;
 using DotLLM.Core.Models;
 using DotLLM.Cuda;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -45,9 +46,7 @@ public sealed class CudaBatchedDecodePerfHarness
             "DOTLLM_CUDA_PERF=1 not set.");
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
 
-        string modelPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q8_0.gguf");
+        string modelPath = TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q8_0.gguf"], null).Path ?? "";
         Skip.If(!File.Exists(modelPath), $"{modelPath} not found");
 
         using var gguf = GgufFile.Open(modelPath);

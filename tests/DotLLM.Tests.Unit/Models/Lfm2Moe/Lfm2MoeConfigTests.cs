@@ -2,6 +2,7 @@ using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Models.Gguf;
 using Xunit;
+using DotLLM.Tests.Integration.Fixtures;
 
 namespace DotLLM.Tests.Unit.Models.Lfm2Moe;
 
@@ -11,20 +12,14 @@ namespace DotLLM.Tests.Unit.Models.Lfm2Moe;
 /// </summary>
 public sealed class Lfm2MoeConfigTests
 {
-    private static string? FindGguf()
-    {
-        string? env = Environment.GetEnvironmentVariable("DOTLLM_LFM2_GGUF");
-        if (!string.IsNullOrEmpty(env) && File.Exists(env)) return env;
-        string hub = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".cache", "huggingface", "hub", "models--LiquidAI--LFM2.5-24B-A2B-GGUF", "snapshots");
-        return Directory.Exists(hub) ? Directory.EnumerateFiles(hub, "*.gguf", SearchOption.AllDirectories).FirstOrDefault() : null;
-    }
+    private static string? FindGguf() =>
+        TestFixtureResolver.ResolveFile("DOTLLM_LFM2_GGUF", "LiquidAI", "LFM2.5-24B-A2B-GGUF", "*.gguf").Path;
 
     [SkippableFact]
     public void RealHeader_ExtractsHybridLayoutAndSigmoidBiasMoe()
     {
         string? path = FindGguf();
-        Skip.If(path is null, "LFM2.5 GGUF not found: set DOTLLM_LFM2_GGUF or fetch LiquidAI/LFM2.5-24B-A2B-GGUF into the HF hub cache.");
+        Skip.If(path is null, "LFM2.5 GGUF not found: set DOTLLM_LFM2_GGUF or fetch LiquidAI/LFM2.5-24B-A2B-GGUF into ~/.dotllm/models/LiquidAI/LFM2.5-24B-A2B-GGUF/.");
         using var gguf = GgufFile.Open(path);
         var cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
 

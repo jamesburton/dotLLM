@@ -407,7 +407,7 @@ backend.
 | Tag | Meaning |
 |---|---|
 | `verified: real weights` | A real HuggingFace checkpoint is downloaded (off-CI, gated on env var or conventional path) and `Forward` returns finite logits with non-zero stddev. Exact test name + checkpoint cited. |
-| `verified: tiny-random` | A tiny-random HF checkpoint (KB–MB, weights are random but shapes match the architecture) is fetched by the test runner into `~/.dotllm/test-cache/`, config is parsed and asserted, and — where the tiny-random ships usable weights — a forward pass runs. |
+| `verified: tiny-random` | A tiny-random HF checkpoint (KB–MB, weights are random but shapes match the architecture) is fetched by the test runner into `~/.dotllm/models/` (the one model store, #1279), config is parsed and asserted, and — where the tiny-random ships usable weights — a forward pass runs. |
 | `verified: tiny-random (synthetic)` | The test builds a deterministic miniature checkpoint on disk at run time because no public tiny-random exists (Mamba-3 is the sole case). |
 | `planned` | Enum variant exists but no working load-and-forward path. Tagged when the loader throws `NotSupportedException` or no dispatch arm covers the variant. |
 | `legacy placeholder` | Public enum value is retained for metadata/API compatibility but is obsolete and intentionally not a supported forward path. |

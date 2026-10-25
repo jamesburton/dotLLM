@@ -2,6 +2,7 @@ using DotLLM.Models.Gguf;
 using DotLLM.Tokenizers;
 using Xunit;
 using Xunit.Abstractions;
+using DotLLM.Tests.Integration.Fixtures;
 
 namespace DotLLM.Tests.Unit.Tokenizers.ChatTemplates;
 
@@ -15,15 +16,8 @@ public sealed class Lfm2ChatTemplateTests
     private readonly ITestOutputHelper _out;
     public Lfm2ChatTemplateTests(ITestOutputHelper output) => _out = output;
 
-    private static string? FindGguf()
-    {
-        string? env = Environment.GetEnvironmentVariable("DOTLLM_LFM2_GGUF");
-        if (!string.IsNullOrEmpty(env) && File.Exists(env)) return env;
-        string hub = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".cache", "huggingface", "hub", "models--LiquidAI--LFM2.5-24B-A2B-GGUF", "snapshots");
-        if (!Directory.Exists(hub)) return null;
-        return Directory.EnumerateFiles(hub, "*.gguf", SearchOption.AllDirectories).FirstOrDefault();
-    }
+    private static string? FindGguf() =>
+        TestFixtureResolver.ResolveFile("DOTLLM_LFM2_GGUF", "LiquidAI", "LFM2.5-24B-A2B-GGUF", "*.gguf").Path;
 
     private static JinjaChatTemplateHolder? Load()
     {
@@ -40,7 +34,7 @@ public sealed class Lfm2ChatTemplateTests
     public void SimpleChat_EndsWithOpenThinkTag()
     {
         var h = Load();
-        Skip.If(h is null, "LFM2.5 GGUF not found: set DOTLLM_LFM2_GGUF or fetch LiquidAI/LFM2.5-24B-A2B-GGUF into the HF hub cache.");
+        Skip.If(h is null, "LFM2.5 GGUF not found: set DOTLLM_LFM2_GGUF or fetch LiquidAI/LFM2.5-24B-A2B-GGUF into ~/.dotllm/models/LiquidAI/LFM2.5-24B-A2B-GGUF/.");
         Assert.NotNull(h);
         string s = h.Template.Apply(new[] { new ChatMessage { Role = "user", Content = "What is C. elegans?" } },
             new ChatTemplateOptions { AddGenerationPrompt = true });
@@ -52,7 +46,7 @@ public sealed class Lfm2ChatTemplateTests
     public void ToolConversation_RendersToolListAndPythonicCall()
     {
         var h = Load();
-        Skip.If(h is null, "LFM2.5 GGUF not found: set DOTLLM_LFM2_GGUF or fetch LiquidAI/LFM2.5-24B-A2B-GGUF into the HF hub cache.");
+        Skip.If(h is null, "LFM2.5 GGUF not found: set DOTLLM_LFM2_GGUF or fetch LiquidAI/LFM2.5-24B-A2B-GGUF into ~/.dotllm/models/LiquidAI/LFM2.5-24B-A2B-GGUF/.");
         Assert.NotNull(h);
         var tools = new[]
         {

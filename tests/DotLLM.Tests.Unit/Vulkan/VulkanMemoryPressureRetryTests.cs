@@ -4,6 +4,7 @@ using DotLLM.Vulkan;
 using DotLLM.Vulkan.Interop;
 using Xunit;
 using Xunit.Abstractions;
+using DotLLM.Tests.Integration.Fixtures;
 
 namespace DotLLM.Tests.Unit.Vulkan;
 
@@ -91,9 +92,7 @@ public sealed class VulkanMemoryPressureRetryTests
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader/device.");
 
         string modelPath = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_STRESS_MODEL")
-            ?? Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q8_0.gguf");
+            ?? TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q8_0.gguf"], null).Path ?? string.Empty;
         Skip.If(!File.Exists(modelPath), $"Stress model not found at {modelPath}");
 
         for (int i = 0; i < cycles; i++)

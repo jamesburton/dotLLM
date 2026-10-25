@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.DependencyInjection;
 using Xunit;
+using DotLLM.Tests.Integration.Fixtures;
 
 namespace DotLLM.Tests.Unit.Server;
 
@@ -142,14 +143,20 @@ public sealed class AmbiguousModelNameEndpointTests : IAsyncLifetime
         Assert.Equal(file, _state.PathForIssuedId("Hcompany/Holo4-27B-GGUF/q4_k_m.gguf"));   // file ids still are
     }
 
-    private static string? FindSmolLm(string quant)
+    private static readonly string? SmolLmQ5;
+    private static readonly string? SmolLmQ3;
+
+    // An explicit static constructor (not field initialisers, which are lazily run) resolves these
+    // before the first instance exists: InitializeAsync then points DOTLLM_MODELS_DIR / HF_HUB_CACHE
+    // at an empty temp root, which would hide the real stores from the resolver.
+    static AmbiguousModelNameEndpointTests()
     {
-        string hub = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache", "huggingface", "hub");
-        return Directory.Exists(hub)
-            ? Directory.EnumerateFiles(hub, "*.gguf", SearchOption.AllDirectories)
-                .FirstOrDefault(f => f.Contains("SmolLM-135M", StringComparison.OrdinalIgnoreCase) && f.Contains(quant, StringComparison.OrdinalIgnoreCase))
-            : null;
+        SmolLmQ5 = FindSmolLm("Q5_K_M");
+        SmolLmQ3 = FindSmolLm("Q3_K_M");
     }
+
+    private static string? FindSmolLm(string quant) =>
+        TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", [$"SmolLM-135M*{quant}*.gguf"], null).Path;
 
     /// <summary>
     /// Review round 2 of #1021, end to end on CPU: after a profile's base changes, reactivating the profile (idled out) loads the NEW base.
@@ -158,7 +165,7 @@ public sealed class AmbiguousModelNameEndpointTests : IAsyncLifetime
     [SkippableFact]
     public async Task ProfileWhoseBaseChanged_ReloadsTheNewBase()
     {
-        string? a = FindSmolLm("Q5_K_M"), b = FindSmolLm("Q3_K_M");
+        string? a = SmolLmQ5, b = SmolLmQ3;
         Skip.If(a is null || b is null, "SmolLM-135M cached GGUF quants not found locally.");
         _state!.Options = _state.Options with { Device = "cpu", UsePaged = false, PromptCacheEnabled = false, Warmup = DotLLM.Engine.WarmupOptions.Disabled };
         ModelProfileStore.Save("swapbase-1021", new ModelProfile { From = a });

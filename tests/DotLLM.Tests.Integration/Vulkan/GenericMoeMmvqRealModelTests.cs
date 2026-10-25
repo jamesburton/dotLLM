@@ -35,13 +35,8 @@ public sealed class GenericMoeMmvqRealModelTests
         string.Concat(Enumerable.Repeat("The history of the Roman Empire spans many centuries, during which the city grew from a small settlement on the banks of the Tiber into the capital of a vast realm. Its legions marched across Europe, and its roads linked provinces from Britain to Syria. ", 4)) + "In summary, the Roman Empire was",
     ];
 
-    private static string? Find(string envVar, string repoDir, string file)
-    {
-        string? p = Environment.GetEnvironmentVariable(envVar);
-        if (!string.IsNullOrWhiteSpace(p) && File.Exists(p)) return p;
-        string hub = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache", "huggingface", "hub", repoDir, "snapshots");
-        return Directory.Exists(hub) ? Directory.EnumerateFiles(hub, file, SearchOption.AllDirectories).FirstOrDefault() : null;
-    }
+    private static string? Find(string envVar, string org, string repo, string file)
+        => DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveFile(envVar, org, repo, file).Path;
 
     [SkippableTheory]
     [InlineData("glm")]
@@ -51,8 +46,8 @@ public sealed class GenericMoeMmvqRealModelTests
         Skip.If(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1", "DOTLLM_SKIP_VULKAN=1");
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan device.");
         string? path = which == "glm"
-            ? Find("DOTLLM_GLM_GGUF", "models--unsloth--GLM-4.7-Flash-GGUF", "GLM-4.7-Flash-Q4_K_M.gguf")
-            : Find("DOTLLM_GPTOSS_GGUF", "models--ggml-org--gpt-oss-20b-GGUF", "gpt-oss-20b-mxfp4.gguf");
+            ? Find("DOTLLM_GLM_GGUF", "unsloth", "GLM-4.7-Flash-GGUF", "GLM-4.7-Flash-Q4_K_M.gguf")
+            : Find("DOTLLM_GPTOSS_GGUF", "ggml-org", "gpt-oss-20b-GGUF", "gpt-oss-20b-mxfp4.gguf");
         Skip.If(path is null, $"model for '{which}' not found (set DOTLLM_GLM_GGUF / DOTLLM_GPTOSS_GGUF).");
         string spv = Path.Combine(AppContext.BaseDirectory, "spv");
 

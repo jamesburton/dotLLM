@@ -7,7 +7,7 @@ namespace DotLLM.Tests.Integration.Models.Gguf;
 
 /// <summary>
 /// Tests <see cref="GgufModelConfigExtractor"/> against a real GGUF model (SmolLM-135M, llama architecture).
-/// Auto-downloads on first run, cached in <c>~/.dotllm/test-cache/</c>.
+/// Auto-downloads on first run, cached in <c>~/.dotllm/models/</c>.
 /// </summary>
 [Collection("SmallModel")]
 public class GgufModelConfigTests

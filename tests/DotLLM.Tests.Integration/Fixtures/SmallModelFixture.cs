@@ -6,7 +6,7 @@ namespace DotLLM.Tests.Integration.Fixtures;
 /// Downloads a small GGUF model once and caches it for all tests in the collection.
 /// Uses <c>QuantFactory/SmolLM-135M-GGUF</c> Q8_0 (~145 MB) — llama architecture,
 /// so both GGUF parsing and <c>GgufModelConfigExtractor</c> work against it.
-/// Cached in <c>~/.dotllm/test-cache/</c> across test runs.
+/// Cached in <c>~/.dotllm/models/</c> across test runs.
 /// </summary>
 public sealed class SmallModelFixture : IAsyncLifetime
 {

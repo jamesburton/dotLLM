@@ -2,7 +2,7 @@ using System.Diagnostics;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
-using DotLLM.HuggingFace;
+using DotLLM.Tests.Integration.Fixtures;
 using DotLLM.Models.Gguf;
 using DotLLM.Vulkan;
 
@@ -83,11 +83,8 @@ internal static class VulkanPipelineSpanProfile
 
         if (ggufPath is null)
         {
-            string cacheDir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache", "dotllm-bench");
-            Console.WriteLine($"No --gguf given; downloading {repoId}/{filename} via HuggingFaceDownloader ...");
-            using var dl = new HuggingFaceDownloader();
-            ggufPath = dl.DownloadFileAsync(repoId, filename, cacheDir).GetAwaiter().GetResult();
+            Console.WriteLine($"No --gguf given; resolving {repoId}/{filename} from the model store ...");
+            ggufPath = TestModelDownloader.EnsureModelAsync(repoId, filename).GetAwaiter().GetResult();
         }
 
         Console.WriteLine($"GGUF: {ggufPath} ({new FileInfo(ggufPath).Length / 1024.0 / 1024.0:F1} MiB)");

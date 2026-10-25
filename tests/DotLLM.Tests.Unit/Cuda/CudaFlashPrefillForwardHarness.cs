@@ -3,6 +3,7 @@ using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Cuda;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -408,14 +409,7 @@ public sealed class CudaFlashPrefillForwardHarness
         string? env = Environment.GetEnvironmentVariable("DOTLLM_CUDA_FLASH_GGUF");
         if (!string.IsNullOrWhiteSpace(env) && File.Exists(env)) return Path.GetFullPath(env);
 
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string[] candidates =
-        [
-            Path.Combine(home, ".dotllm", "models", "bartowski", "Llama-3.2-1B-Instruct-GGUF", "Llama-3.2-1B-Instruct-Q8_0.gguf"),
-            Path.Combine(home, ".dotllm", "test-cache", "bartowski", "Llama-3.2-1B-Instruct-GGUF", "Llama-3.2-1B-Instruct-Q8_0.gguf"),
-        ];
-        foreach (var c in candidates) if (File.Exists(c)) return Path.GetFullPath(c);
-        return null;
+        return TestFixtureResolver.ResolveFile([], "bartowski", "Llama-3.2-1B-Instruct-GGUF", ["Llama-3.2-1B-Instruct-Q8_0.gguf"], null).Path;
     }
 
     private static string ResolvePtxDir()

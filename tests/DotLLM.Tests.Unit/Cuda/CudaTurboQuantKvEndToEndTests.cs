@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using DotLLM.Cuda;
 using DotLLM.Engine.KvCache.Codecs;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -55,9 +56,7 @@ public sealed unsafe class CudaTurboQuantKvEndToEndTests
         string? ptxDir = FindPtxDir();
         Skip.If(ptxDir == null, "PTX files not found");
         string modelPath = Environment.GetEnvironmentVariable("DOTLLM_SMOLLM_Q8_GGUF")
-            ?? Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q8_0.gguf");
+            ?? TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q8_0.gguf"], null).Path ?? "";
         Skip.If(!File.Exists(modelPath), $"SmolLM-135M Q8_0 GGUF not found at {modelPath}");
 
         using var gguf = GgufFile.Open(modelPath);

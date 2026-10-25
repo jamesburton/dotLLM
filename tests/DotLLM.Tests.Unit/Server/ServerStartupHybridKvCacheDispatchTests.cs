@@ -10,6 +10,7 @@ using DotLLM.Tests.Unit.Cuda;
 using DotLLM.Tokenizers.ChatTemplates;
 using Xunit;
 using Xunit.Abstractions;
+using DotLLM.Tests.Integration.Fixtures;
 
 namespace DotLLM.Tests.Unit.Server;
 
@@ -61,7 +62,7 @@ public sealed class ServerStartupHybridKvCacheDispatchTests
         string? path = ResolveFixturePath();
         Skip.If(path is null,
             $"Bonsai PQ2_0 GGUF fixture not found. Set {ModelPathEnvVar}, or place {FileName} under "
-            + "~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/ or ~/.dotllm/test-cache/prism-ml/Ternary-Bonsai-2-27B-gguf/.");
+            + "~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/.");
         Skip.If(FindPtxDir() is null, "PTX files not found");
 
         var options = new ServerOptions
@@ -107,7 +108,7 @@ public sealed class ServerStartupHybridKvCacheDispatchTests
         string? path = ResolveFixturePath();
         Skip.If(path is null,
             $"Bonsai PQ2_0 GGUF fixture not found. Set {ModelPathEnvVar}, or place {FileName} under "
-            + "~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/ or ~/.dotllm/test-cache/prism-ml/Ternary-Bonsai-2-27B-gguf/.");
+            + "~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/.");
         Skip.If(FindPtxDir() is null, "PTX files not found");
 
         var options = new ServerOptions
@@ -160,24 +161,7 @@ public sealed class ServerStartupHybridKvCacheDispatchTests
         }
     }
 
-    private static string? ResolveFixturePath()
-    {
-        string? envPath = Environment.GetEnvironmentVariable(ModelPathEnvVar);
-        if (!string.IsNullOrWhiteSpace(envPath) && File.Exists(envPath))
-            return envPath;
-
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string[] candidates =
-        [
-            Path.Combine(home, ".dotllm", "models", "prism-ml", "Ternary-Bonsai-2-27B-gguf", FileName),
-            Path.Combine(home, ".dotllm", "test-cache", "prism-ml", "Ternary-Bonsai-2-27B-gguf", FileName),
-        ];
-        foreach (string candidate in candidates)
-            if (File.Exists(candidate))
-                return candidate;
-
-        return null;
-    }
+    private static string? ResolveFixturePath() => KnownTestFixtures.TernaryBonsai27B_Q2_0.Path;
 
     private static string? FindPtxDir()
     {

@@ -35,20 +35,15 @@ public sealed class Qwen36SharedExpertPackedRealModelTests
     private const int Tail = 6;      // prefix lengths (len-Tail+1 .. len) per prompt are scored
     private const int Steps = 12;
 
-    private static string? Find(string envVar, string repoDir, string file)
-    {
-        string? p = Environment.GetEnvironmentVariable(envVar);
-        if (!string.IsNullOrWhiteSpace(p) && File.Exists(p)) return p;
-        string hub = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache", "huggingface", "hub", repoDir, "snapshots");
-        return Directory.Exists(hub) ? Directory.EnumerateFiles(hub, file, SearchOption.AllDirectories).FirstOrDefault() : null;
-    }
+    private static string? Find(string envVar, string org, string repo, string file)
+        => DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveFile(envVar, org, repo, file).Path;
 
     [SkippableFact]
     public void SharedExperts_StayPackedQ8_AndKlVsCpuIsNotWorseThanF16Control()
     {
         Skip.If(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1", "DOTLLM_SKIP_VULKAN=1");
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan device.");
-        string? path = Find("DOTLLM_QWEN36_A3B_Q4_K_M_GGUF", "models--unsloth--Qwen3.6-35B-A3B-GGUF", "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf");
+        string? path = Find("DOTLLM_QWEN36_A3B_Q4_K_M_GGUF", "unsloth", "Qwen3.6-35B-A3B-GGUF", "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf");
         Skip.If(path is null, "Qwen3.6-35B-A3B UD-Q4_K_M not found (set DOTLLM_QWEN36_A3B_Q4_K_M_GGUF).");
         string spv = Path.Combine(AppContext.BaseDirectory, "spv");
 

@@ -2,6 +2,7 @@ using DotLLM.Server.Models;
 using DotLLM.Engine;
 using DotLLM.Server;
 using Xunit;
+using DotLLM.Tests.Integration.Fixtures;
 
 namespace DotLLM.Tests.Unit.Server;
 
@@ -55,19 +56,8 @@ public sealed class ServerStateResidencyTests : IDisposable
         return state;
     }
 
-    private static string? FindCachedGguf(string quantMarker)
-    {
-        string hub = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".cache", "huggingface", "hub");
-        if (!Directory.Exists(hub)) return null;
-
-        return Directory.EnumerateFiles(hub, "*.gguf", SearchOption.AllDirectories)
-            .FirstOrDefault(f =>
-                f.Contains("SmolLM-135M", StringComparison.OrdinalIgnoreCase) &&
-                f.Contains(quantMarker, StringComparison.OrdinalIgnoreCase) &&
-                File.Exists(f));
-    }
+    private static string? FindCachedGguf(string quantMarker) =>
+        TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", [$"SmolLM-135M*{quantMarker}*.gguf"], null).Path;
 
     private static bool FixturesAvailable => PathA is not null && PathB is not null;
 

@@ -10,6 +10,7 @@ using DotLLM.Models.Gguf;
 using DotLLM.Models.SafeTensors;
 using DotLLM.Tests.Unit.Models.SafeTensors;
 using Xunit;
+using DotLLM.Tests.Integration.Fixtures;
 
 namespace DotLLM.Tests.Unit.Models.Architectures;
 
@@ -31,7 +32,7 @@ namespace DotLLM.Tests.Unit.Models.Architectures;
 /// rather than an abs/rel envelope.</para>
 ///
 /// <para>Some tests use the cached SmolLM-135M Q8_0 GGUF
-/// (<c>~/.dotllm/test-cache/QuantFactory/SmolLM-135M-GGUF/SmolLM-135M.Q8_0.gguf</c>)
+/// (<c>~/.dotllm/models/QuantFactory/SmolLM-135M-GGUF/SmolLM-135M.Q8_0.gguf</c>)
 /// and are skipped when it isn't present. Phase 5b adds F32 synthetic-fixture
 /// tests that run in every CI configuration.</para>
 /// </remarks>
@@ -50,8 +51,7 @@ public sealed class TransformerModelForwardBatchTests : IDisposable
         try { Directory.Delete(_scratch, recursive: true); } catch { /* best-effort */ }
     }
     private static readonly string CachedSmolLmPath =
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "test-cache", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q8_0.gguf");
+        TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q8_0.gguf"], null).Path ?? string.Empty;
 
     [SkippableFact]
     public void ForwardBatch_SingleSequence_EqualsForwardLoop()
@@ -949,8 +949,7 @@ public sealed class TransformerModelForwardBatchTests : IDisposable
     // ─────────────────────────────────────────────────────────────────────────
 
     private static readonly string CachedDeepSeekV2LitePath =
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "test-cache", "mradermacher", "DeepSeek-V2-Lite-GGUF", "DeepSeek-V2-Lite.Q4_K_M.gguf");
+        TestFixtureResolver.ResolveFile([], "mradermacher", "DeepSeek-V2-Lite-GGUF", ["DeepSeek-V2-Lite.Q4_K_M.gguf"], null).Path ?? string.Empty;
 
     /// <summary>
     /// Two sequences with DIFFERENT non-zero LoRA adapters going through the

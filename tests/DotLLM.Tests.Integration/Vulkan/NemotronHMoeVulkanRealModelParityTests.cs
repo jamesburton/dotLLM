@@ -14,7 +14,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// #402 acceptance on real bytes: NVIDIA Nemotron 3.5 Lightning 30B-A3B (ollama / ggml-org Q4_K_M, <c>nemotron_h_moe</c>) on Vulkan
 /// against the CPU forward, which #926 pinned to llama.cpp (KL 4e-5 .. 0.011 on identical ids). Expert banks are Q5_0 / Q8_0 here,
 /// so this also covers the Q5_0 -> Q5_1 repack and the indexed MMVQ kernels on real quantised weights. Gated on
-/// <c>DOTLLM_NEMOTRON_MOE_GGUF</c> or <c>~/.dotllm/test-cache/nvidia/nemotron-3.5-lightning/</c>; hold the GPU lock.
+/// <c>DOTLLM_NEMOTRON_MOE_GGUF</c> or <c>~/.dotllm/models/nvidia/nemotron-3.5-lightning/</c>; hold the GPU lock.
 /// </summary>
 [Trait("Category", "GPU")]
 [Collection(GpuCollection.Name)]

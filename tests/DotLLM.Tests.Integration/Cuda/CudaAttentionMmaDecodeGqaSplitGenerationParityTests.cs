@@ -102,7 +102,7 @@ public sealed class CudaAttentionMmaDecodeGqaSplitGenerationParityTests
         Skip.If(ggufPath is null,
             "Bonsai PQ2_0 GGUF fixture not found. Set DOTLLM_BONSAI_PQ2_0_GGUF, or place "
             + "Ternary-Bonsai-2-27B-PQ2_0.gguf under ~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/ "
-            + "or ~/.dotllm/test-cache/prism-ml/Ternary-Bonsai-2-27B-gguf/.");
+            + "or ~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/.");
         string? ptxDir = FindPtxDir();
         Skip.If(ptxDir is null, "PTX files not found");
 
@@ -343,23 +343,7 @@ public sealed class CudaAttentionMmaDecodeGqaSplitGenerationParityTests
     }
 
     private static string? ResolveModelPath()
-    {
-        string? envPath = Environment.GetEnvironmentVariable("DOTLLM_BONSAI_PQ2_0_GGUF");
-        if (!string.IsNullOrWhiteSpace(envPath) && File.Exists(envPath))
-            return envPath;
-
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string[] candidates =
-        [
-            Path.Combine(home, ".dotllm", "models", "prism-ml", "Ternary-Bonsai-2-27B-gguf", "Ternary-Bonsai-2-27B-PQ2_0.gguf"),
-            Path.Combine(home, ".dotllm", "test-cache", "prism-ml", "Ternary-Bonsai-2-27B-gguf", "Ternary-Bonsai-2-27B-PQ2_0.gguf"),
-        ];
-        foreach (string candidate in candidates)
-            if (File.Exists(candidate))
-                return candidate;
-
-        return null;
-    }
+        => DotLLM.Tests.Integration.Fixtures.KnownTestFixtures.TernaryBonsai27B_Q2_0.Path;
 
     private static string? FindPtxDir()
     {

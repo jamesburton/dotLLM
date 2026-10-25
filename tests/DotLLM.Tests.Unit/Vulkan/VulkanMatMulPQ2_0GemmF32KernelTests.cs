@@ -4,6 +4,7 @@ using DotLLM.Models.Gguf;
 using DotLLM.Vulkan;
 using DotLLM.Vulkan.Kernels;
 using Xunit;
+using DotLLM.Tests.Integration.Fixtures;
 
 namespace DotLLM.Tests.Unit.Vulkan;
 
@@ -331,27 +332,10 @@ public class VulkanMatMulPQ2_0GemmF32KernelTests
     private const string FixtureSkipMessage =
         "Bonsai PQ2_0 GGUF fixture not found. Set " + ModelPathEnvVar + ", or place " + FileName
         + " under ~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/ or "
-        + "~/.dotllm/test-cache/prism-ml/Ternary-Bonsai-2-27B-gguf/.";
+        + "~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/.";
 
     /// <summary>Mirrors <c>PQ2_0RealGgufSmokeTests.ResolveFixturePath</c>.</summary>
-    private static string? ResolveFixturePath()
-    {
-        string? envPath = Environment.GetEnvironmentVariable(ModelPathEnvVar);
-        if (!string.IsNullOrWhiteSpace(envPath) && File.Exists(envPath))
-            return envPath;
-
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string[] candidates =
-        [
-            Path.Combine(home, ".dotllm", "models", "prism-ml", "Ternary-Bonsai-2-27B-gguf", FileName),
-            Path.Combine(home, ".dotllm", "test-cache", "prism-ml", "Ternary-Bonsai-2-27B-gguf", FileName),
-        ];
-        foreach (string candidate in candidates)
-            if (File.Exists(candidate))
-                return candidate;
-
-        return null;
-    }
+    private static string? ResolveFixturePath() => KnownTestFixtures.TernaryBonsai27B_Q2_0.Path;
 
     /// <summary>
     /// Packs a row-major <c>[m, k]</c> ternary matrix + per-(row,group) fp16 scales into the

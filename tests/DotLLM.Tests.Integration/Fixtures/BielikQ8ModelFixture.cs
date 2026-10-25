@@ -5,7 +5,7 @@ namespace DotLLM.Tests.Integration.Fixtures;
 /// <summary>
 /// Downloads Bielik-1.5B-v3.0-Instruct Q8_0 GGUF (~1.6 GB) for bias support integration tests.
 /// Bielik has linear layer biases on all 7 projections per layer — exercises the bias code path.
-/// Cached in <c>~/.dotllm/test-cache/</c> across test runs.
+/// Cached in <c>~/.dotllm/models/</c> across test runs.
 /// </summary>
 public sealed class BielikQ8ModelFixture : IAsyncLifetime
 {

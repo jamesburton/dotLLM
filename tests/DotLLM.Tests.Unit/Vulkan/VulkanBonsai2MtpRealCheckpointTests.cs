@@ -10,6 +10,7 @@ using DotLLM.Models.Gguf;
 using DotLLM.Vulkan;
 using Xunit;
 using Xunit.Abstractions;
+using DotLLM.Tests.Integration.Fixtures;
 
 namespace DotLLM.Tests.Unit.Vulkan;
 
@@ -56,23 +57,8 @@ public sealed class VulkanBonsai2MtpRealCheckpointTests
 
     public VulkanBonsai2MtpRealCheckpointTests(ITestOutputHelper output) => _out = output;
 
-    private static string? FindCheckpoint()
-    {
-        string? env = Environment.GetEnvironmentVariable("DOTLLM_BONSAI2_MTP_GGUF");
-        if (!string.IsNullOrEmpty(env) && File.Exists(env)) return env;
-
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string repo = Path.Combine(home, ".cache", "huggingface", "hub",
-            "models--ProCreations--Ternary-Bonsai-2-27B-MTP", "snapshots");
-        if (!Directory.Exists(repo)) return null;
-
-        foreach (string snapshot in Directory.EnumerateDirectories(repo))
-        {
-            string[] hits = Directory.GetFiles(snapshot, "*MTP*.gguf");
-            if (hits.Length > 0) return hits[0];
-        }
-        return null;
-    }
+    private static string? FindCheckpoint() =>
+        TestFixtureResolver.ResolveFile("DOTLLM_BONSAI2_MTP_GGUF", "ProCreations", "Ternary-Bonsai-2-27B-MTP", "*MTP*.gguf").Path;
 
     /// <summary>
     /// Acceptance criterion 2: the same draft tokens, from the same checkpoint, at the same

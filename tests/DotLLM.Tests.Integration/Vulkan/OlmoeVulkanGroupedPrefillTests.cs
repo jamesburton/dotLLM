@@ -22,12 +22,7 @@ public sealed class OlmoeVulkanGroupedPrefillTests
 
     private static string? ModelPath()
     {
-        string? p = Environment.GetEnvironmentVariable("DOTLLM_OLMOE_GGUF");
-        if (!string.IsNullOrWhiteSpace(p) && File.Exists(p)) return p;
-        string hub = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".cache", "huggingface", "hub", "models--bartowski--OLMoE-1B-7B-0924-Instruct-GGUF", "snapshots");
-        if (!Directory.Exists(hub)) return null;
-        return Directory.EnumerateFiles(hub, "OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf", SearchOption.AllDirectories).FirstOrDefault();
+        return DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveFile("DOTLLM_OLMOE_GGUF", "bartowski", "OLMoE-1B-7B-0924-Instruct-GGUF", "OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf").Path;
     }
 
     private const string Prose =

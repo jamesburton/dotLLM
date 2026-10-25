@@ -4,6 +4,7 @@ using DotLLM.Models.Gguf;
 using DotLLM.Vulkan;
 using Xunit;
 using Xunit.Abstractions;
+using DotLLM.Tests.Integration.Fixtures;
 
 namespace DotLLM.Tests.Unit.Vulkan;
 
@@ -97,12 +98,6 @@ public sealed class VulkanResidentModelKvChurnTests
         if (!string.IsNullOrEmpty(overridePath))
             return File.Exists(overridePath) ? overridePath : null;
 
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string[] candidates =
-        [
-            Path.Combine(home, ".dotllm", "test-cache", "bartowski", "Llama-3.2-1B-Instruct-GGUF", "Llama-3.2-1B-Instruct-Q8_0.gguf"),
-            Path.Combine(home, ".dotllm", "models", "bartowski", "Llama-3.2-1B-Instruct-GGUF", "Llama-3.2-1B-Instruct-Q8_0.gguf"),
-        ];
-        return candidates.FirstOrDefault(File.Exists);
+        return TestFixtureResolver.ResolveFile([], "bartowski", "Llama-3.2-1B-Instruct-GGUF", ["Llama-3.2-1B-Instruct-Q8_0.gguf"], null).Path;
     }
 }

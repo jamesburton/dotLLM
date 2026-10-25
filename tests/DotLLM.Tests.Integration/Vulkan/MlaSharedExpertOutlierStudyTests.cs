@@ -28,10 +28,7 @@ public sealed class MlaSharedExpertOutlierStudyTests
     {
         Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_GLM_OUTLIER_STUDY") == "1", "opt-in");
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan device.");
-        string hub = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache", "huggingface", "hub", "models--unsloth--GLM-4.7-Flash-GGUF", "snapshots");
-        string? path = Environment.GetEnvironmentVariable("DOTLLM_GLM_GGUF");
-        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
-            path = Directory.Exists(hub) ? Directory.EnumerateFiles(hub, "GLM-4.7-Flash-Q4_K_M.gguf", SearchOption.AllDirectories).FirstOrDefault() : null;
+        string? path = DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveFile("DOTLLM_GLM_GGUF", "unsloth", "GLM-4.7-Flash-GGUF", "GLM-4.7-Flash-Q4_K_M.gguf").Path;
         Skip.If(path is null, "GLM file not found");
         string spv = Path.Combine(AppContext.BaseDirectory, "spv");
 

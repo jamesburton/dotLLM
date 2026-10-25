@@ -28,7 +28,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// <para>
 /// Each test self-skips when its GGUF is not present at the conventional
 /// path (or env-var override). Conventional paths follow the same
-/// <c>~/.dotllm/test-cache/&lt;org&gt;/&lt;repo&gt;/&lt;file&gt;</c> layout used by the
+/// <c>~/.dotllm/models/&lt;org&gt;/&lt;repo&gt;/&lt;file&gt;</c> layout used by the
 /// existing CPU GGUF tests. The Q4_K_M / Q5_K_M / Q6_K_M / Q8_0 kernels are
 /// production-shippable per the Phase 1 commits (afb2272, 15099b9,
 /// 29a1459 and their wiring siblings).

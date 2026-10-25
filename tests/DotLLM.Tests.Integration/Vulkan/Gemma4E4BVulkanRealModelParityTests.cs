@@ -15,16 +15,12 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// Issue #734 acceptance: real gemma-4-E4B-it (Q4_K_M) on Vulkan vs the CPU path - greedy token identity over
 /// several prompts, prefill-logit parity, and Vulkan throughput. The CPU reference (~5 s/token) is computed once and
 /// cached in the JSON file named by <c>DOTLLM_GEMMA4E4B_REF</c> (default: temp dir), so reruns only pay for Vulkan.
-/// Gated on <c>DOTLLM_GEMMA4E4B_GGUF</c> / the canonical HF-hub path; acquire the GPU lock before running.
+/// Gated on <c>DOTLLM_GEMMA4E4B_GGUF</c> / the shared model store / HF-hub cache; acquire the GPU lock before running.
 /// </summary>
 [Trait("Category", "GPU")]
 [Collection(GpuCollection.Name)]
 public sealed class Gemma4E4BVulkanRealModelParityTests
 {
-    private const string DefaultHubPath =
-        "C:/Users/james/.cache/huggingface/hub/models--unsloth--gemma-4-E4B-it-GGUF/" +
-        "snapshots/653803f092503c04a65164346f3208a36e707693/gemma-4-E4B-it-Q4_K_M.gguf";
-
     private static readonly string[] Prompts =
     [
         "The capital of France is",
@@ -41,9 +37,7 @@ public sealed class Gemma4E4BVulkanRealModelParityTests
 
     private static string? ModelPath()
     {
-        string? p = Environment.GetEnvironmentVariable("DOTLLM_GEMMA4E4B_GGUF");
-        if (!string.IsNullOrWhiteSpace(p) && File.Exists(p)) return p;
-        return File.Exists(DefaultHubPath) ? DefaultHubPath : null;
+        return DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveFile("DOTLLM_GEMMA4E4B_GGUF", "unsloth", "gemma-4-E4B-it-GGUF", "gemma-4-E4B-it-Q4_K_M.gguf").Path;
     }
 
     [SkippableFact]

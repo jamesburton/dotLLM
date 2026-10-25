@@ -5,6 +5,7 @@ using DotLLM.Models.Gguf;
 using DotLLM.Tokenizers.Bpe;
 using DotLLM.Vulkan;
 using Xunit;
+using DotLLM.Tests.Integration.Fixtures;
 
 namespace DotLLM.Tests.Unit.Vulkan;
 
@@ -33,21 +34,8 @@ public sealed class VulkanHybridSchedulerIdentityTests
     private static string Chat(string q) =>
         "<|im_start|>user\n" + q + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
 
-    private static string? FindGguf()
-    {
-        string? env = Environment.GetEnvironmentVariable("DOTLLM_TEV1_4B_GGUF");
-        if (!string.IsNullOrEmpty(env) && File.Exists(env)) return env;
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string snaps = Path.Combine(home, ".cache", "huggingface", "hub",
-            "models--bartowski--togethercomputer_Tev1-4B-experimental-GGUF", "snapshots");
-        if (!Directory.Exists(snaps)) return null;
-        foreach (string s in Directory.EnumerateDirectories(snaps))
-        {
-            string[] hits = Directory.GetFiles(s, "*Q4_K_M.gguf");
-            if (hits.Length > 0) return hits[0];
-        }
-        return null;
-    }
+    private static string? FindGguf() =>
+        TestFixtureResolver.ResolveFile("DOTLLM_TEV1_4B_GGUF", "bartowski", "togethercomputer_Tev1-4B-experimental-GGUF", "*Q4_K_M.gguf").Path;
 
     [SkippableFact]
     public async Task Scheduler_ConcurrentRequests_MatchSerialTextGenerator()
@@ -339,9 +327,7 @@ public sealed class VulkanHybridSchedulerIdentityTests
     public void Probe_Moe35B_LongContextGreedyStream()
     {
         Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_MOE35B_STREAM_PROBE") == "1", "opt-in probe");
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string snaps = Path.Combine(home, ".cache", "huggingface", "hub", "models--unsloth--Qwen3.6-35B-A3B-GGUF", "snapshots");
-        string? path = Directory.Exists(snaps) ? Directory.EnumerateDirectories(snaps).SelectMany(d => Directory.GetFiles(d, "*UD-Q4_K_M.gguf")).FirstOrDefault() : null;
+        string? path = TestFixtureResolver.ResolveFile([], "unsloth", "Qwen3.6-35B-A3B-GGUF", ["*UD-Q4_K_M.gguf"], null).Path;
         Skip.If(path is null, "35B GGUF not found.");
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var gguf = GgufFile.Open(path!);
