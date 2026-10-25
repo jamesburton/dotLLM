@@ -4526,8 +4526,10 @@ public sealed partial class VulkanTransformerModel : IModel
 
             // MiMo-V2: V was zero-padded to the K head dim (VulkanWeights), so the attention output rows are K-shaped with exact-zero pad
             // columns; compact them to the V head dim (and apply attention_value_scale, linear in V) into the Q scratch (dead after attention).
+            // The scale applies independently of the head dims (llama.cpp mimo2 scales every layer's attention output); with equal dims the
+            // kernel degenerates to a scaled copy.
             VulkanDevice.Buffer attnOutBuf = _state.AttnOutput;
-            if (Config.HasDistinctValueHeadDim)
+            if (Config.HasDistinctValueHeadDim || Config.AttentionValueScale is not null)
             {
                 RecordAttnCompactScale(cmdBuf, _state.AttnOutput, _state.Q, seqLen * numHeads, headDim, Config.GetValueHeadDim(),
                     Config.AttentionValueScale ?? 1.0f);

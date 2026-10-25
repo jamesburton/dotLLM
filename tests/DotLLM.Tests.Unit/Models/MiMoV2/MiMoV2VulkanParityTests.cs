@@ -178,6 +178,27 @@ public sealed class MiMoV2VulkanParityTests
         Assert.True(bad > 0.4, $"mutant '{mutant}' is invisible: only {bad:P0} rows moved");
     }
 
+    /// <summary>
+    /// attention_value_scale must apply when V and K share a head dim too (llama.cpp mimo2 scales unconditionally). The Vulkan per-sequence path
+    /// once ran the compact+scale kernel only for distinct dims, silently dropping the 0.707. The control drops the scale on the Vulkan side and
+    /// must be detected, proving the comparison can fail at equal dims.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ValueScale_EqualHeadDims_MatchesCpu(bool decode)
+    {
+        var o = Q80 with { ValueDim = SyntheticMiMoV2Gguf.KDim };
+        var (cpu, vk, vocab) = Run(o, Ids16, vkDecode: decode);
+        Report($"equal-dims value-scale {(decode ? "decode" : "prefill")}", cpu, vk, vocab);
+        AssertRowsAgree(vk, cpu, vocab);
+
+        var (cpu2, vkNoScale, _) = Run(o, Ids16, vkDecode: decode, mutateVk: c => c with { AttentionValueScale = null });
+        var (rk, _) = PerRow(vkNoScale, cpu2, vocab);
+        double moved = rk.Count(x => x > 0.02) / (double)rk.Length;
+        Assert.True(moved > 0.4, $"dropping the value scale at equal dims is invisible: only {moved:P0} rows moved");
+    }
+
     // ---- #996: small-row (2..4 rows) forwards --------------------------------------------------------------------------------------------------------------
 
     /// <summary>

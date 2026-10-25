@@ -36,6 +36,8 @@ internal static class SyntheticMiMoV2Gguf
         /// <summary>Router weight std (0.6 reproduces the llama.cpp golden). Large hidden sizes need ~2.4/sqrt(hidden): sigmoid saturates otherwise and
         /// near-1.0 ties make CPU and GPU pick different experts (a fixture artefact, not an engine difference).</summary>
         public float RouterStd { get; init; } = 0.6f;
+        /// <summary>V head dim (default <see cref="VDim"/>). <see cref="KDim"/> makes V and K the same width, so only attention_value_scale stays MiMo-specific.</summary>
+        public int ValueDim { get; init; } = VDim;
     }
 
     public static byte[] Build(Options? options = null)
@@ -43,7 +45,7 @@ internal static class SyntheticMiMoV2Gguf
         options ??= new Options();
         var rng = new Random(options.Seed);
         var w = new GgufWriter();
-        int hidden = options.HiddenSize, moeFf = options.ExpertFf, denseFf = options.DenseFfWidth;
+        int hidden = options.HiddenSize, moeFf = options.ExpertFf, denseFf = options.DenseFfWidth, vDim = options.ValueDim;
         const string arch = "mimo2";
         int blocks = Layers + NextN;
         w.AddString("general.architecture", arch);
@@ -61,7 +63,7 @@ internal static class SyntheticMiMoV2Gguf
         w.AddUInt32($"{arch}.expert_group_used_count", 1);
         w.AddUInt32($"{arch}.expert_gating_func", 2);
         w.AddUInt32($"{arch}.attention.key_length", KDim);
-        w.AddUInt32($"{arch}.attention.value_length", VDim);
+        w.AddUInt32($"{arch}.attention.value_length", (uint)vDim);
         w.AddUInt32($"{arch}.attention.sliding_window", Window);
         w.AddInt32Array($"{arch}.attention.sliding_window_pattern", Enumerable.Range(0, blocks).Select(i => IsSliding(i) ? 1 : 0).ToArray());
         w.AddUInt32($"{arch}.expert_count", Experts);
@@ -93,8 +95,8 @@ internal static class SyntheticMiMoV2Gguf
             bool trunk = i < Layers;
             int kv = sliding ? SlidingKv : GlobalKv;
             Norm(w, rng, $"{p}.attn_norm.weight", hidden);
-            Matrix(w, rng, $"{p}.attn_qkv.weight", hidden, Heads * KDim + kv * KDim + kv * VDim, 1.4f / MathF.Sqrt(hidden));
-            Matrix(w, rng, $"{p}.attn_output.weight", Heads * VDim, hidden, 1.4f / MathF.Sqrt(Heads * VDim));
+            Matrix(w, rng, $"{p}.attn_qkv.weight", hidden, Heads * KDim + kv * KDim + kv * vDim, 1.4f / MathF.Sqrt(hidden));
+            Matrix(w, rng, $"{p}.attn_output.weight", Heads * vDim, hidden, 1.4f / MathF.Sqrt(Heads * vDim));
             if (sliding)
             {
                 var sinks = new float[Heads];
