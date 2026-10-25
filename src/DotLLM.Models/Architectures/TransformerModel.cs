@@ -501,9 +501,24 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     /// </remarks>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache, ILoraAdapter? adapter)
+        => ForwardWithAdapter(tokenIds, positions, deviceId, kvCache, adapter, lastTokenLogitsOnly: false);
+
+    /// <summary>
+    /// Adapter-aware forward with the <paramref name="lastTokenLogitsOnly"/> hint (shared by the
+    /// public adapter overload and <see cref="ForwardBatch"/>).
+    /// </summary>
+    /// <param name="tokenIds">Input token IDs for this step.</param>
+    /// <param name="positions">Position indices for each token.</param>
+    /// <param name="deviceId">Target device for computation.</param>
+    /// <param name="kvCache">Optional KV-cache.</param>
+    /// <param name="adapter">Optional LoRA adapter; <see langword="null"/> for the base model.</param>
+    /// <param name="lastTokenLogitsOnly">When true and there is more than one token, return only the last row.</param>
+    /// <returns>Logits <c>[1, vocab]</c> when the hint applies, otherwise <c>[seqLen, vocab]</c>.</returns>
+    private ITensor ForwardWithAdapter(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                                       int deviceId, IKvCache? kvCache, ILoraAdapter? adapter, bool lastTokenLogitsOnly)
     {
         if (adapter is null)
-            return Forward(tokenIds, positions, deviceId, kvCache);
+            return Forward(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly);
 
         ValidateAdapterForModel(adapter);
 
@@ -520,7 +535,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         _currentAdapter = adapter;
         try
         {
-            return Forward(tokenIds, positions, deviceId, kvCache);
+            return Forward(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly);
         }
         finally
         {
@@ -3138,7 +3153,9 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     /// Q/K/V/O/gate/up/down GEMMs across sequences (one big <c>[Σ N_i, hidden] × W</c>
     /// dispatch instead of N small ones — the matmul-fusion win this method exists for).
     /// Complex sequences fall back to a per-seq <see cref="RunLayersAndFinalNormCore"/>
-    /// loop. The lm_head GEMM is fused across the union of both subgroups.
+    /// loop. The lm_head GEMM is fused across the union of both subgroups, over only the rows
+    /// that get logits: a request with <see cref="SequenceForwardRequest.LastTokenLogitsOnly"/>
+    /// contributes (and gets back) its last row alone (#1267).
     /// </summary>
     /// <remarks>
     /// <para>Phase 5a fused the lm_head only. Phase 5b adds intra-block matmul fusion
@@ -3159,14 +3176,19 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         if (requests.Count == 1)
         {
             var r0 = requests[0];
-            return new[] { Forward(r0.TokenIds.Span, r0.Positions.Span,
-                                   deviceId, r0.KvCache, r0.Adapter) };
+            return new[] { ForwardWithAdapter(r0.TokenIds.Span, r0.Positions.Span,
+                                              deviceId, r0.KvCache, r0.Adapter, r0.LastTokenLogitsOnly) };
         }
 
         int hiddenSize = Config.HiddenSize;
         int vocabSize = Config.VocabSize;
         int totalTokens = 0;
-        foreach (var r in requests) totalTokens += r.TokenIds.Length;
+        int outTotal = 0;
+        foreach (var r in requests)
+        {
+            totalTokens += r.TokenIds.Length;
+            outTotal += LogitRows(r);
+        }
 
         _state.EnsureCapacity(totalTokens);
 
@@ -3201,46 +3223,56 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             }
         }
 
-        // Per-batch snapshot buffer: each per-seq RunLayersAndFinalNormCore call
-        // and the batched simple-subgroup pass all write final hidden states into
-        // _state.HiddenState (overlapping). We copy each seq's slice OUT to its
-        // index-ordered offset in `batched` immediately after producing it, then
-        // copy the whole thing BACK into _state.HiddenState for the batched
-        // lm_head dispatch. The total snapshot footprint is the same as Phase 5a
-        // (totalTokens * hidden * 4 bytes).
+        // Only the rows that get logits are kept (#1267): every row of an all-rows request, the
+        // last row of a LastTokenLogitsOnly one. They are gathered, in request order, into a
+        // contiguous [outTotal, hidden] block at the head of _state.HiddenState for ONE lm_head GEMM.
+        // With no complex sequence the packed pass leaves every hidden row in request order, so the
+        // gather is an in-place compaction. A per-seq RunLayersAndFinalNormCore call overwrites
+        // _state.HiddenState from row 0, so with any complex sequence the kept rows are staged in a
+        // pooled side buffer first (sized by kept rows, not by Σ N_i).
+        float* hidden = (float*)_state.HiddenState;
         var pool = ArrayPool<float>.Shared;
-        float[] batched = pool.Rent(totalTokens * hiddenSize);
+        float[]? staged = complexCount > 0 ? pool.Rent(outTotal * hiddenSize) : null;
         try
         {
-            // Per-seq token offsets in the original (caller-supplied) request
-            // order — drives the lm_head logits-split-back step and the per-seq
-            // copy destination in `batched`.
-            Span<int> tokOffsets = requests.Count <= 256
+            // Per-seq offset of the first kept row in the gathered block, in request order.
+            Span<int> outOffsets = requests.Count <= 256
                 ? stackalloc int[requests.Count]
                 : new int[requests.Count];
             int running = 0;
             for (int i = 0; i < requests.Count; i++)
             {
-                tokOffsets[i] = running;
-                running += requests[i].TokenIds.Length;
+                outOffsets[i] = running;
+                running += LogitRows(requests[i]);
             }
 
             // ── Simple subgroup: batched matmul path ────────────────────────
             // Writes its sequences' final hidden states into _state.HiddenState
-            // packed in the order of `simpleIdxs[0..simpleCount]`. We snapshot
-            // each one out into its original-index offset in `batched`.
+            // packed in the order of `simpleIdxs[0..simpleCount]`.
             if (simpleCount > 0)
             {
                 RunLayersAndFinalNormBatched(requests, simpleIdxs[..simpleCount], simpleTotalTokens);
 
                 int packedOff = 0;
-                float* hidden = (float*)_state.HiddenState;
                 for (int s = 0; s < simpleCount; s++)
                 {
                     int origIdx = simpleIdxs[s];
                     int n = requests[origIdx].TokenIds.Length;
-                    new Span<float>(hidden + packedOff * hiddenSize, n * hiddenSize)
-                        .CopyTo(batched.AsSpan(tokOffsets[origIdx] * hiddenSize, n * hiddenSize));
+                    int keep = LogitRows(requests[origIdx]);
+                    float* src = hidden + (long)(packedOff + n - keep) * hiddenSize;
+                    var srcSpan = new ReadOnlySpan<float>(src, keep * hiddenSize);
+                    if (staged is not null)
+                    {
+                        srcSpan.CopyTo(staged.AsSpan(outOffsets[origIdx] * hiddenSize, keep * hiddenSize));
+                    }
+                    else
+                    {
+                        // In-place compaction: dst never passes src, and CopyTo is overlap-safe.
+                        float* dst = hidden + (long)outOffsets[origIdx] * hiddenSize;
+                        if (dst != src)
+                            srcSpan.CopyTo(new Span<float>(dst, keep * hiddenSize));
+                    }
+
                     packedOff += n;
                 }
             }
@@ -3251,6 +3283,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 int origIdx = complexIdxs[c];
                 var r = requests[origIdx];
                 int n = r.TokenIds.Length;
+                int keep = LogitRows(r);
                 if (r.Adapter is not null)
                 {
                     ValidateAdapterForModel(r.Adapter);
@@ -3260,8 +3293,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 try
                 {
                     RunLayersAndFinalNormCore(r.TokenIds.Span, r.Positions.Span, r.KvCache);
-                    new Span<float>((float*)_state.HiddenState, n * hiddenSize)
-                        .CopyTo(batched.AsSpan(tokOffsets[origIdx] * hiddenSize, n * hiddenSize));
+                    new ReadOnlySpan<float>(hidden + (long)(n - keep) * hiddenSize, keep * hiddenSize)
+                        .CopyTo(staged!.AsSpan(outOffsets[origIdx] * hiddenSize, keep * hiddenSize));
                 }
                 finally
                 {
@@ -3269,41 +3302,45 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 }
             }
 
-            // Stack the per-seq snapshots back into _state.HiddenState in original
-            // request order, then run one batched lm_head dispatch at seqLen = Σ N_i.
-            batched.AsSpan(0, totalTokens * hiddenSize)
-                .CopyTo(new Span<float>((float*)_state.HiddenState, totalTokens * hiddenSize));
+            // Stack the staged rows back into _state.HiddenState in request order.
+            staged?.AsSpan(0, outTotal * hiddenSize).CopyTo(new Span<float>(hidden, outTotal * hiddenSize));
 
+            // One batched lm_head dispatch over the kept rows only.
             float* logitsPtr = (float*)_state.Logits;
             var rwOutput = _weights.RepackedOutput ?? default;
             GemmInterleaved(_weights.OutputWeight, _weights.OutputQuantType,
-                (float*)_state.HiddenState, logitsPtr,
-                _weights.OutputOutputDim, _weights.OutputInputDim, totalTokens,
+                hidden, logitsPtr,
+                _weights.OutputOutputDim, _weights.OutputInputDim, outTotal,
                 null, in rwOutput);
 
             // Optional Gemma 2/3 final-logit soft-cap over the entire batched logits
             // block. Same convention as the per-seq path; no-op when not configured.
-            ApplyFinalLogitSoftcap(logitsPtr, (long)totalTokens * vocabSize);
+            ApplyFinalLogitSoftcap(logitsPtr, (long)outTotal * vocabSize);
 
-            // Split logits per-seq.
+            // Split logits per-seq: [keep_i, vocab] each.
             var results = new ITensor[requests.Count];
             for (int i = 0; i < requests.Count; i++)
             {
-                int n = requests[i].TokenIds.Length;
-                int srcOff = tokOffsets[i];
-                var shape = new TensorShape(n, vocabSize);
-                var tensor = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
-                new Span<float>(logitsPtr + (long)srcOff * vocabSize, n * vocabSize).CopyTo(
-                    new Span<float>((void*)tensor.DataPointer, n * vocabSize));
+                int keep = LogitRows(requests[i]);
+                var tensor = UnmanagedTensor.Allocate(new TensorShape(keep, vocabSize), DType.Float32, deviceId);
+                new Span<float>(logitsPtr + (long)outOffsets[i] * vocabSize, keep * vocabSize).CopyTo(
+                    new Span<float>((void*)tensor.DataPointer, keep * vocabSize));
                 results[i] = tensor;
             }
             return results;
         }
         finally
         {
-            pool.Return(batched);
+            if (staged is not null) pool.Return(staged);
         }
     }
+
+    /// <summary>Number of logit rows <see cref="ForwardBatch"/> returns for <paramref name="request"/>.</summary>
+    /// <param name="request">The batched request.</param>
+    /// <returns>1 when the request asks for the last row only and has more than one token, otherwise its token count.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int LogitRows(in SequenceForwardRequest request)
+        => request.LastTokenLogitsOnly && request.TokenIds.Length > 1 ? 1 : request.TokenIds.Length;
 
     /// <summary>
     /// Capability check for the Phase 5b matmul-fused batch path: false when the model

@@ -596,6 +596,160 @@ public sealed class TransformerModelForwardBatchTests : IDisposable
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Last-token-only logits (#1267)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// One sequence of a last-token-only parity case: <paramref name="Prefix"/> is forwarded
+    /// first (outside the batch) so a 1-token <paramref name="Tokens"/> is a genuine decode step.
+    /// </summary>
+    /// <param name="Prefix">Tokens already in the KV cache before the batched step.</param>
+    /// <param name="Tokens">Tokens of the batched step.</param>
+    /// <param name="LastOnly">Value of <see cref="SequenceForwardRequest.LastTokenLogitsOnly"/>.</param>
+    /// <param name="Adapter">Optional LoRA adapter (routes the sequence to the per-seq fallback).</param>
+    private sealed record LastRowCase(int[] Prefix, int[] Tokens, bool LastOnly,
+                                      DotLLM.Core.Lora.ILoraAdapter? Adapter = null);
+
+    /// <summary>
+    /// GQA group 2 (4 Q heads over 2 KV heads), every request last-token-only, prefill and decode
+    /// mixed in one batch: each result is <c>[1, vocab]</c> and bit-equal to
+    /// <c>Forward(..., lastTokenLogitsOnly: true)</c>. Also covers the single-request path.
+    /// </summary>
+    /// <param name="single">True to run a one-request batch (the non-packed early-return path).</param>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ForwardBatch_LastTokenOnly_MixedPrefillDecode_Gqa_MatchesForwardLastOnly(bool single)
+    {
+        LastRowCase[] cases = single
+            ? [new([], [1, 2, 3, 4, 5], true)]
+            :
+            [
+                new([], [1, 2, 3, 4, 5], true),   // prefill
+                new([6, 7, 0], [3], true),        // decode
+                new([], [7, 0, 3], true),         // prefill
+                new([2, 4], [1], true),           // decode
+            ];
+        AssertLastRowParity(cases, seed: 1267);
+    }
+
+    /// <summary>
+    /// All-rows and last-token-only requests mixed in one all-simple batch: the in-place
+    /// compaction of kept rows must leave each sequence's rows where its logits split expects them.
+    /// </summary>
+    [Fact]
+    public void ForwardBatch_LastTokenOnly_MixedModes_SimpleBatch_MatchesForward()
+    {
+        AssertLastRowParity(
+        [
+            new([], [1, 2, 3, 4], false),
+            new([], [5, 6, 7, 0, 1], true),
+            new([3, 2], [6], true),
+            new([], [7, 0, 3], false),
+        ], seed: 1268);
+    }
+
+    /// <summary>
+    /// Mixed modes with adapter-carrying (per-seq fallback) sequences in both modes: exercises the
+    /// staged gather path, where kept rows are copied out before the next per-seq core call.
+    /// </summary>
+    [Fact]
+    public void ForwardBatch_LastTokenOnly_MixedModes_WithComplexFallback_MatchesForward()
+    {
+        using var adapter = BuildZeroAdapter(BuildGqaConfig(numHeads: 4));
+        AssertLastRowParity(
+        [
+            new([], [1, 2, 3, 4], true),
+            new([], [5, 6, 7], false, adapter),
+            new([], [7, 0, 3, 2, 1], true, adapter),
+            new([4], [2], true),
+            new([], [6, 5], false),
+        ], seed: 1269);
+    }
+
+    private void AssertLastRowParity(LastRowCase[] cases, int seed)
+    {
+        var cfg = BuildGqaConfig(numHeads: 4);
+        string path = Path.Combine(_scratch, $"lastonly-{seed}.safetensors");
+        WriteGqaFixture(path, seed, numHeads: 4);
+
+        float[][] expected = RunLastRowCases(path, cfg, cases, batched: false);
+        float[][] actual = RunLastRowCases(path, cfg, cases, batched: true);
+        for (int i = 0; i < cases.Length; i++)
+        {
+            int rows = cases[i].LastOnly ? 1 : cases[i].Tokens.Length;
+            Assert.Equal(rows * cfg.VocabSize, actual[i].Length);
+            AssertBitEqual(expected[i], actual[i], $"[#1267 seq{i}] lastOnly={cases[i].LastOnly} rows={rows}");
+        }
+    }
+
+    private static float[][] RunLastRowCases(string path, ModelConfig cfg, LastRowCase[] cases, bool batched)
+    {
+        using var sf = SafetensorsFile.Open(path);
+        using var model = TransformerModel.LoadFromSafetensors(sf, cfg);
+        var caches = new SimpleKvCache[cases.Length];
+        try
+        {
+            var requests = new SequenceForwardRequest[cases.Length];
+            for (int i = 0; i < cases.Length; i++)
+            {
+                var c = cases[i];
+                caches[i] = new SimpleKvCache(cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, cfg.MaxSequenceLength);
+                if (c.Prefix.Length > 0)
+                    model.Forward(c.Prefix, Enumerable.Range(0, c.Prefix.Length).ToArray(), deviceId: -1, caches[i], c.Adapter).Dispose();
+                requests[i] = new SequenceForwardRequest
+                {
+                    TokenIds = c.Tokens,
+                    Positions = Enumerable.Range(c.Prefix.Length, c.Tokens.Length).ToArray(),
+                    KvCache = caches[i],
+                    Adapter = c.Adapter,
+                    LastTokenLogitsOnly = c.LastOnly,
+                };
+            }
+
+            var outs = new float[cases.Length][];
+            if (batched)
+            {
+                var results = model.ForwardBatch(requests, deviceId: -1);
+                try
+                {
+                    for (int i = 0; i < cases.Length; i++) outs[i] = CopyLogits(results[i]);
+                }
+                finally
+                {
+                    foreach (var t in results) t.Dispose();
+                }
+
+                return outs;
+            }
+
+            for (int i = 0; i < cases.Length; i++)
+            {
+                var r = requests[i];
+                if (r.Adapter is null)
+                {
+                    using ITensor t = model.Forward(r.TokenIds.Span, r.Positions.Span, deviceId: -1, r.KvCache,
+                        lastTokenLogitsOnly: r.LastTokenLogitsOnly);
+                    outs[i] = CopyLogits(t);
+                }
+                else
+                {
+                    // The public adapter overload has no hint: the reference is the last row of all rows.
+                    using ITensor t = model.Forward(r.TokenIds.Span, r.Positions.Span, deviceId: -1, r.KvCache, r.Adapter);
+                    float[] all = CopyLogits(t);
+                    outs[i] = r.LastTokenLogitsOnly ? all[^cfg.VocabSize..] : all;
+                }
+            }
+
+            return outs;
+        }
+        finally
+        {
+            foreach (var kv in caches) kv?.Dispose();
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Synthetic F32 GQA fixture (used by Phase 5b F32 / fallback tests)
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -603,35 +757,36 @@ public sealed class TransformerModelForwardBatchTests : IDisposable
     private const int FxNumLayers = 2;
     private const int FxNumHeads = 2;
     private const int FxNumKvHeads = 2;
-    private const int FxHeadDim = FxHiddenSize / FxNumHeads; // 8
     private const int FxVocabSize = 8;
     private const int FxIntermediateSize = 24;
     private const int FxMaxSeqLen = 32;
 
-    private static ModelConfig BuildGqaConfig() => new ModelConfig
+    // numHeads > FxNumKvHeads gives a GQA group > 1 (head dim shrinks to keep hidden fixed).
+    private static ModelConfig BuildGqaConfig(int numHeads = FxNumHeads) => new ModelConfig
     {
         Architecture = Architecture.Llama,
         VocabSize = FxVocabSize,
         HiddenSize = FxHiddenSize,
         IntermediateSize = FxIntermediateSize,
         NumLayers = FxNumLayers,
-        NumAttentionHeads = FxNumHeads,
+        NumAttentionHeads = numHeads,
         NumKvHeads = FxNumKvHeads,
-        HeadDim = FxHeadDim,
+        HeadDim = FxHiddenSize / numHeads,
         MaxSequenceLength = FxMaxSeqLen,
         NormEpsilon = 1e-5f,
-        RoPEConfig = new RoPEConfig(Theta: 10000f, DimensionCount: FxHeadDim, Type: RoPEType.Norm),
+        RoPEConfig = new RoPEConfig(Theta: 10000f, DimensionCount: FxHiddenSize / numHeads, Type: RoPEType.Norm),
     };
 
-    private static void WriteGqaFixture(string path, int seed)
+    private static void WriteGqaFixture(string path, int seed, int numHeads = FxNumHeads)
     {
         var b = new SafetensorsFixtureBuilder();
         AddDeterministic(b, "model.embed_tokens.weight", [FxVocabSize, FxHiddenSize], amplitude: 0.05f, seed: seed + 0);
         AddDeterministic(b, "model.norm.weight", [FxHiddenSize], amplitude: 0.05f, seed: seed + 1, center: 1.0f, jitter: 0.05f);
         AddDeterministic(b, "lm_head.weight", [FxVocabSize, FxHiddenSize], amplitude: 0.05f, seed: seed + 2);
 
-        int qOut = FxNumHeads * FxHeadDim;
-        int kvOut = FxNumKvHeads * FxHeadDim;
+        int headDim = FxHiddenSize / numHeads;
+        int qOut = numHeads * headDim;
+        int kvOut = FxNumKvHeads * headDim;
         for (int i = 0; i < FxNumLayers; i++)
         {
             int s = seed + 10 * (i + 1);

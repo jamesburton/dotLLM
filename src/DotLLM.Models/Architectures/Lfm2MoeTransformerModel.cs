@@ -294,7 +294,7 @@ public sealed unsafe partial class Lfm2MoeTransformerModel : IModel
             var r = requests[i];
             if (requests.Count > 1 && r.SsmState is null)
                 throw new ArgumentException($"ForwardBatch with {requests.Count} requests requires a per-seq SsmState; request[{i}] has none.");
-            results[i] = ForwardCore(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, ResolveState(r.SsmState), false, r.Adapter);
+            results[i] = ForwardCore(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, ResolveState(r.SsmState), r.LastTokenLogitsOnly, r.Adapter);
         }
         return results;
     }
