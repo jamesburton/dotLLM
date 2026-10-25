@@ -316,7 +316,7 @@ Inspired by OS virtual memory paging. This is the **memory management** half of 
 `PagedKvCache` implements `IPagedKvCache` (Core): block size, uniform `KvStride`, the block table (`BlockIds`) and
 per-layer views of the physical K/V block storage, whose `DType` is the row type. `TransformerModel.AttendCachedF32`
 sends a paged cache to `Attention.Execute(float*, IPagedKvCache, ...)`, which reads the blocks in place: no gather and no
-staging. It is the same kernel as the quantized-cache path (`ExecuteTiledHead`), generalised over row addressing
+staging. It is the same kernel as the quantized-cache path (`ExecuteHeadGroup`), generalised over row addressing
 (contiguous / ring / paged, a paged block resolved once per run of rows, not per row) and row type (F32 / F16 / Q8_0 /
 Q4_0, one head slice decoded into a `headDim` scratch by the existing per-row helpers). It supports a custom score scale
 (Gemma `query_pre_attn_scalar`, Granite), softcap, sinks and sliding windows, and partitions heads across workers with
