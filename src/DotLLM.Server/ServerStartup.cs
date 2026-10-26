@@ -684,6 +684,8 @@ public static class ServerStartup
             recurrentPrefixCacheOptions: options.GetPrefixSnapshotOptions());
         if (options.PrefillChunkSize > 0)
             Console.WriteLine($"[dotllm] Prefill chunk size: {options.PrefillChunkSize} tokens per forward pass");
+        if (generator.RecurrentStepCheckpointBytes > 0)
+            Console.WriteLine($"[dotllm] Prompt-cache steps: a {generator.RecurrentStepCheckpointBytes / 1048576.0:F1} MiB recurrent checkpoint every {options.PromptCacheStep} prefill tokens, keeping {options.PromptCacheStepKeep ?? 8}");
         if (options.PrefixSnapshotDiskDirectory is not null)
             Console.WriteLine($"[dotllm] Prefix snapshot disk transport: {generator.RecurrentPrefixStatistics.DiskTransport ?? "unavailable (provider or directory)"} (restart persistence disabled)");
 

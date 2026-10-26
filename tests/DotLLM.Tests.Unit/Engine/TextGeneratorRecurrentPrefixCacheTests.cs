@@ -542,6 +542,150 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
         cached.ClearRecurrentPrefixCache();
     }
 
+    // ── mid-history step checkpoints (issue #1286) ──
+
+    /// <summary>A 200-token history: steps of 32 land at 32 .. 192, and the first request's own boundary at 199.</summary>
+    private static readonly int[] History = Run(1000, 200);
+
+    /// <summary><see cref="History"/> with the token at <paramref name="at"/> changed: it shares exactly <paramref name="at"/> tokens.</summary>
+    private static int[] DivergedAt(int at) { int[] p = [.. History]; p[at] = 9999; return p; }
+
+    private static (TextGenerator Cached, TextGenerator Plain, HistoryModel Model) BuildSteps(int step, int keep = 8, long budget = 0, long checkpointBytes = 4)
+    {
+        var model = new HistoryModel { CheckpointBytes = checkpointBytes };
+        Func<ModelConfig, int, IKvCache> kv = (cfg, size) => new SimpleKvCache(KvGeometry.FromConfig(cfg), size);
+        return (new TextGenerator(model, new CsvTokenizer(), kv, recurrentPrefixCache: true,
+                    recurrentPrefixCacheOptions: new() { StepTokens = step, MaxStepCheckpoints = keep, StepBudgetBytes = budget }),
+                new TextGenerator(model, new CsvTokenizer(), kv), model);
+    }
+
+    private static InferenceResponse Check(TextGenerator cached, TextGenerator plain, HistoryModel model, int[] prompt)
+        => Check(cached, plain, model, string.Join(",", prompt));
+
+    /// <summary>Prompt tokens the last cached request ran through the model (its forwards minus the one-token decode steps).</summary>
+    private static int Prefilled(HistoryModel model) => model.Calls.Sum() - (Opts.MaxTokens - 1);
+
+    [Theory]
+    [InlineData(10, 0)]      // before the first step: nothing to resume from, a full prefill
+    [InlineData(100, 96)]    // between two steps: the deepest one before the divergence
+    [InlineData(96, 96)]     // exactly at a step: the step itself (it consumed only shared tokens)
+    [InlineData(195, 192)]   // after the last step, before the boundary at 199
+    public void DivergingPrompt_ResumesFromTheDeepestStepBeforeTheDivergence(int divergeAt, int resumeAt)
+    {
+        var (cached, plain, model) = BuildSteps(step: 32);
+        Check(cached, plain, model, History);
+
+        var got = Check(cached, plain, model, DivergedAt(divergeAt));
+
+        Assert.Equal(resumeAt, got.Timings.CachedTokenCount);
+        Assert.Equal(History.Length - resumeAt, Prefilled(model));
+    }
+
+    [Fact]
+    public void ExtendingPrompt_StillResumesFromTheBoundary_PastTheLastStep()
+    {
+        var (cached, plain, model) = BuildSteps(step: 32);
+        Check(cached, plain, model, History);
+
+        var got = Check(cached, plain, model, [.. History, .. Run(3000, 10)]);
+
+        Assert.Equal(History.Length - 1, got.Timings.CachedTokenCount);
+    }
+
+    [Fact]
+    public void Resume_InvalidatesTheCheckpointsPastTheDivergence()
+    {
+        // The diverged request overwrites the KV rows past 96. Were the original history's checkpoints at 128 .. 199 kept, the
+        // original prompt would resume at 199 over the diverged rows; it must resume at 96 again and match a cold prefill.
+        var (cached, plain, model) = BuildSteps(step: 32);
+        Check(cached, plain, model, History);
+        Assert.Equal(96, Check(cached, plain, model, DivergedAt(100)).Timings.CachedTokenCount);
+
+        var back = Check(cached, plain, model, History);
+
+        Assert.Equal(96, back.Timings.CachedTokenCount);
+    }
+
+    [Fact]
+    public void Steps_KeepOnlyTheNewestCount_SoAnEarlyDivergenceMisses()
+    {
+        var (cached, plain, model) = BuildSteps(step: 16, keep: 3);
+        Check(cached, plain, model, History);                      // steps 16 .. 192: only 160, 176, 192 kept
+        Assert.Equal(3, cached.RecurrentPrefixStatistics.StepCheckpoints);
+
+        Assert.Equal(176, Check(cached, plain, model, DivergedAt(180)).Timings.CachedTokenCount);
+        Assert.Equal(0, Check(cached, plain, model, DivergedAt(100)).Timings.CachedTokenCount);
+        Assert.True(cached.RecurrentPrefixStatistics.StepCheckpoints <= 3);
+    }
+
+    [Fact]
+    public void Steps_HonourTheByteBudget()
+    {
+        var (cached, plain, model) = BuildSteps(step: 16, budget: 250, checkpointBytes: 100);
+        Check(cached, plain, model, History);
+
+        var stats = cached.RecurrentPrefixStatistics;
+        Assert.Equal(2, stats.StepCheckpoints);
+        Assert.Equal(200, stats.StepCheckpointBytes);
+        Assert.Equal(176, Check(cached, plain, model, DivergedAt(180)).Timings.CachedTokenCount);
+        Assert.True(cached.RecurrentPrefixStatistics.StepCheckpointBytes <= 250);
+    }
+
+    [Fact]
+    public void Steps_LargerThanTheBudget_AreNotTaken()
+    {
+        var (cached, plain, model) = BuildSteps(step: 16, budget: 50, checkpointBytes: 100);
+        Check(cached, plain, model, History);
+
+        Assert.Equal(0, cached.RecurrentPrefixStatistics.StepCheckpoints);
+        Assert.Equal(0, Check(cached, plain, model, DivergedAt(100)).Timings.CachedTokenCount);
+    }
+
+    [Fact]
+    public void Steps_NeedAKnownCheckpointSize()
+    {
+        var (cached, plain, model) = BuildSteps(step: 16, checkpointBytes: 0);
+        Check(cached, plain, model, History);
+
+        Assert.Equal(0, cached.RecurrentStepCheckpointBytes);
+        Assert.Equal(0, Check(cached, plain, model, DivergedAt(100)).Timings.CachedTokenCount);
+    }
+
+    [Fact]
+    public void WithSteps_ARetriedTurn_ResumesAtThePreviousBoundary()
+    {
+        // Issue #1090: turn 2 extends turn 1 and moves the snapshot to its own end; a retry of turn 2 shares only turn 1. With
+        // steps on, the boundary the hit moved past is kept as a step, so the retry resumes there instead of re-prefilling.
+        var (cached, plain, model) = BuildSteps(step: 64);
+        int[] t1 = Run(1000, 40), t2 = [.. t1, .. Run(2000, 40)], retry = [.. t1, .. Run(3000, 40)];
+        Check(cached, plain, model, t1);
+        Assert.Equal(t1.Length - 1, Check(cached, plain, model, t2).Timings.CachedTokenCount);
+
+        var got = Check(cached, plain, model, retry);
+
+        Assert.Equal(t1.Length - 1, got.Timings.CachedTokenCount);
+    }
+
+    [Fact]
+    public async Task Streaming_ResumesMidHistory_AndMatchesAColdPrefill()
+    {
+        var (cached, plain, model) = BuildSteps(step: 32);
+        Check(cached, plain, model, History);
+        string prompt = string.Join(",", DivergedAt(100));
+        var want = plain.Generate(prompt, Opts);
+
+        var text = new System.Text.StringBuilder();
+        InferenceTimings? timings = null;
+        await foreach (var token in cached.GenerateStreamingTokensAsync(prompt, Opts))
+        {
+            text.Append(token.Text);
+            timings = token.Timings ?? timings;
+        }
+
+        Assert.Equal(want.Text, text.ToString());
+        Assert.Equal(96, timings!.Value.CachedTokenCount);
+    }
+
     // ── fakes ──
 
     /// <summary>A KV whose storage another cache's forwards overwrite, like the CUDA hybrid's model-owned handle.</summary>
@@ -609,6 +753,10 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
         public object? CheckpointRecurrentState() => _state;
         public void RestoreRecurrentState(object? checkpoint) { if (checkpoint is int s) _state = s; }
 
+        /// <summary>What one checkpoint reports it holds (issue #1286's byte budget reads it at generator construction).</summary>
+        public long CheckpointBytes { get; set; } = 4;
+        public long RecurrentStateCheckpointBytes => CheckpointBytes;
+
         public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d) => Core(t, p, d, null);
         public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IKvCache? kv) => Core(t, p, d, kv);
         public ITensor Forward(ReadOnlySpan<int> t, ReadOnlySpan<int> p, int d, IKvCache? kv, bool last) => Core(t, p, d, kv);
@@ -662,16 +810,9 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
             if (kvCache is not null && kvCache.CurrentLength != positions[0])
                 KvLengthMismatches.Add($"kv length {kvCache.CurrentLength} but forward starts at position {positions[0]}");
 
-            nint ptr = (nint)NativeMemory.AlignedAlloc((nuint)((long)seqLen * Vocab * sizeof(float)), 64);
-            float* dst = (float*)ptr;
-            for (int r = 0; r < seqLen; r++)
-            {
-                _state = (_state * 31 + tokenIds[r] + 1) % 9973;
-                var row = new Span<float>(dst + (long)r * Vocab, Vocab);
-                row.Fill(-10f);
-                row[_state % (Vocab - 1)] = 10f;
-            }
-
+            // Each KV row's first key element is its token (+1), and the logits also depend on a digest of every row the KV holds,
+            // as attention would: a resume whose KV rows belong to another history (stale rows past a divergence) changes tokens.
+            int kvDigest = 0;
             if (kvCache is not null)
             {
                 int kvStride = NumKvHeads * HeadDim;
@@ -680,10 +821,26 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
                 nint vPtr = (nint)NativeMemory.AlignedAlloc(bytes, 64);
                 NativeMemory.Clear((void*)kPtr, bytes);
                 NativeMemory.Clear((void*)vPtr, bytes);
+                for (int r = 0; r < seqLen; r++)
+                    ((float*)kPtr)[(long)r * kvStride] = tokenIds[r] + 1;
                 kvCache.Update(new TensorRef(seqLen, kvStride, DType.Float32, -1, kPtr),
                                new TensorRef(seqLen, kvStride, DType.Float32, -1, vPtr), positions, 0);
                 NativeMemory.AlignedFree((void*)kPtr);
                 NativeMemory.AlignedFree((void*)vPtr);
+
+                var keys = kvCache.GetKeysRef(0);
+                for (int i = 0; i < kvCache.CurrentLength; i++)
+                    kvDigest = (kvDigest * 7 + (int)((float*)keys.DataPointer)[(long)i * kvStride]) % 9973;
+            }
+
+            nint ptr = (nint)NativeMemory.AlignedAlloc((nuint)((long)seqLen * Vocab * sizeof(float)), 64);
+            float* dst = (float*)ptr;
+            for (int r = 0; r < seqLen; r++)
+            {
+                _state = (_state * 31 + tokenIds[r] + 1) % 9973;
+                var row = new Span<float>(dst + (long)r * Vocab, Vocab);
+                row.Fill(-10f);
+                row[(_state + kvDigest) % (Vocab - 1)] = 10f;
             }
 
             return new UnmanagedTensor(new TensorShape(seqLen, Vocab), DType.Float32, deviceId, ptr);

@@ -14,7 +14,11 @@ public sealed partial class TextGenerator
 
     /// <summary>Current recurrent prefix cache occupancy and counters.</summary>
     public RecurrentPrefixCacheStatistics RecurrentPrefixStatistics => _tieredSnapshots?.Statistics
-        ?? new() { Enabled = _recurrentPrefixEnabled, Entries = _recurrentPrefix is null ? 0 : 1, MaxEntries = 1, Hits = _legacyPrefixHits, VramHits = _legacyPrefixHits, Misses = _legacyPrefixMisses };
+        ?? new() { Enabled = _recurrentPrefixEnabled, Entries = _recurrentPrefix is null ? 0 : 1, MaxEntries = 1, Hits = _legacyPrefixHits, VramHits = _legacyPrefixHits, Misses = _legacyPrefixMisses,
+            StepCheckpoints = _recurrentPrefix?.StepCount ?? 0, StepCheckpointBytes = (_recurrentPrefix?.StepCount ?? 0) * _checkpointBytes };
+
+    /// <summary>Bytes one mid-history step checkpoint holds (issue #1286), or 0 when steps are off.</summary>
+    public long RecurrentStepCheckpointBytes => _stepTokens > 0 ? _checkpointBytes : 0;
     /// <summary>Tier used for the most recent request's prefix hit.</summary>
     public string? LastPrefixCacheTier { get; private set; }
     /// <summary>Milliseconds spent restoring the most recent request's prefix.</summary>

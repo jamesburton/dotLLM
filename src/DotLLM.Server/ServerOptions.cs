@@ -66,6 +66,12 @@ public sealed record ServerOptions
     /// <summary>Maximum snapshot spill bytes. Zero disables the disk tier.</summary>
     public long PrefixSnapshotDiskBudgetBytes { get; init; }
 
+    /// <summary>Recurrent-state checkpoint every this many prefill tokens for mid-history resume (issue #1286); 0 disables.</summary>
+    public int PromptCacheStep { get; init; }
+
+    /// <summary>Most step checkpoints kept; null means the engine default (8).</summary>
+    public int? PromptCacheStepKeep { get; init; }
+
     /// <summary>Validates and resolves recurrent snapshot limits for this server.</summary>
     public RecurrentPrefixCacheOptions GetPrefixSnapshotOptions()
     {
@@ -73,6 +79,8 @@ public sealed record ServerOptions
         if (count < 1) throw new ArgumentOutOfRangeException(nameof(PrefixSnapshots), "--prefix-snapshots must be at least 1.");
         if (PrefixSnapshotHostBudgetBytes < 0) throw new ArgumentOutOfRangeException(nameof(PrefixSnapshotHostBudgetBytes));
         if (PrefixSnapshotDiskBudgetBytes < 0) throw new ArgumentOutOfRangeException(nameof(PrefixSnapshotDiskBudgetBytes));
+        if (PromptCacheStep < 0) throw new ArgumentOutOfRangeException(nameof(PromptCacheStep), "--prompt-cache-step must not be negative.");
+        if (PromptCacheStepKeep < 1) throw new ArgumentOutOfRangeException(nameof(PromptCacheStepKeep), "--prompt-cache-step-keep must be at least 1.");
         string? directory = PrefixSnapshotDiskDirectory;
         if (directory is not null && string.IsNullOrWhiteSpace(directory))
             throw new ArgumentException("--prefix-snapshot-disk-dir must name a directory.");
@@ -85,14 +93,16 @@ public sealed record ServerOptions
             { throw new ArgumentException("--prefix-snapshot-disk-dir is not a valid directory path.", ex); }
         }
         return new() { MaxEntries = count, HostBudgetBytes = PrefixSnapshotHostBudgetBytes,
-            DiskDirectory = directory, DiskBudgetBytes = PrefixSnapshotDiskBudgetBytes };
+            DiskDirectory = directory, DiskBudgetBytes = PrefixSnapshotDiskBudgetBytes,
+            StepTokens = PromptCacheStep, MaxStepCheckpoints = PromptCacheStepKeep ?? new RecurrentPrefixCacheOptions().MaxStepCheckpoints };
     }
 
     /// <summary>Resolves CLI count and human-readable host byte budget before loading a model.</summary>
     public static RecurrentPrefixCacheOptions BuildPrefixSnapshotOptions(int? count, string? hostBudget,
-        string? diskDirectory = null, string? diskBudget = null)
+        string? diskDirectory = null, string? diskBudget = null, int step = 0, int? stepKeep = null)
         => new ServerOptions { Model = "", PrefixSnapshots = count, PrefixSnapshotHostBudgetBytes = ParsePrefixSnapshotHostBudget(hostBudget),
-            PrefixSnapshotDiskDirectory = diskDirectory, PrefixSnapshotDiskBudgetBytes = ParsePrefixSnapshotDiskBudget(diskBudget) }
+            PrefixSnapshotDiskDirectory = diskDirectory, PrefixSnapshotDiskBudgetBytes = ParsePrefixSnapshotDiskBudget(diskBudget),
+            PromptCacheStep = step, PromptCacheStepKeep = stepKeep }
             .GetPrefixSnapshotOptions();
 
     /// <summary>Parses nonnegative bytes or decimal/binary units, for example 8000000, 8GB or 8GiB.</summary>
@@ -394,6 +404,8 @@ public sealed record ServerOptions
         bool allowModelAdmin = false;
         bool allowLoraAdmin = false;
         int? maxMessagesCli = null;
+        int promptCacheStep = 0;
+        int? promptCacheStepKeep = null;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -478,6 +490,10 @@ public sealed record ServerOptions
                     prefixSnapshotDiskDirectory = next ?? throw new ArgumentException("--prefix-snapshot-disk-dir requires a path."); i++; break;
                 case "--prefix-snapshot-disk-budget":
                     prefixSnapshotDiskBudget = next ?? throw new ArgumentException("--prefix-snapshot-disk-budget requires a size."); i++; break;
+                case "--prompt-cache-step":
+                    promptCacheStep = int.Parse(next ?? throw new ArgumentException("--prompt-cache-step requires a token count."), System.Globalization.CultureInfo.InvariantCulture); i++; break;
+                case "--prompt-cache-step-keep":
+                    promptCacheStepKeep = int.Parse(next ?? throw new ArgumentException("--prompt-cache-step-keep requires a count."), System.Globalization.CultureInfo.InvariantCulture); i++; break;
                 case "--rope-scaling":
                     ropeScaling = next; i++; break;
                 case "--rope-freq-base":
@@ -525,7 +541,8 @@ public sealed record ServerOptions
         if (modelId.EndsWith(".gguf", StringComparison.OrdinalIgnoreCase))
             modelId = modelId[..^5];
 
-        var snapshotOptions = BuildPrefixSnapshotOptions(prefixSnapshots, prefixSnapshotHostBudget, prefixSnapshotDiskDirectory, prefixSnapshotDiskBudget);
+        var snapshotOptions = BuildPrefixSnapshotOptions(prefixSnapshots, prefixSnapshotHostBudget, prefixSnapshotDiskDirectory, prefixSnapshotDiskBudget,
+            promptCacheStep, promptCacheStepKeep);
         return new ServerOptions
         {
             Model = model,
@@ -546,6 +563,8 @@ public sealed record ServerOptions
             PrefixSnapshotHostBudgetBytes = snapshotOptions.HostBudgetBytes,
             PrefixSnapshotDiskDirectory = snapshotOptions.DiskDirectory,
             PrefixSnapshotDiskBudgetBytes = snapshotOptions.DiskBudgetBytes,
+            PromptCacheStep = snapshotOptions.StepTokens,
+            PromptCacheStepKeep = promptCacheStepKeep,
             UsePaged = usePaged,
             Warmup = new WarmupOptions
             {

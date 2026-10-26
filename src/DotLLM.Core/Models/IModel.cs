@@ -362,6 +362,13 @@ public interface IModel : IDisposable
     object? CheckpointRecurrentState() => null;
 
     /// <summary>
+    /// Bytes one <see cref="CheckpointRecurrentState"/> snapshot holds, in the state's own dtype, or 0 when unknown. A caller that
+    /// retains several checkpoints (the mid-history prompt-cache steps, issue #1286) needs it to honour a byte budget, and
+    /// does not retain them when it is unknown.
+    /// </summary>
+    long RecurrentStateCheckpointBytes => 0;
+
+    /// <summary>
     /// True when <see cref="SnapshotSequencePrefix"/> / <see cref="RestoreSequencePrefix"/> are implemented: a PER-SEQUENCE
     /// (threaded-state) prefix, i.e. the first N tokens' KV rows plus that sequence's recurrent state, can be captured
     /// into an independent snapshot and later restored into a DIFFERENT sequence's KV cache + state container. This is what a

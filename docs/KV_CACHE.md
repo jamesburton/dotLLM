@@ -796,6 +796,42 @@ live KV handle rather than copying it, and the head now gets the same treatment:
 With no snapshot held, a prompt that shares nothing usable with the previous one (the first turn of a conversation)
 now snapshots at its own end. The second agent turn then hits instead of re-prefilling the first.
 
+## Mid-history resume: step checkpoints (#1286)
+
+An agent that trims an old tool result resends a prompt that diverges from the cached history in the middle. The
+single-slot snapshot sits at the end of the last prompt, so before #1286 that was a miss and a full re-prefill.
+
+`--prompt-cache-step N` (chat and serve; `RecurrentPrefixCacheOptions.StepTokens`) checkpoints the recurrent state every
+N prefill tokens, at absolute positions that are multiples of N. Idea from azllm's `--prompt-cache-step`.
+
+- **Resume.** A new request finds where it diverges from the cached history and resumes from the deepest checkpoint at
+  or before that point. It rolls the KV back there and re-prefills only the rest.
+- **KV is shared.** Attention KV is per token, so every checkpoint along one history shares the single slot's KV
+  handle. A step copies only the recurrent (GDN/conv) state, in its own dtype
+  (`IModel.RecurrentStateCheckpointBytes`).
+- **Invalidation.** Checkpoints past the resume point are dropped, because the request overwrites those rows.
+- **Bounds.** The newest (deepest) `--prompt-cache-step-keep K` steps are kept, default 8; `StepBudgetBytes` adds an
+  optional byte cap. When steps are on, the boundary a hit moves past is kept as a step too, so a retried turn (#1090)
+  resumes there.
+- **Default off.** Each step is a full recurrent-state copy, which needs sign-off under the avoid-state-copies rule.
+  Bonsai-2 27B holds about 150 MiB of state per checkpoint, so eight steps cost about 1.2 GiB (in VRAM on CUDA/Vulkan).
+  Enable it where agent traces trim history.
+- **MTP.** A mid-history resume decodes plain, because the MTP head is marked only at the snapshot boundary.
+- **Scope.** Steps live on the single-slot path only (CPU, and CUDA/Vulkan hosts with `CheckpointRecurrentState`). The
+  tiered cache (`--prefix-snapshots` > 1) and the continuous-batch scheduler copy KV rows into every snapshot, so
+  periodic snapshots there would copy the history again and again. They wait for KV rows shared with the snapshot
+  (#1111). A model that cannot size its checkpoints takes no steps.
+
+Measured on CPU (Bonsai-2 2B PQ2_0; `HybridMidHistoryResumeProbe`, `DOTLLM_HYBRID_RESUME_PROBE=1`), step 512:
+
+- **Trace.** A 3,523-token agent trace. The second request trims the middle tool result, giving 2,392 tokens that share
+  1,222 with the first.
+- **Resume and output.** The resumed request restored the step at 1,024 and re-prefilled 1,368 tokens. Its greedy output
+  is identical to a cold prefill.
+- **TTFT.** 127 s resumed against 467 s cold. Absolute times are inflated by other workloads on the box, so read the ratio,
+  not the seconds.
+- **Size.** One checkpoint is 19.3 MiB (F32 GDN + conv state); the six steps held cost 115.6 MiB.
+
 ## Disk spill below the host tier (#1034)
 
 Use all three limits to retain more conversations than fit in pinned memory:

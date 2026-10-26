@@ -1356,6 +1356,9 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
         return new PooledGdnCheckpoint(this, snapshot);
     }
 
+    /// <inheritdoc/>
+    public long RecurrentStateCheckpointBytes => _gdnCache.AllocatedBytes;
+
     private GdnStateCache? _spareGdnCheckpoint;
 
     /// <summary>A pooled GDN snapshot; disposing returns its buffers to the owning model.</summary>

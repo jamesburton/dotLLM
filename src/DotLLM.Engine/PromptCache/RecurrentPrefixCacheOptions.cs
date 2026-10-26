@@ -11,6 +11,21 @@ public sealed record RecurrentPrefixCacheOptions
     public string? DiskDirectory { get; init; }
     /// <summary>Maximum owned disk bytes including file headers and temporary writes.</summary>
     public long DiskBudgetBytes { get; init; }
+
+    /// <summary>
+    /// Mid-history resume (issue #1286): checkpoint the recurrent state every this many prefill tokens, at absolute positions
+    /// that are multiples of it, so a request that diverges from the cached history (an agent trimming an old tool result)
+    /// resumes from the deepest checkpoint at or before the divergence instead of re-prefilling everything. 0 (default)
+    /// disables it. Applies to the single-slot path, whose KV rows are shared by every checkpoint along one history; each
+    /// checkpoint copies only the recurrent state (<see cref="DotLLM.Core.Models.IModel.RecurrentStateCheckpointBytes"/>).
+    /// </summary>
+    public int StepTokens { get; init; }
+
+    /// <summary>Most step checkpoints kept (the deepest are kept); default 8, as azllm's <c>--prompt-cache-step</c>.</summary>
+    public int MaxStepCheckpoints { get; init; } = 8;
+
+    /// <summary>Byte cap over the retained step checkpoints. 0 (default) leaves <see cref="MaxStepCheckpoints"/> as the only bound.</summary>
+    public long StepBudgetBytes { get; init; }
 }
 
 /// <summary>Recurrent prefix cache occupancy and lifetime counters.</summary>
@@ -48,4 +63,8 @@ public sealed record RecurrentPrefixCacheStatistics
     public long Evictions { get; init; }
     /// <summary>Failed restores discarded as misses.</summary>
     public long RestoreFailures { get; init; }
+    /// <summary>Mid-history step checkpoints currently retained (issue #1286).</summary>
+    public int StepCheckpoints { get; init; }
+    /// <summary>Bytes held by the retained step checkpoints.</summary>
+    public long StepCheckpointBytes { get; init; }
 }
