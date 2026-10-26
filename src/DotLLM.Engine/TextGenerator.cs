@@ -613,7 +613,7 @@ public sealed partial class TextGenerator
                     stopConditionsForSuffixTrim: stopConditions);
             }
 
-            int specDrafted = 0, specAccepted = 0;
+            int specDrafted = 0, specAccepted = 0, specSteps = 0;
             bool useDraftSpec = _draftModel != null && !captureLogprobs && IsEffectivelyGreedy(options);
             bool useLookupSpec = UsePromptLookup(useDraftSpec, useMtp, captureLogprobs, options);
             int mtpFallbackStep = 0;                // > 0: the MTP rounds measured slower than plain decode; plain decode resumes at this step (#900)
@@ -659,6 +659,7 @@ public sealed partial class TextGenerator
 
                         decodeTicks += result.DraftTicks + result.VerifyTicks;
                         specDrafted += result.DraftedCount;
+                        specSteps++;
 
                         // Constraint is already advanced inside DraftAndVerify — do NOT advance again here.
                         // Only count tokens that actually make it into output (stop conditions may discard some).
@@ -752,6 +753,7 @@ public sealed partial class TextGenerator
                         }
                         mtpCtl?.Record(result.DraftedCount, result.AcceptedCount, result.RoundTicks * 1000.0 / Stopwatch.Frequency);
                         specDrafted += result.DraftedCount;
+                        specSteps++;
 
                         // Constraint is already advanced inside DraftAndVerify — do NOT advance again here.
                         bool shouldBreak = false;
@@ -889,7 +891,7 @@ public sealed partial class TextGenerator
             RecordMtpGate(mtpGate, useMtp, generatedIds.Count, mtpTicks, mtpTokens, decodeTicks, samplerTicks);
             return BuildResponse(promptLen, generatedIds, finishReason,
                 prefillTicks, decodeTicks, samplerTicks, GetKvCacheBytes(kvCache), cachedTokenCount,
-                specDrafted, specAccepted, logprobsList?.ToArray(),
+                specDrafted, specAccepted, specSteps, logprobsList?.ToArray(),
                 stopConditionsForSuffixTrim: stopConditions);
         }
         finally
@@ -1163,7 +1165,7 @@ public sealed partial class TextGenerator
                 yield return new GenerationToken(firstTokenId, text, null, Logprobs: firstLogprobInfo);
             }
 
-            int specDrafted = 0, specAccepted = 0;
+            int specDrafted = 0, specAccepted = 0, specSteps = 0;
             bool useDraftSpec = _draftModel != null && !captureLogprobs && IsEffectivelyGreedy(options);
             bool useLookupSpec = UsePromptLookup(useDraftSpec, useMtp, captureLogprobs, options);
             int mtpFallbackStep = 0;                // > 0: the MTP rounds measured slower than plain decode; plain decode resumes at this step (#900)
@@ -1206,6 +1208,7 @@ public sealed partial class TextGenerator
 
                         decodeTicks += result.DraftTicks + result.VerifyTicks;
                         specDrafted += result.DraftedCount;
+                        specSteps++;
 
                         // Constraint is already advanced inside DraftAndVerify — do NOT advance again here.
                         // Only count tokens that actually make it into output.
@@ -1226,14 +1229,14 @@ public sealed partial class TextGenerator
                                 {
                                     generatedIds.RemoveAt(generatedIds.Count - 1);
                                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
-                                    var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
+                                    var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted, specSteps);
                                     yield return new GenerationToken(tokenId, detok.TakeWithheld(), fr, timings, GeneratedTokenCount: generatedIds.Count);
                                 }
                                 else
                                 {
                                     if (i < result.AcceptedCount - 1) specAccepted++;   // drafts only: the round's last token is the target's own
                                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
-                                    var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
+                                    var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted, specSteps);
                                     string text = detok.TakeDelta(flushIncomplete: true);
                                     yield return new GenerationToken(tokenId, text, fr, timings, GeneratedTokenCount: generatedIds.Count);
                                 }
@@ -1250,7 +1253,7 @@ public sealed partial class TextGenerator
                                 if (isLastStep && i == result.AcceptedCount - 1)
                                 {
                                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
-                                    var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
+                                    var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted, specSteps);
                                     yield return new GenerationToken(tokenId, text, FinishReason.Length, timings, GeneratedTokenCount: generatedIds.Count);
                                     shouldBreak = true;
                                     break;
@@ -1310,6 +1313,7 @@ public sealed partial class TextGenerator
                         }
                         mtpCtl?.Record(result.DraftedCount, result.AcceptedCount, result.RoundTicks * 1000.0 / Stopwatch.Frequency);
                         specDrafted += result.DraftedCount;
+                        specSteps++;
 
                         // Constraint is already advanced inside DraftAndVerify — do NOT advance again here.
                         bool shouldBreak = false;
@@ -1328,14 +1332,14 @@ public sealed partial class TextGenerator
                                 {
                                     generatedIds.RemoveAt(generatedIds.Count - 1);
                                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
-                                    var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
+                                    var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted, specSteps);
                                     yield return new GenerationToken(tokenId, detok.TakeWithheld(), fr, timings, GeneratedTokenCount: generatedIds.Count);
                                 }
                                 else
                                 {
                                     specAccepted++;
                                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
-                                    var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
+                                    var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted, specSteps);
                                     string text = detok.TakeDelta(flushIncomplete: true);
                                     yield return new GenerationToken(tokenId, text, fr, timings, GeneratedTokenCount: generatedIds.Count);
                                 }
@@ -1352,7 +1356,7 @@ public sealed partial class TextGenerator
                                 if (isLastStep && i == result.AcceptedCount - 1)
                                 {
                                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
-                                    var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
+                                    var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted, specSteps);
                                     yield return new GenerationToken(tokenId, text, FinishReason.Length, timings, GeneratedTokenCount: generatedIds.Count);
                                     shouldBreak = true;
                                     break;
@@ -1423,13 +1427,13 @@ public sealed partial class TextGenerator
                         {
                             generatedIds.RemoveAt(generatedIds.Count - 1);
                             StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
-                            var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
+                            var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted, specSteps);
                             yield return new GenerationToken(nextTokenId, detok.TakeWithheld(), fr, timings, tokenLogprob, GeneratedTokenCount: generatedIds.Count);
                         }
                         else
                         {
                             StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
-                            var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
+                            var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted, specSteps);
                             string text = detok.TakeDelta(flushIncomplete: true);
                             yield return new GenerationToken(nextTokenId, text, fr, timings, tokenLogprob, GeneratedTokenCount: generatedIds.Count);
                         }
@@ -1443,7 +1447,7 @@ public sealed partial class TextGenerator
                         if (isLastStep)
                         {
                             StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
-                            var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
+                            var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted, specSteps);
                             yield return new GenerationToken(nextTokenId, text, FinishReason.Length, timings, tokenLogprob, GeneratedTokenCount: generatedIds.Count);
                             yield break;
                         }
@@ -2057,6 +2061,7 @@ public sealed partial class TextGenerator
         int chunkSize = configured > 0 ? Math.Min(configured, prefillLen) : prefillLen;
         int[] positionsArray = ArrayPool<int>.Shared.Rent(chunkSize);
         ITensor? logits = null;
+        PrefillPulse? pulse = RequestTimingLog.BeginPrefill(prefillLen); // null (free) unless timing logs are on (#1288)
         try
         {
             int offset = 0;
@@ -2081,6 +2086,9 @@ public sealed partial class TextGenerator
                 logits = _model.Forward(promptIds.AsSpan(prefillStart + offset, len), positions,
                     deviceId: -1, kvCache, adapter, mtpState, lastTokenLogitsOnly: true);
                 offset += len;
+
+                // Forward returned host logits, so the device has finished this chunk: count completed work, not queued.
+                pulse?.Advance(len);
                 if (onSnapshotPoint is not null && prefillStart + offset == snapshotAt)
                     onSnapshotPoint();
             }
@@ -2093,6 +2101,7 @@ public sealed partial class TextGenerator
         }
         finally
         {
+            pulse?.Dispose();
             ArrayPool<int>.Shared.Return(positionsArray);
         }
     }
@@ -2144,7 +2153,7 @@ public sealed partial class TextGenerator
     private InferenceResponse BuildResponse(int promptLen, List<int> generatedIds,
         FinishReason finishReason, long prefillTicks, long decodeTicks, long samplerTicks,
         long kvCacheBytes = 0, int cachedTokenCount = 0,
-        int specDrafted = 0, int specAccepted = 0,
+        int specDrafted = 0, int specAccepted = 0, int specSteps = 0,
         TokenLogprobInfo[]? logprobs = null,
         List<IStopCondition>? stopConditionsForSuffixTrim = null)
     {
@@ -2174,7 +2183,7 @@ public sealed partial class TextGenerator
             FinishReason = finishReason,
             PromptTokenCount = promptLen,
             GeneratedTokenCount = generatedIds.Count,
-            Timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvCacheBytes, cachedTokenCount, specDrafted, specAccepted),
+            Timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvCacheBytes, cachedTokenCount, specDrafted, specAccepted, specSteps),
             Logprobs = logprobs,
             MatchedStopSequence = matchedStop,
         };
@@ -2182,12 +2191,12 @@ public sealed partial class TextGenerator
 
     private InferenceTimings BuildTimings(int promptLen, int generatedCount,
         long prefillTicks, long decodeTicks, long samplerTicks, long kvCacheBytes = 0,
-        int cachedTokenCount = 0, int specDrafted = 0, int specAccepted = 0)
+        int cachedTokenCount = 0, int specDrafted = 0, int specAccepted = 0, int specSteps = 0)
     {
         double tickFreq = Stopwatch.Frequency;
         int decodeSteps = generatedCount > 1 ? generatedCount - 1 : 0;
 
-        return new InferenceTimings
+        var timings = new InferenceTimings
         {
             PrefillTimeMs = prefillTicks / tickFreq * 1000.0,
             DecodeTimeMs = decodeTicks / tickFreq * 1000.0,
@@ -2199,8 +2208,13 @@ public sealed partial class TextGenerator
             CacheTier = LastPrefixCacheTier,
             CacheRestoreMilliseconds = LastPrefixRestoreMilliseconds,
             SpeculativeDraftTokens = specDrafted,
-            SpeculativeAcceptedTokens = specAccepted
+            SpeculativeAcceptedTokens = specAccepted,
+            SpeculativeSteps = specSteps,
         };
+
+        // Built exactly once per finished request, so this is the per-request timing line (#1288).
+        RequestTimingLog.Report(timings);
+        return timings;
     }
 
     /// <summary>

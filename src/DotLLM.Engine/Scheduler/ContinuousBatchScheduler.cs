@@ -289,7 +289,11 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             stopConditions: stops,
             constraint: constraint,
             submissionOrder: Interlocked.Increment(ref _submissionCounter),
-            tcs: tcs);
+            tcs: tcs)
+        {
+            // Submitted on the request's flow: keep its log scope for the timing line the run loop writes (#1288).
+            LogContext = RequestTimingLog.CaptureContext(),
+        };
 
         // Stop strings match on decoded text, so give this sequence a detokenizer to produce one
         // (#459). Only when a stop string is actually registered — token-level conditions (EOS,
@@ -1047,6 +1051,10 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         if (_prefillPositions.Length < totalTokens)
             _prefillPositions = new int[totalTokens];
 
+        // Live progress for this step's prefill (#1288), tagged with the first submitter; null (free) when logging is off.
+        // A prompt prefills in one step here, so the pulse mostly shows elapsed time until the forward returns.
+        using var pulse = count > 0 ? RequestTimingLog.BeginPrefill(totalTokens, _prefillReady[0].Seq.LogContext) : null;
+
         _prefillBatch.Clear();
         int off = 0;
         for (int i = 0; i < count; i++)
@@ -1086,6 +1094,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                 return;
             }
             long perSeqTicks = (Stopwatch.GetTimestamp() - fwdStart) / count;
+            pulse?.Advance(totalTokens);
 
             for (int i = 0; i < count; i++)
             {
@@ -1156,6 +1165,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                     continue;
                 }
                 seq.PrefillTicks += Stopwatch.GetTimestamp() - fwdStart;
+                pulse?.Advance(p.ForwardLen);
                 try
                 {
                     FinishPrefill(seq, logits);
@@ -1641,6 +1651,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             seq.DecodeTicks,
             seq.SamplerTicks,
             kvBytes) with { CachedTokenCount = seq.PrefixCachedTokens };
+        RequestTimingLog.Report(timings, seq.LogContext);
 
         var response = new InferenceResponse
         {

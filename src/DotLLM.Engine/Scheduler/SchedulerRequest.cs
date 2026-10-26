@@ -59,6 +59,9 @@ internal sealed class SchedulerRequest : ISchedulerRequest
     /// <summary>Prompt tokens that were reused from the prefix trie (no prefill needed).</summary>
     public int PrefixCachedTokens { get; set; }
 
+    /// <summary>The submitter's execution context for the per-request timing line (#1288); null when timing logs are off.</summary>
+    public ExecutionContext? LogContext { get; init; }
+
     /// <summary>
     /// True when this sequence was preempted and re-queued and must be re-admitted via the
     /// recompute-on-resume path (rebuild KV from prompt + already-generated tokens) instead of a

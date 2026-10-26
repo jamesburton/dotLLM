@@ -42,6 +42,15 @@ public readonly record struct InferenceTimings
     /// </summary>
     public int SpeculativeAcceptedTokens { get; init; }
 
+    /// <summary>Draft-and-verify rounds run during speculative decoding (#1288). 0 when not speculating.</summary>
+    public int SpeculativeSteps { get; init; }
+
+    /// <summary>
+    /// Mean tokens emitted per speculative verify round (accepted drafts plus the bonus token), i.e. the mean accepted
+    /// length; 0 when no speculation ran.
+    /// </summary>
+    public double SpeculativeMeanAcceptedLength => SpeculativeSteps > 0 ? (double)SpeculativeAcceptedTokens / SpeculativeSteps : 0;
+
     /// <summary>
     /// Draft acceptance rate: proportion of draft tokens that matched the target model.
     /// Clamped to [0, 1] — bonus tokens (produced when all K drafts are accepted) are not counted

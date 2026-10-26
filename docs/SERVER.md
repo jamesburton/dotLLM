@@ -287,6 +287,26 @@ Logged: arrival (method + path), the requested `model`, lock waits (only when co
 duration, or the failure), idle-unload / explicit unload, and completion (status + duration) or cancellation. `GET`s (health / props polling)
 are not logged. Spectre.Console output (banner, spinners) is not stamped.
 
+### Timing lines and prefill progress (#1288)
+
+Every finished generation writes one llama.cpp `print_timing`-style line, and a long prefill reports progress every 3 s:
+
+```
+[dotllm] req#3 prefill: 8192/30000 tokens (27.3%), 2730.1 tok/s, 3.0s elapsed
+[dotllm] req#3 timing: prompt eval 10987.0 ms / 30000 tokens (0.37 ms/tok, 2730.5 tok/s) | eval 2310.4 ms / 127 tokens (18.19 ms/tok, 55.0 tok/s) | prompt cache 512/30512 tokens reused | draft acceptance 0.712 (89/125), mean len 2.31
+```
+
+- Prompt eval counts **computed** tokens only; prefix-cache hits are reported separately (`prompt cache N/M tokens reused`).
+- `draft acceptance` (accepted/drafted) and `mean len` (tokens emitted per verify round) appear only when speculation (draft
+  model or MTP) ran.
+- Progress counts a prefill chunk once `IModel.Forward` returned for it. Every backend returns host logits, so it has synchronised
+  its device first (CUDA stream sync, Vulkan fence): the count is completed work, not queued work. It needs a chunked prefill —
+  `--prefill-chunk-size`, or a model that chunks itself — otherwise the only report is `0/N` plus elapsed time.
+- The continuous-batch scheduler writes both, tagged with the submitting request, but it prefills a whole prompt in one
+  step (`MaxPrefillTokensPerStep` gates admission, it does not split a prompt), so its pulse shows `0/N` plus elapsed time
+  until that forward returns: proof of life, not a fraction.
+- `DOTLLM_LOG_TIMINGS=0` turns both off; the engine then pays a single null check per request.
+
 ## CPU KV cache type default (#1284)
 
 With paged KV (the `serve` default) on CPU, leaving both `--cache-type-k` and `--cache-type-v` unset selects Q8_0 paged blocks on uniform,
