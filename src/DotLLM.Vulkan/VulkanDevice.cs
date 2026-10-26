@@ -1886,6 +1886,12 @@ public sealed class VulkanDevice : IDisposable
     /// <summary>Per-instance override of the synthetic device-local limit (test hook, issue #810); &lt; 0 disables.</summary>
     internal void SetDeviceLocalLimitBytes(long bytes) => _deviceLocalLimitBytes = bytes;
 
+    /// <summary>
+    /// Test hook (#1290): fill every new buffer with NaN bytes, so a shader that reads scratch it never wrote (padding rows
+    /// past the token count, stale capacity) poisons its output instead of passing.
+    /// </summary>
+    internal static bool TestPoisonNewBuffers;
+
     /// <summary>Live bytes this device holds on <paramref name="heap"/> (test hook).</summary>
     internal long LiveBytesOnHeap(int heap) => Interlocked.Read(ref _liveBytesByHeap[heap]);
 
@@ -2360,7 +2366,10 @@ public sealed class VulkanDevice : IDisposable
                 $"[vulkan-mem] alloc {req.size} B type={typeIndex} heap={heapIndex} at {TraceSite()} -> {MemorySnapshot()}");
         }
 
-        return new Buffer(this, buffer, memory, bytes, hostVisible, heapIndex, (long)req.size, typeIndex);
+        var result = new Buffer(this, buffer, memory, bytes, hostVisible, heapIndex, (long)req.size, typeIndex);
+        if (TestPoisonNewBuffers)
+            FillBufferSynchronous(result, 0xFFFFFFFFu);   // NaN in F16 and F32 (#1290)
+        return result;
         }
         finally
         {
@@ -2678,7 +2687,28 @@ public sealed class VulkanDevice : IDisposable
     /// path (the fence-pipelined path uses <c>vkCmdCopyBuffer</c> directly
     /// against the forward pass's shared command buffer).
     /// </summary>
-    public unsafe void CopyBufferRangeSynchronous(Buffer src, Buffer dst, ulong srcOffset, ulong dstOffset, ulong size)
+    public void CopyBufferRangeSynchronous(Buffer src, Buffer dst, ulong srcOffset, ulong dstOffset, ulong size)
+    {
+        nint cmdBuf = BeginOneShot("CopyBufferRangeSynchronous", out nint fence);
+        var region = new VkBufferCopy { srcOffset = srcOffset, dstOffset = dstOffset, size = size };
+        VulkanApi.vkCmdCopyBuffer(cmdBuf, src.Handle, dst.Handle, 1, region);
+        SubmitOneShotAndWait("CopyBufferRangeSynchronous", cmdBuf, fence);
+    }
+
+    /// <summary>Fills all of <paramref name="dst"/> with the 32-bit <paramref name="pattern"/> and waits (one-shot <c>vkCmdFillBuffer</c>).</summary>
+    /// <param name="dst">Buffer to fill.</param>
+    /// <param name="pattern">Repeated 4-byte pattern.</param>
+    internal void FillBufferSynchronous(Buffer dst, uint pattern)
+    {
+        nint cmdBuf = BeginOneShot("FillBufferSynchronous", out nint fence);
+        VulkanApi.vkCmdFillBuffer(cmdBuf, dst.Handle, 0, VkWholeSize, pattern);
+        SubmitOneShotAndWait("FillBufferSynchronous", cmdBuf, fence);
+    }
+
+    private const ulong VkWholeSize = ulong.MaxValue;   // VK_WHOLE_SIZE
+
+    /// <summary>Allocates a one-time command buffer and its fence and begins recording.</summary>
+    private nint BeginOneShot(string site, out nint fence)
     {
         var cbai = new VkCommandBufferAllocateInfo
         {
@@ -2687,26 +2717,35 @@ public sealed class VulkanDevice : IDisposable
             level = VkCommandBufferLevel.Primary,
             commandBufferCount = 1,
         };
-        VulkanApi.vkAllocateCommandBuffers(_device, cbai, out nint cmdBuf)
-            .ThrowOnError("vkAllocateCommandBuffers CopyBufferRangeSynchronous");
+        VulkanApi.vkAllocateCommandBuffers(_device, cbai, out nint cmdBuf).ThrowOnError($"vkAllocateCommandBuffers {site}");
 
         var fenceCi = new VkFenceCreateInfo { sType = VkStructureType.FenceCreateInfo };
-        VulkanApi.vkCreateFence(_device, fenceCi, 0, out nint fence)
-            .ThrowOnError("vkCreateFence CopyBufferRangeSynchronous");
+        if (VulkanApi.vkCreateFence(_device, fenceCi, 0, out fence) is var rc and < 0)
+        {
+            VulkanApi.vkFreeCommandBuffers(_device, _commandPool, 1, cmdBuf);
+            rc.ThrowOnError($"vkCreateFence {site}");
+        }
 
+        var begin = new VkCommandBufferBeginInfo
+        {
+            sType = VkStructureType.CommandBufferBeginInfo,
+            flags = VkCommandBufferUsageFlags.OneTimeSubmit,
+        };
+        if (VulkanApi.vkBeginCommandBuffer(cmdBuf, begin) is var brc and < 0)
+        {
+            VulkanApi.vkDestroyFence(_device, fence, 0);
+            VulkanApi.vkFreeCommandBuffers(_device, _commandPool, 1, cmdBuf);
+            brc.ThrowOnError($"vkBeginCommandBuffer {site}");
+        }
+        return cmdBuf;
+    }
+
+    /// <summary>Ends, submits and waits for a <see cref="BeginOneShot"/> command buffer, then frees it and its fence.</summary>
+    private unsafe void SubmitOneShotAndWait(string site, nint cmdBuf, nint fence)
+    {
         try
         {
-            var begin = new VkCommandBufferBeginInfo
-            {
-                sType = VkStructureType.CommandBufferBeginInfo,
-                flags = VkCommandBufferUsageFlags.OneTimeSubmit,
-            };
-            VulkanApi.vkBeginCommandBuffer(cmdBuf, begin).ThrowOnError("vkBeginCommandBuffer CopyBufferRangeSynchronous");
-
-            var region = new VkBufferCopy { srcOffset = srcOffset, dstOffset = dstOffset, size = size };
-            VulkanApi.vkCmdCopyBuffer(cmdBuf, src.Handle, dst.Handle, 1, region);
-
-            VulkanApi.vkEndCommandBuffer(cmdBuf).ThrowOnError("vkEndCommandBuffer CopyBufferRangeSynchronous");
+            VulkanApi.vkEndCommandBuffer(cmdBuf).ThrowOnError($"vkEndCommandBuffer {site}");
 
             var submit = new VkSubmitInfo
             {
@@ -2714,11 +2753,10 @@ public sealed class VulkanDevice : IDisposable
                 commandBufferCount = 1,
                 pCommandBuffers = (nint)(&cmdBuf),
             };
-            VulkanApi.vkQueueSubmit(_queue, 1, submit, fence).ThrowOnError("vkQueueSubmit CopyBufferRangeSynchronous");
+            VulkanApi.vkQueueSubmit(_queue, 1, submit, fence).ThrowOnError($"vkQueueSubmit {site}");
 
             nint fenceLocal = fence;
-            VulkanApi.vkWaitForFences(_device, 1, fenceLocal, waitAll: 1, ulong.MaxValue)
-                .ThrowOnError("vkWaitForFences CopyBufferRangeSynchronous");
+            VulkanApi.vkWaitForFences(_device, 1, fenceLocal, waitAll: 1, ulong.MaxValue).ThrowOnError($"vkWaitForFences {site}");
         }
         finally
         {
