@@ -100,6 +100,9 @@ public sealed class QwenXmlToolCallParser : IToolCallParser
     }
 
     /// <inheritdoc/>
+    public IReadOnlyList<string> StartMarkers { get; } = [OpenTag, FunctionOpen];
+
+    /// <inheritdoc/>
     public bool IsToolCallStart(string text)
         => text.Contains(OpenTag, StringComparison.Ordinal)
            || text.Contains(FunctionOpen, StringComparison.Ordinal);

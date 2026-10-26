@@ -318,6 +318,16 @@ var toolCalls = accumulator.TryParseCompleted();
 - Once `IsToolCallStart()` triggers: `Append()` returns `true` for all subsequent text — caller suppresses output.
 - After generation: `TryParseCompleted()` extracts the full tool call(s).
 
+**Marker-tail hold-back (#1287)** — what the server endpoints use: `AppendStreamable(text)` returns the part of the new
+text that is safe to stream now. Each parser declares its literal call openers (`IToolCallParser.StartMarkers`:
+`<tool_call>`, `<|python_tag|>`, `[TOOL_CALLS]`, `<|tool_call>`, `<|tool_call|>`, `<|tool_call_start|>`, `<function=`,
+Harmony's `<|start|>` / `<|channel|>` / `to=functions.`, and `{` for the generic bare-JSON parser). Text streams up to the
+first complete marker; only a trailing fragment that is a prefix of some marker (`<to`, `<|pyth`) is held, and released as
+soon as it stops matching. A parser heuristic with no literal marker (`IsToolCallStart`, e.g. a bare pythonic call) still
+stops emission where it fires. `EmittedLength` tells the caller where held text starts, so text that never parses into a
+call is delivered after generation. This applies to every parser, including a forced `tool_choice` (generic parser) and the
+generic parser as an unknown model's own parser: brace-bearing prose there is delayed until the end of the turn, not lost.
+
 ## Chat Template Integration
 
 The Jinja2 chat template engine (Step 16) handles tool definitions natively:
@@ -541,5 +551,5 @@ The weather in Paris is 22°C and sunny.
 
 Tracked under Wave 8 ([issue #121](https://github.com/kkokosa/dotLLM/issues/121)).
 
-- **Streaming tool calls arrive whole, not as argument fragments.** `/v1/chat/completions` with `stream: true` no longer leaks tool-call markup as `delta.content` (#771): from the moment the model-family parser's `IsToolCallStart` recognises a call, tokens are held back (prose before the call still streams), and the parsed calls are emitted in the **final** chunk's `delta.tool_calls` with `finish_reason: "tool_calls"`. Held-back text that does not parse into a call (truncated generation) is delivered as one trailing `delta.content` chunk, never swallowed. What is NOT done: incremental `delta.tool_calls` fragments (partial `arguments` strings) — a call is reported only once complete. A marker split across tokens (`<tool` | `_call>`) leaks its first fragment, because detection runs on the accumulated text. The Anthropic stream behaves the same (`tool_use` blocks after the text block).
+- **Streaming tool calls arrive whole, not as argument fragments.** `/v1/chat/completions` with `stream: true` no longer leaks tool-call markup as `delta.content` (#771): from the moment the model-family parser's `IsToolCallStart` recognises a call, tokens are held back (prose before the call still streams), and the parsed calls are emitted in the **final** chunk's `delta.tool_calls` with `finish_reason: "tool_calls"`. Held-back text that does not parse into a call (truncated generation) is delivered as one trailing `delta.content` chunk, never swallowed. What is NOT done: incremental `delta.tool_calls` fragments (partial `arguments` strings) — a call is reported only once complete. A marker split across tokens (`<tool` | `_call>`) no longer leaks its first fragment (#1287: only a could-become-marker tail is held, see above). The Anthropic stream behaves the same (`tool_use` blocks after the text block).
 - **`tool_choice` other than `auto` is not enforced.** The server parses `tool_choice` from the request but does not currently constrain decoding for `"required"` or specific-function values. The short-term plan is to reject unsupported `tool_choice` values with HTTP 400; long-term is constraint-driven enforcement via `ToolCallSchemaBuilder` + `JsonSchemaConstraint`.

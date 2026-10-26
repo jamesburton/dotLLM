@@ -222,10 +222,79 @@ public sealed class OpenAiStreamingToolCallTests
         Assert.Equal("get_weather", r.FinalToolCalls!.Value[0].GetProperty("function").GetProperty("name").GetString());
     }
 
+    /// <summary>One prose-then-call completion per parser, in that parser's own wire format (#1287).</summary>
+    public static TheoryData<string, string> ProseThenCall() => new()
+    {
+        { nameof(HermesToolCallParser), "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>" },
+        { nameof(XmlToolCallParser), "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>" },
+        { nameof(QwenXmlToolCallParser), "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>" },
+        { nameof(LlamaToolCallParser), "<|python_tag|>{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}" },
+        { nameof(MistralToolCallParser), "[TOOL_CALLS][{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}]" },
+        { nameof(Gemma4ToolCallParser), "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>" },
+        { nameof(GlmToolCallParser), "<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\n</tool_call>" },
+        { nameof(GraniteToolCallParser), "<|tool_call|>[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}]" },
+        { nameof(PythonicToolCallParser), "<|tool_call_start|>[get_weather(city=\"Paris\")]<|tool_call_end|>" },
+        { nameof(HarmonyToolCallParser), "to=functions.get_weather <|constrain|>json<|message|>{\"city\": \"Paris\"}<|call|>" },
+        { nameof(GenericToolCallParser), "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}" },
+    };
+
+    private static IToolCallParser ParserNamed(string name) => name switch
+    {
+        nameof(HermesToolCallParser) => new HermesToolCallParser(),
+        nameof(XmlToolCallParser) => new XmlToolCallParser(),
+        nameof(QwenXmlToolCallParser) => new QwenXmlToolCallParser(),
+        nameof(LlamaToolCallParser) => new LlamaToolCallParser(),
+        nameof(MistralToolCallParser) => new MistralToolCallParser(),
+        nameof(Gemma4ToolCallParser) => new Gemma4ToolCallParser(),
+        nameof(GlmToolCallParser) => new GlmToolCallParser(),
+        nameof(GraniteToolCallParser) => new GraniteToolCallParser(),
+        nameof(PythonicToolCallParser) => new PythonicToolCallParser(),
+        nameof(HarmonyToolCallParser) => new HarmonyToolCallParser(),
+        _ => new GenericToolCallParser(),
+    };
+
+    /// <summary>
+    /// #1287: with tools present, prose before a call streams as it arrives (several content chunks, not one flush at the
+    /// end), the call is reported, and no fragment of the marker leaks into content, even when the marker arrives split
+    /// across tokens (3-char pieces here).
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(ProseThenCall))]
+    public async Task ProseBeforeCall_Streams_AndNoMarkerFragmentLeaks(string parserName, string call)
+    {
+        const string prose = "Let me look that up for you. ";
+        string all = prose + call;
+        var pieces = Enumerable.Range(0, (all.Length + 2) / 3).Select(i => all.Substring(i * 3, Math.Min(3, all.Length - i * 3))).ToArray();
+
+        var r = await RunAsync(pieces, ParserNamed(parserName));
+
+        Assert.Equal("tool_calls", r.FinishReason);
+        Assert.Equal("get_weather", r.FinalToolCalls!.Value[0].GetProperty("function").GetProperty("name").GetString());
+        Assert.Equal(prose, r.Content);
+        int contentChunks = r.Raw.Split("\n\n").Count(b => b.Contains("\"content\":\"", StringComparison.Ordinal));
+        Assert.True(contentChunks >= 5, $"prose should stream piece by piece, got {contentChunks} content chunk(s)");
+    }
+
+    /// <summary>#1287: a tail that only looks like the start of a marker is released once it stops matching.</summary>
+    [Fact]
+    public async Task MarkerLookalike_IsHeldOnlyUntilItDiverges()
+    {
+        var r = await RunAsync(["a <to", "ol>b <tool_", "x> done"], new HermesToolCallParser());
+
+        Assert.Null(r.FinalToolCalls);
+        Assert.Equal("a <tool>b <tool_x> done", r.Content);
+    }
+
+    /// <summary>
+    /// The generic parser now holds from a <c>{</c> (#1287), but brace-bearing prose that never parses into a call is
+    /// delayed, not swallowed: it is delivered once generation ends. (A <c>{"name": ...}</c> object, by contrast, is
+    /// reported once as a call: before #1287 it went out as content AND as the final chunk's tool_calls.)
+    /// </summary>
     [Fact]
     public async Task GenericModelParser_UnderAuto_DoesNotSwallowJsonishProse()
     {
-        var r = await RunAsync(["Use {\"name\": ", "\"x\"} as the shape."], new GenericToolCallParser());
-        Assert.Equal("Use {\"name\": \"x\"} as the shape.", r.Content);
+        var r = await RunAsync(["Use {", "\"a\": 1} as ", "the shape."], new GenericToolCallParser());
+        Assert.Null(r.FinalToolCalls);
+        Assert.Equal("Use {\"a\": 1} as the shape.", r.Content);
     }
 }

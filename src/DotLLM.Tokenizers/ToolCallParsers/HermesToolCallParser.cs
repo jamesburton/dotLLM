@@ -54,6 +54,9 @@ public sealed class HermesToolCallParser : IToolCallParser
     }
 
     /// <inheritdoc/>
+    public IReadOnlyList<string> StartMarkers { get; } = [OpenTag];
+
+    /// <inheritdoc/>
     public bool IsToolCallStart(string text)
         => text.Contains(OpenTag, StringComparison.Ordinal);
 }

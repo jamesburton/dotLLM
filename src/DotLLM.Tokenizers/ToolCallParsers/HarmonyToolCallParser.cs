@@ -94,6 +94,14 @@ public sealed class HarmonyToolCallParser : IToolCallParser
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// A call's header (<c>&lt;|start|&gt;assistant&lt;|channel|&gt;commentary to=functions.x ...</c>) reaches the answer
+    /// stream from its first token, so the frame openers count as markers too: holding only from <c>to=functions.</c>
+    /// would leak the <c>&lt;|start|&gt;assistant&lt;|channel|&gt;commentary </c> before it.
+    /// </remarks>
+    public IReadOnlyList<string> StartMarkers { get; } = ["<|start|>", "<|channel|>", "to=" + Functions];
+
+    /// <inheritdoc/>
     public bool IsToolCallStart(string text)
     {
         int r = text.IndexOf("to=" + Functions, StringComparison.Ordinal);
