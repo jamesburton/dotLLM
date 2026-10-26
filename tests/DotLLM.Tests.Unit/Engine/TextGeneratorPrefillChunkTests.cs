@@ -118,6 +118,35 @@ public sealed class TextGeneratorPrefillChunkTests
         Assert.Contains($"/ {PromptLen} tokens", timing);
     }
 
+    /// <summary>#1291: the fake model always argmaxes token 3, so the repeat guard trips on exactly the N-th token.</summary>
+    [Theory]
+    [InlineData(4, 4)]
+    [InlineData(0, 12)]
+    [InlineData(13, 12)]
+    public void RepeatGuard_EndsAsLength_OnTheNthIdenticalToken(int guard, int expectedTokens)
+    {
+        using var model = new RecordingModel(argmaxToken: 3);
+        var response = new TextGenerator(model, new StubTokenizer())
+            .Generate("prompt", new InferenceOptions { MaxTokens = 12, Temperature = 0f, RepeatGuardLimit = guard });
+
+        Assert.Equal(FinishReason.Length, response.FinishReason);
+        Assert.Equal(expectedTokens, response.GeneratedTokenCount);
+    }
+
+    /// <summary>#1291: the streaming path builds its own stop list; the guard must be in it too.</summary>
+    [Fact]
+    public async Task RepeatGuard_AppliesToStreaming()
+    {
+        using var model = new RecordingModel(argmaxToken: 3);
+        GenerationToken last = default!;
+        await foreach (var t in new TextGenerator(model, new StubTokenizer())
+            .GenerateStreamingTokensAsync("prompt", new InferenceOptions { MaxTokens = 12, Temperature = 0f, RepeatGuardLimit = 5 }))
+            last = t;
+
+        Assert.Equal(FinishReason.Length, last.FinishReason);
+        Assert.Equal(5, last.GeneratedTokenCount);
+    }
+
     // ── Fakes ──
 
     private sealed record ForwardCall(int Length, int FirstPosition);
