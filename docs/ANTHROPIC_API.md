@@ -83,8 +83,9 @@ non-streaming (JSON) and streaming (named SSE events).
   blocks on an assistant message are replayed to the chat template as that turn's
   reasoning (#767), so an extended-thinking transcript can be replayed unchanged.
 - `thinking` (the request field): `{"type":"enabled"}` / `{"type":"disabled"}` set the
-  template's `enable_thinking`; absent leaves the template default. `budget_tokens` is
-  accepted and not enforced (thinking counts toward `max_tokens`).
+  template's `enable_thinking`; absent leaves the template default. With `enabled`,
+  `budget_tokens` is enforced as the thinking budget (#1292) and `max_tokens` is raised to
+  budget + answer reserve; see [SERVER.md](SERVER.md#thinking-budget-1292).
 - `chat_template_kwargs` and `reasoning_format` (dotLLM extensions) pass extra
   variables to the chat template and override the server's `--reasoning-format`
   for the request; see [SERVER.md](SERVER.md#reasoning--thinking-models-767).

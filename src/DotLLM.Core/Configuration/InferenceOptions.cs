@@ -76,6 +76,12 @@ public record InferenceOptions
     /// </summary>
     public int? RepeatGuardLimit { get; init; }
 
+    /// <summary>
+    /// Thinking budget (#1292): after this many thinking tokens the engine forces the budget message and the close tag.
+    /// Null (default) = unlimited. Needs the sampler pipeline to have a tokenizer.
+    /// </summary>
+    public ThinkingBudget? ThinkingBudget { get; init; }
+
     /// <summary>Random seed for reproducible sampling. Null = non-deterministic.</summary>
     public int? Seed { get; init; }
 

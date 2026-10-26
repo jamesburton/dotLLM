@@ -208,6 +208,26 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [DefaultValue("auto")]
         public string ReasoningFormat { get; set; } = "auto";
 
+        /// <summary>Default thinking budget (#1292).</summary>
+        [CommandOption("--reasoning-budget|--thinking-budget")]
+        [Description("Thinking token budget (llama.cpp semantics): -1 unlimited (default), 0 end thinking immediately, N at most N thinking " +
+                     "tokens, then --reasoning-budget-message and the close tag are forced and the answer continues. Requests override with " +
+                     "thinking_budget_tokens (Anthropic: thinking.budget_tokens).")]
+        [DefaultValue(-1)]
+        public int ReasoningBudget { get; set; } = -1;
+
+        /// <summary>Text forced before the close tag when the thinking budget runs out (#1292).</summary>
+        [CommandOption("--reasoning-budget-message")]
+        [Description("Text forced before the end-of-thinking tag when the thinking budget runs out (default none).")]
+        public string? ReasoningBudgetMessage { get; set; }
+
+        /// <summary>Answer reserve added to max_tokens with a thinking budget (#1292).</summary>
+        [CommandOption("--reasoning-answer-reserve")]
+        [Description("With a thinking budget, max_tokens is raised to at least budget + this so the answer is not truncated " +
+                     "(default 8192; 0 = llama.cpp: the budget counts inside max_tokens). The context window still caps it.")]
+        [DefaultValue(8192)]
+        public int ReasoningAnswerReserve { get; set; } = 8192;
+
         /// <summary>Expected number of concurrent decode streams; 5 or more enables the Vulkan continuous-batch scheduler.</summary>
         [CommandOption("--expected-concurrency")]
         [Description("Expected number of concurrently decoding requests. At 5 or more, Vulkan hybrid models serve through the continuous-batch " +
@@ -473,6 +493,9 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             MtpHeadPath = settings.MtpHead,
             DFlashPath = settings.DFlash,
             ReasoningFormat = DotLLM.Tokenizers.Reasoning.ReasoningFormats.Parse(settings.ReasoningFormat),
+            ReasoningBudget = Math.Max(-1, settings.ReasoningBudget),
+            ReasoningBudgetMessage = settings.ReasoningBudgetMessage,
+            ReasoningAnswerReserve = Math.Max(0, settings.ReasoningAnswerReserve),
             PrefillChunkSize = settings.PrefillChunkSize,
             PrefixSnapshots = settings.PrefixSnapshots,
             PrefixSnapshotHostBudgetBytes = ServerOptions.ParsePrefixSnapshotHostBudget(settings.PrefixSnapshotHostBudget),

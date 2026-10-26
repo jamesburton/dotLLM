@@ -72,9 +72,7 @@ public sealed class SamplerPipeline
             _steps = options.SamplerSteps.ToArray();
 
             // Build processors: use explicit list if provided, otherwise auto-build from flat properties
-            _processors = options.LogitProcessors is not null
-                ? options.LogitProcessors.ToArray()
-                : BuildProcessors(options, tokenizer);
+            _processors = ResolveProcessors(options, tokenizer);
 
             _processorContext = BuildProcessorContext(options);
             _samplerContext = new SamplerContext(
@@ -96,9 +94,7 @@ public sealed class SamplerPipeline
             && options.TopNSigma < 0f;
 
         // Build processor chain (only add if enabled)
-        _processors = options.LogitProcessors is not null
-            ? options.LogitProcessors.ToArray()
-            : BuildProcessors(options, tokenizer);
+        _processors = ResolveProcessors(options, tokenizer);
 
         // Build sampler step chain (only add if enabled)
         var steps = new List<ISamplerStep>();
@@ -126,6 +122,21 @@ public sealed class SamplerPipeline
             options.MinP,
             options.Seed,
             options.TopNSigma);
+    }
+
+    /// <summary>
+    /// The explicit <see cref="InferenceOptions.LogitProcessors"/> (or the auto-built chain), preceded by a fresh
+    /// <see cref="ThinkingBudgetProcessor"/> when <see cref="InferenceOptions.ThinkingBudget"/> is set (#1292). It is stateful,
+    /// so it is created here, per pipeline (= per sequence), never shared through the options.
+    /// </summary>
+    private static ILogitProcessor[] ResolveProcessors(InferenceOptions options, ITokenizer? tokenizer)
+    {
+        var processors = options.LogitProcessors is not null
+            ? options.LogitProcessors.ToArray()
+            : BuildProcessors(options, tokenizer);
+        return options.ThinkingBudget is { } budget && tokenizer is not null
+            ? [new ThinkingBudgetProcessor(budget, tokenizer), .. processors]
+            : processors;
     }
 
     /// <summary>

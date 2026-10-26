@@ -589,6 +589,25 @@ the history is the template's call — Qwen3.x keeps it unless `chat_template_kw
 way and shows it in a collapsible "Thinking" block above each answer (open while streaming, collapsed once the answer starts), with a Thinking
 selector (model default / on / off) in the settings panel.
 
+### Thinking budget (#1292)
+
+`--reasoning-budget N` (alias `--thinking-budget`; llama.cpp semantics) caps the think block: -1 unlimited (default), 0 end
+thinking immediately, N > 0 at most N thinking tokens. When the budget runs out the engine forces
+`--reasoning-budget-message` (default none) and the close tag (`</think>`, Gemma-4 `<channel|>`) token by token, then the
+answer continues; a block that closes on its own first is untouched, and a budget that lands inside a multi-token UTF-8
+character waits for it to complete. Per request: `thinking_budget_tokens` (alias `reasoning_budget_tokens`) and
+`reasoning_budget_message` on `/v1/chat/completions`; `thinking: {"type":"enabled","budget_tokens":N}` on `/v1/messages`
+(previously accepted and ignored). It needs split reasoning (`reasoning_format` auto/deepseek, not constrained); Harmony
+(gpt-oss) is not budgeted. The scheduler, the per-request generator and the streaming path all honour it (it is a logit
+processor in the sampler pipeline).
+
+**`max_tokens` and the answer reserve.** Thinking tokens count toward `max_tokens`, so a budget alone can still leave the
+answer cut off. With a positive budget, `max_tokens` is raised to at least budget + `--reasoning-answer-reserve` (default
+8192; 0 restores llama.cpp's behaviour, where the budget counts inside `max_tokens`). **The raised value is still clamped
+to the context window** (`context_length - prompt_tokens`), silently, as every `max_tokens` is: a long prompt can leave less
+room than budget + reserve, and the turn then ends with `finish_reason: "length"`. Check `usage` against your window when an
+answer ends early.
+
 ## Device selection: `--device auto` (#722)
 
 `dotllm serve` defaults to `--device auto`: for each model it tries **CUDA** (when a GPU is present and the model file fits in 85% of its memory),

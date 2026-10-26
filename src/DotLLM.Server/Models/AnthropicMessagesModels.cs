@@ -68,8 +68,8 @@ public sealed record AnthropicMessagesRequest
     /// <summary>
     /// Extended-thinking configuration (<c>{"type":"enabled","budget_tokens":N}</c> or
     /// <c>{"type":"disabled"}</c>). <c>enabled</c>/<c>disabled</c> set the chat template's
-    /// <c>enable_thinking</c> (#767); absent leaves the template default. <c>budget_tokens</c> is accepted
-    /// but not enforced - the model's thinking counts toward <c>max_tokens</c>. When the model thinks, the
+    /// <c>enable_thinking</c> (#767); absent leaves the template default. <c>budget_tokens</c> is enforced as the
+    /// thinking budget (#1292; see <see cref="ThinkingBudgetTokens"/>). When the model thinks, the
     /// response carries <c>thinking</c> content blocks before the text.
     /// </summary>
     [JsonPropertyName("thinking")]
@@ -99,6 +99,17 @@ public sealed record AnthropicMessagesRequest
         => Thinking is { ValueKind: JsonValueKind.Object } t
            && t.TryGetProperty("type", out var type) && type.ValueKind == JsonValueKind.String
             ? type.GetString() switch { "enabled" or "adaptive" => true, "disabled" => false, _ => null }
+            : null;
+
+    /// <summary>
+    /// <c>thinking.budget_tokens</c> when thinking is <c>enabled</c> (#1292): enforced as the thinking budget, as llama.cpp
+    /// maps it to <c>thinking_budget_tokens</c>. Null otherwise.
+    /// </summary>
+    [JsonIgnore]
+    public int? ThinkingBudgetTokens
+        => ThinkingEnabled == true && Thinking is { } t
+           && t.TryGetProperty("budget_tokens", out var b) && b.ValueKind == JsonValueKind.Number && b.TryGetInt32(out int n)
+            ? n
             : null;
 }
 

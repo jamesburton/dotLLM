@@ -116,7 +116,10 @@ public static class MessagesEndpoint
             return;
         }
 
-        int maxTokens = request.MaxTokens ?? state.EffectiveSamplingDefaults.MaxTokens;
+        // thinking.budget_tokens is enforced as the thinking budget, with room kept for the answer (#1292).
+        int? thinkingBudget = plan.ThinkingBudget(request.ThinkingBudgetTokens, state.Options.ReasoningBudget);
+        int maxTokens = ReasoningSupport.WithAnswerReserve(
+            request.MaxTokens ?? state.EffectiveSamplingDefaults.MaxTokens, thinkingBudget, state.Options.ReasoningAnswerReserve);
         var promptError = RequestValidator.ValidatePromptLength(
             prompt, state.Tokenizer!, state.Config!.MaxSequenceLength,
             maxTokens, out int effectiveMaxTokens, out int promptTokenCount);
@@ -130,6 +133,7 @@ public static class MessagesEndpoint
             state.EffectiveSamplingDefaults,
             new DotLLM.Core.Configuration.ThreadingConfig(state.Options.Threads, state.Options.DecodeThreads));
         options = plan.Gate(options with { MaxTokens = effectiveMaxTokens }, ReasoningSupport.UngatedStops);
+        options = plan.WithThinkingBudget(options, thinkingBudget, state.Options.ReasoningBudgetMessage);
         // (#1093) Same hint as the OpenAI surface; every dispatch below carries these options.
         options = options with { GenerationPromptSuffix = generationPromptSuffix };
 
