@@ -29,6 +29,7 @@ public static class CudaModelLoader
         {
             // #1038: the plain CudaTransformerModel has no NVFP4 path (only Nemotron-H does, via CreateFromGguf). Refuse before any upload.
             Nvfp4Support.RejectAny(gguf.TensorsByName, "CUDA");
+            QuantSupport.RejectAny(gguf.TensorsByName, QuantizationType.PTQ1_0, "CUDA", 1280); // no CUDA PTQ1_0 kernels yet
         }
         catch
         {
@@ -76,6 +77,7 @@ public static class CudaModelLoader
         // other architecture would widen it and drop the scale, so refuse before any upload.
         if (config.Architecture is not (Architecture.NemotronH or Architecture.NemotronHMoe))
             Nvfp4Support.RejectAny(gguf.TensorsByName, "CUDA");
+            QuantSupport.RejectAny(gguf.TensorsByName, QuantizationType.PTQ1_0, "CUDA", 1280); // no CUDA PTQ1_0 kernels yet
 
         switch (config.Architecture)
         {
@@ -212,6 +214,7 @@ public static class CudaModelLoader
 
             case GpuOffloadMode.Partial:
                 Nvfp4Support.RejectAny(gguf.TensorsByName, "CUDA"); // #1038, as in CreateFromGguf
+                QuantSupport.RejectAny(gguf.TensorsByName, QuantizationType.PTQ1_0, "CUDA", 1280);
                 if (config.Architecture == Architecture.Qwen3HybridDense)
                 {
                     // Issue #291: architecture-aware GPU-head/CPU-tail split (GDN layers have no attn_output).

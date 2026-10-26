@@ -293,6 +293,7 @@ The Vulkan backend ships native matmul kernels (GEMV decode + GEMM prefill, with
 | IQ1_S | ✓ | ✓ | — | IQ-family — smallest GGUF quant (~1.5-1.7 bpw) |
 | I2_S | ✓ | ✓ | ✓ (`MatMulI2SGemmF32Kernel`) | BitNet b1.58 ternary |
 | PQ2_0 | ✓ | ✓ | ✓ (`MatMulPQ2_0GemmF32Kernel`) | PrismML ternary + per-group scale |
+| PTQ1_0 | ✓ | ✓ (untiled) | — | PrismML dense base-3 trits, 28 B / 128 (1.75 bpw), scale last; CPU + Vulkan only, CUDA refuses at load (#1280) |
 | Q4_0 | ✓ (+ dp4a MMVQ) | ✓ | ✓ (`MatMulQ4_0GemmCoopmatKernel`, wave64) | #1018 |
 | Q4_1 | ✓ (+ dp4a MMVQ) | ✓ | ✓ (same classes, `quant: Q4_1`, wave64) | #1171 (Recursive Flint's official file) |
 | Q5_1 | — | — | — | **not shipped** as a dense projection — see below |

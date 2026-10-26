@@ -122,6 +122,7 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
         CudaTransformerModel.RejectGemmaForCompositeHost(config, nameof(HybridVulkanCudaTransformerModel));
         // #1038: NVFP4 runs only on the Nemotron-H paths, not on this dense Vulkan|CUDA split; refuse before any upload.
         Nvfp4Support.RejectAny(gguf.TensorsByName, "Vulkan/CUDA hybrid");
+        QuantSupport.RejectAny(gguf.TensorsByName, QuantizationType.PTQ1_0, "Vulkan/CUDA hybrid", 1280); // the CUDA side has no PTQ1_0 kernels
         // #737: VulkanTransformerModel.LoadFromGguf now accepts gpt-oss (single-device only); the hybrid
         // split does not wire its sinks/YaRN across the Vulkan|CUDA boundary, so refuse here explicitly.
         if (config.Architecture == DotLLM.Core.Configuration.Architecture.GptOss)

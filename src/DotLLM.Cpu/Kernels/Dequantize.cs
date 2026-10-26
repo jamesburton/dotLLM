@@ -49,6 +49,21 @@ public static unsafe partial class Dequantize
     /// </summary>
     internal const int PQ2_0GroupBytes = QuantFormat.PQ2_0BlockBytes;
 
+    /// <summary>Number of elements per PTQ1_0 group. Same 128-element grouping as PQ2_0.</summary>
+    internal const int PTQ1_0GroupSize = QuantFormat.TernaryGroupSize;
+
+    /// <summary>
+    /// PTQ1_0 group size in bytes: 24 (<c>qs</c>, 5 base-3 trits per byte) + 2 (<c>qh</c>,
+    /// 4 trits per byte) + 2 (Half scale, LAST) = 28.
+    /// </summary>
+    internal const int PTQ1_0GroupBytes = QuantFormat.PTQ1_0BlockBytes;
+
+    /// <summary>Bytes of dense 5-trits-per-byte payload in a PTQ1_0 block.</summary>
+    internal const int PTQ1_0QsBytes = 24;
+
+    /// <summary>Bytes of 4-trits-per-byte tail payload in a PTQ1_0 block.</summary>
+    internal const int PTQ1_0QhBytes = 2;
+
     /// <summary>MXFP4 block size in bytes: 1 (E8M0 scale) + 16 (packed nibble bytes) = 17.</summary>
     internal const int Mxfp4BlockBytes = QuantFormat.Mxfp4BlockBytes;
 
@@ -98,6 +113,8 @@ public static unsafe partial class Dequantize
         QuantizationType.Q2_0 => elementCount / QuantFormat.Q2_0GroupSize * QuantFormat.Q2_0BlockBytes,
         // PQ2_0: scale is per-group (interleaved), so row stride includes it — contrast I2_S.
         QuantizationType.PQ2_0 => elementCount / PQ2_0GroupSize * PQ2_0GroupBytes,
+        // PTQ1_0: as PQ2_0, a per-group in-block scale — but 28 bytes per 128, scale last.
+        QuantizationType.PTQ1_0 => elementCount / PTQ1_0GroupSize * PTQ1_0GroupBytes,
         _ => throw new ArgumentOutOfRangeException(nameof(quantType), quantType,
             $"Unknown quantization type: {quantType}")
     };
@@ -203,6 +220,9 @@ public static unsafe partial class Dequantize
                 break;
             case QuantizationType.Q2_0:
                 DequantizeQ2_0(src, elementCount, dest);
+                break;
+            case QuantizationType.PTQ1_0:
+                DequantizePTQ1_0(src, elementCount, dest);
                 break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(quantType), quantType,
@@ -608,6 +628,90 @@ public static unsafe partial class Dequantize
                 dest[outIdx + 2] = (((packed >> 4) & 0x3) - 1) * scale;
                 dest[outIdx + 3] = (((packed >> 6) & 0x3) - 1) * scale;
             }
+        }
+    }
+
+    // ──────────────────── PTQ1_0 (PrismML Bonsai dense-trit ternary) ────────────────────
+
+    /// <summary>
+    /// Chunk widths of the <c>qs</c> packing stages, in the fork's own order
+    /// (<c>ptq1_0_stages</c> in <c>ggml/src/ggml-quants.c</c>). With
+    /// <c>sizeof(qs) == 24</c> the 32-wide stage never fires, so the effective layout is a
+    /// 16-byte chunk followed by an 8-byte chunk — but the loop is kept general so it matches
+    /// the reference character for character.
+    /// </summary>
+    private static ReadOnlySpan<int> PTQ1_0Stages => [32, 16, 8];
+
+    /// <summary>Powers of three used to shift a packed trit into the top of a byte.</summary>
+    private static ReadOnlySpan<byte> PTQ1_0Pow3 => [1, 3, 9, 27, 81, 243];
+
+    /// <summary>
+    /// Extracts base-3 trit <paramref name="n"/> from a PTQ1_0 packed byte and maps it to
+    /// {-1, 0, +1}.
+    /// <para><b>The 8-bit truncation is load-bearing.</b> The reference is
+    /// <c>uint8_t q = byteValue * pow3[n];</c> — the multiply wraps to 8 bits before
+    /// <c>((uint16_t) q * 3) &gt;&gt; 8</c> recovers the trit. Computing the product in a wider
+    /// type produces correct values for <c>n == 0</c> and garbage for every higher trit, which
+    /// reads like a scale bug rather than a packing bug.</para>
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int PTQ1_0Trit(byte packed, int n)
+    {
+        byte q = (byte)(packed * PTQ1_0Pow3[n]);   // deliberate wrap to 8 bits
+        return ((q * 3) >> 8) - 1;
+    }
+
+    /// <summary>
+    /// Scalar PTQ1_0 dequantization (PrismML Bonsai dense-trit ternary, <c>GGML_TYPE_PTQ1_0</c>
+    /// = 143). Group layout: 128 elements per 28-byte block, laid out as
+    /// <c>qs[24] + qh[2] + scale(Half)</c> — the scale comes <b>LAST</b>, the opposite end of the
+    /// block from <see cref="DequantizePQ2_0"/>'s leading scale. Do not template the offsets from
+    /// PQ2_0.
+    ///
+    /// <para>Values are packed base-3, five trits to a <c>qs</c> byte and four to a <c>qh</c>
+    /// byte, with the FIRST value in the most significant trit position. Element order is
+    /// trit-major within a chunk: for chunk width <c>c</c> starting at <c>qs[j]</c>, the emitted
+    /// order is <c>(n, m) -&gt; qs[j+m] trit n</c> for <c>n</c> in 0..4, <c>m</c> in 0..c-1. With
+    /// <c>sizeof(qs) == 24</c> and stages {32, 16, 8} the chunks are <c>qs[0..15]</c> (elements
+    /// 0..79) and <c>qs[16..23]</c> (elements 80..119); <c>qh</c> then supplies elements 120..127
+    /// as <c>(n, h) -&gt; qh[h] trit n</c> for <c>n</c> in 0..3. Transcribed from
+    /// <c>dequantize_row_ptq1_0</c> in the PrismML fork and gated by a bit-exact comparison
+    /// against that routine (issue #436).</para>
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void DequantizePTQ1_0(nint src, long elementCount, Span<float> dest)
+    {
+        if (elementCount % PTQ1_0GroupSize != 0)
+            throw new ArgumentException(
+                $"PTQ1_0 element count must be a multiple of {PTQ1_0GroupSize}, got {elementCount}",
+                nameof(elementCount));
+
+        byte* data = (byte*)src;
+        long groupCount = elementCount / PTQ1_0GroupSize;
+
+        for (long g = 0; g < groupCount; g++)
+        {
+            byte* qs = data + g * PTQ1_0GroupBytes;
+            byte* qh = qs + PTQ1_0QsBytes;
+            float scale = (float)Unsafe.ReadUnaligned<Half>(qh + PTQ1_0QhBytes);
+            int outIdx = (int)(g * PTQ1_0GroupSize);
+
+            int j = 0;
+            foreach (int c in PTQ1_0Stages)
+            {
+                while (j + c <= PTQ1_0QsBytes)
+                {
+                    for (int n = 0; n < 5; n++)
+                        for (int m = 0; m < c; m++)
+                            dest[outIdx++] = PTQ1_0Trit(qs[j + m], n) * scale;
+
+                    j += c;
+                }
+            }
+
+            for (int n = 0; n < 4; n++)
+                for (int h = 0; h < PTQ1_0QhBytes; h++)
+                    dest[outIdx++] = PTQ1_0Trit(qh[h], n) * scale;
         }
     }
 

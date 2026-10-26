@@ -175,7 +175,7 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
         // and the gather runs as a compute dispatch (pq2_0_embed_gather_f32.comp) instead. Q8_0 / Q4_K / Q6_K tables stay
         // packed too when the caller has their gather (keepEmbedPacked, #1174): Qwen3.8-27B's Q4_K table is 682 MiB packed
         // and 4.85 GiB widened (#919).
-        bool packedEmbed = tokenEmbedQt == QuantizationType.PQ2_0 || keepEmbedPacked;
+        bool packedEmbed = tokenEmbedQt is QuantizationType.PQ2_0 or QuantizationType.PTQ1_0 || keepEmbedPacked;
         VulkanDevice.Buffer? tokenEmbed = null;
         VulkanChunkedRowTable? tokenEmbedRows = null;
         QuantizationType tokenEmbedDeviceQt;
@@ -184,7 +184,7 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
         if (packedEmbed)
         {
             // Uploaded directly rather than through UploadProjectionMatrix: that helper's KeepNative
-            // table has no PQ2_0 arm, and the gather needs the source bytes unconverted.
+            // table has no arm for either ternary pack, and the gather needs the source bytes unconverted.
             tokenEmbedBytes = DotLLM.Cpu.Kernels.Dequantize.RowByteSize(config.HiddenSize, tokenEmbedQt)
                             * (long)config.VocabSize;
             // #508: kept packed means the device image IS the mmap'd bytes — on Bonsai 2

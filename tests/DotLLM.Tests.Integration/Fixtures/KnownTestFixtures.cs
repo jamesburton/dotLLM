@@ -75,6 +75,16 @@ internal static class KnownTestFixtures
     /// <summary>Human-readable name for <see cref="TernaryBonsai2_2B_PQ2_0"/> skip messages.</summary>
     public const string TernaryBonsai2_2BDescription = "Ternary-Bonsai-2-2B PQ2_0 GGUF (prism.hadamard v2)";
 
+    /// <summary>
+    /// Ternary-Bonsai-2-2B, PTQ1_0 (~0.43 GB, dense base-3 trits, 1.75 bpw) — the same checkpoint and repo as
+    /// <see cref="TernaryBonsai2_2B_PQ2_0"/> in the third packing (#1280).
+    /// </summary>
+    public static FixtureLocation TernaryBonsai2_2B_PTQ1_0 => TestFixtureResolver.ResolveFile(
+        "DOTLLM_BONSAI2_2B_PTQ1_0_GGUF",
+        "prism-ml",
+        "Ternary-Bonsai-2-2B-gguf",
+        "Ternary-Bonsai-2-2B-PTQ1_0.gguf");
+
     /// <summary>Human-readable name for <see cref="TernaryBonsai27B_Q2_0"/> skip messages.</summary>
     public const string TernaryBonsai27BDescription = "Ternary-Bonsai-2-27B PQ2_0 GGUF (tokenizer.ggml.pre = qwen35)";
 

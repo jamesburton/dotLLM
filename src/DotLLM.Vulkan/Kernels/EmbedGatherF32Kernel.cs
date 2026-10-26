@@ -10,7 +10,7 @@ namespace DotLLM.Vulkan.Kernels;
 /// </summary>
 /// <remarks>
 /// <para>
-/// One class for every format that has a gather shader: Q8_0 (<c>q8_0_embed_gather_f32</c>), PQ2_0 (<c>pq2_0_embed_gather_f32</c>),
+/// One class for every format that has a gather shader: Q8_0 (<c>q8_0_embed_gather_f32</c>), PQ2_0 (<c>pq2_0_embed_gather_f32</c>), PTQ1_0 (<c>ptq1_0_embed_gather_f32</c>),
 /// Q4_K and Q6_K (<c>q4_k/q6_k_embed_gather_f32</c>). All four share bindings (table, ids, dst), push constants
 /// (nTokens, hidden, blocksPerRow, vocabSize) and the dispatch (<c>ceil(hidden / 256)</c> x nTokens workgroups of 256), and each
 /// shader reproduces the CPU dequant bit for bit.
@@ -53,6 +53,7 @@ public sealed class EmbedGatherF32Kernel : IDisposable
         QuantizationType.Q8_0 => ("q8_0_embed_gather_f32.spv", 32),
         QuantizationType.Q5_0 => ("q5_0_embed_gather_f32.spv", 32),   // #1225: Nemotron-3.5 Lightning
         QuantizationType.PQ2_0 => ("pq2_0_embed_gather_f32.spv", 128),
+        QuantizationType.PTQ1_0 => ("ptq1_0_embed_gather_f32.spv", 128),   // #1280
         QuantizationType.Q4_K => ("q4_k_embed_gather_f32.spv", 256),
         QuantizationType.Q6_K => ("q6_k_embed_gather_f32.spv", 256),
         _ => null,

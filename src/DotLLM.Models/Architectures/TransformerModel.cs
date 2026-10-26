@@ -4015,6 +4015,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             MatMul.GemvI2_S((byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.PQ2_0)
             MatMul.GemvPQ2_0((byte*)weights, x, y, m, k, _threadPool);
+        else if (qt == QuantizationType.PTQ1_0)
+            MatMul.GemvPTQ1_0((byte*)weights, x, y, m, k, _threadPool);
         else if (MatMul.HasPackedLegacyDot(qt))
             // Q4_0/Q4_1/Q5_1/IQ4_NL — packed × Q8_1 dot instead of dequantize-to-F32 (#489).
             MatMul.GemvLegacyQuant((byte*)weights, qt, x, y, m, k, _threadPool);
@@ -4060,6 +4062,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             MatMul.GemmI2_S((byte*)weights, b, c, m, k, n, _threadPool);
         else if (qt == QuantizationType.PQ2_0)
             MatMul.GemmPQ2_0((byte*)weights, b, c, m, k, n, _threadPool);
+        else if (qt == QuantizationType.PTQ1_0)
+            MatMul.GemmPTQ1_0((byte*)weights, b, c, m, k, n, _threadPool);
         else if (MatMul.HasPackedLegacyDot(qt))
             // Q4_0/Q4_1/Q5_1/IQ4_NL — packed × Q8_1 dot instead of dequantize-to-F32 (#489).
             MatMul.GemmLegacyQuantOrDequant((byte*)weights, qt, b, c, m, k, n, _threadPool, preQuantizedInput);

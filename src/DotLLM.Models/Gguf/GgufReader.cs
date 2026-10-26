@@ -70,12 +70,8 @@ public static class GgufReader
     /// </summary>
     private const uint GgufTypePrismPq2_0 = 142;
 
-    /// <summary>
-    /// PrismML <c>GGML_TYPE_PTQ1_0</c> — dense base-3 trit packing at group 128 (28 bytes per 128
-    /// weights, 1.75 bpw). Recognized only so that the failure is a clear diagnostic instead of a
-    /// downstream size overflow; no kernel consumes it yet.
-    /// </summary>
-    private const uint GgufTypePrismPtq1_0 = 143;
+    // PrismML's other private id, GGML_TYPE_PTQ1_0 = 143, needs no alias: the enum member
+    // QuantizationType.PTQ1_0 is literally 143, so the Enum.IsDefined path below maps it.
 
     /// <summary>
     /// Maps a raw GGUF tensor type id onto a <see cref="QuantizationType"/>, translating the
@@ -91,11 +87,6 @@ public static class GgufReader
     {
         if (rawType == GgufTypePrismPq2_0)
             return QuantizationType.PQ2_0;
-
-        if (rawType == GgufTypePrismPtq1_0)
-            throw new NotSupportedException(
-                $"Tensor '{name}' is PTQ1_0 (PrismML ternary, GGUF type {rawType}), which dotLLM " +
-                "does not implement yet. Use the PQ2_0 packing of this model instead.");
 
         if (!Enum.IsDefined(typeof(QuantizationType), (int)rawType))
             throw new NotSupportedException(

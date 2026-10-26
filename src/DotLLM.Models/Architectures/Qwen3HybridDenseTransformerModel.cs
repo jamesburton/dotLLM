@@ -2379,6 +2379,9 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
             case QuantizationType.PQ2_0:
                 MatMul.GemmPQ2_0((byte*)weights, b, c, m, k, n, _threadPool);
                 return;
+            case QuantizationType.PTQ1_0:
+                MatMul.GemmPTQ1_0((byte*)weights, b, c, m, k, n, _threadPool);
+                return;
             case QuantizationType.I2_S:
                 MatMul.GemmI2_S((byte*)weights, b, c, m, k, n, _threadPool);
                 return;

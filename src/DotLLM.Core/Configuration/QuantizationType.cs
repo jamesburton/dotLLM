@@ -196,5 +196,18 @@ public enum QuantizationType
     /// <c>FactorizedWeights</c> naming a sign-factor composite (<c>diag(u1) U diag(l) V diag(v2)</c>, primary plus
     /// residual path), CPU only. Id 100 is outside the GGUF range.
     /// </summary>
-    LittleBit = 100
+    LittleBit = 100,
+
+    /// <summary>
+    /// PrismML ternary weights at group 128 with dense base-3 trit packing
+    /// (<c>GGML_TYPE_PTQ1_0 = 143</c> in the PrismML llama.cpp fork). Block layout
+    /// (<c>block_ptq1_0</c>, 28 bytes per 128 weights = 1.75 bpw):
+    /// <c>qs[24]</c> (5 trits per byte → 120 values), then <c>qh[2]</c> (4 trits per byte →
+    /// 8 values), then the <c>fp16</c> scale — <b>scale LAST</b>, unlike
+    /// <see cref="PQ2_0"/> where it comes first.
+    /// Same base-3 packing as upstream <c>TQ1_0</c> (type 34) but with one scale per 128
+    /// weights instead of per 256, which is what makes it lossless for checkpoints that are
+    /// already ternary at group 128.
+    /// </summary>
+    PTQ1_0 = 143
 }
