@@ -84,15 +84,26 @@ public sealed unsafe class CudaKQuantRows4Tests
             allocs.Add(d);
             return d;
         }
-        double TimeUs(Action launch, int reps)
+        // Host launch costs ~20 us/launch on this WDDM box, which would swamp the 1-60 us kernels measured here, and the
+        // engine replays decode from a CUDA graph anyway: capture `count` launches (each on a different weight copy, so
+        // the working set exceeds L2) into one graph and time replays. Returns GPU us per launch.
+        double TimeUs(Action<int> launch, int count, int reps)
         {
-            for (int i = 0; i < 10; i++) launch();
-            CudaDriverApi.cuEventRecord(e0, s).ThrowOnError();
-            for (int i = 0; i < reps; i++) launch();
-            CudaDriverApi.cuEventRecord(e1, s).ThrowOnError();
-            CudaDriverApi.cuEventSynchronize(e1).ThrowOnError();
-            CudaDriverApi.cuEventElapsedTime(out float ms, e0, e1).ThrowOnError();
-            return ms * 1000.0 / reps;
+            CudaDriverApi.cuStreamBeginCapture_v2(s, CudaDriverApi.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL).ThrowOnError();
+            for (int i = 0; i < count; i++) launch(i);
+            CudaDriverApi.cuStreamEndCapture(s, out nint graph).ThrowOnError();
+            CudaDriverApi.cuGraphInstantiateWithFlags(out nint exec, graph, 0).ThrowOnError();
+            try
+            {
+                for (int i = 0; i < 3; i++) CudaDriverApi.cuGraphLaunch(exec, s).ThrowOnError();
+                CudaDriverApi.cuEventRecord(e0, s).ThrowOnError();
+                for (int i = 0; i < reps; i++) CudaDriverApi.cuGraphLaunch(exec, s).ThrowOnError();
+                CudaDriverApi.cuEventRecord(e1, s).ThrowOnError();
+                CudaDriverApi.cuEventSynchronize(e1).ThrowOnError();
+                CudaDriverApi.cuEventElapsedTime(out float ms, e0, e1).ThrowOnError();
+                return ms * 1000.0 / ((double)reps * count);
+            }
+            finally { CudaDriverApi.cuGraphExecDestroy(exec); CudaDriverApi.cuGraphDestroy(graph); }
         }
         string prevMode = CudaKernels.KQuantGemvMode;
         try
@@ -113,12 +124,11 @@ public sealed unsafe class CudaKQuantRows4Tests
                 var ws = Enumerable.Range(0, copies).Select(_ => Alloc(bytes)).ToArray();
                 nint xh = Alloc((long)k * 2, 0x3C), yh = Alloc((long)n * 2), scratch = Alloc(CudaForwardState.PreQ8_1ScratchBytes(k));
                 kernels.LaunchQuantizeXToQ8_1(xh, scratch, k, s);
-                int rep = 0;
+                int count = Math.Max(copies, 32);
                 CudaKernels.KQuantGemvMode = "large";
-                double large = TimeUs(() => kernels.LaunchQuantizedGemvMmq(ws[rep++ % copies], qt, xh, yh, n, k, scratch, s), 200);
-                rep = 0;
+                double large = TimeUs(i => kernels.LaunchQuantizedGemvMmq(ws[i % copies], qt, xh, yh, n, k, scratch, s), count, 20);
                 CudaKernels.KQuantGemvMode = "rows4";
-                double rows4 = TimeUs(() => kernels.LaunchQuantizedGemvMmq(ws[rep++ % copies], qt, xh, yh, n, k, scratch, s), 200);
+                double rows4 = TimeUs(i => kernels.LaunchQuantizedGemvMmq(ws[i % copies], qt, xh, yh, n, k, scratch, s), count, 20);
                 _out.WriteLine($"{qt} {n,6}x{k,-5} {label,-13} | {bytes / 1e6,7:F1} | {large,8:F1} ({bytes / large / 1e3,5:F0}) | {rows4,8:F1} ({bytes / rows4 / 1e3,5:F0}) | {large / rows4:F2}x");
                 foreach (nint p in ws.Append(xh).Append(yh).Append(scratch)) { CudaDriverApi.cuMemFree_v2(p); allocs.Remove(p); }
             }
