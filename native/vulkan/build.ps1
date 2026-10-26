@@ -15,6 +15,10 @@ if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir | Out
 
 $targetEnv = "vulkan1.2"
 
+# Always optimise (-O): all SPIR-V is built with -O so a rebuild is byte-reproducible
+# (#1254, #1310). A plain build is ~80% larger on big shaders and is NOT what ships.
+$glslcFlags = @("-O")
+
 # Discover all shader sources up-front so we can report what's missing even
 # when glslc isn't installed. This keeps the parity rig honest: a developer
 # without the Vulkan SDK still sees the list of shaders the build expects to
@@ -46,7 +50,7 @@ Write-Host "Compiling GLSL compute shaders -> SPIR-V (target: $targetEnv)..."
 foreach ($compFile in $shaderSources) {
     $base = $compFile.BaseName
 
-    & glslc --target-env=$targetEnv -o "$outDir\$base.spv" $compFile.FullName
+    & glslc --target-env=$targetEnv @glslcFlags -o "$outDir\$base.spv" $compFile.FullName
 
     if ($LASTEXITCODE -ne 0) {
         throw "glslc failed for $($compFile.Name)"
