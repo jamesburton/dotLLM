@@ -3341,3 +3341,85 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
             y[row] = __float2half(v);
     }
 }
+
+// ── Q8_0 MMVQ-large, pre-quantized activations (#1297) ───────────────────────────────────────
+//
+// y[row] = sum_b  d_w[row,b] * dx[b] * dot_int8(w_q[row,b,0..31], xq[b*32 .. b*32+31])
+//
+// Reads the 34-byte Q8_0 blocks IN PLACE (no repack, no expansion) and the Q8_1 activations from
+// the shared pre-quantise scratch (xq | dx | sx2; sx2 unused — Q8_0 has no min term).
+//
+// Thread layout mirrors llama.cpp's mul_mat_vec_q<Q8_0, ncols=1> (vdr=2, qi=8, nwarps=4):
+// 4 consecutive lanes cover one block's 32 quants (8 bytes each), so a warp walks 8 consecutive
+// blocks = 272 contiguous weight bytes per step instead of the legacy kernel's 34-byte lane
+// stride (which made every byte load touch a separate sector). 128 threads = 32 blocks / step.
+//
+// Alignment: a Q8_0 block is 34 bytes, so qs (block + 2) is only 2-byte aligned on half of the
+// blocks. Each 32-bit weight word is therefore assembled from two 16-bit loads (llama.cpp's
+// get_int_b2); a direct int* load would fault (error 716).
+//
+// Accumulation: int32 dp4a per block, F32 across blocks and in the reductions, FP16 only on the
+// final store (CLAUDE.md Precision rule 1: registers only, no stored FP32).
+extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_q8_0_mmvq_large_preq(
+    const uint8_t* __restrict__ weight,
+    const int8_t*  __restrict__ xq_in,
+    const half*    __restrict__ dx_in,
+    const half*    __restrict__ sx2_in,
+    half* __restrict__ y,
+    const int n,
+    const int k)
+{
+    (void)sx2_in;
+
+    const int row = blockIdx.x;
+    if (row >= n) return;
+
+    const int blocks_per_row = k >> 5;
+    __shared__ float s_warp_partials[MMVQ_LARGE_NWARPS];
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+
+    const int sub = tid & 3;     // which 8-byte slice of the 32 quants
+    const int b0 = tid >> 2;     // first block for this thread; stride MMVQ_LARGE_THREADS/4
+
+    const uint8_t* w_row = weight + (size_t)row * blocks_per_row * 34;
+    float acc = 0.0f;
+
+    for (int b = b0; b < blocks_per_row; b += MMVQ_LARGE_THREADS / 4)
+    {
+        const uint8_t* block = w_row + (size_t)b * 34;
+        const unsigned short* q16 = reinterpret_cast<const unsigned short*>(block + 2) + sub * 4;
+        const int w0 = (int)((unsigned)q16[0] | ((unsigned)q16[1] << 16));
+        const int w1 = (int)((unsigned)q16[2] | ((unsigned)q16[3] << 16));
+
+        const int* xi = reinterpret_cast<const int*>(xq_in + (size_t)b * 32) + sub * 2;
+        int dot = __dp4a(w0, xi[0], 0);
+        dot = __dp4a(w1, xi[1], dot);
+
+        const float d = __half2float(*reinterpret_cast<const half*>(block));
+        acc += d * __half2float(dx_in[b]) * (float)dot;
+    }
+
+    // The 4 lanes of a block (lane & 3) each hold a partial of the same block set: a plain
+    // xor-reduction over the whole warp sums them all.
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
+
+    if (lane == 0)
+        s_warp_partials[warp_id] = acc;
+
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        float v = (lane < MMVQ_LARGE_NWARPS) ? s_warp_partials[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 2; offset > 0; offset >>= 1)
+            v += __shfl_xor_sync(0xFFFFFFFF, v, offset);
+        if (lane == 0)
+            y[row] = __float2half(v);
+    }
+}
