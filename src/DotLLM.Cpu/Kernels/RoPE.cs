@@ -138,7 +138,7 @@ public static class RoPE
         float[] rented = ArrayPool<float>.Shared.Rent(halfDim);
         Span<float> freqs = rented.AsSpan(0, halfDim);
         for (int i = 0; i < halfDim; i++)
-            freqs[i] = 1.0f / (MathF.Pow(theta, 2.0f * i / expDim) * factors[i]);
+            freqs[i] = 1.0f / (PortableMath.Pow(theta, 2.0f * i / expDim) * factors[i]);
 
         for (int pos = 0; pos < maxSeqLen; pos++)
         {
@@ -146,8 +146,8 @@ public static class RoPE
             for (int i = 0; i < halfDim; i++)
             {
                 float angle = pos * freqs[i];
-                cosTable[tableBase + i] = MathF.Cos(angle);
-                sinTable[tableBase + i] = MathF.Sin(angle);
+                cosTable[tableBase + i] = PortableMath.Cos(angle);
+                sinTable[tableBase + i] = PortableMath.Sin(angle);
             }
         }
         ArrayPool<float>.Shared.Return(rented);
@@ -159,7 +159,7 @@ public static class RoPE
     {
         int halfDim = freqs.Length;
         for (int i = 0; i < halfDim; i++)
-            freqs[i] = 1.0f / MathF.Pow(theta, 2.0f * i / headDim);
+            freqs[i] = 1.0f / PortableMath.Pow(theta, 2.0f * i / headDim);
 
         for (int pos = 0; pos < maxSeqLen; pos++)
         {
@@ -167,8 +167,8 @@ public static class RoPE
             for (int i = 0; i < halfDim; i++)
             {
                 float angle = pos * freqs[i];
-                cosTable[tableBase + i] = MathF.Cos(angle);
-                sinTable[tableBase + i] = MathF.Sin(angle);
+                cosTable[tableBase + i] = PortableMath.Cos(angle);
+                sinTable[tableBase + i] = PortableMath.Sin(angle);
             }
         }
     }
@@ -232,8 +232,8 @@ public static class RoPE
             for (int i = 0; i < halfDim; i++)
             {
                 float angle = pos * invFreq[i];
-                cosTable[tableBase + i] = MathF.Cos(angle) * mscaleMultiplier;
-                sinTable[tableBase + i] = MathF.Sin(angle) * mscaleMultiplier;
+                cosTable[tableBase + i] = PortableMath.Cos(angle) * mscaleMultiplier;
+                sinTable[tableBase + i] = PortableMath.Sin(angle) * mscaleMultiplier;
             }
         }
     }
@@ -278,8 +278,8 @@ public static class RoPE
         for (int i = 0; i < halfDim; i++)
         {
             float exponent = 2.0f * i / headDim;
-            float freqExtra = 1.0f / MathF.Pow(theta, exponent);
-            float freqInter = 1.0f / (scalingFactor * MathF.Pow(theta, exponent));
+            float freqExtra = 1.0f / PortableMath.Pow(theta, exponent);
+            float freqInter = 1.0f / (scalingFactor * PortableMath.Pow(theta, exponent));
             // Linear ramp on [low, high] in half-dim index space.
             float linear = (i - low) / (high - low);
             float mask = linear < 0.0f ? 0.0f : (linear > 1.0f ? 1.0f : linear);
@@ -337,10 +337,10 @@ public static class RoPE
         {
             for (int i = 0; i < halfDim; i++)
             {
-                float freq = 1.0f / MathF.Pow(theta, 2.0f * i / headDim);
+                float freq = 1.0f / PortableMath.Pow(theta, 2.0f * i / headDim);
                 float angle = pos * freq;
-                cosTable[pos * halfDim + i] = MathF.Cos(angle);
-                sinTable[pos * halfDim + i] = MathF.Sin(angle);
+                cosTable[pos * halfDim + i] = PortableMath.Cos(angle);
+                sinTable[pos * halfDim + i] = PortableMath.Sin(angle);
             }
         }
     }

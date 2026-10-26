@@ -323,7 +323,7 @@ public static unsafe partial class MoeSwiGluMlp
                     // gating weights are the UNBIASED probs of the chosen experts. Renormalise
                     // (expert_weights_norm, sum clamped at 6.1035e-5) then scale.
                     for (int e = 0; e < numExperts; e++)
-                        routingSpan[e] = 1.0f / (1.0f + MathF.Exp(-logitsSpan[e]));
+                        routingSpan[e] = 1.0f / (1.0f + PortableMath.Exp(-logitsSpan[e]));
                     if (selectionBias.IsEmpty)
                     {
                         SelectTopK(routingSpan, topkIdx, topkProb);
@@ -725,7 +725,7 @@ public static unsafe partial class MoeSwiGluMlp
                             float logit = 0f;
                             for (int j = 0; j < hiddenSize; j++)
                                 logit += sharedGatePtr[j] * x[j];
-                            scale = 1.0f / (1.0f + MathF.Exp(-logit));
+                            scale = 1.0f / (1.0f + PortableMath.Exp(-logit));
                         }
                         sharedScaleBuf![t] = scale;
                     }

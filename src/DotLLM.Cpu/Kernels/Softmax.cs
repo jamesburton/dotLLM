@@ -22,7 +22,7 @@ public static class Softmax
         // Subtract max for numerical stability, then exp.
         float max = TensorPrimitives.Max(input);
         TensorPrimitives.Add(input, -max, result);
-        TensorPrimitives.Exp(result, result);
+        PortableMath.Exp(result, result);
 
         // Normalize by sum.
         float sum = TensorPrimitives.Sum(result);
