@@ -194,10 +194,13 @@ public class VulkanHostImportParityTests
 
             // Staging baseline.
             float[] stagingResult = new float[m];
+            nint hW, hX, hY, mW, mX, mY;
             using (var bufW = device.Allocate(stagingBufBytes))
             using (var bufX = device.Allocate((long)k * sizeof(float)))
             using (var bufY = device.Allocate((long)m * sizeof(float)))
             {
+                hW = bufW.Handle; hX = bufX.Handle; hY = bufY.Handle;
+                mW = bufW.Memory; mX = bufX.Memory; mY = bufY.Memory;
                 device.Upload(new ReadOnlySpan<byte>(weightsPtr, totalBytes), bufW);
                 device.Upload(x, bufX);
                 kernel.Launch(bufW, bufX, bufY, m, k);
@@ -215,6 +218,12 @@ public class VulkanHostImportParityTests
                 device.Upload(x, bufX2);
                 kernel.Launch(importedBuf, bufX2, bufY2, m, k);
                 device.Download(bufY2, importedResult);
+
+                // TEMP #463 diagnostic: log handle recycling + full result vectors.
+                Diag463(hW, hX, hY, mW, mX, mY,
+                    importedBuf.Handle, bufX2.Handle, bufY2.Handle,
+                    importedBuf.Memory, bufX2.Memory, bufY2.Memory,
+                    stagingResult, importedResult);
             }
 
             for (int i = 0; i < m; i++)
@@ -273,5 +282,32 @@ public class VulkanHostImportParityTests
         {
             Environment.SetEnvironmentVariable(envVar, original);
         }
+    }
+
+    // TEMP #463 diagnostic sink. Behaviourally inert: appends one line per run.
+    private static void Diag463(
+        nint hW, nint hX, nint hY, nint mW, nint mX, nint mY,
+        nint hW2, nint hX2, nint hY2, nint mW2, nint mX2, nint mY2,
+        float[] staging, float[] imported)
+    {
+        string? path = Environment.GetEnvironmentVariable("DOTLLM463_LOG");
+        if (string.IsNullOrEmpty(path)) return;
+        int alias = (hW2 == hW ? 1 : 0) + (hX2 == hX ? 1 : 0) + (hY2 == hY ? 1 : 0);
+        int memAlias = (mW2 == mW ? 1 : 0) + (mX2 == mX ? 1 : 0) + (mY2 == mY ? 1 : 0);
+        bool allZero = true;
+        int nMismatch = 0;
+        for (int i = 0; i < imported.Length; i++)
+        {
+            if (imported[i] != 0f) allZero = false;
+            if (BitConverter.SingleToInt32Bits(staging[i]) != BitConverter.SingleToInt32Bits(imported[i])) nMismatch++;
+        }
+        string line =
+            $"{DateTime.Now:HH:mm:ss.fff} tid={Environment.CurrentManagedThreadId} alias={alias} memAlias={memAlias} " +
+            $"bufs W {hW:X}->{hW2:X} X {hX:X}->{hX2:X} Y {hY:X}->{hY2:X} " +
+            $"mems W {mW:X}->{mW2:X} X {mX:X}->{mX2:X} Y {mY:X}->{mY2:X} " +
+            $"allZero={allZero} nMismatch={nMismatch}/{imported.Length} " +
+            $"staging0={staging[0]} imported0={imported[0]} " +
+            $"imported=[{string.Join(',', imported)}]";
+        try { System.IO.File.AppendAllText(path, line + Environment.NewLine); } catch { }
     }
 }
