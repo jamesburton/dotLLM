@@ -307,6 +307,15 @@ Every finished generation writes one llama.cpp `print_timing`-style line, and a 
   until that forward returns: proof of life, not a fraction.
 - `DOTLLM_LOG_TIMINGS=0` turns both off; the engine then pays a single null check per request.
 
+### Repeat guard (#1291)
+
+A request that emits the same token N times in a row ends with `finish_reason: "length"` (N = `--repeat-guard`, default 256;
+0 disables; per request, `InferenceOptions.RepeatGuardLimit`). Under memory pressure a sampler can pin on one token until
+`max_tokens`, which looks like a hang from outside. A trip logs once, with free memory of the serving device (NVML for CUDA,
+else host): `[dotllm] req#7 repeat guard: token 29 repeated 256 times after 300 generated; ending as length (cuda:0 free 812 MiB)`.
+Applies to the per-request generator and the continuous-batch scheduler; a caller that supplies its own stop-condition list
+opts out.
+
 ## CPU KV cache type default (#1284)
 
 With paged KV (the `serve` default) on CPU, leaving both `--cache-type-k` and `--cache-type-v` unset selects Q8_0 paged blocks on uniform,

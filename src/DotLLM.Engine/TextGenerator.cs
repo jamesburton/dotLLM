@@ -341,6 +341,8 @@ public sealed partial class TextGenerator
                 EndOfGenerationTokens.CreateStopCondition(_tokenizer),
                 new MaxTokensStopCondition(maxTokens)
             };
+            if (RepeatGuardStopCondition.Create(options.RepeatGuardLimit) is { } repeatGuard)
+                stopConditions.Add(repeatGuard); // #1291
             // StopStringCondition excludes the triggering token. Partial-token
             // suffix trimming would require text-level stop metadata alongside
             // token-level finish semantics.
@@ -972,6 +974,8 @@ public sealed partial class TextGenerator
                 EndOfGenerationTokens.CreateStopCondition(_tokenizer),
                 new MaxTokensStopCondition(maxTokens)
             };
+            if (RepeatGuardStopCondition.Create(options.RepeatGuardLimit) is { } repeatGuard)
+                stopConditions.Add(repeatGuard); // #1291
             stopConditions.AddRange(StopStringCondition.CreateAll(options));
         }
 

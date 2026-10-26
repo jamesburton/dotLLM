@@ -69,6 +69,13 @@ public record InferenceOptions
     /// <summary>Maximum number of tokens to generate.</summary>
     public int MaxTokens { get; init; } = 2048;
 
+    /// <summary>
+    /// Repeat guard (#1291): end the request as <c>finish_reason=length</c> after this many identical tokens in a row.
+    /// Null uses the engine default (<c>RepeatGuardStopCondition.DefaultLimit</c>, 256); 0 disables. Only applies when
+    /// <see cref="StopConditions"/> is not supplied.
+    /// </summary>
+    public int? RepeatGuardLimit { get; init; }
+
     /// <summary>Random seed for reproducible sampling. Null = non-deterministic.</summary>
     public int? Seed { get; init; }
 

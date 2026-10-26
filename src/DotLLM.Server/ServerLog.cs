@@ -96,6 +96,33 @@ public static class ServerLog
         return true;
     }
 
+    /// <summary>
+    /// Routes repeat-guard trips (#1291) to <see cref="Info"/>, with free memory of the serving device: NVML for a CUDA
+    /// device, else the host's available physical memory.
+    /// </summary>
+    /// <param name="resolvedDevice">Returns the device currently serving (<c>cuda</c>, <c>cuda:1</c>, <c>cpu</c>, ...), read at trip time.</param>
+    public static void InstallRepeatGuardLog(Func<string?> resolvedDevice)
+    {
+        DotLLM.Engine.Samplers.StopConditions.RepeatGuardStopCondition.Log = Info;
+        DotLLM.Engine.Samplers.StopConditions.RepeatGuardStopCondition.MemoryProbe = () => FreeMemory(resolvedDevice());
+    }
+
+    /// <summary>Describes free memory for <paramref name="device"/>: <c>"cuda:0 free 812 MiB"</c> or <c>"host free 9123 MiB"</c>.</summary>
+    /// <param name="device">The serving device, or null.</param>
+    /// <returns>The description.</returns>
+    internal static string FreeMemory(string? device)
+    {
+        if (device is not null && device.StartsWith("cuda", StringComparison.OrdinalIgnoreCase))
+        {
+            int ordinal = device.IndexOf(':') is int c and >= 0 && int.TryParse(device.AsSpan(c + 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out int o) ? o : 0;
+            if (DotLLM.Cuda.CudaMemoryInfo.TryGet(ordinal, out long free, out _))
+                return FormattableString.Invariant($"cuda:{ordinal} free {free >> 20} MiB");
+        }
+
+        var gc = GC.GetGCMemoryInfo();
+        return FormattableString.Invariant($"host free {Math.Max(0, gc.TotalAvailableMemoryBytes - gc.MemoryLoadBytes) >> 20} MiB");
+    }
+
     /// <summary>Writes <c>[dotllm] {req#N }{message}</c> to the console (timestamped once <see cref="InstallTimestamps"/> ran).</summary>
     /// <param name="message">The log message, without the prefix.</param>
     public static void Info(string message) =>

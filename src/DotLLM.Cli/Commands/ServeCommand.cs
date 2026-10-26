@@ -281,6 +281,13 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [DefaultValue(0)]
         public int PrefillChunkSize { get; set; }
 
+        /// <summary>Repeat guard: identical tokens in a row that end a request as finish_reason=length (#1291).</summary>
+        [CommandOption("--repeat-guard")]
+        [Description("End a request (finish_reason=length) after this many identical tokens in a row; catches a sampler pinned on one " +
+                     "token under memory pressure, which otherwise looks like a hang. Default 256; 0 disables.")]
+        [DefaultValue(256)]
+        public int RepeatGuard { get; set; } = 256;
+
         /// <summary>Maximum recurrent prefix snapshots.</summary>
         [CommandOption("--prefix-snapshots")]
         [Description("Maximum recurrent prefix snapshots (default 1). Use with --prefix-snapshot-host-budget for alternating sessions.")]
@@ -422,6 +429,9 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         // Per-request timing line + live prefill progress (#1288); DOTLLM_LOG_TIMINGS=0 turns both off.
         DotLLM.Server.ServerLog.InstallTimingLog(Environment.GetEnvironmentVariable(DotLLM.Engine.RequestTimingLog.EnvVar));
 
+        // Repeat guard default for every request (#1291).
+        DotLLM.Engine.Samplers.StopConditions.RepeatGuardStopCondition.DefaultLimit = Math.Max(0, settings.RepeatGuard);
+
         // Reject an unrecognised --device up front instead of serving on the CPU (#468/#790).
         if (DeviceSpec.TryParse(settings.Device, out _, out string? deviceError) is false)
         {
@@ -549,6 +559,9 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         var app = ServerStartup.BuildApp(state!, [], serveUi: !settings.NoUi);
 
         var url = $"http://{settings.Host}:{settings.Port}";
+
+        // Repeat-guard trips are logged with the free memory of the device in use at the time (#1291).
+        DotLLM.Server.ServerLog.InstallRepeatGuardLog(() => state?.Options.ResolvedDevice);
 
         // Print banner
         AnsiConsole.Write(new Rule($"[grey]dotllm serve[/]").LeftJustified());
