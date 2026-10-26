@@ -44,6 +44,7 @@ public static class ModelEndpoint
             KeepAliveSeconds = m.EffectiveKeepAliveSeconds,
             ExpiresInSeconds = m.ExpiresInSeconds,
             SizeBytes = m.EstimatedBytes,
+            Meta = m.Meta,
         }).ToArray();
 
         if (data.Length == 0)
