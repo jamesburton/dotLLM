@@ -82,6 +82,20 @@ public static class ServerLog
         Console.SetError(new TimestampingWriter(Console.Error));
     }
 
+    /// <summary>
+    /// Routes the engine's per-request timing lines and prefill-progress pulse (#1288) to <see cref="Info"/>, unless
+    /// <paramref name="envValue"/> (<c>DOTLLM_LOG_TIMINGS</c>) is <c>0</c>.
+    /// </summary>
+    /// <param name="envValue">The <c>DOTLLM_LOG_TIMINGS</c> value, or null when unset.</param>
+    /// <returns>Whether timing lines are now on.</returns>
+    public static bool InstallTimingLog(string? envValue)
+    {
+        if (envValue?.Trim() == "0")
+            return false;
+        DotLLM.Engine.RequestTimingLog.Sink = Info;
+        return true;
+    }
+
     /// <summary>Writes <c>[dotllm] {req#N }{message}</c> to the console (timestamped once <see cref="InstallTimestamps"/> ran).</summary>
     /// <param name="message">The log message, without the prefix.</param>
     public static void Info(string message) =>

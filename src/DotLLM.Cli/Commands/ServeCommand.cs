@@ -395,6 +395,9 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         // Timestamp every "[dotllm] ..." line from here on, startup load included (#1021).
         DotLLM.Server.ServerLog.InstallTimestamps();
 
+        // Per-request timing line + live prefill progress (#1288); DOTLLM_LOG_TIMINGS=0 turns both off.
+        DotLLM.Server.ServerLog.InstallTimingLog(Environment.GetEnvironmentVariable(DotLLM.Engine.RequestTimingLog.EnvVar));
+
         // Reject an unrecognised --device up front instead of serving on the CPU (#468/#790).
         if (DeviceSpec.TryParse(settings.Device, out _, out string? deviceError) is false)
         {
