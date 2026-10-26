@@ -679,11 +679,14 @@ public static class ServerStartup
         var generator = new TextGenerator(model, tokenizer, kvFactory, prefixCache,
             draftModel: draftModel, speculativeCandidates: options.SpeculativeCandidates,
             mtpEnabled: options.MtpEnabled, mtpAdaptive: true, recurrentPrefixCache: options.PromptCacheEnabled,
+            promptLookup: options.PromptLookup,
             prefixTrieManager: prefixTrieManager,
             prefillChunkSize: options.PrefillChunkSize,
             recurrentPrefixCacheOptions: options.GetPrefixSnapshotOptions());
         if (options.PrefillChunkSize > 0)
             Console.WriteLine($"[dotllm] Prefill chunk size: {options.PrefillChunkSize} tokens per forward pass");
+        if (options.PromptLookup is { } lookup)
+            Console.WriteLine($"[dotllm] Prompt lookup: up to {lookup.DraftTokens} drafts, n-gram {lookup.MinNgram}..{lookup.MaxNgram} (greedy requests; continuous batching off)");
         if (options.PrefixSnapshotDiskDirectory is not null)
             Console.WriteLine($"[dotllm] Prefix snapshot disk transport: {generator.RecurrentPrefixStatistics.DiskTransport ?? "unavailable (provider or directory)"} (restart persistence disabled)");
 
@@ -721,7 +724,7 @@ public static class ServerStartup
         bool vulkanScheduler = vulkanKvFactory is not null && model.SupportsThreadedSequenceState
             && (string.Equals(vkSchedEnv, "1", StringComparison.Ordinal)
                 || (options.ExpectedConcurrency >= 5 && !string.Equals(vkSchedEnv, "0", StringComparison.Ordinal)));
-        if ((pagedFactory is not null || vulkanScheduler) && kvFactory is not null && draftModel is null && !mtpActive)
+        if ((pagedFactory is not null || vulkanScheduler) && kvFactory is not null && draftModel is null && !mtpActive && options.PromptLookup is null)
         {
             var schedulerOptions = ResolveSchedulerOptions(options);
             if (vulkanScheduler)

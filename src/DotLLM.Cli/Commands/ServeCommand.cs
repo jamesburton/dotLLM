@@ -172,6 +172,30 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [DefaultValue(DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates)]
         public int SpeculativeK { get; set; } = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
 
+        /// <summary>Prompt-lookup (n-gram) speculative decoding (issue #1293).</summary>
+        [CommandOption("--prompt-lookup|--lookup")]
+        [Description("Prompt-lookup speculative decoding: drafts are copied from earlier prompt/output text where the last tokens recur, and verified by the model " +
+                     "(greedy output is identical to plain decode). Needs no draft model; pays off on code edits and other self-repeating output. " +
+                     "Greedy requests only; a draft model or an MTP head takes priority.")]
+        [DefaultValue(false)]
+        public bool PromptLookup { get; set; }
+
+        /// <summary>Maximum prompt-lookup drafts per round.</summary>
+        [CommandOption("--lookup-draft")]
+        [Description("Maximum drafts per prompt-lookup round. Default 8.")]
+        [DefaultValue(DotLLM.Engine.PromptLookupOptions.DefaultDraftTokens)]
+        public int LookupDraft { get; set; } = DotLLM.Engine.PromptLookupOptions.DefaultDraftTokens;
+
+        /// <summary>Longest suffix matched by prompt lookup.</summary>
+        [CommandOption("--lookup-ngram")]
+        [Description("Longest context suffix (tokens) prompt lookup matches; shorter matches down to 2 tokens are used when it does not recur. Default 6.")]
+        [DefaultValue(DotLLM.Engine.PromptLookupOptions.DefaultMaxNgram)]
+        public int LookupNgram { get; set; } = DotLLM.Engine.PromptLookupOptions.DefaultMaxNgram;
+
+        /// <summary>The prompt-lookup settings, or null when <see cref="PromptLookup"/> is off.</summary>
+        public DotLLM.Engine.PromptLookupOptions? PromptLookupOptions
+            => PromptLookup ? DotLLM.Engine.PromptLookupOptions.Create(LookupDraft, LookupNgram) : null;
+
         /// <summary>Accepted for back-compat: MTP is already on by default for models with an embedded head.</summary>
         [CommandOption("--mtp")]
         [Description("Multi-Token Prediction (MTP) self-speculative decoding is ON by default for serve when the loaded GGUF carries an " +
@@ -455,6 +479,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             UsePaged = !settings.NoPaged,
             SpeculativeModel = settings.SpeculativeModel,
             SpeculativeCandidates = settings.SpeculativeK,
+            PromptLookup = settings.PromptLookupOptions,
             MtpEnabled = !settings.NoMtp,
             MtpExplicit = settings.Mtp && !settings.NoMtp,
             MtpHeadPath = settings.MtpHead,
