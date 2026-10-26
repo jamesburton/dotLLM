@@ -304,6 +304,34 @@ public sealed class AnthropicStreamingTests
                   .GetProperty("delta").GetProperty("stop_reason").GetString());
     }
 
+    /// <summary>#1287: a marker split across tokens leaks no fragment into text_delta; the prose before it streams.</summary>
+    [Fact]
+    public async Task Streaming_SplitMarker_LeaksNoFragment()
+    {
+        var frames = await RunAsync(
+            Tokens(("Let me check. <to", null),
+                   ("ol_ca", null),
+                   ("ll>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>", FinishReason.Stop)),
+            new HermesToolCallParser());
+
+        Assert.Equal("Let me check. ", TextOf(frames));
+        Assert.Contains(frames, f =>
+            f.Event == "content_block_start" &&
+            f.Data.GetProperty("content_block").GetProperty("type").GetString() == "tool_use");
+    }
+
+    /// <summary>#1287: held-back text that never parses into a call (a forced call cut off by max_tokens) is still delivered.</summary>
+    [Fact]
+    public async Task Streaming_HeldTextThatNeverParses_IsDelivered()
+    {
+        var frames = await RunAsync(
+            Tokens((JsonHead, FinishReason.Length)),
+            new GenericToolCallParser(),
+            suppressToolCallText: true);
+
+        Assert.Equal(JsonHead, TextOf(frames));
+    }
+
     [Fact]
     public async Task Streaming_MarkerToolCall_StreamsThePreambleButNotTheMarkup()
     {

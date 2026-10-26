@@ -416,15 +416,27 @@ public static class MessagesEndpoint
 
         // Tool-call markup must not ALSO go out as text_delta: the same payload would be
         // reported twice — once as text, once as the tool_use block emitted below — and an SDK's
-        // text_stream would print raw JSON at the user. The accumulator holds text back from the
-        // moment the parser recognises a tool call; prose emitted before that is genuine and
-        // still streams. Under a forced tool_choice the whole completion is the call, so
-        // suppression starts immediately. For `auto`, only a marker-based parser drives
-        // suppression: GenericToolCallParser's heuristic fires on any `{ ... "name"`, which would
-        // swallow ordinary prose that merely looks JSON-ish.
-        var suppressor = toolCallParser is not null && !forcedToolCall && toolCallParser is not GenericToolCallParser
-            ? new StreamingToolCallAccumulator(toolCallParser)
-            : null;
+        // text_stream would print raw JSON at the user. Prose streams up to the first complete start
+        // marker of the active parser, holding back only a tail that could still grow into one (#1287).
+        // That covers a forced tool_choice and the generic heuristic parser too (marker `{`): held text
+        // that never parses into a call is delivered after generation.
+        var suppressor = toolCallParser is not null ? new StreamingToolCallAccumulator(toolCallParser) : null;
+
+        async Task WriteTextAsync(string text)
+        {
+            if (openKind != "text")
+            {
+                await CloseBlockAsync();
+                await OpenBlockAsync("text");
+            }
+            await WriteEventAsync(httpContext, "content_block_delta",
+                new AnthropicContentBlockDeltaEvent
+                {
+                    Index = openIndex,
+                    Delta = new AnthropicStreamDeltaDto { Type = "text_delta", Text = text },
+                },
+                ServerJsonContext.Default.AnthropicContentBlockDeltaEvent, ct);
+        }
 
         async Task EmitAsync(ReasoningChunk chunk)
         {
@@ -447,22 +459,9 @@ public static class MessagesEndpoint
             if (chunk.Content.Length > 0)
             {
                 sb.Append(chunk.Content);
-                bool suppress = forcedToolCall || (suppressor?.Append(chunk.Content) ?? false);
-                if (!suppress)
-                {
-                    if (openKind != "text")
-                    {
-                        await CloseBlockAsync();
-                        await OpenBlockAsync("text");
-                    }
-                    await WriteEventAsync(httpContext, "content_block_delta",
-                        new AnthropicContentBlockDeltaEvent
-                        {
-                            Index = openIndex,
-                            Delta = new AnthropicStreamDeltaDto { Type = "text_delta", Text = chunk.Content },
-                        },
-                        ServerJsonContext.Default.AnthropicContentBlockDeltaEvent, ct);
-                }
+                string text = suppressor?.AppendStreamable(chunk.Content) ?? chunk.Content;
+                if (text.Length > 0)
+                    await WriteTextAsync(text);
             }
         }
 
@@ -511,12 +510,6 @@ public static class MessagesEndpoint
             return;
         }
 
-        // Close the open block (the text block in the eager mode). A lazy stream that produced nothing at
-        // all still reports one (empty) text block, as the eager one always has.
-        if (openKind is null && nextIndex == 0)
-            await OpenBlockAsync("text");
-        await CloseBlockAsync();
-
         // Post-generation tool-call detection (mirrors the OpenAI streaming endpoint).
         string text = sb.ToString();
         ToolCall[]? toolCalls = null;
@@ -526,6 +519,17 @@ public static class MessagesEndpoint
             if (toolCalls is { Length: > 0 })
                 finishReason = FinishReason.ToolCalls;
         }
+
+        // Text held back as "probably a tool call" that did not parse into one (a truncated call, prose
+        // with a brace) is still the model's answer: deliver it.
+        if (toolCalls is not { Length: > 0 } && suppressor is not null && suppressor.EmittedLength < text.Length)
+            await WriteTextAsync(text[suppressor.EmittedLength..]);
+
+        // Close the open block (the text block in the eager mode). A lazy stream that produced nothing at
+        // all still reports one (empty) text block, as the eager one always has.
+        if (openKind is null && nextIndex == 0)
+            await OpenBlockAsync("text");
+        await CloseBlockAsync();
 
         // Emit detected tool calls as tool_use blocks after the text block.
         if (toolCalls is { Length: > 0 })

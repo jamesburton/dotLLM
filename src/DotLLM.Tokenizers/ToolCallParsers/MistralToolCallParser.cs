@@ -42,6 +42,9 @@ public sealed class MistralToolCallParser : IToolCallParser
     }
 
     /// <inheritdoc/>
+    public IReadOnlyList<string> StartMarkers { get; } = [Marker];
+
+    /// <inheritdoc/>
     public bool IsToolCallStart(string text)
         => text.Contains(Marker, StringComparison.Ordinal);
 

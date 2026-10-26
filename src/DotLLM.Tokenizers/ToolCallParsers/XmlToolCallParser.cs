@@ -29,4 +29,7 @@ public sealed class XmlToolCallParser : IToolCallParser
 
     /// <inheritdoc/>
     public bool IsToolCallStart(string text) => _inner.IsToolCallStart(text);
+
+    /// <inheritdoc/>
+    public IReadOnlyList<string> StartMarkers => _inner.StartMarkers;
 }

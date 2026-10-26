@@ -471,17 +471,12 @@ public static class ChatCompletionEndpoint
 
         // Tool-call markup must not ALSO go out as delta.content: the same payload would be reported
         // twice (as text, then as the final chunk's tool_calls) and a client would print raw
-        // `<tool_call>...` / `<|tool_call>call:...` at the user. Mirrors the Messages endpoint: prose
-        // before the call still streams; from the moment the model-family parser recognises a call
-        // the rest is held back. Under a forced tool_choice (generic parser, bare JSON) the whole
-        // completion is the call, so everything is held back.
-        // A GenericToolCallParser as the MODEL's own parser (unknown architecture) is heuristic and
-        // would swallow JSON-ish prose, so only a forced choice or a marker-based parser suppresses.
+        // `<tool_call>...` / `<|tool_call>call:...` at the user. Prose streams up to the first complete
+        // start marker of the active parser; only a tail that could still grow into a marker is held
+        // (#1287). This covers every parser, incl. a forced tool_choice and the generic heuristic one
+        // (marker `{`): text held back that never parses into a call is delivered at the end.
         bool hasTools = toolParser is not null && tools is { Length: > 0 };
-        bool forcedCall = hasTools && forcedToolCall;
-        var suppressor = hasTools && !forcedCall && toolParser is not DotLLM.Tokenizers.ToolCallParsers.GenericToolCallParser
-            ? new StreamingToolCallAccumulator(toolParser!)
-            : null;
+        var suppressor = hasTools ? new StreamingToolCallAccumulator(toolParser!) : null;
         int emittedLength = 0;
 
         async Task EmitAsync(ReasoningChunk chunk, LogprobsDto? logprobs)
@@ -504,17 +499,21 @@ public static class ChatCompletionEndpoint
             if (chunk.Content.Length > 0 || (chunk.Reasoning.Length == 0 && logprobs is not null))
             {
                 sb.Append(chunk.Content);
+
                 // Tool-call markup (answer text only: reasoning never reaches the suppressor) is held back.
-                if (chunk.Content.Length > 0 && (forcedCall || (suppressor?.Append(chunk.Content) ?? false)))
+                string content = chunk.Content.Length > 0 && suppressor is not null
+                    ? suppressor.AppendStreamable(chunk.Content)
+                    : chunk.Content;
+                if (chunk.Content.Length > 0 && content.Length == 0)
                     return;
-                emittedLength += chunk.Content.Length;
+                emittedLength += content.Length;
                 await WriteSseChunk(httpContext, new ChatCompletionChunk
                 {
                     Id = requestId,
                     Model = modelId,
                     Choices = [new ChatChunkChoiceDto
                     {
-                        Delta = new ChatDeltaDto { Content = chunk.Content.Length > 0 ? chunk.Content : null },
+                        Delta = new ChatDeltaDto { Content = content.Length > 0 ? content : null },
                         Logprobs = logprobs,
                     }],
                 }, ct);

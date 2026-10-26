@@ -90,6 +90,9 @@ public sealed class Gemma4ToolCallParser : IToolCallParser
     }
 
     /// <inheritdoc/>
+    public IReadOnlyList<string> StartMarkers { get; } = [Open];
+
+    /// <inheritdoc/>
     public bool IsToolCallStart(string text)
         => text.Contains(Open, StringComparison.Ordinal);
 

@@ -33,4 +33,11 @@ public interface IToolCallParser
     /// <param name="text">Text to check.</param>
     /// <returns>True if the text appears to start a tool call.</returns>
     bool IsToolCallStart(string text);
+
+    /// <summary>
+    /// Literal strings that open a tool call in this parser's format (#1287). A streaming caller emits prose up to the
+    /// first complete marker and holds back only a trailing fragment that could still grow into one. Empty for a
+    /// parser with no literal marker, which then relies on <see cref="IsToolCallStart"/> alone.
+    /// </summary>
+    IReadOnlyList<string> StartMarkers => [];
 }

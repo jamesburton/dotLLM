@@ -93,6 +93,9 @@ public sealed class PythonicToolCallParser : IToolCallParser
     }
 
     /// <inheritdoc/>
+    public IReadOnlyList<string> StartMarkers { get; } = [OpenTag, LfmOpenTag];
+
+    /// <inheritdoc/>
     public bool IsToolCallStart(string text)
     {
         if (string.IsNullOrEmpty(text))
