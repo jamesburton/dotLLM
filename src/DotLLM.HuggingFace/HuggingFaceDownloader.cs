@@ -16,6 +16,15 @@ public sealed class HuggingFaceDownloader : IDisposable
     private readonly bool _ownsClient;
     private readonly string _cdnBase;
 
+    /// <summary>Headroom kept free beyond the download itself (#1296): 256 MiB.</summary>
+    public const long FreeSpaceMarginBytes = 256L * 1024 * 1024;
+
+    /// <summary>
+    /// Free bytes on the volume holding a directory, or null when unknown (#1296). Defaults to
+    /// <see cref="DriveInfo.AvailableFreeSpace"/>; tests substitute a fake.
+    /// </summary>
+    public Func<string, long?> FreeBytesProbe { get; init; } = DriveFreeBytes;
+
     /// <summary>
     /// Creates a new downloader.
     /// </summary>
@@ -94,33 +103,109 @@ public sealed class HuggingFaceDownloader : IDisposable
         long? totalBytes = response.Content.Headers.ContentLength.HasValue
             ? response.Content.Headers.ContentLength.Value + existingBytes
             : null;
+        EnsureFreeSpace(partPath, totalBytes, existingBytes);
 
         await using var contentStream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-        await using var fileStream = new FileStream(
+        var fileStream = new FileStream(
             partPath,
             existingBytes > 0 ? FileMode.Append : FileMode.Create,
             FileAccess.Write,
             FileShare.None,
             bufferSize: 81920);
-
-        var buffer = new byte[81920];
-        long totalRead = existingBytes;
-        int bytesRead;
-
-        while ((bytesRead = await contentStream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) > 0)
+        try
         {
-            await fileStream.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken).ConfigureAwait(false);
-            totalRead += bytesRead;
-            progress?.Report((totalRead, totalBytes));
+            var buffer = new byte[81920];
+            long totalRead = existingBytes;
+            int bytesRead;
+
+            while ((bytesRead = await contentStream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) > 0)
+            {
+                await fileStream.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken).ConfigureAwait(false);
+                totalRead += bytesRead;
+                progress?.Report((totalRead, totalBytes));
+            }
+        }
+        catch (IOException ex) when (IsDiskFull(ex))
+        {
+            await fileStream.DisposeAsync().ConfigureAwait(false);
+            throw DiskFilled(partPath, totalBytes, ex);
+        }
+        finally
+        {
+            await fileStream.DisposeAsync().ConfigureAwait(false);
         }
 
         // Rename .part to final path once download is complete
-        fileStream.Close();
         if (File.Exists(destPath))
             File.Delete(destPath);
         File.Move(partPath, destPath);
 
         return destPath;
+    }
+
+    /// <summary>
+    /// Refuses a download that cannot fit (#1296): the bytes still to fetch plus <see cref="FreeSpaceMarginBytes"/> must be
+    /// free on the target volume. Skipped when the size or the free space is unknown.
+    /// </summary>
+    /// <param name="targetPath">The file about to be written.</param>
+    /// <param name="totalBytes">The file's full size, when the server reported it.</param>
+    /// <param name="existingBytes">Bytes already on disk from an earlier, resumed attempt.</param>
+    /// <exception cref="InsufficientDiskSpaceException">The volume lacks the space.</exception>
+    public void EnsureFreeSpace(string targetPath, long? totalBytes, long existingBytes)
+    {
+        if (totalBytes is not long total || total - existingBytes <= 0)
+            return;
+        long required = total - existingBytes + FreeSpaceMarginBytes;
+        string dir = Path.GetDirectoryName(Path.GetFullPath(targetPath)) ?? targetPath;
+        if (FreeBytesProbe(dir) is long free && free < required)
+            throw new InsufficientDiskSpaceException(targetPath, required, free);
+    }
+
+    /// <summary>The default <see cref="FreeBytesProbe"/>: <see cref="DriveInfo.AvailableFreeSpace"/> of the volume, or null.</summary>
+    private static long? DriveFreeBytes(string directory)
+    {
+        try
+        {
+            string? root = Path.GetPathRoot(Path.GetFullPath(directory));
+            return string.IsNullOrEmpty(root) ? null : new DriveInfo(root).AvailableFreeSpace;
+        }
+        catch (Exception ex) when (ex is IOException or ArgumentException or UnauthorizedAccessException)
+        {
+            return null; // unknown volume: do not block the download on a probe failure
+        }
+    }
+
+    /// <summary>
+    /// Whether <paramref name="ex"/> is "disk full": Windows <c>ERROR_DISK_FULL</c> (112) / <c>ERROR_HANDLE_DISK_FULL</c> (39),
+    /// or POSIX <c>ENOSPC</c> (28).
+    /// </summary>
+    /// <param name="ex">The I/O error.</param>
+    /// <returns>True for a full disk.</returns>
+    public static bool IsDiskFull(IOException ex)
+    {
+        int code = ex.HResult & 0xFFFF;
+        return OperatingSystem.IsWindows() ? code is 112 or 39 : code == 28;
+    }
+
+    /// <summary>Deletes the partial file a full disk left behind and describes the failure (#1296).</summary>
+    private InsufficientDiskSpaceException DiskFilled(string partPath, long? totalBytes, IOException ex)
+    {
+        long written = 0;
+        try
+        {
+            if (File.Exists(partPath))
+            {
+                written = new FileInfo(partPath).Length;
+                File.Delete(partPath);
+            }
+        }
+        catch (IOException)
+        {
+            // Best effort: the error below still names the problem.
+        }
+
+        string dir = Path.GetDirectoryName(Path.GetFullPath(partPath)) ?? partPath;
+        return new InsufficientDiskSpaceException(partPath, (totalBytes ?? written) + FreeSpaceMarginBytes, FreeBytesProbe(dir), ex);
     }
 
     /// <summary>
@@ -226,27 +311,36 @@ public sealed class HuggingFaceDownloader : IDisposable
                 ? response.Content.Headers.ContentLength.Value + existingBytes
                 : headLength;
 
+            EnsureFreeSpace(partPath, totalBytes, existingBytes);
             progress?.Report((existingBytes, totalBytes));
 
-            await using (var contentStream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false))
-            await using (var fileStream = new FileStream(partPath,
-                existingBytes > 0 ? FileMode.Append : FileMode.Create,
-                FileAccess.Write, FileShare.None, bufferSize: 81920))
+            try
             {
-                var buffer = new byte[81920];
-                long totalRead = existingBytes;
-                int bytesRead;
-                while ((bytesRead = await contentStream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) > 0)
+                await using (var contentStream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false))
+                await using (var fileStream = new FileStream(partPath,
+                    existingBytes > 0 ? FileMode.Append : FileMode.Create,
+                    FileAccess.Write, FileShare.None, bufferSize: 81920))
                 {
-                    // Deliberately NOT passing the token to WriteAsync: a cancel between the read
-                    // and the write would drop bytes already consumed from the socket, so the
-                    // .incomplete length would no longer match what was received and the resume
-                    // Range would be wrong.
-                    await fileStream.WriteAsync(buffer.AsMemory(0, bytesRead), CancellationToken.None).ConfigureAwait(false);
-                    totalRead += bytesRead;
-                    progress?.Report((totalRead, totalBytes));
+                    var buffer = new byte[81920];
+                    long totalRead = existingBytes;
+                    int bytesRead;
+                    while ((bytesRead = await contentStream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) > 0)
+                    {
+                        // Deliberately NOT passing the token to WriteAsync: a cancel between the read
+                        // and the write would drop bytes already consumed from the socket, so the
+                        // .incomplete length would no longer match what was received and the resume
+                        // Range would be wrong.
+                        await fileStream.WriteAsync(buffer.AsMemory(0, bytesRead), CancellationToken.None).ConfigureAwait(false);
+                        totalRead += bytesRead;
+                        progress?.Report((totalRead, totalBytes));
+                    }
+                    await fileStream.FlushAsync(CancellationToken.None).ConfigureAwait(false);
                 }
-                await fileStream.FlushAsync(CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (IOException ex) when (IsDiskFull(ex))
+            {
+                // The streams are closed by now. Resuming would need the same space again, so free it (#1296).
+                throw DiskFilled(partPath, totalBytes, ex);
             }
 
             File.Move(partPath, blobPath, overwrite: true);
