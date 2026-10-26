@@ -31,6 +31,7 @@ public sealed partial class TextGenerator
     private readonly PrefixCache? _prefixCache;
     private readonly PrefixTrieManager? _prefixTrieManager;
     private readonly IModel? _draftModel;
+    private readonly PromptLookupOptions? _promptLookup;
     private readonly Func<ModelConfig, int, Core.Attention.IKvCache>? _draftKvCacheFactory;
     private readonly int _speculativeCandidates;
     private readonly int _mtpCandidates;   // MTP depth: the model's preferred K when the caller kept the library default
@@ -168,6 +169,9 @@ public sealed partial class TextGenerator
     /// CPU-prefill/GPU-decode path, whose <see cref="HybridPrefillDecodeStrategy.RunPrefill"/>
     /// processes the full prompt itself.</param>
     /// <param name="recurrentPrefixCacheOptions">Optional independent recurrent snapshot count and pinned host memory budget.</param>
+    /// <param name="promptLookup">Enables prompt-lookup (n-gram) speculative decoding (issue #1293) with these settings: drafts are
+    /// copied from earlier context and verified by <paramref name="model"/>, so greedy output is unchanged. Engages only when no
+    /// draft model and no MTP round runs, decoding is effectively greedy and logprobs are not requested. Null (default) = off.</param>
     public TextGenerator(IModel model, ITokenizer tokenizer,
                           Func<ModelConfig, int, Core.Attention.IKvCache>? kvCacheFactory = null,
                           PrefixCache? prefixCache = null,
@@ -180,8 +184,11 @@ public sealed partial class TextGenerator
                           int prefillChunkSize = 0,
                           bool mtpAdaptive = false,
                           bool recurrentPrefixCache = false,
-                          RecurrentPrefixCacheOptions? recurrentPrefixCacheOptions = null)
+                          RecurrentPrefixCacheOptions? recurrentPrefixCacheOptions = null,
+                          PromptLookupOptions? promptLookup = null)
     {
+        promptLookup?.Validate();
+        _promptLookup = promptLookup;
         _model = model;
         _tokenizer = tokenizer;
         _kvCacheFactory = kvCacheFactory;
@@ -608,23 +615,27 @@ public sealed partial class TextGenerator
 
             int specDrafted = 0, specAccepted = 0;
             bool useDraftSpec = _draftModel != null && !captureLogprobs && IsEffectivelyGreedy(options);
+            bool useLookupSpec = UsePromptLookup(useDraftSpec, useMtp, captureLogprobs, options);
             int mtpFallbackStep = 0;                // > 0: the MTP rounds measured slower than plain decode; plain decode resumes at this step (#900)
             long mtpTicks = 0; int mtpTokens = 0;   // MTP-segment wall ticks / committed tokens, for the adaptive gate
 
             // Decode loop (speculative decode disabled when logprobs requested — no per-position logit access;
             // also disabled when sampling isn't effectively greedy, since non-greedy acceptance is not yet
             // distributionally correct under the sampler pipeline — see Wave 8 / issue #121).
-            if (useDraftSpec)
+            if (useDraftSpec || useLookupSpec)
             {
                 // ── Speculative decode loop ──
                 var specDecoder = new SpeculativeDecoder(
                     greedy: true, seed: options.Seed);
-                Core.Attention.IKvCache draftKvCache = AllocateDraftKvCache(cacheSize);
-                int[] specBuffer = ArrayPool<int>.Shared.Rent(_speculativeCandidates + 1);
+                Core.Attention.IKvCache? draftKvCache = useDraftSpec ? AllocateDraftKvCache(cacheSize) : null;
+                PromptLookupDrafter? lookup = useLookupSpec ? CreatePromptLookupDrafter(promptIds, generatedIds, cacheSize) : null;
+                int specK = lookup is null ? _speculativeCandidates : Math.Min(_promptLookup!.DraftTokens, _model.MaxAllRowLogitsLength - 1);
+                int[] specBuffer = ArrayPool<int>.Shared.Rent(specK + 1);
                 try
                 {
                     // Prefill draft model with prompt
-                    PrefillDraftModel(promptIds, draftKvCache);
+                    if (draftKvCache is not null)
+                        PrefillDraftModel(promptIds, draftKvCache);
 
                     int step = 1;
                     while (step < maxTokens)
@@ -635,12 +646,14 @@ public sealed partial class TextGenerator
                         if (pos >= cacheSize) break;
 
                         int remaining = maxTokens - step;
-                        int k = Math.Min(_speculativeCandidates, remaining);
+                        int k = Math.Min(specK, remaining);
 
-                        var result = specDecoder.DraftAndVerify(
-                            _model, _draftModel!, kvCache, draftKvCache,
-                            pipeline, generatedIds, constraint,
-                            pos, vocabSize, _draftModel!.Config.VocabSize, k, specBuffer);
+                        var result = lookup is not null
+                            ? specDecoder.LookupAndVerify(_model, kvCache, lookup, generatedIds[^1], constraint, pos, vocabSize, k, specBuffer)
+                            : specDecoder.DraftAndVerify(
+                                _model, _draftModel!, kvCache, draftKvCache!,
+                                pipeline, generatedIds, constraint,
+                                pos, vocabSize, _draftModel!.Config.VocabSize, k, specBuffer);
 
                         if (result.AcceptedCount == 0) break;
 
@@ -650,10 +663,11 @@ public sealed partial class TextGenerator
                         // Constraint is already advanced inside DraftAndVerify — do NOT advance again here.
                         // Only count tokens that actually make it into output (stop conditions may discard some).
                         bool shouldBreak = false;
-                        for (int i = 0; i < result.AcceptedCount; i++)
+                        for (int i = 0; i < result.AcceptedCount && step < maxTokens; i++)   // a full round plus its bonus can overshoot max_tokens by one
                         {
                             int tokenId = specBuffer[i];
                             generatedIds.Add(tokenId);
+                            lookup?.Append(tokenId);
                             detok.Append(tokenId);
 
                             ReadOnlySpan<char> specTail = detok.GetTailView(stopTailSize, stopScratch);
@@ -669,7 +683,7 @@ public sealed partial class TextGenerator
                                 }
                                 else
                                 {
-                                    specAccepted++;
+                                    if (i < result.AcceptedCount - 1) specAccepted++;   // drafts only: the round's last token is the target's own
                                     onTokenGenerated?.Invoke(tokenId);
                                 }
 
@@ -680,7 +694,7 @@ public sealed partial class TextGenerator
                                 break;
                             }
 
-                            specAccepted++;
+                            if (i < result.AcceptedCount - 1) specAccepted++;   // drafts only: the round's last token is the target's own
                             onTokenGenerated?.Invoke(tokenId);
                             EmitText();
                             step++;
@@ -691,7 +705,8 @@ public sealed partial class TextGenerator
                 }
                 finally
                 {
-                    draftKvCache.Dispose();
+                    draftKvCache?.Dispose();
+                    lookup?.Dispose();
                     ArrayPool<int>.Shared.Return(specBuffer);
                 }
             }
@@ -789,7 +804,7 @@ public sealed partial class TextGenerator
             }
 
             // Plain decode: the default, and the tail of a request whose MTP rounds fell back (mtpFallbackStep).
-            if (!useDraftSpec && (!useMtp || mtpFallbackStep > 0))
+            if (!useDraftSpec && !useLookupSpec && (!useMtp || mtpFallbackStep > 0))
             {
                 // ── Standard decode loop: one token at a time ──
                 for (int step = mtpFallbackStep > 0 ? mtpFallbackStep : 1; step < maxTokens; step++)
@@ -1150,20 +1165,24 @@ public sealed partial class TextGenerator
 
             int specDrafted = 0, specAccepted = 0;
             bool useDraftSpec = _draftModel != null && !captureLogprobs && IsEffectivelyGreedy(options);
+            bool useLookupSpec = UsePromptLookup(useDraftSpec, useMtp, captureLogprobs, options);
             int mtpFallbackStep = 0;                // > 0: the MTP rounds measured slower than plain decode; plain decode resumes at this step (#900)
 
             // Speculative decode disabled when logprobs requested — no per-position logit access.
             // Also disabled when sampling isn't effectively greedy (see Wave 8 / issue #121).
-            if (useDraftSpec)
+            if (useDraftSpec || useLookupSpec)
             {
                 // ── Speculative decode loop ──
                 var specDecoder = new SpeculativeDecoder(
                     greedy: true, seed: options.Seed);
-                Core.Attention.IKvCache draftKvCache = AllocateDraftKvCache(cacheSize);
-                int[] specBuffer = ArrayPool<int>.Shared.Rent(_speculativeCandidates + 1);
+                Core.Attention.IKvCache? draftKvCache = useDraftSpec ? AllocateDraftKvCache(cacheSize) : null;
+                PromptLookupDrafter? lookup = useLookupSpec ? CreatePromptLookupDrafter(promptIds, generatedIds, cacheSize) : null;
+                int specK = lookup is null ? _speculativeCandidates : Math.Min(_promptLookup!.DraftTokens, _model.MaxAllRowLogitsLength - 1);
+                int[] specBuffer = ArrayPool<int>.Shared.Rent(specK + 1);
                 try
                 {
-                    PrefillDraftModel(promptIds, draftKvCache);
+                    if (draftKvCache is not null)
+                        PrefillDraftModel(promptIds, draftKvCache);
 
                     int step = 1;
                     while (step < maxTokens)
@@ -1174,12 +1193,14 @@ public sealed partial class TextGenerator
                         if (pos >= cacheSize) break;
 
                         int remaining = maxTokens - step;
-                        int kk = Math.Min(_speculativeCandidates, remaining);
+                        int kk = Math.Min(specK, remaining);
 
-                        var result = specDecoder.DraftAndVerify(
-                            _model, _draftModel!, kvCache, draftKvCache,
-                            pipeline, generatedIds, constraint,
-                            pos, vocabSize, _draftModel!.Config.VocabSize, kk, specBuffer);
+                        var result = lookup is not null
+                            ? specDecoder.LookupAndVerify(_model, kvCache, lookup, generatedIds[^1], constraint, pos, vocabSize, kk, specBuffer)
+                            : specDecoder.DraftAndVerify(
+                                _model, _draftModel!, kvCache, draftKvCache!,
+                                pipeline, generatedIds, constraint,
+                                pos, vocabSize, _draftModel!.Config.VocabSize, kk, specBuffer);
 
                         if (result.AcceptedCount == 0) break;
 
@@ -1193,6 +1214,7 @@ public sealed partial class TextGenerator
                         {
                             int tokenId = specBuffer[i];
                             generatedIds.Add(tokenId);
+                            lookup?.Append(tokenId);
                             detok.Append(tokenId);
 
                             stopResult = CheckStopConditions(stopConditions, tokenId, generatedIds,
@@ -1209,7 +1231,7 @@ public sealed partial class TextGenerator
                                 }
                                 else
                                 {
-                                    specAccepted++;
+                                    if (i < result.AcceptedCount - 1) specAccepted++;   // drafts only: the round's last token is the target's own
                                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                                     var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
                                     string text = detok.TakeDelta(flushIncomplete: true);
@@ -1219,7 +1241,7 @@ public sealed partial class TextGenerator
                                 yield break;
                             }
 
-                            specAccepted++;
+                            if (i < result.AcceptedCount - 1) specAccepted++;   // drafts only: the round's last token is the target's own
 
                             // Yield each accepted token
                             {
@@ -1244,7 +1266,8 @@ public sealed partial class TextGenerator
                 }
                 finally
                 {
-                    draftKvCache.Dispose();
+                    draftKvCache?.Dispose();
+                    lookup?.Dispose();
                     ArrayPool<int>.Shared.Return(specBuffer);
                 }
             }
@@ -1350,7 +1373,7 @@ public sealed partial class TextGenerator
             }
 
             // Plain decode: the default, and the tail of a request whose MTP rounds fell back (mtpFallbackStep).
-            if (!useDraftSpec && (!useMtp || mtpFallbackStep > 0))
+            if (!useDraftSpec && !useLookupSpec && (!useMtp || mtpFallbackStep > 0))
             {
                 // ── Standard decode loop: one token at a time ──
                 for (int step = mtpFallbackStep > 0 ? mtpFallbackStep : 1; step < maxTokens; step++)
@@ -1652,6 +1675,22 @@ public sealed partial class TextGenerator
     // this restriction by making q/p pipeline-aware.
     private static bool IsEffectivelyGreedy(DotLLM.Core.Configuration.InferenceOptions options)
         => options.Temperature <= 0f && options.RepetitionPenalty == 1.0f;
+
+    // Prompt lookup (#1293) is the fallback draft source: a draft model or an MTP round takes priority. It shares the draft-model
+    // path's greedy gate, since its drafts carry no probabilities for sampled acceptance.
+    private bool UsePromptLookup(bool useDraftSpec, bool useMtp, bool captureLogprobs, DotLLM.Core.Configuration.InferenceOptions options)
+        => _promptLookup is not null && !useDraftSpec && !useMtp && !captureLogprobs && IsEffectivelyGreedy(options);
+
+    /// <summary>Builds the request's n-gram index and widens the model's all-row logits to the verify block.</summary>
+    /// <param name="promptIds">Prompt tokens.</param>
+    /// <param name="generatedIds">Tokens generated so far.</param>
+    /// <param name="cacheSize">KV-cache size: the most tokens the index will hold.</param>
+    /// <returns>The drafter; the caller disposes it.</returns>
+    private PromptLookupDrafter CreatePromptLookupDrafter(int[] promptIds, List<int> generatedIds, int cacheSize)
+    {
+        _model.TrySetAllRowLogitsLimit(_promptLookup!.DraftTokens + 1);
+        return new PromptLookupDrafter(_promptLookup, promptIds, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(generatedIds), cacheSize);
+    }
 
     /// <summary>
     /// Gates MTP self-speculative decoding (issue #253) for one <c>Generate</c>/

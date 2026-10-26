@@ -144,6 +144,12 @@ public sealed record ServerOptions
     public int SpeculativeCandidates { get; init; } = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
 
     /// <summary>
+    /// Prompt-lookup (n-gram) speculative decoding settings (issue #1293), null = off. Like a draft model, it serves through the
+    /// single-sequence generator, so it takes the continuous-batch scheduler offline for the model.
+    /// </summary>
+    public DotLLM.Engine.PromptLookupOptions? PromptLookup { get; init; }
+
+    /// <summary>
     /// Multi-Token Prediction (MTP) self-speculative decoding (issue #253). <b>Defaults to <c>true</c></b>:
     /// when the loaded GGUF carries an embedded MTP head (<c>IModel.SupportsMtp</c>), no external draft model
     /// (<see cref="SpeculativeModel"/>) is given, and <see cref="ExpectedConcurrency"/> is below 5, <c>serve</c>
@@ -375,6 +381,9 @@ public sealed record ServerOptions
         bool schedulerFairness = false;
         string? speculativeModel = null;
         int speculativeCandidates = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
+        bool promptLookup = false;
+        int lookupDraft = DotLLM.Engine.PromptLookupOptions.DefaultDraftTokens;
+        int lookupNgram = DotLLM.Engine.PromptLookupOptions.DefaultMaxNgram;
         bool mtpEnabled = true;
         bool mtpExplicit = false;
         string? mtpHeadPath = null;
@@ -458,6 +467,12 @@ public sealed record ServerOptions
                     speculativeModel = next; i++; break;
                 case "--speculative-k" or "--draft-tokens":
                     speculativeCandidates = int.Parse(next!); i++; break;
+                case "--prompt-lookup" or "--lookup":
+                    promptLookup = true; break;
+                case "--lookup-draft":
+                    lookupDraft = int.Parse(next!); i++; break;
+                case "--lookup-ngram":
+                    lookupNgram = int.Parse(next!); i++; break;
                 case "--mtp":
                     mtpEnabled = true; mtpExplicit = true; break;
                 case "--no-mtp":
@@ -557,6 +572,7 @@ public sealed record ServerOptions
                 : null,
             SpeculativeModel = speculativeModel,
             SpeculativeCandidates = speculativeCandidates,
+            PromptLookup = promptLookup ? DotLLM.Engine.PromptLookupOptions.Create(lookupDraft, lookupNgram) : null,
             MtpEnabled = mtpEnabled,
             MtpExplicit = mtpExplicit,
             MtpHeadPath = mtpHeadPath,

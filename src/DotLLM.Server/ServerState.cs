@@ -1173,7 +1173,7 @@ public sealed class ServerState : IDisposable
         SchedulerLoopCts = null;
         SchedulerLoopTask = null;
 
-        if (PagedFactory is null || KvCacheFactory is null || DraftModel is not null || Model is null || Tokenizer is null)
+        if (PagedFactory is null || KvCacheFactory is null || DraftModel is not null || Options.PromptLookup is not null || Model is null || Tokenizer is null)
             return;
 
         var schedulerOptions = ServerStartup.ResolveSchedulerOptions(Options);
