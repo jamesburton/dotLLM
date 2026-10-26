@@ -188,6 +188,21 @@ public sealed record ServerOptions
     public DotLLM.Tokenizers.Reasoning.ReasoningFormat ReasoningFormat { get; init; } = DotLLM.Tokenizers.Reasoning.ReasoningFormat.Auto;
 
     /// <summary>
+    /// Default thinking budget in tokens (<c>--reasoning-budget</c>, llama.cpp semantics, #1292): -1 unlimited (default),
+    /// 0 end thinking at once, N at most N thinking tokens. A request's <c>thinking_budget_tokens</c> overrides it.
+    /// </summary>
+    public int ReasoningBudget { get; init; } = -1;
+
+    /// <summary>Text forced before the close tag when the thinking budget runs out (<c>--reasoning-budget-message</c>); null = none.</summary>
+    public string? ReasoningBudgetMessage { get; init; }
+
+    /// <summary>
+    /// With a thinking budget, <c>max_tokens</c> is raised to at least budget + this (<c>--reasoning-answer-reserve</c>,
+    /// default 8192) so the answer is not truncated; 0 = llama.cpp behaviour (the budget counts inside max_tokens).
+    /// </summary>
+    public int ReasoningAnswerReserve { get; init; } = 8192;
+
+    /// <summary>
     /// Maximum prompt tokens per prefill forward pass (llama.cpp <c>-ub</c> / micro-batch analog).
     /// 0 (default) = whole prompt in one forward pass. On the single-request
     /// <see cref="DotLLM.Engine.TextGenerator"/> path this chunks the prompt-suffix prefill; when

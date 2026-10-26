@@ -117,8 +117,11 @@ public static class ChatCompletionEndpoint
             return;
         }
 
-        // Validate prompt length against model context
-        int maxTokens = request.MaxTokens ?? state.EffectiveSamplingDefaults.MaxTokens;
+        // Validate prompt length against model context. A thinking budget raises max_tokens to leave room for the
+        // answer (#1292); the context window still caps it below.
+        int? thinkingBudget = plan.ThinkingBudget(request.ThinkingBudgetTokens ?? request.ReasoningBudgetTokens, state.Options.ReasoningBudget);
+        int maxTokens = ReasoningSupport.WithAnswerReserve(
+            request.MaxTokens ?? state.EffectiveSamplingDefaults.MaxTokens, thinkingBudget, state.Options.ReasoningAnswerReserve);
         var promptError = RequestValidator.ValidatePromptLength(
             prompt, state.Tokenizer!, state.Config!.MaxSequenceLength,
             maxTokens, out int effectiveMaxTokens, out _);
@@ -135,6 +138,7 @@ public static class ChatCompletionEndpoint
             new DotLLM.Core.Configuration.ThreadingConfig(
                 state.Options.Threads, state.Options.DecodeThreads));
         options = plan.Gate(options with { MaxTokens = effectiveMaxTokens }, ReasoningSupport.UngatedStops);
+        options = plan.WithThinkingBudget(options, thinkingBudget, request.ReasoningBudgetMessage ?? state.Options.ReasoningBudgetMessage);
         // (#1093) Tell the engine where the generation prompt starts so the recurrent-prefix snapshot lands before it.
         // Set once here: every dispatch below (scheduler, Generate, streaming) carries these options.
         options = options with

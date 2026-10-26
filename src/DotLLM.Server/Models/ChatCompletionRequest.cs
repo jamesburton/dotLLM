@@ -92,6 +92,28 @@ public sealed record ChatCompletionRequest
     public bool? EnableThinking { get; init; }
 
     /// <summary>
+    /// Thinking budget in tokens (#1292, llama.cpp's per-request name): -1 unlimited, 0 end thinking at once, N &gt; 0 at
+    /// most N thinking tokens, then the budget message and the close tag are forced. Null = the server's
+    /// <c>--reasoning-budget</c>. <c>reasoning_budget_tokens</c> is accepted as an alias.
+    /// </summary>
+    [JsonPropertyName("thinking_budget_tokens")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? ThinkingBudgetTokens { get; init; }
+
+    /// <summary>Alias of <see cref="ThinkingBudgetTokens"/> (the sampling-layer name llama.cpp forwards).</summary>
+    [JsonPropertyName("reasoning_budget_tokens")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? ReasoningBudgetTokens { get; init; }
+
+    /// <summary>
+    /// Text forced before the close tag when the thinking budget runs out (#1292). Null = the server's
+    /// <c>--reasoning-budget-message</c>.
+    /// </summary>
+    [JsonPropertyName("reasoning_budget_message")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReasoningBudgetMessage { get; init; }
+
+    /// <summary>
     /// Arbitrary extra variables for the chat template's Jinja context (vLLM / llama.cpp
     /// <c>chat_template_kwargs</c>), e.g. <c>{"enable_thinking": false, "preserve_thinking": true}</c>.
     /// They cannot replace <c>messages</c>, <c>tools</c>, <c>add_generation_prompt</c>, <c>bos_token</c>

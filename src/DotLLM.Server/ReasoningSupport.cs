@@ -63,6 +63,32 @@ internal sealed class ReasoningPlan
             : options;
 
     /// <summary>
+    /// The effective thinking budget (#1292): the request's value, else the server default; null when unlimited
+    /// (negative), when output is not split (thinking off, constrained, <c>reasoning_format=none</c>), or for Harmony,
+    /// whose analysis channel has no single close tag to force.
+    /// </summary>
+    /// <param name="requested">The request's budget (<c>thinking_budget_tokens</c> / Anthropic <c>budget_tokens</c>), or null.</param>
+    /// <param name="serverDefault">The server's <c>--reasoning-budget</c> (-1 = unlimited).</param>
+    /// <returns>The budget in tokens (0 = close at once), or null for none.</returns>
+    public int? ThinkingBudget(int? requested, int serverDefault)
+    {
+        int budget = requested ?? serverDefault;
+        return Enabled && Markup != ReasoningMarkup.Harmony && budget >= 0 ? budget : null;
+    }
+
+    /// <summary>
+    /// Installs the thinking budget on <paramref name="options"/> (#1292); unchanged when <paramref name="budget"/> is null.
+    /// </summary>
+    /// <param name="options">The request's options.</param>
+    /// <param name="budget">From <see cref="ThinkingBudget(int?, int)"/>.</param>
+    /// <param name="message">Text forced before the close tag when the budget runs out, or null.</param>
+    /// <returns>The options carrying the budget.</returns>
+    public InferenceOptions WithThinkingBudget(InferenceOptions options, int? budget, string? message)
+        => budget is int b
+            ? options with { ThinkingBudget = new ThinkingBudget(b, Markup.OpenTag(), Markup.CloseTag(), PromptOpened, message) }
+            : options;
+
+    /// <summary>
     /// Splits one complete generation. The token count is 0 when there was no reasoning.
     /// </summary>
     public (string? Reasoning, string Content, int ReasoningTokens) SplitComplete(string text, ITokenizer? tokenizer)
@@ -238,6 +264,20 @@ internal static class ReasoningSupport
     /// Counts one streamed token toward reasoning: true when the splitter was inside a block before the
     /// token or is inside one after it (so both the opening and the closing tag tokens count).
     /// </summary>
+    /// <summary>
+    /// <c>max_tokens</c> with room for the answer after a thinking budget (#1292): at least budget + reserve, so a think
+    /// block that uses its whole budget cannot leave the answer truncated. Unchanged without a positive budget or reserve.
+    /// The result is still clamped to the context window by prompt validation.
+    /// </summary>
+    /// <param name="maxTokens">The requested (or default) <c>max_tokens</c>.</param>
+    /// <param name="budget">The effective thinking budget, or null.</param>
+    /// <param name="answerReserve">The server's <c>--reasoning-answer-reserve</c> (0 = llama.cpp: the budget counts inside max_tokens).</param>
+    /// <returns>The effective <c>max_tokens</c>.</returns>
+    internal static int WithAnswerReserve(int maxTokens, int? budget, int answerReserve)
+        => budget is > 0 and int b && answerReserve > 0
+            ? (int)Math.Max(maxTokens, Math.Min(int.MaxValue, (long)b + answerReserve))
+            : maxTokens;
+
     internal static bool IsReasoningToken(bool wasInReasoning, IReasoningSplitter splitter)
         => wasInReasoning || splitter.InReasoning;
 
