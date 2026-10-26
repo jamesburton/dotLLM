@@ -140,6 +140,7 @@ app.Configure(config =>
 
 try
 {
+    DotLLM.Cli.Helpers.DirectStoragePrompt.OfferIfMissing(args);
     return app.Run(args);
 }
 catch (Exception ex) when (string.Equals(

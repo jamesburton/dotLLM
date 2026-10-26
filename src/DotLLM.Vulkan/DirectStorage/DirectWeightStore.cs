@@ -172,7 +172,13 @@ internal sealed unsafe class DirectWeightStore : IDisposable
     {
         why = string.Empty;
         if (s_getFactory != null) return true;
-        if (!NativeLibrary.TryLoad("dstorage.dll", typeof(DirectWeightStore).Assembly, DllImportSearchPath.AssemblyDirectory, out nint module)
+        string? found = DirectStorageInstaller.FindDll();
+        nint module = 0;
+        // dstorage.dll resolves dstoragecore.dll through the default search path, not its own folder, so a copy outside
+        // the app directory needs the core module loaded first (DStorageGetFactory returns E_NOTIMPL otherwise).
+        if (found is not null)
+            _ = NativeLibrary.TryLoad(Path.Combine(Path.GetDirectoryName(found)!, "dstoragecore.dll"), out _);
+        if (!(found is not null && NativeLibrary.TryLoad(found, out module))
             && !NativeLibrary.TryLoad("dstorage.dll", out module))
         {
             why = "dstorage.dll_not_found";
