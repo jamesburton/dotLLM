@@ -1,6 +1,6 @@
-using System.Numerics.Tensors;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Sampling;
+using DotLLM.Tokenizers;
 
 namespace DotLLM.Engine.Samplers;
 
@@ -17,6 +17,7 @@ public sealed class SamplerPipeline
     private readonly SamplerContext _samplerContext;
     private readonly Random _rng;
     private readonly bool _greedy;
+    private readonly bool _fastTopKSampling;
 
     /// <summary>
     /// Creates a composable sampling pipeline from explicit steps.
@@ -40,6 +41,7 @@ public sealed class SamplerPipeline
         int? seed = null)
     {
         _greedy = false;
+        _fastTopKSampling = false;
         _rng = seed.HasValue ? new Random(seed.Value) : new Random();
         _processors = processors?.ToArray() ?? [];
         _steps = steps.ToArray();
@@ -52,7 +54,13 @@ public sealed class SamplerPipeline
     /// When <see cref="InferenceOptions.SamplerSteps"/> is set, uses those explicit steps.
     /// Otherwise builds steps automatically from flat properties, skipping disabled ones.
     /// </summary>
-    public SamplerPipeline(InferenceOptions options)
+    /// <param name="options">Inference options controlling the pipeline shape.</param>
+    /// <param name="tokenizer">
+    /// Optional tokenizer used to resolve <see cref="InferenceOptions.DrySequenceBreakers"/> strings
+    /// to token ids when DRY is enabled and no explicit <see cref="InferenceOptions.LogitProcessors"/>
+    /// list is supplied. Null = DRY runs without sequence breakers (matches can span the full window).
+    /// </param>
+    public SamplerPipeline(InferenceOptions options, ITokenizer? tokenizer = null)
     {
         _rng = options.Seed.HasValue ? new Random(options.Seed.Value) : new Random();
 
@@ -60,76 +68,227 @@ public sealed class SamplerPipeline
         if (options.SamplerSteps is not null)
         {
             _greedy = false;
+            _fastTopKSampling = false;
             _steps = options.SamplerSteps.ToArray();
 
             // Build processors: use explicit list if provided, otherwise auto-build from flat properties
-            if (options.LogitProcessors is not null)
-            {
-                _processors = options.LogitProcessors.ToArray();
-            }
-            else
-            {
-                var processors = new List<ILogitProcessor>();
-                if (options.RepetitionPenalty != 1.0f)
-                    processors.Add(new RepetitionPenaltyProcessor());
-                _processors = processors.ToArray();
-            }
+            _processors = ResolveProcessors(options, tokenizer);
 
-            _processorContext = new ProcessorContext(
-                options.RepetitionPenalty,
-                options.RepetitionPenaltyWindow,
-                SequenceId: 0);
+            _processorContext = BuildProcessorContext(options);
             _samplerContext = new SamplerContext(
                 options.Temperature,
                 options.TopK,
                 options.TopP,
                 options.MinP,
-                options.Seed);
+                options.Seed,
+                options.TopNSigma);
             return;
         }
 
         // Auto-build from flat properties
         _greedy = options.Temperature <= 0f;
+        _fastTopKSampling = !_greedy
+            && options.TopK > 0
+            && options.TopP >= 1.0f
+            && options.MinP <= 0f
+            && options.TopNSigma < 0f;
 
         // Build processor chain (only add if enabled)
-        if (options.LogitProcessors is not null)
-        {
-            _processors = options.LogitProcessors.ToArray();
-        }
-        else
-        {
-            var processors = new List<ILogitProcessor>();
-            if (options.RepetitionPenalty != 1.0f)
-                processors.Add(new RepetitionPenaltyProcessor());
-            _processors = processors.ToArray();
-        }
+        _processors = ResolveProcessors(options, tokenizer);
 
         // Build sampler step chain (only add if enabled)
         var steps = new List<ISamplerStep>();
         if (!_greedy)
         {
-            if (options.Temperature != 1.0f)
+            if (!_fastTopKSampling && options.Temperature != 1.0f)
                 steps.Add(new TemperatureSampler());
-            if (options.TopK > 0)
+            if (!_fastTopKSampling && options.TopK > 0)
                 steps.Add(new TopKSampler());
             if (options.TopP < 1.0f)
                 steps.Add(new TopPSampler());
             if (options.MinP > 0f)
                 steps.Add(new MinPSampler());
+            if (options.TopNSigma >= 0f)
+                steps.Add(new TopNSigmaSampler());
         }
         _steps = steps.ToArray();
 
-        _processorContext = new ProcessorContext(
-            options.RepetitionPenalty,
-            options.RepetitionPenaltyWindow,
-            SequenceId: 0);
+        _processorContext = BuildProcessorContext(options);
 
         _samplerContext = new SamplerContext(
             options.Temperature,
             options.TopK,
             options.TopP,
             options.MinP,
-            options.Seed);
+            options.Seed,
+            options.TopNSigma);
+    }
+
+    /// <summary>
+    /// The explicit <see cref="InferenceOptions.LogitProcessors"/> (or the auto-built chain), preceded by a fresh
+    /// <see cref="ThinkingBudgetProcessor"/> when <see cref="InferenceOptions.ThinkingBudget"/> is set (#1292). It is stateful,
+    /// so it is created here, per pipeline (= per sequence), never shared through the options.
+    /// </summary>
+    private static ILogitProcessor[] ResolveProcessors(InferenceOptions options, ITokenizer? tokenizer)
+    {
+        var processors = options.LogitProcessors is not null
+            ? options.LogitProcessors.ToArray()
+            : BuildProcessors(options, tokenizer);
+        return options.ThinkingBudget is { } budget && tokenizer is not null
+            ? [new ThinkingBudgetProcessor(budget, tokenizer), .. processors]
+            : processors;
+    }
+
+    /// <summary>
+    /// Auto-builds the logit processor chain from flat <see cref="InferenceOptions"/> properties,
+    /// only including processors whose parameters are actually enabled.
+    /// </summary>
+    private static ILogitProcessor[] BuildProcessors(InferenceOptions options, ITokenizer? tokenizer)
+    {
+        var processors = new List<ILogitProcessor>();
+        if (options.RepetitionPenalty != 1.0f)
+            processors.Add(new RepetitionPenaltyProcessor());
+        if (options.LogitBias is { Count: > 0 })
+            processors.Add(new LogitBiasProcessor());
+        if (options.FrequencyPenalty != 0f || options.PresencePenalty != 0f)
+            processors.Add(new FrequencyPresencePenaltyProcessor());
+        if (options.DryMultiplier > 0f)
+            processors.Add(new DryProcessor(ResolveDryBreakerTokens(options.DrySequenceBreakers, tokenizer)));
+        return processors.ToArray();
+    }
+
+    private static ProcessorContext BuildProcessorContext(InferenceOptions options) => new(
+        options.RepetitionPenalty,
+        options.RepetitionPenaltyWindow,
+        SequenceId: 0,
+        options.FrequencyPenalty,
+        options.PresencePenalty,
+        options.LogitBias,
+        options.DryMultiplier,
+        options.DryBase,
+        options.DryAllowedLength,
+        options.DryPenaltyLastN,
+        options.DrySequenceBreakers);
+
+    /// <summary>
+    /// Resolves DRY sequence-breaker strings to token ids via the tokenizer. Every token produced by
+    /// encoding a breaker string is added — for the common case (single-token breakers like a bare
+    /// newline or comma) this exactly matches the intended token; multi-token breakers degrade to
+    /// "any of its constituent tokens also breaks a match", a reasonable approximation without full
+    /// multi-token sequence tracking. Returns null when there's no tokenizer or no breakers configured.
+    /// </summary>
+    private static IReadOnlySet<int>? ResolveDryBreakerTokens(
+        IReadOnlyList<string>? breakers, ITokenizer? tokenizer)
+    {
+        if (tokenizer is null || breakers is null || breakers.Count == 0)
+            return null;
+
+        var tokenIds = new HashSet<int>();
+        foreach (var breaker in breakers)
+        {
+            if (string.IsNullOrEmpty(breaker))
+                continue;
+            foreach (var id in tokenizer.EncodeRaw(breaker))
+                tokenIds.Add(id);
+        }
+        return tokenIds.Count > 0 ? tokenIds : null;
+    }
+
+    /// <summary>True when the pipeline draws from a distribution; false when it is a (processor-adjusted) argmax.</summary>
+    public bool IsStochastic => !_greedy;
+
+    /// <summary>True when at least one logit processor (repetition / frequency / presence penalty, logit bias, DRY) runs before the argmax or the steps.</summary>
+    public bool HasProcessors => _processors.Length > 0;
+
+    private ISamplerStep[]? _fastPrepSteps;
+
+    /// <summary>
+    /// Turns <paramref name="logits"/> in place into the exact logits <see cref="Sample"/> would draw from (processors, then temperature /
+    /// top-k / top-p / min-p / ...), without drawing. Speculative sampling (<see cref="TryAcceptDraft"/>) needs the distribution, not just a draw.
+    /// A greedy pipeline only applies its processors: the distribution is the argmax of the result.
+    /// </summary>
+    /// <param name="logits">Logits of one position (modified in place).</param>
+    /// <param name="previousTokens">Tokens generated so far, for the penalty processors.</param>
+    public void PrepareDistribution(Span<float> logits, IReadOnlyList<int> previousTokens)
+    {
+        for (int i = 0; i < _processors.Length; i++)
+            _processors[i].Process(logits, previousTokens, _processorContext);
+        if (_greedy) return;
+
+        if (_fastTopKSampling)
+        {
+            // Sample() skips the steps on this shape and draws straight from the top-k candidates; the equivalent distribution is
+            // temperature then top-k, which is what SampleTopK computes.
+            _fastPrepSteps ??= _samplerContext.Temperature != 1.0f
+                ? [new TemperatureSampler(), new TopKSampler()]
+                : [new TopKSampler()];
+            for (int i = 0; i < _fastPrepSteps.Length; i++)
+                _fastPrepSteps[i].Apply(logits, _samplerContext);
+            return;
+        }
+        for (int i = 0; i < _steps.Length; i++)
+            _steps[i].Apply(logits, _samplerContext);
+    }
+
+    /// <summary>Draws from logits already prepared by <see cref="PrepareDistribution"/> (argmax for a greedy pipeline).</summary>
+    public int SamplePrepared(ReadOnlySpan<float> preparedLogits)
+        => _greedy ? CategoricalSampler.ArgMax(preparedLogits) : CategoricalSampler.Sample(preparedLogits, _rng);
+
+    /// <summary>
+    /// Speculative-sampling accept/reject of ONE deterministic draft token against the prepared distribution <c>p</c> (the draft distribution is a
+    /// point mass, so the accept probability <c>min(1, p(d)/1)</c> is <c>p(d)</c>). Accepted: the token is <paramref name="draftToken"/>. Rejected:
+    /// <paramref name="token"/> is drawn from <c>p</c> with the draft removed and renormalised. Either way the emitted token is distributed exactly
+    /// as <c>p</c>, which is why the result is the same as sampling the target alone. A greedy pipeline accepts iff the draft is the argmax.
+    /// </summary>
+    /// <param name="preparedLogits">Output of <see cref="PrepareDistribution"/> for this position.</param>
+    /// <param name="draftToken">The head's draft for this position.</param>
+    /// <param name="token">The token to emit (the draft when accepted).</param>
+    /// <returns>True when the draft was accepted.</returns>
+    public bool TryAcceptDraft(ReadOnlySpan<float> preparedLogits, int draftToken, out int token)
+    {
+        if (_greedy)
+        {
+            token = CategoricalSampler.ArgMax(preparedLogits);
+            return token == draftToken;
+        }
+
+        int vocab = preparedLogits.Length;
+        float[] rented = System.Buffers.ArrayPool<float>.Shared.Rent(vocab);
+        try
+        {
+            Span<float> probs = rented.AsSpan(0, vocab);
+            System.Numerics.Tensors.TensorPrimitives.SoftMax(preparedLogits, probs);
+            double pd = probs[draftToken];
+            if (_rng.NextDouble() < pd)
+            {
+                token = draftToken;
+                return true;
+            }
+            probs[draftToken] = 0f;
+            double rest = 0;
+            for (int i = 0; i < vocab; i++) rest += probs[i];
+            if (rest <= 1e-12)
+            {
+                token = draftToken;     // all the mass sits on the draft: rejecting it is numerically meaningless
+                return true;
+            }
+            double r = _rng.NextDouble() * rest, cumulative = 0;
+            int last = draftToken;
+            for (int i = 0; i < vocab; i++)
+            {
+                float p = probs[i];
+                if (p <= 0f) continue;
+                last = i;
+                cumulative += p;
+                if (r < cumulative) { token = i; return false; }
+            }
+            token = last;               // rounding: the last token with mass
+            return false;
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(rented);
+        }
     }
 
     /// <summary>
@@ -146,9 +305,16 @@ public sealed class SamplerPipeline
 
         // 2. Greedy: argmax, skip everything else
         if (_greedy)
-            return TensorPrimitives.IndexOfMax(logits);
+            return CategoricalSampler.ArgMax(logits);
 
         // 3. Run sampler steps (temperature → top-k → top-p → min-p)
+        if (_fastTopKSampling)
+            return CategoricalSampler.SampleTopK(
+                logits,
+                _samplerContext.TopK,
+                _samplerContext.Temperature,
+                _rng);
+
         for (int i = 0; i < _steps.Length; i++)
             _steps[i].Apply(logits, _samplerContext);
 

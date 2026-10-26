@@ -1,5 +1,8 @@
+using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using DotLLM.Core.Tensors;
+using DotLLM.Cpu.Kernels;
 
 namespace DotLLM.Engine.KvCache;
 
@@ -7,6 +10,11 @@ namespace DotLLM.Engine.KvCache;
 /// Pool of fixed-size KV blocks. Each block stores <see cref="BlockSize"/> tokens of K and V data
 /// for all layers. Thread-safe allocation and deallocation with reference counting.
 /// Inspired by OS page frame allocator.
+/// <para>
+/// Rows are stored in <see cref="ElementType"/>: <see cref="DType.Float16"/> by default, <see cref="DType.Q8_0"/>
+/// as an option, <see cref="DType.Float32"/> only as a reference/baseline (#1142 C4: no F32 hot-path storage).
+/// Writers hand F32 rows to <see cref="EncodeRows"/>; attention reads the blocks in place.
+/// </para>
 /// </summary>
 public sealed unsafe class KvBlockPool : IDisposable
 {
@@ -14,10 +22,12 @@ public sealed unsafe class KvBlockPool : IDisposable
     private readonly int _numLayers;
     private readonly int _kvStride;     // numKvHeads * headDim
     private readonly int _totalBlocks;
-    private readonly int _blockFloats;  // blockSize * kvStride (floats per block per layer)
+    private readonly DType _elementType;
+    private readonly int _rowBytes;     // bytes per token row (kvStride elements in _elementType)
+    private readonly long _blockBytes;  // blockSize * _rowBytes (bytes per block per layer)
 
     // Per-layer contiguous storage. Block i for layer j:
-    //   keys at _keyBuffers[j] + (long)i * _blockFloats * sizeof(float)
+    //   keys at _keyBuffers[j] + (long)i * _blockBytes
     private readonly nint[] _keyBuffers;
     private readonly nint[] _valueBuffers;
 
@@ -49,8 +59,20 @@ public sealed unsafe class KvBlockPool : IDisposable
     /// <summary>KV stride (numKvHeads * headDim).</summary>
     public int KvStride => _kvStride;
 
+    /// <summary>Element type of the stored rows (<see cref="DType.Float16"/>, <see cref="DType.Q8_0"/> or <see cref="DType.Float32"/>).</summary>
+    public DType ElementType => _elementType;
+
+    /// <summary>Bytes per token row of one layer's K (or V).</summary>
+    public int RowBytes => _rowBytes;
+
+    /// <summary>Bytes one block holds across all layers, keys and values.</summary>
+    public long BlockBytesAllLayers => 2L * _numLayers * _blockBytes;
+
+    /// <summary>Total unmanaged bytes reserved by this pool across key and value storage.</summary>
+    public long AllocatedBytes => BlockBytesAllLayers * _totalBlocks;
+
     /// <summary>
-    /// Creates a new block pool with pre-allocated storage for all blocks across all layers.
+    /// Creates a new block pool of <see cref="DType.Float16"/> rows with pre-allocated storage for all blocks across all layers.
     /// </summary>
     /// <param name="numLayers">Number of transformer layers.</param>
     /// <param name="numKvHeads">Number of KV attention heads per layer.</param>
@@ -59,17 +81,48 @@ public sealed unsafe class KvBlockPool : IDisposable
     /// <param name="totalBlocks">Total number of blocks in the pool.</param>
     public KvBlockPool(int numLayers, int numKvHeads, int headDim,
                        int blockSize = 16, int totalBlocks = 4096)
+        : this(numLayers, numKvHeads, headDim, blockSize, totalBlocks, DType.Float16)
     {
+    }
+
+    /// <summary>
+    /// Creates a new block pool with pre-allocated storage for all blocks across all layers.
+    /// </summary>
+    /// <param name="numLayers">Number of transformer layers.</param>
+    /// <param name="numKvHeads">Number of KV attention heads per layer.</param>
+    /// <param name="headDim">Dimension per attention head.</param>
+    /// <param name="blockSize">Number of tokens per block.</param>
+    /// <param name="totalBlocks">Total number of blocks in the pool.</param>
+    /// <param name="elementType">Row storage type: <see cref="DType.Float16"/>, <see cref="DType.Q8_0"/>
+    /// (requires <paramref name="headDim"/> % 32 == 0) or <see cref="DType.Float32"/> (reference only).</param>
+    /// <exception cref="ArgumentException">Unsupported <paramref name="elementType"/> or Q8_0 with an unaligned head dim.</exception>
+    public KvBlockPool(int numLayers, int numKvHeads, int headDim,
+                       int blockSize, int totalBlocks, DType elementType)
+    {
+        if (numLayers <= 0) throw new ArgumentOutOfRangeException(nameof(numLayers));
+        if (numKvHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numKvHeads));
+        if (headDim <= 0) throw new ArgumentOutOfRangeException(nameof(headDim));
+        if (blockSize <= 0) throw new ArgumentOutOfRangeException(nameof(blockSize));
+        if (totalBlocks <= 0) throw new ArgumentOutOfRangeException(nameof(totalBlocks));
+        if (elementType != DType.Float16 && elementType != DType.Q8_0 && elementType != DType.Float32)
+            throw new ArgumentException($"Paged KV blocks support float16, q8_0 or float32 rows, not {elementType}.", nameof(elementType));
+
+        // Q8_0 blocks are 32 elements; heads must start on a block so attention can decode one head's slice in place.
+        if (elementType == DType.Q8_0 && headDim % KvQuantize.BlockSize != 0)
+            throw new ArgumentException($"Q8_0 paged KV needs headDim % {KvQuantize.BlockSize} == 0, got {headDim}.", nameof(headDim));
+
         _blockSize = blockSize;
         _numLayers = numLayers;
         _kvStride = numKvHeads * headDim;
         _totalBlocks = totalBlocks;
-        _blockFloats = blockSize * _kvStride;
+        _elementType = elementType;
+        _rowBytes = checked((int)elementType.ComputeByteCount(_kvStride));
+        _blockBytes = (long)blockSize * _rowBytes;
 
         _keyBuffers = new nint[numLayers];
         _valueBuffers = new nint[numLayers];
 
-        nuint layerBytes = (nuint)((long)totalBlocks * _blockFloats * sizeof(float));
+        nuint layerBytes = (nuint)checked(totalBlocks * _blockBytes);
         for (int i = 0; i < numLayers; i++)
         {
             _keyBuffers[i] = (nint)NativeMemory.AlignedAlloc(layerBytes, 64);
@@ -112,20 +165,39 @@ public sealed unsafe class KvBlockPool : IDisposable
     /// Increments the reference count for a block (used for shared prefix / beam search).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void AddRef(int blockId) => Interlocked.Increment(ref _refCounts[blockId]);
+    public void AddRef(int blockId)
+    {
+        ValidateBlockId(blockId);
+        int newCount = Interlocked.Increment(ref _refCounts[blockId]);
+        if (newCount <= 1)
+        {
+            Interlocked.Decrement(ref _refCounts[blockId]);
+            throw new InvalidOperationException($"Cannot add a reference to free block {blockId}.");
+        }
+    }
 
     /// <summary>
     /// Gets the current reference count for a block.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public int RefCount(int blockId) => Volatile.Read(ref _refCounts[blockId]);
+    public int RefCount(int blockId)
+    {
+        ValidateBlockId(blockId);
+        return Volatile.Read(ref _refCounts[blockId]);
+    }
 
     /// <summary>
     /// Decrements the reference count. When it reaches 0, returns the block to the free pool.
     /// </summary>
     public void Release(int blockId)
     {
+        ValidateBlockId(blockId);
         int newCount = Interlocked.Decrement(ref _refCounts[blockId]);
+        if (newCount < 0)
+        {
+            Interlocked.Increment(ref _refCounts[blockId]);
+            throw new InvalidOperationException($"Cannot release free block {blockId}.");
+        }
         if (newCount == 0)
         {
             lock (_lock)
@@ -141,9 +213,13 @@ public sealed unsafe class KvBlockPool : IDisposable
     /// <returns>New block ID with independent data.</returns>
     public int CopyBlock(int sourceBlockId)
     {
+        ValidateBlockId(sourceBlockId);
+        if (RefCount(sourceBlockId) <= 0)
+            throw new InvalidOperationException($"Cannot copy free block {sourceBlockId}.");
+
         int newBlockId = Allocate();
 
-        long blockBytes = (long)_blockFloats * sizeof(float);
+        long blockBytes = _blockBytes;
         for (int layer = 0; layer < _numLayers; layer++)
         {
             Buffer.MemoryCopy(
@@ -161,36 +237,96 @@ public sealed unsafe class KvBlockPool : IDisposable
     }
 
     /// <summary>
-    /// Gets a pointer to the start of key data for a specific block and layer.
-    /// Points to <c>blockSize * kvStride</c> floats.
+    /// Gets a pointer to the start of key data for a specific block and layer:
+    /// <c>blockSize</c> rows of <see cref="RowBytes"/> bytes in <see cref="ElementType"/>.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public float* GetKeyPtr(int blockId, int layerIndex)
-        => (float*)_keyBuffers[layerIndex] + (long)blockId * _blockFloats;
+    public byte* GetKeyPtr(int blockId, int layerIndex)
+    {
+        ValidateBlockId(blockId);
+        ValidateLayerIndex(layerIndex);
+        return (byte*)_keyBuffers[layerIndex] + blockId * _blockBytes;
+    }
 
     /// <summary>
-    /// Gets a pointer to the start of value data for a specific block and layer.
-    /// Points to <c>blockSize * kvStride</c> floats.
+    /// Gets a pointer to the start of value data for a specific block and layer:
+    /// <c>blockSize</c> rows of <see cref="RowBytes"/> bytes in <see cref="ElementType"/>.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public float* GetValuePtr(int blockId, int layerIndex)
-        => (float*)_valueBuffers[layerIndex] + (long)blockId * _blockFloats;
+    public byte* GetValuePtr(int blockId, int layerIndex)
+    {
+        ValidateBlockId(blockId);
+        ValidateLayerIndex(layerIndex);
+        return (byte*)_valueBuffers[layerIndex] + blockId * _blockBytes;
+    }
 
     /// <summary>
-    /// Gets a span over key data for a specific block, layer, and token offset within the block.
-    /// Returns <see cref="KvStride"/> floats for one token position.
+    /// Gets the encoded key row (<see cref="RowBytes"/> bytes) for a specific block, layer, and token offset within the block.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public Span<float> GetKeySpan(int blockId, int layerIndex, int offsetInBlock)
-        => new(GetKeyPtr(blockId, layerIndex) + offsetInBlock * _kvStride, _kvStride);
+    public Span<byte> GetKeySpan(int blockId, int layerIndex, int offsetInBlock)
+    {
+        ValidateOffset(offsetInBlock);
+        return new(GetKeyPtr(blockId, layerIndex) + (long)offsetInBlock * _rowBytes, _rowBytes);
+    }
 
     /// <summary>
-    /// Gets a span over value data for a specific block, layer, and token offset within the block.
-    /// Returns <see cref="KvStride"/> floats for one token position.
+    /// Gets the encoded value row (<see cref="RowBytes"/> bytes) for a specific block, layer, and token offset within the block.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public Span<float> GetValueSpan(int blockId, int layerIndex, int offsetInBlock)
-        => new(GetValuePtr(blockId, layerIndex) + offsetInBlock * _kvStride, _kvStride);
+    public Span<byte> GetValueSpan(int blockId, int layerIndex, int offsetInBlock)
+    {
+        ValidateOffset(offsetInBlock);
+        return new(GetValuePtr(blockId, layerIndex) + (long)offsetInBlock * _rowBytes, _rowBytes);
+    }
+
+    /// <summary>Encodes <paramref name="rows"/> F32 rows of <see cref="KvStride"/> elements into this pool's row format.</summary>
+    /// <param name="src">Source F32 rows, contiguous.</param>
+    /// <param name="dst">Destination rows (<see cref="RowBytes"/> each), contiguous.</param>
+    /// <param name="rows">Row count.</param>
+    public void EncodeRows(float* src, byte* dst, int rows)
+    {
+        int elements = checked(rows * _kvStride);
+        if (_elementType == DType.Float16)
+            TensorPrimitives.ConvertToHalf(new ReadOnlySpan<float>(src, elements), new Span<Half>(dst, elements));
+        else if (_elementType == DType.Q8_0)
+            KvQuantize.F32ToQ8_0(src, dst, elements);
+        else
+            Buffer.MemoryCopy(src, dst, (long)elements * sizeof(float), (long)elements * sizeof(float));
+    }
+
+    /// <summary>Decodes <paramref name="rows"/> rows of this pool's row format into F32.</summary>
+    /// <param name="src">Source rows (<see cref="RowBytes"/> each), contiguous.</param>
+    /// <param name="dst">Destination F32 rows of <see cref="KvStride"/> elements, contiguous.</param>
+    /// <param name="rows">Row count.</param>
+    public void DecodeRows(byte* src, float* dst, int rows)
+    {
+        int elements = checked(rows * _kvStride);
+        if (_elementType == DType.Float16)
+            TensorPrimitives.ConvertToSingle(new ReadOnlySpan<Half>(src, elements), new Span<float>(dst, elements));
+        else if (_elementType == DType.Q8_0)
+            KvQuantize.Q8_0ToF32(src, dst, elements);
+        else
+            Buffer.MemoryCopy(src, dst, (long)elements * sizeof(float), (long)elements * sizeof(float));
+    }
+
+    private void ValidateBlockId(int blockId)
+    {
+        if ((uint)blockId >= (uint)_totalBlocks)
+            throw new ArgumentOutOfRangeException(nameof(blockId));
+    }
+
+    private void ValidateLayerIndex(int layerIndex)
+    {
+        if ((uint)layerIndex >= (uint)_numLayers)
+            throw new ArgumentOutOfRangeException(nameof(layerIndex));
+    }
+
+    private void ValidateOffset(int offsetInBlock)
+    {
+        if ((uint)offsetInBlock >= (uint)_blockSize)
+            throw new ArgumentOutOfRangeException(nameof(offsetInBlock));
+    }
 
     /// <inheritdoc/>
     public void Dispose()

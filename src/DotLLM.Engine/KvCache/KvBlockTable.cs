@@ -1,3 +1,5 @@
+using System.Runtime.InteropServices;
+
 namespace DotLLM.Engine.KvCache;
 
 /// <summary>
@@ -10,6 +12,12 @@ public sealed class KvBlockTable
     private readonly int _blockSize;
     private readonly List<int> _blockIds = []; // blockIds[i] = physical block for logical block i
     private int _currentLength;
+
+    /// <summary>
+    /// Physical block IDs in logical order (<c>BlockIds[i]</c> holds tokens <c>[i * BlockSize, (i + 1) * BlockSize)</c>).
+    /// Borrowed view: invalidated by any mutation of the table.
+    /// </summary>
+    public ReadOnlySpan<int> BlockIds => CollectionsMarshal.AsSpan(_blockIds);
 
     /// <summary>Number of tokens currently stored.</summary>
     public int CurrentLength => _currentLength;
@@ -73,6 +81,44 @@ public sealed class KvBlockTable
             target._blockIds.Add(blockId);
         }
         target._currentLength = _currentLength;
+    }
+
+    /// <summary>
+    /// Seeds this table with pre-allocated block IDs whose refcounts have already
+    /// been incremented by the caller (typically the prefix cache). The visible
+    /// length advances to cover all seeded blocks. Must be called on an empty table.
+    /// </summary>
+    /// <remarks>
+    /// The seeded blocks become owned by this table — calling <see cref="Free"/>
+    /// will release one ref per seeded block, matching the AddRef the caller did
+    /// to hand them over.
+    /// </remarks>
+    internal void SeedSharedBlocks(IReadOnlyList<int> blockIds, int tokenCount)
+    {
+        if (_blockIds.Count > 0)
+            throw new InvalidOperationException("SeedSharedBlocks requires an empty block table.");
+        if (tokenCount <= 0) return;
+        if ((tokenCount + _blockSize - 1) / _blockSize != blockIds.Count)
+            throw new ArgumentException("Token count does not match supplied block count.", nameof(tokenCount));
+
+        for (int i = 0; i < blockIds.Count; i++)
+            _blockIds.Add(blockIds[i]);
+        _currentLength = tokenCount;
+    }
+
+    /// <summary>
+    /// Snapshots the contiguous range of FULL physical block IDs covering
+    /// <paramref name="tokenCount"/> tokens. Used by the prefix trie when inserting
+    /// freshly computed blocks. Returns blocks that are fully populated only —
+    /// trailing partial blocks are excluded.
+    /// </summary>
+    internal void SnapshotFullBlocks(int tokenCount, List<int> blockIds)
+    {
+        ArgumentNullException.ThrowIfNull(blockIds);
+        blockIds.Clear();
+        int fullBlocks = tokenCount / _blockSize;
+        for (int i = 0; i < fullBlocks; i++)
+            blockIds.Add(_blockIds[i]);
     }
 
     /// <summary>

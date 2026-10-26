@@ -1,3 +1,5 @@
+using System.Runtime.InteropServices;
+using DotLLM.Core.Tensors;
 using DotLLM.Engine.KvCache;
 using Xunit;
 
@@ -20,6 +22,19 @@ public sealed unsafe class KvBlockPoolTests
         Assert.Equal(BlockSize, pool.BlockSize);
         Assert.Equal(TotalBlocks, pool.TotalBlocks);
         Assert.Equal(TotalBlocks, pool.FreeBlocks);
+        // Default rows are F16 (#1142 C4).
+        Assert.Equal(DType.Float16, pool.ElementType);
+        Assert.Equal(2L * NumLayers * TotalBlocks * BlockSize * KvStride * sizeof(ushort), pool.AllocatedBytes);
+    }
+
+    [Fact]
+    public void Constructor_RejectsInvalidDimensions()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => { new KvBlockPool(0, NumKvHeads, HeadDim, BlockSize, TotalBlocks); });
+        Assert.Throws<ArgumentOutOfRangeException>(() => { new KvBlockPool(NumLayers, 0, HeadDim, BlockSize, TotalBlocks); });
+        Assert.Throws<ArgumentOutOfRangeException>(() => { new KvBlockPool(NumLayers, NumKvHeads, 0, BlockSize, TotalBlocks); });
+        Assert.Throws<ArgumentOutOfRangeException>(() => { new KvBlockPool(NumLayers, NumKvHeads, HeadDim, 0, TotalBlocks); });
+        Assert.Throws<ArgumentOutOfRangeException>(() => { new KvBlockPool(NumLayers, NumKvHeads, HeadDim, BlockSize, 0); });
     }
 
     [Fact]
@@ -71,6 +86,26 @@ public sealed unsafe class KvBlockPoolTests
     }
 
     [Fact]
+    public void Release_ThrowsOnFreeBlock()
+    {
+        using var pool = new KvBlockPool(NumLayers, NumKvHeads, HeadDim, BlockSize, TotalBlocks);
+        int blockId = pool.Allocate();
+        pool.Release(blockId);
+
+        Assert.Throws<InvalidOperationException>(() => pool.Release(blockId));
+    }
+
+    [Fact]
+    public void AddRef_ThrowsOnFreeBlock()
+    {
+        using var pool = new KvBlockPool(NumLayers, NumKvHeads, HeadDim, BlockSize, TotalBlocks);
+        int blockId = pool.Allocate();
+        pool.Release(blockId);
+
+        Assert.Throws<InvalidOperationException>(() => pool.AddRef(blockId));
+    }
+
+    [Fact]
     public void AddRef_IncrementsRefCount()
     {
         using var pool = new KvBlockPool(NumLayers, NumKvHeads, HeadDim, BlockSize, TotalBlocks);
@@ -100,17 +135,17 @@ public sealed unsafe class KvBlockPoolTests
     [Fact]
     public void GetKeyPtr_WritesAndReadsCorrectly()
     {
-        using var pool = new KvBlockPool(NumLayers, NumKvHeads, HeadDim, BlockSize, TotalBlocks);
+        using var pool = CreateF32Pool();
 
         int blockId = pool.Allocate();
 
         // Write to slot 0, layer 0
-        float* kPtr = pool.GetKeyPtr(blockId, layerIndex: 0);
+        float* kPtr = (float*)pool.GetKeyPtr(blockId, layerIndex: 0);
         for (int i = 0; i < KvStride; i++)
             kPtr[i] = i + 1.0f;
 
         // Read back
-        float* kRead = pool.GetKeyPtr(blockId, layerIndex: 0);
+        float* kRead = (float*)pool.GetKeyPtr(blockId, layerIndex: 0);
         for (int i = 0; i < KvStride; i++)
             Assert.Equal(i + 1.0f, kRead[i]);
     }
@@ -118,15 +153,15 @@ public sealed unsafe class KvBlockPoolTests
     [Fact]
     public void GetValuePtr_WritesAndReadsCorrectly()
     {
-        using var pool = new KvBlockPool(NumLayers, NumKvHeads, HeadDim, BlockSize, TotalBlocks);
+        using var pool = CreateF32Pool();
 
         int blockId = pool.Allocate();
 
-        float* vPtr = pool.GetValuePtr(blockId, layerIndex: 1);
+        float* vPtr = (float*)pool.GetValuePtr(blockId, layerIndex: 1);
         for (int i = 0; i < KvStride; i++)
             vPtr[i] = i * 0.5f;
 
-        float* vRead = pool.GetValuePtr(blockId, layerIndex: 1);
+        float* vRead = (float*)pool.GetValuePtr(blockId, layerIndex: 1);
         for (int i = 0; i < KvStride; i++)
             Assert.Equal(i * 0.5f, vRead[i]);
     }
@@ -134,32 +169,32 @@ public sealed unsafe class KvBlockPoolTests
     [Fact]
     public void LayersAreIndependent()
     {
-        using var pool = new KvBlockPool(NumLayers, NumKvHeads, HeadDim, BlockSize, TotalBlocks);
+        using var pool = CreateF32Pool();
 
         int blockId = pool.Allocate();
 
-        float* k0 = pool.GetKeyPtr(blockId, 0);
-        float* k1 = pool.GetKeyPtr(blockId, 1);
+        float* k0 = (float*)pool.GetKeyPtr(blockId, 0);
+        float* k1 = (float*)pool.GetKeyPtr(blockId, 1);
 
         k0[0] = 42.0f;
         k1[0] = 99.0f;
 
-        Assert.Equal(42.0f, pool.GetKeyPtr(blockId, 0)[0]);
-        Assert.Equal(99.0f, pool.GetKeyPtr(blockId, 1)[0]);
+        Assert.Equal(42.0f, ((float*)pool.GetKeyPtr(blockId, 0))[0]);
+        Assert.Equal(99.0f, ((float*)pool.GetKeyPtr(blockId, 1))[0]);
     }
 
     [Fact]
     public void CopyBlock_CreatesIndependentCopy()
     {
-        using var pool = new KvBlockPool(NumLayers, NumKvHeads, HeadDim, BlockSize, TotalBlocks);
+        using var pool = CreateF32Pool();
 
         int srcId = pool.Allocate();
 
         // Fill source with data
         for (int layer = 0; layer < NumLayers; layer++)
         {
-            float* kPtr = pool.GetKeyPtr(srcId, layer);
-            float* vPtr = pool.GetValuePtr(srcId, layer);
+            float* kPtr = (float*)pool.GetKeyPtr(srcId, layer);
+            float* vPtr = (float*)pool.GetValuePtr(srcId, layer);
             int blockFloats = BlockSize * KvStride;
             for (int i = 0; i < blockFloats; i++)
             {
@@ -175,10 +210,10 @@ public sealed unsafe class KvBlockPoolTests
         // Verify data matches
         for (int layer = 0; layer < NumLayers; layer++)
         {
-            float* srcK = pool.GetKeyPtr(srcId, layer);
-            float* copyK = pool.GetKeyPtr(copyId, layer);
-            float* srcV = pool.GetValuePtr(srcId, layer);
-            float* copyV = pool.GetValuePtr(copyId, layer);
+            float* srcK = (float*)pool.GetKeyPtr(srcId, layer);
+            float* copyK = (float*)pool.GetKeyPtr(copyId, layer);
+            float* srcV = (float*)pool.GetValuePtr(srcId, layer);
+            float* copyV = (float*)pool.GetValuePtr(copyId, layer);
 
             int blockFloats = BlockSize * KvStride;
             for (int i = 0; i < blockFloats; i++)
@@ -189,33 +224,65 @@ public sealed unsafe class KvBlockPoolTests
         }
 
         // Modify copy — should not affect source
-        pool.GetKeyPtr(copyId, 0)[0] = -1.0f;
-        Assert.NotEqual(-1.0f, pool.GetKeyPtr(srcId, 0)[0]);
+        ((float*)pool.GetKeyPtr(copyId, 0))[0] = -1.0f;
+        Assert.NotEqual(-1.0f, ((float*)pool.GetKeyPtr(srcId, 0))[0]);
     }
 
     [Fact]
     public void GetKeySpan_ReturnsCorrectSlice()
     {
-        using var pool = new KvBlockPool(NumLayers, NumKvHeads, HeadDim, BlockSize, TotalBlocks);
+        using var pool = CreateF32Pool();
 
         int blockId = pool.Allocate();
 
         // Write to offset 2 in the block
-        var span = pool.GetKeySpan(blockId, layerIndex: 0, offsetInBlock: 2);
+        var span = MemoryMarshal.Cast<byte, float>(pool.GetKeySpan(blockId, layerIndex: 0, offsetInBlock: 2));
         Assert.Equal(KvStride, span.Length);
         span.Fill(7.0f);
 
         // Read back via raw pointer
-        float* kPtr = pool.GetKeyPtr(blockId, 0);
+        float* kPtr = (float*)pool.GetKeyPtr(blockId, 0);
         Assert.Equal(7.0f, kPtr[2 * KvStride]); // offset 2
         Assert.Equal(7.0f, kPtr[2 * KvStride + KvStride - 1]);
     }
 
     [Fact]
+    public void EncodeDecodeRows_RoundTripF16AndQ8()
+    {
+        float[] src = Enumerable.Range(0, 2 * KvStride).Select(i => MathF.Sin(i) * 3f).ToArray();
+        byte* rows = stackalloc byte[2 * 32 * sizeof(float)];
+        float* back = stackalloc float[64];
+        foreach (var type in new[] { DType.Float16, DType.Q8_0 })
+        {
+            // Q8_0 needs headDim % 32 == 0.
+            using var pool = new KvBlockPool(NumLayers, 1, 32, BlockSize, TotalBlocks, type);
+            Assert.Equal((int)type.ComputeByteCount(32), pool.RowBytes);
+            fixed (float* sp = src)
+            {
+                pool.EncodeRows(sp, rows, 2);
+                pool.DecodeRows(rows, back, 2);
+            }
+
+            float tol = type == DType.Q8_0 ? 3f / 127f : 3f / 1024f;
+            for (int i = 0; i < 64; i++)
+                Assert.InRange(MathF.Abs(back[i] - src[i]), 0f, tol);
+        }
+    }
+
+    [Fact]
+    public void Constructor_RejectsUnsupportedRowTypes()
+    {
+        Assert.Throws<ArgumentException>(() => new KvBlockPool(1, 1, 32, BlockSize, TotalBlocks, DType.Q4_0).Dispose());
+        Assert.Throws<ArgumentException>(() => new KvBlockPool(1, 1, 8, BlockSize, TotalBlocks, DType.Q8_0).Dispose());
+    }
+
+    private static KvBlockPool CreateF32Pool()
+        => new(NumLayers, NumKvHeads, HeadDim, BlockSize, TotalBlocks, DType.Float32);
+
+    [Fact]
     public void Dispose_IsSafeToCallMultipleTimes()
     {
-        var pool = new KvBlockPool(NumLayers, NumKvHeads, HeadDim, BlockSize, TotalBlocks);
-        pool.Dispose();
-        pool.Dispose(); // Should not throw
+        using var pool = new KvBlockPool(NumLayers, NumKvHeads, HeadDim, BlockSize, TotalBlocks);
+        pool.Dispose(); // Explicit dispose; the `using` scope disposes again on exit — should not throw
     }
 }

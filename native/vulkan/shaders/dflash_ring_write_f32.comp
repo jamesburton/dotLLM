@@ -1,0 +1,44 @@
+#version 450
+// DFlash context ring write (issue #1193): rows [srcRow0, srcRow0 + rows) of the F32 K and V projections go to the F16 ring
+// slots (pos0 + r) % cap. Halves are packed two per uint (no 16-bit storage feature needed) and rounded to nearest-even in the
+// integer domain, so they equal Half's conversion on the CPU (see convert_f32_to_f16_range.comp).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufK  { float k[]; };      // [*, kvDim]
+layout(set = 0, binding = 1, std430) readonly  buffer BufV  { float v[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufRK { uint ringK[]; };   // F16 pairs
+layout(set = 0, binding = 3, std430) writeonly buffer BufRV { uint ringV[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint kvDim;        // even
+    uint srcRow0;
+    uint pos0;
+    uint cap;
+    uint ringKWord0;   // word offset of the layer's K ring inside the buffer
+    uint ringVWord0;
+} pc;
+
+float roundToHalfRne(float x) {
+    uint b = floatBitsToUint(x);
+    b += 0xFFFu + ((b >> 13u) & 1u);
+    return uintBitsToFloat(b & 0xFFFFE000u);
+}
+
+uint pack(float a, float b) {
+    vec2 c = clamp(vec2(a, b), vec2(-65504.0), vec2(65504.0));
+    return packHalf2x16(vec2(roundToHalfRne(c.x), roundToHalfRne(c.y)));
+}
+
+void main() {
+    uint half_ = pc.kvDim / 2u;
+    uint w = gl_GlobalInvocationID.x;
+    if (w >= pc.rows * half_) return;
+    uint r = w / half_, e = (w % half_) * 2u;
+    uint slot = (pc.pos0 + r) % pc.cap;
+    uint src = (pc.srcRow0 + r) * pc.kvDim + e;
+    uint dst = slot * half_ + e / 2u;
+    ringK[pc.ringKWord0 + dst] = pack(k[src], k[src + 1u]);
+    ringV[pc.ringVWord0 + dst] = pack(v[src], v[src + 1u]);
+}

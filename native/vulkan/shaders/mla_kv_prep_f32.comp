@@ -1,0 +1,78 @@
+#version 450
+// Absorbed-MLA latent-cache row builder (issue #913).
+//
+// One workgroup per token. Input is the raw kv_a_mqa projection row [kvLoraRank + qkRope]:
+//   [0, kvLoraRank)            -> c_kv      : RMSNorm'd with kv_a_layernorm, cached as the shared K *and* V content
+//   [kvLoraRank, +qkRope)      -> k_pe      : rotated (interleaved-pair RoPE, MQA-shared, one per token), cached after c_kv
+// and written straight into the latent cache row  C[rowOffset + t, 0 .. kvLoraRank + qkRope)  (the llama.cpp layout), so
+// the standalone latent rmsnorm, k_pe matmul, rope dispatch and the vkCmdCopyBuffer into the cache all disappear.
+//
+// RoPE angle math is byte-identical to rope_mla_f32.comp (same sincosRed range reduction) so the absorbed path and the
+// expanded path agree to rounding.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufKvA { float kvA[]; };      // [seqLen, kvLoraRank + qkRope]
+layout(set = 0, binding = 1, std430) readonly  buffer BufW   { float normW[]; };    // [kvLoraRank]
+layout(set = 0, binding = 2, std430) readonly  buffer BufPos { int positions[]; };  // [seqLen]
+layout(set = 0, binding = 3, std430) writeonly buffer BufC   { float cache[]; };    // [*, kvLoraRank + qkRope]
+
+layout(push_constant) uniform PushConstants {
+    uint  seqLen;
+    uint  rowOffset;     // cache row of token 0
+    uint  kvLoraRank;
+    uint  qkRope;
+    float eps;
+    float theta;
+} pc;
+
+void sincosRed(float a, out float c, out float s) {
+    float k = floor(a * 0.15915494309189535 + 0.5);
+    float r = fma(-k, 6.28318548202514648, a);
+    r = fma(k, 1.7484556e-7, r);
+    c = cos(r);
+    s = sin(r);
+}
+
+shared float partials[256];
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    if (t >= pc.seqLen) return;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint cDim = pc.kvLoraRank + pc.qkRope;
+    uint inBase = t * cDim;
+    uint outBase = (pc.rowOffset + t) * cDim;
+
+    float sumSq = 0.0;
+    for (uint i = tid; i < pc.kvLoraRank; i += 256u) {
+        float v = kvA[inBase + i];
+        sumSq += v * v;
+    }
+    partials[tid] = sumSq;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] += partials[tid + stride];
+        barrier();
+    }
+    float rinv = inversesqrt(partials[0] / float(pc.kvLoraRank) + pc.eps);
+
+    for (uint i = tid; i < pc.kvLoraRank; i += 256u)
+        cache[outBase + i] = kvA[inBase + i] * rinv * normW[i];
+
+    uint halfRope = pc.qkRope >> 1u;
+    if (tid < halfRope) {
+        float expn  = float(2u * tid) / float(pc.qkRope);
+        float freq  = 1.0 / pow(pc.theta, expn);
+        float angle = float(positions[t]) * freq;
+        float c, s;
+        sincosRed(angle, c, s);
+        uint i0 = inBase + pc.kvLoraRank + 2u * tid;
+        float v0 = kvA[i0];
+        float v1 = kvA[i0 + 1u];
+        uint o0 = outBase + pc.kvLoraRank + 2u * tid;
+        cache[o0]      = v0 * c - v1 * s;
+        cache[o0 + 1u] = v0 * s + v1 * c;
+    }
+}

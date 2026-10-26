@@ -23,9 +23,45 @@ public sealed unsafe class ComputeThreadPool : IDisposable
     /// <summary>Number of spin iterations before falling back to event wait in spin-wait mode.</summary>
     private const int SpinIterations = 10_000;
 
+    /// <summary>
+    /// Splits <paramref name="totalItems"/> across <paramref name="threadCount"/> threads as evenly
+    /// as possible, giving thread <paramref name="threadIdx"/> the half-open range
+    /// <c>[start, end)</c>. Every thread receives either <c>floor(N/T)</c> or <c>ceil(N/T)</c> items,
+    /// and no thread is left empty while <c>N >= T</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>Replaces the ceiling-division split that every worker previously repeated. That form
+    /// gave each thread the rounded-up share, so the work ran out early and the tail threads got an
+    /// empty range: at <c>N = T + 1</c> everyone's share doubles and nearly half the pool idles.</para>
+    /// <para>Severity tracked how close <c>N</c> was to <c>T</c>, which made it invisible on the
+    /// matmul workers (hundreds of tiles across 32 threads) and acute in attention, where the items
+    /// are heads and the count is the same order as the core count.</para>
+    /// <para>Ranges remain contiguous and disjoint, and thread order is preserved, so results are
+    /// bit-identical — this redistributes work, it does not reassociate it.</para>
+    /// </remarks>
+    /// <param name="totalItems">Total number of items to divide.</param>
+    /// <param name="threadIdx">Zero-based index of the requesting thread.</param>
+    /// <param name="threadCount">Total number of participating threads.</param>
+    /// <param name="start">Inclusive start of this thread's range.</param>
+    /// <param name="end">Exclusive end of this thread's range. Equals <paramref name="start"/>
+    /// when there is no work for this thread.</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void PartitionRange(
+        int totalItems, int threadIdx, int threadCount, out int start, out int end)
+    {
+        int baseCount = totalItems / threadCount;
+        int remainder = totalItems % threadCount;
+
+        // Threads below the remainder take one extra item; the Math.Min shifts later threads past
+        // the extras already handed out, which keeps the ranges contiguous.
+        start = (threadIdx * baseCount) + Math.Min(threadIdx, remainder);
+        end = start + baseCount + (threadIdx < remainder ? 1 : 0);
+    }
+
     private readonly Thread[] _workers;
     private readonly ManualResetEventSlim[] _workReady;
     private readonly CountdownEvent _completion;
+    private readonly ManualResetEventSlim? _debugWorkerStartGate;
     private readonly int _threadCount;
     private readonly int _decodeThreadCount;
     private readonly int[] _workerCoreAssignment; // maps worker index → logical processor ID (or -1)
@@ -67,7 +103,7 @@ public sealed unsafe class ComputeThreadPool : IDisposable
     /// </summary>
     /// <param name="threadCount">Total threads including caller. Must be >= 2.</param>
     public ComputeThreadPool(int threadCount)
-        : this(threadCount, topology: null, config: default)
+        : this(threadCount, topology: null, config: default, debugWorkerStartGate: null)
     {
     }
 
@@ -78,23 +114,51 @@ public sealed unsafe class ComputeThreadPool : IDisposable
     /// <param name="topology">Optional NUMA topology for CPU pinning. Null = no pinning.</param>
     /// <param name="config">Threading configuration for decode thread count and pinning options.</param>
     public ComputeThreadPool(int threadCount, NumaTopology? topology, ThreadingConfig config)
+        : this(threadCount, topology, config, debugWorkerStartGate: null)
+    {
+    }
+
+    /// <summary>
+    /// Test-only overload (issue #129 regression coverage): every worker thread blocks on
+    /// <paramref name="debugWorkerStartGate"/> as the very first action in <see cref="WorkerLoop"/>,
+    /// before it reads any dispatch state. Lets a test hold workers at the "OS thread requested via
+    /// <see cref="Thread.Start()"/> but not yet actually scheduled" point deterministically, instead
+    /// of relying on real scheduler contention to hit that window.
+    /// </summary>
+    internal ComputeThreadPool(int threadCount, ManualResetEventSlim debugWorkerStartGate)
+        : this(threadCount, topology: null, config: default, debugWorkerStartGate)
+    {
+    }
+
+    private ComputeThreadPool(
+        int threadCount, NumaTopology? topology, ThreadingConfig config, ManualResetEventSlim? debugWorkerStartGate)
     {
         if (threadCount < 2)
             throw new ArgumentOutOfRangeException(nameof(threadCount), "Thread pool requires at least 2 threads.");
 
+        _debugWorkerStartGate = debugWorkerStartGate;
         _threadCount = threadCount;
         int workerCount = threadCount - 1;
         _activeWorkerCount = workerCount;
 
-        // Compute decode thread count using the pool's actual threadCount, not the config's EffectiveThreadCount
-        // (which may be wrong when using the simple constructor with default config).
-        // When topology is null (no NUMA detection), don't apply the memory channel heuristic —
-        // use all configured threads. The cap only makes sense with real topology data.
+        // Compute decode thread count using the pool's actual threadCount, not the config's
+        // EffectiveThreadCount (which may be wrong when using the simple constructor with default config).
+        //
+        // Decode dispatches are short and happen 30-40 times per token per layer, so the per-dispatch
+        // coordination cost dominates once worker count gets large. ThreadPoolDispatchBenchmarks on
+        // Strix Halo (32 logical) showed SpinWait dispatch collapses at 32 threads — the 30-dispatch
+        // decode burst measured 10.6 ms at 32T vs 32 µs at 8T (see .perf-runs/.../dispatch-microbench.md).
+        // When no NumaTopology is available we therefore fall back to a conservative default of
+        // min(8, threadCount) rather than using every thread; 8 matches typical "memory channels × 2"
+        // for desktop/workstation x86 hosts and keeps the pool in the regime where SpinWait is a win.
+        //
+        // An explicit DecodeThreadCount of 1 means caller-only decode (no workers); only the automatic
+        // choices keep the floor of 2.
         _decodeThreadCount = config.DecodeThreadCount > 0
-            ? Math.Clamp(config.DecodeThreadCount, 2, threadCount)
+            ? Math.Clamp(config.DecodeThreadCount, 1, threadCount)
             : topology is not null
                 ? Math.Clamp(topology.MemoryChannelEstimate, 2, threadCount)
-                : threadCount;
+                : Math.Clamp(AutoDecodeThreadCount(threadCount, DetectHybrid()), 2, threadCount);
 
         // Build core assignment map (and caller core if pinning is enabled).
         (int[] workerAssignment, int callerCore) = BuildCoreAssignment(workerCount, topology, config);
@@ -139,7 +203,7 @@ public sealed unsafe class ComputeThreadPool : IDisposable
     {
         _currentMode = mode;
         _activeWorkerCount = mode == DispatchMode.SpinWait
-            ? Math.Clamp(_decodeThreadCount - 1, 1, _threadCount - 1)
+            ? Math.Clamp(_decodeThreadCount - 1, 0, _threadCount - 1)
             : _threadCount - 1;
     }
 
@@ -169,8 +233,11 @@ public sealed unsafe class ComputeThreadPool : IDisposable
         if (activeWorkers > 0)
             _completion.Reset(activeWorkers);
 
-        // Increment generation counter (wakes spinners)
-        Interlocked.Increment(ref _dispatchGeneration);
+        // Increment generation counter (wakes spinners). A caller-only dispatch leaves the workers
+        // parked and publishes no generation: otherwise a worker still spinning from the previous
+        // dispatch could see the new generation and run this dispatch's work alongside the caller.
+        if (activeWorkers > 0)
+            Interlocked.Increment(ref _dispatchGeneration);
 
         // Also set events (wakes any workers that fell through to kernel wait)
         for (int i = 0; i < activeWorkers; i++)
@@ -210,8 +277,34 @@ public sealed unsafe class ComputeThreadPool : IDisposable
         return ptr;
     }
 
+    /// <summary>
+    /// Default spin-decode worker count when neither an explicit <c>--decode-threads</c> nor a NUMA topology was supplied.
+    /// The historical cap of 8 assumed decode is purely memory-bandwidth-bound; measured on a 16C/32T Zen 5 box it left
+    /// 30-50% of decode throughput on the table for dense AND MoE models (Llama-3.1-8B Q4_K_M 13 -> 18 tok/s, Llama-3.2-1B Q8_0
+    /// 31 -> 47, Mistral-7B 13.8 -> 19.7) because the quantised dot kernels are partly compute/latency-bound and SMT hides the latency.
+    /// A few logical cores are left free: the SpinWait barrier runs at the speed of its slowest thread, so using all of them
+    /// collapses as soon as anything else wants a core (31/32 threads: back to the cap-8 speed). Hybrid P/E CPUs keep the old cap
+    /// of 8 (barriers would wait on E-cores).
+    /// </summary>
+    internal static int AutoDecodeThreadCount(int threadCount, bool hybrid)
+    {
+        const int LegacyCap = 8;
+        if (hybrid || threadCount <= LegacyCap) return Math.Min(threadCount, LegacyCap);
+        return threadCount - Math.Max(2, threadCount / 8);
+    }
+
+    private static bool DetectHybrid()
+    {
+        try { return NumaTopology.Detect().IsHybrid; }
+        catch (Exception) { return true; } // unknown topology: stay on the conservative legacy cap
+    }
+
     private void WorkerLoop(object? state)
     {
+        // Test-only seam (issue #129): let a test hold this thread here — before it touches any
+        // dispatch state — to deterministically simulate an OS-scheduling-delayed worker startup.
+        _debugWorkerStartGate?.Wait();
+
         int arrayIdx = (int)state!;
         int threadIdx = arrayIdx + 1;
 
@@ -219,7 +312,27 @@ public sealed unsafe class ComputeThreadPool : IDisposable
         if (_workerCoreAssignment[arrayIdx] >= 0)
             CpuAffinity.PinCurrentThread(_workerCoreAssignment[arrayIdx]);
 
-        int lastGeneration = Volatile.Read(ref _dispatchGeneration);
+        // Baseline for "has a new dispatch happened since I last checked". This MUST be the
+        // constant 0, not a live Volatile.Read of the mutable _dispatchGeneration field.
+        //
+        // Root cause of issue #129 (dotnet test hangs on the Strix Halo box, 32 logical
+        // processors): Thread.Start() only *requests* OS scheduling — it does not guarantee this
+        // thread runs before the constructor returns to its caller. If the caller immediately
+        // calls Dispatch() and this worker's first read of _dispatchGeneration happens to land
+        // *after* that Dispatch() already incremented it (and Set() this worker's ready-event),
+        // the worker treats the dispatch it was woken for as "nothing new", Reset()s the very
+        // event that woke it, and loops back to waiting for a dispatch that will never come —
+        // while the caller's Dispatch() blocks forever in CountdownEvent.Wait() for a Signal()
+        // this worker will now never issue. Reproduces far more reliably on machines with many
+        // logical processors (more concurrently-scheduled test collections/pools competing for
+        // CPU time widens the window for a freshly-started worker thread to lose the race), which
+        // is why this was effectively unreproducible on the lower-core-count primary workstation.
+        //
+        // 0 is always the correct baseline: _dispatchGeneration is only ever mutated by Dispatch()
+        // and Dispose(), and neither can run before this constructor — which starts every worker
+        // thread — has returned to its own caller, so _dispatchGeneration is guaranteed to still
+        // be its field-initializer value (0) at the moment each worker thread is created.
+        int lastGeneration = 0;
 
         while (true)
         {

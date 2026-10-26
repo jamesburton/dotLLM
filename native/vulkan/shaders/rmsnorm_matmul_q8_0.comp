@@ -1,0 +1,166 @@
+#version 450
+// Fused RMSNorm + Q8_0 GEMV (decode path), sub-tile variant.
+//
+//   norm[i]  = (hidden[i] * rsqrt(mean(hidden^2) + eps)) * normWeight[i]
+//   y[m]     = sum_k W_q8[m, k] * norm[k]
+//
+// Replaces the standalone (rmsnorm_f32 → matmul_q8_0) pair for the
+// single-token decode path. Per layer this saves one dispatch and one
+// pipeline barrier (attn-norm + Q proj, ffn-norm + Gate proj).
+//
+// Sub-tile layout (vs the per-row v1 design which dispatched M workgroups):
+//   Each workgroup outputs ROWS_PER_WG matmul rows, amortising the
+//   rmsnorm reduction across them. 128 threads = 8 rows × 16 threads/row.
+//   Total WGs = ceil(M / 8) — for SmolLM Q (M=576) that's 72 vs 576,
+//   reducing the redundant per-WG rmsnorm work 8×. SmolLM K=576/32=18
+//   blocks/row → 16 threads/row each handle ~1 block — well-utilised.
+//
+// `normOutput` is also written so downstream non-fused matmuls (K, V, Up)
+// can consume the normalised hidden state — the first ceil(K / WG_SIZE)
+// workgroups write the global slice (each leader covers WG_SIZE elements).
+//
+// Dispatch:
+//   groupCount   = (ceil(M / ROWS_PER_WG), 1, 1)
+//   local_size_x = 128
+//
+// Layout: identical to matmul_q8_0.comp — Q8_0 weights as raw uint[]
+// (34-byte blocks: fp16 scale + 32 int8). See matmul_q8_0.comp for the
+// shift / unpackHalf2x16 derivation.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufHidden    { float hidden[]; };     // [K]
+layout(set = 0, binding = 1, std430) readonly  buffer BufNormW     { float normWeight[]; }; // [K]
+layout(set = 0, binding = 2, std430) readonly  buffer BufW         { uint  weight[]; };     // Q8_0 blob
+layout(set = 0, binding = 3, std430) writeonly buffer BufNormOut   { float normOutput[]; }; // [K]
+layout(set = 0, binding = 4, std430) writeonly buffer BufY         { float y[]; };          // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint  M;             // output dim (number of weight rows)
+    uint  K;             // input dim (must be a multiple of 32)
+    uint  blocksPerRow;  // = K / 32
+    uint  rowUints;      // per-row uint stride = ceil(blocksPerRow * 34 / 4)
+    float eps;           // epsilon under the rmsnorm sqrt
+} pc;
+
+// Maximum supported hidden size for the on-chip normalised scratch.
+// 4 KB scratch + 512 B partials = 4.5 KB shared mem per WG. SmolLM
+// hidden=576 fits with headroom; larger models fall back via
+// SupportsHiddenSize() in the kernel binding.
+const uint K_MAX = 1024u;
+
+const uint WG_SIZE = 128u;
+const uint ROWS_PER_WG = 8u;
+const uint THREADS_PER_ROW = 16u;  // WG_SIZE / ROWS_PER_WG
+
+// `partials` is reused across the three phases (rmsnorm reduce, then
+// per-row matmul reduce). Barriers between phases keep the reuse safe.
+shared float partials[WG_SIZE];
+shared float sharedNorm[K_MAX];
+
+int readQsByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    int b = int((u >> shift) & 0xFFu);
+    return (b ^ 0x80) - 0x80;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+void main() {
+    uint wgId = gl_WorkGroupID.x;
+    uint mTileBase = wgId * ROWS_PER_WG;
+    uint tid = gl_LocalInvocationID.x;
+    uint rowInTile = tid / THREADS_PER_ROW;     // 0..3
+    uint laneInRow = tid - rowInTile * THREADS_PER_ROW; // 0..31
+    uint mGlobal = mTileBase + rowInTile;
+
+    // ─── Phase 1: cooperative sum-of-squares for rmsnorm. ───
+    // All 128 threads participate.
+    float sumSq = 0.0;
+    for (uint i = tid; i < pc.K; i += WG_SIZE) {
+        float v = hidden[i];
+        sumSq += v * v;
+    }
+    partials[tid] = sumSq;
+    barrier();
+    for (uint stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0u) {
+        float meanSq = partials[0] / float(pc.K);
+        partials[0] = inversesqrt(meanSq + pc.eps);
+    }
+    barrier();
+    float rinv = partials[0];
+
+    // ─── Phase 2: write sharedNorm[K] (and normOutput[K] from leader WGs). ───
+    for (uint i = tid; i < pc.K; i += WG_SIZE) {
+        sharedNorm[i] = hidden[i] * rinv * normWeight[i];
+    }
+
+    // Leader WGs write the normalised global buffer. Each leader covers a
+    // contiguous WG_SIZE slice; ceil(K / WG_SIZE) leaders total. For
+    // SmolLM K=576 with WG_SIZE=128 that's 5 leader WGs.
+    uint normLeaderCount = (pc.K + WG_SIZE - 1u) / WG_SIZE;
+    if (wgId < normLeaderCount) {
+        uint elemId = wgId * WG_SIZE + tid;
+        if (elemId < pc.K) {
+            normOutput[elemId] = hidden[elemId] * rinv * normWeight[elemId];
+        }
+    }
+    barrier();
+
+    // ─── Phase 3: matmul, ROWS_PER_WG rows in parallel. ───
+    // 32 threads per row stride over the K-blocks; per-row tree reduce
+    // combines the partials. All barriers are WG-uniform — threads on
+    // tail rows (mGlobal >= M) participate but contribute zero.
+    float acc = 0.0;
+    if (mGlobal < pc.M) {
+        uint rowByteStride = pc.blocksPerRow * 34u;
+        uint rowByteBase = mGlobal * rowByteStride;
+
+        for (uint b = laneInRow; b < pc.blocksPerRow; b += THREADS_PER_ROW) {
+            uint blockByteBase = rowByteBase + b * 34u;
+            float d = readHalf(blockByteBase);
+            uint xBase = b * 32u;
+            float blockSum = 0.0;
+            for (uint j = 0u; j < 32u; j++) {
+                int qv = readQsByte(blockByteBase + 2u + j);
+                blockSum += float(qv) * sharedNorm[xBase + j];
+            }
+            acc += d * blockSum;
+        }
+    }
+
+    partials[tid] = acc;
+    barrier();
+
+    // Per-row tree reduce within each row's 32 threads. matmulPartials
+    // layout matches `tid`: row r occupies [r*32, r*32+32). Reduction
+    // halves stride each iteration and the barrier guards each level.
+    for (uint stride = THREADS_PER_ROW / 2u; stride > 0u; stride >>= 1u) {
+        if (laneInRow < stride) {
+            partials[tid] = partials[tid] + partials[tid + stride];
+        }
+        barrier();
+    }
+
+    if (laneInRow == 0u && mGlobal < pc.M) {
+        y[mGlobal] = partials[rowInTile * THREADS_PER_ROW];
+    }
+}

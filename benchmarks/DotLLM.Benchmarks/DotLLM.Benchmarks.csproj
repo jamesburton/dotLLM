@@ -10,8 +10,19 @@
     <ProjectReference Include="..\..\src\DotLLM.Models\DotLLM.Models.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Cpu\DotLLM.Cpu.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Cuda\DotLLM.Cuda.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.Vulkan\DotLLM.Vulkan.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Engine\DotLLM.Engine.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.HuggingFace\DotLLM.HuggingFace.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.Vulkan\DotLLM.Vulkan.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- #1279: one model store. Shared resolver/downloader linked from the integration suite
+         (both `internal`, so each assembly gets its own copy). -->
+    <Compile Include="..\..\tests\DotLLM.Tests.Integration\Fixtures\TestFixtureResolver.cs"
+             Link="Fixtures\TestFixtureResolver.cs" />
+    <Compile Include="..\..\tests\DotLLM.Tests.Integration\Fixtures\TestModelDownloader.cs"
+             Link="Fixtures\TestModelDownloader.cs" />
   </ItemGroup>
 
   <ItemGroup>

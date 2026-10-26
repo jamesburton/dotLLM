@@ -1,0 +1,88 @@
+#version 450
+// Qwen4-Exp QSA top-k block selection (issue #819). One workgroup per query whose block count exceeds the budget.
+// Selects exactly `budgetBlocks` blocks by (score desc, block index asc) -- the CPU oracle's tie order -- and writes them in
+// ASCENDING block order. Scores are >= 0 so their IEEE bit patterns order like integers: an exact 4-pass MSB radix select finds
+// the threshold key; then an index-ordered compaction emits every block above it plus the lowest-index blocks equal to it.
+
+#define WG 256
+
+layout(local_size_x = WG, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufScores { float scores[]; };  // [qCount, nbCap]
+layout(set = 0, binding = 1, std430) writeonly buffer BufSel    { int   sel[]; };     // [qCount, budgetBlocks]
+
+layout(push_constant) uniform PushConstants {
+    uint qBase;
+    uint qCount;
+    uint firstPos;
+    uint blockSize;
+    uint budgetBlocks;
+    uint nbCap;
+} pc;
+
+shared uint hist[256];
+shared uint shBin, shNeed;
+shared uint cntGt[WG], cntEq[WG], inclEq[WG], baseOut[WG];
+
+void main() {
+    uint lq = gl_WorkGroupID.x;
+    uint p  = pc.firstPos + pc.qBase + lq;
+    uint nb = (p + 1u) / pc.blockSize;
+    if (nb <= pc.budgetBlocks) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint rowBase = lq * pc.nbCap;
+
+    uint prefix = 0u, maskHi = 0u, need = pc.budgetBlocks;
+    for (uint pass = 0u; pass < 4u; pass++) {
+        uint shift = 24u - 8u * pass;
+        hist[tid] = 0u;
+        barrier();
+        for (uint b = tid; b < nb; b += uint(WG)) {
+            uint key = floatBitsToUint(scores[rowBase + b]);
+            if ((key & maskHi) == prefix) atomicAdd(hist[(key >> shift) & 255u], 1u);
+        }
+        barrier();
+        if (tid == 0u) {
+            uint cum = 0u, chosen = 0u, rem = need;
+            for (int bin = 255; bin >= 0; bin--) {
+                uint c = hist[bin];
+                if (cum + c >= need) { chosen = uint(bin); rem = need - cum; break; }
+                cum += c;
+            }
+            shBin = chosen; shNeed = rem;
+        }
+        barrier();
+        prefix |= shBin << shift;
+        maskHi |= 255u << shift;
+        need = shNeed;
+        barrier();
+    }
+
+    uint per = (nb + uint(WG) - 1u) / uint(WG);
+    uint lo = tid * per, hi = min(lo + per, nb);
+    uint gt = 0u, eq = 0u;
+    for (uint b = lo; b < hi; b++) {
+        uint key = floatBitsToUint(scores[rowBase + b]);
+        if (key > prefix) gt++; else if (key == prefix) eq++;
+    }
+    cntGt[tid] = gt; cntEq[tid] = eq;
+    barrier();
+    if (tid == 0u) {
+        uint eqBefore = 0u, run = 0u;
+        for (uint i = 0u; i < uint(WG); i++) {
+            uint inc = eqBefore >= need ? 0u : min(need - eqBefore, cntEq[i]);
+            inclEq[i] = inc;
+            baseOut[i] = run;
+            run += cntGt[i] + inc;
+            eqBefore += cntEq[i];
+        }
+    }
+    barrier();
+    uint outPos = lq * pc.budgetBlocks + baseOut[tid];
+    uint take = inclEq[tid], seen = 0u;
+    for (uint b = lo; b < hi; b++) {
+        uint key = floatBitsToUint(scores[rowBase + b]);
+        if (key > prefix) { sel[outPos++] = int(b); }
+        else if (key == prefix && seen < take) { sel[outPos++] = int(b); seen++; }
+    }
+}

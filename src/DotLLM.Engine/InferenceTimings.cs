@@ -26,6 +26,12 @@ public readonly record struct InferenceTimings
     /// <summary>Number of prompt tokens served from the prefix cache (skipped during prefill).</summary>
     public int CachedTokenCount { get; init; }
 
+    /// <summary>Snapshot storage tier used by the prefix hit, or null for a miss.</summary>
+    public string? CacheTier { get; init; }
+
+    /// <summary>Wall time spent restoring a cached prefix, in milliseconds.</summary>
+    public double CacheRestoreMilliseconds { get; init; }
+
     /// <summary>Total draft tokens proposed during speculative decoding. 0 when not using speculative decoding.</summary>
     public int SpeculativeDraftTokens { get; init; }
 
@@ -35,6 +41,15 @@ public readonly record struct InferenceTimings
     /// should equal the total generated token count.
     /// </summary>
     public int SpeculativeAcceptedTokens { get; init; }
+
+    /// <summary>Draft-and-verify rounds run during speculative decoding (#1288). 0 when not speculating.</summary>
+    public int SpeculativeSteps { get; init; }
+
+    /// <summary>
+    /// Mean tokens emitted per speculative verify round (accepted drafts plus the bonus token), i.e. the mean accepted
+    /// length; 0 when no speculation ran.
+    /// </summary>
+    public double SpeculativeMeanAcceptedLength => SpeculativeSteps > 0 ? (double)SpeculativeAcceptedTokens / SpeculativeSteps : 0;
 
     /// <summary>
     /// Draft acceptance rate: proportion of draft tokens that matched the target model.

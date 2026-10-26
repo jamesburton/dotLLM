@@ -1,0 +1,5 @@
+#version 450
+// Q4_K weights x Q8_1 activations on int8 cooperative matrices (issue #1226); see mmq_cm1_main.glsl.
+#extension GL_GOOGLE_include_directive : require
+#define MMQ_Q4_K 1
+#include "mmq_cm1_main.glsl"

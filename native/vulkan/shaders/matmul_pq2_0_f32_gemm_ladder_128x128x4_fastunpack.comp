@@ -1,0 +1,26 @@
+#version 450
+// Issue #439 ladder, arm (e) — BOTH LEVERS AT ONCE: arm (c)'s 128x128 tile (32.0 MAC/byte) with
+// arm (d)'s cheaper unpack.
+//
+// This is the arm that decides whether the tile hypothesis (#439) and the VALU/unpack hypothesis
+// (#440's RGP counters) are describing ONE bottleneck or TWO:
+//
+//   * if (e) ~= (c), the tile change already removed whatever the unpack was costing — one
+//     bottleneck, and the counters were reading a symptom of the small tile;
+//   * if (e) ~= (d), the unpack was the whole story and the tile win was really a dequant-volume
+//     win by another name;
+//   * if (e) is meaningfully faster than BOTH, they are independent levers and both are worth
+//     having.
+//
+// Same geometry as matmul_pq2_0_f32_gemm_ladder_128x128x4.comp in every other respect, so the
+// (c) -> (e) ratio isolates the unpack exactly as (a) -> (d) does.
+#define BM 128
+#define BN 128
+#define WM 64
+#define WN 64
+#define NSG 4
+#define WAVE 64
+#define FAST_UNPACK
+
+#extension GL_GOOGLE_include_directive : require
+#include "matmul_pq2_0_f32_gemm_ladder.glsl"

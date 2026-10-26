@@ -18,8 +18,8 @@ public sealed class HybridKvCache : IKvCache
     /// <summary>GPU-side KV-cache for layers 0..N-1 (FP16, device memory).</summary>
     internal CudaKvCache GpuCache { get; }
 
-    /// <summary>CPU-side KV-cache for layers N..L-1 (FP32, host memory).</summary>
-    internal SimpleKvCache CpuCache { get; }
+    /// <summary>CPU-side KV-cache for layers N..L-1 (FP32 or quantized, host memory).</summary>
+    internal IKvCache CpuCache { get; }
 
     /// <inheritdoc/>
     public int CurrentLength
@@ -39,9 +39,9 @@ public sealed class HybridKvCache : IKvCache
     /// Creates a hybrid KV-cache splitting layers between GPU and CPU.
     /// </summary>
     /// <param name="gpuCache">GPU cache for the first <paramref name="numGpuLayers"/> layers.</param>
-    /// <param name="cpuCache">CPU cache for the remaining layers.</param>
+    /// <param name="cpuCache">CPU cache for the remaining layers (SimpleKvCache or QuantizedKvCache).</param>
     /// <param name="numGpuLayers">Number of layers handled by the GPU cache.</param>
-    public HybridKvCache(CudaKvCache gpuCache, SimpleKvCache cpuCache, int numGpuLayers)
+    public HybridKvCache(CudaKvCache gpuCache, IKvCache cpuCache, int numGpuLayers)
     {
         GpuCache = gpuCache;
         CpuCache = cpuCache;

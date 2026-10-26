@@ -301,4 +301,18 @@ public class SchemaCompilerTests
 
         Assert.True(schema.Nodes[0].AllowedTypes.HasFlag(JsonSchemaType.Object));
     }
+
+    [Fact]
+    public void PropertyNameTrie_ReachableTerminalBits_TracksReachableProperties()
+    {
+        var trie = new DotLLM.Engine.Constraints.Schema.PropertyNameTrie(["name", "arguments"]);
+        // Root reaches both (bits 0 and 1).
+        Assert.Equal(0b11UL, trie.ReachableTerminalBits(0));
+        // After 'n', only "name" (bit 0) is reachable.
+        Assert.True(trie.TryGetChild(0, 'n', out int nNode));
+        Assert.Equal(0b01UL, trie.ReachableTerminalBits(nNode));
+        // After 'a', only "arguments" (bit 1) is reachable.
+        Assert.True(trie.TryGetChild(0, 'a', out int aNode));
+        Assert.Equal(0b10UL, trie.ReachableTerminalBits(aNode));
+    }
 }

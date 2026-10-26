@@ -37,7 +37,7 @@ public sealed class IncrementalDetokenizerTests
             bosId: 0, eosId: 0, addBosSpace: false);
     }
 
-    private static BpeTokenizer BuildByteFallbackVocab()
+    internal static BpeTokenizer BuildByteFallbackVocab()
     {
         // <unk>, 'a', 256 byte tokens <0x00>..<0xFF>
         var tokens = new List<string> { "<unk>", "a" };
@@ -55,7 +55,7 @@ public sealed class IncrementalDetokenizerTests
         var detok = new IncrementalDetokenizer(tok);
         Assert.Equal(0, detok.Length);
         Assert.Equal(string.Empty, detok.ToString());
-        Assert.Equal(string.Empty, detok.TakeDelta());
+        Assert.Equal(string.Empty, detok.TakeDelta(flushIncomplete: true));
     }
 
     [Fact]
@@ -90,10 +90,10 @@ public sealed class IncrementalDetokenizerTests
         foreach (int id in ids)
         {
             detok.Append(id);
-            accumulated.Append(detok.TakeDelta());
+            accumulated.Append(detok.TakeDelta(flushIncomplete: false));
         }
         Assert.Equal(tok.Decode(ids, stripBosSpace: false), accumulated.ToString());
-        Assert.Equal(string.Empty, detok.TakeDelta()); // no pending delta after draining
+        Assert.Equal(string.Empty, detok.TakeDelta(flushIncomplete: true)); // no pending delta after draining
     }
 
     [Fact]
@@ -104,11 +104,11 @@ public sealed class IncrementalDetokenizerTests
         var detok = new IncrementalDetokenizer(tok);
         foreach (int id in ids) detok.Append(id);
         string full = detok.ToString();
-        string delta = detok.TakeDelta();
+        string delta = detok.TakeDelta(flushIncomplete: true);
         // First drain returns everything; ToString is unchanged; a second drain is empty.
         Assert.Equal(full, delta);
         Assert.Equal(full, detok.ToString());
-        Assert.Equal(string.Empty, detok.TakeDelta());
+        Assert.Equal(string.Empty, detok.TakeDelta(flushIncomplete: true));
     }
 
     [Fact]
@@ -157,6 +157,82 @@ public sealed class IncrementalDetokenizerTests
         foreach (int id in ids) detok.Append(id);
 
         Assert.Equal(bulk, detok.ToString());
+    }
+
+    // Byte-fallback token ids for the UTF-8 encoding of `ch` (id = 2 + byte in BuildByteFallbackVocab).
+    internal static int[] ByteTokens(string ch)
+        => System.Text.Encoding.UTF8.GetBytes(ch).Select(b => 2 + b).ToArray();
+
+    [Theory]
+    [InlineData("é")]   // 2-byte
+    [InlineData("€")]   // 3-byte
+    [InlineData("😀")]  // 4-byte, surrogate pair in UTF-16
+    public void TakeDelta_PerToken_SplitUtf8_ConcatenationEqualsFullText(string ch)
+    {
+        // #1263: a character split one byte per token used to stream as U+FFFD, and the real
+        // character was never sent because completing it does not grow the decoded length.
+        var tok = BuildByteFallbackVocab();
+        int[] ids = [1, .. ByteTokens(ch), 1, .. ByteTokens(ch)]; // "a" ch "a" ch
+        var detok = new IncrementalDetokenizer(tok);
+        var accumulated = new System.Text.StringBuilder();
+        foreach (int id in ids)
+        {
+            detok.Append(id);
+            string delta = detok.TakeDelta(flushIncomplete: false);
+            Assert.DoesNotContain('�', delta);
+            accumulated.Append(delta);
+        }
+
+        accumulated.Append(detok.TakeDelta(flushIncomplete: true));
+        Assert.Equal("a" + ch + "a" + ch, accumulated.ToString());
+        Assert.Equal(tok.Decode(ids, stripBosSpace: false), accumulated.ToString());
+    }
+
+    [Theory]
+    [InlineData("é")]
+    [InlineData("€")]
+    [InlineData("😀")]
+    public void TakeDelta_TruncatedSplitUtf8_FlushesReplacementExactlyOnce(string ch)
+    {
+        // Generation stops (e.g. on the token limit) after only the first bytes of a character:
+        // the dangling U+FFFD must still reach the stream, once, at the terminal flush.
+        var tok = BuildByteFallbackVocab();
+        int[] bytes = ByteTokens(ch);
+        int[] ids = [1, .. bytes[..^1]];
+        var detok = new IncrementalDetokenizer(tok);
+        var accumulated = new System.Text.StringBuilder();
+        foreach (int id in ids)
+        {
+            detok.Append(id);
+            accumulated.Append(detok.TakeDelta(flushIncomplete: false));
+        }
+
+        Assert.Equal("a", accumulated.ToString());
+        accumulated.Append(detok.TakeDelta(flushIncomplete: true));
+        Assert.Equal(string.Empty, detok.TakeDelta(flushIncomplete: true));
+
+        string bulk = tok.Decode(ids, stripBosSpace: false);
+        Assert.Contains('�', bulk);
+        Assert.Equal(bulk, accumulated.ToString());
+    }
+
+    [Fact]
+    public void TakeWithheld_ReturnsTextAsDecodedBeforeTheDroppedToken()
+    {
+        // A stop token that is dropped from the output must not leak into it — not even by
+        // completing the character held back before it.
+        var tok = BuildByteFallbackVocab();
+        int[] euro = ByteTokens("€");
+        var detok = new IncrementalDetokenizer(tok);
+        detok.Append(1);
+        detok.Append(euro[0]);
+        detok.Append(euro[1]);
+        Assert.Equal("a", detok.TakeDelta(flushIncomplete: false));
+
+        detok.Append(euro[2]); // the "stop" token, appended for stop checks and then dropped
+        string expected = tok.Decode([1, euro[0], euro[1]], stripBosSpace: false)[1..];
+        Assert.Equal(expected, detok.TakeWithheld());
+        Assert.Equal(string.Empty, detok.TakeDelta(flushIncomplete: true));
     }
 
     [Fact]

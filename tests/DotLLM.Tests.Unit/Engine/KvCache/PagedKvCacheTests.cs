@@ -15,8 +15,9 @@ public sealed unsafe class PagedKvCacheTests
     private const int TotalBlocks = 32;
     private const int KvStride = NumKvHeads * HeadDim; // 32
 
+    // F32 rows keep these storage tests bit-exact against SimpleKvCache; F16/Q8_0 blocks are covered by PagedAttentionTests.
     private KvBlockPool CreatePool()
-        => new(NumLayers, NumKvHeads, HeadDim, BlockSize, TotalBlocks);
+        => new(NumLayers, NumKvHeads, HeadDim, BlockSize, TotalBlocks, DType.Float32);
 
     [Fact]
     public void Constructor_InitializesCorrectly()
@@ -26,6 +27,19 @@ public sealed unsafe class PagedKvCacheTests
 
         Assert.Equal(0, cache.CurrentLength);
         Assert.Equal(MaxSeqLen, cache.MaxLength);
+        // Staging is lazy and no block is held yet.
+        Assert.Equal(0, cache.AllocatedBytes);
+        Assert.Equal(0, cache.StagingBytes);
+    }
+
+    [Fact]
+    public void Constructor_RejectsPoolShapeMismatch()
+    {
+        using var pool = CreatePool();
+
+        Assert.Throws<ArgumentException>(() => { new PagedKvCache(pool, NumLayers + 1, KvStride, MaxSeqLen); });
+        Assert.Throws<ArgumentException>(() => { new PagedKvCache(pool, NumLayers, KvStride + 1, MaxSeqLen); });
+        Assert.Throws<ArgumentOutOfRangeException>(() => { new PagedKvCache(pool, NumLayers, KvStride, 0); });
     }
 
     [Fact]
@@ -292,20 +306,20 @@ public sealed unsafe class PagedKvCacheTests
         {
             var simpleK = simple.GetKeysRef(layer);
             var pagedK = paged.GetKeysRef(layer);
+            float[] pagedKCopy = new ReadOnlySpan<float>((void*)pagedK.DataPointer, totalLen * KvStride).ToArray();
             var simpleV = simple.GetValuesRef(layer);
             var pagedV = paged.GetValuesRef(layer);
+            float[] pagedVCopy = new ReadOnlySpan<float>((void*)pagedV.DataPointer, totalLen * KvStride).ToArray();
 
             Assert.Equal(simpleK.Dim0, pagedK.Dim0);
 
             var sK = new ReadOnlySpan<float>((void*)simpleK.DataPointer, totalLen * KvStride);
-            var pK = new ReadOnlySpan<float>((void*)pagedK.DataPointer, totalLen * KvStride);
             var sV = new ReadOnlySpan<float>((void*)simpleV.DataPointer, totalLen * KvStride);
-            var pV = new ReadOnlySpan<float>((void*)pagedV.DataPointer, totalLen * KvStride);
 
             for (int i = 0; i < totalLen * KvStride; i++)
             {
-                Assert.Equal(sK[i], pK[i]);
-                Assert.Equal(sV[i], pV[i]);
+                Assert.Equal(sK[i], pagedKCopy[i]);
+                Assert.Equal(sV[i], pagedVCopy[i]);
             }
         }
     }
@@ -348,7 +362,7 @@ public sealed unsafe class PagedKvCacheTests
     public void Dispose_ReturnsBlocksToPool()
     {
         var pool = CreatePool();
-        var cache = new PagedKvCache(pool, NumLayers, KvStride, MaxSeqLen);
+        using var cache = new PagedKvCache(pool, NumLayers, KvStride, MaxSeqLen);
 
         // Add some data to allocate blocks
         nint kPtr = AllocAndFillNative(5, 1.0f);
@@ -394,7 +408,8 @@ public sealed unsafe class PagedKvCacheTests
     [Fact]
     public void Factory_CreatesWorkingCaches()
     {
-        using var factory = new PagedKvCacheFactory(NumLayers, NumKvHeads, HeadDim, BlockSize);
+        using var factory = new PagedKvCacheFactory(NumLayers, NumKvHeads, HeadDim, BlockSize, elementType: DType.Float32);
+        Assert.Equal(factory.Pool.AllocatedBytes, factory.AllocatedBytes);
 
         using var cache1 = factory.Create(MaxSeqLen);
         using var cache2 = factory.Create(MaxSeqLen);
@@ -426,6 +441,15 @@ public sealed unsafe class PagedKvCacheTests
         var k2 = cache2.GetKeysRef(0);
         Assert.Equal(42.0f, *(float*)k1.DataPointer);
         Assert.Equal(42.0f, *(float*)k2.DataPointer);
+    }
+
+    [Fact]
+    public void TextGeneratorByteAccounting_IncludesPagedStagingBytes()
+    {
+        using var pool = CreatePool();
+        using var cache = new PagedKvCache(pool, NumLayers, KvStride, MaxSeqLen);
+
+        Assert.Equal(cache.AllocatedBytes, DotLLM.Engine.TextGenerator.GetKvCacheBytes(cache));
     }
 
     /// <summary>

@@ -5,6 +5,7 @@ using DotLLM.Cuda;
 using DotLLM.Cuda.Interop;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -23,6 +24,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// If |B-C| >> |A-C|, there's a GPU kernel bug.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaGemvPathComparisonTest
 {
     private readonly ITestOutputHelper _out;
@@ -30,7 +32,7 @@ public class CudaGemvPathComparisonTest
 
     private static bool IsCudaDriverPresent()
     {
-        string lib = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "nvcuda.dll" : "libcuda.so.1";
+        string lib = OperatingSystem.IsWindows() ? "nvcuda.dll" : "libcuda.so.1";
         if (!NativeLibrary.TryLoad(lib, out nint h)) return false;
         NativeLibrary.Free(h);
         return CudaAvailableProbe();
@@ -49,12 +51,10 @@ public class CudaGemvPathComparisonTest
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private unsafe void CompareGemvPaths_RealModelWeights_Layer0_QProjection_Impl()
     {
-        string modelPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q8_0.gguf");
+        string modelPath = TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q8_0.gguf"], null).Path ?? "";
         Skip.If(!File.Exists(modelPath), "SmolLM-135M Q8_0 GGUF not found");
 
-        var gguf = GgufFile.Open(modelPath);
+        using var gguf = GgufFile.Open(modelPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config);
 
@@ -131,12 +131,10 @@ public class CudaGemvPathComparisonTest
     private unsafe void CompareGemvPaths_AllProjections_Layer0_Impl()
     {
 
-        string modelPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q8_0.gguf");
+        string modelPath = TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q8_0.gguf"], null).Path ?? "";
         Skip.If(!File.Exists(modelPath), "SmolLM-135M Q8_0 GGUF not found");
 
-        var gguf = GgufFile.Open(modelPath);
+        using var gguf = GgufFile.Open(modelPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config);
 
