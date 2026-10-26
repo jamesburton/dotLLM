@@ -272,12 +272,12 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 
         /// <summary>KV-cache key quantization type.</summary>
         [CommandOption("--cache-type-k")]
-        [Description("KV-cache key quantization: f32/f16 (default), q8_0, q4_0. Synonym of --kv-quant-k.")]
+        [Description("KV-cache key type: f32/f16, q8_0, q4_0. Synonym of --kv-quant-k. With --paged and neither K nor V given, Q8_0 blocks are used; pass f16 for both to keep F16.")]
         public string? CacheTypeK { get; set; }
 
         /// <summary>KV-cache value quantization type.</summary>
         [CommandOption("--cache-type-v")]
-        [Description("KV-cache value quantization: f32/f16 (default), q8_0, q4_0. Synonym of --kv-quant-v.")]
+        [Description("KV-cache value type: f32/f16, q8_0, q4_0. Synonym of --kv-quant-v.")]
         public string? CacheTypeV { get; set; }
 
         /// <summary>Mixed-precision window size for KV-cache quantization.</summary>
@@ -768,15 +768,20 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 // #729: all-GPU fallback for a partial request on Nemotron-H (sparse attention-only KV).
                 kvFactory = (cfg, size) => nemotronHGpu.CreateKvCache(size);
             }
-            else if (settings.Paged && !kvConfig.IsQuantized)
+            else if (settings.Paged && (!kvConfig.IsQuantized || DotLLM.Server.ServerStartup.IsPagedQ8Eligible(kvConfig, config, model)))
             {
+                // Blocks are F16 when a type is given, Q8_0 when none is (#1284) or q8_0 K+V is requested.
+                var blockType = DotLLM.Server.ServerStartup.ResolvePagedBlockType(
+                    kvStorageRequest.Key is not null || kvStorageRequest.Value is not null, kvConfig, config, model, out string? kvInfo);
+                if (kvInfo is not null && !settings.Json)
+                    Console.Error.WriteLine($"INFO: {kvInfo}");
                 pagedFactory = new DotLLM.Engine.KvCache.PagedKvCacheFactory(
-                    config.NumLayers, config.NumKvHeads, config.HeadDim);
+                    config.NumLayers, config.NumKvHeads, config.HeadDim, elementType: blockType);
                 kvFactory = (cfg, size) => pagedFactory.Create(size);
             }
             else if (settings.Paged && kvConfig.IsQuantized)
             {
-                Console.Error.WriteLine("WARNING: Paged KV-cache does not support quantization yet, using quantized simple cache.");
+                Console.Error.WriteLine("WARNING: Paged KV-cache supports q8_0 K+V only (uniform, non-hybrid models); using quantized simple cache.");
                 kvFactory = (cfg, size) => new DotLLM.Engine.KvCache.QuantizedKvCache(
                     DotLLM.Core.Attention.KvGeometry.FromConfig(cfg, model?.SupportsCompactSlidingKv == true), size,
                     kvConfig.KeyDType, kvConfig.ValueDType, kvConfig.MixedPrecisionWindowSize);

@@ -110,13 +110,13 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 
         /// <summary>KV-cache key quantization type.</summary>
         [CommandOption("--cache-type-k")]
-        [Description("KV-cache key quantization: f32 (default), f16, q8_0, q4_0. Synonym of --kv-quant-k. " +
+        [Description("KV-cache key type: f32, f16, q8_0, q4_0. Synonym of --kv-quant-k. Unset (with --cache-type-v unset): paged CPU KV uses Q8_0 blocks (half the memory of f16); pass f16 for both to keep F16. " +
                      "For the CUDA hybrid-dense model f32 means 'not given' (DOTLLM_HYBRID_KV applies); use f16 to force unquantized.")]
         public string? CacheTypeK { get; set; }
 
         /// <summary>KV-cache value quantization type.</summary>
         [CommandOption("--cache-type-v")]
-        [Description("KV-cache value quantization: f32 (default), f16, q8_0, q4_0. Synonym of --kv-quant-v.")]
+        [Description("KV-cache value type: f32, f16, q8_0, q4_0. Synonym of --kv-quant-v.")]
         public string? CacheTypeV { get; set; }
 
         /// <summary>Disable prompt caching (enabled by default).</summary>
@@ -443,8 +443,8 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             DecodeThreads = settings.DecodeThreads,
             Host = settings.Host,
             Port = settings.Port,
-            CacheTypeK = settings.KvQuantK ?? settings.CacheTypeK ?? "f32",
-            CacheTypeV = settings.KvQuantV ?? settings.CacheTypeV ?? "f32",
+            CacheTypeK = settings.KvQuantK ?? settings.CacheTypeK,
+            CacheTypeV = settings.KvQuantV ?? settings.CacheTypeV,
             PromptCacheEnabled = !settings.NoPromptCache,
             PromptCacheSize = settings.PromptCacheSize,
             Warmup = new WarmupOptions

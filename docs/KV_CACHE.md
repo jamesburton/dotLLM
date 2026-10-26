@@ -209,8 +209,7 @@ length-only `CudaHybridKvCacheHandle`. Per full-attention slot (16 of 64 layers 
   on `run` and `serve` they are synonyms of `--cache-type-k/-v` (giving both with different values is an error).
   `dotllm run --device gpu --kv-quant-k q8_0 --kv-quant-v q4_0` selects K8/V4. Precedence is **per side**:
   explicit flag, then `DOTLLM_HYBRID_KV`, then F16 (so `--kv-quant-k q4_0` with `DOTLLM_HYBRID_KV=q8_0` gives K4/V8, and
-  `--kv-quant-k f16 --kv-quant-v f16` forces unquantized over the env var). `serve`'s `--cache-type-*` default is `f32`,
-  which cannot be told apart from "not given" and so leaves the env var in charge; pass `f16` to force unquantized.
+  `--kv-quant-k f16 --kv-quant-v f16` forces unquantized over the env var). `serve`'s `--cache-type-*` are unset by default (#1284: unset reads as "not given", leaving the env var in charge, and on CPU paged selects Q8_0 blocks); an explicit `f32` is also treated as "not given" by the CUDA hybrid-dense model; pass `f16` to force unquantized.
   The pure logic lives in `HybridKvStorage` (Core); the model exposes `ConfigureKvStorage(key, value)` (call before the
   first forward), `KvStorageLabel`, `ComputeKvBytes(maxSeq)` and `KvAllocatedBytes`; the VRAM ledger and the `run`
   summary share that byte math. `run` prints the effective format in the Memory box
@@ -324,15 +323,19 @@ Q4_0, one head slice decoded into a `headDim` scratch by the existing per-row he
 decoded once for the group. Rows with ≤ 2048 visible keys take the contiguous path's single-shot softmax,
 longer rows the same tiled online softmax, so **F32 blocks reproduce the contiguous kernel bit for bit** (#530; tested).
 
-**Block row type** (`KvBlockPool` / `PagedKvCacheFactory` `elementType`): **F16 by default**, Q8_0 as an option (the
-server selects it for `--cache-type-k q8_0 --cache-type-v q8_0` on uniform non-hybrid models, no mixed-precision window),
-F32 only as a reference for bit-identity tests. Bytes per token (K+V, all layers), Llama-3.2-1B (16 L × 8 KV heads × 64):
+**Block row type** (`KvBlockPool` / `PagedKvCacheFactory` `elementType`): **Q8_0 when no KV type is specified** (#1284), F16 when one is. Q8_0 was faster than F16 at every
+context in the #1268 decode benchmark (ctx 512: 172 vs 125 us; 4096: 1.12 vs 0.85 ms; 16384: 4.55 vs 3.18 ms) at about half the bytes, with
+comparable logit drift. The default applies on the CPU paged path (`serve`, `run --paged`, `chat --paged`) for uniform non-hybrid models, no
+mixed-precision window, head dim a multiple of 32; startup logs `INFO: KV cache: no type specified; using Q8_0 paged blocks ...`. Any other model
+keeps F16 blocks (or its own cache). Explicit choices are honoured: `--cache-type-k f16 --cache-type-v f16` (or `f32`) gives F16 blocks, and
+`q8_0` for both gives Q8_0 blocks. Mixed (only K or only V given) is unchanged: a lone `f16`/`f32` side gives F16 blocks, a lone `q8_0`/`q4_0`
+side uses the quantized simple cache. F32 only as a reference for bit-identity tests. Bytes per token (K+V, all layers), Llama-3.2-1B (16 L × 8 KV heads × 64):
 
 | rows | bytes/token | Llama-3.1-8B (32 L × 8 × 128) |
 |---|---|---|
 | F32 (before) | 64 KiB | 256 KiB |
-| F16 (default) | 32 KiB | 128 KiB |
-| Q8_0 | 17 KiB | 68 KiB |
+| F16 (explicit `f16`) | 32 KiB | 128 KiB |
+| Q8_0 (default, #1284) | 17 KiB | 68 KiB |
 
 The old per-sequence F32 staging (`2 × maxSeqLen × kvStride × 4` bytes, allocated eagerly: 64 MiB for Llama-3.1-8B at 8k)
 is gone from the attention path: `GetKeysRef`/`GetValuesRef` still exist for callers without a paged kernel (other

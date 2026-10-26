@@ -42,11 +42,11 @@ public sealed record ServerOptions
     /// <summary>Port to listen on.</summary>
     public int Port { get; init; } = 8080;
 
-    /// <summary>KV-cache key quantization type.</summary>
-    public string CacheTypeK { get; init; } = "f32";
+    /// <summary>KV-cache key type; <c>null</c> = not specified (the CPU paged path then defaults to Q8_0 blocks, #1284).</summary>
+    public string? CacheTypeK { get; init; }
 
-    /// <summary>KV-cache value quantization type.</summary>
-    public string CacheTypeV { get; init; } = "f32";
+    /// <summary>KV-cache value type; <c>null</c> = not specified (see <see cref="CacheTypeK"/>).</summary>
+    public string? CacheTypeV { get; init; }
 
     /// <summary>Whether prompt caching is enabled.</summary>
     public bool PromptCacheEnabled { get; init; } = true;
@@ -362,8 +362,8 @@ public sealed record ServerOptions
         int decodeThreads = 0;
         string host = "localhost";
         int port = 8080;
-        string cacheTypeK = "f32";
-        string cacheTypeV = "f32";
+        string? cacheTypeK = null;
+        string? cacheTypeV = null;
         bool promptCacheEnabled = true;
         int promptCacheSize = 4;
         int? prefixSnapshots = null;
