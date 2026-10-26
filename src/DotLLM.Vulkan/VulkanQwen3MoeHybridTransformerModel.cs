@@ -1871,6 +1871,15 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             rows: expandedRows, numExperts: numE);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("expert_offsets");
+        if (MoeStageProfileEnabled && Environment.GetEnvironmentVariable("DOTLLM_A986_HIST") == "1")
+        {
+            float[] cnt = new float[numE]; _device.Download(_state.MoeGroupCounts, cnt);
+            var cs = cnt.Select(f => (int)BitConverter.SingleToUInt32Bits(f)).OrderBy(x => x).ToArray();
+            int Tiles(int t) => cs.Sum(c => (c + t - 1) / t);
+            Console.Error.WriteLine($"[a986-hist] seq={seqLen} rows={expandedRows} E={numE} empty={cs.Count(c => c == 0)} avg={cs.Average():F1} p50={cs[numE/2]} p90={cs[numE*9/10]} p99={cs[numE*99/100]} max={cs[^1]} " +
+                $"le16={cs.Count(c => c > 0 && c <= 16)} le32={cs.Count(c => c > 0 && c <= 32)} le64={cs.Count(c => c > 0 && c <= 64)} tiles16={Tiles(16)} tiles32={Tiles(32)} tiles64={Tiles(64)} util64={(double)expandedRows / (Tiles(64) * 64):P0}");
+            _moeStageLast = System.Diagnostics.Stopwatch.GetTimestamp();
+        }
         if (fusedGlue)
             _kernels.MoeExpandGatherGroup!.Record(cmdBuf, _state.NormOutput, _state.MoeTopkIndices, _state.MoeGroupOffsets,
                 _state.MoeGroupCounters, _state.MoeDownRows, _state.MoeGroupPerm, _state.MoeGroupInvPerm,
