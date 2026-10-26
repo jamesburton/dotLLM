@@ -1125,6 +1125,8 @@ Prompt caching is **enabled by default** in both `chat` and `serve` commands.
 |------|---------|-------------|
 | `--no-prompt-cache` | `false` | Disable prompt caching |
 | `--prompt-cache-size` | 1 (chat) / 4 (serve) | Maximum number of cached sessions (LRU eviction) |
+| `--prompt-cache-step` | 0 (off) | Hybrid recurrent models: checkpoint the recurrent state every N prefill tokens, so a prompt that diverges mid-history resumes from the nearest one ([KV_CACHE.md](KV_CACHE.md#mid-history-resume-step-checkpoints-1286), #1286) |
+| `--prompt-cache-step-keep` | 8 | Most `--prompt-cache-step` checkpoints kept (deepest first) |
 
 ### API
 

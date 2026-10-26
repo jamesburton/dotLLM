@@ -2118,6 +2118,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         }
     }
 
+    /// <inheritdoc/>
+    public long RecurrentStateCheckpointBytes => _gdnCache.AllocatedBytes;
+
     private VulkanGdnStateCache? _spareGdnCheckpoint;
     private bool _disposed;
 

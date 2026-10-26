@@ -12,6 +12,9 @@ namespace DotLLM.Vulkan;
 /// </summary>
 public sealed partial class VulkanQwen3MoeHybridTransformerModel
 {
+    /// <inheritdoc/>
+    public long RecurrentStateCheckpointBytes => _gdnCache.AllocatedBytes;
+
     private VulkanGdnStateCache? _spareGdnCheckpoint;
     private bool _checkpointsClosed;
 

@@ -624,6 +624,9 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IModel
         _rowSnapshotValidRows = 0;   // issue #473
     }
 
+    /// <inheritdoc/>
+    public long RecurrentStateCheckpointBytes => _gdnCache.AllocatedBytes;
+
     private CudaGdnStateCache? _spareGdnCheckpoint;
 
     /// <summary>A pooled GDN snapshot; disposing returns its buffers to the owning model (issue #469).</summary>

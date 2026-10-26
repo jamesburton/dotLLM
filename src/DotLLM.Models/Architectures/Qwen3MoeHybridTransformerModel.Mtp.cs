@@ -96,6 +96,9 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel
 
     // ── Recurrent checkpoint (issue #287 contract): a rejected draft must not leave its GDN contribution behind ──
 
+    /// <inheritdoc/>
+    public long RecurrentStateCheckpointBytes => _gdnCache.AllocatedBytes;
+
     private GdnStateCache? _spareGdnCheckpoint;
 
     /// <inheritdoc/>

@@ -86,28 +86,94 @@ public sealed partial class TextGenerator
     // null until then. A plain turn never feeds a head that no hit could resume (PR #1091 review).
     private bool? _mtpStatesResumable;
 
-    private sealed class RecurrentPrefixEntry(int[] tokens, Core.Attention.IKvCache kv, object? checkpoint, IMtpState? mtp, object? mtpMark)
+    // Mid-history step checkpoints (issue #1286): every this many prefill tokens, 0 = off. Zero when the tiered cache is active
+    // or the model cannot size its checkpoints (no byte budget could hold).
+    private readonly int _stepTokens;
+    private readonly int _maxStepCheckpoints;
+    private readonly long _stepBudgetBytes;
+    private readonly long _checkpointBytes;
+
+    // The step interval of the running request's prefill: _stepTokens on the single-slot recurrent path, else 0.
+    private int _requestStepTokens;
+
+    /// <summary>A recurrent-state checkpoint at <paramref name="Position"/> tokens of its entry's history.</summary>
+    /// <param name="Position">Tokens the state has consumed.</param>
+    /// <param name="State">The model's <see cref="IModel.CheckpointRecurrentState"/> object.</param>
+    /// <param name="Step">True for a retained step (bounded by count and bytes); false for the current snapshot boundary.</param>
+    private readonly record struct RecurrentCheckpoint(int Position, object? State, bool Step);
+
+    /// <summary>
+    /// One token history, the KV cache holding its rows, and recurrent-state checkpoints along it. The KV rows are per token, so
+    /// every checkpoint shares them: resuming from one rolls the KV back to its position (issue #1286).
+    /// </summary>
+    private sealed class RecurrentPrefixEntry(Core.Attention.IKvCache kv)
     {
-        public readonly int[] Tokens = tokens;
+        /// <summary>The history whose KV rows the entry holds, up to its deepest checkpoint.</summary>
+        public int[] Tokens = [];
         public readonly Core.Attention.IKvCache Kv = kv;
-        public readonly object? Checkpoint = checkpoint;
 
-        /// <summary>The MTP head state whose rows <c>[0, Tokens.Length)</c> hold the prefix, or null (the request decoded plain).</summary>
-        public readonly IMtpState? Mtp = mtp;
+        /// <summary>Checkpoints in ascending position, all at most <c>Tokens.Length</c>.</summary>
+        public readonly List<RecurrentCheckpoint> Points = [];
 
-        /// <summary>The <see cref="IMtpState.MarkPrefix"/> mark of <see cref="Mtp"/> at the snapshot boundary.</summary>
-        public readonly object? MtpMark = mtpMark;
+        /// <summary>The MTP head state whose rows <c>[0, MtpPosition)</c> hold the prefix, or null (the request decoded plain).</summary>
+        public IMtpState? Mtp;
+
+        /// <summary>The <see cref="IMtpState.MarkPrefix"/> mark of <see cref="Mtp"/> at <see cref="MtpPosition"/>.</summary>
+        public object? MtpMark;
+
+        /// <summary>The checkpoint position <see cref="MtpMark"/> belongs to.</summary>
+        public int MtpPosition;
+
+        /// <summary>Retained step checkpoints.</summary>
+        public int StepCount => Points.Count(p => p.Step);
+
+        /// <summary>
+        /// The deepest checkpoint <paramref name="prompt"/> can resume from: at or before where it diverges from <see cref="Tokens"/>,
+        /// leaving at least one prompt token to run for the logits. -1 when none.
+        /// </summary>
+        public int FindResume(ReadOnlySpan<int> prompt)
+        {
+            int usable = Math.Min(prompt.CommonPrefixLength(Tokens), prompt.Length - 1);
+            for (int i = Points.Count - 1; i >= 0; i--)
+                if (Points[i].Position <= usable) return i;
+            return -1;
+        }
+
+        /// <summary>Drops every checkpoint past <paramref name="position"/>: the request resuming there overwrites those rows.</summary>
+        public void TruncateTo(int position)
+        {
+            while (Points.Count > 0 && Points[^1].Position > position)
+            {
+                (Points[^1].State as IDisposable)?.Dispose();
+                Points.RemoveAt(Points.Count - 1);
+            }
+            if (Tokens.Length > position) Tokens = Tokens[..position];
+            if (MtpPosition > position && Mtp is not null)
+            {
+                // Its mark's checkpoint is gone, so nothing can resume the head any more.
+                Mtp.Dispose();
+                Mtp = null;
+                MtpMark = null;
+            }
+        }
+
+        /// <summary>Disposes and removes the checkpoint at <paramref name="index"/>.</summary>
+        public void RemoveAt(int index)
+        {
+            (Points[index].State as IDisposable)?.Dispose();
+            Points.RemoveAt(index);
+        }
 
         public void Dispose() => Release(keepKv: null, keepMtp: null);
 
         /// <summary>
-        /// Releases the checkpoint, and the KV cache and head state unless a newer entry or the running request took them over.
+        /// Releases the checkpoints, and the KV cache and head state unless a newer entry or the running request took them over.
         /// </summary>
         /// <param name="keepKv">A KV cache that stays in use: not disposed when it is this entry's.</param>
         /// <param name="keepMtp">A head state that stays in use: not disposed when it is this entry's.</param>
         public void Release(Core.Attention.IKvCache? keepKv, IMtpState? keepMtp)
         {
-            (Checkpoint as IDisposable)?.Dispose();
+            for (int i = Points.Count - 1; i >= 0; i--) RemoveAt(i);
             if (Mtp is not null && !ReferenceEquals(Mtp, keepMtp)) Mtp.Dispose();
             if (!ReferenceEquals(Kv, keepKv)) Kv.Dispose();
         }
@@ -209,6 +275,18 @@ public sealed partial class TextGenerator
         ArgumentOutOfRangeException.ThrowIfNegative(snapshots.HostBudgetBytes);
         if (_recurrentPrefixEnabled && model is IRecurrentPrefixSnapshotProvider provider && (snapshots.MaxEntries > 1 || snapshots.HostBudgetBytes > 0 || snapshots.DiskBudgetBytes > 0))
             _tieredSnapshots = new RecurrentPrefixSnapshotCache(provider, snapshots);
+        ArgumentOutOfRangeException.ThrowIfNegative(snapshots.StepTokens);
+        ArgumentOutOfRangeException.ThrowIfLessThan(snapshots.MaxStepCheckpoints, 1);
+        ArgumentOutOfRangeException.ThrowIfNegative(snapshots.StepBudgetBytes);
+        // The tiered cache's snapshots copy KV rows too, so periodic ones there would copy the history over and over: steps
+        // live on the single-slot path only, where every checkpoint shares one KV.
+        _checkpointBytes = model.RecurrentStateCheckpointBytes;
+        if (_recurrentPrefixEnabled && _tieredSnapshots is null && _checkpointBytes > 0)
+        {
+            _stepTokens = snapshots.StepTokens;
+            _maxStepCheckpoints = snapshots.MaxStepCheckpoints;
+            _stepBudgetBytes = snapshots.StepBudgetBytes;
+        }
         _mtpGate = mtpAdaptive && MtpAdaptiveGate.EnabledByEnvironment ? new MtpAdaptiveGate(model.MtpGatePriorBytes) : null;
         _mtpGateSampled = _mtpGate is null ? null : new MtpAdaptiveGate(model.MtpGatePriorBytes);
 
@@ -501,8 +579,8 @@ public sealed partial class TextGenerator
                     // Prefill suffix tokens — chunked when a prefill chunk size is configured
                     // (llama.cpp -ub analog); otherwise a single forward pass, as before.
                     using (ITensor prefillLogits = ForwardPrefill(promptIds, prefillStart, prefillLen, kvCache, adapter, mtpState,
-                        snapshotAt, () => { TakeRecurrentSnapshot(promptIds, snapshotAt, kvCache, mtpState); if (_tieredSnapshots is null) ownsKvCache = false; },
-                        cancellationToken))
+                        snapshotAt, (position, isBoundary) => { if (TakeRecurrentCheckpoint(promptIds, position, isBoundary, kvCache, mtpState)) ownsKvCache = false; },
+                        _requestStepTokens, cancellationToken))
                     {
                         long ts1 = Stopwatch.GetTimestamp();
                         prefillTicks = ts1 - ts0;
@@ -1070,8 +1148,8 @@ public sealed partial class TextGenerator
                     // Prefill suffix tokens — chunked when a prefill chunk size is configured
                     // (llama.cpp -ub analog); otherwise a single forward pass, as before.
                     using (ITensor prefillLogits = ForwardPrefill(promptIds, prefillStart, prefillLen, kvCache, adapter, mtpState,
-                        snapshotAt, () => { TakeRecurrentSnapshot(promptIds, snapshotAt, kvCache, mtpState); if (_tieredSnapshots is null) ownsKvCache = false; },
-                        cancellationToken))
+                        snapshotAt, (position, isBoundary) => { if (TakeRecurrentCheckpoint(promptIds, position, isBoundary, kvCache, mtpState)) ownsKvCache = false; },
+                        _requestStepTokens, cancellationToken))
                     {
                         long ts1 = Stopwatch.GetTimestamp();
                         prefillTicks = ts1 - ts0;
@@ -1504,6 +1582,7 @@ public sealed partial class TextGenerator
     {
         snapshotAt = -1;
         _resumedMtp = null;
+        _requestStepTokens = 0;
         LastPrefixCacheTier = null; LastPrefixRestoreMilliseconds = 0;
         if (adapter is not null) ClearRecurrentPrefixCacheCore();
         // A recurrent (Gated DeltaNet / SSM) model carries per-sequence state that has no position
@@ -1763,10 +1842,12 @@ public sealed partial class TextGenerator
             RecurrentSnapshotBoundary.ForContinuation(suffixBoundary, shared, previousSuffixBoundary),
             promptLen);
 
+        // The deepest checkpoint at or before where the prompt diverges from the entry's history, leaving a token to run for the
+        // logits. Without step checkpoints there is one, at the snapshot boundary (issue #1286).
+        _requestStepTokens = _stepTokens;
         var entry = _recurrentPrefix;
-        bool hit = entry is not null
-            && promptLen > entry.Tokens.Length                      // at least one suffix token must run to produce logits
-            && promptIds.AsSpan(0, entry.Tokens.Length).SequenceEqual(entry.Tokens);
+        int resumeIndex = entry?.FindResume(promptIds) ?? -1;
+        bool hit = resumeIndex >= 0;
         if (entry is not null && hit && !EnsureRecurrentPrefixKvCapacity(entry.Kv, needed))
         {
             // Issue #1093: the growth was refused even at the exact size. A long prompt fails here, before anything changed, so
@@ -1782,17 +1863,22 @@ public sealed partial class TextGenerator
         if (entry is not null && hit)
         {
             long restoreStart = Stopwatch.GetTimestamp();
-            entry.Kv.Rollback(entry.Tokens.Length);
-            _model.RestoreRecurrentState(entry.Checkpoint);
+            int resumeAt = entry.Points[resumeIndex].Position;
+            // This request overwrites the rows past the resume point, so the checkpoints past it are invalid.
+            entry.TruncateTo(resumeAt);
+            entry.Kv.Rollback(resumeAt);
+            _model.RestoreRecurrentState(entry.Points[^1].State);
             // The head rolls back with the trunk. TryGrowTo may have grown the KV above, so the head's ceiling follows it.
-            if (entry.Mtp is { } mtp && entry.MtpMark is { } mark && mtp.TryResumeAt(mark, entry.Kv.MaxLength))
+            // Only the boundary the head was marked at can resume it; a mid-history resume decodes plain.
+            if (entry.Mtp is { } mtp && entry.MtpMark is { } mark && entry.MtpPosition == resumeAt
+                && mtp.TryResumeAt(mark, entry.Kv.MaxLength))
                 _resumedMtp = mtp;
             LastPrefixCacheTier = "vram";
             LastPrefixRestoreMilliseconds = Stopwatch.GetElapsedTime(restoreStart).TotalMilliseconds;
             _legacyPrefixHits++;
-            if (boundary >= entry.Tokens.Length + RecurrentPrefixMinTokens)
+            if (boundary >= resumeAt + RecurrentPrefixMinTokens)
                 snapshotAt = boundary;
-            return (entry.Kv, entry.Tokens.Length, false);
+            return (entry.Kv, resumeAt, false);
         }
 
         _legacyPrefixMisses++;
@@ -1857,23 +1943,73 @@ public sealed partial class TextGenerator
     }
 
     /// <summary>
-    /// Snapshots the recurrent state at <paramref name="boundary"/>, which the prefill has just reached. When the request
+    /// Snapshots the recurrent state at <paramref name="position"/>, which the prefill has just reached. At the boundary, when the request
     /// carries the MTP head (it decodes with MTP, or <see cref="TracksMtpHead"/>), the head has absorbed exactly
     /// <c>[0, boundary)</c> too, so the entry keeps that head state and a mark of it (issue #1088). The head's rows below the mark stay valid for the same reason the trunk's KV rows do: every
     /// later write of this request, and of a hit that resumes it, is at or beyond the boundary. The tiered cache copies
     /// only the trunk, so its hits decode plain.
     /// </summary>
-    private void TakeRecurrentSnapshot(int[] promptIds, int boundary, Core.Attention.IKvCache kvCache, IMtpState? mtpState)
+    /// <remarks>
+    /// <para>Issue #1286: a step checkpoint (<paramref name="isBoundary"/> false) is the same capture at a multiple of the step
+    /// interval. Checkpoints along one history share its KV, so a step is only the recurrent state's bytes. When steps are on, the
+    /// boundary a hit moves past is kept as a step too (a retried turn resumes there, #1090); the steps are bounded by count and
+    /// bytes, shallowest dropped first. A step the device cannot admit is skipped.</para>
+    /// </remarks>
+    /// <param name="promptIds">The request's prompt.</param>
+    /// <param name="position">Prompt tokens the state has consumed.</param>
+    /// <param name="isBoundary">True for the request's snapshot boundary, false for a step checkpoint.</param>
+    /// <param name="kvCache">The request's KV cache.</param>
+    /// <param name="mtpState">The request's MTP head state, or null.</param>
+    /// <returns>True when the single-slot entry now holds <paramref name="kvCache"/>, so the request must not dispose it.</returns>
+    private bool TakeRecurrentCheckpoint(int[] promptIds, int position, bool isBoundary, Core.Attention.IKvCache kvCache, IMtpState? mtpState)
     {
-        if (_tieredSnapshots is not null) { _tieredSnapshots.TryCapture(promptIds, kvCache, boundary); return; }
-        object? checkpoint = _model.CheckpointRecurrentState();
-        object? mtpMark = mtpState is not null && mtpState.CurrentLength == boundary ? mtpState.MarkPrefix() : null;
-        var old = _recurrentPrefix;
-        _recurrentPrefix = new RecurrentPrefixEntry(promptIds.AsSpan(0, boundary).ToArray(), kvCache, checkpoint,
-            mtpMark is null ? null : mtpState, mtpMark);
-        // A hit that moves its snapshot forward hands the same KV (and, decoding with MTP, the same head state) to the new
-        // entry, and the request still runs on both: release only what nothing uses any more.
-        old?.Release(keepKv: kvCache, keepMtp: mtpState);
+        if (_tieredSnapshots is not null)
+        {
+            if (isBoundary) _tieredSnapshots.TryCapture(promptIds, kvCache, position);
+            return false;
+        }
+
+        var entry = ReferenceEquals(_recurrentPrefix?.Kv, kvCache) ? _recurrentPrefix : null;
+        if (!isBoundary && (_stepBudgetBytes > 0 && _checkpointBytes > _stepBudgetBytes
+            || entry is not null && entry.Points.Count > 0 && entry.Points[^1].Position >= position))
+            return entry is not null;
+
+        object? checkpoint;
+        try { checkpoint = _model.CheckpointRecurrentState(); }
+        catch (DeviceMemoryAdmissionException) when (!isBoundary) { return entry is not null; }
+
+        if (entry is null)
+        {
+            // A new history (a miss) replaces the old entry. A hit hands the same KV (and, decoding with MTP, the same head
+            // state) on, and the request still runs on both: release only what nothing uses any more.
+            var old = _recurrentPrefix;
+            entry = _recurrentPrefix = new RecurrentPrefixEntry(kvCache);
+            old?.Release(keepKv: kvCache, keepMtp: mtpState);
+        }
+
+        if (isBoundary)
+        {
+            // Without steps the entry keeps exactly one checkpoint, as before #1286; with them the old boundary becomes a step.
+            for (int i = entry.Points.Count - 1; i >= 0; i--)
+            {
+                if (_stepTokens == 0) entry.RemoveAt(i);
+                else if (!entry.Points[i].Step) entry.Points[i] = entry.Points[i] with { Step = true };
+            }
+            object? mtpMark = mtpState is not null && mtpState.CurrentLength == position ? mtpState.MarkPrefix() : null;
+            if (entry.Mtp is not null && !ReferenceEquals(entry.Mtp, mtpState)) entry.Mtp.Dispose();
+            entry.Mtp = mtpMark is null ? null : mtpState;
+            entry.MtpMark = mtpMark;
+            entry.MtpPosition = position;
+        }
+
+        entry.Points.Add(new RecurrentCheckpoint(position, checkpoint, Step: !isBoundary));
+        if (entry.Tokens.Length < position) entry.Tokens = promptIds.AsSpan(0, position).ToArray();
+
+        // Newest (deepest) steps are kept: the shallowest go first when over the count or byte budget.
+        while (entry.StepCount > _maxStepCheckpoints
+               || _stepBudgetBytes > 0 && entry.StepCount * _checkpointBytes > _stepBudgetBytes)
+            entry.RemoveAt(entry.Points.FindIndex(p => p.Step));
+        return true;
     }
 
     /// <summary>
@@ -2059,13 +2195,15 @@ public sealed partial class TextGenerator
     /// </summary>
     private ITensor ForwardPrefill(int[] promptIds, int prefillStart, int prefillLen,
         Core.Attention.IKvCache kvCache, ILoraAdapter? adapter, DotLLM.Core.Models.IMtpState? mtpState = null,
-        int snapshotAt = -1, Action? onSnapshotPoint = null, CancellationToken cancellationToken = default)
+        int snapshotAt = -1, Action<int, bool>? onCheckpoint = null, int stepTokens = 0,
+        CancellationToken cancellationToken = default)
     {
         int configured = EffectivePrefillChunkSize;
         int chunkSize = configured > 0 ? Math.Min(configured, prefillLen) : prefillLen;
         int[] positionsArray = ArrayPool<int>.Shared.Rent(chunkSize);
         ITensor? logits = null;
         PrefillPulse? pulse = RequestTimingLog.BeginPrefill(prefillLen); // null (free) unless timing logs are on (#1288)
+        int end = prefillStart + prefillLen;
         try
         {
             int offset = 0;
@@ -2073,10 +2211,14 @@ public sealed partial class TextGenerator
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 int len = Math.Min(chunkSize, prefillLen - offset);
-                // A recurrent-prefix snapshot needs a forward boundary exactly at snapshotAt.
+                // A recurrent-prefix snapshot needs a forward boundary exactly at snapshotAt, and a step checkpoint (#1286) at
+                // every multiple of the step inside the prefill.
                 int absolute = prefillStart + offset;
-                if (snapshotAt > absolute && snapshotAt < prefillStart + prefillLen)
+                if (snapshotAt > absolute && snapshotAt < end)
                     len = Math.Min(len, snapshotAt - absolute);
+                int nextStep = stepTokens > 0 ? (absolute / stepTokens + 1) * stepTokens : int.MaxValue;
+                if (nextStep < end)
+                    len = Math.Min(len, nextStep - absolute);
                 Span<int> positions = positionsArray.AsSpan(0, len);
                 for (int i = 0; i < len; i++)
                     positions[i] = prefillStart + offset + i;
@@ -2093,8 +2235,10 @@ public sealed partial class TextGenerator
 
                 // Forward returned host logits, so the device has finished this chunk: count completed work, not queued.
                 pulse?.Advance(len);
-                if (onSnapshotPoint is not null && prefillStart + offset == snapshotAt)
-                    onSnapshotPoint();
+                int reached = prefillStart + offset;
+                if (onCheckpoint is not null
+                    && (reached == snapshotAt || stepTokens > 0 && reached < end && reached % stepTokens == 0))
+                    onCheckpoint(reached, reached == snapshotAt);
             }
             return logits!;
         }

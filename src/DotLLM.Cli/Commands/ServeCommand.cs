@@ -328,10 +328,20 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [Description("Snapshot spill budget, such as 32GiB; requires a disk directory. Default 0 disables disk retention.")]
         public string? PrefixSnapshotDiskBudget { get; set; }
 
+        /// <summary>Mid-history resume step (issue #1286).</summary>
+        [CommandOption("--prompt-cache-step")]
+        [Description("Recurrent-state checkpoint every N prefill tokens, so a prompt that diverges mid-history (a trimmed tool result) resumes from the nearest one. Default 0 (off).")]
+        public int PromptCacheStep { get; set; }
+
+        /// <summary>Most mid-history step checkpoints kept.</summary>
+        [CommandOption("--prompt-cache-step-keep")]
+        [Description("Most --prompt-cache-step checkpoints kept, deepest first (default 8).")]
+        public int? PromptCacheStepKeep { get; set; }
+
         /// <inheritdoc/>
         public override ValidationResult Validate()
         {
-            try { ServerOptions.BuildPrefixSnapshotOptions(PrefixSnapshots, PrefixSnapshotHostBudget, PrefixSnapshotDiskDirectory, PrefixSnapshotDiskBudget); }
+            try { ServerOptions.BuildPrefixSnapshotOptions(PrefixSnapshots, PrefixSnapshotHostBudget, PrefixSnapshotDiskDirectory, PrefixSnapshotDiskBudget, PromptCacheStep, PromptCacheStepKeep); }
             catch (ArgumentException ex) { return ValidationResult.Error(ex.Message); }
             return base.Validate();
         }
@@ -526,6 +536,8 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             PrefixSnapshotHostBudgetBytes = ServerOptions.ParsePrefixSnapshotHostBudget(settings.PrefixSnapshotHostBudget),
             PrefixSnapshotDiskDirectory = settings.PrefixSnapshotDiskDirectory,
             PrefixSnapshotDiskBudgetBytes = ServerOptions.ParsePrefixSnapshotDiskBudget(settings.PrefixSnapshotDiskBudget),
+            PromptCacheStep = settings.PromptCacheStep,
+            PromptCacheStepKeep = settings.PromptCacheStepKeep,
             ContextSize = settings.CtxSize is > 0 ? settings.CtxSize : null,
             KeepAliveSeconds = settings.KeepAlive,
             MaxResidentModels = settings.MaxResidentModels,
