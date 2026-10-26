@@ -253,6 +253,7 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
     /// </summary>
     public void WaitAll()
     {
+        DirectStorage.DirectWeightStore.TryGet(_device)?.WaitAll();
         for (int i = 0; i < _slots.Length; i++)
         {
             if (_slots[i] is not { InFlight: true } slot) continue;
@@ -440,6 +441,7 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
         if (_disposed) return;
         _disposed = true;
         WaitAll();
+        DirectStorage.DirectWeightStore.TryGet(_device)?.Seal();   // #1304: end of load - reads landed, DirectStorage queue and ring freed
         if (s_trace)
         {
             Console.Error.WriteLine(

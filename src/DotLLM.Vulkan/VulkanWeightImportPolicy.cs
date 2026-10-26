@@ -70,6 +70,21 @@ internal static class VulkanWeightImportPolicy
 
     private static readonly List<(nint Pointer, long Bytes)> s_stagedRanges = [];
 
+    /// <summary>Tensors below this size are not worth a DirectStorage request and a sub-buffer of their own (#1304).</summary>
+    private const long DirectMinTensorBytes = 64 * 1024;
+
+    /// <summary>Tensors loaded straight from the GGUF into device-local memory with DirectStorage on the current load (#1304).</summary>
+    public static int DirectTensorCount { get; private set; }
+
+    /// <summary>Bytes loaded with DirectStorage on the current load (#1304).</summary>
+    public static long DirectBytes { get; private set; }
+
+    /// <summary>First reason a tensor was declined by the DirectStorage tier on the current load (empty when none was); for the load log.</summary>
+    public static string FirstDirectDecline { get; private set; } = string.Empty;
+
+    /// <summary>Tensors the DirectStorage tier declined on the current load.</summary>
+    public static int DirectDeclinedCount { get; private set; }
+
     // Host-only ranges (#818): source tensors that must NEVER reach the device. The Qwen4-Exp n-gram table is one 28.8 GB tensor in
     // the same mapping as the weights; importing or staging it would flip a ~80 GB model past the resident capacity (the 122B
     // WDDM-thrash class). Survives Reset() (that clears the per-load ledger, not a model-lifetime policy); guarded in TryImport,
@@ -150,6 +165,10 @@ internal static class VulkanWeightImportPolicy
     {
         ImportedTensorCount = 0;
         ImportedBytes = 0;
+        DirectTensorCount = 0;
+        DirectBytes = 0;
+        FirstDirectDecline = string.Empty;
+        DirectDeclinedCount = 0;
         StagedTensorCount = 0;
         StagedBytes = 0;
         LastFallbackReason = string.Empty;
@@ -168,6 +187,26 @@ internal static class VulkanWeightImportPolicy
         ArgumentNullException.ThrowIfNull(device);
         buf = null;
         ThrowIfHostOnly(srcPtr, bytes);
+
+        // #1304: the fast tier. DirectStorage reads the tensor from the file straight into an imported D3D12 heap, i.e. into
+        // device-local memory: no page-cache or process-private duplicate, and device-local speed under weight reuse (file-backed
+        // host pages are ~2x slower). It is not an alias of the mmap, so it does not count as an import and does not block
+        // releasing the whole host mapping (#438). Anything it declines falls through to the paths below.
+        if (DirectStorage.DirectWeightStore.Enabled && !IsDisabled && bytes >= DirectMinTensorBytes)
+        {
+            var direct = DirectStorage.DirectWeightStore.For(device);
+            if (direct is not null && direct.TryLoad(srcPtr, bytes, out buf))
+            {
+                DirectTensorCount++;
+                DirectBytes += bytes;
+                LastFallbackReason = string.Empty;
+                return true;
+            }
+            DirectDeclinedCount++;
+            if (FirstDirectDecline.Length == 0)
+                FirstDirectDecline = direct is null ? "unavailable:" + DirectStorage.DirectWeightStore.UnavailableReason(device) : direct.LastFallbackReason;
+            LastFallbackReason = "direct_storage:" + FirstDirectDecline;
+        }
 
         // HasExternalMemoryHost also covers the #507 UMA gate indirectly: on a discrete
         // GPU the extension may be present but TrySelectHostImportMemoryType refuses, and
@@ -260,6 +299,8 @@ internal static class VulkanWeightImportPolicy
     /// <summary>One-line ledger for load-time diagnostics and the #508 A/B.</summary>
     public static string Summary()
         => $"host-import: {ImportedTensorCount} tensors / {ImportedBytes / (1024.0 * 1024.0):F1} MiB aliased; " +
+           $"{DirectTensorCount} tensors / {DirectBytes / (1024.0 * 1024.0):F1} MiB direct-storage" +
+           (DirectDeclinedCount > 0 ? $" ({DirectDeclinedCount} declined, first: {FirstDirectDecline})" : string.Empty) + "; " +
            $"{StagedTensorCount} tensors / {StagedBytes / (1024.0 * 1024.0):F1} MiB staged" +
            (LastFallbackReason.Length > 0 ? $" (last fallback: {LastFallbackReason})" : string.Empty) +
            $"; whole-mapping release {(MayReleaseWholeHostMapping ? "permitted" : "blocked")}";

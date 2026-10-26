@@ -22,6 +22,8 @@
     <!-- Analyzers (tests/ only for now — see tests/Directory.Build.props) -->
     <PackageVersion Include="IDisposableAnalyzers" Version="4.0.8" />
     <PackageVersion Include="Meziantou.Analyzer" Version="3.0.123" />
+    <!-- Windows DirectStorage redistributable DLLs (native-only; see DotLLM.Vulkan.csproj, #1304) -->
+    <PackageVersion Include="Microsoft.Direct3D.DirectStorage" Version="1.3.0" />
     <!-- Versioning -->
     <PackageVersion Include="MinVer" Version="6.0.0" />
   </ItemGroup>

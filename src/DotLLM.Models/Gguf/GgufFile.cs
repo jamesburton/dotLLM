@@ -339,6 +339,34 @@ public sealed class GgufFile : IDisposable
         return false;
     }
 
+    /// <summary>
+    /// Maps an address inside any open <see cref="GgufFile"/>'s tensor data back to the file it came from and the byte offset
+    /// of that address in the file. For the Windows DirectStorage weight load (#1304), which reads the same bytes straight
+    /// from disk into device memory instead of through this mapping.
+    /// </summary>
+    /// <param name="pointer">Start of the range inside a mapped GGUF's data.</param>
+    /// <param name="bytes">Length of the range.</param>
+    /// <param name="path">Full path of the shard file that contains the range.</param>
+    /// <param name="fileOffset">Offset of <paramref name="pointer"/> from the start of that file.</param>
+    /// <returns>False when the range is not entirely inside one open mapping.</returns>
+    public static bool TryResolveFileRange(nint pointer, long bytes, out string path, out long fileOffset)
+    {
+        path = string.Empty;
+        fileOffset = 0;
+        if (pointer == 0 || bytes <= 0)
+            return false;
+        lock (Shard.LiveLock)
+        {
+            foreach (var shard in Shard.Live)
+                if (shard.TryResolve(pointer, bytes, out fileOffset))
+                {
+                    path = shard.Path;
+                    return true;
+                }
+        }
+        return false;
+    }
+
     /// <summary>Unmaps a view returned by <see cref="TryMapImportAlias"/> (e.g. when the import still failed).</summary>
     /// <param name="alias">The alias address.</param>
     public static void ReleaseImportAlias(nint alias)
@@ -562,6 +590,19 @@ public sealed class GgufFile : IDisposable
             view.SafeMemoryMappedViewHandle.AcquirePointer(ref viewPointer);
             alias = (nint)(viewPointer + view.PointerOffset);
             _aliases.Add(alias, view);
+            return true;
+        }
+
+        /// <summary>The file offset of <c>[pointer, pointer + bytes)</c> when it lies inside this shard's mapping (the whole file is mapped from offset 0).</summary>
+        public bool TryResolve(nint pointer, long bytes, out long fileOffset)
+        {
+            fileOffset = 0;
+            if (_accessor is null)
+                return false;
+            long offset = (long)((byte*)pointer - _basePointer) - _accessor.PointerOffset;
+            if (offset < 0 || offset + bytes > _mappedLength)
+                return false;
+            fileOffset = offset;
             return true;
         }
 

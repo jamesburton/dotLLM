@@ -924,3 +924,44 @@ See [ROADMAP.md](ROADMAP.md) Phase 4 for the full plan.
 ### Vulkan: token-embedding table larger than maxStorageBufferRange (#772)
 
 The widened F32 token-embedding table of `Qwen3HybridDense` (`VulkanQwen3HybridDenseWeights`) is held as row-chunk buffers (`VulkanChunkedRowTable`), each at most the device's queried `maxStorageBufferRange` (4 GiB - 1 on RADV/AMD). Qwen3.8-27B (248320 x 5120 x 4 B = 5.08 GB) loads as 2 chunks; a table that fits is a single chunk (unchanged path). The gather is the same per-token `vkCmdCopyBuffer`, source chunk = `id / rowsPerChunk`. The LM head stays packed (Q6_K ~1 GB) and is bound whole. Since #779 the same table also backs the standard `VulkanWeights` embedding (when it would not stay Q8_0-resident), the Qwen3-MoE-hybrid table and the MTP head-local table. Still single-buffer: Mamba3 and Nemotron-H (small vocab x hidden). `DOTLLM_VULKAN_EMBED_CHUNK_LIMIT_BYTES` forces a smaller limit on a real model for diagnosis. CUDA/CPU have no 32-bit range limit (64-bit pointers). Test hook: `VulkanChunkedRowTable.LimitOverrideBytes`.
+
+## Windows DirectStorage weight load (Vulkan, #1304)
+
+`DOTLLM_VULKAN_DIRECT_STORAGE=1` (opt-in until the A/B is recorded) loads as-is weight tensors **from the GGUF file straight
+into device-local memory**: DirectStorage reads the file range into a shared D3D12 default heap, and Vulkan imports that heap
+(`VK_KHR_external_memory_win32`, `D3D12_HEAP` handle type) as an ordinary device-local allocation. Tensors are sub-buffers of
+those heaps, like a `VulkanWeightArena` slab. Pure C#: hand-rolled COM vtable interop (`src/DotLLM.Vulkan/DirectStorage/`), no
+native shim; only Microsoft's `dstorage.dll` / `dstoragecore.dll` are native (Windows-only conditional `PackageReference`
+`Microsoft.Direct3D.DirectStorage`, copied next to the assembly and packed under `runtimes/win-x64/native`).
+
+Why it exists (#1250, spike `tools/d3d12-vk-import-spike`): importing the mmap'd file pages (read-only, copy-on-write or writable
+alias) cannot match device-local speed under weight reuse - file-backed host pages ran ~2x slower than device-local in a reuse
+micro-benchmark (Qwen3.8 dense pp512 -52%, MoE models unaffected) - while a D3D12 default heap imported into Vulkan runs at
+device-local speed, and the load leaves no process-private or page-cache duplicate (rule 3).
+
+```
+VulkanWeightImportPolicy.TryImport(device, srcPtr, bytes)        (every weight loader goes through it)
+  └── DirectWeightStore.TryLoad            (first tier; >= 64 KiB; Windows + DOTLLM_VULKAN_DIRECT_STORAGE=1)
+        ├── GgufFile.TryResolveFileRange   srcPtr -> (file, offset)
+        ├── place: tensors >= 16 MiB get an exactly-sized heap, smaller ones are first-fit into 128 MiB slabs
+        ├── D3D12 CreateHeap(DEFAULT, SHARED) + placed buffer resource + CreateSharedHandle   (adapter matched by Vulkan LUID)
+        ├── VulkanDevice.TryImportD3D12Heap  vkAllocateMemory(VkImportMemoryWin32HandleInfoKHR), strictly device-local type
+        └── DirectStorage EnqueueRequest(file -> buffer, 16 MiB requests) + Submit      (asynchronous)
+  VulkanStagingBuffer.WaitAll / Dispose  ->  DirectWeightStore.WaitAll (fence) / Seal   (a failed read throws: weights incomplete)
+  any decline (reason in the load log) -> the existing import / staging paths, unchanged
+```
+
+- **Fallbacks, never errors:** not Windows, no `VK_KHR_external_memory_win32`, `dstorage.dll` missing, adapter/LUID not matched,
+  file held open for write elsewhere (sharing violation), heap creation fails, tensor repacked/converted (those never reach
+  `TryImport`). `DOTLLM_VULKAN_DISABLE_HOST_IMPORT=1` also disables the tier.
+- **One host buffer:** DirectStorage's own bounded staging ring (`DOTLLM_VULKAN_DS_STAGING_MIB`, default 64), created per load and
+  freed at `Seal`. Signed off by the user on 2026-10-26.
+- **Load log:** `DOTLLM_VULKAN_MEM_TRACE=1` prints `N tensors / X MiB direct-storage (M declined, first: reason)` next to the
+  aliased and staged totals.
+- **Lifetime:** each heap is freed (Vulkan memory, then the D3D12 resource and heap) when its last tensor is disposed.
+- **Measured (Strix 8060S, Qwen3.8-27B Q4_K_M, interleaved):** process private 19.1 GiB -> 0.87 GiB, device heap 18,276 -> 18,339 MiB
+  (+0.3%, slab tails), load 14.8-15.8 s -> 9.7-11.8 s, decode 10.4-10.5 -> 10.3-10.4 tok/s, pp512 within noise. Greedy text identical
+  on Qwen3.8, Bolt and Flint. Bolt: process private 21.8 -> 0.79 GiB, heap equal, pp512 466 -> 512, tg equal. Flint: private 24.2 -> 0.7 GiB,
+  heap +123 MiB (0.5%), pp512 ~1820 -> ~2110, tg equal, load 19.3 -> 14.6 s (`DOTLLM_MEM_PROBE=1` adds seconds of page census to a
+  load and distorts load-time A/Bs; staging ring 32-512 MiB and request size 4-128 MiB made <= 1 s difference, so the defaults stand).
+  Details: #1304 and #1250.

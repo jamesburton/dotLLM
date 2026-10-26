@@ -246,6 +246,12 @@ public sealed class VulkanDevice : IDisposable
     public bool HasExternalSemaphoreWin32 { get; }
 
     /// <summary>
+    /// True when <c>VK_KHR_external_memory_win32</c> was enabled at device creation, so a shared D3D12 heap can be imported as
+    /// device memory (#1304, <see cref="DotLLM.Vulkan.DirectStorage.DirectWeightStore"/>).
+    /// </summary>
+    internal bool HasExternalMemoryWin32 { get; private set; }
+
+    /// <summary>
     /// True when the physical device advertises <c>VK_AMD_shader_info</c> AND
     /// the device-create call enabled it. Prerequisite for
     /// <see cref="GetShaderStatisticsAmd"/>, which queries the driver's actual
@@ -564,6 +570,11 @@ public sealed class VulkanDevice : IDisposable
                 // Falls back silently when absent — caller checks HasExternalSemaphoreWin32.
                 ProbeExternalSemaphoreWin32(physical, apiVersion, out bool hasExternalSemaphoreWin32);
 
+                // Probe VK_KHR_external_memory_win32 (Win32 only): imports a shared D3D12 heap filled by DirectStorage as
+                // device-local weight memory (#1304). Falls back silently when absent — caller checks HasExternalMemoryWin32.
+                bool hasExternalMemoryWin32 = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                    && HasDeviceExtension(physical, "VK_KHR_external_memory_win32"u8);
+
                 // Probe VK_AMD_shader_info — vendor extension, no feature bits, no
                 // Vulkan-version gate. Just an extension-presence check; enabling
                 // it at device-create is what makes vkGetShaderInfoAMD resolvable.
@@ -583,7 +594,7 @@ public sealed class VulkanDevice : IDisposable
                 nint device = CreateLogicalDevice(
                     physical, queueFamily, hasCoopmat, hasExternalMemoryHost, hasIntegerDotProduct,
                     hasSubgroupSizeControl, hasExternalSemaphoreWin32, hasShaderInfoAmd,
-                    hasPipelineExecutableProperties, numeric);
+                    hasPipelineExecutableProperties, numeric, hasExternalMemoryWin32);
 
                 VulkanApi.vkGetDeviceQueue(device, queueFamily, 0, out nint queue);
 
@@ -607,6 +618,7 @@ public sealed class VulkanDevice : IDisposable
                     hasPipelineExecutableProperties);
                 result.PhysicalDeviceIndex = IndexOfPhysicalDevice(instance, physical);
                 result.NumericFeatures = numeric;
+                result.HasExternalMemoryWin32 = hasExternalMemoryWin32;
                 instance = 0;
                 return result;
             }
@@ -1357,7 +1369,7 @@ public sealed class VulkanDevice : IDisposable
         nint physical, uint queueFamily,
         bool enableCoopmat, bool enableExternalMemoryHost, bool enableIntegerDotProduct,
         bool enableSubgroupSizeControl, bool enableExternalSemaphoreWin32, bool enableShaderInfoAmd,
-        bool enablePipelineExecutableProperties, VulkanNumericFeatures numeric)
+        bool enablePipelineExecutableProperties, VulkanNumericFeatures numeric, bool enableExternalMemoryWin32 = false)
     {
         float priority = 1.0f;
 
@@ -1397,6 +1409,7 @@ public sealed class VulkanDevice : IDisposable
         ReadOnlySpan<byte> extSemWin32Name = "VK_KHR_external_semaphore_win32\0"u8;
         ReadOnlySpan<byte> shaderInfoAmdName = "VK_AMD_shader_info\0"u8;
         ReadOnlySpan<byte> pipeExecName = "VK_KHR_pipeline_executable_properties\0"u8;
+        ReadOnlySpan<byte> extMemWin32Name = "VK_KHR_external_memory_win32\0"u8;
 
         // Pack name bytes + pointer array onto the stack. Worst case all eight
         // extension names are enabled at once (coopmat, external-memory ×2,
@@ -1409,8 +1422,8 @@ public sealed class VulkanDevice : IDisposable
             coopmatName.Length + extMemHostName.Length + extMemName.Length
             + intDotName.Length + sscName.Length
             + extSemName.Length + extSemWin32Name.Length + shaderInfoAmdName.Length
-            + pipeExecName.Length];
-        nint* namePtrs = stackalloc nint[9];
+            + pipeExecName.Length + extMemWin32Name.Length];
+        nint* namePtrs = stackalloc nint[11];
         int nameOffset = 0;
         uint extCount = 0;
 
@@ -1478,6 +1491,21 @@ public sealed class VulkanDevice : IDisposable
             for (int i = 0; i < pipeExecName.Length; i++) nameBytes[nameOffset + i] = pipeExecName[i];
             namePtrs[extCount++] = (nint)(nameBytes + nameOffset);
             nameOffset += pipeExecName.Length;
+        }
+
+        if (enableExternalMemoryWin32)
+        {
+            // #1304: VK_KHR_external_memory_win32 depends on VK_KHR_external_memory; name it too unless the host-pointer block did.
+            if (!enableExternalMemoryHost)
+            {
+                for (int i = 0; i < extMemName.Length; i++) nameBytes[nameOffset + i] = extMemName[i];
+                namePtrs[extCount++] = (nint)(nameBytes + nameOffset);
+                nameOffset += extMemName.Length;
+            }
+
+            for (int i = 0; i < extMemWin32Name.Length; i++) nameBytes[nameOffset + i] = extMemWin32Name[i];
+            namePtrs[extCount++] = (nint)(nameBytes + nameOffset);
+            nameOffset += extMemWin32Name.Length;
         }
 
         // Feature structs chained through pNext on top of the extension enables:
@@ -1695,6 +1723,9 @@ public sealed class VulkanDevice : IDisposable
         /// <summary>Memory type of the backing allocation; <see cref="uint.MaxValue"/> when unknown (imports).</summary>
         internal uint TypeIndex { get; }
 
+        /// <summary>Runs once after this buffer's memory is freed (e.g. releases the D3D12 heap an imported allocation was backed by).</summary>
+        internal Action? FreeHook { get; set; }
+
         /// <summary>Byte offset of this buffer inside <see cref="Memory"/>; non-zero only for a sub-allocated buffer.</summary>
         public long MemoryOffset { get; }
 
@@ -1787,6 +1818,10 @@ public sealed class VulkanDevice : IDisposable
             {
                 s_lifecycleLock.ExitReadLock();
             }
+
+            var hook = FreeHook;
+            FreeHook = null;
+            hook?.Invoke();
         }
     }
 
@@ -1857,6 +1892,135 @@ public sealed class VulkanDevice : IDisposable
         if (s_memTrace)
             Console.Error.WriteLine($"[vulkan-mem] import {size} B {(import is null ? "refused" : "ok")} at {TraceSite()}");
         return import is null ? null : new Buffer(this, import);
+    }
+
+    // ── #1304: shared D3D12 heap import (VK_KHR_external_memory_win32) ──────────────────────────────
+
+    /// <summary><c>VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT</c>.</summary>
+    internal const uint ExternalMemoryHandleD3D12Heap = 0x20;
+
+    // Correct sType values (VkStructureType.ExternalMemoryBufferCreateInfo in VulkanStructs.cs holds 1000072002, which is
+    // EXPORT_MEMORY_ALLOCATE_INFO; the buffer struct is 1000072000 - filed separately, not touched here).
+    private const int StructExternalMemoryBufferCreateInfo = 1000072000;
+    private const int StructImportMemoryWin32HandleInfoKhr = 1000073000;
+    private const int StructMemoryWin32HandlePropertiesKhr = 1000073002;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct VkMemoryWin32HandlePropertiesKhr
+    {
+        public int sType;
+        public nint pNext;
+        public uint memoryTypeBits;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct VkImportMemoryWin32HandleInfoKhr
+    {
+        public int sType;
+        public nint pNext;
+        public uint handleType;
+        public nint handle;
+        public nint name;
+    }
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int VkGetMemoryWin32HandlePropertiesKHR(
+        nint device, uint handleType, nint handle, ref VkMemoryWin32HandlePropertiesKhr pProperties);
+
+    /// <summary>
+    /// Imports a shared D3D12 heap (a Win32 handle from <c>ID3D12Device::CreateSharedHandle</c>) as one device allocation and
+    /// returns a whole-heap slab buffer bound to it; weight tensors are carved from it as sub-buffers like a
+    /// <see cref="VulkanWeightArena"/> slab (#1304). Only a strictly device-local memory type is accepted: the point of the
+    /// route is that the weights end up in the same memory a plain <see cref="AllocateDeviceLocal"/> would use.
+    /// </summary>
+    /// <param name="sharedHandle">Win32 handle of the D3D12 heap. The caller keeps ownership and closes it after the import.</param>
+    /// <param name="bytes">Heap size in bytes (must match the D3D12 heap).</param>
+    /// <param name="reason">Why the import was refused, when it returns null.</param>
+    /// <returns>The slab buffer, or null when the driver refused the import.</returns>
+    internal unsafe Buffer? TryImportD3D12Heap(nint sharedHandle, long bytes, out string reason)
+    {
+        reason = string.Empty;
+        if (!HasExternalMemoryWin32) { reason = "no_external_memory_win32"; return null; }
+        nint fn = VulkanApi.vkGetDeviceProcAddr(_device, "vkGetMemoryWin32HandlePropertiesKHR");
+        if (fn == 0) { reason = "no_handle_properties_proc"; return null; }
+        var getProps = Marshal.GetDelegateForFunctionPointer<VkGetMemoryWin32HandlePropertiesKHR>(fn);
+
+        s_lifecycleLock.EnterReadLock();
+        try
+        {
+            var ext = new VkExternalMemoryBufferCreateInfo
+            {
+                sType = StructExternalMemoryBufferCreateInfo,
+                handleTypes = ExternalMemoryHandleD3D12Heap,
+            };
+            var bci = new VkBufferCreateInfo
+            {
+                sType = VkStructureType.BufferCreateInfo,
+                pNext = (nint)(&ext),
+                size = (ulong)bytes,
+                usage = BufferUsage,
+                sharingMode = VkSharingMode.Exclusive,
+            };
+            int cr = VulkanApi.vkCreateBuffer(_device, bci, 0, out nint buffer);
+            if (cr < 0) { reason = $"vkCreateBuffer({cr})"; return null; }
+
+            VulkanApi.vkGetBufferMemoryRequirements(_device, buffer, out var req);
+            var props = new VkMemoryWin32HandlePropertiesKhr { sType = StructMemoryWin32HandlePropertiesKhr };
+            int pr = getProps(_device, ExternalMemoryHandleD3D12Heap, sharedHandle, ref props);
+            if (pr < 0 || (ulong)bytes < req.size)
+            {
+                VulkanApi.vkDestroyBuffer(_device, buffer, 0);
+                reason = pr < 0 ? $"handle_properties({pr})" : "heap_smaller_than_requirements";
+                return null;
+            }
+
+            uint bits = req.memoryTypeBits & props.memoryTypeBits;
+            if (!TryFindMemoryType(bits, VkMemoryPropertyFlags.DeviceLocal, VkMemoryPropertyFlags.HostVisible, out uint typeIndex)
+                && !TryFindMemoryType(bits, VkMemoryPropertyFlags.DeviceLocal, default, out typeIndex))
+            {
+                VulkanApi.vkDestroyBuffer(_device, buffer, 0);
+                reason = $"no_device_local_type(bits=0x{bits:X})";
+                return null;
+            }
+
+            var import = new VkImportMemoryWin32HandleInfoKhr
+            {
+                sType = StructImportMemoryWin32HandleInfoKhr,
+                handleType = ExternalMemoryHandleD3D12Heap,
+                handle = sharedHandle,
+            };
+            var mai = new VkMemoryAllocateInfo
+            {
+                sType = VkStructureType.MemoryAllocateInfo,
+                pNext = (nint)(&import),
+                allocationSize = (ulong)bytes,
+                memoryTypeIndex = typeIndex,
+            };
+            int ar = VulkanApi.vkAllocateMemory(_device, mai, 0, out nint memory);
+            if (ar < 0)
+            {
+                VulkanApi.vkDestroyBuffer(_device, buffer, 0);
+                reason = $"vkAllocateMemory({ar})";
+                return null;
+            }
+            int br = VulkanApi.vkBindBufferMemory(_device, buffer, memory, 0);
+            if (br < 0)
+            {
+                VulkanApi.vkFreeMemory(_device, memory, 0);
+                VulkanApi.vkDestroyBuffer(_device, buffer, 0);
+                reason = $"vkBindBufferMemory({br})";
+                return null;
+            }
+
+            uint heap = HeapOfType(typeIndex);
+            Interlocked.Add(ref _liveBytesByHeap[heap], bytes);
+            Interlocked.Increment(ref _liveCountByHeap[heap]);
+            return new Buffer(this, buffer, memory, bytes, hostVisible: false, heap, bytes, typeIndex);
+        }
+        finally
+        {
+            s_lifecycleLock.ExitReadLock();
+        }
     }
 
     /// <summary>VkResult VK_ERROR_OUT_OF_DEVICE_MEMORY.</summary>
@@ -3054,6 +3218,8 @@ public sealed class VulkanDevice : IDisposable
             // below can.
             VulkanApi.vkDeviceWaitIdle(_device);
         }
+
+        DotLLM.Vulkan.DirectStorage.DirectWeightStore.Forget(this);
 
         // #369: vkDestroyDevice/vkDestroyInstance are the teardown half of
         // the same loader-level create-vs-allocate race that crashed
