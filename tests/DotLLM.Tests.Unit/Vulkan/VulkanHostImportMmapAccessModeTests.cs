@@ -72,6 +72,7 @@ public class VulkanHostImportMmapAccessModeTests(ITestOutputHelper output)
         using var device = VulkanDevice.Create();
         Skip.IfNot(device.HasExternalMemoryHost,
             "Driver does not expose VK_EXT_external_memory_host on this host.");
+        VulkanHostImportGate.SkipUnlessImportPermitted(device);
 
         ulong alignment = Math.Max(4096UL, device.MinImportedHostPointerAlignment);
         long bytes = (long)alignment * 4;
