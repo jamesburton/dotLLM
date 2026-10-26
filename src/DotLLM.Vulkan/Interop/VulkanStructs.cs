@@ -40,7 +40,7 @@ internal static class VkStructureType
     // VK_KHR_external_memory / Vulkan 1.1 core — VkExternalMemoryBufferCreateInfo
     // chains off VkBufferCreateInfo.pNext to declare the buffer will be bound
     // to imported memory.
-    internal const int ExternalMemoryBufferCreateInfo = 1000072002;
+    internal const int ExternalMemoryBufferCreateInfo = 1000072000;
     // VK_EXT_external_memory_host extension structures.
     // Drives the host-mmap zero-copy weight path (see MemoryDomain.HostVisibleZeroCopy
     // / HostVisibleBuffer). The Properties struct carries

@@ -33,8 +33,7 @@ public class HostVisibleBufferTests
     /// where the import must be refused so the caller stages into VRAM.
     /// </summary>
     private static bool ExpectsZeroCopyImport(VulkanDevice device)
-        => device.PhysicalDeviceTypeValue is VkPhysicalDeviceType.IntegratedGpu
-            or VkPhysicalDeviceType.Cpu;
+        => VulkanHostImportGate.PermitsImport(device);
 
     /// <summary>
     /// Asserts the #507-correct outcome for an import attempt: a live buffer on
