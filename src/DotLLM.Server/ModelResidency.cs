@@ -90,6 +90,9 @@ public sealed record ResidentModelInfo
 
     /// <summary>Seconds until auto-unload, or null when the keep-alive is negative (never expires).</summary>
     public double? ExpiresInSeconds { get; init; }
+
+    /// <summary>llama.cpp-shaped model metadata for <c>/v1/models</c> (#1289); null when unavailable.</summary>
+    public Models.ModelMetaDto? Meta { get; init; }
 }
 
 /// <summary>
@@ -239,6 +242,7 @@ public sealed class ModelResidencyManager : IDisposable
                     EffectiveKeepAliveSeconds = keepAlive,
                     EstimatedBytes = s.EstimatedBytes,
                     ExpiresInSeconds = expiresIn,
+                    Meta = ModelMeta.Build(s.Config, s.CurrentGguf),
                 };
             }).ToList();
         }

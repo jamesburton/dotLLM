@@ -249,6 +249,15 @@ Lists every **resident** model — the active one plus any stashed-but-loaded mo
 ```
 `expires_in_seconds` is omitted when the model's keep-alive is negative (pinned, never auto-unloads).
 
+Each loaded model also carries llama.cpp's `meta` object (#1289) under llama.cpp's field names, plus `n_ctx` (the
+window one request gets after the memory fit or `--ctx-size`) and `ftype` (dominant storage type and bits per weight
+measured from the tensor directory, not `general.file_type`):
+```json
+"meta": {"vocab_type": 2, "n_vocab": 49152, "n_ctx": 8192, "n_ctx_train": 8192, "n_embd": 576,
+         "n_params": 134515008, "size": 144811008, "ftype": "Q8_0 - 8.61 bpw"}
+```
+`meta` is omitted for the bare-server placeholder row (no model loaded).
+
 ### `GET /v1/models/{id}`
 Retrieves one model object — what the OpenAI SDK's `client.models.retrieve()` calls (#450). The
 route is a catch-all (`/v1/models/{**id}`) because ids are HuggingFace repo ids and contain `/`;
@@ -1259,7 +1268,9 @@ Ensures first real request doesn't pay JIT compilation or CUDA kernel loading pe
 
 ## Health & Readiness
 
-- `GET /health` — Returns 200 when server is running.
+- `GET /health` — Returns 200 when server is running. Once a model is loaded the body also carries
+  `max_context` (served window after the fit), `n_ctx_train`, `slots` (concurrent requests: the scheduler's
+  `MaxActiveSequences`, else 1) and `prompt_cache_active` (#1289): `{"status":"ok","max_context":8192,...}`.
 - `GET /ready` — Returns 200 only after warm-up completes and model is loaded. Used by load balancers.
 
 ## Security

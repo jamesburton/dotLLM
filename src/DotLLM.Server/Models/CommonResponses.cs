@@ -100,3 +100,34 @@ public sealed record StatusResponse
     [JsonPropertyName("status")]
     public required string Status { get; init; }
 }
+
+/// <summary>
+/// <c>GET /health</c> body (#1289): liveness <c>status</c> plus, once a model is loaded, the served
+/// context, slot count and prompt-cache state that clients size requests from.
+/// </summary>
+public sealed record HealthResponse
+{
+    /// <summary>Always <c>"ok"</c>; the endpoint stays a 200 liveness probe.</summary>
+    [JsonPropertyName("status")]
+    public required string Status { get; init; }
+
+    /// <summary>Context window one request gets (after any fit). Omitted when no model is loaded.</summary>
+    [JsonPropertyName("max_context")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? MaxContext { get; init; }
+
+    /// <summary>Checkpoint's trained context window. Omitted when no model is loaded.</summary>
+    [JsonPropertyName("n_ctx_train")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? NCtxTrain { get; init; }
+
+    /// <summary>Requests decoded concurrently. Omitted when no model is loaded.</summary>
+    [JsonPropertyName("slots")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? Slots { get; init; }
+
+    /// <summary>Whether a prompt/prefix cache is active. Omitted when no model is loaded.</summary>
+    [JsonPropertyName("prompt_cache_active")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? PromptCacheActive { get; init; }
+}

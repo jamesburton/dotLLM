@@ -887,6 +887,7 @@ public sealed class ServerState : IDisposable
                 EffectiveKeepAliveSeconds = keepAlive,
                 EstimatedBytes = EstimatedBytes,
                 ExpiresInSeconds = expiresIn,
+                Meta = ModelMeta.Build(Config, CurrentGguf),
             });
         }
         result.AddRange(Residency.Snapshot(now));
