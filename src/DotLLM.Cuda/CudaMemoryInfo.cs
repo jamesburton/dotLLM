@@ -60,8 +60,8 @@ public static unsafe class CudaMemoryInfo
                 if (_getHandleByPciBusId(p, &handle) != 0) return false;
             }
             if (_getMemoryInfo(handle, &mem) != 0) return false;
-            freeBytes = (long)mem.Free;
-            totalBytes = (long)mem.Total;
+            freeBytes = DotLLM.Core.Configuration.DeviceMemoryBudget.ClampSimulatedFree(ordinal, (long)mem.Free);   // #1295
+            totalBytes = DotLLM.Core.Configuration.DeviceMemoryBudget.ClampSimulatedCapacity((long)mem.Total);
             return true;
         }
         catch

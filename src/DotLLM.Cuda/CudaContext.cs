@@ -33,6 +33,11 @@ public sealed class CudaContext : IDisposable
         CudaDriverApi.cuInit(0).ThrowOnError();
         CudaDriverApi.cuDeviceGet(out int device, deviceId).ThrowOnError();
         CudaDriverApi.cuCtxCreate_v2(out nint ctx, 0, device).ThrowOnError();
+
+        // #1295: under DOTLLM_VRAM_BUDGET_MB, everything this context allocates from here on counts against the budget.
+        if (DotLLM.Core.Configuration.DeviceMemoryBudget.SimulatedBudgetBytes() is not null
+            && CudaDriverApi.cuMemGetInfoRaw(out nuint free, out _) == 0)
+            DotLLM.Core.Configuration.DeviceMemoryBudget.ResetSimulatedBaseline(device, (long)free);
         return new CudaContext(ctx, deviceId);
     }
 

@@ -60,4 +60,18 @@ public sealed class DeviceMemoryBudgetTests
         Assert.Contains("--ctx-size", m);
         Assert.Contains(DeviceMemoryBudget.ReserveEnvVar, m);
     }
+
+    /// <summary>
+    /// #1295: the simulated card has <c>budget</c> bytes when the baseline was taken; what this process allocated since then
+    /// is charged against it, and it never reports more than is really free.
+    /// </summary>
+    [Theory]
+    [InlineData(2000, 10000, 10000, 2000)]   // nothing allocated yet: the whole budget
+    [InlineData(2000, 10000, 9500, 1500)]    // 500 allocated since the baseline
+    [InlineData(2000, 10000, 7000, 0)]       // allocated past the budget: nothing left, never negative
+    [InlineData(2000, 10000, 1200, 0)]       // ... even as real free memory keeps falling
+    [InlineData(2000, 10000, 12000, 2000)]   // someone else freed memory: still capped at the budget
+    [InlineData(20000, 10000, 9000, 9000)]   // a budget above the card: real free wins
+    public void SimulatedFree_ChargesOwnAllocationsAgainstTheBudget(long budget, long baseline, long free, long expected)
+        => Assert.Equal(expected, DeviceMemoryBudget.SimulatedFree(budget, baseline, free));
 }

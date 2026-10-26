@@ -192,6 +192,53 @@ public sealed class CudaFlintCpuMoeTests : IDisposable
     }
 
     /// <summary>
+    /// #1295: under <c>DOTLLM_VRAM_BUDGET_MB</c> the <c>auto</c> planner reads a simulated small card through
+    /// <c>cuMemGetInfo</c>, so on any GPU it moves the routed experts to the CPU: bit-identical to asking for that placement
+    /// explicitly, and the same greedy tokens as the unconstrained (fully resident) run.
+    /// </summary>
+    [SkippableFact]
+    public void SimulatedVramBudget_AutoTakesCpuExpertPath_GreedyIdenticalToUnconstrained()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
+        using var gguf = GgufFile.Open(_path);
+        ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var auto = new MoeOffloadOptions { CpuThreads = 2 };
+
+        List<float[]> unconstrained, budgeted, explicitCpu;
+        bool streamWas = CudaTransformerModel.StreamCpuExperts;
+        CudaTransformerModel.StreamCpuExperts = false;   // the GPU leg's timing-based split would make the two CPU runs differ
+        try
+        {
+            unconstrained = RunCuda(gguf, cfg, auto, null);
+            Environment.SetEnvironmentVariable(DeviceMemoryBudget.SimulatedBudgetEnvVar, "256");   // < the 512 MiB auto reserve
+            budgeted = RunCuda(gguf, cfg, auto, expectedCpuLayers: 4);
+            Environment.SetEnvironmentVariable(DeviceMemoryBudget.SimulatedBudgetEnvVar, null);
+            explicitCpu = RunCuda(gguf, cfg, auto with { CpuMoeLayers = MoeOffloadOptions.AllLayers }, 4);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(DeviceMemoryBudget.SimulatedBudgetEnvVar, null);
+            CudaTransformerModel.StreamCpuExperts = streamWas;
+        }
+
+        for (int r = 0; r < budgeted.Count; r++)
+        {
+            Assert.Equal(Argmax(unconstrained[r]), Argmax(budgeted[r]));
+            for (int i = 0; i < budgeted[r].Length; i++)
+                Assert.True(BitConverter.SingleToInt32Bits(explicitCpu[r][i]) == BitConverter.SingleToInt32Bits(budgeted[r][i]),
+                    $"row {r} logit {i}: budget-planned {budgeted[r][i]} vs explicit --cpu-moe {explicitCpu[r][i]}");
+        }
+    }
+
+    private static int Argmax(float[] xs)
+    {
+        int best = 0;
+        for (int i = 1; i < xs.Length; i++)
+            if (xs[i] > xs[best]) best = i;
+        return best;
+    }
+
+    /// <summary>
     /// Device-routed decode (#1182): the resident grouped Q4_1 decode body with pointer arrays built on the device from the
     /// top-k ids must give logits bit-identical to the host-routed body (same kernels, same expert order).
     /// </summary>
