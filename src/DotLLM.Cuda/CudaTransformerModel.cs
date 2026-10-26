@@ -237,6 +237,12 @@ public sealed unsafe class CudaTransformerModel : IModel
     public bool UseGraphCapture { get; set; }
 
     /// <summary>
+    /// Every forward returns the last row's logits only (the LM head runs on one row), so a multi-token verify cannot be
+    /// checked row by row. Declared so speculative callers (prompt lookup, #1293) see it instead of reading past the buffer.
+    /// </summary>
+    public int MaxAllRowLogitsLength => 1;
+
+    /// <summary>
     /// Power of two the F16 residual stream is carried at on architectures whose residual nears the F16 range (Flint, #1191):
     /// default 1/8 (<c>DOTLLM_CUDA_RESIDUAL_SCALE</c>; 1 disables it for A/B). Exact: every residual read is an RMSNorm.
     /// </summary>

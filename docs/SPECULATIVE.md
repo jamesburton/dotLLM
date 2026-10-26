@@ -240,6 +240,10 @@ dotllm run qwen3.6-27b-mtp.gguf --no-mtp -p "Hello"
 # It takes the continuous-batch scheduler offline for that model; opt out with --no-mtp (--mtp is accepted but redundant)
 dotllm serve qwen3.6-27b-mtp.gguf
 dotllm serve qwen3.6-27b-mtp.gguf --no-mtp
+
+# Prompt lookup (n-gram drafting, #1293): no draft model; run, chat and serve
+dotllm run model.gguf --prompt-lookup --lookup-draft 8 --lookup-ngram 6 -p "Rewrite this function: ..."
+dotllm serve model.gguf --prompt-lookup
 ```
 
 `--draft-model` and `--draft-tokens` are accepted as aliases of `--speculative-model` and
@@ -258,6 +262,46 @@ The serve UI shows three-state compatibility feedback when selecting a draft mod
 - **Red**: incompatible (different tokenizer family)
 
 Speculative metrics (`acceptance rate`, `drafted`, `accepted`) appear in the stats bar and the hover card.
+
+## Prompt-lookup (n-gram) drafting (issue #1293)
+
+`--prompt-lookup` (alias `--lookup`) drafts without a draft model: the longest suffix of prompt + output (up to
+`--lookup-ngram`, default 6, down to 2 tokens) is looked up in earlier context, and the up to `--lookup-draft` (default 8)
+tokens that followed its latest occurrence are proposed. When the match overlaps the suffix (a periodic run) the
+continuation repeats the period. The drafts go through `SpeculativeDecoder`'s verify/accept path unchanged
+(`LookupAndVerify` → shared `Verify`), so greedy output is token-identical to plain decode; a lookup miss is a one-row
+plain step, with no recurrent checkpoint.
+
+- **Index** (`PromptLookupDrafter`): a hash chain keyed by the 2-gram ending at each position (`head[bucket]` = latest
+  position, `prev[i]` = the previous one in the bucket). Append is O(1); a lookup walks at most 64 candidates newest first
+  and confirms each by comparing tokens, so bucket collisions never match. Buffers are pooled and sized once to the KV
+  capacity; the decode loop allocates nothing.
+- **When it engages**: greedy requests with no logprobs, no draft model and no MTP round (both take priority), on a backend
+  whose verify forward returns every row's logits (`IModel.MaxAllRowLogitsLength > 1` after `TrySetAllRowLogitsLimit`). The
+  dense CUDA model (`CudaTransformerModel`) computes the LM head on the last row only, so lookup stays off there; its
+  hybrid models, CPU and Vulkan qualify. `serve` takes the continuous-batch scheduler offline while it is on, as for a draft
+  model. Settings: `ServerOptions.PromptLookup`; per-request override not yet.
+- **Stats**: `speculative_draft_tokens` / `speculative_accepted_tokens` count drafts and accepted drafts only (the round's
+  bonus/correction token is the target's own); this now holds for the draft-model loop too.
+
+**Measured** (greedy, 200 tokens, Llama-3.2-1B-Instruct Q8_0, prompt "rename `items` → `records` in this 15-line Python
+function", every run token-identical to plain):
+
+| Strix Halo CPU (16 threads) | decode tok/s | drafted / accepted | acceptance |
+|---|---|---|---|
+| plain | 58.4–60.3 | – | – |
+| lookup K=3 | 99.3–100.0 | 159 / 126 | 0.79 |
+| lookup K=5 | 102.9–107.7 | 189 / 141 | 0.75 |
+| lookup K=8 (default) | 102.1–108.3 | 252 / 147 | 0.58 |
+| lookup K=12 | 97.8–104.7 | 288 / 154 | 0.53 |
+
+A story prompt (prose, little copying): plain 53.6–54.8, K=5 67.5–71.8 (0.69), K=8 68.2–69.9 (0.60). On CUDA (local RTX 3060)
+Ternary-Bonsai-2-2B PQ2_0 (`qwen35` hybrid, `--no-mtp`) was token-identical but a **net loss**: plain ~186–191 tok/s (graph
+replay) vs ~57–90 at K=8 and ~88–191 at K=4, noisy host. The verify is eager and a rejection restores + replays the GDN
+state, which a 2B model's ~5 ms step cannot amortise. An adaptive gate (as for MTP) is the follow-up.
+
+**Not yet**: combining with a draft model / MTP / DFlash (azllm's lookup-first chain under the tree root); an adaptive gate;
+all-row logits for the dense CUDA verify; a per-request server switch.
 
 ## When NOT to Use
 

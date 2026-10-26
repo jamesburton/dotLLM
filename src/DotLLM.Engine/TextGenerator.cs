@@ -1677,20 +1677,23 @@ public sealed partial class TextGenerator
         => options.Temperature <= 0f && options.RepetitionPenalty == 1.0f;
 
     // Prompt lookup (#1293) is the fallback draft source: a draft model or an MTP round takes priority. It shares the draft-model
-    // path's greedy gate, since its drafts carry no probabilities for sampled acceptance.
+    // path's greedy gate, since its drafts carry no probabilities for sampled acceptance. It also needs a verify forward that
+    // returns every row's logits: widened here where the backend allows it, off where it never can (last-row-only backends).
     private bool UsePromptLookup(bool useDraftSpec, bool useMtp, bool captureLogprobs, DotLLM.Core.Configuration.InferenceOptions options)
-        => _promptLookup is not null && !useDraftSpec && !useMtp && !captureLogprobs && IsEffectivelyGreedy(options);
+    {
+        if (_promptLookup is null || useDraftSpec || useMtp || captureLogprobs || !IsEffectivelyGreedy(options))
+            return false;
+        _model.TrySetAllRowLogitsLimit(_promptLookup.DraftTokens + 1);
+        return _model.MaxAllRowLogitsLength > 1;
+    }
 
-    /// <summary>Builds the request's n-gram index and widens the model's all-row logits to the verify block.</summary>
+    /// <summary>Builds the request's n-gram index.</summary>
     /// <param name="promptIds">Prompt tokens.</param>
     /// <param name="generatedIds">Tokens generated so far.</param>
     /// <param name="cacheSize">KV-cache size: the most tokens the index will hold.</param>
     /// <returns>The drafter; the caller disposes it.</returns>
     private PromptLookupDrafter CreatePromptLookupDrafter(int[] promptIds, List<int> generatedIds, int cacheSize)
-    {
-        _model.TrySetAllRowLogitsLimit(_promptLookup!.DraftTokens + 1);
-        return new PromptLookupDrafter(_promptLookup, promptIds, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(generatedIds), cacheSize);
-    }
+        => new(_promptLookup!, promptIds, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(generatedIds), cacheSize);
 
     /// <summary>
     /// Gates MTP self-speculative decoding (issue #253) for one <c>Generate</c>/
