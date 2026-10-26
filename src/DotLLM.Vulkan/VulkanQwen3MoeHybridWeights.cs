@@ -392,12 +392,21 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
     // difference between loading and not loading.
     private static bool KeepPQ2_0(QuantizationType qt, int k) => qt == QuantizationType.PQ2_0 && (k % 128) == 0;
 
+    // PTQ1_0 packs the same 128 weights into 28 bytes (1.75 bpw) — the same argument as PQ2_0
+    // above, only more so. Added together with its dispatch arms in
+    // VulkanQwen3HybridDenseTransformerModel.RecordMatmul and
+    // VulkanQwen3MoeHybridTransformerModel.RecordMatmul (#436): this class is shared by BOTH
+    // hybrid models, so a keep-packed arm here without a dispatch arm in each of them is not a
+    // missing optimisation, it is an inference-time throw for whichever model was not the one
+    // being tested. That is exactly how PQ2_0 broke.
+    private static bool KeepPTQ1_0(QuantizationType qt, int k) => qt == QuantizationType.PTQ1_0 && (k % 128) == 0;
+
     private static bool KeepNative(QuantizationType qt, int k)
         => KeepQ8(qt, k) || KeepQ4K(qt, k) || KeepQ5K(qt, k) || KeepQ6K(qt, k)
         || KeepQ2K(qt, k) || KeepQ3K(qt, k) || KeepIq4Xs(qt, k) || KeepIq1S(qt, k) || KeepIq4Nl(qt, k)
         || KeepIq2Xxs(qt, k) || KeepIq2Xs(qt, k) || KeepIq2S(qt, k)
         || KeepIq3Xxs(qt, k) || KeepIq3S(qt, k)
-        || KeepF16(qt, k) || KeepBf16(qt, k) || KeepPQ2_0(qt, k);
+        || KeepF16(qt, k) || KeepBf16(qt, k) || KeepPQ2_0(qt, k) || KeepPTQ1_0(qt, k);
 
     private static QuantizationType DeviceQuantTypeFor(QuantizationType qt, int k)
     {
@@ -418,6 +427,7 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
         if (KeepF16(qt, k)) return QuantizationType.F16;
         if (KeepBf16(qt, k)) return QuantizationType.BF16;
         if (KeepPQ2_0(qt, k)) return QuantizationType.PQ2_0;
+        if (KeepPTQ1_0(qt, k)) return QuantizationType.PTQ1_0;
         return QuantizationType.F32;
     }
 

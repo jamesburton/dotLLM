@@ -1,0 +1,117 @@
+#version 450
+// PTQ1_0 token-embedding gather + dequantize — the PTQ1_0 twin of pq2_0_embed_gather_f32.comp,
+// itself the twin of q8_0_embed_gather_f32.comp (#352). Issue #436.
+//
+// This is not optional for Bonsai 2's PTQ1_0 pack. Without it the table falls through
+// VulkanWeights.UploadTokenEmbedding's `dequantToFp32: true` path and is widened to F32:
+// token_embd.weight [5120, 248320] is ~278 MB packed and 5,085,593,600 bytes widened, which
+// EXCEEDS Vulkan's 4 GiB maxStorageBufferRange. The model would not load at all, not merely load
+// fat. A dense PTQ1_0 matmul kernel does not cover this — the embedding lookup dispatches on this
+// table alone, so it needs its own gather.
+//
+// Layout (matches DotLLM.Cpu.Kernels.Dequantize.DequantizePTQ1_0 and
+// matmul_ptq1_0_f32_gemv.comp byte-for-byte; the CPU routine is gated bit-exact against the
+// PrismML fork's dequantize_row_ptq1_0):
+//
+//   Each 128 weights = one 28-byte group:
+//     bytes [0..23]  : qs — 5 base-3 trits per byte
+//     bytes [24..25] : qh — 4 trits per byte
+//     bytes [26..27] : fp16 scale   <-- LAST, unlike PQ2_0 where it is first
+//   Row stride = (hidden/128) * 28 bytes.
+//
+// Element -> (byte, trit) mapping, quoting the fork's own ptq1_0.glsl:
+//     e <  80 : qs[e & 15],        n = e >> 4
+//     e < 120 : qs[16 + (t & 7)],  n = t >> 3,  t = e - 80
+//     else    : qh[t & 1],         n = t >> 1,  t = e - 120
+// and the trit itself by the base-3 remainder recurrence, where the 0xFF mask is the uint8_t
+// wrap the CPU reference depends on:
+//     repeat n times: v = (v * 3) & 0xFF ;  then trit = int((v * 3) >> 8) - 1
+//
+// Math is ordered exactly as the CPU scalar oracle (a single multiply of scale by the ternary
+// value) so gathered rows are bit-identical to a host dequant of the same rows.
+//
+// NOTE: for a Hadamard-folded checkpoint the gathered row is still in the ROTATED basis. The
+// inverse transform (FWHT then signs) is a separate dispatch of hadamard_fwht_f32.comp with
+// inverse=1 — deliberately not fused here, so this shader stays the exact analogue of the PQ2_0
+// and Q8_0 ones.
+//
+// Dispatch:
+//   gl_WorkGroupID.y = token index (0..nTokens-1)
+//   gl_GlobalInvocationID.x = column within the row (0..hidden-1)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW   { uint  src[]; };  // PTQ1_0 table
+layout(set = 0, binding = 1, std430) readonly  buffer BufIds { int   ids[]; };  // [nTokens]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY   { float dst[]; };  // [nTokens*hidden]
+
+layout(push_constant) uniform PushConstants {
+    uint nTokens;      // number of tokens to gather
+    uint hidden;       // row length in elements (multiple of 128)
+    uint blocksPerRow; // = hidden / 128
+    uint vocabSize;    // row-count bound (defensive clamp)
+} pc;
+
+const uint PTQ1_GROUP_SIZE   = 128u;
+const uint PTQ1_GROUP_BYTES  = 28u;
+const uint PTQ1_QS_BYTES     = 24u;
+const uint PTQ1_SCALE_OFFSET = 26u;
+
+uint readByte(uint absByteOff) {
+    uint u = src[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+// The group stride is a multiple of 4, but the scale sits at +26, so it always straddles a uint
+// boundary — read it through byte-addressed halves rather than assuming alignment.
+float readGroupScale(uint groupByteBase) {
+    uint lo = readByte(groupByteBase + PTQ1_SCALE_OFFSET);
+    uint hi = readByte(groupByteBase + PTQ1_SCALE_OFFSET + 1u);
+    return unpackHalf2x16(lo | (hi << 8u)).x;
+}
+
+void main() {
+    uint t = gl_WorkGroupID.y;
+    if (t >= pc.nTokens) return;
+
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.hidden) return;
+
+    // Token ids are host-validated before recording; the clamp is a defensive second gate so a bad
+    // id can never read outside the table.
+    uint row = uint(ids[t]);
+    if (row >= pc.vocabSize) row = 0u;
+
+    uint rowBase = row * pc.blocksPerRow * PTQ1_GROUP_BYTES;
+
+    uint g = c / PTQ1_GROUP_SIZE;             // group within the row
+    uint e = c - g * PTQ1_GROUP_SIZE;         // element within the group (0..127)
+
+    uint groupByteBase = rowBase + g * PTQ1_GROUP_BYTES;
+
+    uint byteInGroup;
+    uint n;
+    if (e < 80u) {
+        byteInGroup = e & 15u;
+        n = e >> 4u;
+    } else if (e < 120u) {
+        uint u = e - 80u;
+        byteInGroup = 16u + (u & 7u);
+        n = u >> 3u;
+    } else {
+        uint u = e - 120u;
+        byteInGroup = PTQ1_QS_BYTES + (u & 1u);
+        n = u >> 1u;
+    }
+
+    uint v = readByte(groupByteBase + byteInGroup);
+    for (uint i = 0u; i < n; ++i) {
+        v = (v * 3u) & 0xFFu;
+    }
+    int code = int((v * 3u) >> 8u) - 1;        // {0,1,2} -> {-1,0,+1}
+
+    float scale = readGroupScale(groupByteBase);
+    precise float val = scale * float(code);
+    dst[t * pc.hidden + c] = val;
+}

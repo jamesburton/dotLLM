@@ -2962,6 +2962,17 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 PQ2_0SmallNDispatch.Record(cmdBuf, _kernels.MatMulPQ2_0, _kernels.MatMulPQ2_0Gemm,
                     weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
+            case QuantizationType.PTQ1_0:
+                // PTQ1_0 (PrismML Bonsai dense-trit ternary, type 143): 128-element group
+                // alignment, enforced upload-side by VulkanQwen3MoeHybridWeights.KeepPTQ1_0.
+                // 28 bytes per group against PQ2_0's 34, with the fp16 scale at the END of the
+                // block. Prefill goes through the untiled correctness-first GEMM (#436) — slow,
+                // but present, so no sequence length reaches the default and throws.
+                if (seqLen == 1)
+                    _kernels.MatMulPTQ1_0.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else
+                    _kernels.MatMulPTQ1_0Gemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                break;
             case QuantizationType.F16:
                 if (seqLen == 1)
                     _kernels.MatMulF16.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);

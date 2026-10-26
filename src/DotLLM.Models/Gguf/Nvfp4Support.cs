@@ -86,24 +86,5 @@ public static class Nvfp4Support
     /// <param name="backend">The backend's name, for the message.</param>
     /// <exception cref="NotSupportedException">An NVFP4 tensor is present.</exception>
     public static void RejectAny(IReadOnlyDictionary<string, GgufTensorDescriptor> tensors, string backend)
-    {
-        ArgumentNullException.ThrowIfNull(tensors);
-        int count = 0;
-        string? first = null;
-        foreach (var (name, desc) in tensors)
-        {
-            if (desc.QuantizationType != QuantizationType.NVFP4)
-                continue;
-            count++;
-            if (first is null || string.CompareOrdinal(name, first) < 0)
-                first = name;
-        }
-
-        if (count == 0)
-            return;
-
-        throw new NotSupportedException(
-            $"The {backend} backend has no NVFP4 (GGUF type 40) path for this model, which has {count} NVFP4 " +
-            $"tensor(s) (first: '{first}'). Use --device cpu (#1038).");
-    }
+        => QuantSupport.RejectAny(tensors, QuantizationType.NVFP4, backend, 1038);
 }
