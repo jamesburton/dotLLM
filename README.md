@@ -409,8 +409,8 @@ To embed the same endpoints inside your own ASP.NET Core app, see [Host the Open
 | `--numa-pin` | | false | Pin workers to NUMA-local cores (multi-socket) |
 | `--pcore-only` | | false | Pin workers to P-cores only (Intel hybrid) |
 | `--quant` | `-q` | *(auto)* | Quant filter when a repo has multiple `.gguf` files (e.g., `Q4_K_M`) |
-| `--cache-type-k` | | `f32` | KV-cache key quant: `f32`, `q8_0`, `q4_0` |
-| `--cache-type-v` | | `f32` | KV-cache value quant: `f32`, `q8_0`, `q4_0` |
+| `--cache-type-k` | | *(unset)* | KV-cache key type: `f32`, `f16`, `q8_0`, `q4_0`. Unset (with V unset) on CPU paged KV uses Q8_0 blocks; `f16` for both keeps F16 (#1284) |
+| `--cache-type-v` | | *(unset)* | KV-cache value type: `f32`, `f16`, `q8_0`, `q4_0` |
 | `--kv-quant-k` / `--kv-quant-v` | | *(unset)* | Synonyms of `--cache-type-k/-v` (`f16`, `q8_0`, `q4_0`); on `run`, `bench` and `serve`. The only way to select quantized KV for the CUDA hybrid-dense model (Bonsai-2 / qwen35), where they override `DOTLLM_HYBRID_KV`. See [docs/KV_CACHE.md](docs/KV_CACHE.md) |
 | `--speculative-model` | | *(none)* | Draft model for speculative decoding (must share vocab) |
 | `--speculative-k` | | 3 | Draft tokens per speculative step |

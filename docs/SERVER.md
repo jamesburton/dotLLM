@@ -278,6 +278,15 @@ Logged: arrival (method + path), the requested `model`, lock waits (only when co
 duration, or the failure), idle-unload / explicit unload, and completion (status + duration) or cancellation. `GET`s (health / props polling)
 are not logged. Spectre.Console output (banner, spinners) is not stamped.
 
+## CPU KV cache type default (#1284)
+
+With paged KV (the `serve` default) on CPU, leaving both `--cache-type-k` and `--cache-type-v` unset selects Q8_0 paged blocks on uniform,
+non-hybrid models (half the memory of F16 and faster at every measured context, #1268). Startup prints
+`[dotllm] INFO: KV cache: no type specified; using Q8_0 paged blocks (faster, half the memory of F16). Use --cache-type-k f16 --cache-type-v f16 for F16.`
+Explicit values are honoured unchanged: `f16`/`f32` for both gives F16 blocks, `q8_0` for both gives Q8_0 blocks. Giving only K or only V
+keeps the pre-#1284 behaviour (a lone `f16` side gives F16 blocks; a lone `q8_0`/`q4_0` side uses the quantized simple cache). Models the
+paged pool does not serve (hybrid/recurrent, per-layer KV widths) keep their existing cache. Details: [KV_CACHE.md](KV_CACHE.md).
+
 ## Model swaps, `GET /v1/status` and SSE keep-alive (#1023)
 
 **Free before load.** A request (or `POST /v1/models/load`) for a different model takes the server lock, then - before loading - stashes the

@@ -27,11 +27,39 @@ public static class ServerStartup
     /// Whether a q8_0 KV request can use Q8_0 paged blocks: both K and V q8_0 (no mixed-precision window), a uniform
     /// non-hybrid model, and a head dim on whole Q8_0 blocks. Otherwise the quantized simple cache serves it.
     /// </summary>
-    internal static bool IsPagedQ8Eligible(KvCacheConfig kvConfig, ModelConfig config, IModel? model)
+    public static bool IsPagedQ8Eligible(KvCacheConfig kvConfig, ModelConfig config, IModel? model)
         => kvConfig.KeyDType == KvCacheDType.Q8_0 && kvConfig.ValueDType == KvCacheDType.Q8_0
            && kvConfig.MixedPrecisionWindowSize == 0 && config.HeadDim % 32 == 0
            && !IsHybridOrRecurrentCpuModel(config, model)
            && DotLLM.Core.Attention.KvGeometry.FromConfig(config).IsUniform;
+
+    /// <summary>
+    /// Picks the CPU paged block type (#1284). Quantized (q8_0 K+V) requests get Q8_0 blocks; an explicit f32/f16 request
+    /// gets F16; when neither K nor V was specified the default is Q8_0 where eligible (faster and half the bytes of F16,
+    /// #1268) and <paramref name="info"/> carries the one-time startup message. Mixed (only K or only V given) is unchanged:
+    /// a lone q8_0 side is not eligible and falls back to the quantized simple cache, a lone f16 side stays F16.
+    /// </summary>
+    /// <param name="kvTypeSpecified">True when the user gave a K or V cache type.</param>
+    /// <param name="kvConfig">The parsed KV configuration.</param>
+    /// <param name="config">Model configuration.</param>
+    /// <param name="model">The loaded model, or <c>null</c>.</param>
+    /// <param name="info">Information message to log, or <c>null</c> when nothing was defaulted.</param>
+    /// <returns>The block element type.</returns>
+    public static DotLLM.Core.Tensors.DType ResolvePagedBlockType(
+        bool kvTypeSpecified, KvCacheConfig kvConfig, ModelConfig config, IModel? model, out string? info)
+    {
+        info = null;
+        if (kvConfig.IsQuantized)
+            return DotLLM.Core.Tensors.DType.Q8_0;
+        if (!kvTypeSpecified && IsPagedQ8Eligible(
+                new KvCacheConfig(KvCacheDType.Q8_0, KvCacheDType.Q8_0, kvConfig.MixedPrecisionWindowSize), config, model))
+        {
+            info = "KV cache: no type specified; using Q8_0 paged blocks (faster, half the memory of F16). " +
+                   "Use --cache-type-k f16 --cache-type-v f16 for F16.";
+            return DotLLM.Core.Tensors.DType.Q8_0;
+        }
+        return DotLLM.Core.Tensors.DType.Float16;
+    }
 
     /// <summary>
     /// True for CPU hybrid/recurrent models (GDN, SSM or hybrid layer layout, or one of the known hybrid model classes) that must
@@ -238,7 +266,7 @@ public static class ServerStartup
         {
             Options = options,
             Config = config,
-            KvCacheConfig = new KvCacheConfig(KvCacheConfig.ParseDType(options.CacheTypeK), KvCacheConfig.ParseDType(options.CacheTypeV)),
+            KvCacheConfig = new KvCacheConfig(KvCacheConfig.ParseDType(options.CacheTypeK ?? "f32"), KvCacheConfig.ParseDType(options.CacheTypeV ?? "f32")),
             IsReady = true,
             Model = model,
             Tokenizer = tokenizer,
@@ -403,10 +431,10 @@ public static class ServerStartup
 
         // KV-cache configuration. TurboQuant applies uniformly to K and V, so its bit-width and
         // QJL flag are taken from the key dtype string (e.g. "tq4", "tq4q").
-        var keyDType = KvCacheConfig.ParseDType(options.CacheTypeK, out int tqBits, out bool tqUseQjl);
+        var keyDType = KvCacheConfig.ParseDType(options.CacheTypeK ?? "f32", out int tqBits, out bool tqUseQjl);
         var kvConfig = new KvCacheConfig(
             keyDType,
-            KvCacheConfig.ParseDType(options.CacheTypeV),
+            KvCacheConfig.ParseDType(options.CacheTypeV ?? "f32"),
             TurboQuantBits: tqBits > 0 ? tqBits : 4,
             TurboQuantUseQjl: tqUseQjl);
 
@@ -563,7 +591,10 @@ public static class ServerStartup
         else if (options.UsePaged && (!kvConfig.IsQuantized || IsPagedQ8Eligible(kvConfig, config, model)))
         {
             // Blocks are F16 by default; q8_0 K and V select Q8_0 blocks (#1268, #1142 C4). Attention reads them in place.
-            var blockType = kvConfig.IsQuantized ? DotLLM.Core.Tensors.DType.Q8_0 : DotLLM.Core.Tensors.DType.Float16;
+            var blockType = ResolvePagedBlockType(
+                options.CacheTypeK is not null || options.CacheTypeV is not null, kvConfig, config, model, out string? kvInfo);
+            if (kvInfo is not null)
+                Console.WriteLine($"[dotllm] INFO: {kvInfo}");
             pagedFactory = new PagedKvCacheFactory(
                 config.NumLayers, config.NumKvHeads, config.HeadDim, elementType: blockType);
             kvFactory = (cfg, size) => pagedFactory.Create(size);
