@@ -1877,11 +1877,14 @@ public sealed class VulkanDevice : IDisposable
     /// DEVICE_LOCAL allocations as out of memory once this device holds N MiB on the preferred
     /// device-local heap, forcing the heap-0 fallback path with a smaller model.
     /// </summary>
+    /// <remarks>Without it, <c>DOTLLM_VRAM_BUDGET_MB</c> (#1295) sets the same limit, read when the device is created.</remarks>
     private static readonly long s_deviceLocalLimitBytes =
         long.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DEVICE_LOCAL_LIMIT_MIB"), out long mib) && mib >= 0
             ? mib * 1024 * 1024 : -1;
 
-    private long _deviceLocalLimitBytes = s_deviceLocalLimitBytes;
+    private long _deviceLocalLimitBytes = s_deviceLocalLimitBytes >= 0
+        ? s_deviceLocalLimitBytes
+        : DotLLM.Core.Configuration.DeviceMemoryBudget.SimulatedBudgetBytes() ?? -1;
 
     /// <summary>Per-instance override of the synthetic device-local limit (test hook, issue #810); &lt; 0 disables.</summary>
     internal void SetDeviceLocalLimitBytes(long bytes) => _deviceLocalLimitBytes = bytes;
@@ -2509,7 +2512,7 @@ public sealed class VulkanDevice : IDisposable
             if ((flags & (uint)VkMemoryHeapFlags.DeviceLocal) != 0)
                 max = Math.Max(max, (long)size);
         }
-        return max;
+        return DotLLM.Core.Configuration.DeviceMemoryBudget.ClampSimulatedCapacity(max);   // #1295
     }
 
     /// <summary>
@@ -2527,7 +2530,8 @@ public sealed class VulkanDevice : IDisposable
             sizes[i] = *(ulong*)(heaps + i * 16);
             flags[i] = (VkMemoryHeapFlags)(*(uint*)(heaps + i * 16 + 8));
         }
-        return VulkanMemoryCapacity.ResidentCapacityBytes(sizes, flags, PhysicalDeviceTypeValue);
+        return DotLLM.Core.Configuration.DeviceMemoryBudget.ClampSimulatedCapacity(   // #1295
+            VulkanMemoryCapacity.ResidentCapacityBytes(sizes, flags, PhysicalDeviceTypeValue));
     }
 
     /// <summary>

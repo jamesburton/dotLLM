@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Cuda.Interop;
 
@@ -38,8 +39,27 @@ internal static partial class CudaDriverApi
     internal static partial int cuDeviceGetPCIBusId(
         [MarshalAs(UnmanagedType.LPArray)] byte[] pciBusId, int len, int device);
 
-    [LibraryImport(LibName)]
-    internal static partial int cuMemGetInfo_v2(out nuint free, out nuint total);
+    /// <summary>The driver's own <c>cuMemGetInfo_v2</c>, unclamped. Planners call <see cref="cuMemGetInfo_v2"/>.</summary>
+    [LibraryImport(LibName, EntryPoint = "cuMemGetInfo_v2")]
+    internal static partial int cuMemGetInfoRaw(out nuint free, out nuint total);
+
+    /// <summary>
+    /// <c>cuMemGetInfo_v2</c> for the current context's device, clamped to <c>DOTLLM_VRAM_BUDGET_MB</c> when set (#1295), so
+    /// every planner that reads free memory sees the simulated card.
+    /// </summary>
+    /// <param name="free">Free bytes (simulated when the budget is on).</param>
+    /// <param name="total">Total bytes (at most the budget when it is on).</param>
+    /// <returns>The CUDA result code.</returns>
+    internal static int cuMemGetInfo_v2(out nuint free, out nuint total)
+    {
+        int rc = cuMemGetInfoRaw(out free, out total);
+        if (rc == 0 && DeviceMemoryBudget.SimulatedBudgetBytes() is not null && cuCtxGetDevice(out int device) == 0)
+        {
+            free = (nuint)DeviceMemoryBudget.ClampSimulatedFree(device, (long)free);
+            total = (nuint)DeviceMemoryBudget.ClampSimulatedCapacity((long)total);
+        }
+        return rc;
+    }
 
     [LibraryImport(LibName)]
     internal static partial int cuDeviceGetAttribute(
