@@ -304,6 +304,10 @@ internal static partial class VulkanApi
         vkCmdDispatchIndirectNative(commandBuffer, buffer, offset);
     }
 
+    /// <summary><c>vkCmdFillBuffer</c>: fills <paramref name="size"/> bytes (VK_WHOLE_SIZE = all) with a 4-byte pattern.</summary>
+    [LibraryImport(LibName)]
+    internal static partial void vkCmdFillBuffer(nint commandBuffer, nint dstBuffer, ulong dstOffset, ulong size, uint data);
+
     [LibraryImport(LibName, EntryPoint = "vkCmdCopyBuffer")]
     private static partial void vkCmdCopyBufferNative(
         nint commandBuffer, nint srcBuffer, nint dstBuffer,

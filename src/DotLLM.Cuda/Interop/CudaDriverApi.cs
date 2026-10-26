@@ -174,8 +174,16 @@ internal static partial class CudaDriverApi
         int r = cuMemAllocNative(out devicePtr, bytesize);
         if (r == 0 && CudaMemTrace.Enabled)
             CudaMemTrace.OnAlloc(devicePtr, (long)bytesize);
+        if (r == 0 && TestPoisonAllocations)
+            cuMemsetD8_v2(devicePtr, 0xFF, bytesize).ThrowOnError();   // 0xFFFF / 0xFFFFFFFF: NaN in F16 and F32
         return r;
     }
+
+    /// <summary>
+    /// Test hook (#1290): fill every new <see cref="cuMemAlloc_v2"/> allocation with NaN bytes, so a kernel that reads
+    /// scratch it never wrote (padding rows past the token count, stale capacity) poisons its output instead of passing.
+    /// </summary>
+    internal static bool TestPoisonAllocations;
 
     /// <summary>Frees device memory allocated by <see cref="cuMemAlloc_v2"/>.</summary>
     /// <param name="devicePtr">The device pointer.</param>
