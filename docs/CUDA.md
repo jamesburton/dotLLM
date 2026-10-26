@@ -715,7 +715,8 @@ All kernels compiled to PTX, loaded via `cuModuleLoadData`, launched via `cuLaun
 
 | Kernel | File | Function Name | Notes |
 |---|---|---|---|
-| Q8_0 GEMV | `quantized_gemv.cu` | `quantized_gemv_q8_0` | FP fmuladd, legacy |
+| Q8_0 GEMV (legacy) | `quantized_gemv.cu` | `quantized_gemv_q8_0` | FP fmuladd, one 256-thread block per row, lanes 34 B apart (~85 GB/s on the RTX 3060); now only the k<1024 / no-scratch fallback and `DOTLLM_DISABLE_MMQ_Q8_0=1` |
+| Q8_0 MMVQ-large `_preq` | `quantized_gemv_mmq.cu` | `quantized_gemv_q8_0_mmvq_large_preq` | dp4a on the shared Q8_1 pre-quant scratch, 1 row/block x 128 threads, 4 lanes per block (8 adjacent blocks = 272 B per warp step) like llama.cpp `mul_mat_vec_q<Q8_0>`; weights read in place (a 34 B block is only 2-byte aligned, so each 32-bit weight word is two 16-bit loads); F32 register accumulate, FP16 store only (#1297). Llama-3.2-1B Q8_0 on the 3060: 318-338 GB/s on gate+up / LM head, tg128 62 -> 195 tok/s |
 | Q4_K GEMV | `quantized_gemv.cu` | `quantized_gemv_q4_k` | FP fmuladd, legacy |
 | Q5_K GEMV | `quantized_gemv.cu` | `quantized_gemv_q5_k` | FP fmuladd, legacy |
 | Q6_K GEMV | `quantized_gemv.cu` | `quantized_gemv_q6_k` | FP fmuladd, legacy |
