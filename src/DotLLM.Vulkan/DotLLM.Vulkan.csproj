@@ -21,16 +21,18 @@
   </ItemGroup>
 
   <!-- #1304: Windows DirectStorage weight loading. The package is native-only (no managed assembly), so it is referenced for
-       restore only (no assets flow, not a nuspec dependency) and its two redistributable DLLs are copied next to the
-       assembly and packed under runtimes/win-x64/native. License: Microsoft DirectStorage SDK terms permit distributing
-       exactly these unmodified files (see distributable_files.txt in the package). When they are absent at run time the
-       loader falls back to the staging path, so a missing DLL is never an error. -->
+       restore only (no assets flow, not a nuspec dependency) and its two DLLs are copied next to the assembly for local and
+       development builds. They are NOT redistributed in release artifacts: the Microsoft DirectStorage SDK licence permits
+       redistribution only with flow-down end-user terms and an indemnity to Microsoft (section 2.b), which an open-source
+       release should not take on by default. Release builds set DotLLMBundleDirectStorage=false (release.yml); users who want
+       the feature obtain the DLLs themselves (add the Microsoft.Direct3D.DirectStorage package, or copy the two DLLs next to
+       the executable). When the DLLs are absent at run time the loader falls back to the staging path, so a missing DLL is never an error. -->
   <ItemGroup Condition="'$(OS)' == 'Windows_NT'">
     <PackageReference Include="Microsoft.Direct3D.DirectStorage" PrivateAssets="all" ExcludeAssets="all" GeneratePathProperty="true" />
   </ItemGroup>
-  <ItemGroup Condition="'$(OS)' == 'Windows_NT' And '$(PkgMicrosoft_Direct3D_DirectStorage)' != ''">
-    <Content Include="$(PkgMicrosoft_Direct3D_DirectStorage)\native\bin\x64\dstorage.dll" Link="dstorage.dll" CopyToOutputDirectory="PreserveNewest" Pack="true" PackagePath="runtimes/win-x64/native/" />
-    <Content Include="$(PkgMicrosoft_Direct3D_DirectStorage)\native\bin\x64\dstoragecore.dll" Link="dstoragecore.dll" CopyToOutputDirectory="PreserveNewest" Pack="true" PackagePath="runtimes/win-x64/native/" />
+  <ItemGroup Condition="'$(OS)' == 'Windows_NT' And '$(PkgMicrosoft_Direct3D_DirectStorage)' != '' And '$(DotLLMBundleDirectStorage)' != 'false'">
+    <Content Include="$(PkgMicrosoft_Direct3D_DirectStorage)\native\bin\x64\dstorage.dll" Link="dstorage.dll" CopyToOutputDirectory="PreserveNewest" Pack="false" />
+    <Content Include="$(PkgMicrosoft_Direct3D_DirectStorage)\native\bin\x64\dstoragecore.dll" Link="dstoragecore.dll" CopyToOutputDirectory="PreserveNewest" Pack="false" />
   </ItemGroup>
 
   <!-- Pre-compiled SPIR-V shaders ship alongside the managed assembly.

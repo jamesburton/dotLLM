@@ -932,7 +932,15 @@ into device-local memory**: DirectStorage reads the file range into a shared D3D
 (`VK_KHR_external_memory_win32`, `D3D12_HEAP` handle type) as an ordinary device-local allocation. Tensors are sub-buffers of
 those heaps, like a `VulkanWeightArena` slab. Pure C#: hand-rolled COM vtable interop (`src/DotLLM.Vulkan/DirectStorage/`), no
 native shim; only Microsoft's `dstorage.dll` / `dstoragecore.dll` are native (Windows-only conditional `PackageReference`
-`Microsoft.Direct3D.DirectStorage`, copied next to the assembly and packed under `runtimes/win-x64/native`).
+`Microsoft.Direct3D.DirectStorage`, copied next to the assembly in local/dev builds).
+
+**Licensing - the DLLs are not redistributed by default.** The DirectStorage SDK licence lets you redistribute exactly those two
+unmodified DLLs, but only if you (b.i) add significant functionality of your own, (b.ii) require distributors and end users to
+accept terms that protect Microsoft at least as much as its own, and (b.iii) indemnify Microsoft against claims arising from the
+distribution or use of your application. Release builds therefore set `DotLLMBundleDirectStorage=false` (`release.yml`): NuGet
+packages and the CLI/Tray bundles contain no Microsoft binaries. To use the feature, add the `Microsoft.Direct3D.DirectStorage`
+package to the host application, or copy the two DLLs next to the executable (the feature then accepts Microsoft's terms for you, as a
+developer/user). Anyone building their own bundle with the DLLs inside takes on section 2.b themselves.
 
 Why it exists (#1250, spike `tools/d3d12-vk-import-spike`): importing the mmap'd file pages (read-only, copy-on-write or writable
 alias) cannot match device-local speed under weight reuse - file-backed host pages ran ~2x slower than device-local in a reuse
