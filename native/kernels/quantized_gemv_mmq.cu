@@ -3445,14 +3445,13 @@ __device__ __forceinline__ void ld_words_unaligned(const uint8_t* p, uint32_t (&
     const uintptr_t a = reinterpret_cast<uintptr_t>(p);
     const uint32_t* ap = reinterpret_cast<const uint32_t*>(a & ~(uintptr_t)3);
     const int sh = (int)(a & 3) * 8;
-    uint32_t prev = ap[0];
+    uint32_t w[N + 1];
+    #pragma unroll
+    for (int i = 0; i < N; i++) w[i] = ap[i];
+    w[N] = (sh != 0) ? ap[N] : 0u;      // the (N+1)-th word is only needed (and only in bounds) when misaligned
     #pragma unroll
     for (int i = 0; i < N; i++)
-    {
-        uint32_t nxt = (sh != 0) ? ap[i + 1] : 0u;
-        out[i] = __funnelshift_r(prev, nxt, sh);
-        prev = nxt;
-    }
+        out[i] = __funnelshift_r(w[i], w[i + 1], sh);
 }
 
 extern "C" __global__ void __launch_bounds__(128) quantized_gemv_q4_k_mmvq_rows4_preq(
