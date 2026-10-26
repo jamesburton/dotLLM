@@ -3423,3 +3423,170 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
             y[row] = __float2half(v);
     }
 }
+
+// ── K-quant MMVQ "rows4" decode GEMVs, pre-quantized activations (#1298) ─────────────────────
+//
+// One WARP per output row, 4 rows per 128-thread block (grid = ceil(n/4)); no __syncthreads and no
+// shared memory — the row reduction is a pure warp-shuffle. Each superblock is covered by 16
+// consecutive lanes (a warp walks 2 superblocks per step), so a row with k=1536 (6 superblocks) keeps
+// all 32 lanes busy for 3 steps. The MMVQ-large kernels instead give a whole 128-thread block to one
+// row and use only superblocks*{4,16} units: at k=1536 that is 24 (Q4_K) of 128 threads — the 128 GB/s
+// gate/up and 65 GB/s 1536x1536 projections in #1298.
+//
+// Quantized blocks are read in place; Q8_1 activations come from the shared pre-quantise scratch.
+// Accumulation: int32 dp4a per sub-block, F32 across sub-blocks and in the reduction, FP16 on the
+// final store only (CLAUDE.md Precision rule 1).
+
+// Reads N consecutive 32-bit words starting at an arbitrary (>= 2-byte aligned) address using aligned
+// loads + funnel shifts. Never reads past the last needed byte when the address is word aligned.
+template <int N>
+__device__ __forceinline__ void ld_words_unaligned(const uint8_t* p, uint32_t (&out)[N])
+{
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    const uint32_t* ap = reinterpret_cast<const uint32_t*>(a & ~(uintptr_t)3);
+    const int sh = (int)(a & 3) * 8;
+    uint32_t w[N + 1];
+    #pragma unroll
+    for (int i = 0; i < N; i++) w[i] = ap[i];
+    w[N] = (sh != 0) ? ap[N] : 0u;      // the (N+1)-th word is only needed (and only in bounds) when misaligned
+    #pragma unroll
+    for (int i = 0; i < N; i++)
+        out[i] = __funnelshift_r(w[i], w[i + 1], sh);
+}
+
+extern "C" __global__ void __launch_bounds__(128) quantized_gemv_q4_k_mmvq_rows4_preq(
+    const uint8_t* __restrict__ weight,
+    const int8_t*  __restrict__ xq_in,
+    const half*    __restrict__ dx_in,
+    const half*    __restrict__ sx2_in,
+    half* __restrict__ y,
+    const int n,
+    const int k)
+{
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 4 + warp;
+    if (row >= n) return;                       // warp-uniform: no block-level barrier below
+
+    const int nsb = k >> 8;
+    const uint8_t* w_row = weight + (size_t)row * nsb * 144;
+
+    const int t = lane & 15;                    // slot inside the superblock
+    const int pair = t >> 2;                    // 32-byte qs group: lo nibbles -> sub-block 2p, hi -> 2p+1
+    const int sub = t & 3;                      // which 8 bytes of the 32
+    const int sbE = pair * 2, sbO = sbE + 1;
+    const float first = (sub == 0) ? 1.0f : 0.0f;   // the min term is added once per sub-block, by sub==0
+
+    float acc = 0.0f;
+    for (int sb = lane >> 4; sb < nsb; sb += 2)
+    {
+        const uint8_t* block = w_row + (size_t)sb * 144;
+        const uint32_t dd = *reinterpret_cast<const uint32_t*>(block);
+        const float d    = __half2float(__ushort_as_half((unsigned short)(dd & 0xFFFF)));
+        const float dmin = __half2float(__ushort_as_half((unsigned short)(dd >> 16)));
+        const uint8_t* sc_raw = block + 4;
+
+        int scE, mE, scO, mO;
+        if (pair < 2)
+        {
+            scE = sc_raw[sbE] & 0x3F;  mE = sc_raw[sbE + 4] & 0x3F;
+            scO = sc_raw[sbO] & 0x3F;  mO = sc_raw[sbO + 4] & 0x3F;
+        }
+        else
+        {
+            scE = (sc_raw[sbE + 4] & 0x0F) | ((sc_raw[sbE - 4] >> 6) << 4);
+            mE  = (sc_raw[sbE + 4] >> 4)   | ((sc_raw[sbE]     >> 6) << 4);
+            scO = (sc_raw[sbO + 4] & 0x0F) | ((sc_raw[sbO - 4] >> 6) << 4);
+            mO  = (sc_raw[sbO + 4] >> 4)   | ((sc_raw[sbO]     >> 6) << 4);
+        }
+
+        const uint32_t* q = reinterpret_cast<const uint32_t*>(block + 16 + pair * 32 + sub * 8);
+        const uint32_t q0 = q[0], q1 = q[1];
+
+        const int chE = sb * 8 + sbE, chO = chE + 1;
+        const int* xe = reinterpret_cast<const int*>(xq_in + (size_t)chE * 32) + sub * 2;
+        const int* xo = reinterpret_cast<const int*>(xq_in + (size_t)chO * 32) + sub * 2;
+
+        int dotE = __dp4a((int)(q0 & 0x0F0F0F0Fu), xe[0], 0);
+        dotE = __dp4a((int)(q1 & 0x0F0F0F0Fu), xe[1], dotE);
+        int dotO = __dp4a((int)((q0 >> 4) & 0x0F0F0F0Fu), xo[0], 0);
+        dotO = __dp4a((int)((q1 >> 4) & 0x0F0F0F0Fu), xo[1], dotO);
+
+        const float dxE = __half2float(dx_in[chE]);
+        const float dxO = __half2float(dx_in[chO]);
+        const float sxE = __half2float(sx2_in[chE * 2]) + __half2float(sx2_in[chE * 2 + 1]);
+        const float sxO = __half2float(sx2_in[chO * 2]) + __half2float(sx2_in[chO * 2 + 1]);
+
+        acc += d * (dxE * (float)scE * (float)dotE + dxO * (float)scO * (float)dotO)
+             - first * dmin * (dxE * (float)mE * sxE + dxO * (float)mO * sxO);
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
+    if (lane == 0)
+        y[row] = __float2half(acc);
+}
+
+// Q6_K: 210-byte blocks (ql[128] qh[64] scales[16] d) — only 2-byte aligned for odd superblocks, so the
+// 16-byte weight slices are read through ld_words_unaligned.
+extern "C" __global__ void __launch_bounds__(128) quantized_gemv_q6_k_mmvq_rows4_preq(
+    const uint8_t* __restrict__ weight,
+    const int8_t*  __restrict__ xq_in,
+    const half*    __restrict__ dx_in,
+    const half*    __restrict__ sx2_in,
+    half* __restrict__ y,
+    const int n,
+    const int k)
+{
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 4 + warp;
+    if (row >= n) return;
+
+    const int nsb = k >> 8;
+    const uint8_t* w_row = weight + (size_t)row * nsb * 210;
+
+    // Same slot decomposition as quantized_gemv_q6_k_mmvq_large_preq: 16 quants (one scale) per lane.
+    const int t = lane & 15;
+    const int half_idx = t >> 3;
+    const int q_quad = (t >> 1) & 3;
+    const int isc = t & 1;
+    const int ql_off = half_idx * 64 + (q_quad & 1) * 32 + isc * 16;
+    const int qh_off = 128 + half_idx * 32 + isc * 16;
+    const int ql_shift = (q_quad & 2) << 1;
+    const int qh_shift = q_quad << 1;
+
+    float acc = 0.0f;
+    for (int sb = lane >> 4; sb < nsb; sb += 2)
+    {
+        const uint8_t* block = w_row + (size_t)sb * 210;
+        uint32_t ql[4], qh[4];
+        ld_words_unaligned<4>(block + ql_off, ql);
+        ld_words_unaligned<4>(block + qh_off, qh);
+
+        const int chunk = sb * 8 + half_idx * 4 + q_quad;
+        const int* xi = reinterpret_cast<const int*>(xq_in + (size_t)chunk * 32 + isc * 16);
+
+        int dot = 0;
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+        {
+            const uint32_t lo4 = (ql[j] >> ql_shift) & 0x0F0F0F0Fu;
+            const uint32_t hi2 = ((qh[j] >> qh_shift) & 0x03030303u) << 4;
+            dot = __dp4a((int)(lo4 | hi2), xi[j], dot);
+        }
+
+        const float d  = __half2float(*reinterpret_cast<const half*>(block + 208));
+        const int sc   = (int)reinterpret_cast<const int8_t*>(block + 192)[half_idx * 8 + q_quad * 2 + isc];
+        const float dx = __half2float(dx_in[chunk]);
+        const float sx = __half2float(sx2_in[chunk * 2 + isc]);
+        acc += dx * d * (float)sc * ((float)dot - 32.0f * sx);
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
+    if (lane == 0)
+        y[row] = __float2half(acc);
+}
