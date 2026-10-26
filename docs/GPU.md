@@ -942,6 +942,8 @@ packages and the CLI/Tray bundles contain no Microsoft binaries. To use the feat
 package to the host application, or copy the two DLLs next to the executable (the feature then accepts Microsoft's terms for you, as a
 developer/user). Anyone building their own bundle with the DLLs inside takes on section 2.b themselves.
 
+**Offer at startup.** On Windows x64/ARM64, when `dotllm run|chat|bench|serve` is started from an interactive terminal and `dstorage.dll` cannot be found, the CLI offers to fetch `Microsoft.Direct3D.DirectStorage 1.3.0` from NuGet (`DirectStorageInstaller`). It downloads the package, checks it against a pinned SHA-256, prints Microsoft's `LICENSE.txt`, and only after the user types `yes` extracts the two DLLs (plus the licence) to `~/.dotllm/native/directstorage/1.3.0/{arch}` (`DOTLLM_DIRECTSTORAGE_DIR` overrides the location). A "no" is remembered in `~/.dotllm/native/directstorage/declined`; `DOTLLM_NO_PROMPT=1` suppresses the offer, and redirected or non-interactive runs never see it. The installed copy is found automatically, but weight loading stays opt-in (`DOTLLM_VULKAN_DIRECT_STORAGE=1`).
+
 Why it exists (#1250, spike `tools/d3d12-vk-import-spike`): importing the mmap'd file pages (read-only, copy-on-write or writable
 alias) cannot match device-local speed under weight reuse - file-backed host pages ran ~2x slower than device-local in a reuse
 micro-benchmark (Qwen3.8 dense pp512 -52%, MoE models unaffected) - while a D3D12 default heap imported into Vulkan runs at
