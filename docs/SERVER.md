@@ -415,6 +415,11 @@ field, and `POST /v1/models/load`:
 | `hf.co/owner/repo:tag`, `hf://owner/repo` | same as `owner/repo[:tag]` |
 | `Tev1-4B-experimental-Q4_K_M` | a local file by stem or filename, **only when exactly one local model has that name** (see below) |
 
+**Free disk space is checked before a pull (#1296).** Every Hub download (`dotllm model pull`, `POST /v1/models/pull`, an
+auto-pull on load) compares the bytes still to fetch plus a 256 MiB margin with `DriveInfo.AvailableFreeSpace` of the target
+volume and refuses up front, naming required vs free space, instead of leaving a half-written 0.1-50 GB file. If the disk fills
+anyway (another writer), the partial file is deleted and the same error is raised. Unknown size or free space skips the check.
+
 **Ambiguous bare names are an error (#1021).** Ids are repo-qualified (`owner/repo/file.gguf`), but a bare stem or filename is still accepted
 for clients holding an old id. When it matches more than one local model - typically a quant filename such as `q4_k_m.gguf` shipped by several
 repos - nothing is guessed: every surface (chat, completions, messages, embeddings, `/api/*`, `POST /v1/models/load`, and the CLI) fails with the

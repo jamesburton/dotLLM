@@ -83,7 +83,31 @@ internal sealed class ModelPullCommand : AsyncCommand<ModelPullCommand.Settings>
 
         AnsiConsole.MarkupLine($"Downloading [bold]{filename.EscapeMarkup()}[/] from [bold]{repoId.EscapeMarkup()}[/]...");
 
-        var path = await AnsiConsole.Progress()
+        string path;
+        try
+        {
+            path = await DownloadWithProgressAsync(downloader, repoId, filename, settings.Directory);
+        }
+        catch (InsufficientDiskSpaceException ex)
+        {
+            // Refused before the first byte (or stopped and cleaned up when the disk filled anyway) (#1296).
+            AnsiConsole.MarkupLine($"[red]{ex.Message.EscapeMarkup()}[/]");
+            return 1;
+        }
+
+        AnsiConsole.MarkupLine($"[green]Saved to:[/] {path.EscapeMarkup()}");
+        return 0;
+    }
+
+    /// <summary>Downloads <paramref name="filename"/> with a progress bar; the hub cache unless <paramref name="directory"/> is set.</summary>
+    /// <param name="downloader">The downloader (it checks free disk space first).</param>
+    /// <param name="repoId">The repository.</param>
+    /// <param name="filename">The file in it.</param>
+    /// <param name="directory">The <c>--dir</c> flat target, or null for the hub cache.</param>
+    /// <returns>The path of the downloaded model.</returns>
+    private static async Task<string> DownloadWithProgressAsync(HuggingFaceDownloader downloader, string repoId, string filename, string? directory)
+    {
+        return await AnsiConsole.Progress()
             .AutoClear(false)
             .Columns(
                 new TaskDescriptionColumn(),
@@ -113,13 +137,10 @@ internal sealed class ModelPullCommand : AsyncCommand<ModelPullCommand.Settings>
                 });
 
                 // Hub cache (shared with huggingface_hub / hf download) + a mirror link; --dir keeps the old flat-directory behaviour.
-                if (settings.Directory is not null)
-                    return await downloader.DownloadFileAsync(repoId, filename, settings.Directory, progress);
+                if (directory is not null)
+                    return await downloader.DownloadFileAsync(repoId, filename, directory, progress);
                 var r = await downloader.DownloadToHubCacheAsync(repoId, filename, progress: progress);
                 return r.ModelPath;
             });
-
-        AnsiConsole.MarkupLine($"[green]Saved to:[/] {path.EscapeMarkup()}");
-        return 0;
     }
 }

@@ -423,6 +423,71 @@ public sealed class ModelPullHubCacheTests : IDisposable
 
     // ────────────────────────────── stub server ───────────────────────────────
 
+    // ───────────────────────────── free disk space (#1296) ─────────────────────────────
+
+    [Fact]
+    public async Task Download_RefusesUpFront_WhenTheVolumeLacksSpace_AndLeavesNothingBehind()
+    {
+        using var stub = new StubHub(MakePayload(4096));
+        string? probed = null;
+        using var downloader = new HuggingFaceDownloader(cdnBase: stub.BaseUrl)
+        {
+            FreeBytesProbe = dir => { probed = dir; return 1000; }, // far less than 4096 + the margin
+        };
+
+        var ex = await Assert.ThrowsAsync<InsufficientDiskSpaceException>(() =>
+            downloader.DownloadToHubCacheAsync(RepoId, Filename, "main", CacheRoot, ModelsDir));
+
+        Assert.Equal(4096 + HuggingFaceDownloader.FreeSpaceMarginBytes, ex.RequiredBytes);
+        Assert.Equal(1000, ex.FreeBytes);
+        Assert.Contains("needs", ex.Message);
+        Assert.Contains("is free", ex.Message);
+        Assert.StartsWith(CacheRoot, probed); // the volume of the hub cache, not of the working directory
+        var blobs = Path.Combine(CacheRoot, "models--acme--test-gguf", "blobs");
+        Assert.True(!Directory.Exists(blobs) || Directory.GetFiles(blobs).Length == 0, "no partial file may be left");
+    }
+
+    [Fact]
+    public async Task Download_Proceeds_WhenSpaceIsEnough_OrUnknown()
+    {
+        using var stub = new StubHub(MakePayload(2048));
+        using var roomy = new HuggingFaceDownloader(cdnBase: stub.BaseUrl) { FreeBytesProbe = _ => long.MaxValue };
+        Assert.True(File.Exists((await roomy.DownloadToHubCacheAsync(RepoId, Filename, "main", CacheRoot, ModelsDir)).BlobPath));
+
+        using var stub2 = new StubHub(MakePayload(2048));
+        using var unknown = new HuggingFaceDownloader(cdnBase: stub2.BaseUrl) { FreeBytesProbe = _ => null };
+        Assert.True(File.Exists((await unknown.DownloadToHubCacheAsync(RepoId, Filename, "main", Path.Combine(_root, "hub2"), ModelsDir)).BlobPath));
+    }
+
+    [Fact]
+    public void EnsureFreeSpace_CountsOnlyTheBytesStillToFetch_OnResume()
+    {
+        using var downloader = new HuggingFaceDownloader { FreeBytesProbe = _ => HuggingFaceDownloader.FreeSpaceMarginBytes + 100 };
+        string target = Path.Combine(_root, "x.gguf");
+
+        downloader.EnsureFreeSpace(target, totalBytes: 10_000, existingBytes: 9_900); // 100 left: fits exactly
+        Assert.Throws<InsufficientDiskSpaceException>(() => downloader.EnsureFreeSpace(target, totalBytes: 10_000, existingBytes: 9_899));
+        downloader.EnsureFreeSpace(target, totalBytes: null, existingBytes: 0); // size unknown: no check
+    }
+
+    [Fact]
+    public void IsDiskFull_RecognisesThePlatformsDiskFullCodes()
+    {
+        static IOException Io(int code) => new("x", unchecked((int)0x80070000) | code);
+
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.True(HuggingFaceDownloader.IsDiskFull(Io(112)));
+            Assert.True(HuggingFaceDownloader.IsDiskFull(Io(39)));
+        }
+        else
+        {
+            Assert.True(HuggingFaceDownloader.IsDiskFull(new IOException("x", 28)));
+        }
+
+        Assert.False(HuggingFaceDownloader.IsDiskFull(Io(5))); // access denied
+    }
+
     private static byte[] MakePayload(int size)
     {
         var bytes = new byte[size];
