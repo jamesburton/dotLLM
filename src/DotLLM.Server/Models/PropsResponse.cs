@@ -72,6 +72,11 @@ public sealed record PropsResponse
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? DeviceFallbackWarning { get; init; }
 
+    /// <summary>What the loaded model's chat template can do with the thinking controls (#1106); null when no template is loaded.</summary>
+    [JsonPropertyName("reasoning")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ReasoningCapabilitiesDto? Reasoning { get; init; }
+
     [JsonPropertyName("is_ready")]
     public bool IsReady { get; init; }
 
@@ -112,4 +117,23 @@ public sealed record SamplingDefaultsDto
     [JsonPropertyName("seed")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public int? Seed { get; init; }
+}
+
+/// <summary>
+/// Which thinking controls the loaded model's chat template reads (<c>/props</c> <c>reasoning</c>, #1106). Detected from the
+/// template source, so it says what the template can honour, not what the model will do.
+/// </summary>
+public sealed record ReasoningCapabilitiesDto
+{
+    /// <summary>The template reads <c>enable_thinking</c> (so the on/off switch works).</summary>
+    [JsonPropertyName("enable_thinking")]
+    public bool EnableThinking { get; init; }
+
+    /// <summary>The template reads <c>reasoning_effort</c>.</summary>
+    [JsonPropertyName("reasoning_effort")]
+    public bool ReasoningEffort { get; init; }
+
+    /// <summary>The model emits a think block the server can split and budget (<c>thinking_budget_tokens</c> applies).</summary>
+    [JsonPropertyName("thinking_block")]
+    public bool ThinkingBlock { get; init; }
 }
