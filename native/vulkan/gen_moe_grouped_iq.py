@@ -566,6 +566,201 @@ struct Stage { uint sw0; uint sw1; uint qs2; uint qhb; uint ib; vec4 bv; };   //
 SHADERS = [IQ4_NL, IQ4_XS, IQ3_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, Q2_0, IQ1_M, Q4_0, Q4_1]
 
 
+# ---------------------------------------------------------------------------------------------------------------------------------
+# Wide-token-tile variants (issue #1348): 32 tokens per workgroup instead of 16. Every subgroup keeps its 16 dequantised weight rows
+# and runs TWO 16x16 MMAs per A fragment (tokens 0..15 and 16..31), so the weight read, the dequantisation, the LDS staging and the barrier
+# of a K round are shared by twice the tokens. The second token half is skipped (uniformly per workgroup) when the expert's tile has
+# <= 16 rows, so a sparsely-routed expert costs no extra MMA. Tile list contract: tileRows = 32 (RowTile).
+WIDE = ['iq4_nl', 'iq4_xs', 'iq3_s']
+
+B_LOAD_WIDE = r'''    uint bRow = tid >> 4u;
+    uint c4 = tid & 15u;
+    uint bRow2 = bRow + 16u;
+    st.bv  = (localRowBase + bRow)  < expertRows ? x4[xRowBase4 + bRow  * (pc.K / 4u) + sb * (SB / 4u) + c4] : vec4(0.0);
+    st.bv2 = (localRowBase + bRow2) < expertRows ? x4[xRowBase4 + bRow2 * (pc.K / 4u) + sb * (SB / 4u) + c4] : vec4(0.0);
+}
+'''
+
+B_COMMIT_WIDE = r'''    uint bRow = tid >> 4u;
+    uint c4 = tid & 15u;
+    uint o = bRow * STRIDE + c4 * 4u;
+    sharedB[o]      = float16_t(st.bv.x);
+    sharedB[o + 1u] = float16_t(st.bv.y);
+    sharedB[o + 2u] = float16_t(st.bv.z);
+    sharedB[o + 3u] = float16_t(st.bv.w);
+    uint o2 = o + 16u * STRIDE;
+    sharedB[o2]      = float16_t(st.bv2.x);
+    sharedB[o2 + 1u] = float16_t(st.bv2.y);
+    sharedB[o2 + 2u] = float16_t(st.bv2.z);
+    sharedB[o2 + 3u] = float16_t(st.bv2.w);
+}
+'''
+
+
+def _rep(text, old, new):
+    assert text.count(old) == 1, old
+    return text.replace(old, new)
+
+
+def render_wide(spec):
+    h = render(spec)
+    h = _rep(h, '// Grouped ' + spec['fmt'] + ' MoE expert matmul',
+             '// WIDE-TOKEN-TILE variant (issue #1348): 32 tokens per workgroup (two 16-token MMA halves per A fragment).\n// Grouped ' + spec['fmt'] + ' MoE expert matmul')
+    h = _rep(h, 'shared float16_t sharedB[TN * STRIDE];',
+             'const uint NT = 2u;                 // 16-token halves per workgroup (32 tokens)\nshared float16_t sharedB[NT * TN * STRIDE];')
+    h = _rep(h, 'shared float storeStage[NSG * TM * TN];', 'shared float storeStage[NSG * NT * TM * TN];')
+    h = _rep(h, B_LOAD, B_LOAD_WIDE)
+    h = _rep(h, B_COMMIT, B_COMMIT_WIDE)
+    h = _rep(h, 'vec4 bv; }', 'vec4 bv; vec4 bv2; }')
+    h = _rep(h, 'localRowBase = gl_WorkGroupID.y * TN;', 'localRowBase = gl_WorkGroupID.y * (NT * TN);')
+    h = _rep(h, '''    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> sums =
+        coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
+''', '''    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> sums =
+        coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> sums2 =
+        coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
+    bool second = (localRowBase + TN) < expertRows;   // workgroup-uniform: tokens 16..31 exist
+''')
+    h = _rep(h, '''            sums = coopMatMulAdd(aTile, bTile, sums);
+''', '''            sums = coopMatMulAdd(aTile, bTile, sums);
+            if (second) {
+                coopMatLoad(bTile, sharedB, TN * STRIDE + kSlice, STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+                sums2 = coopMatMulAdd(aTile, bTile, sums2);
+            }
+''')
+    h = _rep(h, '''    coopMatStore(sums, storeStage, sg * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);
+    barrier();
+
+    for (uint i = 0u; i < 4u; i++) {
+        uint idx = lane64 + i * WAVE;
+        if (idx >= TM * TN) break;
+        uint localRowInTile = idx / TM;
+        uint m = idx - localRowInTile * TM;
+        uint lr = localRowBase + localRowInTile;
+        uint mG = mBase + sg * TM + m;
+        if (lr < expertRows && mG < pc.M) {
+            uint packedRow = expertStart + lr;
+            y[packedRow * pc.M + mG] = storeStage[sg * TM * TN + localRowInTile * TM + m];
+        }
+    }
+''', '''    coopMatStore(sums, storeStage, sg * NT * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);
+    if (second) coopMatStore(sums2, storeStage, sg * NT * TM * TN + TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);
+    barrier();
+
+    for (uint half16 = 0u; half16 < NT; half16++) {
+        if (half16 == 1u && !second) break;
+        for (uint i = 0u; i < 4u; i++) {
+            uint idx = lane64 + i * WAVE;
+            if (idx >= TM * TN) break;
+            uint localRowInTile = idx / TM;
+            uint m = idx - localRowInTile * TM;
+            uint lr = localRowBase + half16 * TN + localRowInTile;
+            uint mG = mBase + sg * TM + m;
+            if (lr < expertRows && mG < pc.M) {
+                uint packedRow = expertStart + lr;
+                y[packedRow * pc.M + mG] = storeStage[sg * NT * TM * TN + half16 * TM * TN + localRowInTile * TM + m];
+            }
+        }
+    }
+''')
+    return h
+
+
+NARROW_EPILOGUE = '''    coopMatStore(sums, storeStage, sg * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);
+    barrier();
+
+    for (uint i = 0u; i < 4u; i++) {
+        uint idx = lane64 + i * WAVE;
+        if (idx >= TM * TN) break;
+        uint localRowInTile = idx / TM;
+        uint m = idx - localRowInTile * TM;
+        uint lr = localRowBase + localRowInTile;
+        uint mG = mBase + sg * TM + m;
+        if (lr < expertRows && mG < pc.M) {
+            uint packedRow = expertStart + lr;
+            y[packedRow * pc.M + mG] = storeStage[sg * TM * TN + localRowInTile * TM + m];
+        }
+    }
+'''
+
+NARROW_DIET = '''    // LDS diet (#1348): one 16x16 staging tile reused by the four subgroups in turn instead of one each.
+    for (uint sgi = 0u; sgi < NSG; sgi++) {
+        if (sg == sgi) coopMatStore(sums, storeStage, 0u, TM, gl_CooperativeMatrixLayoutColumnMajor);
+        barrier();
+        if (sg == sgi) {
+            for (uint i = 0u; i < 4u; i++) {
+                uint idx = lane64 + i * WAVE;
+                if (idx >= TM * TN) break;
+                uint localRowInTile = idx / TM;
+                uint m = idx - localRowInTile * TM;
+                uint lr = localRowBase + localRowInTile;
+                uint mG = mBase + sg * TM + m;
+                if (lr < expertRows && mG < pc.M) {
+                    uint packedRow = expertStart + lr;
+                    y[packedRow * pc.M + mG] = storeStage[localRowInTile * TM + m];
+                }
+            }
+        }
+        barrier();
+    }
+'''
+
+WIDE_EPILOGUE_START = '    coopMatStore(sums, storeStage, sg * NT * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);'
+
+WIDE_DIET = '''    for (uint sgi = 0u; sgi < NSG; sgi++) {
+        for (uint half16 = 0u; half16 < NT; half16++) {
+            if (half16 == 1u && !second) break;
+            if (sg == sgi) {
+                if (half16 == 0u) coopMatStore(sums, storeStage, 0u, TM, gl_CooperativeMatrixLayoutColumnMajor);
+                else coopMatStore(sums2, storeStage, 0u, TM, gl_CooperativeMatrixLayoutColumnMajor);
+            }
+            barrier();
+            if (sg == sgi) {
+                for (uint i = 0u; i < 4u; i++) {
+                    uint idx = lane64 + i * WAVE;
+                    if (idx >= TM * TN) break;
+                    uint localRowInTile = idx / TM;
+                    uint m = idx - localRowInTile * TM;
+                    uint lr = localRowBase + half16 * TN + localRowInTile;
+                    uint mG = mBase + sg * TM + m;
+                    if (lr < expertRows && mG < pc.M) {
+                        uint packedRow = expertStart + lr;
+                        y[packedRow * pc.M + mG] = storeStage[localRowInTile * TM + m];
+                    }
+                }
+            }
+            barrier();
+        }
+    }
+'''
+
+# name suffix -> (wide, diet, ballast bytes). Only the shipped variant is emitted: n32 = 32 tokens per workgroup (two accumulators per subgroup),
+# diet = one 1 KB epilogue staging tile reused by the four subgroups in turn (22.0 KB -> 14.8 KB of LDS; the plain n32 form measured no better than 16 tokens).
+VARIANTS = {
+    'n32diet': (True, True, 0),
+}
+
+
+def render_variant(spec, wide, diet, ballast):
+    h = render_wide(spec) if wide else render(spec)
+    if diet:
+        h = _rep(h, 'shared float storeStage[NSG * NT * TM * TN];' if wide else 'shared float storeStage[NSG * TM * TN];',
+                 'shared float storeStage[TM * TN];')
+        if wide:
+            a = h.index(WIDE_EPILOGUE_START)
+            b = h.rindex('}')  # end of main
+            h = h[:a] + WIDE_DIET + h[b:]
+        else:
+            h = _rep(h, NARROW_EPILOGUE, NARROW_DIET)
+    if ballast:
+        h = _rep(h, 'shared float storeStage[', 'shared float16_t ballast[%du];\nshared float storeStage[' % (ballast // 2))
+        h = _rep(h, '    uint tid = gl_LocalInvocationID.x;\n', '    uint tid = gl_LocalInvocationID.x;\n    ballast[tid] = float16_t(0.0);\n')
+        # keep the dead LDS alive: a never-taken read at the end of main (applyScale is always 0).
+        b = h.rindex('}')
+        h = h[:b] + '    if (pc.applyScale == 0xFFFFFFFFu) y[0] = float(ballast[tid & 255u]);\n' + h[b:]
+    return h
+
+
 def render(spec):
     h = HEADER
     h = h.replace('__FMT__', spec['fmt']).replace('__LOWER__', spec['name']).replace('__LAYOUT__', spec['layout'])
@@ -581,6 +776,12 @@ def main():
         with open(path, 'w', encoding='utf-8', newline='\n') as f:
             f.write(render(spec))
         print('wrote', path)
+        if spec['name'] in WIDE:
+            for suffix, (wide, diet, ballast) in VARIANTS.items():
+                wpath = os.path.join(out, f"moe_grouped_matmul_{spec['name']}_coopmat_m64{suffix}.comp")
+                with open(wpath, 'w', encoding='utf-8', newline='\n') as f:
+                    f.write(render_variant(spec, wide, diet, ballast))
+                print('wrote', wpath)
 
 
 if __name__ == '__main__':
