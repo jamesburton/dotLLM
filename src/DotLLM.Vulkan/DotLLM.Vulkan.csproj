@@ -57,7 +57,9 @@
     <VulkanShader Include="$(VulkanShaderDir)\*.comp" />
   </ItemGroup>
 
-  <!-- Compile stale .comp files to .spv. Incremental via Inputs/Outputs. -->
+  <!-- Compile stale .comp files to .spv. Incremental via Inputs/Outputs. Always -O, matching
+       native/vulkan/build.ps1 / build.sh: the committed .spv are -O builds, and a plain build here
+       would silently overwrite them whenever a .comp mtime is newer than its .spv (#1310). -->
   <Target Name="CompileVulkanShaders"
           BeforeTargets="BeforeBuild"
           Inputs="@(VulkanShader)"
@@ -71,7 +73,7 @@
     <MakeDir Condition="'$(_GlslcExitCode)' == '0'" Directories="$(SpvOutputDir)" />
     <Message Condition="'$(_GlslcExitCode)' == '0'" Importance="high" Text="Compiling %(VulkanShader.Filename).comp to SPIR-V" />
     <Exec Condition="'$(_GlslcExitCode)' == '0'"
-          Command="glslc --target-env=$(VulkanTargetEnv) -o &quot;$(SpvOutputDir)/%(VulkanShader.Filename).spv&quot; &quot;%(VulkanShader.FullPath)&quot;"
+          Command="glslc --target-env=$(VulkanTargetEnv) -O -o &quot;$(SpvOutputDir)/%(VulkanShader.Filename).spv&quot; &quot;%(VulkanShader.FullPath)&quot;"
           StandardOutputImportance="low" />
   </Target>
 

@@ -19,12 +19,16 @@ mkdir -p "$OUT_DIR"
 # MoltenVK). Bump to vulkan1.3 once VK_NV_cooperative_matrix2 kernels are added.
 TARGET_ENV="vulkan1.2"
 
+# Always optimise (-O): all SPIR-V is built with -O so a rebuild is byte-reproducible
+# (#1254, #1310). A plain build is ~80% larger on big shaders and is NOT what ships.
+GLSLC_FLAGS="-O"
+
 echo "Compiling GLSL compute shaders -> SPIR-V (target: $TARGET_ENV)..."
 
 for comp_file in "$SHADER_DIR"/*.comp; do
     [ -f "$comp_file" ] || continue
     base=$(basename "$comp_file" .comp)
-    glslc --target-env="$TARGET_ENV" -o "$OUT_DIR/$base.spv" "$comp_file"
+    glslc --target-env="$TARGET_ENV" $GLSLC_FLAGS -o "$OUT_DIR/$base.spv" "$comp_file"
     echo "  $base.comp -> $base.spv"
 done
 
