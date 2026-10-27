@@ -132,16 +132,28 @@ public sealed class VulkanMoeGroupedIqCoopmatTests
     /// 16/32 tile edges (15, 16, 17, 31, 32, 33, 48, 64, 100, 128) so the skipped second half, the full second half and the ragged tail are all hit.
     /// </summary>
     [SkippableTheory]
-    [InlineData(QuantizationType.IQ3_S, 130, 2560)]    // real gate/up
-    [InlineData(QuantizationType.IQ4_XS, 130, 2560)]
-    [InlineData(QuantizationType.IQ4_NL, 100, 640)]    // real down K
-    [InlineData(QuantizationType.IQ4_NL, 64, 64)]
-    public void GroupedWide_MatchesNarrowBitwiseAndCpuOracle(QuantizationType qt, int m, int k)
+    [InlineData(QuantizationType.IQ3_S, 130, 2560, "n32")]    // real gate/up
+    [InlineData(QuantizationType.IQ4_XS, 130, 2560, "n32")]
+    [InlineData(QuantizationType.IQ4_NL, 100, 640, "n32")]    // real down K
+    [InlineData(QuantizationType.IQ4_NL, 64, 64, "n32")]
+    [InlineData(QuantizationType.IQ3_S, 130, 2560, "diet")]    // real gate/up
+    [InlineData(QuantizationType.IQ4_XS, 130, 2560, "diet")]
+    [InlineData(QuantizationType.IQ4_NL, 100, 640, "diet")]    // real down K
+    [InlineData(QuantizationType.IQ4_NL, 64, 64, "diet")]
+    [InlineData(QuantizationType.IQ3_S, 130, 2560, "n32diet")]    // real gate/up
+    [InlineData(QuantizationType.IQ4_XS, 130, 2560, "n32diet")]
+    [InlineData(QuantizationType.IQ4_NL, 100, 640, "n32diet")]    // real down K
+    [InlineData(QuantizationType.IQ4_NL, 64, 64, "n32diet")]
+    [InlineData(QuantizationType.IQ3_S, 130, 2560, "bal6")]    // real gate/up
+    [InlineData(QuantizationType.IQ4_XS, 130, 2560, "bal6")]
+    [InlineData(QuantizationType.IQ4_NL, 100, 640, "bal6")]    // real down K
+    [InlineData(QuantizationType.IQ4_NL, 64, 64, "bal6")]
+    public void GroupedVariant_MatchesNarrowBitwiseAndCpuOracle(QuantizationType qt, int m, int k, string variant)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
         var iq = MoeIndexedMatmulIqMmvqKernel.FromQuantizationType(qt)!.Value;
-        Skip.IfNot(MoeGroupedMatmulIqCoopmatKernel.IsSupportedOn(device, spvDir, iq) && MoeGroupedMatmulIqCoopmatKernel.IsWideSupportedOn(device, spvDir, iq)
+        Skip.IfNot(MoeGroupedMatmulIqCoopmatKernel.IsSupportedOn(device, spvDir, iq) && MoeGroupedMatmulIqCoopmatKernel.IsVariantSupportedOn(device, spvDir, iq, variant)
                    && MoeBuildTileListKernel.IsSupportedOn(spvDir), "coopmat / native wave64 / wide SPIR-V unavailable.");
 
         int[] counts = { 0, 3, 0, 17, 40, 16, 15, 1, 33, 64, 2, 0, 32, 31, 48, 100, 128, 5 };
@@ -177,9 +189,9 @@ public sealed class VulkanMoeGroupedIqCoopmatTests
         device.Upload(MemoryMarshal.AsBytes<uint>(offsets), bufOffW);
 
         using var narrow = MoeGroupedMatmulIqCoopmatKernel.Create(device, spvDir, iq, codebooks);
-        using var wide = MoeGroupedMatmulIqCoopmatKernel.Create(device, spvDir, iq, codebooks, wide: true);
+        using var wide = MoeGroupedMatmulIqCoopmatKernel.Create(device, spvDir, iq, codebooks, variant: variant);
         Assert.Equal(16, narrow.RowTile);
-        Assert.Equal(32, wide.RowTile);
+        Assert.Equal(variant.StartsWith("n32", StringComparison.Ordinal) ? 32 : 16, wide.RowTile);
         using var build = MoeBuildTileListKernel.Create(device, spvDir);
         wide.Launch(bufW, bufX, bufOffW, yWideLegacy, m, k, rows, E, maxRowsPerExpert: counts.Max());
         using (var ctx = device.CreateSubmitContext())

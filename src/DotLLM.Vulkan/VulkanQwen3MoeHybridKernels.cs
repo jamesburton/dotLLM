@@ -163,11 +163,11 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     internal Iq1Codebooks Iq1CodebooksOwned { get; private set; } = null!;
     private readonly Dictionary<MoeIqQuant, MoeIndexedMatmulIqMmvqKernel> _iqMmvq = new();
     private readonly Dictionary<MoeIqQuant, MoeGroupedMatmulIqCoopmatKernel> _iqGrouped = new();
-    private readonly Dictionary<MoeIqQuant, MoeGroupedMatmulIqCoopmatKernel> _iqGroupedWide = new();
+    private readonly Dictionary<(MoeIqQuant, string), MoeGroupedMatmulIqCoopmatKernel> _iqGroupedVariants = new();
 
-    /// <summary>#1348: the 32-token-tile grouped coopmat IQ kernel for a bank of type <paramref name="qt"/>, or <c>null</c> (no wide variant / unsupported device).</summary>
-    public MoeGroupedMatmulIqCoopmatKernel? MoeGroupedIqWide(DotLLM.Core.Configuration.QuantizationType qt)
-        => MoeIqFormats.FromQuantizationType(qt) is { } f && _iqGroupedWide.TryGetValue(f, out var kern) ? kern : null;
+    /// <summary>#1348: the experimental grouped coopmat IQ kernel variant <paramref name="variant"/> for a bank of type <paramref name="qt"/>, or <c>null</c>.</summary>
+    public MoeGroupedMatmulIqCoopmatKernel? MoeGroupedIqVariant(DotLLM.Core.Configuration.QuantizationType qt, string variant)
+        => MoeIqFormats.FromQuantizationType(qt) is { } f && _iqGroupedVariants.TryGetValue((f, variant), out var kern) ? kern : null;
 
     /// <summary>#823: the indexed IQ-family MMVQ (dp4a) decode kernel serving a resident expert bank of <paramref name="qt"/>, or <c>null</c> (not an IQ bank type / no kernel / no integer-dot).</summary>
     public MoeIndexedMatmulIqMmvqKernel? MoeMmvqIq(DotLLM.Core.Configuration.QuantizationType qt)
@@ -820,10 +820,11 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
                 foreach (var f in Enum.GetValues<MoeIqQuant>())
                     if (MoeGroupedMatmulIqCoopmatKernel.IsSupportedOn(device, spvDir, f))
                         kernels._iqGrouped[f] = MoeGroupedMatmulIqCoopmatKernel.Create(device, spvDir, f, iq3Codebooks, iq2Codebooks, kernels.Iq1CodebooksOwned);
-                // #1348: 32-token-tile variants (IQ3_S / IQ4_XS / IQ4_NL). Created always (a pipeline each), selected per layer by DOTLLM_VK_MOE_WIDE_TILE.
+                // #1348: experimental variants (IQ3_S / IQ4_XS / IQ4_NL), selected per layer call by DOTLLM_VK_MOE_IQ_VARIANT.
                 foreach (var f in Enum.GetValues<MoeIqQuant>())
-                    if (MoeGroupedMatmulIqCoopmatKernel.IsWideSupportedOn(device, spvDir, f))
-                        kernels._iqGroupedWide[f] = MoeGroupedMatmulIqCoopmatKernel.Create(device, spvDir, f, iq3Codebooks, iq2Codebooks, kernels.Iq1CodebooksOwned, wide: true);
+                    foreach (var v in MoeGroupedMatmulIqCoopmatKernel.Variants)
+                        if (MoeGroupedMatmulIqCoopmatKernel.IsVariantSupportedOn(device, spvDir, f, v))
+                            kernels._iqGroupedVariants[(f, v)] = MoeGroupedMatmulIqCoopmatKernel.Create(device, spvDir, f, iq3Codebooks, iq2Codebooks, kernels.Iq1CodebooksOwned, variant: v);
             }
             if ((kernels.MoeGroupedQ5_1 is not null || kernels.MoeGroupedQ8_0 is not null || kernels._iqGrouped.Count > 0) && q4.RowTile != 16)
             {

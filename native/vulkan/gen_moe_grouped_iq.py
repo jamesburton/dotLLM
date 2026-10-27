@@ -666,6 +666,124 @@ def render_wide(spec):
     return h
 
 
+NARROW_EPILOGUE = '''    coopMatStore(sums, storeStage, sg * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);
+    barrier();
+
+    for (uint i = 0u; i < 4u; i++) {
+        uint idx = lane64 + i * WAVE;
+        if (idx >= TM * TN) break;
+        uint localRowInTile = idx / TM;
+        uint m = idx - localRowInTile * TM;
+        uint lr = localRowBase + localRowInTile;
+        uint mG = mBase + sg * TM + m;
+        if (lr < expertRows && mG < pc.M) {
+            uint packedRow = expertStart + lr;
+            y[packedRow * pc.M + mG] = storeStage[sg * TM * TN + localRowInTile * TM + m];
+        }
+    }
+'''
+
+NARROW_DIET = '''    // LDS diet (#1348): one 16x16 staging tile reused by the four subgroups in turn instead of one each.
+    for (uint sgi = 0u; sgi < NSG; sgi++) {
+        if (sg == sgi) coopMatStore(sums, storeStage, 0u, TM, gl_CooperativeMatrixLayoutColumnMajor);
+        barrier();
+        if (sg == sgi) {
+            for (uint i = 0u; i < 4u; i++) {
+                uint idx = lane64 + i * WAVE;
+                if (idx >= TM * TN) break;
+                uint localRowInTile = idx / TM;
+                uint m = idx - localRowInTile * TM;
+                uint lr = localRowBase + localRowInTile;
+                uint mG = mBase + sg * TM + m;
+                if (lr < expertRows && mG < pc.M) {
+                    uint packedRow = expertStart + lr;
+                    y[packedRow * pc.M + mG] = storeStage[localRowInTile * TM + m];
+                }
+            }
+        }
+        barrier();
+    }
+'''
+
+WIDE_EPILOGUE_START = '    coopMatStore(sums, storeStage, sg * NT * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);'
+
+WIDE_DIET = '''    for (uint sgi = 0u; sgi < NSG; sgi++) {
+        for (uint half16 = 0u; half16 < NT; half16++) {
+            if (half16 == 1u && !second) break;
+            if (sg == sgi) {
+                if (half16 == 0u) coopMatStore(sums, storeStage, 0u, TM, gl_CooperativeMatrixLayoutColumnMajor);
+                else coopMatStore(sums2, storeStage, 0u, TM, gl_CooperativeMatrixLayoutColumnMajor);
+            }
+            barrier();
+            if (sg == sgi) {
+                for (uint i = 0u; i < 4u; i++) {
+                    uint idx = lane64 + i * WAVE;
+                    if (idx >= TM * TN) break;
+                    uint localRowInTile = idx / TM;
+                    uint m = idx - localRowInTile * TM;
+                    uint lr = localRowBase + half16 * TN + localRowInTile;
+                    uint mG = mBase + sg * TM + m;
+                    if (lr < expertRows && mG < pc.M) {
+                        uint packedRow = expertStart + lr;
+                        y[packedRow * pc.M + mG] = storeStage[localRowInTile * TM + m];
+                    }
+                }
+            }
+            barrier();
+        }
+    }
+'''
+
+# name suffix -> (wide, diet, ballast bytes)
+VARIANTS = {
+    'n32': (True, False, 0),
+    'diet': (False, True, 0),
+    'n32diet': (True, True, 0),
+    'bal6': (False, False, 6144),      # perturbation: +6 KB of referenced-but-dead LDS on the 16-token kernel (occupancy probe)
+}
+
+
+def render_variant(spec, wide, diet, ballast):
+    h = render_wide(spec) if wide else render(spec)
+    if diet:
+        h = _rep(h, 'shared float storeStage[NSG * NT * TM * TN];' if wide else 'shared float storeStage[NSG * TM * TN];',
+                 'shared float storeStage[TM * TN];')
+        if wide:
+            a = h.index(WIDE_EPILOGUE_START)
+            b = h.rindex('}')  # end of main
+            h = h[:a] + WIDE_DIET + h[b:]
+        else:
+            h = _rep(h, NARROW_EPILOGUE, NARROW_DIET)
+    if ballast:
+        h = _rep(h, 'shared float storeStage[', 'shared float16_t ballast[%du];\nshared float storeStage[' % (ballast // 2))
+        h = _rep(h, '    uint tid = gl_LocalInvocationID.x;\n', '    uint tid = gl_LocalInvocationID.x;\n    ballast[tid] = float16_t(0.0);\n')
+        # keep the dead LDS alive: a never-taken read at the end of main (applyScale is always 0).
+        b = h.rindex('}')
+        h = h[:b] + '    if (pc.applyScale == 0xFFFFFFFFu) y[0] = float(ballast[tid & 255u]);\n' + h[b:]
+    return h
+
+
+# Timing-only perturbation variants (issue #1348; OUTPUT IS WRONG by construction - never select these for real work). Each deletes one phase of the
+# K loop so the wall-time delta bounds what optimising that phase could buy:
+#   nobar - drops the end-of-round barrier (halves the barriers per K round)
+#   noa   - skips the weight dequantisation (the F16 A tile is written as zeros; the weight loads are still issued)
+#   now   - skips the global weight loads (dequantises zeros)
+PERTURB = ['nobar', 'noa', 'now']
+
+
+def render_perturb(spec, kind):
+    h = render(spec)
+    if kind == 'nobar':
+        h = _rep(h, '\n        barrier();\n    }\n\n    coopMatStore(', '\n    }\n\n    coopMatStore(')
+    elif kind == 'noa':
+        h = _rep(h, '    if (!rowValid) {\n', '    if (!rowValid || pc.applyScale == 0u) {\n')
+    elif kind == 'now':
+        h = _rep(h, '    if (rowValid) {\n', '    if (rowValid && pc.applyScale != 0u) {\n')
+    else:
+        raise ValueError(kind)
+    return h.replace('// Grouped ' + spec['fmt'] + ' MoE expert matmul', '// TIMING-ONLY PERTURBATION (' + kind + '): wrong output by construction.\n// Grouped ' + spec['fmt'] + ' MoE expert matmul', 1)
+
+
 def render(spec):
     h = HEADER
     h = h.replace('__FMT__', spec['fmt']).replace('__LOWER__', spec['name']).replace('__LAYOUT__', spec['layout'])
@@ -682,10 +800,16 @@ def main():
             f.write(render(spec))
         print('wrote', path)
         if spec['name'] in WIDE:
-            wpath = os.path.join(out, f"moe_grouped_matmul_{spec['name']}_coopmat_m64n32.comp")
-            with open(wpath, 'w', encoding='utf-8', newline='\n') as f:
-                f.write(render_wide(spec))
-            print('wrote', wpath)
+            for suffix, (wide, diet, ballast) in VARIANTS.items():
+                wpath = os.path.join(out, f"moe_grouped_matmul_{spec['name']}_coopmat_m64{suffix}.comp")
+                with open(wpath, 'w', encoding='utf-8', newline='\n') as f:
+                    f.write(render_variant(spec, wide, diet, ballast))
+                print('wrote', wpath)
+            for kind in PERTURB:
+                ppath = os.path.join(out, f"moe_grouped_matmul_{spec['name']}_coopmat_m64{kind}.comp")
+                with open(ppath, 'w', encoding='utf-8', newline='\n') as f:
+                    f.write(render_perturb(spec, kind))
+                print('wrote', ppath)
 
 
 if __name__ == '__main__':
