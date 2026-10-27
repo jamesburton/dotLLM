@@ -53,7 +53,7 @@ public sealed class RoPERotation
             float theta = rope?.Theta ?? 10000.0f;
             _invFreq = new float[ropeDim / 2];
             for (int i = 0; i < _invFreq.Length; i++)
-                _invFreq[i] = 1.0f / MathF.Pow(theta, 2.0f * i / ropeDim);
+                _invFreq[i] = 1.0f / PortableMath.Pow(theta, 2.0f * i / ropeDim);
             Mscale = 1.0f;
         }
     }
@@ -86,13 +86,13 @@ public sealed class RoPERotation
                 float angle = pos * _invFreq[i];
                 if (_scaled)
                 {
-                    cos[row + i] = MathF.Cos(angle) * Mscale;
-                    sin[row + i] = MathF.Sin(angle) * Mscale;
+                    cos[row + i] = PortableMath.Cos(angle) * Mscale;
+                    sin[row + i] = PortableMath.Sin(angle) * Mscale;
                 }
                 else
                 {
-                    cos[row + i] = MathF.Cos(angle);
-                    sin[row + i] = MathF.Sin(angle);
+                    cos[row + i] = PortableMath.Cos(angle);
+                    sin[row + i] = PortableMath.Sin(angle);
                 }
             }
         }
