@@ -111,11 +111,9 @@ Roofline, routing distribution and A/B measured 2026-10-27 (dev `310ceaee` + ins
 
 **Measurement (`pf`, 3 reps per call, same process, env flipped in-process; tok/s medians off -> on):**
 
-| order | 1K | 4K | 8K |
-|---|---|---|---|
-| off first (2 pairs) | 428 -> 495, 480 -> 496 | 383 -> 412, 374 -> 398 | 340 -> 368, 331 -> 333 |
-| on first (3 pairs 4K, 2 pairs 8K, 2 pairs 2K) | n/a | 376 -> 380 (off), 343 -> 330, 345 -> 337 | 320 -> 327, 295 -> 311, 2K: 379 -> 348, 361 -> 362 |
+Session 1 (off then on within each pair; off -> on): 1K 428 -> 495 and 480 -> 496; 4K 383 -> 412 and 374 -> 398; 8K 340 -> 368 and 331 -> 333.
+Session 2 (on then off within each pair; on -> off): 4K 376 -> 380, 343 -> 330, 345 -> 337; 8K 320 -> 327, 295 -> 311; 2K 379 -> 348, 361 -> 362.
 
-(second table row: each cell is on -> off in that order.) Whichever variant ran second in a pair looked better in the first session (+3..+8%) and the reversed session showed 0..+4% for on, -5..-2% at 8K, with session drift of 15% (376 -> 330 tok/s at 4K over the run). Stage timestamps (prof=2, 4K, 2 reps, readback overhead included): grouped_gate_up 2841 -> 2688 ms (-5.4%), grouped_down 1583 -> 1531 ms (-3.3%), i.e. about 1.6% of wall. **Verdict: a real but marginal gain (about 1-3% of wall), inside the run-to-run drift of this box; not defensible as a win and not shipped.** The tile count falls 35% but stage time only 3-5%, so tile-proportional overhead is not the dominant cost either; the remaining time is inside the per-K-round dequant/LDS pipeline. Next candidates, untested: dequant fused into the MMA operand path with fewer LDS round trips (bigger K round than 64), or measuring VGPR/LDS occupancy of the m64 shaders with RGA before more tile-shape work.
+Whichever variant ran second in a pair looked better in the first session (+3..+8%) and the reversed session showed 0..+4% for on, -5..-2% at 8K, with session drift of 15% (376 -> 330 tok/s at 4K over the run). Stage timestamps (prof=2, 4K, 2 reps, readback overhead included): grouped_gate_up 2841 -> 2688 ms (-5.4%), grouped_down 1583 -> 1531 ms (-3.3%), i.e. about 1.6% of wall. **Verdict: a real but marginal gain (about 1-3% of wall), inside the run-to-run drift of this box; not defensible as a win and not shipped.** The tile count falls 35% but stage time only 3-5%, so tile-proportional overhead is not the dominant cost either; the remaining time is inside the per-K-round dequant/LDS pipeline. Next candidates, untested: dequant fused into the MMA operand path with fewer LDS round trips (bigger K round than 64), or measuring VGPR/LDS occupancy of the m64 shaders with RGA before more tile-shape work.
 
 The only shipped change is the profile counters (`tilesT16..T128`, `activeExperts`, `expertsWithRows[...]`; counts, not ms, printed with the stage table).
