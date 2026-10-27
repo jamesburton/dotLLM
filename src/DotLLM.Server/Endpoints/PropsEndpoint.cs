@@ -30,6 +30,7 @@ public static class PropsEndpoint
                 MtpActive = state.IsReady && state.MtpActive,
                 MtpStatus = state.IsReady ? state.MtpStatus : null,
                 DeviceFallbackWarning = state.IsReady ? state.DeviceFallbackWarning : null,
+                Reasoning = state.IsReady ? ReasoningSupport.Capabilities(state.ChatTemplate) : null,
                 IsReady = state.IsReady,
                 Activity = state.GetStatus(),
                 Version = DotLLM.Core.BuildInfo.Version,

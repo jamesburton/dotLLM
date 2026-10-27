@@ -227,6 +227,13 @@ async function* streamChat(messages, params) {
     if (params.enable_thinking === true || params.enable_thinking === false) {
         body.enable_thinking = params.enable_thinking;
     }
+    // Reasoning effort (template variable) and thinking budget (server forces the close tag after N thinking tokens).
+    if (params.reasoning_effort) {
+        body.reasoning_effort = params.reasoning_effort;
+    }
+    if (params.thinking_budget_tokens != null) {
+        body.thinking_budget_tokens = params.thinking_budget_tokens;
+    }
 
     const response = await fetch('/v1/chat/completions', {
         method: 'POST',
@@ -813,9 +820,110 @@ function syncSettingsFromState() {
     setVal('opt-top-k', d.top_k, 'topk-val');
     setVal('opt-min-p', d.min_p, 'minp-val', v => Number(v).toFixed(2));
     setVal('opt-rep-penalty', d.repetition_penalty, 'rep-val', v => Number(v).toFixed(2));
-    setVal('opt-max-tokens', d.max_tokens);
+    // Max tokens is left empty ("auto") unless the user set one; the server default is shown as the hint.
+    for (const id of ['opt-max-tokens', 'q-maxtok']) {
+        const el = $(`#${id}`);
+        if (el) el.placeholder = `auto (${d.max_tokens})`;
+    }
     setVal('opt-seed', d.seed ?? '');
     $('#opt-verbose').checked = state.verbose;
+    updateGenControlsVisibility();
+}
+
+// ── GENERATION CONTROLS (thinking / effort / budget / max tokens) ──
+// Each control exists twice: in the Settings panel (opt-*) and in the bar above the input (q-*). They mirror each
+// other, apply to the very next request (no "Apply Defaults" needed) and persist in localStorage.
+
+const GEN_PAIRS = [
+    ['opt-thinking', 'q-thinking'],
+    ['opt-effort', 'q-effort'],
+    ['opt-budget', 'q-budget'],
+    ['opt-max-tokens', 'q-maxtok'],
+];
+const GEN_STORAGE_KEY = 'dotllm-gen-opts';
+// With a thinking model and no explicit Max Tokens, leave room for the thinking block AND the answer.
+const AUTO_THINKING_MAX_TOKENS = 16384;
+const MAX_TOKENS_CEILING = 131072;
+
+function setGenOpt(optId, value) {
+    const pair = GEN_PAIRS.find(p => p[0] === optId);
+    for (const id of pair) {
+        const el = $(`#${id}`);
+        if (el) el.value = value;
+    }
+    saveGenOpts();
+    updateGenControlsVisibility();
+}
+
+function saveGenOpts() {
+    try {
+        const o = {};
+        for (const [optId] of GEN_PAIRS) o[optId] = $(`#${optId}`)?.value ?? '';
+        localStorage.setItem(GEN_STORAGE_KEY, JSON.stringify(o));
+    } catch { /* localStorage unavailable */ }
+}
+
+function loadGenOpts() {
+    let o = {};
+    try { o = JSON.parse(localStorage.getItem(GEN_STORAGE_KEY) || '{}') || {}; } catch { /* ignore */ }
+    for (const [optId, qId] of GEN_PAIRS) {
+        const v = o[optId];
+        if (typeof v !== 'string') continue;
+        for (const id of [optId, qId]) {
+            const el = $(`#${id}`);
+            if (el) el.value = v;
+        }
+    }
+}
+
+function initGenControls() {
+    for (const [optId, qId] of GEN_PAIRS) {
+        for (const id of [optId, qId]) {
+            const el = $(`#${id}`);
+            if (!el) continue;
+            const handler = () => setGenOpt(optId, el.value);
+            el.addEventListener('input', handler);
+            el.addEventListener('change', handler);
+        }
+    }
+    loadGenOpts();
+    updateGenControlsVisibility();
+}
+
+/** What the loaded model's chat template can do (/props reasoning, #1106); null when the server does not say. */
+function reasoningCaps() {
+    return state.config?.reasoning ?? null;
+}
+
+function thinkingMode() {
+    return $('#opt-thinking')?.value ?? 'default';   // default | on | off
+}
+
+function updateGenControlsVisibility() {
+    const caps = reasoningCaps();
+    // Unknown (older server / no template) -> show everything; otherwise only what the template reads.
+    const show = {
+        thinking: !caps || caps.enable_thinking || caps.thinking_block,
+        effort: !caps || caps.reasoning_effort,
+        budget: !caps || caps.thinking_block,
+        maxtok: true,
+    };
+    const off = thinkingMode() === 'off';
+    for (const el of document.querySelectorAll('[data-gen]')) {
+        const k = el.dataset.gen;
+        const visible = show[k] && !((k === 'effort' || k === 'budget') && off);
+        el.classList.toggle('hidden', !visible);
+    }
+}
+
+/** Max tokens for the next request: the explicit value, else auto (larger when the model will think). */
+function resolveMaxTokens() {
+    const explicit = parseInt($('#opt-max-tokens')?.value);
+    if (explicit > 0) return Math.min(explicit, MAX_TOKENS_CEILING);
+    const def = state.config?.sampling_defaults?.max_tokens || 2048;
+    const caps = reasoningCaps();
+    const thinks = thinkingMode() !== 'off' && (!caps || caps.thinking_block);
+    return thinks ? Math.max(def, AUTO_THINKING_MAX_TOKENS) : def;
 }
 
 function getSettingsFromUI() {
@@ -826,9 +934,14 @@ function getSettingsFromUI() {
         top_k: parseInt($('#opt-top-k').value) || 0,
         min_p: parseFloat($('#opt-min-p').value),
         repetition_penalty: parseFloat($('#opt-rep-penalty').value),
-        max_tokens: parseInt($('#opt-max-tokens').value) || 2048,
+        // Explicit value, else the server's default (runGeneration swaps in resolveMaxTokens() for real requests).
+        max_tokens: parseInt($('#opt-max-tokens').value) || state.config?.sampling_defaults?.max_tokens || 2048,
         seed: $('#opt-seed').value ? parseInt($('#opt-seed').value) : null,
         enable_thinking: ({ on: true, off: false })[$('#opt-thinking')?.value] ?? null,
+        reasoning_effort: (thinkingMode() !== 'off' && ['low', 'medium', 'high'].includes($('#opt-effort')?.value))
+            ? $('#opt-effort').value : null,
+        thinking_budget_tokens: (thinkingMode() !== 'off' && $('#opt-budget')?.value !== '' && parseInt($('#opt-budget')?.value) >= 0)
+            ? parseInt($('#opt-budget').value) : null,
         logprobs: logprobs,
         top_logprobs: logprobs ? (parseInt($('#opt-top-logprobs')?.value) || 5) : 0,
     };
@@ -1305,6 +1418,7 @@ async function runGeneration(round) {
     const startTime = performance.now();
     let firstTokenTime = null;
     let reasoningText = '';
+    let reasoningTokens = 0;
     let reasoningEl = null;
     let reasoningStart = null;
     const collapseReasoning = () => {
@@ -1328,6 +1442,7 @@ async function runGeneration(round) {
 
     // Get current sampling params + tools
     const params = getSettingsFromUI();
+    params.max_tokens = resolveMaxTokens();
     const tools = getToolsForRequest();
     if (tools) params.tools = tools;
 
@@ -1346,6 +1461,7 @@ async function runGeneration(round) {
                     reasoningEl = createReasoningBlock('', true);
                     placeholder.bubble.insertBefore(reasoningEl, placeholder.contentEl);
                 }
+                reasoningTokens++;
                 reasoningText += event.content;
                 reasoningEl.querySelector('.reasoning-body').textContent = reasoningText;
                 scrollToBottom();
@@ -1480,6 +1596,15 @@ async function runGeneration(round) {
         logprobs: useLogprobs ? logprobEntries : null,
     });
 
+    if (finishReason === 'length') {
+        placeholder.bubble.appendChild(createLengthNotice(placeholder.wrapper, {
+            answered: fullText.trim().length > 0,
+            reasoningTokens: usageData?.completion_tokens_details?.reasoning_tokens ?? reasoningTokens,
+            totalTokens: usageData?.completion_tokens ?? tokenCount,
+            maxTokens: params.max_tokens,
+        }));
+    }
+
     // Reset UI
     state.isGenerating = false;
     sendBtn.classList.remove('hidden');
@@ -1488,6 +1613,51 @@ async function runGeneration(round) {
     setStatus('Ready', 'text-emerald-500');
     userInput.focus();
     saveConversation();
+}
+
+/**
+ * Notice shown when a reply ended on finish_reason "length". Says whether the budget went on thinking and offers
+ * one-click retries (the truncated message is dropped and the same turn is regenerated with the new setting).
+ */
+function createLengthNotice(wrapper, info) {
+    const box = document.createElement('div');
+    box.className = 'mt-2 rounded border border-yellow-600/40 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-300';
+    const msg = document.createElement('div');
+    msg.textContent = info.answered
+        ? `Stopped at the max-token limit (${info.maxTokens}) - the reply was cut off.`
+        : `Stopped at the max-token limit (${info.maxTokens}) before any answer - ${info.reasoningTokens} of ${info.totalTokens} tokens went on thinking. Raise Max Tokens or turn thinking down.`;
+    box.appendChild(msg);
+
+    const row = document.createElement('div');
+    row.className = 'mt-1.5 flex flex-wrap gap-2';
+    const mk = (label, fn) => {
+        const b = document.createElement('button');
+        b.className = 'px-2 py-0.5 rounded border border-yellow-600/50 hover:bg-yellow-500/20 transition';
+        b.textContent = label;
+        b.addEventListener('click', () => retryTruncated(wrapper, fn));
+        row.appendChild(b);
+    };
+    const bigger = Math.min(MAX_TOKENS_CEILING, Math.max(8192, info.maxTokens * 4));
+    if (info.maxTokens < MAX_TOKENS_CEILING) mk(`Retry with ${bigger} tokens`, () => setGenOpt('opt-max-tokens', String(bigger)));
+    const caps = reasoningCaps();
+    if (!info.answered && thinkingMode() !== 'off' && (!caps || caps.enable_thinking)) {
+        mk('Retry with thinking off', () => setGenOpt('opt-thinking', 'off'));
+    }
+    if (!info.answered && thinkingMode() !== 'off' && (!caps || caps.reasoning_effort) && $('#opt-effort')?.value !== 'low') {
+        mk('Retry with low effort', () => setGenOpt('opt-effort', 'low'));
+    }
+    if (row.childElementCount) box.appendChild(row);
+    return box;
+}
+
+async function retryTruncated(wrapper, applySetting) {
+    if (state.isGenerating || state.awaitingToolResults) return;
+    const last = state.messages[state.messages.length - 1];
+    if (last?.role !== 'assistant') return;
+    state.messages.pop();
+    wrapper.remove();
+    applySetting();
+    await runGeneration(0);
 }
 
 // ── TOOL CALL UI ──
@@ -2079,6 +2249,7 @@ function esc(s) {
 
 async function init() {
     setStatus('Connecting...', 'text-yellow-500');
+    initGenControls();
 
     try {
         state.config = await fetchProps();
