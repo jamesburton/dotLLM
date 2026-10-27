@@ -1938,6 +1938,9 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     /// <summary>#823: the grouped coopmat kernel for an IQ-family bank of type <paramref name="qt"/> (16-row tiles only), or null.</summary>
     private MoeGroupedMatmulIqCoopmatKernel? GroupedIqKernel(QuantizationType qt) => _kernels.MoeGroupedIq(qt);
 
+    /// <summary>#1348: <c>DOTLLM_VK_MOE_WIDE_TILE=1</c> selects the 32-token-tile grouped IQ kernels. Read per layer call so one process can A/B it.</summary>
+    private static bool MoeWideTokenTileEnabled() => Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_WIDE_TILE") == "1";
+
     /// <summary>
     /// True when the layer's three banks all have a grouped coopmat kernel that agree on one tile list (#823 extends #849/#821 to IQ banks).
     /// IQ and legacy-quant kernels are 16-row only, so any layer containing one needs 16-row kernels everywhere; a K-quant down kernel that
@@ -1987,6 +1990,36 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     internal bool Q8GateUpMmvq { get; set; }
 
     /// <summary>
+    /// Profile-only (#1334/#1349): reads the per-expert group offsets back and accumulates how many tiles each candidate token-tile width
+    /// would need (sum of ceil(rows/T) over experts), the active-expert count and a rows-per-expert histogram, so the token-tile roofline
+    /// uses the real routing distribution. Keys are counts, not milliseconds. Never runs outside <c>MoeStageProfileEnabled</c>.
+    /// </summary>
+    private void ProfileRoutingDistribution(int numE)
+    {
+        Span<float> raw = numE + 1 <= 4096 ? stackalloc float[numE + 1] : new float[numE + 1];
+        _device.Download(_state.MoeGroupOffsets!, raw);
+        void Add(string key, long v) => _moeStageMs[key] = _moeStageMs.GetValueOrDefault(key) + v;
+        foreach (int t in new[] { 16, 32, 48, 64, 128 })
+        {
+            long tiles = 0;
+            for (int e = 0; e < numE; e++)
+            {
+                uint c = BitConverter.SingleToUInt32Bits(raw[e + 1]) - BitConverter.SingleToUInt32Bits(raw[e]);
+                tiles += (c + (uint)t - 1) / (uint)t;
+            }
+            Add($"tilesT{t}(count,not ms)", tiles);
+        }
+        for (int e = 0; e < numE; e++)
+        {
+            uint c = BitConverter.SingleToUInt32Bits(raw[e + 1]) - BitConverter.SingleToUInt32Bits(raw[e]);
+            if (c > 0) Add("activeExperts(count,not ms)", 1);
+            string bin = c == 0 ? "0" : c <= 4 ? "1-4" : c <= 8 ? "5-8" : c <= 16 ? "9-16" : c <= 32 ? "17-32" : c <= 64 ? "33-64" : c <= 128 ? "65-128" : "129+";
+            Add($"expertsWithRows[{bin}](count,not ms)", 1);
+        }
+        Add("tileLists(count,not ms)", 1);
+    }
+
+    /// <summary>
     /// Grouped-by-expert routed FFN (issue #637). Buffer reuse: MoeExpandedInput (broadcast rows) -> packed rows in MoeDownRows ->
     /// gate/up into MoeGateInter/MoeUpInter (packed order) -> SwiGLU -> grouped down into MoeExpandedInput (dead by now) -> ungroup into
     /// MoeDownRows in the original row order, which the weighted scatter then consumes unchanged.
@@ -1998,6 +2031,13 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         var legacyDown = GroupedLegacyDownKernel(moeW.W2QuantType);
         var iqDown = GroupedIqKernel(moeW.W2QuantType);          // #823
         var iqGateUp = GroupedIqKernel(moeW.W1QuantType);        // #823
+        // #1348: 32-token tiles when gate/up AND down both have a wide variant (they share one tile list); otherwise the layer stays at 16.
+        if (iqGateUp is not null && iqDown is not null && MoeWideTokenTileEnabled()
+            && _kernels.MoeGroupedIqWide(moeW.W1QuantType) is { } wideGu && _kernels.MoeGroupedIqWide(moeW.W2QuantType) is { } wideDn)
+        {
+            iqGateUp = wideGu;
+            iqDown = wideDn;
+        }
         var gateUpMmq = (iqGateUp is null && legacyDown is null && iqDown is null) ? GroupedGateUpMmqKernel(moeW.W1QuantType) : null;
         var downMmq = (gateUpMmq is not null) ? GroupedDownMmqKernel(moeW.W2QuantType) : null;
         bool useMmq = gateUpMmq is not null && downMmq is not null
@@ -2138,6 +2178,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 Span<float> raw = stackalloc float[6];
                 _device.Download(_state.MoeGroupDispatchArgs, raw);   // uint triples reinterpreted as float bits
                 _moeStageMs["tiles(count,not ms)"] = _moeStageMs.GetValueOrDefault("tiles(count,not ms)") + BitConverter.SingleToUInt32Bits(raw[1]);
+                ProfileRoutingDistribution(numE);
                 _moeStageLast = System.Diagnostics.Stopwatch.GetTimestamp();
             }
             if (iqGateUp is not null)

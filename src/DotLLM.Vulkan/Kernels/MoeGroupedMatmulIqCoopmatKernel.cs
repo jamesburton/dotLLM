@@ -12,6 +12,7 @@ namespace DotLLM.Vulkan.Kernels;
 public sealed class MoeGroupedMatmulIqCoopmatKernel : IDisposable, IMoeGroupedF32Kernel
 {
     private const int TileN = 16;
+    private const int WideTileN = 32;
     private const int TileM = 64;
     private const int PushConstantBytes = 8 * sizeof(uint);
 
@@ -27,16 +28,20 @@ public sealed class MoeGroupedMatmulIqCoopmatKernel : IDisposable, IMoeGroupedF3
     /// <summary>The bank format this kernel reads.</summary>
     public MoeIqQuant Quant { get; }
 
+    /// <summary>True for the 32-token-tile variant (issue #1348): <see cref="RowTile"/> is 32 and the tile list must be built with 32-row tiles.</summary>
+    public bool Wide { get; }
+
     /// <summary>Bytes per block (super-block for IQ3_S / IQ4_XS).</summary>
     public int BlockBytes { get; }
 
     /// <summary>Smallest legal K step for the bank: the format's block size, but at least one staging round (64).</summary>
     public int KGroup { get; }
 
-    private MoeGroupedMatmulIqCoopmatKernel(MoeIqQuant quant, VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
+    private MoeGroupedMatmulIqCoopmatKernel(MoeIqQuant quant, bool wide, VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
         int buffersPerSet, VulkanDevice.Buffer[] codebooks)
     {
         Quant = quant;
+        Wide = wide;
         var (blockBytes, group) = MoeIqFormats.Describe(quant);
         BlockBytes = blockBytes;
         KGroup = Math.Max(group, 64);
@@ -53,7 +58,7 @@ public sealed class MoeGroupedMatmulIqCoopmatKernel : IDisposable, IMoeGroupedF3
     private int ElementsPerBlock => MoeIqFormats.Describe(Quant).GroupSize;
 
     /// <summary>The SPIR-V file for <paramref name="quant"/>.</summary>
-    public static string SpvName(MoeIqQuant quant) => quant switch
+    public static string SpvName(MoeIqQuant quant, bool wide = false) => wide ? WideSpvName(quant) : quant switch
     {
         MoeIqQuant.IQ3_S => "moe_grouped_matmul_iq3_s_coopmat_m64.spv",
         MoeIqQuant.IQ4_XS => "moe_grouped_matmul_iq4_xs_coopmat_m64.spv",
@@ -69,6 +74,22 @@ public sealed class MoeGroupedMatmulIqCoopmatKernel : IDisposable, IMoeGroupedF3
         _ => throw new ArgumentOutOfRangeException(nameof(quant)),
     };
 
+    /// <summary>The 32-token-tile SPIR-V for <paramref name="quant"/> (issue #1348), or null when no wide variant is generated for that format.</summary>
+    public static string? WideSpvNameOrNull(MoeIqQuant quant) => quant switch
+    {
+        MoeIqQuant.IQ3_S => "moe_grouped_matmul_iq3_s_coopmat_m64n32.spv",
+        MoeIqQuant.IQ4_XS => "moe_grouped_matmul_iq4_xs_coopmat_m64n32.spv",
+        MoeIqQuant.IQ4_NL => "moe_grouped_matmul_iq4_nl_coopmat_m64n32.spv",
+        _ => null,
+    };
+
+    private static string WideSpvName(MoeIqQuant quant)
+        => WideSpvNameOrNull(quant) ?? throw new ArgumentOutOfRangeException(nameof(quant), "no wide-token-tile variant for this format");
+
+    /// <summary>Whether the wide (32-token) variant of <paramref name="quant"/> can run on <paramref name="device"/> (same gates as <see cref="IsSupportedOn"/>).</summary>
+    public static bool IsWideSupportedOn(VulkanDevice device, string spvDir, MoeIqQuant quant)
+        => WideSpvNameOrNull(quant) is { } n && device.HasCooperativeMatrix && device.SubgroupSize == 64 && File.Exists(Path.Combine(spvDir, n));
+
     /// <summary>
     /// Whether <paramref name="device"/> has cooperative matrices, NATIVE wave64 (the shader bakes 4 x 64-thread subgroups into its
     /// workgroup: on a 32-wide device the surplus subgroups would index shared memory out of bounds and corrupt neighbouring tiles
@@ -78,13 +99,13 @@ public sealed class MoeGroupedMatmulIqCoopmatKernel : IDisposable, IMoeGroupedF3
         => device.HasCooperativeMatrix && device.SubgroupSize == 64 && File.Exists(Path.Combine(spvDir, SpvName(quant)));
 
     /// <summary>Creates the kernel for <paramref name="quant"/>; <paramref name="iq3Codebooks"/> supplies the iq3s grid (IQ3_S only; caller keeps ownership).</summary>
-    internal static MoeGroupedMatmulIqCoopmatKernel Create(VulkanDevice device, string spvDir, MoeIqQuant quant, Iq3Codebooks? iq3Codebooks = null, Iq2Codebooks? iq2Codebooks = null, Iq1Codebooks? iq1Codebooks = null)
+    internal static MoeGroupedMatmulIqCoopmatKernel Create(VulkanDevice device, string spvDir, MoeIqQuant quant, Iq3Codebooks? iq3Codebooks = null, Iq2Codebooks? iq2Codebooks = null, Iq1Codebooks? iq1Codebooks = null, bool wide = false)
     {
-        if (!IsSupportedOn(device, spvDir, quant))
+        if (wide ? !IsWideSupportedOn(device, spvDir, quant) : !IsSupportedOn(device, spvDir, quant))
             throw new InvalidOperationException("MoeGroupedMatmulIqCoopmatKernel requires VK_KHR_cooperative_matrix, wave64 and the SPIR-V.");
         var codebooks = MoeIqFormats.Codebooks(quant, iq3Codebooks, iq2Codebooks, iq1Codebooks);
         int buffersPerSet = 4 + codebooks.Length;
-        var module = VulkanModule.LoadFromFile(device, Path.Combine(spvDir, SpvName(quant)));
+        var module = VulkanModule.LoadFromFile(device, Path.Combine(spvDir, SpvName(quant, wide)));
         ComputePipeline pipeline;
         try
         {
@@ -98,13 +119,13 @@ public sealed class MoeGroupedMatmulIqCoopmatKernel : IDisposable, IMoeGroupedF3
             throw;
         }
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)buffersPerSet);
-        return new MoeGroupedMatmulIqCoopmatKernel(quant, device, module, pipeline, pool, buffersPerSet, codebooks);
+        return new MoeGroupedMatmulIqCoopmatKernel(quant, wide, device, module, pipeline, pool, buffersPerSet, codebooks);
     }
 
     internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
 
-    /// <summary>Token rows per workgroup (always 16).</summary>
-    public int RowTile => TileN;
+    /// <summary>Token rows per workgroup: 16, or 32 for the wide variant (issue #1348).</summary>
+    public int RowTile => Wide ? WideTileN : TileN;
 
     /// <summary>Weight-row tiles per workgroup column (the x extent of the grid): <c>ceil(m / 64)</c>.</summary>
     public int MTiles(int m) => (m + TileM - 1) / TileM;
@@ -141,7 +162,7 @@ public sealed class MoeGroupedMatmulIqCoopmatKernel : IDisposable, IMoeGroupedF3
         if (offsets.Size < (long)(numExperts + 1) * sizeof(uint)) throw new ArgumentException("offsets buffer too small.", nameof(offsets));
         Bind(cmdBuf, bank, packedInput, offsets, output, m, k, rows, numExperts, rowBytes, tileList: 0);
         int rowTiles = maxRowsPerExpert > 0 ? Math.Min(maxRowsPerExpert, rows) : rows;
-        VulkanApi.vkCmdDispatch(cmdBuf, (uint)MTiles(m), (uint)((rowTiles + TileN - 1) / TileN), (uint)numExperts);
+        VulkanApi.vkCmdDispatch(cmdBuf, (uint)MTiles(m), (uint)((rowTiles + RowTile - 1) / RowTile), (uint)numExperts);
     }
 
     /// <summary>
