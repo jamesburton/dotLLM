@@ -315,22 +315,24 @@
                     <!-- KV-Cache options -->
                     <div>
                         <label class="text-[10px] uppercase tracking-wider text-zinc-500 block mb-1">KV-Cache Quantization</label>
-                        <p class="text-[10px] text-zinc-600 mb-1.5">Compress the attention cache to fit longer contexts. Lower precision = less memory but slightly lower quality. f32 is full precision.</p>
+                        <p class="text-[10px] text-zinc-600 mb-1.5">Compress the attention cache to fit longer contexts. Lower precision = less memory but slightly lower quality. auto lets the server pick per model (usually q8_0 or f16).</p>
                         <div class="grid grid-cols-2 gap-2">
                             <div>
                                 <label class="text-[10px] text-zinc-500 block mb-0.5">Keys</label>
                                 <select id="modal-cache-k" class="w-full bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-300 focus:outline-none focus:border-zinc-500">
-                                    <option value="f32" selected>f32 (full precision)</option>
-                                    <option value="q8_0">q8_0 (2x compression)</option>
-                                    <option value="q4_0">q4_0 (4x compression)</option>
+                                    <option value="auto" selected>auto (model default)</option>
+                                    <option value="f16">f16 (half precision)</option>
+                                    <option value="q8_0">q8_0 (about 2x smaller than f16)</option>
+                                    <option value="q4_0">q4_0 (about 4x smaller than f16)</option>
                                 </select>
                             </div>
                             <div>
                                 <label class="text-[10px] text-zinc-500 block mb-0.5">Values</label>
                                 <select id="modal-cache-v" class="w-full bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-300 focus:outline-none focus:border-zinc-500">
-                                    <option value="f32" selected>f32 (full precision)</option>
-                                    <option value="q8_0">q8_0 (2x compression)</option>
-                                    <option value="q4_0">q4_0 (4x compression)</option>
+                                    <option value="auto" selected>auto (model default)</option>
+                                    <option value="f16">f16 (half precision)</option>
+                                    <option value="q8_0">q8_0 (about 2x smaller than f16)</option>
+                                    <option value="q4_0">q4_0 (about 4x smaller than f16)</option>
                                 </select>
                             </div>
                         </div>

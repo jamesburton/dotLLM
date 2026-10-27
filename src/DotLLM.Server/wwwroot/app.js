@@ -169,8 +169,8 @@ async function loadModel(model, quant, opts) {
     if (quant) body.quant = quant;
     if (opts?.device) body.device = opts.device;
     if (opts?.isGpu && opts?.gpuLayers != null) body.gpu_layers = opts.gpuLayers;
-    if (opts?.cacheTypeK && opts.cacheTypeK !== 'f32') body.cache_type_k = opts.cacheTypeK;
-    if (opts?.cacheTypeV && opts.cacheTypeV !== 'f32') body.cache_type_v = opts.cacheTypeV;
+    if (opts?.cacheTypeK && opts.cacheTypeK !== 'auto') body.cache_type_k = opts.cacheTypeK;
+    if (opts?.cacheTypeV && opts.cacheTypeV !== 'auto') body.cache_type_v = opts.cacheTypeV;
     if (opts?.threads) body.threads = opts.threads;
     if (opts?.decodeThreads) body.decode_threads = opts.decodeThreads;
     if (opts?.speculativeModel) body.speculative_model = opts.speculativeModel;
@@ -979,8 +979,8 @@ function openModelModal() {
     modalSpeculativeKVal.textContent = '5';
     modalLoadBtn.disabled = true;
     modalStatus.innerHTML = '';
-    modalCacheK.value = 'f32';
-    modalCacheV.value = 'f32';
+    modalCacheK.value = 'auto';
+    modalCacheV.value = 'auto';
     // (#757) Device defaults to the best servable GPU, CPU only when none is servable (resolved asynchronously).
     modalDeviceTouched = false;
     modalGpuDevice = null;
