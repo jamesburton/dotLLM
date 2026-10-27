@@ -619,6 +619,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             }
             if (_tsCount > 1) CollectStageTimestamps();
             _tsCount = 0;
+            VulkanApi.SkipDispatches = false;
             VulkanApi.vkCmdResetQueryPool(_submit.CommandBuffer, _tsPool, 0, TsMax);
             TsStamp("~begin");
         }
@@ -630,8 +631,21 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         if (MoeStageProfileEnabled) MoeStage(name);
     }
 
+    /// <summary>Perturbation (#1334): <c>DOTLLM_VK_PERTURB=target=after1|after2</c> suppresses every dispatch recorded between the stage marker named in <c>after</c> and the marker <c>target</c> (timing attribution only; needs stage profiling on).</summary>
+    internal static string? PerturbTarget { get; set; }
+    internal static string[] PerturbAfter { get; set; } = [];
+    static VulkanQwen3MoeHybridTransformerModel()
+    {
+        if (Environment.GetEnvironmentVariable("DOTLLM_VK_PERTURB") is { Length: > 0 } pv && pv.Split('=', 2) is [var t, var af]) { PerturbTarget = t; PerturbAfter = af.Split('|'); }
+    }
+
     private void MoeStage(string name)
     {
+        if (PerturbTarget is not null)
+        {
+            if (name == PerturbTarget) VulkanApi.SkipDispatches = false;
+            else if (Array.IndexOf(PerturbAfter, name) >= 0) VulkanApi.SkipDispatches = true;
+        }
         if (!MoeStageProfileEnabled) return;
         if (StageTimestamps) { TsStamp(name); return; }
         KernelSupport.ComputeToHostBarrier(_submit.CommandBuffer);
