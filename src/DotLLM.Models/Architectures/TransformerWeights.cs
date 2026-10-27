@@ -1284,6 +1284,27 @@ internal sealed class TransformerWeights : IDisposable
     /// </exception>
     internal static void ThrowIfArchitectureNeedsDedicatedLoader(ModelConfig config)
     {
+        string? why = DedicatedLoaderReason(config);
+        if (why is null)
+            return;
+
+        throw new NotSupportedException(
+            $"Architecture {config.Architecture} does not use the dense Llama-style GGUF tensor "
+            + $"naming that TransformerWeights.LoadFromGguf assumes, because {why}. Loading it "
+            + "here would fail later with a misleading \"blk.0.attn_output.weight not present\". "
+            + "Load it through the per-architecture dispatcher for your backend instead: "
+            + "ModelLoader.CreateCpuModelFromGguf (CPU), VulkanModelLoader.CreateFromGguf "
+            + "(Vulkan), or CudaModelLoader.CreateFromGguf (CUDA).");
+    }
+
+    /// <summary>
+    /// Why <paramref name="config"/>'s architecture cannot use the dense Llama-style loader
+    /// (<see cref="LoadFromGguf"/>), or <c>null</c> when it can. Lets a caller (e.g. the server validating a
+    /// speculative draft model) check up front, before any expensive work, instead of hitting
+    /// <see cref="ThrowIfArchitectureNeedsDedicatedLoader"/> late.
+    /// </summary>
+    internal static string? DedicatedLoaderReason(ModelConfig config)
+    {
         ArgumentNullException.ThrowIfNull(config);
 
         string? why = config.Architecture switch
@@ -1307,17 +1328,7 @@ internal sealed class TransformerWeights : IDisposable
                 + "safetensors-first on every backend",
             _ => null,
         };
-
-        if (why is null)
-            return;
-
-        throw new NotSupportedException(
-            $"Architecture {config.Architecture} does not use the dense Llama-style GGUF tensor "
-            + $"naming that TransformerWeights.LoadFromGguf assumes, because {why}. Loading it "
-            + "here would fail later with a misleading \"blk.0.attn_output.weight not present\". "
-            + "Load it through the per-architecture dispatcher for your backend instead: "
-            + "ModelLoader.CreateCpuModelFromGguf (CPU), VulkanModelLoader.CreateFromGguf "
-            + "(Vulkan), or CudaModelLoader.CreateFromGguf (CUDA).");
+        return why;
     }
 
     /// <summary>

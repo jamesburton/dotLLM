@@ -190,7 +190,7 @@ public static class ServerStartup
                 explicitState.Options = explicitState.Options with { ResolvedDevice = canonical };
                 return explicitState;
             }
-            catch (Exception ex) when (spec.IsGpu && ex is not DeviceUnavailableException)
+            catch (Exception ex) when (spec.IsGpu && ex is not (DeviceUnavailableException or InvalidServerOptionException))
             {
                 throw new DeviceUnavailableException(
                     DeviceSelector.ExplicitFailureMessage(options.Device, name, bytes, $"loading the model failed: {ex.Message}"), ex);
@@ -221,7 +221,7 @@ public static class ServerStartup
                 }
                 return loaded;
             }
-            catch (Exception ex) when (device != "cpu")
+            catch (Exception ex) when (device != "cpu" && ex is not InvalidServerOptionException)
             {
                 last = ex;
                 gpuFailures.Add($"{device}: {ex.Message}");
@@ -376,6 +376,28 @@ public static class ServerStartup
         }
     }
 
+    /// <summary>
+    /// Opens only the metadata of the <c>--speculative-model</c> draft (the file is mapped, no tensor is read) and rejects architectures the dense draft
+    /// loader cannot take. A draft that is missing or unreadable is left to the real load below, which reports it as before.
+    /// </summary>
+    private static void ValidateSpeculativeDraftEarly(ServerOptions options, ModelConfig target)
+    {
+        if (string.IsNullOrEmpty(options.SpeculativeModel)) return;
+        string? draftPath = ResolveModelPath(options.SpeculativeModel, null);
+        if (draftPath is null) return;
+        ModelConfig draftConfig;
+        try
+        {
+            using var draftGguf = GgufFile.Open(draftPath);
+            draftConfig = GgufModelConfigExtractor.Extract(draftGguf.Metadata);
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or NotSupportedException or ArgumentException)
+        {
+            return;
+        }
+        SpeculativeDraftValidator.Validate(draftConfig, draftPath, target);
+    }
+
     private static ServerState LoadModelCore(string resolvedPath, ServerOptions options)
     {
         Console.WriteLine($"[dotllm] Loading model from {resolvedPath}...");
@@ -389,6 +411,9 @@ public static class ServerStartup
             return LoadEncoderModel(resolvedPath, options, gguf, config, tokenizer);
 
         var threading = new ThreadingConfig(options.Threads, options.DecodeThreads);
+
+        // A draft that cannot load must fail NOW, not after the target (up to tens of GiB) is resident, and not as a "device" failure (#1319).
+        ValidateSpeculativeDraftEarly(options, config);
 
         if (options.GpuLayers is { } requestedLayers && requestedLayers > config.NumLayers)
             Console.WriteLine($"[dotllm] Requested {requestedLayers} GPU layers but {Path.GetFileName(resolvedPath)} has {config.NumLayers}; using all {config.NumLayers}.");
