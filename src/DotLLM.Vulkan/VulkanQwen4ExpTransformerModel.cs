@@ -85,7 +85,7 @@ public sealed class VulkanQwen4ExpSequenceState : IGdnState
 /// (<see cref="AttachMtpHead(string)"/>) and per-row recurrent snapshots live on the model-owned state only (see <c>VulkanQwen4ExpTransformerModel.Mtp.cs</c>); the batch scheduler does not speculate.
 /// </para>
 /// </remarks>
-public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
+public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel, IContextLimitable
 {
     private readonly VulkanDevice _device;
     private readonly GgufFile _gguf;
@@ -162,7 +162,22 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
     private bool _disposed;
 
     /// <inheritdoc/>
-    public ModelConfig Config { get; }
+    public ModelConfig Config { get; private set; }
+
+    /// <summary>
+    /// The window the model was loaded with: the K/V + indexer capacity, at most the checkpoint's own. <see cref="Config"/>'s
+    /// <c>MaxSequenceLength</c> starts here, so the server clamps <c>max_tokens</c> to it (finish_reason <c>length</c>), rejects longer prompts with
+    /// <c>context_length_exceeded</c> and reports it as <c>n_ctx</c>, instead of advertising the checkpoint's window and failing mid-generation.
+    /// </summary>
+    public int NativeMaxSequenceLength { get; private set; }
+
+    /// <inheritdoc/>
+    public void LimitContextLength(int maxSequenceLength)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxSequenceLength);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(maxSequenceLength, NativeMaxSequenceLength);
+        Config = Config with { MaxSequenceLength = maxSequenceLength };
+    }
 
     /// <inheritdoc/>
     public long ComputeMemoryBytes => _core.ComputeMemoryBytes + _weightBytes;
@@ -178,7 +193,8 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
 
     /// <summary>
     /// Positions the K/V and indexer caches are sized for (the longest context this model instance serves). Default
-    /// <c>min(context_length, 8192)</c>, further reduced to fit the device; <c>DOTLLM_VK_QWEN4EXP_CONTEXT</c> overrides the default.
+    /// <c>min(context_length, 8192)</c> (32768 with F16 K/V), further reduced to fit the device; <see cref="RequestedContextTokens"/> (serve
+    /// <c>--ctx-size</c>) and <c>DOTLLM_VK_QWEN4EXP_CONTEXT</c> override the default. <see cref="Config"/> advertises this window.
     /// </summary>
     public int ContextCapacity => _kvCapacity;
 
@@ -222,7 +238,9 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         _embPtr = gguf.TensorDataPointer(ed);
         _embQt = ed.QuantizationType;
         _embRowBytes = Dequantize.RowByteSize(ed.Shape[0], ed.QuantizationType);
-        _device = device; _gguf = gguf; Config = config; _core = core; _q4 = config.Qwen4Exp!;
+        NativeMaxSequenceLength = Math.Min(config.MaxSequenceLength, kvCapacity);
+        Config = config with { MaxSequenceLength = NativeMaxSequenceLength };
+        _device = device; _gguf = gguf; _core = core; _q4 = config.Qwen4Exp!;
         _attnGr = attnGr; _ffnGr = ffnGr; _headGr = headGr; _moe = moe; _ple = ple; _pleLayer = pleLayer;
         _owned = owned; _hostOnlyTable = hostOnlyTable; _gr = gr; _groupRms = groupRms; _sigmoidGate = sigmoidGate;
         _hidden = config.HiddenSize; _streams = _q4.HyperConnectionCount; _lowRank = _q4.HyperConnectionLowRank;
@@ -250,6 +268,16 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         return new(_core.Q4CreateGdnState(), () => _core.Q4CreateKvCache(_kvCapacity, storage, lazy), _ple?.CreateState(),
             () => new VulkanQwen4ExpIndexerState(_device, _qsa.Ordinal.Count(o => o >= 0), _kvCapacity, _q4.IndexerKeyLength, _q4.IndexerBlockSize, lazy, rawF16));
     }
+
+    /// <summary>
+    /// The backstop for a call that would pass the served window. The server clamps <c>max_tokens</c> to <see cref="Config"/>'s window, so this only
+    /// fires for a caller that bypasses it; being a <see cref="DeviceMemoryAdmissionException"/> it is reported as a 400 <c>context_length_exceeded</c>
+    /// (or an in-stream error event), never an unhandled 500.
+    /// </summary>
+    internal DeviceMemoryAdmissionException ContextOverflow(int reach)
+        => new($"qwen4exp on Vulkan serves a {Config.MaxSequenceLength}-token context window (K/V and indexer caches sized for {_kvCapacity}); " +
+               $"this call would reach {reach}. Shorten the prompt or max_tokens, or restart with a larger --ctx-size (DOTLLM_VK_QWEN4EXP_CONTEXT) if the device has the memory " +
+               "(K/V + indexer cost 55.5 KiB per token with F32 K/V, 31.5 with DOTLLM_VK_QWEN4EXP_KV=f16).");
 
     private VulkanKvStorage ResolveKvStorage()
     {
@@ -468,12 +496,8 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         for (int i = 0; i < T; i++)
             if (positions[i] != state.Length + i)
                 throw new ArgumentException($"qwen4exp keeps its own sequence state: positions[{i}] = {positions[i]} but the state is at {state.Length + i}.");
-        if (state.Length + T > Config.MaxSequenceLength)
-            throw new ArgumentOutOfRangeException(nameof(positions), $"Sequence would exceed the context length {Config.MaxSequenceLength}.");
-        if (state.Length + T > _kvCapacity)
-            throw new NotSupportedException(
-                $"qwen4exp on Vulkan is sized for {_kvCapacity} tokens (K/V and indexer caches); this call would reach {state.Length + T}. " +
-                "Raise the capacity with DOTLLM_VK_QWEN4EXP_CONTEXT (K/V costs 48 KiB per token in F32, 24 with DOTLLM_VK_QWEN4EXP_KV=f16) if the device has the memory.");
+        if (state.Length + T > Config.MaxSequenceLength || state.Length + T > _kvCapacity)
+            throw ContextOverflow(state.Length + T);
         if (kvCache is null && kv.CurrentLength > state.Length) kv.Rollback(state.Length);   // rows of rejected speculative tokens
         if (kvCache is not null)
         {

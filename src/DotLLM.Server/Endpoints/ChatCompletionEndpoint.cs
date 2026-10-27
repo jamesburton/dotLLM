@@ -524,6 +524,8 @@ public static class ChatCompletionEndpoint
             }
         }
 
+        try
+        {
         await execute(async () =>
         {
             await WriteSseChunk(httpContext, roleChunk, ct);
@@ -565,6 +567,17 @@ public static class ChatCompletionEndpoint
             if (splitter is not null)
                 await EmitAsync(splitter.Finish(), logprobs: null);
         }, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException and not ModelUnavailableException
+                                   and not DotLLM.Core.Configuration.DeviceMemoryAdmissionException && !ct.IsCancellationRequested)
+        {
+            // #1324: a fault after the SSE response has started (a model that cannot continue) used to escape as an unhandled Kestrel
+            // exception and a truncated stream. A GPU-memory/context refusal still goes to UseModelUnavailableHandler (400
+            // context_length_exceeded); anything else is reported in-stream, as /v1/completions and /v1/messages do.
+            ServerLog.Info($"chat stream failed: {ex.Message}");
+            await SseResponse.WriteOpenAiErrorAsync(httpContext, 500, ErrorResponse.Internal(ex.Message));
+            return;
+        }
 
         // Detect tool calls in the accumulated answer
         string text = sb.ToString();

@@ -579,6 +579,7 @@ public sealed record ServerOptions
             Quant = quant,
             Device = device,
             GpuLayers = gpuLayers,
+            ContextSize = ctxSize,
             MoeOffload = DotLLM.Core.Moe.MoeOffloadOptions.FromCli(new DotLLM.Core.Moe.MoeCliValues(moeOffloadMode, moeCacheMib,
                 moeCachePolicy, moeCold, moeCpuThreads, cpuMoe, nCpuMoe, moeCalibrate, ctxSize)),
             Threads = threads,

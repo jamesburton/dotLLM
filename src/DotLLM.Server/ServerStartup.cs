@@ -333,6 +333,21 @@ public static class ServerStartup
     }
 
     /// <summary>
+    /// Issue #1324: qwen4exp on Vulkan sizes its K/V + indexer caches at load, so the serve options that decide the window are handed to it first:
+    /// <c>--ctx-size</c> becomes the requested capacity (reduced to what fits the device) and the K/V is stored as F16 unless
+    /// <c>DOTLLM_VK_QWEN4EXP_KV</c> says otherwise (24 instead of 48 KiB per token; measured against F32 in docs/ATTENTION.md).
+    /// </summary>
+    /// <param name="config">The checkpoint's configuration.</param>
+    /// <param name="options">Server options.</param>
+    internal static void PrepareQwen4ExpVulkan(ModelConfig config, ServerOptions options)
+    {
+        if (config.Architecture != Architecture.Qwen4Exp) return;
+        DotLLM.Vulkan.VulkanQwen4ExpTransformerModel.RequestedContextTokens = options.ContextSize;
+        if (Environment.GetEnvironmentVariable("DOTLLM_VK_QWEN4EXP_KV") is null && Environment.GetEnvironmentVariable("DOTLLM_VK_QWEN4EXP_QSA") != "0")
+            DotLLM.Vulkan.VulkanQwen4ExpTransformerModel.KvStorage = DotLLM.Vulkan.VulkanKvStorage.F16;
+    }
+
+    /// <summary>
     /// The served context: an explicit request (capped at the model's window) or the fit; never below one 1024-token granule.
     /// </summary>
     /// <param name="requested">The <c>--ctx-size</c> value, or null.</param>
@@ -417,6 +432,8 @@ public static class ServerStartup
 
         if (options.GpuLayers is { } requestedLayers && requestedLayers > config.NumLayers)
             Console.WriteLine($"[dotllm] Requested {requestedLayers} GPU layers but {Path.GetFileName(resolvedPath)} has {config.NumLayers}; using all {config.NumLayers}.");
+
+        PrepareQwen4ExpVulkan(config, options);
 
         // One shared dispatch for CPU / all-GPU / partial CUDA / Vulkan (#259, #729, #790) - the same call run and chat make.
         // Architectures that cannot split layers load all-GPU or FAIL with an actionable error (never a silent CPU fallback).
@@ -735,6 +752,16 @@ public static class ServerStartup
         // Issue #1068: size the CUDA hybrid's served context to free VRAM (after warm-up, so its buffers are counted).
         if (model is DotLLM.Cuda.Architectures.CudaQwen3HybridDenseTransformerModel hybridDense)
             config = ApplyHybridContextFit(hybridDense, options, mtpActive, mtpK);
+        else if (model is DotLLM.Vulkan.VulkanQwen4ExpTransformerModel q4Vulkan)
+        {
+            // #1324: the window is the capacity the caches were sized for at load (--ctx-size, reduced to fit), already in Config.
+            config = q4Vulkan.Config;
+            long perToken = DotLLM.Vulkan.VulkanQwen4ExpTransformerModel.KvBytesPerToken(config);
+            Console.WriteLine($"[dotllm] Context window: {config.MaxSequenceLength} tokens" +
+                (options.ContextSize is > 0 ? " (--ctx-size" + (options.ContextSize > config.MaxSequenceLength ? $" {options.ContextSize} reduced to fit the device" : "") + ")" : " (default)") +
+                $"; K/V + indexer {perToken / 1024.0:F1} KiB/token ({DotLLM.Vulkan.VulkanQwen4ExpTransformerModel.KvStorage.ToString().ToLowerInvariant()} K/V), " +
+                $"{perToken * (long)config.MaxSequenceLength / 1048576.0:F0} MiB if the window fills (allocated lazily). Raise with --ctx-size.");
+        }
         else if (model is IContextLimitable limitable)
             config = ApplyRequestedContextSize(model, limitable, options);
 
