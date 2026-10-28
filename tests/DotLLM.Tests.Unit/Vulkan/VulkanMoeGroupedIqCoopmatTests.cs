@@ -136,6 +136,7 @@ public sealed class VulkanMoeGroupedIqCoopmatTests
     [InlineData(QuantizationType.IQ4_XS, 130, 2560, "n32diet")]
     [InlineData(QuantizationType.IQ4_NL, 100, 640, "n32diet")]    // real down K
     [InlineData(QuantizationType.IQ4_NL, 64, 64, "n32diet")]
+    [InlineData(QuantizationType.IQ3_S, 77, 768, "n32diet")]      // #1352: rowBytes % 4 == 2, odd rows start mid-word
     public void GroupedVariant_MatchesNarrowBitwiseAndCpuOracle(QuantizationType qt, int m, int k, string variant)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
