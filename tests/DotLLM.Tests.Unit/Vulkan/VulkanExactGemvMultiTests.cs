@@ -50,6 +50,10 @@ public class VulkanExactGemvMultiTests
     [InlineData(37, 5376, 2, 4, 3)]    // ffn_down_shexp K = 21 super-blocks: uneven lane strides
     [InlineData(9, 256, 1, 8, 8)]      // one super-block: lanes past the row's 32 groups
     [InlineData(5, 1024, 1, 4, 16)]
+    [InlineData(37, 4096, 1, 2, 14)]   // #1366: 14..16 columns run NR = 4 even when multiRows = 2 (the NR = 2 cliff)
+    [InlineData(37, 5376, 1, 2, 15)]
+    [InlineData(37, 4096, 1, 2, 16)]
+    [InlineData(37, 4096, 1, 2, 13)]   // still NR = 2
     public void Iq2Xxs_EachColumnBitIdenticalToOneColumnDispatch(int m, int k, int decodeRows, int multiRows, int n)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
