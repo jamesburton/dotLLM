@@ -1193,7 +1193,8 @@ times one target forward over R rows (random token ids, content is irrelevant to
 `verify` = `ForwardWithRecurrentSnapshots` (the call `MtpSpeculativeDecoder` makes; capped at 16 rows by `GemvColumns.MaxColumns`), `fwd` = plain
 `Forward` (used for R = 24, 32). No drafter / tap capture in the timed call. Median of 3 interleaved reps x 5 timings (even reps ascend R, odd reps
 descend, 2 discarded warm-up passes over every R first), under `scripts/gpu-lock.sh`, no human GPU process before or after (ollama idle).
-Same build (`dev` @ c9436002 + the harness), 2026-10-28. Ranges are min-max over the 15 timings. Strix Halo 8060S, Vulkan unless stated.
+Same build (`dev` @ c9436002 + the harness; the build recompiled 30 `.spv` blobs with the local glslc, which differ byte-wise from the checked-in
+ones, so the shaders measured are the local build's), 2026-10-28. Ranges are min-max over the 15 timings. Strix Halo 8060S, Vulkan unless stated.
 
 | rows | Qwen3.8-27B Q4_K_M ms | Bonsai-2 27B PQ2_0 ms | Bolt 24GB ms | CPU, Bonsai-2 PQ2_0 ms |
 |---|---|---|---|---|
