@@ -95,8 +95,8 @@ public static unsafe partial class MatMul
     /// </summary>
     private static readonly bool PQ2_0UseW2A8 = ResolvePQ2_0UseW2A8();
 
-    /// <summary>Largest token count routed to the W2A8 GEMM tier (<c>DOTLLM_PQ2_SMALLN_MAX</c>, default 32; 1 disables).</summary>
-    internal static readonly int PQ2_0SmallNMax = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_PQ2_SMALLN_MAX"), out int v) ? v : 32;
+    /// <summary>Largest token count routed to the W2A8 GEMM tier (<c>DOTLLM_PQ2_SMALLN_MAX</c>, default unbounded since #1386; 1 restores the float tier for every n>=2).</summary>
+    internal static readonly int PQ2_0SmallNMax = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_PQ2_SMALLN_MAX"), out int v) ? v : int.MaxValue;
 
     private static bool ResolvePQ2_0UseW2A8()
     {
@@ -210,7 +210,7 @@ public static unsafe partial class MatMul
     /// float reference tier. Output rows are partitioned across <paramref name="threadPool"/>
     /// workers when present.
     ///
-    /// <para><b>Small n (2..<see cref="PQ2_0SmallNMax"/>, issue #1367) takes the W2A8 tier</b> (4-token tiles, bit-identical per token to the decode GEMV): the speculative-verify range, where the scalar float tier below cost 1.3 s for 2 rows vs 0.25 s for decode. Larger n still takes the float tier (prefill measured 2.5x faster on W2A8 at n=64/128, follow-up: needs a perplexity check). The paragraph that follows is the original n-independent reasoning.</para>
+    /// <para><b>Small n (2..<see cref="PQ2_0SmallNMax"/>, issue #1367) takes the W2A8 tier</b> (4-token tiles, bit-identical per token to the decode GEMV): the speculative-verify range, where the scalar float tier below cost 1.3 s for 2 rows vs 0.25 s for decode. The cut is now unbounded (#1386): Bonsai-2 27B PQ2_0 wikitext-LF vs the float tier, context 32/128/512, mean KL 6.7e-5..9.5e-5, top-1 agreement 99.4-99.8%, PPL delta -0.03%, prefill 2.1-2.6x faster; see docs/PERPLEXITY.md. The paragraph that follows is the original n-independent reasoning.</para>
     ///
     /// <para><b>Not wired to the W2A8 SIMD tier (issue #204 review follow-up).</b> Unlike
     /// <see cref="GemvPQ2_0"/>, this entry point deliberately does <i>not</i> dispatch to
@@ -237,7 +237,7 @@ public static unsafe partial class MatMul
         if (k % PQ2_0GroupSize != 0)
             throw new ArgumentException($"k must be a multiple of {PQ2_0GroupSize}, got {k}", nameof(k));
 
-        // Small-n (speculative-verify, 2..PQ2_0SmallNMax rows): the scalar float tier below unpacks every weight row with a
+        // Small-n (speculative-verify and prefill, 2..PQ2_0SmallNMax rows): the scalar float tier below unpacks every weight row with a
         // per-element scalar loop and dots in f32 - ~1.1 s for a 2-row Bonsai-2 forward vs 0.25 s for the W2A8 decode GEMV (#1367).
         // Route to the W2A8 tier, which reads the packed blocks once per row and matches decode's numerics (Q8_0 activations).
         if (PQ2_0UseW2A8 && n <= PQ2_0SmallNMax)
