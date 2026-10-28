@@ -1772,7 +1772,8 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
             seqLen: seqLen,
             snapshotRows: snapRows,
             deltaRecord: snapRows > 0 ? RowRecLayer(_rowRecD, gdnOrdinal, vDim) : default,
-            readOnlyState: snapRows > 0);
+            readOnlyState: snapRows > 0,
+            pool: _threadPool);
         if (TensorDump.Enabled)
             TensorDump.Dump3D($"blk.{absoluteLayerIdx}.attn_output", gdnOut, seqLen, nVHead, dState);
 
