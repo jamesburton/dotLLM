@@ -1939,14 +1939,14 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     private MoeGroupedMatmulIqCoopmatKernel? GroupedIqKernel(QuantizationType qt) => _kernels.MoeGroupedIq(qt);
 
     /// <summary>
-    /// #1348: the grouped IQ MoE kernels run 32 tokens per workgroup (<c>n32diet</c>) on layers where gate/up and down both have that variant, and the
+    /// #1348/#1353: the grouped IQ MoE kernels run 64 tokens per workgroup (<c>n64diet</c>; <c>n32diet</c> selectable) on layers where gate/up and down both have that variant, and the
     /// 16-token kernels elsewhere. <c>DOTLLM_VK_MOE_IQ_VARIANT=off</c> (or <c>0</c>) restores the 16-token kernels; any other value names a variant suffix.
     /// Read per layer call so one process can A/B it.
     /// </summary>
     private static string? MoeIqVariant()
         => Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_IQ_VARIANT") switch
         {
-            null or "" => "n32diet",
+            null or "" => "n64diet",
             "off" or "0" => null,
             var v => v,
         };
@@ -2048,6 +2048,15 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         {
             iqGateUp = varGu;
             iqDown = varDn;
+        }
+        // #1354: a Q8_0 down bank (5 of 48 qwen4exp layers) has its own 32-token kernel, so those layers join the 32-token tile list too.
+        else if (iqGateUp is not null && legacyDown is not null && moeW.W2QuantType == QuantizationType.Q8_0 && MoeIqVariant() is { } iqVarQ8
+            && Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_Q8_DOWN_WIDE") != "0"   // A/B / kill switch for the Q8_0 32-token down kernel only
+            && _kernels.MoeGroupedIqVariant(moeW.W1QuantType, iqVarQ8) is { } varGuQ8 && _kernels.MoeGroupedQ8_0Wide(iqVarQ8) is { } q8Wide
+            && varGuQ8.RowTile == q8Wide.RowTile)
+        {
+            iqGateUp = varGuQ8;
+            legacyDown = q8Wide;
         }
         var gateUpMmq = (iqGateUp is null && legacyDown is null && iqDown is null) ? GroupedGateUpMmqKernel(moeW.W1QuantType) : null;
         var downMmq = (gateUpMmq is not null) ? GroupedDownMmqKernel(moeW.W2QuantType) : null;
