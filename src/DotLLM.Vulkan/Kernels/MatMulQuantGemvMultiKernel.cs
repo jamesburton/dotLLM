@@ -68,7 +68,7 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
     /// <summary>Largest column count <paramref name="format"/>'s shader serves (#1365).</summary>
     /// <param name="format">The block format.</param>
     /// <returns>8 or 16.</returns>
-    public static int MaxColumnsFor(QuantGemvMultiFormat format) => TakesRows(format) ? WideMaxColumns : MaxColumns;
+    public static int MaxColumnsFor(QuantGemvMultiFormat format) => format == QuantGemvMultiFormat.Q6_K_R2 ? MaxColumns : WideMaxColumns;
 
     /// <summary>Output rows per workgroup (<c>NR</c>, #1220); 1 except for the formats whose shader takes the constant.</summary>
     public int RowsPerWorkgroup => _rowsPerWorkgroup;
