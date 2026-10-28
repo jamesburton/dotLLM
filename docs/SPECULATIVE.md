@@ -1043,7 +1043,7 @@ long prefill and released after it.
 time per request (and, on Vulkan, the drafter's submit count and wait). Vulkan small-row GEMVs: `DOTLLM_VK_Q4K_ROWS` / `DOTLLM_VK_Q4K_ROWS_MULTI` (1..4 output
 rows per workgroup for decode / verify, default 2 / 4, #1220; this replaced #1193's `DOTLLM_VK_Q4K_MULTI_ROWS` / `_R4` kernel) and `DOTLLM_VK_SMALLROW_Q6K_R2_MIN_ROWS` (default 3).
 
-**Not yet.** Tree (DDTree) verification; reduced-vocab (`d2t`) and DSpark drafters (LiLiCorr: #1237 below);
+**Not yet.** Tree (DDTree) verification (gated on the verify-row cost curve, measured: "Verify-row cost curve (issue #1359, stage 1)" below); reduced-vocab (`d2t`) and DSpark drafters (LiLiCorr: #1237 below);
 sampled-selector proposals (llama.cpp's DFlash2 sampled mode).
 
 ### LiLiCorr drafter for Nemotron-3.5 Bolt (issue #1237)
@@ -1184,6 +1184,106 @@ gain over DFlash2 is modest. Both re-rank the drafter's own top-k with pairwise 
 rank/probability features, which mostly helps the long tail of the block. On Qwen3.8 the measured gap to llama.cpp is the target's
 multi-row verify, not draft quality (see the Strix table above), so a better head would not close it. Not worth building until a
 checkpoint exists.
+
+### Verify-row cost curve (issue #1359, stage 1)
+
+Question: is a 16- or 32-node tree verify (DDTree / Weaver-style, Mirai "Trees from Marginals", arXiv 2607.06763) worth building here? That
+depends on what extra verify rows cost. No new kernels: `benchmarks/VerifyRowCurve` loads a model once, prefills 64 tokens (32 on CPU), then
+times one target forward over R rows (random token ids, content is irrelevant to cost), rolls the KV and the recurrent state back, repeats.
+`verify` = `ForwardWithRecurrentSnapshots` (the call `MtpSpeculativeDecoder` makes; capped at 16 rows by `GemvColumns.MaxColumns`), `fwd` = plain
+`Forward` (used for R = 24, 32). No drafter / tap capture in the timed call. Median of 3 interleaved reps x 5 timings (even reps ascend R, odd reps
+descend, 2 discarded warm-up passes over every R first), under `scripts/gpu-lock.sh`, no human GPU process before or after (ollama idle).
+Same build (`dev` @ c9436002 + the harness; the build recompiled 30 `.spv` blobs with the local glslc, which differ byte-wise from the checked-in
+ones, so the shaders measured are the local build's), 2026-10-28. Ranges are min-max over the 15 timings. Strix Halo 8060S, Vulkan unless stated.
+
+| rows | Qwen3.8-27B Q4_K_M ms | Bonsai-2 27B PQ2_0 ms | Bolt 24GB ms | CPU, Bonsai-2 PQ2_0 ms |
+|---|---|---|---|---|
+| 1 (decode) | 98.3 (97.4-101.5) | 44.9 (43.6-45.7) | 38.8 (38.2-44.9) | 247 (234-276) |
+| 2 | 107.6 (106.6-116.3) | 53.5 (51.8-56.5) | 45.1 (44.2-49.6) | 1335 (1271-2282) |
+| 4 | 121.6 (119.9-131.4) | 69.3 (66.2-74.8) | 58.0 (56.9-68.2) | 1604 (1527-1659) |
+| 8 | 147.7 (145.5-151.7) | 106.4 (100.5-111.1) | 81.5 (80.2-86.3) | 2145 (2085-2172) |
+| 9 | **578.3** (575.1-638.4) | **346.0** (344.3-350.5) | 85.6 (85.0-88.6) | not run |
+| 16 | 592.6 (589.2-660.0) | 365.1 (362.2-368.9) | 164.2 (162.9-217.1) | 3462 (3355-4707) |
+| 32 (`fwd`) | 553.5 (550.8-580.1) | 404.0 (402.1-405.5) | 253.0 (249.6-276.8) | 6752 (6398-6858) |
+
+Intermediate rows (Qwen3.8 / Bonsai-2 / Bolt, ms): 3 = 113.9 / 63.2 / 52.0, 6 = 128.9 / 88.9 / 70.1, 12 = 585.3 / 354.5 / 110.4, 24 (`fwd`) = 542.8 /
+386.6 / 234.7. The Qwen3.8 and Bonsai-2 numbers come from the second, finer run (13 and 11 row counts); the earlier 1-32 run (Qwen3.8 only) agreed within
+3% for every row it shared (e.g. 8 rows 150.9, 16 rows 610.6 ms). Bonsai-2, Bolt and CPU were run once (3 interleaved reps). The Bolt numbers are the unprofiled run; its first rep-2 outlier (12 and 16 rows) is why the maxima are high.
+
+**Marginal row cost and ratio vs a decode step** (slope between the quoted rows, ms per extra row, in brackets as % of the 1-row decode):
+
+| cell | 1 -> 8 rows | 8 -> 16 rows | 16 -> 32 rows (`fwd`) | 8 rows / decode | 16 rows / decode | 32 rows / decode |
+|---|---|---|---|---|---|---|
+| Strix Vulkan Qwen3.8 Q4_K_M | 7.1 (7.2%) | 55.6 (57%) | -2.4 | 1.50x | 6.03x | 5.63x |
+| Strix Vulkan Bonsai-2 PQ2_0 | 8.8 (19.6%) | 32.3 (72%) | 2.4 | 2.37x | 8.13x | 9.00x |
+| Strix Vulkan Bolt 24GB | 6.1 (15.7%) | 10.3 (26.6%) | 5.5 (14%) | 2.10x | 4.23x | 6.52x |
+| CPU, Bonsai-2 PQ2_0 | 2 -> 8: 135 (55%) | 164 (66%) | 206 (83%) | 8.7x | 14.0x | 27.3x |
+| RTX 3060 CUDA (T5500) | not run, needs user go-ahead (shared-GPU rule) | | | | | |
+
+Reading: Qwen3.8 and Bonsai-2 have a **cliff between 8 and 9 rows** (4x and 7x of the 8-row cost; the multi-column GEMVs cap at 8 columns and the
+next path is a fixed ~340-570 ms GEMM, issue #1365), so 16/32-row trees cannot be priced from the 1..8 slope. Bolt has no cliff but steepens past 12
+rows (issue #1366). On CPU the cliff is between 1 and 2 rows (issue #1367).
+
+**Break-even tau gain.** A tree of the same depth as a K=7 chain pays the same draft but verifies N rows instead of 8. Break-even needs
+`g* = (draft + V(N)) / (draft + V(8)) - 1` more tokens per round than the chain. Draft = measured in-engine draft ms of the same run (below;
+K=7 DFlash/LiLiCorr: Qwen3.8 31.1, Bonsai-2 32.3, Bolt 76.0; CPU not measured, so `draft = 0` is used, which is a lower bound on `g*`). The
+net columns are `(1+gain) / (1+g*)`, the end-to-end speed relative to the chain, for three tau gains over a chain of the same depth. **Those
+gains are the paper's numbers (Weaver paper sec 5, B200, Qwen3.6-27B, T=1), not ours: +20% (~ Weaver over DDTree at equal size, paper +22.3%), +35% (~ DDTree-64 over a chain, 5.21 -> 6.98, paper +34%),
++75% (~ Weaver over a chain, paper +73.6%).** We have measured no tau gain for a tree.
+
+| cell | N | g* | net at +20% | net at +35% | net at +75% | gate |
+|---|---|---|---|---|---|---|
+| Qwen3.8 Q4_K_M | 16 | +249% | 0.34x | 0.39x | 0.50x | no-go |
+| Qwen3.8 Q4_K_M | 32 | +227% | 0.37x | 0.41x | 0.54x | no-go |
+| Bonsai-2 PQ2_0 | 16 | +187% | 0.42x | 0.47x | 0.61x | no-go |
+| Bonsai-2 PQ2_0 | 32 | +215% | 0.38x | 0.43x | 0.56x | no-go |
+| Bolt + LiLiCorr | 16 | +53% | 0.79x | 0.89x | 1.15x | no-go (only +75% pays) |
+| Bolt + LiLiCorr | 32 | +109% | 0.57x | 0.65x | 0.84x | no-go |
+| CPU Bonsai-2 (draft = 0) | 16 | >= +61% | <= 0.74x | <= 0.84x | <= 1.08x | no-go |
+| CPU Bonsai-2 (draft = 0) | 32 | >= +215% | <= 0.38x | <= 0.43x | <= 0.56x | no-go |
+| CUDA RTX 3060 | - | not run, needs user go-ahead | | | | |
+
+Hypothetical, not measured: if the 8-column cliff were removed and rows 9..16 cost the 1..8 slope, a 16-row verify would be ~204 ms (Qwen3.8) and
+~177 ms (Bonsai-2), i.e. `g*` = +32% and +51%. Still above the +20% gate; it would only be break-even against the paper's training-free tree
+gain (+34%, which the paper itself shows is end-to-end neutral: speedup 3.51x -> 3.56x), so a cliff fix alone does not justify the tree.
+
+**Go / no-go (issue gate: marginal row cost < ~10% of a decode step, or break-even tau gain < 20%):**
+
+- **Qwen3.8 Q4_K_M, Vulkan: NO-GO.** The 1..8 slope (7.2%) passes the 10% gate, but that is the chain, not a tree: at 16/32 rows the cliff makes `g*`
+  +230-250%. Even cliff-free it is ~+32%. Revisit only with Weaver-class gains, and only after #1365.
+- **Bonsai-2 PQ2_0, Vulkan: NO-GO.** 19.6% per row already at 1..8, cliff at 9, `g*` +187% at 16.
+- **Bolt 24GB + LiLiCorr, Vulkan: NO-GO** on the gate (15.7% per row; `g*` +53% at 16). It is the closest: a Weaver-class +75% would net 1.15x at
+  16 nodes, the LiLiCorr lattice is a ready candidate pool, and the recurrence is diagonal. But code tau is draft-quality bound (3.3-3.75), and
+  the draft is already half the round (76 of 161 ms).
+- **CPU: NO-GO** (decode-to-2-row cliff, every extra row 55-83% of a decode step).
+- **CUDA: not run, needs user go-ahead.**
+
+**Vulkan DFlash round breakdown** (`DOTLLM_MTP_ADAPTIVE=0 DOTLLM_DFLASH_DRAFT=K DOTLLM_MTP_TRACE=1 DOTLLM_DFLASH_TRACE=1`, `dotllm run ... -n 128 -t 0`, one
+run per row, code prompt "Write a Python function that implements quicksort, with comments:" except Bolt, prose "The history of the printing
+press began in"; mean over the trace's last window). `round - draft - verify` is the host work between GPU submits (accept walk, argmax over the rows'
+logits, KV rollback, state commit), i.e. the "idle gap" that uzu's accept-behind-draft (#984: 72.8 -> 70.8 ms/pass, -2.7%) removed:
+
+| run | tokens/round | draft ms | verify ms | round ms | gap ms (% of round) | draft detail |
+|---|---|---|---|---|---|---|
+| Qwen3.8 + DFlash2 K=7 | 7.31 | 31.1 | 184.3 | 217.5 | 2.1 (1.0%) | 18 drafts, 40 submits, 406 ms submit wait (10 ms each), head 9 ms/draft, `select` 8.8 ms/draft |
+| Qwen3.8 + DFlash2 K=3 | 3.88 | 17.5 | 129.1 | 147.2 | 0.6 (0.4%) | 33 drafts, 70 submits, 541 ms wait, head 7 ms/draft, `select` 1 ms/draft |
+| Bonsai-2 + r3 DFlash2 K=7 | 5.62 | 32.3 | 100.6 | 133.9 | 1.0 (0.7%) | 21 drafts, 46 submits, 310 ms wait, head 3.8 ms/draft, `select` 14 ms/draft |
+| Bolt + LiLiCorr K=7 | 3.28 | 76.0 | 84.4 | 161.3 | 0.9 (0.6%) | 38 drafts, 118 submits, 1350 ms wait; host LiLiCorr `select` 36 ms/draft |
+
+The between-round gap (host accept walk, rollback, commit) is 0.6-2.1 ms, <= 1.0% of a round, against uzu's 2.7% on M5 Pro. Even if
+accept-behind-draft hid all of it that is the ceiling, so **the inter-round idle gap is not worth chasing on any Vulkan cell.** The idle that is
+visible is *inside* the draft: a draft is two submits (layers, read back for the selector, then the head) and the host `select` stage at K=7 is
+8.8 ms (Qwen3.8, 4% of the round), 14 ms (Bonsai-2, 10%) and 36 ms (Bolt LiLiCorr head, 22%, follow-up #1 above), while the K=3 selector is
+1 ms. `select` is wall time and includes the readback wait, so it is an upper bound on GPU idle, not a measurement of it (submit waits
+account for 72% / 94% / 50% / 49% of the draft wall in the four rows). A GPU-side selector walk is the lever there, not the accept gap; measure
+GPU idle with timestamps before building it. Caveats: the in-engine verify (with tap capture and drafter injection) was 184 ms for 8
+rows on Qwen3.8 against 148 ms bare, 100.6 vs 106.4 on Bonsai-2 and 84.4 vs 81.5 on Bolt, from single runs whose first trace window includes warm-up (not
+reproduced; not trusted). The Bolt row is also at 3.28 tokens/round where the table above records 7.44 on the same prompt (issue #1368). Nothing here
+changes the table's go/no-go: a 36 ms swing in verify is smaller than the cliff.
+
+**Takeaways for stage 2 (not started, gate not passed):** (1) the verify-row curve, not draft quality, still caps speculation on Qwen3.8 and
+Bonsai-2: fix the 9-row cliff (#1365) first, it also lets DFlash K>=8 work; (2) Bolt's 12..16-row `moe_dense` kernel choice (#1366) is a
+cheap cell-level win independent of trees; (3) a tree verify needs `ForwardWithRecurrentSnapshots` above 16 rows (cap `GemvColumns.MaxColumns`).
 
 ### `qwen35moe` MTP head (issue #1188)
 
