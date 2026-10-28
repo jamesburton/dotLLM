@@ -95,6 +95,9 @@ public static unsafe partial class MatMul
     /// </summary>
     private static readonly bool PQ2_0UseW2A8 = ResolvePQ2_0UseW2A8();
 
+    /// <summary>Largest token count routed to the W2A8 GEMM tier (<c>DOTLLM_PQ2_SMALLN_MAX</c>, default unbounded since #1386; 1 restores the float tier for every n>=2).</summary>
+    internal static readonly int PQ2_0SmallNMax = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_PQ2_SMALLN_MAX"), out int v) ? v : int.MaxValue;
+
     private static bool ResolvePQ2_0UseW2A8()
     {
         string? env = Environment.GetEnvironmentVariable("DOTLLM_PQ2_W2A8");
@@ -207,6 +210,8 @@ public static unsafe partial class MatMul
     /// float reference tier. Output rows are partitioned across <paramref name="threadPool"/>
     /// workers when present.
     ///
+    /// <para><b>Small n (2..<see cref="PQ2_0SmallNMax"/>, issue #1367) takes the W2A8 tier</b> (4-token tiles, bit-identical per token to the decode GEMV): the speculative-verify range, where the scalar float tier below cost 1.3 s for 2 rows vs 0.25 s for decode. The cut is now unbounded (#1386): Bonsai-2 27B PQ2_0 wikitext-LF vs the float tier, context 32/128/512, mean KL 6.7e-5..9.5e-5, top-1 agreement 99.4-99.8%, PPL delta -0.03%, prefill 2.1-2.6x faster; see docs/PERPLEXITY.md. The paragraph that follows is the original n-independent reasoning.</para>
+    ///
     /// <para><b>Not wired to the W2A8 SIMD tier (issue #204 review follow-up).</b> Unlike
     /// <see cref="GemvPQ2_0"/>, this entry point deliberately does <i>not</i> dispatch to
     /// <see cref="GemmPQ2_0W2A8"/> even on AVX2/AVX-VNNI hardware: benchmarking
@@ -231,6 +236,15 @@ public static unsafe partial class MatMul
 
         if (k % PQ2_0GroupSize != 0)
             throw new ArgumentException($"k must be a multiple of {PQ2_0GroupSize}, got {k}", nameof(k));
+
+        // Small-n (speculative-verify and prefill, 2..PQ2_0SmallNMax rows): the scalar float tier below unpacks every weight row with a
+        // per-element scalar loop and dots in f32 - ~1.1 s for a 2-row Bonsai-2 forward vs 0.25 s for the W2A8 decode GEMV (#1367).
+        // Route to the W2A8 tier, which reads the packed blocks once per row and matches decode's numerics (Q8_0 activations).
+        if (PQ2_0UseW2A8 && n <= PQ2_0SmallNMax)
+        {
+            GemmPQ2_0W2A8(weights, b, c, m, k, n, threadPool);
+            return;
+        }
 
         if (threadPool is null || m < ParallelMinRows)
         {
@@ -483,10 +497,26 @@ public static unsafe partial class MatMul
             fixed (sbyte* wI8 = rowBuf)
             fixed (float* groupScales = groupScaleBuf)
             {
+                float* acc4 = stackalloc float[4];
                 for (int r = startRow; r < startRow + rowCount; r++)
                 {
                     UnpackPQ2_0RowI8(weights + (long)r * rowBytes, wI8, groupScales, k);   // unpack ONCE per row
-                    for (int t = 0; t < n; t++)
+                    int t = 0;
+                    if (Avx2.IsSupported)
+                    {
+                        // 4 tokens per pass: the weight vector (|w|, w) is loaded once per block and 4 independent accumulators
+                        // break the single FMA dependency chain of the per-token dot (#1367).
+                        for (; t + 4 <= n; t += 4)
+                        {
+                            VecDot4PQ2_0Q8Avx2(wI8, groupScales, bQ8 + (long)t * q8RowBytes, q8RowBytes,
+                                               bScales + (long)t * blockCount, blockCount, blockCount, acc4);
+                            c[(long)t * m + r] = acc4[0];
+                            c[(long)(t + 1) * m + r] = acc4[1];
+                            c[(long)(t + 2) * m + r] = acc4[2];
+                            c[(long)(t + 3) * m + r] = acc4[3];
+                        }
+                    }
+                    for (; t < n; t++)
                     {
                         byte* xQ8 = bQ8 + (long)t * q8RowBytes;
                         c[(long)t * m + r] = VecDotPQ2_0Q8(wI8, groupScales, xQ8, bScales + (long)t * blockCount, blockCount);
@@ -527,6 +557,70 @@ public static unsafe partial class MatMul
         => Avx2.IsSupported
             ? VecDotPQ2_0Q8Avx2(wI8, groupScales, xQ8, xScales, blockCount)
             : VecDotPQ2_0Q8Sse(wI8, groupScales, xQ8, xScales, blockCount);
+
+    /// <summary>
+    /// Four-token variant of <see cref="VecDotPQ2_0Q8Avx2"/>: dots one int8 ternary weight row against 4 consecutive
+    /// Q8_0 activation rows (row stride <paramref name="xStrideBytes"/>, scale stride <paramref name="sStride"/> floats),
+    /// writing 4 results to <paramref name="outp"/>. Same per-block arithmetic as the single-token kernel (so each result
+    /// is bit-identical to it), but |w| is computed once per block and 4 independent accumulators hide FMA latency.
+    /// </summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    internal static void VecDot4PQ2_0Q8Avx2(sbyte* wI8, float* groupScales, byte* xQ8, int xStrideBytes,
+                                            float* xScales, int sStride, int blockCount, float* outp)
+    {
+        const int blocksPerGroup = PQ2_0GroupSize / Q8_0GroupSize;
+        Vector256<float> a0 = Vector256<float>.Zero, a1 = a0, a2 = a0, a3 = a0;
+        bool useVnni = AvxVnni.IsSupported;
+        Vector256<short> ones = Vector256.Create((short)1);
+        byte* x0 = xQ8, x1 = xQ8 + xStrideBytes, x2 = xQ8 + 2L * xStrideBytes, x3 = xQ8 + 3L * xStrideBytes;
+        float* s0 = xScales, s1 = xScales + sStride, s2 = xScales + 2L * sStride, s3 = xScales + 3L * sStride;
+
+        for (int block = 0; block < blockCount; block++)
+        {
+            float g = groupScales[block / blocksPerGroup];
+            Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(wI8 + block * Q8_0GroupSize);
+            Vector256<byte> absW = Avx2.Sign(vw, vw).AsByte();
+            int off = block * Q8_0BlockBytes + 2;
+            Vector256<int> i0, i1, i2, i3;
+            Vector256<sbyte> q0 = Avx2.Sign(Unsafe.ReadUnaligned<Vector256<sbyte>>(x0 + off), vw);
+            Vector256<sbyte> q1 = Avx2.Sign(Unsafe.ReadUnaligned<Vector256<sbyte>>(x1 + off), vw);
+            Vector256<sbyte> q2 = Avx2.Sign(Unsafe.ReadUnaligned<Vector256<sbyte>>(x2 + off), vw);
+            Vector256<sbyte> q3 = Avx2.Sign(Unsafe.ReadUnaligned<Vector256<sbyte>>(x3 + off), vw);
+            if (useVnni)
+            {
+                i0 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, absW, q0);
+                i1 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, absW, q1);
+                i2 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, absW, q2);
+                i3 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, absW, q3);
+            }
+            else
+            {
+                i0 = Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(absW, q0), ones);
+                i1 = Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(absW, q1), ones);
+                i2 = Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(absW, q2), ones);
+                i3 = Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(absW, q3), ones);
+            }
+            if (Fma.IsSupported)
+            {
+                a0 = Fma.MultiplyAdd(Vector256.Create(s0[block] * g), Avx.ConvertToVector256Single(i0), a0);
+                a1 = Fma.MultiplyAdd(Vector256.Create(s1[block] * g), Avx.ConvertToVector256Single(i1), a1);
+                a2 = Fma.MultiplyAdd(Vector256.Create(s2[block] * g), Avx.ConvertToVector256Single(i2), a2);
+                a3 = Fma.MultiplyAdd(Vector256.Create(s3[block] * g), Avx.ConvertToVector256Single(i3), a3);
+            }
+            else
+            {
+                a0 += Avx.ConvertToVector256Single(i0) * Vector256.Create(s0[block] * g);
+                a1 += Avx.ConvertToVector256Single(i1) * Vector256.Create(s1[block] * g);
+                a2 += Avx.ConvertToVector256Single(i2) * Vector256.Create(s2[block] * g);
+                a3 += Avx.ConvertToVector256Single(i3) * Vector256.Create(s3[block] * g);
+            }
+        }
+        outp[0] = HorizontalSumAvx2Float(a0);
+        outp[1] = HorizontalSumAvx2Float(a1);
+        outp[2] = HorizontalSumAvx2Float(a2);
+        outp[3] = HorizontalSumAvx2Float(a3);
+    }
 
     /// <summary>AVX2/AVX-VNNI tier of <see cref="VecDotPQ2_0Q8"/>.</summary>
     [SkipLocalsInit]

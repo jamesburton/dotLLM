@@ -577,7 +577,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
                         state = ServerStartup.LoadModel(resolvedPath, serverOptions);
                     });
             }
-            catch (DeviceUnavailableException ex)
+            catch (Exception ex) when (ex is DeviceUnavailableException or InvalidServerOptionException)
             {
                 // An explicit GPU that cannot be honoured: clean what/why/opt-in message, failing exit code, never a CPU server (#790).
                 AnsiConsole.MarkupLine($"[red]{Markup.Escape(ex.Message)}[/]");

@@ -11,8 +11,47 @@ namespace DotLLM.Vulkan;
 
 public sealed unsafe partial class VulkanQwen4ExpTransformerModel
 {
-    /// <summary>Default context capacity (tokens) of the K/V + indexer caches; <c>DOTLLM_VK_QWEN4EXP_CONTEXT</c> overrides.</summary>
+    /// <summary>Default context capacity (tokens) of the K/V + indexer caches with F32 K/V; <c>DOTLLM_VK_QWEN4EXP_CONTEXT</c> overrides.</summary>
     internal const int DefaultContextCapacity = 8192;
+
+    /// <summary>
+    /// Default capacity with F16 K/V (<see cref="DefaultContextCapacity"/> x 4): F16 halves the bytes per token, so 32768 tokens reserve
+    /// ~1 GiB (0.98 GiB measured, docs/ATTENTION.md) and the capacity is also what the server advertises. 32K is the longest window with
+    /// needle-in-a-haystack evidence (6/6 at 23.8K and 31.0K tokens, #898). Grown lazily, so an idle capacity costs nothing.
+    /// </summary>
+    internal const int DefaultContextCapacityF16 = 32768;
+
+    /// <summary>
+    /// The context window the caller asks for (serve: <c>--ctx-size</c>), read at load. <c>DOTLLM_VK_QWEN4EXP_CONTEXT</c> wins over it;
+    /// null = the default for the K/V format. Clamped to the checkpoint's window and then reduced to what fits the device.
+    /// </summary>
+    public static int? RequestedContextTokens { get; set; }
+
+    /// <summary>Bytes per token of the K/V + indexer caches in the current K/V format (what the load log and the server's context line report).</summary>
+    public static long KvBytesPerToken(ModelConfig config)
+        => Qwen4ExpResidencyPlan.ContextBytes(config, 4096, KvStorage == VulkanKvStorage.F16 ? 2 : 4, IndexerRawF16) / 4096;   // 4096: amortises the pooled keys' +1 block
+
+    /// <summary>The capacity granule: the fit search rounds to multiples of this many tokens.</summary>
+    internal const int CapacityGranule = 256;
+
+    /// <summary>
+    /// Largest capacity in <c>[floor, ceiling]</c> for which <paramref name="fits"/> holds (binary search; <paramref name="fits"/> is monotone: more tokens
+    /// cost more bytes). <paramref name="ceiling"/> itself when it fits; <paramref name="floor"/> when nothing larger does (the caller then reports the plan).
+    /// </summary>
+    internal static int ChooseCapacity(int floor, int ceiling, Func<int, bool> fits)
+    {
+        if (ceiling <= floor) return floor;
+        if (fits(ceiling)) return ceiling;
+        int lo = floor, hi = ceiling;   // lo is assumed to fit, hi does not
+        while (hi - lo > CapacityGranule)
+        {
+            int mid = lo + (hi - lo) / 2;
+            mid -= mid % CapacityGranule;
+            if (mid <= lo) break;
+            if (fits(mid)) lo = mid; else hi = mid;
+        }
+        return lo;
+    }
 
     /// <summary>
     /// Gather token-embedding rows on the host from the mmap'd (quantised) table instead of keeping an F32 copy of the whole table on the device
@@ -99,7 +138,10 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
         // to the model's context and then halved until the plan fits the device - never below the dense limit.
         int denseLimit = q4.IndexerBlockSize > 0 ? q4.IndexerTopK + q4.IndexerBlockSize - 1 : config.MaxSequenceLength;
         int floorCapacity = Math.Min(config.MaxSequenceLength, denseLimit);
-        int requested = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_QWEN4EXP_CONTEXT"), out int envCtx) && envCtx > 0 ? envCtx : DefaultContextCapacity;
+        bool f16Kv = KvStorage == VulkanKvStorage.F16;
+        int? explicitCtx = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_QWEN4EXP_CONTEXT"), out int envCtx) && envCtx > 0 ? envCtx
+            : RequestedContextTokens is > 0 ? RequestedContextTokens : null;
+        int requested = explicitCtx ?? (f16Kv ? DefaultContextCapacityF16 : DefaultContextCapacity);
         int kvCapacity = Math.Max(floorCapacity, Math.Min(config.MaxSequenceLength, requested));
 
         // Residency gate BEFORE touching the device (the 122B WDDM-thrash class: refuse with numbers, do not page).
@@ -113,18 +155,19 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             return pressure is not null ? p with { OtherProcessBytes = pressure.OtherBytes, OtherProcessDetail = pressure.DescribeCulprits() } : p;
         }
         var plan = MakePlan(kvCapacity);
+        long perTokenBytes = KvBytesPerToken(config);
         if (!plan.Fits && kvCapacity > floorCapacity)
         {
             int requestedCapacity = kvCapacity;
-            while (!plan.Fits && kvCapacity > floorCapacity)
-            {
-                kvCapacity = Math.Max(floorCapacity, kvCapacity / 2);
-                plan = MakePlan(kvCapacity);
-            }
+            kvCapacity = ChooseCapacity(floorCapacity, kvCapacity, c => MakePlan(c).Fits);
+            plan = MakePlan(kvCapacity);
             Console.Error.WriteLine($"[dotLLM] qwen4exp context capacity reduced from {requestedCapacity} to {kvCapacity} tokens to fit the device " +
-                                    $"(K/V + indexer caches cost {Qwen4ExpResidencyPlan.ContextBytes(config, 1, KvStorage == VulkanKvStorage.F16 ? 2 : 4, IndexerRawF16) / 1024.0:F0} KiB per token)." +
-                                    (KvStorage == VulkanKvStorage.F32 ? " DOTLLM_VK_QWEN4EXP_KV=f16 halves the K/V part." : ""));
+                                    $"(K/V + indexer caches cost {perTokenBytes / 1024.0:F1} KiB per token)." +
+                                    (f16Kv ? "" : " DOTLLM_VK_QWEN4EXP_KV=f16 halves the K/V part."));
         }
+        Console.Error.WriteLine($"[dotLLM] qwen4exp context capacity: {kvCapacity} tokens ({(explicitCtx is null ? "default" : "requested " + explicitCtx)}; " +
+                                $"{(f16Kv ? "F16" : "F32")} K/V + indexer keys {perTokenBytes / 1024.0:F1} KiB per token = {perTokenBytes * (double)kvCapacity / (1 << 30):F2} GiB " +
+                                "reserved at the full window, allocated lazily). Raise it with --ctx-size or DOTLLM_VK_QWEN4EXP_CONTEXT.");
         if (!plan.Fits)
         {
             string msg = "qwen4exp weights do not fit the Vulkan device's resident capacity: " + plan.Describe() + ". " + plan.DescribeShortfall() + " " +

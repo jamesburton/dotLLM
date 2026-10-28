@@ -99,12 +99,18 @@ public sealed class MatMulExactGemvMultiKernel : IDisposable
         }
     }
 
+    /// <summary>First column count at which IQ2_XXS uses at least 4 rows per workgroup (#1366).</summary>
+    internal const int Iq2WideColumns = 14;
+
     /// <summary>Output rows per workgroup of an <paramref name="n"/>-column dispatch (a row's bits do not depend on it).</summary>
     /// <param name="n">Column count.</param>
     /// <returns>NR for that pipeline.</returns>
     public int RowsPerWorkgroupFor(int n)
     {
         int nr = n == 1 ? _decodeRows : _multiRows;
+        // #1366: IQ2_XXS at 14..16 columns with NR = 2 falls off a cliff (moe_dense of a Bolt verify, ms over 88 layers: 19 at 13 columns, 46-58 at
+        // 14..16, slower than the GEMM path at 32 rows); NR = 4 gives 27 / 32. A row's bits do not depend on NR.
+        if (Format == ExactGemvFormat.Iq2Xxs && n >= Iq2WideColumns) nr = Math.Max(nr, 4);
         while (nr > 1 && nr * n > 64) nr >>= 1;   // the shader's output pass needs NR * NC <= 64 lanes
         return nr;
     }

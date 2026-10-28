@@ -186,7 +186,7 @@ public static class FastMath
         Span<float> dst = output[..input.Length];
         TensorPrimitives.Add(input, offset, dst);
         TensorPrimitives.Max(dst, MinClamp, dst);
-        TensorPrimitives.Exp(dst, dst);
+        PortableMath.Exp(dst, dst);
         return TensorPrimitives.Sum(dst);
     }
 

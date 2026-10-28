@@ -302,6 +302,14 @@ public class VulkanMatMulPQ2_0GemvF32KernelTests
     [InlineData(6, true)]
     [InlineData(7, true)]
     [InlineData(8, true)]
+    [InlineData(9, true)]       // #1365: the 9..16-column multi-row kernels
+    [InlineData(10, true)]
+    [InlineData(11, true)]
+    [InlineData(12, true)]
+    [InlineData(13, true)]
+    [InlineData(14, true)]
+    [InlineData(15, true)]
+    [InlineData(16, true)]
     public void RecordColumns_MatchesTheLoopedGemv(int n, bool multiRow)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
@@ -331,7 +339,7 @@ public class VulkanMatMulPQ2_0GemvF32KernelTests
         using var legacy = MatMulPQ2_0GemvF32Kernel.Create(device, spvDir);
         legacy.MultiRowOverride = false;
 
-        long yLen = YBase + (long)(MatMulPQ2_0GemvF32Kernel.MaxColumns + 1) * M;
+        long yLen = YBase + (long)(MatMulPQ2_0GemvF32Kernel.WideMaxColumns + 1) * M;
         float[] sentinel = new float[yLen];
         Array.Fill(sentinel, Sentinel);
 
@@ -399,7 +407,7 @@ public class VulkanMatMulPQ2_0GemvF32KernelTests
         var variants = EnumerateMultiRowVariants(spvDir);
         Skip.If(variants.Count == 0, "no matmul_pq2_0_f32_gemv_mr_*.spv compiled");
 
-        const int MaxN = MatMulPQ2_0GemvF32Kernel.MaxColumns;
+        const int MaxN = MatMulPQ2_0GemvF32Kernel.WideMaxColumns;   // #1365: covers the r4_c9..c16 variants
         const int XBase = 4 * 3, YBase = 5;           // nonzero base offsets (x must stay vec4-aligned)
         const float Sentinel = -12345.5f;
         var rng = new Random(0x2A_74 ^ (M * 31 + K));

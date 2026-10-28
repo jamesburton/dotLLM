@@ -19,6 +19,13 @@ namespace DotLLM.Models;
 public static class ModelLoader
 {
     /// <summary>
+    /// Why <paramref name="config"/>'s architecture cannot be loaded by the dense Llama-style <see cref="TransformerModel"/> (hybrid / recurrent
+    /// architectures with their own model classes), or <see langword="null"/> when it can. For callers that must reject such a model up front
+    /// (e.g. a speculative draft) rather than after an expensive load.
+    /// </summary>
+    public static string? DenseLoaderUnsupportedReason(ModelConfig config) => TransformerWeights.DedicatedLoaderReason(config);
+
+    /// <summary>
     /// Loads a model from a GGUF file path. Opens the file, extracts config,
     /// and creates the appropriate model instance.
     /// </summary>

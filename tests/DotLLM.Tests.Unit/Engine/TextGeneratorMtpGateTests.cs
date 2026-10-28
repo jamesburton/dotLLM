@@ -12,7 +12,7 @@ namespace DotLLM.Tests.Unit.Engine;
 /// the generator must (a) keep the output identical to plain decode through a mid-request switch to plain decode, (b) actually stop speculating when
 /// the measured rounds lose, (c) keep speculating when they win, and (d) speculate on sampled requests too. Each assertion fails if the path is skipped.
 /// </summary>
-public sealed class TextGeneratorMtpGateTests
+public sealed class TextGeneratorMtpGateTests : IDisposable
 {
     private const int Vocab = 16;
 
@@ -27,12 +27,20 @@ public sealed class TextGeneratorMtpGateTests
             OnDraftStep = () => Spin(1),
         };
 
-    // Thread.Sleep resolves to ~15 ms on Windows; the gate compares millisecond figures, so wait on the clock.
-    private static void Spin(int ms)
+    // The gate compares millisecond figures measured by the engine, so the engine reads a per-thread VIRTUAL clock (EngineClock) that only the
+    // mock's simulated latencies advance. Wall time and scheduler preemption cannot reach the measured figures (#1373).
+    private static void Spin(int ms) => t_virtualTicks += ms * System.Diagnostics.Stopwatch.Frequency / 1000;
+
+    [ThreadStatic] private static long t_virtualTicks;
+    private readonly IDisposable _clock;
+
+    public TextGeneratorMtpGateTests()
     {
-        long end = System.Diagnostics.Stopwatch.GetTimestamp() + ms * System.Diagnostics.Stopwatch.Frequency / 1000;
-        while (System.Diagnostics.Stopwatch.GetTimestamp() < end) { }
+        t_virtualTicks = 0;
+        _clock = EngineClock.Override(() => t_virtualTicks);
     }
+
+    public void Dispose() => _clock.Dispose();
 
     private static InferenceOptions Greedy(int maxTokens) => new() { MaxTokens = maxTokens, Temperature = 0f };
 

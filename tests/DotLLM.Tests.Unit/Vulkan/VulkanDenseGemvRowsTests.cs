@@ -85,6 +85,75 @@ public class VulkanDenseGemvRowsTests
             (cmd, bw, bx, by, nn) => rows.Record(cmd, bw, bx, by, m, k, nn));
     }
 
+    /// <summary>
+    /// #1365: the 9..16-column pipelines (NR = 1..4 rows per workgroup) keep the same bits per column as the one-column dispatch, so a 9..16-row
+    /// dense qwen35 verify / DFlash block is still identical to plain greedy decode. Discriminating shapes: M not a multiple of NR (spare rows
+    /// of the last workgroup must not be stored), K of 3 super-blocks (window tail), every column a distinct activation row.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(37, 5120, 4, 9)]
+    [InlineData(37, 5120, 4, 12)]
+    [InlineData(37, 5120, 3, 13)]   // M % NR != 0 at NR = 3
+    [InlineData(65, 5120, 4, 16)]   // M % NR != 0, the widest pipeline
+    [InlineData(64, 17408, 4, 16)]  // ffn_down K
+    [InlineData(30, 768, 2, 11)]    // K = 3 super-blocks: window tail
+    [InlineData(1, 512, 4, 16)]     // M below NR
+    [InlineData(41, 1280, 1, 10)]
+    public void Q4KWide_EachColumnBitIdenticalToOneColumnDispatch(int m, int k, int wideRows, int n)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        var rng = new Random(0x1365 + m * 7 + k * 11 + n * 13 + wideRows);
+        float[] w = F16Bf16Fixture.RandomFloats(rng, m * k, 0.1f);
+        float[] x = F16Bf16Fixture.RandomFloats(rng, n * k, 1.0f);
+        byte[] wq = Quantize.FromFloat32(w, (long)m * k, QuantizationType.Q4_K);
+        using var rows = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q4_K, 2, 4, wideRows)
+                         ?? throw new Xunit.Sdk.XunitException("matmul_q4_k_gemv_f32_multi.spv unavailable");
+        Assert.Equal(16, rows.MaxColumnsSupported);
+        AssertColumnsMatchOneColumnDispatch(device, wq, x, m, k, n, QuantizationType.Q4_K,
+            (cmd, bw, bx, by, nn) => rows.Record(cmd, bw, bx, by, m, k, nn));
+    }
+
+    [SkippableTheory]
+    [InlineData(37, 5120, 4, 9)]
+    [InlineData(48, 5120, 4, 16)]   // ssm_alpha / beta
+    [InlineData(37, 6144, 3, 13)]   // M % NR != 0
+    [InlineData(40, 96, 2, 12)]     // K = 3 blocks: window tail
+    public void Q8Wide_EachColumnBitIdenticalToOneColumnDispatch(int m, int k, int wideRows, int n)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        var rng = new Random(0x1365 + m * 7 + k * 11 + n * 13 + wideRows);
+        float[] w = F16Bf16Fixture.RandomFloats(rng, m * k, 0.1f);
+        float[] x = F16Bf16Fixture.RandomFloats(rng, n * k, 1.0f);
+        byte[] wq = Quantize.FromFloat32(w, (long)m * k, QuantizationType.Q8_0);
+        using var rows = MatMulQ8_0GemvMultiKernel.TryCreate(device, spvDir, 2, 4, wideRows)
+                         ?? throw new Xunit.Sdk.XunitException("matmul_q8_0_gemv_multi.spv unavailable");
+        AssertColumnsMatchOneColumnDispatch(device, wq, x, m, k, n, QuantizationType.Q8_0,
+            (cmd, bw, bx, by, nn) => rows.Record(cmd, bw, bx, by, m, k, nn));
+    }
+
+    [SkippableTheory]
+    [InlineData(37, 6144, 4, 9)]    // attn_output K, M % NR != 0
+    [InlineData(64, 5120, 4, 16)]
+    [InlineData(30, 768, 3, 12)]    // K = 3 super-blocks: window tail
+    [InlineData(65, 5120, 1, 14)]
+    public void Q6KWide_EachColumnBitIdenticalToOneColumnDispatch(int m, int k, int wideRows, int n)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        var rng = new Random(0x6365 + m * 7 + k * 11 + n * 13 + wideRows);
+        float[] x = F16Bf16Fixture.RandomFloats(rng, n * k, 1.0f);
+        byte[] wq = new byte[m * (k / 256) * 210];
+        rng.NextBytes(wq);
+        for (int off = 0; off < wq.Length; off += 210)
+            BitConverter.TryWriteBytes(wq.AsSpan(off + 208, 2), (Half)(0.0005f + 0.001f * (float)rng.NextDouble()));
+        using var rows = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K_Rows, 2, 4, wideRows)
+                         ?? throw new Xunit.Sdk.XunitException("matmul_q6_k_gemv_f32_rows.spv unavailable");
+        AssertColumnsMatchOneColumnDispatch(device, wq, x, m, k, n, QuantizationType.Q6_K,
+            (cmd, bw, bx, by, nn) => rows.Record(cmd, bw, bx, by, m, k, nn));
+    }
+
     internal static void AssertColumnsMatchOneColumnDispatch(VulkanDevice device, byte[] wq, float[] x, int m, int k, int n, QuantizationType qt,
                                                              Action<nint, VulkanDevice.Buffer, VulkanDevice.Buffer, VulkanDevice.Buffer, int> record,
                                                              float scale = 1f)
