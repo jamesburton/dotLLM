@@ -45,6 +45,12 @@ if ($null -eq $glslc) {
     exit 1
 }
 
+$pin = (Get-Content (Join-Path $scriptDir "glslc.version") -TotalCount 1 -ErrorAction SilentlyContinue)
+$got = (& glslc --version | Select-Object -First 1)
+if ($pin -and -not $got.StartsWith($pin)) {
+    Write-Warning "glslc '$got' != pinned '$pin' (glslc.version); output bytes will differ from the committed .spv (#1364)"
+}
+
 Write-Host "Compiling GLSL compute shaders -> SPIR-V (target: $targetEnv)..."
 
 foreach ($compFile in $shaderSources) {

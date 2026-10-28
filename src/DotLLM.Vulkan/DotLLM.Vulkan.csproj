@@ -39,7 +39,7 @@
        End users need the Vulkan SDK (glslc) only to rebuild shaders from source;
        the .spv blobs checked into native/vulkan/spv/ are loaded verbatim at runtime. -->
   <ItemGroup>
-    <Content Include="..\..\native\vulkan\spv\*.spv" Link="spv\%(Filename)%(Extension)" Condition="Exists('..\..\native\vulkan\spv\')">
+    <Content Include="..\..\native\vulkan\spv\*.spv" Link="spv%(Filename)%(Extension)" Condition="Exists('..\..\native\vulkan\spv\')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
@@ -57,23 +57,62 @@
     <VulkanShader Include="$(VulkanShaderDir)\*.comp" />
   </ItemGroup>
 
-  <!-- Compile stale .comp files to .spv. Incremental via Inputs/Outputs. Always -O, matching
-       native/vulkan/build.ps1 / build.sh: the committed .spv are -O builds, and a plain build here
-       would silently overwrite them whenever a .comp mtime is newer than its .spv (#1310). -->
+  <!-- glslc pin (#1364). SPIR-V bytes depend on the glslc version, so tracked .spv are only (re)written by the
+       toolchain recorded in native/vulkan/glslc.version. A different glslc would rewrite ~30 tracked blobs with
+       equivalent-but-different bytes and dirty every worktree/PR, so an ordinary build SKIPS compiling (with a
+       warning) on a mismatch. Opt-ins:
+         -p:DotLLMStrictSpv=true         mismatch is an error (CI / release)
+         dotnet msbuild -t:RegenerateVulkanShaders   rebuild EVERY .spv now (warns on mismatch; use after
+                                          changing a .comp, then bump glslc.version if the toolchain changed) -->
+  <PropertyGroup>
+    <GlslcPinFile>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', '..', '..', 'native', 'vulkan', 'glslc.version'))</GlslcPinFile>
+  </PropertyGroup>
+
+  <Target Name="_DetectGlslc">
+    <ReadLinesFromFile File="$(GlslcPinFile)" Condition="Exists('$(GlslcPinFile)')">
+      <Output TaskParameter="Lines" ItemName="_GlslcPinLine" />
+    </ReadLinesFromFile>
+    <PropertyGroup>
+      <_GlslcPin>@(_GlslcPinLine)</_GlslcPin>
+    </PropertyGroup>
+    <Exec Command="glslc --version" IgnoreExitCode="true" ConsoleToMSBuild="true" StandardOutputImportance="low" StandardErrorImportance="low">
+      <Output TaskParameter="ExitCode" PropertyName="_GlslcExitCode" />
+      <Output TaskParameter="ConsoleOutput" ItemName="_GlslcVersionLine" />
+    </Exec>
+    <PropertyGroup>
+      <_GlslcAllLines>@(_GlslcVersionLine->'%(Identity)', '|')</_GlslcAllLines>
+      <_GlslcFirstLine Condition="'$(_GlslcAllLines)' != ''">$(_GlslcAllLines.Split('|')[0])</_GlslcFirstLine>
+      <_GlslcMatchesPin Condition="'$(_GlslcExitCode)' == '0' And '$(_GlslcPin)' != '' And $(_GlslcFirstLine.StartsWith('$(_GlslcPin)'))">true</_GlslcMatchesPin>
+    </PropertyGroup>
+  </Target>
+
+  <!-- Incremental compile of stale .comp files. Writes only when glslc matches the pin. -->
   <Target Name="CompileVulkanShaders"
           BeforeTargets="BeforeBuild"
+          DependsOnTargets="_DetectGlslc"
           Inputs="@(VulkanShader)"
           Outputs="@(VulkanShader->'$(SpvOutputDir)\%(Filename).spv')">
-    <Exec Command="glslc --version" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low">
-      <Output TaskParameter="ExitCode" PropertyName="_GlslcExitCode" />
-    </Exec>
     <Message Condition="'$(_GlslcExitCode)' != '0'" Importance="high"
              Text="WARNING: .comp source is newer than .spv but glslc not found in PATH. Pre-compiled SPIR-V may be stale. Install the Vulkan SDK to auto-compile shaders." />
+    <Error Condition="'$(_GlslcExitCode)' == '0' And '$(_GlslcMatchesPin)' != 'true' And '$(DotLLMStrictSpv)' == 'true'"
+           Text="glslc '$(_GlslcFirstLine)' does not match the pinned '$(_GlslcPin)' (native/vulkan/glslc.version). Install the pinned shaderc or run -t:RegenerateVulkanShaders and bump the pin (#1364)." />
+    <Warning Condition="'$(_GlslcExitCode)' == '0' And '$(_GlslcMatchesPin)' != 'true'"
+             Text="glslc '$(_GlslcFirstLine)' does not match the pinned '$(_GlslcPin)' (native/vulkan/glslc.version); NOT recompiling tracked .spv so the tree stays clean (#1364). Use -t:RegenerateVulkanShaders to force." />
 
-    <MakeDir Condition="'$(_GlslcExitCode)' == '0'" Directories="$(SpvOutputDir)" />
-    <Message Condition="'$(_GlslcExitCode)' == '0'" Importance="high" Text="Compiling %(VulkanShader.Filename).comp to SPIR-V" />
-    <Exec Condition="'$(_GlslcExitCode)' == '0'"
+    <MakeDir Condition="'$(_GlslcMatchesPin)' == 'true'" Directories="$(SpvOutputDir)" />
+    <Message Condition="'$(_GlslcMatchesPin)' == 'true'" Importance="high" Text="Compiling %(VulkanShader.Filename).comp to SPIR-V" />
+    <Exec Condition="'$(_GlslcMatchesPin)' == 'true'"
           Command="glslc --target-env=$(VulkanTargetEnv) -O -o &quot;$(SpvOutputDir)/%(VulkanShader.Filename).spv&quot; &quot;%(VulkanShader.FullPath)&quot;"
+          StandardOutputImportance="low" />
+  </Target>
+
+  <!-- Explicit regenerate: rebuilds every .spv regardless of timestamps or glslc version. -->
+  <Target Name="RegenerateVulkanShaders" DependsOnTargets="_DetectGlslc">
+    <Error Condition="'$(_GlslcExitCode)' != '0'" Text="glslc not found in PATH." />
+    <Warning Condition="'$(_GlslcMatchesPin)' != 'true'"
+             Text="Regenerating with glslc '$(_GlslcFirstLine)' != pinned '$(_GlslcPin)': every changed .spv will need review and glslc.version must be bumped (#1364)." />
+    <MakeDir Directories="$(SpvOutputDir)" />
+    <Exec Command="glslc --target-env=$(VulkanTargetEnv) -O -o &quot;$(SpvOutputDir)/%(VulkanShader.Filename).spv&quot; &quot;%(VulkanShader.FullPath)&quot;"
           StandardOutputImportance="low" />
   </Target>
 
