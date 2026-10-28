@@ -8939,7 +8939,7 @@ public sealed partial class VulkanTransformerModel : IModel
             // 128x128 GEMM tile; the policy lives in PQ2_0SmallNDispatch and is shared with
             // the two hybrid models.
             PQ2_0SmallNDispatch.Record(cmdBuf, _matmulPQ2_0, _matmulPQ2_0Gemm,
-                weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                weights, input, output, m: outputDim, k: inputDim, n: seqLen, hostMaxColumns: PQ2_0SmallNDispatch.UnvalidatedHostMaxColumns);
         }
         else if (weightQt == QuantType.PTQ1_0)
         {

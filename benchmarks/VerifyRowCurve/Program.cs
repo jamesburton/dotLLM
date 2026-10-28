@@ -1,6 +1,6 @@
 // Diagnostics tool (not shipped) for issue #1359 stage 1: multi-row verify wall time vs rows R.
 //   VerifyRowCurve <gguf> <vulkan|cpu> [reps=3] [inner=5] [ctx=64] [rows=1,2,4,8,16,32] [ab]
-// With `ab` (Vulkan dense qwen35 only, #1365) every timing is taken twice in the same process: "old" = the multi-column GEMVs capped at 8 rows
+// With `ab` (Vulkan dense qwen35 #1365, MoE host #1374; models without recurrent row snapshots time plain Forward instead) every timing is taken twice in the same process: "old" = the multi-column GEMVs capped at 8 rows
 // (the pre-#1365 dispatch: DOTLLM_VK_SMALLROW_WIDE=0 + DOTLLM_VK_PQ2_0_MULTICOL_MAX_N=8) and "new" = up to 16; the order alternates with the rep.
 // Loads ONCE, prefills ctx tokens, then times a forward over R rows at positions ctx..ctx+R-1 (token content is irrelevant to cost),
 // rolls the KV and the recurrent state back, and repeats. Two series per R: "fwd" (plain Forward) and "verify" (ForwardWithRecurrentSnapshots,
@@ -26,6 +26,7 @@ bool ab = args.Length > 6 && args[6] == "ab";
 void SetWide(bool wide)
 {
     DotLLM.Vulkan.VulkanQwen3HybridDenseTransformerModel.SmallRowWideEnabled = wide;
+    DotLLM.Vulkan.VulkanQwen3MoeHybridTransformerModel.SmallRowWideEnabled = wide;   // #1374
     DotLLM.Vulkan.Kernels.PQ2_0SmallNDispatch.MultiColumnMaxNOverride = wide ? 16 : 8;
 }
 if (ab) SetWide(true);
@@ -82,15 +83,16 @@ double Time(int rows, bool verify)
 }
 
 bool VerifyOk(int r) => canSnap && r >= 2 && r <= 16;
+bool AbOk(int r) => r >= 2 && r <= 16;   // ab arm: verify series when the model snapshots, plain Forward otherwise
 if (ab)
 {
     // Old/new interleaved per timing, alternating which goes first; verify series only (ForwardWithRecurrentSnapshots, <= 16 rows).
-    foreach (int r in rowsList.Where(VerifyOk)) { SetWide(false); Time(r, true); SetWide(true); Time(r, true); }
+    foreach (int r in rowsList.Where(AbOk)) { SetWide(false); Time(r, canSnap); SetWide(true); Time(r, canSnap); }
     var oldL = rowsList.ToDictionary(r => r, _ => new List<double>());
     var newL = rowsList.ToDictionary(r => r, _ => new List<double>());
     for (int rep = 0; rep < reps; rep++)
     {
-        foreach (int r in (rep % 2 == 0 ? rowsList : rowsList.Reverse().ToArray()).Where(VerifyOk))
+        foreach (int r in (rep % 2 == 0 ? rowsList : rowsList.Reverse().ToArray()).Where(AbOk))
             for (int i = 0; i < inner; i++)
             {
                 bool newFirst = ((rep + i) & 1) == 1;
@@ -98,13 +100,13 @@ if (ab)
                 {
                     bool wide = (pass == 0) == newFirst;
                     SetWide(wide);
-                    (wide ? newL : oldL)[r].Add(Time(r, true));
+                    (wide ? newL : oldL)[r].Add(Time(r, canSnap));
                 }
             }
         Console.WriteLine($"[vrc] ab rep {rep + 1}/{reps} done {sw0.Elapsed.TotalSeconds:F0} s");
     }
     Console.WriteLine("ab	rows	arm	min	med	max");
-    foreach (int r in rowsList.Where(VerifyOk))
+    foreach (int r in rowsList.Where(AbOk))
     {
         Console.WriteLine($"ab	{r}	old	{oldL[r].Min():F1}	{Med(oldL[r]):F1}	{oldL[r].Max():F1}");
         Console.WriteLine($"ab	{r}	new	{newL[r].Min():F1}	{Med(newL[r]):F1}	{newL[r].Max():F1}");

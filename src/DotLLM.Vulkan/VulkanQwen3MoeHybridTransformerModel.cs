@@ -2862,6 +2862,15 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     internal static bool SmallRowGemvEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_SMALLROW_GEMV") != "0";
 
     /// <summary>
+    /// <c>DOTLLM_VK_SMALLROW_WIDE=0</c> caps the multi-column GEMVs at 8 rows again (#1374: A/B and diagnostics; 9..16 rows then take the GEMM
+    /// path). Pair it with <c>DOTLLM_VK_PQ2_0_MULTICOL_MAX_N=8</c> for PQ2_0 weights (<see cref="PQ2_0SmallNDispatch"/>).
+    /// </summary>
+    internal static bool SmallRowWideEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_SMALLROW_WIDE") != "0";
+
+    /// <summary>Largest row count the Q4_K / Q6_K_Rows / Q8_0 / BF16 multi-column GEMVs serve here: 16 (#1374), or 8 with <see cref="SmallRowWideEnabled"/> off.</summary>
+    internal static int SmallRowMaxRows => SmallRowWideEnabled ? MatMulQuantGemvMultiKernel.WideMaxColumns : MatMulQuantGemvMultiKernel.MaxColumns;
+
+    /// <summary>
     /// qwen4exp opt-in (#885): single-token decode takes the multi-row routed-MoE MMVQs (Q4_K gate/up NR=2, Q5_1 down NR=4) - 56.7 -> 52.5 ms per 1-row
     /// forward on the real UD-Q4_K_XL file (interleaved same-process A/B). Other MoE models keep the static default (not measured there).
     /// </summary>
@@ -2901,6 +2910,11 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                     _kernels.MatMulQ8MmvqMulti!.Record(cmdBuf, weights, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, output,
                         m: outputDim, k: inputDim, n: seqLen);
                 }   // #876: 2..8 rows read the weights once instead of the 128x128 coopmat GEMM
+                else if (SmallRowGemvEnabled && seqLen <= SmallRowMaxRows && _kernels.MatMulQ8Multi is not null && MatMulQ8_0GemvMultiKernel.AcceptsWide(seqLen, inputDim))
+                {
+                    CountSmallRow(SmallRowPath.Q8Multi);
+                    _kernels.MatMulQ8Multi.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);   // #1374: 9..16 rows, F32 activations (the MMVQ multi stops at 8)
+                }
                 else if (_kernels.MatMulQ8GemmCoopmat is not null)
                     _kernels.MatMulQ8GemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
@@ -2938,8 +2952,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                     q4kRows.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: 1);   // #1220: same kernel as the verify rows
                 else if (seqLen == 1)
                     _kernels.MatMulQ4K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
-                else if (SmallRowGemvEnabled && _kernels.MatMulQ4KMulti is { } multiQ4K && MatMulQuantGemvMultiKernel.Accepts(seqLen, inputDim))
-                { CountSmallRow(SmallRowPath.QuantMulti); multiQ4K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen); }   // #902
+                else if (SmallRowGemvEnabled && seqLen <= SmallRowMaxRows && _kernels.MatMulQ4KMulti is { } multiQ4K && multiQ4K.AcceptsColumns(seqLen, inputDim))
+                { CountSmallRow(SmallRowPath.QuantMulti); multiQ4K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen); }   // #902; 9..16 rows: #1374
                 else if (_kernels.MatMulQ4KGemmCoopmat is not null && (inputDim % 256) == 0)
                     _kernels.MatMulQ4KGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
@@ -2960,6 +2974,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                     _kernels.MatMulQ6K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
                 else if (SmallRowGemvEnabled && _kernels.MatMulQ6KMulti is { } multiQ6K && MatMulQuantGemvMultiKernel.Accepts(seqLen, inputDim))
                 { CountSmallRow(SmallRowPath.QuantMulti); multiQ6K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen); }   // #902
+                else if (SmallRowGemvEnabled && seqLen <= SmallRowMaxRows && _kernels.MatMulQ6KRows is { } rowsQ6K && rowsQ6K.AcceptsColumns(seqLen, inputDim))
+                { CountSmallRow(SmallRowPath.QuantMulti); rowsQ6K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen); }   // #1374: 9..16 rows (the deterministic NR-parameterised kernel)
                 else if (_kernels.MatMulQ6KGemmCoopmat is not null && (inputDim % 256) == 0)
                     _kernels.MatMulQ6KGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
@@ -3028,7 +3044,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 // which reads the weights once for all of them; the 128x128 GEMM tile costs
                 // 4-6 single-token GEMVs even at n = 2.
                 PQ2_0SmallNDispatch.Record(cmdBuf, _kernels.MatMulPQ2_0, _kernels.MatMulPQ2_0Gemm,
-                    weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                    weights, input, output, m: outputDim, k: inputDim, n: seqLen, hostMaxColumns: PQ2_0SmallNDispatch.UnvalidatedHostMaxColumns);
                 break;
             case QuantizationType.PTQ1_0:
                 // PTQ1_0 (PrismML Bonsai dense-trit ternary, type 143): 128-element group
@@ -3054,7 +3070,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             case QuantizationType.BF16:
                 if (seqLen == 1)
                     _kernels.MatMulBf16.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
-                else if (seqLen <= MatMulBf16GemvMultiF32Kernel.MaxColumns && _kernels.MatMulBf16Multi is { } bf16Multi)
+                else if (seqLen <= (SmallRowWideEnabled ? MatMulBf16GemvMultiF32Kernel.WideMaxColumns : MatMulBf16GemvMultiF32Kernel.MaxColumns) && _kernels.MatMulBf16Multi is { } bf16Multi)
                     bf16Multi.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);   // #706: thin BF16 projections at 2..8 rows
                 else
                     _kernels.MatMulBf16Gemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
