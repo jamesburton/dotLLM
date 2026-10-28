@@ -120,21 +120,17 @@ public class VulkanQuantGemvMultiKernelTests
     [InlineData(QuantGemvMultiFormat.IQ4_XS, 37, 2560, 10)]
     [InlineData(QuantGemvMultiFormat.IQ4_XS, 65, 1024, 16)]
     [InlineData(QuantGemvMultiFormat.IQ4_XS, 17, 256, 15)]
-    [InlineData(QuantGemvMultiFormat.IQ3_S, 37, 2560, 11)]
-    [InlineData(QuantGemvMultiFormat.IQ3_S, 65, 1024, 16)]
-    [InlineData(QuantGemvMultiFormat.IQ3_S, 17, 256, 14)]
     public void Multi_EachColumnMatchesSingleRowGemv(QuantGemvMultiFormat format, int m, int k, int n) => RunParity(format, m, k, n);
 
     /// <summary>
-    /// #1377: a wide (9..16) dispatch and the 8-column dispatch produce the SAME BITS for the columns they share, so a 9..16-row verify
-    /// does not change the tokens a 2..8-row one would have produced. Also pins the per-format column cap (the R2 Q6_K stays at 8).
+    /// #1377: a wide (9..16) dispatch and the 8-column dispatch agree to ULP level on the columns they share (not bit-equal: per-NC
+    /// specialisation lets the driver contract FMAs differently, unlike the NR-parameterised Q4_K / Q6_K_Rows shaders). Also pins the per-format column cap (the R2 Q6_K stays at 8).
     /// </summary>
     [SkippableTheory]
     [InlineData(QuantGemvMultiFormat.Q5_K, 37, 2560, 13)]
     [InlineData(QuantGemvMultiFormat.Q6_K, 37, 2560, 16)]
     [InlineData(QuantGemvMultiFormat.IQ4_XS, 37, 2560, 11)]
-    [InlineData(QuantGemvMultiFormat.IQ3_S, 37, 2560, 16)]
-    public void Wide_SharedColumnsBitIdenticalToEightColumnDispatch(QuantGemvMultiFormat format, int m, int k, int n)
+    public void Wide_SharedColumnsMatchEightColumnDispatch(QuantGemvMultiFormat format, int m, int k, int n)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         var rng = new Random(0x1377 + m * 7 + k * 11 + n + (int)format);
@@ -174,12 +170,16 @@ public class VulkanQuantGemvMultiKernelTests
         device.Download(byWide, wide);
         device.Download(by8, eight);
         Assert.Contains(eight, v => v != 0f);
-        Assert.Equal(eight, wide.AsSpan(0, 8 * m).ToArray());
+        // Not bit-equal: the non-Rows shaders are specialised per NC, so the driver may contract FMAs differently (ULP-level, e.g. 49.449379 vs
+        // 49.4493713). The accumulation ORDER per column is the same; the bound below is far tighter than the 2e-3 + 1e-4 rel parity vs the single-row kernel.
+        float[] w8 = wide.AsSpan(0, 8 * m).ToArray();
+        for (int i = 0; i < w8.Length; i++)
+            Assert.True(Math.Abs(eight[i] - w8[i]) <= 1e-4f + 1e-5f * Math.Abs(eight[i]), $"[{i}]: 8-col {eight[i]:G9} vs wide {w8[i]:G9}");
     }
 
-    /// <summary>The Q6_K two-rows-per-workgroup variant has no wide pipelines: it stops at eight and the dispatcher must not hand it more.</summary>
+    /// <summary>The Q6_K two-rows-per-workgroup variant has no wide pipelines and IQ3_S spills above 8 columns: both stop at eight and the dispatcher must not hand them more.</summary>
     [SkippableFact]
-    public void Q6KR2_StopsAtEightColumns()
+    public void Q6KR2AndIq3S_StopAtEightColumns()
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
@@ -187,5 +187,41 @@ public class VulkanQuantGemvMultiKernelTests
         Skip.If(r2 is null, "Q6_K_R2 unavailable");
         Assert.Equal(8, r2!.MaxColumnsSupported);
         Assert.False(r2.AcceptsColumns(9, 256));
+        using var iq3 = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.IQ3_S);
+        if (iq3 is not null) { Assert.Equal(8, iq3.MaxColumnsSupported); Assert.False(iq3.AcceptsColumns(9, 256)); }
+    }
+
+    /// <summary>
+    /// Opt-in timing (<c>DOTLLM_GEMV_WIDE_BENCH=1</c>, #1377): per format at an FFN shape, one 16-column dispatch against two 8-column dispatches
+    /// (the alternative that needs no wide shader) and a single 8-column one. Minimum of 5 rounds x 20 back-to-back dispatches; device-local weights.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(QuantGemvMultiFormat.Q5_K, 176, 17408, 5120)]
+    [InlineData(QuantGemvMultiFormat.Q6_K, 210, 5120, 6144)]
+    [InlineData(QuantGemvMultiFormat.IQ4_XS, 136, 17408, 5120)]
+    public void Bench_WideColumns(QuantGemvMultiFormat format, int blockBytes, int m, int k)
+    {
+        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_GEMV_WIDE_BENCH") == "1", "DOTLLM_GEMV_WIDE_BENCH=1 to enable.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        using var multi = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, format);
+        Skip.If(multi is null, "unavailable");
+        using var gridOwner = format == QuantGemvMultiFormat.IQ3_S ? MatMulIq3SGemvF32Kernel.Create(device, spvDir) : null;
+        var rng = new Random(m + k);
+        byte[] wq = RandomBlocks(rng, m, k, blockBytes, format == QuantGemvMultiFormat.Q6_K ? new[] { 208 } : new[] { 0, 2 });
+        using var staging = device.Allocate(((long)wq.Length + 3) & ~3L);
+        device.Upload(new ReadOnlySpan<byte>(wq), staging);
+        using var bw = device.AllocateDeviceLocal(((long)wq.Length + 3) & ~3L);
+        device.CopyBufferSynchronous(staging, bw, (ulong)wq.Length);
+        using var bx = device.Allocate(16L * k * 4);
+        device.Upload(F16Bf16Fixture.RandomFloats(rng, 16 * k, 1.0f), bx);
+        using var by = device.AllocateDeviceLocal(16L * m * 4);
+        var cb = gridOwner?.GridBuffer;
+        double[] t = VulkanDenseGemvRowsTests.Time(device, [
+            cmd => multi!.Record(cmd, bw, bx, by, m, k, 8, cb),
+            cmd => { multi!.Record(cmd, bw, bx, by, m, k, 8, cb); multi.Record(cmd, bw, bx, by, m, k, 8, cb); },
+            cmd => multi!.Record(cmd, bw, bx, by, m, k, 16, cb),
+            cmd => multi!.Record(cmd, bw, bx, by, m, k, 12, cb)]);
+        Console.WriteLine($"wide-bench {format} m={m} k={k}: 1x8 {t[0] * 1000:F0} us | 2x8 {t[1] * 1000:F0} us | 1x12 {t[3] * 1000:F0} us | 1x16 {t[2] * 1000:F0} us");
     }
 }
