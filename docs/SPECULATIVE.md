@@ -1342,8 +1342,37 @@ Parity: `VulkanDenseGemvRowsTests.{Q4KWide,Q8Wide,Q6KWide}_*` (every column bit-
 over the dequantised weights; ragged M, K of 3 blocks, M below NR), `VulkanMatMulPQ2_0GemvF32KernelTests.{RecordColumns,MultiRowVariants}_*` extended to 16 columns
 (vs the looped #470 kernel at 1e-5 and the scalar reference, sentinel past the live columns), `VulkanMatMulBf16GemvMultiF32KernelTests` at 9/12/13/16.
 CUDA has the same 8-column caps (`Pq2_0GemvMultiMaxColumns`, `CudaQ8_0RbGemv.MaxColumns`, `CudaSmallSGemvDispatch.MaxColumns`); not measured here (#1375). The shared
-`PQ2_0SmallNDispatch` cap is now 16 for the MoE host and `VulkanTransformerModel` too (their 9..16-row PQ2_0 prefill / verify is unmeasured; #1374). Remaining: 17..32 rows (#1376),
-Q5_K / Q6_K / IQ4_XS / IQ3_S wide kernels (#1377), the DFlash K >= 8 premise above (#1378).
+`PQ2_0SmallNDispatch` cap stays 8 on the MoE host and `VulkanTransformerModel` (their 9..16-row PQ2_0 path is unmeasured, #1374 below). Remaining: 17..32 rows (#1376), the DFlash K >= 8 premise above (#1378).
+
+#### Verify-cliff on the MoE host and `VulkanTransformerModel` (issue #1374)
+
+`VulkanQwen3MoeHybridTransformerModel` now serves 9..16 rows on the same wide multi-column GEMVs through the `AcceptsColumns` gate: Q4_K, Q6_K_Rows
+(preferred above 8; the older non-Rows Q6_K otherwise), Q8_0 (the F32-activation `MatMulQ8Multi`, since the Q8_1 MMVQ multi stops at 8; so 9..16 rows are
+ULP-close, not bit-equal, to the 2..8-row Q8_1 path) and BF16. `DOTLLM_VK_SMALLROW_WIDE=0` restores the 8-column cap (pair it with `DOTLLM_VK_PQ2_0_MULTICOL_MAX_N=8`
+for PQ2_0). Routed-expert paths are unchanged.
+
+Qwen3.6-35B-A3B UD-Q4_K_M (Q8_0 attention / GDN / shared-expert projections; Q4_K / Q5_K routed banks), Strix Halo Vulkan, ctx 64, `VerifyRowCurve ab`
+(old = 8-column cap, new = wide; interleaved in-process, alternating order, 5 reps x 5, `ForwardWithRecurrentSnapshots`), median [min-max] ms:
+
+| rows | old | new |
+|---|---|---|
+| 2 | 28.6 [28.1-30.7] | 28.8 [28.0-30.4] |
+| 8 | 53.0 [50.8-54.2] | 53.0 [51.6-56.1] |
+| 9 | 75.4 [74.1-80.9] | 60.3 [59.3-62.4] |
+| 10 | 78.6 [76.4-88.3] | 64.1 [62.8-66.0] |
+| 12 | 84.5 [83.5-88.5] | 72.1 [70.3-74.2] |
+| 14 | 91.5 [89.6-94.0] | 79.9 [78.4-89.3] |
+| 16 | 88.2 [85.4-90.2] | 78.7 [76.2-81.6] |
+
+1..8 rows unchanged; 9 rows -20%, 16 rows -11%. The MoE host's cliff was small (8 -> 9 rows: 53 -> 75 ms, 1.4x, not the 3-8x of the dense hosts) because
+its dense projections are a minor share; the wide GEMVs recover 14-15 ms of it. A step remains at 8 -> 9 (53 -> 60 ms): the routed-expert and attention paths.
+
+`VulkanTransformerModel` (Llama-3.1-8B Q4_K_M, plain `Forward`, 5 x 3): 1 row 25.3, 4 rows 69.2, 8 rows 79.7, 9 rows 82.5, 12 rows 82.4, 16 rows 82.9 ms. No 8 -> 9 cliff
+(its Q4_K goes to MMQ, Q6_K / Q8_0 multi-column GEMVs are deliberately capped at 4 rows by #996), so nothing to widen. Its 2..4-row cost (2.7x a decode step at 4 rows) is a different matter.
+
+**PQ2_0 default (16, #1365) is NOT carried over.** No PQ2_0 model runs on the MoE host or `VulkanTransformerModel` locally, so 9..16-row PQ2_0 gains / regressions there
+are unmeasurable; both hosts pass `hostMaxColumns: PQ2_0SmallNDispatch.UnvalidatedHostMaxColumns` (8) to `PQ2_0SmallNDispatch.Record`, which is the pre-#1365 behaviour. The
+dense qwen35 host keeps 16 (measured, #1365). Raise it per host once a PQ2_0 model is measured there.
 
 ### `qwen35moe` MTP head (issue #1188)
 

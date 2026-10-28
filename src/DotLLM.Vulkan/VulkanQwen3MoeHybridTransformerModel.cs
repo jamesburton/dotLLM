@@ -3044,7 +3044,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 // which reads the weights once for all of them; the 128x128 GEMM tile costs
                 // 4-6 single-token GEMVs even at n = 2.
                 PQ2_0SmallNDispatch.Record(cmdBuf, _kernels.MatMulPQ2_0, _kernels.MatMulPQ2_0Gemm,
-                    weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                    weights, input, output, m: outputDim, k: inputDim, n: seqLen, hostMaxColumns: PQ2_0SmallNDispatch.UnvalidatedHostMaxColumns);
                 break;
             case QuantizationType.PTQ1_0:
                 // PTQ1_0 (PrismML Bonsai dense-trit ternary, type 143): 128-element group

@@ -86,6 +86,9 @@ public static class PQ2_0SmallNDispatch
     /// <summary>Largest <c>n</c> sent to the multi-column GEMV by default.</summary>
     public const int DefaultMultiColumnMaxN = MatMulPQ2_0GemvF32Kernel.WideMaxColumns;   // #1365: 16 (was 8, the cliff)
 
+    /// <summary>Cap for hosts whose 9..16-row PQ2_0 path is unmeasured (MoE host, <c>VulkanTransformerModel</c>; #1374): they stay on the 8-column range.</summary>
+    public const int UnvalidatedHostMaxColumns = MatMulPQ2_0GemvF32Kernel.MaxColumns;
+
     /// <summary>Environment variable overriding <see cref="DefaultMultiColumnMaxN"/>; <c>0</c> disables the multi-column path.</summary>
     public const string MultiColumnEnvVar = "DOTLLM_VK_PQ2_0_MULTICOL_MAX_N";
 
@@ -131,11 +134,16 @@ public static class PQ2_0SmallNDispatch
     /// <param name="m">Output rows per token.</param>
     /// <param name="k">Inner dimension.</param>
     /// <param name="n">Token count.</param>
+    /// <param name="hostMaxColumns">
+    /// Cap the calling host applies on top of <see cref="MultiColumnMaxN"/>. The dense qwen35 host (measured, #1365) passes the default;
+    /// the MoE host and <c>VulkanTransformerModel</c> pass <see cref="UnvalidatedHostMaxColumns"/> (8) because no PQ2_0 model runs on them
+    /// to measure 9..16 rows (#1374).
+    /// </param>
     public static void Record(
         nint cmdBuf,
         MatMulPQ2_0GemvF32Kernel gemv, MatMulPQ2_0GemmF32Kernel gemm,
         VulkanDevice.Buffer weights, VulkanDevice.Buffer input, VulkanDevice.Buffer output,
-        int m, int k, int n)
+        int m, int k, int n, int hostMaxColumns = int.MaxValue)
     {
         ArgumentNullException.ThrowIfNull(gemv);
         ArgumentNullException.ThrowIfNull(gemm);
@@ -147,7 +155,7 @@ public static class PQ2_0SmallNDispatch
             return;
         }
 
-        if (n <= MultiColumnMaxN && n <= gemv.MaxColumnsAvailable)
+        if (n <= Math.Min(MultiColumnMaxN, hostMaxColumns) && n <= gemv.MaxColumnsAvailable)
         {
             gemv.RecordColumns(cmdBuf, weights, input, output, m, k, n);
             return;
