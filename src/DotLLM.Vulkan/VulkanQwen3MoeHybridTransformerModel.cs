@@ -2962,7 +2962,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             case QuantizationType.Q5_K:
                 if (seqLen == 1)
                     _kernels.MatMulQ5K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
-                else if (SmallRowGemvEnabled && _kernels.MatMulQ5KMulti is { } multiQ5K && MatMulQuantGemvMultiKernel.Accepts(seqLen, inputDim))
+                else if (SmallRowGemvEnabled && seqLen <= SmallRowMaxRows && _kernels.MatMulQ5KMulti is { } multiQ5K && multiQ5K.AcceptsColumns(seqLen, inputDim))
                 { CountSmallRow(SmallRowPath.QuantMulti); multiQ5K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen); }   // #902
                 else if (_kernels.MatMulQ5KGemmCoopmat is not null && (inputDim % 256) == 0)
                     _kernels.MatMulQ5KGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
@@ -2972,7 +2972,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             case QuantizationType.Q6_K:
                 if (seqLen == 1)
                     _kernels.MatMulQ6K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
-                else if (SmallRowGemvEnabled && _kernels.MatMulQ6KMulti is { } multiQ6K && MatMulQuantGemvMultiKernel.Accepts(seqLen, inputDim))
+                else if (SmallRowGemvEnabled && seqLen <= SmallRowMaxRows && (seqLen <= MatMulQuantGemvMultiKernel.MaxColumns || _kernels.MatMulQ6KRows is null) && _kernels.MatMulQ6KMulti is { } multiQ6K && multiQ6K.AcceptsColumns(seqLen, inputDim))
                 { CountSmallRow(SmallRowPath.QuantMulti); multiQ6K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen); }   // #902
                 else if (SmallRowGemvEnabled && seqLen <= SmallRowMaxRows && _kernels.MatMulQ6KRows is { } rowsQ6K && rowsQ6K.AcceptsColumns(seqLen, inputDim))
                 { CountSmallRow(SmallRowPath.QuantMulti); rowsQ6K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen); }   // #1374: 9..16 rows (the deterministic NR-parameterised kernel)
@@ -2990,7 +2990,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             case QuantizationType.IQ4_XS:
                 if (seqLen == 1)
                     _kernels.MatMulIq4Xs.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
-                else if (SmallRowGemvEnabled && _kernels.MatMulIq4XsMulti is { } multiIq4Xs && MatMulQuantGemvMultiKernel.Accepts(seqLen, inputDim))
+                else if (SmallRowGemvEnabled && seqLen <= SmallRowMaxRows && _kernels.MatMulIq4XsMulti is { } multiIq4Xs && multiIq4Xs.AcceptsColumns(seqLen, inputDim))
                 { CountSmallRow(SmallRowPath.QuantMulti); multiIq4Xs.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen); }   // #902
                 else if (_kernels.MatMulIq4XsGemmCoopmat is not null && (inputDim % 256) == 0)
                     _kernels.MatMulIq4XsGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
@@ -3024,7 +3024,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             case QuantizationType.IQ3_S:
                 if (seqLen == 1)
                     _kernels.MatMulIq3S.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
-                else if (SmallRowGemvEnabled && _kernels.MatMulIq3SMulti is { } multiIq3S && MatMulQuantGemvMultiKernel.Accepts(seqLen, inputDim))
+                else if (SmallRowGemvEnabled && seqLen <= SmallRowMaxRows && _kernels.MatMulIq3SMulti is { } multiIq3S && multiIq3S.AcceptsColumns(seqLen, inputDim))
                 { CountSmallRow(SmallRowPath.QuantMulti); multiIq3S.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen, codebook: _kernels.MatMulIq3S.GridBuffer); }   // #902
                 else
                     _kernels.MatMulIq3SGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
