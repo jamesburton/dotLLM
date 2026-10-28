@@ -346,7 +346,9 @@ public sealed unsafe class PQ2_0Tests
     [InlineData(5, 640, 5)]
     [InlineData(6, 256, 8)]
     [InlineData(11, 512, 9)]
-    [InlineData(4, 256, 33)]   // above the small-n cut: float tier, tolerance only
+    [InlineData(4, 256, 33)]   // formerly above the n=32 cut (float tier); W2A8 and bit-identical since #1386
+    [InlineData(4, 256, 70)]
+    [InlineData(3, 384, 131)]
     public void GemmPQ2_0_SmallN_BitIdenticalToDecodeGemv_PerToken(int m, int k, int n)
     {
         Skip.IfNot(System.Runtime.Intrinsics.X86.Ssse3.IsSupported, "W2A8 PQ2_0 requires SSSE3.");
