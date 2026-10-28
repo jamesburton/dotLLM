@@ -49,7 +49,7 @@ internal sealed class PQ2_0GemvMultiRowPipeline : IDisposable
         VulkanDevice device, string spvDir, string spvFileName, int rows, int columns)
     {
         if (rows < 1) throw new ArgumentOutOfRangeException(nameof(rows));
-        if (columns < 1 || columns > MatMulPQ2_0GemvF32Kernel.MaxColumns) throw new ArgumentOutOfRangeException(nameof(columns));
+        if (columns < 1 || columns > MatMulPQ2_0GemvF32Kernel.WideMaxColumns) throw new ArgumentOutOfRangeException(nameof(columns));
 
         string path = Path.Combine(spvDir, spvFileName);
         if (!File.Exists(path))

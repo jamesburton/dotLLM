@@ -721,15 +721,15 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         kernels.MatMulF32Multi = MatMulF32GemvMultiKernel.TryCreate(device, spvDir);
         kernels.MatMulF16Multi = MatMulF16GemvMultiKernel.TryCreate(device, spvDir);
         kernels.MatMulQ8Multi = MatMulQ8_0GemvMultiKernel.TryCreate(device, spvDir, Q8RowsPerWorkgroup,
-            RowsFromEnv("DOTLLM_VK_Q8_ROWS_MULTI", 4));
+            RowsFromEnv("DOTLLM_VK_Q8_ROWS_MULTI", 4), RowsFromEnv("DOTLLM_VK_Q8_ROWS_WIDE", 4));
         // #1220 (supersedes #1193's Q4_K_R4): NR rows per workgroup share the activation loads; deterministic, and also the qwen35 decode GEMV.
         kernels.MatMulQ4KMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q4_K, Q4KRowsPerWorkgroup,
-            RowsFromEnv("DOTLLM_VK_Q4K_ROWS_MULTI", 4));
+            RowsFromEnv("DOTLLM_VK_Q4K_ROWS_MULTI", 4), RowsFromEnv("DOTLLM_VK_Q4K_ROWS_WIDE", 4));
         kernels.MatMulQ5KMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q5_K);
         kernels.MatMulQ6KMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K);
         if (Environment.GetEnvironmentVariable("DOTLLM_VK_Q6K_ROWS_DECODE") != "0")
             kernels.MatMulQ6KRows = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K_Rows,
-                RowsFromEnv("DOTLLM_VK_Q6K_ROWS", 2), RowsFromEnv("DOTLLM_VK_Q6K_ROWS_MULTI", 4));
+                RowsFromEnv("DOTLLM_VK_Q6K_ROWS", 2), RowsFromEnv("DOTLLM_VK_Q6K_ROWS_MULTI", 4), RowsFromEnv("DOTLLM_VK_Q6K_ROWS_WIDE", 4));
         kernels.MatMulQ6KMultiR2 = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K_R2);
         kernels.MatMulIq4XsMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.IQ4_XS);
         kernels.MatMulIq3SMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.IQ3_S);

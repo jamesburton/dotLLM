@@ -1285,6 +1285,66 @@ changes the table's go/no-go: a 36 ms swing in verify is smaller than the cliff.
 Bonsai-2: fix the 9-row cliff (#1365) first, it also lets DFlash K>=8 work; (2) Bolt's 12..16-row `moe_dense` kernel choice (#1366) is a
 cheap cell-level win independent of trees; (3) a tree verify needs `ForwardWithRecurrentSnapshots` above 16 rows (cap `GemvColumns.MaxColumns`).
 
+#### Verify-cliff fix: 9..16-column GEMVs (issue #1365)
+
+Profile first (`DOTLLM_VULKAN_HYBRID_PROFILE=1`, 9 rows, Qwen3.8 Q4_K_M, per-category GPU timestamps): proj_ffn 501 ms vs 95 at 8 rows, proj_gdn 156 vs 36,
+lm_head 75 vs 8, proj_attn 57 vs 11; everything else (gdn scan, attention, norms) is flat at 2-3 ms. So the cliff is the projections, all of them:
+the GEMV caps at 8 columns and the next path is the 128x128 coopmat GEMM. The weight mix of that file is Q4_K (FFN), Q8_0 (GDN / attn q,k,v and the
+48-row ssm_alpha/beta) and Q6_K (attn_output, lm_head), so Q4_K alone (the issue's title) is a third of it; Bonsai-2 is PQ2_0 everywhere plus BF16
+ssm_alpha/beta. Fix, no new storage and no expansion (the weights are read as blocks in the tile load, as before):
+
+- `matmul_q4_k_gemv_f32_multi`, `matmul_q6_k_gemv_f32_rows`, `matmul_q8_0_gemv_multi` are already specialisation-constant in NC and NR, so the 9..16-column
+  pipelines are the same SPIR-V with `NC = 9..16, NR = 4` (`MatMulQuantGemvMultiKernel.WideMaxColumns`, `MatMulQ8_0GemvMultiKernel.WideMaxColumns`;
+  `DOTLLM_VK_{Q4K,Q6K,Q8}_ROWS_WIDE` override NR, 1..4 because the shaders store one output per lane and have 64 lanes). A row's bits do not depend on NR
+  or NC, so **every column of a 9..16-row verify is bit-identical to the one-column decode dispatch**, as it is for 2..8.
+- PQ2_0: eight new `matmul_pq2_0_f32_gemv_mr_r4_c{9..16}_b1_w64` variants of the #474 multi-row family (`PQ2_0SmallNDispatch` default max `n` 8 -> 16).
+- BF16: `matmul_bf16_gemv_multi_f32` `MAX_N` 8 -> 16 (same code; the 2 and 4/8-row Bonsai-2 verify did not move, 4 x 5 interleaved timings each way).
+- Only the dense qwen35 host takes the wide path (`VulkanQwen3HybridDenseTransformerModel.SmallRow.cs`); the MoE host and `VulkanTransformerModel` keep their 8 cap
+  (not validated above 8 rows; follow-up). Q5_K, Q6_K (non-Rows), IQ4_XS, IQ3_S multi kernels stay at 8 (`MaxColumnsFor`).
+- Escape hatch / A/B: `DOTLLM_VK_SMALLROW_WIDE=0` plus `DOTLLM_VK_PQ2_0_MULTICOL_MAX_N=8` restores the old dispatch.
+
+NR matters a lot here (every activation vec4 load is shared by NR weight rows; at 16 columns the loads, not the weight bytes, are the cost). Whole verify forward,
+ms, 9 / 12 / 16 rows: Qwen3.8 Q4_K_M NR 1 = 276 / - / 410, NR 2 = 210 / 303 / 404, NR 4 = 158 / - / 250 (12 rows not taken for NR 1 and 4); Bonsai-2 PQ2_0 rows per workgroup 1 = 172 / 240 / 341,
+2 = 123 / 159 / 210, 4 = 103 / 127 / 163 (one 3-sample pass each, `VerifyRowCurve`; NR 4 x 16 columns is also all a 64-lane workgroup can store).
+
+Result, `ForwardWithRecurrentSnapshots` ms, `VerifyRowCurve ... ab` (old = caps at 8, new = up to 16, **in the same process**, every timing taken both ways,
+order alternating, 3 reps x 5; median (min-max); Strix Halo 8060S Vulkan, ctx 64, `dev` + this change, checked-in `-O` shaders, 2026-10-28):
+
+| rows | Qwen3.8 old | Qwen3.8 new | Bonsai-2 old | Bonsai-2 new |
+|---|---|---|---|---|
+| 2 | 102.3 | 102.4 | 49.8 | 49.8 |
+| 8 | 135.0 | 135.1 | 98.4 | 98.4 |
+| 9 | 317.8 (312-338) | **145.9** (141-150) | 319.6 (305-334) | **107.0** (102-112) |
+| 10 | 320.7 | 156.9 | 314.5 | 113.8 |
+| 12 | 320.3 | 180.7 (176-186) | 318.9 | 131.8 |
+| 14 | 322.9 | 210.1 | 322.6 | 151.3 |
+| 16 | 329.5 (320-355) | **240.3** (233-256) | 325.5 (322-346) | **167.2** (165-189) |
+
+The "old" column is the GEMM path and moves between invocations (462 ms at 9 rows in an earlier invocation the same hour, 578 in the issue's run, whose build
+recompiled shaders without `-O`); the new column and the 1..8 rows reproduced within a few percent. Marginal cost 8 -> 16 rows is now 13.1 ms/row (Qwen3.8)
+and 8.6 (Bonsai-2) against the same-run 1..8 slope of ~5.4 and ~7.9, i.e. 16 rows cost 1.7-1.8x an 8-row verify and 2.5x / 3.9x a decode step, not the 3.4x / 7.6x of the
+old arm. Qwen3.8's remaining slope is FFN FMA/load issue (proj_ffn 164 of 244 attributed ms at 16 rows, profiling on); getting under it means an int8 dot or coopmat tile on the
+quantized blocks, not more columns per lane (not tried). 17..32 rows are unchanged (the GEMM, ~320 ms).
+
+End to end on the CLI (`--mtp-head`/embedded MTP, `DOTLLM_MTP_ADAPTIVE=0`, code prompt, `-n 128 -t 0`, decode tok/s, old/new/new/old order, two runs each):
+Qwen3.8 + `mtp-Qwen3.8-27B-Q8_0` head, K = 7: old 33.6 / 35.3, new 34.8 / 33.9 (no change, as expected: 8 rows); K = 11: old 20.9 / 26.5, new 35.6 / 38.4; K = 15:
+old 28.4 / 30.3, new 38.0 / 36.6. Bonsai-2 + its embedded MTP head: K = 7 24.3 / 21.1 vs 24.5 / 24.8; K = 11 9.2 / 9.2 vs 18.3 / 18.2 (in-engine verify 318 -> 134 ms);
+K = 15 8.3 / 8.6 vs 13.9 / 13.8 (verify 331-343 -> 178 ms). Greedy text is identical old vs new at K = 7, 11, 15 on both models. Acceptance on this prompt is low
+(3.06 tokens/round for Bonsai-2 at any K), so K >= 8 is not faster than K = 7 *here*; the fix removes the penalty, it does not make long chains pay on a low-acceptance prompt.
+**DFlash K = 8 / 11 / 15 is not reachable with the shipped drafters**: `DOTLLM_DFLASH_DRAFT` only caps the block's `BlockSize - 1 = 7` drafts, so the DFlash
+numbers above stay at 8 rows; the cliff bites MTP K >= 8, prompt-lookup `--lookup-draft` >= 8 and any tree verify of 9..16 nodes.
+
+Updated tree arithmetic (same formula, same-run V): Qwen3.8 N = 16 `g*` = (31.1 + 240.3) / (31.1 + 135.1) - 1 = +63%; Bonsai-2 (32.3 + 167.2) / (32.3 + 98.4) - 1 = +53%.
+That is worse than the "+32% / +51% if the cliff were removed and the 1..8 slope held" extrapolation above, because the 9..16 slope is steeper than the 1..8 one. The tree
+gate does not open; what #1365 changes is that 9..16-row verifies no longer cost 3-5x.
+
+Parity: `VulkanDenseGemvRowsTests.{Q4KWide,Q8Wide,Q6KWide}_*` (every column bit-identical to the one-column dispatch and within 1e-3 + 1e-4 rel of an f64 dot
+over the dequantised weights; ragged M, K of 3 blocks, M below NR), `VulkanMatMulPQ2_0GemvF32KernelTests.{RecordColumns,MultiRowVariants}_*` extended to 16 columns
+(vs the looped #470 kernel at 1e-5 and the scalar reference, sentinel past the live columns), `VulkanMatMulBf16GemvMultiF32KernelTests` at 9/12/13/16.
+CUDA has the same 8-column caps (`Pq2_0GemvMultiMaxColumns`, `CudaQ8_0RbGemv.MaxColumns`, `CudaSmallSGemvDispatch.MaxColumns`); not measured here (#1375). The shared
+`PQ2_0SmallNDispatch` cap is now 16 for the MoE host and `VulkanTransformerModel` too (their 9..16-row PQ2_0 prefill / verify is unmeasured; #1374). Remaining: 17..32 rows (#1376),
+Q5_K / Q6_K / IQ4_XS / IQ3_S wide kernels (#1377), the DFlash K >= 8 premise above (#1378).
+
 ### `qwen35moe` MTP head (issue #1188)
 
 Qwen3.6-35B-A3B ships its MTP block embedded (`blk.40`, `nextn_predict_layers = 1`; `ggml-org/Qwen3.6-35B-A3B-MTP-GGUF`,
