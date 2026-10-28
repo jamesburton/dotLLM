@@ -154,20 +154,6 @@ public class VulkanDenseGemvRowsTests
             (cmd, bw, bx, by, nn) => rows.Record(cmd, bw, bx, by, m, k, nn));
     }
 
-    /// <summary>The 8-column formats refuse 9..16 rows instead of reading a pipeline that does not exist.</summary>
-    [SkippableFact]
-    public void FormatsWithoutWidePipelinesStopAtEight()
-    {
-        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
-        using var device = VulkanDevice.Create();
-        Skip.IfNot(device.HasSubgroupArithmetic, "No subgroup arithmetic.");
-        using var q5 = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q5_K);
-        Skip.If(q5 is null, "Q5_K multi unavailable");
-        Assert.Equal(8, q5!.MaxColumnsSupported);
-        Assert.True(q5.AcceptsColumns(8, 256));
-        Assert.False(q5.AcceptsColumns(9, 256));
-    }
-
     internal static void AssertColumnsMatchOneColumnDispatch(VulkanDevice device, byte[] wq, float[] x, int m, int k, int n, QuantizationType qt,
                                                              Action<nint, VulkanDevice.Buffer, VulkanDevice.Buffer, VulkanDevice.Buffer, int> record,
                                                              float scale = 1f)

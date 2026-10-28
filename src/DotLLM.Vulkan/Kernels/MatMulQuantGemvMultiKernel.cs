@@ -40,8 +40,8 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
     public const int MaxColumns = 8;
 
     /// <summary>
-    /// Largest column count any instance serves (#1365). Only the NR-parameterised deterministic shaders (<see cref="QuantGemvMultiFormat.Q4_K"/>,
-    /// <see cref="QuantGemvMultiFormat.Q6_K_Rows"/>) go above <see cref="MaxColumns"/>; see <see cref="MaxColumnsFor"/>.
+    /// Largest column count any instance serves (#1365, #1377). Every shader goes to 16 columns (the NR-parameterised Q4_K / Q6_K_Rows since #1365;
+    /// Q5_K, non-Rows Q6_K, IQ4_XS and IQ3_S since #1377) except <see cref="QuantGemvMultiFormat.Q6_K_R2"/>; see <see cref="MaxColumnsFor"/>.
     /// </summary>
     public const int WideMaxColumns = 16;
 

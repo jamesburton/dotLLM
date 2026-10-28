@@ -110,5 +110,82 @@ public class VulkanQuantGemvMultiKernelTests
     [InlineData(QuantGemvMultiFormat.IQ4_XS, 48, 2560, 7)]
     [InlineData(QuantGemvMultiFormat.IQ3_S, 64, 1024, 2)]
     [InlineData(QuantGemvMultiFormat.IQ3_S, 40, 2560, 6)]
+    // #1377: 9..16 columns. Odd M, a single super-block, partial windows, the widest pipeline, every column a distinct activation row.
+    [InlineData(QuantGemvMultiFormat.Q5_K, 37, 2560, 9)]
+    [InlineData(QuantGemvMultiFormat.Q5_K, 65, 1024, 16)]
+    [InlineData(QuantGemvMultiFormat.Q5_K, 17, 256, 13)]
+    [InlineData(QuantGemvMultiFormat.Q6_K, 37, 2560, 12)]
+    [InlineData(QuantGemvMultiFormat.Q6_K, 65, 1024, 16)]
+    [InlineData(QuantGemvMultiFormat.Q6_K, 17, 256, 9)]
+    [InlineData(QuantGemvMultiFormat.IQ4_XS, 37, 2560, 10)]
+    [InlineData(QuantGemvMultiFormat.IQ4_XS, 65, 1024, 16)]
+    [InlineData(QuantGemvMultiFormat.IQ4_XS, 17, 256, 15)]
+    [InlineData(QuantGemvMultiFormat.IQ3_S, 37, 2560, 11)]
+    [InlineData(QuantGemvMultiFormat.IQ3_S, 65, 1024, 16)]
+    [InlineData(QuantGemvMultiFormat.IQ3_S, 17, 256, 14)]
     public void Multi_EachColumnMatchesSingleRowGemv(QuantGemvMultiFormat format, int m, int k, int n) => RunParity(format, m, k, n);
+
+    /// <summary>
+    /// #1377: a wide (9..16) dispatch and the 8-column dispatch produce the SAME BITS for the columns they share, so a 9..16-row verify
+    /// does not change the tokens a 2..8-row one would have produced. Also pins the per-format column cap (the R2 Q6_K stays at 8).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(QuantGemvMultiFormat.Q5_K, 37, 2560, 13)]
+    [InlineData(QuantGemvMultiFormat.Q6_K, 37, 2560, 16)]
+    [InlineData(QuantGemvMultiFormat.IQ4_XS, 37, 2560, 11)]
+    [InlineData(QuantGemvMultiFormat.IQ3_S, 37, 2560, 16)]
+    public void Wide_SharedColumnsBitIdenticalToEightColumnDispatch(QuantGemvMultiFormat format, int m, int k, int n)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        var rng = new Random(0x1377 + m * 7 + k * 11 + n + (int)format);
+        (int blockBytes, int[] halves) = format switch
+        {
+            QuantGemvMultiFormat.Q5_K => (176, new[] { 0, 2 }),
+            QuantGemvMultiFormat.Q6_K => (210, new[] { 208 }),
+            QuantGemvMultiFormat.IQ4_XS => (136, new[] { 0 }),
+            _ => (110, new[] { 0 }),
+        };
+        byte[] wq = RandomBlocks(rng, m, k, blockBytes, halves);
+        float[] x = F16Bf16Fixture.RandomFloats(rng, n * k, 1.0f);
+        using var device = VulkanDevice.Create();
+        using var multi = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, format);
+        Skip.If(multi is null, $"{format} multi shader unavailable on this device.");
+        Assert.Equal(16, multi!.MaxColumnsSupported);
+        Assert.True(multi.AcceptsColumns(16, 256));
+        Assert.False(multi.AcceptsColumns(17, 256));
+        VulkanDevice.Buffer? codebook = null;
+        using var gridOwner = format == QuantGemvMultiFormat.IQ3_S ? MatMulIq3SGemvF32Kernel.Create(device, spvDir) : null;
+        codebook = gridOwner?.GridBuffer;
+        using var bw = device.Allocate(((long)wq.Length + 3) & ~3L);
+        using var bx = device.Allocate((long)n * k * 4);
+        using var byWide = device.Allocate((long)n * m * 4);
+        using var by8 = device.Allocate(8L * m * 4);
+        device.Upload(new ReadOnlySpan<byte>(wq), bw);
+        device.Upload(x, bx);
+        using (var ctx = device.CreateSubmitContext())
+        {
+            ctx.Begin();
+            multi.Record(ctx.CommandBuffer, bw, bx, byWide, m, k, n, codebook);
+            KernelSupport.ComputeToComputeBarrier(ctx.CommandBuffer);
+            multi.Record(ctx.CommandBuffer, bw, bx, by8, m, k, 8, codebook);
+            ctx.SubmitAndWait();
+        }
+        float[] wide = new float[n * m], eight = new float[8 * m];
+        device.Download(byWide, wide);
+        device.Download(by8, eight);
+        Assert.Contains(eight, v => v != 0f);
+        Assert.Equal(eight, wide.AsSpan(0, 8 * m).ToArray());
+    }
+
+    /// <summary>The Q6_K two-rows-per-workgroup variant has no wide pipelines: it stops at eight and the dispatcher must not hand it more.</summary>
+    [SkippableFact]
+    public void Q6KR2_StopsAtEightColumns()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        using var r2 = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K_R2);
+        Skip.If(r2 is null, "Q6_K_R2 unavailable");
+        Assert.Equal(8, r2!.MaxColumnsSupported);
+        Assert.False(r2.AcceptsColumns(9, 256));
+    }
 }
