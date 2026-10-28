@@ -291,12 +291,12 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
                             pipeline.PrepareDistribution(rowLogits, generatedIds);
                             if (row == k)
                             {
-                                emitted = pipeline.SamplePrepared(rowLogits);   // every draft held: the bonus token
+                                emitted = pipeline.SamplePrepared(rowLogits, generatedIds.Count);   // every draft held: the bonus token
                                 draftHeld = false;
                             }
                             else
                             {
-                                draftHeld = pipeline.TryAcceptDraft(rowLogits, draftTokens[row], out emitted);
+                                draftHeld = pipeline.TryAcceptDraft(rowLogits, draftTokens[row], out emitted, generatedIds.Count);
                             }
                         }
 

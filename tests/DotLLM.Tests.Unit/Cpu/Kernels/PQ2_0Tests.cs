@@ -334,6 +334,59 @@ public sealed unsafe class PQ2_0Tests
         finally { NativeMemory.Free(w); }
     }
 
+    /// <summary>
+    /// #1367: the public GEMM routes 2..PQ2_0SmallNMax tokens to the W2A8 tier (4-token tiles + single-token tail). Each token's
+    /// result must be BIT-IDENTICAL to the decode GEMV on that token alone (the verify then scores a row exactly like decode would),
+    /// and within quant tolerance of the float reference. n = 2,3 (tail only), 4, 5 (tile + tail), 8, 9 (two tiles + tail).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(7, 640, 2)]
+    [InlineData(7, 640, 3)]
+    [InlineData(9, 384, 4)]
+    [InlineData(5, 640, 5)]
+    [InlineData(6, 256, 8)]
+    [InlineData(11, 512, 9)]
+    [InlineData(4, 256, 33)]   // above the small-n cut: float tier, tolerance only
+    public void GemmPQ2_0_SmallN_BitIdenticalToDecodeGemv_PerToken(int m, int k, int n)
+    {
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Ssse3.IsSupported, "W2A8 PQ2_0 requires SSSE3.");
+        var rng = new Random(1367 + m * 1000 + k * 10 + n);
+        sbyte[] ternary = new sbyte[m * k];
+        for (int i = 0; i < ternary.Length; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        int groupsPerRow = k / 128;
+        float[] groupScales = new float[m * groupsPerRow];
+        for (int i = 0; i < groupScales.Length; i++) groupScales[i] = 0.005f + rng.NextSingle() * 0.08f;
+        float[] b = new float[n * k];
+        for (int i = 0; i < b.Length; i++) b[i] = rng.NextSingle() * 2f - 1f;
+
+        byte* w = PackPQ2_0Rows(ternary, groupScales, m, k);
+        try
+        {
+            float[] c = new float[n * m];
+            float[] single = new float[m];
+            fixed (float* bp = b)
+            fixed (float* cp = c)
+            fixed (float* sp = single)
+            {
+                MatMul.GemmPQ2_0(w, bp, cp, m, k, n, null);
+                for (int t = 0; t < n; t++)
+                {
+                    MatMul.GemmPQ2_0(w, bp + (long)t * k, sp, m, k, 1, null);
+                    for (int r = 0; r < m; r++)
+                    {
+                        if (n <= MatMul.PQ2_0SmallNMax)
+                            Assert.Equal(BitConverter.SingleToInt32Bits(single[r]), BitConverter.SingleToInt32Bits(c[t * m + r]));
+                        float acc = 0f;
+                        for (int col = 0; col < k; col++)
+                            acc += ternary[r * k + col] * groupScales[r * groupsPerRow + col / 128] * b[t * k + col];
+                        AssertWithinQuantTolerance(acc, c[t * m + r]);
+                    }
+                }
+            }
+        }
+        finally { NativeMemory.Free(w); }
+    }
+
     private static void AssertWithinQuantTolerance(float expected, float actual)
     {
         // Same envelope as I2S's AssertWithinQuantTolerance: absolute floor for near-zero sums,

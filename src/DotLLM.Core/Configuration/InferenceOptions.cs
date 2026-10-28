@@ -85,6 +85,14 @@ public record InferenceOptions
     /// <summary>Random seed for reproducible sampling. Null = non-deterministic.</summary>
     public int? Seed { get; init; }
 
+    /// <summary>
+    /// Draw stochastic tokens as a position-seeded Gumbel-max, <c>argmax(prepared logits + Gumbel(seed, generation index))</c> (#1358),
+    /// instead of from a sequential RNG stream. Exact, and speculative decoding then yields the same text as plain decoding for the same
+    /// seed. Default off (it changes which tokens a given <see cref="Seed"/> produces); <c>DOTLLM_GUMBEL_SAMPLING=1</c> turns it on globally.
+    /// No property initializer: this type may be deserialized through a source-generated context.
+    /// </summary>
+    public bool GumbelSampling { get; init; }
+
     /// <summary>Stop sequences that terminate generation.</summary>
     public IReadOnlyList<string> StopSequences { get; init; } = [];
 

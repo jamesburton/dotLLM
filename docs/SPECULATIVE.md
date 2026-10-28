@@ -1039,7 +1039,7 @@ uses the MTP decoder's exact accept/residual rule unchanged.
 (42 MB for Qwen3.8-27B-DFlash2). Taps: `rows × 5 × 5120 × 2 B` F16 per verify (400 KB at B = 8), capped at the ring for a
 long prefill and released after it.
 
-**Knobs.** `DOTLLM_DFLASH_DRAFT=n` caps drafts per round (default B-1 = 7); `DOTLLM_DFLASH_TRACE=1` prints draft / inject wall
+**Knobs.** `DOTLLM_DFLASH_DRAFT=n` caps drafts per round (default B-1 = 7; it can only lower it, so a DFlash verify is never more than 8 rows); `DOTLLM_DFLASH_TRACE=1` prints draft / inject wall
 time per request (and, on Vulkan, the drafter's submit count and wait). Vulkan small-row GEMVs: `DOTLLM_VK_Q4K_ROWS` / `DOTLLM_VK_Q4K_ROWS_MULTI` (1..4 output
 rows per workgroup for decode / verify, default 2 / 4, #1220; this replaced #1193's `DOTLLM_VK_Q4K_MULTI_ROWS` / `_R4` kernel) and `DOTLLM_VK_SMALLROW_Q6K_R2_MIN_ROWS` (default 3).
 
@@ -1111,7 +1111,7 @@ Strix (Vulkan):
 
 These runs used Bolt 24GB with the real LiLiCorr drafter on Strix Halo 8060S. Each figure is the median of 3 interleaved reps:
 128 greedy tokens, `DOTLLM_MTP_ADAPTIVE=0`, K = 7 drafts (`--spec-draft-n-max 7` for llama.cpp master 0ae0e1976 Vulkan).
-p0 is prose ("The history of the printing press began in"); p1 is code (Python quicksort).
+p0 is the high-acceptance prompt and p1 the low-acceptance one. Reproduced in #1368: the prose prompt "The history of the printing press began in" gives 3.25-3.75 tokens/round and 21-22 tok/s on every build from #1237 to dev (so it is p1), and a code prompt ("def quicksort(arr):") gives 7.9 tokens/round and ~41 tok/s (p0). The p0/p1 labels in these tables originally said the opposite; the numbers are right.
 
 | Strix 8060S, Bolt 24GB | p0 tok/s | p1 tok/s | tokens/round | peak private / GPU-shared MiB |
 |---|---|---|---|---|
@@ -1147,7 +1147,7 @@ is bit-identical to the one-column decode dispatch. Rows per workgroup for verif
 (`DOTLLM_VK_NEMOTRON_GEMV_ROWS=decode,verify` overrides; `DOTLLM_VK_NEMOTRON_EXACT_GEMV=0` restores #1237's per-column GEMVs). The
 opt-in NVFP4 MMVQ keeps NVFP4 decode, as before. No new buffers.
 
-Strix 8060S, Bolt 24GB + LiLiCorr, K = 7, 128 greedy tokens, medians of 3 interleaved reps (p0 prose, p1 code):
+Strix 8060S, Bolt 24GB + LiLiCorr, K = 7, 128 greedy tokens, medians of 3 interleaved reps (p0 code, p1 prose; labels corrected in #1368):
 
 | `DOTLLM_VK_NEMOTRON_PROFILE`, ms over all layers | 8-row verify before | after | 3-row verify before | after | decode before | after |
 |---|---|---|---|---|---|---|
@@ -1167,10 +1167,15 @@ Strix 8060S, Bolt 24GB + LiLiCorr, K = 7, 128 greedy tokens, medians of 3 interl
 | llama.cpp `draft-dflash` + LiLiCorr | 60.22 | 29.38 | | 24,970 / 24,068 |
 
 Every dotLLM run (plain and speculative, before and after, both verify modes) produced the same text. Speculation now beats plain
-on prose (1.44x) but not on code (3.3-3.75 tokens/round). The round is now half draft: about 45 ms of each draft is the host-side
+on code (1.44x) but not on prose (3.3-3.75 tokens/round). The round is now half draft: about 45 ms of each draft is the host-side
 LiLiCorr head (`select` in `DOTLLM_DFLASH_TRACE`). The verify (81 ms) is 2.5x a 32.6 ms decode step; the rest of it is the indexed
 routed experts, which barely share expert reads across 8 tokens (top-k routing over 240 experts). The read-only verify beats the
 pre-verify copy by ~2 ms per round and 180 MiB.
+
+**IQ2_XXS 14..16-column cliff (#1366).** With 2 rows per workgroup `matmul_iq2_xxs_gemv_multi` was 2.5x slower at 14..16 columns than at 13
+(Bolt `moe_dense`, ms over 88 layers: 19.7 at 13, 46-58 at 14..16, slower than the 32-row GEMM path's 37). 4 rows per workgroup from 14 columns
+(`MatMulExactGemvMultiKernel.Iq2WideColumns`) gives 26.0 / 28.2 / 30.4 at 14 / 15 / 16, bit-identical (a row's bits do not depend on NR).
+Verify medians (ms, 3 reps each, same session): 14 rows 141 -> 117, 16 rows 151-153 -> 129. NR=1 and NR=2 both cliff; 4 is the largest NR with NR x columns <= 64.
 
 **Next (follow-ups):**
 
@@ -1222,7 +1227,7 @@ Intermediate rows (Qwen3.8 / Bonsai-2 / Bolt, ms): 3 = 113.9 / 63.2 / 52.0, 6 = 
 
 Reading: Qwen3.8 and Bonsai-2 have a **cliff between 8 and 9 rows** (4x and 7x of the 8-row cost; the multi-column GEMVs cap at 8 columns and the
 next path is a fixed ~340-570 ms GEMM, issue #1365), so 16/32-row trees cannot be priced from the 1..8 slope. Bolt has no cliff but steepens past 12
-rows (issue #1366). On CPU the cliff is between 1 and 2 rows (issue #1367).
+rows (issue #1366). On CPU the cliff is between 1 and 2 rows (issue #1367). **Fixed in #1367** (CPU only): the 2..8-row GEMM took the scalar float PQ2_0 tier (per-element unpack + f32 dot) and the GDN scan was single-threaded scalar. Now small-n PQ2_0 takes the W2A8 tier in 4-token tiles (bit-identical per token to the decode GEMV) and the scan is head-parallel + Vector256 (bit-identical to the scalar walk). CPU Bonsai-2 PQ2_0, same harness, ms (min-max of 9 timings): 1 row 164-387 (noisy; was 234-276), 2 rows 295-363 (was 1271-2282), 4 rows 305-372 (1527-1659), 8 rows 493-639 (2085-2172), 16 rows 946-1196 (3355-4707), 32 rows 1822-1997 (6398-6858). Marginal row cost 8->16 is now ~55 ms (about 25% of a decode step) against 164 before.
 
 **Break-even tau gain.** A tree of the same depth as a K=7 chain pays the same draft but verifies N rows instead of 8. Break-even needs
 `g* = (draft + V(N)) / (draft + V(8)) - 1` more tokens per round than the chain. Draft = measured in-engine draft ms of the same run (below;
@@ -1282,7 +1287,7 @@ reproduced; not trusted). The Bolt row is also at 3.28 tokens/round where the ta
 changes the table's go/no-go: a 36 ms swing in verify is smaller than the cliff.
 
 **Takeaways for stage 2 (not started, gate not passed):** (1) the verify-row curve, not draft quality, still caps speculation on Qwen3.8 and
-Bonsai-2: fix the 9-row cliff (#1365) first, it also lets DFlash K>=8 work; (2) Bolt's 12..16-row `moe_dense` kernel choice (#1366) is a
+Bonsai-2: fix the 9-row cliff (#1365) first (it unblocks MTP K>=8, `--lookup-draft` >= 8 and tree verifies of 9..16 nodes; it does NOT enable DFlash K>=8, which the shipped drafters cannot produce, see #1378); (2) Bolt's 12..16-row `moe_dense` kernel choice (#1366) is a
 cheap cell-level win independent of trees; (3) a tree verify needs `ForwardWithRecurrentSnapshots` above 16 rows (cap `GemvColumns.MaxColumns`).
 
 #### Verify-cliff fix: 9..16-column GEMVs (issue #1365)
@@ -1342,7 +1347,7 @@ Parity: `VulkanDenseGemvRowsTests.{Q4KWide,Q8Wide,Q6KWide}_*` (every column bit-
 over the dequantised weights; ragged M, K of 3 blocks, M below NR), `VulkanMatMulPQ2_0GemvF32KernelTests.{RecordColumns,MultiRowVariants}_*` extended to 16 columns
 (vs the looped #470 kernel at 1e-5 and the scalar reference, sentinel past the live columns), `VulkanMatMulBf16GemvMultiF32KernelTests` at 9/12/13/16.
 CUDA has the same 8-column caps (`Pq2_0GemvMultiMaxColumns`, `CudaQ8_0RbGemv.MaxColumns`, `CudaSmallSGemvDispatch.MaxColumns`); not measured here (#1375). The shared
-`PQ2_0SmallNDispatch` cap stays 8 on the MoE host and `VulkanTransformerModel` (their 9..16-row PQ2_0 path is unmeasured, #1374 below). Remaining: 17..32 rows (#1376), the DFlash K >= 8 premise above (#1378).
+`PQ2_0SmallNDispatch` cap stays 8 on the MoE host and `VulkanTransformerModel` (their 9..16-row PQ2_0 path is unmeasured, #1374 below). Remaining: 17..32 rows (#1376), Q5_K / Q6_K / IQ4_XS / IQ3_S wide kernels (#1377), (the DFlash K >= 8 premise in the stage-1 takeaways was wrong and is corrected above, #1378).
 
 #### Verify-cliff on the MoE host and `VulkanTransformerModel` (issue #1374)
 
@@ -1418,3 +1423,7 @@ expert -> `nextn.shared_head_norm` -> the trunk's LM head. Absorb computes K/V o
   Round anatomy (K=3, with snapshots): draft 7.5 ms, verify 38 ms (4 rows; 20 ms for 1), a fully accepted round ~47 ms for 4 tokens. Greedy
   output equalled plain decode on 2 of 12 runs (llama.cpp: 1 of 4 at K=3): the multi-row routed-MoE / Q8_1 kernels are not bit-identical to the
   fused single-token decode chain, so near-ties resolve differently. Making the verify exact and cheaper is the follow-up.
+
+## Gumbel-coupled sampled verification (#1358, CPU reference)
+
+Opt-in (`InferenceOptions.GumbelSampling` or `DOTLLM_GUMBEL_SAMPLING=1`; default off because it changes which tokens a seed yields). A stochastic token is drawn as `argmax_i(prepared_logit_i + G(seed, n, i))`, n = generation index (`generatedIds.Count`), G = Philox4x32-10 noise from a 24-bit uniform (`GumbelNoise`; a 32-bit conversion rounds to u = 1 and gives +inf noise). `prepared` is the output of `SamplerPipeline.PrepareDistribution` (penalties, temperature, top-k/p, min-p, constraint mask), so excluded tokens never win and the draw is exactly softmax(prepared). A verify row accepts draft d iff d equals the row own sample: P(accept) = p(d), same as rejection sampling for point-mass drafts, and the emitted token is the one plain decoding draws for that seed, so speculative text equals plain text (tests: GumbelSpeculativeSamplingTests). T = 0 unchanged. The device-side (Vulkan) sampler that removes the per-row logits readback is not built yet.
