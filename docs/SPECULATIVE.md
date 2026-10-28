@@ -1172,6 +1172,11 @@ LiLiCorr head (`select` in `DOTLLM_DFLASH_TRACE`). The verify (81 ms) is 2.5x a 
 routed experts, which barely share expert reads across 8 tokens (top-k routing over 240 experts). The read-only verify beats the
 pre-verify copy by ~2 ms per round and 180 MiB.
 
+**IQ2_XXS 14..16-column cliff (#1366).** With 2 rows per workgroup `matmul_iq2_xxs_gemv_multi` was 2.5x slower at 14..16 columns than at 13
+(Bolt `moe_dense`, ms over 88 layers: 19.7 at 13, 46-58 at 14..16, slower than the 32-row GEMM path's 37). 4 rows per workgroup from 14 columns
+(`MatMulExactGemvMultiKernel.Iq2WideColumns`) gives 26.0 / 28.2 / 30.4 at 14 / 15 / 16, bit-identical (a row's bits do not depend on NR).
+Verify medians (ms, 3 reps each, same session): 14 rows 141 -> 117, 16 rows 151-153 -> 129. NR=1 and NR=2 both cliff; 4 is the largest NR with NR x columns <= 64.
+
 **Next (follow-ups):**
 
 1. The LiLiCorr head and the top-k/softmax on the GPU (no 3.6 MB logits readback); now the largest cost per round.
