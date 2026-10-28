@@ -1039,7 +1039,7 @@ uses the MTP decoder's exact accept/residual rule unchanged.
 (42 MB for Qwen3.8-27B-DFlash2). Taps: `rows × 5 × 5120 × 2 B` F16 per verify (400 KB at B = 8), capped at the ring for a
 long prefill and released after it.
 
-**Knobs.** `DOTLLM_DFLASH_DRAFT=n` caps drafts per round (default B-1 = 7); `DOTLLM_DFLASH_TRACE=1` prints draft / inject wall
+**Knobs.** `DOTLLM_DFLASH_DRAFT=n` caps drafts per round (default B-1 = 7; it can only lower it, so a DFlash verify is never more than 8 rows); `DOTLLM_DFLASH_TRACE=1` prints draft / inject wall
 time per request (and, on Vulkan, the drafter's submit count and wait). Vulkan small-row GEMVs: `DOTLLM_VK_Q4K_ROWS` / `DOTLLM_VK_Q4K_ROWS_MULTI` (1..4 output
 rows per workgroup for decode / verify, default 2 / 4, #1220; this replaced #1193's `DOTLLM_VK_Q4K_MULTI_ROWS` / `_R4` kernel) and `DOTLLM_VK_SMALLROW_Q6K_R2_MIN_ROWS` (default 3).
 
@@ -1282,7 +1282,7 @@ reproduced; not trusted). The Bolt row is also at 3.28 tokens/round where the ta
 changes the table's go/no-go: a 36 ms swing in verify is smaller than the cliff.
 
 **Takeaways for stage 2 (not started, gate not passed):** (1) the verify-row curve, not draft quality, still caps speculation on Qwen3.8 and
-Bonsai-2: fix the 9-row cliff (#1365) first, it also lets DFlash K>=8 work; (2) Bolt's 12..16-row `moe_dense` kernel choice (#1366) is a
+Bonsai-2: fix the 9-row cliff (#1365) first (it unblocks MTP K>=8, `--lookup-draft` >= 8 and tree verifies of 9..16 nodes; it does NOT enable DFlash K>=8, which the shipped drafters cannot produce, see #1378); (2) Bolt's 12..16-row `moe_dense` kernel choice (#1366) is a
 cheap cell-level win independent of trees; (3) a tree verify needs `ForwardWithRecurrentSnapshots` above 16 rows (cap `GemvColumns.MaxColumns`).
 
 #### Verify-cliff fix: 9..16-column GEMVs (issue #1365)
@@ -1343,7 +1343,7 @@ over the dequantised weights; ragged M, K of 3 blocks, M below NR), `VulkanMatMu
 (vs the looped #470 kernel at 1e-5 and the scalar reference, sentinel past the live columns), `VulkanMatMulBf16GemvMultiF32KernelTests` at 9/12/13/16.
 CUDA has the same 8-column caps (`Pq2_0GemvMultiMaxColumns`, `CudaQ8_0RbGemv.MaxColumns`, `CudaSmallSGemvDispatch.MaxColumns`); not measured here (#1375). The shared
 `PQ2_0SmallNDispatch` cap is now 16 for the MoE host and `VulkanTransformerModel` too (their 9..16-row PQ2_0 prefill / verify is unmeasured; #1374). Remaining: 17..32 rows (#1376),
-Q5_K / Q6_K / IQ4_XS / IQ3_S wide kernels (#1377), the DFlash K >= 8 premise above (#1378).
+Q5_K / Q6_K / IQ4_XS / IQ3_S wide kernels (#1377), (the DFlash K >= 8 premise in the stage-1 takeaways was wrong and is corrected above, #1378).
 
 ### `qwen35moe` MTP head (issue #1188)
 
