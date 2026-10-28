@@ -1939,6 +1939,19 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     private MoeGroupedMatmulIqCoopmatKernel? GroupedIqKernel(QuantizationType qt) => _kernels.MoeGroupedIq(qt);
 
     /// <summary>
+    /// #1348: the grouped IQ MoE kernels run 32 tokens per workgroup (<c>n32diet</c>) on layers where gate/up and down both have that variant, and the
+    /// 16-token kernels elsewhere. <c>DOTLLM_VK_MOE_IQ_VARIANT=off</c> (or <c>0</c>) restores the 16-token kernels; any other value names a variant suffix.
+    /// Read per layer call so one process can A/B it.
+    /// </summary>
+    private static string? MoeIqVariant()
+        => Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_IQ_VARIANT") switch
+        {
+            null or "" => "n32diet",
+            "off" or "0" => null,
+            var v => v,
+        };
+
+    /// <summary>
     /// True when the layer's three banks all have a grouped coopmat kernel that agree on one tile list (#823 extends #849/#821 to IQ banks).
     /// IQ and legacy-quant kernels are 16-row only, so any layer containing one needs 16-row kernels everywhere; a K-quant down kernel that
     /// came out as the 32-row row-pair form cannot share the list with an IQ gate/up, and such a layer simply stays on MMVQ.
@@ -2028,6 +2041,14 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         var legacyDown = GroupedLegacyDownKernel(moeW.W2QuantType);
         var iqDown = GroupedIqKernel(moeW.W2QuantType);          // #823
         var iqGateUp = GroupedIqKernel(moeW.W1QuantType);        // #823
+        // #1348: 32-token tiles when gate/up AND down both have a wide variant (they share one tile list); otherwise the layer stays at 16.
+        if (iqGateUp is not null && iqDown is not null && MoeIqVariant() is { } iqVar
+            && _kernels.MoeGroupedIqVariant(moeW.W1QuantType, iqVar) is { } varGu && _kernels.MoeGroupedIqVariant(moeW.W2QuantType, iqVar) is { } varDn
+            && varGu.RowTile == varDn.RowTile)
+        {
+            iqGateUp = varGu;
+            iqDown = varDn;
+        }
         var gateUpMmq = (iqGateUp is null && legacyDown is null && iqDown is null) ? GroupedGateUpMmqKernel(moeW.W1QuantType) : null;
         var downMmq = (gateUpMmq is not null) ? GroupedDownMmqKernel(moeW.W2QuantType) : null;
         bool useMmq = gateUpMmq is not null && downMmq is not null

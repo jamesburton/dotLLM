@@ -97,23 +97,49 @@ pf 8192 0 2 2               # GPU-timestamp stage profile
 perturb grouped_gate_up tile_list_build   # then pf ... 2 ; "perturb off" to clear
 ```
 
-## 6. Lever 1 follow-up: wider token tile for the grouped MoE GEMMs (#1348) - small, not a win
+## 6. Lever 1 follow-up: the grouped MoE GEMMs (#1348) - 32-token tile + LDS diet wins 4-9%
 
-Roofline, routing distribution and A/B measured 2026-10-27 (dev `310ceaee` + instruments), UD-IQ4_XS, F16 K/V, one process, GPU lock held.
+Measured 2026-10-27/28, UD-IQ4_XS, F16 K/V, one process, GPU lock held, no human GPU process before/after. All A/B below flip `DOTLLM_VK_MOE_IQ_VARIANT` in-process.
 
-**The quant mix is not what section 4 assumed.** gate/up banks are IQ3_S in 47 of 48 layers (IQ4_XS in 1); down banks are IQ4_NL in 43 layers, Q8_0 in 5. The kernels on the path are `moe_grouped_matmul_iq3_s_coopmat_m64` and `..._iq4_nl_...`. Expert banks per layer: IQ3_S 360 MB, IQ4_NL 472 MB, Q8_0 891 MB.
+**The quant mix is not what section 4 assumed.** gate/up banks are IQ3_S in 47 of 48 layers (IQ4_XS in 1); down banks are IQ4_NL in 43 layers, Q8_0 in 5. The hot kernels are `moe_grouped_matmul_iq3_s_coopmat_m64` and `..._iq4_nl_...` (Q8_0-down layers keep the 16-token kernels). Banks per layer: IQ3_S 360 MB, IQ4_NL 472 MB, Q8_0 891 MB.
 
-**Real routing (new profile-only counters, `pf ... prof=2`, wikitext, 1024-row chunk):** only **352 of 512 experts** get any row per layer-chunk. Experts by rows: 1-4: 111, 5-8: 47, 9-16: 54, 17-32: 59, 33-64: 48, 65-128: 21, 129+: 13. Tiles per layer-chunk by token-tile width: **16: 850, 32: 556, 48: 465, 64: 424, 128: 375**.
+**Real routing (profile-only counters, wikitext, 1024-row chunk):** only **352 of 512 experts** get any row per layer-chunk. Experts by rows: 1-4: 111, 5-8: 47, 9-16: 54, 17-32: 59, 33-64: 48, 65-128: 21, 129+: 13. Tiles per layer-chunk by token-tile width: **16: 850, 32: 556, 48: 465, 64: 424, 128: 375**.
 
-**Roofline per 1024-row chunk (205 GB/s, 59 TFLOPS f16 coopmat peak):** gate/up 0.57 s measured vs 0.117 s weight-read floor (active experts once) / 0.28 s with 850 tiles and no cache reuse / 3.2 TFLOP = 10% of peak; down 0.32 s vs 0.083 s / 0.20 s / 1.6 TFLOP = 8%. Neither DRAM traffic nor MMA is the limiter; the rest is per-tile weight fetch + dequant + LDS staging + barriers (4 MMAs per 64-K round per subgroup).
+**Roofline per 1024-row chunk (205 GB/s, 59 TFLOPS f16 coopmat peak):** gate/up 0.57 s measured vs 0.117 s weight-read floor (active experts once) / 0.28 s with 850 tiles and no cache reuse / 3.2 TFLOP = 10% of peak; down 0.32 s vs 0.083 s / 0.20 s / 1.6 TFLOP = 8%. Neither DRAM traffic nor MMA is the limiter alone.
 
-**Prototype** (branch `issue/1348-moe-grouped-token-tile-prototype`, not merged): generator-emitted `*_m64n32` variants for IQ3_S/IQ4_XS/IQ4_NL, 32 tokens per workgroup, two accumulators per subgroup sharing one dequantised A tile, second half skipped when the tile has <= 16 rows; `DOTLLM_VK_MOE_WIDE_TILE=1`, layer falls back to 16 unless gate/up AND down both have a wide variant. **Bit-identical** to the 16-token kernel: unit test (rows 0..128 around the 16/32 edges, legacy grid and indirect) asserts `==` and end-to-end `kl` over 2 last-row logit vectors gave meanKL 0, max|dlogit| 0, top-1 2/2.
+**rga (gfx1151, live driver; no spills anywhere):**
 
-**Measurement (`pf`, 3 reps per call, same process, env flipped in-process; tok/s medians off -> on):**
+| shader | VGPR | LDS |
+|---|---|---|
+| iq3_s m64 (production, 16 tokens) | 96 | 15,872 B |
+| iq3_s n32 (32 tokens, per-subgroup epilogue staging) | 75 | 22,016 B |
+| iq3_s m64diet (16 tokens, shared 1 KB epilogue staging) | 65 | 12,800 B |
+| iq3_s n32diet (shipped) | 73 | 14,848 B |
+| iq4_nl m64 / n32 / diet / n32diet | 93 / 58 / 62 / 56 | 15,872 / 22,016 / 12,800 / 14,848 B |
 
-Session 1 (off then on within each pair; off -> on): 1K 428 -> 495 and 480 -> 496; 4K 383 -> 412 and 374 -> 398; 8K 340 -> 368 and 331 -> 333.
-Session 2 (on then off within each pair; on -> off): 4K 376 -> 380, 343 -> 330, 345 -> 337; 8K 320 -> 327, 295 -> 311; 2K 379 -> 348, 361 -> 362.
+Occupancy probe: `bal6` = the production kernel plus 6 KB of referenced-but-dead LDS (22,016 B, the n32 footprint). It ran 3-13% slower than its neighbours in a palindromic session (mean -6.5%), so LDS occupancy matters: plain n32 spends it and gains little, the diet gives it back.
 
-Whichever variant ran second in a pair looked better in the first session (+3..+8%) and the reversed session showed 0..+4% for on, -5..-2% at 8K, with session drift of 15% (376 -> 330 tok/s at 4K over the run). Stage timestamps (prof=2, 4K, 2 reps, readback overhead included): grouped_gate_up 2841 -> 2688 ms (-5.4%), grouped_down 1583 -> 1531 ms (-3.3%), i.e. about 1.6% of wall. **Verdict: a real but marginal gain (about 1-3% of wall), inside the run-to-run drift of this box; not defensible as a win and not shipped.** The tile count falls 35% but stage time only 3-5%, so tile-proportional overhead is not the dominant cost either; the remaining time is inside the per-K-round dequant/LDS pipeline. Next candidates, untested: dequant fused into the MMA operand path with fewer LDS round trips (bigger K round than 64), or measuring VGPR/LDS occupancy of the m64 shaders with RGA before more tile-shape work.
+**Phase perturbations (timing only, wrong output; GPU-timestamp `grouped_gate_up` / `grouped_down`, 4K, palindromic, normalised for the changed tile count; base 2540 / 1394 ms per 4K prefill):**
 
-The only shipped change is the profile counters (`tilesT16..T128`, `activeExperts`, `expertsWithRows[...]`; counts, not ms, printed with the stage table).
+| removed | gate/up | down | meaning |
+|---|---|---|---|
+| end-of-round barrier (half the barriers) | +1% | +1% | **lever 2 (K=128, fewer barriers) refuted before building**; it would also add ~7 KB of LDS (-6.5% by `bal6`) |
+| weight dequantisation (A tile written as zeros, loads kept) | -15.5% | -16% | upper bound for lever 3's dequant/LDS-write part: <= ~5% of wall; a register-built A operand would also need the implementation-defined coopmat element mapping, not built |
+| global weight loads (dequant of zeros) | -33% | -26% | fetch incl. tile re-reads is ~1/3 of gate/up, already near the DRAM floor for 850 tiles |
+
+**Shipped: `n32diet`.** The generator emits 32-token variants (`..._m64n32diet`) of the IQ3_S/IQ4_XS/IQ4_NL grouped shaders: two accumulators per subgroup share one dequantised A tile, the second token half is skipped (workgroup-uniformly) when the tile has <= 16 rows, and the epilogue stages through one 1 KB tile reused by the four subgroups in turn. A layer uses it when gate/up and down both have the variant (Q8_0-down layers stay at 16); `DOTLLM_VK_MOE_IQ_VARIANT=off` restores the 16-token kernels. Tile list tileRows = 32.
+
+*Parity:* **bit-identical** to the 16-token kernel. Unit test (legacy grid + indirect, expert row counts 0..128 around the 16/32 edges, K up to 2560, vs the 16-token kernel `==` and vs the CPU dequant oracle) passes; end-to-end last-row logits over 2/4/3 vectors (512- and 1024-row chunks, 1K-3K tokens) gave meanKL 0, max|dlogit| 0, top-1 identical.
+
+*Throughput (`pf`, median of 3 reps per call, palindromic base-new-new-base blocks so linear drift cancels; new/base):*
+
+| shape | block ratios | mean |
+|---|---|---|
+| 4K | 1.037, 1.079, 1.083, 1.155 | **1.088** (+3.7..+15.5%) |
+| 8K | 1.028, 1.046 | **1.037** (+2.8..+4.6%) |
+
+An earlier 10-call palindromic session gave n32diet +2.5% (range wide), plain `n32` +1.2%, `diet` alone -1%, so the gain needs both parts. Absolute tok/s drifted 10-15% over every session on this box (thermal/power); only the paired ratios are meaningful. Session-1 numbers for plain n32 (off-first +3..8%, on-first -5..+9%) are the same effect plus drift.
+
+**Not tried / left:** the remaining ~50% of gate/up time is MMA + LDS + B staging + epilogue; the IQ3_S stage load issues ~11 single-byte 32-bit loads per thread per round (the load-issue pattern from the decode GEMV work), which could be coalesced into aligned word loads; a TN=48/64 tile (424 tiles) would need a smaller LDS budget; Q8_0-down layers (5 of 48) still use the 16-token down kernel and force those layers back to 16.
+
+Instruments: profile counters `tilesT16..T128`, `activeExperts`, `expertsWithRows[...]` (counts, not ms) in the `pf ... prof=2` stage table. Perturbation and ballast variants live on branch `issue/1348-moe-grouped-token-tile-prototype`, not in the tree.
