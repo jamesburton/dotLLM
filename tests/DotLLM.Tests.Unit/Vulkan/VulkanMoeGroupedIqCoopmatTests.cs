@@ -126,6 +126,89 @@ public sealed class VulkanMoeGroupedIqCoopmatTests
         Assert.True(worst > 0 || r0.Length == 0, "bit-identical to the F32 CPU oracle is implausible with F16 operands; the grouped kernel may not have run.");
     }
 
+    /// <summary>
+    /// Issue #1348: the 32-token-tile variants must reproduce the 16-token kernel BIT FOR BIT (each output element sees the same K-ordered MMA
+    /// chain; only the number of token columns per workgroup changed) and stay inside the CPU-dequant envelope. Expert row counts straddle the
+    /// 16/32 tile edges (15, 16, 17, 31, 32, 33, 48, 64, 100, 128) so the skipped second half, the full second half and the ragged tail are all hit.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(QuantizationType.IQ3_S, 130, 2560, "n32diet")]    // real gate/up
+    [InlineData(QuantizationType.IQ4_XS, 130, 2560, "n32diet")]
+    [InlineData(QuantizationType.IQ4_NL, 100, 640, "n32diet")]    // real down K
+    [InlineData(QuantizationType.IQ4_NL, 64, 64, "n32diet")]
+    public void GroupedVariant_MatchesNarrowBitwiseAndCpuOracle(QuantizationType qt, int m, int k, string variant)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        var iq = MoeIndexedMatmulIqMmvqKernel.FromQuantizationType(qt)!.Value;
+        Skip.IfNot(MoeGroupedMatmulIqCoopmatKernel.IsSupportedOn(device, spvDir, iq) && MoeGroupedMatmulIqCoopmatKernel.IsVariantSupportedOn(device, spvDir, iq, variant)
+                   && MoeBuildTileListKernel.IsSupportedOn(spvDir), "coopmat / native wave64 / wide SPIR-V unavailable.");
+
+        int[] counts = { 0, 3, 0, 17, 40, 16, 15, 1, 33, 64, 2, 0, 32, 31, 48, 100, 128, 5 };
+        int E = counts.Length, rows = counts.Sum();
+        uint[] offsets = new uint[E + 1];
+        int[] expertOfRow = new int[rows];
+        for (int e = 0, r = 0; e < E; e++)
+        {
+            offsets[e + 1] = offsets[e] + (uint)counts[e];
+            for (int i = 0; i < counts[e]; i++) expertOfRow[r++] = e;
+        }
+
+        var (blockBytes, group) = MoeIndexedMatmulIqMmvqKernel.Describe(iq);
+        int rowBytes = (k / group) * blockBytes;
+        var rng = new Random(0x1348 + (int)qt * 101 + m * 31 + k);
+        byte[] bank = RandomBank(rng, (long)E * m, rowBytes, blockBytes);
+        float[] x = new float[(long)rows * k];
+        for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        using var codebooks = Iq3Codebooks.Create(device);
+        using var bufW = device.Allocate((bank.Length + 3L) & ~3L);
+        using var bufX = device.Allocate((long)rows * k * sizeof(float));
+        using var bufOffN = device.Allocate(MoeBuildTileListKernel.OffsetsBufferUints(E, rows) * sizeof(uint));
+        using var bufOffW = device.Allocate(MoeBuildTileListKernel.OffsetsBufferUints(E, rows) * sizeof(uint));
+        using var bufArgsN = device.Allocate(2 * MoeBuildTileListKernel.ArgsStrideBytes);
+        using var bufArgsW = device.Allocate(2 * MoeBuildTileListKernel.ArgsStrideBytes);
+        using var yNarrow = device.Allocate((long)rows * m * sizeof(float));
+        using var yWide = device.Allocate((long)rows * m * sizeof(float));
+        using var yWideLegacy = device.Allocate((long)rows * m * sizeof(float));
+        device.Upload(bank, bufW);
+        device.Upload(x, bufX);
+        device.Upload(MemoryMarshal.AsBytes<uint>(offsets), bufOffN);
+        device.Upload(MemoryMarshal.AsBytes<uint>(offsets), bufOffW);
+
+        using var narrow = MoeGroupedMatmulIqCoopmatKernel.Create(device, spvDir, iq, codebooks);
+        using var wide = MoeGroupedMatmulIqCoopmatKernel.Create(device, spvDir, iq, codebooks, variant: variant);
+        Assert.Equal(16, narrow.RowTile);
+        Assert.Equal(variant.StartsWith("n32", StringComparison.Ordinal) ? 32 : 16, wide.RowTile);
+        using var build = MoeBuildTileListKernel.Create(device, spvDir);
+        wide.Launch(bufW, bufX, bufOffW, yWideLegacy, m, k, rows, E, maxRowsPerExpert: counts.Max());
+        using (var ctx = device.CreateSubmitContext())
+        {
+            ctx.Begin();
+            build.Record(ctx.CommandBuffer, bufOffN, bufArgsN, E, narrow.MTiles(m), narrow.MTiles(m), narrow.RowTile);
+            build.Record(ctx.CommandBuffer, bufOffW, bufArgsW, E, wide.MTiles(m), wide.MTiles(m), wide.RowTile);
+            KernelSupport.ComputeToIndirectAndComputeBarrier(ctx.CommandBuffer);
+            narrow.RecordIndirect(ctx.CommandBuffer, bufW, bufX, bufOffN, yNarrow, bufArgsN, 0, m, k, rows, E);
+            wide.RecordIndirect(ctx.CommandBuffer, bufW, bufX, bufOffW, yWide, bufArgsW, 0, m, k, rows, E);
+            ctx.SubmitAndWait();
+        }
+
+        float[] a = new float[(long)rows * m], b = new float[(long)rows * m], c = new float[(long)rows * m];
+        device.Download(yNarrow, a);
+        device.Download(yWide, b);
+        device.Download(yWideLegacy, c);
+        float[] r0 = CpuOracle(bank, qt, expertOfRow, x, m, k, rows, rowBytes);
+        float maxAbs = r0.Max(MathF.Abs);
+        Assert.True(maxAbs > 1e-3f, "reference output is degenerate (all ~0).");
+        float tol = 6e-3f * maxAbs;
+        for (int i = 0; i < r0.Length; i++)
+        {
+            Assert.True(a[i] == b[i], $"{qt} idx {i} (row {i / m}, col {i % m}): narrow {a[i]:G9} != wide-indirect {b[i]:G9}");
+            Assert.True(b[i] == c[i], $"{qt} idx {i} (row {i / m}, col {i % m}): wide-indirect {b[i]:G9} != wide-legacy-grid {c[i]:G9}");
+            Assert.True(MathF.Abs(b[i] - r0[i]) <= tol, $"{qt} idx {i}: wide {b[i]:G9} vs cpu {r0[i]:G9} (tol {tol:G4})");
+        }
+    }
+
     private static unsafe float[] CpuOracle(byte[] bank, QuantizationType qt, int[] expertOfRow, float[] x, int m, int k, int rows, int rowBytes)
     {
         var y = new float[(long)rows * m];

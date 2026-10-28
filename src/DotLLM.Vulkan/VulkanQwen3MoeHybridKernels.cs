@@ -163,6 +163,11 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     internal Iq1Codebooks Iq1CodebooksOwned { get; private set; } = null!;
     private readonly Dictionary<MoeIqQuant, MoeIndexedMatmulIqMmvqKernel> _iqMmvq = new();
     private readonly Dictionary<MoeIqQuant, MoeGroupedMatmulIqCoopmatKernel> _iqGrouped = new();
+    private readonly Dictionary<(MoeIqQuant, string), MoeGroupedMatmulIqCoopmatKernel> _iqGroupedVariants = new();
+
+    /// <summary>#1348: the experimental grouped coopmat IQ kernel variant <paramref name="variant"/> for a bank of type <paramref name="qt"/>, or <c>null</c>.</summary>
+    public MoeGroupedMatmulIqCoopmatKernel? MoeGroupedIqVariant(DotLLM.Core.Configuration.QuantizationType qt, string variant)
+        => MoeIqFormats.FromQuantizationType(qt) is { } f && _iqGroupedVariants.TryGetValue((f, variant), out var kern) ? kern : null;
 
     /// <summary>#823: the indexed IQ-family MMVQ (dp4a) decode kernel serving a resident expert bank of <paramref name="qt"/>, or <c>null</c> (not an IQ bank type / no kernel / no integer-dot).</summary>
     public MoeIndexedMatmulIqMmvqKernel? MoeMmvqIq(DotLLM.Core.Configuration.QuantizationType qt)
@@ -716,15 +721,15 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         kernels.MatMulF32Multi = MatMulF32GemvMultiKernel.TryCreate(device, spvDir);
         kernels.MatMulF16Multi = MatMulF16GemvMultiKernel.TryCreate(device, spvDir);
         kernels.MatMulQ8Multi = MatMulQ8_0GemvMultiKernel.TryCreate(device, spvDir, Q8RowsPerWorkgroup,
-            RowsFromEnv("DOTLLM_VK_Q8_ROWS_MULTI", 4));
+            RowsFromEnv("DOTLLM_VK_Q8_ROWS_MULTI", 4), RowsFromEnv("DOTLLM_VK_Q8_ROWS_WIDE", 4));
         // #1220 (supersedes #1193's Q4_K_R4): NR rows per workgroup share the activation loads; deterministic, and also the qwen35 decode GEMV.
         kernels.MatMulQ4KMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q4_K, Q4KRowsPerWorkgroup,
-            RowsFromEnv("DOTLLM_VK_Q4K_ROWS_MULTI", 4));
+            RowsFromEnv("DOTLLM_VK_Q4K_ROWS_MULTI", 4), RowsFromEnv("DOTLLM_VK_Q4K_ROWS_WIDE", 4));
         kernels.MatMulQ5KMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q5_K);
         kernels.MatMulQ6KMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K);
         if (Environment.GetEnvironmentVariable("DOTLLM_VK_Q6K_ROWS_DECODE") != "0")
             kernels.MatMulQ6KRows = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K_Rows,
-                RowsFromEnv("DOTLLM_VK_Q6K_ROWS", 2), RowsFromEnv("DOTLLM_VK_Q6K_ROWS_MULTI", 4));
+                RowsFromEnv("DOTLLM_VK_Q6K_ROWS", 2), RowsFromEnv("DOTLLM_VK_Q6K_ROWS_MULTI", 4), RowsFromEnv("DOTLLM_VK_Q6K_ROWS_WIDE", 4));
         kernels.MatMulQ6KMultiR2 = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K_R2);
         kernels.MatMulIq4XsMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.IQ4_XS);
         kernels.MatMulIq3SMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.IQ3_S);
@@ -815,6 +820,11 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
                 foreach (var f in Enum.GetValues<MoeIqQuant>())
                     if (MoeGroupedMatmulIqCoopmatKernel.IsSupportedOn(device, spvDir, f))
                         kernels._iqGrouped[f] = MoeGroupedMatmulIqCoopmatKernel.Create(device, spvDir, f, iq3Codebooks, iq2Codebooks, kernels.Iq1CodebooksOwned);
+                // #1348: experimental variants (IQ3_S / IQ4_XS / IQ4_NL), selected per layer call by DOTLLM_VK_MOE_IQ_VARIANT.
+                foreach (var f in Enum.GetValues<MoeIqQuant>())
+                    foreach (var v in MoeGroupedMatmulIqCoopmatKernel.Variants)
+                        if (MoeGroupedMatmulIqCoopmatKernel.IsVariantSupportedOn(device, spvDir, f, v))
+                            kernels._iqGroupedVariants[(f, v)] = MoeGroupedMatmulIqCoopmatKernel.Create(device, spvDir, f, iq3Codebooks, iq2Codebooks, kernels.Iq1CodebooksOwned, variant: v);
             }
             if ((kernels.MoeGroupedQ5_1 is not null || kernels.MoeGroupedQ8_0 is not null || kernels._iqGrouped.Count > 0) && q4.RowTile != 16)
             {

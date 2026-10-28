@@ -2902,8 +2902,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             case QuantizationType.BF16:
                 if (seqLen == 1)
                     _kernels.MatMulBf16.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
-                else if (seqLen <= MatMulBf16GemvMultiF32Kernel.MaxColumns && _kernels.MatMulBf16Multi is { } bf16Multi)
-                    bf16Multi.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);   // #706: thin BF16 projections at 2..8 rows
+                else if (seqLen <= (SmallRowWideEnabled ? MatMulBf16GemvMultiF32Kernel.WideMaxColumns : MatMulBf16GemvMultiF32Kernel.MaxColumns) && _kernels.MatMulBf16Multi is { } bf16Multi)
+                    bf16Multi.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);   // #706/#1365: thin BF16 projections at 2..16 rows
                 else
                     _kernels.MatMulBf16Gemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;

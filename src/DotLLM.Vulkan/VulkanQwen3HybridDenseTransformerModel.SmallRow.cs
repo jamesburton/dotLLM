@@ -18,6 +18,16 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel
     /// <summary><c>DOTLLM_VK_SMALLROW_GEMV=0</c> disables the multi-column GEMVs here as on the MoE host (A/B and diagnostics).</summary>
     internal static bool SmallRowGemvEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_SMALLROW_GEMV") != "0";
 
+    /// <summary>
+    /// <c>DOTLLM_VK_SMALLROW_WIDE=0</c> caps the multi-column GEMVs at 8 rows again (#1365: A/B and diagnostics; 9..16 rows then take the GEMM
+    /// path with its 340-570 ms fixed cost). Pair it with <c>DOTLLM_VK_PQ2_0_MULTICOL_MAX_N=8</c> for PQ2_0 weights, whose cap lives in
+    /// <see cref="PQ2_0SmallNDispatch"/>.
+    /// </summary>
+    internal static bool SmallRowWideEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_SMALLROW_WIDE") != "0";
+
+    /// <summary>Largest row count the multi-column GEMVs serve here: 16 (#1365), or 8 with <see cref="SmallRowWideEnabled"/> off.</summary>
+    internal static int SmallRowMaxRows => SmallRowWideEnabled ? MatMulQuantGemvMultiKernel.WideMaxColumns : MatMulQuantGemvMultiKernel.MaxColumns;
+
     /// <summary>Fewest rows that take the two-rows-per-workgroup Q6_K GEMV (#1193; <c>DOTLLM_VK_SMALLROW_Q6K_R2_MIN_ROWS</c>, as the dense host; 99 = off).</summary>
     private static readonly int SmallRowQ6KR2MinRows =
         int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_SMALLROW_Q6K_R2_MIN_ROWS"), out int r) && r >= 2 ? r : 3;
@@ -26,7 +36,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel
     private bool TryRecordSmallRowMatmul(nint cmdBuf, VulkanDevice.Buffer weights, QuantizationType qt,
                                          VulkanDevice.Buffer input, VulkanDevice.Buffer output, int m, int k, int n)
     {
-        if (!SmallRowGemvEnabled)
+        if (!SmallRowGemvEnabled || n > SmallRowMaxRows)
             return false;
         MatMulQuantGemvMultiKernel? quant = qt switch
         {
@@ -37,7 +47,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel
             QuantizationType.IQ4_XS => _kernels.MatMulIq4XsMulti,
             _ => null,
         };
-        if (quant is not null && MatMulQuantGemvMultiKernel.Accepts(n, k))
+        if (quant is not null && quant.AcceptsColumns(n, k))   // #1365: 9..16 rows on the NR-parameterised Q4_K / Q6_K kernels
         {
             quant.Record(cmdBuf, weights, input, output, m: m, k: k, n: n);
             return true;
@@ -50,7 +60,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel
         // Decode runs on this kernel (n = 1, #1220), so every verify column is bit-identical to it. With DOTLLM_VK_Q8_ROWS_DECODE=0 the decode
         // is the coalesced 1-row GEMV (same lane map, ULP-close); a device decoding on the block-per-lane variant then keeps the GEMM.
         if (qt == QuantizationType.Q8_0 && (_q8Decode is not null || _kernels.MatMulQ8.VariantName == "coalesced")
-            && _kernels.MatMulQ8Multi is { } q8 && MatMulQ8_0GemvMultiKernel.Accepts(n, k))
+            && _kernels.MatMulQ8Multi is { } q8 && MatMulQ8_0GemvMultiKernel.AcceptsWide(n, k))
         {
             q8.Record(cmdBuf, weights, input, output, m: m, k: k, n: n);
             return true;

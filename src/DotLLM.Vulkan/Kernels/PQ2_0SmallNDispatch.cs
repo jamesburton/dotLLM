@@ -9,9 +9,10 @@ namespace DotLLM.Vulkan.Kernels;
 /// <remarks>
 /// <para>
 /// <b>Three kernels, chosen by token count.</b> <c>n = 1</c> is the decode GEMV.
-/// <c>2 &lt;= n &lt;= </c><see cref="MultiColumnMaxN"/> (default 8) is the multi-column GEMV
+/// <c>2 &lt;= n &lt;= </c><see cref="MultiColumnMaxN"/> (default 16 since #1365, 8 before) is the multi-column GEMV
 /// (#470), which decodes each weight byte once for all <c>n</c> columns. Above that is the
-/// 128x128 coopmat GEMM. The per-token GEMV loop from #446 is now only a fallback, used when the
+/// 128x128 coopmat GEMM. The 9..16-column kernels are 4-rows-per-workgroup #474 variants; with the cap at 8 an
+/// 9-row verify jumped from ~105 ms to ~320 ms on Bonsai-2 27B (Strix), a 3x cliff the 9..16 kernels remove (~107 ms). The per-token GEMV loop from #446 is now only a fallback, used when the
 /// multi-column path is switched off.
 /// </para>
 /// <para>
@@ -83,14 +84,14 @@ public static class PQ2_0SmallNDispatch
     public const string ThresholdEnvVar = "DOTLLM_VK_PQ2_0_GEMV_LOOP_MAX_N";
 
     /// <summary>Largest <c>n</c> sent to the multi-column GEMV by default.</summary>
-    public const int DefaultMultiColumnMaxN = MatMulPQ2_0GemvF32Kernel.MaxColumns;
+    public const int DefaultMultiColumnMaxN = MatMulPQ2_0GemvF32Kernel.WideMaxColumns;   // #1365: 16 (was 8, the cliff)
 
     /// <summary>Environment variable overriding <see cref="DefaultMultiColumnMaxN"/>; <c>0</c> disables the multi-column path.</summary>
     public const string MultiColumnEnvVar = "DOTLLM_VK_PQ2_0_MULTICOL_MAX_N";
 
     private static readonly int Threshold = ReadEnv(ThresholdEnvVar, DefaultGemvLoopMaxN, int.MaxValue);
     private static readonly int MultiColumnFromEnv =
-        ReadEnv(MultiColumnEnvVar, DefaultMultiColumnMaxN, MatMulPQ2_0GemvF32Kernel.MaxColumns);
+        ReadEnv(MultiColumnEnvVar, DefaultMultiColumnMaxN, MatMulPQ2_0GemvF32Kernel.WideMaxColumns);
 
     /// <summary>
     /// The effective loop threshold: the GEMV loop is recorded for <c>n &lt;= </c> this when the
@@ -146,7 +147,7 @@ public static class PQ2_0SmallNDispatch
             return;
         }
 
-        if (n <= MultiColumnMaxN)
+        if (n <= MultiColumnMaxN && n <= gemv.MaxColumnsAvailable)
         {
             gemv.RecordColumns(cmdBuf, weights, input, output, m, k, n);
             return;

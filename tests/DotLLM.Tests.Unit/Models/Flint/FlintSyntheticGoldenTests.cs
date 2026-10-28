@@ -3,6 +3,9 @@ using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using Xunit;
 using Architecture = DotLLM.Core.Configuration.Architecture;
 
@@ -75,6 +78,28 @@ public sealed class FlintSyntheticGoldenTests : IDisposable
         return f;
     }
 
+    /// <summary>
+    /// The CPU path this process actually took (#1309): CI failed this golden intermittently (0.0199) on a runner whose CPU we cannot
+    /// reproduce, so every failure message names the ISA tiers the kernels dispatch on, the OS/runtime, and (Linux) the CPU model.
+    /// </summary>
+    internal static string IsaInfo()
+    {
+        string cpu = "";
+        try
+        {
+            if (File.Exists("/proc/cpuinfo"))
+                cpu = File.ReadLines("/proc/cpuinfo").FirstOrDefault(l => l.StartsWith("model name", StringComparison.Ordinal))?.Split(':', 2).LastOrDefault()?.Trim() ?? "";
+        }
+        catch { /* diagnostics only */ }
+        string env = string.Join(' ', Environment.GetEnvironmentVariables().Keys.Cast<string>()
+            .Where(k => k.StartsWith("DOTNET_", StringComparison.OrdinalIgnoreCase) || k.StartsWith("DOTLLM_", StringComparison.OrdinalIgnoreCase))
+            .Select(k => k + "=" + Environment.GetEnvironmentVariable(k)));
+        return $"[cpu='{cpu}' arch={RuntimeInformation.ProcessArchitecture} os='{RuntimeInformation.OSDescription}' rt='{RuntimeInformation.FrameworkDescription}' " +
+               $"Vector512={Vector512.IsHardwareAccelerated} Vector256={Vector256.IsHardwareAccelerated} Avx2={Avx2.IsSupported} Fma={Fma.IsSupported} " +
+               $"AvxVnni={AvxVnni.IsSupported} Avx512F={Avx512F.IsSupported} Avx512BW={Avx512BW.IsSupported} Avx512VL={Avx512F.VL.IsSupported} Avx10v1={Avx10v1.IsSupported} " +
+               $"Ssse3={Ssse3.IsSupported} Sse41={Sse41.IsSupported} env='{env}']";
+    }
+
     private static float MaxAbs(float[] a, float[] b)
     {
         float m = 0;
@@ -120,7 +145,7 @@ public sealed class FlintSyntheticGoldenTests : IDisposable
         float[] ours = Run(gguf, cfg);
         Assert.Equal(Golden.Length, ours.Length);
         float diff = MaxAbs(ours, Golden);
-        Assert.True(diff < 1e-4f, $"max |dotLLM - llama.cpp| = {diff}");
+        Assert.True(diff < 1e-4f, $"max |dotLLM - llama.cpp| = {diff} {IsaInfo()}");
     }
 
     [Fact]
@@ -131,7 +156,7 @@ public sealed class FlintSyntheticGoldenTests : IDisposable
         float[] ours = Run(gguf, cfg);
         Assert.Equal(GoldenQuantized.Length, ours.Length);
         float diff = MaxAbs(ours, GoldenQuantized);
-        Assert.True(diff < QuantizedTolerance, $"max |dotLLM - llama.cpp| = {diff}");
+        Assert.True(diff < QuantizedTolerance, $"max |dotLLM - llama.cpp| = {diff} {IsaInfo()}");
     }
 
     /// <summary>
@@ -148,7 +173,7 @@ public sealed class FlintSyntheticGoldenTests : IDisposable
         float[] ours = Run(gguf, cfg);
         Assert.Equal(GoldenDenseQ4_1LlamaCpp.Length, ours.Length);
         float diff = MaxAbs(ours, GoldenDenseQ4_1LlamaCpp);
-        Assert.True(diff < QuantizedTolerance, $"max |dotLLM - llama.cpp Q4_1| = {diff}");
+        Assert.True(diff < QuantizedTolerance, $"max |dotLLM - llama.cpp Q4_1| = {diff} {IsaInfo()}");
     }
 
     /// <summary>
@@ -161,7 +186,7 @@ public sealed class FlintSyntheticGoldenTests : IDisposable
         using var gguf = GgufFile.Open(Write(DenseQ4_1, "denseq"));
         ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
         float diff = MaxAbs(Run(gguf, cfg, decode: true), Run(gguf, cfg));
-        Assert.True(diff < 1e-4f, $"decode vs batched {diff}");
+        Assert.True(diff < 1e-4f, $"decode vs batched {diff} {IsaInfo()}");
     }
 
     [Fact]
@@ -181,7 +206,7 @@ public sealed class FlintSyntheticGoldenTests : IDisposable
             }
         }
         float diff = MaxAbs(Run(gguf, cfg, threading: new ThreadingConfig(4)), Run(gguf, cfg));
-        Assert.True(diff < 1e-4f, $"threaded vs serial {diff}");
+        Assert.True(diff < 1e-4f, $"threaded vs serial {diff} {IsaInfo()}");
     }
 
     /// <summary>
@@ -202,7 +227,7 @@ public sealed class FlintSyntheticGoldenTests : IDisposable
         float[] threaded = Run(gguf, cfg, decode: true, threading: new ThreadingConfig(4));
         Assert.True(DotLLM.Cpu.Kernels.MoeSwiGluMlp.DecodeN1SharedFusedCalls > fused0, "the fused shared-expert decode path did not run");
         float diff = MaxAbs(threaded, serial);
-        Assert.True(diff < 1e-4f, $"threaded fused decode vs serial {diff}");
+        Assert.True(diff < 1e-4f, $"threaded fused decode vs serial {diff} {IsaInfo()}");
     }
 
     [Fact]
@@ -211,7 +236,7 @@ public sealed class FlintSyntheticGoldenTests : IDisposable
         using var gguf = GgufFile.Open(Write());
         ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
         float diff = MaxAbs(Run(gguf, cfg, decode: true), Run(gguf, cfg));
-        Assert.True(diff < 1e-4f, $"decode vs batched {diff}");
+        Assert.True(diff < 1e-4f, $"decode vs batched {diff} {IsaInfo()}");
     }
 
     // ---- each Flint mechanism must be observable: a mutant of it has to move the logits far beyond the parity tolerance ----
@@ -233,7 +258,7 @@ public sealed class FlintSyntheticGoldenTests : IDisposable
             _ => cfg with { Moe = cfg.Moe! with { NormalizeExpertWeights = false } },
         };
         float diff = MaxAbs(Run(gguf, m), Golden);
-        Assert.True(diff > 0.02f, $"mutant '{mutant}' is invisible to the golden (max diff {diff})");
+        Assert.True(diff > 0.02f, $"mutant '{mutant}' is invisible to the golden (max diff {diff}) {IsaInfo()}");
     }
 
     [Fact]
@@ -243,7 +268,7 @@ public sealed class FlintSyntheticGoldenTests : IDisposable
         using var noSinks = GgufFile.Open(Write(new SyntheticFlintGguf.Options { Sinks = false }, "nosinks"));
         ModelConfig cfg = GgufModelConfigExtractor.Extract(withSinks.Metadata);
         float diff = MaxAbs(Run(withSinks, cfg), Run(noSinks, cfg));
-        Assert.True(diff > 0.02f, $"attention sinks have no effect on the CPU forward (max diff {diff})");
+        Assert.True(diff > 0.02f, $"attention sinks have no effect on the CPU forward (max diff {diff}) {IsaInfo()}");
     }
 
     [Fact]

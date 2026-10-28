@@ -328,8 +328,8 @@ public static class Attention
         float max = TensorPrimitives.Max((ReadOnlySpan<float>)row);
         float m = MathF.Max(max, sink);
         TensorPrimitives.Add((ReadOnlySpan<float>)row, -m, row);
-        TensorPrimitives.Exp((ReadOnlySpan<float>)row, row);
-        float sum = TensorPrimitives.Sum((ReadOnlySpan<float>)row) + MathF.Exp(sink - m);
+        PortableMath.Exp(row, row);
+        float sum = TensorPrimitives.Sum((ReadOnlySpan<float>)row) + PortableMath.Exp(sink - m);
         TensorPrimitives.Multiply((ReadOnlySpan<float>)row, 1f / sum, row);
     }
 
@@ -626,7 +626,7 @@ public static class Attention
                     var row = scores.AsSpan(i * seqKv, seqKv);
                     float m = sink;
                     for (int j = 0; j < seqKv; j++) m = MathF.Max(m, row[j]);
-                    float sum = MathF.Exp(sink - m);
+                    float sum = PortableMath.Exp(sink - m);
                     for (int j = 0; j < seqKv; j++)
                     {
                         row[j] = MathF.Exp(row[j] - m);

@@ -126,6 +126,25 @@ internal static class ReasoningSupport
         ["<|im_end|>", "<|eot_id|>", "<|eom_id|>", "<|end|>", "</s>"];
 
     /// <summary>
+    /// What the loaded chat template does with the thinking controls, for <c>/props</c> (#1106): whether it reads
+    /// <c>enable_thinking</c> / <c>reasoning_effort</c> and whether it emits a splittable think block.
+    /// Null when no Jinja template is loaded.
+    /// </summary>
+    internal static Models.ReasoningCapabilitiesDto? Capabilities(IChatTemplate? template)
+    {
+        if (template is not JinjaChatTemplate jinja)
+            return null;
+        string src = jinja.TemplateSource;
+        return new Models.ReasoningCapabilitiesDto
+        {
+            EnableThinking = src.Contains("enable_thinking", StringComparison.Ordinal),
+            ReasoningEffort = src.Contains("reasoning_effort", StringComparison.Ordinal),
+            ThinkingBlock = jinja.ReasoningMarkup != ReasoningMarkup.Harmony
+                && src.Contains(jinja.ReasoningMarkup.OpenTag(), StringComparison.Ordinal),
+        };
+    }
+
+    /// <summary>
     /// Builds the template options for a request. <paramref name="constrained"/> (a <c>response_format</c>
     /// / grammar / forced <c>tool_choice</c> will constrain decoding from the first token) defaults
     /// thinking OFF unless the client asked for it explicitly: a constraint cannot coexist with an open

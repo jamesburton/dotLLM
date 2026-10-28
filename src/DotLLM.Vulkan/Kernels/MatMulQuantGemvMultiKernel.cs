@@ -33,25 +33,42 @@ public enum QuantGemvMultiFormat
 /// <remarks>One workgroup per output row; <c>NC</c> is a specialization constant (one pipeline per column count). K must be a multiple of 256.</remarks>
 public sealed class MatMulQuantGemvMultiKernel : IDisposable
 {
-    /// <summary>Largest supported column count.</summary>
+    /// <summary>
+    /// Largest column count the format-agnostic static <see cref="Accepts"/> gate and the hosts that predate #1365 (MoE host, dense
+    /// <c>VulkanTransformerModel</c>) serve; they have not been validated or measured above 8 rows.
+    /// </summary>
     public const int MaxColumns = 8;
+
+    /// <summary>
+    /// Largest column count any instance serves (#1365). Only the NR-parameterised deterministic shaders (<see cref="QuantGemvMultiFormat.Q4_K"/>,
+    /// <see cref="QuantGemvMultiFormat.Q6_K_Rows"/>) go above <see cref="MaxColumns"/>; see <see cref="MaxColumnsFor"/>.
+    /// </summary>
+    public const int WideMaxColumns = 16;
 
     private const int PushConstantBytes = 4 * sizeof(uint); // M, K, blocksPerRow, rowUints
     private const int GroupSize = 256;
 
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
-    private readonly ComputePipeline?[] _pipelines = new ComputePipeline?[MaxColumns + 1];
+    private readonly ComputePipeline?[] _pipelines = new ComputePipeline?[WideMaxColumns + 1];
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
     private readonly int _buffersPerSet;
     private readonly int _blockBytes;
     private readonly int _rowsPerWorkgroup;
-    private readonly int[] _rowsForColumns = new int[MaxColumns + 1];   // NR per column count (#1220)
+    private readonly int[] _rowsForColumns = new int[WideMaxColumns + 1];   // NR per column count (#1220)
     private bool _disposed;
 
     /// <summary>The format this instance serves.</summary>
     public QuantGemvMultiFormat Format { get; }
+
+    /// <summary>Largest column count this instance serves: <see cref="WideMaxColumns"/> for the NR-parameterised formats, else <see cref="MaxColumns"/>.</summary>
+    public int MaxColumnsSupported { get; }
+
+    /// <summary>Largest column count <paramref name="format"/>'s shader serves (#1365).</summary>
+    /// <param name="format">The block format.</param>
+    /// <returns>8 or 16.</returns>
+    public static int MaxColumnsFor(QuantGemvMultiFormat format) => TakesRows(format) ? WideMaxColumns : MaxColumns;
 
     /// <summary>Output rows per workgroup (<c>NR</c>, #1220); 1 except for the formats whose shader takes the constant.</summary>
     public int RowsPerWorkgroup => _rowsPerWorkgroup;
@@ -67,16 +84,17 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
     private static bool TakesRows(QuantGemvMultiFormat f) => f is QuantGemvMultiFormat.Q4_K or QuantGemvMultiFormat.Q6_K_Rows;
 
     private MatMulQuantGemvMultiKernel(QuantGemvMultiFormat format, VulkanDevice device, VulkanModule module, nint pool, int buffersPerSet, int blockBytes,
-                                       uint requiredSubgroupSize, int rowsPerWorkgroup, int multiColumnRowsPerWorkgroup)
+                                       uint requiredSubgroupSize, int rowsPerWorkgroup, int multiColumnRowsPerWorkgroup, int wideRowsPerWorkgroup)
     {
         Format = format;
+        MaxColumnsSupported = MaxColumnsFor(format);
         _device = device; _module = module; _descriptorPool = pool; _buffersPerSet = buffersPerSet; _blockBytes = blockBytes;
         _rowsPerWorkgroup = rowsPerWorkgroup;
-        for (int n = 1; n <= MaxColumns; n++)
-            _rowsForColumns[n] = n == 1 ? rowsPerWorkgroup : multiColumnRowsPerWorkgroup;
+        for (int n = 1; n <= MaxColumnsSupported; n++)
+            _rowsForColumns[n] = n == 1 ? rowsPerWorkgroup : n <= MaxColumns ? multiColumnRowsPerWorkgroup : wideRowsPerWorkgroup;
         var bindings = new VkDescriptorBinding[buffersPerSet];
         for (int i = 0; i < buffersPerSet; i++) bindings[i] = new VkDescriptorBinding((uint)i);
-        for (int n = SupportsSingleColumn ? 1 : 2; n <= MaxColumns; n++)
+        for (int n = SupportsSingleColumn ? 1 : 2; n <= MaxColumnsSupported; n++)
             _pipelines[n] = module.CreateComputePipeline(
                 entryPoint: "main", bindings: bindings, pushConstantBytes: PushConstantBytes, requiredSubgroupSize: requiredSubgroupSize,
                 specConstants: [(uint)n, (uint)_rowsForColumns[n]]);
@@ -126,11 +144,16 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
     /// <param name="format">The block format.</param>
     /// <param name="rowsPerWorkgroup">Output rows per workgroup (1..8); only <see cref="QuantGemvMultiFormat.Q4_K"/> and <see cref="QuantGemvMultiFormat.Q6_K_Rows"/> take more than 1 (#1220). Used by the one-column (decode) pipeline.</param>
     /// <param name="multiColumnRowsPerWorkgroup">NR of the 2..8-column pipelines; 0 = <paramref name="rowsPerWorkgroup"/>. A row's bits do not depend on NR.</param>
+    /// <param name="wideRowsPerWorkgroup">NR of the 9..16-column pipelines (#1365; only the NR-parameterised formats have them); 0 = 4 (1 for the formats without wide pipelines). 1..4: the shaders store with one lane per
+    /// output (lane &lt; NR x NC), so NR x 16 may not exceed their 64 lanes. Measured: 4 rows beat 2 by 1.6x at 16 columns (Qwen3.8 Q4_K_M verify).</param>
     /// <returns>The kernel, or null when it cannot run correctly here.</returns>
     public static MatMulQuantGemvMultiKernel? TryCreate(VulkanDevice device, string spvDir, QuantGemvMultiFormat format, int rowsPerWorkgroup = 1,
-                                                          int multiColumnRowsPerWorkgroup = 0)
+                                                          int multiColumnRowsPerWorkgroup = 0, int wideRowsPerWorkgroup = 0)
     {
         if (multiColumnRowsPerWorkgroup == 0) multiColumnRowsPerWorkgroup = rowsPerWorkgroup;
+        if (wideRowsPerWorkgroup == 0) wideRowsPerWorkgroup = TakesRows(format) ? 4 : 1;
+        if (wideRowsPerWorkgroup < 1 || wideRowsPerWorkgroup > 4 || (wideRowsPerWorkgroup > 1 && !TakesRows(format)))
+            throw new ArgumentOutOfRangeException(nameof(wideRowsPerWorkgroup));
         if (multiColumnRowsPerWorkgroup < 1 || multiColumnRowsPerWorkgroup > 8 || (multiColumnRowsPerWorkgroup > 1 && !TakesRows(format)))
             throw new ArgumentOutOfRangeException(nameof(multiColumnRowsPerWorkgroup));
         if (rowsPerWorkgroup < 1 || rowsPerWorkgroup > 8 || (rowsPerWorkgroup > 1 && !TakesRows(format)))
@@ -144,13 +167,19 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
         try
         {
             nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)buffers);
-            return new MatMulQuantGemvMultiKernel(format, device, module, pool, buffers, blockBytes, subgroupSize, rowsPerWorkgroup, multiColumnRowsPerWorkgroup);
+            return new MatMulQuantGemvMultiKernel(format, device, module, pool, buffers, blockBytes, subgroupSize, rowsPerWorkgroup, multiColumnRowsPerWorkgroup, wideRowsPerWorkgroup);
         }
         catch { module.Dispose(); throw; }
     }
 
     /// <summary>True when this kernel serves a matmul with <paramref name="n"/> rows and contraction <paramref name="k"/>.</summary>
     public static bool Accepts(int n, int k) => n >= 2 && n <= MaxColumns && k > 0 && (k % GroupSize) == 0;
+
+    /// <summary>True when this instance serves a matmul with <paramref name="n"/> rows (2..<see cref="MaxColumnsSupported"/>) and contraction <paramref name="k"/> (#1365).</summary>
+    /// <param name="n">Activation rows.</param>
+    /// <param name="k">Contraction length.</param>
+    /// <returns>Whether <see cref="Record"/> accepts it.</returns>
+    public bool AcceptsColumns(int n, int k) => n >= 2 && n <= MaxColumnsSupported && k > 0 && (k % GroupSize) == 0;
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
     internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
@@ -159,7 +188,7 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
     public unsafe void Record(nint cmdBuf, VulkanDevice.Buffer weights, VulkanDevice.Buffer input, VulkanDevice.Buffer output, int m, int k, int n,
                               VulkanDevice.Buffer? codebook = null)
     {
-        if (!Accepts(n, k) && !(n == 1 && SupportsSingleColumn && k > 0 && (k % GroupSize) == 0))
+        if (!AcceptsColumns(n, k) && !(n == 1 && SupportsSingleColumn && k > 0 && (k % GroupSize) == 0))
             throw new ArgumentOutOfRangeException(nameof(n), $"n={n}, k={k}");
         int blocksPerRow = k / GroupSize;
         long rowBytes = (long)blocksPerRow * _blockBytes;
