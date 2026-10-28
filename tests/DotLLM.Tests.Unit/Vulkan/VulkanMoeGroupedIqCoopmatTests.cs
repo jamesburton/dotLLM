@@ -137,6 +137,10 @@ public sealed class VulkanMoeGroupedIqCoopmatTests
     [InlineData(QuantizationType.IQ4_NL, 100, 640, "n32diet")]    // real down K
     [InlineData(QuantizationType.IQ4_NL, 64, 64, "n32diet")]
     [InlineData(QuantizationType.IQ3_S, 77, 768, "n32diet")]      // #1352: rowBytes % 4 == 2, odd rows start mid-word
+    [InlineData(QuantizationType.IQ3_S, 130, 2560, "n64diet")]
+    [InlineData(QuantizationType.IQ3_S, 77, 768, "n64diet")]
+    [InlineData(QuantizationType.IQ4_NL, 100, 640, "n64diet")]
+    [InlineData(QuantizationType.IQ4_XS, 130, 2560, "n64diet")]
     public void GroupedVariant_MatchesNarrowBitwiseAndCpuOracle(QuantizationType qt, int m, int k, string variant)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
@@ -145,7 +149,7 @@ public sealed class VulkanMoeGroupedIqCoopmatTests
         Skip.IfNot(MoeGroupedMatmulIqCoopmatKernel.IsSupportedOn(device, spvDir, iq) && MoeGroupedMatmulIqCoopmatKernel.IsVariantSupportedOn(device, spvDir, iq, variant)
                    && MoeBuildTileListKernel.IsSupportedOn(spvDir), "coopmat / native wave64 / wide SPIR-V unavailable.");
 
-        int[] counts = { 0, 3, 0, 17, 40, 16, 15, 1, 33, 64, 2, 0, 32, 31, 48, 100, 128, 5 };
+        int[] counts = { 0, 3, 0, 17, 40, 16, 15, 1, 33, 64, 2, 0, 32, 31, 48, 100, 128, 5, 47, 49, 63, 65 };
         int E = counts.Length, rows = counts.Sum();
         uint[] offsets = new uint[E + 1];
         int[] expertOfRow = new int[rows];
@@ -180,7 +184,7 @@ public sealed class VulkanMoeGroupedIqCoopmatTests
         using var narrow = MoeGroupedMatmulIqCoopmatKernel.Create(device, spvDir, iq, codebooks);
         using var wide = MoeGroupedMatmulIqCoopmatKernel.Create(device, spvDir, iq, codebooks, variant: variant);
         Assert.Equal(16, narrow.RowTile);
-        Assert.Equal(variant.StartsWith("n32", StringComparison.Ordinal) ? 32 : 16, wide.RowTile);
+        Assert.Equal(int.Parse(variant.AsSpan(1, 2)), wide.RowTile);
         using var build = MoeBuildTileListKernel.Create(device, spvDir);
         wide.Launch(bufW, bufX, bufOffW, yWideLegacy, m, k, rows, E, maxRowsPerExpert: counts.Max());
         using (var ctx = device.CreateSubmitContext())

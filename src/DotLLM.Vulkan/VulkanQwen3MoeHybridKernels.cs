@@ -154,7 +154,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     /// <summary>Grouped coopmat Q8_0 prefill kernel (16-row tiles).</summary>
     public MoeGroupedMatmulLegacyQuantCoopmatKernel? MoeGroupedQ8_0 { get; private set; }
     private readonly Dictionary<string, MoeGroupedMatmulLegacyQuantCoopmatKernel> _q8Wide = new();
-    /// <summary>#1354: the wide-tile Q8_0 grouped kernel for variant suffix <paramref name="variant"/> (<c>n32diet</c>), or null.</summary>
+    /// <summary>#1354/#1353: the wide-tile Q8_0 grouped kernel for variant suffix <paramref name="variant"/> (<c>n32diet</c>, <c>n64diet</c>), or null.</summary>
     public MoeGroupedMatmulLegacyQuantCoopmatKernel? MoeGroupedQ8_0Wide(string variant) => _q8Wide.GetValueOrDefault(variant);
     /// <summary>16-row Q4_K grouped kernel, present only when <see cref="MoeGroupedQ4K"/> is the 32-row row-pair form: a layer whose down
     /// bank is legacy-quant (16-row tiles only) needs gate/up on the same 16-row tile list.</summary>

@@ -41,8 +41,8 @@ public sealed class MoeGroupedMatmulLegacyQuantCoopmatKernel : IDisposable
     /// <summary>Shader variant suffix (<c>n32diet</c>: 32-token tile + shared epilogue staging, Q8_0 only, issue #1354), or null for the 16-token production kernel.</summary>
     public string? Variant { get; }
 
-    /// <summary>The wide-tile variant suffixes this kernel class can load (Q8_0 only): 32 tokens per workgroup (issue #1354).</summary>
-    public static readonly string[] WideVariants = { "n32diet" };
+    /// <summary>The wide-tile variant suffixes this kernel class can load (Q8_0 only): 32 and 64 tokens per workgroup (issues #1354, #1353).</summary>
+    public static readonly string[] WideVariants = { "n32diet", "n64diet" };
 
     private MoeGroupedMatmulLegacyQuantCoopmatKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, MoeGroupedLegacyQuant quant, string? variant)
     {
@@ -109,7 +109,7 @@ public sealed class MoeGroupedMatmulLegacyQuantCoopmatKernel : IDisposable
 
     internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
 
-    /// <summary>Token rows per workgroup: 16, or 32 for the wide variant (issue #1354).</summary>
+    /// <summary>Token rows per workgroup: 16, or 32 for the wide variant (issues #1354, #1353).</summary>
     public int RowTile => Variant is null ? TileN : int.Parse(Variant.AsSpan(1, 2));
 
     /// <summary>Weight-row tiles per workgroup column (the x extent of the grid): <c>ceil(m / 64)</c>.</summary>

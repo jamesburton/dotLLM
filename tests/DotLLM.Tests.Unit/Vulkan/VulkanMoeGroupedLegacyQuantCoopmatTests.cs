@@ -138,6 +138,8 @@ public sealed class VulkanMoeGroupedLegacyQuantCoopmatTests
     [InlineData(100, 640, false, "n32diet")]    // real qwen4exp down shape family: K = 640
     [InlineData(100, 640, true, "n32diet")]
     [InlineData(64, 64, true, "n32diet")]
+    [InlineData(128, 704, false, "n64diet")]
+    [InlineData(100, 640, true, "n64diet")]
     public void Q8_0_WideVariant_IsBitIdenticalToNarrow(int m, int k, bool useScale, string variant)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);

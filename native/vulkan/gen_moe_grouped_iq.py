@@ -848,7 +848,9 @@ def render_nt(spec, nt, base=None):
     return h[:a] + ep + h[b:]
 
 
-NT_VARIANTS = {}   # wider token tiles through render_nt would go here (NT 16-token MMA halves)
+# Issue #1353: wider token tiles through render_nt (NT 16-token MMA halves; the activation staging and accumulators scale with NT, the A tile does not).
+# n64diet measured +3.6% (4K) / +6-7% (8K) over n32diet; n48diet (17.4 KB LDS, the same 3 workgroups per WGP as n64) was not shipped.
+NT_VARIANTS = {'n64diet': 4}
 
 
 def render_variant(spec, wide, diet, ballast, base=None):
@@ -893,7 +895,7 @@ def render_q8_0_wide(here, nt=2):
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     out = os.path.join(here, 'shaders')
-    for suffix, nt in (('n32diet', 2),):
+    for suffix, nt in (('n32diet', 2), ('n64diet', 4)):
         with open(os.path.join(out, f'moe_grouped_matmul_q8_0_coopmat_m64{suffix}.comp'), 'w', encoding='utf-8', newline='\n') as f:
             f.write(render_q8_0_wide(here, nt))
     for spec in SHADERS:

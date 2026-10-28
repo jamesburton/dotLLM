@@ -177,3 +177,31 @@ the Q8_0 piece for A/B.
 0..128 around the 16/32 edges, K up to 704; end-to-end last-row logits meanKL 0 / max|dlogit| 0.
 *Throughput* (`pf 4096`, `Q8_DOWN_WIDE` 1/0, ABBA blocks): 1.003, 1.056, 1.093; mean **1.05**. The ceiling is small (5 of 48 layers) but those layers carry the largest bank, so the
 share is bigger than 5/48; the first block's drift in the base arm is why the range is wide.
+
+### 7.3 64-token tile (#1353) - +3.6% at 4K, +6.8% at 8K, shipped as the default (`n64diet`)
+
+Token-tile width is the number of 16-token MMA halves per dequantised A fragment (`NT`). `render_nt` in the generator emits any `NT` (NT=2 reproduces `n32diet` byte for byte, checked
+for IQ3_S/IQ4_NL/IQ4_XS); the A tile (9 KB, scales with weight rows) does not grow, only the staged activations do (+2.25 KB per extra half), and each thread keeps NT activation
+vec4s in flight. rga (gfx1151, no spills):
+
+| shader | VGPR | LDS | workgroups per WGP (64 KB) |
+|---|---|---|---|
+| iq3_s n32diet | 73 | 14,848 B | 4 |
+| iq3_s n48diet | 82 | 17,408 B | 3 |
+| iq3_s n64diet | 91 | 19,456 B | 3 |
+
+So this trades one workgroup of occupancy (4 -> 3; `bal6` in section 6 measured 4 -> 2 at -6.5%) for 24% fewer tiles per layer-chunk (556 -> 424 at 1024 rows: weight read, dequantisation
+and LDS staging are paid per tile). It wins anyway. `n48diet` is in the same 3-workgroup LDS class as `n64diet` with less reuse, so it was not pursued (it was generated and checked for bit-identity but
+never timed). Q8_0-down layers use `moe_grouped_matmul_q8_0_coopmat_m64n64diet` (same transform); otherwise they would fall back to 16-token tiles and the shared tile list could not be used.
+`DOTLLM_VK_MOE_IQ_VARIANT=n32diet` selects the 32-token kernels, `off` the 16-token ones.
+
+*Path proof:* `tiles(count)` in the 2048-token stage profile: 54,269 at `n32diet` -> 41,861 at `n64diet` (the 64-token count measured in section 6, so every layer including the Q8_0 ones is on the
+new tile list); GPU-timestamp `grouped_gate_up` 1099 -> 1025 ms and `grouped_down` 579 -> 538 ms in that single profiled pair (-6.8% / -7.1%).
+*Parity:* bit-identical to the 16-token kernels - `GroupedVariant_MatchesNarrowBitwiseAndCpuOracle` and `Q8_0_WideVariant_IsBitIdenticalToNarrow` now include `n64diet`, with expert row counts
+47/48/49/63/64/65 around the 48/64 edges (legacy grid and indirect list, vs the 16-token kernel `==` and vs the CPU dequant oracle); end-to-end last-row logits (4 probe prompts, 13-70 tokens):
+meanKL 0, max|dlogit| 0, top-1 identical for `n32diet`, `n48diet` and `n64diet`.
+*Throughput* (`pf`, `n64diet` / `n32diet`, ABBA blocks in both orders, both arms include the Q8_0 variant). 4K block ratios: 1.019, 1.022, 1.061, 1.054, 0.995, 1.042 (base first),
+1.078, 1.020 (new first): mean **1.036**, 7 of 8 blocks above 1. 8K: 1.075, 1.061, mean **1.068**.
+
+**Not tried:** a `SB=32` staging round (one block per round: A 5 KB + B 5 KB at 64 tokens = 11.3 KB, 5 workgroups per WGP) would keep occupancy at 4+ with 64 tokens, but halves the weight
+bytes each thread owns per round (8 elements), which cuts against the load-issue gain of 7.1 and needs every format's `Stage` struct rewritten; the follow-up if prefill needs another step here.

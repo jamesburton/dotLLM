@@ -1939,14 +1939,14 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     private MoeGroupedMatmulIqCoopmatKernel? GroupedIqKernel(QuantizationType qt) => _kernels.MoeGroupedIq(qt);
 
     /// <summary>
-    /// #1348/#1354: the grouped IQ MoE kernels run 32 tokens per workgroup (<c>n32diet</c>) on layers where gate/up and down both have that variant, and the
+    /// #1348/#1353: the grouped IQ MoE kernels run 64 tokens per workgroup (<c>n64diet</c>; <c>n32diet</c> selectable) on layers where gate/up and down both have that variant, and the
     /// 16-token kernels elsewhere. <c>DOTLLM_VK_MOE_IQ_VARIANT=off</c> (or <c>0</c>) restores the 16-token kernels; any other value names a variant suffix.
     /// Read per layer call so one process can A/B it.
     /// </summary>
     private static string? MoeIqVariant()
         => Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_IQ_VARIANT") switch
         {
-            null or "" => "n32diet",
+            null or "" => "n64diet",
             "off" or "0" => null,
             var v => v,
         };
