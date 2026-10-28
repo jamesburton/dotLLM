@@ -143,3 +143,22 @@ An earlier 10-call palindromic session gave n32diet +2.5% (range wide), plain `n
 **Not tried / left:** the remaining ~50% of gate/up time is MMA + LDS + B staging + epilogue; the IQ3_S stage load issues ~11 single-byte 32-bit loads per thread per round (the load-issue pattern from the decode GEMV work), which could be coalesced into aligned word loads; a TN=48/64 tile (424 tiles) would need a smaller LDS budget; Q8_0-down layers (5 of 48) still use the 16-token down kernel and force those layers back to 16.
 
 Instruments: profile counters `tilesT16..T128`, `activeExperts`, `expertsWithRows[...]` (counts, not ms) in the `pf ... prof=2` stage table. Perturbation and ballast variants live on branch `issue/1348-moe-grouped-token-tile-prototype`, not in the tree.
+
+## 7. Lever 3 follow-ups on the grouped MoE GEMMs (#1352, #1354, #1353)
+
+Same protocol as section 6 (UD-IQ4_XS, F16 K/V, context 12288, one process, GPU lock held, no human GPU process before/after, in-process switches). Absolute tok/s drifted
+~15% per session (matched calls ranged 340-430 tok/s), so only paired ratios below count: blocks of `base,new,new,base` and `new,base,base,new` (3 reps per call, median per
+call, ratio = mean of the new calls / mean of the base calls inside a block).
+
+### 7.1 IQ3_S stage load: word loads instead of single-byte loads (#1352) - +3.3% (range 0.3..6.7%), shipped
+
+Every offset an IQ3_S thread reads is even (rows are `nsb*110` bytes, every field sits at an even offset), so the fp16 `d`, the two sign bytes and the 4 `qs` bytes are
+reachable with one aligned word load each (the `qs` quad straddles at most two words and is funnel-shifted). Weight loads per thread per round: 9-11 single-byte/straddling
+`readByte`/`readHalfBits` -> 6 (`d`, `qs` x2, signs, `qh`, scale byte). rga (gfx1151): ISA 7,184 -> 6,744 B, **VGPR 73 and LDS 14,848 B unchanged** (so occupancy cannot be the
+reason for any difference). The change is in the shared IQ3_S body, so the 16-token `m64` kernel gets it too.
+
+*Parity:* **bit-identical** to the byte-load kernel. During the A/B the word-load 32-token kernel was compared bitwise against the (then still byte-load) 16-token kernel by
+`GroupedVariant_MatchesNarrowBitwiseAndCpuOracle` and to the CPU dequant oracle; end-to-end last-row logits over the 4 probe prompts: meanKL 0, max|dlogit| 0, top-1 identical. The test now also covers `K = 768` (`rowBytes % 4 == 2`), where odd rows start mid-word and the funnel shift has a non-zero phase.
+
+*Throughput* (`pf 4096`, new/base per block, blocks in both orders): 1.003, 1.035, 1.067 (base first); 1.017, 1.030, 1.045 (new first). Mean **1.033**. A first 2-call
+smoke gave 1.025. Consistent with section 6: removing the weight loads outright was -33% of gate/up, so trimming their issue count buys a few percent, not the whole third.

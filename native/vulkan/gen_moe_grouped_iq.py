@@ -300,11 +300,18 @@ struct Stage { uint aw[6]; uint ib; vec4 bv; };   // aw[0]: d | scales_h<<16, aw
 
 # ---------------------------------------------------------------------------------------------------------------------------------
 # IQ3_S: 110-byte super-blocks (NOT word aligned): d, qs[64], qh[8], signs[32], scales[4]; grid in an SSBO (512 x 4 magnitude bytes).
+# Issue #1352: every offset the thread reads is EVEN (rows are nsb*110 bytes, all fields at even offsets), so a 16-bit field is always inside ONE word
+# and the 4 qs bytes straddle at most two words (funnel shift) - 6 weight loads instead of the previous 9-11 single-byte ones (rga: ISA 7184 -> 6744 B,
+# same 73 VGPR / 14,848 B LDS).
 IQ3_S = dict(
     name='iq3_s', fmt='IQ3_S', kreq='256',
     extra='layout(set = 0, binding = 4, std430) readonly  buffer BufGrid { uint iq3sGrid[]; };  // 512 x uint32 (4 grid magnitude bytes each)\n',
     layout='Bank layout: [E, M, K/256 super-blocks of 110 bytes]: fp16 d, qs[64], qh[8], signs[32], scales[4]. Sub-block ib32 (32 elements) = 4 pairs of 8: pair l reads\n// qs[ib32*8 + 2l .. +1] (+ one qh bit each) as two 9-bit iq3s grid indices (4 magnitude bytes each) and sign byte signs[ib32*4 + l] (bit e = negate element e);\n// value = d * (1 + 2 * sub_scale) * sign * grid byte. This thread owns pairs 2*half_ and 2*half_+1 (16 elements).',
     body='''const uint IQ3_S_BLOCK_BYTES = 110u;
+
+uint readEvenHalf(uint absByteOff) {
+    return (weight[absByteOff >> 2u] >> ((absByteOff & 2u) * 8u)) & 0xFFFFu;
+}
 
 struct Stage { uint dq; uint qs4; uint sg2; uint misc; vec4 bv; };   // dq: d bits | ib32<<16; qs4: 4 qs bytes; sg2: 2 sign bytes; misc: qh | scaleByte<<8
 
@@ -313,11 +320,12 @@ struct Stage { uint dq; uint qs4; uint sg2; uint misc; vec4 bv; };   // dq: d bi
         uint s = sb * 2u + blk;            // 32-element sub-block index along K
         uint base = rowBase + (s >> 3u) * IQ3_S_BLOCK_BYTES;
         uint ib32 = s & 7u;
-        uint d = readHalfBits(base);
+        uint d = readEvenHalf(base);
         uint qso = base + 2u + ib32 * 8u + half_ * 4u;
-        st.qs4 = readByte(qso) | (readByte(qso + 1u) << 8u) | (readByte(qso + 2u) << 16u) | (readByte(qso + 3u) << 24u);
-        uint sgo = base + 74u + ib32 * 4u + half_ * 2u;
-        st.sg2 = readByte(sgo) | (readByte(sgo + 1u) << 8u);
+        uint qi = qso >> 2u;
+        uint qsh = (qso & 2u) * 8u;                          // 0 or 16
+        st.qs4 = (weight[qi] >> qsh) | ((weight[qi + 1u] << 1u) << (31u - qsh));
+        st.sg2 = readEvenHalf(base + 74u + ib32 * 4u + half_ * 2u);
         st.misc = readByte(base + 66u + ib32) | (readByte(base + 106u + (ib32 >> 1u)) << 8u);
         st.dq = d | (ib32 << 16u);
     }
