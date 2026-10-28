@@ -2270,6 +2270,9 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         else
             downKernel!.Record(cmdBuf, moeW.W2Bank, _state.MoeSiluInter, _state.MoeGroupOffsets, _state.MoeExpandedInput,
                 m: hidden, k: interm, rows: expandedRows, numExperts: numE, maxRowsPerExpert: seqLen);
+        } // end else (!useMmq)
+        // Shared by the MMQ and coopmat arms (#1351): the barrier that publishes the down output and the unfused ungroup used to sit INSIDE
+        // the coopmat else-block (a merge-resolution slip, bcfb6804), so the MMQ arm raced the combine and skipped the ungroup.
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("grouped_down");
         if (!fusedGlue)
@@ -2277,7 +2280,6 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             _kernels.MoeUngroupScatter!.Record(cmdBuf, _state.MoeExpandedInput, _state.MoeGroupPerm, _state.MoeDownRows, rows: expandedRows, hidden: hidden);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
             MoeStage("ungroup");
-        }
         }
     }
 
