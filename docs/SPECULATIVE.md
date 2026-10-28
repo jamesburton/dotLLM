@@ -1371,3 +1371,7 @@ expert -> `nextn.shared_head_norm` -> the trunk's LM head. Absorb computes K/V o
   Round anatomy (K=3, with snapshots): draft 7.5 ms, verify 38 ms (4 rows; 20 ms for 1), a fully accepted round ~47 ms for 4 tokens. Greedy
   output equalled plain decode on 2 of 12 runs (llama.cpp: 1 of 4 at K=3): the multi-row routed-MoE / Q8_1 kernels are not bit-identical to the
   fused single-token decode chain, so near-ties resolve differently. Making the verify exact and cheaper is the follow-up.
+
+## Gumbel-coupled sampled verification (#1358, CPU reference)
+
+Opt-in (`InferenceOptions.GumbelSampling` or `DOTLLM_GUMBEL_SAMPLING=1`; default off because it changes which tokens a seed yields). A stochastic token is drawn as `argmax_i(prepared_logit_i + G(seed, n, i))`, n = generation index (`generatedIds.Count`), G = Philox4x32-10 noise from a 24-bit uniform (`GumbelNoise`; a 32-bit conversion rounds to u = 1 and gives +inf noise). `prepared` is the output of `SamplerPipeline.PrepareDistribution` (penalties, temperature, top-k/p, min-p, constraint mask), so excluded tokens never win and the draw is exactly softmax(prepared). A verify row accepts draft d iff d equals the row own sample: P(accept) = p(d), same as rejection sampling for point-mass drafts, and the emitted token is the one plain decoding draws for that seed, so speculative text equals plain text (tests: GumbelSpeculativeSamplingTests). T = 0 unchanged. The device-side (Vulkan) sampler that removes the per-row logits readback is not built yet.
