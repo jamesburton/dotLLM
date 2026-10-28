@@ -1111,7 +1111,7 @@ Strix (Vulkan):
 
 These runs used Bolt 24GB with the real LiLiCorr drafter on Strix Halo 8060S. Each figure is the median of 3 interleaved reps:
 128 greedy tokens, `DOTLLM_MTP_ADAPTIVE=0`, K = 7 drafts (`--spec-draft-n-max 7` for llama.cpp master 0ae0e1976 Vulkan).
-p0 is prose ("The history of the printing press began in"); p1 is code (Python quicksort).
+p0 is the high-acceptance prompt and p1 the low-acceptance one. Reproduced in #1368: the prose prompt "The history of the printing press began in" gives 3.25-3.75 tokens/round and 21-22 tok/s on every build from #1237 to dev (so it is p1), and a code prompt ("def quicksort(arr):") gives 7.9 tokens/round and ~41 tok/s (p0). The p0/p1 labels in these tables originally said the opposite; the numbers are right.
 
 | Strix 8060S, Bolt 24GB | p0 tok/s | p1 tok/s | tokens/round | peak private / GPU-shared MiB |
 |---|---|---|---|---|
@@ -1147,7 +1147,7 @@ is bit-identical to the one-column decode dispatch. Rows per workgroup for verif
 (`DOTLLM_VK_NEMOTRON_GEMV_ROWS=decode,verify` overrides; `DOTLLM_VK_NEMOTRON_EXACT_GEMV=0` restores #1237's per-column GEMVs). The
 opt-in NVFP4 MMVQ keeps NVFP4 decode, as before. No new buffers.
 
-Strix 8060S, Bolt 24GB + LiLiCorr, K = 7, 128 greedy tokens, medians of 3 interleaved reps (p0 prose, p1 code):
+Strix 8060S, Bolt 24GB + LiLiCorr, K = 7, 128 greedy tokens, medians of 3 interleaved reps (p0 code, p1 prose; labels corrected in #1368):
 
 | `DOTLLM_VK_NEMOTRON_PROFILE`, ms over all layers | 8-row verify before | after | 3-row verify before | after | decode before | after |
 |---|---|---|---|---|---|---|
@@ -1167,7 +1167,7 @@ Strix 8060S, Bolt 24GB + LiLiCorr, K = 7, 128 greedy tokens, medians of 3 interl
 | llama.cpp `draft-dflash` + LiLiCorr | 60.22 | 29.38 | | 24,970 / 24,068 |
 
 Every dotLLM run (plain and speculative, before and after, both verify modes) produced the same text. Speculation now beats plain
-on prose (1.44x) but not on code (3.3-3.75 tokens/round). The round is now half draft: about 45 ms of each draft is the host-side
+on code (1.44x) but not on prose (3.3-3.75 tokens/round). The round is now half draft: about 45 ms of each draft is the host-side
 LiLiCorr head (`select` in `DOTLLM_DFLASH_TRACE`). The verify (81 ms) is 2.5x a 32.6 ms decode step; the rest of it is the indexed
 routed experts, which barely share expert reads across 8 tokens (top-k routing over 240 experts). The read-only verify beats the
 pre-verify copy by ~2 ms per round and 180 MiB.
