@@ -165,7 +165,7 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
 
         int lastToken = generatedIds[^1];
 
-        long roundStart = Stopwatch.GetTimestamp();
+        long roundStart = EngineClock.GetTimestamp();
         long draftTicks = 0;
         long verifyTicks = 0;
 
@@ -188,17 +188,17 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
             {
                 for (int i = 0; i < k; i++)
                 {
-                    long fwdStart = Stopwatch.GetTimestamp();
+                    long fwdStart = EngineClock.GetTimestamp();
                     if (draftArgMax)
                     {
                         draftToken = targetModel.ForwardMtpArgMax(mtpState, draftToken, position + i);
-                        draftTicks += Stopwatch.GetTimestamp() - fwdStart;
+                        draftTicks += EngineClock.GetTimestamp() - fwdStart;
                         DraftArgMaxSteps++;
                     }
                     else
                     {
                         using ITensor draftLogits = targetModel.ForwardMtp(mtpState, draftToken, position + i);
-                        draftTicks += Stopwatch.GetTimestamp() - fwdStart;
+                        draftTicks += EngineClock.GetTimestamp() - fwdStart;
 
                         unsafe
                         {
@@ -252,13 +252,13 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
                 verifyPositions[i + 1] = position + i + 1;
             }
 
-            long verifyStart = Stopwatch.GetTimestamp();
+            long verifyStart = EngineClock.GetTimestamp();
             using ITensor targetLogits = rowSnapshots
                 ? targetModel.ForwardWithRecurrentSnapshots(
                     verifyTokens, verifyPositions, deviceId: -1, kvCacheTarget, mtpState)
                 : targetModel.Forward(
                     verifyTokens, verifyPositions, deviceId: -1, kvCacheTarget, adapter: null, mtpState);
-            verifyTicks += Stopwatch.GetTimestamp() - verifyStart;
+            verifyTicks += EngineClock.GetTimestamp() - verifyStart;
 
             int accepted = 0;       // drafts accepted
             int acceptedCount = 0;  // tokens written to outputBuffer (accepted drafts + correction/bonus)
@@ -345,7 +345,7 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
                     deviceId: -1, kvCacheTarget, adapter: null, mtpState: null);
             }
 
-            long roundTicks = Stopwatch.GetTimestamp() - roundStart;
+            long roundTicks = EngineClock.GetTimestamp() - roundStart;
             if (MtpAdaptiveGate.TraceEnabled)
                 TraceRound(draftTicks, verifyTicks, roundTicks, acceptedCount);
             return new SpeculativeResult(acceptedCount, draftTicks, verifyTicks, k, roundTicks);

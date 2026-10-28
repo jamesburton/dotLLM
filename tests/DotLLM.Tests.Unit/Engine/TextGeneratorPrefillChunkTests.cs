@@ -100,20 +100,25 @@ public sealed class TextGeneratorPrefillChunkTests
         {
             if (mine.Value) lines.Enqueue(line); // parallel tests share the static sink; keep only this flow's lines
         };
-        RequestTimingLog.PulseInterval = TimeSpan.FromMilliseconds(5);
+        RequestTimingLog.PulseInterval = Timeout.InfiniteTimeSpan;   // no timer: the model ticks the pulse itself (#1314)
+        PrefillPulse? pulse = null;
+        RequestTimingLog.t_pulseCreated = p => pulse = p;
         try
         {
-            using var model = new RecordingModel(argmaxToken: 3) { DelayMs = 40 };
+            using var model = new RecordingModel(argmaxToken: 3) { OnPrefillForward = () => pulse?.Pulse() };
             new TextGenerator(model, new StubTokenizer(), prefillChunkSize: 2)
                 .Generate("prompt", new InferenceOptions { MaxTokens = 3, Temperature = 0f });
         }
         finally
         {
+            RequestTimingLog.t_pulseCreated = null;
             RequestTimingLog.Sink = previousSink;
             RequestTimingLog.PulseInterval = previousInterval;
         }
 
-        Assert.Contains(lines, l => l.StartsWith("prefill: ", StringComparison.Ordinal) && l.Contains($"/{PromptLen} tokens"));
+        // Five chunks of two: the pulse ticked before chunk i sees exactly 2*(i-1) tokens completed. Counts, not durations.
+        var progress = lines.Where(l => l.StartsWith("prefill: ", StringComparison.Ordinal)).Select(l => l.Split(' ')[1]).ToArray();
+        Assert.Equal(new[] { $"0/{PromptLen}", $"2/{PromptLen}", $"4/{PromptLen}", $"6/{PromptLen}", $"8/{PromptLen}" }, progress);
         var timing = Assert.Single(lines, l => l.StartsWith("timing: ", StringComparison.Ordinal));
         Assert.Contains($"/ {PromptLen} tokens", timing);
     }
@@ -217,8 +222,8 @@ public sealed class TextGeneratorPrefillChunkTests
 
         public List<ForwardCall> Calls { get; } = new();
 
-        /// <summary>Simulated compute time per prefill Forward (multi-token calls only).</summary>
-        public int DelayMs { get; init; }
+        /// <summary>Called at the start of each prefill Forward (multi-token calls only).</summary>
+        public Action? OnPrefillForward { get; init; }
 
         public RecordingModel(int argmaxToken) => _argmaxToken = argmaxToken;
 
@@ -244,8 +249,8 @@ public sealed class TextGeneratorPrefillChunkTests
             int deviceId, IKvCache? kvCache)
         {
             Calls.Add(new ForwardCall(tokenIds.Length, positions[0]));
-            if (DelayMs > 0 && tokenIds.Length > 1)
-                Thread.Sleep(DelayMs);
+            if (tokenIds.Length > 1)
+                OnPrefillForward?.Invoke();
 
             int batchSize = tokenIds.Length;
             long totalFloats = (long)batchSize * VocabSize;

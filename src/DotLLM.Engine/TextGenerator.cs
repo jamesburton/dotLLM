@@ -543,7 +543,7 @@ public sealed partial class TextGenerator
             int prefillLen = promptLen - prefillStart;
 
             int firstTokenId;
-            long ts0 = Stopwatch.GetTimestamp();
+            long ts0 = EngineClock.GetTimestamp();
 
             using (var prefillSpan = telemetry.StartPrefill())
             {
@@ -560,14 +560,14 @@ public sealed partial class TextGenerator
                         prefillTicks = handoff.PrefillTicks;
 
                         using var sampleSpan = telemetry.StartSample();
-                        long samplerStart = Stopwatch.GetTimestamp();
+                        long samplerStart = EngineClock.GetTimestamp();
                         var logitSpan = handoff.LastLogits.AsSpan(0, vocabSize);
                         if (constraint != null)
                             TokenMaskApplier.Apply(logitSpan, constraint.GetAllowedTokens());
                         var (tid, lp) = SampleWithLogprobs(logitSpan);
                         firstTokenId = tid;
                         if (lp.HasValue) logprobsList!.Add(lp.Value);
-                        samplerTicks += Stopwatch.GetTimestamp() - samplerStart;
+                        samplerTicks += EngineClock.GetTimestamp() - samplerStart;
                     }
                     finally
                     {
@@ -582,13 +582,13 @@ public sealed partial class TextGenerator
                         snapshotAt, (position, isBoundary) => { if (TakeRecurrentCheckpoint(promptIds, position, isBoundary, kvCache, mtpState)) ownsKvCache = false; },
                         _requestStepTokens, cancellationToken))
                     {
-                        long ts1 = Stopwatch.GetTimestamp();
+                        long ts1 = EngineClock.GetTimestamp();
                         prefillTicks = ts1 - ts0;
 
                         unsafe
                         {
                             using var sampleSpan = telemetry.StartSample();
-                            long samplerStart = Stopwatch.GetTimestamp();
+                            long samplerStart = EngineClock.GetTimestamp();
                             // GPU/hybrid models return [1, vocabSize] (last token only);
                             // CPU model returns [seqLen, vocabSize]. Use actual shape to index.
                             float* logitPtr = (float*)prefillLogits.DataPointer;
@@ -599,7 +599,7 @@ public sealed partial class TextGenerator
                             var (tid, lp) = SampleWithLogprobs(logitSpan);
                             firstTokenId = tid;
                             if (lp.HasValue) logprobsList!.Add(lp.Value);
-                            samplerTicks += Stopwatch.GetTimestamp() - samplerStart;
+                            samplerTicks += EngineClock.GetTimestamp() - samplerStart;
                         }
                     }
                 }
@@ -608,20 +608,20 @@ public sealed partial class TextGenerator
                     // 100% cache hit — re-forward last prompt token to get logits
                     using (ITensor logits = _model.Forward([promptIds[^1]], [promptLen - 1], deviceId: -1, kvCache, adapter))
                     {
-                        long ts1 = Stopwatch.GetTimestamp();
+                        long ts1 = EngineClock.GetTimestamp();
                         prefillTicks = ts1 - ts0;
 
                         unsafe
                         {
                             using var sampleSpan = telemetry.StartSample();
-                            long samplerStart = Stopwatch.GetTimestamp();
+                            long samplerStart = EngineClock.GetTimestamp();
                             var logitSpan = new Span<float>((void*)logits.DataPointer, vocabSize);
                             if (constraint != null)
                                 TokenMaskApplier.Apply(logitSpan, constraint.GetAllowedTokens());
                             var (tid, lp) = SampleWithLogprobs(logitSpan);
                             firstTokenId = tid;
                             if (lp.HasValue) logprobsList!.Add(lp.Value);
-                            samplerTicks += Stopwatch.GetTimestamp() - samplerStart;
+                            samplerTicks += EngineClock.GetTimestamp() - samplerStart;
                         }
                     }
                 }
@@ -902,22 +902,22 @@ public sealed partial class TextGenerator
                     int lastToken = generatedIds[^1];
                     int nextTokenId;
 
-                    long fwdStart = Stopwatch.GetTimestamp();
+                    long fwdStart = EngineClock.GetTimestamp();
                     using (ITensor logits = _model.Forward([lastToken], [pos], deviceId: -1, kvCache, adapter))
                     {
-                        decodeTicks += Stopwatch.GetTimestamp() - fwdStart;
+                        decodeTicks += EngineClock.GetTimestamp() - fwdStart;
 
                         unsafe
                         {
                             using var sampleSpan = telemetry.StartSample();
-                            long samplerStart = Stopwatch.GetTimestamp();
+                            long samplerStart = EngineClock.GetTimestamp();
                             var logitSpan = new Span<float>((void*)logits.DataPointer, vocabSize);
                             if (constraint != null)
                                 TokenMaskApplier.Apply(logitSpan, constraint.GetAllowedTokens());
                             var (tid, lp) = SampleWithLogprobs(logitSpan);
                             nextTokenId = tid;
                             if (lp.HasValue) logprobsList!.Add(lp.Value);
-                            samplerTicks += Stopwatch.GetTimestamp() - samplerStart;
+                            samplerTicks += EngineClock.GetTimestamp() - samplerStart;
                         }
                     }
 
@@ -1117,7 +1117,7 @@ public sealed partial class TextGenerator
 
             int firstTokenId;
             TokenLogprobInfo? firstLogprobInfo = null;
-            long ts0 = Stopwatch.GetTimestamp();
+            long ts0 = EngineClock.GetTimestamp();
 
             using (var prefillSpan = telemetry.StartPrefill())
             {
@@ -1131,12 +1131,12 @@ public sealed partial class TextGenerator
                         prefillTicks = handoff.PrefillTicks;
 
                         using var sampleSpan = telemetry.StartSample();
-                        long samplerStart = Stopwatch.GetTimestamp();
+                        long samplerStart = EngineClock.GetTimestamp();
                         var logitSpan = handoff.LastLogits.AsSpan(0, vocabSize);
                         if (constraint != null)
                             TokenMaskApplier.Apply(logitSpan, constraint.GetAllowedTokens());
                         (firstTokenId, firstLogprobInfo) = SampleWithLogprobs(logitSpan);
-                        samplerTicks += Stopwatch.GetTimestamp() - samplerStart;
+                        samplerTicks += EngineClock.GetTimestamp() - samplerStart;
                     }
                     finally
                     {
@@ -1151,13 +1151,13 @@ public sealed partial class TextGenerator
                         snapshotAt, (position, isBoundary) => { if (TakeRecurrentCheckpoint(promptIds, position, isBoundary, kvCache, mtpState)) ownsKvCache = false; },
                         _requestStepTokens, cancellationToken))
                     {
-                        long ts1 = Stopwatch.GetTimestamp();
+                        long ts1 = EngineClock.GetTimestamp();
                         prefillTicks = ts1 - ts0;
 
                         unsafe
                         {
                             using var sampleSpan = telemetry.StartSample();
-                            long samplerStart = Stopwatch.GetTimestamp();
+                            long samplerStart = EngineClock.GetTimestamp();
                             // GPU/hybrid models return [1, vocabSize] (last token only);
                             // CPU model returns [seqLen, vocabSize]. Use actual shape to index.
                             float* logitPtr = (float*)prefillLogits.DataPointer;
@@ -1166,7 +1166,7 @@ public sealed partial class TextGenerator
                             if (constraint != null)
                                 TokenMaskApplier.Apply(logitSpan, constraint.GetAllowedTokens());
                             (firstTokenId, firstLogprobInfo) = SampleWithLogprobs(logitSpan);
-                            samplerTicks += Stopwatch.GetTimestamp() - samplerStart;
+                            samplerTicks += EngineClock.GetTimestamp() - samplerStart;
                         }
                     }
                 }
@@ -1175,18 +1175,18 @@ public sealed partial class TextGenerator
                     // 100% cache hit — re-forward last prompt token to get logits
                     using (ITensor logits = _model.Forward([promptIds[^1]], [promptLen - 1], deviceId: -1, kvCache, adapter))
                     {
-                        long ts1 = Stopwatch.GetTimestamp();
+                        long ts1 = EngineClock.GetTimestamp();
                         prefillTicks = ts1 - ts0;
 
                         unsafe
                         {
                             using var sampleSpan = telemetry.StartSample();
-                            long samplerStart = Stopwatch.GetTimestamp();
+                            long samplerStart = EngineClock.GetTimestamp();
                             var logitSpan = new Span<float>((void*)logits.DataPointer, vocabSize);
                             if (constraint != null)
                                 TokenMaskApplier.Apply(logitSpan, constraint.GetAllowedTokens());
                             (firstTokenId, firstLogprobInfo) = SampleWithLogprobs(logitSpan);
-                            samplerTicks += Stopwatch.GetTimestamp() - samplerStart;
+                            samplerTicks += EngineClock.GetTimestamp() - samplerStart;
                         }
                     }
                 }
@@ -1476,20 +1476,20 @@ public sealed partial class TextGenerator
                     int nextTokenId;
                     TokenLogprobInfo? tokenLogprob;
 
-                    long fwdStart = Stopwatch.GetTimestamp();
+                    long fwdStart = EngineClock.GetTimestamp();
                     using (ITensor logits = _model.Forward([lastToken], [pos], deviceId: -1, kvCache, adapter))
                     {
-                        decodeTicks += Stopwatch.GetTimestamp() - fwdStart;
+                        decodeTicks += EngineClock.GetTimestamp() - fwdStart;
 
                         unsafe
                         {
                             using var sampleSpan = telemetry.StartSample();
-                            long samplerStart = Stopwatch.GetTimestamp();
+                            long samplerStart = EngineClock.GetTimestamp();
                             var logitSpan = new Span<float>((void*)logits.DataPointer, vocabSize);
                             if (constraint != null)
                                 TokenMaskApplier.Apply(logitSpan, constraint.GetAllowedTokens());
                             (nextTokenId, tokenLogprob) = SampleWithLogprobs(logitSpan);
-                            samplerTicks += Stopwatch.GetTimestamp() - samplerStart;
+                            samplerTicks += EngineClock.GetTimestamp() - samplerStart;
                         }
                     }
 
@@ -1862,7 +1862,7 @@ public sealed partial class TextGenerator
 
         if (entry is not null && hit)
         {
-            long restoreStart = Stopwatch.GetTimestamp();
+            long restoreStart = EngineClock.GetTimestamp();
             int resumeAt = entry.Points[resumeIndex].Position;
             // This request overwrites the rows past the resume point, so the checkpoints past it are invalid.
             entry.TruncateTo(resumeAt);
