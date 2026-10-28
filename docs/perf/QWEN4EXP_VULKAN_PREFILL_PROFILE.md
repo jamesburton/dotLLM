@@ -96,3 +96,24 @@ pf 8192 0 3                 # throughput: total hist reps
 pf 8192 0 2 2               # GPU-timestamp stage profile
 perturb grouped_gate_up tile_list_build   # then pf ... 2 ; "perturb off" to clear
 ```
+
+## 6. Lever 1 follow-up: wider token tile for the grouped MoE GEMMs (#1348) - small, not a win
+
+Roofline, routing distribution and A/B measured 2026-10-27 (dev `310ceaee` + instruments), UD-IQ4_XS, F16 K/V, one process, GPU lock held.
+
+**The quant mix is not what section 4 assumed.** gate/up banks are IQ3_S in 47 of 48 layers (IQ4_XS in 1); down banks are IQ4_NL in 43 layers, Q8_0 in 5. The kernels on the path are `moe_grouped_matmul_iq3_s_coopmat_m64` and `..._iq4_nl_...`. Expert banks per layer: IQ3_S 360 MB, IQ4_NL 472 MB, Q8_0 891 MB.
+
+**Real routing (new profile-only counters, `pf ... prof=2`, wikitext, 1024-row chunk):** only **352 of 512 experts** get any row per layer-chunk. Experts by rows: 1-4: 111, 5-8: 47, 9-16: 54, 17-32: 59, 33-64: 48, 65-128: 21, 129+: 13. Tiles per layer-chunk by token-tile width: **16: 850, 32: 556, 48: 465, 64: 424, 128: 375**.
+
+**Roofline per 1024-row chunk (205 GB/s, 59 TFLOPS f16 coopmat peak):** gate/up 0.57 s measured vs 0.117 s weight-read floor (active experts once) / 0.28 s with 850 tiles and no cache reuse / 3.2 TFLOP = 10% of peak; down 0.32 s vs 0.083 s / 0.20 s / 1.6 TFLOP = 8%. Neither DRAM traffic nor MMA is the limiter; the rest is per-tile weight fetch + dequant + LDS staging + barriers (4 MMAs per 64-K round per subgroup).
+
+**Prototype** (branch `issue/1348-moe-grouped-token-tile-prototype`, not merged): generator-emitted `*_m64n32` variants for IQ3_S/IQ4_XS/IQ4_NL, 32 tokens per workgroup, two accumulators per subgroup sharing one dequantised A tile, second half skipped when the tile has <= 16 rows; `DOTLLM_VK_MOE_WIDE_TILE=1`, layer falls back to 16 unless gate/up AND down both have a wide variant. **Bit-identical** to the 16-token kernel: unit test (rows 0..128 around the 16/32 edges, legacy grid and indirect) asserts `==` and end-to-end `kl` over 2 last-row logit vectors gave meanKL 0, max|dlogit| 0, top-1 2/2.
+
+**Measurement (`pf`, 3 reps per call, same process, env flipped in-process; tok/s medians off -> on):**
+
+Session 1 (off then on within each pair; off -> on): 1K 428 -> 495 and 480 -> 496; 4K 383 -> 412 and 374 -> 398; 8K 340 -> 368 and 331 -> 333.
+Session 2 (on then off within each pair; on -> off): 4K 376 -> 380, 343 -> 330, 345 -> 337; 8K 320 -> 327, 295 -> 311; 2K 379 -> 348, 361 -> 362.
+
+Whichever variant ran second in a pair looked better in the first session (+3..+8%) and the reversed session showed 0..+4% for on, -5..-2% at 8K, with session drift of 15% (376 -> 330 tok/s at 4K over the run). Stage timestamps (prof=2, 4K, 2 reps, readback overhead included): grouped_gate_up 2841 -> 2688 ms (-5.4%), grouped_down 1583 -> 1531 ms (-3.3%), i.e. about 1.6% of wall. **Verdict: a real but marginal gain (about 1-3% of wall), inside the run-to-run drift of this box; not defensible as a win and not shipped.** The tile count falls 35% but stage time only 3-5%, so tile-proportional overhead is not the dominant cost either; the remaining time is inside the per-K-round dequant/LDS pipeline. Next candidates, untested: dequant fused into the MMA operand path with fewer LDS round trips (bigger K round than 64), or measuring VGPR/LDS occupancy of the m64 shaders with RGA before more tile-shape work.
+
+The only shipped change is the profile counters (`tilesT16..T128`, `activeExperts`, `expertsWithRows[...]`; counts, not ms, printed with the stage table).

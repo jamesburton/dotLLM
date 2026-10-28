@@ -1987,6 +1987,36 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     internal bool Q8GateUpMmvq { get; set; }
 
     /// <summary>
+    /// Profile-only (#1334/#1349): reads the per-expert group offsets back and accumulates how many tiles each candidate token-tile width
+    /// would need (sum of ceil(rows/T) over experts), the active-expert count and a rows-per-expert histogram, so the token-tile roofline
+    /// uses the real routing distribution. Keys are counts, not milliseconds. Never runs outside <c>MoeStageProfileEnabled</c>.
+    /// </summary>
+    private void ProfileRoutingDistribution(int numE)
+    {
+        Span<float> raw = numE + 1 <= 4096 ? stackalloc float[numE + 1] : new float[numE + 1];
+        _device.Download(_state.MoeGroupOffsets!, raw);
+        void Add(string key, long v) => _moeStageMs[key] = _moeStageMs.GetValueOrDefault(key) + v;
+        foreach (int t in new[] { 16, 32, 48, 64, 128 })
+        {
+            long tiles = 0;
+            for (int e = 0; e < numE; e++)
+            {
+                uint c = BitConverter.SingleToUInt32Bits(raw[e + 1]) - BitConverter.SingleToUInt32Bits(raw[e]);
+                tiles += (c + (uint)t - 1) / (uint)t;
+            }
+            Add($"tilesT{t}(count,not ms)", tiles);
+        }
+        for (int e = 0; e < numE; e++)
+        {
+            uint c = BitConverter.SingleToUInt32Bits(raw[e + 1]) - BitConverter.SingleToUInt32Bits(raw[e]);
+            if (c > 0) Add("activeExperts(count,not ms)", 1);
+            string bin = c == 0 ? "0" : c <= 4 ? "1-4" : c <= 8 ? "5-8" : c <= 16 ? "9-16" : c <= 32 ? "17-32" : c <= 64 ? "33-64" : c <= 128 ? "65-128" : "129+";
+            Add($"expertsWithRows[{bin}](count,not ms)", 1);
+        }
+        Add("tileLists(count,not ms)", 1);
+    }
+
+    /// <summary>
     /// Grouped-by-expert routed FFN (issue #637). Buffer reuse: MoeExpandedInput (broadcast rows) -> packed rows in MoeDownRows ->
     /// gate/up into MoeGateInter/MoeUpInter (packed order) -> SwiGLU -> grouped down into MoeExpandedInput (dead by now) -> ungroup into
     /// MoeDownRows in the original row order, which the weighted scatter then consumes unchanged.
@@ -2138,6 +2168,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 Span<float> raw = stackalloc float[6];
                 _device.Download(_state.MoeGroupDispatchArgs, raw);   // uint triples reinterpreted as float bits
                 _moeStageMs["tiles(count,not ms)"] = _moeStageMs.GetValueOrDefault("tiles(count,not ms)") + BitConverter.SingleToUInt32Bits(raw[1]);
+                ProfileRoutingDistribution(numE);
                 _moeStageLast = System.Diagnostics.Stopwatch.GetTimestamp();
             }
             if (iqGateUp is not null)
