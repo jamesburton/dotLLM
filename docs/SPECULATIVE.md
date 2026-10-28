@@ -1222,7 +1222,7 @@ Intermediate rows (Qwen3.8 / Bonsai-2 / Bolt, ms): 3 = 113.9 / 63.2 / 52.0, 6 = 
 
 Reading: Qwen3.8 and Bonsai-2 have a **cliff between 8 and 9 rows** (4x and 7x of the 8-row cost; the multi-column GEMVs cap at 8 columns and the
 next path is a fixed ~340-570 ms GEMM, issue #1365), so 16/32-row trees cannot be priced from the 1..8 slope. Bolt has no cliff but steepens past 12
-rows (issue #1366). On CPU the cliff is between 1 and 2 rows (issue #1367).
+rows (issue #1366). On CPU the cliff is between 1 and 2 rows (issue #1367). **Fixed in #1367** (CPU only): the 2..8-row GEMM took the scalar float PQ2_0 tier (per-element unpack + f32 dot) and the GDN scan was single-threaded scalar. Now small-n PQ2_0 takes the W2A8 tier in 4-token tiles (bit-identical per token to the decode GEMV) and the scan is head-parallel + Vector256 (bit-identical to the scalar walk). CPU Bonsai-2 PQ2_0, same harness, ms (min-max of 9 timings): 1 row 164-387 (noisy; was 234-276), 2 rows 295-363 (was 1271-2282), 4 rows 305-372 (1527-1659), 8 rows 493-639 (2085-2172), 16 rows 946-1196 (3355-4707), 32 rows 1822-1997 (6398-6858). Marginal row cost 8->16 is now ~55 ms (about 25% of a decode step) against 164 before.
 
 **Break-even tau gain.** A tree of the same depth as a K=7 chain pays the same draft but verifies N rows instead of 8. Break-even needs
 `g* = (draft + V(N)) / (draft + V(8)) - 1` more tokens per round than the chain. Draft = measured in-engine draft ms of the same run (below;
