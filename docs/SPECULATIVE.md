@@ -1374,6 +1374,24 @@ its dense projections are a minor share; the wide GEMVs recover 14-15 ms of it. 
 are unmeasurable; both hosts pass `hostMaxColumns: PQ2_0SmallNDispatch.UnvalidatedHostMaxColumns` (8) to `PQ2_0SmallNDispatch.Record`, which is the pre-#1365 behaviour. The
 dense qwen35 host keeps 16 (measured, #1365). Raise it per host once a PQ2_0 model is measured there.
 
+#### Q5_K / Q6_K / IQ4_XS / IQ3_S wide GEMVs (issue #1377)
+
+Q5_K, non-Rows Q6_K and IQ4_XS multi GEMVs now serve 9..16 columns (Q5_K / Q6_K already used `acc[NC]` arrays: only the pipelines were missing; the IQ4_XS generator
+`gen_iq_gemv_multi.py` emits 16 scalar accumulators). Every column keeps the single-row kernel's accumulation order but is **not bit-equal** across NC
+(per-NC specialisation changes FMA contraction: ~1e-7 relative); the parity tests compare to the single-row kernels (2e-3 + 1e-4 rel) and to the 8-column dispatch (1e-4 + 1e-5 rel).
+Kernel timing (`Bench_WideColumns`, `DOTLLM_GEMV_WIDE_BENCH=1`, device-local weights, min of 5 x 20 dispatches; us):
+
+| format, shape | 1x8 | 2x8 | 1x12 | 1x16 |
+|---|---|---|---|---|
+| Q5_K 17408x5120 | 768 | 1497 | 1016 | 1299 |
+| Q6_K 5120x6144 | 288 | 542 | 373 | 531 |
+| IQ4_XS 17408x5120 | 712 | 1441 | 894 | 1390 |
+| IQ3_S 17408x5120 (probe only) | 1937 | 3793 | 18248 | 23352 |
+
+Q5_K / Q6_K / IQ4_XS 16 columns cost about the same as two 8-column dispatches (4-13% less) and avoid the GEMM fallback. **IQ3_S is refuted**: 12 / 16 columns are 10x slower than two
+8-column dispatches (register spill in the scalar-accumulator shader), so IQ3_S stays capped at 8 (`MaxColumnsFor`); the generator keeps `IQ3S_COLS = 8`.
+The end-to-end 9..16-row verify on a Q5_K / IQ4_XS file was not measured (no such hybrid model locally); the kernel-level numbers above are the evidence.
+
 ### `qwen35moe` MTP head (issue #1188)
 
 Qwen3.6-35B-A3B ships its MTP block embedded (`blk.40`, `nextn_predict_layers = 1`; `ggml-org/Qwen3.6-35B-A3B-MTP-GGUF`,
