@@ -39,6 +39,12 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
     /// </summary>
     public const int MaxColumns = 8;
 
+    /// <summary>
+    /// Issue #1365 — the widest multi-row variant. 9..16 columns exist only as multi-row kernels, so they need <see cref="UsesMultiRow"/>;
+    /// the #470 kernels stop at <see cref="MaxColumns"/>.
+    /// </summary>
+    public const int WideMaxColumns = 16;
+
     /// <summary>Column counts with a compiled <c>matmul_pq2_0_f32_gemv_multicol_{n}.spv</c>, ascending.</summary>
     private static readonly int[] MultiColumnWidths = [2, 3, 4, 5, 6, 7, 8];
 
@@ -67,6 +73,16 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
 
     private const int MultiRowRows = 4;
 
+    /// <summary>
+    /// Output rows per workgroup of the 9..16-column kernels (<c>matmul_pq2_0_f32_gemv_mr_r4_c{9..16}_b1_w64</c>). Measured at 9/12/16 columns on
+    /// Bonsai-2 (Strix, whole verify forward, ms): 1 row 172/240/341, 2 rows 123/159/210, 4 rows 103/127/163. More rows share each activation
+    /// load, which dominates at this column count; 4 x 16 = 64 outputs is also all the 64-lane store covers.
+    /// </summary>
+    private const int WideRows = 4;
+
+    /// <summary>SPIR-V of the 9..16-column kernel.</summary>
+    private static string WideSpvName(int columns) => $"matmul_pq2_0_f32_gemv_mr_r{WideRows}_c{columns}_b1_w64.spv";
+
     /// <summary>Environment variable; <c>0</c> disables the #474 multi-row kernels (read once).</summary>
     public const string MultiRowEnvVar = "DOTLLM_VK_PQ2_0_MULTIROW";
 
@@ -89,6 +105,12 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
 
     /// <summary>Whether this instance records the #474 multi-row kernels.</summary>
     internal bool UsesMultiRow => MultiRowOverride ?? MultiRowGlobalOverride ?? MultiRowFromEnv;
+
+    /// <summary>
+    /// Largest column count <see cref="RecordColumns"/> serves on this instance now: the multi-row family's (8, plus 9..16 when those
+    /// kernels loaded) while <see cref="UsesMultiRow"/>, else the #470 kernels' <see cref="MaxColumns"/>.
+    /// </summary>
+    public int MaxColumnsAvailable => UsesMultiRow ? _multiRow.Length : MaxColumns;
 
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
@@ -176,6 +198,12 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
                 multiColumn.Add(CreateMultiColumn(device, spvDir, width));
             for (int c = 1; c <= MultiRowSpvNames.Length; c++)
                 multiRow.Add(PQ2_0GemvMultiRowPipeline.Create(device, spvDir, MultiRowSpvNames[c - 1], MultiRowRows, c));
+            // #1365: 9..16 columns. Optional so an install with a stale spv directory degrades to the GEMM beyond 8, as before.
+            for (int c = MaxColumns + 1; c <= WideMaxColumns; c++)
+            {
+                if (!File.Exists(Path.Combine(spvDir, WideSpvName(c)))) break;
+                multiRow.Add(PQ2_0GemvMultiRowPipeline.Create(device, spvDir, WideSpvName(c), WideRows, c));
+            }
         }
         catch
         {
@@ -385,7 +413,7 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
         VulkanDevice.Buffer weightsPQ2_0, VulkanDevice.Buffer x, VulkanDevice.Buffer y,
         int m, int k, int columns, int xOffsetElements = 0, int yOffsetElements = 0)
     {
-        if (columns < 1 || columns > MaxColumns) throw new ArgumentOutOfRangeException(nameof(columns));
+        if (columns < 1 || columns > MaxColumnsAvailable) throw new ArgumentOutOfRangeException(nameof(columns));
         if (columns == 1)
         {
             Record(cmdBuf, weightsPQ2_0, x, y, m, k, xOffsetElements, yOffsetElements);
