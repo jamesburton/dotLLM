@@ -162,3 +162,18 @@ reason for any difference). The change is in the shared IQ3_S body, so the 16-to
 
 *Throughput* (`pf 4096`, new/base per block, blocks in both orders): 1.003, 1.035, 1.067 (base first); 1.017, 1.030, 1.045 (new first). Mean **1.033**. A first 2-call
 smoke gave 1.025. Consistent with section 6: removing the weight loads outright was -33% of gate/up, so trimming their issue count buys a few percent, not the whole third.
+
+### 7.2 Q8_0 down: 32-token tile for the 5 Q8_0-down layers (#1354) - +5% (range 0.3..9.3%), shipped
+
+`n32diet` was on only where gate/up and down both had the variant, so the 5 qwen4exp layers with a Q8_0 down bank (891 MB each) stayed on 16-token tiles. The generator now derives
+`moe_grouped_matmul_q8_0_coopmat_m64n32diet.comp` from the hand-written Q8_0 shader with the same wide/diet transform (the per-expert scale epilogue is kept); same 14,848 B LDS
+as the IQ variants. `MoeGroupedMatmulLegacyQuantCoopmatKernel` loads it as a variant (`RowTile` 32) and `RecordGroupedExperts` pairs it with an `n32diet` IQ gate/up on Q8_0-down
+layers. `DOTLLM_VK_MOE_IQ_VARIANT=off` still restores every 16-token kernel (the Q8_0 variant only exists inside the variant branch); `DOTLLM_VK_MOE_Q8_DOWN_WIDE=0` turns off just
+the Q8_0 piece for A/B.
+
+*Path proof:* the profile's `tiles(count)` for a 2048-token prefill is 54,269 with the Q8_0 variant on (all 48 layers at 32 tokens) and higher with `DOTLLM_VK_MOE_Q8_DOWN_WIDE=0`
+(the 5 Q8_0 layers back at 16-token tiles).
+*Parity:* `Q8_0_WideVariant_IsBitIdenticalToNarrow` - bitwise equal to the 16-token kernel on the legacy grid and the indirect tile list, scale epilogue on and off, expert row counts
+0..128 around the 16/32 edges, K up to 704; end-to-end last-row logits meanKL 0 / max|dlogit| 0.
+*Throughput* (`pf 4096`, `Q8_DOWN_WIDE` 1/0, ABBA blocks): 1.003, 1.056, 1.093; mean **1.05**. The ceiling is small (5 of 48 layers) but those layers carry the largest bank, so the
+share is bigger than 5/48; the first block's drift in the base arm is why the range is wide.

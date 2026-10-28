@@ -571,6 +571,7 @@ struct Stage { uint sw0; uint sw1; uint qs2; uint qhb; uint ib; vec4 bv; };   //
     }
 ''' + B_COMMIT)
 
+
 SHADERS = [IQ4_NL, IQ4_XS, IQ3_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, Q2_0, IQ1_M, Q4_0, Q4_1]
 
 
@@ -610,8 +611,8 @@ def _rep(text, old, new):
     return text.replace(old, new)
 
 
-def render_wide(spec):
-    h = render(spec)
+def render_wide(spec, h=None):
+    h = render(spec) if h is None else h
     h = _rep(h, '// Grouped ' + spec['fmt'] + ' MoE expert matmul',
              '// WIDE-TOKEN-TILE variant (issue #1348): 32 tokens per workgroup (two 16-token MMA halves per A fragment).\n// Grouped ' + spec['fmt'] + ' MoE expert matmul')
     h = _rep(h, 'shared float16_t sharedB[TN * STRIDE];',
@@ -749,8 +750,109 @@ VARIANTS = {
 }
 
 
-def render_variant(spec, wide, diet, ballast):
-    h = render_wide(spec) if wide else render(spec)
+def render_nt(spec, nt, base=None):
+    """Issue #1353: the diet form for ANY token-tile width of NT 16-token MMA halves (NT=2 reproduces `n32diet` byte for byte; NT=3 -> 48 tokens,
+    NT=4 -> 64 tokens). Every extra half costs one more staged activation vec4 per thread, one more MMA per A fragment and 2.25 KB of LDS."""
+    assert nt in (2, 3, 4)
+    h = render(spec) if base is None else base
+    toks = 16 * nt
+    h = _rep(h, '// Grouped ' + spec['fmt'] + ' MoE expert matmul',
+             '// WIDE-TOKEN-TILE variant (issue #1348' + (', NT=%d: issue #1353' % nt if nt != 2 else '') + '): %d tokens per workgroup (%s 16-token MMA halves per A fragment).\n// Grouped ' % (toks, {2: 'two', 3: 'three', 4: 'four'}[nt]) + spec['fmt'] + ' MoE expert matmul')
+    h = _rep(h, 'shared float16_t sharedB[TN * STRIDE];',
+             'const uint NT = %du;                 // 16-token halves per workgroup (%d tokens)\nshared float16_t sharedB[NT * TN * STRIDE];' % (nt, toks))
+    h = _rep(h, 'shared float storeStage[NSG * TM * TN];', 'shared float storeStage[TM * TN];')
+    # B staging: thread owns column group c4 of NT activation rows 16 apart.
+    bl = '    uint bRow = tid >> 4u;\n    uint c4 = tid & 15u;\n'
+    for j in range(nt):
+        sfx = '' if j == 0 else str(j + 1)
+        if j == 0:
+            bl += '    st.bv  = (localRowBase + bRow)  < expertRows ? x4[xRowBase4 + bRow  * (pc.K / 4u) + sb * (SB / 4u) + c4] : vec4(0.0);\n'
+        else:
+            bl += '    uint bRow%d = bRow + %du;\n' % (j + 1, 16 * j)
+            bl += '    st.bv%d = (localRowBase + bRow%d) < expertRows ? x4[xRowBase4 + bRow%d * (pc.K / 4u) + sb * (SB / 4u) + c4] : vec4(0.0);\n' % (j + 1, j + 1, j + 1)
+    bl += '}\n'
+    if nt == 2:
+        bl = B_LOAD_WIDE
+    h = _rep(h, B_LOAD, bl)
+    bc = '    uint bRow = tid >> 4u;\n    uint c4 = tid & 15u;\n    uint o = bRow * STRIDE + c4 * 4u;\n'
+    bc += ''.join('    sharedB[o%s] = float16_t(st.bv.%s);\n' % ('' if i == 0 else ' + %du' % i, c) for i, c in enumerate('xyzw'))
+    for j in range(1, nt):
+        bc += '    uint o%d = o + %du * STRIDE;\n' % (j + 1, 16 * j)
+        bc += ''.join('    sharedB[o%d%s] = float16_t(st.bv%d.%s);\n' % (j + 1, '' if i == 0 else ' + %du' % i, j + 1, c) for i, c in enumerate('xyzw'))
+    bc += '}\n'
+    if nt == 2:
+        bc = B_COMMIT_WIDE
+    h = _rep(h, B_COMMIT, bc)
+    h = _rep(h, 'vec4 bv; }', 'vec4 bv; ' + ' '.join('vec4 bv%d;' % (j + 1) for j in range(1, nt)) + ' }')
+    h = _rep(h, 'localRowBase = gl_WorkGroupID.y * TN;', 'localRowBase = gl_WorkGroupID.y * (NT * TN);')
+    acc = '''    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> sums =
+        coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
+'''
+    accs = acc
+    for j in range(1, nt):
+        accs += '''    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> sums%d =
+        coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
+''' % (j + 1)
+    if nt == 2:
+        accs += '    bool second = (localRowBase + TN) < expertRows;   // workgroup-uniform: tokens 16..31 exist\n'
+    else:
+        for j in range(1, nt):
+            accs += '    bool half%d = (localRowBase + %du) < expertRows;   // workgroup-uniform: tokens %d..%d exist\n' % (j + 1, 16 * j, 16 * j, 16 * j + 15)
+    h = _rep(h, acc, accs)
+    mma = '            sums = coopMatMulAdd(aTile, bTile, sums);\n'
+    mmas = mma
+    for j in range(1, nt):
+        cond = 'second' if nt == 2 else 'half%d' % (j + 1)
+        mmas += '''            if (%s) {
+                coopMatLoad(bTile, sharedB, %s * STRIDE + kSlice, STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+                sums%d = coopMatMulAdd(aTile, bTile, sums%d);
+            }
+''' % (cond, 'TN' if j == 1 else '%d * TN' % j, j + 1, j + 1)
+    h = _rep(h, mma, mmas)
+    # diet epilogue: one 1 KB tile reused by the four subgroups in turn, one 16-token half at a time.
+    a = h.index('    coopMatStore(sums, storeStage, sg * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);')
+    b = h.rindex('}')
+    ep = '    for (uint sgi = 0u; sgi < NSG; sgi++) {\n        for (uint half16 = 0u; half16 < NT; half16++) {\n'
+    if nt == 2:
+        ep += '            if (half16 == 1u && !second) break;\n'
+    else:
+        ep += '            if (half16 > 0u && (localRowBase + half16 * TN) >= expertRows) break;\n'
+    ep += '            if (sg == sgi) {\n'
+    for j in range(nt):
+        kw = 'if' if j == 0 else 'else if'
+        ep += '                %s (half16 == %du) coopMatStore(sums%s, storeStage, 0u, TM, gl_CooperativeMatrixLayoutColumnMajor);\n' % (kw, j, '' if j == 0 else str(j + 1))
+    ep += '''            }
+            barrier();
+            if (sg == sgi) {
+                for (uint i = 0u; i < 4u; i++) {
+                    uint idx = lane64 + i * WAVE;
+                    if (idx >= TM * TN) break;
+                    uint localRowInTile = idx / TM;
+                    uint m = idx - localRowInTile * TM;
+                    uint lr = localRowBase + half16 * TN + localRowInTile;
+                    uint mG = mBase + sg * TM + m;
+                    if (lr < expertRows && mG < pc.M) {
+                        uint packedRow = expertStart + lr;
+                        y[packedRow * pc.M + mG] = storeStage[localRowInTile * TM + m];
+                    }
+                }
+            }
+            barrier();
+        }
+    }
+'''
+    if nt == 2:
+        # n32diet historic form: the three-branch store was an if/else pair.
+        ep = ep.replace('                if (half16 == 0u) coopMatStore(sums, storeStage, 0u, TM, gl_CooperativeMatrixLayoutColumnMajor);\n                else if (half16 == 1u) coopMatStore(sums2, storeStage, 0u, TM, gl_CooperativeMatrixLayoutColumnMajor);\n',
+                        '                if (half16 == 0u) coopMatStore(sums, storeStage, 0u, TM, gl_CooperativeMatrixLayoutColumnMajor);\n                else coopMatStore(sums2, storeStage, 0u, TM, gl_CooperativeMatrixLayoutColumnMajor);\n')
+    return h[:a] + ep + h[b:]
+
+
+NT_VARIANTS = {}   # wider token tiles through render_nt would go here (NT 16-token MMA halves)
+
+
+def render_variant(spec, wide, diet, ballast, base=None):
+    h = render_wide(spec, base) if wide else (render(spec) if base is None else base)
     if diet:
         h = _rep(h, 'shared float storeStage[NSG * NT * TM * TN];' if wide else 'shared float storeStage[NSG * TM * TN];',
                  'shared float storeStage[TM * TN];')
@@ -776,9 +878,24 @@ def render(spec):
     return h + '\n' + spec['body'] + MAIN
 
 
+def render_q8_0_wide(here, nt=2):
+    """Issue #1354: the 32-token diet variant of the hand-written Q8_0 down shader (the 5 qwen4exp layers whose down bank is Q8_0). The source shader is
+    read from disk; its per-expert scale multiply is lifted out before the shared wide/diet transforms and put back on the epilogue write."""
+    src = open(os.path.join(here, 'shaders', 'moe_grouped_matmul_q8_0_coopmat_m64.comp'), encoding='utf-8').read()
+    assert src.count('localRowInTile * TM + m] * scl;') == 1
+    base = src.replace('localRowInTile * TM + m] * scl;', 'localRowInTile * TM + m];')
+    base = base.replace('// Grouped Q8_0 MoE expert matmul', '// GENERATED variant (gen_moe_grouped_iq.py, issue #1354) of moe_grouped_matmul_q8_0_coopmat_m64.comp - edit that file or the generator.\n// Grouped Q8_0 MoE expert matmul', 1)
+    h = render_nt(dict(fmt='Q8_0'), nt, base)
+    assert h.count('storeStage[localRowInTile * TM + m];') == 1
+    return h.replace('storeStage[localRowInTile * TM + m];', 'storeStage[localRowInTile * TM + m] * scl;')
+
+
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     out = os.path.join(here, 'shaders')
+    for suffix, nt in (('n32diet', 2),):
+        with open(os.path.join(out, f'moe_grouped_matmul_q8_0_coopmat_m64{suffix}.comp'), 'w', encoding='utf-8', newline='\n') as f:
+            f.write(render_q8_0_wide(here, nt))
     for spec in SHADERS:
         path = os.path.join(out, f"moe_grouped_matmul_{spec['name']}_coopmat_m64.comp")
         with open(path, 'w', encoding='utf-8', newline='\n') as f:
@@ -789,6 +906,11 @@ def main():
                 wpath = os.path.join(out, f"moe_grouped_matmul_{spec['name']}_coopmat_m64{suffix}.comp")
                 with open(wpath, 'w', encoding='utf-8', newline='\n') as f:
                     f.write(render_variant(spec, wide, diet, ballast))
+                print('wrote', wpath)
+            for suffix, nt in NT_VARIANTS.items():
+                wpath = os.path.join(out, f"moe_grouped_matmul_{spec['name']}_coopmat_m64{suffix}.comp")
+                with open(wpath, 'w', encoding='utf-8', newline='\n') as f:
+                    f.write(render_nt(spec, nt))
                 print('wrote', wpath)
 
 

@@ -153,6 +153,9 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MoeGroupedMatmulLegacyQuantCoopmatKernel? MoeGroupedQ5_1 { get; private set; }
     /// <summary>Grouped coopmat Q8_0 prefill kernel (16-row tiles).</summary>
     public MoeGroupedMatmulLegacyQuantCoopmatKernel? MoeGroupedQ8_0 { get; private set; }
+    private readonly Dictionary<string, MoeGroupedMatmulLegacyQuantCoopmatKernel> _q8Wide = new();
+    /// <summary>#1354: the wide-tile Q8_0 grouped kernel for variant suffix <paramref name="variant"/> (<c>n32diet</c>), or null.</summary>
+    public MoeGroupedMatmulLegacyQuantCoopmatKernel? MoeGroupedQ8_0Wide(string variant) => _q8Wide.GetValueOrDefault(variant);
     /// <summary>16-row Q4_K grouped kernel, present only when <see cref="MoeGroupedQ4K"/> is the 32-row row-pair form: a layer whose down
     /// bank is legacy-quant (16-row tiles only) needs gate/up on the same 16-row tile list.</summary>
     public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ4K16 { get; private set; }
@@ -814,6 +817,9 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
                 kernels.MoeGroupedQ5_1 = MoeGroupedMatmulLegacyQuantCoopmatKernel.Create(device, spvDir, MoeGroupedLegacyQuant.Q5_1);
             if (MoeGroupedMatmulLegacyQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedLegacyQuant.Q8_0))
                 kernels.MoeGroupedQ8_0 = MoeGroupedMatmulLegacyQuantCoopmatKernel.Create(device, spvDir, MoeGroupedLegacyQuant.Q8_0);
+            foreach (var wv in MoeGroupedMatmulLegacyQuantCoopmatKernel.WideVariants)
+                if (MoeGroupedMatmulLegacyQuantCoopmatKernel.IsVariantSupportedOn(device, spvDir, MoeGroupedLegacyQuant.Q8_0, wv))
+                    kernels._q8Wide[wv] = MoeGroupedMatmulLegacyQuantCoopmatKernel.Create(device, spvDir, MoeGroupedLegacyQuant.Q8_0, wv);
             // #823: grouped IQ kernels (16-row tiles). DOTLLM_VK_MOE_IQ_GROUPED=0 leaves IQ banks on the MMVQ path for every row count.
             if (Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_IQ_GROUPED") != "0")
             {
@@ -1020,6 +1026,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeIndexedMatmulQ5_1?.InvalidateDescriptorCache();
         MoeIndexedMatmulQ8_0?.InvalidateDescriptorCache();
         foreach (var gk in _iqGrouped.Values) gk.InvalidateDescriptorCache();
+        foreach (var gk in _iqGroupedVariants.Values) gk.InvalidateDescriptorCache();
         foreach (var mk in _iqMmvq.Values) mk.InvalidateDescriptorCache();
         MoeMmvqQ5_1?.InvalidateDescriptorCache();
         MoeMmvqQ8_0?.InvalidateDescriptorCache();
@@ -1028,6 +1035,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulQ4_0Gemm?.InvalidateDescriptorCache();
         MoeGroupedQ5_1?.InvalidateDescriptorCache();
         MoeGroupedQ8_0?.InvalidateDescriptorCache();
+        foreach (var wk in _q8Wide.Values) wk.InvalidateDescriptorCache();
         MoeGroupedQ4K16?.InvalidateDescriptorCache();
         MoeGroupedQ5K16?.InvalidateDescriptorCache();
     }
@@ -1037,6 +1045,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         YarnRope?.Dispose();
         MatMulQ4_0Gemm?.Dispose();
         foreach (var gk in _iqGrouped.Values) gk.Dispose();
+        foreach (var gk in _iqGroupedVariants.Values) gk.Dispose();
+        foreach (var wk in _q8Wide.Values) wk.Dispose();
         foreach (var mk in _iqMmvq.Values) mk.Dispose();
         MoeIndexedMatmulQ5_1?.Dispose(); MoeIndexedMatmulQ8_0?.Dispose(); MoeMmvqQ5_1?.Dispose(); MoeMmvqQ8_0?.Dispose(); MatMulQ4_0Mmvq?.Dispose(); MatMulQ4_0GemmCoopmat?.Dispose(); MoeMmvqQ4KMr?.Dispose(); MoeMmvqQ5_1Mr?.Dispose();
         MoeGroupedQ5_1?.Dispose(); MoeGroupedQ8_0?.Dispose(); MoeGroupedQ4K16?.Dispose(); MoeGroupedQ5K16?.Dispose();
