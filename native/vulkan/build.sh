@@ -23,6 +23,10 @@ TARGET_ENV="vulkan1.2"
 # (#1254, #1310). A plain build is ~80% larger on big shaders and is NOT what ships.
 GLSLC_FLAGS="-O"
 
+PIN="$(head -n1 "$SCRIPT_DIR/glslc.version" 2>/dev/null | tr -d '')"
+GOT="$(glslc --version | head -n1)"
+case "$GOT" in "$PIN"*) ;; *) echo "WARNING: glslc '$GOT' != pinned '$PIN' (glslc.version); output bytes will differ from the committed .spv (#1364)" >&2 ;; esac
+
 echo "Compiling GLSL compute shaders -> SPIR-V (target: $TARGET_ENV)..."
 
 for comp_file in "$SHADER_DIR"/*.comp; do
