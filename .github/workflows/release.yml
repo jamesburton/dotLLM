@@ -105,7 +105,9 @@ jobs:
             rid: win-x64
             archive: zip
             exe: dotllm.exe
-          - os: macos-15
+          # JIT single-file publish uses target RID packs; this job neither compiles nor runs
+          # native macOS code. Cross-publish on Linux to avoid scarce/retiring Mac runners.
+          - os: ubuntu-latest
             rid: osx-arm64
             archive: tar.gz
             exe: dotllm
