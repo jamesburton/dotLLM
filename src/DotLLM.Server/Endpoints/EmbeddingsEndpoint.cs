@@ -160,47 +160,18 @@ public static class EmbeddingsEndpoint
         bool normalize = request.Normalize ?? true;
         int hiddenSize = state.Config.HiddenSize;
 
-        var vectors = new float[sequences.Count][];
         int promptTokens = 0;
+        foreach (var seq in sequences) promptTokens += seq.Length;
 
+        float[][] vectors;
         try
         {
-            // Both locks are still needed and both are still taken -- ExecuteAsync now acquires
-            // the scheduler lease itself (#461 follow-up), so this endpoint no longer takes it
-            // separately. Re-adding an inner AcquireModelAsync here would self-deadlock: the
-            // semaphore is not reentrant.
-            // (#1023 review) Re-validated under the gate: the model is read THEN, never the instance seen before a queued swap.
-            await state.ExecuteOnModelAsync(admittedModelId, async () =>
-            {
-                var embeddingModel = state.Model as IEmbeddingModel
-                    ?? throw new ModelUnavailableException(admittedModelId, "the active model does not support embedding extraction");
-                for (int i = 0; i < sequences.Count; i++)
-                {
-                    ct.ThrowIfCancellationRequested();
-
-                    int[] tokens = sequences[i];
-                    var positions = new int[tokens.Length];
-                    for (int p = 0; p < positions.Length; p++)
-                        positions[p] = p;
-
-                    var vector = new float[hiddenSize];
-                    using (var hidden = embeddingModel.ForwardHidden(tokens, positions, deviceId: 0))
-                    {
-                        var hiddenSpan = AsSpan(hidden, tokens.Length * hiddenSize);
-                        EmbeddingPooler.Pool(hiddenSpan, tokens.Length, hiddenSize, pooling, vector);
-                    }
-
-                    // Matryoshka-style truncation: keep the leading outDims components, then renormalise.
-                    if (outDims < hiddenSize)
-                        vector = vector.AsSpan(0, outDims).ToArray();
-
-                    if (normalize)
-                        EmbeddingPooler.L2Normalize(vector);
-
-                    vectors[i] = vector;
-                    promptTokens += tokens.Length;
-                }
-            }, ct);
+            // (#1405) Requests are coalesced by the batcher: one gate acquisition per batch, sequences run in parallel
+            // across cores where the backend supports it. The gate/scheduler-lease/model re-validation rules from
+            // ExecuteOnModelAsync (#1023, #461) are unchanged; they are taken once per batch inside the batcher.
+            var job = new EmbeddingBatcher.Job(admittedModelId, sequences, pooling, hiddenSize, outDims, normalize, ct);
+            await state.Embeddings.RunAsync(job);
+            vectors = job.Vectors;
         }
         catch (NotSupportedException ex)
         {
