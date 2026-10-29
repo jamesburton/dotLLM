@@ -47,6 +47,14 @@ public sealed record EmbeddingRequest
     /// </summary>
     [JsonPropertyName("normalize")]
     public bool? Normalize { get; init; }
+
+    /// <summary>
+    /// dotLLM extension: force (<c>true</c>) or suppress (<c>false</c>) appending the tokenizer's EOS token to
+    /// text inputs. Omitted: appended for last-token pooling on decoder embedders (Qwen3-Embedding), as
+    /// llama.cpp does (#1398). Ignored for token-id inputs, which are used verbatim.
+    /// </summary>
+    [JsonPropertyName("add_eos")]
+    public bool? AddEos { get; init; }
 }
 
 /// <summary>One embedding in an <see cref="EmbeddingResponse"/>.</summary>

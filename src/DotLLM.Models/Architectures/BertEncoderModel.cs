@@ -84,6 +84,9 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
     /// <inheritdoc/>
     public PoolingType? DeclaredPoolingType => Config.PoolingType;
 
+    /// <inheritdoc/>
+    public bool AppendsEosForLastPooling => false;
+
     private BertEncoderModel(
         GgufFile gguf, ModelConfig config, Layer[] layers,
         nint tokenEmbd, QuantizationType tokenEmbdQt,

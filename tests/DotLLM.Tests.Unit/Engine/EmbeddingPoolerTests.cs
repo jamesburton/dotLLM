@@ -149,3 +149,67 @@ public sealed class EmbeddingPoolerTests
         Assert.Equal(PoolingType.None, EmbeddingPooler.Resolve(null, PoolingType.None));
     }
 }
+
+/// <summary>EOS handling for last-token pooling on decoder embedders (#1398).</summary>
+public sealed class EmbeddingPoolerAppendEosTests
+{
+    private const int Eos = 151643;
+
+    [Fact]
+    public void Last_pooling_decoder_appends_eos_and_does_not_mutate_input()
+    {
+        int[] tokens = [10, 20, 30];
+        var r = EmbeddingPooler.AppendEos(tokens, PoolingType.Last, modelAppendsEos: true, Eos, addEosOverride: null);
+        Assert.Equal([10, 20, 30, Eos], r);
+        Assert.Equal([10, 20, 30], tokens);
+    }
+
+    [Theory]
+    [InlineData(PoolingType.Mean)]
+    [InlineData(PoolingType.Cls)]
+    public void Non_last_pooling_leaves_tokens_alone(PoolingType p)
+    {
+        int[] tokens = [10, 20];
+        Assert.Same(tokens, EmbeddingPooler.AppendEos(tokens, p, true, Eos, null));
+    }
+
+    [Fact]
+    public void Encoder_with_last_pooling_does_not_append()
+    {
+        int[] tokens = [10, 20];
+        Assert.Same(tokens, EmbeddingPooler.AppendEos(tokens, PoolingType.Last, modelAppendsEos: false, Eos, null));
+    }
+
+    [Fact]
+    public void Existing_trailing_eos_is_not_doubled()
+    {
+        int[] tokens = [10, Eos];
+        Assert.Same(tokens, EmbeddingPooler.AppendEos(tokens, PoolingType.Last, true, Eos, null));
+    }
+
+    [Fact]
+    public void Override_forces_and_suppresses()
+    {
+        int[] tokens = [10, 20];
+        Assert.Equal([10, 20, Eos], EmbeddingPooler.AppendEos(tokens, PoolingType.Mean, false, Eos, addEosOverride: true));
+        Assert.Same(tokens, EmbeddingPooler.AppendEos(tokens, PoolingType.Last, true, Eos, addEosOverride: false));
+    }
+
+    [Fact]
+    public void Negative_eos_id_disables_appending()
+    {
+        int[] tokens = [10];
+        Assert.Same(tokens, EmbeddingPooler.AppendEos(tokens, PoolingType.Last, true, -1, null));
+    }
+
+    [Fact]
+    public void Last_row_differs_with_and_without_eos_row()
+    {
+        // Discriminating: the pooled vector is the EOS row, not the final text row.
+        float[] hidden = [1f, 2f, 10f, -4f, 100f, 8f];
+        var withEos = new float[2]; var without = new float[2];
+        EmbeddingPooler.Pool(hidden, 3, 2, PoolingType.Last, withEos);
+        EmbeddingPooler.Pool(hidden, 2, 2, PoolingType.Last, without);
+        Assert.NotEqual(without, withEos);
+    }
+}
