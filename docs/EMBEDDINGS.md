@@ -150,6 +150,15 @@ gate GEMM for nomic):
   row-inner, convert + dot per pair) - convert-once-per-tile would remove an n-fold redundant conversion.
   Most public embedding GGUFs are F16, so this is what users hit by default. (It is a bounded per-row scratch, not a stored widened copy, so it
   is a perf defect rather than a precision-rule violation.)
+* **Fixed (#1404).** Two causes: (a) per-token row conversion, (b) `ComputeTileM` gave 256-row tiles so bge-small (m=384) had
+  2 tiles for 32 threads. Now `MatMul.GemmF16RowsFma` (`MatMul.F16Tile.cs`) converts 4 weight rows once into a 4-row per-thread
+  scratch and runs a 4-row x 2-token FMA register tile; the pooled path shrinks tiles (multiple of 4 rows, floor 8) so every worker
+  gets one. Weights stay F16 in place. Per-output arithmetic is tiling-independent (ST and pooled are bit-identical, tested).
+  `DOTLLM_F16_NO_FMA=1` selects the legacy loop for same-session A/B. bge-base F16, 32 threads, `profile`, two paired runs each
+  (ms/doc, GEMM stages Qkv+Out+FfnUp+FfnDown): seq 64 **228 / 123 legacy -> 25-29 new** (total 144-268 -> 69-74, now below the Q8_0
+  figures above); seq 256 **390 / 508 -> 66-67** (total 636-846 -> 297-341). Throughput B=8 seq 64: 6.1-7.1 -> 17.6 docs/s
+  (one noisy rep 11). Attention (single-threaded) and GELU now dominate (#1402/#1403). Parity vs legacy on 50 texts: min cosine
+  0.9999999; unit test vs double-precision reference on m%4, k%8, odd-n shapes.
 * Amdahl view at 32 threads, bge-base Q8 at 64 tokens: ~44 % of the document is the two serial stages (Attention + GELU).
 
 ## 5. Vulkan / CUDA
