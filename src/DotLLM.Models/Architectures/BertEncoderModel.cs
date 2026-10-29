@@ -51,6 +51,9 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
     private readonly int _ropeRows;
     private bool _disposed;
 
+    /// <summary>Optional per-stage wall-clock accumulator (#1369). Null (the default) costs one null check per stage.</summary>
+    internal static EncoderStageProfile? StageProfile { get; set; }
+
     /// <summary>Test seam: erf-exact GELU instead of llama.cpp's tanh approximation.</summary>
     internal static bool UseErfGelu { get; set; }
 
@@ -256,7 +259,10 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
         float* gate = _nomic ? Alloc((long)n * ff) : null;
         try
         {
+            var prof = StageProfile;
+            prof?.Begin();
             Embed(tokenIds, positions, x, h);
+            prof?.Mark(EncoderStage.Embed);
 
             var posSpan = positions;
             for (int li = 0; li < _layers.Length; li++)
@@ -283,6 +289,7 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
                     Gemm(l.V!, x, v, n); AddBias(l.V!.Bias, v, n, h);
                 }
 
+                prof?.Mark(EncoderStage.QkvProj);
                 if (_nomic)
                 {
                     for (int t = 0; t < n; t++)
@@ -292,26 +299,31 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
                         nh, nh, hd, Config.RoPEConfig!.Value.DimensionCount, _ropeCos, _ropeSin, RoPEType.NeoX);
                 }
 
+                prof?.Mark(EncoderStage.Rope);
                 Attention.Execute(
                     new ReadOnlySpan<float>(q, n * h), new ReadOnlySpan<float>(k, n * h), new ReadOnlySpan<float>(v, n * h),
                     new Span<float>(attn, n * h),
                     n, n, nh, nh, hd, 0, 1.0f / MathF.Sqrt(hd), default, null, 0f,
                     AttentionMaskMode.Bidirectional, 0, default);
 
+                prof?.Mark(EncoderStage.Attention);
                 Gemm(l.O!, attn, tmp, n);
                 AddBias(l.O!.Bias, tmp, n, h);
                 // residual + post-attention LayerNorm
                 TensorPrimitives.Add(new ReadOnlySpan<float>(tmp, n * h), new ReadOnlySpan<float>(x, n * h), new Span<float>(tmp, n * h));
+                prof?.Mark(EncoderStage.OutProj);
                 LayerNorm(tmp, l.AttnNormW, l.AttnNormB, x, n, h);   // x := LN(attn_out + x_in)... see below
 
                 // x now holds ffn_inp; keep a copy in tmp for the FFN residual.
                 new ReadOnlySpan<float>(x, n * h).CopyTo(new Span<float>(tmp, n * h));
 
+                prof?.Mark(EncoderStage.Ln1);
                 // ── FFN ──
                 if (_nomic)
                 {
                     Gemm(l.Gate!, x, gate, n);
                     Gemm(l.Up!, x, up, n);
+                    prof?.Mark(EncoderStage.FfnUp);
                     SiLu.Execute(new ReadOnlySpan<float>(gate, n * ff), new Span<float>(gate, n * ff));
                     TensorPrimitives.Multiply(new ReadOnlySpan<float>(gate, n * ff), new ReadOnlySpan<float>(up, n * ff), new Span<float>(up, n * ff));
                 }
@@ -319,13 +331,17 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
                 {
                     Gemm(l.Up!, x, up, n);
                     AddBias(l.Up!.Bias, up, n, ff);
+                    prof?.Mark(EncoderStage.FfnUp);
                     Gelu(up, n * ff);
                 }
+                prof?.Mark(EncoderStage.Act);
 
                 Gemm(l.Down!, up, attn, n);          // reuse attn as the FFN output buffer
                 AddBias(l.Down!.Bias, attn, n, h);
                 TensorPrimitives.Add(new ReadOnlySpan<float>(attn, n * h), new ReadOnlySpan<float>(tmp, n * h), new Span<float>(attn, n * h));
+                prof?.Mark(EncoderStage.FfnDown);
                 LayerNorm(attn, l.OutNormW, l.OutNormB, x, n, h);
+                prof?.Mark(EncoderStage.Ln2);
             }
 
             var result = UnmanagedTensor.Allocate(new TensorShape(n, h), DType.Float32, deviceId);
@@ -499,5 +515,27 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
         if (_disposed) return;
         _disposed = true;
         _pool?.Dispose();
+    }
+}
+
+/// <summary>Stages of one <see cref="BertEncoderModel"/> layer, for <see cref="EncoderStageProfile"/> (#1369).</summary>
+internal enum EncoderStage { Embed, QkvProj, Rope, Attention, OutProj, Ln1, FfnUp, Act, FfnDown, Ln2, Count }
+
+/// <summary>Accumulates wall-clock ticks per <see cref="EncoderStage"/>. Single-threaded caller; the encoder's own pool is joined before each Mark.</summary>
+internal sealed class EncoderStageProfile
+{
+    /// <summary>Ticks (Stopwatch frequency) per stage.</summary>
+    public readonly long[] Ticks = new long[(int)EncoderStage.Count];
+    private long _last;
+
+    /// <summary>Starts a forward pass.</summary>
+    public void Begin() => _last = System.Diagnostics.Stopwatch.GetTimestamp();
+
+    /// <summary>Attributes the time since the previous mark to <paramref name="stage"/>.</summary>
+    public void Mark(EncoderStage stage)
+    {
+        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+        Ticks[(int)stage] += now - _last;
+        _last = now;
     }
 }

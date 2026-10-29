@@ -287,6 +287,7 @@ store** (#1279) — every model, whether pulled by the CLI or by a test, has one
 | Native AOT deployment | [docs/AOT.md](docs/AOT.md) | AOT publishing, trimming, deployment |
 | Perplexity & llama.cpp comparison | [docs/PERPLEXITY.md](docs/PERPLEXITY.md) | Quality measurement, corpus fixtures, CRLF trap (#506) |
 | Precision | [docs/PRECISION.md](docs/PRECISION.md) | Storage/accumulator formats per op and device, KV formats, Keep-FP32 list, #1107 evidence and violation inventory |
+| Embeddings (RAG) survey | [docs/EMBEDDINGS.md](docs/EMBEDDINGS.md) | Embedding models, `dotllm embed`, `/v1/embeddings`, encoder perf, quality gate |
 | Implementation roadmap | [docs/ROADMAP.md](docs/ROADMAP.md) | Planning, task sequencing |
 
 ## Development Workflow

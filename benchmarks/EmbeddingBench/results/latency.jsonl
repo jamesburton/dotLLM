@@ -1,0 +1,15 @@
+{"mode":"latency","model":"bge-base-q8","threads":32,"seq":16,"iters":60,"p50_ms":18.8373,"p90_ms":30.3421,"p99_ms":36.4518,"min_ms":16.9532,"max_ms":36.4518}
+{"mode":"latency","model":"bge-base-q8","threads":32,"seq":64,"iters":60,"p50_ms":65.3058,"p90_ms":67.8484,"p99_ms":68.58,"min_ms":61.0521,"max_ms":68.58}
+{"mode":"latency","model":"bge-base-q8","threads":32,"seq":256,"iters":60,"p50_ms":353.7211,"p90_ms":405.8825,"p99_ms":733.7686,"min_ms":339.3374,"max_ms":733.7686}
+{"mode":"latency","model":"bge-small-f16","threads":32,"seq":16,"iters":60,"p50_ms":28.9371,"p90_ms":244.406,"p99_ms":875.6502,"min_ms":25.539,"max_ms":875.6502}
+{"mode":"latency","model":"bge-small-f16","threads":32,"seq":64,"iters":60,"p50_ms":95.7057,"p90_ms":102.7138,"p99_ms":107.7729,"min_ms":90.5243,"max_ms":107.7729}
+{"mode":"latency","model":"bge-small-f16","threads":32,"seq":256,"iters":60,"p50_ms":427.6115,"p90_ms":479.6285,"p99_ms":510.481,"min_ms":411.0904,"max_ms":510.481}
+{"mode":"latency","model":"minilm-l6-q8","threads":32,"seq":16,"iters":60,"p50_ms":7.2816,"p90_ms":17.0676,"p99_ms":21.6297,"min_ms":5.5008,"max_ms":21.6297}
+{"mode":"latency","model":"minilm-l6-q8","threads":32,"seq":64,"iters":60,"p50_ms":16.6809,"p90_ms":17.9787,"p99_ms":18.801,"min_ms":15.3227,"max_ms":18.801}
+{"mode":"latency","model":"minilm-l6-q8","threads":32,"seq":256,"iters":60,"p50_ms":119.8599,"p90_ms":124.0725,"p99_ms":134.9806,"min_ms":112.6932,"max_ms":134.9806}
+{"mode":"latency","model":"mxbai-large-q8","threads":32,"seq":16,"iters":60,"p50_ms":51.8364,"p90_ms":53.8044,"p99_ms":306.7767,"min_ms":46.9428,"max_ms":306.7767}
+{"mode":"latency","model":"mxbai-large-q8","threads":32,"seq":64,"iters":60,"p50_ms":192.0931,"p90_ms":199.9859,"p99_ms":237.2899,"min_ms":180.8393,"max_ms":237.2899}
+{"mode":"latency","model":"mxbai-large-q8","threads":32,"seq":256,"iters":60,"p50_ms":1122.4432,"p90_ms":1306.4027,"p99_ms":1402.5996,"min_ms":1049.6274,"max_ms":1402.5996}
+{"mode":"latency","model":"nomic-v1.5-q8","threads":32,"seq":16,"iters":60,"p50_ms":15.0524,"p90_ms":28.6666,"p99_ms":34.278,"min_ms":13.2208,"max_ms":34.278}
+{"mode":"latency","model":"nomic-v1.5-q8","threads":32,"seq":64,"iters":60,"p50_ms":48.0285,"p90_ms":54.0676,"p99_ms":83.4107,"min_ms":43.233,"max_ms":83.4107}
+{"mode":"latency","model":"nomic-v1.5-q8","threads":32,"seq":256,"iters":60,"p50_ms":292.8913,"p90_ms":326.6862,"p99_ms":952.9172,"min_ms":274.2222,"max_ms":952.9172}
