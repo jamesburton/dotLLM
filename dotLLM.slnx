@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/benchmarks/">
     <Project Path="benchmarks/DotLLM.Benchmarks/DotLLM.Benchmarks.csproj" />
+    <Project Path="benchmarks/EmbeddingBench/EmbeddingBench.csproj" />
   </Folder>
   <Folder Name="/docs/">
     <File Path="docs/ARCHITECTURE.md" />
