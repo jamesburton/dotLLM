@@ -105,7 +105,7 @@ jobs:
             rid: win-x64
             archive: zip
             exe: dotllm.exe
-          - os: macos-14
+          - os: macos-15
             rid: osx-arm64
             archive: tar.gz
             exe: dotllm
