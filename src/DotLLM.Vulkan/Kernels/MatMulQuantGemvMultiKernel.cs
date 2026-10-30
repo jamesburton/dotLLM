@@ -41,7 +41,7 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
 
     /// <summary>
     /// Largest column count any instance serves (#1365, #1377). Every shader goes to 16 columns (the NR-parameterised Q4_K / Q6_K_Rows since #1365;
-    /// Q5_K, non-Rows Q6_K and IQ4_XS since #1377) except <see cref="QuantGemvMultiFormat.Q6_K_R2"/> (no wide shader) and <see cref="QuantGemvMultiFormat.IQ3_S"/> (12/16 columns spill: 18-23 ms vs 3.8 ms for two 8-column dispatches); see <see cref="MaxColumnsFor"/>.
+    /// Q5_K, non-Rows Q6_K and IQ4_XS since #1377, IQ3_S since #1389 once its shader got the coalesced layout) except <see cref="QuantGemvMultiFormat.Q6_K_R2"/> (no wide shader); see <see cref="MaxColumnsFor"/>.
     /// </summary>
     public const int WideMaxColumns = 16;
 
@@ -68,7 +68,7 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
     /// <summary>Largest column count <paramref name="format"/>'s shader serves (#1365).</summary>
     /// <param name="format">The block format.</param>
     /// <returns>8 or 16.</returns>
-    public static int MaxColumnsFor(QuantGemvMultiFormat format) => format is QuantGemvMultiFormat.Q6_K_R2 or QuantGemvMultiFormat.IQ3_S ? MaxColumns : WideMaxColumns;
+    public static int MaxColumnsFor(QuantGemvMultiFormat format) => format is QuantGemvMultiFormat.Q6_K_R2 ? MaxColumns : WideMaxColumns;
 
     /// <summary>Output rows per workgroup (<c>NR</c>, #1220); 1 except for the formats whose shader takes the constant.</summary>
     public int RowsPerWorkgroup => _rowsPerWorkgroup;
@@ -180,6 +180,9 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
     /// <param name="k">Contraction length.</param>
     /// <returns>Whether <see cref="Record"/> accepts it.</returns>
     public bool AcceptsColumns(int n, int k) => n >= 2 && n <= MaxColumnsSupported && k > 0 && (k % GroupSize) == 0;
+
+    /// <summary>Raw <c>VkPipeline</c> handle of the <paramref name="n"/>-column pipeline, for diagnostics only (<see cref="VulkanDevice.GetShaderStatisticsAmd"/>).</summary>
+    internal nint PipelineHandleFor(int n) => _pipelines[n]!.Pipeline;
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
     internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
