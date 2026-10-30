@@ -11,8 +11,11 @@ public sealed class GumbelArgMaxRowsKernel : IDisposable
 {
     private const int PushConstantBytes = 2 * sizeof(uint);
 
-    /// <summary>Bytes of one row's parameters: <c>(seedLo, seedHi, tokenIndex, invTemp bits)</c> as four uints.</summary>
-    public const int RowParamBytes = 4 * sizeof(uint);
+    /// <summary>Bytes of one row's parameters: <c>(seedLo, seedHi, tokenIndex, invTemp bits, topK, logMinP bits, 0, 0)</c> as eight uints.</summary>
+    public const int RowParamBytes = 8 * sizeof(uint);
+
+    /// <summary>Largest vocabulary the top-k tie cutoff search covers (20 index bits).</summary>
+    public const int MaxFilteredVocab = 1 << 20;
 
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
@@ -65,13 +68,23 @@ public sealed class GumbelArgMaxRowsKernel : IDisposable
     /// <summary>Drops every cached descriptor set; call when any bound buffer has been re-allocated.</summary>
     internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
 
-    /// <summary>Packs one row's parameters into <paramref name="dst"/> (four uints).</summary>
-    public static void PackRow(Span<uint> dst, ulong seed, int tokenIndex, float invTemperature)
+    /// <summary>Packs one row's parameters into <paramref name="dst"/> (eight uints).</summary>
+    /// <param name="dst">Destination, at least 8 uints.</param>
+    /// <param name="seed">Request noise seed.</param>
+    /// <param name="tokenIndex">Generation index of the row's token.</param>
+    /// <param name="invTemperature">F32 <c>1f / temperature</c>.</param>
+    /// <param name="topK">Top-k (0 = off; the shader also ignores k at or above the vocabulary).</param>
+    /// <param name="minP">Min-p (0 = off); the shader receives <c>MathF.Log(minP)</c>, exactly as <c>MinPSampler</c> computes it.</param>
+    public static void PackRow(Span<uint> dst, ulong seed, int tokenIndex, float invTemperature, int topK = 0, float minP = 0f)
     {
         dst[0] = (uint)seed;
         dst[1] = (uint)(seed >> 32);
         dst[2] = (uint)tokenIndex;
         dst[3] = BitConverter.SingleToUInt32Bits(invTemperature);
+        dst[4] = (uint)Math.Max(topK, 0);
+        dst[5] = BitConverter.SingleToUInt32Bits(minP > 0f ? MathF.Log(minP) : float.NegativeInfinity);
+        dst[6] = 0;
+        dst[7] = 0;
     }
 
     /// <summary>Synchronous launch of <see cref="Record"/>; used by unit tests. <paramref name="rowParams"/> is already uploaded.</summary>
@@ -103,6 +116,7 @@ public sealed class GumbelArgMaxRowsKernel : IDisposable
             throw new ArgumentException("Logits buffer too small.", nameof(logits));
         if (ids.Size < (long)rows * sizeof(uint))
             throw new ArgumentException("Id buffer too small.", nameof(ids));
+        if (vocab > MaxFilteredVocab) throw new ArgumentOutOfRangeException(nameof(vocab), "Top-k tie search covers vocabularies up to 2^20.");
         if (rowParams.Size < (long)rows * RowParamBytes)
             throw new ArgumentException("Row-parameter buffer too small.", nameof(rowParams));
 

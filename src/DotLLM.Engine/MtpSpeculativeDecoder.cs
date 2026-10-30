@@ -88,7 +88,7 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
     internal const string DisableDeviceGumbelEnvVar = "DOTLLM_DEVICE_GUMBEL";
 
     /// <summary>
-    /// Draw the verify rows' Gumbel-max samples on the device (<see cref="IModel.ForwardGumbelSampled"/>, #1382) instead of reading every
+    /// Draw the verify rows' Gumbel-max samples on the device (<c>IModel.ForwardGumbelSampled</c>, #1382) instead of reading every
     /// row's logits back: only when the pipeline's prepared distribution is a pure temperature scale
     /// (<see cref="SamplerPipeline.DeviceGumbelInvTemperature"/>), there is no decoding constraint, and the model supports it. Defaults to on unless
     /// <c>DOTLLM_DEVICE_GUMBEL=0</c>; tests and the A/B harness flip it in-process. Needs <c>DOTLLM_GUMBEL_SAMPLING=1</c> to matter at all.
@@ -272,7 +272,8 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
             // the history before the next row, and a row is only reached when the drafts before it held).
             Span<int> deviceSamples = stackalloc int[verifyLen <= 32 ? verifyLen : 0];
             bool deviceGumbel = UseDeviceGumbel && constraint is null && verifyLen <= 32
-                && pipeline.DeviceGumbelInvTemperature is not null
+                && pipeline.DeviceGumbelSpec is { } gumbelSpec
+                && (gumbelSpec.Filter.IsNone || targetModel.SupportsDeviceGumbelFilter)
                 && targetModel.SupportsDeviceGumbelSampling && verifyLen <= targetModel.DeviceGumbelMaxRows;
 
             long verifyStart = EngineClock.GetTimestamp();
@@ -286,7 +287,7 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
             if (deviceGumbel)
             {
                 targetModel.ForwardGumbelSampled(verifyTokens, verifyPositions, deviceId: -1, kvCacheTarget, mtpState, rowSnapshots,
-                    pipeline.GumbelSeed, generatedIds.Count, pipeline.DeviceGumbelInvTemperature!.Value, deviceSamples);
+                    pipeline.GumbelSeed, generatedIds.Count, pipeline.DeviceGumbelSpec!.Value.InvTemperature, pipeline.DeviceGumbelSpec.Value.Filter, deviceSamples);
                 DeviceGumbelRounds++;
             }
             verifyTicks += EngineClock.GetTimestamp() - verifyStart;

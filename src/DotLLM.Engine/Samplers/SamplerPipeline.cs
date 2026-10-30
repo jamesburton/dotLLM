@@ -1,5 +1,6 @@
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Sampling;
+using DotLLM.Core.Models;
 using DotLLM.Tokenizers;
 
 namespace DotLLM.Engine.Samplers;
@@ -21,6 +22,7 @@ public sealed class SamplerPipeline
     private readonly ulong _gumbelSeed;
     private readonly bool _gumbel;
     private readonly float _deviceGumbelInvTemperature;   // 0 = the prepared distribution is not a pure temperature scale
+    private readonly (float InvTemperature, GumbelFilter Filter)? _deviceGumbelSpec;
     internal bool UnsafeUniform32ForTests { get; set; }
 
     /// <summary>The request's Gumbel noise seed (valid when <see cref="UsesGumbel"/>).</summary>
@@ -34,6 +36,14 @@ public sealed class SamplerPipeline
     /// </summary>
     public float? DeviceGumbelInvTemperature
         => _deviceGumbelInvTemperature > 0f && !UnsafeUniform32ForTests ? _deviceGumbelInvTemperature : null;
+
+    /// <summary>
+    /// When a device may draw this pipeline's Gumbel-max sample from RAW logits (#1435): the temperature reciprocal plus an optional top-k /
+    /// min-p restriction (<see cref="GumbelFilter"/>, the host <c>TopKSampler</c> / <c>MinPSampler</c> semantics). Null unless the prepared
+    /// distribution is exactly temperature, then top-k, then min-p (Gumbel mode on and stochastic, no logit processors, no top-p / top-n-sigma,
+    /// flat options). A superset of <see cref="DeviceGumbelInvTemperature"/>.
+    /// </summary>
+    public (float InvTemperature, GumbelFilter Filter)? DeviceGumbelSpec => UnsafeUniform32ForTests ? null : _deviceGumbelSpec;
 
     /// <summary>Env switch that turns position-seeded Gumbel-max sampling on for every stochastic pipeline built from options (#1358).</summary>
     public const string GumbelEnvVar = "DOTLLM_GUMBEL_SAMPLING";
@@ -156,6 +166,10 @@ public sealed class SamplerPipeline
         if (_gumbel && _processors.Length == 0 && _steps.Length <= 1 && !_fastTopKSampling
             && options.TopK <= 0 && options.TopP >= 1.0f && options.MinP <= 0f && options.TopNSigma < 0f)
             _deviceGumbelInvTemperature = options.Temperature == 1.0f ? 1f : 1f / options.Temperature;
+
+        if (_gumbel && _processors.Length == 0 && options.TopP >= 1.0f && options.TopNSigma < 0f)
+            _deviceGumbelSpec = (options.Temperature == 1.0f ? 1f : 1f / options.Temperature,
+                new GumbelFilter(options.TopK > 0 ? options.TopK : 0, options.MinP > 0f ? options.MinP : 0f));
     }
 
     /// <summary>

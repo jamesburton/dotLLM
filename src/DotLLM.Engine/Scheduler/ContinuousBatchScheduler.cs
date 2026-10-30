@@ -759,7 +759,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
 
     /// <summary>
     /// Runs the batched decode through <see cref="IModel.ForwardBatchGumbelSampled"/> when the model supports it and every ready sequence
-    /// is eligible (<see cref="SamplerPipeline.DeviceGumbelInvTemperature"/> set, no constraint). Returns false, with nothing consumed,
+    /// is eligible (<see cref="SamplerPipeline.DeviceGumbelSpec"/> set, no constraint). Returns false, with nothing consumed,
     /// when it does not apply. <see cref="_decodeBatch"/> is already filled by the caller.
     /// </summary>
     private bool TryDeviceGumbelDecode(int readyCount)
@@ -769,7 +769,8 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         for (int j = 0; j < readyCount; j++)
         {
             var seq = _decodeReady[j];
-            if (seq.Constraint is not null || seq.SamplerPipeline.DeviceGumbelInvTemperature is null) return false;
+            if (seq.Constraint is not null || seq.SamplerPipeline.DeviceGumbelSpec is not { } spec) return false;
+            if (!spec.Filter.IsNone && !_model.SupportsDeviceGumbelFilter) return false;
         }
 
         if (_gumbelDraws.Length < readyCount)
@@ -780,8 +781,9 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         for (int j = 0; j < readyCount; j++)
         {
             var seq = _decodeReady[j];
+            var spec = seq.SamplerPipeline.DeviceGumbelSpec!.Value;
             _gumbelDraws[j] = new GumbelDraw(seq.SamplerPipeline.GumbelSeed, seq.GeneratedTokens.Count,
-                seq.SamplerPipeline.DeviceGumbelInvTemperature!.Value);
+                spec.InvTemperature, spec.Filter.TopK, spec.Filter.MinP);
         }
 
         long fwdStart = Stopwatch.GetTimestamp();

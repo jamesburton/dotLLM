@@ -24,7 +24,7 @@ public sealed partial class ContinuousBatchSchedulerTests
         return (h % 2000) / 1000f - 1f;   // [-1, 1)
     }
 
-    private static InferenceRequest GumbelRequest(int promptLen, int seed, float temperature = 0.9f, int topK = 0)
+    private static InferenceRequest GumbelRequest(int promptLen, int seed, float temperature = 0.9f, int topK = 0, float minP = 0f)
     {
         var tokens = new int[promptLen];
         for (int i = 0; i < promptLen; i++) tokens[i] = i + 1;
@@ -33,19 +33,20 @@ public sealed partial class ContinuousBatchSchedulerTests
             TokenIds = tokens,
             Options = new InferenceOptions
             {
-                Temperature = temperature, TopK = topK, Seed = seed, GumbelSampling = true, MaxTokens = GumbelMaxTokens,
+                Temperature = temperature, TopK = topK, MinP = minP, Seed = seed, GumbelSampling = true, MaxTokens = GumbelMaxTokens,
             },
         };
     }
 
     private static async Task<int[][]> RunGumbel(bool device, int[] seeds, float temperature = 0.9f, int topK = 0,
-        Action<TestFixture>? inspect = null, bool useDeviceFlag = true)
+        Action<TestFixture>? inspect = null, bool useDeviceFlag = true, bool filter = false, float minP = 0f)
     {
         using var fix = new TestFixture(requiresPerSequenceState: false);
         fix.Model.LogitFn = GumbelLogit;
         fix.Model.DeviceGumbelBatch = device;
+        fix.Model.DeviceGumbelFilter = filter;
         fix.Scheduler.UseDeviceGumbel = useDeviceFlag;
-        var handles = seeds.Select((s, i) => fix.Scheduler.Submit(GumbelRequest(3 + i, s, temperature, topK))).ToArray();
+        var handles = seeds.Select((s, i) => fix.Scheduler.Submit(GumbelRequest(3 + i, s, temperature, topK, minP))).ToArray();
         DriveUntilIdle(fix.Scheduler);
         var outs = new int[seeds.Length][];
         for (int i = 0; i < handles.Length; i++) outs[i] = (await handles[i].Completion).GeneratedTokenIds;
@@ -123,5 +124,26 @@ public sealed partial class ContinuousBatchSchedulerTests
         Assert.Equal(0, steps);
         var on = await RunGumbel(device: true, seeds);
         for (int i = 0; i < seeds.Length; i++) Assert.Equal(on[i], off[i]);   // switching it off never changes the text
+    }
+
+    [Theory]
+    [InlineData(5, 0f)]
+    [InlineData(0, 0.2f)]
+    [InlineData(6, 0.1f)]
+    public async Task DeviceGumbelBatch_FilteredDraw_MatchesTheHostTopKMinPPath(int topK, float minP)
+    {
+        int[] seeds = [31, 32, 33, 34];
+        long steps = -1;
+        var host = await RunGumbel(device: false, seeds, topK: topK, minP: minP);
+        var dev = await RunGumbel(device: true, seeds, topK: topK, minP: minP, filter: true, inspect: f => steps = f.Scheduler.DeviceGumbelDecodeSteps);
+        Assert.True(steps > 0, "filtered batch never took the device path");
+        for (int i = 0; i < seeds.Length; i++) Assert.Equal(host[i], dev[i]);
+        Assert.NotEqual(host[0], host[1]);
+
+        // A model without filter support keeps the logits path for a filtered pipeline (and never receives a filtered draw).
+        steps = -1;
+        var noFilter = await RunGumbel(device: true, seeds, topK: topK, minP: minP, filter: false, inspect: f => steps = f.Scheduler.DeviceGumbelDecodeSteps);
+        Assert.Equal(0, steps);
+        for (int i = 0; i < seeds.Length; i++) Assert.Equal(host[i], noFilter[i]);
     }
 }

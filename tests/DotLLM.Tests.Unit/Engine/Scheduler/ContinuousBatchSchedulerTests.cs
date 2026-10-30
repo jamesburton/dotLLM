@@ -1193,6 +1193,10 @@ public sealed partial class ContinuousBatchSchedulerTests
         /// <summary>When true the mock advertises the batched device Gumbel draw and implements it on the host (reference arithmetic).</summary>
         public bool DeviceGumbelBatch { get; set; }
         public bool SupportsDeviceGumbelBatch => DeviceGumbelBatch;
+
+        /// <summary>When true the mock also honours the draw's top-k / min-p (#1435), applying the host samplers to the scaled logits.</summary>
+        public bool DeviceGumbelFilter { get; set; }
+        public bool SupportsDeviceGumbelFilter => DeviceGumbelFilter;
         public int DeviceGumbelBatchCalls { get; private set; }
         public List<GumbelDraw> LastDraws { get; } = new();
 
@@ -1209,6 +1213,9 @@ public sealed partial class ContinuousBatchSchedulerTests
                 var scaled = new float[VocabSize];
                 unsafe { new ReadOnlySpan<float>((void*)logits.DataPointer, VocabSize).CopyTo(scaled); }
                 for (int v = 0; v < scaled.Length; v++) scaled[v] *= draws[i].InvTemperature;
+                Assert.True(DeviceGumbelFilter || (draws[i].TopK == 0 && draws[i].MinP == 0f), "filtered draw sent to a model without filter support");
+                if (draws[i].TopK > 0) new DotLLM.Engine.Samplers.TopKSampler(draws[i].TopK).Apply(scaled, default);
+                if (draws[i].MinP > 0f) new DotLLM.Engine.Samplers.MinPSampler(draws[i].MinP).Apply(scaled, default);
                 sampledIds[i] = DotLLM.Engine.Samplers.GumbelNoise.Sample(scaled, draws[i].Seed, draws[i].TokenIndex);
                 LastDraws.Add(draws[i]);
             }

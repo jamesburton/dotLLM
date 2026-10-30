@@ -1,9 +1,16 @@
 #version 450
-// Per-row-parameter twin of gumbel_argmax_f32.comp (#1434): the rows of one launch belong to DIFFERENT sequences (a continuous-batch
-// decode step), so each row carries its own seed, generation index and 1/temperature:
-//     ids[row] = argmax_i ( logits[row][i] * invTemp[row] + G(seed[row], tokenIndex[row], i) )   over the finite entries.
-// The arithmetic is identical to gumbel_argmax_f32.comp (and DotLLM.Engine.Samplers.GumbelNoise): `precise` noise/score, deterministic
-// log, lowest index wins ties, -inf entries skipped.
+// Per-row-parameter twin of gumbel_argmax_f32.comp (#1434) with top-k / min-p filtering (#1435). The rows of one launch may belong to
+// DIFFERENT sequences (a continuous-batch decode step) or to consecutive verify rows of one sequence; each row carries its own
+// seed, generation index, 1/temperature, top-k and log(min-p):
+//     s_i   = logits[row][i] * invTemp                      (the host TemperatureSampler's F32 multiply)
+//     keep_i = top-k(s)_i && s_i >= max(s) + logMinP        (host TopKSampler / MinPSampler, exact tie rules)
+//     ids[row] = argmax_{i: keep_i, s_i finite} ( s_i + G(seed, tokenIndex, i) )
+// The arithmetic is identical to gumbel_argmax_f32.comp (and DotLLM.Engine.Samplers.GumbelNoise): `precise` noise/score,
+// deterministic log, lowest index wins ties, -inf entries skipped.
+//
+// Top-k keeps every entry strictly above the k-th largest value T, plus the FIRST (tiesAllowed = k - countAbove) entries equal to T in
+// index order (TopKSampler.Apply). T is found exactly by a 32-step bisection over the order-preserving uint key of the F32 value;
+// the index-order tie cutoff is only searched when more entries tie at T than slots remain.
 
 #extension GL_GOOGLE_include_directive : require
 
@@ -11,7 +18,9 @@ layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer Logits { float logits[]; };
 layout(set = 0, binding = 1, std430) writeonly buffer Ids { uint ids[]; };
-layout(set = 0, binding = 2, std430) readonly buffer RowParams { uvec4 rowParams[]; };   // (seedLo, seedHi, tokenIndex, invTemp bits)
+// Two uvec4 per row: (seedLo, seedHi, tokenIndex, invTemp bits), (topK, logMinP bits, 0, 0). topK <= 0 or >= vocab: no top-k.
+// logMinP = -inf: no min-p.
+layout(set = 0, binding = 2, std430) readonly buffer RowParams { uvec4 rowParams[]; };
 
 layout(push_constant) uniform PushConstants {
     uint vocab;
@@ -23,21 +32,125 @@ const uint NONE = 0xFFFFFFFFu;
 #include "gumbel_noise.glsl"
 shared float sScore[512];
 shared uint sIdx[512];
+shared uint sCount;
+shared float sMax;
+
+// Order-preserving key of an F32 (+0 and -0 map to the same key: the host compares them equal).
+uint orderKey(float s) {
+    if (s == 0.0) s = 0.0;
+    uint b = floatBitsToUint(s);
+    return (b & 0x80000000u) != 0u ? ~b : (b | 0x80000000u);
+}
+
+// Workgroup-wide sum of a per-thread count.
+uint groupSum(uint local, uint tid) {
+    barrier();
+    if (tid == 0u) sCount = 0u;
+    barrier();
+    if (local != 0u) atomicAdd(sCount, local);
+    barrier();
+    uint r = sCount;
+    barrier();
+    return r;
+}
 
 void main() {
     uint row = gl_WorkGroupID.x;
     uint tid = gl_LocalInvocationID.x;
     uint base = row * pc.rowStride;
-    uvec4 rp = rowParams[row];
+    uvec4 rp = rowParams[2u * row];
+    uvec4 rq = rowParams[2u * row + 1u];
     float invTemp = uintBitsToFloat(rp.w);
+    uint topK = rq.x;
+    float logMinP = uintBitsToFloat(rq.y);
+    bool useTopK = topK > 0u && topK < pc.vocab;
+    bool useMinP = !(floatBitsToUint(logMinP) == 0xFF800000u);   // != -inf
+
+    float thrMin = uintBitsToFloat(0xFF800000u);   // -inf: nothing excluded
+    if (useMinP) {
+        // max over the whole scaled row (including -inf entries, as TensorPrimitives.Max does)
+        float m = uintBitsToFloat(0xFF800000u);
+        for (uint i = tid; i < pc.vocab; i += 512u) {
+            precise float s = logits[base + i] * invTemp;
+            m = max(m, s);
+        }
+        sScore[tid] = m;
+        barrier();
+        for (uint stride = 256u; stride > 0u; stride >>= 1) {
+            if (tid < stride) sScore[tid] = max(sScore[tid], sScore[tid + stride]);
+            barrier();
+        }
+        if (tid == 0u) sMax = sScore[0];
+        barrier();
+        precise float t = sMax + logMinP;
+        thrMin = t;
+        barrier();
+    }
+
+    uint kthKey = 0u;       // key of the k-th largest scaled value
+    uint cutIdx = NONE;     // top-k: among entries with key == kthKey only index <= cutIdx are kept (NONE = all ties kept)
+    if (useTopK) {
+        // largest candidate with count(key >= candidate) >= k  ==  key of the k-th largest value
+        uint cand = 0u;
+        for (int bit = 31; bit >= 0; bit--) {
+            uint t = cand | (1u << uint(bit));
+            uint local = 0u;
+            // 4 independent loads in flight per iteration: the pass is memory-latency bound (one workgroup per row).
+            uint i = tid;
+            for (; i + 1536u < pc.vocab; i += 2048u) {
+                precise float s0 = logits[base + i] * invTemp;
+                precise float s1 = logits[base + i + 512u] * invTemp;
+                precise float s2 = logits[base + i + 1024u] * invTemp;
+                precise float s3 = logits[base + i + 1536u] * invTemp;
+                local += uint(orderKey(s0) >= t) + uint(orderKey(s1) >= t) + uint(orderKey(s2) >= t) + uint(orderKey(s3) >= t);
+            }
+            for (; i < pc.vocab; i += 512u) {
+                precise float s = logits[base + i] * invTemp;
+                if (orderKey(s) >= t) local++;
+            }
+            if (groupSum(local, tid) >= topK) cand = t;
+        }
+        kthKey = cand;
+        uint above = 0u, ties = 0u;
+        for (uint i = tid; i < pc.vocab; i += 512u) {
+            precise float s = logits[base + i] * invTemp;
+            uint k = orderKey(s);
+            if (k > kthKey) above++;
+            else if (k == kthKey) ties++;
+        }
+        above = groupSum(above, tid);
+        ties = groupSum(ties, tid);
+        uint tiesAllowed = topK - above;
+        if (tiesAllowed < ties) {
+            // smallest index c with (#entries == kthKey at index <= c) >= tiesAllowed
+            uint cutoff = 0u;
+            for (int bit = 19; bit >= 0; bit--) {
+                // test whether the answer is > (cutoff | bit) - 1, i.e. count(index < cutoff|bit) < tiesAllowed
+                uint cand2 = cutoff | (1u << uint(bit));
+                uint local = 0u;
+                for (uint i = tid; i < pc.vocab && i < cand2; i += 512u) {
+                    precise float s = logits[base + i] * invTemp;
+                    if (orderKey(s) == kthKey) local++;
+                }
+                if (groupSum(local, tid) < tiesAllowed) cutoff = cand2;
+            }
+            cutIdx = cutoff;   // count(index < cutoff) < tiesAllowed <= count(index <= cutoff): the tiesAllowed-th tie sits at `cutoff`
+        }
+    }
 
     float best = 0.0;
     uint bestIdx = NONE;
     for (uint i = tid; i < pc.vocab; i += 512u) {
         float l = logits[base + i];
         if (floatBitsToUint(l) == 0xFF800000u) continue;   // -inf: excluded
-        precise float g = gumbelNoise(rp.x, rp.y, rp.z, i);
         precise float scaled = l * invTemp;
+        if (useMinP && scaled < thrMin) continue;
+        if (useTopK) {
+            uint k = orderKey(scaled);
+            if (k < kthKey) continue;
+            if (k == kthKey && cutIdx != NONE && i > cutIdx) continue;
+        }
+        precise float g = gumbelNoise(rp.x, rp.y, rp.z, i);
         precise float s = scaled + g;
         if (bestIdx == NONE || s > best) { best = s; bestIdx = i; }
     }
