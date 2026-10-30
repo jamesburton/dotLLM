@@ -14,6 +14,12 @@ public enum ExactGemvFormat
 
     /// <summary>IQ2_XXS (<c>matmul_iq2_xxs_gemv_multi</c>, needs the grid and ksigns tables; #1244).</summary>
     Iq2Xxs,
+
+    /// <summary>Q5_0 (<c>matmul_q5_0_gemv_multi</c>, #1420).</summary>
+    Q5_0,
+
+    /// <summary>Q4_0 (<c>matmul_q4_0_gemv_multi</c>, #1420).</summary>
+    Q4_0,
 }
 
 /// <summary>
@@ -83,6 +89,8 @@ public sealed class MatMulExactGemvMultiKernel : IDisposable
             ExactGemvFormat.Q8_0 => ("matmul_q8_0_gemv_multi.spv", 3, 32, 34),
             ExactGemvFormat.Nvfp4 => ("matmul_nvfp4_gemv_multi.spv", 3, QuantFormat.Nvfp4GroupSize, QuantFormat.Nvfp4BlockBytes),
             ExactGemvFormat.Iq2Xxs => ("matmul_iq2_xxs_gemv_multi.spv", 5, QuantFormat.KQuantGroupSize, QuantFormat.IQ2_XXSBlockBytes),
+            ExactGemvFormat.Q5_0 => ("matmul_q5_0_gemv_multi.spv", 3, 32, 22),
+            ExactGemvFormat.Q4_0 => ("matmul_q4_0_gemv_multi.spv", 3, 32, 18),
             _ => throw new ArgumentOutOfRangeException(nameof(format)),
         };
         string path = Path.Combine(spvDir, spv);

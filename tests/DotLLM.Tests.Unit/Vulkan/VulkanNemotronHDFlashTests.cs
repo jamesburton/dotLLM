@@ -38,12 +38,14 @@ public sealed class VulkanNemotronHDFlashTests : IDisposable
         try { Directory.Delete(_dir, recursive: true); } catch { /* best-effort */ }
     }
 
-    private (IModel, IKvCache) Vk(GgufFile gguf, ModelConfig config)
+    private (IModel, IKvCache) Vk(GgufFile gguf, ModelConfig config) => Vk(gguf, config, 0);
+
+    private (IModel, IKvCache) Vk(GgufFile gguf, ModelConfig config, int maxSeq)
     {
         var device = VulkanDevice.Create();
         _devices.Add(device);
         var m = VulkanNemotronHTransformerModel.BuildFromGguf(device, gguf, config, _spvDir);
-        return (m, m.CreateKvCache(config.MaxSequenceLength));
+        return (m, m.CreateKvCache(maxSeq > 0 ? maxSeq : config.MaxSequenceLength));
     }
 
     private static unsafe float[] Rows(ITensor t, int rows, int vocab)
@@ -108,6 +110,52 @@ public sealed class VulkanNemotronHDFlashTests : IDisposable
         }
         _out.WriteLine($"rowExact={rowExact}: {differing} of {rows.Length * vocab} logits differ from decode");
         if (!rowExact) Assert.True(differing > 0, "the prefill kernels matched decode bit for bit: the test would not catch a regression");
+    }
+
+    /// <summary>
+    /// #1420: the same bit-identity on the real Nemotron-3-Nano-4B Q4_K_M (Q5_0 ssm_in / ffn_up, Q4_K ssm_out, Q6_K and Q8_0 tensors): a 2- and
+    /// an 8- and a 13-row forward give, row for row, the bits of single-row decodes through the new Q5_0 / Q4_K / Q6_K multi-column GEMVs.
+    /// <c>DOTLLM_NEMOTRON_NANO_GGUF</c> overrides the path.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(2)]
+    [InlineData(8)]
+    [InlineData(13)]
+    public void RealNano_SmallBatch_EveryRow_IsBitIdenticalToDecode(int nRows)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out _spvDir);
+        string path = Environment.GetEnvironmentVariable("DOTLLM_NEMOTRON_NANO_GGUF")
+            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dotllm", "models", "lmstudio-community",
+                "NVIDIA-Nemotron-3-Nano-4B-GGUF", "NVIDIA-Nemotron-3-Nano-4B-Q4_K_M.gguf");
+        Skip.IfNot(File.Exists(path), "Nemotron-3-Nano-4B Q4_K_M not present.");
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var (model, kv) = Vk(gguf, config, 512);
+        using var _m = (IDisposable)model;
+        using var _k = kv;
+        int vocab = config.VocabSize;
+        Assert.True(((VulkanNemotronHTransformerModel)model).TrySetAllRowLogitsLimit(16));
+        int[] prompt = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3, 2, 3, 8, 4, 6];
+        int[] rows = Enumerable.Range(0, nRows).Select(i => 1000 + 37 * i).ToArray();
+        int[] P(int start, int n) => Enumerable.Range(start, n).ToArray();
+
+        using (model.Forward(prompt, P(0, prompt.Length), -1, kv)) { }
+        long before = Interlocked.Read(ref MatMulExactGemvMultiKernel.Dispatches);
+        float[] batched;
+        using (var l = model.Forward(rows, P(prompt.Length, rows.Length), -1, kv)) batched = Rows(l, rows.Length, vocab);
+        Assert.True(Interlocked.Read(ref MatMulExactGemvMultiKernel.Dispatches) - before > 0, "no exact multi-column GEMV ran");
+
+        model.ResetSequenceState();
+        kv.Rollback(0);
+        using (model.Forward(prompt, P(0, prompt.Length), -1, kv)) { }
+        for (int r = 0; r < rows.Length; r++)
+        {
+            float[] one;
+            using (var l = model.Forward([rows[r]], [prompt.Length + r], -1, kv)) one = Rows(l, 1, vocab);
+            for (int v = 0; v < vocab; v++)
+                Assert.True(BitConverter.SingleToInt32Bits(one[v]) == BitConverter.SingleToInt32Bits(batched[r * vocab + v]),
+                    $"row {r} logit {v}: decode {one[v]:R} vs batch {batched[r * vocab + v]:R}");
+        }
     }
 
     /// <summary>Checkpoint before a forward, restore: the replayed forward equals the original, bit for bit.</summary>

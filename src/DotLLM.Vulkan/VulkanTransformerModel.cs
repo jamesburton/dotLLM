@@ -5312,6 +5312,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         _smallRowQ6KR2?.InvalidateDescriptorCache();
         _smallRowF32?.InvalidateDescriptorCache();
         _smallRowQ8?.InvalidateDescriptorCache();
+        _smallRowQ8Wide?.InvalidateDescriptorCache(); _smallRowQ4_0?.InvalidateDescriptorCache(); _smallRowQ5_0?.InvalidateDescriptorCache();
         _smallRowAttn?.InvalidateDescriptorCache();
         _smallRowAttnKvF16?.InvalidateDescriptorCache();
         _splitKvAttentionKvF16?.InvalidateDescriptorCache();
@@ -9467,6 +9468,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         _smallRowQ6KR2?.Dispose();
         _smallRowF32?.Dispose();
         _smallRowQ8?.Dispose();
+        _smallRowQ8Wide?.Dispose(); _smallRowQ4_0?.Dispose(); _smallRowQ5_0?.Dispose();
         _smallRowAttn?.Dispose();
         _smallRowAttnKvF16?.Dispose();
         _splitKvAttentionKvF16?.Dispose();

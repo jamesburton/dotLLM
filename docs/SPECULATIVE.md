@@ -1349,6 +1349,36 @@ over the dequantised weights; ragged M, K of 3 blocks, M below NR), `VulkanMatMu
 CUDA has the same 8-column caps (`Pq2_0GemvMultiMaxColumns`, `CudaQ8_0RbGemv.MaxColumns`, `CudaSmallSGemvDispatch.MaxColumns`); not measured here (#1375). The shared
 `PQ2_0SmallNDispatch` cap stays 8 on the MoE host and `VulkanTransformerModel` (their 9..16-row PQ2_0 path is unmeasured, #1374 below). Remaining: 17..32 rows (#1376), Q5_K / Q6_K / IQ4_XS / IQ3_S wide kernels (#1377), (the DFlash K >= 8 premise in the stage-1 takeaways was wrong and is corrected above, #1378).
 
+#### Nemotron-H small-row GEMVs for Q5_0 / Q4_K / Q6_K / Q4_0 (issue #1420)
+
+`VulkanNemotronHTransformerModel` had exact multi-column GEMVs only for NVFP4 / IQ2_XXS / Q8_0 (#1244); every other quant fell to the GEMM for 2..16 rows. Measured with
+`VerifyRowCurve` on NVIDIA-Nemotron-3-Nano-4B Q4_K_M (tensor census: 49 Q5_0 incl. `ssm_in`/`ffn_up`, 33 Q4_K, 9 Q6_K, 3 Q8_0), ctx 64, 3 reps x 3, `fwd` median ms:
+**1 row 16.9, 2 rows 280.4 (16.6x decode), 3-5 rows 282, 8 rows 284, 16 rows 280.6** (a flat ~265 ms fixed GEMM cost; this also hit every short prompt chunk).
+Now Q5_0 and Q4_0 take new `matmul_q5_0_gemv_multi` / `matmul_q4_0_gemv_multi` shaders (the Q8_0 multi shader's layout: 4 lanes per 32-block, `precise` fma chain, fixed
+shared-memory tree) and Q4_K / Q6_K the dense-host `MatMulQuantGemvMultiKernel` (Q4_K, Q6_K_Rows), all with decode = the 1-column dispatch, so every row is bit-identical to a
+decode step (`DOTLLM_VK_NEMOTRON_EXACT_GEMV=0` restores the old dispatch, `DOTLLM_VK_NEMOTRON_KQUANT_ROWS=0` only the K-quant part). Result, same harness:
+
+| rows | 1 | 2 | 3 | 4 | 5 | 8 | 12 | 16 |
+|---|---|---|---|---|---|---|---|---|
+| before ms | 16.9 | 280.4 | 282.0 | 282.1 | 281.7 | 284.1 | 282.9 | 280.6 |
+| after ms | 17.0 | 19.9 | 21.3 | 24.6 | 30.3 | 23.4 | 30.1 | 35.6 |
+
+(`verify` series, `ForwardWithRecurrentSnapshots`: 18.1 / 19.3 / 22.6 / 28.0 / 21.4 / 27.8 / 35.2.) Decode is unchanged (17.0 vs 16.9; ranges 16.0-21.0 vs 16.5-19.0).
+Parity: `VulkanExactGemvMultiTests.LegacyQ_*` (every column bit-identical to its one-column dispatch AND within 1e-3 + 1e-4 rel of an f64 dot over the dequantised weights, random
+blocks so every 5th-bit / nibble pattern occurs, M % NR != 0, K of 3 blocks, 1..16 columns) and `VulkanNemotronHDFlashTests.RealNano_SmallBatch_EveryRow_IsBitIdenticalToDecode`
+(2 / 8 / 13 rows of the real file, all logits bit-identical to single-row decodes). The 5-row point is a tuning leftover (NR=4 for 4 < n < 8 is slower than at 8).
+
+#### Dense `VulkanTransformerModel`: Q8_0 5..16 rows, Q4_0 / Q5_0 2..16 rows (issue #1420)
+
+The Q8_0 Q8_1-activation MMVQ multi GEMV stops at 4 rows, so Llama-3.2-3B Q8_0 jumped from 29 ms (2..4 rows) to 39-40 ms (5..16) on the GEMM, against 19.5 ms for decode.
+5..16 rows now run `MatMulQ8_0GemvMultiKernel` (F32 activations, NR 4), and Q4_0 / Q5_0 the new `matmul_q{4,5}_0_gemv_multi` shaders (from #1420 above) for 2..16 rows.
+`VerifyRowCurve ab` (in-process, order alternated, 4 reps x 5, ctx 64, median ms; old = `DOTLLM_VK_SMALLROW_LEGACYQ=0` arm): 2 rows 28.9 / 28.9 (MMVQ, unchanged), 4 rows 29.3 / 29.0,
+**5 rows 38.8 -> 29.0, 8 rows 39.4 -> 30.1, 12 rows 40.1 -> 32.0, 16 rows 40.4 -> 35.7** (ranges within 1 ms of the medians below 12 rows, <= 2.6 ms at 16).
+The rows are ULP-close, not bit-equal, to decode (decode quantises its activation to Q8_1): `DenseSmallRowLegacyQTests` (Llama-3.2-1B Q8_0 5/8/16 rows: max|batched - seq| 0.20 / 0.41 / 0.41 against
+0.20 / 0.75 / 0.75 on the old path; argmax identical) and on SmolLM-135M Q5_0 (2/9/16 rows) the batched forward tracks an F32-activation decode (`DOTLLM_VULKAN_DISABLE_MMVQ=1`) to 6e-3..1.4e-2
+while the MMVQ decode itself is 0.3..0.8 off it on that degenerate model (Q8_1 activation noise), which is why that test allows an argmax flip only inside the measured noise.
+No local dense Q4_0 model: the Q4_0 shader is covered by the kernel tests only (bit-identical columns + f64 reference), not timed end to end.
+
 #### 17..32-row verify (issue #1376): measured, not built
 
 `VerifyRowCurve` (Qwen3.8-27B Q4_K_M, ctx 64, 3 reps x 3, `dev` @ cc686e1d, both locks held, ollama idle), `fwd` median (min-max) ms: 1 row 102.9 (101.4-106.5),

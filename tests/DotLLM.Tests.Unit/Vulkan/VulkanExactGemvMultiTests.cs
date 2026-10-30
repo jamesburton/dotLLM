@@ -88,6 +88,36 @@ public class VulkanExactGemvMultiTests
     }
 
     /// <summary>
+    /// #1420: Q5_0 / Q4_0 (Nemotron-H Nano Q4_K_M keeps ssm_in / ffn_up in Q5_0). Random blocks (every nibble and 5th-bit pattern, so a transposed
+    /// qh bit or nibble half is visible in the dequantised-reference check), small fp16 d at byte 0; 1..16 columns, M % NR != 0, K of 3 blocks.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(ExactGemvFormat.Q5_0, 37, 3136, 1, 4, 8)]    // Nano ssm_in K
+    [InlineData(ExactGemvFormat.Q5_0, 41, 3136, 2, 4, 16)]
+    [InlineData(ExactGemvFormat.Q5_0, 40, 96, 1, 8, 3)]      // K = 3 blocks: window tail
+    [InlineData(ExactGemvFormat.Q5_0, 29, 12544, 1, 2, 13)]  // ffn_down-like K
+    [InlineData(ExactGemvFormat.Q4_0, 37, 3136, 1, 4, 8)]
+    [InlineData(ExactGemvFormat.Q4_0, 41, 3136, 2, 4, 16)]
+    [InlineData(ExactGemvFormat.Q4_0, 40, 96, 1, 8, 3)]
+    [InlineData(ExactGemvFormat.Q4_0, 29, 12544, 1, 2, 13)]
+    public void LegacyQ_EachColumnBitIdenticalToOneColumnDispatch(ExactGemvFormat format, int m, int k, int decodeRows, int multiRows, int n)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        var rng = new Random(0x1420 + m * 7 + k * 11 + n * 13 + multiRows + (int)format);
+        int blockBytes = format == ExactGemvFormat.Q5_0 ? 22 : 18;
+        byte[] wq = new byte[m * (k / 32) * blockBytes];
+        rng.NextBytes(wq);
+        for (int off = 0; off < wq.Length; off += blockBytes)
+            BitConverter.TryWriteBytes(wq.AsSpan(off, 2), (Half)(0.002f + 0.004f * (float)rng.NextDouble()));
+        float[] x = F16Bf16Fixture.RandomFloats(rng, n * k, 1.0f);
+        using var kernel = Create(device, spvDir, format, decodeRows, multiRows);
+        VulkanDenseGemvRowsTests.AssertColumnsMatchOneColumnDispatch(device, wq, x, m, k, n,
+            format == ExactGemvFormat.Q5_0 ? QuantizationType.Q5_0 : QuantizationType.Q4_0,
+            (cmd, bw, bx, by, nn) => kernel.Record(cmd, bw, bx, by, m, k, nn));
+    }
+
+    /// <summary>
     /// A dispatch wider than 32,768 workgroups folds into y (<see cref="GemvColumns"/>); every row past the fold must still be computed
     /// (Bolt's 131,072-row LM head at one row per workgroup).
     /// </summary>

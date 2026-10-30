@@ -119,6 +119,8 @@ public class VulkanDenseGemvRowsTests
     [InlineData(48, 5120, 4, 16)]   // ssm_alpha / beta
     [InlineData(37, 6144, 3, 13)]   // M % NR != 0
     [InlineData(40, 96, 2, 12)]     // K = 3 blocks: window tail
+    [InlineData(49152, 576, 4, 9)]  // #1420: SmolLM-135M tied lm_head (K = 18 blocks: 16 + tail of 2)
+    [InlineData(49152, 576, 4, 16)]
     public void Q8Wide_EachColumnBitIdenticalToOneColumnDispatch(int m, int k, int wideRows, int n)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
