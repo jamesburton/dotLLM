@@ -30,8 +30,8 @@ Not attempted (same code path as a row above, or outside the 20-600M download ru
 same tokenizer wall as multilingual-e5). Encoder = bidirectional BERT-style (`BertEncoderModel`, CPU only);
 decoder-based embedders (Qwen3-Embedding, last-token pooling) run on `TransformerModel`, also CPU only.
 
-GPU: **no Vulkan or CUDA model implements `IEmbeddingModel`** (`grep` finds only `BertEncoderModel` and `TransformerModel`);
-the server returns 501 for a GPU-backed chat model and refuses encoders on a GPU device (#741 is the work item).
+GPU: Vulkan `VulkanTransformerModel` implements `IEmbeddingModel` since #1406 (section 5); CUDA models do not (the server returns 501),
+and encoders are refused on a GPU device (#741 is the work item).
 
 ## 2. Quality gate
 
@@ -255,11 +255,43 @@ coalescing but no parallelism.
 
 ## 5. Vulkan / CUDA
 
-No GPU encoder (#741): BERT/nomic-bert on a GPU device is refused by design. For the decoder-embedder case,
-`dotllm bench -d vulkan` on Qwen3-Embedding-0.6B F16 (prefill is the whole embedding cost; one extra token), 3 reps, gpu-lock held:
-**pp64 1.66k tok/s, pp256 4.3k, pp512 5.2-5.4k** (38 / 59 / 96-99 ms per document) versus 163-182 tok/s on CPU: **9-30x**.
-That is ~26 docs/s at 64 tokens and ~10 docs/s at 512 on the iGPU - but the Vulkan Qwen3 model has no hidden-state
-output (`IEmbeddingModel`), so `/v1/embeddings` cannot use it yet (lever 6). No CUDA run (T5500 needs the user's go-ahead).
+**Decoder embedders run on Vulkan (#1406).** `VulkanTransformerModel` implements `IEmbeddingModel`: the forward is the unchanged
+graph up to llama.cpp's `result_norm`, then the final RMSNorm of the pooled row(s) only, written straight into a host-readback buffer.
+No LM head runs, and for last/cls pooling only **one row** (`hiddenSize` F32 = 4 KiB for Qwen3-Embedding) is copied, normalised and read back;
+mean pooling reads all rows. The new `IEmbeddingModel.ForwardHiddenForPooling(sequences, pooling, consume, device)` delivers exactly the rows
+pooling reads (default = slice of `ForwardHiddenBatch`, so the CPU models are unchanged); `EmbeddingBatcher`, `dotllm embed` and
+`EmbeddingBench` all use it. Cacheless forward, positions 0..n-1, one sequence per submit (no cross-sequence batching on the GPU yet).
+Weights stay F16 and resident (no expansion); the only added storage is the readback buffer (`rows x hidden x 4 B`, one row for last/cls).
+
+Use: `dotllm embed <qwen3-embedding.gguf> -d vulkan "text"` (default device stays `cpu`), `dotllm serve ... --device vulkan` then
+`POST /v1/embeddings` (batched requests go through the #1405 batcher; Vulkan runs the sequences back to back). Encoders (BERT / nomic-bert)
+on a GPU device stay a **loud refusal**: `embed` fails with a `DeviceUnavailableException` message naming #741; the server's encoder loader throws
+(no silent CPU run, `auto` falls to CPU with the usual warning). Validated architecture: Qwen3 (Qwen3-Embedding-0.6B F16) only; other
+architectures on `VulkanTransformerModel` share the graph but are unvalidated.
+
+**Parity** (`Qwen3EmbeddingVulkanParityTests`, 9 texts: the committed 4-text sentence-transformers fixture + a 1-char text, unicode, 3 long
+texts up to ~450 tokens): Vulkan vs CPU last-token cosine >= 0.9999 and Vulkan vs sentence-transformers fp32 >= 0.9999 (all pass), mean pooling
+Vulkan vs CPU >= 0.9999, one-row readback identical to the last row of the all-row readback, and control arms (unrelated texts < 0.95; no-EOS Vulkan
+vector < 0.99 vs the reference). `dotllm embed "Hello"` on cpu vs vulkan differs in the 4th-5th significant digit (F16 GEMM order).
+
+**Throughput**, `EmbeddingBench throughput --device vulkan|cpu`, Qwen3-Embedding-0.6B F16, 8 documents back to back, `gpu-lock` + `cpu-bench` held,
+paired in order V C C V V C (raw: `benchmarks/EmbeddingBench/results/vulkan-1406.jsonl`), docs/s | tokens/s, min-max over runs:
+
+| seq | Vulkan (iGPU 8060S) | CPU (32 threads, tree with #1404) | ratio |
+|---|---|---|---|
+| 64 | 28.4-29.7 \| 1.8-1.9k | 12.7-13.1 \| 0.81-0.84k (one contended run 6.5) | 2.2x |
+| 256 | 18.2-18.7 \| 4.7-4.8k | 3.16-3.34 \| 0.81-0.85k | 5.6x |
+| 512 | 11.1-11.3 \| 5.7-5.8k | 1.41-1.50 \| 0.67-0.77k | 7.5-8x |
+
+The "9-30x" quoted in the survey compared against the pre-#1404 CPU numbers (163-182 tok/s); F16 GEMM on the CPU has since improved ~4.5x, so
+the honest Vulkan advantage today is 2x (short) to ~8x (512 tokens). Vulkan is per-document-latency bound at 64 tokens (35 ms: launch +
+submit per document); batching several short documents into one forward (padding-free varlen) is the next lever (issue filed).
+No CUDA run (T5500 needs the user's go-ahead). End-to-end `/v1/embeddings` on Vulkan returns 1024-d vectors (smoke-tested, 2 inputs, 10 prompt tokens).
+
+**#741 (GPU BERT encoder), plan only, not started:** needs bidirectional attention (the Vulkan attention shader has a Bidirectional
+mask mode from DiffusionGemma), LayerNorm + bias adds, absolute position / token-type embeddings, GELU, and mean/cls pooling; reuse the coopmat
+prefill GEMM tiles for QKV/out/FFN, a padded-or-varlen batch of length-sorted documents (section 3 padding table) and the same
+`ForwardHiddenForPooling` contract (mean = GPU-side reduction). Expect well above 5k tok/s on 110M-class encoders (unmeasured).
 
 ## 6. Ranked levers (expected wins, from the measurements above)
 
@@ -277,7 +309,7 @@ the same harness, the cosine gate, and a discriminating shape.
    use the Q8_0 GGUF: 1.4-2x faster at 0.9996+ cosine).
 5. (#1405) **Server dynamic batching** for `/v1/embeddings` (collect requests for a few ms, run lever 1 across clients; length-sort so a padded
    path never sees the 60-78 % waste above). Needed for any concurrency scaling; the current gate makes N clients no faster than 1.
-6. (#1406) **Vulkan hidden-state path for decoder embedders** (Qwen3-Embedding-0.6B: 9-30x over CPU, ~26 docs/s at 64 tok today's kernels),
+6. (#1406, DONE) **Vulkan hidden-state path for decoder embedders** (Qwen3-Embedding-0.6B: 2.2x/5.6x/8x over the current CPU at 64/256/512 tokens, 29 docs/s at 64 tok),
    then the **GPU BERT encoder (#741)** reusing the coopmat prefill tiles (110M-class encoders are ~5x fewer FLOPs than the 0.6B
    decoder, so expect well above 5k tok/s; unmeasured).
 7. **Correctness/coverage** (#1398 EOS: FIXED; #1399 gemma-embedding, #1400 nomic-bert-moe, #1401 XLM-R tokenizer): Qwen3-Embedding needs `<|endoftext|>` appended before last-token pooling (llama.cpp does it; dotLLM

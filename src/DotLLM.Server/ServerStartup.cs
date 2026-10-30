@@ -257,7 +257,7 @@ public static class ServerStartup
             gguf.Dispose();
             throw new NotSupportedException(
                 $"{config.Architecture} embedding models are CPU-only for now (requested device '{options.Device}'). "
-                + "Use --device cpu; GPU encoder backends are not implemented and there is no silent CPU fallback.");
+                + "Use --device cpu; GPU encoder backends are not implemented (#741) and there is no silent CPU fallback. Decoder embedders (Qwen3-Embedding) do run on --device vulkan.");
         }
         var threading = new ThreadingConfig(options.Threads, options.DecodeThreads);
         Console.WriteLine($"[dotllm] CPU inference, {config.Architecture} encoder ({threading.EffectiveThreadCount} threads); embeddings only");
