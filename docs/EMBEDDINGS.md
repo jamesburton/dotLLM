@@ -196,23 +196,23 @@ gate GEMM for nomic):
   reference the Q8_0 figures are unchanged within noise (bge-small 0.999612 / 0.999836 old vs 0.999612 / 0.999837 new,
   bge-base 0.999664 / 0.999804 vs 0.999591 / 0.999804, mxbai 0.998643 / 0.999769 vs 0.998745 / 0.999767, min / mean), i.e. the
   gate (F16 >= 0.9999; Q8 figure recorded, recall unmoved) holds. `--legacy-gelu 1` is the same-session A/B arm. Paired A/B,
-  32 threads, 3 reps alternating order, `profile` Act stage and document total (ms/doc, min-max), legacy -> new (measured on a
-  tree without the #1402 attention change, so totals still contain serial attention):
+  32 threads, 3 reps alternating order, `profile` Act stage and document total (ms/doc, min-max), legacy -> new, measured on
+  the tree that already has the parallel attention of #1402 (so the totals are no longer diluted by serial attention):
 
 | Model | seq | Act stage | Document total |
 |---|---|---|---|
-| bge-base Q8_0 | 256 | 93-114 -> 1.6-1.9 | 370-590 -> 277-290 |
-| bge-base Q8_0 | 512 | 182-230 -> 3.1-27 (noisy rep) | 1054-1586 -> 853-1259 (box contended; see rerun) |
-| bge-base F16 | 256 / 512 | 91-94 -> 1.6-1.7 / 174-182 -> 2.1-2.7 | 304-323 -> 222-233 / 859-973 -> 767-776 |
-| bge-small Q8_0 | 256 / 512 | 56-58 -> 1.4-1.5 / 108-109 -> 1.6-1.9 | 241-251 -> 177-178 / 730-782 -> 607-622 |
-| bge-small F16 | 256 / 512 | 56-58 -> 1.6 / 108-109 -> 1.8-1.9 | 217-235 -> 162-177 / 673-753 -> 581-632 |
-| MiniLM Q8_0 | 256 / 512 | 23-24 -> 0.7-0.9 / 45-46 -> 1.5-1.6 | 116-118 -> 88-99 / 357-368 -> 307-343 |
+| bge-base Q8_0 | 256 / 512 | 95.6-97.2 -> 1.6-1.8 / 194-197 -> 2.1-2.2 | 221-224 -> 109-111 / 448-456 -> 238-255 |
+| bge-base F16 | 256 / 512 | 93-96 -> 1.6-4.0 / 192-194 -> 1.8-2.0 | 176-180 -> 78-92 / 367-377 -> 171-181 |
+| bge-small Q8_0 | 256 / 512 | 56.5-57 -> 1.4-4.7 / 113-114 -> 1.5-1.6 | 110-114 -> 51-59 / 241-243 -> 112 |
+| bge-small F16 | 256 / 512 | 56 -> 2.5-3.8 / 113-114 -> 1.5-1.7 | 99-100 -> 54-62 / 213-218 -> 90-100 |
+| MiniLM Q8_0 | 256 / 512 | 23.6 -> 2.6-3.2 / 47 -> 0.8-1.9 | 53-68 -> 43-81 (noisy) / 111-114 -> 57-60 |
 
-  The GELU stage drops 30-100x (target was removing 18-31 % of the document: met, 1.2-1.4x on the whole document at 256 tokens
-  incl. the Amdahl share left by serial attention). 48-text e2e docs/s (median of 3 reps): bge-base F16 5.2-5.4 -> 6.4-7.5,
-  bge-small F16 7.9-8.0 -> 9.8-9.9, bge-small Q8 7.2-7.4 -> 9.0-9.1, MiniLM Q8 13.4-14.5 -> 17.6-17.8, bge-base Q8
-  3.6-4.6 -> 5.7-6.2 (second run; the first run, 4.2-4.6 -> 3.4-5.5, overlapped with other load on the shared box and is not
-  quoted). Raw rows: `benchmarks/EmbeddingBench/results/ab-gelu-1403.jsonl`.
+  The GELU stage drops 25-100x and the whole document is 1.9-2.2x faster at 256-512 tokens (bge-small Q8 at 512: 241-243 ->
+  112 ms; bge-base Q8: 448-456 -> 238-255 ms). The 64-token cells are cold-start noisy (8 iterations) and the MiniLM 256 total
+  has one contended rep. 48-text e2e docs/s (median of 3 reps): bge-base Q8 7.8 -> 14.2-14.7, bge-base F16 9.4-9.6 -> 20.6-21.0,
+  bge-small Q8 14.8-14.9 -> 30.9-33.1, bge-small F16 16.7-16.8 -> 39.7-40.7, MiniLM Q8 32.5-33.1 -> 64.0-65.3. Raw rows:
+  `benchmarks/EmbeddingBench/results/ab-gelu-1403.jsonl` (rerun on the merged tree; the earlier pre-attention run is kept in
+  the same file before it: it showed the same Act-stage drop with totals diluted by serial attention).
 * Amdahl view at 32 threads, bge-base Q8 at 64 tokens: ~44 % of the document is the two serial stages (Attention + GELU).
 
 ### Inter-sequence parallelism and server batching (#1405)
