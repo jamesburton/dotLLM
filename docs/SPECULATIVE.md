@@ -1379,6 +1379,22 @@ The rows are ULP-close, not bit-equal, to decode (decode quantises its activatio
 while the MMVQ decode itself is 0.3..0.8 off it on that degenerate model (Q8_1 activation noise), which is why that test allows an argmax flip only inside the measured noise.
 No local dense Q4_0 model: the Q4_0 shader is covered by the kernel tests only (bit-identical columns + f64 reference), not timed end to end.
 
+#### 17..32-row verify (issue #1376): measured, not built
+
+`VerifyRowCurve` (Qwen3.8-27B Q4_K_M, ctx 64, 3 reps x 3, `dev` @ cc686e1d, both locks held, ollama idle), `fwd` median (min-max) ms: 1 row 102.9 (101.4-106.5),
+8 rows 164.3 (159.3-167.8), 16 rows 276.0 (271.9-282.1; `verify` 277.5), **17 rows 997.6 (979.9-1023.4), 20 rows 990.4, 24 rows 1005.6, 32 rows 1019.3 (973.2-1029.4)**.
+So the 16 -> 17 step is a 3.6x cliff and 17..32 rows are flat at ~1 s (the GEMM's fixed cost: 128x128 coopmat tile + per-projection F16 dequant, #495/#1107 rule 2);
+the 553 ms quoted for 32 rows in the stage-1 table was a different build and the GEMM path has not been stable between builds (320 / 462 / 578 / ~1000 ms).
+
+Why nothing was built: the only way to serve 17..32 rows on the existing GEMVs is two dispatches per projection (columns 0..15 and 16..n-1), which needs
+column-offset descriptors/push constants in every multi-column kernel (the `Record` APIs take whole buffers and the descriptor cache is keyed on handles). The
+ceiling of that is ~16-row cost x 2 = ~550 ms (13 ms/row marginal at 9..16 rows, so 32 rows ~ 135 + 24 x 13 = ~450-550 ms): 4.4-5.4x a decode step. Break-even
+needs `(1 + a) / (1 + C/decode_step)`: at 32 rows that is ~5.4 accepted tokens per round just to match plain decode, against the measured 3.05-3.06 tokens/round
+(Qwen3.6 CPU head, Bonsai-2 MTP). The 16-row tree already did not open the gate (+53..63 % `g*` from the arithmetic above needs acceptance the drafters do not
+deliver), and nothing calls a 17..32-row verify: `ForwardWithRecurrentSnapshots` is capped at `GemvColumns.MaxColumns = 16`, so only plain `Forward` (e.g. prefill
+of a short chunk) lands there. The real fix for that range would be an int8-dot / coopmat tile that reads the quantized blocks (dequant in the tile load), a new GEMM
+family, KL-checked; it is only worth building if a drafter with >= 6 accepted tokens/round or a tree consumer appears. Tracked in #1376; reopen then.
+
 #### Verify-cliff on the MoE host and `VulkanTransformerModel` (issue #1374)
 
 `VulkanQwen3MoeHybridTransformerModel` now serves 9..16 rows on the same wide multi-column GEMVs through the `AcceptsColumns` gate: Q4_K, Q6_K_Rows

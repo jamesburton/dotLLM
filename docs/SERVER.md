@@ -1367,6 +1367,12 @@ Default policy is permissive (`AllowAnyOrigin`) for local Chat UI development. F
 
 These are designed for the local Chat UI workflow and must not be internet-exposed.
 
+### Prompt injection of control tokens (#1339)
+
+Chat endpoints (`/v1/chat/completions`, `/v1/messages`, `/api/chat`, `/api/generate` without `raw`) tokenize message and tool
+text as plain text: a message containing `<|im_end|>` cannot end a turn. Raw completion endpoints are unchanged. See
+[TOKENIZERS.md](TOKENIZERS.md#trust-model-chat-content-never-tokenizes-into-control-tokens-1339).
+
 ## Concurrency
 
 The server has two execution paths and picks per-request:
