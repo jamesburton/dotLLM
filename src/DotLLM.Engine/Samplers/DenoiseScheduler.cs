@@ -130,12 +130,14 @@ public sealed class DenoiseScheduler
     /// <param name="step">Zero-based step index.</param>
     /// <param name="maskedCount">Number of positions still masked at the start of the step.</param>
     /// <param name="logitSoftCap">Optional Gemma final-logit soft-cap; 0 disables.</param>
-    public DiffusionStepContext CreateStepContext(int step, int maskedCount, float logitSoftCap = 0f)
+    /// <param name="tokenIndexBase">Absolute sequence index of canvas position 0 (see <see cref="DiffusionStepContext.TokenIndexBase"/>).</param>
+    public DiffusionStepContext CreateStepContext(int step, int maskedCount, float logitSoftCap = 0f, int tokenIndexBase = 0)
         => new(
             Temperature: TemperatureForStep(step),
             UnmaskBudget: UnmaskBudgetForStep(step, maskedCount),
             EntropyBound: _config.EntropyBound,
-            LogitSoftCap: logitSoftCap);
+            LogitSoftCap: logitSoftCap,
+            TokenIndexBase: tokenIndexBase);
 
     /// <summary>
     /// Decides whether the denoising loop should stop after a completed step. Mirrors the
