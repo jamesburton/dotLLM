@@ -77,7 +77,7 @@ public static class GgufChatTemplateFactory
 
         string bosToken = tokenizer.DecodeToken(tokenizer.BosTokenId);
         string eosToken = tokenizer.DecodeToken(tokenizer.EosTokenId);
-        return new JinjaChatTemplate(template, bosToken, eosToken);
+        return new JinjaChatTemplate(template, bosToken, eosToken, tokenizer);
     }
 
     /// <summary>
@@ -98,13 +98,13 @@ public static class GgufChatTemplateFactory
         // Approach A: BitNet's built-in GGUF template has no tool support.
         // Substitute the tool-aware template unconditionally for BitNet.
         if (architecture == Architecture.BitNet)
-            return new JinjaChatTemplate(BitNetToolAwareTemplateText, bosToken, eosToken);
+            return new JinjaChatTemplate(BitNetToolAwareTemplateText, bosToken, eosToken, tokenizer);
 
         string? template = metadata.GetStringOrDefault("tokenizer.chat_template", null!);
         if (string.IsNullOrEmpty(template))
             return null;
 
-        return new JinjaChatTemplate(template, bosToken, eosToken);
+        return new JinjaChatTemplate(template, bosToken, eosToken, tokenizer);
     }
 
     /// <summary>
@@ -114,7 +114,7 @@ public static class GgufChatTemplateFactory
     public static JinjaChatTemplate CreatePlainFallback(ITokenizer tokenizer)
         => new(PlainCompletionTemplateText,
             tokenizer.DecodeToken(tokenizer.BosTokenId),
-            tokenizer.DecodeToken(tokenizer.EosTokenId));
+            tokenizer.DecodeToken(tokenizer.EosTokenId), tokenizer);
 
     /// <summary>
     /// Tries to create a <see cref="JinjaChatTemplate"/> from a ModelConfig.
@@ -123,12 +123,13 @@ public static class GgufChatTemplateFactory
     /// <param name="config">Model configuration with chat template string.</param>
     /// <param name="bosToken">BOS token string.</param>
     /// <param name="eosToken">EOS token string.</param>
-    public static JinjaChatTemplate? TryCreate(ModelConfig config, string bosToken, string eosToken)
+    /// <param name="guardTokenizer">Tokenizer used to guard untrusted chat text against control-token injection (#1339); null = unguarded.</param>
+    public static JinjaChatTemplate? TryCreate(ModelConfig config, string bosToken, string eosToken, ITokenizer? guardTokenizer = null)
     {
         if (string.IsNullOrEmpty(config.ChatTemplate))
             return null;
 
-        return new JinjaChatTemplate(config.ChatTemplate, bosToken, eosToken);
+        return new JinjaChatTemplate(config.ChatTemplate, bosToken, eosToken, guardTokenizer);
     }
 
     /// <summary>

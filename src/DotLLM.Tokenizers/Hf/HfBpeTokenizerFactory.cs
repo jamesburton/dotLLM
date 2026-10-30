@@ -347,4 +347,6 @@ internal sealed class NormalizingTokenizer(ITokenizer inner, NormalizationForm f
     public string Decode(ReadOnlySpan<int> tokenIds, bool stripBosSpace) => _inner.Decode(tokenIds, stripBosSpace);
     public string DecodeToken(int tokenId) => _inner.DecodeToken(tokenId);
     public int CountTokens(string text) => Encode(text).Length;
+    public string MarkUntrustedSpecials(string text, IReadOnlyList<string>? exemptPrefixes = null)
+        => _inner.MarkUntrustedSpecials(text, exemptPrefixes);
 }

@@ -334,6 +334,29 @@ open channel) or `Harmony` (gpt-oss). `ReasoningSplitter` takes the tag pair as 
 
 If no template found in model metadata, use configurable default (ChatML). Log a warning.
 
+### Trust model: chat content never tokenizes into control tokens (#1339)
+
+The template renders template literals and caller text (message `content`, tool results, tool-call names/arguments,
+tool definitions, `chat_template_kwargs`, reasoning content) into one string, and `BpeTokenizer` recognises special-token
+spellings anywhere in a string. Without a guard, a user message or tool result (web page, file, another agent's output)
+containing `<|im_end|>`, `</think>`, `<tool_response>`, ... becomes a real control token and can close a turn, open a new
+one or forge a tool frame.
+
+`JinjaChatTemplate` (built through `GgufChatTemplateFactory` with the model tokenizer) passes every caller string through
+`ITokenizer.MarkUntrustedSpecials`, which inserts the noncharacter `U+FDD0` (`ControlTokenGuard.Marker`) after the first
+character of each special spelling. The marker is carried in-band through rendering (so every `Encode(prompt)` call site is
+covered with no plumbing), and `BpeTokenizer.Encode/EncodeRaw` strip it and encode the surrounding text as plain text.
+Spellings written by the template itself are never marked, so turn markers, BOS and tool markers still tokenize to control
+ids and ordinary conversations tokenize byte-identically to before.
+
+- Raw entry points keep scan-everything semantics: `/v1/completions`, `/tokenize`, `/api/generate` with `raw: true`, CLI `run`
+  without a chat template. The caller writes those prompts. (A literal `U+FDD0` is dropped from every prompt.)
+- Replayed **assistant** content keeps the model's reasoning tags live (`<think>` / `</think>`, Gemma-4 channel tags) because
+  templates parse them out of history (Qwen3: `content.split('</think>')`); every other spelling in assistant content is guarded.
+- Encoder-only tokenizers (WordPiece, Unigram) are not on a chat path and are unchanged.
+- Known limit: a spelling assembled across a content/template boundary (content ends `<|im_`, template literal starts `end|>`)
+  is not detected; shipped templates emit whole spellings.
+
 ## Tool Calling Protocol
 
 ### Flow

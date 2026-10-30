@@ -1,4 +1,5 @@
 using System.Text.Json;
+using DotLLM.Tokenizers.Reasoning;
 
 namespace DotLLM.Tokenizers.ChatTemplates;
 
@@ -12,6 +13,8 @@ public sealed class JinjaChatTemplate : IChatTemplate
     private readonly string _bosToken;
     private readonly string _eosToken;
     private readonly bool _aliasXmlTools;
+    private readonly ITokenizer? _guard;
+    private readonly string[] _assistantExempt;
 
     private static readonly System.Text.RegularExpressions.Regex GenerationTag = new(
         @"\{%(-?)\s*(?:end)?generation\s*(-?)%\}", System.Text.RegularExpressions.RegexOptions.Compiled);
@@ -22,8 +25,15 @@ public sealed class JinjaChatTemplate : IChatTemplate
     /// <param name="templateSource">Jinja2 template string (from GGUF metadata or HuggingFace config).</param>
     /// <param name="bosToken">Beginning-of-sequence token string.</param>
     /// <param name="eosToken">End-of-sequence token string.</param>
-    public JinjaChatTemplate(string templateSource, string bosToken, string eosToken)
+    /// <param name="guardTokenizer">
+    /// When set, every caller-supplied string (message content, tool results and arguments, tool definitions,
+    /// template kwargs) is passed through <see cref="ITokenizer.MarkUntrustedSpecials"/> before rendering, so the
+    /// rendered prompt tokenizes such text as plain text and never as control tokens (#1339,
+    /// <see cref="ControlTokenGuard"/>). Null = no protection (tests, tooling that renders text only).
+    /// </param>
+    public JinjaChatTemplate(string templateSource, string bosToken, string eosToken, ITokenizer? guardTokenizer = null)
     {
+        _guard = guardTokenizer;
         _bosToken = bosToken;
         _eosToken = eosToken;
 
@@ -50,6 +60,12 @@ public sealed class JinjaChatTemplate : IChatTemplate
 
         TemplateSource = templateSource;
         ReasoningMarkup = Reasoning.ReasoningMarkups.Detect(templateSource);
+
+        // An assistant turn replayed from history legitimately carries its own reasoning tags, and the template
+        // (e.g. Qwen3: content.split('</think>')) parses them out of the content; those spellings stay live there.
+        _assistantExempt = ReasoningMarkup is Reasoning.ReasoningMarkup.Think or Reasoning.ReasoningMarkup.Gemma4Channel
+            ? [ReasoningMarkup.OpenTag(), ReasoningMarkup.CloseTag()]
+            : [];
 
         var lexer = new JinjaLexer(templateSource);
         var tokens = lexer.Tokenize();
@@ -79,8 +95,8 @@ public sealed class JinjaChatTemplate : IChatTemplate
         {
             var dict = new Dictionary<string, object?>
             {
-                ["role"] = msg.Role,
-                ["content"] = msg.Content,
+                ["role"] = Guard(msg.Role),
+                ["content"] = Guard(msg.Content, msg.Role == "assistant" ? _assistantExempt : null),
             };
 
             if (msg.ToolCalls is { Length: > 0 })
@@ -90,14 +106,14 @@ public sealed class JinjaChatTemplate : IChatTemplate
                 {
                     var tcDict = new Dictionary<string, object?>
                     {
-                        ["id"] = tc.Id,
+                        ["id"] = Guard(tc.Id),
                         ["type"] = "function",
                         ["function"] = new Dictionary<string, object?>
                         {
-                            ["name"] = tc.FunctionName,
+                            ["name"] = Guard(tc.FunctionName),
                             // Parse arguments JSON into dict so tojson in templates
                             // produces correct output (not double-serialized).
-                            ["arguments"] = ParseJsonToDict(tc.Arguments) ?? tc.Arguments,
+                            ["arguments"] = Guard(ParseJsonToDict(tc.Arguments) ?? tc.Arguments),
                         }
                     };
                     toolCalls.Add(tcDict);
@@ -106,11 +122,11 @@ public sealed class JinjaChatTemplate : IChatTemplate
             }
 
             if (msg.ToolCallId is not null)
-                dict["tool_call_id"] = msg.ToolCallId;
+                dict["tool_call_id"] = Guard(msg.ToolCallId);
 
             // Only when present: templates test `message.reasoning_content is string`.
             if (msg.ReasoningContent is not null)
-                dict["reasoning_content"] = msg.ReasoningContent;
+                dict["reasoning_content"] = Guard(msg.ReasoningContent);
 
             messageList.Add(dict);
         }
@@ -122,7 +138,7 @@ public sealed class JinjaChatTemplate : IChatTemplate
         if (options.TemplateKwargs is { Count: > 0 })
         {
             foreach (var (key, value) in options.TemplateKwargs)
-                context[key] = ConvertJsonElement(value);
+                context[key] = Guard(ConvertJsonElement(value));
         }
 
         // Reasoning switches: inserted only when the client set them, so an unset value stays
@@ -130,7 +146,7 @@ public sealed class JinjaChatTemplate : IChatTemplate
         if (options.EnableThinking is { } enableThinking)
             context["enable_thinking"] = enableThinking;
         if (options.ReasoningEffort is { Length: > 0 } effort)
-            context["reasoning_effort"] = effort;
+            context["reasoning_effort"] = Guard(effort);
         if (options.PreserveThinking is { } preserve)
             context["preserve_thinking"] = preserve;
 
@@ -150,9 +166,9 @@ public sealed class JinjaChatTemplate : IChatTemplate
                     ["type"] = "function",
                     ["function"] = new Dictionary<string, object?>
                     {
-                        ["name"] = tool.Name,
-                        ["description"] = tool.Description,
-                        ["parameters"] = ParseJsonToDict(tool.ParametersSchema),
+                        ["name"] = Guard(tool.Name),
+                        ["description"] = Guard(tool.Description),
+                        ["parameters"] = Guard(ParseJsonToDict(tool.ParametersSchema)),
                     }
                 };
                 tools.Add(toolDict);
@@ -167,6 +183,34 @@ public sealed class JinjaChatTemplate : IChatTemplate
         }
 
         return context;
+    }
+
+    /// <summary>Marks special-token spellings in untrusted caller text (see <see cref="ControlTokenGuard"/>).</summary>
+    private string? Guard(string? text, IReadOnlyList<string>? exempt = null)
+        => _guard is null || text is null ? text : _guard.MarkUntrustedSpecials(text, exempt);
+
+    /// <summary>Recursive <see cref="Guard(string?, IReadOnlyList{string}?)"/> over parsed JSON (strings and dictionary keys).</summary>
+    private object? Guard(object? value)
+    {
+        if (_guard is null)
+            return value;
+        switch (value)
+        {
+            case string s:
+                return _guard.MarkUntrustedSpecials(s);
+            case Dictionary<string, object?> d:
+                var copy = new Dictionary<string, object?>(d.Count);
+                foreach (var (k, v) in d)
+                    copy[_guard.MarkUntrustedSpecials(k)] = Guard(v);
+                return copy;
+            case List<object?> l:
+                var list = new List<object?>(l.Count);
+                foreach (var v in l)
+                    list.Add(Guard(v));
+                return list;
+            default:
+                return value;
+        }
     }
 
     /// <summary>
