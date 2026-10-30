@@ -45,8 +45,19 @@ public sealed partial class VulkanTransformerModel
     /// <summary>Dispatch counter of the Q4_K / Q5_K / IQ4_XS multi-column GEMVs (test / diagnostic).</summary>
     public long SmallRowKQuantCount { get; private set; }
 
-    /// <summary>A/B hook for VerifyRowCurve <c>ab</c>: true = K-quant multi-column GEMVs up to 16 rows, false = the pre-#917 MMQ / GEMM path (and Q6_K capped at 4 rows).</summary>
-    public static void SetSmallRowKQuantForBench(bool on) => SmallRowKQuantEnabled = on;
+    /// <summary>
+    /// <c>DOTLLM_VK_SMALLROW_LEGACYQ=0</c> keeps Q8_0 5..16-row and Q4_0 / Q5_0 2..16-row forwards on the MMQ / GEMM path (#1420 A/B). Runtime switch.
+    /// </summary>
+    internal static bool SmallRowLegacyQEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_SMALLROW_LEGACYQ") != "0";
+
+    /// <summary>Dispatch counter of the #1420 Q8_0 (5..16 rows) / Q4_0 / Q5_0 F32-activation multi-column GEMVs (test / diagnostic).</summary>
+    public long SmallRowLegacyQCount { get; private set; }
+
+    private MatMulQ8_0GemvMultiKernel? _smallRowQ8Wide;
+    private MatMulExactGemvMultiKernel? _smallRowQ4_0, _smallRowQ5_0;
+
+    /// <summary>A/B hook for VerifyRowCurve <c>ab</c>: true = K-quant multi-column GEMVs up to 16 rows (and the #1420 legacy-quant ones), false = the pre-#917 MMQ / GEMM path (and Q6_K capped at 4 rows).</summary>
+    public static void SetSmallRowKQuantForBench(bool on) { SmallRowKQuantEnabled = on; SmallRowLegacyQEnabled = on; }
 
     private MatMulQuantGemvMultiKernel? _smallRowQ4K, _smallRowQ5K, _smallRowIq4Xs;
 
@@ -60,6 +71,10 @@ public sealed partial class VulkanTransformerModel
         _smallRowQ6KR2 = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K_R2);
         _smallRowF32 = MatMulF32GemvMultiKernel.TryCreate(device, spvDir);
         _smallRowQ8 = MatMulQ8_0MmvqMultiKernel.TryCreate(device, spvDir);
+        // #1420: FP32-activation kernels for what the Q8_1 MMVQ multi (<= 4 rows) and the missing Q4_0 / Q5_0 multi kernels left on the GEMM.
+        _smallRowQ8Wide = MatMulQ8_0GemvMultiKernel.TryCreate(device, spvDir, 2, 4, 4);
+        _smallRowQ4_0 = MatMulExactGemvMultiKernel.TryCreate(device, spvDir, ExactGemvFormat.Q4_0, 2, 4);
+        _smallRowQ5_0 = MatMulExactGemvMultiKernel.TryCreate(device, spvDir, ExactGemvFormat.Q5_0, 2, 4);
         if (_splitKvAttention is not null) _smallRowAttn = VulkanSplitKvRowsAttentionKernel.TryCreate(device, spvDir);
     }
 
@@ -82,10 +97,18 @@ public sealed partial class VulkanTransformerModel
             QuantType.IQ4_XS => seqLen <= SmallRowKMaxRows && KQuantFor(qt) is { } iq && iq.AcceptsColumns(seqLen, inputDim),
             QuantType.Q6_K => seqLen <= (SmallRowKQuantEnabled ? SmallRowQ6KMaxRows : Math.Min(4, SmallRowQ6KMaxRows)) && _smallRowQ6K is { } q6 && q6.AcceptsColumns(seqLen, inputDim),
             QuantType.F32 => seqLen <= SmallRowF32MaxRows && _smallRowF32 is not null && MatMulF32GemvMultiKernel.Accepts(seqLen, inputDim),
-            QuantType.Q8_0 => seqLen <= SmallRowQ8MaxRows && MatMulQ8_0MmvqMultiKernel.Accepts(seqLen, inputDim) && SmallRowQ8Fits(inputDim, seqLen),
+            QuantType.Q8_0 => (seqLen <= SmallRowQ8MaxRows && MatMulQ8_0MmvqMultiKernel.Accepts(seqLen, inputDim) && SmallRowQ8Fits(inputDim, seqLen))
+                              || SmallRowQ8WideApplies(inputDim, seqLen),
+            QuantType.Q4_0 => SmallRowLegacyQEnabled && seqLen <= MatMulExactGemvMultiKernel.MaxColumns && _smallRowQ4_0 is { } q40 && q40.Accepts(seqLen, inputDim),
+            QuantType.Q5_0 => SmallRowLegacyQEnabled && seqLen <= MatMulExactGemvMultiKernel.MaxColumns && _smallRowQ5_0 is { } q50 && q50.Accepts(seqLen, inputDim),
             _ => false,
         };
     }
+
+    /// <summary>True when rows beyond the Q8_1 MMVQ multi kernel's cap (and up to 16) run the FP32-activation Q8_0 multi GEMV (#1420).</summary>
+    private bool SmallRowQ8WideApplies(int inputDim, int seqLen)
+        => SmallRowLegacyQEnabled && Environment.GetEnvironmentVariable("DOTLLM_VK_SMALLROW_Q8WIDE") != "0" && seqLen > SmallRowQ8MaxRows && seqLen <= MatMulQ8_0GemvMultiKernel.WideMaxColumns
+           && _smallRowQ8Wide is not null && MatMulQ8_0GemvMultiKernel.AcceptsWide(seqLen, inputDim);
 
     private MatMulQuantGemvMultiKernel? KQuantFor(QuantType qt)
         => !SmallRowKQuantEnabled ? null : qt switch
@@ -127,6 +150,21 @@ public sealed partial class VulkanTransformerModel
                 SmallRowF32Count++;
                 _smallRowF32!.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 ProfNote("f32_multi", outputDim, inputDim, seqLen);
+                return true;
+            case QuantType.Q4_0:
+                SmallRowLegacyQCount++;
+                _smallRowQ4_0!.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q4_0_multi", outputDim, inputDim, seqLen);
+                return true;
+            case QuantType.Q5_0:
+                SmallRowLegacyQCount++;
+                _smallRowQ5_0!.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q5_0_multi", outputDim, inputDim, seqLen);
+                return true;
+            case QuantType.Q8_0 when SmallRowQ8WideApplies(inputDim, seqLen):
+                SmallRowLegacyQCount++;
+                _smallRowQ8Wide!.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q8_0_multi_f32", outputDim, inputDim, seqLen);
                 return true;
             case QuantType.Q8_0:
                 SmallRowQ8Count++;

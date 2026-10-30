@@ -1368,6 +1368,17 @@ Parity: `VulkanExactGemvMultiTests.LegacyQ_*` (every column bit-identical to its
 blocks so every 5th-bit / nibble pattern occurs, M % NR != 0, K of 3 blocks, 1..16 columns) and `VulkanNemotronHDFlashTests.RealNano_SmallBatch_EveryRow_IsBitIdenticalToDecode`
 (2 / 8 / 13 rows of the real file, all logits bit-identical to single-row decodes). The 5-row point is a tuning leftover (NR=4 for 4 < n < 8 is slower than at 8).
 
+#### Dense `VulkanTransformerModel`: Q8_0 5..16 rows, Q4_0 / Q5_0 2..16 rows (issue #1420)
+
+The Q8_0 Q8_1-activation MMVQ multi GEMV stops at 4 rows, so Llama-3.2-3B Q8_0 jumped from 29 ms (2..4 rows) to 39-40 ms (5..16) on the GEMM, against 19.5 ms for decode.
+5..16 rows now run `MatMulQ8_0GemvMultiKernel` (F32 activations, NR 4), and Q4_0 / Q5_0 the new `matmul_q{4,5}_0_gemv_multi` shaders (from #1420 above) for 2..16 rows.
+`VerifyRowCurve ab` (in-process, order alternated, 4 reps x 5, ctx 64, median ms; old = `DOTLLM_VK_SMALLROW_LEGACYQ=0` arm): 2 rows 28.9 / 28.9 (MMVQ, unchanged), 4 rows 29.3 / 29.0,
+**5 rows 38.8 -> 29.0, 8 rows 39.4 -> 30.1, 12 rows 40.1 -> 32.0, 16 rows 40.4 -> 35.7** (ranges within 1 ms of the medians below 12 rows, <= 2.6 ms at 16).
+The rows are ULP-close, not bit-equal, to decode (decode quantises its activation to Q8_1): `DenseSmallRowLegacyQTests` (Llama-3.2-1B Q8_0 5/8/16 rows: max|batched - seq| 0.20 / 0.41 / 0.41 against
+0.20 / 0.75 / 0.75 on the old path; argmax identical) and on SmolLM-135M Q5_0 (2/9/16 rows) the batched forward tracks an F32-activation decode (`DOTLLM_VULKAN_DISABLE_MMVQ=1`) to 6e-3..1.4e-2
+while the MMVQ decode itself is 0.3..0.8 off it on that degenerate model (Q8_1 activation noise), which is why that test allows an argmax flip only inside the measured noise.
+No local dense Q4_0 model: the Q4_0 shader is covered by the kernel tests only (bit-identical columns + f64 reference), not timed end to end.
+
 #### Verify-cliff on the MoE host and `VulkanTransformerModel` (issue #1374)
 
 `VulkanQwen3MoeHybridTransformerModel` now serves 9..16 rows on the same wide multi-column GEMVs through the `AcceptsColumns` gate: Q4_K, Q6_K_Rows
