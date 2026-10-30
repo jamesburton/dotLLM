@@ -61,7 +61,7 @@ public sealed class BertEmbeddingLlamaCppParityTests(ITestOutputHelper output)
     public static TheoryData<string> Models => new()
     {
         "minilm-f16", "mxbai-f32", "nomic-f32", "mxbai-f16", "nomic-f16",
-        "minilm-q8", "mxbai-q8", "nomic-q8", "nomic-q4km",
+        "minilm-q8", "mxbai-q8", "nomic-q8", "nomic-q4km", "mle5-f16",
     };
 
     internal static Spec SpecFor(string key) => key switch
@@ -84,6 +84,11 @@ public sealed class BertEmbeddingLlamaCppParityTests(ITestOutputHelper output)
             "nomic-embed-text-v1.5-GGUF", "nomic-embed-text-v1.5.Q8_0.gguf", "nomic-embed-text-v1.5 Q8_0 (nomic-bert, mean)"),
         "nomic-q4km" => new("llamacpp-nomic-embed-text-v1.5-q4_k_m.json", "DOTLLM_NOMIC_Q4KM_GGUF", "nomic-ai",
             "nomic-embed-text-v1.5-GGUF", "nomic-embed-text-v1.5.Q4_K_M.gguf", "nomic-embed-text-v1.5 Q4_K_M (nomic-bert, mean)"),
+        // XLM-R SentencePiece Unigram vocabulary (tokenizer.ggml.model = "t5"), #1401. Fixture captured with the "query: " prefix.
+        // NOTE: this community conversion shifts the position table by one row vs HF (see docs/EMBEDDINGS.md), which llama.cpp and
+        // dotLLM share, so it is a faithful same-file anchor, not a sentence-transformers one.
+        "mle5-f16" => new("llamacpp-multilingual-e5-small-f16.json", "DOTLLM_MLE5_F16_GGUF", "hdrrayan",
+            "multilingual-e5-small-gguf", "multilingual-e5-small-f16.gguf", "multilingual-e5-small f16 (bert, XLM-R Unigram, mean)"),
         _ => throw new ArgumentOutOfRangeException(nameof(key)),
     };
 
