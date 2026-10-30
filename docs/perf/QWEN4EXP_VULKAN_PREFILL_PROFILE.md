@@ -245,4 +245,7 @@ it is latency-bound per tile (3 barrier phases per 32 keys, only 2 of 4 subgroup
 
 On prefill (> 1 token) `gr.down` is the Q8_0 coopmat GEMM reading F32 activations directly: there is no Q8_1 activation quantise to fuse with `gr.grouprms` (that exists only on the 1-token decode path). The
 `gr.grouprms` label is also the first stage after each submit, so it carries the inter-submit host gap (its share ranged 8-19% across identical runs: 760-2170 ms per 4K prefill), which makes it unusable as a kernel time.
-The remaining candidate is the group-RMS kernel itself (scalar F32 loads, 8-barrier tree reduction); `benchmarks/Qwen4ExpRowProbe grbench` is the kernel-only microbench.
+**Refuted by `grbench` (kernel-only, 1024 rows x 4 x 2560 F32, 40 back-to-back dispatches, 6 rounds):** the out-of-place group-RMS runs at **0.44 ms per dispatch = 190 GB/s read+write**, i.e. at the DRAM floor
+(~205 GB/s). At 96 calls per 1024-row chunk that is ~42 ms of a ~2300 ms chunk, **~1.8% of wall, already at the roofline**; a vec4 / subgroup-reduction rewrite or a fusion with the norm cannot beat the bytes it must
+move (the F32 read of the residual stream and the F32 write of `_xn` stay unless the GEMM B-load absorbs the norm, which needs the per-row sum of squares first). The 8-19% `gr.grouprms` timestamp share is therefore
+inter-submit host gap attributed to the first stage after each submit, not kernel time. No code change; #1357 closed as refuted.
