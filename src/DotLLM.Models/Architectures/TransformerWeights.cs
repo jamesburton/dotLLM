@@ -608,6 +608,22 @@ internal sealed class Gemma3nLayerWeights
     public required float[] PostLaurelNorm { get; init; }
 }
 
+/// <summary>EmbeddingGemma <c>dense_2</c> / <c>dense_3</c> raw quantized projection heads (mmap views; nothing owned).</summary>
+internal sealed class EmbeddingDenseHeads
+{
+    /// <summary><c>dense_2.weight</c>: ptr, quant, out dim (3072), in dim (n_embd).</summary>
+    public required nint Ptr2;
+    public required QuantizationType Qt2;
+    public required int Out2;
+    public required int In2;
+
+    /// <summary><c>dense_3.weight</c>: ptr, quant, out dim (n_embd), in dim (3072).</summary>
+    public required nint Ptr3;
+    public required QuantizationType Qt3;
+    public required int Out3;
+    public required int In3;
+}
+
 /// <summary>
 /// Model-level DiffusionGemma self-conditioning (SC) weights. Present ONLY on the
 /// diffusion-gemma GGUF (absent on autoregressive gemma4, where SC is meaningless).
@@ -1125,6 +1141,13 @@ internal sealed class TransformerWeights : IDisposable
     /// </summary>
     public float[]? RopeFreqFactors { get; internal set; }
 
+    /// <summary>
+    /// EmbeddingGemma post-pooling projection heads (<c>dense_2</c> then <c>dense_3</c>, bias-free, identity activation).
+    /// Null for every other model (and for a gemma-embedding GGUF converted without
+    /// <c>--sentence-transformers-dense-modules</c>, which llama.cpp then serves without the heads).
+    /// </summary>
+    public EmbeddingDenseHeads? EmbeddingDense { get; internal set; }
+
     /// <summary>Per-layer R4-interleaved weights. Null until <see cref="RepackWeights()"/> is called.</summary>
     public RepackedLayerWeights[]? RepackedLayers { get; private set; }
 
@@ -1524,6 +1547,23 @@ internal sealed class TransformerWeights : IDisposable
             selfCond: selfCond,
             perLayerEmbedding: perLayerEmbedding);
         weights.RopeFreqFactors = ropeFreqFactors;
+
+        // EmbeddingGemma dense heads (llama.cpp gemma-embedding.cpp: both TENSOR_NOT_REQUIRED, applied after pooling).
+        if (config.Architecture == DotLLM.Core.Configuration.Architecture.GemmaEmbedding
+            && tensors.TryGetValue("dense_2.weight", out var dense2Desc)
+            && tensors.TryGetValue("dense_3.weight", out var dense3Desc))
+        {
+            var (d2Ptr, d2Qt, d2M, d2K) = LoadLinear(dataBase, dense2Desc);
+            var (d3Ptr, d3Qt, d3M, d3K) = LoadLinear(dataBase, dense3Desc);
+            if (d2K != config.HiddenSize || d3K != d2M || d3M != config.HiddenSize)
+                throw new InvalidDataException(
+                    $"gemma-embedding dense heads have shapes {d2K}->{d2M} and {d3K}->{d3M}; expected {config.HiddenSize}->N and N->{config.HiddenSize}.");
+            weights.EmbeddingDense = new EmbeddingDenseHeads
+            {
+                Ptr2 = d2Ptr, Qt2 = d2Qt, Out2 = d2M, In2 = d2K,
+                Ptr3 = d3Ptr, Qt3 = d3Qt, Out3 = d3M, In3 = d3K,
+            };
+        }
         return weights;
     }
 
@@ -1745,6 +1785,7 @@ internal sealed class TransformerWeights : IDisposable
         float[]? postFfnNorm = null;
         if (config.Architecture is DotLLM.Core.Configuration.Architecture.Gemma2
                                 or DotLLM.Core.Configuration.Architecture.Gemma3
+                                or DotLLM.Core.Configuration.Architecture.GemmaEmbedding
                                 or DotLLM.Core.Configuration.Architecture.Olmo2)
         {
             postAttnNorm = DequantizeNorm(dataBase, tensors[$"{prefix}.post_attention_norm.weight"], hiddenSize);

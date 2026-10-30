@@ -27,6 +27,9 @@ public readonly record struct AttentionMaskSpec
     /// <summary>Fully bidirectional mask (no causal masking).</summary>
     public static AttentionMaskSpec Bidirectional => new() { Mode = AttentionMaskMode.Bidirectional };
 
+    /// <summary>Bidirectional mask whose sliding-window layers use a symmetric window (EmbeddingGemma, #1399).</summary>
+    public static AttentionMaskSpec SymmetricWindow => new() { Mode = AttentionMaskMode.SymmetricWindow };
+
     /// <summary>
     /// Hybrid mask with a causal prefix of <paramref name="prefixLength"/> positions followed by a
     /// bidirectional canvas.

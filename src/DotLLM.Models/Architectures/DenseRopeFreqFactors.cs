@@ -27,7 +27,7 @@ public static class DenseRopeFreqFactors
     {
         if (factors is null || config.MlaConfig is not null || config.GlobalRoPEConfig is not null)
             return null;
-        if (config.Architecture is Architecture.Gemma3 or Architecture.Gemma4)
+        if (config.Architecture is Architecture.Gemma3 or Architecture.Gemma4 or Architecture.GemmaEmbedding)
             return null;
         if (factors.Length < ropeDim / 2)
             throw new NotSupportedException(

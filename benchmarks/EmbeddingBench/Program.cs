@@ -48,15 +48,23 @@ internal static class Program
         if (mode == "http") return Http(pos[0], pos[1], Ints("clients", "1,8,32"), Ints("seqs", "64"), Ints("per-request", "1"), cellSec);
         if (mode == "llama") return Llama(pos[0], pos[1], Ints("batches", "1,8,32,128"), Ints("seqs", "64,256,512"), cellSec);
 
+        if (mode == "tokens")
+        {
+            // tokens <gguf> <texts.json|fixture.json> <out.json>: token ids per text (no model load); diff against HF/llama.cpp.
+            using var tg = GgufFile.Open(pos[0]);
+            var tk = GgufTokenizerFactory.Load(tg.Metadata);
+            using var doc = JsonDocument.Parse(File.ReadAllText(pos[1]));
+            var arr = doc.RootElement.ValueKind == JsonValueKind.Object ? doc.RootElement.GetProperty("cases").EnumerateArray().Select(c => c.GetProperty("text").GetString()!).ToArray()
+                : doc.RootElement.EnumerateArray().Select(c => c.GetString()!).ToArray();
+            File.WriteAllText(pos[2], JsonSerializer.Serialize(arr.Select(t => tk.Encode(t)).ToArray()));
+            Emit(new { mode = "tokens", tokenizer = tk.GetType().Name, n = arr.Length });
+            return 0;
+        }
+
         string path = pos[0];
         BertEncoderModel.UseLegacyGelu = opt.GetValueOrDefault("legacy-gelu", "0") == "1";   // #1403 A/B arm
         BertEncoderModel.UseLegacyAttention = opt.GetValueOrDefault("legacy-attn", "0") == "1";   // #1402 A/B arm
         var (model, gguf, config) = ModelLoader.LoadFromGguf(path, new ThreadingConfig(threads, threads));
-        if (opt.GetValueOrDefault("device", "cpu") == "vulkan")   // #1406: decoder embedders on the iGPU/GPU (keeps the CPU load only for gguf/config)
-        {
-            model.Dispose();
-            model = DotLLM.Vulkan.VulkanModelLoader.CreateSharedFromGguf(gguf, config).Model;
-        }
         using (gguf) using (model)
         {
             if (model is not IEmbeddingModel emb) { Console.Error.WriteLine($"{config.Architecture} has no IEmbeddingModel"); return 2; }
@@ -152,9 +160,9 @@ internal static class Program
 
     private static unsafe void EmbedOne(IEmbeddingModel emb, int[] ids, int hidden, PoolingType pooling, float[] vec, int[] posBuf)
     {
-        // #1406: only the rows pooling reads come back (one row on a GPU backend for last/cls pooling).
-        var v = vec;
-        emb.ForwardHiddenForPooling([ids], pooling, (_, rows) => EmbeddingPooler.Pool(rows, rows.Length / hidden, hidden, pooling, v), 0);
+        for (int i = 0; i < ids.Length; i++) posBuf[i] = i;
+        using var h = emb.ForwardHidden(ids, posBuf.AsSpan(0, ids.Length), 0);
+        EmbeddingPooler.Pool(new ReadOnlySpan<float>((void*)h.DataPointer, ids.Length * hidden), ids.Length, hidden, pooling, vec);
         EmbeddingPooler.L2Normalize(vec);
     }
 

@@ -71,8 +71,11 @@ public static class GgufBpeTokenizerFactory
         // BOS-less stream and get garbage (Gemma 4 included: #784). Scoped to those architectures on purpose — the other
         // SPM/BPE models keep the historical BOS-agnostic Encode (their chat templates carry BOS).
         string arch = metadata.GetStringOrDefault("general.architecture", "");
-        if (arch is "gemma" or "gemma2" or "gemma3" or "gemma4")
+        if (arch is "gemma" or "gemma2" or "gemma3" or "gemma4" or "gemma-embedding")
             tokenizer.AddBosToken = GgufAddBosResolver.Resolve(metadata);
+        // EmbeddingGemma frames every text as <bos> ... <eos> (sentence-transformers tokenizer template; llama.cpp add_eos_token).
+        if (arch == "gemma-embedding")
+            tokenizer.AddEosToken = metadata.GetBoolOrDefault("tokenizer.ggml.add_eos_token", true);
 
         return tokenizer;
     }
