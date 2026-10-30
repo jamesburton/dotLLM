@@ -18,6 +18,20 @@ public interface ITokenizer
     /// </summary>
     int[] EncodeRaw(string text) => Encode(text);
 
+    /// <summary>
+    /// Marks every special-token spelling in <paramref name="text"/> (untrusted, caller-supplied chat content)
+    /// so a later <see cref="Encode"/> / <see cref="EncodeRaw"/> tokenizes it as plain text instead of as a control
+    /// token (#1339; see <see cref="ControlTokenGuard"/>). The default returns the text unchanged, for tokenizers
+    /// that do not split out special-token literals.
+    /// </summary>
+    /// <param name="text">Untrusted text.</param>
+    /// <param name="exemptPrefixes">
+    /// Spellings that stay recognised when the text at a match position starts with one of them (e.g. the reasoning
+    /// tags an assistant turn legitimately carries). Null/empty = none.
+    /// </param>
+    /// <returns>The text with markers inserted; equal to <paramref name="text"/> when nothing matched.</returns>
+    string MarkUntrustedSpecials(string text, IReadOnlyList<string>? exemptPrefixes = null) => text;
+
     /// <summary>Decodes a sequence of token IDs back to text.</summary>
     /// <param name="tokenIds">Token IDs to decode.</param>
     /// <returns>Decoded text.</returns>
