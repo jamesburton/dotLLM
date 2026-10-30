@@ -1246,6 +1246,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
             headDim: headDim, ropeDim: _ropeDim, theta: _ropeTheta,
             variant: RopeF32Kernel.Variant.NeoX);
+        TmStage("ar_rope", seqLen);
 
         // 6. Attention.
         VulkanDevice.Buffer kSrc, vSrc;
@@ -1256,6 +1257,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             vkCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, absoluteLayerIdx, Q4AttentionHook?.F16Writer);
             if (vkCache.Storage == VulkanKvStorage.F16) KernelSupport.ComputeToComputeBarrier(cmdBuf);   // the convert kernel is a compute writer
             else KernelSupport.TransferToComputeBarrier(cmdBuf);
+            TmStage("ar_kvwrite", seqLen);
             kSrc = vkCache.GetKeysBuffer(absoluteLayerIdx);
             vSrc = vkCache.GetValuesBuffer(absoluteLayerIdx);
             seqKv = vkCache.CurrentLength;

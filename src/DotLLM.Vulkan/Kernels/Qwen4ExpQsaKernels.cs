@@ -69,11 +69,26 @@ public sealed class Qwen4ExpQsaKernels : IDisposable, IVulkanKvF16Writer
     private const int ConvertPcBytes = 2 * 4;
 
     private readonly Stage _pool, _score, _select, _attn, _merge;
-    private readonly Stage? _attn16, _pool16, _convert;
+    private readonly Stage? _attn16, _pool16, _convert, _attnCm;
     private bool _disposed;
 
-    private Qwen4ExpQsaKernels(Stage pool, Stage score, Stage select, Stage attn, Stage merge, Stage? attn16, Stage? pool16, Stage? convert)
-    { _pool = pool; _score = score; _select = select; _attn = attn; _merge = merge; _attn16 = attn16; _pool16 = pool16; _convert = convert; }
+    private Qwen4ExpQsaKernels(Stage pool, Stage score, Stage select, Stage attn, Stage merge, Stage? attn16, Stage? pool16, Stage? convert, Stage? attnCm)
+    { _pool = pool; _score = score; _select = select; _attn = attn; _merge = merge; _attn16 = attn16; _pool16 = pool16; _convert = convert; _attnCm = attnCm; }
+
+    /// <summary>
+    /// Cooperative-matrix gather attention (#1356, <c>qsa_attention_cm_f16kv</c>): one 16-row matrix tile per GQA group, F16 K/V, head_dim 256.
+    /// <c>DOTLLM_VK_QSA_CM=0</c> at startup (or setting this) restores the scalar gather kernel for A/B.
+    /// </summary>
+    public static bool CoopmatGather { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_QSA_CM") != "0";
+
+    /// <summary>Smallest query count of a sub-chunk that takes the cooperative-matrix gather (decode and short verify rows keep the scalar kernel).</summary>
+    public const int CoopmatMinQueries = 16;
+
+    /// <summary>Test hook: dispatches of the cooperative-matrix gather attention kernel.</summary>
+    public long CoopmatAttentionDispatches { get; private set; }
+
+    /// <summary>True when the cooperative-matrix gather pipeline was created.</summary>
+    public bool CoopmatSupported => _attnCm is not null;
 
     /// <summary>True when the F16 K/V gather kernel, the F16-raw pooling kernel and the F32-to-F16 convert kernel were all found (issue #437).</summary>
     public bool F16Supported => _attn16 is not null && _pool16 is not null && _convert is not null;
@@ -95,15 +110,17 @@ public sealed class Qwen4ExpQsaKernels : IDisposable, IVulkanKvF16Writer
             var select = Make("qsa_select_f32", 2, SelectPcBytes); var attn = Make("qsa_attention_f32", 6, AttnPcBytes);
             var merge = Make("qsa_merge_f32", 3, MergePcBytes);
             // The F16 twins are optional: a missing blob only disables the F16 KV option.
-            Stage? attn16 = null, pool16 = null, convert = null;
+            Stage? attn16 = null, pool16 = null, convert = null, attnCm = null;
             if (File.Exists(Path.Combine(spvDir, "qsa_attention_f16kv.spv")) && File.Exists(Path.Combine(spvDir, "qsa_pool_f16raw.spv"))
                 && File.Exists(Path.Combine(spvDir, "convert_f32_to_f16_range.spv")))
             {
                 attn16 = Make("qsa_attention_f16kv", 6, AttnPcBytes);
                 pool16 = Make("qsa_pool_f16raw", 3, PoolPcBytes);
                 convert = Make("convert_f32_to_f16_range", 2, ConvertPcBytes);
+                if (VulkanFlashAttentionCoopmatKernel.SupportsDevice(device) && File.Exists(Path.Combine(spvDir, "qsa_attention_cm_f16kv.spv")))
+                    attnCm = Make("qsa_attention_cm_f16kv", 6, AttnPcBytes);
             }
-            return new Qwen4ExpQsaKernels(pool, score, select, attn, merge, attn16, pool16, convert);
+            return new Qwen4ExpQsaKernels(pool, score, select, attn, merge, attn16, pool16, convert, attnCm);
         }
         catch { foreach (var s in made) s.Dispose(); throw; }
     }
@@ -112,7 +129,7 @@ public sealed class Qwen4ExpQsaKernels : IDisposable, IVulkanKvF16Writer
     public void InvalidateDescriptorCache()
     {
         _pool.Cache.Reset(); _score.Cache.Reset(); _select.Cache.Reset(); _attn.Cache.Reset(); _merge.Cache.Reset();
-        _attn16?.Cache.Reset(); _pool16?.Cache.Reset(); _convert?.Cache.Reset();
+        _attn16?.Cache.Reset(); _pool16?.Cache.Reset(); _convert?.Cache.Reset(); _attnCm?.Cache.Reset();
     }
 
     private static void U(Span<byte> pc, int i, uint v) => BinaryPrimitives.WriteUInt32LittleEndian(pc[(i * 4)..], v);
@@ -164,7 +181,7 @@ public sealed class Qwen4ExpQsaKernels : IDisposable, IVulkanKvF16Writer
     public void RecordAttention(nint cmd, VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer v, VulkanDevice.Buffer sel,
         VulkanDevice.Buffer partOut, VulkanDevice.Buffer partMs, VulkanDevice.Buffer output,
         int qBase, int qCount, int firstPos, int numHeads, int numKvHeads, int headDim, int blockSize, int budgetBlocks, int numSplits,
-        bool kvF16 = false)
+        bool kvF16 = false, Action<string>? stage = null)
     {
         if (headDim > 512) throw new ArgumentOutOfRangeException(nameof(headDim));
         if (kvF16 && _attn16 is null) throw new InvalidOperationException("The F16 KV attention kernel is not available.");
@@ -174,8 +191,16 @@ public sealed class Qwen4ExpQsaKernels : IDisposable, IVulkanKvF16Writer
         U(pc, 5, (uint)headDim); U(pc, 6, (uint)blockSize); U(pc, 7, (uint)budgetBlocks); U(pc, 8, (uint)numSplits);
         U(pc, 9, (uint)budgetBlocks); F(pc, 10, 1.0f / MathF.Sqrt(headDim));
         if (kvF16) F16AttentionDispatches++;
-        (kvF16 ? _attn16! : _attn).Dispatch(cmd, [q.Handle, k.Handle, v.Handle, sel.Handle, partOut.Handle, partMs.Handle], pc, (uint)(numHeads * numSplits), (uint)qCount);
+        if (kvF16 && CoopmatGather && _attnCm is not null && headDim == 256 && qCount >= CoopmatMinQueries
+            && numKvHeads > 0 && numHeads % numKvHeads == 0 && numHeads / numKvHeads <= 16)
+        {
+            CoopmatAttentionDispatches++;
+            _attnCm.Dispatch(cmd, [q.Handle, k.Handle, v.Handle, sel.Handle, partOut.Handle, partMs.Handle], pc, (uint)(numKvHeads * numSplits), (uint)qCount);
+        }
+        else
+            (kvF16 ? _attn16! : _attn).Dispatch(cmd, [q.Handle, k.Handle, v.Handle, sel.Handle, partOut.Handle, partMs.Handle], pc, (uint)(numHeads * numSplits), (uint)qCount);
         KernelSupport.ComputeToComputeBarrier(cmd);
+        stage?.Invoke("ar_gather_partial");
         Span<byte> mc = stackalloc byte[MergePcBytes];
         U(mc, 0, (uint)qBase); U(mc, 1, (uint)numHeads); U(mc, 2, (uint)headDim); U(mc, 3, (uint)numSplits);
         _merge.Dispatch(cmd, [partOut.Handle, partMs.Handle, output.Handle], mc, (uint)numHeads, (uint)qCount);
@@ -204,6 +229,6 @@ public sealed class Qwen4ExpQsaKernels : IDisposable, IVulkanKvF16Writer
         if (_disposed) return;
         _disposed = true;
         _pool.Dispose(); _score.Dispose(); _select.Dispose(); _attn.Dispose(); _merge.Dispose();
-        _attn16?.Dispose(); _pool16?.Dispose(); _convert?.Dispose();
+        _attn16?.Dispose(); _pool16?.Dispose(); _convert?.Dispose(); _attnCm?.Dispose();
     }
 }
