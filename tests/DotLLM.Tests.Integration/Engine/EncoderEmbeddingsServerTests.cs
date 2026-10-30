@@ -128,7 +128,15 @@ public sealed class EncoderEmbeddingsServerTests
         var loc = TestFixtureResolver.ResolveFile("DOTLLM_MINILM_GGUF", "second-state",
             "All-MiniLM-L6-v2-Embedding-GGUF", "all-MiniLM-L6-v2-ggml-model-f16.gguf");
         Skip.If(!loc.Found, loc.SkipMessage("all-MiniLM-L6-v2 f16"));
-        Assert.Throws<NotSupportedException>(() =>
+        // Since #790 every explicit-GPU failure -- a failed preflight, or a loader exception such as the encoder's
+        // NotSupportedException -- surfaces as DeviceUnavailableException (what/why/opt-in); the loader's own
+        // reason is preserved as InnerException. Still loud, still no CPU fallback.
+        var ex = Assert.Throws<DeviceUnavailableException>(() =>
             ServerStartup.LoadModel(loc.Path!, new ServerOptions { Model = loc.Path!, Device = "vulkan", ModelId = "minilm" }));
+        if (ex.InnerException is not null)
+        {
+            Assert.IsType<NotSupportedException>(ex.InnerException);
+            Assert.Contains("CPU-only", ex.Message);
+        }
     }
 }
