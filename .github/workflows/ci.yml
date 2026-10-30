@@ -58,6 +58,34 @@ jobs:
           key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', 'Directory.Packages.props') }}
           restore-keys: nuget-${{ runner.os }}-
 
+      # VulkanSpvFreshnessTests recompiles every tracked .comp with the glslc pinned in native/vulkan/glslc.version
+      # and compares bytes with the committed .spv (#1364). It Skips when glslc is missing or is not the pin, which on
+      # a bare runner silently disabled the check (#1372). The pinned shaderc ships in the LunarG Vulkan SDK
+      # (SDK 1.4.341.1 = shaderc v2026.1); only the glslc binary is extracted and cached. The verify step fails the
+      # job if the installed glslc is not the pin, so the test can no longer skip unnoticed.
+      - name: Cache pinned glslc
+        id: glslc-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/glslc-bin
+          key: glslc-${{ runner.os }}-sdk-1.4.341.1-${{ hashFiles('native/vulkan/glslc.version') }}
+
+      - name: Install pinned glslc
+        if: steps.glslc-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/glslc-bin /tmp/vksdk
+          curl -fsSL --retry 5 "https://sdk.lunarg.com/sdk/download/1.4.341.1/linux/vulkansdk-linux-x86_64-1.4.341.1.tar.xz" | tar -xJ -C /tmp/vksdk --wildcards '*/x86_64/bin/glslc'
+          cp /tmp/vksdk/*/x86_64/bin/glslc ~/glslc-bin/glslc
+          chmod +x ~/glslc-bin/glslc
+
+      - name: Verify glslc is the pinned version
+        run: |
+          echo "$HOME/glslc-bin" >> "$GITHUB_PATH"
+          pin="$(head -n1 native/vulkan/glslc.version | tr -d '\r')"
+          got="$("$HOME/glslc-bin/glslc" --version | head -n1)"
+          echo "pin='$pin' glslc='$got'"
+          case "$got" in "$pin"*) ;; *) echo "::error::glslc '$got' is not the pinned '$pin' (native/vulkan/glslc.version); VulkanSpvFreshnessTests would skip"; exit 1 ;; esac
+
       - name: Unit Tests
         run: dotnet test tests/DotLLM.Tests.Unit/ -c Release --filter "Category!=GPU&Category!=Benchmark" --blame-hang-timeout 5m
 
