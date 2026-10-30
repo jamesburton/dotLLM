@@ -330,7 +330,7 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
                         n, n, nh, nh, hd, 0, 1.0f / MathF.Sqrt(hd), default, null, 0f,
                         AttentionMaskMode.Bidirectional, 0, default);
                 else
-                    Attention.ExecuteBidirectional(q, k, v, attn, n, nh, hd, 1.0f / MathF.Sqrt(hd), _pool);
+                    Attention.ExecuteBidirectional(q, k, v, attn, n, nh, hd, 1.0f / MathF.Sqrt(hd), ActivePool);
 
                 prof?.Mark(EncoderStage.Attention);
                 Gemm(l.O!, attn, tmp, n);
