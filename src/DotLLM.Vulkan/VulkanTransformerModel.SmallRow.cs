@@ -14,7 +14,7 @@ public sealed partial class VulkanTransformerModel
         => int.TryParse(Environment.GetEnvironmentVariable(name), out int v) && v >= 0 ? Math.Min(v, max) : fallback;
 
     /// <summary>Largest row count served by the Q6_K multi-column GEMV (default 4; <c>DOTLLM_VK_SMALLROW_Q6K_MAX_ROWS</c>; 0 restores the MMQ / GEMM path). Runtime A/B switch.</summary>
-    public int SmallRowQ6KMaxRows { get; set; } = EnvRows("DOTLLM_VK_SMALLROW_Q6K_MAX_ROWS", 4, MatMulQuantGemvMultiKernel.MaxColumns);
+    public int SmallRowQ6KMaxRows { get; set; } = EnvRows("DOTLLM_VK_SMALLROW_Q6K_MAX_ROWS", MatMulQuantGemvMultiKernel.WideMaxColumns, MatMulQuantGemvMultiKernel.WideMaxColumns);
     /// <summary>Smallest row count that takes the two-output-rows-per-workgroup Q6_K kernel (default 3: at 2 columns the single-row kernel is as fast; 3..4 columns are load-issue bound there; <c>DOTLLM_VK_SMALLROW_Q6K_R2_MIN_ROWS</c>; 99 = never).</summary>
     public int SmallRowQ6KR2MinRows { get; set; } = EnvRows("DOTLLM_VK_SMALLROW_Q6K_R2_MIN_ROWS", 3, 99);
     /// <summary>Largest row count served by the F32 multi-column GEMV (router, F32 projections; default 4; <c>DOTLLM_VK_SMALLROW_F32_MAX_ROWS</c>; 0 = off).</summary>
@@ -34,8 +34,28 @@ public sealed partial class VulkanTransformerModel
     /// <inheritdoc cref="SmallRowQ6KCount"/>
     public long SmallRowQ8Count { get; private set; }
 
+    /// <summary>
+    /// <c>DOTLLM_VK_SMALLROW_K_GEMV=0</c> keeps Q4_K / Q5_K / IQ4_XS 2..16-row forwards on the MMQ / GEMM path (#917 A/B). Runtime switch.
+    /// </summary>
+    internal static bool SmallRowKQuantEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_SMALLROW_K_GEMV") != "0";
+
+    /// <summary>Largest row count served by the K-quant multi-column GEMVs here (#917; <c>DOTLLM_VK_SMALLROW_K_MAX_ROWS</c>, default 16, hard cap 16; 0 = off).</summary>
+    public int SmallRowKMaxRows { get; set; } = EnvRows("DOTLLM_VK_SMALLROW_K_MAX_ROWS", MatMulQuantGemvMultiKernel.WideMaxColumns, MatMulQuantGemvMultiKernel.WideMaxColumns);
+
+    /// <summary>Dispatch counter of the Q4_K / Q5_K / IQ4_XS multi-column GEMVs (test / diagnostic).</summary>
+    public long SmallRowKQuantCount { get; private set; }
+
+    /// <summary>A/B hook for VerifyRowCurve <c>ab</c>: true = K-quant multi-column GEMVs up to 16 rows, false = the pre-#917 MMQ / GEMM path (and Q6_K capped at 4 rows).</summary>
+    public static void SetSmallRowKQuantForBench(bool on) => SmallRowKQuantEnabled = on;
+
+    private MatMulQuantGemvMultiKernel? _smallRowQ4K, _smallRowQ5K, _smallRowIq4Xs;
+
     private void CreateSmallRowKernels(VulkanDevice device, string spvDir)
     {
+        // #917: NR rows per workgroup as on the qwen35 host (#1220): 2 for one column, 4 for 2..8 and 9..16 columns.
+        _smallRowQ4K = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q4_K, 2, 4, 4);
+        _smallRowQ5K = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q5_K);
+        _smallRowIq4Xs = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.IQ4_XS);
         _smallRowQ6K = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K);
         _smallRowQ6KR2 = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K_R2);
         _smallRowF32 = MatMulF32GemvMultiKernel.TryCreate(device, spvDir);
@@ -57,12 +77,24 @@ public sealed partial class VulkanTransformerModel
         if (seqLen < 2) return false;
         return qt switch
         {
-            QuantType.Q6_K => seqLen <= SmallRowQ6KMaxRows && _smallRowQ6K is not null && MatMulQuantGemvMultiKernel.Accepts(seqLen, inputDim),
+            QuantType.Q4_K => seqLen <= SmallRowKMaxRows && KQuantFor(qt) is { } q4 && q4.AcceptsColumns(seqLen, inputDim),
+            QuantType.Q5_K => seqLen <= SmallRowKMaxRows && KQuantFor(qt) is { } q5 && q5.AcceptsColumns(seqLen, inputDim),
+            QuantType.IQ4_XS => seqLen <= SmallRowKMaxRows && KQuantFor(qt) is { } iq && iq.AcceptsColumns(seqLen, inputDim),
+            QuantType.Q6_K => seqLen <= (SmallRowKQuantEnabled ? SmallRowQ6KMaxRows : Math.Min(4, SmallRowQ6KMaxRows)) && _smallRowQ6K is { } q6 && q6.AcceptsColumns(seqLen, inputDim),
             QuantType.F32 => seqLen <= SmallRowF32MaxRows && _smallRowF32 is not null && MatMulF32GemvMultiKernel.Accepts(seqLen, inputDim),
             QuantType.Q8_0 => seqLen <= SmallRowQ8MaxRows && MatMulQ8_0MmvqMultiKernel.Accepts(seqLen, inputDim) && SmallRowQ8Fits(inputDim, seqLen),
             _ => false,
         };
     }
+
+    private MatMulQuantGemvMultiKernel? KQuantFor(QuantType qt)
+        => !SmallRowKQuantEnabled ? null : qt switch
+        {
+            QuantType.Q4_K => _smallRowQ4K,
+            QuantType.Q5_K => _smallRowQ5K,
+            QuantType.IQ4_XS => _smallRowIq4Xs,
+            _ => null,
+        };
 
     private bool TryRecordSmallRowGemv(
         nint cmdBuf, VulkanDevice.Buffer weights, QuantType qt, VulkanDevice.Buffer input, VulkanDevice.Buffer output,
@@ -71,9 +103,16 @@ public sealed partial class VulkanTransformerModel
         if (!SmallRowGemvApplies(qt, inputDim, seqLen)) return false;
         switch (qt)
         {
+            case QuantType.Q4_K:
+            case QuantType.Q5_K:
+            case QuantType.IQ4_XS:
+                SmallRowKQuantCount++;
+                KQuantFor(qt)!.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                ProfNote(qt == QuantType.Q4_K ? "q4_k_multi" : qt == QuantType.Q5_K ? "q5_k_multi" : "iq4_xs_multi", outputDim, inputDim, seqLen);
+                return true;
             case QuantType.Q6_K:
                 SmallRowQ6KCount++;
-                if (seqLen >= SmallRowQ6KR2MinRows && _smallRowQ6KR2 is { } r2)
+                if (seqLen >= SmallRowQ6KR2MinRows && seqLen <= MatMulQuantGemvMultiKernel.MaxColumns && _smallRowQ6KR2 is { } r2)
                 {
                     r2.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                     ProfNote("q6_k_multi_r2", outputDim, inputDim, seqLen);
