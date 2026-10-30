@@ -48,6 +48,19 @@ internal static class Program
         if (mode == "http") return Http(pos[0], pos[1], Ints("clients", "1,8,32"), Ints("seqs", "64"), Ints("per-request", "1"), cellSec);
         if (mode == "llama") return Llama(pos[0], pos[1], Ints("batches", "1,8,32,128"), Ints("seqs", "64,256,512"), cellSec);
 
+        if (mode == "tokens")
+        {
+            // tokens <gguf> <texts.json|fixture.json> <out.json>: token ids per text (no model load); diff against HF/llama.cpp.
+            using var tg = GgufFile.Open(pos[0]);
+            var tk = GgufTokenizerFactory.Load(tg.Metadata);
+            using var doc = JsonDocument.Parse(File.ReadAllText(pos[1]));
+            var arr = doc.RootElement.ValueKind == JsonValueKind.Object ? doc.RootElement.GetProperty("cases").EnumerateArray().Select(c => c.GetProperty("text").GetString()!).ToArray()
+                : doc.RootElement.EnumerateArray().Select(c => c.GetString()!).ToArray();
+            File.WriteAllText(pos[2], JsonSerializer.Serialize(arr.Select(t => tk.Encode(t)).ToArray()));
+            Emit(new { mode = "tokens", tokenizer = tk.GetType().Name, n = arr.Length });
+            return 0;
+        }
+
         string path = pos[0];
         BertEncoderModel.UseLegacyGelu = opt.GetValueOrDefault("legacy-gelu", "0") == "1";   // #1403 A/B arm
         BertEncoderModel.UseLegacyAttention = opt.GetValueOrDefault("legacy-attn", "0") == "1";   // #1402 A/B arm

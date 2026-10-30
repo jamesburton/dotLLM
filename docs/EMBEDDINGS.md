@@ -21,13 +21,12 @@ Quote ranges, not points: the box is shared, so treat differences under ~15 % as
 | nomic-embed-text-v1.5 | nomic-bert (RoPE, SwiGLU) | 137M | 768 | mean | 2048 | yes | F16, Q8_0, Q4_K_M |
 | mxbai-embed-large-v1 | bert | 335M | 1024 | cls | 512 | yes | F16, Q8_0 |
 | Qwen3-Embedding-0.6B | qwen3 (decoder) | 600M | 1024 | last | 32768 | yes (EOS appended automatically since #1398) | F16 |
-| multilingual-e5-small (XLM-R) | bert | 118M | 384 | mean | 512 | **no**: `BERT GGUF vocabulary is missing [CLS]/[SEP]/[UNK]` | - |
+| multilingual-e5-small (XLM-R, SentencePiece Unigram) | bert | 118M | 384 | mean | 512 (some GGUFs say 511) | yes (#1401) | F16, Q8_0 |
 | EmbeddingGemma-300M | gemma-embedding | 300M | 768 | mean | 2048 | **no**: `Unsupported GGUF architecture: 'gemma-embedding'` | - |
 | nomic-embed-text-v2-moe | nomic-bert-moe | 475M | 768 | mean | 512 | **no**: `Unsupported GGUF architecture: 'nomic-bert-moe'` | - |
 
 Not attempted (same code path as a row above, or outside the 20-600M download rule): bge-large / e5-large / gte-large
-(bert), Qwen3-Embedding-4B/8B (qwen3 decoder), gte-Qwen2, bge-m3 and jina-v3/v4 (XLM-R / custom code, expected to hit the
-same tokenizer wall as multilingual-e5). Encoder = bidirectional BERT-style (`BertEncoderModel`, CPU only);
+(bert), Qwen3-Embedding-4B/8B (qwen3 decoder), gte-Qwen2, bge-m3 and jina-v3/v4 (XLM-R / custom code; bge-m3 uses the same Unigram tokenizer that multilingual-e5 now loads through, #1401). Encoder = bidirectional BERT-style (`BertEncoderModel`, CPU only);
 decoder-based embedders (Qwen3-Embedding, last-token pooling) run on `TransformerModel`, also CPU only.
 
 GPU: Vulkan `VulkanTransformerModel` implements `IEmbeddingModel` since #1406 (section 5); CUDA models do not (the server returns 501),
@@ -60,6 +59,12 @@ Prefixes are applied to both sides (`query: ` for e5, `search_document: ` for no
 Reading: every F16 BERT-class model passes the 0.9999 gate against **both** references, including nomic-bert (RoPE+SwiGLU).
 Q8_0 costs 1e-4 to 1.4e-3 of cosine (worst case is the one-character text); Q4_K_M nomic is visibly degraded (0.93 mean vs
 its own F16) and is not recommended for RAG. Qwen3-Embedding was wrong by default until #1398: the declared-last-pooling decoder embedder now gets the tokenizer EOS appended (llama.cpp b9016 does the same regardless of the `--pooling` override: prompt_tokens 3 for a 2-token text with last or mean; it does not for SmolLM2, which declares no pooling). Override: `--add-eos true|false` on `dotllm embed`, `add_eos` in `/v1/embeddings`. Guard: `Qwen3EmbeddingEosParityTests` against `Fixtures/Embeddings/st-qwen3-embedding-0.6b.json`.
+**multilingual-e5-small (#1401, XLM-R tokenizer `tokenizer.ggml.model = "t5"`)**, 107 texts (48 English `docs/*.md` chunks + 59 multilingual, all `query: ` prefixed, up to the 512-token limit):
+sentence-transformers fp32 on a GGUF whose position table is repaired to HF's (see below): F16 min 0.999997 / mean 0.999999, NN-1 1.00; llama.cpp b9016 CPU on the same repaired file 1.000000 / 1.000000.
+On the unrepaired community F16 file (`hdrrayan/multilingual-e5-small-gguf`) dotLLM equals llama.cpp (1.000000 / 1.000000, n=104) and both sit at 0.9881 min / 0.9989 mean from ST. Its Q8_0 (`TwinSunsLLC`) vs llama.cpp on the same file: 0.999924 / 0.999964.
+**Position-table trap**: `intfloat/multilingual-e5-small` is an HF `BertModel` (absolute positions 0..511, 512 rows), but llama.cpp's `convert_hf_to_gguf.py` treats it as XLM-R and drops `pad_token_id + 1 = 1` rows (the config's `pad_token_id` is 0), so the community
+GGUFs (`hdrrayan`, `TwinSunsLLC`, `keisuke-miyako`) carry 511 rows shifted by one: every token sees position k+1 instead of k. llama.cpp is wrong in exactly the same way, so only a sentence-transformers comparison exposes it. Fix = re-convert, or rewrite
+the tensor from `model.safetensors` (rows 0..511, `bert.context_length` 512); the 0.9999 gate was measured on such a rewrite. The `keisuke-miyako` Q8_0 is a worse conversion (`tokenizer.ggml.model = "bert"`, no scores, every piece `▁`-prefixed) and still fails with the original `[CLS]/[SEP]/[UNK]` error.
 A retrieval-recall set (BEIR slice) is still missing; the cosine+NN-1 gate is what guards speed work for now.
 
 ## 3. Throughput and latency on CPU (32 threads)
@@ -312,8 +317,8 @@ the same harness, the cosine gate, and a discriminating shape.
 6. (#1406, DONE) **Vulkan hidden-state path for decoder embedders** (Qwen3-Embedding-0.6B: 2.2x/5.6x/8x over the current CPU at 64/256/512 tokens, 29 docs/s at 64 tok),
    then the **GPU BERT encoder (#741)** reusing the coopmat prefill tiles (110M-class encoders are ~5x fewer FLOPs than the 0.6B
    decoder, so expect well above 5k tok/s; unmeasured).
-7. **Correctness/coverage** (#1398 EOS: FIXED; #1399 gemma-embedding, #1400 nomic-bert-moe, #1401 XLM-R tokenizer): Qwen3-Embedding needs `<|endoftext|>` appended before last-token pooling (llama.cpp does it; dotLLM
-   mean cosine 0.80); add `gemma-embedding`, `nomic-bert-moe`, and XLM-R (SentencePiece) tokenisation for multilingual-e5/bge-m3.
+7. **Correctness/coverage** (#1398 EOS: FIXED; #1401 XLM-R Unigram tokenizer: FIXED; #1399 gemma-embedding, #1400 nomic-bert-moe): Qwen3-Embedding needs `<|endoftext|>` appended before last-token pooling (llama.cpp does it; dotLLM
+   mean cosine 0.80); add `gemma-embedding` and `nomic-bert-moe`.
 8. Small/free: (#1407) p99 spikes on cold single-document F16 calls (876 ms at 16 tokens), content-hash doc cache at the server,
    int8/binary output formats, Matryoshka truncation is already supported (`--dimensions`), NPU background embedder (#1321, no measurement yet).
 
