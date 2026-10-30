@@ -23,7 +23,7 @@ Quote ranges, not points: the box is shared, so treat differences under ~15 % as
 | Qwen3-Embedding-0.6B | qwen3 (decoder) | 600M | 1024 | last | 32768 | yes (EOS appended automatically since #1398) | F16 |
 | multilingual-e5-small (XLM-R, SentencePiece Unigram) | bert | 118M | 384 | mean | 512 (some GGUFs say 511) | yes (#1401) | F16, Q8_0 |
 | EmbeddingGemma-300M | gemma-embedding | 300M | 768 | mean | 2048 | **no**: `Unsupported GGUF architecture: 'gemma-embedding'` | - |
-| nomic-embed-text-v2-moe | nomic-bert-moe | 475M | 768 | mean | 512 | **no**: `Unsupported GGUF architecture: 'nomic-bert-moe'` | - |
+| nomic-embed-text-v2-moe | nomic-bert-moe (XLM-R Unigram vocab) | 475M (8x277M, top-2) | 768 | mean | 512 | yes (#1400), CPU only | Q8_0 (official GGUF) |
 
 Not attempted (same code path as a row above, or outside the 20-600M download rule): bge-large / e5-large / gte-large
 (bert), Qwen3-Embedding-4B/8B (qwen3 decoder), gte-Qwen2, bge-m3 and jina-v3/v4 (XLM-R / custom code; bge-m3 uses the same Unigram tokenizer that multilingual-e5 now loads through, #1401). Encoder = bidirectional BERT-style (`BertEncoderModel`, CPU only);
@@ -66,6 +66,18 @@ On the unrepaired community F16 file (`hdrrayan/multilingual-e5-small-gguf`) dot
 GGUFs (`hdrrayan`, `TwinSunsLLC`, `keisuke-miyako`) carry 511 rows shifted by one: every token sees position k+1 instead of k. llama.cpp is wrong in exactly the same way, so only a sentence-transformers comparison exposes it. Fix = re-convert, or rewrite
 the tensor from `model.safetensors` (rows 0..511, `bert.context_length` 512); the 0.9999 gate was measured on such a rewrite. The `keisuke-miyako` Q8_0 is a worse conversion (`tokenizer.ggml.model = "bert"`, no scores, every piece `▁`-prefixed) and still fails with the original `[CLS]/[SEP]/[UNK]` error.
 A retrieval-recall set (BEIR slice) is still missing; the cosine+NN-1 gate is what guards speed work for now.
+
+**nomic-embed-text-v2-moe (#1400, `nomic-bert-moe`)**, 103 texts (48 English chunks truncated to 512 tokens keeping the last token, plus 55 multilingual, `search_query: ` / `search_document: ` alternating), CPU. Tokens come from the Unigram tokenizer of #1401. Layout: the nomic-bert encoder (post-LN, fused QKV, RoPE NeoX, token-type row 0) with a biased GELU FFN on even layers and, on odd layers (`moe_every_n_layers = 2`), a top-2-of-8 MoE: softmax over all 8 experts, the two selected probabilities used **as is** (no renormalisation), `up_e` then GELU then `down_e`, no gate projection. Tokens are grouped per expert so each expert runs one GEMM; the 3-D Q8_0 banks are read in place.
+The reference is a PyTorch re-implementation written from the published `modeling_hf_nomic_bert.py` semantics (the remote-code model does not run under current transformers), fp32, on the original safetensors.
+
+| GGUF / arm | vs reference with `experts.bias` (min / mean) | vs llama.cpp b9016 CPU, same file (min / mean) |
+|---|---|---|
+| F32 built from safetensors, **exact-erf** GELU, with bias | 1.0000000 / 1.0000000, NN-1 1.00 | - |
+| same, default tanh GELU (llama.cpp's `ggml_gelu`), with bias | 0.999806 / 0.999987, NN-1 1.00 | - |
+| F32 without the bias tensor (what the official GGUF contains) | 0.998753 / about 0.9996 | 0.999993 / 1.000000 |
+| official Q8_0 | 0.997079 / 0.998978 (llama.cpp itself 0.997333 / 0.998998) | 0.998370 / 0.999802 |
+
+Findings: (1) **The HF model adds a learned `mlp.experts.bias` [768] after the weighted expert sum on every MoE layer (max abs 0.10-0.43); llama.cpp's converter drops it, so the official GGUF cannot reproduce the reference** (cosine 0.9988 min / 0.9996 mean from it before any quantisation, and llama.cpp has the same defect). dotLLM follows llama.cpp when the tensor is absent and adds it when a GGUF carries `blk.N.ffn_down_exps.bias` [768] (the name llama.cpp already uses for expert bias tensors); that is what the 0.9999 row used. Upstream: llama.cpp should keep `experts.bias`. (2) With top-2 routing a 1e-4 GELU approximation difference can flip an expert choice on a borderline token, so the tanh arm shows min 0.9998 on one text where the dense models stay above 0.99999; exact erf removes it. dotLLM keeps the tanh GELU on purpose (same as every other BERT-class model and as llama.cpp). (3) CPU only (`--device cpu`, like the other encoders).
 
 ## 3. Throughput and latency on CPU (32 threads)
 
