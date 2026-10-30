@@ -9303,6 +9303,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     /// <inheritdoc/>
     public void Dispose()
     {
+        _gumbelHostDrawer?.Dispose();
         // Drop the device-side LoRA cache before tearing down the device —
         // each VulkanLoraAdapter owns VkBuffers that must be freed before
         // the device is disposed.

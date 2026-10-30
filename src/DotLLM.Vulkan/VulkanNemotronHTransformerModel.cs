@@ -2712,6 +2712,7 @@ public sealed partial class VulkanNemotronHTransformerModel : IModel
     /// <inheritdoc/>
     public void Dispose()
     {
+        _gumbelHostDrawer?.Dispose();
         DisposeDFlash();
         // Phase 5f mirror — ForwardBatch lm_head scratch (null when never invoked).
         _batchScratch?.Dispose();

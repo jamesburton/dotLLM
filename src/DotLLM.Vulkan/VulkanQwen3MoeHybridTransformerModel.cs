@@ -3155,6 +3155,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     /// <inheritdoc/>
     public void Dispose()
     {
+        _gumbelHostDrawer?.Dispose();
         CloseCheckpoints();
         DisposeMtp();
         _submit.Dispose();

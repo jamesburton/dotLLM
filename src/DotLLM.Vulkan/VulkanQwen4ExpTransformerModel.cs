@@ -927,6 +927,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel, ICon
     /// <inheritdoc/>
     public void Dispose()
     {
+        _gumbelHostDrawer?.Dispose();
         if (_disposed) return;
         _disposed = true;
         _mtp?.Dispose();
