@@ -20,7 +20,20 @@ public sealed class SamplerPipeline
     private readonly bool _fastTopKSampling;
     private readonly ulong _gumbelSeed;
     private readonly bool _gumbel;
+    private readonly float _deviceGumbelInvTemperature;   // 0 = the prepared distribution is not a pure temperature scale
     internal bool UnsafeUniform32ForTests { get; set; }
+
+    /// <summary>The request's Gumbel noise seed (valid when <see cref="UsesGumbel"/>).</summary>
+    internal ulong GumbelSeed => _gumbelSeed;
+
+    /// <summary>
+    /// When a device may draw this pipeline's Gumbel-max sample straight from RAW logits (#1382): the F32 reciprocal <c>1f / temperature</c>
+    /// the temperature step multiplies by (1 for T = 1). Null unless the prepared distribution IS just that scale: Gumbel mode on and stochastic,
+    /// no logit processors (penalties, bias, DRY, thinking budget), no top-k / top-p / min-p / top-n-sigma, built from flat options (no explicit
+    /// steps). Every other shape needs the host (history, constraint state, per-row selection) and keeps the readback path.
+    /// </summary>
+    public float? DeviceGumbelInvTemperature
+        => _deviceGumbelInvTemperature > 0f && !UnsafeUniform32ForTests ? _deviceGumbelInvTemperature : null;
 
     /// <summary>Env switch that turns position-seeded Gumbel-max sampling on for every stochastic pipeline built from options (#1358).</summary>
     public const string GumbelEnvVar = "DOTLLM_GUMBEL_SAMPLING";
@@ -139,6 +152,10 @@ public sealed class SamplerPipeline
             options.MinP,
             options.Seed,
             options.TopNSigma);
+
+        if (_gumbel && _processors.Length == 0 && _steps.Length <= 1 && !_fastTopKSampling
+            && options.TopK <= 0 && options.TopP >= 1.0f && options.MinP <= 0f && options.TopNSigma < 0f)
+            _deviceGumbelInvTemperature = options.Temperature == 1.0f ? 1f : 1f / options.Temperature;
     }
 
     /// <summary>

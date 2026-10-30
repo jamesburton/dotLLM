@@ -219,6 +219,68 @@ public sealed class GumbelSpeculativeSamplingTests
         Assert.Equal(plain, RunPlain(pipeline, WideRow, 1, 30));
     }
 
+    // ── device-side draw wiring (#1382) ──
+
+    private static (List<int> Ids, int Calls) RunSpecDevice(SamplerPipeline pipeline, int start, int newTokens, int k, bool useDevice = true)
+    {
+        Func<int, int> draft = t => { var r = new float[V]; WideRow(t, r); return Array.IndexOf(r, r.Max()); };
+        using var model = new MtpSpeculativeDecoderTests.MockMtpModel(t => 0, draft, supportsMtp: true, targetRow: WideRow) { EmulateDeviceGumbel = true };
+        var decoder = new MtpSpeculativeDecoder { UseDeviceGumbel = useDevice };
+        var ids = new List<int> { start };
+        using var kv = new SimpleKvCache(1, 1, 4, MaxSeqLen);
+        using var mtp = new CpuMtpState(8, 1, 4, maxSteps: MaxSeqLen);
+        int position = 0;
+        var outBuf = new int[k + 1];
+        while (ids.Count - 1 < newTokens)
+        {
+            var r = decoder.DraftAndVerify(model, kv, mtp, pipeline, ids, null, position, V, k, outBuf);
+            for (int i = 0; i < r.AcceptedCount && ids.Count - 1 < newTokens; i++) ids.Add(outBuf[i]);
+            position += r.AcceptedCount;
+        }
+        return (ids.Take(newTokens + 1).ToList(), model.DeviceGumbelCalls);
+    }
+
+    [Theory]
+    [InlineData(1.0f, 3)]
+    [InlineData(0.7f, 4)]
+    public void DeviceDraw_GivesThePlainText_AndIsUsed(float temperature, int k)
+    {
+        int calls = 0;
+        for (int seed = 1; seed <= 30; seed++)
+        {
+            InferenceOptions Opts() => new() { Temperature = temperature, Seed = seed, GumbelSampling = true };
+            var plain = RunPlain(new SamplerPipeline(Opts()), WideRow, start: seed % V, newTokens: 40);
+            var (dev, c) = RunSpecDevice(new SamplerPipeline(Opts()), seed % V, 40, k);
+            Assert.Equal(plain, dev);
+            calls += c;
+        }
+        Assert.True(calls > 30, "the device draw was never used");
+    }
+
+    [Fact]
+    public void DeviceDraw_IsNotUsed_ForGreedy_ForOtherPreparedShapes_OrWhenSwitchedOff()
+    {
+        Assert.Null(new SamplerPipeline(new InferenceOptions { Temperature = 0f, GumbelSampling = true }).DeviceGumbelInvTemperature);
+        Assert.Null(new SamplerPipeline(new InferenceOptions { Temperature = 0.8f }).DeviceGumbelInvTemperature);   // Gumbel off
+        foreach (var o in new InferenceOptions[]
+        {
+            new() { Temperature = 0.8f, GumbelSampling = true, TopK = 8 },
+            new() { Temperature = 0.8f, GumbelSampling = true, TopP = 0.9f },
+            new() { Temperature = 0.8f, GumbelSampling = true, MinP = 0.05f },
+            new() { Temperature = 0.8f, GumbelSampling = true, RepetitionPenalty = 1.2f },
+        })
+            Assert.Null(new SamplerPipeline(o).DeviceGumbelInvTemperature);
+        var ok = new SamplerPipeline(new InferenceOptions { Temperature = 0.8f, GumbelSampling = true });
+        Assert.Equal(1f / 0.8f, ok.DeviceGumbelInvTemperature);
+        Assert.Equal(1f, new SamplerPipeline(new InferenceOptions { Temperature = 1f, GumbelSampling = true }).DeviceGumbelInvTemperature);
+
+        // greedy speculation never reaches the new method; a switched-off decoder and an ineligible pipeline keep the host path
+        var greedy = new SamplerPipeline(new InferenceOptions { Temperature = 0f, GumbelSampling = true });
+        Assert.Equal(0, RunSpecDevice(greedy, 1, 30, 4).Calls);
+        Assert.Equal(0, RunSpecDevice(new SamplerPipeline(new InferenceOptions { Temperature = 0.8f, Seed = 3, GumbelSampling = true }), 1, 30, 4, useDevice: false).Calls);
+        Assert.Equal(0, RunSpecDevice(new SamplerPipeline(new InferenceOptions { Temperature = 0.8f, Seed = 3, GumbelSampling = true, TopK = 5 }), 1, 30, 4).Calls);
+    }
+
     // ── helpers ──
 
     private static double[] Softmax(float[] logits)

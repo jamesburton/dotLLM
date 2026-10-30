@@ -676,4 +676,36 @@ public interface IModel : IDisposable
     int ForwardMtpArgMax(IMtpState state, int tokenId, int position)
         => throw new NotSupportedException(
             $"{GetType().Name} has no native MTP draft argmax (SupportsMtpArgMax=false); use ForwardMtp.");
+
+    /// <summary>
+    /// True when <see cref="ForwardGumbelSampled"/> is implemented: the model draws the position-seeded Gumbel-max sample
+    /// (<c>argmax(logits * invTemperature + Gumbel(seed, n, i))</c>, see <c>GumbelNoise</c>) of every verify row on the device, reading the
+    /// LM-head logits in place, and returns only the sampled token ids (#1382). Default <see langword="false"/>.
+    /// </summary>
+    bool SupportsDeviceGumbelSampling => false;
+
+    /// <summary>The largest row count one <see cref="ForwardGumbelSampled"/> call covers (0 when unsupported).</summary>
+    int DeviceGumbelMaxRows => 0;
+
+    /// <summary>
+    /// A verify forward (<see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, ILoraAdapter?, IMtpState?)"/>, or
+    /// <see cref="ForwardWithRecurrentSnapshots"/> when <paramref name="recurrentRowSnapshots"/>) whose per-row logits are not returned:
+    /// row <c>r</c>'s sample is written to <paramref name="sampledIds"/>[r] and equals <c>GumbelNoise.Sample(logits_r * invTemperature, seed,
+    /// firstTokenIndex + r)</c> bit for bit. Every side effect of the plain forward (KV, recurrent state, MTP capture, DFlash taps) is identical.
+    /// </summary>
+    /// <param name="tokenIds">Verify tokens, one per row.</param>
+    /// <param name="positions">Their positions.</param>
+    /// <param name="deviceId">As for <c>Forward</c>.</param>
+    /// <param name="kvCache">As for <c>Forward</c>.</param>
+    /// <param name="mtpState">As for <c>Forward</c>.</param>
+    /// <param name="recurrentRowSnapshots">Run as <see cref="ForwardWithRecurrentSnapshots"/> (record per-row recurrent snapshots).</param>
+    /// <param name="seed">The request's Gumbel noise seed.</param>
+    /// <param name="firstTokenIndex">Generation index of row 0's token; row r uses <c>firstTokenIndex + r</c>.</param>
+    /// <param name="invTemperature">The F32 <c>1f / temperature</c> the temperature step multiplies by (1 when T = 1).</param>
+    /// <param name="sampledIds">Receives one token id per row.</param>
+    /// <exception cref="NotSupportedException"><see cref="SupportsDeviceGumbelSampling"/> is false or the rows exceed <see cref="DeviceGumbelMaxRows"/>.</exception>
+    void ForwardGumbelSampled(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache,
+                              IMtpState? mtpState, bool recurrentRowSnapshots, ulong seed, int firstTokenIndex, float invTemperature,
+                              Span<int> sampledIds)
+        => throw new NotSupportedException($"{GetType().Name} has no device Gumbel sampling (SupportsDeviceGumbelSampling=false).");
 }
