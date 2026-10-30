@@ -160,6 +160,33 @@ gate GEMM for nomic):
   figures above); seq 256 **390 / 508 -> 66-67** (total 636-846 -> 297-341). Throughput B=8 seq 64: 6.1-7.1 -> 17.6 docs/s
   (one noisy rep 11). Attention (single-threaded) and GELU now dominate (#1402/#1403). Parity vs legacy on 50 texts: min cosine
   0.9999999; unit test vs double-precision reference on m%4, k%8, odd-n shapes.
+* **Fixed (#1403): GELU is vectorised and parallel.** `Gelu.ExecuteTanh` (`Gelu.cs`, ggml's tanh form, `UseErfGelu` seam
+  unchanged) runs `TensorPrimitives` Multiply/Add/Tanh over 512-float L1 tiles, tile ranges split across `ActivePool`
+  (shipping .NET 10 intrinsics only). Max abs error vs the exact double-precision tanh GELU: 6.3e-7 over 100k inputs in
+  [-40, 40] plus 0, +-1e-8, +-9, +-100 (test gate `2e-6 * max(1, |x|)`); serial and parallel results are bit-identical. Model
+  parity vs the old scalar loop (`EmbeddingBench dump --legacy-gelu 1` vs `0`, 48 texts): F16 models min cosine 1.000000000
+  (max |dx| 1.2e-7: MiniLM, bge-small, bge-base; nomic has no GELU and is exactly 0); Q8_0 models min cosine 0.99973-0.99991
+  vs the old path, because Q8 activation quantisation digitises the ~1e-7 difference. Against the sentence-transformers fp32
+  reference the Q8_0 figures are unchanged within noise (bge-small 0.999612 / 0.999836 old vs 0.999612 / 0.999837 new,
+  bge-base 0.999664 / 0.999804 vs 0.999591 / 0.999804, mxbai 0.998643 / 0.999769 vs 0.998745 / 0.999767, min / mean), i.e. the
+  gate (F16 >= 0.9999; Q8 figure recorded, recall unmoved) holds. `--legacy-gelu 1` is the same-session A/B arm. Paired A/B,
+  32 threads, 3 reps alternating order, `profile` Act stage and document total (ms/doc, min-max), legacy -> new (measured on a
+  tree without the #1402 attention change, so totals still contain serial attention):
+
+| Model | seq | Act stage | Document total |
+|---|---|---|---|
+| bge-base Q8_0 | 256 | 93-114 -> 1.6-1.9 | 370-590 -> 277-290 |
+| bge-base Q8_0 | 512 | 182-230 -> 3.1-27 (noisy rep) | 1054-1586 -> 853-1259 (box contended; see rerun) |
+| bge-base F16 | 256 / 512 | 91-94 -> 1.6-1.7 / 174-182 -> 2.1-2.7 | 304-323 -> 222-233 / 859-973 -> 767-776 |
+| bge-small Q8_0 | 256 / 512 | 56-58 -> 1.4-1.5 / 108-109 -> 1.6-1.9 | 241-251 -> 177-178 / 730-782 -> 607-622 |
+| bge-small F16 | 256 / 512 | 56-58 -> 1.6 / 108-109 -> 1.8-1.9 | 217-235 -> 162-177 / 673-753 -> 581-632 |
+| MiniLM Q8_0 | 256 / 512 | 23-24 -> 0.7-0.9 / 45-46 -> 1.5-1.6 | 116-118 -> 88-99 / 357-368 -> 307-343 |
+
+  The GELU stage drops 30-100x (target was removing 18-31 % of the document: met, 1.2-1.4x on the whole document at 256 tokens
+  incl. the Amdahl share left by serial attention). 48-text e2e docs/s (median of 3 reps): bge-base F16 5.2-5.4 -> 6.4-7.5,
+  bge-small F16 7.9-8.0 -> 9.8-9.9, bge-small Q8 7.2-7.4 -> 9.0-9.1, MiniLM Q8 13.4-14.5 -> 17.6-17.8, bge-base Q8
+  3.6-4.6 -> 5.7-6.2 (second run; the first run, 4.2-4.6 -> 3.4-5.5, overlapped with other load on the shared box and is not
+  quoted). Raw rows: `benchmarks/EmbeddingBench/results/ab-gelu-1403.jsonl`.
 * Amdahl view at 32 threads, bge-base Q8 at 64 tokens: ~44 % of the document is the two serial stages (Attention + GELU).
 
 ### Inter-sequence parallelism and server batching (#1405)
@@ -219,7 +246,7 @@ the same harness, the cosine gate, and a discriminating shape.
    per document per worker) is far below the memory bandwidth at that rate.
 2. (#1402) **Parallel + vectorised bidirectional attention** for short sequences (2.3x at 512, 1.6x at 256, 1.1x at 64 for bge-base Q8;
    lifts MiniLM/bge-small/nomic similarly). Today ~9-18 GFLOP/s on one thread; target >= 10x on that stage.
-3. (#1403) **Vectorised/parallel GELU** (1.3-1.4x for bge/e5/gte/mxbai at 64-256 tokens: removes 18-31 % of the document).
+3. (#1403, DONE) **Vectorised/parallel GELU** (1.3-1.4x for bge/e5/gte/mxbai at 64-256 tokens: removes 18-31 % of the document).
 4. (#1404) **F16 GEMM**: convert-once-per-tile and AVX-512 path, so F16 GGUFs match Q8_0 (>= 1.5-2x on F16 files; interim advice is to
    use the Q8_0 GGUF: 1.4-2x faster at 0.9996+ cosine).
 5. (#1405) **Server dynamic batching** for `/v1/embeddings` (collect requests for a few ms, run lever 1 across clients; length-sort so a padded
