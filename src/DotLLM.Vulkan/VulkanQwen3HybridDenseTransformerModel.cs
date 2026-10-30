@@ -216,6 +216,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         _embedGather?.InvalidateDescriptorCache();
         _iqF16Prefill?.InvalidateDescriptorCache();
         _gumbelKernel?.InvalidateDescriptorCache();
+        _gumbelRowsKernel?.InvalidateDescriptorCache();
     }
 
     /// <summary>
@@ -1203,20 +1204,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             _rowSnapshotValidRows = _pendingCommitRows = 0;   // #1194: a pending verify commit belongs to the overwritten state
     }
 
-    /// <summary>
-    /// Per-sequence <c>ForwardBatch</c>. Mirrors
-    /// <see cref="VulkanQwen3MoeHybridTransformerModel.ForwardBatch"/>: the GDN scan
-    /// threads one sequence's recurrent state through tokens in order and cannot
-    /// share a dispatch across sequences, so this loops the per-seq
-    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, IGdnState?)"/>
-    /// using each request's own <see cref="SequenceForwardRequest.GdnState"/>.
-    /// </summary>
-    public IReadOnlyList<ITensor> ForwardBatch(
-        IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
+    /// <summary>Rejects LoRA adapters, and multi-sequence batches whose requests do not each carry their own GDN state.</summary>
+    private void ValidateBatchRequests(IReadOnlyList<SequenceForwardRequest> requests)
     {
-        ArgumentNullException.ThrowIfNull(requests);
-        if (requests.Count == 0) return Array.Empty<ITensor>();
-
         for (int i = 0; i < requests.Count; i++)
         {
             if (requests[i].Adapter is not null)
@@ -1243,6 +1233,24 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
                         nameof(requests));
             }
         }
+
+    }
+
+    /// <summary>
+    /// Per-sequence <c>ForwardBatch</c>. Mirrors
+    /// <see cref="VulkanQwen3MoeHybridTransformerModel.ForwardBatch"/>: the GDN scan
+    /// threads one sequence's recurrent state through tokens in order and cannot
+    /// share a dispatch across sequences, so this loops the per-seq
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, IGdnState?)"/>
+    /// using each request's own <see cref="SequenceForwardRequest.GdnState"/>.
+    /// </summary>
+    public IReadOnlyList<ITensor> ForwardBatch(
+        IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
+    {
+        ArgumentNullException.ThrowIfNull(requests);
+        if (requests.Count == 0) return Array.Empty<ITensor>();
+
+        ValidateBatchRequests(requests);
 
         if (requests.Count >= 2 && BatchFuseEnabled && _prof is null && TotalRows(requests) >= BatchFuseMinRows)
             return ForwardBatchFused(requests);
@@ -1386,6 +1394,18 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             requests[i].Positions.Span.CopyTo(positionsAll.AsSpan(offsets[i]));
         }
         _device.Upload(MemoryMarshal.AsBytes(positionsAll.AsSpan()), _batchPositions!);
+        // #1434: a pending batched Gumbel draw replaces the logits readback with one token id per sequence (single-token rows only).
+        var gumbelBatch = _pendingGumbelBatch;
+        _pendingGumbelBatch = null;
+        if (gumbelBatch is not null)
+        {
+            if (gumbelBatch.Length != n || headTotal != n || _gumbelRowsKernel is null || _gumbelRowIds is null || _gumbelRowParams is null)
+                throw new InvalidOperationException("Batched device Gumbel draw requires one single-token request per draw and preallocated draw buffers.");
+            var packed = new uint[n * 4];
+            for (int i = 0; i < n; i++)
+                GumbelArgMaxRowsKernel.PackRow(packed.AsSpan(i * 4, 4), gumbelBatch[i].Seed, gumbelBatch[i].TokenIndex, gumbelBatch[i].InvTemperature);
+            _device.Upload(MemoryMarshal.AsBytes(packed.AsSpan()), _gumbelRowParams);
+        }
 
         var kinds = _layout.LayerKind;
         double batchAttentionGflops = 0;
@@ -1576,8 +1596,21 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         }
         RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType, headIn, logitsBuf,
             outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: headTotal);
+        if (gumbelBatch is not null)
+        {
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            _gumbelRowsKernel!.Record(cmdBuf, logitsBuf, _gumbelRowIds!, _gumbelRowParams!, n, vocabSize, vocabSize);
+        }
         KernelSupport.ComputeToHostBarrier(cmdBuf);
         _submit.SubmitAndWait();
+
+        if (gumbelBatch is not null)
+        {
+            if (_gumbelBatchHost.Length < n) _gumbelBatchHost = new int[Math.Max(n, 32)];
+            _device.Download(_gumbelRowIds!, MemoryMarshal.Cast<int, float>(_gumbelBatchHost.AsSpan(0, n)));
+            _gumbelBatchHostRows = n;
+            return Array.Empty<ITensor>();
+        }
 
         // ── 4. Download and split the logits ──────────────────────────────────
         var all = new float[checked(headTotal * vocabSize)];
@@ -3023,6 +3056,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         _embedGather?.Dispose();
         _gumbelKernel?.Dispose();
         _gumbelIds?.Dispose();
+        _gumbelRowsKernel?.Dispose();
+        _gumbelRowIds?.Dispose();
+        _gumbelRowParams?.Dispose();
         _mtpHead?.Dispose();
         _mtpScratch?.Dispose();
         _mtpAbsorbScratch?.Dispose();

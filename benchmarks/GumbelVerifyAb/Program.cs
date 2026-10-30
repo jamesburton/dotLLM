@@ -1,6 +1,7 @@
 // Diagnostics tool (not shipped) for issue #1382: device-side Gumbel-max over speculative verify rows (Vulkan).
 //   GumbelVerifyAb parity <gguf> [positions=24] [rows=4] [seeds=1000]   batched-vs-single-row logits bits + Gumbel argmax flip rate (no timing)
 //   GumbelVerifyAb ab     <gguf> [reps=3] [inner=5] [ctx=64] [rows=2,4,8] paired verify-round A/B: host (readback + CPU Gumbel) vs device
+//   GumbelVerifyAb sched  <gguf> [reps=3] [tokens=64] [seqs=2,4,8]  #1434 ContinuousBatchScheduler, T=0.7, Gumbel: device batch draw vs host logits (text identity + tok/s)
 //   GumbelVerifyAb e2e    <gguf> [reps=3] [tokens=96]                      TextGenerator MTP, T=0.7, Gumbel: device vs host (text identity + tok/s)
 // Timing modes need the GPU lock and the cpu-bench lock held by the caller.
 using System.Diagnostics;
@@ -36,6 +37,7 @@ switch (mode)
     case "parity": Parity(); break;
     case "ab": Ab(); break;
     case "e2e": E2e(); break;
+    case "sched": Sched(); break;
     default: throw new ArgumentException(mode);
 }
 (model as IDisposable)?.Dispose();
@@ -255,4 +257,62 @@ void E2e()
         }
     Console.WriteLine($"RESULT e2e host==device {hostVsDevice}/{hostVsDeviceTotal}; plain==device {plainVsSpec}/{plainVsSpecTotal}; plain/device common-prefix tokens {tokEq}/{tokTot}");
     foreach (var (k, v) in tps) Console.WriteLine($"RESULT e2e tok/s {k}: min {v.Min():F1} med {Med(v):F1} max {v.Max():F1}");
+}
+
+void Sched()
+{
+    int reps = args.Length > 2 ? int.Parse(args[2]) : 3;
+    int tokens = args.Length > 3 ? int.Parse(args[3]) : 64;
+    int[] seqsList = (args.Length > 4 ? args[4] : "2,4,8").Split(',').Select(int.Parse).ToArray();
+    string[] questions = ["Describe how a refrigerator works.", "Explain why the sky is blue in two sentences.", "List three uses for a paperclip.",
+        "What is a monad?", "Name five rivers in Europe.", "Why do cats purr?", "How does a bicycle stay upright?", "Summarise the plot of Hamlet."];
+    InferenceOptions Opts(int seed) => new() { Temperature = Temperature, Seed = seed, GumbelSampling = true, MaxTokens = tokens };
+
+    (int[][] Ids, double Ms, double DecodeMs, long DeviceSteps, int Fused, int Serial) Run(bool device, int seqs, int salt)
+    {
+        var sched = new DotLLM.Engine.Scheduler.ContinuousBatchScheduler(model, tokenizer, (c, n) => kvf(n));
+        sched.UseDeviceGumbel = device;
+        int fusedBefore = vm.DeviceGumbelFusedBatches, serialBefore = vm.DeviceGumbelSerialBatches;
+        var handles = new DotLLM.Engine.Scheduler.ISchedulerRequest[seqs];
+        for (int i = 0; i < seqs; i++)
+            handles[i] = sched.Submit(new InferenceRequest { TokenIds = tokenizer.Encode(Chat(questions[i % questions.Length])), Options = Opts(1000 + salt * 10 + i) });
+        var sw = Stopwatch.StartNew();
+        while (!sched.IsIdle) sched.Step();
+        double ms = sw.Elapsed.TotalMilliseconds;
+        var ids = handles.Select(h => h.Completion.Result.GeneratedTokenIds).ToArray();
+        double dec = handles.Sum(h => h.Completion.Result.Timings.DecodeTimeMs);
+        long steps = sched.DeviceGumbelDecodeSteps;
+        sched.Dispose();
+        return (ids, ms, dec, steps, vm.DeviceGumbelFusedBatches - fusedBefore, vm.DeviceGumbelSerialBatches - serialBefore);
+    }
+
+    Run(true, 2, 99); Run(false, 2, 99);   // warm both
+    Console.WriteLine("RESULT sched seqs	arm	total tok/s (min/med/max)	decode ms/token-step (sum of per-seq DecodeTimeMs / tokens)	deviceSteps	fused	serial");
+    foreach (int seqs in seqsList)
+    {
+        var tps = new Dictionary<bool, List<double>> { [true] = [], [false] = [] };
+        var dps = new Dictionary<bool, List<double>> { [true] = [], [false] = [] };
+        int same = 0; long dsteps = 0; int fused = 0, serial = 0;
+        for (int rep = 0; rep < reps; rep++)
+        {
+            bool[] order = (rep & 1) == 0 ? [false, true] : [true, false];
+            var res = new Dictionary<bool, (int[][] Ids, double Ms, double DecodeMs, long DeviceSteps, int Fused, int Serial)>();
+            foreach (bool d in order)
+            {
+                var r = Run(d, seqs, rep);
+                res[d] = r;
+                int total = r.Ids.Sum(x => x.Length);
+                tps[d].Add(total * 1000.0 / r.Ms);
+                dps[d].Add(r.DecodeMs / total);
+            }
+            bool identical = true;
+            for (int i = 0; i < seqs; i++) identical &= res[true].Ids[i].AsSpan().SequenceEqual(res[false].Ids[i]);
+            if (identical) same++;
+            dsteps += res[true].DeviceSteps; fused += res[true].Fused; serial += res[true].Serial;
+            if (res[false].DeviceSteps != 0) Console.WriteLine("[gva] WARNING: host arm used the device draw");
+        }
+        foreach (bool d in new[] { false, true })
+            Console.WriteLine($"RESULT sched {seqs}	{(d ? "device" : "host")}	{tps[d].Min():F1}/{Med(tps[d]):F1}/{tps[d].Max():F1}	{Med(dps[d]):F2}	{(d ? dsteps : 0)}	{(d ? fused : 0)}	{(d ? serial : 0)}");
+        Console.WriteLine($"RESULT sched {seqs} text identity host==device {same}/{reps}");
+    }
 }

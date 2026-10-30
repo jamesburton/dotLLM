@@ -708,4 +708,31 @@ public interface IModel : IDisposable
                               IMtpState? mtpState, bool recurrentRowSnapshots, ulong seed, int firstTokenIndex, float invTemperature,
                               Span<int> sampledIds)
         => throw new NotSupportedException($"{GetType().Name} has no device Gumbel sampling (SupportsDeviceGumbelSampling=false).");
+
+    /// <summary>
+    /// True when <see cref="ForwardBatchGumbelSampled"/> is implemented: a batched decode (one token per request, per-sequence state as for
+    /// <see cref="ForwardBatch"/>) whose rows are drawn on the device with a per-row seed / token index / temperature, so the continuous-batch
+    /// scheduler reads back one token id per sequence instead of a vocabulary row (#1434). Default <see langword="false"/>.
+    /// </summary>
+    bool SupportsDeviceGumbelBatch => false;
+
+    /// <summary>
+    /// <see cref="ForwardBatch"/> over single-token decode requests that returns sampled ids instead of logits: request <c>i</c>'s id is
+    /// <c>GumbelNoise.Sample(logits_i * draws[i].InvTemperature, draws[i].Seed, draws[i].TokenIndex)</c> bit for bit. All side effects of
+    /// <see cref="ForwardBatch"/> (KV, recurrent state) are identical.
+    /// </summary>
+    /// <param name="requests">One decode request per sequence (exactly one token each).</param>
+    /// <param name="deviceId">As for <see cref="ForwardBatch"/>.</param>
+    /// <param name="draws">One draw description per request.</param>
+    /// <param name="sampledIds">Receives one token id per request.</param>
+    /// <exception cref="NotSupportedException"><see cref="SupportsDeviceGumbelBatch"/> is false.</exception>
+    void ForwardBatchGumbelSampled(IReadOnlyList<SequenceForwardRequest> requests, int deviceId,
+                                   ReadOnlySpan<GumbelDraw> draws, Span<int> sampledIds)
+        => throw new NotSupportedException($"{GetType().Name} has no batched device Gumbel sampling (SupportsDeviceGumbelBatch=false).");
 }
+
+/// <summary>One row's position-seeded Gumbel-max draw parameters (see <c>GumbelNoise</c>): seed, generation index, and the F32 <c>1f / temperature</c>.</summary>
+/// <param name="Seed">The request's Gumbel noise seed.</param>
+/// <param name="TokenIndex">Generation index of the token being drawn.</param>
+/// <param name="InvTemperature">The F32 reciprocal of the temperature the pipeline's temperature step multiplies by (1 for T = 1).</param>
+public readonly record struct GumbelDraw(ulong Seed, int TokenIndex, float InvTemperature);

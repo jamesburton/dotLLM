@@ -1,0 +1,64 @@
+#version 450
+// Per-row-parameter twin of gumbel_argmax_f32.comp (#1434): the rows of one launch belong to DIFFERENT sequences (a continuous-batch
+// decode step), so each row carries its own seed, generation index and 1/temperature:
+//     ids[row] = argmax_i ( logits[row][i] * invTemp[row] + G(seed[row], tokenIndex[row], i) )   over the finite entries.
+// The arithmetic is identical to gumbel_argmax_f32.comp (and DotLLM.Engine.Samplers.GumbelNoise): `precise` noise/score, deterministic
+// log, lowest index wins ties, -inf entries skipped.
+
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Logits { float logits[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Ids { uint ids[]; };
+layout(set = 0, binding = 2, std430) readonly buffer RowParams { uvec4 rowParams[]; };   // (seedLo, seedHi, tokenIndex, invTemp bits)
+
+layout(push_constant) uniform PushConstants {
+    uint vocab;
+    uint rowStride;        // elements between rows
+} pc;
+
+const uint NONE = 0xFFFFFFFFu;
+
+#include "gumbel_noise.glsl"
+shared float sScore[512];
+shared uint sIdx[512];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint base = row * pc.rowStride;
+    uvec4 rp = rowParams[row];
+    float invTemp = uintBitsToFloat(rp.w);
+
+    float best = 0.0;
+    uint bestIdx = NONE;
+    for (uint i = tid; i < pc.vocab; i += 512u) {
+        float l = logits[base + i];
+        if (floatBitsToUint(l) == 0xFF800000u) continue;   // -inf: excluded
+        precise float g = gumbelNoise(rp.x, rp.y, rp.z, i);
+        precise float scaled = l * invTemp;
+        precise float s = scaled + g;
+        if (bestIdx == NONE || s > best) { best = s; bestIdx = i; }
+    }
+
+    sScore[tid] = best;
+    sIdx[tid] = bestIdx;
+    barrier();
+    for (uint stride = 256u; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            uint oi = sIdx[tid + stride];
+            if (oi != NONE) {
+                float os = sScore[tid + stride];
+                uint mi = sIdx[tid];
+                float ms = sScore[tid];
+                if (mi == NONE || os > ms || (os == ms && oi < mi)) {
+                    sScore[tid] = os;
+                    sIdx[tid] = oi;
+                }
+            }
+        }
+        barrier();
+    }
+    if (tid == 0u) ids[row] = sIdx[0] == NONE ? 0u : sIdx[0];
+}
