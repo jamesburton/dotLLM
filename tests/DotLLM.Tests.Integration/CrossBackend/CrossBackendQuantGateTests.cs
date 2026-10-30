@@ -181,6 +181,17 @@ public sealed class CrossBackendQuantGateTests
     private const double NatsTolerance = 0.05;
 
     /// <summary>
+    /// Prefill-NLL bound for a (CPU packed Q8_K-activation) vs (GPU F16/F32-activation) comparison, per type.
+    /// IQ1_S gets 0.12, not 0.05 (#1448): the corpus scores only 185 tokens on a model whose NLL is ~10 (PPL ~2e4),
+    /// and re-running the CPU arm with *equally valid* Q8_K activation scales (maxAbs/D, D = 127, 126, 125, 120,
+    /// 110, 100, 64) scatters the CPU NLL over 9.88-10.00 around the exact F32-decoded value 9.966, i.e. +-0.06 from
+    /// activation-quantisation noise alone. The CPU kernel itself is exact: an F32-weight dot over the same
+    /// dequantised rows reproduces the F32-decoded control to 0.0002 nats. 0.12 stays well under the 0.24 nats of
+    /// the real #276 defect. Every other type keeps 0.05.
+    /// </summary>
+    private static double NatsBound(QuantizationType quantType) => quantType == QuantizationType.IQ1_S ? 0.12 : NatsTolerance;
+
+    /// <summary>
     /// Bound on mean <c>(1 - cosine_similarity)</c> between per-step decode logits, CPU vs
     /// backend, over <see cref="DecodeSteps"/> greedy steps. #276 measured 1-cos of 2.8e-3
     /// (CUDA) / 3.0e-3 (Vulkan) against CPU on IQ1_S as "inside the healthy continuum" even
@@ -396,12 +407,12 @@ public sealed class CrossBackendQuantGateTests
             _output.WriteLine(
                 $"[{quantType}/{backend}] prefill NLL: cpu={cpuPpl.MeanNegativeLogLikelihood:F6} "
                 + $"{backend}={gpuPpl.MeanNegativeLogLikelihood:F6} |delta|={natsDelta:F6} nats "
-                + $"(bound {NatsTolerance})");
+                + $"(bound {NatsBound(quantType)})");
 
             Assert.True(double.IsFinite(gpuPpl.MeanNegativeLogLikelihood),
                 $"[{quantType}/{backend}] {backend} mean NLL was not finite.");
-            Assert.True(natsDelta <= NatsTolerance,
-                $"[{quantType}/{backend}] prefill NLL delta {natsDelta:F6} nats exceeds bound {NatsTolerance} "
+            Assert.True(natsDelta <= NatsBound(quantType),
+                $"[{quantType}/{backend}] prefill NLL delta {natsDelta:F6} nats exceeds bound {NatsBound(quantType)} "
                 + $"(cpu={cpuPpl.MeanNegativeLogLikelihood:F6}, {backend}={gpuPpl.MeanNegativeLogLikelihood:F6}).");
 
             // Leg 2: greedy decode (decode/GEMV), per-step logit agreement.
