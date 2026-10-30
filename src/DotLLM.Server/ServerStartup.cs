@@ -419,7 +419,7 @@ public static class ServerStartup
         var gguf = GgufFile.Open(resolvedPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         config = GgufModelConfigExtractor.ApplyRoPEOverride(config, options.RopeOverride);
-        bool isEncoder = config.Architecture is Architecture.Bert or Architecture.NomicBert;
+        bool isEncoder = config.Architecture is Architecture.Bert or Architecture.NomicBert or Architecture.NomicBertMoe;
         var tokenizer = isEncoder ? GgufTokenizerFactory.Load(gguf.Metadata) : GgufBpeTokenizerFactory.Load(gguf.Metadata);
 
         if (isEncoder)

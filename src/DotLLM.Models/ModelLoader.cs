@@ -73,7 +73,7 @@ public static class ModelLoader
         var effectiveThreading = threading ?? ThreadingConfig.SingleThreaded;
         return config.Architecture switch
         {
-            Architecture.Bert or Architecture.NomicBert => BertEncoderModel.LoadFromGguf(gguf, config, effectiveThreading),
+            Architecture.Bert or Architecture.NomicBert or Architecture.NomicBertMoe => BertEncoderModel.LoadFromGguf(gguf, config, effectiveThreading),
             Architecture.NemotronH => NemotronHTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             // #375 slice 2: nemotron_h_moe shares the NemotronH model class — the MoE
             // FFN layers are detected per-layer by the ffn_gate_inp router tensor.

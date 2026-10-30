@@ -44,7 +44,8 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
     private readonly float[] _embNormW;
     private readonly float[] _embNormB;
     private readonly float _eps;
-    private readonly bool _nomic;
+    private readonly bool _nomic;     // RoPE instead of absolute positions (nomic-bert, nomic-bert-moe)
+    private readonly bool _swiglu;    // nomic-bert only: down(silu(gate(x)) * up(x))
     private readonly ComputeThreadPool? _pool;
     private readonly float[]? _ropeCos;
     private readonly float[]? _ropeSin;
@@ -91,9 +92,21 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
         public float[]? Bias;
     }
 
+    private sealed class MoeFfn
+    {
+        public required Proj Router;        // [n_embd -> n_expert], F32
+        public required nint UpBank;        // n_expert x [n_embd -> n_ff]
+        public required nint DownBank;      // n_expert x [n_ff -> n_embd]
+        public required QuantizationType UpQt, DownQt;
+        public required int NumExperts, TopK, Ff;
+        public float[]? Bias;               // HF NomicExperts.bias (absent from llama.cpp's GGUFs, see docs/EMBEDDINGS.md)
+    }
+
     private sealed class Layer
     {
         public Proj? Qkv, Q, K, V, O, Up, Gate, Down;
+        /// <summary>Sparse GELU MoE FFN (nomic-bert-moe odd layers); replaces Up/Down.</summary>
+        public MoeFfn? Moe;
         public required float[] AttnNormW, AttnNormB, OutNormW, OutNormB;
     }
 
@@ -125,7 +138,8 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
         _posEmbd = posEmbd; _posEmbdQt = posEmbdQt; _posRows = posRows;
         _embNormW = embNormW; _embNormB = embNormB;
         _eps = config.NormEpsilon;
-        _nomic = config.Architecture == Architecture.NomicBert;
+        _nomic = config.Architecture is Architecture.NomicBert or Architecture.NomicBertMoe;
+        _swiglu = config.Architecture == Architecture.NomicBert;
         _pool = pool;
         _ropeCos = ropeCos; _ropeSin = ropeSin; _ropeRows = ropeRows;
     }
@@ -134,14 +148,15 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
     public static BertEncoderModel LoadFromGguf(GgufFile gguf, ModelConfig config, ThreadingConfig? threading = null)
     {
         ArgumentNullException.ThrowIfNull(gguf);
-        if (config.Architecture is not (Architecture.Bert or Architecture.NomicBert))
-            throw new ArgumentException($"BertEncoderModel requires Architecture.Bert/NomicBert, got {config.Architecture}.", nameof(config));
+        if (config.Architecture is not (Architecture.Bert or Architecture.NomicBert or Architecture.NomicBertMoe))
+            throw new ArgumentException($"BertEncoderModel requires Architecture.Bert/NomicBert/NomicBertMoe, got {config.Architecture}.", nameof(config));
 
         var dataBase = new GgufDataBase(gguf);
         var t = gguf.TensorsByName;
         Nvfp4Support.RejectUnappliedScales(t, consumedScales: null, "The BERT encoder loader"); // #1038
         int h = config.HiddenSize;
-        bool nomic = config.Architecture == Architecture.NomicBert;
+        bool nomic = config.Architecture is Architecture.NomicBert or Architecture.NomicBertMoe;
+        bool swiglu = config.Architecture == Architecture.NomicBert;
 
         GgufTensorDescriptor Req(string name)
             => t.TryGetValue(name, out var d) ? d
@@ -205,10 +220,29 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
                 OutNormW = Vec(p + "layer_output_norm.weight", h),
                 OutNormB = Vec(p + "layer_output_norm.bias", h),
                 O = ReqProj(p + "attn_output.weight", p + "attn_output.bias"),
-                Up = ReqProj(p + "ffn_up.weight", p + "ffn_up.bias"),
-                Down = ReqProj(p + "ffn_down.weight", p + "ffn_down.bias"),
                 Gate = OptProj(p + "ffn_gate.weight", null),
             };
+            if (t.TryGetValue(p + "ffn_up_exps.weight", out var upExps))
+            {
+                // nomic-bert-moe sparse layer: 3-D expert banks [K, M, E] + F32 router [n_embd, E].
+                var downExps = Req(p + "ffn_down_exps.weight");
+                int experts = upExps.Shape[2];
+                if (config.Moe is not { } moe || experts != moe.NumExperts || downExps.Shape[2] != experts)
+                    throw new InvalidDataException($"nomic-bert-moe layer {i}: expert bank has {experts} experts, config says {config.Moe?.NumExperts}.");
+                l.Moe = new MoeFfn
+                {
+                    Router = ReqProj(p + "ffn_gate_inp.weight", null),
+                    UpBank = dataBase.Of(upExps), UpQt = upExps.QuantizationType,
+                    DownBank = dataBase.Of(downExps), DownQt = downExps.QuantizationType,
+                    NumExperts = experts, TopK = moe.NumExpertsPerTok, Ff = upExps.Shape[1],
+                    Bias = OptVec(p + "ffn_down_exps.bias", h),
+                };
+            }
+            else
+            {
+                l.Up = ReqProj(p + "ffn_up.weight", p + "ffn_up.bias");
+                l.Down = ReqProj(p + "ffn_down.weight", p + "ffn_down.bias");
+            }
             l.Qkv = OptProj(p + "attn_qkv.weight", p + "attn_qkv.bias");
             if (l.Qkv is null)
             {
@@ -216,7 +250,7 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
                 l.K = ReqProj(p + "attn_k.weight", p + "attn_k.bias");
                 l.V = ReqProj(p + "attn_v.weight", p + "attn_v.bias");
             }
-            if (nomic && l.Gate is null)
+            if (swiglu && l.Gate is null)
                 throw new InvalidDataException($"nomic-bert layer {i} is missing ffn_gate.weight (SwiGLU).");
             layers[i] = l;
         }
@@ -281,7 +315,7 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
         float* attn = Alloc((long)n * h);
         float* tmp = Alloc((long)n * h);
         float* up = Alloc((long)n * ff);
-        float* gate = _nomic ? Alloc((long)n * ff) : null;
+        float* gate = _swiglu ? Alloc((long)n * ff) : null;
         try
         {
             var prof = t_serial ? null : StageProfile;
@@ -347,7 +381,16 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
 
                 prof?.Mark(EncoderStage.Ln1);
                 // ── FFN ──
-                if (_nomic)
+                if (l.Moe is not null)
+                {
+                    MoeForward(l.Moe, x, attn, n, h);
+                    prof?.Mark(EncoderStage.FfnDown);
+                    TensorPrimitives.Add(new ReadOnlySpan<float>(attn, n * h), new ReadOnlySpan<float>(tmp, n * h), new Span<float>(attn, n * h));
+                    LayerNorm(attn, l.OutNormW, l.OutNormB, x, n, h);
+                    prof?.Mark(EncoderStage.Ln2);
+                    continue;
+                }
+                if (_swiglu)
                 {
                     Gemm(l.Gate!, x, gate, n);
                     Gemm(l.Up!, x, up, n);
@@ -482,6 +525,85 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
             _subPools[threadsPerSeq] = made;
             return made;
         }
+    }
+
+    /// <summary>
+    /// Sparse MoE FFN of <c>nomic-bert-moe</c> (llama.cpp <c>build_moe_ffn</c> with softmax gating, <c>norm_w = false</c>,
+    /// no gate projection, GELU): <c>out[t] = sum over top-k experts e of p_t[e] * down_e(gelu(up_e(x_t)))</c>, where p_t is the
+    /// softmax over ALL experts (the selected weights are not renormalised), plus the optional HF <c>experts.bias</c>.
+    /// Tokens are grouped per expert so each expert runs one GEMM over its tokens.
+    /// </summary>
+    private void MoeForward(MoeFfn m, float* x, float* output, int n, int h)
+    {
+        int e = m.NumExperts, ff = m.Ff;
+        float* logits = Alloc((long)n * e);
+        var selExpert = new int[n * m.TopK];
+        var selWeight = new float[n * m.TopK];
+        try
+        {
+            Gemm(m.Router, x, logits, n);
+            Span<float> p = stackalloc float[e];
+            Span<int> idx = stackalloc int[e];
+            for (int t = 0; t < n; t++)
+            {
+                var row = new ReadOnlySpan<float>(logits + (long)t * e, e);
+                float max = float.NegativeInfinity;
+                foreach (float v in row) max = MathF.Max(max, v);
+                double sum = 0;
+                for (int i = 0; i < e; i++) { p[i] = MathF.Exp(row[i] - max); sum += p[i]; idx[i] = i; }
+                for (int i = 0; i < e; i++) p[i] = (float)(p[i] / sum);
+                for (int k = 0; k < m.TopK; k++)   // partial selection sort, ties go to the lower expert id
+                {
+                    int best = k;
+                    for (int i = k + 1; i < e; i++)
+                        if (p[idx[i]] > p[idx[best]]) best = i;
+                    (idx[k], idx[best]) = (idx[best], idx[k]);
+                    selExpert[t * m.TopK + k] = idx[k];
+                    selWeight[t * m.TopK + k] = p[idx[k]];
+                }
+            }
+        }
+        finally { Free(logits); }
+
+        new Span<float>(output, n * h).Clear();
+        long upExpertBytes = (long)ff * Dequantize.RowByteSize(h, m.UpQt);
+        long downExpertBytes = (long)h * Dequantize.RowByteSize(ff, m.DownQt);
+        var tokens = new List<int>(n);
+        var slots = new List<int>(n);
+        for (int ex = 0; ex < e; ex++)
+        {
+            tokens.Clear(); slots.Clear();
+            for (int t = 0; t < n; t++)
+                for (int k = 0; k < m.TopK; k++)
+                    if (selExpert[t * m.TopK + k] == ex) { tokens.Add(t); slots.Add(t * m.TopK + k); }
+            int cnt = tokens.Count;
+            if (cnt == 0) continue;
+
+            float* xin = Alloc((long)cnt * h);
+            float* mid = Alloc((long)cnt * ff);
+            float* eout = Alloc((long)cnt * h);
+            try
+            {
+                for (int r = 0; r < cnt; r++)
+                    new ReadOnlySpan<float>(x + (long)tokens[r] * h, h).CopyTo(new Span<float>(xin + (long)r * h, h));
+                var up = new Proj { Weight = m.UpBank + (nint)(ex * upExpertBytes), Qt = m.UpQt, K = h, M = ff };
+                var down = new Proj { Weight = m.DownBank + (nint)(ex * downExpertBytes), Qt = m.DownQt, K = ff, M = h };
+                Gemm(up, xin, mid, cnt);
+                Gelu(mid, cnt * ff);
+                Gemm(down, mid, eout, cnt);
+                for (int r = 0; r < cnt; r++)
+                {
+                    float w = selWeight[slots[r]];
+                    var dst = new Span<float>(output + (long)tokens[r] * h, h);
+                    TensorPrimitives.MultiplyAdd(new ReadOnlySpan<float>(eout + (long)r * h, h), w, dst, dst);
+                }
+            }
+            finally { Free(xin); Free(mid); Free(eout); }
+        }
+
+        if (m.Bias is { } bias)
+            for (int t = 0; t < n; t++)
+                TensorPrimitives.Add(new ReadOnlySpan<float>(output + (long)t * h, h), bias, new Span<float>(output + (long)t * h, h));
     }
 
     private void Embed(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, float* x, int h)

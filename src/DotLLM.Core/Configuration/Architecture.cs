@@ -501,5 +501,12 @@ public enum Architecture
     /// <c>leading_dense_block_count</c> layers, sigmoid + selection-bias top-k MoE (renormalised) after. Tied LM head.
     /// See issue #1015.
     /// </summary>
-    Lfm2Moe
+    Lfm2Moe,
+
+    /// <summary>
+    /// nomic-embed-text-v2-moe (llama.cpp <c>nomic-bert-moe</c>): the <see cref="NomicBert"/> encoder (post-LN, fused QKV, RoPE NeoX)
+    /// with a plain biased GELU FFN on even layers and a sparse top-2-of-8 GELU MoE FFN (softmax router, no renormalisation,
+    /// no gate projection) on odd layers (<c>moe_every_n_layers = 2</c>); XLM-R SentencePiece Unigram vocabulary. CPU only (issue #1400).
+    /// </summary>
+    NomicBertMoe
 }
