@@ -631,6 +631,9 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         if (MoeStageProfileEnabled) MoeStage(name);
     }
 
+    /// <summary>Perturbation probe (#1362, diagnostic only): "scatter" / "shared" makes the routed-MoE layer skip that dispatch (output is garbage; timing only).</summary>
+    internal static string? PerturbSkip { get; set; }
+
     /// <summary>Perturbation (#1334): <c>DOTLLM_VK_PERTURB=target=after1|after2</c> suppresses every dispatch recorded between the stage marker named in <c>after</c> and the marker <c>target</c> (timing attribution only; needs stage profiling on).</summary>
     internal static string? PerturbTarget { get; set; }
     internal static string[] PerturbAfter { get; set; } = [];
@@ -2515,7 +2518,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         }
 
         // 7. Weighted scatter into NormOutput.
-        if (fusedGlue)
+        if (PerturbSkip == "scatter") { }
+        else if (fusedGlue)
             _kernels.MoeWeightedScatterGrouped!.Record(cmdBuf,
                 _state.MoeExpandedInput, _state.MoeGroupInvPerm, _state.MoeTopkWeights, _state.NormOutput,
                 seqLen: seqLen, topK: topK, hiddenSize: hidden);
@@ -2527,7 +2531,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         MoeStage("weighted_scatter");
 
         // 8. Shared-expert branch (Qwen1.5-MoE sigmoid-gated convention).
-        if (moeW.HasSharedExpert)
+        if (moeW.HasSharedExpert && PerturbSkip != "shared")
         {
             RecordSharedExpert(cmdBuf, moeW, postAttnNormWeight, seqLen, hidden, eps);
             MoeStage("shared_expert");
