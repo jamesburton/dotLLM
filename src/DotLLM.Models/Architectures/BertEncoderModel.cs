@@ -51,6 +51,23 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
     private readonly int _ropeRows;
     private bool _disposed;
 
+    /// <summary>True on a batch worker thread running one whole sequence single-threaded (#1405): any use of the compute pool
+    /// from such a thread would be a nested Dispatch on a pool that is already dispatching.</summary>
+    [ThreadStatic] private static bool t_serial;
+
+    /// <summary>The pool a batch worker uses for its own sequence (<c>null</c> = single-threaded). Only meaningful while <see cref="t_serial"/>.</summary>
+    [ThreadStatic] private static ComputeThreadPool? t_ownPool;
+
+    /// <summary>The pool kernels may dispatch on: the batch worker's private pool (or none) on a batch worker, else the model pool.</summary>
+    private ComputeThreadPool? ActivePool => t_serial ? t_ownPool : _pool;
+
+    // Sub-pools for batches smaller than the thread count: G concurrent sequences of T threads each. Keyed by T.
+    private readonly Dictionary<int, ComputeThreadPool[]> _subPools = new();
+
+    /// <summary>Minimum batch size for one-sequence-per-core execution; below it a batch runs sequentially on the pooled kernels.
+    /// Env <c>DOTLLM_EMBED_PAR_MIN</c> overrides (benchmarking).</summary>
+    internal static int ParallelBatchMin { get; set; } = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_EMBED_PAR_MIN"), out int v) ? v : 2;
+
     /// <summary>Optional per-stage wall-clock accumulator (#1369). Null (the default) costs one null check per stage.</summary>
     internal static EncoderStageProfile? StageProfile { get; set; }
 
@@ -259,7 +276,7 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
         float* gate = _nomic ? Alloc((long)n * ff) : null;
         try
         {
-            var prof = StageProfile;
+            var prof = t_serial ? null : StageProfile;
             prof?.Begin();
             Embed(tokenIds, positions, x, h);
             prof?.Mark(EncoderStage.Embed);
@@ -351,6 +368,108 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
         finally
         {
             Free(x); Free(qkv); Free(q); Free(k); Free(v); Free(attn); Free(tmp); Free(up); Free(gate);
+        }
+    }
+
+    /// <inheritdoc/>
+    public void ForwardHiddenBatch(IReadOnlyList<int[]> sequences, IEmbeddingModel.HiddenStateConsumer consume, int deviceId)
+    {
+        ArgumentNullException.ThrowIfNull(sequences);
+        ArgumentNullException.ThrowIfNull(consume);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        int count = sequences.Count;
+        var pool = _pool;
+        if (pool is null || count < ParallelBatchMin)
+        {
+            for (int i = 0; i < count; i++)
+            {
+                int[] tokens = sequences[i];
+                var positions = new int[tokens.Length];
+                for (int p = 0; p < positions.Length; p++) positions[p] = p;
+                using var hidden = ForwardHidden(tokens, positions, deviceId);
+                consume(i, new ReadOnlySpan<float>((void*)hidden.DataPointer, tokens.Length * Config.HiddenSize));
+            }
+            return;
+        }
+
+        // Longest first: the shortest sequences fill the tail, so no worker idles behind one long document.
+        var order = new int[count];
+        for (int i = 0; i < count; i++) order[i] = i;
+        Array.Sort(order, (a, b) => sequences[b].Length.CompareTo(sequences[a].Length));
+
+        // Threads per sequence: all cores for a lone sequence, one for a large batch, an even split in between.
+        int total = pool.ThreadCount;
+        int perSeq = Math.Max(1, total / count);
+        int groups = Math.Min(count, total / perSeq);
+        var subPools = perSeq > 1 ? GetSubPools(perSeq, groups) : null;
+
+        var state = new BatchState(this, sequences, consume, order, deviceId) { SubPools = subPools, Groups = groups };
+        var handle = System.Runtime.InteropServices.GCHandle.Alloc(state);
+        try
+        {
+            var ctx = new BatchCtx { State = System.Runtime.InteropServices.GCHandle.ToIntPtr(handle) };
+            pool.Dispatch((nint)(&ctx), &BatchWorker);
+        }
+        finally { handle.Free(); }
+        state.Error?.Throw();
+    }
+
+    private sealed class BatchState(BertEncoderModel model, IReadOnlyList<int[]> seqs, IEmbeddingModel.HiddenStateConsumer consume, int[] order, int deviceId)
+    {
+        public readonly BertEncoderModel Model = model;
+        public readonly IReadOnlyList<int[]> Seqs = seqs;
+        public readonly IEmbeddingModel.HiddenStateConsumer Consume = consume;
+        public readonly int[] Order = order;
+        public readonly int DeviceId = deviceId;
+        public ComputeThreadPool[]? SubPools;
+        public int Groups;
+        public int Next = -1;
+        public System.Runtime.ExceptionServices.ExceptionDispatchInfo? Error;
+    }
+
+    private struct BatchCtx { public nint State; }
+
+    private static void BatchWorker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        var st = (BatchState)System.Runtime.InteropServices.GCHandle.FromIntPtr(((BatchCtx*)ctxPtr)->State).Target!;
+        if (threadIdx >= st.Groups) return;
+        t_serial = true;
+        t_ownPool = st.SubPools?[threadIdx];
+        try
+        {
+            while (Volatile.Read(ref st.Error) is null)
+            {
+                int slot = Interlocked.Increment(ref st.Next);
+                if (slot >= st.Order.Length) break;
+                int idx = st.Order[slot];
+                var tokens = st.Seqs[idx];
+                try
+                {
+                    var positions = new int[tokens.Length];
+                    for (int p = 0; p < positions.Length; p++) positions[p] = p;
+                    using var hidden = st.Model.ForwardHidden(tokens, positions, st.DeviceId);
+                    st.Consume(idx, new ReadOnlySpan<float>((void*)hidden.DataPointer, tokens.Length * st.Model.Config.HiddenSize));
+                }
+                catch (Exception ex)
+                {
+                    Interlocked.CompareExchange(ref st.Error, System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex), null);
+                }
+            }
+        }
+        finally { t_serial = false; t_ownPool = null; }
+    }
+
+    private ComputeThreadPool[] GetSubPools(int threadsPerSeq, int groups)
+    {
+        lock (_subPools)
+        {
+            if (_subPools.TryGetValue(threadsPerSeq, out var existing) && existing.Length >= groups) return existing;
+            var made = new ComputeThreadPool[groups];
+            int have = existing?.Length ?? 0;
+            for (int i = 0; i < have && i < groups; i++) made[i] = existing![i];
+            for (int i = have; i < groups; i++) made[i] = new ComputeThreadPool(threadsPerSeq);
+            _subPools[threadsPerSeq] = made;
+            return made;
         }
     }
 
@@ -470,33 +589,34 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
 
     private void Gemm(Proj p, float* input, float* output, int n)
     {
+        var pool = ActivePool;
         nint weights = p.Weight;
         var qt = p.Qt;
         int m = p.M, k = p.K;
         if (ForceF32Activations && qt is not (QuantizationType.F32 or QuantizationType.F16))
         {
-            MatMul.GemmDequantRows((byte*)weights, qt, input, output, m, k, n, pool: _pool);
+            MatMul.GemmDequantRows((byte*)weights, qt, input, output, m, k, n, pool: pool);
             return;
         }
 
         switch (qt)
         {
-            case QuantizationType.F32: MatMul.GemmF32((float*)weights, input, output, m, k, n, _pool); return;
-            case QuantizationType.F16: MatMul.GemmF16(weights, input, output, m, k, n, _pool); return;
-            case QuantizationType.Q8_0: MatMul.GemmQ8_0((byte*)weights, input, output, m, k, n, _pool, null); return;
-            case QuantizationType.Q5_0: MatMul.GemmQ5_0((byte*)weights, input, output, m, k, n, _pool, null); return;
-            case QuantizationType.Q2_K: MatMul.GemmQ2_K((byte*)weights, input, output, m, k, n, _pool, null); return;
-            case QuantizationType.Q3_K: MatMul.GemmQ3_K((byte*)weights, input, output, m, k, n, _pool, null); return;
-            case QuantizationType.Q4_K: MatMul.GemmQ4_K((byte*)weights, input, output, m, k, n, _pool, null); return;
-            case QuantizationType.Q5_K: MatMul.GemmQ5_K((byte*)weights, input, output, m, k, n, _pool, null); return;
-            case QuantizationType.Q6_K: MatMul.GemmQ6_K((byte*)weights, input, output, m, k, n, _pool, null); return;
+            case QuantizationType.F32: MatMul.GemmF32((float*)weights, input, output, m, k, n, pool); return;
+            case QuantizationType.F16: MatMul.GemmF16(weights, input, output, m, k, n, pool); return;
+            case QuantizationType.Q8_0: MatMul.GemmQ8_0((byte*)weights, input, output, m, k, n, pool, null); return;
+            case QuantizationType.Q5_0: MatMul.GemmQ5_0((byte*)weights, input, output, m, k, n, pool, null); return;
+            case QuantizationType.Q2_K: MatMul.GemmQ2_K((byte*)weights, input, output, m, k, n, pool, null); return;
+            case QuantizationType.Q3_K: MatMul.GemmQ3_K((byte*)weights, input, output, m, k, n, pool, null); return;
+            case QuantizationType.Q4_K: MatMul.GemmQ4_K((byte*)weights, input, output, m, k, n, pool, null); return;
+            case QuantizationType.Q5_K: MatMul.GemmQ5_K((byte*)weights, input, output, m, k, n, pool, null); return;
+            case QuantizationType.Q6_K: MatMul.GemmQ6_K((byte*)weights, input, output, m, k, n, pool, null); return;
             case QuantizationType.Q4_0:
             case QuantizationType.Q4_1:
             case QuantizationType.Q5_1:
             case QuantizationType.IQ4_NL:
-                MatMul.GemmLegacyQuantOrDequant((byte*)weights, qt, input, output, m, k, n, _pool, null); return;
+                MatMul.GemmLegacyQuantOrDequant((byte*)weights, qt, input, output, m, k, n, pool, null); return;
             default:
-                MatMul.GemmDequantRows((byte*)weights, qt, input, output, m, k, n, pool: _pool); return;
+                MatMul.GemmDequantRows((byte*)weights, qt, input, output, m, k, n, pool: pool); return;
         }
     }
 
@@ -514,6 +634,7 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
     {
         if (_disposed) return;
         _disposed = true;
+        foreach (var set in _subPools.Values) foreach (var sp in set) sp.Dispose();
         _pool?.Dispose();
     }
 }

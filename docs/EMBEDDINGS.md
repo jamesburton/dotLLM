@@ -107,8 +107,8 @@ sentence-transformers at bs=1 is already 3-15x faster, the gap is **kernel effic
 bs=32 is *slower* than bs=1 here: padding waste).
 
 Other numbers: tokenisation is not a lever (WordPiece 17-18k docs/s = 2.2M tokens/s; Qwen BPE 5.8k docs/s = 0.67M tokens/s,
-versus 60-250 ms to embed a document). Server-side `/v1/embeddings` was not load-tested: the code path serialises all
-requests on `ExecuteOnModelAsync` and loops sequences, so concurrent clients add latency, never throughput.
+versus 60-250 ms to embed a document). Server-side `/v1/embeddings` before #1405 serialised all
+requests on `ExecuteOnModelAsync` and looped sequences, so concurrent clients added latency, never throughput (see the #1405 section in 4 for the fix).
 
 ### Padding waste (what a padded batched path would face)
 
@@ -160,6 +160,44 @@ gate GEMM for nomic):
   (one noisy rep 11). Attention (single-threaded) and GELU now dominate (#1402/#1403). Parity vs legacy on 50 texts: min cosine
   0.9999999; unit test vs double-precision reference on m%4, k%8, odd-n shapes.
 * Amdahl view at 32 threads, bge-base Q8 at 64 tokens: ~44 % of the document is the two serial stages (Attention + GELU).
+
+### Inter-sequence parallelism and server batching (#1405)
+
+`IEmbeddingModel.ForwardHiddenBatch(sequences, consume, device)` (default = sequential loop). `BertEncoderModel` overrides it:
+sequences are sorted longest-first, then run **one sequence per core, single-threaded** when the batch is at least as large as the pool,
+or an even thread split in between (`G = min(B, T / (T/B))` concurrent sequences, each with its own `T/B`-thread sub-pool; B=1 uses the
+whole pool as before). Results are **bit-identical** to one-at-a-time (`BertEmbeddingBatchParityTests`: batch sizes 1,2,3,5,13,40,
+Q8_0 / F16 / nomic; every GEMM output is independent of partitioning). The server (`EmbeddingBatcher`, shared by `/v1/embeddings` and
+`/api/embed`) queues requests, waits `DOTLLM_EMBED_BATCH_WINDOW_MS` (default 2 ms, only while fewer than `ProcessorCount` sequences are
+pending), takes the request gate once per batch and fans results back per request in input order. A failing batch is replayed per request so one
+bad request cannot fail its neighbours. `DOTLLM_EMBED_PAR_MIN` (default 2) is the smallest batch that uses the parallel path.
+
+Measured, bge-base Q8_0, 32 threads (16C/32T), `cpu-bench` held, docs/s (min-max):
+
+| Batch (in-process `EmbeddingBench batch`) | 1 | 2 | 4 | 8 | 16 | 32 | 128 |
+|---|---|---|---|---|---|---|---|
+| seq 64, sequential (before, flat) | 14-15 | | | 11-15 | | 15 | 15 |
+| seq 64, batched | 14-15 | 24-27 | 33-35 | 45-47 | 49-54 | 35-51 | 52-53 |
+| seq 256, sequential (before) | 2.8 | | | 2.8 | | | 2.8 |
+| seq 256, batched | 2.7-2.9 | 2.6-2.9 | 2.9-3.3 | 3.6 (one 6.1) | | 11.3-12.0 | 11.5-11.7 |
+
+(The seq-256 batched rows used the first build, with only the one-thread-per-sequence path for B >= 4 and no sub-pool split; seq-64 rows
+used the final build.) Saturation is **3.5x at seq 64 and 4.1x at seq 256**, not the 4-8x estimated: one thread embeds a 64-token document in
+~266 ms (3.75 docs/s); 8 threads give 26 docs/s, 16 threads 43.6, 24 threads 48.9, 32 threads 52.6, so the ceiling is the 16 physical cores
+(~3.3 docs/s each, SMT adds ~20 %). Further gains must come from per-thread efficiency (#1402/#1403/#1404 shrink each sequence's time and
+compose with this).
+
+HTTP, `EmbeddingBench http` (token-id inputs, one document per request, N concurrent clients, seq 64, two paired server runs each):
+
+| Clients | before docs/s (p50 ms) | after docs/s (p50 ms) |
+|---|---|---|
+| 1 | 9.0-10.3 (102-124) | 9.0-10.6 (96-111) |
+| 8 | 9.7-11.4 (767-824) | 31.6-36.1 (220-251) |
+| 32 | 10.8-11.5 (2.8-3.0 s) | 39.8-40.9 (774-836) |
+
+A single client is unchanged within noise (the 2 ms window is invisible against a 100 ms document); concurrency now scales 3.3x at 8 clients
+and 3.7x at 32. Decoder embedders (`TransformerModel`, Qwen3-Embedding) use the default sequential implementation, so they gain request
+coalescing but no parallelism.
 
 ## 5. Vulkan / CUDA
 
