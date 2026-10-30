@@ -89,6 +89,13 @@ jobs:
       - name: Unit Tests
         run: dotnet test tests/DotLLM.Tests.Unit/ -c Release --filter "Category!=GPU&Category!=Benchmark" --blame-hang-timeout 5m
 
+      # The freshness test is a SkippableFact, and the full run above only prints totals: assert here that it really ran.
+      - name: Tracked .spv freshness actually ran (not skipped)
+        run: |
+          out="$(dotnet test tests/DotLLM.Tests.Unit/ -c Release --no-build --filter "FullyQualifiedName~VulkanSpvFreshnessTests")"
+          echo "$out" | tail -n 5
+          echo "$out" | grep -E "Passed: +1, Skipped: +0" >/dev/null || { echo "::error::VulkanSpvFreshnessTests did not run to a pass"; exit 1; }
+
       # The SSE-only tiers (e.g. KQuantSseTierTests) are gated on `Ssse3 && !Avx2`, so on AVX2 runners they
       # never execute. Re-run the CPU kernel tests with the wide ISAs disabled so those tiers are exercised
       # (found via a Westmere box with no AVX, #602).
