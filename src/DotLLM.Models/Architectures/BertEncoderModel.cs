@@ -74,6 +74,8 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
     /// <summary>Test seam: erf-exact GELU instead of llama.cpp's tanh approximation.</summary>
     internal static bool UseErfGelu { get; set; }
 
+    /// <summary>Test/bench seam (#1403): run the old serial scalar <c>MathF.Tanh</c> GELU instead of the vectorised kernel.</summary>
+    internal static bool UseLegacyGelu { get; set; }
     /// <summary>Test/bench seam (#1402): run the old single-threaded attention call instead of the parallel kernel.</summary>
     internal static bool UseLegacyAttention { get; set; }
 
@@ -554,7 +556,7 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
         }
     }
 
-    private static void Gelu(float* data, int count)
+    private void Gelu(float* data, int count)
     {
         if (UseErfGelu)
         {
@@ -563,7 +565,13 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
             return;
         }
 
-        // ggml_gelu: tanh approximation (GELU_COEF_A = 0.044715, SQRT_2_OVER_PI).
+        // ggml_gelu: tanh approximation (GELU_COEF_A = 0.044715, SQRT_2_OVER_PI). #1403: vectorised, split over ActivePool.
+        if (!UseLegacyGelu)
+        {
+            DotLLM.Cpu.Kernels.Gelu.ExecuteTanh(data, count, ActivePool);
+            return;
+        }
+
         for (int i = 0; i < count; i++)
         {
             float x = data[i];

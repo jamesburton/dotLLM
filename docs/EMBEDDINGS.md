@@ -186,6 +186,33 @@ gate GEMM for nomic):
   bge-small F16 7.0-7.3 -> 16.9-17.3, MiniLM Q8 13.7-14.0 -> 33.9-34.7, nomic Q8 4.7-4.8 -> 10.9-11.0 (raw rows:
   `benchmarks/EmbeddingBench/results/ab-attention-1402.jsonl`; this bench runs documents back to back, the server batcher of #1405
   already parallelises across documents). Remaining serial stage: GELU (#1403).
+* **Fixed (#1403): GELU is vectorised and parallel.** `Gelu.ExecuteTanh` (`Gelu.cs`, ggml's tanh form, `UseErfGelu` seam
+  unchanged) runs `TensorPrimitives` Multiply/Add/Tanh over 512-float L1 tiles, tile ranges split across `ActivePool`
+  (shipping .NET 10 intrinsics only). Max abs error vs the exact double-precision tanh GELU: 6.3e-7 over 100k inputs in
+  [-40, 40] plus 0, +-1e-8, +-9, +-100 (test gate `2e-6 * max(1, |x|)`); serial and parallel results are bit-identical. Model
+  parity vs the old scalar loop (`EmbeddingBench dump --legacy-gelu 1` vs `0`, 48 texts): F16 models min cosine 1.000000000
+  (max |dx| 1.2e-7: MiniLM, bge-small, bge-base; nomic has no GELU and is exactly 0); Q8_0 models min cosine 0.99973-0.99991
+  vs the old path, because Q8 activation quantisation digitises the ~1e-7 difference. Against the sentence-transformers fp32
+  reference the Q8_0 figures are unchanged within noise (bge-small 0.999612 / 0.999836 old vs 0.999612 / 0.999837 new,
+  bge-base 0.999664 / 0.999804 vs 0.999591 / 0.999804, mxbai 0.998643 / 0.999769 vs 0.998745 / 0.999767, min / mean), i.e. the
+  gate (F16 >= 0.9999; Q8 figure recorded, recall unmoved) holds. `--legacy-gelu 1` is the same-session A/B arm. Paired A/B,
+  32 threads, 3 reps alternating order, `profile` Act stage and document total (ms/doc, min-max), legacy -> new, measured on
+  the tree that already has the parallel attention of #1402 (so the totals are no longer diluted by serial attention):
+
+| Model | seq | Act stage | Document total |
+|---|---|---|---|
+| bge-base Q8_0 | 256 / 512 | 95.6-97.2 -> 1.6-1.8 / 194-197 -> 2.1-2.2 | 221-224 -> 109-111 / 448-456 -> 238-255 |
+| bge-base F16 | 256 / 512 | 93-96 -> 1.6-4.0 / 192-194 -> 1.8-2.0 | 176-180 -> 78-92 / 367-377 -> 171-181 |
+| bge-small Q8_0 | 256 / 512 | 56.5-57 -> 1.4-4.7 / 113-114 -> 1.5-1.6 | 110-114 -> 51-59 / 241-243 -> 112 |
+| bge-small F16 | 256 / 512 | 56 -> 2.5-3.8 / 113-114 -> 1.5-1.7 | 99-100 -> 54-62 / 213-218 -> 90-100 |
+| MiniLM Q8_0 | 256 / 512 | 23.6 -> 2.6-3.2 / 47 -> 0.8-1.9 | 53-68 -> 43-81 (noisy) / 111-114 -> 57-60 |
+
+  The GELU stage drops 25-100x and the whole document is 1.9-2.2x faster at 256-512 tokens (bge-small Q8 at 512: 241-243 ->
+  112 ms; bge-base Q8: 448-456 -> 238-255 ms). The 64-token cells are cold-start noisy (8 iterations) and the MiniLM 256 total
+  has one contended rep. 48-text e2e docs/s (median of 3 reps): bge-base Q8 7.8 -> 14.2-14.7, bge-base F16 9.4-9.6 -> 20.6-21.0,
+  bge-small Q8 14.8-14.9 -> 30.9-33.1, bge-small F16 16.7-16.8 -> 39.7-40.7, MiniLM Q8 32.5-33.1 -> 64.0-65.3. Raw rows:
+  `benchmarks/EmbeddingBench/results/ab-gelu-1403.jsonl` (rerun on the merged tree; the earlier pre-attention run is kept in
+  the same file before it: it showed the same Act-stage drop with totals diluted by serial attention).
 * Amdahl view at 32 threads, bge-base Q8 at 64 tokens: ~44 % of the document is the two serial stages (Attention + GELU).
 
 ### Inter-sequence parallelism and server batching (#1405)
@@ -245,7 +272,7 @@ the same harness, the cosine gate, and a discriminating shape.
    per document per worker) is far below the memory bandwidth at that rate.
 2. (#1402, parallel part DONE) **Parallel + vectorised bidirectional attention** for short sequences (2.3x at 512, 1.6x at 256, 1.1x at 64 for bge-base Q8;
    lifts MiniLM/bge-small/nomic similarly). Today ~9-18 GFLOP/s on one thread; target >= 10x on that stage.
-3. (#1403) **Vectorised/parallel GELU** (1.3-1.4x for bge/e5/gte/mxbai at 64-256 tokens: removes 18-31 % of the document).
+3. (#1403, DONE) **Vectorised/parallel GELU** (1.3-1.4x for bge/e5/gte/mxbai at 64-256 tokens: removes 18-31 % of the document).
 4. (#1404) **F16 GEMM**: convert-once-per-tile and AVX-512 path, so F16 GGUFs match Q8_0 (>= 1.5-2x on F16 files; interim advice is to
    use the Q8_0 GGUF: 1.4-2x faster at 0.9996+ cosine).
 5. (#1405) **Server dynamic batching** for `/v1/embeddings` (collect requests for a few ms, run lever 1 across clients; length-sort so a padded

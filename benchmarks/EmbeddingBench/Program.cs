@@ -49,6 +49,7 @@ internal static class Program
         if (mode == "llama") return Llama(pos[0], pos[1], Ints("batches", "1,8,32,128"), Ints("seqs", "64,256,512"), cellSec);
 
         string path = pos[0];
+        BertEncoderModel.UseLegacyGelu = opt.GetValueOrDefault("legacy-gelu", "0") == "1";   // #1403 A/B arm
         BertEncoderModel.UseLegacyAttention = opt.GetValueOrDefault("legacy-attn", "0") == "1";   // #1402 A/B arm
         var (model, gguf, config) = ModelLoader.LoadFromGguf(path, new ThreadingConfig(threads, threads));
         using (gguf) using (model)
