@@ -36,7 +36,9 @@ public static class SyntheticQwen35MoeGguf
     private const int SharedIntermediate = 16;
     private const int NumExperts = 4;
     private const int NumExpertsPerTok = 2;
-    internal const int BlockCount = 2;          // layer 0 GDN, layer 1 full-attn
+    internal const int BlockCount = 2;          // layer 0 GDN, layer 1 full-attn (default trunk depth)
+    // Callers needing recurrent layers on both sides of a layer cut (layer-window / cycling coverage, issue #395)
+    // pass a larger even blockCount to Build; full_attention_interval 2 then alternates GDN / attention.
     private const int FullAttnInterval = 2;    // (i+1) % 2 == 0 → layer 1 is attention
 
     // GDN config ({arch}.ssm.* keys, qwen35moe semantics).
@@ -54,8 +56,19 @@ public static class SyntheticQwen35MoeGguf
     /// trunk is drawn first, so the trunk weights equal the <see langword="false"/> fixture's for the same seed.
     /// </param>
     /// <param name="contextLength">Overrides the context length (8); speculative-decode tests need room for several rounds.</param>
-    public static byte[] Build(uint seed = 0xC0FFEEu, bool withMtp = false, int contextLength = ContextLength)
+    /// <param name="blockCount">
+    /// Trunk depth (excluding any MTP block). Must be positive and even, so that <c>full_attention_interval = 2</c> yields an
+    /// alternating GDN / attention layout ending on an attention layer. Values above the default exist for layer-window coverage,
+    /// where a cut must have recurrent layers on both sides to prove anything (issue #395).
+    /// </param>
+    public static byte[] Build(uint seed = 0xC0FFEEu, bool withMtp = false, int contextLength = ContextLength,
+                               int blockCount = BlockCount)
     {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(blockCount);
+        if (blockCount % FullAttnInterval != 0)
+            throw new ArgumentOutOfRangeException(nameof(blockCount),
+                $"blockCount must be a multiple of {FullAttnInterval} to keep the GDN / attention alternation intact.");
+
         var w = new GgufWriter();
         var rng = new SyntheticGemma4Gguf.Xorshift(seed);
         const string arch = "qwen35moe";
@@ -67,7 +80,7 @@ public static class SyntheticQwen35MoeGguf
 
         w.AddUInt32($"{arch}.context_length", (uint)contextLength);
         w.AddUInt32($"{arch}.embedding_length", HiddenSize);
-        w.AddUInt32($"{arch}.block_count", (uint)(withMtp ? BlockCount + 1 : BlockCount));
+        w.AddUInt32($"{arch}.block_count", (uint)(withMtp ? blockCount + 1 : blockCount));
         if (withMtp)
             w.AddUInt32($"{arch}.nextn_predict_layers", 1);
         w.AddUInt32($"{arch}.attention.head_count", NumAttentionHeads);
@@ -102,7 +115,7 @@ public static class SyntheticQwen35MoeGguf
         AddMatrixF32(w, rng, "token_embd.weight", inK: HiddenSize, outM: VocabSize, 0.05f);
         AddNorm(w, rng, "output_norm.weight", HiddenSize);
 
-        for (int i = 0; i < BlockCount; i++)
+        for (int i = 0; i < blockCount; i++)
         {
             bool fullAttn = (i + 1) % FullAttnInterval == 0;
             string p = $"blk.{i}";
@@ -120,7 +133,7 @@ public static class SyntheticQwen35MoeGguf
 
         if (withMtp)
         {
-            string mp = $"blk.{BlockCount}";
+            string mp = $"blk.{blockCount}";
             AddNorm(w, rng, $"{mp}.attn_norm.weight", HiddenSize);
             AddNorm(w, rng, $"{mp}.post_attention_norm.weight", HiddenSize);
             AddFullAttnLayer(w, rng, mp);
@@ -139,9 +152,11 @@ public static class SyntheticQwen35MoeGguf
     /// <param name="seed">Xorshift PRNG seed.</param>
     /// <param name="withMtp">See <see cref="Build"/>.</param>
     /// <param name="contextLength">See <see cref="Build"/>.</param>
-    public static string Write(string path, uint seed = 0xC0FFEEu, bool withMtp = false, int contextLength = ContextLength)
+    /// <param name="blockCount">See <see cref="Build"/>.</param>
+    public static string Write(string path, uint seed = 0xC0FFEEu, bool withMtp = false, int contextLength = ContextLength,
+                               int blockCount = BlockCount)
     {
-        File.WriteAllBytes(path, Build(seed, withMtp, contextLength));
+        File.WriteAllBytes(path, Build(seed, withMtp, contextLength, blockCount));
         return path;
     }
 

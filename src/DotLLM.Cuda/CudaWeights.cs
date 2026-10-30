@@ -268,13 +268,27 @@ internal sealed class CudaWeights : IDisposable
     /// Optional predicate over the GLOBAL layer index: true keeps that MoE layer's routed experts in the mmap'd GGUF
     /// for the CPU leg (<c>--cpu-moe</c> / <c>--n-cpu-moe</c>, #1187) instead of uploading them. Null uploads every expert.
     /// </param>
+    /// <param name="skipOutputHead">
+    /// When <c>true</c>, the output norm + LM head (and the head's quantized decode copy) are not
+    /// uploaded even though this window reaches the last layer, exactly as if the window stopped
+    /// short of it. For a caller that applies the head elsewhere — the layer-cycling perplexity
+    /// windows, which always run the head on the host so that logits are produced for every row
+    /// (issue #395) — the head is otherwise pure dead VRAM on the one window that happens to contain
+    /// the final layer, enough to OOM the last window of a cycle whose earlier windows all fit.
+    /// Measured per-window on Llama-3.2-1B-Q8_0 via <c>cuMemGetInfo_v2</c> around the same window
+    /// built both ways: <b>268 MiB</b>, matching the <c>vocab x hidden</c> arithmetic for the raw
+    /// quantized copy (no FP16 copy is made when a GEMV kernel is loaded for the head's quant type).
+    /// It scales with <c>vocab x hidden</c>, so it is materially larger on a 27-30B model. Default
+    /// <c>false</c> preserves the existing "final window owns the head" behavior.
+    /// </param>
     public static CudaWeights LoadFromGguf(TransformerWeights cpuWeights, ModelConfig config,
                                               CudaKernels kernels, nint stream,
                                               int numGpuLayers = -1, int firstLayer = 0,
                                               bool skipTokenEmbed = false,
                                               Action<nint>? onHostTensorUploaded = null,
                                               Func<int, bool>? hostMoeLayer = null,
-                                              bool hostTokenEmbed = false)
+                                              bool hostTokenEmbed = false,
+                                              bool skipOutputHead = false)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(firstLayer);
         // Dense Gemma-4 (E2B/E4B, #734) runs only on the whole-model CudaTransformerModel Gemma-4 forward; a layer
@@ -285,9 +299,10 @@ internal sealed class CudaWeights : IDisposable
         int layerCount = numGpuLayers < 0
             ? config.NumLayers - firstLayer
             : Math.Min(numGpuLayers, config.NumLayers - firstLayer);
-        // isHybrid: the CUDA upload covers only a contiguous slice of the full model,
-        // so it does NOT own the output norm + LM head (caller owns them separately).
-        bool isHybrid = (firstLayer + layerCount) < config.NumLayers;
+        // isHybrid: this upload does NOT own the output norm + LM head, because either it covers
+        // only a contiguous slice of the full model (the caller owns the tail), or the caller has
+        // said outright that it applies the head itself (skipOutputHead).
+        bool isHybrid = (firstLayer + layerCount) < config.NumLayers || skipOutputHead;
 
         // #509: pinned, chunked, double-buffered H2D staging for the large weight tensors.
         // OPT-IN and OFF by default (DOTLLM_CUDA_PINNED_UPLOAD=1) because no available host can
