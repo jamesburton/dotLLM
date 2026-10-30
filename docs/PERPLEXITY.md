@@ -724,3 +724,21 @@ noise-injection floor and the F32-activation control on the same window; only a 
 text types or window lengths only entropy-matched. Every one of these arms exists because a control that cannot disagree proves
 nothing: `Qwen4ExpNoiseFloorDiagnosticsTests` pins that the switches are inert off, engaged on, and graded, and
 `VulkanQwen4ExpActivationPrecisionTests` pins which activation precision each Vulkan path uses.
+
+### PQ2_0 W2A8 GEMM at any n (issue #1386, 2026-10-28)
+
+Question: is the int8-activation (W2A8, Q8_0 activations) PQ2_0 CPU GEMM, routed for n=2..32 by #1385, safe for prefill-sized n? Arms:
+Ternary-Bonsai-2-27B PQ2_0, CPU (32 threads), LF wikitext-2 test (`--corpus`, BOS model-derived, LF so no CRLF trap), sliding windows,
+`DOTLLM_PQ2_SMALLN_MAX=1` (float tier for every n>=2, the reference) vs `4096` (W2A8 at every n); full-vocab logits via
+`DOTLLM_PPL_LOGITS_DUMP`, KL(float || W2A8) over the scored half of every window (decode already uses the W2A8 GEMV in both arms).
+
+| context (= GEMM n) | scored rows | PPL float | PPL W2A8 | mean KL | median KL | top-1 agree | wall float -> W2A8 (incl. ~10 s load) |
+|---|---|---|---|---|---|---|---|
+| 32 (32 win) | 480 | n/a | n/a | 9.5e-5 | 5.8e-5 | 99.79% | 163 -> 77 s |
+| 128 (8 win) | 504 | 13.9188 | 13.9151 (-0.03%) | 8.0e-5 | 4.2e-5 | 99.60% | 179 -> 76 s |
+| 512 (2 win) | 510 | n/a | n/a | 6.7e-5 | 3.2e-5 | 99.41% | 226 -> 88 s |
+
+Mean KL ~1e-4 is two orders below the activation-precision floor recorded above (~0.01-0.03) and below the 1e-3 of a single quant step, so the
+Q8 activation numerics are accepted and the default cut is now unbounded (`DOTLLM_PQ2_SMALLN_MAX=1` restores the float tier). W2A8 is faster at
+every measured n (2.1-2.6x), so there is no crossover to cut at. Single-session, one model; windows are few (sd of PPL ~1.9), but the paired
+per-token KL does not depend on that.

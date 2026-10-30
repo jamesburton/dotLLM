@@ -178,18 +178,30 @@ public static class Attention
                                     int slidingWindowSize, int headIdx, int kvHeadIdx, float alibiSlope,
                                     float softCap, AttentionMaskMode maskMode, int prefixLen,
                                     float sinkLogit)
+        => ExecuteHeadRows(q, k, v, output, scratch, 0, seqQ, seqKv, headDim, scale,
+                           qStride, kvStride, positionOffset, tileSize, slidingWindowSize, headIdx, kvHeadIdx,
+                           alibiSlope, softCap, maskMode, prefixLen, sinkLogit);
+
+    /// <summary><see cref="ExecuteHead"/> restricted to query rows <c>[rowStart, rowEnd)</c>; each row's arithmetic is unchanged.</summary>
+    private static void ExecuteHeadRows(ReadOnlySpan<float> q, ReadOnlySpan<float> k, ReadOnlySpan<float> v,
+                                    Span<float> output, Span<float> scratch, int rowStart, int rowEnd,
+                                    int seqKv, int headDim, float scale,
+                                    int qStride, int kvStride, int positionOffset, int tileSize,
+                                    int slidingWindowSize, int headIdx, int kvHeadIdx, float alibiSlope,
+                                    float softCap, AttentionMaskMode maskMode, int prefixLen,
+                                    float sinkLogit)
     {
         bool hasSink = !float.IsNegativeInfinity(sinkLogit);
 
-        for (int i = 0; i < seqQ; i++)
+        for (int i = rowStart; i < rowEnd; i++)
         {
             int qPos = positionOffset + i;
             var qRow = q.Slice(i * qStride + headIdx * headDim, headDim);
             var outRow = output.Slice(i * qStride + headIdx * headDim, headDim);
             outRow.Clear();
 
-            int visibleEnd = VisibleEnd(maskMode, qPos, prefixLen, seqKv);
-            int visibleStart = VisibleStart(qPos, slidingWindowSize);
+            int visibleEnd = VisibleEnd(maskMode, qPos, prefixLen, seqKv, slidingWindowSize);
+            int visibleStart = VisibleStart(qPos, slidingWindowSize, maskMode);
             if (visibleStart >= visibleEnd)
                 continue;
 
@@ -328,8 +340,8 @@ public static class Attention
         float max = TensorPrimitives.Max((ReadOnlySpan<float>)row);
         float m = MathF.Max(max, sink);
         TensorPrimitives.Add((ReadOnlySpan<float>)row, -m, row);
-        TensorPrimitives.Exp((ReadOnlySpan<float>)row, row);
-        float sum = TensorPrimitives.Sum((ReadOnlySpan<float>)row) + MathF.Exp(sink - m);
+        PortableMath.Exp(row, row);
+        float sum = TensorPrimitives.Sum((ReadOnlySpan<float>)row) + PortableMath.Exp(sink - m);
         TensorPrimitives.Multiply((ReadOnlySpan<float>)row, 1f / sum, row);
     }
 
@@ -503,6 +515,76 @@ public static class Attention
     }
 
 
+    // ──────────────────── Bidirectional encoder attention (#1402) ────────────────────
+
+    private unsafe struct BlockedCtx
+    {
+        public float* Q, K, V, Output;
+        public int Seq, NumHeads, HeadDim, QStride, QBlock, BlocksPerHead, TileSize;
+        public float Scale;
+    }
+
+    /// <summary>
+    /// Full (bidirectional, no GQA, no mask) self-attention for BERT-class encoders, parallelised over
+    /// <c>head x query-block</c> work items on <paramref name="pool"/>. Each query row runs exactly the arithmetic of
+    /// the single-threaded <c>Execute</c>, so the result is bit-identical; rows are independent, so only the
+    /// schedule changes. Layout of q/k/v/output: <c>[seq, numHeads * headDim]</c>.
+    /// </summary>
+    [SkipLocalsInit]
+    public static unsafe void ExecuteBidirectional(float* q, float* k, float* v, float* output,
+                                                   int seq, int numHeads, int headDim, float scale,
+                                                   ComputeThreadPool? pool)
+    {
+        if (pool is null || pool.ThreadCount < 2)
+        {
+            int len = seq * numHeads * headDim;
+            Execute(new ReadOnlySpan<float>(q, len), new ReadOnlySpan<float>(k, len), new ReadOnlySpan<float>(v, len),
+                    new Span<float>(output, len), seq, seq, numHeads, numHeads, headDim, 0, scale, default, null, 0f,
+                    AttentionMaskMode.Bidirectional, 0, default);
+            return;
+        }
+
+        // Aim for ~8 work items per thread so the static partition stays balanced; a block is at least 4 rows.
+        int target = pool.ThreadCount * 8;
+        int blocksPerHead = Math.Clamp(target / numHeads, 1, Math.Max(1, seq / 4));
+        int qBlock = (seq + blocksPerHead - 1) / blocksPerHead;
+        blocksPerHead = (seq + qBlock - 1) / qBlock;
+        var ctx = new BlockedCtx
+        {
+            Q = q, K = k, V = v, Output = output, Seq = seq, NumHeads = numHeads, HeadDim = headDim,
+            QStride = numHeads * headDim, QBlock = qBlock, BlocksPerHead = blocksPerHead,
+            TileSize = ComputeTileSize(headDim), Scale = scale,
+        };
+        pool.Dispatch((nint)(&ctx), &BlockedWorker);
+    }
+
+    [SkipLocalsInit]
+    private static unsafe void BlockedWorker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        ref var ctx = ref Unsafe.AsRef<BlockedCtx>((void*)ctxPtr);
+        int items = ctx.NumHeads * ctx.BlocksPerHead;
+        ComputeThreadPool.PartitionRange(items, threadIdx, threadCount, out int start, out int end);
+        if (start >= end) return;
+
+        int len = ctx.Seq * ctx.QStride;
+        var qSpan = new ReadOnlySpan<float>(ctx.Q, len);
+        var kSpan = new ReadOnlySpan<float>(ctx.K, len);
+        var vSpan = new ReadOnlySpan<float>(ctx.V, len);
+        var outSpan = new Span<float>(ctx.Output, len);
+        Span<float> scratch = stackalloc float[OneShotMaxKeys];
+
+        for (int item = start; item < end; item++)
+        {
+            int h = item / ctx.BlocksPerHead;
+            int b = item - h * ctx.BlocksPerHead;
+            int r0 = b * ctx.QBlock;
+            int r1 = Math.Min(ctx.Seq, r0 + ctx.QBlock);
+            ExecuteHeadRows(qSpan, kSpan, vSpan, outSpan, scratch, r0, r1, ctx.Seq, ctx.HeadDim, ctx.Scale,
+                            ctx.QStride, ctx.QStride, 0, ctx.TileSize, 0, h, h, 0f, 0f,
+                            AttentionMaskMode.Bidirectional, 0, float.NegativeInfinity);
+        }
+    }
+
     /// <summary>
     /// Scalar reference implementation for correctness verification.
     /// Convenience overload that computes <c>scale = 1/sqrt(headDim)</c>.
@@ -593,7 +675,7 @@ public static class Attention
             for (int i = 0; i < seqQ; i++)
             {
                 int qPos = positionOffset + i;
-                int upperExclusive = VisibleEnd(maskMode, qPos, prefixLen, seqKv);
+                int upperExclusive = VisibleEnd(maskMode, qPos, prefixLen, seqKv, slidingWindowSize ?? 0);
                 for (int j = upperExclusive; j < seqKv; j++)
                     scores[i * seqKv + j] = float.NegativeInfinity;
             }
@@ -604,7 +686,7 @@ public static class Attention
                 int window = slidingWindowSize.Value;
                 for (int i = 0; i < seqQ; i++)
                 {
-                    int earliestVisible = positionOffset + i - window + 1;
+                    int earliestVisible = VisibleStart(positionOffset + i, window, maskMode);
                     for (int j = 0; j < seqKv && j < earliestVisible; j++)
                     {
                         scores[i * seqKv + j] = float.NegativeInfinity;
@@ -626,7 +708,7 @@ public static class Attention
                     var row = scores.AsSpan(i * seqKv, seqKv);
                     float m = sink;
                     for (int j = 0; j < seqKv; j++) m = MathF.Max(m, row[j]);
-                    float sum = MathF.Exp(sink - m);
+                    float sum = PortableMath.Exp(sink - m);
                     for (int j = 0; j < seqKv; j++)
                     {
                         row[j] = MathF.Exp(row[j] - m);
@@ -790,6 +872,20 @@ public static class Attention
                 ApplySlidingWindowMask(scores, seqQ, seqKv, positionOffset, slidingWindowSize);
                 return;
 
+            case AttentionMaskMode.SymmetricWindow:
+                if (slidingWindowSize is int sw && sw > 0)
+                {
+                    int half = sw / 2;
+                    for (int i = 0; i < seqQ; i++)
+                    {
+                        int qPos = positionOffset + i;
+                        for (int j = 0; j < seqKv; j++)
+                            if (j < qPos - half || j > qPos + half)
+                                scores[i * seqKv + j] = float.NegativeInfinity;
+                    }
+                }
+                return;
+
             case AttentionMaskMode.Hybrid:
                 // Causal prefix; bidirectional canvas. A prefix query (qPos < prefixLen) masks
                 // future keys exactly like the causal path; a canvas query (qPos >= prefixLen)
@@ -814,12 +910,15 @@ public static class Attention
     /// queries, <c>seqKv</c> for canvas queries.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int VisibleEnd(AttentionMaskMode mode, int qPos, int prefixLen, int seqKv)
+    private static int VisibleEnd(AttentionMaskMode mode, int qPos, int prefixLen, int seqKv, int slidingWindowSize = 0)
     {
         switch (mode)
         {
             case AttentionMaskMode.Bidirectional:
                 return seqKv;
+            case AttentionMaskMode.SymmetricWindow:
+                // Windowed layer: keys up to qPos + window/2 (inclusive); no window: fully bidirectional.
+                return slidingWindowSize > 0 ? Math.Min(seqKv, qPos + slidingWindowSize / 2 + 1) : seqKv;
             case AttentionMaskMode.Hybrid:
                 return qPos < prefixLen ? Math.Min(seqKv, qPos + 1) : seqKv;
             default: // Causal
@@ -832,8 +931,10 @@ public static class Attention
     /// with one it is <c>max(0, qPos - window + 1)</c>. Independent of <c>seqKv</c> by construction.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int VisibleStart(int qPos, int slidingWindowSize)
-        => slidingWindowSize > 0 ? Math.Max(0, qPos - slidingWindowSize + 1) : 0;
+    private static int VisibleStart(int qPos, int slidingWindowSize, AttentionMaskMode mode = AttentionMaskMode.Causal)
+        => slidingWindowSize <= 0 ? 0
+         : mode == AttentionMaskMode.SymmetricWindow ? Math.Max(0, qPos - slidingWindowSize / 2)
+         : Math.Max(0, qPos - slidingWindowSize + 1);
 
     /// <summary>
     /// Computes weighted sum: <c>output_h[i,:] = sum_j(weights[i,j] * V_kvH[j,:])</c>.

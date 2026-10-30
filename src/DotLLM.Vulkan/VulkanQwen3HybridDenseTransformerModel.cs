@@ -215,6 +215,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         _hadamard?.InvalidateDescriptorCache();
         _embedGather?.InvalidateDescriptorCache();
         _iqF16Prefill?.InvalidateDescriptorCache();
+        _gumbelKernel?.InvalidateDescriptorCache();
     }
 
     /// <summary>
@@ -805,6 +806,17 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType,
             headIn, logitsBuf,
             outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: headRows);
+        // #1382: draw the verify rows' Gumbel-max samples on the device, reading the logits in place; only the ids are read back.
+        var gumbelReq = _pendingGumbel;
+        _pendingGumbel = null;
+        bool gumbelOnDevice = gumbelReq is not null && headRows == seqLen && _gumbelKernel is not null && _gumbelIds is not null;
+        if (gumbelOnDevice)
+        {
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            _gumbelKernel!.Record(cmdBuf, logitsBuf, _gumbelIds!, headRows, vocabSize, vocabSize,
+                gumbelReq!.Value.Seed, gumbelReq.Value.FirstTokenIndex, gumbelReq.Value.InvTemperature);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.LmHead);
+        }
         KernelSupport.ComputeToHostBarrier(cmdBuf);
         if (dflashTaps is not null)
             KernelSupport.TransferToHostBarrier(cmdBuf);
@@ -813,13 +825,24 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         _submit.SubmitAndWait();
         ProfAfterSubmit();
 
-        // ── 4. Download logits ───────────────────────────────────────────────
-        var shape = new TensorShape(headRows, vocabSize);
-        var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
-        unsafe
+        // ── 4. Download logits (or, when the device drew the samples, just the ids) ─────────
+        ITensor result;
+        if (gumbelOnDevice)
         {
-            var dest = new Span<float>((void*)result.DataPointer, headRows * vocabSize);
-            _device.Download(logitsBuf, dest);
+            if (_gumbelHost.Length < headRows) _gumbelHost = new int[Math.Max(headRows, 32)];
+            _device.Download(_gumbelIds!, System.Runtime.InteropServices.MemoryMarshal.Cast<int, float>(_gumbelHost.AsSpan(0, headRows)));
+            _gumbelHostRows = headRows;
+            result = UnmanagedTensor.Allocate(new TensorShape(1, 1), DType.Float32, deviceId: -1);   // placeholder: no logits were read back
+        }
+        else
+        {
+            var shape = new TensorShape(headRows, vocabSize);
+            result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
+            unsafe
+            {
+                var dest = new Span<float>((void*)result.DataPointer, headRows * vocabSize);
+                _device.Download(logitsBuf, dest);
+            }
         }
 
         ProfEndForward();
@@ -2902,8 +2925,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             case QuantizationType.BF16:
                 if (seqLen == 1)
                     _kernels.MatMulBf16.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
-                else if (seqLen <= MatMulBf16GemvMultiF32Kernel.MaxColumns && _kernels.MatMulBf16Multi is { } bf16Multi)
-                    bf16Multi.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);   // #706: thin BF16 projections at 2..8 rows
+                else if (seqLen <= (SmallRowWideEnabled ? MatMulBf16GemvMultiF32Kernel.WideMaxColumns : MatMulBf16GemvMultiF32Kernel.MaxColumns) && _kernels.MatMulBf16Multi is { } bf16Multi)
+                    bf16Multi.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);   // #706/#1365: thin BF16 projections at 2..16 rows
                 else
                     _kernels.MatMulBf16Gemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
@@ -2998,6 +3021,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         _gdnCache.Dispose();
         _hadamard?.Dispose();
         _embedGather?.Dispose();
+        _gumbelKernel?.Dispose();
+        _gumbelIds?.Dispose();
         _mtpHead?.Dispose();
         _mtpScratch?.Dispose();
         _mtpAbsorbScratch?.Dispose();

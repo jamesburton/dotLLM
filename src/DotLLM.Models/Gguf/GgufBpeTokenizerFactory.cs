@@ -20,9 +20,9 @@ public static class GgufBpeTokenizerFactory
     public static BpeTokenizer Load(GgufMetadata metadata)
     {
         string model = metadata.GetStringOrDefault("tokenizer.ggml.model", "llama");
-        if (model == "bert")
+        if (model is "bert" or "t5")
             throw new NotSupportedException(
-                "This GGUF carries a BERT WordPiece vocabulary (tokenizer.ggml.model = \"bert\"), which is "
+                $"This GGUF carries a {(model == "bert" ? "BERT WordPiece" : "SentencePiece Unigram")} vocabulary (tokenizer.ggml.model = \"{model}\"), which is "
                 + "not a BpeTokenizer. Load it with GgufTokenizerFactory.Load (returns an ITokenizer).");
         string[] tokens = metadata.GetStringArray("tokenizer.ggml.tokens");
 
@@ -71,8 +71,11 @@ public static class GgufBpeTokenizerFactory
         // BOS-less stream and get garbage (Gemma 4 included: #784). Scoped to those architectures on purpose — the other
         // SPM/BPE models keep the historical BOS-agnostic Encode (their chat templates carry BOS).
         string arch = metadata.GetStringOrDefault("general.architecture", "");
-        if (arch is "gemma" or "gemma2" or "gemma3" or "gemma4")
+        if (arch is "gemma" or "gemma2" or "gemma3" or "gemma4" or "gemma-embedding")
             tokenizer.AddBosToken = GgufAddBosResolver.Resolve(metadata);
+        // EmbeddingGemma frames every text as <bos> ... <eos> (sentence-transformers tokenizer template; llama.cpp add_eos_token).
+        if (arch == "gemma-embedding")
+            tokenizer.AddEosToken = metadata.GetBoolOrDefault("tokenizer.ggml.add_eos_token", true);
 
         return tokenizer;
     }

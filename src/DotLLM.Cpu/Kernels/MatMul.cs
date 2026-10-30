@@ -1562,7 +1562,8 @@ public static unsafe partial class MatMul
         int tileM = ComputeTileM(rowBytes);
         Half* weightsHalf = (Half*)weights;
 
-        float[] rented = ArrayPool<float>.Shared.Rent(k);
+        bool fma = F16FmaTier && !F16SseTier;
+        float[] rented = ArrayPool<float>.Shared.Rent(fma ? GemmF16FmaScratchFloats(k) : k);
         try
         {
             fixed (float* rowBuf = rented)
@@ -1571,6 +1572,12 @@ public static unsafe partial class MatMul
                 {
                     int tileRows = Math.Min(tileM, m - mStart);
                     Half* tileWeightsHalf = weightsHalf + (long)mStart * k;
+
+                    if (fma)
+                    {
+                        GemmF16RowsFma(tileWeightsHalf, tileRows, b, c + mStart, m, k, n, rowBuf);
+                        continue;
+                    }
 
                     if (F16SseTier)
                     {
@@ -2516,6 +2523,11 @@ public static unsafe partial class MatMul
             int mStart = tile * ctx.TileM;
             int tileRows = Math.Min(ctx.TileM, ctx.M - mStart);
             Half* tileWeightsHalf = weightsHalf + (long)mStart * ctx.K;
+            if (F16FmaTier && !F16SseTier)
+            {
+                GemmF16RowsFma(tileWeightsHalf, tileRows, ctx.B, ctx.C + mStart, ctx.M, ctx.K, ctx.N, rowBuf);
+                continue;
+            }
             if (F16SseTier)
             {
                 GemmF16RowsSse(tileWeightsHalf, tileRows, ctx.B, ctx.C + mStart, ctx.M, ctx.K, ctx.N, rowBuf);
@@ -2776,6 +2788,15 @@ public static unsafe partial class MatMul
 
         int rowBytes = k * sizeof(Half);
         int tileM = ComputeTileM(rowBytes);
+        bool fma = F16FmaTier && !F16SseTier;
+        if (fma)
+        {
+            // #1404: the L2-sized tile (up to 256 rows) left bge-small (m=384) with 2 tiles for 32
+            // threads. The weights stream once per tile regardless, so shrink the tile until every
+            // worker has one (multiple of 4 rows, floor 8).
+            int perThread = ((m + pool.ThreadCount - 1) / pool.ThreadCount + 3) & ~3;
+            tileM = Math.Min(tileM, Math.Max(8, perThread));
+        }
         int totalTiles = (m + tileM - 1) / tileM;
 
         if (totalTiles < 2)
@@ -2786,7 +2807,7 @@ public static unsafe partial class MatMul
 
         int threadCount = pool.ThreadCount;
         nint* scratchPtrs = stackalloc nint[threadCount];
-        int scratchBytes = k * sizeof(float);
+        int scratchBytes = (fma ? GemmF16FmaScratchFloats(k) : k) * sizeof(float);
         for (int i = 0; i < threadCount; i++)
             scratchPtrs[i] = pool.GetWorkerScratch(i, scratchBytes);
 

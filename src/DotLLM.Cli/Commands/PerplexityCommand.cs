@@ -136,6 +136,24 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         [Description("Full-precision window size for quantized KV cache (recent tokens kept in FP32 before quantize-on-evict). 0 = quantize all tokens immediately. Only applies when --kv-cache is q8_0 or q4_0.")]
         [DefaultValue(0)]
         public int KvWindow { get; set; }
+
+        [CommandOption("--gpu-layers")]
+        [Description("Number of transformer layers to offload to GPU. 0 = CPU only. " +
+                     "Omit for default (0 with --device cpu, all with a GPU device).")]
+        public int? GpuLayers { get; set; }
+
+        [CommandOption("--first-layer")]
+        [Description("First global layer index of the GPU window, so the offloaded block is an arbitrary " +
+                     "contiguous range rather than a prefix. Requires --gpu-layers; incompatible with --cycle.")]
+        [DefaultValue(0)]
+        public int FirstLayer { get; set; }
+
+        [CommandOption("--cycle")]
+        [Description("Layer cycling: slide a --gpu-layers-wide GPU window across the whole trunk within one " +
+                     "corpus pass, checkpointing boundary activations, so every layer is GPU-executed even " +
+                     "when the model does not fit on the device.")]
+        [DefaultValue(false)]
+        public bool Cycle { get; set; }
     }
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
@@ -215,9 +233,26 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         int forwardDeviceId;
         string deviceLabel;
         bool addBos;
+        // Layer placement (issue #395). Safetensors directories are CPU-only whole-model runs.
+        var placement = new LayerPlacement(Cycle: false, FirstLayer: 0, GpuLayers: 0, Backend: "cpu");
+
+        // #992: optional KV cache so perplexity measures the cache's storage format.
+        if (!TryParseKvCacheMode(settings.KvCache, out KvCacheDType? kvKeyDType, out KvCacheDType? kvValueDType))
+        {
+            AnsiConsole.MarkupLine(
+                $"[red]Unknown --kv-cache '{Markup.Escape(settings.KvCache)}'. Expected 'none', 'f32', 'q8_0', or 'q4_0'.[/]");
+            return 1;
+        }
 
         if (hfDir is not null)
         {
+            if (settings.GpuLayers is > 0 || settings.Cycle || settings.FirstLayer > 0)
+            {
+                AnsiConsole.MarkupLine(
+                    "[red]--gpu-layers / --first-layer / --cycle are not supported for safetensors model directories (CPU only).[/]");
+                return 1;
+            }
+
             var (m, src, cfg) = ModelLoader.LoadFromSafetensors(hfDir, new ThreadingConfig(settings.Threads));
             model = m; config = cfg; safetensorsSource = src as IDisposable;
             ownedDevice = safetensorsSource;
@@ -242,11 +277,78 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         if (!Helpers.DeviceCli.TryResolveForTool(settings.Device, resolvedPath, json: false, out string backend, out int gpuId))
             return 1;
 
+        // Layer placement is resolved before anything is loaded, because it decides WHICH loader
+        // runs: a windowed or cycled run never builds a whole-device model at all.
+        int numLayers = config.NumLayers;
+        int gpuLayers = settings.GpuLayers.HasValue
+            ? Math.Clamp(settings.GpuLayers.Value, 0, numLayers)
+            // Same default as run/chat/serve: CPU device means no offload, a GPU device means all of it.
+            : (backend == "cpu" ? 0 : numLayers);
+
+        // run/chat treat an explicit --gpu-layers as the request that decides the backend, not a
+        // modifier on --device: `--device cpu --gpu-layers 8` offloads 8 layers there too. Matching
+        // that here is what "semantics matching run/chat/serve" means.
+        if (backend == "cpu" && gpuLayers > 0)
+            backend = "cuda";
+
+        if (!TryResolvePlacement(settings, backend, gpuLayers, numLayers, out placement))
+            return 1;
+
+        if (placement.UsesLayerWindows)
+        {
+            if (kvKeyDType is not null)
+            {
+                AnsiConsole.MarkupLine(
+                    "[red]--kv-cache is not supported with --cycle / --first-layer (the layer-window engine scores cacheless).[/]");
+                return 1;
+            }
+
+            int windowContext = Math.Min(settings.Context, config.MaxSequenceLength);
+            List<int> windowTokens = LoadCorpusTokens(settings, tokenizer!, addBos);
+            if (windowTokens.Count < 2)
+            {
+                AnsiConsole.MarkupLine($"[red]Corpus tokenized to {windowTokens.Count} tokens; at least 2 are required.[/]");
+                return 1;
+            }
+            if (settings.DumpTokens is not null)
+                File.WriteAllText(settings.DumpTokens, string.Join(' ', windowTokens));
+
+            int windowStride = settings.Stride > 0 ? settings.Stride : windowContext;
+            int windowPrefix = settings.UnscoredPrefix >= 0
+                ? settings.UnscoredPrefix
+                : Math.Min(windowContext - 1, Math.Max(1, windowContext / 2 + 1));
+            var windowOptions = new PerplexityOptions(
+                mode, windowContext, windowStride, settings.MaxTokens, windowPrefix,
+                addBos ? tokenizer!.BosTokenId : -1);
+
+            return RunLayerWindowed(
+                gguf, config, settings, windowOptions, windowTokens, placement, gpuId,
+                windowContext, windowStride, windowPrefix, mode, corpusCarriageReturns);
+        }
+
         // Both are owned here and released in the finally below. The previous CPU-only code got
         // this from `using TransformerModel`; with a backend switch the model's static type is
         // IModel (itself IDisposable) and Vulkan additionally owns a device handle.
         switch (backend)
         {
+            case "cuda" when gpuLayers > 0 && gpuLayers < numLayers:
+            {
+                // Prefix offload — GPU runs [0..gpuLayers), CPU runs the rest. Same dispatch and
+                // same semantics as run/chat/serve, including the per-architecture routing that
+                // issue #291 added for Qwen3HybridDense's interleaved GDN / attention layers (the
+                // generic splitter assumes a uniform per-layer tensor-name set and throws on them).
+                var hybridThreading = new ThreadingConfig(settings.Threads);
+                model = config.Architecture == DotLLM.Core.Configuration.Architecture.Qwen3HybridDense
+                    ? DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel.LoadFromGguf(
+                        gguf, config, gpuLayers, gpuId, hybridThreading)
+                    : DotLLM.Cuda.HybridTransformerModel.LoadFromGguf(
+                        gguf, config, gpuLayers, gpuId, hybridThreading);
+                forwardDeviceId = gpuId;
+                deviceLabel =
+                    $"{DotLLM.Cuda.CudaDevice.GetDevice(gpuId).Name} [0..{gpuLayers}) + cpu [{gpuLayers}..{numLayers})";
+                break;
+            }
+
             case "cuda":
             {
                 // Shared per-architecture CUDA dispatch — routes hybrid architectures
@@ -295,33 +397,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
             ? settings.UnscoredPrefix
             : Math.Min(effectiveContext - 1, Math.Max(1, effectiveContext / 2 + 1));
 
-        // Streamed, then buffered once: scoring needs random access across windows, but the file
-        // itself is never held in memory and the token list is bounded by --max-tokens.
-        var tokens = new List<int>();
-        if (settings.TokensFile is not null)
-        {
-            // Accept both bare whitespace-separated ids and the JSON-array form that reference
-            // tools print, so a dump can be pasted in without reformatting.
-            foreach (string part in File.ReadAllText(settings.TokensFile)
-                         .Split(TokenIdSeparators, StringSplitOptions.RemoveEmptyEntries))
-            {
-                tokens.Add(int.Parse(part));
-                if (settings.MaxTokens > 0 && tokens.Count >= settings.MaxTokens) break;
-            }
-        }
-        else
-        {
-            using var fileReader = new StreamReader(settings.Corpus);
-            // Default is the raw bytes: llama.cpp on Linux keeps the CRs too, so stripping them
-            // unconditionally would trade a Windows mismatch for a Linux one (issue #506).
-            using TextReader reader = settings.NormalizeLineEndings
-                ? new CrlfNormalizingTextReader(fileReader)
-                : fileReader;
-            foreach (int id in CorpusReader.StreamTokens(
-                         reader, tokenizer!, settings.MaxTokens,
-                         bosTokenId: addBos ? tokenizer!.BosTokenId : -1))
-                tokens.Add(id);
-        }
+        List<int> tokens = LoadCorpusTokens(settings, tokenizer!, addBos);
 
         if (tokens.Count < 2)
         {
@@ -331,14 +407,6 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
 
         if (settings.DumpTokens is not null)
             File.WriteAllText(settings.DumpTokens, string.Join(' ', tokens));
-
-        // #992: optional KV cache so perplexity measures the cache's storage format.
-        if (!TryParseKvCacheMode(settings.KvCache, out KvCacheDType? kvKeyDType, out KvCacheDType? kvValueDType))
-        {
-            AnsiConsole.MarkupLine(
-                $"[red]Unknown --kv-cache '{Markup.Escape(settings.KvCache)}'. Expected 'none', 'f32', 'q8_0', or 'q4_0'.[/]");
-            return 1;
-        }
 
         IKvCache? kvCache = null;
         string kvCacheLabel = "none (cacheless, exact K/V)";
@@ -396,30 +464,12 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         }
         sw.Stop();
 
-        // Window geometry and scored-token count are reported alongside the figure deliberately:
-        // a perplexity without them is not comparable to anything.
-        var table = new Table().Border(TableBorder.Rounded);
-        table.AddColumn("Metric");
-        table.AddColumn(new TableColumn("Value").RightAligned());
-        // Printed as "PPL +/- err" in llama.cpp's own format so the two can be compared by eye.
-        // Without the error bar a reader has no way to tell a regression from sampling noise.
-        table.AddRow("Perplexity", $"{result.Perplexity:F4} +/- {result.StandardError:F5}");
-        table.AddRow("Mean NLL (nats)", $"{result.MeanNegativeLogLikelihood:F6}");
-        table.AddRow("Scored tokens", $"{result.ScoredTokens:N0}");
-        table.AddRow("Windows", $"{result.WindowCount:N0}");
-        table.AddRow("Mode", mode == PerplexityMode.SlidingWindow ? "sliding-window" : "teacher-forced");
-        table.AddRow("Context", $"{effectiveContext:N0}");
-        table.AddRow("Stride", $"{effectiveStride:N0}");
-        table.AddRow("Unscored prefix", $"{effectivePrefix:N0}");
-        table.AddRow("Corpus tokens", $"{tokens.Count:N0}");
-        if (settings.TokensFile is null)
-        {
-            table.AddRow("Corpus line endings", Markup.Escape(
-                CorpusLineEndings.SummarizeForReport(corpusCarriageReturns, settings.NormalizeLineEndings)));
-        }
-        table.AddRow("KV cache", kvCacheLabel);
-        table.AddRow("Elapsed", $"{sw.Elapsed.TotalSeconds:F2} s");
-        AnsiConsole.Write(table);
+        WriteResultTable(result, mode, placement.Describe(deviceLabel, config.NumLayers),
+            effectiveContext, effectiveStride, effectivePrefix, tokens.Count, sw.Elapsed,
+            settings.TokensFile is null
+                ? CorpusLineEndings.SummarizeForReport(corpusCarriageReturns, settings.NormalizeLineEndings)
+                : null,
+            kvCacheLabel);
 
         await Task.CompletedTask;
         return 0;
@@ -432,6 +482,337 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         }
     }
 
+
+    /// <summary>
+    /// Where the trunk's layers run, and by what mechanism.
+    /// </summary>
+    /// <param name="Cycle">The GPU window slides across the whole trunk within one corpus pass.</param>
+    /// <param name="FirstLayer">First global layer index of the GPU window.</param>
+    /// <param name="GpuLayers">Layers resident on the GPU at any one time.</param>
+    /// <param name="Backend">Normalized backend name (<c>cpu</c>, <c>cuda</c>, <c>vulkan</c>).</param>
+    private readonly record struct LayerPlacement(bool Cycle, int FirstLayer, int GpuLayers, string Backend)
+    {
+        /// <summary>
+        /// True when the run goes through the layer-window engine rather than a whole-device or
+        /// prefix-offload model.
+        /// </summary>
+        public bool UsesLayerWindows => Cycle || FirstLayer > 0;
+
+        /// <summary>Renders the placement for the result table.</summary>
+        /// <param name="deviceLabel">Human-readable device name for the GPU half.</param>
+        /// <param name="numLayers">Total transformer layers.</param>
+        /// <returns>A one-line description naming every device and its layer range.</returns>
+        public string Describe(string deviceLabel, int numLayers)
+        {
+            if (Cycle)
+            {
+                int phases = (numLayers + GpuLayers - 1) / GpuLayers;
+                return $"cycled: {phases} x <={GpuLayers} layers on {deviceLabel}, covering [0..{numLayers}); "
+                     + "output head on cpu";
+            }
+
+            if (FirstLayer > 0)
+            {
+                int end = FirstLayer + GpuLayers;
+                string tail = end < numLayers ? $" + cpu [{end}..{numLayers})" : string.Empty;
+                return $"cpu [0..{FirstLayer}) + {deviceLabel} [{FirstLayer}..{end}){tail}";
+            }
+
+            if (GpuLayers <= 0)
+                return $"cpu [0..{numLayers}) (whole model)";
+
+            return GpuLayers >= numLayers
+                ? $"{deviceLabel} [0..{numLayers}) (whole model)"
+                : deviceLabel;
+        }
+    }
+
+    /// <summary>
+    /// Validates the requested layer placement and rejects combinations the harness cannot honour.
+    /// </summary>
+    /// <param name="settings">Parsed command settings.</param>
+    /// <param name="backend">Normalized backend name.</param>
+    /// <param name="gpuLayers">Resolved GPU layer count.</param>
+    /// <param name="numLayers">Total transformer layers.</param>
+    /// <param name="placement">The validated placement.</param>
+    /// <returns><see langword="true"/> when the placement is usable; otherwise an error was printed.</returns>
+    /// <remarks>
+    /// Every rejection here is a case where proceeding would produce a plausible-looking number that
+    /// is not the measurement the user asked for — so they fail loudly rather than degrading.
+    /// </remarks>
+    private static bool TryResolvePlacement(
+        Settings settings, string backend, int gpuLayers, int numLayers, out LayerPlacement placement)
+    {
+        placement = new LayerPlacement(settings.Cycle, settings.FirstLayer, gpuLayers, backend);
+
+        if (settings.FirstLayer < 0 || settings.FirstLayer >= numLayers)
+        {
+            AnsiConsole.MarkupLine(
+                $"[red]--first-layer must be in [0, {numLayers - 1}]; got {settings.FirstLayer}.[/]");
+            return false;
+        }
+
+        // A partial offload has no Vulkan implementation. Silently loading the whole model on the
+        // device instead would report a figure under a placement the user did not ask for.
+        if (backend == "vulkan" && gpuLayers > 0 && gpuLayers < numLayers)
+        {
+            AnsiConsole.MarkupLine(
+                "[red]Partial layer offload is not implemented for the Vulkan backend. "
+                + "Use --device cuda, or omit --gpu-layers to score the whole model on Vulkan.[/]");
+            return false;
+        }
+
+        if (!placement.UsesLayerWindows)
+            return true;
+
+        if (settings.Cycle && settings.FirstLayer > 0)
+        {
+            AnsiConsole.MarkupLine(
+                "[red]--cycle covers every layer, so --first-layer has no meaning with it. Use one or the other.[/]");
+            return false;
+        }
+
+        if (backend != "cuda")
+        {
+            AnsiConsole.MarkupLine(
+                $"[red]--cycle / --first-layer need a CUDA device; --device is '{Markup.Escape(settings.Device)}'.[/]");
+            return false;
+        }
+
+        if (gpuLayers <= 0)
+        {
+            AnsiConsole.MarkupLine("[red]--cycle / --first-layer require --gpu-layers greater than 0.[/]");
+            return false;
+        }
+
+        if (!settings.Cycle && settings.FirstLayer + gpuLayers > numLayers)
+        {
+            AnsiConsole.MarkupLine(
+                $"[red]GPU window [{settings.FirstLayer}..{settings.FirstLayer + gpuLayers}) runs past the "
+                + $"model's {numLayers} layers.[/]");
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Scores through the layer-window engine: an arbitrary contiguous GPU window
+    /// (<c>--first-layer</c>) or a GPU window cycled across the whole trunk (<c>--cycle</c>).
+    /// </summary>
+    /// <remarks>
+    /// <para>Both modes go through <see cref="CyclingPerplexityEvaluator"/>, which checkpoints the
+    /// hidden state at each layer cut and replays the next window from it. The final scoring pass is
+    /// the ordinary <see cref="PerplexityEvaluator"/> against the saved boundaries, so the reported
+    /// figure, its error bar, <c>--per-window</c> and the whole window geometry are produced by
+    /// exactly the code a whole-device run uses.</para>
+    /// <para>The CPU model supplies the output head (final norm + LM head): the CUDA layer windows
+    /// return only a hidden state, and sliding-window scoring needs logits for every row rather than
+    /// the last row the device forward paths are optimised for. Every transformer <em>layer</em>
+    /// still runs on the GPU.</para>
+    /// </remarks>
+    private static int RunLayerWindowed(
+        GgufFile gguf, ModelConfig config, Settings settings, PerplexityOptions options,
+        List<int> tokens, LayerPlacement placement, int gpuId,
+        int effectiveContext, int effectiveStride, int effectivePrefix, PerplexityMode mode,
+        long corpusCarriageReturns)
+    {
+        int numLayers = config.NumLayers;
+        var sw = Stopwatch.StartNew();
+        PerplexityResult result;
+        // Filled inside the try: enumerating the device is itself a CUDA call that throws when no
+        // usable device is present, and doing it above the handler reproduced — in a different
+        // failure mode — the same unhandled-stack-trace problem the model construction below was
+        // moved in here to fix.
+        string deviceLabel = $"cuda:{gpuId}";
+
+        // Model construction is INSIDE the try, not above it. CudaLayerWindowModel's whole contract
+        // is that an architecture its window loop cannot execute is rejected at load time rather
+        // than silently mis-scored — and a rejection that reaches the user as an unhandled stack
+        // trace is not the clean refusal that contract advertises. Every hybrid / MoE model takes
+        // exactly this path.
+        try
+        {
+            deviceLabel = DotLLM.Cuda.CudaDevice.GetDevice(gpuId).Name;
+
+            // The CPU model is the head provider and, for a non-cycled window, also executes the
+            // layers outside the GPU window. Its weights are mmap-backed, so holding it resident
+            // alongside the device window costs page cache rather than committed memory.
+            using IModel cpuModel = ModelLoader.CreateCpuModelFromGguf(
+                gguf, config, new ThreadingConfig(settings.Threads));
+            using var cpuWindows = new CpuLayerWindowModel(cpuModel, config);
+            using var cudaWindows = DotLLM.Cuda.Evaluation.CudaLayerWindowModel.LoadFromGguf(
+                gguf, config, gpuId, cpuWindows);
+
+            var assignments = new List<CompositeLayerWindowModel.LayerAssignment>();
+            if (placement.Cycle)
+            {
+                foreach (LayerWindow w in CyclingPerplexityEvaluator.PartitionLayers(numLayers, placement.GpuLayers))
+                    assignments.Add(new CompositeLayerWindowModel.LayerAssignment(w, cudaWindows));
+            }
+            else
+            {
+                int first = placement.FirstLayer;
+                int end = first + placement.GpuLayers;
+                if (first > 0)
+                    assignments.Add(new CompositeLayerWindowModel.LayerAssignment(
+                        new LayerWindow(0, first), cpuWindows));
+                assignments.Add(new CompositeLayerWindowModel.LayerAssignment(
+                    new LayerWindow(first, placement.GpuLayers), cudaWindows));
+                if (end < numLayers)
+                    assignments.Add(new CompositeLayerWindowModel.LayerAssignment(
+                        new LayerWindow(end, numLayers - end), cpuWindows));
+            }
+
+            using var composite = new CompositeLayerWindowModel(assignments, cpuWindows);
+
+            AnsiConsole.MarkupLine(
+                $"[grey]placement: {Markup.Escape(placement.Describe(deviceLabel, numLayers))}[/]");
+
+            PerplexityEvaluator.WindowObserver? observer = settings.PerWindow
+                ? (i, ppl, n) => Console.WriteLine($"window {i}: ppl={ppl:F6} scored={n}")
+                : null;
+            // Escaped: a LayerWindow renders as "[0..8)" and Spectre would read the '[' as a tag.
+            CyclingPerplexityEvaluator.PhaseObserver onPhase = (i, count, w) =>
+                AnsiConsole.MarkupLine($"[grey]  layer window {i + 1}/{count}: {Markup.Escape(w.ToString())}[/]");
+
+            result = CyclingPerplexityEvaluator.Evaluate(
+                composite,
+                System.Runtime.InteropServices.CollectionsMarshal.AsSpan(tokens),
+                options,
+                composite.Windows(),
+                observer,
+                onPhase);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException
+                                     or InvalidOperationException or DotLLM.Cuda.Interop.CudaException)
+        {
+            // CudaException / InvalidOperationException cover the device itself being absent or
+            // unusable, which is a user-facing configuration problem like the others here, not a
+            // defect worth a stack trace.
+            AnsiConsole.MarkupLine($"[red]{Markup.Escape(ex.Message)}[/]");
+            return 1;
+        }
+        sw.Stop();
+
+        WriteResultTable(result, mode, placement.Describe(deviceLabel, numLayers),
+            effectiveContext, effectiveStride, effectivePrefix, tokens.Count, sw.Elapsed,
+            settings.TokensFile is null
+                ? CorpusLineEndings.SummarizeForReport(corpusCarriageReturns, settings.NormalizeLineEndings)
+                : null,
+            kvCacheLabel: "none (layer-window engine)");
+        return 0;
+    }
+
+    /// <summary>
+    /// Prints the result table shared by every scoring path.
+    /// </summary>
+    /// <param name="result">The scored result.</param>
+    /// <param name="mode">Scoring mode.</param>
+    /// <param name="placement">Rendered layer placement.</param>
+    /// <param name="context">Effective context window.</param>
+    /// <param name="stride">Effective stride.</param>
+    /// <param name="unscoredPrefix">Effective unscored prefix.</param>
+    /// <param name="corpusTokens">Corpus token count.</param>
+    /// <param name="elapsed">Wall-clock scoring time.</param>
+    /// <param name="lineEndings">Corpus line-ending summary (#506), or <see langword="null"/> for a pre-tokenized input.</param>
+    /// <param name="kvCacheLabel">KV-cache storage format label.</param>
+    /// <remarks>
+    /// Window geometry and scored-token count sit next to the figure deliberately: a perplexity
+    /// without them is not comparable to anything. <c>Layer placement</c> is printed on every run,
+    /// whole-device included, so a scraped table can never pass a split or cycled run off as a
+    /// single-device one (issue #395).
+    /// </remarks>
+    private static void WriteResultTable(
+        PerplexityResult result, PerplexityMode mode, string placement,
+        int context, int stride, int unscoredPrefix, int corpusTokens, TimeSpan elapsed,
+        string? lineEndings, string kvCacheLabel)
+    {
+        var table = new Table().Border(TableBorder.Rounded);
+        table.AddColumn("Metric");
+        table.AddColumn(new TableColumn("Value").RightAligned());
+        // Printed as "PPL +/- err" in llama.cpp's own format so the two can be compared by eye.
+        // Without the error bar a reader has no way to tell a regression from sampling noise.
+        table.AddRow("Perplexity", $"{result.Perplexity:F4} +/- {result.StandardError:F5}");
+        table.AddRow("Mean NLL (nats)", $"{result.MeanNegativeLogLikelihood:F6}");
+        table.AddRow("Scored tokens", $"{result.ScoredTokens:N0}");
+        table.AddRow("Windows", $"{result.WindowCount:N0}");
+        table.AddRow("Mode", mode == PerplexityMode.SlidingWindow ? "sliding-window" : "teacher-forced");
+        // Escaped, not raw: the placement renders layer ranges as "[0..8)", and Spectre reads a
+        // leading '[' as the start of a markup tag — an unescaped row aborts the whole run with
+        // "malformed markup tag" instead of printing the result.
+        table.AddRow("Layer placement", Markup.Escape(placement));
+        table.AddRow("Context", $"{context:N0}");
+        table.AddRow("Stride", $"{stride:N0}");
+        table.AddRow("Unscored prefix", $"{unscoredPrefix:N0}");
+        table.AddRow("Corpus tokens", $"{corpusTokens:N0}");
+        if (lineEndings is not null)
+            table.AddRow("Corpus line endings", Markup.Escape(lineEndings));
+        table.AddRow("KV cache", kvCacheLabel);
+        table.AddRow("Elapsed", $"{elapsed.TotalSeconds:F2} s");
+        AnsiConsole.Write(table);
+    }
+
+    /// <summary>
+    /// Parses <c>--device</c> into a backend name and GPU ordinal, mirroring <c>bench</c>'s syntax so
+    /// the two commands accept the same strings (<c>cpu</c>, <c>vulkan</c>, <c>cuda</c>, <c>cuda:1</c>,
+    /// and <c>gpu</c> as an alias for cuda).
+    /// </summary>
+    /// <param name="device">Raw option value.</param>
+    /// <param name="backend">Normalized backend name.</param>
+    /// <param name="gpuId">Device ordinal; 0 unless an explicit <c>:N</c> suffix is given.</param>
+    /// <returns><see langword="true"/> when the value names a supported backend.</returns>
+    private static bool TryParseDevice(string device, out string backend, out int gpuId)
+    {
+        backend = (device ?? "cpu").Split(':')[0].ToLowerInvariant();
+        if (backend.Length == 0) backend = "cpu";
+        if (backend == "gpu") backend = "cuda";
+
+        gpuId = 0;
+        string[] parts = (device ?? string.Empty).Split(':');
+        if (parts.Length > 1 && int.TryParse(parts[1], out int ordinal) && ordinal >= 0)
+            gpuId = ordinal;
+
+        return backend is "cpu" or "cuda" or "vulkan";
+    }
+
+    /// <summary>
+    /// Streams the corpus (or reads a pre-tokenized ids file) into a buffered list. Scoring needs
+    /// random access across windows, but the file itself is never held in memory and the list is
+    /// bounded by <c>--max-tokens</c>.
+    /// </summary>
+    private static List<int> LoadCorpusTokens(Settings settings, DotLLM.Tokenizers.ITokenizer tokenizer, bool addBos)
+    {
+        // Streamed, then buffered once: scoring needs random access across windows, but the file
+        // itself is never held in memory and the token list is bounded by --max-tokens.
+        var tokens = new List<int>();
+        if (settings.TokensFile is not null)
+        {
+            // Accept both bare whitespace-separated ids and the JSON-array form that reference
+            // tools print, so a dump can be pasted in without reformatting.
+            foreach (string part in File.ReadAllText(settings.TokensFile)
+                         .Split(TokenIdSeparators, StringSplitOptions.RemoveEmptyEntries))
+            {
+                tokens.Add(int.Parse(part));
+                if (settings.MaxTokens > 0 && tokens.Count >= settings.MaxTokens) break;
+            }
+        }
+        else
+        {
+            using var fileReader = new StreamReader(settings.Corpus);
+            // Default is the raw bytes: llama.cpp on Linux keeps the CRs too, so stripping them
+            // unconditionally would trade a Windows mismatch for a Linux one (issue #506).
+            using TextReader reader = settings.NormalizeLineEndings
+                ? new CrlfNormalizingTextReader(fileReader)
+                : fileReader;
+            foreach (int id in CorpusReader.StreamTokens(
+                         reader, tokenizer, settings.MaxTokens,
+                         bosTokenId: addBos ? tokenizer.BosTokenId : -1))
+                tokens.Add(id);
+        }
+
+        return tokens;
+    }
 
     /// <summary>
     /// Resolves the SPIR-V blob directory for Vulkan: <c>spv/</c> next to the running assembly,

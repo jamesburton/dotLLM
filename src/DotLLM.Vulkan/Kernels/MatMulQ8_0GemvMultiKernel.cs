@@ -10,20 +10,23 @@ namespace DotLLM.Vulkan.Kernels;
 /// </summary>
 public sealed class MatMulQ8_0GemvMultiKernel : IDisposable
 {
-    /// <summary>Largest supported column count.</summary>
+    /// <summary>Column count the static <see cref="Accepts"/> gate and the hosts that predate #1365 serve (not validated above 8 rows).</summary>
     public const int MaxColumns = 8;
+
+    /// <summary>Largest column count the shader serves (#1365).</summary>
+    public const int WideMaxColumns = 16;
 
     private const int PushConstantBytes = 4 * sizeof(uint); // M, K, blocksPerRow, rowUints
 
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
-    private readonly ComputePipeline?[] _pipelines = new ComputePipeline?[MaxColumns + 1];
+    private readonly ComputePipeline?[] _pipelines = new ComputePipeline?[WideMaxColumns + 1];
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
     private bool _disposed;
 
     private readonly int _rowsPerWorkgroup;
-    private readonly int[] _rowsForColumns = new int[MaxColumns + 1];   // NR per column count (#1220)
+    private readonly int[] _rowsForColumns = new int[WideMaxColumns + 1];   // NR per column count (#1220)
 
     /// <summary>Output rows per workgroup (<c>NR</c>, #1220).</summary>
     public int RowsPerWorkgroup => _rowsPerWorkgroup;
@@ -33,12 +36,12 @@ public sealed class MatMulQ8_0GemvMultiKernel : IDisposable
     /// <returns>NR for that pipeline.</returns>
     public int RowsPerWorkgroupFor(int n) => _rowsForColumns[n];
 
-    private MatMulQ8_0GemvMultiKernel(VulkanDevice device, VulkanModule module, nint pool, int rowsPerWorkgroup, int multiColumnRowsPerWorkgroup)
+    private MatMulQ8_0GemvMultiKernel(VulkanDevice device, VulkanModule module, nint pool, int rowsPerWorkgroup, int multiColumnRowsPerWorkgroup, int wideRowsPerWorkgroup)
     {
         _device = device; _module = module; _descriptorPool = pool; _rowsPerWorkgroup = rowsPerWorkgroup;
-        for (int n = 1; n <= MaxColumns; n++)
-            _rowsForColumns[n] = n == 1 ? rowsPerWorkgroup : multiColumnRowsPerWorkgroup;
-        for (int n = 1; n <= MaxColumns; n++)
+        for (int n = 1; n <= WideMaxColumns; n++)
+            _rowsForColumns[n] = n == 1 ? rowsPerWorkgroup : n <= MaxColumns ? multiColumnRowsPerWorkgroup : wideRowsPerWorkgroup;
+        for (int n = 1; n <= WideMaxColumns; n++)
             _pipelines[n] = module.CreateComputePipeline(
                 entryPoint: "main",
                 bindings: [new VkDescriptorBinding(0), new VkDescriptorBinding(1), new VkDescriptorBinding(2)],
@@ -53,11 +56,15 @@ public sealed class MatMulQ8_0GemvMultiKernel : IDisposable
     /// <param name="rowsPerWorkgroup">Output rows per workgroup of the one-column (decode) pipeline, 1..8 (#1220).</param>
     /// <param name="multiColumnRowsPerWorkgroup">NR of the 2..8-column pipelines, 1..8; 0 = <paramref name="rowsPerWorkgroup"/>. A row's bits do not
     /// depend on NR, so decode and verify may differ in it.</param>
+    /// <param name="wideRowsPerWorkgroup">NR of the 9..16-column pipelines (#1365), 1..4 (the shader stores one lane per output, NR x 16 &lt;= 64 lanes); 0 = 4.</param>
     /// <returns>The kernel, or null when the shader is missing.</returns>
     public static MatMulQ8_0GemvMultiKernel? TryCreate(VulkanDevice device, string spvDir, int rowsPerWorkgroup = 1,
-                                                       int multiColumnRowsPerWorkgroup = 0)
+                                                       int multiColumnRowsPerWorkgroup = 0, int wideRowsPerWorkgroup = 0)
     {
         if (multiColumnRowsPerWorkgroup == 0) multiColumnRowsPerWorkgroup = rowsPerWorkgroup;
+        if (wideRowsPerWorkgroup == 0) wideRowsPerWorkgroup = 4;
+        ArgumentOutOfRangeException.ThrowIfLessThan(wideRowsPerWorkgroup, 1);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(wideRowsPerWorkgroup, 4);
         ArgumentOutOfRangeException.ThrowIfLessThan(multiColumnRowsPerWorkgroup, 1);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(multiColumnRowsPerWorkgroup, 8);
         ArgumentOutOfRangeException.ThrowIfLessThan(rowsPerWorkgroup, 1);
@@ -68,7 +75,7 @@ public sealed class MatMulQ8_0GemvMultiKernel : IDisposable
         try
         {
             nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
-            return new MatMulQ8_0GemvMultiKernel(device, module, pool, rowsPerWorkgroup, multiColumnRowsPerWorkgroup);
+            return new MatMulQ8_0GemvMultiKernel(device, module, pool, rowsPerWorkgroup, multiColumnRowsPerWorkgroup, wideRowsPerWorkgroup);
         }
         catch { module.Dispose(); throw; }
     }
@@ -76,13 +83,19 @@ public sealed class MatMulQ8_0GemvMultiKernel : IDisposable
     /// <summary>True when this kernel serves a matmul with <paramref name="n"/> rows and contraction <paramref name="k"/>.</summary>
     public static bool Accepts(int n, int k) => n >= 2 && n <= MaxColumns && k > 0 && (k % 32) == 0;
 
+    /// <summary>True when this kernel serves 2..<see cref="WideMaxColumns"/> rows at contraction <paramref name="k"/> (#1365).</summary>
+    /// <param name="n">Activation rows.</param>
+    /// <param name="k">Contraction length.</param>
+    /// <returns>Whether <see cref="Record"/> accepts it.</returns>
+    public static bool AcceptsWide(int n, int k) => n >= 2 && n <= WideMaxColumns && k > 0 && (k % 32) == 0;
+
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
     internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
 
     /// <summary>Records the GEMV for 1..8 activation columns (output layout <c>[n, m]</c>); n = 1 is the dense qwen35 decode GEMV (#1220).</summary>
     public unsafe void Record(nint cmdBuf, VulkanDevice.Buffer weightsA, VulkanDevice.Buffer inputB, VulkanDevice.Buffer outputC, int m, int k, int n)
     {
-        if (!Accepts(n, k) && !(n == 1 && k > 0 && (k % 32) == 0)) throw new ArgumentOutOfRangeException(nameof(n), $"n={n}, k={k}");
+        if (!AcceptsWide(n, k) && !(n == 1 && k > 0 && (k % 32) == 0)) throw new ArgumentOutOfRangeException(nameof(n), $"n={n}, k={k}");
         if (weightsA.Size < (long)m * (k / 32) * 34) throw new ArgumentException("Weights buffer too small.", nameof(weightsA));
         if (inputB.Size < (long)n * k * sizeof(float)) throw new ArgumentException("Input buffer too small.", nameof(inputB));
         if (outputC.Size < (long)n * m * sizeof(float)) throw new ArgumentException("Output buffer too small.", nameof(outputC));

@@ -287,6 +287,7 @@ store** (#1279) — every model, whether pulled by the CLI or by a test, has one
 | Native AOT deployment | [docs/AOT.md](docs/AOT.md) | AOT publishing, trimming, deployment |
 | Perplexity & llama.cpp comparison | [docs/PERPLEXITY.md](docs/PERPLEXITY.md) | Quality measurement, corpus fixtures, CRLF trap (#506) |
 | Precision | [docs/PRECISION.md](docs/PRECISION.md) | Storage/accumulator formats per op and device, KV formats, Keep-FP32 list, #1107 evidence and violation inventory |
+| Embeddings (RAG) survey | [docs/EMBEDDINGS.md](docs/EMBEDDINGS.md) | Embedding models, `dotllm embed`, `/v1/embeddings`, encoder perf, quality gate |
 | Implementation roadmap | [docs/ROADMAP.md](docs/ROADMAP.md) | Planning, task sequencing |
 
 ## Development Workflow
@@ -358,6 +359,23 @@ If a PR to upstream sits without maintainer activity for **two weeks**, post a p
 - Add a regression test that **discriminates** between the broken and fixed forms — tests using degenerate shapes (e.g. NKHead=1 where `vh/N` and `vh%N` coincide) cannot catch broadcast-style bugs and have already let one bug ship.
 - If a parallel agent is working on a backend listed in a task's "do not touch" surface, document the cross-backend fix you applied so they can pick it up; do NOT defer the fix.
 - Reference llama.cpp's CPU implementation (`ggml/src/ggml-cpu/ops.cpp`) as the authoritative source for any GGUF-format model op semantics — including head-broadcast conventions, sign conventions, and accumulator placement.
+
+## Prove the Test Can Fail
+
+**For any test guarding a correctness invariant, DEMONSTRATE that it fails against a wrong implementation, and record how in the PR body.** Claiming a test discriminates is not evidence that it does — three times this rule was asserted and wrong, twice caught only by an explicit check, once not caught for months.
+
+Two accepted methods:
+
+- **Mutation** — apply a deliberate wrong implementation, re-run, confirm the test fails. Best for logic. List which mutants were applied and which died.
+- **Substitution** — swap the component for a plausible wrong alternative *on real data* and confirm the output actually differs. Best for data-dependent paths.
+
+**Substitution is not optional for data-dependent tests: a strong assertion over weak fixture data still cannot fail.** A real-GGUF pre-tokenizer parity test passed CI, its author's testing and a review — then was shown to produce byte-identical token ids when the pipeline was forcibly swapped, because neither vocabulary contained a single multi-digit token, so the very construct under test was unobservable. The assertion was fine; the *fixture* could not distinguish right from wrong.
+
+A surviving mutant is a finding, not a failure — it usually converts into a one-line test guarding real behaviour.
+
+**Scope:** correctness gates only — tests whose name or issue claims a guarantee. A smoke test is allowed to be a smoke test. This generalizes the per-type negative-control standard already mandated for quantization (issue #344, "the test must be shown to fail against a deliberately broken implementation"); keep the two consistent.
+
+**Weak assertions to distrust on sight:** `IsFinite`, non-empty, non-constant, `> 0`, and fixed tolerances where the bound should scale with the reduction length (√K). A months-old attention bug survived behind "logits are finite and non-constant".
 
 ## What Claude Should Know
 

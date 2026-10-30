@@ -48,7 +48,7 @@ public static class DirectStorageInstaller
     public static string? FindDll()
     {
         if (!IsSupportedPlatform) return null;
-        string? asmDir = Path.GetDirectoryName(typeof(DirectStorageInstaller).Assembly.Location);
+        string asmDir = AppContext.BaseDirectory; // Assembly.Location is empty in single-file apps (IL3000)
         foreach (string? dir in new[] { asmDir, InstallDirectory })
         {
             if (string.IsNullOrEmpty(dir)) continue;

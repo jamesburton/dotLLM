@@ -53,6 +53,9 @@ public sealed class BertEmbeddingLlamaCppParityTests(ITestOutputHelper output)
         "mxbai-q8" => 0.9997,
         "nomic-q8" => 0.998,
         "nomic-q4km" => 0.98,
+        // Measured over 100 texts: dotLLM Q8_0 vs llama.cpp Q8_0 min 0.99837 / mean 0.99980 (Q8 activations flip top-2 routing on a few
+        // tokens; both sit at 0.9971-0.9973 vs the HF reference, so the gate is the inter-provider floor).
+        "nomic-moe-q8" => 0.997,
         _ => CosineGate,
     };
 
@@ -61,7 +64,7 @@ public sealed class BertEmbeddingLlamaCppParityTests(ITestOutputHelper output)
     public static TheoryData<string> Models => new()
     {
         "minilm-f16", "mxbai-f32", "nomic-f32", "mxbai-f16", "nomic-f16",
-        "minilm-q8", "mxbai-q8", "nomic-q8", "nomic-q4km",
+        "minilm-q8", "mxbai-q8", "nomic-q8", "nomic-q4km", "mle5-f16", "nomic-moe-q8",
     };
 
     internal static Spec SpecFor(string key) => key switch
@@ -84,6 +87,15 @@ public sealed class BertEmbeddingLlamaCppParityTests(ITestOutputHelper output)
             "nomic-embed-text-v1.5-GGUF", "nomic-embed-text-v1.5.Q8_0.gguf", "nomic-embed-text-v1.5 Q8_0 (nomic-bert, mean)"),
         "nomic-q4km" => new("llamacpp-nomic-embed-text-v1.5-q4_k_m.json", "DOTLLM_NOMIC_Q4KM_GGUF", "nomic-ai",
             "nomic-embed-text-v1.5-GGUF", "nomic-embed-text-v1.5.Q4_K_M.gguf", "nomic-embed-text-v1.5 Q4_K_M (nomic-bert, mean)"),
+        // XLM-R SentencePiece Unigram vocabulary (tokenizer.ggml.model = "t5"), #1401. Fixture captured with the "query: " prefix.
+        // NOTE: this community conversion shifts the position table by one row vs HF (see docs/EMBEDDINGS.md), which llama.cpp and
+        // dotLLM share, so it is a faithful same-file anchor, not a sentence-transformers one.
+        "mle5-f16" => new("llamacpp-multilingual-e5-small-f16.json", "DOTLLM_MLE5_F16_GGUF", "hdrrayan",
+            "multilingual-e5-small-gguf", "multilingual-e5-small-f16.gguf", "multilingual-e5-small f16 (bert, XLM-R Unigram, mean)"),
+        // nomic-embed-text-v2-moe (#1400): XLM-R Unigram vocabulary + sparse top-2-of-8 GELU MoE on odd layers. The official GGUF omits the
+        // HF experts.bias, which llama.cpp also ignores, so llama.cpp is the faithful same-file anchor.
+        "nomic-moe-q8" => new("llamacpp-nomic-embed-text-v2-moe-q8_0.json", "DOTLLM_NOMIC_MOE_Q8_GGUF", "nomic-ai",
+            "nomic-embed-text-v2-moe-GGUF", "nomic-embed-text-v2-moe.Q8_0.gguf", "nomic-embed-text-v2-moe Q8_0 (nomic-bert-moe, mean)"),
         _ => throw new ArgumentOutOfRangeException(nameof(key)),
     };
 

@@ -17,6 +17,10 @@ public class VulkanMatMulBf16GemvMultiF32KernelTests
     [InlineData(48, 5120, 2)]
     [InlineData(48, 5120, 4)]
     [InlineData(48, 5120, 8)]
+    [InlineData(48, 5120, 9)]      // #1365: the 9..16 verify / DFlash block rows
+    [InlineData(48, 5120, 12)]
+    [InlineData(48, 5120, 16)]
+    [InlineData(37, 1280, 13)]     // ragged M, K not a multiple of the 128 threads x 2
     [InlineData(576, 768, 3)]
     [InlineData(17, 128, 5)]
     public void Launch_EachColumnMatchesSingleColumnGemv(int m, int k, int n)

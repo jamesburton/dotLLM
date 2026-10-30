@@ -44,15 +44,41 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
     private readonly float[] _embNormW;
     private readonly float[] _embNormB;
     private readonly float _eps;
-    private readonly bool _nomic;
+    private readonly bool _nomic;     // RoPE instead of absolute positions (nomic-bert, nomic-bert-moe)
+    private readonly bool _swiglu;    // nomic-bert only: down(silu(gate(x)) * up(x))
     private readonly ComputeThreadPool? _pool;
     private readonly float[]? _ropeCos;
     private readonly float[]? _ropeSin;
     private readonly int _ropeRows;
     private bool _disposed;
 
+    /// <summary>True on a batch worker thread running one whole sequence single-threaded (#1405): any use of the compute pool
+    /// from such a thread would be a nested Dispatch on a pool that is already dispatching.</summary>
+    [ThreadStatic] private static bool t_serial;
+
+    /// <summary>The pool a batch worker uses for its own sequence (<c>null</c> = single-threaded). Only meaningful while <see cref="t_serial"/>.</summary>
+    [ThreadStatic] private static ComputeThreadPool? t_ownPool;
+
+    /// <summary>The pool kernels may dispatch on: the batch worker's private pool (or none) on a batch worker, else the model pool.</summary>
+    private ComputeThreadPool? ActivePool => t_serial ? t_ownPool : _pool;
+
+    // Sub-pools for batches smaller than the thread count: G concurrent sequences of T threads each. Keyed by T.
+    private readonly Dictionary<int, ComputeThreadPool[]> _subPools = new();
+
+    /// <summary>Minimum batch size for one-sequence-per-core execution; below it a batch runs sequentially on the pooled kernels.
+    /// Env <c>DOTLLM_EMBED_PAR_MIN</c> overrides (benchmarking).</summary>
+    internal static int ParallelBatchMin { get; set; } = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_EMBED_PAR_MIN"), out int v) ? v : 2;
+
+    /// <summary>Optional per-stage wall-clock accumulator (#1369). Null (the default) costs one null check per stage.</summary>
+    internal static EncoderStageProfile? StageProfile { get; set; }
+
     /// <summary>Test seam: erf-exact GELU instead of llama.cpp's tanh approximation.</summary>
     internal static bool UseErfGelu { get; set; }
+
+    /// <summary>Test/bench seam (#1403): run the old serial scalar <c>MathF.Tanh</c> GELU instead of the vectorised kernel.</summary>
+    internal static bool UseLegacyGelu { get; set; }
+    /// <summary>Test/bench seam (#1402): run the old single-threaded attention call instead of the parallel kernel.</summary>
+    internal static bool UseLegacyAttention { get; set; }
 
     /// <summary>Test seam: skip Q8 activation quantisation for quantized weights (dequantize-and-dot with F32 activations).</summary>
     internal static bool ForceF32Activations { get; set; }
@@ -66,9 +92,21 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
         public float[]? Bias;
     }
 
+    private sealed class MoeFfn
+    {
+        public required Proj Router;        // [n_embd -> n_expert], F32
+        public required nint UpBank;        // n_expert x [n_embd -> n_ff]
+        public required nint DownBank;      // n_expert x [n_ff -> n_embd]
+        public required QuantizationType UpQt, DownQt;
+        public required int NumExperts, TopK, Ff;
+        public float[]? Bias;               // HF NomicExperts.bias (absent from llama.cpp's GGUFs, see docs/EMBEDDINGS.md)
+    }
+
     private sealed class Layer
     {
         public Proj? Qkv, Q, K, V, O, Up, Gate, Down;
+        /// <summary>Sparse GELU MoE FFN (nomic-bert-moe odd layers); replaces Up/Down.</summary>
+        public MoeFfn? Moe;
         public required float[] AttnNormW, AttnNormB, OutNormW, OutNormB;
     }
 
@@ -80,6 +118,9 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
 
     /// <inheritdoc/>
     public PoolingType? DeclaredPoolingType => Config.PoolingType;
+
+    /// <inheritdoc/>
+    public bool AppendsEosForLastPooling => false;
 
     private BertEncoderModel(
         GgufFile gguf, ModelConfig config, Layer[] layers,
@@ -97,7 +138,8 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
         _posEmbd = posEmbd; _posEmbdQt = posEmbdQt; _posRows = posRows;
         _embNormW = embNormW; _embNormB = embNormB;
         _eps = config.NormEpsilon;
-        _nomic = config.Architecture == Architecture.NomicBert;
+        _nomic = config.Architecture is Architecture.NomicBert or Architecture.NomicBertMoe;
+        _swiglu = config.Architecture == Architecture.NomicBert;
         _pool = pool;
         _ropeCos = ropeCos; _ropeSin = ropeSin; _ropeRows = ropeRows;
     }
@@ -106,14 +148,15 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
     public static BertEncoderModel LoadFromGguf(GgufFile gguf, ModelConfig config, ThreadingConfig? threading = null)
     {
         ArgumentNullException.ThrowIfNull(gguf);
-        if (config.Architecture is not (Architecture.Bert or Architecture.NomicBert))
-            throw new ArgumentException($"BertEncoderModel requires Architecture.Bert/NomicBert, got {config.Architecture}.", nameof(config));
+        if (config.Architecture is not (Architecture.Bert or Architecture.NomicBert or Architecture.NomicBertMoe))
+            throw new ArgumentException($"BertEncoderModel requires Architecture.Bert/NomicBert/NomicBertMoe, got {config.Architecture}.", nameof(config));
 
         var dataBase = new GgufDataBase(gguf);
         var t = gguf.TensorsByName;
         Nvfp4Support.RejectUnappliedScales(t, consumedScales: null, "The BERT encoder loader"); // #1038
         int h = config.HiddenSize;
-        bool nomic = config.Architecture == Architecture.NomicBert;
+        bool nomic = config.Architecture is Architecture.NomicBert or Architecture.NomicBertMoe;
+        bool swiglu = config.Architecture == Architecture.NomicBert;
 
         GgufTensorDescriptor Req(string name)
             => t.TryGetValue(name, out var d) ? d
@@ -177,10 +220,29 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
                 OutNormW = Vec(p + "layer_output_norm.weight", h),
                 OutNormB = Vec(p + "layer_output_norm.bias", h),
                 O = ReqProj(p + "attn_output.weight", p + "attn_output.bias"),
-                Up = ReqProj(p + "ffn_up.weight", p + "ffn_up.bias"),
-                Down = ReqProj(p + "ffn_down.weight", p + "ffn_down.bias"),
                 Gate = OptProj(p + "ffn_gate.weight", null),
             };
+            if (t.TryGetValue(p + "ffn_up_exps.weight", out var upExps))
+            {
+                // nomic-bert-moe sparse layer: 3-D expert banks [K, M, E] + F32 router [n_embd, E].
+                var downExps = Req(p + "ffn_down_exps.weight");
+                int experts = upExps.Shape[2];
+                if (config.Moe is not { } moe || experts != moe.NumExperts || downExps.Shape[2] != experts)
+                    throw new InvalidDataException($"nomic-bert-moe layer {i}: expert bank has {experts} experts, config says {config.Moe?.NumExperts}.");
+                l.Moe = new MoeFfn
+                {
+                    Router = ReqProj(p + "ffn_gate_inp.weight", null),
+                    UpBank = dataBase.Of(upExps), UpQt = upExps.QuantizationType,
+                    DownBank = dataBase.Of(downExps), DownQt = downExps.QuantizationType,
+                    NumExperts = experts, TopK = moe.NumExpertsPerTok, Ff = upExps.Shape[1],
+                    Bias = OptVec(p + "ffn_down_exps.bias", h),
+                };
+            }
+            else
+            {
+                l.Up = ReqProj(p + "ffn_up.weight", p + "ffn_up.bias");
+                l.Down = ReqProj(p + "ffn_down.weight", p + "ffn_down.bias");
+            }
             l.Qkv = OptProj(p + "attn_qkv.weight", p + "attn_qkv.bias");
             if (l.Qkv is null)
             {
@@ -188,7 +250,7 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
                 l.K = ReqProj(p + "attn_k.weight", p + "attn_k.bias");
                 l.V = ReqProj(p + "attn_v.weight", p + "attn_v.bias");
             }
-            if (nomic && l.Gate is null)
+            if (swiglu && l.Gate is null)
                 throw new InvalidDataException($"nomic-bert layer {i} is missing ffn_gate.weight (SwiGLU).");
             layers[i] = l;
         }
@@ -253,10 +315,13 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
         float* attn = Alloc((long)n * h);
         float* tmp = Alloc((long)n * h);
         float* up = Alloc((long)n * ff);
-        float* gate = _nomic ? Alloc((long)n * ff) : null;
+        float* gate = _swiglu ? Alloc((long)n * ff) : null;
         try
         {
+            var prof = t_serial ? null : StageProfile;
+            prof?.Begin();
             Embed(tokenIds, positions, x, h);
+            prof?.Mark(EncoderStage.Embed);
 
             var posSpan = positions;
             for (int li = 0; li < _layers.Length; li++)
@@ -283,6 +348,7 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
                     Gemm(l.V!, x, v, n); AddBias(l.V!.Bias, v, n, h);
                 }
 
+                prof?.Mark(EncoderStage.QkvProj);
                 if (_nomic)
                 {
                     for (int t = 0; t < n; t++)
@@ -292,26 +358,43 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
                         nh, nh, hd, Config.RoPEConfig!.Value.DimensionCount, _ropeCos, _ropeSin, RoPEType.NeoX);
                 }
 
-                Attention.Execute(
-                    new ReadOnlySpan<float>(q, n * h), new ReadOnlySpan<float>(k, n * h), new ReadOnlySpan<float>(v, n * h),
-                    new Span<float>(attn, n * h),
-                    n, n, nh, nh, hd, 0, 1.0f / MathF.Sqrt(hd), default, null, 0f,
-                    AttentionMaskMode.Bidirectional, 0, default);
+                prof?.Mark(EncoderStage.Rope);
+                if (UseLegacyAttention)
+                    Attention.Execute(
+                        new ReadOnlySpan<float>(q, n * h), new ReadOnlySpan<float>(k, n * h), new ReadOnlySpan<float>(v, n * h),
+                        new Span<float>(attn, n * h),
+                        n, n, nh, nh, hd, 0, 1.0f / MathF.Sqrt(hd), default, null, 0f,
+                        AttentionMaskMode.Bidirectional, 0, default);
+                else
+                    Attention.ExecuteBidirectional(q, k, v, attn, n, nh, hd, 1.0f / MathF.Sqrt(hd), ActivePool);
 
+                prof?.Mark(EncoderStage.Attention);
                 Gemm(l.O!, attn, tmp, n);
                 AddBias(l.O!.Bias, tmp, n, h);
                 // residual + post-attention LayerNorm
                 TensorPrimitives.Add(new ReadOnlySpan<float>(tmp, n * h), new ReadOnlySpan<float>(x, n * h), new Span<float>(tmp, n * h));
+                prof?.Mark(EncoderStage.OutProj);
                 LayerNorm(tmp, l.AttnNormW, l.AttnNormB, x, n, h);   // x := LN(attn_out + x_in)... see below
 
                 // x now holds ffn_inp; keep a copy in tmp for the FFN residual.
                 new ReadOnlySpan<float>(x, n * h).CopyTo(new Span<float>(tmp, n * h));
 
+                prof?.Mark(EncoderStage.Ln1);
                 // ── FFN ──
-                if (_nomic)
+                if (l.Moe is not null)
+                {
+                    MoeForward(l.Moe, x, attn, n, h);
+                    prof?.Mark(EncoderStage.FfnDown);
+                    TensorPrimitives.Add(new ReadOnlySpan<float>(attn, n * h), new ReadOnlySpan<float>(tmp, n * h), new Span<float>(attn, n * h));
+                    LayerNorm(attn, l.OutNormW, l.OutNormB, x, n, h);
+                    prof?.Mark(EncoderStage.Ln2);
+                    continue;
+                }
+                if (_swiglu)
                 {
                     Gemm(l.Gate!, x, gate, n);
                     Gemm(l.Up!, x, up, n);
+                    prof?.Mark(EncoderStage.FfnUp);
                     SiLu.Execute(new ReadOnlySpan<float>(gate, n * ff), new Span<float>(gate, n * ff));
                     TensorPrimitives.Multiply(new ReadOnlySpan<float>(gate, n * ff), new ReadOnlySpan<float>(up, n * ff), new Span<float>(up, n * ff));
                 }
@@ -319,13 +402,17 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
                 {
                     Gemm(l.Up!, x, up, n);
                     AddBias(l.Up!.Bias, up, n, ff);
+                    prof?.Mark(EncoderStage.FfnUp);
                     Gelu(up, n * ff);
                 }
+                prof?.Mark(EncoderStage.Act);
 
                 Gemm(l.Down!, up, attn, n);          // reuse attn as the FFN output buffer
                 AddBias(l.Down!.Bias, attn, n, h);
                 TensorPrimitives.Add(new ReadOnlySpan<float>(attn, n * h), new ReadOnlySpan<float>(tmp, n * h), new Span<float>(attn, n * h));
+                prof?.Mark(EncoderStage.FfnDown);
                 LayerNorm(attn, l.OutNormW, l.OutNormB, x, n, h);
+                prof?.Mark(EncoderStage.Ln2);
             }
 
             var result = UnmanagedTensor.Allocate(new TensorShape(n, h), DType.Float32, deviceId);
@@ -336,6 +423,187 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
         {
             Free(x); Free(qkv); Free(q); Free(k); Free(v); Free(attn); Free(tmp); Free(up); Free(gate);
         }
+    }
+
+    /// <inheritdoc/>
+    public void ForwardHiddenBatch(IReadOnlyList<int[]> sequences, IEmbeddingModel.HiddenStateConsumer consume, int deviceId)
+    {
+        ArgumentNullException.ThrowIfNull(sequences);
+        ArgumentNullException.ThrowIfNull(consume);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        int count = sequences.Count;
+        var pool = _pool;
+        if (pool is null || count < ParallelBatchMin)
+        {
+            for (int i = 0; i < count; i++)
+            {
+                int[] tokens = sequences[i];
+                var positions = new int[tokens.Length];
+                for (int p = 0; p < positions.Length; p++) positions[p] = p;
+                using var hidden = ForwardHidden(tokens, positions, deviceId);
+                consume(i, new ReadOnlySpan<float>((void*)hidden.DataPointer, tokens.Length * Config.HiddenSize));
+            }
+            return;
+        }
+
+        // Longest first: the shortest sequences fill the tail, so no worker idles behind one long document.
+        var order = new int[count];
+        for (int i = 0; i < count; i++) order[i] = i;
+        Array.Sort(order, (a, b) => sequences[b].Length.CompareTo(sequences[a].Length));
+
+        // Threads per sequence: all cores for a lone sequence, one for a large batch, an even split in between.
+        int total = pool.ThreadCount;
+        int perSeq = Math.Max(1, total / count);
+        int groups = Math.Min(count, total / perSeq);
+        var subPools = perSeq > 1 ? GetSubPools(perSeq, groups) : null;
+
+        var state = new BatchState(this, sequences, consume, order, deviceId) { SubPools = subPools, Groups = groups };
+        var handle = System.Runtime.InteropServices.GCHandle.Alloc(state);
+        try
+        {
+            var ctx = new BatchCtx { State = System.Runtime.InteropServices.GCHandle.ToIntPtr(handle) };
+            pool.Dispatch((nint)(&ctx), &BatchWorker);
+        }
+        finally { handle.Free(); }
+        state.Error?.Throw();
+    }
+
+    private sealed class BatchState(BertEncoderModel model, IReadOnlyList<int[]> seqs, IEmbeddingModel.HiddenStateConsumer consume, int[] order, int deviceId)
+    {
+        public readonly BertEncoderModel Model = model;
+        public readonly IReadOnlyList<int[]> Seqs = seqs;
+        public readonly IEmbeddingModel.HiddenStateConsumer Consume = consume;
+        public readonly int[] Order = order;
+        public readonly int DeviceId = deviceId;
+        public ComputeThreadPool[]? SubPools;
+        public int Groups;
+        public int Next = -1;
+        public System.Runtime.ExceptionServices.ExceptionDispatchInfo? Error;
+    }
+
+    private struct BatchCtx { public nint State; }
+
+    private static void BatchWorker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        var st = (BatchState)System.Runtime.InteropServices.GCHandle.FromIntPtr(((BatchCtx*)ctxPtr)->State).Target!;
+        if (threadIdx >= st.Groups) return;
+        t_serial = true;
+        t_ownPool = st.SubPools?[threadIdx];
+        try
+        {
+            while (Volatile.Read(ref st.Error) is null)
+            {
+                int slot = Interlocked.Increment(ref st.Next);
+                if (slot >= st.Order.Length) break;
+                int idx = st.Order[slot];
+                var tokens = st.Seqs[idx];
+                try
+                {
+                    var positions = new int[tokens.Length];
+                    for (int p = 0; p < positions.Length; p++) positions[p] = p;
+                    using var hidden = st.Model.ForwardHidden(tokens, positions, st.DeviceId);
+                    st.Consume(idx, new ReadOnlySpan<float>((void*)hidden.DataPointer, tokens.Length * st.Model.Config.HiddenSize));
+                }
+                catch (Exception ex)
+                {
+                    Interlocked.CompareExchange(ref st.Error, System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex), null);
+                }
+            }
+        }
+        finally { t_serial = false; t_ownPool = null; }
+    }
+
+    private ComputeThreadPool[] GetSubPools(int threadsPerSeq, int groups)
+    {
+        lock (_subPools)
+        {
+            if (_subPools.TryGetValue(threadsPerSeq, out var existing) && existing.Length >= groups) return existing;
+            var made = new ComputeThreadPool[groups];
+            int have = existing?.Length ?? 0;
+            for (int i = 0; i < have && i < groups; i++) made[i] = existing![i];
+            for (int i = have; i < groups; i++) made[i] = new ComputeThreadPool(threadsPerSeq);
+            _subPools[threadsPerSeq] = made;
+            return made;
+        }
+    }
+
+    /// <summary>
+    /// Sparse MoE FFN of <c>nomic-bert-moe</c> (llama.cpp <c>build_moe_ffn</c> with softmax gating, <c>norm_w = false</c>,
+    /// no gate projection, GELU): <c>out[t] = sum over top-k experts e of p_t[e] * down_e(gelu(up_e(x_t)))</c>, where p_t is the
+    /// softmax over ALL experts (the selected weights are not renormalised), plus the optional HF <c>experts.bias</c>.
+    /// Tokens are grouped per expert so each expert runs one GEMM over its tokens.
+    /// </summary>
+    private void MoeForward(MoeFfn m, float* x, float* output, int n, int h)
+    {
+        int e = m.NumExperts, ff = m.Ff;
+        float* logits = Alloc((long)n * e);
+        var selExpert = new int[n * m.TopK];
+        var selWeight = new float[n * m.TopK];
+        try
+        {
+            Gemm(m.Router, x, logits, n);
+            Span<float> p = stackalloc float[e];
+            Span<int> idx = stackalloc int[e];
+            for (int t = 0; t < n; t++)
+            {
+                var row = new ReadOnlySpan<float>(logits + (long)t * e, e);
+                float max = float.NegativeInfinity;
+                foreach (float v in row) max = MathF.Max(max, v);
+                double sum = 0;
+                for (int i = 0; i < e; i++) { p[i] = MathF.Exp(row[i] - max); sum += p[i]; idx[i] = i; }
+                for (int i = 0; i < e; i++) p[i] = (float)(p[i] / sum);
+                for (int k = 0; k < m.TopK; k++)   // partial selection sort, ties go to the lower expert id
+                {
+                    int best = k;
+                    for (int i = k + 1; i < e; i++)
+                        if (p[idx[i]] > p[idx[best]]) best = i;
+                    (idx[k], idx[best]) = (idx[best], idx[k]);
+                    selExpert[t * m.TopK + k] = idx[k];
+                    selWeight[t * m.TopK + k] = p[idx[k]];
+                }
+            }
+        }
+        finally { Free(logits); }
+
+        new Span<float>(output, n * h).Clear();
+        long upExpertBytes = (long)ff * Dequantize.RowByteSize(h, m.UpQt);
+        long downExpertBytes = (long)h * Dequantize.RowByteSize(ff, m.DownQt);
+        var tokens = new List<int>(n);
+        var slots = new List<int>(n);
+        for (int ex = 0; ex < e; ex++)
+        {
+            tokens.Clear(); slots.Clear();
+            for (int t = 0; t < n; t++)
+                for (int k = 0; k < m.TopK; k++)
+                    if (selExpert[t * m.TopK + k] == ex) { tokens.Add(t); slots.Add(t * m.TopK + k); }
+            int cnt = tokens.Count;
+            if (cnt == 0) continue;
+
+            float* xin = Alloc((long)cnt * h);
+            float* mid = Alloc((long)cnt * ff);
+            float* eout = Alloc((long)cnt * h);
+            try
+            {
+                for (int r = 0; r < cnt; r++)
+                    new ReadOnlySpan<float>(x + (long)tokens[r] * h, h).CopyTo(new Span<float>(xin + (long)r * h, h));
+                var up = new Proj { Weight = m.UpBank + (nint)(ex * upExpertBytes), Qt = m.UpQt, K = h, M = ff };
+                var down = new Proj { Weight = m.DownBank + (nint)(ex * downExpertBytes), Qt = m.DownQt, K = ff, M = h };
+                Gemm(up, xin, mid, cnt);
+                Gelu(mid, cnt * ff);
+                Gemm(down, mid, eout, cnt);
+                for (int r = 0; r < cnt; r++)
+                {
+                    float w = selWeight[slots[r]];
+                    var dst = new Span<float>(output + (long)tokens[r] * h, h);
+                    TensorPrimitives.MultiplyAdd(new ReadOnlySpan<float>(eout + (long)r * h, h), w, dst, dst);
+                }
+            }
+            finally { Free(xin); Free(mid); Free(eout); }
+        }
+
+        if (m.Bias is { } bias)
+            for (int t = 0; t < n; t++)
+                TensorPrimitives.Add(new ReadOnlySpan<float>(output + (long)t * h, h), bias, new Span<float>(output + (long)t * h, h));
     }
 
     private void Embed(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, float* x, int h)
@@ -410,7 +678,7 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
         }
     }
 
-    private static void Gelu(float* data, int count)
+    private void Gelu(float* data, int count)
     {
         if (UseErfGelu)
         {
@@ -419,7 +687,13 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
             return;
         }
 
-        // ggml_gelu: tanh approximation (GELU_COEF_A = 0.044715, SQRT_2_OVER_PI).
+        // ggml_gelu: tanh approximation (GELU_COEF_A = 0.044715, SQRT_2_OVER_PI). #1403: vectorised, split over ActivePool.
+        if (!UseLegacyGelu)
+        {
+            DotLLM.Cpu.Kernels.Gelu.ExecuteTanh(data, count, ActivePool);
+            return;
+        }
+
         for (int i = 0; i < count; i++)
         {
             float x = data[i];
@@ -454,33 +728,34 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
 
     private void Gemm(Proj p, float* input, float* output, int n)
     {
+        var pool = ActivePool;
         nint weights = p.Weight;
         var qt = p.Qt;
         int m = p.M, k = p.K;
         if (ForceF32Activations && qt is not (QuantizationType.F32 or QuantizationType.F16))
         {
-            MatMul.GemmDequantRows((byte*)weights, qt, input, output, m, k, n, pool: _pool);
+            MatMul.GemmDequantRows((byte*)weights, qt, input, output, m, k, n, pool: pool);
             return;
         }
 
         switch (qt)
         {
-            case QuantizationType.F32: MatMul.GemmF32((float*)weights, input, output, m, k, n, _pool); return;
-            case QuantizationType.F16: MatMul.GemmF16(weights, input, output, m, k, n, _pool); return;
-            case QuantizationType.Q8_0: MatMul.GemmQ8_0((byte*)weights, input, output, m, k, n, _pool, null); return;
-            case QuantizationType.Q5_0: MatMul.GemmQ5_0((byte*)weights, input, output, m, k, n, _pool, null); return;
-            case QuantizationType.Q2_K: MatMul.GemmQ2_K((byte*)weights, input, output, m, k, n, _pool, null); return;
-            case QuantizationType.Q3_K: MatMul.GemmQ3_K((byte*)weights, input, output, m, k, n, _pool, null); return;
-            case QuantizationType.Q4_K: MatMul.GemmQ4_K((byte*)weights, input, output, m, k, n, _pool, null); return;
-            case QuantizationType.Q5_K: MatMul.GemmQ5_K((byte*)weights, input, output, m, k, n, _pool, null); return;
-            case QuantizationType.Q6_K: MatMul.GemmQ6_K((byte*)weights, input, output, m, k, n, _pool, null); return;
+            case QuantizationType.F32: MatMul.GemmF32((float*)weights, input, output, m, k, n, pool); return;
+            case QuantizationType.F16: MatMul.GemmF16(weights, input, output, m, k, n, pool); return;
+            case QuantizationType.Q8_0: MatMul.GemmQ8_0((byte*)weights, input, output, m, k, n, pool, null); return;
+            case QuantizationType.Q5_0: MatMul.GemmQ5_0((byte*)weights, input, output, m, k, n, pool, null); return;
+            case QuantizationType.Q2_K: MatMul.GemmQ2_K((byte*)weights, input, output, m, k, n, pool, null); return;
+            case QuantizationType.Q3_K: MatMul.GemmQ3_K((byte*)weights, input, output, m, k, n, pool, null); return;
+            case QuantizationType.Q4_K: MatMul.GemmQ4_K((byte*)weights, input, output, m, k, n, pool, null); return;
+            case QuantizationType.Q5_K: MatMul.GemmQ5_K((byte*)weights, input, output, m, k, n, pool, null); return;
+            case QuantizationType.Q6_K: MatMul.GemmQ6_K((byte*)weights, input, output, m, k, n, pool, null); return;
             case QuantizationType.Q4_0:
             case QuantizationType.Q4_1:
             case QuantizationType.Q5_1:
             case QuantizationType.IQ4_NL:
-                MatMul.GemmLegacyQuantOrDequant((byte*)weights, qt, input, output, m, k, n, _pool, null); return;
+                MatMul.GemmLegacyQuantOrDequant((byte*)weights, qt, input, output, m, k, n, pool, null); return;
             default:
-                MatMul.GemmDequantRows((byte*)weights, qt, input, output, m, k, n, pool: _pool); return;
+                MatMul.GemmDequantRows((byte*)weights, qt, input, output, m, k, n, pool: pool); return;
         }
     }
 
@@ -498,6 +773,29 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
     {
         if (_disposed) return;
         _disposed = true;
+        foreach (var set in _subPools.Values) foreach (var sp in set) sp.Dispose();
         _pool?.Dispose();
+    }
+}
+
+/// <summary>Stages of one <see cref="BertEncoderModel"/> layer, for <see cref="EncoderStageProfile"/> (#1369).</summary>
+internal enum EncoderStage { Embed, QkvProj, Rope, Attention, OutProj, Ln1, FfnUp, Act, FfnDown, Ln2, Count }
+
+/// <summary>Accumulates wall-clock ticks per <see cref="EncoderStage"/>. Single-threaded caller; the encoder's own pool is joined before each Mark.</summary>
+internal sealed class EncoderStageProfile
+{
+    /// <summary>Ticks (Stopwatch frequency) per stage.</summary>
+    public readonly long[] Ticks = new long[(int)EncoderStage.Count];
+    private long _last;
+
+    /// <summary>Starts a forward pass.</summary>
+    public void Begin() => _last = System.Diagnostics.Stopwatch.GetTimestamp();
+
+    /// <summary>Attributes the time since the previous mark to <paramref name="stage"/>.</summary>
+    public void Mark(EncoderStage stage)
+    {
+        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+        Ticks[(int)stage] += now - _last;
+        _last = now;
     }
 }

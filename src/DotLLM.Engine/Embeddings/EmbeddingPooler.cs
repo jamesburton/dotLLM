@@ -151,4 +151,27 @@ public static class EmbeddingPooler
     /// </remarks>
     public static PoolingType Resolve(PoolingType? requested, PoolingType? declared)
         => requested ?? declared ?? PoolingType.Last;
+
+    /// <summary>
+    /// Appends the EOS token to a tokenised text when the embedder needs it (#1398). Last-token pooling
+    /// on a decoder embedder (Qwen3-Embedding) reads the hidden state of the final token, which the model
+    /// was trained to be EOS (<c>&lt;|endoftext|&gt;</c>); llama.cpp appends it for such models, and without it
+    /// the vectors are wrong (cosine 0.80 mean / 0.47 min vs the reference).
+    /// </summary>
+    /// <param name="tokens">Tokenised text (not modified).</param>
+    /// <param name="declaredPooling">The checkpoint-declared pooling (<see cref="IEmbeddingModel.DeclaredPoolingType"/>), not the caller override: llama.cpp (b9016) appends EOS to Qwen3-Embedding for <c>--pooling last</c> and <c>mean</c> alike (prompt_tokens 3 for a 2-token text), and not to SmolLM2, which declares no pooling.</param>
+    /// <param name="modelAppendsEos"><see cref="IEmbeddingModel.AppendsEosForLastPooling"/>.</param>
+    /// <param name="eosTokenId">Tokenizer EOS id; a negative value disables appending.</param>
+    /// <param name="addEosOverride">Explicit caller choice (<c>true</c>/<c>false</c>), or <c>null</c> for the default rule.</param>
+    /// <returns>The input array itself when nothing is appended; never appends a second EOS.</returns>
+    public static int[] AppendEos(int[] tokens, PoolingType? declaredPooling, bool modelAppendsEos, int eosTokenId, bool? addEosOverride)
+    {
+        bool add = addEosOverride ?? (declaredPooling == PoolingType.Last && modelAppendsEos);
+        if (!add || eosTokenId < 0) return tokens;
+        if (tokens.Length > 0 && tokens[^1] == eosTokenId) return tokens;
+        var withEos = new int[tokens.Length + 1];
+        tokens.CopyTo(withEos, 0);
+        withEos[^1] = eosTokenId;
+        return withEos;
+    }
 }

@@ -1,7 +1,9 @@
 using System.ComponentModel;
 using System.Globalization;
 using System.Text;
+using DotLLM.Cli.Helpers;
 using DotLLM.Core.Models;
+using DotLLM.Server;
 using DotLLM.Engine.Embeddings;
 using DotLLM.Models;
 using DotLLM.Models.Gguf;
@@ -11,8 +13,8 @@ namespace DotLLM.Cli.Commands;
 
 /// <summary>
 /// <c>dotllm embed &lt;model&gt; [text...]</c> — prints one embedding per input as a JSON array on its own
-/// line (JSON Lines). With no text arguments, reads one input per line from stdin. CPU only (#740):
-/// encoders (BERT / nomic-bert) and decoder checkpoints that implement <see cref="IEmbeddingModel"/>.
+/// line (JSON Lines). With no text arguments, reads one input per line from stdin. CPU, or Vulkan for decoder embedders (#1406):
+/// encoders (BERT / nomic-bert, CPU only) and decoder checkpoints that implement <see cref="IEmbeddingModel"/>.
 /// </summary>
 internal sealed class EmbedCommand : Command<EmbedCommand.Settings>
 {
@@ -34,6 +36,10 @@ internal sealed class EmbedCommand : Command<EmbedCommand.Settings>
         [Description("Pooling override: last, mean or cls. Default: the model's declared pooling.")]
         public string? Pooling { get; set; }
 
+        [CommandOption("--add-eos")]
+        [Description("Force (true) or suppress (false) appending the EOS token. Default: appended for last-token pooling on decoder embedders (Qwen3-Embedding).")]
+        public bool? AddEos { get; set; }
+
         [CommandOption("--dimensions")]
         [Description("Truncate to the leading N components (Matryoshka), then renormalise.")]
         public int? Dimensions { get; set; }
@@ -42,6 +48,11 @@ internal sealed class EmbedCommand : Command<EmbedCommand.Settings>
         [Description("Return un-normalised vectors.")]
         [DefaultValue(false)]
         public bool NoNormalize { get; set; }
+
+        [CommandOption("--device|-d")]
+        [Description("Compute device: 'cpu' (default) or 'vulkan' (decoder embedders such as Qwen3-Embedding; BERT-style encoders are CPU-only, #741). An explicit GPU that cannot be honoured is an error, never a silent CPU run.")]
+        [DefaultValue("cpu")]
+        public string Device { get; set; } = "cpu";
 
         [CommandOption("--threads")]
         [Description("CPU threads (0 = auto).")]
@@ -68,7 +79,39 @@ internal sealed class EmbedCommand : Command<EmbedCommand.Settings>
             if (requested is null) { Console.Error.WriteLine("--pooling must be last, mean or cls."); return 1; }
         }
 
-        var (model, gguf, config) = ModelLoader.LoadFromGguf(path, new DotLLM.Core.Configuration.ThreadingConfig(s.Threads, s.Threads));
+        if (DeviceCli.Validate(s.Device) is { } deviceError) { Console.Error.WriteLine(deviceError); return 1; }
+        var deviceSpec = DeviceSpec.Parse(s.Device);
+        var threading = new DotLLM.Core.Configuration.ThreadingConfig(s.Threads, s.Threads);
+        var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        IModel model;
+        try
+        {
+            bool isEncoder = config.Architecture is DotLLM.Core.Configuration.Architecture.Bert or DotLLM.Core.Configuration.Architecture.NomicBert;
+            if (isEncoder && deviceSpec.IsGpu)
+            {
+                // #741: there is no GPU encoder (bidirectional attention + LayerNorm graph). Loud refusal, never a CPU run.
+                throw new DeviceUnavailableException(DeviceSelector.ExplicitFailureMessage(
+                    s.Device, Path.GetFileName(path), 0,
+                    $"{config.Architecture} encoder embedding models have no GPU backend yet (#741); use --device cpu. Decoder embedders such as Qwen3-Embedding run on vulkan"));
+            }
+            if (isEncoder || deviceSpec.Kind == DeviceKind.Cpu)
+            {
+                model = ModelLoader.CreateCpuModelFromGguf(gguf, config, threading);
+            }
+            else
+            {
+                var (loaded, outcome) = DeviceCli.Load(gguf, config, s.Device, null, threading, path);
+                model = loaded.Model;
+                DeviceCli.Report(outcome, json: true);   // stderr: stdout stays pure JSON Lines
+            }
+        }
+        catch (DeviceUnavailableException ex)
+        {
+            DeviceCli.PrintError(ex.Message, json: true);
+            gguf.Dispose();
+            return 1;
+        }
         using (gguf)
         using (model)
         {
@@ -90,17 +133,16 @@ internal sealed class EmbedCommand : Command<EmbedCommand.Settings>
 
             foreach (string text in inputs)
             {
-                int[] tokens = tokenizer.Encode(text).ToArray();
+                int[] tokens = EmbeddingPooler.AppendEos(tokenizer.Encode(text).ToArray(), emb.DeclaredPoolingType, emb.AppendsEosForLastPooling, tokenizer.EosTokenId, s.AddEos);
                 if (tokens.Length == 0 || tokens.Length > config.MaxSequenceLength)
                 {
                     Console.Error.WriteLine($"Input has {tokens.Length} tokens (valid: 1..{config.MaxSequenceLength}).");
                     return 1;
                 }
-                var positions = new int[tokens.Length];
-                for (int i = 0; i < positions.Length; i++) positions[i] = i;
                 var vec = new float[hidden];
-                using (var h = emb.ForwardHidden(tokens, positions, deviceId: 0))
-                    EmbeddingPooler.Pool(new ReadOnlySpan<float>((void*)h.DataPointer, tokens.Length * hidden), tokens.Length, hidden, pooling, vec);
+                // Only the rows pooling reads come back (one row for last/cls on a GPU), #1406.
+                emb.ForwardHiddenForPooling([tokens], pooling,
+                    (_, rows) => EmbeddingPooler.Pool(rows, rows.Length / hidden, hidden, pooling, vec), deviceId: 0);
                 var outv = outDims < hidden ? vec.AsSpan(0, outDims).ToArray() : vec;
                 if (!s.NoNormalize) EmbeddingPooler.L2Normalize(outv);
 

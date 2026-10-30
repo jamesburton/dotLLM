@@ -17,7 +17,7 @@ compute shaders instead of PTX. The architectural parallel is exact:
 | Native loader | `libcuda.so` / `nvcuda.dll` | `libvulkan.so.1` / `vulkan-1.dll` |
 | Shader IR | PTX (text) | SPIR-V (u32 binary) |
 | Kernel source | CUDA C++ (`.cu`) | GLSL compute (`.comp`) |
-| Compiler | `nvcc -ptx` | `glslc --target-env=vulkan1.2` |
+| Compiler | `nvcc -ptx` | `glslc --target-env=vulkan1.2 -O` |
 | Module type | `CUmodule` | `VkShaderModule` |
 | Launch | `cuLaunchKernel` | `vkCmdDispatch` |
 | Vendor reach | NVIDIA only | AMD, NVIDIA, Intel, Apple (MoltenVK), Qualcomm, ARM |
@@ -67,13 +67,31 @@ launches, memory-type heuristics beyond HOST_VISIBLE|HOST_COHERENT.
 End users need only the compiled `.spv` blobs, which ship as MSBuild
 `Content` alongside the managed DLL. Shader *authors* need the Vulkan
 SDK (https://vulkan.lunarg.com/) for `glslc`. The MSBuild target is
-idempotent: if `glslc` is not on PATH it logs a warning and uses the
+committed `.spv` files.
+
+**Shader build rule (#1254, #1310):** always `glslc --target-env=vulkan1.2 -O` (build scripts and the MSBuild target
+all pass it); committed `.spv` files are byte-reproducible with that command. Stay on `vulkan1.2` (SPIR-V 1.5, matching
+the 1.2 instance) until a shader needs a 1.3 feature, then raise the instance requirement too. Bytes depend on the
+`glslc` version: the committed set was verified with shaderc v2026.1 (spirv-tools v2026.1), so record the version when
+regenerating a shader on a newer toolchain.
+
+**glslc pin (#1364):** the verified toolchain is recorded in `native/vulkan/glslc.version` (`shaderc v2026.1`).
+An ordinary build runs `CompileVulkanShaders` only when `glslc --version` starts with that string; on any other
+glslc it **warns and skips**, so a build never rewrites tracked `.spv` with version-drifted bytes (previously ~30
+files dirtied every worktree and PR). Without glslc it also just uses the committed blobs.
+- `dotnet msbuild src/DotLLM.Vulkan -t:RegenerateVulkanShaders` rebuilds every `.spv` unconditionally (the
+  explicit authoring path; warns when the glslc differs from the pin - then review the diff and bump the pin).
+- `-p:DotLLMStrictSpv=true` turns the mismatch warning into an error.
+- `VulkanSpvFreshnessTests` (non-GPU, runs in the unit-test job) recompiles every `.comp` with the pinned glslc
+  and fails if any tracked `.spv` differs; it skips when glslc is absent or not the pinned version. The MSBuild
+  incremental check is timestamp-based, and timestamps are arbitrary after a checkout, so only this test (not the
+  build) proves a tracked `.spv` matches its `.comp`. Always run it after editing a shader.
 committed `.spv` files.
 
 ```
 native/vulkan/shaders/add.comp         (author edits)
             │
-            │   glslc --target-env=vulkan1.2 -o add.spv add.comp
+            │   glslc --target-env=vulkan1.2 -O -o add.spv add.comp
             ▼
 native/vulkan/spv/add.spv              (checked in — ships to users)
             │

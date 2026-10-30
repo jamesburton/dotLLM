@@ -193,6 +193,8 @@ public sealed unsafe class MatMulParallelTests : IDisposable
     [Theory]
     [InlineData(64, 128, 4)]
     [InlineData(256, 4096, 8)]
+    [InlineData(387, 391, 7)]  // m%4!=0, k%8!=0, odd n (#1404 discriminating shape)
+    [InlineData(384, 384, 64)] // bge-small QKV-like
     public void GemmF16_Parallel_MatchesSingleThreaded(int m, int k, int n)
     {
         var rng = new Random(42);

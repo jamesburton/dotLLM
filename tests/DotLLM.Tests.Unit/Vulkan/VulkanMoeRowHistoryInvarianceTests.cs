@@ -83,7 +83,11 @@ public sealed class VulkanMoeRowHistoryInvarianceTests : IDisposable
         var cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
         using var device = VulkanDevice.Create();
 
+        // #1235 widened the scratch's per-row K to include numHeads x headDim, so the o_proj width (QDim) now FITS by construction; the history-dependence
+        // hazard survives only for a width beyond the scratch's K, which no real projection has but the fit predicate must still treat consistently.
+        const int TooWide = 2 * QDim;
         var fits = new List<bool>();
+        var tooWideFits = new List<bool>();
         foreach (int[] history in new[] { new[] { 2 }, new[] { 4, 2 }, new[] { 8, 2 } })
         {
             var (model, kvFactory) = VulkanModelLoader.CreateFromGguf(device, gguf, cfg, spvDir, 0);
@@ -96,9 +100,12 @@ public sealed class VulkanMoeRowHistoryInvarianceTests : IDisposable
                 using var l = vk.Forward(ids, Enumerable.Range(0, rows).ToArray(), -1, kv);
             }
             fits.Add(vk.Q8RowsFitForTest(seqLen: 2, inputDim: QDim));
+            tooWideFits.Add(vk.Q8RowsFitForTest(seqLen: 2, inputDim: TooWide));
         }
         Assert.All(fits, f => Assert.Equal(fits[0], f));
-        Assert.False(fits[0], "the o_proj width exceeds the scratch's per-row K, so it must never claim to fit");
+        Assert.True(fits[0], "the o_proj width (numHeads x headDim) is part of the scratch's per-row K since #1235, so it must fit on every history");
+        Assert.All(tooWideFits, f => Assert.Equal(tooWideFits[0], f));
+        Assert.False(tooWideFits[0], "a width beyond the scratch's per-row K must never claim to fit, whatever capacity earlier forwards grew (a byte-size test says true after a 4-row forward)");
     }
 
     private static int[][] Sequences()

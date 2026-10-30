@@ -87,13 +87,56 @@ public sealed class EncoderEmbeddingsServerTests
         finally { client.Dispose(); await app.StopAsync(); await app.DisposeAsync(); }
     }
 
+    /// <summary>#1405: concurrent requests are coalesced into batches yet each gets exactly its own (one-at-a-time) vectors, in order.</summary>
+    [SkippableFact]
+    public async Task Concurrent_requests_are_batched_and_match_one_at_a_time()
+    {
+        var (client, app) = (await Boot())!.Value;
+        try
+        {
+            var texts = Enumerable.Range(0, 12).Select(i => string.Join(' ', Enumerable.Repeat($"word{i} alpha beta", 1 + i * 3))).ToArray();
+            var solo = new float[texts.Length][];
+            for (int i = 0; i < texts.Length; i++)
+                solo[i] = await Embed(client, JsonSerializer.Serialize(new { input = texts[i] }));
+
+            var state = app.Services.GetRequiredService<ServerState>();
+            int before = state.Embeddings.BatchesRun;
+            // Two-text requests (reversed order in half of them) so order within a request is checked too.
+            var tasks = texts.Select((t, i) => Task.Run(async () =>
+            {
+                string other = texts[(i + 1) % texts.Length];
+                bool flip = i % 2 == 1;
+                var r = await client.PostAsync("/v1/embeddings", new StringContent(
+                    JsonSerializer.Serialize(new { input = flip ? new[] { other, t } : new[] { t, other } }), Encoding.UTF8, "application/json"));
+                Assert.Equal(HttpStatusCode.OK, r.StatusCode);
+                using var doc = JsonDocument.Parse(await r.Content.ReadAsStringAsync());
+                var data = doc.RootElement.GetProperty("data");
+                var mine = data[flip ? 1 : 0].GetProperty("embedding").EnumerateArray().Select(x => x.GetSingle()).ToArray();
+                var theirs = data[flip ? 0 : 1].GetProperty("embedding").EnumerateArray().Select(x => x.GetSingle()).ToArray();
+                Assert.Equal(solo[i], mine);
+                Assert.Equal(solo[(i + 1) % texts.Length], theirs);
+            })).ToArray();
+            await Task.WhenAll(tasks);
+            Assert.True(state.Embeddings.BatchesRun - before < texts.Length, "requests were not coalesced");
+        }
+        finally { client.Dispose(); await app.StopAsync(); await app.DisposeAsync(); }
+    }
+
     [SkippableFact]
     public void Encoder_on_gpu_device_fails_loudly_instead_of_falling_back()
     {
         var loc = TestFixtureResolver.ResolveFile("DOTLLM_MINILM_GGUF", "second-state",
             "All-MiniLM-L6-v2-Embedding-GGUF", "all-MiniLM-L6-v2-ggml-model-f16.gguf");
         Skip.If(!loc.Found, loc.SkipMessage("all-MiniLM-L6-v2 f16"));
-        Assert.Throws<NotSupportedException>(() =>
+        // Since #790 every explicit-GPU failure -- a failed preflight, or a loader exception such as the encoder's
+        // NotSupportedException -- surfaces as DeviceUnavailableException (what/why/opt-in); the loader's own
+        // reason is preserved as InnerException. Still loud, still no CPU fallback.
+        var ex = Assert.Throws<DeviceUnavailableException>(() =>
             ServerStartup.LoadModel(loc.Path!, new ServerOptions { Model = loc.Path!, Device = "vulkan", ModelId = "minilm" }));
+        if (ex.InnerException is not null)
+        {
+            Assert.IsType<NotSupportedException>(ex.InnerException);
+            Assert.Contains("CPU-only", ex.Message);
+        }
     }
 }
