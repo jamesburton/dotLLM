@@ -1393,8 +1393,11 @@ Kernel timing (`Bench_WideColumns`, `DOTLLM_GEMV_WIDE_BENCH=1`, device-local wei
 | IQ4_XS 17408x5120 | 712 | 1441 | 894 | 1390 |
 | IQ3_S 17408x5120 (probe only) | 1937 | 3793 | 18248 | 23352 |
 
-Q5_K / Q6_K / IQ4_XS 16 columns cost about the same as two 8-column dispatches (4-13% less) and avoid the GEMM fallback. **IQ3_S is refuted**: 12 / 16 columns are 10x slower than two
-8-column dispatches (register spill in the scalar-accumulator shader), so IQ3_S stays capped at 8 (`MaxColumnsFor`); the generator keeps `IQ3S_COLS = 8`.
+Q5_K / Q6_K / IQ4_XS 16 columns cost about the same as two 8-column dispatches (4-13% less) and avoid the GEMM fallback. **IQ3_S was capped at 8**: 12 / 16 columns were 10x slower than two
+8-column dispatches. #1389 found the cause: NOT a register spill (`VK_AMD_shader_info`: 127 / 256 VGPRs, 0 bytes scratch at 16 columns) but the
+per-thread layout (32 contiguous floats per column per lane, 128 B apart across lanes) that thrashes the L1 as the working set grows with the column count, the same
+failure IQ4_XS had before its coalesced rewrite (#902). IQ3_S now uses the coalesced K-position layout (one 32-lane workgroup per row, lane = 8 consecutive elements, two
+vec4 loads per column), and serves 16 columns: 1x8 700, 2x8 1450, 1x12 1250, 1x16 1310 us (was 1941 / 3833 / 18389 / 23636 us), so 8 columns got 2.8x faster too.
 The end-to-end 9..16-row verify on a Q5_K / IQ4_XS file was not measured (no such hybrid model locally); the kernel-level numbers above are the evidence.
 
 ### `qwen35moe` MTP head (issue #1188)
