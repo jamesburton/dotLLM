@@ -22,15 +22,15 @@ Quote ranges, not points: the box is shared, so treat differences under ~15 % as
 | mxbai-embed-large-v1 | bert | 335M | 1024 | cls | 512 | yes | F16, Q8_0 |
 | Qwen3-Embedding-0.6B | qwen3 (decoder) | 600M | 1024 | last | 32768 | yes (EOS appended automatically since #1398) | F16 |
 | multilingual-e5-small (XLM-R, SentencePiece Unigram) | bert | 118M | 384 | mean | 512 (some GGUFs say 511) | yes (#1401) | F16, Q8_0 |
-| EmbeddingGemma-300M | gemma-embedding | 300M | 768 | mean | 2048 | **no**: `Unsupported GGUF architecture: 'gemma-embedding'` | - |
+| EmbeddingGemma-300M | gemma-embedding (bidirectional Gemma3 + dense heads) | 300M | 768 | mean | 2048 | yes (#1399), CPU only | Q8_0 (ggml-org), F32 / F16 / BF16 (heads added) |
 | nomic-embed-text-v2-moe | nomic-bert-moe (XLM-R Unigram vocab) | 475M (8x277M, top-2) | 768 | mean | 512 | yes (#1400), CPU only | Q8_0 (official GGUF) |
 
 Not attempted (same code path as a row above, or outside the 20-600M download rule): bge-large / e5-large / gte-large
 (bert), Qwen3-Embedding-4B/8B (qwen3 decoder), gte-Qwen2, bge-m3 and jina-v3/v4 (XLM-R / custom code; bge-m3 uses the same Unigram tokenizer that multilingual-e5 now loads through, #1401). Encoder = bidirectional BERT-style (`BertEncoderModel`, CPU only);
 decoder-based embedders (Qwen3-Embedding, last-token pooling) run on `TransformerModel`, also CPU only.
 
-GPU: **no Vulkan or CUDA model implements `IEmbeddingModel`** (`grep` finds only `BertEncoderModel` and `TransformerModel`);
-the server returns 501 for a GPU-backed chat model and refuses encoders on a GPU device (#741 is the work item).
+GPU: Vulkan `VulkanTransformerModel` implements `IEmbeddingModel` since #1406 (section 5); CUDA models do not (the server returns 501),
+and encoders are refused on a GPU device (#741 is the work item).
 
 ## 2. Quality gate
 
@@ -78,6 +78,17 @@ The reference is a PyTorch re-implementation written from the published `modelin
 | official Q8_0 | 0.997079 / 0.998978 (llama.cpp itself 0.997333 / 0.998998) | 0.998370 / 0.999802 |
 
 Findings: (1) **The HF model adds a learned `mlp.experts.bias` [768] after the weighted expert sum on every MoE layer (max abs 0.10-0.43); llama.cpp's converter drops it, so the official GGUF cannot reproduce the reference** (cosine 0.9988 min / 0.9996 mean from it before any quantisation, and llama.cpp has the same defect). dotLLM follows llama.cpp when the tensor is absent and adds it when a GGUF carries `blk.N.ffn_down_exps.bias` [768] (the name llama.cpp already uses for expert bias tensors); that is what the 0.9999 row used. Upstream: llama.cpp should keep `experts.bias`. (2) With top-2 routing a 1e-4 GELU approximation difference can flip an expert choice on a borderline token, so the tanh arm shows min 0.9998 on one text where the dense models stay above 0.99999; exact erf removes it. dotLLM keeps the tanh GELU on purpose (same as every other BERT-class model and as llama.cpp). (3) CPU only (`--device cpu`, like the other encoders).
+
+**EmbeddingGemma-300M (#1399, `gemma-embedding`)**, 103 texts (48 English `docs/*.md` chunks, up to 752 tokens, plus 55 multilingual; alternating model-card prompts `task: search result | query: ` / `title: none | text: `), CPU, reference = sentence-transformers fp32 (Transformer, mean Pooling, Dense 768-3072, Dense 3072-768, Normalize; `unsloth/embeddinggemma-300m` mirrors the gated `google/embeddinggemma-300m`). Token ids identical to the reference on 103/103 texts (`<bos> ... <eos>`; the SPM `add_space_prefix=false` GGUF keys are honoured).
+
+| GGUF | vs ST fp32 (min / mean) | vs llama.cpp b9016 CPU, same file (min / mean) |
+|---|---|---|
+| F32 with dense heads (`unsloth` F32 + heads from the ST modules) | 1.0000000 / 1.00000000, NN-1 1.00 | 0.999999 / 1.000000 |
+| F32 without heads (`unsloth`) vs ST modules 0-1 only | 1.0000000 / 1.00000000, NN-1 1.00 | - |
+| Q8_0 with heads (`ggml-org`) | 0.998849 / 0.999713 (llama.cpp itself: 0.998812 / 0.999609) | 0.999091 / 0.999712 |
+
+How it works: the Gemma 3 tower (QK-norm, four RMSNorms, GeGLU, dual RoPE, 5:1 local/global) with **bidirectional** attention. Sliding-window layers (window 512) use a **symmetric** window, keys `q-256 .. q+256` (llama.cpp `LLAMA_SWA_TYPE_SYMMETRIC`; HF folds this into `sliding_window // 2 + 1`), new `AttentionMaskMode.SymmetricWindow`. The window only matters past 257 tokens: with it ignored the nine >257-token texts drop to 0.9886 (mutant run), with it they are 1.0000000. The heads are applied after pooling in llama.cpp and sentence-transformers; both are linear and mean/CLS/last pooling are linear row combinations, so dotLLM applies them per token row inside `ForwardHidden` (`dense_3(dense_2(h))`, Q8 weights read in place, 128-row chunks) and every existing consumer (CLI, server, batcher, bench) keeps pooling + normalising unchanged. Cost: two small GEMMs, 2 x 768 x 3072 MACs per token, a few percent of the 24-layer tower.
+Gotchas: (1) many community GGUFs (`unsloth`, `second-state`) were converted **without** `--sentence-transformers-dense-modules` and carry no `dense_2/dense_3`; llama.cpp and dotLLM then return the raw pooled vector, which is not the model's output space (cosine about 0 against the published embeddings). Use `ggml-org/embeddinggemma-300M-GGUF`, or add the heads. (2) the tokenizer frames `<bos> text <eos>` (the factory sets `AddEosToken` for this architecture only). (3) CPU only: `--device vulkan|gpu` fails loudly, `auto` falls back to the CPU; a causal `Forward` on the model throws instead of silently returning wrong hidden states. (4) prompts are the caller's job (`task: search result | query: ` for queries, `title: none | text: ` for documents; others in the model card's `config_sentence_transformers.json`).
 
 ## 3. Throughput and latency on CPU (32 threads)
 
@@ -272,11 +283,43 @@ coalescing but no parallelism.
 
 ## 5. Vulkan / CUDA
 
-No GPU encoder (#741): BERT/nomic-bert on a GPU device is refused by design. For the decoder-embedder case,
-`dotllm bench -d vulkan` on Qwen3-Embedding-0.6B F16 (prefill is the whole embedding cost; one extra token), 3 reps, gpu-lock held:
-**pp64 1.66k tok/s, pp256 4.3k, pp512 5.2-5.4k** (38 / 59 / 96-99 ms per document) versus 163-182 tok/s on CPU: **9-30x**.
-That is ~26 docs/s at 64 tokens and ~10 docs/s at 512 on the iGPU - but the Vulkan Qwen3 model has no hidden-state
-output (`IEmbeddingModel`), so `/v1/embeddings` cannot use it yet (lever 6). No CUDA run (T5500 needs the user's go-ahead).
+**Decoder embedders run on Vulkan (#1406).** `VulkanTransformerModel` implements `IEmbeddingModel`: the forward is the unchanged
+graph up to llama.cpp's `result_norm`, then the final RMSNorm of the pooled row(s) only, written straight into a host-readback buffer.
+No LM head runs, and for last/cls pooling only **one row** (`hiddenSize` F32 = 4 KiB for Qwen3-Embedding) is copied, normalised and read back;
+mean pooling reads all rows. The new `IEmbeddingModel.ForwardHiddenForPooling(sequences, pooling, consume, device)` delivers exactly the rows
+pooling reads (default = slice of `ForwardHiddenBatch`, so the CPU models are unchanged); `EmbeddingBatcher`, `dotllm embed` and
+`EmbeddingBench` all use it. Cacheless forward, positions 0..n-1, one sequence per submit (no cross-sequence batching on the GPU yet).
+Weights stay F16 and resident (no expansion); the only added storage is the readback buffer (`rows x hidden x 4 B`, one row for last/cls).
+
+Use: `dotllm embed <qwen3-embedding.gguf> -d vulkan "text"` (default device stays `cpu`), `dotllm serve ... --device vulkan` then
+`POST /v1/embeddings` (batched requests go through the #1405 batcher; Vulkan runs the sequences back to back). Encoders (BERT / nomic-bert)
+on a GPU device stay a **loud refusal**: `embed` fails with a `DeviceUnavailableException` message naming #741; the server's encoder loader throws
+(no silent CPU run, `auto` falls to CPU with the usual warning). Validated architecture: Qwen3 (Qwen3-Embedding-0.6B F16) only; other
+architectures on `VulkanTransformerModel` share the graph but are unvalidated.
+
+**Parity** (`Qwen3EmbeddingVulkanParityTests`, 9 texts: the committed 4-text sentence-transformers fixture + a 1-char text, unicode, 3 long
+texts up to ~450 tokens): Vulkan vs CPU last-token cosine >= 0.9999 and Vulkan vs sentence-transformers fp32 >= 0.9999 (all pass), mean pooling
+Vulkan vs CPU >= 0.9999, one-row readback identical to the last row of the all-row readback, and control arms (unrelated texts < 0.95; no-EOS Vulkan
+vector < 0.99 vs the reference). `dotllm embed "Hello"` on cpu vs vulkan differs in the 4th-5th significant digit (F16 GEMM order).
+
+**Throughput**, `EmbeddingBench throughput --device vulkan|cpu`, Qwen3-Embedding-0.6B F16, 8 documents back to back, `gpu-lock` + `cpu-bench` held,
+paired in order V C C V V C (raw: `benchmarks/EmbeddingBench/results/vulkan-1406.jsonl`), docs/s | tokens/s, min-max over runs:
+
+| seq | Vulkan (iGPU 8060S) | CPU (32 threads, tree with #1404) | ratio |
+|---|---|---|---|
+| 64 | 28.4-29.7 \| 1.8-1.9k | 12.7-13.1 \| 0.81-0.84k (one contended run 6.5) | 2.2x |
+| 256 | 18.2-18.7 \| 4.7-4.8k | 3.16-3.34 \| 0.81-0.85k | 5.6x |
+| 512 | 11.1-11.3 \| 5.7-5.8k | 1.41-1.50 \| 0.67-0.77k | 7.5-8x |
+
+The "9-30x" quoted in the survey compared against the pre-#1404 CPU numbers (163-182 tok/s); F16 GEMM on the CPU has since improved ~4.5x, so
+the honest Vulkan advantage today is 2x (short) to ~8x (512 tokens). Vulkan is per-document-latency bound at 64 tokens (35 ms: launch +
+submit per document); batching several short documents into one forward (padding-free varlen) is the next lever (issue filed).
+No CUDA run (T5500 needs the user's go-ahead). End-to-end `/v1/embeddings` on Vulkan returns 1024-d vectors (smoke-tested, 2 inputs, 10 prompt tokens).
+
+**#741 (GPU BERT encoder), plan only, not started:** needs bidirectional attention (the Vulkan attention shader has a Bidirectional
+mask mode from DiffusionGemma), LayerNorm + bias adds, absolute position / token-type embeddings, GELU, and mean/cls pooling; reuse the coopmat
+prefill GEMM tiles for QKV/out/FFN, a padded-or-varlen batch of length-sorted documents (section 3 padding table) and the same
+`ForwardHiddenForPooling` contract (mean = GPU-side reduction). Expect well above 5k tok/s on 110M-class encoders (unmeasured).
 
 ## 6. Ranked levers (expected wins, from the measurements above)
 
@@ -294,11 +337,11 @@ the same harness, the cosine gate, and a discriminating shape.
    use the Q8_0 GGUF: 1.4-2x faster at 0.9996+ cosine).
 5. (#1405) **Server dynamic batching** for `/v1/embeddings` (collect requests for a few ms, run lever 1 across clients; length-sort so a padded
    path never sees the 60-78 % waste above). Needed for any concurrency scaling; the current gate makes N clients no faster than 1.
-6. (#1406) **Vulkan hidden-state path for decoder embedders** (Qwen3-Embedding-0.6B: 9-30x over CPU, ~26 docs/s at 64 tok today's kernels),
+6. (#1406, DONE) **Vulkan hidden-state path for decoder embedders** (Qwen3-Embedding-0.6B: 2.2x/5.6x/8x over the current CPU at 64/256/512 tokens, 29 docs/s at 64 tok),
    then the **GPU BERT encoder (#741)** reusing the coopmat prefill tiles (110M-class encoders are ~5x fewer FLOPs than the 0.6B
    decoder, so expect well above 5k tok/s; unmeasured).
 7. **Correctness/coverage** (#1398 EOS: FIXED; #1401 XLM-R Unigram tokenizer: FIXED; #1399 gemma-embedding, #1400 nomic-bert-moe): Qwen3-Embedding needs `<|endoftext|>` appended before last-token pooling (llama.cpp does it; dotLLM
-   mean cosine 0.80); add `gemma-embedding` and `nomic-bert-moe`.
+   mean cosine 0.80); add `gemma-embedding`, `nomic-bert-moe`, and XLM-R (SentencePiece) tokenisation for multilingual-e5/bge-m3.
 8. Small/free: (#1407) p99 spikes on cold single-document F16 calls (876 ms at 16 tokens), content-hash doc cache at the server,
    int8/binary output formats, Matryoshka truncation is already supported (`--dimensions`), NPU background embedder (#1321, no measurement yet).
 

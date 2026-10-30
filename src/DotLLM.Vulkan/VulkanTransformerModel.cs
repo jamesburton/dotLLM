@@ -56,7 +56,7 @@ namespace DotLLM.Vulkan;
 /// matching the CUDA return convention.
 /// </para>
 /// </remarks>
-public sealed partial class VulkanTransformerModel : IModel
+public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
 {
     private readonly VulkanDevice _device;
     private readonly VulkanWeights _weights;
@@ -4119,9 +4119,13 @@ public sealed partial class VulkanTransformerModel : IModel
         // All-row logits (#564), opt-in: reuse the diffusion all-position head. Its logits buffer is
         // allocated HERE, before any recording, because growing it invalidates the kernel descriptor
         // caches, which must never happen against an open command buffer.
-        bool allRowHead = seqLen > 1 && seqLen <= _allRowLogitsLimit;
+        bool embedForward = _embedRows != EmbedRows.None;
+        bool allRowHead = !embedForward && seqLen > 1 && seqLen <= _allRowLogitsLimit;
         if (allRowHead)
             EnsureDiffusionLogits(seqLen, vocabSize);
+        // Embedding output (#1406): the host-readback buffer is sized BEFORE recording (growth invalidates the descriptor caches).
+        if (embedForward)
+            EnsureEmbedReadback(_embedRows == EmbedRows.All ? seqLen : 1, hiddenSize);
 
         // Pipeline stage resume (layer-spanning): seed HiddenState from the handed-off hidden rows of a
         // previous stage instead of gathering token embeddings. Synchronous host→device upload into the
@@ -4858,6 +4862,11 @@ public sealed partial class VulkanTransformerModel : IModel
                 BarrierComputeToCompute(cmdBuf);
         }
 
+        // 3-embed. Embedding forward (#1406): final RMSNorm of the pooled row(s) only, no LM head, then a read-back of
+        //          just those rows. Same graph as the logits path up to llama.cpp's result_norm.
+        if (embedForward)
+            return FinishEmbeddingForward(cmdBuf, seqLen, hiddenSize, eps, deviceId);
+
         // 3a. PKV prefill: the captured per-layer K/V is all we need — skip the final
         //     norm + LM head entirely (the generator discards the prefill result).
         if (_pkvPhase == DiffusionKvPhase.Prefill)
@@ -4937,6 +4946,102 @@ public sealed partial class VulkanTransformerModel : IModel
         DpEnd();
         return result;
     }
+
+    // ── Embedding output (#1406) ─────────────────────────────────────────────
+
+    /// <summary>Which rows of the post-final-norm hidden state an embedding forward reads back.</summary>
+    private enum EmbedRows { None, All, First, Last }
+
+    private EmbedRows _embedRows;
+    private VulkanDevice.Buffer? _embedReadback;
+    private long _embedReadbackBytes;
+
+    /// <summary>Grows the host-readback buffer for <paramref name="rows"/> x <paramref name="hiddenSize"/> floats. Call outside recording.</summary>
+    private void EnsureEmbedReadback(int rows, int hiddenSize)
+    {
+        long bytes = (long)rows * hiddenSize * sizeof(float);
+        if (_embedReadback is not null && _embedReadbackBytes >= bytes) return;
+        _embedReadback?.Dispose();
+        _embedReadback = _device.AllocateHostReadback(bytes);
+        _embedReadbackBytes = bytes;
+        InvalidateKernelCaches();   // a cached RMSNorm descriptor set may reference the old handle
+    }
+
+    /// <summary>
+    /// Embedding forward tail: final RMSNorm (no LM head) of the rows pooling reads, written straight into a host-readback
+    /// buffer. For last/cls pooling only that one row is copied to the norm scratch, normalised and downloaded
+    /// (hiddenSize floats), never the full sequence.
+    /// </summary>
+    private unsafe ITensor FinishEmbeddingForward(nint cmdBuf, int seqLen, int hiddenSize, float eps, int deviceId)
+    {
+        int rows = _embedRows == EmbedRows.All ? seqLen : 1;
+        if (_embedRows == EmbedRows.All)
+        {
+            // The last layer's residual add is a compute write the norm reads; the layer loop only barriers BETWEEN layers.
+            BarrierComputeToCompute(cmdBuf);
+            _rmsnorm.Record(cmdBuf, _state.HiddenState, _weights.OutputNormWeight, _embedReadback!,
+                rowCount: seqLen, n: hiddenSize, eps: eps);
+        }
+        else
+        {
+            long rowBytes = (long)hiddenSize * sizeof(float);
+            long rowOffset = _embedRows == EmbedRows.Last ? (long)(seqLen - 1) * rowBytes : 0;
+            BarrierComputeToTransfer(cmdBuf);
+            RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.NormOutput,
+                srcOffset: (ulong)rowOffset, dstOffset: 0, size: (ulong)rowBytes);
+            BarrierTransferToCompute(cmdBuf);
+            _rmsnorm.Record(cmdBuf, _state.NormOutput, _weights.OutputNormWeight, _embedReadback!,
+                rowCount: 1, n: hiddenSize, eps: eps);
+        }
+        KernelSupport.ComputeToHostBarrier(cmdBuf);
+        _submit.SubmitAndWait();
+
+        var result = UnmanagedTensor.Allocate(new TensorShape(rows, hiddenSize), DType.Float32, deviceId: -1);
+        _device.Download(_embedReadback!, new Span<float>((void*)result.DataPointer, rows * hiddenSize));
+        return result;
+    }
+
+    private ITensor RunEmbedForward(ReadOnlySpan<int> tokenIds, EmbedRows rows)
+    {
+        if (_headless || _noTokenEmbed || _seedHiddenRows is not null || _pkvPhase != DiffusionKvPhase.None
+            || Config.DiffusionConfig is not null || _diffusionMaskMode != AttentionMaskMode.Causal)
+            throw new NotSupportedException(
+                $"{Config.Architecture}: embedding extraction is not available on this Vulkan model variant (pipeline stage / diffusion).");
+        var positions = new int[tokenIds.Length];
+        for (int i = 0; i < positions.Length; i++) positions[i] = i;
+        _embedRows = rows;
+        try { return Forward(tokenIds, positions, deviceId: 0, kvCache: null); }
+        finally { _embedRows = EmbedRows.None; }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Post-final-norm hidden state of every position (llama.cpp's <c>result_norm</c>); the LM head is not run. Mean pooling needs
+    /// every row; last/cls pooling should go through <see cref="ForwardHiddenForPooling"/>, which reads back one row.
+    /// Validated against the CPU path for Qwen3-Embedding only; other architectures share the graph but are unvalidated.
+    /// </remarks>
+    public ITensor ForwardHidden(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
+    {
+        for (int i = 0; i < positions.Length; i++)
+            if (positions[i] != i)
+                throw new NotSupportedException("Vulkan ForwardHidden supports only positions 0..n-1 (cacheless embedding forward).");
+        return RunEmbedForward(tokenIds, EmbedRows.All);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void ForwardHiddenForPooling(IReadOnlyList<int[]> sequences, PoolingType pooling,
+        IEmbeddingModel.HiddenStateConsumer consume, int deviceId)
+    {
+        var rows = pooling switch { PoolingType.Last => EmbedRows.Last, PoolingType.Cls => EmbedRows.First, _ => EmbedRows.All };
+        for (int i = 0; i < sequences.Count; i++)
+        {
+            using var hidden = RunEmbedForward(sequences[i], rows);
+            consume(i, new ReadOnlySpan<float>((void*)hidden.DataPointer, (int)(hidden.Shape[0] * hidden.Shape[1])));
+        }
+    }
+
+    /// <inheritdoc/>
+    public PoolingType? DeclaredPoolingType => Config.PoolingType;
 
     /// <summary>
     /// DiffusionGemma forward tail: final RMSNorm + LM head over ALL <paramref name="seqLen"/>
@@ -5087,7 +5192,8 @@ public sealed partial class VulkanTransformerModel : IModel
         if (_seedStaging is null || _seedStaging.Size < bytes)
         {
             _seedStaging?.Dispose();
-            _seedStaging = _device.Allocate(bytes); // host-visible, host-coherent
+        _embedReadback?.Dispose();
+    _seedStaging = _device.Allocate(bytes); // host-visible, host-coherent
         }
         _device.Upload(rows[..count], _seedStaging);                 // host → staging (mapped write)
         _device.CopyBufferRangeSynchronous(_seedStaging, _state.HiddenState,

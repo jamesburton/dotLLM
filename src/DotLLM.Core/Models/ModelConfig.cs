@@ -268,6 +268,14 @@ public record ModelConfig
     public PoolingType? PoolingType { get; init; }
 
     /// <summary>
+    /// True for an embedding-only tower whose attention is bidirectional with symmetric sliding windows
+    /// (EmbeddingGemma, GGUF arch <c>gemma-embedding</c>, llama.cpp <c>causal_attn = false</c>). Such a model only
+    /// supports the cacheless <see cref="IEmbeddingModel.ForwardHidden"/> path; a causal <c>Forward</c> would silently
+    /// produce wrong hidden states, so it is refused.
+    /// </summary>
+    public bool BidirectionalAttention { get; init; }
+
+    /// <summary>
     /// Layer indices that skip RoPE entirely (NoPE — "no positional encoding").
     /// Null or empty means every layer applies RoPE per the standard
     /// <see cref="RoPEConfig"/>. SmolLM3 ships a sparse pattern
@@ -290,7 +298,8 @@ public record ModelConfig
         Architecture is DotLLM.Core.Configuration.Architecture.Gemma3
                      or DotLLM.Core.Configuration.Architecture.Gemma4
                      or DotLLM.Core.Configuration.Architecture.DiffusionGemma
-                     or DotLLM.Core.Configuration.Architecture.Gemma3n;
+                     or DotLLM.Core.Configuration.Architecture.Gemma3n
+                     or DotLLM.Core.Configuration.Architecture.GemmaEmbedding;
 
     /// <summary>
     /// Gemma-3n AltUp / Laurel / activation-sparsity configuration. Non-null iff

@@ -62,6 +62,31 @@ public interface IEmbeddingModel
     }
 
     /// <summary>
+    /// Like <see cref="ForwardHiddenBatch"/>, but hands <paramref name="consume"/> only the rows that
+    /// <paramref name="pooling"/> reads (#1406): <see cref="PoolingType.Last"/> gets the final row,
+    /// <see cref="PoolingType.Cls"/> the first row, <see cref="PoolingType.Mean"/> every row. The span length is
+    /// <c>rows * hiddenSize</c>, so <c>EmbeddingPooler.Pool(span, span.Length / hiddenSize, ...)</c> yields exactly the vector
+    /// that pooling the full matrix would. The default slices the full result; a GPU backend overrides it so the
+    /// device never reads back (or even normalises) the rows nobody pools.
+    /// </summary>
+    /// <param name="sequences">Token id sequences; each must be non-empty.</param>
+    /// <param name="pooling">Pooling that will be applied to the delivered rows.</param>
+    /// <param name="consume">Per-sequence result sink.</param>
+    /// <param name="deviceId">Target device for computation.</param>
+    void ForwardHiddenForPooling(IReadOnlyList<int[]> sequences, PoolingType pooling, HiddenStateConsumer consume, int deviceId)
+        => ForwardHiddenBatch(sequences, (idx, hidden) =>
+        {
+            int n = sequences[idx].Length;
+            int h = hidden.Length / n;
+            consume(idx, pooling switch
+            {
+                PoolingType.Last => hidden.Slice((n - 1) * h, h),
+                PoolingType.Cls => hidden[..h],
+                _ => hidden,
+            });
+        }, deviceId);
+
+    /// <summary>
     /// The pooling strategy declared by the model checkpoint (GGUF <c>{arch}.pooling_type</c>),
     /// or <c>null</c> when the checkpoint does not declare one.
     /// </summary>
