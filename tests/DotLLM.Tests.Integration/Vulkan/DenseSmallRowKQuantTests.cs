@@ -13,6 +13,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// or comparable to the old MMQ path (control arm: the switch off).
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public class DenseSmallRowKQuantTests
 {
     private static (float[] Batched, float[] Seq, long Count, int Vocab) Run(string path, int ctx, int rows, bool on)
