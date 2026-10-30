@@ -178,10 +178,22 @@ public static class Attention
                                     int slidingWindowSize, int headIdx, int kvHeadIdx, float alibiSlope,
                                     float softCap, AttentionMaskMode maskMode, int prefixLen,
                                     float sinkLogit)
+        => ExecuteHeadRows(q, k, v, output, scratch, 0, seqQ, seqKv, headDim, scale,
+                           qStride, kvStride, positionOffset, tileSize, slidingWindowSize, headIdx, kvHeadIdx,
+                           alibiSlope, softCap, maskMode, prefixLen, sinkLogit);
+
+    /// <summary><see cref="ExecuteHead"/> restricted to query rows <c>[rowStart, rowEnd)</c>; each row's arithmetic is unchanged.</summary>
+    private static void ExecuteHeadRows(ReadOnlySpan<float> q, ReadOnlySpan<float> k, ReadOnlySpan<float> v,
+                                    Span<float> output, Span<float> scratch, int rowStart, int rowEnd,
+                                    int seqKv, int headDim, float scale,
+                                    int qStride, int kvStride, int positionOffset, int tileSize,
+                                    int slidingWindowSize, int headIdx, int kvHeadIdx, float alibiSlope,
+                                    float softCap, AttentionMaskMode maskMode, int prefixLen,
+                                    float sinkLogit)
     {
         bool hasSink = !float.IsNegativeInfinity(sinkLogit);
 
-        for (int i = 0; i < seqQ; i++)
+        for (int i = rowStart; i < rowEnd; i++)
         {
             int qPos = positionOffset + i;
             var qRow = q.Slice(i * qStride + headIdx * headDim, headDim);
@@ -502,6 +514,76 @@ public static class Attention
         }
     }
 
+
+    // ──────────────────── Bidirectional encoder attention (#1402) ────────────────────
+
+    private unsafe struct BlockedCtx
+    {
+        public float* Q, K, V, Output;
+        public int Seq, NumHeads, HeadDim, QStride, QBlock, BlocksPerHead, TileSize;
+        public float Scale;
+    }
+
+    /// <summary>
+    /// Full (bidirectional, no GQA, no mask) self-attention for BERT-class encoders, parallelised over
+    /// <c>head x query-block</c> work items on <paramref name="pool"/>. Each query row runs exactly the arithmetic of
+    /// the single-threaded <c>Execute</c>, so the result is bit-identical; rows are independent, so only the
+    /// schedule changes. Layout of q/k/v/output: <c>[seq, numHeads * headDim]</c>.
+    /// </summary>
+    [SkipLocalsInit]
+    public static unsafe void ExecuteBidirectional(float* q, float* k, float* v, float* output,
+                                                   int seq, int numHeads, int headDim, float scale,
+                                                   ComputeThreadPool? pool)
+    {
+        if (pool is null || pool.ThreadCount < 2)
+        {
+            int len = seq * numHeads * headDim;
+            Execute(new ReadOnlySpan<float>(q, len), new ReadOnlySpan<float>(k, len), new ReadOnlySpan<float>(v, len),
+                    new Span<float>(output, len), seq, seq, numHeads, numHeads, headDim, 0, scale, default, null, 0f,
+                    AttentionMaskMode.Bidirectional, 0, default);
+            return;
+        }
+
+        // Aim for ~8 work items per thread so the static partition stays balanced; a block is at least 4 rows.
+        int target = pool.ThreadCount * 8;
+        int blocksPerHead = Math.Clamp(target / numHeads, 1, Math.Max(1, seq / 4));
+        int qBlock = (seq + blocksPerHead - 1) / blocksPerHead;
+        blocksPerHead = (seq + qBlock - 1) / qBlock;
+        var ctx = new BlockedCtx
+        {
+            Q = q, K = k, V = v, Output = output, Seq = seq, NumHeads = numHeads, HeadDim = headDim,
+            QStride = numHeads * headDim, QBlock = qBlock, BlocksPerHead = blocksPerHead,
+            TileSize = ComputeTileSize(headDim), Scale = scale,
+        };
+        pool.Dispatch((nint)(&ctx), &BlockedWorker);
+    }
+
+    [SkipLocalsInit]
+    private static unsafe void BlockedWorker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        ref var ctx = ref Unsafe.AsRef<BlockedCtx>((void*)ctxPtr);
+        int items = ctx.NumHeads * ctx.BlocksPerHead;
+        ComputeThreadPool.PartitionRange(items, threadIdx, threadCount, out int start, out int end);
+        if (start >= end) return;
+
+        int len = ctx.Seq * ctx.QStride;
+        var qSpan = new ReadOnlySpan<float>(ctx.Q, len);
+        var kSpan = new ReadOnlySpan<float>(ctx.K, len);
+        var vSpan = new ReadOnlySpan<float>(ctx.V, len);
+        var outSpan = new Span<float>(ctx.Output, len);
+        Span<float> scratch = stackalloc float[OneShotMaxKeys];
+
+        for (int item = start; item < end; item++)
+        {
+            int h = item / ctx.BlocksPerHead;
+            int b = item - h * ctx.BlocksPerHead;
+            int r0 = b * ctx.QBlock;
+            int r1 = Math.Min(ctx.Seq, r0 + ctx.QBlock);
+            ExecuteHeadRows(qSpan, kSpan, vSpan, outSpan, scratch, r0, r1, ctx.Seq, ctx.HeadDim, ctx.Scale,
+                            ctx.QStride, ctx.QStride, 0, ctx.TileSize, 0, h, h, 0f, 0f,
+                            AttentionMaskMode.Bidirectional, 0, float.NegativeInfinity);
+        }
+    }
 
     /// <summary>
     /// Scalar reference implementation for correctness verification.

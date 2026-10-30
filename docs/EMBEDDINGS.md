@@ -160,6 +160,32 @@ gate GEMM for nomic):
   figures above); seq 256 **390 / 508 -> 66-67** (total 636-846 -> 297-341). Throughput B=8 seq 64: 6.1-7.1 -> 17.6 docs/s
   (one noisy rep 11). Attention (single-threaded) and GELU now dominate (#1402/#1403). Parity vs legacy on 50 texts: min cosine
   0.9999999; unit test vs double-precision reference on m%4, k%8, odd-n shapes.
+* **Fixed (#1402): encoder attention is parallel.** `Attention.ExecuteBidirectional` (`Attention.cs`) splits `head x query-block`
+  work items (about 8 per thread) over `ActivePool` (never `_pool`: batch workers run inside a pool dispatch). Every query row runs
+  the unchanged per-row arithmetic of the old single-threaded path (`ExecuteHeadRows`), so the output is **bit-identical**
+  (tested for nh/hd = 12/32, 12/64, 16/64, 3/32, 4/16 and seq 1..1500 incl. the tiled long-row path; and `EmbeddingBench dump`
+  on 48 texts is byte-identical for MiniLM F16, bge-small F16/Q8, bge-base F16/Q8 and nomic F16, i.e. cosine 1.0 vs the old path,
+  so the cosine >= 0.9999 gate vs sentence-transformers/llama.cpp above is untouched). `EmbeddingBench ... --legacy-attn 1` selects
+  the old call for same-session A/B. Not done: a vectorised score/softmax micro-kernel (the stage is now ~45-52 ms at 512 tokens,
+  about the size of one Q8 GEMM stage, so it is no longer the lever). Paired A/B, 32 threads, 3 reps alternating order, single
+  document `profile` (ms/doc, min-max), legacy -> new:
+
+| Model | seq | Attention stage | Document total |
+|---|---|---|---|
+| bge-base Q8_0 | 256 | 152-160 -> 14.7-21.2 | 372-373 -> 215-268 |
+| bge-base Q8_0 | 512 | 644-655 -> 51.6-52.3 | 1029-1057 -> 443-450 |
+| bge-base F16 | 256 / 512 | 152-154 -> 13.6-15.3 / 627-644 -> 45-53 | 320-331 -> 171-175 / 931-960 -> 359-366 |
+| bge-small Q8_0 | 256 / 512 | 141-145 -> 13.8-16.2 / 576-581 -> 40.6-51.2 | 245-262 -> 107-111 / 764-771 -> 229-241 |
+| bge-small F16 | 256 / 512 | 144-149 -> 14.9-17.5 / 576-594 -> 45-47 | 236-239 -> 98-100 / 740-762 -> 208-211 |
+| MiniLM Q8_0 | 256 / 512 | 71-72 -> 12-16.7 / 288-297 -> 20-22 | 122-123 -> 56-61 / 374-382 -> 105-108 |
+| nomic Q8_0 | 256 / 512 | 159-165 -> 13.6-16.1 / 645-654 -> 45-51 | 302-310 -> 134-149 / 893-923 -> 283-297 |
+
+  Attention stage 10-14x at 256-512 tokens (target >= 10x met); whole document 1.6-3.6x at 512. The 64-token cells are
+  dominated by cold-start noise (8 iterations) and show no reliable change. End-to-end 48-text set (mean 148 tokens, docs/s
+  median over 3 reps): bge-base Q8 4.4-4.6 -> 7.6-7.8, bge-base F16 5.3-5.6 -> 9.6-9.9, bge-small Q8 6.4-6.9 -> 14.9-15.8,
+  bge-small F16 7.0-7.3 -> 16.9-17.3, MiniLM Q8 13.7-14.0 -> 33.9-34.7, nomic Q8 4.7-4.8 -> 10.9-11.0 (raw rows:
+  `benchmarks/EmbeddingBench/results/ab-attention-1402.jsonl`; this bench runs documents back to back, the server batcher of #1405
+  already parallelises across documents). Remaining serial stage: GELU (#1403).
 * **Fixed (#1403): GELU is vectorised and parallel.** `Gelu.ExecuteTanh` (`Gelu.cs`, ggml's tanh form, `UseErfGelu` seam
   unchanged) runs `TensorPrimitives` Multiply/Add/Tanh over 512-float L1 tiles, tile ranges split across `ActivePool`
   (shipping .NET 10 intrinsics only). Max abs error vs the exact double-precision tanh GELU: 6.3e-7 over 100k inputs in
@@ -244,7 +270,7 @@ the same harness, the cosine gate, and a discriminating shape.
    237 ms/doc (bge-base Q8, 64 tok) so 32 independent workers would give on the order of 60-130 docs/s (SMT and shared L3 will eat part of the ideal) versus 16 today, because attention, GELU,
    LN and bias then stop being Amdahl terms. Needs per-worker scratch and a server batcher (lever 5). Weight streaming (117 MB
    per document per worker) is far below the memory bandwidth at that rate.
-2. (#1402) **Parallel + vectorised bidirectional attention** for short sequences (2.3x at 512, 1.6x at 256, 1.1x at 64 for bge-base Q8;
+2. (#1402, parallel part DONE) **Parallel + vectorised bidirectional attention** for short sequences (2.3x at 512, 1.6x at 256, 1.1x at 64 for bge-base Q8;
    lifts MiniLM/bge-small/nomic similarly). Today ~9-18 GFLOP/s on one thread; target >= 10x on that stage.
 3. (#1403, DONE) **Vectorised/parallel GELU** (1.3-1.4x for bge/e5/gte/mxbai at 64-256 tokens: removes 18-31 % of the document).
 4. (#1404) **F16 GEMM**: convert-once-per-tile and AVX-512 path, so F16 GGUFs match Q8_0 (>= 1.5-2x on F16 files; interim advice is to

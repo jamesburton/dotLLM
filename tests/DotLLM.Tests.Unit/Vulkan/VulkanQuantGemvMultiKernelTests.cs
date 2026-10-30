@@ -120,6 +120,13 @@ public class VulkanQuantGemvMultiKernelTests
     [InlineData(QuantGemvMultiFormat.IQ4_XS, 37, 2560, 10)]
     [InlineData(QuantGemvMultiFormat.IQ4_XS, 65, 1024, 16)]
     [InlineData(QuantGemvMultiFormat.IQ4_XS, 17, 256, 15)]
+    // #1389: IQ3_S 9..16 columns (coalesced K-position layout, no longer capped at 8).
+    [InlineData(QuantGemvMultiFormat.IQ3_S, 37, 2560, 9)]
+    [InlineData(QuantGemvMultiFormat.IQ3_S, 65, 1024, 16)]
+    [InlineData(QuantGemvMultiFormat.IQ3_S, 17, 256, 13)]
+    [InlineData(QuantGemvMultiFormat.IQ3_S, 33, 2560, 12)]
+    [InlineData(QuantGemvMultiFormat.IQ3_S, 40, 2560, 8)]
+    [InlineData(QuantGemvMultiFormat.IQ3_S, 64, 1024, 3)]
     public void Multi_EachColumnMatchesSingleRowGemv(QuantGemvMultiFormat format, int m, int k, int n) => RunParity(format, m, k, n);
 
     /// <summary>
@@ -130,6 +137,8 @@ public class VulkanQuantGemvMultiKernelTests
     [InlineData(QuantGemvMultiFormat.Q5_K, 37, 2560, 13)]
     [InlineData(QuantGemvMultiFormat.Q6_K, 37, 2560, 16)]
     [InlineData(QuantGemvMultiFormat.IQ4_XS, 37, 2560, 11)]
+    [InlineData(QuantGemvMultiFormat.IQ3_S, 37, 2560, 16)]
+    [InlineData(QuantGemvMultiFormat.IQ3_S, 37, 2560, 12)]
     public void Wide_SharedColumnsMatchEightColumnDispatch(QuantGemvMultiFormat format, int m, int k, int n)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
@@ -177,9 +186,9 @@ public class VulkanQuantGemvMultiKernelTests
             Assert.True(Math.Abs(eight[i] - w8[i]) <= 1e-4f + 1e-5f * Math.Abs(eight[i]), $"[{i}]: 8-col {eight[i]:G9} vs wide {w8[i]:G9}");
     }
 
-    /// <summary>The Q6_K two-rows-per-workgroup variant has no wide pipelines and IQ3_S spills above 8 columns: both stop at eight and the dispatcher must not hand them more.</summary>
+    /// <summary>The Q6_K two-rows-per-workgroup variant has no wide pipelines: it stops at eight and the dispatcher must not hand it more. IQ3_S serves 16 since #1389.</summary>
     [SkippableFact]
-    public void Q6KR2AndIq3S_StopAtEightColumns()
+    public void Q6KR2_StopsAtEightColumns_Iq3SServesSixteen()
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
@@ -188,7 +197,7 @@ public class VulkanQuantGemvMultiKernelTests
         Assert.Equal(8, r2!.MaxColumnsSupported);
         Assert.False(r2.AcceptsColumns(9, 256));
         using var iq3 = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.IQ3_S);
-        if (iq3 is not null) { Assert.Equal(8, iq3.MaxColumnsSupported); Assert.False(iq3.AcceptsColumns(9, 256)); }
+        if (iq3 is not null) { Assert.Equal(16, iq3.MaxColumnsSupported); Assert.True(iq3.AcceptsColumns(16, 256)); Assert.False(iq3.AcceptsColumns(17, 256)); }
     }
 
     /// <summary>
@@ -199,6 +208,7 @@ public class VulkanQuantGemvMultiKernelTests
     [InlineData(QuantGemvMultiFormat.Q5_K, 176, 17408, 5120)]
     [InlineData(QuantGemvMultiFormat.Q6_K, 210, 5120, 6144)]
     [InlineData(QuantGemvMultiFormat.IQ4_XS, 136, 17408, 5120)]
+    [InlineData(QuantGemvMultiFormat.IQ3_S, 110, 17408, 5120)]   // #1389
     public void Bench_WideColumns(QuantGemvMultiFormat format, int blockBytes, int m, int k)
     {
         Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_GEMV_WIDE_BENCH") == "1", "DOTLLM_GEMV_WIDE_BENCH=1 to enable.");

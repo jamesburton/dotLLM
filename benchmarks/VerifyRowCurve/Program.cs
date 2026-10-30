@@ -27,6 +27,7 @@ void SetWide(bool wide)
 {
     DotLLM.Vulkan.VulkanQwen3HybridDenseTransformerModel.SmallRowWideEnabled = wide;
     DotLLM.Vulkan.VulkanQwen3MoeHybridTransformerModel.SmallRowWideEnabled = wide;   // #1374
+    DotLLM.Vulkan.VulkanTransformerModel.SetSmallRowKQuantForBench(wide);   // #917: dense VulkanTransformerModel K-quant multi GEMVs on/off
     DotLLM.Vulkan.Kernels.PQ2_0SmallNDispatch.MultiColumnMaxNOverride = wide ? 16 : 8;
 }
 if (ab) SetWide(true);
