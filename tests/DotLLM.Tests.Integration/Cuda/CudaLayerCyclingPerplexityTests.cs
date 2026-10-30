@@ -43,6 +43,7 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// layer, a dropped residual, a KV or state leak across a cut — moves that comparison a long way,
 /// while FP16 boundary rounding moves it very little.</para>
 /// </remarks>
+[Collection(GpuCollection.Name)]
 public sealed class CudaLayerCyclingPerplexityTests(ITestOutputHelper output)
 {
     /// <summary>Short corpus: the whole-device reference path is O(n^2) in forward passes.</summary>
