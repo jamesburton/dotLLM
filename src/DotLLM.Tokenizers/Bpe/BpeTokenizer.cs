@@ -176,10 +176,25 @@ public sealed class BpeTokenizer : ITokenizer
             var withBos = new int[ids.Length + 1];
             withBos[0] = BosTokenId;
             ids.CopyTo(withBos, 1);
-            return withBos;
+            ids = withBos;
+        }
+        if (AddEosToken && (ids.Length == 0 || ids[^1] != EosTokenId))
+        {
+            var withEos = new int[ids.Length + 1];
+            ids.CopyTo(withEos, 0);
+            withEos[^1] = EosTokenId;
+            ids = withEos;
         }
         return ids;
     }
+
+    /// <summary>
+    /// When true, <see cref="Encode"/> appends <see cref="EosTokenId"/> unless the encoded text already ends with it.
+    /// Off by default; the GGUF factory switches it on only for embedding towers whose tokenizer template frames the
+    /// text as <c>&lt;bos&gt; … &lt;eos&gt;</c> (EmbeddingGemma, <c>gemma-embedding</c>). Never set for generative models:
+    /// an EOS after the prompt would end the turn.
+    /// </summary>
+    public bool AddEosToken { get; set; }
 
     /// <summary>
     /// When true, <see cref="Encode"/> prepends <see cref="BosTokenId"/> unless the encoded text

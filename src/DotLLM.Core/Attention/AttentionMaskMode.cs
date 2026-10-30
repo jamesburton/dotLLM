@@ -30,4 +30,11 @@ public enum AttentionMaskMode
     /// still apply.
     /// </summary>
     Hybrid = 2,
+
+    /// <summary>
+    /// Bidirectional with a <b>symmetric</b> sliding window (llama.cpp <c>LLAMA_SWA_TYPE_SYMMETRIC</c>, EmbeddingGemma):
+    /// a layer with window size <c>W</c> sees keys at positions <c>q - W/2 .. q + W/2</c> (both inclusive); a layer
+    /// with no window is fully bidirectional. Only the CPU kernels implement it (issue #1399).
+    /// </summary>
+    SymmetricWindow = 3,
 }

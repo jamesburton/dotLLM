@@ -32,7 +32,7 @@ public sealed class TransformerArchitecture : IModelArchitecture
          // embed-scale, QK-norm, per-attention-type RoPE, dual KV-head/head-dim,
          // sparse MoE, soft-cap). DiffusionGemma adds only a DiffusionConfig the
          // generator consumes — the tower itself is the Gemma-4 MoE backbone.
-         Architecture.Gemma3, Architecture.Gemma4, Architecture.DiffusionGemma,
+         Architecture.Gemma3, Architecture.Gemma4, Architecture.DiffusionGemma, Architecture.GemmaEmbedding,
          Architecture.BitNet];
 
     /// <inheritdoc/>

@@ -750,7 +750,18 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     /// </remarks>
     public ITensor ForwardHidden(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
     {
-        RunLayersAndFinalNormCore(tokenIds, positions, kvCache: null);
+        if (Config.BidirectionalAttention)
+        {
+            // EmbeddingGemma: bidirectional attention with symmetric sliding windows (llama.cpp causal_attn = false).
+            _currentMaskSpec = AttentionMaskSpec.SymmetricWindow;
+            try { RunLayersAndFinalNormCore(tokenIds, positions, kvCache: null); }
+            finally { _currentMaskSpec = AttentionMaskSpec.Causal; }
+            ApplyEmbeddingDenseHeads(tokenIds.Length);
+        }
+        else
+        {
+            RunLayersAndFinalNormCore(tokenIds, positions, kvCache: null);
+        }
 
         int seqLen = tokenIds.Length;
         int hiddenSize = Config.HiddenSize;
@@ -760,6 +771,39 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         new ReadOnlySpan<float>(hidden, seqLen * hiddenSize)
             .CopyTo(new Span<float>((void*)result.DataPointer, seqLen * hiddenSize));
         return result;
+    }
+
+    /// <summary>
+    /// EmbeddingGemma post-pooling heads <c>dense_3(dense_2(pooled))</c> (bias-free, identity activation; llama.cpp
+    /// <c>build_dense_out</c>). Both heads are linear and every supported pooling (mean, CLS, last) is a fixed linear
+    /// row combination, so <c>dense(pool(h)) == pool(dense(h))</c> up to float rounding: the heads are applied to each
+    /// token row here and the caller's ordinary pooling and normalisation produce the final vector. This keeps
+    /// every <see cref="IEmbeddingModel"/> consumer (CLI, server, batcher, bench) unchanged. In place on the final
+    /// hidden state, in row chunks so the 3072-wide intermediate stays small. No-op when the GGUF has no dense tensors.
+    /// </summary>
+    private void ApplyEmbeddingDenseHeads(int seqLen)
+    {
+        var heads = _weights.EmbeddingDense;
+        if (heads is null) return;
+
+        const int ChunkRows = 128;
+        int hiddenSize = Config.HiddenSize;
+        float* hidden = (float*)_state.HiddenState;
+        float* mid = (float*)NativeMemory.AlignedAlloc((nuint)((long)ChunkRows * heads.Out2 * sizeof(float)), 64);
+        try
+        {
+            for (int row = 0; row < seqLen; row += ChunkRows)
+            {
+                int n = Math.Min(ChunkRows, seqLen - row);
+                float* chunk = hidden + (long)row * hiddenSize;
+                Gemm(heads.Ptr2, heads.Qt2, chunk, mid, heads.Out2, heads.In2, n, null);
+                Gemm(heads.Ptr3, heads.Qt3, mid, chunk, heads.Out3, heads.In3, n, null);
+            }
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(mid);
+        }
     }
 
     /// <inheritdoc/>
@@ -949,6 +993,11 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         // A distinct per-layer head dim (Gemma 4 global_head_dim) is supported on
         // the cacheless path only — reject a KV-cache up front with a clear message.
         GuardKvCacheHeadDim(kvCache);
+
+        if (Config.BidirectionalAttention && _currentMaskSpec.Mode != AttentionMaskMode.SymmetricWindow)
+            throw new NotSupportedException(
+                $"{Config.Architecture} is a bidirectional embedding tower: use IEmbeddingModel.ForwardHidden "
+                + "(a causal Forward would silently produce wrong hidden states).");
 
         int maxSeq = Config.MaxSequenceLength;
         for (int i = 0; i < positions.Length; i++)

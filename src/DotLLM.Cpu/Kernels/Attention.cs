@@ -200,8 +200,8 @@ public static class Attention
             var outRow = output.Slice(i * qStride + headIdx * headDim, headDim);
             outRow.Clear();
 
-            int visibleEnd = VisibleEnd(maskMode, qPos, prefixLen, seqKv);
-            int visibleStart = VisibleStart(qPos, slidingWindowSize);
+            int visibleEnd = VisibleEnd(maskMode, qPos, prefixLen, seqKv, slidingWindowSize);
+            int visibleStart = VisibleStart(qPos, slidingWindowSize, maskMode);
             if (visibleStart >= visibleEnd)
                 continue;
 
@@ -675,7 +675,7 @@ public static class Attention
             for (int i = 0; i < seqQ; i++)
             {
                 int qPos = positionOffset + i;
-                int upperExclusive = VisibleEnd(maskMode, qPos, prefixLen, seqKv);
+                int upperExclusive = VisibleEnd(maskMode, qPos, prefixLen, seqKv, slidingWindowSize ?? 0);
                 for (int j = upperExclusive; j < seqKv; j++)
                     scores[i * seqKv + j] = float.NegativeInfinity;
             }
@@ -686,7 +686,7 @@ public static class Attention
                 int window = slidingWindowSize.Value;
                 for (int i = 0; i < seqQ; i++)
                 {
-                    int earliestVisible = positionOffset + i - window + 1;
+                    int earliestVisible = VisibleStart(positionOffset + i, window, maskMode);
                     for (int j = 0; j < seqKv && j < earliestVisible; j++)
                     {
                         scores[i * seqKv + j] = float.NegativeInfinity;
@@ -872,6 +872,20 @@ public static class Attention
                 ApplySlidingWindowMask(scores, seqQ, seqKv, positionOffset, slidingWindowSize);
                 return;
 
+            case AttentionMaskMode.SymmetricWindow:
+                if (slidingWindowSize is int sw && sw > 0)
+                {
+                    int half = sw / 2;
+                    for (int i = 0; i < seqQ; i++)
+                    {
+                        int qPos = positionOffset + i;
+                        for (int j = 0; j < seqKv; j++)
+                            if (j < qPos - half || j > qPos + half)
+                                scores[i * seqKv + j] = float.NegativeInfinity;
+                    }
+                }
+                return;
+
             case AttentionMaskMode.Hybrid:
                 // Causal prefix; bidirectional canvas. A prefix query (qPos < prefixLen) masks
                 // future keys exactly like the causal path; a canvas query (qPos >= prefixLen)
@@ -896,12 +910,15 @@ public static class Attention
     /// queries, <c>seqKv</c> for canvas queries.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int VisibleEnd(AttentionMaskMode mode, int qPos, int prefixLen, int seqKv)
+    private static int VisibleEnd(AttentionMaskMode mode, int qPos, int prefixLen, int seqKv, int slidingWindowSize = 0)
     {
         switch (mode)
         {
             case AttentionMaskMode.Bidirectional:
                 return seqKv;
+            case AttentionMaskMode.SymmetricWindow:
+                // Windowed layer: keys up to qPos + window/2 (inclusive); no window: fully bidirectional.
+                return slidingWindowSize > 0 ? Math.Min(seqKv, qPos + slidingWindowSize / 2 + 1) : seqKv;
             case AttentionMaskMode.Hybrid:
                 return qPos < prefixLen ? Math.Min(seqKv, qPos + 1) : seqKv;
             default: // Causal
@@ -914,8 +931,10 @@ public static class Attention
     /// with one it is <c>max(0, qPos - window + 1)</c>. Independent of <c>seqKv</c> by construction.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int VisibleStart(int qPos, int slidingWindowSize)
-        => slidingWindowSize > 0 ? Math.Max(0, qPos - slidingWindowSize + 1) : 0;
+    private static int VisibleStart(int qPos, int slidingWindowSize, AttentionMaskMode mode = AttentionMaskMode.Causal)
+        => slidingWindowSize <= 0 ? 0
+         : mode == AttentionMaskMode.SymmetricWindow ? Math.Max(0, qPos - slidingWindowSize / 2)
+         : Math.Max(0, qPos - slidingWindowSize + 1);
 
     /// <summary>
     /// Computes weighted sum: <c>output_h[i,:] = sum_j(weights[i,j] * V_kvH[j,:])</c>.
