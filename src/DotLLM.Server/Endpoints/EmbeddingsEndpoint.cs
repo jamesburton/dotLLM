@@ -133,8 +133,20 @@ public static class EmbeddingsEndpoint
             }
         }
 
+        var pooling = EmbeddingPooler.Resolve(requestedPooling, preGateModel.DeclaredPoolingType);
+        if (pooling is PoolingType.None or PoolingType.Rank)
+        {
+            return EmbedResult.Fail(400, $"The loaded checkpoint declares pooling type '{pooling}', which this endpoint cannot represent. "
+                + "Pass \"pooling\": \"last\" (or \"mean\"/\"cls\") explicitly.");
+        }
+
         var tokenizer = state.Tokenizer;
-        var parsed = EmbeddingInputParser.Parse(request.Input, tokenizer.Encode, state.Config.VocabSize);
+        // #1398: decoder embedders pooled on the last token need the EOS appended to text inputs.
+        var parsed = EmbeddingInputParser.Parse(
+            request.Input,
+            text => EmbeddingPooler.AppendEos(
+                tokenizer.Encode(text).ToArray(), preGateModel.DeclaredPoolingType, preGateModel.AppendsEosForLastPooling, tokenizer.EosTokenId, request.AddEos),
+            state.Config.VocabSize);
         if (!parsed.Ok)
         {
             return EmbedResult.Fail(400, parsed.Error!);
@@ -148,13 +160,6 @@ public static class EmbeddingsEndpoint
             {
                 return EmbedResult.Fail(400, $"'input[{i}]' is {sequences[i].Length} tokens, which exceeds the model's context length of {maxSeq}.");
             }
-        }
-
-        var pooling = EmbeddingPooler.Resolve(requestedPooling, preGateModel.DeclaredPoolingType);
-        if (pooling is PoolingType.None or PoolingType.Rank)
-        {
-            return EmbedResult.Fail(400, $"The loaded checkpoint declares pooling type '{pooling}', which this endpoint cannot represent. "
-                + "Pass \"pooling\": \"last\" (or \"mean\"/\"cls\") explicitly.");
         }
 
         bool normalize = request.Normalize ?? true;

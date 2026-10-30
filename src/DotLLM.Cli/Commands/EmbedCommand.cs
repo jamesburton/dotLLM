@@ -34,6 +34,10 @@ internal sealed class EmbedCommand : Command<EmbedCommand.Settings>
         [Description("Pooling override: last, mean or cls. Default: the model's declared pooling.")]
         public string? Pooling { get; set; }
 
+        [CommandOption("--add-eos")]
+        [Description("Force (true) or suppress (false) appending the EOS token. Default: appended for last-token pooling on decoder embedders (Qwen3-Embedding).")]
+        public bool? AddEos { get; set; }
+
         [CommandOption("--dimensions")]
         [Description("Truncate to the leading N components (Matryoshka), then renormalise.")]
         public int? Dimensions { get; set; }
@@ -90,7 +94,7 @@ internal sealed class EmbedCommand : Command<EmbedCommand.Settings>
 
             foreach (string text in inputs)
             {
-                int[] tokens = tokenizer.Encode(text).ToArray();
+                int[] tokens = EmbeddingPooler.AppendEos(tokenizer.Encode(text).ToArray(), emb.DeclaredPoolingType, emb.AppendsEosForLastPooling, tokenizer.EosTokenId, s.AddEos);
                 if (tokens.Length == 0 || tokens.Length > config.MaxSequenceLength)
                 {
                     Console.Error.WriteLine($"Input has {tokens.Length} tokens (valid: 1..{config.MaxSequenceLength}).");

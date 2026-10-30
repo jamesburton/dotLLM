@@ -66,4 +66,11 @@ public interface IEmbeddingModel
     /// or <c>null</c> when the checkpoint does not declare one.
     /// </summary>
     PoolingType? DeclaredPoolingType => null;
+
+    /// <summary>
+    /// Whether text inputs need the tokenizer's EOS token appended before <see cref="PoolingType.Last"/>
+    /// pooling (decoder embedders such as Qwen3-Embedding, #1398). <c>false</c> for encoders, whose
+    /// tokenizer already frames the sequence (<c>[CLS] ... [SEP]</c>).
+    /// </summary>
+    bool AppendsEosForLastPooling => true;
 }
