@@ -145,9 +145,18 @@ public sealed class EntropyBoundSampler : IDiffusionUnmaskSampler
             positions[i] = positionsByRow[row];
             // Default: deterministic argmax (reproducible, == temperature → 0). When a pipeline is
             // supplied, reuse it for stochastic token sampling.
-            tokens[i] = _tokenSampler is null
-                ? TensorPrimitives.IndexOfMax((ReadOnlySpan<float>)logitBuf)
-                : _tokenSampler.Sample(logitBuf, []);
+            if (_tokenSampler is null)
+                tokens[i] = TensorPrimitives.IndexOfMax((ReadOnlySpan<float>)logitBuf);
+            else if (_tokenSampler.UsesGumbel)
+            {
+                // Position-seeded Gumbel-max (#1358) keys its noise on the generation index. Sample(buf, []) would use
+                // history.Count = 0 for EVERY committed position (identical noise vector at all of them, and again in
+                // every canvas), so draw at the token's real sequence index instead (#1433).
+                _tokenSampler.PrepareDistribution(logitBuf, []);
+                tokens[i] = _tokenSampler.SamplePrepared(logitBuf, context.TokenIndexBase + positions[i]);
+            }
+            else
+                tokens[i] = _tokenSampler.Sample(logitBuf, []);
         }
 
         return new UnmaskDecision
