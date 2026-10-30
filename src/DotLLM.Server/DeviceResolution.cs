@@ -130,6 +130,12 @@ public static class DeviceModelLoader
         if (spec.Kind == DeviceKind.Auto)
             throw new ArgumentException("LoadExact needs a concrete device, not 'auto'.", nameof(canonicalDevice));
 
+        // Bidirectional embedding towers (EmbeddingGemma) have no GPU implementation: the CUDA/Vulkan decoders are causal and
+        // would return wrong vectors without any error. Fail loudly (auto falls through to the CPU with a warning).
+        if (config.BidirectionalAttention && spec.Kind != DeviceKind.Cpu)
+            throw new NotSupportedException(
+                $"{config.Architecture} is a bidirectional embedding model and runs on the CPU only (requested '{canonicalDevice}'); use --device cpu.");
+
         if (spec.Kind == DeviceKind.Vulkan)
         {
             if (requestedGpuLayers is > 0)

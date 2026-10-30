@@ -22,7 +22,7 @@ Quote ranges, not points: the box is shared, so treat differences under ~15 % as
 | mxbai-embed-large-v1 | bert | 335M | 1024 | cls | 512 | yes | F16, Q8_0 |
 | Qwen3-Embedding-0.6B | qwen3 (decoder) | 600M | 1024 | last | 32768 | yes (EOS appended automatically since #1398) | F16 |
 | multilingual-e5-small (XLM-R) | bert | 118M | 384 | mean | 512 | **no**: `BERT GGUF vocabulary is missing [CLS]/[SEP]/[UNK]` | - |
-| EmbeddingGemma-300M | gemma-embedding | 300M | 768 | mean | 2048 | **no**: `Unsupported GGUF architecture: 'gemma-embedding'` | - |
+| EmbeddingGemma-300M | gemma-embedding (bidirectional Gemma3 + dense heads) | 300M | 768 | mean | 2048 | yes (#1399), CPU only | Q8_0 (ggml-org), F32 / F16 / BF16 (heads added) |
 | nomic-embed-text-v2-moe | nomic-bert-moe | 475M | 768 | mean | 512 | **no**: `Unsupported GGUF architecture: 'nomic-bert-moe'` | - |
 
 Not attempted (same code path as a row above, or outside the 20-600M download rule): bge-large / e5-large / gte-large
@@ -61,6 +61,17 @@ Reading: every F16 BERT-class model passes the 0.9999 gate against **both** refe
 Q8_0 costs 1e-4 to 1.4e-3 of cosine (worst case is the one-character text); Q4_K_M nomic is visibly degraded (0.93 mean vs
 its own F16) and is not recommended for RAG. Qwen3-Embedding was wrong by default until #1398: the declared-last-pooling decoder embedder now gets the tokenizer EOS appended (llama.cpp b9016 does the same regardless of the `--pooling` override: prompt_tokens 3 for a 2-token text with last or mean; it does not for SmolLM2, which declares no pooling). Override: `--add-eos true|false` on `dotllm embed`, `add_eos` in `/v1/embeddings`. Guard: `Qwen3EmbeddingEosParityTests` against `Fixtures/Embeddings/st-qwen3-embedding-0.6b.json`.
 A retrieval-recall set (BEIR slice) is still missing; the cosine+NN-1 gate is what guards speed work for now.
+
+**EmbeddingGemma-300M (#1399, `gemma-embedding`)**, 103 texts (48 English `docs/*.md` chunks, up to 752 tokens, plus 55 multilingual; alternating model-card prompts `task: search result | query: ` / `title: none | text: `), CPU, reference = sentence-transformers fp32 (Transformer, mean Pooling, Dense 768-3072, Dense 3072-768, Normalize; `unsloth/embeddinggemma-300m` mirrors the gated `google/embeddinggemma-300m`). Token ids identical to the reference on 103/103 texts (`<bos> ... <eos>`; the SPM `add_space_prefix=false` GGUF keys are honoured).
+
+| GGUF | vs ST fp32 (min / mean) | vs llama.cpp b9016 CPU, same file (min / mean) |
+|---|---|---|
+| F32 with dense heads (`unsloth` F32 + heads from the ST modules) | 1.0000000 / 1.00000000, NN-1 1.00 | 0.999999 / 1.000000 |
+| F32 without heads (`unsloth`) vs ST modules 0-1 only | 1.0000000 / 1.00000000, NN-1 1.00 | - |
+| Q8_0 with heads (`ggml-org`) | 0.998849 / 0.999713 (llama.cpp itself: 0.998812 / 0.999609) | 0.999091 / 0.999712 |
+
+How it works: the Gemma 3 tower (QK-norm, four RMSNorms, GeGLU, dual RoPE, 5:1 local/global) with **bidirectional** attention. Sliding-window layers (window 512) use a **symmetric** window, keys `q-256 .. q+256` (llama.cpp `LLAMA_SWA_TYPE_SYMMETRIC`; HF folds this into `sliding_window // 2 + 1`), new `AttentionMaskMode.SymmetricWindow`. The window only matters past 257 tokens: with it ignored the nine >257-token texts drop to 0.9886 (mutant run), with it they are 1.0000000. The heads are applied after pooling in llama.cpp and sentence-transformers; both are linear and mean/CLS/last pooling are linear row combinations, so dotLLM applies them per token row inside `ForwardHidden` (`dense_3(dense_2(h))`, Q8 weights read in place, 128-row chunks) and every existing consumer (CLI, server, batcher, bench) keeps pooling + normalising unchanged. Cost: two small GEMMs, 2 x 768 x 3072 MACs per token, a few percent of the 24-layer tower.
+Gotchas: (1) many community GGUFs (`unsloth`, `second-state`) were converted **without** `--sentence-transformers-dense-modules` and carry no `dense_2/dense_3`; llama.cpp and dotLLM then return the raw pooled vector, which is not the model's output space (cosine about 0 against the published embeddings). Use `ggml-org/embeddinggemma-300M-GGUF`, or add the heads. (2) the tokenizer frames `<bos> text <eos>` (the factory sets `AddEosToken` for this architecture only). (3) CPU only: `--device vulkan|gpu` fails loudly, `auto` falls back to the CPU; a causal `Forward` on the model throws instead of silently returning wrong hidden states. (4) prompts are the caller's job (`task: search result | query: ` for queries, `title: none | text: ` for documents; others in the model card's `config_sentence_transformers.json`).
 
 ## 3. Throughput and latency on CPU (32 threads)
 
@@ -312,7 +323,7 @@ the same harness, the cosine gate, and a discriminating shape.
 6. (#1406, DONE) **Vulkan hidden-state path for decoder embedders** (Qwen3-Embedding-0.6B: 2.2x/5.6x/8x over the current CPU at 64/256/512 tokens, 29 docs/s at 64 tok),
    then the **GPU BERT encoder (#741)** reusing the coopmat prefill tiles (110M-class encoders are ~5x fewer FLOPs than the 0.6B
    decoder, so expect well above 5k tok/s; unmeasured).
-7. **Correctness/coverage** (#1398 EOS: FIXED; #1399 gemma-embedding, #1400 nomic-bert-moe, #1401 XLM-R tokenizer): Qwen3-Embedding needs `<|endoftext|>` appended before last-token pooling (llama.cpp does it; dotLLM
+7. **Correctness/coverage** (#1398 EOS: FIXED; #1399 gemma-embedding: FIXED; #1400 nomic-bert-moe, #1401 XLM-R tokenizer): Qwen3-Embedding needs `<|endoftext|>` appended before last-token pooling (llama.cpp does it; dotLLM
    mean cosine 0.80); add `gemma-embedding`, `nomic-bert-moe`, and XLM-R (SentencePiece) tokenisation for multilingual-e5/bge-m3.
 8. Small/free: (#1407) p99 spikes on cold single-document F16 calls (876 ms at 16 tokens), content-hash doc cache at the server,
    int8/binary output formats, Matryoshka truncation is already supported (`--dimensions`), NPU background embedder (#1321, no measurement yet).
