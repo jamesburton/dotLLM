@@ -2,16 +2,16 @@
 
 ## Purpose
 
-The KV-cache stores previously computed key and value vectors for all layers, avoiding O(n²) recomputation during autoregressive generation. At each decode step, only the new token's K/V are computed and appended.
+The KV-cache stores previously computed key and value vectors for all layers, so each decode step computes and appends K/V only for the new token. Attention still reads the cached history: a decode step takes work proportional to the context length, and processing a full causal sequence has quadratic attention work in its length.
 
 ## Memory Consumption
 
 Llama 3 8B, FP16, 2048 tokens:
 ```
 2 (K+V) × 32 layers × 8 KV heads × 128 head_dim × 2048 tokens × 2 bytes
-= ~1 GB
+= 268,435,456 bytes = 256 MiB
 ```
-Scales linearly with sequence length and batch size. Dominant memory consumer in production.
+For uniform full-attention layers, this scales linearly with sequence length and batch size. Per-layer KV widths and sliding windows change the total. The CPU `SimpleKvCache` stores separate K and V FP32 buffers per layer in position-major rows `[capacity, kvStride]`, where `kvStride = numKvHeads × headDim` for that layer; windowed layers retain only their configured recent rows. Other cache implementations can use different layouts and precision.
 
 ### Quantized KV-Cache Memory
 
