@@ -52,6 +52,11 @@ internal static class Program
         BertEncoderModel.UseLegacyGelu = opt.GetValueOrDefault("legacy-gelu", "0") == "1";   // #1403 A/B arm
         BertEncoderModel.UseLegacyAttention = opt.GetValueOrDefault("legacy-attn", "0") == "1";   // #1402 A/B arm
         var (model, gguf, config) = ModelLoader.LoadFromGguf(path, new ThreadingConfig(threads, threads));
+        if (opt.GetValueOrDefault("device", "cpu") == "vulkan")   // #1406: decoder embedders on the iGPU/GPU (keeps the CPU load only for gguf/config)
+        {
+            model.Dispose();
+            model = DotLLM.Vulkan.VulkanModelLoader.CreateSharedFromGguf(gguf, config).Model;
+        }
         using (gguf) using (model)
         {
             if (model is not IEmbeddingModel emb) { Console.Error.WriteLine($"{config.Architecture} has no IEmbeddingModel"); return 2; }
@@ -147,9 +152,9 @@ internal static class Program
 
     private static unsafe void EmbedOne(IEmbeddingModel emb, int[] ids, int hidden, PoolingType pooling, float[] vec, int[] posBuf)
     {
-        for (int i = 0; i < ids.Length; i++) posBuf[i] = i;
-        using var h = emb.ForwardHidden(ids, posBuf.AsSpan(0, ids.Length), 0);
-        EmbeddingPooler.Pool(new ReadOnlySpan<float>((void*)h.DataPointer, ids.Length * hidden), ids.Length, hidden, pooling, vec);
+        // #1406: only the rows pooling reads come back (one row on a GPU backend for last/cls pooling).
+        var v = vec;
+        emb.ForwardHiddenForPooling([ids], pooling, (_, rows) => EmbeddingPooler.Pool(rows, rows.Length / hidden, hidden, pooling, v), 0);
         EmbeddingPooler.L2Normalize(vec);
     }
 

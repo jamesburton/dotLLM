@@ -153,11 +153,26 @@ internal sealed class EmbeddingBatcher(ServerState state)
 
         try
         {
-            model.ForwardHiddenBatch(all, (idx, hidden) =>
+            // Jobs in one batch can pool differently, so deliver the union: all rows unless every job reads a single row.
+            // (#1406) A GPU backend then reads back one row per sequence for last/cls pooling instead of the full matrix.
+            var pooling = live[0].Pooling;
+            bool uniform = live.All(j => j.Pooling == pooling);
+            if (uniform)
             {
-                var (job, local) = owner[idx];
-                job.Vectors[local] = Finish(job, hidden, all[idx].Length);
-            }, deviceId: 0);
+                model.ForwardHiddenForPooling(all, pooling, (idx, hidden) =>
+                {
+                    var (job, local) = owner[idx];
+                    job.Vectors[local] = Finish(job, hidden, hidden.Length / job.HiddenSize);
+                }, deviceId: 0);
+            }
+            else
+            {
+                model.ForwardHiddenBatch(all, (idx, hidden) =>
+                {
+                    var (job, local) = owner[idx];
+                    job.Vectors[local] = Finish(job, hidden, all[idx].Length);
+                }, deviceId: 0);
+            }
             foreach (var j in live) j.Done.TrySetResult();
         }
         catch (Exception) when (live.Count > 1)
@@ -168,7 +183,7 @@ internal sealed class EmbeddingBatcher(ServerState state)
                 try
                 {
                     var seqs = j.Sequences;
-                    model.ForwardHiddenBatch(seqs, (idx, hidden) => j.Vectors[idx] = Finish(j, hidden, seqs[idx].Length), deviceId: 0);
+                    model.ForwardHiddenForPooling(seqs, j.Pooling, (idx, hidden) => j.Vectors[idx] = Finish(j, hidden, hidden.Length / j.HiddenSize), deviceId: 0);
                     j.Done.TrySetResult();
                 }
                 catch (Exception ex) { j.Done.TrySetException(ex); }

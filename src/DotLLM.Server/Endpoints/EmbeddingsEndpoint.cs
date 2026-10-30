@@ -89,8 +89,8 @@ public static class EmbeddingsEndpoint
         if (state.Model is not IEmbeddingModel preGateModel)
         {
             return EmbedResult.Fail(501, $"The loaded model ({state.Model.GetType().Name}) does not support embedding extraction. "
-                + "POST /v1/embeddings is implemented for the CPU backend only; run the server without "
-                + "a GPU backend to use it.");
+                + "POST /v1/embeddings is implemented for the CPU backend and, for decoder embedders (Qwen3-Embedding), Vulkan (#1406); "
+                + "run the server with --device cpu or --device vulkan to use it.");
         }
 
         string admittedModelId = state.Options.ModelId;
