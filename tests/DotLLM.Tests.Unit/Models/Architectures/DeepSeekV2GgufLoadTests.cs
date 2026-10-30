@@ -6,6 +6,7 @@ using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Tests.Unit.Models.Gguf;
 using Xunit;
+using DotLLM.Tests.Integration.Fixtures;
 
 namespace DotLLM.Tests.Unit.Models.Architectures;
 
@@ -18,6 +19,7 @@ namespace DotLLM.Tests.Unit.Models.Architectures;
 /// finite logits. The decisive evidence that the GGUF MLA + MoE loader chain
 /// actually works end-to-end without needing a 10 GB downloaded checkpoint.
 /// </summary>
+[Collection(DotLLM.Tests.Unit.Cuda.CudaCollection.Name)]
 public sealed class DeepSeekV2GgufLoadTests
 {
     // Tiny shapes that exercise both monolithic-Q (V2-Lite) and the
@@ -209,10 +211,7 @@ public sealed class DeepSeekV2GgufLoadTests
     [SkippableFact]
     public void RealGguf_ConfigExtractor_ParsesDeepSeekV2Lite()
     {
-        string path = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "bartowski", "DeepSeek-Coder-V2-Lite-Instruct-GGUF",
-            "DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf");
+        string path = RealGgufPath("Q4_K_M");
         Skip.If(!File.Exists(path), $"Real DeepSeek-V2-Lite GGUF not cached at {path}");
 
         using var gguf = GgufFile.Open(path);
@@ -274,10 +273,7 @@ public sealed class DeepSeekV2GgufLoadTests
     public void RealGguf_QuantizedMla_Layer0Smoke()
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
-        string path = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "bartowski", "DeepSeek-Coder-V2-Lite-Instruct-GGUF",
-            "DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf");
+        string path = RealGgufPath("Q4_K_M");
         Skip.If(!File.Exists(path), $"Real DeepSeek-V2-Lite GGUF not cached at {path}");
 
         using var gguf = GgufFile.Open(path);
@@ -324,10 +320,7 @@ public sealed class DeepSeekV2GgufLoadTests
     public void RealGguf_QuantizedMlaMoe_TwoLayerSmoke()
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
-        string path = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "bartowski", "DeepSeek-Coder-V2-Lite-Instruct-GGUF",
-            "DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf");
+        string path = RealGgufPath("Q4_K_M");
         Skip.If(!File.Exists(path), $"Real DeepSeek-V2-Lite GGUF not cached at {path}");
 
         using var gguf = GgufFile.Open(path);
@@ -373,10 +366,7 @@ public sealed class DeepSeekV2GgufLoadTests
     public void RealGguf_QuantizedMlaMoe_NLayerSmoke(int numLayers)
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
-        string path = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "bartowski", "DeepSeek-Coder-V2-Lite-Instruct-GGUF",
-            "DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf");
+        string path = RealGgufPath("Q4_K_M");
         Skip.If(!File.Exists(path), $"Real DeepSeek-V2-Lite GGUF not cached at {path}");
 
         using var gguf = GgufFile.Open(path);
@@ -418,10 +408,7 @@ public sealed class DeepSeekV2GgufLoadTests
     public void RealGguf_Q3KM_FullModel_27LayerSmoke()
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
-        string path = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "bartowski", "DeepSeek-Coder-V2-Lite-Instruct-GGUF",
-            "DeepSeek-Coder-V2-Lite-Instruct-Q3_K_M.gguf");
+        string path = RealGgufPath("Q3_K_M");
         Skip.If(!File.Exists(path), $"Q3_K_M GGUF not cached at {path}");
 
         // Q3_K_M GGUFs use the GGUF quant type 11 (Q3_K) for token_embd.weight
@@ -451,7 +438,7 @@ public sealed class DeepSeekV2GgufLoadTests
         // headroom). Real production sizes to actual prompt+decode budget.
         var config = fullConfig with { MaxSequenceLength = 16 };
 
-        using var model = CudaTransformerModel.LoadFromGguf(gguf, config);
+        using var model = LoadCudaAllowingQuantExpansion(gguf, config);
 
         // Prefill on 4 tokens. MLA dispatch uses the model's internal
         // _mlaKvCache; the kvCache parameter is ignored on the MLA path.
@@ -488,10 +475,7 @@ public sealed class DeepSeekV2GgufLoadTests
     public void RealGguf_Q2K_FullModel_27LayerSmoke()
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
-        string path = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "bartowski", "DeepSeek-Coder-V2-Lite-Instruct-GGUF",
-            "DeepSeek-Coder-V2-Lite-Instruct-Q2_K.gguf");
+        string path = RealGgufPath("Q2_K");
         Skip.If(!File.Exists(path), $"Q2_K GGUF not cached at {path}");
 
         // Catches Q2_K loader gaps the same way the Q3_K_M smoke caught Q3_K
@@ -516,7 +500,7 @@ public sealed class DeepSeekV2GgufLoadTests
         // OOM the 12 GB cap before any inference.
         var config = fullConfig with { MaxSequenceLength = 16 };
 
-        using var model = CudaTransformerModel.LoadFromGguf(gguf, config);
+        using var model = LoadCudaAllowingQuantExpansion(gguf, config);
 
         // Prefill on 4 tokens. MLA dispatch uses the model's internal
         // _mlaKvCache; the kvCache parameter is ignored on the MLA path.
@@ -538,6 +522,32 @@ public sealed class DeepSeekV2GgufLoadTests
                 deviceId: 0, kvCache: null);
             AssertAllFinite(step, $"Q2_K decode step {i}");
             curTok = ArgmaxLogits(step);
+        }
+    }
+
+    /// <summary>
+    /// Loads on CUDA with <see cref="CudaKernels.AllowQuantExpansion"/> opted in for the load
+    /// only. The Q3_K_M and Q2_K mixtures carry Q3_K tensors (Q3_K_M's token_embd among them),
+    /// which CUDA has no native kernel for, so they take the load-time dequant-and-expand
+    /// fallback that <see cref="CudaKernels.EnsureQuantExpansionAllowed"/> refuses by default.
+    /// These smokes predate that guard and are about whether the full model loads and decodes
+    /// within 12 GB, so they opt in. The flag is read from the env var once at type init, so the
+    /// static is the lever; it is process-global, which is why this class is in the
+    /// non-parallel CUDA collection (the flag must not flip under
+    /// <c>CudaQuantExpansionGateTests</c>, which asserts the default).
+    /// </summary>
+    private static CudaTransformerModel LoadCudaAllowingQuantExpansion(
+        GgufFile gguf, DotLLM.Core.Models.ModelConfig config)
+    {
+        bool prevAllowExpansion = CudaKernels.AllowQuantExpansion;
+        CudaKernels.AllowQuantExpansion = true;
+        try
+        {
+            return CudaTransformerModel.LoadFromGguf(gguf, config);
+        }
+        finally
+        {
+            CudaKernels.AllowQuantExpansion = prevAllowExpansion;
         }
     }
 
@@ -745,4 +755,7 @@ public sealed class DeepSeekV2GgufLoadTests
         // GGUF tensor type IDs: F32=0, F16=1, ...
         b.AddTensor(name, shape, quantType: 0, bytes);
     }
+
+    private static string RealGgufPath(string quant) =>
+        TestFixtureResolver.ResolveFile([], "bartowski", "DeepSeek-Coder-V2-Lite-Instruct-GGUF", [$"DeepSeek-Coder-V2-Lite-Instruct-{quant}.gguf"], null).Path ?? string.Empty;
 }

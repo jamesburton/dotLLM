@@ -45,11 +45,13 @@ public sealed class MoeIndexedMatmulQ5_1F32Kernel : IDisposable
     private readonly ComputePipeline _pipeline;
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
+    private readonly int _blockBytes;
     private bool _disposed;
 
     private MoeIndexedMatmulQ5_1F32Kernel(
-        VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
+        VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, int blockBytes)
     {
+        _blockBytes = blockBytes;
         _device = device;
         _module = module;
         _pipeline = pipeline;
@@ -58,9 +60,13 @@ public sealed class MoeIndexedMatmulQ5_1F32Kernel : IDisposable
     }
 
     /// <summary>Loads <c>moe_indexed_matmul_q5_1_f32.spv</c> from <paramref name="spvDir"/>.</summary>
-    public static MoeIndexedMatmulQ5_1F32Kernel Create(VulkanDevice device, string spvDir)
+    /// <param name="device">Target device.</param>
+    /// <param name="spvDir">Directory holding the compiled shaders.</param>
+    /// <param name="q5_0">Read a PACKED Q5_0 bank (22-byte blocks, #1225) instead of Q5_1.</param>
+    /// <returns>The kernel.</returns>
+    public static MoeIndexedMatmulQ5_1F32Kernel Create(VulkanDevice device, string spvDir, bool q5_0 = false)
     {
-        string path = Path.Combine(spvDir, "moe_indexed_matmul_q5_1_f32.spv");
+        string path = Path.Combine(spvDir, q5_0 ? "moe_indexed_matmul_q5_0_f32.spv" : "moe_indexed_matmul_q5_1_f32.spv");
         if (!File.Exists(path))
             throw new FileNotFoundException(
                 $"Vulkan SPIR-V not found: {path}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");
@@ -84,7 +90,7 @@ public sealed class MoeIndexedMatmulQ5_1F32Kernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)BuffersPerSet);
-        return new MoeIndexedMatmulQ5_1F32Kernel(device, module, pipeline, pool);
+        return new MoeIndexedMatmulQ5_1F32Kernel(device, module, pipeline, pool, q5_0 ? QuantFormat.Q5_0BlockBytes : Q5_1BlockBytes);
     }
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
@@ -129,7 +135,7 @@ public sealed class MoeIndexedMatmulQ5_1F32Kernel : IDisposable
             throw new ArgumentException($"k must be a multiple of {Q5_1GroupSize}, got {k}", nameof(k));
 
         int blocksPerRow = k / Q5_1GroupSize;
-        long rowBytes = (long)blocksPerRow * Q5_1BlockBytes;
+        long rowBytes = (long)blocksPerRow * _blockBytes;
         long bankBytes = (long)numExperts * m * rowBytes;
         long xBytes = (long)n * k * sizeof(float);
         long idxBytes = (long)n * sizeof(int);

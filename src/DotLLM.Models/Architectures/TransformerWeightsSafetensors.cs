@@ -39,10 +39,26 @@ internal static class TransformerWeightsSafetensorsLoader
     /// <paramref name="config"/>. Throws on missing required tensors.
     /// </summary>
     public static TransformerWeights Load(
-        ISafetensorsTensorSource file, ModelConfig config, BitNetI2SCacheContext? i2sCache = null)
+        ISafetensorsTensorSource file, ModelConfig config, BitNetI2SCacheContext? i2sCache = null,
+        bool allowFactorized = false)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(config);
+
+        // LittleBit factorized checkpoints (#864) are a CPU-only weight kind for dense Qwen3. Every other consumer of
+        // this loader (Vulkan, CUDA, HIP, tools) must fail loudly instead of falling through to "missing tensor".
+        if (FactorizedWeights.IsFactorized(file))
+        {
+            if (!allowFactorized)
+                throw new NotSupportedException(
+                    "This checkpoint stores LittleBit factorized linears (U_packed/V_packed/u1/u2/v1/v2). "
+                    + "They are supported on the CPU backend only (use --device cpu); Vulkan, CUDA and HIP cannot run them.");
+            if (config.Architecture != DotLLM.Core.Configuration.Architecture.Qwen || config.Moe is not null)
+                throw new NotSupportedException(
+                    $"LittleBit factorized linears are only supported for dense Qwen3, got Architecture.{config.Architecture}.");
+            if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+                throw new PlatformNotSupportedException("LittleBit factorized linears require AVX2.");
+        }
 
         var owned = new List<nint>();
         try
@@ -163,7 +179,7 @@ internal static class TransformerWeightsSafetensorsLoader
         {
             // Roll back any allocations we made before rethrowing.
             foreach (var p in owned)
-                unsafe { NativeMemory.AlignedFree((void*)p); }
+                unsafe { FactorizedWeights.Release(p); NativeMemory.AlignedFree((void*)p); }
             throw;
         }
     }

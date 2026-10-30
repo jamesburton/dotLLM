@@ -109,8 +109,44 @@ public static unsafe partial class MatMul
 
         int blockCount = k / Mxfp4GroupSize;
 
-        for (int t = 0; t < n; t++)
-            ComputeRowsMxfp4Parallel(weights, b + (long)t * k, c + (long)t * m, m, blockCount, pool);
+        // Rows outer, columns inner: each weight row (K/32 * 17 bytes) is streamed from memory ONCE and stays in L1 for all n
+        // columns, instead of being re-read per column. Every (row, column) result is the same ComputeRowsMxfp4 row dot
+        // whatever n is, so a token's result does not depend on how many other tokens share its expert bucket (the
+        // batch-invariance requirement of the grouped MoE path).
+        if (pool is null || m < ParallelMinRows)
+        {
+            ComputeRowsMxfp4Cols(weights, b, c, 0, m, m, k, blockCount, n);
+            return;
+        }
+        var ctx = new ColsCtx { Weights = weights, B = b, C = c, M = m, K = k, BlockCount = blockCount, N = n };
+        pool.Dispatch((nint)(&ctx), &ComputeRowsMxfp4ColsWorker);
+    }
+
+    private struct ColsCtx
+    {
+        public byte* Weights;
+        public float* B;
+        public float* C;
+        public int M, K, BlockCount, N;
+    }
+
+    private static void ComputeRowsMxfp4ColsWorker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        ref var ctx = ref Unsafe.AsRef<ColsCtx>((void*)ctxPtr);
+        PartitionRows(ctx.M, threadIdx, threadCount, out int start, out int count);
+        if (count == 0) return;
+        ComputeRowsMxfp4Cols(ctx.Weights, ctx.B, ctx.C, start, count, ctx.M, ctx.K, ctx.BlockCount, ctx.N);
+    }
+
+    private static void ComputeRowsMxfp4Cols(byte* weights, float* b, float* c, int rowStart, int rowCount, int m, int k, int blockCount, int n)
+    {
+        long rowBytes = (long)blockCount * Mxfp4BlockBytes;
+        for (int row = rowStart; row < rowStart + rowCount; row++)
+        {
+            byte* w = weights + row * rowBytes;
+            for (int t = 0; t < n; t++)
+                ComputeRowsMxfp4(w, b + (long)t * k, c + (long)t * m + row, 1, blockCount);
+        }
     }
 
     private struct ComputeRowsMxfp4Ctx
@@ -168,11 +204,70 @@ public static unsafe partial class MatMul
             for (int row = 0; row < m; row++)
                 result[row] = VecDotMxfp4F32Avx2(weights + row * rowBytes, x, blockCount);
         }
+        else if (Ssse3.IsSupported)
+        {
+            // SSE-only CPUs (e.g. Westmere Xeons, #602): same pshufb unpack, 128-bit float accumulate.
+            for (int row = 0; row < m; row++)
+                result[row] = VecDotMxfp4F32Sse(weights + row * rowBytes, x, blockCount);
+        }
         else
         {
             for (int row = 0; row < m; row++)
                 result[row] = VecDotMxfp4F32Scalar(weights + row * rowBytes, x, blockCount);
         }
+    }
+
+    /// <summary>
+    /// SSSE3 MXFP4 × f32 dot product for CPUs without AVX2 (issue #602). Identical nibble unpack to
+    /// <see cref="VecDotMxfp4F32Avx2"/> (<c>pshufb</c> of the 16-entry kvalue table), widened to float and
+    /// accumulated in 128-bit lanes (no FMA/AVX required). Measured on a Xeon X5670 the scalar fallback
+    /// this replaces decoded at ~4.5 tok/s, ~5x below the neighbouring legacy quants.
+    /// </summary>
+    [SkipLocalsInit]
+    internal static float VecDotMxfp4F32Sse(byte* w, float* x, int blockCount)
+    {
+        Vector128<float> acc0 = Vector128<float>.Zero;
+        Vector128<float> acc1 = Vector128<float>.Zero;
+        Vector128<byte> nibbleMask = Vector128.Create((byte)0x0F);
+        Vector128<sbyte> kvalueTable = Vector128.Create(
+            (sbyte)0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+
+        for (int block = 0; block < blockCount; block++)
+        {
+            byte* wBlock = w + block * Mxfp4BlockBytes;
+            float* xBlock = x + block * Mxfp4GroupSize;
+
+            Vector128<float> vd = Vector128.Create(Dequantize.E8M0ToFloatHalf(wBlock[0]));
+
+            Vector128<byte> qsRaw = Unsafe.ReadUnaligned<Vector128<byte>>(wBlock + 1);
+            Vector128<byte> lo = Sse2.And(qsRaw, nibbleMask);
+            Vector128<byte> hi = Sse2.And(
+                Sse2.ShiftRightLogical(qsRaw.AsUInt16(), 4).AsByte(), nibbleMask);
+            Vector128<sbyte> wLo = Ssse3.Shuffle(kvalueTable, lo.AsSByte());  // elements 0..15
+            Vector128<sbyte> wHi = Ssse3.Shuffle(kvalueTable, hi.AsSByte());  // elements 16..31
+
+            // Per-block partial (scaled once by the E8M0 half-scale) keeps the multiply count down.
+            Vector128<float> blk = Mxfp4MulGroupSse(wLo, xBlock)
+                                 + Mxfp4MulGroupSse(wHi, xBlock + 16);
+            acc0 += blk * vd;
+            (acc0, acc1) = (acc1, acc0);   // alternate accumulators to shorten the add dependency chain
+        }
+
+        return Vector128.Sum(acc0 + acc1);
+    }
+
+    /// <summary>16 sbyte table values × 16 f32 activations → one 4-lane partial sum vector.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector128<float> Mxfp4MulGroupSse(Vector128<sbyte> w16, float* xPtr)
+    {
+        (Vector128<short> shortLo, Vector128<short> shortHi) = Vector128.Widen(w16);
+        (Vector128<int> intA, Vector128<int> intB) = Vector128.Widen(shortLo);
+        (Vector128<int> intC, Vector128<int> intD) = Vector128.Widen(shortHi);
+
+        return Sse2.ConvertToVector128Single(intA) * Sse.LoadVector128(xPtr)
+             + Sse2.ConvertToVector128Single(intB) * Sse.LoadVector128(xPtr + 4)
+             + Sse2.ConvertToVector128Single(intC) * Sse.LoadVector128(xPtr + 8)
+             + Sse2.ConvertToVector128Single(intD) * Sse.LoadVector128(xPtr + 12);
     }
 
     /// <summary>

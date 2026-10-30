@@ -195,6 +195,53 @@ public sealed record MoeConfig
     public bool UngatedReluSquaredExperts { get; init; }
 
     /// <summary>
+    /// Per-layer top-k, indexed by GGUF block index, for checkpoints whose
+    /// <c>{arch}.expert_used_count</c> is a per-layer array (Nemotron 3.5 Bolt, a Puzzle/NAS
+    /// derivative — issue #1037). Entries are 0 on non-MoE layers. When <see langword="null"/>
+    /// every MoE layer uses <see cref="NumExpertsPerTok"/>; when set, <see cref="NumExpertsPerTok"/>
+    /// holds the maximum entry. Read through <see cref="ExpertsPerTokForLayer"/>.
+    /// </summary>
+    public IReadOnlyList<int>? PerLayerNumExpertsPerTok { get; init; }
+
+    /// <summary>
+    /// Per-layer routed-expert intermediate width, indexed by GGUF block index, for checkpoints
+    /// whose <c>{arch}.expert_feed_forward_length</c> is a per-layer array (Nemotron 3.5 Bolt,
+    /// issue #1037). Entries are 0 on non-MoE layers. When <see langword="null"/> every MoE layer
+    /// uses <see cref="MoeIntermediateSize"/>; when set, <see cref="MoeIntermediateSize"/> holds the
+    /// maximum entry. Read through <see cref="IntermediateSizeForLayer"/>.
+    /// </summary>
+    public IReadOnlyList<int>? PerLayerMoeIntermediateSize { get; init; }
+
+    /// <summary>
+    /// LatentMoE bottleneck width (<c>{arch}.moe_latent_size</c>; 1024 on Nemotron 3.5 Bolt,
+    /// issue #1037), or 0 when the routed experts run on the full hidden state. With a latent,
+    /// each MoE layer projects the hidden state down (<c>ffn_latent_down</c>) before the routed
+    /// experts and back up (<c>ffn_latent_up</c>) after their weighted sum; the router and the
+    /// shared expert still read the full hidden state (llama.cpp <c>nemotron-h.cpp</c>
+    /// <c>build_ffn_layer</c>).
+    /// </summary>
+    public int LatentSize { get; init; }
+
+    /// <summary>
+    /// Returns the top-k for layer <paramref name="layerIdx"/>: the per-layer entry when
+    /// <see cref="PerLayerNumExpertsPerTok"/> is set, otherwise <see cref="NumExpertsPerTok"/>.
+    /// </summary>
+    /// <param name="layerIdx">GGUF block index.</param>
+    /// <returns>The number of routed experts selected per token on that layer.</returns>
+    public int ExpertsPerTokForLayer(int layerIdx)
+        => PerLayerNumExpertsPerTok is { } perLayer ? perLayer[layerIdx] : NumExpertsPerTok;
+
+    /// <summary>
+    /// Returns the routed-expert intermediate width for layer <paramref name="layerIdx"/>: the
+    /// per-layer entry when <see cref="PerLayerMoeIntermediateSize"/> is set, otherwise
+    /// <see cref="MoeIntermediateSize"/>.
+    /// </summary>
+    /// <param name="layerIdx">GGUF block index.</param>
+    /// <returns>The routed-expert intermediate width on that layer.</returns>
+    public int IntermediateSizeForLayer(int layerIdx)
+        => PerLayerMoeIntermediateSize is { } perLayer ? perLayer[layerIdx] : MoeIntermediateSize;
+
+    /// <summary>
     /// Returns true if layer <paramref name="layerIdx"/> is a routed-MoE
     /// layer under the current configuration. Checks the
     /// <see cref="MlpOnlyLayers"/> override first (forced dense), then the

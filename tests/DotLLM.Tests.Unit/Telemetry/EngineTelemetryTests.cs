@@ -31,6 +31,7 @@ public sealed class EngineTelemetryTests
     public void MeterListener_CapturesPrefillAndDecodeMetrics()
     {
         var capture = new MetricCapture();
+        using var own = Own();
         using var listener = capture.Listen();
 
         RunGreedy(promptLen: 3, maxTokens: 4);
@@ -46,12 +47,13 @@ public sealed class EngineTelemetryTests
     [Fact]
     public void ActivityListener_CapturesRequestAndPrefillSpans()
     {
-        var spans = new List<Activity>();
+        var spans = new System.Collections.Concurrent.ConcurrentQueue<Activity>();
+        using var own = Own();
         using var listener = new ActivityListener
         {
             ShouldListenTo = src => string.Equals(src.Name, EngineTelemetry.Name, StringComparison.Ordinal),
             Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllData,
-            ActivityStopped = spans.Add,
+            ActivityStopped = a => { if (t_mine) spans.Enqueue(a); },
         };
         ActivitySource.AddActivityListener(listener);
 
@@ -91,12 +93,13 @@ public sealed class EngineTelemetryTests
     public void DecodeStep_SamplesAtOnePercent()
     {
         // With listeners attached, decode_step spans should be emitted at the configured rate.
-        var stepSpans = new List<Activity>();
+        var stepSpans = new System.Collections.Concurrent.ConcurrentQueue<Activity>();
+        using var own = Own();
         using var listener = new ActivityListener
         {
             ShouldListenTo = src => string.Equals(src.Name, EngineTelemetry.Name, StringComparison.Ordinal),
             Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllData,
-            ActivityStopped = a => { if (string.Equals(a.OperationName, EngineActivities.DecodeStep, StringComparison.Ordinal)) stepSpans.Add(a); },
+            ActivityStopped = a => { if (t_mine && string.Equals(a.OperationName, EngineActivities.DecodeStep, StringComparison.Ordinal)) stepSpans.Enqueue(a); },
         };
         ActivitySource.AddActivityListener(listener);
 
@@ -105,6 +108,14 @@ public sealed class EngineTelemetryTests
         RunGreedy(promptLen: 1, maxTokens: 201);
         Assert.InRange(stepSpans.Count, 1, 5);
     }
+
+    // Parallel test classes run their own TextGenerators in this process, and listeners are process-global: only count what this
+    // test thread produced (activities stop and measurements record synchronously on the thread that ran Generate).
+    [ThreadStatic] private static bool t_mine;
+
+    private static IDisposable Own() { t_mine = true; return new Disown(); }
+
+    private sealed class Disown : IDisposable { public void Dispose() => t_mine = false; }
 
     private static void RunGreedy(int promptLen, int maxTokens)
     {
@@ -174,6 +185,7 @@ public sealed class EngineTelemetryTests
             };
             listener.SetMeasurementEventCallback<long>((instrument, value, tags, _) =>
             {
+                if (!t_mine) return;
                 CaptureModelTag(tags);
                 switch (instrument.Name)
                 {
@@ -183,6 +195,7 @@ public sealed class EngineTelemetryTests
             });
             listener.SetMeasurementEventCallback<double>((instrument, value, tags, _) =>
             {
+                if (!t_mine) return;
                 CaptureModelTag(tags);
                 switch (instrument.Name)
                 {

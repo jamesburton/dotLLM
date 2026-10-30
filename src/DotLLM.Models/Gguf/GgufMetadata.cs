@@ -86,11 +86,35 @@ public sealed class GgufMetadata
     /// <summary>Gets a float32 array value.</summary>
     public float[] GetFloat32Array(string key) => GetTyped<float[]>(key, GgufValueType.Array);
 
+    /// <summary>
+    /// Gets a byte blob stored as an 8/32-bit integer array (e.g. <c>tokenizer.ggml.precompiled_charsmap</c>, which
+    /// converters write as uint8, int8 or int32 depending on the gguf-py version); empty when the key is absent.
+    /// </summary>
+    public byte[] GetByteBlobOrEmpty(string key)
+    {
+        if (!_entries.TryGetValue(key, out var entry) || entry.Type != GgufValueType.Array)
+            return [];
+        switch (entry.Value)
+        {
+            case byte[] u8: return u8;
+            case sbyte[] s8: return Array.ConvertAll(s8, static v => unchecked((byte)v));
+            case int[] i32: return Array.ConvertAll(i32, static v => unchecked((byte)v));
+            case uint[] u32: return Array.ConvertAll(u32, static v => unchecked((byte)v));
+            default: throw new InvalidOperationException($"GGUF metadata key '{key}' is not a byte array ({entry.Value.GetType().Name}).");
+        }
+    }
+
     /// <summary>Gets an int32 array value.</summary>
     public int[] GetInt32Array(string key) => GetTyped<int[]>(key, GgufValueType.Array);
 
     /// <summary>Gets a uint32 array value.</summary>
     public uint[] GetUInt32Array(string key) => GetTyped<uint[]>(key, GgufValueType.Array);
+
+    /// <summary>Gets a uint64 array value (exact 64-bit values; no float round-trip).</summary>
+    public ulong[] GetUInt64Array(string key) => GetTyped<ulong[]>(key, GgufValueType.Array);
+
+    /// <summary>Gets an int64 array value.</summary>
+    public long[] GetInt64Array(string key) => GetTyped<long[]>(key, GgufValueType.Array);
 
     private T GetTyped<T>(string key, GgufValueType expectedType)
     {

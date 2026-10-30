@@ -61,6 +61,8 @@ public sealed class CheckpointGuardTests
         {
             File.WriteAllBytes(path, BitConverter.GetBytes(50UL));
 
+            long lengthBeforeWriter = new FileInfo(path).Length;
+
             using var stop = new CancellationTokenSource();
             Task writer = Task.Run(() =>
             {
@@ -82,6 +84,32 @@ public sealed class CheckpointGuardTests
 
             try
             {
+                // Wait for the writer to have ACTUALLY appended before asserting.
+                //
+                // Without this the test races its own writer: the loader fails within
+                // milliseconds, so IsPlausiblyInFlight samples the length, sleeps
+                // InFlightRecheckDelay and samples again — and on a loaded CI runner the
+                // Task.Run writer may not have been scheduled at all in that window. The guard
+                // then correctly concludes "not growing" and the InvalidDataException
+                // propagates.
+                //
+                // The wait is against the length captured BEFORE the writer started, not
+                // against a hardcoded size. #547's first fix compared to sizeof(ulong), which
+                // is only the starting size of the truncated-prefix case — in the
+                // bounds-overshoot case the file already begins well over 8 bytes, so that loop
+                // exited immediately and left the race untouched. It duly failed on #549's CI.
+                //
+                // Waiting makes the precondition the test asserts about — a file that is
+                // observably growing — true by construction rather than by scheduling luck. It
+                // does not weaken the assertion.
+                var grew = new System.Diagnostics.Stopwatch();
+                grew.Start();
+                while (new FileInfo(path).Length <= lengthBeforeWriter && grew.Elapsed < TimeSpan.FromSeconds(10))
+                    Thread.Sleep(10);
+                Assert.True(new FileInfo(path).Length > lengthBeforeWriter,
+                    $"the writer task never appended (still {new FileInfo(path).Length} bytes, started at "
+                    + $"{lengthBeforeWriter}), so this test cannot exercise the in-flight path");
+
                 var ex = Assert.Throws<Xunit.SkipException>(() =>
                     CheckpointGuard.LoadOrSkip(path, "regression fixture", () => SafetensorsFile.Open(path)));
                 Assert.Contains(
@@ -191,6 +219,8 @@ public sealed class CheckpointGuardTests
         {
             WriteBoundsOvershootSafetensorsFile(path, declaredEnd: 1_000_000, actualDataBytes: 4);
 
+            long lengthBeforeWriter = new FileInfo(path).Length;
+
             using var stop = new CancellationTokenSource();
             Task writer = Task.Run(() =>
             {
@@ -212,6 +242,32 @@ public sealed class CheckpointGuardTests
 
             try
             {
+                // Wait for the writer to have ACTUALLY appended before asserting.
+                //
+                // Without this the test races its own writer: the loader fails within
+                // milliseconds, so IsPlausiblyInFlight samples the length, sleeps
+                // InFlightRecheckDelay and samples again — and on a loaded CI runner the
+                // Task.Run writer may not have been scheduled at all in that window. The guard
+                // then correctly concludes "not growing" and the InvalidDataException
+                // propagates.
+                //
+                // The wait is against the length captured BEFORE the writer started, not
+                // against a hardcoded size. #547's first fix compared to sizeof(ulong), which
+                // is only the starting size of the truncated-prefix case — in the
+                // bounds-overshoot case the file already begins well over 8 bytes, so that loop
+                // exited immediately and left the race untouched. It duly failed on #549's CI.
+                //
+                // Waiting makes the precondition the test asserts about — a file that is
+                // observably growing — true by construction rather than by scheduling luck. It
+                // does not weaken the assertion.
+                var grew = new System.Diagnostics.Stopwatch();
+                grew.Start();
+                while (new FileInfo(path).Length <= lengthBeforeWriter && grew.Elapsed < TimeSpan.FromSeconds(10))
+                    Thread.Sleep(10);
+                Assert.True(new FileInfo(path).Length > lengthBeforeWriter,
+                    $"the writer task never appended (still {new FileInfo(path).Length} bytes, started at "
+                    + $"{lengthBeforeWriter}), so this test cannot exercise the in-flight path");
+
                 var ex = Assert.Throws<Xunit.SkipException>(() =>
                     CheckpointGuard.LoadOrSkip(path, "regression fixture", () => SafetensorsFile.Open(path)));
                 Assert.Contains(

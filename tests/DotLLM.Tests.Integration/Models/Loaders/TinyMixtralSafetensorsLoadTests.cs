@@ -27,7 +27,7 @@ namespace DotLLM.Tests.Integration.Models.Loaders;
 /// semantic output quality.
 /// </para>
 /// <para>
-/// Downloads to <c>~/.dotllm/test-cache/&lt;repo&gt;/</c>; 50 MB cap. Skips
+/// Downloads to <c>~/.dotllm/models/&lt;repo&gt;/</c>; 50 MB cap. Skips
 /// gracefully on offline / rate-limited CI.
 /// </para>
 /// </remarks>
@@ -43,9 +43,7 @@ public sealed class TinyMixtralSafetensorsLoadTests
         ("yujiepan/mixtral-tiny-random", ["model.safetensors", "config.json"]),
     ];
 
-    private static readonly string CacheDir = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-        ".dotllm", "test-cache");
+    private static readonly string CacheDir = DotLLM.Tests.Integration.Fixtures.TestModelDownloader.CacheDirectory;
 
     private readonly ITestOutputHelper _output;
 
@@ -176,8 +174,7 @@ public sealed class TinyMixtralSafetensorsLoadTests
     {
         foreach (var (repoId, files) in Candidates)
         {
-            string cachedDir = Path.Combine(
-                CacheDir, repoId.Replace('/', Path.DirectorySeparatorChar));
+            string cachedDir = DotLLM.Tests.Integration.Fixtures.TestRepoDirectory.Resolve(repoId, "model.safetensors", "config.json");
             string cachedModel = Path.Combine(cachedDir, "model.safetensors");
             string cachedConfig = Path.Combine(cachedDir, "config.json");
 

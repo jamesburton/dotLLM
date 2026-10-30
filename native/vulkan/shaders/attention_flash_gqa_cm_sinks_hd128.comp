@@ -1,0 +1,7 @@
+#version 450
+// head_dim <= 128 twin of attention_flash_gqa_cm_sinks.comp (issue #1161): fragment arrays and the K/V tile sized for 128, not 256.
+#define MAX_HEAD_DIM 128
+// GQA-grouped cooperative-matrix flash-attention prefill with per-head attention sinks (issue #1200), F32 K / V. Body: attention_flash_gqa_cm.glsl.
+#define SINKS 1
+#extension GL_GOOGLE_include_directive : require
+#include "attention_flash_gqa_cm.glsl"

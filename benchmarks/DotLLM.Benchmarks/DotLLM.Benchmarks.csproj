@@ -17,6 +17,15 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- #1279: one model store. Shared resolver/downloader linked from the integration suite
+         (both `internal`, so each assembly gets its own copy). -->
+    <Compile Include="..\..\tests\DotLLM.Tests.Integration\Fixtures\TestFixtureResolver.cs"
+             Link="Fixtures\TestFixtureResolver.cs" />
+    <Compile Include="..\..\tests\DotLLM.Tests.Integration\Fixtures\TestModelDownloader.cs"
+             Link="Fixtures\TestModelDownloader.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="BenchmarkDotNet" />
   </ItemGroup>
 

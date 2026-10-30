@@ -7,7 +7,7 @@ namespace DotLLM.Vulkan;
 
 /// <summary>
 /// Vulkan-side KV cache. Per-layer device-local buffers of shape
-/// <c>[maxSeqLen, numKvHeads * headDim]</c> FP32. The host never touches
+/// <c>[maxSeqLen, numKvHeads * headDim]</c>, FP32 or (issue #1171) FP16 (<see cref="Storage"/>). The host never touches
 /// cached K/V — updates are recorded as <c>vkCmdCopyBuffer</c> from the
 /// host-visible activation buffers to the device-local cache, either
 /// synchronously (legacy <see cref="UpdateDevice"/>) or appended to a caller-
@@ -32,7 +32,7 @@ namespace DotLLM.Vulkan;
 /// object satisfy the same API.
 /// </para>
 /// </remarks>
-public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache
+public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache, IWindowedKvCache
 {
     private readonly VulkanDevice _device;
     private readonly VulkanDevice.Buffer[] _keys;
@@ -44,6 +44,18 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     // and global layers carry different KV-head counts AND head dims (e.g. sliding
     // 8×256 vs global 2×512) — so each layer's cached K/V row is a different width.
     private readonly int[] _kvStride;
+    private readonly VulkanKvStorage _storage;
+    private readonly int _elemBytes;
+
+    // Compact sliding-window rows (#1176): null unless the geometry marks windowed slots. Grow-only, so a resize (which swaps
+    // buffer handles and invalidates descriptor sets) happens only in EnsureWindowCapacity, before recording.
+    private readonly SlidingWindowRows? _rows;
+
+    // TILE_KV of the reference sink kernel (attention_sinks_f32.glsl), which tiles the KV range from row 0. Ring bases stay multiples of it,
+    // so the kernel sees the same tiles as on a full-length cache and the ring is bit-identical to it (the decode / small-row kernels
+    // split relative to the window start and do not care). The GQA flash sink twins (#1200) tile in 16 / 32 rows, which divide it.
+    private const int KvTileRows = 256;
+    private readonly VulkanDevice.Buffer? _moveScratch; // overlapping compaction moves stage through here (K then V half)
     private int _currentLength;
     private bool _disposed;
 
@@ -52,6 +64,24 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
 
     /// <inheritdoc/>
     public int MaxLength => _maxSeqLen;
+
+    /// <summary>
+    /// Element format of the cached rows. <see cref="VulkanKvStorage.F16"/> rows are written by the F16 convert kernel and read in place by the
+    /// <c>_kvf16</c> attention twins; only models that create those twins (Flint, issue #1171) accept such a cache.
+    /// </summary>
+    public VulkanKvStorage Storage => _storage;
+
+    /// <summary>Device bytes held by the K and V buffers of every layer.</summary>
+    public long AllocatedBytes
+    {
+        get
+        {
+            if (_rows is not null) return _rows.AllocatedBytes(i => 2L * _kvStride[i] * _elemBytes);
+            long total = 0;
+            for (int i = 0; i < _numLayers; i++) total += 2L * _maxSeqLen * _kvStride[i] * _elemBytes;
+            return total;
+        }
+    }
 
     /// <summary>
     /// Creates the per-layer K/V buffers with a UNIFORM <c>numKvHeads × headDim</c>
@@ -67,12 +97,27 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     /// Creates the per-layer K/V buffers from a Core <see cref="KvGeometry"/> descriptor.
     /// Byte-identical to the uniform constructor for every dense/GQA/MoE model and supplies
     /// distinct per-layer strides for Gemma-4. This is the constructor
-    /// <see cref="VulkanTransformerModel.CreateKvCache"/> uses (via
-    /// <see cref="KvGeometry.FromConfig"/>), so the per-layer-stride derivation lives in one
+    /// <see cref="VulkanTransformerModel.CreateKvCache(int)"/> uses (via
+    /// <see cref="KvGeometry.FromConfig(DotLLM.Core.Models.ModelConfig)"/>), so the per-layer-stride derivation lives in one
     /// place (Core) rather than being rebuilt inline.
     /// </summary>
     public VulkanKvCache(VulkanDevice device, KvGeometry geometry, int maxSeqLen)
-        : this(device, ExtractStrides(geometry), maxSeqLen)
+        : this(device, geometry, maxSeqLen, VulkanKvStorage.F32)
+    {
+    }
+
+    /// <summary>
+    /// As <see cref="VulkanKvCache(VulkanDevice, KvGeometry, int)"/> with an explicit element format (issue #1171). A geometry with
+    /// sliding windows (<see cref="KvGeometry.HasSlidingWindows"/>) keeps only the recent rows of those slots (issue #1176): see
+    /// <see cref="IWindowedKvCache"/> and <see cref="EnsureWindowCapacity"/>.
+    /// </summary>
+    /// <param name="device">The device.</param>
+    /// <param name="geometry">Per-layer KV geometry.</param>
+    /// <param name="maxSeqLen">Positions per layer.</param>
+    /// <param name="storage">Element format of the cached rows.</param>
+    public VulkanKvCache(VulkanDevice device, KvGeometry geometry, int maxSeqLen, VulkanKvStorage storage)
+        : this(device, ExtractStrides(geometry), maxSeqLen, storage,
+            geometry.HasSlidingWindows ? new SlidingWindowRows(geometry, maxSeqLen, growOnly: true, baseAlignment: KvTileRows) : null)
     {
     }
 
@@ -90,7 +135,16 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     /// layer). Used by Gemma-4, whose sliding and global layers have different
     /// KV-head counts and head dims, so each layer's cached row is a different width.
     /// </summary>
-    public VulkanKvCache(VulkanDevice device, int[] kvStridePerLayer, int maxSeqLen)
+    /// <param name="device">The device.</param>
+    /// <param name="kvStridePerLayer">Per-layer row width in elements.</param>
+    /// <param name="maxSeqLen">Positions per layer.</param>
+    /// <param name="storage">Element format of the cached rows (F16 needs an even row width: two halves per word).</param>
+    public VulkanKvCache(VulkanDevice device, int[] kvStridePerLayer, int maxSeqLen, VulkanKvStorage storage = VulkanKvStorage.F32)
+        : this(device, kvStridePerLayer, maxSeqLen, storage, rows: null)
+    {
+    }
+
+    private VulkanKvCache(VulkanDevice device, int[] kvStridePerLayer, int maxSeqLen, VulkanKvStorage storage, SlidingWindowRows? rows)
     {
         ArgumentNullException.ThrowIfNull(device);
         ArgumentNullException.ThrowIfNull(kvStridePerLayer);
@@ -101,6 +155,9 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         _numLayers = kvStridePerLayer.Length;
         _maxSeqLen = maxSeqLen;
         _kvStride = (int[])kvStridePerLayer.Clone();
+        _storage = storage;
+        _elemBytes = storage.ElementBytes();
+        _rows = rows;
 
         _keys = new VulkanDevice.Buffer[_numLayers];
         _values = new VulkanDevice.Buffer[_numLayers];
@@ -110,9 +167,20 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
             if (_kvStride[i] <= 0)
                 throw new ArgumentOutOfRangeException(nameof(kvStridePerLayer),
                     $"Per-layer KV stride must be positive; layer {i} = {_kvStride[i]}.");
-            long bytesPerLayer = (long)maxSeqLen * _kvStride[i] * sizeof(float);
+            if (storage == VulkanKvStorage.F16 && (_kvStride[i] & 1) != 0)
+                throw new ArgumentOutOfRangeException(nameof(kvStridePerLayer), $"An F16 KV row must hold an even element count; layer {i} = {_kvStride[i]}.");
+            long bytesPerLayer = (long)(rows?.CapacityOf(i) ?? maxSeqLen) * _kvStride[i] * _elemBytes;
             _keys[i] = device.AllocateDeviceLocal(bytesPerLayer);
             _values[i] = device.AllocateDeviceLocal(bytesPerLayer);
+        }
+
+        if (rows is not null)
+        {
+            // K and V of the largest possible compaction stage side by side.
+            long scratch = 0;
+            for (int i = 0; i < _numLayers; i++)
+                scratch = Math.Max(scratch, 2L * rows.MaxKeptRows(i) * _kvStride[i] * _elemBytes);
+            _moveScratch = device.AllocateDeviceLocal(scratch);
         }
     }
 
@@ -146,6 +214,8 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     {
         if (positions.Length != seqLen)
             throw new ArgumentException("positions.Length must equal seqLen", nameof(positions));
+        RequireF32("UpdateDevice");
+        ThrowIfWindowed(layerIndex, "UpdateDevice");
 
         int rowBytes = _kvStride[layerIndex] * sizeof(float);
 
@@ -191,10 +261,12 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     /// written cache rows), and for advancing <see cref="CurrentLength"/>
     /// after the batch commits.
     /// </summary>
+    /// <remarks>An F16 cache is written by <paramref name="f16Writer"/> (a compute dispatch: the caller's following barrier is compute to compute).</remarks>
     internal unsafe void RecordUpdate(
         nint cmdBuf,
         VulkanDevice.Buffer kDev, VulkanDevice.Buffer vDev,
-        ReadOnlySpan<int> positions, int seqLen, int layerIndex)
+        ReadOnlySpan<int> positions, int seqLen, int layerIndex,
+        Kernels.IVulkanKvF16Writer? f16Writer = null)
     {
         if (positions.Length != seqLen)
             throw new ArgumentException("positions.Length must equal seqLen", nameof(positions));
@@ -203,6 +275,28 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         int maxPos = ValidateAndFindMaxPos(positions, seqLen);
         bool contiguous = IsContiguousAscending(positions);
 
+        // Compact sliding-window slot (#1176): compact on the device first, then write at row = position - base.
+        int rowBase = 0;
+        if (_rows is not null && _rows.IsWindowed(layerIndex))
+        {
+            if (!contiguous)
+                throw new InvalidOperationException("A compact sliding-window KV slot is written from contiguous positions only.");
+            RecordWindowMove(cmdBuf, layerIndex, positions[0], maxPos);
+            rowBase = _rows.BaseOf(layerIndex);
+        }
+
+        if (_storage == VulkanKvStorage.F16)
+        {
+            // The F32 rows the projections produced are converted on the device; there is no copy-engine path for F16.
+            if (!contiguous || f16Writer is null)
+                throw new InvalidOperationException("An F16 KV cache is written by the convert kernel from contiguous positions only.");
+            long elemOffset = (long)(positions[0] - rowBase) * _kvStride[layerIndex], count = (long)seqLen * _kvStride[layerIndex];
+            f16Writer.RecordF32ToF16(cmdBuf, kDev, _keys[layerIndex], elemOffset, count);
+            f16Writer.RecordF32ToF16(cmdBuf, vDev, _values[layerIndex], elemOffset, count);
+            if (maxPos + 1 > _currentLength) _currentLength = maxPos + 1;
+            return;
+        }
+
         // Hazard-scoped barriers (issue #144): declare the append's access set
         // (reads the fresh K/V activations, writes the per-layer cache rows)
         // so the tracker emits the RoPE→copy barrier and the later
@@ -210,10 +304,12 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         // per buffer pair covers both the contiguous and per-row forms.
         _device.ActiveHazards?.OnTransfer(kDev.Handle, _keys[layerIndex].Handle);
         _device.ActiveHazards?.OnTransfer(vDev.Handle, _values[layerIndex].Handle);
+        // The copies below read what RoPE (a compute shader) just wrote; a COMPUTE->COMPUTE barrier does not order a TRANSFER read (races on Intel Arc, #1249).
+        if (_device.ActiveHazards is null) Kernels.KernelSupport.ComputeToTransferBarrier(cmdBuf);
 
         if (contiguous)
         {
-            int startPos = positions[0];
+            int startPos = positions[0] - rowBase;
             var region = new VkBufferCopy
             {
                 srcOffset = 0,
@@ -255,6 +351,8 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     {
         if (positions.Length != seqLen)
             throw new ArgumentException("positions.Length must equal seqLen", nameof(positions));
+        if (_rows is not null)
+            throw new InvalidOperationException("The fused RoPE+KV write addresses rows by absolute position; a compact sliding-window cache cannot take it.");
 
         int maxPos = ValidateAndFindMaxPos(positions, seqLen);
         int newLength = maxPos + 1;
@@ -313,15 +411,139 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         => throw new NotSupportedException("VulkanKvCache does not materialise cached values as CPU tensors.");
 
     /// <inheritdoc/>
+    /// <remarks>A compact sliding-window cache refuses a cut past its 64-position margin (<see cref="CanTruncateTo"/>).</remarks>
     public void Rollback(int length)
     {
         if ((uint)length > (uint)_currentLength)
             throw new ArgumentOutOfRangeException(nameof(length));
-        _currentLength = length;
+        Truncate(length);
     }
 
     /// <summary>Resets the visible length. Used when starting a new sequence.</summary>
-    public void Reset() => _currentLength = 0;
+    public void Reset() => Truncate(0);
+
+    /// <inheritdoc/>
+    public int RowBaseOf(int layerIndex) => _rows?.BaseOf(layerIndex) ?? 0;
+
+    /// <summary>True when some layers keep only their sliding-window rows (issue #1176).</summary>
+    public bool HasCompactWindows => _rows is not null;
+
+    /// <summary>
+    /// True when the cache can be cut back to <paramref name="length"/>: always for a full cache; for compact sliding-window
+    /// layers only while they still hold the rows a query at that position needs.
+    /// </summary>
+    /// <param name="length">The length to cut back to.</param>
+    /// <returns>Whether <see cref="Rollback"/> / <see cref="SetCurrentLength"/> to that length succeeds.</returns>
+    public bool CanTruncateTo(int length) => _rows is null || _rows.CanTruncateTo(length);
+
+    /// <summary>
+    /// Grows any compact sliding-window slot too small for an append of <paramref name="positions"/> (a prefill chunk longer
+    /// than the ring's free half). Must run before the forward starts recording: a grown slot gets new buffer handles, so the
+    /// caller drops its cached descriptor sets when this returns true. The kept rows move with a device-side copy.
+    /// </summary>
+    /// <param name="positions">Positions the next forward appends.</param>
+    /// <returns>True when any buffer was replaced.</returns>
+    public bool EnsureWindowCapacity(ReadOnlySpan<int> positions)
+    {
+        if (_rows is null || positions.Length == 0) return false;
+        int maxPos = ValidateAndFindMaxPos(positions, positions.Length);
+        int minPos = int.MaxValue;
+        foreach (int p in positions) minPos = Math.Min(minPos, p);
+        bool resized = false;
+        for (int l = 0; l < _numLayers; l++)
+        {
+            if (!_rows.TryPlan(l, minPos, maxPos, _currentLength, out var m) || !m.Resize) continue;
+            long rowBytes = (long)_kvStride[l] * _elemBytes;
+            _keys[l] = Regrow(_keys[l], m, rowBytes);
+            _values[l] = Regrow(_values[l], m, rowBytes);
+            _rows.Commit(l, m);
+            resized = true;
+        }
+        return resized;
+
+        VulkanDevice.Buffer Regrow(VulkanDevice.Buffer old, WindowMove m, long rowBytes)
+        {
+            var grown = _device.AllocateDeviceLocal(m.Capacity * rowBytes);
+            if (m.Keep > 0)
+                _device.CopyBufferRangeSynchronous(old, grown, (ulong)(m.Shift * rowBytes), 0, (ulong)(m.Keep * rowBytes));
+            old.Dispose();
+            return grown;
+        }
+    }
+
+    /// <summary>
+    /// Records the compaction of a windowed slot when the append <c>[minPos, maxPos]</c> would overflow its ring: the kept rows
+    /// move to row 0 on the device, directly when source and destination do not overlap, else staged through the move scratch
+    /// (<c>vkCmdCopyBuffer</c> forbids overlapping regions).
+    /// </summary>
+    private void RecordWindowMove(nint cmdBuf, int layer, int minPos, int maxPos)
+    {
+        if (!_rows!.TryPlan(layer, minPos, maxPos, _currentLength, out var m)) return;
+        if (m.Resize)
+            throw new InvalidOperationException(
+                $"Layer {layer}'s sliding-window ring is too small for positions {minPos}..{maxPos}; call {nameof(EnsureWindowCapacity)} before recording.");
+        if (m.Shift > 0 && m.Keep > 0)
+        {
+            ulong rowBytes = (ulong)_kvStride[layer] * (ulong)_elemBytes;
+            ulong src = (ulong)m.Shift * rowBytes, bytes = (ulong)m.Keep * rowBytes;
+            nint k = _keys[layer].Handle, v = _values[layer].Handle;
+            if (m.Shift >= m.Keep)
+            {
+                CopyRange(cmdBuf, k, k, src, 0, bytes, first: true);
+                CopyRange(cmdBuf, v, v, src, 0, bytes, first: false);
+            }
+            else
+            {
+                nint s = _moveScratch!.Handle;
+                CopyRange(cmdBuf, k, s, src, 0, bytes, first: true);
+                CopyRange(cmdBuf, v, s, src, bytes, bytes, first: false);
+                LegacyBarrier(cmdBuf);
+                CopyRange(cmdBuf, s, k, 0, 0, bytes, first: false);
+                CopyRange(cmdBuf, s, v, bytes, 0, bytes, first: false);
+            }
+
+            LegacyBarrier(cmdBuf);
+        }
+
+        _rows.Commit(layer, m);
+    }
+
+    /// <summary>One <c>vkCmdCopyBuffer</c> region, declared to the hazard tracker (or preceded by a blanket barrier when untracked and <paramref name="first"/>).</summary>
+    private void CopyRange(nint cmdBuf, nint src, nint dst, ulong srcOffset, ulong dstOffset, ulong size, bool first)
+    {
+        if (_device.ActiveHazards is { } hz) hz.OnTransfer(src, dst);
+        else if (first) Kernels.KernelSupport.ComputeTransferFullBarrier(cmdBuf);
+        var region = new VkBufferCopy { srcOffset = srcOffset, dstOffset = dstOffset, size = size };
+        VulkanApi.vkCmdCopyBuffer(cmdBuf, src, dst, 1, region);
+    }
+
+    /// <summary>Blanket compute/transfer barrier on the untracked path; the hazard tracker inserts its own.</summary>
+    private void LegacyBarrier(nint cmdBuf)
+    {
+        if (_device.ActiveHazards is null) Kernels.KernelSupport.ComputeTransferFullBarrier(cmdBuf);
+    }
+
+    private void Truncate(int length)
+    {
+        if (_rows is not null)
+        {
+            if (!_rows.CanTruncateTo(length))
+                throw new InvalidOperationException(
+                    $"Cannot cut the KV-cache back to {length}: a sliding-window layer already dropped rows that length needs "
+                    + $"(margin {SlidingWindowRows.Margin} positions).");
+            if (length == 0) _rows.Reset();
+        }
+
+        _currentLength = length;
+    }
+
+    private void ThrowIfWindowed(int layerIndex, string operation)
+    {
+        if (_rows is not null && _rows.IsWindowed(layerIndex))
+            throw new NotSupportedException(
+                $"VulkanKvCache.{operation}: layer {layerIndex} keeps only its sliding-window rows; build the cache with "
+                + "KvGeometry.FromConfig(config) for full-history consumers.");
+    }
 
     /// <summary>
     /// Number of layers in this cache.
@@ -364,8 +586,10 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     public unsafe void IngestFromHost(int layerIndex, int length,
         ReadOnlySpan<float> keys, ReadOnlySpan<float> values)
     {
+        RequireF32("IngestFromHost");
         if ((uint)layerIndex >= (uint)_numLayers)
             throw new ArgumentOutOfRangeException(nameof(layerIndex));
+        ThrowIfWindowed(layerIndex, "IngestFromHost");
         if (length <= 0)
             throw new ArgumentOutOfRangeException(nameof(length), "length must be positive.");
         if (length > _maxSeqLen)
@@ -412,7 +636,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     {
         if ((uint)length > (uint)_maxSeqLen)
             throw new ArgumentOutOfRangeException(nameof(length));
-        _currentLength = length;
+        Truncate(length);
     }
 
     // ── IHostStagedKvCache: device↔host staging for cross-device KV handoff ──
@@ -432,8 +656,10 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     /// <inheritdoc/>
     public void DownloadLayer(int layerIndex, Span<float> keys, Span<float> values)
     {
+        RequireF32("DownloadLayer");
         if ((uint)layerIndex >= (uint)_numLayers)
             throw new ArgumentOutOfRangeException(nameof(layerIndex));
+        ThrowIfWindowed(layerIndex, "DownloadLayer");
         int count = _currentLength * _kvStride[layerIndex];
         if (count == 0) return;
         if (keys.Length < count || values.Length < count)
@@ -446,6 +672,13 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     /// <inheritdoc/>
     public void UploadLayer(int layerIndex, int length, ReadOnlySpan<float> keys, ReadOnlySpan<float> values)
         => IngestFromHost(layerIndex, length, keys, values);
+
+    // shortcut: the host-staged F32 transport (handoff, ingest) has no F16 arm yet; add one when an F16 model needs cross-device handoff.
+    private void RequireF32(string operation)
+    {
+        if (_storage != VulkanKvStorage.F32)
+            throw new NotSupportedException($"VulkanKvCache.{operation} moves F32 rows; this cache stores {_storage}.");
+    }
 
     private unsafe void MapAndCopy(VulkanDevice.Buffer staging, ReadOnlySpan<float> source)
     {
@@ -478,5 +711,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
             _keys[i]?.Dispose();
             _values[i]?.Dispose();
         }
+
+        _moveScratch?.Dispose();
     }
 }

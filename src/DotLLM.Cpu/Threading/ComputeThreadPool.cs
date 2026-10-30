@@ -46,7 +46,7 @@ public sealed unsafe class ComputeThreadPool : IDisposable
     /// <param name="end">Exclusive end of this thread's range. Equals <paramref name="start"/>
     /// when there is no work for this thread.</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static void PartitionRange(
+    internal static void PartitionRange(
         int totalItems, int threadIdx, int threadCount, out int start, out int end)
     {
         int baseCount = totalItems / threadCount;
@@ -151,12 +151,14 @@ public sealed unsafe class ComputeThreadPool : IDisposable
         // When no NumaTopology is available we therefore fall back to a conservative default of
         // min(8, threadCount) rather than using every thread; 8 matches typical "memory channels × 2"
         // for desktop/workstation x86 hosts and keeps the pool in the regime where SpinWait is a win.
-        const int DefaultDecodeThreadCountCap = 8;
+        //
+        // An explicit DecodeThreadCount of 1 means caller-only decode (no workers); only the automatic
+        // choices keep the floor of 2.
         _decodeThreadCount = config.DecodeThreadCount > 0
-            ? Math.Clamp(config.DecodeThreadCount, 2, threadCount)
+            ? Math.Clamp(config.DecodeThreadCount, 1, threadCount)
             : topology is not null
                 ? Math.Clamp(topology.MemoryChannelEstimate, 2, threadCount)
-                : Math.Clamp(DefaultDecodeThreadCountCap, 2, threadCount);
+                : Math.Clamp(AutoDecodeThreadCount(threadCount, DetectHybrid()), 2, threadCount);
 
         // Build core assignment map (and caller core if pinning is enabled).
         (int[] workerAssignment, int callerCore) = BuildCoreAssignment(workerCount, topology, config);
@@ -201,7 +203,7 @@ public sealed unsafe class ComputeThreadPool : IDisposable
     {
         _currentMode = mode;
         _activeWorkerCount = mode == DispatchMode.SpinWait
-            ? Math.Clamp(_decodeThreadCount - 1, 1, _threadCount - 1)
+            ? Math.Clamp(_decodeThreadCount - 1, 0, _threadCount - 1)
             : _threadCount - 1;
     }
 
@@ -231,8 +233,11 @@ public sealed unsafe class ComputeThreadPool : IDisposable
         if (activeWorkers > 0)
             _completion.Reset(activeWorkers);
 
-        // Increment generation counter (wakes spinners)
-        Interlocked.Increment(ref _dispatchGeneration);
+        // Increment generation counter (wakes spinners). A caller-only dispatch leaves the workers
+        // parked and publishes no generation: otherwise a worker still spinning from the previous
+        // dispatch could see the new generation and run this dispatch's work alongside the caller.
+        if (activeWorkers > 0)
+            Interlocked.Increment(ref _dispatchGeneration);
 
         // Also set events (wakes any workers that fell through to kernel wait)
         for (int i = 0; i < activeWorkers; i++)
@@ -270,6 +275,28 @@ public sealed unsafe class ComputeThreadPool : IDisposable
         _workerScratch[threadIdx] = ptr;
         _workerScratchSize[threadIdx] = minBytes;
         return ptr;
+    }
+
+    /// <summary>
+    /// Default spin-decode worker count when neither an explicit <c>--decode-threads</c> nor a NUMA topology was supplied.
+    /// The historical cap of 8 assumed decode is purely memory-bandwidth-bound; measured on a 16C/32T Zen 5 box it left
+    /// 30-50% of decode throughput on the table for dense AND MoE models (Llama-3.1-8B Q4_K_M 13 -> 18 tok/s, Llama-3.2-1B Q8_0
+    /// 31 -> 47, Mistral-7B 13.8 -> 19.7) because the quantised dot kernels are partly compute/latency-bound and SMT hides the latency.
+    /// A few logical cores are left free: the SpinWait barrier runs at the speed of its slowest thread, so using all of them
+    /// collapses as soon as anything else wants a core (31/32 threads: back to the cap-8 speed). Hybrid P/E CPUs keep the old cap
+    /// of 8 (barriers would wait on E-cores).
+    /// </summary>
+    internal static int AutoDecodeThreadCount(int threadCount, bool hybrid)
+    {
+        const int LegacyCap = 8;
+        if (hybrid || threadCount <= LegacyCap) return Math.Min(threadCount, LegacyCap);
+        return threadCount - Math.Max(2, threadCount / 8);
+    }
+
+    private static bool DetectHybrid()
+    {
+        try { return NumaTopology.Detect().IsHybrid; }
+        catch (Exception) { return true; } // unknown topology: stay on the conservative legacy cap
     }
 
     private void WorkerLoop(object? state)

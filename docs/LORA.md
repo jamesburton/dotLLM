@@ -92,6 +92,24 @@ Because the delta is linear, `LoraComposer.Compose` realises this by **rank-conc
 
 Constraints (current): stacked adapters must have **uniform site coverage** (every `(layer, projection)` targeted by one is targeted by all) and **F32 weights**. A single `--lora` bypasses composition entirely (so non-F32 single adapters are unaffected). GPU stacked-parity is validated by a separate env-gated test.
 
+## Qwen4-Exp CPU path (#845)
+
+`Qwen4ExpTransformerModel` applies a runtime adapter (never merged) after the base GEMM of: QSA `q_proj` (the FUSED `[q | gate]` projection, `2*heads*headDim` wide), `k_proj`, `v_proj`, `o_proj`; Gated-DeltaNet `in_proj_qkv`, `in_proj_z`, `in_proj_a`, `in_proj_b`, `out_proj`; and routed-expert `mlp.experts.{j}.{gate,up,down}_proj` (through the shared MoE kernel). The GDN factors must be expressed in the GGUF layout the model consumes (value heads tiled, like the converted base weights); the PEFT loader still only maps `self_attn`/`mlp` names, so GDN adapters are built programmatically until a converter exists. The shared expert, router, hyper-connection mixers, QSA indexer, n-gram (PLE) branch, embeddings and LM head are not adaptable: an adapter entry for any of them, for a name on the wrong layer kind, or with a wrong shape is rejected before any compute (`NotSupportedException` / `ArgumentException` naming the site). `ForwardBatch` honours each request's own adapter (requests run sequentially). Verified by comparing against the same checkpoint with the adapter merged into the weights (`Qwen4ExpLoraTests`).
+
+## LFM2 / LFM2.5 MoE CPU path (#1027)
+
+`Lfm2MoeTransformerModel` applies runtime adapters to attention `q_proj`, `k_proj`,
+`v_proj`, `o_proj`; short-convolution `in_proj` (the fused B/C/X projection) and
+`out_proj`; dense FFN `gate_proj`, `up_proj`, `down_proj`; and routed experts
+`mlp.experts.{j}.{gate,up,down}_proj`. Every target and shape is validated before
+inference changes sequence state. Targets on the wrong layer kind, invalid expert
+indices, norms, convolution kernels, routers, embeddings and the LM head are rejected.
+The model requires the concrete `LoraAdapter` so it can enumerate and validate all sites.
+`ForwardBatch` selects each request's adapter and recurrent state independently.
+Short-convolution adapters use the GGUF B/C/X layout and are currently constructed
+programmatically: the PEFT loader only maps standard `self_attn` and `mlp` names.
+Vulkan LFM2 LoRA remains unsupported and rejects adapters explicitly.
+
 ## Design Decisions
 
 - **No weight merging**: Adapters are never merged into base weights (`W' = W + αBA`). This enables instant switching and concurrent adapters. Trade-off: small per-layer overhead vs. large flexibility gain.

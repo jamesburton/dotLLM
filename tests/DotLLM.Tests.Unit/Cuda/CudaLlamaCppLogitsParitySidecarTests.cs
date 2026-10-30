@@ -5,6 +5,7 @@ using DotLLM.Core.Tensors;
 using DotLLM.Cuda;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -16,6 +17,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// or machine-specific llama.cpp captures.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaLlamaCppLogitsParitySidecarTests
 {
     private const string ModelPathEnvVar = "DOTLLM_IQ4_XS_GGUF_PATH";
@@ -276,26 +278,8 @@ public sealed class CudaLlamaCppLogitsParitySidecarTests
         if (!string.IsNullOrWhiteSpace(sidecarModelPath) && File.Exists(sidecarModelPath))
             return Path.GetFullPath(sidecarModelPath);
 
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string[] candidates =
-        [
-            Path.Combine(home, ".dotllm", "models", "bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF",
-                "Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf"),
-            Path.Combine(home, ".dotllm", "test-cache", "bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF",
-                "Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf"),
-            Path.Combine(home, ".dotllm", "models", "bartowski", "Qwen2.5-7B-Instruct-GGUF",
-                "Qwen2.5-7B-Instruct-IQ4_XS.gguf"),
-            Path.Combine(home, ".dotllm", "test-cache", "bartowski", "Qwen2.5-7B-Instruct-GGUF",
-                "Qwen2.5-7B-Instruct-IQ4_XS.gguf"),
-        ];
-
-        foreach (string candidate in candidates)
-        {
-            if (File.Exists(candidate))
-                return Path.GetFullPath(candidate);
-        }
-
-        return null;
+        return TestFixtureResolver.ResolveFile([], "bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF", ["Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf"], null).Path
+            ?? TestFixtureResolver.ResolveFile([], "bartowski", "Qwen2.5-7B-Instruct-GGUF", ["Qwen2.5-7B-Instruct-IQ4_XS.gguf"], null).Path;
     }
 
     private static int[] Positions(int count)

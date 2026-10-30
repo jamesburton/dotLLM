@@ -96,9 +96,19 @@ public sealed record SyntheticGemma4Config
     /// MoE metadata) — the E2B/E4B shape. True (default) = the 26B MoE shape.</summary>
     public bool IncludeExperts { get; init; } = true;
 
+    /// <summary>E2B shape: the trailing <see cref="SharedKvLayers"/> layers carry a double-wide dense MLP
+    /// (2x <see cref="DenseFeedForward"/>) and <c>feed_forward_length</c> is emitted as a per-layer Int32
+    /// array (E4B and the 26B store a scalar). Requires <see cref="SharedKvLayers"/> &gt; 0.</summary>
+    public bool DoubleWideSharedKvFfn { get; init; }
+
     /// <summary>Emit a <c>rope_freqs.weight</c> proportional-rope factor tensor
     /// [GlobalHeadDim/2] (E4B full-attention layers). Default false.</summary>
     public bool EmitRopeFreqs { get; init; }
+
+    /// <summary>When &gt; 0 (with <see cref="EmitRopeFreqs"/>) the factors take the released E2B/E4B
+    /// proportional form: exactly 1.0 for the leading N pairs and 1e30 (identity) for the rest. 0 (default)
+    /// emits general factors in [1, 1.5).</summary>
+    public int RopeFreqsProportionalPairs { get; init; }
 
     /// <summary>Emit ALL-ZERO K/V projection weights on the shared-KV layers
     /// (which never use them). Discriminates "donor KV used" from "own KV used":

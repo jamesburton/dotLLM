@@ -3,7 +3,9 @@ namespace DotLLM.Tokenizers.ChatTemplates;
 /// <summary>
 /// Tokenizes a Jinja2 template string into a flat token list.
 /// Two-mode lexer: text mode (outside tags) and tag mode (inside {{ }}, {% %}).
-/// Handles whitespace control markers ({%- -%} {{- -}}).
+/// Handles whitespace control markers ({%- -%} {{- -}}) and, like HF transformers and llama.cpp's minja
+/// (both build their environment with <c>trim_blocks</c> + <c>lstrip_blocks</c>), removes the newline after a block
+/// tag and the indentation before one. Templates are authored against that behaviour (#928).
 /// </summary>
 internal sealed class JinjaLexer
 {
@@ -13,9 +15,17 @@ internal sealed class JinjaLexer
     private int _col = 1;
     private int _braceDepth;
 
-    public JinjaLexer(string source)
+    private readonly bool _trimBlocks;
+    private readonly bool _lstripBlocks;
+
+    /// <param name="source">Template source.</param>
+    /// <param name="trimBlocks">Drop the first newline after a block tag (<c>%}</c>) or comment (<c>#}</c>) - Jinja2's <c>trim_blocks</c>.</param>
+    /// <param name="lstripBlocks">Drop spaces/tabs between the start of a line and a block tag or comment - Jinja2's <c>lstrip_blocks</c>.</param>
+    public JinjaLexer(string source, bool trimBlocks = true, bool lstripBlocks = true)
     {
         _source = source;
+        _trimBlocks = trimBlocks;
+        _lstripBlocks = lstripBlocks;
     }
 
     public List<JinjaToken> Tokenize()
@@ -31,7 +41,17 @@ internal sealed class JinjaLexer
             // Check for comment {# ... #}
             if (Match("{#"))
             {
-                SkipComment();
+                int commentStart = _pos - 2;
+                // Whitespace control on comments: {#- trims the preceding text, -#} the following.
+                if (_pos < _source.Length && _source[_pos] == '-')
+                    StripTrailingWhitespace(tokens);
+                else if (_lstripBlocks)
+                    StripLineIndentation(tokens, commentStart);
+                bool stripRight = SkipComment();
+                if (stripRight)
+                    StripLeadingWhitespace(tokens);
+                else if (_trimBlocks)
+                    SkipOneNewline();
                 continue;
             }
 
@@ -56,15 +76,24 @@ internal sealed class JinjaLexer
             // Check for statement start {% or {%-
             if (Match("{%"))
             {
+                int tagStart = _pos - 2;
                 bool stripLeft = false;
+                bool keepIndent = false;
                 if (_pos < _source.Length && _source[_pos] == '-')
                 {
                     stripLeft = true;
                     Advance();
                 }
+                else if (_pos < _source.Length && _source[_pos] == '+')
+                {
+                    keepIndent = true;   // "{%+" disables lstrip_blocks for this tag
+                    Advance();
+                }
 
                 if (stripLeft)
                     StripTrailingWhitespace(tokens);
+                else if (_lstripBlocks && !keepIndent)
+                    StripLineIndentation(tokens, tagStart);
 
                 tokens.Add(new JinjaToken(JinjaTokenType.StmtStart, null, _line, _col));
                 TokenizeTag(tokens, "%}");
@@ -124,6 +153,8 @@ internal sealed class JinjaLexer
                     _col += endMarker.Length;
                     var endType = endMarker == "}}" ? JinjaTokenType.ExprEnd : JinjaTokenType.StmtEnd;
                     tokens.Add(new JinjaToken(endType, null, _line, _col));
+                    if (_trimBlocks && endType == JinjaTokenType.StmtEnd)
+                        SkipOneNewline();
                     return;
                 }
             }
@@ -240,6 +271,17 @@ internal sealed class JinjaLexer
             {
                 Advance(); // skip backslash
                 char escaped = _source[_pos];
+
+                // Python string-literal hex escapes: \xNN, \uNNNN, \UNNNNNNNN (Flint's template strips "\x00").
+                int hexDigits = escaped switch { 'x' => 2, 'u' => 4, 'U' => 8, _ => 0 };
+                if (hexDigits > 0 && TryReadHex(_pos + 1, hexDigits, out int codePoint))
+                {
+                    sb.Append(char.ConvertFromUtf32(codePoint));
+                    for (int i = 0; i <= hexDigits; i++)
+                        Advance();
+                    continue;
+                }
+
                 sb.Append(escaped switch
                 {
                     'n' => '\n',
@@ -265,6 +307,34 @@ internal sealed class JinjaLexer
         Advance(); // skip closing quote
         return new JinjaToken(JinjaTokenType.StringLiteral, sb.ToString(), startLine, startCol);
     }
+
+    /// <summary>Parses exactly <paramref name="count"/> hex digits starting at <paramref name="start"/> as a Unicode scalar value.</summary>
+    /// <param name="start">Index of the first hex digit.</param>
+    /// <param name="count">Number of hex digits to read.</param>
+    /// <param name="codePoint">The parsed code point when successful.</param>
+    /// <returns><see langword="true"/> when all digits are hex and the value is a valid scalar (not a surrogate).</returns>
+    private bool TryReadHex(int start, int count, out int codePoint)
+    {
+        codePoint = 0;
+        if (start + count > _source.Length)
+            return false;
+        for (int i = 0; i < count; i++)
+        {
+            int d = HexValue(_source[start + i]);
+            if (d < 0)
+                return false;
+            codePoint = (codePoint << 4) | d;
+        }
+        return codePoint is >= 0 and <= 0x10FFFF and not (>= 0xD800 and <= 0xDFFF);
+    }
+
+    private static int HexValue(char c) => c switch
+    {
+        >= '0' and <= '9' => c - '0',
+        >= 'a' and <= 'f' => c - 'a' + 10,
+        >= 'A' and <= 'F' => c - 'A' + 10,
+        _ => -1,
+    };
 
     private JinjaToken ReadNumber()
     {
@@ -302,6 +372,7 @@ internal sealed class JinjaLexer
             "set" => JinjaTokenType.Set,
             "macro" => JinjaTokenType.Macro,
             "endmacro" => JinjaTokenType.EndMacro,
+            "endset" => JinjaTokenType.EndSet,
             "not" => JinjaTokenType.Not,
             "and" => JinjaTokenType.And,
             "or" => JinjaTokenType.Or,
@@ -324,16 +395,18 @@ internal sealed class JinjaLexer
         return new JinjaToken(type, value, startLine, startCol);
     }
 
-    private void SkipComment()
+    /// <returns>True when the comment closed with <c>-#}</c> (strip following whitespace).</returns>
+    private bool SkipComment()
     {
         // Already consumed {#, now scan for #}
         while (_pos < _source.Length)
         {
             if (_source[_pos] == '#' && _pos + 1 < _source.Length && _source[_pos + 1] == '}')
             {
+                bool strip = _pos > 0 && _source[_pos - 1] == '-';
                 Advance();
                 Advance();
-                return;
+                return strip;
             }
             Advance();
         }
@@ -379,6 +452,43 @@ internal sealed class JinjaLexer
             }
             _pos++;
         }
+    }
+
+    /// <summary>Skips a single LF or CRLF at the current position (trim_blocks).</summary>
+    private void SkipOneNewline()
+    {
+        if (_pos + 1 < _source.Length && _source[_pos] == '\r' && _source[_pos + 1] == '\n')
+            Advance();
+        if (_pos < _source.Length && _source[_pos] == '\n')
+            Advance();
+    }
+
+    /// <summary>
+    /// lstrip_blocks: removes the spaces/tabs between the start of the SOURCE line and a block tag, but only when nothing
+    /// else precedes the tag on that line. Looks at the source rather than the token (trim_blocks may already have eaten the
+    /// newline that ended the previous line, leaving the indentation as the whole preceding Text token).
+    /// </summary>
+    private void StripLineIndentation(List<JinjaToken> tokens, int tagStart)
+    {
+        int i = tagStart - 1;
+        while (i >= 0 && _source[i] is ' ' or '\t')
+            i--;
+        int indent = tagStart - 1 - i;
+        if (indent == 0 || (i >= 0 && _source[i] != '\n'))
+            return;
+        if (tokens.Count == 0)
+            return;
+        int last = tokens.Count - 1;
+        if (tokens[last].Type != JinjaTokenType.Text)
+            return;
+        string text = (string)tokens[last].Value!;
+        if (text.Length < indent)
+            return;
+        string head = text[..^indent];
+        if (head.Length == 0)
+            tokens.RemoveAt(last);
+        else
+            tokens[last] = tokens[last] with { Value = head };
     }
 
     /// <summary>

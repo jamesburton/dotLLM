@@ -14,14 +14,29 @@ public sealed class HuggingFaceDownloader : IDisposable
 
     private readonly HttpClient _httpClient;
     private readonly bool _ownsClient;
+    private readonly string _cdnBase;
+
+    /// <summary>Headroom kept free beyond the download itself (#1296): 256 MiB.</summary>
+    public const long FreeSpaceMarginBytes = 256L * 1024 * 1024;
+
+    /// <summary>
+    /// Free bytes on the volume holding a directory, or null when unknown (#1296). Defaults to
+    /// <see cref="DriveInfo.AvailableFreeSpace"/>; tests substitute a fake.
+    /// </summary>
+    public Func<string, long?> FreeBytesProbe { get; init; } = DriveFreeBytes;
 
     /// <summary>
     /// Creates a new downloader.
     /// </summary>
     /// <param name="httpClient">Optional pre-configured <see cref="HttpClient"/>.</param>
     /// <param name="token">Optional HuggingFace token. Falls back to <c>HF_TOKEN</c> env var.</param>
-    public HuggingFaceDownloader(HttpClient? httpClient = null, string? token = null)
+    /// <param name="cdnBase">
+    /// Base URL to resolve repo files against. Defaults to <c>https://huggingface.co</c>; tests
+    /// point it at a local stub so no test ever reaches the real Hub.
+    /// </param>
+    public HuggingFaceDownloader(HttpClient? httpClient = null, string? token = null, string? cdnBase = null)
     {
+        _cdnBase = (cdnBase ?? DefaultCdnBase).TrimEnd('/');
         if (httpClient is not null)
         {
             _httpClient = httpClient;
@@ -88,33 +103,346 @@ public sealed class HuggingFaceDownloader : IDisposable
         long? totalBytes = response.Content.Headers.ContentLength.HasValue
             ? response.Content.Headers.ContentLength.Value + existingBytes
             : null;
+        EnsureFreeSpace(partPath, totalBytes, existingBytes);
 
         await using var contentStream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-        await using var fileStream = new FileStream(
+        var fileStream = new FileStream(
             partPath,
             existingBytes > 0 ? FileMode.Append : FileMode.Create,
             FileAccess.Write,
             FileShare.None,
             bufferSize: 81920);
-
-        var buffer = new byte[81920];
-        long totalRead = existingBytes;
-        int bytesRead;
-
-        while ((bytesRead = await contentStream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) > 0)
+        try
         {
-            await fileStream.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken).ConfigureAwait(false);
-            totalRead += bytesRead;
-            progress?.Report((totalRead, totalBytes));
+            var buffer = new byte[81920];
+            long totalRead = existingBytes;
+            int bytesRead;
+
+            while ((bytesRead = await contentStream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) > 0)
+            {
+                await fileStream.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken).ConfigureAwait(false);
+                totalRead += bytesRead;
+                progress?.Report((totalRead, totalBytes));
+            }
+        }
+        catch (IOException ex) when (IsDiskFull(ex))
+        {
+            await fileStream.DisposeAsync().ConfigureAwait(false);
+            throw DiskFilled(partPath, totalBytes, ex);
+        }
+        finally
+        {
+            await fileStream.DisposeAsync().ConfigureAwait(false);
         }
 
         // Rename .part to final path once download is complete
-        fileStream.Close();
         if (File.Exists(destPath))
             File.Delete(destPath);
         File.Move(partPath, destPath);
 
         return destPath;
+    }
+
+    /// <summary>
+    /// Refuses a download that cannot fit (#1296): the bytes still to fetch plus <see cref="FreeSpaceMarginBytes"/> must be
+    /// free on the target volume. Skipped when the size or the free space is unknown.
+    /// </summary>
+    /// <param name="targetPath">The file about to be written.</param>
+    /// <param name="totalBytes">The file's full size, when the server reported it.</param>
+    /// <param name="existingBytes">Bytes already on disk from an earlier, resumed attempt.</param>
+    /// <exception cref="InsufficientDiskSpaceException">The volume lacks the space.</exception>
+    public void EnsureFreeSpace(string targetPath, long? totalBytes, long existingBytes)
+    {
+        if (totalBytes is not long total || total - existingBytes <= 0)
+            return;
+        long required = total - existingBytes + FreeSpaceMarginBytes;
+        string dir = Path.GetDirectoryName(Path.GetFullPath(targetPath)) ?? targetPath;
+        if (FreeBytesProbe(dir) is long free && free < required)
+            throw new InsufficientDiskSpaceException(targetPath, required, free);
+    }
+
+    /// <summary>The default <see cref="FreeBytesProbe"/>: <see cref="DriveInfo.AvailableFreeSpace"/> of the volume, or null.</summary>
+    private static long? DriveFreeBytes(string directory)
+    {
+        try
+        {
+            string? root = Path.GetPathRoot(Path.GetFullPath(directory));
+            return string.IsNullOrEmpty(root) ? null : new DriveInfo(root).AvailableFreeSpace;
+        }
+        catch (Exception ex) when (ex is IOException or ArgumentException or UnauthorizedAccessException)
+        {
+            return null; // unknown volume: do not block the download on a probe failure
+        }
+    }
+
+    /// <summary>
+    /// Whether <paramref name="ex"/> is "disk full": Windows <c>ERROR_DISK_FULL</c> (112) / <c>ERROR_HANDLE_DISK_FULL</c> (39),
+    /// or POSIX <c>ENOSPC</c> (28).
+    /// </summary>
+    /// <param name="ex">The I/O error.</param>
+    /// <returns>True for a full disk.</returns>
+    public static bool IsDiskFull(IOException ex)
+    {
+        int code = ex.HResult & 0xFFFF;
+        return OperatingSystem.IsWindows() ? code is 112 or 39 : code == 28;
+    }
+
+    /// <summary>Deletes the partial file a full disk left behind and describes the failure (#1296).</summary>
+    private InsufficientDiskSpaceException DiskFilled(string partPath, long? totalBytes, IOException ex)
+    {
+        long written = 0;
+        try
+        {
+            if (File.Exists(partPath))
+            {
+                written = new FileInfo(partPath).Length;
+                File.Delete(partPath);
+            }
+        }
+        catch (IOException)
+        {
+            // Best effort: the error below still names the problem.
+        }
+
+        string dir = Path.GetDirectoryName(Path.GetFullPath(partPath)) ?? partPath;
+        return new InsufficientDiskSpaceException(partPath, (totalBytes ?? written) + FreeSpaceMarginBytes, FreeBytesProbe(dir), ex);
+    }
+
+    /// <summary>
+    /// Result of <see cref="DownloadToHubCacheAsync"/>: where the bytes physically live and the
+    /// two paths that reference them.
+    /// </summary>
+    /// <param name="BlobPath">The single physical copy, inside the hub cache's <c>blobs</c> folder.</param>
+    /// <param name="SnapshotPath">Hub-cache snapshot entry (hardlink to the blob).</param>
+    /// <param name="ModelPath">
+    /// Mirror path under <see cref="DefaultModelsDirectory"/> (hardlink to the blob) so the
+    /// server's flat-tree model resolver finds it.
+    /// </param>
+    /// <param name="SizeBytes">Final file size.</param>
+    /// <param name="Hardlinked">False when a hardlink was impossible and the file had to be copied.</param>
+    public readonly record struct HubCacheDownloadResult(
+        string BlobPath, string SnapshotPath, string ModelPath, long SizeBytes, bool Hardlinked);
+
+    /// <summary>
+    /// Downloads a repo file into the <b>Hugging Face hub cache</b> (#454) — the canonical
+    /// <c>blobs</c>/<c>snapshots</c>/<c>refs</c> layout shared with <c>huggingface_hub</c> —
+    /// and hardlinks it into <see cref="DefaultModelsDirectory"/> so the existing flat-tree
+    /// resolver still finds it. Resumable (an interrupted download leaves
+    /// <c>blobs/{etag}.incomplete</c>, which a later call continues via a Range request) and
+    /// cancellable.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately a <b>new</b> method rather than a change to
+    /// <see cref="DownloadFileAsync"/>: the CLI <c>pull</c> command depends on that method's
+    /// existing <c>~/.dotllm/models</c> behaviour.
+    /// </remarks>
+    /// <param name="repoId">Repository ID, e.g. "bartowski/Qwen2.5-3B-GGUF".</param>
+    /// <param name="filename">Filename within the repo.</param>
+    /// <param name="revision">Git revision to resolve. Defaults to <c>main</c>.</param>
+    /// <param name="cacheRoot">Hub cache root. Defaults to <see cref="HubCache.CacheRoot"/>.</param>
+    /// <param name="modelsDir">Mirror root. Defaults to <see cref="DefaultModelsDirectory"/>.</param>
+    /// <param name="progress">Progress callback: (bytesDownloaded, totalBytes).</param>
+    /// <param name="cancellationToken">Cancels the transfer, leaving the <c>.incomplete</c> file for resume.</param>
+    public async Task<HubCacheDownloadResult> DownloadToHubCacheAsync(
+        string repoId,
+        string filename,
+        string? revision = null,
+        string? cacheRoot = null,
+        string? modelsDir = null,
+        IProgress<(long bytesDownloaded, long? totalBytes)>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        revision ??= "main";
+        cacheRoot ??= HubCache.CacheRoot;
+
+        var url = $"{_cdnBase}/{repoId}/resolve/{revision}/{filename}";
+
+        // A HEAD gives the blob identity (etag) and the resolved commit without transferring
+        // bytes, so the resume file can be named before the first byte arrives.
+        //
+        // It MUST NOT follow redirects. Every GGUF on the Hub is an LFS/Xet object, so
+        // /resolve/ answers 302 -> a CDN host, and X-Linked-ETag (the sha256 huggingface_hub
+        // names the blob by), X-Repo-Commit and X-Linked-Size ride on that 302 only — the CDN's
+        // own response carries a different, unrelated ETag and no commit. Following the redirect
+        // here would name the blob by the CDN's ETag (a second physical copy alongside whatever
+        // `hf download` already wrote, defeating the point of using the hub cache at all) and
+        // write snapshots/main/ instead of snapshots/{sha}/. Verified against the live Hub with a
+        // HEAD request, not assumed.
+        string etag;
+        string commit;
+        long? headLength;
+        using (var head = new HttpRequestMessage(HttpMethod.Head, url))
+        using (var headResponse = await MetadataClient.SendAsync(head, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false))
+        {
+            if (headResponse.StatusCode is not System.Net.HttpStatusCode.Found
+                and not System.Net.HttpStatusCode.MovedPermanently
+                and not System.Net.HttpStatusCode.TemporaryRedirect
+                and not System.Net.HttpStatusCode.PermanentRedirect)
+            {
+                headResponse.EnsureSuccessStatusCode();
+            }
+
+            etag = ReadEtag(headResponse);
+            commit = ReadHeader(headResponse, "X-Repo-Commit") ?? revision;
+            headLength = headResponse.Content.Headers.ContentLength
+                ?? (long.TryParse(ReadHeader(headResponse, "X-Linked-Size"), out var linked) ? linked : null);
+        }
+
+        var blobPath = HubCache.BlobPath(repoId, etag, cacheRoot);
+        var partPath = HubCache.IncompleteBlobPath(repoId, etag, cacheRoot);
+        var snapshotPath = HubCache.SnapshotFilePath(repoId, commit, filename, cacheRoot);
+        var mirrorPath = HubCache.MirrorPath(repoId, filename, modelsDir);
+        Directory.CreateDirectory(Path.GetDirectoryName(blobPath)!);
+
+        if (!File.Exists(blobPath))
+        {
+            long existingBytes = File.Exists(partPath) ? new FileInfo(partPath).Length : 0;
+
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            if (existingBytes > 0)
+                request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(existingBytes, null);
+
+            using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+            if (existingBytes > 0 && response.StatusCode != System.Net.HttpStatusCode.PartialContent)
+                existingBytes = 0; // server ignored the Range - restart
+            response.EnsureSuccessStatusCode();
+
+            long? totalBytes = response.Content.Headers.ContentLength.HasValue
+                ? response.Content.Headers.ContentLength.Value + existingBytes
+                : headLength;
+
+            EnsureFreeSpace(partPath, totalBytes, existingBytes);
+            progress?.Report((existingBytes, totalBytes));
+
+            try
+            {
+                await using (var contentStream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false))
+                await using (var fileStream = new FileStream(partPath,
+                    existingBytes > 0 ? FileMode.Append : FileMode.Create,
+                    FileAccess.Write, FileShare.None, bufferSize: 81920))
+                {
+                    var buffer = new byte[81920];
+                    long totalRead = existingBytes;
+                    int bytesRead;
+                    while ((bytesRead = await contentStream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) > 0)
+                    {
+                        // Deliberately NOT passing the token to WriteAsync: a cancel between the read
+                        // and the write would drop bytes already consumed from the socket, so the
+                        // .incomplete length would no longer match what was received and the resume
+                        // Range would be wrong.
+                        await fileStream.WriteAsync(buffer.AsMemory(0, bytesRead), CancellationToken.None).ConfigureAwait(false);
+                        totalRead += bytesRead;
+                        progress?.Report((totalRead, totalBytes));
+                    }
+                    await fileStream.FlushAsync(CancellationToken.None).ConfigureAwait(false);
+                }
+            }
+            catch (IOException ex) when (IsDiskFull(ex))
+            {
+                // The streams are closed by now. Resuming would need the same space again, so free it (#1296).
+                throw DiskFilled(partPath, totalBytes, ex);
+            }
+
+            File.Move(partPath, blobPath, overwrite: true);
+        }
+
+        bool hardlinked = HubCache.LinkOrCopy(blobPath, snapshotPath);
+        hardlinked &= HubCache.LinkOrCopy(blobPath, mirrorPath);
+
+        var refsPath = Path.Combine(HubCache.RepoDirectory(repoId, cacheRoot), "refs", revision);
+        Directory.CreateDirectory(Path.GetDirectoryName(refsPath)!);
+        await File.WriteAllTextAsync(refsPath, commit, CancellationToken.None).ConfigureAwait(false);
+
+        return new HubCacheDownloadResult(
+            blobPath, snapshotPath, mirrorPath, new FileInfo(blobPath).Length, hardlinked);
+    }
+
+    /// <summary>
+    /// Like <see cref="DownloadToHubCacheAsync"/>, but split-GGUF aware (issue #756): when <paramref name="filename"/> is shard 1 of a
+    /// <c>name-00001-of-0000M.gguf</c> set, ALL M shards are fetched into the hub cache (each its own blob, hardlinked into the snapshot
+    /// and the mirror directory side by side - never copied) and the result describes shard 1, the entry point the engine opens. For an
+    /// ordinary file it is exactly <see cref="DownloadToHubCacheAsync"/>. Progress is cumulative over the whole set.
+    /// </summary>
+    /// <param name="repoId">Repository ID.</param>
+    /// <param name="filename">Filename within the repo (shard 1 for a split set).</param>
+    /// <param name="revision">Git revision; defaults to <c>main</c>.</param>
+    /// <param name="cacheRoot">Hub cache root.</param>
+    /// <param name="modelsDir">Mirror root.</param>
+    /// <param name="progress">Cumulative progress callback.</param>
+    /// <param name="cancellationToken">Cancels the transfer.</param>
+    /// <param name="totalBytesHint">Sum of all shard sizes when known (from the repo listing); lets progress report a total across shards.</param>
+    public async Task<HubCacheDownloadResult> DownloadModelToHubCacheAsync(
+        string repoId, string filename, string? revision = null, string? cacheRoot = null, string? modelsDir = null,
+        IProgress<(long bytesDownloaded, long? totalBytes)>? progress = null, CancellationToken cancellationToken = default,
+        long? totalBytesHint = null)
+    {
+        var names = SplitGguf.ShardNames(filename);
+        if (names.Count == 1 || !SplitGguf.IsFirstShard(filename))
+            return await DownloadToHubCacheAsync(repoId, filename, revision, cacheRoot, modelsDir, progress, cancellationToken).ConfigureAwait(false);
+
+        HubCacheDownloadResult first = default;
+        long done = 0;
+        for (int i = 0; i < names.Count; i++)
+        {
+            long before = done;
+            bool last = i == names.Count - 1;
+            var shardProgress = progress is null ? null : new SyncProgress((b, t) =>
+                progress.Report((before + b, totalBytesHint ?? (last && t is not null ? before + t : null))));
+            var r = await DownloadToHubCacheAsync(repoId, names[i], revision, cacheRoot, modelsDir, shardProgress, cancellationToken).ConfigureAwait(false);
+            done += r.SizeBytes;
+            if (i == 0) first = r;
+        }
+        progress?.Report((done, done));
+        return first with { SizeBytes = done };
+    }
+
+    private sealed class SyncProgress(Action<long, long?> report) : IProgress<(long bytesDownloaded, long? totalBytes)>
+    {
+        public void Report((long bytesDownloaded, long? totalBytes) v) => report(v.bytesDownloaded, v.totalBytes);
+    }
+
+    private HttpClient? _metadataClient;
+
+    /// <summary>
+    /// Redirect-free client used only for the metadata HEAD. Separate from
+    /// <see cref="_httpClient"/> so the body GET keeps its normal auto-redirect behaviour (and
+    /// .NET's stripping of the Authorization header when the redirect crosses to the CDN host),
+    /// while the HEAD can read the headers the Hub puts on the 302 itself. Created lazily so the
+    /// ordinary <see cref="DownloadFileAsync"/> path allocates nothing extra.
+    /// </summary>
+    private HttpClient MetadataClient
+    {
+        get
+        {
+            if (_metadataClient is not null) return _metadataClient;
+
+            var handler = new SocketsHttpHandler { AllowAutoRedirect = false };
+            var client = new HttpClient(handler, disposeHandler: true);
+            foreach (var header in _httpClient.DefaultRequestHeaders)
+                client.DefaultRequestHeaders.TryAddWithoutValidation(header.Key, header.Value);
+            return _metadataClient = client;
+        }
+    }
+
+    private static string ReadEtag(HttpResponseMessage response)
+    {
+        var raw = ReadHeader(response, "X-Linked-Etag") ?? ReadHeader(response, "ETag");
+        return raw is null ? "unknown" : HubCache.SanitizeEtag(raw);
+    }
+
+    private static string? ReadHeader(HttpResponseMessage response, string name)
+    {
+        if (response.Headers.TryGetValues(name, out var values))
+        {
+            var v = values.FirstOrDefault();
+            if (!string.IsNullOrWhiteSpace(v)) return v;
+        }
+        if (response.Content.Headers.TryGetValues(name, out var cvalues))
+        {
+            var v = cvalues.FirstOrDefault();
+            if (!string.IsNullOrWhiteSpace(v)) return v;
+        }
+        return null;
     }
 
     /// <summary>
@@ -152,6 +480,8 @@ public sealed class HuggingFaceDownloader : IDisposable
     /// <inheritdoc/>
     public void Dispose()
     {
+        _metadataClient?.Dispose();
+        _metadataClient = null;
         if (_ownsClient)
             _httpClient.Dispose();
     }

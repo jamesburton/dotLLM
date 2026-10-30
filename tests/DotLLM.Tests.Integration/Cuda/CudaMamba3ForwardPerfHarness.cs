@@ -26,6 +26,7 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// "benchmark before/after kernel changes").
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class CudaMamba3ForwardPerfHarness
 {
     private const string PerfEnvVar = "DOTLLM_CUDA_MAMBA3_PERF";

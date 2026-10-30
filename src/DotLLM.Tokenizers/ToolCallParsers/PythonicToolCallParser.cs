@@ -52,6 +52,11 @@ public sealed class PythonicToolCallParser : IToolCallParser
     private const string OpenTag = "<tool_call>";
     private const string CloseTag = "</tool_call>";
 
+    // Liquid AI LFM2 / LFM2.5 (#1015): `<|tool_call_start|>[fn(a=1), fn2(b='x')]<|tool_call_end|>` - special-token wrapper
+    // around a Python LIST of calls. Handled by stripping the wrapper and the list brackets.
+    private const string LfmOpenTag = "<|tool_call_start|>";
+    private const string LfmCloseTag = "<|tool_call_end|>";
+
     /// <inheritdoc/>
     public ToolCall[]? TryParse(string generatedText)
     {
@@ -88,13 +93,17 @@ public sealed class PythonicToolCallParser : IToolCallParser
     }
 
     /// <inheritdoc/>
+    public IReadOnlyList<string> StartMarkers { get; } = [OpenTag, LfmOpenTag];
+
+    /// <inheritdoc/>
     public bool IsToolCallStart(string text)
     {
         if (string.IsNullOrEmpty(text))
             return false;
 
         // Wrapper present → it's a call regardless of payload shape.
-        if (text.Contains(OpenTag, StringComparison.Ordinal))
+        if (text.Contains(OpenTag, StringComparison.Ordinal)
+            || text.Contains(LfmOpenTag, StringComparison.Ordinal))
             return true;
 
         // Otherwise look for an identifier followed directly by '(' in the
@@ -118,6 +127,24 @@ public sealed class PythonicToolCallParser : IToolCallParser
 
     private static string StripWrapperTags(string s)
     {
+        int lfmOpen = s.IndexOf(LfmOpenTag, StringComparison.Ordinal);
+        if (lfmOpen >= 0)
+        {
+            int start = lfmOpen + LfmOpenTag.Length;
+            int end = s.IndexOf(LfmCloseTag, start, StringComparison.Ordinal);
+            string payload = end < 0 ? s[start..] : s[start..end];
+            payload = payload.Trim();
+            // Drop the Python list brackets around the call(s).
+            if (payload.StartsWith('['))
+            {
+                payload = payload[1..];
+                int last = payload.LastIndexOf(']');
+                if (last >= 0 && payload[(last + 1)..].Trim().Length == 0)
+                    payload = payload[..last];
+            }
+            return payload;
+        }
+
         int open = s.IndexOf(OpenTag, StringComparison.Ordinal);
         if (open < 0)
             return s;

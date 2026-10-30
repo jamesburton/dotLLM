@@ -2,6 +2,7 @@ using System.Runtime.InteropServices;
 using DotLLM.Cuda;
 using DotLLM.Cuda.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 using Architecture = DotLLM.Core.Configuration.Architecture;
@@ -10,7 +11,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 
 /// <summary>
 /// Real-weight CUDA smoke test for <see cref="CudaQwen3HybridDenseTransformerModel"/> against
-/// PrismML's actual <c>Ternary-Bonsai-27B-Q2_0.gguf</c> (issue #157). Runs a short deterministic
+/// PrismML's actual <c>Ternary-Bonsai-2-27B-PQ2_0.gguf</c> (issue #157). Runs a short deterministic
 /// prompt through prefill + a few greedy decode steps on the RTX 3060 and asserts every logits
 /// row is finite (no NaN/Inf) — the GPU-side correctness gate before the baseline benchmark.
 /// </summary>
@@ -19,7 +20,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 public class CudaQwen3HybridDenseRealGgufSmokeTest
 {
     private const string ModelPathEnvVar = "DOTLLM_BONSAI_PQ2_0_GGUF";
-    private const string FileName = "Ternary-Bonsai-27B-Q2_0.gguf";
+    private const string FileName = "Ternary-Bonsai-2-27B-PQ2_0.gguf";
 
     private readonly ITestOutputHelper _out;
     public CudaQwen3HybridDenseRealGgufSmokeTest(ITestOutputHelper output) => _out = output;
@@ -39,7 +40,7 @@ public class CudaQwen3HybridDenseRealGgufSmokeTest
         string? path = ResolveFixturePath();
         Skip.If(path is null,
             $"Bonsai PQ2_0 GGUF fixture not found. Set {ModelPathEnvVar}, or place {FileName} under "
-            + "~/.dotllm/models/PrismML/Ternary-Bonsai-27B-GGUF/ or ~/.dotllm/test-cache/PrismML/Ternary-Bonsai-27B-GGUF/.");
+            + "~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/.");
         string? ptxDir = FindPtxDir();
         Skip.If(ptxDir is null, "PTX files not found");
 
@@ -104,21 +105,7 @@ public class CudaQwen3HybridDenseRealGgufSmokeTest
 
     private static string? ResolveFixturePath()
     {
-        string? envPath = Environment.GetEnvironmentVariable(ModelPathEnvVar);
-        if (!string.IsNullOrWhiteSpace(envPath) && File.Exists(envPath))
-            return envPath;
-
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string[] candidates =
-        [
-            Path.Combine(home, ".dotllm", "models", "PrismML", "Ternary-Bonsai-27B-GGUF", FileName),
-            Path.Combine(home, ".dotllm", "test-cache", "PrismML", "Ternary-Bonsai-27B-GGUF", FileName),
-        ];
-        foreach (string candidate in candidates)
-            if (File.Exists(candidate))
-                return candidate;
-
-        return null;
+        return KnownTestFixtures.TernaryBonsai27B_Q2_0.Path;
     }
 
     private static string? FindPtxDir()

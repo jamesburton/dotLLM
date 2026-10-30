@@ -19,6 +19,51 @@ namespace DotLLM.Vulkan;
 /// </remarks>
 public static class VulkanModelLoader
 {
+    private static readonly Lazy<VulkanDevice> SharedDeviceLazy = new(VulkanDevice.Create);
+
+    /// <summary>
+    /// Process-wide Vulkan device for long-lived hosts (<c>serve</c>, <c>run</c>). Created on first use and
+    /// intentionally never disposed: the model does not own its device, and one device per process is
+    /// what the serving paths want across model reloads. Short-lived commands that want deterministic
+    /// teardown (<c>bench</c>) create and dispose their own.
+    /// </summary>
+    public static VulkanDevice SharedDevice => SharedDeviceLazy.Value;
+
+    /// <summary>
+    /// Resolves the SPIR-V blob directory: <c>spv/</c> beside the running assembly (the MSBuild
+    /// content-copy layout), falling back to the in-repo <c>native/vulkan/spv</c> for <c>dotnet run</c>
+    /// from the source tree.
+    /// </summary>
+    public static string ResolveSpvDir()
+    {
+        string[] candidates =
+        {
+            Path.Combine(AppContext.BaseDirectory, "spv"),
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "native", "vulkan", "spv"),
+        };
+        foreach (string c in candidates)
+        {
+            string full = Path.GetFullPath(c);
+            if (Directory.Exists(full) && Directory.GetFiles(full, "*.spv").Length > 0)
+                return full;
+        }
+        throw new InvalidOperationException(
+            "SPIR-V blobs not found (looked for spv/ beside the binary and native/vulkan/spv). " +
+            "Build them with native/vulkan/build.ps1 (requires the Vulkan SDK).");
+    }
+
+    /// <summary>True when a <c>--device</c> string selects the Vulkan backend (<c>vulkan</c>).</summary>
+    public static bool IsVulkanDeviceString(string? device) =>
+        device is not null && device.StartsWith("vulkan", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// <see cref="CreateFromGguf"/> on the <see cref="SharedDevice"/> with the standard SPIR-V directory —
+    /// the one call the serving entry points make.
+    /// </summary>
+    public static (IModel Model, Func<int, IKvCache> KvCacheFactory) CreateSharedFromGguf(
+        GgufFile gguf, ModelConfig config, int nCpuMoeLayers = -1)
+        => CreateFromGguf(SharedDevice, gguf, config, ResolveSpvDir(), nCpuMoeLayers);
+
     /// <summary>
     /// Creates the architecture-appropriate Vulkan model for <paramref name="gguf"/>.
     /// </summary>
@@ -36,7 +81,8 @@ public static class VulkanModelLoader
     /// cache type and there is no common <c>CreateKvCache</c> interface.
     /// </returns>
     /// <exception cref="NotSupportedException">
-    /// The architecture has no GGUF representation at all (Mamba-3).
+    /// The architecture has no GGUF representation at all (Mamba-3), or is only wired on the single-device model
+    /// (gpt-oss on the pipeline/hybrid models; #737).
     /// </exception>
     public static (IModel Model, Func<int, IKvCache> KvCacheFactory) CreateFromGguf(
         VulkanDevice device, GgufFile gguf, ModelConfig config, string spvDir,
@@ -47,6 +93,11 @@ public static class VulkanModelLoader
         ArgumentNullException.ThrowIfNull(config);
         ArgumentNullException.ThrowIfNull(spvDir);
 
+        // #1038: Vulkan NVFP4 runs on the Nemotron-H path only (packed matmul + X.scale). Every other
+        // architecture would widen it and drop the scale, so refuse before any upload.
+        if (config.Architecture is not (Architecture.NemotronH or Architecture.NemotronHMoe))
+            Nvfp4Support.RejectAny(gguf.TensorsByName, "Vulkan");
+
         switch (config.Architecture)
         {
             case Architecture.Qwen3MoeHybrid:
@@ -56,7 +107,15 @@ public static class VulkanModelLoader
                 return (moe, size => moe.CreateKvCache(size));
             }
 
+            case Architecture.Lfm2Moe:
+            {
+                // LFM2.5-24B-A2B (#1015): gated short-conv + GQA hybrid, dense-then-MoE FFN; Q4_0 weights are served as exact Q8_0.
+                var lfm = VulkanLfm2MoeTransformerModel.BuildFromGguf(device, gguf, config, spvDir);
+                return (lfm, size => lfm.CreateKvCache(size));
+            }
+
             case Architecture.NemotronH:
+            case Architecture.NemotronHMoe:   // #402: routed layers are detected per layer by the router tensor
             {
                 var nemotron = VulkanNemotronHTransformerModel.BuildFromGguf(
                     device, gguf, config, spvDir);
@@ -75,12 +134,16 @@ public static class VulkanModelLoader
             // caller then sees "blk.0.attn_output.weight not present" (or a bare
             // "Hybrid SSM / Mamba architectures are not supported") instead of the actual
             // reason.
-            case Architecture.NemotronHMoe:
-                throw new NotSupportedException(
-                    "nemotron_h_moe (Nemotron 3.5 Lightning) is recognized but not yet runnable on " +
-                    "Vulkan: the DeepSeek-V3-style MoE forward is not implemented, and its expert " +
-                    "tensors ship in quantizations (Q5_0/IQ4_NL/Q4_0) the expert-indexed MoE kernel " +
-                    "family does not cover yet. Tracked in issue #375.");
+            case Architecture.Qwen4Exp:
+            {
+                // Qwen3.8-Flash-Next (#818 V1, #871): dense-attention QSA fallback, host n-gram branch. Per-sequence state
+                // (CreateSequenceState) with the QSA K/V rows in an engine KV cache clamped to the dense-attention limit.
+                var q4 = VulkanQwen4ExpTransformerModel.BuildFromGguf(device, gguf, config, spvDir);
+                return (q4, size => q4.CreateKvCache(size));
+            }
+
+            // MiMo-V2 (#955) falls through to `default`: the generic VulkanTransformerModel implements zero-padded-V attention, per-layer
+            // KV heads / rope, sink attention and the IQ routed banks.
 
             case Architecture.Mamba3:
                 throw new NotSupportedException(
@@ -89,9 +152,19 @@ public static class VulkanModelLoader
                     "cannot produce Architecture.Mamba3 in the first place. Mamba-3 is safetensors-first on " +
                     "every backend — load it via VulkanMamba3TransformerModel.LoadFromSafetensors.");
 
+            // gpt-oss (#737) falls through to `default`: VulkanTransformerModel implements its attention
+            // sinks, dense YaRN RoPE, OAI SwiGLU and MXFP4 experts. RejectUnsupportedArchitecture still
+            // refuses it on the pipeline / hybrid / prebuilt-stage side doors.
+
             default:
             {
                 var model = VulkanTransformerModel.LoadFromGguf(device, gguf, config, spvDir);
+                // MLA (DeepSeek-V2/V3, GLM-4.7-Flash) layers read K_nope/V/K_pe from a per-layer
+                // MlaVulkanKvCache. A plain GQA VulkanKvCache makes the forward fall back to its
+                // cacheless branch (attention sees only the current step's rows): prefill is exact
+                // but every decode step after it is garbage (#742 real-weights validation).
+                if (model.Config.MlaConfig is not null)
+                    return (model, size => model.CreateMlaKvCache(size));
                 return (model, size => model.CreateKvCache(size));
             }
         }

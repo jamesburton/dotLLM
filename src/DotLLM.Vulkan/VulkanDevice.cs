@@ -168,6 +168,13 @@ public sealed class VulkanDevice : IDisposable
     public bool HasIntegerDotProduct { get; }
 
     /// <summary>
+    /// The 16-bit / 8-bit storage and float16 / int8 arithmetic features this device supports, all of which were ENABLED at device
+    /// creation (issue #374). Shaders that declare <c>StorageBuffer16BitAccess</c>, <c>Float16</c>, <c>Int8</c> or
+    /// <c>StorageBuffer8BitAccess</c> are only valid on a device whose matching flag is set here.
+    /// </summary>
+    public VulkanNumericFeatures NumericFeatures { get; private set; }
+
+    /// <summary>
     /// True when the physical device advertises <c>VK_EXT_subgroup_size_control</c>
     /// (or Vulkan 1.3 core), reports a valid <c>minSubgroupSize</c>..<c>maxSubgroupSize</c>
     /// range with the compute stage in <c>requiredSubgroupSizeStages</c>, AND the
@@ -237,6 +244,12 @@ public sealed class VulkanDevice : IDisposable
     /// the extension; callers must keep the fence-serialized path available.
     /// </summary>
     public bool HasExternalSemaphoreWin32 { get; }
+
+    /// <summary>
+    /// True when <c>VK_KHR_external_memory_win32</c> was enabled at device creation, so a shared D3D12 heap can be imported as
+    /// device memory (#1304, <see cref="DotLLM.Vulkan.DirectStorage.DirectWeightStore"/>).
+    /// </summary>
+    internal bool HasExternalMemoryWin32 { get; private set; }
 
     /// <summary>
     /// True when the physical device advertises <c>VK_AMD_shader_info</c> AND
@@ -557,6 +570,11 @@ public sealed class VulkanDevice : IDisposable
                 // Falls back silently when absent — caller checks HasExternalSemaphoreWin32.
                 ProbeExternalSemaphoreWin32(physical, apiVersion, out bool hasExternalSemaphoreWin32);
 
+                // Probe VK_KHR_external_memory_win32 (Win32 only): imports a shared D3D12 heap filled by DirectStorage as
+                // device-local weight memory (#1304). Falls back silently when absent — caller checks HasExternalMemoryWin32.
+                bool hasExternalMemoryWin32 = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                    && HasDeviceExtension(physical, "VK_KHR_external_memory_win32"u8);
+
                 // Probe VK_AMD_shader_info — vendor extension, no feature bits, no
                 // Vulkan-version gate. Just an extension-presence check; enabling
                 // it at device-create is what makes vkGetShaderInfoAMD resolvable.
@@ -569,10 +587,14 @@ public sealed class VulkanDevice : IDisposable
                 bool hasPipelineExecutableProperties =
                     HasDeviceExtension(physical, "VK_KHR_pipeline_executable_properties"u8);
 
+                // Issue #374: 16-bit / 8-bit storage and float16 / int8 arithmetic. ~60 shaders declare these capabilities;
+                // every supported one is enabled (binding such a module on a device without the feature is spec-invalid).
+                VulkanNumericFeatures numeric = ProbeNumericFeatures(physical, apiVersion);
+
                 nint device = CreateLogicalDevice(
                     physical, queueFamily, hasCoopmat, hasExternalMemoryHost, hasIntegerDotProduct,
                     hasSubgroupSizeControl, hasExternalSemaphoreWin32, hasShaderInfoAmd,
-                    hasPipelineExecutableProperties);
+                    hasPipelineExecutableProperties, numeric, hasExternalMemoryWin32);
 
                 VulkanApi.vkGetDeviceQueue(device, queueFamily, 0, out nint queue);
 
@@ -594,6 +616,9 @@ public sealed class VulkanDevice : IDisposable
                     hasSubgroupSizeControl, minSubgroupSize, maxSubgroupSize,
                     requiredSubgroupSizeStages, hasExternalSemaphoreWin32, hasShaderInfoAmd,
                     hasPipelineExecutableProperties);
+                result.PhysicalDeviceIndex = IndexOfPhysicalDevice(instance, physical);
+                result.NumericFeatures = numeric;
+                result.HasExternalMemoryWin32 = hasExternalMemoryWin32;
                 instance = 0;
                 return result;
             }
@@ -607,6 +632,21 @@ public sealed class VulkanDevice : IDisposable
         {
             s_lifecycleLock.ExitWriteLock();
         }
+    }
+
+    /// <summary>
+    /// <c>vkEnumeratePhysicalDevices</c> index this device was created on (what <see cref="Create(int)"/> takes), or -1 when unknown. A second device
+    /// bound to the same GPU - e.g. the MTP-head headroom canary (#820) - must use the same index, or it would probe a different adapter.
+    /// </summary>
+    internal int PhysicalDeviceIndex { get; private set; } = -1;
+
+    private static int IndexOfPhysicalDevice(nint instance, nint physical)
+    {
+        uint count = 0;
+        if (VulkanApi.vkEnumeratePhysicalDevices(instance, ref count, null) < 0 || count == 0) return -1;
+        var devices = new nint[count];
+        if (VulkanApi.vkEnumeratePhysicalDevices(instance, ref count, devices) < 0) return -1;
+        return Array.IndexOf(devices, physical);
     }
 
     private static nint CreateInstance()
@@ -1007,6 +1047,54 @@ public sealed class VulkanDevice : IDisposable
     /// required for correctness — the shader works on any driver exposing the
     /// feature; acceleration only affects throughput.
     /// </summary>
+    /// <summary>
+    /// Issue #374: queries the 16-bit storage (1.1 core), float16 / int8 and 8-bit storage (1.2 core) feature bits. A device below
+    /// the version a struct became core reports none of its bits (the extensions are not probed: every target is 1.2+).
+    /// </summary>
+    /// <param name="physical">The physical device.</param>
+    /// <param name="apiVersion">Its API version.</param>
+    /// <returns>The supported bits.</returns>
+    private static unsafe VulkanNumericFeatures ProbeNumericFeatures(nint physical, uint apiVersion)
+    {
+        bool v11 = VkApiMajor(apiVersion) > 1u || (VkApiMajor(apiVersion) == 1u && VkApiMinor(apiVersion) >= 1u);
+        bool v12 = VkApiMajor(apiVersion) > 1u || (VkApiMajor(apiVersion) == 1u && VkApiMinor(apiVersion) >= 2u);
+        if (!v11) return default;
+        try
+        {
+            VkPhysicalDevice16BitStorageFeatures s16 = default;
+            s16.sType = VkStructureType.PhysicalDevice16BitStorageFeatures;
+            VkPhysicalDeviceShaderFloat16Int8Features f16i8 = default;
+            f16i8.sType = VkStructureType.PhysicalDeviceShaderFloat16Int8Features;
+            VkPhysicalDevice8BitStorageFeatures s8 = default;
+            s8.sType = VkStructureType.PhysicalDevice8BitStorageFeatures;
+            if (v12)
+            {
+                s16.pNext = (nint)(&f16i8);
+                f16i8.pNext = (nint)(&s8);
+            }
+
+            VkPhysicalDeviceFeatures2 features2 = default;
+            features2.sType = VkStructureType.PhysicalDeviceFeatures2;
+            features2.pNext = (nint)(&s16);
+            VulkanApi.vkGetPhysicalDeviceFeatures2(physical, ref features2);
+
+            return new VulkanNumericFeatures(
+                StorageBuffer16BitAccess: s16.storageBuffer16BitAccess != 0,
+                UniformAndStorageBuffer16BitAccess: s16.uniformAndStorageBuffer16BitAccess != 0,
+                StoragePushConstant16: s16.storagePushConstant16 != 0,
+                ShaderFloat16: v12 && f16i8.shaderFloat16 != 0,
+                ShaderInt8: v12 && f16i8.shaderInt8 != 0,
+                StorageBuffer8BitAccess: v12 && s8.storageBuffer8BitAccess != 0,
+                UniformAndStorageBuffer8BitAccess: v12 && s8.uniformAndStorageBuffer8BitAccess != 0,
+                StoragePushConstant8: v12 && s8.storagePushConstant8 != 0);
+        }
+        catch
+        {
+            // Same defensive posture as the other probes: an unusable answer enables nothing.
+            return default;
+        }
+    }
+
     private static unsafe void ProbeIntegerDotProduct(
         nint physical, uint apiVersion, out bool hasIntegerDotProduct)
     {
@@ -1281,7 +1369,7 @@ public sealed class VulkanDevice : IDisposable
         nint physical, uint queueFamily,
         bool enableCoopmat, bool enableExternalMemoryHost, bool enableIntegerDotProduct,
         bool enableSubgroupSizeControl, bool enableExternalSemaphoreWin32, bool enableShaderInfoAmd,
-        bool enablePipelineExecutableProperties)
+        bool enablePipelineExecutableProperties, VulkanNumericFeatures numeric, bool enableExternalMemoryWin32 = false)
     {
         float priority = 1.0f;
 
@@ -1321,6 +1409,7 @@ public sealed class VulkanDevice : IDisposable
         ReadOnlySpan<byte> extSemWin32Name = "VK_KHR_external_semaphore_win32\0"u8;
         ReadOnlySpan<byte> shaderInfoAmdName = "VK_AMD_shader_info\0"u8;
         ReadOnlySpan<byte> pipeExecName = "VK_KHR_pipeline_executable_properties\0"u8;
+        ReadOnlySpan<byte> extMemWin32Name = "VK_KHR_external_memory_win32\0"u8;
 
         // Pack name bytes + pointer array onto the stack. Worst case all eight
         // extension names are enabled at once (coopmat, external-memory ×2,
@@ -1333,8 +1422,8 @@ public sealed class VulkanDevice : IDisposable
             coopmatName.Length + extMemHostName.Length + extMemName.Length
             + intDotName.Length + sscName.Length
             + extSemName.Length + extSemWin32Name.Length + shaderInfoAmdName.Length
-            + pipeExecName.Length];
-        nint* namePtrs = stackalloc nint[9];
+            + pipeExecName.Length + extMemWin32Name.Length];
+        nint* namePtrs = stackalloc nint[11];
         int nameOffset = 0;
         uint extCount = 0;
 
@@ -1404,6 +1493,21 @@ public sealed class VulkanDevice : IDisposable
             nameOffset += pipeExecName.Length;
         }
 
+        if (enableExternalMemoryWin32)
+        {
+            // #1304: VK_KHR_external_memory_win32 depends on VK_KHR_external_memory; name it too unless the host-pointer block did.
+            if (!enableExternalMemoryHost)
+            {
+                for (int i = 0; i < extMemName.Length; i++) nameBytes[nameOffset + i] = extMemName[i];
+                namePtrs[extCount++] = (nint)(nameBytes + nameOffset);
+                nameOffset += extMemName.Length;
+            }
+
+            for (int i = 0; i < extMemWin32Name.Length; i++) nameBytes[nameOffset + i] = extMemWin32Name[i];
+            namePtrs[extCount++] = (nint)(nameBytes + nameOffset);
+            nameOffset += extMemWin32Name.Length;
+        }
+
         // Feature structs chained through pNext on top of the extension enables:
         //  - VK_KHR_cooperative_matrix requires `cooperativeMatrix=VK_TRUE`.
         //  - VK_KHR_shader_integer_dot_product requires
@@ -1465,6 +1569,39 @@ public sealed class VulkanDevice : IDisposable
             pipeExecFeatures.pipelineExecutableInfo = 1; // VK_TRUE
             pipeExecFeatures.pNext = featureChain;
             featureChain = (nint)(&pipeExecFeatures);
+        }
+
+        // Issue #374: enable every supported 16-bit / 8-bit storage and float16 / int8 bit (core structs, no extension names).
+        VkPhysicalDevice16BitStorageFeatures s16 = default;
+        if (numeric.Any16BitStorage)
+        {
+            s16.sType = VkStructureType.PhysicalDevice16BitStorageFeatures;
+            s16.storageBuffer16BitAccess = numeric.StorageBuffer16BitAccess ? 1u : 0u;
+            s16.uniformAndStorageBuffer16BitAccess = numeric.UniformAndStorageBuffer16BitAccess ? 1u : 0u;
+            s16.storagePushConstant16 = numeric.StoragePushConstant16 ? 1u : 0u;
+            s16.pNext = featureChain;
+            featureChain = (nint)(&s16);
+        }
+
+        VkPhysicalDeviceShaderFloat16Int8Features f16i8 = default;
+        if (numeric.ShaderFloat16 || numeric.ShaderInt8)
+        {
+            f16i8.sType = VkStructureType.PhysicalDeviceShaderFloat16Int8Features;
+            f16i8.shaderFloat16 = numeric.ShaderFloat16 ? 1u : 0u;
+            f16i8.shaderInt8 = numeric.ShaderInt8 ? 1u : 0u;
+            f16i8.pNext = featureChain;
+            featureChain = (nint)(&f16i8);
+        }
+
+        VkPhysicalDevice8BitStorageFeatures s8 = default;
+        if (numeric.Any8BitStorage)
+        {
+            s8.sType = VkStructureType.PhysicalDevice8BitStorageFeatures;
+            s8.storageBuffer8BitAccess = numeric.StorageBuffer8BitAccess ? 1u : 0u;
+            s8.uniformAndStorageBuffer8BitAccess = numeric.UniformAndStorageBuffer8BitAccess ? 1u : 0u;
+            s8.storagePushConstant8 = numeric.StoragePushConstant8 ? 1u : 0u;
+            s8.pNext = featureChain;
+            featureChain = (nint)(&s8);
         }
 
         ci.pNext = featureChain;
@@ -1540,7 +1677,20 @@ public sealed class VulkanDevice : IDisposable
         /// </summary>
         public bool IsHostVisible { get; }
 
-        internal Buffer(VulkanDevice device, nint buffer, nint memory, long size, bool hostVisible)
+        // Heap index and the ACTUAL allocated size (VkMemoryRequirements.size, which
+        // can exceed the requested Size), so disposal decrements exactly what
+        // AllocateInternal added to the per-heap accounting.
+        private readonly uint _heapIndex;
+        private readonly long _allocatedBytes;
+
+        // Sub-allocation (#1174): a buffer bound into another buffer's memory (a VulkanWeightArena slab)
+        // releases its slab reference instead of freeing memory; a slab frees its memory when the last
+        // reference (the arena's own, plus one per sub-buffer) goes.
+        private readonly Buffer? _slab;
+        private int _slabRefs;
+
+        internal Buffer(VulkanDevice device, nint buffer, nint memory, long size, bool hostVisible,
+            uint heapIndex = 0, long allocatedBytes = 0, uint typeIndex = uint.MaxValue)
         {
             _device = device;
             _buffer = buffer;
@@ -1548,6 +1698,45 @@ public sealed class VulkanDevice : IDisposable
             Size = size;
             _hostImport = null;
             IsHostVisible = hostVisible;
+            _heapIndex = heapIndex;
+            _allocatedBytes = allocatedBytes;
+            TypeIndex = typeIndex;
+        }
+
+        /// <summary>A sub-buffer: <paramref name="buffer"/> is bound to <paramref name="slab"/>'s memory at <paramref name="memoryOffset"/>.</summary>
+        internal Buffer(VulkanDevice device, nint buffer, Buffer slab, long memoryOffset, long size)
+        {
+            _device = device;
+            _buffer = buffer;
+            _memory = slab._memory;
+            Size = size;
+            MemoryOffset = memoryOffset;
+            TypeIndex = slab.TypeIndex;
+            _slab = slab;
+
+            // Never mapped directly: two sub-buffers of one slab share a VkDeviceMemory, which can only be
+            // mapped once, and a map at offset 0 would address the slab, not this buffer. Upload/Download stage instead.
+            IsHostVisible = false;
+            slab.AddSlabRef();
+        }
+
+        /// <summary>Memory type of the backing allocation; <see cref="uint.MaxValue"/> when unknown (imports).</summary>
+        internal uint TypeIndex { get; }
+
+        /// <summary>Runs once after this buffer's memory is freed (e.g. releases the D3D12 heap an imported allocation was backed by).</summary>
+        internal Action? FreeHook { get; set; }
+
+        /// <summary>Byte offset of this buffer inside <see cref="Memory"/>; non-zero only for a sub-allocated buffer.</summary>
+        public long MemoryOffset { get; }
+
+        /// <summary>True when this buffer is bound into a shared slab (<see cref="VulkanWeightArena"/>).</summary>
+        internal bool IsSubAllocated => _slab is not null;
+
+        internal void AddSlabRef() => Interlocked.Increment(ref _slabRefs);
+
+        internal void ReleaseSlabRef()
+        {
+            if (Interlocked.Decrement(ref _slabRefs) == 0) Dispose();
         }
 
         internal Buffer(VulkanDevice device, HostVisibleBuffer hostImport)
@@ -1566,6 +1755,25 @@ public sealed class VulkanDevice : IDisposable
         /// <inheritdoc/>
         public void Dispose()
         {
+            if (_slab is not null)
+            {
+                if (_buffer == 0) return;
+                s_lifecycleLock.EnterReadLock();
+                try
+                {
+                    _device.RecordBufferDestroyed(_buffer);
+                    VulkanApi.vkDestroyBuffer(_device._device, _buffer, 0);
+                    _buffer = 0;
+                    _memory = 0;
+                }
+                finally
+                {
+                    s_lifecycleLock.ExitReadLock();
+                }
+                _slab.ReleaseSlabRef();
+                return;
+            }
+
             if (_hostImport is not null)
             {
                 // The import wrapper owns lifetime — destroying the buffer +
@@ -1575,6 +1783,7 @@ public sealed class VulkanDevice : IDisposable
                 // inside another (ReaderWriterLockSlim is NoRecursion —
                 // that would throw). Clear our local copies so we don't
                 // double-free.
+                _device.RecordBufferDestroyed(_buffer);
                 _hostImport.Dispose();
                 _buffer = 0;
                 _memory = 0;
@@ -1590,6 +1799,7 @@ public sealed class VulkanDevice : IDisposable
             {
                 if (_buffer != 0)
                 {
+                    _device.RecordBufferDestroyed(_buffer);
                     VulkanApi.vkDestroyBuffer(_device._device, _buffer, 0);
                     _buffer = 0;
                 }
@@ -1597,12 +1807,21 @@ public sealed class VulkanDevice : IDisposable
                 {
                     VulkanApi.vkFreeMemory(_device._device, _memory, 0);
                     _memory = 0;
+                    if (_allocatedBytes != 0)
+                    {
+                        Interlocked.Add(ref _device._liveBytesByHeap[_heapIndex], -_allocatedBytes);
+                        Interlocked.Decrement(ref _device._liveCountByHeap[_heapIndex]);
+                    }
                 }
             }
             finally
             {
                 s_lifecycleLock.ExitReadLock();
             }
+
+            var hook = FreeHook;
+            FreeHook = null;
+            hook?.Invoke();
         }
     }
 
@@ -1670,7 +1889,138 @@ public sealed class VulkanDevice : IDisposable
         // still bound with VK_WHOLE_SIZE, so it must fit maxStorageBufferRange.
         ThrowIfExceedsStorageBufferRange(size, MaxStorageBufferRange);
         var import = HostVisibleBuffer.TryCreate(this, hostPointer, size);
+        if (s_memTrace)
+            Console.Error.WriteLine($"[vulkan-mem] import {size} B {(import is null ? "refused" : "ok")} at {TraceSite()}");
         return import is null ? null : new Buffer(this, import);
+    }
+
+    // ── #1304: shared D3D12 heap import (VK_KHR_external_memory_win32) ──────────────────────────────
+
+    /// <summary><c>VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT</c>.</summary>
+    internal const uint ExternalMemoryHandleD3D12Heap = 0x20;
+
+    // Correct sType values (VkStructureType.ExternalMemoryBufferCreateInfo in VulkanStructs.cs holds 1000072002, which is
+    // EXPORT_MEMORY_ALLOCATE_INFO; the buffer struct is 1000072000 - filed separately, not touched here).
+    private const int StructExternalMemoryBufferCreateInfo = 1000072000;
+    private const int StructImportMemoryWin32HandleInfoKhr = 1000073000;
+    private const int StructMemoryWin32HandlePropertiesKhr = 1000073002;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct VkMemoryWin32HandlePropertiesKhr
+    {
+        public int sType;
+        public nint pNext;
+        public uint memoryTypeBits;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct VkImportMemoryWin32HandleInfoKhr
+    {
+        public int sType;
+        public nint pNext;
+        public uint handleType;
+        public nint handle;
+        public nint name;
+    }
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int VkGetMemoryWin32HandlePropertiesKHR(
+        nint device, uint handleType, nint handle, ref VkMemoryWin32HandlePropertiesKhr pProperties);
+
+    /// <summary>
+    /// Imports a shared D3D12 heap (a Win32 handle from <c>ID3D12Device::CreateSharedHandle</c>) as one device allocation and
+    /// returns a whole-heap slab buffer bound to it; weight tensors are carved from it as sub-buffers like a
+    /// <see cref="VulkanWeightArena"/> slab (#1304). Only a strictly device-local memory type is accepted: the point of the
+    /// route is that the weights end up in the same memory a plain <see cref="AllocateDeviceLocal"/> would use.
+    /// </summary>
+    /// <param name="sharedHandle">Win32 handle of the D3D12 heap. The caller keeps ownership and closes it after the import.</param>
+    /// <param name="bytes">Heap size in bytes (must match the D3D12 heap).</param>
+    /// <param name="reason">Why the import was refused, when it returns null.</param>
+    /// <returns>The slab buffer, or null when the driver refused the import.</returns>
+    internal unsafe Buffer? TryImportD3D12Heap(nint sharedHandle, long bytes, out string reason)
+    {
+        reason = string.Empty;
+        if (!HasExternalMemoryWin32) { reason = "no_external_memory_win32"; return null; }
+        nint fn = VulkanApi.vkGetDeviceProcAddr(_device, "vkGetMemoryWin32HandlePropertiesKHR");
+        if (fn == 0) { reason = "no_handle_properties_proc"; return null; }
+        var getProps = Marshal.GetDelegateForFunctionPointer<VkGetMemoryWin32HandlePropertiesKHR>(fn);
+
+        s_lifecycleLock.EnterReadLock();
+        try
+        {
+            var ext = new VkExternalMemoryBufferCreateInfo
+            {
+                sType = StructExternalMemoryBufferCreateInfo,
+                handleTypes = ExternalMemoryHandleD3D12Heap,
+            };
+            var bci = new VkBufferCreateInfo
+            {
+                sType = VkStructureType.BufferCreateInfo,
+                pNext = (nint)(&ext),
+                size = (ulong)bytes,
+                usage = BufferUsage,
+                sharingMode = VkSharingMode.Exclusive,
+            };
+            int cr = VulkanApi.vkCreateBuffer(_device, bci, 0, out nint buffer);
+            if (cr < 0) { reason = $"vkCreateBuffer({cr})"; return null; }
+
+            VulkanApi.vkGetBufferMemoryRequirements(_device, buffer, out var req);
+            var props = new VkMemoryWin32HandlePropertiesKhr { sType = StructMemoryWin32HandlePropertiesKhr };
+            int pr = getProps(_device, ExternalMemoryHandleD3D12Heap, sharedHandle, ref props);
+            if (pr < 0 || (ulong)bytes < req.size)
+            {
+                VulkanApi.vkDestroyBuffer(_device, buffer, 0);
+                reason = pr < 0 ? $"handle_properties({pr})" : "heap_smaller_than_requirements";
+                return null;
+            }
+
+            uint bits = req.memoryTypeBits & props.memoryTypeBits;
+            if (!TryFindMemoryType(bits, VkMemoryPropertyFlags.DeviceLocal, VkMemoryPropertyFlags.HostVisible, out uint typeIndex)
+                && !TryFindMemoryType(bits, VkMemoryPropertyFlags.DeviceLocal, default, out typeIndex))
+            {
+                VulkanApi.vkDestroyBuffer(_device, buffer, 0);
+                reason = $"no_device_local_type(bits=0x{bits:X})";
+                return null;
+            }
+
+            var import = new VkImportMemoryWin32HandleInfoKhr
+            {
+                sType = StructImportMemoryWin32HandleInfoKhr,
+                handleType = ExternalMemoryHandleD3D12Heap,
+                handle = sharedHandle,
+            };
+            var mai = new VkMemoryAllocateInfo
+            {
+                sType = VkStructureType.MemoryAllocateInfo,
+                pNext = (nint)(&import),
+                allocationSize = (ulong)bytes,
+                memoryTypeIndex = typeIndex,
+            };
+            int ar = VulkanApi.vkAllocateMemory(_device, mai, 0, out nint memory);
+            if (ar < 0)
+            {
+                VulkanApi.vkDestroyBuffer(_device, buffer, 0);
+                reason = $"vkAllocateMemory({ar})";
+                return null;
+            }
+            int br = VulkanApi.vkBindBufferMemory(_device, buffer, memory, 0);
+            if (br < 0)
+            {
+                VulkanApi.vkFreeMemory(_device, memory, 0);
+                VulkanApi.vkDestroyBuffer(_device, buffer, 0);
+                reason = $"vkBindBufferMemory({br})";
+                return null;
+            }
+
+            uint heap = HeapOfType(typeIndex);
+            Interlocked.Add(ref _liveBytesByHeap[heap], bytes);
+            Interlocked.Increment(ref _liveCountByHeap[heap]);
+            return new Buffer(this, buffer, memory, bytes, hostVisible: false, heap, bytes, typeIndex);
+        }
+        finally
+        {
+            s_lifecycleLock.ExitReadLock();
+        }
     }
 
     /// <summary>VkResult VK_ERROR_OUT_OF_DEVICE_MEMORY.</summary>
@@ -1687,12 +2037,320 @@ public sealed class VulkanDevice : IDisposable
     private long _deviceLocalFallbacks;
 
     /// <summary>
+    /// <c>DOTLLM_VULKAN_DEVICE_LOCAL_LIMIT_MIB=N</c> (test/A-B knob, issue #810): treat strict
+    /// DEVICE_LOCAL allocations as out of memory once this device holds N MiB on the preferred
+    /// device-local heap, forcing the heap-0 fallback path with a smaller model.
+    /// </summary>
+    /// <remarks>Without it, <c>DOTLLM_VRAM_BUDGET_MB</c> (#1295) sets the same limit, read when the device is created.</remarks>
+    private static readonly long s_deviceLocalLimitBytes =
+        long.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DEVICE_LOCAL_LIMIT_MIB"), out long mib) && mib >= 0
+            ? mib * 1024 * 1024 : -1;
+
+    private long _deviceLocalLimitBytes = s_deviceLocalLimitBytes >= 0
+        ? s_deviceLocalLimitBytes
+        : DotLLM.Core.Configuration.DeviceMemoryBudget.SimulatedBudgetBytes() ?? -1;
+
+    /// <summary>Per-instance override of the synthetic device-local limit (test hook, issue #810); &lt; 0 disables.</summary>
+    internal void SetDeviceLocalLimitBytes(long bytes) => _deviceLocalLimitBytes = bytes;
+
+    /// <summary>
+    /// Test hook (#1290): fill every new buffer with NaN bytes, so a shader that reads scratch it never wrote (padding rows
+    /// past the token count, stale capacity) poisons its output instead of passing.
+    /// </summary>
+    internal static bool TestPoisonNewBuffers;
+
+    /// <summary>Live bytes this device holds on <paramref name="heap"/> (test hook).</summary>
+    internal long LiveBytesOnHeap(int heap) => Interlocked.Read(ref _liveBytesByHeap[heap]);
+
+    private readonly long[] _fallbackBytesByHeap = new long[16];
+    private int _fallbackLogged;
+
+    /// <summary>Bytes that landed on each heap via the device-local fallback (not the preferred type).</summary>
+    public long FallbackBytesOnHeap(int heap) => Interlocked.Read(ref _fallbackBytesByHeap[heap]);
+
+    /// <summary>Live bytes in the heaps that count toward <see cref="ResidentCapacityBytes"/>: every heap on an integrated GPU, device-local heaps only on a discrete one (#880).</summary>
+    internal unsafe long ResidentLiveBytes()
+    {
+        if (PhysicalDeviceTypeValue == VkPhysicalDeviceType.IntegratedGpu) return TotalLiveBytes();
+        VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
+        byte* heaps = (byte*)mem.memoryHeaps;
+        long sum = 0;
+        for (uint i = 0; i < mem.memoryHeapCount && i < _liveBytesByHeap.Length; i++)
+            if ((*(uint*)(heaps + i * 16 + 8) & (uint)VkMemoryHeapFlags.DeviceLocal) != 0) sum += Interlocked.Read(ref _liveBytesByHeap[i]);
+        return sum;
+    }
+
+    /// <summary>Bytes of live buffers this process currently holds, summed over every memory heap (what the <c>[vulkan-mem]</c> diagnostic prints as <c>ours</c>).</summary>
+    public long TotalLiveBytes()
+    {
+        long sum = 0;
+        for (int h = 0; h < _liveBytesByHeap.Length; h++) sum += Interlocked.Read(ref _liveBytesByHeap[h]);
+        return sum;
+    }
+
+    /// <summary>
+    /// Live allocated bytes and allocation count per memory heap, maintained by
+    /// <see cref="AllocateInternal"/> and <see cref="Buffer.Dispose"/>.
+    /// </summary>
+    /// <remarks>
+    /// Device-local memory is unmapped, so it does NOT appear in the process working
+    /// set — "the process held 5.17 GB" says nothing about what is on the GPU heap.
+    /// Without this counter an OOM on a heap reporting tens of GiB free is
+    /// undiagnosable from the outside (see .docs/BONSAI2_27B_SUPPORT.md).
+    /// Indexed by heapIndex; VK_MAX_MEMORY_HEAPS is 16.
+    /// </remarks>
+    private readonly long[] _liveBytesByHeap = new long[16];
+
+    /// <summary>Number of live device allocations this device made (all heaps). Test hook for leak checks.</summary>
+    internal long LiveAllocationCount
+    {
+        get
+        {
+            long n = 0;
+            for (int h = 0; h < _liveCountByHeap.Length; h++) n += Interlocked.Read(ref _liveCountByHeap[h]);
+            return n;
+        }
+    }
+    private readonly long[] _liveCountByHeap = new long[16];
+
+    /// <summary>
+    /// Ring of the most recently destroyed <c>VkBuffer</c> handles (issue #467). The epoch
+    /// <c>k</c> (1-based) destroy lives at slot <c>(k - 1) % DestroyLogCapacity</c>.
+    /// </summary>
+    /// <remarks>
+    /// Drivers recycle <c>VkBuffer</c> handle values, and every <see cref="Kernels.DescriptorSetCache"/>
+    /// keys on raw handles. Without this log, a buffer destroyed and re-created under the same
+    /// handle value hits the old descriptor set, which still addresses the freed allocation — on
+    /// gfx1151 a resident model decoding with a fresh KV cache per request returned wrong tokens in
+    /// ~60% of requests. Caches consult <see cref="BufferDestroyEpoch"/> on every lookup (one
+    /// volatile read) and only walk this log when it has moved. Only handles a cache has bound are
+    /// logged (<see cref="_boundHandles"/>), so the per-call staging buffers of
+    /// <see cref="Download"/> on a discrete GPU never move the epoch on the decode path.
+    /// </remarks>
+    internal const int DestroyLogCapacity = 4096;
+    private readonly nint[] _destroyLog = new nint[DestroyLogCapacity];
+    private readonly Lock _destroyLogLock = new();
+    private readonly HashSet<nint> _boundHandles = new();
+    private long _bufferDestroyEpoch;
+
+    /// <summary>Count of <c>VkBuffer</c> handles destroyed on this device; see <see cref="_destroyLog"/>.</summary>
+    internal long BufferDestroyEpoch => Volatile.Read(ref _bufferDestroyEpoch);
+
+    /// <summary>Notes that a descriptor set now references <paramref name="handles"/>.</summary>
+    internal void RecordBuffersBound(ReadOnlySpan<nint> handles)
+    {
+        lock (_destroyLogLock)
+        {
+            foreach (nint handle in handles)
+            {
+                if (handle != 0)
+                    _boundHandles.Add(handle);
+            }
+        }
+    }
+
+    /// <summary>Records that <paramref name="handle"/> is about to be destroyed and may be recycled.</summary>
+    internal void RecordBufferDestroyed(nint handle)
+    {
+        if (handle == 0) return;
+        lock (_destroyLogLock)
+        {
+            if (!_boundHandles.Remove(handle))
+                return;
+            long epoch = _bufferDestroyEpoch + 1;
+            _destroyLog[(int)((epoch - 1) % DestroyLogCapacity)] = handle;
+            Volatile.Write(ref _bufferDestroyEpoch, epoch);
+        }
+    }
+
+    /// <summary>
+    /// Adds every handle destroyed after <paramref name="sinceEpoch"/> to <paramref name="destroyed"/>
+    /// and returns the epoch the caller is now synchronised to. Returns <c>false</c> (with
+    /// <paramref name="currentEpoch"/> still set) when the ring no longer reaches back that far, in
+    /// which case the caller must treat every handle it holds as possibly destroyed.
+    /// </summary>
+    internal bool TryCollectDestroyedSince(long sinceEpoch, HashSet<nint> destroyed, out long currentEpoch)
+    {
+        lock (_destroyLogLock)
+        {
+            currentEpoch = _bufferDestroyEpoch;
+            if (currentEpoch - sinceEpoch > DestroyLogCapacity)
+                return false;
+            for (long epoch = sinceEpoch + 1; epoch <= currentEpoch; epoch++)
+                destroyed.Add(_destroyLog[(int)((epoch - 1) % DestroyLogCapacity)]);
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// <c>DOTLLM_VULKAN_MEM_TRACE=1</c> logs every device allocation with the running
+    /// per-heap totals, so the whole commit curve is visible rather than just the
+    /// endpoint an OOM reports.
+    /// </summary>
+    private static readonly bool s_memTrace =
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_TRACE") == "1";
+
+    /// <summary>
+    /// The first few DotLLM callers outside this file, for attributing a traced allocation to its
+    /// site (#1174). Only evaluated when <c>DOTLLM_VULKAN_MEM_TRACE=1</c>.
+    /// </summary>
+    private static string TraceSite()
+    {
+        var frames = new System.Diagnostics.StackTrace(2, false).GetFrames();
+        var sb = new StringBuilder();
+        int n = 0;
+        foreach (var f in frames)
+        {
+            var m = System.Diagnostics.DiagnosticMethodInfo.Create(f);
+            string? t = m?.DeclaringTypeName;
+            if (t is null || !t.StartsWith("DotLLM", StringComparison.Ordinal)
+                || t.StartsWith("DotLLM.Vulkan.VulkanDevice", StringComparison.Ordinal)) continue;
+            if (n++ > 0) sb.Append(" < ");
+            sb.Append(t, t.LastIndexOf('.') + 1, t.Length - t.LastIndexOf('.') - 1).Append('.').Append(m!.Name);
+            if (n == 4) break;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Memory type index to heap index. Built once — the mapping is immutable for the life of
+    /// the physical device, and <see cref="AllocateInternal"/> is on the model-load path where a
+    /// per-allocation <c>vkGetPhysicalDeviceMemoryProperties</c> would be pure waste.
+    /// </summary>
+    private uint[]? _typeToHeap;
+
+    private unsafe uint HeapOfType(uint typeIndex)
+    {
+        var map = _typeToHeap;
+        if (map is null)
+        {
+            VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
+            uint* types = (uint*)mem.memoryTypes;
+            map = new uint[mem.memoryTypeCount];
+            for (uint i = 0; i < mem.memoryTypeCount; i++) map[i] = types[i * 2 + 1];
+            _typeToHeap = map;
+        }
+        return typeIndex < map.Length ? map[typeIndex] : 0u;
+    }
+
+    /// <summary>
+    /// Per-heap memory report: what this process has live (our own accounting) next to
+    /// what the driver reports through <c>VK_EXT_memory_budget</c>. The driver's numbers
+    /// are process-scoped, unlike <c>vulkaninfo</c>'s, which describe vulkaninfo.
+    /// </summary>
+    public unsafe string MemorySnapshot()
+    {
+        VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
+        ulong* heaps = (ulong*)mem.memoryHeaps;
+
+        // VkPhysicalDeviceMemoryBudgetPropertiesEXT chained onto
+        // VkPhysicalDeviceMemoryProperties2. Diagnostic-only: when the driver does not
+        // fill it the values stay zero and we simply print our own accounting.
+        byte* budgetBlob = stackalloc byte[272];
+        new Span<byte>(budgetBlob, 272).Clear();
+        *(uint*)budgetBlob = 1000237000; // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT
+        byte* props2 = stackalloc byte[536];
+        new Span<byte>(props2, 536).Clear();
+        *(uint*)props2 = 1000059006; // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2
+        *(nint*)(props2 + 8) = (nint)budgetBlob;
+        VulkanApi.vkGetPhysicalDeviceMemoryProperties2(_physicalDevice, props2);
+
+        var sb = new StringBuilder();
+        for (uint h = 0; h < mem.memoryHeapCount && h < 16; h++)
+        {
+            ulong size = heaps[h * 2];
+            ulong budget = *(ulong*)(budgetBlob + 16 + h * 8);
+            ulong usage = *(ulong*)(budgetBlob + 16 + 128 + h * 8);
+            if (sb.Length > 0) sb.Append("; ");
+            sb.Append($"heap{h} ours={Interlocked.Read(ref _liveBytesByHeap[h]) / (1024 * 1024)} MiB "
+                    + $"in {Interlocked.Read(ref _liveCountByHeap[h])} allocs, "
+                    + $"driver usage={usage / (1024 * 1024)} MiB, budget={budget / (1024 * 1024)} MiB, "
+                    + $"size={size / (1024 * 1024)} MiB"
+                    + (_fallbackBytesByHeap[h] > 0 ? $", of-which-fallback={Interlocked.Read(ref _fallbackBytesByHeap[h]) / (1024 * 1024)} MiB" : ""));
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// <see cref="MemorySnapshot"/> plus this process's Windows <c>GPU Process Memory</c> counters on this adapter and the part of
+    /// them no allocation of ours explains (driver-internal memory: pipelines, descriptor pools, command buffers, shader scratch;
+    /// #1174). The counter read takes seconds on a busy box, so this is for the opt-in <c>DOTLLM_MEM_PROBE</c> lines only.
+    /// </summary>
+    public string MemoryProbeSnapshot()
+    {
+        string snap = MemorySnapshot();
+        if (DeviceLuid() is not { } luid || VulkanGpuMemoryCounters.ReadProcessUsage(luid) is not { } all) return snap;
+        int pid = Environment.ProcessId;
+        foreach (var p in all)
+        {
+            if (p.Pid != pid) continue;
+            return snap + $"; wddm(own) shared={p.SharedBytes / (1024 * 1024)} MiB dedicated={p.DedicatedBytes / (1024 * 1024)} MiB"
+                 + $" untracked={(p.TotalBytes - TotalLiveBytes()) / (1024 * 1024)} MiB";
+        }
+        return snap;
+    }
+
+    /// <summary>Extra text for an out-of-device-memory failure: who else is holding GPU memory (#880). Empty for other results or when unknown.</summary>
+    private string OtherProcessOomHint(int result)
+    {
+        if (result != VkErrorOutOfDeviceMemory) return string.Empty;
+        try
+        {
+            var p = ReadOtherProcessPressure();
+            if (p is null) return string.Empty;
+            return $" Other processes currently hold {p.OtherBytes / (double)(1L << 30):F1} GiB of GPU memory on this adapter ({p.DescribeCulprits()}).";
+        }
+        catch (Exception) { return string.Empty; }   // diagnostics must never mask the real failure
+    }
+
+    /// <summary>The adapter LUID (<c>high &lt;&lt; 32 | low</c>) from <c>VkPhysicalDeviceIDProperties</c>, or null when the driver does not report a valid one.</summary>
+    internal unsafe ulong? DeviceLuid()
+    {
+        byte* id = stackalloc byte[88];
+        new Span<byte>(id, 88).Clear();
+        *(int*)id = 1000071004;   // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES
+        var p2 = default(VkPhysicalDeviceProperties2);
+        p2.sType = VkStructureType.PhysicalDeviceProperties2;
+        p2.pNext = (nint)id;
+        VulkanApi.vkGetPhysicalDeviceProperties2(_physicalDevice, ref p2);
+        // sType(4)+pad(4), pNext(8), deviceUUID[16]@16, driverUUID[16]@32, deviceLUID[8]@48, deviceNodeMask@56, deviceLUIDValid@60
+        if (*(uint*)(id + 60) == 0) return null;
+        return *(ulong*)(id + 48);   // LUID = {u32 LowPart, i32 HighPart}, little-endian
+    }
+
+    /// <summary>
+    /// GPU memory held by OTHER processes on this adapter (Windows PDH counters; <c>VK_EXT_memory_budget</c> cannot see other
+    /// processes - see <see cref="VulkanGpuMemoryPressure"/>). Null when unavailable.
+    /// </summary>
+    internal VulkanGpuMemoryPressure? ReadOtherProcessPressure()
+        => VulkanGpuMemoryPressure.TryRead(DeviceLuid(), PhysicalDeviceTypeValue == VkPhysicalDeviceType.IntegratedGpu);
+
+    /// <summary>Bytes this device object currently has allocated, across every heap.</summary>
+    internal long LiveBytesTotal()
+    {
+        long sum = 0;
+        for (int h = 0; h < _liveBytesByHeap.Length; h++) sum += Interlocked.Read(ref _liveBytesByHeap[h]);
+        return sum;
+    }
+
+    /// <summary>
     /// Number of device-local allocations that fell back to a host-visible memory
     /// type because the strict DEVICE_LOCAL heap was exhausted. Non-zero means part
     /// of the working set lives in the slower (on discrete GPUs) or GTT (on UMA)
     /// heap — perf harnesses should report it alongside any measurement.
     /// </summary>
     public long DeviceLocalFallbackCount => Interlocked.Read(ref _deviceLocalFallbacks);
+
+    private static long s_allocateMemoryTicks;
+
+    /// <summary>Process-wide wall time inside <c>vkAllocateMemory</c> on the primary path (#874 load-time diagnostic).</summary>
+    internal static double AllocateMemoryMilliseconds => Interlocked.Read(ref s_allocateMemoryTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+
+    /// <summary>Usage of every storage buffer this device creates (the arena's sub-buffers too).</summary>
+    internal const VkBufferUsageFlags BufferUsage = VkBufferUsageFlags.StorageBuffer
+        | VkBufferUsageFlags.TransferSrc
+        | VkBufferUsageFlags.TransferDst
+        | VkBufferUsageFlags.IndirectBuffer; // GPU-written dispatch arguments (grouped-MoE tile lists)
 
     private Buffer AllocateInternal(long bytes, bool deviceLocal, bool preferHostCached = false)
     {
@@ -1712,9 +2370,7 @@ public sealed class VulkanDevice : IDisposable
         {
             sType = VkStructureType.BufferCreateInfo,
             size = (ulong)bytes,
-            usage = VkBufferUsageFlags.StorageBuffer
-                  | VkBufferUsageFlags.TransferSrc
-                  | VkBufferUsageFlags.TransferDst,
+            usage = BufferUsage,
             sharingMode = VkSharingMode.Exclusive,
         };
         VulkanApi.vkCreateBuffer(_device, bci, 0, out nint buffer)
@@ -1769,7 +2425,17 @@ public sealed class VulkanDevice : IDisposable
         {
             typeIndex = preferredTypeIndex;
             mai.memoryTypeIndex = typeIndex;
-            allocResult = VulkanApi.vkAllocateMemory(_device, mai, 0, out memory);
+            if (deviceLocal && _deviceLocalLimitBytes >= 0
+                && Interlocked.Read(ref _liveBytesByHeap[HeapOfType(typeIndex)]) + (long)req.size > _deviceLocalLimitBytes)
+            {
+                allocResult = VkErrorOutOfDeviceMemory; memory = 0; // synthetic exhaustion (#810 knob)
+            }
+            else
+            {
+                long tAlloc = System.Diagnostics.Stopwatch.GetTimestamp();
+                allocResult = VulkanApi.vkAllocateMemory(_device, mai, 0, out memory);
+                Interlocked.Add(ref s_allocateMemoryTicks, System.Diagnostics.Stopwatch.GetTimestamp() - tAlloc);
+            }
 
             // The strict device-local heap (discrete VRAM, or the UMA carve-out — e.g. a
             // 16 GB heap[0] on Strix Halo while heap[1] exposes 96 GB of DEVICE_LOCAL +
@@ -1794,6 +2460,13 @@ public sealed class VulkanDevice : IDisposable
                     {
                         typeIndex = fbIndex;
                         Interlocked.Increment(ref _deviceLocalFallbacks);
+                        uint fbHeap = HeapOfType(fbIndex);
+                        Interlocked.Add(ref _fallbackBytesByHeap[fbHeap], (long)req.size);
+                        if (Interlocked.Exchange(ref _fallbackLogged, 1) == 0)
+                            Console.Error.WriteLine(
+                                $"[vulkan-mem] device-local heap {HeapOfType(preferredTypeIndex)} exhausted; " +
+                                $"allocations now fall back to type {fbIndex} on heap {fbHeap} " +
+                                $"(first fallback: {req.size} B). {MemorySnapshot()}");
                         break;
                     }
                 }
@@ -1813,8 +2486,29 @@ public sealed class VulkanDevice : IDisposable
         if (allocResult < 0)
         {
             VulkanApi.vkDestroyBuffer(_device, buffer, 0);
+            // Name the memory type and heap we actually asked for. Without this an OOM on a part
+            // whose device-local heap reports tens of GiB free is undiagnosable from the outside.
+            uint chosenFlags = 0, chosenHeap = 0;
+            ulong heapSize = 0;
+            unsafe
+            {
+                VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var memDiag);
+                uint* typesDiag = (uint*)memDiag.memoryTypes;
+                if (preferredTypeIndex < memDiag.memoryTypeCount)
+                {
+                    chosenFlags = typesDiag[preferredTypeIndex * 2];
+                    chosenHeap = typesDiag[preferredTypeIndex * 2 + 1];
+                }
+                ulong* heapsDiag = (ulong*)memDiag.memoryHeaps;
+                if (chosenHeap < memDiag.memoryHeapCount)
+                    heapSize = heapsDiag[chosenHeap * 2];
+            }
+
             allocResult.ThrowOnError(
-                $"vkAllocateMemory ({bytes} bytes{(IsTransientMemoryResult(allocResult) ? $", {s_memRetries} retries exhausted" : "")})");
+                $"vkAllocateMemory ({bytes} bytes{(IsTransientMemoryResult(allocResult) ? $", {s_memRetries} retries exhausted" : "")}" +
+                $"; memoryTypeIndex={preferredTypeIndex} flags=0x{chosenFlags:X} heapIndex={chosenHeap} " +
+                $"heapSize={heapSize / (1024 * 1024)} MiB; typeBits=0x{req.memoryTypeBits:X}" +
+                $"; live: {MemorySnapshot()}){OtherProcessOomHint(allocResult)}");
         }
 
         int bindResult = VulkanApi.vkBindBufferMemory(_device, buffer, memory, 0);
@@ -1829,7 +2523,20 @@ public sealed class VulkanDevice : IDisposable
         // chosen type also carries HOST_VISIBLE (the UMA case). On a discrete GPU the strict
         // device-local type is NOT mappable, so Download/UploadToDeviceLocal must stage.
         bool hostVisible = !deviceLocal || MemoryTypeIsHostVisible(typeIndex);
-        return new Buffer(this, buffer, memory, bytes, hostVisible);
+
+        uint heapIndex = HeapOfType(typeIndex);
+        Interlocked.Add(ref _liveBytesByHeap[heapIndex], (long)req.size);
+        Interlocked.Increment(ref _liveCountByHeap[heapIndex]);
+        if (s_memTrace)
+        {
+            Console.Error.WriteLine(
+                $"[vulkan-mem] alloc {req.size} B type={typeIndex} heap={heapIndex} at {TraceSite()} -> {MemorySnapshot()}");
+        }
+
+        var result = new Buffer(this, buffer, memory, bytes, hostVisible, heapIndex, (long)req.size, typeIndex);
+        if (TestPoisonNewBuffers)
+            FillBufferSynchronous(result, 0xFFFFFFFFu);   // NaN in F16 and F32 (#1290)
+        return result;
         }
         finally
         {
@@ -1952,37 +2659,11 @@ public sealed class VulkanDevice : IDisposable
         VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
         uint* types = (uint*)mem.memoryTypes;   // 8-byte entries: u32 propertyFlags, u32 heapIndex
         byte* heaps = (byte*)mem.memoryHeaps;   // 16-byte entries: u64 size, u32 flags, padding
-        uint failedHeap = types[failedTypeIndex * 2 + 1];
-
-        var ordered = new List<uint>(8);
-        Span<VkMemoryPropertyFlags> rungs =
-        [
-            VkMemoryPropertyFlags.DeviceLocal | VkMemoryPropertyFlags.HostVisible,
-            VkMemoryPropertyFlags.HostVisible | VkMemoryPropertyFlags.HostCoherent,
-        ];
-        foreach (var required in rungs)
-        {
-            // Two passes per rung: other-heap types first, failed-heap types last.
-            for (int pass = 0; pass < 2; pass++)
-            {
-                var passList = new List<(uint Index, ulong HeapSize)>(4);
-                for (uint i = 0; i < mem.memoryTypeCount; i++)
-                {
-                    if ((typeBits & (1u << (int)i)) == 0 || i == failedTypeIndex) continue;
-                    var flags = (VkMemoryPropertyFlags)types[i * 2];
-                    if ((flags & required) != required) continue;
-                    uint heapIdx = types[i * 2 + 1];
-                    bool otherHeap = heapIdx != failedHeap;
-                    if (otherHeap != (pass == 0)) continue;
-                    passList.Add((i, *(ulong*)(heaps + heapIdx * 16)));
-                }
-                passList.Sort(static (a, b) => b.HeapSize.CompareTo(a.HeapSize));
-                foreach (var (idx, _) in passList)
-                    if (!ordered.Contains(idx))
-                        ordered.Add(idx);
-            }
-        }
-        return ordered;
+        var t = new VkMemTypeInfo[mem.memoryTypeCount];
+        for (int i = 0; i < t.Length; i++) t[i] = new((VkMemoryPropertyFlags)types[i * 2], types[i * 2 + 1]);
+        var h = new ulong[mem.memoryHeapCount];
+        for (int i = 0; i < h.Length; i++) h[i] = *(ulong*)(heaps + i * 16);
+        return VulkanMemoryPlacement.RankDeviceLocalFallback(t, h, typeBits, failedTypeIndex);
     }
 
     /// <summary>
@@ -2004,7 +2685,26 @@ public sealed class VulkanDevice : IDisposable
             if ((flags & (uint)VkMemoryHeapFlags.DeviceLocal) != 0)
                 max = Math.Max(max, (long)size);
         }
-        return max;
+        return DotLLM.Core.Configuration.DeviceMemoryBudget.ClampSimulatedCapacity(max);   // #1295
+    }
+
+    /// <summary>
+    /// Bytes of weights this device can hold resident: <see cref="DeviceLocalHeapBytes"/> on a discrete GPU; on an
+    /// integrated GPU also the non-device-local heaps (the 512 MB-BIOS-split GTT heap, issue #812).
+    /// </summary>
+    public unsafe long ResidentCapacityBytes()
+    {
+        VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
+        byte* heaps = (byte*)mem.memoryHeaps; // 16-byte entries: u64 size, u32 flags, padding
+        var sizes = new ulong[mem.memoryHeapCount];
+        var flags = new VkMemoryHeapFlags[mem.memoryHeapCount];
+        for (int i = 0; i < sizes.Length; i++)
+        {
+            sizes[i] = *(ulong*)(heaps + i * 16);
+            flags[i] = (VkMemoryHeapFlags)(*(uint*)(heaps + i * 16 + 8));
+        }
+        return DotLLM.Core.Configuration.DeviceMemoryBudget.ClampSimulatedCapacity(   // #1295
+            VulkanMemoryCapacity.ResidentCapacityBytes(sizes, flags, PhysicalDeviceTypeValue));
     }
 
     /// <summary>
@@ -2044,6 +2744,103 @@ public sealed class VulkanDevice : IDisposable
         CopyBufferSynchronous(staging, dst, (ulong)source.Length);
     }
 
+    // ────────────────────────────────────────────────────────────────
+    // Deferred transfer primitives (issue #510)
+    //
+    // CopyBufferRangeSynchronous below allocates a command buffer and a
+    // fence, submits, waits, and frees — per copy. VulkanStagingBuffer needs
+    // to keep a copy in flight while the host fills the other slot, so it
+    // owns long-lived command-buffer/fence pairs and drives them through
+    // these three helpers instead.
+    // ────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Allocates one primary command buffer from the device's transfer/compute
+    /// pool, for a caller that will reuse it across many submissions. The
+    /// caller owns it until <see cref="FreeTransferCommandBuffer"/>.
+    /// </summary>
+    internal nint AllocateTransferCommandBuffer()
+    {
+        var cbai = new VkCommandBufferAllocateInfo
+        {
+            sType = VkStructureType.CommandBufferAllocateInfo,
+            commandPool = _commandPool,
+            level = VkCommandBufferLevel.Primary,
+            commandBufferCount = 1,
+        };
+        VulkanApi.vkAllocateCommandBuffers(_device, cbai, out nint cmdBuf)
+            .ThrowOnError("vkAllocateCommandBuffers AllocateTransferCommandBuffer");
+        return cmdBuf;
+    }
+
+    /// <summary>Frees a command buffer obtained from <see cref="AllocateTransferCommandBuffer"/>.</summary>
+    internal void FreeTransferCommandBuffer(nint cmdBuf)
+    {
+        if (cmdBuf == 0) return;
+        nint local = cmdBuf;
+        VulkanApi.vkFreeCommandBuffers(_device, _commandPool, 1, local);
+    }
+
+    /// <summary>Creates an unsignalled fence owned by the caller.</summary>
+    internal nint CreateUnsignalledFence()
+    {
+        var fenceCi = new VkFenceCreateInfo { sType = VkStructureType.FenceCreateInfo };
+        VulkanApi.vkCreateFence(_device, fenceCi, 0, out nint fence)
+            .ThrowOnError("vkCreateFence CreateUnsignalledFence");
+        return fence;
+    }
+
+    /// <summary>Destroys a fence from <see cref="CreateUnsignalledFence"/>.</summary>
+    internal void DestroyOwnedFence(nint fence)
+    {
+        if (fence == 0) return;
+        VulkanApi.vkDestroyFence(_device, fence, 0);
+    }
+
+    /// <summary>
+    /// Records a single <c>vkCmdCopyBuffer</c> region into
+    /// <paramref name="cmdBuf"/> and submits it signalling
+    /// <paramref name="fence"/>. <b>Does not wait.</b> The caller must
+    /// <see cref="WaitAndResetFence"/> before reusing either the command
+    /// buffer, the fence, or the source memory.
+    /// </summary>
+    internal unsafe void SubmitCopyDeferred(
+        nint cmdBuf, nint fence, Buffer src, Buffer dst,
+        ulong srcOffset, ulong dstOffset, ulong size)
+    {
+        VulkanApi.vkResetCommandBuffer(cmdBuf, 0).ThrowOnError("vkResetCommandBuffer SubmitCopyDeferred");
+
+        var begin = new VkCommandBufferBeginInfo
+        {
+            sType = VkStructureType.CommandBufferBeginInfo,
+            flags = VkCommandBufferUsageFlags.OneTimeSubmit,
+        };
+        VulkanApi.vkBeginCommandBuffer(cmdBuf, begin).ThrowOnError("vkBeginCommandBuffer SubmitCopyDeferred");
+
+        var region = new VkBufferCopy { srcOffset = srcOffset, dstOffset = dstOffset, size = size };
+        VulkanApi.vkCmdCopyBuffer(cmdBuf, src.Handle, dst.Handle, 1, region);
+
+        VulkanApi.vkEndCommandBuffer(cmdBuf).ThrowOnError("vkEndCommandBuffer SubmitCopyDeferred");
+
+        nint cmdBufLocal = cmdBuf;
+        var submit = new VkSubmitInfo
+        {
+            sType = VkStructureType.SubmitInfo,
+            commandBufferCount = 1,
+            pCommandBuffers = (nint)(&cmdBufLocal),
+        };
+        VulkanApi.vkQueueSubmit(_queue, 1, submit, fence).ThrowOnError("vkQueueSubmit SubmitCopyDeferred");
+    }
+
+    /// <summary>Host-waits on <paramref name="fence"/> and resets it for reuse.</summary>
+    internal void WaitAndResetFence(nint fence)
+    {
+        nint local = fence;
+        VulkanApi.vkWaitForFences(_device, 1, local, waitAll: 1, ulong.MaxValue)
+            .ThrowOnError("vkWaitForFences WaitAndResetFence");
+        VulkanApi.vkResetFences(_device, 1, local).ThrowOnError("vkResetFences WaitAndResetFence");
+    }
+
     /// <summary>
     /// Records a one-shot <c>vkCmdCopyBuffer</c> from offset 0 of
     /// <paramref name="src"/> to offset 0 of <paramref name="dst"/> and waits
@@ -2058,7 +2855,28 @@ public sealed class VulkanDevice : IDisposable
     /// path (the fence-pipelined path uses <c>vkCmdCopyBuffer</c> directly
     /// against the forward pass's shared command buffer).
     /// </summary>
-    public unsafe void CopyBufferRangeSynchronous(Buffer src, Buffer dst, ulong srcOffset, ulong dstOffset, ulong size)
+    public void CopyBufferRangeSynchronous(Buffer src, Buffer dst, ulong srcOffset, ulong dstOffset, ulong size)
+    {
+        nint cmdBuf = BeginOneShot("CopyBufferRangeSynchronous", out nint fence);
+        var region = new VkBufferCopy { srcOffset = srcOffset, dstOffset = dstOffset, size = size };
+        VulkanApi.vkCmdCopyBuffer(cmdBuf, src.Handle, dst.Handle, 1, region);
+        SubmitOneShotAndWait("CopyBufferRangeSynchronous", cmdBuf, fence);
+    }
+
+    /// <summary>Fills all of <paramref name="dst"/> with the 32-bit <paramref name="pattern"/> and waits (one-shot <c>vkCmdFillBuffer</c>).</summary>
+    /// <param name="dst">Buffer to fill.</param>
+    /// <param name="pattern">Repeated 4-byte pattern.</param>
+    internal void FillBufferSynchronous(Buffer dst, uint pattern)
+    {
+        nint cmdBuf = BeginOneShot("FillBufferSynchronous", out nint fence);
+        VulkanApi.vkCmdFillBuffer(cmdBuf, dst.Handle, 0, VkWholeSize, pattern);
+        SubmitOneShotAndWait("FillBufferSynchronous", cmdBuf, fence);
+    }
+
+    private const ulong VkWholeSize = ulong.MaxValue;   // VK_WHOLE_SIZE
+
+    /// <summary>Allocates a one-time command buffer and its fence and begins recording.</summary>
+    private nint BeginOneShot(string site, out nint fence)
     {
         var cbai = new VkCommandBufferAllocateInfo
         {
@@ -2067,26 +2885,35 @@ public sealed class VulkanDevice : IDisposable
             level = VkCommandBufferLevel.Primary,
             commandBufferCount = 1,
         };
-        VulkanApi.vkAllocateCommandBuffers(_device, cbai, out nint cmdBuf)
-            .ThrowOnError("vkAllocateCommandBuffers CopyBufferRangeSynchronous");
+        VulkanApi.vkAllocateCommandBuffers(_device, cbai, out nint cmdBuf).ThrowOnError($"vkAllocateCommandBuffers {site}");
 
         var fenceCi = new VkFenceCreateInfo { sType = VkStructureType.FenceCreateInfo };
-        VulkanApi.vkCreateFence(_device, fenceCi, 0, out nint fence)
-            .ThrowOnError("vkCreateFence CopyBufferRangeSynchronous");
+        if (VulkanApi.vkCreateFence(_device, fenceCi, 0, out fence) is var rc and < 0)
+        {
+            VulkanApi.vkFreeCommandBuffers(_device, _commandPool, 1, cmdBuf);
+            rc.ThrowOnError($"vkCreateFence {site}");
+        }
 
+        var begin = new VkCommandBufferBeginInfo
+        {
+            sType = VkStructureType.CommandBufferBeginInfo,
+            flags = VkCommandBufferUsageFlags.OneTimeSubmit,
+        };
+        if (VulkanApi.vkBeginCommandBuffer(cmdBuf, begin) is var brc and < 0)
+        {
+            VulkanApi.vkDestroyFence(_device, fence, 0);
+            VulkanApi.vkFreeCommandBuffers(_device, _commandPool, 1, cmdBuf);
+            brc.ThrowOnError($"vkBeginCommandBuffer {site}");
+        }
+        return cmdBuf;
+    }
+
+    /// <summary>Ends, submits and waits for a <see cref="BeginOneShot"/> command buffer, then frees it and its fence.</summary>
+    private unsafe void SubmitOneShotAndWait(string site, nint cmdBuf, nint fence)
+    {
         try
         {
-            var begin = new VkCommandBufferBeginInfo
-            {
-                sType = VkStructureType.CommandBufferBeginInfo,
-                flags = VkCommandBufferUsageFlags.OneTimeSubmit,
-            };
-            VulkanApi.vkBeginCommandBuffer(cmdBuf, begin).ThrowOnError("vkBeginCommandBuffer CopyBufferRangeSynchronous");
-
-            var region = new VkBufferCopy { srcOffset = srcOffset, dstOffset = dstOffset, size = size };
-            VulkanApi.vkCmdCopyBuffer(cmdBuf, src.Handle, dst.Handle, 1, region);
-
-            VulkanApi.vkEndCommandBuffer(cmdBuf).ThrowOnError("vkEndCommandBuffer CopyBufferRangeSynchronous");
+            VulkanApi.vkEndCommandBuffer(cmdBuf).ThrowOnError($"vkEndCommandBuffer {site}");
 
             var submit = new VkSubmitInfo
             {
@@ -2094,11 +2921,10 @@ public sealed class VulkanDevice : IDisposable
                 commandBufferCount = 1,
                 pCommandBuffers = (nint)(&cmdBuf),
             };
-            VulkanApi.vkQueueSubmit(_queue, 1, submit, fence).ThrowOnError("vkQueueSubmit CopyBufferRangeSynchronous");
+            VulkanApi.vkQueueSubmit(_queue, 1, submit, fence).ThrowOnError($"vkQueueSubmit {site}");
 
             nint fenceLocal = fence;
-            VulkanApi.vkWaitForFences(_device, 1, fenceLocal, waitAll: 1, ulong.MaxValue)
-                .ThrowOnError("vkWaitForFences CopyBufferRangeSynchronous");
+            VulkanApi.vkWaitForFences(_device, 1, fenceLocal, waitAll: 1, ulong.MaxValue).ThrowOnError($"vkWaitForFences {site}");
         }
         finally
         {
@@ -2108,40 +2934,107 @@ public sealed class VulkanDevice : IDisposable
     }
 
     /// <summary>
+    /// <c>VkPhysicalDeviceProperties.deviceType</c> of the selected physical
+    /// device — one of the <see cref="VkPhysicalDeviceType"/> constants. Read
+    /// on demand; used to gate the zero-copy host-pointer import (issue #507).
+    /// </summary>
+    internal unsafe int PhysicalDeviceTypeValue
+    {
+        get
+        {
+            VulkanApi.vkGetPhysicalDeviceProperties(_physicalDevice, out var props);
+            return props.deviceType;
+        }
+    }
+
+    /// <summary>
     /// Picks a memory type index for an imported host pointer. The candidate
     /// <paramref name="typeBits"/> is the intersection of
     /// <c>vkGetBufferMemoryRequirements.memoryTypeBits</c> and
     /// <c>VkMemoryHostPointerPropertiesEXT.memoryTypeBits</c>; both filters
-    /// have already been applied by the caller. We additionally prefer a
-    /// type that is HOST_VISIBLE (so the host mmap can still be read/written
-    /// after import) over one that isn't, but accept either since the driver
-    /// is the authority on what's compatible.
+    /// have already been applied by the caller. Thin wrapper over
+    /// <see cref="TrySelectHostImportMemoryType"/> — see that method for the
+    /// UMA-gating rationale (issue #507).
     /// </summary>
     internal unsafe bool TryFindHostImportMemoryType(uint typeBits, out uint memoryTypeIndex)
     {
         VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
         uint* types = (uint*)mem.memoryTypes;
 
-        uint fallbackIdx = uint.MaxValue;
-        for (uint i = 0; i < mem.memoryTypeCount; i++)
-        {
-            if ((typeBits & (1u << (int)i)) == 0) continue;
-            var flags = (VkMemoryPropertyFlags)types[i * 2];
-            if ((flags & VkMemoryPropertyFlags.HostVisible) != 0)
-            {
-                memoryTypeIndex = i;
-                return true;
-            }
-            if (fallbackIdx == uint.MaxValue) fallbackIdx = i;
-        }
+        // VK_MAX_MEMORY_TYPES == 32; memoryTypes is an array of 8-byte entries
+        // (u32 propertyFlags, u32 heapIndex).
+        uint count = Math.Min(mem.memoryTypeCount, 32u);
+        Span<VkMemoryPropertyFlags> flags = stackalloc VkMemoryPropertyFlags[(int)count];
+        for (uint i = 0; i < count; i++)
+            flags[(int)i] = (VkMemoryPropertyFlags)types[i * 2];
 
-        if (fallbackIdx != uint.MaxValue)
+        return TrySelectHostImportMemoryType(
+            typeBits, flags, PhysicalDeviceTypeValue, out memoryTypeIndex);
+    }
+
+    /// <summary>
+    /// Pure memory-type selection for a <c>VK_EXT_external_memory_host</c>
+    /// import. Returns false outright unless <paramref name="deviceType"/> is
+    /// an integrated GPU (or a software/CPU device); otherwise returns the
+    /// lowest index set in <paramref name="typeBits"/> whose property flags
+    /// include <c>HOST_VISIBLE</c>. Index <c>i</c> of
+    /// <paramref name="memoryTypes"/> is memory type <c>i</c>. There is
+    /// deliberately no permissive "any type" fallback — a memory type that is
+    /// not host-visible is nonsense for imported host memory.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the UMA gate for the zero-copy weight import (issue #507).
+    /// Imported host memory is system RAM by construction. On an integrated
+    /// GPU that RAM <i>is</i> the GPU's memory, so the import is a genuine
+    /// zero-copy win. On a discrete GPU the weights would never reach VRAM and
+    /// every matmul would read them across PCIe for the model's lifetime —
+    /// presenting as mysteriously slow inference rather than as an error, so
+    /// the import is refused and the caller's staging path runs instead.
+    /// </para>
+    /// <para>
+    /// <b>Why the device type and not the memory properties.</b> The issue
+    /// proposed requiring the chosen type to be <c>DEVICE_LOCAL</c> as well as
+    /// <c>HOST_VISIBLE</c>, on the theory that on UMA every heap is both. That
+    /// was implemented and <b>measured to be false on the target hardware</b>:
+    /// on Strix Halo (gfx1151, amdvlk/Windows) the driver partitions the one
+    /// physical DRAM into a GTT heap 0 — host-visible, <i>not</i> flagged
+    /// device-local — and a device-local VRAM carve-out heap 1, and
+    /// <c>vkGetMemoryHostPointerPropertiesEXT</c> reports masks
+    /// <c>0x2222</c> (foreign memory) / <c>0xAAAA</c> (host allocation), all of
+    /// which are heap-0 types. The device-local types 2/10 are not importable.
+    /// A <c>DEVICE_LOCAL</c> requirement therefore refuses on UMA too — it
+    /// keys on driver heap bookkeeping, not on locality, and cannot
+    /// discriminate the two cases. The device type can.
+    /// </para>
+    /// <para>
+    /// <c>Cpu</c> (software rasterizers such as lavapipe) is allowed for the
+    /// same reason as an iGPU: there is no separate device memory to miss.
+    /// <c>Other</c> and <c>VirtualGpu</c> are refused conservatively — staging
+    /// is always correct, only slower to load.
+    /// </para>
+    /// </remarks>
+    /// <param name="typeBits">Candidate memory-type mask (bit <c>i</c> = type <c>i</c>).</param>
+    /// <param name="memoryTypes">Property flags of each memory type, indexed by type index.</param>
+    /// <param name="deviceType">The device's <c>VkPhysicalDeviceType</c> value.</param>
+    /// <param name="memoryTypeIndex">The selected memory type index; 0 when the method returns false.</param>
+    internal static bool TrySelectHostImportMemoryType(
+        uint typeBits, ReadOnlySpan<VkMemoryPropertyFlags> memoryTypes, int deviceType,
+        out uint memoryTypeIndex)
+    {
+        memoryTypeIndex = 0;
+
+        if (deviceType is not (VkPhysicalDeviceType.IntegratedGpu or VkPhysicalDeviceType.Cpu))
+            return false;
+
+        for (int i = 0; i < memoryTypes.Length && i < 32; i++)
         {
-            memoryTypeIndex = fallbackIdx;
+            if ((typeBits & (1u << i)) == 0) continue;
+            if ((memoryTypes[i] & VkMemoryPropertyFlags.HostVisible) == 0) continue;
+            memoryTypeIndex = (uint)i;
             return true;
         }
 
-        memoryTypeIndex = 0;
         return false;
     }
 
@@ -2240,6 +3133,34 @@ public sealed class VulkanDevice : IDisposable
         }
     }
 
+    /// <summary>
+    /// Copies rows <paramref name="rowIds"/> of a host table (<paramref name="tableBase"/>, <paramref name="rowCount"/> rows of
+    /// <paramref name="rowBytes"/>) into the host-visible <paramref name="dst"/>, packed in order, under one mapping (#1161).
+    /// </summary>
+    /// <param name="dst">Host-visible destination of at least <c>rowIds.Length * rowBytes</c> bytes.</param>
+    /// <param name="tableBase">Host address of row 0.</param>
+    /// <param name="rowBytes">Bytes per row.</param>
+    /// <param name="rowCount">Rows in the table (ids are range-checked).</param>
+    /// <param name="rowIds">Rows to copy.</param>
+    public unsafe void UploadRows(Buffer dst, nint tableBase, int rowBytes, int rowCount, ReadOnlySpan<int> rowIds)
+    {
+        long bytes = (long)rowIds.Length * rowBytes;
+        if (!dst.IsHostVisible) throw new ArgumentException("Destination must be host-visible.", nameof(dst));
+        if (bytes > dst.Size) throw new ArgumentException("Destination too small.", nameof(dst));
+        foreach (int id in rowIds)
+            if ((uint)id >= (uint)rowCount) throw new ArgumentOutOfRangeException(nameof(rowIds), $"Row {id} is out of range");
+        nint mapped = MapMemoryWithRetry(dst.Memory, 0, (ulong)bytes, "vkMapMemory");
+        try
+        {
+            for (int t = 0; t < rowIds.Length; t++)
+                System.Buffer.MemoryCopy((void*)(tableBase + (nint)((long)rowIds[t] * rowBytes)), (void*)(mapped + (nint)((long)t * rowBytes)), rowBytes, rowBytes);
+        }
+        finally
+        {
+            VulkanApi.vkUnmapMemory(_device, dst.Memory);
+        }
+    }
+
     /// <summary>Copies from the start of <paramref name="src"/> into <paramref name="destination"/> host memory.</summary>
     /// <remarks>
     /// When <paramref name="src"/> is device-local-only (a discrete GPU's VRAM — see
@@ -2297,6 +3218,8 @@ public sealed class VulkanDevice : IDisposable
             // below can.
             VulkanApi.vkDeviceWaitIdle(_device);
         }
+
+        DotLLM.Vulkan.DirectStorage.DirectWeightStore.Forget(this);
 
         // #369: vkDestroyDevice/vkDestroyInstance are the teardown half of
         // the same loader-level create-vs-allocate race that crashed
@@ -2718,9 +3641,45 @@ public sealed class VulkanDevice : IDisposable
             VulkanApi.vkQueueSubmit(_device._queue, 1, submit, _fence).ThrowOnError("vkQueueSubmit SubmitContext");
 
             nint fenceLocal = _fence;
-            VulkanApi.vkWaitForFences(_device._device, 1, fenceLocal, waitAll: 1, ulong.MaxValue)
-                .ThrowOnError("vkWaitForFences SubmitContext");
+            WaitForFenceAdaptive(fenceLocal);
             VulkanApi.vkResetFences(_device._device, 1, fenceLocal).ThrowOnError("vkResetFences SubmitContext");
+        }
+
+        // Fence wait policy. A blocking vkWaitForFences sleeps the host thread, and on this class of machine (Strix Halo UMA, Windows/WDDM) the
+        // wake-up costs ~1.3 ms per forward: with a spin on vkGetFenceStatus instead, Tev1-4B decode went 48.7 -> 55.1 tok/s and
+        // Qwen3.6-35B-A3B decode 39.7 -> ~44 (prefill unchanged: its single long wait hides the latency). Blocking for part of the wait and
+        // spinning the tail did NOT recover it (0.3-0.9 block fractions all ~49-50 tok/s), so the policy is all-or-nothing per forward.
+        // Spinning burns a core, so by default ("auto") it is used only when recent waits were short (EMA < SpinMaxMs: decode-sized forwards);
+        // long prefill waits block as before. DOTLLM_VK_SPIN_WAIT = 0 (always block) | full (always spin) | auto (default).
+        private static readonly string SpinMode = Environment.GetEnvironmentVariable("DOTLLM_VK_SPIN_WAIT") ?? "auto";
+        private const double SpinMaxMs = 40.0;
+        private double _emaWaitMs;
+
+        private unsafe void WaitForFenceAdaptive(nint fence)
+        {
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            bool spin = SpinMode switch
+            {
+                "0" => false,
+                "full" => true,
+                _ => _emaWaitMs > 0 && _emaWaitMs < SpinMaxMs,
+            };
+            if (spin)
+            {
+                while (true)
+                {
+                    int s = VulkanApi.vkGetFenceStatus(_device._device, fence);
+                    if (s == 0) break;
+                    if (s != 1) s.ThrowOnError("vkGetFenceStatus");
+                }
+            }
+            else
+            {
+                VulkanApi.vkWaitForFences(_device._device, 1, fence, waitAll: 1, ulong.MaxValue)
+                    .ThrowOnError("vkWaitForFences SubmitContext");
+            }
+            double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            _emaWaitMs = _emaWaitMs == 0 ? ms : _emaWaitMs * 0.7 + ms * 0.3;
         }
 
         // Lazily-allocated second command buffer for SplitSubmit. At most ONE

@@ -1,0 +1,77 @@
+#version 450
+// 64 x 32 register-blocked tiled F32 GEMM for N > 1: C[N,M] = B[N,K] @ A[M,K]^T (same bindings / push constants as matmul_f32_tiled.comp).
+//
+// matmul_f32_tiled.comp (32 x 32 tile, 2 x 2 cells per thread) ran the Qwen3.6-35B-A3B F32 router (K = 2048, M = 256) at ~1.8 TFLOPS: each
+// shared-memory read feeds only 2 FMAs. Here a 16 x 16 workgroup computes a 64 (M) x 32 (N) tile with 4 x 2 cells per thread (8 FMAs per 6
+// LDS reads), K staged BK = 16 at a time with coalesced K-contiguous global loads. Per-output-element summation order is the same
+// ascending-k F32 chain as the 32 x 32 shader, so results are bit-identical to it.
+//
+// Dispatch: groupCount = (ceil(M / 64), ceil(N / 32), 1).
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufA { float a[]; }; // [M*K]
+layout(set = 0, binding = 1, std430) readonly  buffer BufB { float b[]; }; // [N*K]
+layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[]; }; // [N*M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+} pc;
+
+const uint TM = 64u;
+const uint TN = 32u;
+const uint BK = 16u;
+
+shared float As[BK][TM + 1u];
+shared float Bs[BK][TN + 1u];
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+    uint tid = ty * 16u + tx;
+    uint mBase = gl_WorkGroupID.x * TM;
+    uint nBase = gl_WorkGroupID.y * TN;
+
+    uint lk = tid & 15u;     // consecutive threads walk k (coalesced)
+    uint lr = tid >> 4u;     // 0..15
+
+    float acc[4][2];
+    for (uint i = 0u; i < 4u; i++) { acc[i][0] = 0.0; acc[i][1] = 0.0; }
+
+    for (uint k0 = 0u; k0 < pc.K; k0 += BK) {
+        uint kk = k0 + lk;
+        bool kOk = kk < pc.K;
+        for (uint h = 0u; h < 4u; h++) {            // A tile: 64 rows x 16 k = 1024 floats, 4 per thread
+            uint r = lr + h * 16u;
+            uint am = mBase + r;
+            As[lk][r] = (kOk && am < pc.M) ? a[am * pc.K + kk] : 0.0;
+        }
+        for (uint h = 0u; h < 2u; h++) {            // B tile: 32 rows x 16 k = 512 floats, 2 per thread
+            uint r = lr + h * 16u;
+            uint bn = nBase + r;
+            Bs[lk][r] = (kOk && bn < pc.N) ? b[bn * pc.K + kk] : 0.0;
+        }
+        barrier();
+        for (uint j = 0u; j < BK; j++) {
+            float b0 = Bs[j][ty];
+            float b1 = Bs[j][ty + 16u];
+            for (uint i = 0u; i < 4u; i++) {
+                float av = As[j][tx + 16u * i];
+                acc[i][0] += av * b0;
+                acc[i][1] += av * b1;
+            }
+        }
+        barrier();
+    }
+
+    for (uint j = 0u; j < 2u; j++) {
+        uint n = nBase + ty + 16u * j;
+        if (n >= pc.N) continue;
+        for (uint i = 0u; i < 4u; i++) {
+            uint m = mBase + tx + 16u * i;
+            if (m < pc.M) c[n * pc.M + m] = acc[i][j];
+        }
+    }
+}

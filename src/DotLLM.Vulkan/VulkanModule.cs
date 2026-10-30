@@ -90,11 +90,18 @@ public sealed class VulkanModule : IDisposable
     /// non-zero value; this is applied unconditionally when set, so an
     /// unsupported value would make <c>vkCreateComputePipelines</c> fail.
     /// </param>
+    /// <param name="specConstants">
+    /// Specialization-constant values, bound to <c>constant_id</c> 0, 1, ... in
+    /// order. Substituted before the driver compiles the shader, so a branch on
+    /// one is resolved at compile time and the dead side costs no registers.
+    /// Empty (the default) leaves every constant at its shader-declared default.
+    /// </param>
     public unsafe ComputePipeline CreateComputePipeline(
         string entryPoint,
         ReadOnlySpan<VkDescriptorBinding> bindings,
         uint pushConstantBytes = 0,
-        uint requiredSubgroupSize = 0)
+        uint requiredSubgroupSize = 0,
+        ReadOnlySpan<uint> specConstants = default)
     {
         // 1. Descriptor-set layout — one binding per storage buffer in the shader.
         nint setLayout = 0;
@@ -158,14 +165,42 @@ public sealed class VulkanModule : IDisposable
                 sType = VkStructureType.PipelineShaderStageRequiredSubgroupSizeCreateInfo,
                 requiredSubgroupSize = requiredSubgroupSize,
             };
+            // Specialization constants, bound to constant_id 0..n-1 in order.
+            // These are substituted before the driver's backend compiler runs, so
+            // a branch on one folds away entirely and the dead side costs no
+            // registers — the property #533 depends on, and the one a push
+            // constant cannot provide (measured: a uniform push constant left the
+            // scalar path's register cost in place and recovered nothing).
+            int specCount = specConstants.Length;
+            Span<VkSpecializationMapEntry> entries = specCount == 0
+                ? default
+                : stackalloc VkSpecializationMapEntry[specCount];
+            for (int i = 0; i < specCount; i++)
+                entries[i] = new VkSpecializationMapEntry
+                {
+                    constantID = (uint)i,
+                    offset = (uint)(i * sizeof(uint)),
+                    size = sizeof(uint),
+                };
+
             fixed (byte* entryPtr = entryUtf8)
+            fixed (VkSpecializationMapEntry* entryMapPtr = entries)
+            fixed (uint* specDataPtr = specConstants)
             {
+                var specInfo = new VkSpecializationInfo
+                {
+                    mapEntryCount = (uint)specCount,
+                    pMapEntries = (nint)entryMapPtr,
+                    dataSize = (nuint)(specCount * sizeof(uint)),
+                    pData = (nint)specDataPtr,
+                };
                 var stage = new VkPipelineShaderStageCreateInfo
                 {
                     sType = VkStructureType.PipelineShaderStageCreateInfo,
                     stage = VkShaderStageFlags.Compute,
                     module = _shaderModule,
                     pName = (nint)entryPtr,
+                    pSpecializationInfo = specCount == 0 ? 0 : (nint)(&specInfo),
                 };
                 if (requiredSubgroupSize != 0)
                 {

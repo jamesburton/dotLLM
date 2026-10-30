@@ -27,6 +27,15 @@ internal sealed record RunBackendDto
 
     /// <summary>CUDA decode-graph state (GPU models only); null on CPU/hybrid.</summary>
     public string? DecodeGraph { get; init; }
+
+    /// <summary>The <c>--device</c> value as given (default <c>auto</c>).</summary>
+    public string? RequestedDevice { get; init; }
+
+    /// <summary>Device the model actually ran on (<c>cpu</c>, <c>vulkan</c>, <c>gpu:N</c>) - never inferred from the request.</summary>
+    public string? ResolvedDevice { get; init; }
+
+    /// <summary>Non-null when <c>auto</c> ended on the CPU (why, and the cost).</summary>
+    public string? DeviceWarning { get; init; }
 }
 
 /// <summary>Detected tool call in generated output.</summary>

@@ -15,20 +15,39 @@ namespace DotLLM.Cuda.Interop;
 /// </summary>
 internal static class CudaLibraryResolver
 {
-    private static int _registered;
+    private static readonly bool Registered;
 
     private static readonly string[] CublasVersions = ["13", "12", "11"];
 
     /// <summary>
-    /// Registers the resolver. Safe to call multiple times (idempotent).
+    /// Issue #504: registration runs in an explicit static constructor, so the CLR's
+    /// type-initialization lock — not a hand-rolled flag — is what makes it happen exactly once.
+    /// The previous <c>Interlocked.Exchange(ref _registered, 1)</c> claimed the flag BEFORE doing
+    /// the work, so a second thread arriving in that window returned having registered nothing and
+    /// then P/Invoked the bare name: <c>DllNotFoundException: Unable to load DLL 'cuda'</c> on a box
+    /// with a perfectly good driver. A thread arriving here now blocks until registration finishes.
     /// </summary>
-    internal static void Register()
+    static CudaLibraryResolver()
     {
-        if (Interlocked.Exchange(ref _registered, 1) != 0) return;
-
         NativeLibrary.SetDllImportResolver(
             typeof(CudaLibraryResolver).Assembly,
             ResolveCudaLibrary);
+        Registered = true;
+    }
+
+    /// <summary>
+    /// Ensures the resolver is installed. Safe to call multiple times, and — unlike the flag-based
+    /// version this replaces — guaranteed to have completed registration by the time it returns.
+    /// </summary>
+    /// <remarks>
+    /// The body reads <see cref="Registered"/> rather than being empty: touching a static field is
+    /// what triggers the type initializer, and consuming the value keeps the access (and so the
+    /// trigger) from being elided.
+    /// </remarks>
+    internal static void Register()
+    {
+        if (!Registered)
+            throw new InvalidOperationException("CUDA library resolver registration did not complete.");
     }
 
     private static nint ResolveCudaLibrary(

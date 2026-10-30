@@ -181,9 +181,12 @@ public sealed class AttentionTests
         Attention.Execute(q, k, v, outputSimd, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset: 0);
         Attention.ExecuteScalar(q, k, v, outputScalar, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset: 0);
 
-        // Tolerance widened from 1e-4 to 5e-2 to account for fast approximate exp
-        // in attention softmax. With only seqKv=5 tokens, exp errors have outsized impact
-        // on the softmax distribution. Production sequences (100s-1000s of tokens) average better.
+        // Tolerance was widened from 1e-4 to 5e-2 when the SIMD path used the approximate exp
+        // and the scalar reference did not: with only seqKv=5 tokens, exp errors have outsized
+        // impact on the softmax distribution. #501 made the attention exp precise by default, so
+        // the bound is now far looser than the SIMD-vs-scalar reassociation it still covers; it
+        // is left wide rather than retightened without a measurement pass, and it is still the
+        // right bound under DOTLLM_FAST_EXP=1.
         for (int i = 0; i < outputSimd.Length; i++)
             Assert.Equal(outputScalar[i], outputSimd[i], 5e-2f);
     }

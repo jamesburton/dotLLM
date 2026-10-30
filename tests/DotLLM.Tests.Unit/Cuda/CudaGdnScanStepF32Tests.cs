@@ -16,6 +16,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// regression coverage against the CPU reference it claims bit-perfect parity with.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaGdnScanStepF32Tests
 {
     private readonly ITestOutputHelper _out;
@@ -162,6 +163,230 @@ public class CudaGdnScanStepF32Tests
             if (dG != 0) CudaDriverApi.cuMemFree_v2(dG);
             if (dBeta != 0) CudaDriverApi.cuMemFree_v2(dBeta);
             if (dOut != 0) CudaDriverApi.cuMemFree_v2(dOut);
+        }
+    }
+
+    /// <summary>
+    /// Issue #1222: <see cref="CudaKernels.LaunchGdnScanMultiF32"/> runs a whole sequence in one launch
+    /// with the state in registers. It must equal the CPU reference over the same sequence exactly —
+    /// output for every token and the final state — since it is meant to be a drop-in for the
+    /// per-token loop. nVHead = 3 × nKHead makes the tiled head broadcast (vh % nKHead) matter.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(48, 16, 1)]   // decode: one token
+    [InlineData(48, 16, 37)]  // Bonsai-2 27B GDN shape, a prefill-sized run
+    public void GdnScanMultiF32_MatchesCpuReference_OverSequence(int nVHead, int nKHead, int seqLen)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+        const int dState = 128;
+
+        using var ctx = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        using var kernels = new CudaKernels(ptxDir!);
+        Skip.IfNot(kernels.CanGdnScanMultiF32(dState), "gdn_scan_multi_f32 not in the loaded PTX");
+
+        var rng = new Random(1222 ^ seqLen);
+        float[] Rand(int n, double lo, double hi)
+        {
+            var a = new float[n];
+            for (int i = 0; i < n; i++) a[i] = (float)(lo + rng.NextDouble() * (hi - lo));
+            return a;
+        }
+
+        float[] state = Rand(nVHead * dState * dState, -1, 1);
+        float[] q = Rand(seqLen * nKHead * dState, -1, 1);
+        float[] k = Rand(seqLen * nKHead * dState, -1, 1);
+        float[] v = Rand(seqLen * nVHead * dState, -1, 1);
+        float[] g = Rand(seqLen * nVHead, 0.5, 1);
+        float[] beta = Rand(seqLen * nVHead, 0, 1);
+
+        nint[] bufs = new nint[7];
+        try
+        {
+            float[][] host = [state, q, k, v, g, beta, new float[seqLen * nVHead * dState]];
+            for (int i = 0; i < host.Length; i++)
+            {
+                CudaDriverApi.cuMemAlloc_v2(out bufs[i], (nuint)(host[i].Length * sizeof(float))).ThrowOnError();
+                unsafe
+                {
+                    fixed (float* p = host[i])
+                        CudaDriverApi.cuMemcpyHtoD_v2(bufs[i], (nint)p, (nuint)(host[i].Length * sizeof(float))).ThrowOnError();
+                }
+            }
+
+            kernels.LaunchGdnScanMultiF32(bufs[0], bufs[1], bufs[2], bufs[3], bufs[4], bufs[5], bufs[6],
+                nVHead, nKHead, seqLen, stream.Handle);
+            stream.Synchronize();
+
+            float[] cpuOut = new float[seqLen * nVHead * dState];
+            float[] cpuState = (float[])state.Clone();
+            int qkTok = nKHead * dState, vTok = nVHead * dState;
+            for (int t = 0; t < seqLen; t++)
+            {
+                GatedDeltaNetScan.Execute(cpuState, q.AsSpan(t * qkTok, qkTok), k.AsSpan(t * qkTok, qkTok),
+                    v.AsSpan(t * vTok, vTok), g.AsSpan(t * nVHead, nVHead), beta.AsSpan(t * nVHead, nVHead),
+                    cpuOut.AsSpan(t * vTok, vTok), nVHead, nKHead, dState, seqLen: 1);
+            }
+
+            float[] gpuOut = new float[cpuOut.Length];
+            float[] gpuState = new float[cpuState.Length];
+            unsafe
+            {
+                fixed (float* p = gpuOut) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, bufs[6], (nuint)(gpuOut.Length * sizeof(float))).ThrowOnError();
+                fixed (float* p = gpuState) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, bufs[0], (nuint)(gpuState.Length * sizeof(float))).ThrowOnError();
+            }
+
+            Assert.True(cpuOut.AsSpan().SequenceEqual(gpuOut), "output mismatch");
+            Assert.True(cpuState.AsSpan().SequenceEqual(gpuState), "final state mismatch");
+        }
+        finally
+        {
+            foreach (nint b in bufs)
+                if (b != 0) CudaDriverApi.cuMemFree_v2(b);
+        }
+    }
+
+    /// <summary>
+    /// Issue #1194: <see cref="CudaKernels.LaunchGdnScanReplayF32"/> rebuilds the state after <c>rows</c> tokens in one launch, and must
+    /// be bit-identical to the scan (CPU oracle here; the step kernel is bit-exact against it above), so a speculative verify's rollback
+    /// lands on exactly the state the verify passed through. Discriminating: the state after one row fewer must differ.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(48, 16, 7)]   // Bonsai-2 27B GDN shape, DFlash K=7
+    [InlineData(32, 16, 1)]   // one row, Qwen3.6-A3B head ratio
+    public void GdnScanReplayF32_IsBitIdenticalToTheScan(int nVHead, int nKHead, int rows)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+        const int dState = 128;
+
+        using var ctx = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        using var kernels = new CudaKernels(ptxDir!);
+        Skip.IfNot(kernels.HasGdnScanReplayF32, "PTX predates gdn_scan_replay_f32_d128");
+
+        var rng = new Random(1194 ^ nVHead ^ rows);
+        float[] Rand(int n, double lo, double hi)
+        {
+            var a = new float[n];
+            for (int i = 0; i < n; i++) a[i] = (float)(lo + rng.NextDouble() * (hi - lo));
+            return a;
+        }
+        float[] state0 = Rand(nVHead * dState * dState, -1, 1);
+        float[] q = Rand(rows * nKHead * dState, -1, 1), k = Rand(rows * nKHead * dState, -1, 1);
+        GatedDeltaNetScan.L2NormalizeHeads(k, dState);
+        float[] v = Rand(rows * nVHead * dState, -1, 1), g = Rand(rows * nVHead, 0.5, 1), beta = Rand(rows * nVHead, 0, 1);
+
+        float[] expected = (float[])state0.Clone();
+        GatedDeltaNetScan.Execute(expected, q, k, v, g, beta, new float[rows * nVHead * dState], nVHead, nKHead, dState, rows);
+        float[] oneFewer = (float[])state0.Clone();
+        GatedDeltaNetScan.Execute(oneFewer, q, k, v, g, beta, new float[rows * nVHead * dState], nVHead, nKHead, dState, rows - 1);
+
+        var allocs = new List<nint>();
+        nint Upload(float[] a)
+        {
+            CudaDriverApi.cuMemAlloc_v2(out nint d, (nuint)(a.Length * sizeof(float))).ThrowOnError();
+            allocs.Add(d);
+            unsafe { fixed (float* p = a) CudaDriverApi.cuMemcpyHtoD_v2(d, (nint)p, (nuint)(a.Length * sizeof(float))).ThrowOnError(); }
+            return d;
+        }
+        try
+        {
+            nint dS = Upload(new float[state0.Length]), dSrc = Upload(state0);
+            kernels.LaunchGdnScanReplayF32(dS, dSrc, Upload(k), Upload(v), Upload(g), Upload(beta), rows, nVHead, nKHead, dState, stream.Handle);
+            stream.Synchronize();
+            float[] actual = new float[state0.Length];
+            unsafe { fixed (float* p = actual) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dS, (nuint)(actual.Length * sizeof(float))).ThrowOnError(); }
+
+            int mismatches = 0;
+            for (int i = 0; i < actual.Length; i++)
+                if (BitConverter.SingleToInt32Bits(actual[i]) != BitConverter.SingleToInt32Bits(expected[i])) mismatches++;
+            Assert.True(mismatches == 0, $"{mismatches} of {actual.Length} state elements differ from the scan");
+            Assert.False(actual.AsSpan().SequenceEqual(oneFewer), "the replay must not equal the state one row earlier");
+        }
+        finally
+        {
+            foreach (nint d in allocs) CudaDriverApi.cuMemFree_v2(d);
+        }
+    }
+
+    /// <summary>
+    /// Issue #1194 read-only verify on CUDA: <see cref="CudaKernels.LaunchGdnScanMultiF32"/> with <c>writeState: false</c> must emit the
+    /// in-place scan's outputs bit for bit and leave the state untouched; <see cref="CudaKernels.LaunchGdnScanReplayF32"/> with the state
+    /// as its own source must then advance it, in place, to exactly the CPU state after rows 0..lastRow (accept nothing, a partial block,
+    /// every row). Bonsai-2's 48/16 heads (tiled broadcast) and a state far from zero. Negative control: one row fewer must differ.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(0)]
+    [InlineData(3)]
+    [InlineData(7)]
+    public void ReadOnlyMultiScan_ThenInPlaceReplay_IsBitIdenticalToTheScan(int lastRow)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+        const int nVHead = 48, nKHead = 16, dState = 128, rows = 8;
+
+        using var ctx = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        using var kernels = new CudaKernels(ptxDir!);
+        Skip.IfNot(kernels.CanGdnScanMultiF32(dState) && kernels.HasGdnScanReplayF32, "PTX predates the #1194 kernels");
+
+        var rng = new Random(1194 + lastRow);
+        float[] Rand(int n, double lo, double hi)
+        {
+            var a = new float[n];
+            for (int i = 0; i < n; i++) a[i] = (float)(lo + rng.NextDouble() * (hi - lo));
+            return a;
+        }
+        float[] state0 = Rand(nVHead * dState * dState, -2, 2);
+        float[] q = Rand(rows * nKHead * dState, -1, 1), k = Rand(rows * nKHead * dState, -1, 1);
+        GatedDeltaNetScan.L2NormalizeHeads(q, dState);
+        GatedDeltaNetScan.L2NormalizeHeads(k, dState);
+        float[] v = Rand(rows * nVHead * dState, -3, 3), g = Rand(rows * nVHead, 0.5, 1), beta = Rand(rows * nVHead, 0.1, 1);
+
+        float[] fullOut = new float[rows * nVHead * dState];
+        GatedDeltaNetScan.Execute((float[])state0.Clone(), q, k, v, g, beta, fullOut, nVHead, nKHead, dState, rows);
+        float[] expected = (float[])state0.Clone();
+        GatedDeltaNetScan.Execute(expected, q, k, v, g, beta, new float[rows * nVHead * dState], nVHead, nKHead, dState, lastRow + 1);
+        float[] oneFewer = (float[])state0.Clone();
+        GatedDeltaNetScan.Execute(oneFewer, q, k, v, g, beta, new float[rows * nVHead * dState], nVHead, nKHead, dState, lastRow);
+
+        var allocs = new List<nint>();
+        nint Upload(float[] a)
+        {
+            CudaDriverApi.cuMemAlloc_v2(out nint d, (nuint)(a.Length * sizeof(float))).ThrowOnError();
+            allocs.Add(d);
+            unsafe { fixed (float* p = a) CudaDriverApi.cuMemcpyHtoD_v2(d, (nint)p, (nuint)(a.Length * sizeof(float))).ThrowOnError(); }
+            return d;
+        }
+        float[] Download(nint d, int n)
+        {
+            float[] a = new float[n];
+            unsafe { fixed (float* p = a) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, d, (nuint)(n * sizeof(float))).ThrowOnError(); }
+            return a;
+        }
+        try
+        {
+            nint dS = Upload(state0), dK = Upload(k), dV = Upload(v), dG = Upload(g), dB = Upload(beta);
+            nint dOut = Upload(new float[fullOut.Length]);
+            kernels.LaunchGdnScanMultiF32(dS, Upload(q), dK, dV, dG, dB, dOut, nVHead, nKHead, rows, stream.Handle, writeState: false);
+            stream.Synchronize();
+            Assert.True(Download(dS, state0.Length).AsSpan().SequenceEqual(state0), "a read-only scan wrote the state");
+            Assert.True(Download(dOut, fullOut.Length).AsSpan().SequenceEqual(fullOut), "read-only outputs differ from the scan");
+
+            kernels.LaunchGdnScanReplayF32(dS, dS, dK, dV, dG, dB, lastRow + 1, nVHead, nKHead, dState, stream.Handle);
+            stream.Synchronize();
+            float[] actual = Download(dS, state0.Length);
+            Assert.True(actual.AsSpan().SequenceEqual(expected), $"in-place replay of {lastRow + 1} row(s) differs from the scan");
+            Assert.False(actual.AsSpan().SequenceEqual(oneFewer), "the replay must not equal the state one row earlier");
+        }
+        finally
+        {
+            foreach (nint d in allocs) CudaDriverApi.cuMemFree_v2(d);
         }
     }
 }

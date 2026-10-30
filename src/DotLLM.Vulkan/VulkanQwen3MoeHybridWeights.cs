@@ -163,7 +163,8 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
     private readonly LayerBuffers[] _layers;
     public LayerBuffers[] Layers => _layers;
 
-    public VulkanDevice.Buffer TokenEmbedding { get; }
+    /// <summary>Widened F32 token-embedding table as row chunks (#778; one chunk when it fits).</summary>
+    public VulkanChunkedRowTable TokenEmbeddingRows { get; }
     public VulkanDevice.Buffer OutputNormWeight { get; }
     public VulkanDevice.Buffer OutputWeight { get; }
     public QuantizationType OutputDeviceQuantType { get; }
@@ -174,14 +175,14 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
 
     private VulkanQwen3MoeHybridWeights(
         LayerBuffers[] layers,
-        VulkanDevice.Buffer tokenEmbedding,
+        VulkanChunkedRowTable tokenEmbedding,
         VulkanDevice.Buffer outputNormWeight,
         VulkanDevice.Buffer outputWeight, QuantizationType outputQt,
         int outputOutputDim, int outputInputDim,
         long allocatedBytes)
     {
         _layers = layers;
-        TokenEmbedding = tokenEmbedding;
+        TokenEmbeddingRows = tokenEmbedding;
         OutputNormWeight = outputNormWeight;
         OutputWeight = outputWeight;
         OutputDeviceQuantType = outputQt;
@@ -201,7 +202,8 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
         Qwen3MoeLayerWeights[] cpuLayers,
         float[] outputNormWeight,
         nint tokenEmbedWeight, QuantizationType tokenEmbedQt,
-        nint outputWeight, QuantizationType outputQt, int outputOutputDim, int outputInputDim)
+        nint outputWeight, QuantizationType outputQt, int outputOutputDim, int outputInputDim,
+        bool hostTokenEmbedding = false)
     {
         ArgumentNullException.ThrowIfNull(device);
         ArgumentNullException.ThrowIfNull(config);
@@ -216,14 +218,16 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
         // upload below — same pattern as VulkanNemotronHWeights).
         long stagingBytes = ComputeMaxStagingBytes(config, cpuLayers, outputNormWeight,
             outputOutputDim, outputInputDim, outputQt, tokenEmbedQt);
+        VulkanWeightImportPolicy.Reset();
         using var staging = VulkanStagingBuffer.Create(device, stagingBytes);
 
         // Token embedding always dequantises to F32 — the embedding gather uses
         // vkCmdCopyBuffer byte offsets and needs a contiguous F32 layout.
-        var tokenEmbed = UploadProjectionMatrix(device, staging,
-            tokenEmbedWeight, tokenEmbedQt, config.VocabSize, config.HiddenSize,
-            forceF32: true, out _, out long tokenEmbedBytes);
-        totalBytes += tokenEmbedBytes;
+        // hostTokenEmbedding (qwen4exp, #819): the caller gathers rows from the mmap'd table on the host, so only a one-row stub is uploaded -
+        // the F32 table is 2.4 GiB at the released vocab, which on a box whose resident GPU memory is capped near the weights is the KV budget.
+        var tokenEmbed = VulkanChunkedRowTable.Create(device, staging,
+            tokenEmbedWeight, tokenEmbedQt, hostTokenEmbedding ? 1 : config.VocabSize, config.HiddenSize);
+        totalBytes += tokenEmbed.TotalBytes;
 
         var layers = new LayerBuffers[config.NumLayers];
         for (int i = 0; i < config.NumLayers; i++)
@@ -257,6 +261,30 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
 
         return new VulkanQwen3MoeHybridWeights(layers, tokenEmbed, outputNorm,
             outputW, outputDeviceQt, outputOutputDim, outputInputDim, totalBytes);
+    }
+
+    /// <summary>
+    /// Uploads only the token embedding, final norm and LM head (no per-layer buffers). Used by architectures that borrow this class's
+    /// recording machinery through a headless host and upload their own layers (LFM2-MoE, #1015).
+    /// </summary>
+    internal static VulkanQwen3MoeHybridWeights UploadHeadOnly(
+        VulkanDevice device, ModelConfig config, float[] outputNormWeight,
+        nint tokenEmbedWeight, QuantizationType tokenEmbedQt,
+        nint outputWeight, QuantizationType outputQt, int outputOutputDim, int outputInputDim)
+    {
+        long stagingBytes = Math.Max((long)config.VocabSize * config.HiddenSize * sizeof(float),
+            ProjectionUploadBytes(outputOutputDim, outputInputDim, outputQt));
+        stagingBytes = Math.Max(stagingBytes, (long)outputNormWeight.Length * sizeof(float));
+        VulkanWeightImportPolicy.Reset();
+        using var staging = VulkanStagingBuffer.Create(device, Math.Max(stagingBytes, 64));
+        var tokenEmbed = VulkanChunkedRowTable.Create(device, staging,
+            tokenEmbedWeight, tokenEmbedQt, config.VocabSize, config.HiddenSize);
+        var outputNorm = UploadFloatArray(device, staging, outputNormWeight);
+        var outputW = UploadProjectionMatrix(device, staging, outputWeight, outputQt, outputOutputDim, outputInputDim,
+            forceF32: false, out var outputDeviceQt, out long outputBytes);
+        long total = tokenEmbed.TotalBytes + (long)outputNormWeight.Length * sizeof(float) + outputBytes;
+        return new VulkanQwen3MoeHybridWeights(Array.Empty<LayerBuffers>(), tokenEmbed, outputNorm,
+            outputW, outputDeviceQt, outputOutputDim, outputInputDim, total);
     }
 
     internal static GdnLayerBuffers UploadGdnLayer(
@@ -340,6 +368,14 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
     private static bool KeepQ4K(QuantizationType qt, int k) => qt == QuantizationType.Q4_K && (k % 256) == 0;
     private static bool KeepQ5K(QuantizationType qt, int k) => qt == QuantizationType.Q5_K && (k % 256) == 0;
     private static bool KeepQ6K(QuantizationType qt, int k) => qt == QuantizationType.Q6_K && (k % 256) == 0;
+    // Q2_K / Q3_K / IQ4_XS / IQ1_S / IQ4_NL: the hybrid-dense and MoE-hybrid RecordMatmul dispatch tables have GEMV + GEMM cases for
+    // all of these, but without an entry here the weights were silently widened to F32 at load (IQ4_XS Tev1-4B decoded at 6 tok/s
+    // streaming 17 GB per token instead of ~2.2 GB packed, and needed ~7x the device memory). Issue #627.
+    private static bool KeepQ2K(QuantizationType qt, int k) => qt == QuantizationType.Q2_K && (k % 256) == 0;
+    private static bool KeepQ3K(QuantizationType qt, int k) => qt == QuantizationType.Q3_K && (k % 256) == 0;
+    private static bool KeepIq4Xs(QuantizationType qt, int k) => qt == QuantizationType.IQ4_XS && (k % 256) == 0;
+    private static bool KeepIq1S(QuantizationType qt, int k) => qt == QuantizationType.IQ1_S && (k % 256) == 0;
+    private static bool KeepIq4Nl(QuantizationType qt, int k) => qt == QuantizationType.IQ4_NL && (k % 32) == 0;
     private static bool KeepIq2Xxs(QuantizationType qt, int k) => qt == QuantizationType.IQ2_XXS && (k % 256) == 0;
     private static bool KeepIq2Xs(QuantizationType qt, int k) => qt == QuantizationType.IQ2_XS && (k % 256) == 0;
     private static bool KeepIq2S(QuantizationType qt, int k) => qt == QuantizationType.IQ2_S && (k % 256) == 0;
@@ -348,11 +384,29 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
     private static bool KeepF16(QuantizationType qt, int k) => qt == QuantizationType.F16 && (k & 1) == 0;
     private static bool KeepBf16(QuantizationType qt, int k) => qt == QuantizationType.BF16 && (k & 1) == 0;
 
+    // PQ2_0 (PrismML Bonsai ternary) packs 128 weights per group into 34 bytes: an f16 group
+    // scale plus 2.125 bits per weight. Widening it to F32 is a ~15x expansion — for Bonsai 2 27B
+    // that is ~108 GB of device-local memory against a 93 GiB budget, which is how the load used
+    // to die with VK_ERROR_OUT_OF_DEVICE_MEMORY on a heap that looked empty
+    // (.docs/BONSAI2_27B_SUPPORT.md). Keeping it packed is not an optimisation here, it is the
+    // difference between loading and not loading.
+    private static bool KeepPQ2_0(QuantizationType qt, int k) => qt == QuantizationType.PQ2_0 && (k % 128) == 0;
+
+    // PTQ1_0 packs the same 128 weights into 28 bytes (1.75 bpw) — the same argument as PQ2_0
+    // above, only more so. Added together with its dispatch arms in
+    // VulkanQwen3HybridDenseTransformerModel.RecordMatmul and
+    // VulkanQwen3MoeHybridTransformerModel.RecordMatmul (#436): this class is shared by BOTH
+    // hybrid models, so a keep-packed arm here without a dispatch arm in each of them is not a
+    // missing optimisation, it is an inference-time throw for whichever model was not the one
+    // being tested. That is exactly how PQ2_0 broke.
+    private static bool KeepPTQ1_0(QuantizationType qt, int k) => qt == QuantizationType.PTQ1_0 && (k % 128) == 0;
+
     private static bool KeepNative(QuantizationType qt, int k)
         => KeepQ8(qt, k) || KeepQ4K(qt, k) || KeepQ5K(qt, k) || KeepQ6K(qt, k)
+        || KeepQ2K(qt, k) || KeepQ3K(qt, k) || KeepIq4Xs(qt, k) || KeepIq1S(qt, k) || KeepIq4Nl(qt, k)
         || KeepIq2Xxs(qt, k) || KeepIq2Xs(qt, k) || KeepIq2S(qt, k)
         || KeepIq3Xxs(qt, k) || KeepIq3S(qt, k)
-        || KeepF16(qt, k) || KeepBf16(qt, k);
+        || KeepF16(qt, k) || KeepBf16(qt, k) || KeepPQ2_0(qt, k) || KeepPTQ1_0(qt, k);
 
     private static QuantizationType DeviceQuantTypeFor(QuantizationType qt, int k)
     {
@@ -360,6 +414,11 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
         if (KeepQ4K(qt, k)) return QuantizationType.Q4_K;
         if (KeepQ5K(qt, k)) return QuantizationType.Q5_K;
         if (KeepQ6K(qt, k)) return QuantizationType.Q6_K;
+        if (KeepQ2K(qt, k)) return QuantizationType.Q2_K;
+        if (KeepQ3K(qt, k)) return QuantizationType.Q3_K;
+        if (KeepIq4Xs(qt, k)) return QuantizationType.IQ4_XS;
+        if (KeepIq1S(qt, k)) return QuantizationType.IQ1_S;
+        if (KeepIq4Nl(qt, k)) return QuantizationType.IQ4_NL;
         if (KeepIq2Xxs(qt, k)) return QuantizationType.IQ2_XXS;
         if (KeepIq2Xs(qt, k)) return QuantizationType.IQ2_XS;
         if (KeepIq2S(qt, k)) return QuantizationType.IQ2_S;
@@ -367,6 +426,8 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
         if (KeepIq3S(qt, k)) return QuantizationType.IQ3_S;
         if (KeepF16(qt, k)) return QuantizationType.F16;
         if (KeepBf16(qt, k)) return QuantizationType.BF16;
+        if (KeepPQ2_0(qt, k)) return QuantizationType.PQ2_0;
+        if (KeepPTQ1_0(qt, k)) return QuantizationType.PTQ1_0;
         return QuantizationType.F32;
     }
 
@@ -426,6 +487,19 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
     /// alignment permits, otherwise dequantises to F32 on the host before
     /// upload.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Zero-copy fast path (issue #508).</b> This helper is the upload path for
+    /// <i>four</i> models — Bonsai 2 27B and the Qwen3 hybrid dense stack via
+    /// <c>VulkanQwen3HybridDenseWeights</c>, Qwen3-MoE-hybrid here, and (through its own
+    /// copy of the same shape) Nemotron-H — and until #508 every one of them staged
+    /// unconditionally, leaving the bytes resident twice on a UMA APU. When the device
+    /// image is the source bytes verbatim, <see cref="VulkanWeightImportPolicy"/> aliases
+    /// the mmap'd pages instead; the staging copy below is the fallback. The widening
+    /// branches cannot import — their device image is a host dequant of the source, not
+    /// the source — so they stage and register the dead source range for #438.
+    /// </para>
+    /// </remarks>
     internal static unsafe VulkanDevice.Buffer UploadProjectionMatrix(
         VulkanDevice device, VulkanStagingBuffer staging,
         nint srcPtr, QuantizationType qt, int outputDim, int inputDim,
@@ -434,6 +508,7 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
         out long uploadedBytes)
     {
         long elems = (long)outputDim * inputDim;
+        long sourceBytes = Dequantize.RowByteSize(inputDim, qt) * outputDim;
 
         if (!forceF32 && KeepNative(qt, inputDim))
         {
@@ -441,13 +516,30 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
             long rowBytes = Dequantize.RowByteSize(inputDim, keepQt);
             long bytes = rowBytes * outputDim;
 
-            var buf = device.AllocateDeviceLocal(bytes);
-            staging.UploadBytes(srcPtr, bytes, buf);
-
             deviceQuantType = keepQt;
             uploadedBytes = bytes;
+
+            if (VulkanWeightImportPolicy.TryImport(device, srcPtr, bytes, out var imported))
+                return imported!;
+
+            var buf = device.AllocateDeviceLocal(bytes);
+            staging.UploadBytes(srcPtr, bytes, buf);
+            VulkanWeightImportPolicy.NoteStaged(srcPtr, bytes);
             return buf;
         }
+
+        deviceQuantType = QuantizationType.F32;
+        uploadedBytes = elems * sizeof(float);
+
+        // An F32 source reaches the device byte-for-byte even on the "widening" arm —
+        // there is nothing to widen — so it is an import candidate too (#508).
+        if (qt == QuantizationType.F32
+            && VulkanWeightImportPolicy.TryImport(device, srcPtr, uploadedBytes, out var importedF32))
+            return importedF32!;
+
+        VulkanWeightImportPolicy.NoteStaged(
+            srcPtr, sourceBytes,
+            qt == QuantizationType.F32 ? null : "not_source_bytes");
 
         long fpBytes = elems * sizeof(float);
         var fpBuf = device.AllocateDeviceLocal(fpBytes);
@@ -489,6 +581,25 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
         return fpBuf;
     }
 
+    /// <summary>
+    /// Uploads a quantised projection verbatim (no widening, no <see cref="KeepNative"/> gate): the zero-copy mmap import when
+    /// <see cref="VulkanWeightImportPolicy"/> allows it, a staged copy otherwise. For a type whose kernels the CALLER has verified exist
+    /// (native Q4_0 on LFM2.5, #1018); the shared <see cref="UploadProjectionMatrix"/> deliberately does not keep Q4_0 so the other hybrid
+    /// models, whose dispatch tables have no Q4_0 arm, keep their old behaviour.
+    /// </summary>
+    internal static VulkanDevice.Buffer UploadRawQuantMatrix(
+        VulkanDevice device, VulkanStagingBuffer staging, nint srcPtr, QuantizationType qt, int outputDim, int inputDim, out long uploadedBytes)
+    {
+        long bytes = Dequantize.RowByteSize(inputDim, qt) * outputDim;
+        uploadedBytes = bytes;
+        if (VulkanWeightImportPolicy.TryImport(device, srcPtr, bytes, out var imported))
+            return imported!;
+        var buf = device.AllocateDeviceLocal(bytes);
+        staging.UploadBytes(srcPtr, bytes, buf);
+        VulkanWeightImportPolicy.NoteStaged(srcPtr, bytes);
+        return buf;
+    }
+
     internal static unsafe VulkanDevice.Buffer UploadFloatArray(
         VulkanDevice device, VulkanStagingBuffer staging, float[] data)
     {
@@ -500,7 +611,7 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
 
     public void Dispose()
     {
-        TokenEmbedding.Dispose();
+        TokenEmbeddingRows.Dispose();
         OutputNormWeight.Dispose();
         OutputWeight.Dispose();
         for (int i = 0; i < _layers.Length; i++)

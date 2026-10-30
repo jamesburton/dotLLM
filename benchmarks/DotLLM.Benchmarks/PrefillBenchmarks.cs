@@ -3,7 +3,7 @@ using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Engine.KvCache;
-using DotLLM.HuggingFace;
+using DotLLM.Tests.Integration.Fixtures;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 
@@ -85,15 +85,7 @@ public unsafe class PrefillBenchmarks
 
     private static string DownloadModel(string repoId, string filename, int approxMB)
     {
-        string cacheDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "test-cache");
-        string cachedPath = Path.Combine(cacheDir, repoId.Replace('/', Path.DirectorySeparatorChar), filename);
-        if (File.Exists(cachedPath))
-            return cachedPath;
-
-        Console.WriteLine($"Downloading {repoId}/{filename} (~{approxMB} MB)...");
-        using var downloader = new HuggingFaceDownloader();
-        return downloader.DownloadFileAsync(repoId, filename, cacheDir).GetAwaiter().GetResult();
+        Console.WriteLine($"Resolving {repoId}/{filename} (~{approxMB} MB)...");
+        return TestModelDownloader.EnsureModelAsync(repoId, filename).GetAwaiter().GetResult();
     }
 }

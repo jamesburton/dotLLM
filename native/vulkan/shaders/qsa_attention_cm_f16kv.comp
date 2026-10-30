@@ -1,0 +1,226 @@
+#version 450
+#extension GL_KHR_cooperative_matrix          : require
+#extension GL_KHR_memory_scope_semantics      : require
+#extension GL_KHR_shader_subgroup_basic       : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage        : require
+
+// Cooperative-matrix twin of qsa_attention_f16kv.comp (issue #1356): same bindings, same push constants, same partial (m, l, acc) output
+// layout (so qsa_merge_f32.comp is reused unchanged), but the whole GQA group of one KV head is one 16-row matrix tile.
+//
+// One workgroup per (KV head, KV split, query). The group's heads (numHeads / numKvHeads <= 16, 12 for qwen4exp) are the rows of the
+// Q tile, the query's virtual key list (selected blocks in ascending order, then the incomplete tail block) is consumed in BC-key tiles
+// gathered from the F16 cache: S = Q.K^T on the matrix cores, an F32 online softmax per head row, O += P.V on the matrix cores.
+// Every key of the list is causally visible, so no mask exists; K and V are read from global memory ONCE per group, not once per head.
+//
+// Numerics (attention_flash_f32_coopmat_hd256.glsl, #685/#686, carried over): QK^T uses a hi/lo f16 split of Q (Q = Qh + Ql); K is the
+// F16 cache itself so its lo half is exactly zero (S = Qh.K + Ql.K, F32 accumulate). P is rounded to f16 for the P.V multiply and the
+// running denominator sums the rounded values, V is the F16 cache, P.V accumulates in F32. Softmax state is F32.
+//
+// head_dim is exactly 256 (host gate). Subgroup safety: matrix ops are subgroup-scope; subgroup 0 / 1 own the two 16-key slices of QK^T,
+// subgroup (id % 4) owns a 16-wide d-block of each P.V round (wave32 would run redundant identical copies, which is correct).
+
+#define BR           16
+#define BC           32
+#define WG_SIZE      256
+#define HD           256
+#define KV_D         64
+#define MAT_K        16
+#define NUM_SLICES   4
+#define NEG_INF      (-3.4e38)
+#define S_STRIDE     (BC + 4)
+#define P_STRIDE     (BC + 8)
+
+layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufQ       { float q[]; };       // [T, numHeads * 256]
+layout(set = 0, binding = 1, std430) readonly  buffer BufK       { uint  kw[]; };      // F16 pairs, [seq_kv, numKvHeads * 256] halves
+layout(set = 0, binding = 2, std430) readonly  buffer BufV       { uint  vw[]; };
+layout(set = 0, binding = 3, std430) readonly  buffer BufSel     { int   sel[]; };     // [qCount, selStride] ascending block ids
+layout(set = 0, binding = 4, std430) writeonly buffer BufPartOut { float partOut[]; }; // [(lq*numHeads + head)*numSplits + split, 256]
+layout(set = 0, binding = 5, std430) writeonly buffer BufPartMS  { float partMS[]; };  // [.., 2]
+
+layout(push_constant) uniform PushConstants {
+    uint  qBase;
+    uint  qCount;
+    uint  firstPos;
+    uint  numHeads;
+    uint  numKvHeads;
+    uint  headDim;
+    uint  blockSize;
+    uint  budgetBlocks;
+    uint  numSplits;
+    uint  selStride;
+    float scale;
+} pc;
+
+shared float16_t qTile  [BR * HD];
+shared float16_t qTileLo[BR * HD];
+shared float16_t kvTile [BC * KV_D];
+shared float     sTile  [BR * S_STRIDE];
+shared float16_t pTile  [BR * P_STRIDE];
+shared float     oStage [NUM_SLICES * 16 * 16];
+shared float     runningMax[BR];
+shared float     runningSum[BR];
+shared float     corrShared[BR];
+shared uint      posT[BC];
+
+// Stage one KV_D-wide d-chunk of BC gathered keys (from `words`) into kvTile; rows past tileLen are zero.
+void stageKV(bool isK, uint tileLen, uint dBase, uint kvStride, uint hkv, uint tid) {
+    for (uint idx = tid; idx < uint(BC * KV_D / 2); idx += uint(WG_SIZE)) {
+        uint c = idx >> 5u;
+        uint w = idx & 31u;
+        uint word = 0u;
+        if (c < tileLen) {
+            uint base = (posT[c] * kvStride + hkv * pc.headDim + dBase) >> 1u;
+            word = isK ? kw[base + w] : vw[base + w];
+        }
+        vec2 v = unpackHalf2x16(word);
+        kvTile[c * uint(KV_D) + 2u * w]      = float16_t(v.x);
+        kvTile[c * uint(KV_D) + 2u * w + 1u] = float16_t(v.y);
+    }
+}
+
+void main() {
+    uint lq      = gl_WorkGroupID.y;
+    uint hkv     = gl_WorkGroupID.x / pc.numSplits;
+    uint splitId = gl_WorkGroupID.x - hkv * pc.numSplits;
+    uint tq      = pc.qBase + lq;
+    uint tid     = gl_LocalInvocationID.x;
+
+    uint groupSize = pc.numHeads / pc.numKvHeads;
+    uint rows      = groupSize;                    // host gate: <= BR
+    uint kvStride  = pc.numKvHeads * pc.headDim;
+
+    uint p       = pc.firstPos + tq;
+    uint nb      = (p + 1u) / pc.blockSize;
+    bool dense   = nb <= pc.budgetBlocks;
+    uint nSel    = dense ? nb : pc.budgetBlocks;
+    uint selKeys = nSel * pc.blockSize;
+    uint nKeys   = selKeys + (p + 1u - nb * pc.blockSize);
+
+    uint splitLen   = (nKeys + pc.numSplits - 1u) / pc.numSplits;
+    uint chunkStart = min(splitId * splitLen, nKeys);
+    uint chunkEnd   = min(chunkStart + splitLen, nKeys);
+
+    // Q tile: row r = head hkv*groupSize + r, hi/lo f16; padding rows are zero.
+    for (uint idx = tid; idx < uint(BR * HD); idx += uint(WG_SIZE)) {
+        uint r = idx >> 8u;
+        uint d = idx & 255u;
+        float val = 0.0;
+        if (r < rows) val = q[tq * pc.numHeads * pc.headDim + (hkv * groupSize + r) * pc.headDim + d];
+        float16_t hi = float16_t(val);
+        qTile[idx]   = hi;
+        qTileLo[idx] = float16_t(val - float(hi));
+    }
+    for (uint idx = tid; idx < uint(BR * P_STRIDE); idx += uint(WG_SIZE)) pTile[idx] = float16_t(0.0);
+    if (tid < uint(BR)) { runningMax[tid] = NEG_INF; runningSum[tid] = 0.0; }
+    float oReg[BR];
+    for (uint i = 0u; i < uint(BR); i++) oReg[i] = 0.0;
+    barrier();
+
+    uint slice  = gl_SubgroupID % uint(NUM_SLICES);
+    uint kslice = gl_SubgroupID & 1u;
+
+    for (uint tStart = chunkStart; tStart < chunkEnd; tStart += uint(BC)) {
+        uint tileLen = min(uint(BC), chunkEnd - tStart);
+
+        if (tid < uint(BC)) {
+            uint pos = 0u;
+            uint i = tStart + tid;
+            if (i < chunkEnd) {
+                if (i < selKeys) {
+                    uint blk = i / pc.blockSize;
+                    uint b = dense ? blk : uint(sel[lq * pc.selStride + blk]);
+                    pos = b * pc.blockSize + (i - blk * pc.blockSize);
+                } else {
+                    pos = nb * pc.blockSize + (i - selKeys);
+                }
+            }
+            posT[tid] = pos;
+        }
+        barrier();
+
+        // S = Q.K^T over the 16-key slices (subgroups 0 and 1).
+        coopmat<float, gl_ScopeSubgroup, BR, MAT_K, gl_MatrixUseAccumulator> accS =
+            coopmat<float, gl_ScopeSubgroup, BR, MAT_K, gl_MatrixUseAccumulator>(0.0);
+        for (uint dBase = 0u; dBase < uint(HD); dBase += uint(KV_D)) {
+            stageKV(true, tileLen, dBase, kvStride, hkv, tid);
+            barrier();
+            if (gl_SubgroupID < 2u) {
+                for (uint ck = 0u; ck < uint(KV_D / MAT_K); ck++) {
+                    coopmat<float16_t, gl_ScopeSubgroup, BR, MAT_K, gl_MatrixUseA> matQ;
+                    coopmat<float16_t, gl_ScopeSubgroup, BR, MAT_K, gl_MatrixUseA> matQl;
+                    coopmat<float16_t, gl_ScopeSubgroup, MAT_K, MAT_K, gl_MatrixUseB> matKt;
+                    uint dl = ck * uint(MAT_K);
+                    coopMatLoad(matKt, kvTile, kslice * 16u * uint(KV_D) + dl, uint(KV_D), gl_CooperativeMatrixLayoutColumnMajor);
+                    coopMatLoad(matQ,  qTile,   dBase + dl, uint(HD), gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(matQl, qTileLo, dBase + dl, uint(HD), gl_CooperativeMatrixLayoutRowMajor);
+                    accS = coopMatMulAdd(matQ, matKt, accS);
+                    accS = coopMatMulAdd(matQl, matKt, accS);
+                }
+            }
+            barrier();
+        }
+        if (gl_SubgroupID < 2u) coopMatStore(accS, sTile, kslice * 16u, uint(S_STRIDE), gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+
+        // Row-owner online softmax (one thread per head row) while all threads stage V round 0.
+        if (tid < rows) {
+            uint r = tid;
+            uint sBase = r * uint(S_STRIDE);
+            float oldMax = runningMax[r];
+            float newMax = oldMax;
+            for (uint c = 0u; c < tileLen; c++) newMax = max(newMax, sTile[sBase + c] * pc.scale);
+            float correction = (oldMax > NEG_INF * 0.5) ? exp(oldMax - newMax) : 0.0;
+            float tileSum = 0.0;
+            for (uint c = 0u; c < uint(BC); c++) {
+                float w = (c < tileLen) ? exp(sTile[sBase + c] * pc.scale - newMax) : 0.0;
+                float16_t wh = float16_t(w);
+                pTile[r * uint(P_STRIDE) + c] = wh;
+                tileSum += float(wh);
+            }
+            runningSum[r] = runningSum[r] * correction + tileSum;
+            runningMax[r] = newMax;
+            corrShared[r] = correction;
+        }
+        stageKV(false, tileLen, 0u, kvStride, hkv, tid);
+        barrier();
+
+        for (uint i = 0u; i < uint(BR); i++) oReg[i] *= (i < rows) ? corrShared[i] : 1.0;
+
+        for (uint round = 0u; round < uint(HD / (16 * NUM_SLICES)); round++) {
+            uint roundBase = round * uint(16 * NUM_SLICES);
+            if (round > 0u) {
+                stageKV(false, tileLen, roundBase, kvStride, hkv, tid);
+                barrier();
+            }
+            coopmat<float, gl_ScopeSubgroup, BR, MAT_K, gl_MatrixUseAccumulator> accO =
+                coopmat<float, gl_ScopeSubgroup, BR, MAT_K, gl_MatrixUseAccumulator>(0.0);
+            for (uint cChunk = 0u; cChunk < uint(BC) / 16u; cChunk++) {
+                coopmat<float16_t, gl_ScopeSubgroup, BR, MAT_K, gl_MatrixUseA> matP;
+                coopmat<float16_t, gl_ScopeSubgroup, MAT_K, MAT_K, gl_MatrixUseB> matV;
+                coopMatLoad(matP, pTile,  cChunk * 16u, uint(P_STRIDE), gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(matV, kvTile, cChunk * 16u * uint(KV_D) + slice * 16u, uint(KV_D), gl_CooperativeMatrixLayoutRowMajor);
+                accO = coopMatMulAdd(matP, matV, accO);
+            }
+            coopMatStore(accO, oStage, slice * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            barrier();
+            if (tid >= roundBase && tid < roundBase + uint(16 * NUM_SLICES)) {
+                uint sl = (tid - roundBase) >> 4u;
+                uint dd = tid & 15u;
+                for (uint i = 0u; i < uint(BR); i++) oReg[i] += oStage[sl * 256u + i * 16u + dd];
+            }
+            barrier();
+        }
+    }
+
+    for (uint r = 0u; r < rows; r++) {
+        uint blockId = (lq * pc.numHeads + hkv * groupSize + r) * pc.numSplits + splitId;
+        partOut[blockId * pc.headDim + tid] = oReg[r];
+        if (tid == 0u) {
+            partMS[blockId * 2u + 0u] = runningMax[r];
+            partMS[blockId * 2u + 1u] = runningSum[r];
+        }
+    }
+}

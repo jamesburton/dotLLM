@@ -130,6 +130,7 @@ public sealed unsafe class HybridTransformerModel : IModel
         GgufFile gguf, ModelConfig config, int numGpuLayers,
         int deviceId, ThreadingConfig threading)
     {
+        CudaTransformerModel.RejectGemmaForCompositeHost(config, nameof(HybridTransformerModel));
         if (numGpuLayers <= 0 || numGpuLayers >= config.NumLayers)
             throw new ArgumentOutOfRangeException(nameof(numGpuLayers),
                 $"numGpuLayers must be between 1 and {config.NumLayers - 1} for hybrid mode. " +
@@ -142,6 +143,12 @@ public sealed unsafe class HybridTransformerModel : IModel
         try
         {
             cpuWeights.RepackWeights();
+
+            // #484: validate the PTX deployment BEFORE any CUDA resource exists. A bad or
+            // incomplete ptxDir is by far the most common way this factory throws, and doing the
+            // check up front means it can no longer orphan a context/stream/cuBLAS handle,
+            // whatever the unwind path does (see CudaKernels.ResolveAndValidatePtxDirectory).
+            string ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(null);
 
             // 2. Initialize CUDA. Context creation cannot leak on its own throw (nothing
             // allocated yet), so it stays outside the inner try/catch — everything created
@@ -160,7 +167,6 @@ public sealed unsafe class HybridTransformerModel : IModel
                 cublas = CudaCublasHandle.Create();
                 cublas.SetStream(stream);
 
-                string? ptxDir = Path.Combine(AppContext.BaseDirectory, "ptx");
                 kernels = new CudaKernels(ptxDir);
 
                 // 3. Upload only GPU layers to VRAM
@@ -204,7 +210,8 @@ public sealed unsafe class HybridTransformerModel : IModel
                 cpuState = new TransformerForwardState(
                     config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
                     config.HeadDim, config.IntermediateSize, config.VocabSize,
-                    config.MaxSequenceLength, ropeDim, ropeTheta);
+                    config.MaxSequenceLength, ropeDim, ropeTheta,
+                    ropeFreqFactors: DotLLM.Models.Architectures.DenseRopeFreqFactors.Select(config, cpuWeights.RopeFreqFactors, ropeDim));
 
                 // 7. ComputeThreadPool for CPU layers
                 if (threading.IsParallel)
@@ -293,6 +300,7 @@ public sealed unsafe class HybridTransformerModel : IModel
     {
         ArgumentNullException.ThrowIfNull(cpuWeights);
         ArgumentNullException.ThrowIfNull(config);
+        CudaTransformerModel.RejectGemmaForCompositeHost(config, nameof(HybridTransformerModel));
         if (numGpuLayers <= 0 || numGpuLayers >= config.NumLayers)
             throw new ArgumentOutOfRangeException(nameof(numGpuLayers),
                 $"numGpuLayers must be between 1 and {config.NumLayers - 1} for hybrid mode. " +
@@ -312,7 +320,10 @@ public sealed unsafe class HybridTransformerModel : IModel
         //    cannot leak on its own throw (nothing allocated yet), so it stays outside the
         //    try/catch — everything created from here on is disposed on any failure before
         //    rethrowing. `cpuWeights` is caller-owned (see this method's doc) — never disposed
-        //    here.
+        //    here. #484: the PTX deployment is validated BEFORE the context exists, so a bad or
+        //    incomplete ptxDir — the most common way this factory throws — can no longer orphan
+        //    a context/stream/cuBLAS handle whatever the unwind path does.
+        ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(ptxDir);
         var context = CudaContext.Create(deviceId);
         CudaStream? stream = null;
         CudaCublasHandle? cublas = null;
@@ -327,7 +338,6 @@ public sealed unsafe class HybridTransformerModel : IModel
             cublas = CudaCublasHandle.Create();
             cublas.SetStream(stream);
 
-            ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
             kernels = new CudaKernels(ptxDir);
 
             // 3. Upload only GPU layers to VRAM
@@ -358,7 +368,8 @@ public sealed unsafe class HybridTransformerModel : IModel
             cpuState = new TransformerForwardState(
                 config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
                 config.HeadDim, config.IntermediateSize, config.VocabSize,
-                config.MaxSequenceLength, ropeDim, ropeTheta);
+                config.MaxSequenceLength, ropeDim, ropeTheta,
+                    ropeFreqFactors: DotLLM.Models.Architectures.DenseRopeFreqFactors.Select(config, cpuWeights.RopeFreqFactors, ropeDim));
 
             // 7. ComputeThreadPool for CPU layers — mirror the LoadFromGguf branch
             if (effectiveThreading.IsParallel)
@@ -479,7 +490,6 @@ public sealed unsafe class HybridTransformerModel : IModel
         int vocabSize = Config.VocabSize;
         int kvStride = numKvHeads * headDim;
         float eps = Config.NormEpsilon;
-        int slidingWindow = Config.SlidingWindowSize ?? 0;
         int h = sizeof(ushort); // FP16 element size
 
         int totalLayers = Config.NumLayers;
@@ -544,6 +554,14 @@ public sealed unsafe class HybridTransformerModel : IModel
         {
             ref readonly var lw = ref _gpuWeights.Layers[layer];
 
+            // Per-layer window: gpt-oss alternates window/dense (pattern=2), Gemma-3 uses
+            // pattern=6; uniform-window and no-window models resolve identically to the old
+            // hoisted value. 0 = dense (kernel convention). Mirrors CPU GetLayerSlidingWindow.
+            // `layer` is the absolute (global) index (GPU phase = global layers 0..gpuLayers-1).
+            int slidingWindow = CudaSlidingWindowResolver.Resolve(
+                Config.SlidingWindowSize, Config.SlidingWindowPattern,
+                Config.PerLayerSlidingWindow, layer);
+
             // ── ATTENTION BLOCK ──
             ProjectGpu(lw.QQuant, lw.QQuantType, lw.Q, _gpuState.NormOutput, _gpuState.Q,
                 lw.QOutputDim, lw.QInputDim, seqLen);
@@ -573,8 +591,10 @@ public sealed unsafe class HybridTransformerModel : IModel
             if (lw.KNormWeight != 0)
                 _kernels.LaunchPerHeadRmsNorm(_gpuState.K, lw.KNormWeight, eps, numKvHeads, headDim, seqLen, s);
 
+            // Dense-YaRN scaling (#366) rides on the weights bundle; (0, 1.0f) when inactive.
             _kernels.LaunchRoPE(_gpuState.Q, _gpuState.K, _gpuState.PositionsDevice,
-                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, _gpuRopeType, s);
+                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, _gpuRopeType, s,
+                _gpuWeights.RopeYarnInvFreqDevice, _gpuWeights.RopeYarnMscale);
 
             // KV-cache update + Attention
             var gpuKvCache = hybridKvCache?.GpuCache;
@@ -582,14 +602,29 @@ public sealed unsafe class HybridTransformerModel : IModel
             {
                 gpuKvCache.UpdateDevice(_gpuState.K, _gpuState.V, positions, seqLen, layer, s);
                 int seqKv = gpuKvCache.CurrentLength;
+                // lw.AttnSinksDevice (#365): 0 unless the GGUF carried `attn_sinks.weight`, so this
+                // is bit-identical for every model that has no sinks. See the else branch for why
+                // this class cannot currently reach a sink-bearing model in practice.
                 _kernels.LaunchAttention(_gpuState.Q, gpuKvCache.GetKeysPtr(layer),
                     gpuKvCache.GetValuesPtr(layer), _gpuState.AttnOutput,
-                    seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], slidingWindow, s);
+                    seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], slidingWindow, s,
+                    lw.AttnSinksDevice);
             }
             else
             {
+                // gpt-oss (the model #365 targets) is MoE and this class has no MoE FFN branch, so
+                // it cannot complete a valid forward here today. Sinks are plumbed anyway because
+                // `attn_sinks.weight` loading is tensor-driven, not architecture-gated
+                // (TransformerWeights.cs LoadOptionalBias) — a future DENSE sinks-bearing model
+                // would run through this partial-offload path (`--gpu-layers N`) and would
+                // otherwise drop its sinks silently, with no error.
+                // NOTE: this class's CPU half (the Attention.Execute calls in the CPU layer loop)
+                // is still sink-unaware — a pre-existing gap, out of scope here, analogous to the
+                // #366 hybrid CPU-tail YaRN gap. A dense sinks model on this path would need that
+                // fixed too before it were correct end to end.
                 _kernels.LaunchAttention(_gpuState.Q, _gpuState.K, _gpuState.V, _gpuState.AttnOutput,
-                    seqLen, seqLen, numHeads, numKvHeads, headDim, 0, slidingWindow, s);
+                    seqLen, seqLen, numHeads, numKvHeads, headDim, 0, slidingWindow, s,
+                    lw.AttnSinksDevice);
             }
 
             // Optional attention Sub-LN (BitNet): RMSNorm over the attention output before o_proj.
@@ -864,15 +899,26 @@ public sealed unsafe class HybridTransformerModel : IModel
                 {
                     var kRef = new TensorRef(seqLen, kvStride, DType.Float32, -1, (nint)k);
                     var vRef = new TensorRef(seqLen, kvStride, DType.Float32, -1, (nint)v);
+                    int cpuLocalLayer = cpuCacheLayer - _numGpuLayers;
                     hybridKvCache.Update(kRef, vRef, positions, cpuCacheLayer);
 
                     int seqKv = hybridKvCache.CpuCache.CurrentLength;
-                    var cachedK = hybridKvCache.CpuCache.GetKeysRef(cpuCacheLayer - _numGpuLayers);
-                    var cachedV = hybridKvCache.CpuCache.GetValuesRef(cpuCacheLayer - _numGpuLayers);
 
-                    Attention.Execute(q, (float*)cachedK.DataPointer, (float*)cachedV.DataPointer, attnOut,
-                        seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], _threadPool,
-                        _slidingWindowSize);
+                    if (hybridKvCache.CpuCache is IQuantizedKvCache qkvCache)
+                    {
+                        Attention.Execute(q, qkvCache, cpuLocalLayer, attnOut,
+                            seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], _threadPool,
+                            _slidingWindowSize);
+                    }
+                    else
+                    {
+                        var cachedK = hybridKvCache.CpuCache.GetKeysRef(cpuLocalLayer);
+                        var cachedV = hybridKvCache.CpuCache.GetValuesRef(cpuLocalLayer);
+
+                        Attention.Execute(q, (float*)cachedK.DataPointer, (float*)cachedV.DataPointer, attnOut,
+                            seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], _threadPool,
+                            _slidingWindowSize);
+                    }
                 }
                 else
                 {
@@ -1317,8 +1363,40 @@ public sealed unsafe class HybridTransformerModel : IModel
                                  int m, int k, int n, byte* preQuantizedInput,
                                  in WeightRepacking.RepackedWeight rw)
     {
-        if (rw.Ptr == 0 || n > 1 || rw.RowBytes < InterleavedMinRowBytes)
+        if (rw.Ptr == 0 || rw.RowBytes < InterleavedMinRowBytes)
         {
+            Gemm(origWeights, qt, b, c, m, k, n, preQuantizedInput);
+            return;
+        }
+
+        if (n > 1)
+        {
+            // #530: the multi-token arm must run the same repacked kernels as the n == 1 arm,
+            // otherwise a row's output depends on how many tokens shared the forward pass.
+            switch (qt)
+            {
+                case QuantizationType.Q8_0:
+                    MatMul.GemmR4TiledQ8_0((byte*)rw.Ptr, b, preQuantizedInput, c,
+                        rw.FullGroupCount, rw.TailRows, k / 32, m, k, n, _threadPool);
+                    return;
+                case QuantizationType.Q5_0:
+                    MatMul.GemmR4TiledQ5_0((byte*)rw.Ptr, b, preQuantizedInput, c,
+                        rw.FullGroupCount, rw.TailRows, k / 32, m, k, n, _threadPool);
+                    return;
+                case QuantizationType.Q4_K:
+                    MatMul.GemmR4TiledQ4_K((byte*)rw.Ptr, b, preQuantizedInput, c,
+                        rw.FullGroupCount, rw.TailRows, k / 256, m, k, n, _threadPool);
+                    return;
+                case QuantizationType.Q5_K:
+                    MatMul.GemmR4TiledQ5_K((byte*)rw.Ptr, b, preQuantizedInput, c,
+                        rw.FullGroupCount, rw.TailRows, k / 256, m, k, n, _threadPool);
+                    return;
+                case QuantizationType.Q6_K:
+                    MatMul.GemmR4TiledQ6_K((byte*)rw.Ptr, b, preQuantizedInput, c,
+                        rw.FullGroupCount, rw.TailRows, k / 256, m, k, n, _threadPool);
+                    return;
+            }
+
             Gemm(origWeights, qt, b, c, m, k, n, preQuantizedInput);
             return;
         }

@@ -5,7 +5,7 @@ namespace DotLLM.Tests.Integration.Fixtures;
 /// <summary>
 /// Downloads Qwen2.5-0.5B-Instruct Q8_0 (~530 MB) for Qwen2 architecture tests.
 /// Tests tied embeddings, Q/K biases, and architecture auto-detection.
-/// Cached in <c>~/.dotllm/test-cache/</c> across test runs.
+/// Cached in <c>~/.dotllm/models/</c> across test runs.
 /// </summary>
 public sealed class QwenModelFixture : IAsyncLifetime
 {

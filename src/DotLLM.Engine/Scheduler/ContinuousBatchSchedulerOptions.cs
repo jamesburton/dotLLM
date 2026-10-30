@@ -13,6 +13,14 @@ public sealed record ContinuousBatchSchedulerOptions
     public int MaxActiveSequences { get; init; } = 64;
 
     /// <summary>
+    /// Capacity (entries) of the recurrent prefix snapshot cache. 0 disables it. Only used for models that report
+    /// <see cref="DotLLM.Core.Models.IModel.SupportsSequencePrefixSnapshot"/> and run without the KV prefix trie: an
+    /// admitted prompt that starts with a snapshotted prefix restores its KV rows + recurrent state and prefills only the
+    /// suffix. Each entry holds a KV prefix copy and a full recurrent-state copy, so keep this small (2-4).
+    /// </summary>
+    public int RecurrentPrefixCacheEntries { get; init; } = 0;
+
+    /// <summary>
     /// Maximum number of prompt tokens admitted (across all newly-admitted sequences) in
     /// a single scheduler iteration. Bounds the worst-case prefill latency before a decode
     /// iteration is allowed to run. Set to 0 to disable the bound.
@@ -101,7 +109,7 @@ public sealed record ContinuousBatchSchedulerOptions
     /// share of an equal-priority weight-1 key). Default <see langword="null"/>.
     /// </summary>
     /// <remarks>
-    /// The provider is called once per <see cref="ContinuousBatchScheduler.Submit"/> under the scheduler's
+    /// The provider is called once per <see cref="ContinuousBatchScheduler.Submit(InferenceRequest, CancellationToken)"/> under the scheduler's
     /// queue lock, so it must be cheap and side-effect-free (a dictionary lookup over a static policy table
     /// is ideal). A <see langword="null"/> provider, or a returned weight ≤ 0 / non-finite, resolves to
     /// weight <c>1.0</c> — making admission byte-identical to the unweighted SFQ behaviour. The provider is

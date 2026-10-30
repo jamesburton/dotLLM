@@ -17,7 +17,9 @@ app.Configure(config =>
     // exception (type, message, stack) with DOTLLM_DEBUG_ERRORS=1.
     if (string.Equals(Environment.GetEnvironmentVariable("DOTLLM_DEBUG_ERRORS"), "1", StringComparison.Ordinal))
         config.PropagateExceptions();
-    config.SetApplicationVersion("0.1.0");
+    // The assembly informational version (0.3.0-dev.N+sha), not a literal: a harness must be able to
+    // tell which build it is talking to (#774).
+    config.SetApplicationVersion(DotLLM.Core.BuildInfo.Version);
     // Spectre.Console.Cli's example validation uses reflection that doesn't work under Native AOT
     if (RuntimeFeature.IsDynamicCodeSupported)
         config.ValidateExamples();
@@ -43,8 +45,29 @@ app.Configure(config =>
             .WithExample("model", "info", "TheBloke/Llama-2-7B-GGUF");
 
         model.AddCommand<ModelDeleteCommand>("delete")
-            .WithDescription("Delete a locally downloaded model.")
+            .WithAlias("rm")
+            .WithDescription("Delete a locally downloaded model, or a model profile.")
             .WithExample("model", "delete", "Qwen/Qwen2.5-0.5B-Instruct-GGUF");
+
+        model.AddCommand<ModelAddCommand>("add")
+            .WithDescription("Add a local .gguf file (linked, not copied) or download one from a URL.")
+            .WithExample("model", "add", "C:\\models\\my-finetune.gguf", "--name", "my-finetune");
+
+        model.AddCommand<ModelCreateCommand>("create")
+            .WithDescription("Create a named model profile: a base model plus system prompt, sampling defaults, device and keep-alive.")
+            .WithExample("model", "create", "terse", "--from", "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M", "--system", "Answer in one sentence.", "--temperature", "0.2");
+
+        model.AddCommand<ModelImportOllamaCommand>("import-ollama")
+            .WithDescription("Import models from an existing ollama installation as profiles (blobs are used in place, nothing is copied).")
+            .WithExample("model", "import-ollama");
+
+        model.AddCommand<ModelShowCommand>("show")
+            .WithDescription("Show a profile's settings and where its model resolves.")
+            .WithExample("model", "show", "terse");
+
+        model.AddCommand<ModelCopyCommand>("cp")
+            .WithDescription("Copy a profile, or alias a model under a new profile name.")
+            .WithExample("model", "cp", "terse", "terse-hot");
     });
 
     config.AddCommand<RunCommand>("run")
@@ -59,9 +82,21 @@ app.Configure(config =>
         .WithDescription("Interactive multi-turn chat with a GGUF model.")
         .WithExample("chat", "QuantFactory/SmolLM-135M-GGUF", "--system", "You are a helpful assistant.");
 
+    config.AddCommand<EmbedCommand>("embed")
+        .WithDescription("Print embeddings (JSON Lines) for text using a GGUF embedding model (CPU).")
+        .WithExample("embed", "nomic-ai/nomic-embed-text-v1.5-GGUF", "hello world", "--dimensions", "256");
+
     config.AddCommand<PerplexityCommand>("perplexity")
         .WithDescription("Compute perplexity over a text corpus.")
         .WithExample("perplexity", "QuantFactory/SmolLM-135M-GGUF", "--corpus", "wiki.test.raw", "--context", "512", "--stride", "256");
+
+    config.AddCommand<PsCommand>("ps")
+        .WithDescription("List the models a running server has loaded.")
+        .WithExample("ps");
+
+    config.AddCommand<StopCommand>("stop")
+        .WithDescription("Unload a model (or all) from a running server (needs --allow-model-admin).")
+        .WithExample("stop", "--all");
 
     config.AddCommand<ServeCommand>("serve")
         .WithDescription("Launch API server with built-in web chat UI.")
@@ -105,6 +140,7 @@ app.Configure(config =>
 
 try
 {
+    DotLLM.Cli.Helpers.DirectStoragePrompt.OfferIfMissing(args);
     return app.Run(args);
 }
 catch (Exception ex) when (string.Equals(

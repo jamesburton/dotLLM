@@ -35,7 +35,7 @@ namespace DotLLM.Tests.Integration.Models.Loaders;
 /// that is tracked as a follow-up.
 /// </para>
 /// <para>
-/// Cache location: <c>~/.dotllm/test-cache/&lt;repo&gt;/</c>. 50 MB cap.
+/// Cache location: <c>~/.dotllm/models/&lt;repo&gt;/</c>. 50 MB cap.
 /// Gracefully skips if all candidates are offline/rate-limited.
 /// </para>
 /// </remarks>
@@ -56,9 +56,7 @@ public sealed class TinyDeepseekMlaSafetensorsLoadTests
         ("katuni4ka/tiny-random-deepseek-v3",  Architecture.DeepSeekV3, ["model.safetensors", "config.json"]),
     ];
 
-    private static readonly string CacheDir = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-        ".dotllm", "test-cache");
+    private static readonly string CacheDir = DotLLM.Tests.Integration.Fixtures.TestModelDownloader.CacheDirectory;
 
     private readonly ITestOutputHelper _output;
 
@@ -214,8 +212,7 @@ public sealed class TinyDeepseekMlaSafetensorsLoadTests
     {
         foreach (var (repoId, expectedArch, files) in Candidates)
         {
-            string cachedDir = Path.Combine(
-                CacheDir, repoId.Replace('/', Path.DirectorySeparatorChar));
+            string cachedDir = DotLLM.Tests.Integration.Fixtures.TestRepoDirectory.Resolve(repoId, "model.safetensors", "config.json");
             string cachedModel = Path.Combine(cachedDir, "model.safetensors");
             string cachedConfig = Path.Combine(cachedDir, "config.json");
 

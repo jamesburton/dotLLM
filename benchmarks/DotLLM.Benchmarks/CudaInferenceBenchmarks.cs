@@ -5,7 +5,7 @@ using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Engine;
-using DotLLM.HuggingFace;
+using DotLLM.Tests.Integration.Fixtures;
 using DotLLM.Models.Gguf;
 using DotLLM.Tokenizers.Bpe;
 
@@ -73,8 +73,7 @@ public class CudaInferenceBenchmarks
         else
         {
             var (repoId, filename, approxMB) = s_models[Model];
-            // Prefer local model cache (CLI convention: ~/.dotllm/models/<repo>/<file>),
-            // fall back to benchmark test-cache and finally HF download.
+            // Resolved from the single model store (~/.dotllm/models), downloading if absent.
             _modelPath = ResolveModelPath(repoId, filename, approxMB);
             _metricsKey = "Cuda_" + Model.ToString();
         }
@@ -220,27 +219,11 @@ public class CudaInferenceBenchmarks
     }
 
     /// <summary>
-    /// Looks in the CLI model cache (<c>~/.dotllm/models/&lt;repo&gt;/&lt;file&gt;</c>)
-    /// before falling back to the benchmark test-cache + HF download.
+    /// Resolves the model from the single model store (<c>~/.dotllm/models</c>), downloading it if absent.
     /// </summary>
     private static string ResolveModelPath(string repoId, string filename, int approxMB)
     {
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-
-        string cliCached = Path.Combine(
-            home, ".dotllm", "models",
-            repoId.Replace('/', Path.DirectorySeparatorChar), filename);
-        if (File.Exists(cliCached))
-            return cliCached;
-
-        string benchCacheDir = Path.Combine(home, ".dotllm", "test-cache");
-        string benchCached = Path.Combine(benchCacheDir,
-            repoId.Replace('/', Path.DirectorySeparatorChar), filename);
-        if (File.Exists(benchCached))
-            return benchCached;
-
-        Console.WriteLine($"Downloading {repoId}/{filename} (~{approxMB} MB)...");
-        using var downloader = new HuggingFaceDownloader();
-        return downloader.DownloadFileAsync(repoId, filename, benchCacheDir).GetAwaiter().GetResult();
+        Console.WriteLine($"Resolving {repoId}/{filename} (~{approxMB} MB)...");
+        return TestModelDownloader.EnsureModelAsync(repoId, filename).GetAwaiter().GetResult();
     }
 }

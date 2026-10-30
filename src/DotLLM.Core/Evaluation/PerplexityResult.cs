@@ -77,8 +77,11 @@ public readonly record struct PerplexityOptions(
     /// non-overlapping chunks of <paramref name="contextLength"/>, scoring the second half of each.
     /// </summary>
     /// <remarks>
-    /// <para>This is the configuration whose output is directly comparable to published llama.cpp
-    /// figures. Verified against llama.cpp build 8683 (<c>d0a6dfeb2</c>).</para>
+    /// <para>This is the configuration whose output is comparable to published llama.cpp figures.
+    /// Verified against llama.cpp build 8683 (<c>d0a6dfeb2</c>). <b>Matching window geometry is
+    /// necessary but not sufficient</b>: the two engines must also tokenize the same bytes, which
+    /// a CRLF corpus silently breaks on Windows (issue #506 — 501 of 512 tokens in chunk 0
+    /// differed on wikitext-2). See <c>docs/PERPLEXITY.md</c> for the like-for-like protocol.</para>
     /// <para>The unscored prefix is <c>contextLength / 2 + 1</c>, not <c>contextLength / 2</c>.
     /// llama.cpp sets <c>first = n_ctx/2</c> and then accumulates <c>count += n_ctx - first - 1</c>,
     /// scoring targets <c>[first + 1, n_ctx)</c> — the token at index <c>first</c> is context, never

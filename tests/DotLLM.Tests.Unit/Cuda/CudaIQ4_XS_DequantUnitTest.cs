@@ -5,6 +5,7 @@ using DotLLM.Cuda.Interop;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -17,6 +18,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// </summary>
 [Trait("Category", "GPU")]
 [Trait("Category", "Diagnostics")]
+[Collection(CudaCollection.Name)]
 public sealed unsafe class CudaIQ4_XS_DequantUnitTest
 {
     private readonly ITestOutputHelper _output;
@@ -146,10 +148,7 @@ public sealed unsafe class CudaIQ4_XS_DequantUnitTest
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
 
-        string modelPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF",
-            "Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf");
+        string modelPath = TestFixtureResolver.ResolveFile([], "bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF", ["Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf"], null).Path ?? "";
         Skip.IfNot(File.Exists(modelPath), "Meta-Llama-3.1-8B IQ4_XS GGUF not found");
 
         using var gguf = GgufFile.Open(modelPath);
@@ -225,10 +224,7 @@ public sealed unsafe class CudaIQ4_XS_DequantUnitTest
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
 
-        string modelPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF",
-            "Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf");
+        string modelPath = TestFixtureResolver.ResolveFile([], "bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF", ["Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf"], null).Path ?? "";
         Skip.IfNot(File.Exists(modelPath), "Meta-Llama-3.1-8B IQ4_XS GGUF not found");
 
         int[] promptTokens = [128000, 791, 6864, 315, 9822, 374];
@@ -335,10 +331,7 @@ public sealed unsafe class CudaIQ4_XS_DequantUnitTest
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
 
-        string modelPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF",
-            "Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf");
+        string modelPath = TestFixtureResolver.ResolveFile([], "bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF", ["Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf"], null).Path ?? "";
         Skip.IfNot(File.Exists(modelPath), "Meta-Llama-3.1-8B IQ4_XS GGUF not found");
 
         int[] promptTokens = [128000, 791, 6864, 315, 9822, 374];
@@ -607,10 +600,7 @@ public sealed unsafe class CudaIQ4_XS_DequantUnitTest
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
 
-        string modelPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF",
-            "Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf");
+        string modelPath = TestFixtureResolver.ResolveFile([], "bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF", ["Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf"], null).Path ?? "";
         Skip.IfNot(File.Exists(modelPath), "Meta-Llama-3.1-8B IQ4_XS GGUF not found");
 
         int[] promptTokens = [128000, 791, 6864, 315, 9822, 374];

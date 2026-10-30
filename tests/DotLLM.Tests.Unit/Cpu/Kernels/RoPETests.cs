@@ -635,4 +635,31 @@ public sealed class RoPETests
             }
         }
     }
+    /// <summary>
+    /// #1309: the RoPE tables must not depend on the C runtime's float libm (UCRT vs glibc differ by an ulp for some inputs, which
+    /// quantized activations digitize into a different int8 / MoE expert: the Flint quantized golden was 8e-6 from llama.cpp on
+    /// Windows and 0.0199 on Linux). Pin the tables bit-for-bit to the double-evaluated, once-rounded reference.
+    /// </summary>
+    [Theory]
+    [InlineData(64, 10000f)]
+    [InlineData(128, 1000000f)]
+    public void PrecomputeFrequencyTable_IsBitIdenticalToDoubleReference(int headDim, float theta)
+    {
+        const int maxSeqLen = 512;
+        int halfDim = headDim / 2;
+        float[] cos = new float[maxSeqLen * halfDim];
+        float[] sin = new float[maxSeqLen * halfDim];
+        RoPE.PrecomputeFrequencyTable(maxSeqLen, headDim, theta, cos, sin);
+
+        for (int i = 0; i < halfDim; i++)
+        {
+            float freq = 1.0f / (float)Math.Pow(theta, 2.0f * i / headDim);
+            for (int pos = 0; pos < maxSeqLen; pos++)
+            {
+                float angle = pos * freq;
+                Assert.Equal(BitConverter.SingleToInt32Bits((float)Math.Cos(angle)), BitConverter.SingleToInt32Bits(cos[pos * halfDim + i]));
+                Assert.Equal(BitConverter.SingleToInt32Bits((float)Math.Sin(angle)), BitConverter.SingleToInt32Bits(sin[pos * halfDim + i]));
+            }
+        }
+    }
 }

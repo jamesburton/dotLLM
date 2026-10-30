@@ -2,6 +2,7 @@ using DotLLM.Core.Tensors;
 using DotLLM.Engine.KvCache;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -29,9 +30,7 @@ public class CpuPrefillLastTokenLogitTest
     [SkippableFact]
     public unsafe void CpuPrefill_LastTokenArgmax_IsParis()
     {
-        string modelPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q4_K_M.gguf");
+        string modelPath = TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q4_K_M.gguf"], null).Path ?? "";
         Skip.If(!File.Exists(modelPath),
             "SmolLM-135M.Q4_K_M.gguf not found (run: dotllm run QuantFactory/SmolLM-135M-GGUF)");
 

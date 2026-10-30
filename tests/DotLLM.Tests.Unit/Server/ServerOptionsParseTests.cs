@@ -32,7 +32,7 @@ public class ServerOptionsParseTests
         // Zero behavior change when unset: no draft model, K default, chunking off.
         var opts = ServerOptions.Parse(new[] { "--model", "m.gguf" });
         Assert.Null(opts.SpeculativeModel);
-        Assert.Equal(5, opts.SpeculativeCandidates);
+        Assert.Equal(3, opts.SpeculativeCandidates);
         Assert.Equal(0, opts.PrefillChunkSize);
     }
 

@@ -14,19 +14,43 @@ namespace DotLLM.Cuda.Architectures;
 /// </summary>
 public sealed class CudaHybridKvCacheHandle : IKvCache
 {
+    private readonly Func<int, bool>? _canGrowTo;
     private int _currentLength;
 
     /// <inheritdoc/>
     public int CurrentLength => _currentLength;
 
     /// <inheritdoc/>
-    public int MaxLength { get; }
+    public int MaxLength { get; private set; }
+
+    /// <summary>
+    /// <see langword="false"/>: the rows live in the owning model's single-slot storage, which a forward on any other handle
+    /// overwrites from position 0 (issue #1025).
+    /// </summary>
+    public bool HasExclusiveStorage => false;
 
     /// <summary>Creates a handle whose <see cref="MaxLength"/> is <paramref name="maxLength"/>.</summary>
-    public CudaHybridKvCacheHandle(int maxLength)
+    /// <param name="maxLength">Positions the handle covers.</param>
+    /// <param name="canGrowTo">
+    /// Supplied by an owning model that keeps its stored rows while its storage grows: it admits or refuses a growth to the
+    /// given length (for example when the copy would not fit in free VRAM). Null, the default, means the handle never grows:
+    /// a model whose growth discards rows must leave it null.
+    /// </param>
+    public CudaHybridKvCacheHandle(int maxLength, Func<int, bool>? canGrowTo = null)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxLength);
         MaxLength = maxLength;
+        _canGrowTo = canGrowTo;
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>Only bookkeeping here. The model grows its storage, keeping the rows, on the next forward that sees the larger <see cref="MaxLength"/>.</remarks>
+    public bool TryGrowTo(int maxLength)
+    {
+        if (maxLength <= MaxLength) return true;
+        if (_canGrowTo is null || !_canGrowTo(maxLength)) return false;
+        MaxLength = maxLength;
+        return true;
     }
 
     /// <summary>Advances the visible length. Called by the owning model as it writes new rows.</summary>

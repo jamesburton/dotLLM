@@ -16,8 +16,8 @@ namespace DotLLM.Engine;
 /// prefix text into the committed buffer.
 /// </para>
 /// <para>
-/// Correctness with partial UTF-8 / SentencePiece byte-tokens: we only evict a token when
-/// <c>Decode(window[1..])</c> is a suffix of <c>Decode(window)</c>. When the tail differs —
+/// Correctness with partial UTF-8 / SentencePiece byte-tokens: we only evict a token prefix when
+/// decoding the remaining tokens yields a suffix of <c>Decode(window)</c>. When the tail differs —
 /// usually because the oldest token contributed bytes to a multi-byte UTF-8 codepoint or an
 /// accumulating byte-token run — we leave the window alone and try again after the next token.
 /// A hard cap prevents unbounded growth in pathological cases by force-committing the current
@@ -34,6 +34,7 @@ internal sealed class IncrementalDetokenizer
     private readonly List<int> _window;
     private string _windowText;
     private int _deltaBaseline;
+    private string _withheld = string.Empty;
 
     public IncrementalDetokenizer(ITokenizer tokenizer, int initialCapacity = 1024)
     {
@@ -54,7 +55,7 @@ internal sealed class IncrementalDetokenizer
 
         while (_window.Count > SoftWindowLimit)
         {
-            if (TryEvictOldest())
+            if (TryEvictStablePrefix())
                 continue;
 
             if (_window.Count > HardWindowLimit)
@@ -69,24 +70,25 @@ internal sealed class IncrementalDetokenizer
         }
     }
 
-    private bool TryEvictOldest()
+    private bool TryEvictStablePrefix()
     {
-        var tail = _tokenizer.Decode(
-            CollectionsMarshal.AsSpan(_window).Slice(1), stripBosSpace: false);
-
-        if (tail.Length > _windowText.Length)
-            return false;
-
         var windowSpan = _windowText.AsSpan();
-        if (!windowSpan[(windowSpan.Length - tail.Length)..].SequenceEqual(tail))
-            return false;
+        var tokens = CollectionsMarshal.AsSpan(_window);
+        // A UTF-8 scalar may occupy several tokens; removing only its first byte corrupts the tail.
+        for (int count = 1; count < tokens.Length; count++)
+        {
+            var tail = _tokenizer.Decode(tokens[count..], stripBosSpace: false);
+            if (tail.Length > windowSpan.Length || !windowSpan[(windowSpan.Length - tail.Length)..].SequenceEqual(tail))
+                continue;
 
-        int commitLen = _windowText.Length - tail.Length;
-        if (commitLen > 0)
-            _committed.Append(_windowText, 0, commitLen);
-        _window.RemoveAt(0);
-        _windowText = tail;
-        return true;
+            int commitLen = windowSpan.Length - tail.Length;
+            if (commitLen > 0)
+                _committed.Append(_windowText, 0, commitLen);
+            _window.RemoveRange(0, count);
+            _windowText = tail;
+            return true;
+        }
+        return false;
     }
 
     /// <summary>
@@ -120,17 +122,58 @@ internal sealed class IncrementalDetokenizer
 
     /// <summary>
     /// Returns the text appended since the previous call to <see cref="TakeDelta"/>
-    /// (or since construction). Advances the baseline to the current length.
+    /// (or since construction) and advances the baseline past it.
     /// </summary>
-    public string TakeDelta()
+    /// <remarks>
+    /// A UTF-8 character split across tokens decodes as U+FFFD until its last byte arrives, after
+    /// which the same position decodes to the real character without the text growing. A delta
+    /// that already carried the U+FFFD can never be corrected, so mid-stream callers pass
+    /// <paramref name="flushIncomplete"/> = <see langword="false"/> to withhold a trailing run of
+    /// U+FFFD / high surrogates until it resolves (#1263). Terminal emissions pass
+    /// <see langword="true"/> so text that never resolves is still sent, exactly once.
+    /// </remarks>
+    /// <param name="flushIncomplete"><see langword="true"/> to include a trailing possibly-incomplete
+    /// character; <see langword="false"/> to hold it back for a later call.</param>
+    /// <returns>The newly stable text; empty when there is none.</returns>
+    public string TakeDelta(bool flushIncomplete)
     {
         int total = Length;
-        if (total == _deltaBaseline)
+        int stable = flushIncomplete ? total : total - IncompleteTailLength();
+        _withheld = stable < total ? SliceRange(Math.Max(stable, _deltaBaseline), total) : string.Empty;
+        if (stable <= _deltaBaseline)
             return string.Empty;
 
-        string delta = SliceRange(_deltaBaseline, total);
-        _deltaBaseline = total;
+        string delta = SliceRange(_deltaBaseline, stable);
+        _deltaBaseline = stable;
         return delta;
+    }
+
+    /// <summary>
+    /// Returns the text the last <see cref="TakeDelta"/> call withheld, as it decoded at that call,
+    /// and marks everything decoded so far as consumed.
+    /// </summary>
+    /// <remarks>
+    /// For a terminal emission whose final token was appended (to run stop checks) but is dropped
+    /// from the output: flushing through <see cref="TakeDelta"/> would emit that token's text, and the
+    /// token may even have completed the withheld character, which the output must not reflect.
+    /// </remarks>
+    /// <returns>The withheld text; empty when nothing was withheld.</returns>
+    public string TakeWithheld()
+    {
+        string withheld = _withheld;
+        _withheld = string.Empty;
+        _deltaBaseline = Length;
+        return withheld;
+    }
+
+    // Trailing chars a later token may still rewrite: U+FFFD for a partial UTF-8 sequence, or a
+    // lone high surrogate. Bytes still in flight always sit in the window, never in _committed.
+    private int IncompleteTailLength()
+    {
+        int i = _windowText.Length;
+        while (i > 0 && (_windowText[i - 1] == '�' || char.IsHighSurrogate(_windowText[i - 1])))
+            i--;
+        return _windowText.Length - i;
     }
 
     /// <summary>Materializes the full decoded text. O(<see cref="Length"/>). Use sparingly.</summary>

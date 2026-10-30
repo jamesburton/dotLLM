@@ -242,6 +242,7 @@ public class VulkanHostImportParityTests
         using var device = VulkanDevice.Create();
         Skip.IfNot(device.HasExternalMemoryHost,
             "Driver does not expose VK_EXT_external_memory_host; env var path is moot.");
+        VulkanHostImportGate.SkipUnlessImportPermitted(device);
 
         const string envVar = "DOTLLM_VULKAN_DISABLE_HOST_IMPORT";
         string? original = Environment.GetEnvironmentVariable(envVar);

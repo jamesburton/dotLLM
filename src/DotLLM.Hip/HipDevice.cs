@@ -30,7 +30,7 @@ public sealed class HipDevice
     {
         Ordinal = ordinal;
         Name = name;
-        TotalMemoryBytes = totalMem;
+        TotalMemoryBytes = DotLLM.Core.Configuration.DeviceMemoryBudget.ClampSimulatedCapacity(totalMem);   // #1295
         ComputeUnitCount = cuCount;
         WarpSize = warpSize;
     }

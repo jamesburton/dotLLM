@@ -44,6 +44,8 @@ public sealed class MoeIndexedMatmulQ4KMmqKernel : IDisposable
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
     private readonly ComputePipeline _pipeline;
+    /// <summary>Test-visible pipeline handle for VK_AMD_shader_info diagnostics (#545).</summary>
+    internal nint PipelineHandle => _pipeline.Pipeline;
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
     private bool _disposed;
@@ -65,11 +67,20 @@ public sealed class MoeIndexedMatmulQ4KMmqKernel : IDisposable
     /// <see cref="MoeIndexedMatmulQ4_KF32Kernel"/>.
     /// </summary>
     public static MoeIndexedMatmulQ4KMmqKernel? TryCreate(VulkanDevice device, string spvDir)
+        => TryCreate(device, spvDir, "moe_indexed_matmul_q4_k_q8_1");
+
+    /// <summary>
+    /// Issue #545 measurement hook: loads <c>{shaderBaseName}.spv</c> instead of the
+    /// production module, so a probe or bench can hold the shipping kernel and a
+    /// baseline open in ONE process and A/B them same-session. Production callers
+    /// never pass this.
+    /// </summary>
+    internal static MoeIndexedMatmulQ4KMmqKernel? TryCreate(VulkanDevice device, string spvDir, string shaderBaseName)
     {
         if (!device.HasIntegerDotProduct)
             return null;
 
-        string path = Path.Combine(spvDir, "moe_indexed_matmul_q4_k_q8_1.spv");
+        string path = Path.Combine(spvDir, shaderBaseName + ".spv");
         if (!File.Exists(path))
             return null;
 

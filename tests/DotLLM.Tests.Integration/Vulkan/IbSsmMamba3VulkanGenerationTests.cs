@@ -69,6 +69,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class IbSsmMamba3VulkanGenerationTests
 {
     private const string CheckpointPathEnvVar = "DOTLLM_IBSSM_CHECKPOINT_PATH";

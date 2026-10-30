@@ -107,9 +107,12 @@ void main() {
     uint rowByteStride = pc.blocksPerRow * SB_BYTES;
 
     float acc[TM][TN];
+    float accPart[TM][TN];   // EXPERIMENT #545: partial over one super-block
     for (uint i = 0u; i < TM; i++)
-        for (uint j = 0u; j < TN; j++)
+        for (uint j = 0u; j < TN; j++) {
             acc[i][j] = 0.0;
+            accPart[i][j] = 0.0;
+        }
 
     for (uint kSB = 0u; kSB < pc.blocksPerRow; kSB++) {
         for (uint h = 0u; h < 2u; h++) {
@@ -214,13 +217,21 @@ void main() {
                     for (uint j = 0u; j < TN; j++) {
                         float dx = sharedXd[(ty + 16u * j) * SUBS_PER_CHUNK + jl];
                         float sx = sharedXs[(ty + 16u * j) * SUBS_PER_CHUNK + jl];
-                        acc[i][j] += dsc * (dx * float(dotI[i][j])) - dmn * sx;
+                        accPart[i][j] += dsc * (dx * float(dotI[i][j])) - dmn * sx;
                     }
                 }
             }
 
             barrier();
         }
+
+        // EXPERIMENT #545: one super-block == 2 chunks x SUBS_PER_CHUNK = 8
+        // accumulations, exactly Q8_0's FLUSH_BLOCKS, so no counter is needed.
+        for (uint i = 0u; i < TM; i++)
+            for (uint j = 0u; j < TN; j++) {
+                acc[i][j] += accPart[i][j];
+                accPart[i][j] = 0.0;
+            }
     }
 
     for (uint j = 0u; j < TN; j++) {

@@ -80,7 +80,7 @@ public sealed class CopyKvHandoffTransfer : IKvHandoffTransfer
         IKvCache destination = destinationFactory(config, source.MaxLength);
         try
         {
-            KvCacheCopy.CopyContents(source, destination, config.NumLayers);
+            KvCacheCopy.CopyContents(source, destination, DotLLM.Core.Attention.KvGeometry.SlotCount(config));
         }
         catch
         {
@@ -130,7 +130,7 @@ public sealed class StagedKvHandoffTransfer : IKvHandoffTransfer
 
             int length = source.CurrentLength;
             if (length > 0)
-                StageLayers(stagedSource, stagedDestination, config.NumLayers, length);
+                StageLayers(stagedSource, stagedDestination, DotLLM.Core.Attention.KvGeometry.SlotCount(config), length);
         }
         catch
         {
@@ -176,7 +176,9 @@ internal static class KvCacheCopy
     /// <summary>
     /// Copies all <paramref name="numLayers"/> layers' K/V entries from <paramref name="source"/> into
     /// <paramref name="destination"/>, preserving positions <c>0..CurrentLength-1</c>. The destination
-    /// must be empty and large enough (<c>MaxLength &gt;= source.CurrentLength</c>).
+    /// must be empty and large enough (<c>MaxLength &gt;= source.CurrentLength</c>). A compact sliding-window layer
+    /// (<see cref="IWindowedKvCache"/>) holds only <c>[RowBaseOf, CurrentLength)</c>, so only those positions are copied;
+    /// the window mask never reads the older ones.
     /// </summary>
     public static void CopyContents(IKvCache source, IKvCache destination, int numLayers)
     {
@@ -191,10 +193,12 @@ internal static class KvCacheCopy
         try
         {
             for (int p = 0; p < length; p++) positions[p] = p;
-            var posSpan = positions.AsSpan(0, length);
+            var windowed = source as IWindowedKvCache;
 
             for (int layer = 0; layer < numLayers; layer++)
             {
+                int rowBase = windowed?.RowBaseOf(layer) ?? 0;
+                var posSpan = positions.AsSpan(rowBase, length - rowBase);
                 // Each GetKeysRef/GetValuesRef gathers into the source's per-layer staging buffer; we
                 // consume it (copy into the destination) before advancing to the next layer, so the
                 // single-staging-buffer reuse across layers is safe.

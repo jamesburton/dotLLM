@@ -9,10 +9,13 @@ namespace DotLLM.Engine.KvCache;
 /// <summary>
 /// Paged KV-cache using block-based allocation from a shared <see cref="KvBlockPool"/>.
 /// Memory is allocated in fixed-size blocks on demand, reducing waste for variable-length sequences.
-/// Attention kernel compatibility is maintained via staging buffers that gather blocks into
-/// contiguous views for <see cref="GetKeysRef"/>/<see cref="GetValuesRef"/>.
+/// <para>
+/// Attention reads the blocks in place through <see cref="IPagedKvCache"/> (#1268). The contiguous
+/// <see cref="GetKeysRef"/>/<see cref="GetValuesRef"/> views remain for callers without a paged kernel: they decode
+/// the history into F32 staging buffers that are allocated lazily, on first use only.
+/// </para>
 /// </summary>
-public sealed unsafe class PagedKvCache : IKvCache, IHostStagedKvCache
+public sealed unsafe class PagedKvCache : IPagedKvCache, IHostStagedKvCache
 {
     private readonly KvBlockPool _pool;
     private readonly KvBlockTable _blockTable;
@@ -20,9 +23,9 @@ public sealed unsafe class PagedKvCache : IKvCache, IHostStagedKvCache
     private readonly int _kvStride;
     private readonly int _maxSeqLen;
 
-    // Pre-allocated staging buffers for contiguous view (reused across GetKeysRef/GetValuesRef calls)
-    private readonly nint _keyStagingPtr;
-    private readonly nint _valueStagingPtr;
+    // Legacy contiguous views (GetKeysRef/GetValuesRef), allocated on first use; the paged attention kernel never needs them.
+    private nint _keyStagingPtr;
+    private nint _valueStagingPtr;
     private readonly long _stagingBytes;
 
     private bool _disposed;
@@ -33,11 +36,28 @@ public sealed unsafe class PagedKvCache : IKvCache, IHostStagedKvCache
     /// <inheritdoc/>
     public int MaxLength => _maxSeqLen;
 
+    /// <inheritdoc/>
+    public int BlockSize => _pool.BlockSize;
+
+    /// <inheritdoc/>
+    public int KvStride => _kvStride;
+
+    /// <inheritdoc/>
+    public ReadOnlySpan<int> BlockIds => _blockTable.BlockIds;
+
+    /// <summary>Row storage type of the backing pool.</summary>
+    public DType ElementType => _pool.ElementType;
+
+    /// <summary>Bytes held by the lazily allocated legacy F32 staging buffers (0 unless a contiguous view was requested).</summary>
+    public long StagingBytes => (_keyStagingPtr == 0 ? 0 : _stagingBytes) +
+                                (_valueStagingPtr == 0 ? 0 : _stagingBytes);
+
     /// <summary>
-    /// Unmanaged bytes reserved for this cache's contiguous K/V staging buffers.
-    /// Shared block-pool bytes are reported separately by <see cref="KvBlockPool.AllocatedBytes"/>.
+    /// Unmanaged bytes this sequence holds: its pool blocks (K and V, all layers) plus any legacy staging.
+    /// Blocks shared with other sequences through the prefix cache are counted by every holder.
+    /// The whole pool's reservation is <see cref="KvBlockPool.AllocatedBytes"/>.
     /// </summary>
-    public long AllocatedBytes => 2 * _stagingBytes;
+    public long AllocatedBytes => _blockTable.BlockCount * _pool.BlockBytesAllLayers + StagingBytes;
 
     /// <summary>The block table mapping logical positions to physical blocks.</summary>
     internal KvBlockTable BlockTable => _blockTable;
@@ -82,17 +102,36 @@ public sealed unsafe class PagedKvCache : IKvCache, IHostStagedKvCache
         _kvStride = kvStride;
         _maxSeqLen = maxSeqLen;
         _blockTable = new KvBlockTable(pool);
-
-        // Pre-allocate staging buffers (one per K and V, sized for maxSeqLen)
-        _stagingBytes = (long)maxSeqLen * kvStride * sizeof(float);
-        _keyStagingPtr = (nint)NativeMemory.AlignedAlloc((nuint)_stagingBytes, 64);
-        _valueStagingPtr = (nint)NativeMemory.AlignedAlloc((nuint)_stagingBytes, 64);
+        _stagingBytes = checked((long)maxSeqLen * kvStride * sizeof(float));
     }
 
     /// <inheritdoc/>
+    public TensorRef GetKeyBlocksRef(int layerIndex)
+    {
+        ValidateLayer(layerIndex);
+        return new TensorRef(checked(_pool.TotalBlocks * BlockSize), _kvStride,
+            _pool.ElementType, -1, (nint)_pool.GetKeyPtr(0, layerIndex));
+    }
+
+    /// <inheritdoc/>
+    public TensorRef GetValueBlocksRef(int layerIndex)
+    {
+        ValidateLayer(layerIndex);
+        return new TensorRef(checked(_pool.TotalBlocks * BlockSize), _kvStride,
+            _pool.ElementType, -1, (nint)_pool.GetValuePtr(0, layerIndex));
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>Rows are F32 <c>[positions.Length, KvStride]</c> on the host; they are encoded into the pool's element type.</remarks>
     public void Update(TensorRef keys, TensorRef values, ReadOnlySpan<int> positions, int layerIndex)
     {
+        ValidateLayer(layerIndex);
         int seqLen = positions.Length;
+        if (keys.DType != DType.Float32 || values.DType != DType.Float32 ||
+            keys.DeviceId != -1 || values.DeviceId != -1 ||
+            keys.Dim0 != seqLen || values.Dim0 != seqLen ||
+            keys.Dim1 != _kvStride || values.Dim1 != _kvStride)
+            throw new ArgumentException($"Expected CPU float32 [{seqLen}, {_kvStride}] K/V projections.");
         if (seqLen == 0) return;
 
         int maxPos = _blockTable.CurrentLength - 1;
@@ -100,7 +139,7 @@ public sealed unsafe class PagedKvCache : IKvCache, IHostStagedKvCache
         float* kSrc = (float*)keys.DataPointer;
         float* vSrc = (float*)values.DataPointer;
 
-        int rowBytes = _kvStride * sizeof(float);
+        int rowBytes = _pool.RowBytes;
         int blockSize = _pool.BlockSize;
 
         // Validate and find max position, ensure capacity upfront
@@ -114,9 +153,9 @@ public sealed unsafe class PagedKvCache : IKvCache, IHostStagedKvCache
         }
         _blockTable.EnsureCapacity(maxPos + 1);
 
-        // Batch contiguous tokens within the same block into a single memcpy.
+        // Batch contiguous tokens within the same block into a single encode.
         // During prefill, positions are sequential (0,1,2,...N) so most tokens
-        // share a block and can be copied together.
+        // share a block and can be written together.
         int i = 0;
         while (i < seqLen)
         {
@@ -133,12 +172,8 @@ public sealed unsafe class PagedKvCache : IKvCache, IHostStagedKvCache
                 runLen++;
             }
 
-            float* kDst = _pool.GetKeyPtr(blockId, layerIndex) + offset * _kvStride;
-            float* vDst = _pool.GetValuePtr(blockId, layerIndex) + offset * _kvStride;
-            long batchBytes = (long)runLen * rowBytes;
-
-            Buffer.MemoryCopy(kSrc + (long)i * _kvStride, kDst, batchBytes, batchBytes);
-            Buffer.MemoryCopy(vSrc + (long)i * _kvStride, vDst, batchBytes, batchBytes);
+            _pool.EncodeRows(kSrc + (long)i * _kvStride, _pool.GetKeyPtr(blockId, layerIndex) + (long)offset * rowBytes, runLen);
+            _pool.EncodeRows(vSrc + (long)i * _kvStride, _pool.GetValuePtr(blockId, layerIndex) + (long)offset * rowBytes, runLen);
 
             i += runLen;
         }
@@ -157,25 +192,27 @@ public sealed unsafe class PagedKvCache : IKvCache, IHostStagedKvCache
     }
 
     /// <inheritdoc/>
+    /// <remarks>Legacy contiguous view: decodes the history into lazily allocated F32 staging. Paged-aware kernels use <see cref="GetKeyBlocksRef"/>.</remarks>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public TensorRef GetKeysRef(int layerIndex)
     {
-        GatherIntoStaging(_keyStagingPtr, layerIndex, isKey: true);
+        GatherIntoStaging(ref _keyStagingPtr, layerIndex, isKey: true);
         return new TensorRef(_blockTable.CurrentLength, _kvStride, DType.Float32, -1, _keyStagingPtr);
     }
 
     /// <inheritdoc/>
+    /// <remarks>Legacy contiguous view: decodes the history into lazily allocated F32 staging. Paged-aware kernels use <see cref="GetValueBlocksRef"/>.</remarks>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public TensorRef GetValuesRef(int layerIndex)
     {
-        GatherIntoStaging(_valueStagingPtr, layerIndex, isKey: false);
+        GatherIntoStaging(ref _valueStagingPtr, layerIndex, isKey: false);
         return new TensorRef(_blockTable.CurrentLength, _kvStride, DType.Float32, -1, _valueStagingPtr);
     }
 
     /// <inheritdoc/>
     public ITensor GetKeys(int layerIndex)
     {
-        GatherIntoStaging(_keyStagingPtr, layerIndex, isKey: true);
+        GatherIntoStaging(ref _keyStagingPtr, layerIndex, isKey: true);
         var shape = new TensorShape(_blockTable.CurrentLength, _kvStride);
         return new TensorView(shape, DType.Float32, -1, _keyStagingPtr);
     }
@@ -183,7 +220,7 @@ public sealed unsafe class PagedKvCache : IKvCache, IHostStagedKvCache
     /// <inheritdoc/>
     public ITensor GetValues(int layerIndex)
     {
-        GatherIntoStaging(_valueStagingPtr, layerIndex, isKey: false);
+        GatherIntoStaging(ref _valueStagingPtr, layerIndex, isKey: false);
         var shape = new TensorShape(_blockTable.CurrentLength, _kvStride);
         return new TensorView(shape, DType.Float32, -1, _valueStagingPtr);
     }
@@ -193,31 +230,32 @@ public sealed unsafe class PagedKvCache : IKvCache, IHostStagedKvCache
     /// <inheritdoc/>
     public int StagedLayerElementCount(int layerIndex)
     {
-        if ((uint)layerIndex >= (uint)_numLayers)
-            throw new ArgumentOutOfRangeException(nameof(layerIndex));
+        ValidateLayer(layerIndex);
         return _blockTable.CurrentLength * _kvStride;
     }
 
     /// <inheritdoc/>
     public void DownloadLayer(int layerIndex, Span<float> keys, Span<float> values)
     {
-        if ((uint)layerIndex >= (uint)_numLayers)
-            throw new ArgumentOutOfRangeException(nameof(layerIndex));
+        ValidateLayer(layerIndex);
         int count = _blockTable.CurrentLength * _kvStride;
         if (count == 0) return;
-        // Gather the paged blocks into the contiguous (host) staging buffers, then copy out. The
-        // staging buffers are reused across layers, so each layer is consumed before the next gather.
-        GatherIntoStaging(_keyStagingPtr, layerIndex, isKey: true);
-        new ReadOnlySpan<float>((void*)_keyStagingPtr, count).CopyTo(keys);
-        GatherIntoStaging(_valueStagingPtr, layerIndex, isKey: false);
-        new ReadOnlySpan<float>((void*)_valueStagingPtr, count).CopyTo(values);
+        if (keys.Length < count || values.Length < count)
+            throw new ArgumentException($"keys/values must contain at least {count} floats.");
+
+        // Decode straight into the caller's buffers: no staging needed.
+        fixed (float* kp = keys)
+        fixed (float* vp = values)
+        {
+            DecodeLayer(layerIndex, isKey: true, kp);
+            DecodeLayer(layerIndex, isKey: false, vp);
+        }
     }
 
     /// <inheritdoc/>
     public void UploadLayer(int layerIndex, int length, ReadOnlySpan<float> keys, ReadOnlySpan<float> values)
     {
-        if ((uint)layerIndex >= (uint)_numLayers)
-            throw new ArgumentOutOfRangeException(nameof(layerIndex));
+        ValidateLayer(layerIndex);
         if (length <= 0) return;
         long expected = (long)length * _kvStride;
         if (keys.Length < expected || values.Length < expected)
@@ -260,44 +298,38 @@ public sealed unsafe class PagedKvCache : IKvCache, IHostStagedKvCache
         _blockTable.SetCurrentLength(length);
     }
 
-    /// <summary>
-    /// Gathers block data into a contiguous staging buffer for attention kernel consumption.
-    /// Copies block-by-block in logical order.
-    /// </summary>
-    private void GatherIntoStaging(nint stagingPtr, int layerIndex, bool isKey)
+    private void ValidateLayer(int layerIndex)
     {
-        int currentLength = _blockTable.CurrentLength;
-        if (currentLength == 0) return;
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if ((uint)layerIndex >= (uint)_numLayers)
+            throw new ArgumentOutOfRangeException(nameof(layerIndex));
+    }
 
-        int blockSize = _pool.BlockSize;
-        int rowBytes = _kvStride * sizeof(float);
-        float* dst = (float*)stagingPtr;
-
-        int fullBlocks = currentLength / blockSize;
-        int tailTokens = currentLength % blockSize;
-
-        // Copy full blocks (contiguous within each block)
-        long blockBytes = (long)blockSize * rowBytes;
-        for (int b = 0; b < fullBlocks; b++)
+    /// <summary>
+    /// Decodes the layer's history into a contiguous F32 staging buffer (allocated on first use) for legacy consumers.
+    /// </summary>
+    private void GatherIntoStaging(ref nint stagingPtr, int layerIndex, bool isKey)
+    {
+        ValidateLayer(layerIndex);
+        if (stagingPtr == 0)
         {
-            var (blockId, _) = _blockTable.Resolve(b * blockSize);
-            float* src = isKey
-                ? _pool.GetKeyPtr(blockId, layerIndex)
-                : _pool.GetValuePtr(blockId, layerIndex);
-
-            Buffer.MemoryCopy(src, dst + (long)b * blockSize * _kvStride, blockBytes, blockBytes);
+            stagingPtr = (nint)NativeMemory.AlignedAlloc((nuint)_stagingBytes, 64);
+            if (stagingPtr == 0) throw new OutOfMemoryException();
         }
 
-        // Copy partial tail block
-        if (tailTokens > 0)
-        {
-            var (blockId, _) = _blockTable.Resolve(fullBlocks * blockSize);
-            float* src = isKey
-                ? _pool.GetKeyPtr(blockId, layerIndex)
-                : _pool.GetValuePtr(blockId, layerIndex);
+        DecodeLayer(layerIndex, isKey, (float*)stagingPtr);
+    }
 
-            long tailBytes = (long)tailTokens * rowBytes;
-            Buffer.MemoryCopy(src, dst + (long)fullBlocks * blockSize * _kvStride, tailBytes, tailBytes);
+    /// <summary>Decodes <see cref="CurrentLength"/> rows of one layer, block by block in logical order, into <paramref name="dst"/>.</summary>
+    private void DecodeLayer(int layerIndex, bool isKey, float* dst)
+    {
+        int currentLength = _blockTable.CurrentLength;
+        int blockSize = _pool.BlockSize;
+        for (int start = 0; start < currentLength; start += blockSize)
+        {
+            var (blockId, _) = _blockTable.Resolve(start);
+            byte* src = isKey ? _pool.GetKeyPtr(blockId, layerIndex) : _pool.GetValuePtr(blockId, layerIndex);
+            _pool.DecodeRows(src, dst + (long)start * _kvStride, Math.Min(blockSize, currentLength - start));
         }
     }
 
@@ -324,6 +356,8 @@ public sealed unsafe class PagedKvCache : IKvCache, IHostStagedKvCache
             NativeMemory.AlignedFree((void*)_keyStagingPtr);
         if (_valueStagingPtr != 0)
             NativeMemory.AlignedFree((void*)_valueStagingPtr);
+        _keyStagingPtr = 0;
+        _valueStagingPtr = 0;
     }
 
     /// <summary>Releases unmanaged staging buffers if <see cref="Dispose()"/> was not called.</summary>

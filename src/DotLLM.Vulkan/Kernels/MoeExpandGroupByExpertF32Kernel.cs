@@ -76,7 +76,7 @@ public sealed class MoeExpandGroupByExpertF32Kernel : IDisposable
         int rows, int hidden, int numExperts)
     {
         if (rows <= 0) throw new ArgumentOutOfRangeException(nameof(rows));
-        if (hidden <= 0) throw new ArgumentOutOfRangeException(nameof(hidden));
+        if (hidden < 0) throw new ArgumentOutOfRangeException(nameof(hidden));   // 0 = permutation only, no copy (#1161)
         if (numExperts <= 0) throw new ArgumentOutOfRangeException(nameof(numExperts));
 
         long matrixBytes = (long)rows * hidden * sizeof(float);

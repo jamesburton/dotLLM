@@ -117,15 +117,66 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
 
         /// <summary>Compute device.</summary>
         [CommandOption("--device|-d")]
-        [Description("Compute device: 'cpu' (default), 'gpu', 'gpu:0', 'gpu:1'.")]
-        [DefaultValue("cpu")]
-        public string Device { get; set; } = "cpu";
+        [Description(DeviceCli.OptionHelp)]
+        [DefaultValue(DeviceCli.DefaultDevice)]
+        public string Device { get; set; } = DeviceCli.DefaultDevice;
 
         /// <summary>Number of GPU layers for hybrid offloading.</summary>
         [CommandOption("--gpu-layers")]
-        [Description("Number of transformer layers to offload to GPU. 0 = CPU only. " +
-                     "Omit for default (0 with --device cpu, all with --device gpu).")]
+        [Description("Number of transformer layers to offload to GPU (CUDA). 0 = CPU only. " +
+                     "Omit for default (all layers on a GPU device, 0 with --device cpu). Ignored on vulkan (whole model is device-resident).")]
         public int? GpuLayers { get; set; }
+
+        /// <summary>Routed-expert placement on CUDA (issue #1070).</summary>
+        [CommandOption(MoeOffloadCli.ModeOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.ModeHelp)]
+        public string? MoeOffload { get; set; }
+
+        /// <summary>VRAM expert-cache size in MiB (issue #1070).</summary>
+        [CommandOption(MoeOffloadCli.CacheMibOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CacheMibHelp)]
+        public string? MoeCacheMib { get; set; }
+
+        /// <summary>Expert-cache replacement policy (issue #1070).</summary>
+        [CommandOption(MoeOffloadCli.PolicyOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.PolicyHelp)]
+        public string? MoeCachePolicy { get; set; }
+
+        /// <summary>Where uncached offloaded experts run (issue #1071).</summary>
+        [CommandOption(MoeOffloadCli.ColdOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.ColdHelp)]
+        public string? MoeCold { get; set; }
+
+        /// <summary>CPU cold-expert worker threads (issue #1071).</summary>
+        [CommandOption(MoeOffloadCli.CpuThreadsOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CpuThreadsHelp)]
+        public int? MoeCpuThreads { get; set; }
+
+        /// <summary>llama.cpp <c>--cpu-moe</c>: every MoE layer's experts on the CPU (issue #1071).</summary>
+        [CommandOption(MoeOffloadCli.CpuMoeOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CpuMoeHelp)]
+        [DefaultValue(false)]
+        public bool CpuMoe { get; set; }
+
+        /// <summary>llama.cpp <c>--n-cpu-moe N</c>: the first N layers' experts on the CPU (issue #1071).</summary>
+        [CommandOption(MoeOffloadCli.NCpuMoeOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.NCpuMoeHelp)]
+        public int? NCpuMoe { get; set; }
+
+        /// <summary>Re-run the MoE offload cost calibration (issue #1071).</summary>
+        [CommandOption(MoeOffloadCli.CalibrateOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.CalibrateHelp)]
+        [DefaultValue(false)]
+        public bool MoeCalibrate { get; set; }
+
+        /// <summary>Context the MoE offload VRAM budget reserves KV cache for (issue #1071).</summary>
+        [CommandOption(MoeOffloadCli.ContextOption)]
+        [Description(DotLLM.Core.Moe.MoeOffloadOptions.ContextHelp)]
+        public int? CtxSize { get; set; }
+
+        /// <summary>The raw MoE offload option values (issues #1070, #1071).</summary>
+        public DotLLM.Core.Moe.MoeCliValues MoeValues => new(MoeOffload, MoeCacheMib, MoeCachePolicy, MoeCold, MoeCpuThreads,
+            CpuMoe, NCpuMoe, MoeCalibrate, CtxSize);
 
         /// <summary>Quantization filter.</summary>
         [CommandOption("--quant|-q")]
@@ -167,15 +218,13 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
 
         /// <summary>KV-cache key quantization type.</summary>
         [CommandOption("--cache-type-k")]
-        [Description("KV-cache key quantization: f32 (default), q8_0, q4_0.")]
-        [DefaultValue("f32")]
-        public string CacheTypeK { get; set; } = "f32";
+        [Description("KV-cache key type: f32, f16, q8_0, q4_0. With --paged and neither K nor V given, Q8_0 blocks are used; pass f16 for both to keep F16.")]
+        public string? CacheTypeK { get; set; }
 
         /// <summary>KV-cache value quantization type.</summary>
         [CommandOption("--cache-type-v")]
-        [Description("KV-cache value quantization: f32 (default), q8_0, q4_0.")]
-        [DefaultValue("f32")]
-        public string CacheTypeV { get; set; } = "f32";
+        [Description("KV-cache value type: f32, f16, q8_0, q4_0.")]
+        public string? CacheTypeV { get; set; }
 
         /// <summary>Mixed-precision window size for KV-cache quantization.</summary>
         [CommandOption("--cache-window")]
@@ -208,15 +257,94 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
 
         /// <summary>Number of draft candidates per speculative step.</summary>
         [CommandOption("--speculative-k|--draft-tokens")]
-        [Description("Number of draft tokens per speculative step (K). Default 5.")]
-        [DefaultValue(5)]
-        public int SpeculativeK { get; set; } = 5;
+        [Description("Number of draft tokens per speculative step (K). Default 3.")]
+        [DefaultValue(DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates)]
+        public int SpeculativeK { get; set; } = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
+
+        /// <summary>Prompt-lookup (n-gram) speculative decoding (issue #1293).</summary>
+        [CommandOption("--prompt-lookup|--lookup")]
+        [Description("Prompt-lookup speculative decoding: drafts are copied from earlier prompt/output text where the last tokens recur, and verified by the model " +
+                     "(greedy output is identical to plain decode). Needs no draft model; pays off on code edits and other self-repeating output. " +
+                     "Greedy requests only; a draft model or an MTP head takes priority.")]
+        [DefaultValue(false)]
+        public bool PromptLookup { get; set; }
+
+        /// <summary>Maximum prompt-lookup drafts per round.</summary>
+        [CommandOption("--lookup-draft")]
+        [Description("Maximum drafts per prompt-lookup round. Default 8.")]
+        [DefaultValue(DotLLM.Engine.PromptLookupOptions.DefaultDraftTokens)]
+        public int LookupDraft { get; set; } = DotLLM.Engine.PromptLookupOptions.DefaultDraftTokens;
+
+        /// <summary>Longest suffix matched by prompt lookup.</summary>
+        [CommandOption("--lookup-ngram")]
+        [Description("Longest context suffix (tokens) prompt lookup matches; shorter matches down to 2 tokens are used when it does not recur. Default 6.")]
+        [DefaultValue(DotLLM.Engine.PromptLookupOptions.DefaultMaxNgram)]
+        public int LookupNgram { get; set; } = DotLLM.Engine.PromptLookupOptions.DefaultMaxNgram;
+
+        /// <summary>The prompt-lookup settings, or null when <see cref="PromptLookup"/> is off.</summary>
+        public DotLLM.Engine.PromptLookupOptions? PromptLookupOptions
+            => PromptLookup ? DotLLM.Engine.PromptLookupOptions.Create(LookupDraft, LookupNgram) : null;
+
+        /// <summary>Opt-out of MTP self-speculative decoding when the model carries (or is given) an MTP head.</summary>
+        [CommandOption("--no-mtp")]
+        [Description("Disable Multi-Token Prediction (MTP) self-speculative decoding (on by default when the model carries an MTP head; an adaptive gate falls back to plain decode when it loses).")]
+        [DefaultValue(false)]
+        public bool NoMtp { get; set; }
+
+        /// <summary>Explicit MTP head GGUF for architectures that ship it as a separate file (qwen4exp).</summary>
+        [CommandOption("--mtp-head")]
+        [Description("Path of a separate MTP head GGUF (qwen4exp ships it as mtp-*.gguf beside the quantisation folders). Default: auto-detected next to the model; a head that does not fit the device is declined with a warning.")]
+        public string? MtpHead { get; set; }
+
+        /// <summary>DFlash / DFlash2 block-diffusion drafter GGUF (issue #1175).</summary>
+        [CommandOption("--dflash")]
+        [Description("Path of a DFlash / DFlash2 drafter GGUF (arch 'dflash', e.g. z-lab/Qwen3.8-27B-DFlash2-GGUF). It takes the MTP slot: drafts are verified by the " +
+                     "MTP speculative decoder, greedy output is identical to plain decode. qwen35 targets on CPU, CUDA or Vulkan (drafter on the CPU). Overrides an embedded MTP head.")]
+        public string? DFlash { get; set; }
 
         /// <summary>Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog).</summary>
         [CommandOption("--prefill-chunk-size|--ubatch-size")]
         [Description("Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog). 0 = whole prompt in one pass (default).")]
         [DefaultValue(0)]
         public int PrefillChunkSize { get; set; }
+
+        /// <summary>Maximum recurrent prefix snapshots.</summary>
+        [CommandOption("--prefix-snapshots")]
+        [Description("Maximum recurrent prefix snapshots (default 1).")]
+        public int? PrefixSnapshots { get; set; }
+
+        /// <summary>Page-locked host byte budget for recurrent prefix snapshots.</summary>
+        [CommandOption("--prefix-snapshot-host-budget")]
+        [Description("Page-locked host snapshot budget, such as 8GiB. Default 0 disables host retention.")]
+        public string? PrefixSnapshotHostBudget { get; set; }
+
+        /// <summary>Directory for ephemeral recurrent prefix spill files.</summary>
+        [CommandOption("--prefix-snapshot-disk-dir")]
+        [Description("Directory for recurrent prefix spill files; requires a positive disk budget.")]
+        public string? PrefixSnapshotDiskDirectory { get; set; }
+
+        /// <summary>Maximum disk snapshot bytes.</summary>
+        [CommandOption("--prefix-snapshot-disk-budget")]
+        [Description("Snapshot spill budget, such as 32GiB; requires a disk directory. Default 0 disables disk retention.")]
+        public string? PrefixSnapshotDiskBudget { get; set; }
+
+        /// <summary>Mid-history resume step (issue #1286).</summary>
+        [CommandOption("--prompt-cache-step")]
+        [Description("Recurrent-state checkpoint every N prefill tokens, so a prompt that diverges mid-history (a trimmed tool result) resumes from the nearest one. Default 0 (off).")]
+        public int PromptCacheStep { get; set; }
+
+        /// <summary>Most mid-history step checkpoints kept.</summary>
+        [CommandOption("--prompt-cache-step-keep")]
+        [Description("Most --prompt-cache-step checkpoints kept, deepest first (default 8).")]
+        public int? PromptCacheStepKeep { get; set; }
+
+        /// <inheritdoc/>
+        public override ValidationResult Validate()
+        {
+            try { DotLLM.Server.ServerOptions.BuildPrefixSnapshotOptions(PrefixSnapshots, PrefixSnapshotHostBudget, PrefixSnapshotDiskDirectory, PrefixSnapshotDiskBudget, PromptCacheStep, PromptCacheStepKeep); }
+            catch (ArgumentException ex) { return ValidationResult.Error(ex.Message); }
+            return base.Validate();
+        }
 
         /// <summary>Verbose debug output.</summary>
         [CommandOption("--verbose|-v")]
@@ -228,6 +356,18 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
     /// <inheritdoc/>
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
     {
+        // Reject an unrecognised --device up front: it used to fall through to the CPU silently (#468/#790).
+        if (DeviceCli.Validate(settings.Device) is { } deviceError)
+        {
+            DeviceCli.PrintError(deviceError, json: false);
+            return 1;
+        }
+        if (MoeOffloadCli.Validate(settings.MoeValues) is { } moeError)
+        {
+            DeviceCli.PrintError(moeError, json: false);
+            return 1;
+        }
+
         // Resolve before loading the model so a bad path fails fast.
         if (!TextArgument.TryResolve(settings.SystemPrompt, settings.SystemPromptFile,
                 "--system|-s", "--system-file", required: false,
@@ -249,7 +389,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         }
         else
         {
-            var ggufPath = GgufFileResolver.Resolve(settings.Model, settings.Quant);
+            var ggufPath = GgufFileResolver.Resolve(settings.Model, settings.Quant, allowPull: true);
             if (ggufPath is null)
                 return 1;
             resolvedPath = ggufPath;
@@ -260,13 +400,19 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         ModelConfig? config = null;
         ITokenizer? tokenizer = null;
         IModel? model = null;
+        Func<int, DotLLM.Core.Attention.IKvCache>? vulkanKv = null;
+        DeviceCli.Outcome deviceOutcome = null!;
 
+        try
+        {
         AnsiConsole.Status()
             .Spinner(Spinner.Known.Dots)
             .Start("Loading model...", ctx =>
             {
                 if (hfDir is not null)
                 {
+                    // Explicit GPU -> error before loading anything; auto -> CPU with a warning (#790).
+                    deviceOutcome = DeviceCli.ResolveCpuOnly(settings.Device, "HuggingFace safetensors checkpoints", Path.GetFileName(hfDir));
                     ctx.Status("Opening HuggingFace safetensors checkpoint...");
                     var threadingCfg = new ThreadingConfig(
                         settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
@@ -290,35 +436,48 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                 ctx.Status("Loading tokenizer...");
                 tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
 
-                int gpuLayers = ResolveGpuLayers(settings, config);
-                if (gpuLayers <= 0)
+                ctx.Status($"Loading {config.Architecture} model on {settings.Device} ({config.NumLayers} layers)...");
+                // THE shared dispatch (#790) behind serve/run/chat: resolves --device (auto = CUDA, then Vulkan, then CPU with a
+                // warning), loads per architecture (Vulkan #259, CUDA full/partial #729/#291, CPU hybrids), and refuses to turn an
+                // explicit GPU request into a CPU run.
+                DotLLM.Server.DeviceLoadResult loaded;
+                (loaded, deviceOutcome) = DeviceCli.Load(gguf, config, settings.Device, settings.GpuLayers,
+                    new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly),
+                    resolvedPath, MoeOffloadCli.Build(settings.MoeValues));
+                model = loaded.Model;
+                vulkanKv = loaded.IsVulkan ? loaded.KvCacheFactory : null;   // CUDA/hybrid models build their caches from the model type below
+                if (settings.DFlash is not null)
                 {
-                    var threading = new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
-                    ctx.Status($"Loading {config.Architecture} model ({config.NumLayers} layers, {threading.EffectiveThreadCount} threads)...");
-                    // Shared per-architecture CPU dispatch — routes hybrid architectures
-                    // (Nemotron-H, Qwen3MoeHybrid) to their dedicated loaders.
-                    model = ModelLoader.CreateCpuModelFromGguf(gguf, config, threading);
+                    if (model is not DotLLM.Core.Models.IDFlashDraftAttachable dflashTarget)
+                        throw new NotSupportedException($"--dflash: {model.GetType().Name} cannot drive a DFlash drafter (qwen35 targets on CPU, CUDA or Vulkan only for now).");
+                    dflashTarget.AttachDFlashDrafter(settings.DFlash);
                 }
-                else if (gpuLayers >= config.NumLayers)
+                else if (!settings.NoMtp)
                 {
-                    int gpuId = settings.Device.IndexOf(':') is int ci and > 0
-                        ? int.Parse(settings.Device.AsSpan(ci + 1))
-                        : 0;
-                    ctx.Status($"Loading {config.Architecture} model on GPU {gpuId}...");
-                    // Shared per-architecture CUDA dispatch — routes hybrid architectures
-                    // (Qwen3MoeHybrid, Qwen3HybridDense) to their dedicated loaders (#259).
-                    (model, _) = DotLLM.Cuda.CudaModelLoader.CreateFromGguf(gguf, config, gpuId);
-                }
-                else
-                {
-                    int gpuId = settings.Device.IndexOf(':') is int ci2 and > 0
-                        ? int.Parse(settings.Device.AsSpan(ci2 + 1))
-                        : 0;
-                    var threading = new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
-                    ctx.Status($"Loading {config.Architecture} model ({gpuLayers} GPU + {config.NumLayers - gpuLayers} CPU layers)...");
-                    model = DotLLM.Cuda.HybridTransformerModel.LoadFromGguf(gguf, config, gpuLayers, gpuId, threading);
+                    // qwen4exp ships its MTP draft head as a separate GGUF (#820): attach the explicit or auto-detected sibling; plain decode if it cannot be attached.
+                    try
+                    {
+                        DotLLM.Models.Architectures.Qwen4ExpMtpHeadResolver.TryAttach(model, resolvedPath, settings.MtpHead,
+                            trunkBytes: model is DotLLM.Core.Models.IMtpHeadAttachable ? DotLLM.HuggingFace.ModelResolver.FileLength(resolvedPath) : -1);
+                    }
+                    catch (Exception ex) when (ex is not FileNotFoundException && (settings.MtpHead is null || ex is NotSupportedException))
+                    {
+                        Console.Error.WriteLine($"WARNING: MTP head not attached ({ex.GetType().Name}: {ex.Message}); decoding without speculation.");
+                    }
                 }
             });
+        }
+        catch (DotLLM.Server.DeviceUnavailableException ex)
+        {
+            // An explicit device that cannot be honoured: a clean what/why/opt-in message and a failing exit code, never a CPU run.
+            DeviceCli.PrintError(ex.Message, json: false);
+            gguf?.Dispose();
+            safetensorsSource?.Dispose();
+            return 1;
+        }
+
+        // Resolved device line + (for auto on the CPU) the prominent warning, printed after the spinner so it stays visible.
+        DeviceCli.Report(deviceOutcome, json: false);
 
         // Display VRAM warning after spinner completes (so it stays visible)
         string? vramWarning = (model as DotLLM.Cuda.CudaTransformerModel)?.VramWarning
@@ -420,9 +579,10 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         var quantLabel = InferQuantLabel(resolvedPath, settings.Quant);
         var samplingLabel = BuildSamplingLabel(settings);
         var deviceLabel = model is DotLLM.Cuda.CudaTransformerModel
-            ? DotLLM.Cuda.CudaDevice.GetDevice(settings.Device.IndexOf(':') is int ci and > 0
-                ? int.Parse(settings.Device.AsSpan(ci + 1)) : 0).ToString()
-            : $"{threadingInfo.EffectiveThreadCount} threads";
+            ? DotLLM.Cuda.CudaDevice.GetDevice(DeviceCli.CudaOrdinal(deviceOutcome.Resolved)).ToString()
+            : vulkanKv is not null
+                ? $"vulkan {DotLLM.Vulkan.VulkanModelLoader.SharedDevice.DeviceName}"
+                : $"{threadingInfo.EffectiveThreadCount} threads";
         var toolsLabel = tools is { Length: > 0 } ? $" | {tools.Length} tool(s)" : "";
         var segments = $"{config!.Architecture} {config.NumLayers}L/{config.HiddenSize}H | {quantLabel} | {deviceLabel} | {samplingLabel}{toolsLabel}";
         AnsiConsole.Write(new Rule($"[grey]dotllm chat | {Markup.Escape(segments)}[/]").LeftJustified());
@@ -435,14 +595,31 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             history.Add(new ChatMessage { Role = "system", Content = systemPrompt });
 
         var kvConfig = new KvCacheConfig(
-            KvCacheConfig.ParseDType(settings.CacheTypeK),
-            KvCacheConfig.ParseDType(settings.CacheTypeV),
+            KvCacheConfig.ParseDType(settings.CacheTypeK ?? "f32"),
+            KvCacheConfig.ParseDType(settings.CacheTypeV ?? "f32"),
             settings.CacheWindow);
 
         Func<ModelConfig, int, DotLLM.Core.Attention.IKvCache>? kvFactory = null;
         DotLLM.Engine.KvCache.PagedKvCacheFactory? pagedFactory = null;
         DotLLM.Cuda.CudaPagedKvCacheFactory? cudaPagedFactory = null;
-        if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
+        if (vulkanKv is not null)
+        {
+            if (settings.Paged)
+                AnsiConsole.MarkupLine("[yellow]WARNING: Paged KV-cache is not supported on Vulkan; using the model's own device KV-cache.[/]");
+
+            if (kvConfig.IsQuantized && model is DotLLM.Vulkan.VulkanTransformerModel vkModel)
+            {
+                string spvDir = DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir();
+                kvFactory = (cfg, size) => vkModel.CreateQuantizedKvCache(
+                    spvDir, size, kvConfig.KeyDType, kvConfig.ValueDType);
+            }
+            else
+            {
+                var vkFactory = vulkanKv;
+                kvFactory = (cfg, size) => vkFactory(size);
+            }
+        }
+        else if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
         {
             if (settings.Paged && kvConfig.IsQuantized)
             {
@@ -471,27 +648,49 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                 AnsiConsole.MarkupLine("[yellow]WARNING: Paged KV-cache not supported with hybrid GPU, using hybrid cache.[/]");
             kvFactory = (cfg, size) => hybridModel.CreateKvCache(size);
         }
-        else if (settings.Paged && !kvConfig.IsQuantized)
+        else if (model is DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel qwen3Split)
         {
+            kvFactory = (cfg, size) => qwen3Split.CreateKvCache(size);
+        }
+        else if (model is DotLLM.Cuda.Architectures.CudaLfm2MoeTransformerModel lfmGpu)
+        {
+            DotLLM.Cuda.Architectures.CudaLfm2MoeTransformerModel.ValidateKvStorage(kvConfig.KeyDType, kvConfig.ValueDType, settings.CacheWindow);
+            if (settings.Paged)
+                Console.Error.WriteLine("WARNING: Paged KV-cache not supported for CUDA LFM2; using the model's own sparse cache.");
+            kvFactory = (cfg, size) => lfmGpu.CreateKvCache(size);
+        }
+        else if (model is DotLLM.Cuda.Architectures.CudaNemotronHTransformerModel nemotronHGpu)
+        {
+            // #729: all-GPU fallback for a partial request on Nemotron-H (sparse attention-only KV).
+            kvFactory = (cfg, size) => nemotronHGpu.CreateKvCache(size);
+        }
+        else if (settings.Paged && (!kvConfig.IsQuantized || DotLLM.Server.ServerStartup.IsPagedQ8Eligible(kvConfig, config!, model)))
+        {
+            // Blocks are F16 when a type is given, Q8_0 when none is (#1284) or q8_0 K+V is requested.
+            var blockType = DotLLM.Server.ServerStartup.ResolvePagedBlockType(
+                settings.CacheTypeK is not null || settings.CacheTypeV is not null, kvConfig, config!, model, out string? kvInfo);
+            if (kvInfo is not null)
+                AnsiConsole.MarkupLine($"[dim]INFO: {Markup.Escape(kvInfo)}[/]");
             pagedFactory = new DotLLM.Engine.KvCache.PagedKvCacheFactory(
-                config!.NumLayers, config.NumKvHeads, config.HeadDim);
+                config!.NumLayers, config.NumKvHeads, config.HeadDim, elementType: blockType);
             kvFactory = (cfg, size) => pagedFactory.Create(size);
         }
         else if (settings.Paged && kvConfig.IsQuantized)
         {
-            AnsiConsole.MarkupLine("[yellow]WARNING: Paged KV-cache does not support quantization yet, using quantized simple cache.[/]");
+            AnsiConsole.MarkupLine("[yellow]WARNING: Paged KV-cache supports q8_0 K+V only (uniform, non-hybrid models); using quantized simple cache.[/]");
             kvFactory = (cfg, size) => new DotLLM.Engine.KvCache.QuantizedKvCache(
-                cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, size,
+                DotLLM.Core.Attention.KvGeometry.FromConfig(cfg, model?.SupportsCompactSlidingKv == true), size,
                 kvConfig.KeyDType, kvConfig.ValueDType, kvConfig.MixedPrecisionWindowSize);
         }
         else if (kvConfig.IsQuantized)
         {
             kvFactory = (cfg, size) => new DotLLM.Engine.KvCache.QuantizedKvCache(
-                cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, size,
+                DotLLM.Core.Attention.KvGeometry.FromConfig(cfg, model?.SupportsCompactSlidingKv == true), size,
                 kvConfig.KeyDType, kvConfig.ValueDType, kvConfig.MixedPrecisionWindowSize);
         }
 
-        PrefixCache? prefixCache = !settings.NoPromptCache
+        // Prefix reuse is CPU-KV only: serve does no cross-request prefix reuse on Vulkan, and chat must not either (#790).
+        PrefixCache? prefixCache = !settings.NoPromptCache && vulkanKv is null
             ? new PrefixCache(settings.PromptCacheSize)
             : null;
 
@@ -532,7 +731,15 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
 
         var generator = new TextGenerator(model!, tokenizer!, kvFactory, prefixCache,
             draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,
-            prefillChunkSize: settings.PrefillChunkSize);
+            mtpEnabled: !settings.NoMtp, mtpAdaptive: true, recurrentPrefixCache: !settings.NoPromptCache,
+            prefillChunkSize: settings.PrefillChunkSize,
+            recurrentPrefixCacheOptions: DotLLM.Server.ServerOptions.BuildPrefixSnapshotOptions(settings.PrefixSnapshots, settings.PrefixSnapshotHostBudget, settings.PrefixSnapshotDiskDirectory, settings.PrefixSnapshotDiskBudget, settings.PromptCacheStep, settings.PromptCacheStepKeep),
+            promptLookup: settings.PromptLookupOptions);
+
+        if (generator.RecurrentStepCheckpointBytes > 0)
+            Console.WriteLine($"[dotllm] Prompt-cache steps: a {generator.RecurrentStepCheckpointBytes / 1048576.0:F1} MiB recurrent checkpoint every {settings.PromptCacheStep} prefill tokens, keeping {settings.PromptCacheStepKeep ?? 8}");
+        if (settings.PrefixSnapshotDiskDirectory is not null)
+            Console.WriteLine($"[dotllm] Prefix snapshot disk transport: {generator.RecurrentPrefixStatistics.DiskTransport ?? "unavailable (provider or directory)"} (restart persistence disabled)");
 
         try
         {
@@ -540,6 +747,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         }
         finally
         {
+            generator.ClearRecurrentPrefixCache();
             pagedFactory?.Dispose();
             cudaPagedFactory?.Dispose();
             draftModel?.Dispose();
@@ -724,7 +932,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         }
 
         // Check for tool calls
-        ToolCall[]? detectedCalls = toolCallParser?.TryParse(assistantText);
+        ToolCall[]? detectedCalls = toolCallParser?.TryParse(assistantText, tools);
 
         if (detectedCalls is { Length: > 0 })
         {
@@ -815,14 +1023,6 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             $"[dim][[{promptTokenCount} prompt tokens{cacheInfo}, {tokenCount} generated tokens, " +
             $"{ttftMs:F0} ms TTFT, {prefillTokSec:F1} prefill tok/s, {decodeTokSec:F1} decode tok/s]][/]");
         Console.WriteLine();
-    }
-
-    private static int ResolveGpuLayers(Settings settings, ModelConfig config)
-    {
-        if (settings.GpuLayers.HasValue)
-            return Math.Clamp(settings.GpuLayers.Value, 0, config.NumLayers);
-        return settings.Device.StartsWith("gpu", StringComparison.OrdinalIgnoreCase)
-            ? config.NumLayers : 0;
     }
 
     private static string InferQuantLabel(string resolvedPath, string? quantFlag)

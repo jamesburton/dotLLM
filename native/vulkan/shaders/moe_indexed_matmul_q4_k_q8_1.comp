@@ -59,6 +59,25 @@ layout(push_constant) uniform PushConstants {
 const uint Q4K_BLOCK_BYTES = 144u;
 const uint Q4K_GROUP_SIZE  = 256u;
 
+// #545 WAS MEASURED HERE AND REJECTED - do not "finish the campaign" on this shader
+// without re-reading this. The two-level accumulation that shipped for Q8_0, Q2_K,
+// Q3_K, Q4_K, Q5_K, Q6_K and IQ4_XS buys 2.2-2.4x accuracy here too, and costs
+// 11-17% at the REAL 26B gate/up shape (n=128, m=704, k=2816, 8 experts),
+// reproducibly and with disjoint IQRs.
+//
+// The cause is not the arithmetic. A ballast arm - this kernel with ONE extra live
+// float and no accumulation change at all - reproduced the whole effect (0.850x at
+// that shape). The driver reports 48 -> 49 VGPRs, and this kernel allocates ZERO
+// LDS, so it is purely occupancy-bound and 48 sits on a wave64 VGPR allocation
+// granularity boundary. Every two-level form needs at least one extra live float,
+// including the variant whose partial lives only inside the outer loop body, so no
+// formulation avoids it. Same reason IQ4_NL was refused (13% for 1.92x), on a worse
+// trade.
+//
+// Probe545MoeQ4KMmqTests holds this shader at its current accuracy and carries the
+// numbers; the candidate shaders are in that branch's history.
+// ANY change here that adds a live float should be re-measured at that shape.
+
 uint readByte(uint absByteOff) {
     uint u = bank[absByteOff >> 2u];
     uint shift = (absByteOff & 3u) * 8u;

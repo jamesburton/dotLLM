@@ -11,6 +11,11 @@ public sealed class GenericToolCallParser : IToolCallParser
         => ToolCallJsonHelper.ExtractAndParse(generatedText, "call");
 
     /// <inheritdoc/>
+    /// <remarks>A bare JSON call opens with <c>{</c>. Prose that merely contains a brace is delayed, not lost: the streaming
+    /// endpoints deliver held text that never parses into a call at the end of the turn.</remarks>
+    public IReadOnlyList<string> StartMarkers { get; } = ["{"];
+
+    /// <inheritdoc/>
     public bool IsToolCallStart(string text)
     {
         // Heuristic: text contains a JSON-like pattern with "name" key

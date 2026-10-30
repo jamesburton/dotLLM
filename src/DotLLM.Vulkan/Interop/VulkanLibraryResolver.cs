@@ -9,18 +9,29 @@ namespace DotLLM.Vulkan.Interop;
 /// </summary>
 internal static class VulkanLibraryResolver
 {
-    private static int _registered;
+    private static readonly bool Registered;
 
     /// <summary>
-    /// Registers the resolver. Safe to call multiple times (idempotent).
+    /// Issue #504: see <c>CudaLibraryResolver</c>'s note — the flag-based guard claimed the flag
+    /// before installing the resolver, so a concurrent caller could return early and then P/Invoke
+    /// <c>vulkan-1</c> with no mapping. The type-initialization lock closes that window.
     /// </summary>
-    internal static void Register()
+    static VulkanLibraryResolver()
     {
-        if (Interlocked.Exchange(ref _registered, 1) != 0) return;
-
         NativeLibrary.SetDllImportResolver(
             typeof(VulkanLibraryResolver).Assembly,
             ResolveVulkanLibrary);
+        Registered = true;
+    }
+
+    /// <summary>
+    /// Ensures the resolver is installed; guaranteed complete on return. The body reads
+    /// <see cref="Registered"/> so the type-initialization trigger cannot be elided.
+    /// </summary>
+    internal static void Register()
+    {
+        if (!Registered)
+            throw new InvalidOperationException("Vulkan library resolver registration did not complete.");
     }
 
     private static nint ResolveVulkanLibrary(

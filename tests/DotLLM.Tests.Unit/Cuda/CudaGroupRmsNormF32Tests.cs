@@ -14,6 +14,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// once per group, with each group's own weight slice).
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaGroupRmsNormF32Tests
 {
     private const float AbsTol = 1e-4f;

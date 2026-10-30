@@ -619,14 +619,19 @@ void main() {
 
     float acc = 0.0;
 
-    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+    // One work item = one (super-block, sub-block) pair (the old mapping gave a thread a whole super-block and
+    // kept 10 of 128 threads busy on a K = 2560 row).
+    uint workItems = pc.blocksPerRow * IQ1_S_NUM_SUB_BLOCKS;
+    for (uint work = tid; work < workItems; work += threads) {
+        uint b = work / IQ1_S_NUM_SUB_BLOCKS;
+        uint ib = work % IQ1_S_NUM_SUB_BLOCKS;
         uint blockByteBase = rowByteBase + b * IQ1_S_BLOCK_BYTES;
         float d = readHalf(blockByteBase);
         uint qsBase = blockByteBase + 2u;
         uint qhBase = blockByteBase + 2u + 32u;
         uint xBase = b * IQ1_S_GROUP_SIZE;
 
-        for (uint ib = 0u; ib < IQ1_S_NUM_SUB_BLOCKS; ib++) {
+        {   // sub-block ib of super-block b
             // qh[] holds 8 uint16; a funnelled word at qhBase + (ib>>1)*4 carries
             // two of them (ib and ib+1). Read it ONCE and pick the half instead
             // of two byte-wise reads per sub-block. The codebook is a

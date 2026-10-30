@@ -145,6 +145,29 @@ internal static class KernelSupport
     }
 
     /// <summary>
+    /// <c>COMPUTE_SHADER write -&gt; DISPATCH_INDIRECT read + COMPUTE_SHADER read/write</c>: a kernel wrote dispatch arguments (and
+    /// possibly data the next dispatch reads); the next dispatch consumes both.
+    /// </summary>
+    internal static unsafe void ComputeToIndirectAndComputeBarrier(nint cmdBuf)
+    {
+        var barrier = new VkMemoryBarrier
+        {
+            sType = VkStructureType.MemoryBarrier,
+            srcAccessMask = VkAccessFlags.ShaderWrite,
+            dstAccessMask = VkAccessFlags.IndirectCommandRead | VkAccessFlags.ShaderRead | VkAccessFlags.ShaderWrite,
+        };
+        Interop.ProfileCounters.Barriers++;
+        VulkanApi.vkCmdPipelineBarrier(
+            cmdBuf,
+            srcStageMask: VkPipelineStageFlags.ComputeShader,
+            dstStageMask: VkPipelineStageFlags.ComputeShader | VkPipelineStageFlags.DrawIndirect,
+            dependencyFlags: 0,
+            memoryBarrierCount: 1, pMemoryBarriers: barrier,
+            bufferMemoryBarrierCount: 0, pBufferMemoryBarriers: 0,
+            imageMemoryBarrierCount: 0, pImageMemoryBarriers: 0);
+    }
+
+    /// <summary>
     /// Inserts a <c>COMPUTE_SHADER → COMPUTE_SHADER</c> pipeline barrier with
     /// a <c>SHADER_WRITE → SHADER_READ</c> memory dependency. Used between
     /// every pair of kernels that share a command buffer to ensure the
@@ -175,6 +198,30 @@ internal static class KernelSupport
     /// <c>vkCmdCopyBuffer</c>, which is in the TRANSFER stage, but the
     /// attention kernel reads them in COMPUTE_SHADER).
     /// </summary>
+    /// <summary>
+    /// Conservative <c>(COMPUTE | TRANSFER) → (COMPUTE | TRANSFER)</c> read/write barrier. Used between layers when a whole short forward is
+    /// recorded into ONE command buffer instead of one submission per layer, so every cross-layer RAW/WAR/WAW edge (compute or transfer on
+    /// either side) is covered without enumerating them.
+    /// </summary>
+    internal static unsafe void ComputeTransferFullBarrier(nint cmdBuf)
+    {
+        var barrier = new VkMemoryBarrier
+        {
+            sType = VkStructureType.MemoryBarrier,
+            srcAccessMask = VkAccessFlags.ShaderWrite | VkAccessFlags.TransferWrite,
+            dstAccessMask = VkAccessFlags.ShaderRead | VkAccessFlags.ShaderWrite | VkAccessFlags.TransferRead | VkAccessFlags.TransferWrite,
+        };
+        Interop.ProfileCounters.Barriers++;
+        VulkanApi.vkCmdPipelineBarrier(
+            cmdBuf,
+            srcStageMask: VkPipelineStageFlags.Transfer | VkPipelineStageFlags.ComputeShader,
+            dstStageMask: VkPipelineStageFlags.Transfer | VkPipelineStageFlags.ComputeShader,
+            dependencyFlags: 0,
+            memoryBarrierCount: 1, pMemoryBarriers: barrier,
+            bufferMemoryBarrierCount: 0, pBufferMemoryBarriers: 0,
+            imageMemoryBarrierCount: 0, pImageMemoryBarriers: 0);
+    }
+
     internal static unsafe void TransferToComputeBarrier(nint cmdBuf)
     {
         var barrier = new VkMemoryBarrier
@@ -216,6 +263,29 @@ internal static class KernelSupport
             cmdBuf,
             srcStageMask: VkPipelineStageFlags.Transfer,
             dstStageMask: VkPipelineStageFlags.Transfer | VkPipelineStageFlags.ComputeShader,
+            dependencyFlags: 0,
+            memoryBarrierCount: 1, pMemoryBarriers: barrier,
+            bufferMemoryBarrierCount: 0, pBufferMemoryBarriers: 0,
+            imageMemoryBarrierCount: 0, pImageMemoryBarriers: 0);
+    }
+
+    /// <summary>
+    /// Inserts a <c>(COMPUTE_SHADER | TRANSFER) → COMPUTE_SHADER</c> barrier: a compute kernel and a <c>vkCmdCopyBuffer</c> recorded
+    /// back to back are both made visible to the compute work that follows.
+    /// </summary>
+    internal static unsafe void ComputeAndTransferToComputeBarrier(nint cmdBuf)
+    {
+        var barrier = new VkMemoryBarrier
+        {
+            sType = VkStructureType.MemoryBarrier,
+            srcAccessMask = VkAccessFlags.ShaderWrite | VkAccessFlags.TransferWrite,
+            dstAccessMask = VkAccessFlags.ShaderRead | VkAccessFlags.ShaderWrite,
+        };
+        Interop.ProfileCounters.Barriers++;
+        VulkanApi.vkCmdPipelineBarrier(
+            cmdBuf,
+            srcStageMask: VkPipelineStageFlags.ComputeShader | VkPipelineStageFlags.Transfer,
+            dstStageMask: VkPipelineStageFlags.ComputeShader,
             dependencyFlags: 0,
             memoryBarrierCount: 1, pMemoryBarriers: barrier,
             bufferMemoryBarrierCount: 0, pBufferMemoryBarriers: 0,
@@ -269,6 +339,26 @@ internal static class KernelSupport
             cmdBuf,
             srcStageMask: VkPipelineStageFlags.ComputeShader,
             dstStageMask: VkPipelineStageFlags.Transfer,
+            dependencyFlags: 0,
+            memoryBarrierCount: 1, pMemoryBarriers: barrier,
+            bufferMemoryBarrierCount: 0, pBufferMemoryBarriers: 0,
+            imageMemoryBarrierCount: 0, pImageMemoryBarriers: 0);
+    }
+
+    /// <summary>Transfer-write (vkCmdCopyBuffer into a host-readback buffer) -&gt; host-read visibility before the submit's fence wait (#885).</summary>
+    internal static unsafe void TransferToHostBarrier(nint cmdBuf)
+    {
+        var barrier = new VkMemoryBarrier
+        {
+            sType = VkStructureType.MemoryBarrier,
+            srcAccessMask = VkAccessFlags.TransferWrite,
+            dstAccessMask = VkAccessFlags.HostRead,
+        };
+        Interop.ProfileCounters.Barriers++;
+        VulkanApi.vkCmdPipelineBarrier(
+            cmdBuf,
+            srcStageMask: VkPipelineStageFlags.Transfer,
+            dstStageMask: VkPipelineStageFlags.Host,
             dependencyFlags: 0,
             memoryBarrierCount: 1, pMemoryBarriers: barrier,
             bufferMemoryBarrierCount: 0, pBufferMemoryBarriers: 0,

@@ -24,7 +24,11 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// upload replaces the originally-anticipated device-side repack kernel.
 /// </para>
 /// </remarks>
+// #502: this class pins MatMul.I2SUseW2A8Override for the whole of its lifetime, and that static is
+// process-wide. Outside the serialized collection, a sibling class's Dispose un-pins it mid-run and
+// the CPU oracle silently moves to the W2A8 tier.
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaMoeFfnBitNetI2STests : IDisposable
 {
     private readonly CudaContext? _ctx;
@@ -34,6 +38,10 @@ public sealed class CudaMoeFfnBitNetI2STests : IDisposable
 
     public CudaMoeFfnBitNetI2STests()
     {
+        // #487: the CPU oracle must be the exact float (W2A16) I2_S reference. #477 enabled the
+        // int8-activation W2A8 tier down to SSSE3, which on a pre-AVX2 CUDA box (the T5500) moved the
+        // oracle itself and broke this CUDA-vs-CPU tolerance by ~1e-3. Pin the reference tier here.
+        MatMul.I2SUseW2A8Override = false;
         if (!CudaDevice.IsAvailable()) return;
         _ctx = CudaContext.Create(0);
         _stream = CudaStream.Create();
@@ -46,6 +54,7 @@ public sealed class CudaMoeFfnBitNetI2STests : IDisposable
 
     public void Dispose()
     {
+        MatMul.I2SUseW2A8Override = null;
         _kernels?.Dispose();
         _cublas?.Dispose();
         _stream?.Dispose();

@@ -34,6 +34,7 @@ namespace DotLLM.Tests.Integration.CrossBackend;
 /// asymmetry is inherent to how CPU decode works today, not a shortcut taken here.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class CrossBackendQuantGateKvCachedDecodeTests
 {
     private readonly ITestOutputHelper _output;
@@ -92,12 +93,34 @@ public sealed class CrossBackendQuantGateKvCachedDecodeTests
         string? path = CrossBackendQuantGateTests.ResolveFixturePath(quantType);
         Skip.If(path is null, $"{quantType}: fixture not found (see CrossBackendQuantGateTests.FixtureHint).");
 
-        using var cpuGguf = GgufFile.Open(path!);
+        // IQ3_S and IQ1_S have no native CUDA kernel, so loading them goes through the
+        // load-time dequant-and-expand fallback that CudaKernels.EnsureQuantExpansionAllowed
+        // refuses by default. That fallback's decode path is what this test scores, so opt in
+        // for the duration of this case only (same pattern as
+        // CrossBackendQuantGateTests.Backend_AgreesWithCpu). AllowQuantExpansion is read from
+        // DOTLLM_CUDA_ALLOW_QUANT_EXPANSION once, at type init, so the static is the lever, not
+        // the env var. Flipping a process-global is race-free only because every CUDA class is
+        // in the non-parallel GPU collection (#483).
+        bool prevAllowExpansion = CudaKernels.AllowQuantExpansion;
+        CudaKernels.AllowQuantExpansion = true;
+        try
+        {
+            await RunCudaKvCachedDecodeCore(quantType, prompt, path!);
+        }
+        finally
+        {
+            CudaKernels.AllowQuantExpansion = prevAllowExpansion;
+        }
+    }
+
+    private async Task RunCudaKvCachedDecodeCore(QuantizationType quantType, string prompt, string path)
+    {
+        using var cpuGguf = GgufFile.Open(path);
         var cpuConfig = GgufModelConfigExtractor.Extract(cpuGguf.Metadata);
         var tokenizer = GgufBpeTokenizerFactory.Load(cpuGguf.Metadata);
         using var cpuModel = ModelLoader.CreateCpuModelFromGguf(cpuGguf, cpuConfig, ThreadingConfig.Auto);
 
-        using var gpuGguf = GgufFile.Open(path!);
+        using var gpuGguf = GgufFile.Open(path);
         var gpuConfig = GgufModelConfigExtractor.Extract(gpuGguf.Metadata);
         using var cudaModel = CudaTransformerModel.LoadFromGguf(gpuGguf, gpuConfig);
 

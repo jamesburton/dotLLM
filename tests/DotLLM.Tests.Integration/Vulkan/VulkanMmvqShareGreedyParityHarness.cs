@@ -26,7 +26,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 ///     (default 128).</item>
 /// </list>
 /// </remarks>
-[Collection("SmallModel")]
+[Collection(SmallModelGpuCollection.Name)]
 [Trait("Category", "GPU")]
 public sealed class VulkanMmvqShareGreedyParityHarness
 {

@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+using System.Threading.Channels;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Models;
 using DotLLM.Engine.KvCache;
@@ -32,6 +34,13 @@ public sealed class ContinuousBatchSchedulerService : IScheduler, IDisposable
 {
     private readonly ContinuousBatchScheduler _inner;
     private readonly SemaphoreSlim _wakeup = new(initialCount: 0, maxCount: int.MaxValue);
+
+    /// <summary>
+    /// Guards exclusive use of the shared model between the run loop's <c>Step</c> calls and any
+    /// out-of-band forward pass a host needs to take on the same model — see
+    /// <see cref="AcquireModelAsync"/>.
+    /// </summary>
+    private readonly SemaphoreSlim _modelLock = new(1, 1);
     private readonly KvBlockPool? _pagedPool;
     private readonly bool _ownsTelemetryProviders;
     private bool _disposed;
@@ -92,6 +101,49 @@ public sealed class ContinuousBatchSchedulerService : IScheduler, IDisposable
         return handle.Completion;
     }
 
+    /// <summary>
+    /// Schedules <paramref name="request"/> and yields its tokens as the run loop samples them, so a
+    /// streaming request batches with every other in-flight request instead of serializing the model
+    /// (#1266). The concatenated <see cref="GenerationToken.Text"/> equals the
+    /// <see cref="InferenceResponse.Text"/> <see cref="EnqueueAsync"/> would return; the final token
+    /// carries the finish reason, timings and <see cref="GenerationToken.GeneratedTokenCount"/>.
+    /// </summary>
+    /// <remarks>
+    /// The request is submitted on the first <c>MoveNextAsync</c>. Tokens are buffered in an unbounded
+    /// channel (at most <c>max_tokens</c> entries), so a slow consumer never stalls the run loop or
+    /// fails the request. Abandoning the enumeration early cancels the request.
+    /// </remarks>
+    /// <param name="request">The request to schedule.</param>
+    /// <param name="cancellationToken">Cancels the request and the enumeration.</param>
+    /// <returns>The generated tokens.</returns>
+    /// <exception cref="OperationCanceledException">The request was cancelled.</exception>
+    public async IAsyncEnumerable<GenerationToken> StreamAsync(
+        InferenceRequest request, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        // Multi-writer: besides the run loop, the caller's cancellation callback completes it.
+        var channel = Channel.CreateUnbounded<GenerationToken>(
+            new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var handle = _inner.Submit(request, cts.Token, channel.Writer);
+        _wakeup.Release();
+        try
+        {
+            await foreach (var token in channel.Reader.ReadAllAsync(cts.Token).ConfigureAwait(false))
+                yield return token;
+
+            // The channel ends on every outcome; the completion says which (and throws on failure).
+            await handle.Completion.ConfigureAwait(false);
+        }
+        finally
+        {
+            // An abandoned enumeration must not leave the sequence generating to max_tokens.
+            if (!handle.Completion.IsCompleted)
+                cts.Cancel();
+        }
+    }
+
     /// <inheritdoc/>
     public async Task RunLoopAsync(CancellationToken cancellationToken)
     {
@@ -119,7 +171,22 @@ public sealed class ContinuousBatchSchedulerService : IScheduler, IDisposable
                 // Drain pending work in a tight loop; yield only when idle.
                 while (!cancellationToken.IsCancellationRequested && !_inner.IsIdle)
                 {
-                    bool didWork = _inner.Step();
+                    // One step == one forward pass over the shared model. Held under the model
+                    // lock so an out-of-band forward (e.g. the embeddings endpoint, #451) can
+                    // interleave BETWEEN steps instead of racing one: the model's scratch
+                    // buffers are shared mutable state. Uncontended this is a completed-task
+                    // await, negligible against a forward pass.
+                    bool didWork;
+                    await _modelLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    try
+                    {
+                        didWork = _inner.Step();
+                    }
+                    finally
+                    {
+                        _modelLock.Release();
+                    }
+
                     if (!didWork)
                     {
                         // Defensive yield — Step returning false on a non-idle scheduler shouldn't
@@ -155,5 +222,35 @@ public sealed class ContinuousBatchSchedulerService : IScheduler, IDisposable
         }
         _inner.Dispose();
         _wakeup.Dispose();
+        _modelLock.Dispose();
+    }
+
+    /// <summary>
+    /// Takes exclusive use of the scheduled model until the returned handle is disposed. The run
+    /// loop finishes the step it is on, then blocks before starting the next one.
+    /// </summary>
+    /// <remarks>
+    /// <para>The scheduler drives forward passes on the model from its own background loop,
+    /// deliberately outside any host-level request gate — batching is the whole point. A host that
+    /// needs a forward pass of its own on the same model (the embeddings endpoint, issue #451)
+    /// therefore cannot rely on that gate: the model's scratch buffers are shared mutable state
+    /// and both results would be silently corrupt. This is the handshake for it.</para>
+    /// <para>Hold it for as short a time as possible: in-flight generations stall meanwhile.</para>
+    /// </remarks>
+    public async Task<IDisposable> AcquireModelAsync(CancellationToken cancellationToken = default)
+    {
+        await _modelLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        return new ModelLease(_modelLock);
+    }
+
+    private sealed class ModelLease(SemaphoreSlim semaphore) : IDisposable
+    {
+        private SemaphoreSlim? _semaphore = semaphore;
+
+        public void Dispose()
+        {
+            var s = Interlocked.Exchange(ref _semaphore, null);
+            s?.Release();
+        }
     }
 }

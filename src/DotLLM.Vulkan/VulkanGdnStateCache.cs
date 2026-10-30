@@ -132,6 +132,100 @@ public sealed class VulkanGdnStateCache : IGdnState
         }
     }
 
+    /// <summary>
+    /// Private geometry-only constructor used by <see cref="Clone"/> — allocates the same
+    /// per-layer buffer shapes without the zeroing upload, because every byte is about to be
+    /// overwritten by a device-to-device copy.
+    /// </summary>
+    private VulkanGdnStateCache(VulkanDevice device, int numGdnLayers, int convStateElements, int gdnStateElements)
+    {
+        _device = device;
+        _numGdnLayers = numGdnLayers;
+        _convStateElements = convStateElements;
+        _gdnStateElements = gdnStateElements;
+        _convStateBuffers = new VulkanDevice.Buffer[numGdnLayers];
+        _gdnStateBuffers = new VulkanDevice.Buffer[numGdnLayers];
+
+        long convBytes = (long)convStateElements * sizeof(float);
+        long stateBytes = (long)gdnStateElements * sizeof(float);
+        for (int i = 0; i < numGdnLayers; i++)
+        {
+            _convStateBuffers[i] = device.AllocateDeviceLocal(convBytes);
+            _gdnStateBuffers[i] = device.AllocateDeviceLocal(stateBytes);
+        }
+    }
+
+    /// <summary>
+    /// Device-to-device snapshot of every layer's recurrent state (issue #435). The returned cache
+    /// is an independent allocation the caller owns and must dispose; it is the Vulkan counterpart
+    /// of <c>GdnStateCache.Clone</c> / <c>CudaGdnStateCache.Clone</c>, and exists for the same
+    /// reason (issue #287): a speculative verify batch advances the GDN recurrence for tokens that
+    /// may then be rejected, and a pure sequential recurrence has no position addressing to undo.
+    /// </summary>
+    public VulkanGdnStateCache Clone()
+    {
+        ThrowIfDisposed();
+        var copy = CloneGeometry();
+        CopyTo(copy);
+        return copy;
+    }
+
+    /// <summary>
+    /// Allocates a cache with this one's geometry and unspecified contents, for use as a
+    /// <see cref="CopyTo"/> destination.
+    /// </summary>
+    public VulkanGdnStateCache CloneGeometry()
+    {
+        ThrowIfDisposed();
+        return new VulkanGdnStateCache(_device, _numGdnLayers, _convStateElements, _gdnStateElements);
+    }
+
+    /// <summary>
+    /// Copies every layer's conv-state and gdn-state buffer into <paramref name="destination"/>
+    /// (device-to-device, no host round-trip). Geometry must match exactly.
+    /// </summary>
+    public void CopyTo(VulkanGdnStateCache destination)
+    {
+        ArgumentNullException.ThrowIfNull(destination);
+        ThrowIfDisposed();
+        destination.ThrowIfDisposed();
+        if (destination._numGdnLayers != _numGdnLayers
+            || destination._convStateElements != _convStateElements
+            || destination._gdnStateElements != _gdnStateElements)
+        {
+            throw new ArgumentException(
+                $"VulkanGdnStateCache geometry mismatch: source " +
+                $"({_numGdnLayers} layers, conv={_convStateElements}, state={_gdnStateElements}) vs destination " +
+                $"({destination._numGdnLayers} layers, conv={destination._convStateElements}, state={destination._gdnStateElements}).",
+                nameof(destination));
+        }
+
+        long convBytes = (long)_convStateElements * sizeof(float);
+        long stateBytes = (long)_gdnStateElements * sizeof(float);
+
+        // One submission for every layer. A synchronous copy per buffer cost a submit + fence wait
+        // each — 96 of them per speculative round on Bonsai 2, which dominated MTP's round time.
+        using var ctx = _device.CreateSubmitContext();
+        ctx.Begin();
+        nint cmdBuf = ctx.CommandBuffer;
+        Kernels.KernelSupport.ComputeToTransferBarrier(cmdBuf);
+        for (int i = 0; i < _numGdnLayers; i++)
+        {
+            if (convBytes > 0)
+                RecordCopy(cmdBuf, _convStateBuffers[i], destination._convStateBuffers[i], (ulong)convBytes);
+            if (stateBytes > 0)
+                RecordCopy(cmdBuf, _gdnStateBuffers[i], destination._gdnStateBuffers[i], (ulong)stateBytes);
+        }
+        Kernels.KernelSupport.TransferToComputeBarrier(cmdBuf);
+        ctx.SubmitAndWait();
+    }
+
+    private static void RecordCopy(nint cmdBuf, VulkanDevice.Buffer src, VulkanDevice.Buffer dst, ulong size)
+    {
+        var region = new Interop.VkBufferCopy { srcOffset = 0, dstOffset = 0, size = size };
+        Interop.VulkanApi.vkCmdCopyBuffer(cmdBuf, src.Handle, dst.Handle, 1, region);
+    }
+
     private void ThrowIfDisposed()
     {
         if (_disposed) throw new ObjectDisposedException(nameof(VulkanGdnStateCache));

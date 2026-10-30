@@ -28,7 +28,11 @@ layout(push_constant) uniform PushConstants {
     uint K;             // multiple of 256
     uint blocksPerRow;  // = K / 256
     uint rowUints;
+    uint cols;
 } pc;
+
+// #1237: `cols` activation columns. Workgroup w (x + 32768 y) computes row w / cols of column w % cols with the
+// one-column arithmetic, so a speculative verify of cols rows is bit-identical to cols decode steps.
 
 const uint IQ2_XXS_BLOCK_BYTES = 66u;
 const uint IQ2_XXS_GROUP_SIZE  = 256u;
@@ -80,8 +84,11 @@ uint ksignByte(uint absIdx) {
 shared float partials[128];
 
 void main() {
-    uint m = gl_WorkGroupID.x;
+    uint wg = gl_WorkGroupID.y * 32768u + gl_WorkGroupID.x;
+    uint col = wg % pc.cols;
+    uint m = wg / pc.cols;
     if (m >= pc.M) return;
+    uint xCol = col * pc.K, yCol = col * pc.M;
 
     uint tid = gl_LocalInvocationID.x;
     uint threads = gl_WorkGroupSize.x;
@@ -91,13 +98,18 @@ void main() {
 
     float acc = 0.0;
 
-    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+    // One work item = one (super-block, sub-block) pair. The old mapping gave a thread a whole super-block,
+    // so a K = 2560 row (10 super-blocks) kept 10 of 128 threads busy (decode at ~60 GB/s on hybrid-dense).
+    uint workItems = pc.blocksPerRow * NUM_SUBBLOCKS;
+    for (uint work = tid; work < workItems; work += threads) {
+        uint b = work / NUM_SUBBLOCKS;
+        uint ib32 = work % NUM_SUBBLOCKS;
         uint blockByteBase = rowByteBase + b * IQ2_XXS_BLOCK_BYTES;
         float d = readHalf(blockByteBase);
         uint qsBase = blockByteBase + 2u;
         uint xBase  = b * IQ2_XXS_GROUP_SIZE;
 
-        for (uint ib32 = 0u; ib32 < NUM_SUBBLOCKS; ib32++) {
+        {   // sub-block ib32 of super-block b
             // a0 (4 grid-byte indices) and a1 (4×7-bit sign indices + sub-scale)
             // are 8 contiguous bytes. Read each as ONE funnelled word instead of
             // four byte-wise readByte calls that reloaded the same shared word.
@@ -118,7 +130,7 @@ void main() {
                 for (uint j = 0u; j < 8u; j++) {
                     float g    = float(gridByte(gridOff + j));
                     float sign = ((signs & (1u << j)) != 0u) ? -1.0 : 1.0;
-                    pairSum += g * sign * x[xOff + j];
+                    pairSum += g * sign * x[xCol + xOff + j];
                 }
                 acc += db * pairSum;
             }
@@ -132,5 +144,5 @@ void main() {
         barrier();
     }
 
-    if (tid == 0u) y[m] = partials[0];
+    if (tid == 0u) y[yCol + m] = partials[0];
 }

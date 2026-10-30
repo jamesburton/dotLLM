@@ -1,5 +1,6 @@
 using DotLLM.Core.Configuration;
 using DotLLM.Engine;
+using DotLLM.Engine.PromptCache;
 using DotLLM.Engine.Scheduler;
 using DotLLM.Server.RateLimiting;
 
@@ -16,11 +17,18 @@ public sealed record ServerOptions
     /// <summary>Quantization filter (e.g., Q8_0, Q4_K_M).</summary>
     public string? Quant { get; init; }
 
-    /// <summary>Compute device: "cpu", "gpu", "gpu:0".</summary>
+    /// <summary>Compute device: "auto", "cpu", "gpu", "gpu:0", "vulkan". The <c>serve</c> CLI and <see cref="Parse"/> default to "auto" (GPU when servable; an explicit device never silently falls back to CPU).</summary>
     public string Device { get; init; } = "cpu";
 
     /// <summary>Number of GPU layers for hybrid offloading.</summary>
     public int? GpuLayers { get; init; }
+
+    /// <summary>
+    /// Routed-expert offload for CUDA <c>nemotron_h_moe</c> models (<c>--moe-offload</c>, <c>--moe-cache-mib</c>,
+    /// <c>--moe-cache-policy</c>, issue #1070; <c>--moe-cold</c>, <c>--moe-cpu-threads</c>, <c>--cpu-moe</c>, <c>--n-cpu-moe</c>,
+    /// <c>--moe-calibrate</c>, <c>--ctx-size</c>, issue #1071). Null = defaults plus the <c>DOTLLM_MOE_*</c> environment variables.
+    /// </summary>
+    public DotLLM.Core.Moe.MoeOffloadOptions? MoeOffload { get; init; }
 
     /// <summary>CPU thread count (0 = auto).</summary>
     public int Threads { get; init; }
@@ -34,17 +42,102 @@ public sealed record ServerOptions
     /// <summary>Port to listen on.</summary>
     public int Port { get; init; } = 8080;
 
-    /// <summary>KV-cache key quantization type.</summary>
-    public string CacheTypeK { get; init; } = "f32";
+    /// <summary>KV-cache key type; <c>null</c> = not specified (the CPU paged path then defaults to Q8_0 blocks, #1284).</summary>
+    public string? CacheTypeK { get; init; }
 
-    /// <summary>KV-cache value quantization type.</summary>
-    public string CacheTypeV { get; init; } = "f32";
+    /// <summary>KV-cache value type; <c>null</c> = not specified (see <see cref="CacheTypeK"/>).</summary>
+    public string? CacheTypeV { get; init; }
 
     /// <summary>Whether prompt caching is enabled.</summary>
     public bool PromptCacheEnabled { get; init; } = true;
 
     /// <summary>Maximum number of cached sessions for prompt caching.</summary>
     public int PromptCacheSize { get; init; } = 4;
+
+    /// <summary>Maximum recurrent prefix snapshots. Null preserves the single-slot default.</summary>
+    public int? PrefixSnapshots { get; init; }
+
+    /// <summary>Maximum page-locked host snapshot bytes. Zero disables host retention.</summary>
+    public long PrefixSnapshotHostBudgetBytes { get; init; }
+
+    /// <summary>Parent directory for ephemeral recurrent snapshot spill files.</summary>
+    public string? PrefixSnapshotDiskDirectory { get; init; }
+
+    /// <summary>Maximum snapshot spill bytes. Zero disables the disk tier.</summary>
+    public long PrefixSnapshotDiskBudgetBytes { get; init; }
+
+    /// <summary>Recurrent-state checkpoint every this many prefill tokens for mid-history resume (issue #1286); 0 disables.</summary>
+    public int PromptCacheStep { get; init; }
+
+    /// <summary>Most step checkpoints kept; null means the engine default (8).</summary>
+    public int? PromptCacheStepKeep { get; init; }
+
+    /// <summary>Validates and resolves recurrent snapshot limits for this server.</summary>
+    public RecurrentPrefixCacheOptions GetPrefixSnapshotOptions()
+    {
+        int count = PrefixSnapshots ?? 1;
+        if (count < 1) throw new ArgumentOutOfRangeException(nameof(PrefixSnapshots), "--prefix-snapshots must be at least 1.");
+        if (PrefixSnapshotHostBudgetBytes < 0) throw new ArgumentOutOfRangeException(nameof(PrefixSnapshotHostBudgetBytes));
+        if (PrefixSnapshotDiskBudgetBytes < 0) throw new ArgumentOutOfRangeException(nameof(PrefixSnapshotDiskBudgetBytes));
+        if (PromptCacheStep < 0) throw new ArgumentOutOfRangeException(nameof(PromptCacheStep), "--prompt-cache-step must not be negative.");
+        if (PromptCacheStepKeep < 1) throw new ArgumentOutOfRangeException(nameof(PromptCacheStepKeep), "--prompt-cache-step-keep must be at least 1.");
+        string? directory = PrefixSnapshotDiskDirectory;
+        if (directory is not null && string.IsNullOrWhiteSpace(directory))
+            throw new ArgumentException("--prefix-snapshot-disk-dir must name a directory.");
+        if ((directory is null) != (PrefixSnapshotDiskBudgetBytes == 0))
+            throw new ArgumentException("--prefix-snapshot-disk-dir and a positive --prefix-snapshot-disk-budget must be supplied together.");
+        if (directory is not null)
+        {
+            try { directory = Path.GetFullPath(directory); }
+            catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+            { throw new ArgumentException("--prefix-snapshot-disk-dir is not a valid directory path.", ex); }
+        }
+        return new() { MaxEntries = count, HostBudgetBytes = PrefixSnapshotHostBudgetBytes,
+            DiskDirectory = directory, DiskBudgetBytes = PrefixSnapshotDiskBudgetBytes,
+            StepTokens = PromptCacheStep, MaxStepCheckpoints = PromptCacheStepKeep ?? new RecurrentPrefixCacheOptions().MaxStepCheckpoints };
+    }
+
+    /// <summary>Resolves CLI count and human-readable host byte budget before loading a model.</summary>
+    public static RecurrentPrefixCacheOptions BuildPrefixSnapshotOptions(int? count, string? hostBudget,
+        string? diskDirectory = null, string? diskBudget = null, int step = 0, int? stepKeep = null)
+        => new ServerOptions { Model = "", PrefixSnapshots = count, PrefixSnapshotHostBudgetBytes = ParsePrefixSnapshotHostBudget(hostBudget),
+            PrefixSnapshotDiskDirectory = diskDirectory, PrefixSnapshotDiskBudgetBytes = ParsePrefixSnapshotDiskBudget(diskBudget),
+            PromptCacheStep = step, PromptCacheStepKeep = stepKeep }
+            .GetPrefixSnapshotOptions();
+
+    /// <summary>Parses nonnegative bytes or decimal/binary units, for example 8000000, 8GB or 8GiB.</summary>
+    public static long ParsePrefixSnapshotHostBudget(string? value)
+        => ParsePrefixSnapshotByteBudget(value, "--prefix-snapshot-host-budget");
+
+    /// <summary>Parses the nonnegative spill budget using the same decimal/binary byte units as the host tier.</summary>
+    public static long ParsePrefixSnapshotDiskBudget(string? value)
+        => ParsePrefixSnapshotByteBudget(value, "--prefix-snapshot-disk-budget");
+
+    private static long ParsePrefixSnapshotByteBudget(string? value, string flag)
+    {
+        if (value is null) return 0;
+        string number = value.Trim();
+        long multiplier = 1;
+        foreach (var (suffix, scale) in new (string, long)[]
+        {
+            ("TiB", 1L << 40), ("GiB", 1L << 30), ("MiB", 1L << 20), ("KiB", 1L << 10),
+            ("TB", 1_000_000_000_000L), ("GB", 1_000_000_000L), ("MB", 1_000_000L), ("KB", 1_000L), ("B", 1L),
+        })
+        {
+            if (!number.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)) continue;
+            number = number[..^suffix.Length].TrimEnd();
+            multiplier = scale;
+            break;
+        }
+        if (!decimal.TryParse(number, System.Globalization.NumberStyles.AllowDecimalPoint,
+                System.Globalization.CultureInfo.InvariantCulture, out decimal amount)
+            || amount < 0 || amount > long.MaxValue / (decimal)multiplier)
+            throw new ArgumentException($"{flag} must be a nonnegative byte size, such as 8GiB.", nameof(value));
+        decimal bytes = amount * multiplier;
+        if (bytes != decimal.Truncate(bytes))
+            throw new ArgumentException($"{flag} must resolve to a whole number of bytes.", nameof(value));
+        return (long)bytes;
+    }
 
     /// <summary>Whether to use paged KV-cache (block-based allocation). Default true for serve.</summary>
     public bool UsePaged { get; init; } = true;
@@ -58,20 +151,66 @@ public sealed record ServerOptions
     /// <summary>Number of draft candidates per speculative step (K). Also used as K for MTP
     /// self-speculative decoding (<see cref="MtpEnabled"/>) — both are the same "candidates per
     /// round" concept.</summary>
-    public int SpeculativeCandidates { get; init; } = 5;
+    public int SpeculativeCandidates { get; init; } = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
 
     /// <summary>
-    /// Enables Multi-Token Prediction (MTP) self-speculative decoding (issue #253) when the loaded
-    /// checkpoint carries an MTP head. Unlike <see cref="SpeculativeModel"/> this needs no second
-    /// model — it's a no-op for any GGUF without an MTP head. Defaults to <c>false</c> (opt-in via
-    /// <c>--mtp</c>) for <c>serve</c>, unlike the CLI's <c>run</c>/<c>chat</c> commands where MTP
-    /// auto-detects and defaults on: enabling it here also disables the continuous-batch scheduler
-    /// for this model (mirrors the existing <see cref="SpeculativeModel"/> restriction — MTP's
-    /// single-sequence self-speculative loop doesn't support multi-request batching in this
-    /// iteration), which would be a surprising throughput regression for concurrent server traffic
-    /// to trigger purely from which GGUF happened to load.
+    /// Prompt-lookup (n-gram) speculative decoding settings (issue #1293), null = off. Like a draft model, it serves through the
+    /// single-sequence generator, so it takes the continuous-batch scheduler offline for the model.
     /// </summary>
-    public bool MtpEnabled { get; init; }
+    public DotLLM.Engine.PromptLookupOptions? PromptLookup { get; init; }
+
+    /// <summary>
+    /// Multi-Token Prediction (MTP) self-speculative decoding (issue #253). <b>Defaults to <c>true</c></b>:
+    /// when the loaded GGUF carries an embedded MTP head (<c>IModel.SupportsMtp</c>), no external draft model
+    /// (<see cref="SpeculativeModel"/>) is given, and <see cref="ExpectedConcurrency"/> is below 5, <c>serve</c>
+    /// enables it automatically with the adaptive gate (it backs off to plain decode when drafts stop paying).
+    /// It is a no-op for any GGUF without a head. Opt out with <c>--no-mtp</c>; <c>--mtp</c> is still accepted
+    /// (back-compat) and only changes the startup log wording - it does not override the concurrency or
+    /// draft-model rules below.
+    /// <para>
+    /// Tradeoff: while MTP is active the continuous-batch scheduler is off for that model (MTP's single-sequence
+    /// self-speculative loop does not batch requests), so many concurrent clients are better served with
+    /// <c>--no-mtp</c> or <c>--expected-concurrency 5</c> (or more), which drops MTP for the model.
+    /// </para>
+    /// </summary>
+    public bool MtpEnabled { get; init; } = true;
+
+    /// <summary>True when <c>--mtp</c> was passed explicitly (back-compat); only affects log wording.</summary>
+    public bool MtpExplicit { get; init; }
+
+    /// <summary>
+    /// Path of a separate MTP head GGUF for architectures that ship it beside the trunk (qwen4exp: <c>mtp-*.gguf</c>). Null = auto-detect a sibling
+    /// file (see <c>Qwen4ExpMtpHeadResolver</c>). An explicit path always attaches; an auto-detected one attaches only when the trunk is large
+    /// enough for MTP to pay (see <c>Qwen4ExpMtpHeadResolver.AutoAttachMinTrunkBytes</c>).
+    /// </summary>
+    public string? MtpHeadPath { get; init; }
+
+    /// <summary>DFlash / DFlash2 drafter GGUF (<c>--dflash</c>, issue #1175); it takes the model's MTP slot. Null = none.</summary>
+    public string? DFlashPath { get; init; }
+
+    /// <summary>
+    /// How reasoning ("thinking") output is separated from the answer (#767): <c>--reasoning-format
+    /// none|auto|deepseek</c>. <see cref="DotLLM.Tokenizers.Reasoning.ReasoningFormat.Auto"/> (default) splits
+    /// into <c>reasoning_content</c> + <c>content</c> when the chat template opened a think block or the model
+    /// emits <c>&lt;think&gt;</c> itself; <c>none</c> returns the raw output in <c>content</c> as before.
+    /// A request may override it with its own <c>reasoning_format</c> field.
+    /// </summary>
+    public DotLLM.Tokenizers.Reasoning.ReasoningFormat ReasoningFormat { get; init; } = DotLLM.Tokenizers.Reasoning.ReasoningFormat.Auto;
+
+    /// <summary>
+    /// Default thinking budget in tokens (<c>--reasoning-budget</c>, llama.cpp semantics, #1292): -1 unlimited (default),
+    /// 0 end thinking at once, N at most N thinking tokens. A request's <c>thinking_budget_tokens</c> overrides it.
+    /// </summary>
+    public int ReasoningBudget { get; init; } = -1;
+
+    /// <summary>Text forced before the close tag when the thinking budget runs out (<c>--reasoning-budget-message</c>); null = none.</summary>
+    public string? ReasoningBudgetMessage { get; init; }
+
+    /// <summary>
+    /// With a thinking budget, <c>max_tokens</c> is raised to at least budget + this (<c>--reasoning-answer-reserve</c>,
+    /// default 8192) so the answer is not truncated; 0 = llama.cpp behaviour (the budget counts inside max_tokens).
+    /// </summary>
+    public int ReasoningAnswerReserve { get; init; } = 8192;
 
     /// <summary>
     /// Maximum prompt tokens per prefill forward pass (llama.cpp <c>-ub</c> / micro-batch analog).
@@ -83,6 +222,54 @@ public sealed record ServerOptions
     /// still prefills in one forward pass there (admission-level cap, not intra-prompt chunking).
     /// </summary>
     public int PrefillChunkSize { get; init; }
+
+    /// <summary>
+    /// Served context window in tokens (<c>--ctx-size</c>, llama.cpp <c>-c</c>). Null or 0 (default): models that size their
+    /// own device memory (the CUDA hybrid) fit the window to free VRAM at load and report it in <c>/props</c>; others keep
+    /// the checkpoint's window. A value overrides the fit (capped at the checkpoint's window) and is logged with a warning
+    /// when it exceeds what fits: requests past the fit are then refused with an out-of-memory error rather than spilled
+    /// (issue #1068).
+    /// </summary>
+    public int? ContextSize { get; init; }
+
+    /// <summary>Default for <see cref="EffectiveMaxMessages"/> when <see cref="MaxMessages"/> is unset.</summary>
+    public const int DefaultMaxMessages = 8192;
+
+    /// <summary>Environment variable that supplies <see cref="MaxMessages"/> when <c>--max-messages</c> is not given.</summary>
+    public const string MaxMessagesEnvVar = "DOTLLM_MAX_MESSAGES";
+
+    /// <summary>
+    /// Maximum number of messages accepted in one chat request on <c>/v1/chat/completions</c> and
+    /// <c>/v1/messages</c> (#835). Null = <see cref="DefaultMaxMessages"/>; 0 = unlimited; negative is
+    /// invalid (rejected by <see cref="ResolveMaxMessages"/>). Set with <c>--max-messages</c> or
+    /// <c>DOTLLM_MAX_MESSAGES</c>. A cheap structural bound only - the prompt-length-vs-context check
+    /// is the real protection for the engine.
+    /// </summary>
+    public int? MaxMessages { get; init; }
+
+    /// <summary>The message-count cap in force: <see cref="MaxMessages"/> or the default. 0 means unlimited.</summary>
+    public int EffectiveMaxMessages => MaxMessages ?? DefaultMaxMessages;
+
+    /// <summary>
+    /// Resolves the message cap from the CLI value and the <see cref="MaxMessagesEnvVar"/> value; the CLI wins.
+    /// Returns null when neither is set (so the default applies). Throws <see cref="ArgumentException"/> for a
+    /// negative or non-integer value, so a typo fails at startup instead of silently disabling the cap.
+    /// </summary>
+    public static int? ResolveMaxMessages(int? cliValue, string? envValue)
+    {
+        if (cliValue is int cli)
+            return cli >= 0 ? cli : throw new ArgumentException(
+                $"--max-messages must be >= 0 (0 = unlimited), got {cli}.");
+
+        if (string.IsNullOrWhiteSpace(envValue))
+            return null;
+
+        if (!int.TryParse(envValue.Trim(), System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out int env) || env < 0)
+            throw new ArgumentException(
+                $"{MaxMessagesEnvVar} must be an integer >= 0 (0 = unlimited), got '{envValue}'.");
+        return env;
+    }
 
     /// <summary>Model display name (derived from file path).</summary>
     public string ModelId { get; init; } = "default";
@@ -102,6 +289,18 @@ public sealed record ServerOptions
     public bool AllowLoraAdminApi { get; init; }
 
     /// <summary>
+    /// Whether the model-administration write endpoints introduced in #454 are enabled:
+    /// <c>POST /v1/models/unload</c>, <c>POST /v1/models/pull</c> (+ its cancel route),
+    /// <c>POST /v1/models/enable</c>, <c>POST /v1/models/disable</c> and
+    /// <c>PUT /v1/settings</c>. The matching read-only routes (<c>GET /v1/settings</c>,
+    /// <c>GET /v1/devices</c>, <c>GET /v1/models/pull</c>) are always available.
+    /// Defaults to <c>false</c> — opt in via <c>--allow-model-admin</c>, mirroring
+    /// <see cref="AllowLoraAdminApi"/>. Deliberately a separate flag: unloading models and
+    /// rewriting residency settings is a different trust boundary from registering a LoRA adapter.
+    /// </summary>
+    public bool AllowModelAdminApi { get; init; }
+
+    /// <summary>
     /// Per-API-key rate-limit configuration. When <see cref="RateLimitConfig.Enabled"/>
     /// is <c>false</c> (or this property is <c>null</c>) the rate-limit middleware
     /// is not wired and the server has no per-caller limits. See <see cref="RateLimitConfig"/>
@@ -117,6 +316,35 @@ public sealed record ServerOptions
     /// preemption, the prefill-token cap, and the active-sequence/reserve limits.
     /// </summary>
     public ContinuousBatchSchedulerOptions? Scheduler { get; init; }
+
+    /// <summary>
+    /// Expected number of concurrently decoding requests (<c>--expected-concurrency</c>). Vulkan hybrid models serve through the serial
+    /// per-request generator by default; at <c>&gt;= 5</c> concurrent decode streams the continuous-batch scheduler measured +73% aggregate
+    /// decode throughput on Tev1-4B (parity at &lt;= 4, slower for a repeated identical prompt, and it is off when MTP is active), so a hint of
+    /// 5 or more enables it automatically and also drops default-on MTP for the model (see <see cref="MtpEnabled"/>). <c>DOTLLM_VK_SCHEDULER=0</c>/<c>1</c> overrides the hint.
+    /// </summary>
+    public int ExpectedConcurrency { get; init; }
+
+    /// <summary>
+    /// Download a missing Hugging Face model when a request or load names one (<c>--auto-pull</c>, issue #714). Off by default so a remote client
+    /// cannot start large downloads; the CLI's own <c>run/chat/serve</c> always pull their main model.
+    /// </summary>
+    public bool AutoPull { get; init; }
+
+    /// <summary>The device a model actually loaded on when <see cref="Device"/> is <c>auto</c> (<c>cpu</c>, <c>vulkan</c>, <c>gpu:0</c>); null otherwise.</summary>
+    public string? ResolvedDevice { get; init; }
+
+    /// <summary>Non-null when <c>--device auto</c> fell back from a faster device because the model is unsupported there (reason + perf consequence); surfaced in <c>/props</c>.</summary>
+    public string? DeviceFallbackWarning { get; init; }
+
+    /// <summary>
+    /// Logit temperature for <c>/v1/systemone</c> probabilities (<c>--decision-temperature</c>); 0 or 1 = the raw restricted softmax. See
+    /// <c>DecisionEvaluator.Temperature</c> for the measured effect on Tev1-4B.
+    /// </summary>
+    public double DecisionTemperature { get; init; }
+
+    /// <summary>Option orderings averaged per noul/choice question (<c>--decision-orderings</c>): 1 (default) or 2 (forward + reversed).</summary>
+    public int DecisionOrderings { get; init; } = 1;
 
     /// <summary>
     /// Server-wide default idle-unload duration in seconds (#369, ollama parity — ollama's own
@@ -156,23 +384,36 @@ public sealed record ServerOptions
     {
         string? model = null;
         string? quant = null;
-        string device = "cpu";
+        string device = "auto";
         int? gpuLayers = null;
+        string? moeOffloadMode = null, moeCacheMib = null, moeCachePolicy = null, moeCold = null;
+        int? moeCpuThreads = null, nCpuMoe = null, ctxSize = null;
+        bool cpuMoe = false, moeCalibrate = false;
         int threads = 0;
         int decodeThreads = 0;
         string host = "localhost";
         int port = 8080;
-        string cacheTypeK = "f32";
-        string cacheTypeV = "f32";
+        string? cacheTypeK = null;
+        string? cacheTypeV = null;
         bool promptCacheEnabled = true;
         int promptCacheSize = 4;
+        int? prefixSnapshots = null;
+        string? prefixSnapshotHostBudget = null;
+        string? prefixSnapshotDiskDirectory = null, prefixSnapshotDiskBudget = null;
         bool usePaged = true;
         bool warmupEnabled = true;
         int warmupIterations = 3;
         bool schedulerFairness = false;
         string? speculativeModel = null;
-        int speculativeCandidates = 5;
-        bool mtpEnabled = false;
+        int speculativeCandidates = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
+        bool promptLookup = false;
+        int lookupDraft = DotLLM.Engine.PromptLookupOptions.DefaultDraftTokens;
+        int lookupNgram = DotLLM.Engine.PromptLookupOptions.DefaultMaxNgram;
+        bool mtpEnabled = true;
+        bool mtpExplicit = false;
+        string? mtpHeadPath = null;
+        string? dflashPath = null;
+        var reasoningFormat = DotLLM.Tokenizers.Reasoning.ReasoningFormat.Auto;
         int prefillChunkSize = 0;
         string? ropeScaling = null;
         float? ropeFreqBase = null;
@@ -184,6 +425,11 @@ public sealed record ServerOptions
         double keepAliveSeconds = 300;
         int maxResidentModels = 1;
         long residentMemoryBudgetBytes = 0;
+        bool allowModelAdmin = false;
+        bool allowLoraAdmin = false;
+        int? maxMessagesCli = null;
+        int promptCacheStep = 0;
+        int? promptCacheStepKeep = null;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -198,6 +444,24 @@ public sealed record ServerOptions
                     quant = next; i++; break;
                 case "--device" or "-d":
                     device = next ?? "cpu"; i++; break;
+                case "--moe-offload":
+                    moeOffloadMode = next; i++; break;
+                case "--moe-cache-mib":
+                    moeCacheMib = next; i++; break;
+                case "--moe-cache-policy":
+                    moeCachePolicy = next; i++; break;
+                case "--moe-cold":
+                    moeCold = next; i++; break;
+                case "--moe-cpu-threads":
+                    moeCpuThreads = int.Parse(next!, System.Globalization.CultureInfo.InvariantCulture); i++; break;
+                case "--n-cpu-moe":
+                    nCpuMoe = int.Parse(next!, System.Globalization.CultureInfo.InvariantCulture); i++; break;
+                case "--ctx-size" or "--ctx":
+                    ctxSize = int.Parse(next!, System.Globalization.CultureInfo.InvariantCulture); i++; break;
+                case "--cpu-moe":
+                    cpuMoe = true; break;
+                case "--moe-calibrate":
+                    moeCalibrate = true; break;
                 case "--gpu-layers":
                     gpuLayers = int.Parse(next!); i++; break;
                 case "--threads":
@@ -230,10 +494,36 @@ public sealed record ServerOptions
                     speculativeModel = next; i++; break;
                 case "--speculative-k" or "--draft-tokens":
                     speculativeCandidates = int.Parse(next!); i++; break;
+                case "--prompt-lookup" or "--lookup":
+                    promptLookup = true; break;
+                case "--lookup-draft":
+                    lookupDraft = int.Parse(next!); i++; break;
+                case "--lookup-ngram":
+                    lookupNgram = int.Parse(next!); i++; break;
                 case "--mtp":
-                    mtpEnabled = true; break;
+                    mtpEnabled = true; mtpExplicit = true; break;
+                case "--no-mtp":
+                    mtpEnabled = false; mtpExplicit = false; break;
+                case "--mtp-head":
+                    mtpHeadPath = next; i++; break;
+                case "--dflash":
+                    dflashPath = next; i++; break;
+                case "--reasoning-format":
+                    reasoningFormat = DotLLM.Tokenizers.Reasoning.ReasoningFormats.Parse(next ?? ""); i++; break;
                 case "--prefill-chunk-size" or "--ubatch-size":
                     prefillChunkSize = int.Parse(next!); i++; break;
+                case "--prefix-snapshots":
+                    prefixSnapshots = int.Parse(next ?? throw new ArgumentException("--prefix-snapshots requires a count."), System.Globalization.CultureInfo.InvariantCulture); i++; break;
+                case "--prefix-snapshot-host-budget":
+                    prefixSnapshotHostBudget = next ?? throw new ArgumentException("--prefix-snapshot-host-budget requires a size."); i++; break;
+                case "--prefix-snapshot-disk-dir":
+                    prefixSnapshotDiskDirectory = next ?? throw new ArgumentException("--prefix-snapshot-disk-dir requires a path."); i++; break;
+                case "--prefix-snapshot-disk-budget":
+                    prefixSnapshotDiskBudget = next ?? throw new ArgumentException("--prefix-snapshot-disk-budget requires a size."); i++; break;
+                case "--prompt-cache-step":
+                    promptCacheStep = int.Parse(next ?? throw new ArgumentException("--prompt-cache-step requires a token count."), System.Globalization.CultureInfo.InvariantCulture); i++; break;
+                case "--prompt-cache-step-keep":
+                    promptCacheStepKeep = int.Parse(next ?? throw new ArgumentException("--prompt-cache-step-keep requires a count."), System.Globalization.CultureInfo.InvariantCulture); i++; break;
                 case "--rope-scaling":
                     ropeScaling = next; i++; break;
                 case "--rope-freq-base":
@@ -254,6 +544,12 @@ public sealed record ServerOptions
                     maxResidentModels = int.Parse(next!); i++; break;
                 case "--resident-memory-budget":
                     residentMemoryBudgetBytes = long.Parse(next!); i++; break;
+                case "--allow-model-admin":
+                    allowModelAdmin = true; break;
+                case "--allow-lora-admin":
+                    allowLoraAdmin = true; break;
+                case "--max-messages":
+                    maxMessagesCli = int.Parse(next!, System.Globalization.CultureInfo.InvariantCulture); i++; break;
                 default:
                     // Positional: treat as model if not set
                     if (model is null && !arg.StartsWith('-'))
@@ -268,16 +564,24 @@ public sealed record ServerOptions
             Environment.Exit(1);
         }
 
-        string modelId = Path.GetFileNameWithoutExtension(model);
-        if (model.Contains('/'))
-            modelId = model.Split('/')[^1]; // last segment of repo
+        // Repo ids keep their final component; local GGUF paths (either separator, relative or absolute) drop the extension,
+        // so one file gets one id however its path was written (#1275).
+        int lastSeparator = Math.Max(model.LastIndexOf('/'), model.LastIndexOf('\\'));
+        string modelId = model[(lastSeparator + 1)..];
+        if (modelId.EndsWith(".gguf", StringComparison.OrdinalIgnoreCase))
+            modelId = modelId[..^5];
 
+        var snapshotOptions = BuildPrefixSnapshotOptions(prefixSnapshots, prefixSnapshotHostBudget, prefixSnapshotDiskDirectory, prefixSnapshotDiskBudget,
+            promptCacheStep, promptCacheStepKeep);
         return new ServerOptions
         {
             Model = model,
             Quant = quant,
             Device = device,
             GpuLayers = gpuLayers,
+            ContextSize = ctxSize,
+            MoeOffload = DotLLM.Core.Moe.MoeOffloadOptions.FromCli(new DotLLM.Core.Moe.MoeCliValues(moeOffloadMode, moeCacheMib,
+                moeCachePolicy, moeCold, moeCpuThreads, cpuMoe, nCpuMoe, moeCalibrate, ctxSize)),
             Threads = threads,
             DecodeThreads = decodeThreads,
             Host = host,
@@ -286,6 +590,12 @@ public sealed record ServerOptions
             CacheTypeV = cacheTypeV,
             PromptCacheEnabled = promptCacheEnabled,
             PromptCacheSize = promptCacheSize,
+            PrefixSnapshots = snapshotOptions.MaxEntries,
+            PrefixSnapshotHostBudgetBytes = snapshotOptions.HostBudgetBytes,
+            PrefixSnapshotDiskDirectory = snapshotOptions.DiskDirectory,
+            PrefixSnapshotDiskBudgetBytes = snapshotOptions.DiskBudgetBytes,
+            PromptCacheStep = snapshotOptions.StepTokens,
+            PromptCacheStepKeep = promptCacheStepKeep,
             UsePaged = usePaged,
             Warmup = new WarmupOptions
             {
@@ -297,11 +607,19 @@ public sealed record ServerOptions
                 : null,
             SpeculativeModel = speculativeModel,
             SpeculativeCandidates = speculativeCandidates,
+            PromptLookup = promptLookup ? DotLLM.Engine.PromptLookupOptions.Create(lookupDraft, lookupNgram) : null,
             MtpEnabled = mtpEnabled,
+            MtpExplicit = mtpExplicit,
+            MtpHeadPath = mtpHeadPath,
+            DFlashPath = dflashPath,
+            ReasoningFormat = reasoningFormat,
             PrefillChunkSize = prefillChunkSize,
             KeepAliveSeconds = keepAliveSeconds,
             MaxResidentModels = maxResidentModels,
             ResidentMemoryBudgetBytes = residentMemoryBudgetBytes,
+            AllowModelAdminApi = allowModelAdmin,
+            AllowLoraAdminApi = allowLoraAdmin,
+            MaxMessages = ResolveMaxMessages(maxMessagesCli, Environment.GetEnvironmentVariable(MaxMessagesEnvVar)),
             ModelId = modelId,
             RopeOverride = BuildRopeOverride(ropeScaling, ropeFreqBase, ropeScale,
                 yarnOrigCtx, yarnAttnFactor, yarnBetaFast, yarnBetaSlow),

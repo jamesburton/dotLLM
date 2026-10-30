@@ -121,8 +121,11 @@ public sealed unsafe class GptOssKernelTests
         // scoreSize must exceed the 8 KB stackalloc threshold to hit the
         // tiled online-softmax path: seqQ * seqKv > 2048 floats. Use a LARGE
         // sink (exp(10) ≈ 22k vs sum ≈ seqKv) so the sink roughly halves the
-        // output — far above the FastExp approximation noise (~1e-3) that the
-        // tiled path carries with or without sinks.
+        // output — far above the ~1e-3 noise the tiled path carries with or without
+        // sinks. (That noise was the FastExp approximation until #501 made the
+        // attention exp precise by default; what is left is tiling/online-softmax
+        // reassociation, which is smaller still. Under DOTLLM_FAST_EXP=1 the
+        // original ~1e-3 figure applies again.)
         const int seqQ = 1, seqKv = 3000, numHeads = 2, numKvHeads = 1, headDim = 8;
         var rng = new Random(23);
         var (q, k, v) = RandomQkv(rng, seqQ, seqKv, numHeads, numKvHeads, headDim);
@@ -179,9 +182,10 @@ public sealed unsafe class GptOssKernelTests
         var rng = new Random(5);
         var (q, k, v) = RandomQkv(rng, seqQ, seqKv, numHeads, numKvHeads, headDim);
 
-        // Baseline: exact-softmax scalar reference (the sink path uses exact
-        // TensorPrimitives softmax; the sink-free fast path uses approximate
-        // FastExp, which differs by ~1%).
+        // Baseline: scalar reference. The sink path uses the exact TensorPrimitives
+        // softmax; the sink-free path uses FastMath.ExpSumAndStore, which since #501
+        // is also precise by default (it was the ~1%-error Schraudolph approximation
+        // before, and still is under DOTLLM_FAST_EXP=1).
         float[] baseline = new float[seqQ * numHeads * headDim];
         Attention.ExecuteScalar(q, k, v, baseline, seqQ, seqKv, numHeads, numKvHeads, headDim, 0);
 

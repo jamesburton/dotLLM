@@ -316,4 +316,95 @@ public sealed class GatedDeltaNetScanTests
 
         Assert.All(output, v => Assert.Equal(sentinel, v));
     }
+
+    /// <summary>
+    /// Issue #1194 read-only verify: a read-only scan must emit exactly the outputs (and deltas) of the in-place scan while leaving the
+    /// state untouched, and replaying rows 0..r in place on that untouched state must rebuild, bit for bit, the state the in-place scan
+    /// leaves after rows 0..r, for r = 0 (accept nothing), a partial block, and every row. Several value heads share key heads (tiled),
+    /// and the starting state is far from zero. Negative control: replaying one row fewer must NOT match.
+    /// </summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(3)]
+    [InlineData(7)]
+    public void ReadOnlyScan_ThenInPlaceReplay_IsBitIdenticalToTheInPlaceScan(int lastRow)
+    {
+        const int nVHead = 6, nKHead = 3, dState = 16, seqLen = 8;
+        var rng = new Random(1194 + lastRow);
+        float[] Rand(int n, float lo, float hi) => Enumerable.Range(0, n).Select(_ => lo + (float)rng.NextDouble() * (hi - lo)).ToArray();
+        int stateLen = nVHead * dState * dState, qk = seqLen * nKHead * dState, vv = seqLen * nVHead * dState;
+        float[] initial = Rand(stateLen, -2f, 2f);
+        float[] q = Rand(qk, -1f, 1f), k = Rand(qk, -1f, 1f), v = Rand(vv, -3f, 3f);
+        float[] g = Rand(seqLen * nVHead, 0.5f, 1f), beta = Rand(seqLen * nVHead, 0.1f, 1f);
+        GatedDeltaNetScan.L2NormalizeHeads(q, dState);
+        GatedDeltaNetScan.L2NormalizeHeads(k, dState);
+
+        // Reference: the ordinary in-place scan over rows 0..lastRow (the state plain decoding of those tokens leaves).
+        float[] expected = (float[])initial.Clone();
+        float[] refOut = new float[vv];
+        GatedDeltaNetScan.Execute(expected, q, k, v, g, beta, refOut, nVHead, nKHead, dState, lastRow + 1);
+        float[] fullOut = new float[vv];
+        GatedDeltaNetScan.Execute((float[])initial.Clone(), q, k, v, g, beta, fullOut, nVHead, nKHead, dState, seqLen);
+
+        // Read-only verify over all rows, recording deltas.
+        float[] live = (float[])initial.Clone();
+        float[] roOut = new float[vv];
+        float[] deltas = new float[vv];
+        GatedDeltaNetScan.Execute(live, q, k, v, g, beta, roOut, nVHead, nKHead, dState, seqLen,
+            snapshotRows: seqLen, deltaRecord: deltas, readOnlyState: true);
+        Assert.Equal(initial, live);     // untouched
+        Assert.Equal(fullOut, roOut);    // bit-identical outputs
+
+        GatedDeltaNetScan.Replay(live, default, k, g, deltas, nVHead, nKHead, dState, lastRow + 1);
+        Assert.Equal(expected, live);
+
+        if (lastRow > 0)
+        {
+            float[] shortReplay = (float[])initial.Clone();
+            GatedDeltaNetScan.Replay(shortReplay, default, k, g, deltas, nVHead, nKHead, dState, lastRow);
+            Assert.NotEqual(expected, shortReplay);
+        }
+        Assert.NotEqual(initial, expected);   // the rows moved the state: an untouched state would not pass the replay check
+    }
+
+    /// <summary>
+    /// #1367: the head-parallel vectorised walk must equal the scalar reference bit for bit - output, deltas and final state - for the
+    /// in-place walk, a stateSource start, and the read-only verify walk, serial and pooled, including head counts that do not divide the threads.
+    /// </summary>
+    [Theory]
+    [InlineData(6, 2, 128, 5, false, false, false)]
+    [InlineData(6, 2, 128, 5, true, false, false)]
+    [InlineData(6, 2, 128, 5, false, true, false)]
+    [InlineData(7, 7, 16, 3, true, true, false)]
+    [InlineData(6, 2, 128, 5, false, true, true)]
+    [InlineData(5, 1, 8, 1, false, false, true)]
+    [InlineData(6, 3, 24, 4, true, true, true)]
+    public void SimdWalk_IsBitIdenticalToScalar(int nV, int nK, int dS, int seqLen, bool fromSource, bool readOnly, bool pooled)
+    {
+        var rng = new Random(1367 + nV * 7 + dS + seqLen);
+        float[] R(int n, float lo, float hi) { var arr = new float[n]; for (int i = 0; i < n; i++) arr[i] = lo + (hi - lo) * rng.NextSingle(); return arr; }
+        float[] state0 = R(nV * dS * dS, -0.5f, 0.5f), src = R(nV * dS * dS, -0.5f, 0.5f);
+        float[] q = R(seqLen * nK * dS, -1, 1), k = R(seqLen * nK * dS, -1, 1), v = R(seqLen * nV * dS, -1, 1);
+        float[] g = R(seqLen * nV, 0.5f, 0.99f), beta = R(seqLen * nV, 0.1f, 0.9f);
+        int snap = Math.Min(seqLen, 3);
+
+        (float[] o, float[] st, float[] d) Run(bool scalar)
+        {
+            float[] st = (float[])state0.Clone(), o = new float[seqLen * nV * dS], d = new float[snap * nV * dS];
+            GatedDeltaNetScan.ForceScalar = scalar;
+            using var pool = pooled && !scalar ? new DotLLM.Cpu.Threading.ComputeThreadPool(3) : null;
+            try
+            {
+                GatedDeltaNetScan.Execute(st, q, k, v, g, beta, o, nV, nK, dS, seqLen, snapshotRows: snap,
+                    stateSource: fromSource ? src : default, deltaRecord: d, readOnlyState: readOnly, pool: pool);
+            }
+            finally { GatedDeltaNetScan.ForceScalar = false; }
+            return (o, st, d);
+        }
+        var a = Run(true);
+        var b = Run(false);
+        for (int i = 0; i < a.o.Length; i++) Assert.Equal(BitConverter.SingleToInt32Bits(a.o[i]), BitConverter.SingleToInt32Bits(b.o[i]));
+        for (int i = 0; i < a.d.Length; i++) Assert.Equal(BitConverter.SingleToInt32Bits(a.d[i]), BitConverter.SingleToInt32Bits(b.d[i]));
+        for (int i = 0; i < a.st.Length; i++) Assert.Equal(BitConverter.SingleToInt32Bits(a.st[i]), BitConverter.SingleToInt32Bits(b.st[i]));
+    }
 }

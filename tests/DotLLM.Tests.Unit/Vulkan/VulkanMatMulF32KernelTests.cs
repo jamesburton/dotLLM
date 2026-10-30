@@ -26,8 +26,20 @@ public class VulkanMatMulF32KernelTests
     [InlineData(17, 33, 5)]              // non-multiple-of-workgroup sizes
     [InlineData(256, 576, 1)]            // SmolLM hidden-size GEMV
     [InlineData(576, 1536, 1)]           // SmolLM up_proj GEMV
+    [InlineData(1, 2048, 1)]             // MoE shared-expert gate logit (single output row)
+    [InlineData(256, 2048, 1)]           // MoE router
+    [InlineData(2048, 512, 1)]           // MoE shared-expert down
+    [InlineData(33, 1028, 1)]            // K/4 not a multiple of the 128-thread stride
+    [InlineData(7, 30, 1)]               // K % 4 != 0 falls back to the per-cell kernel
     [InlineData(128, 64, 8)]             // batched matmul
     [InlineData(576, 576, 4)]            // prefill-ish
+    [InlineData(256, 2048, 512)]         // MoE router at prefill (tiled kernel)
+    [InlineData(37, 45, 33)]             // tiled: tails in M, N and K (K % 16 != 0)
+    [InlineData(32, 16, 32)]             // tiled: exactly one tile
+    [InlineData(65, 17, 2)]              // tiled: N = 2 (second tile row mostly empty)
+    [InlineData(256, 2048, 2048)]        // MoE router at 2048 tokens: 256 groups -> the plain (non-pipelined) 64x32 shader
+    [InlineData(301, 77, 1030)]          // plain 64x32 shader, ragged M / N / K
+    [InlineData(70, 50, 60)]             // 64x32 tails: M = 70 (second M tile 6 wide), N = 60
     public void Launch_MatchesCpuReference(int m, int k, int n)
     {
         SkipIfUnavailable(out string spvDir);

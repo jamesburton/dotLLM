@@ -104,9 +104,35 @@ Models signal tool calls in different formats. Each parser handles one conventio
 | `LlamaToolCallParser` | `<\|python_tag\|>` | `name` + `parameters` | Llama 3.1+ Instruct | `<\|python_tag\|>{"name":"f","parameters":{...}}` |
 | `HermesToolCallParser` | `<tool_call>`...`</tool_call>` | `name` + `arguments` | Hermes, Qwen tool-calling | `<tool_call>{"name":"f","arguments":{...}}</tool_call>` |
 | `XmlToolCallParser` | `<tool_call>`...`</tool_call>` (delegates to Hermes) | `name` + `arguments` | SmolLM3 `xml_tools` branch, Qwen3/Hermes | `<tool_call>{"name":"f","arguments":{...}}</tool_call>` |
+| `QwenXmlToolCallParser` | `<tool_call>`/`<function=NAME>`/`<parameter=KEY>` | XML (values are text) | Qwen3.5 / 3.6 / 3.8, Ornith, Qwen3-Coder | `<tool_call>\n<function=f>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>` |
+| `Gemma4ToolCallParser` | `<\|tool_call>call:` | Gemma dict syntax (bare keys, `<\|"\|>` strings) | Gemma-4 | `<\|tool_call>call:f{city:<\|"\|>Paris<\|"\|>,n:3}<tool_call\|>` |
+| `GlmToolCallParser` | `<tool_call>NAME<arg_key>` | XML (`<arg_key>k</arg_key><arg_value>v</arg_value>`) | GLM-4.5 / 4.6 / 4.7 (incl. GLM-4.7-Flash) | `<tool_call>f<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>` |
+| `GraniteToolCallParser` | `<\|tool_call\|>` | `name` + `arguments` (JSON list) | IBM Granite 3.x | `<\|tool_call\|>[{"name":"f","arguments":{...}}]` |
+| `HarmonyToolCallParser` | `to=functions.NAME` + `<\|message\|>` | JSON object body | gpt-oss (OpenAI Harmony) | `<\|channel\|>commentary to=functions.f <\|constrain\|>json<\|message\|>{"city":"Paris"}<\|call\|>` |
 | `MistralToolCallParser` | `[TOOL_CALLS]` | `name` + `arguments` | Mistral Instruct | `[TOOL_CALLS][{"name":"f","arguments":{...}}]` |
 | `PythonicToolCallParser` | Python call syntax | positional/kwargs → `arguments` | SmolLM3 (`python_tools` branch) | `[f(city="Tokyo")]` |
 | `GenericToolCallParser` | None (bare JSON) | `name` + `arguments`/`parameters` | Fallback **and all constrained output** | `{"name":"f","arguments":{...}}` |
+
+**Llama shapes (#771).** `LlamaToolCallParser` accepts everything Llama 3.x really emits after `<|python_tag|>`: `{"name","parameters"}`, Llama-3.2-1B's `{"type":"function","function":"get_weather","parameters":{...}}` (the `function` string *is* the name), the OpenAI envelope `{"type":"function","function":{"name","arguments"}}`, several calls as a JSON array or separated by `;`/whitespace, and the built-in-tool pythonic form `brave_search.call(query="...")`. The name/envelope normalization lives in `ToolCallJsonHelper.ParseSingle`, so every JSON-based parser benefits. Without the marker, only a response that is *entirely* tool-call JSON counts (prose quoting a schema does not).
+
+**Qwen XML (#771)** follows llama.cpp's `common_chat_params_init_qwen3_coder`: the closing `</tool_call>` is optional (it is a stop sequence for Hermes, and the model often ends the turn first), a bare `<function=` block without `<tool_call>` is accepted, multiple blocks are parallel calls, text before the first call (a leading `</think>`, reasoning, prose) is ignored, and a `<function>` without its `</function>` is a truncated generation and is **not** reported (never execute half a call). The parser is a superset of Hermes: a `<tool_call>` body that is JSON is parsed as Hermes JSON. Each value has exactly one template newline stripped from each end (`<parameter=k>\nVALUE\n</parameter>`); a declared `string` parameter is kept verbatim, integer/number/boolean/object/array are parsed as JSON, and with no schema the text is JSON when valid, else a string. Because the server's `</tool_call>` stop sequence would cut a parallel-call completion after the first call, `ToolChoiceBinder` removes it for this parser.
+
+**Gemma-4 (#776)** mirrors `common_chat_params_init_gemma4`: `call:NAME{key:value,...}` where strings are delimited by the `<|"|>` token and bare values are numbers/`true`/`false`/`null`, with nested objects and arrays. The reader is a recursive-descent scanner (string values may contain `{ } , :`); an unterminated argument object is not reported; `<eos>`/`<turn|>` text after the call is ignored. Separately, generation must *stop*: the GGUF declares `eos_token_id` = `<turn|>` (106) but a tool-call turn ends with `<eos>` (id 1), which used to run to `max_tokens` and leak `<eos><eos>...` into the response. `EndOfGenerationTokens` (used by `TextGenerator` and the batch scheduler) now stops on the declared EOS **plus** `<eos>`, `<end_of_turn>`, `<|eot_id|>`, `<|eom_id|>`, `<|im_end|>`, `<turn|>` when the vocabulary has an entry with exactly that text (found by scanning token text: Gemma-4's `<eos>` is **not** pre-split by `Encode`, so encoding the candidate would miss it; pinned by `EndOfGenerationRealTokenizerTests` against the real E4B vocabulary, and verified live: a tool turn now ends at 14 completion tokens instead of running to `max_tokens`), as llama.cpp's EOG set does. (`<|end|>` / `<|endoftext|>` are deliberately excluded: they delimit messages or pad in some families.) Ids the model file declares as `eot`/`eom` are added too (#797, GLM).
+
+**GLM-4.5+ (#797)** mirrors `common_chat_params_init_glm_4_5`: `<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>`. Several blocks are parallel calls; the closing `</tool_call>` is optional (the server's `</tool_call>` stop sequence trims it, so the text the parser sees usually ends at `</arg_value>`, and `ToolChoiceBinder` removes that stop for this parser, as for Qwen XML, so parallel calls survive); a block whose last `<arg_value>` never closed is a truncated generation and is not reported. Values are text: the template writes strings verbatim and everything else as JSON, so a declared `string` parameter keeps its text and every other declared type is parsed as JSON (no schema: JSON when valid, else a string). Detection is by template (`<arg_key>`; GLM-4.7-Flash's architecture is `deepseek2`, so there is no architecture fallback), checked **before** the bare `<tool_call>` Hermes test. Generation must also *stop*: GLM declares `eos_token_id` = `<|endoftext|>` but ends an ordinary turn with `<|user|>` (GGUF `tokenizer.ggml.eot_token_id`) and a tool call with `<|observation|>` (`eom_token_id`); `EndOfGenerationTokens` now also stops on the `eot`/`eom` ids the model file declares (`ITokenizer.ExtraEndOfGenerationTokenIds`, read by `GgufBpeTokenizerFactory`), which fixed `<|user|>You are ChatGPT...` running on to `max_tokens` (pinned against the real vocabulary by `EndOfGenerationRealTokenizerTests`).
+
+**Recursive Flint (#1173)** uses the same GLM-4.5 envelope (its template carries `<arg_key>`, so `GlmToolCallParser` is picked) plus `<|system|>` / `<|developer|>` / `<|user|>` / `<|assistant|>` / `<|observation|>` turns. The OpenAI `developer` role passes straight through to the template (rendered `<|developer|>`); prior assistant `reasoning_content` is re-rendered as `<think>…</think>` before the content. The generation prompt is a bare `<|assistant|>`, so the turn is never assumed to open in thinking: a model-emitted leading `<think>` is split into `reasoning_content`. `<|user|>` and `<|observation|>` are end-of-generation for pre-tokenizer `flint` even when the file lists no `eot`/`eom` ids (as llama.cpp forces them). Forced `tool_choice` uses the format-agnostic JSON-schema constraint (bare `{"name":…,"arguments":…}`), not the `<arg_key>` envelope. Pinned by `FlintServerFlowTests`.
+
+**SmolLM3 tools (#797).** SmolLM3's template reads its tool list from `xml_tools` / `python_tools` (HF callers pass `xml_tools=...`), never from `tools`, and wraps assistant turns in HF's `{% generation %}` mask markers. The Jinja parser rejected `generation`, so the *whole template* failed to parse and the server silently fell back to the plain completion transcript (no tools, no `/think` switch, wrong chat format: the model replied that it had no tools). `{% generation %}`/`{% endgeneration %}` are now accepted as no-ops (rewritten as comments, keeping `-` whitespace control), and a template that mentions `xml_tools` but not `tools` has the request's `tools` aliased to `xml_tools` unless the client chose a branch with `chat_template_kwargs` (`python_tools`/`xml_tools`).
+**Gemma-4 (#776)** mirrors `common_chat_params_init_gemma4`: `call:NAME{key:value,...}` where strings are delimited by the `<|"|>` token and bare values are numbers/`true`/`false`/`null`, with nested objects and arrays. The reader is a recursive-descent scanner (string values may contain `{ } , :`); an unterminated argument object is not reported; `<eos>`/`<turn|>` text after the call is ignored. Separately, generation must *stop*: the GGUF declares `eos_token_id` = `<turn|>` (106) but a tool-call turn ends with `<eos>` (id 1), which used to run to `max_tokens` and leak `<eos><eos>...` into the response. `EndOfGenerationTokens` (used by `TextGenerator` and the batch scheduler) now stops on the declared EOS **plus** `<eos>`, `<end_of_turn>`, `<|eot_id|>`, `<|eom_id|>`, `<|im_end|>`, `<turn|>`, `<|call|>`, `<|return|>` (Harmony, #798) when the vocabulary has an entry with exactly that text (found by scanning token text: Gemma-4's `<eos>` is **not** pre-split by `Encode`, so encoding the candidate would miss it; pinned by `EndOfGenerationRealTokenizerTests` against the real E4B vocabulary, and verified live: a tool turn now ends at 14 completion tokens instead of running to `max_tokens`), as llama.cpp's EOG set does. (`<|end|>` / `<|endoftext|>` are deliberately excluded: they delimit messages or pad in some families.)
+
+**Harmony / gpt-oss (#798)** follows llama.cpp's gpt-oss handling: a tool call is a *commentary* message whose recipient is `functions.NAME`, with a JSON object body, ended by `<|call|>`. The recipient may follow the channel name (`<|channel|>commentary to=functions.f <|constrain|>json<|message|>`) or sit in the role header (`<|start|>assistant to=functions.f<|channel|>commentary json<|message|>`); both parse. Several messages are parallel calls (ids `call_0`, `call_1`, ...). The terminator is optional: `<|call|>` is an end-of-generation token and is never in the decoded text. Recipients that are not `functions.*` (the built-in `browser` / `python` tools) are not reported, and a body that is not complete JSON is a truncated generation and is not reported (never execute half a call). Arguments are coerced to the tool schema. The parser works on raw output and on the output of `HarmonySplitter`, which routes `analysis` to `reasoning_content`, `final` to `content`, and passes a recipient message through verbatim (the header is buffered until `<|message|>`, so `IsToolCallStart` sees the whole marker at once and the streaming suppressor holds the call back from its first chunk: no `<|channel|>commentary to=...` leaks into `delta.content`). Because Harmony ends the *analysis* message with `<|end|>` and then continues, `<|end|>` must not be a stop string for these models, see [SERVER.md](SERVER.md#reasoning--thinking-models-767).
+
+**Granite (#796)** mirrors `common_chat_params_init_granite`: the `<|tool_call|>` special token followed by a JSON list of `{"name","arguments"}` objects; the marker may repeat per call and prose before it is ignored. Granite previously fell through to the heuristic `GenericToolCallParser`, so the call *parsed* but the streaming suppressor (deliberately off for the generic parser) let `<|tool_call|>` and the raw JSON leak into `delta.content` as well as arriving as `tool_calls`. A marker-based parser lets the suppressor hold the call back from the marker onwards. Granite-3.3-2b also regularly omits `name` when one tool is offered (`<|tool_call|>[{"arguments": {...}}]`, deterministic at temperature 0); with the request's tools known and exactly one declared the call is attributed to that tool, with several tools it is ambiguous and is not reported.
+
+### Argument type coercion
+
+`IToolCallParser.TryParse(text, tools)` (default interface method) coerces each call's arguments to its tool's JSON Schema via `ToolArgumentCoercer`: `"17"` becomes `17` for `integer`/`number`, `"true"` becomes `true`, JSON text becomes an object/array, and a number/bool becomes a string where the schema says `string` (Gemma writes `zip:12345` bare). Union types (`type: [..]`, `anyOf`) are honoured, nested `properties`/`items` are recursed, a `string` in the union keeps the value verbatim, and anything that cannot be coerced is left exactly as the model wrote it. The server and CLI pass the request's tools; the schema-free `TryParse(text)` still works. The XML parser overrides the method because its wire format has no types at all.
 
 ### Key Normalization: `parameters` vs `arguments`
 
@@ -134,10 +160,15 @@ All parsers return `null` on malformed input — they never throw. This is criti
 
 `ToolCallParserFactory.Create(Architecture, chatTemplate?)` selects the appropriate parser via a two-tier heuristic:
 
-**Tier 1 — Template content (highest priority):**
+**Tier 1 — Template content (highest priority; ORDER MATTERS):**
 ```
-"python_tools" without "xml_tools"    → PythonicToolCallParser
-Template contains "<tool_call>"       → XmlToolCallParser
+Template contains "<|channel|>" AND "<|message|>"   → HarmonyToolCallParser
+Template contains "<|tool_call>"                   → Gemma4ToolCallParser
+Template contains "<|tool_call|>"                  → GraniteToolCallParser
+"python_tools" without "xml_tools"                 → PythonicToolCallParser
+Template contains "<arg_key>"                      → GlmToolCallParser      (before "<tool_call>"!)
+Template contains "<function=" AND "<parameter="   → QwenXmlToolCallParser   (before the next line!)
+Template contains "<tool_call>"                    → XmlToolCallParser
 Template contains "python_tag"        → LlamaToolCallParser
 Template contains "[TOOL_CALLS]"      → MistralToolCallParser
 ```
@@ -147,6 +178,10 @@ Template contains "[TOOL_CALLS]"      → MistralToolCallParser
 Architecture.Llama            → LlamaToolCallParser
 Architecture.Mistral          → MistralToolCallParser
 Architecture.Qwen / QwenMoe   → HermesToolCallParser
+Architecture.Qwen3MoeHybrid / Qwen3HybridDense → QwenXmlToolCallParser
+Architecture.Gemma4           → Gemma4ToolCallParser
+Architecture.Granite / GraniteMoe → GraniteToolCallParser
+Architecture.GptOss           → HarmonyToolCallParser
 Architecture.SmolLM3          → XmlToolCallParser
 Architecture.BitNet           → HermesToolCallParser
 *                             → GenericToolCallParser
@@ -283,6 +318,16 @@ var toolCalls = accumulator.TryParseCompleted();
 - Once `IsToolCallStart()` triggers: `Append()` returns `true` for all subsequent text — caller suppresses output.
 - After generation: `TryParseCompleted()` extracts the full tool call(s).
 
+**Marker-tail hold-back (#1287)** — what the server endpoints use: `AppendStreamable(text)` returns the part of the new
+text that is safe to stream now. Each parser declares its literal call openers (`IToolCallParser.StartMarkers`:
+`<tool_call>`, `<|python_tag|>`, `[TOOL_CALLS]`, `<|tool_call>`, `<|tool_call|>`, `<|tool_call_start|>`, `<function=`,
+Harmony's `<|start|>` / `<|channel|>` / `to=functions.`, and `{` for the generic bare-JSON parser). Text streams up to the
+first complete marker; only a trailing fragment that is a prefix of some marker (`<to`, `<|pyth`) is held, and released as
+soon as it stops matching. A parser heuristic with no literal marker (`IsToolCallStart`, e.g. a bare pythonic call) still
+stops emission where it fires. `EmittedLength` tells the caller where held text starts, so text that never parses into a
+call is delivered after generation. This applies to every parser, including a forced `tool_choice` (generic parser) and the
+generic parser as an unknown model's own parser: brace-bearing prose there is delayed until the end of the turn, not lost.
+
 ## Chat Template Integration
 
 The Jinja2 chat template engine (Step 16) handles tool definitions natively:
@@ -344,6 +389,19 @@ Available tools: {{ tools | tojson }}
 ```
 
 **Llama 3.1** uses `<|python_tag|>` and formats tools as a structured system prompt section. The `tojson` filter serializes tool definitions for embedding.
+
+### Rendering fidelity matters for tool round trips (#771)
+
+The harness saw Llama-3.1-8B "ignore the tool result" on the second turn. The parser was not at fault (the call parsed before and after). Diagnosis found two evaluator deviations from Jinja2 (and therefore from llama.cpp's minja and HF `apply_chat_template`); both are fixed and pinned by `JinjaLlama31ToolRoundTripTests` against the byte output of reference Jinja2 3.1.6 and llama.cpp `/apply-template`. They are real rendering bugs affecting every Llama-3.x prompt, but they were **not isolated as the sole cause** of the WARN (each fix was not toggled separately), and llama.cpp on the identical, byte-matching prompt also gave a turn-2 answer that did not use the result — the 8B Q4_K_M round trip is marginal and sensitive to numerics:
+
+- **Trailing newline.** Jinja2's default `keep_trailing_newline=False` drops one trailing newline of the template source. Llama-3.x's GGUF template ends `{%- endif %}\n`, so dotLLM prompts ended `<|start_header_id|>assistant<|end_header_id|>\n\n\n` (an extra blank line the model never trained on). `JinjaChatTemplate` now drops exactly one.
+- **`is iterable` on strings.** In Jinja2 a string is iterable. Llama-3.1's tool branch is `{% if message.content is mapping or message.content is iterable %}{{ message.content | tojson }}`, so a string tool result renders as a quoted, escaped JSON string; dotLLM used to render it raw.
+
+Result with both fixes (dotLLM, greedy): the 8B round trip now answers from the tool result ("...17 degrees Celsius and there is light rain") where before it said "The actual output of the function call is not provided". Llama-3.2-1B still re-calls the tool on turn 2 (model behaviour; llama.cpp cannot even parse the 1B's first-turn shape and returns HTTP 500).
+
+### Known gaps
+
+- **Hermes-family parallel calls are still truncated by the server's `</tool_call>` stop sequence** (Qwen3-4B-Instruct, SmolLM3, BitNet): generation stops after the first call's closing tag, so a second `<tool_call>` block is never produced. Only the Qwen XML parser has the stop removed (`ToolChoiceBinder`). Qwen-XML parallel calls are covered by unit tests, not yet by a real-model run.
 
 ## Multi-Turn Tool Use
 
@@ -457,6 +515,10 @@ The weather in Paris is 22°C and sunny.
 | `Tokenizers/ToolCallParsers/GenericToolCallParser.cs` | Fallback parser |
 | `Tokenizers/ToolCallParsers/ToolCallJsonHelper.cs` | Shared JSON extraction + normalization |
 | `Tokenizers/ToolCallParsers/XmlToolCallParser.cs` | SmolLM3 / Hermes XML envelope |
+| `Tokenizers/ToolCallParsers/QwenXmlToolCallParser.cs` | Qwen3-Coder XML (`<function=..><parameter=..>`): Qwen3.5/3.6/3.8, Ornith |
+| `Tokenizers/ToolCallParsers/Gemma4ToolCallParser.cs` | Gemma-4 `<\|tool_call>call:name{k:<\|"\|>v<\|"\|>}<tool_call\|>` |
+| `Tokenizers/ToolCallParsers/ToolArgumentCoercer.cs` | Schema-driven argument type coercion |
+| `Engine/Samplers/StopConditions/EndOfGenerationTokens.cs` | EOS + vocabulary end-of-turn tokens (llama.cpp EOG set) |
 | `Tokenizers/ToolCallParsers/PythonicToolCallParser.cs` | SmolLM3 Pythonic call syntax |
 | `Tokenizers/ToolCallParsers/ToolCallParserFactory.cs` | Auto-detection factory + `ForToolChoice` (constrained-output rule) |
 | `Engine/Constraints/ToolCallSchemaBuilder.cs` | Schema generation from tool definitions |
@@ -489,5 +551,5 @@ The weather in Paris is 22°C and sunny.
 
 Tracked under Wave 8 ([issue #121](https://github.com/kkokosa/dotLLM/issues/121)).
 
-- **Streaming chat emits raw tool-call text as `delta.content`.** `/v1/chat/completions` with `stream: true` passes every generated token through as `delta.content`; tool-call parsing runs only after the stream completes, at which point the finish reason is switched to `tool_calls`. Clients therefore see raw tool-call markup (e.g., `<tool_call>{...}</tool_call>` or `<|python_tag|>...`) before the final chunk. The **non-streaming** path is correct: `ToolCallDetector` runs before the response is serialized, tool text is replaced with structured `tool_calls`. Planned fix: incremental parser that buffers a rolling window, suppresses `delta.content` inside detected tool-call regions, and emits `delta.tool_calls` fragments per the OpenAI SSE contract.
+- **Streaming tool calls arrive whole, not as argument fragments.** `/v1/chat/completions` with `stream: true` no longer leaks tool-call markup as `delta.content` (#771): from the moment the model-family parser's `IsToolCallStart` recognises a call, tokens are held back (prose before the call still streams), and the parsed calls are emitted in the **final** chunk's `delta.tool_calls` with `finish_reason: "tool_calls"`. Held-back text that does not parse into a call (truncated generation) is delivered as one trailing `delta.content` chunk, never swallowed. What is NOT done: incremental `delta.tool_calls` fragments (partial `arguments` strings) — a call is reported only once complete. A marker split across tokens (`<tool` | `_call>`) no longer leaks its first fragment (#1287: only a could-become-marker tail is held, see above). The Anthropic stream behaves the same (`tool_use` blocks after the text block).
 - **`tool_choice` other than `auto` is not enforced.** The server parses `tool_choice` from the request but does not currently constrain decoding for `"required"` or specific-function values. The short-term plan is to reject unsupported `tool_choice` values with HTTP 400; long-term is constraint-driven enforcement via `ToolCallSchemaBuilder` + `JsonSchemaConstraint`.

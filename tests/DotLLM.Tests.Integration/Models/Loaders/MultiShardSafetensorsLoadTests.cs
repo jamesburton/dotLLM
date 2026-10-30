@@ -38,9 +38,7 @@ public sealed class MultiShardSafetensorsLoadTests
     private const string BaseRepo = "hf-internal-testing/tiny-random-LlamaForCausalLM";
     private const int MaxAllowedBytes = 50 * 1024 * 1024;
 
-    private static readonly string CacheDir = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-        ".dotllm", "test-cache");
+    private static readonly string CacheDir = DotLLM.Tests.Integration.Fixtures.TestModelDownloader.CacheDirectory;
 
     private readonly ITestOutputHelper _output;
 
@@ -98,8 +96,8 @@ public sealed class MultiShardSafetensorsLoadTests
     private string? TryBuildMultiShardFixture(out string? skipReason)
     {
         // Ensure the single-file fixture is available.
-        string singleDir = Path.Combine(
-            CacheDir, BaseRepo.Replace('/', Path.DirectorySeparatorChar));
+        string singleDir = DotLLM.Tests.Integration.Fixtures.TestRepoDirectory.Resolve(
+            BaseRepo, "model.safetensors", "config.json");
         string singleSafetensors = Path.Combine(singleDir, "model.safetensors");
         string singleConfig = Path.Combine(singleDir, "config.json");
 
@@ -146,8 +144,7 @@ public sealed class MultiShardSafetensorsLoadTests
         }
 
         // Derive the sharded scratch directory alongside the single-file cache.
-        string shardRoot = Path.Combine(
-            CacheDir, BaseRepo.Replace('/', Path.DirectorySeparatorChar) + "--sharded-2");
+        string shardRoot = singleDir + "--sharded-2";
         string shardA = Path.Combine(shardRoot, "model-00001-of-00002.safetensors");
         string shardB = Path.Combine(shardRoot, "model-00002-of-00002.safetensors");
         string indexPath = Path.Combine(shardRoot, "model.safetensors.index.json");

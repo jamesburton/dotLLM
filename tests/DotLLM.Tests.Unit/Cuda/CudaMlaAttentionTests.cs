@@ -14,6 +14,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// floating-point reductions in the online softmax / V accumulation.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaMlaAttentionTests : IDisposable
 {
     private const float Tolerance = 1e-3f;

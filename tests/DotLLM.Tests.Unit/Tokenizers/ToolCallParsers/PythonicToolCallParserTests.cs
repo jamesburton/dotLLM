@@ -157,4 +157,61 @@ public sealed class PythonicToolCallParserTests
     {
         Assert.False(_parser.IsToolCallStart("just a word"));
     }
+
+    // ── Liquid AI LFM2 / LFM2.5 (#1015): <|tool_call_start|>[fn(a='x'), g(b=2)]<|tool_call_end|> ──
+
+    [Fact]
+    public void TryParse_Lfm2Wrapper_SingleCall_SingleQuotedString()
+    {
+        const string text = "<|tool_call_start|>[get_candidate_status(candidate_id='12345')]<|tool_call_end|>Checking.";
+
+        var calls = _parser.TryParse(text);
+
+        Assert.NotNull(calls);
+        Assert.Single(calls);
+        Assert.Equal("get_candidate_status", calls![0].FunctionName);
+        using var doc = JsonDocument.Parse(calls[0].Arguments);
+        Assert.Equal("12345", doc.RootElement.GetProperty("candidate_id").GetString());
+    }
+
+    [Fact]
+    public void TryParse_Lfm2Wrapper_ParallelCalls_AndEscapedQuote()
+    {
+        const string text = "<|tool_call_start|>[search(query='it\\'s', n=3), now()]<|tool_call_end|>";
+
+        var calls = _parser.TryParse(text);
+
+        Assert.NotNull(calls);
+        Assert.Equal(2, calls!.Length);
+        Assert.Equal("search", calls[0].FunctionName);
+        using var doc = JsonDocument.Parse(calls[0].Arguments);
+        Assert.Equal("it's", doc.RootElement.GetProperty("query").GetString());
+        Assert.Equal(3, doc.RootElement.GetProperty("n").GetInt32());
+        Assert.Equal("now", calls[1].FunctionName);
+    }
+
+    [Fact]
+    public void TryParse_Lfm2Wrapper_UnterminatedStream_StillParsesOpenList()
+    {
+        // Stop token (<|im_end|>) can cut the stream before <|tool_call_end|>.
+        var calls = _parser.TryParse("<|tool_call_start|>[get_time(zone='UTC')]");
+
+        Assert.NotNull(calls);
+        Assert.Equal("get_time", calls![0].FunctionName);
+    }
+
+    [Fact]
+    public void IsToolCallStart_Lfm2Wrapper_True()
+    {
+        Assert.True(_parser.IsToolCallStart("<|tool_call_start|>"));
+    }
+
+    [Fact]
+    public void Factory_Lfm2Template_And_Arch_RouteToPythonic()
+    {
+        var byTemplate = ToolCallParserFactory.Create(DotLLM.Core.Configuration.Architecture.Llama,
+            "{{ bos_token }}...<|tool_call_start|>[...]<|tool_call_end|>");
+        Assert.IsType<PythonicToolCallParser>(byTemplate);
+        Assert.IsType<PythonicToolCallParser>(ToolCallParserFactory.Create(DotLLM.Core.Configuration.Architecture.Lfm2Moe));
+    }
 }

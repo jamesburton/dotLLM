@@ -29,6 +29,7 @@
 //                                    out = x/(1+exp(-alpha*x)) * (y+1).
 
 #include <math.h>
+#include <cuda_fp16.h>
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -80,6 +81,49 @@ __device__ __forceinline__ float block_reduce_max_128(float v, float* shared)
     }
     __syncthreads();
     return shared[0];
+}
+
+// Block-wide (128 threads) top-k over s_vals[0..n) in shared memory: k rounds of a parallel arg-max. Equal to the old
+// single-thread scan exactly: the larger value wins and, on ties, the lower index (the scan's strict `>`); NaN and -inf
+// are never chosen (best_idx stays -1 when nothing beats -inf). Chosen entries are overwritten with -inf in s_vals.
+// Was a serial scan on thread 0 with a "claimed" inner loop: ~210 us per token for 256 experts / top-6 on an RTX 3060,
+// about 10 ms per decoded token on Flint (#1202 profile); this is a few microseconds.
+__device__ __forceinline__ void block_topk_128(float* s_vals, const int n, const int k, int* sel_idx, float* sel_val)
+{
+    __shared__ float s_wv[4];
+    __shared__ int s_wi[4];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int slot = 0; slot < k; slot++)
+    {
+        float bv = -INFINITY;
+        int bi = -1;
+        for (int i = threadIdx.x; i < n; i += blockDim.x)
+        {
+            float v = s_vals[i];
+            if (v > bv) { bv = v; bi = i; }
+        }
+        for (int off = 16; off > 0; off >>= 1)
+        {
+            float ov = __shfl_down_sync(0xFFFFFFFF, bv, off);
+            int oi = __shfl_down_sync(0xFFFFFFFF, bi, off);
+            if (oi >= 0 && (ov > bv || (ov == bv && (bi < 0 || oi < bi)))) { bv = ov; bi = oi; }
+        }
+        if (lane == 0) { s_wv[warp] = bv; s_wi[warp] = bi; }
+        __syncthreads();
+        if (threadIdx.x == 0)
+        {
+            for (int w = 1; w < 4; w++)
+            {
+                float ov = s_wv[w];
+                int oi = s_wi[w];
+                if (oi >= 0 && (ov > bv || (ov == bv && (bi < 0 || oi < bi)))) { bv = ov; bi = oi; }
+            }
+            sel_idx[slot] = bi;
+            sel_val[slot] = bv;
+            if (bi >= 0) s_vals[bi] = -INFINITY;
+        }
+        __syncthreads();
+    }
 }
 
 // ── moe_gate_bias_add_f32 ────────────────────────────────────────────────
@@ -191,35 +235,209 @@ extern "C" __global__ void __launch_bounds__(128) moe_softmax_topk_f32(
         s_probs[i] = s_probs[i] * inv_sum;
     __syncthreads();
 
-    // Pass 4: top-k selection. Single-threaded max-scan with index-stable ties
-    // (matches MoeSwiGluMlp.SelectTopK exactly: strict `>` keeps the lower
-    // index on ties).
+    // Pass 4: top-k selection, index-stable ties (matches MoeSwiGluMlp.SelectTopK exactly: the lower index wins).
+    // top_k is small (typically 2..8); capped at 64 — DeepSeek-V2 / V3 use 6.
+    __shared__ int   sel_idx[64];
+    __shared__ float sel_prob[64];
+    block_topk_128(s_probs, num_experts, top_k, sel_idx, sel_prob);
     if (threadIdx.x == 0)
     {
-        // Local stack-resident "claimed" array and outputs. top_k is small
-        // (typically 2..8); cap at 64 to be safe — DeepSeek-V2 / V3 use 6.
-        int   sel_idx[64];
-        float sel_prob[64];
-        for (int slot = 0; slot < top_k; slot++)
-        {
-            int   best_idx = -1;
-            float best_val = -INFINITY;
-            for (int i = 0; i < num_experts; i++)
-            {
-                bool claimed = false;
-                for (int p = 0; p < slot; p++) { if (sel_idx[p] == i) { claimed = true; break; } }
-                if (claimed) continue;
-                float v = s_probs[i];
-                if (v > best_val) { best_val = v; best_idx = i; }
-            }
-            sel_idx[slot] = best_idx;
-            sel_prob[slot] = best_val;
-        }
         for (int slot = 0; slot < top_k; slot++)
         {
             topk_idx[(size_t)t * top_k + slot] = sel_idx[slot];
             topk_weight[(size_t)t * top_k + slot] = sel_prob[slot];
         }
+    }
+}
+
+// ── moe_sigmoid_topk_f32 ─────────────────────────────────────────────────
+//
+// Sigmoid routing (Flint, #1172; llama.cpp build_moe_ffn LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID): probs =
+// sigmoid(logits), top-k on probs (no selection bias here), gating weights = the chosen probs, optionally
+// renormalised with the sum clamped at 6.103515625e-5 exactly as MoeSwiGluMlp.Route does. Same launch shape and
+// index-stable tie rule as moe_softmax_topk_f32 (one block per token, 128 threads, dynamic shared num_experts floats).
+extern "C" __global__ void __launch_bounds__(128) moe_sigmoid_topk_f32(
+    const float* __restrict__ logits,      // [seq_len, num_experts]
+    int*   __restrict__ topk_idx,          // [seq_len, top_k]
+    float* __restrict__ topk_weight,       // [seq_len, top_k]
+    const int seq_len, const int num_experts, const int top_k, const int normalize)
+{
+    int t = blockIdx.x;
+    if (t >= seq_len) return;
+
+    extern __shared__ float s_sig[];
+    const float* row = logits + (size_t)t * num_experts;
+    for (int i = threadIdx.x; i < num_experts; i += blockDim.x)
+        s_sig[i] = 1.0f / (1.0f + expf(-row[i]));
+    __syncthreads();
+
+    __shared__ int   sel_idx[64];
+    __shared__ float sel_prob[64];
+    block_topk_128(s_sig, num_experts, top_k, sel_idx, sel_prob);
+    if (threadIdx.x == 0)
+    {
+        float sum = 0.0f;
+        for (int slot = 0; slot < top_k; slot++)
+            sum += sel_prob[slot];
+        float inv = 1.0f;
+        if (normalize)
+        {
+            sum = fmaxf(sum, 6.103515625e-5f);
+            inv = 1.0f / sum;
+        }
+        for (int slot = 0; slot < top_k; slot++)
+        {
+            topk_idx[(size_t)t * top_k + slot] = sel_idx[slot];
+            topk_weight[(size_t)t * top_k + slot] = sel_prob[slot] * inv;
+        }
+    }
+}
+
+// ── moe_pow2_rescale_rows_f32 / moe_scale_rows_f32 ──────────────────────────
+//
+// F16-safe MoE down input for Q8_1 paths that store the block sum d * sum(q) in F16 (#1172, mirrors the CPU
+// MoeSwiGluMlp.RescaleDownInputForF16Sums from #1158 and llama.cpp build_amax_src1_f16): a row whose max|x| exceeds
+// 1024 is divided by 2^k, k = clamp(ceil(log2(amax / 1024)), 0, 127), and factors[row] = 2^k is multiplied back into
+// the projected row by moe_scale_rows_f32. Power-of-two scaling is exact, so untouched rows (factor 1) are bit-identical.
+// One block (256 threads) per row.
+extern "C" __global__ void __launch_bounds__(256) moe_pow2_rescale_rows_f32(
+    float* __restrict__ x, float* __restrict__ factors, const int n)
+{
+    __shared__ float s_max[8];
+    float* row = x + (size_t)blockIdx.x * n;
+    float a = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) a = fmaxf(a, fabsf(row[i]));
+    for (int off = 16; off > 0; off >>= 1) a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFF, a, off));
+    if ((threadIdx.x & 31) == 0) s_max[threadIdx.x >> 5] = a;
+    __syncthreads();
+    a = s_max[0];
+    for (int w = 1; w < (int)(blockDim.x >> 5); w++) a = fmaxf(a, s_max[w]);
+    if (!(a > 1024.0f))
+    {
+        if (threadIdx.x == 0) factors[blockIdx.x] = 1.0f;
+        return;
+    }
+    int k = (int)ceilf(log2f(a / 1024.0f));
+    k = k < 0 ? 0 : (k > 127 ? 127 : k);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) row[i] = ldexpf(row[i], -k);
+    if (threadIdx.x == 0) factors[blockIdx.x] = ldexpf(1.0f, k);
+}
+
+extern "C" __global__ void __launch_bounds__(256) moe_scale_rows_f32(
+    float* __restrict__ y, const float* __restrict__ factors, const int n)
+{
+    float f = factors[blockIdx.x];
+    if (f == 1.0f) return;
+    float* row = y + (size_t)blockIdx.x * n;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) row[i] *= f;
+}
+
+// ── moe_weighted_rows_sum_f32 ───────────────────────────────────────────────
+//
+// Grouped-decode combine (#1172): out[h] += sum_e topk_weight[slot[e]] * rows[e * hidden + h] for the K_active expert
+// rows of the single decode token, in e order (= increasing expert id, the per-expert loop's order). slot holds int64.
+extern "C" __global__ void __launch_bounds__(256) moe_weighted_rows_sum_f32(
+    float* __restrict__ out, const float* __restrict__ rows, const float* __restrict__ topk_weight,
+    const long long* __restrict__ slot, const int k_active, const int hidden)
+{
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= hidden) return;
+    float acc = out[h];
+    for (int e = 0; e < k_active; e++)
+        acc += topk_weight[slot[e]] * rows[(size_t)e * hidden + h];
+    out[h] = acc;
+}
+
+// ── moe_combine_bucketed_f32 ────────────────────────────────────────────────
+//
+// Multi-token combine of the bucketed expert body (#1202): every (token, slot) assignment owns one row of `rows`, laid
+// out expert by expert (ascending id). out[t, h] += sum topk_weight[t, slot] * rows[pos[t, slot], h], summed in
+// ascending row position = ascending expert id, the order of the per-expert axpy loop it replaces, so the result is
+// identical to it. pos < 0 marks an assignment with no row (an out-of-range expert id). One block per token.
+#define MOE_COMBINE_MAX_K 32
+extern "C" __global__ void __launch_bounds__(256) moe_combine_bucketed_f32(
+    float* __restrict__ out, const float* __restrict__ rows, const float* __restrict__ topk_weight,
+    const int* __restrict__ pos, const int seq_len, const int hidden, const int top_k)
+{
+    const int t = blockIdx.x;
+    if (t >= seq_len) return;
+    __shared__ int s_pos[MOE_COMBINE_MAX_K];
+    __shared__ float s_w[MOE_COMBINE_MAX_K];
+    __shared__ int s_n;
+    if (threadIdx.x == 0)
+    {
+        int n = 0;
+        for (int j = 0; j < top_k; j++)
+        {
+            const int p = pos[(size_t)t * top_k + j];
+            const float w = topk_weight[(size_t)t * top_k + j];
+            if (p < 0 || w == 0.0f) continue;   // the axpy loop skipped zero weights too
+            int i = n++;
+            while (i > 0 && s_pos[i - 1] > p) { s_pos[i] = s_pos[i - 1]; s_w[i] = s_w[i - 1]; i--; }
+            s_pos[i] = p;
+            s_w[i] = w;
+        }
+        s_n = n;
+    }
+    __syncthreads();
+    float* out_row = out + (size_t)t * hidden;
+    for (int h = threadIdx.x; h < hidden; h += blockDim.x)
+    {
+        float acc = out_row[h];
+        for (int j = 0; j < s_n; j++)
+        {
+            const float v = rows[(size_t)s_pos[j] * hidden + h] * s_w[j];
+            acc = acc + v;
+        }
+        out_row[h] = acc;
+    }
+}
+
+// ── moe_add_f16_f32 ─────────────────────────────────────────────────────────
+//
+// out[i] += (float)in[i] * factor: adds the CPU part of a split expert layer (#1202) to the F32 MoE output. The host
+// uploads it as F16 divided by factor, a power of two that keeps it inside the F16 range (Flint's MoE output reaches 3.3e4,
+// #1191), so the scaling is exact.
+extern "C" __global__ void __launch_bounds__(256) moe_add_f16_f32(
+    float* __restrict__ out, const half* __restrict__ in, const int n, const float factor)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = out[i] + __half2float(in[i]) * factor;
+}
+
+// ── moe_build_grouped_ptrs ──────────────────────────────────────────────────
+//
+// Device-side routing for the grouped decode body (#1182): writes the pointer arrays the host used to build from the
+// read-back top-k ids, straight from the device ids, so a resident MoE layer needs no host round trip. One thread:
+//   out[0*k + j] = gate weights of the j-th selected expert in ascending id order (the host loop's order)
+//   out[1*k + j] = gate_out + j * out_row_bytes        out[2*k + j] = up weights
+//   out[3*k + j] = up_out + j * out_row_bytes          out[4*k + j] = down weights
+//   out[5*k + j] = routing slot of that expert
+// table holds the layer's expert pointers as int64: [gate E | up E | down E]. Decode only: one token, k distinct ids.
+extern "C" __global__ void __launch_bounds__(32) moe_build_grouped_ptrs(
+    const int* __restrict__ topk_idx, const long long* __restrict__ table, long long* __restrict__ out,
+    const int num_experts, const int top_k, const long long gate_out, const long long up_out, const long long out_row_bytes)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    int ids[MOE_COMBINE_MAX_K], slots[MOE_COMBINE_MAX_K];
+    int n = 0;
+    for (int j = 0; j < top_k; j++)
+    {
+        const int e = topk_idx[j];
+        int i = n++;
+        while (i > 0 && ids[i - 1] > e) { ids[i] = ids[i - 1]; slots[i] = slots[i - 1]; i--; }
+        ids[i] = e;
+        slots[i] = j;
+    }
+    for (int j = 0; j < n; j++)
+    {
+        const int e = ids[j];
+        out[0 * top_k + j] = table[e];
+        out[1 * top_k + j] = gate_out + j * out_row_bytes;
+        out[2 * top_k + j] = table[num_experts + e];
+        out[3 * top_k + j] = up_out + j * out_row_bytes;
+        out[4 * top_k + j] = table[2 * num_experts + e];
+        out[5 * top_k + j] = slots[j];
     }
 }
 

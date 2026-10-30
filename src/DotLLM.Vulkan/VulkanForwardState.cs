@@ -22,6 +22,7 @@ internal sealed class VulkanForwardState : IDisposable
     private readonly int _intermediateSize;
     private readonly int _vocabSize;
     // MLA dims — zero unless the model carries an MLA layer.
+    private readonly bool _mlaAbsorbed;
     private readonly int _mlaQLoraRank;
     private readonly int _mlaKvLoraRank;
     private readonly int _mlaQkNopeHeadDim;
@@ -113,9 +114,13 @@ internal sealed class VulkanForwardState : IDisposable
     public VulkanDevice.Buffer? MoeSiluInter { get; private set; }      // [seqLen * topK, intermediate]
     public VulkanDevice.Buffer? MoeDownRows { get; private set; }       // [seqLen * topK, hidden]
     public VulkanDevice.Buffer? MoeExpertCounts { get; private set; }   // [numExperts] uint32
-    public VulkanDevice.Buffer? MoeExpertOffsets { get; private set; }  // [numExperts + 1] uint32
+    // [numExperts + 1] uint32 group offsets, followed by the (expert, row-tile) work list of the indirect grouped GEMMs (#773);
+    // sized with MoeBuildTileListKernel.OffsetsBufferUints, a superset of the plain offsets array.
+    public VulkanDevice.Buffer? MoeExpertOffsets { get; private set; }
+    public VulkanDevice.Buffer? MoeGroupDispatchArgs { get; private set; }  // 2 x (x, y, z) uint32 indirect-dispatch triples
     public VulkanDevice.Buffer? MoeExpertCounters { get; private set; } // [numExperts] uint32
     public VulkanDevice.Buffer? MoePermutation { get; private set; }    // [seqLen * topK] uint32
+    public VulkanDevice.Buffer? MoeRowScale { get; private set; }       // [seqLen * topK] F32 power-of-two down-input scale (#1171)
     public VulkanDevice.Buffer? MoeGroupedHidden { get; private set; }  // [seqLen * topK, hidden]
     public VulkanDevice.Buffer? MoeGroupedGateInter { get; private set; } // [seqLen * topK, intermediate]
     public VulkanDevice.Buffer? MoeGroupedUpInter { get; private set; } // [seqLen * topK, intermediate]
@@ -168,6 +173,14 @@ internal sealed class VulkanForwardState : IDisposable
     public VulkanDevice.Buffer? MlaKPe { get; private set; }           // [seqLen, qkRope]
     public VulkanDevice.Buffer? MlaAttnOutput { get; private set; }    // [seqLen, numHeads * vHead]
 
+    // Absorbed-MLA scratch (#913), allocated instead of the expanded K/V scratch when _mlaAbsorbed.
+    public VulkanDevice.Buffer? MlaKvA { get; private set; }           // [seqLen, kvLoraRank + qkRope]  raw kv_a_mqa output
+    public VulkanDevice.Buffer? MlaCKvScratch { get; private set; }    // [seqLen, kvLoraRank + qkRope]  latent rows for cache-less forwards
+    public VulkanDevice.Buffer? MlaQAbs { get; private set; }          // [seqLen, numHeads, kvLoraRank + qkRope]  absorbed query
+    public VulkanDevice.Buffer? MlaLatOut { get; private set; }        // [seqLen, numHeads, kvLoraRank]  softmax(QK)·C, pre v_b
+    public VulkanDevice.Buffer? MlaSplitO { get; private set; }        // [MaxSplits, MaxSplitRows, kvLoraRank]
+    public VulkanDevice.Buffer? MlaSplitML { get; private set; }       // [MaxSplits, MaxSplitRows, 2]
+
     // ── Q8_1 activation-quantization scratch (dp4a MMVQ decode path) ───
     // Allocated only when the device supports integer dot product AND the
     // MMVQ kernels were created (mmvqEnabled at construction). Sized for the
@@ -190,6 +203,16 @@ internal sealed class VulkanForwardState : IDisposable
     public VulkanDevice.Buffer? Q8_1XqRows { get; private set; }   // [seqLen*maxK/4] packed int8
     public VulkanDevice.Buffer? Q8_1XdsRows { get; private set; }  // [seqLen*maxK/32] (d, s)
     private int _q8_1RowsMaxK; // per-row K the rows-scratch is currently sized for
+
+    /// <summary>
+    /// Whether a <c>[seqLen, inputDim]</c> activation fits the multi-row Q8_1 scratch (<see cref="Q8_1XqRows"/> / <see cref="Q8_1XdsRows"/>), i.e. whether the
+    /// dp4a MMQ / small-row Q8 paths may quantize it. Decided on the row WIDTH the scratch was sized for - a property of the model - and never on the
+    /// scratch's current byte size, which tracks the largest forward seen so far (<c>capacity x maxK</c>). The two coincide for every K &lt;= maxK, but a
+    /// projection wider than maxK (gpt-oss / Gemma-4 attention output: numHeads x headDim &gt; max(hidden, intermediate)) used to fit only once an earlier
+    /// forward had grown the capacity enough, so the same N-row forward took the MMQ path after a bigger forward and the fallback GEMM before it (#1016).
+    /// </summary>
+    internal bool Q8_1RowsFit(int seqLen, int inputDim)
+        => Q8_1XqRows is not null && Q8_1XdsRows is not null && inputDim <= _q8_1RowsMaxK && seqLen <= _capacitySeqLen;
 
     // ── Logits (last token only) ──────────────────────────────────────
     public VulkanDevice.Buffer Logits { get; private set; }
@@ -235,9 +258,11 @@ internal sealed class VulkanForwardState : IDisposable
         int moeNumExperts = 0, int moeTopK = 0, int moeIntermediateSize = 0,
         int moeSharedIntermediateSize = 0, int moeNumSharedExperts = 0,
         bool mmvqEnabled = false,
-        bool gemma4DualFfn = false)
+        bool gemma4DualFfn = false,
+        bool mlaAbsorbed = false)
     {
         _device = device;
+        _mlaAbsorbed = mlaAbsorbed;
         _mmvqEnabled = mmvqEnabled;
         _gemma4DualFfn = gemma4DualFfn;
         _hiddenSize = hiddenSize;
@@ -265,7 +290,8 @@ internal sealed class VulkanForwardState : IDisposable
         // the model's natural K which is already a 32-multiple for Q8_0).
         if (_mmvqEnabled)
         {
-            int maxK = Math.Max(hiddenSize, intermediateSize);
+            // numHeads * headDim: the o_proj input, wider than hidden and the FFN on some models (#1235: synthetic Flint at head_dim 128).
+            int maxK = Math.Max(Math.Max(hiddenSize, intermediateSize), numHeads * headDim);
             if (moeIntermediateSize > 0) maxK = Math.Max(maxK, moeIntermediateSize);
             if (moeSharedIntermediateSize > 0) maxK = Math.Max(maxK, moeSharedIntermediateSize);
             _q8_1MaxK = (maxK + 31) / 32 * 32;
@@ -451,9 +477,12 @@ internal sealed class VulkanForwardState : IDisposable
         MoeSiluInter = _device.AllocateDeviceLocal(interBytes);
         MoeDownRows = _device.AllocateDeviceLocal(downBytes);
         MoeExpertCounts = _device.AllocateDeviceLocal(expertCountsBytes);
-        MoeExpertOffsets = _device.AllocateDeviceLocal(expertOffsetsBytes);
+        MoeExpertOffsets = _device.AllocateDeviceLocal(
+            Math.Max(expertOffsetsBytes, Kernels.MoeBuildTileListKernel.OffsetsBufferUints(_moeNumExperts, seqLen * _moeTopK) * sizeof(uint)));
+        MoeGroupDispatchArgs = _device.AllocateDeviceLocal(2 * Kernels.MoeBuildTileListKernel.ArgsStrideBytes);
         MoeExpertCounters = _device.AllocateDeviceLocal(expertCountsBytes);
         MoePermutation = _device.AllocateDeviceLocal(routedRowsBytes);
+        MoeRowScale = _device.AllocateDeviceLocal(routedRowsBytes);
         MoeGroupedHidden = _device.AllocateDeviceLocal(expandedBytes);
         MoeGroupedGateInter = _device.AllocateDeviceLocal(interBytes);
         MoeGroupedUpInter = _device.AllocateDeviceLocal(interBytes);
@@ -461,7 +490,7 @@ internal sealed class VulkanForwardState : IDisposable
         long total = routerBytes + topkIdxBytes + topkWtBytes + expandedBytes
                    + interBytes * 3 + downBytes
                    + expertCountsBytes * 2 + expertOffsetsBytes + routedRowsBytes
-                   + expandedBytes + interBytes * 2;
+                   + expandedBytes + interBytes * 2 + routedRowsBytes;
 
         // Indexed-MMVQ expanded-activation Q8_1 scratch (issue #137): sized
         // for seqLen*topK rows of the largest contraction dim (_q8_1MaxK
@@ -502,6 +531,11 @@ internal sealed class VulkanForwardState : IDisposable
         return total;
     }
 
+    /// <summary>Upper bound on split-KV partitions of the absorbed-MLA decode attention (must match the shader).</summary>
+    public const int MlaSplitMaxSplits = 32;
+    /// <summary>Largest token count (rows = tokens x heads) the split-KV absorbed attention handles; larger chunks run unsplit.</summary>
+    public const int MlaSplitMaxRows = 4;
+
     private long AllocateMlaScratch(int seqLen)
     {
         if (_mlaNumHeads == 0) return 0;
@@ -523,6 +557,26 @@ internal sealed class VulkanForwardState : IDisposable
             MlaQLatentNorm = _device.AllocateDeviceLocal(qLatentBytes);
         }
         MlaQ = _device.AllocateDeviceLocal(qBytes);
+        if (_mlaAbsorbed)
+        {
+            // Absorbed MLA (#913): no expanded per-head K/V, no standalone latent buffers. The attention reads the
+            // [kvLoraRank + qkRope] latent cache directly; Q is pre-multiplied by k_b into the same 576-wide space.
+            long cDim = _mlaKvLoraRank + _mlaQkRopeHeadDim;
+            long kvABytes = (long)seqLen * cDim * sizeof(float);
+            long qAbsBytes = (long)seqLen * _mlaNumHeads * cDim * sizeof(float);
+            long latOutBytes = (long)seqLen * _mlaNumHeads * _mlaKvLoraRank * sizeof(float);
+            long absAttnOut = (long)seqLen * _mlaNumHeads * _mlaVHeadDim * sizeof(float);
+            long splitO = (long)MlaSplitMaxSplits * MlaSplitMaxRows * _mlaNumHeads * _mlaKvLoraRank * sizeof(float);
+            long splitML = (long)MlaSplitMaxSplits * MlaSplitMaxRows * _mlaNumHeads * 2 * sizeof(float);
+            MlaKvA = _device.AllocateDeviceLocal(kvABytes);
+            MlaCKvScratch = _device.AllocateDeviceLocal(kvABytes);
+            MlaQAbs = _device.AllocateDeviceLocal(qAbsBytes);
+            MlaLatOut = _device.AllocateDeviceLocal(latOutBytes);
+            MlaAttnOutput = _device.AllocateDeviceLocal(absAttnOut);
+            MlaSplitO = _device.AllocateDeviceLocal(splitO);
+            MlaSplitML = _device.AllocateDeviceLocal(splitML);
+            return qLatentBytes * 2 + qBytes + kvABytes * 2 + qAbsBytes + latOutBytes + absAttnOut + splitO + splitML;
+        }
         MlaKvLatent = _device.AllocateDeviceLocal(kvLatentBytes);
         MlaKvLatentNorm = _device.AllocateDeviceLocal(kvLatentBytes);
         MlaKvBExpanded = _device.AllocateDeviceLocal(kvBExpandedBytes);
@@ -560,6 +614,12 @@ internal sealed class VulkanForwardState : IDisposable
         MlaV?.Dispose(); MlaV = null;
         MlaKPe?.Dispose(); MlaKPe = null;
         MlaAttnOutput?.Dispose(); MlaAttnOutput = null;
+        MlaKvA?.Dispose(); MlaKvA = null;
+        MlaCKvScratch?.Dispose(); MlaCKvScratch = null;
+        MlaQAbs?.Dispose(); MlaQAbs = null;
+        MlaLatOut?.Dispose(); MlaLatOut = null;
+        MlaSplitO?.Dispose(); MlaSplitO = null;
+        MlaSplitML?.Dispose(); MlaSplitML = null;
 
         MoeRouterLogits?.Dispose(); MoeRouterLogits = null;
         MoeTopkIndices?.Dispose(); MoeTopkIndices = null;
@@ -571,8 +631,10 @@ internal sealed class VulkanForwardState : IDisposable
         MoeDownRows?.Dispose(); MoeDownRows = null;
         MoeExpertCounts?.Dispose(); MoeExpertCounts = null;
         MoeExpertOffsets?.Dispose(); MoeExpertOffsets = null;
+        MoeGroupDispatchArgs?.Dispose(); MoeGroupDispatchArgs = null;
         MoeExpertCounters?.Dispose(); MoeExpertCounters = null;
         MoePermutation?.Dispose(); MoePermutation = null;
+        MoeRowScale?.Dispose(); MoeRowScale = null;
         MoeGroupedHidden?.Dispose(); MoeGroupedHidden = null;
         MoeGroupedGateInter?.Dispose(); MoeGroupedGateInter = null;
         MoeGroupedUpInter?.Dispose(); MoeGroupedUpInter = null;

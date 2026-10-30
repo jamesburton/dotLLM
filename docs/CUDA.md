@@ -504,6 +504,54 @@ for cu_file in "$(dirname "$0")"/kernels/*.cu; do
 done
 ```
 
+### The csproj also regenerates PTX — and it does not pin the toolkit
+
+`native/build_ptx.bat` is not the only thing that writes `native/ptx/*.ptx`.
+`src/DotLLM.Cuda/DotLLM.Cuda.csproj` has a `CompileCudaPtx` target that runs
+`BeforeTargets="BeforeBuild"` with `Inputs`/`Outputs` over `.cu` → `.ptx`, so **a plain
+`dotnet build` silently regenerates every `.ptx` whose `.cu` is newer.** It resolves `nvcc` by
+running `nvcc --version` **from `PATH`**, and the host compiler from `VCToolsInstallDir` or, when
+that is unset, `vswhere -latest`.
+
+On a box with more than one CUDA toolkit installed that is a trap:
+
+- PTX whose ISA version exceeds the driver's is rejected outright with
+  `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`. CUDA 12.8 emits `.version 8.7`, which is what every
+  committed `.ptx` in this tree declares; CUDA 13.1 emits `.version 9.1`, which no pre-13.1
+  driver will load.
+- The wrong PTX compiles, commits and reviews exactly like the right PTX. It only fails on
+  someone else's older driver.
+- `build_ptx.bat` guards against this (it takes `nvcc` from `%CUDA_PATH%` and asserts
+  `DOTLLM_PTX_EXPECT_VERSION`, default `8.7`, per file at the moment of generation). **The
+  MSBuild target has no such guard** — it takes whatever `PATH` hands it.
+- This mechanism has now regressed **three times**: #124, #318, and again on 2026-09-23.
+
+**The fix is to pin both resolutions before building**, so the MSBuild path compiles with the
+same toolkit `build_ptx.bat` would:
+
+```bat
+set "CUDA_PATH=<the pinned toolkit>"
+set "PATH=%CUDA_PATH%\bin;%PATH%"
+set "VCToolsInstallDir=<...>\VC\Tools\MSVC\<ver>\"
+dotnet build
+```
+
+After any build that may have regenerated PTX, check the tree before committing:
+
+```bash
+grep -m1 '^.version' native/ptx/*.ptx | sort -u -k2   # every file must say 8.7
+```
+
+**Do not delete a `.ptx` to force a rebuild.** MSBuild evaluates the `<Content Include="..\..\native\ptx\*.ptx">`
+glob at *project load*, so a file that does not exist when the build starts is not in the item
+list — `CompileCudaPtx` regenerates it, but nothing copies it to the output directory in that
+same build, and the kernel is missing at runtime. Touch the `.cu`, or rebuild twice.
+
+Related: the target's per-kernel `Arch` metadata mirrors `build_ptx.bat`'s `ARCH_86` list for the
+same reason. A kernel using `mma.sync`/`cp.async` compiled at the `compute_75` default produces
+PTX that parses at build time and fails to JIT at module load, which `CudaKernels` catches and
+turns into a silently disabled kernel — no build error, no crash.
+
 ### .NET Integration
 
 PTX files are included as content files in the project, copied to output directory:
@@ -606,6 +654,29 @@ First-time PTX loading incurs ~100–500ms per module as the driver compiles PTX
 
 ---
 
+## PTX Pre-flight: `CudaKernels.ResolveAndValidatePtxDirectory` (issue #484)
+
+**Every CUDA model factory must call `CudaKernels.ResolveAndValidatePtxDirectory(ptxDir)` before
+`CudaContext.Create`, and pass its return value to `new CudaKernels(...)`.** Never write
+`ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx")` in a factory — that is what the helper
+does, plus the check.
+
+The factories set up in the order `CudaContext.Create` → `CudaStream.Create` → `cublasCreate` →
+`new CudaKernels(ptxDir)`. A missing or incomplete PTX deployment is the most common way a load
+fails, and without the pre-flight it is detected only *after* three device-backed handles already
+exist — a failure path whose unwind must then be re-proven correct at every call site. Validating
+up front is pure file-system I/O and makes the whole class of leak structurally impossible.
+
+- Throws `DirectoryNotFoundException` if the directory is absent, `FileNotFoundException` naming the
+  first missing module otherwise.
+- `CudaKernels.RequiredPtxFiles` lists every module the constructor loads unconditionally, and
+  `CudaKernelsPtxValidationTests.RequiredPtxFiles_MatchesUnconditionalConstructorLoads` parses the
+  constructor to keep the two in sync. **Adding an unconditional `CudaModule.LoadFromFile` to the
+  constructor requires adding the file to that list** (the test fails otherwise). Optional modules,
+  loaded behind `File.Exists`, must stay out of it.
+
+---
+
 ## Kernel Catalog
 
 All kernels compiled to PTX, loaded via `cuModuleLoadData`, launched via `cuLaunchKernel`:
@@ -644,7 +715,9 @@ All kernels compiled to PTX, loaded via `cuModuleLoadData`, launched via `cuLaun
 
 | Kernel | File | Function Name | Notes |
 |---|---|---|---|
-| Q8_0 GEMV | `quantized_gemv.cu` | `quantized_gemv_q8_0` | FP fmuladd, legacy |
+| Q8_0 GEMV (legacy) | `quantized_gemv.cu` | `quantized_gemv_q8_0` | FP fmuladd, one 256-thread block per row, lanes 34 B apart (~85 GB/s on the RTX 3060); now only the k<1024 / no-scratch fallback and `DOTLLM_DISABLE_MMQ_Q8_0=1` |
+| Q8_0 MMVQ-large `_preq` | `quantized_gemv_mmq.cu` | `quantized_gemv_q8_0_mmvq_large_preq` | dp4a on the shared Q8_1 pre-quant scratch, 1 row/block x 128 threads, 4 lanes per block (8 adjacent blocks = 272 B per warp step) like llama.cpp `mul_mat_vec_q<Q8_0>`; weights read in place (a 34 B block is only 2-byte aligned, so each 32-bit weight word is two 16-bit loads); F32 register accumulate, FP16 store only (#1297). Llama-3.2-1B Q8_0 on the 3060: 318-338 GB/s on gate+up / LM head, tg128 62 -> 195 tok/s |
+| Q4_K / Q6_K MMVQ rows4 `_preq` | `quantized_gemv_mmq.cu` | `quantized_gemv_{q4_k,q6_k}_mmvq_rows4_preq` | dp4a on the shared Q8_1 pre-quant scratch, **one warp per row, 4 rows per 128-thread block**, 16 lanes per superblock (the MMVQ-large kernels fed a 128-thread block one row, leaving 24 of 128 threads busy at k=1536); quantized blocks read in place (Q6_K's 210 B blocks via aligned loads + funnel shift), F32 register accumulate, FP16 store only; no shared memory / barriers (#1298). Selected for k >= 1024 && k % 256 == 0; `DOTLLM_KQUANT_GEMV=large` restores the old kernels, `=rows4` forces. RTX 3060 (T5500), graph-replayed `CudaKQuantRows4Tests.Bench_KQuant_Decode_Shapes` (`DOTLLM_KQUANT_BENCH=1`), weight GB/s large -> rows4: Q4_K 17920x1536 gate+up 125 -> 268, 1536x1536 111 -> 184, 2048x1536 114 -> 211, 1536x8960 down 168 -> 213; Q6_K 1536x8960 down 239 -> 259, 32000x1536 LM head 211 -> 332, 1536x1536 182 -> 231. Bielik-1.5B Q4_K_M `dotllm bench -p 32 -n 128`, 3 interleaved rounds: 120.7 -> 177.4 tok/s median (+47%). Not yet fused: bias add / quantize-x launches, Q5_K/Q2_K/IQ rows4 variants. |
 | Q4_K GEMV | `quantized_gemv.cu` | `quantized_gemv_q4_k` | FP fmuladd, legacy |
 | Q5_K GEMV | `quantized_gemv.cu` | `quantized_gemv_q5_k` | FP fmuladd, legacy |
 | Q6_K GEMV | `quantized_gemv.cu` | `quantized_gemv_q6_k` | FP fmuladd, legacy |
@@ -847,10 +920,16 @@ This is well-proven — llama.cpp, vLLM, and every CUDA inference engine uses th
     subsequent tokens differ. Perplexity confirms independently: flat pre-gate (-0.02%, as expected
     since the kernel can't engage there), +0.30% post-gate. **Recommendation: #183 stays opt-in/
     default-OFF** — the fastest kernel found here is not a safe default despite the win being real.
+    *(Audit #527: the +0.30% here and the −0.173% below are measured on real Bonsai-27B weights —
+    PQ2_0 is the form that model ships in, not a quant-ladder degradation — so both are valid
+    quality claims. Neither reports a **paired standard error** over its ~780 scored steps, and
+    neither transfers to another model: see the annotation in `docs/GPU.md` on why a delta measured
+    on one weight set cannot be divided by one measured on another.)*
   - **#226/#227: tried fp64 accumulation in the cross-split combine step to reduce the
-    reassociation error — no improvement, clean negative result.** Root cause is *not* `fast_exp_neg`
-    (this file's header already documents why precise `expf` was rejected — CPU/GPU parity, both
-    the baseline and split-KV kernels already use the same approximation identically) and *not* the
+    reassociation error — no improvement, clean negative result.** Root cause is *not* the softmax
+    exponential (at the time that was the Schraudolph `fast_exp_neg`, used identically by both the
+    baseline and split-KV kernels; #501 replaced it with precise `expf` in all of them at once, so
+    the "identical in both" premise is unchanged) and *not* the
     final 4-way merge arithmetic: the double-precision combine variant (`attention_f32_split_kv_hp`,
     opt-in `DOTLLM_ATTN_SPLIT_KV_HP=1`, PR #227 open/not merged) diverges at the *identical* step
     225 with an essentially identical margin and perplexity delta. The reassociation error is
@@ -955,7 +1034,10 @@ This is well-proven — llama.cpp, vLLM, and every CUDA inference engine uses th
   opt-in/default-OFF (`DOTLLM_ATTN_MMA_DECODE_GQA_SPLIT=1`) per the standing #180/#183
   precedent — this session validated synthetic-fixture parity and wall-clock, not real
   end-to-end generation parity (the #222-style test that caught #183's real-world precision
-  problem despite it passing synthetic parity), so a default-on flip should wait on that. Not
+  problem despite it passing synthetic parity), so a default-on flip should wait on that.
+  **Superseded: the kernel is default-ON as of 2026-07-30** once that generation-parity pass
+  landed — see the 2026-07-30 entry below, and opt out with
+  `DOTLLM_ATTN_MMA_DECODE_GQA_SPLIT=0`. Not
   wired into any model's forward pass this session (kernel-level validation was the scope,
   matching the precedent that `attention_f32_gqa_split_kv` itself also isn't wired into
   `CudaQwen3MoeHybridTransformerModel`). **This is the first positive wall-clock result in the
@@ -1015,9 +1097,11 @@ This is well-proven — llama.cpp, vLLM, and every CUDA inference engine uses th
   confident decision) consistent with that already-characterized, already-accepted reassociation
   sensitivity rather than a new correctness problem this kernel introduces. Full CUDA unit suite
   (423 tests, 380 real + 43 env-gated skips) passes with zero regressions from the model-file
-  changes. **Still opt-in/default-OFF** (`DOTLLM_ATTN_MMA_DECODE_GQA_SPLIT=1`) pending a maintainer
-  decision on default-on, but the precondition that gap existed for (#222-style real generation
-  validation) is now satisfied.
+  changes. The precondition the opt-in gate existed for (#222-style real generation validation) is
+  satisfied by this pass, and the kernel was **flipped default-ON on 2026-07-30** on the strength of
+  it: `CudaAttentionMmaDecodeGqaSplit.Enabled` is `env != "0"`, so opting *out* now needs
+  `DOTLLM_ATTN_MMA_DECODE_GQA_SPLIT=0`. (The sentence here previously read "still
+  opt-in/default-OFF … pending a maintainer decision", which the flip made wrong.)
 - **BitNet decode CUDA-graph capture, and the generic `attention_f16_dyn` slowdown behind it** (issues #212/#213/#218/#221, PRs #214/#217/#223/#224, 2026-07-28): BitNet was the only supported architecture excluded from the project's default-on decode CUDA-graph capture (the generic captured body omitted BitNet's FP32-residual/Sub-LN/ReLU² ops). #214 ported those ops in and removed the exclusion — bit-exact vs eager, +9-11% decode at shallow depth on both real BitNet models (2B-4T, `bitnet_b1_58-xl`). **Caveat (#338): treat the "bit-exact vs eager" claim as unverified until it is re-measured.** The equivalence suite that backed it (`CudaGraphCaptureEquivalenceTest`) could pass eager-vs-eager — nothing checked that capture actually engaged — and its logit bound had been widened from `1e-3f` to `5.0f`, i.e. ~20-25x the observed drift, leaving argmax equality as the effective gate. Both are fixed in the test (graph-engagement assertions from `GraphReplayCount`, and every step's logits compared rather than step 0's), but the numbers behind this paragraph were produced before that and need one CUDA-box run to reconcile. This surfaced a real depth-dependent regression, fixed for BitNet specifically via #217's depth ceiling (`BitNetGraphCaptureMaxDepth`, default 384).
 
   **#218 then found and fixed the underlying kernel-level cause, and generalized the mitigation to every architecture.** An elevated `ncu --set full` capture (`.perf-runs/ncu-2026-07-28/README.md`) first suggested a CTA-barrier-stall hypothesis (the `seq_kv`/`position_offset` device-pointer reads landing too close to a sync point) — **this was refuted** by direct SASS inspection (`ptxas -arch=sm_86` + `cuobjdump --dump-sass`, no elevation needed): `ptxas` already schedules both loads as the first two real instructions, with 50-90 independent instructions before first use. The actual cause: all 256 threads in `attention_f16_dyn` each independently re-read the same block-uniform pointer values — 8x the redundant memory-latency exposure `attention_f16` doesn't pay (it reads from the near-free constant/parameter bank instead). Fixed by templating the shared kernel body on a `DeviceIndirect` compile-time bool; the `_dyn` instantiation has only thread 0 dereference the pointers once, broadcasting via the dead tail of the existing `warp_scratch[32]` shared buffer — no new shared memory, no new barrier, and `attention_f16`'s SASS is byte-for-byte unaffected (verified via SASS diff). This closed roughly a third of the regression on its own; the rest was closed by generalizing #217's pattern into a new `GraphCaptureMaxDepth` (default 512, `DOTLLM_GRAPH_MAX_DEPTH` override) covering every graph-capable architecture, with BitNet keeping its own tighter, separately-validated ceiling. Falcon-E-3B/Falcon3-3B regression fully closed at every depth ≥512 tested; shallow-depth graph win preserved (+2.8% to +7.9%).
@@ -1030,3 +1114,258 @@ This is well-proven — llama.cpp, vLLM, and every CUDA inference engine uses th
 - **NCCL integration** (Step 51): multi-GPU tensor parallelism. NCCL is another system library — same P/Invoke pattern, no shared library needed.
 - **Fatbin distribution**: ship pre-compiled SASS for common architectures to eliminate JIT overhead.
 - **NVRTC runtime compilation**: compile `.cu` source to PTX at application startup using NVIDIA's Runtime Compilation library, eliminating the nvcc build step entirely. NVRTC is available as `libnvrtc.so` / `nvrtc64_*.dll`.
+
+## Gemma-4 dense variant (E2B/E4B) on CUDA (issue #734)
+
+The dense Gemma-4 variants (per-layer embeddings, 18 trailing shared-KV layers, proportional `rope_freqs`, dual head dim 256/512, no MoE block; `ModelConfig.IsGemma4DensePle`) run on the F32 `ForwardGemma4` path:
+
+- **PLE inputs** are built on the host by the exact CPU-oracle code (`Gemma4PerLayerInputs.ComputeLayerMajor`) and uploaded layer-major; only the per-layer gated injection (gate matmul, GeGLU with the layer slice, proj matmul, post-norm, add) runs on the device. The 1.9 GB `per_layer_token_embd` table never goes to VRAM.
+- **Shared KV**: shared layers skip K/V and read the donor layer (same attention kind). Cacheless uses a 2-slot donor stash; cached uses the donor's lines in the `CudaKvCache`.
+- **rope_freqs** is mapped onto partial rotary (leading-1.0 factors rotate, the 1e30 tail is identity); other factor tables are rejected at load with `NotSupportedException` rather than silently mis-rotated.
+- **KV cache**: the FP16 per-layer-strided `CudaKvCache` (new rows converted F32->F16 on write, cache rows expanded to F32 for the F32 attention kernel). The MoE (26B) forward remains cacheless.
+- **LM head**: chunked F32 device GEMV over the Q4_K tied table (the host LM head would cost about 1 s/token).
+- Layer-split (pipeline / hybrid) loading of this variant is rejected: PLE inputs and cross-window shared-KV donors cannot be split.
+
+Performance caveat: this path dequantises each projection to F32 per forward (the validated 26B design), so decode throughput is far below the quantised-GEMV paths; a quantised-GEMV Gemma-4 path is the perf follow-up.
+
+## v2 tensor-core decode attention: warp-independent, register-resident (issue #988)
+
+`attention_flash_mma_decode_gqa_split_f16` (v1, head_dim 256, GQA group <= 8, seqQ == 1) was latency/sync bound: ~12 us
+per 16-key tile per block (KV_TILE=16, five `__syncthreads`, a 16-deep serial mma chain on two warps, a serial 6-lane
+softmax, a shared-memory O read-modify-write, scalar 2-byte K/V loads and transposed V stores). At 16k keys that is
+~0.9-1.3 ms per attention layer, so Bonsai-2 27B decode fell 18.8 -> 14.5 tok/s between ctx 512 and 16384.
+
+v2 (`attention_flash_mma_decode_gqa_split_f16_v2`, body in `native/kernels/attention_mma_decode_v2.cuh`) keeps the
+interface, the `(numKvHeads, kvSplit)` cooperative grid, the `partial_max/sum/out` scratch layout and the combine
+algebra byte-for-byte, and changes only the per-block inner loop:
+
+- **Every warp is an independent online-softmax stream** over interleaved 16-key tiles; there is no block-level barrier
+  in the key loop. The block merges its 8 warps once at the end (deterministic warp-ordered sum through 8 KiB of smem).
+- **K and V go straight from global into mma fragment registers** with 16-byte loads (no smem staging, no transposes).
+  This relies on the mma k-dimension being a free permutation: a thread loads 8 consecutive `d` of one key and feeds two
+  consecutive k16 steps; Q's A fragments (kept in a 4 KiB smem table) use the identical permutation.
+- **PV is computed transposed** (`O^T[d x q8] += V^T[d x key16] . P^T[key16 x q8]`) so M = d fills all 16 rows, and the
+  QK C fragment is exactly the PV B fragment (FA2-style register reuse, no shuffles for P).
+- **Online softmax is warp-parallel**: quad max via two `shfl_xor`, per-thread partial row sum, reduced once at the end.
+- 230 registers, 0 spills, 12.8 KB static smem, `__launch_bounds__(256, 1)`: one block per SM. kvSplit heuristic is now
+  `clamp(ceil(seqKv / 128), 1, maxCoResident/numKvHeads)` (`CudaKernels.ComputeAttentionMmaV2KvSplit`,
+  `DOTLLM_ATTN_MMA_V2_MIN_KV` override); on a 28-SM 3060 that is 7 splits x 4 KV heads.
+
+The fused quantized-KV kernels (`..._split_kvq_v2_{q8q8,q4q4,q8q4,q4q8}`) instantiate the **same body** with loader
+policies (`V2LoadQ8`/`V2LoadQ4`: one scale + four `u16` data loads per 8 elements, exact `half(d * q)` dequant), so fused
+output is bit-identical to dequant-scratch + the F16 v2 kernel (tested, kernel level and real model).
+
+**Selection / opt-outs.** v2 is the default; `DOTLLM_ATTN_MMA_DECODE_V2=0` (or `CudaKernels.MmaDecodeV2Enabled = false`
+in-process) selects v1 for A/B. Fused quantized decode (`DOTLLM_HYBRID_KV_FUSED`) is now **default ON when the v2 fused
+kernels are loaded** and OFF otherwise (v1 fused is still slower than scratch); `=1` / `=0` force it.
+
+### Measurements (RTX 3060, Bonsai-2 shape 24/4/256, synthetic data, ms per launch; GPU shared with other jobs)
+
+Kernel microbench (`CudaAttentionMmaDecodeV2Tests.Microbench_*`, `DOTLLM_ATTN_MICROBENCH=1`):
+
+| seqKv | v1 F16 | v2 F16 | v2 eff. GB/s | scratch(dequant)+v2 Q8_0 / Q4_0 | fused v2 Q8_0 | fused v2 Q4_0 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 512   | 0.060 | 0.026 | 79  | - | - | - |
+| 4096  | 0.359 | 0.075 | 223 | 0.195 / 0.195 | 0.056 | 0.050 |
+| 16384 | 1.340 | 0.222 | 302 | 0.670 / 0.668 | 0.139 | 0.114 |
+| 65536 | 5.389 | 0.819 | 328 | 2.697 / 2.656 | 0.477 | 0.383 |
+
+v2 F16 is at the DRAM roofline (~330 GB/s of ~360); the fused quantized kernels beat F16 because they read 2-4x fewer
+bytes. (v1 fused was 2.1 ms at 16k, v1 scratch 1.8 ms.)
+
+End-to-end (`bench -p 512 -n 64 --depth-list 0,3584,15872`, MTP off), decode tok/s at ctx 512 / 4096 / 16384:
+
+| KV | before (#956 measurements) | after |
+|---|---|---|
+| F16 | 18.8 / - / 14.5 | 19.2 / 19.6 / 19.4 |
+| Q4_0 fused (new default) | 18.2 / - / 12.4 (fused v1), 18.7 / - / 13.3 (scratch) | 18.5 / 18.6 / 18.7 |
+| Q4_0 scratch + v2 (`DOTLLM_HYBRID_KV_FUSED=0`) | 18.7 / - / 13.3 | 18.9 / 18.7 / 17.8 |
+
+Parity: v2 vs F64 reference max abs error ~1e-5 at seqKv in {1,15,16,17,255,256,4096,16385} (v1 vs v2 <= 2.6e-5);
+`CudaAttentionMmaDecodeGqaSplitGenerationParityTests` PPL delta -0.04% (pre-gate bit-identical).
+
+## Flash-style tensor-core prefill attention, head_dim 256 (issue #962)
+
+`native/kernels/attention_flash_mma_prefill_hd256.cu` replaces the naive `attention_f32` prefill
+(one block per query row x head, scalar F32, F32 K/V staged from the F16 cache) for
+`qwen35`-style dense hybrids (Bonsai-2 27B: 24 Q / 4 KV heads, head_dim 256, causal, no window).
+
+- **Layout**: grid = (ceil(seqQ/16) q-tiles, numKvHeads); block = `group` warps, one per query head
+  of the GQA group, all sharing the same 16 query rows (K/V tile fetched once, reused `group`x;
+  identical causal range per warp). Heaviest q-tiles are scheduled first.
+- **Per warp**: 16x256 F32 O accumulator in registers (222 regs, no spill), `mma.sync.m16n8k16`
+  F16 operands / F32 accumulate for QK^T and PV, S->P fragment re-pack in registers, online
+  softmax in the exp2 domain, O rescaled only when a row max changes. Q in padded shared memory,
+  K/V tiles (16 keys) double-buffered with `cp.async`; dynamic smem 84.5 KB at group 6
+  (opt-in via `cuFuncSetAttribute`; eligibility: group <= 8 and smem <= 99 KB, i.e. group <= 6).
+- **Reads the F16 KV cache directly** (or the F16 dequant scratch for quantized KV); F32 staging is
+  skipped. Q is converted F32->F16 into a per-model scratch. Output F32 `[seqQ, numHeads*256]`.
+- **Dispatch**: `ForwardFullAttnBody`, `seqLen > 1`, head_dim 256, numKvHeads < numHeads, group <= 6.
+  Opt out with `DOTLLM_ATTN_FLASH_PREFILL_HD256=0`; `attention_f32` remains the fallback (also when
+  the PTX is not loaded, e.g. pre-Ampere).
+- **Accuracy** vs `attention_f32` on the same F16-rounded data: relRms 0.9e-4..2.0e-4, max abs
+  <= 2e-4 of max |ref| (`CudaAttentionFlashPrefillHd256Tests`). Real Bonsai-2 weights: last-token
+  prefill logits cosine >= 0.999999, same top-1.
+- **Performance (RTX 3060, seqQ=256, 24/4/256)**:
+
+  | seqKv | flash ms | attention_f32 ms | speedup |
+  |---|---|---|---|
+  | 1024 | 0.81 | 31.5 | 39x |
+  | 4096 | 2.04 | 207 | 102x |
+  | 16384 | 8.54 | 1044 | 122x |
+  | 65536 | 36.5 | 4790 | 131x |
+
+  Sustained ~11-12 TFLOP/s, about the GA106 FP16-with-F32-accumulate tensor peak.
+  End-to-end `dotllm bench -p N`: 2048: 100 -> 150 tok/s; 8192: 49 -> 140 tok/s (now flat in
+  length: prefill is bound by the weight GEMMs, not attention).
+- **Not done**: fused quantized-KV load (quantized KV still dequantizes to the F16 scratch first);
+  group 7/8 would need a smaller Q tile or KV_TILE (smem); no sliding-window / sinks / soft-cap variants.
+
+## LFM2 / LFM2.5 MoE CUDA host (#1032)
+
+`CudaModelLoader.CreateFromGguf` routes `lfm2moe` to
+`CudaLfm2MoeTransformerModel`. The dedicated host implements fused B/C/X short
+convolution with persistent causal history, QK-normalized NeoX GQA attention,
+leading dense SwiGLU FFNs, and sigmoid MoE routing. Expert correction bias affects
+selection only; selected weights use the unbiased sigmoid scores and normalize to
+one. Other CUDA models retain their existing softmax router.
+
+Weights stay in their original quantization on device. Q4_0 embedding lookup reads
+packed weights directly. Dense and routed-expert Q4_0 projections prequantize F32
+activations to Q8_1 once per projection and run packed integer dot products with the
+separately rounded Half scale/sum correction used by CPU execution. This avoids
+expanding expert banks or the tied embedding/head to F16/F32. Other quantization
+types reuse the existing CUDA projection and expert paths. No whole-model speed
+claim has been established for the initial Q4_0 kernel.
+
+The official QAD checkpoint uses Q6_K embedding/head weights. These currently use
+the existing F16 embedding mirror and projection fallback; native Q6_K decode
+optimization and full-checkpoint validation remain follow-up work.
+
+Attention KV storage is sparse by layer and F32. The initial host supports one
+model-owned recurrent sequence and one active KV handle; resuming an overwritten
+handle, batched recurrent sequences and LoRA are rejected. CUDA recurrent snapshots,
+partial offload and CUDA LoRA remain follow-up work.
+
+The official QAD-Q4_0 checkpoint has about 13.6 GB of raw weights and cannot fit the
+local 12 GiB RTX 3060 before scratch/KV allocations. Validation uses small synthetic
+hybrid checkpoints and representative kernel shapes; no full-checkpoint CUDA speed
+or quality result is implied. The committed PTX uses ISA 8.7 / `compute_75`, compiled with CUDA 12.8.93
+and `-fmad=false`, preserving the existing driver compatibility baseline. Local
+validation uses NVIDIA driver 610.88.
+
+## Recursive Flint on CUDA and in-place Q4_1 kernels (#1172, Flint F6)
+
+`flint` loads through the default `CudaTransformerModel` arm (generic FP16 eager loop; MoE decode is captured whole since
+#1210, see below). What it needed, and where it lives:
+
+- **Per-layer NoPE** in the FP16 loop: `Config.IsNoRopeLayer(layer)` passes `rope_dim 0` to the fused RoPE + KV write
+  (the kernel then copies all of K as its "tail") and skips `LaunchRoPE` on the eager path. The dense captured bodies
+  (`CaptureDecodeGraph*`) still refuse `NoRopeLayers` (they always rotate); the MoE decode graph (#1210) captures the eager
+  body itself, so NoPE is honoured there. Composite hosts still refuse NoPE models.
+- **Sinks on every layer**: already wired through `AttnSinksDevice` (#365); nothing Flint-specific.
+- **Sigmoid routing** (`moe_sigmoid_topk_f32`): top-k on `sigmoid(logits)`, renormalised with the CPU's 6.1035e-5 sum
+  clamp, lower index on ties. A selection bias or expert weight scale (DeepSeek-V3 / GLM-4.7-Flash, #742) is still
+  refused at load.
+- **Ungated shared expert, leading dense layers**: the existing `CudaMoeFfn` shared path and dense FFN path.
+
+`native/kernels/q4_1_gemv.cu` reads `block_q4_1` in place (no dequant scratch, no wider weight copy; rule 2). One warp
+per output row, four lanes per 20-byte block (lane & 3 picks the 4-byte nibble chunk: elements 4c..4c+3 and
+16+4c..16+4c+3), so one warp pass reads 160 contiguous bytes. `sum (d q + m) x = d sum(q x) + m sum(x)`, F32 accumulate.
+
+| entry | use |
+|---|---|
+| `quantized_gemv_q4_1` | decode GEMV, F16 in/out (`LaunchQuantizedGemv`) |
+| `quantized_gemm_q4_1_f16` | dense prefill, 8 tokens share each weight load (`Project` prefill branch) |
+| `quantized_gemv_q4_1_f32` / `quantized_gemm_q4_1_f32` | MoE expert projections on F32 activations |
+| `moe_grouped_gemv_q4_1_f16` | grouped gate / up (shared input row) |
+| `moe_grouped_gemv_q4_1_f32_xe` + `moe_weighted_rows_sum_f32` | grouped down (one input row per expert) + combine |
+
+Because Q4_1 now counts as a loaded quantized-GEMV type, `CudaWeights` no longer keeps a persistent F16 copy of Q4_1
+projections or the Q4_1 LM head.
+
+**F16-safe MoE down input.** The Q4_1 expert path never quantizes activations (F32 in), so Flint's ~1.3e4 routed
+SwiGLU output cannot overflow there. dotLLM's own Q8_1 MMQ layout stores integer block sums and an F16 `amax/127`, which
+cannot overflow either. The one CUDA path that stores `d * sum(q)` in F16 is the LFM2 packed Q4_0 x Q8_1 projection; its
+routed down projection now runs `moe_pow2_rescale_rows_f32` / `moe_scale_rows_f32`, the CUDA mirror of the CPU
+`MoeSwiGluMlp.RescaleDownInputForF16Sums` (#1158).
+
+**Microbench** (RTX 3060 12 GB eGPU over Thunderbolt, WDDM, `CudaQ4_1KernelBench`, weight GB/s; back-to-back launches
+so the ~20 us WDDM launch floor dominates the small shapes):
+
+| shape | Q4_1 (new) | Q4_0 `lfm2_gemv_q4_0_f32` | Q8_0 | Q4_K mmq |
+|---|---|---|---|---|
+| 2048x2048 | 85 | 63 | 69 | 27 |
+| 6144x2048 | 239 | 115 | 76 | 29 |
+| 150144x2048 (LM head) | 268 (F16 in) / 335 (F32 in) | 151 | 88 | 33 |
+| grouped 6 x 512x2048 | 142 | - | 79 | 17 |
+
+Prefill (2048x2048, 512 tokens): the in-place Q4_1 GEMM reaches 1.7 TFLOP/s with zero scratch; dequant + cuBLAS HGEMM
+reaches 17 TFLOP/s but needs an F16 copy of the projection (8 MiB here, 25 MiB for the 6144-wide dense FFN), which rule
+2 forbids. A tensor-core MMQ-style Q4_1 prefill is the follow-up (#1181).
+
+**Validation.** `CudaFlintParitySyntheticTests` (synthetic GGUF, all-Q4_1 and routed Q4_1 + shared Q8_0, prefill and
+10 + 6 KV-cache decode) against the CPU on the same weights dequantised to F32: worst max |dlogit| 2.7e-2 (bound 5e-2);
+every Flint feature moves the CPU logits by 3.0-9.1. `CudaFlintRealWeightsProbe` runs the first 8 layers of the official
+Q4_1 file (2 dense, 6 MoE incl. NoPE full layer 5): CPU vs CUDA cosine >= 0.99998, KL <= 1.4e-3 (the CPU runs Q8_1
+activations on its experts), top-1 identical on all 9 compared rows. VRAM 4.80 GiB for those 8 layers (of which the F32
+`token_embd` table is 1.15 GiB, uploaded as-is), +64 MiB KV at 4096 tokens, +16 MiB run scratch. On WDDM, device
+allocations count 1:1 in process private bytes (measured), so private bytes minus VRAM is ~0.5 GiB of host state.
+
+The full file (26 GB) does not fit a 12 GB GPU: F7 (#1187) keeps the routed experts of the first layers on the CPU, read
+from the mmap'd file (`--cpu-moe` / `--n-cpu-moe`, or automatically; see `docs/MOE_OFFLOAD.md`).
+
+**Known gaps** (follow-ups on #1157): the CUDA KV cache is full-length on every layer (no sliding-window ring, #1184); the F32
+`token_embd` is gathered on the host from the mmap for MoE models (#1183, 1.15 GiB of VRAM on Flint); resident MoE layers route on the device at decode
+(#1182) and the MoE decode body is graph-captured (#1210); the CPU-expert layers' prefill runs partly on the GPU
+since #1202 (see `docs/MOE_OFFLOAD.md`); the FP16 residual stream is verified on 8 real layers only;
+NVFP4 grouped experts with the per-expert `_exps.scale` are not implemented (#1179).
+
+### Device memory: itemisation and runtime scratch (#1211)
+
+`DOTLLM_CUDA_MEM_TRACE=1` attributes every `cuMemAlloc_v2` / `cuMemCreate` to its first caller outside the interop layer
+(`CudaMemTrace`), logs allocations of 1 MiB or more as they happen, prints the driver's used VRAM at the load phases
+(context, cuBLAS, kernels, weights, forward state, first multi-token / decode forward) and dumps the live bytes per site
+when the model is disposed. Driver-used minus tracked is the context, modules and cuBLAS (on WDDM `cuMemGetInfo` also
+counts ~1 GiB the OS reserves, which `nvidia-smi` does not).
+
+What it found on Flint (`--n-cpu-moe 34`, pp512), and what changed:
+
+| item | before | after |
+|---|---|---|
+| allocation rounding: one `cuMemAlloc` per routed expert (0.625 MiB Q4_1, three per 2 MiB page) | ~480 MiB | one allocation per `[E, ...]` bank |
+| allocation rounding: one 2 MiB-rounded `cuMemAlloc` per dense tensor (6.25 MiB QKV takes 8) | ~150 MiB | `CudaWeightArena`: bump allocator in one VMM range (`DOTLLM_CUDA_WEIGHT_ARENA=0` off) |
+| F32 shadow of every activation (`HiddenStateF32` ... `SiluOutputF32`), read only by Gemma / high-precision I-quant | 66 MiB | allocated only for those forwards (rule 1, #1107) |
+| `DequantScratch` + `DequantScratchF32` for the largest projection, never read by in-place Q4_1 | 72 MiB | allocated on first use |
+
+Remaining runtime scratch at pp512 (~330 MiB): the prefill GPU leg's expert ring 120 MiB (#1202), MoE scratch 89 MiB
+(F32 `[seqLen*topK, hidden]` gather / down rows, #1107 inventory), FP16 activations 39 MiB, staging 10 MiB, cuBLAS 12 MiB.
+
+### MoE decode graph (#1210)
+
+On WDDM a Flint decode token was ~1,000 `cuLaunchKernel` calls at 15-31 us each, with the GPU idle between them. Since
+#1182 resident MoE layers route on the device, so the only host interaction left in a decode step is the CPU leg of the
+CPU-expert layers. `CudaTransformerModel.ForwardMoeDecodeGraph` therefore captures the **eager decode body itself** (not a
+separate captured copy like the dense `CaptureDecodeGraph`), with three switches while `_moeGraphCapturing` is set:
+
+- token id, position and KV length are uploaded before each replay (one pinned buffer, four async copies); the body skips
+  its own uploads and the host-embedding gather (#1183) fills the pinned staging before the launch, leaving only its copy
+  in the graph;
+- RoPE + KV write and attention use the `_dyn` kernels (`fused_rope_kv_write_f16_dyn`, `attention_f16_dyn`: the same
+  bodies, position and length read from device scalars), with the layer's own `rope_dim` (0 on NoPE layers), window and
+  sinks;
+- a CPU-expert layer queues its input / top-k copies into pinned memory, the shared expert, then the CPU leg as a
+  **host-function node** (`cuLaunchHostFunc`, `CudaMoeHostExperts.EnqueueRun`) and the upload of its result, so nothing
+  waits for the host. A host job's exception is kept and rethrown after the replay's sync.
+
+The first decode step on a KV cache runs eagerly (it allocates the lazy scratch: expert pointer tables, pinned buffers);
+the second captures; later steps replay. The graph is recaptured when the cache, the layer count or any buffer it bakes in
+moves (generation counters on `CudaForwardState`, `CudaMoeScratch`, `CudaMoeHostExperts` and the model's staging). A
+capture failure is logged once and leaves decode eager. Eligible: every MoE layer device-routable (#1182) or a CPU-expert
+layer, a `CudaKvCache`, no adapter / profiling, decode appending at the cache's length. `DOTLLM_CUDA_MOE_GRAPH=0` keeps
+the eager body. No depth ceiling: unlike the dense path (#218), the launches saved dwarf the `_dyn` attention's cost.
+
+Flint Q4_1, RTX 3060, `--n-cpu-moe 34`, tg64 at depth 512: 20-22 -> 26-27 tok/s interleaved with llama.cpp (20.7-22.2),
+same peak VRAM; logits bit-identical to eager (`CudaFlintCpuMoeTests.MoeDecodeGraph_BitIdenticalToEager`: resident,
+mixed and all-CPU placements on the synthetic Flint with a NoPE layer, sinks and a 4-token window); real-file parity
+(`CudaFlintCpuMoeRealProbe`) 158/160 top-1, KL mean 2.1e-3, unchanged.

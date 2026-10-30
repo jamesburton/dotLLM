@@ -2,7 +2,14 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # `dev` is here for the model cache, not only for post-merge CI (#526): a cache saved by
+    # a pull_request run belongs to the merge ref (`refs/pull/.../merge`) and "can only be
+    # restored by re-runs of the pull request", while a run may restore caches from its own
+    # branch, its base branch or the default branch (GitHub dependency-caching docs,
+    # "Restrictions for accessing a cache"). PRs in this fork target `dev`, so without a
+    # `dev`-triggered run nothing ever writes an entry that a *different* PR can read, and
+    # every PR's first run would still start cold.
+    branches: [main, dev]
   pull_request:
 
 env:
@@ -54,6 +61,16 @@ jobs:
       - name: Unit Tests
         run: dotnet test tests/DotLLM.Tests.Unit/ -c Release --filter "Category!=GPU&Category!=Benchmark" --blame-hang-timeout 5m
 
+      # The SSE-only tiers (e.g. KQuantSseTierTests) are gated on `Ssse3 && !Avx2`, so on AVX2 runners they
+      # never execute. Re-run the CPU kernel tests with the wide ISAs disabled so those tiers are exercised
+      # (found via a Westmere box with no AVX, #602).
+      - name: CPU kernel tests (AVX/AVX2/AVX-512 disabled)
+        env:
+          DOTNET_EnableAVX: "0"
+          DOTNET_EnableAVX2: "0"
+          DOTNET_EnableAVX512F: "0"
+        run: dotnet test tests/DotLLM.Tests.Unit/ -c Release --no-build --filter "FullyQualifiedName~DotLLM.Tests.Unit.Cpu&Category!=GPU&Category!=Benchmark" --blame-hang-timeout 5m
+
   integration-tests:
     name: Integration Tests
     needs: build
@@ -73,11 +90,142 @@ jobs:
           key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', 'Directory.Packages.props') }}
           restore-keys: nuget-${{ runner.os }}-
 
-      - name: Cache test models
-        uses: actions/cache@v4
+      # The model cache is split into restore + save (#526). `actions/cache` saves in a
+      # post-job step that only runs when the job succeeds ("On a cache miss, the action
+      # automatically creates a new cache if the job completes successfully" — GitHub
+      # dependency-caching docs), so a red integration suite could never populate the cache,
+      # which made fixture-gated coverage differ run to run. `actions/cache/save` with
+      # `if: always()` is the documented remedy for exactly this ("the builds would run for
+      # hours and the cache couldn't be saved as the workflow failed in between" —
+      # actions/cache save/README.md).
+      #
+      # The NuGet caches above are deliberately left as plain `actions/cache`: the green
+      # `build` job saves the identical key, so they self-heal.
+
+      - name: Resolve test model fixture manifest
+        id: fixtures
+        run: |
+          # The fixture set is the literal argument pairs of TestModelDownloader.EnsureModelAsync,
+          # so the cache key tracks the source of truth and needs no hand-bumped version suffix.
+          # Brittleness note: this only sees single-line call sites. If a call is ever split
+          # across lines the grep misses it, the key stops rotating for that entry, and the
+          # guard below fires if every call site goes multi-line.
+          manifest=$(grep -rhoE 'EnsureModelAsync\("[^"]+", *"[^"]+"\)' tests/DotLLM.Tests.Integration --include='*.cs' \
+            | sed -E 's|EnsureModelAsync\("([^"]+)", *"([^"]+)"\)|\1/\2|' \
+            | LC_ALL=C sort -u || true)
+          if [ -z "$manifest" ]; then
+            echo "::error::No EnsureModelAsync fixtures found — the model-cache key cannot be derived (#526)."
+            exit 1
+          fi
+          printf '%s\n' "$manifest" > "$RUNNER_TEMP/test-models.manifest"
+          expected=$(printf '%s\n' "$manifest" | wc -l | tr -d ' ')
+          hash=$(printf '%s\n' "$manifest" | sha256sum | cut -c1-16)
+          echo "expected=$expected" >> "$GITHUB_OUTPUT"
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
+          echo "Fixture manifest ($expected entries, hash $hash):"
+          sed 's/^/  - /' "$RUNNER_TEMP/test-models.manifest"
+
+      - name: Restore test models
+        id: restore-models
+        uses: actions/cache/restore@v4
         with:
           path: ~/.dotllm/test-cache
-          key: dotllm-test-models-v2
+          # Exact key == "every fixture in the current manifest is in this entry".
+          key: dotllm-test-models-${{ steps.fixtures.outputs.hash }}-${{ steps.fixtures.outputs.expected }}
+          # Fall back to a partial entry for this manifest, then to any older manifest's
+          # entry — either way the run downloads only the delta and saves the union below.
+          restore-keys: |
+            dotllm-test-models-${{ steps.fixtures.outputs.hash }}-
+            dotllm-test-models-
 
       - name: Integration Tests
         run: dotnet test tests/DotLLM.Tests.Integration/ -c Release --blame-hang-timeout 5m
+
+      - name: Inventory cached test models
+        id: inventory
+        if: always()
+        run: |
+          if [ ! -f "$RUNNER_TEMP/test-models.manifest" ]; then
+            echo "No manifest — the resolve step did not complete; nothing to inventory."
+            echo "present=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          present=0
+          bytes=0
+          while IFS= read -r rel; do
+            [ -n "$rel" ] || continue
+            f="$HOME/.dotllm/test-cache/$rel"
+            if [ -f "$f" ]; then
+              present=$((present + 1))
+              bytes=$((bytes + $(stat -c %s "$f")))
+              echo "  cached : $rel"
+            else
+              echo "  MISSING: $rel"
+            fi
+          done < "$RUNNER_TEMP/test-models.manifest"
+          echo "$present of ${{ steps.fixtures.outputs.expected }} fixtures present ($((bytes / 1048576)) MiB)"
+          echo "present=$present" >> "$GITHUB_OUTPUT"
+
+      # Saving under the *actual* fixture count is what makes a partial cache converge:
+      # a run that ends with 5 of 7 saves `...-5`, the next run prefix-restores it, fetches
+      # the rest and saves `...-7` — which is then the exact restore key, so later runs hit
+      # it and skip the save. Re-saving an existing key is a warning, not a failure
+      # (actions/cache src/saveImpl.ts wraps the save in try/catch -> logWarning).
+      - name: Save test models
+        if: always() && steps.restore-models.outputs.cache-hit != 'true' && steps.inventory.outputs.present != '0'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.dotllm/test-cache
+          key: dotllm-test-models-${{ steps.fixtures.outputs.hash }}-${{ steps.inventory.outputs.present }}
+
+  # ---- Fork dev channel ---------------------------------------------------------------------------------------------------------
+  # Every push to `dev` that passes the jobs above publishes a prerelease `v<DEV_BASE_VERSION>-dev.<commit count>` through the same
+  # pipeline as a tagged release (release.yml): archives, SHA256SUMS, provenance attestation. The commit count only ever grows on
+  # `dev`, and numeric prerelease identifiers compare numerically, so the tray's update check orders these correctly - and
+  # 0.3.0-dev.* outranks upstream's 0.2.0-alpha.* tags. When a stable fork release is cut (tag v0.3.0), bump DEV_BASE_VERSION.
+  dev-version:
+    name: Dev version
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev' && github.repository != 'kkokosa/dotLLM'
+    needs: [build, unit-tests, integration-tests]
+    runs-on: ubuntu-latest
+    env:
+      DEV_BASE_VERSION: '0.3.0'
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: v
+        run: echo "tag=v${DEV_BASE_VERSION}-dev.$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+
+  dev-release:
+    name: Dev release
+    needs: dev-version
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.dev-version.outputs.tag }}
+      skip-aot: true
+    secrets: inherit
+
+  # Keep the newest 15 dev prereleases (and their tags); the feed the tray reads stays short and the release page stays readable.
+  dev-prune:
+    name: Prune old dev releases
+    needs: dev-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName,createdAt \
+            --jq '[.[] | select(.tagName | test("-dev[.][0-9]+$"))] | sort_by(.createdAt) | reverse | .[15:] | .[].tagName' |
+          while read -r tag; do
+            echo "deleting $tag"
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+          done

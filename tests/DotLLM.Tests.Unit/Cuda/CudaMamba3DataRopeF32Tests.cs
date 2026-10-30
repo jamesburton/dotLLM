@@ -35,6 +35,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// engineered around here.
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaMamba3DataRopeF32Tests
 {
     private const float Tolerance = 1e-5f;

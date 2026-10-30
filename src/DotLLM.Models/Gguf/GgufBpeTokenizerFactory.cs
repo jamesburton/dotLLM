@@ -20,6 +20,10 @@ public static class GgufBpeTokenizerFactory
     public static BpeTokenizer Load(GgufMetadata metadata)
     {
         string model = metadata.GetStringOrDefault("tokenizer.ggml.model", "llama");
+        if (model is "bert" or "t5")
+            throw new NotSupportedException(
+                $"This GGUF carries a {(model == "bert" ? "BERT WordPiece" : "SentencePiece Unigram")} vocabulary (tokenizer.ggml.model = \"{model}\"), which is "
+                + "not a BpeTokenizer. Load it with GgufTokenizerFactory.Load (returns an ITokenizer).");
         string[] tokens = metadata.GetStringArray("tokenizer.ggml.tokens");
 
         int[]? tokenTypes = metadata.ContainsKey("tokenizer.ggml.token_type")
@@ -29,6 +33,56 @@ public static class GgufBpeTokenizerFactory
         int bosId = (int)metadata.GetUInt32OrDefault("tokenizer.ggml.bos_token_id", 1u);
         int eosId = (int)metadata.GetUInt32OrDefault("tokenizer.ggml.eos_token_id", 2u);
 
+        var tokenizer = LoadByModel(metadata, model, tokens, tokenTypes, bosId, eosId);
+
+        // llama.cpp stops on eot / eom as well as eos (#797): GLM-4.x ends a turn with <|user|> (eot) and a
+        // tool call with <|observation|> (eom), neither of which is the declared eos (<|endoftext|>).
+        var extra = new List<int>(4);
+        void AddEog(int id)
+        {
+            if (id >= 0 && id < tokens.Length && id != eosId && !extra.Contains(id))
+                extra.Add(id);
+        }
+
+        foreach (string key in new[] { "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id" })
+        {
+            if (metadata.ContainsKey(key))
+                AddEog((int)metadata.GetUInt32OrDefault(key, uint.MaxValue));
+        }
+
+        // Explicit EOG list (Flint ships four: <|endoftext|>, <|user|>, <|observation|>, ...).
+        foreach (int id in GgufModelConfigExtractor.GetIntArrayOrEmpty(metadata, "tokenizer.ggml.eog_token_ids"))
+            AddEog(id);
+
+        // llama.cpp (llama-vocab.cpp) also forces <|user|> / <|observation|> as EOG for pre-type "flint".
+        if (metadata.GetStringOrDefault("tokenizer.ggml.pre", "") == "flint")
+        {
+            for (int i = 0; i < tokens.Length; i++)
+            {
+                if (tokens[i] is "<|user|>" or "<|observation|>")
+                    AddEog(i);
+            }
+        }
+
+        tokenizer.ExtraEndOfGenerationTokenIds = extra.ToArray();
+
+        // Gemma 1 / CodeGemma / Gemma 2 are untrained-without-BOS: every consumer that calls
+        // Encode() on a plain prompt (run, bench, server completions) would otherwise feed a
+        // BOS-less stream and get garbage (Gemma 4 included: #784). Scoped to those architectures on purpose — the other
+        // SPM/BPE models keep the historical BOS-agnostic Encode (their chat templates carry BOS).
+        string arch = metadata.GetStringOrDefault("general.architecture", "");
+        if (arch is "gemma" or "gemma2" or "gemma3" or "gemma4" or "gemma-embedding")
+            tokenizer.AddBosToken = GgufAddBosResolver.Resolve(metadata);
+        // EmbeddingGemma frames every text as <bos> ... <eos> (sentence-transformers tokenizer template; llama.cpp add_eos_token).
+        if (arch == "gemma-embedding")
+            tokenizer.AddEosToken = metadata.GetBoolOrDefault("tokenizer.ggml.add_eos_token", true);
+
+        return tokenizer;
+    }
+
+    private static BpeTokenizer LoadByModel(
+        GgufMetadata metadata, string model, string[] tokens, int[]? tokenTypes, int bosId, int eosId)
+    {
         return model switch
         {
             "gpt2" or "llama3" => LoadTiktoken(metadata, tokens, tokenTypes, bosId, eosId),

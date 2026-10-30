@@ -14,8 +14,10 @@ namespace DotLLM.Engine.KvCache;
 /// <item><b>Full-precision ring buffer</b>: recent W tokens in FP32 (quantize-on-evict).</item>
 /// </list>
 /// When <c>windowSize == 0</c>, all tokens are quantized immediately (no ring buffer).
+/// In that mode a geometry with sliding windows (<see cref="KvGeometry.HasSlidingWindows"/>) keeps only the recent rows
+/// of those layers (<see cref="IWindowedKvCache"/>, issue #1169).
 /// </summary>
-public sealed unsafe class QuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache
+public sealed unsafe class QuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache, IWindowedKvCache
 {
     private const int BlockSize = 32;
     private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
@@ -34,6 +36,9 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache, IPerLayerKvCach
     private readonly int[] _keyQuantRowBytes;   // [numLayers] quantized K row bytes
     private readonly int[] _valueQuantRowBytes; // [numLayers] quantized V row bytes
     private readonly int[] _layerQuantizedLength; // per-layer eviction tracking
+    // Compact sliding-window rows; pure quantized mode only. shortcut: the FP32-window mode keeps full rows for sliding
+    // layers, upgrade if that mode is ever used with long-context SWA models (rule 1 says not to grow FP32 windows).
+    private readonly SlidingWindowRows? _rows;
     private int _currentLength;
     private int _quantizedLength;
     private bool _disposed;
@@ -87,7 +92,9 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache, IPerLayerKvCach
     public int KvStrideOf(int layerIndex) => _geom.KvStrideOf(layerIndex);
 
     /// <summary>Total bytes allocated for all KV-cache buffers (quantized + window).</summary>
-    public long AllocatedBytes { get; }
+    public long AllocatedBytes => QuantRowBytesAllocated() + _windowBytes;
+
+    private readonly long _windowBytes;
 
     /// <summary>
     /// Creates a new quantized KV-cache with a single uniform per-layer stride
@@ -131,6 +138,8 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache, IPerLayerKvCach
 
         _keysQuant = new nint[numLayers];
         _valuesQuant = new nint[numLayers];
+        if (windowSize == 0 && geometry.HasSlidingWindows)
+            _rows = new SlidingWindowRows(geometry, maxSeqLen);
 
         long totalBytes = 0;
 
@@ -148,8 +157,9 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache, IPerLayerKvCach
             _keyQuantRowBytes[i] = ComputeQuantRowBytes(stride, keyDType);
             _valueQuantRowBytes[i] = ComputeQuantRowBytes(stride, valueDType);
 
-            nuint kQuantBytes = (nuint)((long)maxSeqLen * _keyQuantRowBytes[i]);
-            nuint vQuantBytes = (nuint)((long)maxSeqLen * _valueQuantRowBytes[i]);
+            long rows = _rows?.CapacityOf(i) ?? maxSeqLen;
+            nuint kQuantBytes = (nuint)(rows * _keyQuantRowBytes[i]);
+            nuint vQuantBytes = (nuint)(rows * _valueQuantRowBytes[i]);
             _keysQuant[i] = (nint)NativeMemory.AlignedAlloc(kQuantBytes, 64);
             _valuesQuant[i] = (nint)NativeMemory.AlignedAlloc(vQuantBytes, 64);
             totalBytes += (long)(kQuantBytes + vQuantBytes);
@@ -169,7 +179,18 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache, IPerLayerKvCach
             }
         }
 
-        AllocatedBytes = totalBytes;
+        _windowBytes = totalBytes - QuantRowBytesAllocated();
+    }
+
+    /// <summary>Bytes held by the quantized row buffers (window buffers excluded).</summary>
+    private long QuantRowBytesAllocated()
+    {
+        if (_rows is not null)
+            return _rows.AllocatedBytes(i => (long)_keyQuantRowBytes[i] + _valueQuantRowBytes[i]);
+        long total = 0;
+        for (int i = 0; i < _numLayers; i++)
+            total += (long)_maxSeqLen * (_keyQuantRowBytes[i] + _valueQuantRowBytes[i]);
+        return total;
     }
 
     /// <summary>Releases unmanaged buffers if <see cref="Dispose()"/> was not called.</summary>
@@ -195,11 +216,19 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache, IPerLayerKvCach
 
         if (_windowSize > 0)
         {
-            // Per-layer eviction: each layer independently tracks how far it has evicted.
             int prevQuantLen = _layerQuantizedLength[layerIndex];
             int newQuantLen = Math.Max(0, newLength - _windowSize);
 
-            for (int evictPos = prevQuantLen; evictPos < newQuantLen; evictPos++)
+            // Phase 1: evict ring slots that hold data from PREVIOUS calls (safe to read).
+            // When seqLen > windowSize, some eviction positions fall in the current batch —
+            // those ring slots have not been written yet (or hold stale data), so we must not
+            // read them. Evict only up to the first position in the current batch.
+            int minNewPos = positions[0];
+            for (int i = 1; i < seqLen; i++)
+                if (positions[i] < minNewPos) minNewPos = positions[i];
+            int safeEvictEnd = Math.Min(newQuantLen, minNewPos);
+
+            for (int evictPos = prevQuantLen; evictPos < safeEvictEnd; evictPos++)
             {
                 int ringIdx = evictPos % _windowSize;
                 QuantizeRow((float*)_keysWindow![layerIndex] + ringIdx * stride,
@@ -210,9 +239,8 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache, IPerLayerKvCach
                             stride, ValueDType);
             }
 
-            _layerQuantizedLength[layerIndex] = newQuantLen;
-
-            // Write new FP32 data into window ring buffer (position-addressed, idempotent).
+            // Phase 2: positions from the current batch that will be evicted immediately
+            // (pos < newQuantLen) — quantize directly from the source data, skip the ring.
             for (int i = 0; i < seqLen; i++)
             {
                 int pos = positions[i];
@@ -220,34 +248,70 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache, IPerLayerKvCach
                     throw new ArgumentOutOfRangeException(nameof(positions),
                         $"Position {pos} exceeds max cache length {_maxSeqLen}.");
 
-                int ringIdx = pos % _windowSize;
-                Buffer.MemoryCopy(
-                    kSrc + i * stride,
-                    (float*)_keysWindow![layerIndex] + ringIdx * stride,
-                    fpRowBytes, fpRowBytes);
-                Buffer.MemoryCopy(
-                    vSrc + i * stride,
-                    (float*)_valuesWindow![layerIndex] + ringIdx * stride,
-                    fpRowBytes, fpRowBytes);
+                if (pos < newQuantLen)
+                {
+                    QuantizeRow(kSrc + i * stride,
+                                (byte*)_keysQuant[layerIndex] + (long)pos * keyRowBytes,
+                                stride, KeyDType);
+                    QuantizeRow(vSrc + i * stride,
+                                (byte*)_valuesQuant[layerIndex] + (long)pos * valueRowBytes,
+                                stride, ValueDType);
+                }
+            }
+
+            _layerQuantizedLength[layerIndex] = newQuantLen;
+
+            // Phase 3: positions that stay in the window — write FP32 into the ring buffer.
+            for (int i = 0; i < seqLen; i++)
+            {
+                int pos = positions[i];
+                if (pos >= newQuantLen)
+                {
+                    int ringIdx = pos % _windowSize;
+                    Buffer.MemoryCopy(
+                        kSrc + i * stride,
+                        (float*)_keysWindow![layerIndex] + ringIdx * stride,
+                        fpRowBytes, fpRowBytes);
+                    Buffer.MemoryCopy(
+                        vSrc + i * stride,
+                        (float*)_valuesWindow![layerIndex] + ringIdx * stride,
+                        fpRowBytes, fpRowBytes);
+                }
             }
 
             _quantizedLength = newQuantLen;
         }
         else
         {
-            // Pure quantized mode: quantize directly at each position (position-addressed).
+            // Pure quantized mode: quantize directly at each position (position-addressed; a compact sliding-window
+            // layer addresses row pos - base).
+            int rowBase = 0;
+            if (_rows is not null && _rows.IsWindowed(layerIndex))
+            {
+                int minPos = positions[0];
+                for (int i = 1; i < seqLen; i++)
+                    if (positions[i] < minPos) minPos = positions[i];
+                if (maxPos >= _maxSeqLen)
+                    throw new ArgumentOutOfRangeException(nameof(positions),
+                        $"Position {maxPos} exceeds max cache length {_maxSeqLen}.");
+                _rows.Prepare(layerIndex, minPos, maxPos, _currentLength,
+                    ref _keysQuant[layerIndex], ref _valuesQuant[layerIndex], keyRowBytes, valueRowBytes);
+                rowBase = _rows.BaseOf(layerIndex);
+            }
+
             for (int i = 0; i < seqLen; i++)
             {
                 int pos = positions[i];
                 if ((uint)pos >= (uint)_maxSeqLen)
                     throw new ArgumentOutOfRangeException(nameof(positions),
                         $"Position {pos} exceeds max cache length {_maxSeqLen}.");
+                long row = pos - rowBase;
 
                 QuantizeRow(kSrc + i * stride,
-                            (byte*)_keysQuant[layerIndex] + (long)pos * keyRowBytes,
+                            (byte*)_keysQuant[layerIndex] + row * keyRowBytes,
                             stride, KeyDType);
                 QuantizeRow(vSrc + i * stride,
-                            (byte*)_valuesQuant[layerIndex] + (long)pos * valueRowBytes,
+                            (byte*)_valuesQuant[layerIndex] + row * valueRowBytes,
                             stride, ValueDType);
             }
 
@@ -265,6 +329,11 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache, IPerLayerKvCach
         var vRef = new TensorRef(positions.Length, stride, values.DType, values.DeviceId, values.DataPointer);
         Update(kRef, vRef, positions, layerIndex);
     }
+
+    /// <inheritdoc/>
+    /// <remarks>For a compact sliding-window layer the quantized rows start at this position, not 0.</remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public int RowBaseOf(int layerIndex) => _rows?.BaseOf(layerIndex) ?? 0;
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -308,6 +377,14 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache, IPerLayerKvCach
     {
         if ((uint)length > (uint)_currentLength)
             throw new ArgumentOutOfRangeException(nameof(length));
+        if (_rows is not null)
+        {
+            if (!_rows.CanTruncateTo(length))
+                throw new InvalidOperationException(
+                    $"Cannot roll the KV-cache back to {length}: a sliding-window layer already dropped rows that length needs "
+                    + $"(margin {SlidingWindowRows.Margin} positions).");
+            if (length == 0) _rows.Reset();
+        }
         _currentLength = length;
         if (_quantizedLength > length)
             _quantizedLength = length;

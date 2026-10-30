@@ -1,10 +1,12 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Evaluation;
 using DotLLM.Core.Models;
 using DotLLM.Engine;
 using DotLLM.Engine.Evaluation;
+using DotLLM.Engine.KvCache;
 using DotLLM.Models;
 using DotLLM.Models.Evaluation;
 using DotLLM.Models.Gguf;
@@ -17,9 +19,18 @@ namespace DotLLM.Cli.Commands;
 /// Computes perplexity over a text corpus: load → stream-tokenize → score.
 /// </summary>
 /// <remarks>
-/// Defaults to <see cref="PerplexityMode.SlidingWindow"/> with <c>stride = context / 2</c>, which
-/// reproduces llama.cpp's <c>--perplexity</c> methodology, so the reported figure is directly
-/// comparable to published numbers for the same model, corpus, context and stride.
+/// Defaults to <see cref="PerplexityMode.SlidingWindow"/> with <c>stride = context</c> —
+/// non-overlapping chunks, scoring the second half of each, per
+/// <see cref="PerplexityOptions.LlamaCppDefault"/> (the remark used to say <c>context / 2</c>,
+/// which is a different measurement: it scores every token rather than half of them). This
+/// reproduces llama.cpp's <c>--perplexity</c> methodology, so the reported figure is comparable to
+/// published numbers for the same model, corpus, context and stride — <b>provided both engines
+/// tokenize the same bytes</b>. That proviso is not automatic: a CRLF corpus is read differently
+/// by an MSVC-built <c>llama-perplexity</c> (text mode collapses <c>\r\n</c>) than by dotLLM, and
+/// measured on wikitext-2 that made 501 of the 512 tokens in chunk 0 differ (issue #506). The
+/// command therefore scans for CR bytes and warns. See <c>docs/PERPLEXITY.md</c> for the LF
+/// fixture and the <c>--kl-divergence-base</c> / <c>--tokens-file</c> protocol that removes the
+/// assumption entirely.
 /// </remarks>
 internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Settings>
 {
@@ -38,6 +49,11 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         [CommandOption("--corpus|-f")]
         [Description("Path to a UTF-8 text corpus (e.g. wiki.test.raw).")]
         public string Corpus { get; set; } = string.Empty;
+
+        [CommandOption("--normalize-line-endings")]
+        [Description("Collapse CRLF to LF while reading --corpus, as MSVC text mode does. OFF by default. Use ONLY when the reference figure came from a Windows llama.cpp build reading the same CRLF file; llama.cpp on Linux keeps the CRs, so normalizing there creates a mismatch. Preferred fix is an LF corpus (see docs/PERPLEXITY.md, issue #506).")]
+        [DefaultValue(false)]
+        public bool NormalizeLineEndings { get; set; }
 
         [CommandOption("--context|-c")]
         [Description("Context window in tokens. Clamped to the model's maximum sequence length.")]
@@ -78,16 +94,15 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         public bool PerWindow { get; set; }
 
         [CommandOption("--bos")]
-        [Description("Substitute BOS at the start of each window. Match the model's add_bos setting: llama.cpp only does this when the tokenizer requests it.")]
-        [DefaultValue(false)]
-        public bool Bos { get; set; }
+        [Description("Prepend BOS to the stream and substitute it at each window start. Defaults to the model's own setting, derived from the vocab exactly as llama.cpp derives it; pass --bos true/false only to override that.")]
+        public bool? Bos { get; set; }
 
         [CommandOption("--quant")]
         [Description("Quantization to select when resolving a HuggingFace repo ID.")]
         public string? Quant { get; set; }
 
         [CommandOption("--device|-d")]
-        [Description("Compute device: 'cpu' (default), 'vulkan', 'cuda' / 'cuda:1' ('gpu' is an alias for cuda).")]
+        [Description("Compute device: 'cpu' (default here, so perplexity numbers stay comparable across machines), 'auto', 'vulkan', 'gpu'/'cuda', 'gpu:1'/'cuda:1'. An explicit GPU that cannot be honoured is an error, never a silent CPU run.")]
         [DefaultValue("cpu")]
         public string Device { get; set; } = "cpu";
 
@@ -95,6 +110,32 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         [Description("Compute threads. 0 = auto.")]
         [DefaultValue(0)]
         public int Threads { get; set; }
+
+        [CommandOption("--rope-scaling")]
+        [Description("RoPE scaling override: 'none', 'linear', 'yarn', 'ntk', 'dynamic' (as on run/serve; issue #1101 measures YaRN's short-context cost).")]
+        public string? RopeScaling { get; set; }
+
+        [CommandOption("--rope-scale")]
+        [Description("RoPE scaling factor override (linear/YaRN/NTK).")]
+        public float? RopeScale { get; set; }
+
+        [CommandOption("--yarn-orig-ctx")]
+        [Description("YaRN original context length override.")]
+        public int? YarnOrigCtx { get; set; }
+
+        [CommandOption("--yarn-attn-factor")]
+        [Description("YaRN attention factor override.")]
+        public float? YarnAttnFactor { get; set; }
+
+        [CommandOption("--kv-cache")]
+        [Description("KV-cache storage format for perplexity scoring: 'none' (cacheless, exact K/V baseline — the default), 'f32' (FP32 cache), 'q8_0', 'q4_0'. When set, the forward pass reads K/V from the cache, so perplexity reflects the quantization quality of KV storage.")]
+        [DefaultValue("none")]
+        public string KvCache { get; set; } = "none";
+
+        [CommandOption("--kv-window")]
+        [Description("Full-precision window size for quantized KV cache (recent tokens kept in FP32 before quantize-on-evict). 0 = quantize all tokens immediately. Only applies when --kv-cache is q8_0 or q4_0.")]
+        [DefaultValue(0)]
+        public int KvWindow { get; set; }
     }
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
@@ -122,6 +163,20 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
             return 1;
         }
 
+        // Issue #506: a CRLF corpus makes dotLLM and a Windows llama.cpp build tokenize different
+        // text, which silently invalidated every end-to-end quality comparison made that way.
+        // Warned before the model loads so it is the first thing on screen, and repeated in the
+        // results table below because the table is what gets pasted into an issue.
+        long corpusCarriageReturns = 0;
+        if (settings.TokensFile is null)
+        {
+            corpusCarriageReturns = CorpusLineEndings.CountCarriageReturns(settings.Corpus);
+            string? lineEndingWarning =
+                CorpusLineEndings.DescribeMismatchRisk(settings.Corpus, corpusCarriageReturns);
+            if (lineEndingWarning is not null)
+                AnsiConsole.MarkupLine($"[yellow]{Markup.Escape(lineEndingWarning)}[/]");
+        }
+
         if (!TryParseMode(settings.Mode, out PerplexityMode mode))
         {
             AnsiConsole.MarkupLine(
@@ -129,28 +184,67 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
             return 1;
         }
 
-        string? resolvedPath = GgufFileResolver.Resolve(settings.Model, settings.Quant);
+        // HuggingFace safetensors directory (e.g. a LittleBit factorized checkpoint, #864): CPU only, token ids
+        // supplied via --tokens-file (no GGUF tokenizer to read).
+        string? hfDir = Directory.Exists(settings.Model) && File.Exists(Path.Combine(settings.Model, "config.json"))
+            ? settings.Model : null;
+        if (hfDir is not null)
+        {
+            if (settings.TokensFile is null)
+            {
+                AnsiConsole.MarkupLine("[red]A safetensors model directory requires --tokens-file (pre-tokenized ids).[/]");
+                return 1;
+            }
+            if (!string.Equals(settings.Device, "cpu", StringComparison.OrdinalIgnoreCase))
+            {
+                AnsiConsole.MarkupLine("[red]Safetensors model directories are scored on --device cpu only.[/]");
+                return 1;
+            }
+        }
+
+        string? resolvedPath = hfDir ?? GgufFileResolver.Resolve(settings.Model, settings.Quant);
         if (resolvedPath is null)
             return 1;
 
-        using GgufFile gguf = GgufFile.Open(resolvedPath);
-        ModelConfig config = GgufModelConfigExtractor.Extract(gguf.Metadata);
-        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
-
-        if (!TryParseDevice(settings.Device, out string backend, out int gpuId))
-        {
-            AnsiConsole.MarkupLine(
-                $"[red]Unknown --device '{Markup.Escape(settings.Device)}'. Expected 'cpu', 'vulkan', 'cuda' or 'cuda:N'.[/]");
-            return 1;
-        }
-
-        // Both are owned here and released in the finally below. The previous CPU-only code got
-        // this from `using TransformerModel`; with a backend switch the model's static type is
-        // IModel (itself IDisposable) and Vulkan additionally owns a device handle.
+        using GgufFile? gguf = hfDir is null ? GgufFile.Open(resolvedPath) : null;
+        ModelConfig config;
+        var tokenizer = hfDir is null ? GgufBpeTokenizerFactory.Load(gguf!.Metadata) : null;
+        IDisposable? safetensorsSource = null;
         IModel model;
         IDisposable? ownedDevice = null;
         int forwardDeviceId;
         string deviceLabel;
+        bool addBos;
+
+        if (hfDir is not null)
+        {
+            var (m, src, cfg) = ModelLoader.LoadFromSafetensors(hfDir, new ThreadingConfig(settings.Threads));
+            model = m; config = cfg; safetensorsSource = src as IDisposable;
+            ownedDevice = safetensorsSource;
+            addBos = settings.Bos ?? false;
+            forwardDeviceId = -1;
+            deviceLabel = $"cpu-{new ThreadingConfig(settings.Threads).EffectiveThreadCount}t (safetensors)";
+        }
+        else
+        {
+        config = GgufModelConfigExtractor.Extract(gguf!.Metadata);
+        config = GgufModelConfigExtractor.ApplyRoPEOverride(config, DotLLM.Server.ServerOptions.BuildRopeOverride(
+            settings.RopeScaling, freqBase: null, settings.RopeScale, settings.YarnOrigCtx, settings.YarnAttnFactor,
+            betaFast: null, betaSlow: null));
+
+        // Issue #515/#516: llama.cpp prepends BOS to the whole stream when the vocab asks for it,
+        // and dotLLM did not -- so every chunk boundary sat one token off llama.cpp's and the two
+        // engines scored different text. The setting is a property of the vocab, not a user
+        // preference, so it is derived here and --bos only overrides it.
+        addBos = settings.Bos ?? GgufAddBosResolver.Resolve(gguf.Metadata);
+
+        // One shared parser/resolution (#790): unknown value -> error, explicit GPU that cannot be honoured -> error (never CPU), auto -> best device.
+        if (!Helpers.DeviceCli.TryResolveForTool(settings.Device, resolvedPath, json: false, out string backend, out int gpuId))
+            return 1;
+
+        // Both are owned here and released in the finally below. The previous CPU-only code got
+        // this from `using TransformerModel`; with a backend switch the model's static type is
+        // IModel (itself IDisposable) and Vulkan additionally owns a device handle.
         switch (backend)
         {
             case "cuda":
@@ -190,6 +284,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
                 break;
             }
         }
+        }
 
         int effectiveContext = Math.Min(settings.Context, config.MaxSequenceLength);
         // Defaults reproduce llama.cpp: non-overlapping chunks, scoring the second half of each.
@@ -216,8 +311,15 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         }
         else
         {
-            using var reader = new StreamReader(settings.Corpus);
-            foreach (int id in CorpusReader.StreamTokens(reader, tokenizer, settings.MaxTokens))
+            using var fileReader = new StreamReader(settings.Corpus);
+            // Default is the raw bytes: llama.cpp on Linux keeps the CRs too, so stripping them
+            // unconditionally would trade a Windows mismatch for a Linux one (issue #506).
+            using TextReader reader = settings.NormalizeLineEndings
+                ? new CrlfNormalizingTextReader(fileReader)
+                : fileReader;
+            foreach (int id in CorpusReader.StreamTokens(
+                         reader, tokenizer!, settings.MaxTokens,
+                         bosTokenId: addBos ? tokenizer!.BosTokenId : -1))
                 tokens.Add(id);
         }
 
@@ -230,17 +332,47 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         if (settings.DumpTokens is not null)
             File.WriteAllText(settings.DumpTokens, string.Join(' ', tokens));
 
+        // #992: optional KV cache so perplexity measures the cache's storage format.
+        if (!TryParseKvCacheMode(settings.KvCache, out KvCacheDType? kvKeyDType, out KvCacheDType? kvValueDType))
+        {
+            AnsiConsole.MarkupLine(
+                $"[red]Unknown --kv-cache '{Markup.Escape(settings.KvCache)}'. Expected 'none', 'f32', 'q8_0', or 'q4_0'.[/]");
+            return 1;
+        }
+
+        IKvCache? kvCache = null;
+        string kvCacheLabel = "none (cacheless, exact K/V)";
+
         try
         {
         // Probed, not assumed: the CPU transformer returns [seqLen, vocab] but the CUDA model
         // returns only the final row, and that difference silently changes the perplexity rather
         // than raising. See BackendPerplexityModel.Probe.
-        bool returnsAllRows = BackendPerplexityModel.Probe(model, forwardDeviceId);
-        var perplexityModel = new BackendPerplexityModel(model, forwardDeviceId, returnsAllRows);
+        // A model that returns the last row only by default may widen on request (#564): a whole
+        // scoring window (+1 for a prepended BOS) is the longest batch this run will submit.
+        model.TrySetAllRowLogitsLimit(effectiveContext + 1);
+        bool returnsAllRows = BackendPerplexityModel.Probe(model, forwardDeviceId, effectiveContext + 1);
+        if (kvKeyDType is not null)
+        {
+            var geom = KvGeometry.FromConfig(config, model.SupportsCompactSlidingKv);
+            if (kvKeyDType == KvCacheDType.F32)
+            {
+                kvCache = new SimpleKvCache(geom, effectiveContext);
+                kvCacheLabel = "f32";
+            }
+            else
+            {
+                kvCache = new QuantizedKvCache(geom, effectiveContext,
+                    kvKeyDType.Value, kvValueDType!.Value, settings.KvWindow);
+                kvCacheLabel = $"{settings.KvCache}" + (settings.KvWindow > 0 ? $" (window={settings.KvWindow})" : "");
+            }
+        }
+
+        var perplexityModel = new BackendPerplexityModel(model, forwardDeviceId, returnsAllRows, kvCache);
         AnsiConsole.MarkupLine(
             $"[grey]device: {Markup.Escape(deviceLabel)}  all-rows logits: {returnsAllRows} "
-            + $"({(returnsAllRows ? "single-pass O(n)" : "growing-prefix O(n^2)")})[/]");
-        int bosTokenId = settings.Bos ? tokenizer.BosTokenId : -1;
+            + $"({(returnsAllRows ? "single-pass O(n)" : "growing-prefix O(n^2)")})  kv-cache: {kvCacheLabel}[/]");
+        int bosTokenId = addBos ? tokenizer!.BosTokenId : -1;
         var options = new PerplexityOptions(
             mode, effectiveContext, effectiveStride, settings.MaxTokens, effectivePrefix, bosTokenId);
 
@@ -280,6 +412,12 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         table.AddRow("Stride", $"{effectiveStride:N0}");
         table.AddRow("Unscored prefix", $"{effectivePrefix:N0}");
         table.AddRow("Corpus tokens", $"{tokens.Count:N0}");
+        if (settings.TokensFile is null)
+        {
+            table.AddRow("Corpus line endings", Markup.Escape(
+                CorpusLineEndings.SummarizeForReport(corpusCarriageReturns, settings.NormalizeLineEndings)));
+        }
+        table.AddRow("KV cache", kvCacheLabel);
         table.AddRow("Elapsed", $"{sw.Elapsed.TotalSeconds:F2} s");
         AnsiConsole.Write(table);
 
@@ -288,33 +426,12 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         }
         finally
         {
+            kvCache?.Dispose();
             model.Dispose();
             ownedDevice?.Dispose();
         }
     }
 
-    /// <summary>
-    /// Parses <c>--device</c> into a backend name and GPU ordinal, mirroring <c>bench</c>'s syntax so
-    /// the two commands accept the same strings (<c>cpu</c>, <c>vulkan</c>, <c>cuda</c>, <c>cuda:1</c>,
-    /// and <c>gpu</c> as an alias for cuda).
-    /// </summary>
-    /// <param name="device">Raw option value.</param>
-    /// <param name="backend">Normalized backend name.</param>
-    /// <param name="gpuId">Device ordinal; 0 unless an explicit <c>:N</c> suffix is given.</param>
-    /// <returns><see langword="true"/> when the value names a supported backend.</returns>
-    private static bool TryParseDevice(string device, out string backend, out int gpuId)
-    {
-        backend = (device ?? "cpu").Split(':')[0].ToLowerInvariant();
-        if (backend.Length == 0) backend = "cpu";
-        if (backend == "gpu") backend = "cuda";
-
-        gpuId = 0;
-        string[] parts = (device ?? string.Empty).Split(':');
-        if (parts.Length > 1 && int.TryParse(parts[1], out int ordinal) && ordinal >= 0)
-            gpuId = ordinal;
-
-        return backend is "cpu" or "cuda" or "vulkan";
-    }
 
     /// <summary>
     /// Resolves the SPIR-V blob directory for Vulkan: <c>spv/</c> next to the running assembly,
@@ -352,6 +469,39 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
                 return true;
             default:
                 mode = default;
+                return false;
+        }
+    }
+
+    /// <summary>
+    /// Parses the <c>--kv-cache</c> value into key/value dtype pairs. Returns <see langword="false"/>
+    /// for unrecognised values. <c>null</c> dtypes mean cacheless (the default).
+    /// </summary>
+    private static bool TryParseKvCacheMode(string value, out KvCacheDType? keyDType, out KvCacheDType? valueDType)
+    {
+        keyDType = null;
+        valueDType = null;
+        switch (value.Trim().ToLowerInvariant())
+        {
+            case "none":
+            case "off":
+                return true;
+            case "f32":
+            case "fp32":
+                keyDType = KvCacheDType.F32;
+                valueDType = KvCacheDType.F32;
+                return true;
+            case "q8_0":
+            case "q8":
+                keyDType = KvCacheDType.Q8_0;
+                valueDType = KvCacheDType.Q8_0;
+                return true;
+            case "q4_0":
+            case "q4":
+                keyDType = KvCacheDType.Q4_0;
+                valueDType = KvCacheDType.Q4_0;
+                return true;
+            default:
                 return false;
         }
     }

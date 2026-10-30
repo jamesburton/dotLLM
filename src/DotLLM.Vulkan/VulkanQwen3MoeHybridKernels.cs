@@ -1,4 +1,4 @@
-﻿using DotLLM.Vulkan.Kernels;
+﻿﻿using DotLLM.Vulkan.Kernels;
 
 namespace DotLLM.Vulkan;
 
@@ -16,6 +16,169 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MatMulQ8_0Kernel MatMulQ8 { get; }
     public MatMulQ8_0GemmKernel MatMulQ8Gemm { get; }
     public MatMulQ8_0GemmCoopmatKernel? MatMulQ8GemmCoopmat { get; }
+
+    // Blocked 128x128 coopmat K-quant / IQ4_XS prefill GEMMs (issue #607): attached after construction in Create so the
+    // (already huge) constructor is untouched. Null when the device lacks wave64 cooperative matrix or the SPIR-V is absent.
+    public MatMulQ2KGemmCoopmatKernel? MatMulQ2KGemmCoopmat { get; private set; }
+    public MatMulQ3KGemmCoopmatKernel? MatMulQ3KGemmCoopmat { get; private set; }
+    public MatMulQ4KGemmCoopmatKernel? MatMulQ4KGemmCoopmat { get; private set; }
+    /// <summary>Int8-coopmat MMQ prefill GEMM for Q8_0 weights (#1226, RDNA3/3.5 only); null elsewhere or with <c>DOTLLM_VK_MMQ_CM1=0</c>.</summary>
+    public MatMulMmqCm1Kernel? MatMulQ8MmqCm1 { get; private set; }
+    /// <summary>Int8-coopmat MMQ prefill GEMM for Q4_K weights (#1226).</summary>
+    public MatMulMmqCm1Kernel? MatMulQ4KMmqCm1 { get; private set; }
+    /// <summary>Row-wise Q8_1 activation quantizer feeding the int8-coopmat GEMMs; non-null exactly when one of them is.</summary>
+    public QuantizeQ8_1RowsKernel? QuantizeQ8_1RowsCm1 { get; private set; }
+    public MatMulQ5KGemmCoopmatKernel? MatMulQ5KGemmCoopmat { get; private set; }
+    public MatMulQ6KGemmCoopmatKernel? MatMulQ6KGemmCoopmat { get; private set; }
+    public MatMulIq4XsGemmCoopmatKernel? MatMulIq4XsGemmCoopmat { get; private set; }
+    // Grouped-by-expert prefill path for resident Q4_K gate/up + Q5_K down banks (issue #637). All null/absent together unless every piece loads.
+    public MoeExpertOffsetsKernel? MoeExpertOffsets { get; private set; }
+    public MoeBuildTileListKernel? MoeBuildTileList { get; private set; }
+    public MoeExpandGatherGroupF32Kernel? MoeExpandGatherGroup { get; private set; }
+    public MoeWeightedScatterGroupedF32Kernel? MoeWeightedScatterGrouped { get; private set; }
+    /// <summary>Single-token fused weighted scatter + shared-expert sigmoid-gated add (#885); null when the SPIR-V is missing.</summary>
+    public MoeScatterGatedAddDecodeF32Kernel? MoeScatterGatedAddDecode { get; private set; }
+    /// <summary>Fused shared-expert gate + sigmoid-gated add for prefill (issue #693); null when disabled or the SPIR-V is missing.</summary>
+    public MoeSharedGateAddF32Kernel? MoeSharedGateAdd { get; private set; }
+    /// <summary>Fused conv + SiLU for the GDN prefill (issue #695); null when disabled or the SPIR-V is missing.</summary>
+    public GdnConvSiluF32Kernel? GdnConvSilu { get; private set; }
+    /// <summary>LFM2 gated short-conv mixer core (#1015); null when the blob is absent.</summary>
+    public Lfm2ShortConvF32Kernel? Lfm2ShortConv { get; private set; }
+    /// <summary>Sigmoid + selection-bias top-k router (DeepSeek-V3 / GLM / MiMo / LFM2-MoE); null when the blob is absent.</summary>
+    public MoeTopKSigmoidBiasF32Kernel? MoeTopkSigmoid { get; private set; }
+    public MoeExpandGroupByExpertF32Kernel? MoeExpandGroupByExpert { get; private set; }
+    public MoeUngroupScatterF32Kernel? MoeUngroupScatter { get; private set; }
+    public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ4K { get; private set; }
+    public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ5K { get; private set; }
+    public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ6K { get; private set; }
+    /// <summary>dp4a register-tiled grouped Q4_K MMQ (issue #986); preferred over coopmat when available.</summary>
+    public MoeGroupedMatmulKQuantMmqKernel? MoeGroupedQ4KMmq { get; private set; }
+    /// <summary>dp4a register-tiled grouped Q5_K MMQ (issue #986).</summary>
+    public MoeGroupedMatmulKQuantMmqKernel? MoeGroupedQ5KMmq { get; private set; }
+    /// <summary>Fused SwiGLU + Q8_1 row quantize for the grouped MMQ prefill path (#986); eliminates a barrier + BW pass.</summary>
+    public SwiGluQuantizeRowsKernel? SwiGluQuantizeRows { get; private set; }
+    /// <summary>Q8_1 broadcast+gather for the quantize-once MMQ path (#986); replaces F32 gather + quantize.</summary>
+    public MoeExpandGatherGroupQ8_1Kernel? MoeExpandGatherGroupQ8_1 { get; private set; }
+    // Decode-path (small expanded-row count) indexed dp4a MMVQ GEMVs: coalesced subgroup-per-cell, replacing the one-thread-per-cell MMQ/scalar kernels.
+    public MoeIndexedMatmulKQuantMmvqKernel? MoeMmvqQ4K { get; private set; }
+    /// <summary>Multi-row (NR output rows per workgroup) Q4_K indexed MMVQ for the 2..15-token MoE steps (#876); null = off.</summary>
+    public MoeIndexedMatmulKQuantMmvqKernel? MoeMmvqQ4KMr { get; private set; }
+    /// <summary>Multi-row Q5_1 indexed MMVQ (down bank) for the 2..15-token MoE steps (#876); null = off.</summary>
+    public MoeIndexedMatmulQ5_1MmvqKernel? MoeMmvqQ5_1Mr { get; private set; }
+    /// <summary>Dense Q8_0 decode MMVQ GEMV (dp4a, coalesced) for the GDN / attention / shared-expert projections (all Q8_0 in the UD-Q4_K_M GGUF).</summary>
+    public MatMulQ8_0MmvqKernel? MatMulQ8Mmvq { get; private set; }
+    /// <summary>Wide Q8_0 MMVQ twins (#885): 4 rows per workgroup (small-K tall matrices) and 4 subgroups per row (large-K short matrices).</summary>
+    public MatMulQ8_0MmvqWideKernel? MatMulQ8MmvqWideRows { get; private set; }
+    public MatMulQ8_0MmvqWideKernel? MatMulQ8MmvqWideKSplit { get; private set; }
+    /// <summary>Q8_0 multi-column MMVQ GEMV for 2..8 rows (#876); null when disabled (<c>DOTLLM_VK_SMALLROW_GEMV=0</c>) or unsupported.</summary>
+    public MatMulQ8_0MmvqMultiKernel? MatMulQ8MmvqMulti { get; private set; }
+    /// <summary>F32 multi-column GEMV for 2..8 rows (#876); null when disabled or unsupported.</summary>
+    public MatMulF32GemvMultiKernel? MatMulF32Multi { get; private set; }
+    /// <summary>F16 multi-column GEMV for 2..8 rows (#876); null when unsupported.</summary>
+    public MatMulF16GemvMultiKernel? MatMulF16Multi { get; private set; }
+
+    /// <summary>Q8_0 multi-column GEMV with FP32 activations, bit-identical per column to the coalesced 1-row GEMV (#1185); null when unavailable.</summary>
+    public MatMulQ8_0GemvMultiKernel? MatMulQ8Multi { get; private set; }
+
+    /// <summary>Multi-column (2..8 rows) F32-in GEMVs for the K-quant / IQ dense-projection formats (#902); null when the shader is missing.</summary>
+    public MatMulQuantGemvMultiKernel? MatMulQ4KMulti { get; private set; }
+
+    /// <summary>
+    /// Output rows per workgroup of <see cref="MatMulQ4KMulti"/> (#1220) for one column: <c>DOTLLM_VK_Q4K_ROWS</c> (1..8), default 2; <c>DOTLLM_VK_Q4K_ROWS_MULTI</c> (default 4) for 2..8 columns. The kernel also serves
+    /// Q4_K decode (one column) so that a verify batch's columns are bit-identical to plain decode.
+    /// </summary>
+    internal static int Q4KRowsPerWorkgroup { get; } = RowsFromEnv("DOTLLM_VK_Q4K_ROWS", 2);
+
+    /// <summary>
+    /// Rows-per-workgroup knob (1..8) from <paramref name="name"/>, else <paramref name="fallback"/>. #1220 on Strix: NR = 2 is best for one column
+    /// (decode), NR = 4 for the 3..4-column MTP verify; the <c>*_MULTI</c> variables set the latter.
+    /// </summary>
+    private static int RowsFromEnv(string name, int fallback) =>
+        int.TryParse(Environment.GetEnvironmentVariable(name), out int v) && v is >= 1 and <= 8 ? v : fallback;
+
+    /// <summary>Q6_K GEMV for the dense qwen35 decode and verify (#1220; NR from <c>DOTLLM_VK_Q6K_ROWS</c> / <c>_MULTI</c>, default 2 / 4); null without the shader or with <c>DOTLLM_VK_Q6K_ROWS_DECODE=0</c>.</summary>
+    public MatMulQuantGemvMultiKernel? MatMulQ6KRows { get; private set; }
+
+    /// <summary>
+    /// Q8_0 decode GEMV on <see cref="MatMulQ8Multi"/> at one column for the dense qwen35 model (#1220) unless <c>DOTLLM_VK_Q8_ROWS_DECODE=0</c>
+    /// (A/B: the coalesced 1-row kernel, ULP-close to the verify columns).
+    /// </summary>
+    internal MatMulQ8_0GemvMultiKernel? Q8DecodeOnRows =>
+        Environment.GetEnvironmentVariable("DOTLLM_VK_Q8_ROWS_DECODE") != "0" ? MatMulQ8Multi : null;
+
+    /// <summary>Output rows per workgroup of <see cref="MatMulQ8Multi"/> (#1220) for one column: <c>DOTLLM_VK_Q8_ROWS</c> (1..8), default 2; <c>DOTLLM_VK_Q8_ROWS_MULTI</c> (default 4) for 2..8 columns.</summary>
+    internal static int Q8RowsPerWorkgroup { get; } = RowsFromEnv("DOTLLM_VK_Q8_ROWS", 2);
+
+    /// <summary>
+    /// Q4_K decode GEMV on <see cref="MatMulQ4KMulti"/> at one column (#1220) unless <c>DOTLLM_VK_Q4K_ROWS_DECODE=0</c>, which restores the
+    /// coalesced 1-row kernel (A/B; MTP verify columns are then only ULP-close to decode).
+    /// </summary>
+    internal MatMulQuantGemvMultiKernel? Q4KDecodeOnRows =>
+        Environment.GetEnvironmentVariable("DOTLLM_VK_Q4K_ROWS_DECODE") != "0" && MatMulQ4KMulti is { SupportsSingleColumn: true } k ? k : null;
+
+    /// <inheritdoc cref="MatMulQ4KMulti"/>
+    public MatMulQuantGemvMultiKernel? MatMulQ5KMulti { get; private set; }
+    /// <inheritdoc cref="MatMulQ4KMulti"/>
+    public MatMulQuantGemvMultiKernel? MatMulQ6KMulti { get; private set; }
+    /// <summary>Q6_K multi-column GEMV with two output rows per workgroup (#996), used from 3 columns (#1193: the lm-head over a verify or a DFlash block).</summary>
+    public MatMulQuantGemvMultiKernel? MatMulQ6KMultiR2 { get; private set; }
+    /// <inheritdoc cref="MatMulQ4KMulti"/>
+    public MatMulQuantGemvMultiKernel? MatMulIq4XsMulti { get; private set; }
+    /// <inheritdoc cref="MatMulQ4KMulti"/>
+    public MatMulQuantGemvMultiKernel? MatMulIq3SMulti { get; private set; }
+    // One-dispatch replacements for the per-token vkCmdCopyBuffer fan-out loops (GDN [Q|K|V] split, attention Q+gate de-interleave).
+    public DeinterleaveF32Kernel? GdnQkvSplit { get; private set; }
+    public DeinterleaveF32Kernel? QGateDeinterleave { get; private set; }
+    // Decode-only fused ops for the MoE layer (issue #647): RMSNorm + Q8_1 quantize, and SwiGLU + Q8_1 quantize.
+    public RmsNormQuantizeQ8_1FusedKernel? RmsNormQuantizeFused { get; private set; }
+    public SwiGluQuantizeQ8_1FusedKernel? SwiGluQuantizeFused { get; private set; }
+    public MoeIndexedMatmulKQuantMmvqKernel? MoeMmvqQ5K { get; private set; }
+    // #849: legacy 32-element-block expert banks (Q5_1 / Q8_0 down projections of UD-Q4_K_XL files). Scalar F32-in indexed kernels are the
+    // always-available correctness path; MMVQ (dp4a) serves decode, the legacy coopmat grouped kernels serve prefill (always 16-row tiles).
+    /// <summary>Scalar F32-in indexed Q5_1 matmul (applies a per-expert output scale; the MoE path passes a unit-scale buffer).</summary>
+    public MoeIndexedMatmulQ5_1F32Kernel? MoeIndexedMatmulQ5_1 { get; private set; }
+    /// <summary>Scalar F32-in indexed Q8_0 matmul.</summary>
+    public MoeIndexedMatmulQ8_0F32Kernel? MoeIndexedMatmulQ8_0 { get; private set; }
+    /// <summary>Indexed Q5_1 MMVQ (dp4a) decode GEMV.</summary>
+    public MoeIndexedMatmulQ5_1MmvqKernel? MoeMmvqQ5_1 { get; private set; }
+    /// <summary>Indexed Q8_0 MMVQ (dp4a) decode GEMV.</summary>
+    public MoeIndexedMatmulQ8_0MmvqKernel? MoeMmvqQ8_0 { get; private set; }
+    /// <summary>Dense native Q4_0 decode MMVQ GEMV (dp4a; #1018). Null without integer-dot-product, or with <c>DOTLLM_VK_Q4_0_NATIVE=0</c>.</summary>
+    public MatMulQ4_0MmvqKernel? MatMulQ4_0Mmvq { get; private set; }
+    /// <summary>Dense native Q4_0 prefill GEMM on the 128x128x4 coopmat tile (#1018). Null without cooperative matrices / wave64.</summary>
+    public MatMulQ4_0GemmCoopmatKernel? MatMulQ4_0GemmCoopmat { get; private set; }
+    /// <summary>Portable packed Q4_0 GEMM fallback when cooperative matrices are unavailable.</summary>
+    public MatMulQ4_0GemmF32Kernel? MatMulQ4_0Gemm { get; private set; }
+    /// <summary>Grouped coopmat Q5_1 prefill kernel (16-row tiles).</summary>
+    public MoeGroupedMatmulLegacyQuantCoopmatKernel? MoeGroupedQ5_1 { get; private set; }
+    /// <summary>Grouped coopmat Q8_0 prefill kernel (16-row tiles).</summary>
+    public MoeGroupedMatmulLegacyQuantCoopmatKernel? MoeGroupedQ8_0 { get; private set; }
+    private readonly Dictionary<string, MoeGroupedMatmulLegacyQuantCoopmatKernel> _q8Wide = new();
+    /// <summary>#1354/#1353: the wide-tile Q8_0 grouped kernel for variant suffix <paramref name="variant"/> (<c>n32diet</c>, <c>n64diet</c>), or null.</summary>
+    public MoeGroupedMatmulLegacyQuantCoopmatKernel? MoeGroupedQ8_0Wide(string variant) => _q8Wide.GetValueOrDefault(variant);
+    /// <summary>16-row Q4_K grouped kernel, present only when <see cref="MoeGroupedQ4K"/> is the 32-row row-pair form: a layer whose down
+    /// bank is legacy-quant (16-row tiles only) needs gate/up on the same 16-row tile list.</summary>
+    public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ4K16 { get; private set; }
+    /// <summary>16-row Q5_K twin (#821): a layer with Q5_K gate/up and a legacy-quant (Q5_1/Q8_0) down - UD-Q4_K_XL layer 2 - shares one 16-row tile list. Present under the same condition as <see cref="MoeGroupedQ4K16"/>.</summary>
+    public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ5K16 { get; private set; }
+    public MoeIndexedMatmulKQuantMmvqKernel? MoeMmvqQ6K { get; private set; }
+    /// <summary>The iq1s grid for the IQ1_M expert kernels (#823), uploaded once per kernel set.</summary>
+    internal Iq1Codebooks Iq1CodebooksOwned { get; private set; } = null!;
+    private readonly Dictionary<MoeIqQuant, MoeIndexedMatmulIqMmvqKernel> _iqMmvq = new();
+    private readonly Dictionary<MoeIqQuant, MoeGroupedMatmulIqCoopmatKernel> _iqGrouped = new();
+    private readonly Dictionary<(MoeIqQuant, string), MoeGroupedMatmulIqCoopmatKernel> _iqGroupedVariants = new();
+
+    /// <summary>#1348: the experimental grouped coopmat IQ kernel variant <paramref name="variant"/> for a bank of type <paramref name="qt"/>, or <c>null</c>.</summary>
+    public MoeGroupedMatmulIqCoopmatKernel? MoeGroupedIqVariant(DotLLM.Core.Configuration.QuantizationType qt, string variant)
+        => MoeIqFormats.FromQuantizationType(qt) is { } f && _iqGroupedVariants.TryGetValue((f, variant), out var kern) ? kern : null;
+
+    /// <summary>#823: the indexed IQ-family MMVQ (dp4a) decode kernel serving a resident expert bank of <paramref name="qt"/>, or <c>null</c> (not an IQ bank type / no kernel / no integer-dot).</summary>
+    public MoeIndexedMatmulIqMmvqKernel? MoeMmvqIq(DotLLM.Core.Configuration.QuantizationType qt)
+        => MoeIqFormats.FromQuantizationType(qt) is { } f && _iqMmvq.TryGetValue(f, out var kern) ? kern : null;
+
+    /// <summary>#823: the grouped coopmat IQ-family prefill kernel (16-row tiles; wave64 + cooperative matrix only), or <c>null</c>.</summary>
+    public MoeGroupedMatmulIqCoopmatKernel? MoeGroupedIq(DotLLM.Core.Configuration.QuantizationType qt)
+        => MoeIqFormats.FromQuantizationType(qt) is { } f && _iqGrouped.TryGetValue(f, out var kern) ? kern : null;
     public MatMulQ2KGemvF32Kernel MatMulQ2K { get; }
     public MatMulQ2KGemmF32Kernel MatMulQ2KGemm { get; }
     public MatMulQ3KGemvF32Kernel MatMulQ3K { get; }
@@ -56,15 +219,71 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MatMulIq3SGemmF32Kernel MatMulIq3SGemm { get; }
     public MatMulIq1SGemvF32Kernel MatMulIq1S { get; }
     public MatMulIq1SGemmF32Kernel MatMulIq1SGemm { get; }
+    /// <summary>PQ2_0 (PrismML Bonsai ternary) GEMV — decode.</summary>
+    public MatMulPQ2_0GemvF32Kernel MatMulPQ2_0 { get; }
+    /// <summary>PQ2_0 GEMM — prefill. Variant chosen per device by <c>PQ2_0GemmVariant.SelectFor</c>.</summary>
+    public MatMulPQ2_0GemmF32Kernel MatMulPQ2_0Gemm { get; }
+    /// <summary>PTQ1_0 (PrismML Bonsai dense-trit ternary) GEMV — decode.</summary>
+    public MatMulPTQ1_0GemvF32Kernel MatMulPTQ1_0 { get; }
+    /// <summary>PTQ1_0 GEMM — prefill. Untiled correctness-first kernel (#436), not a tuned one.</summary>
+    public MatMulPTQ1_0GemmF32Kernel MatMulPTQ1_0Gemm { get; }
     public MatMulF16GemvF32Kernel MatMulF16 { get; }
     public MatMulF16GemmF32Kernel MatMulF16Gemm { get; }
     public MatMulF16GemmCoopmatKernel? MatMulF16GemmCoopmat { get; }
     public MatMulBf16GemvF32Kernel MatMulBf16 { get; }
     public MatMulBf16GemmF32Kernel MatMulBf16Gemm { get; }
+    /// <summary>Multi-column BF16 GEMV for 2..8-row batches (MTP verify, small stacked decode; issue #706). Null when its SPIR-V is absent.</summary>
+    public MatMulBf16GemvMultiF32Kernel? MatMulBf16Multi { get; private set; }
 
     // ── Shared norms / attention / SwiGLU / Add ─────────────────────────────
     public RmsNormF32Kernel RmsNorm { get; }
     public RopeF32Kernel Rope { get; }
+
+    /// <summary>
+    /// Dense-YaRN rotation (issue #1101), or null when the model's RoPE has no active YaRN. Owned by this set once
+    /// attached: <see cref="InvalidateAll"/> and <see cref="Dispose"/> cover it.
+    /// </summary>
+    public VulkanDenseYarnRope? YarnRope { get; private set; }
+
+    /// <summary>Attaches (and takes ownership of) the model's YaRN rotation; null keeps the theta-derived <see cref="Rope"/>.</summary>
+    /// <param name="yarnRope">The rotation, or null.</param>
+    internal void AttachYarnRope(VulkanDenseYarnRope? yarnRope)
+    {
+        if (!ReferenceEquals(YarnRope, yarnRope))
+            YarnRope?.Dispose();
+        YarnRope = yarnRope;
+    }
+
+    /// <summary>
+    /// Records the NeoX RoPE on Q and K: YaRN-ramped when <see cref="YarnRope"/> is attached, the theta-derived
+    /// <see cref="Rope"/> otherwise. Every RoPE call site of a host that may carry YaRN goes through here, so none can
+    /// silently keep the unscaled rotation (issue #1101).
+    /// </summary>
+    /// <param name="cmdBuf">Command buffer being recorded.</param>
+    /// <param name="q">Q rows, <c>[seqLen, numHeads, headDim]</c>.</param>
+    /// <param name="k">K rows, <c>[seqLen, numKvHeads, headDim]</c>.</param>
+    /// <param name="positions">Per-row positions.</param>
+    /// <param name="seqLen">Rows.</param>
+    /// <param name="numHeads">Q heads to rotate.</param>
+    /// <param name="numKvHeads">K heads to rotate.</param>
+    /// <param name="headDim">Head width.</param>
+    /// <param name="ropeDim">Rotated dims per head.</param>
+    /// <param name="theta">RoPE base (used only without YaRN).</param>
+    public void RecordRopeNeoX(nint cmdBuf, VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer positions,
+        int seqLen, int numHeads, int numKvHeads, int headDim, int ropeDim, float theta)
+    {
+        if (YarnRope is { } yarn)
+        {
+            yarn.Record(cmdBuf, q, k, positions, seqLen, numHeads, numKvHeads, headDim);
+            return;
+        }
+
+        Rope.Record(cmdBuf, q, k, positions,
+            seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
+            headDim: headDim, ropeDim: ropeDim, theta: theta,
+            variant: RopeF32Kernel.Variant.NeoX);
+    }
+
     public AttentionF32Kernel Attention { get; }
     /// <summary>
     /// Optional Flash-Attention prefill kernel. Null when the SPV is missing,
@@ -73,6 +292,12 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     /// head_dim to <see cref="Attention"/>.
     /// </summary>
     public VulkanFlashAttentionF32Kernel? FlashAttention { get; }
+    /// <summary>
+    /// Optional cooperative-matrix Flash-Attention prefill kernel with the hd256 pipeline (issue #685): preferred over
+    /// <see cref="FlashAttention"/> for <c>seqQ &gt; 1</c> when it can dispatch the model's head_dim. Null when coopmat attention is
+    /// disabled/unsupported, or when the hd256 SPIR-V is missing for a wide-head model.
+    /// </summary>
+    public VulkanFlashAttentionCoopmatKernel? FlashAttentionCoopmat { get; }
     /// <summary>
     /// Optional split-KV (Flash-Decoding) kernel for the decode path
     /// (seqQ == 1). Null when the SPVs are missing or the env-var opt-out
@@ -83,6 +308,100 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     /// threshold derivation and the ON-by-default evidence.
     /// </summary>
     public VulkanSplitKvAttentionKernel? SplitKvAttention { get; }
+
+    /// <summary>
+    /// The attention kernels for a narrow (F16) KV cache (issue #1102), or null until a host selects one with
+    /// <see cref="EnsureNarrowKv"/>. Owned here so <see cref="InvalidateAll"/> and <see cref="Dispose"/> cover them.
+    /// </summary>
+    public VulkanNarrowKvAttentionKernels? NarrowKv { get; private set; }
+
+    private VulkanDevice? _device;
+    private string? _spvDir;
+
+    /// <summary>
+    /// Returns the narrow-KV kernels for <paramref name="storage"/>, building them on first use (issue #1102).
+    /// </summary>
+    /// <param name="storage">The narrow storage the host's caches use.</param>
+    /// <param name="headDim">The model's per-head dimension (gates which prefill kernels are worth building).</param>
+    /// <returns>The kernel set.</returns>
+    /// <exception cref="NotSupportedException">The storage has no narrow kernels, or this build lacks their SPIR-V.</exception>
+    internal VulkanNarrowKvAttentionKernels EnsureNarrowKv(VulkanKvStorage storage, int headDim)
+    {
+        if (NarrowKv is { } existing && existing.Storage == storage) return existing;
+        var made = VulkanNarrowKvAttentionKernels.Create(_device!, _spvDir!, headDim, storage);
+        if (_gqaDecode) made.SplitKvAttention?.EnableGqaByDefault();
+        NarrowKv?.Dispose();
+        NarrowKv = made;
+        return made;
+    }
+
+    /// <summary>Gets or sets a value indicating whether <see cref="EnsureGqaFlash"/> returns null (an A/B and test switch).</summary>
+    internal bool GqaFlashDisabled { get; set; }
+
+    /// <summary>Gets the GQA-grouped prefill dispatches recorded so far, both KV formats.</summary>
+    internal long GqaFlashDispatches => (_gqaFlashF32?.Dispatches ?? 0) + (_gqaFlashF16?.Dispatches ?? 0);
+
+    private VulkanFlashAttentionGqaKernel? _gqaFlashF32;
+    private VulkanFlashAttentionGqaKernel? _gqaFlashF16;
+    private bool _gqaFlashF32Tried;
+    private bool _gqaFlashF16Tried;
+
+    /// <summary>
+    /// Returns the GQA-grouped tiled prefill attention for <paramref name="storage"/> (issue #441), building it on first use, or null
+    /// when it is disabled (<see cref="VulkanFlashAttentionGqaKernel.DisableEnvVar"/>, the flash opt-out), unavailable on this device,
+    /// or not worth it for this head width: heads of 128 or less keep the per-head flash kernels, which serve them well.
+    /// </summary>
+    /// <param name="storage">The KV storage the host's cache uses.</param>
+    /// <param name="headDim">The model's per-head dimension.</param>
+    /// <returns>The kernel, or null.</returns>
+    internal VulkanFlashAttentionGqaKernel? EnsureGqaFlash(VulkanKvStorage storage, int headDim)
+    {
+        if (GqaFlashDisabled) return null;
+        if (headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim || headDim > VulkanFlashAttentionGqaKernel.MaxHeadDim) return null;
+        bool f16 = storage == VulkanKvStorage.F16;
+        if (f16 ? _gqaFlashF16Tried : _gqaFlashF32Tried) return f16 ? _gqaFlashF16 : _gqaFlashF32;
+        VulkanFlashAttentionGqaKernel? made = VulkanTransformerModel.IsFlashAttentionDisabled()
+            ? null
+            : VulkanFlashAttentionGqaKernel.TryCreate(_device!, _spvDir!, storage,
+                allowCoopmat: !VulkanTransformerModel.IsCoopmatAttentionDisabled());
+        if (f16)
+        {
+            _gqaFlashF16 = made;
+            _gqaFlashF16Tried = true;
+        }
+        else
+        {
+            _gqaFlashF32 = made;
+            _gqaFlashF32Tried = true;
+        }
+
+        return made;
+    }
+
+    private bool _gqaDecode;
+
+    /// <summary>
+    /// Opts this host's split-KV decode kernels (the F32 set and any narrow set) into the GQA-grouped pass (issue #1102), which
+    /// reads each cached K / V element once per KV head instead of once per query head. <c>DOTLLM_VULKAN_SPLITKV_GQA</c> still wins.
+    /// </summary>
+    internal void EnableGqaDecode()
+    {
+        _gqaDecode = true;
+        SplitKvAttention?.EnableGqaByDefault();
+        NarrowKv?.SplitKvAttention?.EnableGqaByDefault();
+    }
+
+    /// <summary>Test hook: forces the grouped decode pass on or off for every split-KV kernel of this set.</summary>
+    /// <param name="on">Whether the grouped pass may run.</param>
+    internal void SetGqaDecodeForTest(bool on)
+    {
+        _gqaDecode = on;
+        if (SplitKvAttention is { } f32) f32.PreferGqa = on;
+        if (NarrowKv?.SplitKvAttention is { } narrow) narrow.PreferGqa = on;
+    }
+
+    /// <summary>Split-KV attention with per-row query offsets for 2..8-row verify forwards (null when its SPIR-V is missing or split decode is disabled).</summary>
+    public VulkanSplitKvRowsAttentionKernel? SplitKvRowsAttention { get; private set; }
     public SwiGluF32Kernel SwiGlu { get; }
     public AddKernel Add { get; }
     public SiluInplaceF32Kernel SiluInplace { get; }
@@ -154,11 +473,14 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulIq3XxsGemvF32Kernel matmulIq3Xxs, MatMulIq3XxsGemmF32Kernel matmulIq3XxsGemm,
         MatMulIq3SGemvF32Kernel matmulIq3S, MatMulIq3SGemmF32Kernel matmulIq3SGemm,
         MatMulIq1SGemvF32Kernel matmulIq1S, MatMulIq1SGemmF32Kernel matmulIq1SGemm,
+        MatMulPQ2_0GemvF32Kernel matmulPQ2_0, MatMulPQ2_0GemmF32Kernel matmulPQ2_0Gemm,
+        MatMulPTQ1_0GemvF32Kernel matmulPTQ1_0, MatMulPTQ1_0GemmF32Kernel matmulPTQ1_0Gemm,
         MatMulF16GemvF32Kernel matmulF16, MatMulF16GemmF32Kernel matmulF16Gemm,
         MatMulF16GemmCoopmatKernel? matmulF16GemmCoopmat,
         MatMulBf16GemvF32Kernel matmulBf16, MatMulBf16GemmF32Kernel matmulBf16Gemm,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope, AttentionF32Kernel attention,
         VulkanFlashAttentionF32Kernel? flashAttention,
+        VulkanFlashAttentionCoopmatKernel? flashAttentionCoopmat,
         VulkanSplitKvAttentionKernel? splitKvAttention,
         SwiGluF32Kernel swiglu, AddKernel add, SiluInplaceF32Kernel silu, Conv1dCausalF32Kernel conv1d,
         GdnL2NormalizeHeadsF32Kernel gdnL2,
@@ -191,11 +513,14 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulIq3Xxs = matmulIq3Xxs; MatMulIq3XxsGemm = matmulIq3XxsGemm;
         MatMulIq3S = matmulIq3S; MatMulIq3SGemm = matmulIq3SGemm;
         MatMulIq1S = matmulIq1S; MatMulIq1SGemm = matmulIq1SGemm;
+        MatMulPQ2_0 = matmulPQ2_0; MatMulPQ2_0Gemm = matmulPQ2_0Gemm;
+        MatMulPTQ1_0 = matmulPTQ1_0; MatMulPTQ1_0Gemm = matmulPTQ1_0Gemm;
         MatMulF16 = matmulF16; MatMulF16Gemm = matmulF16Gemm;
         MatMulF16GemmCoopmat = matmulF16GemmCoopmat;
         MatMulBf16 = matmulBf16; MatMulBf16Gemm = matmulBf16Gemm;
         RmsNorm = rmsnorm; Rope = rope; Attention = attention;
         FlashAttention = flashAttention;
+        FlashAttentionCoopmat = flashAttentionCoopmat;
         SplitKvAttention = splitKvAttention;
         SwiGlu = swiglu; Add = add; SiluInplace = silu; Conv1dCausal = conv1d;
         GdnL2Normalize = gdnL2;
@@ -267,6 +592,13 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         var matmulIq3SGemm   = MatMulIq3SGemmF32Kernel.CreateWithCodebooks(device, spvDir, iq3Codebooks);
         var matmulIq1S = MatMulIq1SGemvF32Kernel.Create(device, spvDir);
         var matmulIq1SGemm = MatMulIq1SGemmF32Kernel.Create(device, spvDir);
+        // PQ2_0 GEMV + GEMM. Always created, same as the generic VulkanTransformerModel:
+        // the GEMM variant is picked per device by PQ2_0GemmVariant.SelectFor, which falls
+        // back to the register-blocked shader when cooperative matrix is unavailable.
+        var matmulPQ2_0 = MatMulPQ2_0GemvF32Kernel.Create(device, spvDir);
+        var matmulPQ2_0Gemm = MatMulPQ2_0GemmF32Kernel.Create(device, spvDir);
+        var matmulPTQ1_0 = MatMulPTQ1_0GemvF32Kernel.Create(device, spvDir);
+        var matmulPTQ1_0Gemm = MatMulPTQ1_0GemmF32Kernel.Create(device, spvDir);
         var matmulF16 = MatMulF16GemvF32Kernel.Create(device, spvDir);
         var matmulF16Gemm = MatMulF16GemmF32Kernel.Create(device, spvDir);
         MatMulF16GemmCoopmatKernel? matmulF16GemmCoopmat = null;
@@ -289,9 +621,20 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         // the per-token attention kernel, so no output was ever wrong — this is resource and
         // consistency alignment, not a correctness fix.
         VulkanFlashAttentionF32Kernel? flashAttention =
-            VulkanTransformerModel.IsFlashAttentionDisabled() || headDim > VulkanFlashAttentionF32Kernel.MaxHeadDim
+            VulkanAttentionFallbackDiagnostics.CreatePrefillFlashAttention(
+                device, spvDir, headDim, "Qwen3Hybrid");
+        // #685: coopmat FA for the wide-head (hd256) hybrids. Only kept when this instance can dispatch the model's head_dim
+        // (an older SPV cache without the hd256 shader leaves SupportedMaxHeadDim at 128: keep the scalar kernel then).
+        VulkanFlashAttentionCoopmatKernel? flashAttentionCoopmat =
+            VulkanTransformerModel.IsFlashAttentionDisabled() || VulkanTransformerModel.IsCoopmatAttentionDisabled()
+                || headDim > VulkanFlashAttentionCoopmatKernel.WideMaxHeadDim
                 ? null
-                : VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir);
+                : VulkanFlashAttentionCoopmatKernel.TryCreate(device, spvDir);
+        if (flashAttentionCoopmat is not null && headDim > flashAttentionCoopmat.SupportedMaxHeadDim)
+        {
+            flashAttentionCoopmat.Dispose();
+            flashAttentionCoopmat = null;
+        }
         VulkanSplitKvAttentionKernel? splitKvAttention =
             VulkanTransformerModel.IsSplitDecodeDisabled() || headDim > VulkanSplitKvAttentionKernel.MaxHeadDim
                 ? null
@@ -339,8 +682,13 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         }
         var moeScatter = MoeWeightedScatterF32Kernel.Create(device, spvDir);
         var moeSigmoidGatedAdd = MoeSigmoidGatedAddF32Kernel.Create(device, spvDir);
+        MoeSharedGateAddF32Kernel? moeSharedGateAdd = Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_SHARED_GATE_FUSED") != "0"
+            && File.Exists(Path.Combine(spvDir, "moe_shared_gate_add_f32.spv")) ? MoeSharedGateAddF32Kernel.Create(device, spvDir) : null;
 
-        return new VulkanQwen3MoeHybridKernels(
+        var matmulBf16Multi = File.Exists(Path.Combine(spvDir, "matmul_bf16_gemv_multi_f32.spv"))
+            ? MatMulBf16GemvMultiF32Kernel.Create(device, spvDir) : null;
+
+        var kernels = new VulkanQwen3MoeHybridKernels(
             matmul, matmulQ8, matmulQ8Gemm, matmulQ8GemmCoopmat,
             matmulQ2K, matmulQ2KGemm,
             matmulQ3K, matmulQ3KGemm,
@@ -357,23 +705,215 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             matmulIq3Xxs, matmulIq3XxsGemm,
             matmulIq3S, matmulIq3SGemm,
             matmulIq1S, matmulIq1SGemm,
+            matmulPQ2_0, matmulPQ2_0Gemm,
+            matmulPTQ1_0, matmulPTQ1_0Gemm,
             matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
             matmulBf16, matmulBf16Gemm,
-            rmsnorm, rope, attention, flashAttention, splitKvAttention, swiglu, add, silu, conv1d,
+            rmsnorm, rope, attention, flashAttention, flashAttentionCoopmat, splitKvAttention, swiglu, add, silu, conv1d,
             gdnL2, gdnScan, gdnScanMulti, gdnPost,
             gdnDecay, sigmoidInplace,
             sigGateMul,
             moeTopk, moeBroadcast, moeIndexed, moeIndexedQ6K, moeIndexedQ4K, moeIndexedQ5K,
             moeIndexedQ4KMmq, quantizeQ8_1Rows, moeIndexedQ5KMmq, moeScatter, moeSigmoidGatedAdd);
+        kernels.SplitKvRowsAttention = splitKvAttention is null ? null : VulkanSplitKvRowsAttentionKernel.TryCreate(device, spvDir);
+        kernels._device = device;
+        kernels._spvDir = spvDir;
+        kernels.Iq1CodebooksOwned = Iq1Codebooks.Create(device);   // #823: grid for the IQ1_M expert kernels
+        kernels.MoeSharedGateAdd = moeSharedGateAdd;
+        kernels.MatMulBf16Multi = matmulBf16Multi;
+        kernels.MatMulF32Multi = MatMulF32GemvMultiKernel.TryCreate(device, spvDir);
+        kernels.MatMulF16Multi = MatMulF16GemvMultiKernel.TryCreate(device, spvDir);
+        kernels.MatMulQ8Multi = MatMulQ8_0GemvMultiKernel.TryCreate(device, spvDir, Q8RowsPerWorkgroup,
+            RowsFromEnv("DOTLLM_VK_Q8_ROWS_MULTI", 4), RowsFromEnv("DOTLLM_VK_Q8_ROWS_WIDE", 4));
+        // #1220 (supersedes #1193's Q4_K_R4): NR rows per workgroup share the activation loads; deterministic, and also the qwen35 decode GEMV.
+        kernels.MatMulQ4KMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q4_K, Q4KRowsPerWorkgroup,
+            RowsFromEnv("DOTLLM_VK_Q4K_ROWS_MULTI", 4), RowsFromEnv("DOTLLM_VK_Q4K_ROWS_WIDE", 4));
+        kernels.MatMulQ5KMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q5_K);
+        kernels.MatMulQ6KMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K);
+        if (Environment.GetEnvironmentVariable("DOTLLM_VK_Q6K_ROWS_DECODE") != "0")
+            kernels.MatMulQ6KRows = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K_Rows,
+                RowsFromEnv("DOTLLM_VK_Q6K_ROWS", 2), RowsFromEnv("DOTLLM_VK_Q6K_ROWS_MULTI", 4), RowsFromEnv("DOTLLM_VK_Q6K_ROWS_WIDE", 4));
+        kernels.MatMulQ6KMultiR2 = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K_R2);
+        kernels.MatMulIq4XsMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.IQ4_XS);
+        kernels.MatMulIq3SMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.IQ3_S);
+        kernels.MatMulQ8MmvqMulti = MatMulQ8_0MmvqMultiKernel.TryCreate(device, spvDir);
+        if (Environment.GetEnvironmentVariable("DOTLLM_VK_GDN_CONV_FUSED") != "0" && GdnConvSiluF32Kernel.IsSupportedOn(spvDir))
+            kernels.GdnConvSilu = GdnConvSiluF32Kernel.Create(device, spvDir);
+        if (Lfm2ShortConvF32Kernel.IsSupportedOn(spvDir))
+            kernels.Lfm2ShortConv = Lfm2ShortConvF32Kernel.Create(device, spvDir);
+        kernels.MoeTopkSigmoid = MoeTopKSigmoidBiasF32Kernel.Create(device, spvDir);
+
+        // Opt-outs are the same env vars the dense VulkanTransformerModel honours (kernel-level LEGACY vars are inside IsSupportedOn).
+        if (Environment.GetEnvironmentVariable(VulkanTransformerModel.DisableQ2KCoopmatEnvVar) != "1" && MatMulQ2KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
+            kernels.MatMulQ2KGemmCoopmat = MatMulQ2KGemmCoopmatKernel.Create(device, spvDir);
+        if (Environment.GetEnvironmentVariable(VulkanTransformerModel.DisableQ3KCoopmatEnvVar) != "1" && MatMulQ3KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
+            kernels.MatMulQ3KGemmCoopmat = MatMulQ3KGemmCoopmatKernel.Create(device, spvDir);
+        if (Environment.GetEnvironmentVariable(VulkanTransformerModel.DisableQ4KCoopmatEnvVar) != "1" && MatMulQ4KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
+            kernels.MatMulQ4KGemmCoopmat = MatMulQ4KGemmCoopmatKernel.Create(device, spvDir);
+        if (Environment.GetEnvironmentVariable(VulkanTransformerModel.DisableQ5KCoopmatEnvVar) != "1" && MatMulQ5KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
+            kernels.MatMulQ5KGemmCoopmat = MatMulQ5KGemmCoopmatKernel.Create(device, spvDir);
+        // #1226: opt-in (DOTLLM_VK_MMQ_CM1_DENSE=1). Measured on the 8060S (Qwen3.8-27B pp512): 300 tok/s against 335-348 for the F16
+        // coopmat GEMM, whose 128x128 tile already runs these shapes at 17-20 TFLOP/s; the MoE grouped form is where the int8 path wins.
+        if (Environment.GetEnvironmentVariable("DOTLLM_VK_MMQ_CM1_DENSE") == "1")
+        {
+            kernels.MatMulQ8MmqCm1 = MatMulMmqCm1Kernel.TryCreate(device, spvDir, DotLLM.Core.Configuration.QuantizationType.Q8_0);
+            kernels.MatMulQ4KMmqCm1 = MatMulMmqCm1Kernel.TryCreate(device, spvDir, DotLLM.Core.Configuration.QuantizationType.Q4_K);
+        }
+        if (kernels.MatMulQ8MmqCm1 is not null || kernels.MatMulQ4KMmqCm1 is not null)
+        {
+            kernels.QuantizeQ8_1RowsCm1 = QuantizeQ8_1RowsKernel.TryCreate(device, spvDir);
+            if (kernels.QuantizeQ8_1RowsCm1 is null)
+            {
+                kernels.MatMulQ8MmqCm1?.Dispose(); kernels.MatMulQ8MmqCm1 = null;
+                kernels.MatMulQ4KMmqCm1?.Dispose(); kernels.MatMulQ4KMmqCm1 = null;
+            }
+        }
+        if (Environment.GetEnvironmentVariable(VulkanTransformerModel.DisableQ6KCoopmatEnvVar) != "1" && MatMulQ6KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
+            kernels.MatMulQ6KGemmCoopmat = MatMulQ6KGemmCoopmatKernel.Create(device, spvDir);
+        if (Environment.GetEnvironmentVariable(VulkanTransformerModel.DisableIq4XsCoopmatEnvVar) != "1" && MatMulIq4XsGemmCoopmatKernel.IsSupportedOn(device, spvDir))
+            kernels.MatMulIq4XsGemmCoopmat = MatMulIq4XsGemmCoopmatKernel.Create(device, spvDir);
+        if (Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_GROUPED") != "0"
+            && MoeGroupedMatmulKQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q4_K)
+            && MoeGroupedMatmulKQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q5_K))
+        {
+            kernels.MoeExpertOffsets = MoeExpertOffsetsKernel.Create(device, spvDir);
+            if (Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_INDIRECT_TILES") != "0" && MoeBuildTileListKernel.IsSupportedOn(spvDir))
+                kernels.MoeBuildTileList = MoeBuildTileListKernel.Create(device, spvDir);
+            if (Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_FUSED_GLUE") != "0"
+                && MoeExpandGatherGroupF32Kernel.IsSupportedOn(spvDir) && MoeWeightedScatterGroupedF32Kernel.IsSupportedOn(spvDir))
+            {
+                kernels.MoeExpandGatherGroup = MoeExpandGatherGroupF32Kernel.Create(device, spvDir);
+                kernels.MoeWeightedScatterGrouped = MoeWeightedScatterGroupedF32Kernel.Create(device, spvDir);
+            }
+            kernels.MoeExpandGroupByExpert = MoeExpandGroupByExpertF32Kernel.Create(device, spvDir);
+            kernels.MoeUngroupScatter = MoeUngroupScatterF32Kernel.Create(device, spvDir);
+            // Row-pair shaders (issue #691): one workgroup covers 32 token rows of an expert and dequantises each weight super-block once
+            // for both 16-row tiles. They need the indirect tile list (built with 32-row tiles) and ONE tile list serves gate/up (Q4_K) and
+            // down (Q5_K/Q6_K), so it is all-or-nothing. DOTLLM_VK_MOE_ROWPAIR=0 opts out.
+            bool rowPair = kernels.MoeBuildTileList is not null
+                && Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_ROWPAIR") != "0"
+                && File.Exists(Path.Combine(spvDir, "moe_grouped_matmul_q4_k_coopmat_m64r2.spv"))
+                && File.Exists(Path.Combine(spvDir, "moe_grouped_matmul_q5_k_coopmat_m64r2.spv"))
+                && File.Exists(Path.Combine(spvDir, "moe_grouped_matmul_q6_k_coopmat_m64r2.spv"));
+            var q4 = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q4_K, rowPair: rowPair);
+            var q5 = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q5_K, rowPair: rowPair);
+            MoeGroupedMatmulKQuantCoopmatKernel? q6 = MoeGroupedMatmulKQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q6_K)
+                ? MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q6_K, rowPair: rowPair) : null;
+            if (rowPair && (q4.RowTile != q5.RowTile || (q6 is not null && q6.RowTile != q4.RowTile)))
+            {
+                // A kernel fell back to the 16-row shader (e.g. wave32): rebuild everything on the 16-row form so one tile list fits all.
+                q4.Dispose(); q5.Dispose(); q6?.Dispose();
+                q4 = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q4_K);
+                q5 = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q5_K);
+                q6 = MoeGroupedMatmulKQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q6_K)
+                    ? MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q6_K) : null;
+            }
+            kernels.MoeGroupedQ4K = q4;
+            kernels.MoeGroupedQ5K = q5;
+            kernels.MoeGroupedQ6K = q6;
+            // #849: legacy-quant grouped down kernels (16-row tiles). They need the indirect tile list (the legacy grid is Q4_K-agnostic too,
+            // but keeping one gate keeps the all-or-nothing invariant simple).
+            if (MoeGroupedMatmulLegacyQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedLegacyQuant.Q5_1))
+                kernels.MoeGroupedQ5_1 = MoeGroupedMatmulLegacyQuantCoopmatKernel.Create(device, spvDir, MoeGroupedLegacyQuant.Q5_1);
+            if (MoeGroupedMatmulLegacyQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedLegacyQuant.Q8_0))
+                kernels.MoeGroupedQ8_0 = MoeGroupedMatmulLegacyQuantCoopmatKernel.Create(device, spvDir, MoeGroupedLegacyQuant.Q8_0);
+            foreach (var wv in MoeGroupedMatmulLegacyQuantCoopmatKernel.WideVariants)
+                if (MoeGroupedMatmulLegacyQuantCoopmatKernel.IsVariantSupportedOn(device, spvDir, MoeGroupedLegacyQuant.Q8_0, wv))
+                    kernels._q8Wide[wv] = MoeGroupedMatmulLegacyQuantCoopmatKernel.Create(device, spvDir, MoeGroupedLegacyQuant.Q8_0, wv);
+            // #823: grouped IQ kernels (16-row tiles). DOTLLM_VK_MOE_IQ_GROUPED=0 leaves IQ banks on the MMVQ path for every row count.
+            if (Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_IQ_GROUPED") != "0")
+            {
+                foreach (var f in Enum.GetValues<MoeIqQuant>())
+                    if (MoeGroupedMatmulIqCoopmatKernel.IsSupportedOn(device, spvDir, f))
+                        kernels._iqGrouped[f] = MoeGroupedMatmulIqCoopmatKernel.Create(device, spvDir, f, iq3Codebooks, iq2Codebooks, kernels.Iq1CodebooksOwned);
+                // #1348: experimental variants (IQ3_S / IQ4_XS / IQ4_NL), selected per layer call by DOTLLM_VK_MOE_IQ_VARIANT.
+                foreach (var f in Enum.GetValues<MoeIqQuant>())
+                    foreach (var v in MoeGroupedMatmulIqCoopmatKernel.Variants)
+                        if (MoeGroupedMatmulIqCoopmatKernel.IsVariantSupportedOn(device, spvDir, f, v))
+                            kernels._iqGroupedVariants[(f, v)] = MoeGroupedMatmulIqCoopmatKernel.Create(device, spvDir, f, iq3Codebooks, iq2Codebooks, kernels.Iq1CodebooksOwned, variant: v);
+            }
+            if ((kernels.MoeGroupedQ5_1 is not null || kernels.MoeGroupedQ8_0 is not null || kernels._iqGrouped.Count > 0) && q4.RowTile != 16)
+            {
+                kernels.MoeGroupedQ4K16 = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q4_K);
+                if (q5.RowTile != 16) kernels.MoeGroupedQ5K16 = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q5_K);
+            }
+        }
+        // #986: dp4a grouped MMQ kernels (preferred over coopmat when available). DOTLLM_VK_MOE_GROUPED_MMQ=0 disables.
+        if (Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_GROUPED_MMQ") != "0")
+        {
+            if (MoeGroupedMatmulKQuantMmqKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q4_K))
+                kernels.MoeGroupedQ4KMmq = MoeGroupedMatmulKQuantMmqKernel.Create(device, spvDir, MoeGroupedKQuant.Q4_K);
+            if (MoeGroupedMatmulKQuantMmqKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q5_K))
+                kernels.MoeGroupedQ5KMmq = MoeGroupedMatmulKQuantMmqKernel.Create(device, spvDir, MoeGroupedKQuant.Q5_K);
+            kernels.SwiGluQuantizeRows = SwiGluQuantizeRowsKernel.TryCreate(device, spvDir);
+            if (MoeExpandGatherGroupQ8_1Kernel.IsSupportedOn(spvDir))
+                kernels.MoeExpandGatherGroupQ8_1 = MoeExpandGatherGroupQ8_1Kernel.Create(device, spvDir);
+        }
+        if (File.Exists(Path.Combine(spvDir, "moe_indexed_matmul_q5_1_f32.spv")))
+            kernels.MoeIndexedMatmulQ5_1 = MoeIndexedMatmulQ5_1F32Kernel.Create(device, spvDir);
+        if (File.Exists(Path.Combine(spvDir, "moe_indexed_matmul_q8_0_f32.spv")))
+            kernels.MoeIndexedMatmulQ8_0 = MoeIndexedMatmulQ8_0F32Kernel.Create(device, spvDir);
+        if (Environment.GetEnvironmentVariable("DOTLLM_VK_DEINTERLEAVE") != "0")
+        {
+            kernels.GdnQkvSplit = DeinterleaveF32Kernel.TryCreate(device, spvDir, DeinterleaveF32Kernel.Kind.GdnQkvSplit);
+            kernels.QGateDeinterleave = DeinterleaveF32Kernel.TryCreate(device, spvDir, DeinterleaveF32Kernel.Kind.QGateDeinterleave);
+        }
+        if (Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_MMVQ") != "0")
+        {
+            kernels.MoeMmvqQ4K = MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q4_K);
+            if (File.Exists(Path.Combine(spvDir, "moe_scatter_gated_add_decode_f32.spv")))
+                kernels.MoeScatterGatedAddDecode = MoeScatterGatedAddDecodeF32Kernel.Create(device, spvDir);
+            // Multi-row variants (#876): measured best at NR = 2 for the ALU-heavy Q4_K gate/up and NR = 4 for the Q5_1 down;
+            // DOTLLM_VK_MOE_MR=<n> forces n for both, DOTLLM_VK_MOE_MR=0 disables them.
+            int moeMrEnv = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_MR"), out int mrv) ? mrv : -1;
+            if (moeMrEnv != 0 && moeMrEnv != 1)
+            {
+                kernels.MoeMmvqQ4KMr = MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q4_K, moeMrEnv > 1 ? moeMrEnv : 2);
+                kernels.MoeMmvqQ5_1Mr = MoeIndexedMatmulQ5_1MmvqKernel.TryCreate(device, spvDir, moeMrEnv > 1 ? moeMrEnv : 4);
+            }
+            if (Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_Q8_MMVQ") != "0")
+                kernels.MatMulQ8Mmvq = MatMulQ8_0MmvqKernel.TryCreate(device, spvDir);
+                kernels.MatMulQ8MmvqWideRows = MatMulQ8_0MmvqWideKernel.TryCreate(device, spvDir, rows: 4, ksplit: 1);
+                kernels.MatMulQ8MmvqWideKSplit = MatMulQ8_0MmvqWideKernel.TryCreate(device, spvDir, rows: 1, ksplit: 4);
+            if (Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_DECODE_FUSED") != "0")
+            {
+                kernels.RmsNormQuantizeFused = RmsNormQuantizeQ8_1FusedKernel.TryCreate(device, spvDir);
+                kernels.SwiGluQuantizeFused = SwiGluQuantizeQ8_1FusedKernel.TryCreate(device, spvDir);
+            }
+            kernels.MoeMmvqQ5K = MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q5_K);
+            kernels.MoeMmvqQ5_1 = MoeIndexedMatmulQ5_1MmvqKernel.TryCreate(device, spvDir);
+            kernels.MoeMmvqQ8_0 = MoeIndexedMatmulQ8_0MmvqKernel.TryCreate(device, spvDir);
+            if (VulkanQwen3MoeMoeUpload.Q4_0NativeEnabled)
+            {
+                kernels.MatMulQ4_0Mmvq = MatMulQ4_0MmvqKernel.TryCreate(device, spvDir);
+                if (File.Exists(Path.Combine(spvDir, "matmul_q4_0_f32_gemm.spv")))
+                    kernels.MatMulQ4_0Gemm = MatMulQ4_0GemmF32Kernel.Create(device, spvDir);
+                if (MatMulQ4_0GemmCoopmatKernel.IsSupportedOn(device, spvDir))
+                    kernels.MatMulQ4_0GemmCoopmat = MatMulQ4_0GemmCoopmatKernel.Create(device, spvDir);
+            }
+            kernels.MoeMmvqQ6K = MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q6_K);
+            foreach (var f in Enum.GetValues<MoeIqQuant>())
+                if (MoeIndexedMatmulIqMmvqKernel.TryCreate(device, spvDir, f, iq3Codebooks, iq2Codebooks, kernels.Iq1CodebooksOwned) is { } mk)
+                    kernels._iqMmvq[f] = mk;
+        }
+        return kernels;
     }
 
     /// <summary>Invalidates every kernel's cached descriptor sets. Call after scratch buffers re-allocate.</summary>
     public void InvalidateAll()
     {
+        YarnRope?.InvalidateDescriptorCache();
         MatMul.InvalidateDescriptorCache();
         MatMulQ8.InvalidateDescriptorCache();
         MatMulQ8Gemm.InvalidateDescriptorCache();
         MatMulQ8GemmCoopmat?.InvalidateDescriptorCache();
+        MatMulQ2KGemmCoopmat?.InvalidateDescriptorCache();
+        MatMulQ3KGemmCoopmat?.InvalidateDescriptorCache();
+        MatMulQ4KGemmCoopmat?.InvalidateDescriptorCache();
+        MatMulQ8MmqCm1?.InvalidateDescriptorCache(); MatMulQ4KMmqCm1?.InvalidateDescriptorCache(); QuantizeQ8_1RowsCm1?.InvalidateDescriptorCache();
+        MatMulQ5KGemmCoopmat?.InvalidateDescriptorCache();
+        MatMulQ6KGemmCoopmat?.InvalidateDescriptorCache();
+        MatMulIq4XsGemmCoopmat?.InvalidateDescriptorCache();
         MatMulQ2K.InvalidateDescriptorCache();
         MatMulQ2KGemm.InvalidateDescriptorCache();
         MatMulQ3K.InvalidateDescriptorCache();
@@ -400,16 +940,26 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulIq3SGemm.InvalidateDescriptorCache();
         MatMulIq1S.InvalidateDescriptorCache();
         MatMulIq1SGemm.InvalidateDescriptorCache();
+        MatMulPQ2_0.InvalidateDescriptorCache();
+        MatMulPQ2_0Gemm.InvalidateDescriptorCache();
+        MatMulPTQ1_0.InvalidateDescriptorCache();
+        MatMulPTQ1_0Gemm.InvalidateDescriptorCache();
         MatMulF16.InvalidateDescriptorCache();
         MatMulF16Gemm.InvalidateDescriptorCache();
         MatMulF16GemmCoopmat?.InvalidateDescriptorCache();
         MatMulBf16.InvalidateDescriptorCache();
         MatMulBf16Gemm.InvalidateDescriptorCache();
+        MatMulBf16Multi?.InvalidateDescriptorCache();
         RmsNorm.InvalidateDescriptorCache();
         Rope.InvalidateDescriptorCache();
         Attention.InvalidateDescriptorCache();
         FlashAttention?.InvalidateDescriptorCache();
+        FlashAttentionCoopmat?.InvalidateDescriptorCache();
         SplitKvAttention?.InvalidateDescriptorCache();
+        SplitKvRowsAttention?.InvalidateDescriptorCache();
+        NarrowKv?.InvalidateAll();
+        _gqaFlashF32?.InvalidateDescriptorCache();
+        _gqaFlashF16?.InvalidateDescriptorCache();
         SwiGlu.InvalidateDescriptorCache();
         Add.InvalidateDescriptorCache();
         SiluInplace.InvalidateDescriptorCache();
@@ -432,11 +982,83 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeIndexedMatmulQ5KMmq?.InvalidateDescriptorCache();
         MoeWeightedScatter.InvalidateDescriptorCache();
         MoeSigmoidGatedAdd.InvalidateDescriptorCache();
+        MoeSharedGateAdd?.InvalidateDescriptorCache();
+        GdnConvSilu?.InvalidateDescriptorCache();
+        Lfm2ShortConv?.InvalidateDescriptorCache();
+        MoeTopkSigmoid?.InvalidateDescriptorCache();
+        MoeExpertOffsets?.InvalidateDescriptorCache();
+        MoeBuildTileList?.InvalidateDescriptorCache();
+        MoeExpandGatherGroup?.InvalidateDescriptorCache();
+        MoeWeightedScatterGrouped?.InvalidateDescriptorCache();
+        MoeScatterGatedAddDecode?.InvalidateDescriptorCache();
+        MoeExpandGroupByExpert?.InvalidateDescriptorCache();
+        MoeUngroupScatter?.InvalidateDescriptorCache();
+        MoeGroupedQ4K?.InvalidateDescriptorCache();
+        MoeGroupedQ5K?.InvalidateDescriptorCache();
+        MoeGroupedQ6K?.InvalidateDescriptorCache();
+        MoeGroupedQ4KMmq?.InvalidateDescriptorCache();
+        MoeGroupedQ5KMmq?.InvalidateDescriptorCache();
+        SwiGluQuantizeRows?.InvalidateDescriptorCache();
+        MoeExpandGatherGroupQ8_1?.InvalidateDescriptorCache();
+        MoeMmvqQ4K?.InvalidateDescriptorCache();
+        MoeMmvqQ4KMr?.InvalidateDescriptorCache();
+        MoeMmvqQ5_1Mr?.InvalidateDescriptorCache();
+        MatMulQ8Mmvq?.InvalidateDescriptorCache();
+        MatMulQ8MmvqWideRows?.InvalidateDescriptorCache();
+        MatMulQ8MmvqWideKSplit?.InvalidateDescriptorCache();
+        MatMulQ8MmvqMulti?.InvalidateDescriptorCache();
+        MatMulF32Multi?.InvalidateDescriptorCache();
+        MatMulF16Multi?.InvalidateDescriptorCache();
+        MatMulQ8Multi?.InvalidateDescriptorCache();
+        MatMulQ4KMulti?.InvalidateDescriptorCache();
+        MatMulQ6KRows?.InvalidateDescriptorCache();
+        MatMulQ5KMulti?.InvalidateDescriptorCache();
+        MatMulQ6KMulti?.InvalidateDescriptorCache();
+        MatMulQ6KMultiR2?.InvalidateDescriptorCache();
+        MatMulIq4XsMulti?.InvalidateDescriptorCache();
+        MatMulIq3SMulti?.InvalidateDescriptorCache();
+        GdnQkvSplit?.InvalidateDescriptorCache();
+        QGateDeinterleave?.InvalidateDescriptorCache();
+        RmsNormQuantizeFused?.InvalidateDescriptorCache();
+        SwiGluQuantizeFused?.InvalidateDescriptorCache();
+        MoeMmvqQ5K?.InvalidateDescriptorCache();
+        MoeMmvqQ6K?.InvalidateDescriptorCache();
+        MoeIndexedMatmulQ5_1?.InvalidateDescriptorCache();
+        MoeIndexedMatmulQ8_0?.InvalidateDescriptorCache();
+        foreach (var gk in _iqGrouped.Values) gk.InvalidateDescriptorCache();
+        foreach (var gk in _iqGroupedVariants.Values) gk.InvalidateDescriptorCache();
+        foreach (var mk in _iqMmvq.Values) mk.InvalidateDescriptorCache();
+        MoeMmvqQ5_1?.InvalidateDescriptorCache();
+        MoeMmvqQ8_0?.InvalidateDescriptorCache();
+        MatMulQ4_0Mmvq?.InvalidateDescriptorCache();
+        MatMulQ4_0GemmCoopmat?.InvalidateDescriptorCache();
+        MatMulQ4_0Gemm?.InvalidateDescriptorCache();
+        MoeGroupedQ5_1?.InvalidateDescriptorCache();
+        MoeGroupedQ8_0?.InvalidateDescriptorCache();
+        foreach (var wk in _q8Wide.Values) wk.InvalidateDescriptorCache();
+        MoeGroupedQ4K16?.InvalidateDescriptorCache();
+        MoeGroupedQ5K16?.InvalidateDescriptorCache();
     }
 
     public void Dispose()
     {
+        YarnRope?.Dispose();
+        MatMulQ4_0Gemm?.Dispose();
+        foreach (var gk in _iqGrouped.Values) gk.Dispose();
+        foreach (var gk in _iqGroupedVariants.Values) gk.Dispose();
+        foreach (var wk in _q8Wide.Values) wk.Dispose();
+        foreach (var mk in _iqMmvq.Values) mk.Dispose();
+        MoeIndexedMatmulQ5_1?.Dispose(); MoeIndexedMatmulQ8_0?.Dispose(); MoeMmvqQ5_1?.Dispose(); MoeMmvqQ8_0?.Dispose(); MatMulQ4_0Mmvq?.Dispose(); MatMulQ4_0GemmCoopmat?.Dispose(); MoeMmvqQ4KMr?.Dispose(); MoeMmvqQ5_1Mr?.Dispose();
+        MoeGroupedQ5_1?.Dispose(); MoeGroupedQ8_0?.Dispose(); MoeGroupedQ4K16?.Dispose(); MoeGroupedQ5K16?.Dispose();
+        QGateDeinterleave?.Dispose(); GdnQkvSplit?.Dispose(); SwiGluQuantizeFused?.Dispose(); RmsNormQuantizeFused?.Dispose(); MatMulQ8Mmvq?.Dispose(); MatMulQ8MmvqWideRows?.Dispose(); MatMulQ8MmvqWideKSplit?.Dispose(); MoeMmvqQ6K?.Dispose(); MoeMmvqQ5K?.Dispose(); MoeMmvqQ4K?.Dispose();
+        MoeGroupedQ4KMmq?.Dispose(); MoeGroupedQ5KMmq?.Dispose(); SwiGluQuantizeRows?.Dispose(); MoeExpandGatherGroupQ8_1?.Dispose();
+        MoeGroupedQ6K?.Dispose(); MoeGroupedQ5K?.Dispose(); MoeGroupedQ4K?.Dispose(); MoeUngroupScatter?.Dispose();
+        MoeExpandGroupByExpert?.Dispose(); MoeExpertOffsets?.Dispose(); MoeBuildTileList?.Dispose(); MoeExpandGatherGroup?.Dispose(); MoeWeightedScatterGrouped?.Dispose(); MoeScatterGatedAddDecode?.Dispose();
         MoeSigmoidGatedAdd.Dispose();
+        MoeSharedGateAdd?.Dispose();
+        GdnConvSilu?.Dispose();
+        Lfm2ShortConv?.Dispose();
+        MoeTopkSigmoid?.Dispose();
         MoeWeightedScatter.Dispose();
         MoeIndexedMatmulQ4KMmq?.Dispose();
         QuantizeQ8_1RowsActivations?.Dispose();
@@ -459,15 +1081,36 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         Add.Dispose();
         SwiGlu.Dispose();
         SplitKvAttention?.Dispose();
+        SplitKvRowsAttention?.Dispose();
+        NarrowKv?.Dispose();
+        _gqaFlashF32?.Dispose();
+        _gqaFlashF16?.Dispose();
         FlashAttention?.Dispose();
+        FlashAttentionCoopmat?.Dispose();
         Attention.Dispose();
         Rope.Dispose();
         RmsNorm.Dispose();
         MatMulBf16Gemm.Dispose();
+        MatMulBf16Multi?.Dispose();
+        MatMulQ8MmvqMulti?.Dispose();
+        MatMulF32Multi?.Dispose();
+        MatMulF16Multi?.Dispose();
+        MatMulQ8Multi?.Dispose();
+        MatMulQ4KMulti?.Dispose();
+        MatMulQ6KRows?.Dispose();
+        MatMulQ5KMulti?.Dispose();
+        MatMulQ6KMulti?.Dispose();
+        MatMulQ6KMultiR2?.Dispose();
+        MatMulIq4XsMulti?.Dispose();
+        MatMulIq3SMulti?.Dispose();
         MatMulBf16.Dispose();
         MatMulF16GemmCoopmat?.Dispose();
         MatMulF16Gemm.Dispose();
         MatMulF16.Dispose();
+        MatMulPTQ1_0Gemm.Dispose();
+        MatMulPTQ1_0.Dispose();
+        MatMulPQ2_0Gemm.Dispose();
+        MatMulPQ2_0.Dispose();
         MatMulIq1SGemm.Dispose();
         MatMulIq1S.Dispose();
         MatMulIq4XsGemm.Dispose();
@@ -479,6 +1122,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulIq3XxsGemm.Dispose();
         MatMulIq3Xxs.Dispose();
         Iq3Codebooks.Dispose();
+        Iq1CodebooksOwned?.Dispose();
         MatMulIq2SGemm.Dispose();
         MatMulIq2S.Dispose();
         MatMulIq2XsGemm.Dispose();
@@ -497,6 +1141,13 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulQ2KGemm.Dispose();
         MatMulQ2K.Dispose();
         MatMulQ8GemmCoopmat?.Dispose();
+        MatMulQ2KGemmCoopmat?.Dispose();
+        MatMulQ3KGemmCoopmat?.Dispose();
+        MatMulQ4KGemmCoopmat?.Dispose();
+        MatMulQ8MmqCm1?.Dispose(); MatMulQ4KMmqCm1?.Dispose(); QuantizeQ8_1RowsCm1?.Dispose();
+        MatMulQ5KGemmCoopmat?.Dispose();
+        MatMulQ6KGemmCoopmat?.Dispose();
+        MatMulIq4XsGemmCoopmat?.Dispose();
         MatMulQ8Gemm.Dispose();
         MatMulQ8.Dispose();
         MatMul.Dispose();

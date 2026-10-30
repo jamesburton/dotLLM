@@ -43,7 +43,7 @@ namespace DotLLM.Tests.Integration.Engine;
 /// to pass unchanged.
 /// </para>
 /// </remarks>
-[Collection("SmallModel")]
+[Collection(SmallModelGpuCollection.Name)]
 [Trait("Category", "GPU")]
 public class HybridPrefillDecodeTests
 {

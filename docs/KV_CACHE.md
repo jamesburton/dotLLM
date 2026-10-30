@@ -2,16 +2,46 @@
 
 ## Purpose
 
-The KV-cache stores previously computed key and value vectors for all layers, avoiding O(n²) recomputation during autoregressive generation. At each decode step, only the new token's K/V are computed and appended.
+The KV-cache stores previously computed key and value vectors for all layers, so each decode step computes and appends K/V only for the new token. Attention still reads the cached history: a decode step takes work proportional to the context length, and processing a full causal sequence has quadratic attention work in its length.
 
 ## Memory Consumption
 
 Llama 3 8B, FP16, 2048 tokens:
 ```
 2 (K+V) × 32 layers × 8 KV heads × 128 head_dim × 2048 tokens × 2 bytes
-= ~1 GB
+= 268,435,456 bytes = 256 MiB
 ```
-Scales linearly with sequence length and batch size. Dominant memory consumer in production.
+For uniform full-attention layers, this scales linearly with sequence length and batch size. Per-layer KV widths and sliding windows change the total. The CPU `SimpleKvCache` stores separate K and V FP32 buffers per layer in position-major rows `[capacity, kvStride]`, where `kvStride = numKvHeads × headDim` for that layer; windowed layers retain only their configured recent rows. Other cache implementations can use different layouts and precision.
+
+### Quantized KV-Cache Memory
+
+Quantizing the KV-cache to Q8_0 or Q4_0 reduces memory by 3.8-7.1x vs FP32,
+enabling long-context inference on memory-constrained systems.
+
+Effective bytes per element (including 2-byte scale per 32-element block):
+
+| Format | Bytes/element | Compression vs FP32 |
+|--------|---------------|---------------------|
+| FP32   | 4.000         | 1.0x                |
+| FP16   | 2.000         | 2.0x                |
+| Q8_0   | 1.0625        | 3.8x                |
+| Q4_0   | 0.5625        | 7.1x                |
+
+KV bytes per token (K+V, one layer, `kvStride = numKvHeads * headDim`):
+
+| Model shape       | KV heads | head_dim | FP32   | Q8_0   | Q4_0   | K8V4   |
+|--------------------|----------|----------|--------|--------|--------|--------|
+| Qwen3.5 27B Dense  | 4        | 128      | 4096 B | 1088 B | 576 B  | 832 B  |
+| Llama 3 8B/70B     | 8        | 128      | 8192 B | 2176 B | 1152 B | 1664 B |
+
+Example: Qwen3.5 27B, 64 layers, 64K context:
+- FP32: 16.4 GB
+- Q8_0: 4.4 GB (3.8x savings)
+- K8V4: 3.3 GB (5.0x savings)
+- Q4_0: 2.3 GB (7.1x savings)
+
+See `.docs/kv_quant_memory_estimates.md` for per-hardware breakdowns (hybrid
+GPU/CPU split, T5500/Framework/Strix targets).
 
 ## Simple KV-Cache (Phase 1)
 
@@ -22,9 +52,240 @@ V_cache[layer][kv_head][max_seq_len][head_dim]  — FP16
 ```
 Simple indexing: `K_cache[layer][head][pos] = new_K`. Wastes memory for short sequences.
 
+### Hybrid-aware geometry (issue #839)
+
+For hybrid models (`ModelConfig.HybridLayout` set: Qwen3.5/3.6/3.8 GDN, Nemotron-H, Qwen4-Exp) only the attention layers hold K/V.
+`KvGeometry.FromConfig` therefore allocates **slots for attention layers only**, in layer order (slot k = k-th attention layer — the
+`kvSlotForLayer` convention every hybrid forward pass, CPU/Vulkan/CUDA, already uses). The geometry exposes the map:
+`HasLayerSlotMap`, `SlotOfLayer(modelLayer)` (-1 for a recurrent layer), `ModelLayerCount`; `LayerCount` is the **slot** count and
+`KvStrideOf(slot)` takes a slot. `KvGeometry.SlotCount(config)` is the allocation-free slot count (use it instead of
+`config.NumLayers` anywhere a cache or handoff is sized). A 1-in-4 hybrid (Qwen4-Exp: 12 of 48) allocates 4x less KV; dense models
+are unchanged (`HasLayerSlotMap == false`, identity map). Vulkan (`VulkanNemotronHKvCache`) and CUDA (`CudaNemotronHKvCache`) hybrid
+caches were already sparse; the CPU `SimpleKvCache` / `QuantizedKvCache` / `TurboQuantKvCache`, the hybrid CPU-tail cache of the
+split Qwen3-hybrid model, the KV handoff paths and the CLI memory estimate now agree with them.
+
+### Vulkan hybrid KV: element format and lazy growth (issue #898)
+
+`VulkanNemotronHKvCache` (shared by the Vulkan Nemotron-H, Qwen3.5/3.6/3.8 hybrids and Qwen4-Exp) takes two opt-in constructor arguments, both OFF by default so existing models are
+untouched: `storage: VulkanKvStorage.F16` (K/V rows written by a convert kernel, 2 bytes per element; read by the Qwen4-Exp QSA gather kernel and,
+since #1102, by the `_kvf16` attention twins the dense hybrid selects; see the next section) and `lazy: true` (buffers start empty and `EnsureCapacity(positions)` reallocates layer by layer, 25 % / >= 1024 positions at a time, copying the live prefix).
+`MaxLength` is the logical limit, `AllocatedLength` the physical one. After `EnsureCapacity` returns true the CALLER must drop every descriptor cache that may name the freed buffers
+(handles are recycled; a stale cached set reads zeros without any error). Qwen4-Exp does this in `ForwardCore` before recording (`EnsureContext`), for the sequence's K/V and its indexer
+state. Switches and measurements: [ATTENTION.md](ATTENTION.md), "Lazy growth and F16 K/V".
+
+#### Growable caches for a continuing session (issue #1100)
+
+The engine grows a sequence's KV with `IKvCache.TryGrowTo` when a recurrent-prefix hit needs more positions than the cache
+was made with (a growing chat session needs that on almost every turn). The Vulkan cache used to keep the interface default
+(never grows), so on Vulkan every turn after the first missed its prefix, and after #1093 a long one was refused.
+
+- **`TryGrowTo(n)`** raises `MaxLength` up to the `growthLimit` the cache was created with (the model's window; 0, the
+  default, means never). A lazy cache only raises the limit, and its buffers grow in the forward. An eager cache re-creates its
+  buffers at once, copying the live rows layer by layer, so the transient cost is one layer's K and V. Out of device memory
+  returns `false` and leaves the cache as it was.
+- **Hosts.** The Bonsai / Qwen3.5 dense hybrid (`VulkanQwen3HybridDenseTransformerModel`) and LFM2
+  (`VulkanLfm2MoeTransformerModel`) create **lazy** caches capped at the window. Before recording, each forward calls
+  `VulkanNemotronHKvCache.PrepareForForward(kv, positionsEnd, ref seenEpoch)`. It grows the buffers to cover the forward and maps
+  out-of-device-memory to `DeviceMemoryAdmissionException` (HTTP 400, not a crash). It returns true when the caller must drop
+  its descriptor caches.
+- **Descriptor epoch.** Kernels cache descriptor sets by buffer handle, and Vulkan recycles a freed handle into the next
+  allocation. Any cache of this type that frees buffers (a growth, per layer, or a dispose) bumps the process-wide
+  `BufferEpoch`. A model drops every descriptor cache when the epoch it last saw has moved. The check covers another sequence's
+  growth and a snapshot's dispose, not only this cache's. The Arc driver does not recycle a handle soon enough for a stale set
+  to change the logits. The tests therefore pin the invalidation itself (`KvBufferInvalidationsForTest`), as well as
+  bit-identical logits against a cache allocated in one step.
+- **Snapshots.** `SnapshotPrefix` copies into an exactly-sized eager cache. `RestorePrefixFrom` grows a lazy destination first.
+  A snapshot taken before a growth restores exactly after it (`VulkanQwen3HybridDenseKvGrowthTests`).
+- **Cost.** Growth, admission and snapshot copies size everything from the cache's `ElementBytes` / `BytesPerPosition`, never an
+  assumed F32. Since #1102 the storage is F16 by default: 64 KiB per token for Bonsai-2 (16 attention layers x 4 KV heads x 256 x
+  K and V x 2 B), so 8 GiB at 128k (F32, the A/B baseline: 128 KiB, 16 GiB). A growth step is 25 % of what is held (at least
+  1,024 positions), plus one layer's K and V in transit.
+
+### Vulkan dense-hybrid (Bonsai 2) KV: F16 storage read in place (issue #1102)
+
+`VulkanQwen3HybridDenseTransformerModel` (Bonsai 2, Qwen3.5 / 3.6 dense hybrids) keeps its KV in a lazy, growable
+`VulkanNemotronHKvCache` (#1100) whose element format is selectable:
+
+```bash
+dotllm serve <bonsai> --device vulkan            # F16 KV by default
+dotllm bench <bonsai> --device vulkan --kv-quant-k f32 --kv-quant-v f32   # explicit F32 A/B baseline
+```
+
+| storage | bytes / element | Bonsai 2 per token (16 attn layers × 4 KV heads × 256 × K+V) | 128k | 262,144 | 1M (YaRN, #1101) |
+|---|---|---|---|---|---|
+| f32 (A/B baseline only) | 4 | 128 KiB | 16 GiB | 32 GiB | 128 GiB |
+| **f16 (default)** | 2 | 64 KiB | 8 GiB | 16 GiB | 64 GiB |
+
+- **Read in place, no widening.** Every attention kernel the model dispatches has an F16 twin (`*_kvf16.comp`) that
+  loads its K / V elements from the packed halves (`kv_load.glsl`, `unpackHalf2x16` in the load). No kernel converts the
+  history to an F32 scratch, so the device holds exactly the per-token cost above plus the existing per-forward
+  scratch. Decode reads 64 KiB per cached token instead of 128 KiB. Details and the kernel list:
+  [ATTENTION.md](ATTENTION.md), "Narrow (F16) KV on Vulkan".
+- **Writes.** The F32 K / V rows the projections produce are converted on the device by `convert_f32_to_f16_range.comp`
+  (round-to-nearest-even in the integer domain, saturating at ±65504), from contiguous positions only. That is every
+  forward the engine issues: prefill tiles, decode, MTP verify and each `ForwardBatch` sequence.
+- **Snapshots, restore, rollback, growth** copy whole rows byte for byte, so they keep the format and round-trip exactly
+  (`ValidateSnapshotLayout` no longer requires F32).
+- **Selection.** `ConfigureKvStorage(VulkanKvStorage)` sets the format of caches created afterwards; the forward picks
+  kernels per cache. The CLI and server accept `f16` / `fp16` and `f32`. q8_0, q4_0, TurboQuant and mixed K / V are
+  refused at startup with a message, never stored as something else. **F16 is the default** (#1107: no F32 KV on hot
+  paths). F32 is the explicit A/B and parity baseline only: `--cache-type-k/-v f32` on `run` / `bench`, or `DOTLLM_VK_KV=f32`
+  (the server cannot tell an explicit `f32` from its option default).
+- **Measured on Strix** (`serve --device vulkan --no-mtp`, one session grown by ~8k-token turns with `scripts/session-growth.py`,
+  64 generated tokens per turn; prefix reuse on every turn after the first; no device loss to 128k with #1100's submit budget):
+
+  | context | decode tok/s, F32 KV | decode tok/s, F16 KV | prefill tok/s (new turn), F16 |
+  |---|---|---|---|
+  | 7.8k | 19.6 | 21.2 | 179 |
+  | 32.9k | 12.6 | 15.9 | 66 |
+  | 64.3k | 8.7 | 12.0 | 38 |
+  | 128.3k | 5.4 | **8.1** | 21 |
+
+  Process private bytes grew 134 KiB/token with F32 and 70 KiB/token with F16: the cache is 128 vs 64 KiB/token, plus the lazy
+  growth headroom. Both arms ran the GQA-grouped decode pass. In the per-layer kernel bench (ATTENTION.md) the per-query-head
+  pass is within 5 % of it for F32, so the F32 column is close to the old default.
+
+  The F16 arm ran the paired-load variant of that pass (#1113). The shipped per-element pass measures 6.13 instead of 5.37 ms
+  per layer at 128k, about 12 ms more per token (16 layers), so expect ~7.4 tok/s at 128k with the shipped kernels.
+- **Accuracy.** F16 rounds each K / V element once (relative error ≤ 2⁻¹¹). On the synthetic fixture the logits stay
+  within the tolerance the Vulkan forward is held to against the CPU reference (abs 5e-3 + rel 1e-3).
+
+### CUDA hybrid-dense KV: staging, quantized storage, fused decode (issue #956)
+
+`CudaQwen3HybridDenseTransformerModel` (Bonsai-2 27B and other qwen35 dense hybrids) owns its KV buffers behind the
+length-only `CudaHybridKvCacheHandle`. Per full-attention slot (16 of 64 layers for Bonsai-2: 4 KV heads x 256 dim,
+32,768 elements/token across slots):
+
+| storage | per token | at 64k |
+|---|---|---|
+| F16 (default) | 64 KiB | 4.0 GiB |
+| Q8_0 (`DOTLLM_HYBRID_KV=q8_0`) | ~34 KiB | ~2.2 GiB |
+| K8/V4 (`k8v4`) | ~26 KiB | ~1.7 GiB |
+| Q4_0 (`q4_0`) | ~18 KiB | ~1.15 GiB |
+
+- **One slot, growable (#1025).** The storage is single-slot: a forward on a different handle overwrites it from position 0,
+  so the handle reports `HasExclusiveStorage = false`, and the engine's recurrent prefix snapshot is dropped when another
+  request runs. Growing a handle (`TryGrowTo`, used when a longer follow-up prompt reuses that snapshot) keeps the live
+  rows. Since #1080 it grows **in place**: each slot's K and V address range is reserved for the context window
+  (`cuMemAddressReserve`) and physical pages are mapped in as it grows (`CudaGrowableDeviceBuffer`), so nothing is copied
+  and a growth admits only the added 2 MiB pages. Without the CUDA VMM API (or with `DOTLLM_CUDA_KV_VMM=0`) it falls back
+  to reallocating and copying, where old and new storage coexist during the copy.
+- **F32 staging is shared and on demand.** Only the F32-consuming tiers (prefill `attention_f32`, opt-in/fallback decode
+  tiers) read F32 K/V. They get ONE staging pair shared by all layers, fully reconverted per use (512 MiB at 64k). The
+  default mma decode kernel reads the F16 cache directly and stages nothing. Before #956 every slot kept a persistent F32
+  mirror (128 KiB/token, power-of-two growth): 8 GiB at 64k, 16 GiB past 65,536.
+- **Quantized storage** (`--kv-quant-k/--kv-quant-v` or `DOTLLM_HYBRID_KV=f16|q8_0|q4_0|k8v4|k4v8`): rows are quantized on write
+  (`quant_f16_to_q{8,4}_0`, standard 32-element blocks) and read either by the **fused** decode kernel
+  (`attention_flash_mma_decode_gqa_split_kvq_*`, dequant inside the K/V tile load, bit-identical to the scratch path;
+  **default ON since #988's v2 kernels** — v1 fused measured slower than scratch, Q4_0 at ctx 16k 12.4 vs 13.3 tok/s, v2
+  reads whole blocks per quad and holds 18.5 tok/s flat from ctx 512 to 16k; `DOTLLM_HYBRID_KV_FUSED=0` opts out), by the
+  **fused flash prefill** (`attention_flash_mma_prefill_hd256_kvq_*`, issue #1094: prefill tiles and MTP verifies wider than
+  the 8-row per-row tier, dequantizing one 16-row K/V tile at a time in shared memory, bit-identical to the scratch path), or
+  by a dequant into one shared F16 scratch pair (the fallback tiers, shapes the hd256 kernels do not cover, and decode when
+  fused is off).
+- **No full-history F16 copy on the Bonsai path (#1094).** Before #1094, every quantized-KV prefill tile dequantized the
+  whole history of every attention layer into that scratch, which grows with the context: 2 bytes x 2 sides x
+  `numKvHeads * headDim` per token, **4 KiB/token on Bonsai-2, ~0.5 GiB at 128k**. It was what held a 12 GB RTX 3060 at a
+  110k fit (q4_0, no MTP, 512 tile). The served fit no longer counts it when the fused prefill applies: q4_0/q4_0 without
+  MTP is 18 KiB/token (KV rows only). `CudaQwen3HybridDenseTransformerModel.FlashPrefillHd256KvqForTest` turns the tier off
+  for A/B tests. Remaining `ResolveKvF16` callers (decode with `DOTLLM_HYBRID_KV_FUSED=0`, decode below the mma split
+  minimum, the F32 fallback tiers) still allocate the scratch on demand, admitted against free VRAM.
+- **The MTP head's KV follows the trunk's type (#1095).** `CudaMtpState` used to keep the head's one attention layer in F32
+  (8 KiB/token on Bonsai-2) and grow it by copying, so the fit counted 16 KiB/token, more than the q4_0 trunk's 16 layers
+  together (18 KiB). The head now stores K/V in the trunk's type per side: Q8_0 / Q4_0 (and the mixed pairs) when the fused
+  quantized-KV decode kernel takes the head's shape, otherwise F16, never wider (#1107). Rows are written exactly like the
+  trunk's (F32 -> F16 staging -> `quant_f16_to_q{8,4}_0`), byte for byte. A draft step reads the history in place with
+  `attention_flash_mma_decode_gqa_split_kvq_*` (quantized) or the F16 tensor-core decode kernel; below their 256-key minimum
+  the short history goes through the dequant scratch and the F32 kernel, which that minimum bounds. The head's attention reads
+  are all single-row draft steps (the absorb writes K/V only), so the prefill and per-row verify tiers never see its cache.
+  K, V and the position iota grow **in place** with `CudaGrowableDeviceBuffer` (address range reserved for the ceiling, pages
+  mapped on growth); without the VMM API the copying growth remains. Per token on Bonsai-2: q4_0 **1,156 B** (2 x 576 + 4 iota),
+  q8_0 2,180 B, f16 4,100 B, against 16,392 B counted before. `DOTLLM_CUDA_MTP_KV=f32` restores F32 storage for A/B runs only.
+- **KV Q4_0 is not the GGUF Q4_0 layout.** KV blocks pack ADJACENT PAIRS (low nibble = even element), matching CPU
+  `KvQuantize` and `quant_kv.cu`; the weight dequant (`dequant_q4_0_f16`) unpacks low/high HALVES. Always use
+  `CudaKernels.LaunchKvDequantToF16` for KV data. (The eager `CudaQuantizedKvCache` path used the weight dequant until
+  #956, permuting elements inside every 32-block.)
+- **CLI selection (issue #967).** `run`, `bench` and `serve` accept `--kv-quant-k` / `--kv-quant-v` (`f16`, `q8_0`, `q4_0`);
+  on `run` and `serve` they are synonyms of `--cache-type-k/-v` (giving both with different values is an error).
+  `dotllm run --device gpu --kv-quant-k q8_0 --kv-quant-v q4_0` selects K8/V4. Precedence is **per side**:
+  explicit flag, then `DOTLLM_HYBRID_KV`, then F16 (so `--kv-quant-k q4_0` with `DOTLLM_HYBRID_KV=q8_0` gives K4/V8, and
+  `--kv-quant-k f16 --kv-quant-v f16` forces unquantized over the env var). `serve`'s `--cache-type-*` are unset by default (#1284: unset reads as "not given", leaving the env var in charge, and on CPU paged selects Q8_0 blocks); an explicit `f32` is also treated as "not given" by the CUDA hybrid-dense model; pass `f16` to force unquantized.
+  The pure logic lives in `HybridKvStorage` (Core); the model exposes `ConfigureKvStorage(key, value)` (call before the
+  first forward), `KvStorageLabel`, `ComputeKvBytes(maxSeq)` and `KvAllocatedBytes`; the VRAM ledger and the `run`
+  summary share that byte math. `run` prints the effective format in the Memory box
+  (`KV Cache  ... (N slots, KV k8v4 (K:Q8_0 V:Q4_0), 1664 MiB)`), `bench` prints a `KV ...` line after the table and
+  records the flags in the results.csv settings column, `serve` logs `KV storage: ...` at startup.
+  - A flag the selected model/backend cannot honour prints a `WARNING` naming the flag, model and backend, never silence:
+    Vulkan (no quantized KV), split GPU/CPU hybrids, Qwen3MoeHybrid and Nemotron-H (own cache, no quantized storage), and
+    `bench` on CPU / plain CUDA models (its `SimpleKvCache` ignores them). `--cache-window` is ignored (warned) for the
+    hybrid-dense model: one format for the whole cache, no mixed-precision window.
+  - Rejected with an error (exit 1 / startup failure): TurboQuant on this model, and quantized storage when
+    `numKvHeads * headDim` is not a multiple of 32.
+- `DOTLLM_HYBRID_VRAM_LEDGER=1` logs the model-owned KV/staging/scratch bytes once after the first attention call.
+
+### Compact sliding-window KV on CPU (issue #1169)
+
+A sliding-window layer with window `W` only ever reads the last `W` positions, so the CPU caches keep only those rows.
+
+- **Opt-in by geometry.** `KvGeometry.FromConfig(config, compactSlidingWindows: true)` marks each sliding-window slot with its
+  window (`ModelConfig.SlidingWindowOf(layer)`: `PerLayerSlidingWindow`, else `SlidingWindowSize` with `SlidingWindowPattern`).
+  The plain `FromConfig(config)` is unchanged. Callers pass `model.SupportsCompactSlidingKv`, which only `TransformerModel`
+  returns true for; other CPU models and GPU upload paths (`HybridPrefillDecodeStrategy.KeysSpan`) read rows by absolute
+  position and never see a compact cache. TextGenerator's default cache, `run` / `chat` / `serve` quantized factories, `bench`
+  and `perplexity` all pass it.
+- **Layout.** A windowed layer gets `2 * (W - 1 + 64)` rows. When an append would overflow, the last `W - 1 + 64` committed rows
+  move to the front and the layer's row base advances (`SlidingWindowRows`). A chunk larger than the buffer grows it for that
+  chunk; the next compaction that fits shrinks it back. Full layers are untouched.
+- **Attention.** `IWindowedKvCache.RowBaseOf(layer)` gives the position in row 0. Callers pass `positionOffset - base` and
+  `seqKv - base`: masks are relative, K is stored after RoPE and sinks have no position, so the kernels are unchanged and the
+  output is bit-identical to a full cache. The quantized kernel applies the base itself; `TransformerModel.AttendCachedF32`
+  does it for F32.
+- **Formats.** `SimpleKvCache` (F32) and `QuantizedKvCache` in pure mode (`--cache-window 0`, Q8_0 / Q4_0). The FP32
+  mixed-precision window mode keeps full rows (rule 1: do not grow FP32 windows). There is no F16 CPU KV yet (#1107).
+- **Rollback and prefix reuse.** The 64-row margin lets speculative rollback and prefix truncation step back that far.
+  `CanTruncateTo(length)` is false once a windowed layer has dropped rows a query at `length` needs; `Rollback` then throws and
+  the prompt cache treats the hit as a miss. Truncating to 0 always works. `SupportsExactF32PrefixCopy` is false.
+  `KvCacheCopy.CopyContents` copies a windowed layer from its row base.
+- **Savings.** At 262K context Flint (35 of 49 layers windowed at 513) needs ~14 GiB F32 / ~3.7 GiB Q8_0 for its 14 full layers
+  plus ~0.15 GiB / ~0.04 GiB for the windowed ones, against ~49 GiB / ~13 GiB with full rows everywhere.
+- Tests: `SlidingWindowKvCacheTests` (bit-identical attention through compactions, an oversized chunk, rollback in and past the
+  margin, F32 / Q8_0 / Q4_0). Real weights: `NemotronProbe swa` runs one stream through a full and a compact cache.
+
+### Compact sliding-window KV on Vulkan (issue #1176)
+
+The same ring on `VulkanKvCache` (F16 for Flint, F32 also works). `SlidingWindowRows` now lives in `DotLLM.Core.Attention` and
+only plans (`TryPlan` / `Commit`); each backend carries out the move.
+
+- **Opt-in.** `VulkanTransformerModel.SupportsCompactSlidingKv` is true for Flint on a single device only, and `CreateKvCache(n)`
+  follows it; `CreateKvCache(n, compactSlidingWindows: false)` is the full-length A/B baseline (`NemotronProbe swa ... vulkan`,
+  `STEPS_FULLKV=1` for `steps`). Gemma-2/3/4, gpt-oss and Mistral-SWA stay on full rows: they also reach the fused RoPE+KV write,
+  the batched forward or Gemma-4 shared-KV donors, which address rows by absolute position. A pipeline stage keeps full rows.
+- **Compaction on the device.** `RecordUpdate` records the move into the forward's command buffer before the F16 write. When the
+  kept rows do not overlap their destination (every decode compaction on the default ring) it is one `vkCmdCopyBuffer` per K / V;
+  otherwise (a prefill chunk crossing the end of the ring) the rows stage through a cache-owned scratch sized for the largest compaction, for
+  K and V, since `vkCmdCopyBuffer` forbids overlapping regions. Barriers come from the hazard tracker, or a blanket
+  compute/transfer barrier on the untracked path. No host round trip.
+- **Oversized chunks grow the ring before recording.** A chunk longer than the ring's free half needs a bigger buffer. Growing
+  swaps buffer handles, so `Forward` calls `EnsureWindowCapacity(positions)` before it records and drops the kernels' cached
+  descriptor sets when anything grew (as on a scratch resize); the kept rows move with a one-off device copy. The ring is
+  grow-only on Vulkan (shrinking would invalidate descriptors again), so it settles at `W - 1 + 64 + chunk` rows.
+- **Bit-identical by alignment.** The sink prefill kernel tiles the KV range in 256-row tiles from row 0, so an arbitrary base
+  changes where a window crosses a tile boundary and the online-softmax rounding with it (measured ~1e-2 on synthetic logits).
+  Vulkan therefore keeps every base a multiple of 256 (`SlidingWindowRows(..., baseAlignment: 256)`): a compaction keeps
+  `W - 1 + 64` to `W - 1 + 64 + 255` rows and the default ring is `2 * (W - 1 + 64) + 255` rows (1,407 for Flint). The decode
+  and small-row kernels split relative to the window start and are shift-invariant anyway. Prefill now runs the GQA flash sink
+  twins (#1200), whose 16 / 32-row tiles divide 256 and whose window-start tile skip is exact, so the ring stays bit-identical.
+- **Attention.** The forward passes `positions[0] - base` / `CurrentLength - base`; the sink, split-KV and small-row kernels are
+  unchanged. The fused RoPE+KV write and the host-staged paths (`IngestFromHost`, `DownloadLayer`) refuse a compact cache.
+- **Rollback / truncation** behave as on the CPU (`CanTruncateTo`, `Rollback`, `SetCurrentLength`, `Reset`).
+- **Bytes** (Flint, F16, 2 KiB per token per layer; 14 full layers + 35 rings of 1,407 rows): 4K 392 → 208 MiB,
+  32K 3.06 → 0.97 GiB, 262K 24.5 → 7.09 GiB.
+- Tests: `FlintVulkanCompactKvTests` (synthetic Flint, window 20: an overlapping in-ring compaction, a grown ring and direct decode
+  compactions against the full-length F16 cache and the CPU compact cache; rollback within / past the margin; reset and reuse).
+
 ## Paged KV-Cache
 
-Inspired by OS virtual memory paging. This is the **memory management** half of PagedAttention (vLLM): block-based allocation, ref counting, CoW. The **kernel** half (attention reading non-contiguous blocks directly) is opt-in on CUDA as of issue #200 (`DOTLLM_ATTN_PAGED_NATIVE=1`, decode only — see the CUDA section below); it remains a future step for CPU and any future Vulkan paged cache, where current kernels still see contiguous buffers via staging-buffer gather.
+Inspired by OS virtual memory paging. This is the **memory management** half of PagedAttention (vLLM): block-based allocation, ref counting, CoW. The **kernel** half (attention reading non-contiguous blocks directly) is the default on CPU since #1268 (the attention kernel reads F16/Q8_0 blocks in place, prefill and decode) and opt-in on CUDA as of issue #200 (`DOTLLM_ATTN_PAGED_NATIVE=1`, decode only — see the CUDA section below; #1270 tracks the CUDA follow-up). Any future Vulkan paged cache still needs it.
 
 ### Why
 
@@ -35,7 +296,7 @@ Inspired by OS virtual memory paging. This is the **memory management** half of 
 - **Step 43 (speculative decoding)** — benefits from cheap block-level rollback on draft rejection and CoW fork for draft branching, though `SimpleKvCache.SetCurrentLength()` truncation works as a fallback.
 - **Beam search** (future) — beams share prefix blocks via `Fork`, diverge via CoW.
 
-**When it doesn't help**: Single-sequence CLI inference. One sequence uses most of its allocation, and the staging-buffer gather adds overhead. This is why paged is opt-in for `run`/`chat` and default-on only for `serve`.
+**When it doesn't help**: Single-sequence CLI inference. One sequence uses most of its allocation. This is why paged is opt-in for `run`/`chat` and default-on only for `serve`.
 
 ### Design
 - Divide cache into fixed-size **blocks** of B tokens (B = 16).
@@ -49,17 +310,57 @@ Inspired by OS virtual memory paging. This is the **memory management** half of 
 - **Copy-on-write**: For beam search — beams share prefix blocks (ref-counted). On divergence, copy the shared block.
 - **Fork**: For prompt caching — new sequence references existing prefix blocks.
 
-### Attention Integration (v1: Staging Buffer)
+### Attention Integration (CPU: direct block reads, #1268)
 
-Current implementation uses a staging buffer approach: `GetKeysRef()`/`GetValuesRef()` gather block data into a pre-allocated contiguous buffer before each attention call. This avoids modifying attention kernels. The gather cost is O(seqLen × headDim) — negligible compared to attention's O(seqLen² × headDim).
+`PagedKvCache` implements `IPagedKvCache` (Core): block size, uniform `KvStride`, the block table (`BlockIds`) and
+per-layer views of the physical K/V block storage, whose `DType` is the row type. `TransformerModel.AttendCachedF32`
+sends a paged cache to `Attention.Execute(float*, IPagedKvCache, ...)`, which reads the blocks in place: no gather and no
+staging. It is the same kernel as the quantized-cache path (`ExecuteHeadGroup`), generalised over row addressing
+(contiguous / ring / paged, a paged block resolved once per run of rows, not per row) and row type (F32 / F16 / Q8_0 /
+Q4_0, one head slice decoded into a `headDim` scratch by the existing per-row helpers). It supports a custom score scale
+(Gemma `query_pre_attn_scalar`, Granite), softcap, sinks and sliding windows, and partitions heads across workers with
+`PartitionRange` like the contiguous path; up to 4 query heads sharing a KV head run together so each cached row is
+decoded once for the group. Rows with ≤ 2048 visible keys take the contiguous path's single-shot softmax,
+longer rows the same tiled online softmax, so **F32 blocks reproduce the contiguous kernel bit for bit** (#530; tested).
 
-Future optimization: specialized paged attention kernels that read blocks directly via block table indirection, eliminating the staging copy.
+**Block row type** (`KvBlockPool` / `PagedKvCacheFactory` `elementType`): **Q8_0 when no KV type is specified** (#1284), F16 when one is. Q8_0 was faster than F16 at every
+context in the #1268 decode benchmark (ctx 512: 172 vs 125 us; 4096: 1.12 vs 0.85 ms; 16384: 4.55 vs 3.18 ms) at about half the bytes, with
+comparable logit drift. The default applies on the CPU paged path (`serve`, `run --paged`, `chat --paged`) for uniform non-hybrid models, no
+mixed-precision window, head dim a multiple of 32; startup logs `INFO: KV cache: no type specified; using Q8_0 paged blocks ...`. Any other model
+keeps F16 blocks (or its own cache). Explicit choices are honoured: `--cache-type-k f16 --cache-type-v f16` (or `f32`) gives F16 blocks, and
+`q8_0` for both gives Q8_0 blocks. Mixed (only K or only V given) is unchanged: a lone `f16`/`f32` side gives F16 blocks, a lone `q8_0`/`q4_0`
+side uses the quantized simple cache. F32 only as a reference for bit-identity tests. Bytes per token (K+V, all layers), Llama-3.2-1B (16 L × 8 KV heads × 64):
+
+| rows | bytes/token | Llama-3.1-8B (32 L × 8 × 128) |
+|---|---|---|
+| F32 (before) | 64 KiB | 256 KiB |
+| F16 (explicit `f16`) | 32 KiB | 128 KiB |
+| Q8_0 (default, #1284) | 17 KiB | 68 KiB |
+
+The old per-sequence F32 staging (`2 × maxSeqLen × kvStride × 4` bytes, allocated eagerly: 64 MiB for Llama-3.1-8B at 8k)
+is gone from the attention path: `GetKeysRef`/`GetValuesRef` still exist for callers without a paged kernel (other
+architectures, KV handoff) and decode into staging that is allocated **lazily**, on first use. `DownloadLayer` decodes
+straight into the caller's buffers. `PagedKvCache.AllocatedBytes` is the bytes of the blocks this sequence holds plus any
+staging (shared prefix blocks are counted by every holder); the pool's reservation is `KvBlockPool.AllocatedBytes`.
+
+Decode attention, one token, 16 q / 4 KV heads, head dim 64, fragmented pages (`PagedAttentionBenchmarks`, 8 threads,
+Zen5): before = F32 blocks gathered into staging + contiguous kernel; after = blocks read in place.
+
+| ctx | before (F32 gather) | after F16 | after Q8_0 | after F32 |
+|---|---|---|---|---|
+| 512 | 256 µs | 172 µs | 125 µs | 93 µs |
+| 4096 | 2.00 ms | 1.12 ms | 0.85 ms | 0.78 ms |
+| 16384 | 10.7 ms | 4.55 ms | 3.18 ms | 4.81 ms |
+
+F16/Q8_0 blocks change greedy output only at near-ties: on SmolLM-135M, teacher-forced logits differ from the F32 simple
+cache by at most 0.94 (F16) / 0.90 (Q8_0), against 0.84 for the existing Q8_0 `QuantizedKvCache`, with top-1 agreement
+14/15 for all three (`PagedKvCache_Blocks_TrackSimpleCacheLogits`).
 
 ### Key Classes
 
 - `KvBlockPool` — Fixed-size pool of KV blocks. Per-layer contiguous storage, 64-byte aligned. Free list with `Interlocked` ref counting for thread safety.
 - `KvBlockTable` — Per-sequence mapping from logical positions to physical block IDs. Supports `Fork` (shared prefix) and `EnsureWritable` (copy-on-write).
-- `PagedKvCache : IKvCache` — Paged cache with staging-buffer gather. Drop-in replacement for `SimpleKvCache`.
+- `PagedKvCache : IPagedKvCache, IHostStagedKvCache` — Paged cache read in place by the CPU attention kernel; legacy contiguous views decode into lazy staging. Drop-in replacement for `SimpleKvCache`.
 - `PagedKvCacheFactory` — Creates `PagedKvCache` instances backed by a shared `KvBlockPool`.
 
 ### CUDA Paged KV-Cache (issue #252)
@@ -128,9 +429,10 @@ dotllm serve model.gguf --no-ui
 - CUDA now has a paged KV-cache (issue #252, see above) via `CudaPagedKvCache`. Hybrid (CPU+GPU
   split-layer) models still fall back to their native KV-cache — `CudaKvBlockPool`'s per-layer
   shape assumes every layer's storage lives on one device, which doesn't fit the hybrid split.
-- Not compatible with quantized KV-cache (`--cache-type-k`/`--cache-type-v`) on either backend.
-  Falls back to `QuantizedKvCache`/`CudaQuantizedKvCache` with a warning.
-- Staging buffer means `GetKeysRef`/`GetValuesRef` (CPU) results are only valid until the next call
+- CPU: q8_0 K+V selects Q8_0 blocks (uniform, non-hybrid models, no mixed-precision window); any other quantized KV
+  request falls back to `QuantizedKvCache` with a warning. CUDA: falls back to `CudaQuantizedKvCache`.
+- CPU paged caches need a uniform per-layer KV stride: Gemma-4 / MiMo-V2 (per-layer KV widths) use the simple cache.
+- The legacy `GetKeysRef`/`GetValuesRef` (CPU) staging results are only valid until the next call
   (shared buffer). CUDA's `CudaPagedKvCache` doesn't implement `GetKeysRef`/`GetValuesRef` at all —
   there's no single contiguous device pointer to hand back without a gather — callers must use
   `PrepareAttentionScratch(layerIndex, stream)` instead.
@@ -139,9 +441,9 @@ dotllm serve model.gguf --no-ui
 - CUDA has an opt-in direct block-table-read decode attention kernel now (issue #200,
   `DOTLLM_ATTN_PAGED_NATIVE=1`, see the CUDA section above and
   `docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md`), but it defaults OFF pending real-hardware
-  measurement, and it only covers CUDA decode — CPU's `PagedKvCache` and any future Vulkan paged
-  cache still only have the staging-buffer-gather shape (see `docs/ROADMAP.md`'s "Paged attention
-  kernels" row for the remaining backends/prefill scope).
+  measurement, and it only covers CUDA decode (#1270). CPU's `PagedKvCache` reads blocks directly
+  since #1268; a future Vulkan paged cache would need its own kernel (see `docs/ROADMAP.md`'s "Paged
+  attention kernels" row).
 
 ## KV-Cache Quantization
 
@@ -173,8 +475,8 @@ On each new token write, the oldest window entry is quantized and appended to th
 
 ### CLI
 ```
---cache-type-k q8_0    # key quantization (f32, q8_0, q4_0)
---cache-type-v q4_0    # value quantization (f32, q8_0, q4_0)
+--cache-type-k q8_0    # key quantization (f32, q8_0, q4_0); synonym --kv-quant-k (also on bench)
+--cache-type-v q4_0    # value quantization (f32, q8_0, q4_0); synonym --kv-quant-v (also on bench)
 --cache-window 64      # recent tokens in full precision (0 = all quantized)
 ```
 
@@ -372,3 +674,194 @@ precedence over the simple `PrefixCache` from Step 54. Both engine paths
   to make room is deferred to Step 59 (priority-based scheduling).
 - The trie walks linearly to find a node by block id during `Release`;
   good enough for typical depths (< 1024 blocks) but a future tweak.
+### Bonsai-2 quality gate and recommended format (#973)
+
+RTX 3060 12 GB, Bonsai-2 27B PQ2_0, flash prefill (#962), v2 decode + fused quantized decode (#988).
+Perplexity: `DOTLLM_HYBRID_KV=<fmt> dotllm perplexity <gguf> --device cuda --kv-cache f32 --context 512 --max-tokens 8192`
+(wikitext-2 test; without `--kv-cache` the CUDA hybrid-dense model scores cacheless over exact F32 K/V and is blind to KV format).
+Needles: 3 secrets at 10/50/90% depth, greedy; token counts are 18,011 / 35,888 / 71,811.
+
+| KV | PPL | vs F16 | needles 18k / 36k / 72k | peak VRAM 36k / 72k | decode tok/s @72k |
+|---|---:|---:|---|---|---:|
+| F16 | 10.2350 | - | 3/3, 3/3, does not fit | 11.7 GB / - | - |
+| Q8_0 | 10.2346 | -0.004% | 3/3, 3/3, 3/3 | 10.7 GB / **12.08 GB** | 18.1 |
+| K8V4 | 10.2529 | +0.18% | 3/3, 3/3, 3/3 | 10.5 GB / 11.5 GB | 17.1 |
+| Q4_0 | 10.2661 | +0.32% | 3/3, 3/3, 3/3 | 10.2 GB / 10.95 GB | 18.8 |
+
+Decode sweep (Q4_0, 64 tokens per point): 18.9 tok/s at ctx 512, 19.5 at 4k, 19.7 at 16k, 18.9 at 32k, 18.4 at 64k.
+
+**Recommendation (12 GB card):** Q8_0 up to ~36k (indistinguishable from F16, 1 GB headroom). Beyond that
+prefer K8V4 (+0.18% PPL, 11.5 GB at 72k) or Q4_0 (10.95 GB) - Q8_0 at 72k peaks at 12.08 GB of 12.29 and is
+one allocation from WDDM paging. Needle retrieval is a coarse test; the PPL deltas are the fine-grained signal.
+# Recurrent prefix snapshots
+
+## LFM2 convolution checkpoints and sequence prefixes (#1028)
+
+CPU and Vulkan LFM2 models implement model-owned recurrent checkpoint/restore and
+independent per-sequence prefix snapshots. A prefix snapshot owns both the attention
+KV prefix and the short-convolution history; restoring it into another sequence leaves
+the KV cache at the captured length. The caller must capture recurrent state immediately
+after exactly that prefix has been consumed. Both backends support interleaved sequences
+through serialized `ForwardBatch` calls; this does not make simultaneous calls on one
+model instance thread-safe.
+
+The initial CPU path supports `SimpleKvCache` host F32 storage. The
+`IKvCache.SupportsExactF32PrefixCopy` capability opts a cache into complete, lossless
+F32 copying with explicit per-layer geometry. Compressed and paged caches have not
+opted in: capture returns null and restore rejects them before changing the destination.
+Vulkan snapshots retain F32 KV and convolution buffers on the same device. Snapshot
+ownership, state/cache geometry, device identity and disposed resources are validated.
+Callers own and dispose snapshots; they can restore an intact snapshot repeatedly.
+
+These APIs do not implement per-row recurrent snapshots, add an LFM MTP head, or add
+the host/disk transport described below to LFM models.
+
+## Host tier for models with snapshot transport (#1033)
+
+Recurrent and hybrid models need both attention KV rows and recurrent state to reuse a
+conversation prefix. Retaining only KV rows is insufficient. Multi-slot snapshots keep
+independent copies of both, match the longest token prefix, and evict least-recently-used
+entries when the configured entry or memory limits are reached. A request still forwards
+at least one suffix token to produce its next-token logits.
+
+`--prefix-snapshots 20 --prefix-snapshot-host-budget 8GiB` enables bounded multi-session
+retention on models with snapshot transport support. The default remains one snapshot and
+no host tier. The host budget counts snapshot buffers, including recurrent state; it does
+not include model weights or the active device KV cache. Pinned host memory cannot be
+paged out, so configure a budget appropriate to the machine's available RAM.
+
+The active snapshot uses device storage when admitted by the backend's memory policy.
+Cold snapshots can use page-locked host memory and restore their exact stored bytes instead
+of prefilling the conversation again. A model/configuration change invalidates snapshots;
+failed restores are discarded as misses. Transfers and generation remain serialized around
+the live state. `DELETE /v1/prompt-cache` clears recurrent snapshots as well as the attention
+prefix trie.
+
+For a representative F16 layout, 16 attention layers × two K/V tensors × 1,024 elements ×
+two bytes gives 64 KiB per token. Use the loaded model's reported KV geometry and
+snapshot byte counts for budgeting. That layout needs about 1.83 GiB for
+30,000 tokens, plus recurrent state (about 150 MiB in the issue's example), so an 8 GiB
+host budget holds roughly four such snapshots. Quantized KV retains its raw packed format
+and reduces this storage proportionally to the actual format block size.
+
+Streaming timing extensions expose `cached_tokens`, `cache_tier` and `cache_restore_ms`.
+`GET /v1/prompt-cache` includes recurrent occupancy, host bytes and tier-specific hit
+counters even when no paged prefix trie is active. The NVMe spill tier is tracked separately
+in #1034; configuring the host tier does not enable disk persistence.
+
+CUDA transport retains raw F16, Q8 or Q4 KV rows and independent convolution/GDN state;
+it does not expand quantized rows to F32. Device admission reserves at least 512 MiB of
+free VRAM beyond the snapshot allocation. Multi-slot mode captures a first-seen prompt
+at its penultimate token so alternating conversations can reuse their first visit.
+Multi-slot hits leave MTP disabled, because the snapshot copies only the trunk, and rerun a suffix token to regenerate logits.
+The default single slot keeps the MTP head with its snapshot, so its hits do speculate (#1088, below).
+Snapshot ownership is tied to the model instance and forward settings. Entries do not
+survive a process restart; persistent storage belongs to #1034.
+
+The initial independent CUDA transport covers the Qwen3 hybrid dense model family,
+including Bonsai. Models without the snapshot-provider capability retain their existing
+single-slot behavior even when a larger entry count is requested; these flags do not add
+transport support to another backend or architecture.
+
+## MTP on a single-slot prefix hit (#1088)
+
+A recurrent-prefix hit skips the cached prefix's forward, and the MTP head drafts from its own KV, which must cover the
+whole sequence (#469). Before #1088 a hit therefore decoded without speculation. The single-slot snapshot shares the
+live KV handle rather than copying it, and the head now gets the same treatment:
+
+- **What the snapshot keeps.** The request's head state (`IMtpState`) stays alive with the entry, plus a mark taken at
+  the snapshot boundary (`IMtpState.MarkPrefix`): the head's length and the trunk hidden row its next absorb pairs with.
+  The head's rows below the mark stay valid for the same reason the trunk's KV rows do: every later write is at or
+  beyond the boundary.
+- **What a hit does.** It rolls the head back to the mark with the trunk (`IMtpState.TryResumeAt`), raising the head's
+  ceiling to the trunk KV's length when the hit grew it. The suffix prefill then absorbs from the mark exactly as a cold
+  run would. The draft logits match a cold run's: bit for bit on the CPU, and within 1.2e-7 on CUDA.
+- **Plain turns keep the head in step while MTP may be used.** A request that takes the snapshot carries the head
+  through its prefill even when it decodes plain (the adaptive gate picked plain, or logprobs were requested), as long as
+  the gate forecasts MTP for a coming request (`MtpAdaptiveGate.LikelyUsesMtpNext`: an arm still unexplored, MTP the
+  measured winner, or a re-probe due). Otherwise a plain first turn would leave every later hit without a head, and the
+  gate could never try MTP. Once plain decode measures faster, plain turns stop feeding the head and the session's later
+  hits stay plain; the next miss starts a fresh head.
+- **Why not copy or recompute it.** Copying the head's F32 KV into the snapshot costs about 8 KiB/token of extra memory
+  and a copy on every turn, and the single slot already shares its storage. Recomputing it needs the trunk's hidden
+  state at every cached position, which is the cost of the prefill the hit exists to skip.
+- **What it costs.** Memory: the head's KV now lives between requests and during hit turns, which the context fit
+  already counts when MTP is on. Compute: a turn that feeds the head pays its absorb in the prefill, so in time to first
+  token. On Bonsai-2 27B on an RTX 3060 the CUDA absorb measured about 0.2 ms per prompt token (3% of the trunk's
+  prefill, 0.7-1.0 s on a 4k-token agent turn); hence the forecast above.
+- **Limits.** The multi-slot tiers (`--prefix-snapshots` > 1) copy only the trunk, so their hits stay plain. Backends
+  whose head state cannot mark (the Vulkan states) keep no head, so their hits stay plain too, and their plain turns
+  never feed one (the first head made shows the states cannot resume).
+
+With no snapshot held, a prompt that shares nothing usable with the previous one (the first turn of a conversation)
+now snapshots at its own end. The second agent turn then hits instead of re-prefilling the first.
+
+## Mid-history resume: step checkpoints (#1286)
+
+An agent that trims an old tool result resends a prompt that diverges from the cached history in the middle. The
+single-slot snapshot sits at the end of the last prompt, so before #1286 that was a miss and a full re-prefill.
+
+`--prompt-cache-step N` (chat and serve; `RecurrentPrefixCacheOptions.StepTokens`) checkpoints the recurrent state every
+N prefill tokens, at absolute positions that are multiples of N. Idea from azllm's `--prompt-cache-step`.
+
+- **Resume.** A new request finds where it diverges from the cached history and resumes from the deepest checkpoint at
+  or before that point. It rolls the KV back there and re-prefills only the rest.
+- **KV is shared.** Attention KV is per token, so every checkpoint along one history shares the single slot's KV
+  handle. A step copies only the recurrent (GDN/conv) state, in its own dtype
+  (`IModel.RecurrentStateCheckpointBytes`).
+- **Invalidation.** Checkpoints past the resume point are dropped, because the request overwrites those rows.
+- **Bounds.** The newest (deepest) `--prompt-cache-step-keep K` steps are kept, default 8; `StepBudgetBytes` adds an
+  optional byte cap. When steps are on, the boundary a hit moves past is kept as a step too, so a retried turn (#1090)
+  resumes there.
+- **Default off.** Each step is a full recurrent-state copy, which needs sign-off under the avoid-state-copies rule.
+  Bonsai-2 27B holds about 150 MiB of state per checkpoint, so eight steps cost about 1.2 GiB (in VRAM on CUDA/Vulkan).
+  Enable it where agent traces trim history.
+- **MTP.** A mid-history resume decodes plain, because the MTP head is marked only at the snapshot boundary.
+- **Scope.** Steps live on the single-slot path only (CPU, and CUDA/Vulkan hosts with `CheckpointRecurrentState`). The
+  tiered cache (`--prefix-snapshots` > 1) and the continuous-batch scheduler copy KV rows into every snapshot, so
+  periodic snapshots there would copy the history again and again. They wait for KV rows shared with the snapshot
+  (#1111). A model that cannot size its checkpoints takes no steps.
+
+Measured on CPU (Bonsai-2 2B PQ2_0; `HybridMidHistoryResumeProbe`, `DOTLLM_HYBRID_RESUME_PROBE=1`), step 512:
+
+- **Trace.** A 3,523-token agent trace. The second request trims the middle tool result, giving 2,392 tokens that share
+  1,222 with the first.
+- **Resume and output.** The resumed request restored the step at 1,024 and re-prefilled 1,368 tokens. Its greedy output
+  is identical to a cold prefill.
+- **TTFT.** 127 s resumed against 467 s cold. Absolute times are inflated by other workloads on the box, so read the ratio,
+  not the seconds.
+- **Size.** One checkpoint is 19.3 MiB (F32 GDN + conv state); the six steps held cost 115.6 MiB.
+
+## Disk spill below the host tier (#1034)
+
+Use all three limits to retain more conversations than fit in pinned memory:
+
+```shell
+dotllm serve --model MODEL --device gpu --prefix-snapshots 20 --prefix-snapshot-host-budget 8GiB --prefix-snapshot-disk-dir ./prefix-cache --prefix-snapshot-disk-budget 40GiB
+```
+
+The disk directory and a positive disk budget must be supplied together. Cold snapshots
+spill as raw packed KV plus recurrent state; their token sequences remain indexed in
+memory, so prefix matching performs no disk reads. Successful reloads report
+`cache_tier: disk`. Recurrent statistics include `disk_entries`, `disk_bytes`,
+`disk_budget_bytes`, `disk_hits` and the implemented `disk_transport`.
+
+The current transport is `file-stream`: overlapped file handles with provider-owned
+pinned CUDA transfers. Native DirectStorage/CUDA external-memory and cuFile integration
+remain unavailable in this implementation. Startup reports the selected disk transport
+or that disk caching is unavailable for the provider or directory. This path does not
+claim a CPU-free GPU read.
+
+Disk accounting includes metadata and temporary writes. Leave enough disk budget for
+an atomic spill while a protected reload is in progress; a capacity calculation based
+only on final snapshot payloads can require additional evictions. Host accounting also
+reserves incoming snapshot bytes before import. Corrupt, truncated, mismatched or failed
+reads become cache misses and trigger ordinary prefill.
+
+Each cache owns a private session subdirectory. Files are written to temporary names,
+flushed and atomically renamed; checksums and bounded metadata are validated before
+state import. Clear, eviction and model changes remove owned files. Restart persistence
+is disabled: a new process creates a new session directory and does not load old files.
+An abrupt process termination can leave an orphaned session directory; after confirming
+its process has stopped, remove that directory manually. Live-instance budgets do not
+include orphaned files from earlier processes.

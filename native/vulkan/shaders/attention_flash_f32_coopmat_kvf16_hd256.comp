@@ -1,0 +1,8 @@
+#version 450
+// F16-KV twin of attention_flash_f32_coopmat_hd256.comp (issue #1102): the same kernel reading K / V stored as F16 (two halves per
+// 32-bit word, see kv_load.glsl). Named {base}_hd256 for the F16 base attention_flash_f32_coopmat_kvf16, which is how the kernel
+// finds its wide pipeline. With F16 K the hi/lo split's K_lo is exactly zero, so the scores match the F32 kernel on rounded rows.
+// Body: attention_flash_f32_coopmat_hd256.glsl.
+#define KV_F16 1
+#extension GL_GOOGLE_include_directive : require
+#include "attention_flash_f32_coopmat_hd256.glsl"

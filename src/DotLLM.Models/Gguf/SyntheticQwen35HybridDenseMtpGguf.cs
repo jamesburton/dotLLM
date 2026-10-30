@@ -47,7 +47,6 @@ public static class SyntheticQwen35HybridDenseMtpGguf
     private const int NKHead = 1;              // ssm.group_count
     private const int DState = 8;              // ssm.state_size
     private const int DConv = 4;               // ssm.conv_kernel
-    private const int DInner = NVHead * DState; // ssm.inner_size
 
     /// <summary>Builds the synthetic <c>qwen35</c> fixture, optionally with a trailing MTP head.</summary>
     /// <param name="seed">Xorshift PRNG seed — deterministic weights, no <c>Random</c>/time.</param>
@@ -77,12 +76,83 @@ public static class SyntheticQwen35HybridDenseMtpGguf
     /// trunk can only ever put one layer on each side) — every other existing caller keeps the
     /// default 2-layer trunk unchanged.
     /// </param>
+    /// <param name="contextLength">
+    /// Overrides <see cref="ContextLength"/>'s default of 16. Issue #435 needs a fixture whose
+    /// context exceeds a backend's all-row-logits bound (also 16), so that a test can assert the
+    /// behaviour on BOTH sides of that bound; every other caller keeps the default.
+    /// </param>
+    /// <param name="gdnKeyHeads">
+    /// Overrides the GDN key-head count (<c>ssm.group_count</c>, default 1). Issue #479 needs
+    /// <c>NKHead &gt;= 2</c>: with a single key head the PrismML <c>gdn_v_grouped</c> tiled→grouped
+    /// value-head permute is the identity, so a test on the default fixture cannot tell a missing
+    /// permute from a correct one.
+    /// </param>
+    /// <param name="gdnValueHeads">
+    /// Overrides the GDN value-head count (<c>ssm.time_step_rank</c>, default 2). Must be a multiple
+    /// of <paramref name="gdnKeyHeads"/>.
+    /// </param>
+    /// <param name="pq2_0Projections">
+    /// Issue #482: when <see langword="true"/>, widens the fixture so every projection input width
+    /// is a multiple of 128 (see <see cref="Dims.Pq2_0"/>) and stores the trunk projections,
+    /// <c>token_embd</c> and <c>output</c> as random ternary PQ2_0 — the Bonsai 2 type mix, so the
+    /// CUDA PQ2_0 GEMV paths (single- and multi-column) are exercised end to end. <c>ssm_alpha</c> /
+    /// <c>ssm_beta</c> and the MTP block stay F32. Default <see langword="false"/> leaves the fixture
+    /// byte-identical to before.
+    /// </param>
+    /// <param name="q8_0MtpHead">
+    /// Issue #486: when <see langword="true"/>, stores the MTP block's projections (attention Q/K/V/O,
+    /// FFN gate/up/down and <c>nextn.eh_proj</c>) as Q8_0 — Bonsai 2's MTP head type — and widens the
+    /// fixture to <see cref="Dims.Pq2_0"/> so every input width is a multiple of 32. Exercises the CUDA
+    /// Q8_0 MTP GEMV paths (single-row draft/absorb and the multi-column batched absorb). The head-local
+    /// embedding / lm_head stay F32. Default <see langword="false"/> leaves the fixture unchanged.
+    /// </param>
+    /// <param name="headDim">
+    /// Issue #1101: overrides the attention head width (null keeps the dims' default). With
+    /// <paramref name="ropeDim"/> 64 and 256 here the fixture has Bonsai 2's partial-rotary shape (64 of 256).
+    /// </param>
+    /// <param name="ropeDim">Overrides <c>rope.dimension_count</c> (null keeps <see cref="RopeDim"/>).</param>
+    /// <param name="ropeFreqBase">Overrides <c>rope.freq_base</c> (null keeps 10000).</param>
+    /// <param name="attentionHeads">
+    /// Overrides <see cref="NumAttentionHeads"/> (2). Issue #1102 needs a GQA shape that is not degenerate: with one KV head every
+    /// query head reads the same KV row, so a wrong head broadcast cannot show. Must be a multiple of <paramref name="kvHeads"/>.
+    /// </param>
+    /// <param name="kvHeads">Overrides <see cref="NumKvHeads"/> (1). See <paramref name="attentionHeads"/>.</param>
+    /// <param name="headOnly">
+    /// Issue #1185: emit only the MTP head, laid out like ggml-org's separate <c>mtp-*.gguf</c> (the full model's metadata, the trunk's
+    /// <c>token_embd</c> / <c>output</c> / <c>output_norm</c> copies and the <c>blk.{BlockCount}.*</c> block, no trunk layers). Weights are drawn in
+    /// the same order as the embedded fixture, so this file plus the <c>withMtp: false</c> trunk (same seed) split the embedded fixture exactly.
+    /// Requires <paramref name="withMtp"/>.
+    /// </param>
+    /// <param name="tiedOutput">
+    /// Issue #1276: omit <c>output.weight</c> so the lm_head is tied to <c>token_embd</c> (the
+    /// Bonsai 2 small-model / <c>prism.hadamard</c> v2 layout).
+    /// </param>
     public static byte[] Build(uint seed = 0xC0FFEEu, bool withMtp = true, bool mtpHasOwnHeadTensors = true,
-        int fullAttnInterval = FullAttnInterval, int blockCount = BlockCount)
+        int fullAttnInterval = FullAttnInterval, int blockCount = BlockCount,
+        int contextLength = ContextLength, int gdnKeyHeads = NKHead, int gdnValueHeads = NVHead,
+        bool pq2_0Projections = false, bool q8_0MtpHead = false,
+        int? headDim = null, int? ropeDim = null, float? ropeFreqBase = null,
+        int attentionHeads = NumAttentionHeads, int kvHeads = NumKvHeads, bool headOnly = false,
+        bool tiedOutput = false)
     {
+        if (headOnly && !withMtp)
+            throw new ArgumentException("A head-only fixture needs withMtp.", nameof(headOnly));
+        if (gdnKeyHeads <= 0 || gdnValueHeads <= 0 || gdnValueHeads % gdnKeyHeads != 0)
+            throw new ArgumentException(
+                $"GDN value heads ({gdnValueHeads}) must be a positive multiple of key heads ({gdnKeyHeads}).");
+        if (kvHeads <= 0 || attentionHeads <= 0 || attentionHeads % kvHeads != 0)
+            throw new ArgumentException(
+                $"Attention heads ({attentionHeads}) must be a positive multiple of KV heads ({kvHeads}).");
+
         var w = new GgufWriter();
         var rng = new SyntheticGemma4Gguf.Xorshift(seed);
         const string arch = "qwen35";
+        Dims d = (pq2_0Projections || q8_0MtpHead ? Dims.Pq2_0 : Dims.Default) with { Heads = attentionHeads, KvHeads = kvHeads };
+        if (headDim is int hd)
+            d = d with { HeadDim = hd };
+        int rotary = ropeDim ?? RopeDim;
+        if (rotary <= 0 || (rotary & 1) != 0 || rotary > d.HeadDim)
+            throw new ArgumentException($"ropeDim {rotary} must be even and at most the head width {d.HeadDim}.");
 
         // ── Metadata ──────────────────────────────────────────────────────
         w.AddString("general.architecture", arch);
@@ -90,17 +160,17 @@ public static class SyntheticQwen35HybridDenseMtpGguf
         w.AddUInt32("general.alignment", 32);
 
         int rawBlockCount = withMtp ? blockCount + 1 : blockCount;
-        w.AddUInt32($"{arch}.context_length", ContextLength);
-        w.AddUInt32($"{arch}.embedding_length", HiddenSize);
+        w.AddUInt32($"{arch}.context_length", (uint)contextLength);
+        w.AddUInt32($"{arch}.embedding_length", (uint)d.Hidden);
         w.AddUInt32($"{arch}.block_count", (uint)rawBlockCount);
-        w.AddUInt32($"{arch}.attention.head_count", NumAttentionHeads);
-        w.AddUInt32($"{arch}.attention.head_count_kv", NumKvHeads);
-        w.AddUInt32($"{arch}.attention.key_length", HeadDim);
-        w.AddUInt32($"{arch}.feed_forward_length", IntermediateSize);
+        w.AddUInt32($"{arch}.attention.head_count", (uint)d.Heads);
+        w.AddUInt32($"{arch}.attention.head_count_kv", (uint)d.KvHeads);
+        w.AddUInt32($"{arch}.attention.key_length", (uint)d.HeadDim);
+        w.AddUInt32($"{arch}.feed_forward_length", (uint)d.Ffn);
         w.AddFloat32($"{arch}.attention.layer_norm_rms_epsilon", 1e-5f);
         w.AddUInt32($"{arch}.vocab_size", VocabSize);
-        w.AddFloat32($"{arch}.rope.freq_base", 10000.0f);
-        w.AddUInt32($"{arch}.rope.dimension_count", RopeDim);
+        w.AddFloat32($"{arch}.rope.freq_base", ropeFreqBase ?? 10000.0f);
+        w.AddUInt32($"{arch}.rope.dimension_count", (uint)rotary);
 
         // Hybrid layout: trunk layer i is full attention when (i+1) % full_attention_interval == 0.
         // fullAttnInterval defaults to the standard fixture shape (mixed GDN+attention); callers that
@@ -113,10 +183,10 @@ public static class SyntheticQwen35HybridDenseMtpGguf
             w.AddUInt32($"{arch}.nextn_predict_layers", 1);
 
         // GDN ({arch}.ssm.* reused with qwen35 semantics — see TryExtractGdnConfig).
-        w.AddUInt32($"{arch}.ssm.inner_size", DInner);
-        w.AddUInt32($"{arch}.ssm.state_size", DState);
-        w.AddUInt32($"{arch}.ssm.time_step_rank", NVHead);
-        w.AddUInt32($"{arch}.ssm.group_count", NKHead);
+        w.AddUInt32($"{arch}.ssm.inner_size", (uint)(gdnValueHeads * d.DState));
+        w.AddUInt32($"{arch}.ssm.state_size", (uint)d.DState);
+        w.AddUInt32($"{arch}.ssm.time_step_rank", (uint)gdnValueHeads);
+        w.AddUInt32($"{arch}.ssm.group_count", (uint)gdnKeyHeads);
         w.AddUInt32($"{arch}.ssm.conv_kernel", DConv);
 
         AddTokenizer(w);
@@ -124,43 +194,50 @@ public static class SyntheticQwen35HybridDenseMtpGguf
         // ── Tensors ───────────────────────────────────────────────────────
         // token_embd [ne0=hidden, ne1=vocab]; separate output.weight (untied, exercises the
         // trunk-fallback path distinctly from the tied-embedding case the MoE fixture covers).
-        AddMatrixF32(w, rng, "token_embd.weight", inK: HiddenSize, outM: VocabSize, 0.05f);
-        AddMatrixF32(w, rng, "output.weight", inK: HiddenSize, outM: VocabSize, 0.05f);
-        AddNorm(w, rng, "output_norm.weight", HiddenSize);
+        // With pq2_0Projections the trunk's projections, token_embd and output are PQ2_0 (as in
+        // Bonsai 2); ssm_alpha/ssm_beta and the MTP block stay F32 (BF16 / Q8_0 in Bonsai 2).
+        bool pq2 = pq2_0Projections;
+        AddProjection(w, rng, "token_embd.weight", inK: d.Hidden, outM: VocabSize, 0.05f, pq2);
+        if (!tiedOutput)
+            AddProjection(w, rng, "output.weight", inK: d.Hidden, outM: VocabSize, 0.05f, pq2);
+        AddNorm(w, rng, "output_norm.weight", d.Hidden);
 
+        // Head-only: the trunk layers are still drawn (so the head's weights match the embedded fixture) but written nowhere.
+        GgufWriter trunkW = headOnly ? new GgufWriter() : w;
         for (int i = 0; i < blockCount; i++)
         {
             bool fullAttn = (i + 1) % fullAttnInterval == 0;
             string p = $"blk.{i}";
 
-            AddNorm(w, rng, $"{p}.attn_norm.weight", HiddenSize);
-            AddNorm(w, rng, $"{p}.post_attention_norm.weight", HiddenSize);
+            AddNorm(trunkW, rng, $"{p}.attn_norm.weight", d.Hidden);
+            AddNorm(trunkW, rng, $"{p}.post_attention_norm.weight", d.Hidden);
 
             if (fullAttn)
-                AddFullAttnLayer(w, rng, p);
+                AddFullAttnLayer(trunkW, rng, p, d, pq2);
             else
-                AddGdnLayer(w, rng, p);
+                AddGdnLayer(trunkW, rng, p, gdnKeyHeads, gdnValueHeads, d, pq2);
 
-            AddDenseFfnLayer(w, rng, p);
+            AddDenseFfnLayer(trunkW, rng, p, d, pq2);
         }
 
         if (withMtp)
         {
             string mp = $"blk.{blockCount}";
-            AddNorm(w, rng, $"{mp}.attn_norm.weight", HiddenSize);
-            AddNorm(w, rng, $"{mp}.post_attention_norm.weight", HiddenSize);
-            AddFullAttnLayer(w, rng, mp); // MTP block is always full-attention
-            AddDenseFfnLayer(w, rng, mp);
+            AddNorm(w, rng, $"{mp}.attn_norm.weight", d.Hidden);
+            AddNorm(w, rng, $"{mp}.post_attention_norm.weight", d.Hidden);
+            AddFullAttnLayer(w, rng, mp, d, pq2: false, q8: q8_0MtpHead); // MTP block is always full-attention
+            AddDenseFfnLayer(w, rng, mp, d, pq2: false, q8: q8_0MtpHead);
 
-            AddMatrixF32(w, rng, $"{mp}.nextn.eh_proj.weight", inK: 2 * HiddenSize, outM: HiddenSize, 0.05f);
-            AddNorm(w, rng, $"{mp}.nextn.enorm.weight", HiddenSize);
-            AddNorm(w, rng, $"{mp}.nextn.hnorm.weight", HiddenSize);
+            AddProjection(w, rng, $"{mp}.nextn.eh_proj.weight", inK: 2 * d.Hidden, outM: d.Hidden, 0.05f,
+                pq2: false, q8: q8_0MtpHead);
+            AddNorm(w, rng, $"{mp}.nextn.enorm.weight", d.Hidden);
+            AddNorm(w, rng, $"{mp}.nextn.hnorm.weight", d.Hidden);
 
             if (mtpHasOwnHeadTensors)
             {
-                AddMatrixF32(w, rng, $"{mp}.nextn.embed_tokens.weight", inK: HiddenSize, outM: VocabSize, 0.05f);
-                AddMatrixF32(w, rng, $"{mp}.nextn.shared_head_head.weight", inK: HiddenSize, outM: VocabSize, 0.05f);
-                AddNorm(w, rng, $"{mp}.nextn.shared_head_norm.weight", HiddenSize);
+                AddMatrixF32(w, rng, $"{mp}.nextn.embed_tokens.weight", inK: d.Hidden, outM: VocabSize, 0.05f);
+                AddMatrixF32(w, rng, $"{mp}.nextn.shared_head_head.weight", inK: d.Hidden, outM: VocabSize, 0.05f);
+                AddNorm(w, rng, $"{mp}.nextn.shared_head_norm.weight", d.Hidden);
             }
         }
 
@@ -169,67 +246,166 @@ public static class SyntheticQwen35HybridDenseMtpGguf
 
     /// <summary>Writes the synthetic fixture to <paramref name="path"/>.</summary>
     public static string Write(string path, uint seed = 0xC0FFEEu, bool withMtp = true, bool mtpHasOwnHeadTensors = true,
-        int fullAttnInterval = FullAttnInterval, int blockCount = BlockCount)
+        int fullAttnInterval = FullAttnInterval, int blockCount = BlockCount,
+        int contextLength = ContextLength, int gdnKeyHeads = NKHead, int gdnValueHeads = NVHead,
+        bool pq2_0Projections = false, bool q8_0MtpHead = false,
+        int? headDim = null, int? ropeDim = null, float? ropeFreqBase = null,
+        int attentionHeads = NumAttentionHeads, int kvHeads = NumKvHeads, bool headOnly = false,
+        bool tiedOutput = false)
     {
-        File.WriteAllBytes(path, Build(seed, withMtp, mtpHasOwnHeadTensors, fullAttnInterval, blockCount));
+        File.WriteAllBytes(path, Build(seed, withMtp, mtpHasOwnHeadTensors, fullAttnInterval, blockCount, contextLength,
+            gdnKeyHeads, gdnValueHeads, pq2_0Projections, q8_0MtpHead, headDim, ropeDim, ropeFreqBase, attentionHeads, kvHeads, headOnly,
+            tiedOutput));
         return path;
+    }
+
+    /// <summary>
+    /// Tensor dimensions. <see cref="Default"/> is the historical tiny fixture (every dim &lt; 128).
+    /// <see cref="Pq2_0"/> (issue #482) makes every projection input width a multiple of 128 so the
+    /// projections can be stored as PQ2_0: hidden 128, ffn 256, head_dim 256 and GDN state 128 (the
+    /// last two are Bonsai 2's real values), giving input widths 128 / 256 / 512.
+    /// </summary>
+    private readonly record struct Dims(int Hidden, int Ffn, int HeadDim, int DState, int Heads = NumAttentionHeads, int KvHeads = NumKvHeads)
+    {
+        public static Dims Default => new(
+            SyntheticQwen35HybridDenseMtpGguf.HiddenSize, SyntheticQwen35HybridDenseMtpGguf.IntermediateSize,
+            SyntheticQwen35HybridDenseMtpGguf.HeadDim, SyntheticQwen35HybridDenseMtpGguf.DState);
+        public static Dims Pq2_0 => new(128, 256, 256, 128);
+    }
+
+    /// <summary>
+    /// Emits a projection matrix as F32, or — when <paramref name="pq2"/> is set — as a random
+    /// ternary PQ2_0 matrix (<paramref name="inK"/> must then be a multiple of 128).
+    /// </summary>
+    private static void AddProjection(GgufWriter w, SyntheticGemma4Gguf.Xorshift rng, string name,
+        int inK, int outM, float scale, bool pq2, bool q8 = false)
+    {
+        if (q8)
+        {
+            AddMatrixQ8_0(w, rng, name, inK, outM, scale);
+            return;
+        }
+        if (!pq2)
+        {
+            AddMatrixF32(w, rng, name, inK, outM, scale);
+            return;
+        }
+        if (inK % 128 != 0)
+            throw new ArgumentException($"PQ2_0 tensor {name} needs an input width that is a multiple of 128, got {inK}.");
+
+        // dotLLM's interleaved on-disk PQ2_0 layout: per 128-element group an fp16 scale, then 32
+        // bytes holding elements 4b..4b+3 at ascending 2-bit offsets, code = value + 1.
+        int groups = inK / 128;
+        byte[] buf = new byte[(long)outM * groups * 34];
+        for (long g = 0; g < (long)outM * groups; g++)
+        {
+            long gb = g * 34;
+            // Per-group scale of the same order as the F32 fixture's weights, with some spread.
+            float s = scale * (0.5f + (rng.NextUInt() & 0xFFFF) / 65536f);
+            ushort bits = BitConverter.HalfToUInt16Bits((Half)s);
+            buf[gb] = (byte)bits;
+            buf[gb + 1] = (byte)(bits >> 8);
+            for (int b = 0; b < 32; b++)
+            {
+                uint r = rng.NextUInt();
+                int packed = 0;
+                for (int i = 0; i < 4; i++)
+                    packed |= (int)((r >> (8 * i)) % 3u) << (2 * i);
+                buf[gb + 2 + b] = (byte)packed;
+            }
+        }
+        w.AddTensor(name, [inK, outM], (uint)QuantizationType.PQ2_0, buf);
     }
 
     /// <summary>
     /// GDN (Gated DeltaNet) token-mixing tensors. Note: NO attn_output.weight — GDN layers have
     /// no attention output projection.
     /// </summary>
-    private static void AddGdnLayer(GgufWriter w, SyntheticGemma4Gguf.Xorshift rng, string p)
+    private static void AddGdnLayer(GgufWriter w, SyntheticGemma4Gguf.Xorshift rng, string p,
+        int nKHead, int nVHead, Dims d, bool pq2)
     {
-        int gdnKDim = NKHead * DState;
-        int gdnVDim = NVHead * DState;
+        int gdnKDim = nKHead * d.DState;
+        int gdnVDim = nVHead * d.DState;
         int qkvOut = 2 * gdnKDim + gdnVDim;
         int convDim = qkvOut; // (2*NKHead + NVHead) * DState
 
-        AddMatrixF32(w, rng, $"{p}.attn_qkv.weight", inK: HiddenSize, outM: qkvOut, 0.05f);
-        AddMatrixF32(w, rng, $"{p}.attn_gate.weight", inK: HiddenSize, outM: gdnVDim, 0.05f);
+        AddProjection(w, rng, $"{p}.attn_qkv.weight", inK: d.Hidden, outM: qkvOut, 0.05f, pq2);
+        AddProjection(w, rng, $"{p}.attn_gate.weight", inK: d.Hidden, outM: gdnVDim, 0.05f, pq2);
 
         // ssm_a: per-V-head decay base — must be negative (exp(a·dt) < 1).
-        var a = new float[NVHead];
-        for (int i = 0; i < NVHead; i++) a[i] = -0.5f + rng.NextSigned(0.25f);
-        AddF32Tensor(w, $"{p}.ssm_a", [NVHead], a);
+        var a = new float[nVHead];
+        for (int i = 0; i < nVHead; i++) a[i] = -0.5f + rng.NextSigned(0.25f);
+        AddF32Tensor(w, $"{p}.ssm_a", [nVHead], a);
 
-        AddMatrixF32(w, rng, $"{p}.ssm_alpha.weight", inK: HiddenSize, outM: NVHead, 0.05f);
-        AddMatrixF32(w, rng, $"{p}.ssm_beta.weight", inK: HiddenSize, outM: NVHead, 0.05f);
+        AddMatrixF32(w, rng, $"{p}.ssm_alpha.weight", inK: d.Hidden, outM: nVHead, 0.05f);
+        AddMatrixF32(w, rng, $"{p}.ssm_beta.weight", inK: d.Hidden, outM: nVHead, 0.05f);
 
         var conv = new float[DConv * convDim];
         for (int i = 0; i < conv.Length; i++) conv[i] = rng.NextSigned(0.1f);
         AddF32Tensor(w, $"{p}.ssm_conv1d.weight", [DConv, convDim], conv);
 
-        var dtBias = new float[NVHead];
-        for (int i = 0; i < NVHead; i++) dtBias[i] = rng.NextSigned(0.1f);
-        AddF32Tensor(w, $"{p}.ssm_dt.bias", [NVHead], dtBias);
+        var dtBias = new float[nVHead];
+        for (int i = 0; i < nVHead; i++) dtBias[i] = rng.NextSigned(0.1f);
+        AddF32Tensor(w, $"{p}.ssm_dt.bias", [nVHead], dtBias);
 
-        AddNorm(w, rng, $"{p}.ssm_norm.weight", DState);
-        AddMatrixF32(w, rng, $"{p}.ssm_out.weight", inK: gdnVDim, outM: HiddenSize, 0.05f);
+        AddNorm(w, rng, $"{p}.ssm_norm.weight", d.DState);
+        AddProjection(w, rng, $"{p}.ssm_out.weight", inK: gdnVDim, outM: d.Hidden, 0.05f, pq2);
     }
 
     /// <summary>Full-attention tensors: fused Q+Gate projection + QK-norm, per qwen35(moe).</summary>
-    private static void AddFullAttnLayer(GgufWriter w, SyntheticGemma4Gguf.Xorshift rng, string p)
+    private static void AddFullAttnLayer(GgufWriter w, SyntheticGemma4Gguf.Xorshift rng, string p, Dims d, bool pq2,
+        bool q8 = false)
     {
-        int qOut = 2 * NumAttentionHeads * HeadDim; // Q + Gate fused per head
-        int kvOut = NumKvHeads * HeadDim;
-        int oIn = NumAttentionHeads * HeadDim;
+        int qOut = 2 * d.Heads * d.HeadDim; // Q + Gate fused per head
+        int kvOut = d.KvHeads * d.HeadDim;
+        int oIn = d.Heads * d.HeadDim;
 
-        AddMatrixF32(w, rng, $"{p}.attn_q.weight", inK: HiddenSize, outM: qOut, 0.05f);
-        AddMatrixF32(w, rng, $"{p}.attn_k.weight", inK: HiddenSize, outM: kvOut, 0.05f);
-        AddMatrixF32(w, rng, $"{p}.attn_v.weight", inK: HiddenSize, outM: kvOut, 0.05f);
-        AddMatrixF32(w, rng, $"{p}.attn_output.weight", inK: oIn, outM: HiddenSize, 0.05f);
-        AddNorm(w, rng, $"{p}.attn_q_norm.weight", HeadDim);
-        AddNorm(w, rng, $"{p}.attn_k_norm.weight", HeadDim);
+        AddProjection(w, rng, $"{p}.attn_q.weight", inK: d.Hidden, outM: qOut, 0.05f, pq2, q8);
+        AddProjection(w, rng, $"{p}.attn_k.weight", inK: d.Hidden, outM: kvOut, 0.05f, pq2, q8);
+        AddProjection(w, rng, $"{p}.attn_v.weight", inK: d.Hidden, outM: kvOut, 0.05f, pq2, q8);
+        AddProjection(w, rng, $"{p}.attn_output.weight", inK: oIn, outM: d.Hidden, 0.05f, pq2, q8);
+        AddNorm(w, rng, $"{p}.attn_q_norm.weight", d.HeadDim);
+        AddNorm(w, rng, $"{p}.attn_k_norm.weight", d.HeadDim);
     }
 
     /// <summary>Dense SwiGLU FFN — standard ffn_gate/up/down naming (no MoE routing).</summary>
-    private static void AddDenseFfnLayer(GgufWriter w, SyntheticGemma4Gguf.Xorshift rng, string p)
+    private static void AddDenseFfnLayer(GgufWriter w, SyntheticGemma4Gguf.Xorshift rng, string p, Dims d, bool pq2,
+        bool q8 = false)
     {
-        AddMatrixF32(w, rng, $"{p}.ffn_gate.weight", inK: HiddenSize, outM: IntermediateSize, 0.05f);
-        AddMatrixF32(w, rng, $"{p}.ffn_up.weight", inK: HiddenSize, outM: IntermediateSize, 0.05f);
-        AddMatrixF32(w, rng, $"{p}.ffn_down.weight", inK: IntermediateSize, outM: HiddenSize, 0.05f);
+        AddProjection(w, rng, $"{p}.ffn_gate.weight", inK: d.Hidden, outM: d.Ffn, 0.05f, pq2, q8);
+        AddProjection(w, rng, $"{p}.ffn_up.weight", inK: d.Hidden, outM: d.Ffn, 0.05f, pq2, q8);
+        AddProjection(w, rng, $"{p}.ffn_down.weight", inK: d.Ffn, outM: d.Hidden, 0.05f, pq2, q8);
+    }
+
+    /// <summary>
+    /// Random matrix like <see cref="AddMatrixF32"/> (same values, same RNG consumption), stored as
+    /// Q8_0: per 32 elements an fp16 scale <c>max|v| / 127</c> and 32 int8 <c>round(v / scale)</c>.
+    /// </summary>
+    private static void AddMatrixQ8_0(GgufWriter w, SyntheticGemma4Gguf.Xorshift rng, string name,
+        int inK, int outM, float scale)
+    {
+        if (inK % 32 != 0)
+            throw new ArgumentException($"Q8_0 tensor {name} needs an input width that is a multiple of 32, got {inK}.");
+        var f = new float[(long)inK * outM];
+        for (long i = 0; i < f.LongLength; i++) f[i] = rng.NextSigned(scale);
+        long blocks = f.LongLength / 32;
+        byte[] buf = new byte[blocks * 34];
+        for (long b = 0; b < blocks; b++)
+        {
+            float amax = 0f;
+            for (int j = 0; j < 32; j++) amax = MathF.Max(amax, MathF.Abs(f[b * 32 + j]));
+            Half dh = (Half)(amax / 127f);
+            float dq = (float)dh;
+            ushort bits = BitConverter.HalfToUInt16Bits(dh);
+            buf[b * 34] = (byte)bits;
+            buf[b * 34 + 1] = (byte)(bits >> 8);
+            for (int j = 0; j < 32; j++)
+            {
+                int q = dq == 0f ? 0 : (int)MathF.Round(f[b * 32 + j] / dq);
+                buf[b * 34 + 2 + j] = (byte)(sbyte)Math.Clamp(q, -127, 127);
+            }
+        }
+        w.AddTensor(name, [inK, outM], (uint)QuantizationType.Q8_0, buf);
     }
 
     // ──────────────────── Tensor emit helpers (all F32) ────────────────────

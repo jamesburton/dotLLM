@@ -1,6 +1,6 @@
 using System.Text;
 using BenchmarkDotNet.Attributes;
-using DotLLM.HuggingFace;
+using DotLLM.Tests.Integration.Fixtures;
 using DotLLM.Models.Gguf;
 using DotLLM.Tokenizers.Bpe;
 
@@ -90,27 +90,11 @@ public class TokenizerAllocationBenchmarks
     public int Naive() => _naive.Encode(_text).Length;
 
     /// <summary>
-    /// Locates the SmolLM-135M GGUF, checking the test cache and the CLI model cache
-    /// before downloading. Matches <see cref="GgufRealModelBenchmarks"/>.
+    /// Locates the SmolLM-135M GGUF in the single model store, downloading it if absent.
+    /// Matches <see cref="GgufRealModelBenchmarks"/>.
     /// </summary>
-    private static string ResolveModelPath()
-    {
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string relative = Path.Combine(RepoId.Replace('/', Path.DirectorySeparatorChar), Filename);
-
-        string testCacheDir = Environment.GetEnvironmentVariable("DOTLLM_TEST_CACHE_DIR")
-            ?? Path.Combine(home, ".dotllm", "test-cache");
-
-        foreach (string root in new[] { testCacheDir, Path.Combine(home, ".dotllm", "models") })
-        {
-            string candidate = Path.Combine(root, relative);
-            if (File.Exists(candidate)) return candidate;
-        }
-
-        Console.WriteLine($"Downloading {RepoId}/{Filename} (~145 MB)...");
-        using var downloader = new HuggingFaceDownloader();
-        return downloader.DownloadFileAsync(RepoId, Filename, testCacheDir).GetAwaiter().GetResult();
-    }
+    private static string ResolveModelPath() =>
+        TestModelDownloader.EnsureModelAsync(RepoId, Filename).GetAwaiter().GetResult();
 
     /// <summary>
     /// Builds <paramref name="length"/> characters of real prose from

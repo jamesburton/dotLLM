@@ -1,0 +1,16 @@
+{"model":"minilm-f16","threads":32,"r":{"docs_s": 142.83555601619815, "docs": 46, "rejected": 2}}
+{"model":"minilm-q8","threads":32,"r":{"docs_s": 139.62022958628012, "docs": 46, "rejected": 2}}
+{"model":"bge-small-f16","threads":32,"r":{"docs_s": 83.99253140393151, "docs": 46, "rejected": 2}}
+{"model":"bge-small-q8","threads":32,"r":{"docs_s": 76.77668167454554, "docs": 46, "rejected": 2}}
+{"model":"e5-small-f16","threads":32,"r":{"docs_s": 86.70151700030767, "docs": 46, "rejected": 2}}
+{"model":"gte-small-f16","threads":32,"r":{"docs_s": 83.47451435098255, "docs": 46, "rejected": 2}}
+{"model":"bge-base-f16","threads":32,"r":{"docs_s": 43.86314936338205, "docs": 46, "rejected": 2}}
+{"model":"bge-base-q8","threads":32,"r":{"docs_s": 33.61747694952563, "docs": 46, "rejected": 2}}
+{"model":"e5-base-f16","threads":32,"r":{"docs_s": 42.99431965728975, "docs": 46, "rejected": 2}}
+{"model":"gte-base-f16","threads":32,"r":{"docs_s": 44.37297484186567, "docs": 46, "rejected": 2}}
+{"model":"nomic-f16","threads":32,"r":{"docs_s": 35.962267649326854, "docs": 48, "rejected": 0}}
+{"model":"nomic-q8","threads":32,"r":{"docs_s": 24.46083719208536, "docs": 48, "rejected": 0}}
+{"model":"nomic-q4km","threads":32,"r":{"docs_s": 31.96985332438853, "docs": 48, "rejected": 0}}
+{"model":"mxbai-f16","threads":32,"r":{"docs_s": 8.720321182116805, "docs": 46, "rejected": 2}}
+{"model":"mxbai-q8","threads":32,"r":{"docs_s": 9.08703258329129, "docs": 46, "rejected": 2}}
+{"model":"qwen3-f16","threads":32,"r":{"docs_s": 6.227620618177002, "docs": 48, "rejected": 0}}

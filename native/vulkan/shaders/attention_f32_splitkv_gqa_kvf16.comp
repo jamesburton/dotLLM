@@ -1,0 +1,6 @@
+#version 450
+// F16-KV twin of attention_f32_splitkv_gqa.comp (issue #1102): K / V read as packed halves (kv_load.glsl).
+// Body: attention_f32_splitkv_gqa.glsl.
+#define KV_F16 1
+#extension GL_GOOGLE_include_directive : require
+#include "attention_f32_splitkv_gqa.glsl"

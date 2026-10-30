@@ -6,7 +6,7 @@ namespace DotLLM.Tests.Integration.Fixtures;
 /// Downloads Llama-3.2-1B-Instruct Q8_0 (~1.1 GB) for chat template integration tests.
 /// Exercises the complex Llama 3.2 Jinja2 template with dict literals, slicing,
 /// strftime_now, and tool-use formatting.
-/// Cached in <c>~/.dotllm/test-cache/</c> across test runs.
+/// Cached in <c>~/.dotllm/models/</c> across test runs.
 /// </summary>
 public sealed class Llama32InstructFixture : IAsyncLifetime
 {

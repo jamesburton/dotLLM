@@ -77,7 +77,7 @@ public sealed class Mach1PackedCheckpoint : IDisposable
     /// </summary>
     /// <param name="root">
     /// The checkpoint root directory (e.g.
-    /// <c>~/.dotllm/test-cache/SyzygyResearch/Mach-1-Additive-35B</c>).
+    /// <c>~/.dotllm/models/SyzygyResearch/Mach-1-Additive-35B</c>).
     /// </param>
     public static Mach1PackedCheckpoint Open(string root)
     {

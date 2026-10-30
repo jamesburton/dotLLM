@@ -124,6 +124,19 @@ output.weight                        — LM head
 5. Memory-map from `data_section_start` to EOF: `MemoryMappedFile.CreateFromFile`.
 6. Tensor data pointer = `mmap_base + tensor.offset`. No copying.
 
+### Split (multi-shard) GGUF — `-0000N-of-0000M.gguf` (#756)
+
+Models over ~50 GB ship as shard sets written by `llama-gguf-split`. Each shard is a complete GGUF file; shard 1 carries all model
+metadata (and, in the Unsloth files, **zero tensors**), every shard carries `split.no` (u16, **zero-based**), `split.count` (u16) and
+`split.tensors.count` (i32, total over the set), and each shard's tensor offsets are relative to *its own* data section.
+
+`GgufFile.Open(firstShard)` discovers the siblings from the file name, validates `split.no`/`split.count`/`split.tensors.count`, rejects
+duplicate tensor names, bounds-checks every tensor against its own shard, and maps each shard separately. A missing sibling throws
+`FileNotFoundException` naming it; opening shard 2..N throws and names shard 1. `Tensors`/`TensorsByName` are unified; descriptors keep
+shard-local `DataOffset`s, so **use `GgufFile.TensorDataPointer(...)`** — `DataBasePointer` throws on a split set (separate mappings have
+no common base; returning one would silently address the wrong bytes). `DataSectionLength` is the sum over shards. Loader wiring
+(`DataBasePointer + DataOffset` call sites) is still to be converted; `ModelResolver` must also fetch all shards.
+
 ### Tensors >2GB
 
 `MemoryMappedViewAccessor` has 2GB limit. Use:

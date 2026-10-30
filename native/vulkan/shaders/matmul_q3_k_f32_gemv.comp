@@ -109,7 +109,12 @@ void main() {
 
     float acc = 0.0;
 
-    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+    // One work item = one (super-block, 16-element sub-block) pair. The old mapping gave a thread a whole
+    // super-block, so a K = 2560 row (10 super-blocks) kept 10 of 128 threads busy.
+    uint workItems = pc.blocksPerRow * 16u;
+    for (uint work = tid; work < workItems; work += threads) {
+        uint b = work >> 4u;
+        uint sub = work & 15u;
         uint blockByteBase = rowByteBase + b * Q3K_BLOCK_BYTES;
         uint hmaskBase  = blockByteBase;
         uint qsBase     = blockByteBase + 32u;
@@ -118,7 +123,7 @@ void main() {
 
         uint xBase = b * Q3K_GROUP_SIZE;
 
-        for (uint sub = 0u; sub < 16u; sub++) {
+        {   // sub-block `sub` of super-block b
             int signedSc = unpackQ3Scale(scalesBase, sub);
             float scF = d * float(signedSc);
 

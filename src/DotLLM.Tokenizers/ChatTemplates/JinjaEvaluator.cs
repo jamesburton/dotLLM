@@ -43,6 +43,7 @@ internal sealed class JinjaEvaluator
         ["string"] = (input, _) => Stringify(input),
         ["list"] = (input, _) => input is IList list ? list : input is IEnumerable e ? ToList(e) : new List<object?> { input },
         ["items"] = (input, _) => GetDictItems(input),
+        ["dictsort"] = (input, _) => DictSort(input),
         ["join"] = (input, args) => JoinFilter(input, args),
         ["replace"] = (input, args) => ReplaceFilter(input, args),
         ["selectattr"] = (input, args) => SelectAttrFilter(input, args),
@@ -90,6 +91,10 @@ internal sealed class JinjaEvaluator
                 SetVariable(setNode.Name, EvalExpr(setNode.Value));
                 break;
 
+            case SetBlockNode setBlock:
+                SetVariable(setBlock.Name, RenderNodes(setBlock.Body));
+                break;
+
             case SetAttributeNode setAttr:
                 EvaluateSetAttribute(setAttr);
                 break;
@@ -102,11 +107,48 @@ internal sealed class JinjaEvaluator
         }
     }
 
+    /// <summary>Binds the loop variable(s) for one item, unpacking dict entries / 2-element lists when the loop has two variables.</summary>
+    private void BindLoopVariables(ForNode node, object? item)
+    {
+        if (node.SecondVariableName != null && item is KeyValuePair<string, object?> kvp)
+        {
+            SetVariable(node.VariableName, kvp.Key);
+            SetVariable(node.SecondVariableName, kvp.Value);
+        }
+        else if (node.SecondVariableName != null && item is IList tupleList && tupleList.Count >= 2)
+        {
+            SetVariable(node.VariableName, tupleList[0]);
+            SetVariable(node.SecondVariableName, tupleList[1]);
+        }
+        else
+        {
+            SetVariable(node.VariableName, item);
+        }
+    }
+
     private void EvaluateFor(ForNode node)
     {
         var iterableValue = EvalExpr(node.Iterable);
-        var items = ToEnumerable(iterableValue);
+        // Jinja iterates a dict's KEYS when the loop has a single variable (two variables unpack items()).
+        var items = iterableValue is Dictionary<string, object?> keyedDict && node.SecondVariableName is null
+            ? keyedDict.Keys.Cast<object?>()
+            : ToEnumerable(iterableValue);
         var itemList = items.ToList();
+
+        if (node.Filter is not null)
+        {
+            // Evaluate the per-item filter in a scope that binds the loop variable(s) exactly as the body will see them.
+            var kept = new List<object?>(itemList.Count);
+            foreach (var candidate in itemList)
+            {
+                PushScope();
+                BindLoopVariables(node, candidate);
+                bool keep = IsTruthy(EvalExpr(node.Filter));
+                PopScope();
+                if (keep) kept.Add(candidate);
+            }
+            itemList = kept;
+        }
 
         if (itemList.Count == 0)
         {
@@ -123,23 +165,13 @@ internal sealed class JinjaEvaluator
 
             var item = itemList[i];
 
-            // Handle tuple unpacking for dict iteration
-            if (node.SecondVariableName != null && item is KeyValuePair<string, object?> kvp)
-            {
-                SetVariable(node.VariableName, kvp.Key);
-                SetVariable(node.SecondVariableName, kvp.Value);
-            }
-            else if (node.SecondVariableName != null && item is IList tupleList && tupleList.Count >= 2)
-            {
-                SetVariable(node.VariableName, tupleList[0]);
-                SetVariable(node.SecondVariableName, tupleList[1]);
-            }
-            else
-            {
-                SetVariable(node.VariableName, item);
-            }
+            BindLoopVariables(node, item);
 
-            // Set loop variable
+            // Set loop variable. previtem/nextitem are intentionally omitted rather than set to
+            // Undefined at the first/last iteration respectively — member access on a
+            // Dictionary<string, object?> already yields Undefined for an absent key (see
+            // EvalMemberAccess), so this reuses the evaluator's existing undefined convention
+            // instead of inventing a new one, and never throws at the boundary (Jinja2 semantics).
             var loopVar = new Dictionary<string, object?>
             {
                 ["index"] = i + 1,
@@ -150,6 +182,10 @@ internal sealed class JinjaEvaluator
                 ["revindex"] = length - i,
                 ["revindex0"] = length - i - 1,
             };
+            if (i > 0)
+                loopVar["previtem"] = itemList[i - 1];
+            if (i < length - 1)
+                loopVar["nextitem"] = itemList[i + 1];
             SetVariable("loop", loopVar);
 
             foreach (var bodyNode in node.Body)
@@ -343,7 +379,15 @@ internal sealed class JinjaEvaluator
         return expr.Op switch
         {
             UnaryOp.Not => !IsTruthy(operand),
-            UnaryOp.Negate => operand is int i ? -i : operand is double d ? -d : throw new JinjaException("Cannot negate non-number"),
+            // Box each arm separately: `cond ? -i : cond2 ? -d : throw` is typed double, which turned -1 into -1.0 and broke
+            // negative list/string indexing (`x[-1]`).
+            UnaryOp.Negate => operand switch
+            {
+                int i => (object)(-i),
+                long l => -l,
+                double d => -d,
+                _ => throw new JinjaException("Cannot negate non-number"),
+            },
             _ => throw new JinjaException($"Unknown unary operator: {expr.Op}")
         };
     }
@@ -583,11 +627,18 @@ internal sealed class JinjaEvaluator
         bool result = expr.TestName switch
         {
             "none" => value is null,
+            // "is defined" is parsed separately as IsDefinedExpr (see JinjaParser), but "is
+            // undefined" falls through to the generic identifier-test path here — mirror the
+            // same Undefined-sentinel check so both spellings agree.
+            "undefined" => ReferenceEquals(value, Undefined),
             "mapping" => value is Dictionary<string, object?>,
             "string" => value is string,
             "sequence" => value is IList,
             "number" or "integer" => value is int or double or long,
-            "iterable" => value is IEnumerable and not string,
+            // Jinja2 `iterable` is `iter(value)` succeeding: strings ARE iterable. Llama-3.1's template relies on it
+            // (`message.content is mapping or message.content is iterable` -> tojson), and both reference
+            // Jinja2 and llama.cpp render a string tool result as a quoted/escaped JSON string.
+            "iterable" => value is IEnumerable,
             "true" => value is true,
             "false" => value is false,
             "callable" => false, // we don't support callable test
@@ -1012,6 +1063,15 @@ internal sealed class JinjaEvaluator
     {
         if (input is Dictionary<string, object?> dict)
             return dict.Select(kvp => (object?)new List<object?> { kvp.Key, kvp.Value }).ToList();
+        return new List<object?>();
+    }
+
+    /// <summary>Jinja2 <c>dictsort</c>: (key, value) pairs ordered by key, case-insensitive (default).</summary>
+    private static object? DictSort(object? input)
+    {
+        if (input is Dictionary<string, object?> dict)
+            return dict.OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase)
+                       .Select(kvp => (object?)new List<object?> { kvp.Key, kvp.Value }).ToList();
         return new List<object?>();
     }
 

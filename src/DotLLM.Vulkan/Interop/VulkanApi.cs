@@ -41,6 +41,15 @@ internal static partial class VulkanApi
     internal static partial void vkGetPhysicalDeviceMemoryProperties(
         nint physicalDevice, out VkPhysicalDeviceMemoryProperties pMemoryProperties);
 
+    // Vulkan 1.1 core: chain-aware memory-property query. Used only for
+    // diagnostics, to chain VkPhysicalDeviceMemoryBudgetPropertiesEXT and read
+    // the driver's PER-PROCESS heap usage/budget at an allocation failure.
+    // Takes a raw blob because the chained struct is written by hand at the
+    // call site (see VulkanDevice.MemorySnapshot).
+    [LibraryImport(LibName)]
+    internal static unsafe partial void vkGetPhysicalDeviceMemoryProperties2(
+        nint physicalDevice, byte* pMemoryProperties);
+
     [LibraryImport(LibName)]
     internal static partial void vkGetPhysicalDeviceQueueFamilyProperties(
         nint physicalDevice, ref uint pQueueFamilyPropertyCount,
@@ -273,6 +282,9 @@ internal static partial class VulkanApi
         nint device, nint queryPool, uint firstQuery, uint queryCount,
         nuint dataSize, nint pData, ulong stride, uint flags);
 
+    /// <summary>Perturbation instrument (#1334, timing attribution only - the results are garbage): while true, dispatch wrappers record nothing. Toggled by the stage markers of the qwen4exp forward (<c>DOTLLM_VK_PERTURB</c>).</summary>
+    internal static bool SkipDispatches;
+
     [LibraryImport(LibName, EntryPoint = "vkCmdDispatch")]
     private static partial void vkCmdDispatchNative(
         nint commandBuffer, uint groupCountX, uint groupCountY, uint groupCountZ);
@@ -282,8 +294,24 @@ internal static partial class VulkanApi
         nint commandBuffer, uint groupCountX, uint groupCountY, uint groupCountZ)
     {
         ProfileCounters.Dispatches++;
+        if (SkipDispatches) return;
         vkCmdDispatchNative(commandBuffer, groupCountX, groupCountY, groupCountZ);
     }
+
+    [LibraryImport(LibName, EntryPoint = "vkCmdDispatchIndirect")]
+    private static partial void vkCmdDispatchIndirectNative(nint commandBuffer, nint buffer, ulong offset);
+
+    /// <summary>Counted wrapper over <c>vkCmdDispatchIndirect</c>: the group counts are read from <paramref name="buffer"/> at <paramref name="offset"/> (3 x uint).</summary>
+    internal static void vkCmdDispatchIndirect(nint commandBuffer, nint buffer, ulong offset)
+    {
+        ProfileCounters.Dispatches++;
+        if (SkipDispatches) return;
+        vkCmdDispatchIndirectNative(commandBuffer, buffer, offset);
+    }
+
+    /// <summary><c>vkCmdFillBuffer</c>: fills <paramref name="size"/> bytes (VK_WHOLE_SIZE = all) with a 4-byte pattern.</summary>
+    [LibraryImport(LibName)]
+    internal static partial void vkCmdFillBuffer(nint commandBuffer, nint dstBuffer, ulong dstOffset, ulong size, uint data);
 
     [LibraryImport(LibName, EntryPoint = "vkCmdCopyBuffer")]
     private static partial void vkCmdCopyBufferNative(
@@ -298,6 +326,11 @@ internal static partial class VulkanApi
         ProfileCounters.Copies++;
         vkCmdCopyBufferNative(commandBuffer, srcBuffer, dstBuffer, regionCount, in pRegions);
     }
+
+    /// <summary><c>vkCmdUpdateBuffer</c>: inline host data (at most 65536 bytes, 4-byte aligned) written by the transfer stage.</summary>
+    [LibraryImport(LibName)]
+    internal static partial void vkCmdUpdateBuffer(
+        nint commandBuffer, nint dstBuffer, ulong dstOffset, ulong dataSize, nint pData);
 
     // Inserts an execution / memory dependency between commands. Used on the
     // hot forward path to chain kernel dispatches without a host wait: a
@@ -333,6 +366,9 @@ internal static partial class VulkanApi
     internal static partial int vkWaitForFences(
         nint device, uint fenceCount, in nint pFences,
         [MarshalAs(UnmanagedType.U4)] uint waitAll, ulong timeout);
+
+    [LibraryImport(LibName)]
+    internal static partial int vkGetFenceStatus(nint device, nint fence);
 
     [LibraryImport(LibName)]
     internal static partial int vkResetFences(

@@ -31,6 +31,7 @@ namespace DotLLM.Tests.Integration.Engine;
 /// the real 26B checkpoint must produce a sensible next token for a trivial factual
 /// prompt (e.g. "The capital of France is" → " Paris").
 /// </remarks>
+[Collection(GpuCollection.Name)]
 public sealed class Gemma4GgufForwardTests
 {
 

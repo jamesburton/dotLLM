@@ -79,6 +79,29 @@ public class VulkanSplitKvAttentionKernelTests
     }
 
     [SkippableFact]
+    public void Decode_Gqa_SplitWiderThanGroupedTile()
+    {
+        // Issue #1102: the GQA-grouped pass splits per KV head (8 here -> S=32), so seqKv=9000 gives 282 positions per split,
+        // three of its 128-row tiles: the cross-tile online-softmax rescale runs (a pass without it fails here).
+        RunOne(seqKv: 9000, numHeads: 32, numKvHeads: 8, headDim: 64, positionOffset: 8999);
+    }
+
+    [SkippableFact]
+    public void Decode_FlintShape_Gqa8_HeadDim128()
+    {
+        // Issue #1161: Recursive Flint's full layers (32 query heads over 4 KV heads, head_dim 128). S=64 per KV head, 79 or 78
+        // positions per split: the v2 pass's 64-row tile loop runs twice with a ragged second tile.
+        RunOne(seqKv: 5003, numHeads: 32, numKvHeads: 4, headDim: 128, positionOffset: 5002);
+    }
+
+    [SkippableFact]
+    public void Decode_FlintShape_SlidingWindow_HeadDim96()
+    {
+        // Sliding window with a head_dim below 128 (v2: lanes 12..15 of each position idle).
+        RunOne(seqKv: 1500, numHeads: 16, numKvHeads: 2, headDim: 96, positionOffset: 1499, slidingWindow: 513);
+    }
+
+    [SkippableFact]
     public void Decode_Causal_MaskedTail_AcrossSplits()
     {
         // Causal with the query NOT at the last position: posQ=300, seqKv=600.
@@ -161,15 +184,25 @@ public class VulkanSplitKvAttentionKernelTests
         device.Upload(kh.AsSpan(), bufK);
         device.Upload(vh.AsSpan(), bufV);
 
-        kernel.Launch(bufQ, bufK, bufV, bufOut,
-            seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset,
-            slidingWindow: slidingWindow, useAlibi: useAlibi,
-            softCap: softCap, maskMode: maskMode, prefixLen: prefixLen);
+        // Issue #1102: both split passes, the per-query-head one and (where the shape allows) the GQA-grouped one, against the
+        // same CPU reference at the same tolerance.
+        // Issue #1161: the grouped pass twice, v1 and (where the shape and device allow) v2.
+        foreach (var (gqa, v2) in new[] { (false, false), (true, false), (true, true) })
+        {
+            kernel.PreferGqa = gqa;
+            kernel.PreferGqa2 = v2;
+            if (gqa && !kernel.UsesGqa(numHeads, numKvHeads, headDim)) continue;
+            if (v2 && !kernel.UsesGqa2(numHeads, numKvHeads, headDim)) continue;
+            kernel.Launch(bufQ, bufK, bufV, bufOut,
+                seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset,
+                slidingWindow: slidingWindow, useAlibi: useAlibi,
+                softCap: softCap, maskMode: maskMode, prefixLen: prefixLen);
 
-        float[] actual = new float[expected.Length];
-        device.Download(bufOut, actual);
+            float[] actual = new float[expected.Length];
+            device.Download(bufOut, actual);
 
-        AssertClose(expected, actual, seqQ, seqKv, numHeads, numKvHeads, headDim);
+            AssertClose(expected, actual, seqQ, seqKv, numHeads, numKvHeads, headDim);
+        }
     }
 
     private static float[] RandomFloats(Random rng, int count)

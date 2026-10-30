@@ -1,0 +1,110 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+
+// Q8_0 GEMV with FP32 activations for 1..8 activation columns (#1185) and NR output rows per workgroup (#1220):
+// Y[col, m] = sum_k W[m, k] * X[col, k].
+//
+// Every lane decodes its weights ONCE and FMAs them against all NC activation rows; NR rows share the activation loads. A row's arithmetic
+// (lane -> block map, explicit fma chain under `precise`, fixed shared-memory reduction tree) does not depend on NC or NR, so each column of
+// a 2..8-row MTP verify is bit-identical to the NC = 1 decode dispatch, which the dense qwen35 model uses for decode. (The Q8_1 MMVQ multi
+// kernel quantises the activations and flipped near-tie argmaxes against the FP32 decode.) NC (constant_id 0) and NR (constant_id 1) are
+// specialization constants; X is [NC, K], Y is [NC, M].
+//
+// Weight layout: each 32 weights = one Q8_0 block of 34 bytes = 17 uint16: [0] fp16 scale d, [1..16] 32 signed int8 qs.
+// Lane L owns 8 contiguous int8 of a window of WG_SIZE/4 blocks: four lanes per block, consecutive lanes on consecutive words.
+// Dispatch: one workgroup of WG_SIZE threads per output row.
+
+#define WG_SIZE 64u
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint NC = 2u;
+layout(constant_id = 1) const uint NR = 1u;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint weight[]; };  // Q8_0 blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { vec4 x4[]; };      // [NC, K/4]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };      // [NC, M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint blocksPerRow;
+    uint rowUints;     // unused; kept for push-constant parity with matmul_q8_0
+} pc;
+
+const uint UINT16_PER_BLOCK = 17u;
+const uint WINDOW_BLOCKS    = WG_SIZE / 4u;
+
+uint readU16(uint idx16) {
+    uint w = weight[idx16 >> 1u];
+    return ((idx16 & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
+}
+
+vec4 unpackS8(uint u) {
+    ivec4 v = ivec4(int(u << 24), int(u << 16), int(u << 8), int(u)) >> 24;
+    return vec4(v);
+}
+
+shared float partials[NR * NC][WG_SIZE];
+
+void main() {
+    uint m0 = (gl_WorkGroupID.y * 32768u + gl_WorkGroupID.x) * NR;   // y folds dispatches wider than 32768 groups (GemvColumns)
+    if (m0 >= pc.M) return;
+
+    uint lane = gl_LocalInvocationID.x;
+    uint blockInWindow = lane >> 2u;
+    uint subInBlock    = lane & 3u;
+    uint qOff16        = 1u + 4u * subInBlock;
+
+    // Rows past M (last workgroup) duplicate row M-1 and are not stored.
+    uint rowBase16[NR];
+    [[unroll]] for (uint r = 0u; r < NR; ++r) rowBase16[r] = min(m0 + r, pc.M - 1u) * pc.blocksPerRow * UINT16_PER_BLOCK;
+    uint xRow4 = pc.K >> 2u;
+
+    precise float acc[NR * NC];
+    [[unroll]] for (uint i = 0u; i < NR * NC; ++i) acc[i] = 0.0;
+    for (uint w0 = 0u; w0 < pc.blocksPerRow; w0 += WINDOW_BLOCKS) {
+        uint blk = w0 + blockInWindow;
+        if (blk >= pc.blocksPerRow)
+            continue;
+
+        float d[NR];
+        vec4 wa[NR];
+        vec4 wb[NR];
+        [[unroll]] for (uint r = 0u; r < NR; ++r) {
+            uint blkBase16 = rowBase16[r] + blk * UINT16_PER_BLOCK;
+            d[r] = unpackHalf2x16(readU16(blkBase16)).x;
+            uint qb = blkBase16 + qOff16;
+            wa[r] = unpackS8(readU16(qb)      | (readU16(qb + 1u) << 16u));
+            wb[r] = unpackS8(readU16(qb + 2u) | (readU16(qb + 3u) << 16u));
+        }
+
+        // Explicit fma chain under `precise` (no driver contraction / reordering): a row's bits do not depend on NR / NC.
+        uint xi = blk * 8u + 2u * subInBlock;
+        [[unroll]] for (uint cc = 0u; cc < NC; ++cc) {
+            vec4 xa = x4[cc * xRow4 + xi];
+            vec4 xb = x4[cc * xRow4 + xi + 1u];
+            [[unroll]] for (uint r = 0u; r < NR; ++r) {
+                precise float dq = wa[r].x * xa.x;
+                dq = fma(wa[r].y, xa.y, dq); dq = fma(wa[r].z, xa.z, dq); dq = fma(wa[r].w, xa.w, dq);
+                dq = fma(wb[r].x, xb.x, dq); dq = fma(wb[r].y, xb.y, dq); dq = fma(wb[r].z, xb.z, dq); dq = fma(wb[r].w, xb.w, dq);
+                acc[r * NC + cc] = fma(d[r], dq, acc[r * NC + cc]);
+            }
+        }
+    }
+
+    // Fixed shared-memory tree over the 64 lanes, NOT subgroupAdd: a driver may compile each NR / NC pipeline at a different subgroup width,
+    // which changes a subgroup reduction's order and so the bits.
+    [[unroll]] for (uint i = 0u; i < NR * NC; ++i) partials[i][lane] = acc[i];
+    barrier();
+    [[unroll]] for (uint stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
+        if (lane < stride)
+            [[unroll]] for (uint i = 0u; i < NR * NC; ++i) partials[i][lane] = partials[i][lane] + partials[i][lane + stride];
+        barrier();
+    }
+    if (lane < NR * NC) {
+        uint r = lane / NC, cc = lane - r * NC;
+        if (m0 + r < pc.M)
+            y[cc * pc.M + m0 + r] = partials[lane][0];
+    }
+}

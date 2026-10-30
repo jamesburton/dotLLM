@@ -48,7 +48,7 @@ public static unsafe partial class Dequantize
 
         for (long b = 0; b < blockCount; b++)
         {
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockBase);
+            float d = MatMul.HalfToSingle(blockBase);
             byte* qs = blockBase + 2;
 
             for (int j = 0; j < IQ4_NL_GroupSize / 2; j++)
@@ -84,7 +84,7 @@ public static unsafe partial class Dequantize
 
         for (long b = 0; b < blockCount; b++)
         {
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockBase);
+            float d = MatMul.HalfToSingle(blockBase);
             ushort scalesH = Unsafe.ReadUnaligned<ushort>(blockBase + 2);
             byte* scalesL = blockBase + 4;
             byte* qs = blockBase + 8;

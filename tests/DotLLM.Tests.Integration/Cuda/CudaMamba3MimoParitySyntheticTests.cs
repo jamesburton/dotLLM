@@ -41,6 +41,7 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// oracle running the identical two-call schedule.
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class CudaMamba3MimoParitySyntheticTests : IDisposable
 {
     // Issue #385: widened from the degenerate SISO-inherited tuple

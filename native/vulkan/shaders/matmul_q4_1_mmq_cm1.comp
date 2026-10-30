@@ -1,0 +1,14 @@
+#version 450
+// Q4_1 weights x Q8_1 activations on int8 cooperative matrices (issue #1235); see mmq_cm1_main.glsl.
+// Tile 64 weight rows x 128 token rows (four wave64 subgroups), three K blocks per barrier: on the 8060S at Flint's dense prefill
+// shapes (pp512) it took 2.40 ms for the seven projections against 2.90 ms for the default 64 x 64 x 4 tile (128 x 64 x 3: 2.42,
+// 64 x 128 x 2: 2.43). BK_STEP 4 does not fit 32 KB of LDS at this tile.
+#extension GL_GOOGLE_include_directive : require
+#define MMQ_Q4_1 1
+#define MMQ_BM 64u
+#define MMQ_BN 128u
+#define MMQ_WM 32u
+#define MMQ_WN 64u
+#define MMQ_THREADS 256
+#define MMQ_BK_STEP 3u
+#include "mmq_cm1_main.glsl"

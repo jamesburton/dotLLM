@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using DotLLM.Cuda;
 using DotLLM.Cuda.Interop;
 using Xunit;
@@ -26,6 +27,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// does, and does not require a downloaded GGUF model to run.
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaAttentionF16PagedPerfHarness
 {
     private readonly ITestOutputHelper _output;
@@ -67,8 +69,18 @@ public sealed class CudaAttentionF16PagedPerfHarness
     /// (~17 blocks) so the gather path's D2D copy volume and the paged path's block-pointer-array
     /// H2D volume are both representative of a real decode step.
     /// </summary>
+    /// <remarks>
+    /// Issue #505: the guards live here and the CUDA work lives in <see cref="Measure"/>, which is
+    /// <see cref="MethodImplOptions.NoInlining"/>, because the JIT resolves a <c>[LibraryImport]</c>
+    /// target when it <b>compiles</b> the referencing method — so a method that merely mentions
+    /// <c>CudaDriverApi</c> tries to load <c>"cuda"</c> before its own first statement runs, and the
+    /// skip below cannot protect it. With the body inline this test failed with
+    /// <c>DllNotFoundException</c> when run as the only filter and passed inside the full CUDA suite,
+    /// purely on whether an earlier class had registered the resolver. Same split, and same reason,
+    /// as <c>CudaDevice.ProbeGpuCount</c>.
+    /// </remarks>
     [SkippableFact]
-    public unsafe void MeasureGatherVsPagedNativeAttentionThroughput()
+    public void MeasureGatherVsPagedNativeAttentionThroughput()
     {
         Skip.IfNot(
             string.Equals(Environment.GetEnvironmentVariable("DOTLLM_CUDA_PERF"), "1", StringComparison.Ordinal),
@@ -77,6 +89,12 @@ public sealed class CudaAttentionF16PagedPerfHarness
         string? ptxDir = FindPtxDir();
         Skip.If(ptxDir == null, "PTX files not found");
 
+        Measure(ptxDir!);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private unsafe void Measure(string ptxDir)
+    {
         const int numHeads = 24, numKvHeads = 4, headDim = 256;
         const int seqKv = 258;
         const int totalBlocks = 64;
@@ -86,7 +104,7 @@ public sealed class CudaAttentionF16PagedPerfHarness
 
         using var ctx = CudaContext.Create(0);
         using var stream = CudaStream.Create();
-        using var kernels = new CudaKernels(ptxDir!);
+        using var kernels = new CudaKernels(ptxDir);
         Skip.IfNot(kernels.HasAttentionF16Paged, "attention_f16_paged not present in PTX (stale build)");
 
         int kvStride = numKvHeads * headDim;

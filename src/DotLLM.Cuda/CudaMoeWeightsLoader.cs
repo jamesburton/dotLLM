@@ -52,6 +52,13 @@ internal static unsafe class CudaMoeWeightsLoader
         nint router = UploadF32Array(moe.Gate, allocs);
 
         // Per-routed-expert projections.
+        // #427 (cross-backend): this path is F32-only — it reads W1/W2/W3 as host matrices.
+        // A quant-expert loader leaves them null, which would upload zero pointers and
+        // silently corrupt the forward pass rather than failing.
+        MoeLayerWeights.ValidateF32ExpertSource(moe.W1, numExperts, "ffn_gate_exps.weight");
+        MoeLayerWeights.ValidateF32ExpertSource(moe.W3, numExperts, "ffn_up_exps.weight");
+        MoeLayerWeights.ValidateF32ExpertSource(moe.W2, numExperts, "ffn_down_exps.weight");
+
         var gateProj = new nint[numExperts];
         var upProj = new nint[numExperts];
         var downProj = new nint[numExperts];
@@ -118,8 +125,15 @@ internal static unsafe class CudaMoeWeightsLoader
     /// via numGpuLayers / NumLayers patching.
     /// </para>
     /// </remarks>
+    /// <param name="cpuLayer">Per-layer weight bundle from the GGUF loader (raw quant views populated).</param>
+    /// <param name="allocs">Allocation list to extend (caller owns + frees on dispose).</param>
+    /// <param name="hostExperts">
+    /// True keeps the routed banks in the mmap'd GGUF for the CPU leg (<c>--cpu-moe</c>, #1187): nothing of them is
+    /// uploaded or copied, and <see cref="CudaMoeLayerWeights.HostExperts"/> carries the CPU bundle.
+    /// </param>
+    /// <returns>Populated <see cref="CudaMoeLayerWeights"/> with device pointers.</returns>
     public static CudaMoeLayerWeights LoadLayerQuant(
-        in TransformerLayerWeights cpuLayer, List<nint> allocs)
+        in TransformerLayerWeights cpuLayer, List<nint> allocs, bool hostExperts = false)
     {
         var moe = cpuLayer.Moe
             ?? throw new InvalidOperationException(
@@ -136,6 +150,20 @@ internal static unsafe class CudaMoeWeightsLoader
                 "as softmax-over-all-experts + top-k + renormalize (mathematically equivalent only " +
                 "when the top-k weights are renormalized to sum to 1). A model with " +
                 "SoftmaxAfterTopK=true and NormTopKProb=false is not supported on CUDA.");
+
+        // Sigmoid routing is honoured (Flint, #1172) but only in its plain form: a selection bias (DeepSeek-V3 /
+        // GLM-4.7-Flash, #742) or an expert weight scale would be silently dropped by the GPU router.
+        if (moe.SigmoidGating && (moe.SelectionBias is not null || moe.WeightsScale != 1.0f))
+            throw new NotSupportedException(
+                "CudaMoeWeightsLoader.LoadLayerQuant: sigmoid MoE routing with a selection bias or an expert weight "
+                + "scale is not implemented on CUDA (issue #742); only bias-free, unscaled sigmoid routing is.");
+
+        // The CPU leg runs MoeSwiGluMlp.ExecuteRoutedFromAssignments, which has plain SwiGLU and no per-expert biases.
+        if (hostExperts && (moe.UseSwiGluOai || moe.GateExpsBias is not null || moe.UpExpsBias is not null
+                            || moe.DownExpsBias is not null))
+            throw new NotSupportedException(
+                "--cpu-moe / --n-cpu-moe on the generic CUDA host does not support per-expert biases or the clamped "
+                + "swiglu_oai activation (gpt-oss): its CPU leg runs plain SwiGLU experts.");
 
         int numExperts = moe.NumExperts;
         int hidden = moe.HiddenSize;
@@ -157,11 +185,11 @@ internal static unsafe class CudaMoeWeightsLoader
         long w1ExpertBytes = moe.GateExpsMDim * w1RowBytes;
         long w3ExpertBytes = moe.UpExpsMDim * w3RowBytes;
         long w2ExpertBytes = moe.DownExpsMDim * w2RowBytes;
-        for (int e = 0; e < numExperts; e++)
+        if (!hostExperts)
         {
-            gateProj[e] = UploadRawBytes(moe.GateExpsRaw + (nint)(e * w1ExpertBytes), w1ExpertBytes, allocs);
-            upProj[e] = UploadRawBytes(moe.UpExpsRaw + (nint)(e * w3ExpertBytes), w3ExpertBytes, allocs);
-            downProj[e] = UploadRawBytes(moe.DownExpsRaw + (nint)(e * w2ExpertBytes), w2ExpertBytes, allocs);
+            UploadExpertBank(moe.GateExpsRaw, w1ExpertBytes, gateProj, allocs);
+            UploadExpertBank(moe.UpExpsRaw, w3ExpertBytes, upProj, allocs);
+            UploadExpertBank(moe.DownExpsRaw, w2ExpertBytes, downProj, allocs);
         }
 
         // Shared expert (DeepSeek-V2/V3 fuses N shared into a single wider MLP).
@@ -183,9 +211,24 @@ internal static unsafe class CudaMoeWeightsLoader
             long suBytes = sharedIntermediate * suRowBytes;
             long sdBytes = hidden * sdRowBytes;
 
-            sharedGate = [UploadRawBytes(moe.SharedGateRaw[0], sgBytes, allocs)];
-            sharedUp = [UploadRawBytes(moe.SharedUpRaw[0], suBytes, allocs)];
-            sharedDown = [UploadRawBytes(moe.SharedDownRaw[0], sdBytes, allocs)];
+            if (sgBytes % 256 == 0 && suBytes % 256 == 0)
+            {
+                // One allocation for the three projections (#1211): Flint's 1.25 MiB each would take a 2 MiB page apiece.
+                nint dShared = CudaWeights.AllocWeight(sgBytes + suBytes + sdBytes, "shared expert", allocs);
+                CudaDriverApi.cuMemcpyHtoD_v2(dShared, moe.SharedGateRaw[0], (nuint)sgBytes).ThrowOnError();
+                CudaDriverApi.cuMemcpyHtoD_v2(dShared + (nint)sgBytes, moe.SharedUpRaw[0], (nuint)suBytes).ThrowOnError();
+                CudaDriverApi.cuMemcpyHtoD_v2(dShared + (nint)(sgBytes + suBytes), moe.SharedDownRaw[0], (nuint)sdBytes)
+                    .ThrowOnError();
+                sharedGate = [dShared];
+                sharedUp = [dShared + (nint)sgBytes];
+                sharedDown = [dShared + (nint)(sgBytes + suBytes)];
+            }
+            else
+            {
+                sharedGate = [UploadRawBytes(moe.SharedGateRaw[0], sgBytes, allocs)];
+                sharedUp = [UploadRawBytes(moe.SharedUpRaw[0], suBytes, allocs)];
+                sharedDown = [UploadRawBytes(moe.SharedDownRaw[0], sdBytes, allocs)];
+            }
             sgQt = moe.SharedGateRawQt;
             suQt = moe.SharedUpRawQt;
             sdQt = moe.SharedDownRawQt;
@@ -220,7 +263,11 @@ internal static unsafe class CudaMoeWeightsLoader
             gateExpsBiasF32: gateExpsBiasF32,
             upExpsBiasF32: upExpsBiasF32,
             downExpsBiasF32: downExpsBiasF32,
-            useSwiGluOai: moe.UseSwiGluOai);
+            useSwiGluOai: moe.UseSwiGluOai)
+        {
+            SigmoidGating = moe.SigmoidGating,
+            HostExperts = hostExperts ? moe : null,
+        };
     }
 
     /// <summary>
@@ -348,6 +395,26 @@ internal static unsafe class CudaMoeWeightsLoader
         return devPtr;
     }
 
+    /// <summary>
+    /// Uploads a fused <c>[E, ...]</c> expert bank as ONE allocation and points each expert at its slice (#1211).
+    /// One allocation per expert cost Flint ~630 MiB: the driver packs sub-2 MiB allocations into 2 MiB pages, and three
+    /// 0.625 MiB Q4_1 experts leave 0.125 MiB of every page unused. Slices that would not stay 256-byte aligned (an odd
+    /// expert size) keep one allocation per expert.
+    /// </summary>
+    private static void UploadExpertBank(nint hostBase, long expertBytes, nint[] dst, List<nint> allocs)
+    {
+        if (expertBytes % 256 != 0)
+        {
+            for (int e = 0; e < dst.Length; e++)
+                dst[e] = UploadRawBytes(hostBase + (nint)(e * expertBytes), expertBytes, allocs);
+            return;
+        }
+
+        nint dBase = UploadRawBytes(hostBase, expertBytes * dst.Length, allocs);
+        for (int e = 0; e < dst.Length; e++)
+            dst[e] = dBase + (nint)(e * expertBytes);
+    }
+
     private static unsafe nint UploadRawBytes(nint hostPtr, long bytes, List<nint> allocs)
     {
         if (hostPtr == 0)
@@ -369,7 +436,7 @@ internal static unsafe class CudaMoeWeightsLoader
         return devPtr;
     }
 
-    private static nint UploadF32Array(float[] data, List<nint> allocs)
+    private static nint UploadF32Array(ReadOnlySpan<float> data, List<nint> allocs)
     {
         long bytes = (long)data.Length * sizeof(float);
         CudaDriverApi.cuMemAlloc_v2(out nint devPtr, (nuint)bytes).ThrowOnError();

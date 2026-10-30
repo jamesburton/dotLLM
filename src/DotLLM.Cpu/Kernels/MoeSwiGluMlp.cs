@@ -224,6 +224,10 @@ public static unsafe partial class MoeSwiGluMlp
     /// (identity-MoTE / Qwen3 aux-loss-free routing). Empty span ⇒ no bias. Shifts the top-k
     /// selection; cannot be folded into <paramref name="gateWeights"/>.
     /// </param>
+    /// <param name="sigmoidGating">When true, router scores are <c>sigmoid(logit)</c> instead of softmax (DeepSeek-V3 / GLM-4.7-Flash).</param>
+    /// <param name="selectionBias">Optional per-expert bias added to the sigmoid scores for top-k SELECTION only (<c>exp_probs_b</c>); gating weights stay unbiased.</param>
+    /// <param name="weightsScale">Multiplier applied to the final (optionally renormalised) top-k weights (<c>expert_weights_scale</c>).</param>
+    /// <param name="pool">Optional pool for the router logits (split over experts, same per-row dot, so bit-identical to serial).</param>
     /// <returns>Number of unique experts actually used (the valid prefix length of <paramref name="uniqueExperts"/>).</returns>
     public static int Route(
         ReadOnlySpan<float> hidden,
@@ -237,7 +241,11 @@ public static unsafe partial class MoeSwiGluMlp
         int numExperts, int numExpertsPerTok,
         int hiddenSize, int seqLen,
         bool normTopKProb,
-        ReadOnlySpan<float> gateBias = default)
+        ReadOnlySpan<float> gateBias = default,
+        bool sigmoidGating = false,
+        ReadOnlySpan<float> selectionBias = default,
+        float weightsScale = 1.0f,
+        ComputeThreadPool? pool = null)
     {
         if (numExperts <= 0) throw new ArgumentOutOfRangeException(nameof(numExperts));
         if (numExpertsPerTok <= 0 || numExpertsPerTok > numExperts)
@@ -270,11 +278,25 @@ public static unsafe partial class MoeSwiGluMlp
             fixed (float* gateWPtr = gateWeights)
             fixed (float* logitsAllPtr = gateLogitsBuf)
             {
-                for (int t = 0; t < seqLen; t++)
+                if (pool is not null && numExperts >= 64)
                 {
-                    float* x = hiddenPtr + t * hiddenSize;
-                    float* logits = logitsAllPtr + t * numExperts;
-                    MatMul.GemvF32(gateWPtr, x, logits, numExperts, hiddenSize);
+                    // #1159: the same per-(row, token) dot, split over expert rows; each worker reuses its rows across every
+                    // token from cache instead of streaming the whole router once per token on one thread.
+                    var ctx = new RouterLogitsCtx
+                    {
+                        Gate = gateWPtr, Hidden = hiddenPtr, Logits = logitsAllPtr,
+                        NumExperts = numExperts, HiddenSize = hiddenSize, SeqLen = seqLen,
+                    };
+                    pool.Dispatch((nint)(&ctx), &RouterLogitsWorker);
+                }
+                else
+                {
+                    for (int t = 0; t < seqLen; t++)
+                    {
+                        float* x = hiddenPtr + t * hiddenSize;
+                        float* logits = logitsAllPtr + t * numExperts;
+                        MatMul.GemvF32(gateWPtr, x, logits, numExperts, hiddenSize);
+                    }
                 }
             }
 
@@ -294,17 +316,47 @@ public static unsafe partial class MoeSwiGluMlp
                         logitsSpan[e] += gateBias[e];
                 }
 
-                Softmax.Execute(logitsSpan, routingSpan);
-
-                SelectTopK(routingSpan, topkIdx, topkProb);
+                if (sigmoidGating)
+                {
+                    // DeepSeek-V3 / GLM-4.7-Flash routing (llama.cpp build_moe_ffn, SIGMOID):
+                    // probs = sigmoid(logits); top-k is chosen on probs + selection_bias, but the
+                    // gating weights are the UNBIASED probs of the chosen experts. Renormalise
+                    // (expert_weights_norm, sum clamped at 6.1035e-5) then scale.
+                    for (int e = 0; e < numExperts; e++)
+                        routingSpan[e] = 1.0f / (1.0f + PortableMath.Exp(-logitsSpan[e]));
+                    if (selectionBias.IsEmpty)
+                    {
+                        SelectTopK(routingSpan, topkIdx, topkProb);
+                    }
+                    else
+                    {
+                        float[] scoreBuf = ArrayPool<float>.Shared.Rent(numExperts);
+                        try
+                        {
+                            for (int e = 0; e < numExperts; e++)
+                                scoreBuf[e] = routingSpan[e] + selectionBias[e];
+                            SelectTopK(scoreBuf.AsSpan(0, numExperts), topkIdx, topkProb);
+                        }
+                        finally { ArrayPool<float>.Shared.Return(scoreBuf); }
+                        for (int i = 0; i < numExpertsPerTok; i++) topkProb[i] = routingSpan[topkIdx[i]];
+                    }
+                }
+                else
+                {
+                    Softmax.Execute(logitsSpan, routingSpan);
+                    SelectTopK(routingSpan, topkIdx, topkProb);
+                }
 
                 if (normTopKProb)
                 {
                     float sum = 0f;
                     for (int i = 0; i < numExpertsPerTok; i++) sum += topkProb[i];
+                    if (sigmoidGating) sum = MathF.Max(sum, 6.103515625e-5f);
                     float invSum = sum > 0f ? 1.0f / sum : 0f;
                     for (int i = 0; i < numExpertsPerTok; i++) topkProb[i] *= invSum;
                 }
+                if (weightsScale != 1.0f)
+                    for (int i = 0; i < numExpertsPerTok; i++) topkProb[i] *= weightsScale;
 
                 for (int slot = 0; slot < numExpertsPerTok; slot++)
                 {
@@ -421,7 +473,7 @@ public static unsafe partial class MoeSwiGluMlp
     /// <param name="hiddenSize">Hidden / residual dimension (H).</param>
     /// <param name="intermediateSize">Per-expert MLP intermediate dimension (I).</param>
     /// <param name="seqLen">Number of tokens in this batch (T).</param>
-    /// <param name="sharedGateProj">Per-shared-expert gate_proj pointers (F32 only here; shared-expert quant overlay is rec #3 from the perf analysis).</param>
+    /// <param name="sharedGateProj">Per-shared-expert gate_proj F32 pointers. An entry may be 0 when <paramref name="sharedGateRaw"/> supplies the quantised weights instead.</param>
     /// <param name="sharedUpProj">Per-shared-expert up_proj pointers.</param>
     /// <param name="sharedDownProj">Per-shared-expert down_proj pointers.</param>
     /// <param name="sharedIntermediateSize">Per-shared-expert intermediate width (0 to disable).</param>
@@ -430,6 +482,13 @@ public static unsafe partial class MoeSwiGluMlp
     /// <param name="loraLayer">Layer index used to resolve adapter weights.</param>
     /// <param name="threadPool">Optional thread pool — when non-null the outer per-expert loop is parallelised.</param>
     /// <param name="useGeGLU">When <c>true</c>, experts apply GeGLU (tanh-approx GELU) instead of SwiGLU. Gemma 4 MoE.</param>
+    /// <param name="packedLegacyExperts">When <c>true</c>, Q4_0/Q4_1/Q5_1/IQ4_NL expert banks use the packed x Q8_1 dot instead of the dequantise-to-F32 fallback (batch-invariant: per-column activation quantisation). Opt-in per model (LFM2-MoE, #1015).</param>
+    /// <param name="sharedGateRaw">Optional per-shared-expert gate_proj pointers into the raw GGUF quant view, used where the matching <paramref name="sharedGateProj"/> entry is 0 (no F32 copy; #1158).</param>
+    /// <param name="sharedGateRawQt">Storage type of <paramref name="sharedGateRaw"/>.</param>
+    /// <param name="sharedUpRaw">Raw up_proj pointers; see <paramref name="sharedGateRaw"/>.</param>
+    /// <param name="sharedUpRawQt">Storage type of <paramref name="sharedUpRaw"/>.</param>
+    /// <param name="sharedDownRaw">Raw down_proj pointers; see <paramref name="sharedGateRaw"/>.</param>
+    /// <param name="sharedDownRawQt">Storage type of <paramref name="sharedDownRaw"/>.</param>
     [SkipLocalsInit]
     public static void ExecuteRoutedFromAssignments(
         ReadOnlySpan<float> hidden,
@@ -445,7 +504,11 @@ public static unsafe partial class MoeSwiGluMlp
         int sharedIntermediateSize, ReadOnlySpan<float> sharedExpertGate,
         ILoraAdapter? loraAdapter, int loraLayer,
         ComputeThreadPool? threadPool = null,
-        bool useGeGLU = false)
+        bool useGeGLU = false,
+        bool packedLegacyExperts = false,
+        ReadOnlySpan<nint> sharedGateRaw = default, QuantizationType sharedGateRawQt = QuantizationType.F32,
+        ReadOnlySpan<nint> sharedUpRaw = default, QuantizationType sharedUpRawQt = QuantizationType.F32,
+        ReadOnlySpan<nint> sharedDownRaw = default, QuantizationType sharedDownRawQt = QuantizationType.F32)
     {
         if (hidden.Length < (long)seqLen * hiddenSize)
             throw new ArgumentException("hidden too small", nameof(hidden));
@@ -492,8 +555,10 @@ public static unsafe partial class MoeSwiGluMlp
             // (gather/gate/up/silu/down scratch + optional Q8 input scratch) is owned by
             // the worker — when parallelised each thread rents its own. Per-expert writes
             // hit disjoint (token, slot) rows in scatterDown by construction.
+            bool sharedDone = false;
             fixed (float* hiddenPtr = hidden)
             fixed (float* scatterDownPtr = scatterDownBuf)
+            fixed (float* sharedDownOut = sharedDownBatchBuf)
             {
                 // Snapshot pointers + sizes the worker captures.
                 var workerCtx = new RoutedExpertWorkerCtx
@@ -516,9 +581,35 @@ public static unsafe partial class MoeSwiGluMlp
                     IntermediateSize = intermediateSize,
                     NumExpertsPerTok = numExpertsPerTok,
                     UseGeGLU = useGeGLU,
+                    PackedLegacy = packedLegacyExperts,
                 };
 
-                if (threadPool is null || uniqueExpertCount < 2)
+                // An ungated raw-quant single shared expert can ride in the decode path's two dispatches (#1159).
+                bool sharedFusable = hasSharedExpert && numSharedExperts == 1 && !hasSharedGate
+                    && sharedGateProj[0] == 0 && sharedUpProj[0] == 0 && sharedDownProj[0] == 0
+                    && sharedGateRaw.Length > 0 && sharedUpRaw.Length > 0 && sharedDownRaw.Length > 0;
+                var sharedN1 = sharedFusable
+                    ? new DecodeN1Shared
+                    {
+                        Gate = sharedGateRaw[0], Up = sharedUpRaw[0], Down = sharedDownRaw[0],
+                        GateQt = sharedGateRawQt, UpQt = sharedUpRawQt, DownQt = sharedDownRawQt,
+                        Intermediate = sharedIntermediateSize, Out = sharedDownOut, Layer = loraLayer,
+                    }
+                    : default;
+                if (seqLen == 1 && threadPool is not null && loraAdapter is null
+                    && gateExpsF32Ptrs.IsEmpty && upExpsF32Ptrs.IsEmpty && downExpsF32Ptrs.IsEmpty
+                    && TryExecuteRoutedDecodeN1(
+                        hiddenPtr, scatterDownPtr,
+                        gateExpsRawBase, gateExpsQt, gateExpsRowBytes,
+                        upExpsRawBase, upExpsQt, upExpsRowBytes,
+                        downExpsRawBase, downExpsQt, downExpsRowBytes,
+                        bucketCursors, bucketSlots, uniqueExperts, uniqueExpertCount,
+                        numExpertsPerTok, hiddenSize, intermediateSize, useGeGLU, threadPool, packedLegacyExperts,
+                        sharedN1, out sharedDone))
+                {
+                    // Decode fast path ran: two pool dispatches for the whole layer (see TryExecuteRoutedDecodeN1).
+                }
+                else if (threadPool is null || uniqueExpertCount < 2)
                 {
                     // Serial path — bit-identity with the historical ascending-id loop.
                     for (int u = 0; u < uniqueExpertCount; u++)
@@ -560,8 +651,13 @@ public static unsafe partial class MoeSwiGluMlp
                 }
             }
 
-            // ────────────── Shared-expert batched compute (F32 only, unchanged) ──────────────
-            if (hasSharedExpert)
+            // ────────────── Shared-expert batched compute (F32, or the raw quant view when the F32 slot is 0) ──────────────
+            long _ps = CpuStageProf.T();
+            if (sharedDone)
+            {
+                sharedScaleBuf![0] = 1.0f;   // ungated: the fused decode path already wrote the shared down row
+            }
+            else if (hasSharedExpert)
             {
                 fixed (float* hiddenPtr = hidden)
                 fixed (float* sgBatch = sharedGateBatchBuf)
@@ -572,14 +668,10 @@ public static unsafe partial class MoeSwiGluMlp
                 {
                     for (int k = 0; k < numSharedExperts; k++)
                     {
-                        float* sharedW1k = (float*)sharedGateProj[k];
-                        float* sharedW3k = (float*)sharedUpProj[k];
-                        float* sharedW2k = (float*)sharedDownProj[k];
-
-                        MatMul.GemmF32(sharedW1k, hiddenPtr, sgBatch,
-                            sharedIntermediateSize, hiddenSize, seqLen);
-                        MatMul.GemmF32(sharedW3k, hiddenPtr, suBatch,
-                            sharedIntermediateSize, hiddenSize, seqLen);
+                        SharedProjection(sharedGateProj[k], sharedGateRaw, sharedGateRawQt, k, hiddenPtr, sgBatch,
+                            sharedIntermediateSize, hiddenSize, seqLen, threadPool, packedLegacyExperts);
+                        SharedProjection(sharedUpProj[k], sharedUpRaw, sharedUpRawQt, k, hiddenPtr, suBatch,
+                            sharedIntermediateSize, hiddenSize, seqLen, threadPool, packedLegacyExperts);
 
                         var sharedGateSpanBatch = new Span<float>(sgBatch, seqLen * sharedIntermediateSize);
                         var sharedUpSpanBatch = new Span<float>(suBatch, seqLen * sharedIntermediateSize);
@@ -596,10 +688,11 @@ public static unsafe partial class MoeSwiGluMlp
                                 FusedOps.SwiGLU(gSlice, uSlice, oSlice);
                         }
 
+                        if (ActivationRangeProbe.On) ActivationRangeProbe.Record(loraLayer, "shexp_down_in", ssBatch, (long)seqLen * sharedIntermediateSize);
                         if (k == 0)
                         {
-                            MatMul.GemmF32(sharedW2k, ssBatch, sdBatch,
-                                hiddenSize, sharedIntermediateSize, seqLen);
+                            SharedProjection(sharedDownProj[k], sharedDownRaw, sharedDownRawQt, k, ssBatch, sdBatch,
+                                hiddenSize, sharedIntermediateSize, seqLen, threadPool, packedLegacyExperts);
                         }
                         else
                         {
@@ -608,8 +701,8 @@ public static unsafe partial class MoeSwiGluMlp
                             {
                                 fixed (float* tmpPtr = tmp)
                                 {
-                                    MatMul.GemmF32(sharedW2k, ssBatch, tmpPtr,
-                                        hiddenSize, sharedIntermediateSize, seqLen);
+                                    SharedProjection(sharedDownProj[k], sharedDownRaw, sharedDownRawQt, k, ssBatch, tmpPtr,
+                                        hiddenSize, sharedIntermediateSize, seqLen, threadPool, packedLegacyExperts);
                                 }
                                 TensorPrimitives.Add(
                                     new ReadOnlySpan<float>(sdBatch, seqLen * hiddenSize),
@@ -632,12 +725,14 @@ public static unsafe partial class MoeSwiGluMlp
                             float logit = 0f;
                             for (int j = 0; j < hiddenSize; j++)
                                 logit += sharedGatePtr[j] * x[j];
-                            scale = 1.0f / (1.0f + MathF.Exp(-logit));
+                            scale = 1.0f / (1.0f + PortableMath.Exp(-logit));
                         }
                         sharedScaleBuf![t] = scale;
                     }
                 }
             }
+
+            CpuStageProf.E(14, _ps);
 
             // ────────────── Final in-order accumulation ──────────────
             var acc = accBuf.AsSpan(0, hiddenSize);
@@ -675,6 +770,37 @@ public static unsafe partial class MoeSwiGluMlp
         }
     }
 
+    private struct RouterLogitsCtx
+    {
+        public float* Gate;
+        public float* Hidden;
+        public float* Logits;
+        public int NumExperts;
+        public int HiddenSize;
+        public int SeqLen;
+    }
+
+    /// <summary>Router rows to keep hot while every token is dotted against them (8 KiB per row at Flint's 2048).</summary>
+    private const int RouterRowTile = 8;
+
+    private static void RouterLogitsWorker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        ref var c = ref Unsafe.AsRef<RouterLogitsCtx>((void*)ctxPtr);
+        ComputeThreadPool.PartitionRange(c.NumExperts, threadIdx, threadCount, out int start, out int end);
+        int k = c.HiddenSize;
+        for (int r0 = start; r0 < end; r0 += RouterRowTile)
+        {
+            int r1 = Math.Min(end, r0 + RouterRowTile);
+            for (int t = 0; t < c.SeqLen; t++)
+            {
+                var x = new ReadOnlySpan<float>(c.Hidden + (long)t * k, k);
+                float* logits = c.Logits + (long)t * c.NumExperts;
+                for (int r = r0; r < r1; r++)
+                    logits[r] = TensorPrimitives.Dot(new ReadOnlySpan<float>(c.Gate + (long)r * k, k), x);
+            }
+        }
+    }
+
     /// <summary>
     /// Per-expert worker context — captured as a value type by the per-expert loop body
     /// so it can be passed to both the serial loop and the <see cref="System.Threading.Tasks.Parallel.For(int, int, Action{int})"/>
@@ -701,6 +827,7 @@ public static unsafe partial class MoeSwiGluMlp
         public int NumExpertsPerTok;
         /// <summary>When true, experts apply GeGLU (tanh-approx GELU) instead of SwiGLU.</summary>
         public bool UseGeGLU;
+        public bool PackedLegacy;
     }
 
     /// <summary>
@@ -725,12 +852,14 @@ public static unsafe partial class MoeSwiGluMlp
         int intermediateSize = ctx.IntermediateSize;
         int numExpertsPerTok = ctx.NumExpertsPerTok;
 
+        long _p0 = CpuStageProf.T();
         // Rent per-call buffers from ArrayPool — worker-local, returned in finally.
         float[] batchInBuf = ArrayPool<float>.Shared.Rent(batch * hiddenSize);
         float[] gateBatchBuf = ArrayPool<float>.Shared.Rent(batch * intermediateSize);
         float[] upBatchBuf = ArrayPool<float>.Shared.Rent(batch * intermediateSize);
         float[] siluBatchBuf = ArrayPool<float>.Shared.Rent(batch * intermediateSize);
         float[] downBatchBuf = ArrayPool<float>.Shared.Rent(batch * hiddenSize);
+        float[] downScaleBuf = ArrayPool<float>.Shared.Rent(batch);
 
         // Optional Q8 pre-quantized input scratch — sized for the largest pre-quant format
         // we might need across gate/up (k=hiddenSize) and down (k=intermediateSize).
@@ -738,7 +867,7 @@ public static unsafe partial class MoeSwiGluMlp
         bool gateUpUsesF32Resolved = (ctx.GateExpsQt == QuantizationType.F32 && gateExpsF32Ptrs.Length > e)
                                   || (ctx.UpExpsQt == QuantizationType.F32 && upExpsF32Ptrs.Length > e);
         bool gateUpShareQt = !gateUpUsesF32Resolved && ctx.GateExpsQt == ctx.UpExpsQt;
-        int prequantBytes = gateUpShareQt
+        int prequantBytes = gateUpShareQt && (ctx.PackedLegacy || !IsPackedLegacyQuant(ctx.GateExpsQt))
             ? ComputePrequantBytes(ctx.GateExpsQt, hiddenSize, batch)
             : 0;
         // Always rent at least 1 byte so the fixed-pointer pin is well-defined; we only
@@ -794,23 +923,25 @@ public static unsafe partial class MoeSwiGluMlp
                     preQuantGateUp = prequantPtr;
                 }
 
+                CpuStageProf.E(9, _p0); _p0 = CpuStageProf.T();
                 // ── gate = batchIn × W1 (gate_proj) ───────────────────────────
                 DispatchGemm(
                     ctx.GateExpsQt, gatePtr, batchInPtr, gateBatchPtr,
                     intermediateSize, hiddenSize, batch,
-                    preQuantGateUp, threadPool);
+                    preQuantGateUp, threadPool, ctx.PackedLegacy);
 
                 // ── up = batchIn × W3 (up_proj) ───────────────────────────────
                 DispatchGemm(
                     ctx.UpExpsQt, upPtr, batchInPtr, upBatchPtr,
                     intermediateSize, hiddenSize, batch,
-                    preQuantGateUp, threadPool);
+                    preQuantGateUp, threadPool, ctx.PackedLegacy);
 
                 ApplyLoraDelta(loraAdapter, loraLayer, ExpertProjectionName(e, "gate_proj"),
                     batchInPtr, gateBatchPtr, batch, hiddenSize, intermediateSize);
                 ApplyLoraDelta(loraAdapter, loraLayer, ExpertProjectionName(e, "up_proj"),
                     batchInPtr, upBatchPtr, batch, hiddenSize, intermediateSize);
 
+                CpuStageProf.E(10, _p0); _p0 = CpuStageProf.T();
                 // ── Per-row gate fuse (GeGLU for Gemma 4, SwiGLU otherwise) ──
                 var gateBatchSpan = new Span<float>(gateBatchPtr, batch * intermediateSize);
                 var upBatchSpan = new Span<float>(upBatchPtr, batch * intermediateSize);
@@ -827,6 +958,12 @@ public static unsafe partial class MoeSwiGluMlp
                         FusedOps.SwiGLU(gSlice, uSlice, oSlice);
                 }
 
+                if (ActivationRangeProbe.On) ActivationRangeProbe.Record(loraLayer, "moe_down_in", siluBatchPtr, (long)batch * intermediateSize);
+                // F16-safe down input (llama.cpp build_amax_src1_f16); undone per row in the scatter below.
+                for (int b = 0; b < batch; b++)
+                    downScaleBuf[b] = RescaleDownInputForF16Sums(siluBatchPtr + (long)b * intermediateSize, intermediateSize);
+
+                CpuStageProf.E(11, _p0); _p0 = CpuStageProf.T();
                 // ── down = silu × W2 (down_proj) ─────────────────────────────
                 // K=intermediateSize differs from gate/up (K=hiddenSize) so the pre-quantized
                 // input is not reusable here — let the kernel quantize internally. This is one
@@ -834,22 +971,25 @@ public static unsafe partial class MoeSwiGluMlp
                 DispatchGemm(
                     ctx.DownExpsQt, downPtr, siluBatchPtr, downBatchPtr,
                     hiddenSize, intermediateSize, batch,
-                    preQuantizedInput: null, threadPool);
+                    preQuantizedInput: null, threadPool, ctx.PackedLegacy);
 
                 ApplyLoraDelta(loraAdapter, loraLayer, ExpertProjectionName(e, "down_proj"),
                     siluBatchPtr, downBatchPtr, batch, intermediateSize, hiddenSize);
 
+                CpuStageProf.E(12, _p0); _p0 = CpuStageProf.T();
                 // ── Scatter down rows to scatterDown[(t*k+slot)*H] ───────────
                 for (int b = 0; b < batch; b++)
                 {
                     int t = bucketTokens[start + b];
                     int slot = bucketSlots[start + b];
-                    Buffer.MemoryCopy(
-                        downBatchPtr + (long)b * hiddenSize,
-                        scatterDownPtr + (long)(t * numExpertsPerTok + slot) * hiddenSize,
-                        hiddenSize * sizeof(float),
-                        hiddenSize * sizeof(float));
+                    var src = new ReadOnlySpan<float>(downBatchPtr + (long)b * hiddenSize, hiddenSize);
+                    var dst = new Span<float>(scatterDownPtr + (long)(t * numExpertsPerTok + slot) * hiddenSize, hiddenSize);
+                    if (downScaleBuf[b] != 1f)
+                        TensorPrimitives.Multiply(src, downScaleBuf[b], dst);
+                    else
+                        src.CopyTo(dst);
                 }
+                CpuStageProf.E(13, _p0);
             }
         }
         finally
@@ -859,9 +999,64 @@ public static unsafe partial class MoeSwiGluMlp
             ArrayPool<float>.Shared.Return(upBatchBuf);
             ArrayPool<float>.Shared.Return(siluBatchBuf);
             ArrayPool<float>.Shared.Return(downBatchBuf);
+            ArrayPool<float>.Shared.Return(downScaleBuf);
             ArrayPool<byte>.Shared.Return(prequantInputBuf);
         }
     }
+
+    /// <summary>
+    /// One shared-expert projection <c>C[n,m] = B[n,k] × W[m,k]^T</c>: the F32 copy when present, otherwise the raw GGUF
+    /// quant view through <see cref="DispatchGemm"/> (no widened copy of the weights).
+    /// </summary>
+    /// <param name="f32">F32 weight pointer, or 0 when only the raw view exists.</param>
+    /// <param name="raw">Raw quant pointers per shared expert.</param>
+    /// <param name="rawQt">Storage type of <paramref name="raw"/>.</param>
+    /// <param name="index">Shared-expert index.</param>
+    /// <param name="b">Input activations [n × k].</param>
+    /// <param name="c">Output [n × m].</param>
+    /// <param name="m">Output rows.</param>
+    /// <param name="k">Inner dimension.</param>
+    /// <param name="n">Token count.</param>
+    /// <param name="pool">Optional thread pool.</param>
+    /// <param name="packedLegacy">Packed x Q8_1 dot for legacy quants (see <see cref="DispatchGemm"/>).</param>
+    private static void SharedProjection(nint f32, ReadOnlySpan<nint> raw, QuantizationType rawQt, int index,
+        float* b, float* c, int m, int k, int n, ComputeThreadPool? pool, bool packedLegacy)
+    {
+        if (f32 != 0)
+        {
+            MatMul.GemmF32((float*)f32, b, c, m, k, n);
+            return;
+        }
+        if (raw.Length <= index || raw[index] == 0)
+            throw new InvalidOperationException($"Shared expert {index} has neither F32 nor raw quantised weights.");
+        DispatchGemm(rawQt, raw[index], b, c, m, k, n, preQuantizedInput: null, pool, packedLegacy);
+    }
+
+    /// <summary>
+    /// Keeps a routed-expert down-projection input row inside F16 range for the Q8 activation block sums (llama.cpp
+    /// <c>build_amax_src1_f16</c>, applied there to Flint / Mistral4 / Mellum): when <c>max|row| &gt; 1024</c> the row is divided by
+    /// <c>e = 2^ceil(log2(max|row| / 1024))</c>, leaving x32 headroom for the F16 sum of a 32-value Q8_1 block; the caller multiplies
+    /// the projected row by the returned <c>e</c>. A power of two is exact in both directions, so rows at or below 1024 are untouched
+    /// and every other row gives the same result as unscaled maths would without the overflow (Flint reaches ~13000, whose Q8_1
+    /// block sum overflows F16 to inf and turns the layer into NaN).
+    /// </summary>
+    /// <param name="row">Row to rescale in place.</param>
+    /// <param name="n">Row length.</param>
+    /// <returns>The factor to multiply the projected row by (1 when untouched).</returns>
+    internal static float RescaleDownInputForF16Sums(float* row, int n)
+    {
+        var span = new Span<float>(row, n);
+        float amax = MathF.Abs(TensorPrimitives.MaxMagnitude((ReadOnlySpan<float>)span));
+        if (!(amax > 1024f))
+            return 1f;
+        int k = Math.Clamp((int)MathF.Ceiling(MathF.Log2(amax / 1024f)), 0, 127);
+        float e = MathF.ScaleB(1f, k);
+        TensorPrimitives.Multiply(span, MathF.ScaleB(1f, -k), span);
+        return e;
+    }
+
+    private static bool IsPackedLegacyQuant(QuantizationType qt)
+        => qt is QuantizationType.Q4_0 or QuantizationType.Q4_1 or QuantizationType.Q5_1 or QuantizationType.IQ4_NL;
 
     /// <summary>
     /// Total byte size of a pre-quantized batch of <paramref name="batch"/> rows
@@ -878,9 +1073,23 @@ public static unsafe partial class MoeSwiGluMlp
                 if (k % 32 != 0) return 0;
                 return batch * (k / 32) * 34;
             case QuantizationType.Q5_0:
-                // Q5_0 weight × Q8_1 input: 36 bytes per 32-element block.
+            case QuantizationType.Q4_0:
+            case QuantizationType.Q4_1:
+            case QuantizationType.Q5_1:
+            case QuantizationType.IQ4_NL:
+                // Legacy weights × Q8_1 input: 36 bytes per 32-element block.
                 if (k % 32 != 0) return 0;
                 return batch * (k / 32) * 36;
+            case QuantizationType.Q2_K:
+            case QuantizationType.Q3_K:
+            case QuantizationType.IQ4_XS:
+            case QuantizationType.IQ2_XXS:
+            case QuantizationType.IQ2_XS:
+            case QuantizationType.IQ2_S:
+            case QuantizationType.IQ3_XXS:
+            case QuantizationType.IQ3_S:
+            case QuantizationType.IQ1_M:
+            case QuantizationType.IQ1_S:
             case QuantizationType.Q4_K:
             case QuantizationType.Q5_K:
             case QuantizationType.Q6_K:
@@ -910,12 +1119,26 @@ public static unsafe partial class MoeSwiGluMlp
                     break;
                 }
             case QuantizationType.Q5_0:
+            case QuantizationType.Q4_0:
+            case QuantizationType.Q4_1:
+            case QuantizationType.Q5_1:
+            case QuantizationType.IQ4_NL:
                 {
                     int rowBytes = (k / 32) * 36;
                     for (int b = 0; b < batch; b++)
                         MatMul.QuantizeF32ToQ8_1(src + b * k, dest + b * rowBytes, k);
                     break;
                 }
+            case QuantizationType.Q2_K:
+            case QuantizationType.Q3_K:
+            case QuantizationType.IQ4_XS:
+            case QuantizationType.IQ2_XXS:
+            case QuantizationType.IQ2_XS:
+            case QuantizationType.IQ2_S:
+            case QuantizationType.IQ3_XXS:
+            case QuantizationType.IQ3_S:
+            case QuantizationType.IQ1_M:
+            case QuantizationType.IQ1_S:
             case QuantizationType.Q4_K:
             case QuantizationType.Q5_K:
             case QuantizationType.Q6_K:
@@ -928,6 +1151,19 @@ public static unsafe partial class MoeSwiGluMlp
         }
     }
 
+    /// <summary>IQ1_M routed experts use the packed x Q8_K dot (default). <c>DOTLLM_CPU_IQ1M_PACKED=0</c> falls back to dequantize-per-row (A/B baseline).</summary>
+    public static bool Iq1MPackedEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_CPU_IQ1M_PACKED") != "0";
+
+    /// <summary>
+    /// Diagnostic (#873): when true every quantized expert GEMM dequantizes the weights to F32 and dots them with the UNQUANTIZED F32
+    /// activations (no Q8_K/Q8_0 activation quantization) - the "F32-decoded control" that separates activation-quantization noise from
+    /// everything else. Slow; default off (env <c>DOTLLM_Q4E_DIAG_F32ACT=1</c>).
+    /// </summary>
+    public static bool DiagF32Activations { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_Q4E_DIAG_F32ACT") is "1" or "moe";
+
+    /// <summary>Diagnostic (#873): same control for the NON-expert projections (<c>DOTLLM_Q4E_DIAG_F32ACT=1</c> or <c>dense</c>); consulted by the qwen4exp model's dense GEMM.</summary>
+    public static bool DiagF32ActivationsDense { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_Q4E_DIAG_F32ACT") is "1" or "dense";
+
     /// <summary>
     /// Dispatch one weight-quant-typed GEMM <c>C[N,M] = B[N,K] × A[M,K]^T</c>. Routes to
     /// the matching <c>MatMul.GemmQX</c> kernel for supported quant types, falls back to
@@ -936,8 +1172,26 @@ public static unsafe partial class MoeSwiGluMlp
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void DispatchGemm(
         QuantizationType qt, nint weights, float* b, float* c,
-        int m, int k, int n, byte* preQuantizedInput, ComputeThreadPool? pool)
+        int m, int k, int n, byte* preQuantizedInput, ComputeThreadPool? pool, bool packedLegacy = false)
     {
+        // A/B switch for the IQ1_M packed arm (#958): DOTLLM_CPU_IQ1M_PACKED=0 restores the generic dequant-per-row path.
+        if (qt == QuantizationType.IQ1_M && !Iq1MPackedEnabled)
+        {
+            MatMul.GemmDequantRows((byte*)weights, qt, b, c, m, k, n, pool);
+            return;
+        }
+        if (DiagF32Activations && qt is not (QuantizationType.F32 or QuantizationType.F16))
+        {
+            MatMul.GemmDequantRows((byte*)weights, qt, b, c, m, k, n, pool);
+            return;
+        }
+        // #1015: Q4_0 / Q4_1 / Q5_1 / IQ4_NL expert banks: packed x Q8_1 dot (llama.cpp quantises the activations to Q8 for these
+        // banks too; the dequantise-to-F32 fallback below is ~10x slower and numerically differs from the reference).
+        if (packedLegacy && IsPackedLegacyQuant(qt))
+        {
+            MatMul.GemmLegacyQuant((byte*)weights, qt, b, c, m, k, n, pool, preQuantizedInput);
+            return;
+        }
         switch (qt)
         {
             case QuantizationType.F32:
@@ -958,6 +1212,36 @@ public static unsafe partial class MoeSwiGluMlp
                 else
                     MatMul.GemmQ5_0((byte*)weights, b, c, m, k, n, preQuantizedInput);
                 return;
+            // Q2_K/Q3_K are safe here where the packed legacy quants are not (see the note on
+            // the default arm): their ComputeRows does not vary with n, so a token's result does
+            // not depend on how many others routed to the same expert.
+            case QuantizationType.Q2_K:
+                if (pool is not null)
+                    MatMul.GemmQ2_K((byte*)weights, b, c, m, k, n, pool, preQuantizedInput);
+                else
+                    MatMul.GemmQ2_K((byte*)weights, b, c, m, k, n, preQuantizedInput);
+                return;
+            case QuantizationType.Q3_K:
+                if (pool is not null)
+                    MatMul.GemmQ3_K((byte*)weights, b, c, m, k, n, pool, preQuantizedInput);
+                else
+                    MatMul.GemmQ3_K((byte*)weights, b, c, m, k, n, preQuantizedInput);
+                return;
+            case QuantizationType.IQ4_XS:
+                if (pool is not null)
+                    MatMul.GemmIQ4_XS((byte*)weights, b, c, m, k, n, pool, preQuantizedInput);
+                else
+                    MatMul.GemmIQ4_XS((byte*)weights, b, c, m, k, n, preQuantizedInput);
+                return;
+            case QuantizationType.IQ2_XXS:
+            case QuantizationType.IQ2_XS:
+            case QuantizationType.IQ2_S:
+            case QuantizationType.IQ3_XXS:
+            case QuantizationType.IQ3_S:
+            case QuantizationType.IQ1_M:
+            case QuantizationType.IQ1_S:
+                MatMul.GemmIQCodebook(qt, (byte*)weights, b, c, m, k, n, pool, preQuantizedInput);
+                return;
             case QuantizationType.Q4_K:
                 if (pool is not null)
                     MatMul.GemmQ4_K((byte*)weights, b, c, m, k, n, pool, preQuantizedInput);
@@ -976,8 +1260,26 @@ public static unsafe partial class MoeSwiGluMlp
                 else
                     MatMul.GemmQ6_K((byte*)weights, b, c, m, k, n, preQuantizedInput);
                 return;
+            case QuantizationType.MXFP4:
+                // SIMD pshufb row dot against the F32 activations (no activation quantisation, same maths as the dequant fallback),
+                // batch-invariant by construction (see GemmMxfp4). The generic dequant fallback below was ~3 s/token on MiMo-V2 (#935).
+                MatMul.GemmMxfp4((byte*)weights, b, c, m, k, n, pool);
+                return;
             default:
-                // Fallback for quant types without a direct kernel (Q4_0, Q4_1, Q5_1, IQ*, BF16).
+                // Fallback for quant types without a direct kernel (Q4_0/Q4_1/Q5_1, IQ*, BF16).
+                //
+                // The packed legacy-quant dots added in #489 are deliberately NOT wired in here,
+                // even though this is a GEMM over the same formats. MatMul.GemmLegacyQuantOrDequant
+                // chooses its kernel from n, and this is grouped-GEMM MoE: n is the size of an
+                // expert's token bucket, which depends on routing. A token's result would then
+                // depend on which other tokens happened to route to the same expert in the same
+                // forward, and the two kernels do not agree bit for bit (the packed one quantizes
+                // the activations). That showed up as SyntheticGemma4GgufRegionAwareLoraTests
+                // failing: its expert-down bank is Q5_1, and a region-scoped LoRA delta changed
+                // routing enough to move one bucket across the threshold, shifting the logits of
+                // tokens in the *other* region by ~3e-3 and breaking the isolation assertion.
+                // Making MoE experts use the packed dot needs a batch-invariant policy (always
+                // packed, at a prefill cost), which is its own measurement.
                 // Dequant per row then F32 dot, row-parallel and dequantizing each row once for
                 // all n columns (#263). Shares MatMul.GemmDequantRows with the model's own
                 // fallback so both stay bit-identical.

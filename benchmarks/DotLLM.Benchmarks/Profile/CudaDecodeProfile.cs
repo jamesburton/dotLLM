@@ -2,7 +2,7 @@ using System.Diagnostics;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Cuda;
-using DotLLM.HuggingFace;
+using DotLLM.Tests.Integration.Fixtures;
 using DotLLM.Models.Gguf;
 using DotLLM.Tokenizers.Bpe;
 
@@ -349,18 +349,7 @@ internal static class CudaDecodeProfile
         string envPath = Environment.GetEnvironmentVariable("DOTLLM_BENCH_MODEL_PATH") ?? "";
         if (!string.IsNullOrEmpty(envPath) && File.Exists(envPath)) return envPath;
 
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string cli = Path.Combine(home, ".dotllm", "models",
-            DefaultRepoId.Replace('/', Path.DirectorySeparatorChar), DefaultFilename);
-        if (File.Exists(cli)) return cli;
-
-        string benchCacheDir = Path.Combine(home, ".dotllm", "test-cache");
-        string benchCached = Path.Combine(benchCacheDir,
-            DefaultRepoId.Replace('/', Path.DirectorySeparatorChar), DefaultFilename);
-        if (File.Exists(benchCached)) return benchCached;
-
-        Console.WriteLine($"Downloading {DefaultRepoId}/{DefaultFilename}...");
-        using var dl = new HuggingFaceDownloader();
-        return dl.DownloadFileAsync(DefaultRepoId, DefaultFilename, benchCacheDir).GetAwaiter().GetResult();
+        Console.WriteLine($"Resolving {DefaultRepoId}/{DefaultFilename}...");
+        return TestModelDownloader.EnsureModelAsync(DefaultRepoId, DefaultFilename).GetAwaiter().GetResult();
     }
 }

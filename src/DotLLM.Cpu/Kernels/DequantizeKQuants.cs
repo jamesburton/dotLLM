@@ -54,6 +54,45 @@ public static unsafe partial class Dequantize
         }
     }
 
+    /// <summary>
+    /// Unpacks Q3_K's 12 packed scale bytes into 16 <b>unsigned</b> 6-bit sub-block scales.
+    /// Callers apply the format's bias themselves: the signed scale is <c>dest16[sub] - 32</c>.
+    /// </summary>
+    /// <remarks>
+    /// Per llama.cpp <c>ggml-quants.c dequantize_row_q3_K</c> (the 32-bit <c>aux</c>/<c>kmask</c>
+    /// shuffle, written out per sub-block):
+    /// <code>
+    ///   scales[ 0+b] = (s[  b] &amp; 0xF) | (((s[8+b] >> 0) &amp; 3) &lt;&lt; 4)
+    ///   scales[ 4+b] = (s[4+b] &amp; 0xF) | (((s[8+b] >> 2) &amp; 3) &lt;&lt; 4)
+    ///   scales[ 8+b] = (s[  b] >>  4)  | (((s[8+b] >> 4) &amp; 3) &lt;&lt; 4)
+    ///   scales[12+b] = (s[4+b] >>  4)  | (((s[8+b] >> 6) &amp; 3) &lt;&lt; 4)     for b in 0..3
+    /// </code>
+    /// i.e. the low nibble comes from bytes 0..7 (low nibble for sub 0..7, high nibble for
+    /// sub 8..15) and the high 2 bits from byte <c>8 + (sub % 4)</c> at shift <c>2 * (sub / 4)</c>.
+    /// That byte/shift pair is <b>transposed</b> relative to the obvious-looking
+    /// <c>8 + sub/4 @ (sub%4)*2</c>; getting it the wrong way round scrambles 12 of the 16
+    /// sub-blocks. Shared by the dequantizer and the Q3_K × Q8_K dots so the two cannot drift.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void UnpackQ3KScales(byte* scales12, byte* dest16)
+    {
+        // llama.cpp's own 4-word form, not the per-sub-block loop: this runs once per 256-element
+        // super-block on the Q3_K dot's hot path, where a 16-iteration branchy loop was measurable
+        // (~2.3x the per-super-block cost of Q2_K, which has no such unpack). The byte order of
+        // the result is the sub-block order, so it is the same 16 values either way.
+        const uint kmask1 = 0x03030303u;  // the 2 high bits of each scale, packed 4-per-byte
+        const uint kmask2 = 0x0f0f0f0fu;  // the low nibble of each scale
+
+        uint a0 = Unsafe.ReadUnaligned<uint>(scales12);
+        uint a1 = Unsafe.ReadUnaligned<uint>(scales12 + 4);
+        uint tmp = Unsafe.ReadUnaligned<uint>(scales12 + 8);
+
+        Unsafe.WriteUnaligned(dest16, (a0 & kmask2) | (((tmp >> 0) & kmask1) << 4));
+        Unsafe.WriteUnaligned(dest16 + 4, (a1 & kmask2) | (((tmp >> 2) & kmask1) << 4));
+        Unsafe.WriteUnaligned(dest16 + 8, ((a0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4));
+        Unsafe.WriteUnaligned(dest16 + 12, ((a1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4));
+    }
+
     // ──────────────────── Q6_K ────────────────────
 
     /// <summary>
@@ -90,7 +129,7 @@ public static unsafe partial class Dequantize
             byte* ql = blockBase;
             byte* qh = blockBase + 128;
             sbyte* scales = (sbyte*)(blockBase + 192);
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockBase + 208);
+            float d = MatMul.HalfToSingle(blockBase + 208);
 
             // Process two 128-element halves, matching llama.cpp dequantize_row_q6_K.
             // Within each half: ql lower nibbles → first 64 elements,
@@ -143,7 +182,7 @@ public static unsafe partial class Dequantize
                 byte* ql = blockBase;
                 byte* qh = blockBase + 128;
                 sbyte* scales = (sbyte*)(blockBase + 192);
-                float d = (float)Unsafe.ReadUnaligned<Half>(blockBase + 208);
+                float d = MatMul.HalfToSingle(blockBase + 208);
 
                 // Process 32 values per iteration (2 sub-blocks of 16), 8 iterations for 256 values.
                 // Matches llama.cpp: within each half (128 elements), ql lower nibbles produce
@@ -222,6 +261,14 @@ public static unsafe partial class Dequantize
     /// scales[16] (4-bit scale + 4-bit dmin coef per sub-block, packed) +
     /// qs[64] (2-bit elements, 4 per byte) + d (half) + dmin (half) = 84 bytes per 256 elements.
     /// Per-element decode: <c>value = d × scale × q2 − dmin × dmin_coef</c>.
+    /// <para><b>Element ordering is transposed</b>, exactly as in Q3_K. Per llama.cpp
+    /// <c>dequantize_row_q2_K</c>, each 128-element half consumes 32 <c>qs</c> bytes and each byte
+    /// supplies FOUR elements 32 apart: element <c>e</c> reads bit-pair <c>(e&gt;&gt;5)&amp;3</c> of byte
+    /// <c>32·(e&gt;&gt;7) + (e&amp;31)</c>. Reading it as <c>e/4 @ (e%4)·2</c> — the obvious-looking layout
+    /// this kernel shipped with until issue #498 — permutes every element into the wrong sub-block
+    /// scale; decoded weights then correlate ~0.07 with the true values (measured on
+    /// <c>Llama-3.2-1B-pure-Q2_K</c> against Q8_0 of the same base; the correct layout scores 0.954).
+    /// The scale/dmin sub-block index <c>e&gt;&gt;4</c> was and remains correct.</para>
     /// </summary>
     [SkipLocalsInit]
     internal static unsafe void DequantizeQ2_K(nint src, long elementCount, Span<float> dest)
@@ -238,15 +285,15 @@ public static unsafe partial class Dequantize
             byte* block = basePtr + sb * Q2_K_BlockBytes;
             byte* scales = block;          // 16 bytes
             byte* qs = block + 16;         // 64 bytes
-            float d = (float)Unsafe.ReadUnaligned<Half>(block + 80);
-            float dmin = (float)Unsafe.ReadUnaligned<Half>(block + 82);
+            float d = MatMul.HalfToSingle(block + 80);
+            float dmin = MatMul.HalfToSingle(block + 82);
 
             int outOffset = (int)(sb * KQuantGroupSize);
             for (int t = 0; t < KQuantGroupSize; t++)
             {
-                int sub = t >> 4;          // t / 16
-                int byteIdx = t >> 2;      // t / 4
-                int bitOff = (t & 0x3) << 1; // (t % 4) * 2
+                int sub = t >> 4;                        // t / 16 — scale sub-block
+                int byteIdx = ((t >> 7) << 5) | (t & 31); // 32*(t/128) + t%32
+                int bitOff = ((t >> 5) & 0x3) << 1;       // 2 * ((t/32) % 4)
                 int q2 = (qs[byteIdx] >> bitOff) & 0x3;
                 int scale = scales[sub] & 0xF;
                 int dmCoef = (scales[sub] >> 4) & 0xF;
@@ -287,7 +334,7 @@ public static unsafe partial class Dequantize
         long numBlocks = elementCount / KQuantGroupSize;
         byte* blockBase = (byte*)src;
         long destOffset = 0;
-        Span<byte> scales = stackalloc byte[16];
+        byte* scales = stackalloc byte[16];
 
         for (long b = 0; b < numBlocks; b++)
         {
@@ -295,28 +342,9 @@ public static unsafe partial class Dequantize
             byte* qs = blockBase + 32;               // [64 bytes]
             byte* scales12 = blockBase + 32 + 64;    // [12 bytes]
             ushort dHalf = *(ushort*)(blockBase + 32 + 64 + 12);
-            float d = (float)BitConverter.UInt16BitsToHalf(dHalf);
+            float d = MatMul.HalfToSingle(dHalf);
 
-            // Unpack 12 bytes → 16 unsigned 6-bit scales (then biased by -32).
-            // Per llama.cpp ggml-quants.c dequantize_row_q3_K (the `aux` shuffle):
-            //   scales[ 0+b] = (s[  b] & 0xF) | (((s[8+b] >> 0) & 3) << 4)
-            //   scales[ 4+b] = (s[4+b] & 0xF) | (((s[8+b] >> 2) & 3) << 4)
-            //   scales[ 8+b] = (s[  b] >> 4)  | (((s[8+b] >> 4) & 3) << 4)
-            //   scales[12+b] = (s[4+b] >> 4)  | (((s[8+b] >> 6) & 3) << 4)   for b in 0..3
-            // i.e. the low nibble comes from bytes 0..7 (low nibble for sub 0..7,
-            // high nibble for sub 8..15) and the high 2 bits come from
-            // byte 8 + (sub % 4) at shift 2 * (sub / 4). The byte/shift pair is
-            // TRANSPOSED relative to the obvious-looking 8 + sub/4 @ (sub%4)*2 —
-            // getting it the wrong way round scrambles 12 of the 16 sub-blocks.
-            for (int sub = 0; sub < 16; sub++)
-            {
-                int lowSrcByte = sub < 8 ? sub : sub - 8;  // sub 8..15 → bytes 0..7 high nibble
-                int lowNibble = sub < 8 ? scales12[lowSrcByte] & 0x0F : (scales12[lowSrcByte] >> 4) & 0x0F;
-                int hiByte = 8 + (sub % 4);
-                int hiShift = (sub / 4) * 2;
-                int hiBits = (scales12[hiByte] >> hiShift) & 0x03;
-                scales[sub] = (byte)(lowNibble | (hiBits << 4));
-            }
+            UnpackQ3KScales(scales12, scales);
 
             // 16 sub-blocks × 16 elements = 256 elements per super-block.
             //
@@ -386,8 +414,8 @@ public static unsafe partial class Dequantize
 
         for (long b = 0; b < blockCount; b++)
         {
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockBase);
-            float dmin = (float)Unsafe.ReadUnaligned<Half>(blockBase + 2);
+            float d = MatMul.HalfToSingle(blockBase);
+            float dmin = MatMul.HalfToSingle(blockBase + 2);
             UnpackQ4Q5Scales(blockBase + 4, scBuf, mnBuf);
             byte* qs = blockBase + 16;
 
@@ -430,8 +458,8 @@ public static unsafe partial class Dequantize
 
             for (long b = 0; b < blockCount; b++)
             {
-                float d = (float)Unsafe.ReadUnaligned<Half>(blockBase);
-                float dmin = (float)Unsafe.ReadUnaligned<Half>(blockBase + 2);
+                float d = MatMul.HalfToSingle(blockBase);
+                float dmin = MatMul.HalfToSingle(blockBase + 2);
                 UnpackQ4Q5Scales(blockBase + 4, scBuf, mnBuf);
                 byte* qs = blockBase + 16;
 
@@ -514,8 +542,8 @@ public static unsafe partial class Dequantize
 
         for (long b = 0; b < blockCount; b++)
         {
-            float d = (float)Unsafe.ReadUnaligned<Half>(blockBase);
-            float dmin = (float)Unsafe.ReadUnaligned<Half>(blockBase + 2);
+            float d = MatMul.HalfToSingle(blockBase);
+            float dmin = MatMul.HalfToSingle(blockBase + 2);
             UnpackQ4Q5Scales(blockBase + 4, scBuf, mnBuf);
             byte* qh = blockBase + 16;
             byte* qs = blockBase + 48;
@@ -562,8 +590,8 @@ public static unsafe partial class Dequantize
 
             for (long b = 0; b < blockCount; b++)
             {
-                float d = (float)Unsafe.ReadUnaligned<Half>(blockBase);
-                float dmin = (float)Unsafe.ReadUnaligned<Half>(blockBase + 2);
+                float d = MatMul.HalfToSingle(blockBase);
+                float dmin = MatMul.HalfToSingle(blockBase + 2);
                 UnpackQ4Q5Scales(blockBase + 4, scBuf, mnBuf);
                 byte* qh = blockBase + 16;
                 byte* qs = blockBase + 48;

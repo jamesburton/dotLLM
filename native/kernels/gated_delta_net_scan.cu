@@ -394,6 +394,151 @@ extern "C" __global__ void __launch_bounds__(128) gdn_scan_step_f32(
     output_t[(size_t)vh * d_state + col] = out_col * scale;
 }
 
+// ─── Multi-token scan, state in registers (issue #1222) ──────────────────────
+// gdn_scan_step_f32 above re-reads and re-writes the whole [d_state, d_state] head state from
+// global memory in 4 passes per token, and the host launches it once per token — a 512-token
+// prefill is 512 launches per GDN layer, each streaming the layer's full state. This variant
+// runs ALL seq_len tokens in one launch: thread `col` loads its state column into registers
+// once, steps through the tokens, and stores it once at the end.
+//
+// Bit-identical to seq_len launches of gdn_scan_step_f32: the same thread owns the same column,
+// every phase performs the same operations in the same row order (decay multiply, retrieve
+// sum over rows 0..127, delta, rank-1 write, read sum over rows 0..127, scale), and the TU is
+// built with -fmad=false, so nothing is contracted differently. Only where S lives changes.
+// d_state is fixed at 128 (the full unroll keeps the column in registers; Qwen3.5/3.6/Bonsai
+// all use 128) — callers keep the per-token kernel for any other size.
+//
+// Layout per token t (row-major, contiguous tokens):
+//   q, k : [seq_len, n_k_head, 128]    v, out : [seq_len, n_v_head, 128]
+//   g, beta : [seq_len, n_v_head]
+// write_state == 0 (#1194 read-only speculative verify): emit the outputs but leave `state` untouched;
+// the accepted rows are replayed into it afterwards by gdn_scan_replay_f32_d128 (src == state).
+#define GDN_MT_DSTATE 128
+extern "C" __global__ void __launch_bounds__(GDN_MT_DSTATE) gdn_scan_multi_f32(
+    float* __restrict__ state,
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ g,
+    const float* __restrict__ beta,
+    float* __restrict__ output,
+    const int n_v_head, const int n_k_head, const int seq_len, const int write_state)
+{
+    const int vh = blockIdx.x;
+    if (vh >= n_v_head) return;
+    const int col = threadIdx.x;
+    const int kh = vh % n_k_head;   // TILED head broadcast, as in gdn_scan_step_f32
+    const size_t kDim = (size_t)n_k_head * GDN_MT_DSTATE;
+    const size_t vDim = (size_t)n_v_head * GDN_MT_DSTATE;
+
+    float* S = state + (size_t)vh * GDN_MT_DSTATE * GDN_MT_DSTATE;
+    float s[GDN_MT_DSTATE];
+    #pragma unroll
+    for (int row = 0; row < GDN_MT_DSTATE; row++)
+        s[row] = S[row * GDN_MT_DSTATE + col];
+
+    __shared__ float k_shared[GDN_MT_DSTATE];
+    __shared__ float q_shared[GDN_MT_DSTATE];
+    const float scale = 1.0f / sqrtf((float)GDN_MT_DSTATE);
+
+    for (int t = 0; t < seq_len; t++)
+    {
+        __syncthreads();   // the previous token's readers are done with k_shared / q_shared
+        k_shared[col] = k[t * kDim + (size_t)kh * GDN_MT_DSTATE + col];
+        q_shared[col] = q[t * kDim + (size_t)kh * GDN_MT_DSTATE + col];
+        const float g_vh = g[(size_t)t * n_v_head + vh];
+        const float beta_vh = beta[(size_t)t * n_v_head + vh];
+        const float v_col = v[t * vDim + (size_t)vh * GDN_MT_DSTATE + col];
+        __syncthreads();
+
+        float tmp_col = 0.0f;
+        #pragma unroll
+        for (int row = 0; row < GDN_MT_DSTATE; row++)
+        {
+            s[row] *= g_vh;
+            tmp_col += s[row] * k_shared[row];
+        }
+        tmp_col = beta_vh * (v_col - tmp_col);
+        // Re-read k_shared below instead of keeping all 128 values live across both loops
+        // (that CSE pushes the kernel past 255 registers and into spills).
+        asm volatile("" ::: "memory");
+
+        float out_col = 0.0f;
+        #pragma unroll
+        for (int row = 0; row < GDN_MT_DSTATE; row++)
+        {
+            s[row] += k_shared[row] * tmp_col;
+            out_col += s[row] * q_shared[row];
+        }
+        output[t * vDim + (size_t)vh * GDN_MT_DSTATE + col] = out_col * scale;
+    }
+
+    if (!write_state) return;
+    #pragma unroll
+    for (int row = 0; row < GDN_MT_DSTATE; row++)
+        S[row * GDN_MT_DSTATE + col] = s[row];
+}
+
+// ─── Replay of recorded rows (issue #1194) ─────────────────────────────────
+// Rebuilds the state after `rows` tokens from the state before them (read from `src`, written to
+// `state`; they may alias), for a speculative verify's
+// rollback: the verify keeps one pre-verify state and each row's k / v / g / beta instead of a
+// full state per row. The result is BIT-IDENTICAL to `rows` launches of gdn_scan_step_f32 on the
+// same inputs: thread `col` performs exactly that kernel's operations on its own column (decay
+// multiply, retrieve sum in row order 0..D-1, delta, rank-1 write), compiled with the same
+// -fmad=false, so nothing is contracted or re-associated. The read-out (q, output) is skipped: it
+// never feeds back into the state. Unlike the step kernel the column stays in registers across
+// all rows, so the state is read and written once per replay instead of four times per row.
+//
+//   blockIdx.x = vh, blockDim.x = D (the column this thread owns), shared: k row [D]
+//   k [rows, n_k_head * D], v [rows, n_v_head * D], g / beta [rows, n_v_head], all row-major.
+extern "C" __global__ void __launch_bounds__(128) gdn_scan_replay_f32_d128(
+    float* state, const float* src, const float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ g, const float* __restrict__ beta,
+    const int rows, const int n_v_head, const int n_k_head)
+{
+    constexpr int D = 128;   // the column lives in registers, so the head size is compile-time
+    int vh = blockIdx.x;
+    int col = threadIdx.x;
+    int kh = vh % n_k_head;
+    float* S = state + (size_t)vh * D * D;
+    const float* S0 = src + (size_t)vh * D * D;   // the state before the rows (may be `state` itself)
+    extern __shared__ float smem[];
+    float* k_shared = smem;
+
+    float s[D];
+#pragma unroll
+    for (int row = 0; row < D; row++)
+        s[row] = S0[row * D + col];
+
+    for (int t = 0; t < rows; t++)
+    {
+        k_shared[col] = k[(size_t)t * n_k_head * D + (size_t)kh * D + col];
+        float g_vh = g[(size_t)t * n_v_head + vh];
+        float beta_vh = beta[(size_t)t * n_v_head + vh];
+        float v_col = v[(size_t)t * n_v_head * D + (size_t)vh * D + col];
+        __syncthreads();
+
+#pragma unroll
+        for (int row = 0; row < D; row++)
+            s[row] *= g_vh;
+        float tmp_col = 0.0f;
+#pragma unroll
+        for (int row = 0; row < D; row++)
+            tmp_col += s[row] * k_shared[row];
+        tmp_col = beta_vh * (v_col - tmp_col);
+#pragma unroll
+        for (int row = 0; row < D; row++)
+            s[row] += k_shared[row] * tmp_col;
+
+        __syncthreads();   // every thread has read k_shared before the next row overwrites it
+    }
+
+#pragma unroll
+    for (int row = 0; row < D; row++)
+        S[row * D + col] = s[row];
+}
+
 // ─── L2 normalize per head ──────────────────────────────────────────────────
 // Mirrors DotLLM.Cpu.Kernels.GatedDeltaNetScan.L2NormalizeHeads exactly.
 // Layout: x is treated as `total_heads` contiguous head vectors of `d_state`

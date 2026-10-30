@@ -321,4 +321,110 @@ public class JinjaParserTests
         Assert.Equal("default", filter.FilterName);
         Assert.Single(filter.Args);
     }
+
+    // ── Tuple literals (#409) ──
+    //
+    // Jinja2/Python semantics: parentheses containing a comma-separated expression list
+    // form a tuple; a lone comma after a single item ("(a,)") is significant and still makes
+    // a tuple, while a comma-free "(a)" is plain grouping and must NOT become a tuple.
+
+    [Fact]
+    public void ParenGrouping_SingleExpression_NoTrailingComma_IsNotATuple()
+    {
+        // "(a)" must parse identically to "a" — no ListExpr wrapper. This is the case a
+        // naive "any parens with a comma-splittable body" implementation gets wrong.
+        var grouped = Parse("{{ (x) }}");
+        var groupedOutput = Assert.IsType<ExpressionOutputNode>(grouped.Nodes[0]);
+        Assert.IsType<IdentifierExpr>(groupedOutput.Expression);
+
+        var plain = Parse("{{ x }}");
+        var plainOutput = Assert.IsType<ExpressionOutputNode>(plain.Nodes[0]);
+        Assert.Equal(
+            ((IdentifierExpr)plainOutput.Expression).Name,
+            ((IdentifierExpr)groupedOutput.Expression).Name);
+    }
+
+    [Fact]
+    public void ParenGrouping_ArithmeticPrecedence_StillWorks()
+    {
+        // "(a)" grouping must still compose normally with surrounding operators.
+        var ast = Parse("{{ (1 + 2) * 3 }}");
+        var output = Assert.IsType<ExpressionOutputNode>(ast.Nodes[0]);
+        var binary = Assert.IsType<BinaryExpr>(output.Expression);
+        Assert.Equal(BinaryOp.Multiply, binary.Op);
+        Assert.IsType<BinaryExpr>(binary.Left); // the "(1 + 2)" grouping, unwrapped
+    }
+
+    [Fact]
+    public void TupleLiteral_OneElementWithTrailingComma_IsAOneElementTuple()
+    {
+        // "(a,)" — the trailing comma is significant: distinct from plain "(a)" grouping.
+        var ast = Parse("{{ (x,) }}");
+        var output = Assert.IsType<ExpressionOutputNode>(ast.Nodes[0]);
+        var tuple = Assert.IsType<ListExpr>(output.Expression);
+        Assert.Single(tuple.Items);
+        Assert.IsType<IdentifierExpr>(tuple.Items[0]);
+    }
+
+    [Fact]
+    public void TupleLiteral_MultipleElements()
+    {
+        var ast = Parse("{{ ('xhigh', 'medium', 'low') }}");
+        var output = Assert.IsType<ExpressionOutputNode>(ast.Nodes[0]);
+        var tuple = Assert.IsType<ListExpr>(output.Expression);
+        Assert.Equal(3, tuple.Items.Count);
+        Assert.Equal("xhigh", ((LiteralExpr)tuple.Items[0]).Value);
+        Assert.Equal("medium", ((LiteralExpr)tuple.Items[1]).Value);
+        Assert.Equal("low", ((LiteralExpr)tuple.Items[2]).Value);
+    }
+
+    [Fact]
+    public void TupleLiteral_TrailingCommaAfterMultipleElements_IsLegal()
+    {
+        var ast = Parse("{{ (1, 2, 3,) }}");
+        var output = Assert.IsType<ExpressionOutputNode>(ast.Nodes[0]);
+        var tuple = Assert.IsType<ListExpr>(output.Expression);
+        Assert.Equal(3, tuple.Items.Count);
+    }
+
+    [Fact]
+    public void TupleLiteral_Empty()
+    {
+        var ast = Parse("{{ () }}");
+        var output = Assert.IsType<ExpressionOutputNode>(ast.Nodes[0]);
+        var tuple = Assert.IsType<ListExpr>(output.Expression);
+        Assert.Empty(tuple.Items);
+    }
+
+    [Fact]
+    public void TupleLiteral_NotIn_TrueBranch()
+    {
+        // The literal construct from Qwen3.8-27B's chat_template.jinja line 48.
+        var ast = Parse(
+            "{%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') -%}yes{%- endif -%}");
+        var ifNode = Assert.IsType<IfNode>(ast.Nodes[0]);
+        var condition = ifNode.Branches[0].Condition;
+        var unary = Assert.IsType<UnaryExpr>(condition);
+        Assert.Equal(UnaryOp.Not, unary.Op);
+        var binary = Assert.IsType<BinaryExpr>(unary.Operand);
+        Assert.Equal(BinaryOp.In, binary.Op);
+        var tuple = Assert.IsType<ListExpr>(binary.Right);
+        Assert.Equal(3, tuple.Items.Count);
+    }
+
+    [Fact]
+    public void TupleLiteral_In_EvaluatesTrueWhenMember()
+    {
+        var ast = Parse("{%- if effort in ('xhigh', 'medium', 'low') -%}matched{%- else -%}unmatched{%- endif -%}");
+        var evaluator = new JinjaEvaluator(new Dictionary<string, object?> { ["effort"] = "medium" });
+        Assert.Equal("matched", evaluator.Evaluate(ast));
+    }
+
+    [Fact]
+    public void TupleLiteral_NotIn_EvaluatesTrueWhenNotMember()
+    {
+        var ast = Parse("{%- if effort not in ('xhigh', 'medium', 'low') -%}matched{%- else -%}unmatched{%- endif -%}");
+        var evaluator = new JinjaEvaluator(new Dictionary<string, object?> { ["effort"] = "auto" });
+        Assert.Equal("matched", evaluator.Evaluate(ast));
+    }
 }

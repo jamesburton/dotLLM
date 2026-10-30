@@ -25,6 +25,11 @@ public sealed class NaiveAttentionStrategy : IAttentionStrategy
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// False: this strategy takes contiguous K/V tensors. Paged caches are read in place by
+    /// <see cref="Kernels.Attention.Execute(float*, Core.Attention.IPagedKvCache, int, float*, int, int, int, int, int, float, Threading.ComputeThreadPool?, int?, float, float[])"/>,
+    /// which the CPU forward pass calls directly (#1268).
+    /// </remarks>
     public bool SupportsPagedKvCache => false;
 
     /// <inheritdoc/>

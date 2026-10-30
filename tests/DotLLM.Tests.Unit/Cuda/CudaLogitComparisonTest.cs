@@ -6,6 +6,7 @@ using DotLLM.Cuda;
 using DotLLM.Engine.KvCache;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -32,9 +33,7 @@ public class CudaLogitComparisonTest
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
 
-        string modelPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", ggufFile);
+        string modelPath = TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", [ggufFile], null).Path ?? "";
         string? ggufPath = File.Exists(modelPath) ? modelPath : null;
         Skip.If(ggufPath == null, $"{ggufFile} not found (run: dotllm run QuantFactory/SmolLM-135M-GGUF)");
 

@@ -7,7 +7,7 @@ namespace DotLLM.Cuda;
 /// Loads all PTX kernel modules and provides typed launch methods for each kernel.
 /// Arguments are marshaled as pointer arrays for <see cref="CudaDriverApi.cuLaunchKernel"/>.
 /// </summary>
-public sealed unsafe class CudaKernels : IDisposable
+public sealed unsafe partial class CudaKernels : IDisposable
 {
     private const int BlockSize = 256;
 
@@ -106,6 +106,46 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _turboquantEncodeF32Func;
     private readonly nint _turboquantDequantF16Func;
     private readonly nint _turboquantEncodeF16Func;
+
+    // PrismML Hadamard activation transform (hadamard_fwht.ptx) — optional module. The CUDA twin
+    // of the Vulkan hadamard_fwht_f32 shader and DotLLM.Cpu.Kernels.Hadamard (issue #479). 0 when
+    // the PTX is absent/stale; Hadamard-folded checkpoints then refuse to load on CUDA.
+    private readonly CudaModule? _hadamardFwhtModule;
+    private readonly nint _hadamardFwhtF32Func;
+    private readonly nint _hadamardFwht1024F32Func;   // #1222: blockSize == 1024 fast path
+
+    // Small-S multi-column PQ2_0 GEMV (pq2_0_gemv_multi.ptx) — optional module (issue #482). One
+    // exact-width entry point per S = 1..8; index 0 unused. All zero when the PTX is absent, stale or
+    // fails to JIT: HasPQ2_0GemvMulti then reports false and seqLen 2..8 PQ2_0 projections keep the
+    // dequant+cuBLAS path.
+    private readonly CudaModule? _pq2_0GemvMultiModule;
+    private readonly nint[] _pq2_0GemvMultiFuncs = new nint[Pq2_0GemvMultiMaxColumns + 1];
+    private readonly string? _pq2_0GemvMultiUnavailableReason;
+    private readonly bool _hasPQ2_0GemvMulti;   // cached: read on every seqLen 2..8 PQ2_0 projection
+
+    // PQ2_0 GEMV v2 — int8 activations + dp4a (pq2_0_gemv_dp4a.ptx), optional module (issue #485).
+    // One activation quantizer plus one exact-width GEMV entry point per S = 1..8 (index 0 unused).
+    // All zero when the PTX is absent, stale or fails to JIT: HasPQ2_0GemvDp4a then reports false and
+    // the #482 / single-column paths stay in charge.
+    private readonly CudaModule? _pq2_0GemvDp4aModule;
+    private readonly nint _pq2_0Dp4aQuantizeFunc;
+    private readonly nint[] _pq2_0GemvDp4aFuncs = new nint[Pq2_0GemvMultiMaxColumns + 1];
+    private readonly string? _pq2_0GemvDp4aUnavailableReason;
+    private readonly bool _hasPQ2_0GemvDp4a;   // cached: read on every dp4a-eligible PQ2_0 projection
+
+    // Packed PQ2_0 PREFILL GEMM (pq2_0_mmq_dp4a.ptx) — optional module (issue #490). Two tile
+    // instantiations over the same body; consumes #485's quantizer output unchanged. All zero when
+    // the PTX is absent, stale or fails to JIT: HasPQ2_0MmqDp4a then reports false and PQ2_0
+    // projections wider than the GEMV keep the dequant-to-F16 + cuBLAS path.
+    private readonly CudaModule? _pq2_0MmqDp4aModule;
+    private readonly nint _pq2_0MmqDp4aBn32Func;
+    private readonly nint _pq2_0MmqDp4aBn16Func;
+    private readonly string? _pq2_0MmqDp4aUnavailableReason;
+    private readonly bool _hasPQ2_0MmqDp4a;   // cached: read on every prefill-width PQ2_0 projection
+    // int8 tensor-core tile of the same GEMM (pq2_0_mmq_mma.ptx, issue #1222): compute_86 PTX, so it
+    // only loads on sm_80+; absent, the 64-column tile falls back to the dp4a 32-column one.
+    private readonly CudaModule? _pq2_0MmqMmaModule;
+    private readonly nint _pq2_0MmqMmaFunc;
     private readonly nint _quantizedGemvQ2_KMmqPreqFunc;
     private readonly nint _quantizedGemvQ4_KMmqPreqFunc;
     private readonly nint _quantizedGemvQ5_KMmqPreqFunc;
@@ -118,6 +158,9 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _quantizedGemvQ6_KMmvqLargePreqFunc;
     private readonly nint _quantizedGemvIQ4_NLMmvqLargePreqFunc;
     private readonly nint _quantizedGemvIQ4_XSMmvqLargePreqFunc;
+    private readonly nint _quantizedGemvQ8_0MmvqLargePreqFunc;
+    private readonly nint _quantizedGemvQ4_KMmvqRows4PreqFunc;
+    private readonly nint _quantizedGemvQ6_KMmvqRows4PreqFunc;
     // Batched-M dp4a MMQ prefill kernel (issue #349) — DESIGNED to amortize weight reads
     // across MMQ_BATCH_M_TILE(2) prefill tokens per block via L1/L2 cache reuse (see
     // native/kernels/quantized_gemv_mmq.cu for the kernel body), but measured 2x-51x
@@ -288,6 +331,17 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _dequantMXFP4Func;
     private readonly nint _dequantMXFP4F32Func;
 
+    // NVFP4 (nvfp4.ptx) — issue #1038: dequant to F16/F32, the F32 decode GEMV with the per-tensor
+    // X.scale, and the in-place scale applied after the dequant + cuBLAS prefill GEMM.
+    private readonly CudaModule? _nvfp4Module;
+    private readonly nint _dequantNVFP4Func;
+    private readonly nint _dequantNVFP4F32Func;
+    private readonly nint _nvfp4GemvF32Func;
+    private readonly nint _scaleF32InplaceFunc;
+
+    // NVFP4 dp4a decode GEMV on int8 activations (#1061).
+    private readonly nint _nvfp4GemvQ8Func;
+
     private readonly CudaModule? _quantKvModule;
     private readonly nint _quantKvQ8_0Func;
     private readonly nint _quantKvQ4_0Func;
@@ -316,6 +370,7 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _kvWriteOneF16RingFunc;
     private readonly nint _kvDequantQ8_0DynFunc;
     private readonly nint _kvDequantQ4_0DynFunc;
+    private readonly nint _kvDequantQ4_0Func;
     private readonly nint _kvWindowToScratchDynFunc;
 
     // Fused decode-step RoPE + KV-cache write. Replaces three eager launches per
@@ -391,6 +446,23 @@ public sealed unsafe class CudaKernels : IDisposable
     // projection. Optional — PTX may be missing on stale builds; HasMoeGroupedGemv
     // reports false and CudaMoeFfn falls back to the per-expert path.
     private readonly CudaModule? _moeGroupedGemvModule;
+
+    // Q4_1 in-place kernels (q4_1_gemv.cu, #1172): dense GEMV / multi-token GEMM (F16 and F32 activations) and the MoE
+    // grouped GEMV. Optional module; every entry is 0 on a stale PTX tree and the callers keep their old paths.
+    private readonly CudaModule? _q4_1Module;
+    private readonly nint _quantizedGemvQ4_1Func;
+    private readonly nint _quantizedGemmQ4_1F16Func;
+    private readonly nint _quantizedGemvQ4_1F32Func;
+    private readonly nint _quantizedGemmQ4_1F32Func;
+    private readonly nint _moeGroupedGemvQ4_1Func;
+    private readonly nint _moeGroupedGemvQ4_1F32XeFunc;
+    private readonly nint _moeWeightedRowsSumF32Func;
+    private readonly nint _moeCombineBucketedF32Func;
+    private readonly nint _moeAddF16F32Func;
+    private readonly nint _moeBuildGroupedPtrsFunc;
+    private readonly nint _moeSigmoidTopkF32Func;
+    private readonly nint _moePow2RescaleRowsF32Func;
+    private readonly nint _moeScaleRowsF32Func;
     private readonly nint _moeGroupedGemvQ2_KFunc;
     private readonly nint _moeGroupedGemvQ4_KFunc;
     private readonly nint _moeGroupedGemvQ5_KFunc;
@@ -426,7 +498,9 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _gdnConv1dCausalDecodeF32Func;
     private readonly CudaModule? _gdnScanF32Module;
     private readonly nint _gdnScanStepF32Func;
+    private readonly nint _gdnScanReplayF32D128Func;   // issue #1194
     private readonly nint _gdnScanStepF32CoopSplit4Func;
+    private readonly nint _gdnScanMultiF32Func;   // #1222
     private int _gdnScanCoopSplit4MaxCoResidentGrid = -1; // -1 = not yet queried
     private readonly CudaModule? _l2NormHeadsF32Module;
     private readonly nint _l2NormHeadsF32Func;
@@ -511,17 +585,136 @@ public sealed unsafe class CudaKernels : IDisposable
     // PTX, Ampere-only (mma.sync is sm_80+).
     private readonly CudaModule? _attentionMmaDecodeGqaSplitModule;
     private readonly nint _attentionMmaDecodeGqaSplitFunc;
+
+    // Quantized-KV fused-dequant variants of the mma decode kernel (issue #956), indexed by
+    // KvqIndex(kDtype, vDtype): 0 = q8q8, 1 = q4q4, 2 = q8q4, 3 = q4q8. Best-effort load: absent
+    // PTX or a pre-Ampere driver leaves them 0 and callers fall back to dequant-into-scratch.
+    // Tensor-core flash-style PREFILL attention for head_dim 256 reading the F16 KV cache directly
+    // (issue #962 -- native/kernels/attention_flash_mma_prefill_hd256.cu). Best-effort load,
+    // Ampere-only; absent/unloadable leaves the func 0 and callers fall back to attention_f32.
+    private readonly CudaModule? _attentionFlashPrefillHd256Module;
+    private readonly nint _attentionFlashPrefillHd256Func;
+
+    // Quantized-KV variants of the flash prefill kernel above (issue #1094 --
+    // native/kernels/attention_flash_mma_prefill_hd256_kvq.cu): Q8_0/Q4_0 K/V blocks are
+    // dequantized inside the tile load, so prefill needs no full-history F16 scratch. Indexed by
+    // KvqIndex (0 = q8q8, 1 = q4q4, 2 = q8q4, 3 = q4q8); same best-effort load as the F16 kernel.
+    private readonly CudaModule? _attentionFlashPrefillHd256KvqModule;
+    private readonly nint[] _attentionFlashPrefillHd256KvqFuncs = new nint[4];
+
+    private readonly CudaModule? _attentionMmaDecodeKvqModule;
+    private readonly nint[] _attentionMmaDecodeKvqFuncs = new nint[4];
+    private readonly int[] _attentionMmaDecodeKvqMaxCoResident = { -1, -1, -1, -1 };
     private int _attnMmaDecodeGqaSplitMaxCoResidentGrid = -1; // -1 = not yet queried
     private int _attnMmaDecodeGqaSplitCachedGroup = -1;        // group the cached query above is valid for
 
+    // Issue #988: v2 (warp-independent, register-resident) decode kernels living in the same PTX
+    // modules as the v1 kernels above. v1 stays loaded as the DOTLLM_ATTN_MMA_DECODE_V2=0 fallback.
+    private nint _attentionMmaDecodeGqaSplitV2Func;
+    private readonly nint[] _attentionMmaDecodeKvqV2Funcs = new nint[4];
+    private readonly int[] _attentionMmaDecodeKvqV2MaxCoResident = { -1, -1, -1, -1 };
+    private int _attnMmaDecodeGqaSplitV2MaxCoResidentGrid = -1;
+
+    /// <summary>
+    /// Issue #988: selects the v2 mma decode kernels (default ON; <c>DOTLLM_ATTN_MMA_DECODE_V2=0</c>
+    /// opts back out to v1). Mutable so tests/benchmarks can A/B within one process; the
+    /// per-function co-residency ceilings are cached separately so toggling is safe.
+    /// </summary>
+    public static bool MmaDecodeV2Enabled =
+        Environment.GetEnvironmentVariable("DOTLLM_ATTN_MMA_DECODE_V2") != "0";
+
+    private bool UseMmaDecodeV2 => MmaDecodeV2Enabled && _attentionMmaDecodeGqaSplitV2Func != 0;
+    private nint ActiveMmaDecodeFunc => UseMmaDecodeV2 ? _attentionMmaDecodeGqaSplitV2Func : _attentionMmaDecodeGqaSplitFunc;
+    private bool UseMmaDecodeKvqV2(int idx) => MmaDecodeV2Enabled && _attentionMmaDecodeKvqV2Funcs[idx] != 0;
+
+
+    /// <summary>
+    /// The directory this instance loaded its PTX from — lets an optional, separately-owned kernel
+    /// module (e.g. <see cref="CudaQ8_0StagedGemv"/>) resolve its file next to the rest.
+    /// </summary>
+    internal string PtxDirectory { get; }
+
+    /// <summary>
+    /// Every PTX file the <see cref="CudaKernels(string)"/> constructor loads <b>unconditionally</b>
+    /// (i.e. via a bare <c>CudaModule.LoadFromFile</c>, not behind a <c>File.Exists</c> guard).
+    /// A missing entry aborts construction, so these are exactly the files whose absence makes a
+    /// CUDA model load impossible.
+    /// </summary>
+    /// <remarks>
+    /// Kept in sync with the constructor by <c>CudaKernelsRequiredPtxListTests</c>, which parses
+    /// the constructor body and asserts set equality — the list is a pre-flight mirror, not a
+    /// second source of truth.
+    /// </remarks>
+    public static readonly IReadOnlyList<string> RequiredPtxFiles =
+    [
+        "rmsnorm.ptx", "rope.ptx", "swiglu.ptx", "add.ptx", "softmax.ptx", "embedding.ptx",
+        "attention.ptx", "kv_cache_update.ptx", "bias_add.ptx", "per_head_rmsnorm.ptx",
+        "convert.ptx", "dequant.ptx", "quantized_gemv.ptx", "fused_add_rmsnorm.ptx",
+        "rmsnorm_f32in.ptx", "add_f32.ptx", "embedding_f32out.ptx", "rope_f32.ptx",
+        "attention_f32.ptx", "swiglu_f32.ptx", "bias_add_f32.ptx", "per_head_rmsnorm_f32.ptx",
+        "rmsnorm_f32.ptx", "quantized_gemv_f32in.ptx", "i2_s_gemv.ptx", "dequant_i2_s.ptx",
+        "pq2_0_gemv.ptx", "dequant_pq2_0.ptx", "pq2_0_repack.ptx", "relu2.ptx", "relu2_f32.ptx",
+        "relu2_glu_rmsnorm.ptx", "fused_add_rmsnorm_f32res.ptx", "nemotron_moe.ptx",
+    ];
+
+    /// <summary>
+    /// Resolves <paramref name="ptxDir"/> (null =&gt; <c>AppContext.BaseDirectory/ptx</c>) and
+    /// verifies the PTX deployment is complete, <b>without touching CUDA</b>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Issue #484. Every CUDA model factory follows the order
+    /// <c>CudaContext.Create</c> → <c>CudaStream.Create</c> → <c>cublasCreate</c> →
+    /// <c>new CudaKernels(ptxDir)</c>, so a bad or incomplete PTX directory used to throw only
+    /// <i>after</i> a context, stream and cuBLAS handle already existed on the device. #383 added
+    /// catch-blocks that dispose that trio, but "allocate three device-backed handles, then throw,
+    /// then unwind" is a failure path that has to be re-proven correct at every one of the twelve
+    /// factory call sites and on every driver.
+    /// </para>
+    /// <para>
+    /// Calling this <b>before</b> <c>CudaContext.Create</c> makes the whole class of failure
+    /// structurally impossible instead: a misconfigured PTX deployment — by far the most common
+    /// way these factories throw — now fails with zero CUDA resources ever allocated, so there is
+    /// nothing to leak whatever the unwind path does.
+    /// </para>
+    /// </remarks>
+    /// <param name="ptxDir">Directory containing compiled .ptx files, or null to auto-detect.</param>
+    /// <returns>The resolved, validated PTX directory to hand to <see cref="CudaKernels(string)"/>.</returns>
+    /// <exception cref="DirectoryNotFoundException">The resolved directory does not exist.</exception>
+    /// <exception cref="FileNotFoundException">The directory exists but is missing a required PTX file.</exception>
+    public static string ResolveAndValidatePtxDirectory(string? ptxDir)
+    {
+        ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
+
+        if (!Directory.Exists(ptxDir))
+            throw new DirectoryNotFoundException(
+                $"CUDA PTX directory not found: '{ptxDir}'. Build the native PTX targets or pass an explicit ptxDir.");
+
+        foreach (string required in RequiredPtxFiles)
+        {
+            string path = Path.Combine(ptxDir, required);
+            if (!File.Exists(path))
+                throw new FileNotFoundException(
+                    $"CUDA PTX directory '{ptxDir}' is incomplete: required kernel module '{required}' is missing. "
+                    + "Rebuild the native PTX targets.",
+                    path);
+        }
+
+        return ptxDir;
+    }
 
     /// <summary>
     /// Loads all PTX modules from the specified directory.
     /// </summary>
+    /// <remarks>
+    /// Callers that create CUDA resources before this point must run
+    /// <see cref="ResolveAndValidatePtxDirectory"/> first — see its remarks (issue #484).
+    /// </remarks>
     /// <param name="ptxDir">Directory containing compiled .ptx files.</param>
     public CudaKernels(string ptxDir)
     {
-        _rmsnormModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "rmsnorm.ptx"));
+        PtxDirectory = ptxDir;
+        _rmsnormModule =CudaModule.LoadFromFile(Path.Combine(ptxDir, "rmsnorm.ptx"));
         _ropeModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "rope.ptx"));
         _swigluModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "swiglu.ptx"));
         _addModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "add.ptx"));
@@ -563,6 +756,8 @@ public sealed unsafe class CudaKernels : IDisposable
         _relu2F32Module = CudaModule.LoadFromFile(Path.Combine(ptxDir, "relu2_f32.ptx"));
         _relu2GluRmsNormModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "relu2_glu_rmsnorm.ptx"));
         _fusedAddRmsNormF32ResModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "fused_add_rmsnorm_f32res.ptx"));
+        _nemotronMoeModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "nemotron_moe.ptx"));
+        LoadNemotronMoeFunctions();
 
         // Query the device's opt-in dynamic shared-memory cap ONCE, unconditionally (not gated
         // on the optional MMQ PTX below) — the always-loaded I2_S GEMV kernels need it too (see
@@ -616,6 +811,9 @@ public sealed unsafe class CudaKernels : IDisposable
             _quantizedGemvQ6_KMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmvq_large_preq");
             _quantizedGemvIQ4_NLMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_iq4_nl_mmvq_large_preq");
             _quantizedGemvIQ4_XSMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_iq4_xs_mmvq_large_preq");
+            _quantizedGemvQ8_0MmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q8_0_mmvq_large_preq");
+            _quantizedGemvQ4_KMmvqRows4PreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q4_k_mmvq_rows4_preq");
+            _quantizedGemvQ6_KMmvqRows4PreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmvq_rows4_preq");
             // Batched-M prefill kernel (issue #349) — TryGetFunction so a stale PTX
             // without the new symbol still loads; HasMmqBatchedQ4K reports false.
             _quantizedGemvQ4_KMmqBatchedFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q4_k_mmq_batched");
@@ -662,6 +860,106 @@ public sealed unsafe class CudaKernels : IDisposable
             _turboquantEncodeF32Func = _turboquantModule.TryGetFunction("turboquant_encode_f32");
             _turboquantDequantF16Func = _turboquantModule.TryGetFunction("turboquant_dequant_f16");
             _turboquantEncodeF16Func = _turboquantModule.TryGetFunction("turboquant_encode_f16");
+        }
+
+        string hadamardFwhtPath = Path.Combine(ptxDir, "hadamard_fwht.ptx");
+        if (File.Exists(hadamardFwhtPath))
+        {
+            _hadamardFwhtModule = CudaModule.LoadFromFile(hadamardFwhtPath);
+            _hadamardFwhtF32Func = _hadamardFwhtModule.TryGetFunction("hadamard_fwht_f32");
+            _hadamardFwht1024F32Func = _hadamardFwhtModule.TryGetFunction("hadamard_fwht1024_f32");
+        }
+
+        string pq2_0GemvMultiPath = Path.Combine(ptxDir, "pq2_0_gemv_multi.ptx");
+        if (File.Exists(pq2_0GemvMultiPath))
+        {
+            try
+            {
+                _pq2_0GemvMultiModule = CudaModule.LoadFromFile(pq2_0GemvMultiPath);
+                for (int s = 1; s <= Pq2_0GemvMultiMaxColumns; s++)
+                    _pq2_0GemvMultiFuncs[s] = _pq2_0GemvMultiModule.TryGetFunction($"pq2_0_gemv_multi_f16x_f32y_{s}");
+                _hasPQ2_0GemvMulti = AllPQ2_0GemvMultiFuncsLoaded();
+                if (!_hasPQ2_0GemvMulti)
+                    _pq2_0GemvMultiUnavailableReason =
+                        "pq2_0_gemv_multi.ptx is stale (missing a pq2_0_gemv_multi_f16x_f32y_{1..8} entry point)";
+            }
+            catch (CudaException ex)
+            {
+                Array.Clear(_pq2_0GemvMultiFuncs);
+                _hasPQ2_0GemvMulti = false;
+                _pq2_0GemvMultiUnavailableReason = $"pq2_0_gemv_multi.ptx failed to load: {ex.Message}";
+            }
+        }
+        else
+        {
+            _pq2_0GemvMultiUnavailableReason = $"pq2_0_gemv_multi.ptx not found in {ptxDir}";
+        }
+
+        string pq2_0GemvDp4aPath = Path.Combine(ptxDir, "pq2_0_gemv_dp4a.ptx");
+        if (File.Exists(pq2_0GemvDp4aPath))
+        {
+            try
+            {
+                _pq2_0GemvDp4aModule = CudaModule.LoadFromFile(pq2_0GemvDp4aPath);
+                _pq2_0Dp4aQuantizeFunc = _pq2_0GemvDp4aModule.TryGetFunction("pq2_0_dp4a_quantize_x");
+                for (int s = 1; s <= Pq2_0GemvMultiMaxColumns; s++)
+                    _pq2_0GemvDp4aFuncs[s] = _pq2_0GemvDp4aModule.TryGetFunction($"pq2_0_gemv_dp4a_f32y_{s}");
+                _hasPQ2_0GemvDp4a = AllPQ2_0GemvDp4aFuncsLoaded();
+                if (!_hasPQ2_0GemvDp4a)
+                    _pq2_0GemvDp4aUnavailableReason =
+                        "pq2_0_gemv_dp4a.ptx is stale (missing pq2_0_dp4a_quantize_x or a pq2_0_gemv_dp4a_f32y_{1..8} entry point)";
+            }
+            catch (CudaException ex)
+            {
+                Array.Clear(_pq2_0GemvDp4aFuncs);
+                _pq2_0Dp4aQuantizeFunc = 0;
+                _hasPQ2_0GemvDp4a = false;
+                _pq2_0GemvDp4aUnavailableReason = $"pq2_0_gemv_dp4a.ptx failed to load: {ex.Message}";
+            }
+        }
+        else
+        {
+            _pq2_0GemvDp4aUnavailableReason = $"pq2_0_gemv_dp4a.ptx not found in {ptxDir}";
+        }
+
+        string pq2_0MmqDp4aPath = Path.Combine(ptxDir, "pq2_0_mmq_dp4a.ptx");
+        if (File.Exists(pq2_0MmqDp4aPath))
+        {
+            try
+            {
+                _pq2_0MmqDp4aModule = CudaModule.LoadFromFile(pq2_0MmqDp4aPath);
+                _pq2_0MmqDp4aBn32Func = _pq2_0MmqDp4aModule.TryGetFunction("pq2_0_mmq_dp4a_f32y_bn32");
+                _pq2_0MmqDp4aBn16Func = _pq2_0MmqDp4aModule.TryGetFunction("pq2_0_mmq_dp4a_f32y_bn16");
+                _hasPQ2_0MmqDp4a = _pq2_0MmqDp4aBn32Func != 0 && _pq2_0MmqDp4aBn16Func != 0;
+                if (!_hasPQ2_0MmqDp4a)
+                    _pq2_0MmqDp4aUnavailableReason =
+                        "pq2_0_mmq_dp4a.ptx is stale (missing pq2_0_mmq_dp4a_f32y_bn32 or pq2_0_mmq_dp4a_f32y_bn16)";
+            }
+            catch (CudaException ex)
+            {
+                _pq2_0MmqDp4aBn32Func = 0;
+                _pq2_0MmqDp4aBn16Func = 0;
+                _hasPQ2_0MmqDp4a = false;
+                _pq2_0MmqDp4aUnavailableReason = $"pq2_0_mmq_dp4a.ptx failed to load: {ex.Message}";
+            }
+        }
+        else
+        {
+            _pq2_0MmqDp4aUnavailableReason = $"pq2_0_mmq_dp4a.ptx not found in {ptxDir}";
+        }
+
+        string pq2_0MmqMmaPath = Path.Combine(ptxDir, "pq2_0_mmq_mma.ptx");
+        if (File.Exists(pq2_0MmqMmaPath))
+        {
+            try
+            {
+                _pq2_0MmqMmaModule = CudaModule.LoadFromFile(pq2_0MmqMmaPath);
+                _pq2_0MmqMmaFunc = _pq2_0MmqMmaModule.TryGetFunction("pq2_0_mmq_mma_f32y");
+            }
+            catch (CudaException)
+            {
+                _pq2_0MmqMmaFunc = 0;   // pre-Ampere device: the compute_86 PTX does not JIT
+            }
         }
 
         _rmsnormFunc = _rmsnormModule.GetFunction("rmsnorm_f16");
@@ -848,6 +1146,18 @@ public sealed unsafe class CudaKernels : IDisposable
             _dequantMXFP4F32Func = _dequantBf16Mxfp4Module.TryGetFunction("dequant_mxfp4_f32");
         }
 
+        // NVFP4 — issue #1038.
+        string nvfp4Path = Path.Combine(ptxDir, "nvfp4.ptx");
+        if (File.Exists(nvfp4Path))
+        {
+            _nvfp4Module = CudaModule.LoadFromFile(nvfp4Path);
+            _dequantNVFP4Func = _nvfp4Module.TryGetFunction("dequant_nvfp4_f16");
+            _dequantNVFP4F32Func = _nvfp4Module.TryGetFunction("dequant_nvfp4_f32");
+            _nvfp4GemvF32Func = _nvfp4Module.TryGetFunction("nvfp4_gemv_f32");
+            _scaleF32InplaceFunc = _nvfp4Module.TryGetFunction("scale_f32_inplace");
+            _nvfp4GemvQ8Func = _nvfp4Module.TryGetFunction("nvfp4_gemv_q8");
+        }
+
         // KV-cache quantization (optional — PTX may not be compiled yet)
         string quantKvPath = Path.Combine(ptxDir, "quant_kv.ptx");
         if (File.Exists(quantKvPath))
@@ -868,6 +1178,7 @@ public sealed unsafe class CudaKernels : IDisposable
             _kvWriteOneF16RingFunc = _kvWriteModule.GetFunction("kv_write_one_f16_ring");
             _kvDequantQ8_0DynFunc = _kvWriteModule.GetFunction("kv_dequant_q8_0_dyn");
             _kvDequantQ4_0DynFunc = _kvWriteModule.GetFunction("kv_dequant_q4_0_dyn");
+            _kvDequantQ4_0Func = _kvWriteModule.TryGetFunction("kv_dequant_q4_0");
             _kvWindowToScratchDynFunc = _kvWriteModule.GetFunction("kv_window_to_scratch_dyn");
         }
 
@@ -928,6 +1239,13 @@ public sealed unsafe class CudaKernels : IDisposable
         {
             _moeFfnModule = CudaModule.LoadFromFile(moeFfnPath);
             _moeSoftmaxTopkF32Func = _moeFfnModule.TryGetFunction("moe_softmax_topk_f32");
+            _moeSigmoidTopkF32Func = _moeFfnModule.TryGetFunction("moe_sigmoid_topk_f32");
+            _moeWeightedRowsSumF32Func = _moeFfnModule.TryGetFunction("moe_weighted_rows_sum_f32");
+            _moeCombineBucketedF32Func = _moeFfnModule.TryGetFunction("moe_combine_bucketed_f32");
+            _moeAddF16F32Func = _moeFfnModule.TryGetFunction("moe_add_f16_f32");
+            _moeBuildGroupedPtrsFunc = _moeFfnModule.TryGetFunction("moe_build_grouped_ptrs");
+            _moePow2RescaleRowsF32Func = _moeFfnModule.TryGetFunction("moe_pow2_rescale_rows_f32");
+            _moeScaleRowsF32Func = _moeFfnModule.TryGetFunction("moe_scale_rows_f32");
             _moeRenormTopkF32Func = _moeFfnModule.TryGetFunction("moe_renorm_topk_f32");
             _moeZeroF32Func = _moeFfnModule.TryGetFunction("moe_zero_f32");
             _moeAxpyScaledRowF32Func = _moeFfnModule.TryGetFunction("moe_axpy_scaled_row_f32");
@@ -957,6 +1275,18 @@ public sealed unsafe class CudaKernels : IDisposable
             _moeGroupedGemvIQ4_XSFunc = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_iq4_xs_f16");
         }
 
+        string q4_1Path = Path.Combine(ptxDir, "q4_1_gemv.ptx");
+        if (File.Exists(q4_1Path))
+        {
+            _q4_1Module = CudaModule.LoadFromFile(q4_1Path);
+            _quantizedGemvQ4_1Func = _q4_1Module.TryGetFunction("quantized_gemv_q4_1");
+            _quantizedGemmQ4_1F16Func = _q4_1Module.TryGetFunction("quantized_gemm_q4_1_f16");
+            _quantizedGemvQ4_1F32Func = _q4_1Module.TryGetFunction("quantized_gemv_q4_1_f32");
+            _quantizedGemmQ4_1F32Func = _q4_1Module.TryGetFunction("quantized_gemm_q4_1_f32");
+            _moeGroupedGemvQ4_1Func = _q4_1Module.TryGetFunction("moe_grouped_gemv_q4_1_f16");
+            _moeGroupedGemvQ4_1F32XeFunc = _q4_1Module.TryGetFunction("moe_grouped_gemv_q4_1_f32_xe");
+        }
+
         // Qwen3MoeHybrid recurrence-path kernels (optional — present only when
         // the GDN/conv1d CUDA path has been built). Each .cu file compiles to
         // a separate .ptx; build_ptx.bat auto-globs native/kernels/*.cu so no
@@ -974,10 +1304,12 @@ public sealed unsafe class CudaKernels : IDisposable
         {
             _gdnScanF32Module = CudaModule.LoadFromFile(gdnScanF32Path);
             _gdnScanStepF32Func = _gdnScanF32Module.TryGetFunction("gdn_scan_step_f32");
+            _gdnScanReplayF32D128Func = _gdnScanF32Module.TryGetFunction("gdn_scan_replay_f32_d128");
             // Opt-in, default-off row-split cooperative-groups variant (issue #180) — see
             // gated_delta_net_scan.cu's header for the full measured-speedup-vs-bit-parity-
             // tradeoff writeup. TryGetFunction so a stale PTX (pre-#180) still loads gracefully.
             _gdnScanStepF32CoopSplit4Func = _gdnScanF32Module.TryGetFunction("gdn_scan_step_f32_coop_split4");
+            _gdnScanMultiF32Func = _gdnScanF32Module.TryGetFunction("gdn_scan_multi_f32");
             // The L2-norm and decay helpers live in the same .cu translation unit,
             // so they are in the same .ptx module — query each function pointer here.
             _l2NormHeadsF32Module = _gdnScanF32Module;
@@ -1118,12 +1450,96 @@ public sealed unsafe class CudaKernels : IDisposable
             {
                 var mmaDecodeGqaSplitModule = CudaModule.LoadFromFile(attentionMmaDecodeGqaSplitPath);
                 _attentionMmaDecodeGqaSplitFunc = mmaDecodeGqaSplitModule.TryGetFunction("attention_flash_mma_decode_gqa_split_f16");
+                _attentionMmaDecodeGqaSplitV2Func = mmaDecodeGqaSplitModule.TryGetFunction("attention_flash_mma_decode_gqa_split_f16_v2");
                 _attentionMmaDecodeGqaSplitModule = mmaDecodeGqaSplitModule;
             }
             catch (CudaException)
             {
                 _attentionMmaDecodeGqaSplitModule = null;
                 _attentionMmaDecodeGqaSplitFunc = 0;
+                _attentionMmaDecodeGqaSplitV2Func = 0;
+            }
+        }
+
+        string attentionMmaDecodeKvqPath = Path.Combine(ptxDir, "attention_flash_mma_decode_gqa_split_kvq.ptx");
+        if (File.Exists(attentionMmaDecodeKvqPath))
+        {
+            try
+            {
+                var kvqModule = CudaModule.LoadFromFile(attentionMmaDecodeKvqPath);
+                string[] names =
+                {
+                    "attention_flash_mma_decode_gqa_split_kvq_q8q8",
+                    "attention_flash_mma_decode_gqa_split_kvq_q4q4",
+                    "attention_flash_mma_decode_gqa_split_kvq_q8q4",
+                    "attention_flash_mma_decode_gqa_split_kvq_q4q8",
+                };
+                for (int i = 0; i < names.Length; i++)
+                {
+                    _attentionMmaDecodeKvqFuncs[i] = kvqModule.TryGetFunction(names[i]);
+                    _attentionMmaDecodeKvqV2Funcs[i] = kvqModule.TryGetFunction(
+                        names[i].Replace("_kvq_", "_kvq_v2_"));
+                }
+                _attentionMmaDecodeKvqModule = kvqModule;
+            }
+            catch (CudaException)
+            {
+                _attentionMmaDecodeKvqModule = null;
+                Array.Clear(_attentionMmaDecodeKvqFuncs);
+                Array.Clear(_attentionMmaDecodeKvqV2Funcs);
+            }
+        }
+
+        // Flash-style tensor-core prefill attention, head_dim 256 (issue #962). Same best-effort
+        // pattern as the decode kernels above: mma.sync/cp.async PTX is sm_80+, so a pre-Ampere
+        // device (or stale PTX) throws CudaException at module load and the feature stays off.
+        string attentionFlashPrefillHd256Path = Path.Combine(ptxDir, "attention_flash_mma_prefill_hd256.ptx");
+        if (File.Exists(attentionFlashPrefillHd256Path))
+        {
+            try
+            {
+                var m = CudaModule.LoadFromFile(attentionFlashPrefillHd256Path);
+                nint f = m.TryGetFunction("attention_flash_mma_prefill_hd256_f16");
+                if (f != 0)
+                    SetMaxDynamicSharedBytes(f, AttentionFlashPrefillHd256MaxSmemBytes);
+                _attentionFlashPrefillHd256Func = f;
+                _attentionFlashPrefillHd256Module = m;
+            }
+            catch (CudaException)
+            {
+                _attentionFlashPrefillHd256Module = null;
+                _attentionFlashPrefillHd256Func = 0;
+            }
+        }
+
+        // Quantized-KV flash prefill (issue #1094): same arch, geometry and shared-memory budget
+        // as the F16 kernel, so the same opt-in cap applies to every entry.
+        string attentionFlashPrefillHd256KvqPath = Path.Combine(ptxDir, "attention_flash_mma_prefill_hd256_kvq.ptx");
+        if (File.Exists(attentionFlashPrefillHd256KvqPath))
+        {
+            try
+            {
+                var m = CudaModule.LoadFromFile(attentionFlashPrefillHd256KvqPath);
+                string[] names =
+                {
+                    "attention_flash_mma_prefill_hd256_kvq_q8q8",
+                    "attention_flash_mma_prefill_hd256_kvq_q4q4",
+                    "attention_flash_mma_prefill_hd256_kvq_q8q4",
+                    "attention_flash_mma_prefill_hd256_kvq_q4q8",
+                };
+                for (int i = 0; i < names.Length; i++)
+                {
+                    nint f = m.TryGetFunction(names[i]);
+                    if (f != 0)
+                        SetMaxDynamicSharedBytes(f, AttentionFlashPrefillHd256MaxSmemBytes);
+                    _attentionFlashPrefillHd256KvqFuncs[i] = f;
+                }
+                _attentionFlashPrefillHd256KvqModule = m;
+            }
+            catch (CudaException)
+            {
+                _attentionFlashPrefillHd256KvqModule = null;
+                Array.Clear(_attentionFlashPrefillHd256KvqFuncs);
             }
         }
     }
@@ -1139,6 +1555,131 @@ public sealed unsafe class CudaKernels : IDisposable
         && _scaleInplaceF32Func != 0 && _rmsnormWeightlessF32Func != 0
         && _softcapInplaceF32Func != 0 && _moeRenormTopkClampedF32Func != 0
         && _quantizeActQ8_0RoundtripF32Func != 0;
+
+    /// <summary>
+    /// True when the head_dim-256 tensor-core flash prefill kernel (issue #962,
+    /// <c>attention_flash_mma_prefill_hd256.ptx</c>) is loaded on this device.
+    /// </summary>
+    public bool HasAttentionFlashPrefillHd256 => _attentionFlashPrefillHd256Func != 0;
+
+    /// <summary>Largest dynamic shared memory the flash prefill hd256 kernel is opted into (99 KB sm_86 cap).</summary>
+    public const int AttentionFlashPrefillHd256MaxSmemBytes = 99 * 1024;
+
+    /// <summary>KV rows per pipeline stage the kernel was compiled with -- MUST match <c>KV_TILE</c> in the .cu.</summary>
+    public const int AttentionFlashPrefillHd256KvTile = 16;
+
+    /// <summary>Double-buffered K/V stages -- MUST match <c>NBUF</c> in the .cu.</summary>
+    public const int AttentionFlashPrefillHd256NumBuf = 2;
+
+    /// <summary>
+    /// Opt-out gate: <c>DOTLLM_ATTN_FLASH_PREFILL_HD256=0</c> forces the attention_f32 prefill
+    /// path. Read once; default ON (issue #962).
+    /// </summary>
+    public static readonly bool EnableAttentionFlashPrefillHd256 =
+        Environment.GetEnvironmentVariable("DOTLLM_ATTN_FLASH_PREFILL_HD256") != "0";
+
+    /// <summary>Dynamic shared memory the kernel needs for a GQA <paramref name="group"/>.</summary>
+    public static int AttentionFlashPrefillHd256SmemBytes(int group)
+        => (group * 16 * (256 + 8) + AttentionFlashPrefillHd256NumBuf * 2 * AttentionFlashPrefillHd256KvTile * (256 + 8)) * 2;
+
+    /// <summary>
+    /// Pure shape check for <see cref="LaunchAttentionFlashPrefillHd256"/>: head_dim 256, real GQA
+    /// (numKvHeads &lt; numHeads, evenly divisible), group &lt;= 8 and the shared-memory footprint fits
+    /// the opt-in cap. Does not check whether the kernel is loaded.
+    /// </summary>
+    public static bool IsAttentionFlashPrefillHd256Shape(int numHeads, int numKvHeads, int headDim)
+    {
+        if (headDim != 256 || numKvHeads <= 0 || numKvHeads >= numHeads || numHeads % numKvHeads != 0) return false;
+        int group = numHeads / numKvHeads;
+        return group <= 8 && AttentionFlashPrefillHd256SmemBytes(group) <= AttentionFlashPrefillHd256MaxSmemBytes;
+    }
+
+    /// <summary>
+    /// Flash-style tensor-core causal prefill attention (issue #962). <paramref name="q"/> is F16
+    /// <c>[seqQ, numHeads*256]</c>, <paramref name="k"/>/<paramref name="v"/> are the F16 KV history
+    /// <c>[seqKv, numKvHeads*256]</c>, <paramref name="output"/> is F32 <c>[seqQ, numHeads*256]</c> --
+    /// the same output contract as <see cref="LaunchAttentionF32"/>. Query row i attends keys
+    /// <c>0..positionOffset+i</c>. <paramref name="scale"/> 0 means <c>1/sqrt(256)</c>.
+    /// </summary>
+    public void LaunchAttentionFlashPrefillHd256(nint q, nint k, nint v, nint output,
+        int seqQ, int seqKv, int numHeads, int numKvHeads, int positionOffset, nint stream,
+        float scale = 0f)
+    {
+        if (_attentionFlashPrefillHd256Func == 0)
+            throw new InvalidOperationException("attention_flash_mma_prefill_hd256 kernel is not loaded.");
+        LaunchAttentionFlashPrefillHd256Core(_attentionFlashPrefillHd256Func, q, k, v, output,
+            seqQ, seqKv, numHeads, numKvHeads, positionOffset, stream, scale);
+    }
+
+    /// <summary>
+    /// True when the quantized-KV flash prefill kernel (issue #1094,
+    /// <c>attention_flash_mma_prefill_hd256_kvq.ptx</c>) for this K/V format pair is loaded.
+    /// Supported pairs: every combination of <see cref="KvCacheDType.Q8_0"/> and <see cref="KvCacheDType.Q4_0"/>.
+    /// </summary>
+    /// <param name="k">K cache element format.</param>
+    /// <param name="v">V cache element format.</param>
+    /// <returns><see langword="true"/> when <see cref="LaunchAttentionFlashPrefillHd256Kvq"/> can run this pair.</returns>
+    public bool HasAttentionFlashPrefillHd256Kvq(KvCacheDType k, KvCacheDType v)
+    {
+        int i = KvqIndex(k, v);
+        return i >= 0 && _attentionFlashPrefillHd256KvqFuncs[i] != 0;
+    }
+
+    /// <summary>
+    /// <see cref="LaunchAttentionFlashPrefillHd256"/> reading the KV history straight from KV-format
+    /// Q8_0 / Q4_0 blocks (issue #1094): each K/V tile is dequantized into the kernel's shared
+    /// memory as it is loaded, so no full-history F16 scratch is needed. Same grid, block, shared
+    /// memory and output contract as the F16 kernel; bit-identical to
+    /// <see cref="LaunchKvDequantToF16"/> into scratch followed by the F16 kernel.
+    /// </summary>
+    /// <param name="q">F16 queries <c>[seqQ, numHeads*256]</c>.</param>
+    /// <param name="k">Raw K blocks, logical layout <c>[seqKv, numKvHeads*256]</c> in <paramref name="kDtype"/>.</param>
+    /// <param name="v">Raw V blocks, logical layout <c>[seqKv, numKvHeads*256]</c> in <paramref name="vDtype"/>.</param>
+    /// <param name="kDtype">K block format (Q8_0 or Q4_0).</param>
+    /// <param name="vDtype">V block format (Q8_0 or Q4_0).</param>
+    /// <param name="output">F32 output <c>[seqQ, numHeads*256]</c>.</param>
+    /// <param name="seqQ">Query rows.</param>
+    /// <param name="seqKv">KV rows (history including the query rows).</param>
+    /// <param name="numHeads">Query heads.</param>
+    /// <param name="numKvHeads">KV heads.</param>
+    /// <param name="positionOffset">Absolute position of query row 0.</param>
+    /// <param name="stream">CUDA stream.</param>
+    /// <param name="scale">Softmax scale; 0 means <c>1/sqrt(256)</c>.</param>
+    /// <exception cref="InvalidOperationException">The kernel for this K/V pair is not loaded.</exception>
+    /// <exception cref="ArgumentException"><paramref name="k"/> or <paramref name="v"/> is not 16-byte aligned.</exception>
+    public void LaunchAttentionFlashPrefillHd256Kvq(nint q, nint k, nint v, KvCacheDType kDtype, KvCacheDType vDtype,
+        nint output, int seqQ, int seqKv, int numHeads, int numKvHeads, int positionOffset, nint stream,
+        float scale = 0f)
+    {
+        int idx = KvqIndex(kDtype, vDtype);
+        if (idx < 0 || _attentionFlashPrefillHd256KvqFuncs[idx] == 0)
+            throw new InvalidOperationException(
+                $"attention_flash_mma_prefill_hd256_kvq kernel for {kDtype}/{vDtype} is not loaded.");
+        // The kernel cp.async-copies whole raw KV rows (272 / 144 B, multiples of 16) in 16-byte chunks.
+        if (((k | v) & 15) != 0)
+            throw new ArgumentException("Quantized K/V base pointers must be 16-byte aligned.");
+        LaunchAttentionFlashPrefillHd256Core(_attentionFlashPrefillHd256KvqFuncs[idx], q, k, v, output,
+            seqQ, seqKv, numHeads, numKvHeads, positionOffset, stream, scale);
+    }
+
+    // Shared launch for the F16 and quantized-KV flash prefill entries: identical argument list,
+    // grid (q tiles x KV heads), block (one warp per GQA query head) and dynamic shared memory.
+    private static void LaunchAttentionFlashPrefillHd256Core(nint func, nint q, nint k, nint v, nint output,
+        int seqQ, int seqKv, int numHeads, int numKvHeads, int positionOffset, nint stream, float scale)
+    {
+        DotLLM.Core.Attention.AttentionSpanInvariant.AssertTight(seqKv, positionOffset, seqQ, "CUDA");
+
+        int group = numHeads / numKvHeads;
+        nint qArg = q, kArg = k, vArg = v, oArg = output;
+        int sqArg = seqQ, skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, poArg = positionOffset;
+        float scArg = scale > 0f ? scale : 1f / MathF.Sqrt(256f);
+
+        void** args = stackalloc void*[] { &qArg, &kArg, &vArg, &oArg, &sqArg, &skvArg, &nhArg, &nkvArg, &poArg, &scArg };
+        uint gridX = (uint)((seqQ + 15) / 16);
+        CudaDriverApi.cuLaunchKernel(func,
+                gridX, (uint)numKvHeads, 1, (uint)(group * 32), 1, 1,
+                (uint)AttentionFlashPrefillHd256SmemBytes(group), stream, (nint)args, 0).ThrowOnError();
+    }
 
     /// <summary>
     /// True when the hand-fused mma.sync flash-attention prefill kernel is loaded
@@ -1441,8 +1982,17 @@ public sealed unsafe class CudaKernels : IDisposable
         QuantizationType.Q8_0 => HasMoeGroupedGemvQ8_0,
         QuantizationType.IQ4_NL => HasMoeGroupedGemvIQ4_NL,
         QuantizationType.IQ4_XS => HasMoeGroupedGemvIQ4_XS,
+        QuantizationType.Q4_1 => !DisableQuantizedGemv && _moeGroupedGemvQ4_1Func != 0,
         _ => false,
     };
+
+    /// <summary>
+    /// K alignment <see cref="LaunchMoeGroupedGemv"/> requires for <paramref name="qt"/>: 32 for Q4_1 (whose kernel
+    /// walks 32-element blocks), 256 for every other grouped type (the shared K-quant gate).
+    /// </summary>
+    /// <param name="qt">Expert weight quantization type.</param>
+    /// <returns>The required divisor of K.</returns>
+    public static int MoeGroupedGemvKAlignment(QuantizationType qt) => qt == QuantizationType.Q4_1 ? 32 : 256;
 
     /// <summary>
     /// Opt a kernel into >48 KB dynamic shared memory (up to the device's optin cap).
@@ -1479,15 +2029,17 @@ public sealed unsafe class CudaKernels : IDisposable
     /// Allocates dynamic shared memory: <c>(hiddenSize + 32) * sizeof(float)</c> per block.
     /// hiddenSize rounded up to even is the FP32 sum cache; the trailing 32 floats are warp-reduce scratch (also stores rms_inv).
     /// For hidden=576 (SmolLM-135M), this is 2432 bytes — well within the SM86 default 48 KB budget.
+    /// The sum is <c>residual * residualScale + x * xScale</c>: both are 1 except on a power-of-two scaled residual stream (#1191).
     /// </remarks>
     public void LaunchFusedAddRmsNorm(nint residual, nint x, nint weight, nint output,
-                                        int hiddenSize, float eps, int rows, nint stream)
+                                        int hiddenSize, float eps, int rows, nint stream,
+                                        float residualScale = 1f, float xScale = 1f)
     {
         nint resArg = residual, xArg = x, wArg = weight, outArg = output;
         int nArg = hiddenSize;
-        float epsArg = eps;
+        float epsArg = eps, rScaleArg = residualScale, xScaleArg = xScale;
 
-        void** args = stackalloc void*[] {&resArg, &xArg, &wArg, &outArg, &nArg, &epsArg};
+        void** args = stackalloc void*[] {&resArg, &xArg, &wArg, &outArg, &nArg, &epsArg, &rScaleArg, &xScaleArg};
         // Shared memory: n floats (sum cache, padded to even) + 32 floats (warp scratch)
         uint sharedBytes = (uint)((((hiddenSize + 1) & ~1) + 32) * sizeof(float));
         CudaDriverApi.cuLaunchKernel(_fusedAddRmsNormFunc,
@@ -2226,11 +2778,21 @@ public sealed unsafe class CudaKernels : IDisposable
     /// for the standard <c>ropeDim/2</c> (Qwen3 / NemotronH / Llama — matches CPU
     /// <c>RoPE.Execute</c>); pass <c>headDim/2</c> for Gemma-4 partial global layers (matches CPU
     /// <c>RoPE.ApplyRotationNeoXPartial</c>).
+    /// <para>
+    /// <paramref name="ropeInvFreq"/> / <paramref name="ropeMscale"/> carry the dense-YaRN
+    /// scaling (#366): a device buffer of <c>ropeDim/2</c> floats holding the ramped
+    /// inverse frequencies produced by <c>RoPE.ComputeYarnInverseFrequencies</c>, plus the
+    /// cos/sin multiplier from <c>RoPEConfig.ComputeYarnMscaleMultiplier</c>. The defaults
+    /// (<c>0</c> / <c>1.0f</c>) select the kernel's original in-kernel
+    /// <c>powf(theta, ...)</c> and are bit-identical to the pre-#366 behaviour. When
+    /// <paramref name="ropeInvFreq"/> is non-zero it supersedes <paramref name="freqDim"/>.
+    /// </para>
     /// </summary>
     public void LaunchRoPEF32(nint q, nint k, nint positions,
                                 int seqLen, int numHeads, int numKvHeads, int headDim,
                                 int ropeDim, float theta, int ropeType, nint stream,
-                                int freqDim = 0, int neoxPairOffset = 0)
+                                int freqDim = 0, int neoxPairOffset = 0,
+                                nint ropeInvFreq = 0, float ropeMscale = 1.0f)
     {
         nint qArg = q, kArg = k, posArg = positions;
         int slArg = seqLen, nhArg = numHeads, nkvArg = numKvHeads;
@@ -2238,9 +2800,12 @@ public sealed unsafe class CudaKernels : IDisposable
         int fdArg = freqDim; // 0 ⇒ kernel falls back to rope_dim
         int npoArg = neoxPairOffset; // 0 ⇒ kernel falls back to rope_dim/2 (standard)
         float thetaArg = theta;
+        nint invFreqArg = ropeInvFreq; // 0 ⇒ nullptr ⇒ in-kernel powf(theta, ...)
+        float mscaleArg = ropeMscale;
 
         void** args = stackalloc void*[] {&qArg, &kArg, &posArg, &slArg, &nhArg, &nkvArg,
-                        &hdArg, &rdArg, &thetaArg, &rtArg, &fdArg, &npoArg};
+                        &hdArg, &rdArg, &thetaArg, &rtArg, &fdArg, &npoArg,
+                        &invFreqArg, &mscaleArg};
 
         int halfRope = ropeDim / 2;
         int totalPairs = seqLen * Math.Max(numHeads, numKvHeads) * halfRope;
@@ -2251,20 +2816,55 @@ public sealed unsafe class CudaKernels : IDisposable
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
-    /// <summary>FP32 attention: Q/K/V/output all FP32.</summary>
+    /// <summary>
+    /// FP32 attention: Q/K/V/output all FP32.
+    /// </summary>
+    /// <param name="q">Device pointer to the query tensor, <c>[seqQ, numHeads, headDim]</c>.</param>
+    /// <param name="k">Device pointer to the cached keys, <c>[seqKv, numKvHeads, headDim]</c>.</param>
+    /// <param name="v">Device pointer to the cached values, <c>[seqKv, numKvHeads, headDim]</c>.</param>
+    /// <param name="output">Device pointer to the output, <c>[seqQ, numHeads, headDim]</c>. Overwritten.</param>
+    /// <param name="seqQ">Number of query positions in this launch.</param>
+    /// <param name="seqKv">Cached KV length (causal upper bound is <paramref name="positionOffset"/>).</param>
+    /// <param name="numHeads">Number of query attention heads.</param>
+    /// <param name="numKvHeads">Number of KV heads (GQA broadcast group = numHeads/numKvHeads).</param>
+    /// <param name="headDim">Per-head dimension.</param>
+    /// <param name="positionOffset">Position of the first query row (causal mask upper bound).</param>
+    /// <param name="slidingWindow">Sliding window size, or 0 for full causal attention.</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    /// <param name="sinks">
+    /// Optional device pointer to <c>numHeads</c> per-head gpt-oss sink logits (issue #365).
+    /// <c>0</c> (default) selects nullptr, disabling the sink — bit-identical to pre-#365
+    /// behaviour. When non-zero, the kernel folds each head's sink logit into that row's
+    /// softmax denominator (extra "no-op" attention slot that absorbs probability mass but
+    /// contributes no value vector), matching the CPU reference's
+    /// <see cref="DotLLM.Cpu.Kernels.Attention.SoftmaxRowWithSink"/> convention.
+    /// </param>
+    /// <param name="scoreScale">
+    /// Gemma <c>query_pre_attn_scalar</c> support: when &gt; 0 the kernel multiplies Q·K by this value
+    /// instead of <c>1/sqrt(headDim)</c>. <c>0</c> (default) keeps the historical scale.
+    /// </param>
+    /// <param name="attnSoftcap">
+    /// Gemma-2 attention-logit soft-cap: when &gt; 0 each (scaled) score becomes
+    /// <c>cap * tanh(score / cap)</c> before masking/softmax. <c>0</c> (default) = off.
+    /// </param>
     public void LaunchAttentionF32(nint q, nint k, nint v, nint output,
                                      int seqQ, int seqKv,
                                      int numHeads, int numKvHeads, int headDim,
-                                     int positionOffset, int slidingWindow, nint stream)
+                                     int positionOffset, int slidingWindow, nint stream,
+                                     nint sinks = 0, float scoreScale = 0f, float attnSoftcap = 0f)
     {
+        DotLLM.Core.Attention.AttentionSpanInvariant.AssertTight(seqKv, positionOffset, seqQ, "CUDA");
+
         nint qArg = q, kArg = k, vArg = v, outArg = output;
         int sqArg = seqQ, skvArg = seqKv;
         int nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
         int poArg = positionOffset, swArg = slidingWindow;
+        nint sinksArg = sinks; // 0 ⇒ nullptr ⇒ sink disabled (pre-#365 behaviour)
+        float scaleArg = scoreScale, capArg = attnSoftcap;
 
         void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
                         &sqArg, &skvArg, &nhArg, &nkvArg, &hdArg,
-                        &poArg, &swArg};
+                        &poArg, &swArg, &sinksArg, &scaleArg, &capArg};
 
         int numBlocks = seqQ * numHeads;
         // Tiled online softmax: q_shared[headDim] + score_tile[256] + out_accum[headDim] + warp_scratch[32]
@@ -2372,19 +2972,32 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <param name="partialSum">Scratch, <c>[numHeads, AttentionKvSplit]</c> floats.</param>
     /// <param name="partialOut">Scratch, <c>[numHeads, AttentionKvSplit, headDim]</c> floats.</param>
     /// <param name="stream">CUDA stream handle.</param>
+    /// <param name="sinks">
+    /// Optional device pointer to <c>numHeads</c> per-head gpt-oss sink logits (issue #365).
+    /// <c>0</c> (default) selects nullptr, disabling the sink — bit-identical to pre-#365
+    /// behaviour. When non-zero, the kernel folds each head's sink logit into that row's
+    /// softmax denominator (extra "no-op" attention slot that absorbs probability mass but
+    /// contributes no value vector), matching the CPU reference's
+    /// <see cref="DotLLM.Cpu.Kernels.Attention.SoftmaxRowWithSink"/> convention.
+    /// </param>
     public void LaunchAttentionF32SplitKv(nint q, nint k, nint v, nint output,
                                      int seqKv, int numHeads, int numKvHeads, int headDim,
                                      int positionOffset, int slidingWindow,
-                                     nint partialMax, nint partialSum, nint partialOut, nint stream)
+                                     nint partialMax, nint partialSum, nint partialOut, nint stream,
+                                     nint sinks = 0)
     {
+        // split-KV is decode-only, so seqQ is 1 by construction.
+        DotLLM.Core.Attention.AttentionSpanInvariant.AssertTight(seqKv, positionOffset, 1, "CUDA split-KV");
+
         nint qArg = q, kArg = k, vArg = v, outArg = output;
         int skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
         int poArg = positionOffset, swArg = slidingWindow;
         nint pmArg = partialMax, psArg = partialSum, poutArg = partialOut;
+        nint sinksArg = sinks; // 0 ⇒ nullptr ⇒ sink disabled (pre-#365 behaviour)
 
         void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
                         &skvArg, &nhArg, &nkvArg, &hdArg,
-                        &poArg, &swArg, &pmArg, &psArg, &poutArg};
+                        &poArg, &swArg, &pmArg, &psArg, &poutArg, &sinksArg};
 
         const int TileKv = 256;
         uint sharedBytes = (uint)((headDim + TileKv + headDim + 32) * sizeof(float));
@@ -2764,6 +3377,14 @@ public sealed unsafe class CudaKernels : IDisposable
     {
         if (_attentionMmaDecodeGqaSplitFunc == 0 || numKvHeads <= 0 || group <= 0) return 0;
 
+        if (UseMmaDecodeV2)
+        {
+            if (_attnMmaDecodeGqaSplitV2MaxCoResidentGrid < 0)
+                _attnMmaDecodeGqaSplitV2MaxCoResidentGrid = QueryCoResidentGrid(_attentionMmaDecodeGqaSplitV2Func);
+            return _attnMmaDecodeGqaSplitV2MaxCoResidentGrid <= 0
+                ? 0 : _attnMmaDecodeGqaSplitV2MaxCoResidentGrid / numKvHeads;
+        }
+
         if (_attnMmaDecodeGqaSplitMaxCoResidentGrid < 0 || _attnMmaDecodeGqaSplitCachedGroup != group)
         {
             CudaDriverApi.cuCtxGetDevice(out int device);
@@ -2788,6 +3409,47 @@ public sealed unsafe class CudaKernels : IDisposable
 
         if (_attnMmaDecodeGqaSplitMaxCoResidentGrid <= 0) return 0;
         return _attnMmaDecodeGqaSplitMaxCoResidentGrid / numKvHeads; // integer floor; 0 = unsafe at any split
+    }
+
+    private int QueryCoResidentGrid(nint func)
+    {
+        CudaDriverApi.cuCtxGetDevice(out int device);
+        CudaDriverApi.cuDeviceGetAttribute(out int coopSupported,
+            CudaDriverApi.CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH, device);
+        if (coopSupported == 0) return 0;
+        CudaDriverApi.cuDeviceGetAttribute(out int numSms,
+            CudaDriverApi.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
+        int rc = CudaDriverApi.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+            out int maxBlocksPerSm, func, AttentionMmaDecodeGqaSplitBlockSize, dynamicSMemSize: 0);
+        return rc == 0 ? numSms * maxBlocksPerSm : 0;
+    }
+
+    /// <summary>True when the v2 fused quantized-KV kernel for this K/V pair is loaded AND v2 is selected (issue #988).</summary>
+    public bool HasAttentionMmaDecodeKvqV2(KvCacheDType kDtype, KvCacheDType vDtype)
+    {
+        int i = KvqIndex(kDtype, vDtype);
+        return i >= 0 && UseMmaDecodeKvqV2(i);
+    }
+
+    /// <summary>True when the v2 decode kernel (issue #988) is loaded AND selected.</summary>
+    public bool MmaDecodeV2Active => UseMmaDecodeV2;
+
+    /// <summary>
+    /// Minimum KV rows per split for the v2 kernel (8 warps x 16-key tiles = 128 keys keeps every
+    /// warp busy). <c>DOTLLM_ATTN_MMA_V2_MIN_KV</c> overrides.
+    /// </summary>
+    private static readonly int MmaV2MinKvPerSplit = EnvIntOrDefault("DOTLLM_ATTN_MMA_V2_MIN_KV", 128);
+
+    /// <summary>
+    /// kvSplit for the v2 decode kernels: <c>clamp(ceil(seqKv / MmaV2MinKvPerSplit), 1, maxSafe)</c>.
+    /// v2 blocks are independent warp streams (no per-tile barrier), so the split only has to
+    /// fill the SMs, not hide sync latency like v1's heuristic assumes.
+    /// </summary>
+    public static int ComputeAttentionMmaV2KvSplit(int seqKv, int maxSafeSplit)
+    {
+        if (seqKv <= 0 || maxSafeSplit <= 0) return 1;
+        int byKv = (seqKv + MmaV2MinKvPerSplit - 1) / MmaV2MinKvPerSplit;
+        return Math.Max(1, Math.Min(byKv, maxSafeSplit));
     }
 
     /// <summary>
@@ -2824,11 +3486,97 @@ public sealed unsafe class CudaKernels : IDisposable
         void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
                         &skvArg, &nhArg, &nkvArg, &scArg, &ksArg, &pmArg, &psArg, &poutArg};
 
-        CudaDriverApi.cuLaunchCooperativeKernel(_attentionMmaDecodeGqaSplitFunc,
+        CudaDriverApi.cuLaunchCooperativeKernel(ActiveMmaDecodeFunc,
                 (uint)numKvHeads, (uint)kvSplit, 1, AttentionMmaDecodeGqaSplitBlockSize, 1, 1,
                 0, stream, (nint)args).ThrowOnError();
     }
 
+
+    private static int KvqIndex(KvCacheDType k, KvCacheDType v) => (k, v) switch
+    {
+        (KvCacheDType.Q8_0, KvCacheDType.Q8_0) => 0,
+        (KvCacheDType.Q4_0, KvCacheDType.Q4_0) => 1,
+        (KvCacheDType.Q8_0, KvCacheDType.Q4_0) => 2,
+        (KvCacheDType.Q4_0, KvCacheDType.Q8_0) => 3,
+        _ => -1,
+    };
+
+    /// <summary>True when the fused quantized-KV mma decode kernel for this K/V format pair is loaded (issue #956).</summary>
+    public bool HasAttentionMmaDecodeKvq(KvCacheDType kDtype, KvCacheDType vDtype)
+    {
+        int i = KvqIndex(kDtype, vDtype);
+        return i >= 0 && _attentionMmaDecodeKvqFuncs[i] != 0;
+    }
+
+    /// <summary>
+    /// Cooperative co-residency ceiling (max safe kvSplit) for the fused quantized-KV kernel, using ITS
+    /// OWN occupancy (its register count differs from the F16 kernel's). 0 = unsupported/unsafe.
+    /// </summary>
+    public int MaxSafeAttentionMmaDecodeKvq(int numKvHeads, KvCacheDType kDtype, KvCacheDType vDtype)
+    {
+        int idx = KvqIndex(kDtype, vDtype);
+        if (idx < 0 || _attentionMmaDecodeKvqFuncs[idx] == 0 || numKvHeads <= 0) return 0;
+
+        if (UseMmaDecodeKvqV2(idx))
+        {
+            if (_attentionMmaDecodeKvqV2MaxCoResident[idx] < 0)
+                _attentionMmaDecodeKvqV2MaxCoResident[idx] = QueryCoResidentGrid(_attentionMmaDecodeKvqV2Funcs[idx]);
+            int g2 = _attentionMmaDecodeKvqV2MaxCoResident[idx];
+            return g2 <= 0 ? 0 : g2 / numKvHeads;
+        }
+
+        if (_attentionMmaDecodeKvqMaxCoResident[idx] < 0)
+        {
+            CudaDriverApi.cuCtxGetDevice(out int device);
+            CudaDriverApi.cuDeviceGetAttribute(out int coopSupported,
+                CudaDriverApi.CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH, device);
+            if (coopSupported == 0)
+            {
+                _attentionMmaDecodeKvqMaxCoResident[idx] = 0;
+            }
+            else
+            {
+                CudaDriverApi.cuDeviceGetAttribute(out int numSms,
+                    CudaDriverApi.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
+                int rc = CudaDriverApi.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                    out int maxBlocksPerSm, _attentionMmaDecodeKvqFuncs[idx],
+                    AttentionMmaDecodeGqaSplitBlockSize, dynamicSMemSize: 0);
+                _attentionMmaDecodeKvqMaxCoResident[idx] = rc == 0 ? numSms * maxBlocksPerSm : 0;
+            }
+        }
+        int grid = _attentionMmaDecodeKvqMaxCoResident[idx];
+        return grid <= 0 ? 0 : grid / numKvHeads;
+    }
+
+    /// <summary>
+    /// Fused quantized-KV variant of <see cref="LaunchAttentionMmaDecodeGqaSplit"/> (issue #956):
+    /// <paramref name="k"/>/<paramref name="v"/> are KV-format Q8_0/Q4_0 block bytes
+    /// (<c>[seqKv, numKvHeads*headDim]</c> logical elements) read in-kernel, bit-identical to
+    /// dequantizing into F16 first. <paramref name="kvSplit"/> must be clamped to
+    /// <see cref="MaxSafeAttentionMmaDecodeKvq"/>.
+    /// </summary>
+    public void LaunchAttentionMmaDecodeGqaSplitKvq(nint q, nint k, nint v,
+        KvCacheDType kDtype, KvCacheDType vDtype, nint output,
+        int seqKv, int numHeads, int numKvHeads, int kvSplit,
+        nint partialMax, nint partialSum, nint partialOut, nint stream)
+    {
+        int idx = KvqIndex(kDtype, vDtype);
+        if (idx < 0 || _attentionMmaDecodeKvqFuncs[idx] == 0)
+            throw new InvalidOperationException($"Fused KV decode kernel for {kDtype}/{vDtype} is not loaded.");
+
+        nint qArg = q, kArg = k, vArg = v, outArg = output;
+        int skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, ksArg = kvSplit;
+        float scArg = 1.0f / MathF.Sqrt(AttentionMmaDecodeGqaSplitHeadDim);
+        nint pmArg = partialMax, psArg = partialSum, poutArg = partialOut;
+
+        void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
+                        &skvArg, &nhArg, &nkvArg, &scArg, &ksArg, &pmArg, &psArg, &poutArg};
+
+        nint kvqFunc = UseMmaDecodeKvqV2(idx) ? _attentionMmaDecodeKvqV2Funcs[idx] : _attentionMmaDecodeKvqFuncs[idx];
+        CudaDriverApi.cuLaunchCooperativeKernel(kvqFunc,
+                (uint)numKvHeads, (uint)kvSplit, 1, AttentionMmaDecodeGqaSplitBlockSize, 1, 1,
+                0, stream, (nint)args).ThrowOnError();
+    }
 
     /// <summary>FP32 SwiGLU: out = SiLU(gate) * up, all FP32.</summary>
     public void LaunchSwiGLUF32(nint gate, nint up, nint output,
@@ -3133,6 +3881,80 @@ public sealed unsafe class CudaKernels : IDisposable
 
         CudaDriverApi.cuLaunchKernel(_gdnConv1dCausalDecodeF32Func,
                 gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>True when <see cref="LaunchGdnScanReplayF32"/> is available (issue #1194; needs a PTX that has it).</summary>
+    public bool HasGdnScanReplayF32 => _gdnScanReplayF32D128Func != 0;
+
+    /// <summary>
+    /// Rebuilds the GDN state after <paramref name="rows"/> tokens from the state before them (issue #1194): bit-identical to
+    /// <paramref name="rows"/> launches of <see cref="LaunchGdnScanStepF32"/> on the same k / v / g / beta, minus the read-out, with
+    /// each column held in registers across the rows. <c>dState</c> must be 128.
+    /// </summary>
+    /// <param name="state">Device pointer, <c>[nVHead, 128, 128]</c> F32: receives the state after the rows.</param>
+    /// <param name="source">Device pointer to the state before the rows (same shape); may equal <paramref name="state"/>.</param>
+    /// <param name="k">Device pointer, <c>[rows, nKHead, 128]</c> L2-normalised keys.</param>
+    /// <param name="v">Device pointer, <c>[rows, nVHead, 128]</c> values.</param>
+    /// <param name="g">Device pointer, <c>[rows, nVHead]</c> decays.</param>
+    /// <param name="beta">Device pointer, <c>[rows, nVHead]</c> write gates.</param>
+    /// <param name="rows">Tokens to replay (&gt;= 1).</param>
+    /// <param name="nVHead">Value heads.</param>
+    /// <param name="nKHead">Key heads (value head <c>vh</c> uses key head <c>vh % nKHead</c>).</param>
+    /// <param name="dState">Per-head state dimension; only 128 is compiled.</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="dState"/> is not 128 or <paramref name="rows"/> is below 1.</exception>
+    public void LaunchGdnScanReplayF32(nint state, nint source, nint k, nint v, nint g, nint beta,
+                                       int rows, int nVHead, int nKHead, int dState, nint stream)
+    {
+        if (dState != 128) throw new ArgumentOutOfRangeException(nameof(dState), $"dState={dState}; only gdn_scan_replay_f32_d128 is compiled.");
+        if (rows < 1) throw new ArgumentOutOfRangeException(nameof(rows));
+        nint sArg = state, srcArg = source, kArg = k, vArg = v, gArg = g, bArg = beta;
+        int rowsArg = rows, nvArg = nVHead, nkArg = nKHead;
+        void** args = stackalloc void*[] { &sArg, &srcArg, &kArg, &vArg, &gArg, &bArg, &rowsArg, &nvArg, &nkArg };
+        CudaDriverApi.cuLaunchKernel(_gdnScanReplayF32D128Func,
+                (uint)nVHead, 1, 1, 128, 1, 1,
+                128 * sizeof(float), stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Whether <see cref="LaunchGdnScanMultiF32"/> can run a <paramref name="dState"/>-wide scan:
+    /// the kernel is loaded (a stale pre-#1222 PTX lacks it) and <paramref name="dState"/> is 128.
+    /// </summary>
+    /// <param name="dState">Per-head state dimension.</param>
+    /// <returns><see langword="true"/> when the multi-token kernel covers this shape.</returns>
+    public bool CanGdnScanMultiF32(int dState) => _gdnScanMultiF32Func != 0 && dState == 128;
+
+    /// <summary>
+    /// Gated DeltaNet recurrence over <paramref name="seqLen"/> contiguous tokens in ONE launch
+    /// (issue #1222). Each thread keeps its state column in registers for the whole sequence, so
+    /// the state is read and written once instead of four passes per token, and a prefill no longer
+    /// pays one launch per token. Bit-identical to <paramref name="seqLen"/> calls of
+    /// <see cref="LaunchGdnScanStepF32"/> on the same buffers.
+    /// </summary>
+    /// <param name="state">Device pointer to <c>[nVHead, 128, 128]</c> FP32 state, updated in place (read only when <paramref name="writeState"/> is false).</param>
+    /// <param name="q">Device pointer to <c>[seqLen, nKHead, 128]</c> L2-normalised queries.</param>
+    /// <param name="k">Device pointer to <c>[seqLen, nKHead, 128]</c> L2-normalised keys.</param>
+    /// <param name="v">Device pointer to <c>[seqLen, nVHead, 128]</c> values.</param>
+    /// <param name="g">Device pointer to <c>[seqLen, nVHead]</c> decay scalars.</param>
+    /// <param name="beta">Device pointer to <c>[seqLen, nVHead]</c> write gates.</param>
+    /// <param name="output">Device pointer to <c>[seqLen, nVHead, 128]</c> output, overwritten.</param>
+    /// <param name="nVHead">Number of value heads.</param>
+    /// <param name="nKHead">Number of key heads (tiled broadcast, <c>kh = vh % nKHead</c>).</param>
+    /// <param name="seqLen">Number of tokens.</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    /// <param name="writeState">
+    /// False (#1194 read-only speculative verify): emit the outputs but leave <paramref name="state"/> untouched; the accepted rows are
+    /// replayed into it afterwards with <see cref="LaunchGdnScanReplayF32"/>.
+    /// </param>
+    public void LaunchGdnScanMultiF32(nint state, nint q, nint k, nint v, nint g, nint beta, nint output,
+                                      int nVHead, int nKHead, int seqLen, nint stream, bool writeState = true)
+    {
+        nint sArg = state, qArg = q, kArg = k, vArg = v, gArg = g, bArg = beta, oArg = output;
+        int nvArg = nVHead, nkArg = nKHead, slArg = seqLen, wsArg = writeState ? 1 : 0;
+        void** args = stackalloc void*[] { &sArg, &qArg, &kArg, &vArg, &gArg, &bArg, &oArg, &nvArg, &nkArg, &slArg, &wsArg };
+        CudaDriverApi.cuLaunchKernel(_gdnScanMultiF32Func,
+                (uint)nVHead, 1, 1, 128, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
@@ -3827,18 +4649,26 @@ public sealed unsafe class CudaKernels : IDisposable
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
-    /// <summary>Rotary position embedding. In-place on Q and K.</summary>
+    /// <summary>
+    /// Rotary position embedding. In-place on Q and K.
+    /// <paramref name="ropeInvFreq"/> / <paramref name="ropeMscale"/> carry the dense-YaRN
+    /// scaling (#366) — see <see cref="LaunchRoPEF32"/> for the contract. The defaults
+    /// (<c>0</c> / <c>1.0f</c>) are bit-identical to the pre-#366 behaviour.
+    /// </summary>
     public void LaunchRoPE(nint q, nint k, nint positions,
                             int seqLen, int numHeads, int numKvHeads, int headDim,
-                            int ropeDim, float theta, int ropeType, nint stream)
+                            int ropeDim, float theta, int ropeType, nint stream,
+                            nint ropeInvFreq = 0, float ropeMscale = 1.0f)
     {
         nint qArg = q, kArg = k, posArg = positions;
         int slArg = seqLen, nhArg = numHeads, nkvArg = numKvHeads;
         int hdArg = headDim, rdArg = ropeDim, rtArg = ropeType;
         float thetaArg = theta;
+        nint invFreqArg = ropeInvFreq;
+        float mscaleArg = ropeMscale;
 
         void** args = stackalloc void*[] {&qArg, &kArg, &posArg, &slArg, &nhArg, &nkvArg,
-                        &hdArg, &rdArg, &thetaArg, &rtArg};
+                        &hdArg, &rdArg, &thetaArg, &rtArg, &invFreqArg, &mscaleArg};
 
         int halfRope = ropeDim / 2;
         int totalPairs = seqLen * Math.Max(numHeads, numKvHeads) * halfRope;
@@ -4051,20 +4881,29 @@ public sealed unsafe class CudaKernels : IDisposable
         _ => false,
     };
 
-    /// <summary>Naive scaled dot-product attention with causal mask and GQA.</summary>
+    /// <summary>
+    /// Naive scaled dot-product attention with causal mask and GQA.
+    /// <para>
+    /// <c>sinks</c> (issue #365): optional device pointer to gpt-oss per-head sink logits —
+    /// <b>F32</b>, <c>numHeads</c> elements, indexed by QUERY head. 0 ⇒ nullptr ⇒ sink disabled,
+    /// which is bit-identical to the pre-#365 kernel.
+    /// </para>
+    /// </summary>
     public void LaunchAttention(nint q, nint k, nint v, nint output,
                                  int seqQ, int seqKv,
                                  int numHeads, int numKvHeads, int headDim,
-                                 int positionOffset, int slidingWindow, nint stream)
+                                 int positionOffset, int slidingWindow, nint stream,
+                                 nint sinks = 0)
     {
         nint qArg = q, kArg = k, vArg = v, outArg = output;
         int sqArg = seqQ, skvArg = seqKv;
         int nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
         int poArg = positionOffset, swArg = slidingWindow;
+        nint sinksArg = sinks; // 0 ⇒ nullptr ⇒ sink disabled (pre-#365 behaviour)
 
         void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
                         &sqArg, &skvArg, &nhArg, &nkvArg, &hdArg,
-                        &poArg, &swArg};
+                        &poArg, &swArg, &sinksArg};
 
         int numBlocks = seqQ * numHeads;
         // Tiled online softmax: q_shared[headDim] + score_tile[256] + out_accum[headDim] + warp_scratch[32]
@@ -4088,7 +4927,8 @@ public sealed unsafe class CudaKernels : IDisposable
     public void LaunchAttentionDyn(nint q, nint k, nint v, nint output,
                                     int seqQ, nint seqKvPtr,
                                     int numHeads, int numKvHeads, int headDim,
-                                    nint positionOffsetPtr, int slidingWindow, nint stream)
+                                    nint positionOffsetPtr, int slidingWindow, nint stream,
+                                    nint sinks = 0)
     {
         nint qArg = q, kArg = k, vArg = v, outArg = output;
         int sqArg = seqQ;
@@ -4096,10 +4936,15 @@ public sealed unsafe class CudaKernels : IDisposable
         int nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
         nint poPtrArg = positionOffsetPtr;
         int swArg = slidingWindow;
+        // 0 ⇒ nullptr ⇒ sink disabled. Graph-safe: the sink buffer is a fixed per-layer
+        // allocation whose CONTENTS never change between decode steps, so baking this
+        // pointer into the captured graph is valid across every replay (unlike seqKv /
+        // positionOffset, which is exactly why those two are passed indirectly).
+        nint sinksArg = sinks;
 
         void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
                         &sqArg, &skvPtrArg, &nhArg, &nkvArg, &hdArg,
-                        &poPtrArg, &swArg};
+                        &poPtrArg, &swArg, &sinksArg};
 
         int numBlocks = seqQ * numHeads;
         const int TileKv = 256;
@@ -4301,6 +5146,41 @@ public sealed unsafe class CudaKernels : IDisposable
     }
 
     /// <summary>
+    /// Eager dequantization of a contiguous run of KV-format blocks (as written by
+    /// <see cref="LaunchQuantKv"/>) to FP16. KV Q4_0 packs ADJACENT PAIRS (low nibble = even
+    /// element), which differs from the GGUF weight layout <see cref="LaunchDequantToF16"/>
+    /// unpacks -- use this, not the generic weight dequant, for any KV-cache data (issue #956).
+    /// Q8_0 shares the weight layout and is forwarded to the generic kernel.
+    /// </summary>
+    public void LaunchKvDequantToF16(nint src, KvCacheDType dtype, nint dst, int totalElements, nint stream)
+    {
+        switch (dtype)
+        {
+            case KvCacheDType.Q8_0:
+                LaunchDequantToF16(src, QuantizationType.Q8_0, dst, totalElements, stream);
+                return;
+            case KvCacheDType.Q4_0:
+            {
+                if (_kvDequantQ4_0Func == 0)
+                    throw new InvalidOperationException(
+                        "kv_dequant_q4_0 not loaded (kv_write.ptx missing/stale). Rebuild native PTX.");
+                nint srcArg = src, dstArg = dst;
+                int totalBlocks = totalElements / 32;
+                int tbArg = totalBlocks;
+                void** args = stackalloc void*[] { &srcArg, &dstArg, &tbArg };
+                uint gridDim = (uint)Math.Min((totalBlocks + 7) / 8, MaxDequantGridSize);
+                if (gridDim == 0) gridDim = 1;
+                CudaDriverApi.cuLaunchKernel(_kvDequantQ4_0Func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+            default:
+                throw new NotSupportedException($"KV dequant not supported for {dtype}.");
+        }
+    }
+
+    /// <summary>
     /// Scatters the live FP16 window from a per-layer ring buffer into the FP16 attention
     /// scratch starting at row <c>max(0, posPtr[0] + 1 - windowSize)</c>. One CUDA block
     /// per ring slot — each block predicates on whether its slot is currently populated
@@ -4337,6 +5217,14 @@ public sealed unsafe class CudaKernels : IDisposable
     /// Q is rotated in place on <paramref name="qSrc"/>; K is rotated and the rotated row
     /// is written to <paramref name="kCacheBase"/><c> + cachePos * kvStride</c>; V is plain-copied
     /// to <paramref name="vCacheBase"/><c> + cachePos * kvStride</c>.
+    /// <para>
+    /// <paramref name="ropeInvFreq"/> / <paramref name="ropeMscale"/> carry the dense-YaRN
+    /// scaling (#366) — see <see cref="LaunchRoPEF32"/> for the contract. This launcher is
+    /// the one that matters most for YaRN: decode takes it by default, so leaving it
+    /// unscaled would mis-rotate every generated token. Both values are model constants,
+    /// so baking them into a captured CUDA graph is safe (the per-step values — positions
+    /// and cache row — are already read from device memory by the Dyn variant).
+    /// </para>
     /// </summary>
     public void LaunchFusedRopeKvWriteF16(
         nint qSrc, nint kSrc, nint vSrc,
@@ -4344,7 +5232,7 @@ public sealed unsafe class CudaKernels : IDisposable
         nint positionsDevice, int cachePos,
         int numHeads, int numKvHeads, int headDim,
         int ropeDim, int kvStride, float theta, int ropeType,
-        nint stream)
+        nint stream, nint ropeInvFreq = 0, float ropeMscale = 1.0f)
     {
         if (_fusedRopeKvWriteModule == null)
             throw new InvalidOperationException(
@@ -4358,13 +5246,16 @@ public sealed unsafe class CudaKernels : IDisposable
         int rdArg = ropeDim, kvStrideArg = kvStride;
         float thetaArg = theta;
         int rtArg = ropeType;
+        nint invFreqArg = ropeInvFreq;
+        float mscaleArg = ropeMscale;
 
         void** args = stackalloc void*[] {
             &qArg, &kArg, &vArg, &kCacheArg, &vCacheArg,
             &posArg, &cachePosArg,
             &nhArg, &nkvArg, &hdArg,
             &rdArg, &kvStrideArg,
-            &thetaArg, &rtArg
+            &thetaArg, &rtArg,
+            &invFreqArg, &mscaleArg
         };
 
         int halfRope = ropeDim / 2;
@@ -4391,7 +5282,7 @@ public sealed unsafe class CudaKernels : IDisposable
         nint positionsDevice, nint cachePosPtr,
         int numHeads, int numKvHeads, int headDim,
         int ropeDim, int kvStride, float theta, int ropeType,
-        nint stream)
+        nint stream, nint ropeInvFreq = 0, float ropeMscale = 1.0f)
     {
         if (_fusedRopeKvWriteModule == null)
             throw new InvalidOperationException(
@@ -4405,13 +5296,16 @@ public sealed unsafe class CudaKernels : IDisposable
         int rdArg = ropeDim, kvStrideArg = kvStride;
         float thetaArg = theta;
         int rtArg = ropeType;
+        nint invFreqArg = ropeInvFreq;
+        float mscaleArg = ropeMscale;
 
         void** args = stackalloc void*[] {
             &qArg, &kArg, &vArg, &kCacheArg, &vCacheArg,
             &posArg, &cachePosPtrArg,
             &nhArg, &nkvArg, &hdArg,
             &rdArg, &kvStrideArg,
-            &thetaArg, &rtArg
+            &thetaArg, &rtArg,
+            &invFreqArg, &mscaleArg
         };
 
         int halfRope = ropeDim / 2;
@@ -4507,10 +5401,139 @@ public sealed unsafe class CudaKernels : IDisposable
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
+    /// <summary>True when the NVFP4 kernels (nvfp4.ptx) are loaded (#1038).</summary>
+    public bool HasNvfp4 => _nvfp4GemvF32Func != 0 && _scaleF32InplaceFunc != 0 && _dequantNVFP4Func != 0;
+
+    /// <summary>Output rows per CUDA block of the NVFP4 dp4a GEMV: <c>NV4D_WARPS_PER_BLOCK × NV4D_ROWS_PER_WARP</c> in nvfp4.cu.</summary>
+    private const int Nvfp4GemvQ8RowsPerBlock = 4 * 2;
+
+    /// <summary>
+    /// Smallest NVFP4 weight (bytes) whose decode GEMV takes the dp4a path under
+    /// <see cref="Nvfp4DecodeGemv.Auto"/> (#1061). The dp4a GEMV is never slower on the GPU, but it costs a
+    /// second launch (the activation quantize). On T5500's RTX 3060, a host loop of quantize + dp4a lost to the
+    /// single FP32-activation GEMV at 0.6-2.4 MB of weights (launch-bound: 0.51-0.99x), won 1.47x at 4.7 MB and
+    /// 2.4-3.2x from 9.4 MB up. Bolt's SSM projections are 18.9 and 42.8 MB.
+    /// </summary>
+    public const long Nvfp4Dp4aMinWeightBytes = 4L << 20;
+
+    /// <summary>
+    /// Which NVFP4 decode GEMV <see cref="UseNvfp4Dp4a"/> picks (#1061). Environment variable
+    /// <c>DOTLLM_NVFP4_DECODE_GEMV=auto|dp4a|f32</c>; anything else is <see cref="Nvfp4DecodeGemv.Auto"/>.
+    /// </summary>
+    public static Nvfp4DecodeGemv Nvfp4DecodeGemvMode { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_NVFP4_DECODE_GEMV")?.ToLowerInvariant() switch
+        {
+            "dp4a" => Nvfp4DecodeGemv.Dp4a,
+            "f32" => Nvfp4DecodeGemv.F32,
+            _ => Nvfp4DecodeGemv.Auto,
+        };
+
+    /// <summary>
+    /// True when the NVFP4 dp4a decode GEMV and the F32 → int8 activation quantizer it consumes
+    /// (<see cref="LaunchPQ2_0Dp4aQuantizeX"/>) are both loaded (#1061).
+    /// </summary>
+    public bool HasNvfp4Dp4a => _nvfp4GemvQ8Func != 0 && _pq2_0Dp4aQuantizeFunc != 0;
+
+    /// <summary>
+    /// Whether an <c>m × k</c> NVFP4 decode GEMV should run on the dp4a kernel (quantize + <see cref="LaunchNvfp4GemvQ8"/>)
+    /// rather than <see cref="LaunchNvfp4GemvF32"/>, per <see cref="Nvfp4DecodeGemvMode"/> (#1061).
+    /// </summary>
+    /// <param name="m">Output rows.</param>
+    /// <param name="k">Contraction length.</param>
+    /// <returns>True for the dp4a path; never true when <see cref="HasNvfp4Dp4a"/> is false.</returns>
+    public bool UseNvfp4Dp4a(int m, int k) => HasNvfp4Dp4a && Nvfp4DecodeGemvMode switch
+    {
+        Nvfp4DecodeGemv.Dp4a => true,
+        Nvfp4DecodeGemv.F32 => false,
+        _ => (long)m * (k / QuantFormat.Nvfp4GroupSize) * QuantFormat.Nvfp4BlockBytes >= Nvfp4Dp4aMinWeightBytes,
+    };
+
+    /// <summary>
+    /// NVFP4 decode GEMV on int8 activations (#1061): <c>y[m] = scale · Σ_k W[m, k] · x[k]</c>, with
+    /// <c>x</c> already quantized by <see cref="LaunchPQ2_0Dp4aQuantizeX"/> over its <paramref name="k"/>
+    /// elements — the CPU's Q8_0 activation quantizer, byte for byte. Numerically the CPU's NVFP4 × Q8_0
+    /// GEMV (<c>MatMul.GemmNvfp4</c>, llama.cpp's <c>ggml_vec_dot_nvfp4_q8_0</c>); only the FP32
+    /// summation order differs. The per-tensor <c>X.scale</c> is applied once, in the kernel.
+    /// </summary>
+    /// <param name="weight">Packed NVFP4 weights, <paramref name="m"/> rows of <c>k / 64</c> 36-byte blocks.</param>
+    /// <param name="xQ8">Quantized activations (int8, permuted layout), <paramref name="k"/> bytes, 16-byte aligned.</param>
+    /// <param name="xMeta">Activation block metadata, <c>k / 32</c> 8-byte pairs.</param>
+    /// <param name="y">FP32 output, length <paramref name="m"/>.</param>
+    /// <param name="m">Output rows.</param>
+    /// <param name="k">Contraction length; a multiple of 64.</param>
+    /// <param name="scale">The weight's per-tensor <c>X.scale</c> (1 when absent).</param>
+    /// <param name="stream">CUDA stream.</param>
+    /// <exception cref="InvalidOperationException">The kernel is not loaded.</exception>
+    /// <exception cref="ArgumentException"><paramref name="k"/> is not a multiple of 64.</exception>
+    public void LaunchNvfp4GemvQ8(nint weight, nint xQ8, nint xMeta, nint y, int m, int k, float scale, nint stream)
+    {
+        if (k % QuantFormat.Nvfp4GroupSize != 0)
+            throw new ArgumentException($"NVFP4 k must be a multiple of {QuantFormat.Nvfp4GroupSize}, got {k}.", nameof(k));
+        if (_nvfp4GemvQ8Func == 0)
+            throw new InvalidOperationException("NVFP4 dp4a GEMV kernel not present — rebuild nvfp4.ptx (#1061).");
+        nint wArg = weight, qArg = xQ8, mtArg = xMeta, yArg = y;
+        int mArg = m, bArg = k / QuantFormat.Nvfp4GroupSize;
+        float sArg = scale;
+        void** args = stackalloc void*[] {&wArg, &qArg, &mtArg, &yArg, &mArg, &bArg, &sArg};
+        CudaDriverApi.cuLaunchKernel(_nvfp4GemvQ8Func,
+                (uint)((m + Nvfp4GemvQ8RowsPerBlock - 1) / Nvfp4GemvQ8RowsPerBlock), 1, 1, 128, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// NVFP4 decode GEMV with FP32 activations: <c>y[m] = scale · Σ_k W[m, k] · x[k]</c> (#1038).
+    /// </summary>
+    /// <param name="weight">Packed NVFP4 weights, <paramref name="m"/> rows of <c>k / 64</c> 36-byte blocks.</param>
+    /// <param name="x">FP32 input, length <paramref name="k"/>.</param>
+    /// <param name="y">FP32 output, length <paramref name="m"/>.</param>
+    /// <param name="m">Output rows.</param>
+    /// <param name="k">Contraction length; a multiple of 64.</param>
+    /// <param name="scale">The weight's per-tensor <c>X.scale</c> (1 when absent).</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchNvfp4GemvF32(nint weight, nint x, nint y, int m, int k, float scale, nint stream)
+    {
+        if (_nvfp4GemvF32Func == 0)
+            throw new InvalidOperationException("NVFP4 GEMV kernel not present — rebuild nvfp4.ptx (#1038).");
+        if (k % QuantFormat.Nvfp4GroupSize != 0)
+            throw new ArgumentException($"NVFP4 k must be a multiple of {QuantFormat.Nvfp4GroupSize}, got {k}.", nameof(k));
+        nint wArg = weight, xArg = x, yArg = y;
+        int mArg = m, bArg = k / QuantFormat.Nvfp4GroupSize;
+        float sArg = scale;
+        void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &mArg, &bArg, &sArg};
+        // One warp per row, four rows per 128-thread block.
+        CudaDriverApi.cuLaunchKernel(_nvfp4GemvF32Func,
+                (uint)((m + 3) / 4), 1, 1, 128, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>In place <c>y[i] *= scale</c> over <paramref name="n"/> floats — a weight's per-tensor <c>X.scale</c> (#1038).</summary>
+    /// <param name="y">FP32 buffer.</param>
+    /// <param name="n">Element count.</param>
+    /// <param name="scale">Multiplier.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchScaleF32Inplace(nint y, int n, float scale, nint stream)
+    {
+        if (_scaleF32InplaceFunc == 0)
+            throw new InvalidOperationException("scale_f32_inplace kernel not present — rebuild nvfp4.ptx (#1038).");
+        nint yArg = y;
+        int nArg = n;
+        float sArg = scale;
+        void** args = stackalloc void*[] {&yArg, &nArg, &sArg};
+        uint gridDim = (uint)Math.Min((n + BlockSize - 1) / BlockSize, 1024);
+        CudaDriverApi.cuLaunchKernel(_scaleF32InplaceFunc,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
     /// <summary>Quantized GEMV: y[n] = W_quant[n,k] @ x[k]. Operates directly on quantized weights.</summary>
     public void LaunchQuantizedGemv(nint quantWeight, QuantizationType qt,
                                       nint x, nint y, int n, int k, nint stream)
     {
+        if (qt == QuantizationType.Q4_1)
+        {
+            LaunchQ4_1(_quantizedGemvQ4_1Func, "quantized_gemv_q4_1", quantWeight, x, y, n, k, null, 1, stream);
+            return;
+        }
         nint wArg = quantWeight, xArg = x, yArg = y;
         int nArg = n, kArg = k;
 
@@ -4544,7 +5567,7 @@ public sealed unsafe class CudaKernels : IDisposable
     public static bool HasQuantizedGemv(QuantizationType qt) =>
         qt is QuantizationType.Q8_0 or QuantizationType.Q4_K or QuantizationType.Q5_0
             or QuantizationType.Q5_K or QuantizationType.Q6_K
-            or QuantizationType.Q2_K
+            or QuantizationType.Q2_K or QuantizationType.Q4_1
             or QuantizationType.IQ4_NL or QuantizationType.IQ4_XS
             or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS or QuantizationType.IQ2_S;
 
@@ -4566,8 +5589,213 @@ public sealed unsafe class CudaKernels : IDisposable
         QuantizationType.IQ2_XXS => !DisableQuantizedGemv && _quantizedGemvIQ2_XXSFunc != 0,
         QuantizationType.IQ2_XS => !DisableQuantizedGemv && _quantizedGemvIQ2_XSFunc != 0,
         QuantizationType.IQ2_S => !DisableQuantizedGemv && _quantizedGemvIQ2_SFunc != 0,
+        QuantizationType.Q4_1 => !DisableQuantizedGemv && _quantizedGemvQ4_1Func != 0,
         _ => false,
     };
+
+    /// <summary>
+    /// True when the in-place Q4_1 multi-token GEMMs are loaded (<see cref="LaunchQuantizedGemmQ4_1F16"/>,
+    /// <see cref="LaunchQuantizedGemmQ4_1F32"/>): prefill and MoE expert batches read the Q4_1 blocks directly instead of
+    /// dequantizing the weight into scratch (#1172, CLAUDE.md rule 2).
+    /// </summary>
+    public bool HasQ4_1Gemm => !DisableQuantizedGemv && _quantizedGemmQ4_1F16Func != 0 && _quantizedGemmQ4_1F32Func != 0
+        && _quantizedGemvQ4_1F32Func != 0 && _quantizedGemvQ4_1Func != 0;
+
+    /// <summary>
+    /// Q4_1 multi-token GEMM with FP16 activations: <c>Y[m, n] = X[m, k] * W[n, k]^T</c>, reading the Q4_1 blocks in
+    /// place (8 tokens share each weight load). <paramref name="k"/> must be a multiple of 32.
+    /// </summary>
+    /// <param name="quantWeight">Device Q4_1 weight <c>[n, k]</c>.</param>
+    /// <param name="x">Device FP16 input <c>[m, k]</c>.</param>
+    /// <param name="y">Device FP16 output <c>[m, n]</c>.</param>
+    /// <param name="n">Output rows.</param>
+    /// <param name="k">Input width.</param>
+    /// <param name="m">Activation rows (tokens).</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchQuantizedGemmQ4_1F16(nint quantWeight, nint x, nint y, int n, int k, int m, nint stream)
+    {
+        if (m == 1)
+            LaunchQ4_1(_quantizedGemvQ4_1Func, "quantized_gemv_q4_1", quantWeight, x, y, n, k, null, 1, stream);
+        else
+            LaunchQ4_1(_quantizedGemmQ4_1F16Func, "quantized_gemm_q4_1_f16", quantWeight, x, y, n, k, m,
+                (uint)((m + Q4_1TokTile - 1) / Q4_1TokTile), stream);
+    }
+
+    /// <summary>
+    /// Q4_1 GEMV / multi-token GEMM with FP32 activations (the MoE expert path): <c>Y[m, n] = X[m, k] * W[n, k]^T</c>,
+    /// reading the Q4_1 blocks in place. F32 inputs also mean a large routed SwiGLU output never passes through F16.
+    /// </summary>
+    /// <param name="quantWeight">Device Q4_1 weight <c>[n, k]</c>.</param>
+    /// <param name="x">Device FP32 input <c>[m, k]</c>.</param>
+    /// <param name="y">Device FP32 output <c>[m, n]</c>.</param>
+    /// <param name="n">Output rows.</param>
+    /// <param name="k">Input width, a multiple of 32.</param>
+    /// <param name="m">Activation rows (tokens).</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchQuantizedGemmQ4_1F32(nint quantWeight, nint x, nint y, int n, int k, int m, nint stream)
+    {
+        if (m == 1)
+            LaunchQ4_1(_quantizedGemvQ4_1F32Func, "quantized_gemv_q4_1_f32", quantWeight, x, y, n, k, null, 1, stream);
+        else
+            LaunchQ4_1(_quantizedGemmQ4_1F32Func, "quantized_gemm_q4_1_f32", quantWeight, x, y, n, k, m,
+                (uint)((m + Q4_1TokTile - 1) / Q4_1TokTile), stream);
+    }
+
+    /// <summary>
+    /// True when the fully grouped Q4_1 decode expert body is loaded: <see cref="LaunchMoeGroupedGemvQ4_1F32PerExpertInput"/>
+    /// (routed down projection) and <see cref="LaunchMoeWeightedRowsSum"/> (combine), #1172.
+    /// </summary>
+    public bool HasMoeGroupedDownQ4_1 => !DisableQuantizedGemv && _moeGroupedGemvQ4_1F32XeFunc != 0
+        && _moeWeightedRowsSumF32Func != 0;
+
+    /// <summary>
+    /// MoE grouped decode GEMV with one F32 input row per expert: <c>y[e, m] = W_e[m, K] @ x[e, :]</c> for the
+    /// <paramref name="kActive"/> experts in one launch (the routed down projection, each expert reading its own SwiGLU row).
+    /// </summary>
+    /// <param name="xF32">Contiguous F32 inputs <c>[kActive, K]</c>.</param>
+    /// <param name="weightPtrsDevice">Device array of <paramref name="kActive"/> Q4_1 weight pointers (<c>[M, K]</c> each).</param>
+    /// <param name="yF32">Contiguous F32 outputs <c>[kActive, M]</c>.</param>
+    /// <param name="M">Output rows per expert.</param>
+    /// <param name="K">Input width, a multiple of 32.</param>
+    /// <param name="kActive">Active experts.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchMoeGroupedGemvQ4_1F32PerExpertInput(nint xF32, nint weightPtrsDevice, nint yF32,
+        int M, int K, int kActive, nint stream)
+    {
+        if (kActive <= 0) return;
+        LaunchQ4_1(_moeGroupedGemvQ4_1F32XeFunc, "moe_grouped_gemv_q4_1_f32_xe", xF32, weightPtrsDevice, yF32,
+            M, K, kActive, (uint)kActive, stream);
+    }
+
+    /// <summary>
+    /// Grouped-decode combine: <c>out[h] += sum_e topkWeight[slot[e]] * rows[e, h]</c> over the <paramref name="kActive"/>
+    /// expert rows of one token, replacing one weighted axpy launch per expert.
+    /// </summary>
+    /// <param name="outF32">F32 output row <c>[hidden]</c>, accumulated into.</param>
+    /// <param name="rowsF32">F32 expert rows <c>[kActive, hidden]</c>.</param>
+    /// <param name="topkWeight">F32 routing weights of the token (indexed by slot).</param>
+    /// <param name="slotIdxDevice">Device int64 array: the routing slot of each expert row.</param>
+    /// <param name="kActive">Expert rows.</param>
+    /// <param name="hidden">Row width.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchMoeWeightedRowsSum(nint outF32, nint rowsF32, nint topkWeight, nint slotIdxDevice,
+        int kActive, int hidden, nint stream)
+    {
+        if (_moeWeightedRowsSumF32Func == 0)
+            throw new InvalidOperationException("moe_weighted_rows_sum_f32 not available. Recompile native/kernels/moe_ffn.cu to PTX.");
+        nint o = outF32, r = rowsF32, w = topkWeight, sl = slotIdxDevice;
+        int ka = kActive, h = hidden;
+        void** args = stackalloc void*[] { &o, &r, &w, &sl, &ka, &h };
+        CudaDriverApi.cuLaunchKernel(_moeWeightedRowsSumF32Func, (uint)((hidden + BlockSize - 1) / BlockSize), 1, 1,
+            BlockSize, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>True when <see cref="LaunchMoeCombineBucketedF32"/> is loaded (the multi-token bucketed expert body, #1202).</summary>
+    public bool HasMoeCombineBucketed => _moeCombineBucketedF32Func != 0 && _moeGatherTokenRowsF32Func != 0;
+
+    /// <summary>Most top-k slots per token <see cref="LaunchMoeCombineBucketedF32"/> supports.</summary>
+    public const int MoeCombineMaxTopK = 32;
+
+    /// <summary>
+    /// Multi-token MoE combine: <c>out[t, :] += sum_slot topkWeight[t, slot] * rows[pos[t, slot], :]</c>, summed in ascending
+    /// row position (= ascending expert id of the bucketed layout), replacing one weighted axpy per expert and slot.
+    /// </summary>
+    /// <param name="outF32">F32 output <c>[seqLen, hidden]</c>, accumulated into.</param>
+    /// <param name="rowsF32">F32 expert output rows <c>[seqLen * topK, hidden]</c>, bucketed by expert.</param>
+    /// <param name="topkWeight">F32 routing weights <c>[seqLen, topK]</c>.</param>
+    /// <param name="posDevice">Int32 row of each assignment <c>[seqLen, topK]</c>; negative = no row.</param>
+    /// <param name="seqLen">Tokens.</param>
+    /// <param name="hidden">Row width.</param>
+    /// <param name="topK">Slots per token, at most <see cref="MoeCombineMaxTopK"/>.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchMoeCombineBucketedF32(nint outF32, nint rowsF32, nint topkWeight, nint posDevice,
+        int seqLen, int hidden, int topK, nint stream)
+    {
+        if (_moeCombineBucketedF32Func == 0)
+            throw new InvalidOperationException("moe_combine_bucketed_f32 not available. Recompile native/kernels/moe_ffn.cu to PTX.");
+        if ((uint)topK > MoeCombineMaxTopK)
+            throw new ArgumentOutOfRangeException(nameof(topK), topK, $"At most {MoeCombineMaxTopK} slots per token.");
+        nint o = outF32, r = rowsF32, w = topkWeight, p = posDevice;
+        int sl = seqLen, h = hidden, k = topK;
+        void** args = stackalloc void*[] { &o, &r, &w, &p, &sl, &h, &k };
+        CudaDriverApi.cuLaunchKernel(_moeCombineBucketedF32Func, (uint)seqLen, 1, 1,
+            BlockSize, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>True when <see cref="LaunchMoeAddF16F32"/> is loaded.</summary>
+    public bool HasMoeAddF16F32 => _moeAddF16F32Func != 0;
+
+    /// <summary>
+    /// <c>out[i] += (float)in[i] * factor</c>: adds an F16 partial (the CPU part of a split expert layer, #1202), stored
+    /// divided by the power of two <paramref name="factor"/>, to an F32 output.
+    /// </summary>
+    /// <param name="outF32">F32 output, accumulated into.</param>
+    /// <param name="inF16">F16 addend.</param>
+    /// <param name="n">Elements.</param>
+    /// <param name="factor">Power-of-two scale the addend was divided by.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchMoeAddF16F32(nint outF32, nint inF16, int n, float factor, nint stream)
+    {
+        if (_moeAddF16F32Func == 0)
+            throw new InvalidOperationException("moe_add_f16_f32 not available. Recompile native/kernels/moe_ffn.cu to PTX.");
+        nint o = outF32, i = inF16;
+        int count = n;
+        float f = factor;
+        void** args = stackalloc void*[] { &o, &i, &count, &f };
+        CudaDriverApi.cuLaunchKernel(_moeAddF16F32Func, (uint)((n + BlockSize - 1) / BlockSize), 1, 1,
+            BlockSize, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>True when <see cref="LaunchMoeBuildGroupedPtrs"/> is loaded (device-routed decode, #1182).</summary>
+    public bool HasMoeBuildGroupedPtrs => _moeBuildGroupedPtrsFunc != 0;
+
+    /// <summary>
+    /// Builds the grouped decode body's six pointer arrays (<c>[6, topK]</c> int64: gate W / out, up W / out, down W, slot)
+    /// on the device from the top-k ids of one token, experts in ascending id order, so no host read-back is needed.
+    /// </summary>
+    /// <param name="topkIdx">Device int32 top-k ids <c>[topK]</c>.</param>
+    /// <param name="expertTable">Device int64 expert pointers <c>[gate E | up E | down E]</c>.</param>
+    /// <param name="outPtrs">Device int64 output <c>[6 * topK]</c>.</param>
+    /// <param name="numExperts">Experts per bank.</param>
+    /// <param name="topK">Selected experts (at most <see cref="MoeCombineMaxTopK"/>).</param>
+    /// <param name="gateOut">Device base of the F16 gate outputs <c>[topK, I]</c>.</param>
+    /// <param name="upOut">Device base of the F16 up outputs <c>[topK, I]</c>.</param>
+    /// <param name="outRowBytes">Bytes of one output row.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchMoeBuildGroupedPtrs(nint topkIdx, nint expertTable, nint outPtrs, int numExperts, int topK,
+        nint gateOut, nint upOut, long outRowBytes, nint stream)
+    {
+        if (_moeBuildGroupedPtrsFunc == 0)
+            throw new InvalidOperationException("moe_build_grouped_ptrs not available. Recompile native/kernels/moe_ffn.cu to PTX.");
+        if ((uint)topK > MoeCombineMaxTopK)
+            throw new ArgumentOutOfRangeException(nameof(topK), topK, $"At most {MoeCombineMaxTopK} slots per token.");
+        nint ids = topkIdx, table = expertTable, o = outPtrs;
+        int e = numExperts, k = topK;
+        long g = gateOut, u = upOut, rb = outRowBytes;
+        void** args = stackalloc void*[] { &ids, &table, &o, &e, &k, &g, &u, &rb };
+        CudaDriverApi.cuLaunchKernel(_moeBuildGroupedPtrsFunc, 1, 1, 1, 32, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    // q4_1_gemv.cu: 8 rows (warps) per 256-thread block, 8 tokens per GEMM tile.
+    private const int Q4_1RowsPerBlock = 8;
+    private const int Q4_1TokTile = 8;
+
+    // Shared launcher for the q4_1_gemv.cu entries: (a0, a1, a2, rows, k[, m]) args, grid (ceil(rows / 8), gridY).
+    // The GEMV entries take five arguments; the trailing m is ignored by them.
+    private void LaunchQ4_1(nint func, string name, nint a0, nint a1, nint a2, int rows, int k, int? m, uint gridY,
+        nint stream)
+    {
+        if (func == 0)
+            throw new NotSupportedException($"{name} not available. Compile native/kernels/q4_1_gemv.cu to PTX.");
+        if ((k & 31) != 0)
+            throw new ArgumentException($"Q4_1 kernels need k % 32 == 0 (got {k}).", nameof(k));
+        nint p0 = a0, p1 = a1, p2 = a2;
+        int rowsArg = rows, kArg = k, mArg = m ?? 0;
+        void** args = stackalloc void*[] { &p0, &p1, &p2, &rowsArg, &kArg, &mArg };
+        CudaDriverApi.cuLaunchKernel(func,
+                (uint)((rows + Q4_1RowsPerBlock - 1) / Q4_1RowsPerBlock), gridY, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
 
     /// <summary>
     /// True when any loaded decode-time quantized GEMV implementation can execute
@@ -4628,8 +5856,15 @@ public sealed unsafe class CudaKernels : IDisposable
                                        int M, int K, int kActive, nint stream)
     {
         if (kActive <= 0 || M <= 0 || K <= 0) return;
-        if ((K & 255) != 0)
-            throw new ArgumentException($"K must be a multiple of 256 (got {K}).", nameof(K));
+        int kAlign = MoeGroupedGemvKAlignment(qt);
+        if (K % kAlign != 0)
+            throw new ArgumentException($"K must be a multiple of {kAlign} for {qt} (got {K}).", nameof(K));
+        if (qt == QuantizationType.Q4_1)
+        {
+            LaunchQ4_1(_moeGroupedGemvQ4_1Func, "moe_grouped_gemv_q4_1_f16",
+                x, weightPtrsDevice, outputPtrsDevice, M, K, kActive, (uint)kActive, stream);
+            return;
+        }
 
         nint func = qt switch
         {
@@ -4670,6 +5905,13 @@ public sealed unsafe class CudaKernels : IDisposable
 
     /// <summary>True when the MMQ-style IQ4_NL GEMV kernel is loaded (PTX present).</summary>
     public bool HasMmqIQ4_NL => !DisableQuantizedGemv && _quantizedGemvIQ4_NLMmqFunc != 0;
+
+    /// <summary>True when the Q8_0 dp4a MMVQ-large kernel (<c>quantized_gemv_q8_0_mmvq_large_preq</c>, #1297) and the
+    /// pre-Q8_1 quantiser are loaded and not disabled. Q8_0 has only this pre-quantized variant (no on-the-fly twin):
+    /// <c>LaunchQuantizedGemvMmq</c> falls back to the legacy FP kernel when the caller supplies no pre-Q8_1 scratch
+    /// (k &lt; <see cref="MmvqLargeKThreshold"/>).</summary>
+    public bool HasMmqQ8_0 => _quantizedGemvQ8_0MmvqLargePreqFunc != 0 && _quantizedGemvQ8_0Func != 0
+        && HasPreQ8_1 && !DisableQuantizedGemv && !DisableMmqQ8_0;
 
     /// <summary>True when the MMQ-style IQ4_XS GEMV kernel is loaded (PTX present).</summary>
     public bool HasMmqIQ4_XS => !DisableQuantizedGemv && _quantizedGemvIQ4_XSMmqFunc != 0;
@@ -4721,6 +5963,39 @@ public sealed unsafe class CudaKernels : IDisposable
     /// </summary>
     public bool HasMmqBatchedQ4K => _quantizedGemvQ4_KMmqBatchedFunc != 0 && _quantizeXToQ8_1BatchedFunc != 0
         && !DisableQuantizedGemv && !DisableMmqBatchedQ4K;
+
+    /// <summary>Force Q8_0 decode back to the legacy FP GEMV (A/B switch for #1297). <c>DOTLLM_DISABLE_MMQ_Q8_0=1</c>.</summary>
+    public static bool DisableMmqQ8_0 { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMQ_Q8_0") == "1";
+
+    /// <summary>
+    /// K-quant decode GEMV selector (#1298), <c>DOTLLM_KQUANT_GEMV</c>: <c>auto</c> (default, per-shape rule in
+    /// <see cref="UseKQuantRows4"/>), <c>rows4</c> (force the warp-per-row kernel wherever it exists) or
+    /// <c>large</c> (force the legacy one-row-per-block MMVQ-large kernel). A/B switch; also settable in tests.
+    /// </summary>
+    public static string KQuantGemvMode { get; set; } =
+        (Environment.GetEnvironmentVariable("DOTLLM_KQUANT_GEMV") ?? "auto").ToLowerInvariant();
+
+    /// <summary>True when the warp-per-row (4 rows / block) pre-Q8_1 kernel is loaded for <paramref name="qt"/> (#1298).</summary>
+    public bool HasMmvqRows4Preq(QuantizationType qt) => qt switch
+    {
+        QuantizationType.Q4_K => _quantizedGemvQ4_KMmvqRows4PreqFunc != 0,
+        QuantizationType.Q6_K => _quantizedGemvQ6_KMmvqRows4PreqFunc != 0,
+        _ => false,
+    };
+
+    /// <summary>
+    /// Per-shape kernel rule for the K-quant decode GEMV (#1298). Each entry cites its measurement in docs/CUDA.md.
+    /// </summary>
+    private bool UseKQuantRows4(QuantizationType qt, int n, int k)
+    {
+        if (!HasMmvqRows4Preq(qt) || k < MmvqLargeKThreshold || (k & 255) != 0) return false;
+        return KQuantGemvMode switch
+        {
+            "large" => false,
+            "rows4" => true,
+            _ => true,
+        };
+    }
 
     /// <summary>Test/benchmark hook to force the legacy Q2_K GEMV kernel even when MMQ is loaded.</summary>
     public static bool DisableMmqQ2K { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMQ_Q2K") == "1";
@@ -4822,6 +6097,7 @@ public sealed unsafe class CudaKernels : IDisposable
         QuantizationType.Q6_K => HasMmqQ6K,
         QuantizationType.IQ4_NL => HasMmqIQ4_NL,
         QuantizationType.IQ4_XS => HasMmqIQ4_XS,
+        QuantizationType.Q8_0 => HasMmqQ8_0,
         _ => false,
     };
 
@@ -4943,6 +6219,42 @@ public sealed unsafe class CudaKernels : IDisposable
                 "MMQ GEMV kernel not available. Compile native/kernels/quantized_gemv_mmq.cu to PTX.");
 
         bool usePreq = preqScratch != 0 && HasPreQ8_1;
+
+        // Q8_0 (#1297): dp4a MMVQ over the pre-quantized activations, reading the 34-byte blocks in place.
+        // No on-the-fly / 4-rows twin exists, so without scratch (k < MmvqLargeKThreshold) use the legacy kernel.
+        if (qt == QuantizationType.Q8_0)
+        {
+            if (!usePreq || _quantizedGemvQ8_0MmvqLargePreqFunc == 0)
+            {
+                LaunchQuantizedGemv(quantWeight, qt, x, y, n, k, stream);
+                return;
+            }
+            int chunks = k >> 5;
+            nint wQ = quantWeight, xqQ = preqScratch, dxQ = preqScratch + k,
+                 sx2Q = preqScratch + k + (nint)(chunks * 2), yQ = y;
+            int nQ = n, kQ = k;
+            void** argsQ = stackalloc void*[] { &wQ, &xqQ, &dxQ, &sx2Q, &yQ, &nQ, &kQ };
+            // 128 = compiled MMVQ_LARGE_THREADS (the kernel's block stride is baked in; not tunable via env).
+            CudaDriverApi.cuLaunchKernel(_quantizedGemvQ8_0MmvqLargePreqFunc,
+                    (uint)n, 1, 1, 128, 1, 1,
+                    0, stream, (nint)argsQ, 0).ThrowOnError();
+            return;
+        }
+
+        // K-quant warp-per-row decode GEMV (#1298): 4 rows per 128-thread block, pre-quantised activations only.
+        if (usePreq && UseKQuantRows4(qt, n, k))
+        {
+            int chunksR = k >> 5;
+            nint wR = quantWeight, xqR = preqScratch, dxR = preqScratch + k,
+                 sx2R = preqScratch + k + (nint)(chunksR * 2), yR = y;
+            int nR = n, kR = k;
+            void** argsR = stackalloc void*[] { &wR, &xqR, &dxR, &sx2R, &yR, &nR, &kR };
+            // 128 = launch_bounds of the rows4 kernels (4 warps, one row each).
+            CudaDriverApi.cuLaunchKernel(qt == QuantizationType.Q4_K ? _quantizedGemvQ4_KMmvqRows4PreqFunc : _quantizedGemvQ6_KMmvqRows4PreqFunc,
+                    (uint)((n + 3) / 4), 1, 1, 128, 1, 1,
+                    0, stream, (nint)argsR, 0).ThrowOnError();
+            return;
+        }
 
         // llama.cpp-faithful coalesced+accumulate-once Q4_K MMVQ (opt-in, DOTLLM_CUDA_MMVQ_LLAMACPP=1):
         // same warp-per-superblock coalesced 128-byte qs load as MmvqCoalesced below, but defers ALL
@@ -5218,7 +6530,338 @@ public sealed unsafe class CudaKernels : IDisposable
         return numChunks * bytesPerChunk;
     }
 
-    /// <summary>Dequantize a weight matrix to FP32 on the GPU.</summary>
+    /// <summary>Largest Hadamard block width <see cref="LaunchHadamardFwhtF32"/> supports (its shared-memory staging size).</summary>
+    public const int HadamardFwhtMaxBlockSize = 1024;
+
+    /// <summary>Threads per CUDA block for <c>hadamard_fwht_f32</c>. Must match <c>HADAMARD_THREADS</c> in native/kernels/hadamard_fwht.cu.</summary>
+    private const int HadamardFwhtThreads = 256;
+
+    /// <summary>Whether the PrismML Hadamard FWHT kernel is loaded (hadamard_fwht.ptx present and current).</summary>
+    public bool HasHadamardFwht => _hadamardFwhtF32Func != 0;
+
+    /// <summary>Test hook (#1222): route 1024-wide blocks through the generic kernel, the fast path's oracle.</summary>
+    internal bool ForceGenericHadamardForTest { get; set; }
+
+    /// <summary>
+    /// Blockwise normalized Sylvester Walsh-Hadamard transform over a <c>[rows, width]</c> F32
+    /// activation (PrismML <c>prism.hadamard.*</c> fold, issue #479). One CUDA block per
+    /// (row, <paramref name="blockSize"/>-wide block), staged in shared memory.
+    /// </summary>
+    /// <remarks>
+    /// Forward (<paramref name="inverse"/> false): optional GDN tiled→grouped permute → sign flip →
+    /// FWHT. Inverse: FWHT → sign flip. <paramref name="src"/> may equal <paramref name="dst"/>
+    /// only when <paramref name="permute"/> is false (the permute reads across blocks).
+    /// <paramref name="scale"/> must be <c>1f / MathF.Sqrt(blockSize)</c> — computed on the host so
+    /// the kernel matches the CPU oracle exactly.
+    /// </remarks>
+    /// <param name="src">Source activation, device F32 <c>[rows, width]</c>.</param>
+    /// <param name="dst">Destination, device F32 <c>[rows, width]</c>.</param>
+    /// <param name="signs">Device F32 ±1 vector of <paramref name="width"/> elements; may be 0 when <paramref name="applySigns"/> is false.</param>
+    /// <param name="rows">Token rows.</param>
+    /// <param name="width">Row width; a positive multiple of <paramref name="blockSize"/>.</param>
+    /// <param name="blockSize">Power of two in <c>[1, HadamardFwhtMaxBlockSize]</c>.</param>
+    /// <param name="applySigns">False for the identity sign step.</param>
+    /// <param name="inverse">True for the inverse order (signs after the rotation).</param>
+    /// <param name="permute">True to apply the GDN value-head permute on load (<c>ssm_out</c> input only).</param>
+    /// <param name="permDState">Head width for the permute.</param>
+    /// <param name="permNKHead">Key heads for the permute.</param>
+    /// <param name="permRep">Value heads per key head for the permute.</param>
+    /// <param name="scale"><c>1f / MathF.Sqrt(blockSize)</c>.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public unsafe void LaunchHadamardFwhtF32(
+        nint src, nint dst, nint signs, int rows, int width, int blockSize,
+        bool applySigns, bool inverse, bool permute, int permDState, int permNKHead, int permRep,
+        float scale, nint stream)
+    {
+        if (_hadamardFwhtF32Func == 0)
+            throw new InvalidOperationException("hadamard_fwht_f32 not loaded (hadamard_fwht.ptx missing/stale).");
+        if (blockSize <= 0 || (blockSize & (blockSize - 1)) != 0 || blockSize > HadamardFwhtMaxBlockSize)
+            throw new ArgumentOutOfRangeException(nameof(blockSize),
+                $"Hadamard block size must be a power of two <= {HadamardFwhtMaxBlockSize}, got {blockSize}.");
+        if (width <= 0 || width % blockSize != 0)
+            throw new ArgumentException($"Activation width {width} is not a positive multiple of Hadamard block size {blockSize}.", nameof(width));
+        if (permute && src == dst)
+            throw new ArgumentException("The GDN permute reads across blocks; src must not alias dst.", nameof(dst));
+        if (permute && (permDState <= 0 || permNKHead <= 0 || permRep <= 0 || permDState * permNKHead * permRep != width))
+            throw new ArgumentException(
+                $"GDN permute geometry {permDState}x{permNKHead}x{permRep} does not match width {width}.", nameof(width));
+        if (rows <= 0) return;
+
+        nint s = src, d = dst, sg = signs;
+        int r = rows, w = width, bs = blockSize;
+        int aps = applySigns ? 1 : 0, inv = inverse ? 1 : 0, perm = permute ? 1 : 0;
+        int pds = permDState, pnk = permNKHead, prp = permRep;
+        float sc = scale;
+        void** args = stackalloc void*[] { &s, &d, &sg, &r, &w, &bs, &aps, &inv, &perm, &pds, &pnk, &prp, &sc };
+        // #1222: 1024-wide blocks (Bonsai 2) take the register/shuffle kernel — same butterflies, bit-identical.
+        nint func = blockSize == 1024 && _hadamardFwht1024F32Func != 0 && !ForceGenericHadamardForTest
+            ? _hadamardFwht1024F32Func : _hadamardFwhtF32Func;
+        CudaDriverApi.cuLaunchKernel(func,
+                (uint)(width / blockSize), (uint)rows, 1, HadamardFwhtThreads, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>Widest column count the multi-column PQ2_0 GEMV has an exact-width entry point for.</summary>
+    public const int Pq2_0GemvMultiMaxColumns = 8;
+
+    /// <summary>Rows per block of <c>pq2_0_gemv_multi_*</c>. Must match <c>PQ2M_ROWS_PER_BLOCK</c> in native/kernels/pq2_0_gemv_multi.cu.</summary>
+    private const int Pq2_0GemvMultiRowsPerBlock = 16;
+
+    /// <summary>
+    /// Whether every exact-width entry point of the small-S multi-column PQ2_0 GEMV
+    /// (<c>pq2_0_gemv_multi.ptx</c>, issue #482) is loaded.
+    /// </summary>
+    public bool HasPQ2_0GemvMulti => _hasPQ2_0GemvMulti;
+
+    private bool AllPQ2_0GemvMultiFuncsLoaded()
+    {
+        for (int s = 1; s <= Pq2_0GemvMultiMaxColumns; s++)
+            if (_pq2_0GemvMultiFuncs[s] == 0) return false;
+        return true;
+    }
+
+    /// <summary>Why <see cref="HasPQ2_0GemvMulti"/> is false, or <see langword="null"/> when it is true.</summary>
+    public string? PQ2_0GemvMultiUnavailableReason => HasPQ2_0GemvMulti ? null : _pq2_0GemvMultiUnavailableReason;
+
+    /// <summary>
+    /// Multi-column PQ2_0 GEMV (issue #482): <c>y[s, row] = W[row, :] · x[s, :]</c> for
+    /// <c>s &lt; columns</c>, reading and decoding each packed weight byte once for all columns.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="quantWeight"/> is the load-time SPLIT layout (see
+    /// <see cref="LaunchPQ2_0RepackSplitF16"/>). <paramref name="xF16"/> is HALF activations,
+    /// <c>[columns, k]</c> row-major and 16-byte aligned — convert F32 activations with
+    /// <see cref="LaunchConvertF32ToF16"/> first, which applies the same rounding the single-column
+    /// kernel's own staging does. <paramref name="yF32"/> is <c>[columns, n]</c> row-major.
+    /// Not bit-identical to <paramref name="columns"/> single-column launches (FP32 reassociation);
+    /// see native/kernels/pq2_0_gemv_multi.cu.
+    /// </remarks>
+    /// <param name="quantWeight">Split-layout PQ2_0 weight <c>[n, k]</c>.</param>
+    /// <param name="xF16">Half activations <c>[columns, k]</c>.</param>
+    /// <param name="yF32">F32 output <c>[columns, n]</c>.</param>
+    /// <param name="n">Output rows.</param>
+    /// <param name="k">Input width, a multiple of 128.</param>
+    /// <param name="columns">Token columns, 1..<see cref="Pq2_0GemvMultiMaxColumns"/>.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchPQ2_0GemvMulti(nint quantWeight, nint xF16, nint yF32, int n, int k, int columns, nint stream)
+    {
+        if ((uint)(columns - 1) >= Pq2_0GemvMultiMaxColumns)
+            throw new ArgumentOutOfRangeException(nameof(columns), columns,
+                $"Multi-column PQ2_0 GEMV supports 1..{Pq2_0GemvMultiMaxColumns} columns.");
+        if (k <= 0 || k % 128 != 0)
+            throw new ArgumentException($"PQ2_0 k must be a positive multiple of 128, got {k}.", nameof(k));
+        nint func = _pq2_0GemvMultiFuncs[columns];
+        if (func == 0)
+            throw new InvalidOperationException(
+                $"pq2_0_gemv_multi_f16x_f32y_{columns} not loaded ({_pq2_0GemvMultiUnavailableReason}).");
+        if (n <= 0) return;
+
+        nint wArg = quantWeight, xArg = xF16, yArg = yF32;
+        int nArg = n, kArg = k;
+        void** args = stackalloc void*[] { &wArg, &xArg, &yArg, &nArg, &kArg };
+        uint grid = (uint)((n + Pq2_0GemvMultiRowsPerBlock - 1) / Pq2_0GemvMultiRowsPerBlock);
+        CudaDriverApi.cuLaunchKernel(func,
+                grid, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>Elements per activation quantization block of the dp4a PQ2_0 GEMV (the CPU Q8_0 block).</summary>
+    public const int Pq2_0Dp4aQuantBlock = 32;
+
+    /// <summary>
+    /// Bytes of per-block metadata the dp4a quantizer writes: one <c>{ float d, int sum }</c> pair per
+    /// <see cref="Pq2_0Dp4aQuantBlock"/> activations.
+    /// </summary>
+    public const int Pq2_0Dp4aMetaBytesPerBlock = 8;
+
+    /// <summary>
+    /// Whether the int8-activation dp4a PQ2_0 GEMV (<c>pq2_0_gemv_dp4a.ptx</c>, issue #485) — its
+    /// activation quantizer and every exact-width entry point — is loaded.
+    /// </summary>
+    public bool HasPQ2_0GemvDp4a => _hasPQ2_0GemvDp4a;
+
+    /// <summary>Why <see cref="HasPQ2_0GemvDp4a"/> is false, or <see langword="null"/> when it is true.</summary>
+    public string? PQ2_0GemvDp4aUnavailableReason => HasPQ2_0GemvDp4a ? null : _pq2_0GemvDp4aUnavailableReason;
+
+    private bool AllPQ2_0GemvDp4aFuncsLoaded()
+    {
+        if (_pq2_0Dp4aQuantizeFunc == 0) return false;
+        for (int s = 1; s <= Pq2_0GemvMultiMaxColumns; s++)
+            if (_pq2_0GemvDp4aFuncs[s] == 0) return false;
+        return true;
+    }
+
+    /// <summary>
+    /// Quantizes F32 activations to the int8 layout the dp4a PQ2_0 GEMV consumes (issue #485): per
+    /// block of 32, exactly the CPU W2A8 activation quantizer's rounding
+    /// (<c>MatMul.QuantizeF32ToQ8_0</c>), with the int8 values permuted within each 16-element chunk
+    /// and one <c>{ half-rounded scale as float bits, int32 sum of the block's int8 values }</c> pair
+    /// per block. The layout contract is in native/kernels/pq2_0_gemv_dp4a.cu.
+    /// </summary>
+    /// <param name="xF32">F32 activations, <paramref name="elements"/> long (e.g. <c>[S, k]</c>), 16-byte aligned.</param>
+    /// <param name="xQ8">Output int8, <paramref name="elements"/> bytes, 16-byte aligned.</param>
+    /// <param name="xMeta">Output metadata, <c>elements / 32 * 8</c> bytes, 8-byte aligned.</param>
+    /// <param name="elements">Element count, a positive multiple of 32.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchPQ2_0Dp4aQuantizeX(nint xF32, nint xQ8, nint xMeta, int elements, nint stream)
+    {
+        if (elements <= 0 || elements % Pq2_0Dp4aQuantBlock != 0)
+            throw new ArgumentException(
+                $"elements must be a positive multiple of {Pq2_0Dp4aQuantBlock}, got {elements}.", nameof(elements));
+        if (_pq2_0Dp4aQuantizeFunc == 0)
+            throw new InvalidOperationException($"pq2_0_dp4a_quantize_x not loaded ({_pq2_0GemvDp4aUnavailableReason}).");
+
+        nint xArg = xF32, qArg = xQ8, mArg = xMeta;
+        int blocks = elements / Pq2_0Dp4aQuantBlock;
+        void** args = stackalloc void*[] { &xArg, &qArg, &mArg, &blocks };
+        CudaDriverApi.cuLaunchKernel(_pq2_0Dp4aQuantizeFunc,
+                (uint)((blocks + BlockSize - 1) / BlockSize), 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// dp4a PQ2_0 GEMV (issue #485): <c>y[s, row] = W[row, :] · x[s, :]</c> for <c>s &lt; columns</c>
+    /// on int8 activations produced by <see cref="LaunchPQ2_0Dp4aQuantizeX"/> over the same
+    /// <c>[columns, k]</c> rows. Numerically the CPU W2A8 tier; only FP32 summation order differs.
+    /// </summary>
+    /// <param name="quantWeight">Split-layout PQ2_0 weight <c>[n, k]</c> (see <see cref="LaunchPQ2_0RepackSplitF16"/>).</param>
+    /// <param name="xQ8">Quantized activations <c>[columns, k]</c>.</param>
+    /// <param name="xMeta">Quantizer metadata <c>[columns, k/32]</c>.</param>
+    /// <param name="yF32">F32 output <c>[columns, n]</c>.</param>
+    /// <param name="n">Output rows.</param>
+    /// <param name="k">Input width, a multiple of 128.</param>
+    /// <param name="columns">Token columns, 1..<see cref="Pq2_0GemvMultiMaxColumns"/>.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchPQ2_0GemvDp4a(nint quantWeight, nint xQ8, nint xMeta, nint yF32, int n, int k, int columns, nint stream)
+    {
+        if ((uint)(columns - 1) >= Pq2_0GemvMultiMaxColumns)
+            throw new ArgumentOutOfRangeException(nameof(columns), columns,
+                $"dp4a PQ2_0 GEMV supports 1..{Pq2_0GemvMultiMaxColumns} columns.");
+        if (k <= 0 || k % 128 != 0)
+            throw new ArgumentException($"PQ2_0 k must be a positive multiple of 128, got {k}.", nameof(k));
+        nint func = _pq2_0GemvDp4aFuncs[columns];
+        if (func == 0)
+            throw new InvalidOperationException(
+                $"pq2_0_gemv_dp4a_f32y_{columns} not loaded ({_pq2_0GemvDp4aUnavailableReason}).");
+        if (n <= 0) return;
+
+        nint wArg = quantWeight, qArg = xQ8, mArg = xMeta, yArg = yF32;
+        int nArg = n, kArg = k;
+        void** args = stackalloc void*[] { &wArg, &qArg, &mArg, &yArg, &nArg, &kArg };
+        uint grid = (uint)((n + Pq2_0GemvMultiRowsPerBlock - 1) / Pq2_0GemvMultiRowsPerBlock);
+        CudaDriverApi.cuLaunchKernel(func,
+                grid, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>Token columns per block tile of the wide (default) PQ2_0 MMQ instantiation. Must match <c>pq2_0_mmq_dp4a_f32y_bn32</c>.</summary>
+    public const int Pq2_0MmqTileColumnsWide = 32;
+
+    /// <summary>Output rows per block tile of the wide PQ2_0 MMQ instantiation (<c>BM = 32 * TM</c>).</summary>
+    public const int Pq2_0MmqTileRowsWide = 128;
+
+    /// <summary>Token columns per block tile of the narrow PQ2_0 MMQ instantiation (<c>pq2_0_mmq_dp4a_f32y_bn16</c>).</summary>
+    public const int Pq2_0MmqTileColumnsNarrow = 16;
+
+    /// <summary>Output rows per block tile of the narrow PQ2_0 MMQ instantiation.</summary>
+    public const int Pq2_0MmqTileRowsNarrow = 256;
+
+    /// <summary>Token columns per block tile of the int8 tensor-core PQ2_0 MMQ (<c>pq2_0_mmq_mma_f32y</c>, issue #1222).</summary>
+    public const int Pq2_0MmqTileColumnsMma = 64;
+
+    /// <summary>Output rows per block tile of the int8 tensor-core PQ2_0 MMQ.</summary>
+    public const int Pq2_0MmqTileRowsMma = 128;
+
+    /// <summary>
+    /// Whether the int8 tensor-core PQ2_0 prefill GEMM (<c>pq2_0_mmq_mma.ptx</c>, issue #1222) loaded
+    /// (sm_80+ only). It shares <see cref="LaunchPQ2_0MmqDp4a"/>'s inputs and is bit-identical to its
+    /// dp4a tiles; select it with <see cref="Pq2_0MmqTileColumnsMma"/>.
+    /// </summary>
+    public bool HasPQ2_0MmqMma => _pq2_0MmqMmaFunc != 0;
+
+    /// <summary>
+    /// Whether the packed PQ2_0 prefill GEMM (<c>pq2_0_mmq_dp4a.ptx</c>, issue #490) is loaded. It
+    /// consumes <see cref="LaunchPQ2_0Dp4aQuantizeX"/>'s output, so
+    /// <see cref="HasPQ2_0GemvDp4a"/> must hold too for the path to be usable.
+    /// </summary>
+    public bool HasPQ2_0MmqDp4a => _hasPQ2_0MmqDp4a;
+
+    /// <summary>Why <see cref="HasPQ2_0MmqDp4a"/> is false, or <see langword="null"/> when it is true.</summary>
+    public string? PQ2_0MmqDp4aUnavailableReason => HasPQ2_0MmqDp4a ? null : _pq2_0MmqDp4aUnavailableReason;
+
+    /// <summary>
+    /// Packed PQ2_0 prefill GEMM (issue #490): <c>y[s, row] = W[row, :] · x[s, :]</c> for
+    /// <c>s &lt; columns</c>, reading the weights PACKED and decoding them in registers instead of
+    /// dequantizing the whole matrix to F16 for cuBLAS. Numerically the CPU W2A8 tier, exactly like
+    /// <see cref="LaunchPQ2_0GemvDp4a"/> (whose quantizer output it consumes unchanged); only the
+    /// FP32 summation order differs.
+    /// </summary>
+    /// <remarks>
+    /// The grid is (column tile, row tile) in that order on purpose — the blocks sharing a weight row
+    /// tile are scheduled together so the weight stream is read from DRAM about once and served to its
+    /// siblings from L2. See native/kernels/pq2_0_mmq_dp4a.cu.
+    /// </remarks>
+    /// <param name="quantWeight">Split-layout PQ2_0 weight <c>[n, k]</c> (see <see cref="LaunchPQ2_0RepackSplitF16"/>).</param>
+    /// <param name="xQ8">Quantized activations <c>[columns, k]</c> from <see cref="LaunchPQ2_0Dp4aQuantizeX"/>.</param>
+    /// <param name="xMeta">Quantizer metadata <c>[columns, k/32]</c>.</param>
+    /// <param name="yF32">F32 output <c>[columns, n]</c>.</param>
+    /// <param name="n">Output rows.</param>
+    /// <param name="k">Input width, a multiple of 128.</param>
+    /// <param name="columns">Token columns (any positive count; tails are masked).</param>
+    /// <param name="tileColumns">
+    /// Column tile: <see cref="Pq2_0MmqTileColumnsWide"/>, <see cref="Pq2_0MmqTileColumnsNarrow"/>, or
+    /// <see cref="Pq2_0MmqTileColumnsMma"/> (the int8 tensor-core tile; falls back to the wide dp4a
+    /// tile when <see cref="HasPQ2_0MmqMma"/> is false).
+    /// </param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchPQ2_0MmqDp4a(nint quantWeight, nint xQ8, nint xMeta, nint yF32,
+        int n, int k, int columns, int tileColumns, nint stream)
+    {
+        if (columns <= 0)
+            throw new ArgumentOutOfRangeException(nameof(columns), columns, "columns must be positive.");
+        if (k <= 0 || k % 128 != 0)
+            throw new ArgumentException($"PQ2_0 k must be a positive multiple of 128, got {k}.", nameof(k));
+
+        if (tileColumns == Pq2_0MmqTileColumnsMma)
+        {
+            if (_pq2_0MmqMmaFunc != 0)
+            {
+                if (n <= 0) return;
+                nint wA = quantWeight, qA = xQ8, mA = xMeta, yA = yF32;
+                int nA = n, kA = k, cA = columns;
+                void** a = stackalloc void*[] { &wA, &qA, &mA, &yA, &nA, &kA, &cA };
+                CudaDriverApi.cuLaunchKernel(_pq2_0MmqMmaFunc,
+                        (uint)((columns + Pq2_0MmqTileColumnsMma - 1) / Pq2_0MmqTileColumnsMma),   // x = column tile
+                        (uint)((n + Pq2_0MmqTileRowsMma - 1) / Pq2_0MmqTileRowsMma), 1,
+                        BlockSize, 1, 1,
+                        0, stream, (nint)a, 0).ThrowOnError();
+                return;
+            }
+            tileColumns = Pq2_0MmqTileColumnsWide;
+        }
+
+        bool narrow = tileColumns == Pq2_0MmqTileColumnsNarrow;
+        if (!narrow && tileColumns != Pq2_0MmqTileColumnsWide)
+            throw new ArgumentOutOfRangeException(nameof(tileColumns), tileColumns,
+                $"PQ2_0 MMQ tiles are {Pq2_0MmqTileColumnsNarrow} or {Pq2_0MmqTileColumnsWide} columns.");
+
+        nint func = narrow ? _pq2_0MmqDp4aBn16Func : _pq2_0MmqDp4aBn32Func;
+        if (func == 0)
+            throw new InvalidOperationException(
+                $"pq2_0_mmq_dp4a_f32y_bn{tileColumns} not loaded ({_pq2_0MmqDp4aUnavailableReason}).");
+        if (n <= 0) return;
+
+        int tileRows = narrow ? Pq2_0MmqTileRowsNarrow : Pq2_0MmqTileRowsWide;
+        nint wArg = quantWeight, qArg = xQ8, mArg = xMeta, yArg = yF32;
+        int nArg = n, kArg = k, cArg = columns;
+        void** args = stackalloc void*[] { &wArg, &qArg, &mArg, &yArg, &nArg, &kArg, &cArg };
+        CudaDriverApi.cuLaunchKernel(func,
+                (uint)((columns + tileColumns - 1) / tileColumns),   // x = column tile (L2 reuse order)
+                (uint)((n + tileRows - 1) / tileRows), 1,
+                BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
     /// <summary>Whether the TurboQuant KV codec kernels are loaded (turboquant.ptx present).</summary>
     public bool TurboQuantAvailable => _turboquantDequantF32Func != 0 && _turboquantEncodeF32Func != 0;
 
@@ -5325,6 +6968,21 @@ public sealed unsafe class CudaKernels : IDisposable
                 uint gridDim = (uint)Math.Min((totalElements + (int)BlockSize - 1) / (int)BlockSize,
                     MaxDequantGridSize);
                 CudaDriverApi.cuLaunchKernel(_dequantBF16F32Func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+
+            case QuantizationType.NVFP4:
+            {
+                if (_dequantNVFP4F32Func == 0)
+                    break;
+                int totalBlocks = totalElements / QuantFormat.Nvfp4GroupSize;
+                int tbArg = totalBlocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tbArg};
+                // Each 256-thread CUDA block covers 4 NVFP4 blocks (64 elements each).
+                uint gridDim = (uint)Math.Min((totalBlocks + 3) / 4, MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(_dequantNVFP4F32Func,
                         gridDim, 1, 1, BlockSize, 1, 1,
                         0, stream, (nint)args, 0).ThrowOnError();
                 return;
@@ -5641,6 +7299,21 @@ public sealed unsafe class CudaKernels : IDisposable
                 uint gridDim = (uint)Math.Min((totalElements + (int)BlockSize - 1) / (int)BlockSize,
                     MaxDequantGridSize);
                 CudaDriverApi.cuLaunchKernel(_dequantBF16Func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+
+            case QuantizationType.NVFP4:
+            {
+                if (_dequantNVFP4Func == 0)
+                    throw new InvalidOperationException(
+                        "NVFP4 dequant kernel not present — rebuild nvfp4.ptx from native/kernels/nvfp4.cu (#1038).");
+                int totalBlocks = totalElements / QuantFormat.Nvfp4GroupSize;
+                int tbArg = totalBlocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tbArg};
+                uint gridDim = (uint)Math.Min((totalBlocks + 3) / 4, MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(_dequantNVFP4Func,
                         gridDim, 1, 1, BlockSize, 1, 1,
                         0, stream, (nint)args, 0).ThrowOnError();
                 return;
@@ -6055,6 +7728,72 @@ public sealed unsafe class CudaKernels : IDisposable
         CudaDriverApi.cuLaunchKernel(_moeSoftmaxTopkF32Func,
                 (uint)seqLen, 1, 1, block, 1, 1,
                 sharedBytes, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Divides each row of <paramref name="x"/> whose max|x| exceeds 1024 by a power of two in place and writes the factor
+    /// to undo it (1 for untouched rows) to <paramref name="factors"/>: the F16-safe MoE down input of the CPU
+    /// (<c>MoeSwiGluMlp.RescaleDownInputForF16Sums</c>, #1158) for Q8_1 paths with F16 block sums. Undo with
+    /// <see cref="LaunchMoeScaleRows"/> on the projected rows.
+    /// </summary>
+    /// <param name="x">F32 rows <c>[rows, n]</c>, rescaled in place.</param>
+    /// <param name="factors">F32 <c>[rows]</c> output factors.</param>
+    /// <param name="rows">Row count.</param>
+    /// <param name="n">Row length.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchMoePow2RescaleRows(nint x, nint factors, int rows, int n, nint stream)
+        => LaunchRowKernel(_moePow2RescaleRowsF32Func, "moe_pow2_rescale_rows_f32", x, factors, rows, n, stream);
+
+    /// <summary>Multiplies each row of <paramref name="y"/> by <paramref name="factors"/>[row] (skips rows whose factor is 1).</summary>
+    /// <param name="y">F32 rows <c>[rows, n]</c>, scaled in place.</param>
+    /// <param name="factors">F32 <c>[rows]</c> factors from <see cref="LaunchMoePow2RescaleRows"/>.</param>
+    /// <param name="rows">Row count.</param>
+    /// <param name="n">Row length.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchMoeScaleRows(nint y, nint factors, int rows, int n, nint stream)
+        => LaunchRowKernel(_moeScaleRowsF32Func, "moe_scale_rows_f32", y, factors, rows, n, stream);
+
+    private void LaunchRowKernel(nint func, string name, nint a0, nint a1, int rows, int n, nint stream)
+    {
+        if (func == 0)
+            throw new InvalidOperationException($"{name} not available. Recompile native/kernels/moe_ffn.cu to PTX.");
+        if (rows <= 0) return;
+        nint p0 = a0, p1 = a1;
+        int nArg = n;
+        void** args = stackalloc void*[] { &p0, &p1, &nArg };
+        CudaDriverApi.cuLaunchKernel(func, (uint)rows, 1, 1, BlockSize, 1, 1, 0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>True when the sigmoid top-k router kernel is loaded (moe_ffn.cu, #1172).</summary>
+    public bool HasMoeSigmoidTopk => _moeSigmoidTopkF32Func != 0;
+
+    /// <summary>
+    /// Per-token sigmoid + top-k selection for MoE routing (Flint; llama.cpp SIGMOID gating, no selection bias):
+    /// <paramref name="topkWeight"/> holds the chosen sigmoid probabilities, renormalised (sum clamped at 6.1035e-5,
+    /// as the CPU <c>MoeSwiGluMlp.Route</c>) when <paramref name="normalize"/> is set.
+    /// </summary>
+    /// <param name="logits">Router logits <c>[seqLen, numExperts]</c> (F32).</param>
+    /// <param name="topkIdx">Output expert ids <c>[seqLen, topK]</c> (int32).</param>
+    /// <param name="topkWeight">Output gating weights <c>[seqLen, topK]</c> (F32).</param>
+    /// <param name="seqLen">Tokens.</param>
+    /// <param name="numExperts">Routed experts.</param>
+    /// <param name="topK">Experts per token (at most 64).</param>
+    /// <param name="normalize">Renormalise the chosen weights to sum to 1.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchMoeSigmoidTopk(nint logits, nint topkIdx, nint topkWeight,
+        int seqLen, int numExperts, int topK, bool normalize, nint stream)
+    {
+        if (_moeSigmoidTopkF32Func == 0)
+            throw new InvalidOperationException(
+                "moe_sigmoid_topk_f32 not available. Recompile native/kernels/moe_ffn.cu to PTX.");
+        if (topK > 64)
+            throw new ArgumentOutOfRangeException(nameof(topK), "topK > 64 is not supported by the GPU MoE kernel.");
+        nint logitsArg = logits, idxArg = topkIdx, wArg = topkWeight;
+        int slArg = seqLen, neArg = numExperts, kArg = topK, normArg = normalize ? 1 : 0;
+        void** args = stackalloc void*[] { &logitsArg, &idxArg, &wArg, &slArg, &neArg, &kArg, &normArg };
+        CudaDriverApi.cuLaunchKernel(_moeSigmoidTopkF32Func,
+                (uint)seqLen, 1, 1, 128, 1, 1,
+                (uint)(numExperts * sizeof(float)), stream, (nint)args, 0).ThrowOnError();
     }
 
     /// <summary>
@@ -6477,6 +8216,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _dequantIQ3Module?.Dispose();
         _dequantIQ1Module?.Dispose();
         _dequantBf16Mxfp4Module?.Dispose();
+        _nvfp4Module?.Dispose();
         _quantizedGemvModule.Dispose();
         _fusedAddRmsNormModule.Dispose();
         _rmsnormF32InModule.Dispose();
@@ -6500,14 +8240,21 @@ public sealed unsafe class CudaKernels : IDisposable
         _relu2F32Module.Dispose();
         _relu2GluRmsNormModule.Dispose();
         _fusedAddRmsNormF32ResModule.Dispose();
+        _nemotronMoeModule?.Dispose();
         _quantKvModule?.Dispose();
         _turboquantModule?.Dispose();
+        _hadamardFwhtModule?.Dispose();
+        _pq2_0GemvMultiModule?.Dispose();
+        _pq2_0GemvDp4aModule?.Dispose();
+        _pq2_0MmqDp4aModule?.Dispose();
+        _pq2_0MmqMmaModule?.Dispose();
         _kvWriteModule?.Dispose();
         _fusedRopeKvWriteModule?.Dispose();
         _attentionMlaModule?.Dispose();
         _mlaHelpersModule?.Dispose();
         _moeFfnModule?.Dispose();
         _moeGroupedGemvModule?.Dispose();
+        _q4_1Module?.Dispose();
         _attentionMlaLatentModule?.Dispose();
         // GDN/conv1d modules: _l2NormHeadsF32Module aliases _gdnScanF32Module
         // (same .ptx file), so dispose only the scan module — disposing both

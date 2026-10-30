@@ -68,6 +68,42 @@ public sealed class GgufFileTests : IDisposable
     }
 
     [Fact]
+    public unsafe void CopyOnWriteAlias_SameBytes_WritesStayPrivate()
+    {
+        // #1190: the Vulkan import retries a read-only weight range through a copy-on-write alias view.
+        // The alias must address the same bytes, never write through to the file, and die with the GgufFile.
+        byte[] tensorData = new byte[64 * 1024 + 300];
+        new Random(1190).NextBytes(tensorData);
+        var data = new GgufTestData(version: 3)
+            .AddString("general.architecture", "llama")
+            .AddTensor("test.weight", [tensorData.Length / 4], 0, tensorData);
+        string path = WriteTempGguf(data);
+
+        using (var file = GgufFile.Open(path))
+        {
+            Assert.Equal(System.IO.MemoryMappedFiles.MemoryMappedFileAccess.Read, GgufFile.MappingAccess);
+            nint src = file.DataBasePointer + 300; // not page- or granularity-aligned
+            long len = tensorData.Length - 300;
+
+            Assert.False(GgufFile.TryMapImportAlias(1, 16, writable: false, out _)); // not inside any mapping
+            Assert.True(GgufFile.TryMapImportAlias(src, len, writable: false, out nint alias));
+            Assert.NotEqual(src, alias);
+            Assert.True(new ReadOnlySpan<byte>((void*)alias, (int)len).SequenceEqual(tensorData.AsSpan(300)));
+
+            ((byte*)alias)[0] ^= 0xFF; // privatises the alias page only
+            Assert.Equal(tensorData[300], ((byte*)src)[0]);
+
+            // The writable alias sees the same bytes (and the file stays shareable with the read-only mapping).
+            Assert.True(GgufFile.TryMapImportAlias(src, len, writable: true, out nint alias2));
+            Assert.True(new ReadOnlySpan<byte>((void*)alias2, (int)len).SequenceEqual(tensorData.AsSpan(300)));
+            GgufFile.ReleaseImportAlias(alias2);
+        }
+
+        using var reopened = GgufFile.Open(path);
+        Assert.Equal(tensorData[300], ((byte*)reopened.DataBasePointer)[300]);
+    }
+
+    [Fact]
     public void Open_V2File_WithArrayMetadataAndTensors_Succeeds()
     {
         // Reproduces the real-world GGUF v2 failure (e.g. TheBloke/Llama-2-13B-GGUF): before the

@@ -18,11 +18,25 @@ pipeline is selected in `TiktokenPreTokenizer.GetRegexes`.
 - **Unknown value** → `InvalidDataException` at load (llama.cpp throws here too). Escape hatch:
   `DOTLLM_ALLOW_UNKNOWN_PRETOKENIZER=1` proceeds with the GPT-2 default pipeline — never with
   "no pre-tokenization", which silently mis-tokenizes.
-- Supported `pre` values: `default`/`gpt2`; `llama3`/`llama-v3`/`llama-bpe`/`falcon3`/`falcon-h1`/
-  `pixtral`/`midm-2.0`/`lfm2`/`jina-v5-nano` (one shared Llama-3 pipeline, as in llama.cpp);
-  `starcoder`/`refact`/`command-r`/`smollm`/`codeshell`/`exaone`/`minerva`/`mellum2`;
-  `deepseek-llm`; `deepseek-coder`; `gpt-4o`/`llama4`. New values are sourced from llama.cpp
-  `llama-vocab.cpp` (authoritative), never invented.
+- Supported `pre` values (one row per pipeline; aliases share a pipeline exactly as they share
+  a `case` block in llama.cpp):
+
+  | Pipeline | `tokenizer.ggml.pre` values |
+  |---|---|
+  | GPT-2 default | `default`, `gpt2` (also the absent/empty and opt-out fallback) |
+  | Llama 3 | `llama3`, `llama-v3`, `llama-bpe`, `falcon3`, `falcon-h1`, `pixtral`, `midm-2.0`, `lfm2`, `jina-v5-nano` |
+  | StarCoder/SmolLM | `starcoder`, `refact`, `command-r`, `smollm`, `codeshell`, `exaone`, `minerva`, `minerva-7b`, `mellum2` |
+  | DeepSeek LLM | `deepseek-llm` |
+  | DeepSeek Coder | `deepseek-coder` |
+  | Qwen 2 | `qwen2`, `deepseek-r1-qwen`, `kormo`, `f2llmv2`, `megrez`, `stablelm2`, `hunyuan`, `solar-open` |
+  | Qwen 3.5 | `qwen35` |
+  | GPT-4o | `gpt-4o`, `llama4` |
+  | Tekken | `tekken` |
+
+  New values are sourced from llama.cpp `llama-vocab.cpp` (authoritative), never invented.
+  The Qwen pipelines differ from Llama 3 only in the digit alternative — a bare `\p{N}`
+  splits every digit — and Qwen 3.5 additionally folds combining marks into the letter run
+  (`[\p{L}\p{M}]+`). Any `pre` value not in this table throws; see the policy above.
 
 ### SentencePiece BPE (Llama 2)
 
@@ -57,6 +71,53 @@ Implemented in `Gemma4SpmBpeEncoding` (`BpeTokenizer.CreateGemma4`); routed by
 are present (files without merges keep the SentencePiece longest-match fallback).
 Oracle-pinned parity tests: `Gemma4TokenizerParityTests` (integration, vs
 `llama-tokenize --ids`) and `Gemma4BpeTokenizerTests` (unit, synthetic vocab).
+
+### WordPiece (BERT, `tokenizer.ggml.model = "bert"`)
+
+`DotLLM.Tokenizers.WordPiece.WordPieceTokenizer` (issue #738) implements HF `BertTokenizer`
+semantics for embedding encoders: NFC, clean (drop NUL/U+FFFD/control, whitespace to space), CJK
+ideographs padded with spaces, optional lower-casing + accent stripping (NFD, drop `Mn`),
+punctuation split (all ASCII non-alphanumerics + Unicode `P*`), greedy longest-match with `##`
+continuation, whole word to `[UNK]` when unsegmentable or longer than 100 code points. `Encode`
+returns `[CLS] ... [SEP]`; literal `[CLS]`/`[SEP]`/`[MASK]`/... in the text map to their ids.
+
+- **GGUF**: llama.cpp stores the vocabulary in "WPM" form: word-initial pieces prefixed `▁`,
+  continuations bare (`##` stripped), bracketed specials untouched. `FromGgufTokens` converts to the
+  canonical form. CLS/SEP ids come from `cls_token_id`/`seperator_token_id` (sic) or, in older files,
+  `bos_token_id`/`eos_token_id`; anything missing is resolved by string. `GgufTokenizerFactory.Load`
+  dispatches `bert` to this tokenizer and everything else to the BPE factory.
+- **tokenizer.json**: `HfWordPieceLoader.Parse` (`model.type == "WordPiece"`; honours
+  `BertNormalizer` / `Lowercase` / `StripAccents`).
+- Validated: exact id parity with HF `tokenizers` on 18 sentences (accents, CJK, Korean, symbols,
+  control characters, over-long word, literal specials) through both paths
+  (`BertWordPieceParityTests`). llama.cpp b9016's `/tokenize` on the same GGUF was also measured on 9
+  sentences (incl. accents and CJK) and is id-identical to HF, so there is no known deviation from
+  llama.cpp either.
+
+### SentencePiece Unigram (XLM-R, T5; `tokenizer.ggml.model = "t5"`)
+
+`DotLLM.Tokenizers.Unigram.UnigramTokenizer` (issue #1401) is a port of llama.cpp's `llm_tokenizer_ugm`, which follows
+SentencePiece's optimized Viterbi. It exists for BERT-family GGUFs with an XLM-R vocabulary (multilingual-e5, bge-m3):
+`BertEncoderModel` is unchanged, only the vocabulary differs from WordPiece.
+
+- **Pipeline**: literal control tokens in the text (`<s>`, `</s>`, `<pad>`, `<unk>`) become their ids; each segment goes through the
+  `precompiled_charsmap` (`PrecompiledCharsMap`: a darts-clone double array walked exactly like llama.cpp's XCDA reader, longest rule
+  wins, unmatched characters pass through; **not** `string.Normalize(FormKC)`, the table is frozen at SentencePiece training time),
+  whitespace collapse/trim (`remove_extra_whitespaces`), every space run becomes one `▁` before the next word (`add_space_prefix`),
+  then Viterbi over the UTF-8 bytes maximising the summed piece scores.
+- **Unknown characters** cost `min(NORMAL scores) - 10`; consecutive unknown characters fuse into one `<unk>`. Only NORMAL and
+  USER_DEFINED pieces are matchable (UNUSED `[PADn]` fillers and control pieces are not) and only NORMAL scores set the unknown cost.
+- **GGUF keys**: `tokens`, `scores` (required), `token_type`, `precompiled_charsmap` (uint8/int8/int32 array), `add_space_prefix`,
+  `remove_extra_whitespaces`, `unknown/bos/eos/seperator/padding_token_id`, `add_bos_token`/`add_eos_token`. `Encode` returns
+  `<s> ... </s>` (the encoder's CLS/SEP). `GgufTokenizerFactory.Load` dispatches `t5` here; `GgufBpeTokenizerFactory` throws for it.
+- **Validated** against HF `AutoTokenizer` (`intfloat/multilingual-e5-small`) and llama.cpp b9016 `/tokenize`: 63 curated multilingual
+  texts (Latin/diacritics, Cyrillic, Arabic, Devanagari, Thai, CJK, Japanese, Korean, emoji, full-width/ligature/circled NFKC cases,
+  whitespace edge cases) identical to both; 3000 random vocab/odd-codepoint texts identical to llama.cpp, and identical to HF except 23.
+  Those 23 are an HF quirk, not a dotLLM bug: HF's Rust charsmap normalizer maps per grapheme cluster and, when the cluster's first
+  character has a rule, drops the rest of the cluster (`ﬁ` + U+0301 gives `fi` in HF, `fi` + U+0301 in SentencePiece and llama.cpp).
+  `XlmRUnigramParityTests` pins both sides (fixture `hf-xlmr-multilingual-e5-small.json`).
+- Not covered: `<mask>` lstrip (HF eats the space before `<mask>`; the community GGUF has no `<mask>` piece anyway), Unigram byte
+  fallback (XLM-R has none), `treat_whitespace_as_suffix`.
 
 ### HuggingFace tokenizer.json
 
@@ -211,11 +272,38 @@ ChatMessage:
   Content: string
   ToolCalls: ToolCall[]?     (for assistant messages with tool calls)
   ToolCallId: string?        (for tool result messages)
+  ReasoningContent: string?  (assistant reasoning; exposed as message.reasoning_content, #767)
 
 ChatTemplateOptions:
   AddGenerationPrompt: bool  (append assistant turn prefix)
   Tools: ToolDefinition[]?   (for tool-calling models)
+  EnableThinking: bool?      (-> enable_thinking; null = left undefined, the template default applies)
+  ReasoningEffort: string?   (-> reasoning_effort)
+  PreserveThinking: bool?    (-> preserve_thinking)
+  TemplateKwargs: IReadOnlyDictionary<string, JsonElement>?  (chat_template_kwargs; merged first, so the
+                             typed members above and the structural variables messages / tools /
+                             add_generation_prompt / bos_token / eos_token always win)
 ```
+
+The reasoning members are **only inserted into the Jinja context when set**: Qwen3.x tests
+`enable_thinking is undefined`, and a null-valued key is *defined*, so inserting nulls would silently turn thinking off.
+`JinjaQwen3_8_27BReasoningOptionsTests` renders the real Qwen3.x template through `JinjaChatTemplate.Apply` with these
+options (typed and as kwargs) and compares against the Python Jinja2 goldens in `Fixtures/qwen3.8-27b-render-cases.json`.
+
+### Reasoning split (`DotLLM.Tokenizers.Reasoning`, #767)
+
+Models that think emit `<think>…</think>` before the answer; many templates open the block in the generation prompt.
+`ReasoningFormats.PromptOpensThinking(prompt)` decides from the **rendered prompt** (last `<think>` after the last `</think>`, only
+whitespace after it) whether generation starts inside a block, and `ReasoningSplitter` is the incremental splitter the server drives
+(`Feed(text)` per token, `Finish()` at the end; non-streaming is the same machine fed once). It never emits part of a tag, drops the
+whitespace around the tags, treats an unclosed block as all reasoning, and recognises a model-emitted `<think>` only at the start of the output
+(`ReasoningFormat.Auto`) or anywhere (`Deepseek`). See [SERVER.md](SERVER.md#reasoning--thinking-models-767) for the wire behaviour.
+
+**Markups (#798).** The tag pair is per model: `ReasoningMarkups.Detect(templateSource)` returns `Think` (default), `Gemma4Channel`
+(`<|channel>thought` … `<channel|>`; `PromptOpensThinking(prompt, open, close)` handles the case where a tool-response generation prompt ends in an
+open channel) or `Harmony` (gpt-oss). `ReasoningSplitter` takes the tag pair as constructor arguments; `HarmonySplitter` is a separate state machine
+(Idle / Header / Body over channel messages) and both implement `IReasoningSplitter` (`Feed`, `Finish`, `InReasoning`, `SawReasoning`,
+`ReasoningRawLength`). The server asks `ReasoningPlan` for a splitter and never branches on the family itself.
 
 ### Known Template Formats
 

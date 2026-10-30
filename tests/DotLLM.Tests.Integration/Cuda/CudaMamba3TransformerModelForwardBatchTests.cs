@@ -41,6 +41,7 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class CudaMamba3TransformerModelForwardBatchTests : IDisposable
 {
     private const int VocabSize = 16; // must match CudaMamba3ParitySyntheticTests' fixture constants.

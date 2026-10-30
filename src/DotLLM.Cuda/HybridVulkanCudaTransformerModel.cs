@@ -119,6 +119,14 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
     {
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
+        CudaTransformerModel.RejectGemmaForCompositeHost(config, nameof(HybridVulkanCudaTransformerModel));
+        // #1038: NVFP4 runs only on the Nemotron-H paths, not on this dense Vulkan|CUDA split; refuse before any upload.
+        Nvfp4Support.RejectAny(gguf.TensorsByName, "Vulkan/CUDA hybrid");
+        QuantSupport.RejectAny(gguf.TensorsByName, QuantizationType.PTQ1_0, "Vulkan/CUDA hybrid", 1280); // the CUDA side has no PTQ1_0 kernels
+        // #737: VulkanTransformerModel.LoadFromGguf now accepts gpt-oss (single-device only); the hybrid
+        // split does not wire its sinks/YaRN across the Vulkan|CUDA boundary, so refuse here explicitly.
+        if (config.Architecture == DotLLM.Core.Configuration.Architecture.GptOss)
+            throw new NotSupportedException(VulkanTransformerModel.GptOssUnsupportedMessage);
         if (numVulkanLayers <= 0 || numVulkanLayers >= config.NumLayers)
             throw new ArgumentOutOfRangeException(nameof(numVulkanLayers),
                 $"numVulkanLayers must be between 1 and {config.NumLayers - 1}. " +
@@ -185,6 +193,8 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
         ArgumentNullException.ThrowIfNull(cpuWeights);
         ArgumentNullException.ThrowIfNull(config);
         ArgumentNullException.ThrowIfNull(vulkanDevice);
+        if (config.Architecture == DotLLM.Core.Configuration.Architecture.GptOss)
+            throw new NotSupportedException(VulkanTransformerModel.GptOssUnsupportedMessage);
         if (numVulkanLayers <= 0 || numVulkanLayers >= config.NumLayers)
             throw new ArgumentOutOfRangeException(nameof(numVulkanLayers),
                 $"numVulkanLayers must be between 1 and {config.NumLayers - 1}.");
@@ -220,6 +230,12 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
         ModelConfig config, VulkanTransformerModel vulkanModel, int numVulkanLayers,
         TransformerWeights cpuWeights, int cudaDeviceId, string? ptxDir)
     {
+        // #484: validate the PTX deployment BEFORE any CUDA resource exists. A bad or
+        // incomplete ptxDir is by far the most common way this factory throws, and doing the
+        // check up front means it can no longer orphan a context/stream/cuBLAS handle,
+        // whatever the unwind path does (see CudaKernels.ResolveAndValidatePtxDirectory).
+        ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(ptxDir);
+
         // Initialize CUDA. #383: context creation cannot leak on its own throw (nothing
         // allocated yet), so it stays outside the try/catch — everything created from here on
         // is disposed on any failure before rethrowing. This method does NOT own
@@ -237,7 +253,6 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
             cublas = CudaCublasHandle.Create();
             cublas.SetStream(stream);
 
-            ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
             kernels = new CudaKernels(ptxDir);
 
             // Upload only the CUDA-resident layers to CUDA VRAM. Layers 0..numVulkanLayers-1
@@ -457,7 +472,6 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
         int intermediateSize = Config.IntermediateSize;
         int vocabSize = Config.VocabSize;
         float eps = Config.NormEpsilon;
-        int slidingWindow = Config.SlidingWindowSize ?? 0;
         int h = sizeof(ushort); // FP16 element size
 
         _context.MakeCurrent();
@@ -498,6 +512,15 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
             ref readonly var lw = ref _cudaWeights.Layers[localLayer];
             int cacheLayer = localLayer;
 
+            // Per-layer window: gpt-oss alternates window/dense (pattern=2), Gemma-3 uses
+            // pattern=6; uniform-window and no-window models resolve identically to the old
+            // hoisted value. 0 = dense (kernel convention). Mirrors CPU GetLayerSlidingWindow.
+            // `layer` is the absolute (global) index (CUDA phase = global layers
+            // _numVulkanLayers..totalLayers-1).
+            int slidingWindow = CudaSlidingWindowResolver.Resolve(
+                Config.SlidingWindowSize, Config.SlidingWindowPattern,
+                Config.PerLayerSlidingWindow, layer);
+
             // ── ATTENTION BLOCK ──
             Project(lw.QQuant, lw.QQuantType, lw.Q, _cudaState.NormOutput, _cudaState.Q,
                 lw.QOutputDim, lw.QInputDim, seqLen, s, cublasH);
@@ -515,21 +538,30 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
             if (lw.KNormWeight != 0)
                 _kernels.LaunchPerHeadRmsNorm(_cudaState.K, lw.KNormWeight, eps, numKvHeads, headDim, seqLen, s);
 
+            // Dense-YaRN scaling (#366) rides on the weights bundle; (0, 1.0f) when inactive.
             _kernels.LaunchRoPE(_cudaState.Q, _cudaState.K, _cudaState.PositionsDevice,
-                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, _ropeType, s);
+                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, _ropeType, s,
+                _cudaWeights.RopeYarnInvFreqDevice, _cudaWeights.RopeYarnMscale);
 
             if (cudaKvCache is not null)
             {
                 cudaKvCache.UpdateDevice(_cudaState.K, _cudaState.V, positions, seqLen, cacheLayer, s);
                 int seqKv = cudaKvCache.CurrentLength;
+                // lw.AttnSinksDevice (#365): 0 unless the GGUF carried `attn_sinks.weight`, so this
+                // is bit-identical for every model that has no sinks. Plumbed for the same reason
+                // as HybridTransformerModel's pair — sink loading is tensor-driven, not
+                // architecture-gated, so a future dense sinks model reaching this split path must
+                // not drop them silently.
                 _kernels.LaunchAttention(_cudaState.Q, cudaKvCache.GetKeysPtr(cacheLayer),
                     cudaKvCache.GetValuesPtr(cacheLayer), _cudaState.AttnOutput,
-                    seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], slidingWindow, s);
+                    seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], slidingWindow, s,
+                    lw.AttnSinksDevice);
             }
             else
             {
                 _kernels.LaunchAttention(_cudaState.Q, _cudaState.K, _cudaState.V, _cudaState.AttnOutput,
-                    seqLen, seqLen, numHeads, numKvHeads, headDim, 0, slidingWindow, s);
+                    seqLen, seqLen, numHeads, numKvHeads, headDim, 0, slidingWindow, s,
+                    lw.AttnSinksDevice);
             }
 
             Project(lw.OQuant, lw.OQuantType, lw.O, _cudaState.AttnOutput, _cudaState.NormOutput,

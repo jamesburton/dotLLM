@@ -23,6 +23,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaMoeFfnTests : IDisposable
 {
     private const float DefaultTolerance = 1e-3f;
@@ -97,6 +98,25 @@ public sealed class CudaMoeFfnTests : IDisposable
             normTopKProb: true,
             numSharedExperts: 0, sharedIntermediate: 0, hasSharedGate: false,
             seed: 7);
+    }
+
+    /// <summary>
+    /// A 24-token call over 8 experts, top-3, with a gated shared expert: every expert's bucket mixes routing slots, the case
+    /// the per-expert loop handled with one host copy per row. The bucketed body (#1202) must match it bit for bit.
+    /// </summary>
+    [SkippableFact]
+    public void MoeFfn_MultiToken_MixedSlots_BucketedMatchesLoopAndCpuOracle()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        Skip.If(_kernels == null, "PTX files not found");
+        Skip.IfNot(_kernels!.HasMoeKernels && _kernels.HasMoeCombineBucketed, "MoE PTX kernels not available");
+
+        Run(seqLen: 24,
+            numExperts: 8, topK: 3,
+            hidden: 64, intermediate: 96,
+            normTopKProb: true,
+            numSharedExperts: 1, sharedIntermediate: 64, hasSharedGate: true,
+            seed: 1202, compareLegacyLoop: true);
     }
 
     [SkippableFact]
@@ -367,7 +387,8 @@ public sealed class CudaMoeFfnTests : IDisposable
         bool normTopKProb,
         int numSharedExperts, int sharedIntermediate, bool hasSharedGate,
         int seed,
-        float tolerance = DefaultTolerance)
+        float tolerance = DefaultTolerance,
+        bool compareLegacyLoop = false)
     {
         var rng = new Random(seed);
 
@@ -512,6 +533,28 @@ public sealed class CudaMoeFfnTests : IDisposable
             fixed (float* p = gpuOut)
                 CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dOut,
                     (nuint)(gpuOut.Length * sizeof(float))).ThrowOnError();
+
+            if (compareLegacyLoop)
+            {
+                // The bucketed multi-token body (#1202) must reproduce the per-expert loop bit for bit.
+                float[] legacy = new float[seqLen * hidden];
+                CudaMoeFfn.BucketedEnabled = false;
+                try
+                {
+                    CudaMoeFfn.Forward(hiddenF32: dHidden, outputF32: dOut, seqLen: seqLen, weights: weights,
+                        scratch: scratch, cublasHandle: _cublas!.Handle, kernels: _kernels!, stream: _stream!.Handle);
+                    _stream.Synchronize();
+                }
+                finally
+                {
+                    CudaMoeFfn.BucketedEnabled = true;
+                }
+                fixed (float* p = legacy)
+                    CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dOut, (nuint)(legacy.Length * sizeof(float))).ThrowOnError();
+                for (int i = 0; i < legacy.Length; i++)
+                    Assert.True(BitConverter.SingleToInt32Bits(legacy[i]) == BitConverter.SingleToInt32Bits(gpuOut[i]),
+                        $"bucketed vs per-expert loop differ at {i}: {gpuOut[i]} vs {legacy[i]}");
+            }
 
             int mismatches = 0;
             float maxDiff = 0f;

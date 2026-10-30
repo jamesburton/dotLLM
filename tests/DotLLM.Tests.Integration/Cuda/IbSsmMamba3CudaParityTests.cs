@@ -28,6 +28,7 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// resolve. Additionally requires a CUDA device.
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class IbSsmMamba3CudaParityTests
 {
     private const string CheckpointPathEnvVar = "DOTLLM_IBSSM_CHECKPOINT_PATH";

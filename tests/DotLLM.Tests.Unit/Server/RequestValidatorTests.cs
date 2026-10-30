@@ -23,7 +23,7 @@ public class RequestValidatorTests
     [Fact]
     public void ValidateChatRequest_TooManyMessages_ReturnsError()
     {
-        var messages = new ChatMessageDto[RequestValidator.MaxMessages + 1];
+        var messages = new ChatMessageDto[RequestValidator.DefaultMaxMessages + 1];
         for (int i = 0; i < messages.Length; i++)
             messages[i] = new ChatMessageDto { Role = "user", Content = "hi" };
 

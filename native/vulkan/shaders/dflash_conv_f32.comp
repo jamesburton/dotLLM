@@ -1,0 +1,32 @@
+#version 450
+// DFlash2 grouped dynamic causal convolution along the draft block (issue #1193; CUDA twin dflash_conv_f32 in
+// native/kernels/dflash_f32.cu, CPU twin DFlashCpuBackend.Conv):
+//   y[p][c] = sum_{tap < kernel, tap <= p} (base[side][tap][c] + dyn[p][side][tap][c / group]) * x[p - tap][c]
+// Out of place; one invocation per output element.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufX    { float x[]; };     // [rows, hidden]
+layout(set = 0, binding = 1, std430) readonly  buffer BufDyn  { float dyn[]; };   // [rows, 2, kernel, hidden / group]
+layout(set = 0, binding = 2, std430) readonly  buffer BufBase { float base_[]; }; // [2, kernel, hidden]
+layout(set = 0, binding = 3, std430) writeonly buffer BufY    { float y[]; };     // [rows, hidden]
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint hidden;
+    uint kernel;
+    uint group;
+    uint side;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.rows * pc.hidden) return;
+    uint p = idx / pc.hidden, c = idx % pc.hidden;
+    uint groups = pc.hidden / pc.group;
+    uint d = p * 2u * pc.kernel * groups + pc.side * pc.kernel * groups;
+    float s = 0.0;
+    for (uint tap = 0u; tap < pc.kernel && tap <= p; tap++)
+        s += (base_[(pc.side * pc.kernel + tap) * pc.hidden + c] + dyn[d + tap * groups + c / pc.group]) * x[(p - tap) * pc.hidden + c];
+    y[idx] = s;
+}
