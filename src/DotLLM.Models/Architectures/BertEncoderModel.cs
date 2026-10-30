@@ -57,6 +57,9 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
     /// <summary>Test seam: erf-exact GELU instead of llama.cpp's tanh approximation.</summary>
     internal static bool UseErfGelu { get; set; }
 
+    /// <summary>Test/bench seam (#1402): run the old single-threaded attention call instead of the parallel kernel.</summary>
+    internal static bool UseLegacyAttention { get; set; }
+
     /// <summary>Test seam: skip Q8 activation quantisation for quantized weights (dequantize-and-dot with F32 activations).</summary>
     internal static bool ForceF32Activations { get; set; }
 
@@ -300,11 +303,14 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
                 }
 
                 prof?.Mark(EncoderStage.Rope);
-                Attention.Execute(
-                    new ReadOnlySpan<float>(q, n * h), new ReadOnlySpan<float>(k, n * h), new ReadOnlySpan<float>(v, n * h),
-                    new Span<float>(attn, n * h),
-                    n, n, nh, nh, hd, 0, 1.0f / MathF.Sqrt(hd), default, null, 0f,
-                    AttentionMaskMode.Bidirectional, 0, default);
+                if (UseLegacyAttention)
+                    Attention.Execute(
+                        new ReadOnlySpan<float>(q, n * h), new ReadOnlySpan<float>(k, n * h), new ReadOnlySpan<float>(v, n * h),
+                        new Span<float>(attn, n * h),
+                        n, n, nh, nh, hd, 0, 1.0f / MathF.Sqrt(hd), default, null, 0f,
+                        AttentionMaskMode.Bidirectional, 0, default);
+                else
+                    Attention.ExecuteBidirectional(q, k, v, attn, n, nh, hd, 1.0f / MathF.Sqrt(hd), _pool);
 
                 prof?.Mark(EncoderStage.Attention);
                 Gemm(l.O!, attn, tmp, n);
