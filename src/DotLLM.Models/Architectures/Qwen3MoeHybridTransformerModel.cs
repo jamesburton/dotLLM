@@ -22,7 +22,7 @@ namespace DotLLM.Models.Architectures;
 /// Full-attention layers occur every <see cref="GatedDeltaNetConfig.FullAttnInterval"/> steps
 /// (1-indexed), e.g. layers 4, 8, 12, … 40 for interval=4.
 /// </summary>
-public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
+public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel
 {
     private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
     private const int Q8_0GroupSize = QuantFormat.LegacyGroupSize;
@@ -177,12 +177,13 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
         if (config.Moe is null)
             throw new ArgumentException("Qwen3MoeHybrid config must have Moe populated.", nameof(config));
 
-        nint dataBase = gguf.DataBasePointer;
+        var dataBase = new GgufDataBase(gguf);
         var tensors = gguf.TensorsByName;
+        Nvfp4Support.RejectUnappliedScales(tensors, consumedScales: null, "The Qwen3 MoE-hybrid loader"); // #1038
         var layout = config.HybridLayout;
 
         var embDesc = tensors["token_embd.weight"];
-        nint embPtr = dataBase + (nint)embDesc.DataOffset;
+        nint embPtr = dataBase.Of(embDesc);
 
         var outNormDesc = tensors["output_norm.weight"];
         float[] outputNormWeight = DequantizeF32(dataBase, outNormDesc, config.HiddenSize);
@@ -192,7 +193,7 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
         int outputM, outputK;
         if (tensors.TryGetValue("output.weight", out var outDesc))
         {
-            outputPtr = dataBase + (nint)outDesc.DataOffset;
+            outputPtr = dataBase.Of(outDesc);
             outputQt = outDesc.QuantizationType;
             outputK = outDesc.Shape[0];
             outputM = outDesc.Shape[1];
@@ -231,6 +232,9 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
         var ropeSin = new float[config.MaxSequenceLength * halfRope];
         RoPE.PrecomputeFrequencyTable(config.MaxSequenceLength, ropeDim, ropeTheta, ropeCos, ropeSin);
 
+        // MTP head (#1188): null unless the file declares nextn_predict_layers and carries blk.{NumLayers}.nextn.*.
+        var mtpHead = LoadMtpHeadIfPresent(dataBase, tensors, config, owned);
+
         ComputeThreadPool? pool = CreatePool(threading);
 
         return new Qwen3MoeHybridTransformerModel(
@@ -239,7 +243,10 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
             outputPtr, outputQt, outputM, outputK,
             kvSlotForLayer, attentionLayerCount,
             ropeCos, ropeSin, ropeDim,
-            pool, ownsPool: pool is not null);
+            pool, ownsPool: pool is not null)
+        {
+            _mtpHead = mtpHead,
+        };
     }
 
     private static ComputeThreadPool? CreatePool(ThreadingConfig threading)
@@ -341,7 +348,7 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
     /// decoders and wires them into the SAME <see cref="Qwen3MoeLayerWeights"/> /
     /// <see cref="GdnTokenMixingWeights"/> / <see cref="Qwen3FullAttnWeights"/> /
     /// <see cref="MoeLayerWeights"/> shapes <see cref="LoadFromGguf(GgufFile, ModelConfig)"/>
-    /// populates — the forward pass (<see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, IGdnState?)"/>)
+    /// populates — the forward pass (<see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, IGdnState?, IMtpState?)"/>)
     /// is completely unmodified; this method is a loader-only addition.
     /// </summary>
     /// <remarks>
@@ -753,7 +760,7 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
 
     private static Qwen3MoeLayerWeights LoadLayer(
         int layerIdx,
-        nint dataBase,
+        GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config,
         List<nint> owned)
@@ -799,7 +806,7 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
 
     private static GdnTokenMixingWeights LoadGdnLayer(
         string prefix,
-        nint dataBase,
+        GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config)
     {
@@ -824,24 +831,24 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
 
         return new GdnTokenMixingWeights
         {
-            QkvWeight = dataBase + (nint)qkvDesc.DataOffset,
+            QkvWeight = dataBase.Of(qkvDesc),
             QkvQuantType = qkvDesc.QuantizationType,
             QkvInputDim = qkvDesc.Shape[0],
             QkvOutputDim = qkvDesc.Shape[1],
 
-            GateWeight = dataBase + (nint)gateDesc.DataOffset,
+            GateWeight = dataBase.Of(gateDesc),
             GateQuantType = gateDesc.QuantizationType,
             GateInputDim = gateDesc.Shape[0],
             GateOutputDim = gateDesc.Shape[1],
 
             A = a,
 
-            AlphaWeight = dataBase + (nint)alphaDesc.DataOffset,
+            AlphaWeight = dataBase.Of(alphaDesc),
             AlphaQuantType = alphaDesc.QuantizationType,
             AlphaInputDim = alphaDesc.Shape[0],
             AlphaOutputDim = alphaDesc.Shape[1],
 
-            BetaWeight = dataBase + (nint)betaDesc.DataOffset,
+            BetaWeight = dataBase.Of(betaDesc),
             BetaQuantType = betaDesc.QuantizationType,
             BetaInputDim = betaDesc.Shape[0],
             BetaOutputDim = betaDesc.Shape[1],
@@ -851,7 +858,7 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
             DtBias = dtBias,
             SsmNormWeight = ssmNormWeight,
 
-            OutWeight = dataBase + (nint)outDesc.DataOffset,
+            OutWeight = dataBase.Of(outDesc),
             OutQuantType = outDesc.QuantizationType,
             OutInputDim = outDesc.Shape[0],
             OutOutputDim = outDesc.Shape[1],
@@ -860,7 +867,7 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
 
     private static Qwen3FullAttnWeights LoadFullAttnLayer(
         string prefix,
-        nint dataBase,
+        GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config,
         int numKvHeads)
@@ -886,22 +893,22 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
 
         return new Qwen3FullAttnWeights
         {
-            QWeight = dataBase + (nint)q.DataOffset,
+            QWeight = dataBase.Of(q),
             QQuantType = q.QuantizationType,
             QInputDim = q.Shape[0],
             QOutputDim = q.Shape[1],
 
-            KWeight = dataBase + (nint)k.DataOffset,
+            KWeight = dataBase.Of(k),
             KQuantType = k.QuantizationType,
             KInputDim = k.Shape[0],
             KOutputDim = k.Shape[1],
 
-            VWeight = dataBase + (nint)v.DataOffset,
+            VWeight = dataBase.Of(v),
             VQuantType = v.QuantizationType,
             VInputDim = v.Shape[0],
             VOutputDim = v.Shape[1],
 
-            OWeight = dataBase + (nint)o.DataOffset,
+            OWeight = dataBase.Of(o),
             OQuantType = o.QuantizationType,
             OInputDim = o.Shape[0],
             OOutputDim = o.Shape[1],
@@ -988,10 +995,14 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
     /// Optional per-seq GDN recurrent state container. Must be a
     /// <see cref="GdnStateCache"/> sized for this model's GDN-layer count.
     /// </param>
+    /// <param name="mtpState">
+    /// Optional MTP state (#1188): when a <see cref="CpuMtpState"/> on a model with a head, the post-final-norm rows are captured and the
+    /// batch is absorbed into the head's KV. Logits are unaffected.
+    /// </param>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
-                           int deviceId, IKvCache? kvCache, IGdnState? gdnState)
+                           int deviceId, IKvCache? kvCache, IGdnState? gdnState, IMtpState? mtpState = null)
         => ForwardCore(tokenIds, ReadOnlySpan<float>.Empty, positions, deviceId, kvCache, gdnState,
-                       firstLayer: 0, layerCount: _layers.Length, hiddenOut: Span<float>.Empty)!;
+                       firstLayer: 0, layerCount: _layers.Length, hiddenOut: Span<float>.Empty, mtpState)!;
 
     /// <summary>
     /// Runs a contiguous window of this model's layers standalone, entering from token ids
@@ -1000,7 +1011,7 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
     /// </summary>
     /// <remarks>
     /// <para>This is the layer-cycling entry point (issue #395): the same trunk loop the whole-model
-    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, IGdnState?)"/> runs,
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, IGdnState?, IMtpState?)"/> runs,
     /// restricted to <c>[firstLayer, firstLayer + layerCount)</c>, with no output norm and no LM
     /// head. Apply those separately with <see cref="ApplyOutputHead"/>.</para>
     /// <para><b>GDN state stays globally indexed.</b> Each Gated-DeltaNet layer addresses its
@@ -1058,7 +1069,9 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
     /// Final output norm (in place over <c>_state.HiddenState</c>) + LM-head GEMM, materialised into
     /// a freshly-allocated caller-owned logits tensor.
     /// </summary>
-    private ITensor RunOutputHead(int seqLen, int deviceId)
+    private ITensor RunOutputHead(
+        int seqLen, int deviceId,
+        ReadOnlySpan<int> tokenIds = default, ReadOnlySpan<int> positions = default, IMtpState? mtpState = null)
     {
         int hiddenSize = Config.HiddenSize;
         int vocabSize = Config.VocabSize;
@@ -1088,6 +1101,10 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
         new Span<float>(logits, seqLen * vocabSize).CopyTo(
             new Span<float>((void*)result.DataPointer, seqLen * vocabSize));
 
+        // hidden still holds the post-final-norm rows (llama.cpp's h_nextn) the MTP head pairs with.
+        if (_mtpHead is not null && mtpState is CpuMtpState mtp)
+            CaptureAndAbsorbMtp(mtp, hidden, tokenIds, positions);
+
         return result;
     }
 
@@ -1101,7 +1118,7 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
     private ITensor? ForwardCore(
         ReadOnlySpan<int> tokenIds, ReadOnlySpan<float> hiddenIn, ReadOnlySpan<int> positions,
         int deviceId, IKvCache? kvCache, IGdnState? gdnState,
-        int firstLayer, int layerCount, Span<float> hiddenOut)
+        int firstLayer, int layerCount, Span<float> hiddenOut, IMtpState? mtpState = null)
     {
         // Resolve the GDN state: caller-supplied container preferred, model-owned
         // fallback for the single-seq Forward callers that pre-date the per-seq API.
@@ -1211,6 +1228,7 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
             }
             if (TensorDump.Enabled)
                 TensorDump.Dump2D($"blk.{layer}.attn_norm", normOut, seqLen, hiddenSize);
+            if (DotLLM.Cpu.ActivationRangeProbe.On) DotLLM.Cpu.ActivationRangeProbe.Record(layer, "attn_in", normOut, (long)seqLen * hiddenSize);
 
             if (kinds[layer] == HybridLayerKind.GatedDeltaNet)
                 ForwardGdnBody(lw.Gdn!, layer, seqLen, hiddenSize, normOut, eps, gdnCache);
@@ -1240,6 +1258,11 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
 
             if (TensorDump.Enabled)
                 TensorDump.Dump2D($"blk.{layer}.attn_post_norm", normOut, seqLen, hiddenSize);
+            if (DotLLM.Cpu.ActivationRangeProbe.On)
+            {
+                DotLLM.Cpu.ActivationRangeProbe.Record(layer, "resid_mid", hidden, (long)seqLen * hiddenSize);
+                DotLLM.Cpu.ActivationRangeProbe.Record(layer, "ffn_in", normOut, (long)seqLen * hiddenSize);
+            }
 
             ForwardMoeBody(lw.Moe, layer, seqLen, hiddenSize, normOut);
             if (TensorDump.Enabled)
@@ -1255,6 +1278,11 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
             }
             if (TensorDump.Enabled)
                 TensorDump.Dump2D($"blk.{layer}.l_out", hidden, seqLen, hiddenSize);
+            if (DotLLM.Cpu.ActivationRangeProbe.On)
+            {
+                DotLLM.Cpu.ActivationRangeProbe.Record(layer, "ffn_out", normOut, (long)seqLen * hiddenSize);
+                DotLLM.Cpu.ActivationRangeProbe.Record(layer, "resid_out", hidden, (long)seqLen * hiddenSize);
+            }
         }
 
         // Window mode: hand back the residual stream leaving the last executed layer and stop
@@ -1266,7 +1294,7 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
             return null;
         }
 
-        return RunOutputHead(seqLen, deviceId);
+        return RunOutputHead(seqLen, deviceId, tokenIds, positions, mtpState);
     }
 
     /// <inheritdoc/>
@@ -1287,7 +1315,7 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
     public IRecurrentSequenceState? CreateSequenceState() => new GdnStateCache(_gdn, _gdnCache.NumGdnLayers);
 
     /// <summary>
-    /// Per-sequence loop over <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, IGdnState?)"/>
+    /// Per-sequence loop over <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, IGdnState?, IMtpState?)"/>
     /// — threads each request's GDN state through to the GDN scan, so multi-seq batched
     /// dispatch is safe as long as every request supplies a fresh
     /// <see cref="GdnStateCache"/>. The default <see cref="IModel.ForwardBatch"/> would
@@ -1334,193 +1362,39 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
     /// <summary>
     /// GDN (Gated DeltaNet) token-mixing forward pass. Reads pre-normed activations from
     /// <paramref name="normOut"/> and writes the <c>ssm_out</c> projection back to the same buffer.
-    /// Advances the per-layer GDN conv and associative-memory state in place.
+    /// Advances the per-layer GDN conv and associative-memory state in place. The body is the shared
+    /// <see cref="GdnTokenMixer"/> (Qwen3.5 uses the SiLU output gate); this wrapper only binds the model's scratch and GEMM dispatch.
     /// </summary>
     /// <remarks>
-    /// Operation order (confirmed from llama.cpp <c>qwen35moe.cpp</c>):
-    /// <list type="number">
-    ///   <item>Project <c>attn_qkv</c>, <c>attn_gate</c>, <c>ssm_alpha</c>, <c>ssm_beta</c> from <c>input</c>.</item>
-    ///   <item>Sigmoid(<c>beta</c>); compute decay <c>g = exp(softplus(alpha + dt_bias) × A)</c>.</item>
-    ///   <item>Conv1d on QKV concat (prepend rolling conv state, causal 1-D, SiLU).</item>
-    ///   <item>De-interleave conv output into Q, K, V; L2-normalise both Q and K.</item>
-    ///   <item><see cref="GatedDeltaNetScan.Execute"/> → GDN output.</item>
-    ///   <item>Per-head <c>RMSNorm(out, ssm_norm_weight) × silu(z)</c> gating.</item>
-    ///   <item><c>ssm_out</c> projection back into <paramref name="normOut"/>.</item>
-    /// </list>
+    /// Operation order (confirmed from llama.cpp <c>qwen35moe.cpp</c>): project <c>attn_qkv</c>, <c>attn_gate</c>, <c>ssm_alpha</c>,
+    /// <c>ssm_beta</c>; sigmoid(beta) and decay <c>g = exp(softplus(alpha + dt_bias) x A)</c>; causal conv + SiLU; Q/K/V split and
+    /// L2-normalised Q/K; delta-rule scan; per-head <c>RMSNorm(out, ssm_norm_weight) x silu(z)</c>; <c>ssm_out</c> back into
+    /// <paramref name="normOut"/>.
     /// </remarks>
-    [SkipLocalsInit]
     private void ForwardGdnBody(
         GdnTokenMixingWeights gdnW, int absoluteLayerIdx, int seqLen,
         int hiddenSize, float* normOut, float eps, GdnStateCache gdnCache)
     {
-        int nVHead = _gdn.NVHead;
-        int nKHead = _gdn.NKHead;
-        int dState = _gdn.DState;
-        int dConv = _gdn.DConv;
-        int convDim = (2 * nKHead + nVHead) * dState;
-        int vDim = nVHead * dState;   // NVHead*DState per token
-        int kDim = nKHead * dState;   // NKHead*DState per token
+        int nV = _gdn.NVHead, nK = _gdn.NKHead, dS = _gdn.DState, dC = _gdn.DConv;
+        int convDim = (2 * nK + nV) * dS, vDim = nV * dS, kDim = nK * dS, T = seqLen;
+        var scratch = new GdnMixerScratch(
+            new Span<float>((float*)_state.GdnQkvBuf, T * convDim), new Span<float>((float*)_state.GdnZBuf, T * vDim),
+            new Span<float>((float*)_state.GdnAlphaBuf, T * nV), new Span<float>((float*)_state.GdnBetaBuf, T * nV),
+            new Span<float>((float*)_state.GdnConvInput, (dC - 1 + T) * convDim), new Span<float>((float*)_state.GdnQBuf, T * kDim),
+            new Span<float>((float*)_state.GdnKBuf, T * kDim), new Span<float>((float*)_state.GdnVBuf, T * vDim),
+            new Span<float>((float*)_state.GdnOut, T * vDim));
+        GdnTokenMixer.Forward(gdnW, _gdn, absoluteLayerIdx, _gdnLayerOrdinal[absoluteLayerIdx], T, hiddenSize, eps, GdnOutputGate.SiLu,
+                              new ReadOnlySpan<float>(normOut, T * hiddenSize), new Span<float>(normOut, T * hiddenSize),
+                              _gdnGemm ??= GdnGemmAdapter, scratch, gdnCache);
+    }
 
-        float* qkvBuf = (float*)_state.GdnQkvBuf;
-        float* zBuf = (float*)_state.GdnZBuf;
-        float* alphaBuf = (float*)_state.GdnAlphaBuf;
-        float* betaBuf = (float*)_state.GdnBetaBuf;
-        float* qBuf = (float*)_state.GdnQBuf;
-        float* kBuf = (float*)_state.GdnKBuf;
-        float* vBuf = (float*)_state.GdnVBuf;
-        float* gdnOut = (float*)_state.GdnOut;
-        float* convInput = (float*)_state.GdnConvInput;
+    private GdnGemm? _gdnGemm;
 
-        int gdnOrdinal = _gdnLayerOrdinal[absoluteLayerIdx];
-
-        // ── 1. Projections from normed input ──────────────────────────────────
-        // All four projections read from normOut (the attn_norm output).
-        Gemm(gdnW.QkvWeight, gdnW.QkvQuantType, normOut, qkvBuf,
-             gdnW.QkvOutputDim, gdnW.QkvInputDim, seqLen, preQuantizedInput: null);
-        Gemm(gdnW.GateWeight, gdnW.GateQuantType, normOut, zBuf,
-             gdnW.GateOutputDim, gdnW.GateInputDim, seqLen, preQuantizedInput: null);
-        Gemm(gdnW.AlphaWeight, gdnW.AlphaQuantType, normOut, alphaBuf,
-             gdnW.AlphaOutputDim, gdnW.AlphaInputDim, seqLen, preQuantizedInput: null);
-        Gemm(gdnW.BetaWeight, gdnW.BetaQuantType, normOut, betaBuf,
-             gdnW.BetaOutputDim, gdnW.BetaInputDim, seqLen, preQuantizedInput: null);
-
-        if (TensorDump.Enabled)
-        {
-            TensorDump.Dump2D($"blk.{absoluteLayerIdx}.linear_attn_qkv_mixed", qkvBuf, seqLen, convDim);
-            TensorDump.Dump2D($"blk.{absoluteLayerIdx}.z", zBuf, seqLen, vDim);
-            TensorDump.Dump2D($"blk.{absoluteLayerIdx}.alpha_proj", alphaBuf, seqLen, nVHead);
-            TensorDump.Dump2D($"blk.{absoluteLayerIdx}.beta_proj", betaBuf, seqLen, nVHead);
-        }
-
-        // ── 2. Compute decay g and write-gate beta ────────────────────────────
-        // g[t,vh] = exp(softplus(alpha[t,vh] + DtBias[vh]) * A[vh])
-        for (int t = 0; t < seqLen; t++)
-        {
-            int gbOff = t * nVHead;
-            for (int vh = 0; vh < nVHead; vh++)
-            {
-                float alpha = alphaBuf[gbOff + vh] + gdnW.DtBias[vh];
-                float sp = MathF.Log(1f + MathF.Exp(alpha)); // softplus
-                alphaBuf[gbOff + vh] = MathF.Exp(sp * gdnW.A[vh]);
-            }
-        }
-        // beta = sigmoid(beta_proj)
-        TensorPrimitives.Sigmoid(
-            new ReadOnlySpan<float>(betaBuf, seqLen * nVHead),
-            new Span<float>(betaBuf, seqLen * nVHead));
-
-        if (TensorDump.Enabled)
-        {
-            TensorDump.Dump2D($"blk.{absoluteLayerIdx}.g", alphaBuf, seqLen, nVHead);
-            TensorDump.Dump2D($"blk.{absoluteLayerIdx}.beta_sigmoid", betaBuf, seqLen, nVHead);
-        }
-
-        // ── 3. Conv1d on QKV concat ────────────────────────────────────────────
-        // Fill ConvInput: [conv_state (DConv-1 rows) | qkvBuf (seqLen rows)]
-        var convState = gdnCache.GetConvState(gdnOrdinal);
-        convState.CopyTo(new Span<float>(convInput, (dConv - 1) * convDim));
-        for (int t = 0; t < seqLen; t++)
-        {
-            new ReadOnlySpan<float>(qkvBuf + t * convDim, convDim)
-                .CopyTo(new Span<float>(convInput + (dConv - 1 + t) * convDim, convDim));
-        }
-
-        // Conv1d → qkvBuf (reuse as output), then SiLU in place.
-        int convInputElems = (dConv - 1 + seqLen) * convDim;
-        Conv1dCausal.Execute(
-            input: new ReadOnlySpan<float>(convInput, convInputElems),
-            weight: gdnW.Conv1dWeight,
-            bias: gdnW.Conv1dBias,
-            output: new Span<float>(qkvBuf, seqLen * convDim),
-            dConv: dConv,
-            channels: convDim,
-            seqLen: seqLen);
-        SiLu.Execute(
-            new ReadOnlySpan<float>(qkvBuf, seqLen * convDim),
-            new Span<float>(qkvBuf, seqLen * convDim));
-
-        if (TensorDump.Enabled)
-            TensorDump.Dump2D($"blk.{absoluteLayerIdx}.conv_output_silu", qkvBuf, seqLen, convDim);
-
-        // Save the trailing (dConv-1) rows of convInput back as rolling state.
-        for (int r = 0; r < dConv - 1; r++)
-        {
-            new ReadOnlySpan<float>(convInput + (seqLen + r) * convDim, convDim)
-                .CopyTo(convState.Slice(r * convDim, convDim));
-        }
-
-        // ── 4. De-interleave Q/K/V and L2-normalise Q and K ──────────────────
-        // Conv output layout per token: [Q (kDim) | K (kDim) | V (vDim)]
-        for (int t = 0; t < seqLen; t++)
-        {
-            float* row = qkvBuf + t * convDim;
-            new ReadOnlySpan<float>(row,          kDim).CopyTo(new Span<float>(qBuf + t * kDim, kDim));
-            new ReadOnlySpan<float>(row + kDim,   kDim).CopyTo(new Span<float>(kBuf + t * kDim, kDim));
-            new ReadOnlySpan<float>(row + 2 * kDim, vDim).CopyTo(new Span<float>(vBuf + t * vDim, vDim));
-        }
-        if (TensorDump.Enabled)
-        {
-            TensorDump.Dump3D($"blk.{absoluteLayerIdx}.q_conv", qBuf, seqLen, nKHead, dState);
-            TensorDump.Dump3D($"blk.{absoluteLayerIdx}.k_conv", kBuf, seqLen, nKHead, dState);
-            TensorDump.Dump3D($"blk.{absoluteLayerIdx}.v_conv", vBuf, seqLen, nVHead, dState);
-        }
-        GatedDeltaNetScan.L2NormalizeHeads(new Span<float>(qBuf, seqLen * kDim), dState);
-        GatedDeltaNetScan.L2NormalizeHeads(new Span<float>(kBuf, seqLen * kDim), dState);
-        if (TensorDump.Enabled)
-        {
-            TensorDump.Dump3D($"blk.{absoluteLayerIdx}.q_conv_predelta", qBuf, seqLen, nKHead, dState);
-            TensorDump.Dump3D($"blk.{absoluteLayerIdx}.k_conv_predelta", kBuf, seqLen, nKHead, dState);
-        }
-
-        // ── 5. GDN scan ───────────────────────────────────────────────────────
-        var gdnState = gdnCache.GetGdnState(gdnOrdinal);
-        GatedDeltaNetScan.Execute(
-            state: gdnState,
-            q: new ReadOnlySpan<float>(qBuf, seqLen * kDim),
-            k: new ReadOnlySpan<float>(kBuf, seqLen * kDim),
-            v: new ReadOnlySpan<float>(vBuf, seqLen * vDim),
-            g: new ReadOnlySpan<float>(alphaBuf, seqLen * nVHead),
-            beta: new ReadOnlySpan<float>(betaBuf, seqLen * nVHead),
-            output: new Span<float>(gdnOut, seqLen * vDim),
-            nVHead: nVHead,
-            nKHead: nKHead,
-            dState: dState,
-            seqLen: seqLen);
-        if (TensorDump.Enabled)
-            TensorDump.Dump3D($"blk.{absoluteLayerIdx}.attn_output", gdnOut, seqLen, nVHead, dState);
-
-        // ── 6. Per-head RMSNorm(out) * silu(z) gating ─────────────────────────
-        // ssm_norm_weight [dState] is broadcast across all heads.
-        for (int t = 0; t < seqLen; t++)
-        {
-            int tBase = t * vDim;
-            for (int vh = 0; vh < nVHead; vh++)
-            {
-                int headOff = tBase + vh * dState;
-                // RMSNorm in place with shared norm weight.
-                RmsNorm.Execute(
-                    new ReadOnlySpan<float>(gdnOut + headOff, dState),
-                    gdnW.SsmNormWeight, eps,
-                    new Span<float>(gdnOut + headOff, dState));
-                // Multiply by silu(z[head]).
-                float* zHead = zBuf + headOff;
-                float* outHead = gdnOut + headOff;
-                for (int i = 0; i < dState; i++)
-                {
-                    float zi = zHead[i];
-                    outHead[i] *= zi * (1f / (1f + MathF.Exp(-zi))); // silu(z) = z * sigmoid(z)
-                }
-            }
-        }
-        if (TensorDump.Enabled)
-            TensorDump.Dump3D($"blk.{absoluteLayerIdx}.final_output", gdnOut, seqLen, nVHead, dState);
-
-        // ── 7. ssm_out projection into normOut ────────────────────────────────
-        Gemm(gdnW.OutWeight, gdnW.OutQuantType, gdnOut, normOut,
-             gdnW.OutOutputDim, gdnW.OutInputDim, seqLen, preQuantizedInput: null);
-
-        if (TensorDump.Enabled)
-            TensorDump.Dump2D($"blk.{absoluteLayerIdx}.linear_attn_out", normOut, seqLen, hiddenSize);
+    private void GdnGemmAdapter(GdnProjection projection, nint weight, QuantizationType qt, ReadOnlySpan<float> input, Span<float> output, int outDim, int inDim, int seqLen)
+    {
+        fixed (float* b = input)
+        fixed (float* c = output)
+            Gemm(weight, qt, b, c, outDim, inDim, seqLen, preQuantizedInput: null);
     }
 
     /// <summary>
@@ -1829,6 +1703,24 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
             case QuantizationType.Q5_0:
                 MatMul.GemmQ5_0((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
                 return;
+            case QuantizationType.Q2_K:
+                MatMul.GemmQ2_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+                return;
+            case QuantizationType.Q3_K:
+                MatMul.GemmQ3_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+                return;
+            case QuantizationType.IQ4_XS:
+                MatMul.GemmIQ4_XS((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+                return;
+            case QuantizationType.IQ2_XXS:
+            case QuantizationType.IQ2_XS:
+            case QuantizationType.IQ2_S:
+            case QuantizationType.IQ3_XXS:
+            case QuantizationType.IQ3_S:
+            case QuantizationType.IQ1_M:
+            case QuantizationType.IQ1_S:
+                MatMul.GemmIQCodebook(qt, (byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+                return;
             case QuantizationType.Q4_K:
                 MatMul.GemmQ4_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
                 return;
@@ -1843,6 +1735,13 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
                 return;
             case QuantizationType.F16:
                 MatMul.GemmF16(weights, b, c, m, k, n, _threadPool);
+                return;
+            case QuantizationType.Q4_0:
+            case QuantizationType.Q4_1:
+            case QuantizationType.Q5_1:
+            case QuantizationType.IQ4_NL:
+                // Packed x Q8_1 dot instead of dequantize-to-F32 (#489).
+                MatMul.GemmLegacyQuantOrDequant((byte*)weights, qt, b, c, m, k, n, _threadPool, preQuantizedInput);
                 return;
             default:
                 // Shared dequantize-and-dot fallback (#263): decodes each weight row once and
@@ -1870,9 +1769,9 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
         GC.SuppressFinalize(this);
     }
 
-    private static float[] DequantizeF32(nint dataBase, GgufTensorDescriptor desc, int expectedSize)
+    private static float[] DequantizeF32(GgufDataBase dataBase, GgufTensorDescriptor desc, int expectedSize)
     {
-        nint ptr = dataBase + (nint)desc.DataOffset;
+        nint ptr = dataBase.Of(desc);
         float[] result = new float[expectedSize];
         Dequantize.ToFloat32(ptr, expectedSize, desc.QuantizationType, result);
         return result;

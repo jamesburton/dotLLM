@@ -5,7 +5,7 @@ namespace DotLLM.Tests.Integration.Fixtures;
 /// <summary>
 /// Downloads Bielik-1.5B-v3.0-Instruct Q4_K_M GGUF (~0.9 GB) for bias + K-quant integration tests.
 /// Bielik has linear layer biases on all 7 projections per layer — exercises bias + mixed-quant paths.
-/// Cached in <c>~/.dotllm/test-cache/</c> across test runs.
+/// Cached in <c>~/.dotllm/models/</c> across test runs.
 /// </summary>
 public sealed class BielikQ4KModelFixture : IAsyncLifetime
 {

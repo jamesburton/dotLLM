@@ -16,6 +16,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// from any model-loading concerns.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed unsafe class CudaQuantizedKvCacheGraphTest : IDisposable
 {
     private readonly CudaContext? _ctx;

@@ -2,6 +2,7 @@ using System.Runtime.InteropServices;
 using DotLLM.Cuda;
 using DotLLM.Cuda.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 using Architecture = DotLLM.Core.Configuration.Architecture;
@@ -41,7 +42,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 public class CudaQwen3HybridDenseLastTokenLogitsOnlyTest
 {
     private const string ModelPathEnvVar = "DOTLLM_BONSAI_PQ2_0_GGUF";
-    private const string FileName = "Ternary-Bonsai-27B-Q2_0.gguf";
+    private const string FileName = "Ternary-Bonsai-2-27B-PQ2_0.gguf";
     private const int SliceLen = 64;
 
     private readonly ITestOutputHelper _out;
@@ -62,7 +63,7 @@ public class CudaQwen3HybridDenseLastTokenLogitsOnlyTest
         string? path = ResolveFixturePath();
         Skip.If(path is null,
             $"Bonsai PQ2_0 GGUF fixture not found. Set {ModelPathEnvVar}, or place {FileName} under "
-            + "~/.dotllm/models/PrismML/Ternary-Bonsai-27B-GGUF/ or ~/.dotllm/test-cache/PrismML/Ternary-Bonsai-27B-GGUF/.");
+            + "~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/.");
         string? ptxDir = FindPtxDir();
         Skip.If(ptxDir is null, "PTX files not found");
 
@@ -89,6 +90,16 @@ public class CudaQwen3HybridDenseLastTokenLogitsOnlyTest
         // IKvCache is passed, making the two calls' outputs incomparable. Fresh model instances
         // give each call its own zero-initialized recurrent state, isolating the comparison to
         // exactly what lastTokenLogitsOnly changes: the LM-head row count.
+        // #500: the hinted call runs the LM head at one row and the full call runs it at seqLen, and
+        // the row count decides which PQ2_0 path each takes (dp4a int8 for small S, dequant+cuBLAS F16
+        // above). That is #485's deliberate numeric trade, an order of magnitude larger than the
+        // GEMV-vs-general-path drift this test bounds, so pin one path across both arms.
+        bool? dp4aWas = CudaSmallSGemvDispatch.Dp4aOverride;
+        bool? mmqWas = CudaSmallSGemvDispatch.MmqOverride;
+        CudaSmallSGemvDispatch.Dp4aOverride = false;
+        CudaSmallSGemvDispatch.MmqOverride = false;   // #1222: the W2A8 prefill GEMM is the default above 8 rows
+        try
+        {
         _out.WriteLine("Running full (lastTokenLogitsOnly: false) on a fresh model instance...");
         float[] fullLastRow;
         using (var gguf1 = GgufFile.Open(path!))
@@ -128,6 +139,12 @@ public class CudaQwen3HybridDenseLastTokenLogitsOnlyTest
                 $"exceeds tolerance {tol} -- shrinking the LM-head to one row changed the computed " +
                 "value by more than the expected GEMV-vs-general-path kernel drift.");
         }
+        }
+        finally
+        {
+            CudaSmallSGemvDispatch.MmqOverride = mmqWas;
+            CudaSmallSGemvDispatch.Dp4aOverride = dp4aWas;
+        }
 
         _out.WriteLine($"{SliceLen} logits compared -- full-call last row vs. lastTokenLogitsOnly row: within tolerance.");
     }
@@ -143,21 +160,7 @@ public class CudaQwen3HybridDenseLastTokenLogitsOnlyTest
 
     private static string? ResolveFixturePath()
     {
-        string? envPath = Environment.GetEnvironmentVariable(ModelPathEnvVar);
-        if (!string.IsNullOrWhiteSpace(envPath) && File.Exists(envPath))
-            return envPath;
-
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string[] candidates =
-        [
-            Path.Combine(home, ".dotllm", "models", "PrismML", "Ternary-Bonsai-27B-GGUF", FileName),
-            Path.Combine(home, ".dotllm", "test-cache", "PrismML", "Ternary-Bonsai-27B-GGUF", FileName),
-        ];
-        foreach (string candidate in candidates)
-            if (File.Exists(candidate))
-                return candidate;
-
-        return null;
+        return KnownTestFixtures.TernaryBonsai27B_Q2_0.Path;
     }
 
     private static string? FindPtxDir()

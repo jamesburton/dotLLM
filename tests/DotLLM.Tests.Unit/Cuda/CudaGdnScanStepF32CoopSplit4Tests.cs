@@ -22,6 +22,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// drift evolves over many decode steps, since the GDN state persists across an entire generation.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaGdnScanStepF32CoopSplit4Tests
 {
     private readonly ITestOutputHelper _out;

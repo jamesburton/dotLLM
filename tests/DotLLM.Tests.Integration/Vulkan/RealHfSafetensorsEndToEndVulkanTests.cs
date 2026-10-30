@@ -57,6 +57,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class RealHfSafetensorsEndToEndVulkanTests
 {
     // Tolerances mirrored from VulkanTransformerModelTests.
@@ -78,6 +79,13 @@ public sealed class RealHfSafetensorsEndToEndVulkanTests
     // (wrong gate, missing shared expert, dropped layer) causes the
     // strict-argmax count to fall well below the 5/9 floor in well under
     // one full decode trajectory, so this test still catches real bugs.
+    //
+    // UPDATE (#764 / #313): the "unusual scale-multiplier stack" above was NOT implemented on either backend when this
+    // tolerance was chosen (both ran as if every multiplier were 1, so "CPU agrees with Vulkan" certified the error and
+    // the huge L-inf was partly that). Both now implement embedding / attention / residual / logit scalars and are
+    // checked against an independent reference with ablation arms (GraniteGgufTests, GraniteVulkanReferenceTests), and
+    // against llama.cpp on real GGUFs. This soft mode is left as-is only because the 6.3 GB safetensors checkpoint was
+    // not available to re-measure; tighten it to the dense tolerance (LogitsAbsTol) as soon as it is.
     private const float LogitsAbsTolGraniteMoe = 1.0e6f;
     private const bool SoftPerStepGraniteMoe = true;
     private const int TopKForJaccard = 10;
@@ -116,9 +124,8 @@ public sealed class RealHfSafetensorsEndToEndVulkanTests
     [SkippableFact]
     public void Qwen25_0_5B_VulkanForward_MatchesCpuReference_OnEightDecodeSteps()
     {
-        string? root = ResolveCheckpointRoot(
-            envVar: "DOTLLM_QWEN25_CHECKPOINT_PATH",
-            conventional: "C:/Users/james/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B/snapshots/060db6499f32faf8b98477b0a26969ef7d8b9987");
+        string? root = DotLLM.Tests.Integration.Fixtures.TestFixtureResolver.ResolveDirectory(
+            "DOTLLM_QWEN25_CHECKPOINT_PATH", "Qwen", "Qwen2.5-0.5B", "config.json").Path;
         Skip.If(root is null,
             "Qwen2.5-0.5B checkpoint not found. Set DOTLLM_QWEN25_CHECKPOINT_PATH "
             + "or ensure the HF snapshot is present at the conventional path.");
@@ -241,8 +248,9 @@ public sealed class RealHfSafetensorsEndToEndVulkanTests
         // Phase C); HF's DeepSeek extractor defaults UseHybridMlaCache=true,
         // so we strip those flags for the Vulkan-side config. The no-cache
         // forward-pass parity below is bit-equivalent across cache modes.
-        (ISafetensorsTensorSource vkSource, ModelConfig vkProbeConfig) =
-            ModelLoader.OpenSafetensorsAndConfig(root);
+        (ISafetensorsTensorSource vkSource, ModelConfig vkProbeConfig) = CheckpointGuard.LoadOrSkip(
+            root, $"{label} HF safetensors checkpoint (Vulkan)",
+            () => ModelLoader.OpenSafetensorsAndConfig(root));
         ModelConfig vkConfig = NormalizeForVulkan(vkProbeConfig);
 
         var vkLoadWatch = Stopwatch.StartNew();
@@ -269,8 +277,9 @@ public sealed class RealHfSafetensorsEndToEndVulkanTests
 
         // ── CPU model ──────────────────────────────────────────────────
         var cpuLoadWatch = Stopwatch.StartNew();
-        (IModel cpuModel, ISafetensorsTensorSource cpuSource, ModelConfig cpuConfig)
-            = ModelLoader.LoadFromSafetensors(root);
+        (IModel cpuModel, ISafetensorsTensorSource cpuSource, ModelConfig cpuConfig) = CheckpointGuard.LoadOrSkip(
+            root, $"{label} HF safetensors checkpoint (CPU)",
+            () => ModelLoader.LoadFromSafetensors(root));
         cpuLoadWatch.Stop();
         Assert.Equal(expectedArch, cpuConfig.Architecture);
         _output.WriteLine(

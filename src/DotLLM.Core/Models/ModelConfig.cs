@@ -107,6 +107,54 @@ public record ModelConfig
     public float? QueryPreAttnScalar { get; init; }
 
     /// <summary>
+    /// True when the optional Q/K RMSNorm is ONE norm over the whole projection (weight length
+    /// <c>n_heads*head_dim</c> for Q, <c>n_kv_heads*head_dim</c> for K, applied before the head reshape: OLMo 2, OLMoE)
+    /// instead of the per-head norm (<c>head_dim</c> weights, applied per head: Qwen3, Gemma 3). The CPU backend
+    /// discriminates by weight length; the GPU backends must read this flag (a per-head norm over whole-projection
+    /// weights is silently wrong).
+    /// </summary>
+    public bool QkNormWholeProjection { get; init; }
+
+    /// <summary>
+    /// Granite attention multiplier (HF <c>attention_multiplier</c>, GGUF <c>{arch}.attention.scale</c>): the
+    /// score scale <b>itself</b> (not a divisor operand), replacing <c>1/sqrt(head_dim)</c>. Null = default.
+    /// Takes precedence over <see cref="QueryPreAttnScalar"/>. Resolve through <see cref="AttentionScoreScale"/>.
+    /// </summary>
+    public float? AttentionScale { get; init; }
+
+    /// <summary>
+    /// Granite residual multiplier (HF <c>residual_multiplier</c>, GGUF <c>{arch}.residual_scale</c>): every
+    /// sublayer output is scaled by this value BEFORE the residual add (<c>h = h + scale * sublayer(h)</c>),
+    /// for both the attention and the FFN/MoE sublayer. Null = 1 (no scaling).
+    /// </summary>
+    public float? ResidualScale { get; init; }
+
+    /// <summary>
+    /// Granite logit scale (HF <c>logits_scaling</c>, GGUF <c>{arch}.logit_scale</c>): the LM-head logits are
+    /// DIVIDED by this value (llama.cpp <c>ggml_scale(cur, 1/f_logit_scale)</c>). Null = no scaling.
+    /// </summary>
+    public float? LogitScale { get; init; }
+
+    /// <summary>
+    /// True when any Granite-style scalar (<see cref="ResidualScale"/>, <see cref="LogitScale"/>,
+    /// <see cref="AttentionScale"/>) is configured. Backends whose layer loop does not implement them must
+    /// reject such a model rather than produce silently wrong logits (#313).
+    /// </summary>
+    public bool HasGraniteScalars => ResidualScale.HasValue || LogitScale.HasValue || AttentionScale.HasValue;
+
+    /// <summary>
+    /// The attention score multiplier for a layer whose per-head dim is <paramref name="headDim"/>:
+    /// <see cref="AttentionScale"/> if set, else <c>1/sqrt(<see cref="QueryPreAttnScalar"/>)</c> if set,
+    /// else <c>1/sqrt(headDim)</c>. Single source of truth for every backend's score scale.
+    /// </summary>
+    public float AttentionScoreScale(int headDim)
+    {
+        if (AttentionScale is float a && a > 0f) return a;
+        if (QueryPreAttnScalar is float q && q > 0f) return 1.0f / MathF.Sqrt(q);
+        return 1.0f / MathF.Sqrt(headDim);
+    }
+
+    /// <summary>
     /// Interleaved sliding-window pattern period. 0 (default) = the sliding
     /// window (when set) applies to every layer (Mistral convention). N &gt; 0 =
     /// layer <c>il</c> uses the sliding window iff <c>il % N &lt; N - 1</c>
@@ -124,6 +172,12 @@ public record ModelConfig
     /// Null for pure-Transformer architectures.
     /// </summary>
     public HybridLayerLayout? HybridLayout { get; init; }
+
+    /// <summary>
+    /// LFM2 short-convolution kernel length (<c>{arch}.shortconv.l_cache</c>, 3 for LFM2.5); the recurrent state holds the
+    /// last <c>L_cache - 1</c> projected inputs per channel. 0 for architectures without short-conv layers.
+    /// </summary>
+    public int ShortConvCacheLength { get; init; }
 
     /// <summary>
     /// Mamba2 SSM configuration shared by all SSM layers in a hybrid model.
@@ -156,6 +210,17 @@ public record ModelConfig
     /// interval) that do not map onto the Mamba-2 <see cref="SsmConfig"/>.
     /// </summary>
     public GatedDeltaNetConfig? GdnConfig { get; init; }
+
+    /// <summary>
+    /// PrismML blockwise-Hadamard weight fold (GGUF <c>prism.hadamard.*</c>). Non-null only for
+    /// checkpoints stored in a rotated basis — currently the Bonsai 2 ternary family.
+    /// </summary>
+    /// <remarks>
+    /// When present, every folded weight's input activation must be transformed before the matmul
+    /// (and rotated lookup tables un-transformed after the lookup). Ignoring it does not fail: the
+    /// weights are well-formed values in the wrong basis, so the model generates fluent nonsense.
+    /// </remarks>
+    public HadamardFoldConfig? HadamardFold { get; init; }
 
     /// <summary>
     /// Number of trailing Multi-Token Prediction (MTP / "NextN") head layers present in the
@@ -196,6 +261,21 @@ public record ModelConfig
     public string? ChatTemplate { get; init; }
 
     /// <summary>
+    /// Sequence-pooling strategy declared by the checkpoint (GGUF <c>{arch}.pooling_type</c>).
+    /// Null when the checkpoint does not declare one — which is the case for every ordinary
+    /// generative decoder. Consumed by the embeddings path (issue #451); ignored elsewhere.
+    /// </summary>
+    public PoolingType? PoolingType { get; init; }
+
+    /// <summary>
+    /// True for an embedding-only tower whose attention is bidirectional with symmetric sliding windows
+    /// (EmbeddingGemma, GGUF arch <c>gemma-embedding</c>, llama.cpp <c>causal_attn = false</c>). Such a model only
+    /// supports the cacheless <see cref="IEmbeddingModel.ForwardHidden"/> path; a causal <c>Forward</c> would silently
+    /// produce wrong hidden states, so it is refused.
+    /// </summary>
+    public bool BidirectionalAttention { get; init; }
+
+    /// <summary>
     /// Layer indices that skip RoPE entirely (NoPE — "no positional encoding").
     /// Null or empty means every layer applies RoPE per the standard
     /// <see cref="RoPEConfig"/>. SmolLM3 ships a sparse pattern
@@ -218,7 +298,8 @@ public record ModelConfig
         Architecture is DotLLM.Core.Configuration.Architecture.Gemma3
                      or DotLLM.Core.Configuration.Architecture.Gemma4
                      or DotLLM.Core.Configuration.Architecture.DiffusionGemma
-                     or DotLLM.Core.Configuration.Architecture.Gemma3n;
+                     or DotLLM.Core.Configuration.Architecture.Gemma3n
+                     or DotLLM.Core.Configuration.Architecture.GemmaEmbedding;
 
     /// <summary>
     /// Gemma-3n AltUp / Laurel / activation-sparsity configuration. Non-null iff
@@ -228,6 +309,12 @@ public record ModelConfig
     /// AltUp or Laurel blocks). See <see cref="Gemma3nConfig"/>.
     /// </summary>
     public Gemma3nConfig? Gemma3n { get; init; }
+
+    /// <summary>
+    /// Qwen4-Exp hyper-connection / QSA-indexer / n-gram-embedding parameters. Non-null iff <see cref="Architecture"/> is
+    /// <see cref="DotLLM.Core.Configuration.Architecture.Qwen4Exp"/>; null for every other architecture. See <see cref="Qwen4ExpConfig"/>.
+    /// </summary>
+    public Qwen4ExpConfig? Qwen4Exp { get; init; }
 
     /// <summary>
     /// Optional per-attention-type RoPE override for the FULL-attention layers
@@ -242,6 +329,33 @@ public record ModelConfig
     /// per-layer dispatch then collapses to the single <see cref="RoPEConfig"/>.
     /// </summary>
     public RoPEConfig? GlobalRoPEConfig { get; init; }
+
+    /// <summary>
+    /// Mistral-3 / Ministral-3 (Llama-4-style) attention temperature tuning, GGUF
+    /// <c>mistral3.attention.temperature_scale</c>. 0 = disabled (every other model). When non-zero
+    /// the post-RoPE query of the token at position <c>p</c> is multiplied by
+    /// <see cref="AttnTemperatureAt"/> on every layer — llama.cpp <c>llm_graph_input_attn_temp</c> /
+    /// <c>mistral3.cpp</c> (issue #743).
+    /// </summary>
+    public float AttnTemperatureScale { get; init; }
+
+    /// <summary>
+    /// Position bucket width for <see cref="AttnTemperatureScale"/> (llama.cpp
+    /// <c>n_attn_temp_floor_scale</c> = the YaRN original context length). Ignored when the scale is 0.
+    /// </summary>
+    public int AttnTemperatureFloorScale { get; init; }
+
+    /// <summary>
+    /// Per-position query multiplier <c>log(floor(pos / floorScale) + 1) * scale + 1</c>
+    /// (llama.cpp <c>llm_graph_input_attn_temp::set_input</c>, offset 0, double-precision log).
+    /// Returns exactly 1 when the feature is disabled.
+    /// </summary>
+    /// <param name="position">Absolute token position.</param>
+    public float AttnTemperatureAt(int position)
+    {
+        if (AttnTemperatureScale == 0f || AttnTemperatureFloorScale <= 0) return 1.0f;
+        return (float)(Math.Log(Math.Floor((double)position / AttnTemperatureFloorScale) + 1.0) * AttnTemperatureScale + 1.0);
+    }
 
     /// <summary>
     /// Optional partial-rotary factor applied to the FULL-attention layers
@@ -295,6 +409,29 @@ public record ModelConfig
     public int? GlobalHeadDim { get; init; }
 
     /// <summary>
+    /// Per-head dimension of V (and of the attention output feeding <c>o_proj</c>) when it differs from the Q/K head
+    /// dim <see cref="HeadDim"/> (MiMo-V2: K 192, V 128). Null = V uses <see cref="HeadDim"/> (every other
+    /// non-MLA architecture). Resolve through <see cref="GetValueHeadDim"/>.
+    /// </summary>
+    public int? ValueHeadDim { get; init; }
+
+    /// <summary>The V head dimension: <see cref="ValueHeadDim"/> when set, else <see cref="HeadDim"/>.</summary>
+    public int GetValueHeadDim() => ValueHeadDim ?? HeadDim;
+
+    /// <summary>
+    /// True when V's head dim differs from Q/K's (<see cref="ValueHeadDim"/> set and unequal to <see cref="HeadDim"/>).
+    /// Backends whose attention kernels assume one head dim for Q, K and V must reject such a model explicitly.
+    /// </summary>
+    public bool HasDistinctValueHeadDim => ValueHeadDim is int v && v != HeadDim;
+
+    /// <summary>
+    /// Constant multiplier applied to the attention-layer value contribution (MiMo-V2 <c>attention_value_scale</c> 0.707,
+    /// GGUF <c>{arch}.attention.value_scale</c>). V is linear in the attention output, so it is equivalent to scaling V or
+    /// the pre-<c>o_proj</c> attention output. Null = 1.
+    /// </summary>
+    public float? AttentionValueScale { get; init; }
+
+    /// <summary>
     /// Returns the per-head dimension for <paramref name="layerIdx"/>. Full-attention
     /// layers use <see cref="GlobalHeadDim"/> when set (Gemma 4 <c>global_head_dim</c>);
     /// sliding-window layers and every other architecture use <see cref="HeadDim"/>.
@@ -317,7 +454,7 @@ public record ModelConfig
     /// to a uniform <see cref="NumKvHeads"/> when <see cref="NumGlobalKvHeads"/> is
     /// null, so non-Gemma-4 models are unaffected. This is the single source of
     /// truth for per-layer KV-head resolution (backends delegate here rather than
-    /// re-deriving it) and feeds <see cref="DotLLM.Core.Attention.KvGeometry.FromConfig"/>.
+    /// re-deriving it) and feeds <see cref="DotLLM.Core.Attention.KvGeometry.FromConfig(ModelConfig)"/>.
     /// </summary>
     [System.Runtime.CompilerServices.MethodImpl(
         System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
@@ -347,6 +484,25 @@ public record ModelConfig
     }
 
     /// <summary>
+    /// The sliding-window size of <paramref name="layer"/>, or <see langword="null"/> for a full-attention layer.
+    /// <see cref="PerLayerSlidingWindow"/> wins when set; otherwise <see cref="SlidingWindowSize"/> applies, modulated by
+    /// <see cref="SlidingWindowPattern"/>: pattern N &gt; 0 windows only the layers where <c>layer % N &lt; N - 1</c>
+    /// (llama.cpp <c>set_swa_pattern(N, dense_first=false)</c>; gpt-oss N=2: even layers windowed, odd dense).
+    /// </summary>
+    /// <param name="layer">Model layer index.</param>
+    /// <returns>The window in positions, or <see langword="null"/> when the layer attends the whole context.</returns>
+    public int? SlidingWindowOf(int layer)
+    {
+        var perLayer = PerLayerSlidingWindow;
+        if (perLayer is not null && (uint)layer < (uint)perLayer.Count)
+            return perLayer[layer];
+        if (SlidingWindowSize is null) return null;
+        int pattern = SlidingWindowPattern;
+        if (pattern <= 0) return SlidingWindowSize;
+        return (layer % pattern) < pattern - 1 ? SlidingWindowSize : null;
+    }
+
+    /// <summary>
     /// Number of trailing layers that REUSE an earlier layer's KV instead of
     /// projecting/caching their own (Gemma-4 E2B/E4B
     /// <c>attention.shared_kv_layers</c>; llama.cpp <c>n_layer_kv_from_start =
@@ -359,6 +515,44 @@ public record ModelConfig
     /// full-attention layers the last own-KV full layer).
     /// </summary>
     public int NumSharedKvLayers { get; init; }
+
+    /// <summary>
+    /// True for the dense Gemma-4 variants (E2B/E4B): a Gemma-4 graph with no routed-MoE
+    /// block and/or per-layer embeddings (PLE) and trailing shared-KV layers. Implemented
+    /// on the CPU backend only; the CUDA and Vulkan backends model Gemma-4 as the dual-FFN
+    /// MoE (26B-A4B) and must reject this shape up front (issue #730).
+    /// </summary>
+    public bool IsGemma4DensePle
+        => Gemma4DualFfn && (Moe is null || PerLayerEmbedding is not null || NumSharedKvLayers > 0);
+
+    /// <summary>
+    /// Actionable refusal for GPU backends asked to run a MiMo-V2 (<c>mimo2</c>) model. Their attention kernels, KV caches and
+    /// generic MoE paths assume one head dim for Q, K and V; MiMo-V2 has K 192 / V 128, a sliding-window ring with sinks on 39
+    /// of 48 layers and Q2_K/IQ expert banks that the generic MoE loaders would widen to F32. Running it anyway would load and
+    /// produce wrong logits silently, so refuse. CPU is the reference backend (issue #936).
+    /// </summary>
+    public static string MiMoV2UnsupportedMessage(string backend)
+        => $"The MiMo-V2 architecture (GGUF 'mimo2', Xiaomi MiMo-V2 / V2.5 / V2.6-Flash) is not supported on the {backend} backend (or mode) yet - the CPU and the single-device Vulkan model run it: "
+         + "its attention uses V head_dim 128 with Q/K head_dim 192 (every GPU attention kernel and KV cache here assumes one head dim), "
+         + "it needs a sliding-window KV ring with learned attention sinks on the sliding layers, and its low-bit routed-expert banks "
+         + "(Q2_K / IQ1_M / IQ2_*) are not kept packed by the generic MoE path. Use --device cpu. "
+         + "Tracked in https://github.com/jamesburton/dotLLM/issues/935 (CPU reference: #936).";
+
+    /// <summary>Actionable message for backends that cannot run <see cref="Architecture.Flint"/> yet.</summary>
+    /// <param name="backend">Backend name shown to the user.</param>
+    /// <returns>The refusal message.</returns>
+    public static string FlintUnsupportedMessage(string backend)
+        => $"The Flint architecture (GGUF 'flint', Recursive Flint) is not supported on the {backend} backend yet - the CPU backend and the "
+         + "single-device Vulkan model run it: this path lacks NoPE on the full-attention layers inside the MoE loop, sinks on every layer, a "
+         + "quantised ungated shared-expert path and, for the official file, Q4_1 kernels. Use --device cpu or a single Vulkan device. "
+         + "Tracked in https://github.com/jamesburton/dotLLM/issues/1157 (Vulkan F4 #1171, CUDA F6).";
+
+    /// <summary>Actionable message for backends that cannot run <see cref="IsGemma4DensePle"/> models.</summary>
+    public static string Gemma4DensePleUnsupportedMessage(string backend)
+        => $"The Gemma-4 dense variant (E2B/E4B: per-layer embeddings, shared-KV layers, no MoE block) "
+         + $"is not supported on the {backend} backend; only the CPU backend implements it. Support is "
+         + "tracked as a priority in https://github.com/jamesburton/dotLLM/issues/734 (dense Gemma-4 E4B on Vulkan and CUDA). "
+         + "Use --device cpu (much slower), or --device auto, which falls back to CPU with a warning.";
 
     /// <summary>
     /// Returns true when <paramref name="layerIdx"/> projects and stores its own

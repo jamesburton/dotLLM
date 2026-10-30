@@ -48,7 +48,7 @@ public enum LoraScenario
 /// <remarks>
 /// <para>
 /// Strategy: load a real GGUF checkpoint (TinyLlama 1.1B preferred; falls back
-/// to Llama-3.2-1B then SmolLM-135M from the local test-cache), build a
+/// to Llama-3.2-1B then SmolLM-135M from the local model store), build a
 /// deterministic synthetic LoRA adapter via <see cref="SyntheticLoraAdapter"/>,
 /// then run two workloads — a ~512-token prefill and a 128-token decode loop —
 /// with and without the adapter active. Per-iteration prefill / decode tok/s

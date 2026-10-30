@@ -26,12 +26,13 @@ namespace DotLLM.Tests.Integration.Vulkan.Lora;
 /// Skip rather than failing. Vulkan unavailability also self-skips.
 /// </para>
 /// <para>
-/// Cache layout: <c>~/.dotllm/test-cache/&lt;org&gt;/&lt;repo&gt;/</c> for both
+/// Cache layout: <c>~/.dotllm/models/&lt;org&gt;/&lt;repo&gt;/</c> for both
 /// base and adapter — same as the CPU sister test, so a previous CPU run
 /// warms the cache for this test.
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class VulkanTinyLlamaLoraAdapterTests
 {
     private const int MaxBaseBytes = 50 * 1024 * 1024;
@@ -45,9 +46,7 @@ public sealed class VulkanTinyLlamaLoraAdapterTests
         ("llamafactory/tiny-random-Llama-3", "llamafactory/tiny-random-Llama-3-lora"),
     ];
 
-    private static readonly string CacheDir = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-        ".dotllm", "test-cache");
+    private static readonly string CacheDir = DotLLM.Tests.Integration.Fixtures.TestModelDownloader.CacheDirectory;
 
     private readonly ITestOutputHelper _output;
 
@@ -240,7 +239,7 @@ public sealed class VulkanTinyLlamaLoraAdapterTests
 
     private string? TryEnsureBase(string repoId)
     {
-        string cachedDir = Path.Combine(CacheDir, repoId.Replace('/', Path.DirectorySeparatorChar));
+        string cachedDir = DotLLM.Tests.Integration.Fixtures.TestRepoDirectory.Resolve(repoId, "model.safetensors", "config.json");
         string cachedModel = Path.Combine(cachedDir, "model.safetensors");
         string cachedConfig = Path.Combine(cachedDir, "config.json");
         if (File.Exists(cachedModel) && File.Exists(cachedConfig))
@@ -271,7 +270,7 @@ public sealed class VulkanTinyLlamaLoraAdapterTests
 
     private string? TryEnsureAdapter(string repoId)
     {
-        string cachedDir = Path.Combine(CacheDir, repoId.Replace('/', Path.DirectorySeparatorChar));
+        string cachedDir = DotLLM.Tests.Integration.Fixtures.TestRepoDirectory.Resolve(repoId, "adapter_model.safetensors", "adapter_config.json");
         string cachedAdapter = Path.Combine(cachedDir, "adapter_model.safetensors");
         string cachedConfig = Path.Combine(cachedDir, "adapter_config.json");
         if (File.Exists(cachedAdapter) && File.Exists(cachedConfig))

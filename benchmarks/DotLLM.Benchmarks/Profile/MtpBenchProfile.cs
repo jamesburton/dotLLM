@@ -187,7 +187,10 @@ internal static class MtpBenchProfile
         int[] prefill, int prefillLen, int decodeTokens, int k, int cacheCapacity, DotLLM.Core.Models.ModelConfig config)
     {
         using var kv = new SimpleKvCache(config.NumLayers, config.NumKvHeads, config.HeadDim, cacheCapacity);
-        using var mtpState = model.CreateMtpState()!;
+        // Sized to the trunk KV-cache, exactly like TextGenerator.CreateMtpState: the head's own
+        // cache is indexed by sequence position, so it must reach as far as the trunk's (#469).
+        using var mtpState = model.CreateMtpState(cacheCapacity)
+            ?? throw new InvalidOperationException($"{model.GetType().Name}.SupportsMtp is true but CreateMtpState() returned null.");
         var decoder = new MtpSpeculativeDecoder(greedy: true);
         var pipeline = new SamplerPipeline(new InferenceOptions { Temperature = 0f });
 
@@ -196,7 +199,11 @@ internal static class MtpBenchProfile
 
         var prefillSw = Stopwatch.StartNew();
         int lastToken;
-        using (var t = model.Forward(prefill, prefillPositions, deviceId: -1, kv))
+        // The prefill must carry the MTP state (#469 absorb contract, mirroring TextGenerator's
+        // ForwardPrefill): every trunk Forward of an MTP sequence feeds its hidden rows to the head,
+        // prefill included. Without it the head never absorbs the prompt, so its first drafts run
+        // on an empty MTP KV history and the acceptance/speed numbers come out understated (#481).
+        using (var t = model.Forward(prefill, prefillPositions, deviceId: -1, kv, adapter: null, mtpState))
             lastToken = ArgmaxFirstRow(t, prefillLen - 1, config.VocabSize);
         prefillSw.Stop();
 

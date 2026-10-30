@@ -1,6 +1,6 @@
 using System.Diagnostics;
 using DotLLM.Core.Configuration;
-using DotLLM.HuggingFace;
+using DotLLM.Tests.Integration.Fixtures;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Vulkan;
@@ -42,11 +42,7 @@ internal static class VulkanHostImportProfile
 
         if (ggufPath is null)
         {
-            string cacheDir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                ".cache", "dotllm-bench");
-            using var dl = new HuggingFaceDownloader();
-            ggufPath = dl.DownloadFileAsync(DefaultRepoId, DefaultFilename, cacheDir).GetAwaiter().GetResult();
+            ggufPath = TestModelDownloader.EnsureModelAsync(DefaultRepoId, DefaultFilename).GetAwaiter().GetResult();
         }
 
         Console.WriteLine($"GGUF: {ggufPath}");

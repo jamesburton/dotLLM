@@ -5,7 +5,7 @@ namespace DotLLM.Tests.Integration.Fixtures;
 /// <summary>
 /// Downloads SmolLM2-135M-Instruct Q8_0 (~145 MB) for chat template integration tests.
 /// Small instruct model with ChatML template — exercises the Jinja2 engine end-to-end.
-/// Cached in <c>~/.dotllm/test-cache/</c> across test runs.
+/// Cached in <c>~/.dotllm/models/</c> across test runs.
 /// </summary>
 public sealed class SmolLM2InstructFixture : IAsyncLifetime
 {

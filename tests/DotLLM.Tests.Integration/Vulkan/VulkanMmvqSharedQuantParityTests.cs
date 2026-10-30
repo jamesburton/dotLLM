@@ -36,7 +36,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// paths then collapse to the same F32-in GEMV and the test is vacuous).
 /// </para>
 /// </remarks>
-[Collection("SmallModel")]
+[Collection(SmallModelGpuCollection.Name)]
 [Trait("Category", "GPU")]
 public sealed class VulkanMmvqSharedQuantParityTests
 {

@@ -26,6 +26,118 @@ public sealed record ChatCompletionRequest
     [JsonPropertyName("stream")]
     public bool Stream { get; init; }
 
+    /// <summary>
+    /// Streaming options (#450). Today only <c>include_usage</c> is meaningful: it asks for a
+    /// final usage-only chunk, which SDKs rely on for token accounting over a stream.
+    /// </summary>
+    [JsonPropertyName("stream_options")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public StreamOptionsDto? StreamOptions { get; init; }
+
+    /// <summary>
+    /// True when this request asked for the final <c>choices: []</c> usage chunk.
+    /// </summary>
+    [JsonIgnore]
+    public bool WantsUsageChunk => StreamOptions?.IncludeUsage == true;
+
+    /// <summary>
+    /// When <c>false</c>, the assistant may emit at most one tool call per turn (#450). Null =
+    /// OpenAI's default, i.e. parallel calls are allowed. The model is not constrained during
+    /// decode, so this is enforced on the response.
+    /// </summary>
+    [JsonPropertyName("parallel_tool_calls")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? ParallelToolCalls { get; init; }
+
+    /// <summary>
+    /// End-user identifier for abuse tracking. Accepted and ignored — this server has no
+    /// per-end-user concept, and a client that always sends it must not get a 400 (#450).
+    /// </summary>
+    [JsonPropertyName("user")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? User { get; init; }
+
+    /// <summary>
+    /// Whether to persist the completion for OpenAI's dashboard. Accepted and ignored — nothing
+    /// is stored server-side here (#450).
+    /// </summary>
+    [JsonPropertyName("store")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? Store { get; init; }
+
+    /// <summary>
+    /// Latency tier hint. Accepted and ignored — there is one tier (#450).
+    /// </summary>
+    [JsonPropertyName("service_tier")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ServiceTier { get; init; }
+
+    /// <summary>
+    /// Reasoning-effort hint (#767). Passed to the chat template as <c>reasoning_effort</c>, so a
+    /// template that understands it (Qwen3.x: <c>low</c>/<c>medium</c>/<c>xhigh</c>) honours it and one
+    /// that rejects the value yields a 400. <c>none</c> is OpenAI's "do not reason" and maps to
+    /// <c>enable_thinking=false</c> unless that was given explicitly. Templates with no such variable ignore it.
+    /// </summary>
+    [JsonPropertyName("reasoning_effort")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReasoningEffort { get; init; }
+
+    /// <summary>
+    /// Turns the model's thinking on or off by setting the template's <c>enable_thinking</c> variable
+    /// (vLLM / llama.cpp convention; Qwen3.x, Bonsai, GLM). Null = the template's default. Equivalent to
+    /// <c>chat_template_kwargs.enable_thinking</c>, which it overrides.
+    /// </summary>
+    [JsonPropertyName("enable_thinking")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? EnableThinking { get; init; }
+
+    /// <summary>
+    /// Thinking budget in tokens (#1292, llama.cpp's per-request name): -1 unlimited, 0 end thinking at once, N &gt; 0 at
+    /// most N thinking tokens, then the budget message and the close tag are forced. Null = the server's
+    /// <c>--reasoning-budget</c>. <c>reasoning_budget_tokens</c> is accepted as an alias.
+    /// </summary>
+    [JsonPropertyName("thinking_budget_tokens")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? ThinkingBudgetTokens { get; init; }
+
+    /// <summary>Alias of <see cref="ThinkingBudgetTokens"/> (the sampling-layer name llama.cpp forwards).</summary>
+    [JsonPropertyName("reasoning_budget_tokens")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? ReasoningBudgetTokens { get; init; }
+
+    /// <summary>
+    /// Text forced before the close tag when the thinking budget runs out (#1292). Null = the server's
+    /// <c>--reasoning-budget-message</c>.
+    /// </summary>
+    [JsonPropertyName("reasoning_budget_message")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReasoningBudgetMessage { get; init; }
+
+    /// <summary>
+    /// Arbitrary extra variables for the chat template's Jinja context (vLLM / llama.cpp
+    /// <c>chat_template_kwargs</c>), e.g. <c>{"enable_thinking": false, "preserve_thinking": true}</c>.
+    /// They cannot replace <c>messages</c>, <c>tools</c>, <c>add_generation_prompt</c>, <c>bos_token</c>
+    /// or <c>eos_token</c>.
+    /// </summary>
+    [JsonPropertyName("chat_template_kwargs")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Dictionary<string, JsonElement>? ChatTemplateKwargs { get; init; }
+
+    /// <summary>
+    /// Per-request override of the server's <c>--reasoning-format</c>: <c>none</c>, <c>auto</c> or
+    /// <c>deepseek</c> (#767). Null = the server setting.
+    /// </summary>
+    [JsonPropertyName("reasoning_format")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReasoningFormat { get; init; }
+
+    /// <summary>
+    /// Opaque client key/value tags. Accepted and ignored (#450).
+    /// </summary>
+    [JsonPropertyName("metadata")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public JsonElement? Metadata { get; init; }
+
     [JsonPropertyName("stop")]
     public JsonElement? Stop { get; init; }
 
@@ -95,8 +207,19 @@ public sealed record ChatCompletionRequest
     [JsonPropertyName("top_logprobs")]
     public int? TopLogprobs { get; init; }
 
+    /// <summary>
+    /// Number of choices to generate. Nullable rather than <c>= 1</c>: source-generated
+    /// deserialization drops an initializer on a type with a <c>required</c> member (#462), so
+    /// the old form arrived as <b>0</b>. Resolve the default through <see cref="ChoiceCount"/>,
+    /// never by reading <c>N</c> directly.
+    /// </summary>
+    /// <remarks><c>n</c> is currently accepted and ignored — see #460.</remarks>
     [JsonPropertyName("n")]
-    public int N { get; init; } = 1;
+    public int? N { get; init; }
+
+    /// <summary>The effective number of choices: <see cref="N"/> when given, else 1.</summary>
+    [JsonIgnore]
+    public int ChoiceCount => N ?? 1;
 
     /// <summary>
     /// Optional LoRA adapter name (must already be registered with the server's
@@ -136,6 +259,19 @@ public sealed record ChatCompletionRequest
     [JsonPropertyName("keep_alive")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public double? KeepAlive { get; init; }
+}
+
+/// <summary>
+/// OpenAI <c>stream_options</c> (#450). Shared by the chat and raw-completion requests.
+/// </summary>
+public sealed record StreamOptionsDto
+{
+    /// <summary>
+    /// When true, the stream emits one extra chunk before <c>[DONE]</c> carrying <c>usage</c>
+    /// and an empty <c>choices</c> array. SDKs use it to report token counts for a stream.
+    /// </summary>
+    [JsonPropertyName("include_usage")]
+    public bool IncludeUsage { get; init; }
 }
 
 /// <summary>
@@ -179,6 +315,20 @@ public sealed record ChatMessageDto
 
     [JsonPropertyName("tool_call_id")]
     public string? ToolCallId { get; init; }
+
+    /// <summary>
+    /// The assistant's reasoning, split from <see cref="Content"/> (#767). On a response it is the
+    /// model's thinking; on a request it is replayed to the chat template (Qwen3.x renders it back into
+    /// the history unless <c>preserve_thinking</c> is false). <c>reasoning</c> is accepted as an alias.
+    /// </summary>
+    [JsonPropertyName("reasoning_content")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReasoningContent { get; init; }
+
+    /// <summary>Request-side alias of <see cref="ReasoningContent"/> (OpenRouter / some clients).</summary>
+    [JsonPropertyName("reasoning")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Reasoning { get; init; }
 }
 
 /// <summary>
@@ -186,8 +336,14 @@ public sealed record ChatMessageDto
 /// </summary>
 public sealed record ToolDefinitionDto
 {
+    /// <summary>
+    /// Constant discriminator. Read-only on purpose: an initialized settable property is
+    /// silently dropped by source-generated deserialization on a type with a <c>required</c>
+    /// member (#462), which made this arrive as <c>null</c> instead of <c>"function"</c>.
+    /// Nothing may set it, so nothing can lose it.
+    /// </summary>
     [JsonPropertyName("type")]
-    public string Type { get; init; } = "function";
+    public string Type => "function";
 
     [JsonPropertyName("function")]
     public required ToolFunctionDto Function { get; init; }
@@ -216,8 +372,9 @@ public sealed record ToolCallDto
     [JsonPropertyName("id")]
     public required string Id { get; init; }
 
+    /// <inheritdoc cref="ToolDefinitionDto.Type"/>
     [JsonPropertyName("type")]
-    public string Type { get; init; } = "function";
+    public string Type => "function";
 
     [JsonPropertyName("function")]
     public required ToolCallFunctionDto Function { get; init; }

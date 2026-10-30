@@ -56,9 +56,9 @@ public enum Architecture
     /// dense MLP replaced by a DeepSeek-V3-style MoE (sigmoid router with per-expert
     /// bias, expert-weight norm + scale, ungated squared-ReLU experts, one shared
     /// expert) plus an optional MTP head layer. Used by Nemotron 3.5 Lightning
-    /// (30B-A3B). GGUF architecture string: <c>nemotron_h_moe</c> — a separate
-    /// llama.cpp arch from <c>nemotron_h</c>. Recognition and layout parsing are
-    /// implemented; the MoE forward is not yet (issue #375).
+    /// (30B-A3B) and Bolt (74B-A9B, LatentMoE). GGUF architecture string: <c>nemotron_h_moe</c> — a separate
+    /// llama.cpp arch from <c>nemotron_h</c>. The MoE forward runs on CPU (#375), Vulkan (#1045)
+    /// and CUDA (#403, experts resident in VRAM).
     /// </summary>
     NemotronHMoe,
 
@@ -391,5 +391,132 @@ public enum Architecture
     /// description for the exact boundary.
     /// </para>
     /// </summary>
-    Gemma3n
+    Gemma3n,
+
+    /// <summary>
+    /// Google Gemma 1 / CodeGemma (llama.cpp GGUF arch <c>gemma</c>). A Llama-shaped
+    /// two-norm decoder with GeGLU (tanh-approximate GELU) FFN, <c>sqrt(hidden)</c>
+    /// embedding scaling, tied embeddings, NeoX RoPE and head_dim independent of
+    /// <c>hidden/heads</c> (2B: MQA, 1 KV head; 7B: MHA). No QK-norm, no post-norms,
+    /// no soft-capping, no sliding window. The GGUF converter bakes the <c>(1+w)</c>
+    /// RMSNorm convention into the stored weights, so plain-weight RMSNorm kernels apply.
+    /// GGUF only (no safetensors mapping yet).
+    /// </summary>
+    Gemma,
+
+    /// <summary>
+    /// Google Gemma 2 (llama.cpp GGUF arch <c>gemma2</c>). The <see cref="Gemma"/> backbone plus
+    /// four RMSNorms per layer (post-attention and post-FFN norms before each residual add),
+    /// attention-logit soft-capping (50.0), final-logit soft-capping (30.0), alternating
+    /// sliding-window / full attention (even layers windowed — llama.cpp
+    /// <c>set_swa_pattern(2)</c>) and the <c>query_pre_attn_scalar</c> score scale
+    /// (<c>head_dim</c> for 2B/9B, <c>hidden/heads</c> for the 46-layer 27B). GGUF only.
+    /// </summary>
+    Gemma2,
+
+    /// <summary>
+    /// BERT-class bidirectional encoder (llama.cpp <c>bert</c>): post-LayerNorm, learned absolute
+    /// positions + token-type embedding, biased projections, GELU FFN. Embedding-only (no LM head);
+    /// served via <see cref="DotLLM.Core.Models.IEmbeddingModel"/> (issue #739).
+    /// </summary>
+    Bert,
+
+    /// <summary>
+    /// nomic-embed encoder (llama.cpp <c>nomic-bert</c>): BERT layout with RoPE (NeoX) instead of
+    /// absolute positions, fused QKV, SwiGLU FFN, no biases (issue #739).
+    /// </summary>
+    NomicBert,
+
+    /// <summary>
+    /// IBM Granite dense decoder (llama.cpp <c>granite</c>, HF <c>GraniteForCausalLM</c>; Granite-3.x / 4.x). A
+    /// Llama-shaped GQA + SwiGLU transformer plus the four Granite scalars: embedding multiplier,
+    /// attention multiplier (replaces <c>1/sqrt(head_dim)</c>), residual multiplier (on both sublayer
+    /// outputs) and logit scale (logits divided). See <see cref="DotLLM.Core.Models.ModelConfig.ResidualScale"/>,
+    /// <see cref="DotLLM.Core.Models.ModelConfig.AttentionScale"/>, <see cref="DotLLM.Core.Models.ModelConfig.LogitScale"/>
+    /// and <see cref="DotLLM.Core.Models.ModelConfig.EmbeddingScale"/> (issue #313, #764).
+    /// </summary>
+    Granite,
+
+    /// <summary>
+    /// AllenAI OLMo 2 (llama.cpp <c>olmo2</c>): post-norm-only residual layout (NO attention / FFN pre-norms;
+    /// <c>h = x + post_attn_norm(attn(x))</c>, <c>h = h + post_ffn_norm(ffn(h))</c>), full-width Q/K RMSNorm before the
+    /// head reshape, NeoX RoPE, SwiGLU. GGUF only; OLMo 3 (sliding window + YaRN) is refused (issue #765).
+    /// </summary>
+    Olmo2,
+
+    /// <summary>
+    /// Qwen4-Exp / Qwen3.8-Flash-Next (llama.cpp <c>qwen4exp</c>, HF <c>qwen4_exp</c>): a 3:1 Gated-DeltaNet / QSA (block-pooled sparse
+    /// attention with an indexer) hybrid with a 512-expert softmax MoE + sigmoid-gated shared expert in every layer, a 4-stream gated
+    /// residual ("hyper-connection") replacing the pre-norms and final norm, an n-gram hash embedding ("PLE") on one layer and an
+    /// optional MTP block. GGUF only (multi-shard). Recognition and config/metadata parsing are implemented; the forward pass is NOT
+    /// (every backend refuses it explicitly) — see <see cref="DotLLM.Core.Models.Qwen4ExpConfig"/> and issues #814 / #815.
+    /// </summary>
+    Qwen4Exp,
+
+    /// <summary>
+    /// Xiaomi MiMo-V2 / V2.5 / V2.6-Flash (llama.cpp <c>mimo2</c>, HF <c>MiMoV2ForCausalLM</c>): plain GQA attention + MoE.
+    /// Per-layer global/sliding-window mix (<c>hybrid_layer_pattern</c>; window 128 with learned per-head attention sinks on
+    /// the sliding layers only), K head_dim 192 but V head_dim 128 (<see cref="DotLLM.Core.Models.ModelConfig.ValueHeadDim"/>),
+    /// partial NEOX RoPE (first 64 dims; theta 1e7 global / 1e4 sliding), V scaled by 0.707
+    /// (<see cref="DotLLM.Core.Models.ModelConfig.AttentionValueScale"/>), fused QKV, a dense first layer then
+    /// sigmoid + selection-bias top-8 MoE with no shared expert. Trailing <c>nextn_predict_layers</c> MTP blocks are
+    /// not part of the trunk. See issues #935 / #936.
+    /// </summary>
+    MiMoV2,
+
+    /// <summary>
+    /// Recursive Flint (llama.cpp <c>flint</c>, HF <c>FlintForCausalLM</c>): a Qwen3-MoE-shaped trunk with learned per-head
+    /// attention sinks on every layer, a 3:1 sliding-window (513) / full-attention mix with NoPE on the full layers
+    /// (<see cref="DotLLM.Core.Models.ModelConfig.NoRopeLayers"/>), per-head QK-RMSNorm, two leading dense layers, then
+    /// sigmoid top-6-of-256 routing (renormalised, no selection bias) plus one ungated shared expert. See issues #1157 / #1158.
+    /// </summary>
+    Flint,
+
+    /// <summary>
+    /// Gemma 4 MTP drafter model (llama.cpp GGUF arch <c>gemma4-assistant</c>). A
+    /// standalone 4-layer mini-transformer (78M params for E4B, ~407M for larger
+    /// variants) that drafts speculative tokens for the <see cref="Gemma4"/> trunk
+    /// using Q-only cross-attention into the trunk's KV-cache — no K/V weights, all
+    /// layers read K/V directly from the trunk's cache (<c>shared_kv_layers = block_count</c>).
+    /// <para>
+    /// <b>Forward flow (per draft step):</b>
+    /// <c>nextn.pre_projection(concat(embed(token) * sqrt(trunk_hidden), trunk_hidden))</c>
+    /// → 4 decoder layers (Q-only GQA cross-attention into trunk KV + GeGLU FFN,
+    /// interleaved SWA/full per <c>sliding_window_pattern</c>) →
+    /// <c>output_norm</c> → trunk's LM head for logits; <c>nextn.post_projection</c>
+    /// output feeds back as the next step's hidden-state input.
+    /// </para>
+    /// <para>
+    /// Ships as a separate GGUF (<c>mtp-*.gguf</c>, ~57 MB for E4B Q4_0) beside the
+    /// trunk checkpoint. Attached via <see cref="DotLLM.Core.Models.IMtpHeadAttachable"/>
+    /// (issue #959).
+    /// </para>
+    /// </summary>
+    Gemma4Assistant,
+
+    /// <summary>
+    /// Liquid AI LFM2 / LFM2.5 MoE (llama.cpp <c>lfm2moe</c>, HF <c>Lfm2MoeForCausalLM</c>): 30 gated short-convolution
+    /// layers (<c>in_proj -> B*X -> causal depthwise conv k=L_cache -> C* -> out_proj</c>, no activation, no bias) interleaved
+    /// with 10 GQA layers (per-head QK RMS-norm, NeoX RoPE); every layer then has a SwiGLU FFN: dense for the leading
+    /// <c>leading_dense_block_count</c> layers, sigmoid + selection-bias top-k MoE (renormalised) after. Tied LM head.
+    /// See issue #1015.
+    /// </summary>
+    Lfm2Moe,
+
+    /// <summary>
+    /// Google EmbeddingGemma (llama.cpp <c>gemma-embedding</c>, HF <c>Gemma3TextModel</c> with
+    /// <c>use_bidirectional_attention</c>; sentence-transformers Transformer + mean Pooling + Dense + Dense + Normalize).
+    /// The <see cref="Gemma3"/> tower (QK-norm, four RMSNorms, GeGLU, dual RoPE, 5:1 local/global) with
+    /// <b>bidirectional</b> attention (sliding-window layers see keys within +-<c>(window-1)/2</c> positions on both
+    /// sides, llama.cpp <c>LLAMA_SWA_TYPE_SYMMETRIC</c>), no LM head, and two bias-free linear heads
+    /// (<c>dense_2</c> 768 to 3072, <c>dense_3</c> 3072 to 768) applied after pooling. CPU only (issue #1399).
+    /// </summary>
+    GemmaEmbedding,
+
+    /// <summary>
+    /// nomic-embed-text-v2-moe (llama.cpp <c>nomic-bert-moe</c>): the <see cref="NomicBert"/> encoder (post-LN, fused QKV, RoPE NeoX)
+    /// with a plain biased GELU FFN on even layers and a sparse top-2-of-8 GELU MoE FFN (softmax router, no renormalisation,
+    /// no gate projection) on odd layers (<c>moe_every_n_layers = 2</c>); XLM-R SentencePiece Unigram vocabulary. CPU only (issue #1400).
+    /// </summary>
+    NomicBertMoe
 }

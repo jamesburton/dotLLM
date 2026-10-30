@@ -27,8 +27,11 @@ namespace DotLLM.Cpu.Kernels;
 /// Q8_0 blocks of 32 elements, since <see cref="PQ2_0GroupSize"/> == 4 · <c>Q8_0GroupSize</c>),
 /// multiplied in alongside the activation's own Q8_0 block scale — see
 /// <see cref="VecDotPQ2_0Q8"/>.</item>
+/// <item><b>128-bit W2A8</b> (issue #477): on pre-AVX2 hardware with SSSE3 (e.g. Westmere) the
+/// same W2A8 path runs with the PMADDUBSW/PMADDWD kernels in <c>MatMul.W2A8Sse.cs</c>.</item>
 /// <item><b>Float fallback</b> (unpack row once into a per-group-scaled float buffer, then dot
-/// via <see cref="TensorPrimitives.Dot"/>): used on hardware without AVX2 (e.g. Westmere), and
+/// via <see cref="TensorPrimitives.Dot"/>): used on hardware without SSSE3, when
+/// <c>DOTLLM_PQ2_W2A8=0</c>, and
 /// — <b>unlike I2_S</b> — always used by <see cref="GemmPQ2_0"/> (GEMM/prefill) regardless of
 /// ISA. Issue #204 added the W2A8 tier and benchmarked both entry points: GEMV/decode got a
 /// solid, repeatable 2.4x-3.1x win and dispatches to W2A8 on AVX2/AVX-VNNI hardware as expected,
@@ -67,6 +70,7 @@ public static unsafe partial class MatMul
     {
         public byte* Weights;
         public byte* XQ8;   // quantized activations (Q8_0), one token
+        public float* XScales; // XQ8's block scales, pre-converted to float (issue #477)
         public float* Result;
         public int M;
         public int K;
@@ -76,22 +80,38 @@ public static unsafe partial class MatMul
     {
         public byte* Weights;
         public byte* BQ8;   // quantized activations (Q8_0), N tokens contiguous
+        public float* BScales; // BQ8's block scales as float, [N, K/32] (issue #477)
         public float* C;
         public int M;
         public int K;
         public int N;
     }
 
-    /// <summary>True when a SIMD W2A8 (int8-activation) path is available.</summary>
-    private static bool PQ2_0UseW2A8 => Avx2.IsSupported;
+    /// <summary>
+    /// True when a SIMD W2A8 (int8-activation) path is available and enabled: the AVX2/AVX-VNNI
+    /// tier, or (issue #477) the 128-bit SSSE3 tier in <c>MatMul.W2A8Sse.cs</c> on pre-AVX2
+    /// hardware such as Westmere. Overridable via <c>DOTLLM_PQ2_W2A8=0</c> to force the float
+    /// (W2A16) tier for A/B runs (mirrors <c>DOTLLM_I2S_W2A8</c>).
+    /// </summary>
+    private static readonly bool PQ2_0UseW2A8 = ResolvePQ2_0UseW2A8();
+
+    /// <summary>Largest token count routed to the W2A8 GEMM tier (<c>DOTLLM_PQ2_SMALLN_MAX</c>, default unbounded since #1386; 1 restores the float tier for every n>=2).</summary>
+    internal static readonly int PQ2_0SmallNMax = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_PQ2_SMALLN_MAX"), out int v) ? v : int.MaxValue;
+
+    private static bool ResolvePQ2_0UseW2A8()
+    {
+        string? env = Environment.GetEnvironmentVariable("DOTLLM_PQ2_W2A8");
+        if (env is "0" or "false" or "off") return false;
+        return Ssse3.IsSupported;
+    }
 
     /// <summary>
     /// PQ2_0 ternary GEMV: <c>result[r] = dot(perGroupScaled(A[r,:]), x)</c>.
     /// A is [M,K] packed PQ2_0 (row-major, K a multiple of 128, row stride
-    /// <c>(K/128)·34</c> bytes); x is f32 [K]; result is f32 [M]. On AVX2/AVX-VNNI hardware the
-    /// activation is quantized to int8 (Q8_0) once and the W2A8 SIMD path runs; older hardware
-    /// falls back to the float path. Output rows are partitioned across
-    /// <paramref name="threadPool"/> workers when present.
+    /// <c>(K/128)·34</c> bytes); x is f32 [K]; result is f32 [M]. On SSSE3-or-better hardware the
+    /// activation is quantized to int8 (Q8_0) once and the W2A8 SIMD path runs (256-bit on AVX2,
+    /// 128-bit otherwise — issue #477); hardware without SSSE3 falls back to the float path.
+    /// Output rows are partitioned across <paramref name="threadPool"/> workers when present.
     /// </summary>
     [SkipLocalsInit]
     public static void GemvPQ2_0(byte* weights, float* x, float* result, int m, int k,
@@ -190,6 +210,8 @@ public static unsafe partial class MatMul
     /// float reference tier. Output rows are partitioned across <paramref name="threadPool"/>
     /// workers when present.
     ///
+    /// <para><b>Small n (2..<see cref="PQ2_0SmallNMax"/>, issue #1367) takes the W2A8 tier</b> (4-token tiles, bit-identical per token to the decode GEMV): the speculative-verify range, where the scalar float tier below cost 1.3 s for 2 rows vs 0.25 s for decode. The cut is now unbounded (#1386): Bonsai-2 27B PQ2_0 wikitext-LF vs the float tier, context 32/128/512, mean KL 6.7e-5..9.5e-5, top-1 agreement 99.4-99.8%, PPL delta -0.03%, prefill 2.1-2.6x faster; see docs/PERPLEXITY.md. The paragraph that follows is the original n-independent reasoning.</para>
+    ///
     /// <para><b>Not wired to the W2A8 SIMD tier (issue #204 review follow-up).</b> Unlike
     /// <see cref="GemvPQ2_0"/>, this entry point deliberately does <i>not</i> dispatch to
     /// <see cref="GemmPQ2_0W2A8"/> even on AVX2/AVX-VNNI hardware: benchmarking
@@ -214,6 +236,15 @@ public static unsafe partial class MatMul
 
         if (k % PQ2_0GroupSize != 0)
             throw new ArgumentException($"k must be a multiple of {PQ2_0GroupSize}, got {k}", nameof(k));
+
+        // Small-n (speculative-verify and prefill, 2..PQ2_0SmallNMax rows): the scalar float tier below unpacks every weight row with a
+        // per-element scalar loop and dots in f32 - ~1.1 s for a 2-row Bonsai-2 forward vs 0.25 s for the W2A8 decode GEMV (#1367).
+        // Route to the W2A8 tier, which reads the packed blocks once per row and matches decode's numerics (Q8_0 activations).
+        if (PQ2_0UseW2A8 && n <= PQ2_0SmallNMax)
+        {
+            GemmPQ2_0W2A8(weights, b, c, m, k, n, threadPool);
+            return;
+        }
 
         if (threadPool is null || m < ParallelMinRows)
         {
@@ -281,7 +312,7 @@ public static unsafe partial class MatMul
         for (int g = 0; g < groups; g++)
         {
             byte* groupBase = rowPtr + g * PQ2_0GroupBytes;
-            float scale = (float)Unsafe.ReadUnaligned<Half>(groupBase);
+            float scale = HalfToSingle(groupBase);
             byte* codes = groupBase + 2;
             int outBase = g * PQ2_0GroupSize;
 
@@ -310,25 +341,29 @@ public static unsafe partial class MatMul
         int xQ8Bytes = blockCount * Q8_0BlockBytes;
 
         byte[] xQ8Buf = ArrayPool<byte>.Shared.Rent(xQ8Bytes);
+        float[] xScaleBuf = ArrayPool<float>.Shared.Rent(blockCount);
         try
         {
             fixed (byte* xQ8 = xQ8Buf)
+            fixed (float* xScales = xScaleBuf)
             {
                 QuantizeF32ToQ8_0(x, xQ8, k);
+                ConvertQ8_0Scales(xQ8, xScales, blockCount);
 
                 if (threadPool is null || m < ParallelMinRows)
                 {
-                    GemvPQ2_0W2A8Rows(weights, xQ8, result, 0, m, k);
+                    GemvPQ2_0W2A8Rows(weights, xQ8, xScales, result, 0, m, k);
                     return;
                 }
 
-                var ctx = new GemvPQ2SQ8Ctx { Weights = weights, XQ8 = xQ8, Result = result, M = m, K = k };
+                var ctx = new GemvPQ2SQ8Ctx { Weights = weights, XQ8 = xQ8, XScales = xScales, Result = result, M = m, K = k };
                 threadPool.Dispatch((nint)(&ctx), &GemvPQ2_0W2A8Worker);
             }
         }
         finally
         {
             ArrayPool<byte>.Shared.Return(xQ8Buf);
+            ArrayPool<float>.Shared.Return(xScaleBuf);
         }
     }
 
@@ -338,13 +373,13 @@ public static unsafe partial class MatMul
         ref var ctx = ref Unsafe.AsRef<GemvPQ2SQ8Ctx>((void*)ctxPtr);
         PartitionRows(ctx.M, threadIdx, threadCount, out int start, out int count);
         if (count == 0) return;
-        GemvPQ2_0W2A8Rows(ctx.Weights, ctx.XQ8, ctx.Result, start, count, ctx.K);
+        GemvPQ2_0W2A8Rows(ctx.Weights, ctx.XQ8, ctx.XScales, ctx.Result, start, count, ctx.K);
     }
 
     /// <summary>Computes <paramref name="rowCount"/> output rows (W2A8) starting at <paramref name="startRow"/>.</summary>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void GemvPQ2_0W2A8Rows(byte* weights, byte* xQ8, float* result,
+    private static void GemvPQ2_0W2A8Rows(byte* weights, byte* xQ8, float* xScales, float* result,
                                           int startRow, int rowCount, int k)
     {
         int rowBytes = (k / PQ2_0GroupSize) * PQ2_0GroupBytes;
@@ -361,7 +396,7 @@ public static unsafe partial class MatMul
                 for (int r = startRow; r < startRow + rowCount; r++)
                 {
                     UnpackPQ2_0RowI8(weights + (long)r * rowBytes, wI8, groupScales, k);
-                    result[r] = VecDotPQ2_0Q8(wI8, groupScales, xQ8, blockCount);
+                    result[r] = VecDotPQ2_0Q8(wI8, groupScales, xQ8, xScales, blockCount);
                 }
             }
         }
@@ -404,26 +439,30 @@ public static unsafe partial class MatMul
         long bQ8Bytes = (long)n * q8RowBytes;
 
         byte[] bQ8Buf = ArrayPool<byte>.Shared.Rent(checked((int)bQ8Bytes));
+        float[] bScaleBuf = ArrayPool<float>.Shared.Rent(checked(n * blockCount));
         try
         {
             fixed (byte* bQ8 = bQ8Buf)
+            fixed (float* bScales = bScaleBuf)
             {
                 for (int t = 0; t < n; t++)
                     QuantizeF32ToQ8_0(b + (long)t * k, bQ8 + (long)t * q8RowBytes, k);
+                ConvertQ8_0Scales(bQ8, bScales, n * blockCount);
 
                 if (threadPool is null || m < ParallelMinRows)
                 {
-                    GemmPQ2_0W2A8Rows(weights, bQ8, c, m, 0, m, k, n);
+                    GemmPQ2_0W2A8Rows(weights, bQ8, bScales, c, m, 0, m, k, n);
                     return;
                 }
 
-                var ctx = new GemmPQ2SQ8Ctx { Weights = weights, BQ8 = bQ8, C = c, M = m, K = k, N = n };
+                var ctx = new GemmPQ2SQ8Ctx { Weights = weights, BQ8 = bQ8, BScales = bScales, C = c, M = m, K = k, N = n };
                 threadPool.Dispatch((nint)(&ctx), &GemmPQ2_0W2A8Worker);
             }
         }
         finally
         {
             ArrayPool<byte>.Shared.Return(bQ8Buf);
+            ArrayPool<float>.Shared.Return(bScaleBuf);
         }
     }
 
@@ -433,7 +472,7 @@ public static unsafe partial class MatMul
         ref var ctx = ref Unsafe.AsRef<GemmPQ2SQ8Ctx>((void*)ctxPtr);
         PartitionRows(ctx.M, threadIdx, threadCount, out int start, out int count);
         if (count == 0) return;
-        GemmPQ2_0W2A8Rows(ctx.Weights, ctx.BQ8, ctx.C, ctx.M, start, count, ctx.K, ctx.N);
+        GemmPQ2_0W2A8Rows(ctx.Weights, ctx.BQ8, ctx.BScales, ctx.C, ctx.M, start, count, ctx.K, ctx.N);
     }
 
     /// <summary>
@@ -443,7 +482,7 @@ public static unsafe partial class MatMul
     /// </summary>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void GemmPQ2_0W2A8Rows(byte* weights, byte* bQ8, float* c, int m,
+    private static void GemmPQ2_0W2A8Rows(byte* weights, byte* bQ8, float* bScales, float* c, int m,
                                           int startRow, int rowCount, int k, int n)
     {
         int rowBytes = (k / PQ2_0GroupSize) * PQ2_0GroupBytes;
@@ -458,13 +497,29 @@ public static unsafe partial class MatMul
             fixed (sbyte* wI8 = rowBuf)
             fixed (float* groupScales = groupScaleBuf)
             {
+                float* acc4 = stackalloc float[4];
                 for (int r = startRow; r < startRow + rowCount; r++)
                 {
                     UnpackPQ2_0RowI8(weights + (long)r * rowBytes, wI8, groupScales, k);   // unpack ONCE per row
-                    for (int t = 0; t < n; t++)
+                    int t = 0;
+                    if (Avx2.IsSupported)
+                    {
+                        // 4 tokens per pass: the weight vector (|w|, w) is loaded once per block and 4 independent accumulators
+                        // break the single FMA dependency chain of the per-token dot (#1367).
+                        for (; t + 4 <= n; t += 4)
+                        {
+                            VecDot4PQ2_0Q8Avx2(wI8, groupScales, bQ8 + (long)t * q8RowBytes, q8RowBytes,
+                                               bScales + (long)t * blockCount, blockCount, blockCount, acc4);
+                            c[(long)t * m + r] = acc4[0];
+                            c[(long)(t + 1) * m + r] = acc4[1];
+                            c[(long)(t + 2) * m + r] = acc4[2];
+                            c[(long)(t + 3) * m + r] = acc4[3];
+                        }
+                    }
+                    for (; t < n; t++)
                     {
                         byte* xQ8 = bQ8 + (long)t * q8RowBytes;
-                        c[(long)t * m + r] = VecDotPQ2_0Q8(wI8, groupScales, xQ8, blockCount);
+                        c[(long)t * m + r] = VecDotPQ2_0Q8(wI8, groupScales, xQ8, bScales + (long)t * blockCount, blockCount);
                     }
                 }
             }
@@ -493,12 +548,84 @@ public static unsafe partial class MatMul
     /// applies <c>d_b</c> alone — the per-tensor <c>scale</c> multiply I2_S does at the very end
     /// has no equivalent here (there is no single tensor-wide scale to apply).</para>
     ///
-    /// <para>Dispatches to the VNNI tier when available, else the AVX2 (maddubs) tier. Both
-    /// tiers use the sign trick (see <c>MatMul.I2S.cs</c>'s class summary for the derivation).</para>
+    /// <para>Dispatches to the AVX2 tier (VNNI when available, else maddubs) or, on pre-AVX2
+    /// hardware, the 128-bit SSSE3 tier <see cref="VecDotPQ2_0Q8Sse"/> (issue #477). All tiers use
+    /// the sign trick (see <c>MatMul.I2S.cs</c>'s class summary for the derivation).</para>
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float VecDotPQ2_0Q8(sbyte* wI8, float* groupScales, byte* xQ8, float* xScales, int blockCount)
+        => Avx2.IsSupported
+            ? VecDotPQ2_0Q8Avx2(wI8, groupScales, xQ8, xScales, blockCount)
+            : VecDotPQ2_0Q8Sse(wI8, groupScales, xQ8, xScales, blockCount);
+
+    /// <summary>
+    /// Four-token variant of <see cref="VecDotPQ2_0Q8Avx2"/>: dots one int8 ternary weight row against 4 consecutive
+    /// Q8_0 activation rows (row stride <paramref name="xStrideBytes"/>, scale stride <paramref name="sStride"/> floats),
+    /// writing 4 results to <paramref name="outp"/>. Same per-block arithmetic as the single-token kernel (so each result
+    /// is bit-identical to it), but |w| is computed once per block and 4 independent accumulators hide FMA latency.
     /// </summary>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static float VecDotPQ2_0Q8(sbyte* wI8, float* groupScales, byte* xQ8, int blockCount)
+    internal static void VecDot4PQ2_0Q8Avx2(sbyte* wI8, float* groupScales, byte* xQ8, int xStrideBytes,
+                                            float* xScales, int sStride, int blockCount, float* outp)
+    {
+        const int blocksPerGroup = PQ2_0GroupSize / Q8_0GroupSize;
+        Vector256<float> a0 = Vector256<float>.Zero, a1 = a0, a2 = a0, a3 = a0;
+        bool useVnni = AvxVnni.IsSupported;
+        Vector256<short> ones = Vector256.Create((short)1);
+        byte* x0 = xQ8, x1 = xQ8 + xStrideBytes, x2 = xQ8 + 2L * xStrideBytes, x3 = xQ8 + 3L * xStrideBytes;
+        float* s0 = xScales, s1 = xScales + sStride, s2 = xScales + 2L * sStride, s3 = xScales + 3L * sStride;
+
+        for (int block = 0; block < blockCount; block++)
+        {
+            float g = groupScales[block / blocksPerGroup];
+            Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(wI8 + block * Q8_0GroupSize);
+            Vector256<byte> absW = Avx2.Sign(vw, vw).AsByte();
+            int off = block * Q8_0BlockBytes + 2;
+            Vector256<int> i0, i1, i2, i3;
+            Vector256<sbyte> q0 = Avx2.Sign(Unsafe.ReadUnaligned<Vector256<sbyte>>(x0 + off), vw);
+            Vector256<sbyte> q1 = Avx2.Sign(Unsafe.ReadUnaligned<Vector256<sbyte>>(x1 + off), vw);
+            Vector256<sbyte> q2 = Avx2.Sign(Unsafe.ReadUnaligned<Vector256<sbyte>>(x2 + off), vw);
+            Vector256<sbyte> q3 = Avx2.Sign(Unsafe.ReadUnaligned<Vector256<sbyte>>(x3 + off), vw);
+            if (useVnni)
+            {
+                i0 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, absW, q0);
+                i1 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, absW, q1);
+                i2 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, absW, q2);
+                i3 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, absW, q3);
+            }
+            else
+            {
+                i0 = Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(absW, q0), ones);
+                i1 = Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(absW, q1), ones);
+                i2 = Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(absW, q2), ones);
+                i3 = Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(absW, q3), ones);
+            }
+            if (Fma.IsSupported)
+            {
+                a0 = Fma.MultiplyAdd(Vector256.Create(s0[block] * g), Avx.ConvertToVector256Single(i0), a0);
+                a1 = Fma.MultiplyAdd(Vector256.Create(s1[block] * g), Avx.ConvertToVector256Single(i1), a1);
+                a2 = Fma.MultiplyAdd(Vector256.Create(s2[block] * g), Avx.ConvertToVector256Single(i2), a2);
+                a3 = Fma.MultiplyAdd(Vector256.Create(s3[block] * g), Avx.ConvertToVector256Single(i3), a3);
+            }
+            else
+            {
+                a0 += Avx.ConvertToVector256Single(i0) * Vector256.Create(s0[block] * g);
+                a1 += Avx.ConvertToVector256Single(i1) * Vector256.Create(s1[block] * g);
+                a2 += Avx.ConvertToVector256Single(i2) * Vector256.Create(s2[block] * g);
+                a3 += Avx.ConvertToVector256Single(i3) * Vector256.Create(s3[block] * g);
+            }
+        }
+        outp[0] = HorizontalSumAvx2Float(a0);
+        outp[1] = HorizontalSumAvx2Float(a1);
+        outp[2] = HorizontalSumAvx2Float(a2);
+        outp[3] = HorizontalSumAvx2Float(a3);
+    }
+
+    /// <summary>AVX2/AVX-VNNI tier of <see cref="VecDotPQ2_0Q8"/>.</summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    internal static float VecDotPQ2_0Q8Avx2(sbyte* wI8, float* groupScales, byte* xQ8, float* xScales, int blockCount)
     {
         const int blocksPerGroup = PQ2_0GroupSize / Q8_0GroupSize; // 128 / 32 = 4
 
@@ -510,7 +637,7 @@ public static unsafe partial class MatMul
         {
             // Activation Q8_0 block: 2-byte Half scale + 32 sbyte values.
             byte* xBlock = xQ8 + block * Q8_0BlockBytes;
-            float dx = (float)Unsafe.ReadUnaligned<Half>(xBlock);
+            float dx = xScales[block];   // pre-converted once per activation row (see ConvertQ8_0Scales)
 
             // Weight-side per-128-group scale: 4 consecutive Q8_0 blocks share one PQ2_0 group.
             float gScale = groupScales[block / blocksPerGroup];
@@ -568,9 +695,23 @@ public static unsafe partial class MatMul
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void UnpackPQ2_0RowI8(byte* rowPtr, sbyte* dest, float* groupScales, int k)
     {
-        int groups = k / PQ2_0GroupSize;
+        if (Sse2.IsSupported)
+            UnpackPQ2_0RowI8Sse(rowPtr, dest, groupScales, k);
+        else
+            UnpackPQ2_0RowI8Scalar(rowPtr, dest, groupScales, k);
+    }
 
-        if (Avx2.IsSupported)
+    /// <summary>
+    /// Former AVX2 tier of <see cref="UnpackPQ2_0RowI8"/>, <b>no longer dispatched</b> (issue #477):
+    /// its scalar re-interleave loop made it ~3.5x slower end-to-end than
+    /// <see cref="UnpackPQ2_0RowI8Sse"/>, which interleaves in registers and is byte-exact with it.
+    /// Kept as an independent oracle for <c>W2A8SseTierTests</c>.
+    /// </summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    internal static void UnpackPQ2_0RowI8Avx2(byte* rowPtr, sbyte* dest, float* groupScales, int k)
+    {
+        int groups = k / PQ2_0GroupSize;
         {
             sbyte* field0 = stackalloc sbyte[32]; // element 4b   (bit offset 0)
             sbyte* field2 = stackalloc sbyte[32]; // element 4b+1 (bit offset 2)
@@ -580,7 +721,7 @@ public static unsafe partial class MatMul
             for (int g = 0; g < groups; g++)
             {
                 byte* groupBase = rowPtr + g * PQ2_0GroupBytes;
-                groupScales[g] = (float)Unsafe.ReadUnaligned<Half>(groupBase);
+                groupScales[g] = HalfToSingle(groupBase);
                 byte* bp = groupBase + 2;
                 sbyte* outp = dest + g * PQ2_0GroupSize;
 
@@ -605,13 +746,18 @@ public static unsafe partial class MatMul
                     outp[outIdx + 3] = field6[b];
                 }
             }
-            return;
         }
+    }
 
+    /// <summary>Scalar reference tier of <see cref="UnpackPQ2_0RowI8"/>.</summary>
+    [SkipLocalsInit]
+    internal static void UnpackPQ2_0RowI8Scalar(byte* rowPtr, sbyte* dest, float* groupScales, int k)
+    {
+        int groups = k / PQ2_0GroupSize;
         for (int g = 0; g < groups; g++)
         {
             byte* groupBase = rowPtr + g * PQ2_0GroupBytes;
-            groupScales[g] = (float)Unsafe.ReadUnaligned<Half>(groupBase);
+            groupScales[g] = HalfToSingle(groupBase);
             byte* bp = groupBase + 2;
             int outBase = g * PQ2_0GroupSize;
             for (int b = 0; b < 32; b++)

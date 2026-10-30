@@ -41,6 +41,16 @@ public static class QuantFormat
     public const int Q8_1BlockBytes = 36;
     /// <summary>block_mxfp4: E8M0 scale byte + 16 nibble bytes.</summary>
     public const int Mxfp4BlockBytes = 17;
+    /// <summary>block_nvfp4: 4 UE4M3 sub-block scale bytes + 32 nibble bytes (#1038).</summary>
+    public const int Nvfp4BlockBytes = 36;
+    /// <summary>Elements per NVFP4 block (<c>QK_NVFP4</c>).</summary>
+    public const int Nvfp4GroupSize = 64;
+    /// <summary>Elements per NVFP4 sub-block sharing one UE4M3 scale (<c>QK_NVFP4_SUB</c>).</summary>
+    public const int Nvfp4SubBlockSize = 16;
+    /// <summary>Upstream ggml Q2_0: fp16 d + 16 code bytes per 64 elements (#823).</summary>
+    public const int Q2_0BlockBytes = 18;
+    /// <summary>Elements per upstream Q2_0 block.</summary>
+    public const int Q2_0GroupSize = 64;
     /// <summary>block_iq4_nl: d(f16) + 16 nibble bytes (non-linear codebook).</summary>
     public const int IQ4_NLBlockBytes = 18;
 
@@ -61,6 +71,8 @@ public static class QuantFormat
     public const int Q8_KBlockBytes = 292;
     /// <summary>block_iq1_s: d(f16) + qs[32] + qh[16×i16... packed 8×u16].</summary>
     public const int IQ1_SBlockBytes = 50;
+    /// <summary>IQ1_M super-block bytes (#823): qs[32] + qh[16] + scales[8].</summary>
+    public const int IQ1_MBlockBytes = 56;
     /// <summary>block_iq2_xxs: d(f16) + qs[32×u16].</summary>
     public const int IQ2_XXSBlockBytes = 66;
     /// <summary>block_iq2_xs: d(f16) + qs[32×u16] + scales[8].</summary>
@@ -75,7 +87,7 @@ public static class QuantFormat
     public const int IQ4_XSBlockBytes = 136;
 
     // ── Ternary / 2-bit 128-element group formats ──
-    /// <summary>Elements per group for the 2-bit 128-code packings (I2_S, PQ2_0).</summary>
+    /// <summary>Elements per group for the ternary 128-element packings (I2_S, PQ2_0, PTQ1_0).</summary>
     public const int TernaryGroupSize = 128;
     /// <summary>
     /// I2_S: 128 2-bit codes packed 4/byte = 32 bytes. The scale is NOT in the
@@ -85,6 +97,12 @@ public static class QuantFormat
     public const int I2_SBlockBytes = 32;
     /// <summary>PQ2_0: scale(f16) + 32 packed code bytes; scale is per-group, in-block.</summary>
     public const int PQ2_0BlockBytes = 34;
+    /// <summary>
+    /// PTQ1_0: qs[24] (5 base-3 trits per byte) + qh[2] (4 trits per byte) + scale(f16) =
+    /// 28 bytes per 128 weights. The scale is per-group and in-block, but it comes
+    /// <b>last</b>, not first as in PQ2_0.
+    /// </summary>
+    public const int PTQ1_0BlockBytes = 28;
 
     /// <summary>
     /// Static geometry for one quantization format. A <c>readonly record struct</c>
@@ -125,13 +143,16 @@ public static class QuantFormat
         QuantizationType.Q5_1 => new Info(type, Q5_1BlockBytes, LegacyGroupSize, HasMin: true),
         QuantizationType.Q8_0 => new Info(type, Q8_0BlockBytes, LegacyGroupSize, HasMin: false),
         QuantizationType.MXFP4 => new Info(type, Mxfp4BlockBytes, LegacyGroupSize, HasMin: false),
+        QuantizationType.NVFP4 => new Info(type, Nvfp4BlockBytes, Nvfp4GroupSize, HasMin: false),
         QuantizationType.IQ4_NL => new Info(type, IQ4_NLBlockBytes, LegacyGroupSize, HasMin: false),
+        QuantizationType.Q2_0 => new Info(type, Q2_0BlockBytes, Q2_0GroupSize, HasMin: false),
         QuantizationType.Q2_K => new Info(type, Q2_KBlockBytes, KQuantGroupSize, HasMin: true),
         QuantizationType.Q3_K => new Info(type, Q3_KBlockBytes, KQuantGroupSize, HasMin: false),
         QuantizationType.Q4_K => new Info(type, Q4_KBlockBytes, KQuantGroupSize, HasMin: true),
         QuantizationType.Q5_K => new Info(type, Q5_KBlockBytes, KQuantGroupSize, HasMin: true),
         QuantizationType.Q6_K => new Info(type, Q6_KBlockBytes, KQuantGroupSize, HasMin: false),
         QuantizationType.IQ1_S => new Info(type, IQ1_SBlockBytes, KQuantGroupSize, HasMin: false),
+        QuantizationType.IQ1_M => new Info(type, IQ1_MBlockBytes, KQuantGroupSize, HasMin: false),
         QuantizationType.IQ2_XXS => new Info(type, IQ2_XXSBlockBytes, KQuantGroupSize, HasMin: false),
         QuantizationType.IQ2_XS => new Info(type, IQ2_XSBlockBytes, KQuantGroupSize, HasMin: false),
         QuantizationType.IQ2_S => new Info(type, IQ2_SBlockBytes, KQuantGroupSize, HasMin: false),
@@ -140,6 +161,7 @@ public static class QuantFormat
         QuantizationType.IQ4_XS => new Info(type, IQ4_XSBlockBytes, KQuantGroupSize, HasMin: false),
         QuantizationType.I2_S => new Info(type, I2_SBlockBytes, TernaryGroupSize, HasMin: false),
         QuantizationType.PQ2_0 => new Info(type, PQ2_0BlockBytes, TernaryGroupSize, HasMin: false),
+        QuantizationType.PTQ1_0 => new Info(type, PTQ1_0BlockBytes, TernaryGroupSize, HasMin: false),
         _ => null,
     };
 
@@ -150,13 +172,13 @@ public static class QuantFormat
     public static ReadOnlySpan<QuantizationType> BlockFormats =>
     [
         QuantizationType.Q4_0, QuantizationType.Q4_1, QuantizationType.Q5_0,
-        QuantizationType.Q5_1, QuantizationType.Q8_0, QuantizationType.MXFP4,
-        QuantizationType.IQ4_NL,
+        QuantizationType.Q5_1, QuantizationType.Q8_0, QuantizationType.MXFP4, QuantizationType.NVFP4,
+        QuantizationType.IQ4_NL, QuantizationType.Q2_0,
         QuantizationType.Q2_K, QuantizationType.Q3_K, QuantizationType.Q4_K,
         QuantizationType.Q5_K, QuantizationType.Q6_K,
-        QuantizationType.IQ1_S, QuantizationType.IQ2_XXS, QuantizationType.IQ2_XS,
+        QuantizationType.IQ1_S, QuantizationType.IQ1_M, QuantizationType.IQ2_XXS, QuantizationType.IQ2_XS,
         QuantizationType.IQ2_S, QuantizationType.IQ3_XXS, QuantizationType.IQ3_S,
         QuantizationType.IQ4_XS,
-        QuantizationType.I2_S, QuantizationType.PQ2_0,
+        QuantizationType.I2_S, QuantizationType.PQ2_0, QuantizationType.PTQ1_0,
     ];
 }

@@ -38,11 +38,14 @@ namespace DotLLM.Cuda;
 /// </para>
 /// <para>
 /// <b>Precision.</b> Inherits v1's hard-won precision groundwork (FP16 Q/K/V, FP32 mma
-/// accumulator, fast_exp_neg-for-P / precise-expf-for-cross-tile-correction split) plus
+/// accumulator) plus
 /// <see cref="CudaKernels.LaunchAttentionF32GqaSplit"/>'s already-characterized cross-split
 /// reassociation tolerance at <c>kvSplit&gt;1</c> — re-verified for this kernel's new
 /// multi-warp PV split and packed-M-dim layout in
-/// <c>CudaAttentionMmaDecodeGqaSplitTests.cs</c>, not just assumed. Real generation-parity
+/// <c>CudaAttentionMmaDecodeGqaSplitTests.cs</c>, not just assumed. #501 then removed the
+/// Schraudolph <c>fast_exp_neg</c> from the per-key weights as well, so v1's deliberate
+/// approximate-P / precise-correction split is moot: every softmax exponential in this kernel
+/// is now <c>expf</c> (see the .cu file's Precision header). Real generation-parity
 /// validated (<c>CudaAttentionMmaDecodeGqaSplitGenerationParityTests.cs</c>, same harness shape
 /// as #222's split-KV test): pre-gate bit-identical, post-gate perplexity IMPROVES slightly
 /// (-0.173%), greedy generation diverges at the same step/depth (225/257) #222 already
@@ -113,7 +116,38 @@ internal sealed class CudaAttentionMmaDecodeGqaSplit
     {
         int maxSafe = _kernels.MaxSafeAttentionMmaDecodeGqaSplit(numKvHeads, SupportedHeadDim, group);
         if (maxSafe <= 0) return 0;
+        if (_kernels.MmaDecodeV2Active) return CudaKernels.ComputeAttentionMmaV2KvSplit(seqKv, maxSafe);
         return CudaKernels.ComputeAttentionKvSplit(seqKv, numKvHeads, maxSafe);
+    }
+
+    /// <summary>Shape/precondition check for the fused quantized-KV kernel (issue #956); mirrors <see cref="CanUse"/>.</summary>
+    internal bool CanUseKvq(Core.Configuration.KvCacheDType kDtype, Core.Configuration.KvCacheDType vDtype,
+                            int seqQ, int seqKv, int slidingWindow, int numHeads, int numKvHeads, int headDim)
+        => Enabled
+        && _kernels.HasAttentionMmaDecodeKvq(kDtype, vDtype)
+        && seqQ == 1
+        && seqKv > 0
+        && headDim == SupportedHeadDim
+        && slidingWindow <= 0
+        && CudaKernels.IsGqaGroupShapeSupported(numHeads, numKvHeads);
+
+    internal int ComputeSafeKvSplitKvq(Core.Configuration.KvCacheDType kDtype,
+                                       Core.Configuration.KvCacheDType vDtype, int numKvHeads, int seqKv)
+    {
+        int maxSafe = _kernels.MaxSafeAttentionMmaDecodeKvq(numKvHeads, kDtype, vDtype);
+        if (maxSafe <= 0) return 0;
+        if (CudaKernels.MmaDecodeV2Enabled) return CudaKernels.ComputeAttentionMmaV2KvSplit(seqKv, maxSafe);
+        return CudaKernels.ComputeAttentionKvSplit(seqKv, numKvHeads, maxSafe);
+    }
+
+    internal void RunKvq(nint q, nint k, nint v, Core.Configuration.KvCacheDType kDtype,
+                         Core.Configuration.KvCacheDType vDtype, nint output,
+                         int seqKv, int numHeads, int numKvHeads, int kvSplit,
+                         nint partialMax, nint partialSum, nint partialOut, nint stream)
+    {
+        DispatchCount++;
+        _kernels.LaunchAttentionMmaDecodeGqaSplitKvq(q, k, v, kDtype, vDtype, output, seqKv, numHeads,
+            numKvHeads, kvSplit, partialMax, partialSum, partialOut, stream);
     }
 
     /// <summary>

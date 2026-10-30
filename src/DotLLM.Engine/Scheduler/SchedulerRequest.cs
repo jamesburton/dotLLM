@@ -1,9 +1,12 @@
 using System.Diagnostics;
+using System.Text;
+using System.Threading.Channels;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Constraints;
 using DotLLM.Core.Models;
 using DotLLM.Core.Sampling;
 using DotLLM.Engine.Samplers;
+using DotLLM.Engine.Samplers.StopConditions;
 
 namespace DotLLM.Engine.Scheduler;
 
@@ -46,12 +49,18 @@ internal sealed class SchedulerRequest : ISchedulerRequest
     /// </summary>
     public IRecurrentSequenceState? RecurrentState { get; set; }
 
+    /// <summary>True when <see cref="RecurrentState"/> came from the scheduler's slot pool and may hold a previous sequence's data.</summary>
+    public bool RecurrentStateDirty { get; set; }
+
     /// <summary>True when the cache was minted by the prefix trie manager; its completion
     /// must be routed through <c>PrefixTrieManager.RecordCompletion</c> before disposal.</summary>
     public bool IsPrefixCached { get; set; }
 
     /// <summary>Prompt tokens that were reused from the prefix trie (no prefill needed).</summary>
     public int PrefixCachedTokens { get; set; }
+
+    /// <summary>The submitter's execution context for the per-request timing line (#1288); null when timing logs are off.</summary>
+    public ExecutionContext? LogContext { get; init; }
 
     /// <summary>
     /// True when this sequence was preempted and re-queued and must be re-admitted via the
@@ -69,6 +78,38 @@ internal sealed class SchedulerRequest : ISchedulerRequest
     /// <summary>Optional decoding constraint for structured output (JSON / schema / regex / grammar).</summary>
     public IDecodingConstraint? Constraint { get; }
 
+    /// <summary>
+    /// Per-sequence incremental detokenizer, present <b>only</b> when this request registered at
+    /// least one <see cref="DotLLM.Engine.Samplers.StopConditions.StopStringCondition"/> (#459)
+    /// or streams its tokens (<see cref="StreamWriter"/>, #1266).
+    /// Stop strings match on decoded text, so without it the scheduler had no tail to test and
+    /// every stop string — user-supplied or built-in like <c>&lt;|eom_id|&gt;</c> — was silently
+    /// inert. <see langword="null"/> when only token-level conditions (EOS, max-tokens) are
+    /// registered, which keeps the detokenize cost off requests that cannot use it.
+    /// </summary>
+    public IncrementalDetokenizer? Detokenizer { get; set; }
+
+    /// <summary>Scratch buffer for <see cref="IncrementalDetokenizer.GetTailView"/>, sized by
+    /// <see cref="StopTailSize"/>. Allocated once per request rather than pooled: a sequence has
+    /// a dozen distinct terminal paths (completion, cancellation, six failure sites) with no
+    /// single place to return a rented array, and the hot-path guarantee is per <i>token</i>, not
+    /// per request — this is one ~128-byte array beside an already-allocated
+    /// <c>List&lt;int&gt;(maxTokens)</c>.</summary>
+    public char[] StopScratch { get; set; } = [];
+
+    /// <summary>Character window handed to stop conditions; covers the longest registered stop
+    /// string with a cushion.</summary>
+    public int StopTailSize { get; set; }
+
+    /// <summary>
+    /// The stop <i>string</i> that ended this sequence, or <see langword="null"/> when it ended on
+    /// EOS, max-tokens or cancellation. The triggering token is deliberately kept in
+    /// <see cref="GeneratedTokens"/> — the match may cover only a suffix of it — and the stop
+    /// string is trimmed from the decoded text instead, at the character boundary. Recorded rather
+    /// than recomputed because the trim makes it unrecoverable from the returned text.
+    /// </summary>
+    public string? MatchedStopSequence { get; set; }
+
     /// <summary>Reason this sequence stopped (set when transitioning to <see cref="SequenceState.Completed"/>).</summary>
     public FinishReason FinishReason { get; set; } = FinishReason.Length;
 
@@ -81,10 +122,64 @@ internal sealed class SchedulerRequest : ISchedulerRequest
     /// <summary>Cumulative sampling ticks across all iterations.</summary>
     public long SamplerTicks { get; set; }
 
+    /// <summary>
+    /// Per-request token stream (#1266), or <see langword="null"/> for a completion-only request.
+    /// Unbounded, so the step loop never blocks on (or fails a request for) a slow consumer; growth
+    /// is bounded by <see cref="MaxTokens"/>. Completed at every terminal path alongside
+    /// <see cref="CompletionSource"/>, which carries the outcome (result, cancellation, or error).
+    /// </summary>
+    public ChannelWriter<GenerationToken>? StreamWriter { get; set; }
+
+    /// <summary>Holds back possible stop-string prefixes so the streamed text concatenates to
+    /// <see cref="InferenceResponse.Text"/> (#424). Set together with <see cref="StreamWriter"/>.</summary>
+    public StopAwareTextEmitter? TextEmitter { get; set; }
+
+    /// <summary>Text released by <see cref="TextEmitter"/> since the last emitted token.</summary>
+    public StringBuilder? StreamText { get; set; }
+
+    /// <summary>The most recently sampled token, kept even when a stop condition drops it from
+    /// <see cref="GeneratedTokens"/> so the final streamed token can still report it.</summary>
+    public int LastSampledToken { get; set; }
+
     /// <summary>Completion source resolved when the sequence finishes.</summary>
     public TaskCompletionSource<InferenceResponse> CompletionSource { get; }
 
     public Task<InferenceResponse> Completion => CompletionSource.Task;
+
+    /// <summary>Cancels the completion and ends the token stream, if any. Thread-safe (also called
+    /// from the caller's cancellation callback).</summary>
+    public void Cancel()
+    {
+        CompletionSource.TrySetCanceled();
+        StreamWriter?.TryComplete();
+    }
+
+    /// <summary>Faults the completion with <paramref name="ex"/> and ends the token stream, if any.</summary>
+    /// <param name="ex">The failure, surfaced to the caller through <see cref="Completion"/>.</param>
+    public void Fail(Exception ex)
+    {
+        CompletionSource.TrySetException(ex);
+        StreamWriter?.TryComplete();
+    }
+
+    /// <summary>Resolves the completion with <paramref name="response"/> and ends the token stream, if any.</summary>
+    /// <param name="response">The finished response.</param>
+    public void Complete(InferenceResponse response)
+    {
+        CompletionSource.TrySetResult(response);
+        StreamWriter?.TryComplete();
+    }
+
+    /// <summary>Takes the text released since the last emitted token.</summary>
+    /// <returns>The pending stream text; empty when there is none.</returns>
+    public string TakeStreamText()
+    {
+        var sb = StreamText!;
+        if (sb.Length == 0) return string.Empty;
+        string text = sb.ToString();
+        sb.Clear();
+        return text;
+    }
 
     /// <summary>Cancellation registration on the caller's token; disposed on completion.</summary>
     public CancellationTokenRegistration CancellationRegistration { get; set; }

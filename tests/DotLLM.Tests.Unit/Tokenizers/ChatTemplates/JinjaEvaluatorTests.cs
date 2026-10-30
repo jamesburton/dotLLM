@@ -404,6 +404,40 @@ public class JinjaEvaluatorTests
         Assert.Equal("yes", Eval("{% if x %}yes{% else %}no{% endif %}", new Dictionary<string, object?>(StringComparer.Ordinal) { ["x"] = "hi" }));
     }
 
+    // ── Inline-if without else (Jinja2: false branch is undefined -> renders empty). #770 ──
+
+    [Fact]
+    public void InlineIf_NoElse_FalseRendersEmpty()
+    {
+        Assert.Equal("", Eval("{{ 'x' if false }}"));
+    }
+
+    [Fact]
+    public void InlineIf_NoElse_TrueRendersValue()
+    {
+        Assert.Equal("x", Eval("{{ 'x' if true }}"));
+    }
+
+    [Fact]
+    public void InlineIf_NoElse_Gemma4CommaPattern_SeparatesItemsOnly()
+    {
+        // Gemma-4 template: {{- ',' if not loop.last -}} inside a for loop.
+        var vars = new Dictionary<string, object?>(StringComparer.Ordinal) { ["items"] = new List<object?> { "a", "b", "c" } };
+        Assert.Equal("a,b,c", Eval("{% for i in items %}{{ i }}{{- ',' if not loop.last -}}{% endfor %}", vars));
+    }
+
+    [Fact]
+    public void BlockSet_CapturesRenderedBody()
+    {
+        Assert.Equal("[x-1]", Eval("{% set c %}x-{{ 1 }}{% endset %}[{{ c }}]"));
+    }
+
+    [Fact]
+    public void Comment_WhitespaceControl_TrimsBothSides()
+    {
+        Assert.Equal("ab", Eval("a \n  {#- c -#}  \n b"));
+    }
+
     // ── Conditional (ternary) ──
 
     [Fact]

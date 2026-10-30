@@ -32,6 +32,8 @@ public class QuantFormatTests
     [InlineData(QuantizationType.Q8_0, 2 + 32, 32)]                 // d + qs[QK8_0]
     [InlineData(QuantizationType.MXFP4, 1 + 16, 32)]                // e8m0 scale + qs
     [InlineData(QuantizationType.IQ4_NL, 2 + 16, 32)]               // d + qs
+    // NVFP4 64-element blocks (#1038)
+    [InlineData(QuantizationType.NVFP4, 4 + 32, 64)]                // d[QK_NVFP4/QK_NVFP4_SUB] (UE4M3) + qs[QK_NVFP4/2]
     // K-quant / IQ 256-element super-blocks
     [InlineData(QuantizationType.Q2_K, 16 + 64 + 2 + 2, 256)]       // scales[QK_K/16] + qs[QK_K/4] + d + dmin
     [InlineData(QuantizationType.Q3_K, 32 + 64 + 12 + 2, 256)]      // hmask[QK_K/8] + qs[QK_K/4] + scales[12] + d
@@ -125,7 +127,7 @@ public class QuantFormatTests
             ["IQ3_XXS"] = QuantFormat.IQ3_XXSBlockBytes, ["IQ3_S"] = QuantFormat.IQ3_SBlockBytes,
             ["IQ4_NL"] = QuantFormat.IQ4_NLBlockBytes, ["IQ4_XS"] = QuantFormat.IQ4_XSBlockBytes,
             ["I2S"] = QuantFormat.I2_SBlockBytes, ["PQ2_0"] = QuantFormat.PQ2_0BlockBytes,
-            ["MXFP4"] = QuantFormat.Mxfp4BlockBytes,
+            ["MXFP4"] = QuantFormat.Mxfp4BlockBytes, ["Q2_0"] = QuantFormat.Q2_0BlockBytes, ["IQ1_M"] = QuantFormat.IQ1_MBlockBytes,
         };
         // filename fragment -> expected bytes, for bare `BLOCK_BYTES`
         var byFile = new (string Fragment, int Bytes)[]
@@ -134,6 +136,7 @@ public class QuantFormatTests
             ("q5_0", QuantFormat.Q5_0BlockBytes), ("q5_1", QuantFormat.Q5_1BlockBytes),
             ("q4_0", QuantFormat.Q4_0BlockBytes), ("q4_1", QuantFormat.Q4_1BlockBytes),
             ("iq4_nl", QuantFormat.IQ4_NLBlockBytes), ("mxfp4", QuantFormat.Mxfp4BlockBytes),
+            ("iq2_xxs", QuantFormat.IQ2_XXSBlockBytes), ("iq2_xs", QuantFormat.IQ2_XSBlockBytes), ("iq1_m", QuantFormat.IQ1_MBlockBytes),
         };
 
         var re = new Regex(@"const uint (?<name>[A-Z0-9_]*?)_?BLOCK_BYTES\s*=\s*(?<val>\d+)",

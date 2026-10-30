@@ -27,6 +27,7 @@ namespace DotLLM.Tests.Integration.Backends;
 /// cosine &gt; 0.999 — the same bar as the CPU↔CUDA gate in
 /// <c>BitNetAccuracyTests.CpuVsCuda_LastTokenLogits_Match</c>.
 /// </remarks>
+[Collection(GpuCollection.Name)]
 public sealed class BitNetVulkanAccuracyTests
 {
     private readonly ITestOutputHelper _output;

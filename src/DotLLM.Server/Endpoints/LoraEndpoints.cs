@@ -34,9 +34,9 @@ public static class LoraEndpoints
                 return Results.StatusCode(403);
 
             if (string.IsNullOrWhiteSpace(request.Name))
-                return Results.BadRequest(new ErrorResponse { Error = "name is required" });
+                return Results.BadRequest(ErrorResponse.InvalidRequest("name is required", param: "name"));
             if (string.IsNullOrWhiteSpace(request.Path))
-                return Results.BadRequest(new ErrorResponse { Error = "path is required" });
+                return Results.BadRequest(ErrorResponse.InvalidRequest("path is required", param: "path"));
 
             var registry = state.LoraRegistry;
             if (registry is null)
@@ -60,23 +60,23 @@ public static class LoraEndpoints
             }
             catch (InvalidOperationException ex)
             {
-                return Results.BadRequest(new ErrorResponse { Error = ex.Message });
+                return Results.BadRequest(ErrorResponse.InvalidRequest(ex.Message));
             }
             catch (DirectoryNotFoundException ex)
             {
-                return Results.BadRequest(new ErrorResponse { Error = ex.Message });
+                return Results.BadRequest(ErrorResponse.InvalidRequest(ex.Message));
             }
             catch (FileNotFoundException ex)
             {
-                return Results.BadRequest(new ErrorResponse { Error = ex.Message });
+                return Results.BadRequest(ErrorResponse.InvalidRequest(ex.Message));
             }
             catch (NotSupportedException ex)
             {
-                return Results.BadRequest(new ErrorResponse { Error = ex.Message });
+                return Results.BadRequest(ErrorResponse.InvalidRequest(ex.Message));
             }
             catch (InvalidDataException ex)
             {
-                return Results.BadRequest(new ErrorResponse { Error = ex.Message });
+                return Results.BadRequest(ErrorResponse.InvalidRequest(ex.Message));
             }
         });
 

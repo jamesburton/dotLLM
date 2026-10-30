@@ -1,0 +1,17 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer W { uvec4 w[]; };
+layout(std430, binding = 1) buffer O { uint o[]; };
+layout(push_constant) uniform P { uint chunkVec4; uint tiles; } p;
+// Mimics a GEMM's weight reuse: `tiles` adjacent workgroups re-read the same weight chunk.
+void main() {
+    uint id = gl_WorkGroupID.x;
+    uint c = id / p.tiles, t = id % p.tiles;
+    uint base = c * p.chunkVec4;
+    uint acc = t;
+    for (uint i = gl_LocalInvocationID.x; i < p.chunkVec4; i += 256u) {
+        uvec4 v = w[base + i];
+        acc ^= v.x + v.y + v.z + v.w;
+    }
+    o[id * 256u + gl_LocalInvocationID.x] = acc;
+}

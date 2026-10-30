@@ -1,0 +1,366 @@
+[
+ {
+  "name": "user_only_default_thinking",
+  "context": {
+   "bos_token": "<|endoftext|>",
+   "eos_token": "<|im_end|>",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 2 + 2?"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nWhat is 2 + 2?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "user_only_thinking_off",
+  "context": {
+   "bos_token": "<|endoftext|>",
+   "eos_token": "<|im_end|>",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 2 + 2?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": false
+  },
+  "expected": "<|im_start|>user\nWhat is 2 + 2?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "name": "user_only_thinking_explicit_on",
+  "context": {
+   "bos_token": "<|endoftext|>",
+   "eos_token": "<|im_end|>",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 2 + 2?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true
+  },
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nWhat is 2 + 2?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "effort_low",
+  "context": {
+   "bos_token": "<|endoftext|>",
+   "eos_token": "<|im_end|>",
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ],
+   "add_generation_prompt": true,
+   "reasoning_effort": "low"
+  },
+  "expected": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "effort_medium",
+  "context": {
+   "bos_token": "<|endoftext|>",
+   "eos_token": "<|im_end|>",
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ],
+   "add_generation_prompt": true,
+   "reasoning_effort": "medium"
+  },
+  "expected": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "effort_xhigh",
+  "context": {
+   "bos_token": "<|endoftext|>",
+   "eos_token": "<|im_end|>",
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ],
+   "add_generation_prompt": true,
+   "reasoning_effort": "xhigh"
+  },
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "effort_invalid_raises",
+  "context": {
+   "bos_token": "<|endoftext|>",
+   "eos_token": "<|im_end|>",
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ],
+   "add_generation_prompt": true,
+   "reasoning_effort": "bogus"
+  },
+  "expectedError": "Unexpected reasoning effort bogus. Supported types are xhigh (default), medium, and low."
+ },
+ {
+  "name": "system_and_user",
+  "context": {
+   "bos_token": "<|endoftext|>",
+   "eos_token": "<|im_end|>",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nYou are terse.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "system_and_user_thinking_off",
+  "context": {
+   "bos_token": "<|endoftext|>",
+   "eos_token": "<|im_end|>",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": false
+  },
+  "expected": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "name": "multi_turn",
+  "context": {
+   "bos_token": "<|endoftext|>",
+   "eos_token": "<|im_end|>",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello there!"
+    },
+    {
+     "role": "user",
+     "content": "Tell me a joke"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nHello there!<|im_end|>\n<|im_start|>user\nTell me a joke<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "multi_turn_reasoning_content",
+  "context": {
+   "bos_token": "<|endoftext|>",
+   "eos_token": "<|im_end|>",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello!",
+     "reasoning_content": "  greeting  "
+    },
+    {
+     "role": "user",
+     "content": "Again"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\ngreeting\n</think>\n\nHello!<|im_end|>\n<|im_start|>user\nAgain<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "multi_turn_preserve_thinking_false",
+  "context": {
+   "bos_token": "<|endoftext|>",
+   "eos_token": "<|im_end|>",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello!",
+     "reasoning_content": "r"
+    },
+    {
+     "role": "user",
+     "content": "Again"
+    }
+   ],
+   "add_generation_prompt": true,
+   "preserve_thinking": false
+  },
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello!<|im_end|>\n<|im_start|>user\nAgain<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "no_generation_prompt",
+  "context": {
+   "bos_token": "<|endoftext|>",
+   "eos_token": "<|im_end|>",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello!"
+    }
+   ],
+   "add_generation_prompt": false
+  },
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nHello!<|im_end|>\n"
+ },
+ {
+  "name": "unicode_and_whitespace",
+  "context": {
+   "bos_token": "<|endoftext|>",
+   "eos_token": "<|im_end|>",
+   "messages": [
+    {
+     "role": "user",
+     "content": "  café ☃ \n"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\ncafé ☃<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "no_user_message_raises",
+  "context": {
+   "bos_token": "<|endoftext|>",
+   "eos_token": "<|im_end|>",
+   "messages": [
+    {
+     "role": "system",
+     "content": "only system"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "expectedError": "No user query found in messages."
+ },
+ {
+  "name": "tools_declared",
+  "context": {
+   "bos_token": "<|endoftext|>",
+   "eos_token": "<|im_end|>",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get weather",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tool_call_roundtrip",
+  "context": {
+   "bos_token": "<|endoftext|>",
+   "eos_token": "<|im_end|>",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "sunny"
+    },
+    {
+     "role": "user",
+     "content": "thanks"
+    }
+   ],
+   "add_generation_prompt": true,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get weather",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsunny\n</tool_response><|im_end|>\n<|im_start|>user\nthanks<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ }
+]

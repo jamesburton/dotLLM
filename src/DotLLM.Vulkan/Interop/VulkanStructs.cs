@@ -40,7 +40,7 @@ internal static class VkStructureType
     // VK_KHR_external_memory / Vulkan 1.1 core — VkExternalMemoryBufferCreateInfo
     // chains off VkBufferCreateInfo.pNext to declare the buffer will be bound
     // to imported memory.
-    internal const int ExternalMemoryBufferCreateInfo = 1000072002;
+    internal const int ExternalMemoryBufferCreateInfo = 1000072000;
     // VK_EXT_external_memory_host extension structures.
     // Drives the host-mmap zero-copy weight path (see MemoryDomain.HostVisibleZeroCopy
     // / HostVisibleBuffer). The Properties struct carries
@@ -55,6 +55,11 @@ internal static class VkStructureType
     // and the device-create enable. Drives the dp4a MMVQ decode path
     // (dotPacked4x8AccSatEXT / GL_EXT_integer_dot_product).
     internal const int PhysicalDeviceShaderIntegerDotProductFeatures = 1000280000;
+    // Issue #374: the numeric-type / narrow-storage feature structs (16-bit storage: 1.1 core; float16/int8 and 8-bit
+    // storage: 1.2 core). Probed and enabled at device creation because shaders declare the matching SPIR-V capabilities.
+    internal const int PhysicalDevice16BitStorageFeatures = 1000083000;
+    internal const int PhysicalDeviceShaderFloat16Int8Features = 1000082000;
+    internal const int PhysicalDevice8BitStorageFeatures = 1000177000;
     // VK_EXT_subgroup_size_control (promoted to Vulkan 1.3 core). The Properties
     // struct (chained off VkPhysicalDeviceProperties2) reports min/max subgroup
     // size and which shader stages accept a required size; the Features struct
@@ -179,6 +184,7 @@ internal enum VkBufferUsageFlags : uint
     TransferSrc = 0x00000001,
     TransferDst = 0x00000002,
     StorageBuffer = 0x00000020,
+    IndirectBuffer = 0x00000100,
 }
 
 // VkMemoryPropertyFlagBits (bitflags)
@@ -658,6 +664,7 @@ internal struct VkQueryPoolCreateInfo
 internal static class VkPipelineStageFlags
 {
     internal const uint TopOfPipe = 0x00000001;
+    internal const uint DrawIndirect = 0x00000002;   // also the stage that reads vkCmdDispatchIndirect arguments
     internal const uint Transfer = 0x00001000;
     internal const uint ComputeShader = 0x00000800;
     internal const uint BottomOfPipe = 0x00002000;
@@ -667,6 +674,7 @@ internal static class VkPipelineStageFlags
 // VkAccessFlagBits — memory access masks for vkCmdPipelineBarrier.
 internal static class VkAccessFlags
 {
+    internal const uint IndirectCommandRead = 0x00000001;
     internal const uint ShaderRead = 0x00000020;
     internal const uint ShaderWrite = 0x00000040;
     internal const uint TransferRead = 0x00000800;
@@ -753,6 +761,39 @@ internal struct VkPhysicalDeviceShaderIntegerDotProductFeatures
     internal int sType;
     internal nint pNext;
     internal uint shaderIntegerDotProduct; // VkBool32
+}
+
+// VkPhysicalDevice16BitStorageFeatures (Vulkan 1.1 core) - issue #374.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDevice16BitStorageFeatures
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint storageBuffer16BitAccess;           // VkBool32
+    internal uint uniformAndStorageBuffer16BitAccess; // VkBool32
+    internal uint storagePushConstant16;              // VkBool32
+    internal uint storageInputOutput16;               // VkBool32
+}
+
+// VkPhysicalDeviceShaderFloat16Int8Features (Vulkan 1.2 core) - issue #374.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDeviceShaderFloat16Int8Features
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint shaderFloat16; // VkBool32
+    internal uint shaderInt8;    // VkBool32
+}
+
+// VkPhysicalDevice8BitStorageFeatures (Vulkan 1.2 core) - issue #374.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDevice8BitStorageFeatures
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint storageBuffer8BitAccess;           // VkBool32
+    internal uint uniformAndStorageBuffer8BitAccess; // VkBool32
+    internal uint storagePushConstant8;              // VkBool32
 }
 
 // VkPhysicalDeviceSubgroupSizeControlProperties — VK_EXT_subgroup_size_control
@@ -961,4 +1002,32 @@ internal struct VkShaderStatisticsInfoAmd
     internal uint computeWorkGroupSizeX;
     internal uint computeWorkGroupSizeY;
     internal uint computeWorkGroupSizeZ;
+}
+
+/// <summary>
+/// One entry of a <see cref="VkSpecializationInfo"/> map: which
+/// <c>constant_id</c> in the SPIR-V takes its value from which offset of the
+/// supplied data blob.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkSpecializationMapEntry
+{
+    internal uint constantID;
+    internal uint offset;
+    internal nuint size;
+}
+
+/// <summary>
+/// Specialization constants for a shader stage. Unlike a push constant, these
+/// are substituted BEFORE the driver's backend compiler runs, so branches on
+/// them fold away and the dead side costs no registers — which is the whole
+/// point of using one here (see #533).
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkSpecializationInfo
+{
+    internal uint mapEntryCount;
+    internal nint pMapEntries;
+    internal nuint dataSize;
+    internal nint pData;
 }

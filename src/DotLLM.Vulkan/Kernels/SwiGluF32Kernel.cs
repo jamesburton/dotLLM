@@ -21,6 +21,10 @@ public sealed class SwiGluF32Kernel : IDisposable
     private readonly ComputePipeline _pipeline;
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
+    private VulkanModule? _f16Module;
+    private ComputePipeline? _f16Pipeline;
+    private nint _f16Pool;
+    private DescriptorSetCache? _f16Cache;
     private bool _disposed;
 
     private SwiGluF32Kernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
@@ -60,11 +64,65 @@ public sealed class SwiGluF32Kernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
-        return new SwiGluF32Kernel(device, module, pipeline, pool);
+        var kernel = new SwiGluF32Kernel(device, module, pipeline, pool);
+        kernel.TryCreateF16Out(device, spvDir);
+        return kernel;
     }
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
-    internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
+    internal void InvalidateDescriptorCache()
+    {
+        _descriptorCache.Reset();
+        _f16Cache?.Reset();
+    }
+
+    /// <summary>True when the F16-output variant (<see cref="RecordF16Out"/>) is available (SPIR-V present, not disabled by <c>DOTLLM_VK_F16_ACT=0</c>).</summary>
+    internal bool HasF16Out => _f16Pipeline is not null;
+
+    private void TryCreateF16Out(VulkanDevice device, string spvDir)
+    {
+        if (Environment.GetEnvironmentVariable(CoopmatF16Gemm.EnvVar) == "0") return;
+        string path = Path.Combine(spvDir, "swiglu_f16out_f32.spv");
+        if (!File.Exists(path)) return;
+        var module = VulkanModule.LoadFromFile(device, path);
+        try
+        {
+            Span<VkDescriptorBinding> bindings = stackalloc VkDescriptorBinding[3];
+            for (int i = 0; i < 3; i++) bindings[i] = new VkDescriptorBinding((uint)i);
+            _f16Pipeline = module.CreateComputePipeline("main", bindings, PushConstantBytes);
+            _f16Pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
+            _f16Cache = new DescriptorSetCache(device, _f16Pool, _f16Pipeline, buffersPerSet: 3);
+            _f16Module = module;
+        }
+        catch
+        {
+            module.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// SwiGLU with an F16 result: <paramref name="resultF16"/> receives <paramref name="n"/> halves (<c>n * 2</c> bytes), each
+    /// rounded exactly as the GEMM staging would round the F32 value. Feeds <see cref="CoopmatF16Gemm"/>.
+    /// </summary>
+    internal unsafe void RecordF16Out(nint cmdBuf, VulkanDevice.Buffer gate, VulkanDevice.Buffer up,
+                                      VulkanDevice.Buffer resultF16, int n)
+    {
+        if (_f16Pipeline is null) throw new InvalidOperationException("F16-output SwiGLU is unavailable.");
+        if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n));
+        long bytes = (long)n * sizeof(float);
+        if (gate.Size < bytes) throw new ArgumentException("Gate buffer too small.", nameof(gate));
+        if (up.Size < bytes) throw new ArgumentException("Up buffer too small.", nameof(up));
+        if (resultF16.Size < (long)n * sizeof(ushort)) throw new ArgumentException("F16 result buffer too small.", nameof(resultF16));
+
+        Span<nint> buffers = stackalloc nint[3] { gate.Handle, up.Handle, resultF16.Handle };
+        nint set = _f16Cache!.GetOrCreate(buffers);
+        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _f16Pipeline.Pipeline);
+        VulkanApi.vkCmdBindDescriptorSets(cmdBuf, VkPipelineBindPoint.Compute, _f16Pipeline.Layout, 0, 1, set, 0, 0);
+        uint pushN = (uint)n;
+        VulkanApi.vkCmdPushConstants(cmdBuf, _f16Pipeline.Layout, VkShaderStageFlags.Compute, 0, sizeof(uint), (nint)(&pushN));
+        VulkanApi.vkCmdDispatch(cmdBuf, (uint)((n + WorkgroupSize - 1) / WorkgroupSize), 1, 1);
+    }
 
     /// <summary>
     /// Dispatches SwiGLU over <paramref name="n"/> elements. Synchronous —
@@ -122,6 +180,10 @@ public sealed class SwiGluF32Kernel : IDisposable
 
         if (_descriptorPool != 0)
             VulkanApi.vkDestroyDescriptorPool(_device.Handle, _descriptorPool, 0);
+        if (_f16Pool != 0)
+            VulkanApi.vkDestroyDescriptorPool(_device.Handle, _f16Pool, 0);
+        _f16Pipeline?.Dispose();
+        _f16Module?.Dispose();
         _pipeline.Dispose();
         _module.Dispose();
     }

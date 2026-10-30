@@ -44,6 +44,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// with a real <c>GdnStateCache</c>), so they need no multi-GB download and no known-good reference:
 /// only determinism.</para>
 /// </remarks>
+[Collection(GpuCollection.Name)]
 public sealed class ReprefillSequenceStateResetTests : IDisposable
 {
     private readonly ITestOutputHelper _output;

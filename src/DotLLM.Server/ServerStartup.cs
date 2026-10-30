@@ -6,6 +6,7 @@ using DotLLM.Engine;
 using DotLLM.Engine.KvCache;
 using DotLLM.Engine.PromptCache;
 using DotLLM.Engine.Scheduler;
+using DotLLM.HuggingFace;
 using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
@@ -23,36 +24,108 @@ namespace DotLLM.Server;
 public static class ServerStartup
 {
     /// <summary>
+    /// Whether a q8_0 KV request can use Q8_0 paged blocks: both K and V q8_0 (no mixed-precision window), a uniform
+    /// non-hybrid model, and a head dim on whole Q8_0 blocks. Otherwise the quantized simple cache serves it.
+    /// </summary>
+    public static bool IsPagedQ8Eligible(KvCacheConfig kvConfig, ModelConfig config, IModel? model)
+        => kvConfig.KeyDType == KvCacheDType.Q8_0 && kvConfig.ValueDType == KvCacheDType.Q8_0
+           && kvConfig.MixedPrecisionWindowSize == 0 && config.HeadDim % 32 == 0
+           && !IsHybridOrRecurrentCpuModel(config, model)
+           && DotLLM.Core.Attention.KvGeometry.FromConfig(config).IsUniform;
+
+    /// <summary>
+    /// Picks the CPU paged block type (#1284). Quantized (q8_0 K+V) requests get Q8_0 blocks; an explicit f32/f16 request
+    /// gets F16; when neither K nor V was specified the default is Q8_0 where eligible (faster and half the bytes of F16,
+    /// #1268) and <paramref name="info"/> carries the one-time startup message. Mixed (only K or only V given) is unchanged:
+    /// a lone q8_0 side is not eligible and falls back to the quantized simple cache, a lone f16 side stays F16.
+    /// </summary>
+    /// <param name="kvTypeSpecified">True when the user gave a K or V cache type.</param>
+    /// <param name="kvConfig">The parsed KV configuration.</param>
+    /// <param name="config">Model configuration.</param>
+    /// <param name="model">The loaded model, or <c>null</c>.</param>
+    /// <param name="info">Information message to log, or <c>null</c> when nothing was defaulted.</param>
+    /// <returns>The block element type.</returns>
+    public static DotLLM.Core.Tensors.DType ResolvePagedBlockType(
+        bool kvTypeSpecified, KvCacheConfig kvConfig, ModelConfig config, IModel? model, out string? info)
+    {
+        info = null;
+        if (kvConfig.IsQuantized)
+            return DotLLM.Core.Tensors.DType.Q8_0;
+        if (!kvTypeSpecified && IsPagedQ8Eligible(
+                new KvCacheConfig(KvCacheDType.Q8_0, KvCacheDType.Q8_0, kvConfig.MixedPrecisionWindowSize), config, model))
+        {
+            info = "KV cache: no type specified; using Q8_0 paged blocks (faster, half the memory of F16). " +
+                   "Use --cache-type-k f16 --cache-type-v f16 for F16.";
+            return DotLLM.Core.Tensors.DType.Q8_0;
+        }
+        return DotLLM.Core.Tensors.DType.Float16;
+    }
+
+    /// <summary>
+    /// True for CPU hybrid/recurrent models (GDN, SSM or hybrid layer layout, or one of the known hybrid model classes) that must
+    /// NOT get the generic paged KV pool: it is sized for <c>NumLayers x MaxSequenceLength</c> although only the attention layers
+    /// hold KV, so e.g. Bonsai-2-27B (64 layers, 16 KV layers, 262144 ctx) died at startup with "Insufficient memory" (#760).
+    /// </summary>
+    internal static bool IsHybridOrRecurrentCpuModel(ModelConfig config, IModel? model)
+        => config.HybridLayout is not null || config.SsmConfig is not null || config.GdnConfig is not null
+           || model is Qwen3HybridDenseTransformerModel or Qwen3MoeHybridTransformerModel
+                or NemotronHTransformerModel or Mamba3TransformerModel;
+
+    /// <summary>
     /// Resolves a model argument (file path or HuggingFace repo ID) to a local GGUF path.
     /// </summary>
     public static string? ResolveModelPath(string modelArg, string? quant)
     {
-        // Direct .gguf file path
-        if (modelArg.EndsWith(".gguf", StringComparison.OrdinalIgnoreCase) && File.Exists(modelArg))
-            return modelArg;
+        // A profile name resolves to its base model (#716); profiles shadow a model that happens to share the name.
+        if (ModelProfileStore.Resolve(modelArg) is { } resolved)
+            return ModelResolver.ResolveLocal(resolved.BaseReference, quant, includeOllama: true);
+        return ModelResolver.ResolveLocal(modelArg, quant, includeOllama: true);
+    }
 
-        // HuggingFace repo ID — check cached models directory
-        var modelsDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models");
+    /// <summary>
+    /// The id a loaded model is known by: the profile name when <paramref name="requested"/> names a profile (so a request for that alias
+    /// matches the active model and residency keys by it), otherwise the repo-qualified <see cref="ModelResolver.IdForPath"/>
+    /// (<c>owner/repo/file.gguf</c>; the bare file stem only for a file outside the model stores).
+    /// </summary>
+    public static string ModelIdFor(string requested, string resolvedPath) =>
+        ModelProfileStore.NormalizeName(requested) is { } n && ModelProfileStore.TryGet(n) is not null
+            ? n
+            // An ollama blob is named sha256-<hex>: key the model by the ollama name it was requested under.
+            : OllamaStore.IsBlobPath(resolvedPath) && OllamaRef.TryParse(requested) is { } o ? o.ToString()
+            : ModelResolver.IdForPath(resolvedPath);
 
-        var repoDir = Path.Combine(modelsDir, modelArg.Replace('/', Path.DirectorySeparatorChar));
-        if (!Directory.Exists(repoDir))
-            return null;
+    /// <summary>
+    /// <see cref="ResolveModelPath"/>, falling back to a Hub download when <paramref name="autoPull"/> is on and the reference names a Hub repo
+    /// (<c>--auto-pull</c>, issue #714). Off by default: a remote client must not be able to start multi-gigabyte downloads by naming a repo.
+    /// </summary>
+    public static async Task<string?> ResolveOrPullAsync(string modelArg, string? quant, bool autoPull, CancellationToken ct)
+    {
+        string? path = ResolveModelPath(modelArg, quant);
+        if (path is not null || !autoPull) return path;
 
-        var ggufFiles = Directory.GetFiles(repoDir, "*.gguf");
-        if (quant is not null)
+        string baseRef = ModelProfileStore.Resolve(modelArg)?.BaseReference ?? modelArg;
+        if (OllamaRef.TryParse(baseRef) is { } ollamaRef && !ModelResolver.Parse(baseRef).IsRepo)
         {
-            ggufFiles = ggufFiles.Where(f =>
-                Path.GetFileName(f).Contains(quant, StringComparison.OrdinalIgnoreCase)).ToArray();
+            using var registry = new OllamaRegistry();
+            Console.WriteLine($"[dotllm] --auto-pull: downloading {ollamaRef} from the ollama registry");
+            return await ModelResolver.PullOllamaAsync(ollamaRef, registry, progress: null, ct).ConfigureAwait(false);
         }
+        var reference = ModelResolver.Parse(baseRef);
+        if (!reference.IsRepo) return null;
+        using var client = new HuggingFaceClient();
+        using var downloader = new HuggingFaceDownloader();
+        Console.WriteLine($"[dotllm] --auto-pull: downloading {modelArg}");
+        return await ModelResolver.PullAsync(reference, quant, client, downloader, progress: null, ct).ConfigureAwait(false);
+    }
 
-        return ggufFiles.Length switch
-        {
-            1 => ggufFiles[0],
-            > 1 => ggufFiles.OrderByDescending(f => new FileInfo(f).Length).First(),
-            _ => null,
-        };
+    /// <summary>The message for an unresolvable model name, with the way out.</summary>
+    public static string NotFoundMessage(string modelArg)
+    {
+        string baseRef = ModelProfileStore.Resolve(modelArg)?.BaseReference ?? modelArg;
+        bool hf = ModelResolver.Parse(baseRef).IsRepo;
+        string pull = !hf && OllamaRef.TryParse(baseRef) is { } o ? $"dotllm model pull ollama:{o}" : $"dotllm model pull {modelArg}";
+        return $"Model not found: {modelArg}. Download it with `{pull}` or POST /v1/models/pull" +
+               (hf || OllamaRef.TryParse(baseRef) is not null ? ", or start the server with --auto-pull." : ".");
     }
 
     /// <summary>
@@ -92,40 +165,285 @@ public static class ServerStartup
     /// </summary>
     public static ServerState LoadModel(string resolvedPath, ServerOptions options)
     {
+        // One parser for every entry point (#790): "cuda", a typo or "vulkan:1" must never silently mean the CPU.
+        if (!DeviceSpec.TryParse(options.Device, out var spec, out string? deviceError))
+            throw new ArgumentException(deviceError);
+
+        if (spec.Kind != DeviceKind.Auto)
+        {
+            // Explicit device: preflight against the machine, then load on exactly that device. An explicit GPU that
+            // cannot be honoured is an error (what/why/opt-in), never a CPU run. ResolvedDevice is always recorded so
+            // /props and `model ps` report the same thing as an auto load does.
+            string canonical = spec.Canonical;
+            long bytes = ModelResolver.FileLength(resolvedPath);
+            string name = ModelIdFor(options.Model, resolvedPath);
+            if (spec.IsGpu)
+            {
+                var plan = DeviceSelector.Plan(spec, bytes, Endpoints.DeviceEndpoint.Describe(),
+                    fullOffload: options.GpuLayers is null or < 0 && !ExpertOffloadPossible(resolvedPath, options.MoeOffload));
+                if (plan.Error is not null)
+                    throw new DeviceUnavailableException(DeviceSelector.ExplicitFailureMessage(options.Device, name, bytes, plan.Error));
+            }
+            try
+            {
+                var explicitState = LoadModelCore(resolvedPath, options with { Device = canonical });
+                explicitState.Options = explicitState.Options with { ResolvedDevice = canonical };
+                return explicitState;
+            }
+            catch (Exception ex) when (spec.IsGpu && ex is not (DeviceUnavailableException or InvalidServerOptionException))
+            {
+                throw new DeviceUnavailableException(
+                    DeviceSelector.ExplicitFailureMessage(options.Device, name, bytes, $"loading the model failed: {ex.Message}"), ex);
+            }
+        }
+
+        // --device auto (#722): try the best device first and fall through on a failed load. The server keeps "auto" as its configured device
+        // (so later on-demand loads choose again, per model size); the device actually used is recorded in ResolvedDevice.
+        // CPU is only reached here by the user's own choice of "auto"; when a GPU candidate failed first, that is surfaced as a prominent
+        // WARNING (console + ServerState.DeviceFallbackWarning -> /props) rather than a quiet log line (#733).
+        Exception? last = null;
+        var gpuFailures = new List<string>();
+        var autoPlan = DeviceSelector.Plan(spec, ModelResolver.FileLength(resolvedPath), Endpoints.DeviceEndpoint.Describe());
+        foreach (string device in autoPlan.Candidates)
+        {
+            try
+            {
+                Console.WriteLine($"[dotllm] --device auto: trying {device}");
+                var loaded = LoadModelCore(resolvedPath, options with { Device = device });
+                loaded.Options = loaded.Options with { Device = options.Device, ResolvedDevice = device };
+                if (device == "cpu" && (gpuFailures.Count > 0 || autoPlan.CpuWarning is not null))
+                {
+                    // Auto on the CPU always warns: after a failed GPU load (reason + consequence), or because no GPU was servable at all.
+                    loaded.DeviceFallbackWarning = gpuFailures.Count > 0
+                        ? DeviceSelector.FallbackWarning(ModelIdFor(options.Model, resolvedPath), gpuFailures)
+                        : autoPlan.CpuWarning;
+                    Console.WriteLine($"[dotllm] WARNING: {loaded.DeviceFallbackWarning}");
+                }
+                return loaded;
+            }
+            catch (Exception ex) when (device != "cpu" && ex is not InvalidServerOptionException)
+            {
+                last = ex;
+                gpuFailures.Add($"{device}: {ex.Message}");
+                Console.WriteLine($"[dotllm] {device} could not load this model ({ex.Message}); trying the next device");
+            }
+        }
+        throw last ?? new InvalidOperationException("No device could load the model.");
+    }
+
+    /// <summary>
+    /// Resolves the requested GPU layer count against the layer count the loader actually sees (<paramref name="numLayers"/>).
+    /// A negative request (<see cref="AllGpuLayers"/>) or an unset request on a <c>gpu</c> device means "all layers"; otherwise the
+    /// request is clamped to <c>[0, numLayers]</c>; unset on a non-GPU device is 0.
+    /// </summary>
+    public static int ResolveGpuLayers(int? requested, string device, int numLayers) =>
+        requested is < 0 ? numLayers
+        : requested.HasValue ? Math.Clamp(requested.Value, 0, numLayers)
+        : DeviceSpec.TryParse(device, out var spec, out _) && spec.Kind == DeviceKind.Cuda ? numLayers : 0;
+
+    /// <summary>Sentinel <c>gpu_layers</c> value meaning "every layer, as the loader counts them".</summary>
+    public const int AllGpuLayers = -1;
+
+    /// <summary>
+    /// Embedding-only encoder checkpoints (BERT / nomic-bert, #739): no generator, KV-cache, chat template
+    /// or scheduler; only <c>/v1/embeddings</c> (and the ollama embed routes) serve them. CPU only -- a GPU
+    /// device request fails loudly rather than silently running on the CPU.
+    /// </summary>
+    private static ServerState LoadEncoderModel(
+        string resolvedPath, ServerOptions options, GgufFile gguf, ModelConfig config, ITokenizer tokenizer)
+    {
+        if (!string.Equals(options.Device, "cpu", StringComparison.OrdinalIgnoreCase))
+        {
+            gguf.Dispose();
+            throw new NotSupportedException(
+                $"{config.Architecture} embedding models are CPU-only for now (requested device '{options.Device}'). "
+                + "Use --device cpu; GPU encoder backends are not implemented (#741) and there is no silent CPU fallback. Decoder embedders (Qwen3-Embedding) do run on --device vulkan.");
+        }
+        var threading = new ThreadingConfig(options.Threads, options.DecodeThreads);
+        Console.WriteLine($"[dotllm] CPU inference, {config.Architecture} encoder ({threading.EffectiveThreadCount} threads); embeddings only");
+        var model = BertEncoderModel.LoadFromGguf(gguf, config, threading);
+        return new ServerState
+        {
+            Options = options,
+            Config = config,
+            KvCacheConfig = new KvCacheConfig(KvCacheConfig.ParseDType(options.CacheTypeK ?? "f32"), KvCacheConfig.ParseDType(options.CacheTypeV ?? "f32")),
+            IsReady = true,
+            Model = model,
+            Tokenizer = tokenizer,
+            LoadedModelPath = resolvedPath,
+            CurrentGguf = gguf,
+            LoraRegistry = CreateLoraRegistry(),
+            Residency = CreateResidencyManager(options),
+            EstimatedBytes = SafeFileLength(resolvedPath),
+            LastUsedUtc = DateTimeOffset.UtcNow,
+        };
+    }
+
+    /// <summary>Fitted windows below this many tokens get a loud warning: agent clients cannot work in less.</summary>
+    internal const int SmallContextWarningTokens = 8192;
+
+    /// <summary>
+    /// Issue #1068: chooses the served context for the CUDA hybrid and applies it to the model. Without this the server
+    /// advertised the checkpoint's 262,144 tokens on a 12 GB card that fits a fraction of that, so clients never compacted,
+    /// the KV cache outgrew VRAM, and WDDM spilled it into system RAM (requests went from minutes to hours).
+    /// </summary>
+    /// <param name="model">The loaded, warmed-up model.</param>
+    /// <param name="options">Server options (<see cref="ServerOptions.ContextSize"/>).</param>
+    /// <param name="mtpActive">Whether MTP self-speculation will run.</param>
+    /// <param name="mtpK">MTP draft tokens per round.</param>
+    /// <returns>The model's config after the limit.</returns>
+    internal static ModelConfig ApplyHybridContextFit(
+        DotLLM.Cuda.Architectures.CudaQwen3HybridDenseTransformerModel model, ServerOptions options, bool mtpActive, int mtpK)
+    {
+        var fit = model.MeasureServingContextFit(mtpActive, mtpK + 1);
+        if (fit.SizingError is { } sizingError)
+            Console.WriteLine($"[dotllm] WARNING: the context sizing pass was refused: {sizingError}");
+        int native = model.NativeMaxSequenceLength;
+        int chosen = ChooseServedContext(options.ContextSize, fit.MaxContext, native, out string? warning);
+        if (warning is not null)
+            Console.WriteLine($"[dotllm] WARNING: {warning}");
+        if (chosen < native)
+            model.LimitContextLength(chosen);
+        string kv = model.KvStorageLabel + (mtpActive ? " KV + MTP" : " KV");
+        Console.WriteLine(options.ContextSize is > 0
+            ? $"[dotllm] Context window: {model.Config.MaxSequenceLength} tokens (--ctx-size; {fit.MaxContext} fit in free VRAM: {fit.Describe()}, {kv})."
+            : $"[dotllm] Context window: {model.Config.MaxSequenceLength} of {native} tokens, fitted to free VRAM ({fit.Describe()}, {kv}). " +
+              "Set --ctx-size to override.");
+        return model.Config;
+    }
+
+    /// <summary>
+    /// Issue #1101: applies <c>--ctx-size</c> to a model that can lower its window but has no VRAM fit (the Vulkan hybrid). With
+    /// YaRN its window is factor × original (about 1M for Bonsai-2); without this the flag was ignored on Vulkan and the server
+    /// advertised the whole window.
+    /// </summary>
+    /// <param name="model">The loaded model.</param>
+    /// <param name="limitable">The same model, as <see cref="IContextLimitable"/>.</param>
+    /// <param name="options">Server options (<see cref="ServerOptions.ContextSize"/>).</param>
+    /// <returns>The model's config after the limit.</returns>
+    internal static ModelConfig ApplyRequestedContextSize(IModel model, IContextLimitable limitable, ServerOptions options)
+    {
+        int native = limitable.NativeMaxSequenceLength;
+        if (options.ContextSize is > 0 and int requested && requested < native)
+            limitable.LimitContextLength(requested);
+        Console.WriteLine(options.ContextSize is > 0
+            ? $"[dotllm] Context window: {model.Config.MaxSequenceLength} of {native} tokens (--ctx-size)."
+            : $"[dotllm] Context window: {native} tokens. Set --ctx-size to lower it.");
+        return model.Config;
+    }
+
+    /// <summary>
+    /// Issue #1324: qwen4exp on Vulkan sizes its K/V + indexer caches at load, so the serve options that decide the window are handed to it first:
+    /// <c>--ctx-size</c> becomes the requested capacity (reduced to what fits the device) and the K/V is stored as F16 unless
+    /// <c>DOTLLM_VK_QWEN4EXP_KV</c> says otherwise (24 instead of 48 KiB per token; measured against F32 in docs/ATTENTION.md).
+    /// </summary>
+    /// <param name="config">The checkpoint's configuration.</param>
+    /// <param name="options">Server options.</param>
+    internal static void PrepareQwen4ExpVulkan(ModelConfig config, ServerOptions options)
+    {
+        if (config.Architecture != Architecture.Qwen4Exp) return;
+        DotLLM.Vulkan.VulkanQwen4ExpTransformerModel.RequestedContextTokens = options.ContextSize;
+        if (Environment.GetEnvironmentVariable("DOTLLM_VK_QWEN4EXP_KV") is null && Environment.GetEnvironmentVariable("DOTLLM_VK_QWEN4EXP_QSA") != "0")
+            DotLLM.Vulkan.VulkanQwen4ExpTransformerModel.KvStorage = DotLLM.Vulkan.VulkanKvStorage.F16;
+    }
+
+    /// <summary>
+    /// The served context: an explicit request (capped at the model's window) or the fit; never below one 1024-token granule.
+    /// </summary>
+    /// <param name="requested">The <c>--ctx-size</c> value, or null.</param>
+    /// <param name="fit">Tokens that fit in free VRAM.</param>
+    /// <param name="native">The checkpoint's window.</param>
+    /// <param name="warning">A warning to log, or null.</param>
+    /// <returns>The window to serve.</returns>
+    internal static int ChooseServedContext(int? requested, int fit, int native, out string? warning)
+    {
+        warning = null;
+        if (requested is > 0 and int r)
+        {
+            int chosen = Math.Min(r, native);
+            if (chosen > fit)
+                warning = $"--ctx-size {chosen} exceeds the {fit} tokens that fit in free VRAM. Requests that grow past the fit will be " +
+                          "refused with an out-of-memory error (they are not spilled into system RAM).";
+            return chosen;
+        }
+
+        int served = Math.Clamp(fit, Math.Min(DeviceMemoryBudget.ContextGranularity, native), native);
+        if (fit < SmallContextWarningTokens)
+            warning = $"only {fit} tokens of context fit in free VRAM (serving {served}). Use a smaller KV type " +
+                      "(--kv-quant-k/-v q8_0 or q4_0), --no-mtp, or free GPU memory.";
+        return served;
+    }
+
+    /// <summary>
+    /// Whether the GGUF at <paramref name="path"/> is a <c>nemotron_h_moe</c> model whose routed experts may be offloaded
+    /// (#1070), read from its metadata; false when the file cannot be read.
+    /// </summary>
+    private static bool ExpertOffloadPossible(string path, DotLLM.Core.Moe.MoeOffloadOptions? moeOffload)
+    {
+        try
+        {
+            using var gguf = GgufFile.Open(path);
+            return DeviceModelLoader.ExpertOffloadPossible(GgufModelConfigExtractor.Extract(gguf.Metadata), moeOffload);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Opens only the metadata of the <c>--speculative-model</c> draft (the file is mapped, no tensor is read) and rejects architectures the dense draft
+    /// loader cannot take. A draft that is missing or unreadable is left to the real load below, which reports it as before.
+    /// </summary>
+    private static void ValidateSpeculativeDraftEarly(ServerOptions options, ModelConfig target)
+    {
+        if (string.IsNullOrEmpty(options.SpeculativeModel)) return;
+        string? draftPath = ResolveModelPath(options.SpeculativeModel, null);
+        if (draftPath is null) return;
+        ModelConfig draftConfig;
+        try
+        {
+            using var draftGguf = GgufFile.Open(draftPath);
+            draftConfig = GgufModelConfigExtractor.Extract(draftGguf.Metadata);
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or NotSupportedException or ArgumentException)
+        {
+            return;
+        }
+        SpeculativeDraftValidator.Validate(draftConfig, draftPath, target);
+    }
+
+    private static ServerState LoadModelCore(string resolvedPath, ServerOptions options)
+    {
         Console.WriteLine($"[dotllm] Loading model from {resolvedPath}...");
         var gguf = GgufFile.Open(resolvedPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         config = GgufModelConfigExtractor.ApplyRoPEOverride(config, options.RopeOverride);
-        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        bool isEncoder = config.Architecture is Architecture.Bert or Architecture.NomicBert or Architecture.NomicBertMoe;
+        var tokenizer = isEncoder ? GgufTokenizerFactory.Load(gguf.Metadata) : GgufBpeTokenizerFactory.Load(gguf.Metadata);
+
+        if (isEncoder)
+            return LoadEncoderModel(resolvedPath, options, gguf, config, tokenizer);
 
         var threading = new ThreadingConfig(options.Threads, options.DecodeThreads);
 
-        int gpuLayers = options.GpuLayers.HasValue
-            ? Math.Clamp(options.GpuLayers.Value, 0, config.NumLayers)
-            : options.Device.StartsWith("gpu", StringComparison.OrdinalIgnoreCase) ? config.NumLayers : 0;
+        // A draft that cannot load must fail NOW, not after the target (up to tens of GiB) is resident, and not as a "device" failure (#1319).
+        ValidateSpeculativeDraftEarly(options, config);
 
-        IModel model;
-        if (gpuLayers <= 0)
-        {
-            Console.WriteLine($"[dotllm] CPU inference ({threading.EffectiveThreadCount} threads)");
-            // Shared per-architecture CPU dispatch — routes hybrid architectures
-            // (Nemotron-H, Qwen3MoeHybrid) to their dedicated loaders.
-            model = ModelLoader.CreateCpuModelFromGguf(gguf, config, threading);
-        }
-        else if (gpuLayers >= config.NumLayers)
-        {
-            int gpuId = ParseGpuId(options.Device);
-            Console.WriteLine($"[dotllm] GPU {gpuId} inference");
-            // Shared per-architecture CUDA dispatch — routes hybrid architectures
-            // (Qwen3MoeHybrid, Qwen3HybridDense) to their dedicated loaders (#259).
-            (model, _) = DotLLM.Cuda.CudaModelLoader.CreateFromGguf(gguf, config, gpuId);
-        }
-        else
-        {
-            int gpuId = ParseGpuId(options.Device);
-            Console.WriteLine($"[dotllm] Hybrid inference ({gpuLayers} GPU + {config.NumLayers - gpuLayers} CPU layers)");
-            model = DotLLM.Cuda.HybridTransformerModel.LoadFromGguf(gguf, config, gpuLayers, gpuId, threading);
-        }
+        if (options.GpuLayers is { } requestedLayers && requestedLayers > config.NumLayers)
+            Console.WriteLine($"[dotllm] Requested {requestedLayers} GPU layers but {Path.GetFileName(resolvedPath)} has {config.NumLayers}; using all {config.NumLayers}.");
+
+        PrepareQwen4ExpVulkan(config, options);
+
+        // One shared dispatch for CPU / all-GPU / partial CUDA / Vulkan (#259, #729, #790) - the same call run and chat make.
+        // Architectures that cannot split layers load all-GPU or FAIL with an actionable error (never a silent CPU fallback).
+        var (model, deviceKvFactory) = DeviceModelLoader.LoadExact(
+            gguf, config, options.Device, options.GpuLayers, threading,
+            msg => Console.WriteLine($"[dotllm] {msg}"),
+            w => Console.WriteLine($"[dotllm] WARNING: {w}"),
+            options.MoeOffload);
+        // Only the Vulkan models' KV factory is wired here (CUDA/hybrid models keep their own per-request caches).
+        Func<int, IKvCache>? vulkanKvFactory = DeviceSpec.Parse(options.Device).Kind == DeviceKind.Vulkan ? deviceKvFactory : null;
 
         // Create chat template. The declared template is untrusted input from the GGUF's
         // tokenizer.chat_template metadata — a parse failure (unsupported Jinja construct,
@@ -155,10 +473,10 @@ public static class ServerStartup
 
         // KV-cache configuration. TurboQuant applies uniformly to K and V, so its bit-width and
         // QJL flag are taken from the key dtype string (e.g. "tq4", "tq4q").
-        var keyDType = KvCacheConfig.ParseDType(options.CacheTypeK, out int tqBits, out bool tqUseQjl);
+        var keyDType = KvCacheConfig.ParseDType(options.CacheTypeK ?? "f32", out int tqBits, out bool tqUseQjl);
         var kvConfig = new KvCacheConfig(
             keyDType,
-            KvCacheConfig.ParseDType(options.CacheTypeV),
+            KvCacheConfig.ParseDType(options.CacheTypeV ?? "f32"),
             TurboQuantBits: tqBits > 0 ? tqBits : 4,
             TurboQuantUseQjl: tqUseQjl);
 
@@ -166,7 +484,39 @@ public static class ServerStartup
         PagedKvCacheFactory? pagedFactory = null;
         DotLLM.Cuda.CudaPagedKvCacheFactory? cudaPagedFactory = null;
         PrefixTrieManager? prefixTrieManager = null;
-        if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
+        if (vulkanKvFactory is not null)
+        {
+            // Vulkan models own their device-resident KV storage. Requests run one at a time through the
+            // per-request TextGenerator unless the opt-in Vulkan scheduler below engages (hybrid models,
+            // DOTLLM_VK_SCHEDULER); there is no paged KV pool and no cross-request prefix trie yet.
+            if (options.UsePaged)
+                Console.WriteLine("[dotllm] Paged KV-cache not supported on Vulkan; using the model's own KV-cache.");
+            if (kvConfig.IsQuantized && model is DotLLM.Vulkan.VulkanTransformerModel vkModel)
+            {
+                string spvDir = DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir();
+                kvFactory = (cfg, size) => vkModel.CreateQuantizedKvCache(
+                    spvDir, size, kvConfig.KeyDType, kvConfig.ValueDType);
+            }
+            else
+            {
+                if (model is DotLLM.Vulkan.VulkanQwen3HybridDenseTransformerModel vkDense)
+                {
+                    // #1102: the dense hybrid (Bonsai 2) stores its KV as f16 (the default) and reads it in place. "f32" is the
+                    // option default, so it means "not given" here; DOTLLM_VK_KV=f32 selects the F32 A/B baseline. q8_0 / q4_0 /
+                    // mixed K and V fail startup.
+                    static string? Given(string? v) => string.Equals(v?.Trim(), "f32", StringComparison.OrdinalIgnoreCase) ? null : v;
+                    vkDense.ConfigureKvStorage(DotLLM.Vulkan.VulkanKvStorageExtensions.ParseOptions(
+                        Given(options.CacheTypeK), Given(options.CacheTypeV)));
+                    Console.WriteLine(
+                        $"[dotllm] KV storage: {vkDense.KvStorage.ToString().ToLowerInvariant()} ({vkDense.KvBytesPerPosition / 1024.0:F0} KiB/token), " +
+                        $"~{vkDense.KvBytesPerPosition * (long)config.MaxSequenceLength / 1048576.0:F0} MiB at {config.MaxSequenceLength} tokens.");
+                }
+
+                var vkFactory = vulkanKvFactory;
+                kvFactory = (cfg, size) => vkFactory(size);
+            }
+        }
+        else if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
         {
             if (options.UsePaged && kvConfig.IsQuantized)
             {
@@ -176,11 +526,11 @@ public static class ServerStartup
             else if (options.UsePaged)
             {
                 // Issue #252: GPU-resident block pool + gather-into-scratch attention dispatch.
-                // NOT wired into ContinuousBatchScheduler (pagedFactory stays null below) — the
-                // scheduler runs through IModel.ForwardBatch, which CudaTransformerModel doesn't
-                // yet override, so CUDA requests continue to serve one at a time through the
-                // per-request TextGenerator path exactly as before this cache existed. Only the
-                // per-request KV-cache backing changes (block-based instead of one flat buffer).
+                // NOT wired into ContinuousBatchScheduler (pagedFactory stays null below): although
+                // CudaTransformerModel implements IModel.ForwardBatch (#251), the GPU pool is not yet
+                // part of the scheduler's admission, so CUDA requests still serve one at a time through
+                // the per-request TextGenerator path. Only the per-request KV-cache backing changes
+                // (block-based instead of one flat buffer).
                 cudaPagedFactory = new DotLLM.Cuda.CudaPagedKvCacheFactory(
                     DotLLM.Core.Attention.KvGeometry.FromConfig(config));
                 var factory = cudaPagedFactory;
@@ -198,7 +548,34 @@ public static class ServerStartup
         {
             if (options.UsePaged)
                 Console.WriteLine("[dotllm] Paged KV-cache not supported with hybrid GPU, using hybrid cache.");
+            if (kvConfig.IsQuantized)
+                Console.WriteLine($"[dotllm] WARNING: --cache-type-k/-v (K:{kvConfig.KeyDType} V:{kvConfig.ValueDType}) is ignored: the hybrid GPU/CPU model owns its KV cache and has no quantized storage (model {config.Architecture}).");
             kvFactory = (cfg, size) => hybridModel.CreateKvCache(size);
+        }
+        else if (model is DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel qwen3SplitModel)
+        {
+            // #729: partial-offload Qwen3HybridDense owns a split (GPU head / CPU tail) cache.
+            if (options.UsePaged)
+                Console.WriteLine("[dotllm] Paged KV-cache not supported with hybrid GPU, using the model's split cache.");
+            if (kvConfig.IsQuantized)
+                Console.WriteLine($"[dotllm] WARNING: --cache-type-k/-v (K:{kvConfig.KeyDType} V:{kvConfig.ValueDType}) is ignored: the split GPU/CPU model owns its KV cache and has no quantized storage (model {config.Architecture}).");
+            kvFactory = (cfg, size) => qwen3SplitModel.CreateKvCache(size);
+        }
+        else if (model is DotLLM.Cuda.Architectures.CudaLfm2MoeTransformerModel lfmModel)
+        {
+            DotLLM.Cuda.Architectures.CudaLfm2MoeTransformerModel.ValidateKvStorage(kvConfig.KeyDType, kvConfig.ValueDType);
+            if (options.UsePaged)
+                Console.WriteLine("[dotllm] Paged KV-cache not supported for CUDA LFM2; using the model's own sparse cache.");
+            kvFactory = (cfg, size) => lfmModel.CreateKvCache(size);
+        }
+        else if (model is DotLLM.Cuda.Architectures.CudaNemotronHTransformerModel nemotronHModel)
+        {
+            // #729: the all-GPU fallback for a partial request on Nemotron-H; sparse attention-only KV.
+            if (options.UsePaged)
+                Console.WriteLine("[dotllm] Paged KV-cache not supported for Nemotron-H on GPU; using the model's own cache.");
+            if (kvConfig.IsQuantized)
+                Console.WriteLine($"[dotllm] WARNING: --cache-type-k/-v (K:{kvConfig.KeyDType} V:{kvConfig.ValueDType}) is ignored: Nemotron-H owns its KV cache and has no quantized storage (model {config.Architecture}).");
+            kvFactory = (cfg, size) => nemotronHModel.CreateKvCache(size);
         }
         else if (model is DotLLM.Cuda.Architectures.CudaQwen3HybridDenseTransformerModel qwen3HybridDenseModel)
         {
@@ -215,8 +592,14 @@ public static class ServerStartup
             // EnsureF16KvCache using AttentionLayerCount.
             if (options.UsePaged)
                 Console.WriteLine("[dotllm] Paged KV-cache not supported for Qwen3HybridDense hybrid GPU model (#274); using the model's own internal KV-cache.");
-            else if (kvConfig.IsQuantized)
-                Console.WriteLine("[dotllm] KV-cache quantization not supported for Qwen3HybridDense hybrid GPU model (#274); using the model's own internal KV-cache.");
+            // #967: the model owns quantized K/V storage; --cache-type-k/-v / --kv-quant-k/-v override DOTLLM_HYBRID_KV.
+            // "f32" (the option default) means "not given"; an unsupported pair (TurboQuant, row width % 32) throws.
+            qwen3HybridDenseModel.ConfigureKvStorage(
+                HybridKvStorage.FromServerOption(options.CacheTypeK),
+                HybridKvStorage.FromServerOption(options.CacheTypeV));
+            Console.WriteLine(
+                $"[dotllm] KV storage: {qwen3HybridDenseModel.KvStorageLabel} (K:{qwen3HybridDenseModel.KvKeyStorage} V:{qwen3HybridDenseModel.KvValueStorage}), " +
+                $"~{qwen3HybridDenseModel.ComputeKvBytes(config.MaxSequenceLength) / 1048576.0:F0} MiB at {config.MaxSequenceLength} tokens.");
             kvFactory = (cfg, size) => qwen3HybridDenseModel.CreateKvCache(size);
         }
         else if (model is DotLLM.Cuda.Architectures.CudaQwen3MoeHybridTransformerModel qwen3MoeHybridModel)
@@ -231,26 +614,47 @@ public static class ServerStartup
                 Console.WriteLine("[dotllm] KV-cache quantization not supported for Qwen3MoeHybrid hybrid GPU model (#274); using the model's own internal KV-cache.");
             kvFactory = (cfg, size) => qwen3MoeHybridModel.CreateKvCache(size);
         }
-        else if (options.UsePaged && !kvConfig.IsQuantized)
+        else if (options.UsePaged && !kvConfig.IsQuantized && IsHybridOrRecurrentCpuModel(config, model))
         {
+            // CPU hybrid/recurrent models: the paged pool is sized for config.NumLayers x MaxSequenceLength
+            // (e.g. Bonsai-2-27B: 64 layers x 262144 ctx, though only 16 layers hold KV), which dies at startup
+            // with "Insufficient memory to continue the execution of the program" under default flags. They also
+            // carry recurrent state the paged scheduler does not manage, so use the simple cache.
+            Console.WriteLine("[dotllm] Paged KV-cache not supported for hybrid/recurrent CPU models; using the simple KV-cache.");
+        }
+        else if (options.UsePaged && !kvConfig.IsQuantized && !DotLLM.Core.Attention.KvGeometry.FromConfig(config).IsUniform)
+        {
+            // Per-layer KV row widths: Gemma-4 (dual head dim 256/512) and MiMo-V2 (8 sliding / 4 global KV heads). Per-layer
+            // KV strides exist only on the contiguous F32 SimpleKvCache; the CPU forward's GuardKvCacheHeadDim rejects
+            // PagedKvCache with a 500 on the first request (#917, #943). Fall back to the simple cache instead of failing
+            // every request.
+            Console.WriteLine("[dotllm] Paged KV-cache does not support models with per-layer KV widths (Gemma-4, MiMo-V2); using the simple KV-cache.");
+        }
+        else if (options.UsePaged && (!kvConfig.IsQuantized || IsPagedQ8Eligible(kvConfig, config, model)))
+        {
+            // Blocks are F16 by default; q8_0 K and V select Q8_0 blocks (#1268, #1142 C4). Attention reads them in place.
+            var blockType = ResolvePagedBlockType(
+                options.CacheTypeK is not null || options.CacheTypeV is not null, kvConfig, config, model, out string? kvInfo);
+            if (kvInfo is not null)
+                Console.WriteLine($"[dotllm] INFO: {kvInfo}");
             pagedFactory = new PagedKvCacheFactory(
-                config.NumLayers, config.NumKvHeads, config.HeadDim);
+                config.NumLayers, config.NumKvHeads, config.HeadDim, elementType: blockType);
             kvFactory = (cfg, size) => pagedFactory.Create(size);
             // Cross-request prefix cache (Step 37). Enabled in tandem with paged.
             prefixTrieManager = new PrefixTrieManager(pagedFactory);
-            Console.WriteLine("[dotllm] Using paged KV-cache (block-based allocation) with cross-request prefix cache");
+            Console.WriteLine($"[dotllm] Using paged KV-cache ({blockType} blocks) with cross-request prefix cache");
         }
         else if (options.UsePaged && kvConfig.IsQuantized)
         {
-            Console.WriteLine("[dotllm] Paged KV-cache does not support quantization yet, using quantized simple cache.");
+            Console.WriteLine("[dotllm] Paged KV-cache supports q8_0 K+V only (uniform, non-hybrid models, no mixed-precision window); using quantized simple cache.");
             kvFactory = (cfg, size) => new QuantizedKvCache(
-                DotLLM.Core.Attention.KvGeometry.FromConfig(cfg), size,
+                DotLLM.Core.Attention.KvGeometry.FromConfig(cfg, model?.SupportsCompactSlidingKv == true), size,
                 kvConfig.KeyDType, kvConfig.ValueDType, kvConfig.MixedPrecisionWindowSize);
         }
         else if (kvConfig.IsQuantized)
         {
             kvFactory = (cfg, size) => new QuantizedKvCache(
-                DotLLM.Core.Attention.KvGeometry.FromConfig(cfg), size,
+                DotLLM.Core.Attention.KvGeometry.FromConfig(cfg, model?.SupportsCompactSlidingKv == true), size,
                 kvConfig.KeyDType, kvConfig.ValueDType, kvConfig.MixedPrecisionWindowSize);
         }
         else if (kvConfig.IsTurboQuant)
@@ -258,11 +662,11 @@ public static class ServerStartup
             Console.WriteLine($"[dotllm] Using TurboQuant KV-cache ({kvConfig.TurboQuantBits}-bit, data-oblivious" +
                 (kvConfig.TurboQuantUseQjl ? ", QJL unbiased scores)." : ")."));
             kvFactory = (cfg, size) => new TurboQuantKvCache(
-                cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, size,
+                DotLLM.Core.Attention.KvGeometry.SlotCount(cfg), cfg.NumKvHeads, cfg.HeadDim, size,
                 kvConfig.TurboQuantBits, kvConfig.TurboQuantSeed, kvConfig.TurboQuantUseQjl);
         }
 
-        PrefixCache? prefixCache = options.PromptCacheEnabled
+        PrefixCache? prefixCache = options.PromptCacheEnabled && vulkanKvFactory is null
             ? new PrefixCache(options.PromptCacheSize)
             : null;
 
@@ -295,23 +699,40 @@ public static class ServerStartup
             Console.WriteLine($"[dotllm] Speculative decoding: draft={Path.GetFileName(draftPath)}, K={options.SpeculativeCandidates}");
         }
 
-        // MTP self-speculative decoding (issue #253) — opt-in for serve (unlike run/chat's
-        // auto-detect default), since engaging it also takes the continuous-batch scheduler
-        // offline for this model (see below). Only actually engages requests when the loaded
-        // checkpoint carries an MTP head; otherwise this is a no-op even with --mtp set.
-        bool mtpActive = options.MtpEnabled && draftModel is null && model.SupportsMtp;
-        if (options.MtpEnabled && draftModel is null && model.SupportsMtp)
-            Console.WriteLine($"[dotllm] MTP self-speculative decoding: K={options.SpeculativeCandidates} (model carries an MTP head)");
-        else if (options.MtpEnabled && draftModel is null && !model.SupportsMtp)
-            Console.WriteLine("[dotllm] --mtp was set but this checkpoint has no MTP head (nextn.* tensors) — ignoring.");
+        // MTP self-speculative decoding (issue #253) - DEFAULT ON for serve when the checkpoint carries an embedded head
+        // (--no-mtp opts out). Engaging it takes the continuous-batch scheduler offline for this model, so an explicit
+        // concurrency hint (>= 5) wins and drops MTP (the scheduler measured +73% aggregate decode at 8 streams on Vulkan);
+        // an external draft model also wins (the two speculation modes are mutually exclusive).
+        string? vkSchedEnvForMtp = Environment.GetEnvironmentVariable("DOTLLM_VK_SCHEDULER");
+        bool schedulerAvailable = (vulkanKvFactory is not null && !string.Equals(vkSchedEnvForMtp, "0", StringComparison.Ordinal))
+            || pagedFactory is not null;
+        bool concurrencyOverMtp = options.MtpEnabled && options.ExpectedConcurrency >= 5 && schedulerAvailable;
+        // qwen4exp ships its draft head as a separate mtp-*.gguf (#820): attach it when MTP can engage (same rules as DecideMtp) so the default-on
+        // serve path actually speculates; a head that does not fit the device is declined with a message, never fatal.
+        if (options.MtpEnabled && !concurrencyOverMtp && draftModel is null && (!model.SupportsMtp || options.DFlashPath is not null))
+            TryAttachSeparateMtpHead(model, resolvedPath, options);
+        int mtpK = options.SpeculativeCandidates == TextGenerator.DefaultSpeculativeCandidates && model.MtpPreferredDraftTokens > 0
+            ? model.MtpPreferredDraftTokens : options.SpeculativeCandidates;
+        var mtpDecision = DecideMtp(options, model.SupportsMtp, draftModel is not null, concurrencyOverMtp, schedulerAvailable, mtpK);
+        bool mtpActive = mtpDecision.Active;
+        if (mtpDecision.Message is { } mtpMsg)
+            Console.WriteLine(mtpMsg);
 
         var generator = new TextGenerator(model, tokenizer, kvFactory, prefixCache,
             draftModel: draftModel, speculativeCandidates: options.SpeculativeCandidates,
-            mtpEnabled: options.MtpEnabled,
+            mtpEnabled: options.MtpEnabled, mtpAdaptive: true, recurrentPrefixCache: options.PromptCacheEnabled,
+            promptLookup: options.PromptLookup,
             prefixTrieManager: prefixTrieManager,
-            prefillChunkSize: options.PrefillChunkSize);
+            prefillChunkSize: options.PrefillChunkSize,
+            recurrentPrefixCacheOptions: options.GetPrefixSnapshotOptions());
         if (options.PrefillChunkSize > 0)
             Console.WriteLine($"[dotllm] Prefill chunk size: {options.PrefillChunkSize} tokens per forward pass");
+        if (options.PromptLookup is { } lookup)
+            Console.WriteLine($"[dotllm] Prompt lookup: up to {lookup.DraftTokens} drafts, n-gram {lookup.MinNgram}..{lookup.MaxNgram} (greedy requests; continuous batching off)");
+        if (generator.RecurrentStepCheckpointBytes > 0)
+            Console.WriteLine($"[dotllm] Prompt-cache steps: a {generator.RecurrentStepCheckpointBytes / 1048576.0:F1} MiB recurrent checkpoint every {options.PromptCacheStep} prefill tokens, keeping {options.PromptCacheStepKeep ?? 8}");
+        if (options.PrefixSnapshotDiskDirectory is not null)
+            Console.WriteLine($"[dotllm] Prefix snapshot disk transport: {generator.RecurrentPrefixStatistics.DiskTransport ?? "unavailable (provider or directory)"} (restart persistence disabled)");
 
         // Diffusion models (DiffusionGemma) route chat completions through a masked-canvas
         // diffusion generator instead of the autoregressive TextGenerator. Built only when the
@@ -328,24 +749,64 @@ public static class ServerStartup
             WarmupRunner.Run(generator, tokenizer, options.Warmup);
         prefixCache?.Clear(); // Discard warm-up KV-cache entries
 
-        // Continuous-batch scheduler. Enabled when a paged factory is available and speculative
-        // decoding is off — the scheduler doesn't support draft models (or MTP self-speculative
-        // decoding, same restriction) in this iteration, and GPU/hybrid models keep their existing
-        // single-request path until the IModel.ForwardBatch override lands in those backends.
+        // Issue #1068: size the CUDA hybrid's served context to free VRAM (after warm-up, so its buffers are counted).
+        if (model is DotLLM.Cuda.Architectures.CudaQwen3HybridDenseTransformerModel hybridDense)
+            config = ApplyHybridContextFit(hybridDense, options, mtpActive, mtpK);
+        else if (model is DotLLM.Vulkan.VulkanQwen4ExpTransformerModel q4Vulkan)
+        {
+            // #1324: the window is the capacity the caches were sized for at load (--ctx-size, reduced to fit), already in Config.
+            config = q4Vulkan.Config;
+            long perToken = DotLLM.Vulkan.VulkanQwen4ExpTransformerModel.KvBytesPerToken(config);
+            Console.WriteLine($"[dotllm] Context window: {config.MaxSequenceLength} tokens" +
+                (options.ContextSize is > 0 ? " (--ctx-size" + (options.ContextSize > config.MaxSequenceLength ? $" {options.ContextSize} reduced to fit the device" : "") + ")" : " (default)") +
+                $"; K/V + indexer {perToken / 1024.0:F1} KiB/token ({DotLLM.Vulkan.VulkanQwen4ExpTransformerModel.KvStorage.ToString().ToLowerInvariant()} K/V), " +
+                $"{perToken * (long)config.MaxSequenceLength / 1048576.0:F0} MiB if the window fills (allocated lazily). Raise with --ctx-size.");
+        }
+        else if (model is IContextLimitable limitable)
+            config = ApplyRequestedContextSize(model, limitable, options);
+
+        // Continuous-batch scheduler. Enabled when a (CPU) paged factory is available, or on the opt-in
+        // Vulkan hybrid path below, and speculative decoding is off: the scheduler doesn't support draft
+        // models (or MTP self-speculative decoding, same restriction). CUDA keeps the single-request path
+        // until its GPU paged pool is wired into scheduler admission (see above). Streaming requests run
+        // on the scheduler too (#1266).
         ContinuousBatchSchedulerService? scheduler = null;
-        if (pagedFactory is not null && kvFactory is not null && draftModel is null && !mtpActive)
+        // Vulkan hybrid models (per-sequence GDN state + serial ForwardBatch) can run through the scheduler, but the
+        // serial TextGenerator path is faster until recurrent prefix restore + fused batching land, so this is opt-in:
+        // DOTLLM_VK_SCHEDULER=1. No paged pool and no prefix trie (KV-only, paged-only) on this path.
+        string? vkSchedEnv = Environment.GetEnvironmentVariable("DOTLLM_VK_SCHEDULER");
+        bool vulkanScheduler = vulkanKvFactory is not null && model.SupportsThreadedSequenceState
+            && (string.Equals(vkSchedEnv, "1", StringComparison.Ordinal)
+                || (options.ExpectedConcurrency >= 5 && !string.Equals(vkSchedEnv, "0", StringComparison.Ordinal)));
+        if ((pagedFactory is not null || vulkanScheduler) && kvFactory is not null && draftModel is null && !mtpActive && options.PromptLookup is null)
         {
             var schedulerOptions = ResolveSchedulerOptions(options);
+            if (vulkanScheduler)
+            {
+                // Every active sequence owns a device KV cache + a GDN state slot on a (usually unified) GPU heap, and there is
+                // no byte-budget admission without a paged pool, so bound concurrency conservatively. Override with
+                // DOTLLM_VK_SCHEDULER_MAX_SEQS.
+                int maxSeqs = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_SCHEDULER_MAX_SEQS"), out int m) && m > 0 ? m : 8;
+                schedulerOptions = (schedulerOptions ?? new ContinuousBatchSchedulerOptions()) with
+                {
+                    MaxActiveSequences = Math.Min(schedulerOptions?.MaxActiveSequences ?? maxSeqs, maxSeqs),
+                    // Recurrent prefix snapshots (KV prefix + GDN state copies; ~tens of MB each on a 4B hybrid). Opt out with
+                    // DOTLLM_SCHED_RECURRENT_PREFIX=0.
+                    RecurrentPrefixCacheEntries = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_SCHED_RECURRENT_PREFIX"), out int rp) && rp >= 0 ? rp : 4,
+                };
+            }
 
             scheduler = new ContinuousBatchSchedulerService(
                 model,
                 tokenizer,
                 kvFactory,
                 options: schedulerOptions,
-                pagedPool: pagedFactory.Pool);
+                pagedPool: pagedFactory?.Pool);
             Console.WriteLine(options.Scheduler?.EnableFairness == true
                 ? "[dotllm] Continuous-batch scheduler active (per-API-key fairness on)"
-                : "[dotllm] Continuous-batch scheduler active");
+                : vulkanScheduler
+                    ? "[dotllm] Continuous-batch scheduler active (Vulkan; DOTLLM_VK_SCHEDULER=1 or --expected-concurrency >= 5)"
+                    : "[dotllm] Continuous-batch scheduler active");
         }
 
         long estimatedBytes = SafeFileLength(resolvedPath);
@@ -373,11 +834,85 @@ public static class ServerStartup
             DraftModel = draftModel,
             DraftModelPath = draftModelPath,
             DraftGguf = draftGguf,
+            MtpActive = mtpActive,
+            MtpStatus = mtpDecision.Status,
             LoraRegistry = CreateLoraRegistry(),
             Residency = CreateResidencyManager(options),
             EstimatedBytes = estimatedBytes,
             LastUsedUtc = DateTimeOffset.UtcNow,
         };
+    }
+
+    /// <summary>
+    /// Attaches a separate MTP head GGUF (qwen4exp) to <paramref name="model"/>: an explicit <c>--mtp-head</c> always, an auto-detected sibling only when
+    /// the trunk is big enough for self-speculation to beat plain decode (measured per quantisation, see <see cref="Qwen4ExpMtpHeadResolver"/>).
+    /// Failure to attach (no room on the device, bad tensor table) is reported and serving continues without speculation.
+    /// </summary>
+    internal static void TryAttachSeparateMtpHead(IModel model, string resolvedPath, ServerOptions options)
+    {
+        if (options.DFlashPath is { } dflashPath)
+        {
+            // An explicit drafter is the user's choice: failing to attach it fails startup rather than silently decoding plain.
+            if (model is not IDFlashDraftAttachable dflash)
+                throw new NotSupportedException($"--dflash: {model.GetType().Name} cannot drive a DFlash drafter (qwen35 targets on CPU, CUDA or Vulkan only).");
+            dflash.AttachDFlashDrafter(dflashPath);
+            Console.WriteLine($"[dotllm] DFlash: attached drafter {Path.GetFileName(dflashPath)}.");
+            return;
+        }
+        if (model is not IMtpHeadAttachable) return;
+        try
+        {
+            string? headPath = options.MtpHeadPath;
+            if (headPath is null)
+            {
+                headPath = Qwen4ExpMtpHeadResolver.Find(resolvedPath);
+                if (headPath is null) return;
+                long trunk = ModelResolver.FileLength(resolvedPath);
+                if (!Qwen4ExpMtpHeadResolver.ShouldAutoAttach(trunk))
+                {
+                    Console.WriteLine($"[dotllm] MTP: head {Path.GetFileName(headPath)} found but not attached - a {trunk / (double)(1L << 30):F0} GiB trunk measures slower with " +
+                                      "speculation than without (--mtp-head <path> forces it).");
+                    return;
+                }
+            }
+            Qwen4ExpMtpHeadResolver.TryAttach(model, resolvedPath, headPath);
+            Console.WriteLine($"[dotllm] MTP: attached head {Path.GetFileName(headPath)}.");
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            Console.WriteLine($"[dotllm] MTP: head not attached ({ex.GetType().Name}: {ex.Message}); decoding without speculation.");
+        }
+    }
+
+    /// <summary>Outcome of the serve-time MTP policy: whether it engages, the startup log line (null = stay quiet), and a short /props status.</summary>
+    internal readonly record struct MtpDecision(bool Active, string? Message, string Status);
+
+    /// <summary>
+    /// Pure MTP policy (#757). Active only when enabled, the model has an embedded head, no external draft model is given, and the
+    /// expected concurrency does not route to the continuous-batch scheduler. Always explains why when MTP is not engaged for a model
+    /// that has a head (or when the user explicitly asked with <c>--mtp</c>).
+    /// </summary>
+    internal static MtpDecision DecideMtp(ServerOptions options, bool supportsMtp, bool hasDraftModel, bool concurrencyOverMtp, bool schedulerAvailable = true, int? draftDepth = null)
+    {
+        if (!options.MtpEnabled)
+            return new(false, supportsMtp ? "[dotllm] MTP: skipped - disabled by --no-mtp (this model carries an MTP head)." : null,
+                "off (--no-mtp)");
+        if (!supportsMtp)
+            return new(false,
+                options.MtpExplicit ? "[dotllm] MTP: --mtp was set but this checkpoint has no MTP head (nextn.* tensors) - ignoring." : null,
+                "unavailable (no MTP head)");
+        if (hasDraftModel)
+            return new(false, "[dotllm] MTP: skipped - an external draft model (--speculative-model) was given; it takes precedence over the built-in MTP head.",
+                "skipped (external draft model)");
+        if (concurrencyOverMtp)
+            return new(false,
+                $"[dotllm] MTP: skipped - --expected-concurrency {options.ExpectedConcurrency} >= 5: serving through the continuous-batch scheduler, which cannot run MTP self-speculation.",
+                "skipped (expected concurrency >= 5)");
+        string how = options.MtpExplicit ? "enabled (--mtp)" : "enabled automatically (model carries an MTP head)";
+        string tradeoff = schedulerAvailable
+            ? " Tradeoff: continuous batching is off for this model; for many concurrent clients pass --no-mtp or --expected-concurrency 5."
+            : "";
+        return new(true, $"[dotllm] MTP: {how}, K={draftDepth ?? options.SpeculativeCandidates}, adaptive gate on.{tradeoff}", "active");
     }
 
     /// <summary>
@@ -392,9 +927,7 @@ public static class ServerStartup
     {
         try
         {
-            if (File.ResolveLinkTarget(path, returnFinalTarget: true) is FileInfo target)
-                return target.Length;
-            return new FileInfo(path).Length;
+            return ModelResolver.FileLength(path);   // follows symlinks; sums every shard of a split GGUF (#756)
         }
         catch { return 0; }
     }
@@ -483,13 +1016,32 @@ public static class ServerStartup
         app.UseDeveloperExceptionPage();
         app.UseCors();
 
+        // (#1021) "[dotllm] req#N POST /v1/chat/completions" ... "done 200 in 3.2s" / "cancelled after 600.0s".
+        app.UseRequestLifecycleLog();
+
+        // (#1023) A request whose admitted model was swapped out while it queued, and could not be re-activated: 503 / in-stream error.
+        ModelUnavailableException.UseModelUnavailableHandler(app);
+
+        // SDK observability headers (#452) — x-request-id, openai-processing-ms and the
+        // x-ratelimit-* trio. Registered unconditionally and OUTSIDE the limiter so the headers
+        // also land on its 429 short-circuit; the manager is null when limiting is off, in which
+        // case only the id/timing headers are emitted.
+        // The headers middleware must partition on the SAME resolver as the limiter, or the
+        // x-ratelimit-* values it reports come from a different bucket under a host-supplied
+        // IApiKeyResolver.
+        var apiKeyResolver = state.RateLimitManager is null
+            ? null
+            : app.Services.GetRequiredService<IApiKeyResolver>();
+
+        app.UseDotLLMResponseHeaders(state.RateLimitManager, apiKeyResolver);
+
         if (state.RateLimitManager is { } rlm)
-        {
-            var resolver = app.Services.GetRequiredService<IApiKeyResolver>();
-            app.UseDotLLMRateLimiting(rlm, resolver);
-        }
+            app.UseDotLLMRateLimiting(rlm, apiKeyResolver!);
 
         app.MapDotLLMEndpoints(serveUi);
+
+        // (#1021) The startup model's id is one the server hands out too.
+        state.RememberIssuedId(state.Options.ModelId, state.LoadedModelPath);
 
         var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
         state.ShutdownToken = lifetime.ApplicationStopping;
@@ -507,9 +1059,4 @@ public static class ServerStartup
 
         return app;
     }
-
-    private static int ParseGpuId(string device) =>
-        device.IndexOf(':') is int ci and > 0
-            ? int.Parse(device.AsSpan(ci + 1))
-            : 0;
 }

@@ -17,7 +17,7 @@ compute shaders instead of PTX. The architectural parallel is exact:
 | Native loader | `libcuda.so` / `nvcuda.dll` | `libvulkan.so.1` / `vulkan-1.dll` |
 | Shader IR | PTX (text) | SPIR-V (u32 binary) |
 | Kernel source | CUDA C++ (`.cu`) | GLSL compute (`.comp`) |
-| Compiler | `nvcc -ptx` | `glslc --target-env=vulkan1.2` |
+| Compiler | `nvcc -ptx` | `glslc --target-env=vulkan1.2 -O` |
 | Module type | `CUmodule` | `VkShaderModule` |
 | Launch | `cuLaunchKernel` | `vkCmdDispatch` |
 | Vendor reach | NVIDIA only | AMD, NVIDIA, Intel, Apple (MoltenVK), Qualcomm, ARM |
@@ -67,13 +67,31 @@ launches, memory-type heuristics beyond HOST_VISIBLE|HOST_COHERENT.
 End users need only the compiled `.spv` blobs, which ship as MSBuild
 `Content` alongside the managed DLL. Shader *authors* need the Vulkan
 SDK (https://vulkan.lunarg.com/) for `glslc`. The MSBuild target is
-idempotent: if `glslc` is not on PATH it logs a warning and uses the
+committed `.spv` files.
+
+**Shader build rule (#1254, #1310):** always `glslc --target-env=vulkan1.2 -O` (build scripts and the MSBuild target
+all pass it); committed `.spv` files are byte-reproducible with that command. Stay on `vulkan1.2` (SPIR-V 1.5, matching
+the 1.2 instance) until a shader needs a 1.3 feature, then raise the instance requirement too. Bytes depend on the
+`glslc` version: the committed set was verified with shaderc v2026.1 (spirv-tools v2026.1), so record the version when
+regenerating a shader on a newer toolchain.
+
+**glslc pin (#1364):** the verified toolchain is recorded in `native/vulkan/glslc.version` (`shaderc v2026.1`).
+An ordinary build runs `CompileVulkanShaders` only when `glslc --version` starts with that string; on any other
+glslc it **warns and skips**, so a build never rewrites tracked `.spv` with version-drifted bytes (previously ~30
+files dirtied every worktree and PR). Without glslc it also just uses the committed blobs.
+- `dotnet msbuild src/DotLLM.Vulkan -t:RegenerateVulkanShaders` rebuilds every `.spv` unconditionally (the
+  explicit authoring path; warns when the glslc differs from the pin - then review the diff and bump the pin).
+- `-p:DotLLMStrictSpv=true` turns the mismatch warning into an error.
+- `VulkanSpvFreshnessTests` (non-GPU, runs in the unit-test job) recompiles every `.comp` with the pinned glslc
+  and fails if any tracked `.spv` differs; it skips when glslc is absent or not the pinned version. The MSBuild
+  incremental check is timestamp-based, and timestamps are arbitrary after a checkout, so only this test (not the
+  build) proves a tracked `.spv` matches its `.comp`. Always run it after editing a shader.
 committed `.spv` files.
 
 ```
 native/vulkan/shaders/add.comp         (author edits)
             │
-            │   glslc --target-env=vulkan1.2 -o add.spv add.comp
+            │   glslc --target-env=vulkan1.2 -O -o add.spv add.comp
             ▼
 native/vulkan/spv/add.spv              (checked in — ships to users)
             │
@@ -223,3 +241,27 @@ dotnet test tests/DotLLM.Tests.Unit --filter FullyQualifiedName~Vulkan
 ```
 
 Opt out on CI without a usable driver: `DOTLLM_SKIP_VULKAN=1`.
+
+## Gemma-4 dense variant (E2B/E4B) (issue #734)
+
+Supported: per-layer embeddings (PLE), trailing shared-KV layers, proportional `rope_freqs`, mixed head dim 256/512, dense GeGLU FFN, layer output scale, final logit soft-cap.
+
+- PLE inputs are computed on the host with the CPU-oracle code (`Gemma4PerLayerInputs`) and uploaded layer-major; each layer copies its `[seq, pleDim]` slice and runs gate matmul -> GeGLU -> proj matmul -> post-norm -> add on the device.
+- Shared layers read the donor layer's `VulkanKvCache` lines (cacheless: a 2-slot donor stash).
+- `rope_freqs` is accepted only in the released `{1.0 x n, 1e30 x rest}` form (mapped onto partial rotary); any other table throws at load.
+- Not supported: layer-split pipeline stages, TurboQuant KV, and the fused `ForwardBatch` path (falls back to per-sequence forwards).
+- Measured on Strix Halo (gfx1151), Q4_K_M: decode 36.5 tok/s, prefill 381 tok/s at 128 tokens; wikitext PPL within 0.04% of CPU (see PR).
+
+## Expert-grouped coopmat MoE prefill (issue #789, builds on #773/#785)
+
+For prefill (S >= 16 tokens; `DOTLLM_VK_MOE_GROUPED_MIN_TOKENS`) the generic MoE layer (`VulkanTransformerModel.RecordMoeLayer`) no longer runs the
+scalar indexed expert matmuls when every routed bank is a packed Q4_K / Q5_K / Q6_K / Q8_0 / MXFP4 tensor: it sorts the (token, slot) rows by expert once,
+builds an indirect tile list (`moe_build_tile_list`) and runs one cooperative-matrix GEMM per (expert, 16-row tile) with a 64-row weight tile
+(`moe_grouped_matmul_{q4_k,q5_k,q6_k,q8_0,mxfp4}_coopmat_m64`). The activation (SiLU, or gpt-oss's clamped OAI SwiGLU) is pointwise so it runs in packed
+order; the down GEMM reads that packed activation directly; one ungroup restores the (token, slot) order for the unchanged weighted scatter. gpt-oss's
+per-expert gate/up/down bias is added in the MXFP4 shader epilogue (`applyScale == 2`), the same single F32 add the scalar path does as a separate pass.
+Operands are F16 (dequantised weights and activations), so logits differ from the scalar path by ~1% of their rms; see the tests for the measured envelopes.
+
+* Opt-out: `DOTLLM_VK_MOE_GROUPED=0` (load time) or `VulkanTransformerModel.GroupedMoeEnabled = false` (runtime, in-process A/B).
+* Decode (S < gate) and LoRA keep the indexed MMVQ kernels. Wave64 + cooperative matrix devices only; others fall back to the scalar path.
+* Measured on gfx1151 (same session, split-submit profile): gpt-oss-20b pp512 74-82 -> 730-780 tok/s, OLMoE Q4_K_M pp512 `VK_ERROR_DEVICE_LOST` (#787) -> ~2900.

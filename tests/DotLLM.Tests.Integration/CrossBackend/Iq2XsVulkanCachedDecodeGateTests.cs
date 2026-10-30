@@ -42,6 +42,7 @@ namespace DotLLM.Tests.Integration.CrossBackend;
 /// since the described defect does not currently reproduce.
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class Iq2XsVulkanCachedDecodeGateTests
 {
     private const string Corpus =

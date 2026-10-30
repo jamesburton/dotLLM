@@ -62,10 +62,10 @@ extern "C" __global__ void __launch_bounds__(WG_SIZE) mamba3_data_rope_f32(
         }
         __syncthreads();
 
-        if (tid < nra)
+        for (int i = tid; i < nra; i += WG_SIZE)
         {
-            float co = sharedCos[tid];
-            float si = sharedSin[tid];
+            float co = sharedCos[i];
+            float si = sharedSin[i];
             int tokenBase = t * bcTokenStride;
             for (int r = 0; r < nRank; r++)
             {
@@ -73,11 +73,11 @@ extern "C" __global__ void __launch_bounds__(WG_SIZE) mamba3_data_rope_f32(
                 int i0, i1;
                 if (mode == 0)
                 {
-                    i0 = bcBase + 2 * tid; i1 = i0 + 1;
+                    i0 = bcBase + 2 * i; i1 = i0 + 1;
                 }
                 else
                 {
-                    i0 = bcBase + tid; i1 = bcBase + halfDState + tid;
+                    i0 = bcBase + i; i1 = bcBase + halfDState + i;
                 }
                 float be = b[i0]; float bo = b[i1];
                 float ce = c[i0]; float co2 = c[i1];

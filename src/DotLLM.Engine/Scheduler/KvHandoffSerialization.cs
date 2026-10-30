@@ -164,9 +164,9 @@ public sealed class SerializedKvHandoffTransfer : IKvHandoffTransfer
         try
         {
             using var stream = new MemoryStream();
-            KvHandoffSerialization.Export(source, config.NumLayers, stream);
+            KvHandoffSerialization.Export(source, DotLLM.Core.Attention.KvGeometry.SlotCount(config), stream);
             stream.Position = 0;
-            KvHandoffSerialization.Import(stream, destination, config.NumLayers);
+            KvHandoffSerialization.Import(stream, destination, DotLLM.Core.Attention.KvGeometry.SlotCount(config));
         }
         catch
         {

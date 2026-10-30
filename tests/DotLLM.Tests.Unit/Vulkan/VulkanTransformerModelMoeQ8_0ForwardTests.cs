@@ -222,9 +222,9 @@ public sealed class VulkanTransformerModelMoeQ8_0ForwardTests : IDisposable
 
             // ── Router gate ([numExperts, hiddenSize]) ───────────────────────────
             // moe.Gate is a managed float[] — safe to mutate in place.
-            moe.GateQ8Ptr = QuantizeF32MatrixToQ8(moe.Gate, numE, hidden);
+            moe.GateQ8Ptr = QuantizeF32MatrixToQ8(moe.Gate.ToArray(), numE, hidden);
             moe.GateQuantTypeOverlay = QuantizationType.Q8_0;
-            DequantizeQ8RowsToF32Span(moe.GateQ8Ptr, numE, hidden, moe.Gate);
+            DequantizeQ8RowsToF32Span(moe.GateQ8Ptr, numE, hidden, System.Runtime.InteropServices.MemoryMarshal.CreateSpan(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(moe.Gate), moe.Gate.Length));
 
             if (!expectShared) continue;
             Assert.True(moe.HasSharedExpert, $"Layer {i}: expected shared experts but loader produced none.");

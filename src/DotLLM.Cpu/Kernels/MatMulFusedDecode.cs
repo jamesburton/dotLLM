@@ -26,7 +26,13 @@ public static unsafe partial class MatMul
     {
         QuantizationType.Q8_0 => QuantFamily.Q8_0Family,
         QuantizationType.Q5_0 => QuantFamily.Q8_1Family,
-        QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K => QuantFamily.KQuantFamily,
+        // Packed legacy quants — same Q8_1 activation block as Q5_0, so they share pre-quant (#489).
+        QuantizationType.Q4_0 or QuantizationType.Q4_1
+            or QuantizationType.Q5_1 or QuantizationType.IQ4_NL => QuantFamily.Q8_1Family,
+        QuantizationType.Q2_K or QuantizationType.Q3_K
+            or QuantizationType.Q4_K or QuantizationType.Q5_K
+            or QuantizationType.Q6_K or QuantizationType.IQ4_XS => QuantFamily.KQuantFamily,
+        _ when IsCodebookIq(qt) => QuantFamily.KQuantFamily,
         _ => QuantFamily.None,
     };
 
@@ -42,11 +48,30 @@ public static unsafe partial class MatMul
     {
         QuantizationType.Q8_0 => &ComputeRows,
         QuantizationType.Q5_0 => &ComputeRowsQ5_0,
+        QuantizationType.Q2_K => &ComputeRowsQ2_K,
+        QuantizationType.Q3_K => &ComputeRowsQ3_K,
+        QuantizationType.IQ4_XS => &ComputeRowsIQ4_XS,
         QuantizationType.Q4_K => &ComputeRowsQ4_K,
         QuantizationType.Q5_K => &ComputeRowsQ5_K,
         QuantizationType.Q6_K => &ComputeRowsQ6_K,
-        _ => null,
+        QuantizationType.Q4_0 => &ComputeRowsQ4_0,
+        QuantizationType.Q4_1 => &ComputeRowsQ4_1,
+        QuantizationType.Q5_1 => &ComputeRowsQ5_1,
+        QuantizationType.IQ4_NL => &ComputeRowsIQ4_NL,
+        _ => GetComputeRowsIq(qt),
     };
+
+    private static void ComputeRowsQ4_0(byte* w, byte* xQ8, float* result, int m, int blockCount)
+        => ComputeRowsLegacyQuant(QuantizationType.Q4_0, w, xQ8, result, m, blockCount);
+
+    private static void ComputeRowsQ4_1(byte* w, byte* xQ8, float* result, int m, int blockCount)
+        => ComputeRowsLegacyQuant(QuantizationType.Q4_1, w, xQ8, result, m, blockCount);
+
+    private static void ComputeRowsQ5_1(byte* w, byte* xQ8, float* result, int m, int blockCount)
+        => ComputeRowsLegacyQuant(QuantizationType.Q5_1, w, xQ8, result, m, blockCount);
+
+    private static void ComputeRowsIQ4_NL(byte* w, byte* xQ8, float* result, int m, int blockCount)
+        => ComputeRowsLegacyQuant(QuantizationType.IQ4_NL, w, xQ8, result, m, blockCount);
 
     /// <summary>
     /// Reports whether the fused decode path can compute a projection for <paramref name="qt"/>.
@@ -67,15 +92,47 @@ public static unsafe partial class MatMul
     public static bool SupportsFusedDecode(QuantizationType qt) =>
         qt is QuantizationType.F32 or QuantizationType.F16 || GetComputeRowsFn(qt) != null;
 
+    /// <summary>
+    /// Row-kernel descriptor for a quantised projection used by the MoE n=1 decode path: the <c>ComputeRows</c> function (the same one
+    /// <see cref="FusedDecodeGemv2"/> dispatches), the weight row stride and the block count for reduction width <paramref name="k"/>.
+    /// Returns false when <paramref name="qt"/> has no fused row kernel or <paramref name="k"/> is not a whole number of blocks.
+    /// <paramref name="family"/> is the activation-quantisation family (equal families share one pre-quantised input).
+    /// </summary>
+    internal static bool TryGetDecodeRowKernel(
+        QuantizationType qt, int k,
+        out delegate*<byte*, byte*, float*, int, int, void> computeRows, out long weightRowBytes, out int blockCount, out int family)
+    {
+        computeRows = null; weightRowBytes = 0; blockCount = 0; family = 0;
+        var fam = GetQuantFamily(qt);
+        if (fam == QuantFamily.None) return false;
+        var fn = GetComputeRowsFn(qt);
+        if (fn == null) return false;
+        int group = fam == QuantFamily.KQuantFamily ? KQuantGroupSize : Q8_0GroupSize;
+        if (k <= 0 || k % group != 0) return false;
+        computeRows = fn;
+        blockCount = k / group;
+        weightRowBytes = (long)blockCount * GetWeightBlockBytes(qt);
+        family = (int)fam;
+        return true;
+    }
+
     /// <summary>Returns per-row weight block bytes for the given quant type.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int GetWeightBlockBytes(QuantizationType qt) => qt switch
     {
         QuantizationType.Q8_0 => Q8_0BlockBytes,
         QuantizationType.Q5_0 => Q5_0BlockBytes,
+        QuantizationType.Q2_K => Q2_K_BlockBytes,
+        QuantizationType.Q3_K => Q3_K_BlockBytes,
+        QuantizationType.IQ4_XS => IQ4_XS_BlockBytes,
+        _ when IsCodebookIq(qt) => IqCodebookBlockBytes(qt),
         QuantizationType.Q4_K => Q4_K_BlockBytes,
         QuantizationType.Q5_K => Q5_K_BlockBytes,
         QuantizationType.Q6_K => Q6_K_BlockBytes,
+        QuantizationType.Q4_0 => Q4_0BlockBytes,
+        QuantizationType.Q4_1 => Q4_1BlockBytes,
+        QuantizationType.Q5_1 => Q5_1BlockBytes,
+        QuantizationType.IQ4_NL => IQ4_NLBlockBytes,
         _ => 0,
     };
 
@@ -125,6 +182,7 @@ public static unsafe partial class MatMul
         public byte* PreQuantInput;
         public int BlockCount;
         public int TotalRows;
+        public long Next;             // next unclaimed row (dynamic scheduling, #1159)
     }
 
     /// <summary>Fused context for 2 projections (Gate/Up) in one dispatch.</summary>
@@ -135,96 +193,55 @@ public static unsafe partial class MatMul
         public byte* PreQuantInput;
         public int BlockCount;
         public int TotalRows;
+        public long Next;             // next unclaimed row (dynamic scheduling, #1159)
     }
 
     // ──────────────────── Workers ────────────────────
 
+    /// <summary>
+    /// Rows per dynamic claim. A multiple of 8 so claims keep the 4- and 8-row kernel groupings of a projection that starts on a
+    /// claim boundary; rows are independent, so which thread computes a row never changes its value.
+    /// </summary>
+    private const int FusedClaimRows = 32;
+
+    // Dynamic claims instead of a static 1/threadCount slice (#1159): on a hybrid P/E-core CPU, or with another process on a
+    // core, the static slice made every decode dispatch wait for the slowest thread (the MoE decode path already claims).
     private static void FusedDecode3Worker(nint ctxPtr, int threadIdx, int threadCount)
     {
         ref var ctx = ref Unsafe.AsRef<FusedDecode3Ctx>((void*)ctxPtr);
-        PartitionRows(ctx.TotalRows, threadIdx, threadCount, out int start, out int count);
-        if (count == 0) return;
-
-        int end = start + count;
-        int offset = 0;
-
-        // Proj0
-        if (ctx.Proj0.M > 0)
+        while (true)
         {
-            int projStart = Math.Max(0, start - offset);
-            int projEnd = Math.Min(ctx.Proj0.M, end - offset);
-            if (projEnd > projStart)
-                ctx.Proj0.ComputeRows(
-                    ctx.Proj0.Weights + (long)projStart * ctx.Proj0.WeightRowBytes,
-                    ctx.PreQuantInput,
-                    ctx.Proj0.Result + projStart,
-                    projEnd - projStart, ctx.BlockCount);
-            offset += ctx.Proj0.M;
-        }
-
-        // Proj1
-        if (ctx.Proj1.M > 0)
-        {
-            int projStart = Math.Max(0, start - offset);
-            int projEnd = Math.Min(ctx.Proj1.M, end - offset);
-            if (projEnd > projStart)
-                ctx.Proj1.ComputeRows(
-                    ctx.Proj1.Weights + (long)projStart * ctx.Proj1.WeightRowBytes,
-                    ctx.PreQuantInput,
-                    ctx.Proj1.Result + projStart,
-                    projEnd - projStart, ctx.BlockCount);
-            offset += ctx.Proj1.M;
-        }
-
-        // Proj2
-        if (ctx.Proj2.M > 0)
-        {
-            int projStart = Math.Max(0, start - offset);
-            int projEnd = Math.Min(ctx.Proj2.M, end - offset);
-            if (projEnd > projStart)
-                ctx.Proj2.ComputeRows(
-                    ctx.Proj2.Weights + (long)projStart * ctx.Proj2.WeightRowBytes,
-                    ctx.PreQuantInput,
-                    ctx.Proj2.Result + projStart,
-                    projEnd - projStart, ctx.BlockCount);
+            long s = Interlocked.Add(ref ctx.Next, FusedClaimRows) - FusedClaimRows;
+            if (s >= ctx.TotalRows) break;
+            int start = (int)s, end = Math.Min(ctx.TotalRows, start + FusedClaimRows);
+            FusedRange(ref ctx.Proj0, 0, start, end, ctx.PreQuantInput, ctx.BlockCount);
+            FusedRange(ref ctx.Proj1, ctx.Proj0.M, start, end, ctx.PreQuantInput, ctx.BlockCount);
+            FusedRange(ref ctx.Proj2, ctx.Proj0.M + ctx.Proj1.M, start, end, ctx.PreQuantInput, ctx.BlockCount);
         }
     }
 
     private static void FusedDecode2Worker(nint ctxPtr, int threadIdx, int threadCount)
     {
         ref var ctx = ref Unsafe.AsRef<FusedDecode2Ctx>((void*)ctxPtr);
-        PartitionRows(ctx.TotalRows, threadIdx, threadCount, out int start, out int count);
-        if (count == 0) return;
-
-        int end = start + count;
-        int offset = 0;
-
-        // Proj0
-        if (ctx.Proj0.M > 0)
+        while (true)
         {
-            int projStart = Math.Max(0, start - offset);
-            int projEnd = Math.Min(ctx.Proj0.M, end - offset);
-            if (projEnd > projStart)
-                ctx.Proj0.ComputeRows(
-                    ctx.Proj0.Weights + (long)projStart * ctx.Proj0.WeightRowBytes,
-                    ctx.PreQuantInput,
-                    ctx.Proj0.Result + projStart,
-                    projEnd - projStart, ctx.BlockCount);
-            offset += ctx.Proj0.M;
+            long s = Interlocked.Add(ref ctx.Next, FusedClaimRows) - FusedClaimRows;
+            if (s >= ctx.TotalRows) break;
+            int start = (int)s, end = Math.Min(ctx.TotalRows, start + FusedClaimRows);
+            FusedRange(ref ctx.Proj0, 0, start, end, ctx.PreQuantInput, ctx.BlockCount);
+            FusedRange(ref ctx.Proj1, ctx.Proj0.M, start, end, ctx.PreQuantInput, ctx.BlockCount);
         }
+    }
 
-        // Proj1
-        if (ctx.Proj1.M > 0)
-        {
-            int projStart = Math.Max(0, start - offset);
-            int projEnd = Math.Min(ctx.Proj1.M, end - offset);
-            if (projEnd > projStart)
-                ctx.Proj1.ComputeRows(
-                    ctx.Proj1.Weights + (long)projStart * ctx.Proj1.WeightRowBytes,
-                    ctx.PreQuantInput,
-                    ctx.Proj1.Result + projStart,
-                    projEnd - projStart, ctx.BlockCount);
-        }
+    /// <summary>Computes the part of the fused row range <c>[start, end)</c> that falls in <paramref name="p"/> (rows <c>offset..offset+M</c>).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void FusedRange(ref FusedProjection p, int offset, int start, int end, byte* xQ, int blockCount)
+    {
+        if (p.M <= 0) return;
+        int projStart = Math.Max(0, start - offset);
+        int projEnd = Math.Min(p.M, end - offset);
+        if (projEnd > projStart)
+            p.ComputeRows(p.Weights + (long)projStart * p.WeightRowBytes, xQ, p.Result + projStart, projEnd - projStart, blockCount);
     }
 
     // ──────────────────── Build FusedProjection helper ────────────────────
@@ -439,12 +456,29 @@ public static unsafe partial class MatMul
             {
                 case QuantizationType.Q8_0: GemvQ8_0(weights, input, result, m, k, pool); break;
                 case QuantizationType.Q5_0: GemvQ5_0(weights, input, result, m, k, pool); break;
+                case QuantizationType.Q2_K: GemvQ2_K(weights, input, result, m, k, pool); break;
+                case QuantizationType.Q3_K: GemvQ3_K(weights, input, result, m, k, pool); break;
+                case QuantizationType.IQ4_XS: GemvIQ4_XS(weights, input, result, m, k, pool); break;
+                case QuantizationType.IQ2_XXS:
+                case QuantizationType.IQ2_XS:
+                case QuantizationType.IQ2_S:
+                case QuantizationType.IQ3_XXS:
+                case QuantizationType.IQ3_S:
+                case QuantizationType.IQ1_M:
+                case QuantizationType.IQ1_S:
+                    GemvIQCodebook(qt, weights, input, result, m, k, pool); break;
                 case QuantizationType.Q4_K: GemvQ4_K(weights, input, result, m, k, pool); break;
                 case QuantizationType.Q5_K: GemvQ5_K(weights, input, result, m, k, pool); break;
                 case QuantizationType.Q6_K: GemvQ6_K(weights, input, result, m, k, pool); break;
                 case QuantizationType.I2_S: GemvI2_S(weights, input, result, m, k, pool); break;
                 case QuantizationType.PQ2_0: GemvPQ2_0(weights, input, result, m, k, pool); break;
+                case QuantizationType.PTQ1_0: GemvPTQ1_0(weights, input, result, m, k, pool); break;
                 case QuantizationType.MXFP4: GemvMxfp4(weights, input, result, m, k, pool); break;
+                case QuantizationType.Q4_0:
+                case QuantizationType.Q4_1:
+                case QuantizationType.Q5_1:
+                case QuantizationType.IQ4_NL:
+                    GemvLegacyQuant(weights, qt, input, result, m, k, pool); break;
                 default:
                     // No dedicated GEMV for this format. Rather than fail the whole decode step,
                     // dequantize row-by-row and dot — the same last-resort path the MoE MLP uses.

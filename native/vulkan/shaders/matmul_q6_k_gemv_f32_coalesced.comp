@@ -1,0 +1,121 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Q6_K decode GEMV with an FP32 activation, COALESCED lane=K-position layout (issue #576).
+//
+//   y[m] = sum_k W_q6k[m,k] * x[k]
+//
+// Same contract and bindings as matmul_q6_k_gemv_f32.comp (see it for the layout derivation), with
+// the memory layout of matmul_q8_0_coalesced.comp (#471). Super-block = 210 bytes = 105 uint16:
+//   [0..127] ql[128]   [128..191] qh[64]   [192..207] scales[16] (int8)   [208..209] fp16 d
+// 210 is 2 (mod 4), so blocks alternate word alignment and every field is read as uint16.
+//
+// Work split: a super-block is two 128-element halves; in half hf, for l = 0..31, four outputs
+//   out[l] out[l+32] out[l+64] out[l+96]
+// come from ql[l], ql[l+32], qh[l] (each group takes a different nibble / 2-bit field). A lane owns
+// four consecutive l (l0 = 4j, j = 0..7), producing 16 outputs, so consecutive lanes read consecutive
+// bytes of ql / qh and consecutive vec4 of x. 16 lanes cover a super-block; a 64-lane workgroup covers
+// four per window step.
+//
+// Dispatch: one workgroup of 64 threads per output row; subgroupAdd then a shared-memory pass.
+
+#define WG_SIZE 64u
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint weight[]; };  // Q6_K blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { vec4 x4[]; };      // [K/4]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };      // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint blocksPerRow;   // = K / 256 (super-blocks)
+    uint rowUints;       // unused; kept for parity with matmul_q6_k_gemv_f32
+} pc;
+
+const uint UINT16_PER_BLOCK = 105u;
+const uint WINDOW_BLOCKS    = WG_SIZE / 16u;
+
+uint readU16(uint idx16) {
+    uint w = weight[idx16 >> 1u];
+    return ((idx16 & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
+}
+
+// 4 bytes starting at even byte offset (2*idx16), as a little-endian uint.
+uint read4(uint idx16) {
+    return readU16(idx16) | (readU16(idx16 + 1u) << 16u);
+}
+
+int sbyte(uint u16, uint hi) {
+    uint b = hi != 0u ? (u16 >> 8u) & 0xFFu : u16 & 0xFFu;
+    return int(b ^ 0x80u) - 128;
+}
+
+shared float partials[WG_SIZE];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint lane = gl_LocalInvocationID.x;
+    uint blockInWindow = lane >> 4u;
+    uint t  = lane & 15u;
+    uint hf = t >> 3u;            // 128-element half
+    uint j  = t & 7u;             // which 4 consecutive l
+    uint l0 = 4u * j;
+    uint isc = j >> 2u;           // l / 16
+
+    uint rowBase16 = m * pc.blocksPerRow * UINT16_PER_BLOCK;
+
+    float acc = 0.0;
+    for (uint w0 = 0u; w0 < pc.blocksPerRow; w0 += WINDOW_BLOCKS) {
+        uint blk = w0 + blockInWindow;
+        if (blk >= pc.blocksPerRow)
+            continue;
+
+        uint b16 = rowBase16 + blk * UINT16_PER_BLOCK;
+        float d = unpackHalf2x16(readU16(b16 + 104u)).x;
+
+        uint qlA = read4(b16 + (64u * hf + l0) / 2u);          // ql[64hf + l0 .. +3]
+        uint qlB = read4(b16 + (64u * hf + 32u + l0) / 2u);    // ql[64hf + 32 + l0 .. +3]
+        uint qh  = read4(b16 + 64u + (32u * hf + l0) / 2u);    // qh[32hf + l0 .. +3]
+
+        // scales[8hf + isc + 2g] for g = 0..3 -> byte offsets 192 + 8hf + isc + 2g
+        float s0 = float(sbyte(readU16(b16 + 96u + 4u * hf + (isc + 0u) / 2u), (isc + 0u) & 1u));
+        float s1 = float(sbyte(readU16(b16 + 96u + 4u * hf + (isc + 2u) / 2u), (isc + 2u) & 1u));
+        float s2 = float(sbyte(readU16(b16 + 96u + 4u * hf + (isc + 4u) / 2u), (isc + 4u) & 1u));
+        float s3 = float(sbyte(readU16(b16 + 96u + 4u * hf + (isc + 6u) / 2u), (isc + 6u) & 1u));
+
+        uvec4 lA = uvec4(qlA & 0xFFu, (qlA >> 8) & 0xFFu, (qlA >> 16) & 0xFFu, (qlA >> 24) & 0xFFu);
+        uvec4 lB = uvec4(qlB & 0xFFu, (qlB >> 8) & 0xFFu, (qlB >> 16) & 0xFFu, (qlB >> 24) & 0xFFu);
+        uvec4 hB = uvec4(qh & 0xFFu, (qh >> 8) & 0xFFu, (qh >> 16) & 0xFFu, (qh >> 24) & 0xFFu);
+
+        vec4 q0 = vec4((lA & 0xFu)        | (((hB >> 0u) & 3u) << 4u)) - vec4(32.0);
+        vec4 q1 = vec4((lB & 0xFu)        | (((hB >> 2u) & 3u) << 4u)) - vec4(32.0);
+        vec4 q2 = vec4((lA >> 4u)         | (((hB >> 4u) & 3u) << 4u)) - vec4(32.0);
+        vec4 q3 = vec4((lB >> 4u)         | (((hB >> 6u) & 3u) << 4u)) - vec4(32.0);
+
+        uint xi = blk * 64u + hf * 32u + j;                    // vec4 index of x[256blk + 128hf + l0]
+        acc += d * (s0 * dot(q0, x4[xi])
+                  + s1 * dot(q1, x4[xi + 8u])
+                  + s2 * dot(q2, x4[xi + 16u])
+                  + s3 * dot(q3, x4[xi + 24u]));
+    }
+
+    float sum = subgroupAdd(acc);
+    if (gl_NumSubgroups == 1u) {
+        if (subgroupElect())
+            y[m] = sum;
+        return;
+    }
+    if (subgroupElect())
+        partials[gl_SubgroupID] = sum;
+    barrier();
+    if (lane == 0u) {
+        float total = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; i++)
+            total += partials[i];
+        y[m] = total;
+    }
+}

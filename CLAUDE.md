@@ -77,6 +77,45 @@ dotLLM/
 - `IAsyncEnumerable<T>` for streaming token generation.
 - Composability over inheritance. Interfaces and records, not deep class hierarchies.
 
+## JSON DTO Rules (System.Text.Json source generation)
+
+- **Never express a default with a property initializer on an `init`-only property of a DTO that is
+  deserialized through a source-generated context.** The initializer is silently dropped:
+
+  ```csharp
+  public sealed record Req {
+      public bool Stream { get; init; } = true;   // arrives as FALSE
+      public string Name { get; init; } = "";     // arrives as NULL
+  }
+  ```
+
+  No warning, no error. Direct construction (`new Req { ... }`) still honours it, so a test that
+  does not round-trip through JSON cannot see the bug.
+
+- **The trigger is the `init` accessor, not `required` and not `record`** — measured, not assumed
+  (`TrayJsonContextDefaultsTests`, .NET 10):
+
+  | shape | source-generated | reflection-based |
+  |---|---|---|
+  | `{ get; init; } = x` on a `record` | **dropped** | honoured |
+  | `{ get; init; } = x` on a `class` | **dropped** | honoured |
+  | `{ get; set; } = x` | honoured | honoured |
+  | `+ a required member` | **dropped** (no different) | honoured |
+
+  The first three hits (`ModelPullRequest.Stream`, `TraySettings`, `ChatCompletionRequest.N`) all
+  happened to sit on types that *also* had `required` members, which made `required` look causal.
+  It is a correlate. Any `init` property with an initializer is affected, which is a far larger
+  surface than the original rule described — and it is the house style, so it recurs.
+
+- **The fix**: make the property nullable and resolve the default in code
+  (`public int? N { get; init; }` + `public int ChoiceCount => N ?? 1;`). Switching to `set` also
+  restores the initializer, but trades away immutability for a behaviour that depends on a
+  serializer implementation detail — prefer nullable.
+- `JsonContextDefaultsTests` guards `ServerJsonContext` and `TrayJsonContextDefaultsTests` guards
+  the tray's two contexts. **If you add a JSON context, add the equivalent guard**: construct the
+  type directly, deserialize `{}`, and compare — initializers are invisible to reflection, so
+  direct construction is the only available oracle.
+
 ## Memory Management Rules
 
 - **NEVER** allocate managed arrays for tensor data. Use `NativeMemory.AlignedAlloc` (64-byte for AVX-512, 32-byte for AVX2).
@@ -86,17 +125,79 @@ dotLLM/
 - Tensor metadata (shape, stride, pointer): structs, not classes.
 - GC: Server GC, `SustainedLowLatency` mode during inference.
 
+## Precision & Expansion Rules (user decisions, 2026-10-22, #1107)
+
+These are hard rules. Breaking either one needs **strong measured evidence and the user's explicit sign-off**, recorded in
+the issue/PR. Reference/baseline comparisons (tests, oracles, A/B measurements) are the only standing exception.
+
+### 1. No FP32 tensor storage on hot paths
+
+- FP32 gives no meaningful accuracy gain over FP16/BF16 almost anywhere in LLM inference. It doubles memory and bandwidth,
+  and is slower on everything except legacy FP32-only hardware.
+- **FP16/BF16 is the widest default** for anything stored or streamed: KV caches, activations, staging and scratch buffers,
+  embedding/LM-head tables, recurrent/MTP state buffers, and inter-kernel tensors.
+- **Always evaluate formats below FP16 too** (q8_0, q4_0, FP8/MXFP4 where the hardware supports them). Pick on measured
+  memory *and* speed, and state per-token or per-tensor byte costs in the PR.
+- *Accumulation* (in registers; no storage, no extra pass):
+  - **Default F32** for norms (sum of squares), softmax and attention sums, long-KV attention, recurrent-state updates, and
+    the combine step of split reductions. FP16's 65,504 ceiling and swamping make overflow or bias structural there.
+  - **In compute-bound kernels** (tensor-core or packed-half GEMM), prefer F16 accumulation wherever it measures faster and
+    passes KL/PPL parity against an F32-accumulate reference. For long K, accumulate in F16 over chunks and promote to F32
+    every 64–256 terms.
+  - Integer dot products (dp4a, VNNI, int8 MMA) accumulate in int32 by construction.
+  - Stored F32 partials (split-K, split-KV) are storage and need this rule's sign-off.
+  - Evidence and per-device choices live in `docs/PRECISION.md`.
+- Model-declared FP32 state (e.g. an HF `mamba_ssm_dtype: float32`) is evidence to cite in the PR, not an automatic
+  exemption.
+- Existing FP32 stores on hot paths are tracked for removal in #1107 (e.g. Vulkan hybrid KV, CUDA MTP head KV, F32 staging,
+  F32-widened embedding tables, CPU `SimpleKvCache`). Don't add new ones.
+
+### 2. Quantized weights (and KV) run quantized — no expansion
+
+- A quantized model's kernels must **read the quantized blocks directly** (dequantize in registers or shared memory inside
+  the tile load), never expand weights or KV history into a wider stored copy: F16/F32 scratch, staged copies, or upload-time
+  transcodes to a wider type.
+- Expansion blows up VRAM/RAM and blocks models or contexts that should fit. Treat it as a **defect to remove, not a cost to
+  budget around**.
+- Where no in-place kernel exists yet for a quant type or shape, that is a gap to fill. Until it is filled, any expansion
+  fallback must be bounded, admitted against free device memory (never spill), logged, and listed with its byte cost in the
+  PR.
+- Known expansions being removed: the full-history KV dequant scratch (fixed for Bonsai-2 prefill in #1094), the LM head
+  over more than 8 rows (#1099), and the per-projection F16 weight dequant on prefill GEMMs (#495, audit in #1107).
+
+### 3. Disk ↔ device transfers go direct
+
+- Moving data between disk and a GPU must go **direct**, never via a system-RAM copy. That covers model weight loading,
+  prefix-snapshot disk spill and restore, and any other large disk ↔ device transfer.
+- The direct routes:
+  - **Discrete GPUs:**
+    - Windows: DirectStorage into a D3D12 resource imported into CUDA or Vulkan via external memory.
+    - Linux: cuFile/GPUDirect Storage.
+  - **UMA devices (Strix, Arc):** import the mmap'd or host pages zero-copy.
+- A host bounce buffer (a pinned staging ring, or read-then-copy) is a **double allocation and an extra copy**. It
+  needs measured justification and the user's sign-off, recorded in the issue or PR. Where a direct route doesn't exist
+  yet for a platform or device, treat it as a gap to fill, and state the bounce path's cost (bytes, time) in the PR.
+
 ## Model & Fixture Storage Rules
 
-**Model weights NEVER live in the repository, and are never committed.** They belong in the
-shared on-disk cache:
+**Model weights NEVER live in the repository, and are never committed.** There is **one model
+store** (#1279) — every model, whether pulled by the CLI or by a test, has one physical copy:
 
 | location | holds |
 |---|---|
-| `~/.dotllm/models/` | models fetched for normal use (`dotllm model pull`) |
-| `~/.dotllm/test-cache/{org}/{repo}/` | fixtures the test suite resolves, incl. `DOTLLM_*_GGUF` overrides |
+| `~/.dotllm/models/{org}/{repo}/` | **the** dotLLM model store: `dotllm model pull` *and* test downloads (`TestModelDownloader`; `$DOTLLM_TEST_CACHE_DIR` is only an override, e.g. for CI) |
+| HF hub cache (`$HF_HUB_CACHE` / `$HF_HOME/hub` / `~/.cache/huggingface/hub`) | models fetched by `hf` / `huggingface_hub`; read in place, never re-downloaded |
 | `~/.dotllm/quant-ladder/` | generated per-quantization coverage fixtures |
+| `~/.dotllm/test-cache/` | **generated, non-model** test artefacts only: `corpora/`, `token-oracles/`, `mimo2-tiny*/`, `nanoquant-oracle/`, `littlebit-*/`. Model files here are legacy — still read, never written |
 
+- **Tests resolve models through `TestFixtureResolver`** (env override → `~/.dotllm/models` →
+  legacy `test-cache` → HF cache), never by a hardcoded store path. A hit outside
+  `~/.dotllm/models` is hardlinked in when on the same volume, else used in place — never copied.
+  Tests must not depend on following HF snapshot symlinks (Windows refuses some with
+  `ERROR_UNTRUSTED_MOUNT_POINT`).
+- `scripts/dedupe-models.ps1` (dry run by default, `-Apply` to act) finds duplicates across the
+  stores by SHA-256, replaces them with hardlinks, and moves legacy `test-cache` models into
+  `~/.dotllm/models`.
 - **If a path inside the tree needs a model, symlink to the cache — never copy it in.**
 - Reference fixtures from tests via the existing `DOTLLM_*_GGUF` environment overrides
   (see `docs/QUANT_FIXTURES.md`), not by relative path into the working tree.
@@ -176,11 +277,17 @@ shared on-disk cache:
 | Diagnostics & interpretability | [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md) | Hooks, logit lens, SAE |
 | Telemetry & observability | [docs/TELEMETRY.md](docs/TELEMETRY.md) | Metrics, request tracing |
 | Server & API | [docs/SERVER.md](docs/SERVER.md) | Endpoints, rate limiting, warm-up |
+| Anthropic Messages API | [docs/ANTHROPIC_API.md](docs/ANTHROPIC_API.md) | `/v1/messages`, content blocks, streaming events, mapping |
+| Windows system tray | [docs/TRAY.md](docs/TRAY.md) | Tray app, server lifecycle/ownership, autostart, packaging, updates |
+| Releases, dev channel, NuGet/dnx | [docs/PACKAGING.md](docs/PACKAGING.md) | Release workflow, versioning, checksums/attestation, package ids |
 | Warm-up | [docs/WARMUP.md](docs/WARMUP.md) | Startup warm-up, JIT compilation, CUDA warm-up |
 | GPU inference | [docs/GPU.md](docs/GPU.md) | GPU forward pass, weight loading, KV-cache, CLI |
 | CUDA backend | [docs/CUDA.md](docs/CUDA.md) | PTX architecture, P/Invoke, kernel conventions, build |
 | Multi-GPU | [docs/MULTI_GPU.md](docs/MULTI_GPU.md) | Tensor/pipeline parallelism, NCCL |
 | Native AOT deployment | [docs/AOT.md](docs/AOT.md) | AOT publishing, trimming, deployment |
+| Perplexity & llama.cpp comparison | [docs/PERPLEXITY.md](docs/PERPLEXITY.md) | Quality measurement, corpus fixtures, CRLF trap (#506) |
+| Precision | [docs/PRECISION.md](docs/PRECISION.md) | Storage/accumulator formats per op and device, KV formats, Keep-FP32 list, #1107 evidence and violation inventory |
+| Embeddings (RAG) survey | [docs/EMBEDDINGS.md](docs/EMBEDDINGS.md) | Embedding models, `dotllm embed`, `/v1/embeddings`, encoder perf, quality gate |
 | Implementation roadmap | [docs/ROADMAP.md](docs/ROADMAP.md) | Planning, task sequencing |
 
 ## Development Workflow

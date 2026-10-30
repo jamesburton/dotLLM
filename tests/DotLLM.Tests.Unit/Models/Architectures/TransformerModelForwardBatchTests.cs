@@ -10,6 +10,7 @@ using DotLLM.Models.Gguf;
 using DotLLM.Models.SafeTensors;
 using DotLLM.Tests.Unit.Models.SafeTensors;
 using Xunit;
+using DotLLM.Tests.Integration.Fixtures;
 
 namespace DotLLM.Tests.Unit.Models.Architectures;
 
@@ -31,7 +32,7 @@ namespace DotLLM.Tests.Unit.Models.Architectures;
 /// rather than an abs/rel envelope.</para>
 ///
 /// <para>Some tests use the cached SmolLM-135M Q8_0 GGUF
-/// (<c>~/.dotllm/test-cache/QuantFactory/SmolLM-135M-GGUF/SmolLM-135M.Q8_0.gguf</c>)
+/// (<c>~/.dotllm/models/QuantFactory/SmolLM-135M-GGUF/SmolLM-135M.Q8_0.gguf</c>)
 /// and are skipped when it isn't present. Phase 5b adds F32 synthetic-fixture
 /// tests that run in every CI configuration.</para>
 /// </remarks>
@@ -50,8 +51,7 @@ public sealed class TransformerModelForwardBatchTests : IDisposable
         try { Directory.Delete(_scratch, recursive: true); } catch { /* best-effort */ }
     }
     private static readonly string CachedSmolLmPath =
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "test-cache", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q8_0.gguf");
+        TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q8_0.gguf"], null).Path ?? string.Empty;
 
     [SkippableFact]
     public void ForwardBatch_SingleSequence_EqualsForwardLoop()
@@ -596,6 +596,160 @@ public sealed class TransformerModelForwardBatchTests : IDisposable
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Last-token-only logits (#1267)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// One sequence of a last-token-only parity case: <paramref name="Prefix"/> is forwarded
+    /// first (outside the batch) so a 1-token <paramref name="Tokens"/> is a genuine decode step.
+    /// </summary>
+    /// <param name="Prefix">Tokens already in the KV cache before the batched step.</param>
+    /// <param name="Tokens">Tokens of the batched step.</param>
+    /// <param name="LastOnly">Value of <see cref="SequenceForwardRequest.LastTokenLogitsOnly"/>.</param>
+    /// <param name="Adapter">Optional LoRA adapter (routes the sequence to the per-seq fallback).</param>
+    private sealed record LastRowCase(int[] Prefix, int[] Tokens, bool LastOnly,
+                                      DotLLM.Core.Lora.ILoraAdapter? Adapter = null);
+
+    /// <summary>
+    /// GQA group 2 (4 Q heads over 2 KV heads), every request last-token-only, prefill and decode
+    /// mixed in one batch: each result is <c>[1, vocab]</c> and bit-equal to
+    /// <c>Forward(..., lastTokenLogitsOnly: true)</c>. Also covers the single-request path.
+    /// </summary>
+    /// <param name="single">True to run a one-request batch (the non-packed early-return path).</param>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ForwardBatch_LastTokenOnly_MixedPrefillDecode_Gqa_MatchesForwardLastOnly(bool single)
+    {
+        LastRowCase[] cases = single
+            ? [new([], [1, 2, 3, 4, 5], true)]
+            :
+            [
+                new([], [1, 2, 3, 4, 5], true),   // prefill
+                new([6, 7, 0], [3], true),        // decode
+                new([], [7, 0, 3], true),         // prefill
+                new([2, 4], [1], true),           // decode
+            ];
+        AssertLastRowParity(cases, seed: 1267);
+    }
+
+    /// <summary>
+    /// All-rows and last-token-only requests mixed in one all-simple batch: the in-place
+    /// compaction of kept rows must leave each sequence's rows where its logits split expects them.
+    /// </summary>
+    [Fact]
+    public void ForwardBatch_LastTokenOnly_MixedModes_SimpleBatch_MatchesForward()
+    {
+        AssertLastRowParity(
+        [
+            new([], [1, 2, 3, 4], false),
+            new([], [5, 6, 7, 0, 1], true),
+            new([3, 2], [6], true),
+            new([], [7, 0, 3], false),
+        ], seed: 1268);
+    }
+
+    /// <summary>
+    /// Mixed modes with adapter-carrying (per-seq fallback) sequences in both modes: exercises the
+    /// staged gather path, where kept rows are copied out before the next per-seq core call.
+    /// </summary>
+    [Fact]
+    public void ForwardBatch_LastTokenOnly_MixedModes_WithComplexFallback_MatchesForward()
+    {
+        using var adapter = BuildZeroAdapter(BuildGqaConfig(numHeads: 4));
+        AssertLastRowParity(
+        [
+            new([], [1, 2, 3, 4], true),
+            new([], [5, 6, 7], false, adapter),
+            new([], [7, 0, 3, 2, 1], true, adapter),
+            new([4], [2], true),
+            new([], [6, 5], false),
+        ], seed: 1269);
+    }
+
+    private void AssertLastRowParity(LastRowCase[] cases, int seed)
+    {
+        var cfg = BuildGqaConfig(numHeads: 4);
+        string path = Path.Combine(_scratch, $"lastonly-{seed}.safetensors");
+        WriteGqaFixture(path, seed, numHeads: 4);
+
+        float[][] expected = RunLastRowCases(path, cfg, cases, batched: false);
+        float[][] actual = RunLastRowCases(path, cfg, cases, batched: true);
+        for (int i = 0; i < cases.Length; i++)
+        {
+            int rows = cases[i].LastOnly ? 1 : cases[i].Tokens.Length;
+            Assert.Equal(rows * cfg.VocabSize, actual[i].Length);
+            AssertBitEqual(expected[i], actual[i], $"[#1267 seq{i}] lastOnly={cases[i].LastOnly} rows={rows}");
+        }
+    }
+
+    private static float[][] RunLastRowCases(string path, ModelConfig cfg, LastRowCase[] cases, bool batched)
+    {
+        using var sf = SafetensorsFile.Open(path);
+        using var model = TransformerModel.LoadFromSafetensors(sf, cfg);
+        var caches = new SimpleKvCache[cases.Length];
+        try
+        {
+            var requests = new SequenceForwardRequest[cases.Length];
+            for (int i = 0; i < cases.Length; i++)
+            {
+                var c = cases[i];
+                caches[i] = new SimpleKvCache(cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, cfg.MaxSequenceLength);
+                if (c.Prefix.Length > 0)
+                    model.Forward(c.Prefix, Enumerable.Range(0, c.Prefix.Length).ToArray(), deviceId: -1, caches[i], c.Adapter).Dispose();
+                requests[i] = new SequenceForwardRequest
+                {
+                    TokenIds = c.Tokens,
+                    Positions = Enumerable.Range(c.Prefix.Length, c.Tokens.Length).ToArray(),
+                    KvCache = caches[i],
+                    Adapter = c.Adapter,
+                    LastTokenLogitsOnly = c.LastOnly,
+                };
+            }
+
+            var outs = new float[cases.Length][];
+            if (batched)
+            {
+                var results = model.ForwardBatch(requests, deviceId: -1);
+                try
+                {
+                    for (int i = 0; i < cases.Length; i++) outs[i] = CopyLogits(results[i]);
+                }
+                finally
+                {
+                    foreach (var t in results) t.Dispose();
+                }
+
+                return outs;
+            }
+
+            for (int i = 0; i < cases.Length; i++)
+            {
+                var r = requests[i];
+                if (r.Adapter is null)
+                {
+                    using ITensor t = model.Forward(r.TokenIds.Span, r.Positions.Span, deviceId: -1, r.KvCache,
+                        lastTokenLogitsOnly: r.LastTokenLogitsOnly);
+                    outs[i] = CopyLogits(t);
+                }
+                else
+                {
+                    // The public adapter overload has no hint: the reference is the last row of all rows.
+                    using ITensor t = model.Forward(r.TokenIds.Span, r.Positions.Span, deviceId: -1, r.KvCache, r.Adapter);
+                    float[] all = CopyLogits(t);
+                    outs[i] = r.LastTokenLogitsOnly ? all[^cfg.VocabSize..] : all;
+                }
+            }
+
+            return outs;
+        }
+        finally
+        {
+            foreach (var kv in caches) kv?.Dispose();
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Synthetic F32 GQA fixture (used by Phase 5b F32 / fallback tests)
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -603,35 +757,36 @@ public sealed class TransformerModelForwardBatchTests : IDisposable
     private const int FxNumLayers = 2;
     private const int FxNumHeads = 2;
     private const int FxNumKvHeads = 2;
-    private const int FxHeadDim = FxHiddenSize / FxNumHeads; // 8
     private const int FxVocabSize = 8;
     private const int FxIntermediateSize = 24;
     private const int FxMaxSeqLen = 32;
 
-    private static ModelConfig BuildGqaConfig() => new ModelConfig
+    // numHeads > FxNumKvHeads gives a GQA group > 1 (head dim shrinks to keep hidden fixed).
+    private static ModelConfig BuildGqaConfig(int numHeads = FxNumHeads) => new ModelConfig
     {
         Architecture = Architecture.Llama,
         VocabSize = FxVocabSize,
         HiddenSize = FxHiddenSize,
         IntermediateSize = FxIntermediateSize,
         NumLayers = FxNumLayers,
-        NumAttentionHeads = FxNumHeads,
+        NumAttentionHeads = numHeads,
         NumKvHeads = FxNumKvHeads,
-        HeadDim = FxHeadDim,
+        HeadDim = FxHiddenSize / numHeads,
         MaxSequenceLength = FxMaxSeqLen,
         NormEpsilon = 1e-5f,
-        RoPEConfig = new RoPEConfig(Theta: 10000f, DimensionCount: FxHeadDim, Type: RoPEType.Norm),
+        RoPEConfig = new RoPEConfig(Theta: 10000f, DimensionCount: FxHiddenSize / numHeads, Type: RoPEType.Norm),
     };
 
-    private static void WriteGqaFixture(string path, int seed)
+    private static void WriteGqaFixture(string path, int seed, int numHeads = FxNumHeads)
     {
         var b = new SafetensorsFixtureBuilder();
         AddDeterministic(b, "model.embed_tokens.weight", [FxVocabSize, FxHiddenSize], amplitude: 0.05f, seed: seed + 0);
         AddDeterministic(b, "model.norm.weight", [FxHiddenSize], amplitude: 0.05f, seed: seed + 1, center: 1.0f, jitter: 0.05f);
         AddDeterministic(b, "lm_head.weight", [FxVocabSize, FxHiddenSize], amplitude: 0.05f, seed: seed + 2);
 
-        int qOut = FxNumHeads * FxHeadDim;
-        int kvOut = FxNumKvHeads * FxHeadDim;
+        int headDim = FxHiddenSize / numHeads;
+        int qOut = numHeads * headDim;
+        int kvOut = FxNumKvHeads * headDim;
         for (int i = 0; i < FxNumLayers; i++)
         {
             int s = seed + 10 * (i + 1);
@@ -794,8 +949,7 @@ public sealed class TransformerModelForwardBatchTests : IDisposable
     // ─────────────────────────────────────────────────────────────────────────
 
     private static readonly string CachedDeepSeekV2LitePath =
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "test-cache", "mradermacher", "DeepSeek-V2-Lite-GGUF", "DeepSeek-V2-Lite.Q4_K_M.gguf");
+        TestFixtureResolver.ResolveFile([], "mradermacher", "DeepSeek-V2-Lite-GGUF", ["DeepSeek-V2-Lite.Q4_K_M.gguf"], null).Path ?? string.Empty;
 
     /// <summary>
     /// Two sequences with DIFFERENT non-zero LoRA adapters going through the
@@ -1209,6 +1363,180 @@ public sealed class TransformerModelForwardBatchTests : IDisposable
         {
             adapter.Dispose();
             throw;
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // #1264 — per-sequence-only features must keep ForwardBatch on the per-seq core
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private const int G4Hidden = 32;
+    private const int G4Heads = 4;
+    private const int G4KvHeads = 2;   // GQA group 2: a broadcast mix-up is visible
+    private const int G4HeadDim = 8;
+    private const int G4ValueHeadDim = 4;
+    private const int G4Vocab = 16;
+    private const int G4Inter = 48;
+    private const int G4Layers = 2;
+    private const int G4MaxSeq = 32;
+
+    /// <summary>Feature enabled on the #1264 fixture; each is implemented only by the per-sequence forward.</summary>
+    public enum PerSeqOnlyFeature
+    {
+        /// <summary>No extra feature: the packed loop runs and must already be batch-exact.</summary>
+        Baseline,
+
+        /// <summary>BitNet squared-ReLU gate activation.</summary>
+        Relu2,
+
+        /// <summary>BitNet FFN Sub-LN before down_proj.</summary>
+        FfnSubNorm,
+
+        /// <summary>BitNet attention Sub-LN before o_proj.</summary>
+        AttnSubNorm,
+
+        /// <summary>MiMo-V2 attention_value_scale.</summary>
+        ValueScale,
+
+        /// <summary>MiMo-V2 V head dim smaller than the K head dim.</summary>
+        DistinctValueHeadDim,
+
+        /// <summary>gpt-oss per-head attention sinks.</summary>
+        AttnSinks,
+    }
+
+    /// <summary>
+    /// Each variant enables one feature the per-sequence forward implements but the packed
+    /// matmul-fused loop does not. ForwardBatch must route such a model to the per-seq core,
+    /// so its logits equal per-sequence Forward bit-for-bit. Before #1264 the packed loop ran
+    /// and silently dropped the feature. <see cref="PerSeqOnlyFeature.Baseline"/> proves the fixture itself is batch-exact.
+    /// </summary>
+    /// <param name="variant">The feature to enable on the synthetic F32 GQA fixture.</param>
+    [Theory]
+    [InlineData(PerSeqOnlyFeature.Baseline)]
+    [InlineData(PerSeqOnlyFeature.Relu2)]
+    [InlineData(PerSeqOnlyFeature.FfnSubNorm)]
+    [InlineData(PerSeqOnlyFeature.AttnSubNorm)]
+    [InlineData(PerSeqOnlyFeature.ValueScale)]
+    [InlineData(PerSeqOnlyFeature.DistinctValueHeadDim)]
+    [InlineData(PerSeqOnlyFeature.AttnSinks)]
+    public unsafe void ForwardBatch_PerSeqOnlyFeature_MatchesPerSeqForward(PerSeqOnlyFeature variant)
+    {
+        var allocs = new List<nint>();
+        try
+        {
+            var rng = new Random(1264);
+            nint Alloc(int count, float amplitude)
+            {
+                nint p = (nint)System.Runtime.InteropServices.NativeMemory.AlignedAlloc((nuint)(count * sizeof(float)), 64);
+                allocs.Add(p);
+                for (int i = 0; i < count; i++) ((float*)p)[i] = ((float)rng.NextDouble() * 2f - 1f) * amplitude;
+                return p;
+            }
+            float[] Vec(int count, float center, float jitter)
+            {
+                var a = new float[count];
+                for (int i = 0; i < count; i++) a[i] = center + ((float)rng.NextDouble() * 2f - 1f) * jitter;
+                return a;
+            }
+
+            int vHeadDim = variant == PerSeqOnlyFeature.DistinctValueHeadDim ? G4ValueHeadDim : G4HeadDim;
+            var cfg = new ModelConfig
+            {
+                Architecture = Architecture.Llama,
+                VocabSize = G4Vocab,
+                HiddenSize = G4Hidden,
+                IntermediateSize = G4Inter,
+                NumLayers = G4Layers,
+                NumAttentionHeads = G4Heads,
+                NumKvHeads = G4KvHeads,
+                HeadDim = G4HeadDim,
+                MaxSequenceLength = G4MaxSeq,
+                NormEpsilon = 1e-5f,
+                RoPEConfig = new RoPEConfig(Theta: 10000f, DimensionCount: G4HeadDim, Type: RoPEType.Norm),
+                ActivationFunction = variant == PerSeqOnlyFeature.Relu2 ? ActivationFunction.ReluSquared : ActivationFunction.SiLU,
+                AttentionValueScale = variant == PerSeqOnlyFeature.ValueScale ? 0.5f : null,
+                ValueHeadDim = variant == PerSeqOnlyFeature.DistinctValueHeadDim ? G4ValueHeadDim : null,
+            };
+
+            int qOut = G4Heads * G4HeadDim;
+            int kvOut = G4KvHeads * G4HeadDim;
+            int vOut = G4KvHeads * vHeadDim;
+            int oIn = G4Heads * vHeadDim;
+            var layers = new TransformerLayerWeights[G4Layers];
+            for (int i = 0; i < G4Layers; i++)
+            {
+                layers[i] = new TransformerLayerWeights(
+                    attnNormWeight: Vec(G4Hidden, 1f, 0.05f),
+                    qWeight: Alloc(qOut * G4Hidden, 0.3f), qQuantType: QuantizationType.F32, qOutputDim: qOut, qInputDim: G4Hidden,
+                    kWeight: Alloc(kvOut * G4Hidden, 0.3f), kQuantType: QuantizationType.F32, kOutputDim: kvOut, kInputDim: G4Hidden,
+                    vWeight: Alloc(vOut * G4Hidden, 0.3f), vQuantType: QuantizationType.F32, vOutputDim: vOut, vInputDim: G4Hidden,
+                    oWeight: Alloc(G4Hidden * oIn, 0.3f), oQuantType: QuantizationType.F32, oOutputDim: G4Hidden, oInputDim: oIn,
+                    ffnNormWeight: Vec(G4Hidden, 1f, 0.05f),
+                    gateWeight: Alloc(G4Inter * G4Hidden, 0.3f), gateQuantType: QuantizationType.F32, gateOutputDim: G4Inter, gateInputDim: G4Hidden,
+                    upWeight: Alloc(G4Inter * G4Hidden, 0.3f), upQuantType: QuantizationType.F32, upOutputDim: G4Inter, upInputDim: G4Hidden,
+                    downWeight: Alloc(G4Hidden * G4Inter, 0.3f), downQuantType: QuantizationType.F32, downOutputDim: G4Hidden, downInputDim: G4Inter,
+                    attnSubNormWeight: variant == PerSeqOnlyFeature.AttnSubNorm ? Vec(oIn, 1f, 0.5f) : null,
+                    ffnSubNormWeight: variant == PerSeqOnlyFeature.FfnSubNorm ? Vec(G4Inter, 1f, 0.5f) : null,
+                    attnSinks: variant == PerSeqOnlyFeature.AttnSinks ? Vec(G4Heads, 0f, 2f) : null);
+            }
+
+            using var weights = TransformerWeights.CreateFromSafetensors(
+                tokenEmbedWeight: Alloc(G4Vocab * G4Hidden, 1f), tokenEmbedQt: QuantizationType.F32,
+                vocabSize: G4Vocab, hiddenSize: G4Hidden,
+                layers: layers,
+                outputNormWeight: Vec(G4Hidden, 1f, 0.05f),
+                outputWeight: Alloc(G4Vocab * G4Hidden, 0.3f), outputQt: QuantizationType.F32,
+                outputM: G4Vocab, outputK: G4Hidden,
+                ownedAllocations: new List<nint>());
+            using var model = TransformerModel.BuildFromPrebuiltWeights(weights, cfg);
+
+            // Mixed prefill lengths so attention spans several keys per query.
+            int[][] tokenSets = [[3], [1, 7, 4], [9, 2], [5, 11, 0, 14]];
+            SimpleKvCache NewCache() => new(cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, cfg.MaxSequenceLength);
+
+            var refLogits = new float[tokenSets.Length][];
+            for (int i = 0; i < tokenSets.Length; i++)
+            {
+                using var kv = NewCache();
+                using ITensor logits = model.Forward(tokenSets[i], Enumerable.Range(0, tokenSets[i].Length).ToArray(), deviceId: -1, kv);
+                refLogits[i] = CopyLogits(logits);
+            }
+
+            var caches = new SimpleKvCache[tokenSets.Length];
+            try
+            {
+                var requests = new SequenceForwardRequest[tokenSets.Length];
+                for (int i = 0; i < tokenSets.Length; i++)
+                {
+                    caches[i] = NewCache();
+                    requests[i] = new SequenceForwardRequest
+                    {
+                        TokenIds = tokenSets[i],
+                        Positions = Enumerable.Range(0, tokenSets[i].Length).ToArray(),
+                        KvCache = caches[i],
+                    };
+                }
+
+                var results = model.ForwardBatch(requests, deviceId: -1);
+                try
+                {
+                    for (int i = 0; i < tokenSets.Length; i++)
+                        AssertBitEqual(refLogits[i], CopyLogits(results[i]), $"[#1264/{variant}/seq{i}]");
+                }
+                finally
+                {
+                    foreach (var t in results) t.Dispose();
+                }
+            }
+            finally
+            {
+                foreach (var kv in caches) kv?.Dispose();
+            }
+        }
+        finally
+        {
+            foreach (nint p in allocs) System.Runtime.InteropServices.NativeMemory.AlignedFree((void*)p);
         }
     }
 }

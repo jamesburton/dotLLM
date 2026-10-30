@@ -56,6 +56,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed unsafe class CudaTransformerDenseRopeParityTests
 {
     private readonly ITestOutputHelper _out;

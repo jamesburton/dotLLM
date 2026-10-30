@@ -28,6 +28,7 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// </list>
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class CudaAttentionSplitKvGenerationParityTests
 {
     private readonly ITestOutputHelper _output;
@@ -109,8 +110,8 @@ public sealed class CudaAttentionSplitKvGenerationParityTests
         string? ggufPath = ResolveModelPath();
         Skip.If(ggufPath is null,
             "Bonsai PQ2_0 GGUF fixture not found. Set DOTLLM_BONSAI_PQ2_0_GGUF, or place "
-            + "Ternary-Bonsai-27B-Q2_0.gguf under ~/.dotllm/models/PrismML/Ternary-Bonsai-27B-GGUF/ "
-            + "or ~/.dotllm/test-cache/PrismML/Ternary-Bonsai-27B-GGUF/.");
+            + "Ternary-Bonsai-2-27B-PQ2_0.gguf under ~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/ "
+            + "or ~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/.");
         string? ptxDir = FindPtxDir();
         Skip.If(ptxDir is null, "PTX files not found");
 
@@ -301,8 +302,8 @@ public sealed class CudaAttentionSplitKvGenerationParityTests
         string? ggufPath = ResolveModelPath();
         Skip.If(ggufPath is null,
             "Bonsai PQ2_0 GGUF fixture not found. Set DOTLLM_BONSAI_PQ2_0_GGUF, or place "
-            + "Ternary-Bonsai-27B-Q2_0.gguf under ~/.dotllm/models/PrismML/Ternary-Bonsai-27B-GGUF/ "
-            + "or ~/.dotllm/test-cache/PrismML/Ternary-Bonsai-27B-GGUF/.");
+            + "Ternary-Bonsai-2-27B-PQ2_0.gguf under ~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/ "
+            + "or ~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/.");
         string? ptxDir = FindPtxDir();
         Skip.If(ptxDir is null, "PTX files not found");
 
@@ -516,23 +517,7 @@ public sealed class CudaAttentionSplitKvGenerationParityTests
     }
 
     private static string? ResolveModelPath()
-    {
-        string? envPath = Environment.GetEnvironmentVariable("DOTLLM_BONSAI_PQ2_0_GGUF");
-        if (!string.IsNullOrWhiteSpace(envPath) && File.Exists(envPath))
-            return envPath;
-
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string[] candidates =
-        [
-            Path.Combine(home, ".dotllm", "models", "PrismML", "Ternary-Bonsai-27B-GGUF", "Ternary-Bonsai-27B-Q2_0.gguf"),
-            Path.Combine(home, ".dotllm", "test-cache", "PrismML", "Ternary-Bonsai-27B-GGUF", "Ternary-Bonsai-27B-Q2_0.gguf"),
-        ];
-        foreach (string candidate in candidates)
-            if (File.Exists(candidate))
-                return candidate;
-
-        return null;
-    }
+        => DotLLM.Tests.Integration.Fixtures.KnownTestFixtures.TernaryBonsai27B_Q2_0.Path;
 
     private static string? FindPtxDir()
     {

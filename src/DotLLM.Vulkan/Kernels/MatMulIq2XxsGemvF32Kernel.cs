@@ -19,7 +19,7 @@ public sealed class MatMulIq2XxsGemvF32Kernel : IDisposable
     /// <summary>Elements per IQ2 super-block.</summary>
     public const int IQ2_XXSGroupSize = QuantFormat.KQuantGroupSize;
 
-    private const int PushConstantBytes = 4 * sizeof(uint);
+    private const int PushConstantBytes = 5 * sizeof(uint); // M, K, blocksPerRow, rowUints, cols (#1237)
 
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
@@ -103,12 +103,16 @@ public sealed class MatMulIq2XxsGemvF32Kernel : IDisposable
         ctx.SubmitAndWait();
     }
 
-    /// <summary>Records the GEMV into <paramref name="cmdBuf"/> without submitting.</summary>
+    /// <summary>
+    /// Records the GEMV into <paramref name="cmdBuf"/> without submitting; with <paramref name="cols"/> &gt; 1 over that many
+    /// activation rows, each bit-identical to a one-column call (#1237, <see cref="GemvColumns"/>).
+    /// </summary>
     public unsafe void Record(
         nint cmdBuf,
         VulkanDevice.Buffer weights, VulkanDevice.Buffer x, VulkanDevice.Buffer y,
-        int m, int k)
+        int m, int k, int cols = 1)
     {
+        if (cols <= 0) throw new ArgumentOutOfRangeException(nameof(cols));
         if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m));
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
         if ((k % IQ2_XXSGroupSize) != 0)
@@ -122,9 +126,9 @@ public sealed class MatMulIq2XxsGemvF32Kernel : IDisposable
         if (weights.Size < weightsMin)
             throw new ArgumentException(
                 $"Weights buffer too small: need >= {weightsMin} bytes, got {weights.Size}.", nameof(weights));
-        if (x.Size < (long)k * sizeof(float))
+        if (x.Size < (long)cols * k * sizeof(float))
             throw new ArgumentException("Input buffer too small.", nameof(x));
-        if (y.Size < (long)m * sizeof(float))
+        if (y.Size < (long)cols * m * sizeof(float))
             throw new ArgumentException("Output buffer too small.", nameof(y));
 
         Span<nint> buffers = stackalloc nint[5]
@@ -142,12 +146,13 @@ public sealed class MatMulIq2XxsGemvF32Kernel : IDisposable
             cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout,
             0, 1, descriptorSet, 0, 0);
 
-        Span<uint> pc = stackalloc uint[4]
+        Span<uint> pc = stackalloc uint[5]
         {
             (uint)m,
             (uint)k,
             (uint)blocksPerRow,
             (uint)rowUints,
+            (uint)cols,
         };
         fixed (uint* pcPtr = pc)
         {
@@ -156,7 +161,7 @@ public sealed class MatMulIq2XxsGemvF32Kernel : IDisposable
                 0, PushConstantBytes, (nint)pcPtr);
         }
 
-        VulkanApi.vkCmdDispatch(cmdBuf, (uint)m, 1, 1);
+        GemvColumns.Dispatch(cmdBuf, (long)m * cols);
     }
 
     /// <inheritdoc/>

@@ -26,7 +26,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// passed at the call site, or the qualification guard admitting an
 /// unsupported layer shape).
 /// </remarks>
-[Collection("SmallModel")]
+[Collection(SmallModelGpuCollection.Name)]
 [Trait("Category", "GPU")]
 public sealed class VulkanSwiGluQuantizeFusedParityTests
 {

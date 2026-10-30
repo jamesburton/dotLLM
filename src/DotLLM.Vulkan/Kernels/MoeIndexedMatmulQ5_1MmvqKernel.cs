@@ -44,10 +44,16 @@ public sealed class MoeIndexedMatmulQ5_1MmvqKernel : IDisposable
     private readonly ComputePipeline _pipeline;
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
+    private int _blockBytes = Q5_1BlockBytes;
     private bool _disposed;
+    private readonly int _rowsPerGroup;
 
-    private MoeIndexedMatmulQ5_1MmvqKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
+    /// <summary>Output rows each workgroup produces (1 = the one-cell-per-workgroup kernel; &gt; 1 = the multi-row variant, #876).</summary>
+    public int RowsPerGroup => _rowsPerGroup;
+
+    private MoeIndexedMatmulQ5_1MmvqKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, int rowsPerGroup)
     {
+        _rowsPerGroup = rowsPerGroup;
         _device = device;
         _module = module;
         _pipeline = pipeline;
@@ -61,12 +67,18 @@ public sealed class MoeIndexedMatmulQ5_1MmvqKernel : IDisposable
     /// does not advertise integer-dot-product support — the router then falls back to
     /// the scalar <see cref="MoeIndexedMatmulQ5_1F32Kernel"/>.
     /// </summary>
-    public static MoeIndexedMatmulQ5_1MmvqKernel? TryCreate(VulkanDevice device, string spvDir)
+    /// <param name="device">Target device.</param>
+    /// <param name="spvDir">Directory holding the compiled shaders.</param>
+    /// <param name="rowsPerGroup">Output rows per workgroup (the multi-row Q5_1 kernel when &gt; 1).</param>
+    /// <param name="q5_0">Read a PACKED Q5_0 bank (22-byte blocks, #1225) instead of Q5_1; single-row only.</param>
+    /// <returns>The kernel, or <see langword="null"/> without integer dot product or the SPIR-V.</returns>
+    public static MoeIndexedMatmulQ5_1MmvqKernel? TryCreate(VulkanDevice device, string spvDir, int rowsPerGroup = 1, bool q5_0 = false)
     {
-        if (!device.HasIntegerDotProduct)
+        if (!device.HasIntegerDotProduct || (q5_0 && rowsPerGroup > 1))
             return null;
 
-        string path = Path.Combine(spvDir, "moe_indexed_matmul_q5_1_mmvq.spv");
+        string path = Path.Combine(spvDir, q5_0 ? "moe_indexed_matmul_q5_0_mmvq.spv"
+            : rowsPerGroup > 1 ? "moe_indexed_matmul_q5_1_mmvq_mr.spv" : "moe_indexed_matmul_q5_1_mmvq.spv");
         if (!File.Exists(path))
             return null;
 
@@ -83,7 +95,8 @@ public sealed class MoeIndexedMatmulQ5_1MmvqKernel : IDisposable
                 entryPoint: "main",
                 bindings: bindings,
                 pushConstantBytes: PushConstantBytes,
-                requiredSubgroupSize: requiredSubgroupSize);
+                requiredSubgroupSize: requiredSubgroupSize,
+                specConstants: rowsPerGroup > 1 ? new[] { (uint)rowsPerGroup } : default);
         }
         catch
         {
@@ -92,7 +105,10 @@ public sealed class MoeIndexedMatmulQ5_1MmvqKernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)BuffersPerSet);
-        return new MoeIndexedMatmulQ5_1MmvqKernel(device, module, pipeline, pool);
+        return new MoeIndexedMatmulQ5_1MmvqKernel(device, module, pipeline, pool, rowsPerGroup)
+        {
+            _blockBytes = q5_0 ? QuantFormat.Q5_0BlockBytes : Q5_1BlockBytes,
+        };
     }
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
@@ -124,7 +140,7 @@ public sealed class MoeIndexedMatmulQ5_1MmvqKernel : IDisposable
             throw new ArgumentException($"k must be a multiple of {Q5_1GroupSize}, got {k}", nameof(k));
 
         int blocksPerRow = k / Q5_1GroupSize;
-        long rowBytes = (long)blocksPerRow * Q5_1BlockBytes;
+        long rowBytes = (long)blocksPerRow * _blockBytes;
         long bankBytes = (long)numExperts * m * rowBytes;
         if (bankQ5_1.Size < bankBytes) throw new ArgumentException("bankQ5_1 buffer too small.", nameof(bankQ5_1));
         if (xq.Size < QuantizeQ8_1RowsKernel.PackedBytes(n, k))
@@ -158,8 +174,10 @@ public sealed class MoeIndexedMatmulQ5_1MmvqKernel : IDisposable
                 0, PushConstantBytes, (nint)pcPtr);
         }
 
-        // One wave32 workgroup per (m, n) output cell.
-        VulkanApi.vkCmdDispatch(cmdBuf, (uint)m, (uint)n, 1);
+        // One wave32 workgroup per (m, n) output cell (or per NR consecutive rows of one n in the multi-row variant).
+        if (_rowsPerGroup > 1 && (m % _rowsPerGroup) != 0)
+            throw new ArgumentException($"m ({m}) must be a multiple of the rows-per-group ({_rowsPerGroup}).", nameof(m));
+        VulkanApi.vkCmdDispatch(cmdBuf, (uint)(m / _rowsPerGroup), (uint)n, 1);
     }
 
     /// <inheritdoc/>

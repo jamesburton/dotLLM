@@ -6,6 +6,7 @@ using DotLLM.Core.Tensors;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Models.Architectures;
 using DotLLM.Vulkan;
+using DotLLM.Vulkan.Kernels;
 using Xunit;
 using Architecture = DotLLM.Core.Configuration.Architecture;
 
@@ -100,6 +101,86 @@ public sealed class VulkanNemotronHTransformerModelIq3ForwardTests
     {
         var kinds = new[] { HybridLayerKind.Attention, HybridLayerKind.Ssm, HybridLayerKind.Ffn };
         AssertVulkanMatchesCpu(QuantizationType.IQ3_XXS, kinds, seqLen: 1, seed: 113);
+    }
+
+    /// <summary>
+    /// #1060: a prompt at the F16-prefill threshold (lowered to 2 here) takes <see cref="IqF16PrefillMatmul"/> on every IQ3
+    /// projection (dequantise to F16, coopmat GEMM) instead of the scalar IQ3 GEMM, and must still match the CPU forward.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(QuantizationType.IQ3_XXS, 307)]
+    [InlineData(QuantizationType.IQ3_S, 313)]
+    public void Forward_Iq3_AttentionThenSsmThenFfn_F16Prefill_MatchesCpuReference(QuantizationType qt, int seed)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out _);
+        using (var probe = VulkanDevice.Create())
+            Skip.IfNot(probe.HasCooperativeMatrix, "no cooperative-matrix F16 GEMM on this device: the F16 prefill path does not exist here");
+        var kinds = new[] { HybridLayerKind.Attention, HybridLayerKind.Ssm, HybridLayerKind.Ffn };
+        using (new F16PrefillTestScope())
+        {
+            AssertVulkanMatchesCpu(qt, kinds, seqLen: 4, seed: seed);
+            Assert.True(Interlocked.Read(ref IqF16PrefillMatmul.Counters.Iq) > 0, "the IQ projections did not take the F16 prefill path");
+        }
+    }
+
+    /// <summary>#1069 control: the all-IQ2_XXS mini Nemotron-H at one token (GEMVs only, no prefill GEMM) against the CPU forward.</summary>
+    [SkippableFact]
+    public void Forward_Iq2Xxs_AttentionThenSsmThenFfn_SingleToken_MatchesCpuReference()
+    {
+        var kinds = new[] { HybridLayerKind.Attention, HybridLayerKind.Ssm, HybridLayerKind.Ffn };
+        AssertVulkanMatchesCpu(QuantizationType.IQ2_XXS, kinds, seqLen: 1, seed: 1069);
+    }
+
+    /// <summary>
+    /// #1069: a 4-token prompt on an all-IQ2_XXS mini Nemotron-H takes the native IQ2_XXS coopmat GEMM on every prefill projection
+    /// (no F16 scratch sized), or with the native kernel disabled the #1060 F16 path; both must match the CPU forward.
+    /// </summary>
+    /// <param name="native">Whether the native GEMM (default) or the F16 dequant path (native disabled, F16 threshold lowered) runs.</param>
+    [SkippableTheory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Forward_Iq2Xxs_AttentionThenSsmThenFfn_Prefill_MatchesCpuReference(bool native)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using (var probe = VulkanDevice.Create())
+        {
+            Skip.IfNot(probe.HasCooperativeMatrix, "no cooperative-matrix GEMM on this device");
+            if (native) Skip.IfNot(MatMulIq2XxsGemmCoopmatKernel.IsSupportedOn(probe, spvDir), "no wave64 cooperative-matrix device");
+        }
+        var kinds = new[] { HybridLayerKind.Attention, HybridLayerKind.Ssm, HybridLayerKind.Ffn };
+        using var prefillKernels = new RowExactOffScope();   // a short batch would otherwise take the decode GEMVs (#1237)
+        using var nativeOff = native ? null : new EnvVarScope(MatMulIq2XxsGemmCoopmatKernel.LegacyEnvVar, "1");
+        using var f16 = native ? null : new F16PrefillTestScope();
+        IqF16PrefillMatmul.Counters.Reset();
+        Interlocked.Exchange(ref MatMulIq2XxsGemmCoopmatKernel.Dispatches, 0);
+
+        AssertVulkanMatchesCpu(QuantizationType.IQ2_XXS, kinds, seqLen: 4, seed: 1069);
+
+        long viaNative = Interlocked.Read(ref MatMulIq2XxsGemmCoopmatKernel.Dispatches);
+        long viaF16 = Interlocked.Read(ref IqF16PrefillMatmul.Counters.Iq);
+        if (native)
+        {
+            Assert.True(viaNative > 0, "the IQ2_XXS projections did not take the native coopmat GEMM");
+            Assert.Equal(0, viaF16);
+        }
+        else
+        {
+            Assert.Equal(0, viaNative);
+            Assert.True(viaF16 > 0, "the IQ2_XXS projections did not take the F16 prefill path");
+        }
+    }
+
+    /// <summary>
+    /// Random but valid IQ2_XXS rows: fp16 d in [2.5e-4, 7.5e-4) per super-block (weights of the same order as the IQ3 fixture's ±0.05), random grid / sign indices and 4-bit scales.
+    /// </summary>
+    internal static byte[] RandomIq2XxsRows(Random rng, int rows, int cols)
+    {
+        int blocks = rows * (cols / 256);
+        byte[] bytes = new byte[blocks * 66];
+        rng.NextBytes(bytes);
+        for (int b = 0; b < blocks; b++)
+            BitConverter.TryWriteBytes(bytes.AsSpan(b * 66, 2), (Half)(2.5e-4 + rng.NextDouble() * 5e-4));
+        return bytes;
     }
 
     [SkippableFact]
@@ -265,8 +346,8 @@ public sealed class VulkanNemotronHTransformerModelIq3ForwardTests
         public static NemotronHIq3FixtureBuilder Build(
             HybridLayerKind[] layerKinds, int seed, QuantizationType iq3Type)
         {
-            if (iq3Type != QuantizationType.IQ3_S && iq3Type != QuantizationType.IQ3_XXS)
-                throw new ArgumentException($"Unexpected IQ3 type {iq3Type}", nameof(iq3Type));
+            if (iq3Type != QuantizationType.IQ3_S && iq3Type != QuantizationType.IQ3_XXS && iq3Type != QuantizationType.IQ2_XXS)
+                throw new ArgumentException($"Unexpected IQ type {iq3Type}", nameof(iq3Type));
             var b = new NemotronHIq3FixtureBuilder();
             b.BuildInternal(layerKinds, seed, iq3Type);
             return b;
@@ -451,9 +532,13 @@ public sealed class VulkanNemotronHTransformerModelIq3ForwardTests
             for (int i = 0; i < src.Length; i++)
                 src[i] = ((float)rng.NextDouble() * 2f - 1f) * 0.05f;
 
-            byte[] iq3Bytes = _iq3Type == QuantizationType.IQ3_XXS
-                ? Iq3Fixture.QuantizeRowsIq3Xxs(src, outputDim, inputDim)
-                : Iq3Fixture.QuantizeRowsIq3S(src, outputDim, inputDim);
+            byte[] iq3Bytes = _iq3Type switch
+            {
+                QuantizationType.IQ3_XXS => Iq3Fixture.QuantizeRowsIq3Xxs(src, outputDim, inputDim),
+                QuantizationType.IQ3_S => Iq3Fixture.QuantizeRowsIq3S(src, outputDim, inputDim),
+                // #1069: no IQ2_XXS quantizer in tree; both backends consume the same random (valid) blocks, which is all parity needs.
+                _ => RandomIq2XxsRows(new Random(outputDim * 7919 + inputDim), outputDim, inputDim),
+            };
 
             long totalBytes = iq3Bytes.Length;
             nint dst = (nint)NativeMemory.AlignedAlloc((nuint)totalBytes, 64);

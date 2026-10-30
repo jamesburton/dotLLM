@@ -1,0 +1,6 @@
+#version 450
+// Expert-grouped MoE Q8_0 x Q8_1 GEMM on int8 cooperative matrices (issue #1226); see mmq_cm1_main.glsl (MMQ_GROUPED).
+#extension GL_GOOGLE_include_directive : require
+#define MMQ_Q8_0 1
+#define MMQ_GROUPED 1
+#include "mmq_cm1_main.glsl"

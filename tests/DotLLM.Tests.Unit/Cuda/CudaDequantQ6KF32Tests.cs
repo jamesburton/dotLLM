@@ -24,6 +24,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// </para>
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaDequantQ6KF32Tests
 {
     private const int Q6_K_BlockBytes = 210;

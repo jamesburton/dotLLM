@@ -7,6 +7,7 @@ using DotLLM.Cuda.Interop;
 using DotLLM.Engine.KvCache;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -28,9 +29,7 @@ public class CudaDecodeDebugTest
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
 
-        string modelPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q8_0.gguf");
+        string modelPath = TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q8_0.gguf"], null).Path ?? "";
         Skip.If(!File.Exists(modelPath), "SmolLM-135M Q8_0 GGUF not found");
 
         RunDecodeComparison(modelPath, "Tell best meal is", 15);
@@ -41,9 +40,7 @@ public class CudaDecodeDebugTest
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
 
-        string modelPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "Qwen", "Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf");
+        string modelPath = TestFixtureResolver.ResolveFile([], "Qwen", "Qwen2.5-0.5B-Instruct-GGUF", ["qwen2.5-0.5b-instruct-q8_0.gguf"], null).Path ?? "";
         Skip.If(!File.Exists(modelPath), "Qwen2.5-0.5B-Instruct Q8_0 GGUF not found");
 
         RunDecodeComparison(modelPath, "The capital of France is", 15);
@@ -54,9 +51,7 @@ public class CudaDecodeDebugTest
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
 
-        string modelPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "Qwen", "Qwen3-0.6B-GGUF", "qwen3-0.6b-q8_0.gguf");
+        string modelPath = TestFixtureResolver.ResolveFile([], "Qwen", "Qwen3-0.6B-GGUF", ["qwen3-0.6b-q8_0.gguf"], null).Path ?? "";
         Skip.If(!File.Exists(modelPath), "Qwen3-0.6B Q8_0 GGUF not found");
 
         RunDecodeComparison(modelPath, "The capital of France is", 15);
@@ -70,9 +65,7 @@ public class CudaDecodeDebugTest
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
 
-        string modelPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "bartowski", "Llama-3.2-1B-Instruct-GGUF", "Llama-3.2-1B-Instruct-Q8_0.gguf");
+        string modelPath = TestFixtureResolver.ResolveFile([], "bartowski", "Llama-3.2-1B-Instruct-GGUF", ["Llama-3.2-1B-Instruct-Q8_0.gguf"], null).Path ?? "";
         Skip.If(!File.Exists(modelPath), "Llama-3.2-1B-Instruct Q8_0 GGUF not found");
 
         RunLayerBisect(modelPath, "The capital of France is");
@@ -86,9 +79,7 @@ public class CudaDecodeDebugTest
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
 
-        string modelPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q8_0.gguf");
+        string modelPath = TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q8_0.gguf"], null).Path ?? "";
         Skip.If(!File.Exists(modelPath), "SmolLM-135M Q8_0 GGUF not found");
 
         RunLayerBisect(modelPath, "The capital of France is");
@@ -102,9 +93,7 @@ public class CudaDecodeDebugTest
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
 
-        string modelPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "Qwen", "Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf");
+        string modelPath = TestFixtureResolver.ResolveFile([], "Qwen", "Qwen2.5-0.5B-Instruct-GGUF", ["qwen2.5-0.5b-instruct-q8_0.gguf"], null).Path ?? "";
         Skip.If(!File.Exists(modelPath), "Qwen2.5-0.5B-Instruct Q8_0 GGUF not found");
 
         RunLayerBisect(modelPath, "The capital of France is");
@@ -115,10 +104,7 @@ public class CudaDecodeDebugTest
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
 
-        string modelPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF",
-            "Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf");
+        string modelPath = TestFixtureResolver.ResolveFile([], "bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF", ["Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf"], null).Path ?? "";
         Skip.If(!File.Exists(modelPath), "Meta-Llama-3.1-8B-Instruct IQ4_XS GGUF not found");
 
         RunLayerBisectWithTokens(modelPath, [128000, 791, 6864, 315, 9822, 374]);
@@ -133,9 +119,7 @@ public class CudaDecodeDebugTest
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
 
-        string modelPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "Qwen", "Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf");
+        string modelPath = TestFixtureResolver.ResolveFile([], "Qwen", "Qwen2.5-0.5B-Instruct-GGUF", ["qwen2.5-0.5b-instruct-q8_0.gguf"], null).Path ?? "";
         Skip.If(!File.Exists(modelPath), "Qwen2.5-0.5B-Instruct Q8_0 GGUF not found");
 
         using var gguf = GgufFile.Open(modelPath);

@@ -1,4 +1,6 @@
 using System.Buffers;
+using System.Numerics.Tensors;
+using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Tensors;
 using DotLLM.Cuda.Interop;
@@ -231,13 +233,17 @@ public sealed class CudaKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache
     /// <param name="ropeType">0 = standard pairs, 1 = NeoX split halves.</param>
     /// <param name="stream">CUDA stream.</param>
     /// <param name="kernels">Kernel dispatcher.</param>
+    /// <param name="ropeInvFreq">Dense-YaRN ramped inverse-frequency device buffer
+    /// (<c>ropeDim/2</c> floats), or 0 for the kernel's in-kernel <c>powf(theta, ...)</c>. See #366.</param>
+    /// <param name="ropeMscale">Dense-YaRN cos/sin multiplier, or 1.0f when inactive. See #366.</param>
     internal void FusedRopeAndUpdateDevice(
         nint qSrc, nint kSrc, nint vSrc,
         nint positionsDevice, int position,
         int layerIndex,
         int numHeads, int numKvHeads, int headDim,
         int ropeDim, float ropeTheta, int ropeType,
-        nint stream, CudaKernels kernels)
+        nint stream, CudaKernels kernels,
+        nint ropeInvFreq = 0, float ropeMscale = 1.0f)
     {
         if ((uint)position >= (uint)_maxSeqLen)
             throw new ArgumentOutOfRangeException(nameof(position),
@@ -249,7 +255,7 @@ public sealed class CudaKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache
             positionsDevice, position,
             numHeads, numKvHeads, headDim,
             ropeDim, Stride(layerIndex), ropeTheta, ropeType,
-            stream);
+            stream, ropeInvFreq, ropeMscale);
 
         int newLength = position + 1;
         if (newLength > _currentLength)
@@ -348,9 +354,9 @@ public sealed class CudaKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache
             fixed (ushort* hp = host)
             {
                 CudaDriverApi.cuMemcpyDtoH_v2((nint)hp, _keys[layerIndex], (nuint)bytes).ThrowOnError();
-                for (int i = 0; i < count; i++) keys[i] = (float)BitConverter.UInt16BitsToHalf(host[i]);
+                TensorPrimitives.ConvertToSingle(MemoryMarshal.Cast<ushort, Half>(host.AsSpan(0, count)), keys); // vectorized; the scalar cast is a managed call (#1119)
                 CudaDriverApi.cuMemcpyDtoH_v2((nint)hp, _values[layerIndex], (nuint)bytes).ThrowOnError();
-                for (int i = 0; i < count; i++) values[i] = (float)BitConverter.UInt16BitsToHalf(host[i]);
+                TensorPrimitives.ConvertToSingle(MemoryMarshal.Cast<ushort, Half>(host.AsSpan(0, count)), values); // vectorized; the scalar cast is a managed call (#1119)
             }
         }
         finally

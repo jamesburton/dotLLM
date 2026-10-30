@@ -1,5 +1,6 @@
 using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
+using DotLLM.Cpu.Threading;
 
 namespace DotLLM.Cpu.Kernels;
 
@@ -51,6 +52,7 @@ public static unsafe class PerLayerEmbeddings
     /// <param name="numLayers">Number of decoder layers (L).</param>
     /// <param name="pleDim">Per-layer embedding dimension (P).</param>
     /// <param name="eps">RMSNorm epsilon.</param>
+    /// <param name="pool">Optional thread pool for the F32 projection GEMMs (null = single-threaded).</param>
     public static void ComputeInputs(
         float* tokenIdentity,
         float* inputsEmbeds,
@@ -58,14 +60,15 @@ public static unsafe class PerLayerEmbeddings
         ReadOnlySpan<float> projNormWeight,
         float* projScratch,
         float* output,
-        int seqLen, int hiddenSize, int numLayers, int pleDim, float eps)
+        int seqLen, int hiddenSize, int numLayers, int pleDim, float eps,
+        ComputeThreadPool? pool = null)
     {
         int lp = numLayers * pleDim;
         float projScale = 1.0f / MathF.Sqrt(hiddenSize);
         float combineScale = 1.0f / MathF.Sqrt(2.0f);
 
         // Context projection: [seq, L*P] = inputsEmbeds[seq,hidden] · projWeight[L*P,hidden]^T
-        MatMul.GemmF32(projWeight, inputsEmbeds, projScratch, lp, hiddenSize, seqLen);
+        MatMul.GemmF32(projWeight, inputsEmbeds, projScratch, lp, hiddenSize, seqLen, pool);
 
         for (int t = 0; t < seqLen; t++)
         {
@@ -110,6 +113,7 @@ public static unsafe class PerLayerEmbeddings
     /// <param name="hiddenSize">Model hidden size.</param>
     /// <param name="pleDim">Per-layer embedding dimension.</param>
     /// <param name="eps">RMSNorm epsilon.</param>
+    /// <param name="pool">Optional thread pool for the F32 gate / projection GEMMs (null = single-threaded).</param>
     public static void InjectLayer(
         float* hidden,
         float* perLayerInputs,
@@ -119,12 +123,13 @@ public static unsafe class PerLayerEmbeddings
         ReadOnlySpan<float> postNormWeight,
         float* gateScratch,
         float* projScratch,
-        int seqLen, int hiddenSize, int pleDim, float eps)
+        int seqLen, int hiddenSize, int pleDim, float eps,
+        ComputeThreadPool? pool = null)
     {
         int lp = numLayers * pleDim;
 
         // gate = hidden · gateWeight^T → [seq, pleDim]
-        MatMul.GemmF32(gateWeight, hidden, gateScratch, pleDim, hiddenSize, seqLen);
+        MatMul.GemmF32(gateWeight, hidden, gateScratch, pleDim, hiddenSize, seqLen, pool);
 
         // gelu_tanh(gate) * per_layer_input[:, layerIdx, :]
         for (int t = 0; t < seqLen; t++)
@@ -136,7 +141,7 @@ public static unsafe class PerLayerEmbeddings
         }
 
         // proj = gate · projWeight^T → [seq, hidden]
-        MatMul.GemmF32(projWeight, gateScratch, projScratch, hiddenSize, pleDim, seqLen);
+        MatMul.GemmF32(projWeight, gateScratch, projScratch, hiddenSize, pleDim, seqLen, pool);
 
         // post-norm + residual add into hidden (in place)
         for (int t = 0; t < seqLen; t++)

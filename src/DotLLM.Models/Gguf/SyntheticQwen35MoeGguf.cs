@@ -25,7 +25,7 @@ namespace DotLLM.Models.Gguf;
 public static class SyntheticQwen35MoeGguf
 {
     // Compact but architecturally valid shapes (mirrors the CPU unit-test fixture dims).
-    private const int VocabSize = 8;
+    internal const int VocabSize = 8;
     private const int HiddenSize = 32;
     private const int NumAttentionHeads = 2;
     private const int NumKvHeads = 1;          // GQA repeat factor = 2
@@ -36,13 +36,9 @@ public static class SyntheticQwen35MoeGguf
     private const int SharedIntermediate = 16;
     private const int NumExperts = 4;
     private const int NumExpertsPerTok = 2;
-    /// <summary>
-    /// Default trunk depth: layer 0 Gated-DeltaNet, layer 1 full attention. Callers that need
-    /// recurrent layers on <em>both</em> sides of a layer cut (layer-window / cycling coverage,
-    /// issue #395) pass a larger even <c>blockCount</c> to <see cref="Build"/>; the
-    /// <c>full_attention_interval</c> of 2 then alternates GDN / attention the whole way down.
-    /// </summary>
-    private const int DefaultBlockCount = 2;
+    internal const int BlockCount = 2;          // layer 0 GDN, layer 1 full-attn (default trunk depth)
+    // Callers needing recurrent layers on both sides of a layer cut (layer-window / cycling coverage, issue #395)
+    // pass a larger even blockCount to Build; full_attention_interval 2 then alternates GDN / attention.
     private const int FullAttnInterval = 2;    // (i+1) % 2 == 0 → layer 1 is attention
 
     // GDN config ({arch}.ssm.* keys, qwen35moe semantics).
@@ -53,15 +49,20 @@ public static class SyntheticQwen35MoeGguf
     private const int DInner = NVHead * DState; // ssm.inner_size
 
     /// <summary>Builds the synthetic <c>qwen35moe</c> fixture to a byte array.</summary>
-    /// <param name="seed">PRNG seed; the fixture is fully deterministic in it.</param>
-    /// <param name="blockCount">
-    /// Trunk depth. Must be positive and even, so that <c>full_attention_interval = 2</c> yields
-    /// an alternating GDN / attention layout ending on an attention layer. Values above the
-    /// default exist for layer-window coverage, where a cut must have recurrent layers on both
-    /// sides to prove anything (issue #395).
+    /// <param name="seed">Xorshift PRNG seed.</param>
+    /// <param name="withMtp">
+    /// Issue #1188: append one MTP block at raw index <see cref="BlockCount"/> (gated full attention + the MoE FFN with its gated shared
+    /// expert + <c>nextn.{eh_proj,enorm,hnorm}</c>) and set <c>nextn_predict_layers = 1</c>, as ggml-org's Qwen3.6-35B-A3B-MTP-GGUF does. The
+    /// trunk is drawn first, so the trunk weights equal the <see langword="false"/> fixture's for the same seed.
     /// </param>
-    /// <returns>The GGUF bytes.</returns>
-    public static byte[] Build(uint seed = 0xC0FFEEu, int blockCount = DefaultBlockCount)
+    /// <param name="contextLength">Overrides the context length (8); speculative-decode tests need room for several rounds.</param>
+    /// <param name="blockCount">
+    /// Trunk depth (excluding any MTP block). Must be positive and even, so that <c>full_attention_interval = 2</c> yields an
+    /// alternating GDN / attention layout ending on an attention layer. Values above the default exist for layer-window coverage,
+    /// where a cut must have recurrent layers on both sides to prove anything (issue #395).
+    /// </param>
+    public static byte[] Build(uint seed = 0xC0FFEEu, bool withMtp = false, int contextLength = ContextLength,
+                               int blockCount = BlockCount)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(blockCount);
         if (blockCount % FullAttnInterval != 0)
@@ -77,9 +78,11 @@ public static class SyntheticQwen35MoeGguf
         w.AddString("general.name", "synthetic-qwen35moe-tiny");
         w.AddUInt32("general.alignment", 32);
 
-        w.AddUInt32($"{arch}.context_length", ContextLength);
+        w.AddUInt32($"{arch}.context_length", (uint)contextLength);
         w.AddUInt32($"{arch}.embedding_length", HiddenSize);
-        w.AddUInt32($"{arch}.block_count", (uint)blockCount);
+        w.AddUInt32($"{arch}.block_count", (uint)(withMtp ? blockCount + 1 : blockCount));
+        if (withMtp)
+            w.AddUInt32($"{arch}.nextn_predict_layers", 1);
         w.AddUInt32($"{arch}.attention.head_count", NumAttentionHeads);
         w.AddUInt32($"{arch}.attention.head_count_kv", NumKvHeads);
         w.AddUInt32($"{arch}.attention.key_length", HeadDim);
@@ -128,17 +131,32 @@ public static class SyntheticQwen35MoeGguf
             AddMoeLayer(w, rng, p);
         }
 
+        if (withMtp)
+        {
+            string mp = $"blk.{blockCount}";
+            AddNorm(w, rng, $"{mp}.attn_norm.weight", HiddenSize);
+            AddNorm(w, rng, $"{mp}.post_attention_norm.weight", HiddenSize);
+            AddFullAttnLayer(w, rng, mp);
+            AddMoeLayer(w, rng, mp);
+            AddMatrixF32(w, rng, $"{mp}.nextn.eh_proj.weight", inK: 2 * HiddenSize, outM: HiddenSize, 0.05f);
+            AddNorm(w, rng, $"{mp}.nextn.enorm.weight", HiddenSize);
+            AddNorm(w, rng, $"{mp}.nextn.hnorm.weight", HiddenSize);
+            AddNorm(w, rng, $"{mp}.nextn.shared_head_norm.weight", HiddenSize);
+        }
+
         return w.Build();
     }
 
     /// <summary>Writes the synthetic <c>qwen35moe</c> fixture to <paramref name="path"/>.</summary>
-    /// <param name="path">Destination file path.</param>
-    /// <param name="seed">PRNG seed; the fixture is fully deterministic in it.</param>
-    /// <param name="blockCount">Trunk depth; see <see cref="Build"/>.</param>
-    /// <returns><paramref name="path"/>, for call chaining.</returns>
-    public static string Write(string path, uint seed = 0xC0FFEEu, int blockCount = DefaultBlockCount)
+    /// <param name="path">Destination file.</param>
+    /// <param name="seed">Xorshift PRNG seed.</param>
+    /// <param name="withMtp">See <see cref="Build"/>.</param>
+    /// <param name="contextLength">See <see cref="Build"/>.</param>
+    /// <param name="blockCount">See <see cref="Build"/>.</param>
+    public static string Write(string path, uint seed = 0xC0FFEEu, bool withMtp = false, int contextLength = ContextLength,
+                               int blockCount = BlockCount)
     {
-        File.WriteAllBytes(path, Build(seed, blockCount));
+        File.WriteAllBytes(path, Build(seed, withMtp, contextLength, blockCount));
         return path;
     }
 

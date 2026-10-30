@@ -39,6 +39,9 @@ public sealed class MatMulIq4NlMmqKernel : IDisposable
     private readonly ComputePipeline _pipeline;
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
+    /// <summary>Test-visible pipeline handle for VK_AMD_shader_info diagnostics (#545).</summary>
+    internal nint PipelineHandle => _pipeline.Pipeline;
+
     private bool _disposed;
 
     private MatMulIq4NlMmqKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
@@ -52,11 +55,19 @@ public sealed class MatMulIq4NlMmqKernel : IDisposable
 
     /// <summary>Loads <c>matmul_iq4_nl_mmq.spv</c>; null when missing or no integer-dot support.</summary>
     public static MatMulIq4NlMmqKernel? TryCreate(VulkanDevice device, string spvDir)
+        => TryCreate(device, spvDir, "matmul_iq4_nl_mmq");
+
+    /// <summary>
+    /// Issue #545 measurement hook: loads <c>{shaderBaseName}.spv</c> instead of the
+    /// production module, so a bench can hold the shipping kernel and a baseline open
+    /// in ONE process and A/B them same-session. Production callers never pass this.
+    /// </summary>
+    internal static MatMulIq4NlMmqKernel? TryCreate(VulkanDevice device, string spvDir, string shaderBaseName)
     {
         if (!device.HasIntegerDotProduct)
             return null;
 
-        string path = Path.Combine(spvDir, "matmul_iq4_nl_mmq.spv");
+        string path = Path.Combine(spvDir, shaderBaseName + ".spv");
         if (!File.Exists(path))
             return null;
 

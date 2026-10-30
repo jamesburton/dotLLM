@@ -255,7 +255,7 @@ public sealed class VulkanRopeKvWriteFusionParityTests
                 seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
                 headDim: headDim, ropeDim: ropeDim, theta: theta,
                 variant: RopeF32Kernel.Variant.Norm);
-            KernelSupport.ComputeToComputeBarrier(ctx.CommandBuffer);
+            KernelSupport.ComputeToTransferBarrier(ctx.CommandBuffer); // RoPE (compute write) -> vkCmdCopyBuffer (transfer read)
             kvCacheBaseline.RecordUpdate(ctx.CommandBuffer, bufKBaseline, bufVBaseline, positions, seqLen, layerIndex: 0);
             KernelSupport.TransferToComputeBarrier(ctx.CommandBuffer);
             ctx.SubmitAndWait();
@@ -309,7 +309,9 @@ public sealed class VulkanRopeKvWriteFusionParityTests
         // (both already contain the SAME rotated K — the CPU oracle for K was computed
         // above into kExpectedRotated but is not directly indexed against cache rows
         // here since the baseline path already validates that mapping via VulkanRopeF32KernelTests).
-        AssertClose(kCacheBaseline, kCacheFused, "K-cache fused vs unfused baseline");
+        // Only the rows this call appends are defined; the rest of the cache buffers is uninitialised device memory (differs run to run).
+        var written = new Range(positionOffset * kvStride, (positionOffset + seqLen) * kvStride);
+        AssertClose(kCacheBaseline[written], kCacheFused[written], "K-cache fused vs unfused baseline");
 
         // Spot-check K-cache rows against the CPU oracle directly (rotated K values written at
         // [positionOffset + t, :]).
@@ -329,7 +331,7 @@ public sealed class VulkanRopeKvWriteFusionParityTests
 
         // V-cache: zero-tolerance copy check — fused vs unfused baseline, AND fused vs the
         // raw V source (no rotation should ever touch V).
-        Assert.Equal(vCacheBaseline, vCacheFused);
+        Assert.Equal(vCacheBaseline[written], vCacheFused[written]);
         for (int t = 0; t < seqLen; t++)
         {
             int cacheRow = positionOffset + t;

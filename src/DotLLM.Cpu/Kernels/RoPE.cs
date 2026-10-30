@@ -4,6 +4,8 @@ using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.PositionEncoding;
+using Architecture = DotLLM.Core.Configuration.Architecture;
 
 namespace DotLLM.Cpu.Kernels;
 
@@ -116,13 +118,19 @@ public static class RoPE
     /// <param name="factors">Per-pair divisors, length <c>headDim / 2</c>.</param>
     /// <param name="cosTable">Destination cosine table; length ≥ maxSeqLen * headDim / 2.</param>
     /// <param name="sinTable">Destination sine table; length ≥ maxSeqLen * headDim / 2.</param>
+    /// <param name="frequencyDenominatorDim">
+    /// Dimension used in the <c>θ^(-2i/dim)</c> exponent. 0 (default) = <paramref name="headDim"/>. Must be the
+    /// FULL head dim when only the leading <paramref name="headDim"/> dims rotate (Gemma-4 26B/31B global layers:
+    /// 128 rotated of 512) — ggml's <c>n_rot</c> there is the full 512, so the exponent denominator is 512 (#784).
+    /// </param>
     public static void PrecomputeFrequencyTableWithFactors(
         int maxSeqLen, int headDim, float theta, ReadOnlySpan<float> factors,
-        Span<float> cosTable, Span<float> sinTable)
+        Span<float> cosTable, Span<float> sinTable, int frequencyDenominatorDim = 0)
     {
         if (headDim <= 0 || headDim % 2 != 0)
             throw new ArgumentException($"headDim must be a positive even number, got {headDim}", nameof(headDim));
         int halfDim = headDim / 2;
+        int expDim = frequencyDenominatorDim > headDim ? frequencyDenominatorDim : headDim;
         if (factors.Length < halfDim)
             throw new ArgumentException(
                 $"factors length {factors.Length} must be >= headDim/2 ({halfDim}).", nameof(factors));
@@ -130,7 +138,7 @@ public static class RoPE
         float[] rented = ArrayPool<float>.Shared.Rent(halfDim);
         Span<float> freqs = rented.AsSpan(0, halfDim);
         for (int i = 0; i < halfDim; i++)
-            freqs[i] = 1.0f / (MathF.Pow(theta, 2.0f * i / headDim) * factors[i]);
+            freqs[i] = 1.0f / (PortableMath.Pow(theta, 2.0f * i / expDim) * factors[i]);
 
         for (int pos = 0; pos < maxSeqLen; pos++)
         {
@@ -138,8 +146,8 @@ public static class RoPE
             for (int i = 0; i < halfDim; i++)
             {
                 float angle = pos * freqs[i];
-                cosTable[tableBase + i] = MathF.Cos(angle);
-                sinTable[tableBase + i] = MathF.Sin(angle);
+                cosTable[tableBase + i] = PortableMath.Cos(angle);
+                sinTable[tableBase + i] = PortableMath.Sin(angle);
             }
         }
         ArrayPool<float>.Shared.Return(rented);
@@ -151,7 +159,7 @@ public static class RoPE
     {
         int halfDim = freqs.Length;
         for (int i = 0; i < halfDim; i++)
-            freqs[i] = 1.0f / MathF.Pow(theta, 2.0f * i / headDim);
+            freqs[i] = 1.0f / PortableMath.Pow(theta, 2.0f * i / headDim);
 
         for (int pos = 0; pos < maxSeqLen; pos++)
         {
@@ -159,8 +167,8 @@ public static class RoPE
             for (int i = 0; i < halfDim; i++)
             {
                 float angle = pos * freqs[i];
-                cosTable[tableBase + i] = MathF.Cos(angle);
-                sinTable[tableBase + i] = MathF.Sin(angle);
+                cosTable[tableBase + i] = PortableMath.Cos(angle);
+                sinTable[tableBase + i] = PortableMath.Sin(angle);
             }
         }
     }
@@ -211,6 +219,52 @@ public static class RoPE
 
         int halfDim = headDim / 2;
 
+        Span<float> invFreq = halfDim * sizeof(float) <= StackAllocThreshold
+            ? stackalloc float[halfDim]
+            : new float[halfDim];
+        ComputeYarnInverseFrequencies(headDim, theta, scalingFactor,
+            originalMaxPositionEmbeddings, betaFast, betaSlow, invFreq);
+
+        // Fill cos/sin with optional mscale pre-multiply.
+        for (int pos = 0; pos < maxSeqLen; pos++)
+        {
+            int tableBase = pos * halfDim;
+            for (int i = 0; i < halfDim; i++)
+            {
+                float angle = pos * invFreq[i];
+                cosTable[tableBase + i] = PortableMath.Cos(angle) * mscaleMultiplier;
+                sinTable[tableBase + i] = PortableMath.Sin(angle) * mscaleMultiplier;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Builds the YaRN ramped per-pair inverse-frequency vector — the frequency half of
+    /// <see cref="PrecomputeFrequencyTableYarn"/>, factored out so GPU backends can upload
+    /// the same <c>headDim / 2</c> floats and evaluate <c>cos/sin(pos * invFreq[i]) * mscale</c>
+    /// in-kernel at arbitrary positions, instead of either re-deriving the ramp (drift) or
+    /// uploading a position-indexed table bounded by some assumed max sequence length.
+    /// This is the single source of truth for the ramp math: <see cref="PrecomputeFrequencyTableYarn"/>
+    /// calls it too, so CPU and GPU cannot diverge.
+    /// </summary>
+    /// <param name="headDim">Dimension per attention head (must be even).</param>
+    /// <param name="theta">Base frequency (e.g. 10000.0).</param>
+    /// <param name="scalingFactor">YaRN context-length scaling factor (HF <c>rope_scaling.factor</c>).</param>
+    /// <param name="originalMaxPositionEmbeddings">Baseline context length YaRN ramps around.</param>
+    /// <param name="betaFast">Rotation threshold above which dims extrapolate at the original base (HF default 32).</param>
+    /// <param name="betaSlow">Rotation threshold below which dims interpolate at the scaled base (HF default 1).</param>
+    /// <param name="invFreq">Destination, length &gt;= <c>headDim / 2</c>.</param>
+    public static void ComputeYarnInverseFrequencies(
+        int headDim, float theta, float scalingFactor, int originalMaxPositionEmbeddings,
+        float betaFast, float betaSlow, Span<float> invFreq)
+    {
+        if (headDim <= 0 || headDim % 2 != 0)
+            throw new ArgumentException($"headDim must be a positive even number, got {headDim}", nameof(headDim));
+        int halfDim = headDim / 2;
+        if (invFreq.Length < halfDim)
+            throw new ArgumentException(
+                $"invFreq length {invFreq.Length} must be >= headDim/2 ({halfDim}).", nameof(invFreq));
+
         // yarn_find_correction_range in HF returns clamped integer bounds in the
         // FULL-dim space [0, headDim-1], but the linear ramp is applied over
         // dim // 2 entries (i.e. halfDim). That matches the mixing formula
@@ -221,15 +275,11 @@ public static class RoPE
         high = MathF.Min(high, headDim - 1.0f);
         if (low == high) high += 0.001f; // prevent divide-by-zero per HF yarn_linear_ramp_mask
 
-        // Build per-halfDim inv_freq[i].
-        Span<float> invFreq = halfDim * sizeof(float) <= StackAllocThreshold
-            ? stackalloc float[halfDim]
-            : new float[halfDim];
         for (int i = 0; i < halfDim; i++)
         {
             float exponent = 2.0f * i / headDim;
-            float freqExtra = 1.0f / MathF.Pow(theta, exponent);
-            float freqInter = 1.0f / (scalingFactor * MathF.Pow(theta, exponent));
+            float freqExtra = 1.0f / PortableMath.Pow(theta, exponent);
+            float freqInter = 1.0f / (scalingFactor * PortableMath.Pow(theta, exponent));
             // Linear ramp on [low, high] in half-dim index space.
             float linear = (i - low) / (high - low);
             float mask = linear < 0.0f ? 0.0f : (linear > 1.0f ? 1.0f : linear);
@@ -238,18 +288,26 @@ public static class RoPE
             //   inv_freq = freq_inter * linear_ramp + freq_extra * (1 - linear_ramp)
             invFreq[i] = freqInter * mask + freqExtra * (1.0f - mask);
         }
+    }
 
-        // Fill cos/sin with optional mscale pre-multiply.
-        for (int pos = 0; pos < maxSeqLen; pos++)
-        {
-            int tableBase = pos * halfDim;
-            for (int i = 0; i < halfDim; i++)
-            {
-                float angle = pos * invFreq[i];
-                cosTable[tableBase + i] = MathF.Cos(angle) * mscaleMultiplier;
-                sinTable[tableBase + i] = MathF.Sin(angle) * mscaleMultiplier;
-            }
-        }
+    /// <summary>
+    /// Resolves the dense-YaRN rotation for a model whose RoPE rotates <paramref name="ropeDim"/> dims
+    /// (issue #1101): the ramped inverse frequencies and the cos/sin multiplier, or <c>(null, 1)</c> when
+    /// <see cref="RoPEConfig.IsDenseYarnActive"/> is false. The ramp runs over the ROTARY dim, as HF does
+    /// (<c>dim = head_dim * partial_rotary_factor</c>): for Bonsai-2 / Qwen3.8 that is 64, not the 256-wide head.
+    /// One helper for the CPU table, the CUDA upload and the Vulkan upload, so the hosts cannot drift.
+    /// </summary>
+    /// <param name="rope">The model's RoPE configuration, or null.</param>
+    /// <param name="architecture">Selects the mscale convention (<see cref="RoPEConfig.ComputeYarnMscaleMultiplier"/>).</param>
+    /// <param name="ropeDim">Rotated dims per head (even).</param>
+    /// <returns>The <c>ropeDim / 2</c> inverse frequencies (null when YaRN is off) and the cos/sin multiplier.</returns>
+    public static (float[]? InvFreq, float Mscale) ResolveDenseYarn(RoPEConfig? rope, Architecture architecture, int ropeDim)
+    {
+        if (rope is not { IsDenseYarnActive: true } r)
+            return (null, 1.0f);
+        float[] invFreq = new float[ropeDim / 2];
+        ComputeYarnInverseFrequencies(ropeDim, r.Theta, r.ScalingFactor, r.OrigMaxSeqLen, r.BetaFast, r.BetaSlow, invFreq);
+        return (invFreq, r.ComputeYarnMscaleMultiplier(architecture));
     }
 
     /// <summary>
@@ -279,10 +337,10 @@ public static class RoPE
         {
             for (int i = 0; i < halfDim; i++)
             {
-                float freq = 1.0f / MathF.Pow(theta, 2.0f * i / headDim);
+                float freq = 1.0f / PortableMath.Pow(theta, 2.0f * i / headDim);
                 float angle = pos * freq;
-                cosTable[pos * halfDim + i] = MathF.Cos(angle);
-                sinTable[pos * halfDim + i] = MathF.Sin(angle);
+                cosTable[pos * halfDim + i] = PortableMath.Cos(angle);
+                sinTable[pos * halfDim + i] = PortableMath.Sin(angle);
             }
         }
     }

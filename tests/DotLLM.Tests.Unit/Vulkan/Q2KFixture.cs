@@ -22,11 +22,18 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// <c>[scales[16]][qs[64]][d:fp16][dmin:fp16]</c>.
 /// </para>
 /// <para>
-/// Per-element decode (mirrors the CPU oracle): for sub-block <c>j</c> in
-/// <c>[0, 16)</c> and element <c>l</c> in <c>[0, 16)</c>:
-/// <c>q2 = (qs[t/4] &gt;&gt; ((t%4)*2)) &amp; 3</c>,
+/// Per-element decode (mirrors the CPU oracle): for in-super-block index
+/// <c>t</c> in <c>[0, 256)</c>, sub-block <c>j = t &gt;&gt; 4</c>:
+/// <c>q2 = (qs[32*(t&gt;&gt;7) + (t&amp;31)] &gt;&gt; (2*((t&gt;&gt;5)&amp;3))) &amp; 3</c>,
 /// <c>scale = scales[j] &amp; 0xF</c>, <c>dmCoef = (scales[j] &gt;&gt; 4) &amp; 0xF</c>,
 /// <c>value = d * scale * q2 - dmin * dmCoef</c>.
+/// </para>
+/// <para>
+/// <b>The element ordering is transposed</b> (issue #498): each 128-element half
+/// consumes 32 <c>qs</c> bytes and each byte carries FOUR elements 32 apart, exactly
+/// as in Q3_K. This fixture originally packed the obvious-looking
+/// <c>qs[t/4] @ (t%4)*2</c> layout, which agreed with the (then equally wrong)
+/// kernels — producer and consumer cancelling out is why the bug survived.
 /// </para>
 /// <para>
 /// The fixture quantiser is intentionally NOT placed in <c>DotLLM.Cpu</c> —
@@ -178,17 +185,23 @@ internal static unsafe class Q2KFixture
         {
             dstSuper[j] = (byte)((sc4[j] & 0xF) | ((mn4[j] & 0xF) << 4));
         }
-        // qs[64] @ 16: 4 elements per byte.
+        // qs[64] @ 16: 4 elements per byte, TRANSPOSED exactly as llama.cpp's
+        // quantize_row_q2_K_ref does it — each 128-element half fills 32 bytes and
+        // each byte carries elements l, l+32, l+64, l+96 of that half:
+        //   qs[j/4 + l] = L[j+l] | L[j+l+32]<<2 | L[j+l+64]<<4 | L[j+l+96]<<6
+        // (j steps 0, 128). The inverse is the DequantizeQ2_K addressing
+        // qs[32*(t>>7) + (t&31)] @ 2*((t>>5)&3) — see issue #498.
         byte* qsPtr = dstSuper + 16;
-        for (int b = 0; b < 64; b++)
+        for (int j = 0; j < Q2KGroupSize; j += 128)
         {
-            int t0 = b * 4;
-            byte packed = (byte)(
-                (q2vals[t0 + 0] & 3) |
-                ((q2vals[t0 + 1] & 3) << 2) |
-                ((q2vals[t0 + 2] & 3) << 4) |
-                ((q2vals[t0 + 3] & 3) << 6));
-            qsPtr[b] = packed;
+            for (int l = 0; l < 32; l++)
+            {
+                qsPtr[j / 4 + l] = (byte)(
+                    (q2vals[j + l] & 3) |
+                    ((q2vals[j + l + 32] & 3) << 2) |
+                    ((q2vals[j + l + 64] & 3) << 4) |
+                    ((q2vals[j + l + 96] & 3) << 6));
+            }
         }
         // d / dmin @ 80, 82.
         Unsafe.WriteUnaligned(dstSuper + 80, (Half)dF);
@@ -283,8 +296,9 @@ internal static unsafe class Q2KFixture
                         for (int l = 0; l < 16; l++)
                         {
                             int t = sub * 16 + l;
-                            int qByte = qs[t >> 2];
-                            int q2 = (qByte >> ((t & 3) * 2)) & 0x3;
+                            // Transposed addressing, per issue #498.
+                            int qByte = qs[((t >> 7) << 5) | (t & 31)];
+                            int q2 = (qByte >> (((t >> 5) & 3) << 1)) & 0x3;
                             float w = sc * q2 - mn;
                             sum += w * x[outBase + l];
                         }
@@ -336,8 +350,9 @@ internal static unsafe class Q2KFixture
                             for (int l = 0; l < 16; l++)
                             {
                                 int tIdx = sub * 16 + l;
-                                int qByte = qs[tIdx >> 2];
-                                int q2 = (qByte >> ((tIdx & 3) * 2)) & 0x3;
+                                // Transposed addressing, per issue #498.
+                                int qByte = qs[((tIdx >> 7) << 5) | (tIdx & 31)];
+                                int q2 = (qByte >> (((tIdx >> 5) & 3) << 1)) & 0x3;
                                 float w = sc * q2 - mn;
                                 sum += w * inputB[bRowBase + outBase + l];
                             }

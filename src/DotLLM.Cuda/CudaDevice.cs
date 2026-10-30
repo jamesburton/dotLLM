@@ -32,7 +32,7 @@ public sealed class CudaDevice
     {
         Ordinal = ordinal;
         Name = name;
-        TotalMemoryBytes = totalMem;
+        TotalMemoryBytes = DotLLM.Core.Configuration.DeviceMemoryBudget.ClampSimulatedCapacity(totalMem);   // #1295
         ComputeCapabilityMajor = ccMajor;
         ComputeCapabilityMinor = ccMinor;
         MultiprocessorCount = smCount;

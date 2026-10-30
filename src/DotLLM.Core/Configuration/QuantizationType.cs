@@ -49,6 +49,14 @@ public enum QuantizationType
     /// <summary>6-bit K-quant, super-block of 256.</summary>
     Q6_K = 14,
 
+    /// <summary>
+    /// 32-bit signed integer tensor (ggml <c>GGML_TYPE_I32</c> = 26). Not a weight-quantization
+    /// format: it carries index lists and bit-packed payloads (e.g. the community NanoQuant GGUF stores
+    /// its <c>nq_u</c>/<c>nq_v</c> sign words and <c>nq_salient_idx</c> as I32). 4 bytes per element,
+    /// little-endian. The matmul kernels do not accept it; consumers read the raw words.
+    /// </summary>
+    I32 = 26,
+
     /// <summary>4-bit non-linear importance quantization, block size 32.</summary>
     IQ4_NL = 20,
 
@@ -97,6 +105,14 @@ public enum QuantizationType
     IQ1_S = 19,
 
     /// <summary>
+    /// 1.75 bpw importance quantization (ggml <c>IQ1_M</c>, id 29; issue #823). Super-block of 256 elements stored in 56 bytes:
+    /// <c>qs[32]@0 + qh[16]@32 + scales[4 x uint16]@48</c>. There is no separate fp16 super-scale: it is spread over the top nibbles of
+    /// the four <c>scales</c> words. Each 32-element sub-block has two 3-bit sub-scales (<c>dl = d * (2*s + 1)</c>) and four 8-element
+    /// groups indexing the shared iq1s grid with an 11-bit index (<c>qs | 3 bits of qh &lt;&lt; 8</c>) plus a per-group delta sign.
+    /// </summary>
+    IQ1_M = 29,
+
+    /// <summary>
     /// 3-bit importance quantization, "extra extra small" (3.0625 bpw).
     /// Super-block of 256 elements stored in 98 bytes:
     /// <c>d(Half@0) + qs[64]@2 + scales_and_signs[32]@66</c>. The first 64
@@ -141,6 +157,15 @@ public enum QuantizationType
     MXFP4 = 39,
 
     /// <summary>
+    /// NVFP4 (NVIDIA FP4, issue #1038): blocks of 64 elements stored as <c>d[4]</c> (one unsigned
+    /// UE4M3 scale per 16-element sub-block) followed by <c>qs[32]</c> (E2M1 nibbles indexing the same
+    /// doubled table as <see cref="MXFP4"/>) — 36 bytes, 4.5 bpw. Matches llama.cpp's
+    /// <c>GGML_TYPE_NVFP4</c> = 40. A tensor of this type usually has a sibling <c>X.scale</c>
+    /// (F32, one element) that multiplies the matmul output; loaders that do not apply it must refuse.
+    /// </summary>
+    NVFP4 = 40,
+
+    /// <summary>
     /// PrismML ternary weights (Bonsai model family). Same 2-bit code packing as
     /// <see cref="I2_S"/> (4 codes/byte, codes 0→-1, 1→0, 2→+1) but with a per-128-element
     /// <c>fp16</c> scale instead of I2_S's single per-tensor <c>fp32</c> scale — block layout
@@ -155,5 +180,34 @@ public enum QuantizationType
     /// hypothesis (codes-then-scale, or separate contiguous code/scale regions) produces
     /// invalid codes and/or wildly inconsistent scale magnitudes.
     /// </summary>
-    PQ2_0 = 42
+    PQ2_0 = 42,
+
+    /// <summary>
+    /// Upstream ggml <c>Q2_0</c> (issue #823): 64-element blocks of <c>fp16 d</c> + 16 bytes of 2-bit codes (2.25 bpw, 18 bytes/block);
+    /// element j of a block is <c>((qs[j/4] &gt;&gt; (2*(j%4))) &amp; 3) - 1) * d</c> (codes 0..3 = -1, 0, +1, +2). On disk it shares GGUF
+    /// type id 42 with <see cref="PQ2_0"/>, so the id is not enough: <c>GgufReader.ReclassifyUpstreamQ2_0</c> decides from the tensor's
+    /// on-disk extent and re-labels the tensor with this internal value (242, outside the GGUF id range). Used for the ISTA
+    /// Qwen3.8-Flash-Next expert down banks.
+    /// </summary>
+    Q2_0 = 242,
+
+    /// <summary>
+    /// LittleBit factorized linear (issue #864): not a GGUF type. The weight "pointer" is a handle into
+    /// <c>FactorizedWeights</c> naming a sign-factor composite (<c>diag(u1) U diag(l) V diag(v2)</c>, primary plus
+    /// residual path), CPU only. Id 100 is outside the GGUF range.
+    /// </summary>
+    LittleBit = 100,
+
+    /// <summary>
+    /// PrismML ternary weights at group 128 with dense base-3 trit packing
+    /// (<c>GGML_TYPE_PTQ1_0 = 143</c> in the PrismML llama.cpp fork). Block layout
+    /// (<c>block_ptq1_0</c>, 28 bytes per 128 weights = 1.75 bpw):
+    /// <c>qs[24]</c> (5 trits per byte → 120 values), then <c>qh[2]</c> (4 trits per byte →
+    /// 8 values), then the <c>fp16</c> scale — <b>scale LAST</b>, unlike
+    /// <see cref="PQ2_0"/> where it comes first.
+    /// Same base-3 packing as upstream <c>TQ1_0</c> (type 34) but with one scale per 128
+    /// weights instead of per 256, which is what makes it lossless for checkpoints that are
+    /// already ternary at group 128.
+    /// </summary>
+    PTQ1_0 = 143
 }

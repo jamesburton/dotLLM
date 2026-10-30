@@ -62,8 +62,8 @@ internal sealed class DebugEmbedLookupCommand : Command<DebugEmbedLookupCommand.
         }
 
         int hiddenSize = config.HiddenSize;
-        nint dataBase = gguf.DataBasePointer;
-        nint embPtr = dataBase + (nint)embDesc.DataOffset;
+        var dataBase = new GgufDataBase(gguf);
+        nint embPtr = dataBase.Of(embDesc);
         var qt = embDesc.QuantizationType;
 
         // Dequantize one row

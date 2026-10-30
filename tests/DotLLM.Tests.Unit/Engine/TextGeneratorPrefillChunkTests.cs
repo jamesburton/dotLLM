@@ -85,6 +85,115 @@ public sealed class TextGeneratorPrefillChunkTests
         Assert.Equal(new[] { 3, 3, 3, 1 }, chunked.Calls.Take(4).Select(c => c.Length).ToArray());
     }
 
+    /// <summary>
+    /// #1288: with a timing sink installed, a chunked prefill reports live progress from this request's flow (the pulse
+    /// timer carries the execution context) and the finished request writes exactly one timing line over the prompt.
+    /// </summary>
+    [Fact]
+    public void TimingLog_PulsesDuringChunkedPrefill_AndWritesOneTimingLine()
+    {
+        var mine = new AsyncLocal<bool> { Value = true };
+        var lines = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        var previousSink = RequestTimingLog.Sink;
+        var previousInterval = RequestTimingLog.PulseInterval;
+        RequestTimingLog.Sink = line =>
+        {
+            if (mine.Value) lines.Enqueue(line); // parallel tests share the static sink; keep only this flow's lines
+        };
+        RequestTimingLog.PulseInterval = Timeout.InfiniteTimeSpan;   // no timer: the model ticks the pulse itself (#1314)
+        PrefillPulse? pulse = null;
+        RequestTimingLog.t_pulseCreated = p => pulse = p;
+        try
+        {
+            using var model = new RecordingModel(argmaxToken: 3) { OnPrefillForward = () => pulse?.Pulse() };
+            new TextGenerator(model, new StubTokenizer(), prefillChunkSize: 2)
+                .Generate("prompt", new InferenceOptions { MaxTokens = 3, Temperature = 0f });
+        }
+        finally
+        {
+            RequestTimingLog.t_pulseCreated = null;
+            RequestTimingLog.Sink = previousSink;
+            RequestTimingLog.PulseInterval = previousInterval;
+        }
+
+        // Five chunks of two: the pulse ticked before chunk i sees exactly 2*(i-1) tokens completed. Counts, not durations.
+        var progress = lines.Where(l => l.StartsWith("prefill: ", StringComparison.Ordinal)).Select(l => l.Split(' ')[1]).ToArray();
+        Assert.Equal(new[] { $"0/{PromptLen}", $"2/{PromptLen}", $"4/{PromptLen}", $"6/{PromptLen}", $"8/{PromptLen}" }, progress);
+        var timing = Assert.Single(lines, l => l.StartsWith("timing: ", StringComparison.Ordinal));
+        Assert.Contains($"/ {PromptLen} tokens", timing);
+    }
+
+    /// <summary>#1291: the fake model always argmaxes token 3, so the repeat guard trips on exactly the N-th token.</summary>
+    [Theory]
+    [InlineData(4, 4)]
+    [InlineData(0, 12)]
+    [InlineData(13, 12)]
+    public void RepeatGuard_EndsAsLength_OnTheNthIdenticalToken(int guard, int expectedTokens)
+    {
+        using var model = new RecordingModel(argmaxToken: 3);
+        var response = new TextGenerator(model, new StubTokenizer())
+            .Generate("prompt", new InferenceOptions { MaxTokens = 12, Temperature = 0f, RepeatGuardLimit = guard });
+
+        Assert.Equal(FinishReason.Length, response.FinishReason);
+        Assert.Equal(expectedTokens, response.GeneratedTokenCount);
+    }
+
+    /// <summary>#1291: the streaming path builds its own stop list; the guard must be in it too.</summary>
+    [Fact]
+    public async Task RepeatGuard_AppliesToStreaming()
+    {
+        using var model = new RecordingModel(argmaxToken: 3);
+        GenerationToken last = default!;
+        await foreach (var t in new TextGenerator(model, new StubTokenizer())
+            .GenerateStreamingTokensAsync("prompt", new InferenceOptions { MaxTokens = 12, Temperature = 0f, RepeatGuardLimit = 5 }))
+            last = t;
+
+        Assert.Equal(FinishReason.Length, last.FinishReason);
+        Assert.Equal(5, last.GeneratedTokenCount);
+    }
+
+    /// <summary>
+    /// #1292 end to end through the generator: after the budget the message and the close tag are forced, and the answer
+    /// then runs on to max_tokens (it is not cut off by the budget).
+    /// </summary>
+    [Fact]
+    public void ThinkingBudget_ForcesMessageAndCloseTag_ThenTheAnswerContinues()
+    {
+        using var model = new RecordingModel(argmaxToken: 3);
+        var response = new TextGenerator(model, new TagTokenizer()).Generate("prompt", new InferenceOptions
+        {
+            MaxTokens = 8,
+            Temperature = 0f,
+            ThinkingBudget = new ThinkingBudget(2, "<think>", "</think>", StartsInside: true, "Done."),
+        });
+
+        Assert.Equal(new[] { 3, 3, 14, 13, 3, 3, 3, 3 }, response.GeneratedTokenIds);
+        Assert.Equal(FinishReason.Length, response.FinishReason);
+    }
+
+    /// <summary>StubTokenizer plus fixed ids for the think tags (12, 13) and the budget message (14).</summary>
+    private sealed class TagTokenizer : ITokenizer
+    {
+        private readonly StubTokenizer _inner = new();
+
+        public int VocabSize => _inner.VocabSize;
+        public int BosTokenId => _inner.BosTokenId;
+        public int EosTokenId => _inner.EosTokenId;
+
+        public int[] Encode(string text) => text switch
+        {
+            "<think>" => [12],
+            "</think>" => [13],
+            "Done." => [14],
+            _ => _inner.Encode(text),
+        };
+
+        public string Decode(ReadOnlySpan<int> tokenIds) => _inner.Decode(tokenIds);
+        public string Decode(ReadOnlySpan<int> tokenIds, bool stripBosSpace) => _inner.Decode(tokenIds);
+        public string DecodeToken(int tokenId) => _inner.DecodeToken(tokenId);
+        public int CountTokens(string text) => _inner.CountTokens(text);
+    }
+
     // ── Fakes ──
 
     private sealed record ForwardCall(int Length, int FirstPosition);
@@ -113,6 +222,9 @@ public sealed class TextGeneratorPrefillChunkTests
 
         public List<ForwardCall> Calls { get; } = new();
 
+        /// <summary>Called at the start of each prefill Forward (multi-token calls only).</summary>
+        public Action? OnPrefillForward { get; init; }
+
         public RecordingModel(int argmaxToken) => _argmaxToken = argmaxToken;
 
         public ModelConfig Config => new()
@@ -137,6 +249,8 @@ public sealed class TextGeneratorPrefillChunkTests
             int deviceId, IKvCache? kvCache)
         {
             Calls.Add(new ForwardCall(tokenIds.Length, positions[0]));
+            if (tokenIds.Length > 1)
+                OnPrefillForward?.Invoke();
 
             int batchSize = tokenIds.Length;
             long totalFloats = (long)batchSize * VocabSize;

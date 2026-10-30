@@ -15,6 +15,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// small relative drift vs the legacy kernel is expected and tolerated.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaMmqKernelTests
 {
     private readonly ITestOutputHelper _out;

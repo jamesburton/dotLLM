@@ -155,12 +155,6 @@ public static class PerplexityEvaluator
             tokens.Length, context);
         int prefix = plan.UnscoredPrefix;
 
-        if (!model.ReturnsAllRows)
-            throw new NotSupportedException(
-                "Sliding-window mode requires a backend that returns all rows. Use PerplexityMode.TeacherForced " +
-                "for last-row-only backends — re-prefilling per target inside a window would be O(n^2) and is " +
-                "already what the growing-prefix path does.");
-
         int vocab = model.VocabSize;
         var positions = new int[context];
         var accumulator = new NllAccumulator();
@@ -177,6 +171,18 @@ public static class PerplexityEvaluator
         // The plan applies the substitution so that the cycling driver cannot disagree about it.
         var windowBuffer = new int[context];
 
+        // Debug aid (#737): DOTLLM_PPL_NLL_DUMP=<path> writes one "window pos token nll" line per scored
+        // token, for per-token diffing against llama.cpp's --kl-divergence-base log-probs.
+        string? nllDumpPath = Environment.GetEnvironmentVariable("DOTLLM_PPL_NLL_DUMP");
+        using StreamWriter? nllDump = string.IsNullOrEmpty(nllDumpPath) ? null : new StreamWriter(nllDumpPath);
+
+        // Debug aid (#862): DOTLLM_PPL_LOGITS_DUMP=<path> appends every window's raw float32 logits (all rows,
+        // [context][vocab], row i predicts token i+1) so a cross-engine KL can be computed offline over the
+        // FULL vocabulary (not a top-k truncation). Multi-GB for long windows: point it at scratch.
+        string? logitsDumpPath = Environment.GetEnvironmentVariable("DOTLLM_PPL_LOGITS_DUMP");
+        using FileStream? logitsDump = string.IsNullOrEmpty(logitsDumpPath)
+            ? null : new FileStream(logitsDumpPath, FileMode.Create, FileAccess.Write, FileShare.Read, 1 << 20);
+
         for (int w = 0; w < plan.WindowCount; w++)
         {
             int start = plan.StartOf(w);
@@ -185,9 +191,40 @@ public static class PerplexityEvaluator
 
             // Every window is an independent sequence (positions restart at 0), so the previous
             // window's recurrent state must not carry into this one — see #261.
+            if (!model.ReturnsAllRows)
+            {
+                // Last-row-only backend (#793): each scored target t gets its own prefill over window[..t-start]
+                // (positions 0..), whose final row predicts it. Same targets, geometry and BOS substitution as the
+                // all-rows path, so per-window PPL stays pairable with llama-perplexity. O(n^2) forwards, but only
+                // the scored half of the window is replayed.
+                windows++;
+                double gpNll = 0;
+                int gpScored = 0;
+                for (int t = start + prefix; t < start + context; t++)
+                {
+                    model.ResetState();
+                    using ITensor lastRow = model.Forward(window[..(t - start)], positions.AsSpan(0, t - start));
+                    var rowSpan = new ReadOnlySpan<float>((void*)lastRow.DataPointer, vocab);
+                    double nll = -LogProb.OfTarget(rowSpan, tokens[t]);
+                    gpNll += nll;
+                    gpScored++;
+                    accumulator.Add(nll);
+                    if (nllDump is not null)
+                        nllDump.WriteLine(FormattableString.Invariant($"{windows - 1} {t - start} {tokens[t]} {nll:R}"));
+                }
+                onWindow?.Invoke(windows - 1, Math.Exp(gpNll / gpScored), gpScored);
+                continue;
+            }
+
             model.ResetState();
             using ITensor logits = model.Forward(window, positions);
             windows++;
+            if (logitsDump is not null)
+            {
+                long bytes = (long)context * vocab * sizeof(float);
+                for (long off = 0; off < bytes; off += 1 << 30)
+                    logitsDump.Write(new ReadOnlySpan<byte>((void*)(logits.DataPointer + (nint)off), (int)Math.Min(1 << 30, bytes - off)));
+            }
 
             double windowNll = 0;
             int windowScored = 0;
@@ -202,6 +239,8 @@ public static class PerplexityEvaluator
                 windowNll += nll;
                 windowScored++;
                 accumulator.Add(nll);
+                if (nllDump is not null)
+                    nllDump.WriteLine(FormattableString.Invariant($"{windows - 1} {t - start} {tokens[t]} {nll:R}"));
             }
 
             onWindow?.Invoke(windows - 1, Math.Exp(windowNll / windowScored), windowScored);

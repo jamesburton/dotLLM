@@ -126,6 +126,10 @@ const modalDecodeThreads = $('#modal-decode-threads');
 const modalStatus = $('#modal-status');
 const modalCancelBtn = $('#modal-cancel-btn');
 const modalLoadBtn = $('#modal-load-btn');
+const modalMtpSection = $('#modal-mtp-section');
+const modalMtpEnabled = $('#modal-mtp-enabled');
+const modalDeviceHint = $('#modal-device-hint');
+const modalDeviceGpuLabel = $('#modal-device-gpu-label');
 const modalSpeculativeSection = $('#modal-speculative-section');
 const modalSpeculativeSelect = $('#modal-speculative-select');
 const modalSpeculativeInfo = $('#modal-speculative-info');
@@ -145,6 +149,14 @@ async function fetchAvailableModels() {
     return res.json();
 }
 
+// (#757) Devices the server can actually serve; recommended_device uses the same ordering as `--device auto`.
+async function fetchDevices(modelBytes) {
+    try {
+        const res = await fetch('/v1/devices' + (modelBytes ? `?model_bytes=${modelBytes}` : ''));
+        return res.ok ? res.json() : null;
+    } catch { return null; }
+}
+
 async function inspectModel(fullPath) {
     const res = await fetch(`/v1/models/inspect?path=${encodeURIComponent(fullPath)}`);
     return res.ok ? res.json() : null;
@@ -152,15 +164,18 @@ async function inspectModel(fullPath) {
 
 async function loadModel(model, quant, opts) {
     const body = { model };
+    // Exact file the user picked/inspected; repo+quant resolution can choose a different GGUF in the same repo.
+    if (opts?.path) body.path = opts.path;
     if (quant) body.quant = quant;
     if (opts?.device) body.device = opts.device;
-    if (opts?.device === 'gpu' && opts?.gpuLayers != null) body.gpu_layers = opts.gpuLayers;
-    if (opts?.cacheTypeK && opts.cacheTypeK !== 'f32') body.cache_type_k = opts.cacheTypeK;
-    if (opts?.cacheTypeV && opts.cacheTypeV !== 'f32') body.cache_type_v = opts.cacheTypeV;
+    if (opts?.isGpu && opts?.gpuLayers != null) body.gpu_layers = opts.gpuLayers;
+    if (opts?.cacheTypeK && opts.cacheTypeK !== 'auto') body.cache_type_k = opts.cacheTypeK;
+    if (opts?.cacheTypeV && opts.cacheTypeV !== 'auto') body.cache_type_v = opts.cacheTypeV;
     if (opts?.threads) body.threads = opts.threads;
     if (opts?.decodeThreads) body.decode_threads = opts.decodeThreads;
     if (opts?.speculativeModel) body.speculative_model = opts.speculativeModel;
     if (opts?.speculativeK) body.speculative_k = opts.speculativeK;
+    if (opts?.mtp != null) body.mtp = opts.mtp;
     const res = await fetch('/v1/models/load', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -185,6 +200,10 @@ async function* streamChat(messages, params) {
     const body = {
         messages,
         stream: true,
+        // The server no longer carries usage on the final content chunk (OpenAI puts it in a
+        // dedicated chunk, and only on request) — so ask for it explicitly, or the token
+        // counts in the stats line go blank.
+        stream_options: { include_usage: true },
         temperature: params.temperature,
         top_p: params.top_p,
         top_k: params.top_k,
@@ -203,6 +222,17 @@ async function* streamChat(messages, params) {
     if (params.logprobs) {
         body.logprobs = true;
         body.top_logprobs = params.top_logprobs || 5;
+    }
+    // Thinking switch (#767): null = the model's default; true/false -> the chat template's enable_thinking.
+    if (params.enable_thinking === true || params.enable_thinking === false) {
+        body.enable_thinking = params.enable_thinking;
+    }
+    // Reasoning effort (template variable) and thinking budget (server forces the close tag after N thinking tokens).
+    if (params.reasoning_effort) {
+        body.reasoning_effort = params.reasoning_effort;
+    }
+    if (params.thinking_budget_tokens != null) {
+        body.thinking_budget_tokens = params.thinking_budget_tokens;
     }
 
     const response = await fetch('/v1/chat/completions', {
@@ -235,6 +265,9 @@ async function* streamChat(messages, params) {
                     const chunk = JSON.parse(data);
                     const choice = chunk.choices?.[0];
 
+                    if (choice?.delta?.reasoning_content) {
+                        yield { type: 'reasoning', content: choice.delta.reasoning_content };
+                    }
                     if (choice?.delta?.content) {
                         yield { type: 'delta', content: choice.delta.content, logprobs: choice?.logprobs?.content };
                     }
@@ -415,6 +448,8 @@ function extractQuantFromPath(modelPath) {
 }
 
 function buildModelBadgeText(config) {
+    if (config?.activity?.state === 'loading')
+        return `loading ${config.activity.loading_model_id} (${Math.round(config.activity.loading_elapsed_seconds)}s)`;
     if (!config || !config.is_ready) return 'no model loaded';
 
     const parts = [];
@@ -435,6 +470,9 @@ function buildModelBadgeText(config) {
     } else {
         parts.push('GPU');
     }
+    if (config.device_fallback_warning) parts.push('CPU FALLBACK (slow): ' + config.device_fallback_warning);
+
+    if (config.mtp_active) parts.push('MTP');
 
     // Draft model indicator
     if (config.draft_model_path) {
@@ -473,7 +511,23 @@ function hideWelcome() {
     welcomeEl.classList.add('hidden');
 }
 
-function addMessageToDOM(role, content, stats, rawPrompt, rawResponse) {
+// Collapsible "thinking" block (#767). Open while the model is still reasoning, collapsed once the answer starts.
+function createReasoningBlock(text, open) {
+    const details = document.createElement('details');
+    details.className = 'reasoning-block';
+    details.open = !!open;
+    const summary = document.createElement('summary');
+    summary.className = 'reasoning-summary';
+    summary.textContent = open ? 'Thinking\u2026' : 'Thought process';
+    details.appendChild(summary);
+    const body = document.createElement('div');
+    body.className = 'reasoning-body';
+    body.textContent = text || '';
+    details.appendChild(body);
+    return details;
+}
+
+function addMessageToDOM(role, content, stats, rawPrompt, rawResponse, reasoning) {
     hideWelcome();
 
     const wrapper = document.createElement('div');
@@ -492,6 +546,10 @@ function addMessageToDOM(role, content, stats, rawPrompt, rawResponse) {
         (role === 'user' ? 'text-zinc-500' : 'text-accent/60');
     label.textContent = role;
     bubble.appendChild(label);
+
+    if (role === 'assistant' && reasoning) {
+        bubble.appendChild(createReasoningBlock(reasoning, false));
+    }
 
     // Content
     const contentEl = document.createElement('div');
@@ -762,9 +820,110 @@ function syncSettingsFromState() {
     setVal('opt-top-k', d.top_k, 'topk-val');
     setVal('opt-min-p', d.min_p, 'minp-val', v => Number(v).toFixed(2));
     setVal('opt-rep-penalty', d.repetition_penalty, 'rep-val', v => Number(v).toFixed(2));
-    setVal('opt-max-tokens', d.max_tokens);
+    // Max tokens is left empty ("auto") unless the user set one; the server default is shown as the hint.
+    for (const id of ['opt-max-tokens', 'q-maxtok']) {
+        const el = $(`#${id}`);
+        if (el) el.placeholder = `auto (${d.max_tokens})`;
+    }
     setVal('opt-seed', d.seed ?? '');
     $('#opt-verbose').checked = state.verbose;
+    updateGenControlsVisibility();
+}
+
+// ── GENERATION CONTROLS (thinking / effort / budget / max tokens) ──
+// Each control exists twice: in the Settings panel (opt-*) and in the bar above the input (q-*). They mirror each
+// other, apply to the very next request (no "Apply Defaults" needed) and persist in localStorage.
+
+const GEN_PAIRS = [
+    ['opt-thinking', 'q-thinking'],
+    ['opt-effort', 'q-effort'],
+    ['opt-budget', 'q-budget'],
+    ['opt-max-tokens', 'q-maxtok'],
+];
+const GEN_STORAGE_KEY = 'dotllm-gen-opts';
+// With a thinking model and no explicit Max Tokens, leave room for the thinking block AND the answer.
+const AUTO_THINKING_MAX_TOKENS = 16384;
+const MAX_TOKENS_CEILING = 131072;
+
+function setGenOpt(optId, value) {
+    const pair = GEN_PAIRS.find(p => p[0] === optId);
+    for (const id of pair) {
+        const el = $(`#${id}`);
+        if (el) el.value = value;
+    }
+    saveGenOpts();
+    updateGenControlsVisibility();
+}
+
+function saveGenOpts() {
+    try {
+        const o = {};
+        for (const [optId] of GEN_PAIRS) o[optId] = $(`#${optId}`)?.value ?? '';
+        localStorage.setItem(GEN_STORAGE_KEY, JSON.stringify(o));
+    } catch { /* localStorage unavailable */ }
+}
+
+function loadGenOpts() {
+    let o = {};
+    try { o = JSON.parse(localStorage.getItem(GEN_STORAGE_KEY) || '{}') || {}; } catch { /* ignore */ }
+    for (const [optId, qId] of GEN_PAIRS) {
+        const v = o[optId];
+        if (typeof v !== 'string') continue;
+        for (const id of [optId, qId]) {
+            const el = $(`#${id}`);
+            if (el) el.value = v;
+        }
+    }
+}
+
+function initGenControls() {
+    for (const [optId, qId] of GEN_PAIRS) {
+        for (const id of [optId, qId]) {
+            const el = $(`#${id}`);
+            if (!el) continue;
+            const handler = () => setGenOpt(optId, el.value);
+            el.addEventListener('input', handler);
+            el.addEventListener('change', handler);
+        }
+    }
+    loadGenOpts();
+    updateGenControlsVisibility();
+}
+
+/** What the loaded model's chat template can do (/props reasoning, #1106); null when the server does not say. */
+function reasoningCaps() {
+    return state.config?.reasoning ?? null;
+}
+
+function thinkingMode() {
+    return $('#opt-thinking')?.value ?? 'default';   // default | on | off
+}
+
+function updateGenControlsVisibility() {
+    const caps = reasoningCaps();
+    // Unknown (older server / no template) -> show everything; otherwise only what the template reads.
+    const show = {
+        thinking: !caps || caps.enable_thinking || caps.thinking_block,
+        effort: !caps || caps.reasoning_effort,
+        budget: !caps || caps.thinking_block,
+        maxtok: true,
+    };
+    const off = thinkingMode() === 'off';
+    for (const el of document.querySelectorAll('[data-gen]')) {
+        const k = el.dataset.gen;
+        const visible = show[k] && !((k === 'effort' || k === 'budget') && off);
+        el.classList.toggle('hidden', !visible);
+    }
+}
+
+/** Max tokens for the next request: the explicit value, else auto (larger when the model will think). */
+function resolveMaxTokens() {
+    const explicit = parseInt($('#opt-max-tokens')?.value);
+    if (explicit > 0) return Math.min(explicit, MAX_TOKENS_CEILING);
+    const def = state.config?.sampling_defaults?.max_tokens || 2048;
+    const caps = reasoningCaps();
+    const thinks = thinkingMode() !== 'off' && (!caps || caps.thinking_block);
+    return thinks ? Math.max(def, AUTO_THINKING_MAX_TOKENS) : def;
 }
 
 function getSettingsFromUI() {
@@ -775,8 +934,14 @@ function getSettingsFromUI() {
         top_k: parseInt($('#opt-top-k').value) || 0,
         min_p: parseFloat($('#opt-min-p').value),
         repetition_penalty: parseFloat($('#opt-rep-penalty').value),
-        max_tokens: parseInt($('#opt-max-tokens').value) || 2048,
+        // Explicit value, else the server's default (runGeneration swaps in resolveMaxTokens() for real requests).
+        max_tokens: parseInt($('#opt-max-tokens').value) || state.config?.sampling_defaults?.max_tokens || 2048,
         seed: $('#opt-seed').value ? parseInt($('#opt-seed').value) : null,
+        enable_thinking: ({ on: true, off: false })[$('#opt-thinking')?.value] ?? null,
+        reasoning_effort: (thinkingMode() !== 'off' && ['low', 'medium', 'high'].includes($('#opt-effort')?.value))
+            ? $('#opt-effort').value : null,
+        thinking_budget_tokens: (thinkingMode() !== 'off' && $('#opt-budget')?.value !== '' && parseInt($('#opt-budget')?.value) >= 0)
+            ? parseInt($('#opt-budget').value) : null,
         logprobs: logprobs,
         top_logprobs: logprobs ? (parseInt($('#opt-top-logprobs')?.value) || 5) : 0,
     };
@@ -869,6 +1034,47 @@ function resetToolsJson() {
 let modalModels = [];      // flat list from /v1/models/available
 let modalInspect = null;   // inspect result for selected model
 let modalSelectedFullPath = null;
+let modalGpuDevice = null;      // device string to send for "GPU" (e.g. "vulkan", "gpu:0"); null when no GPU is servable
+let modalDeviceTouched = false; // the user picked a device by hand: never override it
+
+/** Picks the GPU device string for the GPU radio from a /v1/devices payload (recommended first, else any servable non-CPU device). */
+function pickGpuDevice(devices) {
+    if (!devices) return null;
+    if (devices.recommended_device && devices.recommended_device !== 'cpu') return devices.recommended_device;
+    for (const b of devices.backends || []) {
+        if (b.name === 'cpu' || !b.servable) continue;
+        const d = (b.devices || []).find(x => x.device_string);
+        if (d) return d.device_string;
+    }
+    return null;
+}
+
+function applyModalDevices(devices) {
+    modalGpuDevice = pickGpuDevice(devices);
+    const gpuRadio = document.querySelector('input[name="modal-device"][value="gpu"]');
+    const cpuRadio = document.querySelector('input[name="modal-device"][value="cpu"]');
+    if (!devices) {
+        modalDeviceHint.textContent = 'Detecting devices...';
+        gpuRadio.disabled = false;
+        modalDeviceGpuLabel.textContent = 'GPU';
+        return;
+    }
+    gpuRadio.disabled = !modalGpuDevice;
+    if (modalGpuDevice) {
+        modalDeviceGpuLabel.textContent = `GPU (${modalGpuDevice})`;
+        modalDeviceHint.textContent = 'GPU is selected by default because a servable GPU was found. CPU is universal but several times slower. An explicit GPU load that fails reports an error; it never falls back to the CPU silently.';
+        if (!modalDeviceTouched) gpuRadio.checked = true;
+    } else {
+        modalDeviceGpuLabel.textContent = 'GPU (none detected)';
+        modalDeviceHint.textContent = 'No servable GPU (CUDA or Vulkan) was detected, so the CPU is used.';
+        cpuRadio.checked = true;
+    }
+    updateGpuVisibility();
+}
+
+async function refreshModalDevices(modelBytes) {
+    applyModalDevices(await fetchDevices(modelBytes));
+}
 
 function openModelModal() {
     modalSelectedFullPath = null;
@@ -877,6 +1083,8 @@ function openModelModal() {
     modalGpuSection.classList.add('hidden');
     modalModelInfo.classList.add('hidden');
     modalSpeculativeSection.classList.add('hidden');
+    modalMtpSection.classList.add('hidden');
+    modalMtpEnabled.checked = true;
     modalSpeculativeSelect.innerHTML = '<option value="">None (disabled)</option>';
     modalSpeculativeInfo.classList.add('hidden');
     modalSpeculativeInfo.textContent = '';
@@ -884,9 +1092,14 @@ function openModelModal() {
     modalSpeculativeKVal.textContent = '5';
     modalLoadBtn.disabled = true;
     modalStatus.innerHTML = '';
-    modalCacheK.value = 'f32';
-    modalCacheV.value = 'f32';
+    modalCacheK.value = 'auto';
+    modalCacheV.value = 'auto';
+    // (#757) Device defaults to the best servable GPU, CPU only when none is servable (resolved asynchronously).
+    modalDeviceTouched = false;
+    modalGpuDevice = null;
     document.querySelector('input[name="modal-device"][value="cpu"]').checked = true;
+    applyModalDevices(null);
+    refreshModalDevices();
     modelModalOverlay.classList.remove('hidden');
     modelModalOverlay.style.display = 'flex';
     populateModalDropdown();
@@ -978,6 +1191,7 @@ async function onModalModelChange() {
         modalOptions.classList.add('hidden');
         modalModelInfo.classList.add('hidden');
         modalSpeculativeSection.classList.add('hidden');
+        modalMtpSection.classList.add('hidden');
         modalLoadBtn.disabled = true;
         modalInspect = null;
         modalSelectedFullPath = null;
@@ -985,12 +1199,15 @@ async function onModalModelChange() {
     }
 
     modalSelectedFullPath = fullPath;
+    modalMtpSection.classList.add('hidden');
     modalLoadBtn.disabled = false;
     modalModelInfo.classList.remove('hidden');
     modalModelInfo.textContent = 'Inspecting model...';
 
     // Inspect the selected model to get layer count
-    modalInspect = await inspectModel(fullPath);
+    const inspected = await inspectModel(fullPath);
+    if (modalSelectedFullPath !== fullPath) return;   // a newer selection superseded this (out-of-order response)
+    modalInspect = inspected;
     if (modalInspect) {
         const size = formatFileSize(modalInspect.file_size_bytes);
         modalModelInfo.textContent = `${modalInspect.architecture} | ${modalInspect.num_layers} layers | ${modalInspect.hidden_size}H | ctx ${modalInspect.max_sequence_length?.toLocaleString() ?? '?'} | ${size}`;
@@ -1000,16 +1217,32 @@ async function onModalModelChange() {
         modalGpuLayers.value = modalInspect.num_layers;
         modalGpuLayersMax.textContent = modalInspect.num_layers;
         updateGpuLayersDisplay();
+        // (#729) Architectures that cannot split layers (e.g. Nemotron-H): all-or-nothing on GPU.
+        const canSplit = modalInspect.supports_partial_offload !== false;
+        modalGpuLayers.disabled = !canSplit;
+        modalGpuLayers.title = canSplit ? '' : 'Partial GPU offload is not supported for this architecture';
     } else {
-        modalModelInfo.textContent = 'Could not read model metadata';
+        modalModelInfo.textContent = 'Could not read model metadata (layer count unknown; "All" will load every layer)';
+        modalGpuLayersMax.textContent = '?';
+        updateGpuLayersDisplay();
     }
 
     modalOptions.classList.remove('hidden');
     updateGpuVisibility();
 
-    // Show speculative section and populate draft model dropdown
-    modalSpeculativeSection.classList.remove('hidden');
-    populateSpeculativeDropdown(fullPath);
+    // (#757) Embedded MTP head: automatic, with an opt-out. Otherwise offer an optional external draft model.
+    if (modalInspect?.has_mtp) {
+        modalMtpSection.classList.remove('hidden');
+        modalSpeculativeSection.classList.add('hidden');
+        modalSpeculativeSelect.value = '';
+    } else {
+        modalMtpSection.classList.add('hidden');
+        modalSpeculativeSection.classList.remove('hidden');
+        populateSpeculativeDropdown(fullPath);
+    }
+
+    // Re-pick the GPU device for this model's size (CUDA is skipped when the file will not fit).
+    refreshModalDevices(modalInspect?.file_size_bytes);
 }
 
 function getModalDevice() {
@@ -1028,6 +1261,11 @@ function updateGpuVisibility() {
 function updateGpuLayersDisplay() {
     const layers = parseInt(modalGpuLayers.value) || 0;
     const maxLayers = parseInt(modalGpuLayers.max) || 32;
+    if (!modalInspect) {
+        // Inspect failed or not run: the slider range is a placeholder, so don't claim a layer count.
+        modalGpuLayersVal.textContent = layers === 0 ? 'CPU only (no offloading)' : 'All layers on GPU';
+        return;
+    }
 
     if (layers === 0) {
         modalGpuLayersVal.textContent = 'CPU only (no offloading)';
@@ -1057,8 +1295,16 @@ async function handleModalLoad() {
     const repo = opt?.dataset.repo;
     const filename = opt?.dataset.filename;
     const quant = extractQuantFromPath(filename);
-    const device = getModalDevice();
-    const gpuLayers = device === 'gpu' ? parseInt(modalGpuLayers.value) : undefined;
+    const deviceChoice = getModalDevice();
+    const isGpu = deviceChoice === 'gpu' && !!modalGpuDevice;
+    const device = isGpu ? modalGpuDevice : 'cpu';
+    // "All" is a sentinel (-1), not the slider's number: the server resolves it against the layer count the loader sees.
+    // Also covers a failed inspect, where the slider still shows its HTML default.
+    const sliderLayers = parseInt(modalGpuLayers.value);
+    const sliderMax = parseInt(modalGpuLayers.max);
+    const gpuLayers = !isGpu ? undefined
+        : (!modalInspect || !(sliderLayers < sliderMax)) ? -1
+        : sliderLayers;
     const threads = parseInt(modalThreads.value) || 0;
     const decodeThreads = parseInt(modalDecodeThreads.value) || 0;
 
@@ -1068,13 +1314,17 @@ async function handleModalLoad() {
     setStatus('Loading and warming up model...', 'text-yellow-500');
 
     // Get speculative model selection
-    const specPath = modalSpeculativeSelect.value || undefined;
-    const specK = parseInt(modalSpeculativeK.value) || 5;
+    const embeddedMtp = !modalMtpSection.classList.contains('hidden');
+    const specPath = embeddedMtp ? undefined : (modalSpeculativeSelect.value || undefined);
+    const specK = parseInt(modalSpeculativeK.value) || 3;
 
     try {
         const res = await loadModel(repo, quant, {
+            path: modalSelectedFullPath,
             device,
+            isGpu,
             gpuLayers,
+            mtp: embeddedMtp ? modalMtpEnabled.checked : undefined,
             cacheTypeK: modalCacheK.value,
             cacheTypeV: modalCacheV.value,
             threads: threads || undefined,
@@ -1090,7 +1340,9 @@ async function handleModalLoad() {
             closeModelModal();
         } else {
             const err = await res.json().catch(() => ({}));
-            const errMsg = err.error || `HTTP ${res.status}`;
+            // #452: the error envelope is now {"error": {"message", ...}}. Read .message, but
+            // still tolerate a bare string so this keeps working against an older server.
+            const errMsg = (err.error && (err.error.message || err.error)) || `HTTP ${res.status}`;
             modalStatus.innerHTML = `<span class="text-red-400">Failed: ${esc(errMsg)}</span>`;
             setStatus(`Load failed: ${errMsg}`, 'text-red-400');
         }
@@ -1116,6 +1368,8 @@ function buildApiMessages() {
         const msg = { role: m.role, content: m.content };
         if (m.tool_calls) msg.tool_calls = m.tool_calls;
         if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
+        // Replay earlier reasoning; the chat template decides whether to render it (preserve_thinking).
+        if (m.role === 'assistant' && m.reasoning) msg.reasoning_content = m.reasoning;
         // Assistant tool-call messages have null content per OpenAI spec
         if (m.role === 'assistant' && m.tool_calls) msg.content = null;
         apiMessages.push(msg);
@@ -1163,6 +1417,16 @@ async function runGeneration(round) {
     let finishReason = null;
     const startTime = performance.now();
     let firstTokenTime = null;
+    let reasoningText = '';
+    let reasoningTokens = 0;
+    let reasoningEl = null;
+    let reasoningStart = null;
+    const collapseReasoning = () => {
+        if (!reasoningEl || !reasoningEl.open) return;
+        reasoningEl.open = false;
+        const secs = ((performance.now() - reasoningStart) / 1000).toFixed(1);
+        reasoningEl.querySelector('.reasoning-summary').textContent = `Thought for ${secs}s`;
+    };
 
     // Show live timer immediately (before first token)
     placeholder.liveStats.classList.remove('hidden');
@@ -1178,6 +1442,7 @@ async function runGeneration(round) {
 
     // Get current sampling params + tools
     const params = getSettingsFromUI();
+    params.max_tokens = resolveMaxTokens();
     const tools = getToolsForRequest();
     if (tools) params.tools = tools;
 
@@ -1186,10 +1451,25 @@ async function runGeneration(round) {
 
     try {
         for await (const event of streamChat(apiMessages, params)) {
-            if (event.type === 'delta') {
+            if (event.type === 'reasoning') {
                 if (firstTokenTime === null) {
                     firstTokenTime = performance.now();
                 }
+                tokenCount++;
+                if (!reasoningEl) {
+                    reasoningStart = performance.now();
+                    reasoningEl = createReasoningBlock('', true);
+                    placeholder.bubble.insertBefore(reasoningEl, placeholder.contentEl);
+                }
+                reasoningTokens++;
+                reasoningText += event.content;
+                reasoningEl.querySelector('.reasoning-body').textContent = reasoningText;
+                scrollToBottom();
+            } else if (event.type === 'delta') {
+                if (firstTokenTime === null) {
+                    firstTokenTime = performance.now();
+                }
+                collapseReasoning();
                 tokenCount++;
                 fullText += event.content;
                 if (useLogprobs && event.logprobs) {
@@ -1221,6 +1501,7 @@ async function runGeneration(round) {
 
     // Finalize
     clearInterval(liveTimer);
+    collapseReasoning();
     placeholder.contentEl.classList.remove('cursor-blink');
     placeholder.liveStats.remove();
 
@@ -1243,6 +1524,7 @@ async function runGeneration(round) {
         state.messages.push({
             role: 'assistant',
             content: fullText,
+            reasoning: reasoningText || undefined,
             tool_calls: detectedToolCalls,
             stats: statsInfo,
             rawPrompt,
@@ -1310,8 +1592,18 @@ async function runGeneration(round) {
     placeholder.bubble.setAttribute('data-msg-idx', msgIdx);
     state.messages.push({
         role: 'assistant', content: fullText, stats: statsInfo, rawPrompt, rawResponse: fullText,
+        reasoning: reasoningText || undefined,
         logprobs: useLogprobs ? logprobEntries : null,
     });
+
+    if (finishReason === 'length') {
+        placeholder.bubble.appendChild(createLengthNotice(placeholder.wrapper, {
+            answered: fullText.trim().length > 0,
+            reasoningTokens: usageData?.completion_tokens_details?.reasoning_tokens ?? reasoningTokens,
+            totalTokens: usageData?.completion_tokens ?? tokenCount,
+            maxTokens: params.max_tokens,
+        }));
+    }
 
     // Reset UI
     state.isGenerating = false;
@@ -1321,6 +1613,51 @@ async function runGeneration(round) {
     setStatus('Ready', 'text-emerald-500');
     userInput.focus();
     saveConversation();
+}
+
+/**
+ * Notice shown when a reply ended on finish_reason "length". Says whether the budget went on thinking and offers
+ * one-click retries (the truncated message is dropped and the same turn is regenerated with the new setting).
+ */
+function createLengthNotice(wrapper, info) {
+    const box = document.createElement('div');
+    box.className = 'mt-2 rounded border border-yellow-600/40 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-300';
+    const msg = document.createElement('div');
+    msg.textContent = info.answered
+        ? `Stopped at the max-token limit (${info.maxTokens}) - the reply was cut off.`
+        : `Stopped at the max-token limit (${info.maxTokens}) before any answer - ${info.reasoningTokens} of ${info.totalTokens} tokens went on thinking. Raise Max Tokens or turn thinking down.`;
+    box.appendChild(msg);
+
+    const row = document.createElement('div');
+    row.className = 'mt-1.5 flex flex-wrap gap-2';
+    const mk = (label, fn) => {
+        const b = document.createElement('button');
+        b.className = 'px-2 py-0.5 rounded border border-yellow-600/50 hover:bg-yellow-500/20 transition';
+        b.textContent = label;
+        b.addEventListener('click', () => retryTruncated(wrapper, fn));
+        row.appendChild(b);
+    };
+    const bigger = Math.min(MAX_TOKENS_CEILING, Math.max(8192, info.maxTokens * 4));
+    if (info.maxTokens < MAX_TOKENS_CEILING) mk(`Retry with ${bigger} tokens`, () => setGenOpt('opt-max-tokens', String(bigger)));
+    const caps = reasoningCaps();
+    if (!info.answered && thinkingMode() !== 'off' && (!caps || caps.enable_thinking)) {
+        mk('Retry with thinking off', () => setGenOpt('opt-thinking', 'off'));
+    }
+    if (!info.answered && thinkingMode() !== 'off' && (!caps || caps.reasoning_effort) && $('#opt-effort')?.value !== 'low') {
+        mk('Retry with low effort', () => setGenOpt('opt-effort', 'low'));
+    }
+    if (row.childElementCount) box.appendChild(row);
+    return box;
+}
+
+async function retryTruncated(wrapper, applySetting) {
+    if (state.isGenerating || state.awaitingToolResults) return;
+    const last = state.messages[state.messages.length - 1];
+    if (last?.role !== 'assistant') return;
+    state.messages.pop();
+    wrapper.remove();
+    applySetting();
+    await runGeneration(0);
 }
 
 // ── TOOL CALL UI ──
@@ -1620,6 +1957,7 @@ function saveConversation() {
                 const msg = { role: m.role, content: m.content };
                 if (m.tool_calls) msg.tool_calls = m.tool_calls;
                 if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
+                if (m.reasoning) msg.reasoning = m.reasoning;
                 return msg;
             })
         ));
@@ -1654,6 +1992,7 @@ function loadConversation() {
             const stateMsg = { role: m.role, content: m.content };
             if (m.tool_calls) stateMsg.tool_calls = m.tool_calls;
             if (m.tool_call_id) stateMsg.tool_call_id = m.tool_call_id;
+            if (m.reasoning) stateMsg.reasoning = m.reasoning;
             state.messages.push(stateMsg);
 
             if (m.role === 'tool') {
@@ -1674,7 +2013,7 @@ function loadConversation() {
                 messagesEl.appendChild(wrapper);
                 hideWelcome();
             } else {
-                addMessageToDOM(m.role, m.content);
+                addMessageToDOM(m.role, m.content, undefined, undefined, undefined, m.reasoning);
             }
         }
     } catch { /* corrupted data, ignore */ }
@@ -1816,7 +2155,7 @@ modalModelSelect.addEventListener('change', onModalModelChange);
 
 // Device radio toggle → show/hide GPU section
 document.querySelectorAll('input[name="modal-device"]').forEach(radio => {
-    radio.addEventListener('change', updateGpuVisibility);
+    radio.addEventListener('change', () => { modalDeviceTouched = true; updateGpuVisibility(); });
 });
 
 // GPU layers slider live update
@@ -1910,6 +2249,7 @@ function esc(s) {
 
 async function init() {
     setStatus('Connecting...', 'text-yellow-500');
+    initGenControls();
 
     try {
         state.config = await fetchProps();

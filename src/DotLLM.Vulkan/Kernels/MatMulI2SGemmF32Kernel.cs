@@ -218,6 +218,40 @@ public readonly record struct I2SGemmVariant(
     public static I2SGemmVariant Production => RegisterBlocked;
 
     /// <summary>
+    /// Issue #443: the proven 128x128, BK=32, four-wave64-subgroup blocked tile, instantiated
+    /// from the shared <c>gemm_coopmat_blocked_*.glsl</c> template.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Total weight-unpack work is <c>M*K*N / BN</c> — each weight element is re-unpacked once
+    /// per N-tile, so BN 16 -&gt; 128 deletes 8x of it at N=512 (RGP measured 8.47x on PQ2_0
+    /// against 8.0x predicted).
+    /// </para>
+    /// <para>
+    /// <b>I2_S is the one instantiation where BK=32 genuinely costs something.</b> Its byte
+    /// <c>gp</c> packs elements <c>{gp, gp+32, gp+64, gp+96}</c> at descending bit offsets — a
+    /// real strided layout, unlike PQ2_0's four consecutive elements per byte — so a 32-element
+    /// K-slice is all 32 code bytes read with one bit field, and each byte is fetched four times
+    /// across a block. That is 4 KB of extra A-side VMEM per chunk against 16 KB of B staging.
+    /// Keeping BK=128 is not an option: a 128x128 tile would need 64 KB of LDS against a 32 KB
+    /// device limit and the pipeline would not create.
+    /// </para>
+    /// <para>
+    /// The A operand stages raw ternary, exact in F16, and the per-tensor scale is applied to
+    /// the F32 accumulator after the K loop — so the weight side is lossless and this is held to
+    /// the same 3e-2 / 5e-3 coopmat-tier tolerance as the other I2_S coopmat variants.
+    /// </para>
+    /// </remarks>
+    public static I2SGemmVariant Blocked128x128x4 =>
+        new("matmul_i2_s_f32_gemm_coopmat_128x128x4.spv", 128, 128, RequiresCooperativeMatrix: true);
+
+    /// <summary>
+    /// Environment variable that restores the pre-issue-#443 preference in
+    /// <see cref="SelectFor"/>.
+    /// </summary>
+    public const string BlockedLegacyEnvVar = "DOTLLM_VK_I2_S_GEMM_LEGACY";
+
+    /// <summary>
     /// Picks the I2_S GEMM variant for <paramref name="device"/>, preferring a coopmat variant
     /// only where the device can supply BOTH cooperative matrix and a pinned wave32 compute
     /// subgroup size, and falling back to <see cref="RegisterBlocked"/> otherwise (the caller,
@@ -261,10 +295,30 @@ public readonly record struct I2SGemmVariant(
         ArgumentNullException.ThrowIfNull(device);
         if (IsCoopmatDisabled()) return Production;
         if (!device.HasCooperativeMatrix) return Production;
+        if (device.VendorId != AmdVendorId && !IsCoopmatForced()) return Production;
+
+        // Issue #443. Measured on gfx1151, interleaved order-reversed, median of per-pass
+        // ratios, against Coopmat32Wave32 — the variant this used to return — on the MALL-
+        // exceeding 65536x4096 shape: 7.70x at n=256, 2.79x at n=32, 1.55x at n=8, 1.34x at
+        // n=4. It wins on the honest row at EVERY batch size tested, which the other #443
+        // instantiations do not, so there is no small-n crossover to gate on here.
+        //
+        // The blocked tile needs no subgroup-size PIN (it is sized in the driver's native wave64
+        // units and four subgroups own the tile), so it is offered BEFORE the pin check and is
+        // available on an AMD device that cannot pin at all. It does, however, REQUIRE that the
+        // native width actually be 64: local_size_x = 256 maps to the shader's 2x2 subgroup grid
+        // only there. On a 32-wide device the same threads form EIGHT subgroups, ids 4-7 index
+        // past the grid, and they read sharedB out of bounds and store into the NEXT tile's rows
+        // while tileAllIn still reports the fast path safe — silent wrong answers, not a
+        // pipeline failure. Gate, do not hope.
+        // DOTLLM_VK_I2_S_GEMM_LEGACY=1 restores the previous preference exactly.
+        if (Environment.GetEnvironmentVariable(BlockedLegacyEnvVar) != "1"
+            && device.SubgroupSize == 64)
+            return Blocked128x128x4;
+
         // The 32-thread workgroup and the pin are a pair — refuse the variant outright where
         // the wave width cannot be pinned, rather than shipping a half-wave dispatch.
         if (!device.SupportsRequiredSubgroupSize(32, VkShaderStageFlags.Compute)) return Production;
-        if (device.VendorId != AmdVendorId && !IsCoopmatForced()) return Production;
         return Coopmat32Wave32;
     }
 

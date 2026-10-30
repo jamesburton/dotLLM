@@ -8,7 +8,7 @@ namespace DotLLM.Tests.Unit.Engine.KvCache;
 /// <summary>
 /// Unit tests for <see cref="KvGeometry"/> — the Core per-layer KV-stride
 /// descriptor (KV Phase 0). Verifies the uniform fast path stays byte-identical
-/// for non-Gemma models and that <see cref="KvGeometry.FromConfig"/> produces the
+/// for non-Gemma models and that <see cref="KvGeometry.FromConfig(DotLLM.Core.Models.ModelConfig)"/> produces the
 /// distinct sliding-vs-global strides for Gemma-4.
 /// </summary>
 public sealed class KvGeometryTests

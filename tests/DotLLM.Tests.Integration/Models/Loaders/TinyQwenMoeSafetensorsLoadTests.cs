@@ -32,7 +32,7 @@ namespace DotLLM.Tests.Integration.Models.Loaders;
 /// synthetic unit-test fixture.
 /// </para>
 /// <para>
-/// Cache location: <c>~/.dotllm/test-cache/&lt;repo&gt;/</c>. 50 MB cap.
+/// Cache location: <c>~/.dotllm/models/&lt;repo&gt;/</c>. 50 MB cap.
 /// </para>
 /// </remarks>
 public sealed class TinyQwenMoeSafetensorsLoadTests
@@ -51,9 +51,7 @@ public sealed class TinyQwenMoeSafetensorsLoadTests
         ("optimum-internal-testing/tiny-random-qwen3_moe", ["model.safetensors", "config.json"]),
     ];
 
-    private static readonly string CacheDir = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-        ".dotllm", "test-cache");
+    private static readonly string CacheDir = DotLLM.Tests.Integration.Fixtures.TestModelDownloader.CacheDirectory;
 
     private readonly ITestOutputHelper _output;
 
@@ -180,8 +178,7 @@ public sealed class TinyQwenMoeSafetensorsLoadTests
     {
         foreach (var (repoId, files) in Candidates)
         {
-            string cachedDir = Path.Combine(
-                CacheDir, repoId.Replace('/', Path.DirectorySeparatorChar));
+            string cachedDir = DotLLM.Tests.Integration.Fixtures.TestRepoDirectory.Resolve(repoId, "model.safetensors", "config.json");
             string cachedModel = Path.Combine(cachedDir, "model.safetensors");
             string cachedConfig = Path.Combine(cachedDir, "config.json");
 

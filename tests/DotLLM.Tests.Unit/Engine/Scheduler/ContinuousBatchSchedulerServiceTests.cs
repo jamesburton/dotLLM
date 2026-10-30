@@ -17,7 +17,7 @@ namespace DotLLM.Tests.Unit.Engine.Scheduler;
 /// the run-loop drives the inner step-based scheduler, that <see cref="ContinuousBatchSchedulerService.EnqueueAsync"/>
 /// wakes the loop from idle, and that multiple concurrent enqueues all complete.
 /// </summary>
-public sealed class ContinuousBatchSchedulerServiceTests
+public sealed partial class ContinuousBatchSchedulerServiceTests
 {
     private const int VocabSize = 32;
     private const int NumLayers = 2;

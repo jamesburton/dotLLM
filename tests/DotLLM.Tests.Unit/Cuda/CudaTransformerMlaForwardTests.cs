@@ -24,6 +24,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// <see cref="CudaMoeFfnTests"/>).
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaTransformerMlaForwardTests : IDisposable
 {
     // Tiny but production-shaped MLA fixture. Two layers (both dense FFN

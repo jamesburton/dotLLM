@@ -30,7 +30,7 @@ namespace DotLLM.Models.Architectures;
 /// MoE routing — and the corresponding per-model quant dispatch gaining a <c>PQ2_0</c> arm
 /// (Bonsai's ternary quant type; see <c>MatMul.PQ2S.cs</c>).
 /// </summary>
-public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
+public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
 {
     private readonly GgufFile? _gguf; // kept alive; null when built from prebuilt weights
     private readonly Qwen3HybridDenseLayerWeights[] _layers;
@@ -53,11 +53,19 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     // GDN layer ordinal per layer index (-1 for attention layers).
     private readonly int[] _gdnLayerOrdinal;
 
-    private readonly float[] _ropeCosTable;
-    private readonly float[] _ropeSinTable;
+    // Issue #1101: inverse frequencies + mscale only; cos/sin rows are computed per forward for the positions in flight, so
+    // nothing here grows with the context window (YaRN takes it to ~1M; #1107 bars context-sized F32 tables).
+    private readonly RoPERotation _rope;
     private readonly int _ropeDim;
 
+    /// <summary>Test hook (issue #1101): the rotation the trunk and the MTP head use.</summary>
+    internal RoPERotation RopeForTest => _rope;
+
     private readonly Qwen3HybridDenseForwardState _state;
+
+    // PrismML Hadamard fold (prism.hadamard.*) — null for every checkpoint outside the Bonsai 2
+    // family, and every rotation site below is a no-op when it is null.
+    private readonly HadamardActivationRotator? _hadamard;
     private readonly GdnStateCache _gdnCache;
 
     private readonly ComputeThreadPool? _threadPool;
@@ -66,7 +74,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     // Multi-Token Prediction (MTP / "NextN") head — issue #253. Null for every GGUF without a
     // nextn.* tensor group, which is the overwhelming majority: every other field and code path
     // in this class is completely unaffected by MTP being absent.
-    private readonly MtpHeadWeights? _mtpHead;
+    private MtpHeadWeights? _mtpHead; // set at load (embedded head) or by AttachMtpHead (separate mtp-*.gguf, #1185)
 
     /// <inheritdoc/>
     public ModelConfig Config { get; }
@@ -78,7 +86,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     public int AttentionLayerCount => _attentionLayerCount;
 
     /// <inheritdoc/>
-    public bool SupportsMtp => _mtpHead is not null;
+    public bool SupportsMtp => _mtpHead is not null || _dflash is not null;
 
     private Qwen3HybridDenseTransformerModel(
         ModelConfig config,
@@ -88,9 +96,10 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         nint tokenEmbedWeight, QuantizationType tokenEmbedQuantType,
         nint outputWeight, QuantizationType outputQuantType, int outputOutputDim, int outputInputDim,
         int[] kvSlotForLayer, int attentionLayerCount,
-        float[] ropeCosTable, float[] ropeSinTable, int ropeDim,
+        RoPERotation rope, int ropeDim,
         ComputeThreadPool? threadPool, bool ownsPool,
-        MtpHeadWeights? mtpHead = null)
+        MtpHeadWeights? mtpHead = null,
+        int hadamardFirstLayer = 0, int hadamardFullLayerCount = 0)
     {
         Config = config;
         _gguf = gguf;
@@ -107,8 +116,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         _gdn = config.GdnConfig!.Value;
         _kvSlotForLayer = kvSlotForLayer;
         _attentionLayerCount = attentionLayerCount;
-        _ropeCosTable = ropeCosTable;
-        _ropeSinTable = ropeSinTable;
+        _rope = rope;
         _ropeDim = ropeDim;
         _threadPool = threadPool;
         _ownsThreadPool = ownsPool;
@@ -134,7 +142,26 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             nVHead: _gdn.NVHead,
             nKHead: _gdn.NKHead,
             dState: _gdn.DState,
-            intermediateSize: config.IntermediateSize);
+            intermediateSize: config.IntermediateSize,
+            hasHadamardFold: config.HadamardFold is not null);
+
+        if (config.HadamardFold is { } fold)
+        {
+            _hadamard = new HadamardActivationRotator(fold, _gdn);
+            // Cheap insurance for the fixed-site rotation strategy: if a checkpoint ever folds a
+            // different set of weights than the sites below cover, fail here rather than generate
+            // fluent text in the wrong basis.
+            //
+            // A partial-offload tail (LoadTailFromGguf) is a sliced instance: its config.NumLayers
+            // is the slice, local block i is GLOBAL block hadamardFirstLayer + i, and the
+            // declaration still names every block of the full trunk. It therefore validates the
+            // blocks it owns (plus the lm_head it runs) against the full declaration (#481) —
+            // the GPU head does the same for its prefix, and both refuse any declared name that
+            // no block of the whole model rotates.
+            int fullLayerCount = hadamardFullLayerCount > 0 ? hadamardFullLayerCount : config.NumLayers;
+            _hadamard.ValidateQwen35FoldSet(fullLayerCount, _gdn.FullAttnInterval,
+                ownedFirstLayer: hadamardFirstLayer, ownedLayerCount: config.NumLayers, ownsLmHead: true);
+        }
     }
 
     /// <summary>
@@ -168,12 +195,14 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         if (config.GdnConfig is null)
             throw new ArgumentException("Qwen3HybridDense config must have GdnConfig populated.", nameof(config));
 
-        nint dataBase = gguf.DataBasePointer;
+        var dataBase = new GgufDataBase(gguf);
         var tensors = gguf.TensorsByName;
         var layout = config.HybridLayout;
+        Nvfp4Support.RejectUnappliedScales(tensors, consumedScales: null, "The Qwen3 hybrid-dense loader"); // #1038
+        config.HadamardFold?.ValidateOutputHead(tensors.ContainsKey("output.weight")); // #1276
 
         var embDesc = tensors["token_embd.weight"];
-        nint embPtr = dataBase + (nint)embDesc.DataOffset;
+        nint embPtr = dataBase.Of(embDesc);
 
         var outNormDesc = tensors["output_norm.weight"];
         float[] outputNormWeight = DequantizeF32(dataBase, outNormDesc, config.HiddenSize);
@@ -183,7 +212,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         int outputM, outputK;
         if (tensors.TryGetValue("output.weight", out var outDesc))
         {
-            outputPtr = dataBase + (nint)outDesc.DataOffset;
+            outputPtr = dataBase.Of(outDesc);
             outputQt = outDesc.QuantizationType;
             outputK = outDesc.Shape[0];
             outputM = outDesc.Shape[1];
@@ -215,11 +244,8 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
                 : -1;
         }
 
-        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
-        int halfRope = ropeDim / 2;
-        var ropeCos = new float[config.MaxSequenceLength * halfRope];
-        var ropeSin = new float[config.MaxSequenceLength * halfRope];
-        RoPE.PrecomputeFrequencyTable(config.MaxSequenceLength, ropeDim, ropeTheta, ropeCos, ropeSin);
+        // Plain theta rotation, or YaRN's when --rope-scaling yarn is active (issue #1101).
+        var rope = new RoPERotation(config.RoPEConfig, config.Architecture, ropeDim);
 
         ComputeThreadPool? pool = CreatePool(threading);
 
@@ -233,7 +259,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             embPtr, embDesc.QuantizationType,
             outputPtr, outputQt, outputM, outputK,
             kvSlotForLayer, attentionLayerCount,
-            ropeCos, ropeSin, ropeDim,
+            rope, ropeDim,
             pool, ownsPool: pool is not null,
             mtpHead);
     }
@@ -304,7 +330,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             throw new ArgumentOutOfRangeException(nameof(startLayer),
                 $"startLayer must be between 1 and {fullConfig.NumLayers - 1} for a GPU/CPU split.");
 
-        nint dataBase = gguf.DataBasePointer;
+        var dataBase = new GgufDataBase(gguf);
         var tensors = gguf.TensorsByName;
         int tailCount = fullConfig.NumLayers - startLayer;
 
@@ -323,9 +349,10 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         // force NextnPredictLayers=0 so this slice never tries (and fails) to resolve an MTP
         // block at the wrong raw index.
         var tailConfig = fullConfig with { NumLayers = tailCount, HybridLayout = tailLayout, NextnPredictLayers = 0 };
+        fullConfig.HadamardFold?.ValidateOutputHead(tensors.ContainsKey("output.weight")); // #1276
 
         var embDesc = tensors["token_embd.weight"];
-        nint embPtr = dataBase + (nint)embDesc.DataOffset;
+        nint embPtr = dataBase.Of(embDesc);
 
         var outNormDesc = tensors["output_norm.weight"];
         float[] outputNormWeight = DequantizeF32(dataBase, outNormDesc, fullConfig.HiddenSize);
@@ -335,7 +362,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         int outputM, outputK;
         if (tensors.TryGetValue("output.weight", out var outDesc))
         {
-            outputPtr = dataBase + (nint)outDesc.DataOffset;
+            outputPtr = dataBase.Of(outDesc);
             outputQt = outDesc.QuantizationType;
             outputK = outDesc.Shape[0];
             outputM = outDesc.Shape[1];
@@ -370,11 +397,8 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
                 : -1;
         }
 
-        float ropeTheta = fullConfig.RoPEConfig?.Theta ?? 10000.0f;
-        int halfRope = ropeDim / 2;
-        var ropeCos = new float[fullConfig.MaxSequenceLength * halfRope];
-        var ropeSin = new float[fullConfig.MaxSequenceLength * halfRope];
-        RoPE.PrecomputeFrequencyTable(fullConfig.MaxSequenceLength, ropeDim, ropeTheta, ropeCos, ropeSin);
+        // Plain theta rotation, or YaRN's when --rope-scaling yarn is active (issue #1101).
+        var rope = new RoPERotation(fullConfig.RoPEConfig, fullConfig.Architecture, ropeDim);
 
         ComputeThreadPool? pool = CreatePool(threading);
 
@@ -383,9 +407,10 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             embPtr, embDesc.QuantizationType,
             outputPtr, outputQt, outputM, outputK,
             kvSlotForLayer, attentionLayerCount,
-            ropeCos, ropeSin, ropeDim,
+            rope, ropeDim,
             pool, ownsPool: pool is not null,
-            mtpHead: null);
+            mtpHead: null,
+            hadamardFirstLayer: startLayer, hadamardFullLayerCount: fullConfig.NumLayers);
     }
 
     /// <summary>
@@ -446,6 +471,9 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
                 $"Qwen3HybridDenseTransformerModel requires a CPU GdnStateCache; got {gdnState.GetType().Name}.",
                 nameof(gdnState));
         }
+
+        // Mirrors Forward: a read-only verify's accepted rows land before anything reads the model-owned state (#1194).
+        CommitPendingRows();
 
         int vocabSize = Config.VocabSize;
         int intermediateSize = Config.IntermediateSize;
@@ -537,7 +565,15 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
                 new Span<float>(hidden + t * hiddenSize, hiddenSize));
         }
 
-        Gemm(_outputWeight, _outputQuantType, hidden, logits,
+        // output.weight is folded too — the final-norm output needs rotating before the lm_head.
+        float* headIn = hidden;
+        if (_hadamard is { } headRot)
+        {
+            headIn = (float*)_state.HadamardScratch;
+            headRot.RotateForward(hidden, headIn, seqLen, _outputInputDim);
+        }
+
+        Gemm(_outputWeight, _outputQuantType, headIn, logits,
              _outputOutputDim, _outputInputDim, seqLen);
 
         var shape = new TensorShape(seqLen, vocabSize);
@@ -597,33 +633,20 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             throw new ArgumentException(
                 $"rope_dim={ropeDim} exceeds head_dim={config.HeadDim}.", nameof(config));
 
-        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
-        int halfRope = ropeDim / 2;
-        float[] ropeCos, ropeSin;
-        if (attentionLayerCount > 0)
-        {
-            ropeCos = new float[config.MaxSequenceLength * halfRope];
-            ropeSin = new float[config.MaxSequenceLength * halfRope];
-            RoPE.PrecomputeFrequencyTable(config.MaxSequenceLength, ropeDim, ropeTheta, ropeCos, ropeSin);
-        }
-        else
-        {
-            ropeCos = Array.Empty<float>();
-            ropeSin = Array.Empty<float>();
-        }
+        var rope = new RoPERotation(config.RoPEConfig, config.Architecture, ropeDim);
 
         return new Qwen3HybridDenseTransformerModel(
             config, gguf: null, layers, outputNormWeight,
             tokenEmbedWeight, tokenEmbedQuantType,
             outputWeight, outputQuantType, outputOutputDim, outputInputDim,
             kvSlotForLayer, attentionLayerCount,
-            ropeCos, ropeSin, ropeDim,
+            rope, ropeDim,
             threadPool: null, ownsPool: false);
     }
 
     private static Qwen3HybridDenseLayerWeights LoadLayer(
         int layerIdx,
-        nint dataBase,
+        GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config)
     {
@@ -663,17 +686,17 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             Gdn = tokenMixing.gdn,
             FullAttn = tokenMixing.attn,
 
-            GateWeight = dataBase + (nint)gateDesc.DataOffset,
+            GateWeight = dataBase.Of(gateDesc),
             GateQuantType = gateDesc.QuantizationType,
             GateInputDim = gateDesc.Shape[0],
             GateOutputDim = gateDesc.Shape[1],
 
-            UpWeight = dataBase + (nint)upDesc.DataOffset,
+            UpWeight = dataBase.Of(upDesc),
             UpQuantType = upDesc.QuantizationType,
             UpInputDim = upDesc.Shape[0],
             UpOutputDim = upDesc.Shape[1],
 
-            DownWeight = dataBase + (nint)downDesc.DataOffset,
+            DownWeight = dataBase.Of(downDesc),
             DownQuantType = downDesc.QuantizationType,
             DownInputDim = downDesc.Shape[0],
             DownOutputDim = downDesc.Shape[1],
@@ -682,7 +705,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
 
     private static GdnTokenMixingWeights LoadGdnLayer(
         string prefix,
-        nint dataBase,
+        GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config)
     {
@@ -707,24 +730,24 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
 
         return new GdnTokenMixingWeights
         {
-            QkvWeight = dataBase + (nint)qkvDesc.DataOffset,
+            QkvWeight = dataBase.Of(qkvDesc),
             QkvQuantType = qkvDesc.QuantizationType,
             QkvInputDim = qkvDesc.Shape[0],
             QkvOutputDim = qkvDesc.Shape[1],
 
-            GateWeight = dataBase + (nint)gateDesc.DataOffset,
+            GateWeight = dataBase.Of(gateDesc),
             GateQuantType = gateDesc.QuantizationType,
             GateInputDim = gateDesc.Shape[0],
             GateOutputDim = gateDesc.Shape[1],
 
             A = a,
 
-            AlphaWeight = dataBase + (nint)alphaDesc.DataOffset,
+            AlphaWeight = dataBase.Of(alphaDesc),
             AlphaQuantType = alphaDesc.QuantizationType,
             AlphaInputDim = alphaDesc.Shape[0],
             AlphaOutputDim = alphaDesc.Shape[1],
 
-            BetaWeight = dataBase + (nint)betaDesc.DataOffset,
+            BetaWeight = dataBase.Of(betaDesc),
             BetaQuantType = betaDesc.QuantizationType,
             BetaInputDim = betaDesc.Shape[0],
             BetaOutputDim = betaDesc.Shape[1],
@@ -734,7 +757,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             DtBias = dtBias,
             SsmNormWeight = ssmNormWeight,
 
-            OutWeight = dataBase + (nint)outDesc.DataOffset,
+            OutWeight = dataBase.Of(outDesc),
             OutQuantType = outDesc.QuantizationType,
             OutInputDim = outDesc.Shape[0],
             OutOutputDim = outDesc.Shape[1],
@@ -743,7 +766,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
 
     private static Qwen3FullAttnWeights LoadFullAttnLayer(
         string prefix,
-        nint dataBase,
+        GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config,
         int numKvHeads)
@@ -770,22 +793,22 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
 
         return new Qwen3FullAttnWeights
         {
-            QWeight = dataBase + (nint)q.DataOffset,
+            QWeight = dataBase.Of(q),
             QQuantType = q.QuantizationType,
             QInputDim = q.Shape[0],
             QOutputDim = q.Shape[1],
 
-            KWeight = dataBase + (nint)k.DataOffset,
+            KWeight = dataBase.Of(k),
             KQuantType = k.QuantizationType,
             KInputDim = k.Shape[0],
             KOutputDim = k.Shape[1],
 
-            VWeight = dataBase + (nint)v.DataOffset,
+            VWeight = dataBase.Of(v),
             VQuantType = v.QuantizationType,
             VInputDim = v.Shape[0],
             VOutputDim = v.Shape[1],
 
-            OWeight = dataBase + (nint)o.DataOffset,
+            OWeight = dataBase.Of(o),
             OQuantType = o.QuantizationType,
             OInputDim = o.Shape[0],
             OOutputDim = o.Shape[1],
@@ -813,7 +836,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     /// <c>GGML_ASSERT(hparams.nextn_predict_layers == 1)</c> for the QWEN35 family today.
     /// </remarks>
     private static MtpHeadWeights? LoadMtpHeadIfPresent(
-        nint dataBase,
+        GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config)
     {
@@ -854,17 +877,17 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             FullAttn = attn,
             Gdn = null,
 
-            GateWeight = dataBase + (nint)gateDesc.DataOffset,
+            GateWeight = dataBase.Of(gateDesc),
             GateQuantType = gateDesc.QuantizationType,
             GateInputDim = gateDesc.Shape[0],
             GateOutputDim = gateDesc.Shape[1],
 
-            UpWeight = dataBase + (nint)upDesc.DataOffset,
+            UpWeight = dataBase.Of(upDesc),
             UpQuantType = upDesc.QuantizationType,
             UpInputDim = upDesc.Shape[0],
             UpOutputDim = upDesc.Shape[1],
 
-            DownWeight = dataBase + (nint)downDesc.DataOffset,
+            DownWeight = dataBase.Of(downDesc),
             DownQuantType = downDesc.QuantizationType,
             DownInputDim = downDesc.Shape[0],
             DownOutputDim = downDesc.Shape[1],
@@ -878,7 +901,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         QuantizationType embedTokensQt = default;
         if (tensors.TryGetValue($"{prefix}.nextn.embed_tokens.weight", out var embedDesc))
         {
-            embedTokensPtr = dataBase + (nint)embedDesc.DataOffset;
+            embedTokensPtr = dataBase.Of(embedDesc);
             embedTokensQt = embedDesc.QuantizationType;
         }
 
@@ -886,7 +909,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         QuantizationType sharedHeadQt = default;
         if (tensors.TryGetValue($"{prefix}.nextn.shared_head_head.weight", out var sharedHeadDesc))
         {
-            sharedHeadPtr = dataBase + (nint)sharedHeadDesc.DataOffset;
+            sharedHeadPtr = dataBase.Of(sharedHeadDesc);
             sharedHeadQt = sharedHeadDesc.QuantizationType;
         }
 
@@ -898,7 +921,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         {
             Layer = layer,
 
-            EhProjWeight = dataBase + (nint)ehProjDesc.DataOffset,
+            EhProjWeight = dataBase.Of(ehProjDesc),
             EhProjQuantType = ehProjDesc.QuantizationType,
             EhProjInputDim = ehProjDesc.Shape[0],
             EhProjOutputDim = ehProjDesc.Shape[1],
@@ -1020,6 +1043,10 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
 
         _state.EnsureCapacity(seqLen);
 
+        // #1194: the last read-only verify left the model-owned state untouched; its accepted rows (all, unless a rollback said
+        // otherwise) land before this forward reads it. ForwardWithRecurrentSnapshots re-validates after this call returns.
+        CommitPendingRows();
+
         // Adaptive dispatch mode: spin-wait for decode (short, frequent dispatches),
         // event-based for prefill (long dispatches where kernel transition cost is negligible).
         _threadPool?.SetDispatchMode(seqLen == 1 ? DispatchMode.SpinWait : DispatchMode.EventBased);
@@ -1039,9 +1066,15 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             TensorDump.Dump2D("token_embd", hidden, seqLen, hiddenSize);
 
         var kinds = _layout.LayerKind;
+        // DFlash (#1175): the drafter conditions on these layers' inputs; only the rows its context ring can hold are kept.
+        DFlash.DFlashMtpState? dflashTaps = _dflash is not null ? mtpState as DFlash.DFlashMtpState : null;
+        int tapFirst = dflashTaps is null ? 0 : Math.Max(0, seqLen - dflashTaps.RingCapacity);
+        dflashTaps?.EnsureTapRows(seqLen - tapFirst);
         for (int layer = 0; layer < _layers.Length; layer++)
         {
             var lw = _layers[layer];
+            if (dflashTaps is not null)
+                CaptureDFlashTaps(dflashTaps, layer, hidden, tapFirst, seqLen, hiddenSize);
             // ── Token-mixing sub-layer ─────────────────────────────────────────
             // Snapshot hidden as residual, then attn_norm.
             new Span<float>(hidden, seqLen * hiddenSize)
@@ -1101,12 +1134,8 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
                 TensorDump.Dump2D($"blk.{layer}.l_out", hidden, seqLen, hiddenSize);
         }
 
-        // MTP (issue #253): capture the pre-final-norm hidden state for every position, one row
-        // per input token, BEFORE the final RMSNorm below overwrites `hidden` in place. This is
-        // the exact quantity llama.cpp's MTP head consumes (`h_pre_norm` / `llama_get_embeddings_pre_norm`)
-        // — a pure side effect that never changes the logits this call returns.
-        if (mtpState is CpuMtpState mtpCapture)
-            mtpCapture.SetCapturedRows(new ReadOnlySpan<float>(hidden, seqLen * hiddenSize), seqLen);
+        if (dflashTaps is not null)
+            CaptureDFlashTaps(dflashTaps, _layers.Length, hidden, tapFirst, seqLen, hiddenSize);
 
         // Final output norm + logit projection.
         for (int t = 0; t < seqLen; t++)
@@ -1119,7 +1148,23 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         if (TensorDump.Enabled)
             TensorDump.Dump2D("result_norm", hidden, seqLen, hiddenSize);
 
-        Gemm(_outputWeight, _outputQuantType, hidden, logits,
+        // MTP (issues #253, #469): capture the POST-final-norm hidden state for every position —
+        // llama.cpp's `h_nextn`, taken after output_norm and before the lm_head (and before the
+        // Hadamard rotation that feeds it). Pre-norm rows are the wrong input: the head's hnorm
+        // is an RMSNorm, which cancels scale but not output_norm's per-channel weights.
+        CpuMtpState? mtpCapture = mtpState as CpuMtpState;
+        if (mtpCapture is not null && _mtpHead is not null)
+            mtpCapture.SetCapturedRows(new ReadOnlySpan<float>(hidden, seqLen * hiddenSize), seqLen);
+
+        // output.weight is folded too — the final-norm output needs rotating before the lm_head.
+        float* headIn = hidden;
+        if (_hadamard is { } headRot)
+        {
+            headIn = (float*)_state.HadamardScratch;
+            headRot.RotateForward(hidden, headIn, seqLen, _outputInputDim);
+        }
+
+        Gemm(_outputWeight, _outputQuantType, headIn, logits,
              _outputOutputDim, _outputInputDim, seqLen);
 
         if (TensorDump.Enabled)
@@ -1130,7 +1175,139 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         new Span<float>(logits, seqLen * vocabSize).CopyTo(
             new Span<float>((void*)result.DataPointer, seqLen * vocabSize));
 
+        if (mtpCapture is not null && _mtpHead is not null)
+            AbsorbMtp(_mtpHead, mtpCapture, tokenIds, positions);
+        if (dflashTaps is not null)
+        {
+            dflashTaps.InjectCaptured(positions.Slice(tapFirst));
+            dflashTaps.TrimTapRows();
+        }
+
         return result;
+    }
+
+    /// <summary>
+    /// Runs the MTP head over every token of a trunk batch, without logits, so its KV-cache holds
+    /// the whole sequence — llama.cpp's <c>common_speculative_impl_draft_mtp::process()</c>
+    /// (issue #469). Token <c>i</c> at <c>positions[i]</c> pairs with the trunk hidden state of
+    /// the PREVIOUS position: the carried row for <c>i == 0</c>, captured row <c>i - 1</c>
+    /// otherwise. Leaves the carry and the pending hidden at the batch's last captured row.
+    /// </summary>
+    private void AbsorbMtp(MtpHeadWeights mtpHead, CpuMtpState state,
+                           ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions)
+    {
+        if (!MtpAbsorbDispatch.UsePerToken && MtpAbsorbDispatch.IsContiguous(positions))
+        {
+            AbsorbMtpBatched(mtpHead, state, tokenIds, positions[0]);
+            state.SeedFromCapturedRow(tokenIds.Length - 1);
+            return;
+        }
+        for (int i = 0; i < tokenIds.Length; i++)
+        {
+            if (i == 0) state.SetPendingFromCarry();
+            else state.SetPendingFromCapturedRow(i - 1);
+            ForwardMtpCore(mtpHead, state, tokenIds[i], positions[i], computeLogits: false);
+        }
+        state.SeedFromCapturedRow(tokenIds.Length - 1);
+    }
+
+    /// <summary>
+    /// Batched, KV-only absorb of S contiguous positions (issue #472) — see
+    /// <see cref="MtpAbsorbDispatch"/>. Computes exactly the K/V rows <see cref="ForwardMtpCore"/>
+    /// writes per token, for all S rows at once, and nothing past them: an absorbed step's output
+    /// hidden is discarded, so its attention, O-projection and FFN are dead compute.
+    /// </summary>
+    private void AbsorbMtpBatched(MtpHeadWeights mtpHead, CpuMtpState state,
+                                  ReadOnlySpan<int> tokenIds, int firstPosition)
+    {
+        int s = tokenIds.Length;
+        int hiddenSize = Config.HiddenSize;
+        var attn = mtpHead.Layer.FullAttn!;
+        int numKvHeads = attn.NumKvHeads;
+        int headDim = Config.HeadDim;
+        int kvStride = numKvHeads * headDim;
+        float eps = Config.NormEpsilon;
+
+        state.BeginAbsorb(firstPosition, s);
+
+        var pool = ArrayPool<float>.Shared;
+        float[] embedArr = pool.Rent(s * hiddenSize);
+        float[] pairArr = pool.Rent(s * hiddenSize);
+        float[] concatArr = pool.Rent(s * 2 * hiddenSize);
+        float[] curArr = pool.Rent(s * hiddenSize);
+        float[] normedArr = pool.Rent(s * hiddenSize);
+        int[] posArr = ArrayPool<int>.Shared.Rent(s);
+        try
+        {
+            var embed = embedArr.AsSpan(0, s * hiddenSize);
+            var pair = pairArr.AsSpan(0, s * hiddenSize);
+            var concat = concatArr.AsSpan(0, s * 2 * hiddenSize);
+            var cur = curArr.AsSpan(0, s * hiddenSize);
+            var normed = normedArr.AsSpan(0, s * hiddenSize);
+            var pos = posArr.AsSpan(0, s);
+            for (int i = 0; i < s; i++) pos[i] = firstPosition + i;
+
+            // ── Embed all S tokens. The trunk-table fallback goes through EmbedTokens, which also
+            //    restores the primal basis of a Hadamard-latent table (#435); a head-local
+            //    nextn.embed_tokens is not folded. ──
+            if (mtpHead.EmbedTokensWeight is { } headEmbed)
+            {
+                for (int i = 0; i < s; i++)
+                    EmbedOneToken(tokenIds[i], headEmbed, mtpHead.EmbedTokensQuantType,
+                        embed.Slice(i * hiddenSize, hiddenSize), hiddenSize);
+            }
+            else
+            {
+                fixed (float* embedPtr = embed)
+                    EmbedTokens(tokenIds, embedPtr, hiddenSize);
+            }
+
+            // Pairing (#469): token i goes with h_{p-1} — the carry for i == 0, captured row i-1 otherwise.
+            state.CopyAbsorbPairingRows(s, pair);
+
+            // concat row i = [enorm(embed_i), hnorm(h_i)]
+            for (int i = 0; i < s; i++)
+            {
+                var row = concat.Slice(i * 2 * hiddenSize, 2 * hiddenSize);
+                RmsNorm.Execute(embed.Slice(i * hiddenSize, hiddenSize), mtpHead.EnormWeight, eps,
+                    row.Slice(0, hiddenSize));
+                RmsNorm.Execute(pair.Slice(i * hiddenSize, hiddenSize), mtpHead.HnormWeight, eps,
+                    row.Slice(hiddenSize, hiddenSize));
+            }
+
+            fixed (float* concatPtr = concat, curPtr = cur)
+                Gemm(mtpHead.EhProjWeight, mtpHead.EhProjQuantType, concatPtr, curPtr,
+                     mtpHead.EhProjOutputDim, mtpHead.EhProjInputDim, s);
+
+            for (int i = 0; i < s; i++)
+                RmsNorm.Execute(cur.Slice(i * hiddenSize, hiddenSize), mtpHead.Layer.AttnNormWeight, eps,
+                    normed.Slice(i * hiddenSize, hiddenSize));
+
+            // K/V projections write straight into the head's cache slab [firstPosition, +s): the
+            // cache is one contiguous [maxSteps, kvStride] buffer.
+            float* kDst = state.KeyCachePtr + (long)firstPosition * kvStride;
+            float* vDst = state.ValueCachePtr + (long)firstPosition * kvStride;
+            fixed (float* normedPtr = normed)
+            {
+                Gemm(attn.KWeight, attn.KQuantType, normedPtr, kDst, attn.KOutputDim, attn.KInputDim, s);
+                Gemm(attn.VWeight, attn.VQuantType, normedPtr, vDst, attn.VOutputDim, attn.VInputDim, s);
+            }
+
+            var kSlab = new Span<float>(kDst, s * kvStride);
+            Mamba3QkNorm.Execute(kSlab, attn.KNormWeight, eps, s, numKvHeads, headDim);
+            _rope.Apply(Span<float>.Empty, kSlab, pos, /* numHeads */ 0, numKvHeads, headDim, RoPEType.NeoX);
+
+            state.EndAbsorb(firstPosition + s);
+        }
+        finally
+        {
+            pool.Return(embedArr);
+            pool.Return(pairArr);
+            pool.Return(concatArr);
+            pool.Return(curArr);
+            pool.Return(normedArr);
+            ArrayPool<int>.Shared.Return(posArr);
+        }
     }
 
     /// <inheritdoc/>
@@ -1139,7 +1316,11 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     /// caller-supplied <see cref="IGdnState"/>. Callers that treat each forward as an independent
     /// sequence (perplexity windows) must call this between sequences — see issue #261.
     /// </remarks>
-    public void ResetSequenceState() => _gdnCache.Reset();
+    public void ResetSequenceState()
+    {
+        _gdnCache.Reset();
+        _rowSnapshotValidRows = 0;   // issue #473: snapshots no longer describe the state
+    }
 
     /// <inheritdoc/>
     public bool RequiresPerSequenceState => true;
@@ -1161,27 +1342,188 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     public bool SupportsRecurrentStateCheckpoint => true;
 
     /// <inheritdoc/>
-    public object? CheckpointRecurrentState() => _gdnCache.Clone();
+    /// <remarks>
+    /// Snapshots are pooled (one spare): a speculative decoder takes one per round, and allocating
+    /// and zeroing a fresh copy of every layer's recurrent state each time cost more than the copy
+    /// (issue #469). Disposing the returned checkpoint hands its buffers back for the next round.
+    /// </remarks>
+    public object? CheckpointRecurrentState()
+    {
+        CommitPendingRows();
+        GdnStateCache snapshot = Interlocked.Exchange(ref _spareGdnCheckpoint, null)
+            ?? new GdnStateCache(_gdn, _gdnCache.NumGdnLayers);
+        _gdnCache.CopyTo(snapshot);
+        return new PooledGdnCheckpoint(this, snapshot);
+    }
+
+    /// <inheritdoc/>
+    public long RecurrentStateCheckpointBytes => _gdnCache.AllocatedBytes;
+
+    private GdnStateCache? _spareGdnCheckpoint;
+
+    /// <summary>A pooled GDN snapshot; disposing returns its buffers to the owning model.</summary>
+    private sealed class PooledGdnCheckpoint(Qwen3HybridDenseTransformerModel owner, GdnStateCache snapshot)
+        : IDisposable
+    {
+        private GdnStateCache? _snapshot = snapshot;
+
+        public GdnStateCache Snapshot
+            => _snapshot ?? throw new ObjectDisposedException(nameof(PooledGdnCheckpoint));
+
+        public void Dispose()
+        {
+            var s = Interlocked.Exchange(ref _snapshot, null);
+            if (s is null) return;
+            if (Interlocked.CompareExchange(ref owner._spareGdnCheckpoint, s, null) is not null)
+                s.Dispose();
+        }
+    }
 
     /// <inheritdoc/>
     public void RestoreRecurrentState(object? checkpoint)
     {
-        if (checkpoint is null) return;
-        if (checkpoint is not GdnStateCache snapshot)
-            throw new ArgumentException(
-                $"{GetType().Name}.RestoreRecurrentState expects a GdnStateCache checkpoint; got {checkpoint.GetType().Name}.",
-                nameof(checkpoint));
-        snapshot.CopyTo(_gdnCache);
+        GdnStateCache snapshot = checkpoint switch
+        {
+            null => null!,
+            PooledGdnCheckpoint pooled => pooled.Snapshot,
+            GdnStateCache raw => raw,
+            _ => throw new ArgumentException(
+                $"{GetType().Name}.RestoreRecurrentState expects a checkpoint from CheckpointRecurrentState; " +
+                $"got {checkpoint.GetType().Name}.",
+                nameof(checkpoint)),
+        };
+        snapshot?.CopyTo(_gdnCache);
+        if (snapshot is not null)
+            _rowSnapshotValidRows = 0;   // issue #473
+    }
+
+    // ── Per-row recurrent snapshots (issue #473) ─────────────────────────────
+
+    // Issue #1194: no copy of the GDN state at all. The verify scan reads the live state and never writes it (nor the conv state);
+    // per row and GDN layer it keeps only what GatedDeltaNetScan.Replay needs: the L2-normalised keys, the decays and the scan's
+    // deltas (nV * (1 + dS) + nK * dS floats vs nV * dS^2). The conv windows of all rows share one slice of ConvInput
+    // (rows 1 .. rows + dConv - 2). The accepted rows are then replayed into the live state in place. Capacity is the most rows any
+    // verify has asked for.
+    private readonly Qwen4ExpNativeBuffer _rowRecK = new(), _rowRecG = new(), _rowRecD = new(), _rowSnapConv = new();
+    private int _rowSnapCapacity;
+    private int _rowSnapshotRequestRows;   // > 0 only while ForwardWithRecurrentSnapshots runs
+    private int _rowSnapshotValidRows;     // rows the last such forward recorded and not yet committed; 0 = none
+
+    /// <summary>Bytes currently held by the per-row recurrent snapshot scratch (issues #473, #1194).</summary>
+    public long RecurrentRowSnapshotBytes
+        => _rowRecK.Bytes + _rowRecG.Bytes + _rowRecD.Bytes + _rowSnapConv.Bytes;
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Read-only verify (#1194): the forward leaves the GDN and conv state untouched and records, per row and GDN layer, the scan's
+    /// keys, decays and deltas. <see cref="RestoreRecurrentStateToRow"/> replays rows 0..r into the live state in place; without a
+    /// rollback, the next forward (or checkpoint) replays every row. The replay is bit-identical to the scan's own update, so the state
+    /// matches what plain decoding of the accepted tokens leaves.
+    /// </remarks>
+    public bool SupportsRecurrentRowSnapshots => true;
+
+    /// <inheritdoc/>
+    public ITensor ForwardWithRecurrentSnapshots(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                                                 int deviceId, IKvCache? kvCache, IMtpState? mtpState)
+    {
+        CommitPendingRows();   // before the records are reused or regrown
+        int rows = tokenIds.Length;
+        EnsureRowSnapshotCapacity(rows);
+        _rowSnapshotRequestRows = rows;
+        ITensor logits;
+        try
+        {
+            logits = Forward(tokenIds, positions, deviceId, kvCache, gdnState: null, mtpState);
+        }
+        finally
+        {
+            _rowSnapshotRequestRows = 0;
+        }
+        _rowSnapshotValidRows = rows;
+        return logits;
+    }
+
+    /// <inheritdoc/>
+    public void RestoreRecurrentStateToRow(int row)
+    {
+        if ((uint)row >= (uint)_rowSnapshotValidRows)
+            throw new InvalidOperationException(
+                $"No recurrent snapshot for row {row}: the last ForwardWithRecurrentSnapshots recorded " +
+                $"{_rowSnapshotValidRows} row(s), or a later forward invalidated them.");
+        CommitRows(row + 1);
+    }
+
+    /// <summary>Replays every row of a not-yet-committed read-only verify into the live state (#1194).</summary>
+    private void CommitPendingRows()
+    {
+        if (_rowSnapshotValidRows > 0) CommitRows(_rowSnapshotValidRows);
+    }
+
+    /// <summary>Advances the untouched live GDN and conv state through the first <paramref name="rows"/> verify rows, in place.</summary>
+    private void CommitRows(int rows)
+    {
+        _rowSnapshotValidRows = 0;
+        for (int l = 0; l < _gdnCache.NumGdnLayers; l++)
+        {
+            GatedDeltaNetScan.Replay(_gdnCache.GetGdnState(l), default, RowRecLayer(_rowRecK, l, _gdn.NKHead * _gdn.DState),
+                RowRecLayer(_rowRecG, l, _gdn.NVHead), RowRecLayer(_rowRecD, l, _gdn.NVHead * _gdn.DState),
+                _gdn.NVHead, _gdn.NKHead, _gdn.DState, rows);
+            if (_gdn.DConv > 1) RowSnapshotConv(l, rows - 1).CopyTo(_gdnCache.GetConvState(l));
+        }
+    }
+
+    private void EnsureRowSnapshotCapacity(int rows)
+    {
+        if (rows <= _rowSnapCapacity) return;
+        int layers = _gdnCache.NumGdnLayers;
+        int kDim = _gdn.NKHead * _gdn.DState, vDim = _gdn.NVHead * _gdn.DState, convDim = 2 * kDim + vDim;
+        _rowRecK.EnsureExact(Math.Max((long)layers * rows * kDim, 16));
+        _rowRecG.EnsureExact(Math.Max((long)layers * rows * _gdn.NVHead, 16));
+        _rowRecD.EnsureExact(Math.Max((long)layers * rows * vDim, 16));
+        _rowSnapConv.EnsureExact(Math.Max((long)layers * RowSnapConvRows(rows) * convDim, 16));
+        _rowSnapCapacity = rows;
+    }
+
+    private void FreeRowSnapshots()
+    {
+        _rowRecK.Dispose();
+        _rowRecG.Dispose();
+        _rowRecD.Dispose();
+        _rowSnapConv.Dispose();
+        _rowSnapCapacity = 0;
+        _rowSnapshotValidRows = 0;
+    }
+
+    /// <summary>ConvInput rows the conv windows of <paramref name="rows"/> snapshot rows span: rows 1 .. rows + dConv - 2.</summary>
+    private int RowSnapConvRows(int rows) => _gdn.DConv > 1 ? rows + _gdn.DConv - 2 : 0;
+
+    /// <summary>GDN layer <paramref name="ordinal"/>'s region of a per-row record (<paramref name="perRow"/> floats per row).</summary>
+    private Span<float> RowRecLayer(Qwen4ExpNativeBuffer buffer, int ordinal, int perRow)
+        => buffer.Slice((long)ordinal * _rowSnapCapacity * perRow, _rowSnapCapacity * perRow);
+
+    /// <summary>GDN layer <paramref name="ordinal"/>'s conv window after row <paramref name="row"/>: stashed ConvInput rows row+1 .. row+dConv-1.</summary>
+    private Span<float> RowSnapshotConv(int ordinal, int row)
+    {
+        int convDim = (2 * _gdn.NKHead + _gdn.NVHead) * _gdn.DState;
+        return _rowSnapConv.Slice(((long)ordinal * RowSnapConvRows(_rowSnapCapacity) + row) * convDim, _gdnCache.ConvStateElements);
     }
 
     /// <inheritdoc/>
     /// <remarks>
     /// Sized for the MTP head's own attention (<see cref="Config"/>'s standard head count/dim —
-    /// the MTP block is a normal full-attention layer, see <see cref="MtpHeadWeights"/>), with a
-    /// KV-cache deep enough for <see cref="MtpDefaultMaxDraftSteps"/> autoregressive draft steps.
+    /// the MTP block is a normal full-attention layer, see <see cref="MtpHeadWeights"/>). The head's
+    /// KV-cache is indexed by sequence position (issue #469), so it must cover the whole sequence;
+    /// this overload uses the model's whole context window as the ceiling. The head KV allocates
+    /// lazily (issue #966), so that costs only the first 1024 positions up front.
     /// </remarks>
     public IMtpState? CreateMtpState()
+        => CreateMtpState(Math.Max(MtpDefaultMaxSequenceLength, Config.MaxSequenceLength));
+
+    /// <inheritdoc/>
+    public IMtpState? CreateMtpState(int maxSequenceLength)
     {
+        if (_dflash is not null)
+            return new DFlash.DFlashMtpState(_dflash);   // an attached DFlash drafter takes the MTP slot (#1175)
         if (_mtpHead is null)
             return null;
 
@@ -1189,20 +1531,20 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             hiddenSize: Config.HiddenSize,
             numKvHeads: _mtpHead.Layer.FullAttn!.NumKvHeads,
             headDim: Config.HeadDim,
-            maxSteps: MtpDefaultMaxDraftSteps);
+            maxSteps: maxSequenceLength);
     }
 
     /// <summary>
-    /// Default MTP KV-cache depth when a caller doesn't need a specific candidate count K up
-    /// front. Callers that know K in advance (e.g. an MTP self-speculative decoder, see issue
-    /// #253) can size their own <see cref="CpuMtpState"/> directly instead of going through
-    /// <see cref="CreateMtpState"/>.
+    /// Floor of the ceiling <see cref="CreateMtpState()"/> uses: <c>max(this, Config.MaxSequenceLength)</c>.
+    /// Callers that know their context length should use <see cref="CreateMtpState(int)"/>.
     /// </summary>
-    public const int MtpDefaultMaxDraftSteps = 16;
+    public const int MtpDefaultMaxSequenceLength = 4096;
 
     /// <inheritdoc/>
     public ITensor ForwardMtp(IMtpState state, int tokenId, int position)
     {
+        if (state is DFlash.DFlashMtpState dflash)
+            return ForwardDFlashDraft(dflash, tokenId, position);
         if (_mtpHead is null)
             throw new NotSupportedException(
                 $"{nameof(Qwen3HybridDenseTransformerModel)} has no MTP head loaded (SupportsMtp=false).");
@@ -1213,7 +1555,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         if ((uint)tokenId >= (uint)Config.VocabSize)
             throw new ArgumentOutOfRangeException(nameof(tokenId));
 
-        return ForwardMtpCore(_mtpHead, mtp, tokenId, position);
+        return ForwardMtpCore(_mtpHead, mtp, tokenId, position, computeLogits: true)!;
     }
 
     /// <summary>
@@ -1288,10 +1630,19 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         int gdnOrdinal = _gdnLayerOrdinal[absoluteLayerIdx];
 
         // ── 1. Projections from normed input ──────────────────────────────────
-        // All four projections read from normOut (the attn_norm output).
-        Gemm(gdnW.QkvWeight, gdnW.QkvQuantType, normOut, qkvBuf,
+        // All four projections read from normOut (the attn_norm output), but on a
+        // Hadamard-folded checkpoint only qkv and gate are folded: alpha and beta are NOT, so they
+        // must keep reading the unrotated activation. Hence the rotation goes to scratch.
+        float* foldedIn = normOut;
+        if (_hadamard is { } rot)
+        {
+            foldedIn = (float*)_state.HadamardScratch;
+            rot.RotateForward(normOut, foldedIn, seqLen, gdnW.QkvInputDim);
+        }
+
+        Gemm(gdnW.QkvWeight, gdnW.QkvQuantType, foldedIn, qkvBuf,
              gdnW.QkvOutputDim, gdnW.QkvInputDim, seqLen);
-        Gemm(gdnW.GateWeight, gdnW.GateQuantType, normOut, zBuf,
+        Gemm(gdnW.GateWeight, gdnW.GateQuantType, foldedIn, zBuf,
              gdnW.GateOutputDim, gdnW.GateInputDim, seqLen);
         Gemm(gdnW.AlphaWeight, gdnW.AlphaQuantType, normOut, alphaBuf,
              gdnW.AlphaOutputDim, gdnW.AlphaInputDim, seqLen);
@@ -1356,11 +1707,24 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         if (TensorDump.Enabled)
             TensorDump.Dump2D($"blk.{absoluteLayerIdx}.conv_output_silu", qkvBuf, seqLen, convDim);
 
-        // Save the trailing (dConv-1) rows of convInput back as rolling state.
-        for (int r = 0; r < dConv - 1; r++)
+        // Issue #473/#1194: a read-only verify records every row and leaves the conv and GDN state untouched.
+        int snapRows = _rowSnapshotRequestRows > 0 && ReferenceEquals(gdnCache, _gdnCache)
+            ? Math.Min(_rowSnapshotRequestRows, seqLen)
+            : 0;
+
+        // Save the trailing (dConv-1) rows of convInput back as rolling state (not in a read-only verify: the commit does it).
+        for (int r = 0; snapRows == 0 && r < dConv - 1; r++)
         {
             new ReadOnlySpan<float>(convInput + (seqLen + r) * convDim, convDim)
                 .CopyTo(convState.Slice(r * convDim, convDim));
+        }
+        // After row t the rolling window is convInput rows t+1 .. t+dConv-1 (the save above takes t = seqLen-1); every window lies in
+        // convInput rows 1 .. snapRows + dConv - 2, stashed once (#1194).
+        if (snapRows > 0 && dConv > 1)
+        {
+            int convRows = RowSnapConvRows(snapRows);
+            new ReadOnlySpan<float>(convInput + convDim, convRows * convDim)
+                .CopyTo(_rowSnapConv.Slice((long)gdnOrdinal * RowSnapConvRows(_rowSnapCapacity) * convDim, convRows * convDim));
         }
 
         // ── 4. De-interleave Q/K/V and L2-normalise Q and K ──────────────────
@@ -1388,6 +1752,12 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
 
         // ── 5. GDN scan ───────────────────────────────────────────────────────
         var gdnState = gdnCache.GetGdnState(gdnOrdinal);
+        if (snapRows > 0)
+        {
+            // #1194: what Replay advances the untouched live state with: the rows' keys and decays (the scan records the deltas).
+            new ReadOnlySpan<float>(kBuf, snapRows * kDim).CopyTo(RowRecLayer(_rowRecK, gdnOrdinal, kDim));
+            new ReadOnlySpan<float>(alphaBuf, snapRows * nVHead).CopyTo(RowRecLayer(_rowRecG, gdnOrdinal, nVHead));
+        }
         GatedDeltaNetScan.Execute(
             state: gdnState,
             q: new ReadOnlySpan<float>(qBuf, seqLen * kDim),
@@ -1399,7 +1769,11 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             nVHead: nVHead,
             nKHead: nKHead,
             dState: dState,
-            seqLen: seqLen);
+            seqLen: seqLen,
+            snapshotRows: snapRows,
+            deltaRecord: snapRows > 0 ? RowRecLayer(_rowRecD, gdnOrdinal, vDim) : default,
+            readOnlyState: snapRows > 0,
+            pool: _threadPool);
         if (TensorDump.Enabled)
             TensorDump.Dump3D($"blk.{absoluteLayerIdx}.attn_output", gdnOut, seqLen, nVHead, dState);
 
@@ -1430,7 +1804,17 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             TensorDump.Dump3D($"blk.{absoluteLayerIdx}.final_output", gdnOut, seqLen, nVHead, dState);
 
         // ── 7. ssm_out projection into normOut ────────────────────────────────
-        Gemm(gdnW.OutWeight, gdnW.OutQuantType, gdnOut, normOut,
+        // ssm_out is the one folded weight that also needs the value-head permutation: the fold was
+        // computed in grouped [dState, rep, nKHead] order while the recurrence emits tiled order.
+        float* outIn = gdnOut;
+        if (_hadamard is { } outRot)
+        {
+            outIn = (float*)_state.HadamardScratch;
+            outRot.RotateForward(gdnOut, outIn, seqLen, gdnW.OutInputDim,
+                                 permuteGdnValueHeads: true);
+        }
+
+        Gemm(gdnW.OutWeight, gdnW.OutQuantType, outIn, normOut,
              gdnW.OutOutputDim, gdnW.OutInputDim, seqLen);
 
         if (TensorDump.Enabled)
@@ -1470,7 +1854,16 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         float* gate = (float*)_state.GateScratch;
 
         // 1. Fused Q+Gate projection.
-        Gemm(attn.QWeight, attn.QQuantType, normOut, qgBuf, attn.QOutputDim, attn.QInputDim, seqLen);
+        // attn_q/attn_k/attn_v are all folded and all read the same attn_norm output, so one
+        // rotation serves the three (the fork memoizes the identical way).
+        float* projIn = normOut;
+        if (_hadamard is { } qkvRot)
+        {
+            projIn = (float*)_state.HadamardScratch;
+            qkvRot.RotateForward(normOut, projIn, seqLen, attn.QInputDim);
+        }
+
+        Gemm(attn.QWeight, attn.QQuantType, projIn, qgBuf, attn.QOutputDim, attn.QInputDim, seqLen);
         if (TensorDump.Enabled)
             TensorDump.Dump2D($"blk.{layer}.fa_qg", qgBuf, seqLen, qgElems);
 
@@ -1499,8 +1892,8 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         }
 
         // 3. K and V projections.
-        Gemm(attn.KWeight, attn.KQuantType, normOut, k, attn.KOutputDim, attn.KInputDim, seqLen);
-        Gemm(attn.VWeight, attn.VQuantType, normOut, v, attn.VOutputDim, attn.VInputDim, seqLen);
+        Gemm(attn.KWeight, attn.KQuantType, projIn, k, attn.KOutputDim, attn.KInputDim, seqLen);
+        Gemm(attn.VWeight, attn.VQuantType, projIn, v, attn.VOutputDim, attn.VInputDim, seqLen);
         if (TensorDump.Enabled)
         {
             TensorDump.Dump2D($"blk.{layer}.fa_k", k, seqLen, numKvHeads * headDim);
@@ -1527,12 +1920,11 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         //    synthetic CPU↔CUDA parity fixture in CudaQwen3MoeHybridParityTests.cs (shared attention
         //    implementation).
         int kvStride = numKvHeads * headDim;
-        RoPE.Execute(
+        _rope.Apply(
             new Span<float>(q, seqLen * qElems),
             new Span<float>(k, seqLen * kvStride),
             positions,
-            numHeads, numKvHeads, headDim, _ropeDim,
-            _ropeCosTable, _ropeSinTable, RoPEType.NeoX);
+            numHeads, numKvHeads, headDim, RoPEType.NeoX);
         if (TensorDump.Enabled)
         {
             TensorDump.Dump2D($"blk.{layer}.fa_q_postrope", q, seqLen, qElems);
@@ -1584,7 +1976,16 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             TensorDump.Dump2D($"blk.{layer}.fa_attnout_postgate", attnOut, seqLen, qElems);
 
         // 8. Output projection.
-        Gemm(attn.OWeight, attn.OQuantType, attnOut, normOut, attn.OOutputDim, attn.OInputDim, seqLen);
+        // attn_output shares the 6144-wide sign vector with ssm_out but takes NO value-head
+        // permutation — the permutation is per-weight state, not a property of the width.
+        float* oIn = attnOut;
+        if (_hadamard is { } oRot)
+        {
+            oIn = (float*)_state.HadamardScratch;
+            oRot.RotateForward(attnOut, oIn, seqLen, attn.OInputDim);
+        }
+
+        Gemm(attn.OWeight, attn.OQuantType, oIn, normOut, attn.OOutputDim, attn.OInputDim, seqLen);
     }
 
     /// <summary>
@@ -1600,8 +2001,16 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         float* ffnUp = (float*)_state.FfnUp;
         float* siluOut = (float*)_state.SiluOutput;
 
-        Gemm(lw.GateWeight, lw.GateQuantType, normOut, ffnGate, lw.GateOutputDim, lw.GateInputDim, seqLen);
-        Gemm(lw.UpWeight, lw.UpQuantType, normOut, ffnUp, lw.UpOutputDim, lw.UpInputDim, seqLen);
+        // ffn_gate and ffn_up are both folded and share the same input — one rotation.
+        float* ffnIn = normOut;
+        if (_hadamard is { } ffnRot)
+        {
+            ffnIn = (float*)_state.HadamardScratch;
+            ffnRot.RotateForward(normOut, ffnIn, seqLen, lw.GateInputDim);
+        }
+
+        Gemm(lw.GateWeight, lw.GateQuantType, ffnIn, ffnGate, lw.GateOutputDim, lw.GateInputDim, seqLen);
+        Gemm(lw.UpWeight, lw.UpQuantType, ffnIn, ffnUp, lw.UpOutputDim, lw.UpInputDim, seqLen);
 
         for (int t = 0; t < seqLen; t++)
         {
@@ -1611,7 +2020,16 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             FusedOps.SwiGLU(gateSpan, upSpan, outSpan);
         }
 
-        Gemm(lw.DownWeight, lw.DownQuantType, siluOut, normOut, lw.DownOutputDim, lw.DownInputDim, seqLen);
+        // ffn_down's input is the 17408-wide SwiGLU result. Reusing the scratch is safe: the
+        // gate/up rotation above has already been consumed by both GEMMs.
+        float* downIn = siluOut;
+        if (_hadamard is { } downRot)
+        {
+            downIn = (float*)_state.HadamardScratch;
+            downRot.RotateForward(siluOut, downIn, seqLen, lw.DownInputDim);
+        }
+
+        Gemm(lw.DownWeight, lw.DownQuantType, downIn, normOut, lw.DownOutputDim, lw.DownInputDim, seqLen);
     }
 
     private void EmbedTokens(ReadOnlySpan<int> tokenIds, float* hidden, int hiddenSize)
@@ -1646,6 +2064,12 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
                 Dequantize.ToFloat32(embPtr + (nint)((long)tokenId * rowBytes), hiddenSize, qt, destSpan);
             }
         }
+
+        // A Hadamard-latent embedding table stores rotated rows: restore the primal basis right
+        // after the lookup. Note the INVERSE order — rotation first, then signs (h = s * (H z)) —
+        // which is the opposite of every folded-weight site above.
+        if (_hadamard is { } embRot)
+            embRot.RotateInverseInPlace(hidden, tokenIds.Length, hiddenSize);
     }
 
     /// <summary>Single-token embedding lookup against an arbitrary embedding table — used by
@@ -1692,7 +2116,8 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     ///         <c>shared_head_head</c> (or the trunk's own LM head fallback) → logits.</item>
     /// </list>
     /// </remarks>
-    private ITensor ForwardMtpCore(MtpHeadWeights mtpHead, CpuMtpState state, int tokenId, int position)
+    private ITensor? ForwardMtpCore(MtpHeadWeights mtpHead, CpuMtpState state, int tokenId, int position,
+                                    bool computeLogits)
     {
         int hiddenSize = Config.HiddenSize;
         int vocabSize = Config.VocabSize;
@@ -1705,11 +2130,22 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         int intermediateSize = mtpHead.Layer.GateOutputDim;
         float eps = Config.NormEpsilon;
 
-        int step = state.CurrentLength;
+        // The head's KV-cache is indexed by sequence position (issue #469): slot p holds the pair
+        // (h_{p-1}, x_p). Writing at a later position discards anything speculative beyond it;
+        // a gap would leave unwritten slots inside the attention window.
+        if (state.CurrentLength > position)
+            state.Rollback(position);
+        else if (state.CurrentLength < position)
+            throw new InvalidOperationException(
+                $"MTP step at position {position} but the MTP KV-cache only covers {state.CurrentLength} " +
+                "positions. Every trunk Forward of the sequence must pass the MTP state so the head " +
+                "absorbs it (prefill included).");
+        int step = position;
         if (step >= state.MaxSteps)
             throw new InvalidOperationException(
-                $"CpuMtpState KV-cache exhausted ({state.MaxSteps} steps advanced). Size the state for " +
-                "at least numCandidates MTP draft steps per speculation round.");
+                $"CpuMtpState KV-cache exhausted at position {position} (MaxSteps={state.MaxSteps}). " +
+                "Create the state with CreateMtpState(maxSequenceLength) covering the whole sequence.");
+        state.EnsureCapacity(step + 1);   // issue #966: lazy head-KV growth, before any row pointer is taken
 
         var pool = ArrayPool<float>.Shared;
         float[] tokEmbedArr = pool.Rent(hiddenSize);
@@ -1753,10 +2189,21 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             var logits = logitsArr.AsSpan(0, vocabSize);
 
             // ── Embed predicted-from token, combine with pending trunk/MTP hidden state ──
+            bool usesTrunkEmbed = mtpHead.EmbedTokensWeight is null;
             EmbedOneToken(tokenId,
                 mtpHead.EmbedTokensWeight ?? _tokenEmbedWeight,
                 mtpHead.EmbedTokensWeight is not null ? mtpHead.EmbedTokensQuantType : _tokenEmbedQuantType,
                 tokEmbed, hiddenSize);
+
+            // PrismML Hadamard fold (#435): the MTP head falls back to the trunk's own
+            // token_embd.weight whenever the checkpoint ships no nextn.embed_tokens — and on a
+            // folded checkpoint (Bonsai 2) that table is in prism.hadamard.inverse_weight_names,
+            // i.e. it stores ROTATED rows. EmbedTokens restores the primal basis right after the
+            // lookup; this path must do the same or every MTP draft step runs on garbage. The MTP
+            // block's own nextn.embed_tokens (when present) is NOT folded, so it stays untouched.
+            if (usesTrunkEmbed && _hadamard is { } embRot)
+                fixed (float* tokEmbedPtr = tokEmbed)
+                    embRot.RotateInverseInPlace(tokEmbedPtr, 1, hiddenSize);
 
             RmsNorm.Execute(tokEmbed, mtpHead.EnormWeight, eps, eNorm);
             RmsNorm.Execute(state.PendingHidden, mtpHead.HnormWeight, eps, hNorm);
@@ -1796,8 +2243,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
 
             Span<int> posSpan = stackalloc int[1];
             posSpan[0] = position;
-            RoPE.Execute(q, k, posSpan, numHeads, numKvHeads, headDim, _ropeDim,
-                _ropeCosTable, _ropeSinTable, RoPEType.NeoX);
+            _rope.Apply(q, k, posSpan, numHeads, numKvHeads, headDim, RoPEType.NeoX);
 
             // Append this step's K/V into the MTP head's own tiny cache and attend causally over
             // everything drafted so far in this round (NOT the trunk's KV-cache).
@@ -1843,25 +2289,57 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
 
             Add.Execute(residual, cur, cur); // cur = ffn_residual + ffn_out
 
-            // `cur` is now the MTP block's own output hidden state ("h_pre_norm" in llama.cpp) —
-            // seed the NEXT ForwardMtp call's pending hidden with it before the head-norm below
-            // consumes it, then advance the MTP KV-cache length.
-            cur.CopyTo(state.PendingHiddenMutable);
             state.Advance();
+            if (!computeLogits)
+                return null;   // absorb: the caller seeds the next step from a trunk row
 
             // ── Shared LM head (falls back to the trunk's output_norm/output.weight when the
             //    GGUF didn't ship head-local nextn.shared_head_* tensors) ──
             float[] headNormWeight = mtpHead.SharedHeadNormWeight ?? _outputNormWeight;
             RmsNorm.Execute(cur, headNormWeight, eps, normedHead);
 
+            // The next chained draft step pairs this step's hidden state with the token it
+            // predicts. llama.cpp chains the head's `h_nextn`, i.e. AFTER shared_head_norm — the
+            // same post-norm convention as the trunk rows (issue #469).
+            normedHead.CopyTo(state.PendingHiddenMutable);
+
+            bool usesTrunkHead = mtpHead.SharedHeadHeadWeight is null;
             nint headWeight = mtpHead.SharedHeadHeadWeight ?? _outputWeight;
             QuantizationType headQt = mtpHead.SharedHeadHeadWeight is not null
                 ? mtpHead.SharedHeadHeadQuantType : _outputQuantType;
             int headOutputDim = mtpHead.SharedHeadHeadWeight is not null ? vocabSize : _outputOutputDim;
             int headInputDim = mtpHead.SharedHeadHeadWeight is not null ? hiddenSize : _outputInputDim;
 
+            // PrismML Hadamard fold (#435), the mirror of the embedding case above: falling back
+            // to the trunk's own output.weight means falling back to a FOLDED matrix (it is the
+            // first entry of prism.hadamard.weight_names), so its input needs the forward rotation
+            // exactly as the trunk's own lm_head does. A head-local nextn.shared_head_head is not
+            // folded and takes the unrotated input.
             fixed (float* normedHeadPtr = normedHead, logitsPtr = logits)
-                Gemm(headWeight, headQt, normedHeadPtr, logitsPtr, headOutputDim, headInputDim, 1);
+            {
+                float* headInPtr = normedHeadPtr;
+                float[]? headRotArr = null;
+                try
+                {
+                    if (usesTrunkHead && _hadamard is { } headRot)
+                    {
+                        headRotArr = pool.Rent(headInputDim);
+                        fixed (float* headRotPtr = headRotArr)
+                        {
+                            headRot.RotateForward(normedHeadPtr, headRotPtr, 1, headInputDim);
+                            Gemm(headWeight, headQt, headRotPtr, logitsPtr, headOutputDim, headInputDim, 1);
+                        }
+                    }
+                    else
+                    {
+                        Gemm(headWeight, headQt, headInPtr, logitsPtr, headOutputDim, headInputDim, 1);
+                    }
+                }
+                finally
+                {
+                    if (headRotArr is not null) pool.Return(headRotArr);
+                }
+            }
 
             var shape = new TensorShape(1, vocabSize);
             var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
@@ -1905,6 +2383,9 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             case QuantizationType.PQ2_0:
                 MatMul.GemmPQ2_0((byte*)weights, b, c, m, k, n, _threadPool);
                 return;
+            case QuantizationType.PTQ1_0:
+                MatMul.GemmPTQ1_0((byte*)weights, b, c, m, k, n, _threadPool);
+                return;
             case QuantizationType.I2_S:
                 MatMul.GemmI2_S((byte*)weights, b, c, m, k, n, _threadPool);
                 return;
@@ -1913,6 +2394,24 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
                 return;
             case QuantizationType.Q5_0:
                 MatMul.GemmQ5_0((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+                return;
+            case QuantizationType.Q2_K:
+                MatMul.GemmQ2_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+                return;
+            case QuantizationType.Q3_K:
+                MatMul.GemmQ3_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+                return;
+            case QuantizationType.IQ4_XS:
+                MatMul.GemmIQ4_XS((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+                return;
+            case QuantizationType.IQ2_XXS:
+            case QuantizationType.IQ2_XS:
+            case QuantizationType.IQ2_S:
+            case QuantizationType.IQ3_XXS:
+            case QuantizationType.IQ3_S:
+            case QuantizationType.IQ1_M:
+            case QuantizationType.IQ1_S:
+                MatMul.GemmIQCodebook(qt, (byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
                 return;
             case QuantizationType.Q4_K:
                 MatMul.GemmQ4_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
@@ -1929,6 +2428,13 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             case QuantizationType.F16:
                 MatMul.GemmF16(weights, b, c, m, k, n, _threadPool);
                 return;
+            case QuantizationType.Q4_0:
+            case QuantizationType.Q4_1:
+            case QuantizationType.Q5_1:
+            case QuantizationType.IQ4_NL:
+                // Packed x Q8_1 dot instead of dequantize-to-F32 (#489).
+                MatMul.GemmLegacyQuantOrDequant((byte*)weights, qt, b, c, m, k, n, _threadPool, preQuantizedInput);
+                return;
             default:
                 // Shared dequantize-and-dot fallback (#263): decodes each weight row once and
                 // reuses it across all n columns instead of re-decoding the matrix per token.
@@ -1944,12 +2450,17 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             _threadPool?.Dispose();
         _state.Dispose();
         _gdnCache.Dispose();
+        Interlocked.Exchange(ref _spareGdnCheckpoint, null)?.Dispose();
+        FreeRowSnapshots();
+        _dflash?.Dispose();
+        if (_dflashHeadScratch != 0) { System.Runtime.InteropServices.NativeMemory.AlignedFree((void*)_dflashHeadScratch); _dflashHeadScratch = 0; }
+        _ownedMtpHeadFile?.Dispose();
         GC.SuppressFinalize(this);
     }
 
-    private static float[] DequantizeF32(nint dataBase, GgufTensorDescriptor desc, int expectedSize)
+    private static float[] DequantizeF32(GgufDataBase dataBase, GgufTensorDescriptor desc, int expectedSize)
     {
-        nint ptr = dataBase + (nint)desc.DataOffset;
+        nint ptr = dataBase.Of(desc);
         float[] result = new float[expectedSize];
         Dequantize.ToFloat32(ptr, expectedSize, desc.QuantizationType, result);
         return result;

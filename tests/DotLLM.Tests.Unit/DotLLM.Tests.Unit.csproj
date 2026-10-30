@@ -42,6 +42,28 @@
          / ~/.dotllm/test-cache root), so it comes along. -->
     <Compile Include="..\DotLLM.Tests.Integration\Fixtures\TestModelDownloader.cs"
              Link="Fixtures\TestModelDownloader.cs" />
+    <!-- #384: shared checkpoint-load-to-skip helper (partial/locked download tolerance). -->
+    <Compile Include="..\DotLLM.Tests.Integration\Fixtures\CheckpointGuard.cs"
+             Link="Fixtures\CheckpointGuard.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- #409: chat-template fixtures are read at runtime from the output dir. [CallerFilePath] is
+         deterministic-path-mapped to "/_/..." in CI, so it cannot locate source files. -->
+    <None Include="Tokenizers\ChatTemplates\Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <!-- #815: header-only dump (metadata + tensor tables) of the real Qwen3.8-Flash-Next GGUFs; the contract test reads it at runtime. -->
+    <None Include="Models\Gguf\TestData\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <!-- #832: LittleBit spike fixture (generated offline from the paper equations). -->
+    <None Include="Cpu\Kernels\LittleBitData\littlebit_fixture.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Cpu\Kernels\LittleBitData\littlebit_real_fixture.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Cpu\Kernels\LittleBitData\littlebit_generation_reference.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Cpu\Kernels\LittleBitData\littlebit_packed_fixture.json" CopyToOutputDirectory="PreserveNewest" />
+    <!-- #866: NanoQuant crop fixture (real community bits + float64 numpy reference) and full-layer expectations. -->
+    <None Include="Cpu\Kernels\NanoQuantData\nanoquant_crop_fixture.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Cpu\Kernels\NanoQuantData\nanoquant_full_expect.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Cpu\Kernels\NanoQuantData\oracle_p*.json" CopyToOutputDirectory="PreserveNewest" />
+    <!-- #816: HF-generated Qwen4-Exp reference fixtures (generators in Models\Qwen4Exp\Reference; CI has no torch). -->
+    <None Include="Models\Qwen4Exp\Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>

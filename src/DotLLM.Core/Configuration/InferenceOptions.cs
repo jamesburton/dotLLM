@@ -69,11 +69,45 @@ public record InferenceOptions
     /// <summary>Maximum number of tokens to generate.</summary>
     public int MaxTokens { get; init; } = 2048;
 
+    /// <summary>
+    /// Repeat guard (#1291): end the request as <c>finish_reason=length</c> after this many identical tokens in a row.
+    /// Null uses the engine default (<c>RepeatGuardStopCondition.DefaultLimit</c>, 256); 0 disables. Only applies when
+    /// <see cref="StopConditions"/> is not supplied.
+    /// </summary>
+    public int? RepeatGuardLimit { get; init; }
+
+    /// <summary>
+    /// Thinking budget (#1292): after this many thinking tokens the engine forces the budget message and the close tag.
+    /// Null (default) = unlimited. Needs the sampler pipeline to have a tokenizer.
+    /// </summary>
+    public ThinkingBudget? ThinkingBudget { get; init; }
+
     /// <summary>Random seed for reproducible sampling. Null = non-deterministic.</summary>
     public int? Seed { get; init; }
 
+    /// <summary>
+    /// Draw stochastic tokens as a position-seeded Gumbel-max, <c>argmax(prepared logits + Gumbel(seed, generation index))</c> (#1358),
+    /// instead of from a sequential RNG stream. Exact, and speculative decoding then yields the same text as plain decoding for the same
+    /// seed. Default off (it changes which tokens a given <see cref="Seed"/> produces); <c>DOTLLM_GUMBEL_SAMPLING=1</c> turns it on globally.
+    /// No property initializer: this type may be deserialized through a source-generated context.
+    /// </summary>
+    public bool GumbelSampling { get; init; }
+
     /// <summary>Stop sequences that terminate generation.</summary>
     public IReadOnlyList<string> StopSequences { get; init; } = [];
+
+    /// <summary>
+    /// When non-null, <see cref="StopSequences"/> are suspended while the model is inside a reasoning block
+    /// (#767) and only match answer text after it. Null = stop strings are active from the first token.
+    /// EOS and max-tokens are never gated.
+    /// </summary>
+    public StopGate? ReasoningStopGate { get; init; }
+
+    /// <summary>
+    /// Entries of <see cref="StopSequences"/> exempt from <see cref="ReasoningStopGate"/> (template control
+    /// tokens such as <c>&lt;|im_end|&gt;</c> that must end the turn wherever they appear).
+    /// </summary>
+    public IReadOnlyList<string>? StopSequencesUngated { get; init; }
 
     /// <summary>
     /// Explicit sampler steps composing the sampling pipeline.
@@ -109,4 +143,12 @@ public record InferenceOptions
 
     /// <summary>CPU threading configuration for parallel inference. Default: auto (all cores).</summary>
     public ThreadingConfig Threading { get; init; } = ThreadingConfig.Auto;
+
+    /// <summary>
+    /// The text the chat template appended to the prompt as its generation prompt (e.g. <c>&lt;|im_start|&gt;assistant\n</c>),
+    /// or <see langword="null"/> when unknown (raw completions, or a template that cannot render without it). A recurrent
+    /// model's prefix snapshot then lands just before it, so the next turn of the conversation reuses this whole turn even
+    /// when it re-renders the generation prompt differently (issue #1093). Null keeps the previous snapshot placement.
+    /// </summary>
+    public string? GenerationPromptSuffix { get; init; }
 }

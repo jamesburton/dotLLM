@@ -30,7 +30,12 @@ public class VulkanMoeTopKSoftmaxF32KernelTests
     [InlineData(4, 8, 2, true)]                  // multi-token batch
     [InlineData(8, 16, 4, true)]                 // 8 tokens, 16 experts, top-4
     [InlineData(1, 16, 1, true)]                 // top-1 — degenerate (norm = identity)
-    [InlineData(1, 256, 8, true)]                // MAX_EXPERTS, top-8
+    [InlineData(1, 256, 8, true)]                // 256-expert regression arm (Qwen3.6-35B-A3B), top-8
+    [InlineData(2, 256, 8, true)]
+    [InlineData(1, 512, 10, true)]               // MAX_EXPERTS: Qwen3.8-Flash-Next router, top-10 renorm (#818)
+    [InlineData(3, 512, 10, true)]
+    [InlineData(2, 300, 10, true)]               // non-power-of-two count > 256
+    [InlineData(1, 512, 10, false)]              // raw softmax probs, no renorm
     public void Launch_MatchesCpuReference(
         int seqLen, int numExperts, int k, bool normTopKProb)
     {

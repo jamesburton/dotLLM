@@ -86,6 +86,43 @@ weights. CPU vec_dot pairs MXFP4 weights with Q8_0-quantized activations
 (nibble→sbyte pshufb LUT + integer MAC), mirroring llama.cpp's
 `ggml_vec_dot_mxfp4_q8_0`.
 
+### NVFP4 (4.5 bits/weight, GGUF type 40, #1038)
+
+```
+struct block_nvfp4 {         // 36 bytes, 64 values (QK_NVFP4 = 64, QK_NVFP4_SUB = 16)
+    uint8_t d[4];            // one UE4M3 scale per 16-element sub-block
+    uint8_t qs[32];          // 64 x 4-bit e2m1 indices
+};
+Value table: the doubled e2m1 table shared with MXFP4
+UE4M3: unsigned, 4 exponent bits (bias 7), 3 mantissa bits, returned halved;
+       0x00 and 0x7F decode to 0, bit 7 is ignored (ggml_ue4m3_to_fp32)
+Unpack: sub-block s owns qs[8s..8s+7]; byte j -> element 16s+j (low nibble), 16s+8+j (high nibble)
+Dequantize: val = kvalues[nibble] * ue4m3_half(d[s])
+```
+
+NVIDIA FP4. A tensor `X.weight` stored as NVFP4 usually has a sibling `X.scale`
+(F32, one element, NVIDIA's "scale2") that multiplies the matmul **output**
+(llama.cpp `build_lora_mm`: `mul_mat(w, x) * w_s`). In NVIDIA's Nemotron 3.5 Bolt
+GGUF these are about 1e-4, so a loader that drops one is off by ~4 orders of
+magnitude. `Nvfp4Support` makes every GGUF loader name the scales it applies and
+refuse the rest. Today only the Nemotron-H SSM projections (`ssm_in`, `ssm_out`) apply
+them, on CPU, Vulkan and CUDA; every other architecture refuses scaled NVFP4 weights, and
+the Vulkan and CUDA loaders refuse NVFP4 outside Nemotron-H.
+
+The CPU vec_dot pairs NVFP4 with Q8_0 activations (two Q8_0 blocks per NVFP4 block),
+a transcription of llama.cpp's `ggml_vec_dot_nvfp4_q8_0` (scalar + AVX2). Vulkan keeps
+the blocks packed and dequantizes in the shader against FP32 activations
+(`matmul_nvfp4_f32_gemv/gemm`, shared `nvfp4_decode.glsl`), applying `X.scale` to the output.
+CUDA (`native/kernels/nvfp4.cu`) decodes with a dp4a GEMV (`nvfp4_gemv_q8`, #1061): the token
+is quantized to int8 once by the house F32 activation quantizer (`pq2_0_dp4a_quantize_x`,
+byte-exact with the CPU's Q8_0 activation quantizer), the E2M1 codes are looked up as int8 with
+`__byte_perm`, and `X.scale` is folded in. That is the CPU's NVFP4 × Q8_0 numerics (only the FP32
+summation order differs) at ~315 GB/s of weights on an RTX 3060 at Bolt's `ssm_in` shape
+(136 µs, against 431 µs / 99 GB/s for #1038's FP32-activation GEMV). The FP32-activation GEMV
+remains for weights under 4 MiB, where the extra quantize launch costs more than it saves
+(`DOTLLM_NVFP4_DECODE_GEMV=auto|dp4a|f32`). Prefill goes through dequant-to-F16 + cuBLAS
+followed by an in-place scale kernel.
+
 ### I2_S (BitNet b1.58 ternary, ~2 bits/weight, GGUF type 36)
 
 ```
@@ -111,6 +148,56 @@ fast paths never noticed the distinction). dotLLM's ragged-K support (CPU: `MatM
 `I2SRaggedCode`/`UnpackRowRagged`; CUDA: `i2_s_gemv_{f16,f32}in_ragged` / `dequant_i2_s_f16_ragged`
 in `native/kernels/`) is a scalar, correctness-first fallback reached only when `k % 128 != 0` — the
 aligned SIMD/uint4 fast paths are untouched.
+
+### NanoQuant (community GGUF, sub-1-bit factorised; issue #866)
+
+Not a block quant: a linear is a **composite** of tensors, `W ~ diag(post) U diag(mid) V diag(pre)` with U, V in {+-1}.
+Community layout (`quantization.nanoquant.version = 2`, `bit_order = lsb_first`, `positive_bit = 0`,
+`outlier_format = column_side_path`), per linear `<base>`:
+
+| tensor | ggml dtype | GGUF dims (fastest first) |
+|---|---|---|
+| `.nq_u` | **I32** (type 26) | `[ceil(r/32), d_out]`  sign words, bit set = -1, LSB-first, tail clear |
+| `.nq_v` | **I32** | `[ceil(d_in/32), r]` |
+| `.nq_scale_pre / _mid / _post` | BF16 (30) / F16 / F32 | `[d_in] / [r] / [d_out]` |
+| `.nq_salient_idx` | I32 | `[k]` strictly increasing input columns (scale_pre is exactly 0 there) |
+| `.nq_salient_weight` | F16/BF16/F32 | `[k, d_out]`; `y += W_sal . x[idx]` using the RAW x |
+
+`y = post * (U (mid * (V (pre * x)))) + salient`. The sign layout is byte-identical to the LittleBit spike (#832), so
+`NanoQuantLayer` (`DotLLM.Cpu.Kernels.Experimental`) is one `LittleBitPath` plus the salient side path, with a float64
+scalar reference (`NanoQuantReference`). `NanoQuantLoader` (`DotLLM.Models.Quantization`) reads the composites. Stacked
+`attn_qkv` is just `d_out = dq+dk+dv`; ranks differ per tensor. Scales are held fp16 by the spike, so loading refuses
+bf16 values that are not exact in fp16 (the whole Qwen3-0.6B file is exact). `I32` is a raw-word type: no matmul kernel
+takes it. Quality of the available community files is low (Qwen3-0.6B WikiText PPL 55 -> 292); they are format/kernel
+vehicles. Test: `DOTLLM_NANOQUANT_GGUF` (or the HF-cache copy of `arelath/Qwen3-0.6B-nanoquant-GGUF`).
+
+**End-to-end CPU load (issue #869).** `NanoQuantLoader` composites are registered as `QuantizationType.LittleBit` weights
+(`FactorizedWeights`, see LittleBit above): `TransformerModel.LoadFromGguf` loads the community Qwen3-0.6B file as an ordinary
+dense Qwen3. Stacked `attn_qkv` is split by row into q (n_heads*head_dim), k, v (n_kv*head_dim) layers with the shared right
+factor replicated (3x stage-1 work for qkv; ~0.3 MiB each, negligible memory); the salient columns are applied by
+`GemmLittleBit` after the base GEMM on the raw input. Scales are F32 (bf16 widened exactly), so the former fp16-exactness guard is
+gone. Vulkan/CUDA/HIP/hybrid loaders and any non-Qwen3 architecture throw `NotSupportedException` ("CPU backend only" / "dense
+Qwen3"); the CPU-only switch is `TransformerWeights.LoadFromGguf(..., allowNanoQuant: true)`.
+
+- **Oracle** (modified llama.cpp fork `arelath/llama.cpp@nanoquants`, mingw CPU build, no repack, 3 prompts / 22 positions): top-1 agreement
+  22/22, per-position KL(oracle||dotLLM) 1.2e-7..7.9e-5 nats, max |dlogit| 0.002..0.065 over the 151,936-entry vocab; greedy 16-token
+  continuation identical for 2 of 3 prompts and 13/16 for the third (first divergence at generated token 14, cause not investigated; per-position logits agree to KL<1e-4). Test: `NanoQuantEndToEndTests` (committed top-1/top-5/greedy in `NanoQuantData/oracle_p*.json`; full logits from
+  `DOTLLM_NANOQUANT_ORACLE_DIR` / `~/.dotllm/test-cache/nanoquant-oracle`, skipped when absent).
+- **F32-decoded control** (`DOTLLM_LITTLEBIT_DENSE_CONTROL=1`: every projection incl. salient columns decoded to dense F32): layer-level
+  kernel-vs-dense gap 3.4e-6 of RMS (blk.0.ffn_gate); the model logits are (near-)bit-identical because the Q8_0 head quantises its
+  input to int8, which absorbs that gap.
+- **Perplexity** (`dotllm perplexity`, WikiText-2 test LF fixture, token ids dumped from the GGUF run so teacher and student score the
+  identical stream): 64 windows x 128 tokens (closest to the card protocol; card: BF16 55.17, NanoQuant 292.26, ratio 5.30x) -> dense bf16
+  Qwen3-0.6B (rev c1899de) **53.88**, NanoQuant **302.49**, ratio **5.61x**. 32 windows x 512 (second half scored): teacher 19.30, NanoQuant
+  99.96 (5.18x). Absolute numbers differ from the card because the card's own window sampling / batching is not reproducible from the card;
+  the ratio is the comparable figure and agrees to ~6%.
+- **Memory**: the 196 factorised projections hold 63.4 MiB resident (packed signs + F32 scales + F32 salient columns) vs 840 MiB as dense
+  bf16 (1680 MiB as the F32 the dense CPU path upcasts to): 13x/26x smaller. File 375 MiB total, dominated by the Q8_0 embedding and head
+  (2 x 157.6 MiB, mmap'd).
+- **Decode** (`dotllm run`, 64 tokens, greedy, CPU, 3 interleaved same-session pairs on a loaded box): NanoQuant 43.9 / 29.0 / 23.9 tok/s vs dense
+  bf16 (upcast to F32) 10.1 / 10.8 / 15.2: per-pair ratios 4.3x / 2.7x / 1.6x, median 2.7x. The NanoQuant file also benefits from its Q8_0 head
+  (the dense baseline streams an F32-upcast tied head), so read it as an upper bound of the projection-only gain.
+
 
 ## Kernel Types
 
@@ -142,6 +229,44 @@ GGUF files can have different types per tensor. Dispatch to correct kernel based
 - GPU: custom CUDA kernels dequantize in shared memory, use tensor cores. Ref: llama.cpp `ggml-cuda/mmq.cu`.
 - Block alignment awkward for SIMD — handle tail elements carefully.
 
+### Decode and prefill are two valid orderings of the same sum (issue #538)
+
+A quantized projection is computed by a **different kernel** depending on how many
+tokens are in flight, and the two do not agree bitwise. On Vulkan Q8_0, `n == 1`
+takes `matmul_q8_0_mmvq` (the decode GEMV) and `n > 1` takes `matmul_q8_0_mmq`
+(the prefill GEMM). This is expected, not a defect — but two things about it are
+easy to get wrong, so they are recorded here.
+
+**The activations are identical; only the accumulation order differs.** The two
+Q8_1 activation quantizers (`QuantizeQ8_1Kernel` and `QuantizeQ8_1RowsKernel`)
+emit **bitwise identical** `xq`/`xds` at `n == 1`, measured, with a control that
+reports a difference on two different rows. So the arms are summing the same
+numbers in a different order, and both land ~1E-07 RMS from an f64 accumulation
+of the same quantities. Neither is wrong.
+
+**But the prefill kernel is the less accurate of the two**, by 1.65× at K=2048
+and 2.37× at K=8192 — and the gap widens with K because the mechanism is
+**reduction depth**, not a missing scale (both scale per 32-block):
+
+| | how the block products are summed | error growth |
+|---|---|---|
+| `matmul_q8_0_mmvq` (decode) | blocks split across a subgroup, finished with `subgroupAdd` — a tree | O(log n) |
+| `matmul_q8_0_mmq` (prefill) | all K/32 blocks accumulated sequentially into one float | O(n) |
+
+Two consequences worth carrying:
+
+1. **Do not "unify" a dispatch split by routing `n == 1` through the `n > 1`
+   kernel.** In both halves of #538 the multi-token path is the *less* accurate
+   one (the same is true of attention, where prefill uses f16 coopmat tiles and
+   the 1-token path the f32 dense kernel). Converging on it degrades output.
+2. **Perplexity is scored through the prefill path**, so prefill accuracy is a
+   quality lever in its own right, independent of any chunking-consistency
+   question.
+
+`Probe538Q8SplitTests` holds this as a standing gate: the quantizers must stay
+bit-identical, MMVQ must stay deterministic, neither arm may drift from the f64
+oracle, and MMQ may not fall further than 5× behind MMVQ.
+
 ## Vulkan Backend Coverage
 
 The Vulkan backend ships native matmul kernels (GEMV decode + GEMM prefill, with an opt-in F16 cooperative-matrix tile when the device enumerates F16xF16→F32) for the following source dtypes / quant formats. Source bytes stay on device — dequantisation happens in the shader inner loop, so memory cost is the GGUF source size (not 2-4× expanded F32):
@@ -152,16 +277,67 @@ The Vulkan backend ships native matmul kernels (GEMV decode + GEMM prefill, with
 | F16 | ✓ | ✓ | ✓ (F16xF16→F32, M=N=K=16 tile) | `c9c08c5` |
 | BF16 | ✓ | ✓ | — (BF16 tiles not enumerated on RDNA3.5; use shift-left-16 reinterpret) | `c9c08c5` |
 | Q8_0 | ✓ | ✓ | ✓ (`MatMulQ8_0GemmCoopmatKernel`) | pre-existing |
-| Q2_K | ✓ | ✓ | — | (this branch) |
-| Q3_K | ✓ | ✓ | — | (this branch) |
-| Q4_K_M | ✓ | ✓ | — (Phase 1 follow-up) | `afb2272` + `b1ee6bc` |
-| Q5_K_M | ✓ | ✓ | — | `15099b9` + `83e0732` |
-| Q6_K_M | ✓ | ✓ | — | `29a1459` + `39b7646` |
+| Q2_K | ✓ | ✓ | — | layout fixed in #498 |
+| Q3_K | ✓ | ✓ | — | layout fixed in #311 |
+| Q4_K | ✓ | ✓ | — (Phase 1 follow-up) | `afb2272` + `b1ee6bc` |
+| Q5_K | ✓ | ✓ | — | `15099b9` + `83e0732` |
+| Q6_K | ✓ | ✓ | — | `29a1459` + `39b7646` |
+| Q5_0 | ✓ | ✓ | — | legacy-quant pair of Q8_0 |
 | IQ4_NL | ✓ | ✓ | — | IQ-family Phase 2 |
 | IQ4_XS | ✓ | ✓ | — | IQ-family Phase 2 |
+| IQ3_XXS | ✓ | ✓ | — | IQ-family |
+| IQ3_S | ✓ | ✓ | — | IQ-family |
+| IQ2_XXS | ✓ | ✓ | — | `79cca9b` |
+| IQ2_XS | ✓ | ✓ | — | `743984c` |
+| IQ2_S (also IQ2_M) | ✓ | ✓ | — | `9ecce75` |
 | IQ1_S | ✓ | ✓ | — | IQ-family — smallest GGUF quant (~1.5-1.7 bpw) |
+| I2_S | ✓ | ✓ | ✓ (`MatMulI2SGemmF32Kernel`) | BitNet b1.58 ternary |
+| PQ2_0 | ✓ | ✓ | ✓ (`MatMulPQ2_0GemmF32Kernel`) | PrismML ternary + per-group scale |
+| PTQ1_0 | ✓ | ✓ (untiled) | — | PrismML dense base-3 trits, 28 B / 128 (1.75 bpw), scale last; CPU + Vulkan only, CUDA refuses at load (#1280) |
+| Q4_0 | ✓ (+ dp4a MMVQ) | ✓ | ✓ (`MatMulQ4_0GemmCoopmatKernel`, wave64) | #1018 |
+| Q4_1 | ✓ (+ dp4a MMVQ) | ✓ | ✓ (same classes, `quant: Q4_1`, wave64) | #1171 (Recursive Flint's official file) |
+| Q5_1 | — | — | — | **not shipped** as a dense projection — see below |
 
-Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q2_K / Q3_K / IQ3_x / IQ2_x Vulkan kernels are not yet shipped — the upload path falls back to F32 dequant for those formats, so weight memory is doubled / quadrupled. K-quant Q4/5/6 priority was chosen because they cover the majority of production GGUF deployments (`*-Q4_K_M.gguf` is the de-facto default for most checkpoints); IQ4_NL and IQ4_XS followed because they are the most-used IQ-family quants in production (Llama-3.1 / Qwen2.5 IQ4_XS). IQ1_S closes the IQ family at the smallest end. Q2_K + Q3_K + IQ3 / IQ2 are present in the CUDA backend (lighter-weight reference kernels) and are tracked as Vulkan follow-ups.
+Routed MoE banks of Q4_0 / Q4_1 (and the IQ family) are read in place by `MoeIndexedMatmulIqMmvqKernel` (decode, any row count when
+no grouped kernel exists) and `MoeGroupedMatmulIqCoopmatKernel` (prefill, wave64 coopmat).
+
+**The unshipped dense set is exactly Q5_1** (and Q4_0 under `DOTLLM_VK_Q4_0_NATIVE=0`). For those the upload path falls back to
+F32 dequant, so weight memory is quadrupled; every other `QuantizationType` stays on device
+in its packed source form. The authority is `VulkanWeights.DeviceQuantTypeFor` — each
+`Keep*OnDevice` predicate there additionally requires the contraction axis to be a multiple of the
+format's group size, and a misaligned tensor of *any* format falls back to F32 regardless of kernel
+availability.
+
+**This table is the kernel inventory and the _dense_ (`VulkanWeights`) loader's coverage. The other
+weight loaders keep strictly less**, because each carries its own `DeviceQuantTypeFor` /
+`KeepQuantOnDevice` rather than sharing the dense one — a format having a kernel does not mean every
+architecture's loader will route to it:
+
+| loader | additionally falls back to F32 |
+|---|---|
+| `VulkanWeights` (dense) | — (the table above) |
+| `VulkanNemotronHWeights` | I2_S, PQ2_0 (Q5_0 stays packed since #568). nemotron_h_moe routed expert banks: Q8_0 and Q5_1 as stored, Q5_0 repacked to Q5_1; any other expert quant is refused with a `NotSupportedException` (#402, #407) |
+| `VulkanMamba3Weights` | Q5_0, I2_S, PQ2_0 |
+| `VulkanQwen3MoeHybridWeights` | Q5_0, Q2_K, Q3_K, IQ4_NL, IQ4_XS, IQ1_S, I2_S |
+| `VulkanQwen3HybridDenseWeights` | everything but PQ2_0 (it handles only the packed token embed) |
+
+Widening a hybrid loader is mechanical — add the missing `Keep*OnDevice` arms — but it is a code
+change, not a documentation one, so check the loader for the architecture you are running before
+assuming a format stays packed.
+
+One caveat on Q5_1: it has no general projection kernel, but it *is* supported as a routed-MoE
+`down` bank (`moe_indexed_matmul_q5_1_{f32,mmvq}.comp`), and Q5_0 `down` banks are repacked
+bit-exactly to Q5_1 at upload. So "Q5_1 unshipped" is true of dense projections only.
+
+Ordering rationale, for why the family filled in as it did: K-quant Q4/5/6 came first because they
+cover the majority of production GGUF deployments (`*-Q4_K_M.gguf` is the de-facto default for most
+checkpoints). IQ4_NL and IQ4_XS followed as the most-used IQ-family quants in production
+(Llama-3.1 / Qwen2.5 IQ4_XS). The IQ2 family was prioritised to enable Qwen3.6-A3B-IQ2_M
+(~11.5 GB GGUFs) on Strix Halo without a 4× expansion to F32 (~46 GB) at upload. IQ1_S closed the IQ
+family at the smallest end, and Q2_K + Q3_K — the densest K-quants — closed the K-quant family;
+their matmul kernels share the dispatch shape of Q4/5/6_K (one workgroup per output row at decode,
+16×16 output tile at prefill) but use a 16-element K-chunk to match Q2/3_K's 16-element sub-block
+size.
 
 ### IQ4_NL / IQ4_XS layout (Vulkan)
 
@@ -189,11 +365,6 @@ per sub-block ib:
 ```
 
 Alignment: IQ4_NL kernels require `inputDim % 32 == 0`; IQ4_XS kernels require `inputDim % 256 == 0`. The upload path's `KeepIq4NlOnDevice` / `KeepIq4XsOnDevice` predicates gate on these.
-| IQ2_XXS | ✓ | ✓ | — | `79cca9b` |
-| IQ2_XS | ✓ | ✓ | — | `743984c` |
-| IQ2_S (also IQ2_M) | ✓ | ✓ | — | `9ecce75` |
-
-Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q2_K / Q3_K / IQ4_NL / IQ4_XS / IQ1_*, IQ3_* Vulkan kernels are not yet shipped — the upload path falls back to F32 dequant for those formats. K-quant Q4/5/6 priority was chosen because they cover the majority of production GGUF deployments (`*-Q4_K_M.gguf` is the de-facto default for most checkpoints). Q2_K + Q3_K + IQ4_NL + IQ4_XS are present in the CUDA backend and are tracked as Vulkan follow-ups (parallel agent landed CUDA IQ4 in `6f12eab`'s sibling commits). The IQ2 family was prioritised on Vulkan to enable Qwen3.6-A3B-IQ2_M (~11.5 GB GGUFs) on Strix Halo without a 4× expansion to F32 (~46 GB) at upload.
 
 ### IQ1_S layout (Vulkan)
 
@@ -220,7 +391,6 @@ per group l in [0..4):
 ```
 
 Alignment: IQ1_S kernels require `inputDim % 256 == 0`. The upload path's `KeepIq1SOnDevice` predicate gates on this.
-Q4_0 / Q4_1 / Q5_0 / Q5_1 / IQ-family Vulkan kernels are not yet shipped — the upload path falls back to F32 dequant for those formats, so weight memory is doubled / quadrupled. K-quant Q4/5/6 priority was chosen because they cover the majority of production GGUF deployments (`*-Q4_K_M.gguf` is the de-facto default for most checkpoints). Q2_K and Q3_K — the densest K-quants — close the K-quant family on Vulkan; matmul kernels share the dispatch shape of Q4/5/6_K (one workgroup per output row at decode, 16×16 output tile at prefill) but use a 16-element K-chunk to match Q2/3_K's 16-element sub-block size.
 
 **Q3_K layout (fixed in #311).** Q3_K's decode is the easiest K-quant to get wrong, and dotLLM shipped it wrong in *every* backend until #311. Two independent transpositions, both now corrected against llama.cpp's `dequantize_row_q3_K`:
 
@@ -228,6 +398,29 @@ Q4_0 / Q4_1 / Q5_0 / Q5_1 / IQ-family Vulkan kernels are not yet shipped — the
 2. **Element ordering.** The 2-bit quants are **not** stored four consecutive elements per byte. Each 128-element half of the super-block uses 32 `qs` bytes, and every byte supplies **four elements 32 apart**: element `t` reads bit-pair `(t/32) % 4` of `qs[(t % 32) + 32*(t/128)]`. The `hmask` is transposed the same way: bit `t/32` of `hmask[t % 32]` (llama.cpp's `shift`/`m` loop). The old `qs[t/4] >> (t%4)*2` / `hmask[t/8] >> t%8` form scatters every element into the wrong sub-block scale.
 
 Combined, the old decode produced **noise**: dequantized Bielik-1.5B Q3_K tensors correlated **0.006** with the same tensors from the Q8_0 build of the model (0.988 after the fix). This was invisible to CPU↔Vulkan parity because all backends shared the bug, and invisible to the kernel unit tests because `Q3KFixture` *encoded* with the same wrong layout it decoded with — a closed loop that never touched real GGUF bytes. `DequantizeKQuantTests.Q3_K_DenseRandomBlocks_MatchLlamaCppReference` now pins the CPU oracle to a literal transcription of llama.cpp over dense pseudorandom super-blocks, which is the layer that had been missing.
+
+**Q2_K layout (fixed in #498).** Q2_K carries the *same* element transposition Q3_K did, and it
+survived the #311 sweep because nobody re-checked Q2_K at the time — the Q3_K fix comment in
+`DequantizeKQuants.cs` already named the wrong form as "the old dotLLM layout". Authority is
+llama.cpp's `dequantize_row_q2_K` (`ggml-quants.c`):
+
+- **Element ordering (was wrong).** The 2-bit quants are **not** four consecutive elements per
+  byte. Each 128-element half of the super-block consumes 32 `qs` bytes and every byte supplies
+  **four elements 32 apart**: element `t` is at byte `32*(t>>7) + (t&31)`, shift `2*((t>>5)&3)`.
+  The old `qs[t/4] >> (t%4)*2` form scatters every element.
+- **Scale/dmin sub-block (was, and remains, correct).** The 4-bit scale and 4-bit dmin for element
+  `t` come from sub-block `t>>4`. That index is **not** transposed — only the `qs` addressing was.
+
+Evidence: `blk.0.attn_q.weight` of `Llama-3.2-1B-pure-Q2_K.gguf` correlated against the same
+tensor from the Q8_0 build of the same base gives **0.954** under the llama.cpp layout and
+**0.069** under the old one (Q3_K, checked identically as a control, is 0.988 — correct and
+untouched). As with Q3_K, the unit tests could not see it: `Q2_K_SingleBlock_HandCalculated`
+writes one non-zero `qs` byte and reads elements 0/1/16, the three indices where the two layouts
+coincide, and `Q2KFixture` *encoded* with the same wrong order it decoded with. The oracle that
+was missing is `DequantizeKQuantTests.Q2_K_DenseRandomBlocks_MatchLlamaCppReference`, a literal
+transcription of llama.cpp over dense pseudorandom super-blocks. Vulkan and CUDA carried the same
+transposition and were fixed in the same issue. **Any Q2_K quality number from before #498 is
+meaningless** — the decoded weights were noise.
 
 See [docs/VULKAN.md](VULKAN.md) for runtime selection details and [docs/CUDA.md](CUDA.md) for the CUDA backend's coverage (Q2_K through Q8_0 plus pre-Q8_1 + MMVQ-large + MMQ + grouped-MoE-GEMV variants).
 
@@ -242,6 +435,10 @@ Sparse-MoE forward (Mixtral / Qwen-MoE / Qwen3MoeHybrid) needs a kernel shape di
 | Q6_K | `MoeIndexedMatmulQ6_KF32Kernel` (`moe_indexed_matmul_q6_k_f32.comp`) | Raw Q6_K super-blocks `[numExperts, M, (K/256)*210]`. Per-row Q6_K dequant in shader (matches `DequantizeQ6_KScalar` byte-for-byte). | Qwen3MoeHybrid (Qwen3.6-A3B) when both `DOTLLM_VK_MOE_RESIDENT=1` AND the source banks are uniformly Q6_K — required for `Qwen3.6-A3B-UD-Q6_K_XL` to fit on Strix Halo's 128 GB unified memory (≈25 GB Q6_K-resident vs ≈120 GB if dequantised to F32). |
 
 The Q6_K MoE kernel completes the original Phase 10 follow-up gap noted in `VulkanQwen3MoeHybridTransformerModel`: with this kernel in place, opting in to `DOTLLM_VK_MOE_RESIDENT=1` on a Q6_K-source Qwen3MoeHybrid model now uploads the routed banks once and keeps them resident across forwards, eliminating the per-forward host→device dequant + upload cost. Mixed-quant layers (e.g. UD checkpoints with Q5_K W2 and Q6_K W1/W3) fall back to the F32 path automatically.
+
+**Resident routed-expert banks (Vulkan), current set (#849):** Q4_K, Q5_K, Q6_K, Q5_1 and Q8_0, resolved per bank (`VulkanQwen3MoeMoeUpload.BankStaysPacked`, shared with the qwen4exp pre-load residency estimate). Any other bank quant still widens to F32. Q5_1 / Q8_0 banks (UD-Q4_K_XL down projections) have the scalar F32-in indexed kernel, an indexed MMVQ (dp4a) decode arm and a grouped coopmat prefill arm (16-row tiles; K % 64). The K-quant fast paths need K % 256, the legacy arms only K % 32 (MMVQ) / K % 64 (grouped), so a 640-wide expert (qwen4exp) takes the fast arms with a Q5_1/Q8_0 down bank. Constraint: the legacy grouped kernel is 16-row only, so a layer with a legacy-quant down bank runs its Q4_K gate/up grouped GEMM on the 16-row kernel instead of the 32-row row-pair form. The fused single-token Qwen3.6 decode layer still requires a Q5_K/Q6_K down bank.
+
+**IQ-family resident banks (#823):** IQ3_S, IQ4_XS, IQ4_NL, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS and upstream-ggml Q2_0 also stay packed (K % block: 256 for the super-block types, 32 for IQ4_NL, 64 for Q2_0; integer-dot-product required, `DOTLLM_VK_IQ_RESIDENT=0` widens them to F32 again). Decode uses `MoeIndexedMatmulIqMmvqKernel` (`moe_indexed_matmul_iq*_mmvq.comp`, GENERATED from the dense `matmul_iq*_mmvq.comp` by `native/vulkan/gen_moe_indexed_iq.py`; Q2_0 hand-written) for any row count the grouped path does not take; prefill >= 16 tokens uses `MoeGroupedMatmulIqCoopmatKernel` (`moe_grouped_matmul_<fmt>_coopmat_m64.comp`, GENERATED by `native/vulkan/gen_moe_grouped_iq.py`; 16-row tiles, native wave64 + cooperative matrix only, `DOTLLM_VK_MOE_IQ_GROUPED=0` leaves IQ banks on MMVQ). There is NO scalar F32-in indexed kernel for these formats, which is why residency requires dp4a. IQ1_M (ggml id 29) exists as a CPU-dequantised format only (banks widen to F32). qwen4exp's BF16 gated-residual projections (ISTA files) upload as F16 when exactly representable so they get the cooperative-matrix prefill GEMM instead of the tiled F32 one (`VulkanQwen4ExpGrWeights`, `DOTLLM_VK_Q4E_BF16_AS_F16=0` keeps BF16). Upstream ggml `Q2_0` shares GGUF id 42 with PQ2_0: `GgufReader.ReclassifyUpstreamQ2_0` decides from the on-disk tensor extent and re-labels such tensors with the internal `QuantizationType.Q2_0` (242).
 
 ## IQ-family (importance-quant) Coverage
 
@@ -289,7 +486,7 @@ The Vulkan IQ3 family kernels store the two codebook tables as readonly SSBOs up
 
 Two expert-tier containers exist and are dispatched on the layer file's own metadata, never assumed (`Mach1ExpertContainerKind`/`Mach1ExpertContainer.Detect`): the chunked `trained_susv_wave_gamma_chunked_v1` container (`Mach1ExpertLayerDecoderV3T`, the one shipped in the current repo) and the older per-expert manifest-driven container (`Mach1ExpertLayerDecoderV2`, structurally ported but unverified — no sample of this container currently exists to check against). The NE ("spine": attention / linear-attn / shared-expert) tier uses the same trellis workhorse with int8-sign SU/SV + a scalar Wscale instead of continuous su/sv (`Mach1NeSpineDecoder`).
 
-**Bit-exactness is validated**, not just approximated: `tests/DotLLM.Tests.Integration/Models/Quantization/Mach1/Mach1GoldenBitExactTests.cs` decodes layer 0 / expert 0's gate/up/down projections and compares every element's raw bit pattern against the vendor's own `goldens/L0_e0_fp32.safetensors` — zero mismatches. The fixture resolves via `DOTLLM_MACH1_35B_DIR`, falling back to `~/.dotllm/test-cache/SyzygyResearch/Mach-1-Additive-35B/`, and the test skips (does not fail) when absent. Per-primitive unit tests in `tests/DotLLM.Tests.Unit/Models/Quantization/Mach1/` use discriminating shapes (non-power-of-two dims that force real padding, `Mb != Nb` grids) and, for the trellis/quantlut_sym/expert-pipeline primitives, cross-check against vectors captured by running the vendor's own `decode.py` — not a re-derivation of this port.
+**Bit-exactness is validated**, not just approximated: `tests/DotLLM.Tests.Integration/Models/Quantization/Mach1/Mach1GoldenBitExactTests.cs` decodes layer 0 / expert 0's gate/up/down projections and compares every element's raw bit pattern against the vendor's own `goldens/L0_e0_fp32.safetensors` — zero mismatches. The fixture resolves via `DOTLLM_MACH1_35B_DIR`, falling back to `TestFixtureResolver` (`~/.dotllm/models/SyzygyResearch/Mach-1-Additive-35B/`, legacy `test-cache`, HF cache — #1279), and the test skips (does not fail) when absent. Per-primitive unit tests in `tests/DotLLM.Tests.Unit/Models/Quantization/Mach1/` use discriminating shapes (non-power-of-two dims that force real padding, `Mb != Nb` grids) and, for the trellis/quantlut_sym/expert-pipeline primitives, cross-check against vectors captured by running the vendor's own `decode.py` — not a re-derivation of this port.
 
 **Phase B (load path)** wires the Phase A decoders into the standard model-loading surface, entirely via existing infrastructure — the `packed/` layout turned out to be readable by the existing generic `SafetensorsFile` reader as-is (composite `|`-delimited keys and per-file `__metadata__` blobs are just ordinary safetensors headers), so no new binary parser was needed:
 
@@ -357,3 +554,45 @@ All errors are consistent with ordinary fp32 reassociation noise (the two paths 
 - **Wiring into the actual MoE forward pass** (`Qwen3MoeHybridTransformerModel`'s FFN dispatch) — this pass validates the kernel in isolation against real weights, not end-to-end token generation through the fused path. The forward pass currently uses `LoadFromMach1Packed`'s dense-decode-then-cache route only.
 - **The other three tiers' stepping-stone completion** (NE spine 0.70 GB, LM head 0.33 GB, embeddings 0.29 GB) — issue #266's permitted stepping-stone decodes these to dense/Q8_0 at load while only the routed-expert GEMV fuses; that decode-at-load path already exists from Phase B, it just hasn't been threaded into a real "packed-resident" load mode (currently everything, including these three tiers, decodes to dense fp32 the same way, so the ~7.5 GB headline number is not yet achievable end-to-end).
 - **Model-scale (not per-expert) resident-memory and perplexity/top-1 measurement**, gated on the ~70-128 GB RAM issue #266 already documents as needed for a full dense-decode baseline run, or on the forward-pass wiring above making a dense baseline unnecessary.
+
+## LittleBit factorized linears (issue #864, CPU only)
+
+`QuantizationType.LittleBit` (id 100, not a GGUF type) is a *factorized-linear* weight kind: a projection stored as sign
+factors plus FP scales, `W ~= sum_paths diag(u1) . Us . diag(l) . Vs . diag(v2)` with `l = bf16(v1*u2)`, `Us in {+-1}^(out x r)`,
+`Vs in {+-1}^(r x in)`, primary path plus an optional residual path (`*_R`). Implemented clean-room from the paper equations and our own
+trainer (`tools/littlebit-qat`); no third-party code.
+
+- **Checkpoint**: a safetensors directory with `config.json` (Qwen3) and `littlebit_config.json`. Per projection the keys are
+  `{prefix}U_packed, V_packed, U_shape, V_shape, u1, u2, v1, v2` and `U_R_packed ... v2_R`. Packed words are int32, LSB-first,
+  bit 1 = -1, padded with +1; `U` is `[out, ceil(r/32)]` and `V` is `[r, ceil(in/32)]`, which is byte-identical to the kernel layout, so
+  loading is a row copy (`LittleBitLoader`). Embeddings, norms and the (tied) head stay bf16 and are upcast to F32 by the normal loader.
+- **Where it plugs in**: `SafetensorsTensorResolver.ResolveLinear` returns `(token, QuantizationType.LittleBit, out, in)` when `{prefix}weight`
+  is absent but `{prefix}U_packed` exists; `TransformerModel.Gemm` dispatches on the type. Everything else (QK-norm, RoPE, GQA attention,
+  SwiGLU, KV cache, `generate`, perplexity) is the stock dense-Qwen3 path. Fused decode kernels are skipped (`SupportsFusedDecode` is false).
+- **Kernels** (`DotLLM.Cpu.Kernels.Experimental.LittleBit`): two-stage signed-sum GEMV (stage 1 `t = l .* (Vs (v2 .* x))`, stage 2
+  `y += u1 .* (Us t)`), AVX2 float path. Decode is row-parallel over the pool (two dispatches per projection); prefill parallelises over
+  tokens, each thread running the single-thread GEMV with its own scratch (bit-identical per token). Scalar double reference in
+  `LittleBitReference`. The VNNI int8 variant exists but is not used by the model (it adds activation-quantisation error).
+- **Rejections** (explicit `NotSupportedException`, never a fall-through): the shared weight loader used by Vulkan, CUDA and HIP refuses a
+  factorized checkpoint ("supported on the CPU backend only"); the CPU path refuses any architecture other than dense Qwen (`Architecture.Qwen`,
+  no MoE) and layers with a bias; AVX2 is required. `dotllm perplexity` accepts a safetensors directory on `--device cpu` only
+  (with `--tokens-file`).
+- **Memory** (Qwen3-0.6B, eff_bit 0.55, 196 projections, residual on): sign bits 26.5 MiB + F32 scales 5.1 MiB = **31.6 MiB** against 840 MiB for the same
+  projections in bf16 (26.6x smaller; 0.60 stored bits per weight, 0.55 with bf16 scales). Scales are held as F32 (exact widening of the bf16 source,
+  and not clamped to fp16 range): that costs 2.5 MiB more than bf16 scales would. Padding to x32 is included. The paper's bit formula counts 2 bits
+  per sign; this layout stores 1.
+- **Precision**: scales are bf16 in the checkpoint, widened exactly; `l` is rounded once to bf16 like the reference forward. The kernel
+  accumulates in F32. Layer level (step 1): max relative error 1.7e-7 vs a float64 reference, 5.8e-3 vs the trainer's all-bf16 forward.
+- **Whole-model validation** (Qwen3-0.6B-055, `LittleBitModelTests`, fixtures from `tools/littlebit-qat/gen_dotllm_reference.py`): against torch fp32,
+  120/120 teacher-forced top-1 and byte-identical 40-token greedy continuations on 3 prompts, max |logit diff| 0.044 over torch's top-8. Against the
+  torch **bf16** forward only 115/120 top-1 (the bf16 forward itself agrees with torch fp32 on 115/120: it flips near-tied argmaxes on this
+  PPL~400 model, so bf16 is the wrong oracle for an fp32 engine). F32-decoded control (`DOTLLM_LITTLEBIT_DENSE_CONTROL=1` decodes every
+  projection to dense F32 and runs the stock GEMM): identical metrics, last-position logits differ from the factorized kernel by 1e-5.
+- **Perplexity**: WikiText-2 test, first 40 non-overlapping 2048-token windows, scored as the trainer's `eval_ppl.py` does (targets 1..2047 of each window):
+  trainer 401.02, `dotllm perplexity <dir> --tokens-file wikitext2_first40.tokens --context 2048 --stride 2048 --unscored-prefix 1` gives **400.89**
+  (ratio 0.9997). The teacher (bf16 Qwen3-0.6B) is 19.6; this checkpoint is a 1500-step spike run, so the model is poor even though the engine matches.
+- Fixtures (`~/.dotllm/test-cache/littlebit-qwen3-0.6b-055`, or `DOTLLM_LITTLEBIT_CKPT`); tests skip cleanly when absent.
+- **Decode speed** (`dotllm run`, 64 tokens, CPU, same session, runs interleaved dense/LittleBit): LittleBit 19-30 tok/s vs 10-14 tok/s for the dense
+  Qwen3-0.6B baseline of the same model, per-pair ratios 1.4x-2.9x (median 2.3x). The "dense bf16" baseline is the safetensors loader's bf16->F32
+  upcast (there is no resident-bf16 GEMV), so it streams 4 B/weight; the box was at 100% CPU from other processes, so judge the ratio, not the absolutes.
+  Both runs include the F32-upcast tied lm_head (594 MiB/token), which is now a large share of the LittleBit decode traffic. Prefill (perplexity run): ~213 tok/s.

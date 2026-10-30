@@ -2,6 +2,7 @@ using DotLLM.Core.Attention;
 using DotLLM.Core.Models;
 using DotLLM.Cuda;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -19,6 +20,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// argmax (and near-identical logits) match at every step.
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaBatchedDecodeTests
 {
     private readonly ITestOutputHelper _out;
@@ -32,9 +34,7 @@ public class CudaBatchedDecodeTests
         "2 + 2 = 4. 3 + 3 =",
     };
 
-    private static string ResolveModelPath(string fileName) => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-        ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", fileName);
+    private static string ResolveModelPath(string fileName) => TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", [fileName], null).Path ?? "";
 
     /// <summary>
     /// Prefills <c>Prompts.Length</c> independent sequences (each its own <see cref="CudaKvCache"/>),

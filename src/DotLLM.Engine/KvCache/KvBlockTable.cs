@@ -1,3 +1,5 @@
+using System.Runtime.InteropServices;
+
 namespace DotLLM.Engine.KvCache;
 
 /// <summary>
@@ -10,6 +12,12 @@ public sealed class KvBlockTable
     private readonly int _blockSize;
     private readonly List<int> _blockIds = []; // blockIds[i] = physical block for logical block i
     private int _currentLength;
+
+    /// <summary>
+    /// Physical block IDs in logical order (<c>BlockIds[i]</c> holds tokens <c>[i * BlockSize, (i + 1) * BlockSize)</c>).
+    /// Borrowed view: invalidated by any mutation of the table.
+    /// </summary>
+    public ReadOnlySpan<int> BlockIds => CollectionsMarshal.AsSpan(_blockIds);
 
     /// <summary>Number of tokens currently stored.</summary>
     public int CurrentLength => _currentLength;

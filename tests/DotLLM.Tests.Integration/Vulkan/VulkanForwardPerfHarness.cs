@@ -33,7 +33,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// </list>
 /// </para>
 /// </remarks>
-[Collection("SmallModel")]
+[Collection(SmallModelGpuCollection.Name)]
 [Trait("Category", "GPU")]
 public class VulkanForwardPerfHarness
 {

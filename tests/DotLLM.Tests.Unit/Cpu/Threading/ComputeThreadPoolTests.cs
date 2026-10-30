@@ -48,6 +48,18 @@ public sealed unsafe class ComputeThreadPoolTests
         }
     }
 
+    [Theory]
+    [InlineData(2, false, 2)]
+    [InlineData(8, false, 8)]
+    [InlineData(12, false, 10)]
+    [InlineData(16, false, 14)]
+    [InlineData(32, false, 28)]
+    [InlineData(64, false, 56)]
+    [InlineData(32, true, 8)]
+    [InlineData(6, true, 6)]
+    public void AutoDecodeThreadCount_LeavesCoresFreeAndKeepsHybridCap(int threads, bool hybrid, int expected)
+        => Assert.Equal(expected, ComputeThreadPool.AutoDecodeThreadCount(threads, hybrid));
+
     /// <summary>
     /// Verifies that decode thread cap correctly reduces the number of active workers.
     /// All threads should still produce correct results, but with fewer partitions.

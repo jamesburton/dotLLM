@@ -10,6 +10,7 @@ using DotLLM.Engine.KvCache;
 using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -65,6 +66,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// </para>
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaLogitsMatchPyTorchReferenceTests
 {
     private readonly ITestOutputHelper _output;
@@ -87,9 +89,7 @@ public sealed class CudaLogitsMatchPyTorchReferenceTests
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
 
-        string ggufPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q4_K_M.gguf");
+        string ggufPath = TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q4_K_M.gguf"], null).Path ?? "";
         Skip.If(!File.Exists(ggufPath),
             $"SmolLM-135M Q4_K_M GGUF not found at {ggufPath} (run: dotllm run QuantFactory/SmolLM-135M-GGUF).");
 
@@ -159,7 +159,8 @@ public sealed class CudaLogitsMatchPyTorchReferenceTests
     {
         RunCudaSafetensorsGate(
             envVar: "DOTLLM_QWEN25_CHECKPOINT_PATH",
-            conventional: "C:/Users/james/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B/snapshots/060db6499f32faf8b98477b0a26969ef7d8b9987",
+            conventional: TestFixtureResolver.ResolveDirectory(
+                "DOTLLM_QWEN25_CHECKPOINT_PATH", "Qwen", "Qwen2.5-0.5B", "config.json").Path ?? "(Qwen/Qwen2.5-0.5B not in model store)",
             referenceFile: "qwen2.5-0.5b-reference.json",
             expectedArch: Architecture.Qwen,
             tolerances: DriftTolerances.Tight);
@@ -404,8 +405,9 @@ public sealed class CudaLogitsMatchPyTorchReferenceTests
         _output.WriteLine($"PTX dir:    {ptxDir}");
 
         var loadWatch = Stopwatch.StartNew();
-        var (gpuModel, source, config) = CudaModelLoader.LoadFromSafetensors(
-            root, deviceId: 0, ptxDir);
+        var (gpuModel, source, config) = CheckpointGuard.LoadOrSkip(
+            root, "HF safetensors checkpoint (CUDA)",
+            () => CudaModelLoader.LoadFromSafetensors(root, deviceId: 0, ptxDir));
         loadWatch.Stop();
         _output.WriteLine(
             $"CUDA load: {loadWatch.Elapsed.TotalMilliseconds:F1} ms "

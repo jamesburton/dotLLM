@@ -19,6 +19,13 @@ namespace DotLLM.Models;
 public static class ModelLoader
 {
     /// <summary>
+    /// Why <paramref name="config"/>'s architecture cannot be loaded by the dense Llama-style <see cref="TransformerModel"/> (hybrid / recurrent
+    /// architectures with their own model classes), or <see langword="null"/> when it can. For callers that must reject such a model up front
+    /// (e.g. a speculative draft) rather than after an expensive load.
+    /// </summary>
+    public static string? DenseLoaderUnsupportedReason(ModelConfig config) => TransformerWeights.DedicatedLoaderReason(config);
+
+    /// <summary>
     /// Loads a model from a GGUF file path. Opens the file, extracts config,
     /// and creates the appropriate model instance.
     /// </summary>
@@ -66,12 +73,17 @@ public static class ModelLoader
         var effectiveThreading = threading ?? ThreadingConfig.SingleThreaded;
         return config.Architecture switch
         {
+            Architecture.Bert or Architecture.NomicBert or Architecture.NomicBertMoe => BertEncoderModel.LoadFromGguf(gguf, config, effectiveThreading),
             Architecture.NemotronH => NemotronHTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             // #375 slice 2: nemotron_h_moe shares the NemotronH model class — the MoE
             // FFN layers are detected per-layer by the ffn_gate_inp router tensor.
             Architecture.NemotronHMoe => NemotronHTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             Architecture.Qwen3MoeHybrid => Qwen3MoeHybridTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
+            // LFM2.5-24B-A2B (#1015): gated short-conv + GQA hybrid with dense-then-MoE FFN.
+            Architecture.Lfm2Moe => Lfm2MoeTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             Architecture.Qwen3HybridDense => Qwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
+            // CPU reference forward (#816): GR + GDN/QSA + 512-expert MoE + n-gram PLE.
+            Architecture.Qwen4Exp => Qwen4ExpTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             _ => TransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
         };
     }
@@ -150,7 +162,7 @@ public static class ModelLoader
             IModel model = config.Architecture switch
             {
                 Architecture.Llama or Architecture.Mistral or Architecture.Phi or Architecture.Qwen
-                    or Architecture.Mixtral or Architecture.QwenMoe or Architecture.GraniteMoe
+                    or Architecture.Mixtral or Architecture.QwenMoe or Architecture.GraniteMoe or Architecture.Granite
                     or Architecture.DeepSeekV2 or Architecture.DeepSeekV3
                     or Architecture.SmolLM3
                     or Architecture.Gemma3 or Architecture.Gemma4
@@ -174,7 +186,7 @@ public static class ModelLoader
                     => Mamba3TransformerModel.LoadFromSafetensors(source, config),
                 _ => throw new NotSupportedException(
                     $"Safetensors loader does not yet dispatch architecture {config.Architecture}. "
-                    + "Supported today: Llama, Mistral, Phi, Qwen, Mixtral, QwenMoe, GraniteMoe, DeepSeekV2, DeepSeekV3, SmolLM3, Gemma3, Gemma4, Gemma3n, DiffusionGemma, BitNet, Mamba3."),
+                    + "Supported today: Llama, Mistral, Phi, Qwen, Mixtral, QwenMoe, GraniteMoe, Granite, DeepSeekV2, DeepSeekV3, SmolLM3, Gemma3, Gemma4, Gemma3n, DiffusionGemma, BitNet, Mamba3."),
             };
 
             return (model, source, config);

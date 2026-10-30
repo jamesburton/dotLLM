@@ -1,0 +1,140 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+
+// IQ2_XXS GEMV for 1..16 FP32 activation columns and NR output rows per workgroup (#1244):
+//   Y[col, m] = sum_k W_iq2xxs[m, k] * X[col, k]
+//
+// One work item = one 32-weight sub-block (super-block b, sub-block ib32): 64 lanes stride over the row's blocksPerRow * 8 sub-blocks.
+// Each lane decodes a sub-block's grid entries, signs and sub-scale ONCE per row and FMAs the 32 weights against all NC activation columns, so a
+// K+1-row speculative verify pays one decode per weight instead of one per column (the `cols` GEMV of #1237 re-decoded per column).
+//
+// Determinism (the #1220 pattern): a column's arithmetic (lane -> group map, explicit fma chain under `precise`, fixed shared-memory
+// reduction tree) does not depend on NC or NR, so each column of a verify is bit-identical to the NC = 1 dispatch the Nemotron-H decode
+// runs. NC (constant_id 0) and NR (constant_id 1) are specialization constants; X is [NC, K], Y is [NC, M].
+//
+// Super-block (66 bytes): fp16 d, then 8 sub-blocks of two uint32: a0 = 4 grid-byte indices, a1 = 4 x 7-bit sign indices + a 4-bit
+// sub-scale in the top nibble; db = d * (0.5 + (a1 >> 28)) * 0.25 (DotLLM.Cpu Dequantize.DequantizeIQ2_XXS).
+// Dispatch: ceil(M / NR) workgroups of 64 threads.
+
+#define WG_SIZE 64u
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint NC = 2u;
+layout(constant_id = 1) const uint NR = 1u;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW      { uint weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufX      { vec4 x4[]; };        // [NC, K/4]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY      { float y[]; };        // [NC, M]
+layout(set = 0, binding = 3, std430) readonly  buffer BufGrid   { uint iq2xxsGrid[]; };
+layout(set = 0, binding = 4, std430) readonly  buffer BufKsigns { uint ksigns[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;             // multiple of 256
+    uint blocksPerRow;  // K / 256
+    uint rowUints;      // unused; kept for push-constant parity with matmul_iq2_xxs_f32_gemv
+} pc;
+
+const uint IQ2_XXS_BLOCK_BYTES = 66u;
+
+// 4 bytes at a 2-byte-aligned offset as a little-endian uint (the 66-byte super-block puts qs at offset 2 mod 4 every other block).
+uint read4Bytes(uint absByteOff) {
+    uint idx = absByteOff >> 2u;
+    uint ph  = absByteOff & 3u;
+    uint lo  = weight[idx];
+    if (ph == 0u) return lo;
+    uint hi = weight[idx + 1u];
+    return (lo >> (ph * 8u)) | (hi << ((4u - ph) * 8u));
+}
+
+// fp16 at an even byte offset (never straddles a word: every super-block starts at an even byte).
+float readHalf(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    return unpackHalf2x16((u >> ((absByteOff & 3u) * 8u)) & 0xFFFFu).x;
+}
+
+uint ksignByte(uint idx) {
+    return (ksigns[idx >> 2u] >> ((idx & 3u) * 8u)) & 0xFFu;
+}
+
+float signedByte(uint word, uint i, uint signs, uint j) {
+    float g = float((word >> (8u * i)) & 0xFFu);
+    return ((signs & (1u << j)) != 0u) ? -g : g;
+}
+
+shared float partials[NR * NC][WG_SIZE];
+
+void main() {
+    uint m0 = (gl_WorkGroupID.y * 32768u + gl_WorkGroupID.x) * NR;   // y folds dispatches wider than 32768 groups (GemvColumns)
+    if (m0 >= pc.M) return;
+
+    uint lane = gl_LocalInvocationID.x;
+
+    // Rows past M (last workgroup) duplicate row M-1 and are not stored.
+    uint rowByteBase[NR];
+    [[unroll]] for (uint r = 0u; r < NR; ++r) rowByteBase[r] = min(m0 + r, pc.M - 1u) * pc.blocksPerRow * IQ2_XXS_BLOCK_BYTES;
+    uint xRow4 = pc.K >> 2u;
+
+    precise float acc[NR * NC];
+    [[unroll]] for (uint i = 0u; i < NR * NC; ++i) acc[i] = 0.0;
+    uint subBlocks = pc.blocksPerRow * 8u;
+    for (uint sbi = lane; sbi < subBlocks; sbi += WG_SIZE) {
+        uint b = sbi >> 3u;
+        uint ib32 = sbi & 7u;
+
+        float db[NR];
+        uint a0[NR], a1[NR];
+        [[unroll]] for (uint r = 0u; r < NR; ++r) {
+            uint blockByte = rowByteBase[r] + b * IQ2_XXS_BLOCK_BYTES;
+            float d = readHalf(blockByte);
+            uint p = blockByte + 2u + 8u * ib32;
+            a0[r] = read4Bytes(p);
+            a1[r] = read4Bytes(p + 4u);
+            precise float dbr = d * (0.5 + float(a1[r] >> 28u)) * 0.25;
+            db[r] = dbr;
+        }
+
+        for (uint l = 0u; l < 4u; ++l) {
+            vec4 wa[NR], wb[NR];
+            [[unroll]] for (uint r = 0u; r < NR; ++r) {
+                uint gridIdx = (a0[r] >> (8u * l)) & 0xFFu;
+                uint signs = ksignByte((a1[r] >> (7u * l)) & 0x7Fu);
+                uint g0 = iq2xxsGrid[gridIdx * 2u];
+                uint g1 = iq2xxsGrid[gridIdx * 2u + 1u];
+                wa[r] = vec4(signedByte(g0, 0u, signs, 0u), signedByte(g0, 1u, signs, 1u), signedByte(g0, 2u, signs, 2u), signedByte(g0, 3u, signs, 3u));
+                wb[r] = vec4(signedByte(g1, 0u, signs, 4u), signedByte(g1, 1u, signs, 5u), signedByte(g1, 2u, signs, 6u), signedByte(g1, 3u, signs, 7u));
+            }
+
+            // Two independent 4-term fma chains under `precise` (no driver contraction / reordering) and a fixed combine: a row's bits
+            // do not depend on NR / NC.
+            uint xi = (sbi * 4u + l) * 2u;   // vec4 index of element 32 sbi + 8 l
+            [[unroll]] for (uint cc = 0u; cc < NC; ++cc) {
+                vec4 xa = x4[cc * xRow4 + xi];
+                vec4 xb = x4[cc * xRow4 + xi + 1u];
+                [[unroll]] for (uint r = 0u; r < NR; ++r) {
+                    precise float pa = wa[r].x * xa.x;
+                    pa = fma(wa[r].y, xa.y, pa); pa = fma(wa[r].z, xa.z, pa); pa = fma(wa[r].w, xa.w, pa);
+                    precise float pb = wb[r].x * xb.x;
+                    pb = fma(wb[r].y, xb.y, pb); pb = fma(wb[r].z, xb.z, pb); pb = fma(wb[r].w, xb.w, pb);
+                    precise float dq = pa + pb;
+                    acc[r * NC + cc] = fma(db[r], dq, acc[r * NC + cc]);
+                }
+            }
+        }
+    }
+
+    // Fixed shared-memory tree over the 64 lanes, NOT subgroupAdd (a pipeline's subgroup width may differ per NR / NC).
+    [[unroll]] for (uint i = 0u; i < NR * NC; ++i) partials[i][lane] = acc[i];
+    barrier();
+    [[unroll]] for (uint stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
+        if (lane < stride)
+            [[unroll]] for (uint i = 0u; i < NR * NC; ++i) partials[i][lane] = partials[i][lane] + partials[i][lane + stride];
+        barrier();
+    }
+    if (lane < NR * NC) {
+        uint r = lane / NC, cc = lane - r * NC;
+        if (m0 + r < pc.M)
+            y[cc * pc.M + m0 + r] = partials[lane][0];
+    }
+}

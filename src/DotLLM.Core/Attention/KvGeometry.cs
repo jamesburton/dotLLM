@@ -23,16 +23,54 @@ namespace DotLLM.Core.Attention;
 public readonly struct KvGeometry
 {
     private readonly int[] _kvStridePerLayer;
+    private readonly int[]? _slotForLayer;
+    private readonly int[]? _slidingWindowPerSlot;
 
-    private KvGeometry(int[] kvStridePerLayer, bool isUniform, int uniformStride)
+    private KvGeometry(int[] kvStridePerLayer, bool isUniform, int uniformStride, int[]? slotForLayer = null,
+        int[]? slidingWindowPerSlot = null)
     {
         _kvStridePerLayer = kvStridePerLayer;
         IsUniform = isUniform;
         UniformStride = uniformStride;
+        _slotForLayer = slotForLayer;
+        _slidingWindowPerSlot = slidingWindowPerSlot;
     }
 
-    /// <summary>Number of layers this geometry describes.</summary>
+    /// <summary>
+    /// True when at least one slot is a compact sliding-window slot (see <see cref="SlidingWindowOf"/>). Only geometries
+    /// built with <c>FromConfig(config, compactSlidingWindows: true)</c> carry windows.
+    /// </summary>
+    public bool HasSlidingWindows => _slidingWindowPerSlot is not null;
+
+    /// <summary>
+    /// The sliding window of <paramref name="slot"/> when the cache may keep only that slot's recent rows, else 0 (the slot
+    /// holds every position).
+    /// </summary>
+    /// <param name="slot">Cache slot index.</param>
+    /// <returns>The window in positions, or 0 for a full slot.</returns>
+    public int SlidingWindowOf(int slot) => _slidingWindowPerSlot is null ? 0 : _slidingWindowPerSlot[slot];
+
+    /// <summary>
+    /// Number of KV <b>slots</b> (buffers) this geometry describes. Equals the model's layer count for every dense / GQA / MoE
+    /// model; for a hybrid (GDN / SSM + attention) model it is the number of <em>attention</em> layers only
+    /// (see <see cref="HasLayerSlotMap"/>, <see cref="SlotOfLayer"/>).
+    /// </summary>
     public int LayerCount => _kvStridePerLayer.Length;
+
+    /// <summary>
+    /// True when the slots are a compacted subset of the model's layers (hybrid models: slots only for attention layers).
+    /// <see cref="KvStrideOf"/> and every cache indexer then take the <b>slot</b>, not the model layer index.
+    /// </summary>
+    public bool HasLayerSlotMap => _slotForLayer is not null;
+
+    /// <summary>Number of model layers the slot map spans (== <see cref="LayerCount"/> when there is no slot map).</summary>
+    public int ModelLayerCount => _slotForLayer?.Length ?? _kvStridePerLayer.Length;
+
+    /// <summary>
+    /// The cache slot holding model layer <paramref name="modelLayer"/>'s K/V, or -1 if that layer has none (a recurrent
+    /// layer of a hybrid). Identity when there is no slot map.
+    /// </summary>
+    public int SlotOfLayer(int modelLayer) => _slotForLayer is null ? modelLayer : _slotForLayer[modelLayer];
 
     /// <summary>
     /// True when every layer shares the same KV row width. Hot paths may then use
@@ -63,7 +101,7 @@ public readonly struct KvGeometry
         if (headDim <= 0)
             throw new System.ArgumentOutOfRangeException(nameof(headDim), headDim, "headDim must be positive.");
 
-        int stride = numKvHeads * headDim;
+        int stride = checked(numKvHeads * headDim);
         var strides = new int[numLayers];
         System.Array.Fill(strides, stride);
         return new KvGeometry(strides, isUniform: true, uniformStride: stride);
@@ -96,16 +134,84 @@ public readonly struct KvGeometry
     }
 
     /// <summary>
+    /// Number of KV slots a cache for <paramref name="config"/> needs: <c>NumLayers</c> for non-hybrid models, the number of
+    /// <see cref="HybridLayerKind.Attention"/> layers (min 1) for a model with a <see cref="ModelConfig.HybridLayout"/>.
+    /// Allocation-free; equals <c>FromConfig(config).LayerCount</c>.
+    /// </summary>
+    public static int SlotCount(ModelConfig config)
+    {
+        System.ArgumentNullException.ThrowIfNull(config);
+        if (config.HybridLayout is not { } layout)
+            return config.NumLayers;
+        int n = 0;
+        int limit = System.Math.Min(config.NumLayers, layout.LayerKind.Length);
+        for (int l = 0; l < limit; l++)
+            if (layout.LayerKind[l] == HybridLayerKind.Attention) n++;
+        return n > 0 ? n : 1;
+    }
+
+    /// <summary>
     /// Derives the KV geometry for <paramref name="config"/>: each layer's stride is
-    /// <c>GetLayerKvHeads(l) * GetLayerHeadDim(l)</c>. Returns a uniform geometry for
+    /// <c>GetLayerKvHeads(l) * GetLayerHeadDim(l)</c>. For a hybrid model (<see cref="ModelConfig.HybridLayout"/> set) only the
+    /// <see cref="HybridLayerKind.Attention"/> layers get a slot, in layer order (slot k = k-th attention layer, the
+    /// <c>kvSlotForLayer</c> convention every hybrid forward pass already uses), and <see cref="HasLayerSlotMap"/> is true. Returns a uniform geometry for
     /// every non-Gemma-4 model (where both resolve to the model-wide defaults), so the
     /// scalar addressing path is preserved. This is the single helper every backend
     /// cache factory should call instead of re-deriving per-layer strides.
     /// </summary>
     public static KvGeometry FromConfig(ModelConfig config)
+        => FromConfig(config, compactSlidingWindows: false);
+
+    /// <summary>
+    /// <see cref="FromConfig(ModelConfig)"/>, optionally marking each sliding-window layer's slot with its window
+    /// (<see cref="ModelConfig.SlidingWindowOf"/>) so caches keep only the recent rows of those slots. Pass
+    /// <see langword="true"/> only for a model whose <see cref="IModel.SupportsCompactSlidingKv"/> is true: other readers
+    /// address cached rows by absolute position.
+    /// </summary>
+    /// <param name="config">Model configuration.</param>
+    /// <param name="compactSlidingWindows">Mark sliding-window slots as compact.</param>
+    /// <returns>The geometry for <paramref name="config"/>.</returns>
+    public static KvGeometry FromConfig(ModelConfig config, bool compactSlidingWindows)
+    {
+        var g = FromConfigCore(config);
+        if (!compactSlidingWindows) return g;
+        int[]? windows = null;
+        for (int l = 0; l < g.ModelLayerCount; l++)
+        {
+            int slot = g.SlotOfLayer(l);
+            if (slot < 0 || config.SlidingWindowOf(l) is not int w || w <= 0) continue;
+            windows ??= new int[g.LayerCount];
+            windows[slot] = w;
+        }
+        return windows is null ? g : new KvGeometry(g._kvStridePerLayer, g.IsUniform, g.UniformStride, g._slotForLayer, windows);
+    }
+
+    private static KvGeometry FromConfigCore(ModelConfig config)
     {
         System.ArgumentNullException.ThrowIfNull(config);
         int n = config.NumLayers;
+        if (config.HybridLayout is { } layout)
+        {
+            int limit = System.Math.Min(n, layout.LayerKind.Length);
+            var map = new int[n];
+            var slotStrides = new System.Collections.Generic.List<int>();
+            for (int l = 0; l < n; l++)
+            {
+                if (l < limit && layout.LayerKind[l] == HybridLayerKind.Attention)
+                {
+                    map[l] = slotStrides.Count;
+                    slotStrides.Add(config.GetLayerKvHeads(l) * config.GetLayerHeadDim(l));
+                }
+                else map[l] = -1;
+            }
+            if (slotStrides.Count == 0)
+            {
+                // No attention layer at all: keep one minimal slot so the cache object is constructible.
+                slotStrides.Add(config.GetLayerKvHeads(0) * config.GetLayerHeadDim(0));
+            }
+            var g = PerLayer(slotStrides.ToArray());
+            return new KvGeometry(g._kvStridePerLayer, g.IsUniform, g.UniformStride, map);
+        }
         var strides = new int[n];
         for (int l = 0; l < n; l++)
             strides[l] = config.GetLayerKvHeads(l) * config.GetLayerHeadDim(l);

@@ -5,6 +5,20 @@ namespace DotLLM.Tests.Unit.Cpu.Threading;
 
 public sealed class NumaTopologyTests
 {
+    /// <summary>
+    /// Windows EfficiencyClass: HIGHER = higher-performing. Meteor Lake (Core Ultra 7 155H) reports three classes
+    /// (LP-E, E, P); only the max is a P-core. The inverted MIN rule pinned --pcore-only to the slow cores (~6x).
+    /// </summary>
+    [Theory]
+    [InlineData(2, CoreType.Performance)]
+    [InlineData(1, CoreType.Efficiency)]
+    [InlineData(0, CoreType.Efficiency)]
+    public void Hybrid_classification_treats_the_highest_efficiency_class_as_P_cores(byte efficiencyClass, CoreType expected)
+    {
+        byte[] meteorLake = [2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0];
+        Assert.Equal(expected, NumaTopology.ClassifyHybrid(efficiencyClass, meteorLake));
+    }
+
     [Fact]
     public void Detect_ReturnsNonNull()
     {

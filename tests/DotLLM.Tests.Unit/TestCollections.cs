@@ -38,3 +38,15 @@ public class VulkanKernelsCollection
 public class CudaKernelsCollection
 {
 }
+
+/// <summary>
+/// Marker for CPU Nemotron-H MoE test classes that flip the process-global
+/// <c>NemotronHTransformerModel.GroupedMoePrefill</c> / <c>GroupedMoeBlockTokens</c>
+/// statics (issue #1039). Sharing one collection keeps them from running in
+/// parallel, so a test asking for the grouped body cannot silently get the
+/// per-token body because another class reset the toggle mid-forward.
+/// </summary>
+[CollectionDefinition("NemotronHMoeStatics")]
+public class NemotronHMoeStaticsCollection
+{
+}

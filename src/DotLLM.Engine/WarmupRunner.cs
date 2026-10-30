@@ -42,6 +42,8 @@ public static class WarmupRunner
             Console.WriteLine($"[dotllm]   Iteration {i + 1}/{options.Iterations}: {iterMs:F0}ms");
         }
 
+        generator.ResetMtpGate();   // cold, 15-token requests must not set the adaptive gate's first verdict
+
         double totalMs = Stopwatch.GetElapsedTime(totalStart).TotalMilliseconds;
         Console.WriteLine($"[dotllm] Warm-up complete in {totalMs:F0}ms");
     }

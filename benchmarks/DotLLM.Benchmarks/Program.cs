@@ -22,6 +22,10 @@ if (args.Length > 0 && args[0] == "span-vulkan")
 {
     return VulkanPipelineSpanProfile.Run(args[1..]);
 }
+if (args.Length > 0 && args[0] == "littlebit-bench")
+{
+    return LittleBitBenchProfile.Run(args[1..]);
+}
 if (args.Length > 0 && args[0] == "mtp-bench")
 {
     return MtpBenchProfile.Run(args[1..]);

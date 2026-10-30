@@ -5,6 +5,7 @@ using DotLLM.Core.Tensors;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.SafeTensors;
 using Xunit;
+using DotLLM.Tests.Integration.Fixtures;
 
 namespace DotLLM.Tests.Unit.Models.SafeTensors;
 
@@ -228,7 +229,7 @@ public sealed class SmolLM3SafetensorsLoadTests : IDisposable
 
     /// <summary>
     /// Gated real-weight load test — points at
-    /// <c>~/.dotllm/test-cache/HuggingFaceTB/SmolLM3-3B/</c>. Skipped when
+    /// <c>~/.dotllm/models/HuggingFaceTB/SmolLM3-3B/</c>. Skipped when
     /// the checkpoint is absent (the default for CI). When present, runs a
     /// 3-token prefill and asserts finite vocab-sized logits. The user
     /// drops the safetensors / config.json into the cache; this test does
@@ -237,12 +238,10 @@ public sealed class SmolLM3SafetensorsLoadTests : IDisposable
     [SkippableFact]
     public void RealWeights_Loads_And_ForwardsFiniteLogits_WhenAvailable()
     {
-        string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string checkpointDir = Path.Combine(
-            userProfile, ".dotllm", "test-cache", "HuggingFaceTB", "SmolLM3-3B");
-        string configPath = Path.Combine(checkpointDir, "config.json");
+        var loc = TestFixtureResolver.ResolveDirectory([], "HuggingFaceTB", "SmolLM3-3B", ["config.json"], null);
         // Used to `return;` here, which xunit reports as PASSED (#307).
-        Skip.IfNot(File.Exists(configPath), $"SmolLM3-3B checkpoint not found at {checkpointDir}.");
+        Skip.IfNot(loc.Found, loc.SkipMessage("SmolLM3-3B checkpoint"));
+        string checkpointDir = loc.Path!;
 
         var (model, source, config) = DotLLM.Models.ModelLoader.LoadFromSafetensors(checkpointDir);
         try

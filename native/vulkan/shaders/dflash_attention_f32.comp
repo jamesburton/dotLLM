@@ -1,0 +1,141 @@
+#version 450
+// DFlash block attention (issue #1193; CUDA twin dflash_attention_f32, CPU twin DFlashCpuBackend.AttendHead): the b block
+// queries attend non-causally over the drafter's context ring positions [lo, start) (F16, slot = pos % cap; a key at or beyond
+// `window` behind the query is masked) and then over the block's own K/V (F32).
+//
+// With sinks (#1237, Nemotron drafters) each head has one more logit with no value row: the online softmax starts from it
+// (running max = sink, running sum = 1), which is llama.cpp's soft_max_ext with sinks.
+//
+// One workgroup per (query row, head). Keys are scored a tile at a time into shared memory with an online softmax (running max
+// and sum, F32), so the context length is not bounded by shared memory (Strix: 32 KB). Thread t owns output dims t and t + 128.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+const uint TILE = 512u;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufQ  { float q[]; };      // [b, heads * hd]
+layout(set = 0, binding = 1, std430) readonly  buffer BufKb { float kb[]; };     // [b, kvHeads * hd]
+layout(set = 0, binding = 2, std430) readonly  buffer BufVb { float vb[]; };
+layout(set = 0, binding = 3, std430) readonly  buffer BufRK { uint ringK[]; };   // F16 pairs, [cap, kvHeads * hd]
+layout(set = 0, binding = 4, std430) readonly  buffer BufRV { uint ringV[]; };
+layout(set = 0, binding = 5, std430) writeonly buffer BufO  { float o[]; };      // [b, heads * hd]
+layout(set = 0, binding = 6, std430) readonly  buffer BufS  { float sinks[]; };  // [heads], read only when useSinks != 0
+
+layout(push_constant) uniform PushConstants {
+    uint b;
+    uint heads;
+    uint kvHeads;
+    uint hd;          // <= 256, even
+    uint cap;
+    uint lo;
+    uint start;
+    uint window;
+    float scale;
+    uint ringKWord0;  // word offset of the layer's rings inside the buffers
+    uint ringVWord0;
+    uint useSinks;
+} pc;
+
+shared float qs[256];
+shared float sc[TILE];
+shared float red[128];
+
+
+float reduceMax(float v) {
+    uint tid = gl_LocalInvocationID.x;
+    red[tid] = v;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (tid < s) red[tid] = max(red[tid], red[tid + s]);
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+float reduceSum(float v) {
+    uint tid = gl_LocalInvocationID.x;
+    red[tid] = v;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x / pc.heads, head = gl_WorkGroupID.x % pc.heads;
+    uint kvh = head / (pc.heads / pc.kvHeads);
+    uint nCtx = pc.start - pc.lo, nKeys = nCtx + pc.b;
+    uint qStride = pc.heads * pc.hd, kvStride = pc.kvHeads * pc.hd;
+    // A finite sentinel, not -inf: drivers may compile with no-inf fast math (Arc returned NaN for a fully masked tile).
+    const float NEG_INF = -1.0e30;
+
+    for (uint d = tid; d < pc.hd; d += 128u) qs[d] = q[row * qStride + head * pc.hd + d];
+    barrier();
+
+    float m = NEG_INF, l = 0.0, acc0 = 0.0, acc1 = 0.0;
+    if (pc.useSinks != 0u) { m = sinks[head]; l = 1.0; }
+    uint d0 = tid, d1 = tid + 128u;
+    for (uint t0 = 0u; t0 < nKeys; t0 += TILE) {
+        uint n = min(TILE, nKeys - t0);
+        float tmax = NEG_INF;
+        for (uint j = tid; j < n; j += 128u) {
+            uint key = t0 + j;
+            float s = 0.0;
+            if (key < nCtx) {
+                uint pos = pc.lo + key;
+                if (pc.start + row - pos >= pc.window) { sc[j] = NEG_INF; continue; }
+                uint slot = pos % pc.cap;
+                uint w0 = pc.ringKWord0 + (slot * kvStride + kvh * pc.hd) / 2u;
+                for (uint d = 0u; d < pc.hd; d += 2u) {
+                    vec2 kk = unpackHalf2x16(ringK[w0 + d / 2u]);
+                    s += qs[d] * kk.x + qs[d + 1u] * kk.y;
+                }
+            } else {
+                uint kr = (key - nCtx) * kvStride + kvh * pc.hd;
+                for (uint d = 0u; d < pc.hd; d++) s += qs[d] * kb[kr + d];
+            }
+            s *= pc.scale;
+            sc[j] = s;
+            tmax = max(tmax, s);
+        }
+        float mNew = max(m, reduceMax(tmax));   // uniform: every thread reads the same reduction
+        if (mNew <= 0.5 * NEG_INF) continue;    // the whole prefix so far is masked
+        float corr = exp(m - mNew);             // m = -inf -> 0
+        float tsum = 0.0;
+        for (uint j = tid; j < n; j += 128u) {
+            float e = exp(sc[j] - mNew);
+            sc[j] = e;
+            tsum += e;
+        }
+        l = l * corr + reduceSum(tsum);         // the reduction's barriers also publish sc[]
+        acc0 *= corr;
+        acc1 *= corr;
+        for (uint j = 0u; j < n; j++) {
+            float p = sc[j];
+            if (p == 0.0) continue;
+            uint key = t0 + j;
+            if (key < nCtx) {
+                uint slot = (pc.lo + key) % pc.cap;
+                uint e0 = slot * kvStride + kvh * pc.hd;
+                if (d0 < pc.hd) acc0 += p * unpackHalf2x16(ringV[pc.ringVWord0 + (e0 + d0) / 2u])[(e0 + d0) & 1u];
+                if (d1 < pc.hd) acc1 += p * unpackHalf2x16(ringV[pc.ringVWord0 + (e0 + d1) / 2u])[(e0 + d1) & 1u];
+            } else {
+                uint vr = (key - nCtx) * kvStride + kvh * pc.hd;
+                if (d0 < pc.hd) acc0 += p * vb[vr + d0];
+                if (d1 < pc.hd) acc1 += p * vb[vr + d1];
+            }
+        }
+        m = mNew;
+        barrier();                              // sc[] is rewritten by the next tile
+    }
+    float inv = 1.0 / l;
+    if (d0 < pc.hd) o[row * qStride + head * pc.hd + d0] = acc0 * inv;
+    if (d1 < pc.hd) o[row * qStride + head * pc.hd + d1] = acc1 * inv;
+}

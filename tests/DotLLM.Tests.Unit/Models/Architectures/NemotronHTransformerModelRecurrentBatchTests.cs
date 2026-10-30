@@ -123,6 +123,38 @@ public sealed unsafe class NemotronHTransformerModelRecurrentBatchTests
         AssertClose(refB, batchB, "seqB");
     }
 
+    /// <summary>
+    /// #839: the engine's default CPU cache (<c>KvGeometry.FromConfig</c>) holds slots for the attention layers only. An irregular
+    /// layout (attention at layers 1 and 4, NOT every k-th) makes slot != layer index; logits must be bit-identical to the legacy
+    /// one-slot-per-layer cache, and the cache must be smaller by exactly layers/attention.
+    /// </summary>
+    [Fact]
+    public void HybridAwareKvGeometry_BitIdenticalToLegacyPerLayerCache_AndSmaller()
+    {
+        var kinds = new[] { HybridLayerKind.Ssm, HybridLayerKind.Attention, HybridLayerKind.Ssm, HybridLayerKind.Ffn, HybridLayerKind.Attention };
+        using var fix = NemotronHFixture.Build(kinds, seed: 41);
+        int[] tok = [2, 4, 6, 1, 3];
+        int[] pos = [0, 1, 2, 3, 4];
+        int[] decTok = [5]; int[] decPos = [5];
+
+        float[] Run(Func<DotLLM.Engine.KvCache.SimpleKvCache> mk, out long bytes)
+        {
+            using var model = Build(fix);
+            using var kv = mk();
+            bytes = kv.AllocatedBytes;
+            model.Forward(tok, pos, -1, kv).Dispose();
+            using var lg = model.Forward(decTok, decPos, -1, kv);
+            return CopyLastRow(lg);
+        }
+
+        var legacy = Run(() => new DotLLM.Engine.KvCache.SimpleKvCache(kinds.Length, NumKvHeads, HeadDim, MaxSeqLen), out long legacyBytes);
+        var compact = Run(() => new DotLLM.Engine.KvCache.SimpleKvCache(DotLLM.Core.Attention.KvGeometry.FromConfig(fix.Config), MaxSeqLen), out long compactBytes);
+
+        Assert.Equal(legacy, compact);                                  // bit-identical
+        Assert.Equal(legacyBytes * 2 / kinds.Length, compactBytes);     // 2 attention layers of 5
+        Assert.Equal(2, DotLLM.Core.Attention.KvGeometry.SlotCount(fix.Config));
+    }
+
     // ── Helpers ──
 
     private static NemotronHTransformerModel Build(NemotronHFixture f)

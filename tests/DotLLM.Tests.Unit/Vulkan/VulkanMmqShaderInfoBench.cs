@@ -66,4 +66,21 @@ public sealed class VulkanMmqShaderInfoBench
         else
             _output.WriteLine("  => No register spill reported — VGPR/SGPR allocation fits without scratch memory.");
     }
+
+    [SkippableTheory]
+    [InlineData(MoeGroupedKQuant.Q4_K, 16)]
+    [InlineData(MoeGroupedKQuant.Q4_K, 64)]
+    [InlineData(MoeGroupedKQuant.Q5_K, 64)]
+    [InlineData(MoeGroupedKQuant.Q6_K, 64)]
+    public void Bench_GroupedMoeCoopmatShaderStatistics(MoeGroupedKQuant quant, int tileM)
+    {
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_MMQ_SHADER_INFO_BENCH"), "1", StringComparison.Ordinal),
+            "DOTLLM_MMQ_SHADER_INFO_BENCH=1 to enable this diagnostic.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(device.HasShaderInfoAmd && device.HasCooperativeMatrix, "Needs VK_AMD_shader_info + cooperative matrix.");
+        using var k = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, quant, tileM);
+        var st = device.GetShaderStatisticsAmd(k.PipelineHandle);
+        _output.WriteLine($"grouped {quant} m{tileM}: VGPR {st.resourceUsage.numUsedVgprs}/{st.numAvailableVgprs}, SGPR {st.resourceUsage.numUsedSgprs}, LDS {st.resourceUsage.ldsUsageSizeInBytes} B, scratch {st.resourceUsage.scratchMemUsageInBytes} B, wg {st.computeWorkGroupSizeX}");
+    }
 }

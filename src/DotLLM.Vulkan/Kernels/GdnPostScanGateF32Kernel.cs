@@ -41,10 +41,13 @@ public sealed class GdnPostScanGateF32Kernel : IDisposable
         _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 3);
     }
 
-    /// <summary>Loads <c>gdn_post_scan_gate_f32.spv</c> from <paramref name="spvDir"/>.</summary>
-    public static GdnPostScanGateF32Kernel Create(VulkanDevice device, string spvDir)
+    /// <summary>
+    /// Loads <c>gdn_post_scan_gate_f32.spv</c> (silu gate, Qwen3.5/3.6) - or, with <paramref name="sigmoidGate"/>, the
+    /// <c>gdn_post_scan_gate_sigmoid_f32.spv</c> variant (<c>norm(core) * sigmoid(z)</c>, Qwen4-Exp) - from <paramref name="spvDir"/>.
+    /// </summary>
+    public static GdnPostScanGateF32Kernel Create(VulkanDevice device, string spvDir, bool sigmoidGate = false)
     {
-        string path = Path.Combine(spvDir, "gdn_post_scan_gate_f32.spv");
+        string path = Path.Combine(spvDir, sigmoidGate ? "gdn_post_scan_gate_sigmoid_f32.spv" : "gdn_post_scan_gate_f32.spv");
         if (!File.Exists(path))
             throw new FileNotFoundException(
                 $"Vulkan SPIR-V not found: {path}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");

@@ -118,7 +118,7 @@ public sealed class VulkanTransformerModelMoeF16GroupedForwardTests : IDisposabl
             nint w3Raw = BuildF16BankAndRoundedF32(moe.W3, w3, IntermediateSize, HiddenSize);
 
             var f16Moe = new MoeLayerWeights(
-                moe.Gate, w1, w2, w3,
+                moe.Gate.ToArray(), w1, w2, w3,
                 moe.NumExperts, moe.NumExpertsPerTok, moe.HiddenSize, moe.IntermediateSize,
                 moe.NormTopKProb,
                 Array.Empty<nint>(), Array.Empty<nint>(), Array.Empty<nint>(),

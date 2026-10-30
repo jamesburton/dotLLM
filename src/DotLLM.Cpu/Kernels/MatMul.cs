@@ -174,6 +174,11 @@ public static unsafe partial class MatMul
                 result[row] = VecDotQ8_0Avx2(weightsQ8 + (long)row * rowBytes, xQ8, blockCount);
             }
         }
+        else if (Ssse3.IsSupported)
+        {
+            // 128-bit tier for pre-AVX2 hardware (Westmere, #477); bit-exact with scalar.
+            ComputeRowsQ8_0Sse(weightsQ8, xQ8, result, m, blockCount);
+        }
         else
         {
             for (int row = 0; row < m; row++)
@@ -193,15 +198,16 @@ public static unsafe partial class MatMul
     internal static float VecDotQ8_0ScalarR4(byte* groupBase, int rowInGroup, byte* xQ8, int blockCount)
     {
         float sumf = 0;
-        const int wStride = 4 * Q8_0BlockBytes;
+        const int wStride = Q8_0BlockBytes; // #1156: original row-major rows, rowStride apart
+        nint rowStride = (nint)blockCount * Q8_0BlockBytes;
 
         for (int block = 0; block < blockCount; block++)
         {
-            byte* wBlock = groupBase + block * wStride + rowInGroup * Q8_0BlockBytes;
+            byte* wBlock = groupBase + block * wStride + rowInGroup * rowStride;
             byte* xBlock = xQ8 + block * Q8_0BlockBytes;
 
-            float dw = (float)Unsafe.ReadUnaligned<Half>(wBlock);
-            float dx = (float)Unsafe.ReadUnaligned<Half>(xBlock);
+            float dw = HalfToSingle(wBlock);
+            float dx = HalfToSingle(xBlock);
 
             sbyte* qw = (sbyte*)(wBlock + 2);
             sbyte* qx = (sbyte*)(xBlock + 2);
@@ -223,84 +229,75 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     internal static void VecDotQ8_0Avx2_4RowsR4(
         byte* groupBase, byte* x, int blockCount, float* results)
+        => VecDotQ8_0Avx2_4RowsStrided(groupBase, (nint)blockCount * Q8_0BlockBytes, Q8_0BlockBytes, x, blockCount, results);
+
+    /// <summary>
+    /// The 4-row Q8_0 AVX2 dot over any layout: row <c>r</c>'s block <c>b</c> is at <c>w + r·rowStride + b·blockStride</c>.
+    /// R4 is <c>(34, 136)</c>; the original row-major weights are <c>(rowBytes, 34)</c>. Same arithmetic either way.
+    /// </summary>
+    /// <param name="w">Row 0's first block.</param>
+    /// <param name="rowStride">Bytes between rows' blocks at the same K position.</param>
+    /// <param name="blockStride">Bytes between consecutive blocks of one row.</param>
+    /// <param name="x">Q8_0 activation row.</param>
+    /// <param name="blockCount">Blocks per row.</param>
+    /// <param name="results">Four outputs.</param>
+    [SkipLocalsInit]
+    internal static void VecDotQ8_0Avx2_4RowsStrided(
+        byte* w, nint rowStride, nint blockStride, byte* x, int blockCount, float* results)
     {
         Vector256<float> acc0 = Vector256<float>.Zero;
         Vector256<float> acc1 = Vector256<float>.Zero;
         Vector256<float> acc2 = Vector256<float>.Zero;
         Vector256<float> acc3 = Vector256<float>.Zero;
         Vector256<short> ones = Vector256.Create((short)1);
-        const int wStride = 4 * Q8_0BlockBytes;
+        float* scale = stackalloc float[4];
 
         for (int block = 0; block < blockCount; block++)
         {
             byte* xBlock = x + block * Q8_0BlockBytes;
-            float dx = (float)Unsafe.ReadUnaligned<Half>(xBlock);
             Vector256<sbyte> vx = Unsafe.ReadUnaligned<Vector256<sbyte>>(xBlock + 2);
             Vector256<sbyte> absX = Avx2.Sign(vx, vx);
 
-            byte* blockBase = groupBase + block * wStride;
+            byte* blockBase = w + block * blockStride;
 
-            // Row 0
-            {
-                byte* wBlock = blockBase;
-                float dw = (float)Unsafe.ReadUnaligned<Half>(wBlock);
-                Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock + 2);
-                Vector256<sbyte> adjW = Avx2.Sign(vw, vx);
-                Vector256<short> prod = Avx2.MultiplyAddAdjacent(absX.AsByte(), adjW);
-                Vector256<int> isum = Avx2.MultiplyAddAdjacent(prod, ones);
-                if (Fma.IsSupported)
-                    acc0 = Fma.MultiplyAdd(Vector256.Create(dx * dw), Avx.ConvertToVector256Single(isum), acc0);
-                else
-                    acc0 += Avx.ConvertToVector256Single(isum) * Vector256.Create(dx * dw);
-            }
+            // The four rows' dx*dw at once: (float)Half is a managed call on .NET 10, costlier than the block dot (#1119).
+            // HalfToSingleSse2 is exact and IEEE multiplication commutes, so each lane equals the scalar dx * dw.
+            Vector128<float> dw4 = HalfToSingleSse2(LoadHalf4(blockBase, rowStride));
+            Sse.Store(scale, Sse.Multiply(Vector128.Create(HalfToSingle(xBlock)), dw4));
 
-            // Row 1
-            {
-                byte* wBlock = blockBase + Q8_0BlockBytes;
-                float dw = (float)Unsafe.ReadUnaligned<Half>(wBlock);
-                Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock + 2);
-                Vector256<sbyte> adjW = Avx2.Sign(vw, vx);
-                Vector256<short> prod = Avx2.MultiplyAddAdjacent(absX.AsByte(), adjW);
-                Vector256<int> isum = Avx2.MultiplyAddAdjacent(prod, ones);
-                if (Fma.IsSupported)
-                    acc1 = Fma.MultiplyAdd(Vector256.Create(dx * dw), Avx.ConvertToVector256Single(isum), acc1);
-                else
-                    acc1 += Avx.ConvertToVector256Single(isum) * Vector256.Create(dx * dw);
-            }
-
-            // Row 2
-            {
-                byte* wBlock = blockBase + 2 * Q8_0BlockBytes;
-                float dw = (float)Unsafe.ReadUnaligned<Half>(wBlock);
-                Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock + 2);
-                Vector256<sbyte> adjW = Avx2.Sign(vw, vx);
-                Vector256<short> prod = Avx2.MultiplyAddAdjacent(absX.AsByte(), adjW);
-                Vector256<int> isum = Avx2.MultiplyAddAdjacent(prod, ones);
-                if (Fma.IsSupported)
-                    acc2 = Fma.MultiplyAdd(Vector256.Create(dx * dw), Avx.ConvertToVector256Single(isum), acc2);
-                else
-                    acc2 += Avx.ConvertToVector256Single(isum) * Vector256.Create(dx * dw);
-            }
-
-            // Row 3
-            {
-                byte* wBlock = blockBase + 3 * Q8_0BlockBytes;
-                float dw = (float)Unsafe.ReadUnaligned<Half>(wBlock);
-                Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock + 2);
-                Vector256<sbyte> adjW = Avx2.Sign(vw, vx);
-                Vector256<short> prod = Avx2.MultiplyAddAdjacent(absX.AsByte(), adjW);
-                Vector256<int> isum = Avx2.MultiplyAddAdjacent(prod, ones);
-                if (Fma.IsSupported)
-                    acc3 = Fma.MultiplyAdd(Vector256.Create(dx * dw), Avx.ConvertToVector256Single(isum), acc3);
-                else
-                    acc3 += Avx.ConvertToVector256Single(isum) * Vector256.Create(dx * dw);
-            }
+            acc0 = Q8_0BlockFma(acc0, blockBase, vx, absX, scale[0], ones);
+            acc1 = Q8_0BlockFma(acc1, blockBase + rowStride, vx, absX, scale[1], ones);
+            acc2 = Q8_0BlockFma(acc2, blockBase + 2 * rowStride, vx, absX, scale[2], ones);
+            acc3 = Q8_0BlockFma(acc3, blockBase + 3 * rowStride, vx, absX, scale[3], ones);
         }
 
         results[0] = HorizontalSumAvx2Float(acc0);
         results[1] = HorizontalSumAvx2Float(acc1);
         results[2] = HorizontalSumAvx2Float(acc2);
         results[3] = HorizontalSumAvx2Float(acc3);
+    }
+
+    /// <summary>
+    /// One Q8_0 block of one row against one activation block: <c>acc + (dx·dw) · Σ w·x</c> per 8-lane group,
+    /// with the sign trick (<c>|x|</c> times <c>sign(w, x)</c>) so <c>vpmaddubsw</c> sees an unsigned operand.
+    /// </summary>
+    /// <param name="acc">Running accumulator.</param>
+    /// <param name="wBlock">The weight block (Half scale, then 32 int8).</param>
+    /// <param name="vx">The activation block's 32 int8.</param>
+    /// <param name="absX"><c>|vx|</c>.</param>
+    /// <param name="scale">dx * dw.</param>
+    /// <param name="ones">Sixteen 1s for the pairwise int16 reduction.</param>
+    /// <returns>The updated accumulator.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<float> Q8_0BlockFma(Vector256<float> acc, byte* wBlock, Vector256<sbyte> vx,
+        Vector256<sbyte> absX, float scale, Vector256<short> ones)
+    {
+        Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock + 2);
+        Vector256<short> prod = Avx2.MultiplyAddAdjacent(absX.AsByte(), Avx2.Sign(vw, vx));
+        Vector256<float> isum = Avx.ConvertToVector256Single(Avx2.MultiplyAddAdjacent(prod, ones));
+        return Fma.IsSupported
+            ? Fma.MultiplyAdd(Vector256.Create(scale), isum, acc)
+            : acc + isum * Vector256.Create(scale);
     }
 
     /// <summary>
@@ -351,7 +348,8 @@ public static unsafe partial class MatMul
         Vector512<float> acc1 = Vector512<float>.Zero;
         Vector512<float> acc2 = Vector512<float>.Zero;
         Vector512<float> acc3 = Vector512<float>.Zero;
-        const int wStride = 4 * Q8_0BlockBytes;
+        const int wStride = Q8_0BlockBytes; // #1156: original row-major rows, rowStride apart
+        nint rowStride = (nint)blockCount * Q8_0BlockBytes;
 
         int block = 0;
 
@@ -359,8 +357,8 @@ public static unsafe partial class MatMul
         {
             byte* xBlock0 = x + block * Q8_0BlockBytes;
             byte* xBlock1 = x + (block + 1) * Q8_0BlockBytes;
-            float dx0 = (float)Unsafe.ReadUnaligned<Half>(xBlock0);
-            float dx1 = (float)Unsafe.ReadUnaligned<Half>(xBlock1);
+            float dx0 = HalfToSingle(xBlock0);
+            float dx1 = HalfToSingle(xBlock1);
 
             // Load x data once and share it across all 4 rows.
             Vector256<sbyte> vx0 = Unsafe.ReadUnaligned<Vector256<sbyte>>(xBlock0 + 2);
@@ -368,15 +366,14 @@ public static unsafe partial class MatMul
             Vector256<sbyte> absX0 = Avx2.Sign(vx0, vx0);
             Vector256<sbyte> absX1 = Avx2.Sign(vx1, vx1);
 
-            // Row r's block b lives at groupBase + b * wStride + r * Q8_0BlockBytes, so each row
-            // is a fixed offset from the group base with the interleave stride between its blocks.
+            // Row r's block b lives at groupBase + r * rowStride + b * wStride (#1156: original row-major weights).
             ProcessVnniDualBlock(groupBase, block, wStride,
                 vx0, vx1, absX0, absX1, dx0, dx1, ref acc0);
-            ProcessVnniDualBlock(groupBase + Q8_0BlockBytes, block, wStride,
+            ProcessVnniDualBlock(groupBase + rowStride, block, wStride,
                 vx0, vx1, absX0, absX1, dx0, dx1, ref acc1);
-            ProcessVnniDualBlock(groupBase + 2 * Q8_0BlockBytes, block, wStride,
+            ProcessVnniDualBlock(groupBase + 2 * rowStride, block, wStride,
                 vx0, vx1, absX0, absX1, dx0, dx1, ref acc2);
-            ProcessVnniDualBlock(groupBase + 3 * Q8_0BlockBytes, block, wStride,
+            ProcessVnniDualBlock(groupBase + 3 * rowStride, block, wStride,
                 vx0, vx1, absX0, absX1, dx0, dx1, ref acc3);
         }
 
@@ -389,15 +386,15 @@ public static unsafe partial class MatMul
         if (block < blockCount)
         {
             byte* xBlock = x + block * Q8_0BlockBytes;
-            float dx = (float)Unsafe.ReadUnaligned<Half>(xBlock);
+            float dx = HalfToSingle(xBlock);
             Vector256<sbyte> vx = Unsafe.ReadUnaligned<Vector256<sbyte>>(xBlock + 2);
             Vector256<sbyte> absX = Avx2.Sign(vx, vx);
             Vector256<short> ones = Vector256.Create((short)1);
 
             results[0] += ProcessAvx2SingleBlock(groupBase, block, wStride, vx, absX, dx, ones);
-            results[1] += ProcessAvx2SingleBlock(groupBase + Q8_0BlockBytes, block, wStride, vx, absX, dx, ones);
-            results[2] += ProcessAvx2SingleBlock(groupBase + 2 * Q8_0BlockBytes, block, wStride, vx, absX, dx, ones);
-            results[3] += ProcessAvx2SingleBlock(groupBase + 3 * Q8_0BlockBytes, block, wStride, vx, absX, dx, ones);
+            results[1] += ProcessAvx2SingleBlock(groupBase + rowStride, block, wStride, vx, absX, dx, ones);
+            results[2] += ProcessAvx2SingleBlock(groupBase + 2 * rowStride, block, wStride, vx, absX, dx, ones);
+            results[3] += ProcessAvx2SingleBlock(groupBase + 3 * rowStride, block, wStride, vx, absX, dx, ones);
         }
     }
 
@@ -423,6 +420,14 @@ public static unsafe partial class MatMul
                 VecDotQ8_0Avx2_4RowsR4(groupBase, xQ8, blockCount, result + g * 4);
             }
         }
+        else if (Ssse3.IsSupported)
+        {
+            for (int g = 0; g < fullGroups; g++)
+            {
+                byte* groupBase = repackedWeights + (long)g * groupBytes;
+                VecDotQ8_0Sse_4RowsR4(groupBase, xQ8, blockCount, result + g * 4);
+            }
+        }
         else
         {
             for (int g = 0; g < fullGroups; g++)
@@ -439,9 +444,7 @@ public static unsafe partial class MatMul
             int rowBytes = blockCount * Q8_0BlockBytes;
             byte* tailBase = repackedWeights + (long)fullGroups * groupBytes;
             for (int r = 0; r < tailRows; r++)
-                result[fullGroups * 4 + r] = Avx2.IsSupported
-                    ? VecDotQ8_0Avx2(tailBase + (long)r * rowBytes, xQ8, blockCount)
-                    : VecDotQ8_0Scalar(tailBase + (long)r * rowBytes, xQ8, blockCount);
+                result[fullGroups * 4 + r] = VecDotQ8_0Row(tailBase + (long)r * rowBytes, xQ8, blockCount);
         }
     }
 
@@ -504,82 +507,25 @@ public static unsafe partial class MatMul
         }
     }
 
-    private struct GemmR4TiledQ8Ctx
-    {
-        public byte* RepackedWeights;
-        public byte* InputQ8;
-        public float* C;
-        public int FullGroups;
-        public int TailRows;
-        public int BlockCount;
-        public int M;
-        public int N;
-        public int TileGroups;
-    }
-
     /// <summary>
-    /// Parallel <c>GemmR4TiledQ8_0</c>. Partitions row-group tiles across threads; each
-    /// thread owns a disjoint row range of C, so no synchronisation is needed.
+    /// Parallel <c>GemmR4TiledQ8_0</c> over pre-quantized input. Runs the generic R4 GEMM, which partitions
+    /// row groups across threads and adds the multi-token kernel (#1119); the per-element arithmetic is
+    /// unchanged, so results equal the serial overload's.
     /// </summary>
+    /// <param name="repackedWeights">R4-interleaved weight data.</param>
+    /// <param name="inputQ8">Pre-quantized Q8_0 input, [N x q8RowBytes].</param>
+    /// <param name="c">Output [N x M], row-major.</param>
+    /// <param name="fullGroups">Complete 4-row groups (M / 4).</param>
+    /// <param name="tailRows">Leftover rows (M % 4), stored row-major after the interleaved data.</param>
+    /// <param name="blockCount">Blocks per row (K / 32).</param>
+    /// <param name="m">Total output rows.</param>
+    /// <param name="n">Token count.</param>
+    /// <param name="pool">Thread pool, or null for single-threaded.</param>
     [SkipLocalsInit]
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     internal static void GemmR4TiledQ8_0(byte* repackedWeights, byte* inputQ8, float* c,
         int fullGroups, int tailRows, int blockCount, int m, int n, ComputeThreadPool? pool)
-    {
-        if (pool is null || m < ParallelMinRows)
-        {
-            GemmR4TiledQ8_0(repackedWeights, inputQ8, c, fullGroups, tailRows, blockCount, m, n);
-            return;
-        }
-
-        var ctx = new GemmR4TiledQ8Ctx
-        {
-            RepackedWeights = repackedWeights, InputQ8 = inputQ8, C = c,
-            FullGroups = fullGroups, TailRows = tailRows, BlockCount = blockCount,
-            M = m, N = n, TileGroups = Math.Max(1, ComputeTileM(blockCount * Q8_0BlockBytes) / 4),
-        };
-        pool.Dispatch((nint)(&ctx), &GemmR4TiledQ8Worker);
-    }
-
-    private static void GemmR4TiledQ8Worker(nint ctxPtr, int threadIdx, int threadCount)
-    {
-        ref var ctx = ref Unsafe.AsRef<GemmR4TiledQ8Ctx>((void*)ctxPtr);
-
-        int q8RowBytes = ctx.BlockCount * Q8_0BlockBytes;
-        int groupBytes = 4 * q8RowBytes;
-
-        // Partition groups across threads, then tile within each thread's share.
-        ComputeThreadPool.PartitionRange(ctx.FullGroups, threadIdx, threadCount, out int startGroup, out int endGroup);
-
-        for (int gStart = startGroup; gStart < endGroup; gStart += ctx.TileGroups)
-        {
-            int gCount = Math.Min(ctx.TileGroups, endGroup - gStart);
-            byte* tileWeights = ctx.RepackedWeights + (long)gStart * groupBytes;
-
-            for (int t = 0; t < ctx.N; t++)
-            {
-                ComputeRowsQ8_0Interleaved(
-                    tileWeights,
-                    ctx.InputQ8 + (long)t * q8RowBytes,
-                    ctx.C + (long)t * ctx.M + gStart * 4,
-                    gCount, tailRows: 0, ctx.BlockCount);
-            }
-        }
-
-        // Thread 0 handles the row-major tail rows.
-        if (threadIdx == 0 && ctx.TailRows > 0)
-        {
-            byte* tailBase = ctx.RepackedWeights + (long)ctx.FullGroups * groupBytes;
-            for (int t = 0; t < ctx.N; t++)
-            {
-                ComputeRows(
-                    tailBase,
-                    ctx.InputQ8 + (long)t * q8RowBytes,
-                    ctx.C + (long)t * ctx.M + ctx.FullGroups * 4,
-                    ctx.TailRows, ctx.BlockCount);
-            }
-        }
-    }
+        => GemmR4TiledQ8_0(repackedWeights, null, inputQ8, c, fullGroups, tailRows, blockCount, m,
+            blockCount * Q8_0GroupSize, n, pool);
 
     /// <summary>
     /// Parallel R4-interleaved Q8_0 ComputeRows. Partitions groups across threads.
@@ -621,8 +567,8 @@ public static unsafe partial class MatMul
             byte* aBlock = a + block * Q8_0BlockBytes;
             byte* bBlock = b + block * Q8_0BlockBytes;
 
-            float da = (float)Unsafe.ReadUnaligned<Half>(aBlock);
-            float db = (float)Unsafe.ReadUnaligned<Half>(bBlock);
+            float da = HalfToSingle(aBlock);
+            float db = HalfToSingle(bBlock);
 
             sbyte* qa = (sbyte*)(aBlock + 2);
             sbyte* qb = (sbyte*)(bBlock + 2);
@@ -656,8 +602,8 @@ public static unsafe partial class MatMul
             byte* aBlock = a + block * Q8_0BlockBytes;
             byte* bBlock = b + block * Q8_0BlockBytes;
 
-            float da = (float)Unsafe.ReadUnaligned<Half>(aBlock);
-            float db = (float)Unsafe.ReadUnaligned<Half>(bBlock);
+            float da = HalfToSingle(aBlock);
+            float db = HalfToSingle(bBlock);
 
             // Load 32 signed bytes from each operand.
             Vector256<sbyte> va = Unsafe.ReadUnaligned<Vector256<sbyte>>(aBlock + 2);
@@ -701,7 +647,7 @@ public static unsafe partial class MatMul
         for (int block = 0; block < blockCount; block++)
         {
             byte* xBlock = x + block * Q8_0BlockBytes;
-            float dx = (float)Unsafe.ReadUnaligned<Half>(xBlock);
+            float dx = HalfToSingle(xBlock);
 
             // Load x data once per block.
             Vector256<sbyte> vx = Unsafe.ReadUnaligned<Vector256<sbyte>>(xBlock + 2);
@@ -710,7 +656,7 @@ public static unsafe partial class MatMul
             // Row 0
             {
                 byte* wBlock = w0 + block * Q8_0BlockBytes;
-                float dw = (float)Unsafe.ReadUnaligned<Half>(wBlock);
+                float dw = HalfToSingle(wBlock);
                 Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock + 2);
                 Vector256<sbyte> adjW = Avx2.Sign(vw, vx);
                 Vector256<short> prod = Avx2.MultiplyAddAdjacent(absX.AsByte(), adjW);
@@ -726,7 +672,7 @@ public static unsafe partial class MatMul
             // Row 1
             {
                 byte* wBlock = w1 + block * Q8_0BlockBytes;
-                float dw = (float)Unsafe.ReadUnaligned<Half>(wBlock);
+                float dw = HalfToSingle(wBlock);
                 Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock + 2);
                 Vector256<sbyte> adjW = Avx2.Sign(vw, vx);
                 Vector256<short> prod = Avx2.MultiplyAddAdjacent(absX.AsByte(), adjW);
@@ -742,7 +688,7 @@ public static unsafe partial class MatMul
             // Row 2
             {
                 byte* wBlock = w2 + block * Q8_0BlockBytes;
-                float dw = (float)Unsafe.ReadUnaligned<Half>(wBlock);
+                float dw = HalfToSingle(wBlock);
                 Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock + 2);
                 Vector256<sbyte> adjW = Avx2.Sign(vw, vx);
                 Vector256<short> prod = Avx2.MultiplyAddAdjacent(absX.AsByte(), adjW);
@@ -758,7 +704,7 @@ public static unsafe partial class MatMul
             // Row 3
             {
                 byte* wBlock = w3 + block * Q8_0BlockBytes;
-                float dw = (float)Unsafe.ReadUnaligned<Half>(wBlock);
+                float dw = HalfToSingle(wBlock);
                 Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock + 2);
                 Vector256<sbyte> adjW = Avx2.Sign(vw, vx);
                 Vector256<short> prod = Avx2.MultiplyAddAdjacent(absX.AsByte(), adjW);
@@ -801,10 +747,10 @@ public static unsafe partial class MatMul
             byte* aBlock1 = a + (block + 1) * Q8_0BlockBytes;
             byte* bBlock1 = b + (block + 1) * Q8_0BlockBytes;
 
-            float da0 = (float)Unsafe.ReadUnaligned<Half>(aBlock0);
-            float db0 = (float)Unsafe.ReadUnaligned<Half>(bBlock0);
-            float da1 = (float)Unsafe.ReadUnaligned<Half>(aBlock1);
-            float db1 = (float)Unsafe.ReadUnaligned<Half>(bBlock1);
+            float da0 = HalfToSingle(aBlock0);
+            float db0 = HalfToSingle(bBlock0);
+            float da1 = HalfToSingle(aBlock1);
+            float db1 = HalfToSingle(bBlock1);
 
             // Load 32 bytes from each block.
             Vector256<sbyte> va0 = Unsafe.ReadUnaligned<Vector256<sbyte>>(aBlock0 + 2);
@@ -844,8 +790,8 @@ public static unsafe partial class MatMul
             byte* aBlock = a + block * Q8_0BlockBytes;
             byte* bBlock = b + block * Q8_0BlockBytes;
 
-            float da = (float)Unsafe.ReadUnaligned<Half>(aBlock);
-            float db = (float)Unsafe.ReadUnaligned<Half>(bBlock);
+            float da = HalfToSingle(aBlock);
+            float db = HalfToSingle(bBlock);
 
             Vector256<sbyte> va = Unsafe.ReadUnaligned<Vector256<sbyte>>(aBlock + 2);
             Vector256<sbyte> vb = Unsafe.ReadUnaligned<Vector256<sbyte>>(bBlock + 2);
@@ -883,8 +829,8 @@ public static unsafe partial class MatMul
         {
             byte* xBlock0 = x + block * Q8_0BlockBytes;
             byte* xBlock1 = x + (block + 1) * Q8_0BlockBytes;
-            float dx0 = (float)Unsafe.ReadUnaligned<Half>(xBlock0);
-            float dx1 = (float)Unsafe.ReadUnaligned<Half>(xBlock1);
+            float dx0 = HalfToSingle(xBlock0);
+            float dx1 = HalfToSingle(xBlock1);
 
             // Load x data once.
             Vector256<sbyte> vx0 = Unsafe.ReadUnaligned<Vector256<sbyte>>(xBlock0 + 2);
@@ -908,7 +854,7 @@ public static unsafe partial class MatMul
         if (block < blockCount)
         {
             byte* xBlock = x + block * Q8_0BlockBytes;
-            float dx = (float)Unsafe.ReadUnaligned<Half>(xBlock);
+            float dx = HalfToSingle(xBlock);
             Vector256<sbyte> vx = Unsafe.ReadUnaligned<Vector256<sbyte>>(xBlock + 2);
             Vector256<sbyte> absX = Avx2.Sign(vx, vx);
             Vector256<short> ones = Vector256.Create((short)1);
@@ -931,8 +877,8 @@ public static unsafe partial class MatMul
     {
         byte* wBlock0 = w + block * Q8_0BlockBytes;
         byte* wBlock1 = w + (block + 1) * Q8_0BlockBytes;
-        float dw0 = (float)Unsafe.ReadUnaligned<Half>(wBlock0);
-        float dw1 = (float)Unsafe.ReadUnaligned<Half>(wBlock1);
+        float dw0 = HalfToSingle(wBlock0);
+        float dw1 = HalfToSingle(wBlock1);
 
         Vector256<sbyte> vw0 = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock0 + 2);
         Vector256<sbyte> vw1 = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock1 + 2);
@@ -995,8 +941,8 @@ public static unsafe partial class MatMul
         {
             byte* xBlock0 = x + block * Q8_0BlockBytes;
             byte* xBlock1 = x + (block + 1) * Q8_0BlockBytes;
-            float dx0 = (float)Unsafe.ReadUnaligned<Half>(xBlock0);
-            float dx1 = (float)Unsafe.ReadUnaligned<Half>(xBlock1);
+            float dx0 = HalfToSingle(xBlock0);
+            float dx1 = HalfToSingle(xBlock1);
 
             Vector256<sbyte> vx0 = Unsafe.ReadUnaligned<Vector256<sbyte>>(xBlock0 + 2);
             Vector256<sbyte> vx1 = Unsafe.ReadUnaligned<Vector256<sbyte>>(xBlock1 + 2);
@@ -1017,7 +963,7 @@ public static unsafe partial class MatMul
         if (block < blockCount)
         {
             byte* xBlock = x + block * Q8_0BlockBytes;
-            float dx = (float)Unsafe.ReadUnaligned<Half>(xBlock);
+            float dx = HalfToSingle(xBlock);
             Vector256<sbyte> vx = Unsafe.ReadUnaligned<Vector256<sbyte>>(xBlock + 2);
             Vector256<sbyte> absX = Avx2.Sign(vx, vx);
             Vector256<short> ones = Vector256.Create((short)1);
@@ -1042,8 +988,8 @@ public static unsafe partial class MatMul
     {
         byte* wBlock0 = w + block * blockStride;
         byte* wBlock1 = w + (block + 1) * blockStride;
-        float dw0 = (float)Unsafe.ReadUnaligned<Half>(wBlock0);
-        float dw1 = (float)Unsafe.ReadUnaligned<Half>(wBlock1);
+        float dw0 = HalfToSingle(wBlock0);
+        float dw1 = HalfToSingle(wBlock1);
 
         Vector256<sbyte> vw0 = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock0 + 2);
         Vector256<sbyte> vw1 = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock1 + 2);
@@ -1073,7 +1019,7 @@ public static unsafe partial class MatMul
         float dx, Vector256<short> ones)
     {
         byte* wBlock = w + block * blockStride;
-        float dw = (float)Unsafe.ReadUnaligned<Half>(wBlock);
+        float dw = HalfToSingle(wBlock);
         Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock + 2);
         Vector256<sbyte> adjW = Avx2.Sign(vw, vx);
         Vector256<short> prod = Avx2.MultiplyAddAdjacent(absX.AsByte(), adjW);
@@ -1556,6 +1502,12 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     public static void GemvF16(nint weights, float* x, float* y, int m, int k)
     {
+        if (F16SseTier)
+        {
+            GemvF16Sse((ushort*)weights, x, y, m, k);
+            return;
+        }
+
         const int stackThreshold = 2048; // 8KB of floats
         Half* weightsHalf = (Half*)weights;
 
@@ -1598,11 +1550,20 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     public static void GemmF16(nint weights, float* b, float* c, int m, int k, int n)
     {
+        if (n == 1)
+        {
+            // Mirrors the pooled overload: single-token calls (e.g. MoE expert decode) take the
+            // GEMV path, which on the SSE tier is the fused convert+dot.
+            GemvF16(weights, b, c, m, k);
+            return;
+        }
+
         int rowBytes = k * sizeof(Half);
         int tileM = ComputeTileM(rowBytes);
         Half* weightsHalf = (Half*)weights;
 
-        float[] rented = ArrayPool<float>.Shared.Rent(k);
+        bool fma = F16FmaTier && !F16SseTier;
+        float[] rented = ArrayPool<float>.Shared.Rent(fma ? GemmF16FmaScratchFloats(k) : k);
         try
         {
             fixed (float* rowBuf = rented)
@@ -1611,6 +1572,18 @@ public static unsafe partial class MatMul
                 {
                     int tileRows = Math.Min(tileM, m - mStart);
                     Half* tileWeightsHalf = weightsHalf + (long)mStart * k;
+
+                    if (fma)
+                    {
+                        GemmF16RowsFma(tileWeightsHalf, tileRows, b, c + mStart, m, k, n, rowBuf);
+                        continue;
+                    }
+
+                    if (F16SseTier)
+                    {
+                        GemmF16RowsSse(tileWeightsHalf, tileRows, b, c + mStart, m, k, n, rowBuf);
+                        continue;
+                    }
 
                     for (int t = 0; t < n; t++)
                     {
@@ -1643,15 +1616,10 @@ public static unsafe partial class MatMul
 
     /// <summary>
     /// Converts a Half (IEEE 754 binary16) at the given pointer to float.
-    /// Extracted into a tiny helper so RyuJIT reliably emits <c>vcvtph2ps</c> (F16C) for the
-    /// <c>Half→float</c> cast. In large methods with high register pressure, the JIT may fail
-    /// to inline <c>Half.op_Explicit</c> and fall back to a software function call.
+    /// Kept as a name for its callers; see <see cref="HalfToSingle(byte*)"/> (#1119: the cast is a managed call on .NET 10).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static float HalfBitsToFloat(byte* ptr)
-    {
-        return (float)Unsafe.ReadUnaligned<Half>(ptr);
-    }
+    private static float HalfBitsToFloat(byte* ptr) => HalfToSingle(ptr);
 
     /// <summary>
     /// Scalar reference outer-product microkernel for Q8_0 R4 layout.
@@ -1663,7 +1631,8 @@ public static unsafe partial class MatMul
         byte* groupBase, byte* x0, byte* x1, byte* x2,
         float* c, int blockCount, int cStride)
     {
-        const int wStride = 4 * Q8_0BlockBytes;
+        const int wStride = Q8_0BlockBytes; // #1156: original row-major rows, rowStride apart
+        nint rowStride = (nint)blockCount * Q8_0BlockBytes;
 
         // 12 accumulators: [row][token]
         float acc00 = 0, acc01 = 0, acc02 = 0;
@@ -1678,14 +1647,14 @@ public static unsafe partial class MatMul
             byte* x1Block = x1 + b * Q8_0BlockBytes;
             byte* x2Block = x2 + b * Q8_0BlockBytes;
 
-            float dx0 = (float)Unsafe.ReadUnaligned<Half>(x0Block);
-            float dx1 = (float)Unsafe.ReadUnaligned<Half>(x1Block);
-            float dx2 = (float)Unsafe.ReadUnaligned<Half>(x2Block);
+            float dx0 = HalfToSingle(x0Block);
+            float dx1 = HalfToSingle(x1Block);
+            float dx2 = HalfToSingle(x2Block);
 
             for (int r = 0; r < 4; r++)
             {
-                byte* wBlock = blockBase + r * Q8_0BlockBytes;
-                float dw = (float)Unsafe.ReadUnaligned<Half>(wBlock);
+                byte* wBlock = blockBase + r * rowStride;
+                float dw = HalfToSingle(wBlock);
                 sbyte* qw = (sbyte*)(wBlock + 2);
 
                 // Token 0
@@ -1738,7 +1707,8 @@ public static unsafe partial class MatMul
         byte* groupBase, byte* x0, byte* x1, byte* x2,
         float* c, int blockCount, int cStride)
     {
-        const int wStride = 4 * Q8_0BlockBytes;
+        const int wStride = Q8_0BlockBytes; // #1156: original row-major rows, rowStride apart
+        nint rowStride = (nint)blockCount * Q8_0BlockBytes;
         Vector256<short> ones = Vector256.Create((short)1);
 
         // Process one weight row at a time with only 3 accumulators (one per token).
@@ -1752,7 +1722,7 @@ public static unsafe partial class MatMul
 
             for (int b = 0; b < blockCount; b++)
             {
-                byte* wBlock = groupBase + b * wStride + r * Q8_0BlockBytes;
+                byte* wBlock = groupBase + b * wStride + r * rowStride;
                 float dw = HalfBitsToFloat(wBlock);
                 Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock + 2);
 
@@ -1810,7 +1780,8 @@ public static unsafe partial class MatMul
         byte* groupBase, byte* x0, byte* x1, byte* x2, byte* x3, byte* x4, byte* x5,
         float* c, int blockCount, int cStride)
     {
-        const int wStride = 4 * Q8_0BlockBytes;
+        const int wStride = Q8_0BlockBytes; // #1156: original row-major rows, rowStride apart
+        nint rowStride = (nint)blockCount * Q8_0BlockBytes;
 
         // 24 accumulators: acc_r{row}t{token}
         Vector512<float> a0t0 = Vector512<float>.Zero, a0t1 = Vector512<float>.Zero, a0t2 = Vector512<float>.Zero;
@@ -1858,8 +1829,8 @@ public static unsafe partial class MatMul
 
             // Row 1
             {
-                byte* wb0 = blockBase0 + Q8_0BlockBytes;
-                byte* wb1 = blockBase1 + Q8_0BlockBytes;
+                byte* wb0 = blockBase0 + rowStride;
+                byte* wb1 = blockBase1 + rowStride;
                 float dw0 = HalfBitsToFloat(wb0);
                 float dw1 = HalfBitsToFloat(wb1);
                 Vector256<sbyte> vwLo = Unsafe.ReadUnaligned<Vector256<sbyte>>(wb0 + 2);
@@ -1875,8 +1846,8 @@ public static unsafe partial class MatMul
 
             // Row 2
             {
-                byte* wb0 = blockBase0 + 2 * Q8_0BlockBytes;
-                byte* wb1 = blockBase1 + 2 * Q8_0BlockBytes;
+                byte* wb0 = blockBase0 + 2 * rowStride;
+                byte* wb1 = blockBase1 + 2 * rowStride;
                 float dw0 = HalfBitsToFloat(wb0);
                 float dw1 = HalfBitsToFloat(wb1);
                 Vector256<sbyte> vwLo = Unsafe.ReadUnaligned<Vector256<sbyte>>(wb0 + 2);
@@ -1892,8 +1863,8 @@ public static unsafe partial class MatMul
 
             // Row 3
             {
-                byte* wb0 = blockBase0 + 3 * Q8_0BlockBytes;
-                byte* wb1 = blockBase1 + 3 * Q8_0BlockBytes;
+                byte* wb0 = blockBase0 + 3 * rowStride;
+                byte* wb1 = blockBase1 + 3 * rowStride;
                 float dw0 = HalfBitsToFloat(wb0);
                 float dw1 = HalfBitsToFloat(wb1);
                 Vector256<sbyte> vwLo = Unsafe.ReadUnaligned<Vector256<sbyte>>(wb0 + 2);
@@ -2355,6 +2326,8 @@ public static unsafe partial class MatMul
         public int K;
         public int N;
         public int TileM;
+        /// <summary>Token chunks per weight tile (>= 1): lets few-tile GEMMs (PLE gate: 7 tiles) use every thread.</summary>
+        public int TokChunks;
     }
 
     private struct GemmTiledF16Ctx
@@ -2401,6 +2374,8 @@ public static unsafe partial class MatMul
             byte* groupBase = ctx.RepackedWeights + (long)g * groupBytes;
             if (Avx2.IsSupported)
                 VecDotQ8_0Avx2_4RowsR4(groupBase, ctx.XQ, ctx.BlockCount, ctx.Result + g * 4);
+            else if (Ssse3.IsSupported)
+                VecDotQ8_0Sse_4RowsR4(groupBase, ctx.XQ, ctx.BlockCount, ctx.Result + g * 4);
             else
                 for (int r = 0; r < 4; r++)
                     ctx.Result[g * 4 + r] = VecDotQ8_0ScalarR4(groupBase, r, ctx.XQ, ctx.BlockCount);
@@ -2413,9 +2388,7 @@ public static unsafe partial class MatMul
             int tailEnd = Math.Min(end, ctx.M) - ctx.FullGroups * 4;
             byte* tailBase = ctx.RepackedWeights + (long)ctx.FullGroups * groupBytes;
             for (int r = tailStart; r < tailEnd; r++)
-                ctx.Result[ctx.FullGroups * 4 + r] = Avx2.IsSupported
-                    ? VecDotQ8_0Avx2(tailBase + (long)r * rowBytes, ctx.XQ, ctx.BlockCount)
-                    : VecDotQ8_0Scalar(tailBase + (long)r * rowBytes, ctx.XQ, ctx.BlockCount);
+                ctx.Result[ctx.FullGroups * 4 + r] = VecDotQ8_0Row(tailBase + (long)r * rowBytes, ctx.XQ, ctx.BlockCount);
         }
     }
 
@@ -2442,6 +2415,11 @@ public static unsafe partial class MatMul
         ref var ctx = ref Unsafe.AsRef<GemvF16Ctx>((void*)ctxPtr);
         PartitionRows(ctx.M, threadIdx, threadCount, out int start, out int count);
         if (count == 0) return;
+        if (F16SseTier)
+        {
+            GemvF16Sse((ushort*)ctx.Weights + (long)start * ctx.K, ctx.X, ctx.Y + start, count, ctx.K);
+            return;
+        }
         Half* weightsHalf = (Half*)ctx.Weights;
         float* scratch = (float*)ctx.ScratchPtrs[threadIdx];
         var xSpan = new ReadOnlySpan<float>(ctx.X, ctx.K);
@@ -2514,14 +2492,18 @@ public static unsafe partial class MatMul
     {
         ref var ctx = ref Unsafe.AsRef<GemmTiledF32Ctx>((void*)ctxPtr);
         int totalTiles = (ctx.M + ctx.TileM - 1) / ctx.TileM;
-        ComputeThreadPool.PartitionRange(totalTiles, threadIdx, threadCount, out int startTile, out int endTile);
+        // Work item = (tile, token chunk); row results are independent dots, so any split is bit-identical.
+        int chunks = Math.Max(1, ctx.TokChunks);
+        ComputeThreadPool.PartitionRange(totalTiles * chunks, threadIdx, threadCount, out int startItem, out int endItem);
 
-        for (int tile = startTile; tile < endTile; tile++)
+        for (int item = startItem; item < endItem; item++)
         {
+            int tile = item / chunks;
+            ComputeThreadPool.PartitionRange(ctx.N, item % chunks, chunks, out int t0, out int t1);
             int mStart = tile * ctx.TileM;
             int tileRows = Math.Min(ctx.TileM, ctx.M - mStart);
             float* tileWeights = ctx.A + (long)mStart * ctx.K;
-            for (int t = 0; t < ctx.N; t++)
+            for (int t = t0; t < t1; t++)
                 GemvF32(tileWeights, ctx.B + t * ctx.K, ctx.C + t * ctx.M + mStart, tileRows, ctx.K);
         }
     }
@@ -2541,6 +2523,16 @@ public static unsafe partial class MatMul
             int mStart = tile * ctx.TileM;
             int tileRows = Math.Min(ctx.TileM, ctx.M - mStart);
             Half* tileWeightsHalf = weightsHalf + (long)mStart * ctx.K;
+            if (F16FmaTier && !F16SseTier)
+            {
+                GemmF16RowsFma(tileWeightsHalf, tileRows, ctx.B, ctx.C + mStart, ctx.M, ctx.K, ctx.N, rowBuf);
+                continue;
+            }
+            if (F16SseTier)
+            {
+                GemmF16RowsSse(tileWeightsHalf, tileRows, ctx.B, ctx.C + mStart, ctx.M, ctx.K, ctx.N, rowBuf);
+                continue;
+            }
             for (int t = 0; t < ctx.N; t++)
             {
                 float* xPtr = ctx.B + t * ctx.K;
@@ -2764,13 +2756,14 @@ public static unsafe partial class MatMul
         int tileM = ComputeTileM(rowBytes);
         int totalTiles = (m + tileM - 1) / tileM;
 
-        if (totalTiles < 2)
+        if (totalTiles < 2 && n < 8)
         {
             GemmF32(a, b, c, m, k, n);
             return;
         }
 
-        var ctx = new GemmTiledF32Ctx { A = a, B = b, C = c, M = m, K = k, N = n, TileM = tileM };
+        int tokChunks = totalTiles >= pool.ThreadCount ? 1 : Math.Min(n, (pool.ThreadCount + totalTiles - 1) / totalTiles);
+        var ctx = new GemmTiledF32Ctx { A = a, B = b, C = c, M = m, K = k, N = n, TileM = tileM, TokChunks = tokChunks };
         pool.Dispatch((nint)(&ctx), &GemmTiledF32Worker);
     }
 
@@ -2795,6 +2788,15 @@ public static unsafe partial class MatMul
 
         int rowBytes = k * sizeof(Half);
         int tileM = ComputeTileM(rowBytes);
+        bool fma = F16FmaTier && !F16SseTier;
+        if (fma)
+        {
+            // #1404: the L2-sized tile (up to 256 rows) left bge-small (m=384) with 2 tiles for 32
+            // threads. The weights stream once per tile regardless, so shrink the tile until every
+            // worker has one (multiple of 4 rows, floor 8).
+            int perThread = ((m + pool.ThreadCount - 1) / pool.ThreadCount + 3) & ~3;
+            tileM = Math.Min(tileM, Math.Max(8, perThread));
+        }
         int totalTiles = (m + tileM - 1) / tileM;
 
         if (totalTiles < 2)
@@ -2805,7 +2807,7 @@ public static unsafe partial class MatMul
 
         int threadCount = pool.ThreadCount;
         nint* scratchPtrs = stackalloc nint[threadCount];
-        int scratchBytes = k * sizeof(float);
+        int scratchBytes = (fma ? GemmF16FmaScratchFloats(k) : k) * sizeof(float);
         for (int i = 0; i < threadCount; i++)
             scratchPtrs[i] = pool.GetWorkerScratch(i, scratchBytes);
 

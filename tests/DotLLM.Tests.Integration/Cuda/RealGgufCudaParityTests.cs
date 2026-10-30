@@ -45,6 +45,7 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class RealGgufCudaParityTests
 {
     private const float LogitsAbsTol = 3.0f;
@@ -249,7 +250,7 @@ public sealed class RealGgufCudaParityTests
     {
         _output.WriteLine($"[NemotronH] gguf: {path}");
 
-        using var cpuGguf = GgufFile.Open(path);
+        using var cpuGguf = CheckpointGuard.LoadOrSkip(path, "GGUF checkpoint (CPU)", () => GgufFile.Open(path));
         var config = GgufModelConfigExtractor.Extract(cpuGguf.Metadata);
         Assert.Equal(Architecture.NemotronH, config.Architecture);
         Assert.NotNull(config.HybridLayout);
@@ -258,7 +259,7 @@ public sealed class RealGgufCudaParityTests
         using var cpuModel = NemotronHTransformerModel.LoadFromGguf(cpuGguf, config);
         var tokenizer = GgufBpeTokenizerFactory.Load(cpuGguf.Metadata);
 
-        using var cudaGguf = GgufFile.Open(path);
+        using var cudaGguf = CheckpointGuard.LoadOrSkip(path, "GGUF checkpoint (CUDA)", () => GgufFile.Open(path));
         IModel? cudaModel = null;
         try
         {
@@ -378,7 +379,7 @@ public sealed class RealGgufCudaParityTests
 
         _output.WriteLine($"[{label}] gguf: {path}");
 
-        using var cpuGguf = GgufFile.Open(path);
+        using var cpuGguf = CheckpointGuard.LoadOrSkip(path, "GGUF checkpoint (CPU)", () => GgufFile.Open(path));
         var config = GgufModelConfigExtractor.Extract(cpuGguf.Metadata);
         Assert.Equal(expectedArch, config.Architecture);
 
@@ -391,7 +392,7 @@ public sealed class RealGgufCudaParityTests
 
         var tokenizer = GgufBpeTokenizerFactory.Load(cpuGguf.Metadata);
 
-        using var cudaGguf = GgufFile.Open(path);
+        using var cudaGguf = CheckpointGuard.LoadOrSkip(path, "GGUF checkpoint (CUDA)", () => GgufFile.Open(path));
         var cudaLoadWatch = System.Diagnostics.Stopwatch.StartNew();
         CudaTransformerModel? cudaModel = null;
         try

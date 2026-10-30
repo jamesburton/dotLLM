@@ -48,6 +48,13 @@ public sealed unsafe class GdnStateCache : IGdnState
 
     private bool _disposed;
 
+    // Lazy ("fused") copy: while _pendingSource is set, layers with _pending[i] logically hold the SOURCE cache's layer i; the live
+    // buffers of those layers are stale. The next update of such a layer reads the source for its first token instead
+    // (BeginUpdate), so a checkpoint / restore of the 100+ MiB recurrent state costs no separate copy pass (#840).
+    private GdnStateCache? _pendingSource;
+    private bool[]? _pending;
+    private int _pendingCount;
+
     /// <summary>Number of GDN layers covered by this cache.</summary>
     public int NumGdnLayers => _numGdnLayers;
 
@@ -109,6 +116,7 @@ public sealed unsafe class GdnStateCache : IGdnState
         ThrowIfDisposed();
         if ((uint)gdnLayerIndex >= (uint)_numGdnLayers)
             throw new ArgumentOutOfRangeException(nameof(gdnLayerIndex));
+        if (_pendingCount != 0) MaterializeLayer(gdnLayerIndex);
         return new Span<float>(
             (float*)_convState + (long)gdnLayerIndex * _convStateElements,
             _convStateElements);
@@ -124,6 +132,7 @@ public sealed unsafe class GdnStateCache : IGdnState
         ThrowIfDisposed();
         if ((uint)gdnLayerIndex >= (uint)_numGdnLayers)
             throw new ArgumentOutOfRangeException(nameof(gdnLayerIndex));
+        if (_pendingCount != 0) MaterializeLayer(gdnLayerIndex);
         return new Span<float>(
             (float*)_gdnState + (long)gdnLayerIndex * _gdnStateElements,
             _gdnStateElements);
@@ -135,6 +144,7 @@ public sealed unsafe class GdnStateCache : IGdnState
     public void Reset()
     {
         ThrowIfDisposed();
+        ClearPending();
         if (_numGdnLayers == 0) return;
         NativeMemory.Clear((void*)_convState, (nuint)((long)_numGdnLayers * _convStateElements * sizeof(float)));
         NativeMemory.Clear((void*)_gdnState, (nuint)((long)_numGdnLayers * _gdnStateElements * sizeof(float)));
@@ -178,6 +188,21 @@ public sealed unsafe class GdnStateCache : IGdnState
         }
 
         if (_numGdnLayers == 0) return;
+        if (ReferenceEquals(destination, this)) return;
+        destination.ClearPending();   // the destination is fully overwritten below
+
+        if (_pendingCount != 0)
+        {
+            // This cache is lazily pointing at a source: the logical content of a pending layer is the source's layer.
+            for (int i = 0; i < _numGdnLayers; i++)
+            {
+                var src = _pending![i] ? _pendingSource! : this;
+                long cb = (long)_convStateElements * sizeof(float), sb = (long)_gdnStateElements * sizeof(float);
+                Buffer.MemoryCopy((float*)src._convState + (long)i * _convStateElements, (float*)destination._convState + (long)i * _convStateElements, cb, cb);
+                Buffer.MemoryCopy((float*)src._gdnState + (long)i * _gdnStateElements, (float*)destination._gdnState + (long)i * _gdnStateElements, sb, sb);
+            }
+            return;
+        }
 
         long convBytes = (long)_numGdnLayers * _convStateElements * sizeof(float);
         long stateBytes = (long)_numGdnLayers * _gdnStateElements * sizeof(float);
@@ -185,6 +210,146 @@ public sealed unsafe class GdnStateCache : IGdnState
             Buffer.MemoryCopy((void*)_convState, (void*)destination._convState, convBytes, convBytes);
         if (stateBytes > 0)
             Buffer.MemoryCopy((void*)_gdnState, (void*)destination._gdnState, stateBytes, stateBytes);
+    }
+
+    // ── lazy / fused copy (checkpoint-restore without a separate copy pass, #840) ──
+
+    /// <summary>True while at least one layer logically holds another cache's content (see <see cref="DeferCopyFrom"/>).</summary>
+    public bool HasPendingSource => _pendingCount != 0;
+
+    /// <summary>True when this cache's pending layers point at <paramref name="source"/>.</summary>
+    public bool IsPendingOn(GdnStateCache source) => _pendingCount != 0 && ReferenceEquals(_pendingSource, source);
+
+    /// <summary>
+    /// Makes this cache logically equal to <paramref name="source"/> WITHOUT copying: every layer is marked pending on it and the
+    /// live buffers become stale. The next <see cref="BeginUpdate"/> of a layer hands out the source's spans so the update can read
+    /// them for its first step (fusing the copy into work the update does anyway); every other accessor materialises on demand.
+    /// <paramref name="source"/> must stay unmodified and alive while pending layers remain; release it via
+    /// <see cref="MaterializePending"/> first. A source that itself has pending layers is materialised first.
+    /// </summary>
+    public void DeferCopyFrom(GdnStateCache source)
+    {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(source);
+        if (ReferenceEquals(source, this)) return;
+        CheckShape(source);
+        if (source._pendingCount != 0) source.MaterializePending();
+        if (_numGdnLayers == 0) return;
+        _pendingSource = source;
+        _pending ??= new bool[_numGdnLayers];
+        Array.Fill(_pending, true);
+        _pendingCount = _numGdnLayers;
+    }
+
+    /// <summary>
+    /// Prepares layer <paramref name="gdnLayerIndex"/> for an in-place update. When the layer is pending, <paramref name="srcConv"/> /
+    /// <paramref name="srcGdn"/> are the SOURCE's current conv / matrix state (the caller must read its input from them and write the
+    /// result into the live spans from <see cref="GetConvStateForUpdate"/> / <see cref="GetGdnStateForUpdate"/>); the layer is then
+    /// no longer pending. Otherwise both are empty and the update is the usual in-place one.
+    /// </summary>
+    public void BeginUpdate(int gdnLayerIndex, out ReadOnlySpan<float> srcConv, out ReadOnlySpan<float> srcGdn)
+    {
+        ThrowIfDisposed();
+        if ((uint)gdnLayerIndex >= (uint)_numGdnLayers) throw new ArgumentOutOfRangeException(nameof(gdnLayerIndex));
+        if (_pendingCount != 0 && _pending![gdnLayerIndex])
+        {
+            var src = _pendingSource!;
+            srcConv = new ReadOnlySpan<float>((float*)src._convState + (long)gdnLayerIndex * _convStateElements, _convStateElements);
+            srcGdn = new ReadOnlySpan<float>((float*)src._gdnState + (long)gdnLayerIndex * _gdnStateElements, _gdnStateElements);
+            _pending[gdnLayerIndex] = false;
+            if (--_pendingCount == 0) _pendingSource = null;
+        }
+        else { srcConv = default; srcGdn = default; }
+    }
+
+    /// <summary>Live conv state of a layer for a write (after <see cref="BeginUpdate"/>); never materialises.</summary>
+    public Span<float> GetConvStateForUpdate(int gdnLayerIndex)
+        => new((float*)_convState + (long)gdnLayerIndex * _convStateElements, _convStateElements);
+
+    /// <summary>Live matrix state of a layer for a write (after <see cref="BeginUpdate"/>); never materialises.</summary>
+    public Span<float> GetGdnStateForUpdate(int gdnLayerIndex)
+        => new((float*)_gdnState + (long)gdnLayerIndex * _gdnStateElements, _gdnStateElements);
+
+    /// <summary>
+    /// Layer <paramref name="gdnLayerIndex"/> is about to be fully overwritten by the caller: drops its pending mark without copying.
+    /// </summary>
+    public void DiscardPending(int gdnLayerIndex)
+    {
+        if (_pendingCount != 0 && _pending![gdnLayerIndex])
+        {
+            _pending[gdnLayerIndex] = false;
+            if (--_pendingCount == 0) _pendingSource = null;
+        }
+    }
+
+    /// <summary>Layers physically copied by lazy-copy materialisation so far (a lazy copy consumed by <see cref="BeginUpdate"/> or
+    /// resolved by <see cref="TryTakeSourceBuffers"/> costs none).</summary>
+    public long MaterializedLayerCopies { get; private set; }
+
+    /// <summary>
+    /// <paramref name="source"/> is about to be released and this cache still lazily reads ALL of its layers from it: instead of
+    /// copying, exchange buffers (this cache takes the source's, which hold exactly its logical content; the source takes the stale
+    /// ones, whose content its owner no longer needs). Returns false (and does nothing) unless every layer is still pending on
+    /// <paramref name="source"/>.
+    /// </summary>
+    public bool TryTakeSourceBuffers(GdnStateCache source)
+    {
+        if (_pendingCount != _numGdnLayers || _numGdnLayers == 0 || !ReferenceEquals(_pendingSource, source)) return false;
+        (_convState, source._convState) = (source._convState, _convState);
+        (_gdnState, source._gdnState) = (source._gdnState, _gdnState);
+        ClearPending();
+        return true;
+    }
+
+    /// <summary>Performs every outstanding lazy copy (after this the cache no longer depends on its former source).</summary>
+    public void MaterializePending()
+    {
+        if (_pendingCount == 0) return;
+        for (int i = 0; i < _numGdnLayers; i++)
+            if (_pending![i]) MaterializeLayer(i);
+    }
+
+    private void MaterializeLayer(int i)
+    {
+        if (!_pending![i]) return;
+        var src = _pendingSource!;
+        long cb = (long)_convStateElements * sizeof(float), sb = (long)_gdnStateElements * sizeof(float);
+        Buffer.MemoryCopy((float*)src._convState + (long)i * _convStateElements, (float*)_convState + (long)i * _convStateElements, cb, cb);
+        Buffer.MemoryCopy((float*)src._gdnState + (long)i * _gdnStateElements, (float*)_gdnState + (long)i * _gdnStateElements, sb, sb);
+        _pending[i] = false;
+        MaterializedLayerCopies++;
+        if (--_pendingCount == 0) _pendingSource = null;
+    }
+
+    private void ClearPending()
+    {
+        if (_pendingCount == 0) return;
+        Array.Clear(_pending!);
+        _pendingCount = 0;
+        _pendingSource = null;
+    }
+
+    /// <summary>
+    /// Exchanges the underlying buffers with <paramref name="other"/> (O(1)). Both must be fully materialised (no pending layers) and
+    /// of the same shape. Used to capture a checkpoint without copying: the checkpoint takes the live buffers, the live cache takes
+    /// the checkpoint's stale ones and defers its content from the checkpoint via <see cref="DeferCopyFrom"/>.
+    /// </summary>
+    public void SwapBuffersWith(GdnStateCache other)
+    {
+        ThrowIfDisposed(); other.ThrowIfDisposed();
+        CheckShape(other);
+        if (_pendingCount != 0 || other._pendingCount != 0)
+            throw new InvalidOperationException("Materialise pending layers before swapping buffers.");
+        (_convState, other._convState) = (other._convState, _convState);
+        (_gdnState, other._gdnState) = (other._gdnState, _gdnState);
+    }
+
+    private void CheckShape(GdnStateCache other)
+    {
+        if (other._numGdnLayers != _numGdnLayers
+            || other._convStateElements != _convStateElements
+            || other._gdnStateElements != _gdnStateElements)
+            throw new ArgumentException("GdnStateCache shape does not match.", nameof(other));
     }
 
     /// <inheritdoc/>

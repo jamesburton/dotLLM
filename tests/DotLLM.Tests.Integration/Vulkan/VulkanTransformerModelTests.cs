@@ -41,7 +41,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// follow-up once pre-dequantised weights are available.
 /// </para>
 /// </remarks>
-[Collection("SmallModel")]
+[Collection(SmallModelGpuCollection.Name)]
 [Trait("Category", "GPU")]
 public class VulkanTransformerModelTests
 {

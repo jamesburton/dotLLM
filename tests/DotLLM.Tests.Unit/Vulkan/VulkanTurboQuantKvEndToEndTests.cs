@@ -5,6 +5,7 @@ using DotLLM.Models.Gguf;
 using DotLLM.Vulkan;
 using Xunit;
 using Xunit.Abstractions;
+using DotLLM.Tests.Integration.Fixtures;
 
 namespace DotLLM.Tests.Unit.Vulkan;
 
@@ -31,9 +32,7 @@ public sealed unsafe class VulkanTurboQuantKvEndToEndTests
     public void Vulkan_TurboQuantKv_TracksFullPrecision_OnSmolLM()
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
-        string modelPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q8_0.gguf");
+        string modelPath = TestFixtureResolver.ResolveFile([], "QuantFactory", "SmolLM-135M-GGUF", ["SmolLM-135M.Q8_0.gguf"], null).Path ?? string.Empty;
         Skip.If(!File.Exists(modelPath), $"SmolLM-135M Q8_0 GGUF not found at {modelPath}");
 
         using var gguf = GgufFile.Open(modelPath);

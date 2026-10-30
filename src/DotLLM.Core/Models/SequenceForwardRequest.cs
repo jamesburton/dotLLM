@@ -53,4 +53,14 @@ public readonly record struct SequenceForwardRequest
     /// model, unsafe across multi-sequence batched dispatch.
     /// </summary>
     public ISsmState? SsmState { get; init; }
+
+    /// <summary>
+    /// When <see langword="true"/>, the caller reads only this sequence's last position, so the
+    /// model MAY return <c>[1, vocab_size]</c> for it instead of <c>[N, vocab_size]</c> and skip the
+    /// LM head over the other rows (#1267). Same contract as the <c>lastTokenLogitsOnly</c> hint on
+    /// <see cref="IModel.Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, bool)"/>:
+    /// callers must index the last row as <c>Shape[0] - 1</c>. Default <see langword="false"/>
+    /// (every row) — required by callers that inspect each position, e.g. speculative verification.
+    /// </summary>
+    public bool LastTokenLogitsOnly { get; init; }
 }

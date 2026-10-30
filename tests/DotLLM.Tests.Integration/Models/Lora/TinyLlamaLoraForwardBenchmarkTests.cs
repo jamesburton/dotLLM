@@ -6,6 +6,7 @@ using DotLLM.Core.Tensors;
 using DotLLM.HuggingFace;
 using DotLLM.Models;
 using DotLLM.Models.Architectures;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -42,9 +43,7 @@ public sealed class TinyLlamaLoraForwardBenchmarkTests
     private const string ConventionalAdapterPath = "C:/temp/dotllm-tinyllama-lora";
     private const long MaxAdapterBytes = 512L * 1024 * 1024;
 
-    private static readonly string CacheDir = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-        ".dotllm", "test-cache");
+    private static readonly string CacheDir = DotLLM.Tests.Integration.Fixtures.TestModelDownloader.CacheDirectory;
 
     private readonly ITestOutputHelper _output;
 
@@ -68,7 +67,9 @@ public sealed class TinyLlamaLoraForwardBenchmarkTests
         int prefillTokens = ReadPositiveInt(PrefillTokensEnvVar, 64);
         int samples = ReadPositiveInt(SamplesEnvVar, 3);
 
-        var (model, source, config) = ModelLoader.LoadFromSafetensors(checkpointRoot!);
+        var (model, source, config) = CheckpointGuard.LoadOrSkip(
+            checkpointRoot!, "TinyLlama checkpoint",
+            () => ModelLoader.LoadFromSafetensors(checkpointRoot!));
         try
         {
             Skip.If(
@@ -158,7 +159,7 @@ public sealed class TinyLlamaLoraForwardBenchmarkTests
 
     private string? TryDownloadAdapter(string repoId)
     {
-        string cachedDir = Path.Combine(CacheDir, repoId.Replace('/', Path.DirectorySeparatorChar));
+        string cachedDir = DotLLM.Tests.Integration.Fixtures.TestRepoDirectory.Resolve(repoId, "adapter_model.safetensors", "adapter_config.json");
         if (HasPeftAdapterFiles(cachedDir))
             return cachedDir;
 

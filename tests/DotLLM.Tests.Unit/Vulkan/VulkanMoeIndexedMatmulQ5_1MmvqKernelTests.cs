@@ -33,6 +33,7 @@ public sealed class VulkanMoeIndexedMatmulQ5_1MmvqKernelTests
     [InlineData(3, 4, 9, 256, 3)]     // 8 blocks/row = exactly one lane window
     [InlineData(9, 16, 20, 288, 11)]  // 9 blocks/row — window + 1-block tail
     [InlineData(8, 16, 2816, 704, 8)] // real 26B down shape: M=hidden 2816, K=Ie 704
+    [InlineData(10, 512, 48, 640, 10)] // #849 qwen4exp down: 512 experts, top-10, K=Ie 640 (not a multiple of 256), 20 blocks/row
     public void Launch_MatchesSameTierCpuOracle(int n, int numExperts, int m, int k, int activeExperts)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);

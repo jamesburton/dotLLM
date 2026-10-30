@@ -1,0 +1,44 @@
+#version 450
+// Per-row power-of-two downscale of an activation that a cooperative-matrix GEMM will round to F16 (issue #1171, Recursive Flint).
+//
+// Flint's routed SwiGLU output (the down projection's input) reaches ~1e4 and, for some tokens, exceeds the F16 maximum (65504): the
+// grouped coopmat MoE kernels fold B into an F16 operand, so such a row became inf and the whole token NaN. llama.cpp guards the same
+// spot (build_amax_src1_f16) and the CPU path does it too (MoeSwiGluMlp): when max|row| > 1024 the row is divided by
+// e = 2^ceil(log2(max|row| / 1024)) and the projected row is multiplied back by e (row_scale_mul_f32). A power of two is exact, so a
+// row at or below 1024 is untouched and every other row equals the unscaled maths without the overflow.
+//
+// One workgroup per row, in place; scales[row] = e.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer BufX { float x[]; };                 // [rows, n]
+layout(set = 0, binding = 1, std430) writeonly buffer BufScale { float scales[]; }; // [rows]
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint n;
+} pc;
+
+shared float red[256];
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    if (r >= pc.rows) return;   // uniform per workgroup
+    uint t = gl_LocalInvocationID.x;
+    uint base = r * pc.n;
+    float m = 0.0;
+    for (uint i = t; i < pc.n; i += 256u) m = max(m, abs(x[base + i]));
+    red[t] = m;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s) red[t] = max(red[t], red[t + s]);
+        barrier();
+    }
+    float amax = red[0];
+    float e = amax > 1024.0 ? exp2(ceil(log2(amax / 1024.0))) : 1.0;
+    if (e != 1.0) {
+        float inv = 1.0 / e;   // exact: e is a power of two
+        for (uint i = t; i < pc.n; i += 256u) x[base + i] *= inv;
+    }
+    if (t == 0u) scales[r] = e;
+}

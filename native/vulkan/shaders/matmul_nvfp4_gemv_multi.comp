@@ -1,0 +1,118 @@
+#version 450
+#extension GL_GOOGLE_include_directive    : require
+#extension GL_EXT_control_flow_attributes : require
+
+// NVFP4 GEMV for 1..16 FP32 activation columns and NR output rows per workgroup (#1244):
+//   Y[col, m] = scale * sum_k W_nvfp4[m, k] * X[col, k]          (FP32 x and y; X.scale applied once to the F32 sum)
+//
+// The lane layout of matmul_nvfp4_gemv_coalesced.comp (#1066): lane L owns sub-block (L & 3) of block (L >> 2) of a window of 16
+// blocks, i.e. two qs words and one scale byte per block. Each lane decodes its 16 E2M1 codes and its UE4M3 scale ONCE per row and
+// FMAs them against all NC activation columns, so a K+1-row speculative verify pays one dequant per weight instead of one per column
+// (the `cols` GEMV of #1237 re-decoded every block per column).
+//
+// Determinism (the #1220 pattern): a column's arithmetic (lane -> block map, explicit fma chain under `precise`, fixed shared-memory
+// reduction tree) does not depend on NC or NR, so each column of a verify is bit-identical to the NC = 1 dispatch the Nemotron-H
+// decode runs. NC (constant_id 0) and NR (constant_id 1) are specialization constants; X is [NC, K], Y is [NC, M].
+// Dispatch: ceil(M / NR) workgroups of 64 threads.
+
+#define WG_SIZE 64u
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint NC = 2u;
+layout(constant_id = 1) const uint NR = 1u;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint weight[]; };  // NVFP4 blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { vec4 x4[]; };      // [NC, K/4]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };      // [NC, M]
+
+layout(push_constant) uniform PushConstants {
+    uint  M;
+    uint  K;             // multiple of 64
+    uint  blocksPerRow;  // K / 64
+    float scale;         // per-tensor X.scale
+} pc;
+
+#include "nvfp4_decode.glsl"
+
+const uint WINDOW_BLOCKS = WG_SIZE / 4u;
+
+// The four nibbles at bits 0..3 of each byte of `u`, decoded (doubled E2M1), byte 0 first.
+vec4 decode4(uint u) {
+    return vec4(e2m1Doubled(u & 0xFu), e2m1Doubled((u >> 8u) & 0xFu), e2m1Doubled((u >> 16u) & 0xFu), e2m1Doubled((u >> 24u) & 0xFu));
+}
+
+shared float partials[NR * NC][WG_SIZE];
+
+void main() {
+    uint m0 = (gl_WorkGroupID.y * 32768u + gl_WorkGroupID.x) * NR;   // y folds dispatches wider than 32768 groups (GemvColumns)
+    if (m0 >= pc.M) return;
+
+    uint lane = gl_LocalInvocationID.x;
+    uint blockInWindow = lane >> 2u;
+    uint s = lane & 3u;
+
+    // Rows past M (last workgroup) duplicate row M-1 and are not stored.
+    uint rowBase[NR];
+    [[unroll]] for (uint r = 0u; r < NR; ++r) rowBase[r] = min(m0 + r, pc.M - 1u) * pc.blocksPerRow * NVFP4_BLOCK_UINTS;
+    uint xRow4 = pc.K >> 2u;
+
+    precise float acc[NR * NC];
+    [[unroll]] for (uint i = 0u; i < NR * NC; ++i) acc[i] = 0.0;
+    for (uint w0 = 0u; w0 < pc.blocksPerRow; w0 += WINDOW_BLOCKS) {
+        uint blk = w0 + blockInWindow;
+        if (blk >= pc.blocksPerRow)
+            continue;
+
+        // Decode once per row: elements 16s + 0..3 (low nibbles of q0), 4..7 (low of q1), 8..11 (high of q0), 12..15 (high of q1).
+        float d[NR];
+        vec4 w0v[NR], w1v[NR], w2v[NR], w3v[NR];
+        [[unroll]] for (uint r = 0u; r < NR; ++r) {
+            uint base = rowBase[r] + blk * NVFP4_BLOCK_UINTS;
+            d[r] = ue4m3_half((weight[base] >> (8u * s)) & 0xFFu);
+            uint q0 = weight[base + 1u + 2u * s];
+            uint q1 = weight[base + 2u + 2u * s];
+            w0v[r] = decode4(q0);
+            w1v[r] = decode4(q1);
+            w2v[r] = decode4(q0 >> 4u);
+            w3v[r] = decode4(q1 >> 4u);
+        }
+
+        // Explicit fma chains under `precise` (no driver contraction / reordering): a row's bits do not depend on NR / NC.
+        uint xi = blk * 16u + 4u * s;
+        [[unroll]] for (uint cc = 0u; cc < NC; ++cc) {
+            uint xc = cc * xRow4 + xi;
+            vec4 x0 = x4[xc], x1 = x4[xc + 1u], x2 = x4[xc + 2u], x3 = x4[xc + 3u];
+            [[unroll]] for (uint r = 0u; r < NR; ++r) {
+                // Four independent 4-term chains (ILP), then a fixed pairwise combine.
+                precise float p0 = w0v[r].x * x0.x;
+                p0 = fma(w0v[r].y, x0.y, p0); p0 = fma(w0v[r].z, x0.z, p0); p0 = fma(w0v[r].w, x0.w, p0);
+                precise float p1 = w1v[r].x * x1.x;
+                p1 = fma(w1v[r].y, x1.y, p1); p1 = fma(w1v[r].z, x1.z, p1); p1 = fma(w1v[r].w, x1.w, p1);
+                precise float p2 = w2v[r].x * x2.x;
+                p2 = fma(w2v[r].y, x2.y, p2); p2 = fma(w2v[r].z, x2.z, p2); p2 = fma(w2v[r].w, x2.w, p2);
+                precise float p3 = w3v[r].x * x3.x;
+                p3 = fma(w3v[r].y, x3.y, p3); p3 = fma(w3v[r].z, x3.z, p3); p3 = fma(w3v[r].w, x3.w, p3);
+                precise float dq = (p0 + p1) + (p2 + p3);
+                acc[r * NC + cc] = fma(d[r], dq, acc[r * NC + cc]);
+            }
+        }
+    }
+
+    // Fixed shared-memory tree over the 64 lanes, NOT subgroupAdd: a driver may compile each NR / NC pipeline at a different subgroup width,
+    // which changes a subgroup reduction's order and so the bits.
+    [[unroll]] for (uint i = 0u; i < NR * NC; ++i) partials[i][lane] = acc[i];
+    barrier();
+    [[unroll]] for (uint stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
+        if (lane < stride)
+            [[unroll]] for (uint i = 0u; i < NR * NC; ++i) partials[i][lane] = partials[i][lane] + partials[i][lane + stride];
+        barrier();
+    }
+    if (lane < NR * NC) {
+        uint r = lane / NC, cc = lane - r * NC;
+        if (m0 + r < pc.M) {
+            precise float v = partials[lane][0] * pc.scale;
+            y[cc * pc.M + m0 + r] = v;
+        }
+    }
+}

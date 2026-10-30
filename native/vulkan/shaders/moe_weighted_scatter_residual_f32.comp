@@ -1,0 +1,33 @@
+#version 450
+// Routed-expert combine fused with the shared-expert add and the FFN residual add (issue #1161, MoE decode):
+//
+//   out[t, h] = residual[t, h] + (sum_slot w[t, slot] * x[t * topK + slot, h] + shared[t, h])
+//
+// Same F32 operations in the same order as moe_weighted_scatter_f32 -> add(shared) -> add(residual), so the result is bit-identical to
+// the three-dispatch sequence it replaces.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufX        { float x[]; };        // [seqLen * topK, hidden] routed down rows
+layout(set = 0, binding = 1, std430) readonly  buffer BufW        { float weights[]; };  // [seqLen * topK] routing weights
+layout(set = 0, binding = 2, std430) readonly  buffer BufResidual { float residual[]; }; // [seqLen, hidden]
+layout(set = 0, binding = 3, std430) readonly  buffer BufShared   { float shared_[]; };  // [seqLen, hidden] shared-expert output
+layout(set = 0, binding = 4, std430) writeonly buffer BufOut      { float outBuf[]; };   // [seqLen, hidden]
+
+layout(push_constant) uniform PushConstants {
+    uint count;    // seqLen * hidden
+    uint hidden;
+    uint topK;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    uint t = i / pc.hidden;
+    uint h = i - t * pc.hidden;
+    uint rowBase = t * pc.topK;
+    float acc = 0.0;
+    for (uint slot = 0u; slot < pc.topK; slot++)
+        acc += weights[rowBase + slot] * x[(rowBase + slot) * pc.hidden + h];
+    outBuf[i] = residual[i] + (acc + shared_[i]);
+}

@@ -48,6 +48,8 @@ public sealed class ResidentModelSnapshot : IDisposable
     public IModel? DraftModel { get; init; }
     public string DraftModelPath { get; init; } = "";
     public GgufFile? DraftGguf { get; init; }
+    public bool MtpActive { get; init; }
+    public string? MtpStatus { get; init; }
 
     /// <summary>Approximate resident footprint (GGUF file size) used for eviction budget accounting.</summary>
     public long EstimatedBytes { get; init; }
@@ -62,6 +64,7 @@ public sealed class ResidentModelSnapshot : IDisposable
     /// <summary>Disposes every owned live object.</summary>
     public void Dispose()
     {
+        Generator?.ClearRecurrentPrefixCache();
         PrefixCache?.Dispose();
         PrefixTrieManager?.Dispose();
         PagedFactory?.Dispose();
@@ -87,6 +90,9 @@ public sealed record ResidentModelInfo
 
     /// <summary>Seconds until auto-unload, or null when the keep-alive is negative (never expires).</summary>
     public double? ExpiresInSeconds { get; init; }
+
+    /// <summary>llama.cpp-shaped model metadata for <c>/v1/models</c> (#1289); null when unavailable.</summary>
+    public Models.ModelMetaDto? Meta { get; init; }
 }
 
 /// <summary>
@@ -168,6 +174,32 @@ public sealed class ModelResidencyManager : IDisposable
     }
 
     /// <summary>
+    /// Evicts (disposes) the least-recently-used stashed model regardless of budget - used to make room on a device before a load
+    /// (#1023). Returns it (already disposed), or null when nothing is stashed.
+    /// </summary>
+    /// <returns>The evicted snapshot, or null.</returns>
+    /// <param name="where">Only stashed models matching this are candidates (e.g. those on the target device); all when null.</param>
+    public ResidentModelSnapshot? EvictLeastRecentlyUsed(Func<ResidentModelSnapshot, bool>? where = null)
+    {
+        ResidentModelSnapshot? oldest;
+        lock (_lock)
+        {
+            oldest = _resident.Values.Where(s => where is null || where(s)).OrderBy(s => s.LastUsedUtc).FirstOrDefault();
+            if (oldest is not null) _resident.Remove(oldest.Key);
+        }
+        oldest?.Dispose();
+        return oldest;
+    }
+
+    /// <summary>Total <see cref="ResidentModelSnapshot.EstimatedBytes"/> of the stashed models matching <paramref name="where"/>.</summary>
+    /// <param name="where">The filter.</param>
+    /// <returns>The byte total.</returns>
+    public long StashedBytes(Func<ResidentModelSnapshot, bool> where)
+    {
+        lock (_lock) { return _resident.Values.Where(where).Sum(s => s.EstimatedBytes); }
+    }
+
+    /// <summary>
     /// Removes and disposes stashed models whose keep-alive has elapsed. Does not touch the active
     /// model — callers check that separately against <see cref="ServerState.LastUsedUtc"/> since it
     /// requires the request gate.
@@ -210,6 +242,7 @@ public sealed class ModelResidencyManager : IDisposable
                     EffectiveKeepAliveSeconds = keepAlive,
                     EstimatedBytes = s.EstimatedBytes,
                     ExpiresInSeconds = expiresIn,
+                    Meta = ModelMeta.Build(s.Config, s.CurrentGguf),
                 };
             }).ToList();
         }

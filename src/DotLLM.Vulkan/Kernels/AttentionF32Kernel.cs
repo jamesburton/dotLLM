@@ -116,9 +116,10 @@ public sealed class AttentionF32Kernel : IDisposable
         VulkanModule sharedModule, ComputePipeline sharedPipeline,
         VulkanModule? subgroupModule, ComputePipeline? subgroupPipeline,
         VulkanModule? coopmatModule, ComputePipeline? coopmatPipeline,
-        nint pool, DispatchMode mode)
+        nint pool, DispatchMode mode, VulkanKvStorage kvStorage)
     {
         _device = device;
+        KvStorage = kvStorage;
         _sharedModule = sharedModule;
         _sharedPipeline = sharedPipeline;
         _subgroupModule = subgroupModule;
@@ -148,9 +149,27 @@ public sealed class AttentionF32Kernel : IDisposable
     /// Both optional SPVs silently degrade when missing from disk — older
     /// builds keep working without the newer shaders.
     /// </remarks>
+    /// <param name="device">The device.</param>
+    /// <param name="spvDir">Directory holding the SPIR-V blobs.</param>
+    /// <returns>An instance reading F32 K / V.</returns>
     public static AttentionF32Kernel Create(VulkanDevice device, string spvDir)
+        => Create(device, spvDir, VulkanKvStorage.F32);
+
+    /// <summary>Element format of the K / V buffers this instance reads (issue #1102); fixed at creation.</summary>
+    public VulkanKvStorage KvStorage { get; }
+
+    /// <summary>
+    /// <see cref="Create(VulkanDevice, string)"/> for K / V stored as <paramref name="kvStorage"/> (issue #1102). F16 loads the
+    /// <c>_kvf16</c> twins of the shared-memory and subgroup shaders, which read the packed halves in place; there is no F16
+    /// cooperative-matrix twin, so an F16 instance never takes that mode.
+    /// </summary>
+    /// <param name="device">The device.</param>
+    /// <param name="spvDir">Directory holding the SPIR-V blobs.</param>
+    /// <param name="kvStorage">Element format of the K / V buffers.</param>
+    /// <returns>The kernel.</returns>
+    public static AttentionF32Kernel Create(VulkanDevice device, string spvDir, VulkanKvStorage kvStorage)
     {
-        string sharedPath = Path.Combine(spvDir, "attention_f32.spv");
+        string sharedPath = Path.Combine(spvDir, kvStorage.ShaderName("attention_f32") + ".spv");
         if (!File.Exists(sharedPath))
             throw new FileNotFoundException(
                 $"Vulkan SPIR-V not found: {sharedPath}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");
@@ -173,7 +192,7 @@ public sealed class AttentionF32Kernel : IDisposable
         bool subgroupAvailable = device.HasSubgroupArithmetic && !RmsNormF32Kernel.IsForceSharedReduce();
         if (subgroupAvailable)
         {
-            string subgroupPath = Path.Combine(spvDir, "attention_f32_sg.spv");
+            string subgroupPath = Path.Combine(spvDir, kvStorage.ShaderName("attention_f32_sg") + ".spv");
             if (File.Exists(subgroupPath))
             {
                 try
@@ -203,7 +222,8 @@ public sealed class AttentionF32Kernel : IDisposable
         // DOTLLM_VULKAN_USE_COOPMAT_ATTENTION=1 on hardware where it wins
         // (NVIDIA tensor cores, AMD discrete). DOTLLM_VULKAN_FORCE_SHARED_REDUCE
         // remains the deepest fallback that disables both subgroup and coopmat.
-        bool coopmatAvailable = device.HasCooperativeMatrix
+        bool coopmatAvailable = kvStorage == VulkanKvStorage.F32
+            && device.HasCooperativeMatrix
             && IsUseCoopmat()
             && !RmsNormF32Kernel.IsForceSharedReduce();
         if (coopmatAvailable)
@@ -241,7 +261,7 @@ public sealed class AttentionF32Kernel : IDisposable
             device, sharedModule, sharedPipeline,
             subgroupModule, subgroupPipeline,
             coopmatModule, coopmatPipeline,
-            pool, mode);
+            pool, mode, kvStorage);
     }
 
     internal static bool IsUseCoopmat() =>
@@ -337,7 +357,7 @@ public sealed class AttentionF32Kernel : IDisposable
         if (prefixLen < 0) throw new ArgumentOutOfRangeException(nameof(prefixLen));
 
         long qBytes   = (long)seqQ  * numHeads   * headDim * sizeof(float);
-        long kvBytes  = (long)seqKv * numKvHeads * headDim * sizeof(float);
+        long kvBytes  = (long)seqKv * numKvHeads * headDim * KvStorage.ElementBytes();
         long outBytes = qBytes;
         if (q.Size      < qBytes)   throw new ArgumentException("Q buffer too small.",      nameof(q));
         if (k.Size      < kvBytes)  throw new ArgumentException("K buffer too small.",      nameof(k));

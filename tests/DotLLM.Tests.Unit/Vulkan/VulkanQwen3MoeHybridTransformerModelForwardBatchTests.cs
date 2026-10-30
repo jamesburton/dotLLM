@@ -5,6 +5,7 @@ using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Vulkan;
 using Xunit;
+using DotLLM.Tests.Integration.Fixtures;
 
 namespace DotLLM.Tests.Unit.Vulkan;
 
@@ -259,9 +260,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModelForwardBatchTests
         string? env = Environment.GetEnvironmentVariable("DOTLLM_QWEN36_A3B_Q6_K_XL_GGUF");
         if (!string.IsNullOrWhiteSpace(env) && File.Exists(env)) return env;
 
-        string conventional = "C:/Users/james/.dotllm/test-cache/unsloth/Qwen3.6-A3B-GGUF/Qwen3.6-A3B-UD-Q6_K_XL.gguf";
-        if (File.Exists(conventional)) return conventional;
-        return null;
+        return TestFixtureResolver.ResolveFile([], "unsloth", "Qwen3.6-A3B-GGUF", ["Qwen3.6-A3B-UD-Q6_K_XL.gguf"], null).Path;
     }
 
     private static unsafe (int idx, float val) ArgmaxOf(ITensor logits)

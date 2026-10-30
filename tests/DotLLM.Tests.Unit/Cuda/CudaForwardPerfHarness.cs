@@ -3,6 +3,7 @@ using System.Globalization;
 using DotLLM.Core.Tensors;
 using DotLLM.Cuda;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -14,6 +15,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// prefill, warm-up decode, and steady-state decode timings.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaForwardPerfHarness
 {
     private readonly ITestOutputHelper _output;
@@ -143,36 +145,10 @@ public sealed class CudaForwardPerfHarness
                 return Path.GetFullPath(envPath);
         }
 
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string[] relativeCandidates =
-        [
-            Path.Combine("bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF",
-                "Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf"),
-            Path.Combine("bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF",
-                "Meta-Llama-3.1-8B-Instruct-IQ4_NL.gguf"),
-            Path.Combine("bartowski", "Qwen2.5-7B-Instruct-GGUF",
-                "Qwen2.5-7B-Instruct-IQ4_XS.gguf"),
-            Path.Combine("bartowski", "Qwen2.5-7B-Instruct-GGUF",
-                "Qwen2.5-7B-Instruct-IQ4_NL.gguf"),
-        ];
-
-        string[] roots =
-        [
-            Path.Combine(home, ".dotllm", "models"),
-            Path.Combine(home, ".dotllm", "test-cache"),
-        ];
-
-        foreach (string root in roots)
-        {
-            foreach (string relative in relativeCandidates)
-            {
-                string candidate = Path.Combine(root, relative);
-                if (File.Exists(candidate))
-                    return Path.GetFullPath(candidate);
-            }
-        }
-
-        return null;
+        return TestFixtureResolver.ResolveFile([], "bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF", ["Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf"], null).Path
+            ?? TestFixtureResolver.ResolveFile([], "bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF", ["Meta-Llama-3.1-8B-Instruct-IQ4_NL.gguf"], null).Path
+            ?? TestFixtureResolver.ResolveFile([], "bartowski", "Qwen2.5-7B-Instruct-GGUF", ["Qwen2.5-7B-Instruct-IQ4_XS.gguf"], null).Path
+            ?? TestFixtureResolver.ResolveFile([], "bartowski", "Qwen2.5-7B-Instruct-GGUF", ["Qwen2.5-7B-Instruct-IQ4_NL.gguf"], null).Path;
     }
 
     private static string ResolvePtxDir()
