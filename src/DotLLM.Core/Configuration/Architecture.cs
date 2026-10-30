@@ -511,5 +511,12 @@ public enum Architecture
     /// sides, llama.cpp <c>LLAMA_SWA_TYPE_SYMMETRIC</c>), no LM head, and two bias-free linear heads
     /// (<c>dense_2</c> 768 to 3072, <c>dense_3</c> 3072 to 768) applied after pooling. CPU only (issue #1399).
     /// </summary>
-    GemmaEmbedding
+    GemmaEmbedding,
+
+    /// <summary>
+    /// nomic-embed-text-v2-moe (llama.cpp <c>nomic-bert-moe</c>): the <see cref="NomicBert"/> encoder (post-LN, fused QKV, RoPE NeoX)
+    /// with a plain biased GELU FFN on even layers and a sparse top-2-of-8 GELU MoE FFN (softmax router, no renormalisation,
+    /// no gate projection) on odd layers (<c>moe_every_n_layers = 2</c>); XLM-R SentencePiece Unigram vocabulary. CPU only (issue #1400).
+    /// </summary>
+    NomicBertMoe
 }

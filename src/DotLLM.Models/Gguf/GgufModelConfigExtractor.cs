@@ -21,7 +21,7 @@ public static partial class GgufModelConfigExtractor
         Architecture architecture = ParseArchitecture(archString);
         string arch = archString.ToLowerInvariant();
 
-        if (architecture is Architecture.Bert or Architecture.NomicBert)
+        if (architecture is Architecture.Bert or Architecture.NomicBert or Architecture.NomicBertMoe)
             return BuildBertConfig(metadata, arch, architecture);
 
         // Gemma 4 / DiffusionGemma have a fundamentally different per-layer shape
@@ -1141,6 +1141,7 @@ public static partial class GgufModelConfigExtractor
             // BERT-class embedding encoders (#739).
             "bert" => Architecture.Bert,
             "nomic-bert" => Architecture.NomicBert,
+            "nomic-bert-moe" => Architecture.NomicBertMoe,
             // Gemma 4 MTP drafter (issue #959): standalone 4-layer mini-transformer
             // that cross-attends into the trunk's KV-cache.
             "gemma4-assistant" or "gemma4_assistant" => Architecture.Gemma4Assistant,

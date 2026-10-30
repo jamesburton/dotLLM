@@ -62,6 +62,7 @@ internal static class Program
         }
 
         string path = pos[0];
+        BertEncoderModel.UseErfGelu = opt.GetValueOrDefault("erf-gelu", "0") == "1";   // exact-erf GELU (HF) instead of llama.cpp tanh
         BertEncoderModel.UseLegacyGelu = opt.GetValueOrDefault("legacy-gelu", "0") == "1";   // #1403 A/B arm
         BertEncoderModel.UseLegacyAttention = opt.GetValueOrDefault("legacy-attn", "0") == "1";   // #1402 A/B arm
         var (model, gguf, config) = ModelLoader.LoadFromGguf(path, new ThreadingConfig(threads, threads));

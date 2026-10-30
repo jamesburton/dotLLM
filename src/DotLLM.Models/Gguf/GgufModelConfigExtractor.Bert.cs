@@ -24,7 +24,8 @@ public static partial class GgufModelConfigExtractor
         int headDim = hidden / heads;
         float eps = metadata.GetFloat32OrDefault($"{arch}.attention.layer_norm_epsilon", 1e-12f);
 
-        bool nomic = architecture == Architecture.NomicBert;
+        bool nomic = architecture is Architecture.NomicBert or Architecture.NomicBertMoe;
+        bool swiglu = architecture == Architecture.NomicBert;
         RoPEConfig? rope = null;
         if (nomic)
         {
@@ -47,10 +48,22 @@ public static partial class GgufModelConfigExtractor
             MaxSequenceLength = (int)metadata.GetUInt32OrDefault($"{arch}.context_length", 512),
             NormEpsilon = eps,
             NormType = NormType.LayerNorm,
-            ActivationFunction = nomic ? ActivationFunction.SiLU : ActivationFunction.GELU,
+            ActivationFunction = swiglu ? ActivationFunction.SiLU : ActivationFunction.GELU,
             PositionEncodingType = nomic ? PositionEncodingType.RoPE : PositionEncodingType.Absolute,
             RoPEConfig = rope,
             PoolingType = ExtractPoolingType(metadata, arch),
+            Moe = architecture == Architecture.NomicBertMoe
+                ? new MoeConfig
+                {
+                    NumExperts = (int)metadata.GetUInt32($"{arch}.expert_count"),
+                    NumExpertsPerTok = (int)metadata.GetUInt32($"{arch}.expert_used_count"),
+                    MoeIntermediateSize = ff,
+                    // llama.cpp build_moe_ffn(norm_w = false): softmax over all experts, top-k weights used as is.
+                    NormTopKProb = false,
+                    // moe_every_n_layers: layers with il % n == 1 are sparse.
+                    DecoderSparseStep = (int)metadata.GetUInt32($"{arch}.moe_every_n_layers"),
+                }
+                : null,
         };
     }
 }
