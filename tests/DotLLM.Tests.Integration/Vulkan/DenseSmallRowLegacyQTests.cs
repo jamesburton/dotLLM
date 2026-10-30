@@ -78,6 +78,8 @@ public class DenseSmallRowLegacyQTests
 
     private static void Check(FixtureLocation fx, int rows)
     {
+        Skip.If(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN"), "1", StringComparison.Ordinal), "DOTLLM_SKIP_VULKAN=1");
+        Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader or physical device available on this host.");
         Skip.If(!fx.Found, fx.SkipMessage("GGUF"));
         var on = Run(fx.Path!, 40, rows, true);
         var off = Run(fx.Path!, 40, rows, false);
