@@ -40,7 +40,7 @@
        End users need the Vulkan SDK (glslc) only to rebuild shaders from source;
        the .spv blobs checked into native/vulkan/spv/ are loaded verbatim at runtime. -->
   <ItemGroup>
-    <Content Include="..\..\native\vulkan\spv\*.spv" Link="spv%(Filename)%(Extension)" Condition="Exists('..\..\native\vulkan\spv\')">
+    <Content Include="..\..\native\vulkan\spv\*.spv" Link="spv\%(Filename)%(Extension)" Condition="Exists('..\..\native\vulkan\spv\')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>

@@ -20,7 +20,7 @@ Quote ranges, not points: the box is shared, so treat differences under ~15 % as
 | bge-base-en-v1.5 / e5-base-v2 / gte-base | bert | 110M | 768 | cls / mean | 512 | yes | F16 (+Q8_0 bge) |
 | nomic-embed-text-v1.5 | nomic-bert (RoPE, SwiGLU) | 137M | 768 | mean | 2048 | yes | F16, Q8_0, Q4_K_M |
 | mxbai-embed-large-v1 | bert | 335M | 1024 | cls | 512 | yes | F16, Q8_0 |
-| Qwen3-Embedding-0.6B | qwen3 (decoder) | 600M | 1024 | last | 32768 | yes, **needs EOS appended** (below) | F16 |
+| Qwen3-Embedding-0.6B | qwen3 (decoder) | 600M | 1024 | last | 32768 | yes (EOS appended automatically since #1398) | F16 |
 | multilingual-e5-small (XLM-R) | bert | 118M | 384 | mean | 512 | **no**: `BERT GGUF vocabulary is missing [CLS]/[SEP]/[UNK]` | - |
 | EmbeddingGemma-300M | gemma-embedding | 300M | 768 | mean | 2048 | **no**: `Unsupported GGUF architecture: 'gemma-embedding'` | - |
 | nomic-embed-text-v2-moe | nomic-bert-moe | 475M | 768 | mean | 512 | **no**: `Unsupported GGUF architecture: 'nomic-bert-moe'` | - |
@@ -52,13 +52,14 @@ Prefixes are applied to both sides (`query: ` for e5, `search_document: ` for no
 | mxbai-large F16 | 0.999983 / 0.999991 | 0.999999 / 1.000000 | 1.00 |
 | nomic-v1.5 F16 | n/a (ST `trust_remote_code` is broken on current transformers) | 0.999999 / 1.000000 | - |
 | Qwen3-Embedding-0.6B F16, **EOS appended** | 1.000000 / 1.000000 | 0.999999 / 1.000000 | 1.00 |
-| Qwen3-Embedding-0.6B F16, as `embed` / `/v1/embeddings` run it | 0.466 / 0.804 | 0.466 / 0.804 | 0.44 |
+| Qwen3-Embedding-0.6B F16, before #1398 (no EOS) | 0.466 / 0.804 | 0.466 / 0.804 | 0.44 |
+| Qwen3-Embedding-0.6B F16, `embed` / `/v1/embeddings` after #1398 | 1.000000 (4-text fixture, ST fp32, >= 0.9999 gated) | - | - |
 | MiniLM Q8_0 / bge-small Q8_0 / bge-base Q8_0 / mxbai Q8_0 | 0.99928 / 0.99962 ; 0.99961 / 0.99984 ; 0.99966 / 0.99980 ; 0.99864 / 0.99977 | bge-base 0.99990, mxbai 0.99955 | 0.95-1.00 |
 | nomic Q8_0 / Q4_K_M | - | 0.99959 / 0.99988 ; 0.99317 / 0.99736 | 0.94 / 0.83 (vs F16 oracle) |
 
 Reading: every F16 BERT-class model passes the 0.9999 gate against **both** references, including nomic-bert (RoPE+SwiGLU).
 Q8_0 costs 1e-4 to 1.4e-3 of cosine (worst case is the one-character text); Q4_K_M nomic is visibly degraded (0.93 mean vs
-its own F16) and is not recommended for RAG. **Bug:** Qwen3-Embedding is wrong by default (see 6, lever 7).
+its own F16) and is not recommended for RAG. Qwen3-Embedding was wrong by default until #1398: the declared-last-pooling decoder embedder now gets the tokenizer EOS appended (llama.cpp b9016 does the same regardless of the `--pooling` override: prompt_tokens 3 for a 2-token text with last or mean; it does not for SmolLM2, which declares no pooling). Override: `--add-eos true|false` on `dotllm embed`, `add_eos` in `/v1/embeddings`. Guard: `Qwen3EmbeddingEosParityTests` against `Fixtures/Embeddings/st-qwen3-embedding-0.6b.json`.
 A retrieval-recall set (BEIR slice) is still missing; the cosine+NN-1 gate is what guards speed work for now.
 
 ## 3. Throughput and latency on CPU (32 threads)
@@ -107,8 +108,8 @@ sentence-transformers at bs=1 is already 3-15x faster, the gap is **kernel effic
 bs=32 is *slower* than bs=1 here: padding waste).
 
 Other numbers: tokenisation is not a lever (WordPiece 17-18k docs/s = 2.2M tokens/s; Qwen BPE 5.8k docs/s = 0.67M tokens/s,
-versus 60-250 ms to embed a document). Server-side `/v1/embeddings` was not load-tested: the code path serialises all
-requests on `ExecuteOnModelAsync` and loops sequences, so concurrent clients add latency, never throughput.
+versus 60-250 ms to embed a document). Server-side `/v1/embeddings` before #1405 serialised all
+requests on `ExecuteOnModelAsync` and looped sequences, so concurrent clients added latency, never throughput (see the #1405 section in 4 for the fix).
 
 ### Padding waste (what a padded batched path would face)
 
@@ -150,7 +151,54 @@ gate GEMM for nomic):
   row-inner, convert + dot per pair) - convert-once-per-tile would remove an n-fold redundant conversion.
   Most public embedding GGUFs are F16, so this is what users hit by default. (It is a bounded per-row scratch, not a stored widened copy, so it
   is a perf defect rather than a precision-rule violation.)
+* **Fixed (#1404).** Two causes: (a) per-token row conversion, (b) `ComputeTileM` gave 256-row tiles so bge-small (m=384) had
+  2 tiles for 32 threads. Now `MatMul.GemmF16RowsFma` (`MatMul.F16Tile.cs`) converts 4 weight rows once into a 4-row per-thread
+  scratch and runs a 4-row x 2-token FMA register tile; the pooled path shrinks tiles (multiple of 4 rows, floor 8) so every worker
+  gets one. Weights stay F16 in place. Per-output arithmetic is tiling-independent (ST and pooled are bit-identical, tested).
+  `DOTLLM_F16_NO_FMA=1` selects the legacy loop for same-session A/B. bge-base F16, 32 threads, `profile`, two paired runs each
+  (ms/doc, GEMM stages Qkv+Out+FfnUp+FfnDown): seq 64 **228 / 123 legacy -> 25-29 new** (total 144-268 -> 69-74, now below the Q8_0
+  figures above); seq 256 **390 / 508 -> 66-67** (total 636-846 -> 297-341). Throughput B=8 seq 64: 6.1-7.1 -> 17.6 docs/s
+  (one noisy rep 11). Attention (single-threaded) and GELU now dominate (#1402/#1403). Parity vs legacy on 50 texts: min cosine
+  0.9999999; unit test vs double-precision reference on m%4, k%8, odd-n shapes.
 * Amdahl view at 32 threads, bge-base Q8 at 64 tokens: ~44 % of the document is the two serial stages (Attention + GELU).
+
+### Inter-sequence parallelism and server batching (#1405)
+
+`IEmbeddingModel.ForwardHiddenBatch(sequences, consume, device)` (default = sequential loop). `BertEncoderModel` overrides it:
+sequences are sorted longest-first, then run **one sequence per core, single-threaded** when the batch is at least as large as the pool,
+or an even thread split in between (`G = min(B, T / (T/B))` concurrent sequences, each with its own `T/B`-thread sub-pool; B=1 uses the
+whole pool as before). Results are **bit-identical** to one-at-a-time (`BertEmbeddingBatchParityTests`: batch sizes 1,2,3,5,13,40,
+Q8_0 / F16 / nomic; every GEMM output is independent of partitioning). The server (`EmbeddingBatcher`, shared by `/v1/embeddings` and
+`/api/embed`) queues requests, waits `DOTLLM_EMBED_BATCH_WINDOW_MS` (default 2 ms, only while fewer than `ProcessorCount` sequences are
+pending), takes the request gate once per batch and fans results back per request in input order. A failing batch is replayed per request so one
+bad request cannot fail its neighbours. `DOTLLM_EMBED_PAR_MIN` (default 2) is the smallest batch that uses the parallel path.
+
+Measured, bge-base Q8_0, 32 threads (16C/32T), `cpu-bench` held, docs/s (min-max):
+
+| Batch (in-process `EmbeddingBench batch`) | 1 | 2 | 4 | 8 | 16 | 32 | 128 |
+|---|---|---|---|---|---|---|---|
+| seq 64, sequential (before, flat) | 14-15 | | | 11-15 | | 15 | 15 |
+| seq 64, batched | 14-15 | 24-27 | 33-35 | 45-47 | 49-54 | 35-51 | 52-53 |
+| seq 256, sequential (before) | 2.8 | | | 2.8 | | | 2.8 |
+| seq 256, batched | 2.7-2.9 | 2.6-2.9 | 2.9-3.3 | 3.6 (one 6.1) | | 11.3-12.0 | 11.5-11.7 |
+
+(The seq-256 batched rows used the first build, with only the one-thread-per-sequence path for B >= 4 and no sub-pool split; seq-64 rows
+used the final build.) Saturation is **3.5x at seq 64 and 4.1x at seq 256**, not the 4-8x estimated: one thread embeds a 64-token document in
+~266 ms (3.75 docs/s); 8 threads give 26 docs/s, 16 threads 43.6, 24 threads 48.9, 32 threads 52.6, so the ceiling is the 16 physical cores
+(~3.3 docs/s each, SMT adds ~20 %). Further gains must come from per-thread efficiency (#1402/#1403/#1404 shrink each sequence's time and
+compose with this).
+
+HTTP, `EmbeddingBench http` (token-id inputs, one document per request, N concurrent clients, seq 64, two paired server runs each):
+
+| Clients | before docs/s (p50 ms) | after docs/s (p50 ms) |
+|---|---|---|
+| 1 | 9.0-10.3 (102-124) | 9.0-10.6 (96-111) |
+| 8 | 9.7-11.4 (767-824) | 31.6-36.1 (220-251) |
+| 32 | 10.8-11.5 (2.8-3.0 s) | 39.8-40.9 (774-836) |
+
+A single client is unchanged within noise (the 2 ms window is invisible against a 100 ms document); concurrency now scales 3.3x at 8 clients
+and 3.7x at 32. Decoder embedders (`TransformerModel`, Qwen3-Embedding) use the default sequential implementation, so they gain request
+coalescing but no parallelism.
 
 ## 5. Vulkan / CUDA
 
@@ -179,7 +227,7 @@ the same harness, the cosine gate, and a discriminating shape.
 6. (#1406) **Vulkan hidden-state path for decoder embedders** (Qwen3-Embedding-0.6B: 9-30x over CPU, ~26 docs/s at 64 tok today's kernels),
    then the **GPU BERT encoder (#741)** reusing the coopmat prefill tiles (110M-class encoders are ~5x fewer FLOPs than the 0.6B
    decoder, so expect well above 5k tok/s; unmeasured).
-7. **Correctness/coverage** (#1398 EOS, #1399 gemma-embedding, #1400 nomic-bert-moe, #1401 XLM-R tokenizer): Qwen3-Embedding needs `<|endoftext|>` appended before last-token pooling (llama.cpp does it; dotLLM
+7. **Correctness/coverage** (#1398 EOS: FIXED; #1399 gemma-embedding, #1400 nomic-bert-moe, #1401 XLM-R tokenizer): Qwen3-Embedding needs `<|endoftext|>` appended before last-token pooling (llama.cpp does it; dotLLM
    mean cosine 0.80); add `gemma-embedding`, `nomic-bert-moe`, and XLM-R (SentencePiece) tokenisation for multilingual-e5/bge-m3.
 8. Small/free: (#1407) p99 spikes on cold single-document F16 calls (876 ms at 16 tokens), content-hash doc cache at the server,
    int8/binary output formats, Matryoshka truncation is already supported (`--dimensions`), NPU background embedder (#1321, no measurement yet).

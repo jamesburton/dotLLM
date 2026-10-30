@@ -45,6 +45,7 @@ internal static class Program
         int threads = int.Parse(opt.GetValueOrDefault("threads", "0"));
         double cellSec = double.Parse(opt.GetValueOrDefault("cell-seconds", "20"), CultureInfo.InvariantCulture);
 
+        if (mode == "http") return Http(pos[0], pos[1], Ints("clients", "1,8,32"), Ints("seqs", "64"), Ints("per-request", "1"), cellSec);
         if (mode == "llama") return Llama(pos[0], pos[1], Ints("batches", "1,8,32,128"), Ints("seqs", "64,256,512"), cellSec);
 
         string path = pos[0];
@@ -59,6 +60,7 @@ internal static class Program
             switch (mode)
             {
                 case "throughput": Throughput(label, emb, tok, config, pooling, Ints("batches", "1,8,32,128"), Ints("seqs", "64,256,512"), cellSec, threads); break;
+                case "batch": BatchThroughput(label, emb, tok, config, Ints("batches", "1,8,32,128"), Ints("seqs", "64,256"), cellSec, threads); break;
                 case "latency": Latency(label, emb, tok, config, pooling, Ints("seqs", "16,64,256"), int.Parse(opt.GetValueOrDefault("iters", "200")), threads); break;
                 case "profile": Profile(label, emb, tok, config, pooling, Ints("seqs", "64,256,512"), int.Parse(opt.GetValueOrDefault("iters", "10"))); break;
                 case "tokenizer": TokenizerBench(label, tok, int.Parse(opt.GetValueOrDefault("iters", "3"))); break;
@@ -182,6 +184,75 @@ internal static class Program
                     docs_s_min = reps[0], docs_s_med = reps[reps.Count / 2], docs_s_max = reps[^1], tok_s_med = reps[reps.Count / 2] * actualSeq, reps = reps.Count });
             }
         }
+    }
+
+    /// <summary>Docs/s through <see cref="IEmbeddingModel.ForwardHiddenBatch"/> (#1405): B documents handed over as one batch.</summary>
+    private static void BatchThroughput(string label, IEmbeddingModel emb, ITokenizer rawTok, ModelConfig cfg,
+        int[] batches, int[] seqs, double cellSec, int threads)
+    {
+        var tk = new Tk(rawTok);
+        foreach (int seq in seqs)
+        {
+            if (seq > cfg.MaxSequenceLength) continue;
+            emb.ForwardHiddenBatch(MakeDocs(tk, 8, seq), (_, _) => { }, 0);
+            foreach (int b in batches)
+            {
+                var docs = MakeDocs(tk, b, seq, 11 + b);
+                var reps = new List<double>(); var sw = Stopwatch.StartNew();
+                for (int rep = 0; rep < 5; rep++)
+                {
+                    var t0 = Stopwatch.GetTimestamp();
+                    emb.ForwardHiddenBatch(docs, (_, _) => { }, 0);
+                    reps.Add(b / Stopwatch.GetElapsedTime(t0).TotalSeconds);
+                    if (sw.Elapsed.TotalSeconds > cellSec && reps.Count >= 3) break;
+                }
+                reps.Sort();
+                Emit(new { mode = "batch", model = label, threads = threads == 0 ? Environment.ProcessorCount : threads, batch = b, seq = docs[0].Length,
+                    docs_s_min = reps[0], docs_s_med = reps[reps.Count / 2], docs_s_max = reps[^1], tok_s_med = reps[reps.Count / 2] * docs[0].Length, reps = reps.Count });
+            }
+        }
+    }
+
+    /// <summary>Concurrent HTTP clients against a running dotLLM server's /v1/embeddings, token-id inputs (#1405).</summary>
+    private static int Http(string url, string gguf, int[] clients, int[] seqs, int[] perRequest, double cellSec)
+    {
+        var gf = GgufFile.Open(gguf); var tk = new Tk(GgufTokenizerFactory.Load(gf.Metadata)); var cfg = GgufModelConfigExtractor.Extract(gf.Metadata);
+        using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(10), BaseAddress = new Uri(url) };
+        string label = Path.GetFileNameWithoutExtension(gguf);
+        foreach (int seq in seqs)
+        foreach (int per in perRequest)
+        foreach (int nc in clients)
+        {
+            var docs = MakeDocs(tk, Math.Max(64, nc * per), seq, 5).ToArray();
+            async Task<int> Call(int[][] input)
+            {
+                string body = JsonSerializer.Serialize(new { input });
+                using var r = await http.PostAsync("/v1/embeddings", new StringContent(body, Encoding.UTF8, "application/json"));
+                r.EnsureSuccessStatusCode(); _ = (await r.Content.ReadAsStringAsync()).Length; return input.Length;
+            }
+            Call(docs[..per]).Wait();
+            var reps = new List<double>();
+            for (int rep = 0; rep < 3; rep++)
+            {
+                long done = 0; var t0 = Stopwatch.GetTimestamp(); var end = Stopwatch.StartNew();
+                var lat = new System.Collections.Concurrent.ConcurrentBag<double>();
+                var tasks = Enumerable.Range(0, nc).Select(c => Task.Run(async () =>
+                {
+                    int i = c * per;
+                    while (end.Elapsed.TotalSeconds < cellSec)
+                    {
+                        var input = Enumerable.Range(0, per).Select(k => docs[(i + k) % docs.Length]).ToArray(); i += nc * per;
+                        var s0 = Stopwatch.GetTimestamp(); int n = await Call(input); lat.Add(Stopwatch.GetElapsedTime(s0).TotalMilliseconds);
+                        Interlocked.Add(ref done, n);
+                    }
+                })).ToArray();
+                Task.WaitAll(tasks);
+                double secs = Stopwatch.GetElapsedTime(t0).TotalSeconds; reps.Add(done / secs);
+                var l = lat.OrderBy(x => x).ToArray();
+                if (rep == 2) Emit(new { mode = "http", model = label, clients = nc, perRequest = per, seq = docs[0].Length, docs_s_med = reps.OrderBy(x => x).ElementAt(reps.Count / 2), docs_s_min = reps.Min(), docs_s_max = reps.Max(), p50_ms = l[l.Length / 2], p99_ms = l[(int)(l.Length * 0.99)] });
+            }
+        }
+        return 0;
     }
 
     private static void Latency(string label, IEmbeddingModel emb, ITokenizer rawTok, ModelConfig cfg, PoolingType pooling,
