@@ -205,3 +205,47 @@ meanKL 0, max|dlogit| 0, top-1 identical for `n32diet`, `n48diet` and `n64diet`.
 
 **Not tried:** a `SB=32` staging round (one block per round: A 5 KB + B 5 KB at 64 tokens = 11.3 KB, 5 workgroups per WGP) would keep occupancy at 4+ with 64 tokens, but halves the weight
 bytes each thread owns per round (8 elements), which cuts against the load-issue gain of 7.1 and needs every format's `Stage` struct rewritten; the follow-up if prefill needs another step here.
+
+## 8. Lever 2: the attention core split (#1356) - cooperative-matrix QSA gather, +10..14%
+
+Same protocol as sections 6-7 (UD-IQ4_XS, F16 K/V, context 12288, one process, GPU lock + `cpu-bench` held for timing, no human GPU process). `attn_rope_core` is now split by
+GPU-timestamp labels `ar_rope`, `ar_kvwrite`, `ar_ix_proj`, `ar_ix_pool`, `ar_ix_qrope`, `ar_ix_score`, `ar_ix_select`, `ar_gather_partial`, `ar_gather_merge`
+(the old `attn_rope_core` label is now an empty residual).
+
+**Split (scalar gather kernel, `pf ... prof=2`, % of wall):**
+
+| sub-stage | 4K | 8K | 2K after 8K |
+|---|---|---|---|
+| `ar_gather_partial` (QSA gather attention, partial pass) | 16.4-19.5 | 20.2 | 20.6 |
+| `ar_ix_proj` (indexer K/Q projections + raw-key store) | 2.4-2.9 | 3.3 | 3.5 |
+| `ar_ix_score` | 0.2 | 0.5 | 1.1 |
+| rope, kv write, pool, qrope, select, merge | each <= 0.1 | | |
+
+The gather kernel IS the attention core: everything else together is 3-5%. Perturbation (4K, skip `ar_gather_partial`): 9310 -> 7931 ms (-14.8%, timestamp share 19.5%; routing tile count moved
+-6%, so a slight understatement-of-confound). Skipping `ar_ix_score` gave -38% wall but moved the routing counter and the timestamp share is 0.2%: confounded, ignored. The other labels are below the noise floor.
+
+**Why it is slow:** `qsa_attention_f16kv` is a *scalar* decode-style kernel (one workgroup per query head and KV split, subgroup-per-key Q.K, per-element V accumulate), not a coopmat kernel, and each of the 12 heads of
+a GQA group re-reads the same gathered K/V. ~1.4 TFLOP/s effective.
+
+**Shipped: `qsa_attention_cm_f16kv.comp`.** One workgroup per (KV head, KV split, query); the group's 12 heads are one 16-row coopmat tile (padding rows inert), the query's virtual key list is gathered
+through the selection in 32-key tiles, S = Qh.K + Ql.K (Q hi/lo f16 split as in the hd256 flash kernel, K is the exact F16 cache), F32 online softmax, P rounded to f16, O += P.V in F32. Same bindings, push
+constants and partial layout as the scalar kernel, so the merge kernel is reused. Used for F16 KV, head_dim 256, group <= 16 and sub-chunks of >= 16 queries; decode / short verify rows keep the scalar kernel.
+`DOTLLM_VK_QSA_CM=0` (or `Qwen4ExpQsaKernels.CoopmatGather`) restores it. LDS ~28 KB.
+
+*Parity:* not bit-identical (P f16-rounded). Unit test `VulkanQwen4ExpQsaCoopmatGatherTests` (vs the scalar F16 gather, per-(query, head) relL2, 6 shapes incl. 8/12/16-row groups, dense+sparse mix,
+ragged tails, several splits, x16-amplitude scores): worst 1.8e-4..2.6e-4. End to end, real wikitext, last-row logits per chunk, cm vs scalar: 1024-row chunks / 6000 tokens meanKL 7.5e-3, maxKL 2.8e-2, top-1 6/6;
+512-row / 3000 tokens meanKL 5.7e-3, maxKL 2.9e-2, top-1 6/6. Noise-floor control (scalar kernel, KV splits 1 vs 2 on 8-row chunks, 300 vectors): meanKL 2.4e-2, top-1 290/300 - the new kernel sits below a pure
+summation-order change. (On the repeated probe prompts the same comparison reads meanKL 4.5e-2; that text is degenerate and amplifies any difference.)
+
+*Throughput* (`pf`, median of 3 reps per call, palindromic ABBA blocks both orders, scalar -> cm, tok/s): 4K blocks 447.8 -> 505.6 (x1.129) and 453.5 -> 510.0 (x1.125); 8K 413.9 -> 457.2 (x1.104, wide rep spread 365-482);
+2K after 8K history 383 -> 435 (x1.136). Stage profile with cm on: `ar_gather_partial` 1747 -> 1142 ms (4K, 16.4% -> 13.3%), 3991 -> 2674 ms (8K), 1280 -> 790 ms (2K after 8K). The kernel is still the single biggest attention label:
+it is latency-bound per tile (3 barrier phases per 32 keys, only 2 of 4 subgroups run QK^T); headroom left in BC=64 tiles and spreading QK^T over all four subgroups.
+
+## 9. Lever 3: gated-residual read (#1357) - premise corrected
+
+On prefill (> 1 token) `gr.down` is the Q8_0 coopmat GEMM reading F32 activations directly: there is no Q8_1 activation quantise to fuse with `gr.grouprms` (that exists only on the 1-token decode path). The
+`gr.grouprms` label is also the first stage after each submit, so it carries the inter-submit host gap (its share ranged 8-19% across identical runs: 760-2170 ms per 4K prefill), which makes it unusable as a kernel time.
+**Refuted by `grbench` (kernel-only, 1024 rows x 4 x 2560 F32, 40 back-to-back dispatches, 6 rounds):** the out-of-place group-RMS runs at **0.44 ms per dispatch = 190 GB/s read+write**, i.e. at the DRAM floor
+(~205 GB/s). At 96 calls per 1024-row chunk that is ~42 ms of a ~2300 ms chunk, **~1.8% of wall, already at the roofline**; a vec4 / subgroup-reduction rewrite or a fusion with the norm cannot beat the bytes it must
+move (the F32 read of the residual stream and the F32 write of `_xn` stay unless the GEMM B-load absorbs the norm, which needs the per-row sum of squares first). The 8-19% `gr.grouprms` timestamp share is therefore
+inter-submit host gap attributed to the first stage after each submit, not kernel time. No code change; #1357 closed as refuted.

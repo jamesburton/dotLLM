@@ -28,6 +28,7 @@ string[] prompts =
 };
 if (args[0] == "tier") { TierRun.Run(args); return; }
 if (args[0] == "kbench") { KBench.Run(args); return; }
+if (args[0] == "grbench") { GrBench.Run(args); return; }
 if (args[0] == "iqbench") { IqKBench.Run(args); return; }
 if (args[0] == "mimobench") { MimoIqBench.Run(args); return; }
 if (args[0] == "q41bench") { Q41Bench.Run(args); return; }
@@ -134,8 +135,10 @@ var tok = GgufTokenizerFactory.Load(file.Metadata);
 int[]? pfIds = null;
 bool realText = true;
 int[] longText = null!;
+bool wikiIds = false;
 int[] Ids(int n, int seed)
 {
+    if (wikiIds && pfIds is not null) return pfIds.AsSpan(seed == 11 ? 0 : 5000 + seed * 997, n).ToArray();
     if (realText)
     {
         longText ??= Enumerable.Range(0, 8).SelectMany(_ => prompts.SelectMany(p => tok.Encode(p))).ToArray();
@@ -704,6 +707,20 @@ void Exec(string line, StringBuilder o)
         case "ids":   // ids <file.i32> : real-text token ids (mkids) used by pf instead of the repeated probe prompts
             pfIds = MemoryMarshal.Cast<byte, int>(File.ReadAllBytes(a[1]).AsSpan()).ToArray();
             o.AppendLine($"ids {pfIds.Length} tokens");
+            break;
+        case "wiki":   // wiki 0|1 : dump/kl/fwd use the real wikitext ids loaded by `ids` instead of the repeated probe prompts
+            wikiIds = a[1] != "0"; o.AppendLine($"wiki {wikiIds}");
+            break;
+        case "qsasplits":   // qsasplits N : cap the gather-attention KV splits (0 = off); a harmless summation-order change, the KL noise-floor control
+        {
+            var qt = typeof(VulkanQwen4ExpTransformerModel).Assembly.GetType("DotLLM.Vulkan.VulkanQwen4ExpQsa")!;
+            qt.GetProperty("SplitsOverride", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic)!.SetValue(null, int.Parse(a[1]));
+            o.AppendLine($"qsasplits {a[1]}");
+            break;
+        }
+        case "qsacm":   // qsacm 0|1 : cooperative-matrix QSA gather attention off/on (#1356 in-process A/B)
+            DotLLM.Vulkan.Kernels.Qwen4ExpQsaKernels.CoopmatGather = a[1] != "0";
+            o.AppendLine($"qsacm {DotLLM.Vulkan.Kernels.Qwen4ExpQsaKernels.CoopmatGather}");
             break;
         case "perturb":   // perturb <target> <after1|after2..> | perturb off : suppress dispatches between stage markers (#1334; timing attribution only, outputs are garbage)
         {
