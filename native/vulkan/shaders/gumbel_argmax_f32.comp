@@ -1,0 +1,70 @@
+#version 450
+// Position-seeded Gumbel-max over F32 logits rows, read in place (#1382):
+//     ids[row] = argmax_i ( logits[row][i] * invTemp + G(seed, firstTokenIndex + row, i) )   over the finite entries.
+// One workgroup per row; only the row's sampled token id is written. This reproduces
+// DotLLM.Engine.Samplers.GumbelNoise bit for bit: Philox4x32-10 with counter (i, tokenIndex, 0, 0) and key = seed, the 24-bit
+// uniform u = max(w >> 8, 1) * 2^-24, and the deterministic log (GumbelNoise.Log: exponent split, fixed degree-9 polynomial,
+// IEEE add/multiply only). Every float operation on the noise and the score is `precise` so the compiler can neither fuse
+// multiply+add into an FMA nor reassociate; GLSL's own log() is NOT used (it promises only an absolute error near 1).
+// Ties go to the lowest index (the CPU loop keeps the first maximum with a strict >), -inf entries are skipped.
+// The pipeline's temperature step multiplies by 1/T; invTemp is that same F32 reciprocal (1.0 when T == 1).
+
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Logits { float logits[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Ids { uint ids[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint vocab;
+    uint rowStride;        // elements between rows
+    uint seedLo;
+    uint seedHi;
+    uint firstTokenIndex;  // generation index of row 0; row r draws token index firstTokenIndex + r
+    float invTemp;
+} pc;
+
+const uint NONE = 0xFFFFFFFFu;
+
+#include "gumbel_noise.glsl"
+shared float sScore[512];
+shared uint sIdx[512];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint base = row * pc.rowStride;
+    uint tokenIndex = pc.firstTokenIndex + row;
+
+    float best = 0.0;
+    uint bestIdx = NONE;
+    for (uint i = tid; i < pc.vocab; i += 512u) {
+        float l = logits[base + i];
+        if (floatBitsToUint(l) == 0xFF800000u) continue;   // -inf: excluded
+        precise float g = gumbelNoise(pc.seedLo, pc.seedHi, tokenIndex, i);
+        precise float scaled = l * pc.invTemp;
+        precise float s = scaled + g;
+        if (bestIdx == NONE || s > best) { best = s; bestIdx = i; }
+    }
+
+    sScore[tid] = best;
+    sIdx[tid] = bestIdx;
+    barrier();
+    for (uint stride = 256u; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            uint oi = sIdx[tid + stride];
+            if (oi != NONE) {
+                float os = sScore[tid + stride];
+                uint mi = sIdx[tid];
+                float ms = sScore[tid];
+                if (mi == NONE || os > ms || (os == ms && oi < mi)) {
+                    sScore[tid] = os;
+                    sIdx[tid] = oi;
+                }
+            }
+        }
+        barrier();
+    }
+    if (tid == 0u) ids[row] = sIdx[0] == NONE ? 0u : sIdx[0];
+}
