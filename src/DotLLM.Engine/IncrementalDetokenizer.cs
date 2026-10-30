@@ -16,8 +16,8 @@ namespace DotLLM.Engine;
 /// prefix text into the committed buffer.
 /// </para>
 /// <para>
-/// Correctness with partial UTF-8 / SentencePiece byte-tokens: we only evict a token when
-/// <c>Decode(window[1..])</c> is a suffix of <c>Decode(window)</c>. When the tail differs —
+/// Correctness with partial UTF-8 / SentencePiece byte-tokens: we only evict a token prefix when
+/// decoding the remaining tokens yields a suffix of <c>Decode(window)</c>. When the tail differs —
 /// usually because the oldest token contributed bytes to a multi-byte UTF-8 codepoint or an
 /// accumulating byte-token run — we leave the window alone and try again after the next token.
 /// A hard cap prevents unbounded growth in pathological cases by force-committing the current
@@ -55,7 +55,7 @@ internal sealed class IncrementalDetokenizer
 
         while (_window.Count > SoftWindowLimit)
         {
-            if (TryEvictOldest())
+            if (TryEvictStablePrefix())
                 continue;
 
             if (_window.Count > HardWindowLimit)
@@ -70,24 +70,25 @@ internal sealed class IncrementalDetokenizer
         }
     }
 
-    private bool TryEvictOldest()
+    private bool TryEvictStablePrefix()
     {
-        var tail = _tokenizer.Decode(
-            CollectionsMarshal.AsSpan(_window).Slice(1), stripBosSpace: false);
-
-        if (tail.Length > _windowText.Length)
-            return false;
-
         var windowSpan = _windowText.AsSpan();
-        if (!windowSpan[(windowSpan.Length - tail.Length)..].SequenceEqual(tail))
-            return false;
+        var tokens = CollectionsMarshal.AsSpan(_window);
+        // A UTF-8 scalar may occupy several tokens; removing only its first byte corrupts the tail.
+        for (int count = 1; count < tokens.Length; count++)
+        {
+            var tail = _tokenizer.Decode(tokens[count..], stripBosSpace: false);
+            if (tail.Length > windowSpan.Length || !windowSpan[(windowSpan.Length - tail.Length)..].SequenceEqual(tail))
+                continue;
 
-        int commitLen = _windowText.Length - tail.Length;
-        if (commitLen > 0)
-            _committed.Append(_windowText, 0, commitLen);
-        _window.RemoveAt(0);
-        _windowText = tail;
-        return true;
+            int commitLen = windowSpan.Length - tail.Length;
+            if (commitLen > 0)
+                _committed.Append(_windowText, 0, commitLen);
+            _window.RemoveRange(0, count);
+            _windowText = tail;
+            return true;
+        }
+        return false;
     }
 
     /// <summary>

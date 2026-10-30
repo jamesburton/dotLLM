@@ -235,6 +235,34 @@ public sealed class IncrementalDetokenizerTests
         Assert.Equal(string.Empty, detok.TakeDelta(flushIncomplete: true));
     }
 
+    [Theory]
+    [InlineData("é", false)]
+    [InlineData("€", false)]
+    [InlineData("🙂", false)]
+    [InlineData("🙂", true)]
+    public void TakeDelta_LongByteFallbackStream_MatchesBulkDecode(string character, bool separator)
+    {
+        var tok = BuildByteFallbackVocab();
+        var ids = new List<int>();
+        for (int i = 0; i < 20; i++)
+        {
+            ids.AddRange(ByteTokens(character));
+            if (separator) ids.Add(1);
+        }
+
+        var detok = new IncrementalDetokenizer(tok);
+        var streamed = new System.Text.StringBuilder();
+        foreach (int id in ids)
+        {
+            detok.Append(id);
+            streamed.Append(detok.TakeDelta(flushIncomplete: false));
+        }
+        streamed.Append(detok.TakeDelta(flushIncomplete: true));
+
+        Assert.Equal(tok.Decode(ids.ToArray(), stripBosSpace: false), streamed.ToString());
+        Assert.DoesNotContain('\uFFFD', streamed.ToString());
+    }
+
     [Fact]
     public void ByteFallbackTokens_LongRun_MatchesBulkDecode()
     {
