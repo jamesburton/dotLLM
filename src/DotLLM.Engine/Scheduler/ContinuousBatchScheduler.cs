@@ -688,6 +688,12 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             });
         }
 
+        // #1434: when every ready sequence draws a pure-temperature Gumbel-max sample the model draws all rows on the device and only
+        // one token id per sequence crosses back (no vocabulary-row readback, no host noise generation). Any other shape (top-k / top-p /
+        // min-p, penalties, a constraint mask, a non-Gumbel pipeline) needs the logits on the host, so the whole batch keeps the logits path.
+        if (TryDeviceGumbelDecode(readyCount))
+            return;
+
         IReadOnlyList<ITensor> results;
         long fwdStart = Stopwatch.GetTimestamp();
         try
@@ -740,6 +746,91 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                 logits.Dispose();
             }
         }
+    }
+
+    /// <summary>Draw eligible batched decode rows on the device when the model can (default on; <c>DOTLLM_DEVICE_GUMBEL=0</c> disables; tests flip it in-process).</summary>
+    internal bool UseDeviceGumbel { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_DEVICE_GUMBEL") != "0";
+
+    private GumbelDraw[] _gumbelDraws = [];
+    private int[] _gumbelIds = [];
+
+    /// <summary>Count of decode steps whose rows were drawn on the device (<see cref="IModel.ForwardBatchGumbelSampled"/>); a test hook proving the path ran.</summary>
+    internal long DeviceGumbelDecodeSteps { get; private set; }
+
+    /// <summary>
+    /// Runs the batched decode through <see cref="IModel.ForwardBatchGumbelSampled"/> when the model supports it and every ready sequence
+    /// is eligible (<see cref="SamplerPipeline.DeviceGumbelInvTemperature"/> set, no constraint). Returns false, with nothing consumed,
+    /// when it does not apply. <see cref="_decodeBatch"/> is already filled by the caller.
+    /// </summary>
+    private bool TryDeviceGumbelDecode(int readyCount)
+    {
+        if (!_model.SupportsDeviceGumbelBatch) return false;
+        if (!UseDeviceGumbel) return false;
+        for (int j = 0; j < readyCount; j++)
+        {
+            var seq = _decodeReady[j];
+            if (seq.Constraint is not null || seq.SamplerPipeline.DeviceGumbelInvTemperature is null) return false;
+        }
+
+        if (_gumbelDraws.Length < readyCount)
+        {
+            _gumbelDraws = new GumbelDraw[readyCount];
+            _gumbelIds = new int[readyCount];
+        }
+        for (int j = 0; j < readyCount; j++)
+        {
+            var seq = _decodeReady[j];
+            _gumbelDraws[j] = new GumbelDraw(seq.SamplerPipeline.GumbelSeed, seq.GeneratedTokens.Count,
+                seq.SamplerPipeline.DeviceGumbelInvTemperature!.Value);
+        }
+
+        long fwdStart = Stopwatch.GetTimestamp();
+        try
+        {
+            _model.ForwardBatchGumbelSampled(_decodeBatch, deviceId: -1, _gumbelDraws.AsSpan(0, readyCount), _gumbelIds.AsSpan(0, readyCount));
+        }
+        catch (OperationCanceledException)
+        {
+            FailReadyDecoders(readyCount, ex: null);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            FailReadyDecoders(readyCount, ex);
+            return true;
+        }
+        long perSeqTicks = (Stopwatch.GetTimestamp() - fwdStart) / readyCount;
+        DeviceGumbelDecodeSteps++;
+
+        for (int j = 0; j < readyCount; j++)
+        {
+            var seq = _decodeReady[j];
+            seq.DecodeTicks += perSeqTicks;
+            try
+            {
+                if (CommitSampledToken(seq, _gumbelIds[j]))
+                {
+                    seq.State = SequenceState.Completed;
+                    CompleteSequence(seq);
+                    _active.Remove(seq);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                seq.State = SequenceState.Cancelled;
+                ReleaseKvCache(seq);
+                seq.Cancel();
+                _active.Remove(seq);
+            }
+            catch (Exception ex)
+            {
+                seq.State = SequenceState.Completed;
+                ReleaseKvCache(seq);
+                seq.Fail(ex);
+                _active.Remove(seq);
+            }
+        }
+        return true;
     }
 
     /// <summary>Fails every ready decoder when the batched forward itself threw (a batch-scoped
@@ -1529,6 +1620,15 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             seq.SamplerTicks += Stopwatch.GetTimestamp() - sStart;
         }
 
+        return CommitSampledToken(seq, nextTokenId);
+    }
+
+    /// <summary>
+    /// Appends a sampled token (host- or device-drawn): advances the constraint, records the token, checks stop conditions and capacity,
+    /// and streams it. Returns whether the sequence finished.
+    /// </summary>
+    private bool CommitSampledToken(SchedulerRequest seq, int nextTokenId)
+    {
         seq.Constraint?.Advance(nextTokenId);
         seq.GeneratedTokens.Add(nextTokenId);
 

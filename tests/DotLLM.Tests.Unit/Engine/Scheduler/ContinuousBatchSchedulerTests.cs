@@ -1187,6 +1187,33 @@ public sealed partial class ContinuousBatchSchedulerTests
 
         public bool RequiresPerSequenceState => _requiresPerSeqState;
 
+        /// <summary>When set, row logits are <c>LogitFn(lastInputToken, position, vocabIndex)</c> instead of a scripted peak (#1434 Gumbel tests).</summary>
+        public Func<int, int, int, float>? LogitFn { get; set; }
+
+        /// <summary>When true the mock advertises the batched device Gumbel draw and implements it on the host (reference arithmetic).</summary>
+        public bool DeviceGumbelBatch { get; set; }
+        public bool SupportsDeviceGumbelBatch => DeviceGumbelBatch;
+        public int DeviceGumbelBatchCalls { get; private set; }
+        public List<GumbelDraw> LastDraws { get; } = new();
+
+        public void ForwardBatchGumbelSampled(IReadOnlyList<SequenceForwardRequest> requests, int deviceId,
+            ReadOnlySpan<GumbelDraw> draws, Span<int> sampledIds)
+        {
+            DeviceGumbelBatchCalls++;
+            LastDraws.Clear();
+            for (int i = 0; i < requests.Count; i++)
+            {
+                var r = requests[i];
+                Assert.Single(r.TokenIds.ToArray());
+                using var logits = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache);
+                var scaled = new float[VocabSize];
+                unsafe { new ReadOnlySpan<float>((void*)logits.DataPointer, VocabSize).CopyTo(scaled); }
+                for (int v = 0; v < scaled.Length; v++) scaled[v] *= draws[i].InvTemperature;
+                sampledIds[i] = DotLLM.Engine.Samplers.GumbelNoise.Sample(scaled, draws[i].Seed, draws[i].TokenIndex);
+                LastDraws.Add(draws[i]);
+            }
+        }
+
         // The mock owns no recurrent state; required because IModel's default throws when
         // RequiresPerSequenceState is true, so a recurrent model cannot silently inherit a no-op.
         public void ResetSequenceState() => ResetSequenceStateCount++;
@@ -1267,6 +1294,13 @@ public sealed partial class ContinuousBatchSchedulerTests
                 // Set argmax for the last position only; for prefill batches the scheduler reads
                 // logitRows-1 anyway, so set the same argmax across the batch for safety.
                 float* row = dst + (long)b * VocabSize;
+                if (LogitFn is not null)
+                {
+                    int lastIn = tokenIds[Math.Min(b, tokenIds.Length - 1)];
+                    int pos = positions[Math.Min(b, positions.Length - 1)];
+                    for (int v = 0; v < VocabSize; v++) row[v] = LogitFn(lastIn, pos, v);
+                    continue;
+                }
                 for (int v = 0; v < VocabSize; v++) row[v] = -10f;
                 row[emitToken] = 10f;
             }
