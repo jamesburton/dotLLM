@@ -21,6 +21,7 @@ internal static class RopePrecision
         int headDim = lab.Config.HeadDim;
         int stride = lab.Geometry.KvStrideOf(0);
         var ci = CultureInfo.InvariantCulture;
+        Console.WriteLine($"corpus {corpusDir}: {corpus.DocumentCount} documents, {corpus.Chunks.Count} chunks; chunk-id sha256 {corpus.ChunkIdHash}");
         Console.WriteLine($"RoPE {rope}; head dim {headDim}; layer-0 stride {stride}");
 
         using var csv = new StreamWriter(outCsv) { AutoFlush = true };

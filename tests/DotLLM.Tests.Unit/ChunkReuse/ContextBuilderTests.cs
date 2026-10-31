@@ -41,6 +41,23 @@ public sealed class ContextBuilderTests
         Assert.Equal(3 + 16, tokenizer.EncodeCalls); // only this test's own re-encodes; Build never tokenises
     }
 
+    [Fact]
+    public void ContextBuilder_ChunkIdHash_IdentifiesTheChunkedCorpus()
+    {
+        var tok = new MergingTokenizer();
+        string a = new ContextBuilder([("d0.cs", "cdeacdea"), ("d1.cs", "bcdebcde")], tok, chunkTokens: 4).ChunkIdHash;
+        string same = new ContextBuilder([("x.cs", "cdeacdea"), ("y.cs", "bcdebcde")], tok, chunkTokens: 4).ChunkIdHash;
+        string edited = new ContextBuilder([("d0.cs", "cdeacdeb"), ("d1.cs", "bcdebcde")], tok, chunkTokens: 4).ChunkIdHash;
+        string reordered = new ContextBuilder([("d1.cs", "bcdebcde"), ("d0.cs", "cdeacdea")], tok, chunkTokens: 4).ChunkIdHash;
+        string moved = new ContextBuilder([("d0.cs", "cdeacde"), ("d1.cs", "abcdebcde")], tok, chunkTokens: 4).ChunkIdHash;
+
+        Assert.Matches("^[0-9a-f]{64}$", a);
+        Assert.Equal(a, same);           // depends on chunk ids only, not on file names
+        Assert.NotEqual(a, edited);      // one token changed
+        Assert.NotEqual(a, reordered);   // chunk order changes indices
+        Assert.NotEqual(a, moved);       // chunk boundaries moved
+    }
+
     /// <summary>Character tokenizer that merges the pair "ab" into a single token (id 3).</summary>
     private sealed class MergingTokenizer : ITokenizer
     {

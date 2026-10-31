@@ -45,6 +45,15 @@ internal static class Program
             case "rope-precision":
                 return RopePrecision.Run(Get("model"), Get("corpus"), Get("pattern", "*.cs"), Ints("deltas", "1024,4096,8192"),
                     Int("chunks", 3), Int("chunk", 512), Int("threads", 0), Get("out"));
+            case "corpus-info":
+            {
+                // Tokenizer only (no weights are run): document/chunk counts and the chunk-id hash of a corpus directory.
+                using var gguf = DotLLM.Models.Gguf.GgufFile.Open(Get("model"));
+                var tokenizer = DotLLM.Models.Gguf.GgufBpeTokenizerFactory.Load(gguf.Metadata);
+                var corpus = ContextBuilder.FromDirectory(Get("corpus"), Get("pattern", "*.cs"), tokenizer, Int("chunk", 512));
+                Console.WriteLine($"corpus {Get("corpus")}: {corpus.DocumentCount} documents, {corpus.Chunks.Count} chunks; chunk-id sha256 {corpus.ChunkIdHash}");
+                return 0;
+            }
             default:
                 Console.Error.WriteLine($"unknown command '{args[0]}'");
                 return 2;

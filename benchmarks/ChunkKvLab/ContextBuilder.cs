@@ -71,6 +71,22 @@ public sealed class ContextBuilder
     public int DocumentCount => _documents.Count;
 
     /// <summary>
+    /// SHA-256 (lowercase hex) of every chunk's token ids in chunk order (little-endian int32, chunk size first): identifies the
+    /// chunked corpus a run used, independent of file names, so a rerun can prove it saw the same chunks.
+    /// </summary>
+    public string ChunkIdHash
+    {
+        get
+        {
+            using var sha = System.Security.Cryptography.IncrementalHash.CreateHash(System.Security.Cryptography.HashAlgorithmName.SHA256);
+            sha.AppendData(BitConverter.GetBytes(ChunkTokens));
+            foreach (CorpusChunk c in _chunks)
+                sha.AppendData(System.Runtime.InteropServices.MemoryMarshal.AsBytes(c.TokenIds.AsSpan()));
+            return Convert.ToHexStringLower(sha.GetHashAndReset());
+        }
+    }
+
+    /// <summary>
     /// Builds the request for <paramref name="seed"/> with <paramref name="contextTokens"/> / <see cref="ChunkTokens"/> chunks.
     /// The seed fixes one permutation of all chunks, so contexts of different sizes for a seed are nested (their chunks can be
     /// encoded once). Base order = the permutation's first k chunks; request order = the first k/2 kept, the rest shuffled.

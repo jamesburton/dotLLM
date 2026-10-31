@@ -27,7 +27,7 @@ internal static class E1Runner
         var sw = Stopwatch.StartNew();
         ContextBuilder corpus = ContextBuilder.FromDirectory(o.CorpusDir, o.Pattern, lab.Tokenizer, o.ChunkTokens);
         Console.WriteLine($"corpus {o.CorpusDir} ({o.Pattern}): {corpus.DocumentCount} documents, {corpus.Chunks.Count} chunks of "
-            + $"{o.ChunkTokens} tokens, tokenised once in {sw.Elapsed.TotalSeconds:F1} s");
+            + $"{o.ChunkTokens} tokens, tokenised once in {sw.Elapsed.TotalSeconds:F1} s; chunk-id sha256 {corpus.ChunkIdHash}");
         Console.WriteLine($"KV F32 bytes/token {lab.KvBytesPerToken}; fingerprint {lab.Fingerprint[..16]}…");
 
         var encoder = new ChunkEncoder(lab.Fingerprint);
