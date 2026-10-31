@@ -392,6 +392,16 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [DefaultValue(0L)]
         public long ResidentMemoryBudgetBytes { get; set; }
 
+        /// <summary>Forces <c>GET /metrics</c> on (#1344).</summary>
+        [CommandOption("--metrics")]
+        [Description("Serve Prometheus metrics at GET /metrics on any bind. Default: on for loopback binds only.")]
+        public bool Metrics { get; set; }
+
+        /// <summary>Forces <c>GET /metrics</c> off (#1344).</summary>
+        [CommandOption("--no-metrics")]
+        [Description("Do not serve GET /metrics.")]
+        public bool NoMetrics { get; set; }
+
         /// <summary>Enables the #454 model-administration write endpoints (off by default).</summary>
         [CommandOption("--allow-model-admin")]
         [Description("Enable the model-administration API (#454): POST /v1/models/unload, /pull, /enable, /disable and PUT /v1/settings. Off by default.")]
@@ -543,6 +553,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             MaxResidentModels = settings.MaxResidentModels,
             ResidentMemoryBudgetBytes = settings.ResidentMemoryBudgetBytes,
             AllowModelAdminApi = settings.AllowModelAdmin,
+            Metrics = settings.NoMetrics ? false : settings.Metrics ? true : null,
             AllowLoraAdminApi = settings.AllowLoraAdmin,
             // #457: nothing in src/ ever assigned RateLimit, so the entire RateLimiting
             // subsystem was unreachable — no invocation of `dotllm serve` could produce a 429,

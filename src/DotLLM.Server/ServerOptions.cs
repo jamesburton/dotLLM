@@ -311,6 +311,25 @@ public sealed record ServerOptions
     public bool AllowModelAdminApi { get; init; }
 
     /// <summary>
+    /// <c>GET /metrics</c> (Prometheus text format, #1344). <c>null</c> (default) = on only when <see cref="Host"/>
+    /// is a loopback bind, so a service exposed on the network never leaks counters by omission;
+    /// <c>--metrics</c> forces it on for any bind, <c>--no-metrics</c> forces it off.
+    /// </summary>
+    public bool? Metrics { get; init; }
+
+    /// <summary>Resolves <see cref="Metrics"/> against <see cref="Host"/>: explicit setting wins, else loopback-only.</summary>
+    public bool MetricsEnabled => Metrics ?? IsLoopbackHost(Host);
+
+    /// <summary>True for <c>localhost</c>, <c>127.x</c>, <c>::1</c> and <c>[::1]</c>.</summary>
+    internal static bool IsLoopbackHost(string? host)
+    {
+        if (string.IsNullOrWhiteSpace(host)) return false;
+        host = host.Trim().Trim('[', ']');
+        if (host.Equals("localhost", StringComparison.OrdinalIgnoreCase)) return true;
+        return System.Net.IPAddress.TryParse(host, out var ip) && System.Net.IPAddress.IsLoopback(ip);
+    }
+
+    /// <summary>
     /// Per-API-key rate-limit configuration. When <see cref="RateLimitConfig.Enabled"/>
     /// is <c>false</c> (or this property is <c>null</c>) the rate-limit middleware
     /// is not wired and the server has no per-caller limits. See <see cref="RateLimitConfig"/>
@@ -436,6 +455,7 @@ public sealed record ServerOptions
         int maxResidentModels = 1;
         long residentMemoryBudgetBytes = 0;
         bool allowModelAdmin = false;
+        bool? metrics = null;
         bool allowLoraAdmin = false;
         int? maxMessagesCli = null;
         int promptCacheStep = 0;
@@ -554,6 +574,10 @@ public sealed record ServerOptions
                     maxResidentModels = int.Parse(next!); i++; break;
                 case "--resident-memory-budget":
                     residentMemoryBudgetBytes = long.Parse(next!); i++; break;
+                case "--metrics":
+                    metrics = true; break;
+                case "--no-metrics":
+                    metrics = false; break;
                 case "--allow-model-admin":
                     allowModelAdmin = true; break;
                 case "--allow-lora-admin":
@@ -630,6 +654,7 @@ public sealed record ServerOptions
             MaxResidentModels = maxResidentModels,
             ResidentMemoryBudgetBytes = residentMemoryBudgetBytes,
             AllowModelAdminApi = allowModelAdmin,
+            Metrics = metrics,
             AllowLoraAdminApi = allowLoraAdmin,
             MaxMessages = ResolveMaxMessages(maxMessagesCli, Environment.GetEnvironmentVariable(MaxMessagesEnvVar)),
             ModelId = modelId,

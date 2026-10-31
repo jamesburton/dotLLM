@@ -33,6 +33,7 @@ public static class EndpointExtensions
         LoraEndpoints.Map(app);
         SettingsEndpoint.Map(app);
         DeviceEndpoint.Map(app);
+        MetricsEndpoint.Map(app);
 
         if (serveUi)
             WebUIEndpoint.Map(app);
