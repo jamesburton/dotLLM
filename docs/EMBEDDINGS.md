@@ -29,8 +29,7 @@ Not attempted (same code path as a row above, or outside the 20-600M download ru
 (bert), Qwen3-Embedding-4B/8B (qwen3 decoder), gte-Qwen2, bge-m3 and jina-v3/v4 (XLM-R / custom code; bge-m3 uses the same Unigram tokenizer that multilingual-e5 now loads through, #1401). Encoder = bidirectional BERT-style (`BertEncoderModel`, CPU only);
 decoder-based embedders (Qwen3-Embedding, last-token pooling) run on `TransformerModel`, also CPU only.
 
-GPU: Vulkan `VulkanTransformerModel` implements `IEmbeddingModel` since #1406 (section 5); CUDA models do not (the server returns 501),
-and encoders are refused on a GPU device (#741 is the work item).
+GPU: Vulkan `VulkanTransformerModel` implements `IEmbeddingModel` since #1406 and `VulkanBertEncoderModel` serves architecture `bert` with F16 weights since #741 (section 5); CUDA models do not (the server returns 501), and every other encoder (nomic-bert, nomic-bert-moe, gemma-embedding, Q8_0/F32 bert files) is refused on a GPU device.
 
 ## 2. Quality gate
 
@@ -348,10 +347,34 @@ Not covered: BERT-class encoders (#741, bidirectional, would need the per-docume
 decoder architectures (gated off until validated).
 No CUDA run (T5500 needs the user's go-ahead). End-to-end `/v1/embeddings` on Vulkan returns 1024-d vectors (smoke-tested, 2 inputs, 10 prompt tokens).
 
-**#741 (GPU BERT encoder), plan only, not started:** needs bidirectional attention (the Vulkan attention shader has a Bidirectional
-mask mode from DiffusionGemma), LayerNorm + bias adds, absolute position / token-type embeddings, GELU, and mean/cls pooling; reuse the coopmat
-prefill GEMM tiles for QKV/out/FFN, a padded-or-varlen batch of length-sorted documents (section 3 padding table) and the same
-`ForwardHiddenForPooling` contract (mean = GPU-side reduction). Expect well above 5k tok/s on 110M-class encoders (unmeasured).
+### Vulkan BERT encoder (#741)
+
+`VulkanBertEncoderModel` (`src/DotLLM.Vulkan/VulkanBertEncoderModel.cs`) runs architecture `bert` (bge, e5, gte, MiniLM, mxbai, multilingual-e5; F16 weights) on the iGPU.
+One command buffer per forward, documents **packed without padding** (the #1437 scheme, up to `DOTLLM_EMBED_PACK_TOKENS` = 1024 tokens or 128 documents per submit):
+host token + type + position row sum (same arithmetic as the CPU encoder) -> uploaded -> `bert_layernorm_f32`; per layer 3 coopmat F16 GEMMs (Q, K, V) + bias adds,
+one **bidirectional** coopmat flash-attention dispatch per document over its slice of Q/K/V (sub-range descriptors, `AttentionMaskMode.Bidirectional`, so no padding mask and no cross-document leak),
+O GEMM, fused `bias + residual + LayerNorm` (`bert_layernorm_f32`), up GEMM, fused `bias + tanh GELU` (`bert_bias_gelu_f32`), down GEMM, fused `bias + residual + LayerNorm`.
+CLS / mean pooling runs on the device (`bert_pool_f32`) and reads back `[docs, hidden]` only (one pre-averaged row per document for mean: `EmbeddingPooler.Pool` of one row is the identity).
+Weights are read in place as F16 (no expansion). Activation scratch is F32, allocated once at load for the pack budget (same convention as the decoder embedder, #1406; bge-small 1024 tokens: about 10 MiB hidden-sized + 6 MiB FFN, bge-base about twice that); F16 activation kernels are a follow-up. Norm / softmax / pooling accumulate in F32 in registers.
+
+Use: `dotllm embed <bert-f16.gguf> -d vulkan "text"`, `dotllm serve <bert-f16.gguf> --device vulkan` then `POST /v1/embeddings`
+(the #1405 batcher hands whole batches to the packed forward; verified end to end, 2 inputs, 70 ms). Refused loudly on Vulkan: Q8_0 / F32 `bert` files, nomic-bert, nomic-bert-moe, gemma-embedding; `cuda` refused for all encoders.
+
+**Parity** (`BertEncoderVulkanParityTests`, 12 texts incl. 1 char, unicode, a 512-token chunk, packed vs the CPU encoder): bge-small, e5-small-v2, bge-base F16, CLS and mean pooling, cosine >= 0.9999 per text for the packed batch and for one-document packs, the vector is independent of the packed neighbours and of pack order (>= 0.99999), all-row hidden state of bge-small per-token cosine >= 0.9999. Control arms: unrelated texts < 0.95; a causal-instead-of-bidirectional mask and a cross-document leak are each detected (the same comparison fails for all but at most one document). On the 48-text set (`EmbeddingBench dump`, bge-small F16, CLS): Vulkan vs CPU min / mean cosine **0.9999999 / 0.9999999**, NN-1 agreement 1.00 (the CPU encoder is itself 0.999997 min vs sentence-transformers fp32).
+
+**Throughput** (`EmbeddingBench textbatch`, 48 mixed `docs/*.md` chunks, mean 148 tokens, tokenised once, `ForwardHiddenForPooling` in groups of B, pool + normalise included; `gpu-lock` + `cpu-bench` held, paired V C C V, docs/s min-max of 3 timed passes per run):
+
+| Model (F16) | B | Vulkan iGPU 8060S | CPU (32 threads, this tree) | ratio |
+|---|---|---|---|---|
+| bge-small | 1 | 229-234 (32.7k tok/s) | 41-43 | 5.4-5.6x |
+| bge-small | 16 | 608-622 (86.5k tok/s) | 42-47 | 13-14.5x |
+| bge-small | 48 | 606-624 (87.9k tok/s) | 49-51 | 12-12.7x |
+| e5-small-v2 (mean) | 1 / 48 | 230-232 / 614-617 | 41-42 / 45-47 | 5.6x / 13x |
+| bge-base | 1 | 120-122 (17.2k tok/s) | 21.9-22.2 | 5.5x |
+| bge-base | 16 / 48 | 280-284 / 278-281 (39.5k tok/s) | 20.5-21 / 21.8-23.1 | 13.4x / 12.3x |
+
+Roofline check: bge-base is about 170 MFLOP per token, so 39.5k tok/s is about 6.7 TFLOP/s effective; weights (170 MB F16) stream in well under 1 ms per pack, so the packed forward is compute / dispatch bound, not bandwidth bound. Batch 1 (a 148-token document) is launch-bound (about 4.3 ms for bge-small, about 100 dispatches). Raw rows: `benchmarks/EmbeddingBench/results/vulkan-bert-741.jsonl`.
+Not measured / open: Q8_0 encoder weights, nomic-bert family, gemma-embedding, CUDA, device-side F16 activations, fusing the Q/K/V GEMMs and per-document attention dispatches (the batch-1 floor), NPU.
 
 ## 6. Ranked levers (expected wins, from the measurements above)
 
@@ -370,8 +393,7 @@ the same harness, the cosine gate, and a discriminating shape.
 5. (#1405) **Server dynamic batching** for `/v1/embeddings` (collect requests for a few ms, run lever 1 across clients; length-sort so a padded
    path never sees the 60-78 % waste above). Needed for any concurrency scaling; the current gate makes N clients no faster than 1.
 6. (#1406, DONE) **Vulkan hidden-state path for decoder embedders** (Qwen3-Embedding-0.6B: 2.2x/5.6x/8x over the current CPU at 64/256/512 tokens, 29 docs/s at 64 tok),
-   then the **GPU BERT encoder (#741)** reusing the coopmat prefill tiles (110M-class encoders are ~5x fewer FLOPs than the 0.6B
-   decoder, so expect well above 5k tok/s; unmeasured).
+   then the **GPU BERT encoder (#741, DONE for F16 `bert`)**: 12-14x the CPU encoder batched, 5.5x at batch 1 (section 5).
 7. **Correctness/coverage** (#1398 EOS: FIXED; #1401 XLM-R Unigram tokenizer: FIXED; #1399 gemma-embedding, #1400 nomic-bert-moe): Qwen3-Embedding needs `<|endoftext|>` appended before last-token pooling (llama.cpp does it; dotLLM
    mean cosine 0.80); add `gemma-embedding`, `nomic-bert-moe`, and XLM-R (SentencePiece) tokenisation for multilingual-e5/bge-m3.
 8. Small/free: (#1407) p99 spikes on cold single-document F16 calls (876 ms at 16 tokens), content-hash doc cache at the server,

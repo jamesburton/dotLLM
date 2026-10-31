@@ -1,0 +1,16 @@
+{"model":"bge-small-en-v1.5_fp16","device":"vulkan","batch":1,"docs_s":[228.6,234.2],"order":"V C C V"}
+{"model":"bge-small-en-v1.5_fp16","device":"vulkan","batch":16,"docs_s":[608.1,621.6]}
+{"model":"bge-small-en-v1.5_fp16","device":"vulkan","batch":48,"docs_s":[606.3,623.5]}
+{"model":"bge-small-en-v1.5_fp16","device":"cpu","batch":1,"docs_s":[41.1,43.2]}
+{"model":"bge-small-en-v1.5_fp16","device":"cpu","batch":16,"docs_s":[42.0,46.9]}
+{"model":"bge-small-en-v1.5_fp16","device":"cpu","batch":48,"docs_s":[48.9,50.6]}
+{"model":"bge-base-en-v1.5_fp16","device":"vulkan","batch":1,"docs_s":[120.2,122.2],"order":"V C V"}
+{"model":"bge-base-en-v1.5_fp16","device":"vulkan","batch":16,"docs_s":[279.9,284.3]}
+{"model":"bge-base-en-v1.5_fp16","device":"vulkan","batch":48,"docs_s":[278.2,281.1]}
+{"model":"bge-base-en-v1.5_fp16","device":"cpu","batch":1,"docs_s":[21.9,22.2]}
+{"model":"bge-base-en-v1.5_fp16","device":"cpu","batch":16,"docs_s":[20.5,21.0]}
+{"model":"bge-base-en-v1.5_fp16","device":"cpu","batch":48,"docs_s":[21.8,23.1]}
+{"model":"e5-small-v2_fp16","device":"vulkan","batch":1,"docs_s":[230.2,232.4],"pooling":"mean"}
+{"model":"e5-small-v2_fp16","device":"vulkan","batch":48,"docs_s":[614.0,616.7]}
+{"model":"e5-small-v2_fp16","device":"cpu","batch":1,"docs_s":[40.8,41.8]}
+{"model":"e5-small-v2_fp16","device":"cpu","batch":48,"docs_s":[44.9,46.7]}

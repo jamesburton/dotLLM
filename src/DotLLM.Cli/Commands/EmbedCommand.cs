@@ -50,7 +50,7 @@ internal sealed class EmbedCommand : Command<EmbedCommand.Settings>
         public bool NoNormalize { get; set; }
 
         [CommandOption("--device|-d")]
-        [Description("Compute device: 'cpu' (default) or 'vulkan' (decoder embedders such as Qwen3-Embedding; BERT-style encoders are CPU-only, #741). An explicit GPU that cannot be honoured is an error, never a silent CPU run.")]
+        [Description("Compute device: 'cpu' (default) or 'vulkan' (decoder embedders such as Qwen3-Embedding and BERT encoders with F16 weights, #741; nomic-bert / gemma-embedding are CPU-only). An explicit GPU that cannot be honoured is an error, never a silent CPU run.")]
         [DefaultValue("cpu")]
         public string Device { get; set; } = "cpu";
 
@@ -88,13 +88,22 @@ internal sealed class EmbedCommand : Command<EmbedCommand.Settings>
         try
         {
             bool isEncoder = config.Architecture is DotLLM.Core.Configuration.Architecture.Bert or DotLLM.Core.Configuration.Architecture.NomicBert;
-            if (isEncoder && deviceSpec.IsGpu)
+            if (isEncoder && deviceSpec.IsGpu && !(deviceSpec.Kind == DeviceKind.Vulkan && config.Architecture == DotLLM.Core.Configuration.Architecture.Bert))
             {
-                // #741: there is no GPU encoder (bidirectional attention + LayerNorm graph). Loud refusal, never a CPU run.
+                // #741: only architecture 'bert' (F16 weights) has a GPU encoder, and only on Vulkan. Loud refusal, never a CPU run.
                 throw new DeviceUnavailableException(DeviceSelector.ExplicitFailureMessage(
                     s.Device, Path.GetFileName(path), 0,
-                    $"{config.Architecture} encoder embedding models have no GPU backend yet (#741); use --device cpu. Decoder embedders such as Qwen3-Embedding run on vulkan"));
+                    $"{config.Architecture} encoder embedding models have no GPU backend on '{s.Device}' (#741; only 'bert' on vulkan); use --device cpu. Decoder embedders such as Qwen3-Embedding run on vulkan"));
             }
+            if (isEncoder && deviceSpec.IsGpu)
+            {
+                try { model = DotLLM.Vulkan.VulkanBertEncoderModel.LoadFromGguf(DotLLM.Vulkan.VulkanModelLoader.SharedDevice, gguf, config, DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir()); }
+                catch (NotSupportedException ex)
+                {
+                    throw new DeviceUnavailableException(DeviceSelector.ExplicitFailureMessage(s.Device, Path.GetFileName(path), 0, ex.Message));
+                }
+            }
+            else
             if (isEncoder || deviceSpec.Kind == DeviceKind.Cpu)
             {
                 model = ModelLoader.CreateCpuModelFromGguf(gguf, config, threading);

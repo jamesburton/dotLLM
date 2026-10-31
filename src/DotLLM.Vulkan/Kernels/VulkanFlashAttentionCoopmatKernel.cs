@@ -555,9 +555,10 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         nint cmdBuf,
         VulkanDevice.Buffer q, long qOffset, VulkanDevice.Buffer k, VulkanDevice.Buffer v, long kvOffset,
         VulkanDevice.Buffer output, long outOffset,
-        int seqLen, int numHeads, int numKvHeads, int headDim, float scaleOverride = 0.0f)
+        int seqLen, int numHeads, int numKvHeads, int headDim, float scaleOverride = 0.0f,
+        AttentionMaskMode maskMode = AttentionMaskMode.Causal)
         => RecordCore(cmdBuf, q, k, v, output, seqLen, seqLen, numHeads, numKvHeads, headDim, 0, 0, false, 0.0f, scaleOverride,
-            AttentionMaskMode.Causal, 0, qOffset, kvOffset, kvOffset, outOffset);
+            maskMode, 0, qOffset, kvOffset, kvOffset, outOffset);
 
     private unsafe void RecordCore(
         nint cmdBuf,

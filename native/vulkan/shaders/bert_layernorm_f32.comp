@@ -1,0 +1,62 @@
+#version 450
+// BERT post-LN block: out[r, :] = LayerNorm(x[r, :] + bias[:] + res[r, :]) * w + b, one workgroup per row (issue #741).
+//
+// ggml_norm semantics (the CPU BertEncoderModel oracle): biased variance, y = (v - mean) * rsqrt(var + eps) * w + b, with
+// v = (x + bias) + res in that order. Row sums are F32 accumulated in registers / LDS (no stored F32 partials).
+// flags bit0 = add bias, bit1 = add residual (unused bindings must still be bound to any valid buffer).
+// Dispatch: local_size_x = 256, groupCount.x = rows. Any width up to 16 * 256 = 4096 (strided loop).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufX    { float x[]; };     // [rows, n] GEMM output
+layout(set = 0, binding = 1, std430) readonly  buffer BufBias { float bias[]; };  // [n]
+layout(set = 0, binding = 2, std430) readonly  buffer BufRes  { float res[]; };   // [rows, n]
+layout(set = 0, binding = 3, std430) readonly  buffer BufW    { float w[]; };     // [n]
+layout(set = 0, binding = 4, std430) readonly  buffer BufB    { float lb[]; };    // [n]
+layout(set = 0, binding = 5, std430) writeonly buffer BufOut  { float outp[]; };  // [rows, n]
+
+layout(push_constant) uniform PushConstants {
+    uint  n;
+    uint  flags;
+    float eps;
+} pc;
+
+shared float red[256];
+
+float blockSum(float v, uint tid) {
+    red[tid] = v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+float load(uint base, uint i) {
+    float v = x[base + i];
+    if ((pc.flags & 1u) != 0u) v += bias[i];
+    if ((pc.flags & 2u) != 0u) v += res[base + i];
+    return v;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint base = gl_WorkGroupID.x * pc.n;
+
+    float s = 0.0;
+    for (uint i = tid; i < pc.n; i += 256u) s += load(base, i);
+    float mean = blockSum(s, tid) / float(pc.n);
+
+    float q = 0.0;
+    for (uint i = tid; i < pc.n; i += 256u) {
+        float d = load(base, i) - mean;
+        q += d * d;
+    }
+    float inv = 1.0 / sqrt(blockSum(q, tid) / float(pc.n) + pc.eps);
+
+    for (uint i = tid; i < pc.n; i += 256u)
+        outp[base + i] = (load(base, i) - mean) * inv * w[i] + lb[i];
+}
