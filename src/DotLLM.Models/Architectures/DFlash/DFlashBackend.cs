@@ -26,6 +26,26 @@ internal unsafe interface IDFlashTargetOps
     void ProjectForDraft(nint hidden, int rows, float* logits);
 
     /// <summary>
+    /// True when <see cref="ProjectForDraftLimited"/> is implemented (#1360). The draft head then reads only the first
+    /// <c>limit</c> rows of the target's lm-head, in place in their stored quantisation.
+    /// </summary>
+    bool SupportsDraftVocabLimit => false;
+
+    /// <summary>The draft-vocabulary limit used when <c>DOTLLM_DFLASH_DRAFT_VOCAB</c> is unset; 0 = the full head.</summary>
+    int DefaultDraftVocabLimit => 0;
+
+    /// <summary>
+    /// Like <see cref="ProjectForDraft"/> but projects onto token ids <c>[0, limit)</c> only (the head's leading rows; no gather, no
+    /// copy). Logits are laid out <c>[rows, limit]</c>. Proposals only: the target's own verify still uses the full head.
+    /// </summary>
+    /// <param name="hidden">Rows <c>[rows, hidden]</c> in backend memory; may be overwritten.</param>
+    /// <param name="rows">Row count.</param>
+    /// <param name="logits">Host destination <c>[rows, limit]</c>.</param>
+    /// <param name="limit">Number of leading vocabulary rows to read, 1..vocab.</param>
+    void ProjectForDraftLimited(nint hidden, int rows, float* logits, int limit)
+        => throw new NotSupportedException($"{GetType().Name} cannot limit the draft head.");
+
+    /// <summary>
     /// Embeds <paramref name="tokens"/> into HOST rows <c>[tokens, hidden]</c> F32 with the target's <c>token_embd</c>, read in place
     /// from its stored type. The LiLiCorr head (#1237) embeds its candidate tokens on the host.
     /// </summary>

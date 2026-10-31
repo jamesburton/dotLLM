@@ -128,7 +128,17 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IDFlas
     }
 
     /// <inheritdoc/>
+    bool IDFlashTargetOps.SupportsDraftVocabLimit => true;
+
+    /// <inheritdoc/>
     void IDFlashTargetOps.ProjectForDraft(nint hidden, int rows, float* logits)
+        => ProjectDraftRows(hidden, rows, logits, _outputOutputDim);
+
+    /// <inheritdoc/>
+    void IDFlashTargetOps.ProjectForDraftLimited(nint hidden, int rows, float* logits, int limit)
+        => ProjectDraftRows(hidden, rows, logits, Math.Clamp(limit, 1, _outputOutputDim));
+
+    private void ProjectDraftRows(nint hidden, int rows, float* logits, int outRows)
     {
         nint streamH = _stream.Handle;
         _state.EnsureCapacity(rows);
@@ -139,10 +149,10 @@ public sealed unsafe partial class CudaQwen3HybridDenseTransformerModel : IDFlas
             headIn = _state.FfnGate;   // #1222: FFN scratch is dead after the trunk
             headRot.RotateForward(hidden, headIn, rows, _outputInputDim, permuteGdnValueHeads: false, streamH);
         }
-        GemmLmHead(_outputDevice, _outputQt, headIn, _state.Logits, _outputOutputDim, _outputInputDim, rows);
+        GemmLmHead(_outputDevice, _outputQt, headIn, _state.Logits, outRows, _outputInputDim, rows);
         _stream.Synchronize();
         CudaDriverApi.cuMemcpyDtoH_v2((nint)logits, _state.Logits,
-            (nuint)((long)rows * Config.VocabSize * sizeof(float))).ThrowOnError();
+            (nuint)((long)rows * outRows * sizeof(float))).ThrowOnError();
     }
 
     private void DisposeDFlash()

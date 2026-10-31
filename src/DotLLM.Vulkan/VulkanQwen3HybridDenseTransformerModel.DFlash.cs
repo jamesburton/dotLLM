@@ -135,7 +135,23 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IDFlashDraf
     }
 
     /// <inheritdoc/>
+    bool IDFlashTargetOps.SupportsDraftVocabLimit => true;
+
+    /// <summary>
+    /// 65536 leading rows on a 128k+ vocabulary (#1360): measured on Strix Vulkan, every drafted token of five prompts sat below 32768
+    /// and the draft head fell 8 ms -> 2 ms with identical round counts. A token the target wants above the limit just isn't proposed.
+    /// </summary>
+    int IDFlashTargetOps.DefaultDraftVocabLimit => Config.VocabSize >= 131072 ? 65536 : 0;
+
+    /// <inheritdoc/>
     unsafe void IDFlashTargetOps.ProjectForDraft(nint hidden, int rows, float* logits)
+        => ProjectDraftRows(hidden, rows, logits, _weights.OutputOutputDim);
+
+    /// <inheritdoc/>
+    unsafe void IDFlashTargetOps.ProjectForDraftLimited(nint hidden, int rows, float* logits, int limit)
+        => ProjectDraftRows(hidden, rows, logits, Math.Clamp(limit, 1, _weights.OutputOutputDim));
+
+    private unsafe void ProjectDraftRows(nint hidden, int rows, float* logits, int outRows)
     {
         var g = _dflashGpu!;
         int h = Config.HiddenSize, vocab = Config.VocabSize;
@@ -154,9 +170,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IDFlashDraf
             KernelSupport.ComputeToComputeBarrier(cmd);
         }
         RecordMatmul(cmd, _weights.OutputWeight, _weights.OutputDeviceQuantType, headIn, logitsBuf,
-            outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: rows);
+            outputDim: outRows, inputDim: _weights.OutputInputDim, seqLen: rows);
         g.Flush();
-        _device.Download(logitsBuf, new Span<float>(logits, rows * vocab));
+        _device.Download(logitsBuf, new Span<float>(logits, rows * outRows));
     }
 
     private void DisposeDFlash()

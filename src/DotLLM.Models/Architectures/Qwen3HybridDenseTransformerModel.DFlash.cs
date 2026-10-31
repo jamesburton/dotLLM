@@ -64,7 +64,17 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IDFlashDra
     void IDFlashTargetOps.EmbedForDraft(ReadOnlySpan<int> tokens, nint dst) => EmbedTokens(tokens, (float*)dst, Config.HiddenSize);
 
     /// <inheritdoc/>
+    bool IDFlashTargetOps.SupportsDraftVocabLimit => true;
+
+    /// <inheritdoc/>
     void IDFlashTargetOps.ProjectForDraft(nint hiddenRows, int rows, float* logits)
+        => ProjectDraftRows(hiddenRows, rows, logits, _outputOutputDim);
+
+    /// <inheritdoc/>
+    void IDFlashTargetOps.ProjectForDraftLimited(nint hiddenRows, int rows, float* logits, int limit)
+        => ProjectDraftRows(hiddenRows, rows, logits, Math.Clamp(limit, 1, _outputOutputDim));
+
+    private void ProjectDraftRows(nint hiddenRows, int rows, float* logits, int outRows)
     {
         float* hidden = (float*)hiddenRows;
         float* headIn = hidden;
@@ -73,6 +83,6 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IDFlashDra
             headIn = (float*)_dflashHeadScratch;
             headRot.RotateForward(hidden, headIn, rows, _outputInputDim);
         }
-        Gemm(_outputWeight, _outputQuantType, headIn, logits, _outputOutputDim, _outputInputDim, rows);
+        Gemm(_outputWeight, _outputQuantType, headIn, logits, outRows, _outputInputDim, rows);
     }
 }

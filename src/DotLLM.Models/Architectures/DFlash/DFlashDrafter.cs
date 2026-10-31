@@ -383,7 +383,15 @@ internal sealed unsafe class DFlashDrafter : IDisposable
     public int TapRowWidth => TargetLayers.Length * HiddenSize;
 
     /// <summary>Logits of the last <see cref="Draft"/>'s drafted rows, <c>[draft, vocab]</c>.</summary>
-    public ReadOnlySpan<float> LastDraftLogits(int row) => new(_logits + (long)row * _vocab, _vocab);
+    public ReadOnlySpan<float> LastDraftLogits(int row) => new(_logits + (long)row * _headStride, _headStride);
+
+    private int _headStride;   // columns per logits row of the last draft: the vocab, or the draft-vocab limit (#1360)
+
+    /// <summary>Draft-vocabulary limit (#1360): <c>DOTLLM_DFLASH_DRAFT_VOCAB=K</c> reads only token ids [0, K) of the lm-head for proposals; 0 = full; unset = the target's default.</summary>
+    [ThreadStatic] internal static int? DraftVocabLimitOverride;   // tests: set on the constructing thread
+
+    internal int? DraftVocabLimitExplicit { get; set; } = DraftVocabLimitOverride ??
+        (int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_DFLASH_DRAFT_VOCAB"), out int dv) ? dv : null);
 
     // ── Context injection ───────────────────────────────────────────────
 
@@ -511,7 +519,17 @@ internal sealed unsafe class DFlashDrafter : IDisposable
         if (_lilicorr is not null)
             _backend.Download(hid, _hiddenHost, nDraft * h);   // before the head, for the same reason
         long th = System.Diagnostics.Stopwatch.GetTimestamp();
-        target.ProjectForDraft(hid, nDraft, _logits);
+        int vocabLimit = DraftVocabLimitExplicit ?? target.DefaultDraftVocabLimit;
+        if (vocabLimit > 0 && vocabLimit < _vocab && _lilicorr is null && target.SupportsDraftVocabLimit)
+        {
+            target.ProjectForDraftLimited(hid, nDraft, _logits, vocabLimit);
+            _headStride = vocabLimit;
+        }
+        else
+        {
+            target.ProjectForDraft(hid, nDraft, _logits);
+            _headStride = _vocab;
+        }
         long ts = System.Diagnostics.Stopwatch.GetTimestamp();
         _headTicks += ts - th;
 

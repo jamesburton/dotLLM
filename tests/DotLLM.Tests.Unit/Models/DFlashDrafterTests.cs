@@ -457,6 +457,47 @@ public sealed unsafe class DFlashDrafterTests : IDisposable
     public void SpeculativeDecode_WithDFlash_IsTokenIdenticalToGreedy(bool snapshots)
         => AssertTokenIdentical(_dir, Cpu, snapshots, _out);
 
+    /// <summary>
+    /// #1360: a draft-vocabulary limit only restricts which tokens are PROPOSED. The MTP decoder's verify still uses the full head,
+    /// so the emitted sequence stays the plain greedy one, and the drafter never proposes a token id at or above the limit.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void DraftVocabLimit_IsTokenIdenticalToGreedy_AndNeverDraftsAboveLimit(bool snapshots)
+    {
+        const int Limit = 6;
+        DFlashDrafter.DraftVocabLimitOverride = Limit;
+        try
+        {
+            AssertTokenIdentical(_dir, Cpu, snapshots, _out);
+
+            string trunk = SyntheticQwen35HybridDenseMtpGguf.Write(Path.Combine(_dir, "trunk-limit.gguf"), withMtp: false, contextLength: 96);
+            var (bytes, _) = BuildDrafter(0xBEEFu, dflash2: true);
+            string drafterPath = Path.Combine(_dir, "drafter-limit.gguf");
+            File.WriteAllBytes(drafterPath, bytes);
+            using var gguf = GgufFile.Open(trunk);
+            var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            var (model, kv) = Cpu(gguf, config);
+            using var _m = model as IDisposable;
+            using var _k = kv;
+            ((IDFlashDraftAttachable)model).AttachDFlashDrafter(drafterPath);
+            using var mtp = model.CreateMtpState()!;
+            int[] prompt = [1, 5, 3, 7, 2, 9];
+            using (model.Forward(prompt, Enumerable.Range(0, prompt.Length).ToArray(), -1, kv, adapter: null, mtp)) { }
+            var state = (DFlashMtpState)mtp;
+            int position = prompt.Length;
+            int tok = 3;
+            for (int i = 0; i < Block - 1; i++)
+            {
+                tok = state.NextDraft((IDFlashTargetOps)model, tok, position + i, Block - 1);
+                Assert.InRange(tok, 0, Limit - 1);
+                Assert.Equal(Limit, state.DraftLogits(position + i).Length);   // the restricted head ran, not the full one
+            }
+        }
+        finally { DFlashDrafter.DraftVocabLimitOverride = null; }
+    }
+
     /// <summary>The gate on any backend: the greedy reference is the same backend's plain decode.</summary>
     internal static void AssertTokenIdentical(string dir, BackendFactory backend, bool snapshots, ITestOutputHelper output)
     {
