@@ -119,6 +119,9 @@ public sealed class VulkanNemotronHDFlashTests : IDisposable
     /// </summary>
     [SkippableTheory]
     [InlineData(2)]
+    [InlineData(4)]    // #1459: per-n NR table
+    [InlineData(5)]    // #1459: padded to 6 columns
+    [InlineData(7)]    // #1459: padded to 8 columns
     [InlineData(8)]
     [InlineData(13)]
     public void RealNano_SmallBatch_EveryRow_IsBitIdenticalToDecode(int nRows)
