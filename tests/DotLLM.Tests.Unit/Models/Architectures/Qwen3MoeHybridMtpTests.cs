@@ -75,7 +75,7 @@ public sealed class Qwen3MoeHybridMtpTests : IDisposable
     public void AbsorbedKv_EqualsTheKvADraftStepWrites()
     {
         // Batched absorb computes K/V only; a draft step at the same position computes the whole block. Their K/V rows must agree (to GEMM
-        // reduction order: the absorb multiplies 4 columns at once).
+        // reduction order: the absorb multiplies 4 columns at once, and to one F16 ulp because the head stores F16, #1141).
         using var m = new Loaded(Fixture(withMtp: true));
         int vocab = m.Model.Config.VocabSize;
         using var kv = m.Kv();
@@ -92,7 +92,7 @@ public sealed class Qwen3MoeHybridMtpTests : IDisposable
         using ITensor draft = m.Model.ForwardMtp(state2, 7, 3);
         float[] draftK = KeyRow((CpuMtpState)state2, 3);
         for (int i = 0; i < absorbedK.Length; i++)
-            Assert.True(MathF.Abs(absorbedK[i] - draftK[i]) <= 1e-5f, $"K[{i}] absorb {absorbedK[i]} vs draft {draftK[i]}");
+            Assert.True(MathF.Abs(absorbedK[i] - draftK[i]) <= 1e-5f + 1.2e-3f * MathF.Abs(absorbedK[i]), $"K[{i}] absorb {absorbedK[i]} vs draft {draftK[i]}");
         Assert.All(Row(draft, 0, vocab), x => Assert.True(float.IsFinite(x)));
     }
 
@@ -166,7 +166,16 @@ public sealed class Qwen3MoeHybridMtpTests : IDisposable
         return ids.Take(NewTokens + 1).ToList();
     }
 
-    private static unsafe float[] KeyRow(CpuMtpState s, int row) => s.GetKeyRow(row).ToArray();
+    private static unsafe float[] KeyRow(CpuMtpState s, int row)
+    {
+        var bytes = s.GetKeyRowBytes(row);
+        return s.KvFormat switch
+        {
+            CpuMtpKvFormat.F32 => System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(bytes).ToArray(),
+            CpuMtpKvFormat.F16 => System.Runtime.InteropServices.MemoryMarshal.Cast<byte, Half>(bytes).ToArray().Select(h => (float)h).ToArray(),
+            _ => throw new NotSupportedException(),
+        };
+    }
 
     private static unsafe float[] Row(ITensor t, int start, int count) => new ReadOnlySpan<float>((float*)t.DataPointer + start, count).ToArray();
 

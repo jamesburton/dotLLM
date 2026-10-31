@@ -1236,6 +1236,8 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
         float[] concatArr = pool.Rent(s * 2 * hiddenSize);
         float[] curArr = pool.Rent(s * hiddenSize);
         float[] normedArr = pool.Rent(s * hiddenSize);
+        float[] kScratch = pool.Rent(s * kvStride);
+        float[] vScratch = pool.Rent(s * kvStride);
         int[] posArr = ArrayPool<int>.Shared.Rent(s);
         try
         {
@@ -1283,24 +1285,26 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
                 RmsNorm.Execute(cur.Slice(i * hiddenSize, hiddenSize), mtpHead.Layer.AttnNormWeight, eps,
                     normed.Slice(i * hiddenSize, hiddenSize));
 
-            // K/V projections write straight into the head's cache slab [firstPosition, +s): the
-            // cache is one contiguous [maxSteps, kvStride] buffer.
-            float* kDst = state.KeyCachePtr + (long)firstPosition * kvStride;
-            float* vDst = state.ValueCachePtr + (long)firstPosition * kvStride;
-            fixed (float* normedPtr = normed)
+            // K/V projections land in transient F32 scratch (not storage), are normed + rotated there, then are stored into
+            // the head's cache slab [firstPosition, +s) in its format (F16 / q8_0 / q4_0, issue #1141).
+            fixed (float* normedPtr = normed, kDst = kScratch, vDst = vScratch)
             {
                 Gemm(attn.KWeight, attn.KQuantType, normedPtr, kDst, attn.KOutputDim, attn.KInputDim, s);
                 Gemm(attn.VWeight, attn.VQuantType, normedPtr, vDst, attn.VOutputDim, attn.VInputDim, s);
             }
 
-            var kSlab = new Span<float>(kDst, s * kvStride);
+            var kSlab = kScratch.AsSpan(0, s * kvStride);
             Mamba3QkNorm.Execute(kSlab, attn.KNormWeight, eps, s, numKvHeads, headDim);
             _rope.Apply(Span<float>.Empty, kSlab, pos, /* numHeads */ 0, numKvHeads, headDim, RoPEType.NeoX);
+            state.StoreKeyRows(firstPosition, kSlab, s);
+            state.StoreValueRows(firstPosition, vScratch.AsSpan(0, s * kvStride), s);
 
             state.EndAbsorb(firstPosition + s);
         }
         finally
         {
+            pool.Return(kScratch);
+            pool.Return(vScratch);
             pool.Return(embedArr);
             pool.Return(pairArr);
             pool.Return(concatArr);
@@ -1532,6 +1536,14 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
             numKvHeads: _mtpHead.Layer.FullAttn!.NumKvHeads,
             headDim: Config.HeadDim,
             maxSteps: maxSequenceLength);
+    }
+
+    /// <inheritdoc/>
+    public IMtpState? CreateMtpState(int maxSequenceLength, KvCacheDType? trunkKvType)
+    {
+        if (_dflash is not null || _mtpHead is null || CpuMtpState.FromTrunk(trunkKvType) is not { } format)
+            return CreateMtpState(maxSequenceLength);
+        return new CpuMtpState(Config.HiddenSize, _mtpHead.Layer.FullAttn!.NumKvHeads, Config.HeadDim, maxSequenceLength, format);
     }
 
     /// <summary>
@@ -2247,18 +2259,11 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
 
             // Append this step's K/V into the MTP head's own tiny cache and attend causally over
             // everything drafted so far in this round (NOT the trunk's KV-cache).
-            k.CopyTo(state.GetKeyRow(step));
-            v.CopyTo(state.GetValueRow(step));
+            state.StoreKeyRows(step, k, 1);
+            state.StoreValueRows(step, v, 1);
 
             int seqKv = step + 1;
-            Attention.Execute(
-                q,
-                new ReadOnlySpan<float>(state.KeyCachePtr, seqKv * kvStride),
-                new ReadOnlySpan<float>(state.ValueCachePtr, seqKv * kvStride),
-                attnOut,
-                /* seqQ */ 1, seqKv, numHeads, numKvHeads, headDim,
-                /* positionOffset */ step,
-                /* slidingWindowSize */ (int?)null);
+            state.AttendOver(q, attnOut, seqKv, numHeads, /* positionOffset */ step);
 
             // sigmoid(gate) applied to attention output before O-proj (Qwen3.5/3.6 gated attention).
             for (int i = 0; i < qElems; i++)

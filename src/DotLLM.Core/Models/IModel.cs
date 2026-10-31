@@ -553,6 +553,16 @@ public interface IModel : IDisposable
     IMtpState? CreateMtpState(int maxSequenceLength) => CreateMtpState();
 
     /// <summary>
+    /// As <see cref="CreateMtpState(int)"/>, told the trunk KV-cache's quantized element type so the head's own KV follows it
+    /// (issue #1141, port of #1095). <paramref name="trunkKvType"/> is <see langword="null"/> or F32 for an unquantized trunk
+    /// (the head then stores F16, never wider). Models whose head KV format is fixed ignore it.
+    /// </summary>
+    /// <param name="maxSequenceLength">Longest sequence, in positions, the state must hold.</param>
+    /// <param name="trunkKvType">The trunk cache's key element type, or <see langword="null"/> when unknown / unquantized.</param>
+    IMtpState? CreateMtpState(int maxSequenceLength, DotLLM.Core.Configuration.KvCacheDType? trunkKvType)
+        => CreateMtpState(maxSequenceLength);
+
+    /// <summary>
     /// Runs a forward pass and, when <paramref name="mtpState"/> is non-null, feeds the batch to the
     /// MTP head: captures the trunk's post-final-norm hidden state (one row per input position) and
     /// absorbs every token into the head's KV-cache, pairing token <c>x_p</c> with the hidden state

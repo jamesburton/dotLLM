@@ -542,6 +542,15 @@ wire-format fields needed.
   `MtpBenchProfile`-only.
 - **Only `nextn_predict_layers == 1`** is supported, matching llama.cpp's own current QWEN35
   assertion — multi-block MTP is out of scope until a real checkpoint needs it.
+### MTP head KV storage on CPU and Vulkan (issue #1141, port of #1095)
+
+The head's one attention layer no longer stores F32 K/V. CPU: F16 by default, q8_0 / q4_0 when the trunk cache is a quantized one
+(`IModel.CreateMtpState(len, trunkKvType)`; needs `headDim % 32 == 0`), read in place by `Attention.ExecuteContiguousRows` (tiled path shared
+with the paged and quantized caches). Vulkan: F16, written by the trunk's F32-to-F16 convert kernel and read by the `_kvf16` attention twins
+(Vulkan has no quantized trunk cache yet, so no q8_0 head). Pending / carried hidden stays F32 (#1144). Draft precision moves acceptance only; the
+verify step keeps output exact. Reference arms: `DOTLLM_CPU_MTP_KV=f32`, `DOTLLM_VULKAN_MTP_KV=f32`. Bonsai-2 head: 8 KiB to 4 KiB per position (Vulkan);
+Tev1-4B CPU greedy output identical to plain decode. Vulkan head growth in place (#1100 analogue) is still not done: the buffer is allocated at `maxSteps`.
+
 ### Separate `mtp-*.gguf` head for `qwen35` (issue #1185)
 
 `ggml-org/Qwen3.8-27B-GGUF` converts the trunk with `--no-mtp` and ships the head beside it as `mtp-Qwen3.8-27B-{Q4_0,Q8_0,BF16}.gguf`:

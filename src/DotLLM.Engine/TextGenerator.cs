@@ -1795,7 +1795,8 @@ public sealed partial class TextGenerator
     /// sequence position, so it must reach as far as the trunk's (issue #469).
     /// </summary>
     private DotLLM.Core.Models.IMtpState CreateMtpState(Core.Attention.IKvCache kvCache)
-        => _model.CreateMtpState(kvCache.MaxLength)
+        => _model.CreateMtpState(kvCache.MaxLength,
+               kvCache is Core.Attention.IQuantizedKvCache { } quantized ? quantized.KeyDType : null)
            ?? throw new InvalidOperationException(
                $"{_model.GetType().Name}.SupportsMtp is true but CreateMtpState() returned null.");
 

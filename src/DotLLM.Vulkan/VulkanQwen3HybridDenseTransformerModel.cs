@@ -1040,18 +1040,57 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         // The RoPE kernel always rotates a Q operand too; give it one head of the (dead) Q scratch.
         _kernels.RecordRopeNeoX(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
             s, 1, numKvHeads, headDim, _ropeDim, _ropeTheta);
-        KernelSupport.ComputeToTransferBarrier(cmdBuf);
 
-        // ── 5. One slab copy into cache slots [firstPosition, firstPosition + S) ──
-        long kvRowBytes = (long)kvStride * sizeof(float);
-        ulong slab = (ulong)((long)s * kvRowBytes);
-        ulong slabOff = (ulong)((long)firstPosition * kvRowBytes);
-        RecordCopyBufferRange(cmdBuf, _state.K, state.KeyCache, 0, slabOff, slab);
-        RecordCopyBufferRange(cmdBuf, _state.V, state.ValueCache, 0, slabOff, slab);
-        TransferToAllBarrier(cmdBuf);
+        // ── 5. One slab store into cache slots [firstPosition, firstPosition + S), in the head's KV format (#1141) ──
+        RecordMtpKvStore(cmdBuf, state, firstPosition, s, kvStride, endOfSubmit: true);
         _submit.SubmitAndWait();
 
         state.EndAbsorb(firstPosition + s);
+    }
+
+    /// <summary>
+    /// Stores <paramref name="rows"/> F32 K/V rows from the model's scratch (<c>_state.K</c> / <c>_state.V</c>) into the head's cache at
+    /// rows <c>[firstRow, +rows)</c> in the head's storage (issue #1141): a plain copy for the F32 reference arm, else the F32 to F16
+    /// convert kernel the trunk's own F16 cache is written with (so stored rows equal <see cref="Half"/>'s conversion). Includes the
+    /// barriers on both sides; <paramref name="endOfSubmit"/> widens the trailing one to every consumer (absorb ends its submit).
+    /// </summary>
+    private void RecordMtpKvStore(nint cmdBuf, VulkanMtpState state, int firstRow, int rows, int kvStride, bool endOfSubmit)
+    {
+        if (state.Storage == VulkanKvStorage.F32)
+        {
+            KernelSupport.ComputeToTransferBarrier(cmdBuf);
+            ulong rowBytes = (ulong)state.KvRowBytes;
+            RecordCopyBufferRange(cmdBuf, _state.K, state.KeyCache, 0, (ulong)firstRow * rowBytes, (ulong)rows * rowBytes);
+            RecordCopyBufferRange(cmdBuf, _state.V, state.ValueCache, 0, (ulong)firstRow * rowBytes, (ulong)rows * rowBytes);
+            if (endOfSubmit) TransferToAllBarrier(cmdBuf); else KernelSupport.TransferToComputeBarrier(cmdBuf);
+            return;
+        }
+
+        var writer = _kernels.EnsureNarrowKv(VulkanKvStorage.F16, Config.HeadDim).Writer;
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        long first = (long)firstRow * kvStride, count = (long)rows * kvStride;
+        writer.RecordF32ToF16(cmdBuf, _state.K, state.KeyCache, first, count);
+        writer.RecordF32ToF16(cmdBuf, _state.V, state.ValueCache, first, count);
+        if (endOfSubmit) ComputeToAllBarrier(cmdBuf); else KernelSupport.ComputeToComputeBarrier(cmdBuf);
+    }
+
+    /// <summary><c>SHADER_WRITE → SHADER_READ | TRANSFER_READ | HOST_READ</c>: the F16 twin of <see cref="TransferToAllBarrier"/>.</summary>
+    private static unsafe void ComputeToAllBarrier(nint cmdBuf)
+    {
+        var barrier = new VkMemoryBarrier
+        {
+            sType = VkStructureType.MemoryBarrier,
+            srcAccessMask = VkAccessFlags.ShaderWrite,
+            dstAccessMask = VkAccessFlags.ShaderRead | VkAccessFlags.TransferRead | VkAccessFlags.TransferWrite | VkAccessFlags.HostRead,
+        };
+        VulkanApi.vkCmdPipelineBarrier(
+            cmdBuf,
+            srcStageMask: VkPipelineStageFlags.ComputeShader,
+            dstStageMask: VkPipelineStageFlags.ComputeShader | VkPipelineStageFlags.Transfer | VkPipelineStageFlags.Host,
+            dependencyFlags: 0,
+            memoryBarrierCount: 1, pMemoryBarriers: barrier,
+            bufferMemoryBarrierCount: 0, pBufferMemoryBarriers: 0,
+            imageMemoryBarrierCount: 0, pImageMemoryBarriers: 0);
     }
 
     /// <summary>
@@ -2414,7 +2453,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
             hiddenSize: Config.HiddenSize,
             numKvHeads: _mtpHead.Attention.NumKvHeads,
             headDim: Config.HeadDim,
-            maxSteps: maxSequenceLength);
+            maxSteps: maxSequenceLength);   // F16 head KV (the trunk's own default; never F32 unless DOTLLM_VULKAN_MTP_KV=f32, #1141)
     }
 
     /// <summary>
@@ -2640,19 +2679,16 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
 
         _kernels.RecordRopeNeoX(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
             1, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta);
-        KernelSupport.ComputeToTransferBarrier(cmdBuf);
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.AttnRope);
 
-        // Append this step's K/V into the MTP head's own tiny cache, then attend causally over
-        // everything drafted so far in this round — NOT the trunk's KV-cache.
-        long kvRowBytes = (long)kvStride * sizeof(float);
-        ulong kvSlot = (ulong)((long)step * kvRowBytes);
-        RecordCopyBufferRange(cmdBuf, _state.K, state.KeyCache, 0, kvSlot, (ulong)kvRowBytes);
-        RecordCopyBufferRange(cmdBuf, _state.V, state.ValueCache, 0, kvSlot, (ulong)kvRowBytes);
-        KernelSupport.TransferToComputeBarrier(cmdBuf);
+        // Append this step's K/V into the MTP head's own tiny cache (in its F16 / F32-reference format, #1141), then attend
+        // causally over everything drafted so far in this round — NOT the trunk's KV-cache.
+        RecordMtpKvStore(cmdBuf, state, step, 1, kvStride, endOfSubmit: false);
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.AttnKvUpdate);
 
-        _kernels.Attention.Record(cmdBuf, _state.Q, state.KeyCache, state.ValueCache, _state.AttnOutput,
+        var headAttention = state.Storage == VulkanKvStorage.F32
+            ? _kernels.Attention : _kernels.EnsureNarrowKv(VulkanKvStorage.F16, headDim).Attention;
+        headAttention.Record(cmdBuf, _state.Q, state.KeyCache, state.ValueCache, _state.AttnOutput,
             seqQ: 1, seqKv: step + 1,
             numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
             positionOffset: step, slidingWindow: 0);

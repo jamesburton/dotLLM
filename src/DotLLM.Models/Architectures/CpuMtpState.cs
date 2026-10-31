@@ -1,5 +1,8 @@
+using System.Numerics.Tensors;
 using System.Runtime.InteropServices;
+using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
+using DotLLM.Cpu.Kernels;
 
 namespace DotLLM.Models.Architectures;
 
@@ -11,6 +14,13 @@ namespace DotLLM.Models.Architectures;
 /// <c>common_speculative_state_draft_mtp</c> (<c>common/speculative.cpp</c>), translated from a
 /// second <c>llama_context</c> into a plain per-sequence state object.
 /// </summary>
+/// <remarks>
+/// <b>Head KV follows the trunk's KV element type (issue #1141, port of #1095).</b> The head's one attention layer stores K/V as
+/// F16 by default (never wider: rule 1 of #1107), or Q8_0 / Q4_0 when the trunk's KV is quantized, and attends over those rows in
+/// place through the tiled attention path. <see cref="CpuMtpKvFormat.F32"/> survives only as the reference arm
+/// (<c>DOTLLM_CPU_MTP_KV=f32</c>, or the constructor argument in tests). Draft precision moves acceptance only, never the output:
+/// the verify step keeps it exact. The pending / carried hidden rows stay F32 (docs/PRECISION.md: kept pending #1144).
+/// </remarks>
 public sealed unsafe class CpuMtpState : IMtpState, IDisposable
 {
     private readonly int _hiddenSize;
@@ -19,9 +29,11 @@ public sealed unsafe class CpuMtpState : IMtpState, IDisposable
     private int _maxSteps;            // hard ceiling on positions (the trunk KV-cache's MaxLength); raised by a resume (issue #1088)
     private int _capacity;            // rows currently allocated, <= _maxSteps; grows on demand (issue #966)
     private readonly int _kvStride; // numKvHeads * headDim
+    private readonly CpuMtpKvFormat _format;
+    private readonly int _rowBytes;   // bytes of one stored K (or V) row in _format
 
-    private nint _keyCache;   // [capacity, kvStride]
-    private nint _valueCache; // [capacity, kvStride]
+    private nint _keyCache;   // [capacity, _rowBytes] bytes
+    private nint _valueCache; // [capacity, _rowBytes] bytes
     private readonly float[] _pendingHidden; // [hiddenSize] — seed for the next ForwardMtp call
 
     // The trunk's hidden state at the last position absorbed into the MTP KV-cache (issue #469):
@@ -40,6 +52,12 @@ public sealed unsafe class CpuMtpState : IMtpState, IDisposable
     /// Exceeding it throws <see cref="InvalidOperationException"/> before any write.
     /// </summary>
     public int MaxSteps => _maxSteps;
+
+    /// <summary>Element format the head's K/V rows are stored in.</summary>
+    public CpuMtpKvFormat KvFormat => _format;
+
+    /// <summary>Bytes of one stored K (or V) row.</summary>
+    public int RowBytes => _rowBytes;
 
     /// <summary>Positions currently allocated; grows in <see cref="MtpKvCapacity.GrowthStep"/> steps up to <see cref="MaxSteps"/>.</summary>
     public int Capacity => _capacity;
@@ -65,7 +83,8 @@ public sealed unsafe class CpuMtpState : IMtpState, IDisposable
     /// <param name="numKvHeads">KV head count for the MTP block's own attention.</param>
     /// <param name="headDim">Per-head dimension for the MTP block's own attention.</param>
     /// <param name="maxSteps">Maximum autoregressive MTP draft steps to size the KV-cache for (typically the max candidate count K).</param>
-    public CpuMtpState(int hiddenSize, int numKvHeads, int headDim, int maxSteps)
+    /// <param name="format">Storage format of the head's K/V rows; <see langword="null"/> = the default (F16, or the <c>DOTLLM_CPU_MTP_KV</c> override).</param>
+    public CpuMtpState(int hiddenSize, int numKvHeads, int headDim, int maxSteps, CpuMtpKvFormat? format = null)
     {
         if (hiddenSize <= 0) throw new ArgumentOutOfRangeException(nameof(hiddenSize));
         if (numKvHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numKvHeads));
@@ -77,10 +96,12 @@ public sealed unsafe class CpuMtpState : IMtpState, IDisposable
         _headDim = headDim;
         _maxSteps = maxSteps;
         _kvStride = numKvHeads * headDim;
+        _format = ResolveFormat(format, headDim);
+        _rowBytes = RowBytesOf(_format, _kvStride);
 
         // Lazy KV (issue #966): min(ceiling, 1024) positions now, grown as positions are reached.
         _capacity = MtpKvCapacity.Initial(maxSteps);
-        long kvBytes = (long)_capacity * _kvStride * sizeof(float);
+        long kvBytes = (long)_capacity * _rowBytes;
         _keyCache = (nint)NativeMemory.AlignedAlloc((nuint)kvBytes, 64);
         _valueCache = (nint)NativeMemory.AlignedAlloc((nuint)kvBytes, 64);
         NativeMemory.Clear((void*)_keyCache, (nuint)kvBytes);
@@ -98,8 +119,8 @@ public sealed unsafe class CpuMtpState : IMtpState, IDisposable
 
     /// <summary>
     /// Makes the buffers cover at least <paramref name="positions"/> rows (issue #966), preserving the
-    /// committed rows <c>[0, CurrentLength)</c>. Pointers from <see cref="KeyCachePtr"/> /
-    /// <see cref="ValueCachePtr"/> / the row getters are invalidated by a grow: re-fetch after calling.
+    /// committed rows <c>[0, CurrentLength)</c>. Row views from <see cref="GetKeyRowBytes"/> /
+    /// <see cref="GetValueRowBytes"/> are invalidated by a grow: re-fetch after calling.
     /// Throws <see cref="InvalidOperationException"/> above <see cref="MaxSteps"/>.
     /// </summary>
     internal void EnsureCapacity(int positions)
@@ -109,8 +130,8 @@ public sealed unsafe class CpuMtpState : IMtpState, IDisposable
         if (target == _capacity)
             return;
 
-        long newBytes = (long)target * _kvStride * sizeof(float);
-        long keepBytes = (long)Math.Min(_currentLength, _capacity) * _kvStride * sizeof(float);
+        long newBytes = (long)target * _rowBytes;
+        long keepBytes = (long)Math.Min(_currentLength, _capacity) * _rowBytes;
         nint newKey = (nint)NativeMemory.AlignedAlloc((nuint)newBytes, 64);
         nint newValue;
         try { newValue = (nint)NativeMemory.AlignedAlloc((nuint)newBytes, 64); }
@@ -136,32 +157,116 @@ public sealed unsafe class CpuMtpState : IMtpState, IDisposable
     internal void SetPendingFromCapturedRow(int row)
         => _capturedRows.AsSpan(row * _hiddenSize, _hiddenSize).CopyTo(_pendingHidden);
 
-    /// <summary>Key-cache row for MTP step <paramref name="step"/> (0-based), shape <c>[kvStride]</c>.</summary>
-    internal Span<float> GetKeyRow(int step)
+    /// <summary>Environment variable selecting the head KV format: <c>f16</c> (default), <c>q8_0</c>, <c>q4_0</c> or <c>f32</c> (reference arm only).</summary>
+    public const string KvEnvVar = "DOTLLM_CPU_MTP_KV";
+
+    /// <summary>
+    /// Resolves the storage format: an explicit request wins, then <see cref="KvEnvVar"/>, then F16. Quantized formats need
+    /// <c>headDim % 32 == 0</c> (each head on whole blocks) and fall back to F16 otherwise.
+    /// </summary>
+    public static CpuMtpKvFormat ResolveFormat(CpuMtpKvFormat? requested, int headDim)
     {
-        ThrowIfDisposed();
-        if ((uint)step >= (uint)_capacity) throw new ArgumentOutOfRangeException(nameof(step));
-        return new Span<float>((float*)_keyCache + (long)step * _kvStride, _kvStride);
+        CpuMtpKvFormat f = requested ?? Environment.GetEnvironmentVariable(KvEnvVar)?.Trim().ToLowerInvariant() switch
+        {
+            "f32" => CpuMtpKvFormat.F32,
+            "q8_0" or "q8" => CpuMtpKvFormat.Q8_0,
+            "q4_0" or "q4" => CpuMtpKvFormat.Q4_0,
+            _ => CpuMtpKvFormat.F16,
+        };
+        if (f is CpuMtpKvFormat.Q8_0 or CpuMtpKvFormat.Q4_0 && headDim % KvQuantize.BlockSize != 0)
+            return CpuMtpKvFormat.F16;
+        return f;
     }
 
-    /// <summary>Value-cache row for MTP step <paramref name="step"/> (0-based), shape <c>[kvStride]</c>.</summary>
-    internal Span<float> GetValueRow(int step)
+    /// <summary>Maps a trunk KV element type to the head's format (the head follows the trunk; an unquantized trunk gives the default F16).</summary>
+    public static CpuMtpKvFormat? FromTrunk(KvCacheDType? trunk) => trunk switch
+    {
+        KvCacheDType.Q8_0 => CpuMtpKvFormat.Q8_0,
+        KvCacheDType.Q4_0 => CpuMtpKvFormat.Q4_0,
+        _ => null,
+    };
+
+    private static int RowBytesOf(CpuMtpKvFormat f, int stride) => f switch
+    {
+        CpuMtpKvFormat.F32 => stride * sizeof(float),
+        CpuMtpKvFormat.F16 => stride * 2,
+        CpuMtpKvFormat.Q8_0 => KvQuantize.QuantizedRowBytes(stride, KvCacheDType.Q8_0),
+        _ => KvQuantize.QuantizedRowBytes(stride, KvCacheDType.Q4_0),
+    };
+
+    /// <summary>Raw bytes of stored key row <paramref name="step"/>.</summary>
+    internal Span<byte> GetKeyRowBytes(int step)
     {
         ThrowIfDisposed();
         if ((uint)step >= (uint)_capacity) throw new ArgumentOutOfRangeException(nameof(step));
-        return new Span<float>((float*)_valueCache + (long)step * _kvStride, _kvStride);
+        return new Span<byte>((byte*)_keyCache + (long)step * _rowBytes, _rowBytes);
+    }
+
+    /// <summary>Raw bytes of stored value row <paramref name="step"/>.</summary>
+    internal Span<byte> GetValueRowBytes(int step)
+    {
+        ThrowIfDisposed();
+        if ((uint)step >= (uint)_capacity) throw new ArgumentOutOfRangeException(nameof(step));
+        return new Span<byte>((byte*)_valueCache + (long)step * _rowBytes, _rowBytes);
     }
 
     /// <summary>
-    /// Base pointer to the full key-cache buffer, shape <c>[maxSteps, kvStride]</c> row-major.
-    /// Used to build a multi-row <c>ReadOnlySpan&lt;float&gt;</c> covering <c>[0, seqKv)</c> steps
-    /// for the attention kernel (a single MTP decode step attends over every step drafted so far
-    /// in the current round, not just the newest one).
+    /// Stores <paramref name="count"/> F32 key rows (<c>[count, kvStride]</c>, already normed and rotated) at positions
+    /// <c>[firstPosition, +count)</c>, converting to the head's format. Does not move the length.
     /// </summary>
-    internal float* KeyCachePtr => (float*)_keyCache;
+    internal void StoreKeyRows(int firstPosition, ReadOnlySpan<float> rows, int count)
+        => StoreRows((byte*)_keyCache, firstPosition, rows, count);
 
-    /// <summary>Base pointer to the full value-cache buffer — see <see cref="KeyCachePtr"/>.</summary>
-    internal float* ValueCachePtr => (float*)_valueCache;
+    /// <summary>Value-side twin of <see cref="StoreKeyRows"/>.</summary>
+    internal void StoreValueRows(int firstPosition, ReadOnlySpan<float> rows, int count)
+        => StoreRows((byte*)_valueCache, firstPosition, rows, count);
+
+    private void StoreRows(byte* basePtr, int firstPosition, ReadOnlySpan<float> rows, int count)
+    {
+        ThrowIfDisposed();
+        if (firstPosition < 0 || count < 0 || (long)firstPosition + count > _capacity)
+            throw new ArgumentOutOfRangeException(nameof(count));
+        if (rows.Length < count * _kvStride)
+            throw new ArgumentException("rows is shorter than count * kvStride.", nameof(rows));
+        fixed (float* src = rows)
+        {
+            for (int r = 0; r < count; r++)
+            {
+                float* s = src + (long)r * _kvStride;
+                byte* d = basePtr + (long)(firstPosition + r) * _rowBytes;
+                switch (_format)
+                {
+                    case CpuMtpKvFormat.F32: Buffer.MemoryCopy(s, d, _rowBytes, _rowBytes); break;
+                    case CpuMtpKvFormat.F16:
+                        TensorPrimitives.ConvertToHalf(new ReadOnlySpan<float>(s, _kvStride), new Span<Half>(d, _kvStride));
+                        break;
+                    case CpuMtpKvFormat.Q8_0: KvQuantize.F32ToQ8_0(s, d, _kvStride); break;
+                    default: KvQuantize.F32ToQ4_0(s, d, _kvStride); break;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Single-token (<c>seqQ = 1</c>) causal attention of <paramref name="q"/> over the head's rows <c>[0, seqKv)</c>, read in
+    /// place in the stored format. The F32 reference arm runs the original contiguous-span kernel (the true pre-#1141 baseline).
+    /// </summary>
+    internal void AttendOver(ReadOnlySpan<float> q, Span<float> output, int seqKv, int numHeads, int positionOffset)
+    {
+        ThrowIfDisposed();
+        if (_format == CpuMtpKvFormat.F32)
+        {
+            Attention.Execute(q, new ReadOnlySpan<float>((float*)_keyCache, seqKv * _kvStride),
+                new ReadOnlySpan<float>((float*)_valueCache, seqKv * _kvStride), output,
+                1, seqKv, numHeads, _numKvHeads, _headDim, positionOffset, (int?)null);
+            return;
+        }
+        var fmt = _format == CpuMtpKvFormat.F16 ? Attention.KvRowFormat.F16
+            : _format == CpuMtpKvFormat.Q8_0 ? Attention.KvRowFormat.Q8_0 : Attention.KvRowFormat.Q4_0;
+        fixed (float* qp = q, op = output)
+            Attention.ExecuteContiguousRows(qp, (byte*)_keyCache, (byte*)_valueCache, fmt, _rowBytes, op,
+                1, seqKv, numHeads, _numKvHeads, _headDim, positionOffset, pool: null);
+    }
 
     /// <summary>Advances the MTP KV-cache length by one step after a successful <c>ForwardMtp</c> call.</summary>
     internal void Advance()
@@ -279,7 +384,10 @@ public sealed unsafe class CpuMtpState : IMtpState, IDisposable
     }
 
     /// <summary>Total bytes allocated for this state's own KV-cache (excludes the small managed captured-rows buffer).</summary>
-    public long AllocatedBytes => 2L * _capacity * _kvStride * sizeof(float);
+    public long AllocatedBytes => 2L * _capacity * _rowBytes;
+
+    /// <summary>Stored KV bytes per position (K + V).</summary>
+    public int KvBytesPerPosition => 2 * _rowBytes;
 
     private void ThrowIfDisposed()
     {
@@ -303,4 +411,17 @@ public sealed unsafe class CpuMtpState : IMtpState, IDisposable
         if (_keyCache != 0) NativeMemory.AlignedFree((void*)_keyCache);
         if (_valueCache != 0) NativeMemory.AlignedFree((void*)_valueCache);
     }
+}
+
+/// <summary>Element format of the CPU MTP head's stored K/V rows (issue #1141).</summary>
+public enum CpuMtpKvFormat
+{
+    /// <summary>F16 (the default: the widest the head stores).</summary>
+    F16,
+    /// <summary>Q8_0 blocks (follows a q8_0 trunk).</summary>
+    Q8_0,
+    /// <summary>Q4_0 blocks (follows a q4_0 trunk).</summary>
+    Q4_0,
+    /// <summary>F32: reference / A-B arm only (rule 1 of #1107).</summary>
+    F32,
 }

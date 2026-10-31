@@ -86,7 +86,7 @@ public sealed class Qwen3HybridDenseMtpBatchedAbsorbTests : IDisposable
             var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
             using var model = (Qwen3HybridDenseTransformerModel)ModelLoader.CreateCpuModelFromGguf(gguf, config);
             using var kv = new SimpleKvCache(model.AttentionLayerCount, config.NumKvHeads, config.HeadDim, config.MaxSequenceLength);
-            using var state = (CpuMtpState)model.CreateMtpState()!;
+            using var state = NewF32State(config);
 
             using (ITensor _ = model.Forward([1, 2, 3], [0, 1, 2], deviceId: -1, kv, adapter: null, state)) { }
             using (ITensor _ = model.Forward([4, 5, 6, 7], [3, 4, 5, 6], deviceId: -1, kv, adapter: null, state)) { }
@@ -110,7 +110,7 @@ public sealed class Qwen3HybridDenseMtpBatchedAbsorbTests : IDisposable
             var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
             using var model = (Qwen3HybridDenseTransformerModel)ModelLoader.CreateCpuModelFromGguf(gguf, config);
             using var kv = new SimpleKvCache(model.AttentionLayerCount, config.NumKvHeads, config.HeadDim, config.MaxSequenceLength);
-            using var state = (CpuMtpState)model.CreateMtpState()!;
+            using var state = NewF32State(config);
 
             using (ITensor _ = model.Forward([1, 2, 3], [0, 1, 2], deviceId: -1, kv, adapter: null, state)) { }
             // Draft three speculative slots 3..5 — the verify batch below starts at 3 again.
@@ -127,11 +127,23 @@ public sealed class Qwen3HybridDenseMtpBatchedAbsorbTests : IDisposable
         }
     }
 
+    /// <summary>F32 reference-format state: per-token and batched absorbs are compared at float tolerance, not at F16 rounding granularity.</summary>
+    private static int KvHeadsOf(DotLLM.Core.Models.ModelConfig config) => config.NumKvHeads;
+
+    private static CpuMtpState NewF32State(DotLLM.Core.Models.ModelConfig config)
+        => new(config.HiddenSize, KvHeadsOf(config), config.HeadDim, config.MaxSequenceLength, CpuMtpKvFormat.F32);
+
     private static unsafe Snapshot Capture(CpuMtpState state, int hiddenSize)
     {
-        int n = state.CurrentLength * (SyntheticQwen35HybridDenseMtpGguf.NumKvHeads * SyntheticQwen35HybridDenseMtpGguf.HeadDim);
-        var keys = new ReadOnlySpan<float>(state.KeyCachePtr, n).ToArray();
-        var values = new ReadOnlySpan<float>(state.ValueCachePtr, n).ToArray();
+        int stride = state.RowBytes / sizeof(float);   // F32 reference arm
+        int n = state.CurrentLength * stride;
+        var keys = new float[n];
+        var values = new float[n];
+        for (int p = 0; p < state.CurrentLength; p++)
+        {
+            System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(state.GetKeyRowBytes(p)).CopyTo(keys.AsSpan(p * stride));
+            System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(state.GetValueRowBytes(p)).CopyTo(values.AsSpan(p * stride));
+        }
         Assert.Equal(hiddenSize, state.PendingHidden.Length);
         return new Snapshot(state.CurrentLength, keys, values, state.PendingHidden.ToArray(), []);
     }
