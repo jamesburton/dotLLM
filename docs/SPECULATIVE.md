@@ -611,6 +611,30 @@ run-to-run drift (about 3%). End to end K=4 MTP (4 prompts, 128 greedy tokens, A
 (+17..21%); K=3 is a 4-row verify and unchanged (-1.5..+1.4%). Greedy MTP == plain on 12/12 (4 prompts x K=2..4). The Q4_K projections are still not at
 the bandwidth floor at 2..4 columns (150-160 GB/s vs 203-212 at n=1); that, not the cliff, is what remains.
 
+**Re-measure vs llama.cpp after #1510 (issue #1220, dev `e4a66e0f`).** Strix Halo 8060S Vulkan, Qwen3.8-27B Q4_K_M + `mtp-Qwen3.8-27B-Q8_0.gguf` /
+DFlash2 Q4_K_M, the same 4 prompts x 128 greedy tokens, `DOTLLM_MTP_ADAPTIVE=0`, one process per run, llama.cpp `0ae0e1976` Vulkan `llama-server`
+(`cache_prompt=false`, top_k 1). 3 reps; each (prompt, arm) is a dotLLM/llama.cpp pair, order dotLLM-first in reps 1 and 3 and llama.cpp-first in rep 2.
+GPU lock and `cpu-bench` held, ollama idle. Mean of the 4 prompts' tok/s (median-free, range = min..max over the 3 reps of that mean):
+
+| arm | dotLLM tok/s | llama.cpp tok/s | dotLLM / llama.cpp (per-rep) | peak private / GPU shared MiB dotLLM | llama.cpp |
+|---|---|---|---|---|---|
+| plain | 10.44 (10.26-10.64) | 10.73 (10.71-10.78) | 0.97 (0.96-0.99) | 19,208 / 18,543 | 19,498 / 18,636 |
+| MTP K=2 | 21.01 (20.17-21.47) | 22.37 (22.04-22.61) | 0.94 (0.92-0.95) | 19,681 / 19,008 | 23,843 / 22,154 |
+| MTP K=3 | 25.03 (24.13-25.73) | 24.66 (24.35-24.92) | 1.02 (0.98-1.04) | 19,697 / 19,010 | 23,991 / 22,301 |
+| MTP K=4 | 27.65 (27.58-27.72) | 24.32 (24.28-24.37) | **1.14** (1.13-1.14) | 19,691 / 19,013 | 24,281 / 22,465 |
+| DFlash2 K=3 | 27.55 (27.27-27.74) | 28.91 (28.56-29.10) | 0.95 (0.94-0.97) | 20,371 / 19,675 | 22,336 / 21,036 |
+
+Against the pre-#1510 re-measure (K=4 0.93, K=3 1.00, K=2 0.96, DFlash K=3 0.94, plain 0.97): K=4 went 22.79 -> 27.65 tok/s (+21%) and now beats
+llama.cpp on all 4 prompts (1.04-1.30x per prompt; prompt 1, the non-degenerate one, is 19.4 vs 14.9). K=3 is unchanged within noise. K=2 and DFlash K=3
+still trail llama.cpp by about 5%. The remaining ~3% on plain decode is the 1-row kernel, not the verify path. Greedy text (first 300 chars) of every
+dotLLM MTP/DFlash run equals dotLLM plain on 16/16 (prompts x arms) in all 3 reps. Caveats: rep 1 has cold-start noise on the first runs of a prompt (e.g. K=3 prompt 0
+23.2 vs 27.0-27.5 in the later reps), which is why rep 1 reads lowest for dotLLM; prompts 0 and 2 degenerate into repetition on the raw prompt so acceptance
+is ~0.95+ there for both engines; llama.cpp's own text differs from dotLLM plain on some prompts.
+
+**Is #1511 the next lever?** Yes, but for K=2/K=3 and DFlash rather than K=4. Those arms verify 3, 4 and 4 rows, in the 2..4 column range where the Q4_K GEMV
+reads 150-160 GB/s against about 205 GB/s at one column, and they are the arms still at or below llama.cpp. Reaching ~190 GB/s would cut the Q4_K share of a
+3-4 row verify by about a fifth; it cannot lift K=4 much further for the same reason. No code change here (measurement only).
+
 **Verify and decode on the same kernels (issue #1220).** The 4-row verify cost 150 ms against a 105 ms decode, and every verify column only
 matched decode by luck: the multi-column GEMVs reduced with `subgroupAdd`, whose order changes with the subgroup width a driver picks for
 each pipeline. Intel picks SIMD8/16/32 by register pressure, so the multi kernels differed from decode at NR = 4 on Arc. The row-split GDN
