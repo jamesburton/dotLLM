@@ -107,16 +107,47 @@ public class VulkanDenseGemvRowsTests
     [InlineData(21, 512, 4, 4)]
     [InlineData(18, 5120, 4, 12)]
     [InlineData(18, 2560, 3, 16)]
-    public void Q4KRows_MatchLaneOrderFmaOracleExactly(int m, int k, int rowsPerWorkgroup, int n)
+    public void Q4KRows_MatchLaneOrderFmaOracleExactly(int m, int k, int rowsPerWorkgroup, int n) => RunKQuantLaneOrderOracle(QuantizationType.Q4_K, m, k, rowsPerWorkgroup, n);
+
+    /// <summary>
+    /// #1515: the Q5_K multi-column shader (same structure as Q4_K plus the qh 5th bit) must equal the same CPU replay: a row's bits do not
+    /// depend on NR or the column count. The old subgroupAdd shader did not have that property.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(37, 768, 1, 2)]
+    [InlineData(37, 768, 4, 3)]
+    [InlineData(21, 1280, 4, 5)]
+    [InlineData(21, 256, 3, 2)]
+    [InlineData(21, 512, 4, 4)]
+    [InlineData(18, 5120, 4, 12)]
+    [InlineData(18, 2560, 3, 16)]
+    [InlineData(1003, 5120, 2, 7)]
+    public void Q5KRows_MatchLaneOrderFmaOracleExactly(int m, int k, int rowsPerWorkgroup, int n) => RunKQuantLaneOrderOracle(QuantizationType.Q5_K, m, k, rowsPerWorkgroup, n);
+
+    private static void RunKQuantLaneOrderOracle(QuantizationType type, int m, int k, int rowsPerWorkgroup, int n)
     {
+        bool q5 = type == QuantizationType.Q5_K;
+        var format = q5 ? QuantGemvMultiFormat.Q5_K : QuantGemvMultiFormat.Q4_K;
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
         var rng = new Random(0x1511 + m * 7 + k * 11 + n * 13);
         float[] w = F16Bf16Fixture.RandomFloats(rng, m * k, 0.1f);
         float[] x = F16Bf16Fixture.RandomFloats(rng, n * k, 1.0f);
-        byte[] wq = Quantize.FromFloat32(w, (long)m * k, QuantizationType.Q4_K);
-        using var rows = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q4_K, rowsPerWorkgroup, rowsPerWorkgroup, rowsPerWorkgroup)
-                         ?? throw new Xunit.Sdk.XunitException("matmul_q4_k_gemv_f32_multi.spv unavailable");
+        byte[] wq;
+        if (q5)
+        {
+            // No Q5_K quantiser: random super-blocks with finite fp16 d / dmin (every bit pattern of qs / qh / scales is a valid code).
+            wq = new byte[(long)m * (k / 256) * 176];
+            rng.NextBytes(wq);
+            for (int b = 0; b < m * (k / 256); b++)
+            {
+                BitConverter.TryWriteBytes(wq.AsSpan(b * 176, 2), (Half)(0.002f + 0.004f * (float)rng.NextDouble()));
+                BitConverter.TryWriteBytes(wq.AsSpan(b * 176 + 2, 2), (Half)(0.002f + 0.004f * (float)rng.NextDouble()));
+            }
+        }
+        else wq = Quantize.FromFloat32(w, (long)m * k, type);
+        using var rows = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, format, rowsPerWorkgroup, rowsPerWorkgroup, rowsPerWorkgroup)
+                         ?? throw new Xunit.Sdk.XunitException($"{format} multi shader unavailable");
         using var bw = device.Allocate(((long)wq.Length + 3) & ~3L);
         using var bx = device.Allocate((long)n * k * 4);
         using var by = device.Allocate((long)n * m * 4);
@@ -125,7 +156,7 @@ public class VulkanDenseGemvRowsTests
         using (var ctx = device.CreateSubmitContext())
         {
             ctx.Begin();
-            if (n == 1) rows.Record(ctx.CommandBuffer, bw, bx, by, m, k, 1); else rows.Record(ctx.CommandBuffer, bw, bx, by, m, k, n);
+            rows.Record(ctx.CommandBuffer, bw, bx, by, m, k, n);
             ctx.SubmitAndWait();
         }
         float[] actual = new float[n * m];
@@ -134,13 +165,14 @@ public class VulkanDenseGemvRowsTests
         for (int c = 0; c < n; c++)
             for (int r = 0; r < m; r++)
             {
-                float expected = Q4KLaneOrderDot(wq, r, nb, x.AsSpan(c * k, k));
+                float expected = KQuantLaneOrderDot(wq, q5, r, nb, x.AsSpan(c * k, k));
                 Assert.Equal(BitConverter.SingleToInt32Bits(expected), BitConverter.SingleToInt32Bits(actual[c * m + r]));
             }
     }
 
-    private static float Q4KLaneOrderDot(byte[] wq, int row, int nb, ReadOnlySpan<float> x)
+    private static float KQuantLaneOrderDot(byte[] wq, bool q5, int row, int nb, ReadOnlySpan<float> x)
     {
+        int blockBytes = q5 ? 176 : 144, qsOff = q5 ? 48 : 16;
         Span<float> partial = stackalloc float[64];
         for (int lane = 0; lane < 64; lane++)
         {
@@ -148,7 +180,7 @@ public class VulkanDenseGemvRowsTests
             float acc = 0f;
             for (int blk = lane >> 5; blk < nb; blk += 2)
             {
-                int o = (row * nb + blk) * 144;
+                int o = (row * nb + blk) * blockBytes;
                 float d = (float)BitConverter.ToHalf(wq, o), dmin = (float)BitConverter.ToHalf(wq, o + 2);
                 int sc, mn;
                 if (sb < 4) { sc = wq[o + 4 + sb] & 63; mn = wq[o + 4 + sb + 4] & 63; }
@@ -161,7 +193,8 @@ public class VulkanDenseGemvRowsTests
                 float scale = d * sc, min = dmin * mn;
                 for (int e = 0; e < 8; e++)
                 {
-                    int code = (wq[o + 16 + (sb >> 1) * 32 + 8 * q + e] >> shift) & 0xF;
+                    int code = (wq[o + qsOff + (sb >> 1) * 32 + 8 * q + e] >> shift) & 0xF;
+                    if (q5) code |= ((wq[o + 16 + 8 * q + e] >> sb) & 1) << 4;
                     float wv = MathF.FusedMultiplyAdd(scale, code, -min);
                     acc = MathF.FusedMultiplyAdd(wv, x[blk * 256 + sb * 32 + 8 * q + e], acc);
                 }
