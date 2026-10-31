@@ -249,3 +249,36 @@ On prefill (> 1 token) `gr.down` is the Q8_0 coopmat GEMM reading F32 activation
 (~205 GB/s). At 96 calls per 1024-row chunk that is ~42 ms of a ~2300 ms chunk, **~1.8% of wall, already at the roofline**; a vec4 / subgroup-reduction rewrite or a fusion with the norm cannot beat the bytes it must
 move (the F32 read of the residual stream and the F32 write of `_xn` stay unless the GEMM B-load absorbs the norm, which needs the per-row sum of squares first). The 8-19% `gr.grouprms` timestamp share is therefore
 inter-submit host gap attributed to the first stage after each submit, not kernel time. No code change; #1357 closed as refuted.
+
+## 10. Lever 2 follow-up: the cm gather kernel itself (#1489) - 2.4x faster kernel, +5..17% prefill
+
+The profile (section 8) named BC=64 tiles, all-four-subgroup QK^T and fewer barriers. Measured on a kernel-only microbench (`Qwen4ExpRowProbe qsabench`: released geometry 24 heads / 2 KV heads, hd 256, 64-key
+blocks, budget 8, 1024 queries after 3072 tokens, 1 split, 20 back-to-back dispatches per sample, 6 samples, alternating order, first round discarded as clock ramp; GPU lock + `cpu-bench` held), those were NOT the levers.
+Every variant below is the same source with macros; all are within worst relL2 2.6e-4 of the scalar gather.
+
+| variant (ms per dispatch, median of 6, range) | ms |
+|---|---|
+| shipped #1442 kernel (BC=32, unpadded, one-thread-per-row softmax) | 8.14-8.89 |
+| BC=32 + vec4 staging only (pad 0, serial softmax) | 6.90 |
+| BC=32 + vec4 + 16-lane softmax (pad 0) | 6.24 |
+| BC=32 + vec4 + pad 8 halves (serial softmax) | 3.97 |
+| **BC=32 + vec4 + pad 8 + 16-lane softmax (shipped)** | **3.30-3.37** (range 3.27-3.43) |
+| BC=64 + pad 8 + 16-lane softmax (QK^T on all 4 subgroups) | 5.06 |
+| BC=64, pad 0 | 8.11 |
+| BC=16, pad 8 | 3.87 |
+| BC=32, pad 16 | 3.50 |
+| BC=32, pad 4 | broken (NaN: 17-vec4 stride breaks the 16-byte coopmat load alignment) |
+
+2x2 on {pad 8, 16-lane softmax} at BC=32: neither 6.90, softmax only 6.24, pad only 3.97, both 3.35. **The dominant cost was LDS bank conflicts**: the K/V tile stride was 128 B and the Q tile stride 512 B,
+so every coopmat load hit one bank group; an 8-half (16 B) row pad nearly halves the kernel. The serial softmax (12 threads, 32 serial exps over 256 threads) is the second lever (-15%). BC=64 is *worse* (5.06 vs 3.35):
+its LDS (+8 KB for the tile, +2 KB S/P) cuts workgroup residency while the per-key barrier count it saves was not the limit. Spreading QK^T over four subgroups therefore does not pay at this LDS budget.
+Scalar-gather reference on the same bench: 13.0 ms (so the cm kernel is now 3.9x the scalar one, was 1.6x). 8K history: 8.96 -> 4.03 ms; 3 KV splits: 9.53 -> 4.55 ms.
+
+Shipped: `qsa_attention_cm_f16kv.comp` (same bindings/push constants/partial layout; vec4 f16 LDS tiles with a 16 B row pad, K/V gathered as `uvec2`, softmax as 16 lanes per head row with subgroup xor-shuffles,
+softmax row state in registers; needs subgroup size >= 16). Not tried (next): lazy-rescale persistent O accumulators in coopmat registers (removes the oStage round trip and 8 of ~20 barriers per tile) and register-prefetch
+double buffering of the K/V tile.
+
+*End to end* (`pf`, median of 3 reps per call, same process, old kernel vs new alternating; absolute tok/s drifts ~10% with other activity on the box, so read the pairs): 4K old 402.4 / 412.2 vs new 441.5 / 444.8 (x1.08-1.10);
+8K old 404.5 / 410.9 vs new 447.7 / 412.9 (x1.00-1.11, one new call hit the same slow phase as the old); 2K after 8K history old 343.5 vs new 401.6 (x1.17, one pair).
+*Parity* (wikitext, 6000 tokens, 1024-row chunks, last-row logits, new vs old cm kernel): meanKL 2.2e-3, maxKL 8.7e-3, max|dlogit| 0.90, top-1 6/6 - below the 2.4e-2 summation-order floor of section 8.
+(A `qsasplits 2` control is vacuous at 1024-row chunks: the host already uses 1 split there, KL reads exactly 0.) Unit test `VulkanQwen4ExpQsaCoopmatGatherTests` (6 shapes vs the scalar gather): pass; `VulkanQwen4ExpQsa*`: 23 passed.
