@@ -182,6 +182,8 @@ public sealed class SamplerPipeline
         var processors = options.LogitProcessors is not null
             ? options.LogitProcessors.ToArray()
             : BuildProcessors(options, tokenizer);
+        if (tokenizer is not null && (options.IgnoreEos || options.MinTokens > 0))
+            processors = [new EosSuppressionProcessor(tokenizer, options.IgnoreEos, options.MinTokens), .. processors]; // #1345
         return options.ThinkingBudget is { } budget && tokenizer is not null
             ? [new ThinkingBudgetProcessor(budget, tokenizer), .. processors]
             : processors;

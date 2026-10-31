@@ -82,6 +82,15 @@ public record InferenceOptions
     /// </summary>
     public ThinkingBudget? ThinkingBudget { get; init; }
 
+    /// <summary>
+    /// Never sample an end-of-generation token (llama.cpp <c>ignore_eos</c>, #1345): their logits are masked to -infinity, so
+    /// generation runs to <c>MaxTokens</c> or an explicit stop string. Needs the sampler pipeline to have a tokenizer.
+    /// </summary>
+    public bool IgnoreEos { get; init; }
+
+    /// <summary>Mask end-of-generation tokens until this many tokens are generated (<c>min_tokens</c>, #1345). 0 = off.</summary>
+    public int MinTokens { get; init; }
+
     /// <summary>Random seed for reproducible sampling. Null = non-deterministic.</summary>
     public int? Seed { get; init; }
 

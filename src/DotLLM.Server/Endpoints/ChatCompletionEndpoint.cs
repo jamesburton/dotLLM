@@ -259,6 +259,8 @@ public static class ChatCompletionEndpoint
             Model = modelId,
             Choices = choices,
             Usage = usage,
+            // #1345: llama.cpp-shaped fields beside usage. One request's timings only; n > 1 runs n generations.
+            Timings = choiceCount == 1 ? TimingsDto.From(results[0].Timings) : null,
         };
 
         // Report actuals to the rate-limit lease so unused token budget is refunded. Every choice

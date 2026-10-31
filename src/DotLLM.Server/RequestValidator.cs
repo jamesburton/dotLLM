@@ -38,6 +38,9 @@ public static class RequestValidator
         if (request.MaxTokens.HasValue && request.MaxTokens.Value <= 0)
             return "max_tokens must be a positive integer";
 
+        if (request.MinTokens is < 0)
+            return "min_tokens must not be negative";
+
         // n used to be accepted and never read, so n:3 silently returned one choice (#460).
         // Range-check it here so an unsupportable value is refused rather than quietly reinterpreted.
         if (request.N.HasValue)
@@ -68,6 +71,9 @@ public static class RequestValidator
 
         if (request.MaxTokens.HasValue && request.MaxTokens.Value <= 0)
             return "max_tokens must be a positive integer";
+
+        if (request.MinTokens is < 0)
+            return "min_tokens must not be negative";
 
         return null;
     }

@@ -1761,7 +1761,8 @@ public sealed partial class TextGenerator
     // tokens and never mask the argmax, so they don't need to be checked. Wave 8 / issue #121 lifts
     // this restriction by making q/p pipeline-aware.
     private static bool IsEffectivelyGreedy(DotLLM.Core.Configuration.InferenceOptions options)
-        => options.Temperature <= 0f && options.RepetitionPenalty == 1.0f;
+        => options.Temperature <= 0f && options.RepetitionPenalty == 1.0f
+           && !options.IgnoreEos && options.MinTokens <= 0;   // #1345: the mask changes the argmax; a raw-argmax verify would not see it
 
     // Prompt lookup (#1293) is the fallback draft source: a draft model or an MTP round takes priority. It shares the draft-model
     // path's greedy gate, since its drafts carry no probabilities for sampled acceptance. It also needs a verify forward that
