@@ -202,6 +202,47 @@ public sealed class BertEncoderVulkanParityTests
     }
 
     [SkippableFact]
+    public void Nomic_bert_moe_q8_0_vulkan_matches_cpu()
+    {
+        // #1471: nomic-embed-text-v2-moe (Unigram tokenizer, top-2-of-8 GELU MoE on odd layers, softmax router WITHOUT renormalisation). Q8_0 expert banks
+        // are read in place by the grouped F16-activation coopmat GEMMs. CPU Q8_0 also quantises its activations, so the gate is the Q8_0 class (0.998).
+        using var c = Load("nomic-embed-text-v2-moe-GGUF", "nomic-embed-text-v2-moe.Q8_0.gguf", "nomic-embed-text-v2-moe Q8_0 GGUF", "NOMIC_V2_MOE_Q8_0", "nomic-ai")!;
+        Assert.Equal(Architecture.NomicBertMoe, c.Config.Architecture);
+        const double gate = 0.998;
+        int h = c.Config.HiddenSize;
+        var pooling = c.Pooling;
+        var want = Embed(c.Cpu, c.Docs, h, pooling);
+        var packed = Embed(c.Vk, c.Docs, h, pooling);
+        for (int i = 0; i < c.Docs.Length; i++)
+        {
+            double cos = Cosine(want[i], packed[i]);
+            Assert.True(cos >= gate, $"text[{i}] ({c.Docs[i].Length} tokens): packed Vulkan vs CPU cosine {cos:F6} < {gate}");
+            var single = Embed(c.Vk, [c.Docs[i]], h, pooling)[0];
+            Assert.True(Cosine(single, packed[i]) >= 0.9999, $"text[{i}]: the vector depends on the packed neighbours");
+        }
+        Assert.True(Cosine(packed[1], packed[8]) < 0.95, "unrelated texts must not look identical");
+
+        // Control arms: wrong expert ids, and renormalised top-k weights (what a softmax-over-the-selected-two router would do) must each be DETECTED.
+        foreach (var mutant in new[] { VulkanBertEncoderModel.MoeRoutingMutant.WrongExperts, VulkanBertEncoderModel.MoeRoutingMutant.RenormalisedWeights })
+        {
+            c.Vk.RoutingMutant = mutant;
+            var bad = Embed(c.Vk, c.Docs, h, pooling);
+            c.Vk.RoutingMutant = VulkanBertEncoderModel.MoeRoutingMutant.None;
+            int below = 0, multi = 0;
+            double worst = 1;
+            for (int i = 0; i < c.Docs.Length; i++)
+            {
+                if (c.Docs[i].Length < 4) continue;
+                multi++;
+                double cs = Cosine(want[i], bad[i]);
+                worst = Math.Min(worst, cs);
+                if (cs < gate) below++;
+            }
+            Assert.True(below >= multi - 1, $"control {mutant}: detected on only {below}/{multi} documents (lowest cosine {worst:F4})");
+        }
+    }
+
+    [SkippableFact]
     public void Activation_scratch_is_f16_not_f32()
     {
         // #1474 / docs/PRECISION.md rule 1: activations are stored half-width. 7 [cap,h] + 1 [cap,ff] + host staging, 2 bytes each.

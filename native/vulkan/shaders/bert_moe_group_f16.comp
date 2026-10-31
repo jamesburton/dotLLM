@@ -1,0 +1,45 @@
+#version 450
+// Groups the routed rows of a nomic-bert-moe layer by expert on F16 activations (issue #1471). Twin of moe_expand_group_by_expert_f32.comp
+// with two differences: the source row is the token that owns the routed row (r / topK), and it also writes the INVERSE permutation
+// (invPerm[r] = packed row) so the combine step can gather without atomics.
+//
+//   one workgroup per routed row r; packed[offsets[expert(r)] + slot] = x[r / topK]; invPerm[r] = that packed row.
+// offsets/counters come from moe_expert_offsets.comp (counters are zeroed there).
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufX       { float16_t x[]; };       // [tokens, hidden]
+layout(set = 0, binding = 1, std430) readonly  buffer BufIdx     { int indices[]; };       // [rows]
+layout(set = 0, binding = 2, std430) readonly  buffer BufOffsets { uint offsets[]; };      // [E + 1] (+ tile list)
+layout(set = 0, binding = 3, std430) coherent  buffer BufCount   { uint counters[]; };     // [E]
+layout(set = 0, binding = 4, std430) writeonly buffer BufPacked  { float16_t packed[]; };  // [rows, hidden]
+layout(set = 0, binding = 5, std430) writeonly buffer BufInv     { uint invPerm[]; };      // [rows]
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint hidden;
+    uint numExperts;
+    uint topK;
+} pc;
+
+shared uint dstRow;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.rows) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint expert = uint(clamp(indices[row], 0, int(pc.numExperts) - 1));
+    if (tid == 0u) {
+        uint slot = atomicAdd(counters[expert], 1u);
+        dstRow = offsets[expert] + slot;
+        invPerm[row] = dstRow;
+    }
+    barrier();
+    uint srcBase = (row / pc.topK) * pc.hidden;
+    uint dstBase = dstRow * pc.hidden;
+    for (uint col = tid; col < pc.hidden; col += 256u)
+        packed[dstBase + col] = x[srcBase + col];
+}

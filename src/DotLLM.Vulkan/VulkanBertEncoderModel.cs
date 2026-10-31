@@ -41,7 +41,22 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
         public Weight Wgate;   // nomic-bert SwiGLU only
         public required VulkanDevice.Buffer Bq, Bk, Bv, Bo, Bup, Bdown;
         public required VulkanDevice.Buffer Ln1W, Ln1B, Ln2W, Ln2B;
+        public MoeLayer? Moe;   // nomic-bert-moe sparse layer: replaces Wup/Wdown/Wgate
     }
+
+    /// <summary>A nomic-bert-moe sparse FFN layer: F32 router and the two 3-D Q8_0 expert banks, resident and read in place (#1471).</summary>
+    private sealed class MoeLayer
+    {
+        public required VulkanDevice.Buffer Router;      // [E, hidden] F32
+        public required VulkanDevice.Buffer UpBank;      // [E, ff, hidden] Q8_0 blocks
+        public required VulkanDevice.Buffer DownBank;    // [E, hidden, ff] Q8_0 blocks
+    }
+
+    /// <summary>Test seam for the MoE router (#1471): wrong expert ids / renormalised top-k weights, to prove the parity tests can detect them.</summary>
+    internal enum MoeRoutingMutant { None = 0, WrongExperts = 1, RenormalisedWeights = 2 }
+
+    /// <summary>Test seam: corrupt the MoE routing (nomic-bert-moe only).</summary>
+    internal MoeRoutingMutant RoutingMutant { get; set; }
 
     /// <summary>A resident weight matrix in its stored format (read in place, never expanded).</summary>
     private readonly record struct Weight(VulkanDevice.Buffer Buf, EncoderWeightFormat Format);
@@ -71,6 +86,7 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
     private readonly nint _tokenEmbd, _posEmbd;
     private readonly QuantizationType _tokenEmbdQt, _posEmbdQt;
     private readonly int _posRows;
+    private readonly bool _swiglu;    // nomic-bert (dense) SwiGLU FFN; nomic-bert-moe keeps the biased GELU FFN on its dense layers
     private readonly bool _nomic;     // RoPE NeoX instead of absolute positions; fused attn_qkv (split at load); SwiGLU FFN
     private readonly float[] _typeRow;
     private readonly VulkanDevice.Buffer _embNormW, _embNormB, _zeros;
@@ -81,7 +97,14 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
     private readonly Dictionary<EncoderWeightFormat, MatMulEncoderGemmKernel> _encGemm = new();
     private readonly VulkanFlashAttentionCoopmatKernel _flash;
     private readonly SimpleComputeKernel _layerNorm, _biasGelu, _biasAdd, _pool;
-    private readonly SimpleComputeKernel? _rope, _swiglu;
+    private readonly SimpleComputeKernel? _rope, _swigluK;
+    // nomic-bert-moe (#1471)
+    private readonly SimpleComputeKernel? _moeRouter, _moeGroup, _moeCombine;
+    private readonly MoeExpertOffsetsKernel? _moeOffsets;
+    private readonly MoeBuildTileListKernel? _moeTiles;
+    private readonly MoeGroupedMatmulQ8_0F16ActKernel? _moeGemm;
+    private readonly VulkanDevice.Buffer? _mPacked, _mMid, _mOut, _mIdx, _mWts, _mInv, _mCounts, _mCounters, _mOffsets, _mArgs;
+    private readonly int _moeE, _moeTopK, _moeFf;
     private readonly float _ropeTheta;
     private readonly int _ropeDim;
 
@@ -113,10 +136,11 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
         _eps = config.NormEpsilon;
         int h = config.HiddenSize, ff = config.IntermediateSize;
 
-        if (config.Architecture is not (DotLLM.Core.Configuration.Architecture.Bert or DotLLM.Core.Configuration.Architecture.NomicBert))
+        if (config.Architecture is not (DotLLM.Core.Configuration.Architecture.Bert or DotLLM.Core.Configuration.Architecture.NomicBert or DotLLM.Core.Configuration.Architecture.NomicBertMoe))
             throw new NotSupportedException(
-                $"The Vulkan encoder supports Architecture.Bert and Architecture.NomicBert (got {config.Architecture}); nomic-bert-moe / gemma-embedding run with --device cpu for now (#1471 / #1472).");
-        _nomic = config.Architecture == DotLLM.Core.Configuration.Architecture.NomicBert;
+                $"The Vulkan encoder supports Architecture.Bert, NomicBert and NomicBertMoe (got {config.Architecture}); gemma-embedding runs with --device cpu for now (#1472).");
+        _nomic = config.Architecture is DotLLM.Core.Configuration.Architecture.NomicBert or DotLLM.Core.Configuration.Architecture.NomicBertMoe;
+        _swiglu = config.Architecture == DotLLM.Core.Configuration.Architecture.NomicBert;
         if (_nomic)
         {
             var rope = config.RoPEConfig ?? throw new InvalidDataException("nomic-bert config has no RoPE configuration.");
@@ -217,26 +241,56 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
             for (int i = 0; i < _layers.Length; i++)
             {
                 string p = $"blk.{i}.";
-                if (t.ContainsKey(p + "ffn_up_exps.weight"))
-                    throw new NotSupportedException($"Vulkan encoder: layer {i} is a mixture-of-experts layer (nomic-bert-moe); not supported yet (#1471).");
-                if (_nomic && (t.ContainsKey(p + "ffn_up.bias") || t.ContainsKey(p + "ffn_gate.bias")))
+                bool isMoe = t.ContainsKey(p + "ffn_up_exps.weight");
+                if (isMoe && config.Architecture != DotLLM.Core.Configuration.Architecture.NomicBertMoe)
+                    throw new NotSupportedException($"Vulkan encoder: layer {i} is a mixture-of-experts layer in a {config.Architecture} model.");
+                if (_swiglu && (t.ContainsKey(p + "ffn_up.bias") || t.ContainsKey(p + "ffn_gate.bias")))
                     throw new NotSupportedException($"Vulkan encoder: layer {i} has SwiGLU FFN biases, which the encoder does not apply.");
                 bool fused = t.ContainsKey(p + "attn_qkv.weight");
                 if (fused && !_nomic) throw new NotSupportedException($"Vulkan encoder: layer {i} has a fused attn_qkv in a non-nomic architecture.");
                 bool qkvBias = t.ContainsKey(p + "attn_qkv.bias");
+                MoeLayer? moeLayer = null;
+                float[]? expertsBias = null;
+                if (isMoe)
+                {
+                    var moeCfg = config.Moe ?? throw new InvalidDataException("nomic-bert-moe config has no MoE configuration.");
+                    var upD = Req(p + "ffn_up_exps.weight"); var downD = Req(p + "ffn_down_exps.weight"); var routD = Req(p + "ffn_gate_inp.weight");
+                    int e = upD.Shape[2], eff = upD.Shape[1];
+                    if (e != moeCfg.NumExperts || downD.Shape[2] != e || upD.Shape[0] != h || downD.Shape[0] != eff || downD.Shape[1] != h)
+                        throw new InvalidDataException($"nomic-bert-moe layer {i}: unexpected expert bank shapes up [{upD.Shape[0]},{upD.Shape[1]},{upD.Shape[2]}] down [{downD.Shape[0]},{downD.Shape[1]},{downD.Shape[2]}].");
+                    if (routD.Shape[0] != h || routD.Shape[1] != e) throw new InvalidDataException($"nomic-bert-moe layer {i}: router shape [{routD.Shape[0]},{routD.Shape[1]}] != [{h},{e}].");
+                    if (e > 16 || moeCfg.NumExpertsPerTok > 4) throw new NotSupportedException($"Vulkan encoder router supports up to 16 experts and top-4 (got {e}, top-{moeCfg.NumExpertsPerTok}).");
+                    if (_moeE != 0 && (_moeE != e || _moeFf != eff)) throw new InvalidDataException("nomic-bert-moe layers disagree on the expert count / width.");
+                    _moeE = e; _moeTopK = moeCfg.NumExpertsPerTok; _moeFf = eff;
+                    VulkanDevice.Buffer Bank(GgufTensorDescriptor d, int k, int m)
+                    {
+                        if (d.QuantizationType != QuantizationType.Q8_0)
+                            throw new NotSupportedException($"Vulkan encoder: expert bank '{d.Name}' is {d.QuantizationType}; only Q8_0 banks are read in place (F16/F32 banks: use --device cpu, #1471).");
+                        if (k % MoeGroupedMatmulQ8_0F16ActKernel.KGroup != 0) throw new NotSupportedException($"Vulkan encoder: expert bank '{d.Name}' has K={k}, which the Q8_0 grouped kernel cannot read (K % 64).");
+                        long bytes = (long)e * m * MoeGroupedMatmulQ8_0F16ActKernel.RowBytes(k);
+                        var b = device.AllocateDeviceLocal((bytes + 3) & ~3L);
+                        toDispose.Add(b);
+                        device.Upload(new ReadOnlySpan<byte>((byte*)dataBase.Of(d), checked((int)bytes)), b);
+                        return b;
+                    }
+                    moeLayer = new MoeLayer { Router = F32(Vec(p + "ffn_gate_inp.weight", e * h)), UpBank = Bank(upD, h, eff), DownBank = Bank(downD, eff, h) };
+                    expertsBias = t.ContainsKey(p + "ffn_down_exps.bias") ? Vec(p + "ffn_down_exps.bias", h) : null;
+                }
                 _layers[i] = new Layer
                 {
+                    Moe = moeLayer,
                     // Fused attn_qkv [h, 3h] is split into three row-range buffers at upload (the same bytes, no copy into a wider format).
                     Wq = fused ? WeightIn(p + "attn_qkv.weight", h, h, 0, 3 * h) : WeightIn(p + "attn_q.weight", h, h),
                     Wk = fused ? WeightIn(p + "attn_qkv.weight", h, h, h, 3 * h) : WeightIn(p + "attn_k.weight", h, h),
                     Wv = fused ? WeightIn(p + "attn_qkv.weight", h, h, 2 * h, 3 * h) : WeightIn(p + "attn_v.weight", h, h),
                     Wo = WeightIn(p + "attn_output.weight", h, h),
-                    Wup = WeightIn(p + "ffn_up.weight", h, ff), Wdown = WeightIn(p + "ffn_down.weight", ff, h),
-                    Wgate = _nomic ? WeightIn(p + "ffn_gate.weight", h, ff) : default,
+                    Wup = isMoe ? default : WeightIn(p + "ffn_up.weight", h, ff), Wdown = isMoe ? default : WeightIn(p + "ffn_down.weight", ff, h),
+                    Wgate = _swiglu ? WeightIn(p + "ffn_gate.weight", h, ff) : default,
                     Bq = F32(fused ? (qkvBias ? VecSlice(p + "attn_qkv.bias", 3 * h, 0, h) : Zero(h)) : BiasOrZero(p + "attn_q.bias", h)),
                     Bk = F32(fused ? (qkvBias ? VecSlice(p + "attn_qkv.bias", 3 * h, h, h) : Zero(h)) : BiasOrZero(p + "attn_k.bias", h)),
                     Bv = F32(fused ? (qkvBias ? VecSlice(p + "attn_qkv.bias", 3 * h, 2 * h, h) : Zero(h)) : BiasOrZero(p + "attn_v.bias", h)),
-                    Bo = F32(BiasOrZero(p + "attn_output.bias", h)), Bup = F32(BiasOrZero(p + "ffn_up.bias", ff)), Bdown = F32(BiasOrZero(p + "ffn_down.bias", h)),
+                    Bo = F32(BiasOrZero(p + "attn_output.bias", h)), Bup = isMoe ? _zeros : F32(BiasOrZero(p + "ffn_up.bias", ff)),
+                    Bdown = isMoe ? (expertsBias is null ? _zeros : F32(expertsBias)) : F32(BiasOrZero(p + "ffn_down.bias", h)),   // the learned experts.bias is applied by the bias + residual + LayerNorm after the combine (CPU order)
                     Ln1W = F32(Vec(p + "attn_output_norm.weight", h)), Ln1B = F32(Vec(p + "attn_output_norm.bias", h)),
                     Ln2W = F32(Vec(p + "layer_output_norm.weight", h)), Ln2B = F32(Vec(p + "layer_output_norm.bias", h)),
                 };
@@ -244,7 +298,7 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
 
             _gemm = MatMulF16GemmCoopmatKernel.Create(device, spvDir, F16GemmCoopmatVariant.SelectF16ActFor(device, spvDir));
             foreach (var l in _layers)
-                foreach (var w in _nomic ? new[] { l.Wq, l.Wk, l.Wv, l.Wo, l.Wup, l.Wdown, l.Wgate } : new[] { l.Wq, l.Wk, l.Wv, l.Wo, l.Wup, l.Wdown })
+                foreach (var w in l.Moe is not null ? new[] { l.Wq, l.Wk, l.Wv, l.Wo } : _swiglu ? new[] { l.Wq, l.Wk, l.Wv, l.Wo, l.Wup, l.Wdown, l.Wgate } : new[] { l.Wq, l.Wk, l.Wv, l.Wo, l.Wup, l.Wdown })
                     if (w.Format != EncoderWeightFormat.F16 && !_encGemm.ContainsKey(w.Format))
                         _encGemm[w.Format] = MatMulEncoderGemmKernel.Create(device, spvDir, w.Format);
             _biasAdd = SimpleComputeKernel.Create(device, spvDir, "bert_bias_add_f16", buffers: 2, pushWords: 2);
@@ -254,19 +308,44 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
             if (_nomic)
             {
                 _rope = SimpleComputeKernel.Create(device, spvDir, "rope_f16", buffers: 3, pushWords: 9);
-                _swiglu = SimpleComputeKernel.Create(device, spvDir, "bert_swiglu_f16", buffers: 2, pushWords: 1);
+            }
+            if (_swiglu) _swigluK = SimpleComputeKernel.Create(device, spvDir, "bert_swiglu_f16", buffers: 2, pushWords: 1);
+            if (_moeE != 0)
+            {
+                if (!MoeGroupedMatmulQ8_0F16ActKernel.IsSupportedOn(device, spvDir))
+                    throw new NotSupportedException($"Vulkan encoder: the nomic-bert-moe grouped Q8_0 expert kernel needs a wave64 cooperative-matrix device (this one has subgroup size {device.SubgroupSize}). Use --device cpu.");
+                _moeRouter = SimpleComputeKernel.Create(device, spvDir, "bert_moe_router_f16", buffers: 4, pushWords: 4);
+                _moeGroup = SimpleComputeKernel.Create(device, spvDir, "bert_moe_group_f16", buffers: 6, pushWords: 4);
+                _moeCombine = SimpleComputeKernel.Create(device, spvDir, "bert_moe_combine_f16", buffers: 4, pushWords: 3);
+                _moeOffsets = MoeExpertOffsetsKernel.Create(device, spvDir);
+                _moeTiles = MoeBuildTileListKernel.Create(device, spvDir);
+                _moeGemm = MoeGroupedMatmulQ8_0F16ActKernel.Create(device, spvDir);
             }
 
             long rowsH = (long)_cap * h;
             _hid = Scratch(rowsH); _hid2 = Scratch(rowsH);
             _q = Scratch(rowsH); _k = Scratch(rowsH); _v = Scratch(rowsH); _attn = Scratch(rowsH); _tmp = Scratch(rowsH);
             _up = Scratch((long)_cap * ff);
-            if (_nomic) { _gate = Scratch((long)_cap * ff); _pos = device.Allocate((long)_cap * sizeof(int)); toDispose.Add(_pos); }
+            if (_swiglu) _gate = Scratch((long)_cap * ff);
+            if (_nomic) { _pos = device.Allocate((long)_cap * sizeof(int)); toDispose.Add(_pos); }
             _seg = device.Allocate(2L * MaxDocsPerPack * sizeof(uint)); toDispose.Add(_seg);
             _poolOut = device.AllocateHostReadback((long)MaxDocsPerPack * h * sizeof(float)); toDispose.Add(_poolOut);
+            if (_moeE != 0)
+            {
+                long routed = (long)_moeTopK * _cap;
+                _mPacked = Scratch(routed * h); _mMid = Scratch(routed * _moeFf); _mOut = Scratch(routed * h);
+                _mIdx = device.AllocateDeviceLocal(routed * sizeof(int)); toDispose.Add(_mIdx);
+                _mWts = device.AllocateDeviceLocal(routed * sizeof(float)); toDispose.Add(_mWts);
+                _mInv = device.AllocateDeviceLocal(routed * sizeof(uint)); toDispose.Add(_mInv);
+                _mCounts = device.AllocateDeviceLocal(_moeE * sizeof(uint)); toDispose.Add(_mCounts);
+                _mCounters = device.AllocateDeviceLocal(_moeE * sizeof(uint)); toDispose.Add(_mCounters);
+                _mOffsets = device.AllocateDeviceLocal(MoeBuildTileListKernel.OffsetsBufferUints(_moeE, (int)routed) * sizeof(uint)); toDispose.Add(_mOffsets);
+                _mArgs = device.AllocateDeviceLocal(2 * MoeBuildTileListKernel.ArgsStrideBytes); toDispose.Add(_mArgs);
+            }
             _hostEmb = (Half*)NativeMemory.AlignedAlloc((nuint)(rowsH * sizeof(ushort)), 64);
             _submit = device.CreateSubmitContext();
-            ComputeMemoryBytes = (7 * rowsH + (_nomic ? 2L : 1L) * _cap * ff + rowsH) * sizeof(ushort) + (_nomic ? (long)_cap * sizeof(int) : 0);   // F16 scratch: 7 [cap,h] + the FFN [cap,ff], plus the host staging
+            ComputeMemoryBytes = (7 * rowsH + (_swiglu ? 2L : 1L) * _cap * ff + rowsH) * sizeof(ushort) + (_nomic ? (long)_cap * sizeof(int) : 0)
+                + (_moeE == 0 ? 0 : (long)_moeTopK * _cap * (2L * h + _moeFf) * sizeof(ushort) + (long)_moeTopK * _cap * 3 * sizeof(uint));   // F16 scratch: 7 [cap,h] + the FFN [cap,ff], plus the host staging
         }
         catch
         {
@@ -417,6 +496,30 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
 
     private static void Barrier(nint cmd) => KernelSupport.ComputeToComputeBarrier(cmd);
 
+    /// <summary>
+    /// Records the sparse MoE FFN of one nomic-bert-moe layer over 	otal packed tokens (#1471), <c>_hid2 -> _tmp</c>, all on F16 activations:
+    /// router (softmax over all experts, top-k, weights NOT renormalised) -> expert offsets -> tile list -> group the routed rows by expert ->
+    /// grouped Q8_0 up GEMM with fused tanh GELU -> grouped Q8_0 down GEMM -> weighted gather-combine. The expert banks are read in place.
+    /// </summary>
+    private void RecordMoeFfn(nint cmd, MoeLayer m, int total)
+    {
+        int h = Config.HiddenSize, ff = _moeFf, e = _moeE, k = _moeTopK, rows = total * k;
+        var idx = _mIdx!; var wts = _mWts!; var inv = _mInv!; var offs = _mOffsets!; var args = _mArgs!; var packed = _mPacked!; var mid = _mMid!; var outB = _mOut!; var gemm = _moeGemm!;
+        _moeRouter!.Record(cmd, [_hid2.Handle, m.Router.Handle, idx.Handle, wts.Handle], [(uint)h, (uint)e, (uint)k, (uint)RoutingMutant], (uint)total);
+        Barrier(cmd);
+        _moeOffsets!.Record(cmd, idx, _mCounts!, offs, _mCounters!, rows, e);
+        Barrier(cmd);
+        _moeTiles!.Record(cmd, offs, args, e, MoeGroupedMatmulQ8_0F16ActKernel.MTiles(ff), MoeGroupedMatmulQ8_0F16ActKernel.MTiles(h));
+        KernelSupport.ComputeToIndirectAndComputeBarrier(cmd);
+        _moeGroup!.Record(cmd, [_hid2.Handle, idx.Handle, offs.Handle, _mCounters!.Handle, packed.Handle, inv.Handle], [(uint)rows, (uint)h, (uint)e, (uint)k], (uint)rows);
+        Barrier(cmd);
+        gemm.RecordIndirect(cmd, m.UpBank, packed, offs, mid, args, 0, ff, h, rows, e, gelu: true);
+        Barrier(cmd);
+        gemm.RecordIndirect(cmd, m.DownBank, mid, offs, outB, args, MoeBuildTileListKernel.ArgsStrideBytes, h, ff, rows, e, gelu: false);
+        Barrier(cmd);
+        _moeCombine!.Record(cmd, [outB.Handle, inv.Handle, wts.Handle, _tmp.Handle], [(uint)(total * h), (uint)h, (uint)k], (uint)(((long)total * h + 255) / 256));
+    }
+
     private void RunPack(IReadOnlyList<int[]> docs, int from, int count, PoolMode mode, Span<float> output)
     {
         int h = Config.HiddenSize, ff = Config.IntermediateSize, nh = Config.NumAttentionHeads, hd = Config.HeadDim;
@@ -501,21 +604,28 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
             _layerNorm.Record(cmd, [_tmp.Handle, l.Bo.Handle, _hid.Handle, l.Ln1W.Handle, l.Ln1B.Handle, _hid2.Handle],
                 [(uint)h, 3u, BitConverter.SingleToUInt32Bits(_eps)], (uint)total);
             Barrier(cmd);
-            if (_nomic)
+            if (l.Moe is not null)
             {
-                Gemm(cmd, l.Wgate, _hid2, _gate!, ff, h, total);
-                Gemm(cmd, l.Wup, _hid2, _up, ff, h, total);
-                Barrier(cmd);
-                _swiglu!.Record(cmd, [_gate!.Handle, _up.Handle], [(uint)(total * ff)], (uint)(((long)total * ff + 255) / 256));
+                RecordMoeFfn(cmd, l.Moe, total);   // _hid2 -> _tmp (weighted expert sum)
             }
             else
             {
-                Gemm(cmd, l.Wup, _hid2, _up, ff, h, total);
+                if (_swiglu)
+                {
+                    Gemm(cmd, l.Wgate, _hid2, _gate!, ff, h, total);
+                    Gemm(cmd, l.Wup, _hid2, _up, ff, h, total);
+                    Barrier(cmd);
+                    _swigluK!.Record(cmd, [_gate!.Handle, _up.Handle], [(uint)(total * ff)], (uint)(((long)total * ff + 255) / 256));
+                }
+                else
+                {
+                    Gemm(cmd, l.Wup, _hid2, _up, ff, h, total);
+                    Barrier(cmd);
+                    _biasGelu.Record(cmd, [_up.Handle, l.Bup.Handle], [(uint)(total * ff), (uint)ff], (uint)(((long)total * ff + 255) / 256));
+                }
                 Barrier(cmd);
-                _biasGelu.Record(cmd, [_up.Handle, l.Bup.Handle], [(uint)(total * ff), (uint)ff], (uint)(((long)total * ff + 255) / 256));
+                Gemm(cmd, l.Wdown, _up, _tmp, h, ff, total);
             }
-            Barrier(cmd);
-            Gemm(cmd, l.Wdown, _up, _tmp, h, ff, total);
             Barrier(cmd);
             _layerNorm.Record(cmd, [_tmp.Handle, l.Bdown.Handle, _hid2.Handle, l.Ln2W.Handle, l.Ln2B.Handle, _hid.Handle],
                 [(uint)h, 3u, BitConverter.SingleToUInt32Bits(_eps)], (uint)total);
@@ -550,7 +660,7 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
         if (_disposed) return;
         _disposed = true;
         _submit.Dispose();
-        _rope?.Dispose(); _swiglu?.Dispose(); _gemm.Dispose(); foreach (var g in _encGemm.Values) g.Dispose(); _flash.Dispose(); _biasAdd.Dispose(); _layerNorm.Dispose(); _biasGelu.Dispose(); _pool.Dispose();
+        _rope?.Dispose(); _swigluK?.Dispose(); _moeRouter?.Dispose(); _moeGroup?.Dispose(); _moeCombine?.Dispose(); _moeOffsets?.Dispose(); _moeTiles?.Dispose(); _moeGemm?.Dispose(); _gemm.Dispose(); foreach (var g in _encGemm.Values) g.Dispose(); _flash.Dispose(); _biasAdd.Dispose(); _layerNorm.Dispose(); _biasGelu.Dispose(); _pool.Dispose();
         foreach (var d in _owned) d.Dispose();
         NativeMemory.AlignedFree(_hostEmb);
         if (_ownsDevice) _device.Dispose();

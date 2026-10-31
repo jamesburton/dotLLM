@@ -1,0 +1,81 @@
+#version 450
+// nomic-bert-moe router (issue #1471): one workgroup per token. logits[e] = x[t, :] . W[e, :] (F32 accumulation of the F16 hidden row against
+// the F32 router), softmax over ALL experts, then top-k by repeated arg-max (strict >, ascending scan, so ties go to the lower expert id, as the
+// CPU encoder). The selected probabilities are used as is (llama.cpp norm_w = false: NOT renormalised).
+//
+// Output is routed-row ordered: row r = t * topK + k  ->  indices[r] = expert id, weights[r] = its probability.
+// pc.mode is a TEST SEAM: 0 = production, 1 = wrong routing ((expert + 1) % E), 2 = renormalised top-k weights. Production never sets it.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufX   { float16_t x[]; };      // [tokens, hidden] F16
+layout(set = 0, binding = 1, std430) readonly  buffer BufW   { float w[]; };          // [E, hidden] F32 router
+layout(set = 0, binding = 2, std430) writeonly buffer BufIdx { int indices[]; };      // [tokens * topK]
+layout(set = 0, binding = 3, std430) writeonly buffer BufWt  { float weights[]; };    // [tokens * topK]
+
+layout(push_constant) uniform PushConstants {
+    uint hidden;
+    uint numExperts;   // <= 16
+    uint topK;         // <= 4
+    uint mode;
+} pc;
+
+const uint MAXE = 16u;
+shared float red[MAXE * 256u];
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint E = pc.numExperts;
+
+    float acc[MAXE];
+    for (uint e = 0u; e < MAXE; e++) acc[e] = 0.0;
+    for (uint c = tid; c < pc.hidden; c += 256u) {
+        float xv = float(x[t * pc.hidden + c]);
+        for (uint e = 0u; e < MAXE; e++)
+            if (e < E) acc[e] += xv * w[e * pc.hidden + c];
+    }
+    for (uint e = 0u; e < MAXE; e++) red[e * 256u + tid] = acc[e];
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s)
+            for (uint e = 0u; e < MAXE; e++) red[e * 256u + tid] += red[e * 256u + tid + s];
+        barrier();
+    }
+
+    if (tid == 0u) {
+        float p[MAXE];
+        float mx = -3.4e38;
+        for (uint e = 0u; e < E; e++) { p[e] = red[e * 256u]; mx = max(mx, p[e]); }
+        float sum = 0.0;
+        for (uint e = 0u; e < E; e++) { p[e] = exp(p[e] - mx); sum += p[e]; }
+        for (uint e = 0u; e < E; e++) p[e] /= sum;
+
+        int sel[4];
+        float sw[4];
+        float selSum = 0.0;
+        for (uint k = 0u; k < pc.topK; k++) {
+            int best = -1;
+            float bv = -1.0;
+            for (uint e = 0u; e < E; e++) {
+                bool taken = false;
+                for (uint j = 0u; j < k; j++) if (sel[j] == int(e)) taken = true;
+                if (!taken && p[e] > bv) { bv = p[e]; best = int(e); }
+            }
+            sel[k] = best;
+            sw[k] = bv;
+            selSum += bv;
+        }
+        for (uint k = 0u; k < pc.topK; k++) {
+            int ex = sel[k];
+            float wv = sw[k];
+            if (pc.mode == 1u) ex = (ex + 1) % int(E);
+            if (pc.mode == 2u) wv = wv / selSum;
+            indices[t * pc.topK + k] = ex;
+            weights[t * pc.topK + k] = wv;
+        }
+    }
+}

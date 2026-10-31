@@ -98,7 +98,7 @@ internal static class Program
         var gguf = GgufFile.Open(path);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         // #741: BERT encoders have a dedicated Vulkan model; every other architecture goes through the decoder-embedder path.
-        if (config.Architecture is DotLLM.Core.Configuration.Architecture.Bert or DotLLM.Core.Configuration.Architecture.NomicBert)
+        if (config.Architecture is DotLLM.Core.Configuration.Architecture.Bert or DotLLM.Core.Configuration.Architecture.NomicBert or DotLLM.Core.Configuration.Architecture.NomicBertMoe)
             return (VulkanBertEncoderModel.LoadFromGguf(gguf, config, VulkanModelLoader.ResolveSpvDir()), gguf, config);
         return (VulkanTransformerModel.LoadFromGguf(gguf, config, VulkanModelLoader.ResolveSpvDir()), gguf, config);
     }
@@ -170,7 +170,7 @@ internal static class Program
             var a = t.Encode("hello").ToArray(); var b = t.Encode("hello hello").ToArray();
             int bodyLen = b.Length - a.Length;
             int firstBody = Array.IndexOf(a, b[^1]);
-            if (firstBody < 0 || bodyLen <= 0) return;
+            if (firstBody < 0 || bodyLen <= 0 || firstBody + bodyLen > a.Length) return;   // e.g. a Unigram tokenizer where "hello hello" re-tokenises the first word: no framing detected
             _pre = a[..firstBody]; _suf = a[(firstBody + bodyLen)..];
         }
         public int FrameLen => _pre.Length + _suf.Length;
