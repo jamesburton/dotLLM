@@ -233,6 +233,73 @@ public sealed class ChunkAssemblyTests : IDisposable
     }
 
     [Fact]
+    public void Assemble_OneTokenChunk_AtNonZeroOffset_MatchesModelKey()
+    {
+        using var tiny = TinyModel.Load(_scratch, "qwen3");
+        var encoder = new ChunkEncoder(Fingerprint);
+        ChunkKvEntry b = encoder.Encode(tiny.Model, ChunkB);
+        int[] single = [20];
+        ChunkKvEntry one = encoder.Encode(tiny.Model, single);
+        int stride = tiny.KvStride, bRows = ChunkB.Length * stride;
+        Assert.Equal(stride, one.KeysPerLayer[0].Length);
+
+        using var cache = NewCache(tiny);
+        new ChunkAssembler(tiny.Config).Assemble(cache, [b, one], Fingerprint);
+        Assert.Equal(ChunkB.Length + 1, cache.CurrentLength);
+
+        // The single token sits at position |B|: its layer-0 key (every head) equals the model's own key there.
+        float[] expected = FullPrefillRows(tiny, [.. ChunkB, .. single], layer: 0, keys: true, from: ChunkB.Length, count: 1);
+        float[] actual = cache.KeysSpan(0)[bRows..(bRows + stride)].ToArray();
+        Assert.True(MaxAbsDiff(one.KeysPerLayer[0], expected) > 1e-2f, "fixture cannot discriminate: unshifted key already matches");
+        float err = MaxAbsDiff(actual, expected);
+        Assert.True(err <= 1e-5f, $"one-token chunk key differs from the model's key at position {ChunkB.Length} by {err}");
+        // Value row unchanged; B's rows untouched.
+        Assert.Equal(one.ValuesPerLayer[0], cache.ValuesSpan(0)[bRows..(bRows + stride)].ToArray());
+        Assert.Equal(b.KeysPerLayer[0], cache.KeysSpan(0)[..bRows].ToArray());
+    }
+
+    [Fact]
+    public void Encode_ChunkLongerThanContext_Throws()
+    {
+        using var tiny = TinyModel.Load(_scratch, "qwen3");
+        Assert.Equal(SyntheticDenseGguf.Context, tiny.Config.MaxSequenceLength);
+        int[] tooLong = Enumerable.Range(0, SyntheticDenseGguf.Context + 1).Select(i => i % SyntheticDenseGguf.Vocab).ToArray();
+
+        // Exact type: the encoder's own guard, not an ArgumentOutOfRangeException from deeper in the forward.
+        var ex = Assert.Throws<ArgumentException>(() => new ChunkEncoder(Fingerprint).Encode(tiny.Model, tooLong));
+        Assert.Contains("context", ex.Message, StringComparison.OrdinalIgnoreCase);
+
+        // The boundary itself (exactly Context tokens) is accepted.
+        int[] atLimit = tooLong[..SyntheticDenseGguf.Context];
+        Assert.Equal(SyntheticDenseGguf.Context, new ChunkEncoder(Fingerprint).Encode(tiny.Model, atLimit).TokenIds.Length);
+    }
+
+    [Fact]
+    public void Assemble_ChunksExceedCapacity_ThrowsAndWritesNothing()
+    {
+        using var tiny = TinyModel.Load(_scratch, "qwen3");
+        var encoder = new ChunkEncoder(Fingerprint);
+        ChunkKvEntry a = encoder.Encode(tiny.Model, ChunkA);
+        ChunkKvEntry b = encoder.Encode(tiny.Model, ChunkB);
+        var assembler = new ChunkAssembler(tiny.Config);
+
+        // Capacity 8: B (4 rows) fits, then A (6 more) would need positions up to 9.
+        using var cache = new SimpleKvCache(KvGeometry.FromConfig(tiny.Config, compactSlidingWindows: false), 8);
+        assembler.Assemble(cache, [b], Fingerprint);
+        float[] keysBefore = cache.KeysSpan(0).ToArray();
+
+        var ex = Assert.Throws<ArgumentException>(() => assembler.Assemble(cache, [a], Fingerprint));
+        Assert.Contains("holds 8", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(ChunkB.Length, cache.CurrentLength);
+        Assert.Equal(keysBefore, cache.KeysSpan(0).ToArray());
+
+        // A list whose first chunk fits and whose second overflows writes nothing either.
+        using var fresh = new SimpleKvCache(KvGeometry.FromConfig(tiny.Config, compactSlidingWindows: false), 8);
+        Assert.Throws<ArgumentException>(() => assembler.Assemble(fresh, [b, a], Fingerprint));
+        Assert.Equal(0, fresh.CurrentLength);
+    }
+
+    [Fact]
     public void Assemble_QuantizedDestination_ThrowsNotSupported()
     {
         using var tiny = TinyModel.Load(_scratch, "qwen3");
