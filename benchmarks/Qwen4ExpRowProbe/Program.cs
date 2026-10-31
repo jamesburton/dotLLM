@@ -31,6 +31,7 @@ if (args[0] == "ovident") { Environment.Exit(SharedOverlapIdent.Run(args)); retu
 if (args[0] == "tier") { TierRun.Run(args); return; }
 if (args[0] == "kbench") { KBench.Run(args); return; }
 if (args[0] == "grbench") { GrBench.Run(args); return; }
+if (args[0] == "qsabench") { QsaBench.Run(args); return; }
 if (args[0] == "iqbench") { IqKBench.Run(args); return; }
 if (args[0] == "mimobench") { MimoIqBench.Run(args); return; }
 if (args[0] == "q41bench") { Q41Bench.Run(args); return; }
