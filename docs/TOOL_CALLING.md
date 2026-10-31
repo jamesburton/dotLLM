@@ -328,6 +328,22 @@ stops emission where it fires. `EmittedLength` tells the caller where held text 
 call is delivered after generation. This applies to every parser, including a forced `tool_choice` (generic parser) and the
 generic parser as an unknown model's own parser: brace-bearing prose there is delayed until the end of the turn, not lost.
 
+**Incremental arguments (#1342, Qwen XML only)** — for `QwenXmlToolCallParser` the first call of a response streams as
+OpenAI deltas instead of arriving whole in the final chunk. `QwenXmlToolCallStreamer` returns the first delta (`index`,
+`id`, `function.name`, empty `arguments`) as soon as `<function=NAME>` completes and NAME is a declared tool, then
+`arguments` fragments: parameters the schema declares as strings stream their text as it is generated (JSON-escaped
+exactly as the parser escapes it, framing newlines stripped, a lone high surrogate held until its pair arrives); every
+other parameter is buffered to its closing tag so it gets the schema-typed JSON value. The concatenated fragments equal
+`QwenXmlToolCallParser`'s arguments for the same text (tests split the text at every position, one character at a time and
+at random points, over quotes, backslashes, CRLF, unicode, emoji, fake tags). Calls after the first still arrive complete
+in the final chunk, indexed from 1; a call with a Hermes JSON body or an undeclared name is not streamed and takes the
+old path. **A call cut off mid-arguments** (`max_tokens`, client abort) has already shown the client a prefix: the stream
+ends with the real `finish_reason` (`length`), never `tool_calls`, the half call is not also delivered as `content`, and
+the arguments seen are not valid JSON; a client must only execute a call whose stream ended with `finish_reason:
+"tool_calls"`. Every other parser (Hermes, Harmony, Granite, Gemma, GLM, Mistral, Llama, pythonic, generic) is explicitly
+unchanged and still emits calls whole in the final chunk, as does the Anthropic `/v1/messages` stream and the
+non-streaming path.
+
 ## Chat Template Integration
 
 The Jinja2 chat template engine (Step 16) handles tool definitions natively:

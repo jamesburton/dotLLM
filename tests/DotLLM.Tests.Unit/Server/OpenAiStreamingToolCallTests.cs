@@ -25,12 +25,13 @@ public sealed class OpenAiStreamingToolCallTests
         new("get_weather", "Get weather", """{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}}}"""),
     ];
 
-    private static async IAsyncEnumerable<GenerationToken> Script(params string[] pieces)
+    private static async IAsyncEnumerable<GenerationToken> Script(FinishReason last, Action<int>? beforePiece, string[] pieces)
     {
         for (int i = 0; i < pieces.Length; i++)
         {
             await Task.Yield();
-            yield return new GenerationToken(0, pieces[i], i == pieces.Length - 1 ? FinishReason.Stop : null);
+            beforePiece?.Invoke(i);
+            yield return new GenerationToken(0, pieces[i], i == pieces.Length - 1 ? last : null);
         }
     }
 
@@ -38,7 +39,8 @@ public sealed class OpenAiStreamingToolCallTests
 
     private sealed record Result(string Content, JsonElement? FinalToolCalls, string? FinishReason, string Raw);
 
-    private static async Task<Result> RunAsync(string[] pieces, IToolCallParser parser, bool forced = false, ToolDefinition[]? tools = null, ReasoningPlan? plan = null)
+    private static async Task<Result> RunAsync(string[] pieces, IToolCallParser parser, bool forced = false, ToolDefinition[]? tools = null, ReasoningPlan? plan = null,
+        FinishReason last = FinishReason.Stop, Action<int, string>? beforePiece = null)
     {
         var ctx = new DefaultHttpContext();
         var body = new MemoryStream();
@@ -46,12 +48,13 @@ public sealed class OpenAiStreamingToolCallTests
         var request = new ChatCompletionRequest { Messages = [], Stream = true };
 
         await ChatCompletionEndpoint.WriteChatStreamAsync(
-            request, ctx, _ => Script(pieces), NoGate, "req_1", "m", tools ?? Tools, parser,
+            request, ctx, _ => Script(last, beforePiece is null ? null : i => beforePiece(i, Encoding.UTF8.GetString(body.ToArray())), pieces), NoGate, "req_1", "m", tools ?? Tools, parser,
             plan ?? ReasoningPlan.Disabled, CancellationToken.None, forced);
 
         string raw = Encoding.UTF8.GetString(body.ToArray());
         var content = new StringBuilder();
-        JsonElement? finalCalls = null;
+        // Reassemble tool_calls the way an OpenAI client does: deltas merge by index, arguments concatenate (#1342).
+        var assembled = new SortedDictionary<int, (string? Id, string? Name, StringBuilder Args)>();
         string? finish = null;
         foreach (string block in raw.Split("\n\n", StringSplitOptions.RemoveEmptyEntries))
         {
@@ -63,10 +66,25 @@ public sealed class OpenAiStreamingToolCallTests
             if (choice.GetProperty("delta").TryGetProperty("content", out var c) && c.ValueKind == JsonValueKind.String)
                 content.Append(c.GetString());
             if (choice.GetProperty("delta").TryGetProperty("tool_calls", out var tc))
-                finalCalls = tc.Clone();
+                foreach (var d in tc.EnumerateArray())
+                {
+                    int idx = d.GetProperty("index").GetInt32();
+                    var cur = assembled.TryGetValue(idx, out var e) ? e : (null, null, new StringBuilder());
+                    var fn = d.GetProperty("function");
+                    string? id = d.TryGetProperty("id", out var idEl) ? idEl.GetString() : cur.Id;
+                    string? name = fn.TryGetProperty("name", out var nEl) ? nEl.GetString() : cur.Name;
+                    cur.Args.Append(fn.GetProperty("arguments").GetString());
+                    assembled[idx] = (id, name, cur.Args);
+                }
             if (choice.TryGetProperty("finish_reason", out var fr) && fr.ValueKind == JsonValueKind.String)
                 finish = fr.GetString();
         }
+        JsonElement? finalCalls = assembled.Count == 0 ? null : JsonSerializer.SerializeToElement(
+            assembled.Select(kv => new
+            {
+                index = kv.Key, id = kv.Value.Id, type = "function",
+                function = new { name = kv.Value.Name, arguments = kv.Value.Args.ToString() },
+            }).ToArray());
         return new Result(content.ToString(), finalCalls, finish, raw);
     }
 
@@ -175,15 +193,80 @@ public sealed class OpenAiStreamingToolCallTests
     }
 
     [Fact]
-    public async Task TruncatedCall_IsDeliveredAsContent_NotSwallowed()
+    public async Task TruncatedUnparseableCall_BeforeAnyName_IsDeliveredAsContent_NotSwallowed()
     {
-        // The model ran out of tokens mid-call: nothing parses, so the held-back text must still reach the client.
-        var r = await RunAsync(
-            ["<tool_call>", "\n<function=get_weather>\n<parameter=city>\nPar"],
-            new QwenXmlToolCallParser());
+        // The model ran out of tokens before the function name completed: nothing streamed, so the held-back text must still reach the client.
+        var r = await RunAsync(["<tool_call>", "\n<function=get_wea"], new QwenXmlToolCallParser());
 
         Assert.Null(r.FinalToolCalls);
-        Assert.Equal("<tool_call>\n<function=get_weather>\n<parameter=city>\nPar", r.Content);
+        Assert.Equal("<tool_call>\n<function=get_wea", r.Content);
+    }
+
+    [Fact]
+    public async Task StreamedCall_ArgumentsArriveBeforeTheCallIsComplete()
+    {
+        // 1342: each piece is fed only after everything the previous pieces released has hit the wire. The city value is
+        // streamed as it arrives, and the id and name are out before any argument text.
+        string[] pieces = ["<tool_call>\n<function=get_weather>\n", "<parameter=city>\n", "Par", "is, Fra", "nce", "\n</parameter>\n", "</function>\n</tool_call>"];
+        var r = await RunAsync(pieces, new QwenXmlToolCallParser(), beforePiece: (i, wire) =>
+        {
+            if (i == 2) { Assert.Contains("\"name\":\"get_weather\"", wire); Assert.Contains("\"id\":\"call_0\"", wire); }
+            if (i == 3) Assert.Contains("Par", wire);               // "Par" is already out while the value is still open
+            if (i == 4) Assert.Contains("is, Fra", wire);
+            if (i == 6) Assert.DoesNotContain("\"finish_reason\":\"tool_calls\"", wire);   // not finished yet
+        });
+
+        Assert.Equal("tool_calls", r.FinishReason);
+        var call = Assert.Single(r.FinalToolCalls!.Value.EnumerateArray().ToArray());
+        Assert.Equal("{\"city\":\"Paris, France\"}", call.GetProperty("function").GetProperty("arguments").GetString());
+        Assert.Equal(0, call.GetProperty("index").GetInt32());
+        // Continuations carry no id/type/name: only the first delta of a call does.
+        Assert.Equal(r.Raw.IndexOf("\"id\":\"call_0\"", StringComparison.Ordinal), r.Raw.LastIndexOf("\"id\":\"call_0\"", StringComparison.Ordinal));
+        Assert.Equal("", r.Content);
+    }
+
+    [Fact]
+    public async Task StreamedCall_ThenSecondCall_SecondGetsIndexOneInTheFinalChunk()
+    {
+        var r = await RunAsync(
+            ["<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\n",
+             "<tool_call>\n<function=get_weather>\n<parameter=city>\nLondon\n</parameter>\n</function>\n</tool_call>"],
+            new QwenXmlToolCallParser());
+
+        var calls = r.FinalToolCalls!.Value.EnumerateArray().ToArray();
+        Assert.Equal(2, calls.Length);
+        Assert.Equal(0, calls[0].GetProperty("index").GetInt32());
+        Assert.Equal(1, calls[1].GetProperty("index").GetInt32());
+        Assert.Equal("{\"city\":\"Paris\"}", calls[0].GetProperty("function").GetProperty("arguments").GetString());
+        Assert.Equal("{\"city\":\"London\"}", calls[1].GetProperty("function").GetProperty("arguments").GetString());
+        Assert.Equal("tool_calls", r.FinishReason);
+    }
+
+    [Fact]
+    public async Task StreamedCall_CutOffByMaxTokens_KeepsLengthFinish_AndNeverLeaksCallTextAsContent()
+    {
+        // Documented outcome (1342): the client saw a prefix of the arguments. The stream ends with the real finish reason (never
+        // tool_calls), the half call is not also delivered as content, and the partial arguments are not valid JSON.
+        var r = await RunAsync(["<tool_call>\n<function=get_weather>\n", "<parameter=city>\nPar"],
+            new QwenXmlToolCallParser(), last: FinishReason.Length);
+
+        Assert.Equal("length", r.FinishReason);
+        Assert.Equal("", r.Content);
+        var call = Assert.Single(r.FinalToolCalls!.Value.EnumerateArray().ToArray());
+        string args = call.GetProperty("function").GetProperty("arguments").GetString()!;
+        Assert.Equal("{\"city\":\"Par", args);
+        Assert.ThrowsAny<JsonException>(() => JsonDocument.Parse(args));
+    }
+
+    [Fact]
+    public async Task HermesJsonBodyInsideQwenParser_IsNotStreamed_AndStillArrivesWhole()
+    {
+        var r = await RunAsync(["<tool_call>\n", "{\"name\": \"get_weather\", ", "\"arguments\": {\"city\": \"Paris\"}}\n</tool_call>"],
+            new QwenXmlToolCallParser());
+
+        Assert.Equal("tool_calls", r.FinishReason);
+        var call = Assert.Single(r.FinalToolCalls!.Value.EnumerateArray().ToArray());
+        Assert.Equal("Paris", JsonDocument.Parse(call.GetProperty("function").GetProperty("arguments").GetString()!).RootElement.GetProperty("city").GetString());
     }
 
     [Fact]

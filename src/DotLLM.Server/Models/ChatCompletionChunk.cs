@@ -150,12 +150,27 @@ public sealed record StreamingToolCallDto
     [JsonPropertyName("index")]
     public required int Index { get; init; }
 
+    /// <summary>Call id. Present on the first delta of a call only (#1342); absent on argument continuations.</summary>
     [JsonPropertyName("id")]
-    public required string Id { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Id { get; init; }
 
+    /// <summary><c>function</c> on the first delta of a call; absent on continuations, as OpenAI sends them.</summary>
     [JsonPropertyName("type")]
-    public string Type => "function";
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Type => Id is null ? null : "function";
 
     [JsonPropertyName("function")]
-    public required ToolCallFunctionDto Function { get; init; }
+    public required StreamingToolCallFunctionDto Function { get; init; }
+}
+
+/// <summary>The <c>function</c> part of a streamed tool-call delta: <c>name</c> on the first delta, <c>arguments</c> fragments after.</summary>
+public sealed record StreamingToolCallFunctionDto
+{
+    [JsonPropertyName("name")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Name { get; init; }
+
+    [JsonPropertyName("arguments")]
+    public required string Arguments { get; init; }
 }

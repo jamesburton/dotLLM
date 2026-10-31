@@ -5,6 +5,7 @@ using DotLLM.Server.Models;
 using DotLLM.Server.RateLimiting;
 using DotLLM.Tokenizers;
 using DotLLM.Tokenizers.Reasoning;
+using DotLLM.Tokenizers.ToolCallParsers;
 
 namespace DotLLM.Server.Endpoints;
 
@@ -483,6 +484,34 @@ public static class ChatCompletionEndpoint
         var suppressor = hasTools ? new StreamingToolCallAccumulator(toolParser!) : null;
         int emittedLength = 0;
 
+        // (#1342) The first Qwen-XML call streams its id, name and arguments as deltas instead of arriving whole in the
+        // final chunk. Other parsers keep the hold-back-then-emit path.
+        var toolStreamer = hasTools && toolParser is QwenXmlToolCallParser ? new QwenXmlToolCallStreamer(tools) : null;
+
+        async Task WriteToolDeltasAsync(List<ToolCallStreamDelta> deltas)
+        {
+            foreach (var d in deltas)
+            {
+                await WriteSseChunk(httpContext, new ChatCompletionChunk
+                {
+                    Id = requestId,
+                    Model = modelId,
+                    Choices = [new ChatChunkChoiceDto
+                    {
+                        Delta = new ChatDeltaDto
+                        {
+                            ToolCalls = [new StreamingToolCallDto
+                            {
+                                Index = d.Index,
+                                Id = d.Id,
+                                Function = new StreamingToolCallFunctionDto { Name = d.Name, Arguments = d.ArgumentsFragment },
+                            }],
+                        },
+                    }],
+                }, ct);
+            }
+        }
+
         async Task EmitAsync(ReasoningChunk chunk, LogprobsDto? logprobs)
         {
             // Reasoning and answer text go out as separate deltas, reasoning first. A token that only fed
@@ -508,8 +537,13 @@ public static class ChatCompletionEndpoint
                 string content = chunk.Content.Length > 0 && suppressor is not null
                     ? suppressor.AppendStreamable(chunk.Content)
                     : chunk.Content;
+                var toolDeltas = toolStreamer is not null && chunk.Content.Length > 0 ? toolStreamer.Feed(chunk.Content) : null;
                 if (chunk.Content.Length > 0 && content.Length == 0)
+                {
+                    if (toolDeltas is { Count: > 0 })
+                        await WriteToolDeltasAsync(toolDeltas);
                     return;
+                }
                 emittedLength += content.Length;
                 await WriteSseChunk(httpContext, new ChatCompletionChunk
                 {
@@ -521,6 +555,8 @@ public static class ChatCompletionEndpoint
                         Logprobs = logprobs,
                     }],
                 }, ct);
+                if (toolDeltas is { Count: > 0 })
+                    await WriteToolDeltasAsync(toolDeltas);
             }
         }
 
@@ -582,17 +618,27 @@ public static class ChatCompletionEndpoint
         // Detect tool calls in the accumulated answer
         string text = sb.ToString();
         ToolCall[]? toolCalls = null;
+        bool streamedCallZero = false;
         // #456: see the non-streaming path — the effective parser honours tool_choice.
         if (toolParser is not null && tools is { Length: > 0 })
         {
             toolCalls = ApplyParallelToolCalls(toolParser.TryParse(text, tools), request.ParallelToolCalls);
+            if (toolStreamer is { Started: true })
+            {
+                // (#1342) Call 0 already went out as deltas: only the calls after it remain, indexed from 1. A call cut off
+                // mid-arguments (max_tokens, abort) leaves the real finish reason: the client saw a prefix, never `tool_calls`.
+                toolCalls = toolCalls is { Length: > 1 } ? toolCalls[1..] : null;
+                streamedCallZero = true;
+                if (toolStreamer.Completed)
+                    finishReason = FinishReason.ToolCalls;
+            }
             if (toolCalls is { Length: > 0 })
                 finishReason = FinishReason.ToolCalls;
         }
 
         // Text held back as "probably a tool call" that did not parse into one (a truncated call,
         // a forced choice that ran out of tokens) is still the model's answer: deliver it.
-        if (toolCalls is not { Length: > 0 } && emittedLength < text.Length)
+        if (toolCalls is not { Length: > 0 } && !streamedCallZero && emittedLength < text.Length)
         {
             await WriteSseChunk(httpContext, new ChatCompletionChunk
             {
@@ -604,7 +650,7 @@ public static class ChatCompletionEndpoint
 
         // Final chunk with finish_reason
         var finalDelta = toolCalls is { Length: > 0 }
-            ? new ChatDeltaDto { ToolCalls = RequestConverter.ToStreamingToolCallDtos(toolCalls) }
+            ? new ChatDeltaDto { ToolCalls = RequestConverter.ToStreamingToolCallDtos(toolCalls, streamedCallZero ? 1 : 0) }
             : new ChatDeltaDto();
 
         int promptTokens = timings?.PrefillTokenCount ?? 0;
