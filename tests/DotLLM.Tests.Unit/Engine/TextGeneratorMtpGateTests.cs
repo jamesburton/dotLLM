@@ -104,6 +104,25 @@ public sealed class TextGeneratorMtpGateTests : IDisposable
     }
 
     [Fact]
+    public void SpeculativeStats_AcceptedNeverExceedsDrafted_AndTheTargetTokenIsReportedSeparately()
+    {
+        // #1243: the MTP loop used to count every emitted token (accepted drafts AND each round's own target token) as "accepted", so with perfect
+        // drafts accepted > drafted. Accepted is now drafts only; the per-round target token is SpeculativeSteps.
+        using var model = NewModel(draftRight: true, plainMs: 20, rowMs: 2, fixedMs: 6);
+        var gen = new TextGenerator(model, new Tok(), mtpEnabled: true, mtpAdaptive: true, speculativeCandidates: 3);
+        gen.MtpGate!.RecordSegment(false, 40, 40 * 20.0);
+        var resp = gen.Generate("p", Greedy(48));
+        var t = resp.Timings;
+
+        Assert.True(t.SpeculativeDraftTokens > 0 && t.SpeculativeSteps > 0);
+        Assert.True(t.SpeculativeAcceptedTokens <= t.SpeculativeDraftTokens, $"accepted {t.SpeculativeAcceptedTokens} > drafted {t.SpeculativeDraftTokens}");
+        Assert.Equal(t.SpeculativeDraftTokens, t.SpeculativeAcceptedTokens);   // perfect drafts: every draft is accepted
+        // Every emitted token except the prefill one is an accepted draft or one round's target token.
+        Assert.InRange(t.SpeculativeAcceptedTokens + t.SpeculativeSteps, resp.GeneratedTokenIds.Length - 1, resp.GeneratedTokenIds.Length);   // a final round may overshoot max_tokens by one
+        Assert.Equal(1f, t.SpeculativeAcceptanceRate);
+    }
+
+    [Fact]
     public void Calibration_IsSkipped_ForShortRequests_AndWhenAPlainSampleExists()
     {
         using var model = NewModel(draftRight: true, plainMs: 20, rowMs: 2, fixedMs: 6);
@@ -128,7 +147,7 @@ public sealed class TextGeneratorMtpGateTests : IDisposable
         var resp = gen.Generate("p", Greedy(48));
 
         Assert.Equal(reference.Text, resp.Text);
-        Assert.True(resp.Timings.SpeculativeAcceptedTokens >= 40, $"accepted {resp.Timings.SpeculativeAcceptedTokens}");
+        Assert.True(resp.Timings.SpeculativeAcceptedTokens >= 30, $"accepted {resp.Timings.SpeculativeAcceptedTokens}");
         Assert.True(model.TrunkForwardCount < 20, $"{model.TrunkForwardCount} trunk forwards: MTP rounds must carry several tokens each");
         Assert.True(gen.MtpGate.MtpMsPerToken > 0 && gen.MtpGate.MtpMsPerToken < gen.MtpGate.PlainMsPerToken);
     }

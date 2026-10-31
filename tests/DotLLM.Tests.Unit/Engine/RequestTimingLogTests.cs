@@ -45,7 +45,7 @@ public sealed class RequestTimingLogTests
 
         string line = RequestTimingLog.Format(t);
 
-        Assert.Contains("draft acceptance 0.500 (20/40), mean len 2.50", line);
+        Assert.Contains("draft acceptance 0.500 (20/40), mean len 3.50", line);
         Assert.DoesNotContain("prompt cache", line);
     }
 
