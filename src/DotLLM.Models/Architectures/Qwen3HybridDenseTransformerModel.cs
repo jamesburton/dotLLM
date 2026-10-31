@@ -1975,12 +1975,24 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
             kvCache.Update(kRef, vRef, positions, kvSlot);
 
             int seqKv = kvCache.CurrentLength;
-            var cachedK = kvCache.GetKeysRef(kvSlot);
-            var cachedV = kvCache.GetValuesRef(kvSlot);
 
-            Attention.Execute(q, (float*)cachedK.DataPointer, (float*)cachedV.DataPointer, attnOut,
-                seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], pool: null,
-                slidingWindowSize: null);
+            if (kvCache is IQuantizedKvCache qkvCache)
+            {
+                // Quantized (Q8_0/Q4_0) cache has no fp32 K/V buffers (GetKeysRef yields a null pointer, #1482):
+                // dequantize tiles on the fly inside the kernel (default 1/sqrt(headDim) scale matches this path).
+                Attention.Execute(q, qkvCache, kvSlot, attnOut,
+                    seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], pool: null,
+                    slidingWindowSize: null);
+            }
+            else
+            {
+                var cachedK = kvCache.GetKeysRef(kvSlot);
+                var cachedV = kvCache.GetValuesRef(kvSlot);
+
+                Attention.Execute(q, (float*)cachedK.DataPointer, (float*)cachedV.DataPointer, attnOut,
+                    seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], pool: null,
+                    slidingWindowSize: null);
+            }
         }
         else
         {
