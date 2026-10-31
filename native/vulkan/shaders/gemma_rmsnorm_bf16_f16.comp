@@ -1,0 +1,43 @@
+#version 450
+// EmbeddingGemma pre-norm (issue #1472): out[r, :] = f16(x[r, :] / rms(x[r, :]) * w[:]), one workgroup per row.
+//
+// The residual stream x is stored BF16 (raw 16-bit words): EmbeddingGemma's residual reaches |x| ~ 1.5e5 in layers 22-23 (measured with the CPU
+// DOTLLM_AMAX_PROBE on the 103-text set; HF: "activations do not support float16"), far past F16's 65504, so F16 residual storage overflows.
+// BF16 keeps the F32 exponent range at half the bytes of F32 (docs/PRECISION.md rule 1: FP16/BF16 is the widest default). The sum of squares is
+// F32 in registers / LDS; the normalised row (|v| <= a few hundred) is rounded to F16 once, ready for the F16 GEMM. w is the GGUF norm weight
+// as stored (llama.cpp's converter has already added Gemma's +1). Dispatch: local_size_x = 256, groupCount.x = rows. Width <= 16 * 256.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufX   { uint16_t x[]; };      // [rows, n] BF16 residual
+layout(set = 0, binding = 1, std430) readonly  buffer BufW   { float w[]; };         // [n]
+layout(set = 0, binding = 2, std430) writeonly buffer BufOut { float16_t outp[]; };  // [rows, n] F16
+
+layout(push_constant) uniform PushConstants {
+    uint  n;
+    float eps;
+} pc;
+
+shared float red[256];
+
+float bf(uint i) { return uintBitsToFloat(uint(x[i]) << 16); }
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint base = gl_WorkGroupID.x * pc.n;
+    float s = 0.0;
+    for (uint i = tid; i < pc.n; i += 256u) { float v = bf(base + i); s += v * v; }
+    red[tid] = s;
+    barrier();
+    for (uint k = 128u; k > 0u; k >>= 1u) {
+        if (tid < k) red[tid] += red[tid + k];
+        barrier();
+    }
+    float inv = inversesqrt(red[0] / float(pc.n) + pc.eps);
+    for (uint i = tid; i < pc.n; i += 256u)
+        outp[base + i] = float16_t(bf(base + i) * inv * w[i]);
+}

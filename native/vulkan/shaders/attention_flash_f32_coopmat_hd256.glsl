@@ -93,9 +93,25 @@
 
 layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
 
+#if defined(ACT_F16)
+// ACT_F16 (issue #1472, EmbeddingGemma on the F16-activation encoder): Q and the output are F16 in memory; K / V are F16 too (KV_F16 is
+// defined with it). Q_LOAD widens to F32 (lossless: Q is staged to F16 in LDS anyway) and the output is the F32 accumulator rounded once.
+// Because Q and K are already exactly F16 the hi/lo split's lo parts are identically zero, so this variant skips the lo tiles and the two
+// extra MMAs (same scores as the split would give, less LDS and matrix work).
+layout(set = 0, binding = 0, std430) readonly  buffer BufQ   { float16_t q[]; };    // [seq_q,  num_heads    * head_dim] F16
+#define Q_LOAD(i) float(q[i])
+#else
 layout(set = 0, binding = 0, std430) readonly  buffer BufQ   { float q[]; };    // [seq_q,  num_heads    * head_dim]
+#define Q_LOAD(i) q[i]
+#endif
 #include "kv_load.glsl"                                       // BufK / BufV (binding 1 / 2), KV_K(i) / KV_V(i)
+#if defined(ACT_F16)
+layout(set = 0, binding = 3, std430) writeonly buffer BufOut { float16_t outp[]; }; // [seq_q,  num_heads    * head_dim] F16
+#define OUT_STORE(i, v) outp[i] = float16_t(v)
+#else
 layout(set = 0, binding = 3, std430) writeonly buffer BufOut { float outp[]; }; // [seq_q,  num_heads    * head_dim]
+#define OUT_STORE(i, v) outp[i] = (v)
+#endif
 
 layout(push_constant) uniform PushConstants {
     uint  seqQ;
@@ -108,7 +124,7 @@ layout(push_constant) uniform PushConstants {
     uint  useAlibi;        // 0 = disabled, 1 = standard fixed ALiBi slopes
     float softCap;         // 0.0 = disabled, >0 = tanh-capped scores
     float scaleOverride;   // 0.0 = use 1/sqrt(headDim), >0 = use this scale (Gemma 3 QPAS)
-    uint  maskMode;        // 0 = Causal, 1 = Bidirectional, 2 = Hybrid (diffusion canvas)
+    uint  maskMode;        // 0 = Causal, 1 = Bidirectional, 2 = Hybrid (diffusion canvas), 3 = symmetric window (EmbeddingGemma, #1472)
     uint  prefixLen;       // Hybrid only: positions < prefixLen stay causal, >= are bidirectional
 } pc;
 
@@ -125,14 +141,19 @@ layout(constant_id = 0) const uint REQUIRE_INVARIANT_PV = 1u;
 // Causal-component mask — byte-identical semantics to attention_flash_f32.comp
 // and the CPU reference (DotLLM.Cpu.Kernels.Attention.ApplyMask).
 bool isMasked(uint tkv, uint posQ, uint maskMode, uint prefixLen) {
+#if defined(SYM_WINDOW)
+    if (maskMode == 3u) return false;
+#endif
     if (maskMode == 1u) return false;
     if (maskMode == 2u && posQ >= prefixLen) return false;
     return tkv > posQ;
 }
 
 shared float16_t qTile [BR * MAX_HEAD_DIM];
+#if !defined(ACT_F16)
 shared float16_t qTileLo[BR * MAX_HEAD_DIM];
 shared float16_t kvTileLo[BC * KV_D];       // Q rows, f16, stride MAX_HEAD_DIM
+#endif
 shared float16_t kvTile[BC * KV_D];              // K d-chunk, then V d-chunk
 shared float     sTile [BR * S_STRIDE];           // QK^T scores (f32)
 shared float16_t pTile [BR * P_STRIDE];           // exp(s - max) fed to P·V
@@ -226,11 +247,13 @@ void main() {
         uint tq = qStartRow + r;
         float val = 0.0;
         if (tq < pc.seqQ && d < pc.headDim) {
-            val = q[tq * qStride + hq * pc.headDim + d];
+            val = Q_LOAD(tq * qStride + hq * pc.headDim + d);
         }
         float16_t hiq = float16_t(val);
         qTile[r * uint(MAX_HEAD_DIM) + d] = hiq;
+#if !defined(ACT_F16)
         qTileLo[r * uint(MAX_HEAD_DIM) + d] = float16_t(val - float(hiq));
+#endif
     }
     for (uint r = rowsInTile + tid; r < uint(BR); r += uint(WG_SIZE)) {
         for (uint c = 0u; c < uint(BC); c++) {
@@ -250,12 +273,24 @@ void main() {
 
     // 2. KV tile loop. Causal early-exit identical to the scalar FA shader.
     uint kvEnd = pc.seqKv;
+    uint kvStart = 0u;
     if (pc.maskMode == 0u) {
         uint lastPosQ = pc.positionOffset + qStartRow + rowsInTile - 1u;
         kvEnd = min(pc.seqKv, lastPosQ + 1u);
     }
+#if defined(SYM_WINDOW)
+    else if (pc.maskMode == 3u && pc.slidingWindow > 0u) {
+        // Symmetric window: only keys within W/2 of some row of this query tile can be visible. Skip whole KV tiles outside
+        // [firstPosQ - W/2, lastPosQ + W/2]; the per-cell mask still decides inside the boundary tiles. (tStart stays a BC multiple.)
+        uint halfW = pc.slidingWindow >> 1u;
+        uint firstQ = pc.positionOffset + qStartRow;
+        uint lastQ = firstQ + rowsInTile - 1u;
+        kvEnd = min(pc.seqKv, lastQ + halfW + 1u);
+        kvStart = ((firstQ > halfW ? firstQ - halfW : 0u) / uint(BC)) * uint(BC);
+    }
+#endif
 
-    for (uint tStart = 0u; tStart < kvEnd; tStart += uint(BC)) {
+    for (uint tStart = kvStart; tStart < kvEnd; tStart += uint(BC)) {
         uint tileLen = min(uint(BC), kvEnd - tStart);
 
         // #533's safe-tile classification, hoisted here because #543's f32 tail
@@ -266,7 +301,11 @@ void main() {
         uint firstPosQ = pc.positionOffset + qStartRow;
         bool tileSafe = (REQUIRE_INVARIANT_PV == 0u)
             || ((tileLen == uint(BC))
+#if defined(SYM_WINDOW)
+                && (pc.maskMode == 1u || pc.maskMode == 3u || (tStart + uint(BC)) <= firstPosQ + 1u));
+#else
                 && (pc.maskMode == 1u || (tStart + uint(BC)) <= firstPosQ + 1u));
+#endif
 
         // 2a/2b. S = Q x K^T on the matrix cores, K staged in KV_D-wide d-chunks (the full 64 x 256 f16 tile would
         //     cost 32 KB of LDS). The F32 accumulator is carried across chunks, so each output still reduces d in
@@ -286,7 +325,9 @@ void main() {
                 }
                 float16_t hik = float16_t(val);
                 kvTile[c * uint(KV_D) + dl] = hik;
+#if !defined(ACT_F16)
                 kvTileLo[c * uint(KV_D) + dl] = float16_t(val - float(hik));
+#endif
             }
             barrier();
             for (uint ck = 0u; gl_SubgroupID < uint(KV_SLICES) && ck < dLen / uint(MAT_K); ck++) {
@@ -296,12 +337,14 @@ void main() {
                 coopMatLoad(matQ,  qTile,  dBase + dl,                            uint(MAX_HEAD_DIM), gl_CooperativeMatrixLayoutRowMajor);
                 coopMatLoad(matKt, kvTile, kslice * 16u * uint(KV_D) + dl,         uint(KV_D),         gl_CooperativeMatrixLayoutColumnMajor);
                 accS = coopMatMulAdd(matQ, matKt, accS);
+#if !defined(ACT_F16)
                 coopmat<float16_t, gl_ScopeSubgroup, BR, MAT_K, gl_MatrixUseA> matQl;
                 coopmat<float16_t, gl_ScopeSubgroup, MAT_K, MAT_K, gl_MatrixUseB> matKl;
                 coopMatLoad(matQl, qTileLo, dBase + dl, uint(MAX_HEAD_DIM), gl_CooperativeMatrixLayoutRowMajor);
                 coopMatLoad(matKl, kvTileLo, kslice * 16u * uint(KV_D) + dl, uint(KV_D), gl_CooperativeMatrixLayoutColumnMajor);
                 accS = coopMatMulAdd(matQ, matKl, accS);
                 accS = coopMatMulAdd(matQl, matKt, accS);
+#endif
             }
             barrier();   // the next chunk (or V round 0) restages kvTile
         }
@@ -336,9 +379,18 @@ void main() {
                 continue;
             }
             uint posQ = pc.positionOffset + qStartRow + r;
+#if defined(SYM_WINDOW)
+            bool masked =
+                isMasked(tkv, posQ, pc.maskMode, pc.prefixLen) ||
+                (pc.maskMode == 3u
+                    // Symmetric window (llama.cpp LLAMA_SWA_TYPE_SYMMETRIC): keys q - W/2 .. q + W/2 inclusive; W == 0 = full bidirectional.
+                    ? (pc.slidingWindow > 0u && (posQ > tkv ? posQ - tkv : tkv - posQ) > (pc.slidingWindow >> 1u))
+                    : (pc.slidingWindow > 0u && posQ >= tkv && (posQ - tkv) >= pc.slidingWindow));
+#else
             bool masked =
                 isMasked(tkv, posQ, pc.maskMode, pc.prefixLen) ||
                 (pc.slidingWindow > 0u && posQ >= tkv && (posQ - tkv) >= pc.slidingWindow);
+#endif
             if (masked) {
                 sTile[sIdx] = NEG_INF;
             } else {
@@ -562,7 +614,7 @@ void main() {
             if (r >= rowsInTile) continue;
             float sum = runningSum[r];
             float inv = (sum > 1e-10) ? (1.0 / sum) : 0.0;
-            outp[(qStartRow + r) * qStride + hq * pc.headDim + d0] = oReg[i] * inv;
+            OUT_STORE((qStartRow + r) * qStride + hq * pc.headDim + d0, oReg[i] * inv);
         }
     }
 }

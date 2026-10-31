@@ -582,8 +582,8 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         VulkanDevice.Buffer q, long qOffset, VulkanDevice.Buffer k, VulkanDevice.Buffer v, long kvOffset,
         VulkanDevice.Buffer output, long outOffset,
         int seqLen, int numHeads, int numKvHeads, int headDim, float scaleOverride = 0.0f,
-        AttentionMaskMode maskMode = AttentionMaskMode.Causal)
-        => RecordCore(cmdBuf, q, k, v, output, seqLen, seqLen, numHeads, numKvHeads, headDim, 0, 0, false, 0.0f, scaleOverride,
+        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int slidingWindow = 0)
+        => RecordCore(cmdBuf, q, k, v, output, seqLen, seqLen, numHeads, numKvHeads, headDim, 0, slidingWindow, false, 0.0f, scaleOverride,
             maskMode, 0, qOffset, kvOffset, kvOffset, outOffset);
 
     private unsafe void RecordCore(
@@ -629,6 +629,9 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         bool useHd64 = _hd64Pipeline is not null && HeadDim64Enabled
             && headDim <= HeadDim64Threshold && (seqKv >= SeqKvThreshold || ActivationsF16);   // #1474: the F16-activation twin (BERT encoders, short bidirectional sequences) takes the LDS-halved pipeline at any length: measured +9-16% batched
         bool useHd256 = headDim > MaxHeadDim;   // SupportedMaxHeadDim above guarantees the pipeline exists
+        if (maskMode == AttentionMaskMode.SymmetricWindow && !(useHd256 && ActivationsF16 && KvStorage == VulkanKvStorage.F16))
+            throw new NotSupportedException(
+                "AttentionMaskMode.SymmetricWindow is implemented only by the F16-activation head_dim-256 coopmat pipeline (EmbeddingGemma, #1472).");
         ComputePipeline pipeline = useHd256 ? _hd256Pipeline! : useHd64 ? _hd64Pipeline! : _pipeline;
         DescriptorSetCache descriptorCache = useHd256 ? _hd256DescriptorCache! : useHd64 ? _hd64DescriptorCache! : _descriptorCache;
 
