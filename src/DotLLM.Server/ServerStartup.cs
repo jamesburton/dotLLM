@@ -256,11 +256,12 @@ public static class ServerStartup
         // #741: architecture 'bert' (F16 weights) has a Vulkan encoder. Explicit vulkan must succeed or fail loudly; auto uses it when
         // a Vulkan device exists and the weights are F16, else the CPU encoder (with the usual warning); CUDA and the other encoder
         // architectures are refused (no silent CPU run for an explicit GPU request).
-        bool vulkanCapable = config.Architecture == Architecture.Bert;
+        bool vulkanCapable = config.Architecture == Architecture.Bert;   // auto-selects Vulkan only for bert (F16); nomic-bert / nomic-bert-moe (#1471) are explicit --device vulkan
+        bool vulkanExplicit = vulkanCapable || config.Architecture is Architecture.NomicBert or Architecture.NomicBertMoe;
         IModel? model = null;
         if (spec.Kind == DeviceKind.Vulkan || (spec.Kind == DeviceKind.Auto && vulkanCapable && DotLLM.Vulkan.VulkanDevice.IsAvailable()))
         {
-            if (!vulkanCapable)
+            if (!vulkanExplicit)
             {
                 gguf.Dispose();
                 throw new NotSupportedException(
