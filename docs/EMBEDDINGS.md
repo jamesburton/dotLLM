@@ -313,7 +313,39 @@ paired in order V C C V V C (raw: `benchmarks/EmbeddingBench/results/vulkan-1406
 
 The "9-30x" quoted in the survey compared against the pre-#1404 CPU numbers (163-182 tok/s); F16 GEMM on the CPU has since improved ~4.5x, so
 the honest Vulkan advantage today is 2x (short) to ~8x (512 tokens). Vulkan is per-document-latency bound at 64 tokens (35 ms: launch +
-submit per document); batching several short documents into one forward (padding-free varlen) is the next lever (issue filed).
+submit per document); batching several short documents into one forward is #1437, below.
+
+**Packed varlen forward (#1437).** `VulkanTransformerModel.ForwardHiddenForPooling` now packs consecutive documents (>= 2 tokens each) into one
+forward up to a token budget (`DOTLLM_EMBED_PACK_TOKENS`, default 1024; `DOTLLM_EMBED_PACK=0` turns it off). No padding: the token rows are
+concatenated, so every GEMM / norm / RoPE / FFN op runs once over all rows with weights read once; positions restart per document (RoPE reads the
+per-row positions buffer); attention is one causal coopmat-flash dispatch **per document** over its slice of Q/K/V/AttnOutput (sub-range
+descriptors, byte offsets multiple of 256: no copies, no new F32 storage, no shader change), so a query never sees another document's keys; last/cls
+pooling copies each document's pooled row into one `[docs, hidden]` norm + readback (4 KiB per document). Scope: `Architecture.Qwen` (validated on
+Qwen3-Embedding-0.6B) with no window / soft-cap / sinks; other models and 1-token documents keep the one-document path. `/v1/embeddings`, `dotllm embed`
+and `EmbeddingBench` get it through the existing `ForwardHiddenForPooling` call (the #1405 batcher already hands over the whole batch).
+
+Per-document cost, Qwen3-Embedding-0.6B F16, iGPU 8060S, `gpu-lock` + `cpu-bench` held, paired off/on/on/off, min-max over reps (ms per document,
+`benchmarks/EmbeddingBench/results/vulkan-pack-1437.jsonl`, `EmbeddingBench vkpack --device vulkan`). A forward costs a ~31 ms floor at <= 64 tokens
+(weights streamed once, 28 layers of dispatches), so packing amortises it:
+
+| doc tokens | one per submit | pack 4 | pack 8 | pack 16 (budget 1024) |
+|---|---|---|---|---|
+| 16 | 30.6-31.3 | 8.6 (3.6x) | 4.9 (6.3x) | 3.2 (9.7x) |
+| 32 | 31.8-32.0 | 9.9 (3.2x) | 6.3 (5.1x) | 4.7-4.8 (6.7x) |
+| 64 | 34.6-34.8 | 12.8 (2.7x) | 9.4-9.6 (3.6x) | 7.1-7.2 (4.9x) |
+| 128 | 40.0-40.6 | 19.3-19.5 (2.1x) | 14.6-14.9 (2.7x) | 14.6-15.0 (2.7x, budget splits it into 2 x 8) |
+| 256 (32 docs) | 54 | | | 31.6 at budget 1024, 29.7-30.0 at 2048+ (1.8x) |
+
+Token budget sweep (32 x 64 tokens): 256 -> 12.7 ms/doc, 512 -> 9.4, 1024 -> 7.2, 2048 -> 6.7-6.8, 4096 -> 6.7; the default stays 1024 (scratch grows with
+the budget; beyond it the win is <= 6 %). 64-token documents go from 29 docs/s to about 140 docs/s (4.9x).
+
+Parity (`Qwen3EmbeddingPackedTests`, 10 documents of 2-110 tokens including EOS-only-ish short ones, unicode and a repeated long one): packed vs
+one-at-a-time Vulkan and packed vs CPU last-token cosine >= 0.9999 for every document; reversed pack order gives the same per-document vectors;
+mean pooling packed vs single >= 0.9999; a pack split by a 40-token budget equals single. **Control arm:** a test-only mutant turns the attention into
+one causal dispatch over the concatenation (cross-document leak); the same comparison must then fail for the later documents (it does: the test
+asserts at least N-2 of the N-1 later documents drop below 0.9999 and that document 0, which cannot see a leak, does not), so a wrong mask is detectable.
+Not covered: BERT-class encoders (#741, bidirectional, would need the per-document slice with the Bidirectional mask), CUDA (no embedding path), other
+decoder architectures (gated off until validated).
 No CUDA run (T5500 needs the user's go-ahead). End-to-end `/v1/embeddings` on Vulkan returns 1024-d vectors (smoke-tested, 2 inputs, 10 prompt tokens).
 
 **#741 (GPU BERT encoder), plan only, not started:** needs bidirectional attention (the Vulkan attention shader has a Bidirectional
