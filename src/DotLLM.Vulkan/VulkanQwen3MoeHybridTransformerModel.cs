@@ -100,7 +100,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     private readonly VulkanDevice.Buffer? _moeUnitScale;
 
     /// <summary>Which routed-MoE fast paths were RECORDED (test hook: proves a branch was taken, not merely that a kernel exists).</summary>
-    internal enum MoePath { GroupedPrefill, GroupedGateUpNotQ4K, GroupedLegacyDown, GroupedMmqPrefill, MmvqDown, MmvqLegacyDown, FusedDecode, IqMmvqGateUp, IqMmvqDown, GroupedIqGateUp, GroupedIqDown }
+    internal enum MoePath { GroupedPrefill, GroupedGateUpNotQ4K, GroupedLegacyDown, GroupedMmqPrefill, MmvqDown, MmvqLegacyDown, FusedDecode, IqMmvqGateUp, IqMmvqDown, GroupedIqGateUp, GroupedIqDown, SharedOverlap }
     internal readonly long[] MoePathCounts = new long[Enum.GetValues<MoePath>().Length];
 
     /// <summary>Record-time counters for the 2..8-row fast paths (#876): prove a fast path ran by counting, not by IsSupported.</summary>
@@ -2323,10 +2323,17 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             KernelSupport.ComputeTransferFullBarrier(cmdBuf);
         }
 
+        // #1452: the shared-expert chain has no dependency on the routed experts until the final gated add, so (2..8 rows, packed Q8_0 shared
+        // weights) its steps ride the routed chain's barrier epochs instead of running as ~11 serial barrier epochs after the scatter.
+        _ovNext = -1;
+        bool ovShared = CanOverlapShared(moeW, seqLen, hidden);
+        if (ovShared) OvBegin(moeW, postAttnNormWeight, seqLen, hidden, eps);
+
         // 1. Router gate logits.
         RecordMatmul(cmdBuf, moeW.Gate, QuantizationType.F32,
             _state.NormOutput, _state.MoeRouterLogits,
             outputDim: numE, inputDim: hidden, seqLen: seqLen);
+        OvPoint(cmdBuf);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("router");
 
@@ -2341,6 +2348,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         _kernels.MoeTopkSoftmax.Record(cmdBuf,
             _state.MoeRouterLogits, _state.MoeTopkIndices, _state.MoeTopkWeights,
             seqLen: seqLen, numExperts: numE, k: topK, normTopKProb: moeW.NormTopKProb);
+        OvPoint(cmdBuf);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("topk");
         // #939 expert tiering: the host makes the selected experts resident (ends this command buffer, loads misses, reopens one) and rewrites the ids
@@ -2368,6 +2376,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             _kernels.MoeBroadcast.Record(cmdBuf,
                 _state.NormOutput, _state.MoeExpandedInput,
                 seqLen: seqLen, topK: topK, hidden: hidden);
+            OvPoint(cmdBuf);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
             MoeStage("broadcast");
         }
@@ -2467,12 +2476,14 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 moeW.W3Bank, _state.MoeExpandedInput, _state.MoeTopkIndices, _state.MoeUpInter,
                 m: interm, k: hidden, n: expandedRows, numExperts: numE);
         }
+        OvPoint(cmdBuf);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("gate_up");
 
         // 5. SwiGLU: silu(gate) * up
         _kernels.SwiGlu.Record(cmdBuf, _state.MoeGateInter, _state.MoeUpInter, _state.MoeSiluInter,
             n: expandedRows * interm);
+        OvPoint(cmdBuf);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("swiglu");
 
@@ -2512,12 +2523,14 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 moeW.W2Bank, _state.MoeSiluInter, _state.MoeTopkIndices, _state.MoeDownRows,
                 m: hidden, k: interm, n: expandedRows, numExperts: numE);
         }
+        OvPoint(cmdBuf);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("down");
 
         }
 
         // 7. Weighted scatter into NormOutput.
+        if (_ovNext >= 0) OvFlush(cmdBuf);   // grouped / other routed variants reach fewer epochs: finish the shared chain before the scatter
         if (PerturbSkip == "scatter") { }
         else if (fusedGlue)
             _kernels.MoeWeightedScatterGrouped!.Record(cmdBuf,
@@ -2531,7 +2544,12 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         MoeStage("weighted_scatter");
 
         // 8. Shared-expert branch (Qwen1.5-MoE sigmoid-gated convention).
-        if (moeW.HasSharedExpert && PerturbSkip != "shared")
+        if (_ovNext >= 0)
+        {
+            OvFinish(cmdBuf);
+            MoeStage("shared_expert");
+        }
+        else if (moeW.HasSharedExpert && PerturbSkip != "shared")
         {
             RecordSharedExpert(cmdBuf, moeW, postAttnNormWeight, seqLen, hidden, eps);
             MoeStage("shared_expert");
@@ -2757,6 +2775,92 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                     "Add a kernel dispatch arm and an upload-side branch in " +
                     "VulkanQwen3MoeMoeUpload.UploadLayer.");
         }
+    }
+
+    // ── Shared-expert overlap (#1452) ────────────────────────────────────────
+
+    /// <summary>
+    /// Runtime switch for overlapping the 2..8-row shared-expert chain with the routed-expert chain (#1452);
+    /// <c>DOTLLM_VK_SHARED_OVERLAP=0</c> at startup disables (A/B and diagnostics).
+    /// </summary>
+    internal static bool SharedOverlapEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_SHARED_OVERLAP") != "0";
+
+    private const int SharedOverlapSteps = 6;
+    private int _ovNext = -1;   // next shared-chain step to record into the current routed barrier epoch; -1 = overlap inactive for this layer
+    private VulkanQwen3MoeMoeUpload.LayerBundle? _ovMoe;
+    private VulkanDevice.Buffer? _ovNorm;
+    private int _ovSeqLen, _ovHidden;
+    private float _ovEps;
+
+    /// <summary>
+    /// True when the shared-expert chain of this layer can ride the routed chain's barrier epochs: packed Q8_0 shared weights at 2..8 rows
+    /// (the multi-column MMVQ GEMV), the fused gated add, and a dedicated Q8_1 activation scratch (the routed gate/up own
+    /// <c>MoeExpandedInputXq/Xds</c>). Same kernels and inputs as the serial chain, so results are bit-identical.
+    /// </summary>
+    private bool CanOverlapShared(VulkanQwen3MoeMoeUpload.LayerBundle moeW, int seqLen, int hidden)
+        => SharedOverlapEnabled && moeW.HasSharedExpert && PerturbSkip != "shared"
+           && moeW.SharedQuantType == QuantizationType.Q8_0 && moeW.SharedExpertGate is not null
+           && moeW.SharedGate is not null && moeW.SharedUp is not null && moeW.SharedDown is not null
+           && moeW.Tier is null
+           && seqLen >= 2 && seqLen <= VulkanQwen3MoeHybridForwardState.SharedOverlapMaxRows && SmallRowQ8(seqLen)
+           && _kernels.MoeSharedGateAdd is not null && (hidden & 31) == 0 && (moeW.SharedIntermediateSize & 31) == 0
+           && _state.SharedXq is not null && _state.SharedXds is not null && _state.SharedSiluXq is not null && _state.SharedSiluXds is not null;
+
+    private void OvBegin(VulkanQwen3MoeMoeUpload.LayerBundle moeW, VulkanDevice.Buffer? norm, int seqLen, int hidden, float eps)
+    {
+        _ovMoe = moeW; _ovNorm = norm; _ovSeqLen = seqLen; _ovHidden = hidden; _ovEps = eps;
+        _ovNext = norm is null ? 1 : 0;   // qwen4exp pre-staged MoeSharedInput: no norm step
+    }
+
+    /// <summary>Records the next shared-chain step into the routed epoch that is about to close (call just before its barrier). No-op when inactive or done.</summary>
+    private void OvPoint(nint cmdBuf)
+    {
+        if (_ovNext < 0 || _ovNext >= SharedOverlapSteps) return;
+        var moeW = _ovMoe!; int seqLen = _ovSeqLen, hidden = _ovHidden, sharedI = moeW.SharedIntermediateSize;
+        switch (_ovNext++)
+        {
+            case 0:
+                _kernels.RmsNorm.Record(cmdBuf, _state.HiddenState, _ovNorm!, _state.MoeSharedInput, rowCount: seqLen, n: hidden, eps: _ovEps);
+                break;
+            case 1:
+                _kernels.QuantizeQ8_1RowsActivations!.Record(cmdBuf, _state.MoeSharedInput, _state.SharedXq!, _state.SharedXds!, n: seqLen, k: hidden);
+                break;
+            case 2:
+                CountSmallRow(SmallRowPath.Q8Multi); CountSmallRow(SmallRowPath.Q8Multi);
+                _kernels.MatMulQ8MmvqMulti!.Record(cmdBuf, moeW.SharedGate!, _state.SharedXq!, _state.SharedXds!, _state.MoeSharedGate, m: sharedI, k: hidden, n: seqLen);
+                _kernels.MatMulQ8MmvqMulti.Record(cmdBuf, moeW.SharedUp!, _state.SharedXq!, _state.SharedXds!, _state.MoeSharedUp, m: sharedI, k: hidden, n: seqLen);
+                break;
+            case 3:
+                _kernels.SwiGlu.Record(cmdBuf, _state.MoeSharedGate, _state.MoeSharedUp, _state.MoeSharedSilu, n: seqLen * sharedI);
+                break;
+            case 4:
+                _kernels.QuantizeQ8_1RowsActivations!.Record(cmdBuf, _state.MoeSharedSilu, _state.SharedSiluXq!, _state.SharedSiluXds!, n: seqLen, k: sharedI);
+                break;
+            case 5:
+                CountSmallRow(SmallRowPath.Q8Multi);
+                _kernels.MatMulQ8MmvqMulti!.Record(cmdBuf, moeW.SharedDown!, _state.SharedSiluXq!, _state.SharedSiluXds!, _state.MoeSharedSumA, m: hidden, k: sharedI, n: seqLen);
+                break;
+        }
+    }
+
+    /// <summary>Records any shared-chain steps the routed path did not reach (other routed variants hit fewer epochs), each in its own epoch.</summary>
+    private void OvFlush(nint cmdBuf)
+    {
+        while (_ovNext >= 0 && _ovNext < SharedOverlapSteps)
+        {
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            OvPoint(cmdBuf);
+        }
+    }
+
+    /// <summary>Closes the overlapped chain after the routed weighted scatter: the gated add into <c>NormOutput</c> (one fused pass).</summary>
+    private void OvFinish(nint cmdBuf)
+    {
+        CountMoePath(MoePath.SharedOverlap);
+        _kernels.MoeSharedGateAdd!.Record(cmdBuf, output: _state.NormOutput, b: _state.MoeSharedSumA, x: _state.MoeSharedInput,
+            gateWeight: _ovMoe!.SharedExpertGate!, seqLen: _ovSeqLen, hiddenSize: _ovHidden);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        _ovNext = -1; _ovMoe = null; _ovNorm = null;
     }
 
     /// <summary>

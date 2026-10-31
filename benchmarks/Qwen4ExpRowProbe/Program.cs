@@ -27,6 +27,7 @@ string[] prompts =
     "The French Revolution began in 1789 and transformed the political landscape of Europe. Key events included the storming of the Bastille, the Declaration of the Rights of Man, the Reign of Terror, and the rise of Napoleon Bonaparte, who eventually crowned himself emperor in 1804. Summarize the main causes.",
 };
 if (args[0] == "moestage") { MoeVerifyStage.Run(args); return; }
+if (args[0] == "ovident") { Environment.Exit(SharedOverlapIdent.Run(args)); return; }
 if (args[0] == "tier") { TierRun.Run(args); return; }
 if (args[0] == "kbench") { KBench.Run(args); return; }
 if (args[0] == "grbench") { GrBench.Run(args); return; }
