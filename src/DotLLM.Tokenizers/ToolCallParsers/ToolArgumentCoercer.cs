@@ -41,6 +41,10 @@ public static class ToolArgumentCoercer
         return result ?? calls;
     }
 
+    /// <summary>True when <paramref name="schema"/> declares a string type, i.e. <see cref="WriteTyped"/> keeps the text verbatim.</summary>
+    internal static bool DeclaresString(JsonElement schema)
+        => schema.ValueKind == JsonValueKind.Object && KindsOf(schema).Has(Kind.String);
+
     /// <summary>Finds the tool named <paramref name="name"/> in <paramref name="tools"/>.</summary>
     internal static ToolDefinition? Find(IReadOnlyList<ToolDefinition>? tools, string name)
     {

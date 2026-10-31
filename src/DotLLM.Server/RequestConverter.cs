@@ -298,7 +298,7 @@ public static class RequestConverter
     /// <summary>
     /// Converts engine tool calls to streaming deltas with distinct, zero-based indexes.
     /// </summary>
-    public static StreamingToolCallDto[] ToStreamingToolCallDtos(ToolCall[] toolCalls)
+    public static StreamingToolCallDto[] ToStreamingToolCallDtos(ToolCall[] toolCalls, int indexOffset = 0)
     {
         var calls = ToToolCallDtos(toolCalls);
         var result = new StreamingToolCallDto[calls.Length];
@@ -306,9 +306,9 @@ public static class RequestConverter
         {
             result[i] = new StreamingToolCallDto
             {
-                Index = i,
+                Index = i + indexOffset,
                 Id = calls[i].Id,
-                Function = calls[i].Function,
+                Function = new StreamingToolCallFunctionDto { Name = calls[i].Function.Name, Arguments = calls[i].Function.Arguments },
             };
         }
         return result;
