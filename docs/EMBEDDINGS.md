@@ -352,6 +352,25 @@ one causal dispatch over the concatenation (cross-document leak); the same compa
 asserts at least N-2 of the N-1 later documents drop below 0.9999 and that document 0, which cannot see a leak, does not), so a wrong mask is detectable.
 Not covered: BERT-class encoders (#741, bidirectional, would need the per-document slice with the Bidirectional mask), CUDA (no embedding path), other
 decoder architectures (gated off until validated).
+**#1465 follow-up: a single segment-aware attention dispatch does not pay (refuted by perturbation, 2026-10-31).** Qwen3-Embedding-0.6B F16,
+iGPU, `gpu-lock` + `cpu-bench` held, 3 reps per arm in interleaved order (A B C C B A A B C), call ms min-max for one packed call
+(`vkpack --device vulkan --pooling last`; seq 16/64 tokens x 16/32 docs; 32 x 64 splits into two 1024-token forwards). Arms: (0) shipped, one
+attention dispatch per document; (2) perturbation that records **only the first document's** attention dispatch (removes N-1 dispatches per layer and
+their work: an upper bound on what any fused dispatch could save); (1) the leak mutant, one causal dispatch over the whole concatenation.
+
+| docs x tokens | shipped | only 1st doc's attention (bound) | one dispatch over concatenation |
+|---|---|---|---|
+| 16 x 16 | 50.2-50.9 | 51.2-51.3 | 53.2-54.1 |
+| 32 x 16 | 75.2-75.9 | 74.7-75.0 | 89.3-90.5 |
+| 16 x 64 | 110.7-112.3 | 104.6-109.3 | 178.7-184.0 |
+| 32 x 64 | 222.4-223.5 | 212.1-222.4 | 359.6-367.3 |
+
+Deleting 15-31 of every layer's 16-32 attention dispatches (448-896 dispatches per forward) moves a 16-64 token pack by 0 to 4 % (at most 3-6 ms of
+110-225 ms, inside the run-to-run spread), so per-document dispatch overhead is not material; the forward is GEMM / FFN bound. A single non-segmented
+dispatch is far slower (full causal work over the concatenation, up to 1.7x). A true segment-aware kernel (block-diagonal skip in one dispatch) could
+therefore save at most that few percent, which does not justify a new shader. Not built. Still open and unmeasured here: other decoder architectures
+(Llama-style, Gemma; gated off until each is validated against the cosine >= 0.9999 gate and the cross-document-leak control) and the mean-pool tail.
+
 No CUDA run (T5500 needs the user's go-ahead). End-to-end `/v1/embeddings` on Vulkan returns 1024-d vectors (smoke-tested, 2 inputs, 10 prompt tokens).
 
 ### Vulkan BERT encoder (#741)
