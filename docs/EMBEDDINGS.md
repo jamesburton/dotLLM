@@ -23,7 +23,7 @@ Quote ranges, not points: the box is shared, so treat differences under ~15 % as
 | Qwen3-Embedding-0.6B | qwen3 (decoder) | 600M | 1024 | last | 32768 | yes (EOS appended automatically since #1398) | F16 |
 | multilingual-e5-small (XLM-R, SentencePiece Unigram) | bert | 118M | 384 | mean | 512 (some GGUFs say 511) | yes (#1401) | F16, Q8_0 |
 | EmbeddingGemma-300M | gemma-embedding (bidirectional Gemma3 + dense heads) | 300M | 768 | mean | 2048 | yes (#1399), CPU only | Q8_0 (ggml-org), F32 / F16 / BF16 (heads added) |
-| nomic-embed-text-v2-moe | nomic-bert-moe (XLM-R Unigram vocab) | 475M (8x277M, top-2) | 768 | mean | 512 | yes (#1400), CPU only | Q8_0 (official GGUF) |
+| nomic-embed-text-v2-moe | nomic-bert-moe (XLM-R Unigram vocab) | 475M (8x277M, top-2) | 768 | mean | 512 | yes (#1400), CPU + Vulkan (#1471) | Q8_0 (official GGUF) |
 
 Not attempted (same code path as a row above, or outside the 20-600M download rule): bge-large / e5-large / gte-large
 (bert), Qwen3-Embedding-4B/8B (qwen3 decoder), gte-Qwen2, bge-m3 and jina-v3/v4 (XLM-R / custom code; bge-m3 uses the same Unigram tokenizer that multilingual-e5 now loads through, #1401). Encoder = bidirectional BERT-style (`BertEncoderModel`, CPU only);
@@ -462,3 +462,17 @@ Throughput, docs/s (48 texts, B=1 / B=48, `gpu-lock` + `cpu-bench`; the first Vu
 **nomic-bert on Vulkan (#1471)**: `VulkanBertEncoderModel` also serves architecture `nomic-bert` (nomic-embed-text-v1.5; F16, F32 and Q8_0 weights). Differences from `bert`, all in the same packed one-command-buffer forward: no position table (positions enter only through RoPE; per-document positions restart at 0, uploaded as an int buffer); `rope_f16` rotates Q and K in place (NeoX pairing, F32 rotation with the range-reduced sin/cos of the decoder kernel, one F16 rounding at the store); the fused `attn_qkv` weight is split at upload into three row-range buffers (a row slice of a row-major tensor is contiguous, the same bytes, so no expansion and the existing three GEMMs are reused; a fused QKV *GEMM* was measured not to be worth building, bias adds are 0 % of the forward); SwiGLU FFN = gate GEMM + up GEMM + `bert_swiglu_f16` (silu(gate) * up, in place on up) + down GEMM; no QKV / FFN biases. CLI (`dotllm embed -d vulkan`), `serve` and `EmbeddingBench --device vulkan` route it.
 Parity vs the CPU encoder (48 texts, min / mean cosine): F16 0.9999990 / 0.9999996; Q8_0 vs CPU Q8_0 0.99849 / 0.99941 (CPU Q8 vs CPU F16 is 0.99689 / 0.99793 here, so the Vulkan Q8_0 path is closer to the reference than the CPU Q8_0 path). `Nomic_bert_vulkan_matches_cpu` (F16, F32 and Q8_0 files; gates 0.9999 / 0.9999 / 0.998 — the 3-token text is the worst case for Q8_0): packed vs CPU, packed vs a pack of one, unrelated texts separated, plus control arms: all-zero RoPE positions must be detected on every multi-token document, and so must a causal mask. (A *constant per-document* position offset is NOT a valid control: RoPE is relative, so it cancels in q.k; the first draft of the control asserted exactly that and correctly failed.)
 Throughput, docs/s (48 texts, mean 148 tokens, F16 weights, B=1 / B=48; `gpu-lock` + `cpu-bench`): Vulkan 95-97 / 185-192; CPU (32 threads) 13-14 / 4; Q8_0 Vulkan 111-112 / 205-212, CPU 9-10 / 3. That is about 7x at B=1 and about 47x batched (the CPU nomic encoder is slow at B=48 because mean 148-token documents are run one at a time with the 2048-context tables).
+
+
+**nomic-bert-moe on Vulkan (#1471)**: `VulkanBertEncoderModel` also serves `nomic-bert-moe` (nomic-embed-text-v2-moe, Q8_0 expert banks; explicit `--device vulkan`). Even layers are the biased-GELU FFN of the bert path; odd layers run the MoE FFN entirely on F16 activations in the same command buffer: `bert_moe_router_f16` (F32 dot of the F16 hidden row with the F32 router, softmax over all 8, top-2, weights NOT renormalised, ties to the lower id) -> `moe_expert_offsets` -> `moe_build_tile_list` -> `bert_moe_group_f16` (gather rows by expert, writes the inverse permutation) -> `moe_grouped_matmul_q8_0_coopmat_m64_hh` (f16vec4 in, float16_t out, fused tanh GELU on the up projection; the 3-D Q8_0 banks are read in place, no expansion) -> same kernel for down -> `bert_moe_combine_f16` (gather, fixed k order, one F16 rounding). A learned `blk.N.ffn_down_exps.bias`, when a GGUF carries it, is added by the following bias + residual + LayerNorm (the CPU order). F16/F32 banks are refused loudly (use `--device cpu`); the official GGUF only exists as Q8_0. Parity (`Nomic_bert_moe_q8_0_vulkan_matches_cpu`): cosine >= 0.998 vs the CPU Q8_0 encoder on 12 texts, single == packed, and two controls (wrong expert ids; renormalised top-k) are each detected on all multi-token documents. Throughput (EmbeddingBench `batch --pooled 1`, Q8_0, gpu-lock + cpu-bench held, 5 reps, docs/s median [min-max]; Vulkan measured twice, CPU once, 32 threads):
+
+| batch x seq | CPU | Vulkan |
+|---|---|---|
+| 1 x 64 | 15.6 [13.1-16.1] | 135-139 [59-142] |
+| 8 x 64 | 35.2 [32.5-36.0] | 376 [128-376] |
+| 32 x 64 | 40.5 [39.8-41.3] | 433-473 [219-479] |
+| 1 x 256 | 6.3 [6.3-6.4] | 74-75 [39-76] |
+| 8 x 256 | 8.7 [8.6-8.8] | 107 [81-107] |
+| 32 x 256 | 9.9 [9.7-10.0] | 106 [88-107] |
+
+About 9-12x CPU at every cell. Low min values are the clock-ramp outlier of the first reps of a cell.
