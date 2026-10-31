@@ -671,6 +671,39 @@ reads 18.2 against 21.0 for K=2), so the table was not re-run against llama.cpp;
 Refuted along the way: more rows per workgroup (NR 6 / 8 slower even at 2 columns), unrolling alone, reducing without the LDS tree (the cliffs follow the load schedule, not the epilogue), coalescing the activation loads (no change; the stride-32B pattern
 is not the cost), LDS-staged activations (already refuted in #1220), and a larger L0 hit rate (identical-address loads cost the same).
 
+**The #1511 structure applied to Q5_K, Q6_K and Q8_0 (issues #1515, #1516).** `Q4KVerifyProbe` now takes a format (`q4k|q5k|q6k|q8_0`) and a `hash` mode (output hash per column count and NR on fixed data, to diff an old and a new `.spv`).
+Probe numbers are gate/up 17408x5120, us/dispatch (GB/s of weights), medians of 5 reps, arms interleaved, GPU + CPU locks held.
+
+*Q5_K (the win).* The old multi-column shader was 1 row per workgroup, dword loads (7 per row-step), `subgroupAdd` per column, and read 153 GB/s at 2 columns falling to 67 GB/s at 8 and 37 at 16 (401 / 455 / 606 / 674 / 784 / 835 / 913 us at
+n = 2..8). `matmul_q5_k_gemv_f32_multi.comp` is now the Q4_K shader plus the qh bit: NR rows per workgroup, 16-byte loads (a 176-byte super-block is 11 uvec4: header, qh x2, qs x8), the pipelined loop, the dequantise-once
+`w = sc * code - min` and the `precise` fma chain, reduced by the fixed LDS tree. Default NR 4 for 2..12 columns, 3 for 13..16: n = 2..8 285 / 291 / 295 / 305 / 322 / 342 / 400 us (215 -> 153 GB/s), n = 12 487, n = 13..16 516 / 585 / 618 / 793.
+That is 1.4x at 2 columns, 2.1x at 4, 2.4x at 6, 2.3x at 8, 2.1x at 16. *This changes bits*: the old shader's `subgroupAdd` order and non-`precise` contraction were not defined (its own 3..16-column hashes
+differed between NR/NC specialisations, so no bit-exact oracle for it existed); the new one is deterministic in NR and NC, which `Q5KRows_MatchLaneOrderFmaOracleExactly` pins by replaying the lane order on the CPU (NR 1..4, 2..16 columns, M % NR != 0, odd block counts, the 1-block prologue; the oracle is the Q4_K one plus
+`code |= qh bit sb << 4`). Mutants killed: wrong qh bit (`sb ^ 1`, 8/8 cases fail), wrong qh word (8/8), half-window tail guard replaced by `true` (6/8), reordered fma pair (8/8). Against the single-row Q5_K GEMV the existing
+`Multi_EachColumnMatchesSingleRowGemv` tolerance still holds (every Q5_K case). End to end, `VerifyRowCurve` on Llama-3.2-3B-Instruct Q5_K_M (generic `VulkanTransformerModel`, ctx 64, `fwd` median ms of 3 reps x 5, base = origin/dev, 3 + 3 processes in
+base/new/new/base/base/new order; ranges are the min-max of the per-process medians): rows 1 / 2 / 3 / 4 / 6 / 8 / 12 / 16 13.1-13.3 / 16.1-16.4 / 18.9-19.3 / 22.2-22.4 / 25.3-25.4 / 28.8-29.5 / 37.4-38.5 / 51.1-51.8 ->
+13.0-13.1 / 13.7-13.9 / 14.6-14.8 / 15.2 / 16.3-16.6 / 19.0-19.2 / 24.3-24.4 / 35.5-36.0 (x0.99 / 0.85 / 0.76 / 0.68 / 0.65 / 0.66 / 0.65 / 0.69). The one-row forward does not use this shader and is unchanged.
+
+*Q4_K tables (#1516).* With the #1511 shader the 5/7-column cliff is gone, so the tables tuned to it are retired. Generic `VulkanTransformerModel` (`_smallRowQ4K`): NR 4 for 2..12 columns, 3 for 13..16. Qwen3-4B-Instruct-2507 Q4_K_M `VerifyRowCurve`
+(`fwd` ms, base -> new): 12 rows 30.1 -> 30.1-30.4, 13 34.9 -> 33.5, 14 37.3 -> 35.4, 15 43.7 -> 37.2, 16 53.4 -> 38.0 (-29%); 2..11 rows equal within 1.7%. Nemotron-H keeps one K-quant table for Q6_K (still has the cliff: see below) and gets its own Q4_K
+table (`Q4KRowsByColumns`: NR 4 for 2..12, 3 for 13..16) and no 5/7 padding for Q4_K (`DOTLLM_VK_NEMOTRON_Q4K_LEGACY=1` restores the #1459 table and padding; `DOTLLM_VK_NEMOTRON_PERN_TABLE` takes an optional fourth field for Q4_K). Nemotron-3-Nano-4B Q4_K_M
+`verify` ms (base -> new, 3 + 3 processes, ABBABA): rows 2 / 3 / 4 / 5 / 6 / 7 / 8 / 12 / 16 16.7-18.4 / 17.1-18.7 / 17.5-19.4 / 17.7-20.1 / 17.9-20.0 / 19.4-22.9 / 19.6-23.3 / 24.2-28.6 / 35.0-41.8 -> 16.9-17.8 / 17.3-18.3 / 17.6-18.3 /
+17.9-18.7 / 17.7-18.8 / 19.6-20.6 / 19.8-21.5 / 24.4-25.8 / 30.5-32.7: equal within noise at 2..12 rows (dropping the padding costs nothing, and removes the dependence on spare buffer rows), -12% at 16. The Nano sweep over a uniform Q4_K NR of 2, 3 and 4 (rows 2..16; 2 reps for NR 2 and 4, 1 for NR 3) agrees: NR 3 and 4 trade places within ~1 ms up to 12 rows, NR 3 wins from 13 (27.4 / 28.8 / 30.8 / 33.0 vs 29.3-30.0 / 30.1-31.5 / 32.5-34.3 / 35.7-38.3 at NR 4), NR 2 is worst everywhere. The Q8_0 / Q5_0 / Q4_0 Nemotron entries (`ExactRowsByColumns`) are not
+touched: their shaders did not change.
+
+*Q6_K rows and Q8_0 multi: refuted, kernels unchanged.* Both read at the DRAM ceiling where verify runs, so there is no load-instruction gap to close:
+
+| 17408x5120, NR 4, GB/s | n=1 | 2 | 3 | 4 | 5 | 6 | 8 | 12 | 16 |
+|---|---|---|---|---|---|---|---|---|---|
+| Q6_K rows (73 MB) | 200 | 181 | 182 | 197 | **103** | 176 | 164 | 137 | 102 |
+| Q8_0 multi (95 MB) | 213 | 208 | 202 | 198 | 208 | 207 | 200 | 182 | 143 |
+
+Q6_K's only hole is the 5-column cliff at NR 4 (NR 2 / 3 / 4 at n = 5: 473 / 388 / 675 us on gate/up, 514 / 424 / 648 on down; 6 columns at NR 4 is 373 / 392): the existing Nemotron `5:3` / padding entries already cover it. The dense qwen35 host (`MatMulQ6KRows`, NR 4) still pays it, but a `5:3` table there (bit-identical, tried via a temporary `DOTLLM_VK_Q6K_ROWS_BYN`) did not show in `VerifyRowCurve` on Qwen3.8-27B Q4_K_M: the six runs (base/new/new/base/base/new, 3 reps x 3) were too noisy to resolve it (5-row `verify` 107-110 ms base against 111-133 new, and the 4- and 6-row control points, which the table does not touch, also read 5-14% slower in the new arms), so it was not shipped. Follow-up filed. What was tried, both bit-identical to the old kernel (hash of the output over 3 shapes x 1..16
+columns x NR 1..4 equal) and both rejected on speed: (1) a 210-byte block is 2 (mod 4) so 16-byte units are not available; reading raw dwords (10 per row-step, one funnel shift for every field since every field starts at a multiple of 4) with a two-register-set pipelined loop: 1..4 columns got 7-15% slower (NR 4: 422 us vs 365-405), and 13..16 columns spilled
+(2.1-2.9 ms against 0.63-0.73); (2) the same without double buffering: n = 5 improved to 502 us but n = 10 became 1104 us and 13..16 spilled again (1.7-2.9 ms). The activations are 4 vec4 per column and step here, so an x double buffer is out (16 VGPRs per column), and the 80 weight dwords alone push NR 4 over the VGPR cliff.
+Q8_0 (34-byte blocks, same 2 (mod 4) problem): three raw dwords + funnel shifts + the full Q4_K-style double buffer (activations included) is bit-identical, makes NR 2 up to 1.5x faster (1471 -> 983 us at 16 columns) but NR 4, the default and the best arm, 1-12% slower at 1..12 columns and 14% slower at 16 (663 -> 756 us). Not worth a new default. Both
+kernels are at 200+ GB/s up to 4 columns (Q8_0 to 12), so the remaining distance to the 210-220 GB/s ceiling is small.
+
 **Verify and decode on the same kernels (issue #1220).** The 4-row verify cost 150 ms against a 105 ms decode, and every verify column only
 matched decode by luck: the multi-column GEMVs reduced with `subgroupAdd`, whose order changes with the subgroup width a driver picks for
 each pipeline. Intel picks SIMD8/16/32 by register pressure, so the multi kernels differed from decode at NR = 4 on Arc. The row-split GDN
