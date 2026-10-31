@@ -84,7 +84,7 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
     private static bool TakesRows(QuantGemvMultiFormat f) => f is QuantGemvMultiFormat.Q4_K or QuantGemvMultiFormat.Q6_K_Rows;
 
     private MatMulQuantGemvMultiKernel(QuantGemvMultiFormat format, VulkanDevice device, VulkanModule module, nint pool, int buffersPerSet, int blockBytes,
-                                       uint requiredSubgroupSize, int rowsPerWorkgroup, int multiColumnRowsPerWorkgroup, int wideRowsPerWorkgroup)
+                                       uint requiredSubgroupSize, int rowsPerWorkgroup, int multiColumnRowsPerWorkgroup, int wideRowsPerWorkgroup, int[]? rowsByColumns)
     {
         Format = format;
         MaxColumnsSupported = MaxColumnsFor(format);
@@ -92,6 +92,9 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
         _rowsPerWorkgroup = rowsPerWorkgroup;
         for (int n = 1; n <= MaxColumnsSupported; n++)
             _rowsForColumns[n] = n == 1 ? rowsPerWorkgroup : n <= MaxColumns ? multiColumnRowsPerWorkgroup : wideRowsPerWorkgroup;
+        if (rowsByColumns is not null)
+            for (int n = 2; n <= MaxColumnsSupported && n < rowsByColumns.Length; n++)
+                if (rowsByColumns[n] > 0) _rowsForColumns[n] = rowsByColumns[n];   // #1459 per-n tuning
         var bindings = new VkDescriptorBinding[buffersPerSet];
         for (int i = 0; i < buffersPerSet; i++) bindings[i] = new VkDescriptorBinding((uint)i);
         for (int n = SupportsSingleColumn ? 1 : 2; n <= MaxColumnsSupported; n++)
@@ -146,10 +149,14 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
     /// <param name="multiColumnRowsPerWorkgroup">NR of the 2..8-column pipelines; 0 = <paramref name="rowsPerWorkgroup"/>. A row's bits do not depend on NR.</param>
     /// <param name="wideRowsPerWorkgroup">NR of the 9..16-column pipelines (#1365; only the NR-parameterised formats have them); 0 = 4 (1 for the formats without wide pipelines). 1..4: the shaders store with one lane per
     /// output (lane &lt; NR x NC), so NR x 16 may not exceed their 64 lanes. Measured: 4 rows beat 2 by 1.6x at 16 columns (Qwen3.8 Q4_K_M verify).</param>
+    /// <param name="rowsByColumns">Optional per-column-count NR override (index = n, 0 = keep; values 1..4, #1459).</param>
     /// <returns>The kernel, or null when it cannot run correctly here.</returns>
     public static MatMulQuantGemvMultiKernel? TryCreate(VulkanDevice device, string spvDir, QuantGemvMultiFormat format, int rowsPerWorkgroup = 1,
-                                                          int multiColumnRowsPerWorkgroup = 0, int wideRowsPerWorkgroup = 0)
+                                                          int multiColumnRowsPerWorkgroup = 0, int wideRowsPerWorkgroup = 0, int[]? rowsByColumns = null)
     {
+        if (rowsByColumns is not null)
+            foreach (int v in rowsByColumns)
+                if (v < 0 || v > 4 || (v > 1 && !TakesRows(format))) throw new ArgumentOutOfRangeException(nameof(rowsByColumns));
         if (multiColumnRowsPerWorkgroup == 0) multiColumnRowsPerWorkgroup = rowsPerWorkgroup;
         if (wideRowsPerWorkgroup == 0) wideRowsPerWorkgroup = TakesRows(format) ? 4 : 1;
         if (wideRowsPerWorkgroup < 1 || wideRowsPerWorkgroup > 4 || (wideRowsPerWorkgroup > 1 && !TakesRows(format)))
@@ -167,7 +174,7 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
         try
         {
             nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)buffers);
-            return new MatMulQuantGemvMultiKernel(format, device, module, pool, buffers, blockBytes, subgroupSize, rowsPerWorkgroup, multiColumnRowsPerWorkgroup, wideRowsPerWorkgroup);
+            return new MatMulQuantGemvMultiKernel(format, device, module, pool, buffers, blockBytes, subgroupSize, rowsPerWorkgroup, multiColumnRowsPerWorkgroup, wideRowsPerWorkgroup, rowsByColumns);
         }
         catch { module.Dispose(); throw; }
     }
@@ -187,6 +194,17 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
     internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
 
+    /// <summary>
+    /// #1459: when true, an column count of 5 or 7 runs the next even column count's pipeline if the input and output buffers have room for
+    /// the extra row (its input row is never read by a result that is kept; its output row lands past the n rows the caller owns). The first n columns are
+    /// bit-identical (a column's bits do not depend on NC). Measured on Nemotron-H Nano: 5 and 7 columns cost 1.5x the 6 and 8 column dispatches.
+    /// </summary>
+    public bool PadOddColumns { get; set; }
+
+    private int RunColumns(int n, int k, int m, VulkanDevice.Buffer input, VulkanDevice.Buffer output, int maxN)
+        => PadOddColumns && (n & 1) == 1 && (n == 5 || n == 7) && n < maxN
+           && input.Size >= (long)(n + 1) * k * sizeof(float) && output.Size >= (long)(n + 1) * m * sizeof(float) ? n + 1 : n;
+
     /// <summary>Records the multi-column GEMV (input <c>[n, k]</c> F32, output <c>[n, m]</c>); <paramref name="codebook"/> is required for IQ3_S.</summary>
     public unsafe void Record(nint cmdBuf, VulkanDevice.Buffer weights, VulkanDevice.Buffer input, VulkanDevice.Buffer output, int m, int k, int n,
                               VulkanDevice.Buffer? codebook = null)
@@ -204,13 +222,14 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
             ? stackalloc nint[4] { weights.Handle, input.Handle, output.Handle, codebook!.Handle }
             : stackalloc nint[3] { weights.Handle, input.Handle, output.Handle };
         nint set = _descriptorCache.GetOrCreate(buffers);
-        var pipe = _pipelines[n]!;
+        int nRun = RunColumns(n, k, m, input, output, MaxColumnsSupported);
+        var pipe = _pipelines[nRun]!;
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, pipe.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(cmdBuf, VkPipelineBindPoint.Compute, pipe.Layout, 0, 1, set, 0, 0);
         Span<uint> pc = stackalloc uint[4] { (uint)m, (uint)k, (uint)blocksPerRow, (uint)((rowBytes + 3) / 4) };
         fixed (uint* p = pc)
             VulkanApi.vkCmdPushConstants(cmdBuf, pipe.Layout, VkShaderStageFlags.Compute, 0, PushConstantBytes, (nint)p);
-        int rowsPerGroup = Format == QuantGemvMultiFormat.Q6_K_R2 ? 2 : _rowsForColumns[n];
+        int rowsPerGroup = Format == QuantGemvMultiFormat.Q6_K_R2 ? 2 : _rowsForColumns[nRun];
         VulkanApi.vkCmdDispatch(cmdBuf, (uint)((m + rowsPerGroup - 1) / rowsPerGroup), 1, 1);
     }
 

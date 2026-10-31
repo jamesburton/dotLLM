@@ -1368,6 +1368,28 @@ Parity: `VulkanExactGemvMultiTests.LegacyQ_*` (every column bit-identical to its
 blocks so every 5th-bit / nibble pattern occurs, M % NR != 0, K of 3 blocks, 1..16 columns) and `VulkanNemotronHDFlashTests.RealNano_SmallBatch_EveryRow_IsBitIdenticalToDecode`
 (2 / 8 / 13 rows of the real file, all logits bit-identical to single-row decodes). The 5-row point is a tuning leftover (NR=4 for 4 < n < 8 is slower than at 8).
 
+#### Nemotron-H 4..7-row verify tuning (issue #1459)
+
+The #1420 table above had 5 rows (30 ms) slower than 8 (23 ms). Root cause, found with `DOTLLM_VK_NEMOTRON_PROFILE=1` (5 rows: `proj_gdn` 11.6 ms, `proj_ffn` 9.7 vs 6.6 / 5.6 at 6 rows; scan, norms, attention and LM head are
+flat): the exact GEMVs' cost is not monotone in the column count. With the single NR=4 the 5- and 7-column pipelines of every projection kernel (Q5_0, Q4_0, Q8_0, Q4_K, Q6_K) cost ~1.5x the 6- and 8-column ones.
+An NR x NR sweep (`DOTLLM_VK_NEMOTRON_GEMV_ROWS` for the legacy-quant kernels, new `DOTLLM_VK_NEMOTRON_KQUANT_NR=multi,wide`, new `DOTLLM_VK_NEMOTRON_PERN_TABLE=n:exactNR:kquantNR;...`) showed the optimum moves with n
+(n=4: exact NR 3 beats 4 by 3.4 ms; n=5: exact 2 / K-quant 3; n=7: 2 / 2; 6, 8..16 stay 4), and then the bigger win: a 5- or 7-column dispatch is faster as a 6- / 8-column dispatch with the spare row discarded.
+Two changes: (1) per-n NR tables (`RowsByColumns` on `MatMulExactGemvMultiKernel`, `rowsByColumns` on `MatMulQuantGemvMultiKernel.TryCreate`); (2) `PadOddColumns`: when the input and output buffers have room for one more row,
+5 columns run the 6-column pipeline and 7 the 8-column one (a column's bits do not depend on NC). `DOTLLM_VK_NEMOTRON_PERN=0` / `DOTLLM_VK_NEMOTRON_PADODD=0` restore the old behaviour.
+
+`VerifyRowCurve`, Nemotron-3-Nano-4B Q4_K_M, ctx 64, `verify` median ms, both locks held, separate-process A/B with the order alternated over 3 rounds (ranges within 0.5 ms; one contended old-arm round discarded):
+
+| rows | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 12 | 16 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| before (#1420) | 16.9 | 18.3 | 21.9 | 27.8 | 17.9 | 33.5 | 20.4 | 21.1 | 25.1 | 31.9 |
+| NR tables only | 16.9 | 18.2 | 18.3 | 20.7 | 17.9 | 27.9 | 20.3 | 21.1 | 25.2 | 32.2 |
+| + padding (now) | 16.9 | 18.3 | 18.3 | 17.7-18.0 | 17.9 | 20.2 | 20.2 | 21.1 | 25.1 | 31.9 |
+
+Parity: `VulkanExactGemvMultiTests.PadOddColumns_*` / `KQuantPadOddColumns_*` (first n columns bit-identical to the unpadded dispatch with the table in force; the spare output row is written when there is room, which proves the
+padded pipeline ran, and a tight buffer leaves its trailing sentinel untouched) and `VulkanNemotronHDFlashTests.RealNano_SmallBatch_EveryRow_IsBitIdenticalToDecode` now also at 4 / 5 / 7 rows of the real file. Caveats:
+the table was measured on Nano only (Bolt's NVFP4 / IQ2_XXS tables are untouched; its Q8_0 attention/LM-head kernels pick up the new n=4/5/7 entries, unmeasured); padding relies on a role buffer never aliasing live data past its `n x m` rows
+(true of every buffer the model passes today). Why the odd pipelines are slow (register allocation / `lane / NC` store pass) is not established; the workaround makes it moot for 5 and 7.
+
 #### Dense `VulkanTransformerModel`: Q8_0 5..16 rows, Q4_0 / Q5_0 2..16 rows (issue #1420)
 
 The Q8_0 Q8_1-activation MMVQ multi GEMV stops at 4 rows, so Llama-3.2-3B Q8_0 jumped from 29 ms (2..4 rows) to 39-40 ms (5..16) on the GEMM, against 19.5 ms for decode.
