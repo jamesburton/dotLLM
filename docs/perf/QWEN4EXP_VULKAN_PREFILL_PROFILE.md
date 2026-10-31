@@ -19,8 +19,23 @@ Real text (wikitext-2 test, different window per rep), fresh state per rep.
 Cross-check with the product path: `dotllm bench -d vulkan -p 4096 -n 16 -r 3` (tiled seed prompt, default F32 K/V, 8192 capacity):
 422 tok/s (417-423). Tiled text routes to fewer distinct experts than wikitext, which probably explains 422 vs 398.
 
-**The issue's "~132 tok/s on one long prompt" is NOT reproduced by plain prefill** (2.5-3.2x below the medians measured here). Not explained;
-untested hypotheses: MTP head absorb during prefill, server path overheads, an older build. Do not treat 132 as the plain-prefill figure.
+**The issue's "~132 tok/s on one long prompt" is a small-ubatch figure (#1355).** Plain whole-prompt prefill does not produce it (2.5-3.2x below the medians above), but the prefill chunk size does.
+Reproduced 2026-10-31 on dev `f7083dc5` with the product path, `dotllm run <UD-IQ4_XS> -d vulkan --prompt-file <3438-token wikitext> -n 8 --temp 0` (default F32 K/V, MTP on by default, GPU lock + `cpu-bench` held,
+one fresh process per row, prefill line of the run summary):
+
+| `--prefill-chunk-size` (ubatch rows) | prefill tok/s |
+|---|---|
+| 0 (default: whole prompt, engine splits at the model's 1024-row forward) | 367.8 |
+| 256 | 279.3 |
+| 64 | 158.7 |
+| 32 | 99.2 |
+
+Throughput falls with rows per forward because every forward re-reads the full set of expert weights (MoE) and the whole GDN/attention weight set: at 32-64 rows the run is weight-bandwidth bound, not compute
+bound, and ~132 tok/s sits between the 64 and 32 rows (~48 rows). Defaults do not do this (`--prefill-chunk-size` and the server's `MaxPrefillTokensPerStep` both default to 0 = whole prompt), so the 132
+figure came from a run with a small ubatch (an explicit `--prefill-chunk-size`/`--ubatch-size`, or a server configured with a small prefill step cap), or from prefill that was fed in small pieces. The original run's
+command line was not recorded, so this is the configuration that reproduces the number, not proof of what that run used. Ruled out: MTP (on by default here, 368 tok/s with it), F32 vs F16 K/V (368 vs 398-422
+in the probe, a few %), cold first process (the run above is a fresh process, no warm-up). Not testable here: a cold OS file cache (weights paged in from NVMe during the first prefill), which can only lower a first run further.
+If a 132 shows up again, check the effective ubatch first (`--prefill-chunk-size`, server `--prefill-chunk-size`, scheduler step cap).
 
 **ds4 comparison is still not matched**: ds4 reports 507/565/595/614 tok/s at 1K/2K/4K/8K with a Q2 quant on ROCm 10/Linux; ours is IQ4_XS
 (roughly 2x the expert bytes). Ratio at 8K is 372/614 = 0.61, at 1K 338/507 = 0.67, with the quant difference unaccounted for.
