@@ -15,6 +15,7 @@ namespace DotLLM.Tests.Unit.Server;
 /// Issue #1023, the parts that need no model: the SSE keep-alive while a streaming request waits for the gate, the role chunk
 /// sent only once the gate is held, the status object, and the free-memory device fit.
 /// </summary>
+[Collection("SequentialFileIO")]   // reads the process-global model-store env vars that SequentialFileIO tests mutate (#1395)
 public sealed class ModelSwapRobustnessTests
 {
     private static async IAsyncEnumerable<GenerationToken> Script(params string[] pieces)

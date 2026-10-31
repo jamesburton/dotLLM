@@ -13,6 +13,7 @@ namespace DotLLM.Tests.Unit.Server;
 /// #450: only the collection route <c>GET /v1/models</c> existed, so the OpenAI SDK's
 /// <c>client.models.retrieve()</c> 404'd.
 /// </summary>
+[Collection("SequentialFileIO")]   // reads the process-global model-store env vars that SequentialFileIO tests mutate (#1395)
 public sealed class ModelRetrieveEndpointTests
 {
     private static ServerState CreateState(string modelId) =>

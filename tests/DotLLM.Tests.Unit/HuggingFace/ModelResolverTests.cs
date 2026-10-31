@@ -4,6 +4,7 @@ using Xunit;
 namespace DotLLM.Tests.Unit.HuggingFace;
 
 /// <summary>Issue #714: one resolver for every place a model is named.</summary>
+[Collection("SequentialFileIO")]   // reads the process-global model-store env vars that SequentialFileIO tests mutate (#1395)
 public sealed class ModelResolverTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), "dotllm-714-" + Guid.NewGuid().ToString("N"));
