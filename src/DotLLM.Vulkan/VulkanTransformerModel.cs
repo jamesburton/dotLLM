@@ -2310,6 +2310,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         {
             mlaAttention = AttentionMlaF32Kernel.Create(device, spvDir);
             mlaRope = RopeMlaF32Kernel.Create(device, spvDir);
+            // YaRN-ramped decoupled rope (#1278): the CPU path rotates DeepSeek-V2/V3 with the ramped table.
+            mlaRope.Yarn = MlaYarnRope.From(config.MlaConfig, config.MlaConfig!.QkRopeHeadDim, config.MlaConfig.RopeTheta);
             mlaKvSplit = MlaKvSplitF32Kernel.Create(device, spvDir);
         }
 
@@ -2474,6 +2476,9 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             model._mlaAbsorbed = true;
             model._mlaKvPrep = MlaKvPrepKernel.Create(device, spvDir);
             model._mlaHeadGemm = MlaHeadGemmQ8Kernel.Create(device, spvDir);
+            var mlaYarn = MlaYarnRope.From(config.MlaConfig, config.MlaConfig!.QkRopeHeadDim, config.MlaConfig.RopeTheta);
+            model._mlaKvPrep.Yarn = mlaYarn;
+            model._mlaHeadGemm.Yarn = mlaYarn;
             model._mlaAbsAttn = MlaAbsorbedAttentionKernel.Create(device, spvDir);
         }
         if (Environment.GetEnvironmentVariable(DisableQ4KCoopmatEnvVar) != "1"

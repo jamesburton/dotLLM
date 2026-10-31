@@ -239,6 +239,22 @@ public static class RoPE
     }
 
     /// <summary>
+    /// The YaRN linear-ramp bounds (<c>low</c>, <c>high</c>, in half-dim index space) HF's <c>yarn_find_correction_range</c> +
+    /// <c>yarn_linear_ramp_mask</c> use. Factored out so a GPU kernel can evaluate the ramp in closed form from push constants
+    /// (<c>mask = clamp((i - low) / (high - low), 0, 1)</c>) and stay in lock-step with <see cref="ComputeYarnInverseFrequencies"/>.
+    /// </summary>
+    public static (float Low, float High) YarnRampBounds(
+        int headDim, float theta, int originalMaxPositionEmbeddings, float betaFast, float betaSlow)
+    {
+        float low = MathF.Floor(YarnFindCorrectionDim(betaFast, headDim, theta, originalMaxPositionEmbeddings));
+        float high = MathF.Ceiling(YarnFindCorrectionDim(betaSlow, headDim, theta, originalMaxPositionEmbeddings));
+        low = MathF.Max(low, 0.0f);
+        high = MathF.Min(high, headDim - 1.0f);
+        if (low == high) high += 0.001f; // prevent divide-by-zero per HF yarn_linear_ramp_mask
+        return (low, high);
+    }
+
+    /// <summary>
     /// Builds the YaRN ramped per-pair inverse-frequency vector — the frequency half of
     /// <see cref="PrecomputeFrequencyTableYarn"/>, factored out so GPU backends can upload
     /// the same <c>headDim / 2</c> floats and evaluate <c>cos/sin(pos * invFreq[i]) * mscale</c>
@@ -269,11 +285,7 @@ public static class RoPE
         // FULL-dim space [0, headDim-1], but the linear ramp is applied over
         // dim // 2 entries (i.e. halfDim). That matches the mixing formula
         // because freq tables are indexed by half-dim i in [0, halfDim).
-        float low = MathF.Floor(YarnFindCorrectionDim(betaFast, headDim, theta, originalMaxPositionEmbeddings));
-        float high = MathF.Ceiling(YarnFindCorrectionDim(betaSlow, headDim, theta, originalMaxPositionEmbeddings));
-        low = MathF.Max(low, 0.0f);
-        high = MathF.Min(high, headDim - 1.0f);
-        if (low == high) high += 0.001f; // prevent divide-by-zero per HF yarn_linear_ramp_mask
+        (float low, float high) = YarnRampBounds(headDim, theta, originalMaxPositionEmbeddings, betaFast, betaSlow);
 
         for (int i = 0; i < halfDim; i++)
         {

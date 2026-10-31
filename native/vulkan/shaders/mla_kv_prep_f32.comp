@@ -1,4 +1,6 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "mla_yarn.glsl"
 // Absorbed-MLA latent-cache row builder (issue #913).
 //
 // One workgroup per token. Input is the raw kv_a_mqa projection row [kvLoraRank + qkRope]:
@@ -24,6 +26,10 @@ layout(push_constant) uniform PushConstants {
     uint  qkRope;
     float eps;
     float theta;
+    float yarnFactor;   // <= 1 : plain theta (#1278)
+    float yarnLow;
+    float yarnHigh;
+    float yarnMscale;   // cos/sin multiplier
 } pc;
 
 void sincosRed(float a, out float c, out float s) {
@@ -63,11 +69,12 @@ void main() {
 
     uint halfRope = pc.qkRope >> 1u;
     if (tid < halfRope) {
-        float expn  = float(2u * tid) / float(pc.qkRope);
-        float freq  = 1.0 / pow(pc.theta, expn);
+        float freq  = mlaRopeFreq(tid, pc.qkRope, pc.theta, pc.yarnFactor, pc.yarnLow, pc.yarnHigh);
         float angle = float(positions[t]) * freq;
         float c, s;
         sincosRed(angle, c, s);
+        c *= pc.yarnMscale;
+        s *= pc.yarnMscale;
         uint i0 = inBase + pc.kvLoraRank + 2u * tid;
         float v0 = kvA[i0];
         float v1 = kvA[i0 + 1u];

@@ -1,4 +1,6 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "mla_yarn.glsl"
 // Per-head batched Q8_0 GEMM for absorbed MLA (issue #913).
 //
 //   out[t, h, m] = sum_k  W[h*M + m, k] * x[t, h, k]          (W: Q8_0 rows, K contiguous per row)
@@ -42,6 +44,10 @@ layout(push_constant) uniform PushConstants {
     uint  ropeSrcOff;     // offset (floats) inside the x head row of q_pe
     uint  ropeDstOff;     // offset (floats) inside the out head row for rotated q_pe
     float theta;
+    float yarnFactor;   // <= 1 : plain theta (#1278)
+    float yarnLow;
+    float yarnHigh;
+    float yarnMscale;   // cos/sin multiplier
 } pc;
 
 shared vec4 xs[MAX_K * 2];
@@ -90,11 +96,12 @@ void main() {
             uint p  = idx - tt * halfRope;
             uint t  = t0 + tt;
             if (t < pc.seqLen) {
-                float expn  = float(2u * p) / float(pc.ropeDim);
-                float freq  = 1.0 / pow(pc.theta, expn);
+                float freq  = mlaRopeFreq(p, pc.ropeDim, pc.theta, pc.yarnFactor, pc.yarnLow, pc.yarnHigh);
                 float angle = float(positions[t]) * freq;
                 float c, s;
                 sincosRed(angle, c, s);
+                c *= pc.yarnMscale;
+                s *= pc.yarnMscale;
                 uint src = t * pc.xTokStride + h * pc.xHeadStride + pc.ropeSrcOff + 2u * p;
                 float v0 = x[src];
                 float v1 = x[src + 1u];

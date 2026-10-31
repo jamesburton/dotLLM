@@ -1,4 +1,6 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "mla_yarn.glsl"
 // MLA RoPE — rotates the decoupled-rope sub-dim of Q (the q_pe tail of each
 // head) and the MQA-shared K_pe (one rope-K per token, broadcast across
 // heads). Mirrors the post-projection RoPE step in
@@ -15,9 +17,8 @@
 // DeepSeek-V2/V3 use this; the parameter is fixed (no NeoX path) for
 // simplicity.
 //
-// Frequency: identical to rope_f32.comp — freq[i] = 1 / theta^(2i/qkRope),
-// no YaRN frequency rescaling at this kernel level (host-side scale
-// folded into the attention kernel's softmax-scale push constant).
+// Frequency: freq[i] = 1 / theta^(2i/qkRope), or the YaRN-ramped frequency when yarnFactor > 1 (#1278) - the CPU path rotates DeepSeek-V2/V3
+// with the ramped table, so the Vulkan kernels must too. The mscale^2 softmax factor is folded into the attention kernel's scale push constant.
 //
 // Dispatch:
 //   local_size_x = 256
@@ -37,6 +38,10 @@ layout(push_constant) uniform PushConstants {
     uint  qkNopeHeadDim;
     uint  qkRopeHeadDim;
     float theta;
+    float yarnFactor;   // <= 1 : plain theta (#1278)
+    float yarnLow;
+    float yarnHigh;
+    float yarnMscale;   // cos/sin multiplier
 } pc;
 
 // sin/cos of a RoPE angle with the argument range-reduced to [-pi, pi] first (issue #898). The GPU's sin/cos reduce the argument in fp32 internally,
@@ -68,11 +73,12 @@ void main() {
         uint head = rem % pc.numHeads;
         uint t    = rem / pc.numHeads;
 
-        float expn  = float(2u * pair) / float(pc.qkRopeHeadDim);
-        float freq  = 1.0 / pow(pc.theta, expn);
+        float freq  = mlaRopeFreq(pair, pc.qkRopeHeadDim, pc.theta, pc.yarnFactor, pc.yarnLow, pc.yarnHigh);
         float angle = float(positions[t]) * freq;
         float c, s;
         sincosRed(angle, c, s);
+        c *= pc.yarnMscale;
+        s *= pc.yarnMscale;
 
         uint headBase = t * pc.numHeads * qkHeadDim + head * qkHeadDim + pc.qkNopeHeadDim;
         uint i0 = headBase + 2u * pair;
@@ -89,11 +95,12 @@ void main() {
         uint pair = idx % halfRope;
         uint t    = idx / halfRope;
 
-        float expn  = float(2u * pair) / float(pc.qkRopeHeadDim);
-        float freq  = 1.0 / pow(pc.theta, expn);
+        float freq  = mlaRopeFreq(pair, pc.qkRopeHeadDim, pc.theta, pc.yarnFactor, pc.yarnLow, pc.yarnHigh);
         float angle = float(positions[t]) * freq;
         float c, s;
         sincosRed(angle, c, s);
+        c *= pc.yarnMscale;
+        s *= pc.yarnMscale;
 
         uint baseIdx = t * pc.qkRopeHeadDim;
         uint i0 = baseIdx + 2u * pair;
