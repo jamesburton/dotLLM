@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
+using DotLLM.Cpu.Threading;
 
 namespace DotLLM.Cpu.Kernels;
 
@@ -86,6 +87,7 @@ public static class GatedDeltaNetScan
     /// Optional (#1194 read-only speculative verify): emit the outputs (and deltas) but leave <paramref name="state"/> untouched; the
     /// evolving state lives in a one-head scratch. Bit-identical outputs. Not combinable with <paramref name="rowSnapshots"/>.
     /// </param>
+    /// <param name="pool">Optional (#1367): value heads are split across the pool's threads (bit-identical to the serial walk).</param>
     [SkipLocalsInit]
     public static void Execute(
         Span<float> state,
@@ -103,7 +105,8 @@ public static class GatedDeltaNetScan
         int snapshotRows = 0,
         ReadOnlySpan<float> stateSource = default,
         Span<float> deltaRecord = default,
-        bool readOnlyState = false)
+        bool readOnlyState = false,
+        ComputeThreadPool? pool = null)
     {
         if (nVHead <= 0) throw new ArgumentOutOfRangeException(nameof(nVHead));
         if (nKHead <= 0) throw new ArgumentOutOfRangeException(nameof(nKHead));
@@ -160,6 +163,13 @@ public static class GatedDeltaNetScan
         if (readOnlyState && recordStates)
             throw new ArgumentException("A read-only scan cannot record whole-state row snapshots.", nameof(rowSnapshots));
 
+        if (!recordStates && !ForceScalar && dState % 8 == 0 && Vector256.IsHardwareAccelerated)
+        {
+            ExecuteSimd(state, q, k, v, g, beta, output, nVHead, nKHead, dState, seqLen, snapshotRows, stateSource,
+                        deltaRecord, readOnlyState, pool);
+            return;
+        }
+
         // Temporary [DState] buffer reused across all (t, vh) iterations.
         // First used for "retrieved" (S.T @ k), then overwritten with delta (β*(v-r)).
         float[] tmpBuf = ArrayPool<float>.Shared.Rent(dState);
@@ -209,6 +219,127 @@ public static class GatedDeltaNetScan
         {
             ArrayPool<float>.Shared.Return(tmpBuf);
         }
+    }
+
+
+    /// <summary>Test/bench switch: force the scalar reference walk (the SIMD walk is bit-identical to it).</summary>
+    internal static bool ForceScalar;
+
+    private unsafe struct SimdCtx
+    {
+        public float* State, StateSource, Q, K, V, G, Beta, Output, DeltaRecord;
+        public int NVHead, NKHead, DState, SeqLen, SnapshotRows;
+        public bool ReadOnly, FromSource, RecordDeltas;
+    }
+
+    /// <summary>
+    /// Head-parallel, vectorised walk (#1367). Value heads are independent, so each head runs its tokens in order on one thread;
+    /// per element it performs exactly the scalar walk's multiplies and adds (no FMA, same accumulation order over rows), so the
+    /// output, deltas and final state are bit-identical to the scalar reference.
+    /// </summary>
+    private static unsafe void ExecuteSimd(
+        Span<float> state, ReadOnlySpan<float> q, ReadOnlySpan<float> k, ReadOnlySpan<float> v, ReadOnlySpan<float> g,
+        ReadOnlySpan<float> beta, Span<float> output, int nVHead, int nKHead, int dState, int seqLen, int snapshotRows,
+        ReadOnlySpan<float> stateSource, Span<float> deltaRecord, bool readOnlyState, ComputeThreadPool? pool)
+    {
+        fixed (float* pState = state, pSrc = stateSource, pQ = q, pK = k, pV = v, pG = g, pBeta = beta, pOut = output, pDelta = deltaRecord)
+        {
+            var ctx = new SimdCtx
+            {
+                State = pState, StateSource = pSrc, Q = pQ, K = pK, V = pV, G = pG, Beta = pBeta, Output = pOut, DeltaRecord = pDelta,
+                NVHead = nVHead, NKHead = nKHead, DState = dState, SeqLen = seqLen, SnapshotRows = snapshotRows,
+                ReadOnly = readOnlyState, FromSource = !stateSource.IsEmpty, RecordDeltas = !deltaRecord.IsEmpty,
+            };
+            if (pool is null || pool.ThreadCount <= 1 || nVHead < 2)
+                SimdWorker((nint)(&ctx), 0, 1);
+            else
+                pool.Dispatch((nint)(&ctx), &SimdWorker);
+        }
+    }
+
+    private static unsafe void SimdWorker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        ref var c = ref Unsafe.AsRef<SimdCtx>((void*)ctxPtr);
+        int per = (c.NVHead + threadCount - 1) / threadCount;
+        int vh0 = threadIdx * per, vh1 = Math.Min(c.NVHead, vh0 + per);
+        if (vh0 >= vh1) return;
+        int d = c.DState, statePerHead = d * d;
+
+        // Scratch: tmp[d] (+ a one-head state in a read-only scan).
+        int scratchFloats = d + (c.ReadOnly ? statePerHead : 0);
+        float[] rented = ArrayPool<float>.Shared.Rent(scratchFloats + 16);
+        try
+        {
+            fixed (float* rp = rented)
+            {
+                float* tmp = rp;
+                for (int vh = vh0; vh < vh1; vh++)
+                {
+                    float* head = c.ReadOnly ? tmp + d : c.State + (long)vh * statePerHead;
+                    for (int t = 0; t < c.SeqLen; t++)
+                    {
+                        float* decaySrc = t == 0 && (c.ReadOnly || c.FromSource)
+                            ? (c.FromSource ? c.StateSource : c.State) + (long)vh * statePerHead : null;
+                        StepHeadSimd(head, decaySrc, c.Q, c.K, c.V, c.G, c.Beta, c.Output, tmp,
+                                     c.RecordDeltas && t < c.SnapshotRows ? c.DeltaRecord : null, t, vh, c.NVHead, c.NKHead, d);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>Vectorised <see cref="StepHead"/>: decay+retrieve fused into one pass over the state, write+read-out into a second.</summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static unsafe void StepHeadSimd(
+        float* S, float* decaySource, float* q, float* k, float* v, float* g, float* beta, float* output, float* tmp,
+        float* deltaRecord, int t, int vh, int nVHead, int nKHead, int d)
+    {
+        int qkOff = t * nKHead * d, vOff = t * nVHead * d, kh = vh % nKHead;
+        float* qHead = q + qkOff + kh * d, kHead = k + qkOff + kh * d, vHead = v + vOff + vh * d;
+        float gHead = g[t * nVHead + vh], betaHead = beta[t * nVHead + vh];
+        var vg = Vector256.Create(gHead);
+
+        for (int c = 0; c < d; c += 8) Vector256.Store(Vector256<float>.Zero, tmp + c);
+        for (int row = 0; row < d; row++)
+        {
+            float* sr = S + row * d;
+            float* src = decaySource != null ? decaySource + row * d : sr;
+            var vk = Vector256.Create(kHead[row]);
+            for (int c = 0; c < d; c += 8)
+            {
+                var s = Vector256.Load(src + c) * vg;     // decay (into the state), then retrieve accumulate
+                Vector256.Store(s, sr + c);
+                Vector256.Store(Vector256.Load(tmp + c) + s * vk, tmp + c);
+            }
+        }
+
+        var vb = Vector256.Create(betaHead);
+        for (int c = 0; c < d; c += 8)
+            Vector256.Store(vb * (Vector256.Load(vHead + c) - Vector256.Load(tmp + c)), tmp + c);
+        if (deltaRecord != null)
+            Buffer.MemoryCopy(tmp, deltaRecord + (t * nVHead + vh) * d, d * sizeof(float), d * sizeof(float));
+
+        float* outHead = output + vOff + vh * d;
+        for (int c = 0; c < d; c += 8) Vector256.Store(Vector256<float>.Zero, outHead + c);
+        for (int row = 0; row < d; row++)
+        {
+            float* sr = S + row * d;
+            var vk = Vector256.Create(kHead[row]);
+            var vq = Vector256.Create(qHead[row]);
+            for (int c = 0; c < d; c += 8)
+            {
+                var s = Vector256.Load(sr + c) + vk * Vector256.Load(tmp + c);   // rank-1 write
+                Vector256.Store(s, sr + c);
+                Vector256.Store(Vector256.Load(outHead + c) + s * vq, outHead + c); // read-out
+            }
+        }
+        var vs = Vector256.Create(1f / MathF.Sqrt(d));
+        for (int c = 0; c < d; c += 8) Vector256.Store(Vector256.Load(outHead + c) * vs, outHead + c);
     }
 
     /// <summary>

@@ -15,8 +15,14 @@ public sealed class MatMulBf16GemvMultiF32Kernel : IDisposable
     /// <summary>Bytes per BF16 element on device.</summary>
     public const int Bf16ElementBytes = 2;
 
-    /// <summary>Largest supported column count.</summary>
+    /// <summary>
+    /// Column count the MoE host and the dense <c>VulkanTransformerModel</c> gate on (the shader serves up to <see cref="WideMaxColumns"/>; those
+    /// hosts have not been validated or measured above 8 rows, so they keep this cap).
+    /// </summary>
     public const int MaxColumns = 8;
+
+    /// <summary>Largest column count the shader serves (#1365: the dense qwen35 host's 9..16-row verify/DFlash blocks).</summary>
+    public const int WideMaxColumns = 16;
 
     private const int WorkgroupSize = 128;
     private const int PushConstantBytes = 5 * sizeof(uint); // M, K, pairsPerRow, rowUints, N
@@ -90,7 +96,7 @@ public sealed class MatMulBf16GemvMultiF32Kernel : IDisposable
     {
         if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m));
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
-        if (n < 1 || n > MaxColumns) throw new ArgumentOutOfRangeException(nameof(n), $"n must be 1..{MaxColumns}, got {n}");
+        if (n < 1 || n > WideMaxColumns) throw new ArgumentOutOfRangeException(nameof(n), $"n must be 1..{WideMaxColumns}, got {n}");
         if ((k & 1) != 0)
             throw new ArgumentException($"k must be a multiple of 2, got {k}", nameof(k));
 

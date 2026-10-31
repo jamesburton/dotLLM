@@ -1039,7 +1039,7 @@ uses the MTP decoder's exact accept/residual rule unchanged.
 (42 MB for Qwen3.8-27B-DFlash2). Taps: `rows × 5 × 5120 × 2 B` F16 per verify (400 KB at B = 8), capped at the ring for a
 long prefill and released after it.
 
-**Knobs.** `DOTLLM_DFLASH_DRAFT=n` caps drafts per round (default B-1 = 7); `DOTLLM_DFLASH_DRAFT_VOCAB=K` limits the draft head to token ids [0, K) (0 = off, #1360); `DOTLLM_DFLASH_TRACE=1` prints draft / inject wall
+**Knobs.** `DOTLLM_DFLASH_DRAFT=n` caps drafts per round (default B-1 = 7; it can only lower it, so a DFlash verify is never more than 8 rows); `DOTLLM_DFLASH_DRAFT_VOCAB=K` limits the draft head to token ids [0, K) (0 = off, #1360); `DOTLLM_DFLASH_TRACE=1` prints draft / inject wall
 time per request (and, on Vulkan, the drafter's submit count and wait). Vulkan small-row GEMVs: `DOTLLM_VK_Q4K_ROWS` / `DOTLLM_VK_Q4K_ROWS_MULTI` (1..4 output
 rows per workgroup for decode / verify, default 2 / 4, #1220; this replaced #1193's `DOTLLM_VK_Q4K_MULTI_ROWS` / `_R4` kernel) and `DOTLLM_VK_SMALLROW_Q6K_R2_MIN_ROWS` (default 3).
 
@@ -1070,7 +1070,7 @@ mostly rejects anyway).
 Net +3-5% tok/s (about -4.5 to -5 ms per round, as the issue predicted). 32768 is a further +0.5-1% but rests on one 5-prompt English/code sample, so
 the default stays at 65536 (CJK-heavy text is untested; if it ever loses acceptance, set the env var to 0). The remaining draft cost is the 5 drafter layers.
 
-**Not yet.** Tree (DDTree) verification; reduced-vocab (`d2t`) and DSpark drafters (LiLiCorr: #1237 below);
+**Not yet.** Tree (DDTree) verification (gated on the verify-row cost curve, measured: "Verify-row cost curve (issue #1359, stage 1)" below); reduced-vocab (`d2t`) and DSpark drafters (LiLiCorr: #1237 below);
 sampled-selector proposals (llama.cpp's DFlash2 sampled mode).
 
 ### LiLiCorr drafter for Nemotron-3.5 Bolt (issue #1237)
@@ -1138,7 +1138,7 @@ Strix (Vulkan):
 
 These runs used Bolt 24GB with the real LiLiCorr drafter on Strix Halo 8060S. Each figure is the median of 3 interleaved reps:
 128 greedy tokens, `DOTLLM_MTP_ADAPTIVE=0`, K = 7 drafts (`--spec-draft-n-max 7` for llama.cpp master 0ae0e1976 Vulkan).
-p0 is prose ("The history of the printing press began in"); p1 is code (Python quicksort).
+p0 is the high-acceptance prompt and p1 the low-acceptance one. Reproduced in #1368: the prose prompt "The history of the printing press began in" gives 3.25-3.75 tokens/round and 21-22 tok/s on every build from #1237 to dev (so it is p1), and a code prompt ("def quicksort(arr):") gives 7.9 tokens/round and ~41 tok/s (p0). The p0/p1 labels in these tables originally said the opposite; the numbers are right.
 
 | Strix 8060S, Bolt 24GB | p0 tok/s | p1 tok/s | tokens/round | peak private / GPU-shared MiB |
 |---|---|---|---|---|
@@ -1174,7 +1174,7 @@ is bit-identical to the one-column decode dispatch. Rows per workgroup for verif
 (`DOTLLM_VK_NEMOTRON_GEMV_ROWS=decode,verify` overrides; `DOTLLM_VK_NEMOTRON_EXACT_GEMV=0` restores #1237's per-column GEMVs). The
 opt-in NVFP4 MMVQ keeps NVFP4 decode, as before. No new buffers.
 
-Strix 8060S, Bolt 24GB + LiLiCorr, K = 7, 128 greedy tokens, medians of 3 interleaved reps (p0 prose, p1 code):
+Strix 8060S, Bolt 24GB + LiLiCorr, K = 7, 128 greedy tokens, medians of 3 interleaved reps (p0 code, p1 prose; labels corrected in #1368):
 
 | `DOTLLM_VK_NEMOTRON_PROFILE`, ms over all layers | 8-row verify before | after | 3-row verify before | after | decode before | after |
 |---|---|---|---|---|---|---|
@@ -1194,10 +1194,15 @@ Strix 8060S, Bolt 24GB + LiLiCorr, K = 7, 128 greedy tokens, medians of 3 interl
 | llama.cpp `draft-dflash` + LiLiCorr | 60.22 | 29.38 | | 24,970 / 24,068 |
 
 Every dotLLM run (plain and speculative, before and after, both verify modes) produced the same text. Speculation now beats plain
-on prose (1.44x) but not on code (3.3-3.75 tokens/round). The round is now half draft: about 45 ms of each draft is the host-side
+on code (1.44x) but not on prose (3.3-3.75 tokens/round). The round is now half draft: about 45 ms of each draft is the host-side
 LiLiCorr head (`select` in `DOTLLM_DFLASH_TRACE`). The verify (81 ms) is 2.5x a 32.6 ms decode step; the rest of it is the indexed
 routed experts, which barely share expert reads across 8 tokens (top-k routing over 240 experts). The read-only verify beats the
 pre-verify copy by ~2 ms per round and 180 MiB.
+
+**IQ2_XXS 14..16-column cliff (#1366).** With 2 rows per workgroup `matmul_iq2_xxs_gemv_multi` was 2.5x slower at 14..16 columns than at 13
+(Bolt `moe_dense`, ms over 88 layers: 19.7 at 13, 46-58 at 14..16, slower than the 32-row GEMM path's 37). 4 rows per workgroup from 14 columns
+(`MatMulExactGemvMultiKernel.Iq2WideColumns`) gives 26.0 / 28.2 / 30.4 at 14 / 15 / 16, bit-identical (a row's bits do not depend on NR).
+Verify medians (ms, 3 reps each, same session): 14 rows 141 -> 117, 16 rows 151-153 -> 129. NR=1 and NR=2 both cliff; 4 is the largest NR with NR x columns <= 64.
 
 **Next (follow-ups):**
 
@@ -1211,6 +1216,310 @@ gain over DFlash2 is modest. Both re-rank the drafter's own top-k with pairwise 
 rank/probability features, which mostly helps the long tail of the block. On Qwen3.8 the measured gap to llama.cpp is the target's
 multi-row verify, not draft quality (see the Strix table above), so a better head would not close it. Not worth building until a
 checkpoint exists.
+
+### Verify-row cost curve (issue #1359, stage 1)
+
+Question: is a 16- or 32-node tree verify (DDTree / Weaver-style, Mirai "Trees from Marginals", arXiv 2607.06763) worth building here? That
+depends on what extra verify rows cost. No new kernels: `benchmarks/VerifyRowCurve` loads a model once, prefills 64 tokens (32 on CPU), then
+times one target forward over R rows (random token ids, content is irrelevant to cost), rolls the KV and the recurrent state back, repeats.
+`verify` = `ForwardWithRecurrentSnapshots` (the call `MtpSpeculativeDecoder` makes; capped at 16 rows by `GemvColumns.MaxColumns`), `fwd` = plain
+`Forward` (used for R = 24, 32). No drafter / tap capture in the timed call. Median of 3 interleaved reps x 5 timings (even reps ascend R, odd reps
+descend, 2 discarded warm-up passes over every R first), under `scripts/gpu-lock.sh`, no human GPU process before or after (ollama idle).
+Same build (`dev` @ c9436002 + the harness; the build recompiled 30 `.spv` blobs with the local glslc, which differ byte-wise from the checked-in
+ones, so the shaders measured are the local build's), 2026-10-28. Ranges are min-max over the 15 timings. Strix Halo 8060S, Vulkan unless stated.
+
+| rows | Qwen3.8-27B Q4_K_M ms | Bonsai-2 27B PQ2_0 ms | Bolt 24GB ms | CPU, Bonsai-2 PQ2_0 ms |
+|---|---|---|---|---|
+| 1 (decode) | 98.3 (97.4-101.5) | 44.9 (43.6-45.7) | 38.8 (38.2-44.9) | 247 (234-276) |
+| 2 | 107.6 (106.6-116.3) | 53.5 (51.8-56.5) | 45.1 (44.2-49.6) | 1335 (1271-2282) |
+| 4 | 121.6 (119.9-131.4) | 69.3 (66.2-74.8) | 58.0 (56.9-68.2) | 1604 (1527-1659) |
+| 8 | 147.7 (145.5-151.7) | 106.4 (100.5-111.1) | 81.5 (80.2-86.3) | 2145 (2085-2172) |
+| 9 | **578.3** (575.1-638.4) | **346.0** (344.3-350.5) | 85.6 (85.0-88.6) | not run |
+| 16 | 592.6 (589.2-660.0) | 365.1 (362.2-368.9) | 164.2 (162.9-217.1) | 3462 (3355-4707) |
+| 32 (`fwd`) | 553.5 (550.8-580.1) | 404.0 (402.1-405.5) | 253.0 (249.6-276.8) | 6752 (6398-6858) |
+
+Intermediate rows (Qwen3.8 / Bonsai-2 / Bolt, ms): 3 = 113.9 / 63.2 / 52.0, 6 = 128.9 / 88.9 / 70.1, 12 = 585.3 / 354.5 / 110.4, 24 (`fwd`) = 542.8 /
+386.6 / 234.7. The Qwen3.8 and Bonsai-2 numbers come from the second, finer run (13 and 11 row counts); the earlier 1-32 run (Qwen3.8 only) agreed within
+3% for every row it shared (e.g. 8 rows 150.9, 16 rows 610.6 ms). Bonsai-2, Bolt and CPU were run once (3 interleaved reps). The Bolt numbers are the unprofiled run; its first rep-2 outlier (12 and 16 rows) is why the maxima are high.
+
+**Marginal row cost and ratio vs a decode step** (slope between the quoted rows, ms per extra row, in brackets as % of the 1-row decode):
+
+| cell | 1 -> 8 rows | 8 -> 16 rows | 16 -> 32 rows (`fwd`) | 8 rows / decode | 16 rows / decode | 32 rows / decode |
+|---|---|---|---|---|---|---|
+| Strix Vulkan Qwen3.8 Q4_K_M | 7.1 (7.2%) | 55.6 (57%) | -2.4 | 1.50x | 6.03x | 5.63x |
+| Strix Vulkan Bonsai-2 PQ2_0 | 8.8 (19.6%) | 32.3 (72%) | 2.4 | 2.37x | 8.13x | 9.00x |
+| Strix Vulkan Bolt 24GB | 6.1 (15.7%) | 10.3 (26.6%) | 5.5 (14%) | 2.10x | 4.23x | 6.52x |
+| CPU, Bonsai-2 PQ2_0 | 2 -> 8: 135 (55%) | 164 (66%) | 206 (83%) | 8.7x | 14.0x | 27.3x |
+| RTX 3060 CUDA (T5500) | not run, needs user go-ahead (shared-GPU rule) | | | | | |
+
+Reading: Qwen3.8 and Bonsai-2 have a **cliff between 8 and 9 rows** (4x and 7x of the 8-row cost; the multi-column GEMVs cap at 8 columns and the
+next path is a fixed ~340-570 ms GEMM, issue #1365), so 16/32-row trees cannot be priced from the 1..8 slope. Bolt has no cliff but steepens past 12
+rows (issue #1366). On CPU the cliff is between 1 and 2 rows (issue #1367). **Fixed in #1367** (CPU only): the 2..8-row GEMM took the scalar float PQ2_0 tier (per-element unpack + f32 dot) and the GDN scan was single-threaded scalar. Now small-n PQ2_0 takes the W2A8 tier in 4-token tiles (bit-identical per token to the decode GEMV) and the scan is head-parallel + Vector256 (bit-identical to the scalar walk). CPU Bonsai-2 PQ2_0, same harness, ms (min-max of 9 timings): 1 row 164-387 (noisy; was 234-276), 2 rows 295-363 (was 1271-2282), 4 rows 305-372 (1527-1659), 8 rows 493-639 (2085-2172), 16 rows 946-1196 (3355-4707), 32 rows 1822-1997 (6398-6858). Marginal row cost 8->16 is now ~55 ms (about 25% of a decode step) against 164 before.
+
+**Break-even tau gain.** A tree of the same depth as a K=7 chain pays the same draft but verifies N rows instead of 8. Break-even needs
+`g* = (draft + V(N)) / (draft + V(8)) - 1` more tokens per round than the chain. Draft = measured in-engine draft ms of the same run (below;
+K=7 DFlash/LiLiCorr: Qwen3.8 31.1, Bonsai-2 32.3, Bolt 76.0; CPU not measured, so `draft = 0` is used, which is a lower bound on `g*`). The
+net columns are `(1+gain) / (1+g*)`, the end-to-end speed relative to the chain, for three tau gains over a chain of the same depth. **Those
+gains are the paper's numbers (Weaver paper sec 5, B200, Qwen3.6-27B, T=1), not ours: +20% (~ Weaver over DDTree at equal size, paper +22.3%), +35% (~ DDTree-64 over a chain, 5.21 -> 6.98, paper +34%),
++75% (~ Weaver over a chain, paper +73.6%).** We have measured no tau gain for a tree.
+
+| cell | N | g* | net at +20% | net at +35% | net at +75% | gate |
+|---|---|---|---|---|---|---|
+| Qwen3.8 Q4_K_M | 16 | +249% | 0.34x | 0.39x | 0.50x | no-go |
+| Qwen3.8 Q4_K_M | 32 | +227% | 0.37x | 0.41x | 0.54x | no-go |
+| Bonsai-2 PQ2_0 | 16 | +187% | 0.42x | 0.47x | 0.61x | no-go |
+| Bonsai-2 PQ2_0 | 32 | +215% | 0.38x | 0.43x | 0.56x | no-go |
+| Bolt + LiLiCorr | 16 | +53% | 0.79x | 0.89x | 1.15x | no-go (only +75% pays) |
+| Bolt + LiLiCorr | 32 | +109% | 0.57x | 0.65x | 0.84x | no-go |
+| CPU Bonsai-2 (draft = 0) | 16 | >= +61% | <= 0.74x | <= 0.84x | <= 1.08x | no-go |
+| CPU Bonsai-2 (draft = 0) | 32 | >= +215% | <= 0.38x | <= 0.43x | <= 0.56x | no-go |
+| CUDA RTX 3060 | - | not run, needs user go-ahead | | | | |
+
+Hypothetical, not measured: if the 8-column cliff were removed and rows 9..16 cost the 1..8 slope, a 16-row verify would be ~204 ms (Qwen3.8) and
+~177 ms (Bonsai-2), i.e. `g*` = +32% and +51%. Still above the +20% gate; it would only be break-even against the paper's training-free tree
+gain (+34%, which the paper itself shows is end-to-end neutral: speedup 3.51x -> 3.56x), so a cliff fix alone does not justify the tree.
+
+**Go / no-go (issue gate: marginal row cost < ~10% of a decode step, or break-even tau gain < 20%):**
+
+- **Qwen3.8 Q4_K_M, Vulkan: NO-GO.** The 1..8 slope (7.2%) passes the 10% gate, but that is the chain, not a tree: at 16/32 rows the cliff makes `g*`
+  +230-250%. Even cliff-free it is ~+32%. Revisit only with Weaver-class gains, and only after #1365.
+- **Bonsai-2 PQ2_0, Vulkan: NO-GO.** 19.6% per row already at 1..8, cliff at 9, `g*` +187% at 16.
+- **Bolt 24GB + LiLiCorr, Vulkan: NO-GO** on the gate (15.7% per row; `g*` +53% at 16). It is the closest: a Weaver-class +75% would net 1.15x at
+  16 nodes, the LiLiCorr lattice is a ready candidate pool, and the recurrence is diagonal. But code tau is draft-quality bound (3.3-3.75), and
+  the draft is already half the round (76 of 161 ms).
+- **CPU: NO-GO** (decode-to-2-row cliff, every extra row 55-83% of a decode step).
+- **CUDA: not run, needs user go-ahead.**
+
+**Vulkan DFlash round breakdown** (`DOTLLM_MTP_ADAPTIVE=0 DOTLLM_DFLASH_DRAFT=K DOTLLM_MTP_TRACE=1 DOTLLM_DFLASH_TRACE=1`, `dotllm run ... -n 128 -t 0`, one
+run per row, code prompt "Write a Python function that implements quicksort, with comments:" except Bolt, prose "The history of the printing
+press began in"; mean over the trace's last window). `round - draft - verify` is the host work between GPU submits (accept walk, argmax over the rows'
+logits, KV rollback, state commit), i.e. the "idle gap" that uzu's accept-behind-draft (#984: 72.8 -> 70.8 ms/pass, -2.7%) removed:
+
+| run | tokens/round | draft ms | verify ms | round ms | gap ms (% of round) | draft detail |
+|---|---|---|---|---|---|---|
+| Qwen3.8 + DFlash2 K=7 | 7.31 | 31.1 | 184.3 | 217.5 | 2.1 (1.0%) | 18 drafts, 40 submits, 406 ms submit wait (10 ms each), head 9 ms/draft, `select` 8.8 ms/draft |
+| Qwen3.8 + DFlash2 K=3 | 3.88 | 17.5 | 129.1 | 147.2 | 0.6 (0.4%) | 33 drafts, 70 submits, 541 ms wait, head 7 ms/draft, `select` 1 ms/draft |
+| Bonsai-2 + r3 DFlash2 K=7 | 5.62 | 32.3 | 100.6 | 133.9 | 1.0 (0.7%) | 21 drafts, 46 submits, 310 ms wait, head 3.8 ms/draft, `select` 14 ms/draft |
+| Bolt + LiLiCorr K=7 | 3.28 | 76.0 | 84.4 | 161.3 | 0.9 (0.6%) | 38 drafts, 118 submits, 1350 ms wait; host LiLiCorr `select` 36 ms/draft |
+
+The between-round gap (host accept walk, rollback, commit) is 0.6-2.1 ms, <= 1.0% of a round, against uzu's 2.7% on M5 Pro. Even if
+accept-behind-draft hid all of it that is the ceiling, so **the inter-round idle gap is not worth chasing on any Vulkan cell.** The idle that is
+visible is *inside* the draft: a draft is two submits (layers, read back for the selector, then the head) and the host `select` stage at K=7 is
+8.8 ms (Qwen3.8, 4% of the round), 14 ms (Bonsai-2, 10%) and 36 ms (Bolt LiLiCorr head, 22%, follow-up #1 above), while the K=3 selector is
+1 ms. `select` is wall time and includes the readback wait, so it is an upper bound on GPU idle, not a measurement of it (submit waits
+account for 72% / 94% / 50% / 49% of the draft wall in the four rows). A GPU-side selector walk is the lever there, not the accept gap; measure
+GPU idle with timestamps before building it. Caveats: the in-engine verify (with tap capture and drafter injection) was 184 ms for 8
+rows on Qwen3.8 against 148 ms bare, 100.6 vs 106.4 on Bonsai-2 and 84.4 vs 81.5 on Bolt, from single runs whose first trace window includes warm-up (not
+reproduced; not trusted). The Bolt row is also at 3.28 tokens/round where the table above records 7.44 on the same prompt (issue #1368). Nothing here
+changes the table's go/no-go: a 36 ms swing in verify is smaller than the cliff.
+
+**Takeaways for stage 2 (not started, gate not passed):** (1) the verify-row curve, not draft quality, still caps speculation on Qwen3.8 and
+Bonsai-2: fix the 9-row cliff (#1365) first (it unblocks MTP K>=8, `--lookup-draft` >= 8 and tree verifies of 9..16 nodes; it does NOT enable DFlash K>=8, which the shipped drafters cannot produce, see #1378); (2) Bolt's 12..16-row `moe_dense` kernel choice (#1366) is a
+cheap cell-level win independent of trees; (3) a tree verify needs `ForwardWithRecurrentSnapshots` above 16 rows (cap `GemvColumns.MaxColumns`).
+
+#### Verify-cliff fix: 9..16-column GEMVs (issue #1365)
+
+Profile first (`DOTLLM_VULKAN_HYBRID_PROFILE=1`, 9 rows, Qwen3.8 Q4_K_M, per-category GPU timestamps): proj_ffn 501 ms vs 95 at 8 rows, proj_gdn 156 vs 36,
+lm_head 75 vs 8, proj_attn 57 vs 11; everything else (gdn scan, attention, norms) is flat at 2-3 ms. So the cliff is the projections, all of them:
+the GEMV caps at 8 columns and the next path is the 128x128 coopmat GEMM. The weight mix of that file is Q4_K (FFN), Q8_0 (GDN / attn q,k,v and the
+48-row ssm_alpha/beta) and Q6_K (attn_output, lm_head), so Q4_K alone (the issue's title) is a third of it; Bonsai-2 is PQ2_0 everywhere plus BF16
+ssm_alpha/beta. Fix, no new storage and no expansion (the weights are read as blocks in the tile load, as before):
+
+- `matmul_q4_k_gemv_f32_multi`, `matmul_q6_k_gemv_f32_rows`, `matmul_q8_0_gemv_multi` are already specialisation-constant in NC and NR, so the 9..16-column
+  pipelines are the same SPIR-V with `NC = 9..16, NR = 4` (`MatMulQuantGemvMultiKernel.WideMaxColumns`, `MatMulQ8_0GemvMultiKernel.WideMaxColumns`;
+  `DOTLLM_VK_{Q4K,Q6K,Q8}_ROWS_WIDE` override NR, 1..4 because the shaders store one output per lane and have 64 lanes). A row's bits do not depend on NR
+  or NC, so **every column of a 9..16-row verify is bit-identical to the one-column decode dispatch**, as it is for 2..8.
+- PQ2_0: eight new `matmul_pq2_0_f32_gemv_mr_r4_c{9..16}_b1_w64` variants of the #474 multi-row family (`PQ2_0SmallNDispatch` default max `n` 8 -> 16).
+- BF16: `matmul_bf16_gemv_multi_f32` `MAX_N` 8 -> 16 (same code; the 2 and 4/8-row Bonsai-2 verify did not move, 4 x 5 interleaved timings each way).
+- Only the dense qwen35 host takes the wide path (`VulkanQwen3HybridDenseTransformerModel.SmallRow.cs`); the MoE host and `VulkanTransformerModel` keep their 8 cap
+  (not validated above 8 rows; follow-up). Q5_K, Q6_K (non-Rows), IQ4_XS, IQ3_S multi kernels stay at 8 (`MaxColumnsFor`).
+- Escape hatch / A/B: `DOTLLM_VK_SMALLROW_WIDE=0` plus `DOTLLM_VK_PQ2_0_MULTICOL_MAX_N=8` restores the old dispatch.
+
+NR matters a lot here (every activation vec4 load is shared by NR weight rows; at 16 columns the loads, not the weight bytes, are the cost). Whole verify forward,
+ms, 9 / 12 / 16 rows: Qwen3.8 Q4_K_M NR 1 = 276 / - / 410, NR 2 = 210 / 303 / 404, NR 4 = 158 / - / 250 (12 rows not taken for NR 1 and 4); Bonsai-2 PQ2_0 rows per workgroup 1 = 172 / 240 / 341,
+2 = 123 / 159 / 210, 4 = 103 / 127 / 163 (one 3-sample pass each, `VerifyRowCurve`; NR 4 x 16 columns is also all a 64-lane workgroup can store).
+
+Result, `ForwardWithRecurrentSnapshots` ms, `VerifyRowCurve ... ab` (old = caps at 8, new = up to 16, **in the same process**, every timing taken both ways,
+order alternating, 3 reps x 5; median (min-max); Strix Halo 8060S Vulkan, ctx 64, `dev` + this change, checked-in `-O` shaders, 2026-10-28):
+
+| rows | Qwen3.8 old | Qwen3.8 new | Bonsai-2 old | Bonsai-2 new |
+|---|---|---|---|---|
+| 2 | 102.3 | 102.4 | 49.8 | 49.8 |
+| 8 | 135.0 | 135.1 | 98.4 | 98.4 |
+| 9 | 317.8 (312-338) | **145.9** (141-150) | 319.6 (305-334) | **107.0** (102-112) |
+| 10 | 320.7 | 156.9 | 314.5 | 113.8 |
+| 12 | 320.3 | 180.7 (176-186) | 318.9 | 131.8 |
+| 14 | 322.9 | 210.1 | 322.6 | 151.3 |
+| 16 | 329.5 (320-355) | **240.3** (233-256) | 325.5 (322-346) | **167.2** (165-189) |
+
+The "old" column is the GEMM path and moves between invocations (462 ms at 9 rows in an earlier invocation the same hour, 578 in the issue's run, whose build
+recompiled shaders without `-O`); the new column and the 1..8 rows reproduced within a few percent. Marginal cost 8 -> 16 rows is now 13.1 ms/row (Qwen3.8)
+and 8.6 (Bonsai-2) against the same-run 1..8 slope of ~5.4 and ~7.9, i.e. 16 rows cost 1.7-1.8x an 8-row verify and 2.5x / 3.9x a decode step, not the 3.4x / 7.6x of the
+old arm. Qwen3.8's remaining slope is FFN FMA/load issue (proj_ffn 164 of 244 attributed ms at 16 rows, profiling on); getting under it means an int8 dot or coopmat tile on the
+quantized blocks, not more columns per lane (not tried). 17..32 rows are unchanged (the GEMM, ~320 ms).
+
+End to end on the CLI (`--mtp-head`/embedded MTP, `DOTLLM_MTP_ADAPTIVE=0`, code prompt, `-n 128 -t 0`, decode tok/s, old/new/new/old order, two runs each):
+Qwen3.8 + `mtp-Qwen3.8-27B-Q8_0` head, K = 7: old 33.6 / 35.3, new 34.8 / 33.9 (no change, as expected: 8 rows); K = 11: old 20.9 / 26.5, new 35.6 / 38.4; K = 15:
+old 28.4 / 30.3, new 38.0 / 36.6. Bonsai-2 + its embedded MTP head: K = 7 24.3 / 21.1 vs 24.5 / 24.8; K = 11 9.2 / 9.2 vs 18.3 / 18.2 (in-engine verify 318 -> 134 ms);
+K = 15 8.3 / 8.6 vs 13.9 / 13.8 (verify 331-343 -> 178 ms). Greedy text is identical old vs new at K = 7, 11, 15 on both models. Acceptance on this prompt is low
+(3.06 tokens/round for Bonsai-2 at any K), so K >= 8 is not faster than K = 7 *here*; the fix removes the penalty, it does not make long chains pay on a low-acceptance prompt.
+**DFlash K = 8 / 11 / 15 is not reachable with the shipped drafters**: `DOTLLM_DFLASH_DRAFT` only caps the block's `BlockSize - 1 = 7` drafts, so the DFlash
+numbers above stay at 8 rows; the cliff bites MTP K >= 8, prompt-lookup `--lookup-draft` >= 8 and any tree verify of 9..16 nodes.
+
+Updated tree arithmetic (same formula, same-run V): Qwen3.8 N = 16 `g*` = (31.1 + 240.3) / (31.1 + 135.1) - 1 = +63%; Bonsai-2 (32.3 + 167.2) / (32.3 + 98.4) - 1 = +53%.
+That is worse than the "+32% / +51% if the cliff were removed and the 1..8 slope held" extrapolation above, because the 9..16 slope is steeper than the 1..8 one. The tree
+gate does not open; what #1365 changes is that 9..16-row verifies no longer cost 3-5x.
+
+Parity: `VulkanDenseGemvRowsTests.{Q4KWide,Q8Wide,Q6KWide}_*` (every column bit-identical to the one-column dispatch and within 1e-3 + 1e-4 rel of an f64 dot
+over the dequantised weights; ragged M, K of 3 blocks, M below NR), `VulkanMatMulPQ2_0GemvF32KernelTests.{RecordColumns,MultiRowVariants}_*` extended to 16 columns
+(vs the looped #470 kernel at 1e-5 and the scalar reference, sentinel past the live columns), `VulkanMatMulBf16GemvMultiF32KernelTests` at 9/12/13/16.
+CUDA has the same 8-column caps (`Pq2_0GemvMultiMaxColumns`, `CudaQ8_0RbGemv.MaxColumns`, `CudaSmallSGemvDispatch.MaxColumns`); not measured here (#1375). The shared
+`PQ2_0SmallNDispatch` cap stays 8 on the MoE host and `VulkanTransformerModel` (their 9..16-row PQ2_0 path is unmeasured, #1374 below). Remaining: 17..32 rows (#1376), Q5_K / Q6_K / IQ4_XS / IQ3_S wide kernels (#1377), (the DFlash K >= 8 premise in the stage-1 takeaways was wrong and is corrected above, #1378).
+
+#### Nemotron-H small-row GEMVs for Q5_0 / Q4_K / Q6_K / Q4_0 (issue #1420)
+
+`VulkanNemotronHTransformerModel` had exact multi-column GEMVs only for NVFP4 / IQ2_XXS / Q8_0 (#1244); every other quant fell to the GEMM for 2..16 rows. Measured with
+`VerifyRowCurve` on NVIDIA-Nemotron-3-Nano-4B Q4_K_M (tensor census: 49 Q5_0 incl. `ssm_in`/`ffn_up`, 33 Q4_K, 9 Q6_K, 3 Q8_0), ctx 64, 3 reps x 3, `fwd` median ms:
+**1 row 16.9, 2 rows 280.4 (16.6x decode), 3-5 rows 282, 8 rows 284, 16 rows 280.6** (a flat ~265 ms fixed GEMM cost; this also hit every short prompt chunk).
+Now Q5_0 and Q4_0 take new `matmul_q5_0_gemv_multi` / `matmul_q4_0_gemv_multi` shaders (the Q8_0 multi shader's layout: 4 lanes per 32-block, `precise` fma chain, fixed
+shared-memory tree) and Q4_K / Q6_K the dense-host `MatMulQuantGemvMultiKernel` (Q4_K, Q6_K_Rows), all with decode = the 1-column dispatch, so every row is bit-identical to a
+decode step (`DOTLLM_VK_NEMOTRON_EXACT_GEMV=0` restores the old dispatch, `DOTLLM_VK_NEMOTRON_KQUANT_ROWS=0` only the K-quant part). Result, same harness:
+
+| rows | 1 | 2 | 3 | 4 | 5 | 8 | 12 | 16 |
+|---|---|---|---|---|---|---|---|---|
+| before ms | 16.9 | 280.4 | 282.0 | 282.1 | 281.7 | 284.1 | 282.9 | 280.6 |
+| after ms | 17.0 | 19.9 | 21.3 | 24.6 | 30.3 | 23.4 | 30.1 | 35.6 |
+
+(`verify` series, `ForwardWithRecurrentSnapshots`: 18.1 / 19.3 / 22.6 / 28.0 / 21.4 / 27.8 / 35.2.) Decode is unchanged (17.0 vs 16.9; ranges 16.0-21.0 vs 16.5-19.0).
+Parity: `VulkanExactGemvMultiTests.LegacyQ_*` (every column bit-identical to its one-column dispatch AND within 1e-3 + 1e-4 rel of an f64 dot over the dequantised weights, random
+blocks so every 5th-bit / nibble pattern occurs, M % NR != 0, K of 3 blocks, 1..16 columns) and `VulkanNemotronHDFlashTests.RealNano_SmallBatch_EveryRow_IsBitIdenticalToDecode`
+(2 / 8 / 13 rows of the real file, all logits bit-identical to single-row decodes). The 5-row point is a tuning leftover (NR=4 for 4 < n < 8 is slower than at 8).
+
+#### Nemotron-H 4..7-row verify tuning (issue #1459)
+
+The #1420 table above had 5 rows (30 ms) slower than 8 (23 ms). Root cause, found with `DOTLLM_VK_NEMOTRON_PROFILE=1` (5 rows: `proj_gdn` 11.6 ms, `proj_ffn` 9.7 vs 6.6 / 5.6 at 6 rows; scan, norms, attention and LM head are
+flat): the exact GEMVs' cost is not monotone in the column count. With the single NR=4 the 5- and 7-column pipelines of every projection kernel (Q5_0, Q4_0, Q8_0, Q4_K, Q6_K) cost ~1.5x the 6- and 8-column ones.
+An NR x NR sweep (`DOTLLM_VK_NEMOTRON_GEMV_ROWS` for the legacy-quant kernels, new `DOTLLM_VK_NEMOTRON_KQUANT_NR=multi,wide`, new `DOTLLM_VK_NEMOTRON_PERN_TABLE=n:exactNR:kquantNR;...`) showed the optimum moves with n
+(n=4: exact NR 3 beats 4 by 3.4 ms; n=5: exact 2 / K-quant 3; n=7: 2 / 2; 6, 8..16 stay 4), and then the bigger win: a 5- or 7-column dispatch is faster as a 6- / 8-column dispatch with the spare row discarded.
+Two changes: (1) per-n NR tables (`RowsByColumns` on `MatMulExactGemvMultiKernel`, `rowsByColumns` on `MatMulQuantGemvMultiKernel.TryCreate`); (2) `PadOddColumns`: when the input and output buffers have room for one more row,
+5 columns run the 6-column pipeline and 7 the 8-column one (a column's bits do not depend on NC). `DOTLLM_VK_NEMOTRON_PERN=0` / `DOTLLM_VK_NEMOTRON_PADODD=0` restore the old behaviour.
+
+`VerifyRowCurve`, Nemotron-3-Nano-4B Q4_K_M, ctx 64, `verify` median ms, both locks held, separate-process A/B with the order alternated over 3 rounds (ranges within 0.5 ms; one contended old-arm round discarded):
+
+| rows | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 12 | 16 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| before (#1420) | 16.9 | 18.3 | 21.9 | 27.8 | 17.9 | 33.5 | 20.4 | 21.1 | 25.1 | 31.9 |
+| NR tables only | 16.9 | 18.2 | 18.3 | 20.7 | 17.9 | 27.9 | 20.3 | 21.1 | 25.2 | 32.2 |
+| + padding (now) | 16.9 | 18.3 | 18.3 | 17.7-18.0 | 17.9 | 20.2 | 20.2 | 21.1 | 25.1 | 31.9 |
+
+Parity: `VulkanExactGemvMultiTests.PadOddColumns_*` / `KQuantPadOddColumns_*` (first n columns bit-identical to the unpadded dispatch with the table in force; the spare output row is written when there is room, which proves the
+padded pipeline ran, and a tight buffer leaves its trailing sentinel untouched) and `VulkanNemotronHDFlashTests.RealNano_SmallBatch_EveryRow_IsBitIdenticalToDecode` now also at 4 / 5 / 7 rows of the real file. Caveats:
+the table was measured on Nano only (Bolt's NVFP4 / IQ2_XXS tables are untouched; its Q8_0 attention/LM-head kernels pick up the new n=4/5/7 entries, unmeasured); padding relies on a role buffer never aliasing live data past its `n x m` rows
+(true of every buffer the model passes today). Why the odd pipelines are slow (register allocation / `lane / NC` store pass) is not established; the workaround makes it moot for 5 and 7.
+
+#### Dense `VulkanTransformerModel`: Q8_0 5..16 rows, Q4_0 / Q5_0 2..16 rows (issue #1420)
+
+The Q8_0 Q8_1-activation MMVQ multi GEMV stops at 4 rows, so Llama-3.2-3B Q8_0 jumped from 29 ms (2..4 rows) to 39-40 ms (5..16) on the GEMM, against 19.5 ms for decode.
+5..16 rows now run `MatMulQ8_0GemvMultiKernel` (F32 activations, NR 4), and Q4_0 / Q5_0 the new `matmul_q{4,5}_0_gemv_multi` shaders (from #1420 above) for 2..16 rows.
+`VerifyRowCurve ab` (in-process, order alternated, 4 reps x 5, ctx 64, median ms; old = `DOTLLM_VK_SMALLROW_LEGACYQ=0` arm): 2 rows 28.9 / 28.9 (MMVQ, unchanged), 4 rows 29.3 / 29.0,
+**5 rows 38.8 -> 29.0, 8 rows 39.4 -> 30.1, 12 rows 40.1 -> 32.0, 16 rows 40.4 -> 35.7** (ranges within 1 ms of the medians below 12 rows, <= 2.6 ms at 16).
+The rows are ULP-close, not bit-equal, to decode (decode quantises its activation to Q8_1): `DenseSmallRowLegacyQTests` (Llama-3.2-1B Q8_0 5/8/16 rows: max|batched - seq| 0.20 / 0.41 / 0.41 against
+0.20 / 0.75 / 0.75 on the old path; argmax identical) and on SmolLM-135M Q5_0 (2/9/16 rows) the batched forward tracks an F32-activation decode (`DOTLLM_VULKAN_DISABLE_MMVQ=1`) to 6e-3..1.4e-2
+while the MMVQ decode itself is 0.3..0.8 off it on that degenerate model (Q8_1 activation noise), which is why that test allows an argmax flip only inside the measured noise.
+No local dense Q4_0 model: the Q4_0 shader is covered by the kernel tests only (bit-identical columns + f64 reference), not timed end to end.
+
+#### 17..32-row verify (issue #1376): measured, not built
+
+`VerifyRowCurve` (Qwen3.8-27B Q4_K_M, ctx 64, 3 reps x 3, `dev` @ cc686e1d, both locks held, ollama idle), `fwd` median (min-max) ms: 1 row 102.9 (101.4-106.5),
+8 rows 164.3 (159.3-167.8), 16 rows 276.0 (271.9-282.1; `verify` 277.5), **17 rows 997.6 (979.9-1023.4), 20 rows 990.4, 24 rows 1005.6, 32 rows 1019.3 (973.2-1029.4)**.
+So the 16 -> 17 step is a 3.6x cliff and 17..32 rows are flat at ~1 s (the GEMM's fixed cost: 128x128 coopmat tile + per-projection F16 dequant, #495/#1107 rule 2);
+the 553 ms quoted for 32 rows in the stage-1 table was a different build and the GEMM path has not been stable between builds (320 / 462 / 578 / ~1000 ms).
+
+Why nothing was built: the only way to serve 17..32 rows on the existing GEMVs is two dispatches per projection (columns 0..15 and 16..n-1), which needs
+column-offset descriptors/push constants in every multi-column kernel (the `Record` APIs take whole buffers and the descriptor cache is keyed on handles). The
+ceiling of that is ~16-row cost x 2 = ~550 ms (13 ms/row marginal at 9..16 rows, so 32 rows ~ 135 + 24 x 13 = ~450-550 ms): 4.4-5.4x a decode step. Break-even
+needs `(1 + a) / (1 + C/decode_step)`: at 32 rows that is ~5.4 accepted tokens per round just to match plain decode, against the measured 3.05-3.06 tokens/round
+(Qwen3.6 CPU head, Bonsai-2 MTP). The 16-row tree already did not open the gate (+53..63 % `g*` from the arithmetic above needs acceptance the drafters do not
+deliver), and nothing calls a 17..32-row verify: `ForwardWithRecurrentSnapshots` is capped at `GemvColumns.MaxColumns = 16`, so only plain `Forward` (e.g. prefill
+of a short chunk) lands there. The real fix for that range would be an int8-dot / coopmat tile that reads the quantized blocks (dequant in the tile load), a new GEMM
+family, KL-checked; it is only worth building if a drafter with >= 6 accepted tokens/round or a tree consumer appears. Tracked in #1376; reopen then.
+
+#### 17..32-row forward is ~1 s? Not a code regression (issue #1458): environment-sensitive, narrow tile refuted
+
+Question: did the GEMM path regress (320 / 462 / 578 / ~1000 ms seen at 17..32 rows on Qwen3.8-27B Q4_K_M)? Method: `VerifyRowCurve` (plain `Forward`, ctx 64), `dev` @ 77f5a3aa,
+both locks held, ollama idle.
+
+- **No code change to bisect.** `git log cc686e1d..dev -- src/DotLLM.Vulkan native/vulkan` is four commits (scheduler Gumbel draw, a MoE probe doc); none touches the dense GEMM routing
+  or any shader. The ~1000 ms at cc686e1d and the other figures are the *same code*.
+- **Same build, same box, one session, 17-row `fwd` median: 770 / 680 / 690 ms early, then 428 / 374 / 357 / 326 / 388 ms later** (16 rows: 260 -> 237 -> 236 -> 243 ms). The GEMV
+  (<= 16 rows) path moved ~10 %, the GEMM path 2x, so the 16 -> 17 "cliff" is 3.0x in one state and 1.4x in another. Quiet-box numbers: 16 rows 236 [234-263],
+  17 rows 326 [322-344], 32 rows 343 [340-351]; decode 103. A python spin on 32 threads costs +29-31 % on 16 / 17 / 32 rows alike; a concurrent `dotnet build` +3 % (16 rows) vs +19 % (17 rows).
+  The 2-3x states were not reproduced on demand (candidates: shared APU power/clock budget, GPU memory residency, other agents' load; unattributed). Quote the 17..32 range as 330-1000 ms and
+  always same-session paired.
+- **What runs** (temporary path log + profiler, Qwen3.8-27B Q4_K_M): Q4_K FFN (m=17408 / 5120) and Q8_0 GDN / attention projections (m=48..12288) take the **F16 coopmat 128x128x4 GEMMs
+  that read the packed blocks in place** (dequant in the LDS tile load); there is **no per-projection F16 weight dequant** for this model (that is the IQ / PQ path). The int8-coopmat MMQ
+  (`Cm1For`) is not available on this device (`cm1=False`), and `DOTLLM_VK_MMQ_CM1=0` is a no-op (652 vs 680 ms, inside drift). Profile at 17 rows: proj_ffn 454 ms (67 %), proj_gdn 156 ms, proj_attn 52 ms
+  (boot-state run, 689 ms wall); n = 17, 32, 64 all cost the same (the 128-wide N tile does the work of 128 rows), n = 128 ~ +25 %.
+- **Narrow-N twin refuted.** A 128x64 (BN=64, WN=32) copy of the Q4_K / Q5_K / Q6_K / Q8_0 blocked shaders for n <= 64 looked like 680 -> 380 ms when compared across processes (it was drift).
+  In-process paired A/B (arms alternate per timing, first arm alternates per rep; 6 reps x 3): 17 rows off 351 [337-356] vs on 385 [373-390]; 32 rows 372 [359-384] vs 412 [398-419];
+  24 / 64 rows the same sign (+10 %). So the narrower tile is ~10 % *slower*; BM=64 / 64x32 / 64x64 / 128x32 variants were only compared across processes and are not trusted. Not built.
+- **Two 16-column GEMV dispatches** (needs column-offset descriptors in every multi-column kernel): ceiling ~ 2 x (236 - 103) + 103 = ~370 ms vs the 326-343 ms GEMM on a quiet box, i.e. no win;
+  it would only help in the contended state where the GEMM inflates 2-3x. Not built.
+- **Prompt prefill of 17..32 tokens** takes the same plain-`Forward` path, so it costs the same 0.33-0.43 s (up to 1 s in the slow state) per chunk on this 27B; larger chunks amortise (64 rows 421,
+  128 rows 535 ms quiet).
+- **If this is worth fixing, the lever is the 128x128 tile's fixed per-weight cost** (stage / dequant of 89 M elements per FFN GEMM at ~2.4 ms, ~21 GB/s effective vs ~150 GB/s for decode GEMVs), e.g. a
+  reuse-the-dequant multi-column design or an int8-dot tile that exists on this device; a different tile *shape* alone does not do it.
+
+#### Verify-cliff on the MoE host and `VulkanTransformerModel` (issue #1374)
+
+`VulkanQwen3MoeHybridTransformerModel` now serves 9..16 rows on the same wide multi-column GEMVs through the `AcceptsColumns` gate: Q4_K, Q6_K_Rows
+(preferred above 8; the older non-Rows Q6_K otherwise), Q8_0 (the F32-activation `MatMulQ8Multi`, since the Q8_1 MMVQ multi stops at 8; so 9..16 rows are
+ULP-close, not bit-equal, to the 2..8-row Q8_1 path) and BF16. `DOTLLM_VK_SMALLROW_WIDE=0` restores the 8-column cap (pair it with `DOTLLM_VK_PQ2_0_MULTICOL_MAX_N=8`
+for PQ2_0). Routed-expert paths are unchanged.
+
+Qwen3.6-35B-A3B UD-Q4_K_M (Q8_0 attention / GDN / shared-expert projections; Q4_K / Q5_K routed banks), Strix Halo Vulkan, ctx 64, `VerifyRowCurve ab`
+(old = 8-column cap, new = wide; interleaved in-process, alternating order, 5 reps x 5, `ForwardWithRecurrentSnapshots`), median [min-max] ms:
+
+| rows | old | new |
+|---|---|---|
+| 2 | 28.6 [28.1-30.7] | 28.8 [28.0-30.4] |
+| 8 | 53.0 [50.8-54.2] | 53.0 [51.6-56.1] |
+| 9 | 75.4 [74.1-80.9] | 60.3 [59.3-62.4] |
+| 10 | 78.6 [76.4-88.3] | 64.1 [62.8-66.0] |
+| 12 | 84.5 [83.5-88.5] | 72.1 [70.3-74.2] |
+| 14 | 91.5 [89.6-94.0] | 79.9 [78.4-89.3] |
+| 16 | 88.2 [85.4-90.2] | 78.7 [76.2-81.6] |
+
+1..8 rows unchanged; 9 rows -20%, 16 rows -11%. The MoE host's cliff was small (8 -> 9 rows: 53 -> 75 ms, 1.4x, not the 3-8x of the dense hosts) because
+its dense projections are a minor share; the wide GEMVs recover 14-15 ms of it. A step remains at 8 -> 9 (53 -> 60 ms): the routed-expert and attention paths.
+
+`VulkanTransformerModel` (Llama-3.1-8B Q4_K_M, plain `Forward`, 5 x 3): 1 row 25.3, 4 rows 69.2, 8 rows 79.7, 9 rows 82.5, 12 rows 82.4, 16 rows 82.9 ms. No 8 -> 9 cliff
+(its Q4_K goes to MMQ, Q6_K / Q8_0 multi-column GEMVs are deliberately capped at 4 rows by #996), so nothing to widen. Its 2..4-row cost (2.7x a decode step at 4 rows) is a different matter.
+
+**PQ2_0 default (16, #1365) is NOT carried over.** No PQ2_0 model runs on the MoE host or `VulkanTransformerModel` locally, so 9..16-row PQ2_0 gains / regressions there
+are unmeasurable; both hosts pass `hostMaxColumns: PQ2_0SmallNDispatch.UnvalidatedHostMaxColumns` (8) to `PQ2_0SmallNDispatch.Record`, which is the pre-#1365 behaviour. The
+dense qwen35 host keeps 16 (measured, #1365). Raise it per host once a PQ2_0 model is measured there.
+
+#### Q5_K / Q6_K / IQ4_XS / IQ3_S wide GEMVs (issue #1377)
+
+Q5_K, non-Rows Q6_K and IQ4_XS multi GEMVs now serve 9..16 columns (Q5_K / Q6_K already used `acc[NC]` arrays: only the pipelines were missing; the IQ4_XS generator
+`gen_iq_gemv_multi.py` emits 16 scalar accumulators). Every column keeps the single-row kernel's accumulation order but is **not bit-equal** across NC
+(per-NC specialisation changes FMA contraction: ~1e-7 relative); the parity tests compare to the single-row kernels (2e-3 + 1e-4 rel) and to the 8-column dispatch (1e-4 + 1e-5 rel).
+Kernel timing (`Bench_WideColumns`, `DOTLLM_GEMV_WIDE_BENCH=1`, device-local weights, min of 5 x 20 dispatches; us):
+
+| format, shape | 1x8 | 2x8 | 1x12 | 1x16 |
+|---|---|---|---|---|
+| Q5_K 17408x5120 | 768 | 1497 | 1016 | 1299 |
+| Q6_K 5120x6144 | 288 | 542 | 373 | 531 |
+| IQ4_XS 17408x5120 | 712 | 1441 | 894 | 1390 |
+| IQ3_S 17408x5120 (probe only) | 1937 | 3793 | 18248 | 23352 |
+
+Q5_K / Q6_K / IQ4_XS 16 columns cost about the same as two 8-column dispatches (4-13% less) and avoid the GEMM fallback. **IQ3_S was capped at 8**: 12 / 16 columns were 10x slower than two
+8-column dispatches. #1389 found the cause: NOT a register spill (`VK_AMD_shader_info`: 127 / 256 VGPRs, 0 bytes scratch at 16 columns) but the
+per-thread layout (32 contiguous floats per column per lane, 128 B apart across lanes) that thrashes the L1 as the working set grows with the column count, the same
+failure IQ4_XS had before its coalesced rewrite (#902). IQ3_S now uses the coalesced K-position layout (one 32-lane workgroup per row, lane = 8 consecutive elements, two
+vec4 loads per column), and serves 16 columns: 1x8 700, 2x8 1450, 1x12 1250, 1x16 1310 us (was 1941 / 3833 / 18389 / 23636 us), so 8 columns got 2.8x faster too.
+The end-to-end 9..16-row verify on a Q5_K / IQ4_XS file was not measured (no such hybrid model locally); the kernel-level numbers above are the evidence.
 
 ### `qwen35moe` MTP head (issue #1188)
 
@@ -1238,3 +1547,21 @@ expert -> `nextn.shared_head_norm` -> the trunk's LM head. Absorb computes K/V o
   Round anatomy (K=3, with snapshots): draft 7.5 ms, verify 38 ms (4 rows; 20 ms for 1), a fully accepted round ~47 ms for 4 tokens. Greedy
   output equalled plain decode on 2 of 12 runs (llama.cpp: 1 of 4 at K=3): the multi-row routed-MoE / Q8_1 kernels are not bit-identical to the
   fused single-token decode chain, so near-ties resolve differently. Making the verify exact and cheaper is the follow-up.
+
+## Gumbel-coupled sampled verification (#1358, CPU reference)
+
+Opt-in (`InferenceOptions.GumbelSampling` or `DOTLLM_GUMBEL_SAMPLING=1`; default off because it changes which tokens a seed yields). A stochastic token is drawn as `argmax_i(prepared_logit_i + G(seed, n, i))`, n = generation index (`generatedIds.Count`), G = Philox4x32-10 noise from a 24-bit uniform (`GumbelNoise`; a 32-bit conversion rounds to u = 1 and gives +inf noise). `prepared` is the output of `SamplerPipeline.PrepareDistribution` (penalties, temperature, top-k/p, min-p, constraint mask), so excluded tokens never win and the draw is exactly softmax(prepared). A verify row accepts draft d iff d equals the row own sample: P(accept) = p(d), same as rejection sampling for point-mass drafts, and the emitted token is the one plain decoding draws for that seed, so speculative text equals plain text (tests: GumbelSpeculativeSamplingTests). T = 0 unchanged. The noise uses a deterministic F32 `GumbelNoise.Log` (IEEE add/multiply only, degree-9 polynomial) instead of `MathF.Log`, so a device kernel reproduces it bit for bit (GLSL `log` promises only an absolute error near 1, which near u = 1 is several times the value).
+
+### Device-side Gumbel draw on Vulkan (#1382)
+
+`gumbel_argmax_f32.comp` (`GumbelArgMaxKernel`) draws `argmax(logits * invT + G(seed, n, i))` per verify row, reading the LM-head logits in place and writing one id per row; `IModel.ForwardGumbelSampled` (implemented by `VulkanQwen3HybridDenseTransformerModel`) runs the verify forward with that dispatch instead of the F32 logits download, and `MtpSpeculativeDecoder` uses it when `DOTLLM_GUMBEL_SAMPLING=1`, the model supports it, there is no constraint and `SamplerPipeline.DeviceGumbelInvTemperature` is non-null. Off switches: `DOTLLM_DEVICE_GUMBEL=0` (decoder) or `DOTLLM_VULKAN_DEVICE_GUMBEL=0` (model).
+
+- **The shader takes RAW logits and applies only the temperature scale** (`l * (1f/T)`, the same reciprocal the CPU step multiplies by). Pre-masked logits would need the readback this removes; top-k / top-p / min-p / penalties / constraint masks need host history and constraint state (unknown for rows beyond the first rejection) or a per-row k-th-largest / sort with the CPU's index-order tie rule. Any such pipeline keeps the host path. Follow-up: device top-k / min-p threshold pass (issue filed).
+- **Bit-exactness** (tests `VulkanGumbelArgMaxKernelTests`): noise equals the CPU for all 2^24 uniforms and for Philox counters; the sampled id equals `GumbelNoise.Sample` on 320 real-vocabulary rows; chi-square vs softmax on the device draw. Every float op in the shader is `precise` (no FMA).
+- **Batched vs single-row logits are NOT bit-identical** on Tev1-4B Q4_K_M (Vulkan): in 240 verify rows (4 rows, 60 positions) not one row equalled the plain single-row decode (99.9% of elements differ, max abs diff 2.5e-3 on logits ~10-20, same size for row 0). Consequence for the identity guarantee: the Gumbel argmax flips between plain and speculative in **3-6e-5 of draws** (T=0.7: 24/480,000; T=1.0: 30/480,000 and 7/240,000 with 8 rows), i.e. about one differing token per 16-30k; greedy argmax flipped 0/240 rows. This bounds "speculative text == plain text" on the GPU; end to end 9/9 runs (763 tokens) were identical.
+- **Cost** (VerifyRowCurve-style paired A/B, ctx 64, 3 reps x 5, order alternated, both locks): a verify forward plus host `PrepareDistribution` + `GumbelNoise.Sample` is dominated by the CPU Gumbel loop (~17.5 ms per row at V = 248k), not the readback: 2 rows 35.3 ms host vs 17.8 device (readback-only floor 17.6); 4 rows 56.7 vs 21.2 (21.7); 8 rows 96.5 vs 25.5 (26.5). End to end (TextGenerator, MTP, T=0.7, 9 runs): tok/s plain 59.9-62.3, host-Gumbel 32.5-43.1, device-Gumbel 44.0-71.3 (median 61.8).
+- Only the dense qwen35 Vulkan host is wired; Gemma4/Qwen4Exp/NemotronH/MoE hosts, the continuous-batch scheduler and `EntropyBoundSampler` (passes an empty history) are not covered.
+
+### Continuous-batch scheduler Gumbel decode (#1434)
+
+The scheduler's host path was already position-seeded (`SamplerPipeline.Sample` keys the noise on `GeneratedTokens.Count`), so batched and per-sequence decode agree for a fixed seed. `IModel.ForwardBatchGumbelSampled` (+ `SupportsDeviceGumbelBatch`, `GumbelDraw` per row) lets a model draw every sequence's decode row on the device with its own seed / index / 1/T; `ContinuousBatchScheduler.TryDeviceGumbelDecode` uses it when every ready sequence has `DeviceGumbelInvTemperature` and no constraint (otherwise the whole batch keeps the logits path; `DOTLLM_DEVICE_GUMBEL=0` disables). Vulkan dense qwen35: at/above the fuse threshold (5 rows) the stacked forward runs `gumbel_argmax_rows_f32.comp` (per-row parameter buffer, `GumbelArgMaxRowsKernel`); below it each sequence's serial forward uses the single-row kernel. Measured on Tev1-4B Q4_K_M (T=0.7, Gumbel, 64 tokens, same-session paired A/B alternating order, 3 reps; `GumbelVerifyAb sched`), aggregate tok/s host -> device: 2 seqs 36.5 -> 56.0, 4 seqs 36.6 -> 56.8, 6 seqs 62.1 -> 163.4, 8 seqs 64.6 -> 174.2, 12 seqs 65.8 -> 177.2 (text identical host==device in every rep; the win is the removed host noise generation over a 248k vocabulary).

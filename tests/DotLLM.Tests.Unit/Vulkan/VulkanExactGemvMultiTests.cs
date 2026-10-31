@@ -50,6 +50,10 @@ public class VulkanExactGemvMultiTests
     [InlineData(37, 5376, 2, 4, 3)]    // ffn_down_shexp K = 21 super-blocks: uneven lane strides
     [InlineData(9, 256, 1, 8, 8)]      // one super-block: lanes past the row's 32 groups
     [InlineData(5, 1024, 1, 4, 16)]
+    [InlineData(37, 4096, 1, 2, 14)]   // #1366: 14..16 columns run NR = 4 even when multiRows = 2 (the NR = 2 cliff)
+    [InlineData(37, 5376, 1, 2, 15)]
+    [InlineData(37, 4096, 1, 2, 16)]
+    [InlineData(37, 4096, 1, 2, 13)]   // still NR = 2
     public void Iq2Xxs_EachColumnBitIdenticalToOneColumnDispatch(int m, int k, int decodeRows, int multiRows, int n)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
@@ -80,6 +84,36 @@ public class VulkanExactGemvMultiTests
         byte[] wq = Quantize.FromFloat32(w, (long)m * k, QuantizationType.Q8_0);
         using var kernel = Create(device, spvDir, ExactGemvFormat.Q8_0, decodeRows, multiRows);
         VulkanDenseGemvRowsTests.AssertColumnsMatchOneColumnDispatch(device, wq, x, m, k, n, QuantizationType.Q8_0,
+            (cmd, bw, bx, by, nn) => kernel.Record(cmd, bw, bx, by, m, k, nn));
+    }
+
+    /// <summary>
+    /// #1420: Q5_0 / Q4_0 (Nemotron-H Nano Q4_K_M keeps ssm_in / ffn_up in Q5_0). Random blocks (every nibble and 5th-bit pattern, so a transposed
+    /// qh bit or nibble half is visible in the dequantised-reference check), small fp16 d at byte 0; 1..16 columns, M % NR != 0, K of 3 blocks.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(ExactGemvFormat.Q5_0, 37, 3136, 1, 4, 8)]    // Nano ssm_in K
+    [InlineData(ExactGemvFormat.Q5_0, 41, 3136, 2, 4, 16)]
+    [InlineData(ExactGemvFormat.Q5_0, 40, 96, 1, 8, 3)]      // K = 3 blocks: window tail
+    [InlineData(ExactGemvFormat.Q5_0, 29, 12544, 1, 2, 13)]  // ffn_down-like K
+    [InlineData(ExactGemvFormat.Q4_0, 37, 3136, 1, 4, 8)]
+    [InlineData(ExactGemvFormat.Q4_0, 41, 3136, 2, 4, 16)]
+    [InlineData(ExactGemvFormat.Q4_0, 40, 96, 1, 8, 3)]
+    [InlineData(ExactGemvFormat.Q4_0, 29, 12544, 1, 2, 13)]
+    public void LegacyQ_EachColumnBitIdenticalToOneColumnDispatch(ExactGemvFormat format, int m, int k, int decodeRows, int multiRows, int n)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        var rng = new Random(0x1420 + m * 7 + k * 11 + n * 13 + multiRows + (int)format);
+        int blockBytes = format == ExactGemvFormat.Q5_0 ? 22 : 18;
+        byte[] wq = new byte[m * (k / 32) * blockBytes];
+        rng.NextBytes(wq);
+        for (int off = 0; off < wq.Length; off += blockBytes)
+            BitConverter.TryWriteBytes(wq.AsSpan(off, 2), (Half)(0.002f + 0.004f * (float)rng.NextDouble()));
+        float[] x = F16Bf16Fixture.RandomFloats(rng, n * k, 1.0f);
+        using var kernel = Create(device, spvDir, format, decodeRows, multiRows);
+        VulkanDenseGemvRowsTests.AssertColumnsMatchOneColumnDispatch(device, wq, x, m, k, n,
+            format == ExactGemvFormat.Q5_0 ? QuantizationType.Q5_0 : QuantizationType.Q4_0,
             (cmd, bw, bx, by, nn) => kernel.Record(cmd, bw, bx, by, m, k, nn));
     }
 
@@ -165,6 +199,107 @@ public class VulkanExactGemvMultiTests
         {
             foreach (var kk in multi.Values) kk.Dispose();
         }
+    }
+
+    /// <summary>
+    /// #1459: with <c>PadOddColumns</c> a 5- or 7-column dispatch runs the 6- / 8-column pipeline when the buffers have room for one more row.
+    /// The first n columns must stay bit-identical to the unpadded dispatch, the extra output row proves the padded pipeline ran (a perturbation, not
+    /// a flag), and a buffer with no spare row must keep the unpadded dispatch (its trailing sentinel survives).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(ExactGemvFormat.Q8_0, 37, 4096, 5)]
+    [InlineData(ExactGemvFormat.Q5_0, 41, 3136, 7)]    // M % NR != 0
+    [InlineData(ExactGemvFormat.Q4_0, 40, 96, 5)]      // K = 3 blocks: window tail
+    [InlineData(ExactGemvFormat.Q5_0, 29, 12544, 7)]
+    public void PadOddColumns_FirstNColumnsBitIdentical_ExtraRowProvesPadding(ExactGemvFormat format, int m, int k, int n)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        var rng = new Random(0x1459 + m * 7 + k * 11 + n * 13 + (int)format);
+        int blockBytes = format switch { ExactGemvFormat.Q8_0 => 34, ExactGemvFormat.Q5_0 => 22, _ => 18 };
+        byte[] wq = new byte[m * (k / 32) * blockBytes];
+        rng.NextBytes(wq);
+        for (int off = 0; off < wq.Length; off += blockBytes)
+            BitConverter.TryWriteBytes(wq.AsSpan(off, 2), (Half)(0.002f + 0.004f * (float)rng.NextDouble()));
+        float[] x = F16Bf16Fixture.RandomFloats(rng, (n + 1) * k, 1.0f);   // row n is the spare one
+        using var plain = Create(device, spvDir, format, 1, 4);
+        using var padded = Create(device, spvDir, format, 1, 4);
+        padded.PadOddColumns = true;
+        padded.RowsByColumns = [0, 0, 0, 0, 3, 2, 0, 2];   // exercised table must not change bits either
+        using var bw = device.Allocate(((long)wq.Length + 3) & ~3L);
+        device.Upload(new ReadOnlySpan<byte>(wq), bw);
+        using var bx = device.Allocate((long)(n + 1) * k * 4);
+        device.Upload(x, bx);
+
+        float[] Run(MatMulExactGemvMultiKernel kernel, long outFloats)
+        {
+            using var by = device.Allocate(outFloats * 4);
+            device.Upload(Enumerable.Repeat(1234.5f, (int)outFloats).ToArray(), by);
+            using (var ctx = device.CreateSubmitContext()) { ctx.Begin(); kernel.Record(ctx.CommandBuffer, bw, bx, by, m, k, n); ctx.SubmitAndWait(); }
+            float[] o = new float[outFloats];
+            device.Download(by, o);
+            return o;
+        }
+
+        float[] reference = Run(plain, (long)n * m + 4);
+        float[] roomy = Run(padded, (long)(n + 1) * m + 4);
+        float[] tight = Run(padded, (long)n * m + 4);
+        Assert.Equal(reference.AsSpan(0, n * m).ToArray(), roomy.AsSpan(0, n * m).ToArray());
+        Assert.Equal(reference.AsSpan(0, n * m).ToArray(), tight.AsSpan(0, n * m).ToArray());
+        Assert.NotEqual(1234.5f, roomy[n * m]);                       // the spare row was written: the 6- / 8-column pipeline ran
+        Assert.All(tight.AsSpan(n * m).ToArray(), v => Assert.Equal(1234.5f, v));   // no room: untouched
+        Assert.All(roomy.AsSpan((n + 1) * m).ToArray(), v => Assert.Equal(1234.5f, v));
+    }
+
+    /// <summary>#1459: the K-quant rows kernels pad 5 / 7 columns to 6 / 8 the same way (and take the per-n NR table) without changing a bit of the first n columns.</summary>
+    [SkippableTheory]
+    [InlineData(QuantGemvMultiFormat.Q4_K, 37, 2560, 5)]
+    [InlineData(QuantGemvMultiFormat.Q4_K, 41, 768, 7)]
+    [InlineData(QuantGemvMultiFormat.Q6_K_Rows, 37, 2560, 7)]
+    [InlineData(QuantGemvMultiFormat.Q6_K_Rows, 30, 768, 5)]
+    public void KQuantPadOddColumns_FirstNColumnsBitIdentical_ExtraRowProvesPadding(QuantGemvMultiFormat format, int m, int k, int n)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        var rng = new Random(0x1459 + m * 7 + k * 11 + n * 13 + (int)format);
+        int blockBytes = format == QuantGemvMultiFormat.Q4_K ? 144 : 210;
+        byte[] wq = new byte[m * (k / 256) * blockBytes];
+        rng.NextBytes(wq);
+        for (int off = 0; off < wq.Length; off += blockBytes)
+            BitConverter.TryWriteBytes(wq.AsSpan(off + (format == QuantGemvMultiFormat.Q4_K ? 0 : 208), 2), (Half)(0.0005f + 0.001f * (float)rng.NextDouble()));
+        if (format == QuantGemvMultiFormat.Q4_K)   // dmin (bytes 2..3) is also fp16: keep it finite
+            for (int off = 0; off < wq.Length; off += blockBytes)
+                BitConverter.TryWriteBytes(wq.AsSpan(off + 2, 2), (Half)(0.0005f * (float)rng.NextDouble()));
+        float[] x = F16Bf16Fixture.RandomFloats(rng, (n + 1) * k, 1.0f);
+        int[] table = [0, 0, 0, 0, 0, 3, 0, 2];
+        using var plain = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, format, 2, 4, 4)
+                          ?? throw new Xunit.Sdk.XunitException($"{format} shader unavailable");
+        using var padded = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, format, 2, 4, 4, table)!;
+        padded.PadOddColumns = true;
+        Assert.Equal(table[n], padded.RowsPerWorkgroupFor(n));
+        using var bw = device.Allocate(((long)wq.Length + 3) & ~3L);
+        device.Upload(new ReadOnlySpan<byte>(wq), bw);
+        using var bx = device.Allocate((long)(n + 1) * k * 4);
+        device.Upload(x, bx);
+
+        float[] Run(MatMulQuantGemvMultiKernel kernel, long outFloats)
+        {
+            using var by = device.Allocate(outFloats * 4);
+            device.Upload(Enumerable.Repeat(1234.5f, (int)outFloats).ToArray(), by);
+            using (var ctx = device.CreateSubmitContext()) { ctx.Begin(); kernel.Record(ctx.CommandBuffer, bw, bx, by, m, k, n); ctx.SubmitAndWait(); }
+            float[] o = new float[outFloats];
+            device.Download(by, o);
+            return o;
+        }
+
+        float[] reference = Run(plain, (long)n * m + 4);
+        float[] roomy = Run(padded, (long)(n + 1) * m + 4);
+        float[] tight = Run(padded, (long)n * m + 4);
+        Assert.Equal(reference.AsSpan(0, n * m).ToArray(), roomy.AsSpan(0, n * m).ToArray());
+        Assert.Equal(reference.AsSpan(0, n * m).ToArray(), tight.AsSpan(0, n * m).ToArray());
+        Assert.NotEqual(1234.5f, roomy[n * m]);
+        Assert.All(tight.AsSpan(n * m).ToArray(), v => Assert.Equal(1234.5f, v));
+        Assert.All(roomy.AsSpan((n + 1) * m).ToArray(), v => Assert.Equal(1234.5f, v));
     }
 
     private static MatMulExactGemvMultiKernel Create(VulkanDevice device, string spvDir, ExactGemvFormat format, int decodeRows, int multiRows)

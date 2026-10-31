@@ -188,3 +188,24 @@ python scripts/small-model-tasks.py http://localhost:8080 <model-id from /v1/mod
 `llama-quantize --tensor-type ffn_gate_exps=q2_k --tensor-type ffn_up_exps=q2_k --tensor-type ffn_down_exps=mxfp4 --output-tensor-type q6_k
 --token-embedding-type q8_0 in.gguf out.gguf Q8_0`; the F32-decoded control file is made by dequantising every tensor with gguf-py. These are
 random-weight fixtures (88 MB / 340 MB because of the real 152576-token vocabulary) and are never committed.
+
+## IQ1_S CPU-vs-GPU prefill gap is activation-quantisation noise (#1448, re-opens #276 evidence)
+
+The CPU packed IQ1_S arm reads up to 0.07 nats below the GPUs and the F32-decoded control on a pure-IQ1_S Llama-3.2-1B
+fixture. Measured on Strix (own fixture: 20-chunk imatrix, llama.cpp b9016; CPU-only, 185 scored tokens):
+
+| arm | NLL |
+|---|---|
+| CPU packed (Q8_K activations, maxAbs/127) | 9.9435 |
+| CPU, same dequantised rows dotted in F32 | 9.9664 |
+| CPU F32-decoded GGUF (gguf-py) | 9.9664 |
+| Vulkan packed / Vulkan F32-decoded | 9.9663 / 9.9687 |
+| CPU packed, Q8_K scale maxAbs/D, D = 126 / 125 / 120 / 110 / 100 / 64 | 9.951 / 9.903 / 9.993 / 10.000 / 9.880 / 9.951 |
+
+- The kernel is not wrong: the IQ1_S grid is bit-identical to gguf-py's (2048 entries), the delta / scale / `qs`+`qh`
+  indexing mirror `dequantize_row_iq1_s` / `ggml_vec_dot_iq1_s_q8_K`, and the F32 dot reproduces the control to 0.0002.
+- The gap is the CPU's Q8_K activation rounding (llama.cpp does the same); any *equally valid* Q8_K scale moves the
+  NLL by +-0.06 on this 185-token, PPL~2e4 model, so 127 is simply one draw. Q2_K/IQ2_* agree tighter only because the
+  destroyed-model amplification (see above) is smaller there.
+- Consequence: the gate's IQ1_S prefill bound is 0.12 (still < the 0.24 nats of the real #276 defect). Use the F32-decoded
+  control, not the CPU-vs-GPU delta, to judge an IQ1_S kernel change.

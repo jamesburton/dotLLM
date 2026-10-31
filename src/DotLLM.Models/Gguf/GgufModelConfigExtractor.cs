@@ -21,7 +21,7 @@ public static partial class GgufModelConfigExtractor
         Architecture architecture = ParseArchitecture(archString);
         string arch = archString.ToLowerInvariant();
 
-        if (architecture is Architecture.Bert or Architecture.NomicBert)
+        if (architecture is Architecture.Bert or Architecture.NomicBert or Architecture.NomicBertMoe)
             return BuildBertConfig(metadata, arch, architecture);
 
         // Gemma 4 / DiffusionGemma have a fundamentally different per-layer shape
@@ -116,7 +116,7 @@ public static partial class GgufModelConfigExtractor
         // Gemma 3: window pattern is per-layer (llama.cpp load_swa_pattern(ml, 6)); modelled as an
         // explicit per-layer list so every backend resolves it identically (CPU/Vulkan/CUDA all
         // consult PerLayerSlidingWindow before the scalar pattern).
-        IReadOnlyList<int?>? perLayerSlidingWindow = architecture == Architecture.Gemma3 && slidingWindowSize is not null
+        IReadOnlyList<int?>? perLayerSlidingWindow = architecture is Architecture.Gemma3 or Architecture.GemmaEmbedding && slidingWindowSize is not null
             ? BuildGemma3PerLayerSlidingWindow(metadata, arch, numTrunkLayers, slidingWindowSize.Value)
             : null;
 
@@ -133,7 +133,7 @@ public static partial class GgufModelConfigExtractor
         // GGUF linear scaling (4B+: factor 8). RoPEConfig carries the LOCAL table, GlobalRoPEConfig the
         // global one (selected per layer via IsFullAttentionLayer).
         RoPEConfig? globalRopeConfig = null;
-        if (architecture == Architecture.Gemma3 && ropeConfig is { } gr)
+        if (architecture is Architecture.Gemma3 or Architecture.GemmaEmbedding && ropeConfig is { } gr)
         {
             globalRopeConfig = gr;
             float localTheta = metadata.GetFloat32OrDefault($"{arch}.rope.freq_base_swa", 10000.0f);
@@ -263,10 +263,10 @@ public static partial class GgufModelConfigExtractor
             : null;
 
         bool isGemma2 = architecture == Architecture.Gemma2;
-        bool isGemma3 = architecture == Architecture.Gemma3;
+        bool isGemma3 = architecture is Architecture.Gemma3 or Architecture.GemmaEmbedding;
         // Gemma 3 removed the soft-caps (final_logit_softcapping is only written when non-zero).
         float g3FinalCap = isGemma3 ? metadata.GetFloat32OrDefault($"{arch}.final_logit_softcapping", 0.0f) : 0f;
-        bool isGemmaFamily = architecture is Architecture.Gemma or Architecture.Gemma2 or Architecture.Gemma3;
+        bool isGemmaFamily = architecture is Architecture.Gemma or Architecture.Gemma2 or Architecture.Gemma3 or Architecture.GemmaEmbedding;
 
         return new ModelConfig
         {
@@ -322,6 +322,7 @@ public static partial class GgufModelConfigExtractor
             HadamardFold = GgufHadamardFoldExtractor.TryExtract(metadata),
             ChatTemplate = chatTemplate,
             PoolingType = ExtractPoolingType(metadata, arch),
+            BidirectionalAttention = architecture == Architecture.GemmaEmbedding,
         };
     }
 
@@ -1125,6 +1126,8 @@ public static partial class GgufModelConfigExtractor
             "gemma2" => Architecture.Gemma2,
             // Gemma 3 text tower (llama.cpp LLM_ARCH_GEMMA3): QK-norm, dual RoPE, 5:1 local/global.
             "gemma3" => Architecture.Gemma3,
+            // EmbeddingGemma (llama.cpp LLM_ARCH_GEMMA_EMBEDDING): the Gemma 3 tower, bidirectional, + dense heads (#1399).
+            "gemma-embedding" => Architecture.GemmaEmbedding,
             // IBM Granite (llama.cpp LLM_ARCH_GRANITE / LLM_ARCH_GRANITE_MOE): Llama/Mixtral shape + 4 scalars.
             "granite" => Architecture.Granite,
             "granitemoe" => Architecture.GraniteMoe,
@@ -1138,6 +1141,7 @@ public static partial class GgufModelConfigExtractor
             // BERT-class embedding encoders (#739).
             "bert" => Architecture.Bert,
             "nomic-bert" => Architecture.NomicBert,
+            "nomic-bert-moe" => Architecture.NomicBertMoe,
             // Gemma 4 MTP drafter (issue #959): standalone 4-layer mini-transformer
             // that cross-attends into the trunk's KV-cache.
             "gemma4-assistant" or "gemma4_assistant" => Architecture.Gemma4Assistant,
@@ -1631,7 +1635,7 @@ public static partial class GgufModelConfigExtractor
         // gemma / gemma2 GGUFs carry NEITHER rope key (llama.cpp falls back to its default
         // freq_base 10000 and rotates the full head); returning null here would silently
         // disable RoPE for them.
-        bool gemmaImplicitRope = architecture is Architecture.Gemma or Architecture.Gemma2 or Architecture.Gemma3;
+        bool gemmaImplicitRope = architecture is Architecture.Gemma or Architecture.Gemma2 or Architecture.Gemma3 or Architecture.GemmaEmbedding;
         if (!gemmaImplicitRope && !metadata.ContainsKey(freqBaseKey) && !metadata.ContainsKey(dimCountKey))
             return null;
 
@@ -1666,7 +1670,7 @@ public static partial class GgufModelConfigExtractor
                 or Architecture.Lfm2Moe
                 // llama.cpp llama_model_rope_type: gemma / gemma2 / gemma3 are NEOX, and their
                 // converter does not permute Q/K (HF rotate_half layout).
-                or Architecture.Gemma or Architecture.Gemma2 or Architecture.Gemma3
+                or Architecture.Gemma or Architecture.Gemma2 or Architecture.Gemma3 or Architecture.GemmaEmbedding
                 // llama.cpp llama_model_rope_type: olmo2 / olmoe are NEOX (HF layout, no permute); smollm3 stays NORM.
                 or Architecture.Olmo2 => RoPEType.NeoX,
             _ => RoPEType.Norm,

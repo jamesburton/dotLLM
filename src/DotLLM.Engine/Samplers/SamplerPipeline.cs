@@ -18,6 +18,31 @@ public sealed class SamplerPipeline
     private readonly Random _rng;
     private readonly bool _greedy;
     private readonly bool _fastTopKSampling;
+    private readonly ulong _gumbelSeed;
+    private readonly bool _gumbel;
+    private readonly float _deviceGumbelInvTemperature;   // 0 = the prepared distribution is not a pure temperature scale
+    internal bool UnsafeUniform32ForTests { get; set; }
+
+    /// <summary>The request's Gumbel noise seed (valid when <see cref="UsesGumbel"/>).</summary>
+    internal ulong GumbelSeed => _gumbelSeed;
+
+    /// <summary>
+    /// When a device may draw this pipeline's Gumbel-max sample straight from RAW logits (#1382): the F32 reciprocal <c>1f / temperature</c>
+    /// the temperature step multiplies by (1 for T = 1). Null unless the prepared distribution IS just that scale: Gumbel mode on and stochastic,
+    /// no logit processors (penalties, bias, DRY, thinking budget), no top-k / top-p / min-p / top-n-sigma, built from flat options (no explicit
+    /// steps). Every other shape needs the host (history, constraint state, per-row selection) and keeps the readback path.
+    /// </summary>
+    public float? DeviceGumbelInvTemperature
+        => _deviceGumbelInvTemperature > 0f && !UnsafeUniform32ForTests ? _deviceGumbelInvTemperature : null;
+
+    /// <summary>Env switch that turns position-seeded Gumbel-max sampling on for every stochastic pipeline built from options (#1358).</summary>
+    public const string GumbelEnvVar = "DOTLLM_GUMBEL_SAMPLING";
+
+    /// <summary>
+    /// True when a stochastic draw is <c>argmax(prepared + Gumbel(seed, generation index))</c> (#1358) instead of a draw from the
+    /// pipeline's sequential <see cref="Random"/>. Speculative verification then reproduces the plain-decode text for the same seed.
+    /// </summary>
+    public bool UsesGumbel => _gumbel;
 
     /// <summary>
     /// Creates a composable sampling pipeline from explicit steps.
@@ -63,6 +88,9 @@ public sealed class SamplerPipeline
     public SamplerPipeline(InferenceOptions options, ITokenizer? tokenizer = null)
     {
         _rng = options.Seed.HasValue ? new Random(options.Seed.Value) : new Random();
+        bool wantGumbel = options.GumbelSampling || Environment.GetEnvironmentVariable(GumbelEnvVar) == "1";
+        if (wantGumbel)
+            _gumbelSeed = options.Seed.HasValue ? (ulong)(uint)options.Seed.Value * 0x9E3779B97F4A7C15UL + 0x1234567UL : (ulong)_rng.NextInt64();
 
         // Explicit steps provided — use composable path
         if (options.SamplerSteps is not null)
@@ -82,11 +110,13 @@ public sealed class SamplerPipeline
                 options.MinP,
                 options.Seed,
                 options.TopNSigma);
+            _gumbel = wantGumbel;
             return;
         }
 
         // Auto-build from flat properties
         _greedy = options.Temperature <= 0f;
+        _gumbel = wantGumbel && !_greedy;
         _fastTopKSampling = !_greedy
             && options.TopK > 0
             && options.TopP >= 1.0f
@@ -122,6 +152,10 @@ public sealed class SamplerPipeline
             options.MinP,
             options.Seed,
             options.TopNSigma);
+
+        if (_gumbel && _processors.Length == 0 && _steps.Length <= 1 && !_fastTopKSampling
+            && options.TopK <= 0 && options.TopP >= 1.0f && options.MinP <= 0f && options.TopNSigma < 0f)
+            _deviceGumbelInvTemperature = options.Temperature == 1.0f ? 1f : 1f / options.Temperature;
     }
 
     /// <summary>
@@ -204,7 +238,7 @@ public sealed class SamplerPipeline
 
     /// <summary>
     /// Turns <paramref name="logits"/> in place into the exact logits <see cref="Sample"/> would draw from (processors, then temperature /
-    /// top-k / top-p / min-p / ...), without drawing. Speculative sampling (<see cref="TryAcceptDraft"/>) needs the distribution, not just a draw.
+    /// top-k / top-p / min-p / ...), without drawing. Speculative sampling (<see cref="TryAcceptDraft(ReadOnlySpan{float}, int, out int)"/>) needs the distribution, not just a draw.
     /// A greedy pipeline only applies its processors: the distribution is the argmax of the result.
     /// </summary>
     /// <param name="logits">Logits of one position (modified in place).</param>
@@ -233,6 +267,26 @@ public sealed class SamplerPipeline
     /// <summary>Draws from logits already prepared by <see cref="PrepareDistribution"/> (argmax for a greedy pipeline).</summary>
     public int SamplePrepared(ReadOnlySpan<float> preparedLogits)
         => _greedy ? CategoricalSampler.ArgMax(preparedLogits) : CategoricalSampler.Sample(preparedLogits, _rng);
+
+    /// <summary>
+    /// As <see cref="SamplePrepared(ReadOnlySpan{float})"/>, for the token at generation index <paramref name="tokenIndex"/> (= the number of tokens
+    /// generated before it). With <see cref="UsesGumbel"/> the draw is the position-seeded Gumbel-max, a pure function of (logits, seed, index).
+    /// </summary>
+    public int SamplePrepared(ReadOnlySpan<float> preparedLogits, int tokenIndex)
+        => _gumbel ? GumbelNoise.Sample(preparedLogits, _gumbelSeed, tokenIndex, UnsafeUniform32ForTests) : SamplePrepared(preparedLogits);
+
+    /// <summary>
+    /// <see cref="TryAcceptDraft(ReadOnlySpan{float}, int, out int)"/> for the token at generation index <paramref name="tokenIndex"/>. With
+    /// <see cref="UsesGumbel"/> the row's own Gumbel-max sample is drawn and the draft is accepted iff it equals that sample: P(accept) is
+    /// <c>p(draft)</c>, as in rejection sampling, and the emitted token is always the sample plain decoding would have drawn.
+    /// </summary>
+    public bool TryAcceptDraft(ReadOnlySpan<float> preparedLogits, int draftToken, out int token, int tokenIndex)
+    {
+        if (!_gumbel)
+            return TryAcceptDraft(preparedLogits, draftToken, out token);
+        token = GumbelNoise.Sample(preparedLogits, _gumbelSeed, tokenIndex, UnsafeUniform32ForTests);
+        return token == draftToken;
+    }
 
     /// <summary>
     /// Speculative-sampling accept/reject of ONE deterministic draft token against the prepared distribution <c>p</c> (the draft distribution is a
@@ -299,6 +353,13 @@ public sealed class SamplerPipeline
     /// <returns>The sampled token index.</returns>
     public int Sample(Span<float> logits, IReadOnlyList<int> previousTokens)
     {
+        if (_gumbel)
+        {
+            // Position-seeded Gumbel-max (#1358): the generation index is previousTokens.Count.
+            PrepareDistribution(logits, previousTokens);
+            return GumbelNoise.Sample(logits, _gumbelSeed, previousTokens.Count, UnsafeUniform32ForTests);
+        }
+
         // 1. Run logit processors (repetition penalty)
         for (int i = 0; i < _processors.Length; i++)
             _processors[i].Process(logits, previousTokens, _processorContext);

@@ -67,8 +67,10 @@ public sealed class VulkanQwen4ExpSmallRowTests
             }
             else
             {
-                // 9 rows: no multi-column GEMV (n > 8 -> GEMM) but still below the grouped threshold -> multi-row MMVQ
-                Assert.Equal(0, f32 + f16 + q8);
+                // 9 rows (#1374): the F32 / F16 multi GEMVs still stop at 8 (-> GEMM), the Q8_0 projections take the 9..16-column F32-activation
+                // GEMV (the Q8_1 MMVQ multi stops at 8), and the routed-MoE multi-row MMVQ runs below the grouped threshold
+                Assert.Equal(0, f32 + f16);
+                Assert.True(q8 > 0, "the 9..16-column Q8_0 GEMV never ran at 9 rows");
                 Assert.True(q4 > 0 && q51 > 0, "multi-row MoE MMVQ never ran at 9 rows");
             }
 
@@ -96,7 +98,7 @@ public sealed class VulkanQwen4ExpSmallRowTests
         _out.WriteLine($"rows {rows}: fast vs CPU relL2 {fastRel:E3} KL {fastKl:E3}; old path vs CPU relL2 {slowRel:E3} KL {slowKl:E3}; fast vs old relL2 {armRel:E3} KL {armKl:E3}");
         Assert.True(fastRel < 0.08 && fastKl < 0.02, $"fast path off the oracle: relL2 {fastRel:E3}, KL {fastKl:E3}");
         Assert.True(armRel < 0.05 && armKl < 0.01, $"fast path diverges from the previous multi-row path: relL2 {armRel:E3}, KL {armKl:E3}");
-        if (rows <= 8)
+        if (rows >= 2)
             Assert.True(armRel > 0, "perturbation inert: the fast path produced bit-identical logits to the old kernels");
     }
 }

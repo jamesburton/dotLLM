@@ -65,6 +65,10 @@ uint readHalfBits(uint absByteOff) {
 
 const uint IQ3_S_BLOCK_BYTES = 110u;
 
+uint readEvenHalf(uint absByteOff) {
+    return (weight[absByteOff >> 2u] >> ((absByteOff & 2u) * 8u)) & 0xFFFFu;
+}
+
 struct Stage { uint dq; uint qs4; uint sg2; uint misc; vec4 bv; };   // dq: d bits | ib32<<16; qs4: 4 qs bytes; sg2: 2 sign bytes; misc: qh | scaleByte<<8
 
 void loadStage(uint sb, uint tid, uint blk, uint half_, bool rowValid, uint rowBase, uint xRowBase4, uint localRowBase, uint expertRows, inout Stage st) {
@@ -73,11 +77,12 @@ void loadStage(uint sb, uint tid, uint blk, uint half_, bool rowValid, uint rowB
         uint s = sb * 2u + blk;            // 32-element sub-block index along K
         uint base = rowBase + (s >> 3u) * IQ3_S_BLOCK_BYTES;
         uint ib32 = s & 7u;
-        uint d = readHalfBits(base);
+        uint d = readEvenHalf(base);
         uint qso = base + 2u + ib32 * 8u + half_ * 4u;
-        st.qs4 = readByte(qso) | (readByte(qso + 1u) << 8u) | (readByte(qso + 2u) << 16u) | (readByte(qso + 3u) << 24u);
-        uint sgo = base + 74u + ib32 * 4u + half_ * 2u;
-        st.sg2 = readByte(sgo) | (readByte(sgo + 1u) << 8u);
+        uint qi = qso >> 2u;
+        uint qsh = (qso & 2u) * 8u;                          // 0 or 16
+        st.qs4 = (weight[qi] >> qsh) | ((weight[qi + 1u] << 1u) << (31u - qsh));
+        st.sg2 = readEvenHalf(base + 74u + ib32 * 4u + half_ * 2u);
         st.misc = readByte(base + 66u + ib32) | (readByte(base + 106u + (ib32 >> 1u)) << 8u);
         st.dq = d | (ib32 << 16u);
     }

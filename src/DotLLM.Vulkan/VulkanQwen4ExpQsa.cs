@@ -251,10 +251,12 @@ internal sealed class VulkanQwen4ExpQsa : IQ4AttentionHook, IDisposable
         else
             VulkanQwen3MoeHybridTransformerModel.Q4Copy(cmd, _ik!, ist.Raw[ord], 0, (ulong)((long)first * _dim * 4), (ulong)((long)seqLen * _dim * 4));
         KernelSupport.ComputeTransferFullBarrier(cmd);
+        _core.Q4Stage("ar_ix_proj");
 
         int firstBlock = first / _blockSize, endBlock = (first + seqLen) / _blockSize;
         _k.RecordPool(cmd, ist.Raw[ord], w.KGamma, ist.Pooled[ord], firstBlock, endBlock - firstBlock, _dim, _ropeDim, _blockSize, _eps, _theta,
             rawF16: ist.RawF16);
+        _core.Q4Stage("ar_ix_pool");
         // An F32 cache keeps the exact dense kernels below the budget; an F16 cache can only be read by the gather kernel, which attends every
         // block while a query's block count fits the budget (the scoring below is skipped for those queries).
         if (!sparse && !kvF16)
@@ -274,6 +276,7 @@ internal sealed class VulkanQwen4ExpQsa : IQ4AttentionHook, IDisposable
                 ropeDim: _ropeDim, theta: _theta, variant: RopeF32Kernel.Variant.NeoX);
         }
         KernelSupport.ComputeToComputeBarrier(cmd);
+        _core.Q4Stage("ar_ix_qrope");
 
         for (int q0 = 0; q0 < seqLen; q0 += _qc)
         {
@@ -283,13 +286,16 @@ internal sealed class VulkanQwen4ExpQsa : IQ4AttentionHook, IDisposable
             {
                 _k.RecordScore(cmd, _iq!, ist.Pooled[ord], _scores!, q0, n, first, _heads, _dim, _blockSize, _budgetBlocks, _nbCap, nbMax);
                 KernelSupport.ComputeToComputeBarrier(cmd);
+                _core.Q4Stage("ar_ix_score");
                 _k.RecordSelect(cmd, _scores!, _sel!, q0, n, first, _blockSize, _budgetBlocks, _nbCap);
                 KernelSupport.ComputeToComputeBarrier(cmd);
+                _core.Q4Stage("ar_ix_select");
             }
             int splits = SplitsFor(n);
             _k.RecordAttention(cmd, st.Q, kSrc, vSrc, _sel!, _partOut!, _partMs!, st.AttnOutput, q0, n, first, _attnHeads, _kvHeads,
-                _headDim, _blockSize, _budgetBlocks, splits, kvF16);
+                _headDim, _blockSize, _budgetBlocks, splits, kvF16, _core.Q4StageProfiling ? _core.Q4Stage : null);
             KernelSupport.ComputeToComputeBarrier(cmd);
+            _core.Q4Stage("ar_gather_merge");
         }
         if (sparse) SparseLayerRecordings++;
         return true;

@@ -487,6 +487,33 @@ public sealed class MtpSpeculativeDecoderTests
         /// <summary>Draft steps served through <see cref="ForwardMtpArgMax"/>.</summary>
         public int ArgMaxDraftCalls { get; private set; }
 
+        /// <summary>Reports <see cref="IModel.SupportsDeviceGumbelSampling"/> and serves it by drawing on the host from this model's own rows (#1382 wiring tests).</summary>
+        public bool EmulateDeviceGumbel { get; init; }
+
+        /// <summary>Verify forwards served through <see cref="ForwardGumbelSampled"/>.</summary>
+        public int DeviceGumbelCalls { get; private set; }
+
+        /// <summary>Gumbel arguments of the last <see cref="ForwardGumbelSampled"/> call.</summary>
+        public (ulong Seed, int First, float InvT) LastGumbel { get; private set; }
+
+        public bool SupportsDeviceGumbelSampling => EmulateDeviceGumbel;
+
+        public int DeviceGumbelMaxRows => EmulateDeviceGumbel ? 32 : 0;
+
+        public unsafe void ForwardGumbelSampled(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache,
+            IMtpState? mtpState, bool recurrentRowSnapshots, ulong seed, int firstTokenIndex, float invTemperature, Span<int> sampledIds)
+        {
+            DeviceGumbelCalls++;
+            LastGumbel = (seed, firstTokenIndex, invTemperature);
+            using ITensor logits = Forward(tokenIds, positions, deviceId, kvCache, adapter: null, mtpState);
+            for (int r = 0; r < tokenIds.Length; r++)
+            {
+                var row = new Span<float>((void*)(logits.DataPointer + (long)r * VocabSize * sizeof(float)), VocabSize);
+                System.Numerics.Tensors.TensorPrimitives.Multiply(row, invTemperature, row);
+                sampledIds[r] = DotLLM.Engine.Samplers.GumbelNoise.Sample(row, seed, firstTokenIndex + r);
+            }
+        }
+
         public bool SupportsMtpArgMax => _supportsArgMax;
 
         public unsafe int ForwardMtpArgMax(IMtpState state, int tokenId, int position)

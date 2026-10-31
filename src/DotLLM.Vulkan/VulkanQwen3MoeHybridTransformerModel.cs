@@ -619,6 +619,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             }
             if (_tsCount > 1) CollectStageTimestamps();
             _tsCount = 0;
+            VulkanApi.SkipDispatches = false;
             VulkanApi.vkCmdResetQueryPool(_submit.CommandBuffer, _tsPool, 0, TsMax);
             TsStamp("~begin");
         }
@@ -630,8 +631,24 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         if (MoeStageProfileEnabled) MoeStage(name);
     }
 
+    /// <summary>Perturbation probe (#1362, diagnostic only): "scatter" / "shared" makes the routed-MoE layer skip that dispatch (output is garbage; timing only).</summary>
+    internal static string? PerturbSkip { get; set; }
+
+    /// <summary>Perturbation (#1334): <c>DOTLLM_VK_PERTURB=target=after1|after2</c> suppresses every dispatch recorded between the stage marker named in <c>after</c> and the marker <c>target</c> (timing attribution only; needs stage profiling on).</summary>
+    internal static string? PerturbTarget { get; set; }
+    internal static string[] PerturbAfter { get; set; } = [];
+    static VulkanQwen3MoeHybridTransformerModel()
+    {
+        if (Environment.GetEnvironmentVariable("DOTLLM_VK_PERTURB") is { Length: > 0 } pv && pv.Split('=', 2) is [var t, var af]) { PerturbTarget = t; PerturbAfter = af.Split('|'); }
+    }
+
     private void MoeStage(string name)
     {
+        if (PerturbTarget is not null)
+        {
+            if (name == PerturbTarget) VulkanApi.SkipDispatches = false;
+            else if (Array.IndexOf(PerturbAfter, name) >= 0) VulkanApi.SkipDispatches = true;
+        }
         if (!MoeStageProfileEnabled) return;
         if (StageTimestamps) { TsStamp(name); return; }
         KernelSupport.ComputeToHostBarrier(_submit.CommandBuffer);
@@ -1232,6 +1249,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
             headDim: headDim, ropeDim: _ropeDim, theta: _ropeTheta,
             variant: RopeF32Kernel.Variant.NeoX);
+        TmStage("ar_rope", seqLen);
 
         // 6. Attention.
         VulkanDevice.Buffer kSrc, vSrc;
@@ -1242,6 +1260,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             vkCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, absoluteLayerIdx, Q4AttentionHook?.F16Writer);
             if (vkCache.Storage == VulkanKvStorage.F16) KernelSupport.ComputeToComputeBarrier(cmdBuf);   // the convert kernel is a compute writer
             else KernelSupport.TransferToComputeBarrier(cmdBuf);
+            TmStage("ar_kvwrite", seqLen);
             kSrc = vkCache.GetKeysBuffer(absoluteLayerIdx);
             vSrc = vkCache.GetValuesBuffer(absoluteLayerIdx);
             seqKv = vkCache.CurrentLength;
@@ -1925,6 +1944,19 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     private MoeGroupedMatmulIqCoopmatKernel? GroupedIqKernel(QuantizationType qt) => _kernels.MoeGroupedIq(qt);
 
     /// <summary>
+    /// #1348/#1353: the grouped IQ MoE kernels run 64 tokens per workgroup (<c>n64diet</c>; <c>n32diet</c> selectable) on layers where gate/up and down both have that variant, and the
+    /// 16-token kernels elsewhere. <c>DOTLLM_VK_MOE_IQ_VARIANT=off</c> (or <c>0</c>) restores the 16-token kernels; any other value names a variant suffix.
+    /// Read per layer call so one process can A/B it.
+    /// </summary>
+    private static string? MoeIqVariant()
+        => Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_IQ_VARIANT") switch
+        {
+            null or "" => "n64diet",
+            "off" or "0" => null,
+            var v => v,
+        };
+
+    /// <summary>
     /// True when the layer's three banks all have a grouped coopmat kernel that agree on one tile list (#823 extends #849/#821 to IQ banks).
     /// IQ and legacy-quant kernels are 16-row only, so any layer containing one needs 16-row kernels everywhere; a K-quant down kernel that
     /// came out as the 32-row row-pair form cannot share the list with an IQ gate/up, and such a layer simply stays on MMVQ.
@@ -1973,6 +2005,36 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     internal bool Q8GateUpMmvq { get; set; }
 
     /// <summary>
+    /// Profile-only (#1334/#1349): reads the per-expert group offsets back and accumulates how many tiles each candidate token-tile width
+    /// would need (sum of ceil(rows/T) over experts), the active-expert count and a rows-per-expert histogram, so the token-tile roofline
+    /// uses the real routing distribution. Keys are counts, not milliseconds. Never runs outside <c>MoeStageProfileEnabled</c>.
+    /// </summary>
+    private void ProfileRoutingDistribution(int numE)
+    {
+        Span<float> raw = numE + 1 <= 4096 ? stackalloc float[numE + 1] : new float[numE + 1];
+        _device.Download(_state.MoeGroupOffsets!, raw);
+        void Add(string key, long v) => _moeStageMs[key] = _moeStageMs.GetValueOrDefault(key) + v;
+        foreach (int t in new[] { 16, 32, 48, 64, 128 })
+        {
+            long tiles = 0;
+            for (int e = 0; e < numE; e++)
+            {
+                uint c = BitConverter.SingleToUInt32Bits(raw[e + 1]) - BitConverter.SingleToUInt32Bits(raw[e]);
+                tiles += (c + (uint)t - 1) / (uint)t;
+            }
+            Add($"tilesT{t}(count,not ms)", tiles);
+        }
+        for (int e = 0; e < numE; e++)
+        {
+            uint c = BitConverter.SingleToUInt32Bits(raw[e + 1]) - BitConverter.SingleToUInt32Bits(raw[e]);
+            if (c > 0) Add("activeExperts(count,not ms)", 1);
+            string bin = c == 0 ? "0" : c <= 4 ? "1-4" : c <= 8 ? "5-8" : c <= 16 ? "9-16" : c <= 32 ? "17-32" : c <= 64 ? "33-64" : c <= 128 ? "65-128" : "129+";
+            Add($"expertsWithRows[{bin}](count,not ms)", 1);
+        }
+        Add("tileLists(count,not ms)", 1);
+    }
+
+    /// <summary>
     /// Grouped-by-expert routed FFN (issue #637). Buffer reuse: MoeExpandedInput (broadcast rows) -> packed rows in MoeDownRows ->
     /// gate/up into MoeGateInter/MoeUpInter (packed order) -> SwiGLU -> grouped down into MoeExpandedInput (dead by now) -> ungroup into
     /// MoeDownRows in the original row order, which the weighted scatter then consumes unchanged.
@@ -1984,6 +2046,23 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         var legacyDown = GroupedLegacyDownKernel(moeW.W2QuantType);
         var iqDown = GroupedIqKernel(moeW.W2QuantType);          // #823
         var iqGateUp = GroupedIqKernel(moeW.W1QuantType);        // #823
+        // #1348: 32-token tiles when gate/up AND down both have a wide variant (they share one tile list); otherwise the layer stays at 16.
+        if (iqGateUp is not null && iqDown is not null && MoeIqVariant() is { } iqVar
+            && _kernels.MoeGroupedIqVariant(moeW.W1QuantType, iqVar) is { } varGu && _kernels.MoeGroupedIqVariant(moeW.W2QuantType, iqVar) is { } varDn
+            && varGu.RowTile == varDn.RowTile)
+        {
+            iqGateUp = varGu;
+            iqDown = varDn;
+        }
+        // #1354: a Q8_0 down bank (5 of 48 qwen4exp layers) has its own 32-token kernel, so those layers join the 32-token tile list too.
+        else if (iqGateUp is not null && legacyDown is not null && moeW.W2QuantType == QuantizationType.Q8_0 && MoeIqVariant() is { } iqVarQ8
+            && Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_Q8_DOWN_WIDE") != "0"   // A/B / kill switch for the Q8_0 32-token down kernel only
+            && _kernels.MoeGroupedIqVariant(moeW.W1QuantType, iqVarQ8) is { } varGuQ8 && _kernels.MoeGroupedQ8_0Wide(iqVarQ8) is { } q8Wide
+            && varGuQ8.RowTile == q8Wide.RowTile)
+        {
+            iqGateUp = varGuQ8;
+            legacyDown = q8Wide;
+        }
         var gateUpMmq = (iqGateUp is null && legacyDown is null && iqDown is null) ? GroupedGateUpMmqKernel(moeW.W1QuantType) : null;
         var downMmq = (gateUpMmq is not null) ? GroupedDownMmqKernel(moeW.W2QuantType) : null;
         bool useMmq = gateUpMmq is not null && downMmq is not null
@@ -2124,6 +2203,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 Span<float> raw = stackalloc float[6];
                 _device.Download(_state.MoeGroupDispatchArgs, raw);   // uint triples reinterpreted as float bits
                 _moeStageMs["tiles(count,not ms)"] = _moeStageMs.GetValueOrDefault("tiles(count,not ms)") + BitConverter.SingleToUInt32Bits(raw[1]);
+                ProfileRoutingDistribution(numE);
                 _moeStageLast = System.Diagnostics.Stopwatch.GetTimestamp();
             }
             if (iqGateUp is not null)
@@ -2204,6 +2284,9 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         else
             downKernel!.Record(cmdBuf, moeW.W2Bank, _state.MoeSiluInter, _state.MoeGroupOffsets, _state.MoeExpandedInput,
                 m: hidden, k: interm, rows: expandedRows, numExperts: numE, maxRowsPerExpert: seqLen);
+        } // end else (!useMmq)
+        // Shared by the MMQ and coopmat arms (#1351): the barrier that publishes the down output and the unfused ungroup used to sit INSIDE
+        // the coopmat else-block (a merge-resolution slip, bcfb6804), so the MMQ arm raced the combine and skipped the ungroup.
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("grouped_down");
         if (!fusedGlue)
@@ -2211,7 +2294,6 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             _kernels.MoeUngroupScatter!.Record(cmdBuf, _state.MoeExpandedInput, _state.MoeGroupPerm, _state.MoeDownRows, rows: expandedRows, hidden: hidden);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
             MoeStage("ungroup");
-        }
         }
     }
 
@@ -2436,7 +2518,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         }
 
         // 7. Weighted scatter into NormOutput.
-        if (fusedGlue)
+        if (PerturbSkip == "scatter") { }
+        else if (fusedGlue)
             _kernels.MoeWeightedScatterGrouped!.Record(cmdBuf,
                 _state.MoeExpandedInput, _state.MoeGroupInvPerm, _state.MoeTopkWeights, _state.NormOutput,
                 seqLen: seqLen, topK: topK, hiddenSize: hidden);
@@ -2448,7 +2531,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         MoeStage("weighted_scatter");
 
         // 8. Shared-expert branch (Qwen1.5-MoE sigmoid-gated convention).
-        if (moeW.HasSharedExpert)
+        if (moeW.HasSharedExpert && PerturbSkip != "shared")
         {
             RecordSharedExpert(cmdBuf, moeW, postAttnNormWeight, seqLen, hidden, eps);
             MoeStage("shared_expert");
@@ -2794,6 +2877,15 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     internal static bool SmallRowGemvEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_SMALLROW_GEMV") != "0";
 
     /// <summary>
+    /// <c>DOTLLM_VK_SMALLROW_WIDE=0</c> caps the multi-column GEMVs at 8 rows again (#1374: A/B and diagnostics; 9..16 rows then take the GEMM
+    /// path). Pair it with <c>DOTLLM_VK_PQ2_0_MULTICOL_MAX_N=8</c> for PQ2_0 weights (<see cref="PQ2_0SmallNDispatch"/>).
+    /// </summary>
+    internal static bool SmallRowWideEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_SMALLROW_WIDE") != "0";
+
+    /// <summary>Largest row count the Q4_K / Q6_K_Rows / Q8_0 / BF16 multi-column GEMVs serve here: 16 (#1374), or 8 with <see cref="SmallRowWideEnabled"/> off.</summary>
+    internal static int SmallRowMaxRows => SmallRowWideEnabled ? MatMulQuantGemvMultiKernel.WideMaxColumns : MatMulQuantGemvMultiKernel.MaxColumns;
+
+    /// <summary>
     /// qwen4exp opt-in (#885): single-token decode takes the multi-row routed-MoE MMVQs (Q4_K gate/up NR=2, Q5_1 down NR=4) - 56.7 -> 52.5 ms per 1-row
     /// forward on the real UD-Q4_K_XL file (interleaved same-process A/B). Other MoE models keep the static default (not measured there).
     /// </summary>
@@ -2833,6 +2925,11 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                     _kernels.MatMulQ8MmvqMulti!.Record(cmdBuf, weights, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, output,
                         m: outputDim, k: inputDim, n: seqLen);
                 }   // #876: 2..8 rows read the weights once instead of the 128x128 coopmat GEMM
+                else if (SmallRowGemvEnabled && seqLen <= SmallRowMaxRows && _kernels.MatMulQ8Multi is not null && MatMulQ8_0GemvMultiKernel.AcceptsWide(seqLen, inputDim))
+                {
+                    CountSmallRow(SmallRowPath.Q8Multi);
+                    _kernels.MatMulQ8Multi.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);   // #1374: 9..16 rows, F32 activations (the MMVQ multi stops at 8)
+                }
                 else if (_kernels.MatMulQ8GemmCoopmat is not null)
                     _kernels.MatMulQ8GemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
@@ -2870,8 +2967,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                     q4kRows.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: 1);   // #1220: same kernel as the verify rows
                 else if (seqLen == 1)
                     _kernels.MatMulQ4K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
-                else if (SmallRowGemvEnabled && _kernels.MatMulQ4KMulti is { } multiQ4K && MatMulQuantGemvMultiKernel.Accepts(seqLen, inputDim))
-                { CountSmallRow(SmallRowPath.QuantMulti); multiQ4K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen); }   // #902
+                else if (SmallRowGemvEnabled && seqLen <= SmallRowMaxRows && _kernels.MatMulQ4KMulti is { } multiQ4K && multiQ4K.AcceptsColumns(seqLen, inputDim))
+                { CountSmallRow(SmallRowPath.QuantMulti); multiQ4K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen); }   // #902; 9..16 rows: #1374
                 else if (_kernels.MatMulQ4KGemmCoopmat is not null && (inputDim % 256) == 0)
                     _kernels.MatMulQ4KGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
@@ -2880,7 +2977,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             case QuantizationType.Q5_K:
                 if (seqLen == 1)
                     _kernels.MatMulQ5K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
-                else if (SmallRowGemvEnabled && _kernels.MatMulQ5KMulti is { } multiQ5K && MatMulQuantGemvMultiKernel.Accepts(seqLen, inputDim))
+                else if (SmallRowGemvEnabled && seqLen <= SmallRowMaxRows && _kernels.MatMulQ5KMulti is { } multiQ5K && multiQ5K.AcceptsColumns(seqLen, inputDim))
                 { CountSmallRow(SmallRowPath.QuantMulti); multiQ5K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen); }   // #902
                 else if (_kernels.MatMulQ5KGemmCoopmat is not null && (inputDim % 256) == 0)
                     _kernels.MatMulQ5KGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
@@ -2890,8 +2987,10 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             case QuantizationType.Q6_K:
                 if (seqLen == 1)
                     _kernels.MatMulQ6K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
-                else if (SmallRowGemvEnabled && _kernels.MatMulQ6KMulti is { } multiQ6K && MatMulQuantGemvMultiKernel.Accepts(seqLen, inputDim))
+                else if (SmallRowGemvEnabled && seqLen <= SmallRowMaxRows && (seqLen <= MatMulQuantGemvMultiKernel.MaxColumns || _kernels.MatMulQ6KRows is null) && _kernels.MatMulQ6KMulti is { } multiQ6K && multiQ6K.AcceptsColumns(seqLen, inputDim))
                 { CountSmallRow(SmallRowPath.QuantMulti); multiQ6K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen); }   // #902
+                else if (SmallRowGemvEnabled && seqLen <= SmallRowMaxRows && _kernels.MatMulQ6KRows is { } rowsQ6K && rowsQ6K.AcceptsColumns(seqLen, inputDim))
+                { CountSmallRow(SmallRowPath.QuantMulti); rowsQ6K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen); }   // #1374: 9..16 rows (the deterministic NR-parameterised kernel)
                 else if (_kernels.MatMulQ6KGemmCoopmat is not null && (inputDim % 256) == 0)
                     _kernels.MatMulQ6KGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
@@ -2906,7 +3005,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             case QuantizationType.IQ4_XS:
                 if (seqLen == 1)
                     _kernels.MatMulIq4Xs.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
-                else if (SmallRowGemvEnabled && _kernels.MatMulIq4XsMulti is { } multiIq4Xs && MatMulQuantGemvMultiKernel.Accepts(seqLen, inputDim))
+                else if (SmallRowGemvEnabled && seqLen <= SmallRowMaxRows && _kernels.MatMulIq4XsMulti is { } multiIq4Xs && multiIq4Xs.AcceptsColumns(seqLen, inputDim))
                 { CountSmallRow(SmallRowPath.QuantMulti); multiIq4Xs.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen); }   // #902
                 else if (_kernels.MatMulIq4XsGemmCoopmat is not null && (inputDim % 256) == 0)
                     _kernels.MatMulIq4XsGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
@@ -2940,7 +3039,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             case QuantizationType.IQ3_S:
                 if (seqLen == 1)
                     _kernels.MatMulIq3S.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
-                else if (SmallRowGemvEnabled && _kernels.MatMulIq3SMulti is { } multiIq3S && MatMulQuantGemvMultiKernel.Accepts(seqLen, inputDim))
+                else if (SmallRowGemvEnabled && seqLen <= SmallRowMaxRows && _kernels.MatMulIq3SMulti is { } multiIq3S && multiIq3S.AcceptsColumns(seqLen, inputDim))
                 { CountSmallRow(SmallRowPath.QuantMulti); multiIq3S.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen, codebook: _kernels.MatMulIq3S.GridBuffer); }   // #902
                 else
                     _kernels.MatMulIq3SGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
@@ -2960,7 +3059,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 // which reads the weights once for all of them; the 128x128 GEMM tile costs
                 // 4-6 single-token GEMVs even at n = 2.
                 PQ2_0SmallNDispatch.Record(cmdBuf, _kernels.MatMulPQ2_0, _kernels.MatMulPQ2_0Gemm,
-                    weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                    weights, input, output, m: outputDim, k: inputDim, n: seqLen, hostMaxColumns: PQ2_0SmallNDispatch.UnvalidatedHostMaxColumns);
                 break;
             case QuantizationType.PTQ1_0:
                 // PTQ1_0 (PrismML Bonsai dense-trit ternary, type 143): 128-element group
@@ -2986,7 +3085,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             case QuantizationType.BF16:
                 if (seqLen == 1)
                     _kernels.MatMulBf16.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
-                else if (seqLen <= MatMulBf16GemvMultiF32Kernel.MaxColumns && _kernels.MatMulBf16Multi is { } bf16Multi)
+                else if (seqLen <= (SmallRowWideEnabled ? MatMulBf16GemvMultiF32Kernel.WideMaxColumns : MatMulBf16GemvMultiF32Kernel.MaxColumns) && _kernels.MatMulBf16Multi is { } bf16Multi)
                     bf16Multi.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);   // #706: thin BF16 projections at 2..8 rows
                 else
                     _kernels.MatMulBf16Gemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);

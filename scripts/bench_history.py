@@ -216,10 +216,17 @@ def get_commits(last: int | None, from_hash: str | None, branch: str | None) -> 
 # Existing results cleanup
 # ---------------------------------------------------------------------------
 
+def _result_index_key(path: str) -> tuple[int, int, str]:
+    """Sort numeric run suffixes in order, then any other matching names."""
+    stem = Path(path).stem
+    suffix = stem.rpartition("_")[2]
+    return (0, int(suffix), stem) if suffix.isascii() and suffix.isdigit() else (1, 0, stem)
+
+
 def _find_existing_results(name: str, output_dir: str) -> list[str]:
     """Find existing result files matching the name pattern."""
     pattern = os.path.join(output_dir, f"{name}_*.json")
-    return sorted(glob.glob(pattern))
+    return sorted(glob.glob(pattern), key=_result_index_key)
 
 
 def _prompt_delete_existing(name: str, output_dir: str) -> None:
@@ -429,7 +436,7 @@ except ImportError:
 def _find_result_files(name: str, output_dir: str) -> list[str]:
     """Find result files for a run name, sorted by index."""
     pattern = os.path.join(output_dir, f"{name}_*.json")
-    files = sorted(glob.glob(pattern))
+    files = sorted(glob.glob(pattern), key=_result_index_key)
     return files
 
 

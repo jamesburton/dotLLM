@@ -534,6 +534,11 @@ sized for `min(context_length, 8192)` tokens by default (`DOTLLM_VK_QWEN4EXP_CON
 128 GiB Strix Halo box the OS keeps ~82 GiB resident per process and the UD-Q4_K_XL trunk is ~79 GiB, which is why the token-embedding table is gathered on the
 HOST for qwen4exp (`DOTLLM_VK_QWEN4EXP_HOST_EMBED`, default on): the device-resident F32 copy was 2.4 GiB.
 
+**Defaults (#1324):** `dotllm serve` now selects F16 K/V (unless `DOTLLM_VK_QWEN4EXP_KV` is set) and sizes the capacity at 32768 tokens (`--ctx-size` /
+`DOTLLM_VK_QWEN4EXP_CONTEXT` override, then reduced by a binary search to the largest window the residency plan fits). The evidence for F16 is the table
+below (KL vs F32 0.006, held-out PPL 9.356 vs 9.337, needles 6/6 to 31K, never slower). The model's `Config.MaxSequenceLength` is the capacity, so the server
+clamps `max_tokens` and rejects over-long prompts up front. Library/CLI users who do not go through `serve` keep the F32 / 8192 defaults.
+
 ### Lazy growth and F16 K/V (issue #898, lifts the ~16K ceiling)
 
 * **Lazy growth (default on, `DOTLLM_VK_QWEN4EXP_KV_LAZY=0` restores eager).** A sequence's K/V cache (`VulkanNemotronHKvCache`, `lazy: true`) and indexer state

@@ -170,7 +170,9 @@ public sealed class VulkanQwen4ExpParityTests
         var vkLogits = Q4eRig.Row(rig.Vk.Forward(ids, pos, -1), 0);
 
         bool quant = IsQuantised(variant);
-        double layerTol = quant ? 0.08 : 3e-3;
+        // #1351: kq256-kquant is the only variant whose geometry (Q4_K gate/up/down, interm % 256 == 0) takes the grouped dp4a MMQ prefill arm. A missing barrier after the MMQ
+        // down (merge slip bcfb6804) put its layers at 5.8e-2 / 9.4e-2 - inside the loose 0.08 quantised bound at layer 0 - while the healthy arm sits at <= 1e-2.
+        double layerTol = variant == 4 ? 0.02 : quant ? 0.08 : 3e-3;
         for (int il = 0; il < rig.Config.NumLayers; il++)
         {
             var a = cpuTrace[$"blk.{il}.l_out"]; var b = vkTrace[$"blk.{il}.l_out"];
@@ -180,6 +182,8 @@ public sealed class VulkanQwen4ExpParityTests
             _out.WriteLine($"{name} layer {il}: relL2 = {rel:E3}");
             Assert.True(rel < layerTol, $"{name} layer {il} residual relL2 {rel:E3} >= {layerTol}");
         }
+        if (variant == 4)
+            Assert.True(rig.Vk.MoePathCount(VulkanQwen3MoeHybridTransformerModel.MoePath.GroupedMmqPrefill) > 0, "kq256-kquant never took the grouped MMQ prefill arm - the guard above is inert");
         var (rl2, kl, top1) = Compare(cpuLogits, vkLogits);
         _out.WriteLine($"{name} first-token logits: relL2 = {rl2:E3}, KL = {kl:E3}, top1 agree = {top1}");
         Assert.True(kl < (quant ? 0.02 : 1e-4), $"{name}: KL {kl:E3}");

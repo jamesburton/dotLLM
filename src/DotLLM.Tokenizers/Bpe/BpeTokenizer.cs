@@ -157,10 +157,52 @@ public sealed class BpeTokenizer : ITokenizer
         if (text.Length == 0)
             return [];
 
+        // #1339: markers (ControlTokenGuard) are removed here; text they protected is encoded as plain text.
+        bool marked = ControlTokenGuard.IsMarked(text);
+
         // Fast path: no special tokens to split on
-        return _specialTokens.Length == 0
-            ? _encoding.Encode(text)
-            : EncodeWithSpecialTokens(text);
+        if (_specialTokens.Length == 0)
+        {
+            string plain = marked ? ControlTokenGuard.Strip(text) : text;
+            return plain.Length == 0 ? [] : _encoding.Encode(plain);
+        }
+        return EncodeWithSpecialTokens(text, marked);
+    }
+
+    /// <inheritdoc/>
+    public string MarkUntrustedSpecials(string text, IReadOnlyList<string>? exemptPrefixes = null)
+    {
+        var trie = _specialTokenTrie;
+        if (trie is null || text.Length < 2)
+            return text;
+
+        System.Text.StringBuilder? sb = null;
+        int copied = 0;
+        for (int p = 0; p < text.Length - 1; p++)
+        {
+            if (!trie.TryMatchLongest(text.AsSpan(p), out _, out _, out _))
+                continue;
+            if (exemptPrefixes is { Count: > 0 } && StartsWithAny(text, p, exemptPrefixes))
+                continue;
+            // The marker goes after the match's first character: every special spelling has length > 1, so the
+            // spelling can no longer match, and overlapping spellings (each with its own start) are all broken.
+            sb ??= new System.Text.StringBuilder(text.Length + 8);
+            sb.Append(text, copied, p + 1 - copied).Append(ControlTokenGuard.Marker);
+            copied = p + 1;
+        }
+        if (sb is null)
+            return text;
+        return sb.Append(text, copied, text.Length - copied).ToString();
+    }
+
+    private static bool StartsWithAny(string text, int pos, IReadOnlyList<string> prefixes)
+    {
+        foreach (string prefix in prefixes)
+        {
+            if (prefix.Length > 0 && string.CompareOrdinal(text, pos, prefix, 0, prefix.Length) == 0)
+                return true;
+        }
+        return false;
     }
 
     /// <inheritdoc/>
@@ -176,10 +218,25 @@ public sealed class BpeTokenizer : ITokenizer
             var withBos = new int[ids.Length + 1];
             withBos[0] = BosTokenId;
             ids.CopyTo(withBos, 1);
-            return withBos;
+            ids = withBos;
+        }
+        if (AddEosToken && (ids.Length == 0 || ids[^1] != EosTokenId))
+        {
+            var withEos = new int[ids.Length + 1];
+            ids.CopyTo(withEos, 0);
+            withEos[^1] = EosTokenId;
+            ids = withEos;
         }
         return ids;
     }
+
+    /// <summary>
+    /// When true, <see cref="Encode"/> appends <see cref="EosTokenId"/> unless the encoded text already ends with it.
+    /// Off by default; the GGUF factory switches it on only for embedding towers whose tokenizer template frames the
+    /// text as <c>&lt;bos&gt; … &lt;eos&gt;</c> (EmbeddingGemma, <c>gemma-embedding</c>). Never set for generative models:
+    /// an EOS after the prompt would end the turn.
+    /// </summary>
+    public bool AddEosToken { get; set; }
 
     /// <summary>
     /// When true, <see cref="Encode"/> prepends <see cref="BosTokenId"/> unless the encoded text
@@ -237,7 +294,7 @@ public sealed class BpeTokenizer : ITokenizer
     /// pre-built trie (O(L) per position where L is the match length), emits their IDs
     /// directly, and BPE-encodes the text segments between them.
     /// </summary>
-    private int[] EncodeWithSpecialTokens(string text)
+    private int[] EncodeWithSpecialTokens(string text, bool marked)
     {
         var trie = _specialTokenTrie!; // Encode() fast-paths when _specialTokens.Length == 0
         var result = new List<int>();
@@ -258,6 +315,8 @@ public sealed class BpeTokenizer : ITokenizer
                 // Find the next special token (or end of string)
                 int nextSpecialPos = FindNextSpecialToken(text, pos + 1);
                 string segment = text[pos..nextSpecialPos];
+                if (marked)
+                    segment = ControlTokenGuard.Strip(segment);
 
                 // BPE-encode the segment.
                 // First segment gets normal encoding (with BOS space prepend for SentencePiece).

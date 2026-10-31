@@ -19,6 +19,13 @@ namespace DotLLM.Models;
 public static class ModelLoader
 {
     /// <summary>
+    /// Why <paramref name="config"/>'s architecture cannot be loaded by the dense Llama-style <see cref="TransformerModel"/> (hybrid / recurrent
+    /// architectures with their own model classes), or <see langword="null"/> when it can. For callers that must reject such a model up front
+    /// (e.g. a speculative draft) rather than after an expensive load.
+    /// </summary>
+    public static string? DenseLoaderUnsupportedReason(ModelConfig config) => TransformerWeights.DedicatedLoaderReason(config);
+
+    /// <summary>
     /// Loads a model from a GGUF file path. Opens the file, extracts config,
     /// and creates the appropriate model instance.
     /// </summary>
@@ -66,7 +73,7 @@ public static class ModelLoader
         var effectiveThreading = threading ?? ThreadingConfig.SingleThreaded;
         return config.Architecture switch
         {
-            Architecture.Bert or Architecture.NomicBert => BertEncoderModel.LoadFromGguf(gguf, config, effectiveThreading),
+            Architecture.Bert or Architecture.NomicBert or Architecture.NomicBertMoe => BertEncoderModel.LoadFromGguf(gguf, config, effectiveThreading),
             Architecture.NemotronH => NemotronHTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             // #375 slice 2: nemotron_h_moe shares the NemotronH model class — the MoE
             // FFN layers are detected per-layer by the ffn_gate_inp router tensor.

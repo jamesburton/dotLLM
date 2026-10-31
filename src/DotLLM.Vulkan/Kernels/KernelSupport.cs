@@ -91,7 +91,7 @@ internal static class KernelSupport
     /// into <paramref name="descriptorSet"/>, starting at binding index 0.
     /// </summary>
     internal static unsafe void WriteBufferBindings(
-        VulkanDevice device, nint descriptorSet, ReadOnlySpan<nint> buffers)
+        VulkanDevice device, nint descriptorSet, ReadOnlySpan<nint> buffers, ReadOnlySpan<ulong> offsets = default)
     {
         int n = buffers.Length;
         Span<VkDescriptorBufferInfo> bufferInfos = stackalloc VkDescriptorBufferInfo[n];
@@ -100,8 +100,8 @@ internal static class KernelSupport
             bufferInfos[i] = new VkDescriptorBufferInfo
             {
                 buffer = buffers[i],
-                offset = 0,
-                range = ulong.MaxValue, // VK_WHOLE_SIZE
+                offset = offsets.IsEmpty ? 0UL : offsets[i],   // sub-range start (#1437); must be a multiple of minStorageBufferOffsetAlignment (<= 256)
+                range = ulong.MaxValue, // VK_WHOLE_SIZE (from offset to the end of the buffer)
             };
         }
 

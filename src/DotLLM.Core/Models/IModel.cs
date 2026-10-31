@@ -676,4 +676,63 @@ public interface IModel : IDisposable
     int ForwardMtpArgMax(IMtpState state, int tokenId, int position)
         => throw new NotSupportedException(
             $"{GetType().Name} has no native MTP draft argmax (SupportsMtpArgMax=false); use ForwardMtp.");
+
+    /// <summary>
+    /// True when <see cref="ForwardGumbelSampled"/> is implemented: the model draws the position-seeded Gumbel-max sample
+    /// (<c>argmax(logits * invTemperature + Gumbel(seed, n, i))</c>, see <c>GumbelNoise</c>) of every verify row on the device, reading the
+    /// LM-head logits in place, and returns only the sampled token ids (#1382). Default <see langword="false"/>.
+    /// </summary>
+    bool SupportsDeviceGumbelSampling => false;
+
+    /// <summary>The largest row count one <see cref="ForwardGumbelSampled"/> call covers (0 when unsupported).</summary>
+    int DeviceGumbelMaxRows => 0;
+
+    /// <summary>
+    /// A verify forward (<see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, ILoraAdapter?, IMtpState?)"/>, or
+    /// <see cref="ForwardWithRecurrentSnapshots"/> when <paramref name="recurrentRowSnapshots"/>) whose per-row logits are not returned:
+    /// row <c>r</c>'s sample is written to <paramref name="sampledIds"/>[r] and equals <c>GumbelNoise.Sample(logits_r * invTemperature, seed,
+    /// firstTokenIndex + r)</c> bit for bit. Every side effect of the plain forward (KV, recurrent state, MTP capture, DFlash taps) is identical.
+    /// </summary>
+    /// <param name="tokenIds">Verify tokens, one per row.</param>
+    /// <param name="positions">Their positions.</param>
+    /// <param name="deviceId">As for <c>Forward</c>.</param>
+    /// <param name="kvCache">As for <c>Forward</c>.</param>
+    /// <param name="mtpState">As for <c>Forward</c>.</param>
+    /// <param name="recurrentRowSnapshots">Run as <see cref="ForwardWithRecurrentSnapshots"/> (record per-row recurrent snapshots).</param>
+    /// <param name="seed">The request's Gumbel noise seed.</param>
+    /// <param name="firstTokenIndex">Generation index of row 0's token; row r uses <c>firstTokenIndex + r</c>.</param>
+    /// <param name="invTemperature">The F32 <c>1f / temperature</c> the temperature step multiplies by (1 when T = 1).</param>
+    /// <param name="sampledIds">Receives one token id per row.</param>
+    /// <exception cref="NotSupportedException"><see cref="SupportsDeviceGumbelSampling"/> is false or the rows exceed <see cref="DeviceGumbelMaxRows"/>.</exception>
+    void ForwardGumbelSampled(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache,
+                              IMtpState? mtpState, bool recurrentRowSnapshots, ulong seed, int firstTokenIndex, float invTemperature,
+                              Span<int> sampledIds)
+        => throw new NotSupportedException($"{GetType().Name} has no device Gumbel sampling (SupportsDeviceGumbelSampling=false).");
+
+    /// <summary>
+    /// True when <see cref="ForwardBatchGumbelSampled"/> is implemented: a batched decode (one token per request, per-sequence state as for
+    /// <see cref="ForwardBatch"/>) whose rows are drawn on the device with a per-row seed / token index / temperature, so the continuous-batch
+    /// scheduler reads back one token id per sequence instead of a vocabulary row (#1434). Default <see langword="false"/>.
+    /// </summary>
+    bool SupportsDeviceGumbelBatch => false;
+
+    /// <summary>
+    /// <see cref="ForwardBatch"/> over single-token decode requests that returns sampled ids instead of logits: request <c>i</c>'s id is
+    /// <c>GumbelNoise.Sample(logits_i * draws[i].InvTemperature, draws[i].Seed, draws[i].TokenIndex)</c> bit for bit. All side effects of
+    /// <see cref="ForwardBatch"/> (KV, recurrent state) are identical.
+    /// </summary>
+    /// <param name="requests">One decode request per sequence (exactly one token each).</param>
+    /// <param name="deviceId">As for <see cref="ForwardBatch"/>.</param>
+    /// <param name="draws">One draw description per request.</param>
+    /// <param name="sampledIds">Receives one token id per request.</param>
+    /// <exception cref="NotSupportedException"><see cref="SupportsDeviceGumbelBatch"/> is false.</exception>
+    void ForwardBatchGumbelSampled(IReadOnlyList<SequenceForwardRequest> requests, int deviceId,
+                                   ReadOnlySpan<GumbelDraw> draws, Span<int> sampledIds)
+        => throw new NotSupportedException($"{GetType().Name} has no batched device Gumbel sampling (SupportsDeviceGumbelBatch=false).");
 }
+
+/// <summary>One row's position-seeded Gumbel-max draw parameters (see <c>GumbelNoise</c>): seed, generation index, and the F32 <c>1f / temperature</c>.</summary>
+/// <param name="Seed">The request's Gumbel noise seed.</param>
+/// <param name="TokenIndex">Generation index of the token being drawn.</param>
+/// <param name="InvTemperature">The F32 reciprocal of the temperature the pipeline's temperature step multiplies by (1 for T = 1).</param>
+public readonly record struct GumbelDraw(ulong Seed, int TokenIndex, float InvTemperature);

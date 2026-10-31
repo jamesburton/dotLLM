@@ -282,6 +282,9 @@ internal static partial class VulkanApi
         nint device, nint queryPool, uint firstQuery, uint queryCount,
         nuint dataSize, nint pData, ulong stride, uint flags);
 
+    /// <summary>Perturbation instrument (#1334, timing attribution only - the results are garbage): while true, dispatch wrappers record nothing. Toggled by the stage markers of the qwen4exp forward (<c>DOTLLM_VK_PERTURB</c>).</summary>
+    internal static bool SkipDispatches;
+
     [LibraryImport(LibName, EntryPoint = "vkCmdDispatch")]
     private static partial void vkCmdDispatchNative(
         nint commandBuffer, uint groupCountX, uint groupCountY, uint groupCountZ);
@@ -291,6 +294,7 @@ internal static partial class VulkanApi
         nint commandBuffer, uint groupCountX, uint groupCountY, uint groupCountZ)
     {
         ProfileCounters.Dispatches++;
+        if (SkipDispatches) return;
         vkCmdDispatchNative(commandBuffer, groupCountX, groupCountY, groupCountZ);
     }
 
@@ -301,6 +305,7 @@ internal static partial class VulkanApi
     internal static void vkCmdDispatchIndirect(nint commandBuffer, nint buffer, ulong offset)
     {
         ProfileCounters.Dispatches++;
+        if (SkipDispatches) return;
         vkCmdDispatchIndirectNative(commandBuffer, buffer, offset);
     }
 

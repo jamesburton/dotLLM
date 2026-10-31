@@ -14,6 +14,12 @@ public enum ExactGemvFormat
 
     /// <summary>IQ2_XXS (<c>matmul_iq2_xxs_gemv_multi</c>, needs the grid and ksigns tables; #1244).</summary>
     Iq2Xxs,
+
+    /// <summary>Q5_0 (<c>matmul_q5_0_gemv_multi</c>, #1420).</summary>
+    Q5_0,
+
+    /// <summary>Q4_0 (<c>matmul_q4_0_gemv_multi</c>, #1420).</summary>
+    Q4_0,
 }
 
 /// <summary>
@@ -65,6 +71,13 @@ public sealed class MatMulExactGemvMultiKernel : IDisposable
     /// <summary>The format this instance serves.</summary>
     public ExactGemvFormat Format { get; }
 
+    /// <summary>
+    /// Optional per-column-count NR override (index = n, 0 = use the multi-column default). #1459: the best NR is not monotone in n (Nemotron-H Nano,
+    /// Q5_0/Q8_0: 5 and 7 columns want NR 2, 6 and 8 want 4). Must be set before the first <see cref="Record"/> (pipelines are created lazily).
+    /// A row's bits do not depend on NR.
+    /// </summary>
+    public int[]? RowsByColumns { get; set; }
+
     /// <summary>Loads the format's shader; null when it is missing.</summary>
     /// <param name="device">The device.</param>
     /// <param name="spvDir">Directory holding the compiled SPIR-V.</param>
@@ -83,6 +96,8 @@ public sealed class MatMulExactGemvMultiKernel : IDisposable
             ExactGemvFormat.Q8_0 => ("matmul_q8_0_gemv_multi.spv", 3, 32, 34),
             ExactGemvFormat.Nvfp4 => ("matmul_nvfp4_gemv_multi.spv", 3, QuantFormat.Nvfp4GroupSize, QuantFormat.Nvfp4BlockBytes),
             ExactGemvFormat.Iq2Xxs => ("matmul_iq2_xxs_gemv_multi.spv", 5, QuantFormat.KQuantGroupSize, QuantFormat.IQ2_XXSBlockBytes),
+            ExactGemvFormat.Q5_0 => ("matmul_q5_0_gemv_multi.spv", 3, 32, 22),
+            ExactGemvFormat.Q4_0 => ("matmul_q4_0_gemv_multi.spv", 3, 32, 18),
             _ => throw new ArgumentOutOfRangeException(nameof(format)),
         };
         string path = Path.Combine(spvDir, spv);
@@ -99,12 +114,19 @@ public sealed class MatMulExactGemvMultiKernel : IDisposable
         }
     }
 
+    /// <summary>First column count at which IQ2_XXS uses at least 4 rows per workgroup (#1366).</summary>
+    internal const int Iq2WideColumns = 14;
+
     /// <summary>Output rows per workgroup of an <paramref name="n"/>-column dispatch (a row's bits do not depend on it).</summary>
     /// <param name="n">Column count.</param>
     /// <returns>NR for that pipeline.</returns>
     public int RowsPerWorkgroupFor(int n)
     {
         int nr = n == 1 ? _decodeRows : _multiRows;
+        if (n >= 2 && RowsByColumns is { } table && n < table.Length && table[n] > 0) nr = table[n];   // #1459 per-n tuning
+        // #1366: IQ2_XXS at 14..16 columns with NR = 2 falls off a cliff (moe_dense of a Bolt verify, ms over 88 layers: 19 at 13 columns, 46-58 at
+        // 14..16, slower than the GEMM path at 32 rows); NR = 4 gives 27 / 32. A row's bits do not depend on NR.
+        if (Format == ExactGemvFormat.Iq2Xxs && n >= Iq2WideColumns) nr = Math.Max(nr, 4);
         while (nr > 1 && nr * n > 64) nr >>= 1;   // the shader's output pass needs NR * NC <= 64 lanes
         return nr;
     }
@@ -122,6 +144,17 @@ public sealed class MatMulExactGemvMultiKernel : IDisposable
         => _pipelines[n] ??= _module.CreateComputePipeline(
             entryPoint: "main", bindings: _bindings, pushConstantBytes: PushConstantBytes,
             specConstants: [(uint)n, (uint)RowsPerWorkgroupFor(n)]);
+
+    /// <summary>
+    /// #1459: when true, an column count of 5 or 7 runs the next even column count's pipeline if the input and output buffers have room for
+    /// the extra row (its input row is never read by a result that is kept; its output row lands past the n rows the caller owns). The first n columns are
+    /// bit-identical (a column's bits do not depend on NC). Measured on Nemotron-H Nano: 5 and 7 columns cost 1.5x the 6 and 8 column dispatches.
+    /// </summary>
+    public bool PadOddColumns { get; set; }
+
+    private int RunColumns(int n, int k, int m, VulkanDevice.Buffer input, VulkanDevice.Buffer output, int maxN)
+        => PadOddColumns && (n & 1) == 1 && (n == 5 || n == 7) && n < maxN
+           && input.Size >= (long)(n + 1) * k * sizeof(float) && output.Size >= (long)(n + 1) * m * sizeof(float) ? n + 1 : n;
 
     /// <summary>Records the GEMV over <paramref name="n"/> activation columns (input <c>[n, k]</c>, output <c>[n, m]</c>).</summary>
     /// <param name="cmdBuf">Command buffer in the recording state.</param>
@@ -158,14 +191,15 @@ public sealed class MatMulExactGemvMultiKernel : IDisposable
         }
 
         nint set = _descriptorCache.GetOrCreate(buffers);
-        var pipe = Pipeline(n);
+        int nRun = RunColumns(n, k, m, input, output, MaxColumns);
+        var pipe = Pipeline(nRun);
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, pipe.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(cmdBuf, VkPipelineBindPoint.Compute, pipe.Layout, 0, 1, set, 0, 0);
         uint extra = Format == ExactGemvFormat.Nvfp4 ? BitConverter.SingleToUInt32Bits(scale) : (uint)((rowBytes + 3) / 4);
         Span<uint> pc = stackalloc uint[4] { (uint)m, (uint)k, (uint)blocksPerRow, extra };
         fixed (uint* p = pc)
             VulkanApi.vkCmdPushConstants(cmdBuf, pipe.Layout, VkShaderStageFlags.Compute, 0, PushConstantBytes, (nint)p);
-        int nr = RowsPerWorkgroupFor(n);
+        int nr = RowsPerWorkgroupFor(nRun);
         GemvColumns.Dispatch(cmdBuf, (m + nr - 1) / nr);
         Interlocked.Increment(ref Dispatches);
     }

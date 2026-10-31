@@ -96,8 +96,17 @@ public static class RequestTimingLog
     /// </summary>
     /// <param name="total">Tokens this prefill computes (prefix-cache hits excluded).</param>
     /// <returns>The pulse to <see cref="PrefillPulse.Advance"/> after each completed chunk and dispose at the end; or null.</returns>
-    public static PrefillPulse? BeginPrefill(int total) =>
-        Sink is { } sink && total > 0 ? new PrefillPulse(sink, total, PulseInterval) : null;
+    public static PrefillPulse? BeginPrefill(int total)
+    {
+        if (Sink is not { } sink || total <= 0)
+            return null;
+        var pulse = new PrefillPulse(sink, total, PulseInterval);
+        t_pulseCreated?.Invoke(pulse);
+        return pulse;
+    }
+
+    /// <summary>Test seam: called on the creating thread with each new pulse, so a test can tick it deterministically (with an infinite <see cref="PulseInterval"/>) instead of racing the timer.</summary>
+    [ThreadStatic] internal static Action<PrefillPulse>? t_pulseCreated;
 
     /// <summary>
     /// <see cref="BeginPrefill(int)"/> inside <paramref name="context"/>, so the pulse's timer (which captures the

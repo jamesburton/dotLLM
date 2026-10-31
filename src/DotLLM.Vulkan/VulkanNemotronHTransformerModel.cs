@@ -2276,6 +2276,8 @@ public sealed partial class VulkanNemotronHTransformerModel : IModel
         _exactQ8?.InvalidateDescriptorCache();
         _exactNvfp4?.InvalidateDescriptorCache();
         _exactIq2Xxs?.InvalidateDescriptorCache();
+        _exactQ5_0?.InvalidateDescriptorCache(); _exactQ4_0?.InvalidateDescriptorCache();
+        _exactQ4K?.InvalidateDescriptorCache(); _exactQ6K?.InvalidateDescriptorCache();
         _matmulNvfp4Coopmat?.InvalidateDescriptorCache();
         _flashAttentionCoopmat?.InvalidateDescriptorCache();
         _matmulIq2XxsCoopmat?.InvalidateDescriptorCache();
@@ -2755,6 +2757,7 @@ public sealed partial class VulkanNemotronHTransformerModel : IModel
         _matmulIq4Nl.Dispose();
         _matmulNvfp4?.Dispose();
         _exactQ8?.Dispose();
+        _exactQ5_0?.Dispose(); _exactQ4_0?.Dispose(); _exactQ4K?.Dispose(); _exactQ6K?.Dispose();
         _exactNvfp4?.Dispose();
         _exactIq2Xxs?.Dispose();
         _matmulNvfp4Coopmat?.Dispose();

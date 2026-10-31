@@ -34,6 +34,11 @@ public sealed class ServerState : IDisposable
 {
     private readonly SemaphoreSlim _requestGate = new(1, 1);
 
+    private EmbeddingBatcher? _embeddings;
+
+    /// <summary>Dynamic batcher shared by <c>/v1/embeddings</c> and <c>/api/embed</c> (#1405).</summary>
+    internal EmbeddingBatcher Embeddings => LazyInitializer.EnsureInitialized(ref _embeddings, () => new EmbeddingBatcher(this))!;
+
     /// <summary>Who holds <see cref="_requestGate"/> (<c>req#3 generate</c>), for the lock-wait log line (#1021). Null when free.</summary>
     private volatile string? _gateHolder;
 

@@ -56,7 +56,7 @@ namespace DotLLM.Vulkan;
 /// matching the CUDA return convention.
 /// </para>
 /// </remarks>
-public sealed partial class VulkanTransformerModel : IModel
+public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
 {
     private readonly VulkanDevice _device;
     private readonly VulkanWeights _weights;
@@ -4119,9 +4119,13 @@ public sealed partial class VulkanTransformerModel : IModel
         // All-row logits (#564), opt-in: reuse the diffusion all-position head. Its logits buffer is
         // allocated HERE, before any recording, because growing it invalidates the kernel descriptor
         // caches, which must never happen against an open command buffer.
-        bool allRowHead = seqLen > 1 && seqLen <= _allRowLogitsLimit;
+        bool embedForward = _embedRows != EmbedRows.None;
+        bool allRowHead = !embedForward && seqLen > 1 && seqLen <= _allRowLogitsLimit;
         if (allRowHead)
             EnsureDiffusionLogits(seqLen, vocabSize);
+        // Embedding output (#1406): the host-readback buffer is sized BEFORE recording (growth invalidates the descriptor caches).
+        if (embedForward)
+            EnsureEmbedReadback(_embedRows == EmbedRows.All ? seqLen : (_embedSegLens?.Length ?? 1), hiddenSize);
 
         // Pipeline stage resume (layer-spanning): seed HiddenState from the handed-off hidden rows of a
         // previous stage instead of gathering token embeddings. Synchronous host→device upload into the
@@ -4524,6 +4528,9 @@ public sealed partial class VulkanTransformerModel : IModel
             float attnSoftCap = Config.AttnLogitSoftcap ?? 0.0f;
             ProfSample("kv_update");
             DpStamp(cmdBuf, DpCatKv);
+            if (_embedSegLens is not null)
+                RecordPackedEmbedAttention(cmdBuf, numHeads, numKvHeads, headDim, attnScaleOverride);
+            else
             RecordAttention(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
@@ -4858,6 +4865,11 @@ public sealed partial class VulkanTransformerModel : IModel
                 BarrierComputeToCompute(cmdBuf);
         }
 
+        // 3-embed. Embedding forward (#1406): final RMSNorm of the pooled row(s) only, no LM head, then a read-back of
+        //          just those rows. Same graph as the logits path up to llama.cpp's result_norm.
+        if (embedForward)
+            return FinishEmbeddingForward(cmdBuf, seqLen, hiddenSize, eps, deviceId);
+
         // 3a. PKV prefill: the captured per-layer K/V is all we need — skip the final
         //     norm + LM head entirely (the generator discards the prefill result).
         if (_pkvPhase == DiffusionKvPhase.Prefill)
@@ -4937,6 +4949,218 @@ public sealed partial class VulkanTransformerModel : IModel
         DpEnd();
         return result;
     }
+
+    // ── Embedding output (#1406) ─────────────────────────────────────────────
+
+    /// <summary>Which rows of the post-final-norm hidden state an embedding forward reads back.</summary>
+    private enum EmbedRows { None, All, First, Last }
+
+    private EmbedRows _embedRows;
+    private VulkanDevice.Buffer? _embedReadback;
+    private long _embedReadbackBytes;
+
+    /// <summary>Grows the host-readback buffer for <paramref name="rows"/> x <paramref name="hiddenSize"/> floats. Call outside recording.</summary>
+    private void EnsureEmbedReadback(int rows, int hiddenSize)
+    {
+        long bytes = (long)rows * hiddenSize * sizeof(float);
+        if (_embedReadback is not null && _embedReadbackBytes >= bytes) return;
+        _embedReadback?.Dispose();
+        _embedReadback = _device.AllocateHostReadback(bytes);
+        _embedReadbackBytes = bytes;
+        InvalidateKernelCaches();   // a cached RMSNorm descriptor set may reference the old handle
+    }
+
+    /// <summary>
+    /// Embedding forward tail: final RMSNorm (no LM head) of the rows pooling reads, written straight into a host-readback
+    /// buffer. For last/cls pooling only that one row is copied to the norm scratch, normalised and downloaded
+    /// (hiddenSize floats), never the full sequence.
+    /// </summary>
+    private unsafe ITensor FinishEmbeddingForward(nint cmdBuf, int seqLen, int hiddenSize, float eps, int deviceId)
+    {
+        var segs = _embedSegLens;
+        int rows = _embedRows == EmbedRows.All ? seqLen : (segs?.Length ?? 1);
+        if (_embedRows == EmbedRows.All)
+        {
+            // The last layer's residual add is a compute write the norm reads; the layer loop only barriers BETWEEN layers.
+            BarrierComputeToCompute(cmdBuf);
+            _rmsnorm.Record(cmdBuf, _state.HiddenState, _weights.OutputNormWeight, _embedReadback!,
+                rowCount: seqLen, n: hiddenSize, eps: eps);
+        }
+        else
+        {
+            long rowBytes = (long)hiddenSize * sizeof(float);
+            BarrierComputeToTransfer(cmdBuf);
+            if (segs is null)
+            {
+                long rowOffset = _embedRows == EmbedRows.Last ? (long)(seqLen - 1) * rowBytes : 0;
+                RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.NormOutput,
+                    srcOffset: (ulong)rowOffset, dstOffset: 0, size: (ulong)rowBytes);
+            }
+            else
+            {
+                // Packed forward (#1437): gather each document's pooled row (its last / first token) into NormOutput row s.
+                long start = 0;
+                for (int s = 0; s < segs.Length; s++)
+                {
+                    long row = _embedRows == EmbedRows.Last ? start + segs[s] - 1 : start;
+                    RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.NormOutput,
+                        srcOffset: (ulong)(row * rowBytes), dstOffset: (ulong)((long)s * rowBytes), size: (ulong)rowBytes);
+                    start += segs[s];
+                }
+            }
+            BarrierTransferToCompute(cmdBuf);
+            _rmsnorm.Record(cmdBuf, _state.NormOutput, _weights.OutputNormWeight, _embedReadback!,
+                rowCount: rows, n: hiddenSize, eps: eps);
+        }
+        KernelSupport.ComputeToHostBarrier(cmdBuf);
+        _submit.SubmitAndWait();
+
+        var result = UnmanagedTensor.Allocate(new TensorShape(rows, hiddenSize), DType.Float32, deviceId: -1);
+        _device.Download(_embedReadback!, new Span<float>((void*)result.DataPointer, rows * hiddenSize));
+        return result;
+    }
+
+    /// <summary>Token count of each document of the packed embedding forward in flight (#1437); null for an ordinary forward.</summary>
+    private int[]? _embedSegLens;
+
+    /// <summary>Test-only (#1437): attend across document boundaries in a packed forward, to prove the tests can detect a wrong mask.</summary>
+    internal bool EmbedPackLeakMutant { get; set; }
+
+    /// <summary>
+    /// Packed-embedding attention (#1437): one causal dispatch per document over its slice of Q/K/V/AttnOutput (sub-range descriptors),
+    /// so documents never attend across boundaries. Every other op of the layer is row-independent and runs once over all packed rows.
+    /// </summary>
+    private void RecordPackedEmbedAttention(nint cmdBuf, int numHeads, int numKvHeads, int headDim, float scaleOverride)
+    {
+        var segs = _embedSegLens!;
+        var fa = _flashAttentionCoopmat!;
+        long qRow = (long)numHeads * headDim * sizeof(float), kvRow = (long)numKvHeads * headDim * sizeof(float);
+        if (EmbedPackLeakMutant)
+        {
+            // Test-only mutant: ONE causal dispatch over the whole concatenation, so later documents attend earlier ones.
+            int total = 0;
+            foreach (int l in segs) total += l;
+            fa.RecordSlice(cmdBuf, _state.Q, 0, _state.K, _state.V, 0, _state.AttnOutput, 0, total, numHeads, numKvHeads, headDim, scaleOverride);
+            return;
+        }
+        long start = 0;
+        for (int s = 0; s < segs.Length; s++)
+        {
+            fa.RecordSlice(cmdBuf, _state.Q, start * qRow, _state.K, _state.V, start * kvRow, _state.AttnOutput, start * qRow,
+                segs[s], numHeads, numKvHeads, headDim, scaleOverride);
+            start += segs[s];
+        }
+    }
+
+    /// <summary>
+    /// True when documents can be packed into one embedding forward: the validated plain-causal
+    /// decoder shape (Qwen3), the coopmat flash kernel serving the head dim, no window / soft-cap / sinks / distinct V dim, and row
+    /// strides that are valid sub-range descriptor offsets.
+    /// </summary>
+    private bool CanPackEmbeddings()
+    {
+        if (Environment.GetEnvironmentVariable("DOTLLM_EMBED_PACK") == "0") return false;
+        if (Config.Architecture != DotLLM.Core.Configuration.Architecture.Qwen || _flashAttentionCoopmat is null) return false;
+        if (Config.HeadDim > _flashAttentionCoopmat.SupportedMaxHeadDim || Config.HasDistinctValueHeadDim || Config.AttentionValueScale is not null) return false;
+        if (Config.AttnLogitSoftcap is not null || _gptOss is not null || Config.NumSharedKvLayers > 0) return false;
+        for (int l = 0; l < Config.NumLayers; l++)
+            if (GetLayerSlidingWindow(l) != 0) return false;
+        long kvRow = (long)Config.NumKvHeads * Config.HeadDim * sizeof(float);
+        return kvRow % 256 == 0 && ((long)Config.NumAttentionHeads * Config.HeadDim * sizeof(float)) % 256 == 0;
+    }
+
+    /// <summary>Token budget of one packed forward (#1437). Packing stops adding documents once the next would exceed it.</summary>
+    internal static int EmbedPackTokenBudget =>
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_EMBED_PACK_TOKENS"), out int v) && v > 0 ? v : 1024;
+
+    private ITensor RunPackedEmbedForward(IReadOnlyList<int[]> docs, int from, int count, EmbedRows rows)
+    {
+        int total = 0;
+        for (int i = 0; i < count; i++) total += docs[from + i].Length;
+        var tokens = new int[total]; var positions = new int[total];
+        var segs = new int[count];
+        int off = 0;
+        for (int i = 0; i < count; i++)
+        {
+            var d = docs[from + i];
+            segs[i] = d.Length;
+            for (int t = 0; t < d.Length; t++) { tokens[off + t] = d[t]; positions[off + t] = t; }   // positions restart per document
+            off += d.Length;
+        }
+        if (_headless || _noTokenEmbed || _seedHiddenRows is not null || _pkvPhase != DiffusionKvPhase.None
+            || Config.DiffusionConfig is not null || _diffusionMaskMode != AttentionMaskMode.Causal)
+            throw new NotSupportedException($"{Config.Architecture}: embedding extraction is not available on this Vulkan model variant.");
+        _embedRows = rows; _embedSegLens = segs;
+        try { return Forward(tokens, positions, deviceId: 0, kvCache: null); }
+        finally { _embedRows = EmbedRows.None; _embedSegLens = null; }
+    }
+
+    private ITensor RunEmbedForward(ReadOnlySpan<int> tokenIds, EmbedRows rows)
+    {
+        if (_headless || _noTokenEmbed || _seedHiddenRows is not null || _pkvPhase != DiffusionKvPhase.None
+            || Config.DiffusionConfig is not null || _diffusionMaskMode != AttentionMaskMode.Causal)
+            throw new NotSupportedException(
+                $"{Config.Architecture}: embedding extraction is not available on this Vulkan model variant (pipeline stage / diffusion).");
+        var positions = new int[tokenIds.Length];
+        for (int i = 0; i < positions.Length; i++) positions[i] = i;
+        _embedRows = rows;
+        try { return Forward(tokenIds, positions, deviceId: 0, kvCache: null); }
+        finally { _embedRows = EmbedRows.None; }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Post-final-norm hidden state of every position (llama.cpp's <c>result_norm</c>); the LM head is not run. Mean pooling needs
+    /// every row; last/cls pooling should go through <see cref="ForwardHiddenForPooling"/>, which reads back one row.
+    /// Validated against the CPU path for Qwen3-Embedding only; other architectures share the graph but are unvalidated.
+    /// </remarks>
+    public ITensor ForwardHidden(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
+    {
+        for (int i = 0; i < positions.Length; i++)
+            if (positions[i] != i)
+                throw new NotSupportedException("Vulkan ForwardHidden supports only positions 0..n-1 (cacheless embedding forward).");
+        return RunEmbedForward(tokenIds, EmbedRows.All);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void ForwardHiddenForPooling(IReadOnlyList<int[]> sequences, PoolingType pooling,
+        IEmbeddingModel.HiddenStateConsumer consume, int deviceId)
+    {
+        var rows = pooling switch { PoolingType.Last => EmbedRows.Last, PoolingType.Cls => EmbedRows.First, _ => EmbedRows.All };
+        bool pack = sequences.Count > 1 && CanPackEmbeddings();
+        int budget = EmbedPackTokenBudget;
+        int i = 0;
+        while (i < sequences.Count)
+        {
+            // Pack consecutive documents (>= 2 tokens each; a 1-token document keeps the ordinary path) up to the token budget (#1437).
+            int n = 1, tokens = sequences[i].Length;
+            if (pack && tokens >= 2)
+                while (i + n < sequences.Count && sequences[i + n].Length >= 2 && tokens + sequences[i + n].Length <= budget)
+                    tokens += sequences[i + n++].Length;
+            if (n == 1)
+            {
+                using var hidden = RunEmbedForward(sequences[i], rows);
+                consume(i, new ReadOnlySpan<float>((void*)hidden.DataPointer, (int)(hidden.Shape[0] * hidden.Shape[1])));
+            }
+            else
+            {
+                using var hidden = RunPackedEmbedForward(sequences, i, n, rows);
+                int h = Config.HiddenSize;
+                var all = new ReadOnlySpan<float>((void*)hidden.DataPointer, (int)(hidden.Shape[0] * hidden.Shape[1]));
+                long start = 0;
+                for (int s = 0; s < n; s++)
+                {
+                    int len = sequences[i + s].Length;
+                    consume(i + s, rows == EmbedRows.All ? all.Slice((int)(start * h), len * h) : all.Slice(s * h, h));
+                    start += len;
+                }
+            }
+            i += n;
+        }
+    }
+
+    /// <inheritdoc/>
+    public PoolingType? DeclaredPoolingType => Config.PoolingType;
 
     /// <summary>
     /// DiffusionGemma forward tail: final RMSNorm + LM head over ALL <paramref name="seqLen"/>
@@ -5087,7 +5311,8 @@ public sealed partial class VulkanTransformerModel : IModel
         if (_seedStaging is null || _seedStaging.Size < bytes)
         {
             _seedStaging?.Dispose();
-            _seedStaging = _device.Allocate(bytes); // host-visible, host-coherent
+        _embedReadback?.Dispose();
+    _seedStaging = _device.Allocate(bytes); // host-visible, host-coherent
         }
         _device.Upload(rows[..count], _seedStaging);                 // host → staging (mapped write)
         _device.CopyBufferRangeSynchronous(_seedStaging, _state.HiddenState,
@@ -5206,6 +5431,7 @@ public sealed partial class VulkanTransformerModel : IModel
         _smallRowQ6KR2?.InvalidateDescriptorCache();
         _smallRowF32?.InvalidateDescriptorCache();
         _smallRowQ8?.InvalidateDescriptorCache();
+        _smallRowQ8Wide?.InvalidateDescriptorCache(); _smallRowQ4_0?.InvalidateDescriptorCache(); _smallRowQ5_0?.InvalidateDescriptorCache();
         _smallRowAttn?.InvalidateDescriptorCache();
         _smallRowAttnKvF16?.InvalidateDescriptorCache();
         _splitKvAttentionKvF16?.InvalidateDescriptorCache();
@@ -8939,7 +9165,7 @@ public sealed partial class VulkanTransformerModel : IModel
             // 128x128 GEMM tile; the policy lives in PQ2_0SmallNDispatch and is shared with
             // the two hybrid models.
             PQ2_0SmallNDispatch.Record(cmdBuf, _matmulPQ2_0, _matmulPQ2_0Gemm,
-                weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                weights, input, output, m: outputDim, k: inputDim, n: seqLen, hostMaxColumns: PQ2_0SmallNDispatch.UnvalidatedHostMaxColumns);
         }
         else if (weightQt == QuantType.PTQ1_0)
         {
@@ -9361,6 +9587,7 @@ public sealed partial class VulkanTransformerModel : IModel
         _smallRowQ6KR2?.Dispose();
         _smallRowF32?.Dispose();
         _smallRowQ8?.Dispose();
+        _smallRowQ8Wide?.Dispose(); _smallRowQ4_0?.Dispose(); _smallRowQ5_0?.Dispose();
         _smallRowAttn?.Dispose();
         _smallRowAttnKvF16?.Dispose();
         _splitKvAttentionKvF16?.Dispose();

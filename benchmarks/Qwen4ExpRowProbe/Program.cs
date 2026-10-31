@@ -26,8 +26,10 @@ string[] prompts =
     "def is_palindrome(s: str) -> bool:" + (char)10 + "    cleaned = " + "''" + ".join(c.lower() for c in s if c.isalnum())" + (char)10 + "    return cleaned == cleaned[::-1]" + (char)10 + (char)10 + "# Write unit tests for the function above",
     "The French Revolution began in 1789 and transformed the political landscape of Europe. Key events included the storming of the Bastille, the Declaration of the Rights of Man, the Reign of Terror, and the rise of Napoleon Bonaparte, who eventually crowned himself emperor in 1804. Summarize the main causes.",
 };
+if (args[0] == "moestage") { MoeVerifyStage.Run(args); return; }
 if (args[0] == "tier") { TierRun.Run(args); return; }
 if (args[0] == "kbench") { KBench.Run(args); return; }
+if (args[0] == "grbench") { GrBench.Run(args); return; }
 if (args[0] == "iqbench") { IqKBench.Run(args); return; }
 if (args[0] == "mimobench") { MimoIqBench.Run(args); return; }
 if (args[0] == "q41bench") { Q41Bench.Run(args); return; }
@@ -131,10 +133,13 @@ Log($"loaded in {sw0.Elapsed.TotalSeconds:F0} s");
 int vocab = cfg.VocabSize;
 var tok = GgufTokenizerFactory.Load(file.Metadata);
 
+int[]? pfIds = null;
 bool realText = true;
 int[] longText = null!;
+bool wikiIds = false;
 int[] Ids(int n, int seed)
 {
+    if (wikiIds && pfIds is not null) return pfIds.AsSpan(seed == 11 ? 0 : 5000 + seed * 997, n).ToArray();
     if (realText)
     {
         longText ??= Enumerable.Range(0, 8).SelectMany(_ => prompts.SelectMany(p => tok.Encode(p))).ToArray();
@@ -698,6 +703,86 @@ void Exec(string line, StringBuilder o)
             model.ProbeDraftStepMs(st, 3);
             var t = model.ProbeDraftStepMs(st, reps).OrderBy(x => x).ToArray();
             o.AppendLine($"draft proxy ctx={ctx} reps={reps}: min {t[0]:F2} med {t[t.Length / 2]:F2} mean {t.Average():F2} max {t[^1]:F2} ms");
+            break;
+        }
+        case "ids":   // ids <file.i32> : real-text token ids (mkids) used by pf instead of the repeated probe prompts
+            pfIds = MemoryMarshal.Cast<byte, int>(File.ReadAllBytes(a[1]).AsSpan()).ToArray();
+            o.AppendLine($"ids {pfIds.Length} tokens");
+            break;
+        case "wiki":   // wiki 0|1 : dump/kl/fwd use the real wikitext ids loaded by `ids` instead of the repeated probe prompts
+            wikiIds = a[1] != "0"; o.AppendLine($"wiki {wikiIds}");
+            break;
+        case "qsasplits":   // qsasplits N : cap the gather-attention KV splits (0 = off); a harmless summation-order change, the KL noise-floor control
+        {
+            var qt = typeof(VulkanQwen4ExpTransformerModel).Assembly.GetType("DotLLM.Vulkan.VulkanQwen4ExpQsa")!;
+            qt.GetProperty("SplitsOverride", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic)!.SetValue(null, int.Parse(a[1]));
+            o.AppendLine($"qsasplits {a[1]}");
+            break;
+        }
+        case "qsacm":   // qsacm 0|1 : cooperative-matrix QSA gather attention off/on (#1356 in-process A/B)
+            DotLLM.Vulkan.Kernels.Qwen4ExpQsaKernels.CoopmatGather = a[1] != "0";
+            o.AppendLine($"qsacm {DotLLM.Vulkan.Kernels.Qwen4ExpQsaKernels.CoopmatGather}");
+            break;
+        case "perturb":   // perturb <target> <after1|after2..> | perturb off : suppress dispatches between stage markers (#1334; timing attribution only, outputs are garbage)
+        {
+            var mt = typeof(VulkanQwen4ExpTransformerModel).Assembly.GetType("DotLLM.Vulkan.VulkanQwen3MoeHybridTransformerModel")!;
+            const System.Reflection.BindingFlags bf = System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;
+            bool off = a[1] == "off";
+            mt.GetProperty("PerturbTarget", bf)!.SetValue(null, off ? null : a[1]);
+            mt.GetProperty("PerturbAfter", bf)!.SetValue(null, off ? Array.Empty<string>() : a[2].Split('|'));
+            o.AppendLine(off ? "perturb off" : $"perturb target={a[1]} after={a[2]}");
+            break;
+        }
+        case "pf":
+        {
+            // pf <total> <hist> <reps> [prof=0|1|2] [chunk=MaxRowsPerForward]: #1334 prefill throughput. Per rep: fresh state, untimed prefill of <hist> tokens,
+            // then <total> tokens prefilled in chunks (the engine's chunking), last-row logits only. Reports tok/s per rep + median/range.
+            // prof 1 = split-submit stage times, 2 = GPU-timestamp stage times (those runs are NOT throughput numbers). One untimed warm-up rep precedes the timed ones.
+            int total = int.Parse(a[1]), hist = int.Parse(a[2]), reps = int.Parse(a[3]);
+            int prof = a.Length > 4 ? int.Parse(a[4]) : 0;
+            int chunk = a.Length > 5 ? int.Parse(a[5]) : model.MaxRowsPerForward;
+            if (pfIds is null) throw new Exception("load ids first");
+            int need = hist + total;
+            var tps = new List<double>(); var sums = new Dictionary<string, double>(); double wallProf = 0;
+            for (int r = -1; r < reps; r++)
+            {
+                int off = (Math.Max(r, 0) * 20011) % Math.Max(1, pfIds.Length - need);
+                var ids = pfIds.AsSpan(off, need).ToArray();
+                using var st = model.CreateState();
+                for (int p = 0; p < hist; p += chunk)
+                {
+                    int n = Math.Min(chunk, hist - p);
+                    using var w = model.Forward(ids.AsSpan(p, n), Enumerable.Range(p, n).ToArray(), -1, st);
+                }
+                if (prof > 0 && r >= 0)
+                {
+                    VulkanQwen4ExpTransformerModel.StageProfile = true;
+                    VulkanQwen4ExpTransformerModel.StageTimestamps = prof == 2;
+                    model.TakeStageTimes();
+                }
+                var t0 = Stopwatch.GetTimestamp();
+                for (int p = 0; p < total; p += chunk)
+                {
+                    int n = Math.Min(chunk, total - p);
+                    using var lg = model.Forward(ids.AsSpan(hist + p, n), Enumerable.Range(hist + p, n).ToArray(), -1, st);
+                }
+                double ms = Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+                if (prof > 0 && r >= 0)
+                {
+                    foreach (var kv in model.TakeStageTimes()) sums[kv.Key] = sums.GetValueOrDefault(kv.Key) + kv.Value;
+                    VulkanQwen4ExpTransformerModel.StageProfile = false;
+                    VulkanQwen4ExpTransformerModel.StageTimestamps = false;
+                    wallProf += ms;
+                }
+                if (r >= 0) tps.Add(total * 1000.0 / ms);
+            }
+            var srt = tps.OrderBy(x => x).ToList();
+            o.AppendLine($"pf total={total} hist={hist} chunk={chunk} prof={prof} reps={reps}: tok/s {string.Join(" ", tps.Select(x => x.ToString("F1")))} | median {srt[srt.Count / 2]:F1} min {srt[0]:F1} max {srt[^1]:F1}");
+            if (prof > 0)
+            {
+                o.AppendLine($"   mean wall {wallProf / reps:F0} ms per {total}-token prefill; stage sum {sums.Values.Sum() / reps:F0} ms");
+                foreach (var kv in sums.OrderByDescending(k => k.Value)) o.AppendLine($"   {kv.Key,-22} {kv.Value / reps,9:F1} ms {100 * kv.Value / Math.Max(1e-9, wallProf):F1}%");
+            }
             break;
         }
         case "stage":

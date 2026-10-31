@@ -84,6 +84,21 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
     internal bool UseDraftArgMax { get; set; } =
         Environment.GetEnvironmentVariable(DisableDraftArgMaxEnvVar) != "0";
 
+    /// <summary>Env switch: <c>DOTLLM_DEVICE_GUMBEL=0</c> keeps the verify rows' Gumbel draw on the host (logits read back) even when the model can draw on the device.</summary>
+    internal const string DisableDeviceGumbelEnvVar = "DOTLLM_DEVICE_GUMBEL";
+
+    /// <summary>
+    /// Draw the verify rows' Gumbel-max samples on the device (<see cref="IModel.ForwardGumbelSampled"/>, #1382) instead of reading every
+    /// row's logits back: only when the pipeline's prepared distribution is a pure temperature scale
+    /// (<see cref="SamplerPipeline.DeviceGumbelInvTemperature"/>), there is no decoding constraint, and the model supports it. Defaults to on unless
+    /// <c>DOTLLM_DEVICE_GUMBEL=0</c>; tests and the A/B harness flip it in-process. Needs <c>DOTLLM_GUMBEL_SAMPLING=1</c> to matter at all.
+    /// </summary>
+    internal bool UseDeviceGumbel { get; set; } =
+        Environment.GetEnvironmentVariable(DisableDeviceGumbelEnvVar) != "0";
+
+    /// <summary>Verify forwards whose rows were drawn on the device.</summary>
+    internal int DeviceGumbelRounds { get; private set; }
+
     /// <summary>Draft steps whose token came from <see cref="IModel.ForwardMtpArgMax"/>.</summary>
     internal int DraftArgMaxSteps { get; private set; }
 
@@ -165,7 +180,7 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
 
         int lastToken = generatedIds[^1];
 
-        long roundStart = Stopwatch.GetTimestamp();
+        long roundStart = EngineClock.GetTimestamp();
         long draftTicks = 0;
         long verifyTicks = 0;
 
@@ -188,17 +203,17 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
             {
                 for (int i = 0; i < k; i++)
                 {
-                    long fwdStart = Stopwatch.GetTimestamp();
+                    long fwdStart = EngineClock.GetTimestamp();
                     if (draftArgMax)
                     {
                         draftToken = targetModel.ForwardMtpArgMax(mtpState, draftToken, position + i);
-                        draftTicks += Stopwatch.GetTimestamp() - fwdStart;
+                        draftTicks += EngineClock.GetTimestamp() - fwdStart;
                         DraftArgMaxSteps++;
                     }
                     else
                     {
                         using ITensor draftLogits = targetModel.ForwardMtp(mtpState, draftToken, position + i);
-                        draftTicks += Stopwatch.GetTimestamp() - fwdStart;
+                        draftTicks += EngineClock.GetTimestamp() - fwdStart;
 
                         unsafe
                         {
@@ -252,13 +267,29 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
                 verifyPositions[i + 1] = position + i + 1;
             }
 
-            long verifyStart = Stopwatch.GetTimestamp();
-            using ITensor targetLogits = rowSnapshots
-                ? targetModel.ForwardWithRecurrentSnapshots(
-                    verifyTokens, verifyPositions, deviceId: -1, kvCacheTarget, mtpState)
-                : targetModel.Forward(
-                    verifyTokens, verifyPositions, deviceId: -1, kvCacheTarget, adapter: null, mtpState);
-            verifyTicks += Stopwatch.GetTimestamp() - verifyStart;
+            // #1382: a Gumbel pipeline whose prepared distribution is just the temperature scale lets the device draw every row's sample
+            // from the LM-head logits in place; only the ids come back. Row r's token index is generatedIds.Count + r (each emitted token joins
+            // the history before the next row, and a row is only reached when the drafts before it held).
+            Span<int> deviceSamples = stackalloc int[verifyLen <= 32 ? verifyLen : 0];
+            bool deviceGumbel = UseDeviceGumbel && constraint is null && verifyLen <= 32
+                && pipeline.DeviceGumbelInvTemperature is not null
+                && targetModel.SupportsDeviceGumbelSampling && verifyLen <= targetModel.DeviceGumbelMaxRows;
+
+            long verifyStart = EngineClock.GetTimestamp();
+            using ITensor? targetLogits = deviceGumbel
+                ? null
+                : rowSnapshots
+                    ? targetModel.ForwardWithRecurrentSnapshots(
+                        verifyTokens, verifyPositions, deviceId: -1, kvCacheTarget, mtpState)
+                    : targetModel.Forward(
+                        verifyTokens, verifyPositions, deviceId: -1, kvCacheTarget, adapter: null, mtpState);
+            if (deviceGumbel)
+            {
+                targetModel.ForwardGumbelSampled(verifyTokens, verifyPositions, deviceId: -1, kvCacheTarget, mtpState, rowSnapshots,
+                    pipeline.GumbelSeed, generatedIds.Count, pipeline.DeviceGumbelInvTemperature!.Value, deviceSamples);
+                DeviceGumbelRounds++;
+            }
+            verifyTicks += EngineClock.GetTimestamp() - verifyStart;
 
             int accepted = 0;       // drafts accepted
             int acceptedCount = 0;  // tokens written to outputBuffer (accepted drafts + correction/bonus)
@@ -268,18 +299,29 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
             bool stochastic = pipeline.IsStochastic;
             unsafe
             {
-                nint basePtr = targetLogits.DataPointer;
+                nint basePtr = targetLogits?.DataPointer ?? 0;
                 try
                 {
                     for (int row = 0; row <= k; row++)
                     {
+                        int emitted;
+                        bool draftHeld;
+                        if (deviceGumbel)
+                        {
+                            emitted = deviceSamples[row];
+                            draftHeld = row < k && draftTokens[row] == emitted;
+                            outputBuffer[acceptedCount++] = emitted;
+                            generatedIds.Add(emitted);
+                            if (!draftHeld) break;
+                            accepted++;
+                            continue;
+                        }
+
                         var rowLogits = new Span<float>(
                             (void*)(basePtr + (long)row * vocabSize * sizeof(float)), vocabSize);
                         if (constraint != null)
                             TokenMaskApplier.Apply(rowLogits, constraint.GetAllowedTokens());
 
-                        int emitted;
-                        bool draftHeld;
                         if (!stochastic && !pipeline.HasProcessors)
                         {
                             // Plain greedy: the target's own argmax (the path every earlier version took, bit for bit).
@@ -291,12 +333,12 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
                             pipeline.PrepareDistribution(rowLogits, generatedIds);
                             if (row == k)
                             {
-                                emitted = pipeline.SamplePrepared(rowLogits);   // every draft held: the bonus token
+                                emitted = pipeline.SamplePrepared(rowLogits, generatedIds.Count);   // every draft held: the bonus token
                                 draftHeld = false;
                             }
                             else
                             {
-                                draftHeld = pipeline.TryAcceptDraft(rowLogits, draftTokens[row], out emitted);
+                                draftHeld = pipeline.TryAcceptDraft(rowLogits, draftTokens[row], out emitted, generatedIds.Count);
                             }
                         }
 
@@ -345,7 +387,7 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
                     deviceId: -1, kvCacheTarget, adapter: null, mtpState: null);
             }
 
-            long roundTicks = Stopwatch.GetTimestamp() - roundStart;
+            long roundTicks = EngineClock.GetTimestamp() - roundStart;
             if (MtpAdaptiveGate.TraceEnabled)
                 TraceRound(draftTicks, verifyTicks, roundTicks, acceptedCount);
             return new SpeculativeResult(acceptedCount, draftTicks, verifyTicks, k, roundTicks);

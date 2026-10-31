@@ -873,6 +873,22 @@ The F32 arm is the same build with `--cache-type-k/-v f32`:
 - The F16 arm ran a paired-load variant of the grouped pass that is ~12 % faster per layer but wrong on Intel and was
   withdrawn (#1113). With the shipped pass expect ~7.4 tok/s at 128k.
 
+### qwen4exp (Qwen3.8-Flash-Next) on Vulkan: the window is the K/V capacity (#1324)
+
+The model sizes its K/V + indexer caches at load, so the window it serves (`/props` `n_ctx`, the `max_tokens` clamp, the
+`context_length_exceeded` check) is that capacity, not the checkpoint's 262,144. Before #1324 the server advertised the checkpoint
+window while the caches held 8192 tokens, so a long reply threw an unhandled `NotSupportedException` mid-stream.
+
+* `serve` stores K/V as **F16** (24 KiB/token; 31.5 KiB with the indexer keys) unless `DOTLLM_VK_QWEN4EXP_KV` is set; the default
+  window is **32768** (8192 with F32 K/V). `--ctx-size N` (or `DOTLLM_VK_QWEN4EXP_CONTEXT`, which wins) requests another window,
+  capped at the checkpoint's and reduced to the largest that the device residency plan fits (the load log says so).
+* Growth is lazy: the capacity is only *reserved* in the plan; a sequence allocates what it uses.
+* A prompt past the window is a 400 `context_length_exceeded`; `max_tokens` is clamped to what remains (`finish_reason: length`).
+  The model's own backstop is a `DeviceMemoryAdmissionException` (400 / in-stream error event), and any other fault after the stream
+  has started is reported as an in-stream `error` event followed by `[DONE]`, never an unhandled exception.
+* Load log: `qwen4exp context capacity: N tokens (... KiB per token = X GiB reserved at the full window)` and
+  `Context window: N tokens ...; K/V + indexer Y KiB/token`.
+
 ### Past 262,144 tokens: YaRN for Bonsai-2 / Qwen3.8 (#1101)
 
 Bonsai-2 and Qwen3.8 train to 262,144 tokens and reach about 1M with opt-in YaRN (factor 4). Turn it on at load:
@@ -1350,6 +1366,12 @@ Default policy is permissive (`AllowAnyOrigin`) for local Chat UI development. F
 - `POST /v1/config` — changes sampling parameters
 
 These are designed for the local Chat UI workflow and must not be internet-exposed.
+
+### Prompt injection of control tokens (#1339)
+
+Chat endpoints (`/v1/chat/completions`, `/v1/messages`, `/api/chat`, `/api/generate` without `raw`) tokenize message and tool
+text as plain text: a message containing `<|im_end|>` cannot end a turn. Raw completion endpoints are unchanged. See
+[TOKENIZERS.md](TOKENIZERS.md#trust-model-chat-content-never-tokenizes-into-control-tokens-1339).
 
 ## Concurrency
 

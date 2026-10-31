@@ -38,8 +38,15 @@ public sealed class MoeGroupedMatmulLegacyQuantCoopmatKernel : IDisposable
     private readonly MoeGroupedLegacyQuant _quant;
     private bool _disposed;
 
-    private MoeGroupedMatmulLegacyQuantCoopmatKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, MoeGroupedLegacyQuant quant)
+    /// <summary>Shader variant suffix (<c>n32diet</c>: 32-token tile + shared epilogue staging, Q8_0 only, issue #1354), or null for the 16-token production kernel.</summary>
+    public string? Variant { get; }
+
+    /// <summary>The wide-tile variant suffixes this kernel class can load (Q8_0 only): 32 and 64 tokens per workgroup (issues #1354, #1353).</summary>
+    public static readonly string[] WideVariants = { "n32diet", "n64diet" };
+
+    private MoeGroupedMatmulLegacyQuantCoopmatKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, MoeGroupedLegacyQuant quant, string? variant)
     {
+        Variant = variant;
         _device = device;
         _module = module;
         _pipeline = pipeline;
@@ -48,13 +55,18 @@ public sealed class MoeGroupedMatmulLegacyQuantCoopmatKernel : IDisposable
         _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 5);
     }
 
-    private static string SpvName(MoeGroupedLegacyQuant q) => q switch
+    private static string SpvName(MoeGroupedLegacyQuant q, string? variant = null) => variant is not null ? VariantSpvName(q, variant) : q switch
     {
         MoeGroupedLegacyQuant.Q5_1 => "moe_grouped_matmul_q5_1_coopmat_m64.spv",
         MoeGroupedLegacyQuant.Mxfp4 => "moe_grouped_matmul_mxfp4_coopmat_m64.spv",
         MoeGroupedLegacyQuant.Q5_0 => "moe_grouped_matmul_q5_0_coopmat_m64.spv",
         _ => "moe_grouped_matmul_q8_0_coopmat_m64.spv",
     };
+
+    private static string VariantSpvName(MoeGroupedLegacyQuant q, string variant)
+        => q == MoeGroupedLegacyQuant.Q8_0 && Array.IndexOf(WideVariants, variant) >= 0
+            ? $"moe_grouped_matmul_q8_0_coopmat_m64{variant}.spv"
+            : throw new ArgumentOutOfRangeException(nameof(variant), $"no '{variant}' variant for {q}");
 
     private static int BlockBytesOf(MoeGroupedLegacyQuant q) => q switch
     {
@@ -68,12 +80,17 @@ public sealed class MoeGroupedMatmulLegacyQuantCoopmatKernel : IDisposable
     public static bool IsSupportedOn(VulkanDevice device, string spvDir, MoeGroupedLegacyQuant quant)
         => device.HasCooperativeMatrix && device.SubgroupSize == 64 && File.Exists(Path.Combine(spvDir, SpvName(quant)));
 
+    /// <summary>Whether the 32-token <paramref name="variant"/> of <paramref name="quant"/> (issue #1354) can run on <paramref name="device"/>.</summary>
+    public static bool IsVariantSupportedOn(VulkanDevice device, string spvDir, MoeGroupedLegacyQuant quant, string variant)
+        => quant == MoeGroupedLegacyQuant.Q8_0 && Array.IndexOf(WideVariants, variant) >= 0 && device.HasCooperativeMatrix && device.SubgroupSize == 64
+           && File.Exists(Path.Combine(spvDir, SpvName(quant, variant)));
+
     /// <summary>Creates the kernel for <paramref name="quant"/>.</summary>
-    public static MoeGroupedMatmulLegacyQuantCoopmatKernel Create(VulkanDevice device, string spvDir, MoeGroupedLegacyQuant quant)
+    public static MoeGroupedMatmulLegacyQuantCoopmatKernel Create(VulkanDevice device, string spvDir, MoeGroupedLegacyQuant quant, string? variant = null)
     {
-        if (!IsSupportedOn(device, spvDir, quant))
+        if (variant is not null ? !IsVariantSupportedOn(device, spvDir, quant, variant) : !IsSupportedOn(device, spvDir, quant))
             throw new InvalidOperationException("MoeGroupedMatmulLegacyQuantCoopmatKernel requires VK_KHR_cooperative_matrix, wave64 and the SPIR-V.");
-        var module = VulkanModule.LoadFromFile(device, Path.Combine(spvDir, SpvName(quant)));
+        var module = VulkanModule.LoadFromFile(device, Path.Combine(spvDir, SpvName(quant, variant)));
         ComputePipeline pipeline;
         try
         {
@@ -87,13 +104,13 @@ public sealed class MoeGroupedMatmulLegacyQuantCoopmatKernel : IDisposable
             throw;
         }
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 5);
-        return new MoeGroupedMatmulLegacyQuantCoopmatKernel(device, module, pipeline, pool, quant);
+        return new MoeGroupedMatmulLegacyQuantCoopmatKernel(device, module, pipeline, pool, quant, variant);
     }
 
     internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
 
-    /// <summary>Token rows per workgroup (always 16: there is no row-pair variant).</summary>
-    public int RowTile => TileN;
+    /// <summary>Token rows per workgroup: 16, or 32 for the wide variant (issues #1354, #1353).</summary>
+    public int RowTile => Variant is null ? TileN : int.Parse(Variant.AsSpan(1, 2));
 
     /// <summary>Weight-row tiles per workgroup column (the x extent of the grid): <c>ceil(m / 64)</c>.</summary>
     public int MTiles(int m) => (m + TileM - 1) / TileM;
@@ -128,7 +145,7 @@ public sealed class MoeGroupedMatmulLegacyQuantCoopmatKernel : IDisposable
         if (offsets.Size < (long)(numExperts + 1) * sizeof(uint)) throw new ArgumentException("offsets buffer too small.", nameof(offsets));
         Bind(cmdBuf, bank, packedInput, offsets, output, scale, applyScale, applyBias, m, k, rows, numExperts, rowBytes, tileList: 0);
         int rowTiles = maxRowsPerExpert > 0 ? Math.Min(maxRowsPerExpert, rows) : rows;
-        VulkanApi.vkCmdDispatch(cmdBuf, (uint)MTiles(m), (uint)((rowTiles + TileN - 1) / TileN), (uint)numExperts);
+        VulkanApi.vkCmdDispatch(cmdBuf, (uint)MTiles(m), (uint)((rowTiles + RowTile - 1) / RowTile), (uint)numExperts);
     }
 
     /// <summary>

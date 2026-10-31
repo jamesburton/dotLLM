@@ -328,7 +328,7 @@ public sealed class DiffusionTextGenerator
                     int rows = GatherMaskedRows(canvas, maskTokenId, logitsRowOffset, vocabSize, logits,
                         maskedPositions, maskedLogits);
 
-                    var ctx = scheduler.CreateStepContext(step, rows, _logitSoftCap);
+                    var ctx = scheduler.CreateStepContext(step, rows, _logitSoftCap, tokenIndexBase: prefixLen);
                     decision = _sampler.SelectAndSample(
                         maskedLogits.AsSpan(0, rows * vocabSize),
                         maskedPositions.AsSpan(0, rows),

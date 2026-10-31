@@ -94,6 +94,31 @@ returns `[CLS] ... [SEP]`; literal `[CLS]`/`[SEP]`/`[MASK]`/... in the text map 
   sentences (incl. accents and CJK) and is id-identical to HF, so there is no known deviation from
   llama.cpp either.
 
+### SentencePiece Unigram (XLM-R, T5; `tokenizer.ggml.model = "t5"`)
+
+`DotLLM.Tokenizers.Unigram.UnigramTokenizer` (issue #1401) is a port of llama.cpp's `llm_tokenizer_ugm`, which follows
+SentencePiece's optimized Viterbi. It exists for BERT-family GGUFs with an XLM-R vocabulary (multilingual-e5, bge-m3):
+`BertEncoderModel` is unchanged, only the vocabulary differs from WordPiece.
+
+- **Pipeline**: literal control tokens in the text (`<s>`, `</s>`, `<pad>`, `<unk>`) become their ids; each segment goes through the
+  `precompiled_charsmap` (`PrecompiledCharsMap`: a darts-clone double array walked exactly like llama.cpp's XCDA reader, longest rule
+  wins, unmatched characters pass through; **not** `string.Normalize(FormKC)`, the table is frozen at SentencePiece training time),
+  whitespace collapse/trim (`remove_extra_whitespaces`), every space run becomes one `▁` before the next word (`add_space_prefix`),
+  then Viterbi over the UTF-8 bytes maximising the summed piece scores.
+- **Unknown characters** cost `min(NORMAL scores) - 10`; consecutive unknown characters fuse into one `<unk>`. Only NORMAL and
+  USER_DEFINED pieces are matchable (UNUSED `[PADn]` fillers and control pieces are not) and only NORMAL scores set the unknown cost.
+- **GGUF keys**: `tokens`, `scores` (required), `token_type`, `precompiled_charsmap` (uint8/int8/int32 array), `add_space_prefix`,
+  `remove_extra_whitespaces`, `unknown/bos/eos/seperator/padding_token_id`, `add_bos_token`/`add_eos_token`. `Encode` returns
+  `<s> ... </s>` (the encoder's CLS/SEP). `GgufTokenizerFactory.Load` dispatches `t5` here; `GgufBpeTokenizerFactory` throws for it.
+- **Validated** against HF `AutoTokenizer` (`intfloat/multilingual-e5-small`) and llama.cpp b9016 `/tokenize`: 63 curated multilingual
+  texts (Latin/diacritics, Cyrillic, Arabic, Devanagari, Thai, CJK, Japanese, Korean, emoji, full-width/ligature/circled NFKC cases,
+  whitespace edge cases) identical to both; 3000 random vocab/odd-codepoint texts identical to llama.cpp, and identical to HF except 23.
+  Those 23 are an HF quirk, not a dotLLM bug: HF's Rust charsmap normalizer maps per grapheme cluster and, when the cluster's first
+  character has a rule, drops the rest of the cluster (`ﬁ` + U+0301 gives `fi` in HF, `fi` + U+0301 in SentencePiece and llama.cpp).
+  `XlmRUnigramParityTests` pins both sides (fixture `hf-xlmr-multilingual-e5-small.json`).
+- Not covered: `<mask>` lstrip (HF eats the space before `<mask>`; the community GGUF has no `<mask>` piece anyway), Unigram byte
+  fallback (XLM-R has none), `treat_whitespace_as_suffix`.
+
 ### HuggingFace tokenizer.json
 
 JSON format containing: model type, vocabulary, merges, pre-tokenizer config, normalizer, post-processor, added tokens. Full specification of the tokenization pipeline.
@@ -308,6 +333,29 @@ open channel) or `Harmony` (gpt-oss). `ReasoningSplitter` takes the tag pair as 
 ### Fallback
 
 If no template found in model metadata, use configurable default (ChatML). Log a warning.
+
+### Trust model: chat content never tokenizes into control tokens (#1339)
+
+The template renders template literals and caller text (message `content`, tool results, tool-call names/arguments,
+tool definitions, `chat_template_kwargs`, reasoning content) into one string, and `BpeTokenizer` recognises special-token
+spellings anywhere in a string. Without a guard, a user message or tool result (web page, file, another agent's output)
+containing `<|im_end|>`, `</think>`, `<tool_response>`, ... becomes a real control token and can close a turn, open a new
+one or forge a tool frame.
+
+`JinjaChatTemplate` (built through `GgufChatTemplateFactory` with the model tokenizer) passes every caller string through
+`ITokenizer.MarkUntrustedSpecials`, which inserts the noncharacter `U+FDD0` (`ControlTokenGuard.Marker`) after the first
+character of each special spelling. The marker is carried in-band through rendering (so every `Encode(prompt)` call site is
+covered with no plumbing), and `BpeTokenizer.Encode/EncodeRaw` strip it and encode the surrounding text as plain text.
+Spellings written by the template itself are never marked, so turn markers, BOS and tool markers still tokenize to control
+ids and ordinary conversations tokenize byte-identically to before.
+
+- Raw entry points keep scan-everything semantics: `/v1/completions`, `/tokenize`, `/api/generate` with `raw: true`, CLI `run`
+  without a chat template. The caller writes those prompts. (A literal `U+FDD0` is dropped from every prompt.)
+- Replayed **assistant** content keeps the model's reasoning tags live (`<think>` / `</think>`, Gemma-4 channel tags) because
+  templates parse them out of history (Qwen3: `content.split('</think>')`); every other spelling in assistant content is guarded.
+- Encoder-only tokenizers (WordPiece, Unigram) are not on a chat path and are unchanged.
+- Known limit: a spelling assembled across a content/template boundary (content ends `<|im_`, template literal starts `end|>`)
+  is not detected; shipped templates emit whole spellings.
 
 ## Tool Calling Protocol
 

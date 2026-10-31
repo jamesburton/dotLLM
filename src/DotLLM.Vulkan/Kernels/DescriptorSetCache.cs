@@ -167,6 +167,47 @@ internal sealed class DescriptorSetCache
         return set;
     }
 
+    // Sub-range descriptor sets (#1437): the same buffer handles bound at different byte offsets (one set per packed-embedding segment).
+    // Kept apart from the whole-buffer slots so the existing key arrays and their scans are untouched.
+    private readonly record struct RangedKey(nint B0, nint B1, nint B2, nint B3, ulong O0, ulong O1, ulong O2, ulong O3);
+    private readonly Dictionary<RangedKey, nint> _ranged = new();
+    private readonly List<nint> _rangedFree = new();
+
+    /// <summary>Hard cap on live sub-range sets (they share the pool with the whole-buffer sets).</summary>
+    internal const int MaxRangedSets = 256;
+
+    /// <summary>
+    /// Like <see cref="GetOrCreate"/>, but binds buffer <c>i</c> from byte offset <paramref name="offsets"/>[i] to its end (a sub-range
+    /// descriptor). At most four buffers. Offsets must be multiples of 256 (the Vulkan ceiling for minStorageBufferOffsetAlignment).
+    /// The hazard tracker still sees the whole buffers, which is conservative.
+    /// </summary>
+    public nint GetOrCreateWithOffsets(ReadOnlySpan<nint> buffers, ReadOnlySpan<ulong> offsets)
+    {
+        if (buffers.Length != _buffersPerSet || buffers.Length > 4 || offsets.Length != buffers.Length)
+            throw new ArgumentException($"Expected {_buffersPerSet} (<= 4) buffers and as many offsets.", nameof(buffers));
+        for (int i = 0; i < offsets.Length; i++)
+            if ((offsets[i] & 255UL) != 0) throw new ArgumentException("Descriptor offsets must be multiples of 256.", nameof(offsets));
+
+        _device.ActiveHazards?.OnDispatch(buffers, _writesMask);
+        if (_device.BufferDestroyEpoch != _seenDestroyEpoch)
+            EvictDestroyed();
+
+        var key = new RangedKey(buffers[0], buffers.Length > 1 ? buffers[1] : 0, buffers.Length > 2 ? buffers[2] : 0, buffers.Length > 3 ? buffers[3] : 0,
+            offsets[0], offsets.Length > 1 ? offsets[1] : 0, offsets.Length > 2 ? offsets[2] : 0, offsets.Length > 3 ? offsets[3] : 0);
+        if (_ranged.TryGetValue(key, out nint existing)) return existing;
+        if (_ranged.Count >= MaxRangedSets)
+            throw new InvalidOperationException($"DescriptorSetCache: more than {MaxRangedSets} distinct sub-range tuples in one forward.");
+
+        nint set;
+        if (_rangedFree.Count > 0) { set = _rangedFree[^1]; _rangedFree.RemoveAt(_rangedFree.Count - 1); }
+        else if (_freeCount > 0) set = _freeSets[--_freeCount];
+        else set = KernelSupport.AllocateDescriptorSet(_device, _pool, _setLayout);
+        KernelSupport.WriteBufferBindings(_device, set, buffers, offsets);
+        _device.RecordBuffersBound(buffers);
+        _ranged[key] = set;
+        return set;
+    }
+
     /// <summary>
     /// Forgets every cached entry and resets the underlying descriptor
     /// pool. Call when the caller has externally invalidated the sets
@@ -192,6 +233,8 @@ internal sealed class DescriptorSetCache
         Array.Clear(_sets);
         _count = 0;
         _freeCount = 0;
+        _ranged.Clear();
+        _rangedFree.Clear();
         _seenDestroyEpoch = _device.BufferDestroyEpoch;
     }
 
@@ -213,6 +256,19 @@ internal sealed class DescriptorSetCache
         destroyed.Clear();
         bool complete = _device.TryCollectDestroyedSince(_seenDestroyEpoch, destroyed, out long epoch);
         _seenDestroyEpoch = epoch;
+
+        if (_ranged.Count > 0)
+        {
+            List<RangedKey>? drop = null;
+            foreach (var kv in _ranged)
+            {
+                var k = kv.Key;
+                if (!complete || destroyed.Contains(k.B0) || destroyed.Contains(k.B1) || destroyed.Contains(k.B2) || destroyed.Contains(k.B3))
+                    (drop ??= new()).Add(k);
+            }
+            if (drop is not null)
+                foreach (var k in drop) { _rangedFree.Add(_ranged[k]); _ranged.Remove(k); }
+        }
 
         int i = 0;
         while (i < _count)

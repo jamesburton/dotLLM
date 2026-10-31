@@ -119,7 +119,11 @@ public sealed class VulkanQwen4ExpEngineTests
             using (rig.Vk.Forward(ok, Enumerable.Range(0, ok.Length).ToArray(), -1)) { }
             // Past the capacity: a clear message naming the knob.
             var ids = VulkanQwen4ExpParityTests.Ids(41, rig.Config.VocabSize);
-            var ex = Assert.Throws<NotSupportedException>(() => rig.Vk.Forward(ids, Enumerable.Range(0, ids.Length).ToArray(), -1));
+            // The model advertises the capacity it really has (so the server clamps max_tokens to it) and the backstop is the
+            // admission exception the server maps to a 400 context_length_exceeded - never a bare NotSupportedException (#1324).
+            Assert.Equal(40, rig.Vk.Config.MaxSequenceLength);
+            var ex = Assert.Throws<DotLLM.Core.Configuration.DeviceMemoryAdmissionException>(
+                () => rig.Vk.Forward(ids, Enumerable.Range(0, ids.Length).ToArray(), -1));
             Assert.Contains(Env, ex.Message);
             Assert.Contains("40", ex.Message);
             // The engine KV cache is clamped to the capacity.
