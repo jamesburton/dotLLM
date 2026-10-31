@@ -1,4 +1,6 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "q8_1_exact_div.glsl"
 // Activation quantization: FP32 x[K] -> Q8_1 (per-32-block int8 + fp32 scale + fp32 sum).
 //
 // This is the right-hand-operand quantization that turns the decode GEMV
@@ -53,18 +55,18 @@ void main() {
             amax = max(amax, abs(x[base + i]));
         }
 
-        float d = amax / 127.0;
-        float id = (d != 0.0) ? (1.0 / d) : 0.0;
+        float d = q81DivBy127(amax);
+        float id = (d != 0.0) ? q81Recip(d) : 0.0;
 
         // Pass 2: quantize + pack 4 int8 lanes per uint, accumulate sum.
         int sumI = 0;
         uint qBase = base >> 2u; // 4 elements per uint
         for (uint g = 0u; g < QK / 4u; g++) {
             uint e = base + g * 4u;
-            int q0 = int(round(x[e + 0u] * id));
-            int q1 = int(round(x[e + 1u] * id));
-            int q2 = int(round(x[e + 2u] * id));
-            int q3 = int(round(x[e + 3u] * id));
+            int q0 = int(roundEven(x[e + 0u] * id));
+            int q1 = int(roundEven(x[e + 1u] * id));
+            int q2 = int(roundEven(x[e + 2u] * id));
+            int q3 = int(roundEven(x[e + 3u] * id));
             sumI += q0 + q1 + q2 + q3;
             uint packed = (uint(q0) & 0xFFu)
                         | ((uint(q1) & 0xFFu) << 8u)

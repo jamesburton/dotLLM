@@ -602,7 +602,9 @@ public static unsafe class FusedOps
                     }
                     float maxAbs = HorizontalMaxAvx2(maxVec);
 
-                    float scale = maxAbs / 127.0f;
+                    // Q8_K contract (#1340): llama.cpp quantize_row_q8_K_ref - iscale = 127/amax (sign folded out), d = 1/iscale.
+                    float iscale = maxAbs > 0 ? 127.0f / maxAbs : 0.0f;
+                    float scale = iscale != 0.0f ? 1.0f / iscale : 0.0f;
                     Unsafe.WriteUnaligned(blockDst, scale);
 
                     sbyte* qs = (sbyte*)(blockDst + 4);
@@ -617,7 +619,7 @@ public static unsafe class FusedOps
                     }
                     else
                     {
-                        Vector256<float> vInvScale = Vector256.Create(1.0f / scale);
+                        Vector256<float> vInvScale = Vector256.Create(iscale);
 
                         // Quantize 32 floats at a time (8 chunks for 256 total)
                         for (int chunk = 0; chunk < 8; chunk++)
@@ -674,7 +676,9 @@ public static unsafe class FusedOps
                     if (abs > maxAbs) maxAbs = abs;
                 }
 
-                float scale = maxAbs / 127.0f;
+                // Q8_K contract (#1340): llama.cpp quantize_row_q8_K_ref - iscale = 127/amax (sign folded out), d = 1/iscale.
+                float iscale = maxAbs > 0 ? 127.0f / maxAbs : 0.0f;
+                float scale = iscale != 0.0f ? 1.0f / iscale : 0.0f;
                 Unsafe.WriteUnaligned(blockDst, scale);
 
                 sbyte* qs = (sbyte*)(blockDst + 4);
@@ -689,7 +693,7 @@ public static unsafe class FusedOps
                 }
                 else
                 {
-                    float invScale = 1.0f / scale;
+                    float invScale = iscale;
                     for (int g = 0; g < 16; g++)
                     {
                         int sum = 0;
