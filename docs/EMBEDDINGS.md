@@ -288,7 +288,7 @@ graph up to llama.cpp's `result_norm`, then the final RMSNorm of the pooled row(
 No LM head runs, and for last/cls pooling only **one row** (`hiddenSize` F32 = 4 KiB for Qwen3-Embedding) is copied, normalised and read back;
 mean pooling reads all rows. The new `IEmbeddingModel.ForwardHiddenForPooling(sequences, pooling, consume, device)` delivers exactly the rows
 pooling reads (default = slice of `ForwardHiddenBatch`, so the CPU models are unchanged); `EmbeddingBatcher`, `dotllm embed` and
-`EmbeddingBench` all use it. Cacheless forward, positions 0..n-1, one sequence per submit (no cross-sequence batching on the GPU yet).
+`EmbeddingBench` all use it. Cacheless forward, positions 0..n-1 per document; since #1437 several short documents share one submit (packed varlen, below).
 Weights stay F16 and resident (no expansion); the only added storage is the readback buffer (`rows x hidden x 4 B`, one row for last/cls).
 
 Use: `dotllm embed <qwen3-embedding.gguf> -d vulkan "text"` (default device stays `cpu`), `dotllm serve ... --device vulkan` then
