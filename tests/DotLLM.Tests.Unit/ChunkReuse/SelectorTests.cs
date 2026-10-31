@@ -177,7 +177,9 @@ public sealed class SelectorTests : IDisposable
         int[] more = sel.Select(ctx, 9, 0);
         Assert.Superset(expected.ToHashSet(), more.ToHashSet());
         int[] extra = more.Except(expected).ToArray();
-        Assert.True(extra.Select(ctx.ChunkOf).Distinct().Count() >= 2, $"remainder not spread: {string.Join(',', extra)}");
+        // 3 extra tokens over 3 stale chunks with 10 tokens left: an even spread touches every stale chunk (index order would
+        // take 8, 9, 12: only B and C).
+        Assert.True(extra.Select(ctx.ChunkOf).Distinct().Count() == 3, $"remainder not spread: {string.Join(',', extra)}");
     }
 
     [Fact]

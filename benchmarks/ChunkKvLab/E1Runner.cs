@@ -99,9 +99,9 @@ internal static class E1Runner
     }
 
     /// <summary>Teacher-forced continuation logits, greedy tokens and the first-token forward time for a cache holding the context.</summary>
-    private sealed record MethodResult(float[] Rows, int[] Greedy, double BuildMs, double FirstTokenMs);
+    internal sealed record MethodResult(float[] Rows, int[] Greedy, double BuildMs, double FirstTokenMs);
 
-    private static MethodResult Evaluate(LabModel lab, SimpleKvCache cache, int L, int[] continuation, int greedyTokens, double buildMs)
+    internal static MethodResult Evaluate(LabModel lab, SimpleKvCache cache, int L, int[] continuation, int greedyTokens, double buildMs)
     {
         if (cache.CurrentLength != L)
             throw new InvalidOperationException($"cache holds {cache.CurrentLength} rows, expected {L}");

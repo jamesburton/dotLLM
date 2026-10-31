@@ -7,6 +7,8 @@ namespace ChunkKvLab;
 /// <code>
 /// ChunkKvLab e1 --model &lt;gguf&gt; --corpus &lt;dir&gt; --seeds 3 --out results.csv [--sizes 2048,4096,8192] [--pattern *.cs]
 ///               [--chunk 512] [--continuation 64] [--greedy 16] [--threads 0]
+/// ChunkKvLab e2 --model &lt;gguf&gt; --corpus &lt;dir&gt; --out e2.csv [--sizes 2048,4096] [--budgets 5,10,15,20] [--selectors ...]
+///               [--contiguous =a,b] [--query 16] [--noise 1] [--expect-hash &lt;sha256&gt;] [--seeds 3] [--first-seed 0]
 /// ChunkKvLab rope-precision --model &lt;gguf&gt; --corpus &lt;dir&gt; --out rope.csv [--deltas 1024,4096,8192] [--chunks 3]
 /// </code>
 /// </summary>
@@ -42,6 +44,18 @@ internal static class Program
                 return E1Runner.Run(new E1Options(
                     Get("model"), Get("corpus"), Get("pattern", "*.cs"), Int("seeds", 3), Ints("sizes", "2048,4096,8192"),
                     Int("chunk", 512), Int("continuation", 64), Int("greedy", 16), Int("threads", 0), Get("out")));
+            case "e2":
+            {
+                // "--contiguous =" (value after '=') lets a script pass an empty list.
+                string[] List(string key, string fallback) =>
+                    Get(key, fallback).TrimStart('=').Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                return E2Runner.Run(new E2Options(
+                    Get("model"), Get("corpus"), Get("pattern", "*.cs"), Int("seeds", 3), Ints("sizes", "2048,4096"),
+                    Ints("budgets", "5,10,15,20"),
+                    List("selectors", "first_k,chunk_starts,deviation,deviation_oracle,random,query,combined"),
+                    List("contiguous", "="), Int("chunk", 512), Int("continuation", 64), Int("query", 16), Int("greedy", 16),
+                    Int("threads", 0), Get("out"), opts.GetValueOrDefault("expect-hash"), Int("noise", 1) != 0, Int("first-seed", 0)));
+            }
             case "rope-precision":
                 return RopePrecision.Run(Get("model"), Get("corpus"), Get("pattern", "*.cs"), Ints("deltas", "1024,4096,8192"),
                     Int("chunks", 3), Int("chunk", 512), Int("threads", 0), Get("out"));
