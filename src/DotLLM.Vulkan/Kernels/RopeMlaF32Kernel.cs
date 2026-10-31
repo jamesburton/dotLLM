@@ -26,8 +26,11 @@ namespace DotLLM.Vulkan.Kernels;
 public sealed class RopeMlaF32Kernel : IDisposable
 {
     private const int WorkgroupSize = 256;
-    // seqLen, numHeads, qkNopeHeadDim, qkRopeHeadDim (u32) + theta (f32)
-    private const int PushConstantBytes = 4 * sizeof(uint) + sizeof(float);
+    // seqLen, numHeads, qkNopeHeadDim, qkRopeHeadDim (u32) + theta, yarnFactor, yarnLow, yarnHigh, yarnMscale (f32)
+    private const int PushConstantBytes = 4 * sizeof(uint) + 5 * sizeof(float);
+
+    /// <summary>YaRN RoPE parameters (#1278); <see cref="MlaYarnRope.Off"/> keeps the plain-theta rotation.</summary>
+    public MlaYarnRope Yarn { get; set; } = MlaYarnRope.Off;
 
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
@@ -140,6 +143,10 @@ public sealed class RopeMlaF32Kernel : IDisposable
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[8..], (uint)qkNopeHeadDim);
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[12..], (uint)qkRopeHeadDim);
         System.Buffers.Binary.BinaryPrimitives.WriteSingleLittleEndian(pcBytes[16..], theta);
+        System.Buffers.Binary.BinaryPrimitives.WriteSingleLittleEndian(pcBytes[20..], Yarn.Factor);
+        System.Buffers.Binary.BinaryPrimitives.WriteSingleLittleEndian(pcBytes[24..], Yarn.Low);
+        System.Buffers.Binary.BinaryPrimitives.WriteSingleLittleEndian(pcBytes[28..], Yarn.High);
+        System.Buffers.Binary.BinaryPrimitives.WriteSingleLittleEndian(pcBytes[32..], Yarn.Mscale);
         fixed (byte* pcPtr = pcBytes)
         {
             VulkanApi.vkCmdPushConstants(

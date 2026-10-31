@@ -85,16 +85,19 @@ public abstract class MlaAbsorbedKernelBase : IDisposable
 /// </summary>
 public sealed class MlaKvPrepKernel : MlaAbsorbedKernelBase
 {
+    /// <summary>YaRN RoPE parameters (#1278); <see cref="MlaYarnRope.Off"/> keeps the plain-theta rotation.</summary>
+    public MlaYarnRope Yarn { get; set; } = MlaYarnRope.Off;
+
     /// <summary>Loads <c>mla_kv_prep_f32.spv</c>.</summary>
     public static MlaKvPrepKernel Create(VulkanDevice device, string spvDir) => new(device, spvDir);
-    private MlaKvPrepKernel(VulkanDevice device, string spvDir) : base(device, spvDir, "mla_kv_prep_f32", 4, 6 * sizeof(uint)) { }
+    private MlaKvPrepKernel(VulkanDevice device, string spvDir) : base(device, spvDir, "mla_kv_prep_f32", 4, 10 * sizeof(uint)) { }
 
     /// <summary>Records the dispatch. <paramref name="rowOffset"/> is the cache row of token 0.</summary>
     public void Record(nint cmdBuf, VulkanDevice.Buffer kvA, VulkanDevice.Buffer normWeight, VulkanDevice.Buffer positions,
         VulkanDevice.Buffer cache, int seqLen, int rowOffset, int kvLoraRank, int qkRope, float eps, float theta)
     {
         Span<nint> bufs = [kvA.Handle, normWeight.Handle, positions.Handle, cache.Handle];
-        Span<uint> pc = [(uint)seqLen, (uint)rowOffset, (uint)kvLoraRank, (uint)qkRope, F(eps), F(theta)];
+        Span<uint> pc = [(uint)seqLen, (uint)rowOffset, (uint)kvLoraRank, (uint)qkRope, F(eps), F(theta), F(Yarn.Factor), F(Yarn.Low), F(Yarn.High), F(Yarn.Mscale)];
         Dispatch(cmdBuf, bufs, pc, (uint)seqLen, 1);
     }
 }
@@ -112,9 +115,12 @@ public sealed class MlaHeadGemmQ8Kernel : MlaAbsorbedKernelBase
     /// <summary>Largest supported contraction length K.</summary>
     public const int MaxK = 512;
 
+    /// <summary>YaRN RoPE parameters (#1278); <see cref="MlaYarnRope.Off"/> keeps the plain-theta rotation.</summary>
+    public MlaYarnRope Yarn { get; set; } = MlaYarnRope.Off;
+
     /// <summary>Loads <c>mla_head_gemm_q8.spv</c>.</summary>
     public static MlaHeadGemmQ8Kernel Create(VulkanDevice device, string spvDir) => new(device, spvDir);
-    private MlaHeadGemmQ8Kernel(VulkanDevice device, string spvDir) : base(device, spvDir, "mla_head_gemm_q8", 4, 12 * sizeof(uint)) { }
+    private MlaHeadGemmQ8Kernel(VulkanDevice device, string spvDir) : base(device, spvDir, "mla_head_gemm_q8", 4, 16 * sizeof(uint)) { }
 
     /// <summary>
     /// <c>out[t,h,m] = sum_k W[h*M+m,k] * x[t,h,k]</c>. When <paramref name="ropeDim"/> &gt; 0 the q_pe slice at
@@ -131,6 +137,7 @@ public sealed class MlaHeadGemmQ8Kernel : MlaAbsorbedKernelBase
         [
             (uint)m, (uint)k, (uint)numHeads, (uint)seqLen, (uint)xTokStride, (uint)xHeadStride,
             (uint)outTokStride, (uint)outHeadStride, (uint)ropeDim, (uint)ropeSrcOff, (uint)ropeDstOff, F(theta),
+            F(Yarn.Factor), F(Yarn.Low), F(Yarn.High), F(Yarn.Mscale),
         ];
         uint rowTiles = (uint)((m + RowsPerGroup - 1) / RowsPerGroup);
         Dispatch(cmdBuf, bufs, pc, (uint)numHeads * rowTiles, (uint)((seqLen + TokensPerGroup - 1) / TokensPerGroup));
