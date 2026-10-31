@@ -110,10 +110,17 @@ Single-document latency, p50 / p99 ms (60 docs each; one-off outliers excluded f
 | Model | 16 tok | 64 tok | 256 tok |
 |---|---|---|---|
 | MiniLM-L6 Q8_0 | 7.3 / 21.6 | 16.7 / 18.8 | 120 / 135 |
-| bge-small F16 | 28.9 / **876** | 95.7 / 108 | 428 / 511 |
+| bge-small F16 | 28.9 / **876** (not reproducible, see below) | 95.7 / 108 | 428 / 511 |
 | bge-base Q8_0 | 18.8 / 36.5 | 65.3 / 68.6 | 354 / 734 |
 | nomic-v1.5 Q8_0 | 15.1 / 34.3 | 48.0 / 83.4 | 293 / 953 |
 | mxbai-large Q8_0 | 51.8 / 307 | 192 / 237 | 1122 / 1403 |
+
+**#1407 re-measurement (2026-10-31, dev 3eb37791, `cpu-bench` held, 32 threads, bge-small F16, 16 tokens).** The 876 ms p99 does
+not reproduce. The exact repro (`latency --seqs 16 --iters 60`) over 6 fresh processes gives p50 12.2-13.1 ms, p99 19.2-23.3 ms,
+max <= 23.3 ms; 1000 calls in one process give p50 8.9 / p99 14.6 / max 21.3 ms, and no call exceeds 4x the median. So there is no
+cold-call tail (JIT tiering, pool wake, scratch allocation and mmap page faults all sit inside a ~2x band). The original sample was
+taken before #1402/#1403 and most likely hit box contention; no code change is justified. `EMB_RAW=1` makes the latency mode print
+the index of any call above 4x the median so a future spike can be located in the call sequence.
 
 Same-text end-to-end docs/s (48 mixed-length chunks of `docs/*.md`, mean 148 tokens; tokenise + embed + pool + normalise;
 dotLLM 3 passes, min-max; llama-server batches the 46 texts <= 512 tokens it accepts in one request and 400s the longer ones;
