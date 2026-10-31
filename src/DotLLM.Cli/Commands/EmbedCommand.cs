@@ -50,7 +50,7 @@ internal sealed class EmbedCommand : Command<EmbedCommand.Settings>
         public bool NoNormalize { get; set; }
 
         [CommandOption("--device|-d")]
-        [Description("Compute device: 'cpu' (default) or 'vulkan' (decoder embedders such as Qwen3-Embedding and BERT encoders with F16 weights, #741; nomic-bert / gemma-embedding are CPU-only). An explicit GPU that cannot be honoured is an error, never a silent CPU run.")]
+        [Description("Compute device: 'cpu' (default) or 'vulkan' (decoder embedders such as Qwen3-Embedding and BERT encoders with F16 weights, #741; nomic-bert, nomic-bert-moe and gemma-embedding run on vulkan too). An explicit GPU that cannot be honoured is an error, never a silent CPU run.")]
         [DefaultValue("cpu")]
         public string Device { get; set; } = "cpu";
 
@@ -87,17 +87,23 @@ internal sealed class EmbedCommand : Command<EmbedCommand.Settings>
         IModel model;
         try
         {
-            bool isEncoder = config.Architecture is DotLLM.Core.Configuration.Architecture.Bert or DotLLM.Core.Configuration.Architecture.NomicBert or DotLLM.Core.Configuration.Architecture.NomicBertMoe;
-            if (isEncoder && deviceSpec.IsGpu && !(deviceSpec.Kind == DeviceKind.Vulkan && config.Architecture is DotLLM.Core.Configuration.Architecture.Bert or DotLLM.Core.Configuration.Architecture.NomicBert or DotLLM.Core.Configuration.Architecture.NomicBertMoe))
+            bool isGemmaEmb = config.Architecture == DotLLM.Core.Configuration.Architecture.GemmaEmbedding;
+            bool isEncoder = isGemmaEmb || config.Architecture is DotLLM.Core.Configuration.Architecture.Bert or DotLLM.Core.Configuration.Architecture.NomicBert or DotLLM.Core.Configuration.Architecture.NomicBertMoe;
+            if (isEncoder && deviceSpec.IsGpu && deviceSpec.Kind != DeviceKind.Vulkan)
             {
                 // #741: only architecture 'bert' (F16 weights) has a GPU encoder, and only on Vulkan. Loud refusal, never a CPU run.
                 throw new DeviceUnavailableException(DeviceSelector.ExplicitFailureMessage(
                     s.Device, Path.GetFileName(path), 0,
-                    $"{config.Architecture} encoder embedding models have no GPU backend on '{s.Device}' (#741 / #1471; only 'bert', 'nomic-bert' and 'nomic-bert-moe' on vulkan); use --device cpu. Decoder embedders such as Qwen3-Embedding run on vulkan"));
+                    $"{config.Architecture} encoder embedding models have no GPU backend on '{s.Device}' (#741 / #1471 / #1472; only 'bert', 'nomic-bert', 'nomic-bert-moe' and 'gemma-embedding' on vulkan); use --device cpu. Decoder embedders such as Qwen3-Embedding run on vulkan"));
             }
             if (isEncoder && deviceSpec.IsGpu)
             {
-                try { model = DotLLM.Vulkan.VulkanBertEncoderModel.LoadFromGguf(DotLLM.Vulkan.VulkanModelLoader.SharedDevice, gguf, config, DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir()); }
+                try
+                {
+                    model = isGemmaEmb
+                        ? DotLLM.Vulkan.VulkanGemmaEmbeddingModel.LoadFromGguf(DotLLM.Vulkan.VulkanModelLoader.SharedDevice, gguf, config, DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir())
+                        : DotLLM.Vulkan.VulkanBertEncoderModel.LoadFromGguf(DotLLM.Vulkan.VulkanModelLoader.SharedDevice, gguf, config, DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir());
+                }
                 catch (NotSupportedException ex)
                 {
                     throw new DeviceUnavailableException(DeviceSelector.ExplicitFailureMessage(s.Device, Path.GetFileName(path), 0, ex.Message));

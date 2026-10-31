@@ -139,9 +139,15 @@ public static class DeviceModelLoader
             return (DotLLM.Vulkan.VulkanBertEncoderModel.LoadFromGguf(
                 DotLLM.Vulkan.VulkanModelLoader.SharedDevice, gguf, config, DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir()), null);
         }
+        if (spec.Kind == DeviceKind.Vulkan && config.Architecture is Architecture.GemmaEmbedding)
+        {
+            log($"Vulkan inference ({DotLLM.Vulkan.VulkanModelLoader.SharedDevice.DeviceName}), {config.Architecture} encoder");
+            return (DotLLM.Vulkan.VulkanGemmaEmbeddingModel.LoadFromGguf(
+                DotLLM.Vulkan.VulkanModelLoader.SharedDevice, gguf, config, DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir()), null);
+        }
         if ((config.BidirectionalAttention || config.Architecture is Architecture.Bert or Architecture.NomicBert or Architecture.NomicBertMoe) && spec.Kind != DeviceKind.Cpu)
             throw new NotSupportedException(
-                $"{config.Architecture} is a bidirectional embedding model and runs on the CPU only (requested '{canonicalDevice}'; the Vulkan BERT encoder covers 'bert', 'nomic-bert' and 'nomic-bert-moe' only, #741 / #1471); use --device cpu.");
+                $"{config.Architecture} is a bidirectional embedding model and runs on the CPU only (requested '{canonicalDevice}'; the Vulkan encoders cover 'bert', 'nomic-bert', 'nomic-bert-moe' and 'gemma-embedding' only, #741 / #1471 / #1472); use --device cpu.");
 
         if (spec.Kind == DeviceKind.Vulkan)
         {

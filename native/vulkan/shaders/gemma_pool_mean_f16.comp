@@ -1,0 +1,28 @@
+#version 450
+// Mean pooling of a packed [total, n] F16 hidden matrix into an F16 [docs, n] (issue #1472): the EmbeddingGemma dense heads (768 -> 3072 -> 768
+// F16-activation GEMMs) consume the pooled rows on the device. F32 accumulation in registers, one F16 rounding on store.
+// seg[2*d] = first row, seg[2*d+1] = row count. Dispatch: local_size_x = 256, groupCount.x = docs, groupCount.y = ceil(n/256).
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufH   { float16_t h[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufSeg { uint  seg[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufOut { float16_t outp[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n;
+} pc;
+
+void main() {
+    uint d = gl_WorkGroupID.x;
+    uint col = gl_WorkGroupID.y * 256u + gl_LocalInvocationID.x;
+    if (col >= pc.n) return;
+    uint start = seg[2u * d];
+    uint len = seg[2u * d + 1u];
+    float s = 0.0;
+    for (uint r = 0u; r < len; r++) s += float(h[(start + r) * pc.n + col]);
+    outp[d * pc.n + col] = float16_t(s / float(len));
+}

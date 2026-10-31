@@ -1,0 +1,9 @@
+#version 450
+// HEAD_DIM-256 F16-activation twin of attention_flash_f32_coopmat_hd256.comp (issue #1472, EmbeddingGemma-300M on the Vulkan encoder): Q, K, V and
+// the output are all F16 in memory. Named {base}_hd256 for the base attention_flash_f32_coopmat_f16act, which is how the kernel finds its wide
+// pipeline. Also implements maskMode 3 (symmetric sliding window). Body: attention_flash_f32_coopmat_hd256.glsl.
+#define KV_F16 1
+#define ACT_F16 1
+#define SYM_WINDOW 1   // maskMode 3 (symmetric window) is compiled into this variant only
+#extension GL_GOOGLE_include_directive : require
+#include "attention_flash_f32_coopmat_hd256.glsl"

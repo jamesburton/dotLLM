@@ -1,0 +1,51 @@
+#version 450
+// EmbeddingGemma post-norm + residual add (issue #1472): res[r, :] = bf16(res[r, :] + x[r, :] / rms(x[r, :]) * w[:]), in place on the BF16
+// residual stream, one workgroup per row. x is the F16 GEMM output (attention out-projection or FFN down-projection); the sum of squares and the
+// add are F32, the residual is rounded to BF16 once. See gemma_rmsnorm_bf16_f16.comp for why the residual is BF16.
+//
+// Overflow sentinel: the FFN down-projection output reaches |x| ~ 6.2e4 in layer 22 on the 103-text set (F16 max 65504). If any x element was
+// already +/-inf or NaN when the GEMM rounded to F16 the row's sum of squares is non-finite; flag[0] is set to 1 and the host fails the forward
+// loudly instead of returning garbage. Dispatch: local_size_x = 256, groupCount.x = rows. Width <= 16 * 256.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufX    { float16_t x[]; };     // [rows, n] F16
+layout(set = 0, binding = 1, std430) readonly  buffer BufW    { float w[]; };         // [n]
+layout(set = 0, binding = 2, std430)           buffer BufRes  { uint16_t res[]; };    // [rows, n] BF16, in place
+layout(set = 0, binding = 3, std430)           buffer BufFlag { uint flag[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint  n;
+    float eps;
+} pc;
+
+shared float red[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint base = gl_WorkGroupID.x * pc.n;
+    float s = 0.0;
+    for (uint i = tid; i < pc.n; i += 256u) { float v = float(x[base + i]); s += v * v; }
+    red[tid] = s;
+    barrier();
+    for (uint k = 128u; k > 0u; k >>= 1u) {
+        if (tid < k) red[tid] += red[tid + k];
+        barrier();
+    }
+    float total = red[0];
+    if (isinf(total) || isnan(total)) {
+        if (tid == 0u) flag[0] = 1u;
+        return;
+    }
+    float inv = inversesqrt(total / float(pc.n) + pc.eps);
+    for (uint i = tid; i < pc.n; i += 256u) {
+        float r = uintBitsToFloat(uint(res[base + i]) << 16) + float(x[base + i]) * inv * w[i];
+        uint b = floatBitsToUint(r);
+        b += 0x7FFFu + ((b >> 16) & 1u);   // round to nearest even
+        res[base + i] = uint16_t(b >> 16);
+    }
+}

@@ -1,0 +1,35 @@
+#version 450
+// EmbeddingGemma Q/K per-head RMSNorm in place on F16 (issue #1472): x[r, :] = f16(x[r, :] / rms(x[r, :]) * w[:]) for rows of head_dim elements
+// (rows = tokens * heads of the [tokens, heads * head_dim] projection). F32 sum of squares in LDS, one workgroup per row, rounded once on store.
+// Dispatch: local_size_x = 256, groupCount.x = rows. Width <= 16 * 256.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430)          buffer BufX { float16_t x[]; };
+layout(set = 0, binding = 1, std430) readonly buffer BufW { float w[]; };   // [n]
+
+layout(push_constant) uniform PushConstants {
+    uint  n;
+    float eps;
+} pc;
+
+shared float red[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint base = gl_WorkGroupID.x * pc.n;
+    float s = 0.0;
+    for (uint i = tid; i < pc.n; i += 256u) { float v = float(x[base + i]); s += v * v; }
+    red[tid] = s;
+    barrier();
+    for (uint k = 128u; k > 0u; k >>= 1u) {
+        if (tid < k) red[tid] += red[tid + k];
+        barrier();
+    }
+    float inv = inversesqrt(red[0] / float(pc.n) + pc.eps);
+    for (uint i = tid; i < pc.n; i += 256u)
+        x[base + i] = float16_t(float(x[base + i]) * inv * w[i]);
+}
