@@ -88,12 +88,12 @@ internal sealed class EmbedCommand : Command<EmbedCommand.Settings>
         try
         {
             bool isEncoder = config.Architecture is DotLLM.Core.Configuration.Architecture.Bert or DotLLM.Core.Configuration.Architecture.NomicBert;
-            if (isEncoder && deviceSpec.IsGpu && !(deviceSpec.Kind == DeviceKind.Vulkan && config.Architecture == DotLLM.Core.Configuration.Architecture.Bert))
+            if (isEncoder && deviceSpec.IsGpu && !(deviceSpec.Kind == DeviceKind.Vulkan && config.Architecture is DotLLM.Core.Configuration.Architecture.Bert or DotLLM.Core.Configuration.Architecture.NomicBert))
             {
                 // #741: only architecture 'bert' (F16 weights) has a GPU encoder, and only on Vulkan. Loud refusal, never a CPU run.
                 throw new DeviceUnavailableException(DeviceSelector.ExplicitFailureMessage(
                     s.Device, Path.GetFileName(path), 0,
-                    $"{config.Architecture} encoder embedding models have no GPU backend on '{s.Device}' (#741; only 'bert' on vulkan); use --device cpu. Decoder embedders such as Qwen3-Embedding run on vulkan"));
+                    $"{config.Architecture} encoder embedding models have no GPU backend on '{s.Device}' (#741 / #1471; only 'bert' and 'nomic-bert' on vulkan); use --device cpu. Decoder embedders such as Qwen3-Embedding run on vulkan"));
             }
             if (isEncoder && deviceSpec.IsGpu)
             {

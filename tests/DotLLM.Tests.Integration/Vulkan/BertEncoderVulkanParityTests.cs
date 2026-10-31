@@ -75,9 +75,9 @@ public sealed class BertEncoderVulkanParityTests
         public void Dispose() { Vk.Dispose(); Cpu.Dispose(); Gguf.Dispose(); }
     }
 
-    private static Ctx? Load(string repo, string file, string description, string tag = "F16")
+    private static Ctx? Load(string repo, string file, string description, string tag = "F16", string org = "ChristianAzinn")
     {
-        var loc = TestFixtureResolver.ResolveFile($"DOTLLM_{repo.Replace('-', '_').ToUpperInvariant()}_{tag}_GGUF", "ChristianAzinn", repo, file);
+        var loc = TestFixtureResolver.ResolveFile($"DOTLLM_{repo.Replace('-', '_').ToUpperInvariant()}_{tag}_GGUF", org, repo, file);
         Skip.If(!loc.Found, loc.SkipMessage(description));
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan device.");
         var gguf = CheckpointGuard.LoadOrSkip(loc.Path!, description, () => GgufFile.Open(loc.Path!));
@@ -153,6 +153,52 @@ public sealed class BertEncoderVulkanParityTests
             // Control arm: the Q8_0 weights are really what ran (an F16 fallback would be ~1.0 to the F16 model on every text).
             Assert.True(differs >= q.Docs.Length / 2, $"{name} {pooling}: Q8_0 output is indistinguishable from the F16 model on {q.Docs.Length - differs} texts (min cpu cosine {min:F6})");
         }
+    }
+
+    public static IEnumerable<object[]> NomicFiles() =>
+    [
+        ["nomic-f16", "nomic-embed-text-v1.5.f16.gguf", "F16", 0.9999],
+        ["nomic-f32", "nomic-embed-text-v1.5.f32.gguf", "F32", 0.9999],
+        ["nomic-q8", "nomic-embed-text-v1.5.Q8_0.gguf", "Q8_0", 0.998],
+    ];
+
+    [SkippableTheory]
+    [MemberData(nameof(NomicFiles))]
+    public void Nomic_bert_vulkan_matches_cpu(string name, string file, string tag, double gate)
+    {
+        // #1471: RoPE NeoX (per-document positions), fused attn_qkv split at load, SwiGLU, F16/F32/Q8_0 weights, packed documents.
+        using var c = Load("nomic-embed-text-v1.5-GGUF", file, $"{name} GGUF", "NOMIC_" + tag, "nomic-ai")!;
+        Assert.Equal(Architecture.NomicBert, c.Config.Architecture);
+        int h = c.Config.HiddenSize;
+        var pooling = c.Pooling;
+        var want = Embed(c.Cpu, c.Docs, h, pooling);
+        var packed = Embed(c.Vk, c.Docs, h, pooling);
+        double min = 1;
+        for (int i = 0; i < c.Docs.Length; i++)
+        {
+            double cos = Cosine(want[i], packed[i]);
+            min = Math.Min(min, cos);
+            Assert.True(cos >= gate, $"{name} text[{i}] ({c.Docs[i].Length} tokens): packed Vulkan vs CPU cosine {cos:F6} < {gate}");
+            var single = Embed(c.Vk, [c.Docs[i]], h, pooling)[0];
+            Assert.True(Cosine(single, packed[i]) >= 0.9999, $"{name} text[{i}]: the vector depends on the packed neighbours (positions must restart per document)");
+        }
+        Assert.True(Cosine(packed[1], packed[8]) < 0.95, $"{name}: unrelated texts must not look identical");
+
+        // Control arm: dropping the relative position signal (all RoPE positions 0) must be detected on (nearly) every multi-token document.
+        // (Positions that merely continue across the pack would NOT change anything: RoPE is relative, so a per-document offset cancels in q.k.)
+        c.Vk.PositionMutant = true;
+        var wrongPos = Embed(c.Vk, c.Docs, h, pooling);
+        c.Vk.PositionMutant = false;
+        int changed = 0;
+        int multiTok = 0;
+        for (int i = 0; i < c.Docs.Length; i++) { if (c.Docs[i].Length < 4) continue; multiTok++; if (Cosine(want[i], wrongPos[i]) < gate) changed++; }
+        Assert.True(changed >= multiTok - 1, $"{name}: collapsed RoPE positions were detected on only {changed}/{multiTok} documents");
+        c.Vk.CausalMutant = true;
+        var causal = Embed(c.Vk, c.Docs, h, pooling);
+        c.Vk.CausalMutant = false;
+        int below = 0, multi = 0;
+        for (int i = 0; i < c.Docs.Length; i++) { if (c.Docs[i].Length < 4) continue; multi++; if (Cosine(want[i], causal[i]) < gate) below++; }
+        Assert.True(below >= multi - 1, $"{name}: causal mask was detected on only {below}/{multi} documents");
     }
 
     [SkippableFact]
