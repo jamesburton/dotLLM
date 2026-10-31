@@ -29,7 +29,7 @@ public sealed unsafe class NemotronHTransformerModelRecurrentBatchTests
     private const int DState = 8;
     private const int NGroup = 2;
     private const int NHead = 2;
-    private const int MaxSeqLen = 16;
+    private const int MaxSeqLen = 32;
 
     [Fact]
     public void Flags_And_Factory_ExposeThreadedSsmState()
@@ -153,6 +153,39 @@ public sealed unsafe class NemotronHTransformerModelRecurrentBatchTests
         Assert.Equal(legacy, compact);                                  // bit-identical
         Assert.Equal(legacyBytes * 2 / kinds.Length, compactBytes);     // 2 attention layers of 5
         Assert.Equal(2, DotLLM.Core.Attention.KvGeometry.SlotCount(fix.Config));
+    }
+
+    /// <summary>
+    /// Issue #1485: with the last-row hint the LM head runs over one row (<c>[1, vocab]</c>) and that row is bit-identical to the
+    /// last row of the full-logits forward (the head is independent per row).
+    /// </summary>
+    [Fact]
+    public void LastTokenLogitsOnly_ReturnsSingleRow_IdenticalToFullLastRow()
+    {
+        var kinds = new[] { HybridLayerKind.Ssm, HybridLayerKind.Ffn, HybridLayerKind.Ssm };
+        using var fix = NemotronHFixture.Build(kinds, seed: 31);
+        int n = NemotronHTransformerModel.RowByRowMaxTokens + 1;   // batched-GEMM path
+        int[] tokens = Enumerable.Range(0, n).Select(i => i % VocabSize).ToArray();
+        int[] pos = Enumerable.Range(0, n).ToArray();
+
+        float[] full, last;
+        int fullRows, lastRows;
+        using (var model = Build(fix))
+        using (var lg = model.Forward(tokens, pos, -1, null))
+        {
+            fullRows = lg.Shape[0];
+            full = CopyLastRow(lg);
+        }
+        using (var model = Build(fix))
+        using (var lg = ((IModel)model).Forward(tokens, pos, -1, null, lastTokenLogitsOnly: true))
+        {
+            lastRows = lg.Shape[0];
+            last = CopyLastRow(lg);
+        }
+
+        Assert.Equal(n, fullRows);
+        Assert.Equal(1, lastRows);
+        Assert.Equal(full, last);
     }
 
     // ── Helpers ──
