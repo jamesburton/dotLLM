@@ -1395,6 +1395,32 @@ deliver), and nothing calls a 17..32-row verify: `ForwardWithRecurrentSnapshots`
 of a short chunk) lands there. The real fix for that range would be an int8-dot / coopmat tile that reads the quantized blocks (dequant in the tile load), a new GEMM
 family, KL-checked; it is only worth building if a drafter with >= 6 accepted tokens/round or a tree consumer appears. Tracked in #1376; reopen then.
 
+#### 17..32-row forward is ~1 s? Not a code regression (issue #1458): environment-sensitive, narrow tile refuted
+
+Question: did the GEMM path regress (320 / 462 / 578 / ~1000 ms seen at 17..32 rows on Qwen3.8-27B Q4_K_M)? Method: `VerifyRowCurve` (plain `Forward`, ctx 64), `dev` @ 77f5a3aa,
+both locks held, ollama idle.
+
+- **No code change to bisect.** `git log cc686e1d..dev -- src/DotLLM.Vulkan native/vulkan` is four commits (scheduler Gumbel draw, a MoE probe doc); none touches the dense GEMM routing
+  or any shader. The ~1000 ms at cc686e1d and the other figures are the *same code*.
+- **Same build, same box, one session, 17-row `fwd` median: 770 / 680 / 690 ms early, then 428 / 374 / 357 / 326 / 388 ms later** (16 rows: 260 -> 237 -> 236 -> 243 ms). The GEMV
+  (<= 16 rows) path moved ~10 %, the GEMM path 2x, so the 16 -> 17 "cliff" is 3.0x in one state and 1.4x in another. Quiet-box numbers: 16 rows 236 [234-263],
+  17 rows 326 [322-344], 32 rows 343 [340-351]; decode 103. A python spin on 32 threads costs +29-31 % on 16 / 17 / 32 rows alike; a concurrent `dotnet build` +3 % (16 rows) vs +19 % (17 rows).
+  The 2-3x states were not reproduced on demand (candidates: shared APU power/clock budget, GPU memory residency, other agents' load; unattributed). Quote the 17..32 range as 330-1000 ms and
+  always same-session paired.
+- **What runs** (temporary path log + profiler, Qwen3.8-27B Q4_K_M): Q4_K FFN (m=17408 / 5120) and Q8_0 GDN / attention projections (m=48..12288) take the **F16 coopmat 128x128x4 GEMMs
+  that read the packed blocks in place** (dequant in the LDS tile load); there is **no per-projection F16 weight dequant** for this model (that is the IQ / PQ path). The int8-coopmat MMQ
+  (`Cm1For`) is not available on this device (`cm1=False`), and `DOTLLM_VK_MMQ_CM1=0` is a no-op (652 vs 680 ms, inside drift). Profile at 17 rows: proj_ffn 454 ms (67 %), proj_gdn 156 ms, proj_attn 52 ms
+  (boot-state run, 689 ms wall); n = 17, 32, 64 all cost the same (the 128-wide N tile does the work of 128 rows), n = 128 ~ +25 %.
+- **Narrow-N twin refuted.** A 128x64 (BN=64, WN=32) copy of the Q4_K / Q5_K / Q6_K / Q8_0 blocked shaders for n <= 64 looked like 680 -> 380 ms when compared across processes (it was drift).
+  In-process paired A/B (arms alternate per timing, first arm alternates per rep; 6 reps x 3): 17 rows off 351 [337-356] vs on 385 [373-390]; 32 rows 372 [359-384] vs 412 [398-419];
+  24 / 64 rows the same sign (+10 %). So the narrower tile is ~10 % *slower*; BM=64 / 64x32 / 64x64 / 128x32 variants were only compared across processes and are not trusted. Not built.
+- **Two 16-column GEMV dispatches** (needs column-offset descriptors in every multi-column kernel): ceiling ~ 2 x (236 - 103) + 103 = ~370 ms vs the 326-343 ms GEMM on a quiet box, i.e. no win;
+  it would only help in the contended state where the GEMM inflates 2-3x. Not built.
+- **Prompt prefill of 17..32 tokens** takes the same plain-`Forward` path, so it costs the same 0.33-0.43 s (up to 1 s in the slow state) per chunk on this 27B; larger chunks amortise (64 rows 421,
+  128 rows 535 ms quiet).
+- **If this is worth fixing, the lever is the 128x128 tile's fixed per-weight cost** (stage / dequant of 89 M elements per FFN GEMM at ~2.4 ms, ~21 GB/s effective vs ~150 GB/s for decode GEMVs), e.g. a
+  reuse-the-dequant multi-column design or an int8-dot tile that exists on this device; a different tile *shape* alone does not do it.
+
 #### Verify-cliff on the MoE host and `VulkanTransformerModel` (issue #1374)
 
 `VulkanQwen3MoeHybridTransformerModel` now serves 9..16 rows on the same wide multi-column GEMVs through the `AcceptsColumns` gate: Q4_K, Q6_K_Rows
