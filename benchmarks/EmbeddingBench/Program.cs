@@ -98,7 +98,7 @@ internal static class Program
         var gguf = GgufFile.Open(path);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         // #741: BERT encoders have a dedicated Vulkan model; every other architecture goes through the decoder-embedder path.
-        if (config.Architecture == DotLLM.Core.Configuration.Architecture.Bert)
+        if (config.Architecture is DotLLM.Core.Configuration.Architecture.Bert or DotLLM.Core.Configuration.Architecture.NomicBert)
             return (VulkanBertEncoderModel.LoadFromGguf(gguf, config, VulkanModelLoader.ResolveSpvDir()), gguf, config);
         return (VulkanTransformerModel.LoadFromGguf(gguf, config, VulkanModelLoader.ResolveSpvDir()), gguf, config);
     }

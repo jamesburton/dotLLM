@@ -38,6 +38,7 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
     private sealed class Layer
     {
         public required Weight Wq, Wk, Wv, Wo, Wup, Wdown;
+        public Weight Wgate;   // nomic-bert SwiGLU only
         public required VulkanDevice.Buffer Bq, Bk, Bv, Bo, Bup, Bdown;
         public required VulkanDevice.Buffer Ln1W, Ln1B, Ln2W, Ln2B;
     }
@@ -60,6 +61,9 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
     /// <summary>Test seam: causal instead of bidirectional attention, to prove the parity tests can detect a wrong mask mode.</summary>
     internal bool CausalMutant { get; set; }
 
+    /// <summary>Test seam (nomic-bert): every token gets RoPE position 0 (no relative position signal), to prove the tests can detect wrong positions. (A constant per-document offset would NOT change the output: RoPE is relative.)</summary>
+    internal bool PositionMutant { get; set; }
+
     private readonly VulkanDevice _device;
     private readonly bool _ownsDevice;
     private readonly GgufFile _gguf;
@@ -67,6 +71,7 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
     private readonly nint _tokenEmbd, _posEmbd;
     private readonly QuantizationType _tokenEmbdQt, _posEmbdQt;
     private readonly int _posRows;
+    private readonly bool _nomic;     // RoPE NeoX instead of absolute positions; fused attn_qkv (split at load); SwiGLU FFN
     private readonly float[] _typeRow;
     private readonly VulkanDevice.Buffer _embNormW, _embNormB, _zeros;
     private readonly float _eps;
@@ -76,8 +81,12 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
     private readonly Dictionary<EncoderWeightFormat, MatMulEncoderGemmKernel> _encGemm = new();
     private readonly VulkanFlashAttentionCoopmatKernel _flash;
     private readonly SimpleComputeKernel _layerNorm, _biasGelu, _biasAdd, _pool;
+    private readonly SimpleComputeKernel? _rope, _swiglu;
+    private readonly float _ropeTheta;
+    private readonly int _ropeDim;
 
     // Activation scratch (F16), sized once for _cap tokens. _tmp doubles as the embedding-sum upload target (free until the first Wo GEMM).
+    private readonly VulkanDevice.Buffer? _gate, _pos;
     private readonly VulkanDevice.Buffer _hid, _hid2, _q, _k, _v, _attn, _tmp, _up, _seg, _poolOut;
     private readonly Half* _hostEmb;   // [_cap, hidden] host staging of the (F16-rounded) embedding sum
     private readonly VulkanDevice.SubmitContext _submit;
@@ -104,9 +113,15 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
         _eps = config.NormEpsilon;
         int h = config.HiddenSize, ff = config.IntermediateSize;
 
-        if (config.Architecture != DotLLM.Core.Configuration.Architecture.Bert)
+        if (config.Architecture is not (DotLLM.Core.Configuration.Architecture.Bert or DotLLM.Core.Configuration.Architecture.NomicBert))
             throw new NotSupportedException(
-                $"The Vulkan encoder supports Architecture.Bert only (got {config.Architecture}); nomic-bert / nomic-bert-moe / gemma-embedding run with --device cpu for now (#741 follow-ups).");
+                $"The Vulkan encoder supports Architecture.Bert and Architecture.NomicBert (got {config.Architecture}); nomic-bert-moe / gemma-embedding run with --device cpu for now (#1471 / #1472).");
+        _nomic = config.Architecture == DotLLM.Core.Configuration.Architecture.NomicBert;
+        if (_nomic)
+        {
+            var rope = config.RoPEConfig ?? throw new InvalidDataException("nomic-bert config has no RoPE configuration.");
+            _ropeTheta = rope.Theta; _ropeDim = rope.DimensionCount;
+        }
         if (h % 64 != 0 || ff % 32 != 0)
             throw new NotSupportedException($"Vulkan encoder needs hidden % 64 == 0 and ffn % 32 == 0 (got {h}, {ff}).");
         if (!device.HasCooperativeMatrix)
@@ -146,9 +161,10 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
             toDispose.Add(b);
             return b;
         }
-        Weight WeightIn(string name, int expectK, int expectM)
+        Weight WeightIn(string name, int expectK, int expectM, int rowStart = 0, int totalRows = -1)
         {
             var d = Req(name);
+            if (totalRows < 0) totalRows = expectM;
             var fmt = d.QuantizationType switch
             {
                 QuantizationType.F16 => EncoderWeightFormat.F16,
@@ -157,8 +173,8 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
                 _ => throw new NotSupportedException(
                     $"Vulkan encoder: tensor '{name}' is {d.QuantizationType}; F16, Q8_0 and F32 weights are read in place, other formats run with --device cpu."),
             };
-            if (d.Shape[0] != expectK || d.Shape[1] != expectM)
-                throw new InvalidDataException($"Tensor '{name}' has shape [{d.Shape[0]}, {d.Shape[1]}], expected [{expectK}, {expectM}].");
+            if (d.Shape[0] != expectK || d.Shape[1] != totalRows)
+                throw new InvalidDataException($"Tensor '{name}' has shape [{d.Shape[0]}, {d.Shape[1]}], expected [{expectK}, {totalRows}].");
             if (!MatMulEncoderGemmKernel.SupportsK(fmt, expectK))
                 throw new NotSupportedException($"Vulkan encoder: '{name}' ({fmt}) has K={expectK}, which the in-place kernel cannot read (Q8_0 needs K % 64 == 0).");
             if (fmt != EncoderWeightFormat.F16 && !MatMulEncoderGemmKernel.IsSupportedOn(device, spvDir, fmt))
@@ -167,8 +183,14 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
             long bytes = MatMulEncoderGemmKernel.WeightBytes(fmt, expectM, expectK);
             var b = device.AllocateDeviceLocal((bytes + 3) & ~3L);
             toDispose.Add(b);
-            device.Upload(new ReadOnlySpan<byte>((void*)dataBase.Of(d), checked((int)bytes)), b);
+            long rowBytes = MatMulEncoderGemmKernel.WeightBytes(fmt, 1, expectK);   // a row slice of a row-major [rows, K] tensor is contiguous
+            device.Upload(new ReadOnlySpan<byte>((byte*)dataBase.Of(d) + rowStart * rowBytes, checked((int)bytes)), b);
             return new Weight(b, fmt);
+        }
+        float[] VecSlice(string name, int total, int start, int n)
+        {
+            var all = Vec(name, total);
+            return all.AsSpan(start, n).ToArray();
         }
         float[] Zero(int n) => new float[n];
         float[] BiasOrZero(string name, int n) => t.ContainsKey(name) ? Vec(name, n) : Zero(n);
@@ -178,8 +200,11 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
             var tokDesc = Req("token_embd.weight");
             if (tokDesc.Shape[0] != h) throw new InvalidDataException($"token_embd.weight row width {tokDesc.Shape[0]} != hidden size {h}.");
             _tokenEmbd = dataBase.Of(tokDesc); _tokenEmbdQt = tokDesc.QuantizationType;
-            var posDesc = Req("position_embd.weight");
-            _posEmbd = dataBase.Of(posDesc); _posEmbdQt = posDesc.QuantizationType; _posRows = posDesc.Shape[1];
+            if (!_nomic)
+            {
+                var posDesc = Req("position_embd.weight");
+                _posEmbd = dataBase.Of(posDesc); _posEmbdQt = posDesc.QuantizationType; _posRows = posDesc.Shape[1];
+            }
             _typeRow = new float[h];
             if (t.TryGetValue("token_types.weight", out var typeDesc))
                 Dequantize.ToFloat32(dataBase.Of(typeDesc), h, typeDesc.QuantizationType, _typeRow);
@@ -192,14 +217,25 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
             for (int i = 0; i < _layers.Length; i++)
             {
                 string p = $"blk.{i}.";
-                if (t.ContainsKey(p + "attn_qkv.weight") || t.ContainsKey(p + "ffn_up_exps.weight") || t.ContainsKey(p + "ffn_gate.weight"))
-                    throw new NotSupportedException($"Vulkan encoder: layer {i} uses a fused-QKV / gated / MoE layout (nomic-bert family); not supported yet.");
+                if (t.ContainsKey(p + "ffn_up_exps.weight"))
+                    throw new NotSupportedException($"Vulkan encoder: layer {i} is a mixture-of-experts layer (nomic-bert-moe); not supported yet (#1471).");
+                if (_nomic && (t.ContainsKey(p + "ffn_up.bias") || t.ContainsKey(p + "ffn_gate.bias")))
+                    throw new NotSupportedException($"Vulkan encoder: layer {i} has SwiGLU FFN biases, which the encoder does not apply.");
+                bool fused = t.ContainsKey(p + "attn_qkv.weight");
+                if (fused && !_nomic) throw new NotSupportedException($"Vulkan encoder: layer {i} has a fused attn_qkv in a non-nomic architecture.");
+                bool qkvBias = t.ContainsKey(p + "attn_qkv.bias");
                 _layers[i] = new Layer
                 {
-                    Wq = WeightIn(p + "attn_q.weight", h, h), Wk = WeightIn(p + "attn_k.weight", h, h), Wv = WeightIn(p + "attn_v.weight", h, h),
+                    // Fused attn_qkv [h, 3h] is split into three row-range buffers at upload (the same bytes, no copy into a wider format).
+                    Wq = fused ? WeightIn(p + "attn_qkv.weight", h, h, 0, 3 * h) : WeightIn(p + "attn_q.weight", h, h),
+                    Wk = fused ? WeightIn(p + "attn_qkv.weight", h, h, h, 3 * h) : WeightIn(p + "attn_k.weight", h, h),
+                    Wv = fused ? WeightIn(p + "attn_qkv.weight", h, h, 2 * h, 3 * h) : WeightIn(p + "attn_v.weight", h, h),
                     Wo = WeightIn(p + "attn_output.weight", h, h),
                     Wup = WeightIn(p + "ffn_up.weight", h, ff), Wdown = WeightIn(p + "ffn_down.weight", ff, h),
-                    Bq = F32(BiasOrZero(p + "attn_q.bias", h)), Bk = F32(BiasOrZero(p + "attn_k.bias", h)), Bv = F32(BiasOrZero(p + "attn_v.bias", h)),
+                    Wgate = _nomic ? WeightIn(p + "ffn_gate.weight", h, ff) : default,
+                    Bq = F32(fused ? (qkvBias ? VecSlice(p + "attn_qkv.bias", 3 * h, 0, h) : Zero(h)) : BiasOrZero(p + "attn_q.bias", h)),
+                    Bk = F32(fused ? (qkvBias ? VecSlice(p + "attn_qkv.bias", 3 * h, h, h) : Zero(h)) : BiasOrZero(p + "attn_k.bias", h)),
+                    Bv = F32(fused ? (qkvBias ? VecSlice(p + "attn_qkv.bias", 3 * h, 2 * h, h) : Zero(h)) : BiasOrZero(p + "attn_v.bias", h)),
                     Bo = F32(BiasOrZero(p + "attn_output.bias", h)), Bup = F32(BiasOrZero(p + "ffn_up.bias", ff)), Bdown = F32(BiasOrZero(p + "ffn_down.bias", h)),
                     Ln1W = F32(Vec(p + "attn_output_norm.weight", h)), Ln1B = F32(Vec(p + "attn_output_norm.bias", h)),
                     Ln2W = F32(Vec(p + "layer_output_norm.weight", h)), Ln2B = F32(Vec(p + "layer_output_norm.bias", h)),
@@ -208,23 +244,29 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
 
             _gemm = MatMulF16GemmCoopmatKernel.Create(device, spvDir, F16GemmCoopmatVariant.SelectF16ActFor(device, spvDir));
             foreach (var l in _layers)
-                foreach (var w in new[] { l.Wq, l.Wk, l.Wv, l.Wo, l.Wup, l.Wdown })
+                foreach (var w in _nomic ? new[] { l.Wq, l.Wk, l.Wv, l.Wo, l.Wup, l.Wdown, l.Wgate } : new[] { l.Wq, l.Wk, l.Wv, l.Wo, l.Wup, l.Wdown })
                     if (w.Format != EncoderWeightFormat.F16 && !_encGemm.ContainsKey(w.Format))
                         _encGemm[w.Format] = MatMulEncoderGemmKernel.Create(device, spvDir, w.Format);
             _biasAdd = SimpleComputeKernel.Create(device, spvDir, "bert_bias_add_f16", buffers: 2, pushWords: 2);
             _layerNorm = SimpleComputeKernel.Create(device, spvDir, "bert_layernorm_f16", buffers: 6, pushWords: 3);
             _biasGelu = SimpleComputeKernel.Create(device, spvDir, "bert_bias_gelu_f16", buffers: 2, pushWords: 2);
             _pool = SimpleComputeKernel.Create(device, spvDir, "bert_pool_f16", buffers: 3, pushWords: 2);
+            if (_nomic)
+            {
+                _rope = SimpleComputeKernel.Create(device, spvDir, "rope_f16", buffers: 3, pushWords: 9);
+                _swiglu = SimpleComputeKernel.Create(device, spvDir, "bert_swiglu_f16", buffers: 2, pushWords: 1);
+            }
 
             long rowsH = (long)_cap * h;
             _hid = Scratch(rowsH); _hid2 = Scratch(rowsH);
             _q = Scratch(rowsH); _k = Scratch(rowsH); _v = Scratch(rowsH); _attn = Scratch(rowsH); _tmp = Scratch(rowsH);
             _up = Scratch((long)_cap * ff);
+            if (_nomic) { _gate = Scratch((long)_cap * ff); _pos = device.Allocate((long)_cap * sizeof(int)); toDispose.Add(_pos); }
             _seg = device.Allocate(2L * MaxDocsPerPack * sizeof(uint)); toDispose.Add(_seg);
             _poolOut = device.AllocateHostReadback((long)MaxDocsPerPack * h * sizeof(float)); toDispose.Add(_poolOut);
             _hostEmb = (Half*)NativeMemory.AlignedAlloc((nuint)(rowsH * sizeof(ushort)), 64);
             _submit = device.CreateSubmitContext();
-            ComputeMemoryBytes = (7 * rowsH + (long)_cap * ff + rowsH) * sizeof(ushort);   // F16 scratch: 7 [cap,h] + the FFN [cap,ff], plus the host staging
+            ComputeMemoryBytes = (7 * rowsH + (_nomic ? 2L : 1L) * _cap * ff + rowsH) * sizeof(ushort) + (_nomic ? (long)_cap * sizeof(int) : 0);   // F16 scratch: 7 [cap,h] + the FFN [cap,ff], plus the host staging
         }
         catch
         {
@@ -354,12 +396,15 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
             int id = tokens[t];
             if ((uint)id >= (uint)Config.VocabSize)
                 throw new ArgumentOutOfRangeException(nameof(tokens), $"Token ID {id} at index {t} is out of range [0, {Config.VocabSize}).");
-            if (t >= _posRows)
+            if (!_nomic && t >= _posRows)
                 throw new ArgumentOutOfRangeException(nameof(tokens), $"Position {t} exceeds the position-embedding table ({_posRows} rows).");
             Dequantize.ToFloat32(_tokenEmbd + (nint)(id * Dequantize.RowByteSize(h, _tokenEmbdQt)), h, _tokenEmbdQt, row);
             TensorPrimitives.Add(row, _typeRow, row);   // same order as the CPU model: (token + type) + position
-            Dequantize.ToFloat32(_posEmbd + (nint)(t * Dequantize.RowByteSize(h, _posEmbdQt)), h, _posEmbdQt, pos);
-            TensorPrimitives.Add(row, pos, row);
+            if (!_nomic)   // nomic-bert has no position table: positions enter through RoPE
+            {
+                Dequantize.ToFloat32(_posEmbd + (nint)(t * Dequantize.RowByteSize(h, _posEmbdQt)), h, _posEmbdQt, pos);
+                TensorPrimitives.Add(row, pos, row);
+            }
             TensorPrimitives.ConvertToHalf(row, new Span<Half>(dst + (long)t * h, h));   // the one F16 rounding of the embedding sum
         }
     }
@@ -394,6 +439,19 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
         }
         _device.Upload(new ReadOnlySpan<byte>(_hostEmb, checked(total * h * sizeof(ushort))), _tmp);
         if (mode != PoolMode.All) _device.Upload(MemoryMarshal.AsBytes(seg), _seg);
+        if (_nomic)
+        {
+            // Per-document positions restart at 0 (RoPE is the only positional signal).
+            var pos = System.Buffers.ArrayPool<int>.Shared.Rent(total);
+            try
+            {
+                int o = 0;
+                for (int i = 0; i < count; i++)
+                    for (int tI = 0; tI < docs[from + i].Length; tI++, o++) pos[o] = PositionMutant ? 0 : tI;
+                _device.Upload(MemoryMarshal.AsBytes(pos.AsSpan(0, total)), _pos!);
+            }
+            finally { System.Buffers.ArrayPool<int>.Shared.Return(pos); }
+        }
 
         // The flash kernel's sub-range descriptor sets are keyed by per-document offsets; the previous submit has completed, so reset them.
         _flash.InvalidateDescriptorCache();
@@ -417,6 +475,14 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
             _biasAdd.Record(cmd, [_k.Handle, l.Bk.Handle], [(uint)(total * h), (uint)h], (uint)(((long)total * h + 255) / 256));
             _biasAdd.Record(cmd, [_v.Handle, l.Bv.Handle], [(uint)(total * h), (uint)h], (uint)(((long)total * h + 255) / 256));
             Barrier(cmd);
+            if (_nomic)
+            {
+                int halfRope = _ropeDim / 2;
+                _rope!.Record(cmd, [_q.Handle, _k.Handle, _pos!.Handle],
+                    [(uint)total, (uint)nh, (uint)nh, (uint)hd, (uint)_ropeDim, 1u, BitConverter.SingleToUInt32Bits(_ropeTheta), (uint)_ropeDim, (uint)halfRope],
+                    (uint)(((long)total * nh * halfRope + 255) / 256));
+                Barrier(cmd);
+            }
             if (PackLeakMutant)
                 _flash.RecordSlice(cmd, _q, 0, _k, _v, 0, _attn, 0, total, nh, nh, hd, 0f, maskMode);
             else
@@ -435,9 +501,19 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
             _layerNorm.Record(cmd, [_tmp.Handle, l.Bo.Handle, _hid.Handle, l.Ln1W.Handle, l.Ln1B.Handle, _hid2.Handle],
                 [(uint)h, 3u, BitConverter.SingleToUInt32Bits(_eps)], (uint)total);
             Barrier(cmd);
-            Gemm(cmd, l.Wup, _hid2, _up, ff, h, total);
-            Barrier(cmd);
-            _biasGelu.Record(cmd, [_up.Handle, l.Bup.Handle], [(uint)(total * ff), (uint)ff], (uint)(((long)total * ff + 255) / 256));
+            if (_nomic)
+            {
+                Gemm(cmd, l.Wgate, _hid2, _gate!, ff, h, total);
+                Gemm(cmd, l.Wup, _hid2, _up, ff, h, total);
+                Barrier(cmd);
+                _swiglu!.Record(cmd, [_gate!.Handle, _up.Handle], [(uint)(total * ff)], (uint)(((long)total * ff + 255) / 256));
+            }
+            else
+            {
+                Gemm(cmd, l.Wup, _hid2, _up, ff, h, total);
+                Barrier(cmd);
+                _biasGelu.Record(cmd, [_up.Handle, l.Bup.Handle], [(uint)(total * ff), (uint)ff], (uint)(((long)total * ff + 255) / 256));
+            }
             Barrier(cmd);
             Gemm(cmd, l.Wdown, _up, _tmp, h, ff, total);
             Barrier(cmd);
@@ -474,7 +550,7 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
         if (_disposed) return;
         _disposed = true;
         _submit.Dispose();
-        _gemm.Dispose(); foreach (var g in _encGemm.Values) g.Dispose(); _flash.Dispose(); _biasAdd.Dispose(); _layerNorm.Dispose(); _biasGelu.Dispose(); _pool.Dispose();
+        _rope?.Dispose(); _swiglu?.Dispose(); _gemm.Dispose(); foreach (var g in _encGemm.Values) g.Dispose(); _flash.Dispose(); _biasAdd.Dispose(); _layerNorm.Dispose(); _biasGelu.Dispose(); _pool.Dispose();
         foreach (var d in _owned) d.Dispose();
         NativeMemory.AlignedFree(_hostEmb);
         if (_ownsDevice) _device.Dispose();
