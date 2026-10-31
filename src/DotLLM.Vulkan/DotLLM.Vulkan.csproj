@@ -14,6 +14,7 @@
     <InternalsVisibleTo Include="DotLLM.Benchmarks" />
     <InternalsVisibleTo Include="DotLLM.Cuda" />
     <InternalsVisibleTo Include="Qwen4ExpRowProbe" />
+    <InternalsVisibleTo Include="Q4KVerifyProbe" />
   </ItemGroup>
 
   <ItemGroup>
