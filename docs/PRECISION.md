@@ -542,7 +542,7 @@ PRs #1103, #1122, #1125, #1126.
 | C4 | CPU | `PagedKvCache` F32 blocks + full-history staging | was: blocks L8B 256 KiB/token, staging @8k 64 MiB/seq; now F16 blocks 128 KiB/token (Q8_0 68 KiB), no staging on the attention path | fixed (#1268) | #1142 |
 | C5 | CPU | `QuantizedKvCache` F32 recent window | L8B W=128: 32 MiB | open | #1142 |
 | C6 | CPU | RoPE cos/sin `float[]`, twice | L8B @128k 64 MiB ×2 | open | #1142 |
-| C7 | CPU | MTP KV and hidden F32 | 32 MiB @4096 positions | open | #1141 |
+| C7 | CPU | MTP KV and hidden F32 | 32 MiB @4096 positions | **KV fixed** (#1141): F16 default (16 MiB), q8_0 (8.5), q4_0 (4.5) when the trunk cache is quantized; hidden stays F32 (#1144); `DOTLLM_CPU_MTP_KV=f32` reference arm | #1141 |
 | C8 | CPU | MLA KV, TurboQuant norms, MoE scatter F32 | per token | open | #1140 |
 | C9 | CPU | recurrent state + snapshots F32 | O(1) per sequence (speculative verify: read-only scan + in-place replay of row inputs, no state copy at all, #1194) | sign-off pending | #1144 |
 | X1 | CPU | safetensors BF16 → F32 | L8B +16 GB; L1B +2.5 GB | open | #1143 (needs #1118) |
@@ -573,7 +573,7 @@ PRs #1103, #1122, #1125, #1126.
 | V1 | Vulkan | dense `VulkanKvCache` F32 default | L1B 64 → 32 KiB/token (K+V) at F16, KL ~5e-4; L3B 224 → 112 KiB, KL ≤ 2e-4 (E10b) | open; F16 measured | #1151, #918 |
 | V2 | Vulkan | hybrid KV F32 default | B2 128 KiB/token | **fixed on dev for B2** (#1102, PR #1122: F16 default, 64 KiB/token); q8_0 open | #1112 |
 | V3 | Vulkan | inter-kernel activations F32 | `4·seqLen·(3H+2q+2kv+3I)` | open | #1138, #677 |
-| V4 | Vulkan | MTP KV and hidden F32 | B2 8 → 4 KiB/token at F16, KL 3.4e-8 (E10b) | open; F16 measured invisible | #1141 |
+| V4 | Vulkan | MTP KV and hidden F32 | B2 8 → 4 KiB/token at F16, KL 3.4e-8 (E10b) | **KV fixed** (#1141): F16 via the trunk's convert kernel + `_kvf16` attention twins; Bonsai-2 greedy text identical, 159/192 drafts accepted both arms; q8_0 head follows once Vulkan has a quantized trunk cache; `DOTLLM_VULKAN_MTP_KV=f32` reference arm | #1141 |
 | V5 | Vulkan | split-KV partials, split-K slabs F32 | 5.24 MB per split-K | sign-off pending | #1144 |
 | V6 | Vulkan | logits `rows·V·4`; recurrent state; MLA KV; Q8_1 `(d,s)` and KV scales F32 | various | open | #1137, #1144, #1140, #1146 |
 | VX1 | Vulkan | token embedding → F32 for every type but Q8_0 | Qwen3.8-27B 4.85 GiB vs 682 MiB (Q4_K); Bolt 2 GiB vs 544 MiB (Q8_0) | **fixed for Nemotron-H and qwen35 dense** (#1174: Q8_0 / Q4_K / Q6_K / PQ2_0 gathered packed); dense `VulkanWeights` K-quants and `VulkanQwen3MoeHybrid` open | #919 |
