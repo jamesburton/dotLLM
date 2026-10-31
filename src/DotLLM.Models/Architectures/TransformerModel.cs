@@ -113,6 +113,15 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     internal int DebugMaxLayers { get; set; }
 
     /// <summary>
+    /// Read-only attention probe (chunk-KV reuse research, query-relevance selection): when set, called once per layer of a
+    /// cached F32 forward (the non-quantized <see cref="AttendCachedF32"/> arm), after the rows' K/V were written to the
+    /// cache and attention ran, with the post-RoPE queries and the attention output. <c>null</c> (the default) costs one
+    /// null check per layer and leaves every result byte-identical. Same single-threaded-per-instance contract as the
+    /// forward state.
+    /// </summary>
+    internal AttentionQueryProbeHandler? AttentionQueryProbe { get; set; }
+
+    /// <summary>
     /// Diagnostic hybrid hook (bug-#2 bisection). When set, Gemma-4 layers
     /// selected by <see cref="Gemma4LayerOverrideSelector"/> are computed by this
     /// delegate (e.g. a Vulkan single-layer) instead of the in-process
@@ -760,6 +769,25 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     internal void ForwardLayerWindow(
         ReadOnlySpan<int> tokenIds, ReadOnlySpan<float> hiddenIn, ReadOnlySpan<int> positions,
         int firstLayer, int layerCount, Span<float> hiddenOut)
+        => ForwardLayerWindow(tokenIds, hiddenIn, positions, firstLayer, layerCount, hiddenOut, kvCache: null);
+
+    /// <summary>
+    /// <see cref="ForwardLayerWindow(ReadOnlySpan{int}, ReadOnlySpan{float}, ReadOnlySpan{int}, int, int, Span{float})"/>
+    /// with a KV-cache: each windowed layer writes the rows' K/V into <paramref name="kvCache"/> at their positions and
+    /// attends over the cached rows <c>[0, CurrentLength)</c> exactly as <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>
+    /// does (same trunk, same kernels), so all windows in order plus <see cref="ApplyOutputHead"/> equal one cached
+    /// forward. A <c>null</c> cache is the original cache-less window (chunk-KV reuse research, layer-wise probes).
+    /// </summary>
+    /// <param name="tokenIds">Token ids; required when <paramref name="firstLayer"/> is 0, else ignored.</param>
+    /// <param name="hiddenIn">Boundary hidden state <c>[seqLen, HiddenSize]</c>; required when <paramref name="firstLayer"/> is above 0.</param>
+    /// <param name="positions">Absolute position id per row; its length defines <c>seqLen</c>.</param>
+    /// <param name="firstLayer">First global layer index to execute.</param>
+    /// <param name="layerCount">Number of layers to execute; at least one.</param>
+    /// <param name="hiddenOut">Destination for the <c>[seqLen, HiddenSize]</c> residual stream leaving the window.</param>
+    /// <param name="kvCache">Cache the window's layers write to and attend over, or <c>null</c> for in-window attention only.</param>
+    internal void ForwardLayerWindow(
+        ReadOnlySpan<int> tokenIds, ReadOnlySpan<float> hiddenIn, ReadOnlySpan<int> positions,
+        int firstLayer, int layerCount, Span<float> hiddenOut, IKvCache? kvCache)
     {
         GuardLayerWindowSupported();
 
@@ -784,7 +812,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             throw new ArgumentException(
                 $"hiddenOut must hold {seqLen}x{Config.HiddenSize} floats; got {hiddenOut.Length}.", nameof(hiddenOut));
 
-        RunLayerRangeCore(tokenIds, hiddenIn, positions, kvCache: null,
+        RunLayerRangeCore(tokenIds, hiddenIn, positions, kvCache,
                           firstLayer, layerCount, hiddenOut);
     }
 
@@ -814,7 +842,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
 
     /// <summary>
     /// Rejects the architectures whose forward pass is not expressible as an independent slice of the
-    /// layer loop. See <see cref="ForwardLayerWindow"/> remarks for why each one is excluded.
+    /// layer loop. See <see cref="ForwardLayerWindow(ReadOnlySpan{int}, ReadOnlySpan{float}, ReadOnlySpan{int}, int, int, Span{float})"/> remarks for why each one is excluded.
     /// </summary>
     private void GuardLayerWindowSupported()
     {
@@ -1790,6 +1818,9 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 {
                     AttendCachedF32(q, kvCache, layer, attnOut, seqLen, positions[0],
                         numHeads, numKvHeadsLayer, headDimLayer, attnScale, layerSlidingWindow, attnSoftCap, lw.AttnSinks);
+                    AttentionQueryProbe?.Invoke(layer, new ReadOnlySpan<float>(q, seqLen * qStrideLayer),
+                        new ReadOnlySpan<float>(attnOut, seqLen * numHeads * headDimLayer), positions,
+                        numHeads, numKvHeadsLayer, headDimLayer, attnScale, kvCache);
                 }
             }
             else
