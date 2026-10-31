@@ -23,9 +23,10 @@ namespace DotLLM.Vulkan;
 ///     scheme). Every GEMM / bias / LayerNorm / GELU runs once over all rows with the weights read once; attention is one
 ///     <see cref="AttentionMaskMode.Bidirectional"/> coopmat flash dispatch per document over its slice of Q/K/V (sub-range
 ///     descriptors), so a query never sees another document's keys.</description></item>
-///   <item><description><b>Weights stay F16 and resident</b>, read in place by the coopmat GEMM (no expansion). Activations are F32
-///     scratch sized once at load for the pack budget (the same convention as the Vulkan decoder embedder, #1406; F16 activation
-///     kernels are a follow-up).</description></item>
+///   <item><description><b>Weights stay F16 and resident</b>, read in place by the coopmat GEMM (no expansion). <b>Activations are F16</b>
+///     (#1474, docs/PRECISION.md rule 1): every stored tensor (hidden, Q/K/V, attention output, FFN) is half-width scratch sized once at
+///     load for the pack budget; the GEMM / flash accumulators, LayerNorm / softmax / pooling sums and the GELU arithmetic are F32 in
+///     registers, and each stored tensor is rounded to F16 exactly once.</description></item>
 ///   <item><description><b>Pooling</b> (CLS or mean) runs on the device and reads back <c>[docs, hidden]</c> only.</description></item>
 /// </list>
 /// <para>Scope of this first slice: <c>Architecture.Bert</c> with F16 weights. nomic-bert (RoPE + SwiGLU), nomic-bert-moe,
@@ -69,12 +70,11 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
 
     private readonly MatMulF16GemmCoopmatKernel _gemm;
     private readonly VulkanFlashAttentionCoopmatKernel _flash;
-    private readonly BiasAddF32Kernel _biasAdd;
-    private readonly SimpleComputeKernel _layerNorm, _biasGelu, _pool;
+    private readonly SimpleComputeKernel _layerNorm, _biasGelu, _biasAdd, _pool;
 
-    // Activation scratch (F32), sized once for _cap tokens.
-    private readonly VulkanDevice.Buffer _embIn, _hid, _hid2, _q, _k, _v, _attn, _tmp, _up, _seg, _poolOut;
-    private readonly float* _hostEmb;   // [_cap, hidden] host staging of the embedding sum
+    // Activation scratch (F16), sized once for _cap tokens. _tmp doubles as the embedding-sum upload target (free until the first Wo GEMM).
+    private readonly VulkanDevice.Buffer _hid, _hid2, _q, _k, _v, _attn, _tmp, _up, _seg, _poolOut;
+    private readonly Half* _hostEmb;   // [_cap, hidden] host staging of the (F16-rounded) embedding sum
     private readonly VulkanDevice.SubmitContext _submit;
     private bool _disposed;
 
@@ -106,8 +106,8 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
             throw new NotSupportedException($"Vulkan encoder needs hidden % 64 == 0 and ffn % 32 == 0 (got {h}, {ff}).");
         if (!device.HasCooperativeMatrix)
             throw new NotSupportedException("The Vulkan encoder needs VK_KHR_cooperative_matrix (F16 coopmat GEMM + flash attention).");
-        _flash = VulkanFlashAttentionCoopmatKernel.TryCreate(device, spvDir)
-            ?? throw new NotSupportedException("The Vulkan encoder needs the coopmat flash-attention kernel (not available on this device / build).");
+        _flash = VulkanFlashAttentionCoopmatKernel.TryCreateF16Activations(device, spvDir)
+            ?? throw new NotSupportedException("The Vulkan encoder needs the F16-activation coopmat flash-attention kernel (not available on this device / build).");
         if (config.HeadDim > _flash.SupportedMaxHeadDim)
             throw new NotSupportedException($"Head dim {config.HeadDim} exceeds the flash kernel's {_flash.SupportedMaxHeadDim}.");
 
@@ -135,9 +135,9 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
             device.Upload(data, b);
             return b;
         }
-        VulkanDevice.Buffer Scratch(long floats)
+        VulkanDevice.Buffer Scratch(long halves)
         {
-            var b = device.AllocateDeviceLocal(Math.Max(16, floats * sizeof(float)));
+            var b = device.AllocateDeviceLocal(Math.Max(16, halves * sizeof(ushort)));
             toDispose.Add(b);
             return b;
         }
@@ -191,21 +191,21 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
                 };
             }
 
-            _gemm = MatMulF16GemmCoopmatKernel.Create(device, spvDir);
-            _biasAdd = BiasAddF32Kernel.Create(device, spvDir);
-            _layerNorm = SimpleComputeKernel.Create(device, spvDir, "bert_layernorm_f32", buffers: 6, pushWords: 3);
-            _biasGelu = SimpleComputeKernel.Create(device, spvDir, "bert_bias_gelu_f32", buffers: 2, pushWords: 2);
-            _pool = SimpleComputeKernel.Create(device, spvDir, "bert_pool_f32", buffers: 3, pushWords: 2);
+            _gemm = MatMulF16GemmCoopmatKernel.Create(device, spvDir, F16GemmCoopmatVariant.SelectF16ActFor(device, spvDir));
+            _biasAdd = SimpleComputeKernel.Create(device, spvDir, "bert_bias_add_f16", buffers: 2, pushWords: 2);
+            _layerNorm = SimpleComputeKernel.Create(device, spvDir, "bert_layernorm_f16", buffers: 6, pushWords: 3);
+            _biasGelu = SimpleComputeKernel.Create(device, spvDir, "bert_bias_gelu_f16", buffers: 2, pushWords: 2);
+            _pool = SimpleComputeKernel.Create(device, spvDir, "bert_pool_f16", buffers: 3, pushWords: 2);
 
             long rowsH = (long)_cap * h;
-            _embIn = Scratch(rowsH); _hid = Scratch(rowsH); _hid2 = Scratch(rowsH);
+            _hid = Scratch(rowsH); _hid2 = Scratch(rowsH);
             _q = Scratch(rowsH); _k = Scratch(rowsH); _v = Scratch(rowsH); _attn = Scratch(rowsH); _tmp = Scratch(rowsH);
             _up = Scratch((long)_cap * ff);
             _seg = device.Allocate(2L * MaxDocsPerPack * sizeof(uint)); toDispose.Add(_seg);
             _poolOut = device.AllocateHostReadback((long)MaxDocsPerPack * h * sizeof(float)); toDispose.Add(_poolOut);
-            _hostEmb = (float*)NativeMemory.AlignedAlloc((nuint)(rowsH * sizeof(float)), 64);
+            _hostEmb = (Half*)NativeMemory.AlignedAlloc((nuint)(rowsH * sizeof(ushort)), 64);
             _submit = device.CreateSubmitContext();
-            ComputeMemoryBytes = 14 * rowsH + (long)_cap * ff * 4;   // F32 scratch: 8 [cap,h] + the FFN [cap,ff] + staging
+            ComputeMemoryBytes = (7 * rowsH + (long)_cap * ff + rowsH) * sizeof(ushort);   // F16 scratch: 7 [cap,h] + the FFN [cap,ff], plus the host staging
         }
         catch
         {
@@ -326,9 +326,10 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
 
     // ───────────────────────────── forward ─────────────────────────────
 
-    private void EmbedHost(int[] tokens, float* dst, int h)
+    private void EmbedHost(int[] tokens, Half* dst, int h)
     {
         Span<float> pos = h <= 4096 ? stackalloc float[h] : new float[h];
+        Span<float> row = h <= 4096 ? stackalloc float[h] : new float[h];
         for (int t = 0; t < tokens.Length; t++)
         {
             int id = tokens[t];
@@ -336,11 +337,11 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
                 throw new ArgumentOutOfRangeException(nameof(tokens), $"Token ID {id} at index {t} is out of range [0, {Config.VocabSize}).");
             if (t >= _posRows)
                 throw new ArgumentOutOfRangeException(nameof(tokens), $"Position {t} exceeds the position-embedding table ({_posRows} rows).");
-            var row = new Span<float>(dst + (long)t * h, h);
             Dequantize.ToFloat32(_tokenEmbd + (nint)(id * Dequantize.RowByteSize(h, _tokenEmbdQt)), h, _tokenEmbdQt, row);
             TensorPrimitives.Add(row, _typeRow, row);   // same order as the CPU model: (token + type) + position
             Dequantize.ToFloat32(_posEmbd + (nint)(t * Dequantize.RowByteSize(h, _posEmbdQt)), h, _posEmbdQt, pos);
             TensorPrimitives.Add(row, pos, row);
+            TensorPrimitives.ConvertToHalf(row, new Span<Half>(dst + (long)t * h, h));   // the one F16 rounding of the embedding sum
         }
     }
 
@@ -366,7 +367,7 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
             seg[2 * i] = (uint)off; seg[2 * i + 1] = (uint)d.Length;
             off += d.Length;
         }
-        _device.Upload(new ReadOnlySpan<float>(_hostEmb, total * h), _embIn);
+        _device.Upload(new ReadOnlySpan<byte>(_hostEmb, checked(total * h * sizeof(ushort))), _tmp);
         if (mode != PoolMode.All) _device.Upload(MemoryMarshal.AsBytes(seg), _seg);
 
         // The flash kernel's sub-range descriptor sets are keyed by per-document offsets; the previous submit has completed, so reset them.
@@ -375,11 +376,11 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
         var ctx = _submit;
         ctx.Begin();
         nint cmd = ctx.CommandBuffer;
-        _layerNorm.Record(cmd, [_embIn.Handle, _zeros.Handle, _embIn.Handle, _embNormW.Handle, _embNormB.Handle, _hid.Handle],
+        _layerNorm.Record(cmd, [_tmp.Handle, _zeros.Handle, _tmp.Handle, _embNormW.Handle, _embNormB.Handle, _hid.Handle],
             [(uint)h, 0u, BitConverter.SingleToUInt32Bits(_eps)], (uint)total);
         Barrier(cmd);
 
-        long rowBytes = (long)h * sizeof(float);
+        long rowBytes = (long)h * sizeof(ushort);   // F16 rows
         var maskMode = CausalMutant ? AttentionMaskMode.Causal : AttentionMaskMode.Bidirectional;
         foreach (var l in _layers)
         {
@@ -387,9 +388,9 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
             _gemm.Record(cmd, l.Wk, _hid, _k, h, h, total);
             _gemm.Record(cmd, l.Wv, _hid, _v, h, h, total);
             Barrier(cmd);
-            _biasAdd.Record(cmd, _q, l.Bq, total, h);
-            _biasAdd.Record(cmd, _k, l.Bk, total, h);
-            _biasAdd.Record(cmd, _v, l.Bv, total, h);
+            _biasAdd.Record(cmd, [_q.Handle, l.Bq.Handle], [(uint)(total * h), (uint)h], (uint)(((long)total * h + 255) / 256));
+            _biasAdd.Record(cmd, [_k.Handle, l.Bk.Handle], [(uint)(total * h), (uint)h], (uint)(((long)total * h + 255) / 256));
+            _biasAdd.Record(cmd, [_v.Handle, l.Bv.Handle], [(uint)(total * h), (uint)h], (uint)(((long)total * h + 255) / 256));
             Barrier(cmd);
             if (PackLeakMutant)
                 _flash.RecordSlice(cmd, _q, 0, _k, _v, 0, _attn, 0, total, nh, nh, hd, 0f, maskMode);
@@ -428,7 +429,17 @@ public sealed unsafe class VulkanBertEncoderModel : IModel, IEmbeddingModel
         KernelSupport.ComputeToHostBarrier(cmd);
         ctx.SubmitAndWait();
 
-        if (mode == PoolMode.All) _device.Download(_hid, output[..(total * h)]);
+        if (mode == PoolMode.All)
+        {
+            int halves = total * h, words = (halves + 1) / 2;
+            var tmp = System.Buffers.ArrayPool<float>.Shared.Rent(words);
+            try
+            {
+                _device.Download(_hid, tmp.AsSpan(0, words));   // raw F16 words
+                TensorPrimitives.ConvertToSingle(MemoryMarshal.Cast<float, Half>(tmp.AsSpan(0, words)).Slice(0, halves), output[..halves]);
+            }
+            finally { System.Buffers.ArrayPool<float>.Shared.Return(tmp); }
+        }
         else _device.Download(_poolOut, output[..(count * h)]);
     }
 

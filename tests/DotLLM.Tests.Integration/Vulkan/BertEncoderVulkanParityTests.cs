@@ -126,6 +126,18 @@ public sealed class BertEncoderVulkanParityTests
         }
     }
 
+    [SkippableFact]
+    public void Activation_scratch_is_f16_not_f32()
+    {
+        // #1474 / docs/PRECISION.md rule 1: activations are stored half-width. 7 [cap,h] + 1 [cap,ff] + host staging, 2 bytes each.
+        using var c = Load("bge-small-en-v1.5-gguf", "bge-small-en-v1.5_fp16.gguf", "bge-small F16 GGUF")!;
+        long cap = Math.Max(VulkanBertEncoderModel.PackTokenBudget, c.Config.MaxSequenceLength);
+        long f16 = (8 * cap * c.Config.HiddenSize + cap * c.Config.IntermediateSize) * sizeof(ushort);
+        long f32 = (8 * cap * c.Config.HiddenSize + cap * c.Config.IntermediateSize) * sizeof(float);
+        Assert.Equal(f16, c.Vk.ComputeMemoryBytes);
+        Assert.True(c.Vk.ComputeMemoryBytes * 2 == f32, "F16 scratch must be exactly half of the F32 layout it replaced");
+    }
+
     [SkippableTheory]
     [InlineData("bge-small", "bge-small-en-v1.5-gguf", "bge-small-en-v1.5_fp16.gguf")]
     public unsafe void All_row_hidden_state_matches_cpu(string name, string repo, string file)

@@ -165,9 +165,16 @@ void main() {
     if (tileAllIn) {
         [[unroll]] for (uint cm_row = 0u; cm_row < CMS_PER_ROW; cm_row++) {
             [[unroll]] for (uint cm_col = 0u; cm_col < CMS_PER_COL; cm_col++) {
+#ifdef GEMM_C_F16
+                // F16 output (#1474): the F32 accumulator is rounded once, here, to the stored format.
+                coopMatStore(coopmat<float16_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(sums[cm_col * CMS_PER_ROW + cm_row]), GEMM_C_BUF,
+                             cSlab + (GEMM_ROW_BASE + dc + cm_col * TN) * GEMM_M + dr + cm_row * TM,
+                             GEMM_M, gl_CooperativeMatrixLayoutColumnMajor);
+#else
                 coopMatStore(sums[cm_col * CMS_PER_ROW + cm_row], GEMM_C_BUF,
                              cSlab + (GEMM_ROW_BASE + dc + cm_col * TN) * GEMM_M + dr + cm_row * TM,
                              GEMM_M, gl_CooperativeMatrixLayoutColumnMajor);
+#endif
             }
         }
     } else {
@@ -191,7 +198,12 @@ void main() {
                     uint mG = g_mBase + (sg % SG_ROWS) * WM + cm_row * TM + (zz % TM);
                     uint tL = g_tBase + (sg / SG_ROWS) * WN + cm_col * TN + (zz / TM);
                     if (tL < uint(GEMM_ROW_LIMIT) && mG < uint(GEMM_M))
+                        
+#ifdef GEMM_C_F16
+                        GEMM_C_BUF[cSlab + (GEMM_ROW_BASE + tL) * GEMM_M + mG] = float16_t(storeStage[z]);
+#else
                         GEMM_C_BUF[cSlab + (GEMM_ROW_BASE + tL) * GEMM_M + mG] = storeStage[z];
+#endif
                 }
                 barrier();
             }

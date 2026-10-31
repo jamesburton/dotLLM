@@ -1,0 +1,10 @@
+#version 450
+// headDim<=64 twin of attention_flash_f32_coopmat_f16act.comp (issue #1474): MAX_HEAD_DIM = 64 halves the qTile / kvTile LDS and the O registers
+// (same trade as attention_flash_f32_coopmat_hd64.comp, issue #378).
+#define KV_F16 1
+#define ACT_F16 1
+#define MAX_HEAD_DIM 64
+#define HD_SHIFT 6          // log2(MAX_HEAD_DIM)
+#define ROW_LANE_SHIFT 2    // log2(WG_SIZE / MAX_HEAD_DIM), see attention_flash_f32_coopmat_hd64.comp (#378)
+#extension GL_GOOGLE_include_directive : require
+#include "attention_flash_f32_coopmat.glsl"

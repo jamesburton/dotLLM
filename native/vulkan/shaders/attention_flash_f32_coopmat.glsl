@@ -64,7 +64,11 @@
 #define BR              16
 #define BC              64
 #define WG_SIZE         256
+#ifndef MAX_HEAD_DIM
 #define MAX_HEAD_DIM    128
+#define HD_SHIFT         7   // log2(MAX_HEAD_DIM)
+#define ROW_LANE_SHIFT   1   // log2(WG_SIZE / MAX_HEAD_DIM)
+#endif
 #define MAT_K           16                  // coopmat inner-dim chunk
 #define NUM_SLICES      (BC / 16)           // 4 KV-column slices of 16
 #define PV_ROUNDS_MAX   (MAX_HEAD_DIM / (16 * NUM_SLICES))  // 2
@@ -81,9 +85,23 @@
 
 layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
 
+#if defined(ACT_F16)
+// Q_F16 / OUT_F16 (issue #1474): Q and the output are stored F16 (two bytes per element, 16-bit storage buffers). Q was staged to F16 in LDS
+// anyway, so reading F16 Q is lossless; the output is the F32 accumulator rounded once at the store.
+layout(set = 0, binding = 0, std430) readonly  buffer BufQ   { float16_t q[]; };    // [seq_q,  num_heads    * head_dim] F16
+#define Q_LOAD(i) float(q[i])
+#else
 layout(set = 0, binding = 0, std430) readonly  buffer BufQ   { float q[]; };    // [seq_q,  num_heads    * head_dim]
+#define Q_LOAD(i) q[i]
+#endif
 #include "kv_load.glsl"                                       // BufK / BufV (binding 1 / 2), KV_K(i) / KV_V(i)
+#if defined(ACT_F16)
+layout(set = 0, binding = 3, std430) writeonly buffer BufOut { float16_t outp[]; }; // [seq_q,  num_heads    * head_dim] F16
+#define OUT_STORE(i, v) outp[i] = float16_t(v)
+#else
 layout(set = 0, binding = 3, std430) writeonly buffer BufOut { float outp[]; }; // [seq_q,  num_heads    * head_dim]
+#define OUT_STORE(i, v) outp[i] = (v)
+#endif
 
 layout(push_constant) uniform PushConstants {
     uint  seqQ;
@@ -195,7 +213,7 @@ void main() {
         uint tq = qStartRow + r;
         float val = 0.0;
         if (tq < pc.seqQ && d < pc.headDim) {
-            val = q[tq * qStride + hq * pc.headDim + d];
+            val = Q_LOAD(tq * qStride + hq * pc.headDim + d);
         }
         qTile[r * uint(MAX_HEAD_DIM) + d] = float16_t(val);
     }
@@ -213,7 +231,7 @@ void main() {
         oReg[i] = 0.0;
     }
     uint d0   = tid & (uint(MAX_HEAD_DIM) - 1u);
-    uint rHi  = tid >> 7u;                       // 0 or 1: row parity offset
+    uint rHi  = tid >> uint(HD_SHIFT);                       // 0 or 1: row parity offset
     barrier();
 
     // 2. KV tile loop. Causal early-exit identical to the scalar FA shader.
@@ -372,7 +390,7 @@ void main() {
         // 2e. Rescale the register O accumulator by this tile's per-row
         //     correction (register cells have fixed rows, see step 1).
         for (uint i = 0u; i < uint(O_CELLS); i++) {
-            uint r = (i << 1u) + rHi;
+            uint r = (i << uint(ROW_LANE_SHIFT)) + rHi;
             oReg[i] *= corrShared[r];
         }
 
@@ -467,7 +485,7 @@ void main() {
                         // 0.0 in sTile's padding rows (2c), so rows past
                         // rowsInTile contribute exact zeros.
                         for (uint i = 0u; i < uint(O_CELLS); i++) {
-                            acc[i] += sTile[((i << 1u) + rHi) * uint(S_STRIDE) + cBase + c] * vv;
+                            acc[i] += sTile[((i << uint(ROW_LANE_SHIFT)) + rHi) * uint(S_STRIDE) + cBase + c] * vv;
                         }
                     }
                 }
@@ -510,7 +528,7 @@ void main() {
                 uint s  = (d0 - roundBase) >> 4u;
                 uint dd = d0 & 15u;
                 for (uint i = 0u; i < uint(O_CELLS); i++) {
-                    uint r = (i << 1u) + rHi;
+                    uint r = (i << uint(ROW_LANE_SHIFT)) + rHi;
                     oReg[i] += oStage[s * 256u + r * 16u + dd];
                 }
             }
@@ -521,11 +539,11 @@ void main() {
     // 3. Normalize and write this thread's register cells.
     if (d0 < pc.headDim) {
         for (uint i = 0u; i < uint(O_CELLS); i++) {
-            uint r = (i << 1u) + rHi;
+            uint r = (i << uint(ROW_LANE_SHIFT)) + rHi;
             if (r >= rowsInTile) continue;
             float sum = runningSum[r];
             float inv = (sum > 1e-10) ? (1.0 / sum) : 0.0;
-            outp[(qStartRow + r) * qStride + hq * pc.headDim + d0] = oReg[i] * inv;
+            OUT_STORE((qStartRow + r) * qStride + hq * pc.headDim + d0, oReg[i] * inv);
         }
     }
 }
