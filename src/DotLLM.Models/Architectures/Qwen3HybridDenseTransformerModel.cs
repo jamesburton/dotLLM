@@ -496,7 +496,6 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
         float* hidden = (float*)_state.HiddenState;
         float* residual = (float*)_state.Residual;
         float* normOut = (float*)_state.NormOutput;
-        float* logits = (float*)_state.Logits;
         float* qAttn = (float*)_state.QScratch;
         float* kAttn = (float*)_state.KScratch;
         float* vAttn = (float*)_state.VScratch;
@@ -573,13 +572,10 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
             headRot.RotateForward(hidden, headIn, seqLen, _outputInputDim);
         }
 
-        Gemm(_outputWeight, _outputQuantType, headIn, logits,
+        // The head writes straight into the caller-owned result: no model-state logits buffer, no rows*V*4 copy (#1485).
+        var result = UnmanagedTensor.Allocate(new TensorShape(seqLen, vocabSize), DType.Float32, deviceId);
+        Gemm(_outputWeight, _outputQuantType, headIn, (float*)result.DataPointer,
              _outputOutputDim, _outputInputDim, seqLen);
-
-        var shape = new TensorShape(seqLen, vocabSize);
-        var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
-        new Span<float>(logits, seqLen * vocabSize).CopyTo(
-            new Span<float>((void*)result.DataPointer, seqLen * vocabSize));
 
         return result;
     }
@@ -996,6 +992,26 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
     /// </param>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache, IGdnState? gdnState, IMtpState? mtpState = null)
+        => Forward(tokenIds, positions, deviceId, kvCache, gdnState, mtpState, lastTokenLogitsOnly: false);
+
+    /// <summary>
+    /// Hint-aware forward (#1485): with <paramref name="lastTokenLogitsOnly"/> and more than one token the LM head runs over the last
+    /// row only and the result is <c>[1, vocab]</c>; every position still runs through the trunk and MTP capture still sees every row.
+    /// </summary>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly)
+        => Forward(tokenIds, positions, deviceId, kvCache, gdnState: null, mtpState: null, lastTokenLogitsOnly);
+
+    /// <summary>Hint-aware forward with an MTP state (#1485); see the overload above. The adapter is a no-op on this architecture.</summary>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, ILoraAdapter? adapter, IMtpState? mtpState,
+                           bool lastTokenLogitsOnly)
+        => Forward(tokenIds, positions, deviceId, kvCache, gdnState: null, mtpState, lastTokenLogitsOnly);
+
+    /// <summary>The trunk implementation behind every public <c>Forward</c> overload on this class.</summary>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, IGdnState? gdnState, IMtpState? mtpState,
+                           bool lastTokenLogitsOnly)
     {
         // Resolve the GDN state: caller-supplied container preferred, model-owned
         // fallback for the single-seq Forward callers that pre-date the per-seq API.
@@ -1054,7 +1070,6 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
         float* hidden = (float*)_state.HiddenState;
         float* residual = (float*)_state.Residual;
         float* normOut = (float*)_state.NormOutput;
-        float* logits = (float*)_state.Logits;
         float* qAttn = (float*)_state.QScratch;
         float* kAttn = (float*)_state.KScratch;
         float* vAttn = (float*)_state.VScratch;
@@ -1137,8 +1152,14 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
         if (dflashTaps is not null)
             CaptureDFlashTaps(dflashTaps, _layers.Length, hidden, tapFirst, seqLen, hiddenSize);
 
-        // Final output norm + logit projection.
-        for (int t = 0; t < seqLen; t++)
+        // Final output norm + logit projection. MTP capture reads every post-norm row, so only a head without capture
+        // may skip the norm of the rows it will not project (#1485).
+        bool lastOnly = lastTokenLogitsOnly && seqLen > 1;
+        int headRows = lastOnly ? 1 : seqLen;
+        CpuMtpState? mtpCapture = mtpState as CpuMtpState;
+        bool captureMtp = mtpCapture is not null && _mtpHead is not null;
+        int firstNorm = lastOnly && !captureMtp ? seqLen - 1 : 0;
+        for (int t = firstNorm; t < seqLen; t++)
         {
             RmsNorm.Execute(
                 new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
@@ -1152,28 +1173,26 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
         // llama.cpp's `h_nextn`, taken after output_norm and before the lm_head (and before the
         // Hadamard rotation that feeds it). Pre-norm rows are the wrong input: the head's hnorm
         // is an RMSNorm, which cancels scale but not output_norm's per-channel weights.
-        CpuMtpState? mtpCapture = mtpState as CpuMtpState;
-        if (mtpCapture is not null && _mtpHead is not null)
-            mtpCapture.SetCapturedRows(new ReadOnlySpan<float>(hidden, seqLen * hiddenSize), seqLen);
+        if (captureMtp)
+            mtpCapture!.SetCapturedRows(new ReadOnlySpan<float>(hidden, seqLen * hiddenSize), seqLen);
 
         // output.weight is folded too — the final-norm output needs rotating before the lm_head.
-        float* headIn = hidden;
+        float* headIn = hidden + (long)(seqLen - headRows) * hiddenSize;
         if (_hadamard is { } headRot)
         {
-            headIn = (float*)_state.HadamardScratch;
-            headRot.RotateForward(hidden, headIn, seqLen, _outputInputDim);
+            float* rotated = (float*)_state.HadamardScratch;
+            headRot.RotateForward(headIn, rotated, headRows, _outputInputDim);
+            headIn = rotated;
         }
 
+        // The head writes straight into the caller-owned result: no model-state logits buffer, no rows*V*4 copy (#1485).
+        var result = UnmanagedTensor.Allocate(new TensorShape(headRows, vocabSize), DType.Float32, deviceId);
+        float* logits = (float*)result.DataPointer;
         Gemm(_outputWeight, _outputQuantType, headIn, logits,
-             _outputOutputDim, _outputInputDim, seqLen);
+             _outputOutputDim, _outputInputDim, headRows);
 
         if (TensorDump.Enabled)
-            TensorDump.Dump2D("result_output", logits, seqLen, vocabSize);
-
-        var shape = new TensorShape(seqLen, vocabSize);
-        var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
-        new Span<float>(logits, seqLen * vocabSize).CopyTo(
-            new Span<float>((void*)result.DataPointer, seqLen * vocabSize));
+            TensorDump.Dump2D("result_output", logits, headRows, vocabSize);
 
         if (mtpCapture is not null && _mtpHead is not null)
             AbsorbMtp(_mtpHead, mtpCapture, tokenIds, positions);
@@ -1593,7 +1612,7 @@ public sealed unsafe partial class Qwen3HybridDenseTransformerModel : IModel
         for (int i = 0; i < requests.Count; i++)
         {
             var r = requests[i];
-            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.GdnState);
+            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.GdnState, null, r.LastTokenLogitsOnly);
         }
         return results;
     }

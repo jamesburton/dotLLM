@@ -319,7 +319,7 @@ public sealed unsafe partial class Lfm2MoeTransformerModel : IModel
         _activeState = state ?? _defaultState;
         try
         {
-            _s.Ensure(T, Config, _lCache, lastOnly ? 1 : T);
+            _s.Ensure(T, Config, _lCache, 0);
             _threadPool?.SetDispatchMode(T == 1 ? DispatchMode.SpinWait : DispatchMode.EventBased);
 
             float* hidden = _s.Hidden, residual = _s.Residual, normOut = _s.NormOut;
@@ -352,10 +352,9 @@ public sealed unsafe partial class Lfm2MoeTransformerModel : IModel
             float* headIn = hidden + (long)(T - rows) * H;
             RmsRows(headIn, _outputNormWeight, eps, headIn, rows, H);
             if (TensorDump.Enabled) TensorDump.Dump2D("result_norm", headIn, rows, H);
-            Gemm(_outputWeight, _outputQuantType, headIn, _s.Logits, _outputOutputDim, _outputInputDim, rows);
-
+            // The head writes straight into the caller-owned result: no scratch logits buffer, no rows*V*4 copy (#1485).
             var result = UnmanagedTensor.Allocate(new TensorShape(rows, V), DType.Float32, deviceId);
-            new Span<float>(_s.Logits, rows * V).CopyTo(new Span<float>((void*)result.DataPointer, rows * V));
+            Gemm(_outputWeight, _outputQuantType, headIn, (float*)result.DataPointer, _outputOutputDim, _outputInputDim, rows);
             return result;
         }
         finally
@@ -582,7 +581,7 @@ public sealed unsafe partial class Lfm2MoeTransformerModel : IModel
         private int _cap;
         private int _logitRows;
         private readonly List<nint> _all = new();
-        public float* Hidden, Residual, NormOut, Logits, ConvProj, ConvBuf, ConvOut, Q, K, V, AttnOut, FfnGate, FfnUp;
+        public float* Hidden, Residual, NormOut, ConvProj, ConvBuf, ConvOut, Q, K, V, AttnOut, FfnGate, FfnUp;
         public int[] MoeAssignExpert = [], MoeBucketTokens = [], MoeBucketSlots = [], MoeBucketCursors = [], MoeUniqueExperts = [];
         public float[] MoeAssignWeight = [];
         public long AllocatedBytes;
@@ -603,7 +602,6 @@ public sealed unsafe partial class Lfm2MoeTransformerModel : IModel
                 int dense = c.IntermediateSize;
                 _cap = newCap; _logitRows = Math.Max(newRows, 1);
                 Hidden = A((long)_cap * H); Residual = A((long)_cap * H); NormOut = A((long)_cap * H);
-                Logits = A((long)_logitRows * c.VocabSize);
                 ConvProj = A((long)_cap * 3 * H); ConvBuf = A((long)(lCache - 1 + _cap) * H); ConvOut = A((long)_cap * H);
                 Q = A((long)_cap * nh * hd); K = A((long)_cap * kvHeads * hd); V = A((long)_cap * kvHeads * hd); AttnOut = A((long)_cap * nh * hd);
                 FfnGate = A((long)_cap * dense); FfnUp = A((long)_cap * dense);

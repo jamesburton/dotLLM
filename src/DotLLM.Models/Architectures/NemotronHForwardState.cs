@@ -12,7 +12,6 @@ internal sealed unsafe class NemotronHForwardState : IDisposable
 {
     private readonly int _hiddenSize;
     private readonly int _maxIntermediateSize;
-    private readonly int _vocabSize;
     private readonly int _qElems;
     private readonly int _kvElems;
     private readonly int _inputScratchRowBytes;
@@ -30,7 +29,6 @@ internal sealed unsafe class NemotronHForwardState : IDisposable
     public nint Residual;
     public nint NormOutput;
     public nint FfnIntermediate;
-    public nint Logits;
     public nint InputQ8Scratch;
 
     public nint QScratch;
@@ -56,7 +54,6 @@ internal sealed unsafe class NemotronHForwardState : IDisposable
             long floats = 0;
             floats += s * _hiddenSize * 3;                // HiddenState, Residual, NormOutput
             floats += s * _maxIntermediateSize;            // FfnIntermediate
-            floats += s * _vocabSize;                      // Logits
             floats += s * _qElems;                         // QScratch
             floats += s * _kvElems * 2;                    // KScratch, VScratch
             floats += s * _qElems;                         // AttnOutput
@@ -89,7 +86,6 @@ internal sealed unsafe class NemotronHForwardState : IDisposable
     {
         _hiddenSize = hiddenSize;
         _maxIntermediateSize = maxIntermediateSize;
-        _vocabSize = vocabSize;
         _qElems = qElems;
         _kvElems = kvElems;
         _inputProjectionDim = inputProjectionDim;
@@ -124,7 +120,6 @@ internal sealed unsafe class NemotronHForwardState : IDisposable
         Residual = AllocFloats((long)cap * _hiddenSize);
         NormOutput = AllocFloats((long)cap * _hiddenSize);
         FfnIntermediate = AllocFloats((long)cap * _maxIntermediateSize);
-        Logits = AllocFloats((long)cap * _vocabSize);
         InputQ8Scratch = AllocBytes((long)cap * _inputScratchRowBytes);
 
         QScratch = AllocFloats((long)cap * _qElems);
@@ -156,7 +151,6 @@ internal sealed unsafe class NemotronHForwardState : IDisposable
         FreeIfNonZero(ref Residual);
         FreeIfNonZero(ref NormOutput);
         FreeIfNonZero(ref FfnIntermediate);
-        FreeIfNonZero(ref Logits);
         FreeIfNonZero(ref InputQ8Scratch);
         FreeIfNonZero(ref QScratch);
         FreeIfNonZero(ref KScratch);

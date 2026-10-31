@@ -19,7 +19,6 @@ namespace DotLLM.Models.Architectures;
 internal sealed unsafe class Qwen3MoeHybridForwardState : IDisposable
 {
     private readonly int _hiddenSize;
-    private readonly int _vocabSize;
     private readonly int _qElems;         // numQHeads * headDim
     private readonly int _kvElems;        // numKvHeads * headDim
     private readonly int _convDim;        // (2*NKHead + NVHead) * DState
@@ -39,7 +38,6 @@ internal sealed unsafe class Qwen3MoeHybridForwardState : IDisposable
     public nint HiddenState;
     public nint Residual;
     public nint NormOutput;
-    public nint Logits;
     public nint InputQ8Scratch;           // byte-sized scratch for input pre-quantisation
 
     // ── GDN sub-layer ─────────────────────────────────────────────────────────
@@ -147,7 +145,6 @@ internal sealed unsafe class Qwen3MoeHybridForwardState : IDisposable
             if (s == 0) return 0;
             long floats = 0;
             floats += s * _hiddenSize * 3;                        // HiddenState, Residual, NormOutput
-            floats += s * _vocabSize;                              // Logits
             floats += (_dConv - 1 + s) * _convDim;                // GdnConvInput
             floats += s * _convDim;                                // GdnQkvBuf
             floats += s * _gdnVDim;                                // GdnZBuf
@@ -176,7 +173,6 @@ internal sealed unsafe class Qwen3MoeHybridForwardState : IDisposable
         int moeNumExpertsPerTok = 0)
     {
         _hiddenSize = hiddenSize;
-        _vocabSize = vocabSize;
         _qElems = qElems;
         _kvElems = kvElems;
         _convDim = convDim;
@@ -220,7 +216,6 @@ internal sealed unsafe class Qwen3MoeHybridForwardState : IDisposable
         HiddenState = AllocFloats((long)cap * _hiddenSize);
         Residual = AllocFloats((long)cap * _hiddenSize);
         NormOutput = AllocFloats((long)cap * _hiddenSize);
-        Logits = AllocFloats((long)cap * _vocabSize);
         InputQ8Scratch = AllocBytes((long)cap * _inputScratchRowBytes);
 
         GdnConvInput = AllocFloats((long)(_dConv - 1 + cap) * _convDim);
@@ -266,7 +261,6 @@ internal sealed unsafe class Qwen3MoeHybridForwardState : IDisposable
         FreeIfNonZero(ref HiddenState);
         FreeIfNonZero(ref Residual);
         FreeIfNonZero(ref NormOutput);
-        FreeIfNonZero(ref Logits);
         FreeIfNonZero(ref InputQ8Scratch);
         FreeIfNonZero(ref GdnConvInput);
         FreeIfNonZero(ref GdnQkvBuf);

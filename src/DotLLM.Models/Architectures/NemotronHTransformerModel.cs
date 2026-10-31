@@ -610,25 +610,39 @@ public sealed unsafe partial class NemotronHTransformerModel : IModel
                            int deviceId, IKvCache? kvCache)
         => ForwardWithTaps(tokenIds, positions, deviceId, kvCache, taps: null);
 
+    /// <summary>
+    /// Hint-aware forward (#1485): with <paramref name="lastTokenLogitsOnly"/> and more than one token the LM head runs over the last
+    /// row only and the result is <c>[1, vocab]</c>; every position still runs through the trunk.
+    /// </summary>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly)
+        => ForwardWithTaps(tokenIds, positions, deviceId, kvCache, taps: null, lastTokenLogitsOnly);
+
     private ITensor ForwardWithTaps(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
-                                    int deviceId, IKvCache? kvCache, DFlash.DFlashMtpState? taps)
+                                    int deviceId, IKvCache? kvCache, DFlash.DFlashMtpState? taps,
+                                    bool lastTokenLogitsOnly = false)
     {
         int seqLen = tokenIds.Length;
         if (seqLen == 0 || seqLen != positions.Length)
             throw new ArgumentException("tokenIds and positions must have equal, non-zero length.");
         int vocabSize = Config.VocabSize;
-        var result = UnmanagedTensor.Allocate(new TensorShape(seqLen, vocabSize), DType.Float32, deviceId);
+        bool lastOnly = lastTokenLogitsOnly && seqLen > 1;
+        var result = UnmanagedTensor.Allocate(new TensorShape(lastOnly ? 1 : seqLen, vocabSize), DType.Float32, deviceId);
         try
         {
             float* dst = (float*)result.DataPointer;
             if (seqLen > 1 && seqLen <= RowByRowMaxTokens && kvCache is not null)   // without a cache the rows must see each other
             {
                 for (int t = 0; t < seqLen; t++)
-                    ForwardCore(tokenIds.Slice(t, 1), positions.Slice(t, 1), kvCache, taps, t, dst + (long)t * vocabSize);
+                {
+                    // lastOnly: rows before the last need no head (null destination), the last one fills the single result row.
+                    float* rowDst = !lastOnly ? dst + (long)t * vocabSize : t == seqLen - 1 ? dst : null;
+                    ForwardCore(tokenIds.Slice(t, 1), positions.Slice(t, 1), kvCache, taps, t, rowDst);
+                }
             }
             else
             {
-                ForwardCore(tokenIds, positions, kvCache, taps, 0, dst);
+                ForwardCore(tokenIds, positions, kvCache, taps, 0, dst, lastOnly);
             }
         }
         catch
@@ -642,7 +656,7 @@ public sealed unsafe partial class NemotronHTransformerModel : IModel
     /// <summary>The forward body: logits of every row into <paramref name="logitsDest"/>; tapped layer inputs into <paramref name="taps"/> rows from <paramref name="tapRow0"/>.</summary>
     [SkipLocalsInit]
     private void ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, IKvCache? kvCache,
-                             DFlash.DFlashMtpState? taps, int tapRow0, float* logitsDest)
+                             DFlash.DFlashMtpState? taps, int tapRow0, float* logitsDest, bool lastRowOnly = false)
     {
         int seqLen = tokenIds.Length;
 
@@ -667,7 +681,6 @@ public sealed unsafe partial class NemotronHTransformerModel : IModel
         float* residual = (float*)_state.Residual;
         float* normOut = (float*)_state.NormOutput;
         float* ffnMid = (float*)_state.FfnIntermediate;
-        float* logits = (float*)_state.Logits;
         byte* inputQ8Scratch = (byte*)_state.InputQ8Scratch;
         float* q = (float*)_state.QScratch;
         float* k = (float*)_state.KScratch;
@@ -738,7 +751,12 @@ public sealed unsafe partial class NemotronHTransformerModel : IModel
 
         if (taps is not null) CaptureDFlashTaps(taps, _layers.Length, hidden, seqLen, tapRow0);
 
-        for (int t = 0; t < seqLen; t++)
+        if (logitsDest is null) return;   // a row-by-row row whose logits nobody reads (#1485)
+
+        // The head writes straight into the caller-owned result: no model-state logits buffer, no rows*V*4 copy (#1485).
+        int headRows = lastRowOnly ? 1 : seqLen;
+        int firstRow = seqLen - headRows;
+        for (int t = firstRow; t < seqLen; t++)
         {
             RmsNorm.Execute(
                 new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
@@ -746,10 +764,8 @@ public sealed unsafe partial class NemotronHTransformerModel : IModel
                 new Span<float>(hidden + t * hiddenSize, hiddenSize));
         }
 
-        Gemm(_outputWeight, _outputQuantType, hidden, logits,
-             _outputOutputDim, _outputInputDim, seqLen, preQuantizedInput: null);
-
-        new Span<float>(logits, seqLen * vocabSize).CopyTo(new Span<float>(logitsDest, seqLen * vocabSize));
+        Gemm(_outputWeight, _outputQuantType, hidden + (long)firstRow * hiddenSize, logitsDest,
+             _outputOutputDim, _outputInputDim, headRows, preQuantizedInput: null);
     }
 
     /// <summary>
@@ -760,10 +776,14 @@ public sealed unsafe partial class NemotronHTransformerModel : IModel
     /// </summary>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache, ISsmState? ssmState)
+        => ForwardWithSsm(tokenIds, positions, deviceId, kvCache, ssmState, lastTokenLogitsOnly: false);
+
+    private ITensor ForwardWithSsm(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                                   int deviceId, IKvCache? kvCache, ISsmState? ssmState, bool lastTokenLogitsOnly)
     {
         SsmStateCache? prev = _activeSsm;
         _activeSsm = ResolveSsm(ssmState);
-        try { return Forward(tokenIds, positions, deviceId, kvCache); }
+        try { return ForwardWithTaps(tokenIds, positions, deviceId, kvCache, taps: null, lastTokenLogitsOnly); }
         finally { _activeSsm = prev; }
     }
 
@@ -835,7 +855,7 @@ public sealed unsafe partial class NemotronHTransformerModel : IModel
         for (int i = 0; i < requests.Count; i++)
         {
             var r = requests[i];
-            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.SsmState);
+            results[i] = ForwardWithSsm(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.SsmState, r.LastTokenLogitsOnly);
         }
         return results;
     }
