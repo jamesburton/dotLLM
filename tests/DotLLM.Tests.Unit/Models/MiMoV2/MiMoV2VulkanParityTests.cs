@@ -28,7 +28,7 @@ public sealed class MiMoV2VulkanParityTests
     private static readonly int[] Ids16 = MiMoV2SyntheticGoldenTests.Ids;
 
     private static (float[] Cpu, float[] Vk, int Vocab) Run(SyntheticMiMoV2Gguf.Options options, int[] ids, bool vkDecode = false,
-        Func<ModelConfig, ModelConfig>? mutateVk = null)
+        Func<ModelConfig, ModelConfig>? mutateVk = null, bool cpuF32Activations = false)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         string path = Path.Combine(Path.GetTempPath(), $"dotllm-mimo2-vk-{Guid.NewGuid():N}.gguf");
@@ -39,11 +39,15 @@ public sealed class MiMoV2VulkanParityTests
             ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
             int[] pos = Enumerable.Range(0, ids.Length).ToArray();
             float[] cpu;
-            using (var cpuModel = TransformerModel.LoadFromGguf(gguf, cfg, ThreadingConfig.SingleThreaded))
+            bool savedF32Act = DotLLM.Cpu.Kernels.MoeSwiGluMlp.DiagF32Activations;
+            try
             {
+                DotLLM.Cpu.Kernels.MoeSwiGluMlp.DiagF32Activations = cpuF32Activations;
+                using var cpuModel = TransformerModel.LoadFromGguf(gguf, cfg, ThreadingConfig.SingleThreaded);
                 using ITensor t = cpuModel.Forward(ids, pos, deviceId: -1);
                 cpu = Copy(t);
             }
+            finally { DotLLM.Cpu.Kernels.MoeSwiGluMlp.DiagF32Activations = savedF32Act; }
             var vkCfg = mutateVk is null ? cfg : mutateVk(cfg);
             using var vk = VulkanTransformerModel.LoadFromGguf(gguf, vkCfg, spvDir);
             float[] vkLogits;
@@ -146,17 +150,35 @@ public sealed class MiMoV2VulkanParityTests
         AssertRowsAgree(vk, cpu, vocab);
     }
 
+    private static double MedianKl(float[] a, float[] reference, int vocab)
+    {
+        var (rk, _) = PerRow(a, reference, vocab);
+        return rk.OrderBy(x => x).ToArray()[rk.Length / 2];
+    }
+
+    /// <summary>
+    /// #1277. The reference is the CPU run with F32 activations (<see cref="DotLLM.Cpu.Kernels.MoeSwiGluMlp.DiagF32Activations"/>: the weights are
+    /// dequantised and dotted with the UNQUANTISED activation - the F32-decoded control). The default CPU path quantises every expert input to Q8_K (llama.cpp
+    /// behaviour; since #958 that includes the IQ1_M gate/up), and on a random-weight MoE the rounding flips top-k expert choices on whole rows: measured
+    /// median per-row KL vs the F32-activation CPU 1.5e-3 (IQ1_M/IQ2_XXS) and 3.3e-2 (IQ1_M/IQ3_S), while the Vulkan kernels (which do not quantise to Q8_K) sit at
+    /// ~1e-6 of the same reference. Comparing against the Q8_K CPU path therefore measured the CPU's activation rounding, not a Vulkan defect. The Q8_K CPU kernels
+    /// themselves are oracle-tested in IQCodebookDotTests. The Q8_K deviation is still printed so a change in it is visible.
+    /// </summary>
     [SkippableTheory]
     [InlineData(QuantizationType.IQ1_M, QuantizationType.IQ2_XXS, false)]
     [InlineData(QuantizationType.IQ1_M, QuantizationType.IQ2_XS, true)]
     [InlineData(QuantizationType.IQ1_M, QuantizationType.IQ3_S, false)]
+    [InlineData(QuantizationType.IQ1_M, QuantizationType.IQ3_S, true)]
     public void IqBanks_MatchCpu(QuantizationType gateUp, QuantizationType down, bool decode)
     {
         var o = new SyntheticMiMoV2Gguf.Options { HiddenSize = 256, ExpertFf = 256, DenseFfWidth = 256, GateUpQuant = gateUp, DownQuant = down, RouterStd = 0.15f };
-        var (cpu, vk, vocab) = Run(o, Ids16, vkDecode: decode);
-        Report($"{gateUp}/{down} {(decode ? "decode" : "prefill")}", cpu, vk, vocab);
-        // The IQ MMVQ / grouped kernels quantise the activation (Q8_1 / F16 inputs) where the CPU path uses Q8_K: noise, not a defect.
-        AssertRowsAgree(vk, cpu, vocab);
+        var (cpuF32, vk, vocab) = Run(o, Ids16, vkDecode: decode, cpuF32Activations: true);
+        Report($"{gateUp}/{down} {(decode ? "decode" : "prefill")} vs F32-activation CPU", cpuF32, vk, vocab);
+        var (cpuQ8K, _, _) = Run(o, Ids16, vkDecode: decode);
+        string line = $"[mimo2 vulkan {gateUp}/{down}] median KL: Vulkan vs F32-act CPU {MedianKl(vk, cpuF32, vocab):E2}, Q8_K CPU vs F32-act CPU {MedianKl(cpuQ8K, cpuF32, vocab):E2}";
+        _output.WriteLine(line); Console.WriteLine(line);
+        // Prefill (grouped coopmat, F16 inputs) measured 1e-6 of this reference; decode (MMVQ quantises the activation to Q8_1) 5e-4..1e-3.
+        AssertRowsAgree(vk, cpuF32, vocab, medianLimit: decode ? 5e-3 : 1e-4);
     }
 
     [SkippableTheory]
