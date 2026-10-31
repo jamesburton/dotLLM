@@ -358,6 +358,8 @@ internal static class Program
             for (int i = 0; i < 5; i++) EmbedOne(emb, docs[i], h, pooling, vec, posBuf);
             var ms = new List<double>();
             foreach (var d in docs) { var t0 = Stopwatch.GetTimestamp(); EmbedOne(emb, d, h, pooling, vec, posBuf); ms.Add(Stopwatch.GetElapsedTime(t0).TotalMilliseconds); }
+            if (Environment.GetEnvironmentVariable("EMB_RAW") == "1")
+                Console.Error.WriteLine("raw seq=" + docs[0].Length + " order: " + string.Join(" ", ms.Select((v, i) => v > 4 * ms.OrderBy(x => x).ElementAt(ms.Count / 2) ? $"#{i}={v:F0}" : null).Where(x => x != null)));
             ms.Sort();
             Emit(new { mode = "latency", model = label, threads = threads == 0 ? Environment.ProcessorCount : threads, seq = docs[0].Length, iters,
                 p50_ms = Pct(ms, .5), p90_ms = Pct(ms, .9), p99_ms = Pct(ms, .99), min_ms = ms[0], max_ms = ms[^1] });
