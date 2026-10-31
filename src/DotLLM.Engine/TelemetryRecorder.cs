@@ -29,7 +29,10 @@ internal struct TelemetryRecorder
                           || EngineTelemetry.DecodeTokens.Enabled
                           || EngineTelemetry.PrefillTokensPerSecond.Enabled
                           || EngineTelemetry.DecodeTokensPerSecond.Enabled
-                          || EngineTelemetry.TimeToFirstTokenMs.Enabled;
+                          || EngineTelemetry.TimeToFirstTokenMs.Enabled
+                          || EngineTelemetry.Requests.Enabled
+                          || EngineTelemetry.RequestDurationMs.Enabled
+                          || EngineTelemetry.CachedTokens.Enabled;
         _activitiesEnabled = EngineTelemetry.ActivitySource.HasListeners();
 
         _modelTag = new KeyValuePair<string, object?>(TelemetryTags.Model, config.Architecture.ToString());
@@ -88,20 +91,9 @@ internal struct TelemetryRecorder
     {
         if (_metricsEnabled)
         {
-            int prefillEffective = promptTokens - cachedTokens;
-            if (prefillEffective > 0)
-            {
-                EngineTelemetry.PrefillTokens.Add(prefillEffective, _modelTag);
-                if (prefillMs > 0)
-                    EngineTelemetry.PrefillTokensPerSecond.Record(prefillEffective / (prefillMs / 1000.0), _modelTag);
-            }
-            int decodeEffective = generatedTokens > 1 ? generatedTokens - 1 : 0;
-            if (decodeEffective > 0)
-            {
-                EngineTelemetry.DecodeTokens.Add(decodeEffective, _modelTag);
-                if (decodeMs > 0)
-                    EngineTelemetry.DecodeTokensPerSecond.Record(decodeEffective / (decodeMs / 1000.0), _modelTag);
-            }
+            double totalMs = _requestStartTicks == 0 ? 0 : (Stopwatch.GetTimestamp() - _requestStartTicks) * 1000.0 / Stopwatch.Frequency;
+            EngineTelemetry.RecordCompletion((string)_modelTag.Value!, promptTokens, cachedTokens, generatedTokens,
+                prefillMs, decodeMs, totalMs, finishReason.ToString());
         }
 
         if (RequestSpan is { IsAllDataRequested: true })

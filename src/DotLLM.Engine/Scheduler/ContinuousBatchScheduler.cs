@@ -1769,6 +1769,11 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         };
 
         RecordPerKeyTokens(seq.Request.ApiKey, seq.GeneratedTokens.Count);
+        // (#1344) Same per-request series the TextGenerator path emits, so /metrics is not empty under the scheduler.
+        if (EngineTelemetry.Requests.Enabled || EngineTelemetry.PrefillTokens.Enabled || EngineTelemetry.DecodeTokens.Enabled)
+            EngineTelemetry.RecordCompletion(_model.Config.Architecture.ToString(), seq.PromptLength, seq.PrefixCachedTokens,
+            seq.GeneratedTokens.Count, timings.PrefillTimeMs, timings.DecodeTimeMs,
+            timings.PrefillTimeMs + timings.DecodeTimeMs, seq.FinishReason.ToString());
 
         EmitFinalStreamToken(seq, response);
         ReleaseKvCache(seq);

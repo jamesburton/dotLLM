@@ -66,6 +66,59 @@ public static class EngineTelemetry
         "dotllm.engine.time_to_first_token_ms", unit: "ms",
         description: "Time from request start to first generated token.");
 
+    /// <summary>Counter — completed requests, tagged by <c>model</c> and <c>finish_reason</c> (#1344).</summary>
+    public static readonly Counter<long> Requests = Meter.CreateCounter<long>(
+        "dotllm.engine.requests", unit: "{request}",
+        description: "Completed generation requests by finish reason.");
+
+    /// <summary>Histogram — end-to-end request duration in milliseconds (#1344).</summary>
+    public static readonly Histogram<double> RequestDurationMs = Meter.CreateHistogram<double>(
+        "dotllm.engine.request.duration_ms", unit: "ms",
+        description: "Wall time of a completed generation request (prefill + decode).");
+
+    /// <summary>Counter — prompt tokens served from the prefix cache instead of being prefilled (#1344).</summary>
+    public static readonly Counter<long> CachedTokens = Meter.CreateCounter<long>(
+        "dotllm.engine.tokens.cached", unit: "tokens",
+        description: "Prompt tokens reused from the prefix cache.");
+
+    /// <summary>
+    /// Records every per-request counter and histogram for one finished request. Each instrument is guarded by its own
+    /// <c>Enabled</c> check, so with no listener this is a handful of branches and no allocation.
+    /// </summary>
+    /// <param name="model">Model tag value (architecture name).</param>
+    /// <param name="promptTokens">Prompt length including cached tokens.</param>
+    /// <param name="cachedTokens">Prompt tokens reused from the prefix cache.</param>
+    /// <param name="generatedTokens">Tokens generated (the first comes from prefill).</param>
+    /// <param name="prefillMs">Prefill wall time.</param>
+    /// <param name="decodeMs">Decode wall time.</param>
+    /// <param name="totalMs">Request wall time; values at or below zero skip the duration histogram.</param>
+    /// <param name="finishReason">Finish reason name (<c>Stop</c>, <c>Length</c>, ...).</param>
+    public static void RecordCompletion(string model, int promptTokens, int cachedTokens, int generatedTokens,
+        double prefillMs, double decodeMs, double totalMs, string finishReason)
+    {
+        var modelTag = new KeyValuePair<string, object?>(TelemetryTags.Model, model);
+
+        int prefillEffective = promptTokens - cachedTokens;
+        if (prefillEffective > 0)
+        {
+            if (PrefillTokens.Enabled) PrefillTokens.Add(prefillEffective, modelTag);
+            if (prefillMs > 0 && PrefillTokensPerSecond.Enabled)
+                PrefillTokensPerSecond.Record(prefillEffective / (prefillMs / 1000.0), modelTag);
+        }
+        int decodeEffective = generatedTokens > 1 ? generatedTokens - 1 : 0;
+        if (decodeEffective > 0)
+        {
+            if (DecodeTokens.Enabled) DecodeTokens.Add(decodeEffective, modelTag);
+            if (decodeMs > 0 && DecodeTokensPerSecond.Enabled)
+                DecodeTokensPerSecond.Record(decodeEffective / (decodeMs / 1000.0), modelTag);
+        }
+        if (cachedTokens > 0 && CachedTokens.Enabled) CachedTokens.Add(cachedTokens, modelTag);
+        if (Requests.Enabled)
+            Requests.Add(1, modelTag, new KeyValuePair<string, object?>("finish_reason", finishReason));
+        if (totalMs > 0 && RequestDurationMs.Enabled)
+            RequestDurationMs.Record(totalMs, modelTag);
+    }
+
     private static Func<long>? s_queueDepthProvider;
     private static Func<double>? s_kvCacheUtilizationProvider;
 

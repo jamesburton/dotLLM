@@ -1346,6 +1346,10 @@ Ensures first real request doesn't pay JIT compilation or CUDA kernel loading pe
   `max_context` (served window after the fit), `n_ctx_train`, `slots` (concurrent requests: the scheduler's
   `MaxActiveSequences`, else 1) and `prompt_cache_active` (#1289): `{"status":"ok","max_context":8192,...}`.
 - `GET /ready` — Returns 200 only after warm-up completes and model is loaded. Used by load balancers.
+- `GET /metrics` — Prometheus text exposition (#1344), served in-process from the `DotLLM.*` meters (no exporter
+  package, no extra port). **On by default only for loopback binds** (`localhost`, `127.x`, `::1`); on any other
+  `--host` it is off unless `--metrics` is passed, and `--no-metrics` turns it off everywhere. It sits outside `/v1/`,
+  so it is never rate limited. Series and naming rules: [TELEMETRY.md](TELEMETRY.md#prometheus-scrape-endpoint-get-metrics).
 
 ## Security
 
