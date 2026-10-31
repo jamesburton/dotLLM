@@ -47,7 +47,8 @@ public sealed unsafe class ActivationQuantizerRoundingTests
         fixed (byte* pc = c)
         {
             MatMul.QuantizeF32ToQ8_0Scalar(src, pa, x.Length);
-            MatMul.QuantizeF32ToQ8_0Avx2(src, pb, x.Length);
+            if (System.Runtime.Intrinsics.X86.Avx2.IsSupported) MatMul.QuantizeF32ToQ8_0Avx2(src, pb, x.Length);
+            else Buffer.BlockCopy(a, 0, b, 0, a.Length);
             if (System.Runtime.Intrinsics.X86.Avx512BW.IsSupported) MatMul.QuantizeF32ToQ8_0Avx512(src, pc, x.Length);
             else Buffer.BlockCopy(a, 0, c, 0, a.Length);
         }
