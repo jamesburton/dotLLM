@@ -541,6 +541,33 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         float softCap = 0.0f, float scaleOverride = 0.0f,
         AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
     {
+        RecordCore(cmdBuf, q, k, v, output, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, slidingWindow, useAlibi,
+            softCap, scaleOverride, maskMode, prefixLen, 0, 0, 0, 0);
+    }
+
+    /// <summary>
+    /// Records one causal attention dispatch over a SLICE of the activation buffers (#1437): Q rows start at byte
+    /// <paramref name="qOffset"/> of <paramref name="q"/>, K/V rows at <paramref name="kvOffset"/>, the output at
+    /// <paramref name="outOffset"/>. One call per document of a packed embedding forward, so a query never sees another document's keys.
+    /// Offsets are bound as sub-range descriptors (multiples of 256 bytes); no copies, no extra storage.
+    /// </summary>
+    internal unsafe void RecordSlice(
+        nint cmdBuf,
+        VulkanDevice.Buffer q, long qOffset, VulkanDevice.Buffer k, VulkanDevice.Buffer v, long kvOffset,
+        VulkanDevice.Buffer output, long outOffset,
+        int seqLen, int numHeads, int numKvHeads, int headDim, float scaleOverride = 0.0f)
+        => RecordCore(cmdBuf, q, k, v, output, seqLen, seqLen, numHeads, numKvHeads, headDim, 0, 0, false, 0.0f, scaleOverride,
+            AttentionMaskMode.Causal, 0, qOffset, kvOffset, kvOffset, outOffset);
+
+    private unsafe void RecordCore(
+        nint cmdBuf,
+        VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer v, VulkanDevice.Buffer output,
+        int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
+        int positionOffset, int slidingWindow, bool useAlibi,
+        float softCap, float scaleOverride,
+        AttentionMaskMode maskMode, int prefixLen,
+        long qOff, long kOff, long vOff, long outOff)
+    {
         if (seqQ <= 0) throw new ArgumentOutOfRangeException(nameof(seqQ));
         if (seqKv <= 0) throw new ArgumentOutOfRangeException(nameof(seqKv));
         if (numHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numHeads));
@@ -565,10 +592,10 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         long qBytes   = (long)seqQ  * numHeads   * headDim * sizeof(float);
         long kvBytes  = (long)seqKv * numKvHeads * headDim * KvStorage.ElementBytes();
         long outBytes = qBytes;
-        if (q.Size      < qBytes)   throw new ArgumentException("Q buffer too small.",      nameof(q));
-        if (k.Size      < kvBytes)  throw new ArgumentException("K buffer too small.",      nameof(k));
-        if (v.Size      < kvBytes)  throw new ArgumentException("V buffer too small.",      nameof(v));
-        if (output.Size < outBytes) throw new ArgumentException("Output buffer too small.", nameof(output));
+        if (q.Size - qOff      < qBytes)   throw new ArgumentException("Q buffer too small.",      nameof(q));
+        if (k.Size - kOff      < kvBytes)  throw new ArgumentException("K buffer too small.",      nameof(k));
+        if (v.Size - vOff      < kvBytes)  throw new ArgumentException("V buffer too small.",      nameof(v));
+        if (output.Size - outOff < outBytes) throw new ArgumentException("Output buffer too small.", nameof(output));
 
         // Issue #378: route headDim<=64 models with enough KV-tile iterations
         // to amortize the occupancy gain to the LDS-halved hd64 shader.
@@ -579,7 +606,13 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         DescriptorSetCache descriptorCache = useHd256 ? _hd256DescriptorCache! : useHd64 ? _hd64DescriptorCache! : _descriptorCache;
 
         Span<nint> buffers = stackalloc nint[4] { q.Handle, k.Handle, v.Handle, output.Handle };
-        nint descriptorSet = descriptorCache.GetOrCreate(buffers);
+        nint descriptorSet;
+        if ((qOff | kOff | vOff | outOff) == 0) descriptorSet = descriptorCache.GetOrCreate(buffers);
+        else
+        {
+            Span<ulong> offs = stackalloc ulong[4] { (ulong)qOff, (ulong)kOff, (ulong)vOff, (ulong)outOff };
+            descriptorSet = descriptorCache.GetOrCreateWithOffsets(buffers, offs);
+        }
 
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, pipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(

@@ -21,6 +21,7 @@ using DotLLM.Engine.Embeddings;
 using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Vulkan;
 
 namespace EmbeddingBench;
 
@@ -65,7 +66,9 @@ internal static class Program
         BertEncoderModel.UseErfGelu = opt.GetValueOrDefault("erf-gelu", "0") == "1";   // exact-erf GELU (HF) instead of llama.cpp tanh
         BertEncoderModel.UseLegacyGelu = opt.GetValueOrDefault("legacy-gelu", "0") == "1";   // #1403 A/B arm
         BertEncoderModel.UseLegacyAttention = opt.GetValueOrDefault("legacy-attn", "0") == "1";   // #1402 A/B arm
-        var (model, gguf, config) = ModelLoader.LoadFromGguf(path, new ThreadingConfig(threads, threads));
+        var (model, gguf, config) = opt.GetValueOrDefault("device", "cpu") == "vulkan"
+            ? LoadVulkan(path)
+            : ModelLoader.LoadFromGguf(path, new ThreadingConfig(threads, threads));
         using (gguf) using (model)
         {
             if (model is not IEmbeddingModel emb) { Console.Error.WriteLine($"{config.Architecture} has no IEmbeddingModel"); return 2; }
@@ -75,6 +78,7 @@ internal static class Program
             switch (mode)
             {
                 case "throughput": Throughput(label, emb, tok, config, pooling, Ints("batches", "1,8,32,128"), Ints("seqs", "64,256,512"), cellSec, threads); break;
+                case "vkpack": VulkanPack(label, emb, tok, config, pooling, Ints("seqs", "16,32,64"), Ints("packs", "1,2,4,8,16,32"), int.Parse(opt.GetValueOrDefault("iters", "20")), opt.GetValueOrDefault("proxy", "0") == "1"); break;
                 case "batch": BatchThroughput(label, emb, tok, config, Ints("batches", "1,8,32,128"), Ints("seqs", "64,256"), cellSec, threads); break;
                 case "latency": Latency(label, emb, tok, config, pooling, Ints("seqs", "16,64,256"), int.Parse(opt.GetValueOrDefault("iters", "200")), threads); break;
                 case "profile": Profile(label, emb, tok, config, pooling, Ints("seqs", "64,256,512"), int.Parse(opt.GetValueOrDefault("iters", "10"))); break;
@@ -86,6 +90,44 @@ internal static class Program
             }
         }
         return 0;
+    }
+
+    private static (IModel, GgufFile, ModelConfig) LoadVulkan(string path)
+    {
+        var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        return (VulkanTransformerModel.LoadFromGguf(gguf, config, VulkanModelLoader.ResolveSpvDir()), gguf, config);
+    }
+
+    /// <summary>
+    /// #1437: per-document cost of <c>ForwardHiddenForPooling</c> for pack-sized groups of seq-token documents (one call = whole group).
+    /// With <paramref name="proxy"/> the group is instead ONE sequence of pack x seq tokens: an upper bound on a packed forward
+    /// (full causal attention over the concatenation, no block-diagonal saving).
+    /// </summary>
+    private static void VulkanPack(string label, IEmbeddingModel emb, ITokenizer rawTok, ModelConfig cfg, PoolingType pooling,
+        int[] seqs, int[] packs, int iters, bool proxy)
+    {
+        var tk = new Tk(rawTok);
+        foreach (int seq in seqs)
+            foreach (int pack in packs)
+            {
+                if (proxy && pack * seq > cfg.MaxSequenceLength) continue;
+                var docs = proxy ? MakeDocs(tk, 8, pack * seq, 5) : MakeDocs(tk, pack, seq, 5);
+                IReadOnlyList<int[]> group = proxy ? [docs[0]] : docs;
+                int docsPerCall = proxy ? pack : pack;
+                emb.ForwardHiddenForPooling(group, pooling, (_, _) => { }, 0);
+                emb.ForwardHiddenForPooling(group, pooling, (_, _) => { }, 0);
+                var ms = new List<double>();
+                for (int i = 0; i < iters; i++)
+                {
+                    var t0 = Stopwatch.GetTimestamp();
+                    emb.ForwardHiddenForPooling(group, pooling, (_, _) => { }, 0);
+                    ms.Add(Stopwatch.GetElapsedTime(t0).TotalMilliseconds);
+                }
+                ms.Sort();
+                Emit(new { mode = "vkpack", model = label, proxy, seq = docs[0].Length / (proxy ? pack : 1), pack, call_ms_min = ms[0], call_ms_med = ms[ms.Count / 2], call_ms_max = ms[^1],
+                    per_doc_ms_med = ms[ms.Count / 2] / docsPerCall, docs_s_med = docsPerCall * 1000.0 / ms[ms.Count / 2] });
+            }
     }
 
     /// <summary>Token id appended to every dump input (Qwen3-Embedding: the reference appends &lt;|endoftext|&gt; but the GGUF tokenizer does not).</summary>
