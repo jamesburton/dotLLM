@@ -44,6 +44,16 @@ public sealed class ModelLoadSelectionTests : IDisposable
         Assert.Equal(8, ModelManagementEndpoint.ResolveRequestedGpuLayers(null, null, 8));
     }
 
+    [Theory]
+    [InlineData(null, null, null)]          // omitted + no startup default: the model's own default
+    [InlineData(null, "q8_0", "q8_0")]      // omitted: the operator's startup default (never the previous model's choice)
+    [InlineData("auto", "q8_0", null)]      // explicit auto: reset to the model default, ignoring the startup default
+    [InlineData("AUTO", null, null)]
+    [InlineData("", "q8_0", null)]
+    [InlineData("f16", "q8_0", "f16")]      // explicit choice wins
+    public void ResolveRequestedCacheType_DistinguishesOmittedFromExplicitAuto(string? request, string? startup, string? expected) =>
+        Assert.Equal(expected, ModelManagementEndpoint.ResolveRequestedCacheType(request, startup));
+
     [Fact]
     public void ResolveExactPath_ReturnsChosenFile_NotLargestSibling()
     {

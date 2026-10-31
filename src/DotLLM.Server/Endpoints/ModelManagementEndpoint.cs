@@ -39,6 +39,17 @@ public static class ModelManagementEndpoint
     internal static int? ResolveRequestedGpuLayers(int? request, int? profile, int? startup) =>
         request is < 0 ? null : request ?? profile ?? startup;
 
+    /// <summary>
+    /// KV cache type for a load (#1416). Omitted field: the operator's startup default (never the previous model's
+    /// per-load choice). Explicit <c>auto</c>/empty: no override, so the model/backend picks its supported default.
+    /// Anything else: that explicit choice.
+    /// </summary>
+    internal static string? ResolveRequestedCacheType(string? request, string? startup)
+    {
+        if (request is null) return startup;
+        return request.Length == 0 || string.Equals(request, "auto", StringComparison.OrdinalIgnoreCase) ? null : request;
+    }
+
     public static void Map(WebApplication app)
     {
         app.MapGet("/v1/models/available", (ServerState state) =>
@@ -109,8 +120,8 @@ public static class ModelManagementEndpoint
                         Quant = request.Quant,
                         Device = loadDevice,
                         GpuLayers = loadGpuLayers,
-                        CacheTypeK = request.CacheTypeK ?? state.Options.CacheTypeK,
-                        CacheTypeV = request.CacheTypeV ?? state.Options.CacheTypeV,
+                        CacheTypeK = ResolveRequestedCacheType(request.CacheTypeK, state.Options.StartupCacheTypeK),
+                        CacheTypeV = ResolveRequestedCacheType(request.CacheTypeV, state.Options.StartupCacheTypeV),
                         Threads = request.Threads ?? state.Options.Threads,
                         DecodeThreads = request.DecodeThreads ?? state.Options.DecodeThreads,
                         SpeculativeModel = request.SpeculativeModel,
