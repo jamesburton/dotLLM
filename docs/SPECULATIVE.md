@@ -614,7 +614,7 @@ the bandwidth floor at 2..4 columns (150-160 GB/s vs 203-212 at n=1); that, not 
 **Re-measure vs llama.cpp after #1510 (issue #1220, dev `e4a66e0f`).** Strix Halo 8060S Vulkan, Qwen3.8-27B Q4_K_M + `mtp-Qwen3.8-27B-Q8_0.gguf` /
 DFlash2 Q4_K_M, the same 4 prompts x 128 greedy tokens, `DOTLLM_MTP_ADAPTIVE=0`, one process per run, llama.cpp `0ae0e1976` Vulkan `llama-server`
 (`cache_prompt=false`, top_k 1). 3 reps; each (prompt, arm) is a dotLLM/llama.cpp pair, order dotLLM-first in reps 1 and 3 and llama.cpp-first in rep 2.
-GPU lock and `cpu-bench` held, ollama idle. Mean of the 4 prompts' tok/s (median-free, range = min..max over the 3 reps of that mean):
+GPU lock and `cpu-bench` held, ollama idle. Mean of the 4 prompts' tok/s (range = min..max over the 3 reps of that mean):
 
 | arm | dotLLM tok/s | llama.cpp tok/s | dotLLM / llama.cpp (per-rep) | peak private / GPU shared MiB dotLLM | llama.cpp |
 |---|---|---|---|---|---|
