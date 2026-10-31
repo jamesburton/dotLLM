@@ -238,12 +238,31 @@ internal sealed unsafe class TransformerForwardState : IDisposable
         FfnGate = AllocFloats(newCapacity * _intermediateSize);
         FfnUp = AllocFloats(newCapacity * _intermediateSize);
         SiluOutput = AllocFloats(newCapacity * _intermediateSize);
-        Logits = AllocFloats((long)newCapacity * _vocabSize); // All positions' logits for speculative verify
-
         InputQ8Scratch = AllocBytes((long)newCapacity * InputScratchRowBytes);
 
         _currentSeqLen = newCapacity;
     }
+
+    /// <summary>
+    /// Ensures <see cref="Logits"/> holds <paramref name="rows"/> rows of <c>vocab</c> F32 (issue #1137). The buffer follows the rows the
+    /// LM head actually computes (1 for a last-row prefill or a decode, k+1 for an MTP verify, every row only for a caller that asked
+    /// for all of them) rather than the batch's token capacity, so a 2048-token last-row prefill no longer reserves
+    /// <c>2048 x vocab x 4</c> bytes (1 GiB on Llama-3.1-8B). Power-of-2 growth; contents are not preserved (the head rewrites them).
+    /// </summary>
+    public void EnsureLogitsCapacity(int rows)
+    {
+        if (rows <= _logitsRows)
+            return;
+        int newRows = (int)BitOperations.RoundUpToPowerOf2((uint)rows);
+        FreeIfNonZero(ref Logits);
+        Logits = AllocFloats((long)newRows * _vocabSize);
+        _logitsRows = newRows;
+    }
+
+    private int _logitsRows;
+
+    /// <summary>Rows currently reserved for <see cref="Logits"/>.</summary>
+    public int LogitsRowCapacity => _logitsRows;
 
     private static nint AllocFloats(long count) => AllocBytes(count * sizeof(float));
 
@@ -264,7 +283,6 @@ internal sealed unsafe class TransformerForwardState : IDisposable
         FreeIfNonZero(ref FfnGate);
         FreeIfNonZero(ref FfnUp);
         FreeIfNonZero(ref SiluOutput);
-        FreeIfNonZero(ref Logits);
         FreeIfNonZero(ref InputQ8Scratch);
     }
 
@@ -279,6 +297,8 @@ internal sealed unsafe class TransformerForwardState : IDisposable
 
     public void Dispose()
     {
+        FreeIfNonZero(ref Logits);
+        _logitsRows = 0;
         FreeBuffers();
         _currentSeqLen = 0;
     }
