@@ -93,6 +93,86 @@ public class VulkanDenseGemvRowsTests
         }
     }
 
+    /// <summary>
+    /// #1511: the pipelined 16-byte-load Q4_K shader must give exactly the bits of the original scalar-load kernel. The oracle replays its arithmetic on
+    /// the CPU: lane l of a 64-lane workgroup owns super-blocks l/32, l/32 + 2, ... , sub-block (l%32)/4 and elements 8q..8q+7, accumulates with one
+    /// fused multiply-add per element in that order, and the lanes are summed by the fixed halving tree. Odd K block counts (3, 5) exercise the
+    /// half-window tail, 1 and 2 blocks the pipeline prologue.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(37, 768, 1, 2)]
+    [InlineData(37, 768, 4, 3)]
+    [InlineData(21, 1280, 4, 5)]
+    [InlineData(21, 256, 3, 2)]
+    [InlineData(21, 512, 4, 4)]
+    [InlineData(18, 5120, 4, 12)]
+    [InlineData(18, 2560, 3, 16)]
+    public void Q4KRows_MatchLaneOrderFmaOracleExactly(int m, int k, int rowsPerWorkgroup, int n)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        var rng = new Random(0x1511 + m * 7 + k * 11 + n * 13);
+        float[] w = F16Bf16Fixture.RandomFloats(rng, m * k, 0.1f);
+        float[] x = F16Bf16Fixture.RandomFloats(rng, n * k, 1.0f);
+        byte[] wq = Quantize.FromFloat32(w, (long)m * k, QuantizationType.Q4_K);
+        using var rows = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q4_K, rowsPerWorkgroup, rowsPerWorkgroup, rowsPerWorkgroup)
+                         ?? throw new Xunit.Sdk.XunitException("matmul_q4_k_gemv_f32_multi.spv unavailable");
+        using var bw = device.Allocate(((long)wq.Length + 3) & ~3L);
+        using var bx = device.Allocate((long)n * k * 4);
+        using var by = device.Allocate((long)n * m * 4);
+        device.Upload(new ReadOnlySpan<byte>(wq), bw);
+        device.Upload(x, bx);
+        using (var ctx = device.CreateSubmitContext())
+        {
+            ctx.Begin();
+            if (n == 1) rows.Record(ctx.CommandBuffer, bw, bx, by, m, k, 1); else rows.Record(ctx.CommandBuffer, bw, bx, by, m, k, n);
+            ctx.SubmitAndWait();
+        }
+        float[] actual = new float[n * m];
+        device.Download(by, actual);
+        int nb = k / 256;
+        for (int c = 0; c < n; c++)
+            for (int r = 0; r < m; r++)
+            {
+                float expected = Q4KLaneOrderDot(wq, r, nb, x.AsSpan(c * k, k));
+                Assert.Equal(BitConverter.SingleToInt32Bits(expected), BitConverter.SingleToInt32Bits(actual[c * m + r]));
+            }
+    }
+
+    private static float Q4KLaneOrderDot(byte[] wq, int row, int nb, ReadOnlySpan<float> x)
+    {
+        Span<float> partial = stackalloc float[64];
+        for (int lane = 0; lane < 64; lane++)
+        {
+            int sb = (lane & 31) >> 2, q = lane & 3, shift = (sb & 1) * 4;
+            float acc = 0f;
+            for (int blk = lane >> 5; blk < nb; blk += 2)
+            {
+                int o = (row * nb + blk) * 144;
+                float d = (float)BitConverter.ToHalf(wq, o), dmin = (float)BitConverter.ToHalf(wq, o + 2);
+                int sc, mn;
+                if (sb < 4) { sc = wq[o + 4 + sb] & 63; mn = wq[o + 4 + sb + 4] & 63; }
+                else
+                {
+                    int hi = wq[o + 4 + sb + 4];
+                    sc = (hi & 0xF) | (((wq[o + 4 + sb - 4] >> 6) & 3) << 4);
+                    mn = ((hi >> 4) & 0xF) | (((wq[o + 4 + sb] >> 6) & 3) << 4);
+                }
+                float scale = d * sc, min = dmin * mn;
+                for (int e = 0; e < 8; e++)
+                {
+                    int code = (wq[o + 16 + (sb >> 1) * 32 + 8 * q + e] >> shift) & 0xF;
+                    float wv = MathF.FusedMultiplyAdd(scale, code, -min);
+                    acc = MathF.FusedMultiplyAdd(wv, x[blk * 256 + sb * 32 + 8 * q + e], acc);
+                }
+            }
+            partial[lane] = acc;
+        }
+        for (int stride = 32; stride > 0; stride >>= 1)
+            for (int l = 0; l < stride; l++) partial[l] += partial[l + stride];
+        return partial[0];
+    }
+
     [SkippableTheory]
     [InlineData(37, 5120, 2, 2)]
     [InlineData(37, 5120, 4, 3)]   // M % NR != 0
