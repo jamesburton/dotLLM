@@ -56,13 +56,13 @@ public sealed class MatMulMmqCm1Kernel : IDisposable
 
     /// <summary>The weight formats this kernel reads.</summary>
     /// <param name="qt">Weight format.</param>
-    /// <returns><see langword="true"/> for Q8_0, Q5_0, Q4_K and Q4_1.</returns>
+    /// <returns><see langword="true"/> for Q8_0, Q5_0, Q4_K, Q4_1 and Q4_0.</returns>
     public static bool IsSupportedQuant(QuantizationType qt)
-        => qt is QuantizationType.Q8_0 or QuantizationType.Q5_0 or QuantizationType.Q4_K or QuantizationType.Q4_1;
+        => qt is QuantizationType.Q8_0 or QuantizationType.Q5_0 or QuantizationType.Q4_K or QuantizationType.Q4_1 or QuantizationType.Q4_0;
 
     private static string SpvName(QuantizationType qt, bool grouped)
     {
-        string q = qt switch { QuantizationType.Q8_0 => "q8_0", QuantizationType.Q5_0 => "q5_0", QuantizationType.Q4_1 => "q4_1", _ => "q4_k" };
+        string q = qt switch { QuantizationType.Q8_0 => "q8_0", QuantizationType.Q5_0 => "q5_0", QuantizationType.Q4_1 => "q4_1", QuantizationType.Q4_0 => "q4_0", _ => "q4_k" };
         return grouped ? $"moe_grouped_{q}_mmq_cm1.spv" : $"matmul_{q}_mmq_cm1.spv";
     }
 

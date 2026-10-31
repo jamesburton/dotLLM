@@ -265,3 +265,18 @@ Operands are F16 (dequantised weights and activations), so logits differ from th
 * Opt-out: `DOTLLM_VK_MOE_GROUPED=0` (load time) or `VulkanTransformerModel.GroupedMoeEnabled = false` (runtime, in-process A/B).
 * Decode (S < gate) and LoRA keep the indexed MMVQ kernels. Wave64 + cooperative matrix devices only; others fall back to the scalar path.
 * Measured on gfx1151 (same session, split-submit profile): gpt-oss-20b pp512 74-82 -> 730-780 tok/s, OLMoE Q4_K_M pp512 `VK_ERROR_DEVICE_LOST` (#787) -> ~2900.
+
+## Dense Q4_0 prefill on Q8_1 activations (issue #1447)
+
+Dense Q4_0 projections at `n > 1` quantise the activations to Q8_1 (shared per q/k/v and gate/up group) and run
+`matmul_q4_0_mmq_cm1` (int8 cooperative matrices, AMD wave64; `mmq_cm1_main.glsl` MMQ_Q4_0 arm, codes recentred to `q - 8` at
+staging so there is no min term) or the dp4a `matmul_q4_0_mmq` fallback (Arc/NVIDIA; parity-tested on the 8060S only). Weights are read
+packed; no expansion. `DOTLLM_VK_Q4_0_PREFILL_Q8_1=0` restores the F16 coopmat / F32 GEMMs.
+
+Measured on the 8060S (paired in-process-env A/B, both orders, 3 rounds, `dotllm bench`, pure-Q4_0 Llama-3.2 requantised from Q8_0):
+pp128 1B 4.0-4.2k -> 6.5-6.9k tok/s, pp512 1B 6.1-6.6k -> 6.9-7.3k, pp512 3B 2.37-2.42k -> 2.78-2.82k, pp2048 1B 5.1k -> 5.4-5.5k;
+decode unchanged (3B 88-91, 1B 197-210). The kernel-level probe (`DOTLLM_GEMM_SHAPE_PROBE=1`) is only ~equal to the F16 coopmat GEMM
+(+-10 %), so the end-to-end gain comes from outside the GEMM itself (the F16 path stages F32 activations to F16 per call, and the MMQ group shares one quantize); the split was not isolated.
+wikitext-2 PPL (c512, 40k tokens, 1B): MMQ 16.614, CPU 16.614, F16 path 16.583. A 64x128 token tile did not help (unlike Q4_1).
+The GPU matches the exact `d * d_x * dot(q - 8, x)`; the CPU/llama.cpp fold the -8 into the fp16-rounded `s_x`, so a GPU-vs-CPU GEMM
+differs by up to ~1e-3 relative where activation block sums are large (a test artefact; real activations ~1e-5).

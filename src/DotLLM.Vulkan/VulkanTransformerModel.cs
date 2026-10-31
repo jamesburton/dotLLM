@@ -287,6 +287,9 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     // Q4_1 prefill on Q8_1 activations (#1235, llama.cpp's and the CPU's #1159 contract): int8 coopmat where the device has it, else dp4a.
     private MatMulMmqCm1Kernel? _matmulQ4_1MmqCm1;
     private MatMulQ4_1MmqKernel? _matmulQ4_1Mmq;
+    // Q4_0 prefill on Q8_1 activations (#1447): the same int8-coopmat / dp4a pair, d * d_x * dot(q - 8, x).
+    private MatMulMmqCm1Kernel? _matmulQ4_0MmqCm1;
+    private MatMulQ4_0MmqKernel? _matmulQ4_0Mmq;
     // Same for Q3_K (issue #598).
     private MatMulQ3KGemmCoopmatKernel? _matmulQ3KGemmCoopmat;
     // Same for IQ4_XS (issue #600).
@@ -2498,6 +2501,13 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             model._matmulQ4_0Mmvq = MatMulQ4_0MmvqKernel.TryCreate(device, spvDir);
             if (MatMulQ4_0GemmCoopmatKernel.IsSupportedOn(device, spvDir))
                 model._matmulQ4_0GemmCoopmat = MatMulQ4_0GemmCoopmatKernel.Create(device, spvDir);
+            string? q40Prefill = Environment.GetEnvironmentVariable(Q4_0PrefillQ8_1EnvVar);
+            if (q40Prefill != "0" && model._quantizeQ8_1Rows is not null)
+            {
+                model._matmulQ4_0MmqCm1 = MatMulMmqCm1Kernel.TryCreate(device, spvDir, QuantType.Q4_0);
+                if (model._matmulQ4_0MmqCm1 is null) model._matmulQ4_0Mmq = MatMulQ4_0MmqKernel.TryCreate(device, spvDir);
+            }
+            model.Q4_0PrefillQ8_1 = q40Prefill != "0";
         }
         if (File.Exists(Path.Combine(spvDir, "matmul_q4_1_f32_gemv.spv")))
         {
@@ -5356,6 +5366,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         _matmulQ4_1GemmCoopmat?.InvalidateDescriptorCache();
         _matmulQ4_1MmqCm1?.InvalidateDescriptorCache();
         _matmulQ4_1Mmq?.InvalidateDescriptorCache();
+        _matmulQ4_0MmqCm1?.InvalidateDescriptorCache();
+        _matmulQ4_0Mmq?.InvalidateDescriptorCache();
         _matmulQ2K.InvalidateDescriptorCache();
         _matmulQ2KGemm.InvalidateDescriptorCache();
         _matmulQ3K.InvalidateDescriptorCache();
@@ -8266,6 +8278,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         QuantType.IQ4_NL => _matmulIq4NlMmq is not null && (inputDim % MatMulIq4NlMmqKernel.Iq4NlGroupSize) == 0,
         QuantType.Q4_1 => Q4_1PrefillQ8_1 && (_matmulQ4_1MmqCm1 is { } cm1 ? cm1.SupportsK(inputDim)
             : _matmulQ4_1Mmq is not null && (inputDim % MatMulQ4_1MmqKernel.Q4_1GroupSize) == 0),
+        QuantType.Q4_0 => Q4_0PrefillQ8_1 && (_matmulQ4_0MmqCm1 is { } cm0 ? cm0.SupportsK(inputDim)
+            : _matmulQ4_0Mmq is not null && (inputDim % MatMulQ4_0MmqKernel.Q4_0GroupSize) == 0),
         _ => false,
     };
 
@@ -8313,6 +8327,9 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                 break;
             case QuantType.Q4_1:
                 RecordQ4_1MmqPreQuantized(cmdBuf, weights, output, outputDim, inputDim, seqLen);
+                break;
+            case QuantType.Q4_0:
+                RecordQ4_0MmqPreQuantized(cmdBuf, weights, output, outputDim, inputDim, seqLen);
                 break;
             default:
                 throw new InvalidOperationException($"No prefill MMQ kernel for {qt}.");
@@ -8485,9 +8502,56 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         Q4_1MmqDispatchCount++;
     }
 
+    /// <summary>Load-time default of <see cref="Q4_0PrefillQ8_1"/>: <c>1</c> = on, <c>0</c> = off (kernels not even created), unset = on.</summary>
+    public const string Q4_0PrefillQ8_1EnvVar = "DOTLLM_VK_Q4_0_PREFILL_Q8_1";
+
+    /// <summary>
+    /// Whether the dense Q4_0 prefill quantises its activations to Q8_1 and runs the MMQ (#1447: llama.cpp's and the CPU's #1159
+    /// contract) instead of the F16 coopmat / F32 GEMMs on F32 activations. Effective only where the int8-coopmat or dp4a MMQ was created.
+    /// Default ON (unlike Q4_1, where the F16 coopmat GEMM wins on the 8060S): Llama-3.2-1B/3B pure Q4_0 on the 8060S, paired A/B in both
+    /// orders, pp128 4.0-4.2k -> 6.5-6.9k tok/s, pp512 6.1-6.6k -> 6.9-7.3k (3B: 2.37-2.42k -> 2.78-2.82k), pp2048 5.1k -> 5.4-5.5k; decode
+    /// unchanged; wikitext PPL 16.614 against the CPU's 16.614 (the F16/F32-activation path: 16.583).
+    /// </summary>
+    public bool Q4_0PrefillQ8_1 { get; set; }
+
+    /// <summary>Q4_0 prefill projections that ran on Q8_1 activations (#1447; test hook).</summary>
+    internal long Q4_0MmqDispatchCount { get; private set; }
+
+    /// <summary>The Q4_0 prefill on Q8_1 activations (#1447); see <see cref="TryRecordQ4_1Mmq"/>.</summary>
+    private bool TryRecordQ4_0Mmq(nint cmdBuf, VulkanDevice.Buffer weights, VulkanDevice.Buffer input, VulkanDevice.Buffer output,
+        int outputDim, int inputDim, int seqLen)
+    {
+        if (!HasMmqPrefillKernel(QuantType.Q4_0, inputDim) || _quantizeQ8_1Rows is null
+            || _state.Q8_1XqRows is not { } xq || _state.Q8_1XdsRows is not { } xds || !_state.Q8_1RowsFit(seqLen, inputDim))
+            return false;
+        BarrierComputeToCompute(cmdBuf);
+        _quantizeQ8_1Rows.Record(cmdBuf, input, xq, xds, n: seqLen, k: inputDim);
+        BarrierComputeToCompute(cmdBuf);
+        RecordQ4_0MmqPreQuantized(cmdBuf, weights, output, outputDim, inputDim, seqLen);
+        return true;
+    }
+
+    /// <summary>The Q4_0 MMQ (#1447) on the already quantised rows scratch.</summary>
+    private void RecordQ4_0MmqPreQuantized(nint cmdBuf, VulkanDevice.Buffer weights, VulkanDevice.Buffer output, int outputDim, int inputDim, int seqLen)
+    {
+        var xq = _state.Q8_1XqRows!;
+        var xds = _state.Q8_1XdsRows!;
+        if (_matmulQ4_0MmqCm1 is { } cm1)
+        {
+            cm1.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim, n: seqLen);
+            ProfNote("q4_0_mmq_cm1", outputDim, inputDim, seqLen);
+        }
+        else
+        {
+            _matmulQ4_0Mmq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim, n: seqLen);
+            ProfNote("q4_0_mmq", outputDim, inputDim, seqLen);
+        }
+        Q4_0MmqDispatchCount++;
+    }
+
     /// <summary>
     /// One legacy 4-bit projection (Q4_0 #1018 / Q4_1 #1171) on the native kernels. Decode: dp4a MMVQ against the Q8_1 activation when the
-    /// scratch exists, else the F32-in GEMV. Prefill: Q4_1 on Q8_1 activations (#1235) where wired, else the 128x128x4 coopmat GEMM, else the
+    /// scratch exists, else the F32-in GEMV. Prefill: Q4_1 / Q4_0 on Q8_1 activations (#1235 / #1447) where wired, else the 128x128x4 coopmat GEMM, else the
     /// tiled F32 GEMM.
     /// </summary>
     private void RecordLegacyQ4Matmul(
@@ -8500,6 +8564,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             throw new InvalidOperationException($"{qt} weights are device-resident but the {qt} kernels were not created.");
         bool q41 = qt == QuantType.Q4_1;
         if (seqLen > 1 && q41 && TryRecordQ4_1Mmq(cmdBuf, weights, input, output, outputDim, inputDim, seqLen))
+            return;
+        if (seqLen > 1 && qt == QuantType.Q4_0 && TryRecordQ4_0Mmq(cmdBuf, weights, input, output, outputDim, inputDim, seqLen))
             return;
         if (seqLen == 1)
         {
@@ -9573,6 +9639,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         _matmulQ4_1GemmCoopmat?.Dispose();
         _matmulQ4_1MmqCm1?.Dispose();
         _matmulQ4_1Mmq?.Dispose();
+        _matmulQ4_0MmqCm1?.Dispose();
+        _matmulQ4_0Mmq?.Dispose();
         _matmulQ8Mmq?.Dispose();
         _matmulQ8MmqResidual?.Dispose();
         _matmulQ4KMmq?.Dispose();

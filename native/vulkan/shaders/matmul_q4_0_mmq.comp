@@ -1,0 +1,168 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+#extension GL_GOOGLE_include_directive : require
+// Q4_0 MMQ prefill GEMM (issue #1447): integer-dot (dp4a) batched matrix multiply.
+//
+//   C[N, M] = B[N, K] @ W_q4_0[M, K]^T
+//
+// The activation B has been pre-quantized to Q8_1 row-wise (quantize_q8_1_rows.comp). Per 32-element block, as llama.cpp's
+// vec_dot_q4_0_q8_1 and the CPU packed dot (#1159):
+//   sum_i d * (q_i - 8) * (d_x * x_i) = d * d_x * dp4a(q - 8, x)
+// with d_x rounded to fp16 as block_q8_1 stores it (the rows quantizer keeps F32; the rounding happens at staging) and the nibble
+// codes recentred to signed int8 at staging, so there is no min term. The devices with int8 cooperative matrices take the
+// matmul_q4_0_mmq_cm1 twin; this kernel is the dp4a fallback (Arc, NVIDIA).
+//
+// Tiling: matmul_q4_1_mmq.comp's (64 token rows x 64 weight rows per workgroup, 16x16 threads, 4x4 register tile strided by 16,
+// +1-uint LDS row padding), with the #544 two-level accumulation of matmul_q8_0_mmq.comp.
+//
+// Q4_0 block: 18 bytes (fp16 d, qs[16]); NOT uint-aligned, so words are assembled from the two uints a byte offset straddles.
+// Low nibble of byte j = element j, high nibble = element j + 16.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW   { uint  weight[]; }; // Q4_0 blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq  { uint  xq[]; };      // [N*K/4]
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds { vec2  xds[]; };     // [N*K/32] (d_x, s_x)
+layout(set = 0, binding = 3, std430) writeonly buffer BufC   { float c[]; };       // [N*M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;            // multiple of 32
+    uint N;
+    uint blocksPerRow; // = K / 32
+    uint rowBytes;     // = blocksPerRow * 18
+} pc;
+
+const uint TILE_M = 64u;         // weight rows per workgroup
+const uint TILE_N = 64u;         // token rows per workgroup
+const uint TM = 4u;              // weight rows per thread (strided by 16)
+const uint TN = 4u;              // token rows per thread (strided by 16)
+const uint BLOCK_BYTES = 18u;
+const uint UINTS_PER_BLOCK = 8u; // 32 int8 / 4
+const uint CHUNK_STRIDE = 9u;    // +1 uint pad -> LDS bank-conflict-free strided reads
+const uint FLUSH_BLOCKS = 8u;    // #544: fold the per-window partial into the total every 8 blocks
+
+shared uint  sharedWq[TILE_M * CHUNK_STRIDE]; // nibble codes as int8
+shared uint  sharedXq[TILE_N * CHUNK_STRIDE]; // Q8_1 activations
+shared float sharedD[TILE_M];                 // per-row d
+shared float sharedDx[TILE_N];                // per-token d_x
+
+#include "q8_1_ds_f16.glsl"
+
+// 32 bits at (unaligned) byte offset `b` of the weight blob.
+uint loadWord(uint b) {
+    uint i = b >> 2u;
+    uint sh = (b & 3u) * 8u;
+    uint lo = weight[i];
+    if (sh == 0u) return lo;
+    return (lo >> sh) | (weight[i + 1u] << (32u - sh));
+}
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;              // 0..15 -> weight-row axis
+    uint ty = gl_LocalInvocationID.y;              // 0..15 -> token-row axis
+    uint tid = ty * 16u + tx;                      // 0..255
+
+    uint mBase = gl_WorkGroupID.x * TILE_M;
+    uint tBase = gl_WorkGroupID.y * TILE_N;
+
+    float acc[TM][TN];
+    float accPart[TM][TN];
+    for (uint i = 0u; i < TM; i++)
+        for (uint j = 0u; j < TN; j++) {
+            acc[i][j] = 0.0;
+            accPart[i][j] = 0.0;
+        }
+
+    for (uint kBlock = 0u; kBlock < pc.blocksPerRow; kBlock++) {
+        // ---- 1. Stage sharedXq[64][8] + sharedDs[64]: 512 uints, two passes of 256 threads. ----
+        for (uint s = 0u; s < 2u; s++) {
+            uint idx = tid + s * 256u;
+            uint rLocal = idx >> 3u;
+            uint lane   = idx & 7u;
+            uint tGlobal = tBase + rLocal;
+            uint v = 0u;
+            if (tGlobal < pc.N) {
+                v = xq[tGlobal * (pc.K >> 2u) + kBlock * UINTS_PER_BLOCK + lane];
+            }
+            sharedXq[rLocal * CHUNK_STRIDE + lane] = v;
+        }
+        if (tid < TILE_N) {
+            uint tGlobal = tBase + tid;
+            sharedDx[tid] = (tGlobal < pc.N) ? roundToF16(xds[tGlobal * pc.blocksPerRow + kBlock].x) : 0.0;
+        }
+
+        // ---- 2. Stage sharedWq[64][8] + sharedD[64]: 64 rows x 4 qs words, one per thread, recentred to q - 8. ----
+        {
+            uint rLocal = tid >> 2u;
+            uint w      = tid & 3u;
+            uint mGlobal = mBase + rLocal;
+            uint lo4 = 0u, hi4 = 0u;
+            if (mGlobal < pc.M) {
+                uint cur = loadWord(mGlobal * pc.rowBytes + kBlock * BLOCK_BYTES + 2u + 4u * w);
+                lo4 = ((cur & 0x0F0F0F0Fu) | 0x80808080u) - 0x08080808u;
+                hi4 = (((cur >> 4u) & 0x0F0F0F0Fu) | 0x80808080u) - 0x08080808u;
+                lo4 ^= 0x80808080u;
+                hi4 ^= 0x80808080u;
+            }
+            sharedWq[rLocal * CHUNK_STRIDE + w]      = lo4;
+            sharedWq[rLocal * CHUNK_STRIDE + 4u + w] = hi4;
+        }
+        if (tid < TILE_M) {
+            uint mGlobal = mBase + tid;
+            sharedD[tid] = (mGlobal < pc.M) ? unpackHalf2x16(loadWord(mGlobal * pc.rowBytes + kBlock * BLOCK_BYTES)).x : 0.0;
+        }
+
+        barrier();
+
+        // ---- 3. dp4a: 4x4 register tile per thread over this block. ----
+        {
+            int dotI[TM][TN];
+            for (uint i = 0u; i < TM; i++)
+                for (uint j = 0u; j < TN; j++)
+                    dotI[i][j] = 0;
+            for (uint g = 0u; g < UINTS_PER_BLOCK; g++) {
+                uint wv[TM];
+                uint xv[TN];
+                for (uint i = 0u; i < TM; i++)
+                    wv[i] = sharedWq[(tx + 16u * i) * CHUNK_STRIDE + g];
+                for (uint j = 0u; j < TN; j++)
+                    xv[j] = sharedXq[(ty + 16u * j) * CHUNK_STRIDE + g];
+                for (uint i = 0u; i < TM; i++)
+                    for (uint j = 0u; j < TN; j++)
+                        dotI[i][j] = dotPacked4x8AccSatEXT(int(wv[i]), int(xv[j]), dotI[i][j]);
+            }
+            for (uint i = 0u; i < TM; i++) {
+                float dw = sharedD[tx + 16u * i];
+                for (uint j = 0u; j < TN; j++)
+                    accPart[i][j] += dw * sharedDx[ty + 16u * j] * float(dotI[i][j]);
+            }
+        }
+
+        if ((kBlock % FLUSH_BLOCKS) == FLUSH_BLOCKS - 1u) {
+            for (uint i = 0u; i < TM; i++)
+                for (uint j = 0u; j < TN; j++) {
+                    acc[i][j] += accPart[i][j];
+                    accPart[i][j] = 0.0;
+                }
+        }
+
+        barrier();
+    }
+
+    for (uint i = 0u; i < TM; i++)
+        for (uint j = 0u; j < TN; j++)
+            acc[i][j] += accPart[i][j];
+
+    // ---- 4. Store output tile if within [N, M] bounds. ----
+    for (uint j = 0u; j < TN; j++) {
+        uint t = tBase + ty + 16u * j;
+        if (t >= pc.N) continue;
+        for (uint i = 0u; i < TM; i++) {
+            uint m = mBase + tx + 16u * i;
+            if (m < pc.M) {
+                c[t * pc.M + m] = acc[i][j];
+            }
+        }
+    }
+}
