@@ -1039,9 +1039,36 @@ uses the MTP decoder's exact accept/residual rule unchanged.
 (42 MB for Qwen3.8-27B-DFlash2). Taps: `rows × 5 × 5120 × 2 B` F16 per verify (400 KB at B = 8), capped at the ring for a
 long prefill and released after it.
 
-**Knobs.** `DOTLLM_DFLASH_DRAFT=n` caps drafts per round (default B-1 = 7); `DOTLLM_DFLASH_TRACE=1` prints draft / inject wall
+**Knobs.** `DOTLLM_DFLASH_DRAFT=n` caps drafts per round (default B-1 = 7); `DOTLLM_DFLASH_DRAFT_VOCAB=K` limits the draft head to token ids [0, K) (0 = off, #1360); `DOTLLM_DFLASH_TRACE=1` prints draft / inject wall
 time per request (and, on Vulkan, the drafter's submit count and wait). Vulkan small-row GEMVs: `DOTLLM_VK_Q4K_ROWS` / `DOTLLM_VK_Q4K_ROWS_MULTI` (1..4 output
 rows per workgroup for decode / verify, default 2 / 4, #1220; this replaced #1193's `DOTLLM_VK_Q4K_MULTI_ROWS` / `_R4` kernel) and `DOTLLM_VK_SMALLROW_Q6K_R2_MIN_ROWS` (default 3).
+
+**Draft-vocabulary head (#1360).** The drafter's head used to read all 248k rows of the target's lm-head (7 rows x ~1 GB of Q6_K,
+~8 ms of a ~17 ms draft on Strix Vulkan, plus a 7 MB logits download and a CPU top-k over it). Proposals only need the frequent tokens, so the
+draft head now projects onto token ids `[0, K)` only: the leading rows of the head matrix, read in place in their stored quant (no gather,
+no copy, no extra memory); the logits are `[rows, K]`. The target's verify still uses the full head, so output is unchanged by construction
+(`DraftVocabLimit_IsTokenIdenticalToGreedy_AndNeverDraftsAboveLimit`: plain-greedy identity plus "never drafts >= K"); only acceptance can
+move, and a target token >= K is just never proposed. A frequency table is not needed: byte-level BPE ids follow merge order, so the prefix
+is the frequent set (uzu needs a table because it gathers arbitrary rows). `DOTLLM_DFLASH_DRAFT_VOCAB=K` sets it (`0` = full head); unset =
+the target's default, 65536 on Vulkan qwen35 hosts with a 128k+ vocab (CPU / CUDA: supported, default off, CUDA unmeasured). Not used by LiLiCorr.
+
+Strix Vulkan, Qwen3.8-27B Q4_K_M + DFlash2, 128 tokens greedy, `DOTLLM_MTP_ADAPTIVE=0`, same-session runs rotated across 3 configs x 3 reps
+(GPU + cpu-bench locks held). Generated text identical in every run; rounds per run identical (`drafts` column), so tau did not move. Drafted-token id
+coverage: 97.0-99.1% below 16384 and 100% below 32768 on code, prose, Q&A and C# (the <100% is the full head drafting rare ids that the verify
+mostly rejects anyway).
+
+| K drafts, prompt | rounds | full: tok/s, ms/draft, head ms/draft | K=65536 | K=32768 |
+|---|---|---|---|---|
+| 3 code | 37 | 25.0-26.0, 15.7-17.6, 5.6-7.5 | 26.0-26.8, 11.1-12.1, 1.6-2.1 | 25.7-26.6, 10.4-10.8, 0.9 |
+| 3 prose | 33 | 29.1-29.4, 14.8-15.3, 5.5 | 30.2-30.3, 10.8-10.9, 1.6 | 30.3-30.4, 10.2, 0.9 |
+| 3 C# | 35 | 27.2-27.8, 14.9-15.4, 5.5 | 28.4-28.6, 10.7-10.9, 1.6 | 28.5-28.8, 10.1-10.4, 0.9 |
+| 3 Q&A | 43 | 22.4-22.8, 14.5-15.8, 5.5 | 23.1-23.5, 10.4-10.8, 1.6 | 23.3-23.7, 9.6-10.1, 0.9 |
+| 7 code | 25 | 32.9-33.3, 17.3-17.6, 5.8 | 33.9-34.3, 12.9-13.0, 1.7 | 34.2-34.6, 11.8-12.4, 0.9 |
+| 7 C# | 20 | 41.2-41.4, 17.7-17.8, 5.8 | 41.8-42.6, 13.2-13.7, 1.7 | 42.8-43.3, 12.1-12.7, 0.9 |
+| 7 prose | 19 | 42.7-43.3, 17.7-17.9, 5.8 | 44.3-44.9, 13.1-13.5, 1.7 | 45.0-45.3, 12.3-12.4, 0.9 |
+
+Net +3-5% tok/s (about -4.5 to -5 ms per round, as the issue predicted). 32768 is a further +0.5-1% but rests on one 5-prompt English/code sample, so
+the default stays at 65536 (CJK-heavy text is untested; if it ever loses acceptance, set the env var to 0). The remaining draft cost is the 5 drafter layers.
 
 **Not yet.** Tree (DDTree) verification; reduced-vocab (`d2t`) and DSpark drafters (LiLiCorr: #1237 below);
 sampled-selector proposals (llama.cpp's DFlash2 sampled mode).

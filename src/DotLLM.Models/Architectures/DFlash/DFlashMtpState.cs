@@ -36,6 +36,9 @@ internal sealed unsafe class DFlashMtpState : IMtpState
     private static readonly bool Trace = Environment.GetEnvironmentVariable("DOTLLM_DFLASH_TRACE") == "1";
     private long _draftTicks, _injectTicks;
     private int _drafts, _injects, _injectRows;
+    private static readonly int[] CoverageCuts = [16384, 32768, 65536, 98304, 131072, 151936];
+    private readonly long[] _tally = new long[CoverageCuts.Length];
+    private long _tallyTotal;
 
     /// <summary>Creates a state for <paramref name="drafter"/>.</summary>
     /// <param name="drafter">The drafter whose context this state holds.</param>
@@ -195,6 +198,12 @@ internal sealed unsafe class DFlashMtpState : IMtpState
             _drafter.Draft(this, target, tokenId, position, _draft.AsSpan(0, _draftCount));
             _draftTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
             _drafts++;
+            if (Trace)
+                foreach (int t in _draft.AsSpan(0, _draftCount))
+                {
+                    _tallyTotal++;
+                    for (int c = 0; c < CoverageCuts.Length; c++) if (t < CoverageCuts[c]) _tally[c]++;
+                }
             _draftStart = position;
             return _draft[0];
         }
@@ -217,6 +226,9 @@ internal sealed unsafe class DFlashMtpState : IMtpState
         {
             double f = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             var p = _drafter.TakeProfile();
+            if (_tallyTotal > 0)
+                Console.Error.WriteLine("[dflash] draft-token id coverage " + string.Join(" ",
+                    CoverageCuts.Select((c, i) => $"<{c}:{100.0 * _tally[i] / _tallyTotal:F1}%")) + $" of {_tallyTotal}");
             Console.Error.WriteLine($"[dflash] drafts={_drafts} draft_ms={_draftTicks * f / Math.Max(1, _drafts):F1}/draft " +
                 $"injects={_injects} rows={_injectRows} inject_ms={_injectTicks * f:F0} total ({_injectTicks * f / Math.Max(1, _injects):F1}/inject) " +
                 $"split_ms gemm={p.Gemm:F0} attn={p.Attn:F0} head={p.Head:F0} select={p.Select:F0}");
