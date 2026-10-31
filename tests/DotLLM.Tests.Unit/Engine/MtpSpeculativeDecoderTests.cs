@@ -387,6 +387,54 @@ public sealed class MtpSpeculativeDecoderTests
         Assert.Equal(plainSeq, spec);
     }
 
+    /// <summary>
+    /// #1345: with <c>ignore_eos</c> / <c>min_tokens</c> the output must not depend on speculation. The target's argmax after token 4
+    /// is the EOG id 5 and the MTP head drafts it too, so the draft is rejected at that row and the masked runner-up
+    /// (<c>t + 2</c>) is the correction, exactly what plain decoding through the same pipeline emits. The unmasked control
+    /// does emit 5, so the mask is what the assertion is about.
+    /// </summary>
+    [Theory]
+    [InlineData(true, 0)]
+    [InlineData(false, 8)]    // min_tokens 8: the EOG is masked for the first 8 generated tokens, which covers the id-5 step
+    public void IgnoreEosAndMinTokens_SpeculativeMatchesPlainDecode_AndNeverEmitsEog(bool ignoreEos, int minTokens)
+    {
+        const int V = VocabSize, Eog = 5;
+        static int Succ(int t) => (t + 1) % V;
+        static void Row(int t, Span<float> row)
+        {
+            row.Fill(-10f);
+            row[Succ(t)] = 10f;
+            row[(t + 2) % V] = 5f;      // distinct runner-up so the masked pick is unambiguous
+        }
+
+        InferenceOptions Opts(bool masked) => new()
+        {
+            Temperature = 0f,
+            LogitProcessors = masked ? [new EosSuppressionProcessor([Eog], ignoreEos, minTokens)] : null,
+        };
+
+        // Plain decoding through the same pipeline: the oracle.
+        var refPipe = new SamplerPipeline(Opts(masked: true));
+        var plain = new List<int> { 1 };
+        var row = new float[V];
+        for (int i = 0; i < 12; i++)
+        {
+            Row(plain[^1], row);
+            plain.Add(refPipe.Sample(row, plain));
+        }
+        Assert.DoesNotContain(Eog, plain);
+        Assert.Equal(12, plain.Count - 1);
+
+        using var model = new MockMtpModel(t => Succ(t), t => Succ(t), supportsMtp: true, targetRow: Row);
+        var spec = RunSpeculative(model, new MtpSpeculativeDecoder(), new SamplerPipeline(Opts(masked: true)), 1, 12, 3);
+        Assert.Equal(plain, spec);
+
+        // Control: no mask -> the EOG is emitted, so the equality above is not vacuous.
+        using var control = new MockMtpModel(t => Succ(t), t => Succ(t), supportsMtp: true, targetRow: Row);
+        var unmasked = RunSpeculative(control, new MtpSpeculativeDecoder(), new SamplerPipeline(Opts(masked: false)), 1, 12, 3);
+        Assert.Contains(Eog, unmasked);
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private static List<int> RunPlainGreedy(int startToken, int totalNewTokens, Func<int, int> targetFn)

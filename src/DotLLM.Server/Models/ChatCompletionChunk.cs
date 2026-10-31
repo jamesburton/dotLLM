@@ -79,9 +79,58 @@ public sealed record TimingsDto
     [JsonPropertyName("speculative_acceptance_rate")]
     public float SpeculativeAcceptanceRate { get; init; }
 
-    /// <summary>Maps engine measurements to the streaming timing extension.</summary>
+    // llama.cpp `timings` field names (#1345), so llama-swap and other proxies that read them record real speeds.
+    // Added beside the dotLLM names above, not replacing them.
+
+    /// <summary>Prompt tokens reused from the prefix cache (<c>cache_n</c>).</summary>
+    [JsonPropertyName("cache_n")]
+    public int CacheN { get; init; }
+
+    /// <summary>Prompt tokens actually prefilled, excluding cached ones (<c>prompt_n</c>).</summary>
+    [JsonPropertyName("prompt_n")]
+    public int PromptN { get; init; }
+
+    /// <summary>Prefill time in ms (<c>prompt_ms</c>).</summary>
+    [JsonPropertyName("prompt_ms")]
+    public double PromptMs { get; init; }
+
+    /// <summary>Prefill ms per prefilled token; 0 when none were prefilled.</summary>
+    [JsonPropertyName("prompt_per_token_ms")]
+    public double PromptPerTokenMs { get; init; }
+
+    /// <summary>Prefill tokens per second.</summary>
+    [JsonPropertyName("prompt_per_second")]
+    public double PromptPerSecond { get; init; }
+
+    /// <summary>Tokens produced by decode passes (<c>predicted_n</c>); the first generated token comes from prefill and is not counted.</summary>
+    [JsonPropertyName("predicted_n")]
+    public int PredictedN { get; init; }
+
+    /// <summary>Decode time in ms (<c>predicted_ms</c>).</summary>
+    [JsonPropertyName("predicted_ms")]
+    public double PredictedMs { get; init; }
+
+    /// <summary>Decode ms per token; 0 when no decode pass ran.</summary>
+    [JsonPropertyName("predicted_per_token_ms")]
+    public double PredictedPerTokenMs { get; init; }
+
+    /// <summary>Decode tokens per second.</summary>
+    [JsonPropertyName("predicted_per_second")]
+    public double PredictedPerSecond { get; init; }
+
+    /// <summary>Maps engine measurements to the timing extension (dotLLM names plus the llama.cpp-shaped ones).</summary>
     public static TimingsDto From(DotLLM.Engine.InferenceTimings timings) => new()
     {
+        CacheN = timings.CachedTokenCount,
+        PromptN = Math.Max(0, timings.PrefillTokenCount - timings.CachedTokenCount),
+        PromptMs = timings.PrefillTimeMs,
+        PromptPerTokenMs = timings.PrefillTokenCount - timings.CachedTokenCount > 0
+            ? timings.PrefillTimeMs / (timings.PrefillTokenCount - timings.CachedTokenCount) : 0,
+        PromptPerSecond = timings.PrefillTokensPerSec,
+        PredictedN = timings.DecodeTokenCount,
+        PredictedMs = timings.DecodeTimeMs,
+        PredictedPerTokenMs = timings.DecodeTokenCount > 0 ? timings.DecodeTimeMs / timings.DecodeTokenCount : 0,
+        PredictedPerSecond = timings.DecodeTokensPerSec,
         PrefillTimeMs = timings.PrefillTimeMs,
         DecodeTimeMs = timings.DecodeTimeMs,
         SamplingTimeMs = timings.SamplingTimeMs,

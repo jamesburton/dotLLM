@@ -24,6 +24,11 @@ public sealed record ChatCompletionResponse
 
     [JsonPropertyName("usage")]
     public required UsageDto Usage { get; init; }
+
+    /// <summary>Timing extension incl. the llama.cpp-shaped fields (#1345). Absent for multi-choice (<c>n &gt; 1</c>) responses.</summary>
+    [JsonPropertyName("timings")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public TimingsDto? Timings { get; init; }
 }
 
 /// <summary>

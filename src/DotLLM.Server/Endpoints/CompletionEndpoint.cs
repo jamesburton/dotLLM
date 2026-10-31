@@ -172,6 +172,7 @@ public static class CompletionEndpoint
                 TotalTokens = result.PromptTokenCount + result.GeneratedTokenCount,
                 PromptTokensDetails = new PromptTokensDetailsDto { CachedTokens = Math.Clamp(result.Timings.CachedTokenCount, 0, result.PromptTokenCount) },
             },
+            Timings = TimingsDto.From(result.Timings),  // #1345
         };
 
         // Report actuals to the rate-limit lease so unused token budget is refunded.

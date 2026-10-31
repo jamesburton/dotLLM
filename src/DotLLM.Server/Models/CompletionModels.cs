@@ -89,6 +89,16 @@ public sealed record CompletionRequest
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public Dictionary<string, float>? LogitBias { get; init; }
 
+    /// <summary>llama.cpp <c>ignore_eos</c> (#1345): never stop on an end-of-generation token; run to <c>max_tokens</c> or a stop string.</summary>
+    [JsonPropertyName("ignore_eos")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? IgnoreEos { get; init; }
+
+    /// <summary>vLLM/llama.cpp <c>min_tokens</c> (#1345): suppress end-of-generation tokens until this many tokens are generated.</summary>
+    [JsonPropertyName("min_tokens")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? MinTokens { get; init; }
+
     /// <summary>Top-nσ sampling threshold (llama.cpp <c>--top-nsigma</c>). Negative = disabled.</summary>
     [JsonPropertyName("top_n_sigma")]
     public float? TopNSigma { get; init; }
@@ -172,6 +182,11 @@ public sealed record CompletionResponse
 
     [JsonPropertyName("usage")]
     public required UsageDto Usage { get; init; }
+
+    /// <summary>Timing extension incl. the llama.cpp-shaped fields (#1345).</summary>
+    [JsonPropertyName("timings")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public TimingsDto? Timings { get; init; }
 }
 
 /// <summary>

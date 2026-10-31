@@ -98,6 +98,26 @@ data: [DONE]
 ### `POST /v1/completions`
 Raw completion (no chat template). Same sampling parameters. Input is `prompt` (string) instead of `messages`.
 
+### `timings`, `ignore_eos`, `min_tokens` (#1345)
+
+Blocking chat (n = 1) and completion responses carry a `timings` object beside `usage`; streaming already puts it in the
+closing chunk. It holds the dotLLM names (`prefill_time_ms`, `decode_tokens_per_sec`, ...) and, beside them, the
+llama.cpp names that llama-swap and similar proxies read: `cache_n` (prefix-cache reused tokens), `prompt_n` (tokens
+actually prefilled), `prompt_ms`, `prompt_per_token_ms`, `prompt_per_second`, `predicted_n`, `predicted_ms`,
+`predicted_per_token_ms`, `predicted_per_second`. `predicted_n` counts decode passes (the first generated token comes
+from prefill), so it is `completion_tokens - 1`; the per-second figures are exact.
+
+`ignore_eos: true` (chat and completions) masks every end-of-generation token's logit to -infinity (llama.cpp
+semantics), so generation runs to `max_tokens` or an explicit stop string; the EOG token never appears in the output or
+the context. `min_tokens: N` masks them only until N tokens are generated. The mask is a logit processor, so MTP verify
+rows give the same tokens as plain decoding (test: `IgnoreEosAndMinTokens_SpeculativeMatchesPlainDecode_AndNeverEmitsEog`);
+draft-model and prompt-lookup speculation, which verify against a raw argmax, are skipped for such requests rather than
+risk a divergent output. For a fixed-length benchmark use `temperature: 0`, `ignore_eos: true`, `max_tokens: N`.
+Not wired for the Ollama (`/api/*`) and Anthropic surfaces.
+
+llama-swap: point `checkEndpoint` at `/health`; the `timings` object is what it reads for tok/s. (Written from the
+llama-swap/llama.cpp field contract; not run against a live llama-swap here.)
+
 ### `POST /v1/messages`, `POST /v1/messages/count_tokens` (Anthropic-compatible, fork-only — #448/#449)
 
 Anthropic Messages API endpoint, served alongside the OpenAI surface so that
