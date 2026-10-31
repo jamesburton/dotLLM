@@ -600,6 +600,17 @@ llama.cpp master `0ae0e1976` `llama-server --spec-type draft-mtp -md <head>`, sa
 - llama.cpp drafts 74 % accepted at K=3. dotLLM's verify (150 ms for 4 rows vs 105 ms decode) and per-step head cost (LM head over 248k rows
   per draft step) are the remaining gap to llama.cpp's 2.2x.
 
+**Q4_K verify cliff at 5 and 7 columns (issue #1220, follow-up).** The profile of a 5-row verify showed the Q4_K FFN at 2.05x its 1-row time. It was
+not ALU or bytes: `benchmarks/Q4KVerifyProbe` (the real 17408x5120 / 5120x17408 shapes, 4 rotating 50 MB weight copies, barriers between dispatches)
+shows the NR = 4 default falling off a cliff at 5 and 7 columns on the 8060S (gate/up us/dispatch, GB/s of weights): n=1 247 (203), n=4 319 (157),
+**n=5 527 (95)**, n=6 332 (151), **n=7 716 (70)**, n=8 401 (125); at NR = 3 n=5 is 324 (155), at NR = 2 n=7 is 578. Shipped: per-n NR table
+`3:3,5:3,7:2` (`DOTLLM_VK_Q4K_ROWS_BYN`, `off` restores) and `PadOddColumns` (5 -> 6 and 7 -> 8 when the scratch has the pad row, `DOTLLM_VK_Q4K_PADODD=0`
+disables). Row bits do not depend on NR or NC (`Q4KTunedTable_AndPadding_KeepColumnsBitIdenticalToDecode`). Qwen3.8-27B Q4_K_M verify wall
+(`VerifyRowCurve`, A B B A, 5 reps each, ms median): 5 rows 169.5 / 163.2 -> 138.4 / 132.8 (-18%), 6 rows 142.0 / 132.4 -> 136.2 / 130.0 (-4%), 2..4 rows within
+run-to-run drift (about 3%). End to end K=4 MTP (4 prompts, 128 greedy tokens, ABBA-interleaved): 16.1 / 18.5 / 19.3 / 13.5 -> 19.5 / 22.2 / 23.5 / 16.2 tok/s
+(+17..21%); K=3 is a 4-row verify and unchanged (-1.5..+1.4%). Greedy MTP == plain on 12/12 (4 prompts x K=2..4). The Q4_K projections are still not at
+the bandwidth floor at 2..4 columns (150-160 GB/s vs 203-212 at n=1); that, not the cliff, is what remains.
+
 **Verify and decode on the same kernels (issue #1220).** The 4-row verify cost 150 ms against a 105 ms decode, and every verify column only
 matched decode by luck: the multi-column GEMVs reduced with `subgroupAdd`, whose order changes with the subgroup width a driver picks for
 each pipeline. Intel picks SIMD8/16/32 by register pressure, so the multi kernels differed from decode at NR = 4 on Arc. The row-split GDN
