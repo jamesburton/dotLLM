@@ -1,0 +1,7 @@
+#version 450
+// F16-activation twin of attention_flash_f32_coopmat.comp (issue #1474): Q, K, V and the output are all F16 in memory (K / V two halves
+// per 32-bit word as kv_load.glsl, Q and the output as float16_t storage). Softmax state and both accumulators stay F32. Body: attention_flash_f32_coopmat.glsl.
+#define KV_F16 1
+#define ACT_F16 1
+#extension GL_GOOGLE_include_directive : require
+#include "attention_flash_f32_coopmat.glsl"

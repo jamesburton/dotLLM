@@ -248,9 +248,10 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
         VulkanModule? hd64Module, ComputePipeline? hd64Pipeline, nint hd64Pool,
         VulkanModule? hd256Module, ComputePipeline? hd256Pipeline, nint hd256Pool,
-        uint requireInvariantPv, VulkanKvStorage kvStorage)
+        uint requireInvariantPv, VulkanKvStorage kvStorage, bool activationsF16)
     {
         KvStorage = kvStorage;
+        ActivationsF16 = activationsF16;
         _hd256Module = hd256Module;
         _hd256Pipeline = hd256Pipeline;
         _hd256DescriptorPool = hd256Pool;
@@ -327,7 +328,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
     /// </summary>
     internal static VulkanFlashAttentionCoopmatKernel Create(
         VulkanDevice device, string spvDir, FlashAttentionCoopmatVariant variant, string shaderBaseName,
-        uint? requireInvariantPv = null, VulkanKvStorage kvStorage = VulkanKvStorage.F32)
+        uint? requireInvariantPv = null, VulkanKvStorage kvStorage = VulkanKvStorage.F32, bool activationsF16 = false)
     {
         if (!SupportsDevice(device))
             throw new InvalidOperationException(
@@ -443,7 +444,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
         return new VulkanFlashAttentionCoopmatKernel(
             device, module, pipeline, pool, hd64Module, hd64Pipeline, hd64Pool,
-            hd256Module, hd256Pipeline, hd256Pool, gate, kvStorage);
+            hd256Module, hd256Pipeline, hd256Pool, gate, kvStorage, activationsF16);
     }
 
     /// <summary>
@@ -477,6 +478,31 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
 
     /// <summary>Element format of the K / V buffers this instance reads (issue #1102); fixed at creation.</summary>
     public VulkanKvStorage KvStorage { get; }
+
+    /// <summary>
+    /// Issue #1474: whether Q and the output are F16 as well (the <c>_f16act</c> twins; K / V are F16 too). The F32 accumulators, softmax state
+    /// and scores are unchanged; Q was staged to F16 in LDS anyway, and the output is rounded once at the store.
+    /// </summary>
+    public bool ActivationsF16 { get; }
+
+    /// <summary>
+    /// <see cref="TryCreate(VulkanDevice, string)"/> for the all-F16 twins (<c>attention_flash_f32_coopmat_f16act</c> and its <c>_hd64</c> sibling): Q, K, V and the
+    /// output are F16 (issue #1474). Returns <see langword="null"/> when the device lacks the coopmat tile, the SPV is missing or a pipeline fails.
+    /// </summary>
+    /// <param name="device">The device.</param>
+    /// <param name="spvDir">Directory holding the SPIR-V blobs.</param>
+    /// <returns>The kernel, or <see langword="null"/>.</returns>
+    public static VulkanFlashAttentionCoopmatKernel? TryCreateF16Activations(VulkanDevice device, string spvDir)
+    {
+        if (!SupportsDevice(device)) return null;
+        try
+        {
+            return Create(device, spvDir, FlashAttentionCoopmatVariant.SelectFor(device),
+                DefaultShaderBaseName + "_f16act", kvStorage: VulkanKvStorage.F16, activationsF16: true);
+        }
+        catch (FileNotFoundException) { return null; }
+        catch (VulkanException) { return null; }
+    }
 
     /// <summary>
     /// <see cref="Create(VulkanDevice, string)"/>, or <see langword="null"/> when the device lacks the coopmat tile, an SPV is missing
@@ -590,7 +616,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
             "scaleOverride must be non-negative (use 0 for the default 1/sqrt(headDim)).");
         if (prefixLen < 0) throw new ArgumentOutOfRangeException(nameof(prefixLen));
 
-        long qBytes   = (long)seqQ  * numHeads   * headDim * sizeof(float);
+        long qBytes   = (long)seqQ  * numHeads   * headDim * (ActivationsF16 ? sizeof(ushort) : sizeof(float));
         long kvBytes  = (long)seqKv * numKvHeads * headDim * KvStorage.ElementBytes();
         long outBytes = qBytes;
         if (q.Size - qOff      < qBytes)   throw new ArgumentException("Q buffer too small.",      nameof(q));
@@ -601,7 +627,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         // Issue #378: route headDim<=64 models with enough KV-tile iterations
         // to amortize the occupancy gain to the LDS-halved hd64 shader.
         bool useHd64 = _hd64Pipeline is not null && HeadDim64Enabled
-            && headDim <= HeadDim64Threshold && seqKv >= SeqKvThreshold;
+            && headDim <= HeadDim64Threshold && (seqKv >= SeqKvThreshold || ActivationsF16);   // #1474: the F16-activation twin (BERT encoders, short bidirectional sequences) takes the LDS-halved pipeline at any length: measured +9-16% batched
         bool useHd256 = headDim > MaxHeadDim;   // SupportedMaxHeadDim above guarantees the pipeline exists
         ComputePipeline pipeline = useHd256 ? _hd256Pipeline! : useHd64 ? _hd64Pipeline! : _pipeline;
         DescriptorSetCache descriptorCache = useHd256 ? _hd256DescriptorCache! : useHd64 ? _hd64DescriptorCache! : _descriptorCache;

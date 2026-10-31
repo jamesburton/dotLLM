@@ -16,9 +16,12 @@ namespace DotLLM.Vulkan.Kernels;
 /// assumes on a device whose <see cref="VulkanDevice.SubgroupSize"/> is exactly this. See
 /// <see cref="Blocked128x128x4"/>.
 /// </param>
+/// <param name="ActivationsF16">
+/// The shader reads its activation input B and writes its output C as F16 (2 bytes per element) instead of F32 (issue #1474).
+/// </param>
 public readonly record struct F16GemmCoopmatVariant(
     string SpvFileName, int RequiredSubgroupSize, int TileM = 16, int TileN = 16,
-    int RequiresNativeSubgroupSize = 0)
+    int RequiresNativeSubgroupSize = 0, bool ActivationsF16 = false)
 {
     /// <summary>
     /// Environment variable that restores the pre-issue-#443 preference
@@ -70,6 +73,21 @@ public readonly record struct F16GemmCoopmatVariant(
     public static F16GemmCoopmatVariant Blocked128x128x4 =>
         new("matmul_f16_gemm_coopmat_128x128x4.spv", 0, TileM: 128, TileN: 128,
             RequiresNativeSubgroupSize: 64);
+
+    /// <summary>
+    /// Issue #1474: <see cref="Blocked128x128x4"/> with F16 activations in and out (B is <c>f16vec4[]</c>, C is <c>float16_t[]</c>; the F32 accumulator is
+    /// rounded once at the store). B was rounded to F16 in the LDS staging already, so reading F16 B changes nothing; same wave64 gate.
+    /// </summary>
+    public static F16GemmCoopmatVariant Blocked128x128x4F16Act =>
+        new("matmul_f16_gemm_coopmat_128x128x4_hh.spv", 0, TileM: 128, TileN: 128,
+            RequiresNativeSubgroupSize: 64, ActivationsF16: true);
+
+    /// <summary>Issue #1474: <see cref="Coopmat64"/> with F16 activations in and out; the any-wave-width fallback for <see cref="Blocked128x128x4F16Act"/>.</summary>
+    public static F16GemmCoopmatVariant Coopmat64F16Act => new("matmul_f16_gemm_coopmat_hh.spv", 0, ActivationsF16: true);
+
+    /// <summary>The F16-activation variant for this device (#1474): the blocked 128x128 tile on a wave64 device, else the 16x16 tile.</summary>
+    public static F16GemmCoopmatVariant SelectF16ActFor(VulkanDevice device, string spvDir)
+        => Blocked128x128x4F16Act.IsSupportedOn(device, spvDir) ? Blocked128x128x4F16Act : Coopmat64F16Act;
 
     /// <summary>
     /// Whether <paramref name="device"/> can create a pipeline for this variant right now: the
@@ -171,11 +189,13 @@ public sealed class MatMulF16GemmCoopmatKernel : IDisposable
     // launch 64x too many workgroups, each recomputing and overwriting the same output.
     private readonly int _tileM;
     private readonly int _tileN;
+    private readonly int _actBytes;
     private bool _disposed;
 
     private MatMulF16GemmCoopmatKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
-        int tileM, int tileN)
+        int tileM, int tileN, bool activationsF16 = false)
     {
+        _actBytes = activationsF16 ? sizeof(ushort) : sizeof(float);
         _tileM = tileM;
         _tileN = tileN;
         _device = device;
@@ -235,7 +255,7 @@ public sealed class MatMulF16GemmCoopmatKernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
-        return new MatMulF16GemmCoopmatKernel(device, module, pipeline, pool, variant.TileM, variant.TileN);
+        return new MatMulF16GemmCoopmatKernel(device, module, pipeline, pool, variant.TileM, variant.TileN, variant.ActivationsF16);
     }
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
@@ -276,8 +296,8 @@ public sealed class MatMulF16GemmCoopmatKernel : IDisposable
             throw new ArgumentException(
                 $"Weights buffer too small: need >= {weightsMin} bytes, got {weightsF16.Size}.",
                 nameof(weightsF16));
-        long bMin = (long)n * k * sizeof(float);
-        long cMin = (long)n * m * sizeof(float);
+        long bMin = (long)n * k * _actBytes;
+        long cMin = (long)n * m * _actBytes;
         if (inputB.Size < bMin) throw new ArgumentException("Input buffer too small.", nameof(inputB));
         if (outputC.Size < cMin) throw new ArgumentException("Output buffer too small.", nameof(outputC));
 

@@ -381,7 +381,7 @@ host token + type + position row sum (same arithmetic as the CPU encoder) -> upl
 one **bidirectional** coopmat flash-attention dispatch per document over its slice of Q/K/V (sub-range descriptors, `AttentionMaskMode.Bidirectional`, so no padding mask and no cross-document leak),
 O GEMM, fused `bias + residual + LayerNorm` (`bert_layernorm_f32`), up GEMM, fused `bias + tanh GELU` (`bert_bias_gelu_f32`), down GEMM, fused `bias + residual + LayerNorm`.
 CLS / mean pooling runs on the device (`bert_pool_f32`) and reads back `[docs, hidden]` only (one pre-averaged row per document for mean: `EmbeddingPooler.Pool` of one row is the identity).
-Weights are read in place as F16 (no expansion). Activation scratch is F32, allocated once at load for the pack budget (same convention as the decoder embedder, #1406; bge-small 1024 tokens: about 10 MiB hidden-sized + 6 MiB FFN, bge-base about twice that); F16 activation kernels are a follow-up. Norm / softmax / pooling accumulate in F32 in registers.
+Weights are read in place as F16 (no expansion). Activation scratch is **F16** (#1474), allocated once at load for the pack budget (bge-small 1024 tokens: 6 MiB + 3 MiB staging for hidden-sized tensors and 3 MiB FFN, half of the F32 layout of #741; `ComputeMemoryBytes` reports it). Every stored tensor is rounded to F16 exactly once (GEMM output, bias add, LayerNorm output, GELU output, attention output, the host-side embedding sum); GEMM / flash accumulators, LayerNorm and pooling sums, softmax state and the GELU arithmetic stay F32 in registers. Kernels: `matmul_f16_gemm_coopmat_128x128x4_hh` (f16vec4 B, float16_t C; `GEMM_C_F16` hook in the blocked template) with `matmul_f16_gemm_coopmat_hh` as the any-wave-width fallback, `attention_flash_f32_coopmat_f16act` (+ `_hd64`), `bert_layernorm_f16`, `bert_bias_add_f16`, `bert_bias_gelu_f16`, `bert_pool_f16`.
 
 Use: `dotllm embed <bert-f16.gguf> -d vulkan "text"`, `dotllm serve <bert-f16.gguf> --device vulkan` then `POST /v1/embeddings`
 (the #1405 batcher hands whole batches to the packed forward; verified end to end, 2 inputs, 70 ms). Refused loudly on Vulkan: Q8_0 / F32 `bert` files, nomic-bert, nomic-bert-moe, gemma-embedding; `cuda` refused for all encoders.
@@ -400,7 +400,21 @@ Use: `dotllm embed <bert-f16.gguf> -d vulkan "text"`, `dotllm serve <bert-f16.gg
 | bge-base | 16 / 48 | 280-284 / 278-281 (39.5k tok/s) | 20.5-21 / 21.8-23.1 | 13.4x / 12.3x |
 
 Roofline check: bge-base is about 170 MFLOP per token, so 39.5k tok/s is about 6.7 TFLOP/s effective; weights (170 MB F16) stream in well under 1 ms per pack, so the packed forward is compute / dispatch bound, not bandwidth bound. Batch 1 (a 148-token document) is launch-bound (about 4.3 ms for bge-small, about 100 dispatches). Raw rows: `benchmarks/EmbeddingBench/results/vulkan-bert-741.jsonl`.
-Not measured / open: Q8_0 encoder weights, nomic-bert family, gemma-embedding, CUDA, device-side F16 activations, fusing the Q/K/V GEMMs and per-document attention dispatches (the batch-1 floor), NPU.
+Not measured / open: Q8_0 encoder weights, nomic-bert family, gemma-embedding, CUDA, a varlen attention dispatch (below), NPU.
+
+**F16 activations (#1474)**, same 48 texts, paired base (F32 activations, #741) / new, orders base-new, new-base, base-new, `gpu-lock` + `cpu-bench` held, docs/s min-max:
+
+| Model | B | F32 act (#741) | F16 act | ratio |
+|---|---|---|---|---|
+| bge-small | 1 | 234-239 | 250-260 | 1.07x |
+| bge-small | 16 | 595-619 | 724-750 | 1.21-1.24x |
+| bge-small | 48 | 642-666 | 809-825 | 1.24-1.26x |
+| bge-base | 1 | 118-124 | 131-136 | 1.11x |
+| bge-base | 16 | 276-284 | 332-342 | 1.19-1.22x |
+| bge-base | 48 | 293-298 | 360-369 | 1.22-1.25x |
+
+Parity vs the CPU encoder on the 48 texts (min / mean cosine): bge-small 0.9999996 / 0.9999998, bge-base 0.9999996 / 0.9999997, e5-small-v2 0.9999986 / 0.9999994, mxbai-large 0.9999996 / 0.9999997 (F32 activations: 0.9999999 / 0.9999999 on small, so the F16 path is measurably a different, still far-inside-the-gate, computation; F16 vs F32 Vulkan min 0.9999996). `BertEncoderVulkanParityTests` unchanged and green plus `Activation_scratch_is_f16_not_f32`.
+Where the time goes (perturbation by skipping dispatches, bge-small F16): the per-document attention dispatches are about 19 % of batch 1 and **about 50 % of B=48** (576 dispatches per pack); the Q/K/V bias adds are 0 % (skipping them moved nothing), so fusing Q/K/V GEMMs / bias is not worth building. The LDS-halved `_hd64` flash pipeline (which the generic kernel only picks for `seqKv >= 640`) is taken for every length by the F16-activation twin: +16 % at B=48 on bge-small, +9 % on bge-base, on top of the F16 gain (the table includes it). A flash dispatch that resolves its document from the segment table (576 dispatches to 12) is the remaining attention lever and is not built.
 
 ## 6. Ranked levers (expected wins, from the measurements above)
 
