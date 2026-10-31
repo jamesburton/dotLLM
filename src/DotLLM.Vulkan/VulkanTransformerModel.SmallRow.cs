@@ -63,8 +63,9 @@ public sealed partial class VulkanTransformerModel
 
     private void CreateSmallRowKernels(VulkanDevice device, string spvDir)
     {
-        // #917: NR rows per workgroup as on the qwen35 host (#1220): 2 for one column, 4 for 2..8 and 9..16 columns.
-        _smallRowQ4K = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q4_K, 2, 4, 4);
+        // #917: NR rows per workgroup as on the qwen35 host (#1220): 2 for one column, 4 for 2..12 columns. #1516: 3 for 13..16 (the pipelined shader of #1511 is
+        // smooth in the column count, so this is the only crossover left; 502-582 us against 570-1117 at NR 4 on the Qwen3.8-27B FFN shapes).
+        _smallRowQ4K = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q4_K, 2, 4, 4, new[] { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 3, 3, 3 });
         _smallRowQ5K = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q5_K);
         _smallRowIq4Xs = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.IQ4_XS);
         _smallRowQ6K = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K);

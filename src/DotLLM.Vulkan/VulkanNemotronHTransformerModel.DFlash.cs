@@ -225,14 +225,27 @@ public sealed partial class VulkanNemotronHTransformerModel : IDFlashDraftAttach
     private static readonly int[] ExactRowsByColumns = ParseTable(0, [0, 0, 0, 0, 3, 2, 0, 2]);
     private static readonly int[] KQuantRowsByColumns = ParseTable(1, [0, 0, 0, 0, 0, 3, 0, 2]);
 
-    // DOTLLM_VK_NEMOTRON_PERN_TABLE="n:exactNR:kquantNR;..." overrides entries (tuning sweeps).
+    /// <summary>
+    /// #1516: Q4_K has its own table since #1511 replaced its shader. The pipelined 16-byte-load Q4_K kernel has no 5- or 7-column cliff (the old
+    /// <see cref="KQuantRowsByColumns"/> entries and the 5 -> 6 / 7 -> 8 padding were tuned to it), so NR stays at the default 4 for 2..12 columns and drops
+    /// to 3 for 13..16 (the same crossover as the Qwen3.8-27B shapes; see the measurements in docs/SPECULATIVE.md). Q6_K keeps <see cref="KQuantRowsByColumns"/>
+    /// and the padding: its shader is unchanged and still has the cliff. <c>DOTLLM_VK_NEMOTRON_Q4K_LEGACY=1</c> restores the #1459 behaviour for A/B.
+    /// </summary>
+    private static readonly int[] Q4KRowsByColumns = ParseTable(2, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 3, 3, 3]);
+
+    private static bool Q4KLegacyTuning => Environment.GetEnvironmentVariable("DOTLLM_VK_NEMOTRON_Q4K_LEGACY") == "1";
+
+    // DOTLLM_VK_NEMOTRON_PERN_TABLE="n:exactNR:kquantNR[:q4kNR];..." overrides entries (tuning sweeps; the optional fourth field is Q4_K's own table, #1516).
     private static int[] ParseTable(int which, int[] def)
     {
         var t = new int[17]; def.CopyTo(t, 0);
         if (Environment.GetEnvironmentVariable("DOTLLM_VK_NEMOTRON_PERN_TABLE") is { Length: > 0 } e)
             foreach (var ent in e.Split(';'))
-                if (ent.Split(':') is [var n, var a, var b] && int.TryParse(n, out int ni) && ni is >= 2 and <= 16)
-                    t[ni] = int.Parse(which == 0 ? a : b);
+            {
+                var f = ent.Split(':');
+                if (f.Length is 3 or 4 && int.TryParse(f[0], out int ni) && ni is >= 2 and <= 16)
+                    t[ni] = int.Parse(which == 0 ? f[1] : which == 1 ? f[2] : f.Length == 4 ? f[3] : f[2]);
+            }
         return t;
     }
 
@@ -273,9 +286,11 @@ public sealed partial class VulkanNemotronHTransformerModel : IDFlashDraftAttach
             int kMulti = 4, kWide = 4;
             if (Environment.GetEnvironmentVariable("DOTLLM_VK_NEMOTRON_KQUANT_NR")?.Split(',') is [var km, var kw]
                 && int.TryParse(km, out int kmv) && int.TryParse(kw, out int kwv)) { kMulti = kmv; kWide = kwv; }
-            _exactQ4K = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q4_K, 2, kMulti, kWide, PerRowCountTuning ? KQuantRowsByColumns : null);
+            bool q4kLegacy = Q4KLegacyTuning;
+            _exactQ4K = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q4_K, 2, kMulti, kWide,
+                PerRowCountTuning ? (q4kLegacy ? KQuantRowsByColumns : Q4KRowsByColumns) : null);
             _exactQ6K = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K_Rows, 2, kMulti, kWide, PerRowCountTuning ? KQuantRowsByColumns : null);
-            if (_exactQ4K is not null) _exactQ4K.PadOddColumns = PadOddColumns;
+            if (_exactQ4K is not null) _exactQ4K.PadOddColumns = PadOddColumns && q4kLegacy;   // #1516: the pipelined shader has no 5/7 cliff; padding only adds work
             if (_exactQ6K is not null) _exactQ6K.PadOddColumns = PadOddColumns;
         }
     }
