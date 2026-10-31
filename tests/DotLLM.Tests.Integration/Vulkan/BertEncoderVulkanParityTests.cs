@@ -75,9 +75,9 @@ public sealed class BertEncoderVulkanParityTests
         public void Dispose() { Vk.Dispose(); Cpu.Dispose(); Gguf.Dispose(); }
     }
 
-    private static Ctx? Load(string repo, string file, string description)
+    private static Ctx? Load(string repo, string file, string description, string tag = "F16")
     {
-        var loc = TestFixtureResolver.ResolveFile($"DOTLLM_{repo.Replace('-', '_').ToUpperInvariant()}_F16_GGUF", "ChristianAzinn", repo, file);
+        var loc = TestFixtureResolver.ResolveFile($"DOTLLM_{repo.Replace('-', '_').ToUpperInvariant()}_{tag}_GGUF", "ChristianAzinn", repo, file);
         Skip.If(!loc.Found, loc.SkipMessage(description));
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan device.");
         var gguf = CheckpointGuard.LoadOrSkip(loc.Path!, description, () => GgufFile.Open(loc.Path!));
@@ -123,6 +123,35 @@ public sealed class BertEncoderVulkanParityTests
                 Assert.True(Cosine(packed[i], rev[c.Docs.Length - 1 - i]) >= 0.99999, $"{name} {pooling} text[{i}]: reversed pack order changes the vector");
             // Control arm: the comparison can disagree.
             Assert.True(Cosine(packed[1], packed[8]) < 0.95, $"{name} {pooling}: unrelated texts must not look identical");
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData("bge-small", "bge-small-en-v1.5-gguf", "bge-small-en-v1.5_fp16.gguf", "bge-small-en-v1.5.Q8_0.gguf")]
+    [InlineData("bge-base", "bge-base-en-v1.5-gguf", "bge-base-en-v1.5_fp16.gguf", "bge-base-en-v1.5.Q8_0.gguf")]
+    public void Q8_0_weights_read_in_place_match_cpu(string name, string repo, string f16File, string q8File)
+    {
+        // #1473: Q8_0 blocks are read directly by the GEMM (dequantised in the LDS tile load). Vulkan Q8_0 vs CPU Q8_0 on the same file:
+        // the CPU also quantises its activations to Q8_1, so the gate is the Q8_0 class (CPU Q8 vs CPU F16 measures 0.9995-0.9996 min), not 0.9999.
+        using var q = Load(repo, q8File, $"{name} Q8_0 GGUF", "Q8_0")!;
+        using var f = Load(repo, f16File, $"{name} F16 GGUF")!;
+        int h = q.Config.HiddenSize;
+        foreach (var pooling in new[] { PoolingType.Cls, PoolingType.Mean })
+        {
+            var cpuQ = Embed(q.Cpu, q.Docs, h, pooling);
+            var vkQ = Embed(q.Vk, q.Docs, h, pooling);
+            var vkF = Embed(f.Vk, f.Docs, h, pooling);
+            double min = 1, differs = 0;
+            for (int i = 0; i < q.Docs.Length; i++)
+            {
+                double cos = Cosine(cpuQ[i], vkQ[i]);
+                min = Math.Min(min, cos);
+                Assert.True(cos >= 0.999, $"{name} {pooling} text[{i}]: Vulkan Q8_0 vs CPU Q8_0 cosine {cos:F6} < 0.999");
+                Assert.True(Cosine(vkF[i], vkQ[i]) >= 0.999, $"{name} {pooling} text[{i}]: Vulkan Q8_0 vs Vulkan F16 cosine below 0.999");
+                if (Cosine(vkF[i], vkQ[i]) < 0.9999995) differs++;
+            }
+            // Control arm: the Q8_0 weights are really what ran (an F16 fallback would be ~1.0 to the F16 model on every text).
+            Assert.True(differs >= q.Docs.Length / 2, $"{name} {pooling}: Q8_0 output is indistinguishable from the F16 model on {q.Docs.Length - differs} texts (min cpu cosine {min:F6})");
         }
     }
 
