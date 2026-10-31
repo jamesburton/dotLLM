@@ -108,6 +108,16 @@ internal sealed class VulkanQwen3MoeHybridForwardState : IDisposable
     public VulkanDevice.Buffer MoeSharedSumA { get; private set; } = null!;
     public VulkanDevice.Buffer MoeSharedSumB { get; private set; } = null!;
     public VulkanDevice.Buffer MoeSharedGateLogits { get; private set; } = null!;
+    /// <summary>
+    /// Q8_1 activation scratch owned by the overlapped shared-expert chain (#1452): the shared Q8_0 gate/up and down matmuls cannot share
+    /// <c>MoeExpandedInputXq/Xds</c> with the routed gate/up when both run in the same barrier epoch (#952). Rows capped at
+    /// <see cref="SharedOverlapMaxRows"/>; <c>SharedXq</c> holds K=hidden (the norm output), <c>SharedSiluXq</c> K=shared-intermediate.
+    /// </summary>
+    public VulkanDevice.Buffer? SharedXq { get; private set; }
+    public VulkanDevice.Buffer? SharedXds { get; private set; }
+    public VulkanDevice.Buffer? SharedSiluXq { get; private set; }
+    public VulkanDevice.Buffer? SharedSiluXds { get; private set; }
+    public const int SharedOverlapMaxRows = 8;
 
     // ── Logits + positions ───────────────────────────────────────────────────
     public VulkanDevice.Buffer Logits { get; }
@@ -237,6 +247,15 @@ internal sealed class VulkanQwen3MoeHybridForwardState : IDisposable
         MoeSharedSumA = _device.AllocateDeviceLocal(hiddenBytes);
         MoeSharedSumB = _device.AllocateDeviceLocal(hiddenBytes);
         MoeSharedGateLogits = _device.AllocateDeviceLocal(sharedGateLogitBytes);
+        SharedXq = SharedXds = SharedSiluXq = SharedSiluXds = null;
+        if (_moeSharedIntermediate > 0 && (_hiddenSize & 31) == 0 && (_moeSharedIntermediate & 31) == 0)
+        {
+            long ovRows = Math.Min(seqLen, SharedOverlapMaxRows);
+            SharedXq = _device.AllocateDeviceLocal(Math.Max(4L, ovRows * (_hiddenSize / 4) * sizeof(uint)));
+            SharedXds = _device.AllocateDeviceLocal(Math.Max(8L, ovRows * (_hiddenSize / 32) * 2 * sizeof(float)));
+            SharedSiluXq = _device.AllocateDeviceLocal(Math.Max(4L, ovRows * (_moeSharedIntermediate / 4) * sizeof(uint)));
+            SharedSiluXds = _device.AllocateDeviceLocal(Math.Max(8L, ovRows * (_moeSharedIntermediate / 32) * 2 * sizeof(float)));
+        }
 
         PositionsBuffer.Dispose();
         PositionsBuffer = _device.Allocate((long)seqLen * sizeof(int));
@@ -268,6 +287,8 @@ internal sealed class VulkanQwen3MoeHybridForwardState : IDisposable
         MoeSharedInput?.Dispose(); MoeSharedGate?.Dispose(); MoeSharedUp?.Dispose();
         MoeSharedSilu?.Dispose(); MoeSharedSumA?.Dispose(); MoeSharedSumB?.Dispose();
         MoeSharedGateLogits?.Dispose();
+        SharedXq?.Dispose(); SharedXds?.Dispose(); SharedSiluXq?.Dispose(); SharedSiluXds?.Dispose();
+        SharedXq = SharedXds = SharedSiluXq = SharedSiluXds = null;
     }
 
     public void Dispose()

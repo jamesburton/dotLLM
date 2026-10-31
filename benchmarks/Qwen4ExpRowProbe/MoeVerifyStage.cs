@@ -36,12 +36,15 @@ internal static class MoeVerifyStage
             for (int r = 0; r < reps; r++)
                 for (int ai = 0; ai < arms.Length; ai++)
                 {
-                    VulkanQwen3MoeHybridTransformerModel.PerturbSkip = arms[ai] == "base" ? null : arms[ai];
+                    // "base" = current default; "ovoff"/"ovon" force the #1452 shared-expert overlap off/on; scatter/shared are skip perturbations.
+                    VulkanQwen3MoeHybridTransformerModel.SharedOverlapEnabled = arms[ai] != "ovoff";
+                    VulkanQwen3MoeHybridTransformerModel.PerturbSkip = arms[ai] is "base" or "ovoff" or "ovon" ? null : arms[ai];
                     string key = arms[ai] + "#" + ai;
                     if (!res.TryGetValue(key, out var l)) res[key] = l = new();
                     l.Add(Fwd(rows, 100 + r));
                 }
             VulkanQwen3MoeHybridTransformerModel.PerturbSkip = null;
+            VulkanQwen3MoeHybridTransformerModel.SharedOverlapEnabled = true;
             foreach (var kv in res) { var s = kv.Value.OrderBy(x => x).ToList(); Console.WriteLine($"rows={rows} arm={kv.Key,-10} min {s[0]:F2} med {s[s.Count / 2]:F2} max {s[^1]:F2} ms"); }
             VulkanQwen3MoeHybridTransformerModel.StageProfileEnabled = true;
             model.TakeStageTimes();
