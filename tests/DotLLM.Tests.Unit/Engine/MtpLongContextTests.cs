@@ -74,12 +74,15 @@ public sealed class MtpLongContextTests : IDisposable
         }
     }
 
+    private static Span<float> KeyRow(CpuMtpState st, int p) => System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(st.GetKeyRowBytes(p));
+    private static Span<float> ValueRow(CpuMtpState st, int p) => System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(st.GetValueRowBytes(p));
+
     [Fact]
     public void CpuMtpState_GrowsLazily_PreservesCommittedRows_AndRefusesPastTheCeiling()
     {
         const int hidden = 4, kvHeads = 2, headDim = 3, ceiling = 5000;
         const int stride = kvHeads * headDim;
-        using var st = new CpuMtpState(hidden, kvHeads, headDim, ceiling);
+        using var st = new CpuMtpState(hidden, kvHeads, headDim, ceiling, CpuMtpKvFormat.F32);   // F32 reference arm: rows stamped as floats
 
         Assert.Equal(ceiling, st.MaxSteps);
         Assert.Equal(1024, st.Capacity);
@@ -91,8 +94,8 @@ public sealed class MtpLongContextTests : IDisposable
         Assert.Equal(2048, st.Capacity);
         for (int p = 0; p < 1500; p++)
         {
-            st.GetKeyRow(p).Fill(p + 0.25f);
-            st.GetValueRow(p).Fill(-(p + 0.5f));
+            KeyRow(st, p).Fill(p + 0.25f);
+            ValueRow(st, p).Fill(-(p + 0.5f));
         }
         st.EndAbsorb(1500);
 
@@ -101,10 +104,10 @@ public sealed class MtpLongContextTests : IDisposable
         Assert.Equal(3072, st.Capacity);
         for (int p = 0; p < 1500; p++)
         {
-            Assert.Equal(p + 0.25f, st.GetKeyRow(p)[stride - 1]);
-            Assert.Equal(-(p + 0.5f), st.GetValueRow(p)[0]);
+            Assert.Equal(p + 0.25f, KeyRow(st, p)[stride - 1]);
+            Assert.Equal(-(p + 0.5f), ValueRow(st, p)[0]);
         }
-        Assert.True(st.GetKeyRow(2999).ToArray().All(v => v == 0f), "grown rows start zeroed");
+        Assert.True(KeyRow(st, 2999).ToArray().All(v => v == 0f), "grown rows start zeroed");
 
         // The ceiling is a hard stop, and a refused request changes nothing.
         int before = st.Capacity;
@@ -114,7 +117,7 @@ public sealed class MtpLongContextTests : IDisposable
 
         st.EnsureCapacity(ceiling);
         Assert.Equal(ceiling, st.Capacity);   // clamped, not rounded to 5120
-        Assert.Throws<ArgumentOutOfRangeException>(() => st.GetKeyRow(ceiling));
+        Assert.Throws<ArgumentOutOfRangeException>(() => st.GetKeyRowBytes(ceiling));
     }
 
     // ── End to end on the CPU backend ────────────────────────────────────────

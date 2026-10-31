@@ -153,6 +153,12 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel
         => _mtpHead is null ? null : new CpuMtpState(Config.HiddenSize, _mtpHead.Attn.NumKvHeads, Config.HeadDim, maxSequenceLength);
 
     /// <inheritdoc/>
+    public IMtpState? CreateMtpState(int maxSequenceLength, KvCacheDType? trunkKvType)
+        => _mtpHead is null || CpuMtpState.FromTrunk(trunkKvType) is not { } format
+            ? CreateMtpState(maxSequenceLength)
+            : new CpuMtpState(Config.HiddenSize, _mtpHead.Attn.NumKvHeads, Config.HeadDim, maxSequenceLength, format);
+
+    /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache,
                            Core.Lora.ILoraAdapter? adapter, IMtpState? mtpState)
     {
@@ -191,6 +197,7 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel
         state.BeginAbsorb(positions[0], s);
         var pool = ArrayPool<float>.Shared;
         float[] embedArr = pool.Rent(s * h), pairArr = pool.Rent(s * h), concatArr = pool.Rent(s * 2 * h), curArr = pool.Rent(s * h);
+        float[] kScratch = pool.Rent(s * kvStride), vScratch = pool.Rent(s * kvStride);
         try
         {
             var embed = embedArr.AsSpan(0, s * h);
@@ -212,20 +219,23 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel
                 RmsNorm.Execute(cur.Slice(i * h, h), head.AttnNorm, eps, cur.Slice(i * h, h));
 
             // K/V straight into the head's slab [positions[0], +s); the attention, O-projection and MoE of an absorbed cell are dead compute.
-            float* kDst = state.KeyCachePtr + (long)positions[0] * kvStride;
-            float* vDst = state.ValueCachePtr + (long)positions[0] * kvStride;
-            fixed (float* curPtr = cur)
+            // K/V land in transient F32 scratch, are normed + rotated there, then stored in the head's format (issue #1141).
+            fixed (float* curPtr = cur, kDst = kScratch, vDst = vScratch)
             {
                 Gemm(head.Attn.KWeight, head.Attn.KQuantType, curPtr, kDst, head.Attn.KOutputDim, head.Attn.KInputDim, s, preQuantizedInput: null);
                 Gemm(head.Attn.VWeight, head.Attn.VQuantType, curPtr, vDst, head.Attn.VOutputDim, head.Attn.VInputDim, s, preQuantizedInput: null);
             }
-            var kSlab = new Span<float>(kDst, s * kvStride);
+            var kSlab = kScratch.AsSpan(0, s * kvStride);
             Mamba3QkNorm.Execute(kSlab, head.Attn.KNormWeight, eps, s, kvHeads, hd);
             RoPE.Execute(Span<float>.Empty, kSlab, positions, 0, kvHeads, hd, _ropeDim, _ropeCosTable, _ropeSinTable, RoPEType.NeoX);
+            state.StoreKeyRows(positions[0], kSlab, s);
+            state.StoreValueRows(positions[0], vScratch.AsSpan(0, s * kvStride), s);
             state.EndAbsorb(positions[0] + s);
         }
         finally
         {
+            pool.Return(kScratch);
+            pool.Return(vScratch);
             pool.Return(embedArr);
             pool.Return(pairArr);
             pool.Return(concatArr);
@@ -257,6 +267,7 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel
         float[] embArr = pool.Rent(h), concatArr = pool.Rent(2 * h), curArr = pool.Rent(h), resArr = pool.Rent(h), normArr = pool.Rent(h);
         float[] qgArr = pool.Rent(2 * qElems), qArr = pool.Rent(qElems), gateArr = pool.Rent(qElems), attnArr = pool.Rent(qElems);
         float[] logitsArr = pool.Rent(vocab);
+        float[] kRowArr = pool.Rent(kvStride), vRowArr = pool.Rent(kvStride);
         try
         {
             var emb = embArr.AsSpan(0, h);
@@ -268,8 +279,8 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel
             var q = qArr.AsSpan(0, qElems);
             var gate = gateArr.AsSpan(0, qElems);
             var attnOut = attnArr.AsSpan(0, qElems);
-            var k = state.GetKeyRow(position);
-            var v = state.GetValueRow(position);
+            var k = kRowArr.AsSpan(0, kvStride);   // transient F32 row; stored into the head's format after norm + RoPE (#1141)
+            var v = vRowArr.AsSpan(0, kvStride);
 
             fixed (float* embPtr = emb)
                 EmbedTokens([tokenId], embPtr, h);
@@ -296,9 +307,9 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel
             Mamba3QkNorm.Execute(k, head.Attn.KNormWeight, eps, 1, kvHeads, hd);
             RoPE.Execute(q, k, [position], heads, kvHeads, hd, _ropeDim, _ropeCosTable, _ropeSinTable, RoPEType.NeoX);
             int seqKv = position + 1;
-            Attention.Execute(q, new ReadOnlySpan<float>(state.KeyCachePtr, seqKv * kvStride),
-                new ReadOnlySpan<float>(state.ValueCachePtr, seqKv * kvStride), attnOut,
-                1, seqKv, heads, kvHeads, hd, position, (int?)null);
+            state.StoreKeyRows(position, k, 1);
+            state.StoreValueRows(position, v, 1);
+            state.AttendOver(q, attnOut, seqKv, heads, position);
             for (int i = 0; i < qElems; i++)
                 attnOut[i] *= 1f / (1f + MathF.Exp(-gate[i]));
             fixed (float* aPtr = attnOut, curPtr = cur)
@@ -335,6 +346,8 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel
             pool.Return(gateArr);
             pool.Return(attnArr);
             pool.Return(logitsArr);
+            pool.Return(kRowArr);
+            pool.Return(vRowArr);
         }
     }
 }

@@ -38,8 +38,11 @@ public sealed class VulkanMtpState : IMtpState, IDisposable
     private readonly int _maxSteps;
     private readonly int _kvStride; // numKvHeads * headDim
 
-    private readonly VulkanDevice.Buffer _keyCache;      // [maxSteps, kvStride] f32, device-local
-    private readonly VulkanDevice.Buffer _valueCache;    // [maxSteps, kvStride] f32, device-local
+    private readonly VulkanKvStorage _storage;
+    private readonly int _kvRowBytes;                    // bytes of one stored K (or V) row
+
+    private readonly VulkanDevice.Buffer _keyCache;      // [maxSteps, kvStride] in _storage (F16 by default), device-local
+    private readonly VulkanDevice.Buffer _valueCache;    // [maxSteps, kvStride] in _storage, device-local
     private readonly VulkanDevice.Buffer _pendingHidden; // [hiddenSize] f32, host-visible
 
     private float[] _capturedRows = []; // host [rowCount, hiddenSize], grown on demand
@@ -71,10 +74,24 @@ public sealed class VulkanMtpState : IMtpState, IDisposable
     /// <inheritdoc/>
     public int HiddenSize => _hiddenSize;
 
-    /// <summary>Device key-cache buffer, <c>[maxSteps, kvStride]</c> row-major F32.</summary>
+    /// <summary>Environment variable selecting the head KV storage: <c>f16</c> (default) or <c>f32</c> (reference arm only).</summary>
+    public const string KvEnvVar = "DOTLLM_VULKAN_MTP_KV";
+
+    /// <summary>Element storage of the head's K/V rows: F16 by default (never wider, rule 1 of #1107), F32 as the reference arm only (issue #1141).</summary>
+    public VulkanKvStorage Storage => _storage;
+
+    /// <summary>Bytes of one stored K (or V) row.</summary>
+    public int KvRowBytes => _kvRowBytes;
+
+    /// <summary>Resolves the storage: an explicit request wins, then <see cref="KvEnvVar"/>, then F16.</summary>
+    public static VulkanKvStorage ResolveStorage(VulkanKvStorage? requested)
+        => requested ?? (string.Equals(Environment.GetEnvironmentVariable(KvEnvVar), "f32", StringComparison.OrdinalIgnoreCase)
+            ? VulkanKvStorage.F32 : VulkanKvStorage.F16);
+
+    /// <summary>Device key-cache buffer, <c>[maxSteps, kvStride]</c> row-major in <see cref="Storage"/>.</summary>
     internal VulkanDevice.Buffer KeyCache => _keyCache;
 
-    /// <summary>Device value-cache buffer, <c>[maxSteps, kvStride]</c> row-major F32.</summary>
+    /// <summary>Device value-cache buffer, <c>[maxSteps, kvStride]</c> row-major in <see cref="Storage"/>.</summary>
     internal VulkanDevice.Buffer ValueCache => _valueCache;
 
     /// <summary>Host-visible pending-hidden buffer, <c>[hiddenSize]</c> F32 — the seed for the next <c>ForwardMtp</c> call.</summary>
@@ -90,7 +107,8 @@ public sealed class VulkanMtpState : IMtpState, IDisposable
     /// <param name="numKvHeads">KV head count for the MTP block's own attention.</param>
     /// <param name="headDim">Per-head dimension for the MTP block's own attention.</param>
     /// <param name="maxSteps">Maximum autoregressive MTP draft steps to size the KV-cache for (typically the max candidate count K).</param>
-    public VulkanMtpState(VulkanDevice device, int hiddenSize, int numKvHeads, int headDim, int maxSteps)
+    /// <param name="storage">K/V row storage; <see langword="null"/> = F16 (or the <see cref="KvEnvVar"/> override). The head follows the trunk's <see cref="VulkanKvStorage"/>.</param>
+    public VulkanMtpState(VulkanDevice device, int hiddenSize, int numKvHeads, int headDim, int maxSteps, VulkanKvStorage? storage = null)
     {
         ArgumentNullException.ThrowIfNull(device);
         if (hiddenSize <= 0) throw new ArgumentOutOfRangeException(nameof(hiddenSize));
@@ -105,8 +123,10 @@ public sealed class VulkanMtpState : IMtpState, IDisposable
         _maxSteps = maxSteps;
         _kvStride = numKvHeads * headDim;
         _carryHidden = new float[hiddenSize];
+        _storage = ResolveStorage(storage);
+        _kvRowBytes = _kvStride * _storage.ElementBytes();
 
-        long kvBytes = (long)maxSteps * _kvStride * sizeof(float);
+        long kvBytes = (long)maxSteps * _kvRowBytes;
         long hiddenBytes = (long)hiddenSize * sizeof(float);
 
         _keyCache = device.AllocateDeviceLocal(kvBytes);
@@ -234,7 +254,7 @@ public sealed class VulkanMtpState : IMtpState, IDisposable
 
     /// <summary>Total device bytes allocated for this state (excludes the small managed captured-rows buffer).</summary>
     public long AllocatedBytes =>
-        2L * _maxSteps * _kvStride * sizeof(float) + (long)_hiddenSize * sizeof(float);
+        2L * _maxSteps * _kvRowBytes + (long)_hiddenSize * sizeof(float);
 
     private void ThrowIfDisposed()
     {

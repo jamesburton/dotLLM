@@ -967,11 +967,15 @@ public static class Attention
     // ──────────────────── Tiled attention over cached KV rows (quantized, ring, paged) ────────────────────
 
     /// <summary>Element format of a cached K or V row, decoded one head slice at a time into F32 scratch.</summary>
-    private enum KvRowFormat : byte
+    public enum KvRowFormat : byte
     {
+        /// <summary>32-bit float.</summary>
         F32,
+        /// <summary>16-bit float.</summary>
         F16,
+        /// <summary>Q8_0 blocks.</summary>
         Q8_0,
+        /// <summary>Q4_0 blocks.</summary>
         Q4_0,
     }
 
@@ -1181,6 +1185,35 @@ public static class Attention
             RunTiled(ref ctx, q, output, seqQ, numHeads, numKvHeads, headDim, positionOffset, pool,
                      slidingWindowSize, softCap, sinks);
         }
+    }
+
+    /// <summary>
+    /// Attention over one contiguous run of cached K / V rows in <paramref name="format"/> (F16, Q8_0 or Q4_0; F32 too), read in place
+    /// with the same tiled online-softmax arithmetic as the paged and quantized-cache paths. Used by the MTP head's own tiny cache
+    /// (issue #1141): rows <c>[0, seqKv)</c> start at <paramref name="keys"/> / <paramref name="values"/>, <paramref name="rowBytes"/> apart.
+    /// </summary>
+    [SkipLocalsInit]
+    public static unsafe void ExecuteContiguousRows(float* q, byte* keys, byte* values, KvRowFormat format, int rowBytes,
+                                                    float* output, int seqQ, int seqKv, int numHeads, int numKvHeads,
+                                                    int headDim, int positionOffset, ComputeThreadPool? pool,
+                                                    int? slidingWindowSize = null)
+    {
+        ValidateHeads(numHeads, numKvHeads, headDim);
+        if (seqQ <= 0 || seqKv <= 0 || positionOffset < 0 || (long)positionOffset + seqQ > seqKv)
+            throw new ArgumentException("Query positions must lie inside the cached rows.");
+        if (format is KvRowFormat.Q8_0 or KvRowFormat.Q4_0 && headDim % KvQuantize.BlockSize != 0)
+            throw new ArgumentException($"Quantized KV rows need headDim % {KvQuantize.BlockSize} == 0.");
+        var ctx = new TiledKvCtx
+        {
+            K0 = KvRows.Create(keys, rowBytes, format, headDim),
+            V0 = KvRows.Create(values, rowBytes, format, headDim),
+            Split = seqKv,
+            SeqKv = seqKv,
+            Scale = 1.0f / MathF.Sqrt(headDim),
+            OneShot = true,
+        };
+        RunTiled(ref ctx, q, output, seqQ, numHeads, numKvHeads, headDim, positionOffset, pool,
+                 slidingWindowSize, 0f, null);
     }
 
     private static void ValidateHeads(int numHeads, int numKvHeads, int headDim)

@@ -100,14 +100,17 @@ public sealed class VulkanQwen3HybridDenseMtpBatchedAbsorbTests : IDisposable
             var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
             using var model = (Qwen3HybridDenseTransformerModel)ModelLoader.CreateCpuModelFromGguf(gguf, config);
             using var kv = new SimpleKvCache(model.AttentionLayerCount, config.NumKvHeads, config.HeadDim, config.MaxSequenceLength);
-            using var state = (CpuMtpState)model.CreateMtpState()!;
+            // F32 reference-format head: this test compares absorb paths at float tolerance, not at F16 rounding granularity (#1141).
+            using var state = new CpuMtpState(config.HiddenSize, KvStride / config.HeadDim, config.HeadDim, config.MaxSequenceLength, CpuMtpKvFormat.F32);
             int p = Drive(model, kv, state);
-            unsafe
+            var keys = new float[p * KvStride];
+            var values = new float[p * KvStride];
+            for (int r = 0; r < p; r++)
             {
-                return new Snapshot(state.CurrentLength,
-                    new ReadOnlySpan<float>(state.KeyCachePtr, p * KvStride).ToArray(),
-                    new ReadOnlySpan<float>(state.ValueCachePtr, p * KvStride).ToArray());
+                System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(state.GetKeyRowBytes(r)).CopyTo(keys.AsSpan(r * KvStride));
+                System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(state.GetValueRowBytes(r)).CopyTo(values.AsSpan(r * KvStride));
             }
+            return new Snapshot(state.CurrentLength, keys, values);
         }
         finally
         {
@@ -125,7 +128,7 @@ public sealed class VulkanQwen3HybridDenseMtpBatchedAbsorbTests : IDisposable
             using var device = VulkanDevice.Create();
             using var model = VulkanQwen3HybridDenseTransformerModel.BuildFromGguf(device, gguf, config, spvDir);
             using var kv = model.CreateKvCache(config.MaxSequenceLength);
-            using var state = (VulkanMtpState)model.CreateMtpState()!;
+            using var state = new VulkanMtpState(device, config.HiddenSize, KvStride / config.HeadDim, config.HeadDim, 4096, VulkanKvStorage.F32);   // F32 reference arm (#1141)
             int p = Drive(model, kv, state);
 
             var all = new float[state.MaxSteps * KvStride];

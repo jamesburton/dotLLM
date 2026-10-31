@@ -162,6 +162,31 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
     /// <inheritdoc/>
     public IMtpState? CreateMtpState() => CreateMtpState(Math.Max(MtpDefaultMaxSequenceLength, Config.MaxSequenceLength));
 
+    /// <summary>
+    /// Stores <paramref name="rows"/> F32 K/V rows from the model's scratch into the head's cache at rows <c>[firstRow, +rows)</c>
+    /// in the head's storage (issue #1141): a plain copy for the F32 reference arm, else the F32 to F16 convert kernel. Brackets
+    /// the writes with the barriers (compute before, compute-or-transfer to compute after).
+    /// </summary>
+    private void RecordMtpKvStore(nint cmd, VulkanMtpState state, int firstRow, int rows, int kvStride)
+    {
+        if (state.Storage == VulkanKvStorage.F32)
+        {
+            KernelSupport.ComputeToTransferBarrier(cmd);
+            ulong rowBytes = (ulong)state.KvRowBytes;
+            RecordCopyBufferRange(cmd, _state.K, state.KeyCache, 0, (ulong)firstRow * rowBytes, (ulong)rows * rowBytes);
+            RecordCopyBufferRange(cmd, _state.V, state.ValueCache, 0, (ulong)firstRow * rowBytes, (ulong)rows * rowBytes);
+            KernelSupport.TransferToComputeBarrier(cmd);
+            return;
+        }
+
+        var writer = _kernels.EnsureNarrowKv(VulkanKvStorage.F16, Config.HeadDim).Writer;
+        KernelSupport.ComputeToComputeBarrier(cmd);
+        long first = (long)firstRow * kvStride, count = (long)rows * kvStride;
+        writer.RecordF32ToF16(cmd, _state.K, state.KeyCache, first, count);
+        writer.RecordF32ToF16(cmd, _state.V, state.ValueCache, first, count);
+        KernelSupport.ComputeToComputeBarrier(cmd);
+    }
+
     /// <inheritdoc/>
     public IMtpState? CreateMtpState(int maxSequenceLength)
         => _mtpHead is null ? null : new VulkanMtpState(_device, Config.HiddenSize, _mtpHead.Attention.NumKvHeads, Config.HeadDim, maxSequenceLength);
@@ -289,10 +314,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
         // The RoPE kernel always rotates a Q operand too; give it one head of the (dead) Q scratch.
         _kernels.Rope.Record(cmd, _state.Q, _state.K, _state.PositionsBuffer, seqLen: s, numHeads: 1, numKvHeads: kvHeads,
             headDim: hd, ropeDim: _ropeDim, theta: _ropeTheta, variant: RopeF32Kernel.Variant.NeoX);
-        KernelSupport.ComputeToTransferBarrier(cmd);
-        long kvRow = (long)kvHeads * hd * sizeof(float);
-        RecordCopyBufferRange(cmd, _state.K, state.KeyCache, 0, (ulong)(first * kvRow), (ulong)(s * kvRow));
-        RecordCopyBufferRange(cmd, _state.V, state.ValueCache, 0, (ulong)(first * kvRow), (ulong)(s * kvRow));
+        RecordMtpKvStore(cmd, state, first, s, kvHeads * hd);
         KernelSupport.ComputeTransferFullBarrier(cmd);
         KernelSupport.ComputeToHostBarrier(cmd);
         _submit.SubmitAndWait();
@@ -358,12 +380,10 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
         KernelSupport.ComputeToComputeBarrier(cmd);
         _kernels.Rope.Record(cmd, _state.Q, _state.K, _state.PositionsBuffer, seqLen: 1, numHeads: heads, numKvHeads: kvHeads,
             headDim: hd, ropeDim: _ropeDim, theta: _ropeTheta, variant: RopeF32Kernel.Variant.NeoX);
-        KernelSupport.ComputeToTransferBarrier(cmd);
-        long kvRow = (long)kvHeads * hd * sizeof(float);
-        RecordCopyBufferRange(cmd, _state.K, state.KeyCache, 0, (ulong)(position * kvRow), (ulong)kvRow);
-        RecordCopyBufferRange(cmd, _state.V, state.ValueCache, 0, (ulong)(position * kvRow), (ulong)kvRow);
-        KernelSupport.TransferToComputeBarrier(cmd);
-        _kernels.Attention.Record(cmd, _state.Q, state.KeyCache, state.ValueCache, _state.AttnOutput,
+        RecordMtpKvStore(cmd, state, position, 1, kvHeads * hd);
+        var headAttention = state.Storage == VulkanKvStorage.F32
+            ? _kernels.Attention : _kernels.EnsureNarrowKv(VulkanKvStorage.F16, hd).Attention;
+        headAttention.Record(cmd, _state.Q, state.KeyCache, state.ValueCache, _state.AttnOutput,
             seqQ: 1, seqKv: position + 1, numHeads: heads, numKvHeads: kvHeads, headDim: hd, positionOffset: position, slidingWindow: 0);
         KernelSupport.ComputeToComputeBarrier(cmd);
         _kernels.SigmoidGateMul.Record(cmd, _state.AttnOutput, _state.GateScratch, nTotal: qElems);
