@@ -1169,7 +1169,6 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         float* ffnGate = (float*)_state.FfnGate;
         float* ffnUp = (float*)_state.FfnUp;
         float* siluOut = (float*)_state.SiluOutput;
-        float* logits = (float*)_state.Logits;
 
         // 1. EMBEDDING LOOKUP — or, for a layer window that does not own the embedding, the
         // boundary residual stream saved by the preceding window.
@@ -3304,12 +3303,14 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     {
         int vocabSize = Config.VocabSize;
         float* hidden = (float*)_state.HiddenState;
-        float* logits = (float*)_state.Logits;
         if (lastRowOnly)
         {
             hidden += (long)(seqLen - 1) * Config.HiddenSize;
             seqLen = 1;
         }
+
+        _state.EnsureLogitsCapacity(seqLen);   // only the rows the head computes (#1137)
+        float* logits = (float*)_state.Logits;
 
         long _tl = G4Prof.T();
         long _tlp = DotLLM.Cpu.CpuStageProf.T();
@@ -3528,6 +3529,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             staged?.AsSpan(0, outTotal * hiddenSize).CopyTo(new Span<float>(hidden, outTotal * hiddenSize));
 
             // One batched lm_head dispatch over the kept rows only.
+            _state.EnsureLogitsCapacity(outTotal);   // only the kept rows (#1137)
             float* logitsPtr = (float*)_state.Logits;
             var rwOutput = _weights.RepackedOutput ?? default;
             GemmInterleaved(_weights.OutputWeight, _weights.OutputQuantType,
