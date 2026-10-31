@@ -1,0 +1,24 @@
+#version 450
+// In-place fused bias add + tanh GELU: x[r, i] = gelu(x[r, i] + bias[i]) (issue #741).
+// ggml_gelu form, same as the CPU encoder (Gelu.ExecuteTanh): 0.5 x (1 + tanh(sqrt(2/pi) x (1 + 0.044715 x^2))).
+// Dispatch: local_size_x = 256, groupCount.x = ceil(rows * width / 256).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430)          buffer BufX    { float x[]; };
+layout(set = 0, binding = 1, std430) readonly buffer BufBias { float bias[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint total;   // rows * width
+    uint width;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.total) return;
+    float v = x[idx] + bias[idx % pc.width];
+    float a = 0.79788456080286535588 * v * (1.0 + 0.044715 * v * v);
+    a = clamp(a, -15.0, 15.0);
+    float t = 2.0 / (1.0 + exp(-2.0 * a)) - 1.0;   // tanh, saturating-safe
+    x[idx] = 0.5 * v * (1.0 + t);
+}

@@ -252,16 +252,43 @@ public static class ServerStartup
     private static ServerState LoadEncoderModel(
         string resolvedPath, ServerOptions options, GgufFile gguf, ModelConfig config, ITokenizer tokenizer)
     {
-        if (!string.Equals(options.Device, "cpu", StringComparison.OrdinalIgnoreCase))
+        var spec = DeviceSpec.TryParse(options.Device, out var parsed, out _) ? parsed : new DeviceSpec(DeviceKind.Auto, 0);
+        // #741: architecture 'bert' (F16 weights) has a Vulkan encoder. Explicit vulkan must succeed or fail loudly; auto uses it when
+        // a Vulkan device exists and the weights are F16, else the CPU encoder (with the usual warning); CUDA and the other encoder
+        // architectures are refused (no silent CPU run for an explicit GPU request).
+        bool vulkanCapable = config.Architecture == Architecture.Bert;
+        IModel? model = null;
+        if (spec.Kind == DeviceKind.Vulkan || (spec.Kind == DeviceKind.Auto && vulkanCapable && DotLLM.Vulkan.VulkanDevice.IsAvailable()))
+        {
+            if (!vulkanCapable)
+            {
+                gguf.Dispose();
+                throw new NotSupportedException(
+                    $"{config.Architecture} embedding models have no Vulkan backend yet (only architecture 'bert' does, #741). Use --device cpu; there is no silent CPU fallback.");
+            }
+            try
+            {
+                var (vkModel, _) = DeviceModelLoader.LoadExact(gguf, config, "vulkan", null, new ThreadingConfig(options.Threads, options.DecodeThreads),
+                    m => Console.WriteLine($"[dotllm] {m}; embeddings only"), m => Console.WriteLine($"[dotllm] WARNING: {m}"));
+                model = vkModel;
+            }
+            catch (NotSupportedException) when (spec.Kind == DeviceKind.Auto)
+            {
+                Console.WriteLine("[dotllm] WARNING: the Vulkan encoder cannot serve this file (F16 weights are required); falling back to the CPU encoder.");
+            }
+        }
+        else if (spec.Kind != DeviceKind.Cpu && spec.Kind != DeviceKind.Auto)
         {
             gguf.Dispose();
             throw new NotSupportedException(
-                $"{config.Architecture} embedding models are CPU-only for now (requested device '{options.Device}'). "
-                + "Use --device cpu; GPU encoder backends are not implemented (#741) and there is no silent CPU fallback. Decoder embedders (Qwen3-Embedding) do run on --device vulkan.");
+                $"{config.Architecture} embedding models run on --device cpu or vulkan (architecture 'bert' only), not '{options.Device}'. There is no silent CPU fallback; Decoder embedders (Qwen3-Embedding) run on --device vulkan.");
         }
-        var threading = new ThreadingConfig(options.Threads, options.DecodeThreads);
-        Console.WriteLine($"[dotllm] CPU inference, {config.Architecture} encoder ({threading.EffectiveThreadCount} threads); embeddings only");
-        var model = BertEncoderModel.LoadFromGguf(gguf, config, threading);
+        if (model is null)
+        {
+            var threading = new ThreadingConfig(options.Threads, options.DecodeThreads);
+            Console.WriteLine($"[dotllm] CPU inference, {config.Architecture} encoder ({threading.EffectiveThreadCount} threads); embeddings only");
+            model = BertEncoderModel.LoadFromGguf(gguf, config, threading);
+        }
         return new ServerState
         {
             Options = options,

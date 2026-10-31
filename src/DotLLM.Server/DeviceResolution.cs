@@ -132,9 +132,16 @@ public static class DeviceModelLoader
 
         // Bidirectional embedding towers (EmbeddingGemma) have no GPU implementation: the CUDA/Vulkan decoders are causal and
         // would return wrong vectors without any error. Fail loudly (auto falls through to the CPU with a warning).
-        if (config.BidirectionalAttention && spec.Kind != DeviceKind.Cpu)
+        // BERT encoders (bge / e5 / gte / MiniLM / mxbai, F16 weights) have a dedicated Vulkan implementation (#741).
+        if (spec.Kind == DeviceKind.Vulkan && config.Architecture == Architecture.Bert)
+        {
+            log($"Vulkan inference ({DotLLM.Vulkan.VulkanModelLoader.SharedDevice.DeviceName}), {config.Architecture} encoder");
+            return (DotLLM.Vulkan.VulkanBertEncoderModel.LoadFromGguf(
+                DotLLM.Vulkan.VulkanModelLoader.SharedDevice, gguf, config, DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir()), null);
+        }
+        if ((config.BidirectionalAttention || config.Architecture is Architecture.Bert or Architecture.NomicBert or Architecture.NomicBertMoe) && spec.Kind != DeviceKind.Cpu)
             throw new NotSupportedException(
-                $"{config.Architecture} is a bidirectional embedding model and runs on the CPU only (requested '{canonicalDevice}'); use --device cpu.");
+                $"{config.Architecture} is a bidirectional embedding model and runs on the CPU only (requested '{canonicalDevice}'; the Vulkan BERT encoder covers architecture 'bert' only, #741); use --device cpu.");
 
         if (spec.Kind == DeviceKind.Vulkan)
         {

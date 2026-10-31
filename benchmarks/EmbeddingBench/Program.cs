@@ -79,7 +79,8 @@ internal static class Program
             {
                 case "throughput": Throughput(label, emb, tok, config, pooling, Ints("batches", "1,8,32,128"), Ints("seqs", "64,256,512"), cellSec, threads); break;
                 case "vkpack": VulkanPack(label, emb, tok, config, pooling, Ints("seqs", "16,32,64"), Ints("packs", "1,2,4,8,16,32"), int.Parse(opt.GetValueOrDefault("iters", "20")), opt.GetValueOrDefault("proxy", "0") == "1"); break;
-                case "batch": BatchThroughput(label, emb, tok, config, Ints("batches", "1,8,32,128"), Ints("seqs", "64,256"), cellSec, threads); break;
+                case "batch": BatchThroughput(label, emb, tok, config, Ints("batches", "1,8,32,128"), Ints("seqs", "64,256"), cellSec, threads, opt.GetValueOrDefault("pooled", "0") == "1" ? pooling : null); break;
+                case "textbatch": TextBatch(label, emb, tok, config, pooling, pos[1], Ints("batches", "1,16,48"), threads); break;
                 case "latency": Latency(label, emb, tok, config, pooling, Ints("seqs", "16,64,256"), int.Parse(opt.GetValueOrDefault("iters", "200")), threads); break;
                 case "profile": Profile(label, emb, tok, config, pooling, Ints("seqs", "64,256,512"), int.Parse(opt.GetValueOrDefault("iters", "10"))); break;
                 case "tokenizer": TokenizerBench(label, tok, int.Parse(opt.GetValueOrDefault("iters", "3"))); break;
@@ -96,6 +97,9 @@ internal static class Program
     {
         var gguf = GgufFile.Open(path);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        // #741: BERT encoders have a dedicated Vulkan model; every other architecture goes through the decoder-embedder path.
+        if (config.Architecture == DotLLM.Core.Configuration.Architecture.Bert)
+            return (VulkanBertEncoderModel.LoadFromGguf(gguf, config, VulkanModelLoader.ResolveSpvDir()), gguf, config);
         return (VulkanTransformerModel.LoadFromGguf(gguf, config, VulkanModelLoader.ResolveSpvDir()), gguf, config);
     }
 
@@ -245,13 +249,14 @@ internal static class Program
 
     /// <summary>Docs/s through <see cref="IEmbeddingModel.ForwardHiddenBatch"/> (#1405): B documents handed over as one batch.</summary>
     private static void BatchThroughput(string label, IEmbeddingModel emb, ITokenizer rawTok, ModelConfig cfg,
-        int[] batches, int[] seqs, double cellSec, int threads)
+        int[] batches, int[] seqs, double cellSec, int threads, PoolingType? pooled = null)
     {
         var tk = new Tk(rawTok);
+        void Run(IReadOnlyList<int[]> d) { if (pooled is { } pl) emb.ForwardHiddenForPooling(d, pl, (_, _) => { }, 0); else emb.ForwardHiddenBatch(d, (_, _) => { }, 0); }
         foreach (int seq in seqs)
         {
             if (seq > cfg.MaxSequenceLength) continue;
-            emb.ForwardHiddenBatch(MakeDocs(tk, 8, seq), (_, _) => { }, 0);
+            Run(MakeDocs(tk, 8, seq));
             foreach (int b in batches)
             {
                 var docs = MakeDocs(tk, b, seq, 11 + b);
@@ -259,7 +264,7 @@ internal static class Program
                 for (int rep = 0; rep < 5; rep++)
                 {
                     var t0 = Stopwatch.GetTimestamp();
-                    emb.ForwardHiddenBatch(docs, (_, _) => { }, 0);
+                    Run(docs);
                     reps.Add(b / Stopwatch.GetElapsedTime(t0).TotalSeconds);
                     if (sw.Elapsed.TotalSeconds > cellSec && reps.Count >= 3) break;
                 }
@@ -267,6 +272,37 @@ internal static class Program
                 Emit(new { mode = "batch", model = label, threads = threads == 0 ? Environment.ProcessorCount : threads, batch = b, seq = docs[0].Length,
                     docs_s_min = reps[0], docs_s_med = reps[reps.Count / 2], docs_s_max = reps[^1], tok_s_med = reps[reps.Count / 2] * docs[0].Length, reps = reps.Count });
             }
+        }
+    }
+
+    /// <summary>
+    /// Docs/s over a fixed text set (#741): tokenise once, then hand the set to <see cref="IEmbeddingModel.ForwardHiddenForPooling"/> in groups of
+    /// B documents (what the server batcher does), pool and normalise per document. 1 warm pass, 3 timed passes.
+    /// </summary>
+    private static void TextBatch(string label, IEmbeddingModel emb, ITokenizer tok, ModelConfig cfg, PoolingType pooling, string textsPath, int[] batches, int threads)
+    {
+        var texts = JsonSerializer.Deserialize<string[]>(File.ReadAllText(textsPath))!;
+        var ids = texts.Select(t => { var x = tok.Encode(t).ToArray(); if (x.Length > cfg.MaxSequenceLength) { int last = x[^1]; x = x[..cfg.MaxSequenceLength]; x[^1] = last; } return x; }).ToArray();
+        long tokens = ids.Sum(x => (long)x.Length); int h = cfg.HiddenSize;
+        foreach (int b in batches)
+        {
+            void Pass()
+            {
+                for (int i = 0; i < ids.Length; i += b)
+                {
+                    var group = ids.Skip(i).Take(b).ToArray();
+                    emb.ForwardHiddenForPooling(group, pooling, (_, rows) =>
+                    {
+                        var v = new float[h]; EmbeddingPooler.Pool(rows, rows.Length / h, h, pooling, v); EmbeddingPooler.L2Normalize(v);
+                    }, 0);
+                }
+            }
+            Pass();
+            var reps = new List<double>();
+            for (int r = 0; r < 3; r++) { var t0 = Stopwatch.GetTimestamp(); Pass(); reps.Add(ids.Length / Stopwatch.GetElapsedTime(t0).TotalSeconds); }
+            reps.Sort();
+            Emit(new { mode = "textbatch", model = label, threads = threads == 0 ? Environment.ProcessorCount : threads, batch = b, texts = ids.Length, tokens,
+                docs_s_min = reps[0], docs_s_med = reps[1], docs_s_max = reps[2], tok_s_med = reps[1] * tokens / ids.Length });
         }
     }
 

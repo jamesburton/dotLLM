@@ -1,0 +1,30 @@
+#version 450
+// Per-document pooling of a packed [total, n] hidden matrix into [docs, n] (issue #741).
+// mode 0 = CLS (first row of the document), 1 = mean over the document's rows (F32 accumulation in registers).
+// seg[2*d] = first row, seg[2*d+1] = row count. Dispatch: local_size_x = 256, groupCount.x = docs, groupCount.y = ceil(n/256).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufH   { float h[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufSeg { uint  seg[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufOut { float outp[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n;
+    uint mode;
+} pc;
+
+void main() {
+    uint d = gl_WorkGroupID.x;
+    uint col = gl_WorkGroupID.y * 256u + gl_LocalInvocationID.x;
+    if (col >= pc.n) return;
+    uint start = seg[2u * d];
+    uint len = seg[2u * d + 1u];
+    if (pc.mode == 0u) {
+        outp[d * pc.n + col] = h[start * pc.n + col];
+    } else {
+        float s = 0.0;
+        for (uint r = 0u; r < len; r++) s += h[(start + r) * pc.n + col];
+        outp[d * pc.n + col] = s / float(len);
+    }
+}
