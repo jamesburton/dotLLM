@@ -24,7 +24,7 @@ var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
 var vdev = VulkanDevice.Create();
 string spvDir = VulkanModelLoader.ResolveSpvDir();
 var (model, kvf) = VulkanModelLoader.CreateFromGguf(vdev, gguf, cfg, spvDir);
-var vm = (VulkanQwen3HybridDenseTransformerModel)model;
+var vm = model as VulkanQwen3HybridDenseTransformerModel;
 Console.WriteLine($"[gva] {Path.GetFileName(path)} model={model.GetType().Name} vocab={cfg.VocabSize} mtp={model.SupportsMtp} deviceGumbel={model.SupportsDeviceGumbelSampling} maxRows={model.DeviceGumbelMaxRows} snapshots={model.SupportsRecurrentRowSnapshots}");
 
 float Temperature = float.Parse(Environment.GetEnvironmentVariable("GVA_T") ?? "0.7", System.Globalization.CultureInfo.InvariantCulture);
@@ -221,7 +221,7 @@ void E2e()
     int reps = args.Length > 2 ? int.Parse(args[2]) : 3;
     int tokens = args.Length > 3 ? int.Parse(args[3]) : 96;
     string[] questions = ["Describe how a refrigerator works.", "Explain why the sky is blue in two sentences.", "List three uses for a paperclip."];
-    InferenceOptions Opts(int seed) => new() { Temperature = Temperature, Seed = seed, GumbelSampling = true, MaxTokens = tokens };
+    InferenceOptions Opts(int seed) => new() { Temperature = Temperature, Seed = seed, GumbelSampling = true, MaxTokens = tokens, TopK = int.Parse(Environment.GetEnvironmentVariable("GVA_TOPK") ?? "0"), MinP = float.Parse(Environment.GetEnvironmentVariable("GVA_MINP") ?? "0", System.Globalization.CultureInfo.InvariantCulture) };
 
     (int[] Ids, double Ms, int Rounds) Run(string arm, string q, int seed)
     {
@@ -266,13 +266,13 @@ void Sched()
     int[] seqsList = (args.Length > 4 ? args[4] : "2,4,8").Split(',').Select(int.Parse).ToArray();
     string[] questions = ["Describe how a refrigerator works.", "Explain why the sky is blue in two sentences.", "List three uses for a paperclip.",
         "What is a monad?", "Name five rivers in Europe.", "Why do cats purr?", "How does a bicycle stay upright?", "Summarise the plot of Hamlet."];
-    InferenceOptions Opts(int seed) => new() { Temperature = Temperature, Seed = seed, GumbelSampling = true, MaxTokens = tokens };
+    InferenceOptions Opts(int seed) => new() { Temperature = Temperature, Seed = seed, GumbelSampling = true, MaxTokens = tokens, TopK = int.Parse(Environment.GetEnvironmentVariable("GVA_TOPK") ?? "0"), MinP = float.Parse(Environment.GetEnvironmentVariable("GVA_MINP") ?? "0", System.Globalization.CultureInfo.InvariantCulture) };
 
     (int[][] Ids, double Ms, double DecodeMs, long DeviceSteps, int Fused, int Serial) Run(bool device, int seqs, int salt)
     {
         var sched = new DotLLM.Engine.Scheduler.ContinuousBatchScheduler(model, tokenizer, (c, n) => kvf(n));
         sched.UseDeviceGumbel = device;
-        int fusedBefore = vm.DeviceGumbelFusedBatches, serialBefore = vm.DeviceGumbelSerialBatches;
+        int fusedBefore = vm?.DeviceGumbelFusedBatches ?? 0, serialBefore = vm?.DeviceGumbelSerialBatches ?? 0;
         var handles = new DotLLM.Engine.Scheduler.ISchedulerRequest[seqs];
         for (int i = 0; i < seqs; i++)
             handles[i] = sched.Submit(new InferenceRequest { TokenIds = tokenizer.Encode(Chat(questions[i % questions.Length])), Options = Opts(1000 + salt * 10 + i) });
@@ -283,7 +283,7 @@ void Sched()
         double dec = handles.Sum(h => h.Completion.Result.Timings.DecodeTimeMs);
         long steps = sched.DeviceGumbelDecodeSteps;
         sched.Dispose();
-        return (ids, ms, dec, steps, vm.DeviceGumbelFusedBatches - fusedBefore, vm.DeviceGumbelSerialBatches - serialBefore);
+        return (ids, ms, dec, steps, (vm?.DeviceGumbelFusedBatches ?? 0) - fusedBefore, (vm?.DeviceGumbelSerialBatches ?? 0) - serialBefore);
     }
 
     Run(true, 2, 99); Run(false, 2, 99);   // warm both

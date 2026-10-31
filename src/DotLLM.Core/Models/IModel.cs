@@ -678,13 +678,19 @@ public interface IModel : IDisposable
             $"{GetType().Name} has no native MTP draft argmax (SupportsMtpArgMax=false); use ForwardMtp.");
 
     /// <summary>
-    /// True when <see cref="ForwardGumbelSampled"/> is implemented: the model draws the position-seeded Gumbel-max sample
+    /// True when <c>ForwardGumbelSampled</c> is implemented: the model draws the position-seeded Gumbel-max sample
     /// (<c>argmax(logits * invTemperature + Gumbel(seed, n, i))</c>, see <c>GumbelNoise</c>) of every verify row on the device, reading the
     /// LM-head logits in place, and returns only the sampled token ids (#1382). Default <see langword="false"/>.
     /// </summary>
     bool SupportsDeviceGumbelSampling => false;
 
-    /// <summary>The largest row count one <see cref="ForwardGumbelSampled"/> call covers (0 when unsupported).</summary>
+    /// <summary>
+    /// True when the device draw also honours a <see cref="GumbelFilter"/> (top-k / min-p) and <see cref="GumbelDraw.TopK"/> /
+    /// <see cref="GumbelDraw.MinP"/> in <see cref="ForwardBatchGumbelSampled"/> (#1435). Default <see langword="false"/>.
+    /// </summary>
+    bool SupportsDeviceGumbelFilter => false;
+
+    /// <summary>The largest row count one <c>ForwardGumbelSampled</c> call covers (0 when unsupported).</summary>
     int DeviceGumbelMaxRows => 0;
 
     /// <summary>
@@ -708,6 +714,20 @@ public interface IModel : IDisposable
                               IMtpState? mtpState, bool recurrentRowSnapshots, ulong seed, int firstTokenIndex, float invTemperature,
                               Span<int> sampledIds)
         => throw new NotSupportedException($"{GetType().Name} has no device Gumbel sampling (SupportsDeviceGumbelSampling=false).");
+
+    /// <summary>
+    /// <see cref="ForwardGumbelSampled(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, IMtpState?, bool, ulong, int, float, Span{int})"/>
+    /// whose rows are restricted by <paramref name="filter"/> (top-k then min-p on the scaled logits) before the draw (#1435). A
+    /// <see cref="GumbelFilter.IsNone"/> filter is the unfiltered overload; otherwise the model must report <see cref="SupportsDeviceGumbelFilter"/>.
+    /// </summary>
+    void ForwardGumbelSampled(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache,
+                              IMtpState? mtpState, bool recurrentRowSnapshots, ulong seed, int firstTokenIndex, float invTemperature,
+                              GumbelFilter filter, Span<int> sampledIds)
+    {
+        if (!filter.IsNone)
+            throw new NotSupportedException($"{GetType().Name} cannot filter a device Gumbel draw (SupportsDeviceGumbelFilter=false).");
+        ForwardGumbelSampled(tokenIds, positions, deviceId, kvCache, mtpState, recurrentRowSnapshots, seed, firstTokenIndex, invTemperature, sampledIds);
+    }
 
     /// <summary>
     /// True when <see cref="ForwardBatchGumbelSampled"/> is implemented: a batched decode (one token per request, per-sequence state as for
@@ -735,4 +755,15 @@ public interface IModel : IDisposable
 /// <param name="Seed">The request's Gumbel noise seed.</param>
 /// <param name="TokenIndex">Generation index of the token being drawn.</param>
 /// <param name="InvTemperature">The F32 reciprocal of the temperature the pipeline's temperature step multiplies by (1 for T = 1).</param>
-public readonly record struct GumbelDraw(ulong Seed, int TokenIndex, float InvTemperature);
+/// <param name="TopK">Top-k filter applied to the scaled logits before the draw (0 = off). Requires <see cref="IModel.SupportsDeviceGumbelFilter"/>.</param>
+/// <param name="MinP">Min-p filter (0 = off). Requires <see cref="IModel.SupportsDeviceGumbelFilter"/>.</param>
+public readonly record struct GumbelDraw(ulong Seed, int TokenIndex, float InvTemperature, int TopK = 0, float MinP = 0f);
+
+/// <summary>Top-k / min-p restriction of a device Gumbel draw (#1435), with the host <c>TopKSampler</c> (index-order ties) / <c>MinPSampler</c> semantics. Default = none.</summary>
+/// <param name="TopK">Top-k (0 = off).</param>
+/// <param name="MinP">Min-p (0 = off).</param>
+public readonly record struct GumbelFilter(int TopK = 0, float MinP = 0f)
+{
+    /// <summary>True when neither top-k nor min-p applies.</summary>
+    public bool IsNone => TopK <= 0 && MinP <= 0f;
+}

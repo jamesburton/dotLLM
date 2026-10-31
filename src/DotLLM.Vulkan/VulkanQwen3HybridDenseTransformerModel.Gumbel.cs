@@ -13,7 +13,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel
     /// <summary>Env switch: <c>DOTLLM_VULKAN_DEVICE_GUMBEL=0</c> turns the device draw off (the host path then reads the logits back).</summary>
     public const string DeviceGumbelEnvVar = "DOTLLM_VULKAN_DEVICE_GUMBEL";
 
-    private readonly record struct GumbelRequest(ulong Seed, int FirstTokenIndex, float InvTemperature);
+    private readonly record struct GumbelRequest(ulong Seed, int FirstTokenIndex, float InvTemperature, GumbelFilter Filter = default);
 
     private GumbelRequest? _pendingGumbel;
     private GumbelArgMaxKernel? _gumbelKernel;
@@ -48,10 +48,22 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel
     public int DeviceGumbelMaxRows => SupportsDeviceGumbelSampling ? Math.Min(_allRowLogitsLimit, 32) : 0;
 
     /// <inheritdoc/>
+    public bool SupportsDeviceGumbelFilter => SupportsDeviceGumbelBatch && Config.VocabSize <= GumbelArgMaxRowsKernel.MaxFilteredVocab;
+
+    /// <inheritdoc/>
     public void ForwardGumbelSampled(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache,
         IMtpState? mtpState, bool recurrentRowSnapshots, ulong seed, int firstTokenIndex, float invTemperature, Span<int> sampledIds)
+        => ForwardGumbelSampled(tokenIds, positions, deviceId, kvCache, mtpState, recurrentRowSnapshots, seed, firstTokenIndex, invTemperature,
+            default, sampledIds);
+
+    /// <inheritdoc/>
+    public void ForwardGumbelSampled(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache,
+        IMtpState? mtpState, bool recurrentRowSnapshots, ulong seed, int firstTokenIndex, float invTemperature, GumbelFilter filter,
+        Span<int> sampledIds)
     {
         int rows = tokenIds.Length;
+        if (!filter.IsNone && !SupportsDeviceGumbelFilter)
+            throw new NotSupportedException($"{nameof(VulkanQwen3HybridDenseTransformerModel)}: no filtered device Gumbel sampling.");
         if (!SupportsDeviceGumbelSampling || rows > DeviceGumbelMaxRows)
             throw new NotSupportedException($"{nameof(VulkanQwen3HybridDenseTransformerModel)}: no device Gumbel sampling for {rows} rows.");
         if (sampledIds.Length < rows) throw new ArgumentException("sampledIds is shorter than the row count.", nameof(sampledIds));
@@ -64,10 +76,11 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel
             _gumbelIds = _device.AllocateHostReadback(32 * sizeof(uint));
             created = true;
         }
+        if (!filter.IsNone) created |= EnsureGumbelRowBuffers(rows);
         if (created) InvalidateDescriptorCaches();
 
         _gumbelHostRows = 0;
-        _pendingGumbel = new GumbelRequest(seed, firstTokenIndex, invTemperature);
+        _pendingGumbel = new GumbelRequest(seed, firstTokenIndex, invTemperature, filter);
         try
         {
             using var placeholder = recurrentRowSnapshots
@@ -114,15 +127,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel
         _gumbelKernel ??= GumbelArgMaxKernel.Create(_device, _spvDir);
         _gumbelRowsKernel ??= GumbelArgMaxRowsKernel.Create(_device, _spvDir);
         if (_gumbelIds is null) { _gumbelIds = _device.AllocateHostReadback(32 * sizeof(uint)); created = true; }
-        if (_gumbelRowIds is null || _gumbelRowCapacity < n)
-        {
-            _gumbelRowIds?.Dispose();
-            _gumbelRowParams?.Dispose();
-            _gumbelRowCapacity = Math.Max(n, 32);
-            _gumbelRowIds = _device.AllocateHostReadback((long)_gumbelRowCapacity * sizeof(uint));
-            _gumbelRowParams = _device.Allocate((long)_gumbelRowCapacity * GumbelArgMaxRowsKernel.RowParamBytes);
-            created = true;
-        }
+        created |= EnsureGumbelRowBuffers(n);
         if (created) InvalidateDescriptorCaches();
 
         if (n >= 2 && BatchFuseEnabled && _prof is null && TotalRows(requests) >= BatchFuseMinRows)
@@ -148,7 +153,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel
         {
             var r = requests[i];
             _gumbelHostRows = 0;
-            _pendingGumbel = new GumbelRequest(draws[i].Seed, draws[i].TokenIndex, draws[i].InvTemperature);
+            _pendingGumbel = new GumbelRequest(draws[i].Seed, draws[i].TokenIndex, draws[i].InvTemperature, new GumbelFilter(draws[i].TopK, draws[i].MinP));
             try
             {
                 using var placeholder = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.GdnState);
@@ -162,5 +167,18 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel
             sampledIds[i] = _gumbelHost[0];
         }
         DeviceGumbelSerialBatches++;
+    }
+
+    /// <summary>Allocates (grow-only) the per-row id and parameter buffers and the per-row kernel; true when a buffer was (re)created.</summary>
+    private bool EnsureGumbelRowBuffers(int rows)
+    {
+        _gumbelRowsKernel ??= GumbelArgMaxRowsKernel.Create(_device, _spvDir);
+        if (_gumbelRowIds is not null && _gumbelRowCapacity >= rows) return false;
+        _gumbelRowIds?.Dispose();
+        _gumbelRowParams?.Dispose();
+        _gumbelRowCapacity = Math.Max(rows, 32);
+        _gumbelRowIds = _device.AllocateHostReadback((long)_gumbelRowCapacity * sizeof(uint));
+        _gumbelRowParams = _device.Allocate((long)_gumbelRowCapacity * GumbelArgMaxRowsKernel.RowParamBytes);
+        return true;
     }
 }

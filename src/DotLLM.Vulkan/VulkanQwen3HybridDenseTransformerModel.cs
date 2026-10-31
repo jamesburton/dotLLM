@@ -814,8 +814,19 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         if (gumbelOnDevice)
         {
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
-            _gumbelKernel!.Record(cmdBuf, logitsBuf, _gumbelIds!, headRows, vocabSize, vocabSize,
-                gumbelReq!.Value.Seed, gumbelReq.Value.FirstTokenIndex, gumbelReq.Value.InvTemperature);
+            if (gumbelReq!.Value.Filter.IsNone)
+                _gumbelKernel!.Record(cmdBuf, logitsBuf, _gumbelIds!, headRows, vocabSize, vocabSize,
+                    gumbelReq.Value.Seed, gumbelReq.Value.FirstTokenIndex, gumbelReq.Value.InvTemperature);
+            else
+            {
+                // #1435: top-k / min-p restricted draw through the per-row kernel (one parameter record per verify row).
+                var gr = gumbelReq.Value;
+                var packedRows = new uint[headRows * 8];
+                for (int r = 0; r < headRows; r++)
+                    GumbelArgMaxRowsKernel.PackRow(packedRows.AsSpan(r * 8, 8), gr.Seed, gr.FirstTokenIndex + r, gr.InvTemperature, gr.Filter.TopK, gr.Filter.MinP);
+                _device.Upload(MemoryMarshal.AsBytes(packedRows.AsSpan()), _gumbelRowParams!);
+                _gumbelRowsKernel!.Record(cmdBuf, logitsBuf, _gumbelRowIds!, _gumbelRowParams!, headRows, vocabSize, vocabSize);
+            }
             ProfMark(cmdBuf, VulkanOpProfiler.Cat.LmHead);
         }
         KernelSupport.ComputeToHostBarrier(cmdBuf);
@@ -831,7 +842,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         if (gumbelOnDevice)
         {
             if (_gumbelHost.Length < headRows) _gumbelHost = new int[Math.Max(headRows, 32)];
-            _device.Download(_gumbelIds!, System.Runtime.InteropServices.MemoryMarshal.Cast<int, float>(_gumbelHost.AsSpan(0, headRows)));
+            _device.Download(gumbelReq!.Value.Filter.IsNone ? _gumbelIds! : _gumbelRowIds!, System.Runtime.InteropServices.MemoryMarshal.Cast<int, float>(_gumbelHost.AsSpan(0, headRows)));
             _gumbelHostRows = headRows;
             result = UnmanagedTensor.Allocate(new TensorShape(1, 1), DType.Float32, deviceId: -1);   // placeholder: no logits were read back
         }
@@ -1401,9 +1412,10 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel, ICo
         {
             if (gumbelBatch.Length != n || headTotal != n || _gumbelRowsKernel is null || _gumbelRowIds is null || _gumbelRowParams is null)
                 throw new InvalidOperationException("Batched device Gumbel draw requires one single-token request per draw and preallocated draw buffers.");
-            var packed = new uint[n * 4];
+            var packed = new uint[n * 8];
             for (int i = 0; i < n; i++)
-                GumbelArgMaxRowsKernel.PackRow(packed.AsSpan(i * 4, 4), gumbelBatch[i].Seed, gumbelBatch[i].TokenIndex, gumbelBatch[i].InvTemperature);
+                GumbelArgMaxRowsKernel.PackRow(packed.AsSpan(i * 8, 8), gumbelBatch[i].Seed, gumbelBatch[i].TokenIndex, gumbelBatch[i].InvTemperature,
+                    gumbelBatch[i].TopK, gumbelBatch[i].MinP);
             _device.Upload(MemoryMarshal.AsBytes(packed.AsSpan()), _gumbelRowParams);
         }
 
