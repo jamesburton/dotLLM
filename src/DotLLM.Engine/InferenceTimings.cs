@@ -36,9 +36,10 @@ public readonly record struct InferenceTimings
     public int SpeculativeDraftTokens { get; init; }
 
     /// <summary>
-    /// Tokens produced by speculative decoding that made it into the final output.
-    /// Excludes tokens discarded by stop conditions. Together with the first prefill token,
-    /// should equal the total generated token count.
+    /// Draft tokens that the target model accepted and that made it into the final output (#1243). Always
+    /// <c>&lt;= <see cref="SpeculativeDraftTokens"/></c>. The one target-model token every verify round also emits
+    /// (the bonus token when all drafts match, otherwise the correction) is NOT counted here; it is
+    /// <see cref="SpeculativeSteps"/> tokens in total. Tokens discarded by stop conditions are excluded.
     /// </summary>
     public int SpeculativeAcceptedTokens { get; init; }
 
@@ -46,10 +47,10 @@ public readonly record struct InferenceTimings
     public int SpeculativeSteps { get; init; }
 
     /// <summary>
-    /// Mean tokens emitted per speculative verify round (accepted drafts plus the bonus token), i.e. the mean accepted
-    /// length; 0 when no speculation ran.
+    /// Mean tokens emitted per speculative verify round: accepted drafts plus the round's one target-model token
+    /// (bonus or correction), i.e. <c>(accepted + steps) / steps</c>; 0 when no speculation ran.
     /// </summary>
-    public double SpeculativeMeanAcceptedLength => SpeculativeSteps > 0 ? (double)SpeculativeAcceptedTokens / SpeculativeSteps : 0;
+    public double SpeculativeMeanAcceptedLength => SpeculativeSteps > 0 ? (double)(SpeculativeAcceptedTokens + SpeculativeSteps) / SpeculativeSteps : 0;
 
     /// <summary>
     /// Draft acceptance rate: proportion of draft tokens that matched the target model.

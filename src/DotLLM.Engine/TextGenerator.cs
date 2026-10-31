@@ -859,7 +859,7 @@ public sealed partial class TextGenerator
                                 }
                                 else
                                 {
-                                    specAccepted++;
+                                    if (i < result.AcceptedCount - 1) specAccepted++;   // drafts only: the round's last token is the target's own (#1243)
                                     onTokenGenerated?.Invoke(tokenId);
                                 }
 
@@ -870,7 +870,7 @@ public sealed partial class TextGenerator
                                 break;
                             }
 
-                            specAccepted++;
+                            if (i < result.AcceptedCount - 1) specAccepted++;   // drafts only (#1243)
                             onTokenGenerated?.Invoke(tokenId);
                             EmitText();
                             step++;
@@ -1419,7 +1419,7 @@ public sealed partial class TextGenerator
                                 }
                                 else
                                 {
-                                    specAccepted++;
+                                    if (i < result.AcceptedCount - 1) specAccepted++;   // drafts only (#1243)
                                     StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                                     var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted, specSteps);
                                     string text = detok.TakeDelta(flushIncomplete: true);
@@ -1429,7 +1429,7 @@ public sealed partial class TextGenerator
                                 yield break;
                             }
 
-                            specAccepted++;
+                            if (i < result.AcceptedCount - 1) specAccepted++;   // drafts only (#1243)
 
                             // Yield each accepted token
                             {
