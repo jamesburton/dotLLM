@@ -1005,6 +1005,32 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel
                        firstLayer: 0, layerCount: _layers.Length, hiddenOut: Span<float>.Empty, mtpState)!;
 
     /// <summary>
+    /// Hint-aware forward (#1485): with <paramref name="lastTokenLogitsOnly"/> and more than one token, the LM head runs over the last
+    /// row only and the result is <c>[1, vocab]</c>; every position is still processed and MTP capture still sees every row.
+    /// </summary>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly)
+        => ForwardCore(tokenIds, ReadOnlySpan<float>.Empty, positions, deviceId, kvCache, null,
+                       firstLayer: 0, layerCount: _layers.Length, hiddenOut: Span<float>.Empty, null, lastTokenLogitsOnly)!;
+
+    /// <summary>Hint-aware forward with an MTP state (#1485); see the overload above.</summary>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, ILoraAdapter? adapter, IMtpState? mtpState,
+                           bool lastTokenLogitsOnly)
+    {
+        if (adapter is null)
+            return ForwardCore(tokenIds, ReadOnlySpan<float>.Empty, positions, deviceId, kvCache, null,
+                               firstLayer: 0, layerCount: _layers.Length, hiddenOut: Span<float>.Empty, mtpState, lastTokenLogitsOnly)!;
+        _currentAdapter = adapter;
+        try
+        {
+            return ForwardCore(tokenIds, ReadOnlySpan<float>.Empty, positions, deviceId, kvCache, null,
+                               firstLayer: 0, layerCount: _layers.Length, hiddenOut: Span<float>.Empty, mtpState, lastTokenLogitsOnly)!;
+        }
+        finally { _currentAdapter = null; }
+    }
+
+    /// <summary>
     /// Runs a contiguous window of this model's layers standalone, entering from token ids
     /// (<paramref name="firstLayer"/> is 0) or from a boundary hidden state, and leaving the
     /// residual stream at the window's far edge.
@@ -1071,16 +1097,22 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel
     /// </summary>
     private ITensor RunOutputHead(
         int seqLen, int deviceId,
-        ReadOnlySpan<int> tokenIds = default, ReadOnlySpan<int> positions = default, IMtpState? mtpState = null)
+        ReadOnlySpan<int> tokenIds = default, ReadOnlySpan<int> positions = default, IMtpState? mtpState = null,
+        bool lastRowOnly = false)
     {
         int hiddenSize = Config.HiddenSize;
         int vocabSize = Config.VocabSize;
         float eps = Config.NormEpsilon;
         float* hidden = (float*)_state.HiddenState;
-        float* logits = (float*)_state.Logits;
+
+        // MTP capture reads every post-final-norm row, so only a head without capture may skip the other rows (#1485).
+        bool captureMtp = _mtpHead is not null && mtpState is CpuMtpState;
+        int firstNorm = lastRowOnly && !captureMtp ? seqLen - 1 : 0;
+        int headRows = lastRowOnly ? 1 : seqLen;
+        float* headIn = hidden + (long)(seqLen - headRows) * hiddenSize;
 
         // Final output norm + logit projection.
-        for (int t = 0; t < seqLen; t++)
+        for (int t = firstNorm; t < seqLen; t++)
         {
             RmsNorm.Execute(
                 new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
@@ -1090,16 +1122,14 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel
         if (TensorDump.Enabled)
             TensorDump.Dump2D("result_norm", hidden, seqLen, hiddenSize);
 
-        Gemm(_outputWeight, _outputQuantType, hidden, logits,
-             _outputOutputDim, _outputInputDim, seqLen, preQuantizedInput: null);
+        // The GEMM writes straight into the caller-owned result: no model-state logits buffer, no rows*V*4 copy (#1485).
+        var result = UnmanagedTensor.Allocate(new TensorShape(headRows, vocabSize), DType.Float32, deviceId);
+        float* logits = (float*)result.DataPointer;
+        Gemm(_outputWeight, _outputQuantType, headIn, logits,
+             _outputOutputDim, _outputInputDim, headRows, preQuantizedInput: null);
 
         if (TensorDump.Enabled)
-            TensorDump.Dump2D("result_output", logits, seqLen, vocabSize);
-
-        var shape = new TensorShape(seqLen, vocabSize);
-        var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
-        new Span<float>(logits, seqLen * vocabSize).CopyTo(
-            new Span<float>((void*)result.DataPointer, seqLen * vocabSize));
+            TensorDump.Dump2D("result_output", logits, headRows, vocabSize);
 
         // hidden still holds the post-final-norm rows (llama.cpp's h_nextn) the MTP head pairs with.
         if (_mtpHead is not null && mtpState is CpuMtpState mtp)
@@ -1118,7 +1148,8 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel
     private ITensor? ForwardCore(
         ReadOnlySpan<int> tokenIds, ReadOnlySpan<float> hiddenIn, ReadOnlySpan<int> positions,
         int deviceId, IKvCache? kvCache, IGdnState? gdnState,
-        int firstLayer, int layerCount, Span<float> hiddenOut, IMtpState? mtpState = null)
+        int firstLayer, int layerCount, Span<float> hiddenOut, IMtpState? mtpState = null,
+        bool lastTokenLogitsOnly = false)
     {
         // Resolve the GDN state: caller-supplied container preferred, model-owned
         // fallback for the single-seq Forward callers that pre-date the per-seq API.
@@ -1294,7 +1325,8 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel
             return null;
         }
 
-        return RunOutputHead(seqLen, deviceId, tokenIds, positions, mtpState);
+        return RunOutputHead(seqLen, deviceId, tokenIds, positions, mtpState,
+            lastRowOnly: lastTokenLogitsOnly && seqLen > 1);
     }
 
     /// <inheritdoc/>
@@ -1354,7 +1386,8 @@ public sealed unsafe partial class Qwen3MoeHybridTransformerModel : IModel
         for (int i = 0; i < requests.Count; i++)
         {
             var r = requests[i];
-            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.GdnState);
+            results[i] = ForwardCore(r.TokenIds.Span, ReadOnlySpan<float>.Empty, r.Positions.Span, deviceId, r.KvCache, r.GdnState,
+                firstLayer: 0, layerCount: _layers.Length, hiddenOut: Span<float>.Empty, null, r.LastTokenLogitsOnly)!;
         }
         return results;
     }
