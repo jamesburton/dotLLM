@@ -10,7 +10,7 @@
 //   * prefetches the next K step into registers while the current one computes,
 //   * walks the M tiles in L2-sized groups.
 //
-// CONTRACT - the wrapper #defines exactly one of MMQ_Q8_0 / MMQ_Q4_K / MMQ_Q5_0 / MMQ_Q4_1, optionally MMQ_GROUPED, and includes this file.
+// CONTRACT - the wrapper #defines exactly one of MMQ_Q8_0 / MMQ_Q4_K / MMQ_Q5_0 / MMQ_Q4_1 / MMQ_Q4_0, optionally MMQ_GROUPED, and includes this file.
 //
 // MMQ_GROUPED (MoE expert-grouped prefill): the weight buffer is a bank [E, M, K]; the activation rows are packed in expert order
 // (offsets[e] .. offsets[e+1], moe_expand_gather_group_q8_1) and the output rows are packed the same way. Workgroup x is the M tile,
@@ -73,10 +73,10 @@
 #define BLOCK_SIZE ((BM / WM) * (BN / WN) * WARP)
 layout(local_size_x = MMQ_THREADS, local_size_y = 1, local_size_z = 1) in;   // BLOCK_SIZE (default: two wave64 subgroups)
 
-#if defined(MMQ_Q8_0) || defined(MMQ_Q5_0)
+#if defined(MMQ_Q8_0) || defined(MMQ_Q5_0) || defined(MMQ_Q4_0)
 layout(set = 0, binding = 0, std430) readonly buffer BufW { uint16_t w16[]; };
 #define HAS_MIN 0
-#if defined(MMQ_Q5_0)
+#if defined(MMQ_Q5_0) || defined(MMQ_Q4_0)
 #define LOAD_VEC_A 8u   // 4 lanes per block, 8 elements each (4 low + 4 high nibbles)
 #else
 #define LOAD_VEC_A 4u
@@ -86,7 +86,7 @@ layout(set = 0, binding = 0, std430) readonly buffer BufW { uint w32[]; };
 #define HAS_MIN 1
 #define LOAD_VEC_A 8u
 #else
-#error "define MMQ_Q8_0, MMQ_Q5_0, MMQ_Q4_K or MMQ_Q4_1"
+#error "define MMQ_Q8_0, MMQ_Q5_0, MMQ_Q4_0, MMQ_Q4_K or MMQ_Q4_1"
 #endif
 layout(set = 0, binding = 1, std430) readonly  buffer BufBq  { uvec4 bq[]; };
 layout(set = 0, binding = 2, std430) readonly  buffer BufBds { vec2  bds[]; };
@@ -113,7 +113,7 @@ uint g_kBlocks;   // K / 32: blocks past it (a partial last staging step) are ze
 
 #define LOAD_VEC_B 16u
 
-#if defined(MMQ_Q4_1)
+#if defined(MMQ_Q4_1) || defined(MMQ_Q4_0)
 #include "q8_1_ds_f16.glsl"
 #endif
 
@@ -168,6 +168,30 @@ void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr) {
     hi4 |= ((blk.qh >> (4u * loadr + 16u)) & 0xFu) * 0x02040810u & 0x10101010u;
     lo4 = ((lo4 | 0x80808080u) - 0x10101010u) ^ 0x80808080u;
     hi4 = ((hi4 | 0x80808080u) - 0x10101010u) ^ 0x80808080u;
+    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4u) + loadr]      = lo4;
+    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4u) + loadr + 4u] = hi4;
+    if (loadr == 0u) buf_a_d[ks * BM + buf_ib] = blk.d;
+}
+#elif defined(MMQ_Q4_0)
+struct block_a_prefetch { uint qs; float d; };
+
+// Q4_0 block (18 bytes = 9 uint16: fp16 d, qs[16]); lane loadr (0..3) takes qs bytes 4*loadr..4*loadr+3, i.e. elements 4*loadr..
+// (low nibbles) and 16+4*loadr.. (high nibbles), recentred to q - 8 (signed int8) so the product is d * d_x * dot(q - 8, x) with no
+// min term (llama.cpp vec_dot_q4_0_q8_1 folds the same -8 into a s_x term; staging it recentred is exact and keeps HAS_MIN 0).
+block_a_prefetch block_a_load(uint row, uint kb, uint loadr) {
+    block_a_prefetch blk;
+    if (row >= pc.M || kb >= g_kBlocks) { blk.qs = 0u; blk.d = 0.0; return blk; }
+    uint base = (g_aRowBase + row) * pc.rowStride + kb * 9u;
+    blk.d = float(uint16BitsToHalf(w16[base]));
+    blk.qs = uint(w16[base + 1u + 2u * loadr]) | (uint(w16[base + 2u + 2u * loadr]) << 16);
+    return blk;
+}
+
+void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr) {
+    uint lo4 = ((blk.qs & 0x0F0F0F0Fu) | 0x80808080u) - 0x08080808u;
+    uint hi4 = (((blk.qs >> 4u) & 0x0F0F0F0Fu) | 0x80808080u) - 0x08080808u;
+    lo4 ^= 0x80808080u;
+    hi4 ^= 0x80808080u;
     buf_a_qs[buf_ib * QPITCH + ks * (BK / 4u) + loadr]      = lo4;
     buf_a_qs[buf_ib * QPITCH + ks * (BK / 4u) + loadr + 4u] = hi4;
     if (loadr == 0u) buf_a_d[ks * BM + buf_ib] = blk.d;
@@ -246,7 +270,7 @@ block_b_prefetch block_b_load(uint row, uint kb, uint loadr) {
     uint g = g_bRowBase + row;
     blk.qs = bq[g * (pc.K >> 4u) + kb * 2u + loadr];
     blk.ds = bds[g * (pc.K >> 5u) + kb];
-#if defined(MMQ_Q4_1)
+#if defined(MMQ_Q4_1) || defined(MMQ_Q4_0)
     blk.ds = roundToF16(blk.ds);   // fp16 (d, s) as block_q8_1 stores them: the CPU (#1159) and llama.cpp products
 #endif
     return blk;
@@ -302,6 +326,8 @@ void main() {
     uint a_panel_bytes = BM * pc.K + (BM * pc.K) / 16u;
 #elif defined(MMQ_Q4_1)
     uint a_panel_bytes = (BM * pc.K) / 2u + (BM * pc.K) / 8u;
+#elif defined(MMQ_Q4_0)
+    uint a_panel_bytes = (BM * pc.K) / 2u + (BM * pc.K) / 16u;   // 18 bytes per 32
 #else
     uint a_panel_bytes = (BM * pc.K) / 2u + (BM * pc.K) / 16u;
 #endif
