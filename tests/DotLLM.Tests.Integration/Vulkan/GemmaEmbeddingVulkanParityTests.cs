@@ -92,7 +92,7 @@ public sealed class GemmaEmbeddingVulkanParityTests(ITestOutputHelper output)
         var (ids, st) = LoadReference();
         var gguf = CheckpointGuard.LoadOrSkip(loc.Path!, Description, () => GgufFile.Open(loc.Path!));
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
-        var cpu = CheckpointGuard.LoadOrSkip(loc.Path!, Description, () => TransformerModel.LoadFromGguf(gguf, config));
+        var cpu = CheckpointGuard.LoadOrSkip(loc.Path!, Description, () => TransformerModel.LoadFromGguf(gguf, config, new ThreadingConfig(16, 16)));
         var vk = CheckpointGuard.LoadOrSkip(loc.Path!, Description, () => VulkanGemmaEmbeddingModel.LoadFromGguf(gguf, config, VulkanModelLoader.ResolveSpvDir()));
         return new Ctx { Gguf = gguf, Config = config, Cpu = cpu, Vk = vk, Docs = ids, St = st };
     }
@@ -173,5 +173,24 @@ public sealed class GemmaEmbeddingVulkanParityTests(ITestOutputHelper output)
         using var c = Load();
         Assert.Throws<NotSupportedException>(() => c.Vk.ForwardHiddenForPooling([[2, 3, 4]], PoolingType.Cls, (_, _) => { }, 0));
         Assert.Throws<NotSupportedException>(() => c.Vk.ForwardHidden([2, 3, 4], [0, 1, 2], 0));
+    }
+
+    [SkippableFact]
+    public void Throughput_vs_cpu_batch1_and_batched()
+    {
+        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_BENCH_GEMMA_EMBED") == "1", "Set DOTLLM_BENCH_GEMMA_EMBED=1 (hold gpu-lock and cpu-bench).");
+        using var c = Load();
+        int h = c.Config.HiddenSize;
+        var docs = c.Docs;
+        long tokens = docs.Sum(d => (long)d.Length);
+        EmbedCpu(c.Cpu, docs.Take(4).ToArray(), h); Embed(c.Vk, docs, h);   // warm-up
+        for (int rep = 0; rep < 4; rep++)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            if (rep % 2 == 0) { EmbedCpu(c.Cpu, docs, h); var cpuT = sw.Elapsed.TotalSeconds; sw.Restart(); foreach (var d in docs) Embed(c.Vk, [d], h); var g1 = sw.Elapsed.TotalSeconds; sw.Restart(); Embed(c.Vk, docs, h); var gb = sw.Elapsed.TotalSeconds;
+                output.WriteLine($"rep{rep} [cpu first] CPU b1 {docs.Length / cpuT:F1} docs/s ({tokens / cpuT:F0} tok/s) | GPU b1 {docs.Length / g1:F1} docs/s | GPU batched {docs.Length / gb:F1} docs/s ({tokens / gb:F0} tok/s)"); }
+            else { foreach (var d in docs) Embed(c.Vk, [d], h); var g1 = sw.Elapsed.TotalSeconds; sw.Restart(); Embed(c.Vk, docs, h); var gb = sw.Elapsed.TotalSeconds; sw.Restart(); EmbedCpu(c.Cpu, docs, h); var cpuT = sw.Elapsed.TotalSeconds;
+                output.WriteLine($"rep{rep} [gpu first] CPU b1 {docs.Length / cpuT:F1} docs/s ({tokens / cpuT:F0} tok/s) | GPU b1 {docs.Length / g1:F1} docs/s | GPU batched {docs.Length / gb:F1} docs/s ({tokens / gb:F0} tok/s)"); }
+        }
     }
 }
