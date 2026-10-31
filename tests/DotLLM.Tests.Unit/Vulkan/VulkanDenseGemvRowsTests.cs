@@ -45,6 +45,54 @@ public class VulkanDenseGemvRowsTests
             (cmd, bw, bx, by, nn) => rows.Record(cmd, bw, bx, by, m, k, nn));
     }
 
+    /// <summary>
+    /// #1220: the per-column-count NR table (3 / 5 / 7 columns) and 5 / 7 -> 6 / 8 column padding the model ships must leave every kept column bit-identical
+    /// to the one-column decode dispatch (NR = 2), with room for the pad row (it runs padded) and without (it runs as asked).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(37, 5120, 2, true)]
+    [InlineData(37, 5120, 3, false)]
+    [InlineData(65, 5120, 5, true)]
+    [InlineData(65, 5120, 5, false)]
+    [InlineData(64, 1792, 7, true)]
+    [InlineData(64, 1792, 7, false)]
+    [InlineData(41, 768, 4, true)]
+    [InlineData(41, 768, 6, true)]
+    [InlineData(30, 512, 8, true)]
+    public void Q4KTunedTable_AndPadding_KeepColumnsBitIdenticalToDecode(int m, int k, int n, bool padRoom)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        var rng = new Random(0x1221 + m * 7 + k * 11 + n * 13);
+        float[] w = F16Bf16Fixture.RandomFloats(rng, m * k, 0.1f);
+        float[] x = F16Bf16Fixture.RandomFloats(rng, (n + 1) * k, 1.0f);
+        byte[] wq = Quantize.FromFloat32(w, (long)m * k, QuantizationType.Q4_K);
+        int[] table = [0, 0, 0, 3, 0, 3, 0, 2, 0];
+        using var tuned = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q4_K, 2, 4, 4, table)
+                          ?? throw new Xunit.Sdk.XunitException("matmul_q4_k_gemv_f32_multi.spv unavailable");
+        tuned.PadOddColumns = true;
+        using var decode = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q4_K, 2, 4, 4)!;
+        int rowsAlloc = padRoom ? n + 1 : n;
+        using var bw = device.Allocate(((long)wq.Length + 3) & ~3L);
+        using var bx = device.Allocate((long)rowsAlloc * k * 4);
+        using var by = device.Allocate((long)rowsAlloc * m * 4);
+        using var bx1 = device.Allocate((long)k * 4);
+        using var by1 = device.Allocate((long)m * 4);
+        device.Upload(new ReadOnlySpan<byte>(wq), bw);
+        device.Upload(x.AsSpan(0, rowsAlloc * k).ToArray(), bx);
+        using (var ctx = device.CreateSubmitContext()) { ctx.Begin(); tuned.Record(ctx.CommandBuffer, bw, bx, by, m, k, n); ctx.SubmitAndWait(); }
+        float[] actual = new float[rowsAlloc * m];
+        device.Download(by, actual);
+        for (int c = 0; c < n; c++)
+        {
+            device.Upload(x.AsSpan(c * k, k).ToArray(), bx1);
+            using (var ctx = device.CreateSubmitContext()) { ctx.Begin(); decode.Record(ctx.CommandBuffer, bw, bx1, by1, m, k, 1); ctx.SubmitAndWait(); }
+            float[] exp = new float[m];
+            device.Download(by1, exp);
+            Assert.Equal(exp, actual.AsSpan(c * m, m).ToArray());
+        }
+    }
+
     [SkippableTheory]
     [InlineData(37, 5120, 2, 2)]
     [InlineData(37, 5120, 4, 3)]   // M % NR != 0
