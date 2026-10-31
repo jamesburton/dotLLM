@@ -1,4 +1,6 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "q8_1_exact_div.glsl"
 // Fused SwiGLU activation + Q8_1 activation quantization for the decode path
 // (issue #71, sibling of rmsnorm_quantize_q8_1.comp / issue #145). One
 // dispatch producing BOTH the gated F32 row
@@ -59,17 +61,17 @@ void main() {
             amax = max(amax, abs(v));
         }
 
-        float d = amax / 127.0;
-        float id = (d != 0.0) ? (1.0 / d) : 0.0;
+        float d = q81DivBy127(amax);
+        float id = (d != 0.0) ? q81Recip(d) : 0.0;
 
         int sumI = 0;
         uint qBase = base >> 2u; // 4 elements per uint
         for (uint g2 = 0u; g2 < QK / 4u; g2++) {
             uint e = g2 * 4u;
-            int q0 = int(round(vals[e + 0u] * id));
-            int q1 = int(round(vals[e + 1u] * id));
-            int q2 = int(round(vals[e + 2u] * id));
-            int q3 = int(round(vals[e + 3u] * id));
+            int q0 = int(roundEven(vals[e + 0u] * id));
+            int q1 = int(roundEven(vals[e + 1u] * id));
+            int q2 = int(roundEven(vals[e + 2u] * id));
+            int q3 = int(roundEven(vals[e + 3u] * id));
             sumI += q0 + q1 + q2 + q3;
             uint packed = (uint(q0) & 0xFFu)
                         | ((uint(q1) & 0xFFu) << 8u)
