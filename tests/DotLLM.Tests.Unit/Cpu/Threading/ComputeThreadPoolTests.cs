@@ -189,7 +189,9 @@ public sealed unsafe class ComputeThreadPoolTests
             done.Set();
         });
 
-        Assert.True(done.Wait(TimeSpan.FromSeconds(5)), "Pool-thread pin attempt timed out");
+        // Generous: a starved ThreadPool injects ~1-2 threads/s, so a queued item can wait tens of seconds while the whole suite runs in parallel
+        // (#1470). A real hang is unbounded, so 90 s still catches one. The 90 s mirrors Dispatch_WorkerStartsAfterDispatchAlreadyRan_StillCompletes.
+        Assert.True(done.Wait(TimeSpan.FromSeconds(90)), "Pool-thread pin attempt timed out");
         Assert.True(wasOnPoolThread, "Test helper did not run on a ThreadPool thread");
         Assert.False(pinnedAfter, "PinCallerThread on a ThreadPool thread must be a no-op");
     }
