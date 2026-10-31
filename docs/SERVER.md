@@ -327,6 +327,9 @@ paged pool does not serve (hybrid/recurrent, per-layer KV widths) keep their exi
 
 ## Model swaps, `GET /v1/status` and SSE keep-alive (#1023)
 
+**KV cache type on a load (#1416).** `cache_type_k` / `cache_type_v` on `POST /v1/models/load`: omitted = the operator's startup `--cache-type-k/v` (never the previously loaded model's per-load choice); `"auto"` (or empty) = no override, the model/backend picks its supported default; anything else is an explicit request. Loads triggered by a chat request use the startup values too.
+
+
 **Free before load.** A request (or `POST /v1/models/load`) for a different model takes the server lock, then - before loading - stashes the
 active model and enforces the residency budget **with the incoming model in the active slot**. By default (`MaxResidentModels = 1`) that
 disposes the old model first, so the two never share device memory. With a larger budget, stashed models are additionally evicted

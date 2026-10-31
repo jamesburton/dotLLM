@@ -825,6 +825,9 @@ public sealed class ServerState : IDisposable
                     ModelId = issued is not null ? targetKey : ServerStartup.ModelIdFor(targetKey, resolvedPath),
                     Device = profile?.Device ?? Options.Device,
                     GpuLayers = profile?.GpuLayers ?? Options.GpuLayers,
+                    // (#1416) A chat-triggered load must not inherit the previous model's per-load KV choice (e.g. a Q8 the new model rejects).
+                    CacheTypeK = Options.StartupCacheTypeK,
+                    CacheTypeV = Options.StartupCacheTypeV,
                 };
                 if (profile?.KeepAlive is { } profileKeepAlive) keepAliveOverride ??= profileKeepAlive;
                 incomingBytes = SafeFileLength(resolvedPath);

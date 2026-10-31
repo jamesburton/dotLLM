@@ -48,6 +48,16 @@ public sealed record ServerOptions
     /// <summary>KV-cache value type; <c>null</c> = not specified (see <see cref="CacheTypeK"/>).</summary>
     public string? CacheTypeV { get; init; }
 
+    /// <summary>
+    /// The operator's startup <c>--cache-type-k</c> (#1416). <see cref="CacheTypeK"/> is replaced by each model load's own
+    /// KV choice, so a load that omits the field, and every chat-triggered load, falls back to THIS value rather than
+    /// to whatever the previously loaded model was given. An explicit <c>auto</c> in a load request means "no override".
+    /// </summary>
+    public string? StartupCacheTypeK { get; init; }
+
+    /// <summary>Startup <c>--cache-type-v</c>; see <see cref="StartupCacheTypeK"/>.</summary>
+    public string? StartupCacheTypeV { get; init; }
+
     /// <summary>Whether prompt caching is enabled.</summary>
     public bool PromptCacheEnabled { get; init; } = true;
 
@@ -588,6 +598,8 @@ public sealed record ServerOptions
             Port = port,
             CacheTypeK = cacheTypeK,
             CacheTypeV = cacheTypeV,
+            StartupCacheTypeK = cacheTypeK,
+            StartupCacheTypeV = cacheTypeV,
             PromptCacheEnabled = promptCacheEnabled,
             PromptCacheSize = promptCacheSize,
             PrefixSnapshots = snapshotOptions.MaxEntries,

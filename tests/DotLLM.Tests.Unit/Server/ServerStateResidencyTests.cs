@@ -282,6 +282,38 @@ public sealed class ServerStateResidencyTests : IDisposable
         Assert.True(state.IsReady);
     }
 
+    /// <summary>
+    /// #1416: a chat-triggered load (EnsureActiveAsync) clones the current Options, which carry the PREVIOUS model's per-load KV choice.
+    /// A Q8 chosen for model A must not become model B's default; the operator's startup value is the fallback. Needs no model fixture:
+    /// the loader seam records the options it is handed and fails.
+    /// </summary>
+    [Fact]
+    public async Task ChatTriggeredSwap_DoesNotInheritThePreviousModelsPerLoadKvChoice()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "dotllm-1416-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            string fake = Path.Combine(dir, "b.gguf");
+            File.WriteAllBytes(fake, "GGUF"u8.ToArray());
+            var state = NewBareState();
+            state.Options = state.Options with
+            {
+                StartupCacheTypeK = null, StartupCacheTypeV = "f16",
+                CacheTypeK = "q8_0", CacheTypeV = "q8_0",   // what a successful explicit load of the previous model leaves behind
+            };
+
+            ServerOptions? seen = null;
+            state.ModelLoader = (path, options) => { seen = options; throw new InvalidOperationException("stop after capturing the options"); };
+            await state.EnsureActiveAsync(fake, keepAliveOverride: null, CancellationToken.None);
+
+            Assert.NotNull(seen);
+            Assert.Null(seen!.CacheTypeK);
+            Assert.Equal("f16", seen.CacheTypeV);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
     /// <summary>#1023: a load whose requester has already gone must not free the active model, let alone load.</summary>
     [SkippableFact]
     public async Task CancelledRequest_DoesNotFreeTheActiveModel_OrStartALoad()
