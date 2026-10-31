@@ -6,6 +6,7 @@ using Xunit;
 namespace DotLLM.Tests.Unit.Server;
 
 /// <summary>Issue #729 inspect payload tests.</summary>
+[Collection("SequentialFileIO")]   // reads the process-global model-store env vars that SequentialFileIO tests mutate (#1395)
 public class ModelInspectPartialOffloadTests
 {
     private static DotLLM.Core.Models.ModelConfig ConfigFor(DotLLM.Core.Configuration.Architecture arch) => new()
@@ -33,6 +34,7 @@ public class ModelInspectPartialOffloadTests
 /// Tests for <see cref="ModelInspectEndpoint"/> path traversal protection.
 /// Validates that only paths within allowed model directories are accepted.
 /// </summary>
+[Collection("SequentialFileIO")]   // reads the process-global model-store env vars that SequentialFileIO tests mutate (#1395)
 public class ModelInspectEndpointTests
 {
     private static ServerState CreateState(string loadedModelPath = "")

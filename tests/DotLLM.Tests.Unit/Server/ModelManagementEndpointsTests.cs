@@ -27,6 +27,7 @@ namespace DotLLM.Tests.Unit.Server;
 /// is already waiting on the response.
 /// </para>
 /// </remarks>
+[Collection("SequentialFileIO")]   // reads the process-global model-store env vars that SequentialFileIO tests mutate (#1395)
 public sealed class ModelManagementEndpointsTests
 {
     private static ServerState NewState(bool allowAdmin = false, string modelId = "test-model") =>

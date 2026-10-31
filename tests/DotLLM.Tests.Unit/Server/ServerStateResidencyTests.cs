@@ -17,6 +17,7 @@ namespace DotLLM.Tests.Unit.Server;
 /// aren't present in the local Hugging Face hub cache (e.g. a fresh clone/CI without the model
 /// downloaded), matching the existing skip pattern used by other real-weight tests in this repo.
 /// </summary>
+[Collection("SequentialFileIO")]   // reads the process-global model-store env vars that SequentialFileIO tests mutate (#1395)
 public sealed class ServerStateResidencyTests : IDisposable
 {
     private static readonly string? PathA = FindCachedGguf("Q5_K_M");

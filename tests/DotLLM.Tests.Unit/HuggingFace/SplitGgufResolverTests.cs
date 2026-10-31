@@ -5,6 +5,7 @@ using Xunit;
 namespace DotLLM.Tests.Unit.HuggingFace;
 
 /// <summary>Issue #756: the resolver treats a <c>-0000N-of-0000M.gguf</c> set as ONE model - pulled whole, listed once, deleted whole.</summary>
+[Collection("SequentialFileIO")]   // reads the process-global model-store env vars that SequentialFileIO tests mutate (#1395)
 public sealed class SplitGgufResolverTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), "dotllm-756-" + Guid.NewGuid().ToString("N"));
