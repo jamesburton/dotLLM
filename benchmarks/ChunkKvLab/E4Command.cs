@@ -324,7 +324,7 @@ internal static class E4Command
     }
 
     /// <summary>The plans (contexts + tasks) this run evaluates; see the class remarks.</summary>
-    private static IReadOnlyList<CodeContextPlan> SelectPlans(E4Options o, Corpus corpus)
+    internal static IReadOnlyList<CodeContextPlan> SelectPlans(E4Options o, Corpus corpus)
     {
         var gen = new CrossFileTaskGenerator(o.Generator);
         var sw = Stopwatch.StartNew();

@@ -45,6 +45,9 @@ internal sealed unsafe class LabModel : IDisposable
     /// <summary>The chunk backend matching <see cref="Model"/> (<c>--backend cpu|vulkan</c>).</summary>
     public IChunkBackend Backend { get; }
 
+    /// <summary>Vulkan device name, or "cpu".</summary>
+    public string DeviceName => _device?.DeviceName ?? "cpu";
+
     /// <summary>Forward device id: -1 (CPU) or 0 (Vulkan).</summary>
     public int DeviceId { get; }
 

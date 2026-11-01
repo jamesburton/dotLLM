@@ -23,6 +23,9 @@ namespace ChunkKvLab;
 ///               [--arms ...] [--light-arms a,b --light-budgets 5,20] [--window 16] [--shard 0/1] [--max-minutes 0] [--expect-hash &lt;sha256&gt;]
 /// ChunkKvLab rope-precision --model &lt;gguf&gt; --corpus &lt;dir&gt; --out rope.csv [--deltas 1024,4096,8192] [--chunks 3]
 /// ChunkKvLab backend-check --model &lt;gguf&gt; [--tokens 64]
+/// ChunkKvLab floor --model &lt;gguf&gt; --names a,b --corpus-dirs d1,d2 --hashes h1,h2 --contexts 7,6 --kept-dir &lt;experiments/corpus&gt;
+///               --out-dir &lt;dir&gt; [--label 2k] [--mode kept|unfiltered] [--context 2048] [--ref-block 512] [--blocks 2048,96,64,8,1]
+///               (loads CPU and Vulkan itself; no --backend)
 /// </code>
 /// Global option on every model-loading command: <c>--backend cpu|vulkan</c> (default cpu). On vulkan the model and the chunk
 /// backend share one device and all-row logits are enabled on demand (<c>TrySetAllRowLogitsLimit</c>); the experiment runners still
@@ -54,6 +57,11 @@ internal static class Program
         int[] Ints(string key, string fallback) =>
             Get(key, fallback).Split(',', StringSplitOptions.RemoveEmptyEntries).Select(s => int.Parse(s, CultureInfo.InvariantCulture)).ToArray();
 
+        if (args[0] == "floor" && opts.ContainsKey("backend"))
+        {
+            Console.Error.WriteLine("'floor' loads both the CPU and the Vulkan model itself; drop --backend.");
+            return 2;
+        }
         string backend = Get("backend", DotLLM.ChunkReuse.Backends.ChunkBackendTags.Cpu);
         if (backend is not (DotLLM.ChunkReuse.Backends.ChunkBackendTags.Cpu or DotLLM.ChunkReuse.Backends.ChunkBackendTags.Vulkan))
         {
@@ -151,6 +159,14 @@ internal static class Program
                     },
                     Int("validate", 0) != 0, double.Parse(Get("max-minutes", "0"), CultureInfo.InvariantCulture), Int("threads", 0),
                     Get("out"), opts.GetValueOrDefault("expect-hash")));
+            case "floor":
+            {
+                string[] List(string key) => Get(key).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                return FloorCommand.Run(new FloorOptions(
+                    Get("model"), List("names"), List("corpus-dirs"), List("hashes"), Ints("contexts", ""), Get("kept-dir"), Get("mode", "kept"),
+                    Int("context", 2048), Int("ref-block", 512), Ints("blocks", "2048,96,64,8,1"), Int("threads", 0), Get("label", "2k"),
+                    Get("out-dir")));
+            }
             case "backend-check":
                 return BackendCheck.Run(Get("model"), Int("tokens", 64), Int("threads", 0));
             default:
