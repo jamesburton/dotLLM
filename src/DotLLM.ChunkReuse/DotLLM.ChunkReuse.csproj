@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Chunk-level KV reuse for dotLLM (research) — encode a token chunk's per-layer K/V in isolation, then assemble cached chunks into a KV-cache at new offsets with RoPE re-rotation of the keys.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DotLLM.Core\DotLLM.Core.csproj" />
+    <ProjectReference Include="..\DotLLM.Cpu\DotLLM.Cpu.csproj" />
+    <ProjectReference Include="..\DotLLM.Engine\DotLLM.Engine.csproj" />
+    <ProjectReference Include="..\DotLLM.Models\DotLLM.Models.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Code corpus (Corpus/): Roslyn syntax for the symbol chunker, semantic model for cross-file task generation. -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" />
+    <ProjectReference Include="..\DotLLM.Tokenizers\DotLLM.Tokenizers.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -26,6 +26,8 @@
     <ProjectReference Include="..\..\src\DotLLM.Server\DotLLM.Server.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.HuggingFace\DotLLM.HuggingFace.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Cli\DotLLM.Cli.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.ChunkReuse\DotLLM.ChunkReuse.csproj" />
+    <ProjectReference Include="..\..\benchmarks\ChunkKvLab\ChunkKvLab.csproj" />
   </ItemGroup>
 
   <ItemGroup>
