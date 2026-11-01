@@ -1,3 +1,4 @@
+using DotLLM.ChunkReuse.Backends;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
@@ -12,7 +13,7 @@ namespace DotLLM.ChunkReuse;
 public sealed class ChunkEncoder
 {
     /// <summary>Creates an encoder that stamps entries with <paramref name="modelFingerprint"/>.</summary>
-    /// <param name="modelFingerprint">Identity of the model the entries come from (<see cref="ChunkFingerprint.Compute"/>).</param>
+    /// <param name="modelFingerprint">Identity of the model the entries come from (<see cref="ChunkFingerprint.Compute(DotLLM.Core.Models.ModelConfig, string, string, string, string)"/>).</param>
     public ChunkEncoder(string modelFingerprint)
     {
         ArgumentException.ThrowIfNullOrEmpty(modelFingerprint);
@@ -57,6 +58,6 @@ public sealed class ChunkEncoder
             keys[l] = cache.KeysSpan(l).ToArray();
             values[l] = cache.ValuesSpan(l).ToArray();
         }
-        return new ChunkKvEntry(ModelFingerprint, tokenIds.ToArray(), keys, values);
+        return new ChunkKvEntry(ModelFingerprint, tokenIds.ToArray(), keys, values, ChunkBackendTags.Cpu);
     }
 }

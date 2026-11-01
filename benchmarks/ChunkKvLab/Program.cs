@@ -22,7 +22,11 @@ namespace ChunkKvLab;
 ///               [--mode kept|unfiltered] [--kept &lt;validation.csv&gt;] [--plans-jsonl &lt;plans&gt;] [--contexts 0 (all)] [--budgets 5,10,15,20]
 ///               [--arms ...] [--light-arms a,b --light-budgets 5,20] [--window 16] [--shard 0/1] [--max-minutes 0] [--expect-hash &lt;sha256&gt;]
 /// ChunkKvLab rope-precision --model &lt;gguf&gt; --corpus &lt;dir&gt; --out rope.csv [--deltas 1024,4096,8192] [--chunks 3]
+/// ChunkKvLab backend-check --model &lt;gguf&gt; [--tokens 64]
 /// </code>
+/// Global option on every model-loading command: <c>--backend cpu|vulkan</c> (default cpu). On vulkan the model and the chunk
+/// backend share one device and all-row logits are enabled on demand (<c>TrySetAllRowLogitsLimit</c>); the experiment runners still
+/// need the CPU <c>SimpleKvCache</c> and refuse vulkan until Phase G Task 3 ports them.
 /// </summary>
 internal static class Program
 {
@@ -49,6 +53,20 @@ internal static class Program
         int Int(string key, int fallback) => opts.TryGetValue(key, out string? v) ? int.Parse(v, CultureInfo.InvariantCulture) : fallback;
         int[] Ints(string key, string fallback) =>
             Get(key, fallback).Split(',', StringSplitOptions.RemoveEmptyEntries).Select(s => int.Parse(s, CultureInfo.InvariantCulture)).ToArray();
+
+        string backend = Get("backend", DotLLM.ChunkReuse.Backends.ChunkBackendTags.Cpu);
+        if (backend is not (DotLLM.ChunkReuse.Backends.ChunkBackendTags.Cpu or DotLLM.ChunkReuse.Backends.ChunkBackendTags.Vulkan))
+        {
+            Console.Error.WriteLine($"--backend must be cpu or vulkan; got '{backend}'");
+            return 2;
+        }
+        LabModel.SelectedBackend = backend;
+        if (backend != DotLLM.ChunkReuse.Backends.ChunkBackendTags.Cpu && args[0] is not ("backend-check" or "corpus-info" or "graph-info"))
+        {
+            // Fail before loading weights: the experiment runners still drive SimpleKvCache directly.
+            Console.Error.WriteLine($"'{args[0]}' runs on the CPU backend only until Phase G Task 3; --backend {backend} is accepted by backend-check.");
+            return 2;
+        }
 
         switch (args[0])
         {
@@ -133,6 +151,8 @@ internal static class Program
                     },
                     Int("validate", 0) != 0, double.Parse(Get("max-minutes", "0"), CultureInfo.InvariantCulture), Int("threads", 0),
                     Get("out"), opts.GetValueOrDefault("expect-hash")));
+            case "backend-check":
+                return BackendCheck.Run(Get("model"), Int("tokens", 64), Int("threads", 0));
             default:
                 Console.Error.WriteLine($"unknown command '{args[0]}'");
                 return 2;

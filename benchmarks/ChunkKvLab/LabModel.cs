@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using DotLLM.ChunkReuse;
+using DotLLM.ChunkReuse.Backends;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
@@ -8,21 +9,27 @@ using DotLLM.Engine.KvCache;
 using DotLLM.Models;
 using DotLLM.Models.Gguf;
 using DotLLM.Tokenizers;
+using DotLLM.Vulkan;
 
 namespace ChunkKvLab;
 
-/// <summary>A CPU model, its tokenizer and the cache/forward helpers the lab commands share.</summary>
+/// <summary>A model on the selected backend (CPU or Vulkan), its tokenizer and the cache/forward helpers the lab commands share.</summary>
 internal sealed unsafe class LabModel : IDisposable
 {
     private readonly GgufFile _gguf;
+    private readonly VulkanDevice? _device;
 
-    private LabModel(GgufFile gguf, ModelConfig config, IModel model, ITokenizer tokenizer, string fingerprint)
+    private LabModel(GgufFile gguf, ModelConfig config, IModel model, ITokenizer tokenizer, string fingerprint, IChunkBackend backend,
+        VulkanDevice? device)
     {
         _gguf = gguf;
+        _device = device;
         Config = config;
         Model = model;
         Tokenizer = tokenizer;
         Fingerprint = fingerprint;
+        Backend = backend;
+        DeviceId = device is null ? -1 : 0;
         Geometry = KvGeometry.FromConfig(config, compactSlidingWindows: false);
         long bytes = 0;
         for (int l = 0; l < Geometry.LayerCount; l++) bytes += 2L * Geometry.KvStrideOf(l) * sizeof(float);
@@ -35,25 +42,81 @@ internal sealed unsafe class LabModel : IDisposable
     public string Fingerprint { get; }
     public KvGeometry Geometry { get; }
 
+    /// <summary>The chunk backend matching <see cref="Model"/> (<c>--backend cpu|vulkan</c>).</summary>
+    public IChunkBackend Backend { get; }
+
+    /// <summary>Forward device id: -1 (CPU) or 0 (Vulkan).</summary>
+    public int DeviceId { get; }
+
+    /// <summary>Backend chosen with the global <c>--backend</c> option (set by <c>Program</c> before a command runs).</summary>
+    public static string SelectedBackend { get; set; } = ChunkBackendTags.Cpu;
+
     /// <summary>F32 K+V bytes per token over all layers.</summary>
     public long KvBytesPerToken { get; }
 
-    public static LabModel Load(string path, int threads)
+    /// <summary>Loads <paramref name="path"/> on <see cref="SelectedBackend"/>.</summary>
+    public static LabModel Load(string path, int threads) => Load(path, threads, SelectedBackend);
+
+    /// <summary>
+    /// Loads <paramref name="path"/> on <paramref name="backend"/>. Vulkan: the model and the chunk backend share one device (caches the
+    /// backend creates are bound by the model's forward), and a model whose keys plain RoPE cannot re-rotate is refused before upload.
+    /// </summary>
+    public static LabModel Load(string path, int threads, string backend)
     {
         var sw = Stopwatch.StartNew();
         var gguf = GgufFile.Open(path);
-        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
-        ITokenizer tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
-        IModel model = ModelLoader.CreateCpuModelFromGguf(gguf, config, new ThreadingConfig(threads));
-        string file = Path.GetFileNameWithoutExtension(path);
-        string quant = file[(file.LastIndexOf('-') + 1)..];
-        string fp = ChunkFingerprint.Compute(config, file, quant, "gguf-embedded:" + file);
-        Console.WriteLine($"loaded {file} ({config.Architecture}, {config.NumLayers} layers, kv heads {config.NumKvHeads}, head dim {config.HeadDim}, "
-            + $"vocab {config.VocabSize}) in {sw.Elapsed.TotalSeconds:F1} s; engine {ChunkFingerprint.EngineVersion}");
-        return new LabModel(gguf, config, model, tokenizer, fp);
+        VulkanDevice? device = null;
+        try
+        {
+            var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            ITokenizer tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+            IModel model;
+            IChunkBackend chunkBackend;
+            switch (backend)
+            {
+                case ChunkBackendTags.Cpu:
+                    model = ModelLoader.CreateCpuModelFromGguf(gguf, config, new ThreadingConfig(threads));
+                    chunkBackend = new CpuChunkBackend(config);
+                    break;
+                case ChunkBackendTags.Vulkan:
+                {
+                    var features = ChunkModelFeatures.FromGguf(gguf);
+                    VulkanChunkBackend.CheckModelSupported(config, features);
+                    string spvDir = VulkanModelLoader.ResolveSpvDir();
+                    device = VulkanDevice.Create();
+                    model = VulkanTransformerModel.LoadFromGguf(device, gguf, config, spvDir);
+                    chunkBackend = new VulkanChunkBackend(device, spvDir, config, features);
+                    break;
+                }
+                default:
+                    throw new ArgumentException($"--backend must be cpu or vulkan; got '{backend}'.");
+            }
+            string file = Path.GetFileNameWithoutExtension(path);
+            string quant = file[(file.LastIndexOf('-') + 1)..];
+            string fp = ChunkFingerprint.Compute(config, file, quant, "gguf-embedded:" + file, chunkBackend.Tag);
+            Console.WriteLine($"loaded {file} ({config.Architecture}, {config.NumLayers} layers, kv heads {config.NumKvHeads}, head dim {config.HeadDim}, "
+                + $"vocab {config.VocabSize}) on {chunkBackend.Tag} in {sw.Elapsed.TotalSeconds:F1} s; engine {ChunkFingerprint.EngineVersion}");
+            return new LabModel(gguf, config, model, tokenizer, fp, chunkBackend, device);
+        }
+        catch
+        {
+            device?.Dispose();
+            gguf.Dispose();
+            throw;
+        }
     }
 
-    public SimpleKvCache NewCache(int capacity) => new(Geometry, capacity);
+    /// <summary>A host F32 cache for the runners that still read <see cref="SimpleKvCache"/> directly (CPU only until Phase G Task 3).</summary>
+    public SimpleKvCache NewCache(int capacity)
+    {
+        if (Backend.Tag != ChunkBackendTags.Cpu)
+            throw new NotSupportedException(
+                $"This command still runs on SimpleKvCache; --backend {Backend.Tag} wires the model and chunk backend only (Phase G Task 3 ports the runners).");
+        return new(Geometry, capacity);
+    }
+
+    /// <summary>An empty exact-F32 cache of the selected backend.</summary>
+    public IKvCache NewBackendCache(int capacity) => Backend.CreateCache(capacity);
 
     /// <summary>Prefills <paramref name="ids"/> at positions <paramref name="firstPosition"/>.. in blocks of <paramref name="block"/> tokens.</summary>
     public void Prefill(IKvCache cache, ReadOnlySpan<int> ids, int firstPosition, int block)
@@ -63,7 +126,7 @@ internal sealed unsafe class LabModel : IDisposable
             int n = Math.Min(block, ids.Length - off);
             int[] positions = new int[n];
             for (int i = 0; i < n; i++) positions[i] = firstPosition + off + i;
-            using ITensor _ = Model.Forward(ids.Slice(off, n), positions, -1, cache, lastTokenLogitsOnly: true);
+            using ITensor _ = Model.Forward(ids.Slice(off, n), positions, DeviceId, cache, lastTokenLogitsOnly: true);
         }
     }
 
@@ -72,11 +135,16 @@ internal sealed unsafe class LabModel : IDisposable
     {
         int[] positions = new int[ids.Length];
         for (int i = 0; i < ids.Length; i++) positions[i] = firstPosition + i;
+        // The Vulkan model returns one logit row per position only up to its all-row limit (default 1): widen it (grow-only).
+        if (allRows && ids.Length > 1 && Backend.Tag != ChunkBackendTags.Cpu && !Model.TrySetAllRowLogitsLimit(ids.Length))
+            throw new NotSupportedException($"The {Backend.Tag} model cannot return all-row logits for {ids.Length} rows.");
         using ITensor logits = allRows
-            ? Model.Forward(ids, positions, -1, cache)
-            : Model.Forward(ids, positions, -1, cache, lastTokenLogitsOnly: true);
+            ? Model.Forward(ids, positions, DeviceId, cache)
+            : Model.Forward(ids, positions, DeviceId, cache, lastTokenLogitsOnly: true);
         int rows = logits.Shape[0];
         int vocab = logits.Shape[1];
+        if (allRows && rows != ids.Length)
+            throw new InvalidOperationException($"Asked for {ids.Length} logit rows; the model returned {rows}.");
         int firstRow = allRows ? 0 : rows - 1;
         int count = allRows ? rows : 1;
         return new ReadOnlySpan<float>((float*)logits.DataPointer + (long)firstRow * vocab, count * vocab).ToArray();
@@ -84,7 +152,9 @@ internal sealed unsafe class LabModel : IDisposable
 
     public void Dispose()
     {
+        (Backend as IDisposable)?.Dispose();
         Model.Dispose();
+        _device?.Dispose();
         _gguf.Dispose();
     }
 }

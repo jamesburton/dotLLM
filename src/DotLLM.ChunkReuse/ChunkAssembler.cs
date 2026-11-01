@@ -1,6 +1,6 @@
+using DotLLM.ChunkReuse.Backends;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Models;
-using DotLLM.Core.Tensors;
 
 namespace DotLLM.ChunkReuse;
 
@@ -13,38 +13,54 @@ public sealed class ChunkAssembler
 {
     private readonly ModelConfig _config;
     private readonly RopeParameters _rope;
+    private readonly IChunkBackend _backend;
 
-    /// <summary>Creates an assembler for chunks produced by a model with <paramref name="config"/>.</summary>
+    /// <summary>Creates a CPU assembler (<see cref="CpuChunkBackend"/>) for chunks produced by a model with <paramref name="config"/>.</summary>
     /// <param name="config">The model configuration (RoPE parameters, head dim, NoPE layers).</param>
     /// <exception cref="NotSupportedException">The model's RoPE variant cannot be re-rotated (see <see cref="RopeParameters.FromConfig"/>).</exception>
     public ChunkAssembler(ModelConfig config)
+        : this(config, new CpuChunkBackend(config ?? throw new ArgumentNullException(nameof(config))))
+    {
+    }
+
+    /// <summary>Creates an assembler that places chunks through <paramref name="backend"/>.</summary>
+    /// <param name="config">The model configuration (RoPE parameters, head dim, NoPE layers).</param>
+    /// <param name="backend">Where the destination cache lives; only entries carrying its <see cref="IChunkBackend.Tag"/> are placed.</param>
+    /// <exception cref="NotSupportedException">The model's RoPE variant cannot be re-rotated (see <see cref="RopeParameters.FromConfig"/>).</exception>
+    public ChunkAssembler(ModelConfig config, IChunkBackend backend)
     {
         ArgumentNullException.ThrowIfNull(config);
+        ArgumentNullException.ThrowIfNull(backend);
         _config = config;
         _rope = RopeParameters.FromConfig(config);
+        _backend = backend;
     }
 
     /// <summary>The RoPE parameters keys are re-rotated with.</summary>
     public RopeParameters Rope => _rope;
 
+    /// <summary>The backend chunks are placed through.</summary>
+    public IChunkBackend Backend => _backend;
+
     /// <summary>
-    /// Appends <paramref name="chunks"/> to <paramref name="destination"/> in list order at running offsets. Every chunk is
-    /// validated before anything is written, so a rejected call leaves the cache unchanged. Entries are not modified (keys
-    /// are shifted in a copy), so the same entry may appear several times.
+    /// Appends <paramref name="chunks"/> to <paramref name="destination"/> in list order at running offsets: each chunk's rows are
+    /// written at its offset and its keys are then re-rotated in the cache by that offset. The destination is vetted by the backend
+    /// and every chunk is validated before anything is written, so a rejected call leaves the cache unchanged. Entries are not
+    /// modified, so the same entry may appear several times.
     /// </summary>
-    /// <param name="destination">An exact host-F32 cache (<see cref="IKvCache.SupportsExactF32PrefixCopy"/>, e.g. <c>SimpleKvCache</c>).</param>
+    /// <param name="destination">A cache the backend accepts (<see cref="IChunkBackend.RequireCache"/>; CPU: an exact host-F32 <c>SimpleKvCache</c>).</param>
     /// <param name="chunks">Chunks to place, in order.</param>
     /// <param name="expectedFingerprint">Fingerprint every chunk must carry (ordinal comparison).</param>
-    /// <exception cref="NotSupportedException">The destination stores KV lossily (quantized, F16, paged) or not as host F32 rows.</exception>
-    /// <exception cref="ArgumentException">A chunk has the wrong fingerprint, is empty, has the wrong shape, or the chunks do not fit.</exception>
-    public unsafe void Assemble(IKvCache destination, IReadOnlyList<ChunkKvEntry> chunks, string expectedFingerprint)
+    /// <exception cref="NotSupportedException">The backend cannot write the destination exactly, or the layer map differs.</exception>
+    /// <exception cref="ArgumentException">A chunk has the wrong fingerprint or backend, is empty, has the wrong shape, or the chunks do not fit.</exception>
+    public void Assemble(IKvCache destination, IReadOnlyList<ChunkKvEntry> chunks, string expectedFingerprint)
     {
         ArgumentNullException.ThrowIfNull(destination);
         ArgumentNullException.ThrowIfNull(chunks);
         ArgumentNullException.ThrowIfNull(expectedFingerprint);
-        if (!destination.SupportsExactF32PrefixCopy || destination is not IPerLayerKvCache perLayer)
-            throw new NotSupportedException(
-                $"Chunk assembly needs an exact host-F32 KV-cache; {destination.GetType().Name} stores KV lossily or off-host.");
+        _backend.RequireCache(destination);
+        if (destination is not IPerLayerKvCache perLayer)
+            throw new NotSupportedException($"Chunk assembly needs per-layer KV strides; {destination.GetType().Name} has none.");
 
         int layers = perLayer.LayerCount;
         if (layers != _config.NumLayers)
@@ -59,6 +75,10 @@ public sealed class ChunkAssembler
             if (!string.Equals(chunk.ModelFingerprint, expectedFingerprint, StringComparison.Ordinal))
                 throw new ArgumentException(
                     $"Chunk {c} has model fingerprint '{chunk.ModelFingerprint}', expected '{expectedFingerprint}'.", nameof(chunks));
+            if (!string.Equals(chunk.Backend, _backend.Tag, StringComparison.Ordinal))
+                throw new ArgumentException(
+                    $"Chunk {c} was encoded by backend '{chunk.Backend}', but this assembler places through backend '{_backend.Tag}'; "
+                    + "convert it explicitly or treat it as a miss.", nameof(chunks));
             int n = chunk.TokenIds?.Length ?? 0;
             if (n == 0)
                 throw new ArgumentException($"Chunk {c} is empty.", nameof(chunks));
@@ -85,27 +105,11 @@ public sealed class ChunkAssembler
         foreach (ChunkKvEntry chunk in chunks)
         {
             int n = chunk.TokenIds.Length;
-            int[] positions = new int[n];
-            for (int i = 0; i < n; i++) positions[i] = offset + i;
-
             for (int l = 0; l < layers; l++)
-            {
-                int stride = perLayer.KvStrideOf(l);
-                float[] keys = chunk.KeysPerLayer[l];
-                if (offset != 0 && !_config.IsNoRopeLayer(l))
-                {
-                    keys = (float[])keys.Clone();
-                    RopeShift.Apply(keys, headDim, offset, in _rope);
-                }
-
-                fixed (float* kPtr = keys)
-                fixed (float* vPtr = chunk.ValuesPerLayer[l])
-                {
-                    var kRef = new TensorRef(n, stride, DType.Float32, -1, (nint)kPtr);
-                    var vRef = new TensorRef(n, stride, DType.Float32, -1, (nint)vPtr);
-                    destination.Update(kRef, vRef, positions, l);
-                }
-            }
+                _backend.WriteRows(destination, l, offset, chunk.KeysPerLayer[l], chunk.ValuesPerLayer[l]);
+            // Keys were encoded at 0..n-1; rotate the placed rows by the offset (NoPE layers are skipped by the backend).
+            if (offset != 0)
+                _backend.ShiftKeys(destination, offset, n, offset, _rope);
             offset += n;
         }
     }
