@@ -732,6 +732,31 @@ Mean of the 4 prompts' tok/s (range = min..max over the 3 reps of that mean); th
   plain runs). Caveats as before: prompts 0 and 2 degenerate into repetition on the raw prompt (acceptance ~0.95+); prompt 1 is the non-degenerate one
   and is where dotLLM leads most (K=4 1.44x); llama.cpp's own MTP varies run to run (K=4 20.8-23.4 on the mean of 4).
 
+**Plain decode stage profile and llama.cpp per-op comparison (issue #1220, dev `59e77ae2`).** Qwen3.8-27B Q4_K_M, 1-row decode, GPU-timestamp profile
+(`DOTLLM_VULKAN_HYBRID_PROFILE=1 ..._MINSEQ=1`; this forces one submission per layer, so its "UNATTRIBUTED" 13.2 ms of 108.4 ms wall is the profiler's own
+64 submits, NOT a decode cost: the fused production step measured `SubmitAndWait` 96-101 ms plus 1.5 ms host (record ~1 ms, logits download 0.1 ms, engine 0.2 ms)).
+Achieved GB/s from the shapes, per bucket: proj_ffn 48.0 ms for 9.6 GB (Q4_K, 192 dispatches of 50.1 MB) = 200 GB/s; proj_gdn 28.9 ms for 5.88 GB (Q8_0) = 203;
+proj_attn 8.3 ms for 1.66 GB = 200; **lm_head 4.8 ms for 1.04 GB (Q6_K, 248320 rows) = 217**; everything else (norm, GDN scan/pre/copy, resid, attention, act) 5.3 ms.
+Total 95.2 ms attributed for 18.2 GB = 191 GB/s. llama.cpp (`GGML_VK_PERF_LOGGER=1`, same file, `74ade5274`) sums to 95.0 ms of GPU time per token with per-op
+times: Q4_K 17408x5120 231 us (217 GB/s), Q4_K down 5120x17408 (fused add) 243 us, Q8_0 10240x5120 263 / 6144x5120 176 / 5120x6144 192 us, Q6_K lm head 4.66 ms,
+small ops ~6.7 ms. By bucket dotLLM is level or ahead everywhere except the Q4_K FFN (48.0 vs 45.1 ms, -2.9 ms = the whole 3%): GDN projections 28.9 vs 30.3,
+attention projections 8.3 vs 8.2, lm head 4.8 vs 4.66, small ops 5.3 vs 6.7. The ceiling for the 9.6 GB FFN at llama's 217 GB/s is 44.2 ms.
+Paired ABBA (llama-bench tg64 vs `bench -n 64`, ollama idle, but a 20000-CPU-second ChunkKvLab process was running, so the box was noisy): llama.cpp 10.71 +-0.06 then
+9.88 +-1.22 tok/s; dotLLM 9.95 / 9.97. llama.cpp's own run-to-run swing (8%) exceeds the gap.
+
+*Q4_K n=1 kernel probe* (`Q4KVerifyProbe 15 1,2,3,4,6 1 q4k`, weights rotating through 200 MB): minimum over 15 reps 238-245 us (205-210 GB/s) for gate/up and 240-250 us for down at
+EVERY NR (1, 2, 3, 4, 6); the medians (255-340 us) swing 10-30% between identical processes under the background load, so NR/median differences are not resolvable. Removing the
+inter-dispatch barrier (`PROBE_NOBARRIER=1`) does not move the minimum (235-250 us): barrier drain is not the gap. The kernel already has 16-byte loads, a two-set
+software pipeline and NR rows per workgroup (#1511); llama.cpp's reads 4-byte words with 2 rows per workgroup, so load width is not what separates them. Remaining Q4_K
+n=1 distance to llama's number is 3-6% of 245 us, below what this box resolves.
+
+*Generality* (same ABBA protocol, `bench -n 128` vs llama-bench tg128): Qwen3-4B-Instruct-2507 Q4_K_M dotLLM 65.8 / 66.3 vs llama.cpp 65.7 / 64.6 tok/s (1.01x);
+Llama-3.2-3B Q8_0 dotLLM 54.7 / 54.5 vs llama.cpp 50.5 / 54.7 (0.99-1.08x). Dense plain decode is at parity there; the 27B residual is specific to the 17408x5120 Q4_K FFN shapes.
+
+*Not a lever (measured / arithmetic):* barrier drain (above); host side (1.5 ms/step = 1.5%, only removable by feeding the next token from a device-side argmax so the next step
+can be recorded while the GPU runs, tracked as a follow-up); fusing SwiGLU into the down GEMV's activation load (each of the ~1100 workgroups would recompute exp over all 17408 elements,
+about 5 us of ALU against the 2.7 us dispatch it removes); LM head (217 GB/s, at the Q8_0 ceiling).
+
 **Verify and decode on the same kernels (issue #1220).** The 4-row verify cost 150 ms against a 105 ms decode, and every verify column only
 matched decode by luck: the multi-column GEMVs reduced with `subgroupAdd`, whose order changes with the subgroup width a driver picks for
 each pipeline. Intel picks SIMD8/16/32 by register pressure, so the multi kernels differed from decode at NR = 4 on Arc. The row-split GDN

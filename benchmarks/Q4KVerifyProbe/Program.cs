@@ -106,7 +106,7 @@ foreach (var (tag, m, k) in shapes)
                 for (int i = 0; i < PerSubmit; i++)
                 {
                     record[nr](ctx.CommandBuffer, ws[i % Copies], x, y, m, k, n);
-                    KernelSupport.ComputeToComputeBarrier(ctx.CommandBuffer);
+                    if (Environment.GetEnvironmentVariable("PROBE_NOBARRIER") != "1") KernelSupport.ComputeToComputeBarrier(ctx.CommandBuffer);
                 }
                 var sw = Stopwatch.StartNew();
                 ctx.SubmitAndWait();
