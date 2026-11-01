@@ -33,7 +33,7 @@ internal static class TasksRunner
         int roundTrip = corpus.Files.Count(f => tokenizer.Decode(tokenizer.EncodeRaw(f.Text)) == f.Text);
         var byReason = corpus.Excluded.GroupBy(e => e.Reason).Select(g => $"{g.Key} {g.Count()}");
         int[] sizes = corpus.Chunks.Select(c => c.TokenIds.Length).Order().ToArray();
-        Console.WriteLine($"corpus {dir}: {corpus.Files.Count} files ({string.Join(", ", byReason)} excluded), {corpus.Chunker.Name}: "
+        Console.WriteLine($"corpus {dir}: {corpus.Files.Count} files ({(corpus.Excluded.Count == 0 ? "0" : string.Join(", ", byReason))} excluded), {corpus.Chunker.Name}: "
             + $"{corpus.Chunks.Count} chunks, {corpus.TotalTokens} tokens (chunk tokens median {Median(sizes)}, max {(sizes.Length > 0 ? sizes[^1] : 0)}); "
             + $"Decode(Encode(file)) == file for {roundTrip}/{corpus.Files.Count}; {sw.Elapsed.TotalSeconds:F1} s");
         string hash = corpus.ChunkIdHash;

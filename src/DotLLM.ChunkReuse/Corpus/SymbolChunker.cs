@@ -223,6 +223,12 @@ public sealed partial class SymbolChunker : IChunker
         }
 
         /// <summary>One line over the limit: slices of <see cref="Limit"/> token ids; offsets from the decoded slice lengths.</summary>
+        /// <remarks>
+        /// Caveat: the char offsets (and so <see cref="Chunk.StartOffset"/>/<see cref="Chunk.EndOffset"/> of the pieces) come from
+        /// decoding each slice on its own. With a byte-level BPE, a slice boundary inside a multi-byte UTF-8 character decodes to
+        /// replacement characters, so the piece offsets can be off by that character (the token ids and the coverage of the
+        /// line are unaffected). Only over-long single lines take this path.
+        /// </remarks>
         private void SliceTokens(int start, int end)
         {
             int[] ids = owner._tokenizer.EncodeRaw(text[start..end]);
