@@ -90,6 +90,20 @@ public sealed class CorpusTests : IDisposable
     }
 
     [Fact]
+    public void SymbolChunker_ConsecutiveFields_FormOneChunk_PropertiesSplit()
+    {
+        string text = Sample("properties");
+        IReadOnlyList<Chunk> chunks = new SymbolChunker(new CharTokenizer(), 4096).Chunk(new SourceFile("p.cs", text));
+
+        AssertCoversWithoutOverlap(text, chunks);
+        Chunk fields = Assert.Single(chunks, c => Text(c).Contains("private int _a;", StringComparison.Ordinal));
+        Assert.Contains("private int _b;", Text(fields));
+        Assert.DoesNotContain("public int A", Text(fields));
+        Chunk a = Assert.Single(chunks, c => Text(c).Contains("public int A {", StringComparison.Ordinal));
+        Assert.DoesNotContain("public int B", Text(a));
+    }
+
+    [Fact]
     public void SymbolChunker_FileWithParseErrors_StillCoversFile_AndSplitsIntactMembers()
     {
         string text = Sample("parse-error");
@@ -385,12 +399,15 @@ public sealed class CorpusTests : IDisposable
         [
             ("Lib/Known.cs", "namespace Lib;\n\npublic static class Known\n{\n    public static int Run(int v) => v;\n}\n"),
             // JsonConvert is not in the corpus or the BCL; Missing.Call does not exist; Ambig is ambiguous between two
-            // namespaces brought in by usings; the delegate call has no source definition. Only Known.Run is a task.
+            // namespaces brought in by usings; Over.Call(null) is an ambiguous overload (two candidate symbols, neither may be
+            // guessed); the delegate call has no source definition. Only Known.Run is a task.
             ("Lib/Ambig1.cs", "namespace X1;\n\npublic static class Ambig\n{\n    public static int Go() => 1;\n}\n"),
             ("Lib/Ambig2.cs", "namespace X2;\n\npublic static class Ambig\n{\n    public static int Go() => 2;\n}\n"),
+            ("Lib/Over.cs", "namespace Lib;\n\npublic static class Over\n{\n    public static int Call(string s) => 1;\n\n" +
+                "    public static int Call(int[] a) => 2;\n}\n"),
             ("App/Use.cs",
                 "using Lib;\nusing X1;\nusing X2;\n\nnamespace App;\n\npublic class Use\n{\n    public void G(System.Func<int> f)\n    {\n" +
-                "        Newtonsoft.Json.JsonConvert.SerializeObject(1);\n        Missing.Call(2);\n        Ambig.Go();\n" +
+                "        Newtonsoft.Json.JsonConvert.SerializeObject(1);\n        Missing.Call(2);\n        Ambig.Go();\n        Over.Call(null);\n" +
                 "        f();\n        Known.Run(5);\n    }\n}\n"),
         ];
         Corpus corpus = BuildCorpus(repo);
@@ -401,7 +418,7 @@ public sealed class CorpusTests : IDisposable
         Assert.Equal("Lib/Known.cs", Assert.Single(t.RequiredChunks).FilePath);
         CallSiteCounts counts = new CrossFileTaskGenerator(SmallOptions).CountCallSites(corpus);
         Assert.Equal(1, counts.CrossFile);
-        Assert.Equal(3, counts.Unresolved); // JsonConvert, Missing, Ambig (f() resolves to the BCL delegate Invoke)
+        Assert.Equal(4, counts.Unresolved); // JsonConvert, Missing, Ambig, Over (f() resolves to the BCL delegate Invoke)
     }
 
     [Fact]
@@ -586,7 +603,8 @@ public sealed class CorpusTests : IDisposable
         var sb = new System.Text.StringBuilder("namespace O;\n\npublic class Big\n{\n    public void Small() { }\n\n    public void Big()\n    {\n");
         for (int i = 0; i < 12; i++)
         {
-            sb.Append("        Step").Append(i).Append("(").Append(i).Append(");\n");
+            // Each call spans three lines, so a cut at an arbitrary line start would land mid-statement.
+            sb.Append("        Step").Append(i).Append("(\n            ").Append(i).Append(",\n            ").Append(i + 1).Append(");\n");
             if (i % 4 == 3) sb.Append("        if (Flag)\n        {\n            Step(").Append(i).Append(");\n        }\n");
         }
         sb.Append("        var s = \"").Append(new string('x', 400)).Append("\";\n");
