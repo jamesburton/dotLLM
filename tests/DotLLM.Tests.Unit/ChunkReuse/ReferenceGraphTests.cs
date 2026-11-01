@@ -245,6 +245,28 @@ public sealed class ReferenceGraphTests
     }
 
     [Fact]
+    public void Graph_LocalsParametersAndVar_GiveNoEdges()
+    {
+        (string, string)[] repo =
+        [
+            ("Lib/Box.cs", "namespace Lib;\n\npublic sealed class Box\n{\n    public int Size;\n}\n"),
+            ("App/Fill.cs",
+                "using Lib;\n\nnamespace App;\n\npublic class Fill\n{\n    public int Run(int seed)\n    {\n        var box = new Box();\n" +
+                "        int total = seed;\n        total += box.Size;\n        return total + seed;\n    }\n}\n"),
+        ];
+        ITokenizer tok = new CharTokenizer();
+        // 16-token chunks put locals' declarations and uses in different chunks.
+        var (graph, chunks, files) = Build(repo, new FixedSizeChunker(tok, 16), tok);
+        string[] uses = graph.Edges.Select(e => IdentifierAt(files, chunks[e.UseChunk], tok, e.UseToken)).ToArray();
+        Assert.Contains("Box", uses);
+        Assert.Contains("Size", uses);
+        Assert.DoesNotContain("var", uses);
+        Assert.DoesNotContain("box", uses);
+        Assert.DoesNotContain("total", uses);
+        Assert.DoesNotContain("seed", uses);
+    }
+
+    [Fact]
     public void Graph_IsDeterministic_AndIndependentOfInputOrder()
     {
         ITokenizer tok = new CharTokenizer();
@@ -252,8 +274,12 @@ public sealed class ReferenceGraphTests
         var (g1, chunks, _) = Build(repo, new SymbolChunker(tok, 4096), tok);
         var (g2, _, _) = Build(repo, new SymbolChunker(tok, 4096), tok);
         Assert.Equal(g1.Edges, g2.Edges);
-
         var (g3, _, _) = Build(repo.Reverse().ToArray(), new SymbolChunker(tok, 4096), tok);
+        // Graph edges sorted by (use chunk, use token, definition chunk, definition token, kind), no duplicates — also when the
+        // chunk order is not the declaration order.
+        foreach (ReferenceGraph g in new[] { g1, g3 })
+            Assert.Equal(g.Edges.OrderBy(e => e.UseChunk).ThenBy(e => e.UseToken).ThenBy(e => e.DefinitionChunk).ThenBy(e => e.DefinitionToken)
+                .ThenBy(e => e.Kind).Distinct(), g.Edges);
         var rng = new Random(7);
         Chunk[] order = chunks.ToArray();
         rng.Shuffle(order);
@@ -310,8 +336,14 @@ public sealed class ReferenceGraphTests
         IChunker chunker = chunkerCase.StartsWith("symbol", StringComparison.Ordinal)
             ? new SymbolChunker(tok, 4096)
             : new FixedSizeChunker(tok, int.Parse(chunkerCase[(chunkerCase.LastIndexOf('-') + 1)..], System.Globalization.CultureInfo.InvariantCulture));
-        // Multi-byte characters before identifiers shift byte-token indices away from char offsets.
-        (string Path, string Text)[] repo = [.. ThreeFiles, .. PartialFiles, .. NestedFiles];
+        // Multi-byte characters before identifiers shift byte-token indices away from char offsets; identifiers starting with
+        // one span several byte tokens.
+        (string Path, string Text)[] repo =
+        [
+            .. ThreeFiles, .. PartialFiles, .. NestedFiles,
+            ("Lib/Äpfel.cs", "namespace Lib;\n\npublic static class Äpfel\n{\n    public static int Öffne() => 1;\n}\n"),
+            ("App/Obst.cs", "using Lib;\n\nnamespace App;\n\npublic class Obst\n{\n    public int Z() => Äpfel.Öffne();\n}\n"),
+        ];
         repo = repo.Select(f => (f.Path, "// Größe — 日本語 ✓\n" + f.Text.Replace("{\n", "{\n    // café ✓\n", StringComparison.Ordinal))).ToArray();
         var (graph, chunks, files) = Build(repo, chunker, tok);
 
@@ -339,9 +371,12 @@ public sealed class ReferenceGraphTests
                 IdentifierAt(files, order[dc], tok, e.DefinitionTokenIndex - starts[dc]));
         }
 
-        // A known cross-file call, at the exact indices.
+        // Known cross-file calls, at the exact indices.
         SourceFile a = File(files, "Lib/MathUtil.cs"), b = File(files, "App/Calc.cs");
         Assert.Contains(new SymbolEdge(At(order, tok, b, Off(b.Text, "Add(")), At(order, tok, a, Off(a.Text, "Add(")), SymbolEdgeKind.Call), edges);
+        SourceFile apfel = File(files, "Lib/Äpfel.cs"), obst = File(files, "App/Obst.cs");
+        Assert.Contains(new SymbolEdge(At(order, tok, obst, Off(obst.Text, "Öffne(")), At(order, tok, apfel, Off(apfel.Text, "Öffne(")),
+            SymbolEdgeKind.Call), edges);
     }
 
     // ---------------------------------------------------------------------------------------------------------------

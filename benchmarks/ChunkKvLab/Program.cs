@@ -13,6 +13,8 @@ namespace ChunkKvLab;
 /// ChunkKvLab tasks --model &lt;gguf&gt; --corpus &lt;dir&gt; --out &lt;prefix&gt; [--chunker symbol|fixed] [--chunk 512] [--count 100] [--seed 0]
 ///               [--context 2048] [--continuation 32] [--prefix 256] [--per-context 4] [--max-distractors n] [--validate 0|1]
 ///               [--max-minutes 0] [--expect-hash &lt;sha256&gt;]
+/// ChunkKvLab graph-info --model &lt;gguf&gt; --corpus &lt;dir&gt; [--chunker symbol|fixed] [--chunk 512] [--repeat 3] [--plans 100] [--seed 0]
+///               [--expect-hash &lt;sha256&gt;]
 /// ChunkKvLab rope-precision --model &lt;gguf&gt; --corpus &lt;dir&gt; --out rope.csv [--deltas 1024,4096,8192] [--chunks 3]
 /// </code>
 /// </summary>
@@ -80,6 +82,9 @@ internal static class Program
                 Console.WriteLine($"corpus {Get("corpus")}: {corpus.DocumentCount} documents, {corpus.Chunks.Count} chunks; chunk-id sha256 {corpus.ChunkIdHash}");
                 return 0;
             }
+            case "graph-info":
+                return GraphRunner.Run(new GraphOptions(Get("model"), Get("corpus"), Get("chunker", "symbol"), Int("chunk", 512),
+                    Int("repeat", 3), Int("plans", 100), Int("seed", 0), opts.GetValueOrDefault("expect-hash")));
             case "tasks":
                 return TasksRunner.Run(new TasksOptions(
                     Get("model"), Get("corpus"), Get("chunker", "symbol"), Int("chunk", 512), Int("count", 100), Int("seed", 0),
