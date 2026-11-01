@@ -470,6 +470,11 @@ public sealed class CorpusTests : IDisposable
             Assert.Equal(same.PrefixTokenIds, p.Tasks[0].PrefixTokenIds);
             Assert.Equal(same.MaskedText, p.Tasks[0].MaskedText);
         }
+        // One task per context: every named task gets its own plan, none repeated.
+        IReadOnlyList<CodeContextPlan> single = new CrossFileTaskGenerator(options with { TasksPerContext = 1 }).GeneratePlansFor(corpus, wanted, seed: 5);
+        Assert.Equal(5, single.Count);
+        Assert.All(single, p => Assert.Single(p.Tasks));
+        Assert.Equal(5, single.Select(p => p.Tasks[0].Id).Distinct().Count());
         // Add's two call sites share one plan (one required chunk).
         Assert.Contains(a, p => p.Tasks.Count == 2 && p.Tasks.All(t => t.MaskedText.StartsWith("Add(", StringComparison.Ordinal)));
         // Another seed keeps the tasks and required chunks but samples other distractors or another order.

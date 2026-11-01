@@ -207,6 +207,42 @@ public sealed class GraphSelectorTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public void GraphSignals_InContextEdges_DefinitionWindowsFirst_ThenUseEnds_NeverInChunk0_WindowsClippedToTheirChunk()
+    {
+        Fixture f = Build(UseBar);
+        Chunk c = f.Order[0], a1 = f.Order[1], b = f.Order[2], a2 = f.Order[3], a3 = f.Order[4];
+        int aDeclLocal = AText.IndexOf("A\n{", StringComparison.Ordinal) - a1.StartOffset;
+        int fooDeclLocal = AText.IndexOf("Foo(", StringComparison.Ordinal) - a1.StartOffset;
+        int bALocal = BText.IndexOf("A.Foo", StringComparison.Ordinal) - b.StartOffset;
+
+        // No query: only the edges between context chunks (B -> type A, B -> Foo, both declared in A.Foo's chunk). Definition
+        // windows come first (in-degree 1 each, context order), then the use tokens in B.
+        Chunk[] order = [c, b, a1, a2, a3];
+        var ctx = new ChunkedContext(order.Select(x => x.TokenIds).ToArray(), []);
+        int[] st = ctx.ChunkStarts;
+        GraphSignals s = GraphSignals.ForQuery(f.Graph, ctx, order, null, 0, 0);
+        int[] expected = [.. Window(st[2] + aDeclLocal, 16), .. Window(st[2] + fooDeclLocal, 16), st[1] + bALocal, st[1] + bALocal + 2];
+        Assert.Equal(expected, s.Picks.ToArray());
+        Assert.Equal(expected.Length, s.CountIn(GraphPickTier.InContextEdge));
+        Assert.Equal(2, s.InContextEdges);
+
+        // The same edges with A.Foo's chunk first: its tokens are exact under naive concatenation, so only the use ends remain.
+        Chunk[] first = [a1, b, c, a2, a3];
+        var ctx0 = new ChunkedContext(first.Select(x => x.TokenIds).ToArray(), []);
+        GraphSignals s0 = GraphSignals.ForQuery(f.Graph, ctx0, first, null, 0, 0);
+        Assert.Equal(new[] { ctx0.ChunkStarts[1] + bALocal, ctx0.ChunkStarts[1] + bALocal + 2 }, s0.Picks.ToArray());
+
+        // A definition near its chunk's end: the window stops at the chunk boundary (Baz's chunk followed by another chunk).
+        Fixture z = Build(UseBaz);
+        Chunk[] zo = [z.Order[0], z.Order[4], z.Order[1]];
+        var zc = new ChunkedContext(zo.Select(x => x.TokenIds).ToArray(), []);
+        GraphSignals zs = GraphSignals.ForQuery(z.Graph, zc, zo, z.Task.CallSitePath, z.Task.MaskStartOffset, z.Task.MaskStartOffset + z.Task.MaskedText.Length);
+        int bazDecl = zc.ChunkStarts[1] + AText.IndexOf("Baz", StringComparison.Ordinal) - zo[1].StartOffset;
+        Assert.True(zc.ChunkStarts[2] - bazDecl < 16, "the fixture must put Baz within 16 tokens of its chunk end");
+        Assert.Equal(Window(bazDecl, zc.ChunkStarts[2] - bazDecl), zs.Picks.ToArray()[..zs.CountIn(GraphPickTier.QueryTarget)]);
+    }
+
+    [Fact]
     public void GraphSelector_SignalsOfAnotherContext_Throw()
     {
         Fixture f = Build(UseBar);
