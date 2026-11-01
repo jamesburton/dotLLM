@@ -349,7 +349,11 @@ internal static class E4Command
             else plans = gen.GeneratePlansFor(corpus, kept, o.Seed).ToList();
             var found = plans.SelectMany(pl => pl.Tasks).Select(t => t.Id).ToHashSet(StringComparer.Ordinal);
             Console.WriteLine($"kept task ids: {kept.Count}; found {found.Count}; missing {string.Join(' ', kept.Where(k => !found.Contains(k)))}");
+            // A CPU-time subset: order the contexts by a hash of their smallest task id (independent of seed and chunker), so
+            // every seed and chunker draws the same definitions when --contexts caps the count.
+            plans = plans.OrderBy(pl => StableKey(pl.Tasks.Select(t => t.Id).Min(StringComparer.Ordinal)!), StringComparer.Ordinal).ToList();
             if (o.MaxContexts > 0) plans = plans.Take(o.MaxContexts).ToList();
+            Console.WriteLine("contexts (first task id): " + string.Join(' ', plans.Select(pl => pl.Tasks.Select(t => t.Id).Min(StringComparer.Ordinal))));
         }
         else throw new ArgumentException($"unknown --mode '{o.Mode}' (kept|unfiltered)");
         Console.WriteLine($"plans: {plans.Count} contexts, {plans.Sum(pl => pl.Tasks.Count)} tasks ({o.Mode}, seed {o.Seed}, {sw.Elapsed.TotalSeconds:F1} s); "
@@ -385,6 +389,8 @@ internal static class E4Command
         var taken = picks.ToHashSet();
         return picks.Concat(rest.Where(i => !taken.Contains(i))).ToArray();
     }
+
+    private static string StableKey(string s) => Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(s)));
 
     private static int RandomSeed(int seed, int plan) => unchecked(seed * 1_000_003 + plan * 7_919 + 17);
 
