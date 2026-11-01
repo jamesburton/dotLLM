@@ -18,7 +18,10 @@ internal static class SyntheticDenseGguf
     public const float RopeTheta = 100f;
 
     /// <summary>Builds the GGUF bytes for <paramref name="arch"/> (<c>qwen3</c> or <c>llama</c>).</summary>
-    public static byte[] Build(string arch, int seed = 20261031)
+    /// <param name="arch">Architecture.</param>
+    /// <param name="seed">Weight seed.</param>
+    /// <param name="ropeDim">When positive, writes <c>rope.dimension_count</c> (partial rotary: only the leading dims of each head rotate).</param>
+    public static byte[] Build(string arch, int seed = 20261031, int ropeDim = 0)
     {
         bool qkNorm = arch switch
         {
@@ -42,6 +45,8 @@ internal static class SyntheticDenseGguf
         // Like the real Qwen3-4B-Instruct-2507 GGUF: freq_base only, no rope.dimension_count (full-head rotation) and no
         // rope.scaling.* keys.
         w.AddFloat32($"{arch}.rope.freq_base", RopeTheta);
+        if (ropeDim > 0)
+            w.AddUInt32($"{arch}.rope.dimension_count", (uint)ropeDim);
         w.AddFloat32($"{arch}.attention.layer_norm_rms_epsilon", 1e-6f);
 
         var tokens = new string[Vocab];

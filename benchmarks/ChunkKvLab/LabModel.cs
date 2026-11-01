@@ -66,12 +66,12 @@ internal sealed unsafe class LabModel : IDisposable
         var sw = Stopwatch.StartNew();
         var gguf = GgufFile.Open(path);
         VulkanDevice? device = null;
+        IModel? model = null;
+        IChunkBackend? chunkBackend = null;
         try
         {
             var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
             ITokenizer tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
-            IModel model;
-            IChunkBackend chunkBackend;
             switch (backend)
             {
                 case ChunkBackendTags.Cpu:
@@ -100,6 +100,9 @@ internal sealed unsafe class LabModel : IDisposable
         }
         catch
         {
+            // Release in reverse order of creation: backend kernel, model (device-resident weights), device, mapped file.
+            (chunkBackend as IDisposable)?.Dispose();
+            model?.Dispose();
             device?.Dispose();
             gguf.Dispose();
             throw;
@@ -130,9 +133,24 @@ internal sealed unsafe class LabModel : IDisposable
         }
     }
 
-    /// <summary>Forwards <paramref name="ids"/> at <paramref name="firstPosition"/>.. and copies the logits (all rows or the last).</summary>
+    /// <summary>
+    /// Largest batch <see cref="ForwardLogits"/> returns all-row logits for. All-row logits cost <c>rows × vocab × 4</c> bytes per call
+    /// (Qwen3 vocab 151,936: ~0.6 GB at 1,024 rows, ~20 GB at 32K), and on Vulkan <c>TrySetAllRowLogitsLimit</c> sizes a device buffer to
+    /// the largest request and never shrinks it, after which every prefill block up to that size also runs the full LM head.
+    /// Runners score long spans in blocks of at most this many rows (prefill the rest with <see cref="Prefill"/>), never whole contexts.
+    /// </summary>
+    public const int MaxAllRowLogitsRows = 1024;
+
+    /// <summary>
+    /// Forwards <paramref name="ids"/> at <paramref name="firstPosition"/>.. and copies the logits (all rows or the last). All-row requests
+    /// are limited to <see cref="MaxAllRowLogitsRows"/> rows.
+    /// </summary>
     public float[] ForwardLogits(IKvCache cache, ReadOnlySpan<int> ids, int firstPosition, bool allRows)
     {
+        if (allRows && ids.Length > MaxAllRowLogitsRows)
+            throw new ArgumentException(
+                $"All-row logits for {ids.Length} rows exceed the lab limit {MaxAllRowLogitsRows} ({(long)ids.Length * Config.VocabSize * 4 / (1 << 20)} MiB); "
+                + "request them in bounded blocks.", nameof(ids));
         int[] positions = new int[ids.Length];
         for (int i = 0; i < ids.Length; i++) positions[i] = firstPosition + i;
         // The Vulkan model returns one logit row per position only up to its all-row limit (default 1): widen it (grow-only).

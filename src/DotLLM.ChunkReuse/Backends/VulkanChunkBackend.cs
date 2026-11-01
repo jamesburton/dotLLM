@@ -48,6 +48,7 @@ public sealed class VulkanChunkBackend : IChunkBackend, IDisposable
 {
     private readonly ModelConfig _config;
     private readonly RopeShiftKvKernel _shift;
+    private readonly RopeParameters _rope;
     private readonly RopeF32Kernel.Variant _variant;
     private bool _disposed;
 
@@ -64,6 +65,7 @@ public sealed class VulkanChunkBackend : IChunkBackend, IDisposable
         RopeParameters rope = CheckModelSupported(config, features);
         Device = device;
         _config = config;
+        _rope = rope;
         _variant = ToVariant(rope.Type);
         _shift = RopeShiftKvKernel.Create(device, spvDir);
     }
@@ -73,6 +75,9 @@ public sealed class VulkanChunkBackend : IChunkBackend, IDisposable
 
     /// <inheritdoc/>
     public string Tag => ChunkBackendTags.Vulkan;
+
+    /// <summary>The model's checked plain-RoPE parameters; <see cref="ShiftKeys"/> rotates with exactly these.</summary>
+    public RopeParameters Rope => _rope;
 
     /// <summary>
     /// Throws <see cref="NotSupportedException"/> naming the feature unless a plain RoPE delta rotation re-rotates the model's stored
@@ -142,15 +147,15 @@ public sealed class VulkanChunkBackend : IChunkBackend, IDisposable
     {
         VulkanKvCache c = Checked(cache);
         ObjectDisposedException.ThrowIf(_disposed, this);
-        RopeF32Kernel.Variant variant = ToVariant(rope.Type);
-        if (variant != _variant)
-            throw new ArgumentException($"RoPE pairing {rope.Type} differs from the model's.", nameof(rope));
+        // One source of truth: the parameters checked at construction. A caller passing anything else is a bug, not a request.
+        if (rope != _rope)
+            throw new ArgumentException($"RoPE parameters {rope} differ from the model's checked {_rope}.", nameof(rope));
         int headDim = _config.HeadDim;
         for (int l = 0; l < c.LayerCount; l++)
         {
             if (_config.IsNoRopeLayer(l)) continue;
             int stride = c.KvStrideOf(l);
-            _shift.Shift(c, l, startPos, count, delta, stride / headDim, headDim, rope.RopeDim, rope.Theta, variant);
+            _shift.Shift(c, l, startPos, count, delta, stride / headDim, headDim, _rope.RopeDim, _rope.Theta, _variant);
         }
     }
 

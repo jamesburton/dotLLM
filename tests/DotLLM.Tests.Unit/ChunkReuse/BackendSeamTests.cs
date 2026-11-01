@@ -119,6 +119,44 @@ public sealed class BackendSeamTests : IDisposable
         Assert.Equal(0, host.CurrentLength);
     }
 
+    [Theory]
+    [InlineData("qwen3")]
+    [InlineData("llama")]
+    public void CpuBackend_ShiftKeys_PartialRotaryAndNoPeLayer(string arch)
+    {
+        // GGUF with rope.dimension_count = 8 < key_length 16; NoPE layer 1 via the config (the synthetic builder has no NoPE
+        // architecture: SmolLM3's every-4th-layer rule needs 4+ layers and its own arch).
+        using var tiny = TinyModel.Load(_scratch, arch, ropeDim: PartialRopeDim);
+        Assert.Equal(PartialRopeDim, RopeParameters.FromConfig(tiny.Config).RopeDim);
+        ModelConfig config = tiny.Config with { NoRopeLayers = [NoPeLayer] };
+        Assert.True(config.IsNoRopeLayer(NoPeLayer) && !config.IsNoRopeLayer(0) && !config.IsNoRopeLayer(2));
+        RopeParameters rope = RopeParameters.FromConfig(config);
+        var cpu = new CpuChunkBackend(config);
+        int stride = tiny.KvStride, headDim = config.HeadDim;
+        float[][] rows = RandomRows(config.NumLayers, ShiftRows * stride, seed: 7);
+
+        using var cache = (SimpleKvCache)cpu.CreateCache(SyntheticDenseGguf.Context);
+        WriteAll(cpu, cache, rows, stride);
+        cpu.ShiftKeys(cache, ShiftStart, ShiftRows, 9, rope);
+        var k = new float[ShiftRows * stride];
+        var v = new float[ShiftRows * stride];
+        for (int l = 0; l < config.NumLayers; l++)
+        {
+            cpu.ReadRows(cache, l, ShiftStart, ShiftRows, k, v);
+            if (l == NoPeLayer)
+            {
+                Assert.Equal(rows[l], k); // NoPE layer: not rotated
+                continue;
+            }
+            float[] expected = (float[])rows[l].Clone();
+            RopeShift.Apply(expected, headDim, 9, rope);
+            Assert.Equal(expected, k);
+            for (int i = 0; i < k.Length; i++)
+                if (i % headDim >= PartialRopeDim) Assert.Equal(rows[l][i], k[i]); // pass-through dims untouched
+            Assert.True(MaxAbsDiff(rows[l], k) > 1e-2f); // rotated dims did move
+        }
+    }
+
     [Fact]
     public void CpuBackend_RoundTrip_EqualsOldPath()
     {
@@ -162,6 +200,30 @@ public sealed class BackendSeamTests : IDisposable
     }
 
     // ---- helpers ----
+
+    internal const int PartialRopeDim = 8, NoPeLayer = 1, ShiftStart = 3, ShiftRows = 10;
+
+    internal static float[][] RandomRows(int layers, int floats, int seed)
+    {
+        var rng = new Random(seed);
+        var rows = new float[layers][];
+        for (int l = 0; l < layers; l++)
+        {
+            rows[l] = new float[floats];
+            for (int i = 0; i < floats; i++) rows[l][i] = (float)(rng.NextDouble() * 2 - 1);
+        }
+        return rows;
+    }
+
+    /// <summary>Zero rows before <see cref="ShiftStart"/>, then <paramref name="rows"/> at it, on every layer.</summary>
+    internal static void WriteAll(IChunkBackend backend, IKvCache cache, float[][] rows, int stride)
+    {
+        for (int l = 0; l < rows.Length; l++)
+        {
+            backend.WriteRows(cache, l, 0, new float[ShiftStart * stride], new float[ShiftStart * stride]);
+            backend.WriteRows(cache, l, ShiftStart, rows[l], rows[l]);
+        }
+    }
 
     /// <summary>The assembly algorithm before the backend seam (ChunkAssembler at b99570ba), kept here as the bit-exact reference.</summary>
     private static unsafe void OldPathAssemble(ModelConfig config, SimpleKvCache destination, IReadOnlyList<ChunkKvEntry> chunks)
@@ -246,10 +308,10 @@ public sealed class BackendSeamTests : IDisposable
         public TransformerModel Model { get; }
         public int KvStride => Config.NumKvHeads * Config.HeadDim;
 
-        public static TinyModel Load(string scratch, string arch)
+        public static TinyModel Load(string scratch, string arch, int ropeDim = 0)
         {
-            string path = Path.Combine(scratch, arch + ".gguf");
-            File.WriteAllBytes(path, SyntheticDenseGguf.Build(arch));
+            string path = Path.Combine(scratch, $"{arch}-r{ropeDim}.gguf");
+            File.WriteAllBytes(path, SyntheticDenseGguf.Build(arch, ropeDim: ropeDim));
             var gguf = GgufFile.Open(path);
             var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
             return new TinyModel(gguf, config, TransformerModel.LoadFromGguf(gguf, config, ThreadingConfig.SingleThreaded));
@@ -369,5 +431,64 @@ public sealed class BackendSeamTestsGpu : IDisposable
         }
         _output.WriteLine($"vulkan assembly vs CPU assembly keys: max abs {worstAsm:E3}");
         Assert.True(worstAsm <= 1e-5f, $"Vulkan assembly differs from the CPU assembly by {worstAsm}");
+    }
+
+    [SkippableTheory]
+    [InlineData("qwen3", 0, 7)]          // NeoX, full rotary
+    [InlineData("qwen3", 8, 7)]          // NeoX, partial rotary (rope.dimension_count 8 < key_length 16)
+    [InlineData("qwen3", 8, -5)]         // negative delta
+    [InlineData("qwen3", 8, 30_000)]     // large delta
+    [InlineData("llama", 8, 7)]          // Norm (interleaved) pairing, partial rotary
+    [InlineData("llama", 0, 30_000)]     // Norm, large delta
+    public void VulkanBackend_ShiftKeys_MatchesCpu_PartialRotaryNoPeNormAndDeltas(string arch, int ropeDim, int delta)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var tiny = BackendSeamTests.TinyModel.Load(_scratch, arch, ropeDim);
+        // NoPE layer through the config (the synthetic builder has no NoPE architecture).
+        ModelConfig config = tiny.Config with { NoRopeLayers = [BackendSeamTests.NoPeLayer] };
+        RopeParameters rope = RopeParameters.FromConfig(config);
+        Assert.Equal(ropeDim > 0 ? ropeDim : config.HeadDim, rope.RopeDim);
+        int stride = tiny.KvStride, headDim = config.HeadDim, n = BackendSeamTests.ShiftRows, at = BackendSeamTests.ShiftStart;
+        float[][] rows = BackendSeamTests.RandomRows(config.NumLayers, n * stride, seed: 11);
+
+        using var device = VulkanDevice.Create();
+        using var vk = new VulkanChunkBackend(device, spvDir, config, ChunkModelFeatures.FromGguf(tiny.Gguf));
+        Assert.Equal(rope, vk.Rope);
+        using var vkCache = vk.CreateCache(SyntheticDenseGguf.Context);
+        BackendSeamTests.WriteAll(vk, vkCache, rows, stride);
+        vk.ShiftKeys(vkCache, at, n, delta, rope);
+        // Mixed sources are refused: only the checked parameters may be passed.
+        Assert.Throws<ArgumentException>(() => vk.ShiftKeys(vkCache, at, n, delta, rope with { RopeDim = rope.RopeDim == headDim ? headDim - 2 : headDim }));
+
+        var cpu = new CpuChunkBackend(config);
+        using var cpuCache = cpu.CreateCache(SyntheticDenseGguf.Context);
+        BackendSeamTests.WriteAll(cpu, cpuCache, rows, stride);
+        cpu.ShiftKeys(cpuCache, at, n, delta, rope);
+
+        var gk = new float[n * stride];
+        var gv = new float[n * stride];
+        var ck = new float[n * stride];
+        var cv = new float[n * stride];
+        double worst = 0;
+        for (int l = 0; l < config.NumLayers; l++)
+        {
+            vk.ReadRows(vkCache, l, at, n, gk, gv);
+            cpu.ReadRows(cpuCache, l, at, n, ck, cv);
+            Assert.Equal(rows[l], gv);
+            if (l == BackendSeamTests.NoPeLayer)
+            {
+                Assert.Equal(rows[l], gk); // NoPE layer untouched on the device
+                continue;
+            }
+            for (int i = 0; i < gk.Length; i++)
+                if (i % headDim >= rope.RopeDim) Assert.Equal(rows[l][i], gk[i]); // pass-through dims untouched
+            Assert.True(BackendSeamTests.MaxAbsDiff(rows[l], gk) > 1e-2f); // the shift moved the rotated dims
+            worst = Math.Max(worst, BackendSeamTests.MaxAbsDiff(gk, ck));
+        }
+        // Small deltas: float rounding only. Large delta: |angle| reaches 3e4 rad, where an F32 angle has an ulp of ~2e-3 and
+        // the host (double cos/sin of the float angle) and the shader (F32) evaluate differently, so the budget scales with it.
+        double tol = Math.Abs(delta) < 1000 ? 1e-5 : 1e-3; // measured 2.4e-4 at delta 3e4 (Norm, full rotary)
+        _output.WriteLine($"{arch} ropeDim={rope.RopeDim} delta={delta}: max |vulkan - cpu| = {worst:E3} (tol {tol:E1})");
+        Assert.True(worst <= tol, $"device shift differs from the CPU shift by {worst}");
     }
 }
