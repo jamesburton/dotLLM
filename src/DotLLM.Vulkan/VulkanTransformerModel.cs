@@ -777,6 +777,10 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     // TurboQuant / MLA / non-contiguous batched writes always use the unfused path.
     private readonly RopeKvWriteF32Kernel? _ropeKvWrite;
     private readonly AttentionF32Kernel _attention;
+    // Per-query-row-position attention (#1531): the non-contiguous / mid-cache path (selective recompute). Null if the shader is absent.
+    private AttentionQueryPositionsKernel? _attentionQPos;
+    /// <summary>Count of attention layers that ran on the per-query-position kernel (#1531; test/diagnostic).</summary>
+    public long AttentionQueryPositionsCount { get; private set; }
     /// <summary>
     /// Flash-Attention F32 kernel for the GQA prefill path (seqQ &gt; 1). Null
     /// when the SPV is missing (older builds), when the env-var opt-out is
@@ -2603,6 +2607,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                 model._moeScatterResidual = SimpleComputeKernel.Create(device, spvDir, "moe_weighted_scatter_residual_f32", buffers: 5, pushWords: 3);
             model._rowScaleMul = SimpleComputeKernel.Create(device, spvDir, "row_scale_mul_f32", buffers: 2, pushWords: 2);
         }
+        if (File.Exists(Path.Combine(spvDir, "attention_f32_qpos.spv")))
+            model._attentionQPos = AttentionQueryPositionsKernel.Create(device, spvDir);
         if (config.Architecture == DotLLM.Core.Configuration.Architecture.GptOss)
             model.InitGptOss(spvDir);
         if (config.Architecture is DotLLM.Core.Configuration.Architecture.MiMoV2 or DotLLM.Core.Configuration.Architecture.Flint)
@@ -4545,6 +4551,18 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             DpStamp(cmdBuf, DpCatKv);
             if (_embedSegLens is not null)
                 RecordPackedEmbedAttention(cmdBuf, numHeads, numKvHeads, headDim, attnScaleOverride);
+            else if (kvCache is VulkanKvCache { Storage: VulkanKvStorage.F32, HasCompactWindows: false }
+                && _attentionQPos is not null && lw.AttnSinks is null
+                && (!IsContiguousAscending(positions) || seqKv != positionOffset + seqLen))
+            {
+                // Selective recompute (#1531): query rows at arbitrary positions (non-contiguous, or a run inside an already-filled
+                // cache). The flash / coopmat kernels derive each row's position as positionOffset + row and assert a tight span.
+                ProfNote("attn_qpos", seqLen, seqKv, numHeads);
+                AttentionQueryPositionsCount++;
+                _attentionQPos.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput, _state.PositionsBuffer,
+                    seqQ: seqLen, seqKv: seqKv, numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
+                    slidingWindow: layerSlidingWindow, softCap: attnSoftCap, scaleOverride: attnScaleOverride);
+            }
             else
             RecordAttention(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
@@ -5469,6 +5487,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         _ropeInvFreq?.InvalidateDescriptorCache();
         _ropeKvWrite?.InvalidateDescriptorCache();
         _attention.InvalidateDescriptorCache();
+        _attentionQPos?.InvalidateDescriptorCache();
         _flashAttention?.InvalidateDescriptorCache();
         _flashAttentionCoopmat?.InvalidateDescriptorCache();
         _splitKvAttention?.InvalidateDescriptorCache();
@@ -9581,6 +9600,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         _flashAttention?.Dispose();
         _flashAttentionCoopmat?.Dispose();
         _attention.Dispose();
+        _attentionQPos?.Dispose();
         _gptOss?.Dispose();
         _ropeYarnInvFreq?.Dispose();
         _rope.Dispose();
