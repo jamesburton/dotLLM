@@ -18,6 +18,9 @@ namespace ChunkKvLab;
 /// ChunkKvLab e3 --model &lt;gguf&gt; --corpus &lt;dir&gt; --name &lt;corpus name&gt; --out-dir &lt;dir&gt; [--chunker symbol|fixed] [--chunk 512]
 ///               [--seed 0] [--count 100] [--context 2048] [--contexts 0 (all)] [--kept &lt;validation.csv&gt; --plans-jsonl &lt;plans&gt;]
 ///               [--query 1] [--raw 0] [--draws 20] [--max-minutes 0] [--chunk-cache-tokens 40000] [--expect-hash &lt;sha256&gt;]
+/// ChunkKvLab e4 --model &lt;gguf&gt; --corpus &lt;dir&gt; --name &lt;corpus name&gt; --out &lt;csv&gt; [--chunker symbol|fixed] [--chunk 512] [--seed 0]
+///               [--mode kept|unfiltered] [--kept &lt;validation.csv&gt;] [--plans-jsonl &lt;plans&gt;] [--contexts 0 (all)] [--budgets 5,10,15,20]
+///               [--arms ...] [--light-arms a,b --light-budgets 5,20] [--window 16] [--shard 0/1] [--max-minutes 0] [--expect-hash &lt;sha256&gt;]
 /// ChunkKvLab rope-precision --model &lt;gguf&gt; --corpus &lt;dir&gt; --out rope.csv [--deltas 1024,4096,8192] [--chunks 3]
 /// </code>
 /// </summary>
@@ -100,6 +103,26 @@ internal static class Program
                     Int("contexts", 0), opts.GetValueOrDefault("plans-jsonl"), opts.GetValueOrDefault("kept"), Int("query", 1) != 0,
                     Int("raw", 0), Int("draws", 20), double.Parse(Get("max-minutes", "0"), CultureInfo.InvariantCulture), Int("threads", 0),
                     Get("out-dir"), Int("chunk-cache-tokens", 40000)));
+            case "e4":
+            {
+                string[] List(string key, string fallback) =>
+                    Get(key, fallback).TrimStart('=').Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                string[] shard = Get("shard", "0/1").Split('/');
+                return E4Command.Run(new E4Options(
+                    Get("model"), Get("corpus"), Get("name"), Get("chunker", "symbol"), Int("chunk", 512), opts.GetValueOrDefault("expect-hash"),
+                    Int("seed", 0), Int("count", 100),
+                    new DotLLM.ChunkReuse.CodeCorpus.TaskGeneratorOptions
+                    {
+                        ContextTokens = Int("context", 2048), ContinuationTokens = Int("continuation", 32), PrefixTokens = Int("prefix", 256),
+                        TasksPerContext = Int("per-context", 4),
+                    },
+                    Get("mode", "kept"), opts.GetValueOrDefault("kept"), opts.GetValueOrDefault("plans-jsonl"), Int("contexts", 0),
+                    Ints("budgets", "5,10,15,20"),
+                    List("arms", "drop_required,oracle_chunk,oracle_def,first_k,chunk_starts,deviation,random,query,graph,hybrid_query,hybrid_dev,oracle_def_fill"),
+                    List("light-arms", "="), Ints("light-budgets", "5,20"), Int("window", 16),
+                    double.Parse(Get("max-minutes", "0"), CultureInfo.InvariantCulture), Int("threads", 0), Get("out"),
+                    Int("chunk-cache-tokens", 40000), int.Parse(shard[0], CultureInfo.InvariantCulture), int.Parse(shard[1], CultureInfo.InvariantCulture)));
+            }
             case "tasks":
                 return TasksRunner.Run(new TasksOptions(
                     Get("model"), Get("corpus"), Get("chunker", "symbol"), Int("chunk", 512), Int("count", 100), Int("seed", 0),

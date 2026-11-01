@@ -341,7 +341,7 @@ internal static class E3Command
         return starts;
     }
 
-    private static void VerifyPlans(IReadOnlyList<CodeContextPlan> plans, string jsonl)
+    internal static void VerifyPlans(IReadOnlyList<CodeContextPlan> plans, string jsonl)
     {
         string[] lines = File.ReadAllLines(jsonl);
         if (lines.Length != plans.Count)
@@ -357,7 +357,7 @@ internal static class E3Command
     }
 
     /// <summary>Plan → kept task ids (Keep = 1) from a Task 8 validation CSV.</summary>
-    private static Dictionary<int, List<string>> ReadKept(string csv)
+    internal static Dictionary<int, List<string>> ReadKept(string csv)
     {
         var result = new Dictionary<int, List<string>>();
         foreach (string line in File.ReadLines(csv).Skip(1))
