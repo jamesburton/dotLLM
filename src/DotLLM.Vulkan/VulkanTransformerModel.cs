@@ -779,6 +779,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     private readonly AttentionF32Kernel _attention;
     // Per-query-row-position attention (#1531): the non-contiguous / mid-cache path (selective recompute). Null if the shader is absent.
     private AttentionQueryPositionsKernel? _attentionQPos;
+    /// <summary>Count of attention layers that ran on the per-query-position kernel (#1531; test/diagnostic).</summary>
+    public long AttentionQueryPositionsCount { get; private set; }
     /// <summary>
     /// Flash-Attention F32 kernel for the GQA prefill path (seqQ &gt; 1). Null
     /// when the SPV is missing (older builds), when the env-var opt-out is
@@ -4556,6 +4558,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                 // Selective recompute (#1531): query rows at arbitrary positions (non-contiguous, or a run inside an already-filled
                 // cache). The flash / coopmat kernels derive each row's position as positionOffset + row and assert a tight span.
                 ProfNote("attn_qpos", seqLen, seqKv, numHeads);
+                AttentionQueryPositionsCount++;
                 _attentionQPos.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput, _state.PositionsBuffer,
                     seqQ: seqLen, seqKv: seqKv, numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                     slidingWindow: layerSlidingWindow, softCap: attnSoftCap, scaleOverride: attnScaleOverride);
