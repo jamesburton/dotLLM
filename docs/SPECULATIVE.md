@@ -6,7 +6,11 @@ A small **draft model** proposes K candidate tokens; the larger **target model**
 
 ## Current Status
 
-Speculative decoding is **greedy-only** in the current implementation. `SpeculativeDecoder`'s constructor rejects `greedy: false` and `TextGenerator` only engages speculative decoding when the sampler is effectively argmax — `Temperature <= 0` and `RepetitionPenalty == 1.0`. Requests that don't meet both fall through to the regular (non-speculative) decode path; they are never sampled from an incorrect distribution.
+Speculative decoding is **greedy by default**. `SpeculativeDecoder`'s constructor (the two-model rejection-sampling path) rejects `greedy: false` and `TextGenerator` only engages speculative decoding when the sampler is effectively argmax — `Temperature <= 0` and `RepetitionPenalty == 1.0` — unless Gumbel-coupled sampled verification is on. Requests that don't meet the conditions fall through to the regular (non-speculative) decode path; they are never sampled from an incorrect distribution.
+
+**Sampled (non-greedy) speculation exists as an opt-in** since #1358: [Gumbel-coupled sampled verification](#gumbel-coupled-sampled-verification-1358-cpu-reference) (`DOTLLM_GUMBEL_SAMPLING=1` / `InferenceOptions.GumbelSampling`) emits exactly the token plain decoding draws for the same seed, with a bit-exact device-side draw on Vulkan (#1382, top-k / min-p in #1435) and in the continuous-batch scheduler (#1434). The modified rejection-sampling path described below remains greedy-only.
+
+**Latest dotLLM-vs-llama.cpp numbers** are consolidated in [COMPARISONS.md](COMPARISONS.md); the newest Qwen3.8-27B table is "Re-measure vs llama.cpp after #1517 and #1520" below. Earlier tables in this file (the first MTP table, the #1510 re-measure) are kept as history and are superseded by it.
 
 The probabilistic (modified rejection sampling) path described below requires `q` and `p` to be drawn from the same post-transform distribution the [sampler pipeline](SAMPLING.md) actually samples from (temperature / top-k / top-p / min-p / repetition penalty). The current code computes them from raw softmax over constraint-masked logits, which only coincides with the pipeline for argmax. Tracked in Wave 8 ([issue #121](https://github.com/kkokosa/dotLLM/issues/121)).
 
@@ -599,6 +603,8 @@ llama.cpp master `0ae0e1976` `llama-server --spec-type draft-mtp -md <head>`, sa
   loads the head file's own `token_embd` / `output` copies. dotLLM's plain baseline is ~4 GB above llama.cpp's (a trunk-side gap, not MTP).
 - llama.cpp drafts 74 % accepted at K=3. dotLLM's verify (150 ms for 4 rows vs 105 ms decode) and per-step head cost (LM head over 248k rows
   per draft step) are the remaining gap to llama.cpp's 2.2x.
+
+> **History:** the tables above this line (MTP vs llama.cpp 2.2x gap, plain 0.985x) predate #1510 / #1511 / #1517 / #1520. The current ratios are in the "Re-measure vs llama.cpp after #1517 and #1520" table below and in [COMPARISONS.md](COMPARISONS.md).
 
 **Q4_K verify cliff at 5 and 7 columns (issue #1220, follow-up).** The profile of a 5-row verify showed the Q4_K FFN at 2.05x its 1-row time. It was
 not ALU or bytes: `benchmarks/Q4KVerifyProbe` (the real 17408x5120 / 5120x17408 shapes, 4 rotating 50 MB weight copies, barriers between dispatches)

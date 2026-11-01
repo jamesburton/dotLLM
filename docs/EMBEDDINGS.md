@@ -3,8 +3,12 @@
 Phase 1 of #1369: **measure only, no new kernels.** The harness is `benchmarks/EmbeddingBench`; the one source
 change under `src/` is a null-checked per-stage timer in `BertEncoderModel` (`EncoderStageProfile`, off by default).
 
+> **Status (2026-11-01):** sections 1-4 are the #1369 CPU baseline and the CPU fixes that followed; section 5 covers the Vulkan
+> encoders and decoder embedders. The "5-25x slower than llama.cpp" figure in section 3 is the **pre-#1402/#1403/#1405 baseline**.
+> For dotLLM-vs-llama.cpp ratios see [COMPARISONS.md](COMPARISONS.md) section 6.
+
 Host: Strix Halo (Zen 5, 16C/32T, AVX-512 on 256-bit datapaths), Windows, .NET 10, `cpu-bench` lock held, box idle
-(9-13 % total CPU before each block). CPU only. All GGUFs come from the HF hub cache (no copies in the tree).
+(9-13 % total CPU before each block). The baseline measurements are CPU only (Vulkan: section 5). All GGUFs come from the HF hub cache (no copies in the tree).
 References: sentence-transformers (PyTorch CPU, **fp32**, venv under the session scratchpad), and llama.cpp
 `llama-server --embeddings -dev none -t 32` (b9016, zen4 CPU backend; Vulkan is never used for numerics).
 Quote ranges, not points: the box is shared, so treat differences under ~15 % as noise.
@@ -26,8 +30,8 @@ Quote ranges, not points: the box is shared, so treat differences under ~15 % as
 | nomic-embed-text-v2-moe | nomic-bert-moe (XLM-R Unigram vocab) | 475M (8x277M, top-2) | 768 | mean | 512 | yes (#1400), CPU + Vulkan (#1471) | Q8_0 (official GGUF) |
 
 Not attempted (same code path as a row above, or outside the 20-600M download rule): bge-large / e5-large / gte-large
-(bert), Qwen3-Embedding-4B/8B (qwen3 decoder), gte-Qwen2, bge-m3 and jina-v3/v4 (XLM-R / custom code; bge-m3 uses the same Unigram tokenizer that multilingual-e5 now loads through, #1401). Encoder = bidirectional BERT-style (`BertEncoderModel`, CPU only);
-decoder-based embedders (Qwen3-Embedding, last-token pooling) run on `TransformerModel`, also CPU only.
+(bert), Qwen3-Embedding-4B/8B (qwen3 decoder), gte-Qwen2, bge-m3 and jina-v3/v4 (XLM-R / custom code; bge-m3 uses the same Unigram tokenizer that multilingual-e5 now loads through, #1401). Encoder = bidirectional BERT-style (`BertEncoderModel` on CPU, `VulkanBertEncoderModel` on Vulkan);
+decoder-based embedders (Qwen3-Embedding, last-token pooling) run on `TransformerModel` (CPU) or `VulkanTransformerModel` (Vulkan).
 
 GPU: Vulkan `VulkanTransformerModel` implements `IEmbeddingModel` since #1406 and `VulkanBertEncoderModel` serves architecture `bert` with F16 weights since #741 (section 5); CUDA models do not (the server returns 501), `VulkanGemmaEmbeddingModel` serves `gemma-embedding` (#1472, section 5); CUDA refuses every encoder.
 
@@ -137,7 +141,7 @@ sentence-transformers is fp32 PyTorch):
 | mxbai-large F16 / Q8_0 | 0.78-0.93 / 1.54-1.58 | 8.7 / 9.1 | 1.7-5.2 / 5.1-5.4 / 2.9-3.0 |
 | Qwen3-Embedding-0.6B F16 | (0.3-2.8, see above) | 6.2 | 1.35 (bs=32) |
 
-**dotLLM is 5-25x slower than llama.cpp (Q8_0 5-12x, F16 10-25x) and 3-15x slower than fp32 PyTorch (bs=1) on the same CPU.** Because
+**At the #1369 baseline (before #1402/#1403/#1404/#1405), dotLLM was 5-25x slower than llama.cpp (Q8_0 5-12x, F16 10-25x) and 3-15x slower than fp32 PyTorch (bs=1) on the same CPU; that gap has since closed to roughly 2x (see section 4 A/B tables and COMPARISONS.md section 6; not re-measured against llama.cpp in one session).** Because
 sentence-transformers at bs=1 is already 3-15x faster, the gap is **kernel efficiency, not missing batching** (PyTorch at
 bs=32 is *slower* than bs=1 here: padding waste).
 
@@ -298,10 +302,10 @@ pooling reads (default = slice of `ForwardHiddenBatch`, so the CPU models are un
 Weights stay F16 and resident (no expansion); the only added storage is the readback buffer (`rows x hidden x 4 B`, one row for last/cls).
 
 Use: `dotllm embed <qwen3-embedding.gguf> -d vulkan "text"` (default device stays `cpu`), `dotllm serve ... --device vulkan` then
-`POST /v1/embeddings` (batched requests go through the #1405 batcher; Vulkan runs the sequences back to back). Encoders (BERT / nomic-bert)
-on a GPU device stay a **loud refusal**: `embed` fails with a `DeviceUnavailableException` message naming #741; the server's encoder loader throws
-(no silent CPU run, `auto` falls to CPU with the usual warning). Validated architecture: Qwen3 (Qwen3-Embedding-0.6B F16) only; other
-architectures on `VulkanTransformerModel` share the graph but are unvalidated.
+`POST /v1/embeddings` (batched requests go through the #1405 batcher; Vulkan packs short documents into one forward since #1437). Encoders (BERT / nomic-bert / gemma-embedding)
+now run on Vulkan via `VulkanBertEncoderModel` / `VulkanGemmaEmbeddingModel` (subsections below; #741, #1471, #1472, #1473); `cuda` still refuses every encoder loudly, and a
+Vulkan configuration those classes do not serve throws rather than silently running on the CPU. Validated decoder architecture on `VulkanTransformerModel`: Qwen3 (Qwen3-Embedding-0.6B F16) only; other
+architectures share the graph but are unvalidated.
 
 **Parity** (`Qwen3EmbeddingVulkanParityTests`, 9 texts: the committed 4-text sentence-transformers fixture + a 1-char text, unicode, 3 long
 texts up to ~450 tokens): Vulkan vs CPU last-token cosine >= 0.9999 and Vulkan vs sentence-transformers fp32 >= 0.9999 (all pass), mean pooling

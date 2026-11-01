@@ -284,14 +284,14 @@ dotLLM uses the **temporary dequant buffer** approach because:
 
 ## Attention on GPU
 
-The current GPU attention kernel is **naive** (not flash attention):
+The baseline GPU attention kernel (the first CUDA implementation, still the fallback for unsupported shapes) is **naive** (not flash attention); flash/tiled kernels now exist on the main paths (CUDA `attention_flash_mma*` including paged/KV-quantized decode splits, Vulkan coopmat flash prefill and split-KV decode below):
 - One thread block per (query_token, query_head) pair
 - Computes full QK^T score vector, applies causal mask + optional sliding window, softmax, weighted V sum
 - GQA support: KV head broadcast via `group_size = num_heads / num_kv_heads`
 - FP16 data, FP32 accumulation for numerical stability
 - Shared memory for scores + output accumulator
 
-See [ATTENTION.md](ATTENTION.md) for mechanism details. **Flash attention** (tiled, O(N) memory) is a planned future optimization.
+See [ATTENTION.md](ATTENTION.md) for mechanism details. Flash attention (tiled, O(N) memory) is implemented on CUDA (`native/kernels/attention_flash_mma*.cu`) and Vulkan (see the next section and the Flint section).
 
 ### Vulkan split-KV (Flash-Decoding) decode attention — default ON
 
@@ -1026,7 +1026,7 @@ Switches: `DOTLLM_VK_SMALLROW_GEMV=0` (all of the above, A/B), `DOTLLM_VK_MOE_MR
 
 ## Future Work
 
-- **Flash Attention**: Replace naive attention with tiled flash attention for O(N) memory and better SM utilization
+- ~~**Flash Attention**~~: done (CUDA `attention_flash_mma*`, Vulkan coopmat flash + split-KV)
 - **Fused Quantized GEMM**: Custom PTX kernels for Q4_K × FP16 (Marlin-style or MMQ-style) to eliminate per-projection dequant overhead during prefill
 - **Multi-GPU** (Step 51): NCCL-based tensor parallelism
 - **Fatbin distribution**: Pre-compiled SASS for common architectures to eliminate JIT overhead

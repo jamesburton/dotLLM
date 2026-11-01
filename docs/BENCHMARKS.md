@@ -41,7 +41,9 @@ requirement, identical *tokens* were — and the measurement rule that **degrade
 small fixed difference** (#519/#520), so pure quant-ladder fixtures are the wrong instrument for
 an engine-vs-engine claim.
 
-## Current Results (2026-03-06)
+> **Where the current numbers are.** Published dotLLM-vs-llama.cpp results per model and backend (Strix Halo Vulkan, RTX 3060 CUDA, CPU, embeddings, perplexity), with hardware, build hashes, ranges and caveats, are consolidated in **[COMPARISONS.md](COMPARISONS.md)**. This page documents the **methodology** (above) and keeps the March-2026 CPU-only series below as **historical**: it was taken on a Ryzen 7 5800HS with llama.cpp b5291, before the later CPU work (weight repacking, GEMM and decode tuning, the .NET 11 runtime result) and before the Vulkan backend work, so its prefill ratios (0.32-0.57x) and the "Roadmap to Parity" table no longer describe the engine.
+
+## Historical Results (2026-03-06)
 
 All results on: **AMD Ryzen 7 5800HS**, 16 GB DDR4, 8 cores / 16 threads, Windows 11, CPU-only, .NET 10, llama.cpp b5291.
 

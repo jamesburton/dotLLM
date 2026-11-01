@@ -285,6 +285,7 @@ store** (#1279) — every model, whether pulled by the CLI or by a test, has one
 | CUDA backend | [docs/CUDA.md](docs/CUDA.md) | PTX architecture, P/Invoke, kernel conventions, build |
 | Multi-GPU | [docs/MULTI_GPU.md](docs/MULTI_GPU.md) | Tensor/pipeline parallelism, NCCL |
 | Native AOT deployment | [docs/AOT.md](docs/AOT.md) | AOT publishing, trimming, deployment |
+| dotLLM vs llama.cpp comparisons | [docs/COMPARISONS.md](docs/COMPARISONS.md) | Quoting or updating any cross-engine number: every figure sourced, with hardware, build hashes, ranges, caveats, needs-re-measure list |
 | Perplexity & llama.cpp comparison | [docs/PERPLEXITY.md](docs/PERPLEXITY.md) | Quality measurement, corpus fixtures, CRLF trap (#506) |
 | Precision | [docs/PRECISION.md](docs/PRECISION.md) | Storage/accumulator formats per op and device, KV formats, Keep-FP32 list, #1107 evidence and violation inventory |
 | Embeddings (RAG) survey | [docs/EMBEDDINGS.md](docs/EMBEDDINGS.md) | Embedding models, `dotllm embed`, `/v1/embeddings`, encoder perf, quality gate |
