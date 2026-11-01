@@ -24,7 +24,8 @@ internal sealed record E3Options(
 /// holding a task the Task 8 validation kept, flagged in <c>.contexts.csv</c>. The query task is the plan's first kept task, else
 /// its first task. With
 /// <c>--query 1</c> one task's query prefix (masked call excluded) is forwarded after the context in both arms and its rows are
-/// compared too (query rows attend to stale K/V in the assembled arm, so they deviate from layer 1 on: propagated error).
+/// compared too (from layer 1 on, query rows attend to stale K/V in the assembled arm, so their K/V deviate from layer 2 on:
+/// propagated error; layer 1 differs only by RoPE-shift float error).
 /// Outputs, per run, in <c>--out-dir</c> with stem <c>&lt;corpus&gt;-&lt;chunker&gt;-s&lt;seed&gt;</c>:
 /// <c>.contexts.csv</c> (one row per context), <c>.cells.csv</c> (per context × layer × group sums), <c>.capture.csv</c>
 /// (per context × layer × metric × k: top-k% share and baselines) and <c>.raw.csv</c> (every row of the first
@@ -261,7 +262,7 @@ internal static class E3Command
                     {
                         int[] top = TopKCapture.TopIndices(values[l], count);
                         double share = TopKCapture.ShareOf(values[l], top);
-                        double rnd = TopKCapture.RandomShare(values[l], f, o.RandomDraws, HashCode.Combine(p, l, o.Seed));
+                        double rnd = TopKCapture.RandomShare(values[l], f, o.RandomDraws, RandomSeed(p, l, o.Seed));
                         double pos = TopKCapture.ShareOf(values[l], posSet);
                         double overlap = count == 0 ? double.NaN : (double)top.Intersect(posSet).Count() / count;
                         double l1 = d.Layers > 1 ? TopKCapture.ShareOf(values[l], layer1Set) : double.NaN;
@@ -319,6 +320,9 @@ internal static class E3Command
         Console.WriteLine($"e3 {o.CorpusName}/{o.Chunker}/s{o.Seed}: {done} contexts in {total.Elapsed.TotalMinutes:F1} min -> {stem}.*");
         return 0;
     }
+
+    /// <summary>Deterministic random-baseline seed for (plan, layer, generator seed); HashCode.Combine is randomised per process.</summary>
+    internal static int RandomSeed(int plan, int layer, int seed) => unchecked((plan * 1_000_003) ^ (layer * 7_919) ^ (seed * 104_729));
 
     private static string LabelString(TokenRoleFlags f)
     {
