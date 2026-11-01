@@ -231,6 +231,26 @@ public static class Qwen4ExpTensors
     // ───────────────────────────── verification ─────────────────────────────
 
     /// <summary>
+    /// The configuration an MTP head file is checked and loaded against (#1529): the trunk's, with <c>NextnPredictLayers = 1</c> and the
+    /// head's OWN routed-expert count. The head is an independent block with its own router and banks, so its count is whatever
+    /// <c>blk.{L}.ffn_gate_inp.weight</c> says; an expert-pruned trunk (256 of 512, ISTA Coder) keeps using the full model's 512-expert head.
+    /// A head file without that tensor falls back to the trunk count, so <see cref="FindProblems"/> reports it as missing.
+    /// </summary>
+    /// <param name="config">The trunk configuration.</param>
+    /// <param name="headTensors">The head file's tensor table.</param>
+    public static ModelConfig HeadConfig(ModelConfig config, IReadOnlyDictionary<string, GgufTensorDescriptor> headTensors)
+    {
+        ArgumentNullException.ThrowIfNull(config);
+        ArgumentNullException.ThrowIfNull(headTensors);
+        var cfg = config with { NextnPredictLayers = 1 };
+        if (config.Moe is { } moe
+            && headTensors.TryGetValue(Block(config.NumLayers, Suffix.FfnGateInp), out GgufTensorDescriptor gate)
+            && gate.Shape.Rank == 2 && gate.Shape[1] is var n && n > 0 && n != moe.NumExperts && n >= moe.NumExpertsPerTok)
+            cfg = cfg with { Moe = moe with { NumExperts = (int)n } };
+        return cfg;
+    }
+
+    /// <summary>
     /// Compares a tensor table against the contract. Returns one human-readable problem per missing required tensor, per
     /// shape mismatch, and per tensor the model does not know — an empty list means the table is exactly the Qwen4Exp layout.
     /// </summary>
