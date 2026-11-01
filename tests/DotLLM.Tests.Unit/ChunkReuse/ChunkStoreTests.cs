@@ -321,6 +321,22 @@ public sealed class ChunkStoreTests : IDisposable
     }
 
     [Fact]
+    public void Store_DtypeTagMismatch_IsMiss()
+    {
+        // Header: magic, version, then the int32 dtype tag. Only F32 rows are readable today; any other tag is a miss.
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, Dtype, Tokens);
+        var store = new FileChunkStore(_root);
+        store.Put(key, NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5));
+        string path = EntryPath(key);
+        byte[] bytes = File.ReadAllBytes(path);
+        Assert.Equal((int)KvDtype.F32, BitConverter.ToInt32(bytes, 8));
+        BitConverter.GetBytes((int)KvDtype.F16).CopyTo(bytes, 8);
+        File.WriteAllBytes(path, bytes);
+        Assert.False(store.Contains(key));
+        Assert.False(store.TryGet(key, out _));
+    }
+
+    [Fact]
     public void Store_Evict_RemovesEntry_AndMissingEvictIsNoOp()
     {
         ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, Dtype, Tokens);
