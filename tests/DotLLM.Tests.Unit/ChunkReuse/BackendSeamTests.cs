@@ -297,6 +297,9 @@ public sealed class BackendSeamTestsGpu : IDisposable
         int stride = tiny.KvStride, n = ChunkA.Length, layers = tiny.Config.NumLayers;
 
         using var device = VulkanDevice.Create();
+        // Construction itself refuses a model the device shift cannot re-rotate (before any cache or kernel use).
+        Assert.Throws<NotSupportedException>(() => new VulkanChunkBackend(device, spvDir, tiny.Config, features with { HasRopeFreqFactors = true }));
+        Assert.Throws<NotSupportedException>(() => new VulkanChunkBackend(device, spvDir, tiny.Config, features with { HasAttentionSinks = true }));
         using var backend = new VulkanChunkBackend(device, spvDir, tiny.Config, features);
         Assert.Equal(ChunkBackendTags.Vulkan, backend.Tag);
         using var cache = (VulkanKvCache)backend.CreateCache(SyntheticDenseGguf.Context);
