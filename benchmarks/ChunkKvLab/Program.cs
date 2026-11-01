@@ -22,6 +22,7 @@ namespace ChunkKvLab;
 ///               [--mode kept|unfiltered] [--kept &lt;validation.csv&gt;] [--plans-jsonl &lt;plans&gt;] [--contexts 0 (all)] [--budgets 5,10,15,20]
 ///               [--arms ...] [--light-arms a,b --light-budgets 5,20] [--window 16] [--shard 0/1] [--max-minutes 0] [--expect-hash &lt;sha256&gt;]
 /// ChunkKvLab rope-precision --model &lt;gguf&gt; --corpus &lt;dir&gt; --out rope.csv [--deltas 1024,4096,8192] [--chunks 3]
+/// ChunkKvLab store-probe --model &lt;gguf&gt; --corpus &lt;dir&gt; --store &lt;empty dir&gt; [--chunks 3] [--chunk 512]
 /// </code>
 /// </summary>
 internal static class Program
@@ -71,6 +72,9 @@ internal static class Program
             case "rope-precision":
                 return RopePrecision.Run(Get("model"), Get("corpus"), Get("pattern", "*.cs"), Ints("deltas", "1024,4096,8192"),
                     Int("chunks", 3), Int("chunk", 512), Int("threads", 0), Get("out"));
+            case "store-probe":
+                return StoreProbe.Run(Get("model"), Get("corpus"), Get("pattern", "*.cs"), Int("chunks", 3), Int("chunk", 512),
+                    Int("threads", 0), Get("store"));
             case "corpus-info":
             {
                 // Tokenizer only (no weights are run): document/chunk counts and the chunk-id hash of a corpus directory.
