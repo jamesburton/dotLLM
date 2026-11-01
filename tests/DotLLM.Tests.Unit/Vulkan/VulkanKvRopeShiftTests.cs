@@ -73,7 +73,8 @@ public sealed class VulkanKvRopeShiftTests
                 Assert.Equal(kBefore[i], kAfter[i]);
         }
 
-        double worstShiftVsExact = 0, worstModelVsExact = 0, worstShiftVsModel = 0;
+        double worstShiftVsExact = 0, worstModelVsExact = 0, worstShiftVsModel = 0, worstSrcVsExact = 0;
+        var srcPosExact = RotateExact(raw, srcPos0, kvHeads, headDim, ropeDim, theta, type);
         for (int r = 0; r < Rows; r++)
             for (int h = 0; h < kvHeads; h++)
             {
@@ -81,24 +82,27 @@ public sealed class VulkanKvRopeShiftTests
                 double norm = 0;
                 for (int d = 0; d < headDim; d++) norm += (double)exact[o + d] * exact[o + d];
                 norm = Math.Sqrt(norm);
-                double eS = 0, eM = 0, eSM = 0;
+                double eS = 0, eM = 0, eSM = 0, eSrc = 0;
                 for (int d = 0; d < headDim; d++)
                 {
                     double got = kAfter[(StartRow + r) * stride + h * headDim + d];
                     eS = Math.Max(eS, Math.Abs(got - exact[o + d]));
                     eM = Math.Max(eM, Math.Abs(model[o + d] - exact[o + d]));
                     eSM = Math.Max(eSM, Math.Abs(got - model[o + d]));
+                    eSrc = Math.Max(eSrc, Math.Abs(src[o + d] - srcPosExact[o + d]));
                 }
                 worstShiftVsExact = Math.Max(worstShiftVsExact, eS / norm);
                 worstModelVsExact = Math.Max(worstModelVsExact, eM / norm);
                 worstShiftVsModel = Math.Max(worstShiftVsModel, eSM / norm);
+                worstSrcVsExact = Math.Max(worstSrcVsExact, eSrc / norm);
             }
         _out.WriteLine($"{storage} {type} delta={delta}: shift-vs-exact {worstShiftVsExact:E2}, model-vs-exact {worstModelVsExact:E2}, shift-vs-model {worstShiftVsModel:E2} (of head norm)");
 
         // F16 storage rounds the stored row (relative eps 2^-11 per element, twice: source + result); the F32 path only floats.
-        double floor = storage == VulkanKvStorage.F16 ? 2.5e-3 : 1e-6;
-        Assert.True(worstShiftVsExact <= 2 * worstModelVsExact + floor,
-            $"shifted K is {worstShiftVsExact:E2} from exact vs the model's own {worstModelVsExact:E2} (floor {floor:E1})");
+        double floor = storage == VulkanKvStorage.F16 ? 5e-4 : 1e-6;
+        // The source rows carry the model's own angle rounding at their position; a rotation preserves it, so it is part of the budget.
+        Assert.True(worstShiftVsExact <= 2 * worstModelVsExact + 2 * worstSrcVsExact + floor,
+            $"shifted K is {worstShiftVsExact:E2} from exact vs the model's own {worstModelVsExact:E2} (source {worstSrcVsExact:E2}, floor {floor:E1})");
     }
 
     // Row r is rotated as position pos0 + r by the CPU model's float table.
