@@ -781,6 +781,11 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     private AttentionQueryPositionsKernel? _attentionQPos;
     /// <summary>Count of attention layers that ran on the per-query-position kernel (#1531; test/diagnostic).</summary>
     public long AttentionQueryPositionsCount { get; private set; }
+    private VulkanQueryRelevanceProbe? _relevanceProbe;
+    /// <summary>Attaches (or, with null, detaches) a query-relevance probe: while attached, every layer of a cached forward on a plain <see cref="VulkanKvCache"/> feeds it (#1531 step 4). Not thread-safe; one forward at a time.</summary>
+    public void AttachQueryRelevanceProbe(VulkanQueryRelevanceProbe? probe) => _relevanceProbe = probe;
+    /// <summary>Creates a query-relevance probe on this model's own device (buffers of another <see cref="VulkanDevice"/> cannot be bound).</summary>
+    public VulkanQueryRelevanceProbe CreateQueryRelevanceProbe(string spvDir, VulkanKvStorage storage = VulkanKvStorage.F32) => VulkanQueryRelevanceProbe.Create(_device, spvDir, storage);
     /// <summary>
     /// Flash-Attention F32 kernel for the GQA prefill path (seqQ &gt; 1). Null
     /// when the SPV is missing (older builds), when the env-var opt-out is
@@ -4570,6 +4575,10 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                 positionOffset: positionOffset, slidingWindow: layerSlidingWindow,
                 softCap: attnSoftCap, scaleOverride: attnScaleOverride,
                 sinks: lw.AttnSinks);
+            // Query-relevance probe (#1531 step 4): reads the post-RoPE Q and the cache's K the attention just read; own buffers, no model state.
+            if (_relevanceProbe is not null && kvCache is VulkanKvCache { HasCompactWindows: false } probeCache && probeCache.Storage == _relevanceProbe.KvStorage)
+                _relevanceProbe.RecordLayer(cmdBuf, _state.Q, kSrc, vSrc, _state.PositionsBuffer, seqLen, numHeads, numKvHeads, headDim,
+                    attnScaleOverride > 0.0f ? attnScaleOverride : 1.0f / MathF.Sqrt(headDim));
             BarrierComputeToCompute(cmdBuf);
             ProfSample("attention");
             DpStamp(cmdBuf, DpCatAttn);
