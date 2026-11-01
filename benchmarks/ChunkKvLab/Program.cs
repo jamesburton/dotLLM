@@ -15,6 +15,9 @@ namespace ChunkKvLab;
 ///               [--max-minutes 0] [--expect-hash &lt;sha256&gt;]
 /// ChunkKvLab graph-info --model &lt;gguf&gt; --corpus &lt;dir&gt; [--chunker symbol|fixed] [--chunk 512] [--repeat 3] [--plans 100] [--seed 0]
 ///               [--expect-hash &lt;sha256&gt;]
+/// ChunkKvLab e3 --model &lt;gguf&gt; --corpus &lt;dir&gt; --name &lt;corpus name&gt; --out-dir &lt;dir&gt; [--chunker symbol|fixed] [--chunk 512]
+///               [--seed 0] [--count 100] [--context 2048] [--contexts 0 (all)] [--kept &lt;validation.csv&gt; --plans-jsonl &lt;plans&gt;]
+///               [--query 1] [--raw 0] [--draws 20] [--max-minutes 0] [--chunk-cache-tokens 40000] [--expect-hash &lt;sha256&gt;]
 /// ChunkKvLab rope-precision --model &lt;gguf&gt; --corpus &lt;dir&gt; --out rope.csv [--deltas 1024,4096,8192] [--chunks 3]
 /// </code>
 /// </summary>
@@ -85,6 +88,18 @@ internal static class Program
             case "graph-info":
                 return GraphRunner.Run(new GraphOptions(Get("model"), Get("corpus"), Get("chunker", "symbol"), Int("chunk", 512),
                     Int("repeat", 3), Int("plans", 100), Int("seed", 0), opts.GetValueOrDefault("expect-hash")));
+            case "e3":
+                return E3Command.Run(new E3Options(
+                    Get("model"), Get("corpus"), Get("name"), Get("chunker", "symbol"), Int("chunk", 512), opts.GetValueOrDefault("expect-hash"),
+                    Int("seed", 0), Int("count", 100),
+                    new DotLLM.ChunkReuse.CodeCorpus.TaskGeneratorOptions
+                    {
+                        ContextTokens = Int("context", 2048), ContinuationTokens = Int("continuation", 32), PrefixTokens = Int("prefix", 256),
+                        TasksPerContext = Int("per-context", 4),
+                    },
+                    Int("contexts", 0), opts.GetValueOrDefault("plans-jsonl"), opts.GetValueOrDefault("kept"), Int("query", 1) != 0,
+                    Int("raw", 0), Int("draws", 20), double.Parse(Get("max-minutes", "0"), CultureInfo.InvariantCulture), Int("threads", 0),
+                    Get("out-dir"), Int("chunk-cache-tokens", 40000)));
             case "tasks":
                 return TasksRunner.Run(new TasksOptions(
                     Get("model"), Get("corpus"), Get("chunker", "symbol"), Int("chunk", 512), Int("count", 100), Int("seed", 0),
