@@ -167,18 +167,30 @@ public sealed class Corpus
         get
         {
             if (_compilation is not null) return _compilation;
-            var trees = new Dictionary<string, SyntaxTree>(StringComparer.Ordinal);
-            foreach (SourceFile f in _files)
-                trees[f.Path] = CSharpSyntaxTree.ParseText(f.Text, SymbolChunker.ParseOptions, f.Path);
-            IEnumerable<SyntaxTree> all = trees.Values;
-            if (_implicitUsings)
-                all = all.Append(CSharpSyntaxTree.ParseText(SdkImplicitUsings, SymbolChunker.ParseOptions, "<implicit-usings>"));
-            _compilation = CSharpCompilation.Create("corpus", all, BclReferences.Value,
-                new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, allowUnsafe: true,
-                    nullableContextOptions: NullableContextOptions.Enable, concurrentBuild: false));
-            _trees = trees;
+            (_compilation, _trees) = CreateCompilation(_files, _implicitUsings);
             return _compilation;
         }
+    }
+
+    /// <summary>
+    /// One Roslyn compilation over <paramref name="files"/> (+ <see cref="SdkImplicitUsings"/> when
+    /// <paramref name="implicitUsings"/>), BCL references only, and each file's syntax tree by path (the implicit-usings tree
+    /// is not a corpus file and is not in the map).
+    /// </summary>
+    internal static (CSharpCompilation Compilation, Dictionary<string, SyntaxTree> Trees) CreateCompilation(
+        IEnumerable<SourceFile> files, bool implicitUsings)
+    {
+        var trees = new Dictionary<string, SyntaxTree>(StringComparer.Ordinal);
+        foreach (SourceFile f in files)
+            if (!trees.TryAdd(f.Path, CSharpSyntaxTree.ParseText(f.Text, SymbolChunker.ParseOptions, f.Path)))
+                throw new ArgumentException($"Duplicate file path '{f.Path}'.", nameof(files));
+        IEnumerable<SyntaxTree> all = trees.Values;
+        if (implicitUsings)
+            all = all.Append(CSharpSyntaxTree.ParseText(SdkImplicitUsings, SymbolChunker.ParseOptions, "<implicit-usings>"));
+        var compilation = CSharpCompilation.Create("corpus", all, BclReferences.Value,
+            new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, allowUnsafe: true,
+                nullableContextOptions: NullableContextOptions.Enable, concurrentBuild: false));
+        return (compilation, trees);
     }
 
     /// <summary>The syntax tree of <paramref name="path"/> in <see cref="Compilation"/>.</summary>

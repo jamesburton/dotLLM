@@ -660,25 +660,6 @@ public sealed class CorpusTests : IDisposable
         return best;
     }
 
-    /// <summary>One token per UTF-16 char (id = char code); counts <see cref="Encode"/> calls.</summary>
-    private sealed class CharTokenizer : ITokenizer
-    {
-        public int EncodeCalls { get; private set; }
-        public int[] Encode(string text) { EncodeCalls++; return text.Select(ch => (int)ch).ToArray(); }
-        public string Decode(ReadOnlySpan<int> tokenIds)
-        {
-            var chars = new char[tokenIds.Length];
-            for (int i = 0; i < chars.Length; i++) chars[i] = (char)tokenIds[i];
-            return new string(chars);
-        }
-        public string Decode(ReadOnlySpan<int> tokenIds, bool stripBosSpace) => Decode(tokenIds);
-        public string DecodeToken(int tokenId) => ((char)tokenId).ToString();
-        public int BosTokenId => -1;
-        public int EosTokenId => -1;
-        public int VocabSize => 65536;
-        public int CountTokens(string text) => text.Length;
-    }
-
     /// <summary>Char tokenizer that merges '.' + letter into one token (id 0x20000 + letter).</summary>
     private sealed class DotMergingTokenizer : ITokenizer
     {
