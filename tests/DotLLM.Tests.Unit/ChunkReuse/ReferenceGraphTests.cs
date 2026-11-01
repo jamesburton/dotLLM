@@ -245,6 +245,33 @@ public sealed class ReferenceGraphTests
     }
 
     [Fact]
+    public void Graph_PositionalRecordProperty_LinksToItsParameter_AndCorpusOverloadMatches()
+    {
+        (string, string)[] repo =
+        [
+            ("Lib/Rec.cs", "namespace Lib;\n\npublic record Rec(int Width);\n"),
+            ("App/UseRec.cs", "using Lib;\n\nnamespace App;\n\npublic class UseRec\n{\n    public int W(Rec r) => r.Width + new Rec(1).Width;\n}\n"),
+        ];
+        ITokenizer tok = new CharTokenizer();
+        var (graph, chunks, files) = Build(repo, new SymbolChunker(tok, 4096), tok);
+        Chunk[] order = chunks.Reverse().ToArray();
+        IReadOnlyList<SymbolEdge> edges = graph.EdgesForContext(Ctx(order));
+        SourceFile rec = File(files, "Lib/Rec.cs"), use = File(files, "App/UseRec.cs");
+
+        int width = At(order, tok, rec, Off(rec.Text, "Width"));
+        Assert.Contains(new SymbolEdge(At(order, tok, use, Off(use.Text, "Width")), width, SymbolEdgeKind.Use), edges);
+        Assert.Contains(new SymbolEdge(At(order, tok, use, Off(use.Text, "Width", 1)), width, SymbolEdgeKind.Use), edges);
+        // The synthesized primary constructor is declared in source (the parameter list): `new Rec(1)` calls it.
+        int created = At(order, tok, use, Off(use.Text, "Rec(1)"));
+        Assert.Contains(edges, e => e.UseTokenIndex == created && e.Kind == SymbolEdgeKind.Use);
+        Assert.Contains(edges, e => e.UseTokenIndex == created && e.Kind == SymbolEdgeKind.Call);
+
+        // Build(Corpus) reuses the corpus compilation and gives the same graph.
+        var corpus = new Corpus(files, new SymbolChunker(tok, 4096), tok);
+        Assert.Equal(new RoslynGraphBuilder(tok).Build(corpus.Files, corpus.Chunks).Edges, new RoslynGraphBuilder(tok).Build(corpus).Edges);
+    }
+
+    [Fact]
     public void Graph_LocalsParametersAndVar_GiveNoEdges()
     {
         (string, string)[] repo =

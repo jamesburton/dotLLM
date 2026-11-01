@@ -11,7 +11,11 @@ public enum SymbolEdgeKind
     /// <summary>A reference to a type, field, property, event, or method group → its declaration name.</summary>
     Use,
 
-    /// <summary>A using directive's name → the imported namespace's name in its ordinal-first declaring file (or the type, for <c>using static</c> / aliases).</summary>
+    /// <summary>
+    /// A using directive's name → the imported namespace's name in its ordinal-first declaring file (or the type, for
+    /// <c>using static</c> / aliases). The use end is the first character of the whole directive name, the definition end the
+    /// last segment's name, so for a dotted namespace (<c>using A.B;</c>) the two ends spell different identifiers (A vs B).
+    /// </summary>
     Import,
 
     /// <summary>An invoked method's name (or a created type's name, for an explicit constructor; or an attribute name) → the method's declaration name.</summary>
