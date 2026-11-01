@@ -43,6 +43,15 @@ public sealed record CodeTask(string Prefix, string ExpectedContinuation, IReadO
     /// <summary>Path of the calling file.</summary>
     public string CallSitePath { get; init; } = "";
 
+    /// <summary>
+    /// File character offset where the query's file text starts: <see cref="Prefix"/> is the <c>// path</c> header line followed by
+    /// the calling file's text [<see cref="PrefixStartOffset"/>, <see cref="MaskStartOffset"/>).
+    /// </summary>
+    public int PrefixStartOffset { get; init; }
+
+    /// <summary>File character offset of the masked text (<see cref="MaskedText"/> spans [this, this + its length)).</summary>
+    public int MaskStartOffset { get; init; }
+
     /// <summary>1-based line of the mask start.</summary>
     public int CallSiteLine { get; init; }
 
@@ -396,6 +405,8 @@ public sealed class CrossFileTaskGenerator
             MaskTokenCount = maskTokens,
             MaskedText = maskedText,
             CallSitePath = s.Path,
+            PrefixStartOffset = from,
+            MaskStartOffset = boundary,
             CallSiteLine = lines.LineOf(s.MaskStart),
             Symbol = s.Symbol,
         };

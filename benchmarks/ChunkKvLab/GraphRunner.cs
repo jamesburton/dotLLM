@@ -14,7 +14,8 @@ internal sealed record GraphOptions(string ModelPath, string CorpusDir, string C
 /// <c>graph-info</c> (Task 9, tokenizer only): builds the Roslyn reference graph of a code corpus <see cref="GraphOptions.Repeat"/>
 /// times from scratch (fresh compilation each time) and prints build time per 100K tokens split into compile / bind / map,
 /// then edge statistics: edges per 1K tokens, kind breakdown, share crossing chunks and files, and — over the Task 8 plans
-/// (<see cref="CrossFileTaskGenerator.GeneratePlans"/>, default options) — cross-chunk edges per 1K context tokens,
+/// (<see cref="CrossFileTaskGenerator.GeneratePlans"/>, default options) — cross-chunk edges per 1K context tokens, query edges
+/// (<see cref="ReferenceGraph.QueryEdges"/>) split into query prefix / masked call / rest of the calling file,
 /// unidentified context chunks and <see cref="ReferenceGraph.EdgesForContext(ChunkedContext)"/> time.
 /// </summary>
 internal static class GraphRunner
@@ -74,18 +75,27 @@ internal static class GraphRunner
         double queryMs = 0;
         var indexOf = new Dictionary<string, int>(StringComparer.Ordinal);
         for (int i = 0; i < chunks.Count; i++) indexOf.TryAdd(chunks[i].Id, i);
-        long callFileEdges = 0, callFileEdgesToRequired = 0;
+        // Calling-file edges into the context, per task, by where the use lies: query prefix / masked call / elsewhere in the file.
+        var split = new long[3, 2]; // [prefix, mask, elsewhere] × [into context, into the required chunk(s)]
+        var prefixByKind = new long[byKind.Length];
+        long tasks = 0;
         foreach (CodeContextPlan plan in plans)
         {
-            // Edges from the calling files (whole files: an upper bound for the query prefixes) into the context.
             var inContext = plan.Chunks.Select(c => indexOf[c.Id]).ToHashSet();
             var required = plan.RequiredIds.Select(id => indexOf[id]).ToHashSet();
-            var callFiles = plan.Tasks.Select(t => t.CallSitePath).ToHashSet(StringComparer.Ordinal);
-            foreach (ChunkEdge x in edges)
+            foreach (CodeTask t in plan.Tasks)
             {
-                if (!callFiles.Contains(chunks[x.UseChunk].FilePath) || !inContext.Contains(x.DefinitionChunk)) continue;
-                callFileEdges++;
-                if (required.Contains(x.DefinitionChunk)) callFileEdgesToRequired++;
+                tasks++;
+                int maskEnd = t.MaskStartOffset + t.MaskedText.Length;
+                foreach (QueryEdge q in graph.QueryEdges(t.CallSitePath, 0, int.MaxValue))
+                {
+                    if (!inContext.Contains(q.DefinitionChunk)) continue;
+                    int where = q.UseOffset >= t.PrefixStartOffset && q.UseOffset < t.MaskStartOffset ? 0
+                        : q.UseOffset >= t.MaskStartOffset && q.UseOffset < maskEnd ? 1 : 2;
+                    split[where, 0]++;
+                    if (required.Contains(q.DefinitionChunk)) split[where, 1]++;
+                    if (where == 0) prefixByKind[(int)q.Kind]++;
+                }
             }
 
             var ctx = new ChunkedContext(plan.Chunks.Select(c => c.TokenIds).ToArray(), []);
@@ -105,8 +115,12 @@ internal static class GraphRunner
             + $"unidentified chunks {unmatched}/{ctxChunks}; cross-chunk edges {ctxEdges} ({ctxEdges / ck:F2} per 1K context tokens, "
             + $"explicit-chunk overload {exactEdges}); tokens on an edge end {Pct(endTokens, ctxTokens)}");
         Console.WriteLine("  by kind: " + string.Join(", ", Enum.GetValues<SymbolEdgeKind>().Select(k => $"{k} {byKind[(int)k]} ({byKind[(int)k] / ck:F2}/1K)")));
-        Console.WriteLine($"calling-file -> context edges (not in EdgesForContext: the query is not a chunk): {callFileEdges / (double)plans.Count:F1} per context, "
-            + $"{Pct(callFileEdgesToRequired, callFileEdges)} into the required chunk(s)");
+        string[] places = ["query prefix", "masked call", "elsewhere in the calling file"];
+        Console.WriteLine($"calling-file -> context edges (not in EdgesForContext: the query is not a chunk), {tasks} tasks:");
+        for (int w = 0; w < 3; w++)
+            Console.WriteLine($"  {places[w],-30} per task {split[w, 0] / (double)tasks:F2} (into required {split[w, 1] / (double)tasks:F2}), "
+                + $"per context {split[w, 0] / (double)plans.Count:F2} (into required {split[w, 1] / (double)plans.Count:F2})");
+        Console.WriteLine("  query-prefix edges by kind: " + string.Join(", ", Enum.GetValues<SymbolEdgeKind>().Select(k => $"{k} {prefixByKind[(int)k]}")));
         Console.WriteLine($"EdgesForContext: {queryMs / plans.Count:F3} ms per context, {queryMs / (ctxTokens / 10_000.0):F3} ms per 10K context tokens");
         return 0;
     }

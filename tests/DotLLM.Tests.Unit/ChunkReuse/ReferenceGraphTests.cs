@@ -69,6 +69,8 @@ public sealed class ReferenceGraphTests
             SymbolEdgeKind.Use), edges);
         Assert.Contains(new SymbolEdge(At(order, tok, b, Off(b.Text, "One;")), At(order, tok, a, Off(a.Text, "One =")),
             SymbolEdgeKind.Use), edges);
+        // A chunk placed twice is used at its first placement.
+        Assert.Equal(edges, graph.EdgesForContext(Ctx([.. order, .. order])));
     }
 
     [Fact]
@@ -272,6 +274,116 @@ public sealed class ReferenceGraphTests
     }
 
     [Fact]
+    public void Graph_GluingTokenizer_NamesStartingMidToken_MapToTheTokenHoldingThem()
+    {
+        (string, string)[] repo =
+        [
+            .. ThreeFiles,
+            ("Lib/Deep/Inner.cs", "namespace Lib.Deep;\n\npublic static class Inner\n{\n    public static int Z() => 0;\n}\n"),
+            ("App/UseDeep.cs", "using Lib.Deep;\n\nnamespace App;\n\npublic class UseDeep\n{\n    public int Q() => Inner.Z();\n}\n"),
+        ];
+        ITokenizer tok = new GluingTokenizer();
+        var (graph, chunks, files) = Build(repo, new SymbolChunker(tok, 4096), tok);
+        Chunk[] order = chunks.Reverse().ToArray();
+        IReadOnlyList<SymbolEdge> edges = graph.EdgesForContext(Ctx(order));
+        SourceFile a = File(files, "Lib/MathUtil.cs"), b = File(files, "App/Calc.cs"), inner = File(files, "Lib/Deep/Inner.cs"),
+            deep = File(files, "App/UseDeep.cs");
+        int T(SourceFile f, string needle, int nth = 0) => TokenAt(order, tok, f, Off(f.Text, needle, nth));
+
+        // ".Add" and " Add" are single tokens: both ends sit inside their token.
+        Assert.Equal(".Add", tok.Decode([Ctx(order).TokenIds[T(b, "Add(")]]));
+        Assert.Contains(new SymbolEdge(T(b, "Add("), T(a, "Add("), SymbolEdgeKind.Call), edges);
+        Assert.Contains(new SymbolEdge(T(b, "MathUtil.Add"), T(a, "MathUtil\n"), SymbolEdgeKind.Use), edges);
+        // `namespace Lib.Deep` also declares Lib, and Lib/Deep/Inner.cs is now the ordinal-first declaring file.
+        Assert.Contains(new SymbolEdge(T(b, "Lib;"), T(inner, "Lib.Deep"), SymbolEdgeKind.Import), edges);
+        // Dotted using: from " Lib" (start of the directive name) to ".Deep" (the namespace's last segment).
+        Assert.Contains(new SymbolEdge(T(deep, "Lib.Deep"), T(inner, "Deep;"), SymbolEdgeKind.Import), edges);
+        Assert.Contains(new SymbolEdge(T(deep, "Z("), T(inner, "Z("), SymbolEdgeKind.Call), edges);
+    }
+
+    [Fact]
+    public void Graph_ConditionalCall_Event_AndPartialProperty()
+    {
+        (string, string)[] repo =
+        [
+            ("Lib/Svc.cs", "namespace Lib;\n\npublic class Svc\n{\n    public event System.Action? Changed;\n\n    public int Run() => 1;\n}\n"),
+            ("Lib/Part1.cs", "namespace Lib;\n\npublic partial class Part\n{\n    public partial int Size { get; }\n}\n"),
+            ("Lib/Part2.cs", "namespace Lib;\n\npublic partial class Part\n{\n    public partial int Size => 3;\n}\n"),
+            ("App/Client.cs",
+                "using Lib;\n\nnamespace App;\n\npublic class Client\n{\n    public int? Go(Svc? s, Part p)\n    {\n" +
+                "        s!.Changed += () => { };\n        return s?.Run() + p.Size;\n    }\n}\n"),
+        ];
+        ITokenizer tok = new CharTokenizer();
+        var (graph, chunks, files) = Build(repo, new SymbolChunker(tok, 4096), tok);
+        Chunk[] order = chunks.Reverse().ToArray();
+        IReadOnlyList<SymbolEdge> edges = graph.EdgesForContext(Ctx(order));
+        SourceFile svc = File(files, "Lib/Svc.cs"), p1 = File(files, "Lib/Part1.cs"), p2 = File(files, "Lib/Part2.cs"),
+            client = File(files, "App/Client.cs");
+
+        // `s?.Run()` is a call (member binding), not a use.
+        int run = At(order, tok, client, Off(client.Text, "Run("));
+        Assert.Equal(new SymbolEdge(run, At(order, tok, svc, Off(svc.Text, "Run(")), SymbolEdgeKind.Call), Assert.Single(edges, e => e.UseTokenIndex == run));
+        Assert.Contains(new SymbolEdge(At(order, tok, client, Off(client.Text, "Changed")), At(order, tok, svc, Off(svc.Text, "Changed")),
+            SymbolEdgeKind.Use), edges);
+        // Partial property: a use links both parts; the implementing part's name → the ordinal-first part.
+        int size1 = At(order, tok, p1, Off(p1.Text, "Size")), size2 = At(order, tok, p2, Off(p2.Text, "Size"));
+        int sizeUse = At(order, tok, client, Off(client.Text, "Size"));
+        Assert.Equal(new[] { size1, size2 }.Order(), edges.Where(e => e.UseTokenIndex == sizeUse).Select(e => e.DefinitionTokenIndex).Order());
+        Assert.Contains(new SymbolEdge(size2, size1, SymbolEdgeKind.Definition), edges);
+    }
+
+    [Fact]
+    public void Graph_QueryEdges_ReturnFileOffsetsInTheRange_SoThePrefixExcludesTheMaskedCall()
+    {
+        ITokenizer tok = new CharTokenizer();
+        var (graph, chunks, files) = Build(ThreeFiles, new SymbolChunker(tok, 4096), tok);
+        SourceFile a = File(files, "Lib/MathUtil.cs"), b = File(files, "App/Calc.cs");
+        (int Chunk, int Token) Def(SourceFile f, string needle)
+        {
+            int off = Off(f.Text, needle);
+            int c = Array.FindIndex(chunks, k => k.FilePath == f.Path && off >= k.StartOffset && off < k.EndOffset);
+            return (c, off - chunks[c].StartOffset);
+        }
+
+        // A task masking `Add(1, 2)`: the query is the file text before it.
+        int maskStart = Off(b.Text, "Add("), maskEnd = maskStart + "Add(1, 2)".Length;
+        IReadOnlyList<QueryEdge> prefix = graph.QueryEdges(b.Path, 0, maskStart);
+        var (libC, libT) = Def(a, "Lib;");
+        var (typeC, typeT) = Def(a, "MathUtil\n");
+        var (addC, addT) = Def(a, "Add(");
+        Assert.Equal(new[]
+        {
+            new QueryEdge(Off(b.Text, "Lib;"), libC, libT, SymbolEdgeKind.Import),
+            new QueryEdge(Off(b.Text, "MathUtil.Add"), typeC, typeT, SymbolEdgeKind.Use),
+        }, prefix);
+        Assert.Equal(new[] { new QueryEdge(maskStart, addC, addT, SymbolEdgeKind.Call) }, graph.QueryEdges(b.Path, maskStart, maskEnd));
+        // The range is half-open, and other files' edges never appear.
+        Assert.Single(graph.QueryEdges(b.Path, 0, Off(b.Text, "MathUtil.Add")));
+        SourceFile text = File(files, "Lib/Text.cs");
+        Assert.Equal(new[] { Off(text.Text, "MathUtil.Zero"), Off(text.Text, "Zero;") },
+            graph.QueryEdges(text.Path, 0, text.Text.Length).Select(e => e.UseOffset));
+        // Sorted by offset whatever the chunk order of the graph.
+        ReferenceGraph reversed = new RoslynGraphBuilder(tok).Build(files, chunks.Reverse().ToArray());
+        IReadOnlyList<QueryEdge> all = reversed.QueryEdges(b.Path, 0, b.Text.Length);
+        Assert.True(all.Count >= 4);
+        Assert.Equal(all.OrderBy(e => e.UseOffset).ThenBy(e => e.DefinitionChunk).ThenBy(e => e.DefinitionToken).ThenBy(e => e.Kind), all);
+    }
+
+    [Fact]
+    public void Graph_MappingMismatch_CountsAChunkCutInsideAMultiByteCharacter()
+    {
+        // "é" is two UTF-8 bytes at byte 12 and 13; 13-byte fixed chunks cut between them, so the second chunk starts with a
+        // continuation byte and its decoded text is not the file slice. It holds the use of B.
+        (string, string)[] repo = [("M.cs", "//xxxxxxxxxxé\nclass A { B b; }\nclass B { }\n")];
+        ITokenizer tok = new ByteTokenizer();
+        var (graph, chunks, _) = Build(repo, new FixedSizeChunker(tok, 13), tok);
+        Assert.NotEmpty(graph.Edges);
+        Assert.True(graph.MappingMismatchChunks >= 1);
+        var (clean, _, _) = Build(repo, new SymbolChunker(tok, 4096), tok);
+        Assert.Equal(0, clean.MappingMismatchChunks);
+    }
+
+    [Fact]
     public void Graph_LocalsParametersAndVar_GiveNoEdges()
     {
         (string, string)[] repo =
@@ -443,6 +555,26 @@ public sealed class ReferenceGraphTests
         {
             if (c.FilePath == file.Path && offset >= c.StartOffset && offset < c.EndOffset)
                 return start + tok.EncodeRaw(file.Text[c.StartOffset..offset]).Length;
+            start += c.TokenIds.Length;
+        }
+        throw new InvalidOperationException($"offset {offset} of {file.Path} is not in the context");
+    }
+
+    /// <summary>Context index of the token whose decoded span contains char <paramref name="offset"/> of <paramref name="file"/>.</summary>
+    private static int TokenAt(IReadOnlyList<Chunk> order, ITokenizer tok, SourceFile file, int offset)
+    {
+        int start = 0;
+        foreach (Chunk c in order)
+        {
+            if (c.FilePath == file.Path && offset >= c.StartOffset && offset < c.EndOffset)
+            {
+                int pos = c.StartOffset;
+                for (int t = 0; t < c.TokenIds.Length; t++)
+                {
+                    pos += tok.Decode(c.TokenIds.AsSpan(t, 1)).Length;
+                    if (offset < pos) return start + t;
+                }
+            }
             start += c.TokenIds.Length;
         }
         throw new InvalidOperationException($"offset {offset} of {file.Path} is not in the context");

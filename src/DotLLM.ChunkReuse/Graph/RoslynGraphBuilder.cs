@@ -3,6 +3,7 @@ using DotLLM.Tokenizers;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Text;
 
 namespace DotLLM.ChunkReuse.Graph;
 
@@ -28,7 +29,7 @@ namespace DotLLM.ChunkReuse.Graph;
 /// <para>
 /// Character → token mapping: each chunk's ids are decoded one token at a time, merging a token with the following ones while
 /// the decoded text holds U+FFFD (a multi-byte character split across byte-level BPE tokens), so a character maps to the
-/// first token of its group. When a chunk's decoded length differs from its character span (token-sliced chunks cut inside a
+/// first token of its group. When a chunk's decoded tokens do not spell its slice of the file (token-sliced chunks cut inside a
 /// multi-byte character — see the caveat on <see cref="SymbolChunker"/> and <see cref="FixedSizeChunker"/>), offsets past
 /// the end are clamped to the last token and the chunk is counted in <see cref="ReferenceGraph.MappingMismatchChunks"/>.
 /// </para>
@@ -36,6 +37,7 @@ namespace DotLLM.ChunkReuse.Graph;
 public sealed class RoslynGraphBuilder
 {
     private const int MaxReplacementGroup = 8;
+    private const char ReplacementChar = (char)0xFFFD; // U+FFFD, what a decoder gives for an incomplete UTF-8 sequence
     private readonly ITokenizer _tokenizer;
 
     /// <summary>Creates the builder.</summary>
@@ -86,15 +88,18 @@ public sealed class RoslynGraphBuilder
         TimeSpan bind = sw.Elapsed;
 
         sw.Restart();
-        var edges = new List<ChunkEdge>(raw.Count);
+        var edges = new List<(ChunkEdge Edge, int UseOffset)>(raw.Count);
         foreach ((Location use, Location def, SymbolEdgeKind kind) in raw)
         {
             if (index.TryMap(use, _tokenizer, out int uc, out int ut) && index.TryMap(def, _tokenizer, out int dc, out int dt))
-                edges.Add(new ChunkEdge(uc, ut, dc, dt, kind));
+                edges.Add((new ChunkEdge(uc, ut, dc, dt, kind), use.SourceSpan.Start));
         }
-        ChunkEdge[] sorted = edges.Distinct().OrderBy(e => e.UseChunk).ThenBy(e => e.UseToken).ThenBy(e => e.DefinitionChunk)
-            .ThenBy(e => e.DefinitionToken).ThenBy(e => e.Kind).ToArray();
-        var graph = new ReferenceGraph(chunks, sorted, index.MismatchChunks);
+        // Distinct by edge (a token holding two names keeps the first name's offset), sorted.
+        (ChunkEdge Edge, int UseOffset)[] sorted = edges.GroupBy(e => e.Edge).Select(g => (g.Key, g.Min(e => e.UseOffset)))
+            .OrderBy(e => e.Key.UseChunk).ThenBy(e => e.Key.UseToken).ThenBy(e => e.Key.DefinitionChunk)
+            .ThenBy(e => e.Key.DefinitionToken).ThenBy(e => e.Key.Kind).ToArray();
+        var graph = new ReferenceGraph(chunks, sorted.Select(e => e.Edge).ToArray(), sorted.Select(e => e.UseOffset).ToArray(),
+            index.MismatchChunks);
         LastTimings = (compile, bind, sw.Elapsed);
         return graph;
     }
@@ -229,6 +234,7 @@ public sealed class RoslynGraphBuilder
         private readonly IReadOnlyList<Chunk> _chunks;
         private readonly Dictionary<string, int[]> _byFile; // chunk indices sorted by start offset
         private readonly int[]?[] _tokenStarts;
+        private readonly Dictionary<string, SourceText> _texts = new(StringComparer.Ordinal);
 
         public ChunkIndex(IReadOnlyList<Chunk> chunks, Dictionary<string, SyntaxTree> trees)
         {
@@ -237,7 +243,10 @@ public sealed class RoslynGraphBuilder
             _byFile = Enumerable.Range(0, chunks.Count).GroupBy(i => chunks[i].FilePath, StringComparer.Ordinal)
                 .ToDictionary(g => g.Key, g => g.OrderBy(i => chunks[i].StartOffset).ToArray(), StringComparer.Ordinal);
             foreach (string path in _byFile.Keys)
-                if (!trees.ContainsKey(path)) throw new ArgumentException($"Chunk file '{path}' is not among the files.", nameof(chunks));
+            {
+                if (!trees.TryGetValue(path, out SyntaxTree? tree)) throw new ArgumentException($"Chunk file '{path}' is not among the files.", nameof(chunks));
+                _texts[path] = tree.GetText();
+            }
         }
 
         public int MismatchChunks { get; private set; }
@@ -279,21 +288,23 @@ public sealed class RoslynGraphBuilder
         {
             int[] ids = chunk.TokenIds;
             var starts = new int[ids.Length];
-            int pos = 0;
+            var decoded = new System.Text.StringBuilder();
             for (int i = 0; i < ids.Length;)
             {
                 int n = 1;
                 string text = tokenizer.Decode(ids.AsSpan(i, 1));
-                while (text.Contains('�') && n < MaxReplacementGroup && i + n < ids.Length)
+                while (text.Contains(ReplacementChar) && n < MaxReplacementGroup && i + n < ids.Length)
                 {
                     n++;
                     text = tokenizer.Decode(ids.AsSpan(i, n));
                 }
-                for (int k = 0; k < n; k++) starts[i + k] = pos;
-                pos += text.Length;
+                for (int k = 0; k < n; k++) starts[i + k] = decoded.Length;
+                decoded.Append(text);
                 i += n;
             }
-            if (pos != chunk.EndOffset - chunk.StartOffset) MismatchChunks++;
+            // The decoded tokens must spell the chunk's own slice of the file; otherwise offsets are approximate.
+            if (!_texts[chunk.FilePath].ToString(new TextSpan(chunk.StartOffset, chunk.EndOffset - chunk.StartOffset)).Equals(decoded.ToString(), StringComparison.Ordinal))
+                MismatchChunks++;
             return starts;
         }
     }

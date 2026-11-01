@@ -330,6 +330,9 @@ public sealed class CorpusTests : IDisposable
             string source = TaskRepo.Single(f => f.Path == t.CallSitePath).Text;
             string prefixBody = t.Prefix[(t.Prefix.IndexOf('\n') + 1)..];          // after the "// path" header line
             Assert.Contains(prefixBody + t.MaskedText, source);
+            // File offsets of the query text and the mask.
+            Assert.Equal(prefixBody, source[t.PrefixStartOffset..t.MaskStartOffset]);
+            Assert.Equal(t.MaskedText, source.Substring(t.MaskStartOffset, t.MaskedText.Length));
             Assert.Equal(t.PrefixTokenIds.Length, t.MaskTokenOffset);
             Assert.Equal(t.MaskedText.Length, t.MaskTokenCount);                   // char tokenizer: one token per char
             Assert.Equal(t.ExpectedContinuation, new CharTokenizer().Decode(t.ContinuationTokenIds));
@@ -356,6 +359,9 @@ public sealed class CorpusTests : IDisposable
         {
             Assert.StartsWith(".", t.MaskedText);
             Assert.False(t.Prefix.EndsWith('.'), t.Prefix);
+            string source = TaskRepo.Single(f => f.Path == t.CallSitePath).Text;
+            Assert.Equal(t.Prefix[(t.Prefix.IndexOf('\n') + 1)..], source[t.PrefixStartOffset..t.MaskStartOffset]);
+            Assert.Equal('.', source[t.MaskStartOffset]);
             int[] joint = tok.Encode(t.Prefix + t.ExpectedContinuation);
             Assert.Equal([.. t.PrefixTokenIds, .. t.ContinuationTokenIds], joint);
             Assert.Equal(t.MaskedText, tok.Decode(t.ContinuationTokenIds.AsSpan(0, t.MaskTokenCount))[..t.MaskedText.Length]);

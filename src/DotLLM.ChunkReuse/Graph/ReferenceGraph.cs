@@ -36,6 +36,13 @@ public readonly record struct SymbolEdge(int UseTokenIndex, int DefinitionTokenI
 /// <param name="Kind">The edge kind.</param>
 public readonly record struct ChunkEdge(int UseChunk, int UseToken, int DefinitionChunk, int DefinitionToken, SymbolEdgeKind Kind);
 
+/// <summary>An edge from a character range of a file (a query) to a chunk: <see cref="ReferenceGraph.QueryEdges"/>.</summary>
+/// <param name="UseOffset">File character offset of the referencing name's first character.</param>
+/// <param name="DefinitionChunk">Chunk of the declaration's name (index into <see cref="ReferenceGraph.Chunks"/>).</param>
+/// <param name="DefinitionToken">Token of that chunk holding the declaration name's first character.</param>
+/// <param name="Kind">The edge kind.</param>
+public readonly record struct QueryEdge(int UseOffset, int DefinitionChunk, int DefinitionToken, SymbolEdgeKind Kind);
+
 /// <summary>
 /// Symbol reference graph over a chunked code corpus (built by <see cref="RoslynGraphBuilder"/> when the chunks are encoded):
 /// every edge in chunk-local token coordinates, including edges inside one chunk. Request-time selection asks
@@ -49,14 +56,16 @@ public sealed class ReferenceGraph
 {
     private readonly Chunk[] _chunks;
     private readonly ChunkEdge[] _edges;
+    private readonly int[] _useOffsets; // file character offset of each edge's use name, parallel to _edges
     private readonly int[] _edgeStart; // edges of use chunk c are _edges[_edgeStart[c] .. _edgeStart[c + 1])
     private readonly Dictionary<string, int> _chunkById;
     private readonly Dictionary<long, List<int>> _chunksByHash; // content hash → chunk indices (collisions resolved by comparing ids)
 
-    internal ReferenceGraph(IReadOnlyList<Chunk> chunks, ChunkEdge[] sortedEdges, int mappingMismatchChunks)
+    internal ReferenceGraph(IReadOnlyList<Chunk> chunks, ChunkEdge[] sortedEdges, int[] useOffsets, int mappingMismatchChunks)
     {
         _chunks = chunks.ToArray();
         _edges = sortedEdges;
+        _useOffsets = useOffsets;
         MappingMismatchChunks = mappingMismatchChunks;
         _edgeStart = new int[_chunks.Length + 1];
         foreach (ChunkEdge e in _edges) _edgeStart[e.UseChunk + 1]++;
@@ -80,11 +89,44 @@ public sealed class ReferenceGraph
     public IReadOnlyList<ChunkEdge> Edges => _edges;
 
     /// <summary>
-    /// Chunks holding an edge end whose per-token character lengths did not add up to the chunk's character span (token-sliced chunks cut inside
-    /// a multi-byte character, see <see cref="SymbolChunker"/>); their offsets are clamped, so an edge end in them can be off
-    /// by a token. Zero for a tokenizer that round-trips each chunk.
+    /// Chunks holding an edge end whose decoded tokens do not spell the chunk's slice of the file (token-sliced chunks cut
+    /// inside a multi-byte character, see <see cref="SymbolChunker"/> and <see cref="FixedSizeChunker"/>): edge ends in them
+    /// can be off by a token. Zero for a tokenizer that round-trips each chunk. Chunks without an edge end are not checked.
     /// </summary>
     public int MappingMismatchChunks { get; }
+
+    /// <summary>
+    /// Edges whose use name starts in the file characters [<paramref name="start"/>, <paramref name="end"/>) of
+    /// <paramref name="filePath"/>, with that start as a file offset. For a query that is a prefix of a corpus file (a Task 8
+    /// <see cref="CodeTask"/>), pass the prefix's range, which ends where the masked call begins, so the masked call — the
+    /// answer — is excluded. Map <see cref="QueryEdge.UseOffset"/> into the query's own tokenisation by character offset (the
+    /// file's chunk tokens are not the query's tokens); keep the edges whose <see cref="QueryEdge.DefinitionChunk"/> is in the
+    /// context. Sorted by (offset, definition chunk, definition token, kind).
+    /// </summary>
+    public IReadOnlyList<QueryEdge> QueryEdges(string filePath, int start, int end)
+    {
+        ArgumentNullException.ThrowIfNull(filePath);
+        var result = new List<QueryEdge>();
+        for (int c = 0; c < _chunks.Length; c++)
+        {
+            Chunk chunk = _chunks[c];
+            if (chunk.EndOffset <= start || chunk.StartOffset >= end || !string.Equals(chunk.FilePath, filePath, StringComparison.Ordinal)) continue;
+            for (int i = _edgeStart[c]; i < _edgeStart[c + 1]; i++)
+            {
+                int offset = _useOffsets[i];
+                if (offset >= start && offset < end)
+                    result.Add(new QueryEdge(offset, _edges[i].DefinitionChunk, _edges[i].DefinitionToken, _edges[i].Kind));
+            }
+        }
+        result.Sort((x, y) =>
+        {
+            int d = x.UseOffset.CompareTo(y.UseOffset);
+            if (d == 0) d = x.DefinitionChunk.CompareTo(y.DefinitionChunk);
+            if (d == 0) d = x.DefinitionToken.CompareTo(y.DefinitionToken);
+            return d != 0 ? d : x.Kind.CompareTo(y.Kind);
+        });
+        return result;
+    }
 
     /// <summary>Edges whose use end lies in chunk <paramref name="chunk"/>.</summary>
     public ReadOnlySpan<ChunkEdge> EdgesFrom(int chunk) => _edges.AsSpan(_edgeStart[chunk], _edgeStart[chunk + 1] - _edgeStart[chunk]);
