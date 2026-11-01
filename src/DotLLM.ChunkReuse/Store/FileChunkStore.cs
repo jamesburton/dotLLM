@@ -16,7 +16,8 @@ namespace DotLLM.ChunkReuse.Store;
 /// </para>
 /// <para>
 /// Writes go to a unique temp file in the shard directory, are flushed to disk and then renamed over the final name, so a crash
-/// or a concurrent writer never leaves a partial <c>.ckv</c> at the final path. Reads memory-map the file and validate the
+/// or a concurrent writer never leaves a partial <c>.ckv</c> at the final path. A crashed writer can leave its temp file behind;
+/// <see cref="SweepTempFiles"/> removes old ones. Reads memory-map the file and validate the
 /// header and the exact file length; any mismatch (truncation, trailing bytes, other version, other key) is a miss.
 /// </para>
 /// </summary>
@@ -26,6 +27,7 @@ public sealed class FileChunkStore : IChunkStore
     public const int FormatVersion = 1;
 
     private const string Extension = ".ckv";
+    private const string TempExtension = ".tmp";
     private const int MaxFingerprintBytes = 4096;
     private const int MaxLayers = 4096;
     private const int MaxHeaderBytes = 16 + 64 + 4 + MaxFingerprintBytes + 8 + 8 * MaxLayers + 8;
@@ -48,18 +50,50 @@ public sealed class FileChunkStore : IChunkStore
     public string Root => _root;
 
     /// <inheritdoc/>
-    public long TotalBytes
+    public long TotalBytes => GetStats().EntryBytes;
+
+    /// <summary>Test hook: runs after the temp file is written, just before the rename, with the destination path.</summary>
+    internal Action<string>? BeforeRenameForTest { get; set; }
+
+    /// <summary>Counts entries and leftover temp files (and their bytes) separately.</summary>
+    /// <returns>The statistics.</returns>
+    public StoreStats GetStats()
     {
-        get
+        int entries = 0, temps = 0;
+        long entryBytes = 0, tempBytes = 0;
+        foreach ((_, string path) in EnumerateEntries())
         {
-            long total = 0;
-            foreach ((_, string path) in EnumerateEntries())
-            {
-                try { total += new FileInfo(path).Length; }
-                catch (IOException) { /* removed meanwhile */ }
-            }
-            return total;
+            if (TryLength(path, out long len)) { entries++; entryBytes += len; }
         }
+        foreach (string path in EnumerateTempFiles())
+        {
+            if (TryLength(path, out long len)) { temps++; tempBytes += len; }
+        }
+        return new StoreStats(entries, entryBytes, temps, tempBytes);
+    }
+
+    /// <summary>
+    /// Deletes store temp files (<c>&lt;key&gt;.&lt;guid&gt;.tmp</c>) last written more than <paramref name="olderThan"/> ago. Use an
+    /// age well above the longest write, so a temp file of a writer that is still running is not removed.
+    /// </summary>
+    /// <param name="olderThan">Minimum age; <see cref="TimeSpan.Zero"/> removes all.</param>
+    /// <returns>Number of files deleted.</returns>
+    public int SweepTempFiles(TimeSpan olderThan)
+    {
+        DateTime cutoff = DateTime.UtcNow - olderThan;
+        int deleted = 0;
+        foreach (string path in EnumerateTempFiles())
+        {
+            try
+            {
+                if (File.GetLastWriteTimeUtc(path) > cutoff) continue;
+                File.Delete(path);
+                deleted++;
+            }
+            catch (IOException) { /* in use or already gone */ }
+            catch (UnauthorizedAccessException) { }
+        }
+        return deleted;
     }
 
     /// <summary>The path an entry for <paramref name="key"/> lives at.</summary>
@@ -139,25 +173,22 @@ public sealed class FileChunkStore : IChunkStore
 
         string dir = Path.GetDirectoryName(path)!;
         Directory.CreateDirectory(dir);
-        string temp = Path.Combine(dir, $"{key.Hex}.{Guid.NewGuid():N}.tmp");
+        string temp = Path.Combine(dir, $"{key.Hex}.{Guid.NewGuid():N}{TempExtension}");
         try
         {
             WriteEntry(temp, key, entry);
-            for (int attempt = 0; ; attempt++)
+            BeforeRenameForTest?.Invoke(path);
+            try
             {
-                try
-                {
-                    File.Move(temp, path, overwrite: true);
-                    return;
-                }
-                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-                {
-                    // On Windows the destination cannot be replaced while a reader has it open; another writer's identical
-                    // entry is as good as ours.
-                    if (Contains(key)) return;
-                    if (attempt >= 20) throw;
-                    Thread.Sleep(5);
-                }
+                File.Move(temp, path, overwrite: true);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                // On Windows the destination cannot be replaced while a reader has it mapped. If it is a valid entry (another
+                // writer stored the same key meanwhile) it is as good as ours; otherwise fail at once instead of waiting for
+                // the reader.
+                if (Contains(key)) return;
+                throw new ChunkStoreBusyException(path, e);
             }
         }
         finally
@@ -179,21 +210,65 @@ public sealed class FileChunkStore : IChunkStore
     private List<(ChunkKey Key, string Path)> EnumerateEntries()
     {
         var result = new List<(ChunkKey, string)>();
-        if (!Directory.Exists(_root)) return result;
-        foreach (string shard in Directory.EnumerateDirectories(_root))
+        foreach ((string shardName, string file) in EnumerateShardFiles("*" + Extension))
+        {
+            // Defensive: require the exact extension (the .NET 10 matcher already does).
+            if (!string.Equals(Path.GetExtension(file), Extension, StringComparison.Ordinal)) continue;
+            string hex = Path.GetFileNameWithoutExtension(file);
+            if (ChunkKey.IsWellFormed(hex) && hex.StartsWith(shardName, StringComparison.Ordinal))
+                result.Add((new ChunkKey(hex), file));
+        }
+        return result;
+    }
+
+    // Store temp files only: "<64 hex key>.<32 hex guid>.tmp" in the shard named by the key's prefix.
+    private List<string> EnumerateTempFiles()
+    {
+        var result = new List<string>();
+        foreach ((string shardName, string file) in EnumerateShardFiles("*" + TempExtension))
+        {
+            string name = Path.GetFileName(file);
+            if (name.Length != 64 + 1 + 32 + TempExtension.Length || name[64] != '.') continue;
+            string hex = name[..64];
+            string guid = name.Substring(65, 32);
+            if (ChunkKey.IsWellFormed(hex) && ChunkKey.IsWellFormed(guid + guid) && hex.StartsWith(shardName, StringComparison.Ordinal))
+                result.Add(file);
+        }
+        return result;
+    }
+
+    // Files in two-character shard directories; a root or shard removed meanwhile contributes nothing.
+    private List<(string Shard, string File)> EnumerateShardFiles(string pattern)
+    {
+        var result = new List<(string, string)>();
+        string[] shards;
+        try { shards = Directory.GetDirectories(_root); }
+        catch (DirectoryNotFoundException) { return result; }
+        foreach (string shard in shards)
         {
             string shardName = Path.GetFileName(shard);
             if (shardName.Length != 2) continue;
-            foreach (string file in Directory.EnumerateFiles(shard, "*" + Extension))
+            try
             {
-                // "*.ckv" also matches longer extensions on Windows; require the exact one.
-                if (!string.Equals(Path.GetExtension(file), Extension, StringComparison.Ordinal)) continue;
-                string hex = Path.GetFileNameWithoutExtension(file);
-                if (ChunkKey.IsWellFormed(hex) && hex.StartsWith(shardName, StringComparison.Ordinal))
-                    result.Add((new ChunkKey(hex), file));
+                foreach (string file in Directory.GetFiles(shard, pattern)) result.Add((shardName, file));
             }
+            catch (DirectoryNotFoundException) { /* shard removed meanwhile */ }
         }
         return result;
+    }
+
+    private static bool TryLength(string path, out long length)
+    {
+        try
+        {
+            length = new FileInfo(path).Length;
+            return true;
+        }
+        catch (IOException)
+        {
+            length = 0;
+            return false;
+        }
     }
 
     private static void Validate(ChunkKvEntry entry)

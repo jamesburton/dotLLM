@@ -15,14 +15,17 @@ public static class ChunkFingerprint
 {
     /// <summary>
     /// Hashes (SHA-256, lowercase hex) the caller-supplied identities that <see cref="ModelConfig"/> does not carry together
-    /// with the configuration's shape, its full RoPE configuration, NoPE layers, per-layer KV strides and the engine version.
+    /// with the configuration's shape, its full RoPE configuration, NoPE layers, per-layer KV strides and the K/V schema version (<see cref="ChunkReuseSchema.KvOutputVersion"/>; not the
+    /// build version, so a rebuild that leaves K/V unchanged keeps stored chunks valid).
     /// </summary>
     /// <param name="config">Model configuration.</param>
     /// <param name="modelId">Model identity, e.g. a repo id or the weights file hash.</param>
     /// <param name="quantization">Weight quantization, e.g. <c>Q4_K_M</c>.</param>
     /// <param name="tokenizerId">Tokenizer identity, e.g. a hash of the vocabulary and merges.</param>
+    /// <param name="kvOutputVersion">K/V schema version; callers pass the default except in tests.</param>
     /// <returns>The fingerprint.</returns>
-    public static string Compute(ModelConfig config, string modelId, string quantization, string tokenizerId)
+    public static string Compute(ModelConfig config, string modelId, string quantization, string tokenizerId,
+        int kvOutputVersion = ChunkReuseSchema.KvOutputVersion)
     {
         ArgumentNullException.ThrowIfNull(config);
         ArgumentNullException.ThrowIfNull(modelId);
@@ -53,12 +56,12 @@ public static class ChunkFingerprint
         var strides = new string[geometry.LayerCount];
         for (int l = 0; l < strides.Length; l++) strides[l] = geometry.KvStrideOf(l).ToString(ci);
         Append(sb, "kv", string.Join(',', strides));
-        Append(sb, "engine", EngineVersion);
+        Append(sb, "kv-output", kvOutputVersion.ToString(ci));
 
         return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(sb.ToString())));
     }
 
-    /// <summary>dotLLM build identity (informational version of <c>DotLLM.Core</c>).</summary>
+    /// <summary>dotLLM build identity (informational version of <c>DotLLM.Core</c>); for logs only, not hashed.</summary>
     public static string EngineVersion { get; } =
         typeof(ModelConfig).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
         ?? typeof(ModelConfig).Assembly.GetName().Version?.ToString()

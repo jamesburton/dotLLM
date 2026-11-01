@@ -1,3 +1,4 @@
+using System.IO.MemoryMappedFiles;
 using System.Runtime.InteropServices;
 using DotLLM.ChunkReuse;
 using DotLLM.ChunkReuse.Store;
@@ -14,7 +15,6 @@ public sealed class ChunkStoreTests : IDisposable
 {
     private const string Fingerprint = "fp-model-a";
     private const string Tokenizer = "tok-a";
-    private const string Engine = "engine-1";
     private const string Backend = "cpu";
     private const KvDtype Dtype = KvDtype.F32;
     private static readonly RopeParameters Rope = new(128, 5_000_000f, RoPEType.NeoX);
@@ -37,24 +37,24 @@ public sealed class ChunkStoreTests : IDisposable
     [InlineData("rope-dim")]
     [InlineData("rope-theta")]
     [InlineData("rope-type")]
-    [InlineData("engine")]
+    [InlineData("kv-output-version")]
     [InlineData("backend")]
     [InlineData("dtype")]
     [InlineData("tokens")]
     public void Key_DiffersWhenModelTokenizerRopeOrEngineVersionChanges(string field)
     {
-        ChunkKey baseKey = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, Dtype, Tokens);
+        ChunkKey baseKey = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
         ChunkKey changed = field switch
         {
-            "model" => ChunkKey.Create("fp-model-b", Tokenizer, Rope, Engine, Backend, Dtype, Tokens),
-            "tokenizer" => ChunkKey.Create(Fingerprint, "tok-b", Rope, Engine, Backend, Dtype, Tokens),
-            "rope-dim" => ChunkKey.Create(Fingerprint, Tokenizer, Rope with { RopeDim = 64 }, Engine, Backend, Dtype, Tokens),
-            "rope-theta" => ChunkKey.Create(Fingerprint, Tokenizer, Rope with { Theta = 1_000_000f }, Engine, Backend, Dtype, Tokens),
-            "rope-type" => ChunkKey.Create(Fingerprint, Tokenizer, Rope with { Type = RoPEType.Norm }, Engine, Backend, Dtype, Tokens),
-            "engine" => ChunkKey.Create(Fingerprint, Tokenizer, Rope, "engine-2", Backend, Dtype, Tokens),
-            "backend" => ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, "vulkan", Dtype, Tokens),
-            "dtype" => ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, KvDtype.F16, Tokens),
-            "tokens" => ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, Dtype, [3, 17, 5, 29, 11, 40, 9]),
+            "model" => ChunkKey.Create("fp-model-b", Tokenizer, Rope, Backend, Dtype, Tokens),
+            "tokenizer" => ChunkKey.Create(Fingerprint, "tok-b", Rope, Backend, Dtype, Tokens),
+            "rope-dim" => ChunkKey.Create(Fingerprint, Tokenizer, Rope with { RopeDim = 64 }, Backend, Dtype, Tokens),
+            "rope-theta" => ChunkKey.Create(Fingerprint, Tokenizer, Rope with { Theta = 1_000_000f }, Backend, Dtype, Tokens),
+            "rope-type" => ChunkKey.Create(Fingerprint, Tokenizer, Rope with { Type = RoPEType.Norm }, Backend, Dtype, Tokens),
+            "kv-output-version" => ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens, ChunkReuseSchema.KvOutputVersion + 1),
+            "backend" => ChunkKey.Create(Fingerprint, Tokenizer, Rope, "vulkan", Dtype, Tokens),
+            "dtype" => ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, KvDtype.F16, Tokens),
+            "tokens" => ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, [3, 17, 5, 29, 11, 40, 9]),
             _ => throw new ArgumentOutOfRangeException(nameof(field)),
         };
         Assert.NotEqual(baseKey, changed);
@@ -70,22 +70,23 @@ public sealed class ChunkStoreTests : IDisposable
     public void Key_FieldBoundariesCannotBeForged()
     {
         // Length prefixes: moving characters between adjacent string fields must change the key.
-        ChunkKey a = ChunkKey.Create("ab", "c", Rope, Engine, Backend, Dtype, Tokens);
-        ChunkKey b = ChunkKey.Create("a", "bc", Rope, Engine, Backend, Dtype, Tokens);
+        ChunkKey a = ChunkKey.Create("ab", "c", Rope, Backend, Dtype, Tokens);
+        ChunkKey b = ChunkKey.Create("a", "bc", Rope, Backend, Dtype, Tokens);
         Assert.NotEqual(a, b);
         // The token count is encoded: a trailing zero token is not the same chunk.
-        Assert.NotEqual(ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, Dtype, [1, 0]),
-                        ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, Dtype, [1]));
+        Assert.NotEqual(ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, [1, 0]),
+                        ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, [1]));
     }
 
     [Fact]
     public void Key_SameInputs_SameKey()
     {
-        ChunkKey a = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, Dtype, Tokens);
+        ChunkKey a = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
         ChunkKey b = ChunkKey.Create(new string(Fingerprint.AsSpan()), new string(Tokenizer.AsSpan()),
-            new RopeParameters(128, 5_000_000f, RoPEType.NeoX), new string(Engine.AsSpan()),
-            new string(Backend.AsSpan()), KvDtype.F32, (int[])Tokens.Clone());
+            new RopeParameters(128, 5_000_000f, RoPEType.NeoX), new string(Backend.AsSpan()), KvDtype.F32, (int[])Tokens.Clone());
         Assert.Equal(a, b);
+        // The default schema version is the current constant.
+        Assert.Equal(a, ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens, ChunkReuseSchema.KvOutputVersion));
         Assert.Equal(64, a.Hex.Length);
         Assert.Matches("^[0-9a-f]{64}$", a.Hex);
     }
@@ -102,7 +103,7 @@ public sealed class ChunkStoreTests : IDisposable
         entry.ValuesPerLayer[2][3] = float.Epsilon;
         entry.ValuesPerLayer[0][5] = float.NegativeInfinity;
 
-        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, Dtype, Tokens);
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
         var store = new FileChunkStore(_root);
         Assert.False(store.Contains(key));
         store.Put(key, entry);
@@ -127,7 +128,7 @@ public sealed class ChunkStoreTests : IDisposable
         float[][] k = strides.Select(s => RandomFloats(rng, n * s)).ToArray();
         float[][] v = strides.Select(s => RandomFloats(rng, n * s)).ToArray();
         var entry = new ChunkKvEntry(Fingerprint, Tokens, k, v);
-        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, Dtype, Tokens);
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
         var store = new FileChunkStore(_root);
         store.Put(key, entry);
         Assert.True(store.TryGet(key, out ChunkKvEntry got));
@@ -145,7 +146,7 @@ public sealed class ChunkStoreTests : IDisposable
     public void Store_TruncatedFile_IsTreatedAsMiss(string where)
     {
         ChunkKvEntry entry = NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5);
-        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, Dtype, Tokens);
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
         var store = new FileChunkStore(_root);
         store.Put(key, entry);
 
@@ -181,7 +182,7 @@ public sealed class ChunkStoreTests : IDisposable
     public void Store_TrailingGarbage_IsTreatedAsMiss()
     {
         ChunkKvEntry entry = NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5);
-        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, Dtype, Tokens);
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
         var store = new FileChunkStore(_root);
         store.Put(key, entry);
         using (var fs = new FileStream(EntryPath(key), FileMode.Append, FileAccess.Write)) fs.WriteByte(0x42);
@@ -194,8 +195,8 @@ public sealed class ChunkStoreTests : IDisposable
     {
         // The header records the key; a file copied or renamed to another key's path must not be served for that key.
         ChunkKvEntry entry = NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5);
-        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, Dtype, Tokens);
-        ChunkKey other = ChunkKey.Create(Fingerprint, Tokenizer, Rope, "engine-2", Backend, Dtype, Tokens);
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
+        ChunkKey other = ChunkKey.Create(Fingerprint, Tokenizer, Rope, "vulkan", Dtype, Tokens);
         var store = new FileChunkStore(_root);
         store.Put(key, entry);
         string otherPath = EntryPath(other);
@@ -209,10 +210,14 @@ public sealed class ChunkStoreTests : IDisposable
     public void Store_ConcurrentPutSameKey_LeavesOneValidEntry()
     {
         ChunkKvEntry entry = NewEntry(Tokens, Fingerprint, layers: 4, stride: 64, seed: 11);
-        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, Dtype, Tokens);
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
         var store = new FileChunkStore(_root);
 
-        // Intra-process only: 16 writers released together, 20 rounds each, interleaved with readers.
+        // 16 threads in this process, released together, each doing 20 Put+TryGet rounds on one key. What this proves: no Put
+        // throws, no read that hits returns different bits, and afterwards there is exactly one file (the .ckv; every temp file
+        // was removed). It does not by itself prove torn-write safety: an in-place writer is caught here by a sharing violation,
+        // not by a torn read; torn files are caught by the exact-length check (truncation tests). Cross-process writers are not
+        // tested.
         const int Writers = 16;
         using var gate = new ManualResetEventSlim(false);
         var errors = new System.Collections.Concurrent.ConcurrentQueue<Exception>();
@@ -240,7 +245,7 @@ public sealed class ChunkStoreTests : IDisposable
         foreach (Thread th in threads) th.Join();
 
         Assert.Empty(errors);
-        Assert.Equal(0, badReads); // a reader may miss mid-write, but never sees a torn entry
+        Assert.Equal(0, badReads); // a read that hits returns the written bits
         string[] files = Directory.GetFiles(_root, "*", SearchOption.AllDirectories);
         Assert.Single(files);
         Assert.EndsWith(".ckv", files[0], StringComparison.Ordinal);
@@ -255,8 +260,8 @@ public sealed class ChunkStoreTests : IDisposable
         // The key has no file path in it: identical chunk tokens from two source files resolve to the same key and file.
         int[] fromFileA = [10, 20, 30, 40];
         int[] fromFileB = [10, 20, 30, 40];
-        ChunkKey a = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, Dtype, fromFileA);
-        ChunkKey b = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, Dtype, fromFileB);
+        ChunkKey a = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, fromFileA);
+        ChunkKey b = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, fromFileB);
         Assert.Equal(a, b);
 
         var store = new FileChunkStore(_root);
@@ -275,7 +280,7 @@ public sealed class ChunkStoreTests : IDisposable
 
         // A different chunk is a second entry and TotalBytes grows.
         int[] other = [10, 20, 30, 41];
-        ChunkKey c = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, Dtype, other);
+        ChunkKey c = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, other);
         store.Put(c, NewEntry(other, Fingerprint, layers: 2, stride: 4, seed: 3));
         Assert.Equal(2, store.Keys().Count());
         Assert.True(store.TotalBytes > afterFirst);
@@ -286,7 +291,7 @@ public sealed class ChunkStoreTests : IDisposable
     {
         // Content-addressed: a valid entry under a key is never rewritten (a rewrite could fail on Windows while a reader has
         // the file mapped, and is wasted I/O).
-        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, Dtype, Tokens);
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
         var store = new FileChunkStore(_root);
         ChunkKvEntry first = NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5);
         store.Put(key, first);
@@ -299,7 +304,7 @@ public sealed class ChunkStoreTests : IDisposable
     public void Store_FormatVersionMismatch_IsMiss()
     {
         ChunkKvEntry entry = NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5);
-        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, Dtype, Tokens);
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
         var store = new FileChunkStore(_root);
         store.Put(key, entry);
 
@@ -324,7 +329,7 @@ public sealed class ChunkStoreTests : IDisposable
     public void Store_DtypeTagMismatch_IsMiss()
     {
         // Header: magic, version, then the int32 dtype tag. Only F32 rows are readable today; any other tag is a miss.
-        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, Dtype, Tokens);
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
         var store = new FileChunkStore(_root);
         store.Put(key, NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5));
         string path = EntryPath(key);
@@ -339,8 +344,8 @@ public sealed class ChunkStoreTests : IDisposable
     [Fact]
     public void Store_Evict_RemovesEntry_AndMissingEvictIsNoOp()
     {
-        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, Dtype, Tokens);
-        ChunkKey other = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, Dtype, [1, 2, 3]);
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
+        ChunkKey other = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, [1, 2, 3]);
         var store = new FileChunkStore(_root);
         store.Put(key, NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5));
         store.Put(other, NewEntry([1, 2, 3], Fingerprint, layers: 2, stride: 4, seed: 6));
@@ -359,7 +364,7 @@ public sealed class ChunkStoreTests : IDisposable
     [Fact]
     public void Store_IgnoresTempAndForeignFiles()
     {
-        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, Dtype, Tokens);
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
         var store = new FileChunkStore(_root);
         store.Put(key, NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5));
         long bytes = store.TotalBytes;
@@ -374,7 +379,7 @@ public sealed class ChunkStoreTests : IDisposable
     [Fact]
     public void Store_PutRejectsMalformedEntry()
     {
-        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, Dtype, Tokens);
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
         var store = new FileChunkStore(_root);
         // K/V layer count mismatch and a row count that is not a multiple of the token count.
         Assert.Throws<ArgumentException>(() => store.Put(key,
@@ -384,7 +389,134 @@ public sealed class ChunkStoreTests : IDisposable
         Assert.False(store.Contains(key));
     }
 
+    [Fact]
+    public void Store_PutWhileReaderHoldsValidDestination_Succeeds()
+    {
+        // Another writer stores the same key between this Put's existence check and its rename, and a reader maps that file:
+        // the rename fails, the destination is valid, so Put returns without an exception and without leaving a temp file.
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
+        ChunkKvEntry entry = NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5);
+        var store = new FileChunkStore(_root);
+        var other = new FileChunkStore(_root);
+        MemoryMappedFile? map = null;
+        FileStream? held = null;
+        store.BeforeRenameForTest = path =>
+        {
+            other.Put(key, entry);
+            (held, map) = MapForRead(path);
+        };
+        try
+        {
+            store.Put(key, entry); // must not throw
+        }
+        finally
+        {
+            map?.Dispose();
+            held?.Dispose();
+        }
+        Assert.NotNull(held); // the hook ran, so the rename really met a mapped destination
+        Assert.True(store.TryGet(key, out ChunkKvEntry got));
+        AssertBitExact(entry, got);
+        Assert.Single(Directory.GetFiles(_root, "*", SearchOption.AllDirectories));
+    }
+
+    [Fact]
+    public void Store_RepairWhileReaderHoldsCorruptFile_ThrowsBusyWithoutRetrying()
+    {
+        // A corrupt file at the destination is mapped by a reader, so it cannot be replaced. Defined behaviour: Put throws
+        // ChunkStoreBusyException after one rename attempt (no retry loop), removes its temp file and leaves the key a miss;
+        // a later Put repairs the entry.
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
+        ChunkKvEntry entry = NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5);
+        var store = new FileChunkStore(_root);
+        store.Put(key, entry);
+        string path = EntryPath(key);
+        using (var fs = new FileStream(path, FileMode.Open, FileAccess.Write)) fs.SetLength(100);
+
+        int renames = 0;
+        store.BeforeRenameForTest = _ => renames++;
+        var (held, map) = MapForRead(path);
+        try
+        {
+            Assert.Throws<ChunkStoreBusyException>(() => store.Put(key, entry));
+            Assert.Equal(1, renames);
+            Assert.False(store.TryGet(key, out _));
+            Assert.Single(Directory.GetFiles(_root, "*", SearchOption.AllDirectories)); // temp file removed
+        }
+        finally
+        {
+            map.Dispose();
+            held.Dispose();
+        }
+        store.Put(key, entry);
+        Assert.True(store.TryGet(key, out ChunkKvEntry got));
+        AssertBitExact(entry, got);
+    }
+
+    [Fact]
+    public void Store_SweepTempFiles_RemovesOnlyOldTemps_AndStatsCountThemSeparately()
+    {
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
+        var store = new FileChunkStore(_root);
+        store.Put(key, NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5));
+        long entryBytes = store.TotalBytes;
+        string shard = Path.GetDirectoryName(EntryPath(key))!;
+        string oldTemp = Path.Combine(shard, key.Hex + "." + Guid.NewGuid().ToString("N") + ".tmp");
+        string newTemp = Path.Combine(shard, key.Hex + "." + Guid.NewGuid().ToString("N") + ".tmp");
+        string foreign = Path.Combine(shard, "notes.tmp");
+        File.WriteAllBytes(oldTemp, new byte[100]);
+        File.WriteAllBytes(newTemp, new byte[30]);
+        File.WriteAllBytes(foreign, new byte[7]);
+        File.SetLastWriteTimeUtc(oldTemp, DateTime.UtcNow.AddHours(-2));
+        File.SetLastWriteTimeUtc(foreign, DateTime.UtcNow.AddHours(-2));
+
+        Assert.Equal(new StoreStats(Entries: 1, EntryBytes: entryBytes, TempFiles: 2, TempBytes: 130), store.GetStats());
+        Assert.Equal(entryBytes, store.TotalBytes); // temp files are not entry bytes
+
+        Assert.Equal(1, store.SweepTempFiles(TimeSpan.FromHours(1)));
+        Assert.False(File.Exists(oldTemp));
+        Assert.True(File.Exists(newTemp));  // may belong to a writer that is still running
+        Assert.True(File.Exists(foreign));  // not a store temp name
+        Assert.True(store.Contains(key));
+        Assert.Equal(new StoreStats(1, entryBytes, 1, 30), store.GetStats());
+
+        Assert.Equal(1, store.SweepTempFiles(TimeSpan.Zero));
+        Assert.Equal(new StoreStats(1, entryBytes, 0, 0), store.GetStats());
+        Assert.True(File.Exists(foreign));
+    }
+
+    [Fact]
+    public void Store_DeletedShardOrRoot_EnumerationTolerates()
+    {
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
+        ChunkKey other = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, [1, 2, 3]);
+        var store = new FileChunkStore(_root);
+        store.Put(key, NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5));
+        store.Put(other, NewEntry([1, 2, 3], Fingerprint, layers: 2, stride: 4, seed: 6));
+        Assert.NotEqual(key.Hex[..2], other.Hex[..2]); // two shards
+
+        Directory.Delete(Path.GetDirectoryName(EntryPath(key))!, recursive: true);
+        Assert.Equal([other], store.Keys());
+        Assert.False(store.Contains(key));
+        store.Evict(key); // no-op
+
+        Directory.Delete(_root, recursive: true);
+        Assert.Empty(store.Keys());
+        Assert.Equal(0, store.TotalBytes);
+        Assert.Equal(new StoreStats(0, 0, 0, 0), store.GetStats());
+        Assert.Equal(0, store.SweepTempFiles(TimeSpan.Zero));
+        store.Put(key, NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5)); // recreates the directories
+        Assert.True(store.Contains(key));
+    }
+
     // ---------------------------------------------------------------- helpers
+
+    private static (FileStream Stream, MemoryMappedFile Map) MapForRead(string path)
+    {
+        var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
+        var map = MemoryMappedFile.CreateFromFile(fs, null, 0, MemoryMappedFileAccess.Read, HandleInheritability.None, leaveOpen: true);
+        return (fs, map);
+    }
 
     private string EntryPath(ChunkKey key) => Path.Combine(_root, key.Hex[..2], key.Hex + ".ckv");
 

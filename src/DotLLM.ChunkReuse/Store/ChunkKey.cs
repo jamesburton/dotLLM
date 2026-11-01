@@ -33,23 +33,25 @@ public enum KvDtype
 public readonly record struct ChunkKey(string Hex)
 {
     // Bumped when the canonical encoding below changes; old keys then simply never match.
-    private const string Scheme = "chunk-key/v1";
+    private const string Scheme = "chunk-key/v2";
 
     /// <summary>Computes the key.</summary>
-    /// <param name="modelFingerprint">Model identity (<see cref="ChunkFingerprint.Compute"/>).</param>
+    /// <param name="modelFingerprint">
+    /// The real model fingerprint (<see cref="ChunkFingerprint.Compute"/>), not a label: RoPE scaling fields (YaRN/NTK factors,
+    /// original context, betas), NoPE layers and the KV layout reach the key only through it.
+    /// </param>
     /// <param name="tokenizerId">Tokenizer identity.</param>
     /// <param name="rope">RoPE parameters the stored keys were rotated with.</param>
-    /// <param name="engineVersion">Engine/KV-format version; every version that may change K/V bits must differ.</param>
     /// <param name="backend">Backend that produced the K/V, e.g. <c>cpu</c> or <c>vulkan</c> (their F32 K/V differ by a noise floor).</param>
     /// <param name="kvDtype">Physical element type of the stored K/V.</param>
     /// <param name="tokenIds">The chunk's token ids.</param>
+    /// <param name="kvOutputVersion">K/V schema version (<see cref="ChunkReuseSchema.KvOutputVersion"/>); callers pass the default except in tests.</param>
     /// <returns>The key.</returns>
-    public static ChunkKey Create(string modelFingerprint, string tokenizerId, RopeParameters rope, string engineVersion,
-        string backend, KvDtype kvDtype, ReadOnlySpan<int> tokenIds)
+    public static ChunkKey Create(string modelFingerprint, string tokenizerId, RopeParameters rope, string backend, KvDtype kvDtype,
+        ReadOnlySpan<int> tokenIds, int kvOutputVersion = ChunkReuseSchema.KvOutputVersion)
     {
         ArgumentNullException.ThrowIfNull(modelFingerprint);
         ArgumentNullException.ThrowIfNull(tokenizerId);
-        ArgumentNullException.ThrowIfNull(engineVersion);
         ArgumentException.ThrowIfNullOrEmpty(backend);
 
         // Canonical encoding: length-prefixed UTF-8 strings and fixed-width little-endian integers, so no value can forge a
@@ -61,7 +63,7 @@ public readonly record struct ChunkKey(string Hex)
         AppendInt(hash, rope.RopeDim);
         AppendInt(hash, BitConverter.SingleToInt32Bits(rope.Theta));
         AppendInt(hash, (int)rope.Type);
-        AppendString(hash, engineVersion);
+        AppendInt(hash, kvOutputVersion);
         AppendString(hash, backend);
         AppendInt(hash, (int)kvDtype);
         AppendInt(hash, tokenIds.Length);

@@ -18,9 +18,9 @@ internal static class StoreProbe
         var encoder = new ChunkEncoder(lab.Fingerprint);
         var rope = RopeParameters.FromConfig(lab.Config);
         string tokenizerId = "gguf-embedded:" + Path.GetFileNameWithoutExtension(modelPath);
-        string engine = ChunkFingerprint.EngineVersion;
+        string engine = ChunkFingerprint.EngineVersion; // build identity, logged only
         Console.WriteLine($"corpus {corpusDir}: {corpus.DocumentCount} documents, {corpus.Chunks.Count} chunks; chunk-id sha256 {corpus.ChunkIdHash}");
-        Console.WriteLine($"store {storeDir}; key: backend cpu, dtype F32, engine '{engine}'");
+        Console.WriteLine($"store {storeDir}; key: backend cpu, dtype F32, kv-output version {ChunkReuseSchema.KvOutputVersion} (build {engine})");
         Console.WriteLine($"analytic F32 K+V bytes per token: {lab.KvBytesPerToken} over {lab.Geometry.LayerCount} layers "
             + $"= {lab.KvBytesPerToken / lab.Geometry.LayerCount} per token per layer");
         if (Directory.Exists(storeDir) && Directory.EnumerateFileSystemEntries(storeDir).Any())
@@ -37,7 +37,7 @@ internal static class StoreProbe
             ChunkKvEntry entry = encoder.Encode(lab.Model, ids);
             double encodeMs = sw.Elapsed.TotalMilliseconds;
 
-            ChunkKey key = ChunkKey.Create(lab.Fingerprint, tokenizerId, rope, engine, "cpu", KvDtype.F32, ids);
+            ChunkKey key = ChunkKey.Create(lab.Fingerprint, tokenizerId, rope, "cpu", KvDtype.F32, ids);
             sw.Restart();
             writer.Put(key, entry);
             double putMs = sw.Elapsed.TotalMilliseconds;

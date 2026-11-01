@@ -17,4 +17,9 @@
     <ProjectReference Include="..\DotLLM.Tokenizers\DotLLM.Tokenizers.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- FileChunkStore.BeforeRenameForTest: lets tests hold the destination open between write and rename. -->
+    <InternalsVisibleTo Include="DotLLM.Tests.Unit" />
+  </ItemGroup>
+
 </Project>
