@@ -282,6 +282,20 @@ public sealed class ChunkStoreTests : IDisposable
     }
 
     [Fact]
+    public void Store_PutExistingValidKey_KeepsExistingFile()
+    {
+        // Content-addressed: a valid entry under a key is never rewritten (a rewrite could fail on Windows while a reader has
+        // the file mapped, and is wasted I/O).
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Engine, Backend, Dtype, Tokens);
+        var store = new FileChunkStore(_root);
+        ChunkKvEntry first = NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5);
+        store.Put(key, first);
+        store.Put(key, NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 6));
+        Assert.True(store.TryGet(key, out ChunkKvEntry got));
+        AssertBitExact(first, got);
+    }
+
+    [Fact]
     public void Store_FormatVersionMismatch_IsMiss()
     {
         ChunkKvEntry entry = NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5);
@@ -336,6 +350,7 @@ public sealed class ChunkStoreTests : IDisposable
         string shard = Path.GetDirectoryName(EntryPath(key))!;
         File.WriteAllBytes(Path.Combine(shard, key.Hex + ".abc.tmp"), new byte[100]); // a crashed writer's leftover
         File.WriteAllBytes(Path.Combine(shard, "notes.txt"), new byte[10]);
+        File.Copy(EntryPath(key), Path.Combine(shard, key.Hex + ".ckvx")); // longer extension, valid-looking name
         Assert.Equal([key], store.Keys());
         Assert.Equal(bytes, store.TotalBytes);
     }
