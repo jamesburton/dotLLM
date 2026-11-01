@@ -16,7 +16,7 @@ internal sealed record E4Options(
     string ModelPath, string CorpusDir, string CorpusName, string Chunker, int ChunkTokens, string? ExpectHash, int Seed, int Count,
     TaskGeneratorOptions Generator, string Mode, string? KeptValidationCsv, string? PlansJsonl, int MaxContexts, int[] Budgets,
     string[] Arms, string[] LightArms, int[] LightBudgets, int Window, double MaxMinutes, int Threads, string OutCsv,
-    long ChunkCacheTokens, int Shard, int Shards);
+    long ChunkCacheTokens, int Shard, int Shards, string ContextKind = "random", double RelatedFraction = 0.5);
 
 /// <summary>
 /// E4 (Task 11): structure-aware recompute selection on the Task 8 cross-file tasks. For each context (a
@@ -32,7 +32,10 @@ internal sealed record E4Options(
 /// Contexts: <c>--mode kept</c> takes the call sites the Task 8 validation kept (<c>--kept</c>). For symbol/seed 0 these are the
 /// Task 8 plans themselves (verified against <c>--plans-jsonl</c>), restricted to their kept tasks; otherwise
 /// <see cref="CrossFileTaskGenerator.GeneratePlansFor"/> re-samples distractors and order with the seed around the same call
-/// sites (chunker-specific required chunk). <c>--mode unfiltered</c> takes the first <c>--contexts</c> plans of
+/// sites (chunker-specific required chunk). With <c>--context-kind related</c> (E4b) the same kept call sites are grouped the same
+/// way, but each context is rebuilt by <see cref="RelatedContextBuilder"/> (a <c>--related-fraction</c> share of the distractors
+/// from files within two reference-graph hops of the calling files) and every cell is re-validated (the Task 8 plans are not
+/// used). <c>--mode unfiltered</c> takes the first <c>--contexts</c> plans of
 /// <see cref="CrossFileTaskGenerator.GeneratePlans"/> with all their tasks.
 /// </remarks>
 internal static class E4Command
@@ -58,7 +61,7 @@ internal static class E4Command
         ReferenceGraph graph = new RoslynGraphBuilder(lab.Tokenizer).Build(corpus);
         Console.WriteLine($"graph: {graph.Edges.Count} edges in {sw.Elapsed.TotalSeconds:F1} s (offline cost); mapping-mismatch chunks {graph.MappingMismatchChunks}");
 
-        IReadOnlyList<CodeContextPlan> plans = SelectPlans(o, corpus);
+        IReadOnlyList<CodeContextPlan> plans = SelectPlans(o, corpus, graph);
         var options = new GraphSignalOptions { DefinitionWindow = o.Window, ChunkStartTokens = 16 };
         Console.WriteLine($"arms {string.Join(',', o.Arms)}; budgets {string.Join(',', o.Budgets)} % (light arms {string.Join(',', o.LightArms)} at "
             + $"{string.Join(',', o.LightBudgets)} %); definition window {o.Window}; shard {o.Shard}/{o.Shards}");
@@ -69,7 +72,7 @@ internal static class E4Command
         using var csv = new StreamWriter(o.OutCsv) { AutoFlush = true };
         csv.WriteLine("corpus,chunker,seed,mode,plan,context_id,cluster,task_id,task_index,context_tokens,chunks,required_first,prefix_tokens,mask_tokens,"
             + "arm,budget_pct,budget_tokens,graph_picks,query_edges,query_targets,query_targets_first,in_context_edges,forward_calls,score_ms,select_ms,"
-            + "recompute_ms,eval_ms,memo,mask_nll,mask_em,cont_nll,greedy_run,kl_cont,top1_cont,kl_mask,top1_mask");
+            + "recompute_ms,eval_ms,memo,mask_nll,mask_em,cont_nll,greedy_run,kl_cont,top1_cont,kl_mask,top1_mask,context_kind,related_chunks,hop1_chunks");
 
         var encoder = new ChunkEncoder(lab.Fingerprint);
         var assembler = new ChunkAssembler(lab.Config);
@@ -94,7 +97,12 @@ internal static class E4Command
             var ctxBase = new ChunkedContext(chunkIds, []);
             int first = ctxBase.ChunkLength(0);
             bool requiredFirst = plan.RequiredIds.Contains(plan.Chunks[0].Id);
-            string contextId = $"{o.CorpusName}/{o.Chunker}/s{o.Seed}/{o.Mode}/p{p}";
+            string contextId = $"{o.CorpusName}/{o.Chunker}/s{o.Seed}/{o.Mode}{(o.ContextKind == "related" ? "-related" : "")}/p{p}";
+            // Distractors from the calling files' two-hop neighbourhood (reported for both context kinds).
+            IReadOnlyDictionary<string, int> hood = RelatedContextBuilder.Neighbourhood(graph, plan.Tasks);
+            Chunk[] distractorChunks = plan.Chunks.Where(c => !plan.RequiredIds.Contains(c.Id)).ToArray();
+            int relatedChunks = distractorChunks.Count(c => hood.ContainsKey(c.FilePath));
+            int hop1Chunks = distractorChunks.Count(c => hood.TryGetValue(c.FilePath, out int h) && h == 1);
             string cluster = $"{o.CorpusName}|{string.Join('+', tasks[0].RequiredChunks.Select(c => c.FilePath).Distinct(StringComparer.Ordinal))}";
             var graphInfo = new (int Edges, int Targets, int TargetsFirst, int InContext)[tasks.Length];
 
@@ -110,7 +118,7 @@ internal static class E4Command
                     calls.ToString(ci), scoreMs.ToString("F1", ci), selectMs.ToString("F3", ci), recomputeMs.ToString("F0", ci),
                     e.EvalMs.ToString("F0", ci), memo ? "1" : "0", e.MaskNll.ToString("G6", ci), e.MaskEm ? "1" : "0", e.ContNll.ToString("G6", ci),
                     e.GreedyRun.ToString(ci), e.KlCont.ToString("G6", ci), e.Top1Cont.ToString("G6", ci), e.KlMask.ToString("G6", ci),
-                    e.Top1Mask.ToString("G6", ci)));
+                    e.Top1Mask.ToString("G6", ci), o.ContextKind, relatedChunks.ToString(ci), hop1Chunks.ToString(ci)));
             }
 
             // Reference: full prefill, then each task's query + continuation (rows kept for KL/top-1). ------------------------
@@ -316,7 +324,8 @@ internal static class E4Command
             Console.WriteLine($"[{contextId} L {L} chunks {plan.Chunks.Count} tasks {tasks.Length}{(requiredFirst ? " required=chunk0" : "")}] "
                 + $"{ctxSw.Elapsed.TotalSeconds:F0} s (full {fullMs / 1000:F1} s, encode {encodeMs / 1000:F1} s, dev {devMs / 1000:F1} s, "
                 + $"query {qrMs.Sum() / 1000:F1} s, {memo.Count} distinct selections); query edges/targets "
-                + string.Join(' ', graphInfo.Select(g => $"{g.Edges}/{g.Targets}")) + $"; ref EM {refEval.Count(e => e.MaskEm)}/{tasks.Length}; "
+                + string.Join(' ', graphInfo.Select(g => $"{g.Edges}/{g.Targets}")) + $"; in-context edges {graphInfo[0].InContext}; "
+                + $"related distractors {relatedChunks}/{distractorChunks.Length} (hop 1: {hop1Chunks}); ref EM {refEval.Count(e => e.MaskEm)}/{tasks.Length}; "
                 + $"at {total.Elapsed.TotalMinutes:F1} min");
         }
         Console.WriteLine($"e4 {o.CorpusName}/{o.Chunker}/s{o.Seed}/{o.Mode} shard {o.Shard}/{o.Shards}: {done} contexts in {total.Elapsed.TotalMinutes:F1} min -> {o.OutCsv}");
@@ -324,8 +333,10 @@ internal static class E4Command
     }
 
     /// <summary>The plans (contexts + tasks) this run evaluates; see the class remarks.</summary>
-    private static IReadOnlyList<CodeContextPlan> SelectPlans(E4Options o, Corpus corpus)
+    private static IReadOnlyList<CodeContextPlan> SelectPlans(E4Options o, Corpus corpus, ReferenceGraph graph)
     {
+        if (o.ContextKind is not ("random" or "related")) throw new ArgumentException($"unknown --context-kind '{o.ContextKind}' (related|random)");
+        if (o.ContextKind == "related" && o.Mode != "kept") throw new ArgumentException("--context-kind related needs --mode kept");
         var gen = new CrossFileTaskGenerator(o.Generator);
         var sw = Stopwatch.StartNew();
         List<CodeContextPlan> plans;
@@ -338,7 +349,17 @@ internal static class E4Command
         {
             Dictionary<int, List<string>> keptByPlan = E3Command.ReadKept(o.KeptValidationCsv ?? throw new ArgumentException("--mode kept needs --kept"));
             var kept = keptByPlan.Values.SelectMany(x => x).ToHashSet(StringComparer.Ordinal);
-            if (o.Chunker == "symbol" && o.Seed == 0 && o.PlansJsonl is not null)
+            if (o.ContextKind == "related")
+            {
+                // Same grouping of the kept call sites as the random contexts (by required chunk, up to --per-context tasks),
+                // each context rebuilt from the calling files' neighbourhood with a seed derived from the run seed and the
+                // context's first task id.
+                plans = gen.GeneratePlansFor(corpus, kept, o.Seed)
+                    .Select(pl => RelatedContextBuilder.Build(corpus, pl.Tasks, graph, o.Generator.ContextTokens, o.RelatedFraction,
+                        PlanSeed(o.Seed, pl.Tasks.Select(t => t.Id).Min(StringComparer.Ordinal)!)))
+                    .ToList();
+            }
+            else if (o.Chunker == "symbol" && o.Seed == 0 && o.PlansJsonl is not null)
             {
                 // The Task 8 contexts themselves (validated there), restricted to their kept tasks.
                 IReadOnlyList<CodeContextPlan> all = gen.GeneratePlans(corpus, o.Count, 0);
@@ -356,7 +377,8 @@ internal static class E4Command
             Console.WriteLine("contexts (first task id): " + string.Join(' ', plans.Select(pl => pl.Tasks.Select(t => t.Id).Min(StringComparer.Ordinal))));
         }
         else throw new ArgumentException($"unknown --mode '{o.Mode}' (kept|unfiltered)");
-        Console.WriteLine($"plans: {plans.Count} contexts, {plans.Sum(pl => pl.Tasks.Count)} tasks ({o.Mode}, seed {o.Seed}, {sw.Elapsed.TotalSeconds:F1} s); "
+        Console.WriteLine($"plans: {plans.Count} contexts, {plans.Sum(pl => pl.Tasks.Count)} tasks ({o.Mode}, {o.ContextKind} contexts"
+            + (o.ContextKind == "related" ? $" fraction {o.RelatedFraction.ToString(CultureInfo.InvariantCulture)}" : "") + $", seed {o.Seed}, {sw.Elapsed.TotalSeconds:F1} s); "
             + $"mean context {plans.Average(pl => pl.ContextTokenIds.Length):F0} tokens, {plans.Average(pl => pl.Chunks.Count):F1} chunks");
         return plans;
     }
@@ -391,6 +413,9 @@ internal static class E4Command
     }
 
     private static string StableKey(string s) => Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(s)));
+
+    private static int PlanSeed(int seed, string firstTaskId) =>
+        unchecked(seed * 1_000_003 + int.Parse(StableKey(firstTaskId)[..7], NumberStyles.HexNumber, CultureInfo.InvariantCulture));
 
     private static int RandomSeed(int seed, int plan) => unchecked(seed * 1_000_003 + plan * 7_919 + 17);
 

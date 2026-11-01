@@ -21,6 +21,7 @@ namespace ChunkKvLab;
 /// ChunkKvLab e4 --model &lt;gguf&gt; --corpus &lt;dir&gt; --name &lt;corpus name&gt; --out &lt;csv&gt; [--chunker symbol|fixed] [--chunk 512] [--seed 0]
 ///               [--mode kept|unfiltered] [--kept &lt;validation.csv&gt;] [--plans-jsonl &lt;plans&gt;] [--contexts 0 (all)] [--budgets 5,10,15,20]
 ///               [--arms ...] [--light-arms a,b --light-budgets 5,20] [--window 16] [--shard 0/1] [--max-minutes 0] [--expect-hash &lt;sha256&gt;]
+///               [--context-kind random|related] [--related-fraction 0.5]
 /// ChunkKvLab rope-precision --model &lt;gguf&gt; --corpus &lt;dir&gt; --out rope.csv [--deltas 1024,4096,8192] [--chunks 3]
 /// </code>
 /// </summary>
@@ -121,7 +122,8 @@ internal static class Program
                     List("arms", "drop_required,oracle_chunk,oracle_def,first_k,chunk_starts,deviation,random,query,graph,hybrid_query,hybrid_dev,oracle_def_fill"),
                     List("light-arms", "="), Ints("light-budgets", "5,20"), Int("window", 16),
                     double.Parse(Get("max-minutes", "0"), CultureInfo.InvariantCulture), Int("threads", 0), Get("out"),
-                    Int("chunk-cache-tokens", 40000), int.Parse(shard[0], CultureInfo.InvariantCulture), int.Parse(shard[1], CultureInfo.InvariantCulture)));
+                    Int("chunk-cache-tokens", 40000), int.Parse(shard[0], CultureInfo.InvariantCulture), int.Parse(shard[1], CultureInfo.InvariantCulture),
+                    Get("context-kind", "random"), double.Parse(Get("related-fraction", "0.5"), CultureInfo.InvariantCulture)));
             }
             case "tasks":
                 return TasksRunner.Run(new TasksOptions(
