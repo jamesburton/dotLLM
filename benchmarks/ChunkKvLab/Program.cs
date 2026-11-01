@@ -9,6 +9,10 @@ namespace ChunkKvLab;
 ///               [--chunk 512] [--continuation 64] [--greedy 16] [--threads 0]
 /// ChunkKvLab e2 --model &lt;gguf&gt; --corpus &lt;dir&gt; --out e2.csv [--sizes 2048,4096] [--budgets 5,10,15,20] [--selectors ...]
 ///               [--contiguous =a,b] [--query 16] [--noise 1] [--expect-hash &lt;sha256&gt;] [--seeds 3] [--first-seed 0]
+/// ChunkKvLab corpus-info --model &lt;gguf&gt; --corpus &lt;dir&gt; [--chunker e1|symbol|fixed] [--chunk 512] [--expect-hash &lt;sha256&gt;]
+/// ChunkKvLab tasks --model &lt;gguf&gt; --corpus &lt;dir&gt; --out &lt;prefix&gt; [--chunker symbol|fixed] [--chunk 512] [--count 100] [--seed 0]
+///               [--context 2048] [--continuation 32] [--prefix 256] [--per-context 4] [--max-distractors n] [--validate 0|1]
+///               [--max-minutes 0] [--expect-hash &lt;sha256&gt;]
 /// ChunkKvLab rope-precision --model &lt;gguf&gt; --corpus &lt;dir&gt; --out rope.csv [--deltas 1024,4096,8192] [--chunks 3]
 /// </code>
 /// </summary>
@@ -62,12 +66,30 @@ internal static class Program
             case "corpus-info":
             {
                 // Tokenizer only (no weights are run): document/chunk counts and the chunk-id hash of a corpus directory.
+                // --chunker e1 (default): the E1/E2 ContextBuilder (all files, 512-token chunks, tails dropped).
+                // --chunker symbol|fixed: the Task 8 code corpus (tests/generated/bin/obj excluded, tails kept).
                 using var gguf = DotLLM.Models.Gguf.GgufFile.Open(Get("model"));
                 var tokenizer = DotLLM.Models.Gguf.GgufBpeTokenizerFactory.Load(gguf.Metadata);
+                string chunker = Get("chunker", "e1");
+                if (chunker != "e1")
+                {
+                    TasksRunner.LoadCorpus(Get("corpus"), chunker, Int("chunk", 512), tokenizer, opts.GetValueOrDefault("expect-hash"));
+                    return 0;
+                }
                 var corpus = ContextBuilder.FromDirectory(Get("corpus"), Get("pattern", "*.cs"), tokenizer, Int("chunk", 512));
                 Console.WriteLine($"corpus {Get("corpus")}: {corpus.DocumentCount} documents, {corpus.Chunks.Count} chunks; chunk-id sha256 {corpus.ChunkIdHash}");
                 return 0;
             }
+            case "tasks":
+                return TasksRunner.Run(new TasksOptions(
+                    Get("model"), Get("corpus"), Get("chunker", "symbol"), Int("chunk", 512), Int("count", 100), Int("seed", 0),
+                    new DotLLM.ChunkReuse.CodeCorpus.TaskGeneratorOptions
+                    {
+                        ContextTokens = Int("context", 2048), ContinuationTokens = Int("continuation", 32), PrefixTokens = Int("prefix", 256),
+                        TasksPerContext = Int("per-context", 4), MaxDistractors = Int("max-distractors", int.MaxValue),
+                    },
+                    Int("validate", 0) != 0, double.Parse(Get("max-minutes", "0"), CultureInfo.InvariantCulture), Int("threads", 0),
+                    Get("out"), opts.GetValueOrDefault("expect-hash")));
             default:
                 Console.Error.WriteLine($"unknown command '{args[0]}'");
                 return 2;

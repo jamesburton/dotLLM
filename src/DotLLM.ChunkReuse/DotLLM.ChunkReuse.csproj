@@ -11,4 +11,10 @@
     <ProjectReference Include="..\DotLLM.Models\DotLLM.Models.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Code corpus (Corpus/): Roslyn syntax for the symbol chunker, semantic model for cross-file task generation. -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" />
+    <ProjectReference Include="..\DotLLM.Tokenizers\DotLLM.Tokenizers.csproj" />
+  </ItemGroup>
+
 </Project>
