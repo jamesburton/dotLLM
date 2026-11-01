@@ -704,6 +704,34 @@ columns x NR 1..4 equal) and both rejected on speed: (1) a 210-byte block is 2 (
 Q8_0 (34-byte blocks, same 2 (mod 4) problem): three raw dwords + funnel shifts + the full Q4_K-style double buffer (activations included) is bit-identical, makes NR 2 up to 1.5x faster (1471 -> 983 us at 16 columns) but NR 4, the default and the best arm, 1-12% slower at 1..12 columns and 14% slower at 16 (663 -> 756 us). Not worth a new default. Both
 kernels are at 200+ GB/s up to 4 columns (Q8_0 to 12), so the remaining distance to the 210-220 GB/s ceiling is small.
 
+**Re-measure vs llama.cpp after #1517 and #1520 (issue #1220, dev `fc8fa0b0`).** Same harness, prompts, llama.cpp build (`0ae0e1976` Vulkan
+`llama-server`), `DOTLLM_MTP_ADAPTIVE=0`, 3 reps with reversed pair order in rep 2, GPU lock and `cpu-bench` held, ollama idle. The machine
+rebooted mid-sweep (during rep 2); the sweep was resumed with the missing runs only (rep 1 and 27 of 40 rep-2 runs pre-reboot, the rest after), so
+rep-to-rep spread is wider than last time. **Absolute tok/s are about 14% lower for BOTH engines than in the #1510 table (plain 8.97 / 9.26 vs
+10.44 / 10.73, including the pre-reboot rep 1), so this session is a slower box state; compare ratios, not absolutes, against the earlier table.**
+Mean of the 4 prompts' tok/s (range = min..max over the 3 reps of that mean); the ratio is the mean of the 3 per-rep ratios:
+
+| arm | dotLLM tok/s | llama.cpp tok/s | dotLLM / llama.cpp (per-rep range) | per prompt ratio (p0 / p1 / p2 / p3, mean of 3 reps) | previous ratio (#1510 table) | peak private / GPU shared MiB dotLLM | llama.cpp |
+|---|---|---|---|---|---|---|---|
+| plain | 8.97 (8.52-9.42) | 9.26 (8.88-9.65) | 0.97 (0.93-1.02) | 0.96 / 0.96 / 0.96 / 0.99 | 0.97 | 19,210 / 18,551 | 19,499 / 18,636 |
+| MTP K=2 | 20.04 (19.69-20.39) | 20.18 (19.33-21.44) | 1.00 (0.92-1.04) | 0.93 / 1.00 / 0.96 / 1.08 | 0.94 | 19,693 / 19,004 | 23,707 / 22,150 |
+| MTP K=3 | 24.55 (23.99-24.83) | 21.50 (20.17-22.88) | **1.14** (1.08-1.23) | 1.06 / 1.34 / 1.02 / 1.25 | 1.02 | 19,694 / 19,013 | 24,129 / 22,301 |
+| MTP K=4 | 26.30 (24.00-29.25) | 21.89 (20.75-23.37) | **1.20** (1.16-1.25) | 1.04 / 1.44 / 1.11 / 1.39 | 1.14 | 19,700 / 19,018 | 24,280 / 22,462 |
+| DFlash2 K=3 | 26.55 (24.55-28.91) | 25.83 (24.34-28.33) | 1.03 (1.01-1.06) | 1.03 / 1.09 / 1.03 / 0.98 | 0.95 | 20,374 / 19,684 | 22,336 / 21,036 |
+
+- K=3 (1.02 -> 1.14) and DFlash K=3 (0.95 -> 1.03) moved ahead of llama.cpp; K=2 went 0.94 -> 1.00 (parity within the rep spread). The dotLLM
+  absolutes of the verify-heavy arms are within ~5% of the #1510 table (K=3 24.55 vs 25.03, K=4 26.30 vs 27.65, DFlash 26.55 vs 27.55) while plain
+  moved -14%, so those arms gained relative to plain. Read this as "the 2..4-column verify gap is closed", not as a new absolute record.
+- **Arms still below llama.cpp:** plain decode only (0.96-0.99 on every prompt, 0.97 mean; the same -3% as in every earlier measurement). K=2 is at
+  parity (0.93 on the degenerate prompt 0, 1.08 on prompt 3). The residual is the 1-row decode path, not verify or speculation.
+- **Next lever:** the 1-row GEMVs. The #1511 perturbation recipe found the multi-column kernels were limited by load instructions and in-flight
+  loads; the n=1 Q4_K / Q6_K / Q8_0 kernels (238-245 us per 17408x5120 gate/up, ~205 GB/s) and the 248k-row Q6_K LM head (4.8 ms of ~105 ms) are the
+  remaining ~3%. Check whether llama.cpp's 1-row kernel exceeds 205 GB/s on the same shape before investing; if it does not, plain decode is at the
+  bandwidth floor and the 3% is dispatch overhead (previously measured as not the lever).
+- **Greedy identity:** every dotLLM MTP/DFlash run (48 runs) equals dotLLM plain on the first 300 characters, per prompt and rep (60 / 60 counting the
+  plain runs). Caveats as before: prompts 0 and 2 degenerate into repetition on the raw prompt (acceptance ~0.95+); prompt 1 is the non-degenerate one
+  and is where dotLLM leads most (K=4 1.44x); llama.cpp's own MTP varies run to run (K=4 20.8-23.4 on the mean of 4).
+
 **Verify and decode on the same kernels (issue #1220).** The 4-row verify cost 150 ms against a 105 ms decode, and every verify column only
 matched decode by luck: the multi-column GEMVs reduced with `subgroupAdd`, whose order changes with the subgroup width a driver picks for
 each pipeline. Intel picks SIMD8/16/32 by register pressure, so the multi kernels differed from decode at NR = 4 on Arc. The row-split GDN
