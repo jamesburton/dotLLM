@@ -195,6 +195,41 @@ public sealed class CrossFileTaskGenerator
         return plans;
     }
 
+    /// <summary>
+    /// Plans for the call sites named by <paramref name="taskIds"/> (<see cref="CodeTask.Id"/>, which depends neither on the seed
+    /// nor on the chunker): the sites are grouped by required chunk(s) (ordinal order of the group key), each group is split into
+    /// plans of up to <see cref="TaskGeneratorOptions.TasksPerContext"/> tasks (ordinal task-id order), and each plan gets
+    /// seeded distractors and a seeded order exactly as <see cref="GeneratePlans"/> builds them. So one seed re-samples the
+    /// contexts around a fixed task set. Ids that match no usable call site (or whose task does not fit the budgets) are
+    /// skipped; compare the returned task ids to detect them.
+    /// </summary>
+    public IReadOnlyList<CodeContextPlan> GeneratePlansFor(Corpus corpus, IEnumerable<string> taskIds, int seed)
+    {
+        ArgumentNullException.ThrowIfNull(corpus);
+        ArgumentNullException.ThrowIfNull(taskIds);
+        var wanted = taskIds.ToHashSet(StringComparer.Ordinal);
+        var rng = new Random(seed);
+        var found = new List<(CallSite Site, CodeTask Task)>();
+        var lineIndex = new Dictionary<string, LineIndex>(StringComparer.Ordinal);
+        foreach (CallSite s in FindCallSites(corpus, out _))
+        {
+            if (!lineIndex.TryGetValue(s.Path, out LineIndex? lines)) lineIndex[s.Path] = lines = new LineIndex(corpus.FileAt(s.Path).Text);
+            if (!wanted.Contains($"{s.Path}:{lines.LineOf(s.MaskStart)}:{s.MaskStart - lines.LineStartOf(s.MaskStart) + 1}")) continue;
+            CodeTask? t = BuildTask(corpus, s);
+            if (t is not null) found.Add((s, t));
+        }
+        var plans = new List<CodeContextPlan>();
+        foreach (var group in found.GroupBy(x => x.Site.RequiredKey, StringComparer.Ordinal).OrderBy(g => g.Key, StringComparer.Ordinal))
+        {
+            Chunk[] required = group.First().Site.Required;
+            if (required.Sum(c => c.TokenIds.Length) > _o.ContextTokens) continue;
+            var ordered = group.OrderBy(x => x.Task.Id, StringComparer.Ordinal).ToList();
+            for (int i = 0; i < ordered.Count; i += _o.TasksPerContext)
+                plans.Add(BuildPlan(corpus, seed, rng, required, ordered.GetRange(i, Math.Min(_o.TasksPerContext, ordered.Count - i))));
+        }
+        return plans;
+    }
+
     /// <summary>Required chunk(s) + seeded distractors up to the budget, in a seeded order, with the chosen tasks.</summary>
     private CodeContextPlan BuildPlan(Corpus corpus, int seed, Random rng, Chunk[] required, List<(CallSite Site, CodeTask Task)> chosen)
     {

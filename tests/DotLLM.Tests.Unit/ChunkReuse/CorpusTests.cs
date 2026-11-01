@@ -442,6 +442,58 @@ public sealed class CorpusTests : IDisposable
     }
 
     [Fact]
+    public void TaskGenerator_PlansFor_KeepsTheNamedTasks_VariesDistractorsBySeed_AcrossChunkers()
+    {
+        // E4 re-samples contexts around a fixed task set: the same call sites (ids are seed- and chunker-independent), grouped
+        // by required chunk, with seeded distractors and order.
+        Corpus corpus = BuildCorpus(TaskRepo);
+        var options = SmallOptions with { TasksPerContext = 4, ContextTokens = 260 };
+        var gen = new CrossFileTaskGenerator(options);
+        CodeTask[] all = gen.Generate(corpus, 100, seed: 1).ToArray();
+        Assert.Equal(6, all.Length);
+        string[] wanted = all.Where(t => !t.MaskedText.StartsWith("Pad", StringComparison.Ordinal)).Select(t => t.Id).Append("nope.cs:1:1").ToArray();
+
+        IReadOnlyList<CodeContextPlan> a = gen.GeneratePlansFor(corpus, wanted, seed: 5);
+        IReadOnlyList<CodeContextPlan> b = gen.GeneratePlansFor(corpus, wanted, seed: 5);
+        Assert.Equal(wanted[..^1].Order(StringComparer.Ordinal), a.SelectMany(p => p.Tasks).Select(t => t.Id).Order(StringComparer.Ordinal));
+        Assert.Equal(a.Select(p => string.Join('|', p.Chunks.Select(c => c.Id))), b.Select(p => string.Join('|', p.Chunks.Select(c => c.Id))));
+        foreach (CodeContextPlan p in a)
+        {
+            string[] required = p.Tasks[0].RequiredChunks.Select(c => c.Id).ToArray();
+            Assert.All(p.Tasks, t => Assert.Equal(required, t.RequiredChunks.Select(c => c.Id).ToArray()));
+            Assert.All(required, r => Assert.Contains(p.Chunks, c => c.Id == r));
+            Assert.True(p.ContextTokenIds.Length <= 260);
+            Assert.True(p.Tasks.Count <= 4);
+            var callFiles = p.Tasks.Select(t => t.CallSitePath).ToHashSet();
+            Assert.DoesNotContain(p.Chunks, c => callFiles.Contains(c.FilePath));
+            CodeTask same = all.Single(t => t.Id == p.Tasks[0].Id);
+            Assert.Equal(same.PrefixTokenIds, p.Tasks[0].PrefixTokenIds);
+            Assert.Equal(same.MaskedText, p.Tasks[0].MaskedText);
+        }
+        // Add's two call sites share one plan (one required chunk).
+        Assert.Contains(a, p => p.Tasks.Count == 2 && p.Tasks.All(t => t.MaskedText.StartsWith("Add(", StringComparison.Ordinal)));
+        // Another seed keeps the tasks and required chunks but samples other distractors or another order.
+        IReadOnlyList<CodeContextPlan> c = gen.GeneratePlansFor(corpus, wanted, seed: 6);
+        Assert.Equal(a.Select(p => string.Join('|', p.Tasks.Select(t => t.Id))), c.Select(p => string.Join('|', p.Tasks.Select(t => t.Id))));
+        Assert.NotEqual(a.Select(p => string.Join('|', p.Chunks.Select(x => x.Id))), c.Select(p => string.Join('|', p.Chunks.Select(x => x.Id))));
+
+        // The fixed-size chunker finds the same call sites; their required chunk is the fixed chunk holding the declaration.
+        var tok = new CharTokenizer();
+        var fixedCorpus = new Corpus(TaskRepo.Select(f => new SourceFile(f.Path, f.Text)), new FixedSizeChunker(tok, 64), tok);
+        IReadOnlyList<CodeContextPlan> f = new CrossFileTaskGenerator(options).GeneratePlansFor(fixedCorpus, wanted, seed: 5);
+        Assert.Equal(wanted[..^1].Order(StringComparer.Ordinal), f.SelectMany(p => p.Tasks).Select(t => t.Id).Order(StringComparer.Ordinal));
+        foreach (CodeTask t in f.SelectMany(p => p.Tasks))
+        {
+            Chunk req = Assert.Single(t.RequiredChunks);
+            string name = t.MaskedText.TrimStart('.')[..t.MaskedText.TrimStart('.').IndexOf('(')];
+            string text = TaskRepo.Single(x => x.Path == req.FilePath).Text;
+            int decl = text.IndexOf(" " + name + "(", StringComparison.Ordinal) + 1;
+            Assert.InRange(decl, req.StartOffset, req.EndOffset - 1);
+            Assert.True(req.TokenIds.Length <= 64);
+        }
+    }
+
+    [Fact]
     public void TaskGenerator_Plans_ShareOneRequiredChunk_ContextFitsBudget_AndExcludesCallSiteFiles()
     {
         Corpus corpus = BuildCorpus(TaskRepo);

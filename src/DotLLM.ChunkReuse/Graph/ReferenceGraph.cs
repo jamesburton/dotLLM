@@ -128,6 +128,13 @@ public sealed class ReferenceGraph
         return result;
     }
 
+    /// <summary>Index into <see cref="Chunks"/> of the chunk with this <see cref="Chunk.Id"/>, or -1.</summary>
+    public int IndexOf(string chunkId)
+    {
+        ArgumentNullException.ThrowIfNull(chunkId);
+        return _chunkById.TryGetValue(chunkId, out int c) ? c : -1;
+    }
+
     /// <summary>Edges whose use end lies in chunk <paramref name="chunk"/>.</summary>
     public ReadOnlySpan<ChunkEdge> EdgesFrom(int chunk) => _edges.AsSpan(_edgeStart[chunk], _edgeStart[chunk + 1] - _edgeStart[chunk]);
 
