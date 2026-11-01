@@ -40,48 +40,63 @@ public class VulkanSelectiveRecomputeTests
 
         using var reference = (VulkanKvCache)vk.CreateKvCache(128);
         using (vk.Forward(ids, pos, 0, reference)) { }
-
-        using var recomputed = (VulkanKvCache)vk.CreateKvCache(128);
-        using (vk.Forward(ids, pos, 0, recomputed)) { }
-        // Poison the selected rows (a stale, wrong K/V) so a recompute that did not run, or wrote elsewhere, cannot pass.
         int stride = reference.KvStride;
-        var junk = new float[stride];
-        Array.Fill(junk, 7.5f);
-        for (int l = 0; l < layers; l++)
-            foreach (int p in subset) recomputed.WriteRows(l, p, 1, junk, junk);
 
-        long before = vk.AttentionQueryPositionsCount;
-        int[] subIds = subset.Select(p => ids[p]).ToArray();
-        using (vk.Forward(subIds, subset, 0, recomputed)) { }
-        long ran = vk.AttentionQueryPositionsCount - before;
-        Assert.Equal(layers, (int)ran);   // the per-query-position kernel ran once per layer
-
-        Assert.Equal(N, recomputed.CurrentLength);
-        double worstSelK = 0, worstSelV = 0, worstOther = 0;
-        var rk = new float[N * stride]; var rv = new float[N * stride];
-        var ck = new float[N * stride]; var cv = new float[N * stride];
-        for (int l = 0; l < layers; l++)
+        // Recomputes `rows` (positions) on a fresh full-prefill cache whose selected rows were first poisoned, so a recompute that did
+        // not run, or wrote elsewhere, cannot pass. Returns (worst rel L2 K, V over the rows, untouched-row worst, per-layer worst K, kernel count).
+        (double k, double v, double other, double[] perLayerK, long qposRuns) Recompute(int[] rows)
         {
-            reference.ReadRows(l, 0, N, rk, rv);
-            recomputed.ReadRows(l, 0, N, ck, cv);
-            for (int p = 0; p < N; p++)
+            using var c = (VulkanKvCache)vk.CreateKvCache(128);
+            using (vk.Forward(ids, pos, 0, c)) { }
+            var junk = new float[stride];
+            Array.Fill(junk, 7.5f);
+            for (int l = 0; l < layers; l++)
+                foreach (int p in rows) c.WriteRows(l, p, 1, junk, junk);
+            long before = vk.AttentionQueryPositionsCount;
+            using (vk.Forward(rows.Select(p => ids[p]).ToArray(), rows, 0, c)) { }
+            long ran = vk.AttentionQueryPositionsCount - before;
+            Assert.Equal(N, c.CurrentLength);
+            double wk = 0, wv = 0, wo = 0;
+            var perLayer = new double[layers];
+            var rk = new float[N * stride]; var rv = new float[N * stride];
+            var ck = new float[N * stride]; var cv = new float[N * stride];
+            for (int l = 0; l < layers; l++)
             {
-                bool sel = Array.IndexOf(subset, p) >= 0;
-                double dk = 0, nk = 0, dv = 0, nv = 0;
-                for (int i = 0; i < stride; i++)
+                reference.ReadRows(l, 0, N, rk, rv);
+                c.ReadRows(l, 0, N, ck, cv);
+                for (int p = 0; p < N; p++)
                 {
-                    double a = rk[p * stride + i], b = ck[p * stride + i];
-                    dk += (a - b) * (a - b); nk += a * a;
-                    a = rv[p * stride + i]; b = cv[p * stride + i];
-                    dv += (a - b) * (a - b); nv += a * a;
+                    bool sel = Array.IndexOf(rows, p) >= 0;
+                    double dk = 0, nk = 0, dv = 0, nv = 0;
+                    for (int i = 0; i < stride; i++)
+                    {
+                        double a = rk[p * stride + i], b = ck[p * stride + i];
+                        dk += (a - b) * (a - b); nk += a * a;
+                        a = rv[p * stride + i]; b = cv[p * stride + i];
+                        dv += (a - b) * (a - b); nv += a * a;
+                    }
+                    double relK = Math.Sqrt(dk / nk), relV = Math.Sqrt(dv / nv);
+                    if (sel) { wk = Math.Max(wk, relK); wv = Math.Max(wv, relV); perLayer[l] = Math.Max(perLayer[l], relK); }
+                    else wo = Math.Max(wo, Math.Max(relK, relV));
                 }
-                double relK = Math.Sqrt(dk / nk), relV = Math.Sqrt(dv / nv);
-                if (sel) { worstSelK = Math.Max(worstSelK, relK); worstSelV = Math.Max(worstSelV, relV); }
-                else worstOther = Math.Max(worstOther, Math.Max(relK, relV));
             }
+            return (wk, wv, wo, perLayer, ran);
         }
-        _out.WriteLine($"[1531 step3] layers={layers} selected rows: worst rel L2 K {worstSelK:E2} V {worstSelV:E2}; untouched rows worst {worstOther:E2}");
-        Assert.Equal(0.0, worstOther);       // rows outside the subset are byte-identical
-        Assert.True(worstSelK < 5e-3 && worstSelV < 5e-3, $"recomputed rows drift from the full prefill: K {worstSelK:E2} V {worstSelV:E2}");
+
+        var sub = Recompute(subset);
+        // Noise floor: an 8-row contiguous tail run on the same path the model always used (flash/coopmat attention, tight span). It differs
+        // from the 96-row prefill only through the numerics of an 8-row vs 96-row forward (activation-quantised matmul paths, attention kernel).
+        var ctl = Recompute(Enumerable.Range(N - subset.Length, subset.Length).ToArray());
+        _out.WriteLine($"[1531 step3] layers={layers} subset (non-contiguous, qpos kernel x{sub.qposRuns}): K {sub.k:E2} V {sub.v:E2}, untouched {sub.other:E2}");
+        _out.WriteLine($"[1531 step3] control (contiguous tail run, old kernels x{ctl.qposRuns}): K {ctl.k:E2} V {ctl.v:E2}, untouched {ctl.other:E2}");
+        _out.WriteLine("[1531 step3] per-layer worst K  layer: subset / control: " + string.Join(" ", Enumerable.Range(0, layers).Where(l => l % 5 == 0 || l == layers - 1).Select(l => $"{l}:{sub.perLayerK[l]:E1}/{ctl.perLayerK[l]:E1}")));
+
+        Assert.Equal(layers, (int)sub.qposRuns);   // the per-query-position kernel ran once per layer on the subset
+        Assert.Equal(0L, ctl.qposRuns);            // and not on the tight control
+        Assert.Equal(0.0, sub.other);              // rows outside the subset are byte-identical
+        Assert.Equal(0.0, ctl.other);
+        // The recompute is as close to the full prefill as the control, which has no non-contiguity at all.
+        Assert.True(sub.k <= 2 * ctl.k + 1e-3 && sub.v <= 2 * ctl.v + 1e-3,
+            $"subset recompute drifts more than the numerics floor: K {sub.k:E2} vs {ctl.k:E2}, V {sub.v:E2} vs {ctl.v:E2}");
     }
 }
