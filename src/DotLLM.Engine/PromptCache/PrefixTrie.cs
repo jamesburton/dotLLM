@@ -471,6 +471,9 @@ public sealed class PrefixTrie
     /// <summary>
     /// Salt that separates approximate children from exact ones in the child map, so both can exist
     /// for the same tokens. The node's <see cref="PrefixTrieNode.IsApprox"/> flag is checked as well.
+    /// The salt adds a cross-class collision (<c>H(a) ^ salt == H(b)</c>) to the existing 64-bit token-hash
+    /// collision case; both are negligible, and a collision only costs a miss or an overwritten sibling,
+    /// never a wrong restore (tokens and the flag are compared on every match).
     /// </summary>
     private const long ApproxKeySalt = unchecked((long)0x9E3779B97F4A7C15UL);
 

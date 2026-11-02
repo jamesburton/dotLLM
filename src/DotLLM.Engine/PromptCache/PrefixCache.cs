@@ -53,7 +53,9 @@ public sealed class PrefixCache : IDisposable
         for (int i = 0; i < _entries.Count; i++)
         {
             int match = _entries[i].GetPrefixMatchLength(promptTokenIds, allowApprox);
-            if (match > bestMatch)
+            // Longest match wins; on a tie, the entry with more exact rows (as the trie prefers exact children).
+            if (match > bestMatch || (match == bestMatch && bestEntry is not null
+                && _entries[i].ApproxRowsIn(match) < bestEntry.ApproxRowsIn(bestMatch)))
             {
                 bestMatch = match;
                 bestEntry = _entries[i];
