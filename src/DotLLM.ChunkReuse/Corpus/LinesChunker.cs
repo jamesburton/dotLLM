@@ -6,7 +6,8 @@ namespace DotLLM.ChunkReuse.CodeCorpus;
 /// Text-first fixed-size chunks, <c>lines-N</c> (E4c ran this chunker as <c>fixed-text-512</c>; every chunk round-trips by
 /// construction, but <c>lines-512</c> is on the wire allow-list only from Phase I Task 19, see
 /// <see cref="WireChunking.PendingE4c"/>): the file <b>text</b> is cut into pieces of at most
-/// <see cref="MaxChunkTokens"/> tokens each, and every piece is tokenised alone (<see cref="ITokenizer.EncodeRaw"/>, no BOS).
+/// <see cref="MaxChunkTokens"/> tokens each, and every piece is tokenised alone (<see cref="ChunkTokenization.Encode"/>, no BOS; every size probe too, so a
+/// piece whose special-token spellings encode as several plain tokens never exceeds the limit).
 /// A server that receives a piece as text and tokenises it reproduces exactly the chunk's ids, which is not true of
 /// <see cref="FixedSizeChunker"/>'s id slices (BPE merges across a slice boundary, slices ending inside a multi-byte UTF-8
 /// character).
@@ -62,7 +63,7 @@ public sealed class LinesChunker : IChunker
     private (int End, int[] Ids) NextCut(string text, int start)
     {
         int n = MaxChunkTokens;
-        int[] rest = _tokenizer.EncodeRaw(text[start..]);
+        int[] rest = ChunkTokenization.Encode(_tokenizer, text[start..]);
         if (rest.Length <= n) return (text.Length, rest);
 
         // Furthest code-point boundary e in (start, text.Length) with Tokens(start..e) <= n.
@@ -77,7 +78,7 @@ public sealed class LinesChunker : IChunker
                 if (mid <= lo) mid += 2;
                 if (mid >= hi) break;           // the only boundary left in (lo, hi) is hi itself
             }
-            int[] ids = _tokenizer.EncodeRaw(text[start..mid]);
+            int[] ids = ChunkTokenization.Encode(_tokenizer, text[start..mid]);
             if (ids.Length <= n) { lo = mid; loIds = ids; }
             else hi = mid;
         }
@@ -90,7 +91,7 @@ public sealed class LinesChunker : IChunker
         {
             if (text[i] != '\n') continue;
             if (i + 1 == lo) return (lo, loIds);
-            int[] ids = _tokenizer.EncodeRaw(text[start..(i + 1)]);
+            int[] ids = ChunkTokenization.Encode(_tokenizer, text[start..(i + 1)]);
             if (ids.Length <= n) return (i + 1, ids);
         }
 
@@ -99,7 +100,7 @@ public sealed class LinesChunker : IChunker
         {
             end--;
             if (SplitsPair(text, end)) continue;
-            int[] ids = _tokenizer.EncodeRaw(text[start..end]);
+            int[] ids = ChunkTokenization.Encode(_tokenizer, text[start..end]);
             if (ids.Length <= n) return (end, ids);
         }
         return (lo, loIds);

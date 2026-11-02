@@ -256,7 +256,7 @@ internal static class BuildCommand
             {
                 if (!byId.TryGetValue(r.Id, out Chunk? chunk))
                     throw new InvalidOperationException($"Chunk {r.Id} is in the index but the chunker no longer produces it; the file changed during the build?");
-                if (!model.Tokenizer.EncodeRaw(Common.TextOf(file, r)).AsSpan().SequenceEqual(chunk.TokenIds)) ineligible++;
+                if (!ChunkTokenization.Encode(model.Tokenizer, Common.TextOf(file, r)).AsSpan().SequenceEqual(chunk.TokenIds)) ineligible++;
                 if (chunk.TokenIds.Length == 0) continue;
                 var assembly = model.Assembler.Assemble([chunk], model.Model, layout.Existing);
                 encoded += assembly.Stats.Misses;

@@ -44,8 +44,8 @@ public static class WireChunking
     }
 
     /// <summary>
-    /// Checks, per chunk, that its text tokenised alone gives exactly its ids (what a server receiving the text would
-    /// compute). The caller marks failures not wire-eligible.
+    /// Checks, per chunk, that its text tokenised alone (<see cref="ChunkTokenization.Encode"/>) gives exactly its ids (what a
+    /// server receiving the text would compute). The caller marks failures not wire-eligible.
     /// </summary>
     /// <param name="chunks">Chunks to check.</param>
     /// <param name="textOf">The text the wire would carry for a chunk: its character range of the file
@@ -60,7 +60,7 @@ public static class WireChunking
         var failed = new List<string>();
         foreach (Chunk c in chunks)
         {
-            int[] ids = tokenizer.EncodeRaw(textOf(c));
+            int[] ids = ChunkTokenization.Encode(tokenizer, textOf(c));
             if (!ids.AsSpan().SequenceEqual(c.TokenIds)) failed.Add(c.Id);
         }
         return new RoundTripReport(chunks.Count, failed.Count, failed);

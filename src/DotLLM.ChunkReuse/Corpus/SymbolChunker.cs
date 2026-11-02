@@ -37,7 +37,7 @@ public sealed partial class SymbolChunker : IChunker
     private readonly ITokenizer _tokenizer;
 
     /// <summary>Creates the chunker.</summary>
-    /// <param name="tokenizer">The model's tokenizer (each chunk's text is encoded with <see cref="ITokenizer.EncodeRaw"/>).</param>
+    /// <param name="tokenizer">The model's tokenizer (each chunk's text is encoded with <see cref="ChunkTokenization.Encode"/>).</param>
     /// <param name="maxChunkTokens">Largest chunk in tokens (default 512).</param>
     public SymbolChunker(ITokenizer tokenizer, int maxChunkTokens = 512)
     {
@@ -177,7 +177,7 @@ public sealed partial class SymbolChunker : IChunker
 
         private void Emit(int start, int end)
         {
-            int[] ids = owner._tokenizer.EncodeRaw(text[start..end]);
+            int[] ids = ChunkTokenization.Encode(owner._tokenizer, text[start..end]);
             if (ids.Length <= Limit)
             {
                 Add(start, end, ids);
@@ -206,7 +206,7 @@ public sealed partial class SymbolChunker : IChunker
                 int[]? bestIds = null;
                 for (int k = j; k < points.Length; k++)
                 {
-                    int[] ids = owner._tokenizer.EncodeRaw(text[cur..points[k]]);
+                    int[] ids = ChunkTokenization.Encode(owner._tokenizer, text[cur..points[k]]);
                     if (ids.Length > Limit) break;
                     best = k;
                     bestIds = ids;
@@ -236,7 +236,7 @@ public sealed partial class SymbolChunker : IChunker
         /// </remarks>
         private void SliceTokens(int start, int end)
         {
-            int[] ids = owner._tokenizer.EncodeRaw(text[start..end]);
+            int[] ids = ChunkTokenization.Encode(owner._tokenizer, text[start..end]);
             int offset = start;
             for (int s = 0; s < ids.Length; s += Limit)
             {

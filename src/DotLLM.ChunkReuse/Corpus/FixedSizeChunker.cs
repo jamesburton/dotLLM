@@ -4,7 +4,7 @@ namespace DotLLM.ChunkReuse.CodeCorpus;
 
 /// <summary>
 /// Fixed-size token chunks (the E1/E2 chunking, but per file and keeping the tail): the file is tokenised exactly once
-/// (<see cref="ITokenizer.EncodeRaw"/>, no BOS) and cut into consecutive slices of <see cref="MaxChunkTokens"/> ids; the last
+/// (<see cref="ChunkTokenization.Encode"/>, no BOS) and cut into consecutive slices of <see cref="MaxChunkTokens"/> ids; the last
 /// slice may be shorter. Chunk boundaries can fall mid-line, so two neighbouring chunks may share a line. Lab-only: no chunk is
 /// <see cref="Chunk.WireEligible"/>.
 /// </summary>
@@ -39,7 +39,7 @@ public sealed class FixedSizeChunker : IChunker
     {
         ArgumentNullException.ThrowIfNull(file);
         if (file.Text.Length == 0) return [];
-        int[] ids = _tokenizer.EncodeRaw(file.Text);
+        int[] ids = ChunkTokenization.Encode(_tokenizer, file.Text);
         var chunks = new List<Chunk>((ids.Length + MaxChunkTokens - 1) / MaxChunkTokens);
         int startOffset = 0, startLine = 1;
         for (int start = 0; start < ids.Length; start += MaxChunkTokens)

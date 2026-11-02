@@ -278,9 +278,9 @@ internal static class CompareCommand
             queryText = file.Text[queryStart..queryEnd];
         }
         else queryText = task.Query!;
-        int[] query = model.Tokenizer.EncodeRaw(queryText);
+        int[] query = ChunkTokenization.Encode(model.Tokenizer, queryText); // as the chat path encodes user text (ruling 21)
         if (query.Length == 0) throw new InvalidOperationException("The query encodes to no tokens.");
-        int[]? expected = task.Continuation is null ? null : model.Tokenizer.EncodeRaw(task.Continuation).Take(task.ContinuationTokens).ToArray();
+        int[]? expected = task.Continuation is null ? null : ChunkTokenization.Encode(model.Tokenizer, task.Continuation).Take(task.ContinuationTokens).ToArray();
         if (expected is { Length: 0 }) throw new InvalidOperationException("The continuation encodes to no tokens.");
         int n = expected?.Length ?? task.ContinuationTokens;
         int capacity = L + query.Length + n + 1;

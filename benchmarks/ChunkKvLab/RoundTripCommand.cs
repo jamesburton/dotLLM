@@ -6,7 +6,9 @@ namespace ChunkKvLab;
 
 /// <summary>
 /// E4c, tokenizer only (no weights run): how often a chunk fails the <b>text round trip</b> a wire server would do — its text,
-/// tokenised alone with <see cref="ITokenizer.EncodeRaw"/>, gives ids different from the chunk's. Per chunker (<c>fixed</c> id
+/// tokenised alone with <see cref="ChunkTokenization.Encode"/> (Phase I Task 5b; before it, bare <c>EncodeRaw</c>), gives ids
+/// different from the chunk's. Also counts the chunks whose text holds a special-token spelling (the only chunks whose ids
+/// the Task 5b tokenisation changes). Per chunker (<c>fixed</c> id
 /// slices, <c>symbol</c>, <c>lines</c>) and per chunk, two texts are checked: the decoded ids (what a client holding only
 /// the ids would send) and the chunk's character range of the file (what a text-first client sends). Also checks the
 /// text-first invariants on the real tokenizer (pieces concatenate to the file, every piece ≤ N, no lone surrogate) and prints
@@ -27,7 +29,7 @@ internal static class RoundTripCommand
         foreach (string chunker in chunkers)
         {
             Corpus corpus = TasksRunner.LoadCorpus(corpusDir, chunker, chunkTokens, tok, null);
-            int n = 0, decodedFail = 0, fffd = 0, rangeFail = 0, edgeOnly = 0;
+            int n = 0, decodedFail = 0, fffd = 0, rangeFail = 0, edgeOnly = 0, special = 0;
             var failFiles = new HashSet<string>(StringComparer.Ordinal);
             foreach (SourceFile f in corpus.Files)
             {
@@ -48,7 +50,7 @@ internal static class RoundTripCommand
                     Chunk c = chunks[k];
                     n++;
                     string decoded = tok.Decode(c.TokenIds);
-                    int[] re = tok.EncodeRaw(decoded);
+                    int[] re = ChunkTokenization.Encode(tok, decoded);
                     bool ok = re.AsSpan().SequenceEqual(c.TokenIds);
                     int firstDiff = -1, lastDiff = -1;
                     if (!ok)
@@ -66,7 +68,8 @@ internal static class RoundTripCommand
                     bool hasFffd = decoded.Contains('�', StringComparison.Ordinal) && !f.Text.Contains('�', StringComparison.Ordinal);
                     if (hasFffd) fffd++;
                     string range = corpus.TextOf(c);
-                    bool rangeOk = tok.EncodeRaw(range).AsSpan().SequenceEqual(c.TokenIds);
+                    if (!string.Equals(tok.MarkUntrustedSpecials(range), range, StringComparison.Ordinal)) special++;
+                    bool rangeOk = ChunkTokenization.Encode(tok, range).AsSpan().SequenceEqual(c.TokenIds);
                     if (!rangeOk) rangeFail++;
                     csv.WriteLine(string.Join(',', name, chunker, "\"" + f.Path + "\"", k.ToString(ci), c.TokenIds.Length.ToString(ci), hasFffd ? "1" : "0",
                         ok ? "1" : "0", (re.Length - c.TokenIds.Length).ToString(ci), firstDiff.ToString(ci), lastDiff.ToString(ci), rangeOk ? "1" : "0"));
@@ -74,7 +77,7 @@ internal static class RoundTripCommand
             }
             Console.WriteLine($"roundtrip {name} {corpus.Chunker.Name}: {n} chunks; decoded-text round trip fails {decodedFail} ({100.0 * decodedFail / n:F1} %; "
                 + $"{failFiles.Count}/{corpus.Files.Count} files; U+FFFD in decoded text {fffd}; mismatch confined to the first/last 3 ids {edgeOnly}); "
-                + $"file-range text round trip fails {rangeFail} ({100.0 * rangeFail / n:F1} %)");
+                + $"file-range text round trip fails {rangeFail} ({100.0 * rangeFail / n:F1} %); chunks with a special-token spelling {special}");
         }
         Console.WriteLine(violations == 0 ? "text-first invariants: OK" : $"text-first invariants: {violations} VIOLATIONS");
         return violations == 0 ? 0 : 1;
