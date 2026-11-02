@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The chunk-cache client: wire DTOs, the span hash, and the control-plane HTTP client for a dotLLM
+    server started with the chunk-cache flag (docs/CHUNK_CACHE_CLIENT.md).
+
+    LICENCE: MIT, unlike the rest of the repository (GPL-3.0-only), so that harnesses under any licence
+    can link it. That is only honest while the package stays pure HTTP plus DTOs:
+      * NO ProjectReference to any DotLLM.* project (they are GPL). The wire DTOs are this package's
+        own copies, checked against the golden contract fixtures in the test project, never shared
+        with the server.
+      * Package references limited to the BCL (and Microsoft.Extensions.AI.Abstractions once the
+        MEAI decorator lands).
+    `Package_HasNoDotLlmEngineReference` in tests/DotLLM.ChunkCache.Client.Tests enforces the first rule.
+  -->
+
+  <PropertyGroup>
+    <!-- Directory.Build.props pins a single net10.0; a client library also serves net8.0 (LTS) hosts. -->
+    <TargetFramework></TargetFramework>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <PackageId>DotLLM.ChunkCache.Client</PackageId>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <Description>Client for dotLLM's chunk-cache wire convention: span hashing, the /v1/chunk-cache control plane (capabilities, prewarm, evict, explain) and local index queries via the chunkcache CLI. Pure HTTP and DTOs; MIT-licensed.</Description>
+    <PackageTags>llm;kv-cache;chunk-cache;dotllm;agents;openai</PackageTags>
+    <!-- Unsafe code is enabled repo-wide for the engine; this package has none. -->
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="DotLLM.ChunkCache.Client.Tests" />
+  </ItemGroup>
+
+  <!-- Ship this package's own README, not the engine's repository README that Directory.Build.props packs. -->
+  <ItemGroup>
+    <None Remove="$(MSBuildThisFileDirectory)..\..\README.md" />
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>

@@ -55,6 +55,10 @@ minutes, so a brand-new version can be downloadable before `dnx` resolves it. Th
 
 Only the tool package is pushed; the `DotLLM.*` libraries are still packed (so a build proves they pack) but not published.
 
+**`DotLLM.ChunkCache.Client` is the one MIT package** (its own `PackageLicenseExpression` override; everything else is
+`GPL-3.0-only`). It stays pure HTTP plus DTOs with no reference to any GPL `DotLLM.*` project, and ships its own README
+instead of the repository's ([CHUNK_CACHE_CLIENT.md](CHUNK_CACHE_CLIENT.md)). It is packed like the others and not pushed.
+
 Availability checked on nuget.org on 2026-10-05:
 
 | Option | `dnx` invocation | Notes |
