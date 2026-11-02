@@ -1,0 +1,5 @@
+#version 450
+// GQA-grouped scalar flash-attention prefill with a position per query token (issue #1540), F32 K / V. Body: attention_flash_gqa.glsl.
+#define QPOS 1
+#extension GL_GOOGLE_include_directive : require
+#include "attention_flash_gqa.glsl"
