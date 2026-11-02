@@ -334,3 +334,21 @@ The submit gaps are ~0.1 ms x 96 = ~10 ms of a 1.0-1.8 s forward (<1%); the per-
 What is left at 512 rows is the weight-read floor: every one of the 352+ active experts per layer is read once for few rows, which is the ceiling `--prefill-chunk-size` experiments in section 1 already showed.
 
 Tooling note for next time: a `quit` line inside a probe job file makes the probe exit before later job files are read; put `quit` in its own final job.
+
+### 11.2 MTP upward depth probe (#1335): no measured end-to-end win, not shipped
+
+Implemented on branch `issue/1335-mtp-upward-probe` (PR #1536, closed unmerged): after 6 consecutive fully accepted rounds at the top K the controller raises its ceiling one step (qwen4exp declares a limit of 7) and the cost model keeps the deeper K
+only if its measured ms/token is lower; unit-tested with five mutants killed. Motivation, fixed-K sweep (UD-IQ4_XS, real Q8_0 head, greedy 192 tok, plain and MTP in one process, contended box so ratios only): the one high-acceptance
+prompt scored 1.98x (K=4) -> 2.17x (K=6) -> 2.33x (K=7), the other three prompts lost from K=5 (0.82-1.38x).
+
+End to end (`dotllm run -d vulkan --mtp-head ... -n 384 --temp 0`, UD-IQ4_XS, `DOTLLM_MTP_UPWARD_PROBE` 1 vs 0, one fresh process per run, order code1 code0 prose1 prose0 prose0 prose1 code0 code1, GPU lock + `cpu-bench` held, box otherwise idle,
+decode tok/s of the run summary):
+
+| prompt | probe on | probe off | on / off (means) |
+|---|---|---|---|
+| code (BST + unittest) | 35.64, 31.89 | 35.07, 33.39 | 0.99 (ranges overlap) |
+| prose (router training) | 29.38, 26.30 | 26.73, 26.89 | 1.04 (ranges overlap) |
+
+Verdict: within the run-to-run spread (the on-arm pairs themselves differ by 4-3.5 tok/s); no win to ship. **Path proof is missing**: `DOTLLM_MTP_TRACE` was off, so these runs do not show that the ceiling ever rose; a single request
+rarely sustains 6 fully accepted K=4 rounds (histograms in section "Making MTP a default win" show 5-of-5 accepted in about a third of rounds on the best prompt), and the benefit only exists above the fixed K=4 that the controller already starts at.
+A re-test needs a trace of the chosen K per round (or a counter) on a high-acceptance long generation; until then the fixed `MtpPreferredDraftTokens = 4` stands.
