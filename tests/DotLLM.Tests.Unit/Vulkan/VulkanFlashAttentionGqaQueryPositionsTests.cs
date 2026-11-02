@@ -141,7 +141,7 @@ public sealed class VulkanFlashAttentionGqaQueryPositionsTests
     }
 
     /// <summary>
-    /// Opt-in kernel timing, old (#1534) vs tiled, Qwen3-4B heads (32 / 8 / 128), F32 KV: <c>DOTLLM_QPOS_BENCH=1</c>. Rows are a sorted
+    /// Opt-in kernel timing, old (#1534) vs tiled, Qwen3-4B heads (32 / 8 / 128), F32 KV: <c>DOTLLM_QPOS_BENCH=1</c>. Row counts are kept small (64 / 16 / 8) so the old kernel never runs a long submit (unclean reboots correlated with 30-68 s ATTN_QPOS submits). Rows are a sorted
     /// random subset of the cache. Take the GPU lock first.
     /// </summary>
     [SkippableFact]
@@ -154,7 +154,7 @@ public sealed class VulkanFlashAttentionGqaQueryPositionsTests
         using var tiled = VulkanFlashAttentionGqaKernel.TryCreate(device, spvDir, VulkanKvStorage.F32, queryPositions: true);
         using var ordinary = VulkanFlashAttentionGqaKernel.TryCreate(device, spvDir, VulkanKvStorage.F32);
         const int H = 32, Hkv = 8, hd = 128;
-        (int kv, int rows)[] pts = { (2048, 410), (8192, 128), (16384, 64) };
+        (int kv, int rows)[] pts = { (2048, 64), (2048, 410), (8192, 128), (16384, 64) };
         string? only = Environment.GetEnvironmentVariable("DOTLLM_QPOS_BENCH_POINTS");
         int reps = int.Parse(Environment.GetEnvironmentVariable("DOTLLM_QPOS_BENCH_REPS") ?? "5");
         _out.WriteLine($"device {device.DeviceName}; tiled coopmat={tiled?.IsCoopmat}; ms per submit-and-wait (min of {reps}), per-row in us");
@@ -175,7 +175,14 @@ public sealed class VulkanFlashAttentionGqaQueryPositionsTests
                 for (int r = 0; r < reps; r++) { long t0 = Stopwatch.GetTimestamp(); a(); best = Math.Min(best, Stopwatch.GetElapsedTime(t0).TotalMilliseconds); }
                 return best;
             }
-            double tOld = Time(() => oracle.Launch(bq, bk, bv, bo, bp, rows, kv, H, Hkv, hd));
+            // The old kernel runs at most 64 rows at 2K and 8 at 8K+ (long submits correlated with unclean reboots); its per-row cost is
+            // flat in rows, so rows beyond the cap use the capped run's per-row figure.
+            int oldRows = Math.Min(rows, kv <= 2048 ? 64 : 8);
+            // A strided sample of the sorted positions keeps the visible-key distribution representative.
+            int[] oldPos = Enumerable.Range(0, oldRows).Select(i => positions[i * rows / oldRows]).ToArray();
+            using var bpOld = device.Allocate(oldRows * 4L);
+            device.Upload(MemoryMarshal.AsBytes(oldPos.AsSpan()), bpOld);
+            double tOld = Time(() => oracle.Launch(bq, bk, bv, bo, bpOld, oldRows, kv, H, Hkv, hd)) * rows / oldRows;
             double tNew = tiled is null ? double.NaN : Time(() => tiled.Launch(bq, bk, bv, bo, rows, kv, H, Hkv, hd, queryPositions: bp));
             // The ordinary prefill kernel on the same row count as a contiguous tail run (the "prefill-class" control).
             double tOrd = ordinary is null ? double.NaN : Time(() => ordinary.Launch(bq, bk, bv, bo, rows, kv, H, Hkv, hd, positionOffset: kv - rows));
