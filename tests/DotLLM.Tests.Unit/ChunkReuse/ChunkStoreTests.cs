@@ -399,7 +399,7 @@ public sealed class ChunkStoreTests : IDisposable
     [Fact]
     public void Store_HeaderBackendTag_Layout()
     {
-        // v2 header: magic, version, dtype, reserved, 64-byte key, int32 + fingerprint, then int32 + UTF-8 backend tag; the size
+        // v2 header: magic, version, dtype, reserved, 64-byte key, int32 + fingerprint, then int32 + ASCII backend tag; the size
         // helper the CLI's estimate uses equals the real file size.
         ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, "vulkan", Dtype, Tokens);
         var store = new FileChunkStore(_root);
