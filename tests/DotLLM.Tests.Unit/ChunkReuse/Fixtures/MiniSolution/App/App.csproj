@@ -8,5 +8,6 @@
     <ProjectReference Include="..\Lib\Lib.csproj" />
     <Compile Include="..\Shared\BuildInfo.cs" Link="BuildInfo.cs" />
     <Compile Include="..\Lib\LibInfo.cs" Link="LibInfo.cs" />
+    <Compile Include="..\Shared\Legacy.cs" Link="Legacy.cs" />
   </ItemGroup>
 </Project>

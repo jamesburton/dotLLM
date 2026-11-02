@@ -15,12 +15,12 @@ namespace ChunkKvLab;
 /// </summary>
 internal static class ScanInfoCommand
 {
-    public static int Run(string modelPath, string solution, string chunkerName, int chunkTokens)
+    public static int Run(string modelPath, string solution, string chunkerName, int chunkTokens, string configuration)
     {
         CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
         var sw = Stopwatch.StartNew();
-        ScanResult scan = SolutionScanner.LoadAsync(solution).GetAwaiter().GetResult();
-        Console.WriteLine($"scan {solution}: {sw.Elapsed.TotalSeconds:F1} s (workspace load, LF texts, compilations)");
+        ScanResult scan = SolutionScanner.LoadAsync(solution, new SolutionScanOptions(configuration)).GetAwaiter().GetResult();
+        Console.WriteLine($"scan {solution} ({configuration}): {sw.Elapsed.TotalSeconds:F1} s (workspace load, LF texts, compilations)");
 
         IReadOnlyList<SourceFile> authored = scan.AuthoredFiles;
         var authoredSet = authored.Select(f => f.Path).ToHashSet(StringComparer.Ordinal);

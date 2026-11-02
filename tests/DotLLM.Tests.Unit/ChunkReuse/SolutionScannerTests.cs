@@ -26,7 +26,7 @@ namespace DotLLM.Tests.Unit.ChunkReuse;
 public sealed class SolutionScannerTests : IClassFixture<SolutionScannerTests.MiniSolution>
 {
     private static readonly string[] Authored =
-        ["App/Heuristics.cs", "App/Program.cs", "Lib/Greeter.cs", "Lib/LibInfo.cs", "Shared/BuildInfo.cs", "UsesBroken/Client.cs"];
+        ["App/Heuristics.cs", "App/Program.cs", "Lib/Greeter.cs", "Lib/LibInfo.cs", "Shared/BuildInfo.cs", "Shared/Legacy.cs", "Std/Std.cs", "UsesBroken/Client.cs"];
 
     private readonly MiniSolution _mini;
 
@@ -40,7 +40,7 @@ public sealed class SolutionScannerTests : IClassFixture<SolutionScannerTests.Mi
         // generated files under obj/ (implicit global usings, assembly info) come too, flagged.
         string[] sourceTree = scan.Files.Select(f => f.Path).Where(p => !p.Contains("/obj/", StringComparison.Ordinal)).ToArray();
         Assert.Equal(new[] { "App/Generated/Stamp.g.cs", "App/Heuristics.cs", "App/Program.cs", "App/Tooling.cs", "Lib/Greeter.cs",
-            "Lib/LibInfo.cs", "Shared/BuildInfo.cs", "UsesBroken/Client.cs" }, sourceTree);
+            "Lib/LibInfo.cs", "Shared/BuildInfo.cs", "Shared/Legacy.cs", "Std/Std.cs", "UsesBroken/Client.cs" }, sourceTree);
         Assert.Contains(scan.Files, f => f.Path.StartsWith("App/obj/", StringComparison.Ordinal) && f.Path.EndsWith("GlobalUsings.g.cs", StringComparison.Ordinal));
         Assert.Contains(scan.Files, f => f.Path.StartsWith("Lib/obj/", StringComparison.Ordinal) && f.Path.EndsWith("GlobalUsings.g.cs", StringComparison.Ordinal));
         // Lib's other target framework is not scanned (its obj/ files nor its own Polyfill.cs).
@@ -59,10 +59,11 @@ public sealed class SolutionScannerTests : IClassFixture<SolutionScannerTests.Mi
 
         // Scanned projects (ordinal by project path). A file compiled by two projects belongs to the one whose directory holds
         // it (Lib/LibInfo.cs, also linked by App: Lib), else to the first by path (Shared/BuildInfo.cs: App).
-        Assert.Equal(new[] { "App/App.csproj", "Lib/Lib.csproj", "UsesBroken/UsesBroken.csproj" }, scan.Projects.Select(p => p.ProjectPath));
-        Assert.Equal(new[] { "App", "Lib(net10.0)", "UsesBroken" }, scan.Projects.Select(p => p.Name));
-        Assert.Equal(new[] { null, "net10.0", null }, scan.Projects.Select(p => p.TargetFramework));
-        Assert.Equal(new[] { "App/Generated/Stamp.g.cs", "App/Heuristics.cs", "App/Program.cs", "App/Tooling.cs", "Shared/BuildInfo.cs" },
+        Assert.Equal(new[] { "App/App.csproj", "Lib/Lib.csproj", "Std/Std.csproj", "UsesBroken/UsesBroken.csproj" }, scan.Projects.Select(p => p.ProjectPath));
+        // Preferred target, not the first by name: Lib net10.0 over netstandard2.0; Std netstandard2.1 over netstandard2.0.
+        Assert.Equal(new[] { "App", "Lib(net10.0)", "Std(netstandard2.1)", "UsesBroken" }, scan.Projects.Select(p => p.Name));
+        Assert.Equal(new[] { null, "net10.0", "netstandard2.1", null }, scan.Projects.Select(p => p.TargetFramework));
+        Assert.Equal(new[] { "App/Generated/Stamp.g.cs", "App/Heuristics.cs", "App/Program.cs", "App/Tooling.cs", "Shared/BuildInfo.cs", "Shared/Legacy.cs" },
             scan.Projects[0].Files.Where(p => !p.Contains("/obj/", StringComparison.Ordinal)));
         Assert.Equal(new[] { "Lib/Greeter.cs", "Lib/LibInfo.cs" }, scan.Projects[1].Files.Where(p => !p.Contains("/obj/", StringComparison.Ordinal)));
         Assert.Equal(scan.Files.Select(f => f.Path), scan.Projects.SelectMany(p => p.Files).Order(StringComparer.Ordinal));
@@ -96,14 +97,18 @@ public sealed class SolutionScannerTests : IClassFixture<SolutionScannerTests.Mi
     public void Scan_ProjectFailsToLoad_IsReportedInSkipped()
     {
         ScanResult scan = _mini.Scan;
-        Assert.Equal(new[] { "Broken/Broken.csproj", "Lib/Lib.csproj", "Missing/Missing.csproj", "Tool/Tool.vbproj" },
+        Assert.Equal(new[] { "Broken/Broken.csproj", "Lib/Lib.csproj", "Missing/Missing.csproj", "Std/Std.csproj", "Tool/Tool.vbproj" },
             scan.Skipped.Select(s => s.ProjectPath));
-        SkippedProject broken = scan.Skipped[0], libExtra = scan.Skipped[1], missing = scan.Skipped[2], tool = scan.Skipped[3];
+        SkippedProject broken = scan.Skipped[0], libExtra = scan.Skipped[1], missing = scan.Skipped[2], stdExtra = scan.Skipped[3], tool = scan.Skipped[4];
+        Assert.Equal(SkippedProject.ExtraTargetFramework, stdExtra.Reason);
+        Assert.Contains("Std(netstandard2.0)", stdExtra.Message, StringComparison.Ordinal);
+        Assert.Empty(stdExtra.Files);
         Assert.Equal(SkippedProject.LoadFailed, broken.Reason);
         Assert.Contains("DotLLM.Missing.Sdk", broken.Message, StringComparison.Ordinal);
         Assert.Equal(SkippedProject.ExtraTargetFramework, libExtra.Reason);
         Assert.Contains("Lib(netstandard2.0)", libExtra.Message, StringComparison.Ordinal);
-        // The files only the other target compiles are listed, not silently dropped.
+        // The files only the other target compiles are listed, not silently dropped; Shared/Legacy.cs, which only Lib's
+        // netstandard2.0 target compiles but App scans, is not lost and not listed.
         Assert.Equal(new[] { "Lib/Polyfill.cs" }, libExtra.Files);
         Assert.Contains("Lib/Polyfill.cs", libExtra.Message, StringComparison.Ordinal);
         Assert.Equal(SkippedProject.LoadFailed, missing.Reason);
@@ -130,7 +135,7 @@ public sealed class SolutionScannerTests : IClassFixture<SolutionScannerTests.Mi
     public void AttributeDiagnostics_ByQuotedProjectPath_NotBySubstring()
     {
         string root = Path.Combine(Path.GetTempPath(), "attr-sln");
-        string a = Path.Combine(root, "A", "A.csproj"), b = Path.Combine(root, "B", "B.csproj");
+        string a = Path.Combine(root, "A", "A.csproj"), b = Path.Combine(root, "B", "B.csproj"), c = Path.Combine(root, "O'Brien", "C.csproj");
         // Roslyn's spelling may differ from the solution's: case (Windows only) and separators.
         string aOther = (OperatingSystem.IsWindows() ? a.ToUpperInvariant() : a).Replace('\\', '/');
         string[] messages =
@@ -142,9 +147,11 @@ public sealed class SolutionScannerTests : IClassFixture<SolutionScannerTests.Mi
             $"Msbuild failed when processing the file '{Path.Combine(root, "X", "X.csproj")}' with message: x",         // unknown → none
             $"Projects '{a}' and '{b}' disagree.",                                                                      // two → none
             "Msbuild failed when processing the file '' with message: could not resolve SDK.",                         // empty path → none
+            $"Msbuild failed when processing the file '{c}' with message: bad.",                                       // apostrophe in path → C
         ];
         (Dictionary<string, List<string>> byProject, List<string> unattributed) =
-            SolutionScanner.AttributeDiagnostics(messages, [a, b], m => m, p => p);
+            SolutionScanner.AttributeDiagnostics(messages, [a, b, c], m => m, p => p);
+        Assert.Equal(new[] { messages[7] }, byProject[c]);
         Assert.Equal(new[] { messages[0] }, byProject[a]);
         Assert.Equal(new[] { messages[3] }, byProject[b]);
         Assert.Equal(new[] { messages[1], messages[2], messages[4], messages[5], messages[6] }, unattributed);
@@ -181,6 +188,20 @@ public sealed class SolutionScannerTests : IClassFixture<SolutionScannerTests.Mi
     }
 
     [Fact]
+    public async Task Scan_Configuration_DebugByDefault_ReleaseOnRequest()
+    {
+        string app = Path.Combine(_mini.Root, "App", "App.csproj");
+        ScanResult debug = await SolutionScanner.LoadAsync(app), release = await SolutionScanner.LoadAsync(app, new SolutionScanOptions("Release"));
+        IReadOnlyCollection<string> Symbols(ScanResult s) => s.Projects.Single(p => p.Name == "App").Compilation.Trees["Program.cs"].Options.PreprocessorSymbolNames.ToArray();
+        Assert.Contains("DEBUG", Symbols(debug));
+        Assert.DoesNotContain("RELEASE", Symbols(debug));
+        Assert.Contains("RELEASE", Symbols(release));
+        Assert.DoesNotContain("DEBUG", Symbols(release));
+        Assert.Contains(release.Files, f => f.Path.StartsWith("obj/Release/", StringComparison.Ordinal));
+        Assert.DoesNotContain(release.Files, f => f.Path.StartsWith("obj/Debug/", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task Scan_Cancelled_Throws()
     {
         using var cts = new CancellationTokenSource();
@@ -211,7 +232,13 @@ public sealed class SolutionScannerTests : IClassFixture<SolutionScannerTests.Mi
     [InlineData("A.cs", "//------\n// <autogenerated />\n//------\nusing System;\nclass A { }", true)]
     [InlineData("A.cs", "/* <auto-generated> */ class A { }", true)]
     [InlineData("A.cs", "[System.CodeDom.Compiler.GeneratedCodeAttribute(\"t\", \"1\")]\nclass A { }", true)]
-    [InlineData("A.cs", "class A { [GeneratedCode(\"t\", \"1\")] void M() { } }", true)]
+    [InlineData("A.cs", "class A { [GeneratedCode(\"t\", \"1\")] void M() { } }", false)]               // one member: not the file
+    [InlineData("A.cs", "[assembly: System.CodeDom.Compiler.GeneratedCode(\"t\", \"1\")]\nclass A { }", true)]
+    [InlineData("A.cs", "/// <auto-generated/>\nclass A { }", true)]                                         // doc-comment header
+    [InlineData("A.cs", "#nullable enable\n// <auto-generated/>\nclass A { }", true)]
+    [InlineData("A.cs", "#pragma warning disable\n// <auto-generated/>\nclass A { }", true)]
+    [InlineData("A.cs", "\uFEFF// <auto-generated/>\nclass A { }", true)]                                     // BOM
+    [InlineData("A.cs", "//------\r\n// <auto-generated>\r\n//------\r\nclass A { }", true)]                   // CRLF
     [InlineData("A.cs", "class A { const string S = \"[GeneratedCode(\\\"t\\\")]\"; }", false)]
     [InlineData("A.cs", "class A { const string S = \"<auto-generated>\"; }", false)]
     [InlineData("A.cs", "using System;\n// <auto-generated/> mentioned below the first token\nclass A { }", false)]
@@ -352,6 +379,7 @@ public sealed class SolutionScannerTests : IClassFixture<SolutionScannerTests.Mi
                 CaseVariantLink = !string.Equals(text, File.ReadAllText(appProject), StringComparison.Ordinal);
             }
             await RunDotnetAsync("restore", Path.Combine("App", "App.csproj"), "--nologo", "-v", "q");
+            await RunDotnetAsync("restore", Path.Combine("Std", "Std.csproj"), "--nologo", "-v", "q");
             Scan = await SolutionScanner.LoadAsync(Path.Combine(Root, "MiniSolution.slnx"));
         }
 

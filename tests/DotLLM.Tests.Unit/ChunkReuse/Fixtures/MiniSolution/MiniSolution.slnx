@@ -4,6 +4,7 @@
   <Project Path="Broken/Broken.csproj" />
   <!-- Listed but absent on purpose (SolutionScannerTests). -->
   <Project Path="Missing/Missing.csproj" />
+  <Project Path="Std/Std.csproj" />
   <Project Path="Tool/Tool.vbproj" />
   <Project Path="UsesBroken/UsesBroken.csproj" />
 </Solution>
