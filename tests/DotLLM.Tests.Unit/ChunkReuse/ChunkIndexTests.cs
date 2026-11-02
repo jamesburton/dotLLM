@@ -255,6 +255,257 @@ public sealed class ChunkIndexTests : IDisposable
         Assert.NotNull(ChunkIndex.Load(path, KeyA).LoadNote);
     }
 
+    // ---------------------------------------------------------------- review fixes (S3-S7, N1)
+
+    [Fact]
+    public void Edit_RepeatedBlockInOneFile_MatchesAsMultiset()
+    {
+        var chunker = new FixedSizeChunker(new CharTokenizer(), chunkTokens: 10);
+        const string A = "aaaaaaaaa\n", B = "bbbbbbbbb\n";
+        var index = new ChunkIndex(KeyA);
+        index.Update([new SourceFile("R.txt", A + A + A + B)], chunker);
+        Assert.Equal(2, index.DistinctKeyCount);
+
+        // One more copy of the repeated block: exactly one chunk is new to the file, although its key was already there.
+        IndexDiff more = index.Update([new SourceFile("R.txt", A + A + A + A + B)], chunker);
+        ChunkRef added = Assert.Single(more.Added);
+        Assert.Equal(KeyA(A.Select(c => (int)c).ToArray()).Hex, added.KeyHex);
+        Assert.Equal(4, more.Unchanged.Count);
+        Assert.Empty(more.Removed);
+
+        // And one copy fewer than at the start: two of the four go, no orphan (the key is still used twice).
+        IndexDiff fewer = index.Update([new SourceFile("R.txt", A + A + B)], chunker);
+        Assert.Equal(2, fewer.Removed.Count);
+        Assert.Empty(fewer.Added);
+        Assert.Empty(fewer.OrphanedKeys);
+    }
+
+    [Fact]
+    public void MoveAcrossFiles_InOneUpdate_IsAddedButNeedsNoEncodingAndIsNotOrphaned()
+    {
+        var chunker = new FixedSizeChunker(new CharTokenizer(), chunkTokens: 10);
+        const string X = "XXXXXXXXX\n", A = "AAAAAAAAA\n", B = "BBBBBBBBB\n", Z = "ZZZZZZZZZ\n";
+        var index = new ChunkIndex(KeyA);
+        IndexDiff first = index.Update([new SourceFile("A.txt", X + A), new SourceFile("B.txt", B)], chunker);
+        var store = new KeySetStore();
+        foreach (ChunkRef r in first.Added) store.Add(r.Key!.Value);
+
+        // X moves from A to B, and both files gain the same new block Z.
+        IndexDiff move = index.Update([new SourceFile("A.txt", A + Z), new SourceFile("B.txt", B + X + Z)], chunker);
+        Assert.Contains(move.Added, r => string.Equals(r.FilePath, "B.txt", StringComparison.Ordinal)
+            && string.Equals(r.KeyHex, KeyA(X.Select(c => (int)c).ToArray()).Hex, StringComparison.Ordinal));
+        Assert.Empty(move.OrphanedKeys); // X is still referenced (by B)
+        ChunkRef need = Assert.Single(move.NeedsEncoding(store)); // X is stored; Z is needed once, not twice
+        Assert.Equal(KeyA(Z.Select(c => (int)c).ToArray()).Hex, need.KeyHex);
+        Assert.Equal(10, need.TokenCount);
+    }
+
+    [Fact]
+    public void EvictableOrphans_RespectOtherIndexesUnderTheStore()
+    {
+        var store = new FileChunkStore(_root);
+        var symbol = new SymbolChunker(new CharTokenizer(), maxChunkTokens: 4096);
+        var fixedChunker = new FixedSizeChunker(new CharTokenizer(), chunkTokens: 4096);
+        var file = new SourceFile("S.cs", "class C { }\n"); // one chunk under both chunkers: the same tokens, the same key
+        var symIndex = new ChunkIndex(KeyA);
+        var fixIndex = new ChunkIndex(KeyA);
+        symIndex.Update([file], symbol);
+        fixIndex.Update([file], fixedChunker);
+        Assert.Equal(symIndex.ChunksOf("S.cs")[0].KeyHex, fixIndex.ChunksOf("S.cs")[0].KeyHex);
+        symIndex.Save(ChunkIndex.DefaultPath(store.Root, symbol.Name));
+        fixIndex.Save(ChunkIndex.DefaultPath(store.Root, fixedChunker.Name));
+
+        IndexDiff deleted = symIndex.Update([], symbol);
+        ChunkKey orphan = Assert.Single(deleted.OrphanedKeys); // orphaned within the symbol index...
+        Assert.Contains(orphan, ChunkIndex.ReferencedKeysUnder(store.Root));
+        Assert.Empty(symIndex.EvictableOrphans(deleted, store.Root)); // ...but the fixed index still uses it
+
+        // The symbol index's own (stale) file does not protect the key; another index's file does.
+        File.Delete(ChunkIndex.DefaultPath(store.Root, fixedChunker.Name));
+        Assert.Equal([orphan], symIndex.EvictableOrphans(deleted, store.Root));
+
+        // An unreadable index under the store: eviction cannot be decided, so it throws rather than guess.
+        File.WriteAllText(Path.Combine(store.Root, "index-other-1.json"), "{ not json");
+        Assert.Throws<InvalidDataException>(() => symIndex.EvictableOrphans(deleted, store.Root));
+    }
+
+    public static TheoryData<string> BadIndexFiles() => new()
+    {
+        "version", "file-null", "path-null", "sha-bad", "chunks-null", "chunk-null", "key-bad", "duplicate-path",
+        "offset-inverted", "offset-gap", "line-inverted", "line-zero", "tokens-negative", "chunker-null", "path-rooted",
+    };
+
+    [Theory]
+    [MemberData(nameof(BadIndexFiles))]
+    public void Load_MalformedOrOtherVersion_IsEmptyWithNote(string defect)
+    {
+        Directory.CreateDirectory(_root);
+        string path = Path.Combine(_root, "index-fixed-10.json");
+        File.WriteAllText(path, IndexJson("valid"));
+        ChunkIndex ok = ChunkIndex.Load(path, KeyA);
+        Assert.Null(ok.LoadNote);
+        Assert.Equal(2, ok.ChunksOf("A.txt").Count);
+
+        File.WriteAllText(path, IndexJson(defect));
+        ChunkIndex bad = ChunkIndex.Load(path, KeyA);
+        Assert.NotNull(bad.LoadNote);
+        Assert.Empty(bad.Paths);
+        Assert.Equal(0, bad.DistinctKeyCount);
+    }
+
+    private static string IndexJson(string defect)
+    {
+        string producer = KeyA([]).Hex;
+        string k1 = KeyA([1]).Hex, k2 = KeyA([2]).Hex, sha = new string('a', 64);
+        string c1 = defect switch
+        {
+            "offset-inverted" => $$"""{"startLine":1,"endLine":1,"startOffset":0,"endOffset":0,"tokens":10,"key":"{{k1}}"}""",
+            "line-inverted" => $$"""{"startLine":2,"endLine":1,"startOffset":0,"endOffset":10,"tokens":10,"key":"{{k1}}"}""",
+            "line-zero" => $$"""{"startLine":0,"endLine":1,"startOffset":0,"endOffset":10,"tokens":10,"key":"{{k1}}"}""",
+            "tokens-negative" => $$"""{"startLine":1,"endLine":1,"startOffset":0,"endOffset":10,"tokens":-1,"key":"{{k1}}"}""",
+            "key-bad" => """{"startLine":1,"endLine":1,"startOffset":0,"endOffset":10,"tokens":10,"key":"XYZ"}""",
+            "chunk-null" => "null",
+            _ => $$"""{"startLine":1,"endLine":1,"startOffset":0,"endOffset":10,"tokens":10,"key":"{{k1}}"}""",
+        };
+        string c2 = defect is "offset-gap"
+            ? $$"""{"startLine":2,"endLine":2,"startOffset":11,"endOffset":20,"tokens":10,"key":"{{k2}}"}"""
+            : $$"""{"startLine":2,"endLine":2,"startOffset":10,"endOffset":20,"tokens":10,"key":"{{k2}}"}""";
+        string chunks = defect is "chunks-null" ? "null" : $"[{c1},{c2}]";
+        string filePath = defect switch { "path-null" => "null", "path-rooted" => "\"/abs/A.txt\"", _ => "\"A.txt\"" };
+        string file = $$"""{"path":{{filePath}},"sha256":"{{(defect is "sha-bad" ? "nothex" : sha)}}","chunks":{{chunks}}}""";
+        string files = defect switch
+        {
+            "file-null" => $"[{file},null]",
+            "duplicate-path" => $$"""[{{file}},{"path":"A.txt","sha256":"{{sha}}","chunks":[]}]""",
+            _ => $"[{file}]",
+        };
+        string chunker = defect is "chunker-null" ? "null" : "\"fixed-10\"";
+        int version = defect is "version" ? ChunkIndex.FormatVersion + 1 : ChunkIndex.FormatVersion;
+        return $$"""{"formatVersion":{{version}},"producer":"{{producer}}","chunker":{{chunker}},"files":{{files}}}""";
+    }
+
+    [Fact]
+    public async Task Save_WhileAReaderHoldsTheIndex_Succeeds()
+    {
+        var chunker = new FixedSizeChunker(new CharTokenizer(), chunkTokens: 10);
+        Directory.CreateDirectory(_root);
+        string path = Path.Combine(_root, "index-fixed-10.json");
+        var index = new ChunkIndex(KeyA);
+        index.Update([new SourceFile("A.txt", "012345678\n")], chunker);
+        index.Save(path);
+
+        index.Update([new SourceFile("A.txt", "012345678\nmore\n")], chunker);
+        Task save;
+        using (FileStream reader = ChunkIndex.OpenForRead(path)) // the share mode Load uses
+        {
+            save = Task.Run(() => index.Save(path)); // waits while the reader holds the file
+            await Task.Delay(150);
+            Assert.Single(ChunkIndex.Load(path, KeyA).ChunksOf("A.txt")); // a second reader still sees the old file
+        }
+        await save.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(2, ChunkIndex.Load(path, KeyA).ChunksOf("A.txt").Count);
+        Assert.Single(Directory.GetFiles(_root)); // no temp file left
+
+        // A reader that never lets go: Save gives up with an error and the old file stays intact.
+        TimeSpan budget = ChunkIndex.SaveRetryBudget;
+        ChunkIndex.SaveRetryBudget = TimeSpan.FromMilliseconds(100);
+        try
+        {
+            using FileStream stuck = ChunkIndex.OpenForRead(path);
+            index.Update([new SourceFile("A.txt", "x\n")], chunker);
+            if (OperatingSystem.IsWindows()) Assert.ThrowsAny<IOException>(() => index.Save(path));
+            else index.Save(path); // POSIX rename replaces an open file; the reader keeps the old inode
+        }
+        finally
+        {
+            ChunkIndex.SaveRetryBudget = budget;
+        }
+        if (OperatingSystem.IsWindows()) Assert.Equal(2, ChunkIndex.Load(path, KeyA).ChunksOf("A.txt").Count);
+        Assert.Single(Directory.GetFiles(_root));
+    }
+
+    [Fact]
+    public void Paths_AreNormalised()
+    {
+        var chunker = new FixedSizeChunker(new CharTokenizer(), chunkTokens: 10);
+        var index = new ChunkIndex(KeyA);
+        index.Update([new SourceFile("src/A.cs", "0123456789")], chunker);
+
+        IndexDiff again = index.Update([new SourceFile("src\\A.cs", "0123456789"), new SourceFile("./src/B.cs", "b")], chunker,
+            removeMissingFiles: false);
+        Assert.Empty(again.Removed);
+        Assert.Equal(["src/A.cs", "src/B.cs"], index.Paths);
+        Assert.Equal("src/B.cs", Assert.Single(again.Added).FilePath);
+        Assert.Single(index.ChunksOf("src\\A.cs"));
+        Assert.Equal("src/A.cs", ChunkIndex.NormalizePath(".\\src\\A.cs"));
+
+        if (OperatingSystem.IsWindows())
+        {
+            IndexDiff cased = index.Update([new SourceFile("SRC/a.cs", "0123456789")], chunker, removeMissingFiles: false);
+            Assert.Empty(cased.Added);
+            Assert.Equal(2, index.Paths.Count);
+            Assert.True(index.Contains("Src/A.CS"));
+        }
+
+        Assert.Throws<ArgumentException>(() => index.Update([new SourceFile("/abs/A.cs", "x")], chunker, removeMissingFiles: false));
+        Assert.Throws<ArgumentException>(() => index.Update([new SourceFile("C:/abs/A.cs", "x")], chunker, removeMissingFiles: false));
+        Assert.Throws<ArgumentException>(() => index.Update([new SourceFile("src/../A.cs", "x")], chunker, removeMissingFiles: false));
+        Assert.Throws<ArgumentException>(() => index.Update([new SourceFile("src/A.cs", "x"), new SourceFile("src\\A.cs", "x")], chunker));
+    }
+
+    [Fact]
+    public void ChunkRef_Json_RoundTrips_WithKindAsNameAndNoComputedProperties()
+    {
+        ChunkRef[] refs =
+        [
+            new("src/A.cs", 3, 9, 40, 180, ChunkKind.Symbol) { TokenCount = 37, KeyHex = KeyA([1, 2]).Hex },
+            new("src/B.cs", 1, 4, 0, 60, ChunkKind.Fixed), // selection made before tokenisation: no count, no key
+        ];
+        string json = System.Text.Json.JsonSerializer.Serialize(refs.ToList(), ChunkRefJsonContext.Default.ListChunkRef);
+        Assert.Contains("\"kind\":\"Symbol\"", json, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"id\"", json, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"key\"", json, StringComparison.Ordinal);
+        List<ChunkRef> back = System.Text.Json.JsonSerializer.Deserialize(json, ChunkRefJsonContext.Default.ListChunkRef)!;
+        Assert.Equal(refs, back);
+    }
+
+    [Fact]
+    public void KindOf_UnknownChunker_IsOther_AndIndexes()
+    {
+        var lines = new LineChunker();
+        Assert.Equal(ChunkKind.Other, ChunkRef.KindOf(lines));
+        var index = new ChunkIndex(KeyA);
+        IndexDiff diff = index.Update([new SourceFile("A.txt", "one\ntwo\n")], lines);
+        Assert.Equal(2, diff.Added.Count);
+        Assert.All(diff.Added, r => Assert.Equal(ChunkKind.Other, r.Kind));
+        string path = Path.Combine(_root, "index-lines.json");
+        index.Save(path);
+        ChunkIndex loaded = ChunkIndex.Load(path, KeyA);
+        Assert.Null(loaded.LoadNote);
+        Assert.Equal(index.ChunksOf("A.txt"), loaded.ChunksOf("A.txt"));
+    }
+
+    /// <summary>One chunk per line (a chunker that is neither symbol nor fixed).</summary>
+    private sealed class LineChunker : IChunker
+    {
+        public string Name => "lines";
+        public int MaxChunkTokens => int.MaxValue;
+        public IReadOnlyList<Chunk> Chunk(SourceFile file)
+        {
+            var chunks = new List<Chunk>();
+            int start = 0, line = 1;
+            while (start < file.Text.Length)
+            {
+                int end = file.Text.IndexOf('\n', start);
+                end = end < 0 ? file.Text.Length : end + 1;
+                chunks.Add(new Chunk(file.Path, line, line, file.Text[start..end].Select(c => (int)c).ToArray()) { StartOffset = start, EndOffset = end });
+                start = end;
+                line++;
+            }
+            return chunks;
+        }
+    }
+
     /// <summary>In-memory store of keys only (status needs <see cref="IChunkStore.Contains"/>).</summary>
     private sealed class KeySetStore : IChunkStore
     {

@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using DotLLM.ChunkReuse.CodeCorpus;
 
 namespace DotLLM.ChunkReuse.Store;
@@ -10,6 +11,9 @@ public enum ChunkKind
 
     /// <summary>One member per chunk from the Roslyn syntax tree (<see cref="SymbolChunker"/>); whole lines.</summary>
     Symbol = 1,
+
+    /// <summary>Any other chunker (its name is neither <c>symbol-*</c> nor <c>fixed-*</c>).</summary>
+    Other = 2,
 }
 
 /// <summary>
@@ -24,6 +28,23 @@ public enum ChunkKind
 /// <param name="StartOffset">Character offset of the chunk's first character in the file text (inclusive).</param>
 /// <param name="EndOffset">Character offset just past the chunk's last character (exclusive).</param>
 /// <param name="Kind">The chunking that produced it.</param>
+/// <remarks>
+/// <para>
+/// <b>Identity.</b> <see cref="Id"/> is a <i>location</i> (path, lines, offset), not content: a chunk whose text is unchanged
+/// gets a new <see cref="Id"/> when an edit above it moves its lines, and two locations with the same text share one
+/// <see cref="KeyHex"/>. Use <see cref="KeyHex"/> for "same K/V" and <see cref="Id"/> for "same place"; never use
+/// <see cref="Id"/> as a cache key.
+/// </para>
+/// <para>
+/// <b>Equality.</b> Record equality compares every field, including <see cref="TokenCount"/> and <see cref="KeyHex"/>, so a
+/// reference made before tokenisation (both null) is not equal to the index's reference for the same place; compare by
+/// <see cref="Id"/> for that.
+/// </para>
+/// <para>
+/// <b>JSON.</b> Serialise with <see cref="ChunkRefJsonContext"/> (camelCase, <see cref="Kind"/> as its name, the computed
+/// <see cref="Key"/> and <see cref="Id"/> omitted; trimming/AOT safe).
+/// </para>
+/// </remarks>
 public sealed record ChunkRef(string FilePath, int StartLine, int EndLine, int StartOffset, int EndOffset, ChunkKind Kind)
 {
     /// <summary>Number of token ids in the chunk, or null when not known (e.g. a selection made before tokenisation).</summary>
@@ -33,9 +54,11 @@ public sealed record ChunkRef(string FilePath, int StartLine, int EndLine, int S
     public string? KeyHex { get; init; }
 
     /// <summary>The key, when <see cref="KeyHex"/> is known.</summary>
+    [JsonIgnore]
     public ChunkKey? Key => KeyHex is null ? null : new ChunkKey(KeyHex);
 
-    /// <summary>Same id as <see cref="Chunk.Id"/>: path, line range and start offset.</summary>
+    /// <summary>Location id, same format as <see cref="Chunk.Id"/>: <c>path:startLine-endLine@startOffset</c> (not content identity).</summary>
+    [JsonIgnore]
     public string Id => $"{FilePath}:{StartLine}-{EndLine}@{StartOffset}";
 
     /// <summary>A reference to <paramref name="chunk"/>, with its token count and (optionally) its key.</summary>
@@ -53,15 +76,33 @@ public sealed record ChunkRef(string FilePath, int StartLine, int EndLine, int S
         };
     }
 
-    /// <summary>The kind of the chunks <paramref name="chunker"/> produces (from its name: <c>symbol-*</c> or <c>fixed-*</c>).</summary>
+    /// <summary>The kind of the chunks <paramref name="chunker"/> produces.</summary>
     /// <param name="chunker">A chunker.</param>
-    /// <returns>Its kind.</returns>
-    /// <exception cref="ArgumentException">The chunker is neither a symbol nor a fixed-size chunker.</exception>
+    /// <returns><see cref="ChunkKind.Symbol"/> or <see cref="ChunkKind.Fixed"/> by name prefix, else <see cref="ChunkKind.Other"/>.</returns>
     public static ChunkKind KindOf(IChunker chunker)
     {
         ArgumentNullException.ThrowIfNull(chunker);
-        if (chunker.Name.StartsWith("symbol-", StringComparison.Ordinal)) return ChunkKind.Symbol;
-        if (chunker.Name.StartsWith("fixed-", StringComparison.Ordinal)) return ChunkKind.Fixed;
-        throw new ArgumentException($"Chunker '{chunker.Name}' is neither symbol-* nor fixed-*.", nameof(chunker));
+        return KindOfName(chunker.Name);
+    }
+
+    /// <summary>The kind for a chunker name (<c>symbol-*</c>, <c>fixed-*</c>, anything else is <see cref="ChunkKind.Other"/>).</summary>
+    /// <param name="chunkerName">Chunker name.</param>
+    /// <returns>The kind.</returns>
+    public static ChunkKind KindOfName(string chunkerName)
+    {
+        ArgumentNullException.ThrowIfNull(chunkerName);
+        if (chunkerName.StartsWith("symbol-", StringComparison.Ordinal)) return ChunkKind.Symbol;
+        if (chunkerName.StartsWith("fixed-", StringComparison.Ordinal)) return ChunkKind.Fixed;
+        return ChunkKind.Other;
     }
 }
+
+/// <summary>
+/// Source-generated JSON contract for <see cref="ChunkRef"/> (camelCase; <see cref="ChunkKind"/> written as its name;
+/// <see cref="ChunkRef.Key"/> and <see cref="ChunkRef.Id"/> are computed and not written).
+/// </summary>
+[JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase, UseStringEnumConverter = true,
+    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
+[JsonSerializable(typeof(ChunkRef))]
+[JsonSerializable(typeof(List<ChunkRef>))]
+public sealed partial class ChunkRefJsonContext : JsonSerializerContext;
