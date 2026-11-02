@@ -307,6 +307,17 @@ public sealed class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTests.Fixtur
         Assert.Contains(sc, c => c.GetProperty("reason").GetString() == "caller" && c.GetProperty("path").GetString() == "src/Shapes.cs" && c.GetProperty("hop").GetInt32() == 1);
         Assert.Contains(sc, c => c.GetProperty("path").GetString() == "src/Shapes.cs" && !c.GetProperty("stored").GetBoolean());
 
+        // Order: Circle's definition (src/Shapes.cs) ranks first, but its callees in src/Calc.cs come first in document order.
+        JsonElement[] rank = Json(Cli(["select", "--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64", "--symbol", "Circle", "--order", "rank", "--json"]))
+            .GetProperty("chunks").EnumerateArray().ToArray();
+        JsonElement[] doc = Json(Cli(["select", "--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64", "--symbol", "Circle", "--json"]))
+            .GetProperty("chunks").EnumerateArray().ToArray();
+        Assert.Equal("definition", rank[0].GetProperty("reason").GetString());
+        Assert.Equal("src/Shapes.cs", rank[0].GetProperty("path").GetString());
+        Assert.Equal("src/Calc.cs", doc[0].GetProperty("path").GetString());
+        Assert.Equal(rank.Select(c => c.GetProperty("priority").GetInt32()).OrderDescending(), rank.Select(c => c.GetProperty("priority").GetInt32()));
+        Assert.Equal(rank.Select(c => c.GetProperty("id").GetString()).Order(StringComparer.Ordinal), doc.Select(c => c.GetProperty("id").GetString()).Order(StringComparer.Ordinal));
+
         // Budget: strict prefix of the rank, trimmed count reported.
         long all = sym.GetProperty("selected_tokens").GetInt64();
         JsonElement budget = Json(Cli(["select", "--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64", "--symbol", "Calc.Mul", "--budget", (all - 1).ToString(System.Globalization.CultureInfo.InvariantCulture), "--json", "--order", "rank"]));
