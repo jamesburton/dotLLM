@@ -64,7 +64,8 @@ internal static class SelectCommand
             }
             foreach (string n in result.Notes) Console.WriteLine($"  note: {n}");
             foreach (string u in result.UnmatchedPatterns) Console.WriteLine($"  unmatched pattern: {u}");
-            if (result.UnmatchedChangedFiles.Count > 0) Console.WriteLine($"  changed files with no chunk: {result.UnmatchedChangedFiles.Count}");
+            if (result.UnmatchedChangedFiles.Count > 0)
+                Console.WriteLine($"  changed files with no chunk ({result.UnmatchedChangedFiles.Count}): {string.Join(", ", result.UnmatchedChangedFiles.Take(20))}");
             if (r.TokenBudget is not null)
             {
                 Console.WriteLine($"  first {Math.Min(show, result.Count)} selected (rank order):");

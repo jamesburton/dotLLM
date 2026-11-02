@@ -80,11 +80,14 @@ public static class SelectionPriority
     /// <summary><see cref="SelectionReason.DefinitionBody"/>.</summary>
     public const int DefinitionBody = 900;
 
-    /// <summary><see cref="SelectionReason.Changed"/>.</summary>
-    public const int Changed = 800;
+    /// <summary>
+    /// <see cref="SelectionReason.Path"/>. Above <see cref="Changed"/>: a glob names the files the caller wants, while a git
+    /// range often sweeps in unrelated files (a merge, a refactor), so under a budget the named files are kept first.
+    /// </summary>
+    public const int Path = 800;
 
-    /// <summary><see cref="SelectionReason.Path"/>.</summary>
-    public const int Path = 700;
+    /// <summary><see cref="SelectionReason.Changed"/>.</summary>
+    public const int Changed = 700;
 
     /// <summary>A neighbour (<see cref="SelectionReason.Caller"/> / <see cref="SelectionReason.Callee"/>) at <paramref name="hop"/> ≥ 1: <c>600 - hop</c>.</summary>
     public static int Neighbour(int hop) => 600 - hop;

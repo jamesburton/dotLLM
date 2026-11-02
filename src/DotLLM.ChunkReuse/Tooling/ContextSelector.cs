@@ -28,7 +28,7 @@ namespace DotLLM.ChunkReuse.Tooling;
 /// </para>
 /// <para>
 /// <b>Rank and trim order.</b> Candidates are ranked by <see cref="SelectedChunk.Priority"/> descending
-/// (<see cref="SelectionPriority"/>: definition 1000 &gt; definition body 900 &gt; changed 800 &gt; path 700 &gt; neighbour at hop
+/// (<see cref="SelectionPriority"/>: definition 1000 &gt; definition body 900 &gt; path 800 &gt; changed 700 &gt; neighbour at hop
 /// h 600−h), then <see cref="SelectedChunk.Weight"/> descending (edges to the previous hop), then path (ordinal), then start
 /// offset. Under <see cref="SelectionRequest.TokenBudget"/> the selection is the longest prefix of that ranking whose tokens fit:
 /// the lowest-ranked candidates are trimmed first, and trimming is strict — once a candidate does not fit, nothing ranked

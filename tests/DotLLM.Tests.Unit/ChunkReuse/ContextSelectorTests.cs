@@ -338,6 +338,13 @@ public sealed class ContextSelectorTests
         });
         Assert.Equal(["README.md", "src/Gone.cs"], r.UnmatchedChangedFiles);
 
+        // An explicit path outranks a changed file under a budget (a git range can sweep in unrelated files).
+        r = ContextSelector.Select(new SelectionRequest { ChangedSince = "origin/main", Paths = ["src/Lib/Unused.cs"], TokenBudget = fx.Tokens("Lonely") },
+            fx.Files, fx.Graph, git, Root);
+        Assert.Equal(Ids(fx.With("Lonely")), Ids(r));
+        Assert.True(SelectionPriority.Path > SelectionPriority.Changed);
+        Assert.Equal(["src/App/Top.cs"], Files(r.Trimmed));
+
         // A path from git that differs only in case is the same file on Windows.
         if (OperatingSystem.IsWindows())
         {
@@ -410,7 +417,7 @@ public sealed class ContextSelectorTests
             Assert.Equal(rb.Selected.Sum(c => (long)c.Tokens), rb.SelectedTokens);
         }
 
-        // Rank order: priority never increases; an explicit path (700) outranks a hop-1 neighbour (599).
+        // Rank order: priority never increases; an explicit path (800) outranks a hop-1 neighbour (599).
         Assert.True(full.Zip(full.Skip(1)).All(p => p.First.Priority >= p.Second.Priority));
         int lonely = fx.Tokens("Lonely");
         r = ContextSelector.Select(request with { Paths = ["src/Lib/Unused.cs"], TokenBudget = fx.Tokens("int Twice(") + lonely }, fx.Files, fx.Graph);
