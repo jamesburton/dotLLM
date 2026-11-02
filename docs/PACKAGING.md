@@ -57,7 +57,8 @@ Only the tool package is pushed; the `DotLLM.*` libraries are still packed (so a
 
 **`DotLLM.ChunkCache.Client` is the one MIT package** (its own `PackageLicenseExpression` override and
 `src/DotLLM.ChunkCache.Client/LICENSE`; everything else is `GPL-3.0-only`). It stays pure HTTP plus DTOs with no reference to
-any GPL `DotLLM.*` project, and ships its own README and LICENSE instead of the repository's
+any GPL `DotLLM.*` project; its one package dependency is `Microsoft.Extensions.AI.Abstractions` (MIT, pinned in
+`Directory.Packages.props`), which on `net8.0` brings `System.Text.Json` 10.x with it. It ships its own README and LICENSE instead of the repository's
 ([CHUNK_CACHE_CLIENT.md](CHUNK_CACHE_CLIENT.md)). Like every library it is **not pushed to nuget.org** (`push-nuget` pushes only
 `$DOTLLM_TOOL_PACKAGE_ID`), but it **is published as a GitHub release asset**: `release.yml`'s `pack-nuget` runs `dotnet pack`
 over the whole repository, `create-release` attaches (and attests) every `*.nupkg` / `*.snupkg`, and `ci.yml` calls that
