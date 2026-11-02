@@ -240,33 +240,40 @@ public sealed class CorpusTests : IDisposable
     // ---------------------------------------------------------------------------------------------------------------
 
     [Fact]
-    public void FixedSizeChunker_DecodeDropsACharacter_ChunksStillTileTheFile()
+    public void FixedSizeChunker_EncodeStripsACharacter_ChunksTileAndMatchTheirIds()
     {
-        // The Qwen BPE decode drops U+FDD0 (src/DotLLM.Tokenizers/ControlTokenGuard.cs in dotLLM): the decode-based offsets fall
-        // one short, and before the fix the last chunk ended before the text did, so ChunkIndex.Update refused the file.
-        var tok = new DroppingTokenizer('﷐');
-        string text = "class A {\n  const string S = \"﷐\";\n}\n" + new string('x', 40) + "\n";
+        // dotLLM's encoder strips U+FDD0 (ControlTokenGuard.Marker) on every encode, so the ids never represent it
+        // (src/DotLLM.Tokenizers/ControlTokenGuard.cs in dotLLM; found on its own ControlTokenGuard.cs). Offsets derived from
+        // decoded lengths then fell short: the last chunk ended before the text (ChunkIndex.Update refused the file) and
+        // every chunk after the marker was shifted. Now the chunks tile the file and each chunk's text is exactly its ids'
+        // text plus any stripped markers.
+        const char marker = (char)0xFDD0;
+        var tok = new StrippingTokenizer(marker);
+        const char nl = '\n';
+        string text = "class A {" + nl + "  const string S = \"" + marker + marker + "\";" + nl + "}" + nl + new string('x', 40) + nl + marker + "y" + nl;
         IReadOnlyList<Chunk> chunks = new FixedSizeChunker(tok, 16).Chunk(new SourceFile("a.cs", text));
         Assert.True(chunks.Count > 2);
         Assert.Equal(0, chunks[0].StartOffset);
         for (int i = 1; i < chunks.Count; i++) Assert.Equal(chunks[i - 1].EndOffset, chunks[i].StartOffset);
         Assert.Equal(text.Length, chunks[^1].EndOffset);
+        foreach (Chunk c in chunks)
+            Assert.Equal(tok.Decode(c.TokenIds), text[c.StartOffset..c.EndOffset].Replace(marker.ToString(), "", StringComparison.Ordinal));
         var index = new DotLLM.ChunkReuse.Store.ChunkIndex(ids => DotLLM.ChunkReuse.Store.ChunkKey.Create("fp", "tok", default, "cpu",
             DotLLM.ChunkReuse.Store.KvDtype.F32, ids));
         index.Update([new SourceFile("a.cs", text)], new FixedSizeChunker(tok, 16)); // throws on a non-tiling chunker
     }
 
-    /// <summary><see cref="CharTokenizer"/> whose decode drops one character.</summary>
-    private sealed class DroppingTokenizer(char dropped) : ITokenizer
+    /// <summary><see cref="CharTokenizer"/> whose encode strips one character (as dotLLM's ControlTokenGuard does).</summary>
+    private sealed class StrippingTokenizer(char stripped) : ITokenizer
     {
         private readonly CharTokenizer _inner = new();
-        public int[] Encode(string text) => _inner.Encode(text);
-        public string Decode(ReadOnlySpan<int> tokenIds) => _inner.Decode(tokenIds).Replace(dropped.ToString(), "", StringComparison.Ordinal);
+        public int[] Encode(string text) => _inner.Encode(text.Replace(stripped.ToString(), "", StringComparison.Ordinal));
+        public string Decode(ReadOnlySpan<int> tokenIds) => _inner.Decode(tokenIds);
         public string DecodeToken(int tokenId) => Decode([tokenId]);
         public int BosTokenId => -1;
         public int EosTokenId => -1;
         public int VocabSize => 65536;
-        public int CountTokens(string text) => text.Length;
+        public int CountTokens(string text) => Encode(text).Length;
     }
 
     [Fact]

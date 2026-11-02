@@ -70,7 +70,7 @@ internal static class StatusCommand
 
         using ModelHandle model = Common.OpenModel(ctx, args);
         IChunker chunker = Common.Chunker(chunkerName, args, model.Tokenizer);
-        StoreLayout layout = StoreLayout.Open(storeRoot);
+        StoreLayout layout = StoreLayout.Open(storeRoot, create: false);
         string indexPath = layout.IndexPath(chunker.Name, model.Producer);
         IndexRecord? record = layout.Find(chunker.Name, model.Producer);
         if (record is null && !File.Exists(indexPath))
@@ -86,8 +86,8 @@ internal static class StatusCommand
             if (record is not null && !ChunkIndex.PathComparer.Equals(Path.TrimEndingDirectorySeparator(record.Root), Path.TrimEndingDirectorySeparator(tree.Root)))
                 ctx.Info($"warning: the index paths are relative to {record.Root}; the scanned tree's root is {tree.Root}");
         }
-        StatusReport report = index.Status(layout.Store, tree?.Files);
-        StoreStats stats = layout.Store.GetStats();
+        StatusReport report = index.Status(layout.Existing, tree?.Files);
+        StoreStats stats = layout.Stats;
         var missing = report.Files.SelectMany(f => f.Missing).Select(r => new MissingJson(r.FilePath, r.StartLine, r.EndLine, r.TokenCount ?? 0)).ToList();
         string[] Of(FileState s) => report.Files.Where(f => f.State == s).Select(f => f.Path).ToArray();
         var result = new StatusResult

@@ -97,8 +97,9 @@ internal static class BuildCommand
 
           --chunker symbol|fixed      chunker (default symbol)       --chunk-tokens N   max tokens per chunk (default 512)
           --configuration C           MSBuild configuration for --solution (default Release)
-          --path G,.. --symbol S --hops H --since REF [--merge-base] --exclude G,.. --budget T --max-per-hop N
-                                      encode only the chunks this selection picks (the whole tree is still indexed)
+          --path G --symbol S --hops H --since REF [--merge-base] --exclude G --budget T --max-per-hop N
+                                      encode only the chunks this selection picks (the whole tree is still indexed);
+                                      list options repeat (--path a --path b) and their values may not contain commas
           --max-chunks N              encode at most N missing chunks (path order)
           --dry-run                   list what would be encoded and the estimated store size; write nothing
           --strict                    exit 3, before writing anything, if a project was skipped, a load failure was not
@@ -152,10 +153,25 @@ internal static class BuildCommand
             return ExitCodes.StrictFailure;
         }
 
-        StoreLayout layout = StoreLayout.Open(storeRoot);
-        string indexPath = layout.IndexPath(chunker.Name, model.Producer);
+        // The selection (chunking, Roslyn graph) depends only on the tree, not on the index: compute it before taking the lock.
+        HashSet<string>? selectedIds = null;
+        if (selection is not null)
+        {
+            sw.Restart();
+            Chunk[] chunks = tree.Files.SelectMany(chunker.Chunk).ToArray();
+            ReferenceGraph graph = tree.BuildGraph(model.Tokenizer, chunks);
+            SelectionResult sel = Common.Select(selection, tree, graph);
+            selectedIds = sel.Select(s => s.Chunk.Id).ToHashSet(StringComparer.Ordinal);
+            ctx.Info($"selection: {sel.Count} chunks / {sel.SelectedTokens} tokens selected ({sel.Trimmed.Count} trimmed) [{sw.Elapsed.TotalSeconds:F1} s]");
+            foreach (string n in sel.Notes) ctx.Info($"  note: {n}");
+            foreach (string u in sel.UnmatchedPatterns) ctx.Info($"  unmatched pattern: {u}");
+        }
+
+        // The lock is held from the index update through every put (AcquireStoreLock contract); a dry run writes nothing,
+        // takes no lock and does not create the store directory.
         using IDisposable? held = dryRun ? null : Common.Lock(ctx, storeRoot, lockTimeout);
-        layout = StoreLayout.Open(storeRoot); // the config as of now, under the lock
+        StoreLayout layout = StoreLayout.Open(storeRoot, create: !dryRun); // the config as of now, under the lock
+        string indexPath = layout.IndexPath(chunker.Name, model.Producer);
         IndexRecord? record = layout.Find(chunker.Name, model.Producer);
         if (record is not null && !ChunkIndex.PathComparer.Equals(Path.TrimEndingDirectorySeparator(record.Root), Path.TrimEndingDirectorySeparator(tree.Root)) && !args.Flag("reroot"))
             throw new InvalidOperationException($"The store's {chunker.Name} index for this model tracks the tree at '{record.Root}', not '{tree.Root}'. "
@@ -184,27 +200,19 @@ internal static class BuildCommand
         long tokens = all.Sum(r => (long)(r.TokenCount ?? 0));
         var distinct = all.DistinctBy(r => r.KeyHex, StringComparer.Ordinal).ToList();
         long distinctTokens = distinct.Sum(r => (long)(r.TokenCount ?? 0));
-        StatusReport status = index.Status(layout.Store);
+        StatusReport status = index.Status(layout.Entries);
+        // Missing chunks in path then text order; restricted to the selection FIRST, then one per distinct key, so a selected
+        // chunk whose text also occurs in an unselected (earlier) file is still encoded.
+        IEnumerable<ChunkRef> candidates = status.Files.SelectMany(f => f.Missing);
+        int missingDistinct = candidates.Select(r => r.KeyHex).Distinct(StringComparer.Ordinal).Count();
+        if (selectedIds is not null) candidates = candidates.Where(r => selectedIds.Contains(r.Id));
         var seen = new HashSet<string>(StringComparer.Ordinal);
-        List<ChunkRef> missing = status.Files.SelectMany(f => f.Missing).Where(r => seen.Add(r.KeyHex!)).ToList();
-        int alreadyStored = distinct.Count - missing.Count;
+        List<ChunkRef> missing = candidates.Where(r => seen.Add(r.KeyHex!)).ToList();
+        int alreadyStored = distinct.Count - missingDistinct;
         ctx.Info($"index {Path.GetFileName(indexPath)}: {tree.Files.Count} files, {all.Count} chunks ({distinct.Count} distinct keys, {tokens} tokens); "
-            + $"added {diff.Added.Count}, removed {diff.Removed.Count}, unchanged {diff.Unchanged.Count}; {missing.Count} distinct chunks missing from the store [{indexMs / 1000:F1} s]");
-
+            + $"added {diff.Added.Count}, removed {diff.Removed.Count}, unchanged {diff.Unchanged.Count}; {missingDistinct} distinct chunks missing from the store"
+            + (selectedIds is null ? "" : $", {missing.Count} of them selected") + $" [{indexMs / 1000:F1} s]");
         int selectedCount = missing.Count;
-        if (selection is not null)
-        {
-            sw.Restart();
-            Chunk[] chunks = tree.Files.SelectMany(chunker.Chunk).ToArray();
-            ReferenceGraph graph = tree.BuildGraph(model.Tokenizer, chunks);
-            SelectionResult sel = Common.Select(selection, tree, graph);
-            var ids = sel.Select(s => s.Chunk.Id).ToHashSet(StringComparer.Ordinal);
-            missing = missing.Where(r => ids.Contains(r.Id)).ToList();
-            selectedCount = missing.Count;
-            ctx.Info($"selection: {sel.Count} chunks / {sel.SelectedTokens} tokens selected ({sel.Trimmed.Count} trimmed); {missing.Count} of them missing [{sw.Elapsed.TotalSeconds:F1} s]");
-            foreach (string n in sel.Notes) ctx.Info($"  note: {n}");
-            foreach (string u in sel.UnmatchedPatterns) ctx.Info($"  unmatched pattern: {u}");
-        }
         if (maxChunks is int cap && missing.Count > cap) missing = missing.Take(cap).ToList();
         long toEncodeTokens = missing.Sum(r => (long)(r.TokenCount ?? 0));
         long estimated = EstimateBytes(model, missing.Select(r => r.TokenCount ?? 0));
@@ -250,7 +258,7 @@ internal static class BuildCommand
                     throw new InvalidOperationException($"Chunk {r.Id} is in the index but the chunker no longer produces it; the file changed during the build?");
                 if (!model.Tokenizer.EncodeRaw(Common.TextOf(file, r)).AsSpan().SequenceEqual(chunk.TokenIds)) ineligible++;
                 if (chunk.TokenIds.Length == 0) continue;
-                var assembly = model.Assembler.Assemble([chunk], model.Model, layout.Store);
+                var assembly = model.Assembler.Assemble([chunk], model.Model, layout.Existing);
                 encoded += assembly.Stats.Misses;
                 hits += assembly.Stats.Hits;
                 encodedTokens += assembly.Stats.EncodedTokens;
@@ -267,8 +275,8 @@ internal static class BuildCommand
             }
         }
         double encodeMs = encodeSw.Elapsed.TotalMilliseconds;
-        StatusReport after = index.Status(layout.Store);
-        StoreStats stats = layout.Store.GetStats();
+        StatusReport after = index.Status(layout.Entries);
+        StoreStats stats = layout.Stats;
         result = result with
         {
             WireIneligibleChunks = ineligible, EncodedChunks = encoded, EncodedTokens = encodedTokens, StoreHits = hits, StoreFailures = failures,
@@ -276,6 +284,11 @@ internal static class BuildCommand
             MissingTokensAfter = after.MissingTokens, StoreEntries = stats.Entries, StoreBytes = stats.EntryBytes, ElapsedMs = total.ElapsedMilliseconds,
         };
         Emit(ctx, result, show);
+        if (failures > 0)
+        {
+            ctx.Info($"error: {failures} encoded chunk(s) could not be written to the store (busy or damaged entries); rerun build to repair.");
+            return ExitCodes.Error;
+        }
         return ExitCodes.Ok;
     }
 

@@ -66,26 +66,39 @@ internal sealed class StoreLayout
     /// <summary>Config format version.</summary>
     public const int ConfigVersion = 1;
 
-    private StoreLayout(string root, List<IndexRecord> records)
+    private StoreLayout(string root, List<IndexRecord> records, FileChunkStore? files)
     {
         Root = root;
         Records = records;
-        Store = new FileChunkStore(root);
+        Files = files;
     }
 
     /// <summary>Store directory (absolute).</summary>
     public string Root { get; }
 
-    /// <summary>The entry store.</summary>
-    public FileChunkStore Store { get; }
+    /// <summary>The entry store, or null when the directory does not exist (opened without creating it).</summary>
+    public FileChunkStore? Files { get; }
+
+    /// <summary>The entries: <see cref="Files"/>, or an empty store when the directory does not exist.</summary>
+    public IChunkStore Entries => (IChunkStore?)Files ?? EmptyChunkStore.Instance;
+
+    /// <summary>Entry statistics (zero when the directory does not exist).</summary>
+    public StoreStats Stats => Files?.GetStats() ?? default;
+
+    /// <summary>The entry store of a layout whose directory exists.</summary>
+    public FileChunkStore Existing => Files ?? throw new DirectoryNotFoundException($"Store not found: {Root}");
 
     /// <summary>The indexes recorded in the config.</summary>
     public List<IndexRecord> Records { get; }
 
-    /// <summary>Opens (creating the directory if needed) the store at <paramref name="root"/>.</summary>
-    public static StoreLayout Open(string root)
+    /// <summary>
+    /// Opens the store at <paramref name="root"/>. With <paramref name="create"/> the directory is created if needed (writers);
+    /// without it a missing directory opens as an empty store and nothing is created (read-only verbs, dry runs).
+    /// </summary>
+    public static StoreLayout Open(string root, bool create)
     {
-        Directory.CreateDirectory(root);
+        if (create) Directory.CreateDirectory(root);
+        else if (!Directory.Exists(root)) return new StoreLayout(Path.GetFullPath(root), [], null);
         string path = Path.Combine(root, ConfigFileName);
         var records = new List<IndexRecord>();
         if (File.Exists(path))
@@ -104,7 +117,7 @@ internal sealed class StoreLayout
                 throw new InvalidDataException($"Store config '{path}' has format version {doc?.FormatVersion}, not {ConfigVersion}.");
             records.AddRange(doc.Indexes ?? []);
         }
-        return new StoreLayout(Path.GetFullPath(root), records);
+        return new StoreLayout(Path.GetFullPath(root), records, new FileChunkStore(root));
     }
 
     /// <summary>Index file of <paramref name="chunker"/> for <paramref name="producer"/>.</summary>
@@ -149,10 +162,47 @@ internal sealed class StoreLayout
         }
     }
 
+    /// <summary>
+    /// Whether <paramref name="name"/> (from <see cref="ConfigFileName"/>) is a plain index file name of this store: no
+    /// directory part, not rooted, no <c>..</c>, and of the form <c>index-*.json</c>. Names that fail are never opened or deleted.
+    /// </summary>
+    public bool IsIndexFileName(string? name)
+    {
+        if (string.IsNullOrEmpty(name) || name.IndexOfAny(['/', '\\', ':']) >= 0 || name.Contains("..", StringComparison.Ordinal)) return false;
+        if (!name.StartsWith("index-", StringComparison.Ordinal) || !name.EndsWith(".json", StringComparison.OrdinalIgnoreCase)) return false;
+        if (name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || Path.GetFileName(name) != name) return false;
+        string full = Path.GetFullPath(Path.Combine(Root, name));
+        return string.Equals(Path.GetDirectoryName(full), Path.TrimEndingDirectorySeparator(Root), StringComparison.OrdinalIgnoreCase);
+    }
+
     private sealed class ConfigDocument
     {
         public int FormatVersion { get; set; }
 
         public List<IndexRecord>? Indexes { get; set; }
+    }
+}
+
+/// <summary>A store with no entries (a store directory that does not exist, opened read-only).</summary>
+internal sealed class EmptyChunkStore : IChunkStore
+{
+    public static readonly EmptyChunkStore Instance = new();
+
+    public bool TryGet(ChunkKey key, out ChunkReuse.ChunkKvEntry entry)
+    {
+        entry = null!;
+        return false;
+    }
+
+    public void Put(ChunkKey key, ChunkReuse.ChunkKvEntry entry) => throw new InvalidOperationException("The store does not exist (opened read-only).");
+
+    public bool Contains(ChunkKey key) => false;
+
+    public IEnumerable<ChunkKey> Keys() => [];
+
+    public long TotalBytes => 0;
+
+    public void Evict(ChunkKey key)
+    {
     }
 }

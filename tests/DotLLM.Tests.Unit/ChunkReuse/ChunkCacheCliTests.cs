@@ -52,7 +52,21 @@ public sealed class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTests.Fixtur
         Assert.Equal(1, Cli(["build", "--model", Path.Combine(store, "missing.gguf"), "--store", store, "--directory", _fx.TreeTemplate]).Code);
         Assert.Equal(1, Cli(["status", "--model", _fx.ModelA, "--store", Path.Combine(store, "nope")]).Code);
         Assert.Equal(1, Cli(["evict", "--store", Path.Combine(store, "nope")]).Code);
+        Assert.Equal(2, Cli(["select", "--model", _fx.ModelA, "--directory", _fx.TreeTemplate, "--path", "src/A.cs,src/B.cs"]).Code); // no comma lists
+        Assert.Equal(2, Cli(["evict", "--store", store, "--threads", "4"]).Code); // model options only with --all-for-model
         Assert.Empty(Directory.EnumerateFileSystemEntries(store)); // usage errors write nothing
+
+        // --json: a failure without a result still prints one JSON document on stdout.
+        var usage = Cli(["build", "--model", _fx.ModelA, "--store", store, "--json"]);
+        Assert.Equal(2, usage.Code);
+        JsonElement err = JsonDocument.Parse(usage.Out).RootElement.GetProperty("error");
+        Assert.Equal("usage", err.GetProperty("code").GetString());
+        Assert.Equal(2, err.GetProperty("exit_code").GetInt32());
+        var missing = Cli(["status", "--model", _fx.ModelA, "--store", Path.Combine(store, "nope"), "--json"]);
+        Assert.Equal(1, missing.Code);
+        Assert.Equal("error", JsonDocument.Parse(missing.Out).RootElement.GetProperty("error").GetProperty("code").GetString());
+        Assert.DoesNotContain("   at ", missing.Err, StringComparison.Ordinal); // no stack trace without --verbose
+        Assert.Contains("   at ", Cli(["status", "--model", _fx.ModelA, "--store", Path.Combine(store, "nope"), "--verbose"]).Err, StringComparison.Ordinal);
     }
 
     // ------------------------------------------------------------------------------------------------ build
@@ -535,8 +549,9 @@ public sealed class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTests.Fixtur
              "query_from": {"path": "src/Shapes.cs", "start_line": 3, "end_line": 6},
              "continuation": "    public double Perimeter", "continuation_tokens": 8}
             """);
-        string[] args = ["compare", "--task", task, "--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64", "--chunkers", "symbol,fixed",
-            "--selectors", "chunkstarts,queryrelevance,hybrid,deviation", "--budgets", "10,100", "--block", "4096"];
+        string[] args = ["compare", "--task", task, "--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64", "--chunkers", "symbol", "--chunkers", "fixed",
+            "--selectors", "chunkstarts", "--selectors", "queryrelevance", "--selectors", "hybrid", "--selectors", "deviation",
+            "--budgets", "10", "--budgets", "100", "--block", "4096"];
         JsonElement r = Json(Cli([.. args, "--json"]));
         Assert.Equal("cpu-per-run", r.GetProperty("recompute_path").GetString());
         Assert.Equal("cpu-prefill", r.GetProperty("prefill_path").GetString());
@@ -555,6 +570,7 @@ public sealed class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTests.Fixtur
             JsonElement naive = mine.Single(x => x.GetProperty("arm").GetString() == "naive");
             int L = full.GetProperty("context_tokens").GetInt32();
             Assert.Equal("cpu-prefill", full.GetProperty("prefill_path").GetString());
+            Assert.Equal(2, full.GetProperty("forward_calls").GetInt32()); // --block 4096: one context forward, one query forward
             Assert.Equal(0, naive.GetProperty("tokens_recomputed").GetInt32());
             Assert.Equal(0, naive.GetProperty("forward_calls").GetInt32());
             Assert.True(naive.GetProperty("kl").GetDouble() > 1e-6, $"{chunker}: naive concatenation should differ from full prefill");
@@ -563,8 +579,11 @@ public sealed class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTests.Fixtur
                 Assert.Equal("cpu-per-run", x.GetProperty("recompute_path").GetString());
                 Assert.Equal(x.GetProperty("budget_tokens").GetInt32(), x.GetProperty("tokens_recomputed").GetInt32());
                 Assert.True(x.GetProperty("forward_calls").GetInt32() >= 1);
-                Assert.True(x.GetProperty("reuse_ms").GetDouble() >= x.GetProperty("recompute_ms").GetDouble());
-                Assert.True(x.GetProperty("exact_match").ValueKind is JsonValueKind.True or JsonValueKind.False);
+                double parts = x.GetProperty("assemble_ms").GetDouble() + x.GetProperty("score_ms").GetDouble() + x.GetProperty("select_ms").GetDouble()
+                    + x.GetProperty("recompute_ms").GetDouble() + x.GetProperty("query_ms").GetDouble();
+                Assert.Equal(parts, x.GetProperty("reuse_ms").GetDouble(), 6); // reuse time is the sum of its parts
+                Assert.True(x.GetProperty("assemble_ms").GetDouble() > 0 && x.GetProperty("query_ms").GetDouble() > 0);
+                Assert.True(x.GetProperty("continuation_exact_match").ValueKind is JsonValueKind.True or JsonValueKind.False);
                 if (x.GetProperty("budget_pct").GetDouble() < 100)
                     Assert.True(x.GetProperty("kl").GetDouble() > 0, $"{chunker} {x.GetProperty("arm")}: a partial recompute starts from the naive cache");
                 if (x.GetProperty("budget_pct").GetDouble() == 100)
@@ -574,7 +593,7 @@ public sealed class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTests.Fixtur
                     Assert.Equal(1, x.GetProperty("forward_calls").GetInt32());
                     Assert.True(x.GetProperty("kl").GetDouble() < 1e-9, $"{chunker} {x.GetProperty("arm")}: KL {x.GetProperty("kl")}");
                     Assert.Equal(1.0, x.GetProperty("top1").GetDouble());
-                    Assert.Equal(full.GetProperty("exact_match").GetBoolean(), x.GetProperty("exact_match").GetBoolean());
+                    Assert.Equal(full.GetProperty("continuation_exact_match").GetBoolean(), x.GetProperty("continuation_exact_match").GetBoolean());
                 }
             }
             // Chunk starts at 10 % recompute several runs (one per stale chunk's prefix): more than one forward.
@@ -589,6 +608,7 @@ public sealed class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTests.Fixtur
         Assert.Contains("cpu-per-run", text.Out, StringComparison.Ordinal);
         Assert.Contains("cpu-prefill", text.Out, StringComparison.Ordinal);
         Assert.Contains("| symbol-64  | hybrid", text.Out, StringComparison.Ordinal);
+        Assert.Contains("continuation exact match", text.Out, StringComparison.Ordinal);
         Assert.Contains("| fixed-64   | chunkstarts", text.Out, StringComparison.Ordinal);
     }
 
@@ -605,7 +625,7 @@ public sealed class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTests.Fixtur
         Assert.True(c.GetProperty("store_misses").GetInt32() > 0);
         Assert.Equal("reference-greedy", c.GetProperty("continuation_source").GetString());
         Assert.NotEmpty(c.GetProperty("notes").EnumerateArray());
-        Assert.All(r.GetProperty("rows").EnumerateArray(), x => Assert.False(x.TryGetProperty("exact_match", out _))); // no expected continuation
+        Assert.All(r.GetProperty("rows").EnumerateArray(), x => Assert.False(x.TryGetProperty("continuation_exact_match", out _))); // no expected continuation
         Assert.Equal(0, new FileChunkStore(store).GetStats().Entries); // read only
         Assert.Empty(Directory.GetFiles(store, "index-*.json"));
     }
@@ -645,6 +665,123 @@ public sealed class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTests.Fixtur
         Assert.Equal((0, 8), CompareCommand.LineRange("ab\ncdef\ng\n", 1, 2));
         Assert.Equal((8, 9), CompareCommand.LineRange("ab\ncdef\ng", 3, 3));
         Assert.Throws<InvalidOperationException>(() => CompareCommand.LineRange("ab\n", 3, 3));
+    }
+
+    // ------------------------------------------------------------------------------------------------ fix round (review S1-S9)
+
+    [Fact]
+    public void Build_Selection_EncodesASelectedChunkWhoseTextAlsoOccursInAnUnselectedEarlierFile()
+    {
+        // a/Dup.cs and b/Dup.cs are identical: every chunk of b has a twin (same key) earlier in path order. Selecting only b
+        // must still encode those keys (the selection is applied before deduplicating by key).
+        string tree = NewTree();
+        string dup = File.ReadAllText(Path.Combine(tree, "src", "Util", "Text.cs"));
+        foreach (string d in new[] { "a", "b" })
+        {
+            Directory.CreateDirectory(Path.Combine(tree, d));
+            File.WriteAllText(Path.Combine(tree, d, "Dup.cs"), dup);
+        }
+        string store = NewDir("store");
+        JsonElement r = Json(Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64", "--path", "b/Dup.cs", "--json"]));
+        using var model = OpenModel(_fx.ModelA);
+        ChunkIndex index = ChunkIndex.Load(Directory.GetFiles(store, "index-*.json").Single(), model.KeyOf);
+        var bKeys = index.ChunksOf("b/Dup.cs").Select(c => c.KeyHex!).ToHashSet(StringComparer.Ordinal);
+        Assert.NotEmpty(bKeys);
+        Assert.Equal(bKeys, index.ChunksOf("a/Dup.cs").Select(c => c.KeyHex!).ToHashSet(StringComparer.Ordinal)); // fixture: twins
+        Assert.Equal(bKeys.Count, r.GetProperty("encoded_chunks").GetInt32());
+        var fs = new FileChunkStore(store);
+        Assert.All(bKeys, k => Assert.True(fs.Contains(new ChunkKey(k))));
+    }
+
+    [Fact]
+    public void Evict_AllForModel_RefusesRegistryIndexNamesOutsideTheStore()
+    {
+        string tree = NewTree();
+        string work = NewDir("evil");
+        string store = Path.Combine(work, "store");
+        Assert.Equal(0, Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64"]).Code);
+        int entries = new FileChunkStore(store).GetStats().Entries;
+        string victim = Path.Combine(work, "victim.json");
+        string config = Path.Combine(store, StoreLayout.ConfigFileName);
+        string original = File.ReadAllText(config);
+        string indexName = Path.GetFileName(Directory.GetFiles(store, "index-*.json").Single());
+        foreach (string evil in new[] { "..\\\\victim.json", "../victim.json", victim.Replace("\\", "\\\\", StringComparison.Ordinal), "sub\\\\index-x.json", "notindex.json" })
+        {
+            File.WriteAllText(victim, "keep me");
+            File.WriteAllText(config, original.Replace($"\"{indexName}\"", $"\"{evil}\"", StringComparison.Ordinal));
+            Assert.Contains(evil, File.ReadAllText(config), StringComparison.Ordinal);
+            var r = Cli(["evict", "--store", store, "--all-for-model", "--model", _fx.ModelA, "--apply"]);
+            Assert.Equal(1, r.Code);
+            Assert.True(File.Exists(victim), $"'{evil}' deleted a file outside the store");
+            Assert.Equal(entries, new FileChunkStore(store).GetStats().Entries); // nothing deleted
+        }
+    }
+
+    [Fact]
+    public async Task ChildProcess_StdoutIsUtf8WithoutBom_WithNonAsciiPathsAndText()
+    {
+        string tree = NewDir("ü tree 日本");
+        CopyTree(_fx.TreeTemplate, tree);
+        File.WriteAllText(Path.Combine(tree, "src", "Ünïcødé.cs"), "class Überall { string G() => \"grüß gott 日本\"; }\n");
+        string exe = Path.Combine(AppContext.BaseDirectory, OperatingSystem.IsWindows() ? "chunkcache.exe" : "chunkcache");
+        var psi = new System.Diagnostics.ProcessStartInfo(exe)
+        {
+            RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, WorkingDirectory = _fx.Scratch,
+        };
+        foreach (string a in new[] { "select", "--model", _fx.ModelA, "--directory", tree, "--chunk-tokens", "64", "--path", "src/Ü*", "--include-text", "--json" })
+            psi.ArgumentList.Add(a);
+        using var p = System.Diagnostics.Process.Start(psi)!;
+        using var bytes = new MemoryStream();
+        Task copy = p.StandardOutput.BaseStream.CopyToAsync(bytes);
+        string err = await p.StandardError.ReadToEndAsync();
+        await copy;
+        await p.WaitForExitAsync();
+        Assert.True(p.ExitCode == 0, err);
+        byte[] raw = bytes.ToArray();
+        Assert.Equal((byte)'{', raw[0]); // no BOM
+        string text = new UTF8Encoding(false, throwOnInvalidBytes: true).GetString(raw);
+        using JsonDocument doc = JsonDocument.Parse(text);
+        JsonElement chunk = doc.RootElement.GetProperty("chunks")[0];
+        Assert.Equal("src/Ünïcødé.cs", chunk.GetProperty("path").GetString());
+        Assert.Contains("grüß gott 日本", chunk.GetProperty("text").GetString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ReadOnlyVerbsAndDryRun_DoNotCreateTheStore()
+    {
+        string tree = NewTree();
+        string parent = NewDir("ro");
+        string store = Path.Combine(parent, "typo-store");
+        Assert.Equal(0, Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64", "--dry-run"]).Code);
+        Assert.Equal(1, Cli(["status", "--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64"]).Code);
+        Assert.Equal(1, Cli(["select", "--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64", "--path", "src/Calc.cs"]).Code);
+        Assert.Equal(1, Cli(["evict", "--store", store]).Code);
+        string task = Path.Combine(parent, "t.json");
+        File.WriteAllText(task, """{"select": {"paths": ["src/Calc.cs"]}, "query": "x"}""");
+        Assert.Equal(1, Cli(["compare", "--task", task, "--model", _fx.ModelA, "--store", store, "--directory", tree]).Code);
+        Assert.False(Directory.Exists(store));
+    }
+
+    [Fact]
+    public void Build_StoreWriteFailure_ExitsOne()
+    {
+        // A damaged entry at a chunk's final path, held open by a reader that does not share delete: the store cannot replace
+        // it (ChunkStoreBusyException), the build uses the fresh K/V for nothing and must report the failure.
+        string tree = NewTree();
+        string store = NewDir("store");
+        JsonElement dry = Json(Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64", "--dry-run", "--json"]));
+        string key = dry.GetProperty("would_encode")[0].GetProperty("key").GetString()!;
+        string path = new FileChunkStore(store).PathOf(new ChunkKey(key));
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllBytes(path, [1, 2, 3]);
+        using (new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            var r = Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64", "--json"]);
+            Assert.Equal(1, r.Code);
+            Assert.Equal(1, JsonDocument.Parse(r.Out).RootElement.GetProperty("store_failures").GetInt32());
+        }
+        Assert.Equal(0, Cli(["build", "--model", _fx.ModelA, "--store", store, "--directory", tree, "--chunk-tokens", "64"]).Code); // repaired
+        Assert.Equal(0, Cli(["status", "--model", _fx.ModelA, "--store", store, "--chunk-tokens", "64", "--strict"]).Code);
     }
 
     // ------------------------------------------------------------------------------------------------ JSON schemas

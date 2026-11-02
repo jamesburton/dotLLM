@@ -11,6 +11,9 @@ internal sealed record EvictResult
     public bool DryRun { get; init; }
 
     public string Mode { get; init; } = "orphans";
+
+    /// <summary>All-for-model mode: entries whose header could not be read (damaged or partial); kept.</summary>
+    public int UnreadableEntries { get; init; }
     public IReadOnlyList<string> Keys { get; init; } = [];
     public IReadOnlyList<string> DroppedIndexes { get; init; } = [];
     public int TempFilesRemoved { get; init; }
@@ -50,18 +53,20 @@ internal static class EvictCommand
         string storeRoot = ctx.FullPath(args.Required("store"));
         bool apply = args.Flag("apply"), allForModel = args.Flag("all-for-model");
         if (allForModel && args.Value("model") is null) throw new UsageException("evict: --all-for-model needs --model.");
-        if (!allForModel && args.Value("model") is not null) throw new UsageException("evict: --model is used only with --all-for-model.");
+        if (!allForModel && (args.Value("model") is not null || args.Flag("strict-model-id") || args.Value("threads") is not null))
+            throw new UsageException("evict: --model, --strict-model-id and --threads are used only with --all-for-model.");
         TimeSpan lockTimeout = args.Seconds("lock-timeout", Common.DefaultLockTimeout);
         int show = args.Int("show", 20, 0);
         if (!Directory.Exists(storeRoot)) throw new DirectoryNotFoundException($"Store not found: {storeRoot}");
 
         using ModelHandle? model = allForModel ? Common.OpenModel(ctx, args) : null;
         using IDisposable? held = apply ? Common.Lock(ctx, storeRoot, lockTimeout) : null;
-        StoreLayout layout = StoreLayout.Open(storeRoot);
-        FileChunkStore store = layout.Store;
+        StoreLayout layout = StoreLayout.Open(storeRoot, create: false);
+        FileChunkStore store = layout.Existing;
         List<ChunkKey> all = store.Keys().ToList();
 
         IReadOnlyList<ChunkKey> victims;
+        int unreadable = 0;
         var dropIndexes = new List<string>();
         if (model is null)
         {
@@ -69,11 +74,25 @@ internal static class EvictCommand
         }
         else
         {
-            victims = all.Where(k => store.TryReadFingerprint(k, out string fp) && fp == model.Fingerprint).OrderBy(k => k.Hex, StringComparer.Ordinal).ToList();
+            var mine = new List<ChunkKey>();
+            foreach (ChunkKey k in all)
+            {
+                if (!store.TryReadFingerprint(k, out string fp)) unreadable++;
+                else if (fp == model.Fingerprint) mine.Add(k);
+            }
+            victims = mine.OrderBy(k => k.Hex, StringComparer.Ordinal).ToList();
+            if (victims.Count == 0)
+                ctx.Info("note: no entry carries this model's fingerprint; if the store was built with (or without) --strict-model-id, pass the same here.");
             string suffix = "." + model.Producer[..12] + ".json";
             dropIndexes.AddRange(Directory.EnumerateFiles(storeRoot, "index-*" + suffix).Select(Path.GetFileName)!);
             dropIndexes.AddRange(layout.Records.Where(r => r.ModelFingerprint == model.Fingerprint).Select(r => r.IndexFile));
             dropIndexes = dropIndexes.Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.Ordinal).ToList();
+            // The registry is data: a name that is not a plain index-*.json in the store root is refused before anything is
+            // deleted (e.g. "..\\x", an absolute path, a subdirectory).
+            string[] bad = dropIndexes.Where(f => !layout.IsIndexFileName(f)).ToArray();
+            if (bad.Length > 0)
+                throw new InvalidDataException($"Store config '{StoreLayout.ConfigFileName}' names index files outside the store or not of the form index-*.json: "
+                    + string.Join(", ", bad.Select(b => $"'{b}'")) + ". Nothing was deleted; repair the config.");
         }
         long freed = 0;
         foreach (ChunkKey k in victims)
@@ -101,7 +120,7 @@ internal static class EvictCommand
 
         var result = new EvictResult
         {
-            Evicted = victims.Count, FreedBytes = freed, KeptReferenced = all.Count - victims.Count, DryRun = !apply,
+            Evicted = victims.Count, FreedBytes = freed, KeptReferenced = all.Count - victims.Count - unreadable, DryRun = !apply, UnreadableEntries = unreadable,
             Mode = model is null ? "orphans" : "all_for_model", Keys = victims.Select(k => k.Hex).ToList(), DroppedIndexes = dropIndexes,
             TempFilesRemoved = tempRemoved, StoreEntriesAfter = apply ? store.Keys().Count() : all.Count,
         };
@@ -113,7 +132,8 @@ internal static class EvictCommand
         TextWriter o = ctx.Out;
         string verb = apply ? "evicted" : "would evict";
         o.WriteLine($"{(apply ? "" : "dry run: ")}{verb} {result.Evicted} {(model is null ? "orphaned" : "model")} entries ({Common.Bytes(freed)}); "
-            + $"kept {result.KeptReferenced} entries{(model is null ? " referenced by an index" : "")}");
+            + $"kept {result.KeptReferenced} entries{(model is null ? " referenced by an index" : " of other models")}"
+            + (unreadable > 0 ? $" and {unreadable} unreadable entries" : ""));
         foreach (string k in result.Keys.Take(show)) o.WriteLine($"  {k}");
         if (result.Keys.Count > show) o.WriteLine($"  ... {result.Keys.Count - show} more (--show N)");
         foreach (string f in dropIndexes) o.WriteLine($"  {(apply ? "dropped" : "would drop")} index {f}");

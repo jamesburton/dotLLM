@@ -59,7 +59,7 @@ internal static class SelectCommand
           trimmed strictly to --budget. Tokenizer only. With --store, the source defaults to the one the store's index records
           and each chunk says whether it is stored.
 
-          --path G,..                 globs (repeatable; '!' negates)   --exclude G,..   drop matching files everywhere
+          --path G                    a glob (repeat for more; '!' negates)   --exclude G   drop matching files everywhere (repeatable)
           --symbol S --hops H         a symbol's definition and its callers/callees within H hops (default 1)
           --max-per-hop N             keep only the N heaviest neighbours per hop
           --since REF [--merge-base]  files changed since REF (or since the merge base of REF and HEAD), plus untracked
@@ -83,7 +83,7 @@ internal static class SelectCommand
         using ModelHandle model = Common.OpenModel(ctx, args);
         IChunker chunker = Common.Chunker(args, model.Tokenizer);
         SelectionRequest request = Common.Selection(args, chunker);
-        StoreLayout? layout = storeArg is null ? null : StoreLayout.Open(ctx.FullPath(storeArg));
+        StoreLayout? layout = storeArg is null ? null : OpenExisting(ctx.FullPath(storeArg));
         IndexRecord? record = layout?.Find(chunker.Name, model.Producer);
         SourceTree tree = SourceTree.Load(ctx, Common.SourceFor(ctx, args, record), model.Tokenizer);
         ctx.Info(tree.Summary);
@@ -104,7 +104,7 @@ internal static class SelectCommand
             string text = Common.TextOf(files[c.FilePath], c);
             Chunk g = graph.Chunks[graph.IndexOf(c.Id)];
             string key = model.KeyOf(g.TokenIds).Hex;
-            bool? isStored = layout is null ? null : layout.Store.Contains(new ChunkKey(key));
+            bool? isStored = layout is null ? null : layout.Entries.Contains(new ChunkKey(key));
             if (isStored == true) stored++;
             list.Add(new SelectedJson(c.Id, c.FilePath, c.StartLine, c.EndLine, s.Tokens, Common.WireHash(text), Name(s.Reason), s.Detail,
                 s.Hop >= 0 ? s.Hop : null, isStored, args.Flag("include-text") ? text : null)
@@ -139,6 +139,9 @@ internal static class SelectCommand
         if (output.UnmatchedChangedFiles.Count > 0) o.WriteLine($"changed files with no chunk: {string.Join(", ", output.UnmatchedChangedFiles.Take(20))}");
         return ExitCodes.Ok;
     }
+
+    private static StoreLayout OpenExisting(string root) =>
+        Directory.Exists(root) ? StoreLayout.Open(root, create: false) : throw new DirectoryNotFoundException($"Store not found: {root}");
 
     private static string Name(SelectionReason r) => r switch
     {

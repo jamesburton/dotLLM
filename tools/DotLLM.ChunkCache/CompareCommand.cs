@@ -62,8 +62,8 @@ internal sealed record CompareRow
     public double Kl { get; init; }
     public double KlMax { get; init; }
     public double Top1 { get; init; }
-    public bool? ExactMatch { get; init; }
-    public int? GraphPicks { get; init; }
+    public bool? ContinuationExactMatch { get; init; }
+    public int? GraphPicksMax { get; init; }
     public double AssembleMs { get; init; }
     public double ScoreMs { get; init; }
     public double SelectMs { get; init; }
@@ -89,7 +89,7 @@ internal sealed record CompareContext
     public int StoreMisses { get; init; }
     public long MissEncodedTokens { get; init; }
     public double FullMs { get; init; }
-    public bool? ReferenceExactMatch { get; init; }
+    public bool? ReferenceContinuationExactMatch { get; init; }
     public IReadOnlyList<string> Notes { get; init; } = [];
 }
 
@@ -122,6 +122,7 @@ internal sealed record CompareResult
 internal static class CompareCommand
 {
     private const string PrefillPath = "cpu-prefill";
+    private const string PrefillBackend = "cpu";
     private static readonly string[] KnownSelectors = ["naive", "chunkstarts", "queryrelevance", "hybrid", "deviation", "random", "firstk"];
 
     public static readonly IReadOnlyDictionary<string, OptionKind> Spec = Common.Merge(Common.ModelOptions, Common.SourceOptions, new Dictionary<string, OptionKind>
@@ -145,10 +146,11 @@ internal static class CompareCommand
           continuation, tokens recomputed, forward calls, and wall time of reuse vs full prefill. Each timing names its path;
           on CPU the recompute is per run (one forward per contiguous run of selected positions).
 
-          --selectors a,b,..   naive (always), chunkstarts, queryrelevance, hybrid (graph picks then query relevance),
+          --selectors S        repeat for each: naive (always), chunkstarts, queryrelevance, hybrid (graph picks then query relevance),
                                deviation, random, firstk (default chunkstarts,queryrelevance,hybrid)
-          --budgets 5,10,20    percent of the context tokens recomputed (default 5,10,20)
-          --chunkers fixed,symbol  (default symbol,fixed)      --chunk-tokens N (512)
+          --budgets P          repeat for each: percent of the context tokens recomputed (default 5, 10, 20)
+          --chunkers C         repeat for each: symbol, fixed (default both)      --chunk-tokens N (512)
+          (list options repeat, one value per flag; a comma in a value is a usage error)
           --solution X | --directory D   source (default: the one the store's index records for each chunker)
           --seed N (random selector)  --block N (prefill block, 512)  --threads N  --json
 
@@ -158,6 +160,11 @@ internal static class CompareCommand
              "query": "text" | "query_from": {"path": "src/A.cs", "start_line": 10, "end_line": 30},
              "continuation": "expected text (optional)", "continuation_tokens": 16}
           Without "continuation", the reference continuation is full prefill's greedy output and exact match is not reported.
+          "continuation exact match" = every expected continuation token is the greedy argmax of its teacher-forced row; it is
+          not comparable with E4's masked-call exact match. "calls" = recompute forwards (full: context + query prefill
+          forwards); scoring probes and continuation rows are not counted.
+          Prefill, assembly and scoring are CPU only (the TransformerModel, SimpleKvCache); only the recompute goes through the
+          strategy seam, and compare refuses a strategy on another backend (no mixed-backend speedups).
         """;
 
     public static int Run(CliContext ctx, CliArgs args)
@@ -180,9 +187,13 @@ internal static class CompareCommand
 
         using ModelHandle model = Common.OpenModel(ctx, args);
         var tm = model.Model as TransformerModel ?? throw new NotSupportedException("compare needs the CPU TransformerModel.");
-        StoreLayout layout = StoreLayout.Open(storeRoot);
-        var store = new ReadOnlyChunkStore(layout.Store);
+        if (!Directory.Exists(storeRoot)) throw new DirectoryNotFoundException($"Store not found: {storeRoot}");
+        StoreLayout layout = StoreLayout.Open(storeRoot, create: false);
+        var store = new ReadOnlyChunkStore(layout.Entries);
         IRecomputeStrategy strategy = new CpuPerRunRecompute();
+        if (strategy.Backend != PrefillBackend)
+            throw new NotSupportedException($"compare times full prefill and assembly on {PrefillBackend}; a {strategy.Backend} recompute strategy would give a mixed-backend speedup.");
+        WarmUp(model);
         ctx.Info($"recompute path: {strategy.Path} ({strategy.Description}); full prefill path: {PrefillPath} (blocks of {block})");
 
         var rows = new List<CompareRow>();
@@ -281,12 +292,14 @@ internal static class CompareCommand
         float[] refRows;
         int[] continuation;
         double fullMs;
+        int fullCalls = 0;
         using (SimpleKvCache full = model.NewCache(capacity))
         {
             sw.Restart();
             Prefill(model, full, contextIds, 0, block);
             float[] first = PrefillLast(model, full, query, L, block);
             fullMs = sw.Elapsed.TotalMilliseconds;
+            fullCalls = Calls(L, block) + Calls(query.Length, block);
             (refRows, continuation) = Continue(model, full, first, L + query.Length, expected, n, vocab);
         }
         bool? refEm = expected is null ? null : ExactMatch(refRows, expected, vocab);
@@ -333,8 +346,8 @@ internal static class CompareCommand
         {
             new()
             {
-                Chunker = chunker.Name, Arm = "full", BudgetPct = 100, BudgetTokens = L, ContextTokens = L, TokensRecomputed = L, ForwardCalls = 0,
-                Kl = 0, KlMax = 0, Top1 = 1, ExactMatch = refEm, FullMs = fullMs, ReuseMs = fullMs, Speedup = 1, RecomputePath = "-", PrefillPath = PrefillPath,
+                Chunker = chunker.Name, Arm = "full", BudgetPct = 100, BudgetTokens = L, ContextTokens = L, TokensRecomputed = L, ForwardCalls = fullCalls,
+                Kl = 0, KlMax = 0, Top1 = 1, ContinuationExactMatch = refEm, FullMs = fullMs, ReuseMs = fullMs, Speedup = 1, RecomputePath = "-", PrefillPath = PrefillPath,
             },
         };
         using SimpleKvCache work = model.NewCache(capacity);
@@ -351,8 +364,8 @@ internal static class CompareCommand
             return new CompareRow
             {
                 Chunker = chunker.Name, Arm = arm, BudgetPct = pct, BudgetTokens = budget, ContextTokens = L, TokensRecomputed = rec.TokensRecomputed,
-                ForwardCalls = rec.ForwardCalls, Kl = kl, KlMax = klMax, Top1 = top1, ExactMatch = expected is null ? null : ExactMatch(armRows, expected, vocab),
-                GraphPicks = graphPicks, AssembleMs = assembleMs, ScoreMs = scoreMs, SelectMs = selectMs, RecomputeMs = rec.Elapsed.TotalMilliseconds,
+                ForwardCalls = rec.ForwardCalls, Kl = kl, KlMax = klMax, Top1 = top1, ContinuationExactMatch = expected is null ? null : ExactMatch(armRows, expected, vocab),
+                GraphPicksMax = graphPicks, AssembleMs = assembleMs, ScoreMs = scoreMs, SelectMs = selectMs, RecomputeMs = rec.Elapsed.TotalMilliseconds,
                 QueryMs = queryMs, ReuseMs = reuse, FullMs = fullMs, Speedup = fullMs / Math.Max(reuse, 1e-9),
                 RecomputePath = rec.ForwardCalls == 0 ? "-" : strategy.Path, PrefillPath = PrefillPath,
             };
@@ -384,7 +397,7 @@ internal static class CompareCommand
         {
             Chunker = chunker.Name, ContextChunks = chunks.Length, ContextTokens = L, QueryTokens = query.Length, ContinuationTokens = n,
             ContinuationSource = expected is null ? "reference-greedy" : "task", StoreHits = assembly.Stats.Hits, StoreMisses = assembly.Stats.Misses,
-            MissEncodedTokens = assembly.Stats.EncodedTokens, FullMs = fullMs, ReferenceExactMatch = refEm, Notes = notes,
+            MissEncodedTokens = assembly.Stats.EncodedTokens, FullMs = fullMs, ReferenceContinuationExactMatch = refEm, Notes = notes,
         };
         return (info, rows);
     }
@@ -485,6 +498,15 @@ internal static class CompareCommand
         return Math.Max(kl, 0);
     }
 
+    private static int Calls(int tokens, int block) => (tokens + block - 1) / block;
+
+    // One untimed forward before any timing, so the first full prefill does not pay JIT and weight page-in.
+    private static void WarmUp(ModelHandle model)
+    {
+        using SimpleKvCache cache = model.NewCache(4);
+        Forward(model, cache, [0, 1], 0, allRows: false);
+    }
+
     private static bool ExactMatch(float[] rows, int[] expected, int vocab)
     {
         for (int j = 0; j < expected.Length; j++)
@@ -530,21 +552,23 @@ internal static class CompareCommand
         foreach (CompareContext c in r.Contexts)
         {
             o.WriteLine($"  {c.Chunker}: {c.ContextChunks} chunks, {c.ContextTokens} context tokens, query {c.QueryTokens}, continuation {c.ContinuationTokens} ({c.ContinuationSource}); "
-                + $"store hits {c.StoreHits}, misses {c.StoreMisses}; full prefill {c.FullMs:F0} ms" + (c.ReferenceExactMatch is bool em ? $"; reference EM {(em ? "yes" : "no")}" : ""));
+                + $"store hits {c.StoreHits}, misses {c.StoreMisses}; full prefill {c.FullMs:F0} ms" + (c.ReferenceContinuationExactMatch is bool em ? $"; full prefill continuation EM {(em ? "yes" : "no")}" : ""));
             foreach (string n in c.Notes) o.WriteLine($"    note: {n}");
         }
         o.WriteLine();
         o.WriteLine(string.Format(ci, "| {0,-10} | {1,-14} | {2,6} | {3,10} | {4,5} | {5,9} | {6,5} | {7,3} | {8,9} | {9,9} | {10,7} | {11,-11} |",
-            "chunker", "arm", "budget", "recomputed", "calls", "KL", "top-1", "EM", "reuse ms", "full ms", "speedup", "path"));
+            "chunker", "arm", "budget", "recomputed", "calls", "KL", "top-1", "cEM", "reuse ms", "full ms", "speedup", "path"));
         o.WriteLine("|------------|----------------|--------|------------|-------|-----------|-------|-----|-----------|-----------|---------|-------------|");
         foreach (CompareRow x in r.Rows)
         {
             o.WriteLine(string.Format(ci, "| {0,-10} | {1,-14} | {2,5:0.#}% | {3,10} | {4,5} | {5,9:0.0000} | {6,5:0.00} | {7,3} | {8,9:F0} | {9,9:F0} | {10,6:0.00}x | {11,-11} |",
-                x.Chunker, x.Arm, x.BudgetPct, x.TokensRecomputed, x.ForwardCalls, x.Kl, x.Top1, x.ExactMatch is bool e ? (e ? "yes" : "no") : "-",
+                x.Chunker, x.Arm, x.BudgetPct, x.TokensRecomputed, x.ForwardCalls, x.Kl, x.Top1, x.ContinuationExactMatch is bool e ? (e ? "yes" : "no") : "-",
                 x.ReuseMs, x.FullMs, x.Speedup, x.Arm == "full" ? x.PrefillPath : x.RecomputePath));
         }
         o.WriteLine();
         o.WriteLine("  reuse ms = assembly (store read + RoPE) + scoring + selection + recompute + query prefill; full ms = context + query prefill.");
+        o.WriteLine("  calls = recompute forwards (full: context + query prefill forwards); cEM = continuation exact match (all expected tokens; not E4's masked-call EM).");
+        o.WriteLine("  Prefill, assembly and scoring run on the CPU; only the recompute goes through the strategy seam.");
         o.WriteLine($"  On CPU the recompute is per run ({r.RecomputePath}): scattered selections pay one forward per run, so reuse can be slower than full prefill here.");
     }
 }

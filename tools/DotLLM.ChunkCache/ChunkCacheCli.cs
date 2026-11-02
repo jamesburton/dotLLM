@@ -39,30 +39,39 @@ internal static class ChunkCacheCli
     };
 
     /// <summary>Runs one command line.</summary>
-    /// <param name="args">Arguments (verb first).</param>
+    /// <param name="args">Arguments (verb first). <c>--verbose</c> anywhere adds stack traces to error messages.</param>
     /// <param name="output">Standard output.</param>
     /// <param name="error">Standard error.</param>
     /// <param name="workingDirectory">Directory relative paths resolve against (default: the process's).</param>
     /// <returns>The exit code (<see cref="ExitCodes"/>).</returns>
+    /// <remarks>
+    /// With <c>--json</c>, a failure that produces no result writes <c>{"error": {"code", "exit_code", "message"}}</c> on stdout
+    /// (codes: <c>usage</c>, <c>strict</c>, <c>store_busy</c>, <c>symbol_not_found</c>, <c>error</c>, <c>internal</c>); the
+    /// human-readable message still goes to stderr.
+    /// </remarks>
     public static int Run(string[] args, TextWriter output, TextWriter error, string? workingDirectory = null)
     {
+        bool verbose = args.Contains("--verbose", StringComparer.Ordinal);
+        bool json = args.Contains("--json", StringComparer.Ordinal);
+        args = args.Where(a => !string.Equals(a, "--verbose", StringComparison.Ordinal)).ToArray();
         var ctx = new CliContext(output, error, workingDirectory ?? Environment.CurrentDirectory);
-        if (args.Length == 0)
+
+        int Fail(int exit, string code, string message, Exception? ex = null, string? extra = null)
         {
-            error.WriteLine(Usage);
-            return ExitCodes.Usage;
+            error.WriteLine(message);
+            if (extra is not null) error.WriteLine(extra);
+            if (verbose && ex is not null) error.WriteLine(ex.ToString());
+            if (json) ctx.WriteJson(new ErrorResult(new ErrorBody(code, exit, message)));
+            return exit;
         }
+
+        if (args.Length == 0) return Fail(ExitCodes.Usage, "usage", "usage error: no verb.", extra: Usage);
         if (args[0] is "--help" or "-h" or "help")
         {
             output.WriteLine(Usage);
             return ExitCodes.Ok;
         }
-        if (!Verbs.TryGetValue(args[0], out var verb))
-        {
-            error.WriteLine($"error: unknown verb '{args[0]}'.");
-            error.WriteLine(Usage);
-            return ExitCodes.Usage;
-        }
+        if (!Verbs.TryGetValue(args[0], out var verb)) return Fail(ExitCodes.Usage, "usage", $"usage error: unknown verb '{args[0]}'.", extra: Usage);
         try
         {
             CliArgs parsed = CliArgs.Parse(args[0], args.Skip(1), verb.Spec);
@@ -76,31 +85,36 @@ internal static class ChunkCacheCli
         }
         catch (UsageException ex)
         {
-            error.WriteLine($"usage error: {ex.Message}");
-            error.WriteLine(verb.Help);
-            return ExitCodes.Usage;
+            return Fail(ExitCodes.Usage, "usage", $"usage error: {ex.Message}", ex, verb.Help);
         }
         catch (StrictFailureException ex)
         {
-            error.WriteLine($"strict: {ex.Message}");
-            return ExitCodes.StrictFailure;
+            return Fail(ExitCodes.StrictFailure, "strict", $"strict: {ex.Message}", ex);
         }
         catch (TimeoutException ex)
         {
-            error.WriteLine($"error: store busy: {ex.Message}");
-            return ExitCodes.Error;
+            return Fail(ExitCodes.Error, "store_busy", $"error: store busy: {ex.Message}", ex);
         }
         catch (SymbolNotFoundException ex)
         {
-            error.WriteLine($"error: {ex.Message}");
-            if (ex.Suggestions.Count > 0) error.WriteLine($"  did you mean: {string.Join(", ", ex.Suggestions)}");
-            return ExitCodes.Error;
+            return Fail(ExitCodes.Error, "symbol_not_found", $"error: {ex.Message}", ex,
+                ex.Suggestions.Count > 0 ? $"  did you mean: {string.Join(", ", ex.Suggestions)}" : null);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or InvalidDataException
             or ArgumentException or NotSupportedException or GitException or KeyNotFoundException or FormatException)
         {
-            error.WriteLine($"error: {ex.Message}");
-            return ExitCodes.Error;
+            return Fail(ExitCodes.Error, "error", $"error: {ex.Message}", ex);
+        }
+        catch (Exception ex)
+        {
+            // Anything else is a bug or an unexpected environment: still exit 1 with one clean line (stack trace with --verbose).
+            return Fail(ExitCodes.Error, "internal", $"error: unexpected {ex.GetType().Name}: {ex.Message}" + (verbose ? "" : " (rerun with --verbose for details)"), ex);
         }
     }
+
+    /// <summary>The JSON error document.</summary>
+    internal sealed record ErrorResult(ErrorBody Error);
+
+    /// <summary>The error object.</summary>
+    internal sealed record ErrorBody(string Code, int ExitCode, string Message);
 }

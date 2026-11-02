@@ -47,15 +47,33 @@ public sealed class FixedSizeChunker : IChunker
             string text = _tokenizer.Decode(slice);
             int newlines = text.AsSpan().Count('\n');
             int endLine = startLine + newlines - (text.EndsWith('\n') ? 1 : 0);
-            // Decode-based offsets can drift from the text (a character the tokenizer drops or replaces on decode, e.g. a
-            // Unicode noncharacter such as U+FDD0, or a cut inside a multi-byte character): clamp, and let the last chunk end at
-            // the end of the text, so the chunks always tile the file (ChunkIndex's contract).
+            // Offsets come from the decoded slice, which can differ from the text: the encoder strips characters (dotLLM's
+            // ControlTokenGuard removes U+FDD0 on every encode, so the ids never represent it), and a cut inside a multi-byte
+            // character decodes to U+FFFD. Advance over the text along the decoded characters, skipping stripped markers, and let
+            // the last chunk end at the end of the text, so the chunks always tile the file (ChunkIndex's contract).
             bool last = start + MaxChunkTokens >= ids.Length;
-            int endOffset = last ? file.Text.Length : Math.Min(file.Text.Length, startOffset + text.Length);
+            int endOffset = last ? file.Text.Length : Advance(file.Text, startOffset, text);
             chunks.Add(new Chunk(file.Path, startLine, Math.Max(startLine, endLine), slice) { StartOffset = startOffset, EndOffset = endOffset });
             startOffset = endOffset;
             startLine += newlines;
         }
         return chunks;
     }
+
+    /// <summary>The text offset after <paramref name="decoded"/>, read from <paramref name="offset"/>: one text character per
+    /// decoded character, skipping text characters the encoder strips (U+FDD0) that the decoded text does not have.</summary>
+    private static int Advance(string text, int offset, string decoded)
+    {
+        int p = offset;
+        foreach (char c in decoded)
+        {
+            while (p < text.Length && text[p] != c && text[p] == StrippedOnEncode) p++;
+            if (p >= text.Length) break;
+            p++;
+        }
+        return p;
+    }
+
+    /// <summary>The character dotLLM's encoder strips (<c>ControlTokenGuard.Marker</c>, U+FDD0).</summary>
+    private const char StrippedOnEncode = (char)0xFDD0;
 }

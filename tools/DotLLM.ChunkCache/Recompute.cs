@@ -20,6 +20,9 @@ internal sealed record RecomputeOutcome(int ForwardCalls, int TokensRecomputed, 
 /// </summary>
 internal interface IRecomputeStrategy
 {
+    /// <summary>Backend the recompute runs on (<c>cpu</c>); compare refuses one that differs from its prefill backend.</summary>
+    string Backend { get; }
+
     /// <summary>Short name printed next to each timing, e.g. <c>cpu-per-run</c>.</summary>
     string Path { get; }
 
@@ -37,6 +40,8 @@ internal interface IRecomputeStrategy
 /// </summary>
 internal sealed class CpuPerRunRecompute : IRecomputeStrategy
 {
+    public string Backend => "cpu";
+
     public string Path => "cpu-per-run";
 
     public string Description => "CPU, one Forward per contiguous run of selected positions (SelectiveRecomputer); scattered selections pay one trunk pass per run";

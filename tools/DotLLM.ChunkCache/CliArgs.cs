@@ -33,7 +33,8 @@ internal enum OptionKind
     /// <summary>One value; given twice is a usage error.</summary>
     Single,
 
-    /// <summary>Repeatable, and each value is split on commas (<c>--path a,b --path c</c>).</summary>
+    /// <summary>Repeatable, one value per flag (<c>--path a --path b</c>); a value with a comma is a usage error (no splitting, no
+    /// trimming, so a glob is passed exactly as given).</summary>
     List,
 }
 
@@ -83,9 +84,10 @@ internal sealed class CliArgs
             else throw new UsageException($"{verb}: --{name} needs a value.");
             if (!parsed._values.TryGetValue(name, out List<string>? list)) parsed._values[name] = list = [];
             else if (kind == OptionKind.Single) throw new UsageException($"{verb}: --{name} given more than once.");
-            if (kind == OptionKind.List)
-                list.AddRange(value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
-            else list.Add(value);
+            if (kind == OptionKind.List && value.Contains(',', StringComparison.Ordinal))
+                throw new UsageException($"{verb}: --{name} takes one value per flag and values may not contain commas ('{value}'); "
+                    + $"repeat the flag instead (--{name} a --{name} b).");
+            list.Add(value);
         }
         return parsed;
     }
