@@ -70,6 +70,137 @@ public sealed class VulkanAssemblyTests : IDisposable
         AssertCachesEqual(backend, host, backend, resident, tiny.Config.NumLayers, tiny.KvStride);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Assemble_FailureOnSecondChunk_RollsBackToStartLength(bool resident)
+    {
+        using var tiny = BackendSeamTests.TinyModel.Load(_scratch, "qwen3");
+        var cpu = new CpuChunkBackend(tiny.Config);
+        var encoder = new ChunkEncoder(Fingerprint);
+        ChunkKvEntry a = encoder.Encode(tiny.Model, cpu, ChunkA), b = encoder.Encode(tiny.Model, cpu, ChunkB);
+        using ResidentChunkKvEntry ra = encoder.EncodeResident(tiny.Model, cpu, ChunkA);
+        using ResidentChunkKvEntry rb = encoder.EncodeResident(tiny.Model, cpu, ChunkB);
+        int layers = tiny.Config.NumLayers, stride = tiny.KvStride;
+
+        // A destination that already holds a chunk (start > 0), and its rows as they were.
+        using IKvCache dest = cpu.CreateCache(SyntheticDenseGguf.Context);
+        new ChunkAssembler(tiny.Config, cpu).Assemble(dest, [b], Fingerprint);
+        int start = dest.CurrentLength;
+        var before = Enumerable.Range(0, layers).Select(l =>
+        {
+            float[] k = new float[start * stride], v = new float[start * stride];
+            cpu.ReadRows(dest, l, 0, start, k, v);
+            return (k, v);
+        }).ToArray();
+
+        // The backend fails on the second chunk's first row operation (after the first chunk was written and shifted).
+        var failing = new FailingBackend(cpu, failAtRowOp: layers);
+        var assembler = new ChunkAssembler(tiny.Config, failing);
+        if (resident)
+            Assert.Throws<IOException>(() => assembler.Assemble(dest, [ra, rb], Fingerprint));
+        else
+            Assert.Throws<IOException>(() => assembler.Assemble(dest, [a, b], Fingerprint));
+        Assert.True(failing.RowOps > layers, "fixture: the first chunk was written before the failure");
+
+        Assert.Equal(start, dest.CurrentLength);
+        for (int l = 0; l < layers; l++)
+        {
+            float[] k = new float[start * stride], v = new float[start * stride];
+            cpu.ReadRows(dest, l, 0, start, k, v);
+            Assert.Equal(before[l].k, k);
+            Assert.Equal(before[l].v, v);
+        }
+    }
+
+    [Fact]
+    public void Assembler_RefusesBackendBoundToOtherRope()
+    {
+        using var tiny = BackendSeamTests.TinyModel.Load(_scratch, "qwen3");
+        var cpu = new CpuChunkBackend(tiny.Config);
+        Assert.Null(cpu.Rope); // the CPU backend rotates with whatever it is given
+        RopeParameters rope = RopeParameters.FromConfig(tiny.Config);
+        _ = new ChunkAssembler(tiny.Config, new FailingBackend(cpu, failAtRowOp: -1, rope: rope)); // same parameters: accepted
+        var ex = Assert.Throws<ArgumentException>(() =>
+            new ChunkAssembler(tiny.Config, new FailingBackend(cpu, failAtRowOp: -1, rope: rope with { Theta = rope.Theta * 2 })));
+        Assert.Contains("RoPE", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ResidentEntry_Disposed_IsRefused()
+    {
+        using var tiny = BackendSeamTests.TinyModel.Load(_scratch, "qwen3");
+        var cpu = new CpuChunkBackend(tiny.Config);
+        var encoder = new ChunkEncoder(Fingerprint);
+        using ResidentChunkKvEntry ra = encoder.EncodeResident(tiny.Model, cpu, ChunkA);
+        ResidentChunkKvEntry rb = encoder.EncodeResident(tiny.Model, cpu, ChunkB);
+        Assert.False(rb.IsDisposed);
+        rb.Dispose();
+        Assert.True(rb.IsDisposed);
+        Assert.Throws<ObjectDisposedException>(() => rb.Cache);
+        rb.Dispose(); // idempotent
+
+        using IKvCache dest = cpu.CreateCache(SyntheticDenseGguf.Context);
+        Assert.Throws<ObjectDisposedException>(() => new ChunkAssembler(tiny.Config, cpu).Assemble(dest, [ra, rb], Fingerprint));
+        Assert.Equal(0, dest.CurrentLength);
+    }
+
+    [Fact]
+    public void ResidentAssembly_RefusesShortSourceAndSelfDestination()
+    {
+        using var tiny = BackendSeamTests.TinyModel.Load(_scratch, "qwen3");
+        var cpu = new CpuChunkBackend(tiny.Config);
+        var encoder = new ChunkEncoder(Fingerprint);
+        var assembler = new ChunkAssembler(tiny.Config, cpu);
+        using ResidentChunkKvEntry ra = encoder.EncodeResident(tiny.Model, cpu, ChunkA);
+        using ResidentChunkKvEntry rb = encoder.EncodeResident(tiny.Model, cpu, ChunkB);
+
+        // The destination is one of the chunks' own caches (a hand-built entry over a roomy cache, so capacity alone would not refuse it).
+        ChunkKvEntry a = encoder.Encode(tiny.Model, cpu, ChunkA);
+        IKvCache roomy = cpu.CreateCache(SyntheticDenseGguf.Context);
+        for (int l = 0; l < tiny.Config.NumLayers; l++) cpu.WriteRows(roomy, l, 0, a.KeysPerLayer[l], a.ValuesPerLayer[l]);
+        using var self = new ResidentChunkKvEntry(Fingerprint, ChunkA, roomy, ChunkBackendTags.Cpu);
+        var ex = Assert.Throws<ArgumentException>(() => assembler.Assemble(self.Cache, [rb, self], Fingerprint));
+        Assert.Contains("own cache", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(ChunkA.Length, self.Cache.CurrentLength);
+
+        // A source cache truncated below the chunk length.
+        using IKvCache dest = cpu.CreateCache(SyntheticDenseGguf.Context);
+        rb.Cache.Rollback(ChunkB.Length - 1);
+        Assert.Throws<ArgumentException>(() => assembler.Assemble(dest, [ra, rb], Fingerprint));
+        Assert.Equal(0, dest.CurrentLength);
+    }
+
+    /// <summary>Delegates to a real backend and throws <see cref="IOException"/> at the given row operation (WriteRows or CopyRows, 0-based).</summary>
+    private sealed class FailingBackend(IChunkBackend inner, int failAtRowOp, RopeParameters? rope = null) : IChunkBackend
+    {
+        public int RowOps { get; private set; }
+        public string Tag => inner.Tag;
+        public int ForwardDeviceId => inner.ForwardDeviceId;
+        public RopeParameters? Rope => rope;
+        public IKvCache CreateCache(int maxSeqLen) => inner.CreateCache(maxSeqLen);
+        public void RequireCache(IKvCache cache) => inner.RequireCache(cache);
+        public void ReadRows(IKvCache cache, int layer, int startPos, int count, Span<float> k, Span<float> v) => inner.ReadRows(cache, layer, startPos, count, k, v);
+        public void ShiftKeys(IKvCache cache, int startPos, int count, int delta, RopeParameters r) => inner.ShiftKeys(cache, startPos, count, delta, r);
+
+        public void WriteRows(IKvCache cache, int layer, int startPos, ReadOnlySpan<float> k, ReadOnlySpan<float> v)
+        {
+            Tick();
+            inner.WriteRows(cache, layer, startPos, k, v);
+        }
+
+        public void CopyRows(IKvCache source, int layer, int srcStart, IKvCache destination, int dstStart, int count)
+        {
+            Tick();
+            inner.CopyRows(source, layer, srcStart, destination, dstStart, count);
+        }
+
+        private void Tick()
+        {
+            if (RowOps++ == failAtRowOp) throw new IOException("injected failure (device lost, allocation)");
+        }
+    }
+
     internal static void AssertCachesEqual(IChunkBackend eb, IKvCache expected, IChunkBackend ab, IKvCache actual, int layers, int stride)
     {
         Assert.Equal(expected.CurrentLength, actual.CurrentLength);

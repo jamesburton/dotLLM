@@ -6,7 +6,7 @@ namespace ChunkKvLab;
 /// Chunk-KV reuse lab (research harness, CPU).
 /// <code>
 /// ChunkKvLab e1 --model &lt;gguf&gt; --corpus &lt;dir&gt; --seeds 3 --out results.csv [--sizes 2048,4096,8192] [--pattern *.cs]
-///               [--expect-hash &lt;sha256&gt;] [--first-seed 0] [--cross-check none|cpu] (cpu: with --backend vulkan, also CPU naive)
+///               [--expect-hash &lt;sha256&gt;] [--first-seed 0] [--cross-check none|cpu|cpu+full] (cpu: with --backend vulkan, also CPU naive; +full: also CPU full prefill)
 ///               [--chunk 512] [--continuation 64] [--greedy 16] [--threads 0]
 /// ChunkKvLab e2 --model &lt;gguf&gt; --corpus &lt;dir&gt; --out e2.csv [--sizes 2048,4096] [--budgets 5,10,15,20] [--selectors ...]
 ///               [--contiguous =a,b] [--query 16] [--noise 1] [--expect-hash &lt;sha256&gt;] [--seeds 3] [--first-seed 0]
@@ -86,9 +86,9 @@ internal static class Program
                     opts.GetValueOrDefault("expect-hash"), Get("cross-check", "none") switch
                     {
                         "none" => false,
-                        "cpu" => true,
-                        string x => throw new ArgumentException($"--cross-check must be none or cpu; got '{x}'"),
-                    }, Int("first-seed", 0)));
+                        "cpu" or "cpu+full" => true,
+                        string x => throw new ArgumentException($"--cross-check must be none, cpu or cpu+full; got '{x}'"),
+                    }, Int("first-seed", 0), Get("cross-check", "none") == "cpu+full"));
             case "e2":
             {
                 // "--contiguous =" (value after '=') lets a script pass an empty list.

@@ -283,6 +283,7 @@ public sealed class BackendSeamTests : IDisposable
         public int Calls { get; private set; }
         public string Tag => "positioned-test";
         public int ForwardDeviceId => -1;
+        public RopeParameters? Rope => null;
         public void CopyRows(IKvCache source, int layer, int srcStart, IKvCache destination, int dstStart, int count) => Calls++;
         public IKvCache CreateCache(int maxSeqLen) => throw new NotSupportedException();
         public void RequireCache(IKvCache cache)
@@ -371,6 +372,7 @@ public sealed class BackendSeamTestsGpu : IDisposable
 
         // A shift of rows that were never written is refused (write first, then shift).
         Assert.ThrowsAny<ArgumentException>(() => backend.ShiftKeys(cache, 4, n, 4, RopeParameters.FromConfig(tiny.Config)));
+        Assert.ThrowsAny<ArgumentException>(() => backend.ShiftKeys(cache, 4, n, 0, RopeParameters.FromConfig(tiny.Config))); // range checked at delta 0 too
 
         // Write every layer at offset 4 (zero rows before it), read back: F32 storage, so exact.
         for (int l = 0; l < layers; l++)

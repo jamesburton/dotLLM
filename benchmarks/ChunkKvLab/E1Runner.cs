@@ -12,9 +12,12 @@ namespace ChunkKvLab;
 /// <param name="CrossCheck">On Vulkan: also load the CPU model and run CPU naive concatenation on the same contexts, comparing its logits
 /// and assembled KV with the Vulkan naive cache (G0 pair (a)).</param>
 /// <param name="FirstSeed">First seed (seeds <c>FirstSeed .. FirstSeed + Seeds - 1</c>).</param>
+/// <param name="CrossCheckFull">With <paramref name="CrossCheck"/>: also run the CPU full prefill of each context and compare its logits
+/// with the Vulkan full prefill (<c>cpu_vs_vk_full</c>): the control that separates stale-cache sensitivity from task variance.</param>
 internal sealed record E1Options(
     string ModelPath, string CorpusDir, string Pattern, int Seeds, int[] Sizes, int ChunkTokens, int ContinuationTokens,
-    int GreedyTokens, int Threads, string OutCsv, string? ExpectHash = null, bool CrossCheck = false, int FirstSeed = 0);
+    int GreedyTokens, int Threads, string OutCsv, string? ExpectHash = null, bool CrossCheck = false, int FirstSeed = 0,
+    bool CrossCheckFull = false);
 
 /// <summary>
 /// E1: for each seed and context size, the full prefill (reference), naive concatenation of isolated chunk KV (RoPE-shifted,
@@ -45,6 +48,9 @@ internal static class E1Runner
         var ci = CultureInfo.InvariantCulture;
         CultureInfo.CurrentCulture = ci;
         var total = Stopwatch.StartNew();
+        // A heartbeat in the run log: a host suspend or a stall shows up as a gap between heartbeats.
+        using var heartbeat = new Timer(_ => Console.WriteLine($"[heartbeat {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC, +{total.Elapsed.TotalMinutes:F1} min]"),
+            null, TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5));
         using LabModel lab = LabModel.Load(o.ModelPath, o.Threads);
         bool vulkan = lab.Backend.Tag == ChunkBackendTags.Vulkan;
         if (o.CrossCheck && !vulkan)
@@ -216,6 +222,18 @@ internal static class E1Runner
                     AddKv(kvCsv, seed, L, "cpu_vs_vk_naive", FloorMetrics.Deviation(cpu.Backend, cpuNaive, lab.Backend, naiveCache, L, lab.Geometry));
                     MethodResult cr = Evaluate(cpu, cpuNaive, L, plan.Continuation, o.GreedyTokens, 0);
                     XCheck(xcheck, seed, L, "cpu_vs_vk_naive", cr, nr, vocab);
+
+                    if (o.CrossCheckFull)
+                    {
+                        // Control: CPU vs Vulkan on the FULL prefill of the same context and continuation (the G0 (a) pair on these tasks).
+                        Console.WriteLine(Step("cross-check: CPU full prefill"));
+                        using IKvCache cpuFull = cpu.NewBackendCache(capacity);
+                        sw.Restart();
+                        cpu.Prefill(cpuFull, plan.ContextIds, 0, o.ChunkTokens);
+                        Time("cpu_full_prefill", sw.Elapsed.TotalMilliseconds, L, (L + o.ChunkTokens - 1) / o.ChunkTokens);
+                        MethodResult cf = Evaluate(cpu, cpuFull, L, plan.Continuation, o.GreedyTokens, 0);
+                        XCheck(xcheck, seed, L, "cpu_vs_vk_full", cf, refResult, vocab);
+                    }
                 }
 
                 Console.WriteLine(Step($"done at {total.Elapsed.TotalMinutes:F1} min; {entries.Count} chunks encoded, "
@@ -344,6 +362,7 @@ internal static class E1Runner
 
         public string Tag => inner.Tag;
         public int ForwardDeviceId => inner.ForwardDeviceId;
+        public RopeParameters? Rope => inner.Rope;
         public void RequireCache(IKvCache cache) => inner.RequireCache(cache);
 
         public IKvCache CreateCache(int maxSeqLen)

@@ -29,6 +29,10 @@ public sealed class CpuChunkBackend : IChunkBackend
     public int ForwardDeviceId => -1;
 
     /// <inheritdoc/>
+    /// <remarks>Null: the host shift rotates with the parameters it is passed.</remarks>
+    public RopeParameters? Rope => null;
+
+    /// <inheritdoc/>
     public IKvCache CreateCache(int maxSeqLen)
         => new SimpleKvCache(KvGeometry.FromConfig(_config, compactSlidingWindows: false), maxSeqLen);
 

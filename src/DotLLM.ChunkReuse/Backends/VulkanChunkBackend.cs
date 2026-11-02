@@ -69,7 +69,15 @@ public sealed class VulkanChunkBackend : IChunkBackend, IDisposable
         _rope = rope;
         _variant = ToVariant(rope.Type);
         _shift = RopeShiftKvKernel.Create(device, spvDir);
-        _submit = device.CreateSubmitContext();
+        try
+        {
+            _submit = device.CreateSubmitContext();
+        }
+        catch
+        {
+            _shift.Dispose();
+            throw;
+        }
     }
 
     /// <summary>The device caches are allocated on.</summary>
@@ -81,8 +89,8 @@ public sealed class VulkanChunkBackend : IChunkBackend, IDisposable
     /// <inheritdoc/>
     public int ForwardDeviceId => 0;
 
-    /// <summary>The model's checked plain-RoPE parameters; <see cref="ShiftKeys"/> rotates with exactly these.</summary>
-    public RopeParameters Rope => _rope;
+    /// <summary>The model's checked plain-RoPE parameters; <see cref="ShiftKeys"/> rotates with exactly these and refuses others.</summary>
+    public RopeParameters? Rope => _rope;
 
     /// <summary>
     /// Throws <see cref="NotSupportedException"/> naming the feature unless a plain RoPE delta rotation re-rotates the model's stored
@@ -109,6 +117,11 @@ public sealed class VulkanChunkBackend : IChunkBackend, IDisposable
     /// Throws <see cref="NotSupportedException"/> unless <paramref name="cache"/> has positioned row IO and stores exact F32 rows: a
     /// <see cref="VulkanKvCache"/> with F32 storage and no compact sliding windows.
     /// </summary>
+    /// <remarks>
+    /// It cannot check that the cache lives on this backend's <see cref="Device"/>: <see cref="VulkanKvCache"/> exposes no device
+    /// (requested from the Vulkan owner). A cache from another device is refused only by <c>CopyRowsFrom</c>, when it is reached; the
+    /// assembler then rolls the destination back to its start length.
+    /// </remarks>
     /// <param name="cache">The destination.</param>
     public static void CheckCacheSupported(IKvCache cache)
     {
@@ -153,8 +166,17 @@ public sealed class VulkanChunkBackend : IChunkBackend, IDisposable
 
     /// <inheritdoc/>
     /// <remarks>
+    /// <para>
     /// All RoPE layers are recorded into one command buffer and submitted once (each layer's K is its own buffer, so the dispatches do
-    /// not touch each other's memory; earlier row writes completed on their own fence). One submit per layer cost ~330 ms for 36 layers.
+    /// not touch each other's memory; earlier row writes completed on their own fence). One submit per layer cost ~330 ms for 36 layers
+    /// together with the row IO; the one-submit shift costs ~0.8 ms per 512-row chunk.
+    /// </para>
+    /// <para>
+    /// <b>Contract:</b> not re-entrant and not thread-safe. It records into the backend's own <see cref="VulkanDevice.SubmitContext"/>,
+    /// whose <c>Begin()</c> clears the device-wide hazard tracker, so it must never be called while a model forward on the same device is
+    /// being recorded (call it between completed forwards, as the assembler does). The range is validated even when
+    /// <paramref name="delta"/> is 0 (nothing is dispatched then).
+    /// </para>
     /// </remarks>
     public void ShiftKeys(IKvCache cache, int startPos, int count, int delta, RopeParameters rope)
     {
@@ -163,7 +185,6 @@ public sealed class VulkanChunkBackend : IChunkBackend, IDisposable
         // One source of truth: the parameters checked at construction. A caller passing anything else is a bug, not a request.
         if (rope != _rope)
             throw new ArgumentException($"RoPE parameters {rope} differ from the model's checked {_rope}.", nameof(rope));
-        if (delta == 0) return;
         int headDim = _config.HeadDim;
         // Record every layer, then submit once. A refused argument throws before the submit, so nothing is applied (no layer is left
         // shifted while another is not); the next Begin resets the abandoned recording.

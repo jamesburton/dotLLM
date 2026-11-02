@@ -20,6 +20,12 @@ public interface IChunkBackend
     /// <summary>The <c>deviceId</c> the backend's model forwards with (<c>IModel.Forward</c>): -1 for the CPU, 0 for Vulkan.</summary>
     int ForwardDeviceId { get; }
 
+    /// <summary>
+    /// The RoPE parameters <see cref="ShiftKeys"/> is bound to (it refuses others), or null when the backend rotates with whatever it is
+    /// given. An assembler checks this against its own parameters at construction, before anything is written.
+    /// </summary>
+    RopeParameters? Rope { get; }
+
     /// <summary>Creates an empty exact-F32 KV-cache of this backend for the backend's model.</summary>
     /// <param name="maxSeqLen">Positions the cache holds.</param>
     /// <returns>The cache.</returns>

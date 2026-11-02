@@ -33,6 +33,11 @@ public sealed class ChunkAssembler
         ArgumentNullException.ThrowIfNull(backend);
         _config = config;
         _rope = RopeParameters.FromConfig(config);
+        // A backend bound to other RoPE parameters would refuse the first shift after a chunk was already written: refuse up front.
+        if (backend.Rope is RopeParameters bound && bound != _rope)
+            throw new ArgumentException(
+                $"The backend shifts with RoPE parameters {bound}, but this assembler's config gives {_rope}; they must be the same model.",
+                nameof(backend));
         _backend = backend;
     }
 
@@ -45,8 +50,9 @@ public sealed class ChunkAssembler
     /// <summary>
     /// Appends <paramref name="chunks"/> to <paramref name="destination"/> in list order at running offsets: each chunk's rows are
     /// written at its offset and its keys are then re-rotated in the cache by that offset. The destination is vetted by the backend
-    /// and every chunk is validated before anything is written, so a rejected call leaves the cache unchanged. Entries are not
-    /// modified, so the same entry may appear several times.
+    /// and every chunk is validated before anything is written, so a rejected call leaves the cache unchanged; a failure while writing
+    /// (device or allocation error) rolls the cache back to its start length. Entries are not modified, so the same entry may appear
+    /// several times.
     /// </summary>
     /// <param name="destination">A cache the backend accepts (<see cref="IChunkBackend.RequireCache"/>; CPU: an exact host-F32 <c>SimpleKvCache</c>).</param>
     /// <param name="chunks">Chunks to place, in order.</param>
@@ -79,22 +85,33 @@ public sealed class ChunkAssembler
         }
 
         int offset = start;
-        foreach (ChunkKvEntry chunk in chunks)
+        try
         {
-            int n = chunk.TokenIds.Length;
-            for (int l = 0; l < layers; l++)
-                _backend.WriteRows(destination, l, offset, chunk.KeysPerLayer[l], chunk.ValuesPerLayer[l]);
-            // Keys were encoded at 0..n-1; rotate the placed rows by the offset (NoPE layers are skipped by the backend).
-            if (offset != 0)
-                _backend.ShiftKeys(destination, offset, n, offset, _rope);
-            offset += n;
+            foreach (ChunkKvEntry chunk in chunks)
+            {
+                int n = chunk.TokenIds.Length;
+                for (int l = 0; l < layers; l++)
+                    _backend.WriteRows(destination, l, offset, chunk.KeysPerLayer[l], chunk.ValuesPerLayer[l]);
+                // Keys were encoded at 0..n-1; rotate the placed rows by the offset (NoPE layers are skipped by the backend).
+                if (offset != 0)
+                    _backend.ShiftKeys(destination, offset, n, offset, _rope);
+                offset += n;
+            }
+        }
+        catch
+        {
+            // Row writes advance the cache length as they go: never leave a partly assembled, partly unshifted cache behind.
+            destination.Rollback(start);
+            throw;
         }
     }
 
     /// <summary>
     /// As <see cref="Assemble(IKvCache, IReadOnlyList{ChunkKvEntry}, string)"/>, for chunks still held in their encode caches: the rows
     /// are copied cache to cache (<see cref="IChunkBackend.CopyRows"/>; on Vulkan device to device), then the keys are re-rotated by the
-    /// offset. Everything (fingerprint, backend tag, capacity, the source caches) is validated before anything is written.
+    /// offset. Fingerprint, backend tag, capacity, disposal and the source caches' type, layers, strides and lengths are validated before
+    /// anything is written. A source cache on another device cannot be detected up front (no public device identity on
+    /// <c>VulkanKvCache</c>); it, and any device error, fails during the copy and the destination is rolled back to its start length.
     /// </summary>
     /// <param name="destination">A cache the backend accepts.</param>
     /// <param name="chunks">Resident chunks to place, in order; they are not modified.</param>
@@ -107,12 +124,15 @@ public sealed class ChunkAssembler
         (IPerLayerKvCache perLayer, int start) = Validate(destination, chunks.Count, expectedFingerprint, c =>
         {
             ResidentChunkKvEntry chunk = chunks[c] ?? throw new ArgumentException($"Chunk {c} is null.", nameof(chunks));
+            ObjectDisposedException.ThrowIf(chunk.IsDisposed, chunk);
             return (chunk.ModelFingerprint, chunk.Backend, chunk.Length);
         });
         int layers = perLayer.LayerCount;
         for (int c = 0; c < chunks.Count; c++)
         {
             ResidentChunkKvEntry chunk = chunks[c];
+            if (ReferenceEquals(chunk.Cache, destination))
+                throw new ArgumentException($"Chunk {c}'s own cache is the destination; assemble into a separate cache.", nameof(destination));
             _backend.RequireCache(chunk.Cache);
             if (chunk.Cache is not IPerLayerKvCache src || src.LayerCount != layers)
                 throw new ArgumentException($"Chunk {c}'s cache does not hold the destination's {layers} layers.", nameof(chunks));
@@ -127,14 +147,22 @@ public sealed class ChunkAssembler
         }
 
         int offset = start;
-        foreach (ResidentChunkKvEntry chunk in chunks)
+        try
         {
-            int n = chunk.Length;
-            for (int l = 0; l < layers; l++)
-                _backend.CopyRows(chunk.Cache, l, 0, destination, offset, n);
-            if (offset != 0)
-                _backend.ShiftKeys(destination, offset, n, offset, _rope);
-            offset += n;
+            foreach (ResidentChunkKvEntry chunk in chunks)
+            {
+                int n = chunk.Length;
+                for (int l = 0; l < layers; l++)
+                    _backend.CopyRows(chunk.Cache, l, 0, destination, offset, n);
+                if (offset != 0)
+                    _backend.ShiftKeys(destination, offset, n, offset, _rope);
+                offset += n;
+            }
+        }
+        catch
+        {
+            destination.Rollback(start);
+            throw;
         }
     }
 
