@@ -81,6 +81,16 @@ public sealed class ChunkStoreTests : IDisposable
     }
 
     [Fact]
+    public void Key_GoldenValue_PinsTheEncoding()
+    {
+        // Pins the canonical encoding (scheme string, field order, widths, endianness). An accidental change would orphan every
+        // persistent store (misses, not wrong hits); a deliberate one bumps the scheme string and updates this value.
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
+        // Cross-checked when pinned by an independent re-implementation of the encoding (Python hashlib/struct, 2026-11-02).
+        Assert.Equal("b0f13424a15549bb98aeff929c34318dbb47586ed3056d1dc177a0e6ef1c80de", key.Hex);
+    }
+
+    [Fact]
     public void Key_SameInputs_SameKey()
     {
         ChunkKey a = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);

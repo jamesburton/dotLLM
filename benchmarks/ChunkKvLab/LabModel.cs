@@ -59,7 +59,7 @@ internal sealed unsafe class LabModel : IDisposable
         IModel model = ModelLoader.CreateCpuModelFromGguf(gguf, config, new ThreadingConfig(threads));
         string file = Path.GetFileNameWithoutExtension(path);
         // Content-based identities: a renamed file keeps its chunks, a re-quantized or edited file with the same name does not.
-        string modelId = GgufIdentity.ModelId(gguf, path);
+        string modelId = GgufIdentity.ModelId(gguf);
         string tokenizerId = GgufIdentity.TokenizerId(gguf.Metadata);
         string quant = gguf.Metadata.TryGetValue("general.file_type", out var ft)
             ? "ftype-" + Convert.ToString(ft.Value, System.Globalization.CultureInfo.InvariantCulture) : "unknown";

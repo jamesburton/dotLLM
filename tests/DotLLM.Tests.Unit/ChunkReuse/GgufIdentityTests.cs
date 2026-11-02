@@ -29,12 +29,27 @@ public sealed class GgufIdentityTests : IDisposable
         public string ChatTemplate { get; init; } = "{{ messages }}";
         public string Name { get; init; } = "tiny";
         public int WeightIndexToFlip { get; init; } = -1; // flips a float in the second tensor
-        public int SecondTensorFloats { get; init; } = 4096; // 16 KiB: an index past 4 KiB is outside the sampled prefix
+        public int SecondTensorFloats { get; init; } = 4096; // 16 KiB: floats 1024..3071 (bytes 4 KiB..12 KiB) are not sampled
+        public bool Split { get; init; } // two shards: a.weight in shard 1, b.weight in shard 2
     }
 
     private (string ModelId, string TokenizerId) Ids(Spec spec, string fileName)
     {
+        var (sampled, _, tok) = AllIds(spec, fileName);
+        return (sampled, tok);
+    }
+
+    // Writes the file (or, for a split spec, the set "<stem>-00001-of-00002.gguf" + "-00002-") and returns the sampled model id,
+    // the full-hash model id and the tokenizer id.
+    private (string Sampled, string Full, string Tokenizer) AllIds(Spec spec, string fileName)
+    {
         var w = new GgufWriter();
+        if (spec.Split)
+        {
+            w.AddUInt16("split.no", 0);
+            w.AddUInt16("split.count", 2);
+            w.AddInt32("split.tensors.count", 2);
+        }
         w.AddString("general.architecture", "llama");
         w.AddString("general.name", spec.Name);
         w.AddUInt32("general.alignment", 32);
@@ -48,11 +63,28 @@ public sealed class GgufIdentityTests : IDisposable
         for (int i = 0; i < second.Length; i++) second[i] = 1f + i;
         if (spec.WeightIndexToFlip >= 0) second[spec.WeightIndexToFlip] = -7f;
         w.AddTensor("a.weight", [64], (uint)QuantizationType.F32, Bytes(first));
-        w.AddTensor("b.weight", [second.Length], (uint)QuantizationType.F32, Bytes(second));
-        string path = Path.Combine(_dir, fileName);
-        File.WriteAllBytes(path, w.Build());
+        string path;
+        if (spec.Split)
+        {
+            string stem = Path.GetFileNameWithoutExtension(fileName);
+            path = Path.Combine(_dir, $"{stem}-00001-of-00002.gguf");
+            File.WriteAllBytes(path, w.Build());
+            var w2 = new GgufWriter();
+            w2.AddUInt16("split.no", 1);
+            w2.AddUInt16("split.count", 2);
+            w2.AddUInt32("general.alignment", 32);
+            w2.AddTensor("b.weight", [second.Length], (uint)QuantizationType.F32, Bytes(second));
+            File.WriteAllBytes(Path.Combine(_dir, $"{stem}-00002-of-00002.gguf"), w2.Build());
+        }
+        else
+        {
+            w.AddTensor("b.weight", [second.Length], (uint)QuantizationType.F32, Bytes(second));
+            path = Path.Combine(_dir, fileName);
+            File.WriteAllBytes(path, w.Build());
+        }
         using var gguf = GgufFile.Open(path);
-        return (GgufIdentity.ModelId(gguf, path), GgufIdentity.TokenizerId(gguf.Metadata));
+        Assert.Equal(spec.Split ? 2 : 1, gguf.ShardPaths.Count);
+        return (GgufIdentity.ModelId(gguf), GgufIdentity.ModelId(gguf, fullHash: true), GgufIdentity.TokenizerId(gguf.Metadata));
     }
 
     private static byte[] Bytes(float[] f) => System.Runtime.InteropServices.MemoryMarshal.AsBytes(f.AsSpan()).ToArray();
@@ -77,12 +109,56 @@ public sealed class GgufIdentityTests : IDisposable
     }
 
     [Fact]
-    public void WeightChangeOutsideSampledPrefix_IsNotDetected_DocumentedLimit()
+    public void WeightChangeInSampledTail_ChangesModelId()
     {
-        // The model id hashes the header, the tensor table and the first 4 KiB of every tensor; not a full-weight hash.
-        var a = Ids(new Spec(), "m.gguf");
-        var b = Ids(new Spec { WeightIndexToFlip = 2048 }, "m.gguf");
-        Assert.Equal(a.ModelId, b.ModelId);
+        // The last 4 KiB of every tensor are sampled too: catches end-of-vocab row edits (e.g. trained reserved-token rows).
+        Assert.NotEqual(Ids(new Spec(), "m.gguf").ModelId, Ids(new Spec { WeightIndexToFlip = 4090 }, "m.gguf").ModelId);
+    }
+
+    [Fact]
+    public void WeightChangeInTheMiddle_MissedBySampledId_CaughtByFullHash_DocumentedLimit()
+    {
+        // Bytes 8 KiB into a 16 KiB tensor lie between the sampled head and tail: the sampled id misses the edit, the full hash
+        // does not.
+        var a = AllIds(new Spec(), "m.gguf");
+        var b = AllIds(new Spec { WeightIndexToFlip = 2048 }, "m.gguf");
+        Assert.Equal(a.Sampled, b.Sampled);
+        Assert.NotEqual(a.Full, b.Full);
+        Assert.StartsWith("gguf-full-sha256:", a.Full, StringComparison.Ordinal);
+        Assert.NotEqual(a.Sampled, a.Full);
+    }
+
+    [Fact]
+    public void ModelId_WorksWhileThisProcessHoldsAWritableHandle()
+    {
+        // e.g. a Vulkan zero-copy import alias opened read-write on the same file (#1190).
+        string expected = Ids(new Spec(), "w.gguf").ModelId;
+        string path = Path.Combine(_dir, "w.gguf");
+        using var gguf = GgufFile.Open(path);
+        using var writer = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
+        Assert.Equal(expected, GgufIdentity.ModelId(gguf));
+    }
+
+    [Fact]
+    public void FullHash_SameContentDifferentName_SameId()
+    {
+        Assert.Equal(AllIds(new Spec(), "x.gguf").Full, AllIds(new Spec(), "y.gguf").Full);
+    }
+
+    [Fact]
+    public void SplitSet_IsSupported_AndEveryShardIsHashed()
+    {
+        var a = AllIds(new Spec { Split = true }, "set.gguf");
+        // Renaming the whole set keeps the ids.
+        Assert.Equal(a, AllIds(new Spec { Split = true }, "renamed.gguf"));
+        // A split set is not the same file as the single-file layout of the same tensors.
+        Assert.NotEqual(a.Sampled, Ids(new Spec(), "single.gguf").ModelId);
+        // Changes in the second shard's tensor: head and tail caught by the sampled id, the middle only by the full hash.
+        Assert.NotEqual(a.Sampled, AllIds(new Spec { Split = true, WeightIndexToFlip = 10 }, "s2.gguf").Sampled);
+        Assert.NotEqual(a.Sampled, AllIds(new Spec { Split = true, WeightIndexToFlip = 4090 }, "s3.gguf").Sampled);
+        var mid = AllIds(new Spec { Split = true, WeightIndexToFlip = 2048 }, "s4.gguf");
+        Assert.Equal(a.Sampled, mid.Sampled);
+        Assert.NotEqual(a.Full, mid.Full);
     }
 
     [Fact]

@@ -454,6 +454,27 @@ public sealed class StoredAssemblyTests : IDisposable
         Assert.Equal(before, inner.CurrentLength);
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(49)]
+    public void Assemble_DestinationExactFit_Succeeds(int prefilled)
+    {
+        // CurrentLength + context tokens == MaxLength is a fit, not an overflow.
+        using var tiny = TinyModel.Load(_scratch, seed: 1);
+        var geometry = KvGeometry.FromConfig(tiny.Config, compactSlidingWindows: false);
+        int total = TokA.Length + TokB.Length + TokC.Length;
+        using var cache = new SimpleKvCache(geometry, prefilled + total);
+        if (prefilled > 0)
+        {
+            int[] filler = Enumerable.Range(0, prefilled).Select(i => i % SyntheticDenseGguf.Vocab).ToArray();
+            new ChunkAssembler(tiny.Config).Assemble(cache, [new ChunkEncoder(tiny.Fingerprint).Encode(tiny.Model, filler)], tiny.Fingerprint);
+        }
+        StoredAssembly r = new StoredContextAssembler(tiny.Fingerprint, Tokenizer).Assemble(Context3, tiny.Model, new DictionaryStore(), cache);
+        Assert.Equal(prefilled, r.DestinationOffset);
+        Assert.Equal(prefilled + total, cache.CurrentLength);
+        Assert.Equal(cache.MaxLength, cache.CurrentLength);
+    }
+
     [Fact]
     public void Assemble_NonEmptyDestination_AppendsAtItsLength_AndReportsTheOffset()
     {

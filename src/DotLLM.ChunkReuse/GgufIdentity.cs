@@ -12,46 +12,79 @@ namespace DotLLM.ChunkReuse;
 /// </summary>
 public static class GgufIdentity
 {
-    /// <summary>Bytes of each tensor's data that <see cref="ModelId"/> hashes.</summary>
+    /// <summary>Bytes hashed at the start and at the end of each tensor's data by the sampled <see cref="ModelId"/>.</summary>
     public const int TensorSampleBytes = 4096;
 
     /// <summary>
-    /// SHA-256 over the GGUF header (everything before the tensor data: magic, version, all metadata, the tensor table with names,
-    /// types, shapes and offsets) and the first <see cref="TensorSampleBytes"/> bytes of every tensor's data. Cheap (a few MB of
-    /// reads for a multi-GB file) and independent of the file name.
+    /// Content identity of a GGUF file or split set. For every shard in order (<see cref="GgufFile.ShardPaths"/>) it hashes the shard
+    /// index, the shard length, the shard header (everything before its tensor data: magic, version, all metadata, the tensor table
+    /// with names, types, shapes and offsets), then either the first and last <see cref="TensorSampleBytes"/> of every tensor's data
+    /// (default: a few MB of reads for a multi-GB model) or, with <paramref name="fullHash"/>, every byte. Independent of the file
+    /// names.
     /// </summary>
     /// <remarks>
-    /// Not a full-weight hash: two files with identical metadata and tensor table that differ only after the first 4 KiB of every
-    /// changed tensor get the same id. Weights from another quantization, imatrix, fine-tune or conversion change the metadata, the
-    /// tensor types or the leading blocks in practice; when that is not enough, pass a full weights SHA-256 or a hub revision as the
-    /// model id instead. Split (multi-shard) GGUFs are refused.
+    /// <para>
+    /// <b>What the sampled id does not catch.</b> Two files with identical metadata (including <c>general.name</c>), an identical
+    /// tensor table and the same length whose weights differ only strictly inside some tensors, more than 4 KiB from both ends,
+    /// get the same id. Dense changes (a full fine-tune, a merge, a LoRA merged into attention/MLP, another quantization or imatrix)
+    /// alter the head of every changed tensor and are caught. Row-sparse edits in the middle of a tensor are not: for example a
+    /// fine-tune that trains only some rows of <c>token_embd</c> or <c>output</c> other than the last ones, a surgical edit of a few
+    /// rows, a tool that rewrites only interior blocks, or an adversarial file. Edits to the last rows (e.g. trained reserved or
+    /// special tokens at the end of the vocabulary) fall in the sampled tail and are caught. Use <paramref name="fullHash"/> (or a
+    /// hub revision) when that matters, e.g. for a persistent store shared across model updates.
+    /// </para>
+    /// <para>
+    /// Each tensor's extent runs from its offset to the next tensor's offset in the same shard (or the end of the shard), so the
+    /// tail sample may include up to the alignment's worth of padding. Identify the file before any writable mapping (e.g. a
+    /// Vulkan import alias) can modify it.
+    /// </para>
     /// </remarks>
-    /// <param name="gguf">The opened file (for the data-section offset and the tensor table).</param>
-    /// <param name="path">Path of the same file.</param>
-    /// <returns><c>gguf-sha256:</c> followed by 64 lowercase hex characters.</returns>
-    /// <exception cref="NotSupportedException">The GGUF is a split set.</exception>
-    public static string ModelId(GgufFile gguf, string path)
+    /// <param name="gguf">The opened file or split set.</param>
+    /// <param name="fullHash">Hash every byte of every shard instead of sampling the tensor data.</param>
+    /// <returns><c>gguf-sha256:</c> (sampled) or <c>gguf-full-sha256:</c> (full) followed by 64 lowercase hex characters.</returns>
+    public static string ModelId(GgufFile gguf, bool fullHash = false)
     {
         ArgumentNullException.ThrowIfNull(gguf);
-        ArgumentException.ThrowIfNullOrEmpty(path);
-        if (gguf.Metadata.TryGetValue("split.count", out GgufMetadataValue split) && Convert.ToInt64(split.Value, CultureInfo.InvariantCulture) > 1)
-            throw new NotSupportedException("GgufIdentity.ModelId does not support split GGUF sets; pass a content hash of all shards instead.");
+        IReadOnlyList<string> shards = gguf.ShardPaths;
+        var shardIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (int i = 0; i < shards.Count; i++) shardIndex[shards[i]] = i;
+        var offsetsByShard = shards.Select(_ => new List<long>()).ToArray();
+        foreach (GgufTensorDescriptor t in gguf.Tensors)
+        {
+            (string path, long offset) = gguf.GetTensorFileLocation(t.Name);
+            offsetsByShard[shardIndex[path]].Add(offset);
+        }
 
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
-        long dataStart = gguf.DataSectionOffset;
-        long fileLength = fs.Length;
-        if (dataStart <= 0 || dataStart > fileLength) throw new InvalidDataException($"GGUF data offset {dataStart} outside the file ({fileLength} B).");
-        AppendRange(hash, fs, 0, dataStart);
-
-        // Tensor data samples in offset order; each sample stops at the next tensor's start (or the end of the file).
-        long[] offsets = gguf.Tensors.Select(t => dataStart + (long)t.DataOffset).Distinct().Order().ToArray();
-        for (int i = 0; i < offsets.Length; i++)
+        AppendInt(hash, shards.Count);
+        for (int s = 0; s < shards.Count; s++)
         {
-            long end = i + 1 < offsets.Length ? offsets[i + 1] : fileLength;
-            AppendRange(hash, fs, offsets[i], Math.Min(TensorSampleBytes, Math.Max(0, end - offsets[i])));
+            // ReadWrite sharing: this process may already hold a writable alias of the file (Vulkan zero-copy import).
+            using var fs = new FileStream(shards[s], FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            long length = fs.Length;
+            AppendInt(hash, s);
+            AppendLong(hash, length);
+            if (fullHash)
+            {
+                AppendRange(hash, fs, 0, length);
+                continue;
+            }
+
+            long[] offsets = offsetsByShard[s].Distinct().Order().ToArray();
+            long dataStart = s == 0 ? gguf.DataSectionOffset : offsets.Length > 0 ? offsets[0] : length;
+            if (dataStart <= 0 || dataStart > length)
+                throw new InvalidDataException($"GGUF shard {shards[s]}: data offset {dataStart} outside the file ({length} B).");
+            AppendRange(hash, fs, 0, dataStart);
+            for (int i = 0; i < offsets.Length; i++)
+            {
+                long end = i + 1 < offsets.Length ? offsets[i + 1] : length;
+                long extent = Math.Max(0, end - offsets[i]);
+                long n = Math.Min(TensorSampleBytes, extent);
+                AppendRange(hash, fs, offsets[i], n);       // head
+                AppendRange(hash, fs, offsets[i] + extent - n, n); // tail
+            }
         }
-        return "gguf-sha256:" + Convert.ToHexStringLower(hash.GetHashAndReset());
+        return (fullHash ? "gguf-full-sha256:" : "gguf-sha256:") + Convert.ToHexStringLower(hash.GetHashAndReset());
     }
 
     /// <summary>
@@ -91,6 +124,8 @@ public static class GgufIdentity
                 AppendInt(hash, a.Length);
                 foreach (string s in a) AppendString(hash, s ?? "");
                 break;
+            // Raw element bytes in host order (Buffer.BlockCopy is native-endian); GgufReader and FileChunkStore assume a
+            // little-endian host, so ids are defined for little-endian hosts only.
             case Array a when a.GetType().GetElementType() is { IsPrimitive: true } elem:
                 AppendString(hash, elem.FullName + "[]");
                 byte[] bytes = new byte[Buffer.ByteLength(a)];
@@ -119,6 +154,13 @@ public static class GgufIdentity
             hash.AppendData(buffer, 0, n);
             left -= n;
         }
+    }
+
+    private static void AppendLong(IncrementalHash hash, long value)
+    {
+        Span<byte> b = stackalloc byte[8];
+        BinaryPrimitives.WriteInt64LittleEndian(b, value);
+        hash.AppendData(b);
     }
 
     private static void AppendInt(IncrementalHash hash, int value)
