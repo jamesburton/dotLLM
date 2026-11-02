@@ -145,11 +145,11 @@ public sealed class SolutionScannerTests : IClassFixture<SolutionScannerTests.Mi
         ITokenizer tok = new CharTokenizer();
         Chunk[] chunks = scan.AuthoredFiles.SelectMany(new SymbolChunker(tok, 4096).Chunk).ToArray();
         ProjectCompilation app = scan.Compilations.Single(c => c.Name == "App"), lib = scan.Compilations.Single(c => c.Name == "Lib(net10.0)");
-        Assert.Throws<ArgumentException>(() => new RoslynGraphBuilder(tok).Build([app, app], chunks));
+        Assert.Contains("more than one project", Assert.Throws<ArgumentException>(() => new RoslynGraphBuilder(tok).Build([app, lib, app], chunks)).Message, StringComparison.Ordinal);
         // A tree must belong to its project's compilation.
-        Assert.Throws<ArgumentException>(() => new RoslynGraphBuilder(tok).Build([app with { Compilation = lib.Compilation }, lib], chunks));
+        Assert.Contains("is not in project", Assert.Throws<ArgumentException>(() => new RoslynGraphBuilder(tok).Build([app with { Compilation = lib.Compilation }, lib], chunks)).Message, StringComparison.Ordinal);
         // Every chunked file must be owned by a project.
-        Assert.Throws<ArgumentException>(() => new RoslynGraphBuilder(tok).Build([app], chunks));
+        Assert.Contains("is not among the files", Assert.Throws<ArgumentException>(() => new RoslynGraphBuilder(tok).Build([app], chunks)).Message, StringComparison.Ordinal);
     }
 
     // ---------------------------------------------------------------------------------------------------------------
