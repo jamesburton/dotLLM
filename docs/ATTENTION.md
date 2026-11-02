@@ -417,6 +417,28 @@ tolerances: GQA 6 and 8 with several KV heads, MHA, position offsets, ragged til
 `VulkanQwen3HybridDenseGqaFlashTests` (whole model, 12 / 2 heads at hd256, both storages, vs the pre-#441 path). Mutants (wrong
 head mapping, missing rescale, causal off by one; each on both implementations) fail every case of their implementation.
 
+### Dense prefill attention on the GQA-grouped kernel — issue #1548 (2026-11)
+
+**Finding.** Dense (non-hybrid, non-sink) Vulkan models (Qwen3, Llama, Qwen2.5, ...) prefilled with the per-head coopmat flash
+kernel (`attn_flash_cm`, one workgroup = one query head x 16 rows): ~1.5 TFLOP/s at depth, so attention became 34 % of a
+1024-row chunk at KV 1024 and 88 % at KV 7168 (`DOTLLM_VULKAN_PREFILL_PROFILE=gpu`, Qwen3-4B Q4_K_M, Strix, chunks of 1024).
+The cause is the kernel design documented above (K/V re-fetched per query head, 16-row amortisation), not the projections or
+the KV write. The GQA-grouped tiled kernel (`attn_flash_gqa`, previously used only by the hd256 hybrids, sinks and the #1540
+per-position path) is now the ordinary causal prefill attention for every `head_dim <= 256` multiple of 16 on F32 KV.
+
+Per-layer-sum attention time of one 1024-row chunk, old -> new: 201 -> 40 ms (KV 1024), 567 -> 111 (2048), 1334 -> 262 (4096),
+3052 -> 448 (7168).
+
+Full prefill GPU time (summed forward GPU timestamps, 1024-row chunks, 3 paired reps): 1.9K tok 1.43 -> 0.90 s, 3.7K tok
+4.0 -> 2.0 s, 7.4K tok 14.7 -> 4.7 s; 14.8K tok 13.2 s (was ~71 s at 16K in the issue), 33K tok 67 s (was ~305 s). llama.cpp Vulkan
+(`-fa 1 -ub 1024`, same model) pp8192 = 1086-1202 tok/s; dotLLM 7.4K tok = ~1580 tok/s of GPU time. At 33K the new kernel is
+near its own roofline (~6.6 TFLOP/s x causal FLOPs), so further long-context gains need a better kernel, not routing.
+
+`DOTLLM_VULKAN_ATTN_PREFILL=ref` (or `VulkanTransformerModel.PrefillGqaFlashEnabled = false`) restores the per-head flash
+kernel as the oracle/fallback; `DOTLLM_VULKAN_FA_GQA=0` disables the GQA kernel everywhere. Parity: `VulkanPrefillGqaFlashTests`
+(Qwen3-4B, 2 x 1024 rows, second chunk at offset 1024): K/V rel-L2 5e-4 / 9e-4 mean, last-row KL 1.5e-7, same argmax; mutants
+(`positionOffset: 0`, `seqKv - 1`) fail it with mean rel-L2 0.35 / 2e-3 and KL 0.75 / 0.48.
+
 ### Tuning headroom (deferred — workable WG=64 + BR=16 baseline shipped)
 
 Things worth probing on Strix Halo before tile sizes lock in:

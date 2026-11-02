@@ -128,7 +128,10 @@ public class VulkanSelectiveRecomputeTests
         Assert.Equal(0.0, sub.other);              // rows outside the subset are byte-identical
         Assert.Equal(0.0, ctl.other);
         // The recompute is as close to the full prefill as the control, which has no non-contiguity at all.
-        Assert.True(sub.k <= 2 * ctl.k + 1e-3 && sub.v <= 2 * ctl.v + 1e-3,
-            $"subset recompute drifts more than the numerics floor: K {sub.k:E2} vs {ctl.k:E2}, V {sub.v:E2} vs {ctl.v:E2}");
+        // The worst-row (max over the rows) metric is heavy-tailed: since #1548 the prefill reference runs the GQA-grouped kernel and the
+        // 8-row control's max moved by 1.4x with the mean unchanged, so the floor is the larger of the control and the #1534 oracle arm.
+        double floorK = Math.Max(ctl.k, refr.k), floorV = Math.Max(ctl.v, refr.v);
+        Assert.True(sub.k <= 2 * floorK + 1e-3 && sub.v <= 2 * floorV + 1e-3,
+            $"subset recompute drifts more than the numerics floor: K {sub.k:E2} vs {floorK:E2}, V {sub.v:E2} vs {floorV:E2}");
     }
 }
