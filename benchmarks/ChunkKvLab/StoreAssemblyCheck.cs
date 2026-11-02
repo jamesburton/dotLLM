@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Runtime.InteropServices;
 using DotLLM.ChunkReuse;
 using DotLLM.ChunkReuse.CodeCorpus;
+using DotLLM.ChunkReuse.Graph;
 using DotLLM.ChunkReuse.Store;
 using DotLLM.Engine.KvCache;
 
@@ -25,7 +26,8 @@ internal static class StoreAssemblyCheck
         using LabModel lab = LabModel.Load(o.ModelPath, o.Threads);
         int vocab = lab.Config.VocabSize;
         Corpus corpus = TasksRunner.LoadCorpus(o.CorpusDir, o.Chunker, o.ChunkTokens, lab.Tokenizer, o.ExpectHash);
-        IReadOnlyList<CodeContextPlan> plans = E4Command.SelectPlans(o, corpus);
+        IReadOnlyList<CodeContextPlan> plans = E4Command.SelectPlans(o, corpus,
+            o.ContextKind == "related" ? new RoslynGraphBuilder(lab.Tokenizer).Build(corpus) : null);
         if (Directory.Exists(storeDir) && Directory.EnumerateFileSystemEntries(storeDir).Any())
             throw new InvalidOperationException($"store directory {storeDir} is not empty");
         string tokenizerId = lab.TokenizerId;
