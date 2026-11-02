@@ -17,9 +17,20 @@ internal static class SyntheticDenseGguf
     public const int Hidden = 64, Layers = 3, Heads = 4, Kv = 2, HeadDim = 16, Ff = 96, Vocab = 48, Context = 64;
     public const float RopeTheta = 100f;
 
+    /// <summary>Vocabulary size and context length of <see cref="Build"/> with <c>byteLevelVocab</c>.</summary>
+    public const int ByteVocab = 256, ByteContext = 8192;
+
     /// <summary>Builds the GGUF bytes for <paramref name="arch"/> (<c>qwen3</c> or <c>llama</c>).</summary>
-    public static byte[] Build(string arch, int seed = 20261031)
+    /// <param name="arch">Architecture.</param>
+    /// <param name="seed">Weight seed.</param>
+    /// <param name="byteLevelVocab">
+    /// False (default): the 48-token <c>t0..t47</c> vocabulary of the id-level tests. True: a GPT-2 byte-level vocabulary of the
+    /// 256 byte tokens (no merges), so the GGUF's own tokenizer encodes any UTF-8 text one token per byte and decodes it back
+    /// exactly, and a context length of <see cref="ByteContext"/>: a whole-tool test model (chunkcache) that reads source files.
+    /// </param>
+    public static byte[] Build(string arch, int seed = 20261031, bool byteLevelVocab = false)
     {
+        int vocab = byteLevelVocab ? ByteVocab : Vocab;
         bool qkNorm = arch switch
         {
             "qwen3" => true,
@@ -31,7 +42,7 @@ internal static class SyntheticDenseGguf
         var w = new GgufWriter();
         w.AddString("general.architecture", arch);
         w.AddUInt32("general.alignment", 32);
-        w.AddUInt32($"{arch}.context_length", Context);
+        w.AddUInt32($"{arch}.context_length", (uint)(byteLevelVocab ? ByteContext : Context));
         w.AddUInt32($"{arch}.embedding_length", Hidden);
         w.AddUInt32($"{arch}.block_count", Layers);
         w.AddUInt32($"{arch}.feed_forward_length", Ff);
@@ -44,17 +55,18 @@ internal static class SyntheticDenseGguf
         w.AddFloat32($"{arch}.rope.freq_base", RopeTheta);
         w.AddFloat32($"{arch}.attention.layer_norm_rms_epsilon", 1e-6f);
 
-        var tokens = new string[Vocab];
-        for (int i = 0; i < Vocab; i++)
-            tokens[i] = "t" + i.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        var tokens = byteLevelVocab ? ByteLevelTokens() : new string[Vocab];
+        if (!byteLevelVocab)
+            for (int i = 0; i < Vocab; i++)
+                tokens[i] = "t" + i.ToString(System.Globalization.CultureInfo.InvariantCulture);
         w.AddString("tokenizer.ggml.model", "gpt2");
         w.AddStringArray("tokenizer.ggml.tokens", tokens);
-        w.AddInt32Array("tokenizer.ggml.token_type", Enumerable.Repeat(1, Vocab).ToArray());
+        w.AddInt32Array("tokenizer.ggml.token_type", Enumerable.Repeat(1, vocab).ToArray());
         w.AddStringArray("tokenizer.ggml.merges", []);
 
-        Matrix(w, rng, "token_embd.weight", Hidden, Vocab, 0.6f);
+        Matrix(w, rng, "token_embd.weight", Hidden, vocab, 0.6f);
         Norm(w, rng, "output_norm.weight", Hidden);
-        Matrix(w, rng, "output.weight", Hidden, Vocab, 0.25f);
+        Matrix(w, rng, "output.weight", Hidden, vocab, 0.25f);
 
         float sh = 1.4f / MathF.Sqrt(Hidden);
         for (int i = 0; i < Layers; i++)
@@ -76,6 +88,20 @@ internal static class SyntheticDenseGguf
             Matrix(w, rng, $"{p}.ffn_down.weight", Ff, Hidden, 1.4f / MathF.Sqrt(Ff));
         }
         return w.Build();
+    }
+
+    /// <summary>GPT-2's bytes_to_unicode: token i is the printable character standing for byte i.</summary>
+    private static string[] ByteLevelTokens()
+    {
+        var printable = new List<int>();
+        for (int b = '!'; b <= '~'; b++) printable.Add(b);
+        for (int b = 0xA1; b <= 0xAC; b++) printable.Add(b);
+        for (int b = 0xAE; b <= 0xFF; b++) printable.Add(b);
+        var tokens = new string[256];
+        int extra = 0;
+        for (int b = 0; b < 256; b++)
+            tokens[b] = ((char)(printable.Contains(b) ? b : 256 + extra++)).ToString();
+        return tokens;
     }
 
     private static double Gauss(Random r)

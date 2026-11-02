@@ -59,4 +59,7 @@
     <Project Path="tests/DotLLM.Tests.Unit/DotLLM.Tests.Unit.csproj" />
     <Project Path="tests/DotLLM.Tray.Tests/DotLLM.Tray.Tests.csproj" />
   </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/DotLLM.ChunkCache/DotLLM.ChunkCache.csproj" />
+  </Folder>
 </Solution>

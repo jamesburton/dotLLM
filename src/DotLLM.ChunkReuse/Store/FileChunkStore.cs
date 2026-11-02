@@ -121,6 +121,32 @@ public sealed class FileChunkStore : IChunkStore
         catch (UnauthorizedAccessException) { return false; }
     }
 
+    /// <summary>
+    /// Reads only the header of <paramref name="key"/>'s entry and returns the model fingerprint it was written with (for
+    /// per-model eviction without loading the K/V payload). A missing or invalid entry (the same checks as
+    /// <see cref="Contains"/>) gives false.
+    /// </summary>
+    /// <param name="key">Chunk key.</param>
+    /// <param name="fingerprint">The entry's model fingerprint when the entry is valid.</param>
+    /// <returns>Whether a valid entry exists.</returns>
+    public bool TryReadFingerprint(ChunkKey key, out string fingerprint)
+    {
+        fingerprint = "";
+        string path = PathOf(key);
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
+            long length = fs.Length;
+            byte[] head = new byte[(int)Math.Min(length, MaxHeaderBytes)];
+            fs.ReadExactly(head);
+            if (!TryParseHeader(head, length, key, out Header h)) return false;
+            fingerprint = h.Fingerprint;
+            return true;
+        }
+        catch (IOException) { return false; }
+        catch (UnauthorizedAccessException) { return false; }
+    }
+
     /// <inheritdoc/>
     public bool TryGet(ChunkKey key, out ChunkKvEntry entry)
     {

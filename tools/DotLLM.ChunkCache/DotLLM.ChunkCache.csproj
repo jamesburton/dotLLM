@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- Not a dotnet tool package yet: the release plan (Phase S Task 9) decides the package set and the command name. -->
+    <IsPackable>false</IsPackable>
+    <AssemblyName>chunkcache</AssemblyName>
+    <RootNamespace>DotLLM.ChunkCache</RootNamespace>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <Description>chunkcache (research): build, select, status, evict and compare for dotLLM chunk-level KV reuse over a .NET solution or a source directory.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\DotLLM.ChunkReuse\DotLLM.ChunkReuse.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.ChunkReuse.Solution\DotLLM.ChunkReuse.Solution.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.Models\DotLLM.Models.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.Tokenizers\DotLLM.Tokenizers.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.Engine\DotLLM.Engine.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.Cpu\DotLLM.Cpu.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="DotLLM.Tests.Unit" />
+  </ItemGroup>
+
+</Project>

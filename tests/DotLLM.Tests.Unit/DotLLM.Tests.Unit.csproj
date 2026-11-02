@@ -29,6 +29,7 @@
     <ProjectReference Include="..\..\src\DotLLM.ChunkReuse\DotLLM.ChunkReuse.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.ChunkReuse.Solution\DotLLM.ChunkReuse.Solution.csproj" />
     <ProjectReference Include="..\..\benchmarks\ChunkKvLab\ChunkKvLab.csproj" />
+    <ProjectReference Include="..\..\tools\DotLLM.ChunkCache\DotLLM.ChunkCache.csproj" />
   </ItemGroup>
 
   <ItemGroup>
