@@ -554,6 +554,8 @@ public sealed class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTests.Fixtur
                 Assert.True(x.GetProperty("forward_calls").GetInt32() >= 1);
                 Assert.True(x.GetProperty("reuse_ms").GetDouble() >= x.GetProperty("recompute_ms").GetDouble());
                 Assert.True(x.GetProperty("exact_match").ValueKind is JsonValueKind.True or JsonValueKind.False);
+                if (x.GetProperty("budget_pct").GetDouble() < 100)
+                    Assert.True(x.GetProperty("kl").GetDouble() > 0, $"{chunker} {x.GetProperty("arm")}: a partial recompute starts from the naive cache");
                 if (x.GetProperty("budget_pct").GetDouble() == 100)
                 {
                     // Recomputing every position in one run is full prefill: same logits.
@@ -610,6 +612,28 @@ public sealed class ChunkCacheCliTests : IClassFixture<ChunkCacheCliTests.Fixtur
         Assert.Equal(2, Cli(["compare", "--task", task, "--model", _fx.ModelA, "--store", store, "--directory", _fx.TreeTemplate]).Code);
         File.WriteAllText(task, """{"select": {"paths": ["src/Calc.cs"]}, "query": "x", "typo_field": 1}""");
         Assert.Equal(2, Cli(["compare", "--task", task, "--model", _fx.ModelA, "--store", store, "--directory", _fx.TreeTemplate]).Code);
+    }
+
+    [Fact]
+    public void Compare_Metrics_KlIsReferenceToArm_Top1AndLineRange()
+    {
+        // KL(p || q) with p = softmax([ln 3, 0]) = (3/4, 1/4) and q = (1/4, 3/4): 3/4 ln 3 + 1/4 ln(1/3) = ln 3 / 2; reversed it is
+        // the same here, so use an asymmetric pair too: p = (1/2, 1/2), q = (9/10, 1/10).
+        float[] p = [0f, 0f], q = [MathF.Log(9f), 0f];
+        double pq = 0.5 * Math.Log(0.5 / 0.9) + 0.5 * Math.Log(0.5 / 0.1);
+        double qp = 0.9 * Math.Log(0.9 / 0.5) + 0.1 * Math.Log(0.1 / 0.5);
+        Assert.Equal(pq, CompareCommand.Kl(p, q), 6);
+        Assert.NotEqual(Math.Round(qp, 6), Math.Round(pq, 6));
+        (double kl, double max, double top1) = CompareCommand.Agreement([0f, 0f, 1f, 0f], [MathF.Log(9f), 0f, 1f, 0f], 2, 2);
+        Assert.Equal(pq / 2, kl, 6);
+        Assert.Equal(pq, max, 6);
+        Assert.Equal(1.0, top1); // row 0: argmax ties -> index 0 both; row 1: index 0 both
+        Assert.Equal(0.5, CompareCommand.Agreement([0f, 1f, 1f, 0f], [1f, 0f, 1f, 0f], 2, 2).Top1);
+
+        Assert.Equal((3, 8), CompareCommand.LineRange("ab\ncdef\ng\n", 2, 2));
+        Assert.Equal((0, 8), CompareCommand.LineRange("ab\ncdef\ng\n", 1, 2));
+        Assert.Equal((8, 9), CompareCommand.LineRange("ab\ncdef\ng", 3, 3));
+        Assert.Throws<InvalidOperationException>(() => CompareCommand.LineRange("ab\n", 3, 3));
     }
 
     // ------------------------------------------------------------------------------------------------ JSON schemas
