@@ -30,6 +30,7 @@ public sealed class StoredAssemblyTests : IDisposable
     private static readonly int[] TokB = [8, 22, 1, 35];
     private static readonly int[] TokC = [12, 7, 44, 2, 19];
     private static readonly int[] TokD = [30, 6, 21];
+    private static readonly int[] TokE = [10, 25, 33, 4, 16, 27]; // same length as TokA: a slot mix-up keeps shapes valid
     private static readonly int[] Query = [9, 14, 38];
 
     private readonly string _scratch = Path.Combine(Path.GetTempPath(), "dotllm-storedasm-" + Guid.NewGuid().ToString("N"));
@@ -64,7 +65,8 @@ public sealed class StoredAssemblyTests : IDisposable
     {
         using var tiny = TinyModel.Load(_scratch, seed: 1);
         string fp = tiny.Fingerprint;
-        IReadOnlyList<Chunk> chunks = Context4;
+        // A and E have the same length and sit side by side, so placing an entry in the wrong slot passes every shape check.
+        IReadOnlyList<Chunk> chunks = [Ch("a.cs", TokA), Ch("e.cs", TokE), Ch("b.cs", TokB), Ch("c.cs", TokC), Ch("copy-of-a.cs", TokA)];
 
         // Oracle: fresh encodes, no store.
         var encoder = new ChunkEncoder(fp);
@@ -103,12 +105,12 @@ public sealed class StoredAssemblyTests : IDisposable
 
         // Fixture guard: the comparison discriminates. Swapping two chunks' K/V (same total length) changes the cache.
         using SimpleKvCache swapped = NewCache(tiny);
-        new ChunkAssembler(tiny.Config).Assemble(swapped, [fresh[1], fresh[0], fresh[2], fresh[3]], fp);
+        new ChunkAssembler(tiny.Config).Assemble(swapped, [fresh[1], fresh[0], fresh[2], fresh[3], fresh[4]], fp);
         Assert.False(CachesBitEqual(tiny, freshCache, swapped, length), "fixture cannot tell chunk order apart");
 
         // The context is the token-level view of the same chunks, followed by the query.
         Assert.Equal(chunks.SelectMany(c => c.TokenIds).ToArray(), warm.Context.TokenIds);
-        Assert.Equal(new[] { 0, 6, 10, 15 }, warm.Context.ChunkStarts);
+        Assert.Equal(new[] { 0, 6, 12, 16, 21 }, warm.Context.ChunkStarts);
         Assert.Equal(Query, warm.Context.QueryTokenIds);
         _output.WriteLine($"cold {cold.Stats}; warm {warm.Stats}; {length} context tokens, bit-exact");
     }
