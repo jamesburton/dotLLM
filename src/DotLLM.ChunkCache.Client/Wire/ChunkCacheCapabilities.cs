@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 using System.Text.Json;
 
 namespace DotLLM.ChunkCache.Client;

@@ -24,6 +24,9 @@
     <PackageTags>llm;kv-cache;chunk-cache;dotllm;agents;openai</PackageTags>
     <!-- Unsafe code is enabled repo-wide for the engine; this package has none. -->
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <!-- Turns on the trim and AOT analyzers (warnings are errors under src/), so the "trim- and AOT-safe" claim on the
+         JSON context is checked by the build rather than asserted. -->
+    <IsAotCompatible>true</IsAotCompatible>
   </PropertyGroup>
 
   <ItemGroup>
@@ -34,6 +37,8 @@
   <ItemGroup>
     <None Remove="$(MSBuildThisFileDirectory)..\..\README.md" />
     <None Include="README.md" Pack="true" PackagePath="\" />
+    <!-- The MIT terms travel with the package and sit in the source folder (the repository root LICENSE is GPL). -->
+    <None Include="LICENSE" Pack="true" PackagePath="\" />
   </ItemGroup>
 
 </Project>

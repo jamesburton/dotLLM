@@ -60,7 +60,43 @@ public sealed class PolicyAndPackageTests
         Assert.Equal("MIT", csproj.Descendants("PackageLicenseExpression").Single().Value);
         Assert.Equal("DotLLM.ChunkCache.Client", csproj.Descendants("PackageId").Single().Value);
 
+        Assert.Contains(csproj.Descendants("None"), n => string.Equals((string?)n.Attribute("Include"), "LICENSE", StringComparison.Ordinal)
+                                                  && string.Equals((string?)n.Attribute("Pack"), "true", StringComparison.Ordinal));
+
         string[] packages = csproj.Descendants("PackageReference").Select(p => (string)p.Attribute("Include")!).ToArray();
         Assert.All(packages, p => Assert.Contains(p, new[] { "Microsoft.Extensions.AI.Abstractions" }));
+    }
+
+    /// <summary>
+    /// The MIT terms are visible in the source tree, not only in nupkg metadata: the repository root LICENSE is GPL, so
+    /// the client folder carries its own MIT LICENSE and every source file an SPDX header.
+    /// </summary>
+    [Fact]
+    public void ClientSources_CarryMitLicenseAndSpdxHeaders()
+    {
+        string dir = Path.Combine(RepoRoot(), "src", "DotLLM.ChunkCache.Client");
+        string license = File.ReadAllText(Path.Combine(dir, "LICENSE"));
+        Assert.StartsWith("MIT License", license, StringComparison.Ordinal);
+        Assert.Contains("Permission is hereby granted, free of charge", license, StringComparison.Ordinal);
+
+        string[] sources = Directory.GetFiles(dir, "*.cs", SearchOption.AllDirectories)
+            .Where(f => !f.Contains(Path.DirectorySeparatorChar + "obj" + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+                        && !f.Contains(Path.DirectorySeparatorChar + "bin" + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+            .ToArray();
+        Assert.NotEmpty(sources);
+        string[] missing = sources.Where(f => !File.ReadLines(f).First().Equals("// SPDX-License-Identifier: MIT", StringComparison.Ordinal))
+            .Select(Path.GetFileName).OfType<string>().ToArray();
+        Assert.True(missing.Length == 0, "no SPDX header: " + string.Join(", ", missing));
+    }
+
+    private static string RepoRoot()
+    {
+        for (var d = new DirectoryInfo(AppContext.BaseDirectory); d is not null; d = d.Parent)
+        {
+            if (File.Exists(Path.Combine(d.FullName, "dotLLM.slnx")))
+                return d.FullName;
+        }
+
+        throw new InvalidOperationException("repository root (dotLLM.slnx) not found above " + AppContext.BaseDirectory);
     }
 }

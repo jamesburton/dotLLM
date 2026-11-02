@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 using System.Text.Json.Serialization;
 
 namespace DotLLM.ChunkCache.Client;
@@ -148,24 +149,18 @@ public sealed record PrewarmText
     /// <summary>The exact chunk text.</summary>
     public string? Text { get; init; }
 
-    /// <summary>Optional provenance; when given, the server applies its deny-list to <c>source.path</c>.</summary>
-    public ChunkSourceWire? Source { get; init; }
+    /// <summary>
+    /// Optional, advisory provenance (contract ruling 14): when present the server applies its deny-list to
+    /// <c>source.path</c>, but a client can omit it, so the server never relies on it.
+    /// </summary>
+    public PrewarmSource? Source { get; init; }
 }
 
-/// <summary>The wire form of a chunk's <c>source</c> object (spec 5.2).</summary>
-public sealed record ChunkSourceWire
+/// <summary>A prewarm item's <c>source</c>: <c>{path}</c> only (contract ruling 14).</summary>
+public sealed record PrewarmSource
 {
-    /// <summary>Source path.</summary>
+    /// <summary>The source path the text came from.</summary>
     public string? Path { get; init; }
-
-    /// <summary>First line.</summary>
-    public int? StartLine { get; init; }
-
-    /// <summary>Last line.</summary>
-    public int? EndLine { get; init; }
-
-    /// <summary>Revision.</summary>
-    public string? Rev { get; init; }
 }
 
 /// <summary>Output of <c>chunkcache_prewarm</c>.</summary>
@@ -309,7 +304,7 @@ public sealed record EvictResult
     public int KeptReferenced { get; init; }
 
     /// <summary>Whether this was a dry run.</summary>
-    public bool DryRun { get; init; }
+    public bool? DryRun { get; init; }
 }
 
 /// <summary>Output of <c>chunkcache_explain</c> (<c>POST /v1/chunk-cache/explain</c>).</summary>

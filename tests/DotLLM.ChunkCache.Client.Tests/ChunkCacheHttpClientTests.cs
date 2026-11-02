@@ -74,8 +74,10 @@ public sealed class ChunkCacheHttpClientTests : IDisposable
     }
 
     /// <summary>
-    /// Only a 404 means "absent". A 401 / 403 / 500 is a present server refusing or failing, and must not silently turn
-    /// annotations off (nor on).
+    /// <c>GetCapabilitiesAsync</c> returns <see langword="null"/> only for "absent" (404, not v1). A 401 / 403 / 500 is a
+    /// present server refusing or failing, so it throws with the status, for diagnostics. Either way the caller strips
+    /// annotations (contract ruling 16): any exception from the probe means "not capable". <c>ProbeAsync</c> packages
+    /// that rule; see <c>ProbeAndReviewFixTests</c>.
     /// </summary>
     [Theory]
     [InlineData(HttpStatusCode.Unauthorized, "authentication_error")]

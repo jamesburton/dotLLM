@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 using System.Net;
 using System.Text;
 using System.Text.Json;
@@ -13,15 +14,20 @@ namespace DotLLM.ChunkCache.Client;
 /// <remarks>
 /// <list type="bullet">
 /// <item><c>GET /v1/chunk-cache</c>: <see langword="null"/> on 404, and on a 200 body that is not JSON or whose
-/// <c>versions</c> lacks 1 (convention absent: strip annotations). Any other error status throws
-/// <see cref="ChunkCacheRequestException"/>: a server that refuses the key is present, not absent.</item>
-/// <item><c>POST /v1/chunk-cache/prewarm</c>: <c>{"texts": [{id, text, source?}], "max_tokens"?}</c>. Text only; a
-/// <c>select</c> input is resolved locally with <c>include_text</c> and its hashes are never sent.</item>
+/// <c>versions</c> lacks 1 (convention absent). Any other error status throws <see cref="ChunkCacheRequestException"/>
+/// (a server that refuses the key is present, and the status helps diagnose it). <b>Either way the caller strips
+/// annotations</b>: contract ruling 16 makes any exception or non-2xx from the probe mean "not capable". Use
+/// <see cref="ChunkCacheProbe.ProbeAsync"/> for that fail-closed form.</item>
+/// <item><c>POST /v1/chunk-cache/prewarm</c>: <c>{"texts": [{id, text, source?: {path}}], "max_tokens"?}</c>. Text only;
+/// a <c>select</c> input is resolved locally with <c>include_text</c> and its hashes are never sent. <c>source.path</c> is
+/// advisory (ruling 14): the server applies its deny-list when present but cannot rely on it.</item>
 /// <item><c>POST /v1/chunk-cache/evict</c>: <c>{mode, path?, namespace?, dry_run}</c>, with <c>mode</c> and
 /// <c>dry_run</c> always sent resolved (<c>orphans</c>, <c>true</c>).</item>
-/// <item><c>POST /v1/chunk-cache/explain</c>: <c>{"request": &lt;the full request body&gt;}</c>.</item>
+/// <item><c>POST /v1/chunk-cache/explain</c>: <c>{"request": &lt;the full request body&gt;}</c> (pinned by ruling 15).</item>
 /// </list>
-/// The API key, when given, is sent as <c>X-API-Key</c>. Tool-level <c>store</c> / <c>server</c> inputs are not sent.
+/// The API key, when given and non-empty, is sent as <c>X-API-Key</c>. User info in the base URL is dropped. Tool-level
+/// <c>store</c> / <c>server</c> inputs are not sent. A 2xx body that is not the expected JSON throws
+/// <see cref="ChunkCacheRequestException"/> too, so callers handle one exception type.
 /// </remarks>
 public sealed class ChunkCacheHttpClient : IChunkCacheClient
 {
@@ -41,10 +47,11 @@ public sealed class ChunkCacheHttpClient : IChunkCacheClient
         ArgumentNullException.ThrowIfNull(baseUrl);
         if (!baseUrl.IsAbsoluteUri) throw new ArgumentException("The base URL must be absolute.", nameof(baseUrl));
         _http = http;
-        _apiKey = apiKey;
+        _apiKey = string.IsNullOrEmpty(apiKey) ? null : apiKey;
         _queries = queries ?? new CliChunkIndexQueries();
 
-        string b = baseUrl.GetLeftPart(UriPartial.Path).TrimEnd('/');
+        // Scheme, host, port and path only: user info never reaches request URLs or exception messages.
+        string b = baseUrl.GetComponents(UriComponents.SchemeAndServer | UriComponents.Path, UriFormat.UriEscaped).TrimEnd('/');
         if (b.EndsWith("/v1", StringComparison.OrdinalIgnoreCase)) b = b[..^3];
         _root = b + "/v1/chunk-cache";
     }
@@ -80,6 +87,10 @@ public sealed class ChunkCacheHttpClient : IChunkCacheClient
     public ValueTask<StatusResult> StatusAsync(StatusRequest request, CancellationToken ct) => _queries.StatusAsync(request, ct);
 
     /// <inheritdoc />
+    /// <remarks>
+    /// When no text remains to send (a <c>select</c> that matched nothing), no request is made and an all-zero
+    /// <see cref="PrewarmResult"/> is returned; it is indistinguishable from a server reply with zero counts.
+    /// </remarks>
     public async ValueTask<PrewarmResult> PrewarmAsync(PrewarmRequest request, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -107,7 +118,7 @@ public sealed class ChunkCacheHttpClient : IChunkCacheClient
                 {
                     Id = c.Id,
                     Text = c.Text,
-                    Source = c.Path is null ? null : new ChunkSourceWire { Path = c.Path, StartLine = c.StartLine, EndLine = c.EndLine },
+                    Source = c.Path is null ? null : new PrewarmSource { Path = c.Path },
                 });
             }
         }
@@ -154,8 +165,18 @@ public sealed class ChunkCacheHttpClient : IChunkCacheClient
         if (!response.IsSuccessStatusCode)
             throw Failure("POST", url, response.StatusCode, body);
 
-        return JsonSerializer.Deserialize(body, resultType)
-            ?? throw new ChunkCacheRequestException(response.StatusCode, null, null, $"POST {url} returned JSON null.");
+        T? result;
+        try
+        {
+            result = JsonSerializer.Deserialize(body, resultType);
+        }
+        catch (JsonException ex)
+        {
+            throw new ChunkCacheRequestException(response.StatusCode, null, null,
+                $"POST {url} returned a body that is not the expected JSON: {ex.Message}", ex);
+        }
+
+        return result ?? throw new ChunkCacheRequestException(response.StatusCode, null, null, $"POST {url} returned JSON null.");
     }
 
     private HttpRequestMessage NewRequest(HttpMethod method, string url, HttpContent? content)

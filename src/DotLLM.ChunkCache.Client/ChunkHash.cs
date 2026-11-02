@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 using System.Security.Cryptography;
 using System.Text;
 
@@ -15,18 +16,15 @@ public static class ChunkHash
     /// </summary>
     /// <remarks>
     /// <paramref name="text"/> is the <b>decoded</b> string (a .NET string, or a JSON string value after its escapes are
-    /// resolved), never the escaped wire bytes. A lone surrogate encodes as U+FFFD, as <see cref="System.Text.Encoding.UTF8"/>
-    /// does on the server.
+    /// resolved), never the escaped wire bytes. A lone surrogate encodes as U+FFFD (EF BF BD), the default
+    /// <see cref="System.Text.Encoding.UTF8"/> replacement; contract ruling 17 requires the server to do the same.
     /// </remarks>
     public static string Of(string text)
     {
         ArgumentNullException.ThrowIfNull(text);
         Span<byte> digest = stackalloc byte[SHA256.HashSizeInBytes];
         SHA256.HashData(Encoding.UTF8.GetBytes(text), digest);
-#if NET9_0_OR_GREATER
-        return Prefix + Convert.ToHexStringLower(digest);
-#else
+        // One code path for net8.0 and net10.0 (the tests run on net10.0 only, so a TFM branch would go unexercised).
         return Prefix + Convert.ToHexString(digest).ToLowerInvariant();
-#endif
     }
 }

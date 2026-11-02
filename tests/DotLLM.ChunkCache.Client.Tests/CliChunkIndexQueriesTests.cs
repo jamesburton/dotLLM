@@ -5,6 +5,9 @@ namespace DotLLM.ChunkCache.Client.Tests;
 /// <summary><see cref="CliChunkIndexQueries"/> with a fake <see cref="IProcessRunner"/>.</summary>
 public sealed class CliChunkIndexQueriesTests
 {
+    /// <summary>A fully qualified CLI path (it need not exist: a fully qualified path is used as given).</summary>
+    internal static readonly string Exe = Path.Combine(Path.GetTempPath(), "cc-tools", OperatingSystem.IsWindows() ? "chunkcache.exe" : "chunkcache");
+
     private const string SelectJson = """
         {"chunks":[{"id":"src/A.cs:1-9@0","path":"src/A.cs","start_line":1,"end_line":9,"tokens":42,
                     "hash":"sha256:00","reason":"path","detail":"src/*.cs","hop":0,"stored":true,"text":"class A {}\n"}],
@@ -19,7 +22,7 @@ public sealed class CliChunkIndexQueriesTests
     public async Task CliQueries_PassesArgsAndParsesJson()
     {
         var runner = new FakeRunner(new ProcessResult(0, SelectJson, "diagnostics on stderr\n"));
-        var q = new CliChunkIndexQueries("C:/tools/chunkcache.exe", runner);
+        var q = new CliChunkIndexQueries(Exe, runner);
 
         var r = await q.SelectAsync(new SelectRequest
         {
@@ -28,7 +31,7 @@ public sealed class CliChunkIndexQueriesTests
             ChangedSince = "HEAD~3", TokenBudget = 8000, IncludeText = true, Order = "rank",
         }, CancellationToken.None);
 
-        Assert.Equal("C:/tools/chunkcache.exe", runner.Executable);
+        Assert.Equal(Exe, runner.Executable);
         Assert.Equal(
         [
             "select", "--json", "--store", "C:/store", "--solution", "C:/src/App.slnx", "--chunker", "symbol-512",
@@ -59,9 +62,9 @@ public sealed class CliChunkIndexQueriesTests
         var runner = new FakeRunner(new ProcessResult(0,
             """{"total_chunks":10,"missing_chunks":2,"missing_tokens":300,"up_to_date":false,"stale_files":["a.cs"],"new_files":[],"deleted_files":[],"missing":[{"path":"a.cs","start_line":1,"end_line":4,"tokens":150}],"store_bytes":1024,"budget_bytes":4096,"entries":8}""",
             ""));
-        var r = await new CliChunkIndexQueries(runner: runner).StatusAsync(new StatusRequest { Path = path, ListMissing = true }, CancellationToken.None);
+        var r = await new CliChunkIndexQueries(Exe, runner).StatusAsync(new StatusRequest { Path = path, ListMissing = true }, CancellationToken.None);
 
-        Assert.Equal("chunkcache", runner.Executable);
+        Assert.Equal(Exe, runner.Executable);
         Assert.Equal(["status", "--json", option, path, "--list-missing"], runner.Arguments!);
         Assert.Equal(10, r.TotalChunks);
         Assert.False(r.UpToDate);
@@ -77,7 +80,7 @@ public sealed class CliChunkIndexQueriesTests
         var runner = new FakeRunner(new ProcessResult(1, SelectJson, "error: index unreadable: index-symbol-512.json\n"));
 
         var ex = await Assert.ThrowsAsync<ChunkCacheCliException>(() =>
-            new CliChunkIndexQueries(runner: runner).SelectAsync(new SelectRequest(), CancellationToken.None).AsTask());
+            new CliChunkIndexQueries(Exe, runner).SelectAsync(new SelectRequest(), CancellationToken.None).AsTask());
 
         Assert.Equal(1, ex.ExitCode);
         Assert.Contains("index unreadable", ex.Stderr, StringComparison.Ordinal);
@@ -92,7 +95,7 @@ public sealed class CliChunkIndexQueriesTests
     {
         var runner = new FakeRunner(new ProcessResult(0, stdout, ""));
         var ex = await Assert.ThrowsAsync<ChunkCacheCliException>(() =>
-            new CliChunkIndexQueries(runner: runner).StatusAsync(new StatusRequest(), CancellationToken.None).AsTask());
+            new CliChunkIndexQueries(Exe, runner).StatusAsync(new StatusRequest(), CancellationToken.None).AsTask());
         Assert.Equal(0, ex.ExitCode);
     }
 

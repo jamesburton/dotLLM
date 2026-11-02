@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 using System.Text.Json.Nodes;
 
 namespace DotLLM.ChunkCache.Client;
@@ -117,7 +118,11 @@ public sealed record ChunkRequestOptions(string Policy = "exact", string? Select
 /// <summary>Control plane over the server's <c>/v1/chunk-cache</c> endpoints (plus local index operations).</summary>
 public interface IChunkCacheClient
 {
-    /// <summary>Probes <c>GET /v1/chunk-cache</c>. <see langword="null"/> = convention absent: strip annotations.</summary>
+    /// <summary>
+    /// Probes <c>GET /v1/chunk-cache</c>. <see langword="null"/> = convention absent. Implementations may throw for a
+    /// present server that refuses or fails; contract ruling 16 makes <b>any</b> exception mean "not capable" as well, so
+    /// the caller strips annotations in both cases. <see cref="ChunkCacheProbe.ProbeAsync"/> applies that rule.
+    /// </summary>
     ValueTask<ChunkCacheCapabilities?> GetCapabilitiesAsync(CancellationToken ct);
 
     /// <summary>Selects chunks from a local index (a local operation; the server has no select endpoint).</summary>

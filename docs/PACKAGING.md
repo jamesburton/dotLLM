@@ -55,9 +55,14 @@ minutes, so a brand-new version can be downloadable before `dnx` resolves it. Th
 
 Only the tool package is pushed; the `DotLLM.*` libraries are still packed (so a build proves they pack) but not published.
 
-**`DotLLM.ChunkCache.Client` is the one MIT package** (its own `PackageLicenseExpression` override; everything else is
-`GPL-3.0-only`). It stays pure HTTP plus DTOs with no reference to any GPL `DotLLM.*` project, and ships its own README
-instead of the repository's ([CHUNK_CACHE_CLIENT.md](CHUNK_CACHE_CLIENT.md)). It is packed like the others and not pushed.
+**`DotLLM.ChunkCache.Client` is the one MIT package** (its own `PackageLicenseExpression` override and
+`src/DotLLM.ChunkCache.Client/LICENSE`; everything else is `GPL-3.0-only`). It stays pure HTTP plus DTOs with no reference to
+any GPL `DotLLM.*` project, and ships its own README and LICENSE instead of the repository's
+([CHUNK_CACHE_CLIENT.md](CHUNK_CACHE_CLIENT.md)). Like every library it is **not pushed to nuget.org** (`push-nuget` pushes only
+`$DOTLLM_TOOL_PACKAGE_ID`), but it **is published as a GitHub release asset**: `release.yml`'s `pack-nuget` runs `dotnet pack`
+over the whole repository, `create-release` attaches (and attests) every `*.nupkg` / `*.snupkg`, and `ci.yml` calls that
+pipeline on every green push to the fork's `dev`. So each dev prerelease carries `DotLLM.ChunkCache.Client.<version>.nupkg`.
+CI builds its `net8.0` target but runs only `tests/DotLLM.Tests.Unit/`, not `tests/DotLLM.ChunkCache.Client.Tests/`.
 
 Availability checked on nuget.org on 2026-10-05:
 
