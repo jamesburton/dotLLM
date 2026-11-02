@@ -48,6 +48,9 @@ internal static class E1Runner
         var ci = CultureInfo.InvariantCulture;
         CultureInfo.CurrentCulture = ci;
         var total = Stopwatch.StartNew();
+        // Keep the box out of Modern Standby, and this process running if it enters it anyway (KeepAwake).
+        using var awake = KeepAwake.Hold("ChunkKvLab e1: long GPU/CPU measurement run");
+        Console.WriteLine(awake.Description);
         // A heartbeat in the run log: a host suspend or a stall shows up as a gap between heartbeats.
         using var heartbeat = new Timer(_ => Console.WriteLine($"[heartbeat {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC, +{total.Elapsed.TotalMinutes:F1} min]"),
             null, TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5));
