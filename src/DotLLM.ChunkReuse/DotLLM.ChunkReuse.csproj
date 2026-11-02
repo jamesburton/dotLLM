@@ -14,9 +14,6 @@
   <ItemGroup>
     <!-- Code corpus (Corpus/): Roslyn syntax for the symbol chunker, semantic model for cross-file task generation. -->
     <PackageReference Include="Microsoft.CodeAnalysis.CSharp" />
-    <!-- Solution scanner: per-project compilations from MSBuildWorkspace (design-time builds run in Roslyn's BuildHost process). -->
-    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" />
-    <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" />
     <ProjectReference Include="..\DotLLM.Tokenizers\DotLLM.Tokenizers.csproj" />
   </ItemGroup>
 

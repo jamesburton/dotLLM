@@ -10,7 +10,7 @@ namespace DotLLM.ChunkReuse.Graph;
 /// <summary>
 /// Builds a <see cref="ReferenceGraph"/> with the Roslyn semantic model — either one compilation over all files, BCL-only
 /// references (as <see cref="Corpus"/>), or one compilation per project (<see cref="ProjectCompilation"/>, from
-/// <see cref="SolutionScanner"/>): symbols are resolved, never matched by name, and anything that does not resolve to a single
+/// the solution scanner in <c>DotLLM.ChunkReuse.Solution</c>): symbols are resolved, never matched by name, and anything that does not resolve to a single
 /// symbol declared in a chunked file gives no edge.
 /// </summary>
 /// <remarks>
@@ -49,6 +49,12 @@ public sealed class RoslynGraphBuilder
         _tokenizer = tokenizer;
     }
 
+    /// <summary>
+    /// How file paths are compared where one file must not count twice: case-insensitive on Windows (where
+    /// <c>Shared/A.cs</c> and <c>shared/a.cs</c> are one file), ordinal elsewhere.
+    /// </summary>
+    public static StringComparer PathComparer { get; } = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+
     /// <summary>Time spent by the last <c>Build</c> call: compilation, symbol binding (edges in characters), and token mapping.</summary>
     public (TimeSpan Compile, TimeSpan Bind, TimeSpan Map) LastTimings { get; private set; }
 
@@ -79,19 +85,20 @@ public sealed class RoslynGraphBuilder
     }
 
     /// <summary>
-    /// Builds the graph of <paramref name="chunks"/> from one compilation per project (for instance
-    /// <see cref="ScanResult.Compilations"/> from <see cref="SolutionScanner"/>): each file is bound in its owning project's
+    /// Builds the graph of <paramref name="chunks"/> from one compilation per project (for instance the solution scanner's
+    /// <c>ScanResult.Compilations</c>): each file is bound in its owning project's
     /// compilation, with that project's parse options, defines and references, so calls into referenced projects resolve
     /// where a single BCL-only compilation cannot. Edge definitions are the same as for the other overloads.
     /// </summary>
-    /// <param name="projects">The projects; each corpus path is owned by one project only, and its tree must be in that project's compilation.</param>
+    /// <param name="projects">The projects; each corpus path is owned by one project only (compared with <see cref="PathComparer"/>:
+    /// case-insensitive on Windows), and its tree must be in that project's compilation.</param>
     /// <param name="chunks">The chunks; every chunk's file must be owned by one of <paramref name="projects"/>.</param>
     /// <remarks><see cref="LastTimings"/>.Compile is zero: the compilations come built (lazily bound by Roslyn).</remarks>
     public ReferenceGraph Build(IReadOnlyList<ProjectCompilation> projects, IReadOnlyList<Chunk> chunks)
     {
         ArgumentNullException.ThrowIfNull(projects);
         ArgumentNullException.ThrowIfNull(chunks);
-        var files = new Dictionary<string, (Compilation, SyntaxTree)>(StringComparer.Ordinal);
+        var files = new Dictionary<string, (Compilation, SyntaxTree)>(PathComparer);
         foreach (ProjectCompilation p in projects)
         {
             ArgumentNullException.ThrowIfNull(p);
@@ -270,7 +277,7 @@ public sealed class RoslynGraphBuilder
         private readonly Dictionary<string, SourceText> _texts = new(StringComparer.Ordinal);
         // Tree file path (as Roslyn locations carry it: absolute for workspace projects) → corpus path. Locations from any
         // compilation (a referencing project's view of another project's tree) map through the file path, not the tree object.
-        private readonly Dictionary<string, string> _corpusPath = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, string> _corpusPath = new(PathComparer);
 
         public ChunkIndex(IReadOnlyList<Chunk> chunks, Dictionary<string, SyntaxTree> trees)
         {

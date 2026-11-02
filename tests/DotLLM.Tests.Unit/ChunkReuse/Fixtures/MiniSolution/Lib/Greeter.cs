@@ -7,4 +7,6 @@ public static class Greeter
 #endif
 
     public static string Name => "Greeter";
+
+    public static int Major => Mini.BuildInfo.Major + LibInfo.Minor;
 }

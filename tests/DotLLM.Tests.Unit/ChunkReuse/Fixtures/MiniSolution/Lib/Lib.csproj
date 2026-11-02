@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <!-- Multi-targeted: scanned once (net10.0, the first Roslyn project by name), the other target reported. -->
-    <TargetFrameworks>net10.0;netstandard2.0</TargetFrameworks>
+    <!-- Multi-targeted: scanned once (net10.0, the preferred target), the other target reported with the files only it compiles. -->
+    <TargetFrameworks>netstandard2.0;net10.0</TargetFrameworks>
     <LangVersion>latest</LangVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
@@ -11,5 +11,8 @@
   <ItemGroup>
     <!-- Also compiled by App: one file, two projects. -->
     <Compile Include="..\Shared\BuildInfo.cs" Link="BuildInfo.cs" />
+    <!-- Compiled only for netstandard2.0. -->
+    <Compile Remove="Polyfill.cs" />
+    <Compile Include="Polyfill.cs" Condition="'$(TargetFramework)' == 'netstandard2.0'" />
   </ItemGroup>
 </Project>
