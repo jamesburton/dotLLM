@@ -27,7 +27,7 @@ public sealed class ContextSelectorTests
             "using Lib;\n\nnamespace App;\n\n// Calc adds numbers up with the MathUtil helpers; this comment makes its first chunk the largest.\npublic class Calc\n{\n    public int Sum() => MathUtil.Twice(3);\n\n    public int Other() => 1;\n}\n"),
         ("src/App/Top.cs", "namespace App;\n\npublic class Top\n{\n    public int Run() => new Calc().Sum();\n}\n"),
         ("tests/LibTests/MathUtilTests.cs",
-            "using Lib;\n\nnamespace LibTests;\n\npublic class MathUtilTests\n{\n    public void T()\n    {\n        _ = MathUtil.Add(1, 2);\n    }\n}\n"),
+            "using Lib;\n\nnamespace LibTests;\n\npublic class MathUtilTests\n{\n    public void T()\n    {\n        _ = MathUtil.Add(1, 2) + MathUtil.Add(3, 4);\n    }\n}\n"),
         ("../shared/Info.cs", "namespace Lib;\n\npublic static class Info\n{\n    public static int V() => MathUtil.Add(0, 0);\n}\n"),
     ];
 
@@ -212,8 +212,18 @@ public sealed class ContextSelectorTests
         Assert.DoesNotContain(other.Id, Ids(r2));
         Assert.Equal(r2.Count, ContextSelector.Select(new SelectionRequest { Symbol = "MathUtil.Twice", Hops = 9 }, fx.Files, fx.Graph).Count);
 
+        // Within hop 2 (equal priority) the heavier neighbour ranks first: T references the hop-1 Add chunk four times
+        // (MathUtil twice, Add twice), V and Run fewer; path order would put T last.
+        SelectedChunk[] hop2 = r2.Where(c => c.Hop == 2).ToArray();
+        Assert.Equal(t.Id, hop2[0].Chunk.Id);
+        Assert.True(hop2[0].Weight > hop2[1].Weight);
+
         // No edge kinds: the walk stops at the definition.
         Assert.Equal(Ids(twice), Ids(ContextSelector.Select(new SelectionRequest { Symbol = "MathUtil.Twice", Hops = 2, EdgeKinds = [] }, fx.Files, fx.Graph)));
+        // Only Use edges: Twice calls Add and is called by Sum (Call edges both), so nothing is a Use neighbour.
+        Assert.Equal(Ids(twice), Ids(ContextSelector.Select(new SelectionRequest { Symbol = "MathUtil.Twice", Hops = 1, EdgeKinds = [SymbolEdgeKind.Use] }, fx.Files, fx.Graph)));
+        // Only Call edges: the same call chain as the default.
+        Assert.Equal(Ids(r1), Ids(ContextSelector.Select(new SelectionRequest { Symbol = "MathUtil.Twice", Hops = 1, EdgeKinds = [SymbolEdgeKind.Call] }, fx.Files, fx.Graph)));
     }
 
     [Theory]
