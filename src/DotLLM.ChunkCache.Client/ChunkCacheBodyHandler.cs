@@ -547,22 +547,17 @@ public sealed class ChunkCacheBodyHandler : DelegatingHandler
             return id[..n];
         }
 
+        /// <summary>Whether <paramref name="text"/> holds a surrogate that is not half of a well-formed pair (vectorised search).</summary>
         private static bool HasLoneSurrogate(ReadOnlySpan<char> text)
         {
-            for (int i = 0; i < text.Length; i++)
+            while (true)
             {
-                if (char.IsHighSurrogate(text[i]))
-                {
-                    if (i + 1 >= text.Length || !char.IsLowSurrogate(text[i + 1])) return true;
-                    i++;
-                }
-                else if (char.IsLowSurrogate(text[i]))
-                {
+                int i = text.IndexOfAnyInRange('\uD800', '\uDFFF');
+                if (i < 0) return false;
+                if (!char.IsHighSurrogate(text[i]) || i + 1 >= text.Length || !char.IsLowSurrogate(text[i + 1]))
                     return true;
-                }
+                text = text[(i + 2)..];
             }
-
-            return false;
         }
     }
 }

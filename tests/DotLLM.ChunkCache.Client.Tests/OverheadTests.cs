@@ -17,7 +17,10 @@ public sealed class TimingCollection;
 [Collection(nameof(TimingCollection))]
 public sealed class OverheadTests(ITestOutputHelper output)
 {
-    /// <summary>The handler and the decorator's lookup add under 5 ms for 100 spans in a 200 KB body (median of 20).</summary>
+    /// <summary>
+    /// The handler and the decorator's lookup add under 5 ms for 100 spans in a 200 KB body (median of 20), measured in
+    /// steady state (40 warm-up rounds, so the JIT has tiered up, as in a long-running harness).
+    /// </summary>
     [Fact]
     public async Task Overhead_Under5ms()
     {
@@ -41,7 +44,7 @@ public sealed class OverheadTests(ITestOutputHelper output)
         using HttpClient plain = new(new CaptureHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
 
         var samples = new List<double>();
-        for (int round = 0; round < 23; round++)
+        for (int round = 0; round < 60; round++)
         {
             var sw = Stopwatch.StartNew();
             using (HttpResponseMessage _ = await plain.SendAsync(Pipeline.Post(input))) { }
@@ -61,7 +64,7 @@ public sealed class OverheadTests(ITestOutputHelper output)
                 Assert.Equal(100, scope.Outcome!.SentSpans);
             }
 
-            if (round >= 3) samples.Add(sw.Elapsed.TotalMilliseconds - baseline);
+            if (round >= 40) samples.Add(sw.Elapsed.TotalMilliseconds - baseline);
         }
 
         samples.Sort();
