@@ -261,6 +261,12 @@ public sealed class CorpusTests : IDisposable
         var index = new DotLLM.ChunkReuse.Store.ChunkIndex(ids => DotLLM.ChunkReuse.Store.ChunkKey.Create("fp", "tok", default, "cpu",
             DotLLM.ChunkReuse.Store.KvDtype.F32, ids));
         index.Update([new SourceFile("a.cs", text)], new FixedSizeChunker(tok, 16)); // throws on a non-tiling chunker
+
+        // A marker at the very end has no decoded character to follow: only the last-chunk rule covers it.
+        string trailing = text + marker;
+        IReadOnlyList<Chunk> t = new FixedSizeChunker(tok, 16).Chunk(new SourceFile("b.cs", trailing));
+        Assert.Equal(trailing.Length, t[^1].EndOffset);
+        index.Update([new SourceFile("a.cs", text), new SourceFile("b.cs", trailing)], new FixedSizeChunker(tok, 16));
     }
 
     /// <summary><see cref="CharTokenizer"/> whose encode strips one character (as dotLLM's ControlTokenGuard does).</summary>
