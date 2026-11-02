@@ -792,6 +792,8 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     public bool SupportsQueryPositionAttention => _attentionQPos is not null;
     /// <summary>Whether the tiled per-query-position kernel (#1540) is loaded (otherwise the one-workgroup-per-row reference runs).</summary>
     public bool SupportsTiledQueryPositionAttention => _attentionQPosTiled is not null;
+    /// <summary>Whether the tiled kernel serves the per-query-position path when loaded (default true); false forces the reference kernel (A/B and oracle runs).</summary>
+    public bool TiledQueryPositionAttentionEnabled { get; set; } = true;
     /// <summary>Environment variable: <c>ref</c> forces the reference per-query-position kernel (#1540 A/B and oracle).</summary>
     public const string QueryPositionsKernelEnvVar = "DOTLLM_VULKAN_ATTN_QPOS";
     private VulkanQueryRelevanceProbe? _relevanceProbe;
@@ -4580,7 +4582,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
                 // Selective recompute (#1531): query rows at arbitrary positions (non-contiguous, or a run inside an already-filled
                 // cache). The flash / coopmat kernels derive each row's position as positionOffset + row and assert a tight span.
                 AttentionQueryPositionsCount++;
-                if (_attentionQPosTiled is { } tiled && tiled.CanDispatch(headDim, numHeads, numKvHeads))
+                if (TiledQueryPositionAttentionEnabled && _attentionQPosTiled is { } tiled && tiled.CanDispatch(headDim, numHeads, numKvHeads))
                 {
                     ProfNote("attn_qpos_tiled", seqLen, seqKv, numHeads);
                     AttentionQueryPositionsTiledCount++;
