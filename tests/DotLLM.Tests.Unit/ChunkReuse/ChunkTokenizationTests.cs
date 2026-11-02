@@ -33,6 +33,8 @@ public sealed class ChunkTokenizationTests
         }
         tokens.Add("\n");
         types.Add(1);
+        tokens.Add("\r");
+        types.Add(1);
         foreach (string s in Specials)
         {
             tokens.Add(s);
@@ -101,6 +103,30 @@ public sealed class ChunkTokenizationTests
         Assert.Equal(ChunkTokenization.Encode(Tok, "ab"), ChunkTokenization.Encode(Tok, "a﷐b"));
     }
 
+    [Fact]
+    public void Encode_NeverAddsBos_EvenWhenTheTokenizerFramesEncode()
+    {
+        // The chunk is mid-prompt text: no BOS, whatever Encode does on its own (kills "Encode instead of EncodeRaw").
+        var tok = new BosFramingTokenizer(Tok);
+        Assert.Equal(tok.BosTokenId, tok.Encode("int x;")[0]);
+        Assert.Equal(Tok.EncodeRaw(Tok.MarkUntrustedSpecials(ThinkChunk)), ChunkTokenization.Encode(tok, ThinkChunk));
+        Assert.DoesNotContain(tok.BosTokenId, ChunkTokenization.Encode(tok, "int x;"));
+    }
+
+    /// <summary>Delegates to <see cref="Tok"/>, but <see cref="Encode"/> prepends BOS (as a Llama-style tokenizer does).</summary>
+    private sealed class BosFramingTokenizer(BpeTokenizer inner) : ITokenizer
+    {
+        public int[] Encode(string text) => [BosTokenId, .. inner.EncodeRaw(text)];
+        public int[] EncodeRaw(string text) => inner.EncodeRaw(text);
+        public string MarkUntrustedSpecials(string text, IReadOnlyList<string>? exemptPrefixes = null) => inner.MarkUntrustedSpecials(text, exemptPrefixes);
+        public string Decode(ReadOnlySpan<int> tokenIds) => inner.Decode(tokenIds);
+        public string DecodeToken(int tokenId) => inner.DecodeToken(tokenId);
+        public int VocabSize => inner.VocabSize;
+        public int BosTokenId => 0;
+        public int EosTokenId => inner.EosTokenId;
+        public int CountTokens(string text) => Encode(text).Length;
+    }
+
     // ------------------------------------------------------------------------------------------------ every chunker uses it
 
     private const string CodeWithThink = """
@@ -140,6 +166,34 @@ public sealed class ChunkTokenizationTests
     }
 
     [Fact]
+    public void SymbolChunker_PackedPieces_UseChunkTokenization()
+    {
+        // A member over the limit whose lines all fit: re-split by Pack at statements / line starts (not sliced).
+        const string code = """
+            namespace Demo;
+
+            public static class R
+            {
+                public static int M()
+                {
+                    // <think> a
+                    // </think> b
+                    int x = 1;
+                    // <think> c
+                    return x;
+                }
+            }
+
+            """;
+        var file = new SourceFile("R.cs", code.ReplaceLineEndings("\n"));
+        Assert.All(file.Text.Split('\n'), l => Assert.True(ChunkTokenization.Encode(Tok, l + "\n").Length < 30));
+        IReadOnlyList<Chunk> chunks = new SymbolChunker(Tok, 30).Chunk(file);
+        Assert.True(chunks.Count >= 3);
+        Assert.All(chunks, c => Assert.True(c.WireEligible, "no slices here"));
+        AssertChunksUseChunkTokenization(file, chunks);
+    }
+
+    [Fact]
     public void SymbolChunker_OverlongLineSlices_UseChunkTokenization()
     {
         // A line over the limit is cut into id slices of the whole line's ids: those ids are the marked encoding too.
@@ -161,6 +215,21 @@ public sealed class ChunkTokenizationTests
         IReadOnlyList<Chunk> chunks = new LinesChunker(Tok, 64).Chunk(file);
         Assert.True(chunks.Count >= 3);
         AssertChunksUseChunkTokenization(file, chunks);
+    }
+
+    [Fact]
+    public void LinesChunker_CrlfBackOff_UsesChunkTokenization()
+    {
+        // The furthest fitting cut falls between '\r' and '\n' with no line end inside the piece: the chunker backs off one
+        // character and re-probes; that probe's ids are the chunk's ids.
+        const int n = 20;
+        string text = "<think>" + new string('y', n - 8) + "\r\n" + "tail line here\r\n";
+        Assert.Equal(n, ChunkTokenization.Encode(Tok, text[..n]).Length);   // up to and including '\r'
+        var file = new SourceFile("crlf.txt", text);
+        IReadOnlyList<Chunk> chunks = new LinesChunker(Tok, n).Chunk(file);
+        Assert.Equal(n - 1, chunks[0].EndOffset);                           // not between '\r' and '\n'
+        foreach (Chunk c in chunks)
+            Assert.Equal(ChunkTokenization.Encode(Tok, text[c.StartOffset..c.EndOffset]), c.TokenIds);
     }
 
     [Fact]
