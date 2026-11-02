@@ -220,17 +220,32 @@ public sealed class MtpRoundController
     private int _calibrationSeen;
     private readonly List<double> _calibrationSamples = new();
     private readonly MtpAdaptiveGate? _gate;
+    private readonly int _maxProbeK;
+    private int _ceiling;
+    private int _fullStreak;
+
+    /// <summary>Consecutive rounds that accepted every draft at the current ceiling K before the ceiling is raised by one (#1335; ds4 uses 8 at 1 token).</summary>
+    public const int UpwardProbeStreak = 6;
+
+    /// <summary>Largest K this controller may currently choose: the configured K, raised one step at a time (up to the probe limit) after a streak of fully accepted rounds.</summary>
+    public int Ceiling => _ceiling;
 
     /// <param name="model">Shared cost model.</param>
     /// <param name="configuredK">The K the caller asked for; also the upper bound.</param>
     /// <param name="calibratePlain">Start with <see cref="CalibrationRounds"/> zero-draft rounds that measure plain decode inside this request. Set when the gate has
     /// no plain sample: without a reference a losing configuration cannot be detected, and the first request would run entirely on MTP.</param>
     /// <param name="gate">The gate that receives the calibrated plain reference as its first plain sample (null in unit tests of the controller alone).</param>
-    public MtpRoundController(MtpCostModel model, int configuredK, bool calibratePlain = false, MtpAdaptiveGate? gate = null)
+    /// <param name="maxProbeK">Upper limit of the upward probe (#1335); at or below <paramref name="configuredK"/> disables it. The model must support verify rows up to this K.</param>
+    public MtpRoundController(MtpCostModel model, int configuredK, bool calibratePlain = false, MtpAdaptiveGate? gate = null, int maxProbeK = 0)
     {
         _gate = gate;
         _model = model;
         _configuredK = Math.Clamp(configuredK, 1, MtpCostModel.MaxK);
+        _maxProbeK = Math.Clamp(maxProbeK, _configuredK, MtpCostModel.MaxK);
+        _ceiling = _configuredK;
+        // A K above the configured one that an earlier request measured at least 3 times keeps its place: the model, not the streak, decides whether it pays.
+        for (int k = _maxProbeK; k > _configuredK; k--)
+            if (_model.RoundsAt(k) >= WarmupRounds && _model.MsPerToken(k) > 0 && _model.MsPerToken(k) < _model.MsPerToken(_configuredK)) { _ceiling = k; break; }
         _calibrationLeft = calibratePlain ? CalibrationRounds : 0;
     }
 
@@ -256,17 +271,17 @@ public sealed class MtpRoundController
     {
         if (_calibrationLeft > 0)
             return 0;
-        int cap = Math.Min(_configuredK, Math.Max(remainingTokens, 1));
+        int cap = Math.Min(_ceiling, Math.Max(remainingTokens, 1));
         int k;
         if (_roundsThisRequest < WarmupRounds && _model.RoundsAt(_configuredK) < WarmupRounds)
             k = cap;
         else
         {
-            k = _model.BestK(_configuredK).K;
+            k = _model.BestK(_ceiling).K;
             if (_round > 0 && _round % ExploreEvery == 0)
             {
                 // Refresh the less-measured neighbour of the current best.
-                int up = Math.Min(k + 1, _configuredK), down = Math.Max(k - 1, 1);
+                int up = Math.Min(k + 1, _ceiling), down = Math.Max(k - 1, 1);
                 k = _model.RoundsAt(up) <= _model.RoundsAt(down) ? up : down;
             }
         }
@@ -294,6 +309,17 @@ public sealed class MtpRoundController
         }
         _roundsThisRequest++;
         _model.RecordRound(k, emitted - 1, roundMs);
+        UpdateCeiling(k, emitted - 1);
+    }
+
+    // #1335: raise the ceiling after a streak of fully accepted rounds at the current top K; the cost model then measures the new K and BestK keeps it only
+    // if its ms/token is lower (a ceiling that does not pay is simply never chosen; it only widens the exploration range).
+    private void UpdateCeiling(int k, int accepted)
+    {
+        if (_maxProbeK <= _configuredK) return;
+        if (k == _ceiling && accepted == k) _fullStreak++;
+        else if (k == _ceiling) _fullStreak = 0;
+        if (_fullStreak >= UpwardProbeStreak && _ceiling < _maxProbeK) { _ceiling++; _fullStreak = 0; return; }
     }
 
     /// <summary>
@@ -304,7 +330,7 @@ public sealed class MtpRoundController
     {
         if (plainMsPerToken <= 0) plainMsPerToken = CalibratedPlainMsPerToken;
         if (plainMsPerToken <= 0 || _roundsThisRequest < MinRoundsForFallback) return false;
-        var (_, perTok) = _model.BestK(_configuredK);
+        var (_, perTok) = _model.BestK(_ceiling);
         return perTok > 0 && perTok > plainMsPerToken * (1.0 + FallbackMargin);
     }
 }

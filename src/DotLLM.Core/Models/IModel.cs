@@ -31,6 +31,13 @@ public interface IModel : IDisposable
     int MtpPreferredDraftTokens => 0;
 
     /// <summary>
+    /// The largest MTP draft depth the model's verify path supports efficiently, or 0 for "no more than <see cref="MtpPreferredDraftTokens"/>" (#1335).
+    /// When above the depth in use, the round controller may probe upward from the preferred K after a streak of fully accepted rounds and keeps the longer K only if
+    /// its measured milliseconds per generated token is lower. qwen4exp returns 7 (an 8-row verify still takes the per-row split-KV attention path).
+    /// </summary>
+    int MtpMaxDraftTokens => 0;
+
+    /// <summary>
     /// Total bytes of committed memory holding repacked (layout-transformed) copies of the model
     /// weights, or 0 when the backend does not repack. This is memory in addition to the
     /// memory-mapped weight file, not a subset of it.

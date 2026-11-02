@@ -437,6 +437,9 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
     public int MtpPreferredDraftTokens => 4;
 
     /// <inheritdoc/>
+    public int MtpMaxDraftTokens => 7;
+
+    /// <inheritdoc/>
     public IMtpState? CreateMtpState() => CreateMtpState(Config.MaxSequenceLength);
 
     /// <inheritdoc/>

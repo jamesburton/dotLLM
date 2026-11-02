@@ -34,6 +34,9 @@ public sealed partial class TextGenerator
     private readonly PromptLookupOptions? _promptLookup;
     private readonly Func<ModelConfig, int, Core.Attention.IKvCache>? _draftKvCacheFactory;
     private readonly int _speculativeCandidates;
+    /// <summary>Upward MTP depth probe (#1335) on models that declare <see cref="DotLLM.Core.Models.IModel.MtpMaxDraftTokens"/>; <c>DOTLLM_MTP_UPWARD_PROBE=0</c> turns it off (A/B diagnostic).</summary>
+    public static bool UpwardProbeEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_MTP_UPWARD_PROBE") != "0";
+    private readonly int _mtpMaxCandidates;   // upward-probe limit (#1335): buffers and the all-row logits limit are sized for it
     private readonly int _mtpCandidates;   // MTP depth: the model's preferred K when the caller kept the library default
     private readonly bool _mtpEnabled;
     private readonly HybridPrefillDecodeStrategy? _hybridStrategy;
@@ -265,6 +268,8 @@ public sealed partial class TextGenerator
         _speculativeCandidates = speculativeCandidates;
         _mtpCandidates = speculativeCandidates == DefaultSpeculativeCandidates && model.MtpPreferredDraftTokens > 0
             ? Math.Min(model.MtpPreferredDraftTokens, MtpCostModel.MaxK) : speculativeCandidates;
+        _mtpMaxCandidates = speculativeCandidates == DefaultSpeculativeCandidates && model.MtpMaxDraftTokens > _mtpCandidates
+            ? Math.Min(model.MtpMaxDraftTokens, MtpCostModel.MaxK) : _mtpCandidates;
         _mtpEnabled = mtpEnabled;
         _hybridStrategy = hybridStrategy;
         _prefillChunkSize = prefillChunkSize;
@@ -442,7 +447,7 @@ public sealed partial class TextGenerator
             && (mtpGate?.ShouldUseMtp(maxTokens) ?? true);
         TraceGate(mtpGate, pipeline.IsStochastic, useMtp, captureLogprobs, cachedTokenCount);
         if (useMtp)
-            _model.TrySetAllRowLogitsLimit(_mtpCandidates + 1);
+            _model.TrySetAllRowLogitsLimit(_mtpMaxCandidates + 1);
         bool useHybrid = _hybridStrategy is not null
             && _hybridStrategy.ShouldRunHybrid(promptLen)
             && cachedTokenCount == 0
@@ -797,8 +802,8 @@ public sealed partial class TextGenerator
                 //    lightweight head drafts candidates from its own hidden state — no second
                 //    model, no second full-model KV-cache, just the model's own IMtpState. ──
                 var mtpDecoder = new MtpSpeculativeDecoder();
-                int[] specBuffer = ArrayPool<int>.Shared.Rent(_mtpCandidates + 1);
-                var mtpCtl = mtpGate is { } mtpG ? new MtpRoundController(mtpG.CostModel, _mtpCandidates, calibratePlain: mtpG.NeedsPlainReference(maxTokens - 1), gate: mtpG) : null;
+                int[] specBuffer = ArrayPool<int>.Shared.Rent(_mtpMaxCandidates + 1);
+                var mtpCtl = mtpGate is { } mtpG ? new MtpRoundController(mtpG.CostModel, _mtpCandidates, calibratePlain: mtpG.NeedsPlainReference(maxTokens - 1), gate: mtpG, maxProbeK: UpwardProbeEnabled ? _mtpMaxCandidates : 0) : null;
                 try
                 {
                     int step = 1;
@@ -1069,7 +1074,7 @@ public sealed partial class TextGenerator
             && (mtpGate?.ShouldUseMtp(maxTokens) ?? true);
         TraceGate(mtpGate, pipeline.IsStochastic, useMtp, captureLogprobs, cachedTokenCount);
         if (useMtp)
-            _model.TrySetAllRowLogitsLimit(_mtpCandidates + 1);
+            _model.TrySetAllRowLogitsLimit(_mtpMaxCandidates + 1);
         bool useHybrid = _hybridStrategy is not null
             && _hybridStrategy.ShouldRunHybrid(promptLen)
             && cachedTokenCount == 0
@@ -1360,8 +1365,8 @@ public sealed partial class TextGenerator
             {
                 // ── MTP self-speculative decode loop (issue #253) — streaming variant. ──
                 var mtpDecoder = new MtpSpeculativeDecoder();
-                int[] specBuffer = ArrayPool<int>.Shared.Rent(_mtpCandidates + 1);
-                var mtpCtl = mtpGate is { } mtpG ? new MtpRoundController(mtpG.CostModel, _mtpCandidates, calibratePlain: mtpG.NeedsPlainReference(maxTokens - 1), gate: mtpG) : null;
+                int[] specBuffer = ArrayPool<int>.Shared.Rent(_mtpMaxCandidates + 1);
+                var mtpCtl = mtpGate is { } mtpG ? new MtpRoundController(mtpG.CostModel, _mtpCandidates, calibratePlain: mtpG.NeedsPlainReference(maxTokens - 1), gate: mtpG, maxProbeK: UpwardProbeEnabled ? _mtpMaxCandidates : 0) : null;
                 try
                 {
                     int step = 1;
