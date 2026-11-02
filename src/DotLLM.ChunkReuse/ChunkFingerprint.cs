@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
+using DotLLM.ChunkReuse.Backends;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Models;
 
@@ -24,10 +25,28 @@ public static class ChunkFingerprint
     /// <param name="tokenizerId">Tokenizer identity, e.g. a hash of the vocabulary and merges.</param>
     /// <param name="kvOutputVersion">K/V schema version; callers pass the default except in tests.</param>
     /// <returns>The fingerprint.</returns>
+    /// <remarks>Means the CPU backend; equal to <see cref="Compute(ModelConfig, string, string, string, string, int)"/> with <see cref="ChunkBackendTags.Cpu"/>.</remarks>
     public static string Compute(ModelConfig config, string modelId, string quantization, string tokenizerId,
+        int kvOutputVersion = ChunkReuseSchema.KvOutputVersion)
+        => Compute(config, modelId, quantization, tokenizerId, ChunkBackendTags.Cpu, kvOutputVersion);
+
+    /// <summary>As <see cref="Compute(ModelConfig, string, string, string, int)"/>, for chunks encoded by <paramref name="backend"/>.</summary>
+    /// <param name="config">Model configuration.</param>
+    /// <param name="modelId">Model identity, e.g. a repo id or the weights file hash.</param>
+    /// <param name="quantization">Weight quantization, e.g. <c>Q4_K_M</c>.</param>
+    /// <param name="tokenizerId">Tokenizer identity, e.g. a hash of the vocabulary and merges.</param>
+    /// <param name="backend">
+    /// Backend tag (<see cref="ChunkBackendTags"/>): CPU and Vulkan K/V differ by a numerical floor. The CPU tag adds no field, so
+    /// CPU fingerprints (and the store keys and files written under them) are the ones written before the backend seam existed;
+    /// every other tag adds a <c>backend</c> field.
+    /// </param>
+    /// <param name="kvOutputVersion">K/V schema version; callers pass the default except in tests.</param>
+    /// <returns>The fingerprint.</returns>
+    public static string Compute(ModelConfig config, string modelId, string quantization, string tokenizerId, string backend,
         int kvOutputVersion = ChunkReuseSchema.KvOutputVersion)
     {
         ArgumentNullException.ThrowIfNull(config);
+        ArgumentException.ThrowIfNullOrEmpty(backend);
         ArgumentNullException.ThrowIfNull(modelId);
         ArgumentNullException.ThrowIfNull(quantization);
         ArgumentNullException.ThrowIfNull(tokenizerId);
@@ -57,6 +76,8 @@ public static class ChunkFingerprint
         for (int l = 0; l < strides.Length; l++) strides[l] = geometry.KvStrideOf(l).ToString(ci);
         Append(sb, "kv", string.Join(',', strides));
         Append(sb, "kv-output", kvOutputVersion.ToString(ci));
+        if (!string.Equals(backend, ChunkBackendTags.Cpu, StringComparison.Ordinal))
+            Append(sb, "backend", backend);
 
         return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(sb.ToString())));
     }

@@ -64,6 +64,10 @@ layout(set = 0, binding = 3, std430) writeonly buffer BufOut { vec4 out4[]; };  
 #if defined(SINKS)
 layout(set = 0, binding = 4, std430) readonly  buffer BufSink { float sinks[]; };  // [num_heads] F32 sink logits
 #endif
+#if defined(QPOS)
+// Per-query-token positions (issue #1540); see attention_flash_gqa_cm.glsl. Causal mask, positionOffset ignored, exclusive with SINKS.
+layout(set = 0, binding = 4, std430) readonly  buffer BufQPos { int qpos[]; };     // [seq_q]
+#endif
 
 layout(push_constant) uniform PushConstants {
     uint  seqQ;
@@ -105,7 +109,11 @@ void main() {
     bool rowLive = m < totalRows;
     uint t    = rowLive ? m / G : 0u;
     uint hq   = hkv * G + (m - t * G);
+#if defined(QPOS)
+    uint posQ = rowLive ? uint(qpos[t]) : 0u;
+#else
     uint posQ = pc.positionOffset + t;
+#endif
 
     uint hd4       = pc.headDim >> 2u;
     uint qStride4  = (pc.numHeads * pc.headDim) >> 2u;
@@ -129,12 +137,23 @@ void main() {
 #endif
 
     uint kvEnd = pc.seqKv;
+#if defined(QPOS)
+    uint wgFirstPos = 0xFFFFFFFFu;
+    uint wgLastPos = 0u;
+    for (uint tt = wgRow0 / G; tt <= (wgRowEnd - 1u) / G; tt++) {
+        uint pp = uint(qpos[tt]);
+        wgFirstPos = min(wgFirstPos, pp);
+        wgLastPos = max(wgLastPos, pp);
+    }
+    kvEnd = min(pc.seqKv, wgLastPos + 1u);
+#else
     if (pc.maskMode == 0u) {
         uint lastPos = pc.positionOffset + (wgRowEnd - 1u) / G;
         kvEnd = min(pc.seqKv, lastPos + 1u);
     }
-    uint kvStart = 0u;
     uint wgFirstPos = pc.positionOffset + wgRow0 / G;
+#endif
+    uint kvStart = 0u;
     if (pc.slidingWindow > 0u && wgFirstPos >= pc.slidingWindow) {
         kvStart = min(((wgFirstPos - pc.slidingWindow + 1u) / uint(BC)) * uint(BC), kvEnd);
     }

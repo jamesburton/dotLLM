@@ -90,19 +90,22 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     internal static int Q4KRowsPerWorkgroup { get; } = RowsFromEnv("DOTLLM_VK_Q4K_ROWS", 2);
 
     /// <summary>
-    /// Per-column-count NR for the Q4_K multi-column GEMV (#1220), measured on the 8060S at the Qwen3.8-27B FFN shapes (50 MB weights, us/dispatch):
-    /// NR 4 (the 2..8 default) costs 527 us at 5 columns against 324 at NR 3, and 716 us at 7 against 578 at NR 2 (401 padded to 8). A row's bits do not
-    /// depend on NR. <c>DOTLLM_VK_Q4K_ROWS_BYN</c> = <c>n:nr,n:nr</c> overrides, <c>off</c> disables; <c>DOTLLM_VK_Q4K_PADODD=0</c> disables 5/7 -> 6/8 padding.
+    /// Per-column-count NR for the Q4_K multi-column GEMV, measured on the 8060S at the Qwen3.8-27B FFN shapes (50 MB weights).
+    /// #1511: with the software-pipelined 16-byte-load shader NR 4 is best for 2..12 columns (245 us at 2..4 columns = 190-204 GB/s,
+    /// 256 at 5, 271 at 6, 291 at 7, 308 at 8) and NR 3 for 13..16 (502-582 us against 570-1117 at NR 4). Before #1511 the
+    /// kernel fell off a compiler-scheduling cliff at 5 and 7 columns (#1220: <c>3:3,5:3,7:2</c> + 5/7 -> 6/8 padding), which the
+    /// new shader does not have, so there is no table below 13 and padding is off by default. A row's bits do not depend on NR.
+    /// <c>DOTLLM_VK_Q4K_ROWS_BYN</c> = <c>n:nr,n:nr</c> overrides, <c>off</c> disables; <c>DOTLLM_VK_Q4K_PADODD=1</c> enables 5/7 -> 6/8 padding.
     /// </summary>
     private static int[]? Q4KRowsByColumns()
     {
-        string spec = Environment.GetEnvironmentVariable("DOTLLM_VK_Q4K_ROWS_BYN") ?? "3:3,5:3,7:2";
+        string spec = Environment.GetEnvironmentVariable("DOTLLM_VK_Q4K_ROWS_BYN") ?? "13:3,14:3,15:3,16:3";
         if (spec == "off") return null;
-        var table = new int[9];
+        var table = new int[17];
         foreach (string part in spec.Split(',', StringSplitOptions.RemoveEmptyEntries))
         {
             string[] kv = part.Split(':');
-            if (kv.Length == 2 && int.TryParse(kv[0], out int n) && int.TryParse(kv[1], out int nr) && n is >= 2 and <= 8 && nr is >= 1 and <= 4) table[n] = nr;
+            if (kv.Length == 2 && int.TryParse(kv[0], out int n) && int.TryParse(kv[1], out int nr) && n is >= 2 and <= 16 && nr is >= 1 and <= 4) table[n] = nr;
         }
         return table;
     }
@@ -746,7 +749,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         // #1220 (supersedes #1193's Q4_K_R4): NR rows per workgroup share the activation loads; deterministic, and also the qwen35 decode GEMV.
         kernels.MatMulQ4KMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q4_K, Q4KRowsPerWorkgroup,
             RowsFromEnv("DOTLLM_VK_Q4K_ROWS_MULTI", 4), RowsFromEnv("DOTLLM_VK_Q4K_ROWS_WIDE", 4), Q4KRowsByColumns());
-        if (kernels.MatMulQ4KMulti is { } q4kMulti) q4kMulti.PadOddColumns = Environment.GetEnvironmentVariable("DOTLLM_VK_Q4K_PADODD") != "0";
+        if (kernels.MatMulQ4KMulti is { } q4kMulti) q4kMulti.PadOddColumns = Environment.GetEnvironmentVariable("DOTLLM_VK_Q4K_PADODD") == "1";   // #1511: the pipelined shader has no 5/7-column cliff, so padding only adds work
         kernels.MatMulQ5KMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q5_K);
         kernels.MatMulQ6KMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.Q6_K);
         if (Environment.GetEnvironmentVariable("DOTLLM_VK_Q6K_ROWS_DECODE") != "0")

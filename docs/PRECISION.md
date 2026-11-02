@@ -592,6 +592,8 @@ PRs #1103, #1122, #1125, #1126.
 | H1 | Vulkan hybrid | IQ4_NL / K-quant prefill on scalar F32 GEMMs (not an expansion; the missing MMQ/coopmat path) | Tev1 63 tok/s Strix, 3.7 tok/s Arc | open | #1149 |
 | L2 | Vulkan LFM2 MoE | F32 KV (`VulkanNemotronHKvCache` F32 path) | per token | open; not measured | #1151 |
 
+**Vulkan embedding encoders (added after this study, compliant with rules 1 and 2).** `VulkanBertEncoderModel` / `VulkanGemmaEmbeddingModel` read F16, Q8_0 and F32 weights in place (no expansion, #1473), store every activation as F16 with F32 accumulators in registers (#1474; the first version of #741 held F32 scratch, halved since), and keep EmbeddingGemma's residual stream in BF16 because it reaches |x| ~ 1.3e5-1.6e5 in layers 22-23 (above the F16 ceiling of 65,504; the forward throws on a non-finite post-norm input rather than return garbage). Evidence and parity gates: [EMBEDDINGS.md](EMBEDDINGS.md) section 5.
+
 New issues filed by this study: #1134–#1146 (inventory), #1148–#1151 (Vulkan arm). Earlier study follow-ups: #1117–#1120
 (CPU), #1132, #1133 (CUDA).
 

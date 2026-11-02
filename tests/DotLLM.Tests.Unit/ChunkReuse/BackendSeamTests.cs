@@ -1,0 +1,498 @@
+using DotLLM.ChunkReuse;
+using DotLLM.ChunkReuse.Backends;
+using DotLLM.Core.Attention;
+using DotLLM.Core.Configuration;
+using DotLLM.Core.Models;
+using DotLLM.Core.PositionEncoding;
+using DotLLM.Core.Tensors;
+using DotLLM.Engine.KvCache;
+using DotLLM.Models.Architectures;
+using DotLLM.Models.Gguf;
+using DotLLM.Tests.Unit.Vulkan;
+using DotLLM.Vulkan;
+using Xunit;
+using Xunit.Abstractions;
+
+namespace DotLLM.Tests.Unit.ChunkReuse;
+
+/// <summary>
+/// The chunk-reuse backend seam (Phase G Task 1): every backend tags what it produces, the Vulkan backend refuses models whose
+/// stored keys a plain RoPE delta shift cannot re-rotate, the assembler asks the backend to vet the destination before writing,
+/// and the CPU backend reproduces the pre-seam assembly bit for bit. The Vulkan round-trip test is GPU-gated.
+/// </summary>
+public sealed class BackendSeamTests : IDisposable
+{
+    internal const string Fingerprint = "test-fingerprint";
+    internal static readonly int[] ChunkA = [3, 17, 5, 29, 11, 40];
+    internal static readonly int[] ChunkB = [8, 22, 1, 35];
+
+    private readonly string _scratch = Path.Combine(Path.GetTempPath(), "dotllm-chunkseam-" + Guid.NewGuid().ToString("N"));
+    private readonly ITestOutputHelper _output;
+
+    public BackendSeamTests(ITestOutputHelper output)
+    {
+        _output = output;
+        Directory.CreateDirectory(_scratch);
+    }
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_scratch, recursive: true); }
+        catch (IOException) { /* best effort: a still-mapped file on Windows */ }
+        catch (UnauthorizedAccessException) { }
+    }
+
+    [Fact]
+    public void Backend_Tag_IsInKeyAndFingerprint()
+    {
+        using var tiny = TinyModel.Load(_scratch, "qwen3");
+        Assert.Equal("cpu", ChunkBackendTags.Cpu);
+        Assert.Equal("vulkan", ChunkBackendTags.Vulkan); // same literals as ChunkKey.Create's backend on feature/chunk-store
+        Assert.Equal(ChunkBackendTags.Cpu, new CpuChunkBackend(tiny.Config).Tag);
+
+        // Fingerprint: the backend is an identity input; the legacy 4-argument overload means the CPU backend.
+        string cpu = ChunkFingerprint.Compute(tiny.Config, "org/model", "F32", "tok", ChunkBackendTags.Cpu);
+        string vk = ChunkFingerprint.Compute(tiny.Config, "org/model", "F32", "tok", ChunkBackendTags.Vulkan);
+        Assert.NotEqual(cpu, vk);
+        Assert.Equal(cpu, ChunkFingerprint.Compute(tiny.Config, "org/model", "F32", "tok"));
+
+        // Entry: the encoder stamps its backend; the assembler treats a backend mismatch as a miss even when the fingerprint
+        // string matches (an entry must never be assembled into another backend's cache without an explicit conversion).
+        ChunkKvEntry a = new ChunkEncoder(Fingerprint).Encode(tiny.Model, ChunkA);
+        Assert.Equal(ChunkBackendTags.Cpu, a.Backend);
+        ChunkKvEntry foreign = a with { Backend = ChunkBackendTags.Vulkan };
+        var assembler = new ChunkAssembler(tiny.Config, new CpuChunkBackend(tiny.Config));
+        using var cache = NewCache(tiny);
+        var ex = Assert.Throws<ArgumentException>(() => assembler.Assemble(cache, [a, foreign], Fingerprint));
+        Assert.Contains("backend", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, cache.CurrentLength); // validated before anything is written
+        assembler.Assemble(cache, [a], Fingerprint); // the same entry with the right tag is accepted
+        Assert.Equal(ChunkA.Length, cache.CurrentLength);
+    }
+
+    [Fact]
+    public void VulkanBackend_RefusesYarnRopeFreqFactorsAndMla()
+    {
+        using var tiny = TinyModel.Load(_scratch, "qwen3");
+        RoPEConfig plain = tiny.Config.RoPEConfig!.Value;
+        var none = new ChunkModelFeatures(HasRopeFreqFactors: false, HasAttentionSinks: false);
+
+        VulkanChunkBackend.CheckModelSupported(tiny.Config, none); // plain RoPE, no factors, no sinks: accepted
+
+        var yarn = tiny.Config with { RoPEConfig = plain with { ScalingType = RoPEScalingType.YaRN, ScalingFactor = 4f, OrigMaxSeqLen = 16 } };
+        Assert.Contains("YaRN", Refusal(yarn, none), StringComparison.Ordinal);
+
+        var mla = tiny.Config with
+        {
+            MlaConfig = new MlaConfig { KvLoraRank = 8, QkNopeHeadDim = 8, QkRopeHeadDim = 8, VHeadDim = 16 },
+        };
+        Assert.Contains("MLA", Refusal(mla, none), StringComparison.Ordinal);
+
+        Assert.Contains("rope_freqs", Refusal(tiny.Config, none with { HasRopeFreqFactors = true }), StringComparison.Ordinal);
+        Assert.Contains("sink", Refusal(tiny.Config, none with { HasAttentionSinks = true }), StringComparison.OrdinalIgnoreCase);
+
+        // The features come from the GGUF tensors, because ModelConfig carries neither.
+        Assert.Equal(none, ChunkModelFeatures.FromGguf(tiny.Gguf));
+        Assert.Equal(new ChunkModelFeatures(true, false), FeaturesOf("rope_freqs.weight"));
+        Assert.Equal(new ChunkModelFeatures(false, true), FeaturesOf("blk.1.attn_sinks.weight"));
+
+        static string Refusal(ModelConfig config, ChunkModelFeatures features)
+            => Assert.Throws<NotSupportedException>(() => VulkanChunkBackend.CheckModelSupported(config, features)).Message;
+    }
+
+    [Fact]
+    public void Assembler_RefusesCacheWithoutPositionedIo()
+    {
+        using var tiny = TinyModel.Load(_scratch, "qwen3");
+        using var host = NewCache(tiny); // SimpleKvCache: exact host F32, but no IPositionedHostKvCache
+
+        // The Vulkan backend's destination gate, which needs no device.
+        Assert.Contains(nameof(IPositionedHostKvCache),
+            Assert.Throws<NotSupportedException>(() => VulkanChunkBackend.CheckCacheSupported(host)).Message, StringComparison.Ordinal);
+
+        // The assembler asks the backend before it validates or writes anything.
+        ChunkKvEntry a = new ChunkEncoder(Fingerprint).Encode(tiny.Model, ChunkA);
+        var backend = new PositionedOnlyBackend();
+        var assembler = new ChunkAssembler(tiny.Config, backend);
+        Assert.Throws<NotSupportedException>(() => assembler.Assemble(host, [a with { Backend = backend.Tag }], Fingerprint));
+        Assert.Equal(0, backend.Calls);
+        Assert.Equal(0, host.CurrentLength);
+    }
+
+    [Theory]
+    [InlineData("qwen3")]
+    [InlineData("llama")]
+    public void CpuBackend_ShiftKeys_PartialRotaryAndNoPeLayer(string arch)
+    {
+        // GGUF with rope.dimension_count = 8 < key_length 16; NoPE layer 1 via the config (the synthetic builder has no NoPE
+        // architecture: SmolLM3's every-4th-layer rule needs 4+ layers and its own arch).
+        using var tiny = TinyModel.Load(_scratch, arch, ropeDim: PartialRopeDim);
+        Assert.Equal(PartialRopeDim, RopeParameters.FromConfig(tiny.Config).RopeDim);
+        ModelConfig config = tiny.Config with { NoRopeLayers = [NoPeLayer] };
+        Assert.True(config.IsNoRopeLayer(NoPeLayer) && !config.IsNoRopeLayer(0) && !config.IsNoRopeLayer(2));
+        RopeParameters rope = RopeParameters.FromConfig(config);
+        var cpu = new CpuChunkBackend(config);
+        int stride = tiny.KvStride, headDim = config.HeadDim;
+        float[][] rows = RandomRows(config.NumLayers, ShiftRows * stride, seed: 7);
+
+        using var cache = (SimpleKvCache)cpu.CreateCache(SyntheticDenseGguf.Context);
+        WriteAll(cpu, cache, rows, stride);
+        cpu.ShiftKeys(cache, ShiftStart, ShiftRows, 9, rope);
+        var k = new float[ShiftRows * stride];
+        var v = new float[ShiftRows * stride];
+        for (int l = 0; l < config.NumLayers; l++)
+        {
+            cpu.ReadRows(cache, l, ShiftStart, ShiftRows, k, v);
+            if (l == NoPeLayer)
+            {
+                Assert.Equal(rows[l], k); // NoPE layer: not rotated
+                continue;
+            }
+            float[] expected = (float[])rows[l].Clone();
+            RopeShift.Apply(expected, headDim, 9, rope);
+            Assert.Equal(expected, k);
+            for (int i = 0; i < k.Length; i++)
+                if (i % headDim >= PartialRopeDim) Assert.Equal(rows[l][i], k[i]); // pass-through dims untouched
+            Assert.True(MaxAbsDiff(rows[l], k) > 1e-2f); // rotated dims did move
+        }
+    }
+
+    [Fact]
+    public void CpuBackend_RoundTrip_EqualsOldPath()
+    {
+        using var tiny = TinyModel.Load(_scratch, "qwen3");
+        var encoder = new ChunkEncoder(Fingerprint);
+        ChunkKvEntry a = encoder.Encode(tiny.Model, ChunkA);
+        ChunkKvEntry b = encoder.Encode(tiny.Model, ChunkB);
+        ChunkKvEntry[] order = [b, a, a];
+
+        using var seam = NewCache(tiny);
+        new ChunkAssembler(tiny.Config, new CpuChunkBackend(tiny.Config)).Assemble(seam, order, Fingerprint);
+        using var legacyCtor = NewCache(tiny);
+        new ChunkAssembler(tiny.Config).Assemble(legacyCtor, order, Fingerprint);
+        using var oldPath = NewCache(tiny);
+        OldPathAssemble(tiny.Config, oldPath, order);
+
+        int total = ChunkB.Length + 2 * ChunkA.Length;
+        Assert.Equal(total, seam.CurrentLength);
+        Assert.Equal(total, oldPath.CurrentLength);
+        for (int l = 0; l < tiny.Config.NumLayers; l++)
+        {
+            Assert.True(seam.KeysSpan(l).SequenceEqual(oldPath.KeysSpan(l)), $"layer {l} keys differ from the pre-seam assembly");
+            Assert.True(seam.ValuesSpan(l).SequenceEqual(oldPath.ValuesSpan(l)), $"layer {l} values differ from the pre-seam assembly");
+            Assert.True(legacyCtor.KeysSpan(l).SequenceEqual(oldPath.KeysSpan(l)));
+        }
+
+        // Positioned row IO on the CPU backend: write at an offset, read back bit for bit, neighbours untouched.
+        var cpu = new CpuChunkBackend(tiny.Config);
+        using var io = (SimpleKvCache)cpu.CreateCache(SyntheticDenseGguf.Context);
+        int stride = tiny.KvStride;
+        for (int l = 0; l < tiny.Config.NumLayers; l++)
+            cpu.WriteRows(io, l, 0, new float[10 * stride], new float[10 * stride]);
+        cpu.WriteRows(io, 1, 4, a.KeysPerLayer[1], a.ValuesPerLayer[1]);
+        var k = new float[ChunkA.Length * stride];
+        var v = new float[ChunkA.Length * stride];
+        cpu.ReadRows(io, 1, 4, ChunkA.Length, k, v);
+        Assert.Equal(a.KeysPerLayer[1], k);
+        Assert.Equal(a.ValuesPerLayer[1], v);
+        Assert.True(io.KeysSpan(1)[..(4 * stride)].ToArray().All(x => x == 0f));
+        Assert.True(io.KeysSpan(0).ToArray().All(x => x == 0f)); // other layer untouched
+    }
+
+    // ---- helpers ----
+
+    internal const int PartialRopeDim = 8, NoPeLayer = 1, ShiftStart = 3, ShiftRows = 10;
+
+    internal static float[][] RandomRows(int layers, int floats, int seed)
+    {
+        var rng = new Random(seed);
+        var rows = new float[layers][];
+        for (int l = 0; l < layers; l++)
+        {
+            rows[l] = new float[floats];
+            for (int i = 0; i < floats; i++) rows[l][i] = (float)(rng.NextDouble() * 2 - 1);
+        }
+        return rows;
+    }
+
+    /// <summary>Zero rows before <see cref="ShiftStart"/>, then <paramref name="rows"/> at it, on every layer.</summary>
+    internal static void WriteAll(IChunkBackend backend, IKvCache cache, float[][] rows, int stride)
+    {
+        for (int l = 0; l < rows.Length; l++)
+        {
+            backend.WriteRows(cache, l, 0, new float[ShiftStart * stride], new float[ShiftStart * stride]);
+            backend.WriteRows(cache, l, ShiftStart, rows[l], rows[l]);
+        }
+    }
+
+    /// <summary>The assembly algorithm before the backend seam (ChunkAssembler at b99570ba), kept here as the bit-exact reference.</summary>
+    private static unsafe void OldPathAssemble(ModelConfig config, SimpleKvCache destination, IReadOnlyList<ChunkKvEntry> chunks)
+    {
+        RopeParameters rope = RopeParameters.FromConfig(config);
+        int offset = destination.CurrentLength;
+        foreach (ChunkKvEntry chunk in chunks)
+        {
+            int n = chunk.TokenIds.Length;
+            int[] positions = Enumerable.Range(offset, n).ToArray();
+            for (int l = 0; l < destination.NumLayers; l++)
+            {
+                int stride = ((IPerLayerKvCache)destination).KvStrideOf(l);
+                float[] keys = chunk.KeysPerLayer[l];
+                if (offset != 0 && !config.IsNoRopeLayer(l))
+                {
+                    keys = (float[])keys.Clone();
+                    RopeShift.Apply(keys, config.HeadDim, offset, in rope);
+                }
+                fixed (float* kPtr = keys)
+                fixed (float* vPtr = chunk.ValuesPerLayer[l])
+                {
+                    destination.Update(new TensorRef(n, stride, DType.Float32, -1, (nint)kPtr),
+                        new TensorRef(n, stride, DType.Float32, -1, (nint)vPtr), positions, l);
+                }
+            }
+            offset += n;
+        }
+    }
+
+    private ChunkModelFeatures FeaturesOf(string tensorName)
+    {
+        var w = new GgufWriter();
+        w.AddString("general.architecture", "qwen3");
+        w.AddUInt32("general.alignment", 32);
+        w.AddTensor(tensorName, [8], (uint)QuantizationType.F32, new byte[8 * sizeof(float)]);
+        string path = Path.Combine(_scratch, Guid.NewGuid().ToString("N") + ".gguf");
+        File.WriteAllBytes(path, w.Build());
+        using var gguf = GgufFile.Open(path);
+        return ChunkModelFeatures.FromGguf(gguf);
+    }
+
+    internal static SimpleKvCache NewCache(TinyModel tiny)
+        => new(KvGeometry.FromConfig(tiny.Config, compactSlidingWindows: false), SyntheticDenseGguf.Context);
+
+    internal static float MaxAbsDiff(ReadOnlySpan<float> a, ReadOnlySpan<float> b)
+    {
+        Assert.Equal(a.Length, b.Length);
+        float m = 0;
+        for (int i = 0; i < a.Length; i++) m = MathF.Max(m, MathF.Abs(a[i] - b[i]));
+        return m;
+    }
+
+    /// <summary>A backend that, like the Vulkan one, only takes caches with positioned row IO; counts every row operation.</summary>
+    private sealed class PositionedOnlyBackend : IChunkBackend
+    {
+        public int Calls { get; private set; }
+        public string Tag => "positioned-test";
+        public int ForwardDeviceId => -1;
+        public RopeParameters? Rope => null;
+        public void CopyRows(IKvCache source, int layer, int srcStart, IKvCache destination, int dstStart, int count) => Calls++;
+        public IKvCache CreateCache(int maxSeqLen) => throw new NotSupportedException();
+        public void RequireCache(IKvCache cache)
+        {
+            if (cache is not IPositionedHostKvCache)
+                throw new NotSupportedException($"{cache.GetType().Name} has no {nameof(IPositionedHostKvCache)}.");
+        }
+        public void WriteRows(IKvCache cache, int layer, int startPos, ReadOnlySpan<float> k, ReadOnlySpan<float> v) => Calls++;
+        public void ReadRows(IKvCache cache, int layer, int startPos, int count, Span<float> k, Span<float> v) => Calls++;
+        public void ShiftKeys(IKvCache cache, int startPos, int count, int delta, RopeParameters rope) => Calls++;
+    }
+
+    /// <summary>A loaded synthetic model; keeps the mapped GGUF alive for the model's lifetime.</summary>
+    internal sealed class TinyModel : IDisposable
+    {
+        private TinyModel(GgufFile gguf, ModelConfig config, TransformerModel model)
+        {
+            Gguf = gguf;
+            Config = config;
+            Model = model;
+        }
+
+        public GgufFile Gguf { get; }
+        public ModelConfig Config { get; }
+        public TransformerModel Model { get; }
+        public int KvStride => Config.NumKvHeads * Config.HeadDim;
+
+        public static TinyModel Load(string scratch, string arch, int ropeDim = 0)
+        {
+            string path = Path.Combine(scratch, $"{arch}-r{ropeDim}.gguf");
+            File.WriteAllBytes(path, SyntheticDenseGguf.Build(arch, ropeDim: ropeDim));
+            var gguf = GgufFile.Open(path);
+            var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            return new TinyModel(gguf, config, TransformerModel.LoadFromGguf(gguf, config, ThreadingConfig.SingleThreaded));
+        }
+
+        public void Dispose()
+        {
+            Model.Dispose();
+            Gguf.Dispose();
+        }
+    }
+}
+
+/// <summary>GPU half of <see cref="BackendSeamTests"/>: the Vulkan backend's row IO, device shift and destination refusals.</summary>
+[Trait("Category", "GPU")]
+[Collection("VulkanKernels")]
+public sealed class BackendSeamTestsGpu : IDisposable
+{
+    private const string Fingerprint = BackendSeamTests.Fingerprint;
+    private static readonly int[] ChunkA = BackendSeamTests.ChunkA;
+    private static readonly int[] ChunkB = BackendSeamTests.ChunkB;
+    private readonly string _scratch = Path.Combine(Path.GetTempPath(), "dotllm-chunkseam-gpu-" + Guid.NewGuid().ToString("N"));
+    private readonly ITestOutputHelper _output;
+
+    public BackendSeamTestsGpu(ITestOutputHelper output)
+    {
+        _output = output;
+        Directory.CreateDirectory(_scratch);
+    }
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_scratch, recursive: true); }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
+    [SkippableFact]
+    public void VulkanBackend_WriteThenRead_RoundTrips()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var tiny = BackendSeamTests.TinyModel.Load(_scratch, "qwen3");
+        var features = ChunkModelFeatures.FromGguf(tiny.Gguf);
+        ChunkKvEntry a = new ChunkEncoder(Fingerprint).Encode(tiny.Model, ChunkA);
+        int stride = tiny.KvStride, n = ChunkA.Length, layers = tiny.Config.NumLayers;
+
+        using var device = VulkanDevice.Create();
+        // Construction itself refuses a model the device shift cannot re-rotate (before any cache or kernel use).
+        Assert.Throws<NotSupportedException>(() => new VulkanChunkBackend(device, spvDir, tiny.Config, features with { HasRopeFreqFactors = true }));
+        Assert.Throws<NotSupportedException>(() => new VulkanChunkBackend(device, spvDir, tiny.Config, features with { HasAttentionSinks = true }));
+        using var backend = new VulkanChunkBackend(device, spvDir, tiny.Config, features);
+        Assert.Equal(ChunkBackendTags.Vulkan, backend.Tag);
+        using var cache = (VulkanKvCache)backend.CreateCache(SyntheticDenseGguf.Context);
+        Assert.Equal(VulkanKvStorage.F32, cache.Storage);
+
+        // A shift of rows that were never written is refused (write first, then shift).
+        Assert.ThrowsAny<ArgumentException>(() => backend.ShiftKeys(cache, 4, n, 4, RopeParameters.FromConfig(tiny.Config)));
+        Assert.ThrowsAny<ArgumentException>(() => backend.ShiftKeys(cache, 4, n, 0, RopeParameters.FromConfig(tiny.Config))); // range checked at delta 0 too
+
+        // Write every layer at offset 4 (zero rows before it), read back: F32 storage, so exact.
+        for (int l = 0; l < layers; l++)
+        {
+            backend.WriteRows(cache, l, 0, new float[4 * stride], new float[4 * stride]);
+            backend.WriteRows(cache, l, 4, a.KeysPerLayer[l], a.ValuesPerLayer[l]);
+        }
+        Assert.Equal(4 + n, cache.CurrentLength);
+        var k = new float[n * stride];
+        var v = new float[n * stride];
+        for (int l = 0; l < layers; l++)
+        {
+            backend.ReadRows(cache, l, 4, n, k, v);
+            Assert.Equal(a.KeysPerLayer[l], k);
+            Assert.Equal(a.ValuesPerLayer[l], v);
+        }
+
+        // Device shift by +4 of the rows at 4..4+n matches the CPU RopeShift of the same rows (F32 rotation, rounding only),
+        // V untouched; and the assembler through this backend writes the same cache as the CPU assembler (to the same tolerance).
+        backend.ShiftKeys(cache, 4, n, 4, RopeParameters.FromConfig(tiny.Config));
+        float worst = 0;
+        for (int l = 0; l < layers; l++)
+        {
+            float[] expected = (float[])a.KeysPerLayer[l].Clone();
+            RopeShift.Apply(expected, tiny.Config.HeadDim, 4, RopeParameters.FromConfig(tiny.Config));
+            backend.ReadRows(cache, l, 4, n, k, v);
+            Assert.Equal(a.ValuesPerLayer[l], v);
+            Assert.True(BackendSeamTests.MaxAbsDiff(a.KeysPerLayer[l], expected) > 1e-2f); // fixture guard: the shift is not a no-op
+            worst = MathF.Max(worst, BackendSeamTests.MaxAbsDiff(k, expected));
+        }
+        _output.WriteLine($"vulkan shift vs CPU RopeShift: max abs {worst:E3}");
+        Assert.True(worst <= 1e-5f, $"device shift differs from the CPU shift by {worst}");
+
+        // Refusals that need a device: a host cache, and an F16 Vulkan cache (not an exact F32 destination).
+        var assembler = new ChunkAssembler(tiny.Config, backend);
+        ChunkKvEntry vkA = a with { Backend = ChunkBackendTags.Vulkan };
+        using var host = BackendSeamTests.NewCache(tiny);
+        Assert.Throws<NotSupportedException>(() => assembler.Assemble(host, [vkA], Fingerprint));
+        using var f16 = new VulkanKvCache(device, KvGeometry.FromConfig(tiny.Config, compactSlidingWindows: false),
+            SyntheticDenseGguf.Context, VulkanKvStorage.F16);
+        Assert.Contains("F16", Assert.Throws<NotSupportedException>(() => assembler.Assemble(f16, [vkA], Fingerprint)).Message,
+            StringComparison.Ordinal);
+        Assert.Equal(0, f16.CurrentLength);
+
+        ChunkKvEntry b = new ChunkEncoder(Fingerprint).Encode(tiny.Model, ChunkB);
+        using var vkAsm = (VulkanKvCache)backend.CreateCache(SyntheticDenseGguf.Context);
+        assembler.Assemble(vkAsm, [b with { Backend = ChunkBackendTags.Vulkan }, vkA], Fingerprint);
+        using var cpuAsm = BackendSeamTests.NewCache(tiny);
+        new ChunkAssembler(tiny.Config).Assemble(cpuAsm, [b, a], Fingerprint);
+        int total = ChunkB.Length + n;
+        Assert.Equal(total, vkAsm.CurrentLength);
+        var vk = new float[total * stride];
+        var vv = new float[total * stride];
+        float worstAsm = 0;
+        for (int l = 0; l < layers; l++)
+        {
+            vkAsm.ReadRows(l, 0, total, vk, vv);
+            Assert.True(cpuAsm.ValuesSpan(l).SequenceEqual(vv));
+            worstAsm = MathF.Max(worstAsm, BackendSeamTests.MaxAbsDiff(vk, cpuAsm.KeysSpan(l)));
+        }
+        _output.WriteLine($"vulkan assembly vs CPU assembly keys: max abs {worstAsm:E3}");
+        Assert.True(worstAsm <= 1e-5f, $"Vulkan assembly differs from the CPU assembly by {worstAsm}");
+    }
+
+    [SkippableTheory]
+    [InlineData("qwen3", 0, 7)]          // NeoX, full rotary
+    [InlineData("qwen3", 8, 7)]          // NeoX, partial rotary (rope.dimension_count 8 < key_length 16)
+    [InlineData("qwen3", 8, -5)]         // negative delta
+    [InlineData("qwen3", 8, 30_000)]     // large delta
+    [InlineData("llama", 8, 7)]          // Norm (interleaved) pairing, partial rotary
+    [InlineData("llama", 0, 30_000)]     // Norm, large delta
+    public void VulkanBackend_ShiftKeys_MatchesCpu_PartialRotaryNoPeNormAndDeltas(string arch, int ropeDim, int delta)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var tiny = BackendSeamTests.TinyModel.Load(_scratch, arch, ropeDim);
+        // NoPE layer through the config (the synthetic builder has no NoPE architecture).
+        ModelConfig config = tiny.Config with { NoRopeLayers = [BackendSeamTests.NoPeLayer] };
+        RopeParameters rope = RopeParameters.FromConfig(config);
+        Assert.Equal(ropeDim > 0 ? ropeDim : config.HeadDim, rope.RopeDim);
+        int stride = tiny.KvStride, headDim = config.HeadDim, n = BackendSeamTests.ShiftRows, at = BackendSeamTests.ShiftStart;
+        float[][] rows = BackendSeamTests.RandomRows(config.NumLayers, n * stride, seed: 11);
+
+        using var device = VulkanDevice.Create();
+        using var vk = new VulkanChunkBackend(device, spvDir, config, ChunkModelFeatures.FromGguf(tiny.Gguf));
+        Assert.Equal(rope, vk.Rope);
+        using var vkCache = vk.CreateCache(SyntheticDenseGguf.Context);
+        BackendSeamTests.WriteAll(vk, vkCache, rows, stride);
+        vk.ShiftKeys(vkCache, at, n, delta, rope);
+        // Mixed sources are refused: only the checked parameters may be passed.
+        Assert.Throws<ArgumentException>(() => vk.ShiftKeys(vkCache, at, n, delta, rope with { RopeDim = rope.RopeDim == headDim ? headDim - 2 : headDim }));
+
+        var cpu = new CpuChunkBackend(config);
+        using var cpuCache = cpu.CreateCache(SyntheticDenseGguf.Context);
+        BackendSeamTests.WriteAll(cpu, cpuCache, rows, stride);
+        cpu.ShiftKeys(cpuCache, at, n, delta, rope);
+
+        var gk = new float[n * stride];
+        var gv = new float[n * stride];
+        var ck = new float[n * stride];
+        var cv = new float[n * stride];
+        double worst = 0;
+        for (int l = 0; l < config.NumLayers; l++)
+        {
+            vk.ReadRows(vkCache, l, at, n, gk, gv);
+            cpu.ReadRows(cpuCache, l, at, n, ck, cv);
+            Assert.Equal(rows[l], gv);
+            if (l == BackendSeamTests.NoPeLayer)
+            {
+                Assert.Equal(rows[l], gk); // NoPE layer untouched on the device
+                continue;
+            }
+            for (int i = 0; i < gk.Length; i++)
+                if (i % headDim >= rope.RopeDim) Assert.Equal(rows[l][i], gk[i]); // pass-through dims untouched
+            Assert.True(BackendSeamTests.MaxAbsDiff(rows[l], gk) > 1e-2f); // the shift moved the rotated dims
+            worst = Math.Max(worst, BackendSeamTests.MaxAbsDiff(gk, ck));
+        }
+        // Small deltas: float rounding only. Large delta: |angle| reaches 3e4 rad, where an F32 angle has an ulp of ~2e-3 and
+        // the host (double cos/sin of the float angle) and the shader (F32) evaluate differently, so the budget scales with it.
+        double tol = Math.Abs(delta) < 1000 ? 1e-5 : 1e-3; // measured 2.4e-4 at delta 3e4 (Norm, full rotary)
+        _output.WriteLine($"{arch} ropeDim={rope.RopeDim} delta={delta}: max |vulkan - cpu| = {worst:E3} (tol {tol:E1})");
+        Assert.True(worst <= tol, $"device shift differs from the CPU shift by {worst}");
+    }
+}

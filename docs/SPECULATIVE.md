@@ -6,7 +6,11 @@ A small **draft model** proposes K candidate tokens; the larger **target model**
 
 ## Current Status
 
-Speculative decoding is **greedy-only** in the current implementation. `SpeculativeDecoder`'s constructor rejects `greedy: false` and `TextGenerator` only engages speculative decoding when the sampler is effectively argmax — `Temperature <= 0` and `RepetitionPenalty == 1.0`. Requests that don't meet both fall through to the regular (non-speculative) decode path; they are never sampled from an incorrect distribution.
+Speculative decoding is **greedy by default**. `SpeculativeDecoder`'s constructor (the two-model rejection-sampling path) rejects `greedy: false` and `TextGenerator` only engages speculative decoding when the sampler is effectively argmax — `Temperature <= 0` and `RepetitionPenalty == 1.0` — unless Gumbel-coupled sampled verification is on. Requests that don't meet the conditions fall through to the regular (non-speculative) decode path; they are never sampled from an incorrect distribution.
+
+**Sampled (non-greedy) speculation exists as an opt-in** since #1358: [Gumbel-coupled sampled verification](#gumbel-coupled-sampled-verification-1358-cpu-reference) (`DOTLLM_GUMBEL_SAMPLING=1` / `InferenceOptions.GumbelSampling`) emits exactly the token plain decoding draws for the same seed, with a bit-exact device-side draw on Vulkan (#1382, top-k / min-p in #1435) and in the continuous-batch scheduler (#1434). The modified rejection-sampling path described below remains greedy-only.
+
+**Latest dotLLM-vs-llama.cpp numbers** are consolidated in [COMPARISONS.md](COMPARISONS.md); the newest Qwen3.8-27B table is "Re-measure vs llama.cpp after #1517 and #1520" below. Earlier tables in this file (the first MTP table, the #1510 re-measure) are kept as history and are superseded by it.
 
 The probabilistic (modified rejection sampling) path described below requires `q` and `p` to be drawn from the same post-transform distribution the [sampler pipeline](SAMPLING.md) actually samples from (temperature / top-k / top-p / min-p / repetition penalty). The current code computes them from raw softmax over constraint-masked logits, which only coincides with the pipeline for argmax. Tracked in Wave 8 ([issue #121](https://github.com/kkokosa/dotLLM/issues/121)).
 
@@ -600,6 +604,8 @@ llama.cpp master `0ae0e1976` `llama-server --spec-type draft-mtp -md <head>`, sa
 - llama.cpp drafts 74 % accepted at K=3. dotLLM's verify (150 ms for 4 rows vs 105 ms decode) and per-step head cost (LM head over 248k rows
   per draft step) are the remaining gap to llama.cpp's 2.2x.
 
+> **History:** the tables above this line (MTP vs llama.cpp 2.2x gap, plain 0.985x) predate #1510 / #1511 / #1517 / #1520. The current ratios are in the "Re-measure vs llama.cpp after #1517 and #1520" table below and in [COMPARISONS.md](COMPARISONS.md).
+
 **Q4_K verify cliff at 5 and 7 columns (issue #1220, follow-up).** The profile of a 5-row verify showed the Q4_K FFN at 2.05x its 1-row time. It was
 not ALU or bytes: `benchmarks/Q4KVerifyProbe` (the real 17408x5120 / 5120x17408 shapes, 4 rotating 50 MB weight copies, barriers between dispatches)
 shows the NR = 4 default falling off a cliff at 5 and 7 columns on the 8060S (gate/up us/dispatch, GB/s of weights): n=1 247 (203), n=4 319 (157),
@@ -634,6 +640,128 @@ is ~0.95+ there for both engines; llama.cpp's own text differs from dotLLM plain
 **Is #1511 the next lever?** Yes, but for K=2/K=3 and DFlash rather than K=4. Those arms verify 3, 4 and 4 rows, in the 2..4 column range where the Q4_K GEMV
 reads 150-160 GB/s against about 205 GB/s at one column, and they are the arms still at or below llama.cpp. Reaching ~190 GB/s would cut the Q4_K share of a
 3-4 row verify by about a fifth; it cannot lift K=4 much further for the same reason. No code change here (measurement only).
+
+**Q4_K at 2..16 columns, 150 -> 190-204 GB/s (issue #1511).** `benchmarks/Q4KVerifyProbe` (gate/up 17408x5120, 50 MB weights, us/dispatch, GB/s of
+weights, NR 4) before -> after: n=2 283 (177) -> 245 (204), n=3 317 (158) -> 242 (207), n=4 324 (155) -> 245 (204), n=5 529 (95) -> 256 (196),
+n=6 331 (151) -> 271 (185), n=7 712 (70) -> 291 (172), n=8 398 (126) -> 308 (163); the 9..16-column range (previously 447-1103 us, 45-112 GB/s) is 322 / 345 / 373 /
+441 us at n=9..12 (NR 4) and 502 / 533 / 567 / 582 at n=13..16 (NR 3). `down` (5120x17408) is the same within 3%. One column is unchanged (238-245 us).
+
+*Cause.* Perturbation first, on the real shapes: removing the activation loads (constants) took n=2..4 to 190-200 GB/s, loading ONE column and reusing it
+(fewer load instructions, same FMAs) did too, loading the same bytes N times from identical addresses (cache hits, same instruction count) did NOT, and removing
+the reduction epilogue did not. So the cost was memory *instructions*, not bytes, ALU or LDS. Dropping the three scale-header loads and one of the two quant loads per
+row (junk values, perturbation only) also recovered 200+ GB/s. `rga --isa` then showed why the timings were erratic across neighbouring (NC, NR): for the slow pairs
+(e.g. NC4/NR4) the compiler split the step's loads into two batches with `s_waitcnt vmcnt(0)` between them (4-7 loads in flight, the loop latency-bound), for fast pairs
+(NC6/NR4) it issued all 18 up front. VGPRs (43-83 at NC 2-4) and spills (zero) did not predict it, and unrolling the loop alone did not fix it (U1 vs U2 flipped
+which pairs were slow).
+
+*Fix* (`matmul_q4_k_gemv_f32_multi.comp`): the weight buffer is read as `uvec4` (a 144-byte super-block is exactly 9 of them): one 16-byte load for the
+d/dmin/scales header and one for the lane's quant words instead of six dword loads per row, and the loop is software pipelined, loading the next block pair into a second register set before consuming the
+current one (two sets swap roles each half-iteration, no copies). The arithmetic is untouched: the same lane -> (block, sub-block, q) map, the same fma chain per
+accumulator, the same fixed reduction tree, so every column is bit-identical to the old kernel. `Q4KRows_MatchLaneOrderFmaOracleExactly` replays that order on the CPU
+(a fused multiply-add per element, lanes summed by the halving tree) and compares bit for bit across NR 1..4, 2..16 columns, odd block counts and the 1/2-block prologue; the oracle also
+passes on the *original* shader (so new == old == oracle), and dies against two mutants (a wrong weight component in one fma; the half-window tail guard replaced by `true`).
+
+*Table.* The smooth shader has no 5/7-column cliff, so the #1510 table (`3:3,5:3,7:2`) and 5 -> 6 / 7 -> 8 padding are retired for this host (padding now costs: 5 columns 256 us vs 271 padded to 6): NR 4 for
+2..12 columns, NR 3 for 13..16 (`DOTLLM_VK_Q4K_ROWS_BYN`, `DOTLLM_VK_Q4K_PADODD=1` re-enables padding). Nemotron-H and the generic Vulkan host also use this shader with tables tuned to the old cliff (#1516).
+
+*Verify wall* (`VerifyRowCurve`, Qwen3.8-27B Q4_K_M, ms median of 3 reps, A B B A order, 4 processes): rows 2 / 3 / 4 / 5 / 6 / 8 / 10 / 12 / 16 old 102.6-108.1 / 110.5-110.6 /
+112.8-112.9 / 120.9 / 118.8 / 133.1-135.4 / 157.6-159.1 / 181.0-182.4 / 240.3-241.3 -> new 95.5 / 96.1-97.1 / 98.9-100.1 / 105.7-106.6 / 105.0-106.1 / 118.1-120.2 /
+128.6-132.4 / 148.1-150.0 / 200.1-210.4 (-12% at 3-4 rows, -11% at 8, -17% at 16).
+
+*End to end* (Qwen3.8-27B Q4_K_M + `mtp-Qwen3.8-27B-Q8_0.gguf` / DFlash2 Q4_K_M, 4 prompts x 128 greedy tokens, `DOTLLM_MTP_ADAPTIVE=0`, one process per run, old = the previous shader + the #1510
+table/padding in the same CLI build, new/old paired and order alternated between reps; 7 pairs per arm because a third of rep 2 was cut when the GPU lock was handed over): K=2 18.16 -> 19.81 tok/s
+(x1.09, per-pair 0.996-1.140), K=3 19.72 -> 21.25 (x1.08, 0.960-1.118), DFlash K=3 22.46 -> 25.38 (x1.13, 1.118-1.139). Greedy text (300 chars, whitespace-folded) equals dotLLM plain on 41/41
+runs of both builds, and a plain-vs-MTP-other-prompt control differs (the check can fail). Caveat: this session's absolute numbers are about 13% below the re-measure table above (plain 10.2 vs 10.44; the old arm
+reads 18.2 against 21.0 for K=2), so the table was not re-run against llama.cpp; applying the paired ratios to it gives roughly K=2 22.9, K=3 27.0, DFlash K=3 31.1 tok/s against llama.cpp's 22.37 / 24.66 / 28.91.
+
+Refuted along the way: more rows per workgroup (NR 6 / 8 slower even at 2 columns), unrolling alone, reducing without the LDS tree (the cliffs follow the load schedule, not the epilogue), coalescing the activation loads (no change; the stride-32B pattern
+is not the cost), LDS-staged activations (already refuted in #1220), and a larger L0 hit rate (identical-address loads cost the same).
+
+**The #1511 structure applied to Q5_K, Q6_K and Q8_0 (issues #1515, #1516).** `Q4KVerifyProbe` now takes a format (`q4k|q5k|q6k|q8_0`) and a `hash` mode (output hash per column count and NR on fixed data, to diff an old and a new `.spv`).
+Probe numbers are gate/up 17408x5120, us/dispatch (GB/s of weights), medians of 5 reps, arms interleaved, GPU + CPU locks held.
+
+*Q5_K (the win).* The old multi-column shader was 1 row per workgroup, dword loads (7 per row-step), `subgroupAdd` per column, and read 153 GB/s at 2 columns falling to 67 GB/s at 8 and 37 at 16 (401 / 455 / 606 / 674 / 784 / 835 / 913 us at
+n = 2..8). `matmul_q5_k_gemv_f32_multi.comp` is now the Q4_K shader plus the qh bit: NR rows per workgroup, 16-byte loads (a 176-byte super-block is 11 uvec4: header, qh x2, qs x8), the pipelined loop, the dequantise-once
+`w = sc * code - min` and the `precise` fma chain, reduced by the fixed LDS tree. Default NR 4 for 2..12 columns, 3 for 13..16: n = 2..8 285 / 291 / 295 / 305 / 322 / 342 / 400 us (215 -> 153 GB/s), n = 12 487, n = 13..16 516 / 585 / 618 / 793.
+That is 1.4x at 2 columns, 2.1x at 4, 2.4x at 6, 2.3x at 8, 2.1x at 16. *This changes bits*: the old shader's `subgroupAdd` order and non-`precise` contraction were not defined (its own 3..16-column hashes
+differed between NR/NC specialisations, so no bit-exact oracle for it existed); the new one is deterministic in NR and NC, which `Q5KRows_MatchLaneOrderFmaOracleExactly` pins by replaying the lane order on the CPU (NR 1..4, 2..16 columns, M % NR != 0, odd block counts, the 1-block prologue; the oracle is the Q4_K one plus
+`code |= qh bit sb << 4`). Mutants killed: wrong qh bit (`sb ^ 1`, 8/8 cases fail), wrong qh word (8/8), half-window tail guard replaced by `true` (6/8), reordered fma pair (8/8). Against the single-row Q5_K GEMV the existing
+`Multi_EachColumnMatchesSingleRowGemv` tolerance still holds (every Q5_K case). End to end, `VerifyRowCurve` on Llama-3.2-3B-Instruct Q5_K_M (generic `VulkanTransformerModel`, ctx 64, `fwd` median ms of 3 reps x 5, base = origin/dev, 3 + 3 processes in
+base/new/new/base/base/new order; ranges are the min-max of the per-process medians): rows 1 / 2 / 3 / 4 / 6 / 8 / 12 / 16 13.1-13.3 / 16.1-16.4 / 18.9-19.3 / 22.2-22.4 / 25.3-25.4 / 28.8-29.5 / 37.4-38.5 / 51.1-51.8 ->
+13.0-13.1 / 13.7-13.9 / 14.6-14.8 / 15.2 / 16.3-16.6 / 19.0-19.2 / 24.3-24.4 / 35.5-36.0 (x0.99 / 0.85 / 0.76 / 0.68 / 0.65 / 0.66 / 0.65 / 0.69). The one-row forward does not use this shader and is unchanged.
+
+*Q4_K tables (#1516).* With the #1511 shader the 5/7-column cliff is gone, so the tables tuned to it are retired. Generic `VulkanTransformerModel` (`_smallRowQ4K`): NR 4 for 2..12 columns, 3 for 13..16. Qwen3-4B-Instruct-2507 Q4_K_M `VerifyRowCurve`
+(`fwd` ms, base -> new): 12 rows 30.1 -> 30.1-30.4, 13 34.9 -> 33.5, 14 37.3 -> 35.4, 15 43.7 -> 37.2, 16 53.4 -> 38.0 (-29%); 2..11 rows equal within 1.7%. Nemotron-H keeps one K-quant table for Q6_K (still has the cliff: see below) and gets its own Q4_K
+table (`Q4KRowsByColumns`: NR 4 for 2..12, 3 for 13..16) and no 5/7 padding for Q4_K (`DOTLLM_VK_NEMOTRON_Q4K_LEGACY=1` restores the #1459 table and padding; `DOTLLM_VK_NEMOTRON_PERN_TABLE` takes an optional fourth field for Q4_K). Nemotron-3-Nano-4B Q4_K_M
+`verify` ms (base -> new, 3 + 3 processes, ABBABA): rows 2 / 3 / 4 / 5 / 6 / 7 / 8 / 12 / 16 16.7-18.4 / 17.1-18.7 / 17.5-19.4 / 17.7-20.1 / 17.9-20.0 / 19.4-22.9 / 19.6-23.3 / 24.2-28.6 / 35.0-41.8 -> 16.9-17.8 / 17.3-18.3 / 17.6-18.3 /
+17.9-18.7 / 17.7-18.8 / 19.6-20.6 / 19.8-21.5 / 24.4-25.8 / 30.5-32.7: equal within noise at 2..12 rows (dropping the padding costs nothing, and removes the dependence on spare buffer rows), -12% at 16. The Nano sweep over a uniform Q4_K NR of 2, 3 and 4 (rows 2..16; 2 reps for NR 2 and 4, 1 for NR 3) agrees: NR 3 and 4 trade places within ~1 ms up to 12 rows, NR 3 wins from 13 (27.4 / 28.8 / 30.8 / 33.0 vs 29.3-30.0 / 30.1-31.5 / 32.5-34.3 / 35.7-38.3 at NR 4), NR 2 is worst everywhere. The Q8_0 / Q5_0 / Q4_0 Nemotron entries (`ExactRowsByColumns`) are not
+touched: their shaders did not change.
+
+*Q6_K rows and Q8_0 multi: refuted, kernels unchanged.* Both read at the DRAM ceiling where verify runs, so there is no load-instruction gap to close:
+
+| 17408x5120, NR 4, GB/s | n=1 | 2 | 3 | 4 | 5 | 6 | 8 | 12 | 16 |
+|---|---|---|---|---|---|---|---|---|---|
+| Q6_K rows (73 MB) | 200 | 181 | 182 | 197 | **103** | 176 | 164 | 137 | 102 |
+| Q8_0 multi (95 MB) | 213 | 208 | 202 | 198 | 208 | 207 | 200 | 182 | 143 |
+
+Q6_K's only hole is the 5-column cliff at NR 4 (NR 2 / 3 / 4 at n = 5: 473 / 388 / 675 us on gate/up, 514 / 424 / 648 on down; 6 columns at NR 4 is 373 / 392): the existing Nemotron `5:3` / padding entries already cover it. The dense qwen35 host (`MatMulQ6KRows`, NR 4) still pays it, but a `5:3` table there (bit-identical, tried via a temporary `DOTLLM_VK_Q6K_ROWS_BYN`) did not show in `VerifyRowCurve` on Qwen3.8-27B Q4_K_M: the six runs (base/new/new/base/base/new, 3 reps x 3) were too noisy to resolve it (5-row `verify` 107-110 ms base against 111-133 new, and the 4- and 6-row control points, which the table does not touch, also read 5-14% slower in the new arms), so it was not shipped. Follow-up filed. What was tried, both bit-identical to the old kernel (hash of the output over 3 shapes x 1..16
+columns x NR 1..4 equal) and both rejected on speed: (1) a 210-byte block is 2 (mod 4) so 16-byte units are not available; reading raw dwords (10 per row-step, one funnel shift for every field since every field starts at a multiple of 4) with a two-register-set pipelined loop: 1..4 columns got 7-15% slower (NR 4: 422 us vs 365-405), and 13..16 columns spilled
+(2.1-2.9 ms against 0.63-0.73); (2) the same without double buffering: n = 5 improved to 502 us but n = 10 became 1104 us and 13..16 spilled again (1.7-2.9 ms). The activations are 4 vec4 per column and step here, so an x double buffer is out (16 VGPRs per column), and the 80 weight dwords alone push NR 4 over the VGPR cliff.
+Q8_0 (34-byte blocks, same 2 (mod 4) problem): three raw dwords + funnel shifts + the full Q4_K-style double buffer (activations included) is bit-identical, makes NR 2 up to 1.5x faster (1471 -> 983 us at 16 columns) but NR 4, the default and the best arm, 1-12% slower at 1..12 columns and 14% slower at 16 (663 -> 756 us). Not worth a new default. Both
+kernels are at 200+ GB/s up to 4 columns (Q8_0 to 12), so the remaining distance to the 210-220 GB/s ceiling is small.
+
+**Re-measure vs llama.cpp after #1517 and #1520 (issue #1220, dev `fc8fa0b0`).** Same harness, prompts, llama.cpp build (`0ae0e1976` Vulkan
+`llama-server`), `DOTLLM_MTP_ADAPTIVE=0`, 3 reps with reversed pair order in rep 2, GPU lock and `cpu-bench` held, ollama idle. The machine
+rebooted mid-sweep (during rep 2); the sweep was resumed with the missing runs only (rep 1 and 27 of 40 rep-2 runs pre-reboot, the rest after), so
+rep-to-rep spread is wider than last time. **Absolute tok/s are about 14% lower for BOTH engines than in the #1510 table (plain 8.97 / 9.26 vs
+10.44 / 10.73, including the pre-reboot rep 1), so this session is a slower box state; compare ratios, not absolutes, against the earlier table.**
+Mean of the 4 prompts' tok/s (range = min..max over the 3 reps of that mean); the ratio is the mean of the 3 per-rep ratios:
+
+| arm | dotLLM tok/s | llama.cpp tok/s | dotLLM / llama.cpp (per-rep range) | per prompt ratio (p0 / p1 / p2 / p3, mean of 3 reps) | previous ratio (#1510 table) | peak private / GPU shared MiB dotLLM | llama.cpp |
+|---|---|---|---|---|---|---|---|
+| plain | 8.97 (8.52-9.42) | 9.26 (8.88-9.65) | 0.97 (0.93-1.02) | 0.96 / 0.96 / 0.96 / 0.99 | 0.97 | 19,210 / 18,551 | 19,499 / 18,636 |
+| MTP K=2 | 20.04 (19.69-20.39) | 20.18 (19.33-21.44) | 1.00 (0.92-1.04) | 0.93 / 1.00 / 0.96 / 1.08 | 0.94 | 19,693 / 19,004 | 23,707 / 22,150 |
+| MTP K=3 | 24.55 (23.99-24.83) | 21.50 (20.17-22.88) | **1.14** (1.08-1.23) | 1.06 / 1.34 / 1.02 / 1.25 | 1.02 | 19,694 / 19,013 | 24,129 / 22,301 |
+| MTP K=4 | 26.30 (24.00-29.25) | 21.89 (20.75-23.37) | **1.20** (1.16-1.25) | 1.04 / 1.44 / 1.11 / 1.39 | 1.14 | 19,700 / 19,018 | 24,280 / 22,462 |
+| DFlash2 K=3 | 26.55 (24.55-28.91) | 25.83 (24.34-28.33) | 1.03 (1.01-1.06) | 1.03 / 1.09 / 1.03 / 0.98 | 0.95 | 20,374 / 19,684 | 22,336 / 21,036 |
+
+- K=3 (1.02 -> 1.14) and DFlash K=3 (0.95 -> 1.03) moved ahead of llama.cpp; K=2 went 0.94 -> 1.00 (parity within the rep spread). The dotLLM
+  absolutes of the verify-heavy arms are within ~5% of the #1510 table (K=3 24.55 vs 25.03, K=4 26.30 vs 27.65, DFlash 26.55 vs 27.55) while plain
+  moved -14%, so those arms gained relative to plain. Read this as "the 2..4-column verify gap is closed", not as a new absolute record.
+- **Arms still below llama.cpp:** plain decode only (0.96-0.99 on every prompt, 0.97 mean; the same -3% as in every earlier measurement). K=2 is at
+  parity (0.93 on the degenerate prompt 0, 1.08 on prompt 3). The residual is the 1-row decode path, not verify or speculation.
+- **Next lever:** the 1-row GEMVs. The #1511 perturbation recipe found the multi-column kernels were limited by load instructions and in-flight
+  loads; the n=1 Q4_K / Q6_K / Q8_0 kernels (238-245 us per 17408x5120 gate/up, ~205 GB/s) and the 248k-row Q6_K LM head (4.8 ms of ~105 ms) are the
+  remaining ~3%. Check whether llama.cpp's 1-row kernel exceeds 205 GB/s on the same shape before investing; if it does not, plain decode is at the
+  bandwidth floor and the 3% is dispatch overhead (previously measured as not the lever).
+- **Greedy identity:** every dotLLM MTP/DFlash run (48 runs) equals dotLLM plain on the first 300 characters, per prompt and rep (60 / 60 counting the
+  plain runs). Caveats as before: prompts 0 and 2 degenerate into repetition on the raw prompt (acceptance ~0.95+); prompt 1 is the non-degenerate one
+  and is where dotLLM leads most (K=4 1.44x); llama.cpp's own MTP varies run to run (K=4 20.8-23.4 on the mean of 4).
+
+**Plain decode stage profile and llama.cpp per-op comparison (issue #1220, dev `59e77ae2`).** Qwen3.8-27B Q4_K_M, 1-row decode, GPU-timestamp profile
+(`DOTLLM_VULKAN_HYBRID_PROFILE=1 ..._MINSEQ=1`; this forces one submission per layer, so its "UNATTRIBUTED" 13.2 ms of 108.4 ms wall is the profiler's own
+64 submits, NOT a decode cost: the fused production step measured `SubmitAndWait` 96-101 ms plus 1.5 ms host (record ~1 ms, logits download 0.1 ms, engine 0.2 ms)).
+Achieved GB/s from the shapes, per bucket: proj_ffn 48.0 ms for 9.6 GB (Q4_K, 192 dispatches of 50.1 MB) = 200 GB/s; proj_gdn 28.9 ms for 5.88 GB (Q8_0) = 203;
+proj_attn 8.3 ms for 1.66 GB = 200; **lm_head 4.8 ms for 1.04 GB (Q6_K, 248320 rows) = 217**; everything else (norm, GDN scan/pre/copy, resid, attention, act) 5.3 ms.
+Total 95.2 ms attributed for 18.2 GB = 191 GB/s. llama.cpp (`GGML_VK_PERF_LOGGER=1`, same file, `74ade5274`) sums to 95.0 ms of GPU time per token with per-op
+times: Q4_K 17408x5120 231 us (217 GB/s), Q4_K down 5120x17408 (fused add) 243 us, Q8_0 10240x5120 263 / 6144x5120 176 / 5120x6144 192 us, Q6_K lm head 4.66 ms,
+small ops ~6.7 ms. By bucket dotLLM is level or ahead everywhere except the Q4_K FFN (48.0 vs 45.1 ms, -2.9 ms = the whole 3%): GDN projections 28.9 vs 30.3,
+attention projections 8.3 vs 8.2, lm head 4.8 vs 4.66, small ops 5.3 vs 6.7. The ceiling for the 9.6 GB FFN at llama's 217 GB/s is 44.2 ms.
+Paired ABBA (llama-bench tg64 vs `bench -n 64`, ollama idle, but a 20000-CPU-second ChunkKvLab process was running, so the box was noisy): llama.cpp 10.71 +-0.06 then
+9.88 +-1.22 tok/s; dotLLM 9.95 / 9.97. llama.cpp's own run-to-run swing (8%) exceeds the gap.
+
+*Q4_K n=1 kernel probe* (`Q4KVerifyProbe 15 1,2,3,4,6 1 q4k`, weights rotating through 200 MB): minimum over 15 reps 238-245 us (205-210 GB/s) for gate/up and 240-250 us for down at
+EVERY NR (1, 2, 3, 4, 6); the medians (255-340 us) swing 10-30% between identical processes under the background load, so NR/median differences are not resolvable. Removing the
+inter-dispatch barrier (`PROBE_NOBARRIER=1`) does not move the minimum (235-250 us): barrier drain is not the gap. The kernel already has 16-byte loads, a two-set
+software pipeline and NR rows per workgroup (#1511); llama.cpp's reads 4-byte words with 2 rows per workgroup, so load width is not what separates them. Remaining Q4_K
+n=1 distance to llama's number is 3-6% of 245 us, below what this box resolves.
+
+*Generality* (same ABBA protocol, `bench -n 128` vs llama-bench tg128): Qwen3-4B-Instruct-2507 Q4_K_M dotLLM 65.8 / 66.3 vs llama.cpp 65.7 / 64.6 tok/s (1.01x);
+Llama-3.2-3B Q8_0 dotLLM 54.7 / 54.5 vs llama.cpp 50.5 / 54.7 (0.99-1.08x). Dense plain decode is at parity there; the 27B residual is specific to the 17408x5120 Q4_K FFN shapes.
+
+*Not a lever (measured / arithmetic):* barrier drain (above); host side (1.5 ms/step = 1.5%, only removable by feeding the next token from a device-side argmax so the next step
+can be recorded while the GPU runs, tracked as a follow-up); fusing SwiGLU into the down GEMV's activation load (each of the ~1100 workgroups would recompute exp over all 17408 elements,
+about 5 us of ALU against the 2.7 us dispatch it removes); LM head (217 GB/s, at the Q8_0 ceiling).
 
 **Verify and decode on the same kernels (issue #1220).** The 4-row verify cost 150 ms against a 105 ms decode, and every verify column only
 matched decode by luck: the multi-column GEMVs reduced with `subgroupAdd`, whose order changes with the subgroup width a driver picks for

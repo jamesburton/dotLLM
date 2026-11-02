@@ -1,0 +1,5 @@
+#version 450
+// F16-KV twin of query_relevance_lse_f32.comp (K read in place as halves, see kv_load.glsl).
+#define KV_F16 1
+#extension GL_GOOGLE_include_directive : require
+#include "query_relevance_lse_f32.glsl"

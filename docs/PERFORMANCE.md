@@ -1,5 +1,7 @@
 # dotLLM Performance Baseline
 
+> **Snapshot, not current.** This is the May-2026 baseline (dotLLM `bcace4b` on `feature/qwen3.6`, llama.cpp b9041, Intel Core Ultra 7 155H + RTX 3060; section 6 is Strix Halo Vulkan without a llama.cpp comparator). Its ratios (Llama-1B CPU 0.69x, CUDA decode 0.43-0.60x, Qwen3.6-A3B 0.25x) predate most of the work since. Current cross-engine figures: [COMPARISONS.md](COMPARISONS.md). Rows that still need a llama.cpp re-measure are listed there.
+
 This document captures a first concrete performance baseline for dotLLM
 versus llama.cpp on a single developer machine. It is the seed for a
 running performance log — future measurements should append to the

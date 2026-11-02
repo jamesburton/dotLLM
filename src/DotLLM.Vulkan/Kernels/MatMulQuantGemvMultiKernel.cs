@@ -79,9 +79,9 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
     public int RowsPerWorkgroupFor(int n) => _rowsForColumns[n];
 
     /// <summary>True when the shader also serves a single activation row (n = 1), i.e. can stand in for the decode GEMV.</summary>
-    public bool SupportsSingleColumn => TakesRows(Format);
+    public bool SupportsSingleColumn => Format is QuantGemvMultiFormat.Q4_K or QuantGemvMultiFormat.Q6_K_Rows;
 
-    private static bool TakesRows(QuantGemvMultiFormat f) => f is QuantGemvMultiFormat.Q4_K or QuantGemvMultiFormat.Q6_K_Rows;
+    private static bool TakesRows(QuantGemvMultiFormat f) => f is QuantGemvMultiFormat.Q4_K or QuantGemvMultiFormat.Q5_K or QuantGemvMultiFormat.Q6_K_Rows;
 
     private MatMulQuantGemvMultiKernel(QuantGemvMultiFormat format, VulkanDevice device, VulkanModule module, nint pool, int buffersPerSet, int blockBytes,
                                        uint requiredSubgroupSize, int rowsPerWorkgroup, int multiColumnRowsPerWorkgroup, int wideRowsPerWorkgroup, int[]? rowsByColumns)
@@ -113,7 +113,7 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
     private static (string Spv, int BlockBytes, int Buffers, bool NeedsSubgroup, bool NeedsWave32) Describe(QuantGemvMultiFormat f) => f switch
     {
         QuantGemvMultiFormat.Q4_K => ("matmul_q4_k_gemv_f32_multi.spv", 144, 3, false, false),
-        QuantGemvMultiFormat.Q5_K => ("matmul_q5_k_gemv_f32_multi.spv", 176, 3, true, false),
+        QuantGemvMultiFormat.Q5_K => ("matmul_q5_k_gemv_f32_multi.spv", 176, 3, false, false),
         QuantGemvMultiFormat.Q6_K => ("matmul_q6_k_gemv_f32_multi.spv", 210, 3, true, false),
         QuantGemvMultiFormat.Q6_K_R2 => ("matmul_q6_k_gemv_f32_multi_r2.spv", 210, 3, true, false),
         QuantGemvMultiFormat.Q6_K_Rows => ("matmul_q6_k_gemv_f32_rows.spv", 210, 3, false, false),
@@ -157,6 +157,14 @@ public sealed class MatMulQuantGemvMultiKernel : IDisposable
         if (rowsByColumns is not null)
             foreach (int v in rowsByColumns)
                 if (v < 0 || v > 4 || (v > 1 && !TakesRows(format))) throw new ArgumentOutOfRangeException(nameof(rowsByColumns));
+        if (format == QuantGemvMultiFormat.Q5_K && rowsPerWorkgroup == 1 && multiColumnRowsPerWorkgroup == 0 && wideRowsPerWorkgroup == 0 && rowsByColumns is null)
+        {
+            // #1515: Q5_K at the Qwen3.8-27B FFN shapes (61 MB weights, 8060S): NR 4 is best for 2..12 columns (285-342 us at 2..7 = 180-215 GB/s), NR 3 for 13..16
+            // (516-793 us against 696-1593 at NR 4). A row's bits do not depend on NR.
+            multiColumnRowsPerWorkgroup = 4;
+            wideRowsPerWorkgroup = 4;
+            rowsByColumns = new[] { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 3, 3, 3 };
+        }
         if (multiColumnRowsPerWorkgroup == 0) multiColumnRowsPerWorkgroup = rowsPerWorkgroup;
         if (wideRowsPerWorkgroup == 0) wideRowsPerWorkgroup = TakesRows(format) ? 4 : 1;
         if (wideRowsPerWorkgroup < 1 || wideRowsPerWorkgroup > 4 || (wideRowsPerWorkgroup > 1 && !TakesRows(format)))

@@ -454,7 +454,7 @@ internal static class E4Command
     }
 
     /// <summary>The plans (contexts + tasks) this run evaluates; see the class remarks.</summary>
-    internal static IReadOnlyList<CodeContextPlan> SelectPlans(E4Options o, Corpus corpus, ReferenceGraph? graph)
+    internal static IReadOnlyList<CodeContextPlan> SelectPlans(E4Options o, Corpus corpus, ReferenceGraph? graph = null)
     {
         if (o.ContextKind is not ("random" or "related")) throw new ArgumentException($"unknown --context-kind '{o.ContextKind}' (related|random)");
         if (o.ContextKind == "related" && o.Mode != "kept") throw new ArgumentException("--context-kind related needs --mode kept");
@@ -538,7 +538,7 @@ internal static class E4Command
     private static int PlanSeed(int seed, string firstTaskId) =>
         unchecked(seed * 1_000_003 + int.Parse(StableKey(firstTaskId)[..7], NumberStyles.HexNumber, CultureInfo.InvariantCulture));
 
-    private static int RandomSeed(int seed, int plan) => unchecked(seed * 1_000_003 + plan * 7_919 + 17);
+    internal static int RandomSeed(int seed, int plan) => unchecked(seed * 1_000_003 + plan * 7_919 + 17);
 
     private static string Key(int[] selection)
     {

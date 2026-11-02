@@ -58,6 +58,12 @@ public sealed class KvDeviation
     public float CombinedRelative(int layer, int token)
         => Ratio(CombinedL2(layer, token), Hypot(KeyReferenceNorm(layer, token), ValueReferenceNorm(layer, token)));
 
+    /// <summary>
+    /// Fills <paramref name="keys"/> and <paramref name="values"/> (each <c>rows × stride</c> floats) with rows <c>[0, rows)</c> of
+    /// <paramref name="layer"/>, for <see cref="Compute(int, int, Func{int, int}, KvRowsReader, KvRowsReader)"/>.
+    /// </summary>
+    public delegate void KvRowsReader(int layer, int rows, Span<float> keys, Span<float> values);
+
     /// <summary>Compares rows <c>[0, <paramref name="rows"/>)</c> of every layer of two caches with the same geometry.</summary>
     /// <param name="reference">The full-prefill cache.</param>
     /// <param name="reused">The assembled (reused) cache.</param>
@@ -72,17 +78,53 @@ public sealed class KvDeviation
             throw new ArgumentException($"Both caches must hold {rows} rows (reference {reference.CurrentLength}, reused {reused.CurrentLength}).");
         if (reference.NumLayers != reused.NumLayers)
             throw new ArgumentException($"Layer counts differ ({reference.NumLayers} vs {reused.NumLayers}).");
+        for (int l = 0; l < reference.NumLayers; l++)
+            if (reused.KvStrideOf(l) != reference.KvStrideOf(l))
+                throw new ArgumentException($"Layer {l}: KV strides differ ({reference.KvStrideOf(l)} vs {reused.KvStrideOf(l)}).");
 
-        int layers = reference.NumLayers;
+        static KvRowsReader Of(SimpleKvCache c) => (layer, n, keys, values) =>
+        {
+            int count = n * c.KvStrideOf(layer);
+            c.KeysSpan(layer)[..count].CopyTo(keys);
+            c.ValuesSpan(layer)[..count].CopyTo(values);
+        };
+        return Compute(reference.NumLayers, rows, reference.KvStrideOf, Of(reference), Of(reused));
+    }
+
+    /// <summary>
+    /// Compares rows <c>[0, <paramref name="rows"/>)</c> of every layer of two caches read through <paramref name="reference"/>
+    /// and <paramref name="reused"/> (any backend; e.g. <c>IChunkBackend.ReadRows</c>). Same arithmetic as the
+    /// <see cref="SimpleKvCache"/> overload; one layer is held in memory per side at a time.
+    /// </summary>
+    /// <param name="layers">Layer count.</param>
+    /// <param name="rows">Rows compared per layer.</param>
+    /// <param name="strideOf">KV row stride (floats) of a layer; the same for both sides.</param>
+    /// <param name="reference">Reads the full-prefill (reference) rows.</param>
+    /// <param name="reused">Reads the compared rows.</param>
+    public static KvDeviation Compute(int layers, int rows, Func<int, int> strideOf, KvRowsReader reference, KvRowsReader reused)
+    {
+        ArgumentNullException.ThrowIfNull(strideOf);
+        ArgumentNullException.ThrowIfNull(reference);
+        ArgumentNullException.ThrowIfNull(reused);
+        ArgumentOutOfRangeException.ThrowIfNegative(layers);
+        ArgumentOutOfRangeException.ThrowIfNegative(rows);
+
         long size = (long)layers * rows;
         float[] dk = new float[size], dv = new float[size], nk = new float[size], nv = new float[size];
+        float[] kr = [], ku = [], vr = [], vu = [];
         for (int l = 0; l < layers; l++)
         {
-            int stride = reference.KvStrideOf(l);
-            if (reused.KvStrideOf(l) != stride)
-                throw new ArgumentException($"Layer {l}: KV strides differ ({stride} vs {reused.KvStrideOf(l)}).");
-            ReadOnlySpan<float> kr = reference.KeysSpan(l), ku = reused.KeysSpan(l);
-            ReadOnlySpan<float> vr = reference.ValuesSpan(l), vu = reused.ValuesSpan(l);
+            int stride = strideOf(l);
+            int count = rows * stride;
+            if (kr.Length != count)
+            {
+                kr = new float[count];
+                ku = new float[count];
+                vr = new float[count];
+                vu = new float[count];
+            }
+            reference(l, rows, kr, vr);
+            reused(l, rows, ku, vu);
             for (int t = 0; t < rows; t++)
             {
                 int o = t * stride;

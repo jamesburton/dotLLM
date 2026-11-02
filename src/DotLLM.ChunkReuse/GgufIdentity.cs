@@ -7,7 +7,7 @@ using DotLLM.Models.Gguf;
 namespace DotLLM.ChunkReuse;
 
 /// <summary>
-/// Content-based identities of a GGUF for chunk-store keys (<see cref="ChunkFingerprint.Compute"/> model id and tokenizer id), so
+/// Content-based identities of a GGUF for chunk-store keys (<see cref="ChunkFingerprint.Compute(DotLLM.Core.Models.ModelConfig, string, string, string, string, int)"/> model id and tokenizer id), so
 /// that a re-quantized, re-downloaded or edited file with the same name is a store miss rather than a wrong hit.
 /// </summary>
 public static class GgufIdentity

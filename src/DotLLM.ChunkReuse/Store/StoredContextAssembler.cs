@@ -83,7 +83,7 @@ public sealed class StoredContextAssembler
     private readonly (string ModelId, string Quantization)? _identity;
 
     /// <summary>Creates an assembler for one model identity, given as a precomputed fingerprint (see the class remarks on identity).</summary>
-    /// <param name="modelFingerprint">The real model fingerprint (<see cref="ChunkFingerprint.Compute"/>) of every model passed to
+    /// <param name="modelFingerprint">The real model fingerprint (<see cref="ChunkFingerprint.Compute(DotLLM.Core.Models.ModelConfig, string, string, string, string, int)"/>) of every model passed to
     /// <see cref="Assemble"/>; not checked against the model.</param>
     /// <param name="tokenizerId">Tokenizer identity, part of the key (content-based, e.g. <see cref="GgufIdentity.TokenizerId"/>).</param>
     public StoredContextAssembler(string modelFingerprint, string tokenizerId)
@@ -138,7 +138,7 @@ public sealed class StoredContextAssembler
 
     /// <summary>
     /// Resolves every chunk from <paramref name="store"/> (encoding and storing misses) and, when <paramref name="destination"/> is
-    /// given, appends the chunks' K/V to it at running offsets from its current length (<see cref="ChunkAssembler.Assemble"/>).
+    /// given, appends the chunks' K/V to it at running offsets from its current length (<see cref="ChunkAssembler.Assemble(DotLLM.Core.Attention.IKvCache, IReadOnlyList{ChunkKvEntry}, string)"/>).
     /// The chunks, the model identity and the destination (exact host F32, layer count, strides, capacity) are validated before
     /// any store read or encode, and the destination is left unchanged whenever the call throws.
     /// </summary>

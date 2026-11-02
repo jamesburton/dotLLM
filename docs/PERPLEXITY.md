@@ -742,3 +742,25 @@ Mean KL ~1e-4 is two orders below the activation-precision floor recorded above 
 Q8 activation numerics are accepted and the default cut is now unbounded (`DOTLLM_PQ2_SMALLN_MAX=1` restores the float tier). W2A8 is faster at
 every measured n (2.1-2.6x), so there is no crossover to cut at. Single-session, one model; windows are few (sd of PPL ~1.9), but the paired
 per-token KL does not depend on that.
+
+### CPU Q8_K activation quantizer: PPL and greedy sanity check (issue #1340, 2026-10-31)
+
+#1507 changed the CPU Q8_K activation quantizer to llama.cpp's `quantize_row_q8_K_ref` (`iscale = 127/amax`,
+`d = 1/iscale`, instead of `d = amax/127` with a reciprocal of `d`). Two CPU builds that differ only by #1507
+(parent `b26128a7` vs merge `e4a66e0f`), Llama-3.2-1B, `wiki.test.lf.raw`, `--context 512`, 64 windows
+(16,320 scored tokens), `--per-window`; reference is llama.cpp b11739 CPU (`-dev none -ngl 0 --chunks 64`).
+
+| model | before #1507 | after #1507 | llama.cpp CPU | paired dNLL (after - before), 64 windows |
+|---|---|---|---|---|
+| Q4_K_M (Q4_K + Q6_K) | 15.7676 | 15.7606 | 15.7555 | -0.00045, se 0.00063 |
+| pure Q3_K | 23.3274 | 23.3185 | 23.2969 | -0.00038, se 0.00077 |
+
+Both deltas are inside noise (-0.04% PPL), and both builds move slightly towards llama.cpp (gap to llama.cpp
++0.077% -> +0.032% on Q4_K_M, +0.131% -> +0.093% on Q3_K; this is a sign, not a resolved effect). No window is
+bit-identical between the builds (max per-window PPL change 1.2-1.4%, mean zero): the change is a one-ULP
+rounding difference in the quantized activations, digitised into different integers on a few elements.
+
+Greedy decode is **not** preserved. 8 short prompts, 96 tokens, `-t 0`, CPU: Q4_K_M diverged on 6/8 and pure Q3_K on
+6/8 (first divergence after 23-92 words). This is expected for any change to activation rounding and is not a
+quality signal; compare perplexity, not text, across the change. Note `dotllm run` defaults to `--device auto`
+(Vulkan on this box): pass `-d cpu` or a CPU A/B silently measures the GPU.

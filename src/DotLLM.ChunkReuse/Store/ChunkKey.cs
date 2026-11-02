@@ -50,7 +50,7 @@ public readonly record struct ChunkKey(string Hex)
 
     /// <summary>Computes the key.</summary>
     /// <param name="modelFingerprint">
-    /// The real model fingerprint (<see cref="ChunkFingerprint.Compute"/>), not a label: RoPE scaling fields (YaRN/NTK factors,
+    /// The real model fingerprint (<see cref="ChunkFingerprint.Compute(DotLLM.Core.Models.ModelConfig, string, string, string, string, int)"/>), not a label: RoPE scaling fields (YaRN/NTK factors,
     /// original context, betas), NoPE layers and the KV layout reach the key only through it.
     /// </param>
     /// <param name="tokenizerId">Tokenizer identity.</param>

@@ -9,6 +9,8 @@
     <ProjectReference Include="..\DotLLM.Cpu\DotLLM.Cpu.csproj" />
     <ProjectReference Include="..\DotLLM.Engine\DotLLM.Engine.csproj" />
     <ProjectReference Include="..\DotLLM.Models\DotLLM.Models.csproj" />
+    <!-- Phase G backend seam: VulkanKvCache positioned row IO and the device RoPE delta shift (#1531). -->
+    <ProjectReference Include="..\DotLLM.Vulkan\DotLLM.Vulkan.csproj" />
   </ItemGroup>
 
   <ItemGroup>

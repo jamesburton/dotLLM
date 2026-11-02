@@ -28,7 +28,8 @@ internal static class SyntheticDenseGguf
     /// 256 byte tokens (no merges), so the GGUF's own tokenizer encodes any UTF-8 text one token per byte and decodes it back
     /// exactly, and a context length of <see cref="ByteContext"/>: a whole-tool test model (chunkcache) that reads source files.
     /// </param>
-    public static byte[] Build(string arch, int seed = 20261031, bool byteLevelVocab = false)
+    /// <param name="ropeDim">When positive, writes <c>rope.dimension_count</c> (partial rotary: only the leading dims of each head rotate).</param>
+    public static byte[] Build(string arch, int seed = 20261031, bool byteLevelVocab = false, int ropeDim = 0)
     {
         int vocab = byteLevelVocab ? ByteVocab : Vocab;
         bool qkNorm = arch switch
@@ -53,6 +54,8 @@ internal static class SyntheticDenseGguf
         // Like the real Qwen3-4B-Instruct-2507 GGUF: freq_base only, no rope.dimension_count (full-head rotation) and no
         // rope.scaling.* keys.
         w.AddFloat32($"{arch}.rope.freq_base", RopeTheta);
+        if (ropeDim > 0)
+            w.AddUInt32($"{arch}.rope.dimension_count", (uint)ropeDim);
         w.AddFloat32($"{arch}.attention.layer_norm_rms_epsilon", 1e-6f);
 
         var tokens = byteLevelVocab ? ByteLevelTokens() : new string[Vocab];

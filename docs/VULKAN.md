@@ -202,6 +202,8 @@ infrastructure for later.
 
 ## Deferred Work
 
+> **Historical (scaffold era).** The list below was written when `DotLLM.Vulkan` was a scaffold; weight staging, descriptor-set caching, fence-based submission and model loading have long since landed (the backend runs full models, see the sections below and [GPU.md](GPU.md)). The `IBackend` item (4) is still accurate: models are served through `VulkanTransformerModel` and its siblings, not an `IBackend` adapter. Current dotLLM-vs-llama.cpp results: [COMPARISONS.md](COMPARISONS.md).
+
 Tracked for future sessions:
 
 1. **Staging buffers for large uploads.** The scaffold allocates

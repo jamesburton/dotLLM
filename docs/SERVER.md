@@ -148,11 +148,14 @@ Full reference: **[ANTHROPIC_API.md](ANTHROPIC_API.md)**.
 ### `POST /v1/embeddings`
 Extract embedding vectors from text (#451).
 
-> **Backend coverage: CPU only.** The pooled hidden state comes from
-> `IEmbeddingModel.ForwardHidden`, which only the CPU `TransformerModel` implements. When a
-> Vulkan or CUDA model is loaded the endpoint returns **501 Not Implemented** with a message
-> naming the model type, rather than silently returning an unvalidated vector. A GPU path is a
-> follow-on, not a blocker.
+> **Backend coverage: CPU and Vulkan.** The pooled hidden state comes from `IEmbeddingModel`.
+> CPU `TransformerModel` / `BertEncoderModel` implement it, and so do the Vulkan models since
+> #1406 (decoder embedders such as Qwen3-Embedding), #741 / #1471 / #1473 (`bert`, `nomic-bert`,
+> `nomic-bert-moe` encoders) and #1472 (EmbeddingGemma); requests are batched across clients by
+> `EmbeddingBatcher` (#1405) and packed into one Vulkan forward (#1437). A CUDA model, or any model
+> that does not implement `IEmbeddingModel`, returns **501 Not Implemented** with a message naming
+> the model type, rather than silently returning an unvalidated vector. See
+> [EMBEDDINGS.md](EMBEDDINGS.md) for validated models and throughput.
 
 **Request**
 
