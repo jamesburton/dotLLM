@@ -500,6 +500,14 @@ public sealed class VulkanRecomputeTestsGpu : IDisposable
         var ex = Assert.Throws<InvalidOperationException>(() =>
             SelectiveRecomputer.Recompute(model, backend, cache, entries, VulkanRecomputeTests.Scattered));
         Assert.Contains("per-query-position", ex.Message, StringComparison.Ordinal);
+        // A contiguous run inside the filled cache needs the kernel too (per-run as well as single pass).
+        using IKvCache cache2 = VulkanRecomputeTests.Assembled(tiny.Config, backend, entries);
+        Assert.Throws<InvalidOperationException>(() =>
+            SelectiveRecomputer.Recompute(model, backend, cache2, entries, [7, 8], RecomputeMode.PerRun));
+        // A run ending at the cache length is an ordinary prefill-shaped forward: fine without the kernel.
+        using IKvCache cache3 = VulkanRecomputeTests.Assembled(tiny.Config, backend, entries);
+        SelectiveRecomputeResult tail = SelectiveRecomputer.Recompute(model, backend, cache3, entries, [L - 2, L - 1]);
+        Assert.Equal(0, tail.QueryPositionAttentionLayers);
     }
 
     private static void AppendSuffix(Rig rig, IKvCache cache)
