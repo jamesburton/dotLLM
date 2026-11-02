@@ -51,9 +51,15 @@ internal static class E1Runner
         // Keep the box out of Modern Standby, and this process running if it enters it anyway (KeepAwake).
         using var awake = KeepAwake.Hold("ChunkKvLab e1: long GPU/CPU measurement run");
         Console.WriteLine(awake.Description);
-        // A heartbeat in the run log: a host suspend or a stall shows up as a gap between heartbeats.
-        using var heartbeat = new Timer(_ => Console.WriteLine($"[heartbeat {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC, +{total.Elapsed.TotalMinutes:F1} min]"),
-            null, TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5));
+        // A heartbeat in the run log, with the time since the previous one: after a host suspend the timer does not fire on schedule,
+        // so a stall shows explicitly as a long "since previous" (e.g. 36 min instead of 5).
+        double lastBeatMin = 0;
+        using var heartbeat = new Timer(_ =>
+        {
+            double now = total.Elapsed.TotalMinutes;
+            Console.WriteLine($"[heartbeat {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC, +{now:F1} min, {now - lastBeatMin:F1} min since previous]");
+            lastBeatMin = now;
+        }, null, TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5));
         using LabModel lab = LabModel.Load(o.ModelPath, o.Threads);
         bool vulkan = lab.Backend.Tag == ChunkBackendTags.Vulkan;
         if (o.CrossCheck && !vulkan)
