@@ -93,6 +93,12 @@ layout(set = 0, binding = 3, std430) writeonly buffer BufOut { float outp[]; }; 
 #if defined(SINKS)
 layout(set = 0, binding = 4, std430) readonly  buffer BufSink { float sinks[]; };  // [num_heads] F32 sink logits
 #endif
+#if defined(QPOS)
+// Per-query-token positions (issue #1540, the tiled twin of attention_f32_qpos): token t attends keys <= qpos[t]. The tokens need not be
+// consecutive and seqKv may exceed the last position (selective recompute inside an already-filled cache). positionOffset is ignored and
+// the mask is Causal. Mutually exclusive with SINKS (both use binding 4).
+layout(set = 0, binding = 4, std430) readonly  buffer BufQPos { int qpos[]; };     // [seq_q]
+#endif
 
 layout(push_constant) uniform PushConstants {
     uint  seqQ;
@@ -201,7 +207,11 @@ void main() {
     // This lane's softmax row.
     uint mRow    = row0 + myRow;
     bool rowLive = mRow < totalRows;
+    #if defined(QPOS)
+    uint posQ    = rowLive ? uint(qpos[mRow / G]) : 0u;
+#else
     uint posQ    = pc.positionOffset + (rowLive ? mRow / G : 0u);
+#endif
 
     // 1. Q fragments (hi / lo f16 halves of the F32 row), staged one 16x16 block at a time through this strip's P scratch.
     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> qh[HD_CHUNKS];
@@ -252,12 +262,29 @@ void main() {
 
     // 2. KV walk. Causal early exit at the workgroup's last position; per strip, tiles past its own last position are skipped.
     uint kvEnd = pc.seqKv;
+#if defined(QPOS)
+    // Positions are arbitrary: the workgroup's KV range is bounded by its tokens' largest position, the sliding-window skip and the
+    // full-tile (no masked cell) test by their smallest, and a strip is switched off past its own tokens' largest.
+    uint wgFirstPos = 0xFFFFFFFFu;
+    uint wgLastPos = 0u;
+    for (uint tt = wgRow0 / G; tt <= (wgRowEnd - 1u) / G; tt++) {
+        uint pp = uint(qpos[tt]);
+        wgFirstPos = min(wgFirstPos, pp);
+        wgLastPos = max(wgLastPos, pp);
+    }
+    kvEnd = min(pc.seqKv, wgLastPos + 1u);
+    uint stripLastPos = 0u;
+    if (stripLive) {
+        for (uint tt = row0 / G; tt <= (stripRowEnd - 1u) / G; tt++) stripLastPos = max(stripLastPos, uint(qpos[tt]));
+    }
+#else
     if (pc.maskMode == 0u) {
         uint lastPos = pc.positionOffset + (wgRowEnd - 1u) / G;
         kvEnd = min(pc.seqKv, lastPos + 1u);
     }
     uint wgFirstPos   = pc.positionOffset + wgRow0 / G;
     uint stripLastPos = pc.positionOffset + (stripLive ? (stripRowEnd - 1u) / G : 0u);
+#endif
     uint kvStart = 0u;
     if (pc.slidingWindow > 0u && wgFirstPos >= pc.slidingWindow) {
         kvStart = min(((wgFirstPos - pc.slidingWindow + 1u) / uint(BC)) * uint(BC), kvEnd);

@@ -781,6 +781,21 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
     private AttentionQueryPositionsKernel? _attentionQPos;
     /// <summary>Count of attention layers that ran on the per-query-position kernel (#1531; test/diagnostic).</summary>
     public long AttentionQueryPositionsCount { get; private set; }
+    // Tiled (GQA-grouped flash) twin of the above (#1540); the reference kernel above stays the oracle and the fallback.
+    private VulkanFlashAttentionGqaKernel? _attentionQPosTiled;
+    /// <summary>Count of attention layers that ran on the tiled per-query-position kernel (#1540; subset of <see cref="AttentionQueryPositionsCount"/>).</summary>
+    public long AttentionQueryPositionsTiledCount { get; private set; }
+    /// <summary>
+    /// Whether the per-query-position attention (#1531) is loaded, so a caller can refuse a selective recompute before writing instead of
+    /// finding out after the forward. When false, the ordinary kernels would mis-mask non-contiguous rows.
+    /// </summary>
+    public bool SupportsQueryPositionAttention => _attentionQPos is not null;
+    /// <summary>Whether the tiled per-query-position kernel (#1540) is loaded (otherwise the one-workgroup-per-row reference runs).</summary>
+    public bool SupportsTiledQueryPositionAttention => _attentionQPosTiled is not null;
+    /// <summary>Whether the tiled kernel serves the per-query-position path when loaded (default true); false forces the reference kernel (A/B and oracle runs).</summary>
+    public bool TiledQueryPositionAttentionEnabled { get; set; } = true;
+    /// <summary>Environment variable: <c>ref</c> forces the reference per-query-position kernel (#1540 A/B and oracle).</summary>
+    public const string QueryPositionsKernelEnvVar = "DOTLLM_VULKAN_ATTN_QPOS";
     private VulkanQueryRelevanceProbe? _relevanceProbe;
     /// <summary>Attaches (or, with null, detaches) a query-relevance probe: while attached, every layer of a cached forward on a plain <see cref="VulkanKvCache"/> feeds it (#1531 step 4). Not thread-safe; one forward at a time.</summary>
     public void AttachQueryRelevanceProbe(VulkanQueryRelevanceProbe? probe) => _relevanceProbe = probe;
@@ -2613,7 +2628,11 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             model._rowScaleMul = SimpleComputeKernel.Create(device, spvDir, "row_scale_mul_f32", buffers: 2, pushWords: 2);
         }
         if (File.Exists(Path.Combine(spvDir, "attention_f32_qpos.spv")))
+        {
             model._attentionQPos = AttentionQueryPositionsKernel.Create(device, spvDir);
+            if (Environment.GetEnvironmentVariable(QueryPositionsKernelEnvVar) != "ref" && !IsFlashAttentionDisabled())
+                model._attentionQPosTiled = VulkanFlashAttentionGqaKernel.TryCreate(device, spvDir, VulkanKvStorage.F32, queryPositions: true);
+        }
         if (config.Architecture == DotLLM.Core.Configuration.Architecture.GptOss)
             model.InitGptOss(spvDir);
         if (config.Architecture is DotLLM.Core.Configuration.Architecture.MiMoV2 or DotLLM.Core.Configuration.Architecture.Flint)
@@ -4562,11 +4581,22 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
             {
                 // Selective recompute (#1531): query rows at arbitrary positions (non-contiguous, or a run inside an already-filled
                 // cache). The flash / coopmat kernels derive each row's position as positionOffset + row and assert a tight span.
-                ProfNote("attn_qpos", seqLen, seqKv, numHeads);
                 AttentionQueryPositionsCount++;
+                if (TiledQueryPositionAttentionEnabled && _attentionQPosTiled is { } tiled && tiled.CanDispatch(headDim, numHeads, numKvHeads))
+                {
+                    ProfNote("attn_qpos_tiled", seqLen, seqKv, numHeads);
+                    AttentionQueryPositionsTiledCount++;
+                    tiled.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput, seqLen, seqKv, numHeads, numKvHeads, headDim,
+                        slidingWindow: layerSlidingWindow, softCap: attnSoftCap, scaleOverride: attnScaleOverride,
+                        queryPositions: _state.PositionsBuffer);
+                }
+                else
+                {
+                ProfNote("attn_qpos", seqLen, seqKv, numHeads);
                 _attentionQPos.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput, _state.PositionsBuffer,
                     seqQ: seqLen, seqKv: seqKv, numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                     slidingWindow: layerSlidingWindow, softCap: attnSoftCap, scaleOverride: attnScaleOverride);
+                }
             }
             else
             RecordAttention(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
@@ -5497,6 +5527,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         _ropeKvWrite?.InvalidateDescriptorCache();
         _attention.InvalidateDescriptorCache();
         _attentionQPos?.InvalidateDescriptorCache();
+        _attentionQPosTiled?.InvalidateDescriptorCache();
         _flashAttention?.InvalidateDescriptorCache();
         _flashAttentionCoopmat?.InvalidateDescriptorCache();
         _splitKvAttention?.InvalidateDescriptorCache();
@@ -9610,6 +9641,7 @@ public sealed partial class VulkanTransformerModel : IModel, IEmbeddingModel
         _flashAttentionCoopmat?.Dispose();
         _attention.Dispose();
         _attentionQPos?.Dispose();
+        _attentionQPosTiled?.Dispose();
         _gptOss?.Dispose();
         _ropeYarnInvFreq?.Dispose();
         _rope.Dispose();
