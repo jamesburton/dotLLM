@@ -329,14 +329,19 @@ public sealed class ChunkIndexTests : IDisposable
         Assert.Throws<InvalidDataException>(() => symIndex.EvictableOrphans(deleted, store.Root));
     }
 
-    public static TheoryData<string> BadIndexFiles() => new()
+    public static TheoryData<string> StructurallyBadIndexFiles() => new()
     {
-        "version", "file-null", "path-null", "sha-bad", "chunks-null", "chunk-null", "key-bad", "duplicate-path",
-        "offset-inverted", "offset-gap", "line-inverted", "line-zero", "tokens-negative", "chunker-null", "path-rooted",
+        "version", "file-null", "path-null", "sha-bad", "chunks-null", "chunk-null", "key-bad", "duplicate-path", "chunker-null",
+        "path-rooted", "path-dotdot",
+    };
+
+    public static TheoryData<string> NonTilingIndexFiles() => new()
+    {
+        "offset-inverted", "offset-gap", "first-not-zero", "line-inverted", "line-zero", "tokens-negative",
     };
 
     [Theory]
-    [MemberData(nameof(BadIndexFiles))]
+    [MemberData(nameof(StructurallyBadIndexFiles))]
     public void Load_MalformedOrOtherVersion_IsEmptyWithNote(string defect)
     {
         Directory.CreateDirectory(_root);
@@ -345,6 +350,7 @@ public sealed class ChunkIndexTests : IDisposable
         ChunkIndex ok = ChunkIndex.Load(path, KeyA);
         Assert.Null(ok.LoadNote);
         Assert.Equal(2, ok.ChunksOf("A.txt").Count);
+        Assert.Single(ok.ChunksOf("Z.txt"));
 
         File.WriteAllText(path, IndexJson(defect));
         ChunkIndex bad = ChunkIndex.Load(path, KeyA);
@@ -353,35 +359,223 @@ public sealed class ChunkIndexTests : IDisposable
         Assert.Equal(0, bad.DistinctKeyCount);
     }
 
+    [Theory]
+    [MemberData(nameof(NonTilingIndexFiles))]
+    public void Load_NonTilingEntry_DropsOnlyThatFile(string defect)
+    {
+        Directory.CreateDirectory(_root);
+        string path = Path.Combine(_root, "index-fixed-10.json");
+        File.WriteAllText(path, IndexJson(defect));
+        ChunkIndex index = ChunkIndex.Load(path, KeyA);
+        Assert.NotNull(index.LoadNote);
+        Assert.Contains("A.txt", index.LoadNote, StringComparison.Ordinal);
+        Assert.Equal(["Z.txt"], index.Paths);
+        Assert.Equal(1, index.DistinctKeyCount); // A's keys are not referenced
+        Assert.Equal(ChunkRef.KindOfName("fixed-10"), index.ChunksOf("Z.txt")[0].Kind);
+    }
+
+    [Fact]
+    public void Load_ZeroLengthChunkAndBackslashPath_AreAccepted()
+    {
+        Directory.CreateDirectory(_root);
+        string path = Path.Combine(_root, "index-fixed-10.json");
+        File.WriteAllText(path, IndexJson("zero-tail"));
+        ChunkIndex index = ChunkIndex.Load(path, KeyA);
+        Assert.Null(index.LoadNote);
+        Assert.Equal(2, index.ChunksOf("A.txt").Count);
+
+        File.WriteAllText(path, IndexJson("path-backslash"));
+        ChunkIndex slashed = ChunkIndex.Load(path, KeyA);
+        Assert.Null(slashed.LoadNote);
+        Assert.Equal(["Z.txt", "sub/A.txt"], slashed.Paths.Order(StringComparer.Ordinal));
+    }
+
     private static string IndexJson(string defect)
     {
         string producer = KeyA([]).Hex;
-        string k1 = KeyA([1]).Hex, k2 = KeyA([2]).Hex, sha = new string('a', 64);
+        string k1 = KeyA([1]).Hex, k2 = KeyA([2]).Hex, k3 = KeyA([3]).Hex, sha = new string('a', 64);
+        string Chunk(int sl, int el, int so, int eo, int t, string k) =>
+            $$"""{"startLine":{{sl}},"endLine":{{el}},"startOffset":{{so}},"endOffset":{{eo}},"tokens":{{t}},"key":"{{k}}"}""";
         string c1 = defect switch
         {
-            "offset-inverted" => $$"""{"startLine":1,"endLine":1,"startOffset":0,"endOffset":0,"tokens":10,"key":"{{k1}}"}""",
-            "line-inverted" => $$"""{"startLine":2,"endLine":1,"startOffset":0,"endOffset":10,"tokens":10,"key":"{{k1}}"}""",
-            "line-zero" => $$"""{"startLine":0,"endLine":1,"startOffset":0,"endOffset":10,"tokens":10,"key":"{{k1}}"}""",
-            "tokens-negative" => $$"""{"startLine":1,"endLine":1,"startOffset":0,"endOffset":10,"tokens":-1,"key":"{{k1}}"}""",
-            "key-bad" => """{"startLine":1,"endLine":1,"startOffset":0,"endOffset":10,"tokens":10,"key":"XYZ"}""",
+            "line-zero" => Chunk(0, 1, 0, 10, 10, k1),
+            "first-not-zero" => Chunk(1, 1, 1, 10, 10, k1),
+            "tokens-negative" => Chunk(1, 1, 0, 10, -1, k1),
+            "key-bad" => Chunk(1, 1, 0, 10, 10, "XYZ"),
             "chunk-null" => "null",
-            _ => $$"""{"startLine":1,"endLine":1,"startOffset":0,"endOffset":10,"tokens":10,"key":"{{k1}}"}""",
+            _ => Chunk(1, 1, 0, 10, 10, k1),
         };
-        string c2 = defect is "offset-gap"
-            ? $$"""{"startLine":2,"endLine":2,"startOffset":11,"endOffset":20,"tokens":10,"key":"{{k2}}"}"""
-            : $$"""{"startLine":2,"endLine":2,"startOffset":10,"endOffset":20,"tokens":10,"key":"{{k2}}"}""";
+        string c2 = defect switch
+        {
+            "offset-gap" => Chunk(2, 2, 11, 20, 10, k2),
+            "offset-inverted" => Chunk(2, 2, 10, 5, 10, k2),
+            "line-inverted" => Chunk(3, 2, 10, 20, 10, k2),
+            "zero-tail" => Chunk(2, 2, 10, 10, 1, k2),
+            _ => Chunk(2, 2, 10, 20, 10, k2),
+        };
         string chunks = defect is "chunks-null" ? "null" : $"[{c1},{c2}]";
-        string filePath = defect switch { "path-null" => "null", "path-rooted" => "\"/abs/A.txt\"", _ => "\"A.txt\"" };
+        string filePath = defect switch
+        {
+            "path-null" => "null",
+            "path-rooted" => "\"/abs/A.txt\"",
+            "path-dotdot" => "\"../A.txt\"",
+            "path-backslash" => "\"sub\\\\A.txt\"",
+            _ => "\"A.txt\"",
+        };
         string file = $$"""{"path":{{filePath}},"sha256":"{{(defect is "sha-bad" ? "nothex" : sha)}}","chunks":{{chunks}}}""";
+        string z = $$"""{"path":"Z.txt","sha256":"{{sha}}","chunks":[{{Chunk(1, 1, 0, 5, 5, k3)}}]}""";
         string files = defect switch
         {
-            "file-null" => $"[{file},null]",
-            "duplicate-path" => $$"""[{{file}},{"path":"A.txt","sha256":"{{sha}}","chunks":[]}]""",
-            _ => $"[{file}]",
+            "file-null" => $"[{file},null,{z}]",
+            "duplicate-path" => $$"""[{{file}},{"path":"A.txt","sha256":"{{sha}}","chunks":[]},{{z}}]""",
+            _ => $"[{file},{z}]",
         };
         string chunker = defect is "chunker-null" ? "null" : "\"fixed-10\"";
         int version = defect is "version" ? ChunkIndex.FormatVersion + 1 : ChunkIndex.FormatVersion;
         return $$"""{"formatVersion":{{version}},"producer":"{{producer}}","chunker":{{chunker}},"files":{{files}}}""";
+    }
+
+    [Fact]
+    public void Update_ChunkerThatDoesNotTileTheFile_FailsLoudlyAndChangesNothing()
+    {
+        var index = new ChunkIndex(KeyA);
+        var good = new FixedSizeChunker(new CharTokenizer(), chunkTokens: 4);
+        index.Update([new SourceFile("A.txt", "abcdefgh")], good);
+        foreach (string mode in new[] { "gap", "short", "overlap" })
+        {
+            var bad = new BrokenChunker(mode);
+            var ex = Assert.Throws<InvalidOperationException>(() =>
+                index.Update([new SourceFile("A.txt", "abcdefgh"), new SourceFile("B.txt", "12345678")], bad));
+            Assert.Contains("broken-" + mode, ex.Message, StringComparison.Ordinal);
+            Assert.Equal(["A.txt"], index.Paths); // nothing applied: B not added, A not re-chunked
+            Assert.Equal(good.Name, index.ChunkerName);
+            Assert.Equal(2, index.ChunksOf("A.txt").Count);
+        }
+    }
+
+    /// <summary>Two halves of the file, with a defect: a one-char gap, a missing tail, or an overlap.</summary>
+    private sealed class BrokenChunker(string mode) : IChunker
+    {
+        public string Name => "broken-" + mode;
+        public int MaxChunkTokens => int.MaxValue;
+        public IReadOnlyList<Chunk> Chunk(SourceFile file)
+        {
+            int n = file.Text.Length, h = n / 2;
+            (int s1, int e1, int s2, int e2) = mode switch
+            {
+                "gap" => (0, h, h + 1, n),
+                "short" => (0, h, h, n - 1),
+                _ => (0, h + 1, h, n),
+            };
+            return
+            [
+                new Chunk(file.Path, 1, 1, file.Text[s1..e1].Select(c => (int)c).ToArray()) { StartOffset = s1, EndOffset = e1 },
+                new Chunk(file.Path, 1, 1, file.Text[s2..e2].Select(c => (int)c).ToArray()) { StartOffset = s2, EndOffset = e2 },
+            ];
+        }
+    }
+
+    [Fact]
+    public void RealChunkers_MultiByteText_TileAndRoundTrip()
+    {
+        // Byte-level tokens, so slices of 7 split multi-byte characters; one over-long line forces the symbol chunker's
+        // token-slice path (pieces of a single line), where decode-based offsets used to drift past the line end.
+        var tokenizer = new ByteTokenizer();
+        string text = "namespace Ü;\n\n// café, naïve, €100, 日本語\npublic class Ä\n{\n    public string S() => \""
+            + string.Concat(Enumerable.Repeat("é€日", 12)) + "\";\n\n    public int N() { return 1; } // ø\n}\n";
+        var files = new[] { new SourceFile("src/Ü.cs", text), new SourceFile("src/plain.cs", "class P { int x; }\n") };
+        foreach (IChunker chunker in new IChunker[] { new SymbolChunker(tokenizer, 7), new FixedSizeChunker(tokenizer, 7) })
+        {
+            var index = new ChunkIndex(KeyA);
+            index.Update(files, chunker);
+            Assert.Equal(text.Length, index.ChunksOf("src/Ü.cs")[^1].EndOffset);
+            string path = Path.Combine(_root, $"index-{chunker.Name}.json");
+            index.Save(path);
+            ChunkIndex loaded = ChunkIndex.Load(path, KeyA);
+            Assert.Null(loaded.LoadNote);
+            Assert.Equal(index.ChunksOf("src/Ü.cs"), loaded.ChunksOf("src/Ü.cs"));
+            Assert.Empty(loaded.Update(files, chunker).Added);
+        }
+    }
+
+    [Fact]
+    public void RelativizeScan_UsesDeepestCommonRoot_ExcludesOtherVolumes_DedupesByPathComparer()
+    {
+        string sep = Path.DirectorySeparatorChar.ToString();
+        string top = Path.GetFullPath(Path.Combine(_root, "repo"));
+        string build = Path.Combine(top, "build");
+        var scan = new List<SourceFile>
+        {
+            new(".." + sep + "src" + sep + "A.cs", "a"),            // relative to the solution folder, outside it
+            new(Path.Combine(top, "src", "B.cs"), "b"),              // absolute
+            new(Path.Combine(top, "shared", "X.cs"), "x"),
+            new(Path.Combine(top, "src", "B.cs"), "b"),              // exact duplicate
+        };
+        if (OperatingSystem.IsWindows())
+        {
+            scan.Add(new(Path.Combine(top, "SRC", "b.cs"), "b"));    // same file, other casing
+            string otherDrive = (char.ToUpperInvariant(top[0]) == 'Z' ? "Y" : "Z") + @":\elsewhere\Y.cs";
+            scan.Add(new(otherDrive, "y"));
+        }
+
+        (IReadOnlyList<SourceFile> files, string root, IReadOnlyList<string> excluded) = ChunkIndex.RelativizeScan(scan, build);
+        Assert.Equal(top, root);
+        Assert.Equal(["shared/X.cs", "src/A.cs", "src/B.cs"], files.Select(f => f.Path).Order(StringComparer.Ordinal));
+        Assert.Equal("a", Assert.Single(files, f => string.Equals(f.Path, "src/A.cs", StringComparison.Ordinal)).Text);
+        if (OperatingSystem.IsWindows()) Assert.Single(excluded);
+        else Assert.Empty(excluded);
+
+        // The relative paths feed Update directly.
+        var index = new ChunkIndex(KeyA);
+        index.Update(files, new FixedSizeChunker(new CharTokenizer(), 4));
+        Assert.Equal(3, index.Paths.Count);
+
+        // Without a root, every path must be absolute; the root is their deepest common directory.
+        (_, string root2, _) = ChunkIndex.RelativizeScan([new(Path.Combine(top, "src", "B.cs"), "b"), new(Path.Combine(top, "src", "deep", "C.cs"), "c")], null);
+        Assert.Equal(Path.Combine(top, "src"), root2);
+        Assert.Throws<ArgumentException>(() => ChunkIndex.RelativizeScan([new("rel/A.cs", "a")], null));
+    }
+
+    [Fact]
+    public void StoreWideOrphans_AreStoreKeysNoIndexReferences_AndTheStoreLockIsExclusive()
+    {
+        var chunker = new FixedSizeChunker(new CharTokenizer(), chunkTokens: 10);
+        Directory.CreateDirectory(_root);
+        var a = new ChunkIndex(KeyA);
+        a.Update([new SourceFile("A.txt", "012345678\n")], chunker);
+        a.Save(ChunkIndex.DefaultPath(_root, "fixed-10"));
+        var b = new ChunkIndex(KeyA);
+        b.Update([new SourceFile("B.txt", "bbbbbbbbb\n")], new SymbolChunker(new CharTokenizer(), 4096));
+        b.Save(ChunkIndex.DefaultPath(_root, "symbol-4096"));
+
+        var store = new KeySetStore();
+        ChunkKey stray = KeyA([42]);
+        foreach (ChunkKey k in a.ReferencedKeys().Concat(b.ReferencedKeys()).Append(stray)) store.Add(k);
+        Assert.Equal([stray], ChunkIndex.StoreWideOrphans(store, _root));
+
+        using (IDisposable held = ChunkIndex.AcquireStoreLock(_root, TimeSpan.FromSeconds(1)))
+        {
+            Assert.Throws<TimeoutException>(() => { using IDisposable second = ChunkIndex.AcquireStoreLock(_root, TimeSpan.FromMilliseconds(100)); });
+        }
+        using (ChunkIndex.AcquireStoreLock(_root, TimeSpan.FromMilliseconds(100))) { }
+        Assert.Equal([stray], ChunkIndex.StoreWideOrphans(store, _root)); // the lock file is not an index
+    }
+
+    [Fact]
+    public void Save_RemovesStaleTempFilesOfThatIndex()
+    {
+        Directory.CreateDirectory(_root);
+        string path = Path.Combine(_root, "index-fixed-10.json");
+        string stale = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        string fresh = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        File.WriteAllText(stale, "x");
+        File.SetLastWriteTimeUtc(stale, DateTime.UtcNow.AddHours(-2));
+        File.WriteAllText(fresh, "x"); // may belong to a writer that is still running
+        var index = new ChunkIndex(KeyA);
+        index.Update([new SourceFile("A.txt", "abc")], new FixedSizeChunker(new CharTokenizer(), 10));
+        index.Save(path);
+        Assert.False(File.Exists(stale));
+        Assert.True(File.Exists(fresh));
     }
 
     [Fact]
@@ -467,6 +661,15 @@ public sealed class ChunkIndexTests : IDisposable
         Assert.DoesNotContain("\"key\"", json, StringComparison.Ordinal);
         List<ChunkRef> back = System.Text.Json.JsonSerializer.Deserialize(json, ChunkRefJsonContext.Default.ListChunkRef)!;
         Assert.Equal(refs, back);
+
+        // Golden wire format (property names and enum names are the contract).
+        string one = System.Text.Json.JsonSerializer.Serialize(refs[0], ChunkRefJsonContext.Default.ChunkRef);
+        Assert.Equal("{\"filePath\":\"src/A.cs\",\"startLine\":3,\"endLine\":9,\"startOffset\":40,\"endOffset\":180,\"kind\":\"Symbol\","
+            + $"\"tokenCount\":37,\"keyHex\":\"{KeyA([1, 2]).Hex}\"}}", one);
+        var other = new ChunkRef("x.txt", 1, 1, 0, 1, ChunkKind.Other);
+        string otherJson = System.Text.Json.JsonSerializer.Serialize(other, ChunkRefJsonContext.Default.ChunkRef);
+        Assert.Equal("{\"filePath\":\"x.txt\",\"startLine\":1,\"endLine\":1,\"startOffset\":0,\"endOffset\":1,\"kind\":\"Other\"}", otherJson);
+        Assert.Equal(other, System.Text.Json.JsonSerializer.Deserialize(otherJson, ChunkRefJsonContext.Default.ChunkRef));
     }
 
     [Fact]

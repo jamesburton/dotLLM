@@ -41,7 +41,10 @@ public sealed record IndexDiff(IReadOnlyList<ChunkRef> Added, IReadOnlyList<Chun
 
     /// <summary>
     /// The chunks of <see cref="Added"/> whose key <paramref name="store"/> lacks, one per distinct key (first occurrence), in
-    /// <see cref="Added"/> order: exactly what must be encoded and put.
+    /// <see cref="Added"/> order: what <i>this update</i> adds that the store lacks. Chunks in <see cref="Unchanged"/> (every
+    /// chunk of a file whose text did not change) are not checked, so if the store was incomplete before the update
+    /// (interrupted build, eviction by another index, a fresh store with an old index) they are not listed: use
+    /// <see cref="ChunkIndex.Status"/> for everything missing, e.g. on a build's first update.
     /// </summary>
     /// <param name="store">The store.</param>
     /// <returns>The chunks to encode.</returns>
@@ -137,7 +140,15 @@ public sealed record StatusReport(IReadOnlyList<FileStatus> Files, int TotalChun
 /// Readers share the file for read, write and delete; on Windows a rename over an open file is still refused, so Save retries
 /// for up to two seconds (a Load holds the file for milliseconds) and then throws, leaving the old file intact. Two writers
 /// do not merge: the last rename wins and the other's update is lost. A tool that updates an index from several processes
-/// must serialise them (e.g. a lock file next to the index).
+/// must serialise them. Eviction is store-wide: every process that updates, saves or evicts in a store must hold the
+/// store-wide lock (<see cref="AcquireStoreLock"/>) from its update through encode/put and save to eviction, since all of a
+/// store's indexes share its entries.
+/// </para>
+/// <para>
+/// <b>Known behaviour.</b> A case-only rename on Windows keeps the old spelling (the first one seen). An index saved on a
+/// case-sensitive system with <c>A.cs</c> and <c>a.cs</c> loads empty on Windows (duplicate path). After a chunker change
+/// the old <c>index-&lt;old&gt;.json</c> still protects its keys from eviction until it is deleted; delete it when switching
+/// chunker.
 /// </para>
 /// </remarks>
 public sealed class ChunkIndex
@@ -176,6 +187,130 @@ public sealed class ChunkIndex
 
     /// <summary>Number of distinct keys the indexed chunks reference.</summary>
     public int DistinctKeyCount => _refCounts.Count;
+
+    /// <summary>
+    /// Turns a solution scan's files into index input: one tree root and '/'-separated paths relative to it. Use it before
+    /// <see cref="Update"/> on files from <c>SolutionScanner</c>, whose paths can start with <c>../</c> (a solution in a
+    /// subfolder, linked files) or be absolute (another drive).
+    /// </summary>
+    /// <param name="scanFiles">Files whose paths are absolute, or relative to <paramref name="root"/>.</param>
+    /// <param name="root">The scan's root directory (e.g. <c>ScanResult.RootDirectory</c>), or null when every path is absolute.</param>
+    /// <returns>
+    /// <c>Files</c>: the files with index paths, deduplicated by <see cref="PathComparer"/> (first occurrence kept), in input
+    /// order. <c>Root</c>: the deepest common ancestor directory of <paramref name="root"/> (when given) and every kept file,
+    /// absolute; persist it with the index, since index paths are relative to it and a different root re-paths every file.
+    /// <c>Excluded</c>: input paths on another volume than the root's (no relative form), to report or fail on.
+    /// </returns>
+    /// <exception cref="ArgumentException"><paramref name="root"/> is null and a path is relative, or <paramref name="root"/> is relative.</exception>
+    /// <remarks>
+    /// The volume is <paramref name="root"/>'s when given, else the volume holding most files (the first one on a tie).
+    /// Turning an index path back into a disk path is <c>Path.Combine(Root, path)</c>.
+    /// </remarks>
+    public static (IReadOnlyList<SourceFile> Files, string Root, IReadOnlyList<string> Excluded) RelativizeScan(IEnumerable<SourceFile> scanFiles, string? root)
+    {
+        ArgumentNullException.ThrowIfNull(scanFiles);
+        if (root is not null && !Path.IsPathFullyQualified(root))
+            throw new ArgumentException($"The scan root must be absolute: '{root}'.", nameof(root));
+        string? rootFull = root is null ? null : Path.TrimEndingDirectorySeparator(Path.GetFullPath(root));
+
+        var absolute = new List<(SourceFile File, string Full)>();
+        foreach (SourceFile f in scanFiles)
+        {
+            string full;
+            if (Path.IsPathFullyQualified(f.Path)) full = Path.GetFullPath(f.Path);
+            else if (rootFull is not null) full = Path.GetFullPath(Path.Combine(rootFull, f.Path));
+            else throw new ArgumentException($"'{f.Path}' is relative but no scan root was given.", nameof(scanFiles));
+            absolute.Add((f, full));
+        }
+
+        string? volume = rootFull is not null ? Path.GetPathRoot(rootFull)
+            : absolute.GroupBy(a => Path.GetPathRoot(a.Full)!, PathComparer).OrderByDescending(g => g.Count()).Select(g => g.Key).FirstOrDefault();
+        var excluded = new List<string>();
+        var kept = new List<(SourceFile File, string Full)>();
+        foreach ((SourceFile f, string full) in absolute)
+        {
+            if (PathComparer.Equals(Path.GetPathRoot(full), volume)) kept.Add((f, full));
+            else excluded.Add(f.Path);
+        }
+
+        // Deepest common ancestor directory, compared segment by segment with PathComparer.
+        IEnumerable<string> dirs = kept.Select(k => Path.GetDirectoryName(k.Full)!);
+        if (rootFull is not null) dirs = dirs.Prepend(rootFull);
+        string[]? common = null;
+        foreach (string d in dirs)
+        {
+            string[] parts = d.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            if (common is null) { common = parts; continue; }
+            int n = 0;
+            while (n < common.Length && n < parts.Length && PathComparer.Equals(common[n], parts[n])) n++;
+            common = common[..n];
+        }
+        // A one-segment ancestor is the volume itself: "C:" -> "C:\", "" (POSIX) -> "/".
+        string commonRoot = common is null || common.Length == 0 ? volume ?? ""
+            : common.Length == 1 ? common[0] + Path.DirectorySeparatorChar
+            : string.Join(Path.DirectorySeparatorChar, common);
+
+        var files = new List<SourceFile>();
+        var seen = new HashSet<string>(PathComparer);
+        foreach ((SourceFile f, string full) in kept)
+        {
+            string rel = NormalizePath(Path.GetRelativePath(commonRoot, full));
+            if (seen.Add(rel)) files.Add(f with { Path = rel });
+        }
+        return (files, commonRoot, excluded);
+    }
+
+    /// <summary>
+    /// Mark-and-sweep: the keys in <paramref name="store"/> that no index file under <paramref name="storeRoot"/> references
+    /// (<see cref="ReferencedKeysUnder"/>). Unlike <see cref="EvictableOrphans"/>, this also finds orphans left by earlier
+    /// updates that were saved but not evicted. Call it only after every index has been saved, and evict its result while
+    /// holding <see cref="AcquireStoreLock"/>, held across every index's update, encode/put and save, so that no other process
+    /// can reference a key between this check and the delete.
+    /// </summary>
+    /// <param name="store">The store.</param>
+    /// <param name="storeRoot">The store directory (where the index files are).</param>
+    /// <returns>Keys to evict, in ordinal order.</returns>
+    /// <exception cref="InvalidDataException">An index file under the store cannot be read.</exception>
+    public static IReadOnlyList<ChunkKey> StoreWideOrphans(IChunkStore store, string storeRoot)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        IReadOnlySet<ChunkKey> referenced = ReferencedKeysUnder(storeRoot);
+        return store.Keys().Where(k => !referenced.Contains(k)).OrderBy(k => k.Hex, StringComparer.Ordinal).ToList();
+    }
+
+    /// <summary>Name of the store-wide lock file (<see cref="AcquireStoreLock"/>), in the store root.</summary>
+    public const string StoreLockFileName = ".chunkstore.lock";
+
+    /// <summary>
+    /// Takes the store-wide writer lock: an exclusively opened <see cref="StoreLockFileName"/> in the store root, released
+    /// on dispose (or when the process dies). Every process that updates or saves an index of the store, puts entries, or
+    /// evicts must hold it, from <see cref="Update"/> through encode/put and <see cref="Save"/> to eviction; readers
+    /// (status, assembly) need not.
+    /// </summary>
+    /// <param name="storeRoot">The store directory.</param>
+    /// <param name="timeout">How long to wait for another holder.</param>
+    /// <returns>The lock; dispose to release.</returns>
+    /// <exception cref="TimeoutException">Another process (or holder) kept the lock for <paramref name="timeout"/>.</exception>
+    public static IDisposable AcquireStoreLock(string storeRoot, TimeSpan timeout)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(storeRoot);
+        Directory.CreateDirectory(storeRoot);
+        string path = Path.Combine(Path.GetFullPath(storeRoot), StoreLockFileName);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (true)
+        {
+            try
+            {
+                return new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            }
+            catch (IOException ex) when (ex is not FileNotFoundException and not DirectoryNotFoundException)
+            {
+                if (sw.Elapsed >= timeout)
+                    throw new TimeoutException($"The chunk store lock '{path}' is held by another writer (waited {timeout.TotalSeconds:0.#} s).", ex);
+                Thread.Sleep(20);
+            }
+        }
+    }
 
     /// <summary>Number of indexed chunks.</summary>
     public int ChunkCount => _files.Values.Sum(f => f.Chunks.Count);
@@ -242,11 +377,8 @@ public sealed class ChunkIndex
                 throw new ArgumentException($"Duplicate file path '{f.Path}'.", nameof(files));
         }
 
-        var added = new List<ChunkRef>();
-        var removed = new List<ChunkRef>();
-        var unchanged = new List<ChunkRef>();
-        var touchedKeys = new HashSet<string>(StringComparer.Ordinal);
-
+        // Phase 1: decide and chunk every file, checking each chunker output, before anything changes.
+        var plan = new List<(string Path, FileEntry? Old, FileEntry? New)>();
         IEnumerable<string> paths = (removeMissingFiles || !sameChunker ? given.Keys.Concat(_files.Keys) : given.Keys)
             .Distinct(PathComparer).Order(PathComparer).ToList();
         foreach (string path in paths)
@@ -255,8 +387,7 @@ public sealed class ChunkIndex
             if (!given.TryGetValue(path, out SourceFile? file))
             {
                 // Not in the tree (or, after a chunker change, chunked by the other chunker): drop its chunks.
-                Release(old!, removed, touchedKeys);
-                _files.Remove(path);
+                plan.Add((path, old, null));
                 continue;
             }
             // Keep the spelling already indexed (case may differ on Windows).
@@ -265,13 +396,38 @@ public sealed class ChunkIndex
             string hash = HashText(file.Text);
             if (old is not null && sameChunker && old.TextHash == hash)
             {
-                unchanged.AddRange(old.Chunks);
+                plan.Add((path, old, old));
                 continue;
             }
 
             var chunks = new List<ChunkRef>();
             foreach (Chunk c in chunker.Chunk(file))
                 chunks.Add(ChunkRef.From(c, kind, _keyOf(c.TokenIds)));
+            string? problem = CheckTiling(chunks.Select(r => (r.StartOffset, r.EndOffset, r.StartLine, r.EndLine, r.TokenCount ?? 0)), file.Text.Length);
+            if (problem is not null)
+                throw new InvalidOperationException($"Chunker '{chunker.Name}' produced chunks that do not tile '{file.Path}': {problem}. "
+                    + "An index needs chunks that cover the file in order, from offset 0 to its end, without gaps or overlaps.");
+            plan.Add((path, old, new FileEntry(file.Path, hash, chunks)));
+        }
+
+        // Phase 2: apply.
+        var added = new List<ChunkRef>();
+        var removed = new List<ChunkRef>();
+        var unchanged = new List<ChunkRef>();
+        var touchedKeys = new HashSet<string>(StringComparer.Ordinal);
+        foreach ((string path, FileEntry? old, FileEntry? now) in plan)
+        {
+            if (now is null)
+            {
+                Release(old!, removed, touchedKeys);
+                _files.Remove(path);
+                continue;
+            }
+            if (ReferenceEquals(old, now))
+            {
+                unchanged.AddRange(old!.Chunks);
+                continue;
+            }
 
             // Match new chunks to old ones by key, as a multiset (a file may hold the same chunk text twice).
             var oldByKey = new Dictionary<string, Queue<ChunkRef>>(StringComparer.Ordinal);
@@ -280,7 +436,7 @@ public sealed class ChunkIndex
                 if (!oldByKey.TryGetValue(r.KeyHex!, out Queue<ChunkRef>? q)) oldByKey[r.KeyHex!] = q = new Queue<ChunkRef>();
                 q.Enqueue(r);
             }
-            foreach (ChunkRef r in chunks)
+            foreach (ChunkRef r in now.Chunks)
             {
                 if (oldByKey.TryGetValue(r.KeyHex!, out Queue<ChunkRef>? q) && q.Count > 0)
                 {
@@ -294,7 +450,7 @@ public sealed class ChunkIndex
                 AddRef(r.KeyHex!);
             }
             if (old is not null) Release(old, removed, touchedKeys, oldByKey);
-            _files[file.Path] = new FileEntry(file.Path, hash, chunks);
+            _files[now.Path] = now;
         }
 
         ChunkerName = _files.Count > 0 || given.Count > 0 ? chunker.Name : ChunkerName;
@@ -351,7 +507,7 @@ public sealed class ChunkIndex
             }
             catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
             {
-                throw new InvalidDataException($"Index file '{file}' cannot be read ({ex.Message}); eviction cannot be decided.", ex);
+                throw new InvalidDataException($"Index file '{file}' cannot be read ({ex.Message}); eviction cannot be decided. Repair or remove it if it is not an index of this store.", ex);
             }
             if (doc?.Files is null)
                 throw new InvalidDataException($"Index file '{file}' has no file list; eviction cannot be decided.");
@@ -442,7 +598,8 @@ public sealed class ChunkIndex
 
     /// <summary>
     /// Writes the index as JSON: to a unique temp file next to <paramref name="path"/>, flushed, then one rename over it. If two
-    /// processes save the same index, the last rename wins (see the class remarks).
+    /// processes save the same index, the last rename wins (see the class remarks). Temp files of this index older than an hour
+    /// (left by a crashed writer) are removed first.
     /// </summary>
     /// <param name="path">Destination file.</param>
     public void Save(string path)
@@ -465,7 +622,9 @@ public sealed class ChunkIndex
             }).ToList(),
         };
         string full = Path.GetFullPath(path);
-        Directory.CreateDirectory(Path.GetDirectoryName(full)!);
+        string dir = Path.GetDirectoryName(full)!;
+        Directory.CreateDirectory(dir);
+        SweepStaleTemps(dir, Path.GetFileName(full));
         string temp = full + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {
@@ -482,12 +641,33 @@ public sealed class ChunkIndex
         }
     }
 
+    private static void SweepStaleTemps(string dir, string indexFileName)
+    {
+        DateTime cutoff = DateTime.UtcNow - TimeSpan.FromHours(1);
+        foreach (string tmp in Directory.EnumerateFiles(dir, indexFileName + ".*.tmp", SearchOption.TopDirectoryOnly))
+        {
+            try
+            {
+                if (File.GetLastWriteTimeUtc(tmp) < cutoff) File.Delete(tmp);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Best effort: a temp file still held by its writer is left for a later save.
+            }
+        }
+    }
+
     /// <summary>
-    /// Loads an index saved by <see cref="Save"/>. A missing file gives an empty index. A file that is not valid JSON, has another
-    /// format version, another producer (<paramref name="keyOf"/> differs from the one it was saved with), or any malformed
-    /// entry (null entry, bad path or hash, duplicate path, bad key, chunks that do not tile the file in order, bad lines or
-    /// token counts, no chunker) gives an empty index with a <see cref="LoadNote"/>, so everything is re-keyed rather than
-    /// trusted. I/O errors (access denied, device errors) propagate.
+    /// Loads an index saved by <see cref="Save"/>. A missing file gives an empty index.
+    /// <list type="bullet">
+    /// <item>Not valid JSON, another format version, another producer (<paramref name="keyOf"/> differs from the one it was
+    /// saved with), or a structurally malformed entry (null entry, bad path or hash, duplicate path, null chunk, bad key, no
+    /// chunker): an empty index with a <see cref="LoadNote"/>, so everything is re-keyed rather than trusted.</item>
+    /// <item>A file entry whose chunks do not tile the file (offset 0 first, contiguous, non-negative lengths, ordered 1-based
+    /// lines, non-negative token counts): only that file is dropped (it is re-chunked on the next <see cref="Update"/>) and
+    /// the <see cref="LoadNote"/> names it.</item>
+    /// </list>
+    /// I/O errors (access denied, device errors) propagate.
     /// </summary>
     /// <param name="path">Index file.</param>
     /// <param name="keyOf">Key of a chunk from its token ids.</param>
@@ -519,12 +699,20 @@ public sealed class ChunkIndex
         if (doc.Files.Count > 0 && string.IsNullOrEmpty(doc.Chunker)) return Empty(keyOf, "index has files but no chunker name");
         ChunkKind kind = doc.Chunker is null ? ChunkKind.Other : ChunkRef.KindOfName(doc.Chunker);
 
+        var seen = new HashSet<string>(PathComparer);
+        var dropped = new List<string>();
         foreach (FileDocument? f in doc.Files)
         {
             string? problem = Validate(f, out string norm);
-            if (problem is null && index._files.ContainsKey(norm)) problem = $"duplicate path '{f!.Path}'";
+            if (problem is null && !seen.Add(norm)) problem = $"duplicate path '{f!.Path}'";
             if (problem is not null) return Empty(keyOf, $"malformed index entry: {problem}");
-            var chunks = f!.Chunks!.Select(c => new ChunkRef(norm, c!.StartLine, c.EndLine, c.StartOffset, c.EndOffset, kind)
+            string? tiling = CheckTiling(f!.Chunks!.Select(c => (c!.StartOffset, c.EndOffset, c.StartLine, c.EndLine, c.Tokens)), textLength: null);
+            if (tiling is not null)
+            {
+                dropped.Add($"'{norm}' ({tiling})");
+                continue;
+            }
+            var chunks = f.Chunks!.Select(c => new ChunkRef(norm, c!.StartLine, c.EndLine, c.StartOffset, c.EndOffset, kind)
             {
                 TokenCount = c.Tokens,
                 KeyHex = c.Key,
@@ -533,14 +721,21 @@ public sealed class ChunkIndex
             foreach (ChunkRef r in chunks) index.AddRef(r.KeyHex!);
         }
         index.ChunkerName = doc.Chunker;
+        if (dropped.Count > 0)
+            index.LoadNote = $"dropped {dropped.Count} file entr{(dropped.Count == 1 ? "y" : "ies")} whose chunks do not tile the file "
+                + $"(re-chunked on the next update): {string.Join("; ", dropped)}";
         return index;
     }
 
     /// <summary>How long <see cref="Save"/> keeps retrying the final rename while a reader holds the destination.</summary>
     internal static TimeSpan SaveRetryBudget { get; set; } = TimeSpan.FromSeconds(2);
 
+    private const int ErrorAccessDenied = unchecked((int)0x80070005);
+    private const int ErrorSharingViolation = unchecked((int)0x80070020);
+    private const int ErrorLockViolation = unchecked((int)0x80070021);
+
     // Windows refuses to rename over a file that is open, even when the reader shares delete; readers hold the index only for
-    // the length of one Load, so retry briefly, then fail loudly (the temp file is removed by the caller).
+    // the length of one Load, so retry briefly on sharing/access errors only, then fail (the caller removes the temp file).
     private static void MoveWithRetry(string temp, string full)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -551,10 +746,12 @@ public sealed class ChunkIndex
                 File.Move(temp, full, overwrite: true);
                 return;
             }
-            catch (Exception ex) when (ex is UnauthorizedAccessException or IOException && File.Exists(temp))
+            catch (Exception ex) when (ex is UnauthorizedAccessException
+                || (ex is IOException && ex.HResult is ErrorAccessDenied or ErrorSharingViolation or ErrorLockViolation))
             {
                 if (sw.Elapsed >= SaveRetryBudget)
-                    throw new IOException($"Index file '{full}' is held open by a reader; it was not replaced.", ex);
+                    throw new IOException($"Index file '{full}' could not be replaced within {SaveRetryBudget.TotalSeconds:0.#} s "
+                        + $"(sharing violation or access denied; e.g. a reader holds it open, or the file is read-only): {ex.Message}", ex);
                 Thread.Sleep(20);
             }
         }
@@ -562,8 +759,8 @@ public sealed class ChunkIndex
 
     private static ChunkIndex Empty(ChunkKeyFunction keyOf, string why) => new(keyOf) { LoadNote = why + "; starting empty" };
 
-    /// <summary>Null when <paramref name="f"/> is well formed: a valid relative path, a SHA-256, and chunks that tile the text
-    /// from offset 0 without gaps or overlaps, with 1-based ordered lines and non-negative token counts.</summary>
+    /// <summary>Null when <paramref name="f"/> is structurally well formed: a valid relative path, a SHA-256, a chunk list
+    /// without null entries, and well-formed keys. Tiling is checked separately (<see cref="CheckTiling"/>).</summary>
     private static string? Validate(FileDocument? f, out string norm)
     {
         norm = "";
@@ -573,17 +770,36 @@ public sealed class ChunkIndex
         catch (ArgumentException) { return $"bad path '{f.Path}'"; }
         if (!ChunkKey.IsWellFormed(f.Sha256)) return $"bad text hash for '{f.Path}'";
         if (f.Chunks is null) return $"no chunk list for '{f.Path}'";
-        int offset = 0, line = 1;
         foreach (ChunkDocument? c in f.Chunks)
         {
             if (c is null) return $"null chunk in '{f.Path}'";
             if (!ChunkKey.IsWellFormed(c.Key)) return $"bad key in '{f.Path}'";
-            if (c.StartOffset != offset || c.EndOffset <= c.StartOffset) return $"chunk offsets {c.StartOffset}-{c.EndOffset} in '{f.Path}' do not tile the file";
-            if (c.StartLine < line || c.EndLine < c.StartLine) return $"chunk lines {c.StartLine}-{c.EndLine} in '{f.Path}' are out of order";
-            if (c.Tokens < 0) return $"negative token count in '{f.Path}'";
-            offset = c.EndOffset;
-            line = c.EndLine;
         }
+        return null;
+    }
+
+    /// <summary>
+    /// The chunk contract an index relies on, checked on chunker output in <see cref="Update"/> and on every file entry in
+    /// <see cref="Load"/>: the first chunk starts at offset 0, each next one starts where the previous ended, no chunk ends
+    /// before it starts (zero-length chunks are allowed: decode-based offsets of a byte-level BPE can produce one at a
+    /// multi-byte boundary), lines are 1-based, ordered and never go back, token counts are non-negative, and (when
+    /// <paramref name="textLength"/> is known) the last chunk ends at the end of the text.
+    /// </summary>
+    /// <returns>Null when the chunks tile the file, else the first problem.</returns>
+    private static string? CheckTiling(IEnumerable<(int StartOffset, int EndOffset, int StartLine, int EndLine, int Tokens)> chunks, int? textLength)
+    {
+        int offset = 0, line = 1, i = 0;
+        foreach ((int so, int eo, int sl, int el, int tokens) in chunks)
+        {
+            if (so != offset) return $"chunk {i} starts at offset {so}, expected {offset}";
+            if (eo < so) return $"chunk {i} ends at offset {eo} before it starts ({so})";
+            if (sl < line || el < sl) return $"chunk {i} lines {sl}-{el} go back or are inverted (previous ended on line {line})";
+            if (tokens < 0) return $"chunk {i} has a negative token count";
+            offset = eo;
+            line = el;
+            i++;
+        }
+        if (textLength is int n && offset != n) return $"chunks end at offset {offset}, the text has {n} characters";
         return null;
     }
 
