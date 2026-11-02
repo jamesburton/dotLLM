@@ -286,9 +286,10 @@ public sealed class VulkanRecomputeTestsGpu : IDisposable
         {
             AppendSuffix(rig, naive);
             (float[] sk, float[] sv) = rig.Read(naive, rig.Layers - 1, VulkanRecomputeTests.Suffix.Length, L);
-            long before = rig.Model.AttentionQueryPositionsCount;
+            long before = rig.Model.AttentionQueryPositionsCount, tiledBefore = rig.Model.AttentionQueryPositionsTiledCount;
             SelectiveRecomputeResult r = SelectiveRecomputer.Recompute(rig.Model, rig.Backend, naive, rig.Entries, all);
             Assert.Equal(rig.Layers, rig.Model.AttentionQueryPositionsCount - before);
+            bool tiledRan = rig.Model.AttentionQueryPositionsTiledCount - tiledBefore == rig.Layers;
             Assert.Equal(1, r.ForwardCalls);
             Assert.Equal(rig.Layers, r.QueryPositionAttentionLayers);
             Assert.Equal(L + VulkanRecomputeTests.Suffix.Length, naive.CurrentLength);
@@ -320,8 +321,11 @@ public sealed class VulkanRecomputeTestsGpu : IDisposable
             float logitsCpu = BackendSeamTests.MaxAbsDiff(cpuLast, r.LastPositionLogits!);
             _output.WriteLine($"all positions via ATTN_QPOS: K/V max |d| vs Vulkan full {vsVulkan:E3}, vs CPU full {vsCpu:E3}; "
                 + $"last logits {logitsVk:E3} / {logitsCpu:E3}");
-            Assert.True(vsCpu <= SameBackendTol, $"K/V vs CPU full prefill {vsCpu}");
-            Assert.True(logitsCpu <= SameBackendTol * 10, $"logits vs CPU full prefill {logitsCpu}");
+            // The reference kernel is plain F32 (CPU-exact to ~5e-6); the tiled kernel (#1540) is flash-style, so against the CPU it gets the
+            // cross-kernel bound like any other Vulkan attention.
+            float cpuTol = tiledRan ? CrossBackendDeepTol : SameBackendTol;
+            Assert.True(vsCpu <= cpuTol, $"K/V vs CPU full prefill {vsCpu} (tiled {tiledRan})");
+            Assert.True(logitsCpu <= (tiledRan ? CrossBackendDeepTol : SameBackendTol * 10), $"logits vs CPU full prefill {logitsCpu} (tiled {tiledRan})");
             Assert.True(vsVulkan <= CrossBackendDeepTol, $"K/V vs Vulkan full prefill {vsVulkan}");
             Assert.True(logitsVk <= CrossBackendDeepTol, $"logits vs Vulkan full prefill {logitsVk}");
             (float[] sk2, float[] sv2) = rig.Read(naive, rig.Layers - 1, VulkanRecomputeTests.Suffix.Length, L);
@@ -464,7 +468,13 @@ public sealed class VulkanRecomputeTestsGpu : IDisposable
         using IKvCache full = rig.Prefill(Context, out float[] fullLast);
         int[] edges = [0, L - 1];
         using IKvCache single = rig.Naive(), perRun = rig.Naive();
+        long tiledBefore = rig.Model.AttentionQueryPositionsTiledCount;
         SelectiveRecomputeResult s = SelectiveRecomputer.Recompute(rig.Model, rig.Backend, single, rig.Entries, edges);
+        // Row 0 attends only to itself: equal to the full prefill's row 0 to F32 rounding with the reference kernel; the tiled kernel's
+        // different attention arithmetic propagates through the deeper layers (cross-kernel bound).
+        // Per-run recomputes L-1 as a tail run (ordinary kernel) while the single pass sends it through the per-query-position kernel, so with
+        // the tiled kernel the two paths also differ across kernels.
+        float row0Tol = rig.Model.AttentionQueryPositionsTiledCount - tiledBefore > 0 ? CrossBackendDeepTol : SameBackendTol;
         SelectiveRecomputeResult p = SelectiveRecomputer.Recompute(rig.Model, rig.Backend, perRun, rig.Entries, edges, RecomputeMode.PerRun);
         Assert.Equal(1, s.ForwardCalls);
         Assert.Equal(2, p.ForwardCalls);
@@ -473,7 +483,7 @@ public sealed class VulkanRecomputeTestsGpu : IDisposable
         Assert.NotNull(s.LastPositionLogits);
         Assert.NotNull(p.LastPositionLogits);
         float dl = BackendSeamTests.MaxAbsDiff(p.LastPositionLogits!, s.LastPositionLogits!);
-        Assert.True(dl <= SameBackendTol * 10, $"last logits single vs per-run {dl}");
+        Assert.True(dl <= (row0Tol == SameBackendTol ? SameBackendTol * 10 : CrossBackendDeepTol), $"last logits single vs per-run {dl}");
         // Not the full prefill's logits: the middle of the cache is stale.
         Assert.True(BackendSeamTests.MaxAbsDiff(fullLast, s.LastPositionLogits!) > 1e-3f, "fixture: stale middle should change the last logits");
 
@@ -482,9 +492,9 @@ public sealed class VulkanRecomputeTestsGpu : IDisposable
             (float[] fk, float[] fv) = rig.Read(full, l, 1);
             (float[] sk, float[] sv) = rig.Read(single, l, 1);
             // Position 0 attends only to itself: its recompute equals the full prefill's row 0 at every layer.
-            Assert.True(BackendSeamTests.MaxAbsDiff(fk, sk) <= SameBackendTol && BackendSeamTests.MaxAbsDiff(fv, sv) <= SameBackendTol, $"row 0, layer {l}");
-            Assert.True(BackendSeamTests.MaxAbsDiff(rig.Read(perRun, l).K, rig.Read(single, l).K) <= SameBackendTol, $"K layer {l}");
-            Assert.True(BackendSeamTests.MaxAbsDiff(rig.Read(perRun, l).V, rig.Read(single, l).V) <= SameBackendTol, $"V layer {l}");
+            Assert.True(BackendSeamTests.MaxAbsDiff(fk, sk) <= row0Tol && BackendSeamTests.MaxAbsDiff(fv, sv) <= row0Tol, $"row 0, layer {l}");
+            Assert.True(BackendSeamTests.MaxAbsDiff(rig.Read(perRun, l).K, rig.Read(single, l).K) <= row0Tol, $"K layer {l}");
+            Assert.True(BackendSeamTests.MaxAbsDiff(rig.Read(perRun, l).V, rig.Read(single, l).V) <= row0Tol, $"V layer {l}");
         }
 
         // The last position alone is a run ending at the cache length: the ordinary kernel, and the same forward as per-run.
@@ -523,33 +533,66 @@ public sealed class VulkanRecomputeTestsGpu : IDisposable
     }
 
     [SkippableFact]
-    public void Recompute_ModelWithoutQueryPositionKernel_IsDetected()
+    public void Recompute_ModelWithoutQueryPositionKernel_IsRefusedBeforeWriting()
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
-        // A SPIR-V directory without attention_f32_qpos.spv: the model then routes a non-contiguous forward through the ordinary
-        // kernel, which masks by positions[0] + row. The recomputer must notice (the per-query-position counter did not move) and throw.
+        // A SPIR-V directory without the per-query-position shaders (reference and tiled): the model then routes a non-contiguous forward
+        // through the ordinary kernel, which masks by positions[0] + row. The recomputer must refuse before writing anything
+        // (SupportsQueryPositionAttention), for the single pass and for per-run, even for a tight tail run.
         string noQpos = Path.Combine(_scratch, "spv-noqpos");
         Directory.CreateDirectory(noQpos);
         foreach (string f in Directory.EnumerateFiles(spvDir))
-            if (!Path.GetFileName(f).StartsWith("attention_f32_qpos", StringComparison.Ordinal))
+            if (!Path.GetFileName(f).Contains("_qpos", StringComparison.Ordinal))
                 File.Copy(f, Path.Combine(noQpos, Path.GetFileName(f)));
         using var tiny = BackendSeamTests.TinyModel.Load(_scratch, "qwen3");
         using var device = VulkanDevice.Create();
         using var model = VulkanTransformerModel.LoadFromGguf(device, tiny.Gguf, tiny.Config, noQpos);
+        Assert.False(model.SupportsQueryPositionAttention);
         using var backend = new VulkanChunkBackend(device, spvDir, tiny.Config, ChunkModelFeatures.FromGguf(tiny.Gguf));
         List<ChunkKvEntry> entries = VulkanRecomputeTests.Encode(model, backend);
         using IKvCache cache = VulkanRecomputeTests.Assembled(tiny.Config, backend, entries);
-        var ex = Assert.Throws<InvalidOperationException>(() =>
-            SelectiveRecomputer.Recompute(model, backend, cache, entries, VulkanRecomputeTests.Scattered));
-        Assert.Contains("per-query-position", ex.Message, StringComparison.Ordinal);
-        // A contiguous run inside the filled cache needs the kernel too (per-run as well as single pass).
-        using IKvCache cache2 = VulkanRecomputeTests.Assembled(tiny.Config, backend, entries);
-        Assert.Throws<InvalidOperationException>(() =>
-            SelectiveRecomputer.Recompute(model, backend, cache2, entries, [7, 8], RecomputeMode.PerRun));
-        // A run ending at the cache length is an ordinary prefill-shaped forward: fine without the kernel.
-        using IKvCache cache3 = VulkanRecomputeTests.Assembled(tiny.Config, backend, entries);
-        SelectiveRecomputeResult tail = SelectiveRecomputer.Recompute(model, backend, cache3, entries, [L - 2, L - 1]);
-        Assert.Equal(0, tail.QueryPositionAttentionLayers);
+        float[] before = VulkanRecomputeTests.Read(backend, cache, tiny.Config.NumLayers - 1, L, tiny.KvStride).K;
+        foreach ((int[] sel, RecomputeMode mode) in new[] { (VulkanRecomputeTests.Scattered, RecomputeMode.SinglePass), ([7, 8], RecomputeMode.PerRun),
+                     ([L - 2, L - 1], RecomputeMode.Auto) })
+        {
+            var ex = Assert.Throws<NotSupportedException>(() => SelectiveRecomputer.Recompute(model, backend, cache, entries, sel, mode));
+            Assert.Contains("per-query-position", ex.Message, StringComparison.Ordinal);
+        }
+        Assert.Equal(before, VulkanRecomputeTests.Read(backend, cache, tiny.Config.NumLayers - 1, L, tiny.KvStride).K);
+        Assert.Equal(L, cache.CurrentLength);
+    }
+
+    [SkippableFact]
+    public void Recompute_TiledAndReferenceKernels_AgreeWithinFloor()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var rig = new Rig(_scratch, spvDir);
+        Skip.IfNot(rig.Model.SupportsTiledQueryPositionAttention, "tiled per-query-position kernel not loaded (DOTLLM_VULKAN_ATTN_QPOS=ref or shader absent)");
+        int[] subset = VulkanRecomputeTests.Scattered;
+        using IKvCache tiled = rig.Naive(), reference = rig.Naive();
+        long t0 = rig.Model.AttentionQueryPositionsTiledCount;
+        SelectiveRecomputer.Recompute(rig.Model, rig.Backend, tiled, rig.Entries, subset);
+        Assert.Equal(rig.Layers, rig.Model.AttentionQueryPositionsTiledCount - t0);
+        rig.Model.TiledQueryPositionAttentionEnabled = false;
+        try
+        {
+            long t1 = rig.Model.AttentionQueryPositionsTiledCount, q1 = rig.Model.AttentionQueryPositionsCount;
+            SelectiveRecomputer.Recompute(rig.Model, rig.Backend, reference, rig.Entries, subset);
+            Assert.Equal(0, rig.Model.AttentionQueryPositionsTiledCount - t1);
+            Assert.Equal(rig.Layers, rig.Model.AttentionQueryPositionsCount - q1);
+        }
+        finally
+        {
+            rig.Model.TiledQueryPositionAttentionEnabled = true;
+        }
+        float worst = 0;
+        for (int l = 0; l < rig.Layers; l++)
+        {
+            worst = MathF.Max(worst, BackendSeamTests.MaxAbsDiff(rig.Read(reference, l).K, rig.Read(tiled, l).K));
+            worst = MathF.Max(worst, BackendSeamTests.MaxAbsDiff(rig.Read(reference, l).V, rig.Read(tiled, l).V));
+        }
+        _output.WriteLine($"tiled vs reference per-query-position kernel on {string.Join(',', subset)}: max |d| {worst:E3}");
+        Assert.True(worst <= CrossBackendDeepTol, $"tiled vs reference {worst}");
     }
 
     private static void AppendSuffix(Rig rig, IKvCache cache)

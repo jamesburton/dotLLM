@@ -133,7 +133,8 @@ public static class SelectiveRecomputer
     /// <exception cref="ArgumentException">Invalid selection, empty context or a cache shorter than <c>L</c>. Nothing is written.</exception>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxRowsPerForward"/> is not positive. Nothing is written.</exception>
     /// <exception cref="NotSupportedException">The cache is not one <paramref name="backend"/> accepts, the model does not match the backend,
-    /// or <see cref="RecomputeMode.SinglePass"/> was asked of the CPU backend. Nothing is written.</exception>
+    /// the Vulkan model has no per-query-position attention (<see cref="VulkanTransformerModel.SupportsQueryPositionAttention"/>), or
+    /// <see cref="RecomputeMode.SinglePass"/> was asked of the CPU backend. Nothing is written.</exception>
     /// <exception cref="InvalidOperationException">The cache length moved during a forward, or a Vulkan forward that needed the
     /// per-query-position attention did not run it. The cache is then undefined.</exception>
     public static SelectiveRecomputeResult Recompute(IModel model, IChunkBackend backend, IKvCache cache, ReadOnlySpan<int> contextTokens,
@@ -153,6 +154,10 @@ public static class SelectiveRecomputer
                 $"Recompute on the Vulkan backend needs a {nameof(VulkanTransformerModel)} (its per-query-position attention); got {model.GetType().Name}.");
         if (!onVulkan && vulkan is not null)
             throw new NotSupportedException($"The {backend.Tag} backend cannot drive a {nameof(VulkanTransformerModel)}; use the Vulkan chunk backend.");
+        if (onVulkan && !vulkan!.SupportsQueryPositionAttention)
+            throw new NotSupportedException(
+                "The Vulkan model has no per-query-position attention (attention_f32_qpos.spv was not loaded), so a recompute forward inside "
+                + "the cache would be masked as consecutive positions. Load the model from a SPIR-V directory that has it.");
         if (mode == RecomputeMode.Auto)
             mode = onVulkan ? RecomputeMode.SinglePass : RecomputeMode.PerRun;
         if (mode == RecomputeMode.SinglePass && !onVulkan)
