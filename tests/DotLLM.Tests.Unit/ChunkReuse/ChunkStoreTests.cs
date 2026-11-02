@@ -488,6 +488,25 @@ public sealed class ChunkStoreTests : IDisposable
     }
 
     [Fact]
+    public void Store_PutOverEntryWithOtherBackendTag_ReplacesIt()
+    {
+        // Put keeps a valid entry only when its header tag equals the new entry's; an entry with another tag under the key (a
+        // writer bug or tampering) is replaced even by a writer that does not evict first. Same tag: kept as before.
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, Backend, Dtype, Tokens);
+        var store = new FileChunkStore(_root);
+        store.Put(key, NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5) with { Backend = "vulkan" });
+        ChunkKvEntry cpu = NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 6);
+        store.Put(key, cpu);
+        Assert.True(new FileChunkStore(_root).TryGet(key, out ChunkKvEntry got));
+        AssertBitExact(cpu, got);
+        Assert.Equal("cpu", got.Backend);
+
+        store.Put(key, NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 7));
+        Assert.True(store.TryGet(key, out ChunkKvEntry kept));
+        AssertBitExact(cpu, kept);
+    }
+
+    [Fact]
     public void Store_HeaderBackendTagLongerThanMax_IsMiss()
     {
         // A tag of MaxBackendTagBytes (64) is stored and read; a file whose tag is one byte longer (otherwise consistent: the tag

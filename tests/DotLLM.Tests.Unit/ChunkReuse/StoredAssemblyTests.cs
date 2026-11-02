@@ -739,6 +739,43 @@ public sealed class StoredAssemblyTests : IDisposable
         Assert.True(shared.Contains(KeyOf(tiny, TokA)));
     }
 
+    [Fact]
+    public void StoredAssembly_OtherBackend_FindsCpuTaggedEntryUnderItsOwnKey_IsRejectedAndReencoded()
+    {
+        // The L4 direction "a CPU-encoded entry is a miss on a Vulkan server, by header": a non-CPU assembler finds an entry tagged
+        // cpu under its OWN key (same fingerprint, tokens and shape). It must reject, evict and re-encode with its tag; the other
+        // tests reach the header check only from the CPU side.
+        using var tiny = TinyModel.Load(_scratch, seed: 1);
+        var other = new RetaggedBackend(new CpuChunkBackend(tiny.Config), ChunkBackendTags.Vulkan);
+        var vk = StoredContextAssembler.ForModel(tiny.Config, TinyModel.ModelIdOf(1), "F32", Tokenizer, other);
+        ChunkKvEntry vkFresh = new ChunkEncoder(vk.ModelFingerprint).Encode(tiny.Model, other, TokA);
+        Assert.Equal("vulkan", vkFresh.Backend);
+        ChunkKey key = vk.KeyOf(tiny.Config, TokA);
+        var store = new DictionaryStore();
+        store.Put(key, vkFresh with { Backend = ChunkBackendTags.Cpu });
+
+        StoredAssembly r = vk.Assemble([Ch("a.cs", TokA)], tiny.Model, store);
+        Assert.Equal(new AssemblyStats(0, 1, TokA.Length, 0), r.Stats);
+        Assert.Equal(1, r.Rejected);
+        Assert.Equal([key], store.Evicted);
+        Assert.Equal("vulkan", r.Entries[0].Backend);
+        AssertBitExact(vkFresh, r.Entries[0]);
+        Assert.True(store.TryGet(key, out ChunkKvEntry replaced));
+        Assert.Equal("vulkan", replaced.Backend);
+        Assert.Equal(new AssemblyStats(1, 0, 0, 0), vk.Assemble([Ch("a.cs", TokA)], tiny.Model, store).Stats);
+    }
+
+    [Fact]
+    public void StoreAssemblyCheck_RefusesNonCpuBackend_BeforeLoading()
+    {
+        // ChunkKvLab store-assembly compares against CPU-only paths (fresh ChunkEncoder encodes, SimpleKvCache); on vulkan it must
+        // refuse with a clear message, not fail later with "lab and assembler fingerprints differ".
+        var ex = Assert.Throws<NotSupportedException>(() => ChunkKvLab.StoreAssemblyGuard.RequireCpu(ChunkBackendTags.Vulkan));
+        Assert.Contains("CPU backend only", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("vulkan", ex.Message, StringComparison.Ordinal);
+        ChunkKvLab.StoreAssemblyGuard.RequireCpu(ChunkBackendTags.Cpu);
+    }
+
     /// <summary>A backend that behaves as <paramref name="inner"/> but carries another tag (a CPU stand-in for a second backend).</summary>
     internal sealed class RetaggedBackend(IChunkBackend inner, string tag) : IChunkBackend
     {
@@ -929,7 +966,10 @@ public sealed class StoredAssemblyTests : IDisposable
 
 /// <summary>
 /// GPU half of the backend tag tests (Phase I Task 1, L4): store-backed assembly on the Vulkan backend with the synthetic F32 model.
-/// CPU and Vulkan entries never mix: a store filled through one backend gives no hit to the other, by key and by the header tag.
+/// CPU and Vulkan entries never mix: a store filled through one backend gives no hit to the other. This shows key separation on the
+/// real device (0 rejects: the header check is not reached) plus a positive control into a device cache; the header check in both
+/// directions is covered on the CPU (StoredAssembly_EntryBackendDiffers_IsRejectedAndReencoded and
+/// StoredAssembly_OtherBackend_FindsCpuTaggedEntryUnderItsOwnKey_IsRejectedAndReencoded).
 /// Kept small (three short chunks, one tiny model, no recompute) because the box has had device-lost resets on long submits.
 /// </summary>
 [Trait("Category", "GPU")]

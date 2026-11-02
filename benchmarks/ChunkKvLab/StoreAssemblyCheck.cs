@@ -20,6 +20,7 @@ internal static class StoreAssemblyCheck
 {
     public static int Run(E4Options o, string storeDir)
     {
+        StoreAssemblyGuard.RequireCpu(LabModel.SelectedBackend); // before the model loads
         var ci = CultureInfo.InvariantCulture;
         CultureInfo.CurrentCulture = ci;
         var total = Stopwatch.StartNew();
@@ -119,5 +120,19 @@ internal static class StoreAssemblyCheck
             if (!MemoryMarshal.AsBytes(a.ValuesSpan(l)[..n]).SequenceEqual(MemoryMarshal.AsBytes(b.ValuesSpan(l)[..n]))) return false;
         }
         return true;
+    }
+}
+
+/// <summary>The backend precondition of <see cref="StoreAssemblyCheck"/>, checked before the model loads.</summary>
+public static class StoreAssemblyGuard
+{
+    /// <summary>Throws unless <paramref name="backend"/> is the CPU backend: store-assembly compares store-backed assembly with fresh
+    /// CPU encodes on <c>SimpleKvCache</c>.</summary>
+    /// <param name="backend">The selected backend tag.</param>
+    public static void RequireCpu(string backend)
+    {
+        if (!string.Equals(backend, DotLLM.ChunkReuse.Backends.ChunkBackendTags.Cpu, StringComparison.Ordinal))
+            throw new NotSupportedException(
+                $"store-assembly runs on the CPU backend only (fresh CPU encodes and SimpleKvCache); got --backend {backend}.");
     }
 }

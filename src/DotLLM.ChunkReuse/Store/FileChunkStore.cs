@@ -183,6 +183,21 @@ public sealed class FileChunkStore : IChunkStore
         catch (UnauthorizedAccessException) { return false; }
     }
 
+    // True when a valid entry under key carries backend tag (header read only).
+    private bool HoldsValidEntry(ChunkKey key, string backend)
+    {
+        try
+        {
+            using var fs = new FileStream(PathOf(key), FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
+            long length = fs.Length;
+            byte[] head = new byte[(int)Math.Min(length, MaxHeaderBytes)];
+            fs.ReadExactly(head);
+            return TryParseHeader(head, length, key, out Header h) && string.Equals(h.Backend, backend, StringComparison.Ordinal);
+        }
+        catch (IOException) { return false; }
+        catch (UnauthorizedAccessException) { return false; }
+    }
+
     /// <inheritdoc/>
     public bool TryGet(ChunkKey key, out ChunkKvEntry entry)
     {
@@ -231,7 +246,9 @@ public sealed class FileChunkStore : IChunkStore
         ArgumentNullException.ThrowIfNull(entry);
         Validate(entry);
         string path = PathOf(key);
-        if (Contains(key)) return; // content-addressed: same key, same content
+        // Content-addressed: a valid entry under the key with the same backend tag has the same content and is kept. One with another
+        // tag (a writer bug or tampering; the key already includes the backend) is replaced, so it cannot stick.
+        if (HoldsValidEntry(key, entry.Backend)) return;
 
         string dir = Path.GetDirectoryName(path)!;
         Directory.CreateDirectory(dir);
@@ -249,7 +266,7 @@ public sealed class FileChunkStore : IChunkStore
                 // On Windows the destination cannot be replaced while a reader has it mapped. If it is a valid entry (another
                 // writer stored the same key meanwhile) it is as good as ours; otherwise fail at once instead of waiting for
                 // the reader.
-                if (Contains(key)) return;
+                if (HoldsValidEntry(key, entry.Backend)) return;
                 throw new ChunkStoreBusyException(path, e);
             }
         }
