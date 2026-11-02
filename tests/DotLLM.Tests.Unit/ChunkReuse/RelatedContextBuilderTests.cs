@@ -11,9 +11,10 @@ namespace DotLLM.Tests.Unit.ChunkReuse;
 /// excluded, the masked call's own edges excluded), the rest random distractors, with the task generator's leak filters.
 /// Fixture (one char per token, every member its own chunk):
 /// <list type="bullet">
-/// <item><c>App/Use.cs</c> — the calling file: <c>H.H0(1)</c> in the prefix, then the masked call <c>Go(a)</c> to <c>Lib.M.Go</c>
+/// <item><c>App/Use.cs</c> — the calling file: <c>H.H0(1) + Extra()</c> (a call into its own file) in the prefix, then the masked call <c>Go(a)</c> to <c>Lib.M.Go</c>
 /// through <c>using static Lib.M</c> (so the masked call is the only non-import reference to <c>M.cs</c>).</item>
-/// <item><c>Lib/H.cs</c> — hop 1 (its methods call <c>D</c>); also declares a different member named <c>Go</c>.</item>
+/// <item><c>Lib/H.cs</c> — hop 1 (its methods call <c>D</c>; it imports namespace <c>Other</c>, declared only in the unrelated
+/// <c>Other/O.cs</c>); also declares a different member named <c>Go</c>.</item>
 /// <item><c>Lib/D.cs</c> — hop 2 (calls <c>E</c> and, in <c>Leak</c>, the masked text <c>M.Go(a)</c>).</item>
 /// <item><c>Lib/E.cs</c> — hop 3; <c>Lib/M.cs</c> — the callee's file (hop 3 via <c>D.Leak</c>); <c>Lib/U.cs</c>, <c>Lib/W.cs</c> — unrelated.</item>
 /// <item><c>App/Use2.cs</c> — a second call site of <c>M.Go</c> whose prefix references <c>W</c>.</item>
@@ -29,15 +30,16 @@ public sealed class RelatedContextBuilderTests
     [
         ("App/Use.cs",
             "using Lib;\nusing static Lib.M;\n\nnamespace App;\n\npublic class Use\n{\n    public int Extra() => 4;\n\n" +
-            "    public int Run()\n    {\n        var a = H.H0(1);\n        return Go(a);\n    }\n}\n"),
+            "    public int Run()\n    {\n        var a = H.H0(1) + Extra();\n        return Go(a);\n    }\n}\n"),
         ("App/Use2.cs",
             "using Lib;\nusing static Lib.M;\n\nnamespace App;\n\npublic class Use2\n{\n" +
             "    public int Run2()\n    {\n        var z = W.W0(2);\n        return Go(z);\n    }\n}\n"),
         ("Lib/D.cs", "namespace Lib;\n\npublic static class D\n{\n" + Members(i => $"public static int D{i}(int x) => E.E{i}(x);") +
             "    public static int Leak(int a) => M.Go(a);\n}\n"),
         ("Lib/E.cs", "namespace Lib;\n\npublic static class E\n{\n" + Members(i => $"public static int E{i}(int x) => x + {i};") + "}\n"),
-        ("Lib/H.cs", "namespace Lib;\n\npublic static class H\n{\n" + Members(i => $"public static int H{i}(int x) => D.D{i}(x);") +
-            "    public static int Go() => 9;\n}\n"),
+        ("Lib/H.cs", "using Other;\n\nnamespace Lib;\n\npublic static class H\n{\n" + Members(i => $"public static int H{i}(int x) => D.D{i}(x);") +
+            "    public static int Go() => H0(9);\n}\n"),
+        ("Other/O.cs", "namespace Other;\n\npublic static class O\n{\n    public static int O1() => 1;\n}\n"),
         ("Lib/M.cs", "namespace Lib;\n\npublic static class M\n{\n    public static int Go(int x) => x + 1;\n\n    public static int Other() => 5;\n}\n"),
         ("Lib/U.cs", "namespace Lib;\n\npublic static class U\n{\n" + Members(i => $"public static int U{i}() => {i};") + "}\n"),
         ("Lib/W.cs", "namespace Lib;\n\npublic static class W\n{\n" + Members(i => $"public static int W{i}(int x) => x - {i};") + "}\n"),
@@ -70,6 +72,10 @@ public sealed class RelatedContextBuilderTests
     private static Chunk[] NonRequired(CodeContextPlan plan) => plan.Chunks.Where(c => c.Id != F.Required.Id).ToArray();
 
     private static bool IsRelated(Chunk c) => c.FilePath is "Lib/H.cs" or "Lib/D.cs";
+
+    /// <summary>Related chunks that pass the leak filters (not D.Leak with the masked text, not H.Go with the callee's name).</summary>
+    private static IEnumerable<Chunk> EligibleRelated() => F.Corpus.Chunks.Where(IsRelated)
+        .Where(c => !F.Corpus.TextOf(c).Contains("Go(a)", StringComparison.Ordinal) && !F.Corpus.TextOf(c).Contains(" Go(", StringComparison.Ordinal));
 
     [Fact]
     public void Related_Neighbourhood_IsTwoHopsOfUseEdges_WithoutImportsOrTheMaskedCall()
@@ -126,21 +132,35 @@ public sealed class RelatedContextBuilderTests
         for (int seed = 0; seed < 6; seed++)
         {
             Chunk[] small = NonRequired(RelatedContextBuilder.Build(F.Corpus, F.Task, F.Graph, req + 4 * 45, 1.0, seed));
-            Assert.NotEmpty(small);
-            Assert.All(small, c => Assert.Equal("Lib/H.cs", c.FilePath));
+            Assert.Contains(small, IsRelated);
+            Assert.All(small.Where(IsRelated), c => Assert.Equal("Lib/H.cs", c.FilePath));
+            AssertOutsideChunksOnlyFill(small, req + 4 * 45, seed);
 
-            Chunk[] mid = NonRequired(RelatedContextBuilder.Build(F.Corpus, F.Task, F.Graph, req + 15 * 45, 1.0, seed));
-            Assert.All(mid, c => Assert.True(IsRelated(c), c.Id));
+            int midBudget = req + 15 * 45;
+            Chunk[] mid = NonRequired(RelatedContextBuilder.Build(F.Corpus, F.Task, F.Graph, midBudget, 1.0, seed));
             Assert.Contains(mid, c => c.FilePath == "Lib/D.cs");
+            AssertOutsideChunksOnlyFill(mid, midBudget, seed);
         }
 
         // Everything fits: every eligible related chunk is used, and only then outside chunks fill the budget.
         Chunk[] all = NonRequired(RelatedContextBuilder.Build(F.Corpus, F.Task, F.Graph, 100_000, 1.0, 3));
-        string[] eligibleRelated = F.Corpus.Chunks.Where(IsRelated)
-            .Where(c => !F.Corpus.TextOf(c).Contains("Go(a)", StringComparison.Ordinal) && !F.Corpus.TextOf(c).Contains(" Go(", StringComparison.Ordinal))
-            .Select(c => c.Id).Order(StringComparer.Ordinal).ToArray();
+        string[] eligibleRelated = EligibleRelated().Select(c => c.Id).Order(StringComparer.Ordinal).ToArray();
         Assert.Equal(eligibleRelated, all.Where(IsRelated).Select(c => c.Id).Order(StringComparer.Ordinal).ToArray());
         Assert.Contains(all, c => c.FilePath is "Lib/E.cs" or "Lib/U.cs" or "Lib/W.cs");
+    }
+
+    /// <summary>
+    /// Chunks from outside the neighbourhood (with relatedFraction 1) may only fill: when the first was added, the budget left
+    /// (at most the final slack plus the outside chunks) fitted no unused eligible related chunk.
+    /// </summary>
+    private static void AssertOutsideChunksOnlyFill(Chunk[] chosen, int budget, int seed)
+    {
+        Chunk[] outside = chosen.Where(c => !IsRelated(c)).ToArray();
+        if (outside.Length == 0) return;
+        int left = budget - F.Required.TokenIds.Length - TokensOf(chosen) + TokensOf(outside);
+        var used = chosen.Select(c => c.Id).ToHashSet();
+        int smallestUnused = EligibleRelated().Where(c => !used.Contains(c.Id)).Select(c => c.TokenIds.Length).DefaultIfEmpty(int.MaxValue).Min();
+        Assert.True(smallestUnused > left, $"seed {seed}: outside chunk added while a related chunk of {smallestUnused} tokens fitted {left}");
     }
 
     [Fact]
@@ -150,6 +170,10 @@ public sealed class RelatedContextBuilderTests
         string Ids(int seed) => string.Join('|', RelatedContextBuilder.Build(F.Corpus, F.Task, F.Graph, budget, 0.5, seed).Chunks.Select(c => c.Id));
         for (int seed = 0; seed < 4; seed++) Assert.Equal(Ids(seed), Ids(seed));
         Assert.True(Enumerable.Range(0, 6).Select(Ids).Distinct().Count() >= 4, "different seeds should give different contexts");
+        // The chunk order is shuffled too: the required chunk is not always first (where naive reuse would already be exact).
+        int[] positions = Enumerable.Range(0, 8).Select(seed => RelatedContextBuilder.Build(F.Corpus, F.Task, F.Graph, budget, 0.5, seed)
+            .Chunks.Select(c => c.Id).ToList().IndexOf(F.Required.Id)).ToArray();
+        Assert.True(positions.Distinct().Count() >= 3, "required chunk positions " + string.Join(',', positions));
     }
 
     [Fact]
