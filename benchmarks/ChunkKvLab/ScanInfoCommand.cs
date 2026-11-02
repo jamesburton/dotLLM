@@ -50,7 +50,7 @@ internal static class ScanInfoCommand
         long tokens = chunks.Sum(c => (long)c.TokenIds.Length);
         Console.WriteLine($"chunker {chunker.Name}: {chunks.Length} chunks, {tokens} tokens ({sw.Elapsed.TotalSeconds:F1} s)");
 
-        // Invocation sites under both set-ups (same LF texts, so (path, offset) identifies a site in both).
+        // Invocation sites under both set-ups (same LF texts, so (path, offset, length) identifies a site in both).
         ProjectCompilation bcl = ProjectCompilation.BclOnly(authored);
         sw.Restart();
         IReadOnlyList<CallSite> projectSites = CallResolution.Sites(scan.Compilations, authoredSet);
@@ -75,8 +75,8 @@ internal static class ScanInfoCommand
         }
 
         // Site by site (sites present in both set-ups).
-        var bclByKey = bclSites.ToDictionary(s => (s.Path, s.Offset));
-        var pairs = projectSites.Where(s => bclByKey.ContainsKey((s.Path, s.Offset))).Select(s => (P: s, B: bclByKey[(s.Path, s.Offset)])).ToArray();
+        var bclByKey = bclSites.ToDictionary(s => (s.Path, s.Offset, s.Length));
+        var pairs = projectSites.Where(s => bclByKey.ContainsKey((s.Path, s.Offset, s.Length))).Select(s => (P: s, B: bclByKey[(s.Path, s.Offset, s.Length)])).ToArray();
         Console.WriteLine($"sites in both set-ups {pairs.Length} (projects only {projectSites.Count - pairs.Length}, bcl-only only {bclSites.Count - pairs.Length}); projects kind x bcl-only kind:");
         foreach (var g in pairs.GroupBy(x => (x.P.Kind, x.B.Kind)).OrderBy(g => g.Key.Item1).ThenBy(g => g.Key.Item2))
         {

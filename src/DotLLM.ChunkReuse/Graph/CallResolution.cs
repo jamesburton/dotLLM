@@ -32,11 +32,12 @@ public enum CallTargetKind
 /// <summary>One invocation site and its binding.</summary>
 /// <param name="Path">Corpus path of the file holding the invocation.</param>
 /// <param name="Offset">Character offset of the invocation expression in that file.</param>
+/// <param name="Length">Length of the invocation expression (nested invocations such as <c>a.B().C()</c> share a start).</param>
 /// <param name="Kind">What it binds to.</param>
 /// <param name="Method">The bound method (display string), or null when unresolved.</param>
 /// <param name="DefinitionPath">For <see cref="CallTargetKind.File"/>: corpus path of the first declaring measured file.</param>
 /// <param name="DefinitionOffset">For <see cref="CallTargetKind.File"/>: offset of that declaration's name; otherwise -1.</param>
-public sealed record CallSite(string Path, int Offset, CallTargetKind Kind, string? Method, string? DefinitionPath, int DefinitionOffset);
+public sealed record CallSite(string Path, int Offset, int Length, CallTargetKind Kind, string? Method, string? DefinitionPath, int DefinitionOffset);
 
 /// <summary>
 /// Measures how many invocation sites bind, to compare compilation set-ups over the same files (BCL-only versus one
@@ -59,7 +60,7 @@ public static class CallResolution
         return new CallResolutionStats(invocations, resolved, inFiles);
     }
 
-    /// <summary>Every invocation site of <paramref name="paths"/> (all owned files when null), by path then offset.</summary>
+    /// <summary>Every invocation site of <paramref name="paths"/> (all owned files when null), by path, offset, then length.</summary>
     public static IReadOnlyList<CallSite> Sites(IReadOnlyList<ProjectCompilation> projects, IReadOnlySet<string>? paths = null)
     {
         ArgumentNullException.ThrowIfNull(projects);
@@ -79,10 +80,10 @@ public static class CallResolution
                 {
                     SymbolInfo info = model.GetSymbolInfo(inv);
                     if (inv.Expression is IdentifierNameSyntax { Identifier.ValueText: "nameof" } && info.Symbol is null) continue;
-                    int at = inv.SpanStart;
+                    int at = inv.SpanStart, length = inv.Span.Length;
                     if (info.Symbol is not IMethodSymbol method)
                     {
-                        sites.Add(new CallSite(path, at, CallTargetKind.Unresolved, null, null, -1));
+                        sites.Add(new CallSite(path, at, length, CallTargetKind.Unresolved, null, null, -1));
                         continue;
                     }
                     IMethodSymbol m = (method.ReducedFrom ?? method).OriginalDefinition;
@@ -93,12 +94,12 @@ public static class CallResolution
                         .Select(d => ((string, int)?)d).FirstOrDefault();
                     string display = m.ToDisplayString();
                     sites.Add(def is { } d
-                        ? new CallSite(path, at, CallTargetKind.File, display, d.Item1, d.Item2)
-                        : new CallSite(path, at, CallTargetKind.Elsewhere, display, null, -1));
+                        ? new CallSite(path, at, length, CallTargetKind.File, display, d.Item1, d.Item2)
+                        : new CallSite(path, at, length, CallTargetKind.Elsewhere, display, null, -1));
                 }
             }
         }
-        sites.Sort((a, b) => string.CompareOrdinal(a.Path, b.Path) is var c && c != 0 ? c : a.Offset.CompareTo(b.Offset));
+        sites.Sort((a, b) => string.CompareOrdinal(a.Path, b.Path) is var c && c != 0 ? c : a.Offset != b.Offset ? a.Offset.CompareTo(b.Offset) : a.Length.CompareTo(b.Length));
         return sites;
     }
 }

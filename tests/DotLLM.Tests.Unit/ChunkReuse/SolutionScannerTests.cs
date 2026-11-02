@@ -274,8 +274,8 @@ public sealed class SolutionScannerTests : IClassFixture<SolutionScannerTests.Mi
         SourceFile app = scan.AuthoredFiles.Single(f => f.Path == "App/Program.cs"), lib = scan.AuthoredFiles.Single(f => f.Path == "Lib/Greeter.cs");
         Assert.Equal(new[]
         {
-            new CallSite("App/Program.cs", Off(app.Text, "Greeter.Greet(Stamp"), CallTargetKind.File, "Mini.Lib.Greeter.Greet(string)", "Lib/Greeter.cs", Off(lib.Text, "Greet(")),
-            new CallSite("App/Program.cs", Off(app.Text, "Greeter.Greet(1)"), CallTargetKind.Unresolved, null, null, -1),
+            new CallSite("App/Program.cs", Off(app.Text, "Greeter.Greet(Stamp"), "Greeter.Greet(Stamp.Value)".Length, CallTargetKind.File, "Mini.Lib.Greeter.Greet(string)", "Lib/Greeter.cs", Off(lib.Text, "Greet(")),
+            new CallSite("App/Program.cs", Off(app.Text, "Greeter.Greet(1)"), "Greeter.Greet(1)".Length, CallTargetKind.Unresolved, null, null, -1),
         }, sites);
     }
 
