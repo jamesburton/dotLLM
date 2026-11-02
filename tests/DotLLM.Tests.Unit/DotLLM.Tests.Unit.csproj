@@ -66,6 +66,11 @@
     <None Include="Cpu\Kernels\NanoQuantData\oracle_p*.json" CopyToOutputDirectory="PreserveNewest" />
     <!-- #816: HF-generated Qwen4-Exp reference fixtures (generators in Models\Qwen4Exp\Reference; CI has no torch). -->
     <None Include="Models\Qwen4Exp\Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <!-- SolutionScannerTests: a small solution read with MSBuildWorkspace from a temp copy. Its sources are data, never compiled
+         into this project (Compile Remove); its own Directory.Build.props/Directory.Packages.props stop the repo's from applying. -->
+    <Compile Remove="ChunkReuse\Fixtures\MiniSolution\**" />
+    <None Remove="ChunkReuse\Fixtures\MiniSolution\**" />
+    <None Include="ChunkReuse\Fixtures\MiniSolution\**\*" Exclude="ChunkReuse\Fixtures\MiniSolution\**\bin\**;ChunkReuse\Fixtures\MiniSolution\**\obj\**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
