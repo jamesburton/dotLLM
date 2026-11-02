@@ -124,12 +124,15 @@ internal static class E1Runner
                 foreach (int c in plan.RequestOrder)
                 {
                     if (entries.ContainsKey(c)) continue;
+                    timed.Reset();
                     sw.Restart();
-                    entries[c] = encoder.Encode(lab.Model, lab.Backend, corpus.Chunks[c].TokenIds);
+                    entries[c] = encoder.Encode(lab.Model, timed, corpus.Chunks[c].TokenIds);
                     double ms = sw.Elapsed.TotalMilliseconds;
                     encodeMs += ms;
                     newChunks++;
                     Time("encode_chunk", ms, corpus.Chunks[c].TokenIds.Length);
+                    Time("encode_chunk.create_cache", timed.CreateMs, corpus.Chunks[c].TokenIds.Length);
+                    Time("encode_chunk.read_rows", timed.ReadMs, corpus.Chunks[c].TokenIds.Length, timed.ReadCalls);
                 }
                 var list = plan.RequestOrder.Select(c => entries[c]).ToList();
                 using IKvCache naiveCache = lab.NewBackendCache(capacity);
@@ -166,6 +169,7 @@ internal static class E1Runner
                 MethodResult pr = Evaluate(lab, fullCache, L, plan.Continuation, o.GreedyTokens, prefixBuildMs);
                 Report(csv, details, lab, Prefix, plan, pr, refResult, vocab, L - m, (long)m * lab.KvBytesPerToken, double.NaN);
                 XCheck(xcheck, seed, L, "prefix_vs_full", refResult, pr, vocab);
+                fullCache.Dispose(); // idempotent; frees ~9.4 GB at 32K before the device-copy arm
 
                 // naive by device copy: the same entries made resident (uploaded once), then assembled cache to cache.
                 {
@@ -332,14 +336,31 @@ internal static class E1Runner
         public int CopyCalls { get; private set; }
         public double ShiftMs { get; private set; }
         public int ShiftCalls { get; private set; }
+        public double ReadMs { get; private set; }
+        public int ReadCalls { get; private set; }
+        public double CreateMs { get; private set; }
 
-        public void Reset() => (WriteMs, WriteCalls, CopyMs, CopyCalls, ShiftMs, ShiftCalls) = (0, 0, 0, 0, 0, 0);
+        public void Reset() => (WriteMs, WriteCalls, CopyMs, CopyCalls, ShiftMs, ShiftCalls, ReadMs, ReadCalls, CreateMs) = (0, 0, 0, 0, 0, 0, 0, 0, 0);
 
         public string Tag => inner.Tag;
         public int ForwardDeviceId => inner.ForwardDeviceId;
-        public IKvCache CreateCache(int maxSeqLen) => inner.CreateCache(maxSeqLen);
         public void RequireCache(IKvCache cache) => inner.RequireCache(cache);
-        public void ReadRows(IKvCache cache, int layer, int startPos, int count, Span<float> k, Span<float> v) => inner.ReadRows(cache, layer, startPos, count, k, v);
+
+        public IKvCache CreateCache(int maxSeqLen)
+        {
+            long t = Stopwatch.GetTimestamp();
+            IKvCache c = inner.CreateCache(maxSeqLen);
+            CreateMs += Stopwatch.GetElapsedTime(t).TotalMilliseconds;
+            return c;
+        }
+
+        public void ReadRows(IKvCache cache, int layer, int startPos, int count, Span<float> k, Span<float> v)
+        {
+            long t = Stopwatch.GetTimestamp();
+            inner.ReadRows(cache, layer, startPos, count, k, v);
+            ReadMs += Stopwatch.GetElapsedTime(t).TotalMilliseconds;
+            ReadCalls++;
+        }
 
         public void WriteRows(IKvCache cache, int layer, int startPos, ReadOnlySpan<float> k, ReadOnlySpan<float> v)
         {
