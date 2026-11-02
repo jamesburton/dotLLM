@@ -180,7 +180,9 @@ internal static class Program
             }
             case "recompute":
             {
-                string[] List(string key, string fallback) => Get(key, fallback).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                // "--selectors =" (value after '=') gives an empty list: only the full prefill, encode, assembly and control arms run.
+                string[] List(string key, string fallback) =>
+                    Get(key, fallback).TrimStart('=').Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
                 return RecomputeCommand.Run(new RecomputeOptions(
                     Get("model"), List("names", ""), List("corpus-dirs", ""), List("hashes", ""), Ints("contexts", ""), Get("kept-dir"),
                     Get("mode", "kept"), Int("context", 2048), Ints("budgets", "5,10,20"), List("selectors", "chunk_starts,random"),

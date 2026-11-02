@@ -218,8 +218,9 @@ internal static class RecomputeCommand
                     {
                         // One forward each (capped by --max-rows), or the "ordinary" arm would be split into an inside-the-cache batch plus a tail.
                         int k = Math.Min((int)Math.Round(L * o.Budgets.Max() / 100.0, MidpointRounding.AwayFromZero), maxRows);
-                        foreach ((string arm, int first) in new[] { ("tail_ordinary", L - k), ("tail_qpos", L - k - 1) })
-                            for (int rep = 0; rep < o.Repeats; rep++)
+                        // Repeats outermost so the two arms interleave (ordinary, qpos, ordinary, qpos, ...).
+                        for (int rep = 0; rep < o.Repeats; rep++)
+                            foreach ((string arm, int first) in new[] { ("tail_ordinary", L - k), ("tail_qpos", L - k - 1) })
                             {
                                 Console.WriteLine(Step($"control {arm}: {k} rows at {first}.. rep {rep}"));
                                 using IKvCache cache = Naive();
