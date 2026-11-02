@@ -293,6 +293,14 @@ public sealed class VulkanAssemblyTestsGpu : IDisposable
         using IKvCache host = rig.Cpu.CreateCache(SyntheticDenseGguf.Context);
         Assert.Throws<ArgumentException>(() => new ChunkAssembler(rig.Tiny.Config, rig.Cpu).Assemble(host, [vkRes], Fingerprint));
         Assert.Equal(0, host.CurrentLength);
+
+        // A resident entry whose cache this backend cannot read (host rows under a Vulkan tag) is refused before the valid chunk ahead
+        // of it is copied: the whole list is vetted first.
+        IKvCache hostRows = rig.Cpu.CreateCache(ChunkA.Length);
+        for (int l = 0; l < rig.Layers; l++) rig.Cpu.WriteRows(hostRows, l, 0, cpuA.KeysPerLayer[l], cpuA.ValuesPerLayer[l]);
+        using var mislabelled = new ResidentChunkKvEntry(Fingerprint, ChunkA, hostRows, ChunkBackendTags.Vulkan);
+        Assert.Throws<NotSupportedException>(() => assembler.Assemble(cache, [vkRes, mislabelled], Fingerprint));
+        Assert.Equal(0, cache.CurrentLength);
     }
 
     [SkippableFact]

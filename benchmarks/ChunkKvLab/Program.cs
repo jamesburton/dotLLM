@@ -6,6 +6,7 @@ namespace ChunkKvLab;
 /// Chunk-KV reuse lab (research harness, CPU).
 /// <code>
 /// ChunkKvLab e1 --model &lt;gguf&gt; --corpus &lt;dir&gt; --seeds 3 --out results.csv [--sizes 2048,4096,8192] [--pattern *.cs]
+///               [--expect-hash &lt;sha256&gt;] [--first-seed 0] [--cross-check none|cpu] (cpu: with --backend vulkan, also CPU naive)
 ///               [--chunk 512] [--continuation 64] [--greedy 16] [--threads 0]
 /// ChunkKvLab e2 --model &lt;gguf&gt; --corpus &lt;dir&gt; --out e2.csv [--sizes 2048,4096] [--budgets 5,10,15,20] [--selectors ...]
 ///               [--contiguous =a,b] [--query 16] [--noise 1] [--expect-hash &lt;sha256&gt;] [--seeds 3] [--first-seed 0]
@@ -28,8 +29,8 @@ namespace ChunkKvLab;
 ///               (loads CPU and Vulkan itself; no --backend)
 /// </code>
 /// Global option on every model-loading command: <c>--backend cpu|vulkan</c> (default cpu). On vulkan the model and the chunk
-/// backend share one device and all-row logits are enabled on demand (<c>TrySetAllRowLogitsLimit</c>); the experiment runners still
-/// need the CPU <c>SimpleKvCache</c> and refuse vulkan until Phase G Task 3 ports them.
+/// backend share one device and all-row logits are enabled on demand (<c>TrySetAllRowLogitsLimit</c>); the experiment runners
+/// other than e1 still need the CPU <c>SimpleKvCache</c> and refuse vulkan (e1 runs on either backend since Phase G Task 3).
 /// </summary>
 internal static class Program
 {
@@ -69,10 +70,10 @@ internal static class Program
             return 2;
         }
         LabModel.SelectedBackend = backend;
-        if (backend != DotLLM.ChunkReuse.Backends.ChunkBackendTags.Cpu && args[0] is not ("backend-check" or "corpus-info" or "graph-info"))
+        if (backend != DotLLM.ChunkReuse.Backends.ChunkBackendTags.Cpu && args[0] is not ("backend-check" or "corpus-info" or "graph-info" or "e1"))
         {
             // Fail before loading weights: the experiment runners still drive SimpleKvCache directly.
-            Console.Error.WriteLine($"'{args[0]}' runs on the CPU backend only until Phase G Task 3; --backend {backend} is accepted by backend-check.");
+            Console.Error.WriteLine($"'{args[0]}' runs on the CPU backend only (not yet ported to the chunk backend seam); --backend {backend} is accepted by e1 and backend-check.");
             return 2;
         }
 
@@ -81,7 +82,13 @@ internal static class Program
             case "e1":
                 return E1Runner.Run(new E1Options(
                     Get("model"), Get("corpus"), Get("pattern", "*.cs"), Int("seeds", 3), Ints("sizes", "2048,4096,8192"),
-                    Int("chunk", 512), Int("continuation", 64), Int("greedy", 16), Int("threads", 0), Get("out")));
+                    Int("chunk", 512), Int("continuation", 64), Int("greedy", 16), Int("threads", 0), Get("out"),
+                    opts.GetValueOrDefault("expect-hash"), Get("cross-check", "none") switch
+                    {
+                        "none" => false,
+                        "cpu" => true,
+                        string x => throw new ArgumentException($"--cross-check must be none or cpu; got '{x}'"),
+                    }, Int("first-seed", 0)));
             case "e2":
             {
                 // "--contiguous =" (value after '=') lets a script pass an empty list.
