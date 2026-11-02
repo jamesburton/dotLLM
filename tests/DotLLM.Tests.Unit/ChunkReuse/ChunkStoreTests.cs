@@ -487,6 +487,30 @@ public sealed class ChunkStoreTests : IDisposable
         Assert.True(store.Contains(key));
     }
 
+    [Fact]
+    public void Store_HeaderBackendTagLongerThanMax_IsMiss()
+    {
+        // A tag of MaxBackendTagBytes (64) is stored and read; a file whose tag is one byte longer (otherwise consistent: the tag
+        // length, the tag bytes and the file length all agree) is a miss, as Put would never write it (mutant M13).
+        string max = new('a', FileChunkStore.MaxBackendTagBytes);
+        Assert.Equal(64, max.Length);
+        ChunkKey key = ChunkKey.Create(Fingerprint, Tokenizer, Rope, max, Dtype, Tokens);
+        var store = new FileChunkStore(_root);
+        store.Put(key, NewEntry(Tokens, Fingerprint, layers: 2, stride: 4, seed: 5) with { Backend = max });
+        Assert.True(store.TryGet(key, out ChunkKvEntry got));
+        Assert.Equal(max, got.Backend);
+
+        string path = EntryPath(key);
+        byte[] bytes = File.ReadAllBytes(path);
+        int at = BackendTagOffset(Fingerprint);
+        Assert.Equal(64, BitConverter.ToInt32(bytes, at));
+        BitConverter.GetBytes(65).CopyTo(bytes, at);
+        byte[] longer = [.. bytes[..(at + 4)], (byte)'a', .. bytes[(at + 4)..]];
+        File.WriteAllBytes(path, longer);
+        Assert.False(store.Contains(key));
+        Assert.False(store.TryGet(key, out _));
+    }
+
     // magic + version + dtype + reserved, key, fingerprint length + bytes: the backend tag's int32 length follows.
     private static int BackendTagOffset(string fingerprint) => 16 + 64 + 4 + System.Text.Encoding.UTF8.GetByteCount(fingerprint);
 
